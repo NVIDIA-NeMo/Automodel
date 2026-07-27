@@ -46,7 +46,7 @@ def _resolve_pass_configs(real_tilelang: Any, pass_configs: dict[Any, Any] | Non
     if pass_configs is None:
         return None
     return {
-        getattr(real_tilelang.PassConfigKey, key) if isinstance(key, str) else key: value
+        vars(real_tilelang.PassConfigKey)[key] if isinstance(key, str) else key: value
         for key, value in pass_configs.items()
     }
 
@@ -95,7 +95,7 @@ class _Math:
 
     def __getattr__(self, name: str) -> Any:
         real_tilelang, _ = _load_tilelang()
-        return getattr(real_tilelang.math, name)
+        return vars(real_tilelang.math)[name]
 
 
 class _PhonyTileLang:
@@ -106,7 +106,7 @@ class _PhonyTileLang:
 
     def __getattr__(self, name: str) -> Any:
         real_tilelang, _ = _load_tilelang()
-        return getattr(real_tilelang, name)
+        return vars(real_tilelang)[name]
 
 
 class _PhonyLanguage:
@@ -122,7 +122,7 @@ class _PhonyLanguage:
 
     def __getattr__(self, name: str) -> Any:
         _, real_language = _load_tilelang()
-        return getattr(real_language, name)
+        return vars(real_language)[name]
 
 
 tilelang = _PhonyTileLang()

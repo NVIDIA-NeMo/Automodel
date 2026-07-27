@@ -54,9 +54,11 @@ class Ernie4_5RotaryEmbedding(nn.Module):
 
     def __init__(self, config, device: torch.device | None = None):
         super().__init__()
-        rope_parameters = getattr(config, "rope_parameters", None) or {}
-        base = rope_parameters.get("rope_theta", getattr(config, "rope_theta", 500000.0))
-        head_dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
+        rope_parameters = (config.rope_parameters if hasattr(config, "rope_parameters") else None) or {}
+        base = rope_parameters.get("rope_theta", (config.rope_theta if hasattr(config, "rope_theta") else 500000.0))
+        head_dim = (
+            config.head_dim if hasattr(config, "head_dim") else None
+        ) or config.hidden_size // config.num_attention_heads
         inv_freq = 1.0 / (
             base ** (torch.arange(0, head_dim, 2, dtype=torch.int64).to(device=device, dtype=torch.float32) / head_dim)
         )

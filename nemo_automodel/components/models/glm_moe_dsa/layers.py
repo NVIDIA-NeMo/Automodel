@@ -180,7 +180,7 @@ class GlmMoeDsaIndexer(nn.Module):
 
         self.backend = backend
         linear_impl = backend.linear
-        dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+        dtype = get_dtype((config.torch_dtype if hasattr(config, "torch_dtype") else None), torch.bfloat16)
 
         # Project Q from q_lora residual -> num_heads * head_dim
         self.wq_b = initialize_linear_module(
@@ -411,7 +411,7 @@ class GlmMoeDsaMLA(nn.Module):
         rms_norm_impl = backend.rms_norm
 
         hidden_size = config.hidden_size
-        dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+        dtype = get_dtype((config.torch_dtype if hasattr(config, "torch_dtype") else None), torch.bfloat16)
 
         # GLM-5.2 always uses q_lora (q_lora_rank is not None)
         self.q_a_proj = initialize_linear_module(
@@ -662,7 +662,11 @@ class GlmMoeDsaMLA(nn.Module):
                     "TileLang DSA sparse attention requires THD/packed sequences (qkv_format='thd'); "
                     f"got '{qkv_format}'. Use backend.attn in {{te, sdpa}} for the bshd dense path."
                 )
-            materialize_effective_weight = getattr(self.kv_b_proj, "materialize_effective_weight", None)
+            materialize_effective_weight = (
+                self.kv_b_proj.materialize_effective_weight
+                if hasattr(self.kv_b_proj, "materialize_effective_weight")
+                else None
+            )
             kv_b_weight = (
                 materialize_effective_weight() if materialize_effective_weight is not None else self.kv_b_proj.weight
             )

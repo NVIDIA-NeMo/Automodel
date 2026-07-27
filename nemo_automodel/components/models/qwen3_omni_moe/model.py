@@ -55,7 +55,7 @@ class Qwen3OmniMoeThinkerTextRotaryEmbedding(HFQwen3OmniMoeThinkerTextRotaryEmbe
         }
         result = super()._apply(fn, recurse=recurse)
         for name, fp32_buffer in fp32_buffers.items():
-            current = getattr(self, name)
+            current = self.get_buffer(name)
             self.register_buffer(name, fp32_buffer.to(device=current.device), persistent=False)
         return result
 
@@ -80,29 +80,31 @@ class Qwen3OmniMoeThinkerTextModel(
             raise ValueError("Cannot pass both moe_config and moe_overrides; use one or the other.")
 
         # Map HF Qwen3OmniMoe config -> our MoE wrapper
-        self.padding_idx = getattr(config, "pad_token_id", None)
+        self.padding_idx = config.pad_token_id if hasattr(config, "pad_token_id") else None
         self.vocab_size = config.vocab_size
 
         # Resolve model dtype once; thread it explicitly to every sub-module
         # so fp32 master weights work even when construction is not wrapped in
         # local_torch_dtype().
-        model_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+        model_dtype = get_dtype((config.torch_dtype if hasattr(config, "torch_dtype") else None), torch.bfloat16)
 
         moe_defaults = dict(
             dim=config.hidden_size,
             inter_dim=config.intermediate_size,
-            moe_inter_dim=getattr(config, "moe_intermediate_size", config.intermediate_size),
-            n_routed_experts=getattr(config, "num_experts", 0),
+            moe_inter_dim=(
+                config.moe_intermediate_size if hasattr(config, "moe_intermediate_size") else config.intermediate_size
+            ),
+            n_routed_experts=(config.num_experts if hasattr(config, "num_experts") else 0),
             n_shared_experts=0,
-            n_activated_experts=getattr(config, "num_experts_per_tok", 1),
+            n_activated_experts=(config.num_experts_per_tok if hasattr(config, "num_experts_per_tok") else 1),
             n_expert_groups=1,
             n_limited_groups=1,
             train_gate=True,
             gate_bias_update_factor=0.0,
             score_func="softmax",
             route_scale=1.0,
-            aux_loss_coeff=getattr(config, "router_aux_loss_coef", 0.0),
-            norm_topk_prob=getattr(config, "norm_topk_prob", False),
+            aux_loss_coeff=(config.router_aux_loss_coef if hasattr(config, "router_aux_loss_coef") else 0.0),
+            norm_topk_prob=(config.norm_topk_prob if hasattr(config, "norm_topk_prob") else False),
             expert_bias=False,
             router_bias=False,
             expert_activation="swiglu",
@@ -272,13 +274,16 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         # every nested sub-config that exposes a torch_dtype attribute (both
         # the top-level and the thinker sub-config) so the HF parent, our
         # text backend, and any HF vision / multimodal code agree.
-        top_dtype = getattr(config, "torch_dtype", None)
+        top_dtype = config.torch_dtype if hasattr(config, "torch_dtype") else None
         if top_dtype is not None:
             for parent in (config, base_config):
                 for sub_cfg in vars(parent).values():
                     if sub_cfg is not parent and hasattr(sub_cfg, "torch_dtype"):
                         sub_cfg.torch_dtype = top_dtype
-            if base_config is not config and getattr(base_config, "torch_dtype", None) != top_dtype:
+            if (
+                base_config is not config
+                and (base_config.torch_dtype if hasattr(base_config, "torch_dtype") else None) != top_dtype
+            ):
                 base_config.torch_dtype = top_dtype
 
         super().__init__(base_config)
@@ -290,7 +295,9 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         self.model = Qwen3OmniMoeThinkerTextModel(
             text_config, backend=self.backend, moe_config=moe_config, moe_overrides=moe_overrides
         )
-        model_dtype = get_dtype(getattr(text_config, "torch_dtype", None), torch.bfloat16)
+        model_dtype = get_dtype(
+            (text_config.torch_dtype if hasattr(text_config, "torch_dtype") else None), torch.bfloat16
+        )
         self.lm_head = initialize_linear_module(
             self.backend.linear, text_config.hidden_size, text_config.vocab_size, bias=False, dtype=model_dtype
         )
@@ -303,7 +310,9 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         self.rope_deltas = None
         self.num_experts = text_config.num_experts
         self.num_experts_per_tok = text_config.num_experts_per_tok
-        self.router_aux_loss_coef = getattr(text_config, "router_aux_loss_coef", 0.0)
+        self.router_aux_loss_coef = (
+            text_config.router_aux_loss_coef if hasattr(text_config, "router_aux_loss_coef") else 0.0
+        )
 
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = Qwen3OmniMoeStateDictAdapter(
@@ -384,7 +393,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         output_hidden_states = (
             output_hidden_states
             if output_hidden_states is not None
-            else getattr(self.config, "output_hidden_states", False)
+            else (self.config.output_hidden_states if hasattr(self.config, "output_hidden_states") else False)
         )
         if "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd":
             input_ids, position_ids, padding_mask, attn_kwargs = squeeze_input_for_thd(
@@ -392,16 +401,18 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
             )
             attention_mask = None
 
-        chunk_idx = getattr(self, "_vlm_chunk_idx", 0)
+        chunk_idx = self._vlm_chunk_idx if hasattr(self, "_vlm_chunk_idx") else 0
         consumed_vlm_chunk = False
 
         if pixel_values is None:
-            image_chunks = getattr(self, "_vlm_pixel_values_chunks", None)
+            image_chunks = self._vlm_pixel_values_chunks if hasattr(self, "_vlm_pixel_values_chunks") else None
             if image_chunks is not None and chunk_idx < len(image_chunks):
                 image_chunk = image_chunks[chunk_idx]
                 if image_chunk.numel() > 0:
                     pixel_values = image_chunk
-                    image_grid_chunks = getattr(self, "_vlm_image_grid_hws_chunks", None)
+                    image_grid_chunks = (
+                        self._vlm_image_grid_hws_chunks if hasattr(self, "_vlm_image_grid_hws_chunks") else None
+                    )
                     if image_grid_chunks is not None and chunk_idx < len(image_grid_chunks):
                         image_grid = image_grid_chunks[chunk_idx]
                         if image_grid is not None and image_grid.numel() > 0:
@@ -415,12 +426,16 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
                 consumed_vlm_chunk = True
 
         if pixel_values_videos is None:
-            video_chunks = getattr(self, "_vlm_pixel_values_videos_chunks", None)
+            video_chunks = (
+                self._vlm_pixel_values_videos_chunks if hasattr(self, "_vlm_pixel_values_videos_chunks") else None
+            )
             if video_chunks is not None and chunk_idx < len(video_chunks):
                 video_chunk = video_chunks[chunk_idx]
                 if video_chunk.numel() > 0:
                     pixel_values_videos = video_chunk
-                    video_grid_chunks = getattr(self, "_vlm_video_grid_thw_chunks", None)
+                    video_grid_chunks = (
+                        self._vlm_video_grid_thw_chunks if hasattr(self, "_vlm_video_grid_thw_chunks") else None
+                    )
                     if video_grid_chunks is not None and chunk_idx < len(video_grid_chunks):
                         video_grid_thw = video_grid_chunks[chunk_idx]
                 consumed_vlm_chunk = True

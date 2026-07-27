@@ -130,7 +130,9 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
 
         self.backend = backend or BackendConfig()
         text_config = thinker_config.text_config if hasattr(thinker_config, "text_config") else thinker_config
-        torch_dtype = getattr(text_config, "torch_dtype", None) or getattr(thinker_config, "torch_dtype", None)
+        torch_dtype = (text_config.torch_dtype if hasattr(text_config, "torch_dtype") else None) or (
+            thinker_config.torch_dtype if hasattr(thinker_config, "torch_dtype") else None
+        )
         dtype = get_dtype(torch_dtype, torch.bfloat16) if torch_dtype is not None else torch.bfloat16
 
         if self.backend.enable_hf_state_dict_adapter:
@@ -194,7 +196,7 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
         output_hidden_states = (
             output_hidden_states
             if output_hidden_states is not None
-            else getattr(self.config, "output_hidden_states", False)
+            else (self.config.output_hidden_states if hasattr(self.config, "output_hidden_states") else False)
         )
 
         if inputs_embeds is None:

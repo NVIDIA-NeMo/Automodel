@@ -83,7 +83,7 @@ class _SSMGateParam:
     def __get__(self, obj, owner=None):
         if obj is None:
             return self
-        return getattr(obj._fp32_params, self.name)
+        return obj._fp32_params.get_parameter(self.name)
 
 
 class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
@@ -657,7 +657,7 @@ def _resolve_ssm_dtype(config):
     Honors ``mamba_ssm_dtype`` when present; otherwise defaults to AutoModel's
     fp32 training-storage contract for ``A_log``/``dt_bias``.
     """
-    ssm_dtype = getattr(config, "mamba_ssm_dtype", None)
+    ssm_dtype = config.mamba_ssm_dtype if hasattr(config, "mamba_ssm_dtype") else None
     if isinstance(ssm_dtype, str):
         ssm_dtype = dtype_from_str(ssm_dtype)
     return ssm_dtype or torch.float32

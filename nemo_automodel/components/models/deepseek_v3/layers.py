@@ -59,7 +59,7 @@ class MLA(nn.Module):
         rms_norm_impl = backend.rms_norm
 
         hidden_size = config.hidden_size
-        dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+        dtype = get_dtype((config.torch_dtype if hasattr(config, "torch_dtype") else None), torch.bfloat16)
 
         if self.q_lora_rank is None:
             self.q_proj = initialize_linear_module(

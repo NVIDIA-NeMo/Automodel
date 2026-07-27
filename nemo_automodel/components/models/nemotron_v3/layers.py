@@ -49,12 +49,12 @@ class NemotronV3Attention(nn.Module):
         self.num_key_value_heads = config.num_key_value_heads
         self.head_dim = config.head_dim
         self.hidden_size = config.hidden_size
-        self.attention_bias = getattr(config, "attention_bias", False)
-        self.attention_dropout = getattr(config, "attention_dropout", 0.0)
+        self.attention_bias = config.attention_bias if hasattr(config, "attention_bias") else False
+        self.attention_dropout = config.attention_dropout if hasattr(config, "attention_dropout") else 0.0
         # Cached for debug-print role disambiguation (backbone vs mtp sublayer).
-        self.num_hidden_layers = int(getattr(config, "num_hidden_layers", 0))
+        self.num_hidden_layers = int((config.num_hidden_layers if hasattr(config, "num_hidden_layers") else 0))
 
-        dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+        dtype = get_dtype((config.torch_dtype if hasattr(config, "torch_dtype") else None), torch.bfloat16)
         self.q_proj = initialize_linear_module(
             self.backend.linear,
             self.hidden_size,
@@ -600,7 +600,7 @@ class NemotronV3Mamba2Mixer(nn.Module):
         with buffer_device:
             # dt_bias: inverse softplus initialization
             # Check _no_reinit flag to avoid re-initializing if called multiple times
-            if not getattr(self.dt_bias, "_no_reinit", False):
+            if not (self.dt_bias._no_reinit if hasattr(self.dt_bias, "_no_reinit") else False):
                 dt_bias_local = _to_local(self.dt_bias)
                 local_num_heads = dt_bias_local.shape[0]
                 dt = torch.exp(
@@ -652,14 +652,14 @@ class NemotronV3Block(nn.Module):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
-        self.residual_in_fp32 = getattr(config, "residual_in_fp32", False)
+        self.residual_in_fp32 = config.residual_in_fp32 if hasattr(config, "residual_in_fp32") else False
 
         # RMSNorm
         self.norm = initialize_rms_norm_module(
             backend.rms_norm,
             config.hidden_size,
             eps=config.layer_norm_epsilon,
-            dtype=get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16),
+            dtype=get_dtype((config.torch_dtype if hasattr(config, "torch_dtype") else None), torch.bfloat16),
         )
 
         # Determine layer type from config
@@ -681,8 +681,8 @@ class NemotronV3Block(nn.Module):
                 inter_dim=config.intermediate_size,
                 backend=backend.linear,
                 dtype=dtype,
-                activation=getattr(config, "mlp_hidden_act", "relu2"),
-                bias=getattr(config, "mlp_bias", False),
+                activation=(config.mlp_hidden_act if hasattr(config, "mlp_hidden_act") else "relu2"),
+                bias=(config.mlp_bias if hasattr(config, "mlp_bias") else False),
             )
         elif self.block_type == "moe":
             from nemo_automodel.components.moe.layers import MoE
@@ -783,8 +783,10 @@ class NemotronV3Block(nn.Module):
             buffer_device: Device for buffer initialization (used by MLP/MoE)
         """
         num_hidden_layers = self.config.num_hidden_layers
-        rescale_prenorm_residual = getattr(self.config, "rescale_prenorm_residual", True)
-        init_std = getattr(self.config, "initializer_range", 0.02)
+        rescale_prenorm_residual = (
+            self.config.rescale_prenorm_residual if hasattr(self.config, "rescale_prenorm_residual") else True
+        )
+        init_std = self.config.initializer_range if hasattr(self.config, "initializer_range") else 0.02
 
         # Initialize norm
         self.norm.reset_parameters()

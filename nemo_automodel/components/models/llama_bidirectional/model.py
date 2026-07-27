@@ -223,7 +223,7 @@ class LlamaBidirectionalForSequenceClassification(LlamaPreTrainedModel):
         if module is self.score:
             # Backport huggingface/transformers#46030 for transformers 5.8.x:
             # initialize the actual dtype tensor, not a float() copy.
-            std = getattr(self.config, "initializer_range", 0.02) or 0.02
+            std = (self.config.initializer_range if hasattr(self.config, "initializer_range") else 0.02) or 0.02
             init.normal_(module.weight, mean=0.0, std=std)
             if module.bias is not None:
                 init.zeros_(module.bias)
@@ -267,11 +267,11 @@ class LlamaBidirectionalForSequenceClassification(LlamaPreTrainedModel):
         pooled_hidden_states = _pool(
             last_hidden_states=hidden_states,
             attention_mask=attention_mask,
-            pool_type=getattr(self.config, "pooling", "avg"),
+            pool_type=(self.config.pooling if hasattr(self.config, "pooling") else "avg"),
         )
 
         pooled_logits = self.score(pooled_hidden_states)
-        pooled_logits = pooled_logits / getattr(self.config, "temperature", 1.0)
+        pooled_logits = pooled_logits / (self.config.temperature if hasattr(self.config, "temperature") else 1.0)
 
         loss = None
         if labels is not None:

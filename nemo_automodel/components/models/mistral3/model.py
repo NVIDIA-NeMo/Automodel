@@ -219,7 +219,9 @@ class Ministral3RotaryEmbedding(nn.Module):
         seq_len: Optional[int] = None,
     ) -> tuple["torch.Tensor", float]:
         base = config.rope_parameters["rope_theta"]
-        dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
+        dim = (
+            config.head_dim if hasattr(config, "head_dim") else None
+        ) or config.hidden_size // config.num_attention_heads
         attention_factor = 1.0
         inv_freq = 1.0 / (
             base ** (torch.arange(0, dim, 2, dtype=torch.int64).to(device=device, dtype=torch.float) / dim)
@@ -294,7 +296,9 @@ class Ministral3Attention(nn.Module):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
-        self.head_dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
+        self.head_dim = (
+            config.head_dim if hasattr(config, "head_dim") else None
+        ) or config.hidden_size // config.num_attention_heads
         self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
         self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
@@ -347,7 +351,7 @@ class Ministral3Attention(nn.Module):
             attention_mask,
             dropout=0.0 if not self.training else self.attention_dropout,
             scaling=self.scaling,
-            sliding_window=getattr(self.config, "sliding_window", None),
+            sliding_window=(self.config.sliding_window if hasattr(self.config, "sliding_window") else None),
             **kwargs,
         )
 
@@ -563,7 +567,7 @@ class Ministral3ForCausalLM(HFCheckpointingMixin, Ministral3PreTrainedModel, Gen
         output_hidden_states = (
             output_hidden_states
             if output_hidden_states is not None
-            else getattr(self.config, "output_hidden_states", False)
+            else (self.config.output_hidden_states if hasattr(self.config, "output_hidden_states") else False)
         )
 
         outputs: BaseModelOutputWithPast = self.model(

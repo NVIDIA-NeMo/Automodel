@@ -84,13 +84,15 @@ class LlamaAttention(nn.Module):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
-        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        self.head_dim = (
+            config.head_dim if hasattr(config, "head_dim") else config.hidden_size // config.num_attention_heads
+        )
         self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
         self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
         self.is_causal = True
-        self.rope_fusion = getattr(backend, "rope_fusion", False)
-        self.rope_backend = getattr(backend, "rope", "torch")
+        self.rope_fusion = backend.rope_fusion if hasattr(backend, "rope_fusion") else False
+        self.rope_backend = backend.rope if hasattr(backend, "rope") else "torch"
         self._quack_apply_rotary_emb = None
         if self.rope_backend == "quack":
             available, apply_rotary_emb = safe_import_from(
@@ -463,7 +465,7 @@ class LlamaForCausalLM(HFCheckpointingMixin, LlamaPreTrainedModel):
         # Transformers v5 does not reliably tie this custom model from the
         # dict-shaped _tied_weights_keys alone. Explicitly honor the config
         # flag after initialization.
-        if getattr(config, "tie_word_embeddings", False):
+        if config.tie_word_embeddings if hasattr(config, "tie_word_embeddings") else False:
             self.tie_weights()
 
         # Convert to configured dtype if specified
@@ -487,7 +489,7 @@ class LlamaForCausalLM(HFCheckpointingMixin, LlamaPreTrainedModel):
         self.lm_head = new_embeddings
 
     def tie_weights(self, *_args: object, **_kwargs: object) -> None:
-        if getattr(self.config, "tie_word_embeddings", False):
+        if self.config.tie_word_embeddings if hasattr(self.config, "tie_word_embeddings") else False:
             self.lm_head.weight = self.model.embed_tokens.weight
 
     def set_decoder(self, decoder):

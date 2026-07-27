@@ -196,17 +196,17 @@ def initialize_bagel_non_backbone_weights(model: torch.nn.Module, *, seed: int) 
         _copy_full_tensor(module.pos_embed, value)
 
     with torch.no_grad():
-        if getattr(model.config, "visual_gen", False):
+        if model.config.visual_gen if hasattr(model.config, "visual_gen") else False:
             bagel.time_embedder.apply(_reset_linear)
             bagel.vae2llm.apply(_reset_linear)
             bagel.llm2vae.apply(_reset_linear)
             _init_position_embedding(bagel.latent_pos_embed)
 
-        if getattr(model.config, "visual_und", False):
+        if model.config.visual_und if hasattr(model.config, "visual_und") else False:
             bagel.connector.apply(_reset_linear)
             _init_position_embedding(bagel.vit_pos_embed)
 
-        if getattr(model.config, "visual_gen", False):
+        if model.config.visual_gen if hasattr(model.config, "visual_gen") else False:
             torch.nn.init.constant_(bagel.llm2vae.weight, 0.0)
             torch.nn.init.constant_(bagel.llm2vae.bias, 0.0)
 

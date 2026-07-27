@@ -121,7 +121,7 @@ class DeepseekV32Indexer(nn.Module):
 
         self.backend = backend
         linear_impl = backend.linear
-        dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+        dtype = get_dtype((config.torch_dtype if hasattr(config, "torch_dtype") else None), torch.bfloat16)
 
         # Project Q from q_lora residual -> num_heads * head_dim
         self.wq_b = initialize_linear_module(
@@ -304,7 +304,7 @@ class DeepseekV32MLA(nn.Module):
         rms_norm_impl = backend.rms_norm
 
         hidden_size = config.hidden_size
-        dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+        dtype = get_dtype((config.torch_dtype if hasattr(config, "torch_dtype") else None), torch.bfloat16)
 
         # V3.2 always uses q_lora (q_lora_rank is not None)
         self.q_a_proj = initialize_linear_module(

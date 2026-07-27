@@ -101,7 +101,7 @@ def _coerce_text_config(cfg: Union[Dict[str, Any], Qwen2Config, None]) -> Qwen2C
     # override before/after this helper runs).
     if not hasattr(cfg, "qk_norm"):
         cfg.qk_norm = True
-    if getattr(cfg, "layer_module", None) is None:
+    if (cfg.layer_module if hasattr(cfg, "layer_module") else None) is None:
         cfg.layer_module = "Qwen2DecoderLayer"
     if not hasattr(cfg, "freeze_und"):
         cfg.freeze_und = False
@@ -109,7 +109,7 @@ def _coerce_text_config(cfg: Union[Dict[str, Any], Qwen2Config, None]) -> Qwen2C
     # pad_token_id: Qwen2Config's default is None, which Qwen2Model tolerates
     # (nn.Embedding accepts padding_idx=None). The packed training path reads
     # it as a scalar, so we fall back to the BAGEL-7B-MoT value when missing.
-    if getattr(cfg, "pad_token_id", None) is None:
+    if (cfg.pad_token_id if hasattr(cfg, "pad_token_id") else None) is None:
         cfg.pad_token_id = 151643
 
     return cfg
@@ -214,7 +214,7 @@ class BagelConfig(PretrainedConfig):
         self.timestep_shift = timestep_shift
 
         super().__init__(pad_token_id=pad_token_id, **kwargs)
-        if not getattr(self, "architectures", None):
+        if not (self.architectures if hasattr(self, "architectures") else None):
             self.architectures = ["BagelForUnifiedMultimodal"]
 
     # Checkpoint-named read aliases (so downstream code can do either

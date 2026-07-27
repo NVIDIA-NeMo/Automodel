@@ -74,7 +74,7 @@ def _resolve_score_func(config: Any) -> str:
     ``e_score_correction_bias`` plus expert-group routing, which Hy-MT2 does
     not use (n_expert_groups=0).
     """
-    use_sigmoid = bool(getattr(config, "moe_router_use_sigmoid", True))
+    use_sigmoid = bool((config.moe_router_use_sigmoid if hasattr(config, "moe_router_use_sigmoid") else True))
     return "sigmoid" if use_sigmoid else "softmax"
 
 
@@ -85,7 +85,7 @@ class Block(nn.Module):
         super().__init__()
         self.self_attn = HyMT2Attention(config, backend)
 
-        first_k_dense = getattr(config, "first_k_dense_replace", 1)
+        first_k_dense = config.first_k_dense_replace if hasattr(config, "first_k_dense_replace") else 1
         if layer_idx < first_k_dense:
             self.mlp = MLP(config.hidden_size, config.intermediate_size, backend.linear)
         else:
@@ -155,7 +155,7 @@ class HyMT2Model(nn.Module):
         # the on-disk config. Prefer ``expert_hidden_dim`` when present
         # (matches the field name used by the HF reference for the expert MLP
         # hidden dim); fall back to ``moe_intermediate_size`` otherwise.
-        moe_inter = getattr(config, "expert_hidden_dim", None)
+        moe_inter = config.expert_hidden_dim if hasattr(config, "expert_hidden_dim") else None
         if moe_inter is None:
             moe_inter = config.moe_intermediate_size
 
@@ -164,23 +164,25 @@ class HyMT2Model(nn.Module):
             inter_dim=config.intermediate_size,
             moe_inter_dim=moe_inter,
             n_routed_experts=config.num_experts,
-            n_shared_experts=getattr(config, "num_shared_experts", 0),
+            n_shared_experts=(config.num_shared_experts if hasattr(config, "num_shared_experts") else 0),
             n_activated_experts=config.num_experts_per_tok,
             n_expert_groups=0,
             n_limited_groups=0,
             train_gate=True,
             gate_bias_update_factor=0.0,
             score_func=_resolve_score_func(config),
-            route_scale=getattr(config, "router_scaling_factor", 1.0),
+            route_scale=(config.router_scaling_factor if hasattr(config, "router_scaling_factor") else 1.0),
             aux_loss_coeff=0.0,
-            norm_topk_prob=getattr(config, "route_norm", True),
+            norm_topk_prob=(config.route_norm if hasattr(config, "route_norm") else True),
             expert_bias=False,
             router_bias=False,
             expert_activation="swiglu",
             softmax_before_topk=False,
             # Ensures e_score_correction_bias buffer is created so HF
             # checkpoints with ``expert_bias`` load cleanly.
-            force_e_score_correction_bias=getattr(config, "moe_router_enable_expert_bias", False),
+            force_e_score_correction_bias=(
+                config.moe_router_enable_expert_bias if hasattr(config, "moe_router_enable_expert_bias") else False
+            ),
         )
         if moe_overrides:
             moe_defaults.update(moe_overrides)
@@ -195,7 +197,9 @@ class HyMT2Model(nn.Module):
         self.norm = initialize_rms_norm_module(backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps)
 
         self.max_seq_len = config.max_position_embeddings
-        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        self.head_dim = (
+            config.head_dim if hasattr(config, "head_dim") else config.hidden_size // config.num_attention_heads
+        )
 
         base, rope_scaling, _ = get_rope_config(config)
 
@@ -335,7 +339,9 @@ class HyMT2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         # the MoE parallelizer enables via ``MixedPrecisionPolicy``. When that
         # path is not used, ``enable_lm_head_fp32`` in the model config still
         # triggers the in-forward upcast.
-        self._enable_lm_head_fp32 = bool(getattr(config, "enable_lm_head_fp32", False))
+        self._enable_lm_head_fp32 = bool(
+            (config.enable_lm_head_fp32 if hasattr(config, "enable_lm_head_fp32") else False)
+        )
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = HyMT2StateDictAdapter(
                 self.config,
@@ -391,7 +397,7 @@ class HyMT2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         output_hidden_states = (
             output_hidden_states
             if output_hidden_states is not None
-            else getattr(self.config, "output_hidden_states", False)
+            else (self.config.output_hidden_states if hasattr(self.config, "output_hidden_states") else False)
         )
 
         is_thd = "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd"

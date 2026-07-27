@@ -122,7 +122,7 @@ class Qwen3_5MoeStateDictAdapter(StateDictAdapter):
         """Return whether MTP experts are stored as split or grouped HF tensors."""
         layout = self.mtp_expert_hf_layout
         if layout is None:
-            config_layout = getattr(self.config, "mtp_expert_hf_layout", None)
+            config_layout = self.config.mtp_expert_hf_layout if hasattr(self.config, "mtp_expert_hf_layout") else None
             layout = config_layout if isinstance(config_layout, str) else None
 
         if layout is not None:
@@ -134,8 +134,7 @@ class Qwen3_5MoeStateDictAdapter(StateDictAdapter):
             raise ValueError(f"Unsupported MTP expert HF layout: {layout!r}")
 
         model_names = [self.pretrained_model_name_or_path]
-        for attr in ("_name_or_path", "name_or_path"):
-            value = getattr(self.config, attr, None)
+        for value in (self.config._name_or_path, self.config.name_or_path):
             if isinstance(value, str) and value:
                 model_names.append(value)
 

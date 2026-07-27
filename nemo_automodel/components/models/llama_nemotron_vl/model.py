@@ -287,7 +287,9 @@ class LlamaBidirectionalModel(LlamaModel):
             )
 
         # Fallback for transformers < 5.0
-        if getattr(self.config, "_attn_implementation", None) == "flash_attention_2":
+        if (
+            self.config._attn_implementation if hasattr(self.config, "_attn_implementation") else None
+        ) == "flash_attention_2":
             has_masked_tokens = (attention_mask == 0).any()
             return attention_mask if has_masked_tokens else None
 
@@ -413,10 +415,14 @@ class LlamaNemotronVLModel(PreTrainedModel):
         # which lacks set_attn_implementation. In 4.56+, set_attn_implementation
         # handles this automatically using the sub_configs declared on the config class.
         if not hasattr(PreTrainedModel, "set_attn_implementation"):
-            parent_attn = getattr(config, "_attn_implementation", None)
+            parent_attn = config._attn_implementation if hasattr(config, "_attn_implementation") else None
             if parent_attn is not None:
                 for sub_config in (config.vision_config, config.llm_config):
-                    if getattr(sub_config, "_attn_implementation_autoset", False):
+                    if (
+                        sub_config._attn_implementation_autoset
+                        if hasattr(sub_config, "_attn_implementation_autoset")
+                        else False
+                    ):
                         sub_config._attn_implementation = parent_attn
                         sub_config._attn_implementation_autoset = False
 

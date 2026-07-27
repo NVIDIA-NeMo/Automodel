@@ -80,7 +80,7 @@ class Block(nn.Module):
 
         # Thread dtype from config.torch_dtype so the block's own params stay
         # aligned with the rest of the model (fp32 under fp32 master weights).
-        dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+        dtype = get_dtype((config.torch_dtype if hasattr(config, "torch_dtype") else None), torch.bfloat16)
 
         if layer_idx < config.first_k_dense_replace:
             self.mlp = MLP(config.hidden_size, config.intermediate_size, backend.linear, dtype=dtype)
@@ -146,7 +146,7 @@ class BailingMoeV2Model(nn.Module):
         # Resolve model dtype once from config.torch_dtype and thread it
         # explicitly into every sub-module so fp32 master weights work even
         # when construction is not wrapped in local_torch_dtype().
-        model_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+        model_dtype = get_dtype((config.torch_dtype if hasattr(config, "torch_dtype") else None), torch.bfloat16)
 
         # MoE wiring: DeepSeek-V3-style sigmoid + grouped topk + per-expert bias
         # + shared expert.  The framework's ``Gate`` (score_func='sigmoid', n_groups>1,
@@ -192,7 +192,7 @@ class BailingMoeV2Model(nn.Module):
 
         self.max_seq_len = config.max_position_embeddings
         self.head_dim = config.head_dim
-        rope_scaling = getattr(config, "rope_scaling", None) or {}
+        rope_scaling = (config.rope_scaling if hasattr(config, "rope_scaling") else None) or {}
 
         self.rotary_emb = RotaryEmbedding(
             head_dim=self.head_dim,
@@ -202,7 +202,9 @@ class BailingMoeV2Model(nn.Module):
             scaling_factor=rope_scaling.get("factor", 1.0),
             ntk_alpha=rope_scaling.get("beta_slow", 1.0),
             ntk_beta=rope_scaling.get("beta_fast", 32.0),
-            partial_rotary_factor=float(getattr(config, "partial_rotary_factor", 1.0)),
+            partial_rotary_factor=float(
+                (config.partial_rotary_factor if hasattr(config, "partial_rotary_factor") else 1.0)
+            ),
             device=torch.device(f"cuda:{torch.cuda.current_device()}") if torch.cuda.is_available() else None,
         )
 
@@ -308,7 +310,7 @@ class BailingMoeV2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin)
         Dispatch is on num_hidden_layers since Ling-1T (~80 layers) is well
         separated from Ling-flash-2.0 (~32) and Ling-mini-2.0 (~20).
         """
-        if getattr(config, "num_hidden_layers", 0) > 64:
+        if (config.num_hidden_layers if hasattr(config, "num_hidden_layers") else 0) > 64:
             return ModelCapabilities(supports_pp=True, supports_ep=True)
         return ModelCapabilities(supports_ep=True)
 
@@ -350,7 +352,7 @@ class BailingMoeV2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin)
             moe_config=moe_config,
             moe_overrides=moe_overrides,
         )
-        model_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+        model_dtype = get_dtype((config.torch_dtype if hasattr(config, "torch_dtype") else None), torch.bfloat16)
         self.lm_head = initialize_linear_module(
             self.backend.linear, config.hidden_size, config.vocab_size, bias=False, dtype=model_dtype
         )
@@ -412,7 +414,7 @@ class BailingMoeV2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin)
         output_hidden_states = (
             output_hidden_states
             if output_hidden_states is not None
-            else getattr(self.config, "output_hidden_states", False)
+            else (self.config.output_hidden_states if hasattr(self.config, "output_hidden_states") else False)
         )
 
         is_thd = "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd"

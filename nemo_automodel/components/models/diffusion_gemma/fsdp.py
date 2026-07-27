@@ -50,8 +50,6 @@ from __future__ import annotations
 from torch import nn
 from torch.distributed.fsdp import fully_shard
 
-from nemo_automodel.components.models.diffusion_gemma.layers import DiffusionGemmaMoEDecoderLayer
-
 
 def _has_fsdp_state(module: nn.Module) -> bool:
     """Return True if ``module`` has already been wrapped by ``fully_shard``."""
@@ -93,7 +91,7 @@ def fully_shard_diffusion_gemma(module: nn.Module, mesh, mp_policy, offload_poli
     Returns:
         The sharded module.
     """
-    if isinstance(module, DiffusionGemmaMoEDecoderLayer):
+    if hasattr(module, "moe") and hasattr(module.moe, "experts"):
         # Shard the grouped experts on their own so they gather/reshard
         # independently and DCP sees their global expert dimension.  The expert
         # parameters are then excluded from the parent layer's FSDP unit per

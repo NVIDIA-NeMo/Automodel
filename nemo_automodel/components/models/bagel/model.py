@@ -87,13 +87,13 @@ def _prepare_config_for_stage(config: BagelConfig) -> None:
     stage-dependent config mutations that its direct ``from_pretrained`` path
     used to do before ``BagelModel`` is built.
     """
-    stage = getattr(config, "stage", None)
+    stage = config.stage if hasattr(config, "stage") else None
     if stage is not None:
         stage_int = _stage_to_int(stage)
         config.stage = stage_int
         if stage_int == 1:
             config.visual_gen = False
-            if getattr(config.text_config, "layer_module", None) is None:
+            if (config.text_config.layer_module if hasattr(config.text_config, "layer_module") else None) is None:
                 config.text_config.layer_module = "Qwen2DecoderLayer"
         else:
             config.visual_gen = True
@@ -101,7 +101,7 @@ def _prepare_config_for_stage(config: BagelConfig) -> None:
             # keys have slots in the module tree. Some serialized configs may
             # carry ``layer_module=null``.
             config.text_config.layer_module = "Qwen2MoTDecoderLayer"
-    elif getattr(config.text_config, "layer_module", None) is None:
+    elif (config.text_config.layer_module if hasattr(config.text_config, "layer_module") else None) is None:
         config.text_config.layer_module = "Qwen2MoTDecoderLayer" if config.visual_gen else "Qwen2DecoderLayer"
 
     # BAGEL applies a select-layer offset so the effective ViT has
@@ -109,7 +109,9 @@ def _prepare_config_for_stage(config: BagelConfig) -> None:
     # checkpoint carries the offset count, so apply this before constructing
     # the tower. Mark the config to avoid accidental double-application.
     if config.vision_config is not None:
-        if not getattr(config, "_bagel_vit_select_layer_applied", False):
+        if not (
+            config._bagel_vit_select_layer_applied if hasattr(config, "_bagel_vit_select_layer_applied") else False
+        ):
             effective_layers = config.vision_config.num_hidden_layers + 1 + config.vit_select_layer
             if effective_layers != config.vision_config.num_hidden_layers:
                 logger.info(
@@ -264,7 +266,9 @@ class BagelForUnifiedMultimodal(HFCheckpointingMixin, nn.Module):
         # Convenience: cached scalars mirrored from the nested text config.
         self.hidden_size = config.text_config.hidden_size
         self.num_heads = config.text_config.num_attention_heads
-        self.use_moe = "Mo" in getattr(config.text_config, "layer_module", "Qwen2DecoderLayer")
+        self.use_moe = "Mo" in (
+            config.text_config.layer_module if hasattr(config.text_config, "layer_module") else "Qwen2DecoderLayer"
+        )
 
     def initialize_weights(self) -> None:
         """Initialize BAGEL weights after AM materializes a ``from_config`` model.
@@ -303,10 +307,17 @@ class BagelForUnifiedMultimodal(HFCheckpointingMixin, nn.Module):
                 module.reset_parameters()
 
         bagel_only_modules = []
-        for name in ("connector", "vit_pos_embed", "time_embedder", "vae2llm", "llm2vae", "latent_pos_embed"):
-            module = getattr(self.model, name, None)
-            if module is not None:
-                bagel_only_modules.append(module)
+        if self.config.visual_und:
+            bagel_only_modules.extend((self.model.connector, self.model.vit_pos_embed))
+        if self.config.visual_gen:
+            bagel_only_modules.extend(
+                (
+                    self.model.time_embedder,
+                    self.model.vae2llm,
+                    self.model.llm2vae,
+                    self.model.latent_pos_embed,
+                )
+            )
         for module in bagel_only_modules:
             module.apply(_init_bagel_module)
 
@@ -376,7 +387,7 @@ class BagelForUnifiedMultimodal(HFCheckpointingMixin, nn.Module):
     @classmethod
     def supports_config(cls, config: Any) -> bool:
         """Return ``True`` if this custom class supports ``config``."""
-        return getattr(config, "model_type", None) == BagelConfig.model_type
+        return (config.model_type if hasattr(config, "model_type") else None) == BagelConfig.model_type
 
     # ------------------------------------------------------------------
     # Convenience accessors used by the parallelizer / state-dict adapter.

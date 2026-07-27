@@ -40,10 +40,12 @@ class MiniMaxM2Attention(nn.Module):
 
         self.num_heads = config.num_attention_heads
         self.num_kv_heads = config.num_key_value_heads
-        self.head_dim = getattr(config, "head_dim", None) or config.hidden_size // self.num_heads
-        self.use_qk_norm = getattr(config, "use_qk_norm", False)
+        self.head_dim = (
+            config.head_dim if hasattr(config, "head_dim") else None
+        ) or config.hidden_size // self.num_heads
+        self.use_qk_norm = config.use_qk_norm if hasattr(config, "use_qk_norm") else False
 
-        dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+        dtype = get_dtype((config.torch_dtype if hasattr(config, "torch_dtype") else None), torch.bfloat16)
 
         self.q_proj = initialize_linear_module(
             backend.linear,

@@ -402,9 +402,9 @@ class DiffusionGemmaForBlockDiffusion(HFCheckpointingMixin, MoEFSDPSyncMixin, Pr
         self.backend = backend or BackendConfig()
         text_config = config.text_config
         self.text_config = text_config
-        self.canvas_length = int(config.canvas_length or 256)
-        self.self_conditioning = bool(self_conditioning)
-        self.freeze_router = bool(freeze_router)
+        self.canvas_length = int(config.canvas_length)
+        self.self_conditioning = bool(config.self_conditioning if self_conditioning is None else self_conditioning)
+        self.freeze_router = bool(config.freeze_router if freeze_router is None else freeze_router)
         self.final_logit_softcapping = text_config.final_logit_softcapping
         self.vocab_size = text_config.vocab_size
 
@@ -461,7 +461,7 @@ class DiffusionGemmaForBlockDiffusion(HFCheckpointingMixin, MoEFSDPSyncMixin, Pr
             for p in gate.proj.parameters():
                 p.requires_grad_(False)
             # scale is nn.Parameter
-            gate.proj.requires_grad_(False)
+            gate.scale.requires_grad_(False)
 
     @torch.no_grad()
     def initialize_weights(

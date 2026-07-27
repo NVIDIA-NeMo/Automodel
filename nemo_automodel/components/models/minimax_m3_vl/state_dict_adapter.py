@@ -177,7 +177,7 @@ class MiniMaxM3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
 
     @property
     def _mtp_enabled(self) -> bool:
-        return int(getattr(self.config, "num_mtp_modules", 0) or 0) > 0
+        return int((self.config.num_mtp_modules if hasattr(self.config, "num_mtp_modules") else 0) or 0) > 0
 
     def _hf_key_to_native(self, key: str) -> str:
         key = key.replace(".block_sparse_moe.gate.weight", ".mlp.gate.weight")

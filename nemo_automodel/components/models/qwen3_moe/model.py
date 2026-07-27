@@ -50,13 +50,13 @@ class Block(nn.Module):
 
         # Thread dtype from config.torch_dtype so the block's own params stay
         # aligned with the rest of the model (fp32 under fp32 master weights).
-        dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+        dtype = get_dtype((config.torch_dtype if hasattr(config, "torch_dtype") else None), torch.bfloat16)
 
         # Qwen3-MoE sparsifies every decoder_sparse_step layer, unless in mlp_only_layers
         is_moe_layer = (
-            (layer_idx not in getattr(config, "mlp_only_layers", []))
-            and (getattr(config, "num_experts", 0) > 0)
-            and ((layer_idx + 1) % getattr(config, "decoder_sparse_step", 1) == 0)
+            (layer_idx not in (config.mlp_only_layers if hasattr(config, "mlp_only_layers") else []))
+            and ((config.num_experts if hasattr(config, "num_experts") else 0) > 0)
+            and ((layer_idx + 1) % (config.decoder_sparse_step if hasattr(config, "decoder_sparse_step") else 1) == 0)
         )
         if is_moe_layer:
             self.mlp = MoE(moe_config, backend)
@@ -130,7 +130,7 @@ class Qwen3MoeModel(nn.Module):
         # Resolve model dtype once from config.torch_dtype and thread it
         # explicitly into every sub-module so fp32 master weights work even
         # when construction is not wrapped in local_torch_dtype().
-        model_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+        model_dtype = get_dtype((config.torch_dtype if hasattr(config, "torch_dtype") else None), torch.bfloat16)
 
         # Map HF Qwen3 MoE config -> our MoE wrapper
         # Qwen config fields from example config:
@@ -138,18 +138,20 @@ class Qwen3MoeModel(nn.Module):
         moe_defaults = dict(
             dim=config.hidden_size,
             inter_dim=config.intermediate_size,
-            moe_inter_dim=getattr(config, "moe_intermediate_size", config.intermediate_size),
-            n_routed_experts=getattr(config, "num_experts", 0),
+            moe_inter_dim=(
+                config.moe_intermediate_size if hasattr(config, "moe_intermediate_size") else config.intermediate_size
+            ),
+            n_routed_experts=(config.num_experts if hasattr(config, "num_experts") else 0),
             n_shared_experts=0,
-            n_activated_experts=getattr(config, "num_experts_per_tok", 1),
+            n_activated_experts=(config.num_experts_per_tok if hasattr(config, "num_experts_per_tok") else 1),
             n_expert_groups=0,
             n_limited_groups=0,
             train_gate=True,
             gate_bias_update_factor=0.0,
             score_func="softmax",  # Qwen3 uses softmax topk routing
             route_scale=1.0,
-            aux_loss_coeff=getattr(config, "router_aux_loss_coef", 0.0),
-            norm_topk_prob=getattr(config, "norm_topk_prob", False),
+            aux_loss_coeff=(config.router_aux_loss_coef if hasattr(config, "router_aux_loss_coef") else 0.0),
+            norm_topk_prob=(config.norm_topk_prob if hasattr(config, "norm_topk_prob") else False),
             expert_bias=False,
             router_bias=False,
             expert_activation="swiglu",
@@ -170,7 +172,9 @@ class Qwen3MoeModel(nn.Module):
 
         # Rotary embedding cache compatible with our rope_utils functions
         self.max_seq_len = config.max_position_embeddings
-        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        self.head_dim = (
+            config.head_dim if hasattr(config, "head_dim") else config.hidden_size // config.num_attention_heads
+        )
 
         base, rope_scaling, _ = get_rope_config(config)
 
@@ -293,7 +297,7 @@ class Qwen3MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         self.backend = backend or BackendConfig()
         moe_overrides = kwargs.pop("moe_overrides", None)
         self.model = Qwen3MoeModel(config, backend=self.backend, moe_config=moe_config, moe_overrides=moe_overrides)
-        model_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+        model_dtype = get_dtype((config.torch_dtype if hasattr(config, "torch_dtype") else None), torch.bfloat16)
         self.lm_head = initialize_linear_module(
             self.backend.linear, config.hidden_size, config.vocab_size, bias=False, dtype=model_dtype
         )
@@ -328,7 +332,7 @@ class Qwen3MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         output_hidden_states = (
             output_hidden_states
             if output_hidden_states is not None
-            else getattr(self.config, "output_hidden_states", False)
+            else (self.config.output_hidden_states if hasattr(self.config, "output_hidden_states") else False)
         )
 
         is_thd = attn_kwargs.get("qkv_format") == "thd"

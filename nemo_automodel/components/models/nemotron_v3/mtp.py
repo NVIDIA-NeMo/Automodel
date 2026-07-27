@@ -155,7 +155,7 @@ class NemotronV3MTPSublayer(NemotronV3Block):
     def init_weights(self, buffer_device: torch.device | None = None) -> None:
         """Initialize sublayer weights, including fusion modules when present."""
         super().init_weights(buffer_device=buffer_device)
-        init_std = getattr(self.config, "initializer_range", 0.02)
+        init_std = self.config.initializer_range if hasattr(self.config, "initializer_range") else 0.02
         if self.has_fusion:
             self.enorm.reset_parameters()
             self.hnorm.reset_parameters()
@@ -187,10 +187,10 @@ def _resolve_block_types_per_sublayer(config) -> list[str] | None:
     Raises:
         ValueError: If ``mtp_layers_block_type`` contains an unknown block type.
     """
-    pattern = getattr(config, "mtp_hybrid_override_pattern", None)
+    pattern = config.mtp_hybrid_override_pattern if hasattr(config, "mtp_hybrid_override_pattern") else None
     if pattern:
         return parse_mtp_layer_pattern(pattern)
-    block_types = getattr(config, "mtp_layers_block_type", None)
+    block_types = config.mtp_layers_block_type if hasattr(config, "mtp_layers_block_type") else None
     if block_types:
         block_types = list(block_types)
         for bt in block_types:
@@ -297,13 +297,13 @@ def build_mtp_config_from_hf(
         :class:`MTPConfig`.
     """
     if num_nextn_predict_layers is None:
-        num_layers = int(getattr(config, "num_nextn_predict_layers", 0) or 0)
+        num_layers = int((config.num_nextn_predict_layers if hasattr(config, "num_nextn_predict_layers") else 0) or 0)
     else:
         num_layers = int(num_nextn_predict_layers)
 
-    pattern = getattr(config, "mtp_hybrid_override_pattern", None) or ""
+    pattern = (config.mtp_hybrid_override_pattern if hasattr(config, "mtp_hybrid_override_pattern") else None) or ""
     if not pattern:
-        block_types = getattr(config, "mtp_layers_block_type", None)
+        block_types = config.mtp_layers_block_type if hasattr(config, "mtp_layers_block_type") else None
         if block_types:
             # Length-only sentinel; real block-type list flows through
             # build_nemotron_v3_mtp's block_types kwarg.

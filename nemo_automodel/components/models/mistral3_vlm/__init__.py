@@ -23,7 +23,11 @@ logger = logging.getLogger(__name__)
 
 def _install_resolver_hook() -> None:
     """Prepend an FP8-Mistral3 VLM check to _resolve_custom_model_cls_for_config."""
-    if getattr(_mi._resolve_custom_model_cls_for_config, "_mistral3_vlm_hook_installed", False):
+    if (
+        _mi._resolve_custom_model_cls_for_config._mistral3_vlm_hook_installed
+        if hasattr(_mi._resolve_custom_model_cls_for_config, "_mistral3_vlm_hook_installed")
+        else False
+    ):
         return
     _orig_resolve = _mi._resolve_custom_model_cls_for_config
 

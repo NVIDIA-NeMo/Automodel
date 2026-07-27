@@ -56,16 +56,18 @@ class BailingMoeV2Attention(nn.Module):
 
         self.num_heads = config.num_attention_heads
         self.num_kv_heads = config.num_key_value_heads
-        self.head_dim = getattr(config, "head_dim", None) or (config.hidden_size // self.num_heads)
-        self.use_qk_norm = bool(getattr(config, "use_qk_norm", False))
+        self.head_dim = (config.head_dim if hasattr(config, "head_dim") else None) or (
+            config.hidden_size // self.num_heads
+        )
+        self.use_qk_norm = bool((config.use_qk_norm if hasattr(config, "use_qk_norm") else False))
 
-        attention_bias = bool(getattr(config, "use_qkv_bias", False))
-        out_bias = bool(getattr(config, "use_bias", False))
+        attention_bias = bool((config.use_qkv_bias if hasattr(config, "use_qkv_bias") else False))
+        out_bias = bool((config.use_bias if hasattr(config, "use_bias") else False))
 
         # Thread dtype explicitly from config.torch_dtype so fp32 master
         # weights work even when construction is not wrapped in
         # local_torch_dtype().
-        dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+        dtype = get_dtype((config.torch_dtype if hasattr(config, "torch_dtype") else None), torch.bfloat16)
 
         # Separate q / k / v projections.  HF Bailing fuses them into a single
         # ``query_key_value`` linear; the state_dict adapter splits that fused
@@ -164,7 +166,7 @@ class BailingMoeV2Attention(nn.Module):
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
         for linear in (self.q_proj, self.k_proj, self.v_proj, self.o_proj):
             nn.init.trunc_normal_(linear.weight, mean=0.0, std=init_std)
-            if getattr(linear, "bias", None) is not None:
+            if (linear.bias if hasattr(linear, "bias") else None) is not None:
                 nn.init.zeros_(linear.bias)
         if self.use_qk_norm:
             self.q_norm.reset_parameters()

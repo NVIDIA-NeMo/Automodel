@@ -50,7 +50,9 @@ def reject_unsupported_tie_word_embeddings(model_cls: type, config: object) -> N
             :attr:`TieSupport.UNTIED_ONLY` class, or untying is requested on a
             :attr:`TieSupport.TIED_ONLY` class.
     """
-    support = getattr(model_cls, "tie_word_embeddings_support", TieSupport.BOTH)
+    support = (
+        model_cls.tie_word_embeddings_support if hasattr(model_cls, "tie_word_embeddings_support") else TieSupport.BOTH
+    )
     if support is TieSupport.BOTH:
         return
 

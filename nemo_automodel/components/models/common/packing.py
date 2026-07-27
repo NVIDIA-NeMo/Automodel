@@ -134,7 +134,11 @@ def _passthrough_create_causal_mask(
     through.  For other backends, pass through packed masks but delegate
     normal 2D masks to HF.
     """
-    if config is not None and getattr(config, "_attn_implementation", None) in _FLASH_ATTN_IMPLEMENTATIONS:
+    if (
+        config is not None
+        and (config._attn_implementation if hasattr(config, "_attn_implementation") else None)
+        in _FLASH_ATTN_IMPLEMENTATIONS
+    ):
         return attention_mask
 
     if attention_mask is not None:
@@ -191,10 +195,16 @@ def _patch_preprocess_mask_arguments_for_packing() -> None:
             "indexed mask values would enable cross-document attention."
         ) from exc
 
-    if getattr(masking_utils, "_nemo_automodel_packing_preprocess_patched", False):
+    if (
+        masking_utils._nemo_automodel_packing_preprocess_patched
+        if hasattr(masking_utils, "_nemo_automodel_packing_preprocess_patched")
+        else False
+    ):
         return
 
-    original_preprocess = getattr(masking_utils, "_preprocess_mask_arguments", None)
+    original_preprocess = (
+        masking_utils._preprocess_mask_arguments if hasattr(masking_utils, "_preprocess_mask_arguments") else None
+    )
     if original_preprocess is None:
         raise RuntimeError(
             "Cannot enable FA2 neat packing because transformers.masking_utils has no "
@@ -251,8 +261,8 @@ def _patch_preprocess_mask_arguments_for_packing() -> None:
         """
         config = kwargs.get("config", args[0] if len(args) > 0 else None)
         attention_mask = kwargs.get("attention_mask", args[2] if len(args) > 2 else None)
-        attn_impl = getattr(config, "_attn_implementation", None) or getattr(
-            config, "_attn_implementation_internal", None
+        attn_impl = (config._attn_implementation if hasattr(config, "_attn_implementation") else None) or (
+            config._attn_implementation_internal if hasattr(config, "_attn_implementation_internal") else None
         )
         if attn_impl in _FLASH_ATTN_IMPLEMENTATIONS and is_indexed_packed_mask(attention_mask):
             return (

@@ -102,7 +102,15 @@ _MISTRAL3P5_128B_NUM_HIDDEN_LAYERS = 88
 def _config_attr(config: Any | None, attr: str) -> Any:
     if isinstance(config, dict):
         return config.get(attr)
-    return getattr(config, attr, None)
+    if config is None:
+        return None
+    if attr == "text_config":
+        return config.text_config if hasattr(config, "text_config") else None
+    if attr == "model_type":
+        return config.model_type if hasattr(config, "model_type") else None
+    if attr == "num_hidden_layers":
+        return config.num_hidden_layers if hasattr(config, "num_hidden_layers") else None
+    raise ValueError(f"Unsupported config attribute: {attr}")
 
 
 def _is_mistral3p5_128b_config(config: Any | None) -> bool:

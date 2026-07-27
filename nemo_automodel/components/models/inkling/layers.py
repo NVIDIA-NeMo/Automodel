@@ -162,7 +162,7 @@ def build_inkling_moe_config(text_config, backend: BackendConfig) -> MoEConfig:
     Returns:
         MoEConfig: Configuration for the routed grouped experts.
     """
-    model_dtype = get_dtype(getattr(text_config, "torch_dtype", None), torch.bfloat16)
+    model_dtype = get_dtype((text_config.torch_dtype if hasattr(text_config, "torch_dtype") else None), torch.bfloat16)
     return MoEConfig(
         dim=text_config.hidden_size,
         inter_dim=text_config.intermediate_size,
@@ -218,7 +218,7 @@ class InklingGate(nn.Module):
         self.top_k = config.num_experts_per_tok
         self.gate_precision = gate_precision
 
-        model_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+        model_dtype = get_dtype((config.torch_dtype if hasattr(config, "torch_dtype") else None), torch.bfloat16)
         self.weight = nn.Parameter(torch.empty(self.n_total_experts, config.hidden_size, dtype=model_dtype))
         self.global_scale = nn.Parameter(torch.ones(1, dtype=model_dtype))
         # Keep the trained correction bias in a callable fp32 FSDP unit. Calling
@@ -295,7 +295,7 @@ class InklingDenseMLP(nn.Module):
 
     def __init__(self, config) -> None:
         super().__init__()
-        model_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+        model_dtype = get_dtype((config.torch_dtype if hasattr(config, "torch_dtype") else None), torch.bfloat16)
         self.gate_up_proj = nn.Parameter(
             torch.empty(config.hidden_size, 2 * config.intermediate_size, dtype=model_dtype)
         )
@@ -337,7 +337,7 @@ class InklingSharedExperts(nn.Module):
         super().__init__()
         self.n_shared_experts = config.n_shared_experts
         intermediate_dim = config.moe_intermediate_size
-        model_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+        model_dtype = get_dtype((config.torch_dtype if hasattr(config, "torch_dtype") else None), torch.bfloat16)
         self.gate_up_proj = nn.Parameter(
             torch.empty(config.n_shared_experts, config.hidden_size, 2 * intermediate_dim, dtype=model_dtype)
         )

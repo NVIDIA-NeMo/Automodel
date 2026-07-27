@@ -1213,8 +1213,10 @@ class DeepseekV4Attention(nn.Module):
         self.num_key_value_groups = config.num_attention_heads
         self.head_dim = config.head_dim
         self.rope_head_dim = config.qk_rope_head_dim
-        self.sliding_window = int(getattr(config, "sliding_window", 128) or 128)
-        self.attention_dropout = float(getattr(config, "attention_dropout", 0.0) or 0.0)
+        self.sliding_window = int((config.sliding_window if hasattr(config, "sliding_window") else 128) or 128)
+        self.attention_dropout = float(
+            (config.attention_dropout if hasattr(config, "attention_dropout") else 0.0) or 0.0
+        )
         self.is_causal = True
         self.scaling = self.head_dim**-0.5
 
@@ -1261,7 +1263,7 @@ class DeepseekV4Attention(nn.Module):
         position_ids: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        cp_group = kwargs.get("_dsv4_cp_group") or getattr(self, "_cp_group", None)
+        cp_group = kwargs.get("_dsv4_cp_group") or (self._cp_group if hasattr(self, "_cp_group") else None)
         cp_active = dsv4_cp_enabled(cp_group)
         packed_seq_ids = kwargs.get("packed_seq_ids")
         if packed_seq_ids is not None and packed_seq_ids.dim() == 1:

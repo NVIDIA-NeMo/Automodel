@@ -122,7 +122,9 @@ class InklingTextModel(HFInklingTextModel):
         elif input_ids is not None:
             raise ValueError("You must provide exactly one of input_ids or inputs_embeds")
 
-        use_cache = getattr(self.config, "use_cache", False) if use_cache is None else use_cache
+        use_cache = (
+            (self.config.use_cache if hasattr(self.config, "use_cache") else False) if use_cache is None else use_cache
+        )
         if use_cache and past_key_values is None:
             past_key_values = DynamicCache(config=self.config)
 
@@ -224,7 +226,7 @@ class InklingForConditionalGeneration(HFCheckpointingMixin, HFInklingForConditio
 
         # Propagate the requested top-level dtype to the nested sub-configs so the
         # HF towers and our MoE parameters are constructed in a consistent dtype.
-        top_dtype = getattr(config, "torch_dtype", None)
+        top_dtype = config.torch_dtype if hasattr(config, "torch_dtype") else None
         if top_dtype is not None:
             for sub_cfg in vars(config).values():
                 if sub_cfg is not config and hasattr(sub_cfg, "torch_dtype"):
@@ -256,7 +258,9 @@ class InklingForConditionalGeneration(HFCheckpointingMixin, HFInklingForConditio
             elif isinstance(layer.mlp, HFInklingMLP):
                 layer.mlp = InklingDenseMLP(text_config)
 
-        model_dtype = get_dtype(getattr(text_config, "torch_dtype", None), torch.bfloat16)
+        model_dtype = get_dtype(
+            (text_config.torch_dtype if hasattr(text_config, "torch_dtype") else None), torch.bfloat16
+        )
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = InklingStateDictAdapter(
                 text_config,
@@ -346,8 +350,8 @@ class InklingForConditionalGeneration(HFCheckpointingMixin, HFInklingForConditio
 
         is_first_stage = language_model.embed_tokens is not None
         if pixel_values is None and is_first_stage:
-            chunks = getattr(self, "_vlm_pixel_values_chunks", None)
-            chunk_idx = getattr(self, "_vlm_chunk_idx", 0)
+            chunks = self._vlm_pixel_values_chunks if hasattr(self, "_vlm_pixel_values_chunks") else None
+            chunk_idx = self._vlm_chunk_idx if hasattr(self, "_vlm_chunk_idx") else 0
             if chunks is not None and chunk_idx is not None and chunk_idx < len(chunks):
                 pixel_values = chunks[chunk_idx]
                 self._vlm_chunk_idx = chunk_idx + 1

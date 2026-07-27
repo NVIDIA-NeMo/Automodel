@@ -46,9 +46,9 @@ class HYV3Attention(nn.Module):
 
         self.num_heads = config.num_attention_heads
         self.num_kv_heads = config.num_key_value_heads
-        self.head_dim = getattr(config, "head_dim", config.hidden_size // self.num_heads)
+        self.head_dim = config.head_dim if hasattr(config, "head_dim") else config.hidden_size // self.num_heads
 
-        attention_bias = getattr(config, "attention_bias", False)
+        attention_bias = config.attention_bias if hasattr(config, "attention_bias") else False
 
         self.q_proj = initialize_linear_module(
             backend.linear, config.hidden_size, self.num_heads * self.head_dim, attention_bias
