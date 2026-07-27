@@ -1947,6 +1947,24 @@ def _make_model_for_ac(
     return model
 
 
+def _make_root_mesh_for_ac(pp_size: int = 1):
+    """Build a stand-in FSDP2 root device mesh with TP=1 and the requested PP size.
+
+    Mirrors the ``(pp, dp_replicate, dp_shard, cp, tp)`` shape that
+    ``_create_fsdp2_device_mesh`` produces, so ``parallelize`` can read the ``pp``
+    axis off the root mesh without a real process group.
+    """
+    mesh = MagicMock(spec=DeviceMesh)
+    mesh.mesh_dim_names = ("pp", "dp_replicate", "dp_shard", "cp", "tp")
+    submeshes = {}
+    for name, size in (("pp", pp_size), ("tp", 1)):
+        submesh = MagicMock()
+        submesh.size.return_value = size
+        submeshes[name] = submesh
+    mesh.__getitem__ = lambda self_, key: submeshes.get(key, submeshes["tp"])
+    return mesh
+
+
 class TestActivationCheckpointingKVSharing:
     """Tests for the KV-sharing–aware activation-checkpointing guards
     in ``DefaultParallelizationStrategy.parallelize``.
@@ -2006,18 +2024,15 @@ class TestActivationCheckpointingKVSharing:
         activation_checkpointing=True,
         activation_checkpointing_scope="all",
         enable_compile=False,
+        pp_size=1,
     ):
         """Invoke the strategy under test and return the model."""
         from nemo_automodel.components.distributed.parallelizer import DefaultParallelizationStrategy
 
         strategy = DefaultParallelizationStrategy()
-        mesh = MagicMock(spec=DeviceMesh)
-        tp_mesh = MagicMock()
-        tp_mesh.size.return_value = 1  # no TP
-        mesh.__getitem__ = lambda self_, key: tp_mesh
         return strategy.parallelize(
             model=model,
-            device_mesh=mesh,
+            device_mesh=_make_root_mesh_for_ac(pp_size=pp_size),
             activation_checkpointing=activation_checkpointing,
             activation_checkpointing_scope=activation_checkpointing_scope,
             enable_compile=enable_compile,
@@ -2468,6 +2483,20 @@ class TestActivationCheckpointingKVSharing:
             gradient_checkpointing_kwargs={"use_reentrant": True}
         )
 
+    def test_hf_native_grad_ckpt_is_non_reentrant_under_pp(self, monkeypatch):
+        """Pipeline parallelism must drop the reentrant checkpoint implementation.
+
+        ``torch.distributed.pipelining`` computes stage input gradients with
+        ``torch.autograd.grad()``, which reentrant ``torch.utils.checkpoint``
+        rejects outright.
+        """
+        model = self._setup_hf_native_model(monkeypatch, num_kv_shared_layers=0)
+        self._run_parallelize(model, pp_size=2)
+
+        model.gradient_checkpointing_enable.assert_called_once_with(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
+
     def test_hf_native_grad_ckpt_skips_frozen_layers(self, monkeypatch):
         """Frozen layers force scoped submodule wrapping instead of whole-model HF native GC."""
         model = self._setup_hf_native_model(monkeypatch, num_kv_shared_layers=0)
@@ -2478,6 +2507,138 @@ class TestActivationCheckpointingKVSharing:
         model.gradient_checkpointing_enable.assert_not_called()
         assert not isinstance(model.model.layers[0].mlp, self._Wrapped)
         assert isinstance(model.model.layers[1].mlp, self._Wrapped)
+
+
+class TestHFNativeGradientCheckpointingAutograd:
+    """Real forward/backward coverage for the HF-native gradient-checkpointing path.
+
+    ``torch.distributed.pipelining`` obtains a stage's input gradients through
+    ``torch.autograd.grad()`` (``_backward._autograd_grad_for_inputs``). Reentrant
+    ``torch.utils.checkpoint`` refuses that call, so with PP enabled every stage
+    after the first raised ``RuntimeError: When use_reentrant=True,
+    torch.utils.checkpoint is incompatible with .grad() or passing an ``inputs``
+    parameter to .backward()``. These tests drive the real HF model and real
+    autograd instead of asserting on ``gradient_checkpointing_enable`` kwargs.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _stub_sharding(self, monkeypatch):
+        """Neutralize FSDP2 sharding so ``parallelize`` runs single-process on CPU."""
+        monkeypatch.setattr(parallelizer, "fully_shard", lambda model, **kw: model)
+        monkeypatch.setattr(parallelizer, "apply_fsdp2_sharding_recursively", lambda *a, **kw: None)
+        monkeypatch.setattr(parallelizer, "get_fsdp_dp_mesh", lambda mesh, *a, **kw: MagicMock())
+
+    @staticmethod
+    def _tiny_causal_lm():
+        """Build a 2-layer HF Llama whose decoder layers take the HF-native GC path."""
+        from transformers import LlamaConfig, LlamaForCausalLM
+
+        config = LlamaConfig(
+            vocab_size=32,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            max_position_embeddings=16,
+            attention_dropout=0.0,
+        )
+        torch.manual_seed(0)
+        return LlamaForCausalLM(config).to(torch.float32).train()
+
+    @staticmethod
+    def _stage_input(model):
+        """Return stage activations of shape [batch, sequence, hidden] requiring grad."""
+        torch.manual_seed(1)
+        return torch.randn(2, 4, model.config.hidden_size, dtype=torch.float32, requires_grad=True)
+
+    @staticmethod
+    def _grad_wrt_stage_input(model, inputs_embeds):
+        """Run the PP non-first-stage backward and return d(sum(logits))/d(inputs_embeds).
+
+        Args:
+            model: Causal LM consuming ``inputs_embeds``.
+            inputs_embeds: Tensor of shape [batch, sequence, hidden] with
+                ``requires_grad=True``, standing in for activations received from
+                the previous pipeline stage.
+
+        Returns:
+            Tensor of shape [batch, sequence, hidden] holding the input gradient.
+        """
+        logits = model(inputs_embeds=inputs_embeds).logits
+        (grad,) = torch.autograd.grad(logits.sum(), inputs_embeds)
+        return grad
+
+    def _reference_input_grad(self):
+        """Input gradient of the same model without any activation checkpointing."""
+        model = self._tiny_causal_lm()
+        inputs_embeds = self._stage_input(model)
+        return self._grad_wrt_stage_input(model, inputs_embeds)
+
+    def test_pp_stage_input_grad_matches_uncheckpointed_reference(self):
+        """With PP on, autograd.grad through the checkpointed stage works and is correct."""
+        reference = self._reference_input_grad()
+
+        model = self._tiny_causal_lm()
+        forward_entries = _count_layer_forward_entries(model)
+        parallelizer.DefaultParallelizationStrategy().parallelize(
+            model=model,
+            device_mesh=_make_root_mesh_for_ac(pp_size=2),
+            activation_checkpointing=True,
+        )
+        assert model.is_gradient_checkpointing, "HF-native gradient checkpointing was not enabled"
+
+        grad = self._grad_wrt_stage_input(model, self._stage_input(model))
+
+        # Each decoder layer is entered once in forward and once more when the
+        # backward pass recomputes it -- proof the gradient did flow through a
+        # checkpoint rather than a silently disabled one.
+        assert forward_entries["count"] == 2 * model.config.num_hidden_layers
+        assert torch.isfinite(grad).all()
+        torch.testing.assert_close(grad, reference)
+
+    def test_without_pp_backward_still_matches_uncheckpointed_reference(self):
+        """The default (reentrant) path keeps working when PP is disabled."""
+        reference = self._reference_input_grad()
+
+        model = self._tiny_causal_lm()
+        parallelizer.DefaultParallelizationStrategy().parallelize(
+            model=model,
+            device_mesh=_make_root_mesh_for_ac(pp_size=1),
+            activation_checkpointing=True,
+        )
+        assert model.is_gradient_checkpointing
+
+        inputs_embeds = self._stage_input(model)
+        # Reentrant checkpointing only supports plain ``.backward()``, so accumulate
+        # into ``.grad`` rather than calling ``torch.autograd.grad``.
+        model(inputs_embeds=inputs_embeds).logits.sum().backward()
+
+        assert torch.isfinite(inputs_embeds.grad).all()
+        torch.testing.assert_close(inputs_embeds.grad, reference)
+
+
+def _count_layer_forward_entries(model):
+    """Count decoder-layer forward entries (forward pass plus AC recompute).
+
+    Uses a forward *pre*-hook: checkpoint recomputation stops early once the saved
+    tensors are repopulated, so the layer's forward often never returns and a
+    post-forward hook would miss the recompute entirely.
+
+    Args:
+        model: HF causal LM whose decoder layers live under ``model.model.layers``.
+
+    Returns:
+        A dict with a live ``"count"`` entry incremented on every forward entry.
+    """
+    counter = {"count": 0}
+
+    def _pre_hook(_module, _args):
+        counter["count"] += 1
+
+    for layer in model.model.layers:
+        layer.register_forward_pre_hook(_pre_hook)
+    return counter
 
 
 class TestSelectiveCheckpointNumerics:

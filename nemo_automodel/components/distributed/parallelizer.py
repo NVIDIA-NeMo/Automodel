@@ -312,7 +312,10 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
         # Set FSDP sharding mesh to context parallel mesh if CP > 1, else default to the data parallel mesh.
         # if dp_replicate_size > 1, use HSDP, else use FSDP
         dp_mesh = get_fsdp_dp_mesh(device_mesh, dp_replicate_mesh_name, dp_shard_cp_mesh_name)
-        pp_enabled = "pp" in dp_mesh.mesh_dim_names and dp_mesh["pp"].size() > 1
+        # Read the PP axis off the root mesh: ``dp_mesh`` is a DP-only submesh
+        # (``dp_shard``, ``dp_shard_cp``, or ``(dp_replicate, dp_shard)``) and never
+        # carries a ``pp`` dimension.
+        pp_enabled = "pp" in device_mesh.mesh_dim_names and device_mesh["pp"].size() > 1
         if pp_enabled and reshard_after_forward is True:
             logger.warning(
                 "reshard_after_forward=True overrides the pipeline-parallel default of keeping layer weights "
@@ -411,7 +414,14 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
                     ac_scopes,
                     enable_compile=enable_compile,
                 ):
-                    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": True})
+                    # Reentrant checkpointing rejects any backward that goes through
+                    # ``torch.autograd.grad()``, which is exactly how
+                    # ``torch.distributed.pipelining`` computes stage input grads
+                    # (``_autograd_grad_for_inputs``). Every PP stage after the first
+                    # would raise "When use_reentrant=True, torch.utils.checkpoint is
+                    # incompatible with .grad()", so PP must use the non-reentrant
+                    # implementation. Without PP, keep the cheaper reentrant path.
+                    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": not pp_enabled})
                 else:
                     apply_submodule_checkpointing(ac_layers, _has_kv_sharing)
 

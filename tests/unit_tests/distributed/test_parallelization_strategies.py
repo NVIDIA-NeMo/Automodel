@@ -421,13 +421,14 @@ class TestDefaultParallelizationStrategy:
         self, strategy, mock_device_mesh, mock_distributed_env, monkeypatch, caplog
     ):
         """Explicit layer resharding overrides the PP default and should warn."""
-        mesh, _, _, _ = mock_device_mesh
+        mesh, _, dp_shard_mesh, tp_mesh = mock_device_mesh
+        # The ``pp`` axis lives on the root mesh; the DP submesh returned by
+        # ``get_fsdp_dp_mesh`` never carries it.
         pp_mesh = MagicMock()
         pp_mesh.size.return_value = 2
-        dp_mesh = MagicMock()
-        dp_mesh.mesh_dim_names = ("pp",)
-        dp_mesh.__getitem__.side_effect = lambda key: {"pp": pp_mesh}[key]
-        monkeypatch.setattr(parallelizer_mod, "get_fsdp_dp_mesh", lambda *args, **kwargs: dp_mesh)
+        mesh.mesh_dim_names = ("pp", "dp_replicate", "dp_shard_cp", "tp")
+        mesh.__getitem__.side_effect = lambda key: {"pp": pp_mesh, "tp": tp_mesh}[key]
+        monkeypatch.setattr(parallelizer_mod, "get_fsdp_dp_mesh", lambda *args, **kwargs: dp_shard_mesh)
 
         with caplog.at_level(logging.WARNING, logger=parallelizer_mod.__name__):
             strategy.parallelize(
