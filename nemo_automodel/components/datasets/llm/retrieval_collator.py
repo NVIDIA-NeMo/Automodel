@@ -205,10 +205,10 @@ class BiEncoderCollator:
         # Per-passage corpus doc ids (positive + negatives, flattened in d_input_ids
         # order) for distributed in-batch same-doc negative masking. Top-level key
         # so it bypasses the q_/d_ unpacking in the trainer.
-        if batch and batch[0].get("doc_id") is not None:
-            doc_id_flat: List[str] = []
-            for x in batch:
-                doc_id_flat.extend(x["doc_id"])
+        doc_id_groups = [x.get("doc_id") for x in batch]
+        # Inline records may not provide IDs; incomplete IDs are unsafe for same-doc masking.
+        if doc_id_groups and all(doc_ids and all(doc_ids) for doc_ids in doc_id_groups):
+            doc_id_flat = [doc_id for doc_ids in doc_id_groups for doc_id in doc_ids]
             merged_batch_dict["passage_doc_ids"] = torch.tensor(
                 [_doc_id_str_to_int64(s) for s in doc_id_flat],
                 dtype=torch.long,

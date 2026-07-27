@@ -59,6 +59,7 @@ from nemo_automodel.components.models.bagel.hf_backbone_loader import (  # noqa:
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG  # noqa: E402
 from nemo_automodel.components.training.step_scheduler import StepScheduler  # noqa: E402
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config  # noqa: E402
+from nemo_automodel.recipes._typed_config import RecipeConfig  # noqa: E402
 from nemo_automodel.recipes.base_recipe import BaseRecipe  # noqa: E402
 
 try:
@@ -562,7 +563,11 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
             self.base_lr = float(optimizer.param_groups[0]["lr"])
 
         # -- dataset + dataloader ----------------------------------------
-        dataloader_config = self.cfg.bagel_dataloader
+        # The recipe holds a raw ConfigNode; ``bagel_dataloader`` is a typed
+        # RecipeConfig property, so resolve it through a RecipeConfig view here
+        # (rather than wrapping self.cfg, which would break the ConfigNode-style
+        # optimizer/wandb access used elsewhere in this recipe).
+        dataloader_config = RecipeConfig(self.cfg).bagel_dataloader
         if dataloader_config is None:
             raise ValueError("BAGEL training requires dataset and dataloader configs")
         dataloader_build = dataloader_config.build(
