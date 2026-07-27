@@ -585,6 +585,8 @@ class LRSchedulerConfig:
         self,
         optimizer: list[torch.optim.Optimizer] | torch.optim.Optimizer,
         step_scheduler: StepScheduler,
+        *,
+        total_steps: int | None = None,
     ) -> list[OptimizerParamScheduler]:
         """Build one LR scheduler per optimizer.
 
@@ -594,23 +596,36 @@ class LRSchedulerConfig:
         Args:
             optimizer: The optimizer(s) to schedule.
             step_scheduler: The step scheduler, used to derive total steps.
+            total_steps: Optional optimizer-step budget. Use this when the
+                optimizer updates less frequently than the outer training loop.
 
         Returns:
             One :class:`OptimizerParamScheduler` per optimizer.
         """
-        # ``epoch_len`` is already expressed in optimizer steps (StepScheduler computes it as
-        # ``ceil(len(dataloader) / grad_acc_steps)``) and is ``None`` for iterable/streaming
-        # dataloaders, where ``len()`` is undefined.  Never call ``len(dataloader)`` here.
-        if step_scheduler.epoch_len is not None:
-            total_steps = step_scheduler.num_epochs * step_scheduler.epoch_len
-            if step_scheduler.max_steps is not None:
-                total_steps = min(total_steps, step_scheduler.max_steps)
-        elif step_scheduler.max_steps is not None:
-            total_steps = step_scheduler.max_steps
-        else:
+        # The removed diffusion-only LR builder accepted a float in (0, 1) as a
+        # fraction of total steps; here it would silently disable warmup (warmup
+        # ends before step 1), so reject it explicitly.
+        if self.lr_warmup_steps is not None and 0 < self.lr_warmup_steps < 1:
             raise ValueError(
-                "Cannot infer total steps for an iterable/streaming dataset; set step_scheduler.max_steps."
+                f"lr_warmup_steps must be an integer step count, got {self.lr_warmup_steps!r}. "
+                "Fractional warmup is not supported; set the number of warmup steps directly."
             )
+        if total_steps is None:
+            # ``epoch_len`` is already expressed in optimizer steps (StepScheduler computes it as
+            # ``ceil(len(dataloader) / grad_acc_steps)``) and is ``None`` for iterable/streaming
+            # dataloaders, where ``len()`` is undefined.  Never call ``len(dataloader)`` here.
+            if step_scheduler.epoch_len is not None:
+                total_steps = step_scheduler.num_epochs * step_scheduler.epoch_len
+                if step_scheduler.max_steps is not None:
+                    total_steps = min(total_steps, step_scheduler.max_steps)
+            elif step_scheduler.max_steps is not None:
+                total_steps = step_scheduler.max_steps
+            else:
+                raise ValueError(
+                    "Cannot infer total steps for an iterable/streaming dataset; set step_scheduler.max_steps."
+                )
+        if total_steps <= 0:
+            raise ValueError(f"total_steps must be greater than 0, got {total_steps}")
         lr_decay_steps = self.lr_decay_steps if self.lr_decay_steps is not None else total_steps
         wd_incr_steps = self.wd_incr_steps if self.wd_incr_steps is not None else total_steps
         if isinstance(optimizer, torch.optim.Optimizer):

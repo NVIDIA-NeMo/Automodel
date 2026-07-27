@@ -26,7 +26,7 @@ import yaml
 
 from nemo_automodel.recipes.base_recipe import is_distributed_stateful
 from nemo_automodel.recipes.diffusion import dmd2 as dmd2_module
-from nemo_automodel.recipes.diffusion.dmd2 import DMD2Objective, _load_negative_prompt_embedding
+from nemo_automodel.recipes.diffusion.dmd2 import _load_negative_prompt_embedding, _QwenImageDMD2Objective
 from nemo_automodel.recipes.diffusion.train import TrainDiffusionRecipe
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -41,7 +41,7 @@ class _ObjectiveConfig(dict):
     __getattr__ = dict.__getitem__
 
 
-def _objective(*, student_update_freq: int = 5) -> DMD2Objective:
+def _objective(*, student_update_freq: int = 5) -> _QwenImageDMD2Objective:
     config = SimpleNamespace(
         student_update_freq=student_update_freq,
         guidance_scale=None,
@@ -50,7 +50,7 @@ def _objective(*, student_update_freq: int = 5) -> DMD2Objective:
     )
     fastgen = SimpleNamespace(DMDConfig=Mock(return_value=config))
     with patch.object(dmd2_module, "_require_qwen_fastgen", return_value=(fastgen, None, None)):
-        return DMD2Objective(_ObjectiveConfig())
+        return _QwenImageDMD2Objective(_ObjectiveConfig())
 
 
 def _linear() -> torch.nn.Linear:
@@ -89,6 +89,7 @@ def _training_fixture():
     objective.modelopt_pipeline = modelopt_pipeline
     objective.teacher = torch.nn.Identity()
     objective.fake_score = fake_score
+    objective.student_optimizer = student_optimizer
     objective.fake_score_optimizer = fake_score_optimizer
     objective.discriminator = discriminator
     objective.discriminator_optimizer = discriminator_optimizer
@@ -98,7 +99,7 @@ def _training_fixture():
     scheduler.step = lambda increment: setattr(scheduler, "num_steps", scheduler.num_steps + increment)
     recipe = SimpleNamespace(
         model=student,
-        optimizer=student_optimizer,
+        optimizer=[student_optimizer],
         lr_scheduler=[scheduler],
         device=torch.device("cpu"),
         compute_dtype=torch.float32,
@@ -109,6 +110,7 @@ def _training_fixture():
     micro_batch = {
         "image_latents": torch.zeros(1, 1, 1, 1),
         "text_embeddings": torch.zeros(1, 1, 1),
+        "text_embeddings_mask": torch.ones(1, 1, dtype=torch.bool),
     }
     return objective, recipe, [micro_batch, micro_batch], modelopt_pipeline, scheduler
 
@@ -126,14 +128,47 @@ def test_load_negative_prompt_embedding_accepts_only_canonical_tensor(tmp_path):
         _load_negative_prompt_embedding(str(path))
 
 
+def test_prepare_batch_preserves_positive_lengths_and_builds_negative_mask():
+    objective = _objective()
+    objective.negative_prompt_embedding = torch.zeros(3, 4)
+    recipe = SimpleNamespace(device=torch.device("cpu"), compute_dtype=torch.float32)
+    batch = {
+        "image_latents": torch.zeros(2, 1, 2, 2),
+        "text_embeddings": torch.zeros(2, 5, 4),
+        "text_embeddings_mask": torch.tensor([[1, 1, 1, 0, 0], [1, 1, 1, 1, 1]]),
+    }
+
+    _, _, text_embeddings, text_mask, negative_embeddings, negative_mask = objective._prepare_batch(recipe, batch)
+
+    assert text_embeddings.shape == (2, 5, 4)
+    torch.testing.assert_close(text_mask, batch["text_embeddings_mask"])
+    assert negative_embeddings.shape == (2, 3, 4)
+    torch.testing.assert_close(negative_mask, torch.ones(2, 3, dtype=torch.long))
+
+
+def test_configure_rejects_flash_attention_with_required_text_mask():
+    objective = _objective()
+    values = {
+        "model.mode": "finetune",
+        "fsdp": {},
+        "model.attention_backend": "flash",
+    }
+    cfg = Mock()
+    cfg.get.side_effect = lambda key, default=None: values.get(key, default)
+    cfg.optimizer = object()
+
+    with pytest.raises(ValueError, match="flash-attn 2"):
+        objective.configure(SimpleNamespace(cfg=cfg))
+
+
 def test_objective_is_tracked_as_distributed_checkpoint_state():
     objective = _objective()
     recipe = TrainDiffusionRecipe.__new__(TrainDiffusionRecipe)
 
-    recipe.dmd2 = objective
+    recipe._dmd2 = objective
 
     assert is_distributed_stateful(objective)
-    assert "dmd2" in recipe.__dict__["__state_tracked"]
+    assert "_dmd2" in recipe.__dict__["__state_tracked"]
 
 
 def test_objective_checkpoint_contains_all_trainable_auxiliary_state():
@@ -206,17 +241,37 @@ def test_train_batch_group_alternates_modelopt_updates_and_active_optimizers():
     torch.testing.assert_close(objective.discriminator.weight, torch.tensor([[0.8]]))
 
 
+def test_student_scheduler_uses_student_update_budget():
+    objective = _objective(student_update_freq=5)
+    lr_scheduler_config = Mock()
+    expected = [object()]
+    lr_scheduler_config.build.return_value = expected
+    optimizer = [Mock()]
+    step_scheduler = SimpleNamespace(epoch_len=10, num_epochs=3, max_steps=22)
+    recipe = SimpleNamespace(
+        cfg=SimpleNamespace(lr_scheduler=lr_scheduler_config),
+        optimizer=optimizer,
+        step_scheduler=step_scheduler,
+    )
+
+    result = objective.build_lr_scheduler(recipe)
+
+    assert result is expected
+    lr_scheduler_config.build.assert_called_once_with(optimizer, step_scheduler, total_steps=5)
+
+
 def test_native_trainer_delegates_dmd2():
     recipe = TrainDiffusionRecipe.__new__(TrainDiffusionRecipe)
     expected = (1.0, 2.0)
     train_batch_group = Mock(return_value=expected)
-    recipe.dmd2 = SimpleNamespace(train_batch_group=train_batch_group)
+    recipe._dmd2 = SimpleNamespace(train_batch_group=train_batch_group)
+    recipe.step_scheduler = SimpleNamespace(step=7)
     batch_group = [{"image_latents": torch.zeros(1)}]
 
-    result = recipe._train_batch_group(batch_group, global_step=7)
+    result = recipe._train_batch_group(batch_group, global_step=99)
 
     assert result is expected
-    train_batch_group.assert_called_once_with(recipe, batch_group, 7)
+    train_batch_group.assert_called_once_with(recipe, batch_group, global_step=7)
 
 
 def test_qwen_image_dmd2_yaml_uses_the_native_trainer_contract():
@@ -224,6 +279,7 @@ def test_qwen_image_dmd2_yaml_uses_the_native_trainer_contract():
 
     assert "recipe" not in config
     assert config["model"]["pretrained_model_name_or_path"] == "Qwen/Qwen-Image"
+    assert "attention_backend" not in config["model"]
 
     dmd2 = config["dmd2"]
     modelopt_config = dmd2["modelopt_config"]
@@ -240,6 +296,10 @@ def test_qwen_image_dmd2_yaml_uses_the_native_trainer_contract():
     assert "pipeline" not in dmd2
     assert "feature_capture_fn" not in dmd2
     assert config["fsdp"]["activation_checkpointing"] == "selective"
+    assert "optim" not in config
+    assert config["optimizer"]["_target_"] == "torch.optim.AdamW"
+    assert config["optimizer"]["lr"] == 2.0e-6
+    assert config["step_scheduler"]["log_remote_every_steps"] == 1
 
     dataloader = config["data"]["dataloader"]
     assert dataloader["_target_"].endswith("build_text_to_image_multiresolution_dataloader")

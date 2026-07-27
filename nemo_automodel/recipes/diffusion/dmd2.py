@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Model Optimizer DMD2 objective for the native diffusion trainer."""
+"""Model Optimizer Qwen-Image DMD2 objective for the native diffusion trainer."""
 
 from __future__ import annotations
 
@@ -24,7 +24,6 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
-from nemo_automodel._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, OptimizerState
 from nemo_automodel.components.training.utils import (
     clip_grad_norm,
@@ -32,10 +31,8 @@ from nemo_automodel.components.training.utils import (
     prepare_for_final_backward,
     prepare_for_grad_accumulation,
 )
-from nemo_automodel.recipes.diffusion.train import (
-    _build_diffusion_parallel_manager_args,
-    _build_optimizer,
-)
+from nemo_automodel.recipes.diffusion.train import build_diffusion_pipeline
+from nemo_automodel.shared.import_utils import safe_import
 
 if TYPE_CHECKING:
     from nemo_automodel.components.config.loader import ConfigNode
@@ -44,12 +41,11 @@ if TYPE_CHECKING:
 
 def _require_qwen_fastgen() -> tuple[Any, Any, Any]:
     """Import ModelOpt only when Qwen-Image DMD2 is configured."""
-    try:
-        import modelopt.torch.fastgen as fastgen
-        import modelopt.torch.fastgen.discriminators as fastgen_discriminators
-        import modelopt.torch.fastgen.plugins.qwen_image as qwen_fastgen
-    except ImportError as exc:
-        raise ImportError("Qwen-Image DMD2 requires ModelOpt FastGen; install with `uv sync --extra dmd2`.") from exc
+    has_fastgen, fastgen = safe_import("modelopt.torch.fastgen")
+    has_discriminator, fastgen_discriminators = safe_import("modelopt.torch.fastgen.discriminators")
+    has_qwen, qwen_fastgen = safe_import("modelopt.torch.fastgen.plugins.qwen_image")
+    if not (has_fastgen and has_discriminator and has_qwen):
+        raise ImportError("Qwen-Image DMD2 requires ModelOpt FastGen; install with `uv sync --extra dmd2`.")
     return fastgen, fastgen_discriminators, qwen_fastgen
 
 
@@ -66,7 +62,7 @@ def _load_negative_prompt_embedding(path: str) -> torch.Tensor:
     return embedding.contiguous()
 
 
-class DMD2Objective:
+class _QwenImageDMD2Objective:
     """Add full Model Optimizer DMD2 updates to ``TrainDiffusionRecipe``.
 
     Model Optimizer owns CFG, VSD/DSM, multi-step simulation, GAN/R1, and EMA.
@@ -86,6 +82,7 @@ class DMD2Objective:
         self.modelopt_pipeline: Any | None = None
         self.teacher: nn.Module | None = None
         self.fake_score: nn.Module | None = None
+        self.student_optimizer: torch.optim.Optimizer | None = None
         self.fake_score_optimizer: torch.optim.Optimizer | None = None
         self.discriminator: nn.Module | None = None
         self.discriminator_optimizer: torch.optim.Optimizer | None = None
@@ -120,6 +117,10 @@ class DMD2Objective:
             raise ValueError("DMD2 does not support model.stage.")
         if bool(recipe.cfg.get("model.transformer_engine_fp8", False)):
             raise ValueError("DMD2 does not yet support Transformer Engine FP8 state.")
+        if recipe.cfg.get("model.attention_backend", None) == "flash":
+            raise ValueError("Qwen-Image DMD2 requires text masks, which the flash-attn 2 backend does not support.")
+        if recipe.cfg.optimizer is None:
+            raise ValueError("DMD2 requires the native top-level `optimizer` configuration.")
 
         ema = self.modelopt_config.ema
         if ema is not None and (not ema.fsdp2 or ema.mode != "full_tensor"):
@@ -128,6 +129,25 @@ class DMD2Objective:
     def primary_optimizer_steps(self, outer_steps: int) -> int:
         """Return the number of student updates in ``outer_steps``."""
         return ceil(outer_steps / int(self.modelopt_config.student_update_freq))
+
+    def build_lr_scheduler(self, recipe: TrainDiffusionRecipe) -> list[Any] | None:
+        """Build the native student scheduler against the student-update budget."""
+        if recipe.cfg.lr_scheduler is None:
+            return None
+        step_scheduler = recipe.step_scheduler
+        if step_scheduler.epoch_len is not None:
+            outer_steps = step_scheduler.num_epochs * step_scheduler.epoch_len
+            if step_scheduler.max_steps is not None:
+                outer_steps = min(outer_steps, step_scheduler.max_steps)
+        else:
+            outer_steps = step_scheduler.max_steps
+        if outer_steps is None or outer_steps <= 0:
+            raise ValueError("DMD2 could not resolve a positive outer-step budget for the LR scheduler.")
+        return recipe.cfg.lr_scheduler.build(
+            recipe.optimizer,
+            step_scheduler,
+            total_steps=self.primary_optimizer_steps(outer_steps),
+        )
 
     def setup(self, recipe: TrainDiffusionRecipe) -> None:
         """Create DMD2 auxiliaries before the native checkpoint restore."""
@@ -142,23 +162,10 @@ class DMD2Objective:
                 dtype=recipe.compute_dtype,
             )
 
-        parallel_scheme = {
-            "transformer": _build_diffusion_parallel_manager_args(
-                fsdp_cfg=recipe.cfg.get("fsdp", None),
-                ddp_cfg=None,
-                world_size=recipe.world_size,
-                dtype=recipe.model_dtype,
-                compute_dtype=recipe.compute_dtype,
-                lora_enabled=False,
-            )
-        }
-        self.teacher = self._load_transformer(recipe, parallel_scheme, trainable=False)
-        self.fake_score = self._load_transformer(recipe, parallel_scheme, trainable=True)
-        self.fake_score_optimizer = _build_optimizer(
-            [parameter for parameter in self.fake_score.parameters() if parameter.requires_grad],
-            recipe.cfg.get("optim.optimizer", {}),
-            float(self.cfg.get("fake_score_lr", recipe.learning_rate)),
-        )
+        self.student_optimizer = self._only_optimizer(recipe.optimizer, "student")
+        self.teacher = self._build_auxiliary_transformer(recipe, trainable=False)
+        self.fake_score = self._build_auxiliary_transformer(recipe, trainable=True)
+        self.fake_score_optimizer = self._build_auxiliary_optimizer(recipe, self.fake_score, "fake-score")
 
         if self.modelopt_config.gan_loss_weight_gen > 0:
             discriminator_cfg = self.cfg.get("discriminator", None)
@@ -169,10 +176,10 @@ class DMD2Objective:
                 dtype=recipe.compute_dtype,
             )
             self._broadcast_discriminator(recipe)
-            self.discriminator_optimizer = _build_optimizer(
-                list(self.discriminator.parameters()),
-                recipe.cfg.get("optim.optimizer", {}),
-                float(self.cfg.get("discriminator_lr", recipe.learning_rate)),
+            self.discriminator_optimizer = self._build_auxiliary_optimizer(
+                recipe,
+                self.discriminator,
+                "discriminator",
             )
 
         self.modelopt_pipeline = qwen_fastgen.QwenImageDMDPipeline(
@@ -250,6 +257,7 @@ class DMD2Objective:
         """Run one student or fake-score/discriminator optimizer phase."""
         self._require_ready()
         assert self.fake_score is not None
+        assert self.student_optimizer is not None
         assert self.fake_score_optimizer is not None
         assert self.teacher is not None
         if not batch_group:
@@ -258,7 +266,7 @@ class DMD2Objective:
         student_phase = global_step % int(self.modelopt_config.student_update_freq) == 0
         phase = "student" if student_phase else "fake_score"
         active_model = recipe.model if student_phase else self.fake_score
-        active_optimizer = recipe.optimizer if student_phase else self.fake_score_optimizer
+        active_optimizer = self.student_optimizer if student_phase else self.fake_score_optimizer
         assert active_model is not None
         assert active_optimizer is not None
         self._set_phase(recipe, student_phase)
@@ -275,13 +283,24 @@ class DMD2Objective:
             if index == num_microbatches - 1:
                 prepare_for_final_backward([active_model], pp_enabled=False)
 
-            latents, noise, text_embeddings, negative_embeddings = self._prepare_batch(recipe, micro_batch)
-            kwargs = {"encoder_hidden_states": text_embeddings, "encoder_hidden_states_mask": None}
+            (
+                latents,
+                noise,
+                text_embeddings,
+                text_mask,
+                negative_embeddings,
+                negative_mask,
+            ) = self._prepare_batch(recipe, micro_batch)
+            kwargs = {
+                "encoder_hidden_states": text_embeddings,
+                "encoder_hidden_states_mask": text_mask,
+            }
             if student_phase:
                 losses = self.modelopt_pipeline.compute_student_loss(
                     latents,
                     noise,
                     negative_encoder_hidden_states=negative_embeddings,
+                    negative_encoder_hidden_states_mask=negative_mask,
                     **kwargs,
                 )
             else:
@@ -337,39 +356,77 @@ class DMD2Objective:
 
         return float(torch.stack(total_losses).mean().item()), grad_norm
 
-    def _load_transformer(
+    def _build_auxiliary_transformer(
         self,
         recipe: TrainDiffusionRecipe,
-        parallel_scheme: dict[str, dict[str, Any]],
         *,
         trainable: bool,
     ) -> nn.Module:
-        pipe, _ = NeMoAutoDiffusionPipeline.from_pretrained(
-            recipe.model_id,
-            torch_dtype=recipe.model_dtype,
+        """Build one teacher or fake-score transformer with the native diffusion loader."""
+        pipe, _ = build_diffusion_pipeline(
+            model_id=recipe.model_id,
+            finetune_mode=True,
             device=recipe.device,
-            parallel_scheme=parallel_scheme,
-            components_to_load=["transformer"],
-            load_for_training=trainable,
-            low_cpu_mem_usage=True,
-            active_transformer=recipe.active_transformer,
+            dtype=recipe.model_dtype,
+            compute_dtype=recipe.compute_dtype,
+            cpu_offload=recipe.cpu_offload,
+            fsdp_cfg=recipe.cfg.get("fsdp", None),
+            ddp_cfg=None,
+            attention_backend=recipe.attention_backend,
             transformer_engine_linear=recipe.transformer_engine_linear,
             transformer_engine_fp8_safe_only=recipe.transformer_engine_fp8,
             fuse_qkv_projections=recipe.fuse_qkv_projections,
             compact_fused_qkv_projections=recipe.compact_fused_qkv_projections,
+            active_transformer=recipe.active_transformer,
         )
         model = pipe.transformer
-        if recipe.attention_backend is not None:
-            getattr(model, "module", model).set_attention_backend(recipe.attention_backend)
         model.train(trainable)
         model.requires_grad_(trainable)
         return model
+
+    @staticmethod
+    def _only_optimizer(
+        optimizers: list[torch.optim.Optimizer] | torch.optim.Optimizer,
+        component: str,
+    ) -> torch.optim.Optimizer:
+        """Return the single optimizer allowed by the supported DP-only topology."""
+        if isinstance(optimizers, torch.optim.Optimizer):
+            return optimizers
+        if len(optimizers) != 1:
+            raise ValueError(f"Qwen-Image DMD2 requires one {component} optimizer, got {len(optimizers)}.")
+        return optimizers[0]
+
+    def _build_auxiliary_optimizer(
+        self,
+        recipe: TrainDiffusionRecipe,
+        model: nn.Module,
+        component: str,
+    ) -> torch.optim.Optimizer:
+        """Build an auxiliary optimizer through AutoModel's typed optimizer config."""
+        assert recipe.cfg.optimizer is not None
+        optimizers = recipe.cfg.optimizer.build(model, device_mesh=recipe.device_mesh)
+        return self._only_optimizer(optimizers, component)
 
     def _prepare_batch(
         self,
         recipe: TrainDiffusionRecipe,
         batch: dict[str, Any],
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor | None,
+    ]:
+        """Move and validate one cached Qwen-Image batch.
+
+        Returns:
+            Image latents ``[B, C, H, W]``, sampled noise with the same shape,
+            positive text embeddings ``[B, S, D]`` and their ``[B, S]`` mask,
+            plus optional negative text embeddings ``[B, S_negative, D]`` and
+            their ``[B, S_negative]`` mask.
+        """
         latents = batch["image_latents"].to(recipe.device, dtype=recipe.compute_dtype, non_blocking=True)
         text_embeddings = batch["text_embeddings"].to(
             recipe.device,
@@ -378,10 +435,21 @@ class DMD2Objective:
         )
         if text_embeddings.ndim == 2:
             text_embeddings = text_embeddings.unsqueeze(0)
+        text_mask = batch.get("text_embeddings_mask")
+        if text_mask is None:
+            raise ValueError("DMD2 requires text_embeddings_mask from AutoModel's text-to-image collator.")
+        text_mask = text_mask.to(recipe.device, non_blocking=True)
+        if text_mask.ndim == 1:
+            text_mask = text_mask.unsqueeze(0)
         if latents.ndim != 4 or text_embeddings.ndim != 3 or latents.shape[0] != text_embeddings.shape[0]:
             raise ValueError(
                 "DMD2 expects image_latents [B,C,H,W] and text_embeddings [B,S,D]; "
                 f"got {tuple(latents.shape)} and {tuple(text_embeddings.shape)}."
+            )
+        if text_mask.shape != text_embeddings.shape[:2]:
+            raise ValueError(
+                "DMD2 expects text_embeddings_mask [B,S] matching text_embeddings; "
+                f"got {tuple(text_mask.shape)} and {tuple(text_embeddings.shape)}."
             )
 
         feature_shape = (latents.shape[-2], latents.shape[-1])
@@ -397,11 +465,17 @@ class DMD2Objective:
             self._feature_capture_shape = feature_shape
 
         negative = None
+        negative_mask = None
         if self.negative_prompt_embedding is not None:
             if self.negative_prompt_embedding.shape[-1] != text_embeddings.shape[-1]:
                 raise ValueError("DMD2 positive and negative text embedding dimensions must match.")
             negative = self.negative_prompt_embedding.unsqueeze(0).expand(latents.shape[0], -1, -1)
-        return latents, torch.randn_like(latents), text_embeddings, negative
+            negative_mask = torch.ones(
+                negative.shape[:2],
+                dtype=text_mask.dtype,
+                device=recipe.device,
+            )
+        return latents, torch.randn_like(latents), text_embeddings, text_mask, negative, negative_mask
 
     def _set_phase(self, recipe: TrainDiffusionRecipe, student_phase: bool) -> None:
         recipe.model.train(student_phase)
@@ -429,5 +503,10 @@ class DMD2Objective:
                 parameter.grad.div_(dp_size)
 
     def _require_ready(self) -> None:
-        if self.modelopt_pipeline is None or self.fake_score is None or self.fake_score_optimizer is None:
+        if (
+            self.modelopt_pipeline is None
+            or self.fake_score is None
+            or self.student_optimizer is None
+            or self.fake_score_optimizer is None
+        ):
             raise RuntimeError("DMD2 objective has not been set up.")

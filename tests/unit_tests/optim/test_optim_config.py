@@ -441,6 +441,12 @@ class TestLRSchedulerConfig:
         scheds = LRSchedulerConfig(lr_warmup_steps=1).build(opt, ss)
         assert scheds[0].lr_decay_steps == 20  # min(num_epochs*epoch_len=1000, max_steps=20)
 
+    def test_build_accepts_explicit_total_steps(self):
+        opt = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=0.01)
+        ss = self._step_scheduler(epoch_len=100, num_epochs=10, max_steps=20)
+        scheds = LRSchedulerConfig(lr_warmup_steps=1).build(opt, ss, total_steps=7)
+        assert scheds[0].lr_decay_steps == 7
+
 
 # ---------------------------------------------------------------------------
 # Per-parameter-group LR overrides (issue #2961)

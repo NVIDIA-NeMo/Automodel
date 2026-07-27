@@ -54,7 +54,6 @@ The DMD2 hyperparameters mirror the validated Qwen-Image recipe: CFG 4.0, four
 student steps, a 1:4 student-to-fake update pattern, and GAN weight 0.03. The
 YAML uses AutoModel's native selective activation checkpointing, so validate
 peak memory on the target topology. It uses the 2e-6
-student/fake-score/discriminator learning rate from that run. R1 and EMA are
-fully supported but disabled in this YAML because the validated production run
-disabled both. EMA requires additional student shadow storage, so enable it
-only when that memory cost fits the launch.
+student/fake-score/discriminator learning rate. R1 and EMA are available
+through ModelOpt but disabled in this YAML. EMA requires additional student
+shadow storage, so enable it only when that memory cost fits the launch.

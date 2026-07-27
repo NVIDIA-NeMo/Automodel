@@ -51,6 +51,7 @@ def _make_production_batch(
     }
     if has_prompt_embeds:
         result["prompt_embeds"] = torch.randn(batch_size, 256, 4096)
+        result["prompt_embeds_mask"] = torch.ones(batch_size, 256, dtype=torch.long)
         result["pooled_prompt_embeds"] = torch.randn(batch_size, 768)
     if has_clip_hidden:
         result["clip_hidden"] = torch.randn(batch_size, 77, 768)
@@ -75,6 +76,7 @@ class TestCollateFnTextToImage:
 
         assert "image_latents" in result
         assert "text_embeddings" in result
+        assert "text_embeddings_mask" in result
         assert "pooled_prompt_embeds" in result
         assert result["data_type"] == "image"
         assert result["image_latents"].shape == prod_batch["latent"].shape
@@ -168,10 +170,20 @@ class TestCollateFnProduction:
         result = collate_fn_production(batch)
 
         assert result["prompt_embeds"].shape == (2, 8, 4)
+        assert result["prompt_embeds_mask"].shape == (2, 8)
         torch.testing.assert_close(result["prompt_embeds"][0, :3], first_prompt_embeds)
         assert torch.count_nonzero(result["prompt_embeds"][0, 3:]) == 0
         torch.testing.assert_close(result["prompt_embeds"][1, :5], second_prompt_embeds)
         assert torch.count_nonzero(result["prompt_embeds"][1, 5:]) == 0
+        torch.testing.assert_close(
+            result["prompt_embeds_mask"],
+            torch.tensor(
+                [
+                    [1, 1, 1, 0, 0, 0, 0, 0],
+                    [1, 1, 1, 1, 1, 0, 0, 0],
+                ]
+            ),
+        )
 
 
 # =============================================================================

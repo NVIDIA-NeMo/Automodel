@@ -1,7 +1,6 @@
 model:
   pretrained_model_name_or_path: Qwen/Qwen-Image
   mode: finetune
-  attention_backend: flash
 
 dmd2:
   modelopt_config:
@@ -28,10 +27,16 @@ dmd2:
   # Generate this once with the same Qwen text encoder used for the data cache.
   negative_prompt_embedding_path: PATH_TO_NEGATIVE_PROMPT_EMBEDDING
 
-optim:
-  learning_rate: 2.0e-6
-  optimizer:
-    fused: true
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 2.0e-6
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+  foreach: false
+  fused: true
+
+clip_grad_norm:
+  max_norm: 1.0
 
 lr_scheduler:
   lr_decay_style: constant
@@ -53,7 +58,8 @@ step_scheduler:
   global_batch_size: 8
   max_steps: 50000
   ckpt_every_steps: 1000
-  log_every: 1
+  save_checkpoint_every_epoch: false
+  log_remote_every_steps: 1
 
 data:
   dataloader:

@@ -3,16 +3,16 @@ title: "YAML Configuration"
 description: ""
 position: 4
 ---
-NeMo AutoModel recipes are configured with YAML. Under the hood, YAML is parsed into a `ConfigNode` which:
+NeMo AutoModel recipes use YAML configs. The YAML parser creates a `ConfigNode` that performs the following actions:
 
-- Translates common scalar strings into typed Python values (e.g., `"10"` → `10`).
-- Resolves `_target_` (and `*_fn`) into Python callables/classes.
-- Supports environment variable interpolation inside YAML strings.
-- Tries to make config printing safe by preserving original placeholders (to avoid leaking secrets).
+- Translates common scalar strings into typed Python values (for example, `"10"` → `10`)
+- Resolves `_target_` and `*_fn` into Python callables and classes
+- Supports environment variable interpolation inside YAML strings
+- Makes config printing safer by preserving original placeholders to avoid leaking secrets
 
 ## Load Model and Dataset Configs
 
-Most recipes load YAML configs by using `nemo_automodel.components.config.loader.load_yaml_config()`, which returns a `ConfigNode`.
+Most recipes load YAML configs using `nemo_automodel.components.config.loader.load_yaml_config()`, which returns a `ConfigNode`.
 
 A `ConfigNode` handles values as follows:
 
@@ -56,6 +56,7 @@ Target resolution is intentionally permissive and should be treated as code exec
 
 <Warning>
 Only load configuration files and `_target_` values from trusted sources. A YAML file that names an importable package or Python file can execute arbitrary Python code during target resolution.
+
 </Warning>
 
 ## Distributed Section (Strategy-Based)
@@ -64,7 +65,7 @@ The `distributed:` section is **not** instantiated using `_target_`. Recipes par
 
 ## Prewarm One-Time CUDA Initialization
 
-The LLM training/fine-tuning and VLM fine-tuning recipes accept an optional `prewarm:` section:
+The LLM training, LLM fine-tuning, and VLM fine-tuning recipes accept an optional `prewarm:` section:
 
 ```yaml
 prewarm:
@@ -88,7 +89,7 @@ Adding GPUs helps only when it sufficiently reduces the relevant per-rank tensor
 
 ## Repair Near-Zero Input Embeddings
 
-The LLM training/fine-tuning recipe can repair a small number of damaged input-embedding rows after loading the base checkpoint and before creating the optimizer:
+The LLM training and fine-tuning recipe can repair a small number of damaged input-embedding rows after loading the base checkpoint and before creating the optimizer:
 
 ```yaml
 embedding_row_repair:
@@ -99,6 +100,8 @@ embedding_row_repair:
 Rows with a non-finite L2 norm or a norm at or below `min_norm` are replaced with the corresponding output-embedding direction, scaled to the RMS norm of healthy input rows. Setup logs the affected token IDs. `max_rows` is a safety limit: setup aborts instead of rewriting a broadly damaged or mismatched checkpoint.
 
 This option is intended for diagnosed checkpoint defects where rare token IDs produce extreme input-embedding gradients. It is disabled when the section is absent and is not currently supported with pipeline parallelism.
+
+For diagnosis, safety behavior, verification steps, and performance impact, see [Repair Damaged Input-Embedding Rows](/model-coverage/troubleshooting#repair-damaged-input-embedding-rows).
 
 ## Interpolate Environment Variables in YAML
 
