@@ -9,7 +9,9 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event.label.name || 'main' }}-${{ github.event_name }}
-  cancel-in-progress: true
+  # PR updates can supersede stale runs, but main must finish populating the
+  # canonical CUDA wheelhouse cache used by every copied PR branch.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   TORCH_CU_INDEX: https://download.pytorch.org/whl/cu130
