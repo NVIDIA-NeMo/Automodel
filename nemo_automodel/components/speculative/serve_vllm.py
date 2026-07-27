@@ -291,10 +291,22 @@ def _load_safetensors_io():
     return load_file, save_file
 
 
-def _export_is_fresh(draft_dir: Path, export_dir: Path) -> bool:
-    """True when ``export_dir`` holds a complete config + weights newer than the source weights or config."""
+def _export_is_fresh(draft_dir: Path, export_dir: Path, expected_config: dict[str, Any]) -> bool:
+    """True when ``export_dir`` holds a complete export matching ``expected_config``.
+
+    Mtime alone is not sufficient. The exported config also depends on the launch
+    flags (``--dflash-causal``), which leave the source checkpoint untouched, so a
+    cached export can be newer than every source file and still describe a
+    different drafter than the one this launch asked for. Comparing the config
+    content covers both the stale-source and the changed-flags cases.
+    """
     exported_config = export_dir / "config.json"
     if not exported_config.exists() or not _has_hf_weight_file(export_dir):
+        return False
+    try:
+        if _load_config(exported_config) != expected_config:
+            return False
+    except json.JSONDecodeError:
         return False
     src_files = [
         *draft_dir.glob("model-*.safetensors"),
@@ -305,21 +317,28 @@ def _export_is_fresh(draft_dir: Path, export_dir: Path) -> bool:
     return exported_config.stat().st_mtime_ns >= src_mtime
 
 
-def _export_for_vllm(draft_dir: Path, config: dict[str, Any]) -> Path:
+def _export_for_vllm(draft_dir: Path, config: dict[str, Any], *, dflash_causal: bool = False) -> Path:
     """Materialize a vLLM-loadable copy of ``draft_dir`` in a ``vllm_export/`` subdir.
 
     The safetensors keys are remapped to strip the Automodel ``self.model``
     wrapper prefix, the config receives the architectures / pard_token fixups, and
     the tokenizer assets are copied alongside. The source checkpoint is left
     untouched. The export is cached and rebuilt only when stale.
+
+    Args:
+        draft_dir: The HF-style drafter directory to export from.
+        config: The parsed drafter ``config.json``.
+        dflash_causal: Forwarded to the config fixups; stamps
+            ``dflash_config.causal=true`` on a DFlash-family draft.
     """
     export_dir = draft_dir / _VLLM_EXPORT_DIRNAME
-    if _export_is_fresh(draft_dir, export_dir):
+    # Validate the config fixups up front so a bad draft fails before any writes.
+    config_updates = _vllm_config_updates(config, dflash_causal=dflash_causal)
+    exported_config = {**config, **config_updates}
+    if _export_is_fresh(draft_dir, export_dir, exported_config):
         logger.info("Reusing fresh vLLM export at %s", export_dir)
         return export_dir
 
-    # Validate the config fixups up front so a bad draft fails before any writes.
-    config_updates = _vllm_config_updates(config)
     load_file, save_file = _load_safetensors_io()
     export_dir.mkdir(parents=True, exist_ok=True)
 
@@ -337,8 +356,6 @@ def _export_for_vllm(draft_dir: Path, config: dict[str, Any]) -> Path:
         with (export_dir / "model.safetensors.index.json").open("w") as f:
             json.dump(index, f, indent=2)
 
-    exported_config = dict(config)
-    exported_config.update(config_updates)
     with (export_dir / "config.json").open("w") as f:
         json.dump(exported_config, f, indent=2)
 
@@ -432,7 +449,7 @@ def resolve_draft_artifacts(
         export_dir = draft_dir / _VLLM_EXPORT_DIRNAME
         if dry_run:
             return str(export_dir), config
-        return str(_export_for_vllm(draft_dir, config)), config
+        return str(_export_for_vllm(draft_dir, config, dflash_causal=dflash_causal)), config
 
     if not dry_run:
         _rewrite_config_for_vllm(config_path, config, dflash_causal=dflash_causal)

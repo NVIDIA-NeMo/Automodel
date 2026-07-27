@@ -49,7 +49,14 @@ class _FakeTrainerModule(nn.Module):
         if i in self._raise_on:
             raise NoValidAnchorsError("every sample too short")
         out = self.dummy(torch.randn(1, 4)).sum()
-        return SimpleNamespace(loss=out.abs() + 1.0, accuracy=torch.tensor(0.5))
+        # The acceptance fields mirror DFlashStepMetrics: the training loop
+        # accumulates them per micro-batch to average over the log window.
+        return SimpleNamespace(
+            loss=out.abs() + 1.0,
+            accuracy=torch.tensor(0.5),
+            accept_len_sum=torch.tensor(2.0),
+            valid_blocks=torch.tensor(1.0),
+        )
 
 
 class _FakeTargetWrapper:

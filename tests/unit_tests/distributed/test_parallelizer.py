@@ -1315,6 +1315,99 @@ class TestApplyFsdpShardingRecursively:
         assert mock_fully_shard.call_count == 1  # Just the nested ModuleList's single layer
 
     @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
+    def test_apply_fsdp_sharding_replicates_frozen_multimodal_module(
+        self, mock_fully_shard, mock_mesh, mock_mp_policy, mock_offload_policy
+    ):
+        """Frozen multimodal modules are skipped and collected when replication is requested."""
+        mock_mesh.mesh_dim_names = ("dp",)
+
+        class VisionTower(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layers = nn.ModuleList([nn.Linear(10, 10)])
+
+        class TestModule(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.vision_tower = VisionTower()
+                self.text_layers = nn.ModuleList([nn.Linear(10, 10)])
+
+        model = TestModule()
+        for param in model.vision_tower.parameters():
+            param.requires_grad = False
+
+        mock_fully_shard.side_effect = lambda x, **kwargs: x
+        ignored_params = set()
+
+        apply_fsdp2_sharding_recursively(
+            module=model,
+            mesh=mock_mesh,
+            mp_policy=mock_mp_policy,
+            offload_policy=mock_offload_policy,
+            frozen_multimodal_sharding="replicate",
+            ignored_multimodal_params=ignored_params,
+        )
+
+        assert ignored_params == set(model.vision_tower.parameters())
+        sharded_modules = [call.args[0] for call in mock_fully_shard.call_args_list]
+        assert model.vision_tower.layers[0] not in sharded_modules
+        assert model.text_layers[0] in sharded_modules
+
+    @pytest.mark.parametrize(
+        "frozen_multimodal_sharding, expected_towers_sharded",
+        [("root", False), ("per_layer", True)],
+    )
+    @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
+    def test_apply_fsdp_sharding_applies_frozen_multimodal_policy(
+        self,
+        mock_fully_shard,
+        mock_mesh,
+        mock_mp_policy,
+        mock_offload_policy,
+        frozen_multimodal_sharding,
+        expected_towers_sharded,
+    ):
+        """Root owns frozen towers while per-layer shards both modalities uniformly."""
+        mock_mesh.mesh_dim_names = ("dp",)
+
+        class AudioTower(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layers = nn.ModuleList([nn.Linear(10, 10)])
+
+        class VisionTower(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layers = nn.ModuleList([nn.Linear(10, 10)])
+
+        class TestModule(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.audio_tower = AudioTower()
+                self.vision_tower = VisionTower()
+                self.text_layers = nn.ModuleList([nn.Linear(10, 10)])
+
+        model = TestModule()
+        for tower in (model.audio_tower, model.vision_tower):
+            for param in tower.parameters():
+                param.requires_grad = False
+
+        mock_fully_shard.side_effect = lambda x, **kwargs: x
+
+        apply_fsdp2_sharding_recursively(
+            module=model,
+            mesh=mock_mesh,
+            mp_policy=mock_mp_policy,
+            offload_policy=mock_offload_policy,
+            frozen_multimodal_sharding=frozen_multimodal_sharding,
+        )
+
+        sharded_modules = [call.args[0] for call in mock_fully_shard.call_args_list]
+        assert (model.audio_tower.layers[0] in sharded_modules) is expected_towers_sharded
+        assert (model.vision_tower.layers[0] in sharded_modules) is expected_towers_sharded
+        assert model.text_layers[0] in sharded_modules
+
+    @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
     def test_apply_fsdp_sharding_empty_module_list(
         self, mock_fully_shard, mock_mesh, mock_mp_policy, mock_offload_policy
     ):
@@ -1358,7 +1451,104 @@ class TestApplyFsdpShardingRecursively:
             module=leaf_module, mesh=mock_mesh, mp_policy=mock_mp_policy, offload_policy=mock_offload_policy
         )
 
-        # Just verify it doesn't crash - leaf modules have no children to process
+
+def test_default_parallelization_replicated_frozen_multimodal_params_are_ignored_by_root(monkeypatch):
+    """The dense root FSDP unit must ignore frozen multimodal params when replication is requested."""
+    from nemo_automodel.components.distributed.parallelizer import DefaultParallelizationStrategy
+
+    class InnerModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = nn.ModuleList([nn.Linear(10, 10)])
+            self.vision_tower = nn.Module()
+            self.vision_tower.layers = nn.ModuleList([nn.Linear(10, 10)])
+
+    class TestModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = InnerModel()
+            self.config = SimpleNamespace(num_attention_heads=8, num_key_value_heads=8)
+
+    model = TestModel()
+    for param in model.model.vision_tower.parameters():
+        param.requires_grad = False
+
+    tp_mesh = MagicMock()
+    tp_mesh.size.return_value = 1
+    device_mesh = MagicMock(spec=DeviceMesh)
+    device_mesh.__getitem__.side_effect = lambda key: tp_mesh
+
+    dp_mesh = MagicMock()
+    dp_mesh.mesh_dim_names = ("dp",)
+    monkeypatch.setattr(parallelizer, "get_fsdp_dp_mesh", lambda *args, **kwargs: dp_mesh)
+    monkeypatch.setattr(parallelizer, "_patch_fsdp_accumulated_grad_guard", lambda: None)
+
+    calls = []
+
+    def fake_fully_shard(module, **kwargs):
+        calls.append((module, kwargs))
+        module.set_modules_to_forward_prefetch = MagicMock()
+        module.set_modules_to_backward_prefetch = MagicMock()
+        return module
+
+    result = DefaultParallelizationStrategy().parallelize(
+        model=model,
+        device_mesh=device_mesh,
+        activation_checkpointing=False,
+        frozen_multimodal_sharding="replicate",
+        fully_shard_fn=fake_fully_shard,
+    )
+
+    assert result is model
+    root_kwargs = next(kwargs for module, kwargs in calls if module is model)
+    assert root_kwargs["ignored_params"] == set(model.model.vision_tower.parameters())
+
+
+def test_default_parallelization_warns_for_per_layer_frozen_multimodal_policy(monkeypatch, caplog):
+    """The expert per-layer policy makes its rank-uniform collective contract visible."""
+    from nemo_automodel.components.distributed.parallelizer import DefaultParallelizationStrategy
+
+    class InnerModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = nn.ModuleList([nn.Linear(10, 10)])
+            self.vision_tower = nn.Module()
+            self.vision_tower.layers = nn.ModuleList([nn.Linear(10, 10)])
+
+    class TestModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = InnerModel()
+            self.config = SimpleNamespace(num_attention_heads=8, num_key_value_heads=8)
+
+    model = TestModel()
+    for param in model.model.vision_tower.parameters():
+        param.requires_grad = False
+
+    tp_mesh = MagicMock()
+    tp_mesh.size.return_value = 1
+    device_mesh = MagicMock(spec=DeviceMesh)
+    device_mesh.__getitem__.side_effect = lambda key: tp_mesh
+    dp_mesh = MagicMock()
+    dp_mesh.mesh_dim_names = ("dp",)
+    monkeypatch.setattr(parallelizer, "get_fsdp_dp_mesh", lambda *args, **kwargs: dp_mesh)
+    monkeypatch.setattr(parallelizer, "_patch_fsdp_accumulated_grad_guard", lambda: None)
+
+    def fake_fully_shard(module, **kwargs):
+        module.set_modules_to_forward_prefetch = MagicMock()
+        module.set_modules_to_backward_prefetch = MagicMock()
+        return module
+
+    with caplog.at_level("WARNING"):
+        DefaultParallelizationStrategy().parallelize(
+            model=model,
+            device_mesh=device_mesh,
+            activation_checkpointing=False,
+            frozen_multimodal_sharding="per_layer",
+            fully_shard_fn=fake_fully_shard,
+        )
+
+    assert "rank-asymmetric modality execution can hang" in caplog.text
 
 
 class TestUnshardFsdp2Model:
@@ -1810,7 +2000,13 @@ class TestActivationCheckpointingKVSharing:
             lambda mesh, *a, **kw: MagicMock(),
         )
 
-    def _run_parallelize(self, model, activation_checkpointing=True, activation_checkpointing_scope="all"):
+    def _run_parallelize(
+        self,
+        model,
+        activation_checkpointing=True,
+        activation_checkpointing_scope="all",
+        enable_compile=False,
+    ):
         """Invoke the strategy under test and return the model."""
         from nemo_automodel.components.distributed.parallelizer import DefaultParallelizationStrategy
 
@@ -1824,6 +2020,7 @@ class TestActivationCheckpointingKVSharing:
             device_mesh=mesh,
             activation_checkpointing=activation_checkpointing,
             activation_checkpointing_scope=activation_checkpointing_scope,
+            enable_compile=enable_compile,
         )
 
     # ------------------------------------------------------------------ #
@@ -1892,6 +2089,24 @@ class TestActivationCheckpointingKVSharing:
             assert isinstance(layer.self_attn, self._Wrapped), (
                 "self_attn should be checkpoint-wrapped for standard models"
             )
+
+    def test_linear_attn_wrapped_with_compile(self):
+        """Compile-compatible checkpointing wraps hybrid blocks' ``linear_attn`` mixers."""
+
+        class _LinearAttentionLayer(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear_attn = nn.Linear(16, 16)
+                self.mlp = nn.Linear(16, 16)
+
+        model = _make_model_for_ac(num_kv_shared_layers=0)
+        model.model.layers = nn.ModuleList([_LinearAttentionLayer() for _ in range(2)])
+
+        self._run_parallelize(model, enable_compile=True)
+
+        for layer in model.model.layers:
+            assert isinstance(layer.linear_attn, self._Wrapped)
+            assert isinstance(layer.mlp, self._Wrapped)
 
     def test_mlp_always_wrapped(self):
         """MLP is checkpoint-wrapped regardless of KV sharing."""

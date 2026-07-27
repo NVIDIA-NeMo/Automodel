@@ -21,7 +21,10 @@ import contextlib
 import torch
 import torch.distributed as dist
 
-from nemo_automodel.components.distributed.context_parallel.sharder import ShardLayout
+from nemo_automodel.components.distributed.context_parallel.sharder import (
+    ShardLayout,
+    contiguous_local_indices,
+)
 from nemo_automodel.components.distributed.thd_utils import (
     split_batch_into_thd_chunks,
     thd_padding_mask_from_token_ids,
@@ -55,26 +58,17 @@ def glm_dsa_cp_all_gather(tensor: torch.Tensor, *, dim: int, cp_group) -> torch.
     return torch.cat(tuple(parts), dim=dim)
 
 
-def _contiguous_cp_indices(total_tokens: int, cp_size: int, cp_rank: int, device: torch.device) -> torch.Tensor:
-    if total_tokens % cp_size != 0:
-        raise ValueError(
-            f"Packed GLM DSA CP requires total tokens divisible by cp_size, got {total_tokens=} {cp_size=}"
-        )
-    local_tokens = total_tokens // cp_size
-    start = cp_rank * local_tokens
-    return torch.arange(start, start + local_tokens, device=device, dtype=torch.long)
-
-
 def _slice_thd_chunk_for_cp(
     chunk: dict[str, torch.Tensor],
     *,
+    cp_mesh,
     cp_group,
     cp_size: int,
     cp_rank: int,
     padding_token_id: int,
 ) -> dict[str, torch.Tensor]:
     total_tokens = int(chunk["input_ids"].shape[0])
-    query_indices = _contiguous_cp_indices(total_tokens, cp_size, cp_rank, chunk["input_ids"].device)
+    query_indices = contiguous_local_indices(cp_mesh, total_tokens, chunk["input_ids"].device)
 
     out: dict[str, torch.Tensor | int | str | object] = {
         "input_ids": chunk["input_ids"].index_select(0, query_indices).to(torch.int64).contiguous(),
@@ -146,6 +140,7 @@ def make_glm_dsa_packed_cp_batch_and_ctx(
     if num_chunks <= 1:
         sliced = _slice_thd_chunk_for_cp(
             thd_batch,
+            cp_mesh=cp_mesh,
             cp_group=cp_group,
             cp_size=cp_size,
             cp_rank=cp_rank,
@@ -159,6 +154,7 @@ def make_glm_dsa_packed_cp_batch_and_ctx(
         chunks.append(
             _slice_thd_chunk_for_cp(
                 chunk,
+                cp_mesh=cp_mesh,
                 cp_group=cp_group,
                 cp_size=cp_size,
                 cp_rank=cp_rank,
