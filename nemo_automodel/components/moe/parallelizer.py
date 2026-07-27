@@ -16,6 +16,7 @@
 
 import functools
 import logging
+import weakref
 from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 
@@ -122,25 +123,19 @@ def _preserve_gate_load_during_recompute(
     gate = getattr(moe, "gate", None)
     if not isinstance(gate, nn.Module) or not hasattr(gate, "_cumulative_expert_load"):
         return context_fn
+    gate_ref = weakref.ref(gate)
 
     def checkpoint_context_fn() -> tuple[AbstractContextManager, AbstractContextManager]:
         forward_context, recompute_context = context_fn() if context_fn is not None else (nullcontext(), nullcontext())
-        load_before_forward = None
-        preserve_load = False
-
-        @contextmanager
-        def forward():
-            nonlocal load_before_forward, preserve_load
-            preserve_load = gate.training and getattr(gate, "bias_update_factor", 0) > 0
-            if preserve_load:
-                current_load = gate._cumulative_expert_load
-                load_before_forward = current_load.clone() if current_load is not None else None
-            with forward_context:
-                yield
+        gate = gate_ref()
+        preserve_load = gate is not None and gate.training and getattr(gate, "bias_update_factor", 0) > 0
+        current_load = gate._cumulative_expert_load if preserve_load else None
+        load_before_forward = current_load.clone() if current_load is not None else None
 
         @contextmanager
         def recompute():
-            if not preserve_load:
+            gate = gate_ref()
+            if not preserve_load or gate is None:
                 with recompute_context:
                     yield
                 return
@@ -153,7 +148,7 @@ def _preserve_gate_load_during_recompute(
             finally:
                 gate._cumulative_expert_load = load_after_forward
 
-        return forward(), recompute()
+        return forward_context, recompute()
 
     return checkpoint_context_fn
 
