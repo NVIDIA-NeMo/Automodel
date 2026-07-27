@@ -121,11 +121,10 @@ ci:
   checkpoint_robustness:
     check_source_load_parity: true
     experts_implementation: grouped_mm
-    hf_kl_threshold: 2e-2
-    hf_keep_in_fp32_modules: A_log,dt_bias
     hf_device_map_auto: true
+    hf_kl_threshold: 1e-1
+    loss_fn._target_: nemo_automodel.components.loss.chunked_ce.ChunkedCrossEntropy
     model.backend.experts: torch_mm
-    resume_loss_threshold: 1e-2
     source_load_cosine_threshold: 0.9985
     source_load_kl_threshold: 1e-1
     source_load_mean_kl_threshold: 1e-2

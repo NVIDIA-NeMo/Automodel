@@ -25,6 +25,7 @@ from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm
     _extract_custom_args,
     _finish_hf_reload_sync,
     _get_input_ids,
+    _hf_fp32_module_names,
     _hf_model_load_context,
     _hf_source_load_kwargs,
     _keep_hf_modules_in_fp32,
@@ -224,7 +225,9 @@ def test_keep_hf_modules_in_fp32_uses_strict_dtype_plan_and_restores_class_state
     previous = getattr(PreTrainedModel, "_keep_in_fp32_modules_strict", None)
     TinyModel(TinyConfig()).save_pretrained(tmp_path)
     plain = TinyModel.from_pretrained(tmp_path, dtype=torch.bfloat16)
-    with _keep_hf_modules_in_fp32(("A_log", "dt_bias")):
+    hf_config = SimpleNamespace(architectures=["Qwen3_5MoeForConditionalGeneration"])
+    assert _hf_fp32_module_names(hf_config) == ("A_log", "dt_bias")
+    with _keep_hf_modules_in_fp32(hf_config):
         assert set(PreTrainedModel._keep_in_fp32_modules_strict) >= {"A_log", "dt_bias"}
         strict = TinyModel.from_pretrained(tmp_path, dtype=torch.bfloat16)
 
@@ -235,11 +238,8 @@ def test_keep_hf_modules_in_fp32_uses_strict_dtype_plan_and_restores_class_state
     assert strict.dt_bias.dtype == torch.float32
 
 
-def test_extract_custom_args_accepts_hf_keep_in_fp32_modules():
-    custom, remaining = _extract_custom_args(["--hf_keep_in_fp32_modules", "A_log,dt_bias", "--other-arg"])
-
-    assert custom["hf_keep_in_fp32_modules"] == "A_log,dt_bias"
-    assert remaining == ["--other-arg"]
+def test_hf_fp32_module_names_is_empty_without_model_contract():
+    assert _hf_fp32_module_names(SimpleNamespace(architectures=["LlamaForCausalLM"])) == ()
 
 
 def test_source_load_parity_failure_is_returned_for_later_reporting():
@@ -249,7 +249,7 @@ def test_source_load_parity_failure_is_returned_for_later_reporting():
     failure = _compare_source_load_parity(
         (reference_logits, None, None),
         candidate_logits,
-        SimpleNamespace(),
+        None,
         source_load_kl_threshold=0.0,
         source_load_mean_kl_threshold=0.0,
         source_load_cosine_threshold=1.0,
@@ -265,7 +265,7 @@ def test_source_load_parity_success_returns_no_deferred_failure():
     failure = _compare_source_load_parity(
         (logits, None, None),
         logits.clone(),
-        SimpleNamespace(),
+        None,
         source_load_kl_threshold=0.0,
         source_load_mean_kl_threshold=0.0,
         source_load_cosine_threshold=1.0,

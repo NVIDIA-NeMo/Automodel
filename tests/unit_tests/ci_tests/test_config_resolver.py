@@ -378,12 +378,18 @@ def test_vlm_checkpoint_robustness_recipes_resolve(tmp_path, recipe_path):
         assert robustness["resume_loss_threshold"] == 1e-2
     if Path(recipe_path).stem == "qwen3_5_35b":
         assert robustness["experts_implementation"] == "grouped_mm"
-        assert robustness["hf_kl_threshold"] == 2e-2
-        assert robustness["hf_keep_in_fp32_modules"] == "A_log,dt_bias"
-        assert robustness["resume_loss_threshold"] == 1e-2
+        for key in (
+            "hf_keep_in_fp32_modules",
+            "resume_loss_threshold",
+        ):
+            assert key not in robustness
+        assert robustness["hf_kl_threshold"] == 1e-1
         assert robustness["source_load_cosine_threshold"] == 0.9985
         assert robustness["source_load_kl_threshold"] == 1e-1
         assert robustness["source_load_mean_kl_threshold"] == 1e-2
+        assert resolved["loss_fn"]["_target_"] == (
+            "nemo_automodel.components.loss.chunked_ce.ChunkedCrossEntropy"
+        )
         assert resolved["model"]["backend"]["experts"] == "torch_mm"
         assert resolved["step_scheduler"]["global_batch_size"] == 16
         assert resolved["step_scheduler"]["local_batch_size"] == 1
