@@ -94,7 +94,7 @@ class TestIsFp8WeightKey:
 # _dequantize_from_fp8                                                        #
 # --------------------------------------------------------------------------- #
 class TestDequantizeFromFp8:
-    """w_bf16 = w_fp8.to(bf16) * scale_inv.to(bf16)."""
+    """w_bf16 = (w_fp8.float() * scale_inv.float()).bfloat16()."""
 
     def test_per_tensor_scale_multiply(self):
         # FP8 e4m3 has limited precision; pick exact-representable values.
@@ -111,6 +111,17 @@ class TestDequantizeFromFp8:
         out = _dequantize_from_fp8(w_fp8, scale, target_dtype=torch.float32)
         assert out.dtype == torch.float32
         assert torch.allclose(out, torch.tensor([2.0, 4.0]))
+
+    def test_multiplies_in_float32_before_casting(self):
+        w_fp8 = torch.tensor([-240.0], dtype=torch.float8_e4m3fn)
+        scale = torch.tensor(1e-5, dtype=torch.float32)
+
+        out = _dequantize_from_fp8(w_fp8, scale, target_dtype=torch.bfloat16)
+
+        expected = (w_fp8.float() * scale).bfloat16()
+        low_precision = w_fp8.bfloat16() * scale.bfloat16()
+        assert torch.equal(out, expected)
+        assert not torch.equal(out, low_precision)
 
 
 # --------------------------------------------------------------------------- #

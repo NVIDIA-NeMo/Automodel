@@ -37,7 +37,7 @@ class PeagleRecipeMixin:
     # the train loop then drives the per-segment forward/backward step.
     _peagle_partitioned = False
 
-    def _configure_peagle_draft_config(self, recipe_cfg, draft_config, target_config) -> int:
+    def _configure_peagle_draft_config(self, recipe_cfg, draft_config, draft_base_config) -> int:
         """Validate P-EAGLE recipe args and populate ``draft_config``; return ``mask_token_id``.
 
         Mutates ``draft_config`` in place with the P-EAGLE keys (``mask_token_id``,
@@ -63,10 +63,10 @@ class PeagleRecipeMixin:
                 "at serve time."
             )
         mask_token_id = int(mask_token_id)
-        if not 0 <= mask_token_id < target_config.vocab_size:
+        if not 0 <= mask_token_id < draft_base_config.vocab_size:
             raise ValueError(
                 f"mask_token_id={mask_token_id} is out of range for the target vocab "
-                f"[0, {target_config.vocab_size}); it indexes the draft embed_tokens table."
+                f"[0, {draft_base_config.vocab_size}); it indexes the draft embed_tokens table."
             )
         draft_config["mask_token_id"] = mask_token_id
         draft_config["num_depths"] = int(recipe_cfg.get("num_depths", 8))

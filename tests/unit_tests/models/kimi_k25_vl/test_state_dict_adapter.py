@@ -26,6 +26,8 @@ from nemo_automodel.components.models.kimi_k25_vl.state_dict_adapter import (
 )
 from nemo_automodel.components.moe.config import MoEConfig
 
+pytestmark = pytest.mark.torch_memory_limit(cpu_mb=128)
+
 
 class TestDequantizeInt4:
     """Tests for INT4 dequantization without CUDA."""
@@ -207,7 +209,7 @@ class TestKimiK25VLStateDictAdapter:
     def test_convert_single_tensor_to_hf_vision_tower(self, adapter):
         """Test convert_single_tensor_to_hf handles vision tower keys."""
         fqn = "model.vision_tower.encoder.blocks.0.wqkv.weight"
-        tensor = torch.randn(3456, 1152)
+        tensor = torch.randn(2, 3)
 
         result = adapter.convert_single_tensor_to_hf(fqn, tensor, quantization=False)
 
@@ -219,7 +221,7 @@ class TestKimiK25VLStateDictAdapter:
         """Test convert_single_tensor_to_hf handles mm_projector key mapping."""
         # Test linear_1 -> proj.0 mapping
         fqn = "model.multi_modal_projector.linear_1.weight"
-        tensor = torch.randn(4608, 4608)
+        tensor = torch.randn(2, 3)
 
         result = adapter.convert_single_tensor_to_hf(fqn, tensor, quantization=False)
 
@@ -230,7 +232,7 @@ class TestKimiK25VLStateDictAdapter:
     def test_convert_single_tensor_to_hf_mm_projector_linear2(self, adapter):
         """Test convert_single_tensor_to_hf handles linear_2 -> proj.2 mapping."""
         fqn = "model.multi_modal_projector.linear_2.weight"
-        tensor = torch.randn(7168, 4608)
+        tensor = torch.randn(2, 3)
 
         result = adapter.convert_single_tensor_to_hf(fqn, tensor, quantization=False)
 
@@ -241,8 +243,8 @@ class TestKimiK25VLStateDictAdapter:
     def test_expand_quantized_keys(self, adapter):
         """Test _expand_quantized_keys expands expert weight keys to triplets."""
         state_dict = {
-            "language_model.model.layers.5.mlp.experts.0.gate_proj.weight": torch.randn(2048, 7168),
-            "language_model.model.layers.5.self_attn.q_proj.weight": torch.randn(1536, 7168),
+            "language_model.model.layers.5.mlp.experts.0.gate_proj.weight": torch.randn(32, 64),
+            "language_model.model.layers.5.self_attn.q_proj.weight": torch.randn(2, 3),
         }
 
         result = adapter._expand_quantized_keys(state_dict)
@@ -272,7 +274,7 @@ class TestKimiK25VLStateDictAdapterFromHF:
     def test_from_hf_vision_tower_key_mapping(self, adapter):
         """Test from_hf maps vision_tower keys correctly."""
         hf_state_dict = {
-            "vision_tower.encoder.blocks.0.wqkv.weight": torch.randn(3456, 1152),
+            "vision_tower.encoder.blocks.0.wqkv.weight": torch.randn(2, 3),
         }
 
         result = adapter.from_hf(hf_state_dict)
@@ -282,9 +284,9 @@ class TestKimiK25VLStateDictAdapterFromHF:
     def test_from_hf_mm_projector_key_mapping(self, adapter):
         """Test from_hf maps mm_projector keys correctly."""
         hf_state_dict = {
-            "mm_projector.proj.0.weight": torch.randn(4608, 4608),
-            "mm_projector.proj.2.weight": torch.randn(7168, 4608),
-            "mm_projector.pre_norm.weight": torch.randn(1152),
+            "mm_projector.proj.0.weight": torch.randn(2, 3),
+            "mm_projector.proj.2.weight": torch.randn(2, 3),
+            "mm_projector.pre_norm.weight": torch.randn(3),
         }
 
         result = adapter.from_hf(hf_state_dict)
@@ -296,7 +298,7 @@ class TestKimiK25VLStateDictAdapterFromHF:
     def test_from_hf_lm_head_key_mapping(self, adapter):
         """Test from_hf maps lm_head keys correctly."""
         hf_state_dict = {
-            "language_model.lm_head.weight": torch.randn(163840, 7168),
+            "language_model.lm_head.weight": torch.randn(2, 3),
         }
 
         result = adapter.from_hf(hf_state_dict)
@@ -306,7 +308,7 @@ class TestKimiK25VLStateDictAdapterFromHF:
     def test_from_hf_dtype_conversion(self, adapter):
         """Test from_hf converts tensors to target dtype."""
         hf_state_dict = {
-            "vision_tower.encoder.blocks.0.wqkv.weight": torch.randn(3456, 1152, dtype=torch.float32),
+            "vision_tower.encoder.blocks.0.wqkv.weight": torch.randn(2, 3, dtype=torch.float32),
         }
 
         result = adapter.from_hf(hf_state_dict)
@@ -464,8 +466,8 @@ class TestKimiK25VLStateDictAdapterToHF:
     def test_to_hf_basic_conversion(self, adapter):
         """Test basic to_hf conversion."""
         state_dict = {
-            "model.vision_tower.encoder.blocks.0.wqkv.weight": torch.randn(3456, 1152),
-            "model.multi_modal_projector.linear_1.weight": torch.randn(4608, 4608),
+            "model.vision_tower.encoder.blocks.0.wqkv.weight": torch.randn(2, 3),
+            "model.multi_modal_projector.linear_1.weight": torch.randn(2, 3),
         }
 
         result = adapter.to_hf(state_dict, quantization=False)
@@ -476,8 +478,8 @@ class TestKimiK25VLStateDictAdapterToHF:
     def test_to_hf_exclude_key_regex(self, adapter):
         """Test to_hf with exclude_key_regex."""
         state_dict = {
-            "model.vision_tower.encoder.blocks.0.wqkv.weight": torch.randn(3456, 1152),
-            "model.multi_modal_projector.linear_1.weight": torch.randn(4608, 4608),
+            "model.vision_tower.encoder.blocks.0.wqkv.weight": torch.randn(2, 3),
+            "model.multi_modal_projector.linear_1.weight": torch.randn(2, 3),
         }
 
         result = adapter.to_hf(state_dict, exclude_key_regex=r".*vision_tower.*", quantization=False)
@@ -488,11 +490,11 @@ class TestKimiK25VLStateDictAdapterToHF:
     def test_to_hf_all_projector_keys(self, adapter):
         """Test to_hf handles all projector key mappings."""
         state_dict = {
-            "model.multi_modal_projector.linear_1.weight": torch.randn(4608, 4608),
-            "model.multi_modal_projector.linear_1.bias": torch.randn(4608),
-            "model.multi_modal_projector.linear_2.weight": torch.randn(7168, 4608),
-            "model.multi_modal_projector.linear_2.bias": torch.randn(7168),
-            "model.multi_modal_projector.pre_norm.weight": torch.randn(1152),
+            "model.multi_modal_projector.linear_1.weight": torch.randn(2, 3),
+            "model.multi_modal_projector.linear_1.bias": torch.randn(2),
+            "model.multi_modal_projector.linear_2.weight": torch.randn(2, 3),
+            "model.multi_modal_projector.linear_2.bias": torch.randn(2),
+            "model.multi_modal_projector.pre_norm.weight": torch.randn(3),
         }
 
         result = adapter.to_hf(state_dict, quantization=False)
@@ -528,7 +530,7 @@ class TestKimiK25VLStateDictAdapterConvertSingleTensor:
     def test_convert_language_model_keys(self, adapter):
         """Test convert_single_tensor_to_hf handles language model keys."""
         fqn = "model.language_model.model.layers.0.self_attn.q_proj.weight"
-        tensor = torch.randn(1536, 7168)
+        tensor = torch.randn(2, 3)
 
         result = adapter.convert_single_tensor_to_hf(fqn, tensor, quantization=False)
 
@@ -540,7 +542,7 @@ class TestKimiK25VLStateDictAdapterConvertSingleTensor:
     def test_convert_with_quantization_expert_key(self, adapter):
         """Test convert_single_tensor_to_hf with quantization for expert key."""
         fqn = "model.language_model.model.layers.5.mlp.experts.0.gate_proj.weight"
-        tensor = torch.randn(2048, 7168)
+        tensor = torch.randn(32, 64)
 
         result = adapter.convert_single_tensor_to_hf(fqn, tensor, quantization=True)
 
@@ -553,7 +555,7 @@ class TestKimiK25VLStateDictAdapterConvertSingleTensor:
     def test_convert_with_quantization_non_expert_key(self, adapter):
         """Test convert_single_tensor_to_hf with quantization for non-expert key."""
         fqn = "model.vision_tower.encoder.blocks.0.wqkv.weight"
-        tensor = torch.randn(3456, 1152)
+        tensor = torch.randn(2, 3)
 
         result = adapter.convert_single_tensor_to_hf(fqn, tensor, quantization=True)
 
@@ -607,9 +609,9 @@ class TestKimiK25VLStateDictAdapterFromHFExtended:
     def test_from_hf_non_expert_keys_only(self, adapter):
         """Test from_hf with non-expert keys (no expert validation triggered)."""
         hf_state_dict = {
-            "vision_tower.encoder.blocks.0.wqkv.weight": torch.randn(3456, 1152),
-            "mm_projector.proj.0.weight": torch.randn(4608, 4608),
-            "mm_projector.proj.2.weight": torch.randn(7168, 4608),
+            "vision_tower.encoder.blocks.0.wqkv.weight": torch.randn(2, 3),
+            "mm_projector.proj.0.weight": torch.randn(2, 3),
+            "mm_projector.proj.2.weight": torch.randn(2, 3),
         }
 
         result = adapter.from_hf(hf_state_dict)
@@ -752,9 +754,9 @@ class TestExpandQuantizedKeysExtended:
     def test_expand_multiple_experts(self, adapter):
         """Test expansion of multiple expert keys."""
         state_dict = {
-            "language_model.model.layers.5.mlp.experts.0.gate_proj.weight": torch.randn(2048, 7168),
-            "language_model.model.layers.5.mlp.experts.1.gate_proj.weight": torch.randn(2048, 7168),
-            "language_model.model.layers.5.mlp.experts.0.up_proj.weight": torch.randn(2048, 7168),
+            "language_model.model.layers.5.mlp.experts.0.gate_proj.weight": torch.randn(32, 64),
+            "language_model.model.layers.5.mlp.experts.1.gate_proj.weight": torch.randn(32, 64),
+            "language_model.model.layers.5.mlp.experts.0.up_proj.weight": torch.randn(32, 64),
         }
 
         result = adapter._expand_quantized_keys(state_dict)
@@ -764,9 +766,9 @@ class TestExpandQuantizedKeysExtended:
 
     def test_expand_preserves_non_expert_keys(self, adapter):
         """Test expansion preserves non-expert keys unchanged."""
-        original_tensor = torch.randn(7168, 7168)
+        original_tensor = torch.randn(2, 3)
         state_dict = {
-            "language_model.model.layers.5.mlp.experts.0.gate_proj.weight": torch.randn(2048, 7168),
+            "language_model.model.layers.5.mlp.experts.0.gate_proj.weight": torch.randn(32, 64),
             "language_model.model.embed_tokens.weight": original_tensor,
         }
 
@@ -777,7 +779,7 @@ class TestExpandQuantizedKeysExtended:
 
     def test_expand_layer_zero_not_expanded(self, adapter):
         """Test layer 0 expert keys are NOT expanded."""
-        original_tensor = torch.randn(2048, 7168)
+        original_tensor = torch.randn(2, 3)
         state_dict = {
             "language_model.model.layers.0.mlp.experts.0.gate_proj.weight": original_tensor,
         }
@@ -998,10 +1000,10 @@ class TestExpertKeyFusionDetection:
     def test_detect_expert_keys_in_llm_keys(self):
         """Test detection of expert keys in LLM state dict."""
         llm_keys = {
-            "model.layers.5.mlp.experts.0.gate_proj.weight": torch.randn(2048, 7168),
-            "model.layers.5.mlp.experts.0.up_proj.weight": torch.randn(2048, 7168),
-            "model.layers.5.mlp.experts.1.gate_proj.weight": torch.randn(2048, 7168),
-            "model.layers.5.self_attn.q_proj.weight": torch.randn(1536, 7168),  # Not expert
+            "model.layers.5.mlp.experts.0.gate_proj.weight": torch.empty(1),
+            "model.layers.5.mlp.experts.0.up_proj.weight": torch.empty(1),
+            "model.layers.5.mlp.experts.1.gate_proj.weight": torch.empty(1),
+            "model.layers.5.self_attn.q_proj.weight": torch.empty(1),  # Not expert
         }
 
         expert_llm_keys = [k for k in llm_keys.keys() if "experts." in k and ".weight" in k]
@@ -1053,8 +1055,8 @@ class TestExpertKeyFusionDetection:
     def test_key_prefix_replacement(self):
         """Test model.language_model.model prefix replacement."""
         converted_llm = {
-            "model.layers.5.self_attn.q_proj.weight": torch.randn(1536, 7168),
-            "model.embed_tokens.weight": torch.randn(163840, 7168),
+            "model.layers.5.self_attn.q_proj.weight": torch.empty(1),
+            "model.embed_tokens.weight": torch.empty(1),
         }
 
         native_state_dict = {}
@@ -1307,7 +1309,7 @@ class TestConvertSingleTensorToHFQuantizationPaths:
     def test_quantization_non_dtensor_produces_packed_scale_shape(self, adapter):
         """Regular (non-DTensor, non-meta) expert weight goes through quantize_to_int4."""
         fqn = "model.language_model.model.layers.5.mlp.experts.0.gate_proj.weight"
-        tensor = torch.randn(2048, 7168)
+        tensor = torch.randn(32, 64)
 
         result = adapter.convert_single_tensor_to_hf(fqn, tensor, quantization=True)
 
@@ -1323,10 +1325,10 @@ class TestConvertSingleTensorToHFQuantizationPaths:
         assert len(shape_key) == 1
 
         assert vals[packed_key[0]].dtype == torch.int32
-        assert vals[packed_key[0]].shape == (2048, 7168 // 8)
+        assert vals[packed_key[0]].shape == (32, 64 // 8)
         assert vals[scale_key[0]].dtype == torch.float16
-        assert vals[scale_key[0]].shape == (2048, 7168 // 32)
-        assert vals[shape_key[0]].tolist() == [2048, 7168]
+        assert vals[scale_key[0]].shape == (32, 64 // 32)
+        assert vals[shape_key[0]].tolist() == [32, 64]
 
     def test_quantization_meta_tensor_produces_meta_placeholders(self, adapter):
         """Meta tensors produce meta-device empty placeholders instead of real quantized data."""
@@ -1356,7 +1358,7 @@ class TestConvertSingleTensorToHFQuantizationPaths:
     def test_quantization_non_expert_key_is_not_quantized(self, adapter):
         """Non-expert keys pass through without quantization even when quantization=True."""
         fqn = "model.vision_tower.encoder.blocks.0.wqkv.weight"
-        tensor = torch.randn(3456, 1152)
+        tensor = torch.randn(2, 3)
 
         result = adapter.convert_single_tensor_to_hf(fqn, tensor, quantization=True)
 

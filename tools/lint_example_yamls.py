@@ -48,6 +48,9 @@ EXCLUDED_RECIPE_FILES = {
     # (torchrun for multi-node), so they have no recipe-class entry point by design.
     Path("examples/speculative/dspark/deepseek_v4_flash_dspark_precompute.yaml"),
     Path("examples/speculative/dspark/glm_5.2_dspark_precompute.yaml"),
+    # A plain YAML list of bench_sweep.py dataset entries, not a recipe config
+    # (consumed via --datasets-config, launched with python -m ... bench_sweep).
+    Path("examples/speculative/bench_sweep/spec_bench_datasets.yaml"),
 }
 
 RECIPE_TARGET_HELP = (

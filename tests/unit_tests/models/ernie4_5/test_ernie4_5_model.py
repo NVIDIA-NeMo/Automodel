@@ -327,10 +327,11 @@ class TestErnie4_5ForCausalLM:
         model = Ernie4_5ForCausalLM(dense_config, backend=backend_config)
         assert model.lm_head.weight is model.model.embed_tokens.weight
 
-    def test_lm_head_untied(self, dense_config, backend_config):
+    def test_lm_head_untied_is_rejected(self, dense_config, backend_config):
+        # ERNIE-4.5 is TIED_ONLY: both shipped checkpoints are tied, so untying is rejected.
         dense_config.tie_word_embeddings = False
-        model = Ernie4_5ForCausalLM(dense_config, backend=backend_config)
-        assert model.lm_head.weight is not model.model.embed_tokens.weight
+        with pytest.raises(NotImplementedError, match="does not support tie_word_embeddings=False"):
+            Ernie4_5ForCausalLM(dense_config, backend=backend_config)
 
     def test_tie_weights_rebinds(self, dense_config, backend_config):
         dense_config.tie_word_embeddings = True
@@ -388,10 +389,11 @@ class TestErnie4_5_MoeForCausalLM:
         model = Ernie4_5_MoeForCausalLM(moe_hf_config, backend=backend_config)
         assert model.lm_head.weight is model.model.embed_tokens.weight
 
-    def test_lm_head_untied(self, moe_hf_config, backend_config):
+    def test_lm_head_untied_is_rejected(self, moe_hf_config, backend_config):
+        # ERNIE-4.5 is TIED_ONLY: both shipped checkpoints are tied, so untying is rejected.
         moe_hf_config.tie_word_embeddings = False
-        model = Ernie4_5_MoeForCausalLM(moe_hf_config, backend=backend_config)
-        assert model.lm_head.weight is not model.model.embed_tokens.weight
+        with pytest.raises(NotImplementedError, match="does not support tie_word_embeddings=False"):
+            Ernie4_5_MoeForCausalLM(moe_hf_config, backend=backend_config)
 
     def test_state_dict_adapter_off_by_default(self, moe_hf_config, backend_config):
         model = Ernie4_5_MoeForCausalLM(moe_hf_config, backend=backend_config)

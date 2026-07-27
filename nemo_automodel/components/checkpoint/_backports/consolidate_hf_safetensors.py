@@ -145,11 +145,24 @@ def _resolve_output_dtype(
 ) -> tuple[torch.dtype, str]:
     """Resolve the output dtype for a tensor.
 
-    Explicit cast_dtype wins for ordinary floating-point tensors. Otherwise,
-    original HF dtype metadata restores ordinary floating-point tensors per FQN
-    when available; checkpoints without that metadata keep the saved dtype.
+    Per-FQN fp32 metadata is an intrinsic model contract and remains authoritative
+    when ``cast_dtype`` is set. The explicit cast wins for other ordinary
+    floating-point tensors. Without a cast, per-FQN metadata restores ordinary
+    floating-point tensors when available; checkpoints without that metadata keep
+    the saved dtype.
     """
     source_dtype = _get_known_dtype(source_dtype_str)
+    mapped_dtype_str = fqn_to_dtype_mapping.get(fqn) if fqn_to_dtype_mapping else None
+    mapped_dtype = _get_known_dtype(mapped_dtype_str) if mapped_dtype_str is not None else None
+
+    if (
+        cast_dtype is not None
+        and mapped_dtype_str is not None
+        and mapped_dtype is torch.float32
+        and _is_regular_floating_dtype(source_dtype)
+    ):
+        return mapped_dtype, mapped_dtype_str
+
     if cast_dtype is not None:
         output_dtype = cast_dtype if _should_cast_dtype(source_dtype, cast_dtype) else source_dtype
         output_dtype_str = (
@@ -157,21 +170,19 @@ def _resolve_output_dtype(
         )
         return output_dtype, output_dtype_str
 
-    if not fqn_to_dtype_mapping or fqn not in fqn_to_dtype_mapping:
+    if mapped_dtype is None or mapped_dtype_str is None:
         return source_dtype, source_dtype_str
 
-    original_dtype_str = fqn_to_dtype_mapping[fqn]
-    original_dtype = _get_known_dtype(original_dtype_str)
-    if original_dtype == source_dtype:
+    if mapped_dtype == source_dtype:
         return source_dtype, source_dtype_str
 
-    if _is_regular_floating_dtype(original_dtype) and torch.empty((), dtype=source_dtype).is_floating_point():
-        return original_dtype, original_dtype_str
+    if _is_regular_floating_dtype(mapped_dtype) and torch.empty((), dtype=source_dtype).is_floating_point():
+        return mapped_dtype, mapped_dtype_str
 
     # If a quantized/packed original tensor was saved as float, keep the float
     # value as a dequantized export instead of pretending we can restore packing.
     if torch.empty((), dtype=source_dtype).is_floating_point() and quantized_dtype_mismatches is not None:
-        quantized_dtype_mismatches.append((fqn, original_dtype_str, source_dtype_str))
+        quantized_dtype_mismatches.append((fqn, mapped_dtype_str, source_dtype_str))
     return source_dtype, source_dtype_str
 
 
@@ -893,15 +904,16 @@ def consolidate_safetensors_files(
                     temporary files will be created in this directory instead of the system temp.
                     Only used when use_staging=True. Useful when system temp has limited space.
         cast_dtype: Optional dtype used to cast floating-point tensors during consolidation.
-        fqn_to_dtype_mapping: Optional mapping from tensor FQN to original HF safetensors dtype string.
+        fqn_to_dtype_mapping: Optional mapping from tensor FQN to target safetensors dtype string. This can combine
+            original HF dtype metadata with model-owned export overrides.
     """
     start_time = time.time()
     logger.info("Consolidating safetensors files from %s to %s.", input_dir, output_dir)
     if cast_dtype is not None:
         logger.info(
             "Requested cast dtype %s for consolidation. Only ordinary floating-point tensors with a different "
-            "source dtype will be cast; tensors already in this dtype, FP8 tensors, and non-floating tensors "
-            "are unchanged.",
+            "source dtype will be cast; tensors mapped to FP32, tensors already in this dtype, FP8 tensors, and "
+            "non-floating tensors are unchanged.",
             cast_dtype,
         )
 
@@ -957,7 +969,8 @@ def consolidate_safetensors_files_on_every_rank(
                     temporary files will be created in this directory instead of the system temp.
                     Only used when use_staging=True. Useful when system temp has limited space.
         cast_dtype: Optional dtype used to cast floating-point tensors during consolidation.
-        fqn_to_dtype_mapping: Optional mapping from tensor FQN to original HF safetensors dtype string.
+        fqn_to_dtype_mapping: Optional mapping from tensor FQN to target safetensors dtype string. This can combine
+            original HF dtype metadata with model-owned export overrides.
     """
 
     start_time = time.time()
@@ -975,8 +988,8 @@ def consolidate_safetensors_files_on_every_rank(
         if cast_dtype is not None:
             logger.info(
                 "Requested cast dtype %s for consolidation. Only ordinary floating-point tensors with a different "
-                "source dtype will be cast; tensors already in this dtype, FP8 tensors, and non-floating tensors "
-                "are unchanged.",
+                "source dtype will be cast; tensors mapped to FP32, tensors already in this dtype, FP8 tensors, and "
+                "non-floating tensors are unchanged.",
                 cast_dtype,
             )
 
@@ -1041,7 +1054,7 @@ def consolidate_safetensors_files_on_every_rank(
     # Wait for all ranks to complete
     if dist.is_available() and dist.is_initialized():
         logger.debug("Rank %d: Waiting for all ranks to complete...", rank)
-        dist.barrier()
+        dist.barrier(group=process_group)
         logger.debug("Rank %d: All ranks have completed.", rank)
         if rank == 0:
             logger.debug("Total time taken: %.2f secs.", time.time() - start_time)

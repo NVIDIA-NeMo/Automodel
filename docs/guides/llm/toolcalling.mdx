@@ -13,7 +13,12 @@ FunctionGemma is a lightweight, 270M-parameter variant built on the Gemma 3 arch
 - Text-only, function-oriented model (not a general dialogue model), best used after task-specific finetuning.
 
 ## Prerequisites
-- Install NeMo AutoModel and its extras: `pip install nemo-automodel`.
+- Install NeMo AutoModel in an activated virtual environment:
+  ```bash
+  uv venv
+  source .venv/bin/activate
+  uv pip install "nemo-automodel"
+  ```
 - A FunctionGemma checkpoint available locally or using [https://huggingface.co/google/functiongemma-270m-it](https://huggingface.co/google/functiongemma-270m-it).
 - Small model footprint: can be fine-tuned on a single GPU; scale batch/sequence as needed.
 

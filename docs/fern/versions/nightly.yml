@@ -194,6 +194,8 @@ navigation:
             slug: overview
           - page: "Kimi-VL"
             path: ../../model-coverage/vlm/moonshotai/kimi-vl.mdx
+          - page: "Inkling"
+            path: ../../model-coverage/vlm/thinkingmachines/inkling.mdx
           - page: "Gemma 3 VL / Gemma 3n"
             path: ../../model-coverage/vlm/google/gemma3-vl.mdx
             slug: gemma-3-vl-gemma-3n

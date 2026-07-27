@@ -90,17 +90,12 @@ model:
 
 ## Try with NeMo AutoModel
 
-**1. Install** ([full instructions](/get-started/installation)):
-
-```bash
-pip install nemo-automodel
-```
-
-**2. Clone the repo** to get the example recipes:
+**1. Clone and install from source** ([full instructions](/get-started/installation)):
 
 ```bash
 git clone https://github.com/NVIDIA-NeMo/Automodel.git
 cd Automodel
+uv sync --locked --all-groups --all-extras
 ```
 
 <Note>
@@ -108,10 +103,10 @@ This is a long-context multi-node recipe that uses CP=8, EP=64, and PP=4. See th
 
 </Note>
 
-**3. Run the recipe** from inside the repo:
+**2. Run the recipe** from inside the repo:
 
 ```bash
-automodel --nproc-per-node=8 examples/llm_finetune/glm/glm_5.2_tulu3_32k_tilelang_cp8.yaml
+uv run automodel --nproc-per-node=8 examples/llm_finetune/glm/glm_5.2_tulu3_32k_tilelang_cp8.yaml
 ```
 
 <Accordion title="Run with Docker">

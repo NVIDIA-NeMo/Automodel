@@ -25,15 +25,19 @@ from nemo_automodel.components.models.glm_moe_dsa import cp as glm_cp
 
 
 class _FakeMesh:
-    def __init__(self, size=2, group="cp-group"):
+    def __init__(self, size=2, group="cp-group", rank=0):
         self._size = size
         self._group = group
+        self._rank = rank
 
     def size(self):
         return self._size
 
     def get_group(self):
         return self._group
+
+    def get_local_rank(self):
+        return self._rank
 
 
 def _thd_chunk(num_tokens=6):
@@ -79,16 +83,24 @@ def test_glm_dsa_cp_all_gather_concatenates_autograd_gather(monkeypatch):
     assert out.tolist() == [[0, 1], [2, 3], [10, 11], [12, 13]]
 
 
-def test_contiguous_cp_indices_requires_even_divisibility():
-    with pytest.raises(ValueError, match="total tokens divisible"):
-        glm_cp._contiguous_cp_indices(total_tokens=5, cp_size=2, cp_rank=0, device=torch.device("cpu"))
-
-    assert glm_cp._contiguous_cp_indices(6, 3, 1, torch.device("cpu")).tolist() == [2, 3]
+def test_slice_thd_chunk_requires_even_divisibility():
+    # The shared contiguous index map owns the divisibility contract; GLM no
+    # longer carries its own copy of the arithmetic.
+    with pytest.raises(ValueError, match="divisible by cp_size"):
+        glm_cp._slice_thd_chunk_for_cp(
+            _thd_chunk(num_tokens=5),
+            cp_mesh=_FakeMesh(size=2, rank=0),
+            cp_group="cp-group",
+            cp_size=2,
+            cp_rank=0,
+            padding_token_id=3,
+        )
 
 
 def test_slice_thd_chunk_for_cp_preserves_global_metadata_and_padding_mask():
     out = glm_cp._slice_thd_chunk_for_cp(
         _thd_chunk(),
+        cp_mesh=_FakeMesh(size=3, rank=1),
         cp_group="cp-group",
         cp_size=3,
         cp_rank=1,
@@ -136,6 +148,25 @@ def test_make_glm_dsa_packed_cp_batch_single_chunk(monkeypatch):
     assert out["input_ids"].tolist() == [0, 1]
     assert out["cp_size"] == 3
     assert out["cp_rank"] == 0
+
+
+def test_shard_glm_dsa_packed_cp_batch_reports_single_chunk_layout(monkeypatch):
+    monkeypatch.setattr(glm_cp, "split_batch_into_thd_chunks", lambda *args, **kwargs: _thd_chunk())
+    monkeypatch.setattr(glm_cp.dist, "is_available", lambda: False)
+    monkeypatch.setattr(glm_cp.dist, "is_initialized", lambda: False)
+
+    ctx, out, layout = glm_cp.shard_glm_dsa_packed_cp_batch(
+        _FakeMesh(size=3),
+        None,
+        {"input_ids": torch.arange(6).view(1, 6)},
+        padding_token_id=3,
+        num_chunks=1,
+    )
+
+    assert ctx is contextlib.nullcontext
+    assert out["input_ids"].tolist() == [0, 1]
+    assert layout.padded_seq_len == 6
+    assert layout.input_row_shape == (1, 6)
 
 
 def test_make_glm_dsa_packed_cp_batch_stacks_pipeline_chunks(monkeypatch):

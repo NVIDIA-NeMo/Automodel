@@ -38,7 +38,7 @@ class _RecordingDraft(nn.Module):
         self.lin = nn.Linear(_HIDDEN, _HIDDEN)
         self.received = None
 
-    def forward(self, input_ids, target_hidden_states, attention_mask):
+    def forward(self, input_ids, target_hidden_states, attention_mask, position_ids=None, seq_lens=None):
         self.received = target_hidden_states.detach().clone()
         return self.lin(target_hidden_states)
 

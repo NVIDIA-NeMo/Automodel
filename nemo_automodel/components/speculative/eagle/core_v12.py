@@ -88,8 +88,21 @@ class EagleTrainerModule(nn.Module):
         input_hidden_states: torch.Tensor,
         target_hidden_states: torch.Tensor,
         target_logits: torch.Tensor,
+        position_ids: torch.Tensor | None = None,
+        seq_lens: torch.Tensor | None = None,
+        doc_remaining: torch.Tensor | None = None,
     ) -> EagleStepMetrics:
-        """Run one EAGLE-1 / EAGLE-2 training step."""
+        """Run one EAGLE-1 / EAGLE-2 training step.
+
+        Per-token tensors are ``[B, T]`` (``position_ids`` / ``doc_remaining``
+        included) except the ``[B, T, H]`` hidden states and ``[B, T, V]``
+        ``target_logits``; ``seq_lens`` is ``[B, max_docs]``. When packing is on,
+        ``position_ids`` / ``seq_lens`` make the draft block-causal and per-document,
+        and ``doc_remaining`` (real tokens after each slot within its document) gates
+        supervision: a document's last real token (``doc_remaining == 0``) is dropped
+        because the wrapper's global left-shift makes its target the next document's
+        first token.
+        """
         if self.training and self.feature_noise > 0:
             # EAGLE feature-noise augmentation (see __init__): add
             # U(-feature_noise, feature_noise) to the draft's input features.
@@ -104,10 +117,16 @@ class EagleTrainerModule(nn.Module):
             input_ids=input_ids,
             target_hidden_states=input_hidden_states,
             attention_mask=attention_mask,
+            position_ids=position_ids,
+            seq_lens=seq_lens,
         )
         predicted_logits = self.compute_logits(predicted_hidden_states)
 
         valid_mask = loss_mask.bool()
+        if doc_remaining is not None:
+            # Packing: drop each document's last real token (doc_remaining == 0),
+            # whose left-shifted supervision target belongs to the next document.
+            valid_mask = valid_mask & (doc_remaining > 0)
         position_mask = valid_mask.unsqueeze(-1)
         valid_tokens = valid_mask.sum()
 

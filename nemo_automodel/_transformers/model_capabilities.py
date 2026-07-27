@@ -54,16 +54,18 @@ class ModelCapabilities:
         supports_cp: Context parallelism.
         supports_pp: Pipeline parallelism.
         supports_ep: Expert parallelism (MoE).
+        supports_thd: THD packed-sequence inputs.
     """
 
     supports_tp: bool = False
     supports_cp: bool = False
     supports_pp: bool = False
     supports_ep: bool = False
+    supports_thd: bool = False
 
 
 def _to_canonical(caps_obj) -> ModelCapabilities:
-    """Re-pack any object with the four ``supports_*`` fields into the canonical type.
+    """Re-pack any object with the five ``supports_*`` fields into the canonical type.
 
     Per-class nested ``ModelCapabilities`` dataclasses are their own types; this
     converts them to the canonical :class:`ModelCapabilities` so callers see a
@@ -76,6 +78,7 @@ def _to_canonical(caps_obj) -> ModelCapabilities:
         supports_cp=bool(caps_obj.supports_cp),
         supports_pp=bool(caps_obj.supports_pp),
         supports_ep=bool(caps_obj.supports_ep),
+        supports_thd=bool(caps_obj.supports_thd),
     )
 
 
@@ -101,29 +104,37 @@ def _arch_from_config(config) -> str:
 
 def _dispatch(model_cls, config) -> ModelCapabilities:
     """Apply the static/dynamic capability rules for a resolved class."""
-    has_dynamic = "get_capabilities" in model_cls.__dict__
-    has_static = "ModelCapabilities" in model_cls.__dict__
+    # Capability attachment wraps models in a thin runtime subclass, while the
+    # declaration remains on the original model class.
+    capability_cls = next(
+        (cls for cls in model_cls.__mro__ if "get_capabilities" in cls.__dict__ or "ModelCapabilities" in cls.__dict__),
+        None,
+    )
+    if capability_cls is None:
+        raise AttributeError(
+            f"{model_cls.__name__} declares no capabilities (neither nested "
+            f"'ModelCapabilities' dataclass nor 'get_capabilities' classmethod)."
+        )
+
+    has_dynamic = "get_capabilities" in capability_cls.__dict__
+    has_static = "ModelCapabilities" in capability_cls.__dict__
 
     if has_dynamic and has_static:
         raise TypeError(
-            f"{model_cls.__name__} declares both 'ModelCapabilities' and "
+            f"{capability_cls.__name__} declares both 'ModelCapabilities' and "
             f"'get_capabilities'. A class must declare exactly one."
         )
     if has_dynamic:
         if config is None:
             raise ValueError(
-                f"{model_cls.__name__} uses dynamic capability dispatch via "
+                f"{capability_cls.__name__} uses dynamic capability dispatch via "
                 f"get_capabilities(config); a config is required. Pass an HF "
                 f"model id, a PretrainedConfig, or a model instance instead of "
                 f"the bare class."
             )
-        return _to_canonical(model_cls.get_capabilities(config))
+        return _to_canonical(capability_cls.get_capabilities(config))
     if has_static:
-        return _to_canonical(model_cls.ModelCapabilities())
-    raise AttributeError(
-        f"{model_cls.__name__} declares no capabilities (neither nested "
-        f"'ModelCapabilities' dataclass nor 'get_capabilities' classmethod)."
-    )
+        return _to_canonical(capability_cls.ModelCapabilities())
 
 
 def query_capabilities(

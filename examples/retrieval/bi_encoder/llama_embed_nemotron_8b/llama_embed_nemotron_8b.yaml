@@ -39,31 +39,31 @@ tokenizer:
   _target_: transformers.AutoTokenizer.from_pretrained
   pretrained_model_name_or_path: meta-llama/Llama-3.1-8B
 
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.retrieval_dataset.RetrievalDatasetConfig
+  model_type: bi_encoder
+  data_dir_list:
+    - ./embed_nemotron_dataset_v1/EmotionClassification/EmotionClassification.json
+    - ./embed_nemotron_dataset_v1/FEVER/FEVER.json
+    - ./embed_nemotron_dataset_v1/GooAQ/GooAQ.json
+    - ./embed_nemotron_dataset_v1/HotpotQA/HotpotQA.json
+    - ./embed_nemotron_dataset_v1/MAmmoTH2/MAmmoTH2.json
+    - ./embed_nemotron_dataset_v1/MIRACL/MIRACL.json
+    - ./embed_nemotron_dataset_v1/MSMARCO/MSMARCO.json
+    - ./embed_nemotron_dataset_v1/NaturalQuestions/NaturalQuestions.json
+    - ./embed_nemotron_dataset_v1/NFCorpus/NFCorpus.json
+    - ./embed_nemotron_dataset_v1/PAQ/PAQ.json
+    - ./embed_nemotron_dataset_v1/SciFact/SciFact.json
+    - ./embed_nemotron_dataset_v1/SQuAD/SQuAD.json
+    - ./embed_nemotron_dataset_v1/SyntheticClassificationData/SyntheticClassificationData.json
+    - ./embed_nemotron_dataset_v1/TriviaQA/TriviaQA.json
+  data_type: train
+  n_passages: 5
+  seed: 125
+  do_shuffle: true
+  use_dataset_instruction: true
+
 dataloader:
-  _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  dataset:
-    _target_: nemo_automodel.components.datasets.llm.make_retrieval_dataset
-    model_type: bi_encoder
-    data_dir_list:
-      - ./embed_nemotron_dataset_v1/EmotionClassification/EmotionClassification.json
-      - ./embed_nemotron_dataset_v1/FEVER/FEVER.json
-      - ./embed_nemotron_dataset_v1/GooAQ/GooAQ.json
-      - ./embed_nemotron_dataset_v1/HotpotQA/HotpotQA.json
-      - ./embed_nemotron_dataset_v1/MAmmoTH2/MAmmoTH2.json
-      - ./embed_nemotron_dataset_v1/MIRACL/MIRACL.json
-      - ./embed_nemotron_dataset_v1/MSMARCO/MSMARCO.json
-      - ./embed_nemotron_dataset_v1/NaturalQuestions/NaturalQuestions.json
-      - ./embed_nemotron_dataset_v1/NFCorpus/NFCorpus.json
-      - ./embed_nemotron_dataset_v1/PAQ/PAQ.json
-      - ./embed_nemotron_dataset_v1/SciFact/SciFact.json
-      - ./embed_nemotron_dataset_v1/SQuAD/SQuAD.json
-      - ./embed_nemotron_dataset_v1/SyntheticClassificationData/SyntheticClassificationData.json
-      - ./embed_nemotron_dataset_v1/TriviaQA/TriviaQA.json
-    data_type: train
-    n_passages: 5
-    seed: 125
-    do_shuffle: true
-    use_dataset_instruction: true
   collate_fn:
     _target_: nemo_automodel.components.datasets.llm.BiEncoderCollator
     q_max_len: 512

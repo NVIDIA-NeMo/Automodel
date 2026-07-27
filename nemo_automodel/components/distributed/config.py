@@ -112,6 +112,7 @@ class DistributedSetup:
         activation_checkpointing: ActivationCheckpointingMode = False,
         world_size: int | None = None,
         timeout_minutes: int | None = None,
+        ranks: list[int] | tuple[int, ...] | None = None,
     ) -> "DistributedSetup":
         """Create a resolved distributed setup from sizes and policy configs.
 
@@ -150,6 +151,7 @@ class DistributedSetup:
             parallelism_sizes=parallelism_sizes,
             world_size=world_size,
             timeout_minutes=timeout_minutes,
+            ranks=ranks,
         )
 
         return cls(
@@ -303,15 +305,28 @@ class MegatronFSDPConfig:
     support pp_size, dp_replicate_size, or ep_size.
 
     Attributes:
-        megatron_fsdp_unit_modules (Optional[List[str]]): List of unit modules to be
-            wrapped with MegatronFSDP.
+        megatron_fsdp_unit_modules (list[str] | None): Class paths of the submodules to wrap
+            as individual MegatronFSDP units. When ``None`` (the default), the wrap classes
+            are auto-derived from the model's ``_no_split_modules`` so the real instantiated
+            block classes are used regardless of backend (HF or NeMo-custom).
         zero_dp_strategy (int): Data parallel sharding strategy.
         init_fsdp_with_meta_device (bool): Initialize MegatronFSDP with meta device if True.
         grad_reduce_in_fp32 (bool): Reduce gradients in fp32 if True.
         preserve_fp32_weights (bool): Preserve fp32 weights if True.
         overlap_grad_reduce (bool): Overlap gradient reduction if True.
         overlap_param_gather (bool): Overlap parameter gathering if True.
-        check_for_nan_in_grad (bool): Check for NaN in gradients if True.
+        check_for_nan_in_grad (bool): Legacy buffer-level gradient NaN check.
+            BREAKING CHANGE on megatron-fsdp 0.5.0: this flag is a no-op,
+            preserved only for config compatibility. 0.5.0 removed the
+            buffer-level NaN check entirely, so gradient NaN checking is now OFF
+            regardless of this value; a truthy value is dropped with a one-time
+            warning. The default is kept True for config compatibility, but has
+            no effect. To restore gradient NaN checking, enable
+            report_nan_in_param_grad instead.
+        report_nan_in_param_grad (bool): Enable megatron-fsdp 0.5.0's precise
+            per-parameter gradient NaN check. This is the replacement for the
+            removed check_for_nan_in_grad and is OFF by default; enabling it can
+            significantly reduce training throughput.
         average_in_collective (bool): Average in collective if True.
         disable_bucketing (bool): Disable bucketing if True.
         calculate_per_token_loss (bool): Calculate per token loss if True.
@@ -322,9 +337,7 @@ class MegatronFSDPConfig:
             MLP layers to save memory.
     """
 
-    megatron_fsdp_unit_modules: List[str] = field(
-        default_factory=lambda: ["transformers.models.llama.modeling_llama.LlamaDecoderLayer"]
-    )
+    megatron_fsdp_unit_modules: list[str] | None = None
     zero_dp_strategy: int = 3
     init_fsdp_with_meta_device: bool = False
     grad_reduce_in_fp32: bool = False
@@ -332,6 +345,7 @@ class MegatronFSDPConfig:
     overlap_grad_reduce: bool = True
     overlap_param_gather: bool = True
     check_for_nan_in_grad: bool = True
+    report_nan_in_param_grad: bool = False
     average_in_collective: bool = False
     disable_bucketing: bool = False
     calculate_per_token_loss: bool = False

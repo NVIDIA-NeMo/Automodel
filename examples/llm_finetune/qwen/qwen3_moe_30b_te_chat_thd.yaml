@@ -91,6 +91,7 @@ dataset:
   truncation: true
   seq_length: 1024
   padding: max_length
+  chat_template: examples/convergence/tulu3/models/qwen3-moe-30b/chat_template.jinja
 
 packed_sequence:
   # No packing — the THD collater synthesizes seq_lens from ChatDataset output.
@@ -109,6 +110,7 @@ validation_dataset:
   truncation: true
   seq_length: 1024
   padding: max_length
+  chat_template: examples/convergence/tulu3/models/qwen3-moe-30b/chat_template.jinja
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
