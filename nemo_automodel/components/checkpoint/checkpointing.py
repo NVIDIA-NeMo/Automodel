@@ -1459,16 +1459,15 @@ fi
                     num_shards,
                 )
 
-        # Add any missing keys from the global pre-shard HF state dict.
+        # Add any missing keys from the global pre-shard HF state dict and the current state dict.
         # These will go to the same file as the last file (or file 1 for single-file models).
-        # Under PP, each rank's state_dict contains only its local stage. Using it here
-        # produces rank-local mappings for keys that are absent from the source index,
-        # such as model-owned tensors injected while adapting the HF checkpoint.
+        # The global keys keep mappings complete under PP, while the current keys preserve
+        # parameters registered after parallelization, such as test- or application-owned weights.
         # Use default of 1 when mapping is empty (e.g., encoder models with different key prefixes)
         default_index = max(fqn_to_file_index_mapping.values()) if fqn_to_file_index_mapping else 1
 
         # add any additional keys that are not in the base checkpoint
-        additional_keys = pre_shard_hf_state_dict_keys or list(state_dict.keys())
+        additional_keys = dict.fromkeys([*(pre_shard_hf_state_dict_keys or ()), *state_dict])
         for fqn in additional_keys:
             if fqn not in excluded_keys:
                 fqn_to_file_index_mapping[fqn] = fqn_to_file_index_mapping.get(fqn, default_index)
