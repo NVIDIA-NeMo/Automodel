@@ -92,7 +92,7 @@ optimizer:
 
 ci:
   recipe_owner: hemildesai
-  time: "00:15:00"
+  time: "00:20:00"
   known_issue_id: AM-648
   allow_failure: true
   checkpoint_robustness:

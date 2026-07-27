@@ -2664,10 +2664,10 @@ class _FakeBlockWithAttn:
 
 
 def _stub_dense_cp_hooks(monkeypatch):
-    cp_utils_stub = types.ModuleType("nemo_automodel.components.distributed.cp_utils")
+    cp_utils_stub = types.ModuleType("nemo_automodel.components.distributed.context_parallel.utils")
     cp_utils_stub.attach_context_parallel_hooks = MagicMock()
     cp_utils_stub.attach_cp_sdpa_hooks = MagicMock()
-    monkeypatch.setitem(sys.modules, "nemo_automodel.components.distributed.cp_utils", cp_utils_stub)
+    monkeypatch.setitem(sys.modules, "nemo_automodel.components.distributed.context_parallel.utils", cp_utils_stub)
     return cp_utils_stub
 
 

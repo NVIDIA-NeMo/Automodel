@@ -28,8 +28,8 @@ import pytest
 import torch
 import torch.nn as nn
 
-import nemo_automodel.components.distributed.magi_attn_utils as mu
-from nemo_automodel.components.distributed.magi_attn_utils import AttnMaskSpec, MagiState, setup_magi
+import nemo_automodel.components.distributed.context_parallel.magi as mu
+from nemo_automodel.components.distributed.context_parallel.magi import AttnMaskSpec, MagiState, setup_magi
 
 
 class _FakeCfg:
@@ -155,10 +155,12 @@ class TestMagiState:
         st = MagiState(enabled=True, custom=True, cp_group=None, cp_size=1)
         batch = {"input_ids": torch.zeros(1, 4, dtype=torch.long), "prefix_tree": ([1, 1, 1], [[0, 1], [0, 2]])}
         try:
-            _, out = st.prepare_llm_batch(
+            _, out, local_indices = st.prepare_llm_batch(
                 model=None, batch=batch, device_mesh=None, is_thd=False, pad_id=0, num_chunks=1
             )
             assert "prefix_tree" not in out
+            # no dispatch ran on this path -> no local-token index map
+            assert local_indices is None
             assert mu.get_active_attn_spec() is not None
         finally:
             mu.set_active_attn_spec(None)

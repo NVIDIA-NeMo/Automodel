@@ -440,7 +440,7 @@ def make_tulu3_dataset(
     ``messages`` field is converted with the same helper the meta-JSON path uses
     (:func:`_convert_sharegpt_to_conversation`), so the resulting data composition is
     **identical** to dumping the split to JSONL and loading it via
-    :func:`make_meta_dataset`: no turn cap, ``system`` turns dropped, every row kept
+    :func:`make_meta_dataset`: no turn cap, ``system`` turns preserved, every row kept
     in the original split order. Conversations are text-only (no ``image`` entries),
     so batches carry no ``pixel_values`` / vision tensors.
 
@@ -533,7 +533,8 @@ def _convert_sharegpt_to_conversation(
     Args:
         example (dict): A single data example in sharegpt format.
         columns (dict): Column name mapping with keys 'messages', 'images', 'videos'.
-        tags (dict): Tag mapping with keys 'role_tag', 'content_tag', 'user_tag', 'assistant_tag'.
+        tags (dict): Tag mapping with keys 'role_tag', 'content_tag', 'user_tag', 'assistant_tag',
+            'system_tag'.
         media_dir (str | None): Directory prefix for resolving relative media paths.
 
     Returns:
@@ -550,6 +551,7 @@ def _convert_sharegpt_to_conversation(
     content_tag = tags.get("content_tag", "content")
     user_tag = tags.get("user_tag", "user")
     assistant_tag = tags.get("assistant_tag", "assistant")
+    system_tag = tags.get("system_tag", "system")
 
     messages = example.get(messages_col, [])
     images = list(example.get(images_col, []) or [])
@@ -567,13 +569,17 @@ def _convert_sharegpt_to_conversation(
             role = "user"
         elif role_value == assistant_tag:
             role = "assistant"
+        elif role_value == system_tag:
+            role = "system"
         else:
             continue
 
-        if role == "assistant":
+        # Media placeholders are only meaningful in user turns; system and
+        # assistant turns are emitted as plain text.
+        if role in ("assistant", "system"):
             conversation.append(
                 {
-                    "role": "assistant",
+                    "role": role,
                     "content": [{"type": "text", "text": content_text}],
                 }
             )
@@ -981,7 +987,7 @@ def make_meta_dataset(
         - file_name (str): Path to the data file (JSON/JSONL). Relative paths are resolved
           against the meta file's directory.
         - columns (dict): Column name mapping (messages, images, videos).
-        - tags (dict): Tag mapping (role_tag, content_tag, user_tag, assistant_tag).
+        - tags (dict): Tag mapping (role_tag, content_tag, user_tag, assistant_tag, system_tag).
         - media_dir (str): Directory prefix for media files.
         - sample_ratio (float): Sampling ratio (0.0 to 1.0, default 1.0).
 

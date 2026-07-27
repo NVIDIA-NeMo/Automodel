@@ -75,7 +75,7 @@ checkpoint:
   enabled: true
   checkpoint_dir: dllm_checkpoints/diffusion_gemma_sft/
   model_save_format: safetensors
-  save_consolidated: false
+  save_consolidated: final  # final step exports the consolidated HF dir generate.py loads
 
 distributed:
   strategy: fsdp2
