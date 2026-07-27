@@ -146,7 +146,36 @@ Use **version-agnostic paths** (no `/latest/`, `/v0.4/`, or `/nightly/` prefix):
 [LLM model list](/model-coverage/large-language-models/overview)
 ```
 
-The same MDX backs every version slug — a hard-coded prefix would jump readers across versions. Page slugs come from explicit `slug:` overrides in the version YAML, not from the (often verbose) display title — so `Install NeMo AutoModel` is at `/get-started/installation`, not `/get-started/install-nemo-automodel`.
+These are **Fern site-root routes**, not repository-relative links. A link that
+starts with `/` will not navigate correctly when the MDX is rendered on
+GitHub, because GitHub resolves it against `github.com`. That limitation is
+expected: Fern requires the published site path for inter-page links and does
+not support file-relative links such as `./meta/llama.mdx`. Do not trade a
+working Fern deployment for GitHub source-view navigation. File-relative paths
+remain correct for images and other page-scoped media. See Fern's
+[Markdown link rules](https://buildwithfern.com/learn/docs/writing-content/markdown-basics#links-in-markdown).
+
+The same MDX backs every version slug, so a hard-coded version prefix would
+jump readers across versions. Page routes are determined by `slug:` values in
+the version navigation YAML, not by the source filename. Treat every internal
+link and its destination `slug:` as one contract:
+
+- Give every new page targeted by an internal link an explicit `slug:`. Always
+  pin the slug when the display name contains acronyms, mixed capitalization,
+  punctuation, or numbers; Fern's generated value may differ from the intended
+  route.
+- Make the MDX link path exactly match the explicit navigation slug. For
+  example, `[LLaVA-OneVision](/model-coverage/vision-language-models/llava-onevision)`
+  requires `slug: llava-onevision` on that page entry.
+- If a page is mounted by more than one active version YAML, keep the explicit
+  slug identical in each applicable file (`nightly.yml`, `latest.yml`, and a
+  frozen version YAML).
+- If a published slug changes, add redirects in `docs.yml` for the former
+  versioned and unversioned URLs before publishing the new route.
+
+Run `make docs-check` after changing links or slugs. For route-sensitive
+changes, also inspect the Fern preview and confirm that the rendered `href`
+contains the selected version and the intended explicit slug.
 
 ### Cross-Repo References (YAML Configs, Source Files)
 

@@ -202,7 +202,42 @@ Use **version-agnostic** paths — no `/latest/`, `/v0.4/`, or `/nightly/` prefi
 [Llama coverage](/model-coverage/large-language-models/llama)
 ```
 
-The same MDX backs every version slug; a hard-coded prefix sends readers across versions unintentionally. URL slugs come from explicit `slug:` overrides in the version YAML (set during the migration so URLs stay short while sidebar titles match the verbose published H1s) — so `Install NeMo AutoModel` is at `/get-started/installation`, not `/get-started/install-nemo-automodel`.
+These are **Fern site-root routes**, not repository-relative links. They do not
+navigate correctly from GitHub's rendered source view because GitHub resolves a
+leading `/` against `github.com`. This is an expected limitation. Fern does not
+support file-relative `.md` or `.mdx` paths for inter-page links, so do not
+replace a deployed-site route with `./foo.mdx` or `../foo.mdx` to make GitHub
+navigation work. File-relative paths are still required for images and other
+page-scoped media.
+
+The same MDX backs every version slug; a hard-coded prefix sends readers across
+versions unintentionally. Treat the MDX link and the navigation `slug:` as one
+contract:
+
+1. Give every new page targeted by an internal link an explicit `slug:` in the
+   applicable version navigation YAML. Always pin slugs for display names with
+   acronyms, mixed capitalization, punctuation, or numbers; Fern's generated
+   slug may differ from the intended route.
+2. Make the last segment of the MDX link exactly match the explicit slug. For
+   example, `/model-coverage/vision-language-models/llava-onevision` requires
+   `slug: llava-onevision`, even if Fern would generate
+   `l-la-va-one-vision` from the display name.
+3. If the same page is mounted in multiple active version YAMLs, use the same
+   explicit slug in every applicable file. Do not fix only `nightly.yml` while
+   leaving `latest.yml` or a frozen version navigation entry on an implicit,
+   different route.
+4. When changing a published slug, add redirects in `docs/fern/docs.yml` for
+   both previously published versioned URLs and any unversioned URL emitted by
+   earlier Fern builds.
+5. Run `make docs-check`, then inspect the Fern preview for route-sensitive
+   changes. Confirm the rendered `href` includes the selected version and the
+   intended explicit slug. A missing version prefix can indicate that Fern did
+   not resolve the target against its navigation graph.
+
+During Sphinx-to-Fern migration, never translate a working filesystem link by
+guessing its final URL from the filename. First define the destination's
+explicit Fern slug, then update the MDX link to that published site path and
+preserve any former public route with a redirect.
 
 For cross-repo references (yaml configs, Python source), use absolute GitHub URLs:
 
