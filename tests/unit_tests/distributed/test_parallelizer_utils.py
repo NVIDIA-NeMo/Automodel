@@ -14,6 +14,7 @@
 
 from typing import List, Tuple
 
+import pytest
 import torch
 import torch.nn as nn
 from torch.distributed.fsdp import MixedPrecisionPolicy
@@ -548,6 +549,98 @@ def test_fully_shard_by_dtype_two_dtypes(monkeypatch):
     # The least common dtype is float32 ('a'), so only 'a' subtree should be sharded individually
     assert [mod for mod, _ in sub_calls] == [model.a]
     assert sub_calls[0][1].param_dtype == torch.float32
+
+
+def test_fully_shard_by_dtype_excludes_ep_params_and_uses_custom_sharder():
+    """Ignored EP experts do not affect grouping and remain excluded from the block unit."""
+
+    class Router(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.zeros(4, dtype=torch.float32))
+            self.register_buffer("e_score_correction_bias", torch.zeros(4, dtype=torch.float32))
+
+    class MoEBlock(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.bulk_1 = nn.Linear(4, 4, bias=False).to(torch.bfloat16)
+            self.bulk_2 = nn.Linear(4, 4, bias=False).to(torch.bfloat16)
+            self.gate = Router()
+            self.experts = nn.Linear(4, 4, bias=False).to(torch.bfloat16)
+
+    block = MoEBlock()
+    expert_params = set(block.experts.parameters())
+    calls: list[tuple[nn.Module, dict]] = []
+
+    def custom_fully_shard(module, **kwargs):
+        calls.append((module, kwargs))
+
+    fully_shard_by_dtype(
+        block,
+        mesh=object(),
+        mp_policy=_make_mp_policy(),
+        offload_policy=object(),
+        fp32_compute_module_names=("gate.weight", "gate.e_score_correction_bias"),
+        reshard_after_forward=False,
+        ignored_params=expert_params,
+        fully_shard_fn=custom_fully_shard,
+    )
+
+    assert [module for module, _ in calls] == [block.gate, block]
+    assert calls[0][1]["mp_policy"].param_dtype == torch.float32
+    assert "ignored_params" not in calls[0][1]
+    assert calls[1][1]["mp_policy"].param_dtype == torch.bfloat16
+    assert calls[1][1]["ignored_params"] == expert_params
+    assert all(module is not block.experts for module, _ in calls)
+
+
+def test_fully_shard_by_dtype_ignored_params_do_not_change_uniform_storage_fallback():
+    """An ignored expert dtype must not make uniform managed master weights look mixed."""
+
+    class BlockWithIgnoredExperts(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.managed = nn.Linear(4, 4, bias=False).to(torch.float32)
+            self.experts = nn.Linear(4, 4, bias=False).to(torch.bfloat16)
+
+    block = BlockWithIgnoredExperts()
+    expert_params = set(block.experts.parameters())
+    calls: list[tuple[nn.Module, dict]] = []
+
+    fully_shard_by_dtype(
+        block,
+        mesh=object(),
+        mp_policy=_make_mp_policy(),
+        offload_policy=object(),
+        ignored_params=expert_params,
+        fully_shard_fn=lambda module, **kwargs: calls.append((module, kwargs)),
+    )
+
+    assert [module for module, _ in calls] == [block]
+    assert calls[0][1]["mp_policy"].param_dtype == torch.bfloat16
+    assert calls[0][1]["ignored_params"] == expert_params
+
+
+def test_fully_shard_by_dtype_rejects_unisolatable_mixed_parameter_owner():
+    """A direct fp32 parameter sharing an owner with bf16 siblings fails early."""
+
+    class MixedRouter(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.zeros(4, dtype=torch.float32))
+            self.bias = nn.Parameter(torch.zeros(4, dtype=torch.bfloat16))
+
+    router = MixedRouter()
+
+    with pytest.raises(ValueError, match="could not isolate parameters with a distinct dtype"):
+        fully_shard_by_dtype(
+            router,
+            mesh=object(),
+            mp_policy=_make_mp_policy(),
+            offload_policy=object(),
+            fp32_compute_module_names=("weight",),
+            fully_shard_fn=lambda *args, **kwargs: None,
+        )
 
 
 def test_fully_shard_by_dtype_three_dtypes(monkeypatch):

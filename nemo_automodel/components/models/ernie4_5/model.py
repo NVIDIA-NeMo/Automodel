@@ -39,6 +39,7 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
 )
+from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.ernie4_5.rope_utils import Ernie4_5RotaryEmbedding, apply_rotary_pos_emb
 from nemo_automodel.components.models.ernie4_5.state_dict_adapter import (
     Ernie4_5_MoeStateDictAdapter,
@@ -328,6 +329,11 @@ class Ernie4_5_MoeModel(nn.Module):
         super().__init__()
         self.config = config
         self.backend = backend
+        # HF disables autocast for ERNIE's router projection and computes the
+        # routing probabilities in fp32. Keep the same default while preserving
+        # an explicit backend override.
+        if self.backend.gate_precision is None:
+            self.backend.gate_precision = torch.float32
         if moe_config is not None and moe_overrides is not None:
             raise ValueError("Cannot pass both moe_config and moe_overrides; use one or the other.")
 
@@ -529,6 +535,7 @@ class Ernie4_5_MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin)
     _nemo_tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
     _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
+    _keep_in_fp32_modules_strict = ["mlp.gate.weight", "mlp.gate.e_score_correction_bias"]
 
     @classmethod
     def get_capabilities(cls, config) -> ModelCapabilities:
@@ -597,6 +604,7 @@ class Ernie4_5_MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin)
         )
         if getattr(config, "tie_word_embeddings", True):
             self.lm_head.weight = self.model.embed_tokens.weight
+        cast_model_to_dtype(self, _config_dtype(config))
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = Ernie4_5_MoeStateDictAdapter(
                 self.config,

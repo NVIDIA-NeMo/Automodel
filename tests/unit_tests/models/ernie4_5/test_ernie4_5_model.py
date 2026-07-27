@@ -27,6 +27,7 @@ from transformers.models.ernie4_5.configuration_ernie4_5 import Ernie4_5Config
 from transformers.models.ernie4_5_moe.configuration_ernie4_5_moe import Ernie4_5_MoeConfig
 
 from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.ernie4_5.model import (
     Ernie4_5_MoeForCausalLM,
     Ernie4_5_MoeModel,
@@ -215,6 +216,17 @@ class TestErnie4_5Model:
 # MoE model
 # ---------------------------------------------------------------------------
 class TestErnie4_5_MoeModel:
+    def test_gate_precision_defaults_to_fp32(self, moe_hf_config, backend_config):
+        assert backend_config.gate_precision is None
+        model = Ernie4_5_MoeModel(moe_hf_config, backend_config)
+        assert backend_config.gate_precision == torch.float32
+        assert model.layers["1"].mlp.gate.gate_precision == torch.float32
+
+    def test_gate_precision_respects_explicit_override(self, moe_hf_config, backend_config):
+        backend_config.gate_precision = torch.bfloat16
+        model = Ernie4_5_MoeModel(moe_hf_config, backend_config)
+        assert model.layers["1"].mlp.gate.gate_precision == torch.bfloat16
+
     def test_moe_config_defaults_from_hf_config(self, moe_hf_config, backend_config):
         model = Ernie4_5_MoeModel(moe_hf_config, backend_config)
         assert hasattr(model, "moe_config")
@@ -424,6 +436,40 @@ class TestErnie4_5_MoeForCausalLM:
         assert model.lm_head.weight is not model.model.embed_tokens.weight
         model.tie_weights()
         assert model.lm_head.weight is model.model.embed_tokens.weight
+
+    def test_router_fp32_contract_preserves_checkpoint_precision(self, moe_hf_config, backend_config):
+        model = Ernie4_5_MoeForCausalLM(moe_hf_config, backend=backend_config)
+        moe = model.model.layers["1"].mlp
+
+        assert "mlp.gate.weight" in model._keep_in_fp32_modules_strict
+        assert "mlp.gate.e_score_correction_bias" in model._keep_in_fp32_modules_strict
+        assert moe.gate.weight.dtype == torch.float32
+        assert moe.gate.e_score_correction_bias.dtype == torch.float32
+        assert moe.experts.gate_and_up_projs.dtype == torch.bfloat16
+
+        reference_weight = torch.linspace(
+            -0.1234567,
+            0.7654321,
+            moe.gate.weight.numel(),
+            dtype=torch.float32,
+        ).reshape_as(moe.gate.weight)
+        assert not torch.equal(reference_weight, reference_weight.to(torch.bfloat16).float())
+
+        model.load_state_dict({"model.layers.1.mlp.gate.weight": reference_weight}, strict=False)
+        cast_model_to_dtype(model, torch.bfloat16)
+
+        assert moe.gate.weight.dtype == torch.float32
+        assert torch.equal(moe.gate.weight, reference_weight)
+
+    def test_router_fp32_contract_applies_to_meta_construction(self, moe_hf_config, backend_config):
+        with torch.device("meta"):
+            model = Ernie4_5_MoeForCausalLM(moe_hf_config, backend=backend_config)
+
+        moe = model.model.layers["1"].mlp
+        assert moe.gate.weight.device.type == "meta"
+        assert moe.gate.weight.dtype == torch.float32
+        assert moe.gate.e_score_correction_bias.dtype == torch.float32
+        assert moe.experts.gate_and_up_projs.dtype == torch.bfloat16
 
 
 # ---------------------------------------------------------------------------
