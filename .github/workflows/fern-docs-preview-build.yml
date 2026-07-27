@@ -54,6 +54,7 @@ jobs:
         with:
           archived-versions: |
             v0.4=docs-archive
+            v0.5=docs-archive
 
       - name: Save PR metadata
         env:

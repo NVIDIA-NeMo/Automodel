@@ -167,10 +167,17 @@ COPY docker/common/update_pyproject_pytorch.sh /opt/Automodel/docker/common/
 ARG BASE_IMAGE=cuda
 ARG AUTOMODEL_INSTALL=all
 ARG UV_SYNC_ARGS="--locked"
-RUN if [ "$BASE_IMAGE" = "pytorch" ]; then \
+# Preserve locally built wheels for source-only CUDA packages such as flash-attn,
+# causal-conv1d, mamba-ssm, and nv-grouped-gemm across BuildKit builds.
+RUN --mount=type=cache,target=/opt/uv_cache,sharing=locked \
+    if [ "$BASE_IMAGE" = "pytorch" ]; then \
         bash docker/common/update_pyproject_pytorch.sh /opt/Automodel; \
     fi && \
-    uv sync --extra $AUTOMODEL_INSTALL --all-groups --no-group magi $UV_SYNC_ARGS --no-cache
+    MAGI_ATTENTION_BUILD_COMPUTE_CAPABILITY="90,100" \
+        MAGI_ATTENTION_PREBUILD_FFA=0 \
+        MAX_JOBS=8 \
+        uv sync --extra $AUTOMODEL_INSTALL --all-groups $UV_SYNC_ARGS && \
+    python -c "import importlib.metadata as m; import magi_attention; print('magi-attention', m.version('magi-attention'))"
 
 # MXFP8 MoE training (experts="torch_mm_mxfp8"): the NGC PyTorch base does not bundle
 # torchao and uv-pytorch.toml gates it off (sys_platform=='never'), so `uv sync` skips
