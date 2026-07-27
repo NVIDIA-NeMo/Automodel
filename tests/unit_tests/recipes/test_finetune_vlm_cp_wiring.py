@@ -39,7 +39,6 @@ import torch
 import nemo_automodel.recipes.vlm.finetune as vlm_finetune
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.distributed.cp_vision_frame_shard import CpVisionFrameShardingConfig
-from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM
 
 
@@ -109,37 +108,6 @@ class _FakeCPMesh:
     def __getitem__(self, key):
         assert key == "cp"
         return SimpleNamespace(size=lambda: 2, get_group=lambda: "cp-group")
-
-
-def test_recipe_config_resolves_cp_vision_frame_sharding_policy():
-    cfg = RecipeConfig(
-        ConfigNode(
-            {
-                "distributed": {
-                    "cp_vision_frame_sharding": {
-                        "enabled": True,
-                        "min_tokens": 17,
-                        "cost_alpha": 0,
-                    }
-                }
-            }
-        )
-    )
-
-    assert cfg.cp_vision_frame_sharding == CpVisionFrameShardingConfig(enabled=True, min_tokens=17, cost_alpha=0)
-
-
-def test_recipe_config_disables_cp_vision_frame_sharding_by_default():
-    policy = RecipeConfig(ConfigNode({})).cp_vision_frame_sharding
-
-    assert policy == CpVisionFrameShardingConfig()
-    assert policy.cost_alpha == "auto"
-
-
-def test_recipe_config_accepts_explicit_auto_cost_alpha():
-    cfg = RecipeConfig(ConfigNode({"distributed": {"cp_vision_frame_sharding": {"cost_alpha": "auto"}}}))
-
-    assert cfg.cp_vision_frame_sharding.cost_alpha == "auto"
 
 
 class _UnsupportedVisionModel:

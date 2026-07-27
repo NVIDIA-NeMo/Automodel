@@ -43,6 +43,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple, Uni
 import torch
 from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy
 
+from nemo_automodel.components.distributed.cp_vision_frame_shard import CpVisionFrameShardingConfig
 from nemo_automodel.shared.multimodal_fsdp import FrozenMultimodalSharding, normalize_frozen_multimodal_sharding
 
 if TYPE_CHECKING:
@@ -184,6 +185,22 @@ class MoEParallelizerConfig:
 
 
 @dataclass
+class MultimodalVisionConfig:
+    """Distributed policies for resolved vision modules.
+
+    Attributes:
+        frame_sharding: Controls frame-level encoder compute sharding over the
+            selected text-model mesh dimensions.
+    """
+
+    frame_sharding: CpVisionFrameShardingConfig = field(default_factory=CpVisionFrameShardingConfig)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.frame_sharding, CpVisionFrameShardingConfig):
+            raise TypeError("MultimodalVisionConfig.frame_sharding must be a CpVisionFrameShardingConfig instance.")
+
+
+@dataclass
 class MultimodalDistributedConfig:
     """Distributed policies for resolved multimodal modules.
 
@@ -198,12 +215,16 @@ class MultimodalDistributedConfig:
             FSDP roots so each rank keeps a full copy. Modules with any
             trainable parameters use normal layer/container sharding
             regardless of this setting.
+        vision: Policies that apply specifically to resolved vision modules.
     """
 
     frozen_sharding: FrozenMultimodalSharding = "root"
+    vision: MultimodalVisionConfig = field(default_factory=MultimodalVisionConfig)
 
     def __post_init__(self) -> None:
         self.frozen_sharding = normalize_frozen_multimodal_sharding(self.frozen_sharding)
+        if not isinstance(self.vision, MultimodalVisionConfig):
+            raise TypeError("MultimodalDistributedConfig.vision must be a MultimodalVisionConfig instance.")
 
 
 @dataclass
