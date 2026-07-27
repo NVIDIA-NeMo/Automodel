@@ -29,7 +29,12 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from nemo_automodel.components.models.common.mtp.mtp import MTPConfig, MTPModule, roll_tensor
+from nemo_automodel.components.models.common.mtp.mtp import (
+    MTPConfig,
+    MTPModule,
+    get_mtp_loss_scaling_factor,
+    roll_tensor,
+)
 
 
 class _RecordingSublayer(nn.Module):
@@ -49,6 +54,24 @@ class _RecordingSublayer(nn.Module):
                 rec[k] = v
         self.calls.append(rec)
         return hidden_states
+
+
+class _MTPModel(nn.Module):
+    def __init__(self, scaling_factor: float) -> None:
+        super().__init__()
+        self.mtp_config = MTPConfig(loss_scaling_factor=scaling_factor)
+
+
+def test_mtp_loss_scaling_factor_defaults_for_model_without_mtp_config():
+    model = nn.Linear(2, 2)
+
+    assert get_mtp_loss_scaling_factor(model, default=0.25) == 0.25
+
+
+def test_mtp_loss_scaling_factor_uses_model_config():
+    model = _MTPModel(scaling_factor=0.35)
+
+    assert get_mtp_loss_scaling_factor(model) == 0.35
 
 
 def _build_module(num_depths: int = 3, pattern_length: int = 1) -> MTPModule:

@@ -52,11 +52,12 @@ def roll_tensor(t: torch.Tensor, shifts: int = -1, dim: int = -1) -> torch.Tenso
 
 
 def get_mtp_loss_scaling_factor(model: nn.Module, default: float = 0.1) -> float:
-    """Return the model's configured MTP auxiliary-loss scaling factor."""
-    mtp_config = model.mtp_config
-    if mtp_config is not None:
-        return float(mtp_config.loss_scaling_factor)
-    return default
+    """Return an MTP model's loss scale, or ``default`` for other modules."""
+    # This generic loss adapter intentionally accepts models without MTP support.
+    mtp_config = getattr(model, "mtp_config", None)  # pylint: disable=bad-builtin
+    if mtp_config is None:
+        return default
+    return float(mtp_config.loss_scaling_factor)
 
 
 @dataclass
