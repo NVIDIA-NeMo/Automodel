@@ -19,6 +19,8 @@ import shutil
 from typing import TYPE_CHECKING, Protocol
 
 import torch
+from huggingface_hub import snapshot_download
+from huggingface_hub.errors import HFValidationError, LocalEntryNotFoundError
 from torch import nn
 
 from nemo_automodel.components.checkpoint._backports.hf_utils import (
@@ -82,7 +84,7 @@ class ConsolidatedHFAddon:
         # Perform save operations on rank 0
         if _is_group_rank_0(process_group):
             # if the HF model has custom model code, we need to save it as part of the checkpoint
-            _maybe_save_custom_model_code(original_model_path, hf_metadata_dir, model_part=model_part)
+            save_custom_model_code(original_model_path, hf_metadata_dir, model_part=model_part)
             # save the config.json file
             if hasattr(model_part, "config"):
                 v4_compatible = kwargs.get("v4_compatible", False)
@@ -198,7 +200,7 @@ class PeftAddon:
         if _is_group_rank_0(process_group):
             # if the HF model has custom model code, we need to save it as part of the checkpoint
             model_part = model_state.model[0] if model_state is not None else None
-            _maybe_save_custom_model_code(original_model_path, model_path, model_part=model_part)
+            save_custom_model_code(original_model_path, model_path, model_part=model_part)
             # save the tokenizer
             if tokenizer is not None:
                 tokenizer.save_pretrained(model_path)
@@ -546,7 +548,7 @@ def _apply_transformers_compat_guards(py_path: str) -> None:
             f.writelines(out)
 
 
-def _maybe_save_custom_model_code(
+def save_custom_model_code(
     original_model_path: str | None,
     hf_metadata_dir: str,
     model_part: nn.Module | None = None,
@@ -555,10 +557,8 @@ def _maybe_save_custom_model_code(
     Save the custom model code if it exists. This function preserves the original directory structure.
 
     When ``original_model_path`` is a local dir, copy its ``.py`` files. When it is an HF
-    hub id (e.g. ``nvidia/Nemotron-Flash-1B``) and the loaded model has ``auto_map`` custom
-    code, copy the ``.py`` files from the cached ``transformers_modules`` directory so the
-    consolidated checkpoint carries ``modeling_*.py`` locally and reloads without needing
-    ``trust_remote_code=True``.
+    Hub ID, resolve its locally cached snapshot first. If no snapshot is available, fall
+    back to custom code loaded through Transformers' dynamic-module cache.
     """
     copied: set[str] = set()
 
@@ -575,14 +575,21 @@ def _maybe_save_custom_model_code(
             _apply_transformers_compat_guards(dst_path)
             copied.add(dst_path)
 
-    if original_model_path is not None:
-        if os.path.isfile(original_model_path):
-            dst_path = os.path.join(hf_metadata_dir, os.path.basename(original_model_path))
+    resolved_model_path = original_model_path
+    if original_model_path is not None and not os.path.exists(original_model_path):
+        try:
+            resolved_model_path = snapshot_download(original_model_path, local_files_only=True)
+        except (HFValidationError, LocalEntryNotFoundError, OSError):
+            resolved_model_path = None
+
+    if resolved_model_path is not None:
+        if os.path.isfile(resolved_model_path):
+            dst_path = os.path.join(hf_metadata_dir, os.path.basename(resolved_model_path))
             os.makedirs(hf_metadata_dir, exist_ok=True)
-            shutil.copy2(original_model_path, dst_path)
+            shutil.copy2(resolved_model_path, dst_path)
             copied.add(dst_path)
-        elif os.path.isdir(original_model_path):
-            _copy_py_tree(original_model_path)
+        elif os.path.isdir(resolved_model_path):
+            _copy_py_tree(resolved_model_path)
 
     # Fallback: HF hub id path — resolve custom code via the model class's module file.
     # Needed for trust_remote_code models (e.g. Nemotron-Flash) so reloads from the

@@ -55,7 +55,7 @@ class _RemoteCodeModel(PreTrainedModel):
         self.post_init()
 
 
-def _make_local_remote_code_model(source_dir) -> _RemoteCodeModel:
+def _make_local_remote_code_model(source_dir, name_or_path=None) -> _RemoteCodeModel:
     source_dir.mkdir(parents=True)
     (source_dir / "configuration_remote.py").write_text(
         """
@@ -92,7 +92,7 @@ class _RemoteCodeModel(PreTrainedModel):
     )
 
     config = _RemoteCodeConfig()
-    config.name_or_path = str(source_dir)
+    config.name_or_path = str(source_dir) if name_or_path is None else name_or_path
     config.auto_map = {
         "AutoConfig": "configuration_remote._RemoteCodeConfig",
         "AutoModel": "modeling_remote._RemoteCodeModel",
@@ -117,17 +117,24 @@ def test_direct_encoder_save_preserves_and_reloads_matching_remote_code(tmp_path
 
     source_dir = tmp_path / "original_checkpoint"
     output_dir = tmp_path / "direct_export"
-    model = _make_local_remote_code_model(source_dir)
+    hub_id = "nvidia/test-remote-code"
+    model = _make_local_remote_code_model(source_dir, name_or_path=hub_id)
 
-    with patch(
-        "nemo_automodel._transformers.retrieval.ModelRegistry.has_retrieval_model",
-        return_value=True,
+    with (
+        patch(
+            "nemo_automodel._transformers.retrieval.ModelRegistry.has_retrieval_model",
+            return_value=True,
+        ),
+        patch(
+            "nemo_automodel.components.checkpoint.addons.snapshot_download",
+            return_value=str(source_dir),
+        ) as snapshot_download,
     ):
         encoder = BiEncoderModel(model)
+        save_encoder_pretrained(encoder, str(output_dir))
 
-    save_encoder_pretrained(encoder, str(output_dir))
-
-    assert encoder.name_or_path == str(source_dir)
+    assert encoder.name_or_path == hub_id
+    snapshot_download.assert_called_once_with(hub_id, local_files_only=True)
     _assert_remote_code_round_trip(model, output_dir)
 
 

@@ -22,8 +22,8 @@ from nemo_automodel.components.checkpoint.addons import (
     _extract_target_modules,
     _group_barrier,
     _is_group_rank_0,
-    _maybe_save_custom_model_code,
     _maybe_strip_quantization_config,
+    save_custom_model_code,
 )
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState
 
@@ -54,7 +54,7 @@ def _write(path: str, content: str) -> None:
         f.write(content)
 
 
-def test_maybe_save_custom_model_code_copies_py_files_and_structure(tmp_path):
+def test_save_custom_model_code_copies_py_files_and_structure(tmp_path):
     # Arrange: create a nested source tree with .py and non-.py files
     src_root = tmp_path / "src_model_code"
     dst_root = tmp_path / "hf_meta"
@@ -71,7 +71,7 @@ def test_maybe_save_custom_model_code_copies_py_files_and_structure(tmp_path):
         _write(os.path.join(src_root, rel), content)
 
     # Act
-    _maybe_save_custom_model_code(str(src_root), str(dst_root))
+    save_custom_model_code(str(src_root), str(dst_root))
 
     # Assert: .py files copied with preserved structure; non-.py and __init__.py ignored
     assert (dst_root / "main.py").exists()
@@ -84,18 +84,18 @@ def test_maybe_save_custom_model_code_copies_py_files_and_structure(tmp_path):
         assert "def foo()" in f.read()
 
 
-def test_maybe_save_custom_model_code_noop_for_none_or_non_dir(tmp_path):
+def test_save_custom_model_code_noop_for_none_or_non_dir(tmp_path):
     dst_root = tmp_path / "hf_meta"
     dst_root.mkdir(parents=True)
 
     # None input should be a no-op
-    _maybe_save_custom_model_code(None, str(dst_root))
+    save_custom_model_code(None, str(dst_root))
     assert list(dst_root.rglob("*.py")) == []
 
     # Non-directory input should be a no-op
     some_file = tmp_path / "not_a_dir.txt"
     some_file.write_text("hello")
-    _maybe_save_custom_model_code(str(some_file), str(dst_root))
+    save_custom_model_code(str(some_file), str(dst_root))
     assert list(dst_root.rglob("*.py")) == []
 
 
