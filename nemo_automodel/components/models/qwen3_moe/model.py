@@ -90,18 +90,20 @@ class Block(nn.Module):
             **attn_kwargs,
         )
         x = x + attn_out
+        mlp_out = self._mlp(self.post_attention_layernorm(x), padding_mask)
+        x = x + mlp_out
+        return x
 
-        mlp_input = self.post_attention_layernorm(x)
+    def _mlp(self, x, padding_mask=None):
         # Activation checkpointing wraps the MLP, so inspect the inner module
         # to select the call signature while still invoking the wrapper.
         mlp = unwrap_checkpoint_wrapper(self.mlp)
         if isinstance(mlp, MLP):
-            mlp_out = self.mlp(mlp_input)
+            mlp_out = self.mlp(x)
         else:
             assert isinstance(mlp, MoE)
-            mlp_out = self.mlp(mlp_input, padding_mask)
-        x = x + mlp_out
-        return x
+            mlp_out = self.mlp(x, padding_mask)
+        return mlp_out
 
     def init_weights(self, buffer_device: torch.device):
         for norm in (self.input_layernorm, self.post_attention_layernorm):
