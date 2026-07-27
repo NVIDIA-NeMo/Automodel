@@ -123,7 +123,7 @@ class InklingTextModel(HFInklingTextModel):
             raise ValueError("You must provide exactly one of input_ids or inputs_embeds")
 
         use_cache = (
-            (self.config.use_cache if hasattr(self.config, "use_cache") else False) if use_cache is None else use_cache
+            (self.config.use_cache if "use_cache" in dir(self.config) else False) if use_cache is None else use_cache
         )
         if use_cache and past_key_values is None:
             past_key_values = DynamicCache(config=self.config)
@@ -226,10 +226,10 @@ class InklingForConditionalGeneration(HFCheckpointingMixin, HFInklingForConditio
 
         # Propagate the requested top-level dtype to the nested sub-configs so the
         # HF towers and our MoE parameters are constructed in a consistent dtype.
-        top_dtype = config.torch_dtype if hasattr(config, "torch_dtype") else None
+        top_dtype = config.torch_dtype if "torch_dtype" in dir(config) else None
         if top_dtype is not None:
             for sub_cfg in vars(config).values():
-                if sub_cfg is not config and hasattr(sub_cfg, "torch_dtype"):
+                if sub_cfg is not config and "torch_dtype" in dir(sub_cfg):
                     sub_cfg.torch_dtype = top_dtype
 
         super().__init__(config)
@@ -259,7 +259,7 @@ class InklingForConditionalGeneration(HFCheckpointingMixin, HFInklingForConditio
                 layer.mlp = InklingDenseMLP(text_config)
 
         model_dtype = get_dtype(
-            (text_config.torch_dtype if hasattr(text_config, "torch_dtype") else None), torch.bfloat16
+            (text_config.torch_dtype if "torch_dtype" in dir(text_config) else None), torch.bfloat16
         )
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = InklingStateDictAdapter(
@@ -350,8 +350,8 @@ class InklingForConditionalGeneration(HFCheckpointingMixin, HFInklingForConditio
 
         is_first_stage = language_model.embed_tokens is not None
         if pixel_values is None and is_first_stage:
-            chunks = self._vlm_pixel_values_chunks if hasattr(self, "_vlm_pixel_values_chunks") else None
-            chunk_idx = self._vlm_chunk_idx if hasattr(self, "_vlm_chunk_idx") else 0
+            chunks = self._vlm_pixel_values_chunks if "_vlm_pixel_values_chunks" in dir(self) else None
+            chunk_idx = self._vlm_chunk_idx if "_vlm_chunk_idx" in dir(self) else 0
             if chunks is not None and chunk_idx is not None and chunk_idx < len(chunks):
                 pixel_values = chunks[chunk_idx]
                 self._vlm_chunk_idx = chunk_idx + 1

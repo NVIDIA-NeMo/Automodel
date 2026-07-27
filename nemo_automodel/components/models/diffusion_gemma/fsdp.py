@@ -91,7 +91,7 @@ def fully_shard_diffusion_gemma(module: nn.Module, mesh, mp_policy, offload_poli
     Returns:
         The sharded module.
     """
-    if hasattr(module, "moe") and hasattr(module.moe, "experts"):
+    if "moe" in dir(module) and "experts" in dir(module.moe):
         # Shard the grouped experts on their own so they gather/reshard
         # independently and DCP sees their global expert dimension.  The expert
         # parameters are then excluded from the parent layer's FSDP unit per

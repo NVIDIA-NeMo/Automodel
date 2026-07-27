@@ -256,7 +256,7 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
         """
         N = self.config.num_hidden_layers
         num_mtp = int(
-            (self.config.num_nextn_predict_layers if hasattr(self.config, "num_nextn_predict_layers") else 0) or 0
+            (self.config.num_nextn_predict_layers if "num_nextn_predict_layers" in dir(self.config) else 0) or 0
         )
         # HF V4 emits both prefixed (``model.layers.{N+k}.*`` for self_attn /
         # mlp / norms) and unprefixed (``layers.{N+k}.*`` for V4 fusion-only
@@ -490,8 +490,8 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
         import json as _json
         import os as _os
 
-        ckpt_path = (self.config._name_or_path if hasattr(self.config, "_name_or_path") else None) or (
-            self.config.name_or_path if hasattr(self.config, "name_or_path") else None
+        ckpt_path = (self.config._name_or_path if "_name_or_path" in dir(self.config) else None) or (
+            self.config.name_or_path if "name_or_path" in dir(self.config) else None
         )
         if not ckpt_path:
             return 0
@@ -521,7 +521,7 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
         # overridden) model config — we need to match the on-disk layout.
         num_hash_layers = self._checkpoint_num_hash_layers()
         if num_hash_layers <= 0:
-            num_hash_layers = int((self.config.num_hash_layers if hasattr(self.config, "num_hash_layers") else 0) or 0)
+            num_hash_layers = int((self.config.num_hash_layers if "num_hash_layers" in dir(self.config) else 0) or 0)
         if num_hash_layers <= 0:
             return state_dict
         hash_layer_ids = {str(i) for i in range(num_hash_layers)}
@@ -874,8 +874,8 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
         return self._checkpoint_expert_quant_layout_cache
 
     def _detect_checkpoint_expert_quant_layout(self) -> _ExpertQuantLayout:
-        ckpt_path = (self.config._name_or_path if hasattr(self.config, "_name_or_path") else None) or (
-            self.config.name_or_path if hasattr(self.config, "name_or_path") else None
+        ckpt_path = (self.config._name_or_path if "_name_or_path" in dir(self.config) else None) or (
+            self.config.name_or_path if "name_or_path" in dir(self.config) else None
         )
         if not ckpt_path:
             return _ExpertQuantLayout.FP4

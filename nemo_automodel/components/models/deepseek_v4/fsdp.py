@@ -57,9 +57,9 @@ def _hca_param_sync_group_from_1d_mesh(mesh):
     if mesh is None:
         return None
 
-    mesh_ndim = mesh.ndim if hasattr(mesh, "ndim") else None
-    mesh_shape = mesh.shape if hasattr(mesh, "shape") else None
-    mesh_dim_names = mesh.mesh_dim_names if hasattr(mesh, "mesh_dim_names") else None
+    mesh_ndim = mesh.ndim if "ndim" in dir(mesh) else None
+    mesh_shape = mesh.shape if "shape" in dir(mesh) else None
+    mesh_dim_names = mesh.mesh_dim_names if "mesh_dim_names" in dir(mesh) else None
     if mesh_ndim is not None:
         is_1d_mesh = mesh_ndim == 1
     elif mesh_shape is not None:
@@ -94,8 +94,8 @@ def _has_fsdp_state(module: nn.Module) -> bool:
 
 def _module_config_model_type(module: nn.Module) -> str | None:
     return (
-        (module.config if hasattr(module, "config") else None).model_type
-        if hasattr((module.config if hasattr(module, "config") else None), "model_type")
+        (module.config if "config" in dir(module) else None).model_type
+        if "model_type" in dir((module.config if "config" in dir(module) else None))
         else None
     )
 
@@ -104,7 +104,7 @@ def _is_deepseek_v4_module(module: nn.Module) -> bool:
     if module.__class__.__name__ in _DSV4_CLASS_NAMES or _module_config_model_type(module) == "deepseek_v4":
         return True
 
-    wrapped = module._checkpoint_wrapped_module if hasattr(module, "_checkpoint_wrapped_module") else None
+    wrapped = module._checkpoint_wrapped_module if "_checkpoint_wrapped_module" in dir(module) else None
     if wrapped is not None and _is_deepseek_v4_module(wrapped):
         return True
 
@@ -192,7 +192,7 @@ def _fp32_module_fsdp_kwargs(module: nn.Module, fsdp_kwargs: dict) -> dict:
 def _attach_hca_param_sync_group(module: nn.Module, mesh) -> None:
     process_group = _hca_param_sync_group_from_1d_mesh(mesh)
     for submodule in module.modules():
-        setter = submodule._set_hca_param_sync_group if hasattr(submodule, "_set_hca_param_sync_group") else None
+        setter = submodule._set_hca_param_sync_group if "_set_hca_param_sync_group" in dir(submodule) else None
         if submodule.__class__.__name__ == "DeepseekV4Compressor" and setter is not None:
             # The FSDP2 mesh is only known while wrapping. Bind its parameter
             # sync group narrowly to the DeepSeek-V4 HCA compressor instead of

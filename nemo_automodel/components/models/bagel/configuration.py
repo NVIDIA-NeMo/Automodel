@@ -66,7 +66,7 @@ def resolve_bagel_backend(backend: Any = None) -> BagelBackendConfig:
     if isinstance(backend, BagelBackendConfig):
         return backend
 
-    if hasattr(backend, "to_dict"):
+    if "to_dict" in dir(backend):
         backend = backend.to_dict()
     if not isinstance(backend, Mapping):
         raise TypeError(f"BAGEL backend must be a mapping or BagelBackendConfig, got {type(backend)!r}")
@@ -99,17 +99,17 @@ def _coerce_text_config(cfg: Union[Dict[str, Any], Qwen2Config, None]) -> Qwen2C
 
     # Defaults for BAGEL-specific attrs (safe to always apply - caller may
     # override before/after this helper runs).
-    if not hasattr(cfg, "qk_norm"):
+    if not "qk_norm" in dir(cfg):
         cfg.qk_norm = True
-    if (cfg.layer_module if hasattr(cfg, "layer_module") else None) is None:
+    if (cfg.layer_module if "layer_module" in dir(cfg) else None) is None:
         cfg.layer_module = "Qwen2DecoderLayer"
-    if not hasattr(cfg, "freeze_und"):
+    if not "freeze_und" in dir(cfg):
         cfg.freeze_und = False
 
     # pad_token_id: Qwen2Config's default is None, which Qwen2Model tolerates
     # (nn.Embedding accepts padding_idx=None). The packed training path reads
     # it as a scalar, so we fall back to the BAGEL-7B-MoT value when missing.
-    if (cfg.pad_token_id if hasattr(cfg, "pad_token_id") else None) is None:
+    if (cfg.pad_token_id if "pad_token_id" in dir(cfg) else None) is None:
         cfg.pad_token_id = 151643
 
     return cfg
@@ -214,7 +214,7 @@ class BagelConfig(PretrainedConfig):
         self.timestep_shift = timestep_shift
 
         super().__init__(pad_token_id=pad_token_id, **kwargs)
-        if not (self.architectures if hasattr(self, "architectures") else None):
+        if not (self.architectures if "architectures" in dir(self) else None):
             self.architectures = ["BagelForUnifiedMultimodal"]
 
     # Checkpoint-named read aliases (so downstream code can do either

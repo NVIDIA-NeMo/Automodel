@@ -27,16 +27,16 @@ from nemo_automodel.components.moe.config import MoEConfig
 
 
 def _mtp_layer_range(config: Any) -> tuple[int, int]:
-    text_config = config.text_config if hasattr(config, "text_config") else config
+    text_config = config.text_config if "text_config" in dir(config) else config
     start = int(
         (
             text_config.mtp_base_layer_idx
-            if hasattr(text_config, "mtp_base_layer_idx")
-            else (text_config.num_hidden_layers if hasattr(text_config, "num_hidden_layers") else 0)
+            if "mtp_base_layer_idx" in dir(text_config)
+            else (text_config.num_hidden_layers if "num_hidden_layers" in dir(text_config) else 0)
         )
         or 0
     )
-    depth = int((text_config.num_nextn_predict_layers if hasattr(text_config, "num_nextn_predict_layers") else 0) or 0)
+    depth = int((text_config.num_nextn_predict_layers if "num_nextn_predict_layers" in dir(text_config) else 0) or 0)
     return start, start + depth
 
 

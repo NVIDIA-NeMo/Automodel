@@ -657,7 +657,7 @@ def _resolve_ssm_dtype(config):
     Honors ``mamba_ssm_dtype`` when present; otherwise defaults to AutoModel's
     fp32 training-storage contract for ``A_log``/``dt_bias``.
     """
-    ssm_dtype = config.mamba_ssm_dtype if hasattr(config, "mamba_ssm_dtype") else None
+    ssm_dtype = config.mamba_ssm_dtype if "mamba_ssm_dtype" in dir(config) else None
     if isinstance(ssm_dtype, str):
         ssm_dtype = dtype_from_str(ssm_dtype)
     return ssm_dtype or torch.float32

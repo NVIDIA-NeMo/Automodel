@@ -68,12 +68,12 @@ def parse_moe_layers_enum(moe_layers_enum: str | int | tuple | list | None, num_
 def _keep_step_router_bias_fp32(module: nn.Module) -> None:
     """Keep Step router correction bias in fp32 after module-wide dtype casts."""
     for submodule in module.modules():
-        bias = submodule.e_score_correction_bias if hasattr(submodule, "e_score_correction_bias") else None
+        bias = submodule.e_score_correction_bias if "e_score_correction_bias" in dir(submodule) else None
         if bias is not None:
             submodule.e_score_correction_bias.data = bias.data.float()
 
         master = (
-            submodule.e_score_correction_bias_master if hasattr(submodule, "e_score_correction_bias_master") else None
+            submodule.e_score_correction_bias_master if "e_score_correction_bias_master" in dir(submodule) else None
         )
         if master is not None:
             submodule.e_score_correction_bias_master.data = master.data.float()
@@ -94,24 +94,24 @@ class Block(nn.Module):
         self.config = config
 
         # Handle need_fp32_gate config for MoE gate precision
-        if (config.need_fp32_gate if hasattr(config, "need_fp32_gate") else False) and backend.gate_precision is None:
+        if (config.need_fp32_gate if "need_fp32_gate" in dir(config) else False) and backend.gate_precision is None:
             backend.gate_precision = torch.float32
 
         # Attention
         self.self_attn = Step3p5Attention(config, layer_idx, backend)
 
         # Determine attention type for this layer
-        layer_types = config.layer_types if hasattr(config, "layer_types") else []
+        layer_types = config.layer_types if "layer_types" in dir(config) else []
         self.attention_type = layer_types[layer_idx] if layer_types else "full_attention"
 
         # Determine if this is an MoE layer
-        moe_layers_enum = config.moe_layers_enum if hasattr(config, "moe_layers_enum") else None
+        moe_layers_enum = config.moe_layers_enum if "moe_layers_enum" in dir(config) else None
         moe_layers = parse_moe_layers_enum(moe_layers_enum, config.num_hidden_layers)
         self.is_moe_layer = layer_idx in moe_layers
 
         # Get swiglu limits for this layer
-        swiglu_limits_shared = config.swiglu_limits_shared if hasattr(config, "swiglu_limits_shared") else None
-        swiglu_limits = config.swiglu_limits if hasattr(config, "swiglu_limits") else None
+        swiglu_limits_shared = config.swiglu_limits_shared if "swiglu_limits_shared" in dir(config) else None
+        swiglu_limits = config.swiglu_limits if "swiglu_limits" in dir(config) else None
 
         swiglu_limit_shared = None
         if swiglu_limits_shared and swiglu_limits_shared[layer_idx]:
@@ -153,8 +153,8 @@ class Block(nn.Module):
 
             # Shared expert with its own intermediate size and swiglu limit
             # HF uses share_expert_dims (plural), but we also support share_expert_dim for compatibility
-            share_expert_dim = (config.share_expert_dims if hasattr(config, "share_expert_dims") else None) or (
-                config.share_expert_dim if hasattr(config, "share_expert_dim") else config.intermediate_size
+            share_expert_dim = (config.share_expert_dims if "share_expert_dims" in dir(config) else None) or (
+                config.share_expert_dim if "share_expert_dim" in dir(config) else config.intermediate_size
             )
             self.share_expert = Step3p5MLP(
                 config,
@@ -249,8 +249,8 @@ class Step3p5Model(nn.Module):
         self.config.num_experts = config.moe_num_experts
 
         # Build MoE config from Step3p5 config
-        use_router_bias = config.use_moe_router_bias if hasattr(config, "use_moe_router_bias") else False
-        router_activation = config.moe_router_activation if hasattr(config, "moe_router_activation") else "softmax"
+        use_router_bias = config.use_moe_router_bias if "use_moe_router_bias" in dir(config) else False
+        router_activation = config.moe_router_activation if "moe_router_activation" in dir(config) else "softmax"
         if use_router_bias and router_activation == "sigmoid":
             score_func = "sigmoid_with_bias"
         else:
@@ -260,23 +260,23 @@ class Step3p5Model(nn.Module):
             dim=config.hidden_size,
             inter_dim=config.intermediate_size,
             moe_inter_dim=(
-                config.moe_intermediate_size if hasattr(config, "moe_intermediate_size") else config.intermediate_size
+                config.moe_intermediate_size if "moe_intermediate_size" in dir(config) else config.intermediate_size
             ),
             n_routed_experts=self.config.num_experts,
             n_shared_experts=0,  # Step3p5 handles shared experts separately
-            n_activated_experts=(config.moe_top_k if hasattr(config, "moe_top_k") else 2),
+            n_activated_experts=(config.moe_top_k if "moe_top_k" in dir(config) else 2),
             n_expert_groups=0,
             n_limited_groups=0,
             train_gate=True,
             gate_bias_update_factor=0.0,
             score_func=score_func,
-            route_scale=(config.moe_router_scaling_factor if hasattr(config, "moe_router_scaling_factor") else 1.0),
+            route_scale=(config.moe_router_scaling_factor if "moe_router_scaling_factor" in dir(config) else 1.0),
             aux_loss_coeff=0.0,
             norm_topk_prob=True,
             router_bias=False,
             expert_bias=False,
             expert_activation="swiglu",
-            dtype=get_dtype((config.torch_dtype if hasattr(config, "torch_dtype") else "bfloat16"), torch.bfloat16),
+            dtype=get_dtype((config.torch_dtype if "torch_dtype" in dir(config) else "bfloat16"), torch.bfloat16),
             force_e_score_correction_bias=use_router_bias,
         )
         if moe_overrides:
@@ -287,7 +287,7 @@ class Step3p5Model(nn.Module):
         self.embed_tokens = nn.Embedding(
             config.vocab_size,
             config.hidden_size,
-            dtype=get_dtype((config.torch_dtype if hasattr(config, "torch_dtype") else "bfloat16"), torch.bfloat16),
+            dtype=get_dtype((config.torch_dtype if "torch_dtype" in dir(config) else "bfloat16"), torch.bfloat16),
         )
 
         # Transformer blocks
@@ -306,11 +306,11 @@ class Step3p5Model(nn.Module):
 
         self.max_seq_len = config.max_position_embeddings
         self.head_dim = (
-            config.head_dim if hasattr(config, "head_dim") else config.hidden_size // config.num_attention_heads
+            config.head_dim if "head_dim" in dir(config) else config.hidden_size // config.num_attention_heads
         )
 
         # Get partial_rotary_factor for the first layer (used for RotaryEmbedding initialization)
-        partial_rotary_factors = config.partial_rotary_factors if hasattr(config, "partial_rotary_factors") else None
+        partial_rotary_factors = config.partial_rotary_factors if "partial_rotary_factors" in dir(config) else None
         partial_rotary_factor = partial_rotary_factors[0] if partial_rotary_factors else 1.0
 
         _, rope_scaling, _ = get_rope_config(config)
@@ -327,7 +327,7 @@ class Step3p5Model(nn.Module):
         )
 
         # Check if model has sliding window attention
-        layer_types = config.layer_types if hasattr(config, "layer_types") else []
+        layer_types = config.layer_types if "layer_types" in dir(config) else []
         self.has_sliding_layers = "sliding_attention" in layer_types
 
     def _apply(self, fn):
@@ -466,7 +466,7 @@ class Step3p5ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         self.backend = backend or BackendConfig()
         moe_overrides = kwargs.pop("moe_overrides", None)
         self.model = Step3p5Model(config, backend=self.backend, moe_config=moe_config, moe_overrides=moe_overrides)
-        model_dtype = get_dtype((config.torch_dtype if hasattr(config, "torch_dtype") else None), torch.bfloat16)
+        model_dtype = get_dtype((config.torch_dtype if "torch_dtype" in dir(config) else None), torch.bfloat16)
         self.lm_head = initialize_linear_module(
             self.backend.linear, config.hidden_size, config.vocab_size, bias=False, dtype=model_dtype
         )
@@ -527,7 +527,7 @@ class Step3p5ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         output_hidden_states = (
             output_hidden_states
             if output_hidden_states is not None
-            else (self.config.output_hidden_states if hasattr(self.config, "output_hidden_states") else False)
+            else (self.config.output_hidden_states if "output_hidden_states" in dir(self.config) else False)
         )
 
         is_thd = attn_kwargs.get("qkv_format") == "thd"

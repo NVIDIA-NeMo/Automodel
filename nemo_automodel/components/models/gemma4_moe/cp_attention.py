@@ -54,11 +54,11 @@ def _patch_fsdp_accumulated_grad_guard() -> None:
     except Exception:
         return
     orig = FSDPParam.to_accumulated_grad_if_needed
-    if orig._gemma4_guarded if hasattr(orig, "_gemma4_guarded") else False:
+    if orig._gemma4_guarded if "_gemma4_guarded" in dir(orig) else False:
         return
 
     def guarded(self):
-        if not hasattr(self, "_unsharded_param"):
+        if not "_unsharded_param" in dir(self):
             return
         return orig(self)
 
@@ -136,7 +136,7 @@ def _cached_block_mask(key, build):
 def _compiled_flex_attention(attention_module: torch.nn.Module):
     compiled = (
         attention_module._gemma4_cp_compiled_flex_attn
-        if hasattr(attention_module, "_gemma4_cp_compiled_flex_attn")
+        if "_gemma4_cp_compiled_flex_attn" in dir(attention_module)
         else None
     )
     if compiled is None:
@@ -173,7 +173,7 @@ def _base_gemma4_cp_mask(attention_module: torch.nn.Module, ctx: Any, q_idx, kv_
     else:
         allowed = kv_global_idx <= q_global_idx
 
-    sliding_window = attention_module.sliding_window if hasattr(attention_module, "sliding_window") else None
+    sliding_window = attention_module.sliding_window
     if sliding_window is not None:
         allowed = allowed & ((q_global_idx - kv_global_idx) < sliding_window)
     return allowed
@@ -309,14 +309,8 @@ def _run_gemma4_flex_chunk(
     if vision_group_ids_kv is None and metadata_chunk.get("mm_token_type_ids") is not None:
         vision_group_ids_kv = gemma4_vision_group_ids(metadata_chunk["mm_token_type_ids"])
 
-    sliding_window = attention_module.sliding_window if hasattr(attention_module, "sliding_window") else None
-    config_uses_vision_bidir = (
-        (attention_module.config if hasattr(attention_module, "config") else None).use_bidirectional_attention
-        if hasattr(
-            (attention_module.config if hasattr(attention_module, "config") else None), "use_bidirectional_attention"
-        )
-        else None
-    ) == "vision"
+    sliding_window = attention_module.sliding_window
+    config_uses_vision_bidir = attention_module.config.use_bidirectional_attention == "vision"
     use_vision_bidirectional = (
         sliding_window is not None
         and config_uses_vision_bidir
@@ -394,7 +388,7 @@ def _run_gemma4_flex_chunk(
                 break
         _block_mask_set_generation(gen_obj)
         block_mask_key = (
-            (attention_module.sliding_window if hasattr(attention_module, "sliding_window") else None),
+            sliding_window,
             bool(ctx.is_causal),
             int(ctx.seq_global_start),
             int(kv_global_start),
@@ -857,11 +851,11 @@ def _ring_use_ffpa_varlen(attention_module: torch.nn.Module, ctx: Any) -> bool:
     map drives the varlen ``cu_seqlens``); Gemma4's manual CP batch always attaches
     one, so it is the sole FFPA path real CP training takes.
     """
-    if not (attention_module._gemma4_cp_use_ffpa if hasattr(attention_module, "_gemma4_cp_use_ffpa") else False):
+    if not (attention_module._gemma4_cp_use_ffpa if "_gemma4_cp_use_ffpa" in dir(attention_module) else False):
         return False
     if not ctx.is_causal:
         return False
-    if (attention_module.sliding_window if hasattr(attention_module, "sliding_window") else None) is not None:
+    if (attention_module.sliding_window if "sliding_window" in dir(attention_module) else None) is not None:
         return False
     if ctx.metadata.get("_packed_seq_ids") is None:
         return False
@@ -1167,11 +1161,9 @@ def _gemma4_cp_manual_attention(
     if query.shape[1] != key.shape[1]:
         enable_gqa = True
 
-    local_metadata = attention_module._cp_manual_metadata if hasattr(attention_module, "_cp_manual_metadata") else {}
+    local_metadata = attention_module._cp_manual_metadata if "_cp_manual_metadata" in dir(attention_module) else {}
     metadata_seq_dims = (
-        attention_module._cp_manual_metadata_seq_dims
-        if hasattr(attention_module, "_cp_manual_metadata_seq_dims")
-        else {}
+        attention_module._cp_manual_metadata_seq_dims if "_cp_manual_metadata_seq_dims" in dir(attention_module) else {}
     )
     ctx = CPRingAttentionContext(
         module=attention_module,
@@ -1212,7 +1204,7 @@ def _install_gemma4_cp_ring_sdpa(attention_module: torch.nn.Module, cp_mesh) -> 
 
     original_sdpa = F_module.scaled_dot_product_attention
     metadata_keys = (
-        attention_module._cp_manual_metadata_keys if hasattr(attention_module, "_cp_manual_metadata_keys") else ()
+        attention_module._cp_manual_metadata_keys if "_cp_manual_metadata_keys" in dir(attention_module) else ()
     )
 
     @torch._dynamo.disable
@@ -1241,7 +1233,7 @@ def _install_gemma4_cp_ring_sdpa(attention_module: torch.nn.Module, cp_mesh) -> 
         # back to that for any key the caller didn't pass so the ring can still
         # build the vision-bidirectional / packed masks. Persisted across the step
         # (not cleared by the post-hook) so it survives activation-checkpoint recompute.
-        fallback = module._cp_dense_metadata if hasattr(module, "_cp_dense_metadata") else None
+        fallback = module._cp_dense_metadata if "_cp_dense_metadata" in dir(module) else None
         if fallback:
             for name in metadata_keys:
                 if captured.get(name) is None:

@@ -245,7 +245,7 @@ class Step3p7TextConfig(PretrainedConfig):
 
     def to_dict(self):
         output = _json_safe_value(super().to_dict())
-        torch_dtype = self.torch_dtype if hasattr(self, "torch_dtype") else None
+        torch_dtype = self.torch_dtype if "torch_dtype" in dir(self) else None
         if torch_dtype is not None:
             output["torch_dtype"] = _json_safe_value(torch_dtype)
         return output

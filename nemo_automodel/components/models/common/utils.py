@@ -632,7 +632,7 @@ def yield_fp32_model(model: nn.Module, restore_dtype: torch.dtype | None = None)
 
 
 def _get_strict_fp32_module_keywords(model: nn.Module) -> list[str]:
-    val = model._keep_in_fp32_modules_strict if hasattr(model, "_keep_in_fp32_modules_strict") else None
+    val = model._keep_in_fp32_modules_strict if "_keep_in_fp32_modules_strict" in dir(model) else None
     if not isinstance(val, (list, set, tuple)):
         return []
     return list(dict.fromkeys(val))

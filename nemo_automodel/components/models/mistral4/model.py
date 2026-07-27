@@ -63,7 +63,7 @@ class Mistral4MLA(MLA):
 
     def __init__(self, config, backend: BackendConfig):
         super().__init__(config, backend)
-        rope_parameters = config.rope_parameters if hasattr(config, "rope_parameters") else config.rope_scaling
+        rope_parameters = config.rope_parameters if "rope_parameters" in dir(config) else config.rope_scaling
         self.llama_4_scaling_beta = rope_parameters.get("llama_4_scaling_beta") if rope_parameters else None
         self.llama_4_orig_max_pos = rope_parameters.get("original_max_position_embeddings") if rope_parameters else None
 
@@ -180,7 +180,7 @@ def _build_moe_config(config, moe_overrides: dict | None = None) -> MoEConfig:
         route_scale=config.routed_scaling_factor,
         aux_loss_coeff=0,
         norm_topk_prob=config.norm_topk_prob,
-        dtype=get_dtype((config.torch_dtype if hasattr(config, "torch_dtype") else None), torch.bfloat16),
+        dtype=get_dtype((config.torch_dtype if "torch_dtype" in dir(config) else None), torch.bfloat16),
     )
     if moe_overrides:
         moe_defaults.update(moe_overrides)
@@ -206,7 +206,7 @@ class Mistral4Model(nn.Module):
         # Resolve model dtype once; thread it explicitly to every sub-module
         # so fp32 master weights work even when construction is not wrapped in
         # local_torch_dtype().
-        model_dtype = get_dtype((config.torch_dtype if hasattr(config, "torch_dtype") else None), torch.bfloat16)
+        model_dtype = get_dtype((config.torch_dtype if "torch_dtype" in dir(config) else None), torch.bfloat16)
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, dtype=model_dtype)
         self.layers = torch.nn.ModuleDict()
@@ -326,7 +326,7 @@ class Mistral4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         **kwargs,
     ):
         # Extract text_config if this is a multimodal wrapper config
-        text_config = config.text_config if hasattr(config, "text_config") else config
+        text_config = config.text_config if "text_config" in dir(config) else config
         return cls(text_config, moe_config, backend, **kwargs)
 
     @classmethod
@@ -353,7 +353,7 @@ class Mistral4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         # before unwrapping to text_config below.
         reject_unsupported_tie_word_embeddings(type(self), config)
         # Extract text_config if this is a multimodal wrapper config
-        config = config.text_config if hasattr(config, "text_config") else config
+        config = config.text_config if "text_config" in dir(config) else config
         self.config = config
         self.backend = backend or BackendConfig()
         moe_overrides = kwargs.pop("moe_overrides", None)
@@ -363,7 +363,7 @@ class Mistral4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             moe_config=moe_config,
             moe_overrides=moe_overrides,
         )
-        model_dtype = get_dtype((config.torch_dtype if hasattr(config, "torch_dtype") else None), torch.bfloat16)
+        model_dtype = get_dtype((config.torch_dtype if "torch_dtype" in dir(config) else None), torch.bfloat16)
         self.lm_head = initialize_linear_module(
             self.backend.linear, config.hidden_size, config.vocab_size, bias=False, dtype=model_dtype
         )
@@ -398,7 +398,7 @@ class Mistral4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         output_hidden_states = (
             output_hidden_states
             if output_hidden_states is not None
-            else (self.config.output_hidden_states if hasattr(self.config, "output_hidden_states") else False)
+            else (self.config.output_hidden_states if "output_hidden_states" in dir(self.config) else False)
         )
 
         is_thd = attn_kwargs.get("qkv_format") == "thd"
@@ -510,7 +510,7 @@ if _HF_MISTRAL3_AVAILABLE:
                 config.hidden_size,
                 config.vocab_size,
                 bias=False,
-                dtype=get_dtype((config.torch_dtype if hasattr(config, "torch_dtype") else None), torch.bfloat16),
+                dtype=get_dtype((config.torch_dtype if "torch_dtype" in dir(config) else None), torch.bfloat16),
             )
 
         @property
@@ -646,13 +646,13 @@ if _HF_MISTRAL3_AVAILABLE:
                     pixel_values=pixel_values,
                     image_sizes=image_sizes,
                     vision_feature_layer=(
-                        self.config.vision_feature_layer if hasattr(self.config, "vision_feature_layer") else -1
+                        self.config.vision_feature_layer if "vision_feature_layer" in dir(self.config) else -1
                     ),
                 )
                 image_features = torch.cat(image_features, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
 
                 # Merge image features into text embeddings at image token positions
-                image_token_index = self.config.image_token_index if hasattr(self.config, "image_token_index") else 10
+                image_token_index = self.config.image_token_index if "image_token_index" in dir(self.config) else 10
                 special_image_mask = (
                     (input_ids == image_token_index).unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
                 )
@@ -695,10 +695,10 @@ if _HF_MISTRAL3_AVAILABLE:
         @classmethod
         def supports_config(cls, config) -> bool:
             """Only handle configs whose text backbone is Mistral4 (MoE + MLA)."""
-            text_config = config.text_config if hasattr(config, "text_config") else None
+            text_config = config.text_config if "text_config" in dir(config) else None
             return (
                 text_config is not None
-                and (text_config.model_type if hasattr(text_config, "model_type") else None) == "mistral4"
+                and (text_config.model_type if "model_type" in dir(text_config) else None) == "mistral4"
             )
 
         @classmethod
@@ -745,10 +745,10 @@ if _HF_MISTRAL3_AVAILABLE:
             # config.json). Propagate the user-requested dtype to every nested
             # sub-config that exposes a torch_dtype attribute, before building
             # the vision tower / text backend.
-            top_dtype = config.torch_dtype if hasattr(config, "torch_dtype") else None
+            top_dtype = config.torch_dtype if "torch_dtype" in dir(config) else None
             if top_dtype is not None:
                 for sub_cfg in vars(config).values():
-                    if sub_cfg is not config and hasattr(sub_cfg, "torch_dtype"):
+                    if sub_cfg is not config and "torch_dtype" in dir(sub_cfg):
                         sub_cfg.torch_dtype = top_dtype
 
             self.config = config
@@ -776,8 +776,8 @@ if _HF_MISTRAL3_AVAILABLE:
             self.model.moe_config = self.moe_config
 
             self.vocab_size = text_config.vocab_size
-            self.pad_token_id = (text_config.pad_token_id if hasattr(text_config, "pad_token_id") else -1) or -1
-            self.image_token_index = config.image_token_index if hasattr(config, "image_token_index") else 10
+            self.pad_token_id = (text_config.pad_token_id if "pad_token_id" in dir(text_config) else -1) or -1
+            self.image_token_index = config.image_token_index if "image_token_index" in dir(config) else 10
 
             if backend.enable_hf_state_dict_adapter:
                 self.state_dict_adapter = Mistral4MultimodalStateDictAdapter(
@@ -785,7 +785,7 @@ if _HF_MISTRAL3_AVAILABLE:
                     self.moe_config,
                     backend,
                     dtype=get_dtype(
-                        (text_config.torch_dtype if hasattr(text_config, "torch_dtype") else None), torch.bfloat16
+                        (text_config.torch_dtype if "torch_dtype" in dir(text_config) else None), torch.bfloat16
                     ),
                 )
 
@@ -820,7 +820,7 @@ if _HF_MISTRAL3_AVAILABLE:
             # PP VLM support: retrieve pixel_values from stored chunks
             if (
                 pixel_values is None
-                and hasattr(self, "_vlm_pixel_values_chunks")
+                and "_vlm_pixel_values_chunks" in dir(self)
                 and self._vlm_pixel_values_chunks is not None
             ):
                 has_media_tokens = (
@@ -829,7 +829,7 @@ if _HF_MISTRAL3_AVAILABLE:
                     and (input_ids == self.image_token_index).any()
                 )
                 if has_media_tokens:
-                    chunk_idx = self._vlm_chunk_idx if hasattr(self, "_vlm_chunk_idx") else 0
+                    chunk_idx = self._vlm_chunk_idx if "_vlm_chunk_idx" in dir(self) else 0
                     if chunk_idx < len(self._vlm_pixel_values_chunks):
                         pixel_values = self._vlm_pixel_values_chunks[chunk_idx]
                         image_grid_hws = self._vlm_image_grid_hws_chunks[chunk_idx]
@@ -854,7 +854,7 @@ if _HF_MISTRAL3_AVAILABLE:
                 **kwargs,
             )
 
-            hidden_states = outputs.last_hidden_state if hasattr(outputs, "last_hidden_state") else outputs
+            hidden_states = outputs.last_hidden_state if "last_hidden_state" in dir(outputs) else outputs
             try:
                 lm = self.lm_head
             except (AttributeError, TypeError):

@@ -158,9 +158,9 @@ class GPTOSSStateDictAdapter(StateDictAdapter):
             sub = out[r0:r1]
 
             # Work on local shards to avoid DTensor advanced indexing
-            blk_local = blk.to_local() if hasattr(blk, "to_local") else blk
-            sub_local = sub.to_local() if hasattr(sub, "to_local") else sub
-            exp_local = exp.to_local() if hasattr(exp, "to_local") else exp
+            blk_local = blk.to_local() if "to_local" in dir(blk) else blk
+            sub_local = sub.to_local() if "to_local" in dir(sub) else sub
+            exp_local = exp.to_local() if "to_local" in dir(exp) else exp
 
             # Ensure uint8 for nibble extraction
             blk_local = blk_local.to(torch.uint8)

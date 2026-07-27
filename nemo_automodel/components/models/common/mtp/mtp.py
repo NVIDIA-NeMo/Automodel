@@ -53,9 +53,9 @@ def roll_tensor(t: torch.Tensor, shifts: int = -1, dim: int = -1) -> torch.Tenso
 
 def get_mtp_loss_scaling_factor(model: nn.Module, default: float = 0.1) -> float:
     """Return the model's configured MTP auxiliary-loss scaling factor."""
-    mtp_config = model.mtp_config if hasattr(model, "mtp_config") else None
+    mtp_config = model.mtp_config if "mtp_config" in dir(model) else None
     if mtp_config is not None:
-        return float((mtp_config.loss_scaling_factor if hasattr(mtp_config, "loss_scaling_factor") else default))
+        return float((mtp_config.loss_scaling_factor if "loss_scaling_factor" in dir(mtp_config) else default))
     return default
 
 

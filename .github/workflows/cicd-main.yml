@@ -90,7 +90,7 @@ jobs:
            --load-plugins=pylint.extensions.bad_builtin \
            --disable=all \
            --enable=bad-builtin \
-           --bad-functions=getattr,setattr \
+           --bad-functions=getattr,setattr,hasattr \
            nemo_automodel/components/models/
 
   import_linting:

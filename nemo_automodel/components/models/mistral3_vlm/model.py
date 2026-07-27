@@ -75,7 +75,7 @@ def _rotary_reinit_self_hook(module, args, kwargs):
     (YaRN) and Pixtral (2D patch positions) produce the right values this
     way, since we defer to the class's authoritative init logic.
     """
-    if module._mistral3_fp8_rotary_reinit_done if hasattr(module, "_mistral3_fp8_rotary_reinit_done") else False:
+    if module._mistral3_fp8_rotary_reinit_done if "_mistral3_fp8_rotary_reinit_done" in dir(module) else False:
         return
     # Pick a device that has real storage. Prefer a buffer with non-meta
     # device (rotary modules typically have `inv_freq` buffer only).
@@ -151,10 +151,10 @@ class Mistral3FP8VLMForConditionalGeneration(_HFMistral3ForConditionalGeneration
         # the linear swap by flipping ``dequantize=True`` on the config
         # (see transformers/integrations/finegrained_fp8.py:742, which early-
         # returns from replace_with_fp8_linear when dequantize is truthy).
-        # ``apply_model_infrastructure`` still sees hasattr(config,
-        # 'quantization_config'), so ``dequantize_base_checkpoint`` is set
-        # to True and our adapter's ``to_hf(quantization=True)`` path runs.
-        qc = config.quantization_config if hasattr(config, "quantization_config") else None
+        # ``apply_model_infrastructure`` still sees ``quantization_config``,
+        # so ``dequantize_base_checkpoint`` is set to True and our adapter's
+        # ``to_hf(quantization=True)`` path runs.
+        qc = config.quantization_config if "quantization_config" in dir(config) else None
         if qc is not None:
             if isinstance(qc, dict):
                 qc["dequantize"] = True
@@ -183,15 +183,15 @@ class Mistral3FP8VLMForConditionalGeneration(_HFMistral3ForConditionalGeneration
         # invoked directly — the PP schedule dispatches stage sub-modules
         # individually and rotary runs inside each attention layer.
         for sub in self.modules():
-            if "inv_freq" in (sub._buffers if hasattr(sub, "_buffers") else {}):
+            if "inv_freq" in (sub._buffers if "_buffers" in dir(sub) else {}):
                 sub._mistral3_fp8_rotary_reinit_done = False
                 sub.register_forward_pre_hook(_rotary_reinit_self_hook, with_kwargs=True, prepend=True)
 
     def tie_weights(self, *_args: object, **_kwargs: object) -> None:
         """Tie ``lm_head`` to the active text embedding when requested."""
         if (
-            (self.config if hasattr(self, "config") else None).tie_word_embeddings
-            if hasattr((self.config if hasattr(self, "config") else None), "tie_word_embeddings")
+            (self.config if "config" in dir(self) else None).tie_word_embeddings
+            if "tie_word_embeddings" in dir((self.config if "config" in dir(self) else None))
             else False
         ):
             self.lm_head.weight = self.model.language_model.embed_tokens.weight
@@ -246,11 +246,11 @@ class Mistral3FP8VLMForConditionalGeneration(_HFMistral3ForConditionalGeneration
             with ``logits``, optional ``loss``, ``past_key_values``, and (when
             ``output_hidden_states`` is set) the final ``hidden_states`` tensor.
         """
-        text_config = self.config.text_config if hasattr(self.config, "text_config") else self.config
+        text_config = self.config.text_config if "text_config" in dir(self.config) else self.config
         output_hidden_states = (
             output_hidden_states
             if output_hidden_states is not None
-            else (text_config.output_hidden_states if hasattr(text_config, "output_hidden_states") else False)
+            else (text_config.output_hidden_states if "output_hidden_states" in dir(text_config) else False)
         )
 
         outputs = self.model(
@@ -292,18 +292,16 @@ class Mistral3FP8VLMForConditionalGeneration(_HFMistral3ForConditionalGeneration
         == 'fp8'``. Consolidated checkpoints are saved in BF16 without the
         source FP8 metadata and still require this class's rotary-buffer reinit.
         """
-        text_config = config.text_config if hasattr(config, "text_config") else None
+        text_config = config.text_config if "text_config" in dir(config) else None
         if (
             text_config is None
-            or (text_config.model_type if hasattr(text_config, "model_type") else None) != "ministral3"
+            or (text_config.model_type if "model_type" in dir(text_config) else None) != "ministral3"
         ):
             return False
-        qc = config.quantization_config if hasattr(config, "quantization_config") else None
+        qc = config.quantization_config if "quantization_config" in dir(config) else None
         if qc is None:
             return True
         method = (
-            qc.get("quant_method")
-            if isinstance(qc, dict)
-            else (qc.quant_method if hasattr(qc, "quant_method") else None)
+            qc.get("quant_method") if isinstance(qc, dict) else (qc.quant_method if "quant_method" in dir(qc) else None)
         )
         return method == "fp8"

@@ -25,7 +25,7 @@ def _install_resolver_hook() -> None:
     """Prepend an FP8-Mistral3 VLM check to _resolve_custom_model_cls_for_config."""
     if (
         _mi._resolve_custom_model_cls_for_config._mistral3_vlm_hook_installed
-        if hasattr(_mi._resolve_custom_model_cls_for_config, "_mistral3_vlm_hook_installed")
+        if "_mistral3_vlm_hook_installed" in dir(_mi._resolve_custom_model_cls_for_config)
         else False
     ):
         return

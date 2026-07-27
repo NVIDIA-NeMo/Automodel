@@ -144,21 +144,21 @@ def _get_rope_config(config) -> tuple[float, dict]:
         Tuple of (rope_theta, rope_scaling_dict)
     """
     # Qwen2 uses config.rope_parameters, Llama uses config.rope_theta + config.rope_scaling
-    if hasattr(config, "rope_parameters") and config.rope_parameters:
+    if "rope_parameters" in dir(config) and config.rope_parameters:
         rope_params = config.rope_parameters
         base = rope_params.get("rope_theta", 10000.0)
         rope_scaling = rope_params  # rope_parameters contains scaling info too
     else:
-        base = config.rope_theta if hasattr(config, "rope_theta") else 10000.0
-        rope_scaling = (config.rope_scaling if hasattr(config, "rope_scaling") else {}) or {}
+        base = config.rope_theta if "rope_theta" in dir(config) else 10000.0
+        rope_scaling = (config.rope_scaling if "rope_scaling" in dir(config) else {}) or {}
     return base, rope_scaling
 
 
 def _compute_default_inv_freq(config, device: Optional[torch.device] = None) -> tuple[torch.Tensor, float]:
     """Computes inverse frequencies for standard RoPE."""
     base, _ = _get_rope_config(config)
-    dim = (config.head_dim if hasattr(config, "head_dim") else None) or config.hidden_size // config.num_attention_heads
-    partial_rotary_factor = config.partial_rotary_factor if hasattr(config, "partial_rotary_factor") else 1.0
+    dim = (config.head_dim if "head_dim" in dir(config) else None) or config.hidden_size // config.num_attention_heads
+    partial_rotary_factor = config.partial_rotary_factor if "partial_rotary_factor" in dir(config) else 1.0
     dim = int(dim * partial_rotary_factor)
 
     inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.int64).to(device=device, dtype=torch.float32) / dim))
@@ -212,7 +212,7 @@ class LlamaRotaryEmbedding(nn.Module):
         super().__init__()
         self.max_seq_len_cached = 0
         self.rope_fusion = rope_fusion
-        self.dtype = (config.torch_dtype if hasattr(config, "torch_dtype") else None) or torch.float32
+        self.dtype = (config.torch_dtype if "torch_dtype" in dir(config) else None) or torch.float32
 
         # ``default`` and ``llama3`` have local fast-path implementations. Every
         # other schedule (``yarn``, ``linear``, ``dynamic``, ``longrope``, ...)

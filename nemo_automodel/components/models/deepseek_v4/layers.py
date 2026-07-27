@@ -657,7 +657,7 @@ def eager_attention_with_sink(
     attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
     if attention_mask is not None:
         attn_weights = attn_weights + attention_mask[:, :, :, : attn_weights.shape[-1]]
-    if hasattr(module, "sinks_param"):
+    if "sinks_param" in dir(module):
         sinks = module.sinks_param(query)
     else:
         sinks = module.sinks
@@ -1213,10 +1213,8 @@ class DeepseekV4Attention(nn.Module):
         self.num_key_value_groups = config.num_attention_heads
         self.head_dim = config.head_dim
         self.rope_head_dim = config.qk_rope_head_dim
-        self.sliding_window = int((config.sliding_window if hasattr(config, "sliding_window") else 128) or 128)
-        self.attention_dropout = float(
-            (config.attention_dropout if hasattr(config, "attention_dropout") else 0.0) or 0.0
-        )
+        self.sliding_window = int((config.sliding_window if "sliding_window" in dir(config) else 128) or 128)
+        self.attention_dropout = float((config.attention_dropout if "attention_dropout" in dir(config) else 0.0) or 0.0)
         self.is_causal = True
         self.scaling = self.head_dim**-0.5
 
@@ -1263,7 +1261,7 @@ class DeepseekV4Attention(nn.Module):
         position_ids: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        cp_group = kwargs.get("_dsv4_cp_group") or (self._cp_group if hasattr(self, "_cp_group") else None)
+        cp_group = kwargs.get("_dsv4_cp_group") or (self._cp_group if "_cp_group" in dir(self) else None)
         cp_active = dsv4_cp_enabled(cp_group)
         packed_seq_ids = kwargs.get("packed_seq_ids")
         if packed_seq_ids is not None and packed_seq_ids.dim() == 1:
@@ -1449,7 +1447,7 @@ class DeepseekV4Attention(nn.Module):
 
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
         for linear in (self.wq_a, self.wq_b, self.wkv, self.wo_b, self.wo_a):
-            if hasattr(linear, "weight"):
+            if "weight" in dir(linear):
                 nn.init.trunc_normal_(linear.weight, mean=0.0, std=init_std)
         for norm in (self.q_norm, self.kv_norm):
             norm.reset_parameters()

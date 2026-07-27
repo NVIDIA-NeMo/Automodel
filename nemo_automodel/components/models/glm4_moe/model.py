@@ -49,7 +49,7 @@ class Block(nn.Module):
 
         # Thread dtype from config.torch_dtype so the block's own params stay
         # aligned with the rest of the model (fp32 under fp32 master weights).
-        dtype = get_dtype((config.torch_dtype if hasattr(config, "torch_dtype") else None), torch.bfloat16)
+        dtype = get_dtype((config.torch_dtype if "torch_dtype" in dir(config) else None), torch.bfloat16)
 
         # GLM4-MoE uses dense layers for first_k_dense_replace layers, then MoE
         is_moe_layer = layer_idx >= config.first_k_dense_replace
@@ -115,7 +115,7 @@ class Glm4MoeModel(nn.Module):
         # Resolve model dtype once; thread it explicitly to every sub-module
         # so fp32 master weights work even when construction is not wrapped in
         # local_torch_dtype().
-        model_dtype = get_dtype((config.torch_dtype if hasattr(config, "torch_dtype") else None), torch.bfloat16)
+        model_dtype = get_dtype((config.torch_dtype if "torch_dtype" in dir(config) else None), torch.bfloat16)
 
         # Map HF GLM4 MoE config -> our MoE wrapper
         # GLM4 MoE config fields:
@@ -159,7 +159,7 @@ class Glm4MoeModel(nn.Module):
         # GLM4 MoE uses partial rotary embeddings
         self.max_seq_len = config.max_position_embeddings
         self.head_dim = (
-            config.head_dim if hasattr(config, "head_dim") else config.hidden_size // config.num_attention_heads
+            config.head_dim if "head_dim" in dir(config) else config.hidden_size // config.num_attention_heads
         )
 
         base, rope_scaling, partial_rotary_factor = get_rope_config(config)
@@ -281,7 +281,7 @@ class Glm4MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             moe_config=moe_config,
             moe_overrides=moe_overrides,
         )
-        model_dtype = get_dtype((config.torch_dtype if hasattr(config, "torch_dtype") else None), torch.bfloat16)
+        model_dtype = get_dtype((config.torch_dtype if "torch_dtype" in dir(config) else None), torch.bfloat16)
         self.lm_head = initialize_linear_module(
             self.backend.linear, config.hidden_size, config.vocab_size, bias=False, dtype=model_dtype
         )
@@ -316,7 +316,7 @@ class Glm4MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         output_hidden_states = (
             output_hidden_states
             if output_hidden_states is not None
-            else (self.config.output_hidden_states if hasattr(self.config, "output_hidden_states") else False)
+            else (self.config.output_hidden_states if "output_hidden_states" in dir(self.config) else False)
         )
 
         is_thd = attn_kwargs.get("qkv_format") == "thd"

@@ -53,11 +53,7 @@ from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 def _config_dtype(config: Any) -> torch.dtype:
     return get_dtype(
-        (
-            config.torch_dtype
-            if hasattr(config, "torch_dtype")
-            else (config.dtype if hasattr(config, "dtype") else None)
-        ),
+        (config.torch_dtype if "torch_dtype" in dir(config) else (config.dtype if "dtype" in dir(config) else None)),
         torch.bfloat16,
     )
 
@@ -71,7 +67,7 @@ class Ernie4_5Attention(nn.Module):
         self.num_heads = config.num_attention_heads
         self.num_kv_heads = config.num_key_value_heads
         self.head_dim = (
-            config.head_dim if hasattr(config, "head_dim") else config.hidden_size // config.num_attention_heads
+            config.head_dim if "head_dim" in dir(config) else config.hidden_size // config.num_attention_heads
         )
         self.q_proj = initialize_linear_module(
             backend.linear,
@@ -350,7 +346,7 @@ class Ernie4_5_MoeModel(nn.Module):
             gate_bias_update_factor=0.0,
             score_func="softmax_with_bias",
             route_scale=1.0,
-            aux_loss_coeff=(config.router_aux_loss_coef if hasattr(config, "router_aux_loss_coef") else 0.0),
+            aux_loss_coeff=(config.router_aux_loss_coef if "router_aux_loss_coef" in dir(config) else 0.0),
             norm_topk_prob=True,
             expert_bias=config.use_bias,
             router_bias=False,
@@ -467,7 +463,7 @@ class Ernie4_5ForCausalLM(HFCheckpointingMixin, nn.Module):
             bias=False,
             dtype=_config_dtype(config),
         )
-        if config.tie_word_embeddings if hasattr(config, "tie_word_embeddings") else True:
+        if config.tie_word_embeddings if "tie_word_embeddings" in dir(config) else True:
             self.lm_head.weight = self.model.embed_tokens.weight
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = Ernie4_5StateDictAdapter(config)
@@ -485,7 +481,7 @@ class Ernie4_5ForCausalLM(HFCheckpointingMixin, nn.Module):
         self.lm_head = new_embeddings
 
     def tie_weights(self):
-        if self.config.tie_word_embeddings if hasattr(self.config, "tie_word_embeddings") else True:
+        if self.config.tie_word_embeddings if "tie_word_embeddings" in dir(self.config) else True:
             self.lm_head.weight = self.model.embed_tokens.weight
 
     def forward(
@@ -502,7 +498,7 @@ class Ernie4_5ForCausalLM(HFCheckpointingMixin, nn.Module):
         output_hidden_states = (
             output_hidden_states
             if output_hidden_states is not None
-            else (self.config.output_hidden_states if hasattr(self.config, "output_hidden_states") else False)
+            else (self.config.output_hidden_states if "output_hidden_states" in dir(self.config) else False)
         )
 
         is_thd = "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd"
@@ -551,7 +547,7 @@ class Ernie4_5_MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin)
            Demonstrated by examples/llm_finetune/ernie4_5/ernie4_5_0p3b_hellaswag.yaml
            (tp/cp/pp/ep all 1).
         """
-        if (config.moe_num_experts if hasattr(config, "moe_num_experts") else 0) > 0:
+        if (config.moe_num_experts if "moe_num_experts" in dir(config) else 0) > 0:
             return ModelCapabilities(supports_ep=True)
         return ModelCapabilities()
 
@@ -601,7 +597,7 @@ class Ernie4_5_MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin)
             bias=config.use_bias,
             dtype=_config_dtype(config),
         )
-        if config.tie_word_embeddings if hasattr(config, "tie_word_embeddings") else True:
+        if config.tie_word_embeddings if "tie_word_embeddings" in dir(config) else True:
             self.lm_head.weight = self.model.embed_tokens.weight
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = Ernie4_5_MoeStateDictAdapter(
@@ -624,7 +620,7 @@ class Ernie4_5_MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin)
         self.lm_head = new_embeddings
 
     def tie_weights(self):
-        if self.config.tie_word_embeddings if hasattr(self.config, "tie_word_embeddings") else True:
+        if self.config.tie_word_embeddings if "tie_word_embeddings" in dir(self.config) else True:
             self.lm_head.weight = self.model.embed_tokens.weight
 
     def forward(
@@ -641,7 +637,7 @@ class Ernie4_5_MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin)
         output_hidden_states = (
             output_hidden_states
             if output_hidden_states is not None
-            else (self.config.output_hidden_states if hasattr(self.config, "output_hidden_states") else False)
+            else (self.config.output_hidden_states if "output_hidden_states" in dir(self.config) else False)
         )
 
         is_thd = "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd"

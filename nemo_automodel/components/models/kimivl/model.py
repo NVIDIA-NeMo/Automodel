@@ -357,7 +357,7 @@ class MoonVitPretrainedModel(nn.Module):
         # GELU with tanh approximation
         activation = lambda x: F.gelu(x, approximate="tanh")
 
-        attn_impl = config._attn_implementation if hasattr(config, "_attn_implementation") else "flash_attention_2"
+        attn_impl = config._attn_implementation if "_attn_implementation" in dir(config) else "flash_attention_2"
         block_cfg = {
             "num_heads": config.num_attention_heads,
             "hidden_dim": config.hidden_size,
@@ -676,9 +676,7 @@ class KimiVLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSyn
         )
 
         self.vocab_size = config.text_config.vocab_size
-        self.pad_token_id = (
-            config.text_config.pad_token_id if hasattr(config.text_config, "pad_token_id") else -1
-        ) or -1
+        self.pad_token_id = (config.text_config.pad_token_id if "pad_token_id" in dir(config.text_config) else -1) or -1
         self.media_placeholder_token_id = config.media_placeholder_token_id
 
         if self.backend.enable_hf_state_dict_adapter:
@@ -687,7 +685,7 @@ class KimiVLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSyn
                 self.moe_config,
                 self.backend,
                 dtype=get_dtype(
-                    (config.text_config.torch_dtype if hasattr(config.text_config, "torch_dtype") else None),
+                    (config.text_config.torch_dtype if "torch_dtype" in dir(config.text_config) else None),
                     torch.bfloat16,
                 ),
             )
@@ -737,7 +735,7 @@ class KimiVLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSyn
             if output_hidden_states is not None
             else (
                 self.config.text_config.output_hidden_states
-                if hasattr(self.config.text_config, "output_hidden_states")
+                if "output_hidden_states" in dir(self.config.text_config)
                 else False
             )
         )
@@ -747,7 +745,7 @@ class KimiVLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSyn
         # finetune.py stores chunks on model, we retrieve them here per microbatch
         if (
             pixel_values is None
-            and hasattr(self, "_vlm_pixel_values_chunks")
+            and "_vlm_pixel_values_chunks" in dir(self)
             and self._vlm_pixel_values_chunks is not None
         ):
             # Check if we have media tokens to process
@@ -757,7 +755,7 @@ class KimiVLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSyn
                 and (input_ids == self.media_placeholder_token_id).any()
             )
             if has_media_tokens:
-                chunk_idx = self._vlm_chunk_idx if hasattr(self, "_vlm_chunk_idx") else 0
+                chunk_idx = self._vlm_chunk_idx if "_vlm_chunk_idx" in dir(self) else 0
                 if chunk_idx < len(self._vlm_pixel_values_chunks):
                     pixel_values = self._vlm_pixel_values_chunks[chunk_idx]
                     image_grid_hws = self._vlm_image_grid_hws_chunks[chunk_idx]

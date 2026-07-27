@@ -59,9 +59,9 @@ class Block(nn.Module):
             self.self_attn = Qwen3NextAttention(config, layer_idx, backend)
 
         is_moe_layer = (
-            (layer_idx not in (config.mlp_only_layers if hasattr(config, "mlp_only_layers") else []))
-            and ((config.num_experts if hasattr(config, "num_experts") else 0) > 0)
-            and ((layer_idx + 1) % (config.decoder_sparse_step if hasattr(config, "decoder_sparse_step") else 1) == 0)
+            (layer_idx not in (config.mlp_only_layers if "mlp_only_layers" in dir(config) else []))
+            and ((config.num_experts if "num_experts" in dir(config) else 0) > 0)
+            and ((layer_idx + 1) % (config.decoder_sparse_step if "decoder_sparse_step" in dir(config) else 1) == 0)
         )
         if is_moe_layer:
             self.mlp = MoE(moe_config, backend)
@@ -72,7 +72,7 @@ class Block(nn.Module):
                 config.hidden_size,
                 config.intermediate_size,
                 backend.linear,
-                dtype=get_dtype((config.torch_dtype if hasattr(config, "torch_dtype") else None), torch.bfloat16),
+                dtype=get_dtype((config.torch_dtype if "torch_dtype" in dir(config) else None), torch.bfloat16),
             )
 
         self.input_layernorm = Qwen3NextRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -153,7 +153,7 @@ class Qwen3NextModel(nn.Module):
         # Resolve model dtype from config.torch_dtype once; thread it
         # explicitly into every sub-module so fp32 master weights work even
         # when construction is not wrapped in local_torch_dtype().
-        model_dtype = get_dtype((config.torch_dtype if hasattr(config, "torch_dtype") else None), torch.bfloat16)
+        model_dtype = get_dtype((config.torch_dtype if "torch_dtype" in dir(config) else None), torch.bfloat16)
 
         # Map HF Qwen3Next MoE config -> our MoE wrapper
         moe_defaults = dict(
@@ -194,7 +194,7 @@ class Qwen3NextModel(nn.Module):
         # Rotary embedding cache compatible with our rope_utils functions
         self.max_seq_len = config.max_position_embeddings
         self.head_dim = (
-            config.head_dim if hasattr(config, "head_dim") else config.hidden_size // config.num_attention_heads
+            config.head_dim if "head_dim" in dir(config) else config.hidden_size // config.num_attention_heads
         )
         base, rope_scaling, partial_rotary_factor = get_rope_config(config)
 
@@ -310,11 +310,13 @@ class Qwen3NextForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         self.backend = backend or BackendConfig()
         moe_overrides = kwargs.pop("moe_overrides", None)
         self.model = Qwen3NextModel(config, backend=self.backend, moe_config=moe_config, moe_overrides=moe_overrides)
-        model_dtype = get_dtype((config.torch_dtype if hasattr(config, "torch_dtype") else None), torch.bfloat16)
+        model_dtype = get_dtype((config.torch_dtype if "torch_dtype" in dir(config) else None), torch.bfloat16)
         self.lm_head = initialize_linear_module(
             self.backend.linear, config.hidden_size, config.vocab_size, bias=False, dtype=model_dtype
         )
-        keep_fp32 = list((self._keep_in_fp32_modules if hasattr(self, "_keep_in_fp32_modules") else None) or [])
+        keep_fp32 = list(
+            (vars(self).get("_keep_in_fp32_modules") or vars(type(self)).get("_keep_in_fp32_modules")) or []
+        )
         if "_fp32_params" not in keep_fp32:
             keep_fp32.append("_fp32_params")
         self._keep_in_fp32_modules = keep_fp32
@@ -349,7 +351,7 @@ class Qwen3NextForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         output_hidden_states = (
             output_hidden_states
             if output_hidden_states is not None
-            else (self.config.output_hidden_states if hasattr(self.config, "output_hidden_states") else False)
+            else (self.config.output_hidden_states if "output_hidden_states" in dir(self.config) else False)
         )
 
         is_thd = attn_kwargs.get("qkv_format") == "thd"

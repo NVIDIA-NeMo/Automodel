@@ -162,7 +162,7 @@ class DeepseekV4Block(nn.Module):
         hc_kwargs = dict(
             hc_mult=config.hc_mult,
             hidden_size=config.hidden_size,
-            hc_sinkhorn_iters=int((config.hc_sinkhorn_iters if hasattr(config, "hc_sinkhorn_iters") else 20) or 20),
+            hc_sinkhorn_iters=int((config.hc_sinkhorn_iters if "hc_sinkhorn_iters" in dir(config) else 20) or 20),
             hc_eps=float(config.hc_eps),
             rms_norm_eps=float(config.rms_norm_eps),
             sinkhorn_backend=_dsv4_sinkhorn_backend(backend),
@@ -368,7 +368,7 @@ class DeepseekV4Model(nn.Module):
             dtype=get_dtype(config.torch_dtype, torch.bfloat16),
             # V4 Flash routed experts use clamped SwiGLU (gate.max=limit,
             # up.±limit) in FP32 — see reference model.py Expert.forward.
-            swiglu_limit=float((config.swiglu_limit if hasattr(config, "swiglu_limit") else 0.0) or 0.0),
+            swiglu_limit=float((config.swiglu_limit if "swiglu_limit" in dir(config) else 0.0) or 0.0),
         )
         if moe_overrides:
             moe_defaults.update(moe_overrides)
@@ -410,7 +410,7 @@ class DeepseekV4Model(nn.Module):
         # to the compress-rope path: when compress_ratio>0 it uses
         # ``original_seq_len=args.original_seq_len`` and theta=compress_rope_theta;
         # otherwise ``original_seq_len=0`` (YaRN disabled) and theta=rope_theta.
-        rope_scaling = config.rope_scaling if hasattr(config, "rope_scaling") else None
+        rope_scaling = config.rope_scaling if "rope_scaling" in dir(config) else None
         self.rotary_emb = DeepseekV4RotaryEmbedding(
             rope_theta=float(config.rope_theta),
             head_dim=int(config.head_dim),
@@ -419,7 +419,7 @@ class DeepseekV4Model(nn.Module):
         )
         self.rotary_emb_compress = DeepseekV4RotaryEmbedding(
             rope_theta=float(
-                (config.compress_rope_theta if hasattr(config, "compress_rope_theta") else 160000.0) or 160000.0
+                (config.compress_rope_theta if "compress_rope_theta" in dir(config) else 160000.0) or 160000.0
             ),
             head_dim=int(config.head_dim),
             partial_rotary_factor=partial_rotary_factor,
@@ -488,7 +488,7 @@ class DeepseekV4Model(nn.Module):
         # Build the 4D additive causal+padding+SWA mask.  Same band-diagonal
         # pattern HF's ``create_sliding_window_causal_mask`` produces; every
         # layer in the released DSV4-Flash was trained under it.
-        sliding_window = int((self.config.sliding_window if hasattr(self.config, "sliding_window") else 0) or 0) or None
+        sliding_window = int((self.config.sliding_window if "sliding_window" in dir(self.config) else 0) or 0) or None
         packed_seq_lens = None
         if attn_kwargs.get("qkv_format") == "thd":
             # THD packing uses seq_lens_padded to keep pack/CP padding inside a
@@ -589,9 +589,9 @@ class DeepseekV4Model(nn.Module):
         # apply the shared RMSNorm.  Both modules live ONLY on the last PP
         # stage (intermediate stages keep h at 4D so the next stage can
         # consume it).  Matches HF PR 45616's ``DeepseekV4Model.forward``.
-        if (self.hc_head if hasattr(self, "hc_head") else None) is not None:
+        if (self.hc_head if "hc_head" in dir(self) else None) is not None:
             h = self.hc_head(h)
-        if (self.norm if hasattr(self, "norm") else None) is not None:
+        if (self.norm if "norm" in dir(self) else None) is not None:
             h = self.norm(h)
         if return_hc_hidden:
             if mtp_hc_hidden is None:
@@ -607,7 +607,7 @@ class DeepseekV4Model(nn.Module):
     @torch.no_grad()
     def init_weights(self, buffer_device: torch.device | None = None) -> None:
         buffer_device = buffer_device or torch.device(f"cuda:{torch.cuda.current_device()}")
-        init_std = float((self.config.initializer_range if hasattr(self.config, "initializer_range") else 0.02))
+        init_std = float((self.config.initializer_range if "initializer_range" in dir(self.config) else 0.02))
         with buffer_device:
             if self.embed_tokens is not None:
                 nn.init.normal_(self.embed_tokens.weight)
@@ -765,10 +765,10 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             if fqn not in modules:
                 modules.append(fqn)
 
-        if (text_model.rotary_emb_compress if hasattr(text_model, "rotary_emb_compress") else None) is not None:
+        if (text_model.rotary_emb_compress if "rotary_emb_compress" in dir(text_model) else None) is not None:
             for modules in stage_modules:
                 append_once(modules, f"{layers_prefix}rotary_emb_compress")
-        if (text_model.hc_head if hasattr(text_model, "hc_head") else None) is not None:
+        if (text_model.hc_head if "hc_head" in dir(text_model) else None) is not None:
             append_once(stage_modules[-1], f"{layers_prefix}hc_head")
         if self.mtp is not None:
             append_once(stage_modules[-1], "mtp")
@@ -787,7 +787,7 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
 
         hidden_shape = (microbatch_size, seq_len, self.config.hidden_size)
         hc_hidden_shape = (microbatch_size, seq_len, self.config.hc_mult, self.config.hidden_size)
-        mtp_depth = int((self.mtp_config.num_layers if hasattr(self.mtp_config, "num_layers") else 0) or 0)
+        mtp_depth = int((self.mtp_config.num_layers if "num_layers" in dir(self.mtp_config) else 0) or 0)
 
         def meta(shape: tuple[int, ...]) -> torch.Tensor:
             return torch.empty(*shape, device="meta", dtype=dtype)
@@ -803,7 +803,7 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
 
         if self.lm_head is not None:
             output_meta = meta((microbatch_size, seq_len, self.config.vocab_size))
-        elif (self.model.norm if hasattr(self.model, "norm") else None) is not None:
+        elif (self.model.norm if "norm" in dir(self.model) else None) is not None:
             output_meta = meta(hidden_shape)
         else:
             output_meta = meta(hc_hidden_shape if self.config.hc_mult > 1 else hidden_shape)
@@ -813,7 +813,7 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     def _is_pipeline_parallel_stage(self) -> bool:
         if self.lm_head is None:
             return True
-        if (self.model.embed_tokens if hasattr(self.model, "embed_tokens") else None) is None:
+        if (self.model.embed_tokens if "embed_tokens" in dir(self.model) else None) is None:
             return True
         try:
             return len(self.model.layers) != int(self.config.num_hidden_layers)
@@ -821,7 +821,7 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             return False
 
     def _build_mtp_embed_inputs_for_pp(self, input_ids: torch.Tensor) -> tuple[torch.Tensor, ...]:
-        if (self.model.embed_tokens if hasattr(self.model, "embed_tokens") else None) is None:
+        if (self.model.embed_tokens if "embed_tokens" in dir(self.model) else None) is None:
             raise ValueError("First PP stage must own embed_tokens to build MTP embeddings")
         if input_ids.dtype not in (torch.int32, torch.int64, torch.long):
             raise ValueError("First PP stage must receive token ids to build MTP embeddings")
@@ -879,8 +879,8 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     ) -> "DeepseekV4CausalLMOutput" | tuple[torch.Tensor, ...] | torch.Tensor:
         if output_hidden_states is None:
             output_hidden_states = (
-                (self.config if hasattr(self, "config") else None).output_hidden_states
-                if hasattr((self.config if hasattr(self, "config") else None), "output_hidden_states")
+                (self.config if "config" in dir(self) else None).output_hidden_states
+                if "output_hidden_states" in dir((self.config if "config" in dir(self) else None))
                 else False
             )
 
@@ -931,7 +931,7 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             if position_ids is None:
                 position_ids = torch.arange(seq_len, device=hidden_states.device).unsqueeze(0).expand(batch_size, -1)
             sliding_window = (
-                int((self.config.sliding_window if hasattr(self.config, "sliding_window") else 0) or 0) or None
+                int((self.config.sliding_window if "sliding_window" in dir(self.config) else 0) or 0) or None
             )
             cp_group = attn_kwargs.get("_dsv4_cp_group")
             if dsv4_cp_enabled(cp_group):

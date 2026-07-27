@@ -325,15 +325,15 @@ class StepRoboticsVisionEncoder(nn.Module):
         self.num_hidden_layers = config.layers
         self.patch_size = config.patch_size
         self.image_size = config.image_size
-        self.use_cls_token = config.use_cls_token if hasattr(config, "use_cls_token") else False
-        self.use_rope2d = config.use_rope2d if hasattr(config, "use_rope2d") else True
-        self.use_abs_posemb = config.use_abs_posemb if hasattr(config, "use_abs_posemb") else True
+        self.use_cls_token = config.use_cls_token if "use_cls_token" in dir(config) else False
+        self.use_rope2d = config.use_rope2d if "use_rope2d" in dir(config) else True
+        self.use_abs_posemb = config.use_abs_posemb if "use_abs_posemb" in dir(config) else True
         self.layer_norm_eps = config.layer_norm_eps
-        self.mlp_ratio = config.mlp_ratio if hasattr(config, "mlp_ratio") else 8960 / 1536
-        self.ls_init_value = config.ls_init_value if hasattr(config, "ls_init_value") else None
+        self.mlp_ratio = config.mlp_ratio if "mlp_ratio" in dir(config) else 8960 / 1536
+        self.ls_init_value = config.ls_init_value if "ls_init_value" in dir(config) else None
         self.hidden_act = config.hidden_act
-        self.use_ln_pre = config.use_ln_pre if hasattr(config, "use_ln_pre") else False
-        self.use_ln_post = config.use_ln_post if hasattr(config, "use_ln_post") else True
+        self.use_ln_pre = config.use_ln_pre if "use_ln_pre" in dir(config) else False
+        self.use_ln_post = config.use_ln_post if "use_ln_post" in dir(config) else True
 
         # Patch embedding.
         self.conv1 = nn.Conv2d(
@@ -378,13 +378,13 @@ class StepRoboticsVisionEncoder(nn.Module):
             use_cls_token=self.use_cls_token,
             use_rope2d=self.use_rope2d,
             rope_kwargs={
-                "rope_theta": (config.rope_theta if hasattr(config, "rope_theta") else 10000),
-                "rope_max_freq": (config.rope_max_freq if hasattr(config, "rope_max_freq") else 10),
-                "rope_num_freqs": (config.rope_num_freqs if hasattr(config, "rope_num_freqs") else 1),
+                "rope_theta": (config.rope_theta if "rope_theta" in dir(config) else 10000),
+                "rope_max_freq": (config.rope_max_freq if "rope_max_freq" in dir(config) else 10),
+                "rope_num_freqs": (config.rope_num_freqs if "rope_num_freqs" in dir(config) else 1),
                 "rope_theta_rescale_factor": (
-                    config.rope_theta_rescale_factor if hasattr(config, "rope_theta_rescale_factor") else 1.0
+                    config.rope_theta_rescale_factor if "rope_theta_rescale_factor" in dir(config) else 1.0
                 ),
-                "rope_freqs_for": (config.rope_freqs_for if hasattr(config, "rope_freqs_for") else "lang"),
+                "rope_freqs_for": (config.rope_freqs_for if "rope_freqs_for" in dir(config) else "lang"),
             },
         )
         self.vit_downsampler1 = nn.Conv2d(self.hidden_size, self.hidden_size * 2, kernel_size=3, stride=2, padding=1)

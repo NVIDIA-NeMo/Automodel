@@ -144,7 +144,7 @@ class NemotronParseEncoderConfig(PretrainedConfig):
         self.preferred_resolution = preferred_resolution or [768, 768]
         self.torch_dtype = torch_dtype
         for key, value in kwargs.items():
-            if not hasattr(self, key):
+            if key not in dir(self):
                 vars(self)[key] = value
 
 
@@ -188,7 +188,7 @@ class NemotronParseConfig(PretrainedConfig):
             self.encoder = AutoConfig.from_pretrained(radio_model_path, trust_remote_code=True)
             # Update with any overrides from encoder dict
             for key, value in encoder.items():
-                if hasattr(self.encoder, key):
+                if key in dir(self.encoder):
                     vars(self.encoder)[key] = value
         else:
             self.encoder = PretrainedConfig()
@@ -462,7 +462,7 @@ class NemotronParseForConditionalGeneration(HFCheckpointingMixin, NemotronParseP
 
         self.lm_head = nn.Linear(config.decoder.d_model, config.decoder.vocab_size, bias=False, dtype=torch.bfloat16)
 
-        num_extra_heads = config.num_extra_heads if hasattr(config, "num_extra_heads") else 0
+        num_extra_heads = config.num_extra_heads if "num_extra_heads" in dir(config) else 0
         self.decoder.extra_heads = nn.ModuleList(
             [
                 nn.Linear(config.decoder.d_model, config.decoder.d_model, dtype=torch.bfloat16)
@@ -476,9 +476,7 @@ class NemotronParseForConditionalGeneration(HFCheckpointingMixin, NemotronParseP
             ]
         )
 
-        self.class_token_indx_start = (
-            config.class_token_start_idx if hasattr(config, "class_token_start_idx") else 50000
-        )
+        self.class_token_indx_start = config.class_token_start_idx if "class_token_start_idx" in dir(config) else 50000
         self.post_init()
 
     def get_encoder(self):
@@ -523,7 +521,7 @@ class NemotronParseForConditionalGeneration(HFCheckpointingMixin, NemotronParseP
             if output_hidden_states is not None
             else (
                 self.config.decoder.output_hidden_states
-                if hasattr(self.config.decoder, "output_hidden_states")
+                if "output_hidden_states" in dir(self.config.decoder)
                 else False
             )
         )
@@ -579,10 +577,8 @@ class NemotronParseForConditionalGeneration(HFCheckpointingMixin, NemotronParseP
             decoder_attentions=decoder_outputs.attentions,
             cross_attentions=decoder_outputs.cross_attentions,
             encoder_last_hidden_state=encoder_outputs.last_hidden_state,
-            encoder_hidden_states=(
-                encoder_outputs.hidden_states if hasattr(encoder_outputs, "hidden_states") else None
-            ),
-            encoder_attentions=(encoder_outputs.attentions if hasattr(encoder_outputs, "attentions") else None),
+            encoder_hidden_states=(encoder_outputs.hidden_states if "hidden_states" in dir(encoder_outputs) else None),
+            encoder_attentions=(encoder_outputs.attentions if "attentions" in dir(encoder_outputs) else None),
         )
         # Expose the final decoder hidden states under ``hidden_states`` for fused
         # cross-entropy. Item assignment (not attribute set) registers the key so

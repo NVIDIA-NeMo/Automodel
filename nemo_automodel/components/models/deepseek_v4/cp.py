@@ -41,9 +41,9 @@ def dsv4_cp_local_seq_multiple(model_or_config) -> int:
     cross-window overlap so they need ``2*R``. The returned value is the LCM across
     all configured ``compress_ratios`` (1 when none are configured).
     """
-    config = model_or_config.config if hasattr(model_or_config, "config") else model_or_config
+    config = model_or_config.config if "config" in dir(model_or_config) else model_or_config
     ratios = [
-        int(r) for r in ((config.compress_ratios if hasattr(config, "compress_ratios") else None) or []) if int(r) > 0
+        int(r) for r in ((config.compress_ratios if "compress_ratios" in dir(config) else None) or []) if int(r) > 0
     ]
     multiple = 1
     for ratio in ratios:

@@ -50,19 +50,19 @@ class Block(nn.Module):
         # IndexShare: per-layer indexer mode from `config.indexer_types`. A "shared" layer
         # owns no indexer and reuses the previous "full" layer's top-k selection. Absent the
         # field (e.g. GLM-5.1, which runs a full indexer every layer), every layer is "full".
-        indexer_types = config.indexer_types if hasattr(config, "indexer_types") else None
+        indexer_types = config.indexer_types if "indexer_types" in dir(config) else None
         self.skip_topk = indexer_types is not None and indexer_types[layer_idx] == "shared"
         self.self_attn = GlmMoeDsaMLA(config, backend, skip_topk=self.skip_topk)
 
         # Thread dtype from config.torch_dtype so the block's own params stay
         # aligned with the rest of the model (fp32 under fp32 master weights).
-        dtype = get_dtype((config.torch_dtype if hasattr(config, "torch_dtype") else None), torch.bfloat16)
+        dtype = get_dtype((config.torch_dtype if "torch_dtype" in dir(config) else None), torch.bfloat16)
 
-        mlp_layer_types = config.mlp_layer_types if hasattr(config, "mlp_layer_types") else None
+        mlp_layer_types = config.mlp_layer_types if "mlp_layer_types" in dir(config) else None
         if mlp_layer_types is not None:
             is_moe_layer = mlp_layer_types[layer_idx] == "sparse"
         else:
-            first_k_dense_replace = config.first_k_dense_replace if hasattr(config, "first_k_dense_replace") else 0
+            first_k_dense_replace = config.first_k_dense_replace if "first_k_dense_replace" in dir(config) else 0
             is_moe_layer = layer_idx >= first_k_dense_replace
 
         if is_moe_layer:
@@ -136,7 +136,7 @@ class GlmMoeDsaModel(nn.Module):
         # Resolve model dtype once; thread it explicitly to every sub-module
         # so fp32 master weights work even when construction is not wrapped in
         # local_torch_dtype().
-        model_dtype = get_dtype((config.torch_dtype if hasattr(config, "torch_dtype") else None), torch.bfloat16)
+        model_dtype = get_dtype((config.torch_dtype if "torch_dtype" in dir(config) else None), torch.bfloat16)
 
         moe_defaults = dict(
             dim=config.hidden_size,
@@ -174,12 +174,12 @@ class GlmMoeDsaModel(nn.Module):
         self.max_seq_len = config.max_position_embeddings
         self.qk_rope_head_dim = config.qk_rope_head_dim
 
-        if hasattr(config, "rope_parameters") and config.rope_parameters is not None:
+        if "rope_parameters" in dir(config) and config.rope_parameters is not None:
             rope_theta = config.rope_parameters["rope_theta"]
         else:
             rope_theta = config.rope_theta
 
-        rope_scaling = config.rope_scaling if hasattr(config, "rope_scaling") else None
+        rope_scaling = config.rope_scaling if "rope_scaling" in dir(config) else None
 
         self.freqs = precompute_freqs_cis(
             qk_rope_head_dim=self.qk_rope_head_dim,
@@ -303,7 +303,7 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             moe_config=moe_config,
             moe_overrides=moe_overrides,
         )
-        model_dtype = get_dtype((config.torch_dtype if hasattr(config, "torch_dtype") else None), torch.bfloat16)
+        model_dtype = get_dtype((config.torch_dtype if "torch_dtype" in dir(config) else None), torch.bfloat16)
         self.lm_head = initialize_linear_module(
             self.backend.linear, config.hidden_size, config.vocab_size, bias=False, dtype=model_dtype
         )
@@ -326,7 +326,7 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
 
     def should_pack_validation_with_training(self) -> bool:
         """GLM DSA TileLang kernels require validation to use the THD packed layout."""
-        return (self.backend.attn if hasattr(self.backend, "attn") else None) == "tilelang"
+        return (self.backend.attn if "attn" in dir(self.backend) else None) == "tilelang"
 
     def prepare_model_inputs_for_cp(
         self,
@@ -347,7 +347,7 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             contiguous_local_indices,
         )
 
-        if (self.backend.attn if hasattr(self.backend, "attn") else None) != "tilelang":
+        if (self.backend.attn if "attn" in dir(self.backend) else None) != "tilelang":
             raise NotImplementedError("GLM DSA context parallelism is implemented only for backend.attn='tilelang'.")
 
         cp_sharder = ContextParallelSharder(
@@ -461,7 +461,7 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         output_hidden_states = (
             output_hidden_states
             if output_hidden_states is not None
-            else (self.config.output_hidden_states if hasattr(self.config, "output_hidden_states") else False)
+            else (self.config.output_hidden_states if "output_hidden_states" in dir(self.config) else False)
         )
 
         # Carry-in arrives as float32 (see get_pipeline_stage_metas, where the pipeline recv

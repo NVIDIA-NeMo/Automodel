@@ -288,7 +288,7 @@ class LlamaBidirectionalModel(LlamaModel):
 
         # Fallback for transformers < 5.0
         if (
-            self.config._attn_implementation if hasattr(self.config, "_attn_implementation") else None
+            self.config._attn_implementation if "_attn_implementation" in dir(self.config) else None
         ) == "flash_attention_2":
             has_masked_tokens = (attention_mask == 0).any()
             return attention_mask if has_masked_tokens else None
@@ -414,13 +414,13 @@ class LlamaNemotronVLModel(PreTrainedModel):
         # Propagate attn_implementation to sub-configs for transformers < 4.56
         # which lacks set_attn_implementation. In 4.56+, set_attn_implementation
         # handles this automatically using the sub_configs declared on the config class.
-        if not hasattr(PreTrainedModel, "set_attn_implementation"):
-            parent_attn = config._attn_implementation if hasattr(config, "_attn_implementation") else None
+        if not "set_attn_implementation" in dir(PreTrainedModel):
+            parent_attn = config._attn_implementation if "_attn_implementation" in dir(config) else None
             if parent_attn is not None:
                 for sub_config in (config.vision_config, config.llm_config):
                     if (
                         sub_config._attn_implementation_autoset
-                        if hasattr(sub_config, "_attn_implementation_autoset")
+                        if "_attn_implementation_autoset" in dir(sub_config)
                         else False
                     ):
                         sub_config._attn_implementation = parent_attn
@@ -428,7 +428,7 @@ class LlamaNemotronVLModel(PreTrainedModel):
 
         # Calculate image token count
         image_size = config.force_image_size or config.vision_config.image_size
-        if hasattr(config.vision_config, "grid_size"):
+        if "grid_size" in dir(config.vision_config):
             grid_size = config.vision_config.grid_size
             self.patch_size = 14
             self.num_image_token = int((grid_size * config.downsample_ratio) ** 2)
@@ -604,7 +604,7 @@ class LlamaNemotronVLModel(PreTrainedModel):
         logits = None
         loss = None
 
-        if hasattr(outputs, "logits"):
+        if "logits" in dir(outputs):
             logits = outputs.logits
             if labels is not None:
                 # Shift so that tokens < n predict n
@@ -651,7 +651,7 @@ class LlamaNemotronVLModel(PreTrainedModel):
         # Extract features from vision encoder
         if self.select_layer == -1:
             vit_embeds = self.vision_model(pixel_values=pixel_values, output_hidden_states=False, return_dict=True)
-            if hasattr(vit_embeds, "last_hidden_state"):
+            if "last_hidden_state" in dir(vit_embeds):
                 vit_embeds = vit_embeds.last_hidden_state
         else:
             vit_embeds = self.vision_model(

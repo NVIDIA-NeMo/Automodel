@@ -192,9 +192,7 @@ class MiniMaxM3VisionTransformer(nn.Module):
         # Image-only support: video segmentation (_apply_max_frames_limit, which splits
         # grid_t > vision_segment_max_frames) is not implemented, so reject such inputs
         # loudly rather than silently producing wrong RoPE positions / masks.
-        max_frames = (
-            self.config.vision_segment_max_frames if hasattr(self.config, "vision_segment_max_frames") else None
-        )
+        max_frames = self.config.vision_segment_max_frames if "vision_segment_max_frames" in dir(self.config) else None
         if max_frames is not None:
             assert all(int(t) <= max_frames for t, _, _ in grid_thw), (
                 f"grid_t exceeds vision_segment_max_frames={max_frames}; video temporal "

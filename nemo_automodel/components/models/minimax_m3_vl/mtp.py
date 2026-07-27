@@ -47,7 +47,7 @@ class MiniMaxM3MTPBlock(nn.Module):
 
     def __init__(self, config: Any, moe_config: MoEConfig, backend: BackendConfig):
         super().__init__()
-        gemma = config.use_gemma_norm if hasattr(config, "use_gemma_norm") else False
+        gemma = config.use_gemma_norm if "use_gemma_norm" in dir(config) else False
         self.enorm = MiniMaxM3RMSNorm(config.hidden_size, eps=config.rms_norm_eps, gemma=gemma)
         self.hnorm = MiniMaxM3RMSNorm(config.hidden_size, eps=config.rms_norm_eps, gemma=gemma)
         self.eh_proj = initialize_linear_module(backend.linear, 2 * config.hidden_size, config.hidden_size, bias=False)

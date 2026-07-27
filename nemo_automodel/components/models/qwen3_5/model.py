@@ -75,9 +75,9 @@ class Qwen3_5CausalLMOutputWithPast(CausalLMOutputWithPast):
 def _resolve_mtp_num_layers(config: Any, override: int | None = None) -> int:
     if override is not None:
         return int(override)
-    value = config.num_nextn_predict_layers if hasattr(config, "num_nextn_predict_layers") else None
+    value = config.num_nextn_predict_layers if "num_nextn_predict_layers" in dir(config) else None
     if value is None:
-        value = config.mtp_num_hidden_layers if hasattr(config, "mtp_num_hidden_layers") else 0
+        value = config.mtp_num_hidden_layers if "mtp_num_hidden_layers" in dir(config) else 0
     return int(value or 0)
 
 
@@ -117,14 +117,14 @@ def build_mtp_config_from_hf(
 
 def _make_full_attention_config(config: Qwen3_5TextConfig, layer_idx: int) -> Qwen3_5TextConfig:
     mtp_config = copy.copy(config)
-    layer_types = list((config.layer_types if hasattr(config, "layer_types") else []) or [])
+    layer_types = list((config.layer_types if "layer_types" in dir(config) else []) or [])
     if len(layer_types) <= layer_idx:
         fill = layer_types[-1] if layer_types else "full_attention"
         layer_types.extend([fill] * (layer_idx + 1 - len(layer_types)))
     layer_types[layer_idx] = "full_attention"
     mtp_config.layer_types = layer_types
     mtp_config.num_hidden_layers = max(
-        int((config.num_hidden_layers if hasattr(config, "num_hidden_layers") else 0) or 0), layer_idx + 1
+        int((config.num_hidden_layers if "num_hidden_layers" in dir(config) else 0) or 0), layer_idx + 1
     )
     # The MTP sublayer re-enters the HF Qwen3.5 decoder self-attention over the
     # SAME packed/varlen batch as the backbone. The HF flash-attention-2 varlen
@@ -243,7 +243,7 @@ class Qwen3_5DenseMTPSublayer(Qwen3_5DecoderLayer):
     @torch.no_grad()
     def init_weights(self, buffer_device: torch.device | None = None) -> None:
         init_std = float(
-            (self.self_attn.config.initializer_range if hasattr(self.self_attn.config, "initializer_range") else 0.02)
+            (self.self_attn.config.initializer_range if "initializer_range" in dir(self.self_attn.config) else 0.02)
         )
         target_device = buffer_device or torch.device("cpu")
         with target_device:
@@ -408,7 +408,7 @@ class Qwen3_5DenseBlock(Block):
                 self.linear_attn.out_proj,
             ):
                 nn.init.trunc_normal_(linear.weight, mean=0.0, std=0.02)
-            if hasattr(self.linear_attn.norm, "reset_parameters"):
+            if "reset_parameters" in dir(self.linear_attn.norm):
                 self.linear_attn.norm.reset_parameters()
             else:
                 self.linear_attn.norm.weight.data.fill_(1.0)
@@ -427,9 +427,9 @@ class Qwen3_5DenseTextBackbone(nn.Module):
         super().__init__()
         self.config = config
         self.backend = backend
-        self.padding_idx = config.pad_token_id if hasattr(config, "pad_token_id") else None
+        self.padding_idx = config.pad_token_id if "pad_token_id" in dir(config) else None
         self.vocab_size = config.vocab_size
-        model_dtype = get_dtype((config.torch_dtype if hasattr(config, "torch_dtype") else None), torch.bfloat16)
+        model_dtype = get_dtype((config.torch_dtype if "torch_dtype" in dir(config) else None), torch.bfloat16)
         moe_config = _dense_moe_config(config, model_dtype)
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx, dtype=model_dtype)
         self.layers = nn.ModuleDict(
@@ -468,7 +468,7 @@ class Qwen3_5DenseTextBackbone(nn.Module):
         if position_ids.ndim == 3 and position_ids.shape[0] == 4:
             position_ids = position_ids[1:]
 
-        if self._cp_enabled if hasattr(self, "_cp_enabled") else False:
+        if self._cp_enabled if "_cp_enabled" in dir(self) else False:
             attention_mask = None
             padding_mask = None
 
@@ -562,7 +562,7 @@ class Qwen3_5Model(HFQwen3_5Model):
             else:
                 input_ids_for_super = None
             media_tensor = pixel_values if pixel_values is not None else pixel_values_videos
-            if isinstance(media_tensor, torch.Tensor) and hasattr(self.visual, "rotary_pos_emb"):
+            if isinstance(media_tensor, torch.Tensor) and "rotary_pos_emb" in dir(self.visual):
                 self.visual.rotary_pos_emb.to(media_tensor.device)
             return super().forward(
                 input_ids=input_ids_for_super,
@@ -653,12 +653,14 @@ class Qwen3_5ForCausalLM(HFCheckpointingMixin, nn.Module):
         dtype = next(self.model.parameters()).dtype
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False, dtype=dtype)
-        if config.tie_word_embeddings if hasattr(config, "tie_word_embeddings") else False:
+        if config.tie_word_embeddings if "tie_word_embeddings" in dir(config) else False:
             self.tie_weights()
 
         # Keep the SSM-gating params (in each linear_attn ``_fp32_params`` holder)
         # in fp32 storage even under a bf16 bulk dtype.
-        keep_fp32 = list((self._keep_in_fp32_modules if hasattr(self, "_keep_in_fp32_modules") else None) or [])
+        keep_fp32 = list(
+            (vars(self).get("_keep_in_fp32_modules") or vars(type(self)).get("_keep_in_fp32_modules")) or []
+        )
         if "_fp32_params" not in keep_fp32:
             keep_fp32.append("_fp32_params")
         self._keep_in_fp32_modules = keep_fp32
@@ -686,7 +688,7 @@ class Qwen3_5ForCausalLM(HFCheckpointingMixin, nn.Module):
         self.lm_head = new_embeddings
 
     def tie_weights(self, *_args: object, **_kwargs: object) -> None:
-        if self.config.tie_word_embeddings if hasattr(self.config, "tie_word_embeddings") else False:
+        if self.config.tie_word_embeddings if "tie_word_embeddings" in dir(self.config) else False:
             self.lm_head.weight = self.model.embed_tokens.weight
 
     def forward(
@@ -765,8 +767,8 @@ class Qwen3_5ForCausalLM(HFCheckpointingMixin, nn.Module):
         return Qwen3_5CausalLMOutputWithPast(
             logits=logits,
             past_key_values=outputs.past_key_values,
-            hidden_states=(outputs.hidden_states if hasattr(outputs, "hidden_states") else None) or (hidden_states,),
-            attentions=(outputs.attentions if hasattr(outputs, "attentions") else None),
+            hidden_states=(outputs.hidden_states if "hidden_states" in dir(outputs) else None) or (hidden_states,),
+            attentions=(outputs.attentions if "attentions" in dir(outputs) else None),
             mtp_per_depth_h=mtp_per_depth_h,
             mtp_loss_scaling_factor=(self.mtp_config.loss_scaling_factor if mtp_per_depth_h is not None else None),
         )
@@ -778,7 +780,7 @@ class Qwen3_5ForCausalLM(HFCheckpointingMixin, nn.Module):
         dtype: torch.dtype = torch.bfloat16,
     ) -> None:
         buffer_device = buffer_device or _default_init_device()
-        init_std = float((self.config.initializer_range if hasattr(self.config, "initializer_range") else 0.02))
+        init_std = float((self.config.initializer_range if "initializer_range" in dir(self.config) else 0.02))
         # The backbone (embed/norm/layers, incl. GatedDeltaNet-specific init) owns
         # its own init_weights; init only the non-backbone modules (lm_head, MTP)
         # generically so the GatedDeltaNet/SSMGate init is not clobbered.
@@ -872,13 +874,15 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
 
         # Keep the SSM-gating params (per-layer ``_fp32_params`` holder) in fp32
         # storage even under a bf16 bulk dtype.
-        keep_fp32 = list((self._keep_in_fp32_modules if hasattr(self, "_keep_in_fp32_modules") else None) or [])
+        keep_fp32 = list(
+            (vars(self).get("_keep_in_fp32_modules") or vars(type(self)).get("_keep_in_fp32_modules")) or []
+        )
         if "_fp32_params" not in keep_fp32:
             keep_fp32.append("_fp32_params")
         self._keep_in_fp32_modules = keep_fp32
 
         param_dtype = next(self.model.language_model.parameters()).dtype
-        dtype = get_dtype((text_config.torch_dtype if hasattr(text_config, "torch_dtype") else None), param_dtype)
+        dtype = get_dtype((text_config.torch_dtype if "torch_dtype" in dir(text_config) else None), param_dtype)
         # ``super().__init__`` ran HF ``post_init`` (-> ``initialize_weights``) and may
         # have cast the inherited ``lm_head`` to a different bulk dtype before the
         # native backbone was swapped in; realign it to the backbone dtype so the
@@ -904,7 +908,7 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
 
     def tie_weights(self, *_args: object, **_kwargs: object) -> None:
         """Tie ``lm_head`` to the active VLM text embedding when requested."""
-        if self.config.tie_word_embeddings if hasattr(self.config, "tie_word_embeddings") else False:
+        if self.config.tie_word_embeddings if "tie_word_embeddings" in dir(self.config) else False:
             self.lm_head.weight = self.model.language_model.embed_tokens.weight
 
     def _pop_staged_vlm_media(
@@ -946,15 +950,15 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
         if not has_media_tokens:
             return pixel_values, pixel_values_videos, image_grid_thw, video_grid_thw
 
-        chunk_idx = self._vlm_chunk_idx if hasattr(self, "_vlm_chunk_idx") else 0
+        chunk_idx = self._vlm_chunk_idx if "_vlm_chunk_idx" in dir(self) else 0
         consumed_vlm_chunk = False
 
         if pixel_values is None:
-            image_chunks = self._vlm_pixel_values_chunks if hasattr(self, "_vlm_pixel_values_chunks") else None
+            image_chunks = self._vlm_pixel_values_chunks if "_vlm_pixel_values_chunks" in dir(self) else None
             if image_chunks is not None and chunk_idx < len(image_chunks):
                 pixel_values = image_chunks[chunk_idx]
                 image_grid_chunks = (
-                    self._vlm_image_grid_hws_chunks if hasattr(self, "_vlm_image_grid_hws_chunks") else None
+                    self._vlm_image_grid_hws_chunks if "_vlm_image_grid_hws_chunks" in dir(self) else None
                 )
                 if image_grid_chunks is not None and chunk_idx < len(image_grid_chunks):
                     image_grid_hws = image_grid_chunks[chunk_idx]
@@ -970,14 +974,14 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
 
         if pixel_values_videos is None:
             video_chunks = (
-                self._vlm_pixel_values_videos_chunks if hasattr(self, "_vlm_pixel_values_videos_chunks") else None
+                self._vlm_pixel_values_videos_chunks if "_vlm_pixel_values_videos_chunks" in dir(self) else None
             )
             if video_chunks is not None and chunk_idx < len(video_chunks):
                 video_chunk = video_chunks[chunk_idx]
                 if video_chunk.numel() > 0:
                     pixel_values_videos = video_chunk
                     video_grid_chunks = (
-                        self._vlm_video_grid_thw_chunks if hasattr(self, "_vlm_video_grid_thw_chunks") else None
+                        self._vlm_video_grid_thw_chunks if "_vlm_video_grid_thw_chunks" in dir(self) else None
                     )
                     if video_grid_chunks is not None and chunk_idx < len(video_grid_chunks):
                         video_grid_thw = video_grid_chunks[chunk_idx]
@@ -1046,8 +1050,8 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
             if "mm_token_type_ids" in inspect.signature(self.model.get_rope_index).parameters:
                 if mm_token_type_ids is None:
                     mm_token_type_ids = torch.zeros_like(input_ids, dtype=torch.long)
-                    image_token_id = self.config.image_token_id if hasattr(self.config, "image_token_id") else None
-                    video_token_id = self.config.video_token_id if hasattr(self.config, "video_token_id") else None
+                    image_token_id = self.config.image_token_id if "image_token_id" in dir(self.config) else None
+                    video_token_id = self.config.video_token_id if "video_token_id" in dir(self.config) else None
                     if image_token_id is not None:
                         mm_token_type_ids = mm_token_type_ids.masked_fill(input_ids == image_token_id, 1)
                     if video_token_id is not None:
@@ -1105,7 +1109,7 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
 
         with cp_dispatcher_suspended(self.cp_mesh):
             if pixel_values is not None:
-                if hasattr(self.model.visual, "rotary_pos_emb"):
+                if "rotary_pos_emb" in dir(self.model.visual):
                     self.model.visual.rotary_pos_emb.to(pixel_values.device)
                 image_outputs = self.model.get_image_features(pixel_values, image_grid_thw, return_dict=True)
                 image_embeds = torch.cat(image_outputs.pooler_output, dim=0).to(
@@ -1119,7 +1123,7 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
                 inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
 
             if pixel_values_videos is not None:
-                if hasattr(self.model.visual, "rotary_pos_emb"):
+                if "rotary_pos_emb" in dir(self.model.visual):
                     self.model.visual.rotary_pos_emb.to(pixel_values_videos.device)
                 video_outputs = self.model.get_video_features(pixel_values_videos, video_grid_thw, return_dict=True)
                 video_embeds = torch.cat(video_outputs.pooler_output, dim=0).to(
@@ -1168,9 +1172,9 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
         else:
             inputs_meta = (torch.empty(microbatch_size, local_seq_len, hidden_size, device="meta", dtype=dtype),)
 
-        has_lm_head = (self.lm_head if hasattr(self, "lm_head") else None) is not None
+        has_lm_head = (self.lm_head if "lm_head" in dir(self) else None) is not None
         emits_hidden_states = (
-            self._pp_return_hidden_states if hasattr(self, "_pp_return_hidden_states") else False
+            self._pp_return_hidden_states if "_pp_return_hidden_states" in dir(self) else False
         ) is True
         if has_lm_head and not emits_hidden_states:
             outputs_meta = (torch.empty(microbatch_size, local_seq_len, vocab_size, device="meta", dtype=dtype),)
@@ -1230,8 +1234,8 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
         # hidden states for the next stage, (c) run lm_head only where it survives.
         # MTP needs embed_tokens (absent past stage 0) so it is skipped under PP.
         language_model = self.model.language_model
-        is_first_stage = (language_model.embed_tokens if hasattr(language_model, "embed_tokens") else None) is not None
-        is_last_stage = (self.lm_head if hasattr(self, "lm_head") else None) is not None
+        is_first_stage = (language_model.embed_tokens if "embed_tokens" in dir(language_model) else None) is not None
+        is_last_stage = (self.lm_head if "lm_head" in dir(self) else None) is not None
 
         # Context-parallel: embed + vision-splice the full sequence, then keep this
         # rank's round-robin chunk pair (aux streams + mRoPE aligned by
@@ -1291,7 +1295,7 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
                     past_key_values=past_key_values,
                     **model_kwargs,
                 )
-                hidden_states = text_out.last_hidden_state if hasattr(text_out, "last_hidden_state") else text_out
+                hidden_states = text_out.last_hidden_state if "last_hidden_state" in dir(text_out) else text_out
             if not is_last_stage:
                 return hidden_states
             return self.lm_head(hidden_states)
@@ -1384,9 +1388,9 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
-            hidden_states=(outputs.hidden_states if hasattr(outputs, "hidden_states") else None) or (hidden_states,),
-            attentions=(outputs.attentions if hasattr(outputs, "attentions") else None),
-            rope_deltas=(outputs.rope_deltas if hasattr(outputs, "rope_deltas") else None),
+            hidden_states=(outputs.hidden_states if "hidden_states" in dir(outputs) else None) or (hidden_states,),
+            attentions=(outputs.attentions if "attentions" in dir(outputs) else None),
+            rope_deltas=(outputs.rope_deltas if "rope_deltas" in dir(outputs) else None),
             mtp_per_depth_h=mtp_per_depth_h,
             mtp_loss_scaling_factor=(self.mtp_config.loss_scaling_factor if mtp_per_depth_h is not None else None),
         )
@@ -1410,7 +1414,7 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
             language_model.init_weights(buffer_device=buffer_device)
         except TypeError:
             language_model.init_weights()
-        mtp = self.mtp if hasattr(self, "mtp") else None
+        mtp = self.mtp if "mtp" in dir(self) else None
         if mtp is not None:
             with buffer_device:
                 for sublayer in mtp.layers:

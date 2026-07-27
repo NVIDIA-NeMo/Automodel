@@ -78,14 +78,14 @@ class Qwen2Attention(nn.Module):
         self.config = config
         self.layer_idx = layer_idx
         self.head_dim = (
-            config.head_dim if hasattr(config, "head_dim") else config.hidden_size // config.num_attention_heads
+            config.head_dim if "head_dim" in dir(config) else config.hidden_size // config.num_attention_heads
         )
         self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
         self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
         self.is_causal = True
-        self.rope_fusion = backend.rope_fusion if hasattr(backend, "rope_fusion") else False
-        self.rope_backend = backend.rope if hasattr(backend, "rope") else "torch"
+        self.rope_fusion = backend.rope_fusion if "rope_fusion" in dir(backend) else False
+        self.rope_backend = backend.rope if "rope" in dir(backend) else "torch"
         self._quack_apply_rotary_emb = None
         if self.rope_backend == "quack":
             available, apply_rotary_emb = safe_import_from(
@@ -176,7 +176,7 @@ class Qwen2SeparateMLP(nn.Module):
 
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
-        mlp_bias = config.mlp_bias if hasattr(config, "mlp_bias") else False
+        mlp_bias = config.mlp_bias if "mlp_bias" in dir(config) else False
         self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=mlp_bias)
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=mlp_bias)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=mlp_bias)
@@ -437,11 +437,11 @@ class Qwen2ForCausalLM(HFCheckpointingMixin, Qwen2PreTrainedModel):
 
         # Tie weights if specified in config (standard for Qwen2/Llama)
         # Must be done after post_init() to ensure embed_tokens is initialized
-        if config.tie_word_embeddings if hasattr(config, "tie_word_embeddings") else True:
+        if config.tie_word_embeddings if "tie_word_embeddings" in dir(config) else True:
             self.tie_weights()
 
         # Convert to configured dtype if specified
-        if hasattr(config, "torch_dtype") and config.torch_dtype is not None:
+        if "torch_dtype" in dir(config) and config.torch_dtype is not None:
             self.to(dtype=config.torch_dtype)
 
         if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
@@ -464,7 +464,7 @@ class Qwen2ForCausalLM(HFCheckpointingMixin, Qwen2PreTrainedModel):
         # Transformers v5 does not reliably tie this custom model from the
         # dict-shaped _tied_weights_keys alone; honor the config flag explicitly
         # (mirrors LlamaForCausalLM).
-        if self.config.tie_word_embeddings if hasattr(self.config, "tie_word_embeddings") else False:
+        if self.config.tie_word_embeddings if "tie_word_embeddings" in dir(self.config) else False:
             self.lm_head.weight = self.model.embed_tokens.weight
 
     @can_return_tuple

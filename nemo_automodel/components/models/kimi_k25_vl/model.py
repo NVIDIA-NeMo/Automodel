@@ -468,7 +468,7 @@ class MoonViT3dPretrainedModel(nn.Module):
         )
 
         activation = lambda x: F.gelu(x, approximate="tanh")
-        attn_impl = config._attn_implementation if hasattr(config, "_attn_implementation") else "flash_attention_2"
+        attn_impl = config._attn_implementation if "_attn_implementation" in dir(config) else "flash_attention_2"
         block_cfg = {
             "num_heads": config.num_attention_heads,
             "hidden_dim": config.hidden_size,
@@ -944,7 +944,7 @@ class KimiK25VLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDP
             )
             config.text_config.num_hidden_layers = num_hidden_layers_override
 
-        num_layers = config.text_config.num_hidden_layers if hasattr(config.text_config, "num_hidden_layers") else 61
+        num_layers = config.text_config.num_hidden_layers if "num_hidden_layers" in dir(config.text_config) else 61
         LOGGER.info(f"Model config has {num_layers} layers")
 
         config.torch_dtype = torch_dtype
@@ -969,9 +969,7 @@ class KimiK25VLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDP
         )
 
         self.vocab_size = config.text_config.vocab_size
-        self.pad_token_id = (
-            config.text_config.pad_token_id if hasattr(config.text_config, "pad_token_id") else -1
-        ) or -1
+        self.pad_token_id = (config.text_config.pad_token_id if "pad_token_id" in dir(config.text_config) else -1) or -1
         self.media_placeholder_token_id = config.media_placeholder_token_id
 
         if self.backend.enable_hf_state_dict_adapter:
@@ -980,7 +978,7 @@ class KimiK25VLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDP
                 self.moe_config,
                 self.backend,
                 dtype=get_dtype(
-                    (config.text_config.torch_dtype if hasattr(config.text_config, "torch_dtype") else None),
+                    (config.text_config.torch_dtype if "torch_dtype" in dir(config.text_config) else None),
                     torch.bfloat16,
                 ),
             )
@@ -1030,7 +1028,7 @@ class KimiK25VLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDP
             if output_hidden_states is not None
             else (
                 self.config.text_config.output_hidden_states
-                if hasattr(self.config.text_config, "output_hidden_states")
+                if "output_hidden_states" in dir(self.config.text_config)
                 else False
             )
         )
@@ -1038,7 +1036,7 @@ class KimiK25VLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDP
         # Retrieve pre-chunked VLM inputs from model attributes (set by finetune.py for PP)
         if (
             pixel_values is None
-            and hasattr(self, "_vlm_pixel_values_chunks")
+            and "_vlm_pixel_values_chunks" in dir(self)
             and self._vlm_pixel_values_chunks is not None
         ):
             has_media_tokens = (
@@ -1047,7 +1045,7 @@ class KimiK25VLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDP
                 and (input_ids == self.media_placeholder_token_id).any()
             )
             if has_media_tokens:
-                chunk_idx = self._vlm_chunk_idx if hasattr(self, "_vlm_chunk_idx") else 0
+                chunk_idx = self._vlm_chunk_idx if "_vlm_chunk_idx" in dir(self) else 0
                 if chunk_idx < len(self._vlm_pixel_values_chunks):
                     pixel_values = self._vlm_pixel_values_chunks[chunk_idx]
                     # Recipe stores as image_grid_hws [N, 2], convert to grid_thws [N, 3] (prepend T=1)

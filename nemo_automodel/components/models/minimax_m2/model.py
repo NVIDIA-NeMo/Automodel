@@ -48,7 +48,7 @@ class Block(nn.Module):
         self.self_attn = MiniMaxM2Attention(config, backend)
         self.mlp = MoE(moe_config, backend)
 
-        dtype = get_dtype((config.torch_dtype if hasattr(config, "torch_dtype") else None), torch.bfloat16)
+        dtype = get_dtype((config.torch_dtype if "torch_dtype" in dir(config) else None), torch.bfloat16)
         self.input_layernorm = initialize_rms_norm_module(
             backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, dtype=dtype
         )
@@ -105,17 +105,17 @@ class MiniMaxM2Model(nn.Module):
         # Keep compatibility with generic MoE utilities that read config.num_experts.
         self.config.num_experts = (
             config.num_local_experts
-            if hasattr(config, "num_local_experts")
-            else (config.num_experts if hasattr(config, "num_experts") else None)
+            if "num_local_experts" in dir(config)
+            else (config.num_experts if "num_experts" in dir(config) else None)
         )
 
-        score_func = config.scoring_func if hasattr(config, "scoring_func") else "sigmoid"
+        score_func = config.scoring_func if "scoring_func" in dir(config) else "sigmoid"
         score_func = "softmax" if str(score_func).lower() == "softmax" else "sigmoid"
 
         # Resolve model dtype once; thread explicitly to every sub-module so
         # fp32 master weights work even when construction is not wrapped in
         # local_torch_dtype().
-        model_dtype = get_dtype((config.torch_dtype if hasattr(config, "torch_dtype") else None), torch.bfloat16)
+        model_dtype = get_dtype((config.torch_dtype if "torch_dtype" in dir(config) else None), torch.bfloat16)
 
         moe_defaults = dict(
             dim=config.hidden_size,
@@ -155,13 +155,13 @@ class MiniMaxM2Model(nn.Module):
 
         self.max_seq_len = config.max_position_embeddings
         self.head_dim = (
-            config.head_dim if hasattr(config, "head_dim") else config.hidden_size // config.num_attention_heads
+            config.head_dim if "head_dim" in dir(config) else config.hidden_size // config.num_attention_heads
         )
 
-        if not hasattr(config, "rope_parameters") or config.rope_parameters is None:
-            rotary_dim = config.rotary_dim if hasattr(config, "rotary_dim") else self.head_dim
+        if not "rope_parameters" in dir(config) or config.rope_parameters is None:
+            rotary_dim = config.rotary_dim if "rotary_dim" in dir(config) else self.head_dim
             config.rope_parameters = {
-                "rope_theta": (config.rope_theta if hasattr(config, "rope_theta") else 5000000.0),
+                "rope_theta": (config.rope_theta if "rope_theta" in dir(config) else 5000000.0),
                 "rope_type": "default",
                 "partial_rotary_factor": rotary_dim / self.head_dim,
             }
@@ -292,7 +292,7 @@ class MiniMaxM2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             moe_config=moe_config,
             moe_overrides=moe_overrides,
         )
-        model_dtype = get_dtype((config.torch_dtype if hasattr(config, "torch_dtype") else None), torch.bfloat16)
+        model_dtype = get_dtype((config.torch_dtype if "torch_dtype" in dir(config) else None), torch.bfloat16)
         self.lm_head = initialize_linear_module(
             self.backend.linear, config.hidden_size, config.vocab_size, bias=False, dtype=model_dtype
         )
@@ -346,7 +346,7 @@ class MiniMaxM2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         output_hidden_states = (
             output_hidden_states
             if output_hidden_states is not None
-            else (self.config.output_hidden_states if hasattr(self.config, "output_hidden_states") else False)
+            else (self.config.output_hidden_states if "output_hidden_states" in dir(self.config) else False)
         )
 
         is_thd = "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd"

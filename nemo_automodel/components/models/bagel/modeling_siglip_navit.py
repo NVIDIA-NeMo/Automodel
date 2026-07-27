@@ -509,7 +509,7 @@ class SiglipPreTrainedModel(PreTrainedModel):
 
     def _init_weights(self, module: nn.Module) -> None:
         if isinstance(module, SiglipVisionEmbeddings):
-            if not self.config.rope and hasattr(module, "position_embedding"):
+            if not self.config.rope and "position_embedding" in dir(module):
                 width = self.config.hidden_size
                 nn.init.normal_(module.position_embedding.weight, std=1 / np.sqrt(width))
         elif isinstance(module, SiglipAttention):

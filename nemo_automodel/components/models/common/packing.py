@@ -136,7 +136,7 @@ def _passthrough_create_causal_mask(
     """
     if (
         config is not None
-        and (config._attn_implementation if hasattr(config, "_attn_implementation") else None)
+        and (config._attn_implementation if "_attn_implementation" in dir(config) else None)
         in _FLASH_ATTN_IMPLEMENTATIONS
     ):
         return attention_mask
@@ -165,7 +165,7 @@ def get_attn_implementation(cfg_model):
 
     Custom models store it in ``backend.attn``; HF models use ``attn_implementation``.
     """
-    if cfg_model is not None and hasattr(cfg_model, "backend") and hasattr(cfg_model.backend, "attn"):
+    if cfg_model is not None and "backend" in dir(cfg_model) and "attn" in dir(cfg_model.backend):
         return cfg_model.backend.attn
     if cfg_model is not None:
         return cfg_model.get("attn_implementation", "sdpa")
@@ -197,13 +197,13 @@ def _patch_preprocess_mask_arguments_for_packing() -> None:
 
     if (
         masking_utils._nemo_automodel_packing_preprocess_patched
-        if hasattr(masking_utils, "_nemo_automodel_packing_preprocess_patched")
+        if "_nemo_automodel_packing_preprocess_patched" in dir(masking_utils)
         else False
     ):
         return
 
     original_preprocess = (
-        masking_utils._preprocess_mask_arguments if hasattr(masking_utils, "_preprocess_mask_arguments") else None
+        masking_utils._preprocess_mask_arguments if "_preprocess_mask_arguments" in dir(masking_utils) else None
     )
     if original_preprocess is None:
         raise RuntimeError(
@@ -261,8 +261,8 @@ def _patch_preprocess_mask_arguments_for_packing() -> None:
         """
         config = kwargs.get("config", args[0] if len(args) > 0 else None)
         attention_mask = kwargs.get("attention_mask", args[2] if len(args) > 2 else None)
-        attn_impl = (config._attn_implementation if hasattr(config, "_attn_implementation") else None) or (
-            config._attn_implementation_internal if hasattr(config, "_attn_implementation_internal") else None
+        attn_impl = (config._attn_implementation if "_attn_implementation" in dir(config) else None) or (
+            config._attn_implementation_internal if "_attn_implementation_internal" in dir(config) else None
         )
         if attn_impl in _FLASH_ATTN_IMPLEMENTATIONS and is_indexed_packed_mask(attention_mask):
             return (
@@ -315,7 +315,7 @@ def configure_packing(attn_implementation: str = "sdpa") -> None:
     # import time, so we must patch each module individually.
     for mod_name in _PACKING_PATCH_MODULES:
         mod = sys.modules.get(mod_name)
-        if mod is not None and hasattr(mod, "create_causal_mask"):
+        if mod is not None and "create_causal_mask" in dir(mod):
             mod.create_causal_mask = _passthrough_create_causal_mask
 
     logger.info(

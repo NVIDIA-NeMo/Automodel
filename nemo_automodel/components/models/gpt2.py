@@ -87,7 +87,7 @@ class CausalSelfAttention(nn.Module):
         q, k, v = (t.transpose(1, 2) for t in (q, k, v))  # (B, n_head, T, head_dim)
 
         # Use torch's optimized SDPA when available (PyTorch ≥2.0)
-        if hasattr(F, "scaled_dot_product_attention"):
+        if "scaled_dot_product_attention" in dir(F):
             attn_output = F.scaled_dot_product_attention(
                 q, k, v, dropout_p=self.attn_dropout, is_causal=True
             )  # (B, n_head, T, head_dim)

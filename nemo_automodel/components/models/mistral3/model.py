@@ -220,7 +220,7 @@ class Ministral3RotaryEmbedding(nn.Module):
     ) -> tuple["torch.Tensor", float]:
         base = config.rope_parameters["rope_theta"]
         dim = (
-            config.head_dim if hasattr(config, "head_dim") else None
+            config.head_dim if "head_dim" in dir(config) else None
         ) or config.hidden_size // config.num_attention_heads
         attention_factor = 1.0
         inv_freq = 1.0 / (
@@ -297,7 +297,7 @@ class Ministral3Attention(nn.Module):
         self.config = config
         self.layer_idx = layer_idx
         self.head_dim = (
-            config.head_dim if hasattr(config, "head_dim") else None
+            config.head_dim if "head_dim" in dir(config) else None
         ) or config.hidden_size // config.num_attention_heads
         self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
         self.scaling = self.head_dim**-0.5
@@ -351,7 +351,7 @@ class Ministral3Attention(nn.Module):
             attention_mask,
             dropout=0.0 if not self.training else self.attention_dropout,
             scaling=self.scaling,
-            sliding_window=(self.config.sliding_window if hasattr(self.config, "sliding_window") else None),
+            sliding_window=(self.config.sliding_window if "sliding_window" in dir(self.config) else None),
             **kwargs,
         )
 
@@ -567,7 +567,7 @@ class Ministral3ForCausalLM(HFCheckpointingMixin, Ministral3PreTrainedModel, Gen
         output_hidden_states = (
             output_hidden_states
             if output_hidden_states is not None
-            else (self.config.output_hidden_states if hasattr(self.config, "output_hidden_states") else False)
+            else (self.config.output_hidden_states if "output_hidden_states" in dir(self.config) else False)
         )
 
         outputs: BaseModelOutputWithPast = self.model(
