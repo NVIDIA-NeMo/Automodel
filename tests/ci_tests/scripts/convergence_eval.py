@@ -33,13 +33,22 @@ import argparse
 import glob
 import json
 import os
+import signal
 import subprocess
 import sys
+import time
 
 import yaml
 
 AUTOMODEL_DIR = "/opt/Automodel"
 RUN_EVAL = "examples/convergence/tulu3/eval/run_eval.sh"
+
+# lm-eval + vLLM (tp>1) reliably hangs on shutdown *after* writing results_*.json, which then
+# runs the SLURM job to its wall-clock limit and fails an otherwise-passing eval on timeout.
+# So we poll for the results file and tear down the eval process tree as soon as the score is
+# written, instead of waiting for a clean exit. Overridable for slow evals.
+EVAL_TIMEOUT_S = int(os.environ.get("CONVERGENCE_EVAL_TIMEOUT_S", str(120 * 60)))
+_POLL_INTERVAL_S = 15
 
 
 def _load_downstream_eval(recipe_path: str) -> dict:
@@ -102,21 +111,78 @@ def _run_eval(cfg: dict, checkpoint: str, output_dir: str) -> None:
         cmd += ["--gen-kwargs", str(cfg["gen_kwargs"])]
 
     print("[convergence_eval] running:", " ".join(cmd), flush=True)
-    subprocess.run(cmd, cwd=AUTOMODEL_DIR, check=True)
+    # Run in its own session so we can tear down the whole eval tree (bash -> lm_eval ->
+    # vLLM engine/workers) once the score is written, sidestepping the vLLM shutdown hang.
+    proc = subprocess.Popen(cmd, cwd=AUTOMODEL_DIR, start_new_session=True)
+    task = str(cfg.get("tasks", "ifeval"))
+    metric = str(cfg["metric"])
+    deadline = time.time() + EVAL_TIMEOUT_S
+    got_results = False
+    try:
+        while time.time() < deadline:
+            if _find_valid_results(output_dir, task, metric) is not None:
+                print("[convergence_eval] results written; tearing down eval process tree", flush=True)
+                got_results = True
+                break
+            if proc.poll() is not None:
+                # eval exited (clean or crashed) before we saw results; check once more below.
+                break
+            time.sleep(_POLL_INTERVAL_S)
+    finally:
+        _terminate_tree(proc)
+
+    if not got_results and _find_valid_results(output_dir, task, metric) is None:
+        sys.exit(
+            "[convergence_eval] eval produced no valid results_*.json "
+            f"(timeout after {EVAL_TIMEOUT_S}s or eval failure); check the eval log above"
+        )
+
+
+def _terminate_tree(proc: "subprocess.Popen") -> None:
+    """SIGTERM (then SIGKILL) the eval process group; no-op if already exited."""
+    if proc.poll() is not None:
+        return
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(os.getpgid(proc.pid), sig)
+        except ProcessLookupError:
+            return
+        try:
+            proc.wait(timeout=30)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+
+
+def _find_valid_results(output_dir: str, task: str, metric: str):
+    """Return the newest results_*.json that already carries ``metric`` for ``task``, else None."""
+    for path in sorted(
+        glob.glob(os.path.join(output_dir, "eval_results", "**", "results_*.json"), recursive=True),
+        reverse=True,
+    ):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            continue  # still being written
+        task_res = data.get("results", {}).get(task, {})
+        if any(key.split(",")[0] == metric for key in task_res):
+            return path
+    return None
 
 
 def _read_metric(output_dir: str, task: str, metric: str) -> float:
-    results = sorted(glob.glob(os.path.join(output_dir, "eval_results", "**", "results_*.json"), recursive=True))
-    if not results:
-        sys.exit(f"[convergence_eval] no results_*.json under {output_dir}/eval_results")
-    with open(results[-1], "r", encoding="utf-8") as f:
+    path = _find_valid_results(output_dir, task, metric)
+    if path is None:
+        sys.exit(f"[convergence_eval] metric '{metric}' for task '{task}' not found under {output_dir}/eval_results")
+    with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
     task_res = data.get("results", {}).get(task, {})
     # lm-eval keys are "<metric>,<filter>" (filter is "none" for ifeval).
     for key, value in task_res.items():
         if key.split(",")[0] == metric:
             return float(value)
-    sys.exit(f"[convergence_eval] metric '{metric}' not found in {results[-1]} (have: {list(task_res)})")
+    sys.exit(f"[convergence_eval] metric '{metric}' not found in {path} (have: {list(task_res)})")
 
 
 def main() -> int:
@@ -138,12 +204,15 @@ def main() -> int:
     diff = abs(score - baseline)
     passed = diff < tol
 
-    print(
+    summary = (
         f"[convergence_eval] metric={cfg['metric']} score={score:.4f} baseline={baseline:.4f} "
-        f"|diff|={diff:.4f} tol={k}*{stderr:.4f}={tol:.4f} -> {'PASS' if passed else 'FAIL'}",
-        flush=True,
+        f"|diff|={diff:.4f} tol={k}*{stderr:.4f}={tol:.4f}"
     )
-    return 0 if passed else 1
+    if passed:
+        print(f"{summary} -> PASS", flush=True)
+        return 0
+    print(f"{summary} -> FAIL: eval score out of threshold", flush=True)
+    return 1
 
 
 if __name__ == "__main__":
