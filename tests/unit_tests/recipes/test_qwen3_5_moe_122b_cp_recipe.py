@@ -19,6 +19,7 @@ from pathlib import Path
 import yaml
 
 from nemo_automodel.components.distributed.cp_vision_frame_shard import CpVisionFrameShardingConfig
+from nemo_automodel.recipes._dist_utils import parse_distributed_section
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 CONFIG_PATH = REPO_ROOT / "examples/vlm_finetune/qwen3_5_moe/qwen3_5_122b_128k_ep8cp32.yaml"
@@ -27,6 +28,7 @@ CONFIG_PATH = REPO_ROOT / "examples/vlm_finetune/qwen3_5_moe/qwen3_5_122b_128k_e
 def test_qwen3_5_moe_122b_example_declares_scaling_contract() -> None:
     """The example selects the 122B model and its required CP/EP features."""
     raw_config = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
+    distributed = parse_distributed_section(raw_config["distributed"])
 
     assert raw_config["model"]["pretrained_model_name_or_path"] == "Qwen/Qwen3.5-122B-A10B"
     assert raw_config["model"]["attn_implementation"] == "sdpa"
@@ -63,5 +65,9 @@ def test_qwen3_5_moe_122b_example_declares_scaling_contract() -> None:
     assert optimizer["exp_avg_dtype"] == "torch.float32"
     assert optimizer["exp_avg_sq_dtype"] == "torch.float32"
 
-    vision_policy = CpVisionFrameShardingConfig(**raw_config["distributed"]["cp_vision_frame_sharding"])
-    assert vision_policy == CpVisionFrameShardingConfig(enabled=True, min_tokens=0, cost_alpha="auto")
+    assert distributed["strategy_config"].multimodal.vision.frame_sharding == CpVisionFrameShardingConfig(
+        enabled=True,
+        mesh_dims=("cp",),
+        min_tokens=0,
+        cost_alpha="auto",
+    )

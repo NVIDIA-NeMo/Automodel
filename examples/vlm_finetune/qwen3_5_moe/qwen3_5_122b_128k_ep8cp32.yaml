@@ -116,10 +116,13 @@ distributed:
   sequence_parallel: false
   activation_checkpointing: true
   defer_fsdp_grad_sync: false
-  cp_vision_frame_sharding:
-    enabled: true
-    min_tokens: 0
-    cost_alpha: auto
+  multimodal:
+    vision:
+      frame_sharding:
+        enabled: true
+        mesh_dims: [cp]
+        min_tokens: 0
+        cost_alpha: auto
 
 freeze_config:
   freeze_embeddings: false
