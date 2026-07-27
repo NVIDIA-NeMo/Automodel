@@ -647,3 +647,35 @@ class TestGetFsdpDpMesh:
 
         mock_get_submesh.assert_called_once_with(mesh, ("my_rep", "my_shard_cp"))
         assert result is submesh_sentinel
+
+
+# ---------------------------------------------------------------------------
+# create_ring_ulysses_mesh
+# ---------------------------------------------------------------------------
+
+
+class TestCreateRingUlyssesMesh:
+    def _mesh_with_cp(self, cp_size):
+        cp_mesh = Mock()
+        cp_mesh.size = Mock(return_value=cp_size)
+        device_mesh = Mock()
+        device_mesh.__getitem__ = Mock(return_value=cp_mesh)
+        return device_mesh, cp_mesh
+
+    def test_reshapes_cp_axis_into_ring_ulysses(self, monkeypatch):
+        device_mesh, cp_mesh = self._mesh_with_cp(4)
+        result_sentinel = Mock()
+        unflatten = Mock(return_value=result_sentinel)
+        monkeypatch.setattr(mesh_utils, "_unflatten_compat", unflatten)
+
+        result = mesh_utils.create_ring_ulysses_mesh(device_mesh, ring_degree=2, ulysses_degree=2)
+
+        device_mesh.__getitem__.assert_called_once_with(MeshAxisName.CP)
+        unflatten.assert_called_once_with(cp_mesh, 0, (2, 2), ("ring", "ulysses"))
+        assert result is result_sentinel
+
+    def test_rejects_mismatched_ring_ulysses_product(self):
+        device_mesh, _ = self._mesh_with_cp(4)
+
+        with pytest.raises(ValueError, match="must equal"):
+            mesh_utils.create_ring_ulysses_mesh(device_mesh, ring_degree=2, ulysses_degree=4)

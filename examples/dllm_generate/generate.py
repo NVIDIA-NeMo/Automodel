@@ -75,7 +75,7 @@ Override preset defaults::
         --checkpoint <path> \
         --sampler nemotron --temperature 0.5 --steps 2048
 
-Infilling (LLaDA and Nemotron samplers)::
+Infilling (LLaDA sampler)::
 
     python examples/dllm_generate/generate.py \
         --checkpoint <path> \
@@ -301,7 +301,14 @@ class DLLMSampler:
                     cur[transfer_idx] = x0[transfer_idx]
                     x[:, block_slice] = cur
                 else:
+                    # Restrict the candidate set to the current block BEFORE top-k
+                    # selection (matching the official LLaDA sampler and the KV-cache
+                    # branch above). Out-of-window positions must never win transfer
+                    # slots: cancelling them after selection leaves the block's
+                    # schedule underfilled, stranding mask tokens in the output.
                     mask_idx = x == self.mask_id
+                    mask_idx[:, :block_start] = False
+                    mask_idx[:, block_end:] = False
                     # No-op unless logit_shift != 0 (I-DLM); LLaDA/Nemotron presets
                     # keep logit_shift = 0 and read the logit at the filled position.
                     logits = self._apply_logit_shift(self.model(x, attention_mask=attention_mask).logits)
@@ -314,9 +321,6 @@ class DLLMSampler:
                         num_transfer_tokens=num_transfer_tokens[:, i],
                         threshold=cfg.threshold,
                     )
-                    for j in range(B):
-                        transfer_idx[j, :block_start] = False
-                        transfer_idx[j, block_end:] = False
                     x[transfer_idx] = x0[transfer_idx]
 
                 if cfg.eos_token_id is not None:
@@ -397,7 +401,13 @@ class DLLMSampler:
 
             transfer_schedule = get_num_transfer_tokens(block_mask, steps_per_block)
             for s in range(transfer_schedule.size(1)):
+                # Restrict the candidate set to this block's window BEFORE top-k
+                # (see the analogous fix in ``sample``): out-of-window masks must
+                # not steal transfer slots from the block's schedule.
                 mask_full = x == self.mask_id
+                for j in range(B):
+                    mask_full[j, :start] = False
+                    mask_full[j, start + widths[j] :] = False
                 # No-op unless logit_shift != 0 (I-DLM); see `sample` above.
                 logits = self._apply_logit_shift(self.model(x, attention_mask=attention_mask).logits)
                 x0, transfer_index = get_transfer_index(
@@ -408,9 +418,6 @@ class DLLMSampler:
                     x,
                     num_transfer_tokens=transfer_schedule[:, s],
                 )
-                for j in range(B):
-                    transfer_index[j, :start] = False
-                    transfer_index[j, start + widths[j] :] = False
                 x[transfer_index] = x0[transfer_index]
 
         return x
@@ -679,6 +686,8 @@ def main():
 
     if args.infill and args.sampler == "llada2":
         parser.error("--infill is not supported by the LLaDA2 generation path")
+    if args.infill and args.sampler == "nemotron":
+        parser.error("--infill is not supported by the Nemotron generation path (the tokenizer has no mask token)")
     if args.infill and args.sampler == "gemma":
         parser.error("--infill is not supported by the DiffusionGemma generation path")
 
@@ -796,8 +805,22 @@ def main():
         else:
             # LLaDA path: LLaDA checkpoints don't ship a built-in ``generate``
             # method, so fall back to the standalone ``DLLMSampler`` here.
-            outputs = sampler.sample(inputs)
-            sequences = trim_response(tokenizer, outputs.tolist(), inputs)
+            #
+            # ``sample()``'s batched EOS-stop and block windows assume every row has
+            # the longest prompt (the canvas is one rectangle sized to
+            # ``max_prompt_len``). With unequal-length prompts that strands the
+            # shorter rows: their tail EOS-fill reads as an early stop, one row
+            # finishing halts refinement for the whole batch, and their block
+            # windows are anchored past the real prompt. When an ``eos_token_id`` is
+            # active, decode one prompt at a time (B=1) so shorter prompts still
+            # complete. Inert for the current LLaDA preset (``eos_token_id=None``);
+            # guards the EOS-stop path once a preset sets it (e.g. I-DLM).
+            if len(inputs) > 1 and sampler.default_config.eos_token_id is not None:
+                outputs = [sampler.sample([inp]) for inp in inputs]
+                sequences = [trim_response(tokenizer, o.tolist(), [inp])[0] for o, inp in zip(outputs, inputs)]
+            else:
+                outputs = sampler.sample(inputs)
+                sequences = trim_response(tokenizer, outputs.tolist(), inputs)
         for i, (prompt, response) in enumerate(zip(args.prompt, sequences)):
             print(f"\n{'─' * 80}\n[Prompt {i}] {prompt}\n{'─' * 80}")
             print(response.strip() or "<empty>")
