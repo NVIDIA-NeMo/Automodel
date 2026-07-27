@@ -16,8 +16,8 @@
 Unified Diffusion Generation Script
 
 Single entry point for generating images and videos from all supported diffusion
-models (FLUX, Wan 2.1/2.2, HunyuanVideo, LTX-2). Supports single-GPU and distributed
-inference with optional checkpoint loading.
+models (FLUX, Qwen-Image, Qwen-Image-Edit, Wan 2.1/2.2, HunyuanVideo, LTX-2).
+Supports single-GPU and distributed inference with optional checkpoint loading.
 
 Pipelines that return an audio track alongside video (e.g. LTX-2) have it muxed
 into the output mp4; video-only pipelines are unaffected.
@@ -641,15 +641,31 @@ def run_inference(pipe, cfg, is_rank0):
 
     Args:
         pipe: The diffusion pipeline.
-        cfg: Config node with `inference` and `output` sections.
+        cfg: Config node with `inference` and `output` sections. The optional
+            `inference.input_images` list supplies one local path or URL per
+            prompt for image-conditioned pipelines.
         is_rank0: Whether this is the main process (for saving outputs).
     """
-    from diffusers.utils import export_to_video
+    from diffusers.utils import export_to_video, load_image
 
     output_type = detect_output_type(pipe)
     prompts = cfg.inference.prompts
+    input_images = getattr(cfg.inference, "input_images", None)
+    if input_images is not None:
+        if not isinstance(input_images, list):
+            raise TypeError("inference.input_images must be a list with one local path or URL per prompt")
+        if len(input_images) != len(prompts):
+            raise ValueError(
+                "inference.input_images must contain one entry per prompt, "
+                f"got {len(input_images)} images for {len(prompts)} prompts"
+            )
+        if any(not isinstance(image, str) or not image for image in input_images):
+            raise TypeError("Every inference.input_images entry must be a non-empty local path or URL string")
+
     max_samples = getattr(cfg.inference, "max_samples", len(prompts))
     prompts = prompts[:max_samples]
+    if input_images is not None:
+        input_images = input_images[:max_samples]
 
     output_dir = Path(getattr(cfg.output, "output_dir", "./inference_outputs"))
     fps = getattr(cfg.output, "fps", 16)
@@ -668,6 +684,14 @@ def run_inference(pipe, cfg, is_rank0):
     extra_kwargs = getattr(cfg.inference, "pipeline_kwargs", None)
     if extra_kwargs is not None:
         pipe_kwargs.update(extra_kwargs.to_dict())
+
+    if input_images is not None:
+        if "image" in pipe_kwargs:
+            raise ValueError("Set source images with inference.input_images, not inference.pipeline_kwargs.image")
+        if "image" not in inspect.signature(pipe.__call__).parameters:
+            raise ValueError(
+                f"{type(pipe).__name__} does not accept image inputs, but inference.input_images is configured"
+            )
 
     # LoRA scale: passed as attention_kwargs (newer diffusers) or
     # cross_attention_kwargs (older diffusers) so the transformer forward()
@@ -693,9 +717,12 @@ def run_inference(pipe, cfg, is_rank0):
         logger.info("[%d/%d] Prompt: %s", i + 1, len(prompts), prompt_text[:80])
 
         generator = torch.Generator(device="cuda").manual_seed(seed + i)
+        sample_kwargs = dict(pipe_kwargs)
+        if input_images is not None:
+            sample_kwargs["image"] = load_image(input_images[i])
 
         with torch.no_grad():
-            output = pipe(prompt=prompt_text, generator=generator, **pipe_kwargs)
+            output = pipe(prompt=prompt_text, generator=generator, **sample_kwargs)
 
         if not is_rank0:
             continue

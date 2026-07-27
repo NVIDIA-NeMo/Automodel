@@ -229,10 +229,11 @@ jobs:
           REGISTRY_AWS: ${{ env.container-registry }}
           REGISTRY_GCP: ${{ env.container-registry-gb200 }}
           IS_MEMBER: ${{ needs.pre-flight.outputs.is_member }}
+          DISABLE_GB200_TESTS: ${{ vars.DISABLE_GB200_TESTS }}
         run: |
           AWS_ENTRY=$(jq -nc --arg registry "$REGISTRY_AWS" --arg runner "${RUNNER_PREFIX}" \
             '{"cloud": "aws", "registry": $registry, "runner": $runner}')
-          if [[ "$IS_MEMBER" == "true" ]]; then
+          if [[ "$IS_MEMBER" == "true" && "$DISABLE_GB200_TESTS" != "true" ]]; then
             GCP_ENTRY=$(jq -nc --arg registry "$REGISTRY_GCP" --arg runner "nemo-ci-gcp-gpu-x2" \
               '{"cloud": "gcp", "registry": $registry, "runner": $runner}')
             MATRIX=$(jq -nc --argjson aws "$AWS_ENTRY" --argjson gcp "$GCP_ENTRY" \
@@ -320,6 +321,7 @@ jobs:
           echo "EOF" | tee -a $GITHUB_OUTPUT
 
       - name: Set up Docker Buildx
+        id: setup-buildx
         uses: docker/setup-buildx-action@v3
 
       - name: Compute cache keys
@@ -343,9 +345,45 @@ jobs:
         run: |
           if [[ "${{ matrix.cloud }}" == "gcp" ]]; then
             echo "platforms=linux/arm64" | tee -a "$GITHUB_OUTPUT"
+            echo "cache-key=arm64" | tee -a "$GITHUB_OUTPUT"
           else
             echo "platforms=linux/amd64" | tee -a "$GITHUB_OUTPUT"
+            echo "cache-key=amd64" | tee -a "$GITHUB_OUTPUT"
           fi
+
+      # Keep multi-GB cache ownership on main. Copied PR branches can restore
+      # main's cache without consuming repository storage with scoped copies.
+      - name: Restore and save uv build cache
+        id: uv-build-cache-main
+        if: github.ref == 'refs/heads/main'
+        uses: actions/cache@v4
+        with:
+          path: .buildkit-cache/uv
+          # Compiled CUDA wheels are ABI-bound to the Dockerfile base image and lockfiles.
+          key: buildkit-uv-${{ runner.os }}-${{ steps.platform.outputs.cache-key }}-${{ hashFiles('docker/Dockerfile', 'docker/common/uv-pytorch.lock', 'uv.lock') }}
+
+      - name: Restore uv build cache
+        id: uv-build-cache-branch
+        if: github.ref != 'refs/heads/main'
+        uses: actions/cache/restore@v4
+        with:
+          path: .buildkit-cache/uv
+          # Compiled CUDA wheels are ABI-bound to the Dockerfile base image and lockfiles.
+          key: buildkit-uv-${{ runner.os }}-${{ steps.platform.outputs.cache-key }}-${{ hashFiles('docker/Dockerfile', 'docker/common/uv-pytorch.lock', 'uv.lock') }}
+
+      - name: Inject uv cache into BuildKit
+        uses: reproducible-containers/buildkit-cache-dance@5b81f4d29dc8397a7d341dba3aeecc7ec54d6361 # v3.3.0
+        with:
+          builder: ${{ steps.setup-buildx.outputs.name }}
+          utility-image: ghcr.io/containerd/busybox@sha256:52f73a0a43a16cf37cd0720c90887ce972fe60ee06a687ee71fb93a7ca601df7
+          scratch-dir: .buildkit-cache/scratch
+          cache-map: |
+            {
+              ".buildkit-cache/uv": "/opt/uv_cache"
+            }
+          # Branch runs are restore-only, so extracting their updated mount
+          # after the build would create an archive that no step persists.
+          skip-extraction: ${{ github.ref != 'refs/heads/main' || steps.uv-build-cache-main.outputs.cache-hit == 'true' }}
 
       - name: Build and push
         uses: docker/build-push-action@v5
@@ -371,42 +409,25 @@ jobs:
   cicd-unit-tests:
     strategy:
       fail-fast: false
-      max-parallel: 6
+      max-parallel: 3
       matrix:
         include:
           - test-name: L0_Unit_Tests_CPU
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             cpu-only: true
-          - test-name: L0_Unit_Tests_GPU_1_of_5
+            timeout: 15
+          - test-name: L0_Unit_Tests_GPU_1_of_2
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             cpu-only: false
             timeout: 30
             shard-id: 0
-            num-shards: 5
-          - test-name: L0_Unit_Tests_GPU_2_of_5
+            num-shards: 2
+          - test-name: L0_Unit_Tests_GPU_2_of_2
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             cpu-only: false
             timeout: 30
             shard-id: 1
-            num-shards: 5
-          - test-name: L0_Unit_Tests_GPU_3_of_5
-            runner: ${{ needs.pre-flight.outputs.runner_prefix }}
-            cpu-only: false
-            timeout: 30
-            shard-id: 2
-            num-shards: 5
-          - test-name: L0_Unit_Tests_GPU_4_of_5
-            runner: ${{ needs.pre-flight.outputs.runner_prefix }}
-            cpu-only: false
-            timeout: 30
-            shard-id: 3
-            num-shards: 5
-          - test-name: L0_Unit_Tests_GPU_5_of_5
-            runner: ${{ needs.pre-flight.outputs.runner_prefix }}
-            cpu-only: false
-            timeout: 30
-            shard-id: 4
-            num-shards: 5
+            num-shards: 2
     needs: [pre-flight, cicd-wait-in-queue, cicd-container-build]
     runs-on: ${{ matrix.runner }}
     name: ${{ matrix.test-name }}
@@ -576,6 +597,7 @@ jobs:
       )
       && !cancelled()
       && needs.pre-flight.outputs.is_member == 'true'
+      && vars.DISABLE_GB200_TESTS != 'true'
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -619,8 +641,9 @@ jobs:
           RUN_ID: ${{ github.run_id }}
           SKIPPING_IS_ALLOWED: ${{ needs.pre-flight.outputs.docs_only == 'true' || needs.pre-flight.outputs.is_deployment_workflow == 'true' || needs.pre-flight.outputs.is_ci_workload == 'true' }}
           IS_MEMBER: ${{ needs.pre-flight.outputs.is_member }}
+          DISABLE_GB200_TESTS: ${{ vars.DISABLE_GB200_TESTS }}
         run: |
-          if [[ "$IS_MEMBER" == "true" ]]; then
+          if [[ "$IS_MEMBER" == "true" && "$DISABLE_GB200_TESTS" != "true" ]]; then
             FAILED_JOBS=$(gh run view $GITHUB_RUN_ID --json jobs --jq '[.jobs[] | select(.status == "completed" and .conclusion != "success")] | length') || echo 0
           else
             FAILED_JOBS=$(gh run view $GITHUB_RUN_ID --json jobs --jq '[.jobs[] | select(.status == "completed" and .conclusion != "success" and (.name | startswith("gb200_") | not))] | length') || echo 0
@@ -666,12 +689,8 @@ jobs:
     runs-on: ubuntu-latest
     needs: [pre-flight, Nemo_CICD_Test]
     if: |
-      (
-        (needs.pre-flight.outputs.is_ci_workload == 'true' && !failure())
-        || success()
-        || (needs.pre-flight.outputs.is_member != 'true' && needs.Nemo_CICD_Test.result == 'success')
-      )
-      && !cancelled()
+      !cancelled()
+      && needs.Nemo_CICD_Test.result == 'success'
       && vars.ENABLE_CODECOV == 'true'
     strategy:
       matrix:

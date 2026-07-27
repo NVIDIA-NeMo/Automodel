@@ -144,6 +144,18 @@ class ModelAdapter(ABC):
             return model_pred[0]
         return model_pred
 
+    def compute_loss(self, model_pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """Compute the unreduced flow-matching loss.
+
+        Args:
+            model_pred: Tensor of shape [batch, ...], with arbitrary trailing latent dimensions.
+            target: Tensor of shape [batch, ...] matching ``model_pred``, containing the flow velocity target.
+
+        Returns:
+            Float32 tensor of shape [batch, ...] matching ``model_pred``, containing the per-element loss.
+        """
+        return nn.functional.mse_loss(model_pred.float(), target.float(), reduction="none")
+
     def auxiliary_losses(self, inputs: Dict[str, Any]) -> Dict[str, torch.Tensor] | None:
         """
         Return additional named scalar losses computed from adapter-stashed state.

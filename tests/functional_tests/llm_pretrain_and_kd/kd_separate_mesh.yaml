@@ -15,7 +15,7 @@ dist_env:
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: /workspace/artifacts/tiny_llama
-  torch_dtype: bfloat16
+  torch_dtype: float32
   attn_implementation: sdpa
 
 teacher_model:
@@ -58,13 +58,9 @@ kd_loss_fn:
   fp32_upcast: true
 
 optimizer:
-  _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
+  _target_: torch.optim.AdamW
   lr: 1.0e-4
   weight_decay: 0.0
-  adam_w_mode: true
-  bias_correction: true
-  master_weights: true
-  master_weight_dtype: torch.float32
 
 dataset:
   _target_: tests.functional_tests.llm_pretrain_and_kd.kd_separate_mesh_test_utils.make_tiny_kd_dataset

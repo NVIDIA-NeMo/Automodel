@@ -60,8 +60,15 @@ class ProcessorRegistry:
         """
 
         def decorator(processor_class: Type[BaseModelProcessor]):
-            if not issubclass(processor_class, BaseModelProcessor):
-                raise TypeError(f"Processor {processor_class.__name__} must inherit from BaseModelProcessor")
+            # Image/video processors subclass BaseModelProcessor; image-edit
+            # manifest encoders instead expose an encode_manifest(...) method.
+            is_media_processor = issubclass(processor_class, BaseModelProcessor)
+            is_manifest_encoder = callable(getattr(processor_class, "encode_manifest", None))
+            if not (is_media_processor or is_manifest_encoder):
+                raise TypeError(
+                    f"Processor {processor_class.__name__} must inherit from BaseModelProcessor "
+                    "or implement encode_manifest(...)"
+                )
             cls._processors[name] = processor_class
             return processor_class
 

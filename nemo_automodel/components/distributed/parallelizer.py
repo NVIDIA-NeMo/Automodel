@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import importlib
+import inspect
 import logging
 import warnings
 from abc import ABC, abstractmethod
@@ -26,6 +27,7 @@ import transformers
 from torch import nn
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     CheckpointImpl,
+    CheckpointWrapper,
     checkpoint_wrapper,
 )
 from torch.distributed.device_mesh import DeviceMesh
@@ -71,7 +73,19 @@ from nemo_automodel.components.distributed.config import (
     normalize_activation_checkpointing_scope,
 )
 from nemo_automodel.components.distributed.mesh_utils import get_fsdp_dp_mesh
+from nemo_automodel.shared.multimodal_fsdp import (
+    FrozenMultimodalSharding,
+    ignored_params_for_root,
+    is_multimodal_module_name,
+    iter_multimodal_modules,
+    module_is_fully_frozen,
+    module_parameters,
+    normalize_frozen_multimodal_sharding,
+)
 from nemo_automodel.shared.tied_weights import ensure_tied_lm_head
+from nemo_automodel.shared.torch_patches import (
+    patch_fsdp_accumulated_grad_guard as _patch_fsdp_accumulated_grad_guard,
+)
 
 
 def _is_transformers_v5_or_higher() -> bool:
@@ -114,17 +128,33 @@ from nemo_automodel.components.distributed.optimized_tp_plans import (
     get_llama_nemotron_super_tp_plan,
 )
 from nemo_automodel.components.distributed.parallel_styles import translate_to_lora
+from nemo_automodel.shared.import_utils import UnavailableMeta, safe_import_from
 
-# TODO(boxiangw): Change to MegatronFSDP once it got published
+_MEGATRON_FSDP_050_REQUIRED_MSG = (
+    "megatron_fsdp.MixedPrecisionPolicy could not be imported: NeMo Automodel requires megatron-fsdp==0.5.0"
+)
+
 HAVE_MEGATRON_FSDP = False
 logging.getLogger("megatron_fsdp").setLevel(logging.WARNING)
 try:
     from megatron_fsdp import fully_shard as megatron_fsdp_fully_shard
     from megatron_fsdp import fully_shard_model as megatron_fsdp_fully_shard_model
 
+    # megatron-fsdp==0.5.0, the only supported release, always exports
+    # MixedPrecisionPolicy. safe_import_from keeps module import safe on any
+    # other install; constructing the returned placeholder then raises
+    # _MEGATRON_FSDP_050_REQUIRED_MSG instead of silently degrading.
+    _, MegatronFSDPMixedPrecisionPolicy = safe_import_from(
+        "megatron_fsdp", "MixedPrecisionPolicy", msg=_MEGATRON_FSDP_050_REQUIRED_MSG
+    )
+
     HAVE_MEGATRON_FSDP = True
 except (ImportError, FileNotFoundError, OSError):
-    pass
+    # megatron_fsdp itself is unavailable; every use is already guarded by
+    # HAVE_MEGATRON_FSDP, and this placeholder fails loudly like the one above.
+    MegatronFSDPMixedPrecisionPolicy = UnavailableMeta(
+        "MixedPrecisionPolicy", (), {"_msg": _MEGATRON_FSDP_050_REQUIRED_MSG}
+    )
 
 # Import as module so tests can patch nemo_automodel.components.distributed.parallelizer_utils.fully_shard_by_dtype
 import nemo_automodel.components.distributed.parallelizer_utils as parallelizer_utils
@@ -132,45 +162,10 @@ import nemo_automodel.components.distributed.parallelizer_utils as parallelizer_
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-
-def _patch_fsdp_accumulated_grad_guard() -> None:
-    """Guard FSDP2 post-backward against params that were never unsharded.
-
-    This is needed for text-only configs that still instantiate and shard a
-    full VLM model, e.g.
-    ``examples/llm_finetune/mistral/ministral3_3b_squad.yaml`` when
-    ``ci.checkpoint_robustness.distributed.tp_size: 2`` reruns the recipe.
-    Ministral3 FP8 is loaded through ``Mistral3FP8VLMForConditionalGeneration``
-    so the vision tower remains separately FSDP-sharded, but SQuAD batches do
-    not execute that tower. Those FSDP params never create PyTorch's lazy
-    ``_unsharded_param`` field, and the fp32 grad-reduce post-backward helper
-    dereferences it unconditionally. If the field is absent, there is no
-    unsharded grad to upcast, so returning early preserves the no-grad case.
-    The wrapper still calls PyTorch first and only handles the exact
-    ``AttributeError`` from the missing lazy field.
-    Permalinks:
-    - Trigger YAML: https://github.com/NVIDIA-NeMo/Automodel/blob/0990cb2c047496bae50e2035dac7b8c509316076/examples/llm_finetune/mistral/ministral3_3b_squad.yaml#L114-L128
-    - Mistral3 layer extraction: https://github.com/NVIDIA-NeMo/Automodel/blob/0990cb2c047496bae50e2035dac7b8c509316076/nemo_automodel/components/distributed/parallelizer.py#L1522-L1530
-    """
-    try:
-        from torch.distributed.fsdp._fully_shard._fsdp_param import FSDPParam
-    except Exception:
-        return
-
-    orig = FSDPParam.to_accumulated_grad_if_needed
-    if getattr(orig, "_nemo_automodel_guarded", False):
-        return
-
-    def guarded(self: Any) -> Any:
-        try:
-            return orig(self)
-        except AttributeError as exc:
-            if "_unsharded_param" not in str(exc) or hasattr(self, "_unsharded_param"):
-                raise
-            return None
-
-    setattr(guarded, "_nemo_automodel_guarded", True)
-    FSDPParam.to_accumulated_grad_if_needed = guarded
+# One-time flag: megatron-fsdp 0.5.0 removed the legacy buffer-level NaN check,
+# so a truthy check_for_nan_in_grad is dropped by _megatron_fsdp_compat_kwargs
+# and only warned about once per process.
+_megatron_fsdp_nan_check_noop_warned = False
 
 
 def apply_selective_activation_checkpointing(
@@ -266,6 +261,7 @@ class ParallelizationStrategy(ABC):
         tp_mesh_name: str = "tp",
         reshard_after_forward: Optional[bool] = None,
         activation_checkpointing_scope: ActivationCheckpointingScope | None = "all",
+        frozen_multimodal_sharding: FrozenMultimodalSharding = "root",
         **kwargs,
     ) -> nn.Module:
         """Apply parallelization strategy to the model."""
@@ -294,9 +290,21 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
         fsdp2_forward_prefetch_depth: int = 1,
         reshard_after_forward: Optional[bool] = None,
         activation_checkpointing_scope: ActivationCheckpointingScope | None = "all",
+        frozen_multimodal_sharding: FrozenMultimodalSharding = "root",
         fully_shard_fn=None,
     ) -> nn.Module:
         """Apply the default parallelization flow."""
+        frozen_multimodal_sharding = normalize_frozen_multimodal_sharding(frozen_multimodal_sharding)
+        frozen_multimodal_modules = [
+            name for name, module in iter_multimodal_modules(model) if module_is_fully_frozen(module)
+        ]
+        if frozen_multimodal_sharding == "per_layer" and frozen_multimodal_modules:
+            logger.warning(
+                "distributed.multimodal.frozen_sharding='per_layer' selected for %s. Every rank in the FSDP "
+                "group must execute or skip these modules the same number of times and in the same order on every "
+                "microbatch; rank-asymmetric modality execution can hang or desynchronize FSDP collectives.",
+                ", ".join(frozen_multimodal_modules),
+            )
         tp_mesh = device_mesh[tp_mesh_name]
         if fully_shard_fn is None:
             fully_shard_fn = fully_shard
@@ -392,7 +400,7 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
                 # (and other trainable) weight gradients.  Wrapping must happen BEFORE FSDP2
                 # sharding so the module structure is stable when fully_shard() indexes params.
                 for layer in ac_layers:
-                    for attr in ("self_attn", "attention", "attn", "mlp", "feed_forward", "ffn"):
+                    for attr in ("self_attn", "attention", "attn", "linear_attn", "mlp", "feed_forward", "ffn"):
                         m = getattr(layer, attr, None)
                         if m is not None:
                             setattr(layer, attr, checkpoint_wrapper(m, checkpoint_impl=CheckpointImpl.NO_REENTRANT))
@@ -418,6 +426,8 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
         # Install this only when NeMo actually enters FSDP2 sharding.
         _patch_fsdp_accumulated_grad_guard()
 
+        ignored_multimodal_params: set[nn.Parameter] = set()
+
         # Find transformer layers and apply parallelisms
         apply_fsdp2_sharding_recursively(
             model,
@@ -429,18 +439,23 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
             fsdp2_forward_prefetch_depth,
             reshard_after_forward,
             fully_shard_fn=fully_shard_fn,
+            frozen_multimodal_sharding=frozen_multimodal_sharding,
+            ignored_multimodal_params=ignored_multimodal_params,
         )
 
         # Apply FSDP to the root model
         # Do not reshard after forward for root model because its parameters
         # will be used in backward immediately
-        model = fully_shard_fn(
-            model,
-            mesh=dp_mesh,
-            mp_policy=mp_policy,
-            reshard_after_forward=False,
-            offload_policy=offload_policy,
-        )
+        root_ignored_params = ignored_params_for_root(model, ignored_multimodal_params)
+        root_kwargs = {
+            "mesh": dp_mesh,
+            "mp_policy": mp_policy,
+            "reshard_after_forward": False,
+            "offload_policy": offload_policy,
+        }
+        if root_ignored_params is not None:
+            root_kwargs["ignored_params"] = root_ignored_params
+        model = fully_shard_fn(model, **root_kwargs)
 
         return model
 
@@ -510,7 +525,7 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
 
             for layer in layers:
                 if hasattr(layer, "block_type") and layer.block_type == "mamba":
-                    from nemo_automodel.components.distributed.mamba_cp import MambaContextParallel
+                    from nemo_automodel.components.distributed.context_parallel.mamba import MambaContextParallel
 
                     mixer = layer.mixer
                     mixer.cp = MambaContextParallel(
@@ -604,8 +619,11 @@ class Qwen3_5ParallelizationStrategy(DefaultParallelizationStrategy):
             fsdp2_forward_prefetch_depth=1,
             reshard_after_forward=None,
             fully_shard_fn=None,
+            frozen_multimodal_sharding="root",
+            ignored_multimodal_params=None,
         ):
             del enable_fsdp2_prefetch, fsdp2_backward_prefetch_depth, fsdp2_forward_prefetch_depth, fully_shard_fn
+            frozen_multimodal_sharding = normalize_frozen_multimodal_sharding(frozen_multimodal_sharding)
             pp_enabled = "pp" in mesh.mesh_dim_names and mesh["pp"].size() > 1
 
             if isinstance(module, (nn.ModuleList, nn.ModuleDict)):
@@ -628,6 +646,8 @@ class Qwen3_5ParallelizationStrategy(DefaultParallelizationStrategy):
                         mp_policy,
                         offload_policy,
                         reshard_after_forward=reshard_after_forward,
+                        frozen_multimodal_sharding=frozen_multimodal_sharding,
+                        ignored_multimodal_params=ignored_multimodal_params,
                     )
 
                 for enum_id, (_, child) in enumerate(flat_layer_items):
@@ -646,13 +666,25 @@ class Qwen3_5ParallelizationStrategy(DefaultParallelizationStrategy):
                         reshard_after_forward=layer_reshard_after_forward,
                     )
             else:
-                for _, sub in module.named_children():
+                for name, sub in module.named_children():
+                    if is_multimodal_module_name(name) and module_is_fully_frozen(sub):
+                        if frozen_multimodal_sharding in ("root", "replicate"):
+                            logger.info(
+                                "Keeping frozen multimodal module %s at FSDP policy %s",
+                                name,
+                                frozen_multimodal_sharding,
+                            )
+                            if frozen_multimodal_sharding == "replicate" and ignored_multimodal_params is not None:
+                                ignored_multimodal_params.update(module_parameters(sub))
+                            continue
                     _fsdp_by_dtype(
                         sub,
                         mesh,
                         mp_policy,
                         offload_policy,
                         reshard_after_forward=reshard_after_forward,
+                        frozen_multimodal_sharding=frozen_multimodal_sharding,
+                        ignored_multimodal_params=ignored_multimodal_params,
                     )
 
         globals()["apply_fsdp2_sharding_recursively"] = _fsdp_by_dtype
@@ -674,6 +706,11 @@ class Qwen3_5ParallelizationStrategy(DefaultParallelizationStrategy):
             for _, mod in model.named_modules():
                 if isinstance(mod, CPAwareGatedDeltaNet):
                     mod._cp_mesh = cp_mesh
+            # Hand the CP submesh to the model so a forward that embeds and
+            # sequence-shards its own primary stream (Megatron-style per-microbatch
+            # CP; see shard_sequence_for_cp_round_robin / shard_batch_aux_only) can build this
+            # rank's round-robin shard.
+            model.cp_mesh = cp_mesh
 
         return result
 
@@ -875,6 +912,98 @@ class LTX2ParallelizationStrategy(HunyuanParallelizationStrategy):
     """
 
 
+def _unwrap_qwen_checkpointed_block(block: nn.Module) -> nn.Module:
+    """Return the Qwen transformer block held by a checkpoint wrapper."""
+    if isinstance(block, CheckpointWrapper):
+        return block._checkpoint_wrapped_module
+    return block
+
+
+def _validate_qwen_transformer_blocks(model: nn.Module) -> nn.ModuleList:
+    """Validate the upstream Qwen dual-stream block structure.
+
+    Args:
+        model: Upstream Qwen image transformer whose ``transformer_blocks``
+            container must hold dual-stream image/text blocks.
+
+    Returns:
+        The model's ``transformer_blocks`` ModuleList. Returned modules alias
+        the model-owned blocks.
+    """
+    blocks = getattr(model, "transformer_blocks", None)
+    if not isinstance(blocks, nn.ModuleList) or not blocks:
+        raise TypeError("Qwen image FSDP2 requires a non-empty transformer_blocks nn.ModuleList")
+
+    required_branches = ("attn", "img_mlp", "txt_mlp")
+    for index, wrapped_block in enumerate(blocks):
+        block = _unwrap_qwen_checkpointed_block(wrapped_block)
+        missing = [name for name in required_branches if not isinstance(getattr(block, name, None), nn.Module)]
+        if missing:
+            raise TypeError(
+                f"Qwen transformer_blocks[{index}] is missing required dual-stream modules: {', '.join(missing)}"
+            )
+    return blocks
+
+
+def _apply_qwen_block_activation_checkpointing(model: nn.Module) -> None:
+    """Checkpoint complete Qwen blocks, including both image and text MLPs.
+
+    Args:
+        model: Upstream Qwen image transformer. Each block consumes image
+            hidden states with shape [batch, image_tokens, hidden], text hidden
+            states with shape [batch, text_tokens, hidden], a text mask with
+            shape [batch, text_tokens], timestep embeddings with shape [batch,
+            hidden], and rotary tensors whose leading layout is owned by
+            Diffusers. Its block outputs preserve the image/text layouts.
+    """
+    blocks = _validate_qwen_transformer_blocks(model)
+    wrapped_count = 0
+    for index, block in enumerate(blocks):
+        if isinstance(block, CheckpointWrapper):
+            continue
+        blocks[index] = checkpoint_wrapper(block, checkpoint_impl=CheckpointImpl.NO_REENTRANT)
+        wrapped_count += 1
+    logger.info("Applied whole-block activation checkpointing to %d Qwen image transformer blocks", wrapped_count)
+
+
+class QwenImageEditParallelizationStrategy(DefaultParallelizationStrategy):
+    """Shard upstream Qwen image transformer blocks as complete FSDP2 units.
+
+    Applies whole-block activation checkpointing that covers the attention,
+    image-MLP, and text-MLP branches of each dual-stream block, then delegates
+    TP planning and FSDP2 sharding to the default strategy.
+    """
+
+    def parallelize(self, model: nn.Module, *args, **kwargs) -> nn.Module:
+        """Apply Qwen block checkpointing followed by the standard FSDP2 flow.
+
+        Args:
+            model: Upstream Qwen image transformer. Tensor layouts are unchanged
+                by sharding; each dual-stream block consumes image tensors of
+                shape [batch, image_tokens, hidden] and text tensors of shape
+                [batch, text_tokens, hidden].
+            *args: Positional arguments forwarded to the default strategy.
+            **kwargs: Keyword arguments accepted by
+                :meth:`DefaultParallelizationStrategy.parallelize`.
+
+        Returns:
+            The same upstream model with its parameters represented by FSDP2
+            DTensors on distributed runs. Global tensor shapes and upstream
+            Diffusers state-dict keys are preserved.
+        """
+        _validate_qwen_transformer_blocks(model)
+        activation_checkpointing = kwargs.get("activation_checkpointing", False)
+        selective_checkpointing = (
+            isinstance(activation_checkpointing, str)
+            and activation_checkpointing.lower().replace("-", "_") == "selective"
+        )
+        if activation_checkpointing and not selective_checkpointing:
+            _apply_qwen_block_activation_checkpointing(model)
+            kwargs["activation_checkpointing"] = False
+
+        return super().parallelize(model, *args, **kwargs)
+
+
 # Strategy registry mapping model class names to parallelization strategies
 PARALLELIZATION_STRATEGIES: Dict[str, ParallelizationStrategy] = {
     "NemotronHForCausalLM": NemotronHParallelizationStrategy(),
@@ -884,6 +1013,7 @@ PARALLELIZATION_STRATEGIES: Dict[str, ParallelizationStrategy] = {
     "WanTransformer3DModel": WanParallelizationStrategy(),
     "HunyuanVideo15Transformer3DModel": HunyuanParallelizationStrategy(),
     "LTX2VideoTransformer3DModel": LTX2ParallelizationStrategy(),
+    "QwenImageTransformer2DModel": QwenImageEditParallelizationStrategy(),
 }
 
 # Default strategy instance
@@ -1030,17 +1160,6 @@ def _apply_per_layer_compile(model: nn.Module) -> None:
     logger.info("Per-layer torch.compile applied to %d decoder layers", compiled_count)
 
 
-def _subtree_all_frozen(module: nn.Module) -> bool:
-    """Return True if ``module`` owns parameters and none of them require grad.
-
-    Used to skip FSDP-wrapping a frozen submodule that never runs in the forward
-    (e.g. the audio tower on image/text-only data); see
-    ``apply_fsdp2_sharding_recursively``.
-    """
-    params = list(module.parameters())
-    return len(params) > 0 and not any(p.requires_grad for p in params)
-
-
 def apply_fsdp2_sharding_recursively(
     module: nn.Module,
     mesh: DeviceMesh,
@@ -1051,6 +1170,8 @@ def apply_fsdp2_sharding_recursively(
     fsdp2_forward_prefetch_depth: int = 1,
     reshard_after_forward: Optional[bool] = None,
     fully_shard_fn=None,
+    frozen_multimodal_sharding: FrozenMultimodalSharding = "root",
+    ignored_multimodal_params: set[nn.Parameter] | None = None,
 ) -> None:
     """
     Recursively apply FSDP2 sharding to modules, with optimizations for ModuleList.
@@ -1075,10 +1196,15 @@ def apply_fsdp2_sharding_recursively(
         fsdp2_forward_prefetch_depth (int): Forward prefetch depth.
         reshard_after_forward (Optional[bool]): Optional override for each layer's
             ``fully_shard`` reshard behavior.
+        frozen_multimodal_sharding: Whether fully frozen multimodal modules are
+            owned by the root FSDP unit, sharded per layer, or replicated.
+        ignored_multimodal_params: Accumulator for replicated frozen multimodal
+            parameters that must be ignored by ancestor FSDP roots.
     Note:
         This function modifies the module in-place by replacing modules with their
         FSDP2-subclassed versions.
     """
+    frozen_multimodal_sharding = normalize_frozen_multimodal_sharding(frozen_multimodal_sharding)
     if fully_shard_fn is None:
         fully_shard_fn = fully_shard
 
@@ -1110,6 +1236,8 @@ def apply_fsdp2_sharding_recursively(
                 fsdp2_forward_prefetch_depth,
                 reshard_after_forward,
                 fully_shard_fn=fully_shard_fn,
+                frozen_multimodal_sharding=frozen_multimodal_sharding,
+                ignored_multimodal_params=ignored_multimodal_params,
             )
 
         for enum_id, (layer_key, child_module) in enumerate(flat_layer_items):
@@ -1154,17 +1282,16 @@ def apply_fsdp2_sharding_recursively(
                     fsdp_units[i].set_modules_to_backward_prefetch(targets)
     else:
         for name, sub_module in module.named_children():
-            # A frozen audio tower never runs in the forward on image/text-only
-            # data (in gemma E4B and E2B models), so wrapping its layers as their own FSDP units leaves those
-            # units never all-gathered. Under gradient accumulation FSDP's
-            # deferred post-backward then dereferences their (never-created)
-            # ``_unsharded_param`` and raises ``AttributeError``. Skip it so its
-            # params stay with the always-run root FSDP unit (which is still
-            # sharded, and whose frozen params have ``grad is None`` so the
-            # accumulate path is a no-op). Mirrors the audio_tower guard in
-            # ``components/moe/parallelizer.py``.
-            if name == "audio_tower" and _subtree_all_frozen(sub_module):
-                continue
+            if is_multimodal_module_name(name) and module_is_fully_frozen(sub_module):
+                if frozen_multimodal_sharding in ("root", "replicate"):
+                    logger.info(
+                        "Keeping frozen multimodal module %s at FSDP policy %s",
+                        name,
+                        frozen_multimodal_sharding,
+                    )
+                    if frozen_multimodal_sharding == "replicate" and ignored_multimodal_params is not None:
+                        ignored_multimodal_params.update(module_parameters(sub_module))
+                    continue
             apply_fsdp2_sharding_recursively(
                 sub_module,
                 mesh,
@@ -1175,6 +1302,8 @@ def apply_fsdp2_sharding_recursively(
                 fsdp2_forward_prefetch_depth,
                 reshard_after_forward,
                 fully_shard_fn=fully_shard_fn,
+                frozen_multimodal_sharding=frozen_multimodal_sharding,
+                ignored_multimodal_params=ignored_multimodal_params,
             )
 
 
@@ -2189,6 +2318,7 @@ def fsdp2_strategy_parallelize(
     fsdp2_forward_prefetch_depth: int = 1,
     reshard_after_forward: Optional[bool] = None,
     activation_checkpointing_scope: ActivationCheckpointingScope | None = "all",
+    frozen_multimodal_sharding: FrozenMultimodalSharding = "root",
 ):
     """
     Apply parallelisms and activation checkpointing to the model.
@@ -2220,6 +2350,10 @@ def fsdp2_strategy_parallelize(
             Used when data parallel shard is enabled. Defaults to "dp_shard_cp".
         tp_mesh_name (str): Key name for the tensor parallel mesh in device_mesh.
             Defaults to "tp".
+        frozen_multimodal_sharding: Whether fully frozen multimodal modules are
+            owned by the root FSDP unit (``"root"``), sharded normally
+            (``"per_layer"``), or excluded from FSDP and copied on every rank
+            (``"replicate"``).
 
     Returns:
         The parallelized model.
@@ -2249,7 +2383,113 @@ def fsdp2_strategy_parallelize(
         fsdp2_forward_prefetch_depth=fsdp2_forward_prefetch_depth,
         reshard_after_forward=reshard_after_forward,
         activation_checkpointing_scope=activation_checkpointing_scope,
+        frozen_multimodal_sharding=frozen_multimodal_sharding,
     )
+
+
+def _megatron_fsdp_compat_kwargs(
+    shard_fn,
+    *,
+    grad_reduce_in_fp32: bool,
+    preserve_fp32_weights: bool,
+    check_for_nan_in_grad: bool,
+    report_nan_in_param_grad: bool,
+) -> Dict[str, Any]:
+    """Translate the config precision controls to the Megatron-FSDP 0.5.0 API.
+
+    megatron-fsdp==0.5.0, the only supported release, expresses precision
+    through a ``MixedPrecisionPolicy`` plus a more expensive per-parameter NaN
+    reporter. The reporter stays a separate opt-in rather than being silently
+    enabled from the legacy buffer-check setting; because 0.5.0 has no
+    buffer-level NaN check at all, a truthy ``check_for_nan_in_grad`` is
+    dropped with a one-time warning that points at ``report_nan_in_param_grad``
+    as the opt-in replacement. Any other ``fully_shard`` signature — older or
+    newer releases alike — fails loudly instead of guessing a translation.
+    """
+    try:
+        parameters = inspect.signature(shard_fn).parameters
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("cannot determine the installed Megatron-FSDP fully_shard API") from exc
+
+    required_names = {"mixed_precision_policy", "report_nan_in_param_grad"}
+    if not required_names.issubset(parameters):
+        raise RuntimeError(
+            "unsupported Megatron-FSDP fully_shard API: NeMo Automodel requires megatron-fsdp==0.5.0, "
+            f"whose signature has the arguments {sorted(required_names)!r}; got {sorted(parameters)!r}"
+        )
+
+    global _megatron_fsdp_nan_check_noop_warned
+    if check_for_nan_in_grad and not _megatron_fsdp_nan_check_noop_warned:
+        _megatron_fsdp_nan_check_noop_warned = True
+        logger.warning(
+            "check_for_nan_in_grad=True is a no-op with megatron-fsdp==0.5.0, which removed the "
+            "legacy buffer-level NaN check: gradient NaN checking is now DISABLED. Set "
+            "report_nan_in_param_grad=True to restore per-parameter gradient NaN checking."
+        )
+    return {
+        "mixed_precision_policy": MegatronFSDPMixedPrecisionPolicy(
+            main_params_dtype=torch.float32 if preserve_fp32_weights else None,
+            main_grads_dtype=torch.float32 if grad_reduce_in_fp32 else None,
+            # In megatron-fsdp 0.5.0, None makes communication use the main
+            # gradient dtype, matching the legacy grad_reduce_in_fp32 flag.
+            grad_comm_dtype=None,
+        ),
+        "report_nan_in_param_grad": report_nan_in_param_grad,
+    }
+
+
+def _derive_megatron_fsdp_unit_modules(model: nn.Module) -> list[type[nn.Module]]:
+    """Derive the MegatronFSDP wrap classes from a model's ``_no_split_modules``.
+
+    Used when a config does not specify ``megatron_fsdp_unit_modules``. HF
+    ``PreTrainedModel`` and the NeMo custom models both define ``_no_split_modules``
+    as a list of block class *names* (for example ``["LlamaDecoderLayer"]``).
+    Walking ``model.modules()`` and matching ``type(module).__name__`` against those
+    names resolves the actual instantiated classes, so the result is correct for
+    both the HF backend and the NeMo-custom backend (which use distinct classes that
+    share the same name). For VLM/MoE models whose top-level ``_no_split_modules``
+    lists several block classes (for example vision and language towers), every
+    matching class found anywhere in the module tree is collected.
+
+    Args:
+        model: The (already TP-parallelized) model to be wrapped by MegatronFSDP.
+
+    Returns:
+        The de-duplicated list of submodule classes to wrap as MegatronFSDP units,
+        in module-traversal order.
+
+    Raises:
+        ValueError: If the model does not expose a non-empty ``_no_split_modules``,
+            or if none of those names match an instantiated submodule. Raised with
+            an actionable message instead of letting MegatronFSDP later fail with
+            ``ZeroDivisionError`` (``total_fsdp_module=0``) when zero modules are wrapped.
+    """
+    no_split_modules = getattr(model, "_no_split_modules", None)
+    if not no_split_modules:
+        raise ValueError(
+            "distributed.megatron_fsdp_unit_modules was not provided and the model does not define a "
+            "non-empty '_no_split_modules' to derive them from. Set distributed.megatron_fsdp_unit_modules "
+            "explicitly to the transformer block class path(s) to wrap as MegatronFSDP units."
+        )
+    no_split_names = set(no_split_modules)
+    derived: list[type[nn.Module]] = []
+    seen: set[type[nn.Module]] = set()
+    for submodule in model.modules():
+        cls = type(submodule)
+        if cls.__name__ in no_split_names and cls not in seen:
+            seen.add(cls)
+            derived.append(cls)
+    if not derived:
+        raise ValueError(
+            "distributed.megatron_fsdp_unit_modules was not provided and none of the model's "
+            f"_no_split_modules {sorted(no_split_names)} matched an instantiated submodule; cannot derive "
+            "MegatronFSDP unit modules. Set distributed.megatron_fsdp_unit_modules explicitly."
+        )
+    logger.info(
+        "Auto-derived MegatronFSDP unit modules from _no_split_modules: %s",
+        [cls.__name__ for cls in derived],
+    )
+    return derived
 
 
 def megatron_fsdp_strategy_parallelize(
@@ -2265,6 +2505,7 @@ def megatron_fsdp_strategy_parallelize(
     overlap_grad_reduce: bool = True,
     overlap_param_gather: bool = True,
     check_for_nan_in_grad: bool = True,
+    report_nan_in_param_grad: bool = False,
     average_in_collective: bool = False,
     disable_bucketing: bool = False,
     calculate_per_token_loss: bool = False,
@@ -2281,9 +2522,10 @@ def megatron_fsdp_strategy_parallelize(
         model: The model to be parallelized.
         device_mesh (DeviceMesh): The device mesh describing the physical devices
             used for distributed training.
-        megatron_fsdp_unit_modules (Optional[List[str]]): Names of sub-modules that should
-            become individual MegatronFSDP units. If None, the full model is wrapped as
-            a single unit.
+        megatron_fsdp_unit_modules (Optional[List[str]]): Class paths of the sub-modules that
+            should become individual MegatronFSDP units. When None or empty, the wrap classes
+            are auto-derived from the model's ``_no_split_modules`` (see
+            :func:`_derive_megatron_fsdp_unit_modules`).
         tp_shard_plan (Optional[Dict[str, Union[RowwiseParallel, ColwiseParallel, SequenceParallel]]]):
             A tensor-parallel sharding plan.
             Keys are module names; values specify the parallel style to apply
@@ -2300,8 +2542,17 @@ def megatron_fsdp_strategy_parallelize(
             backward computation.
         overlap_param_gather (bool): If True, overlap parameter gathering with
             forward computation.
-        check_for_nan_in_grad (bool): Whether to check gradients for NaNs/Infs
-            before applying the optimizer step.
+        check_for_nan_in_grad (bool): Legacy buffer-level gradient NaN check.
+            BREAKING CHANGE on megatron-fsdp 0.5.0: this flag is a no-op,
+            preserved only for config compatibility. 0.5.0 removed the
+            buffer-level NaN check entirely, so gradient NaN checking is now OFF
+            regardless of this value; a truthy value is dropped with a one-time
+            warning per process. Enable ``report_nan_in_param_grad`` to restore
+            gradient NaN checking.
+        report_nan_in_param_grad (bool): Whether Megatron-FSDP should perform
+            its precise per-parameter gradient NaN check. This is the 0.5.0
+            replacement for ``check_for_nan_in_grad`` and is disabled by default
+            because it can significantly reduce training throughput.
         average_in_collective (bool): Perform gradient averaging inside the
             collective operation instead of dividing afterward.
         disable_bucketing (bool): Disable gradient bucketing; gradients are
@@ -2343,9 +2594,6 @@ def megatron_fsdp_strategy_parallelize(
     if tp_mesh.size() > 1:
         parallelize_module(model, tp_mesh, tp_shard_plan)
 
-    # Import MegatronFSDP unit modules specified by the user.
-    megatron_fsdp_unit_modules = import_classes_from_paths(megatron_fsdp_unit_modules)
-
     # MegatronFSDP requires a sharded DP dimension to create its param/grad buffers.
     # In practice, configurations like world_size=2,tp=2 -> dp=1 frequently hit
     # DTensor metadata assertions inside megatron_fsdp. In that case, we still
@@ -2366,6 +2614,17 @@ def megatron_fsdp_strategy_parallelize(
                 model = model.to("cuda")
         return model, optimizer
 
+    # Resolve the MegatronFSDP unit (wrap) modules (only needed on the wrapping path).
+    # When the config specifies them, import the class paths as-is. Otherwise derive
+    # them from the model's `_no_split_modules` so the real instantiated block classes
+    # are wrapped regardless of backend (HF or NeMo-custom); a mismatched hard-coded
+    # class path would otherwise wrap zero modules and MegatronFSDP would raise a
+    # ZeroDivisionError (total_fsdp_module=0).
+    if megatron_fsdp_unit_modules:
+        megatron_fsdp_unit_modules = import_classes_from_paths(megatron_fsdp_unit_modules)
+    else:
+        megatron_fsdp_unit_modules = _derive_megatron_fsdp_unit_modules(model)
+
     # Wrap model with MegatronFSDP.
     # When an optimizer is provided, use the combined fully_shard which handles
     # both model wrapping and optimizer sharding in one step.
@@ -2380,11 +2639,8 @@ def megatron_fsdp_strategy_parallelize(
         tp_dim=tp_dim,
         zero_dp_strategy=zero_dp_strategy,
         init_model_with_meta_device=init_fsdp_with_meta_device,
-        grad_reduce_in_fp32=grad_reduce_in_fp32,
-        preserve_fp32_weights=preserve_fp32_weights,
         overlap_grad_reduce=overlap_grad_reduce,
         overlap_param_gather=overlap_param_gather,
-        check_for_nan_in_grad=check_for_nan_in_grad,
         average_in_collective=average_in_collective,
         disable_bucketing=disable_bucketing,
         calculate_per_token_loss=calculate_per_token_loss,
@@ -2393,8 +2649,26 @@ def megatron_fsdp_strategy_parallelize(
         fsdp_double_buffer=fsdp_double_buffer,
     )
     if optimizer is not None:
+        fsdp_kwargs.update(
+            _megatron_fsdp_compat_kwargs(
+                megatron_fsdp_fully_shard,
+                grad_reduce_in_fp32=grad_reduce_in_fp32,
+                preserve_fp32_weights=preserve_fp32_weights,
+                check_for_nan_in_grad=check_for_nan_in_grad,
+                report_nan_in_param_grad=report_nan_in_param_grad,
+            )
+        )
         model, optimizer = megatron_fsdp_fully_shard(module=model, optimizer=optimizer, **fsdp_kwargs)
     else:
+        fsdp_kwargs.update(
+            _megatron_fsdp_compat_kwargs(
+                megatron_fsdp_fully_shard_model,
+                grad_reduce_in_fp32=grad_reduce_in_fp32,
+                preserve_fp32_weights=preserve_fp32_weights,
+                check_for_nan_in_grad=check_for_nan_in_grad,
+                report_nan_in_param_grad=report_nan_in_param_grad,
+            )
+        )
         model = megatron_fsdp_fully_shard_model(module=model, **fsdp_kwargs)
         model._replace_param_with_distributed_if_needed()
 

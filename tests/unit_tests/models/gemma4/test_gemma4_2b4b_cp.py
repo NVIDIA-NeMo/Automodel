@@ -29,8 +29,8 @@ from unittest import mock
 import pytest
 import torch
 
+from nemo_automodel.components.distributed.context_parallel.sharder import shard_batch_contiguous
 from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.gemma4_moe.cp_batch import make_contiguous_shard_cp_batch_and_ctx
 from nemo_automodel.components.models.gemma4_moe.model import (
     Gemma4Config,
     Gemma4ForConditionalGeneration,
@@ -139,12 +139,16 @@ def test_get_capabilities_plain_dense_unchanged():
 # ---------------------------------------------------------------------------
 def _shard_batch(batch, cp_size, cp_rank, seq_len):
     mesh = _FakeCPMesh(cp_size, cp_rank)
-    _ctx_fn, sharded = make_contiguous_shard_cp_batch_and_ctx(
+    # Exercise the public contiguous shard directly on the 4D per_layer_inputs key
+    # (the production entry the model wraps), the same slice the sunk forward applies.
+    _ctx_fn, sharded, _ = shard_batch_contiguous(
         mesh,
         None,
         batch,
         loss_mask=None,
         padding_token_id=0,
+        extra_seq_keys={"per_layer_inputs": 1},
+        extra_pad_values={"per_layer_inputs": 0},
     )
     return sharded
 
@@ -234,21 +238,39 @@ def test_dense_init_attaches_ring_to_all_self_attention_incl_shared():
 # ---------------------------------------------------------------------------
 # per_layer_inputs threading through prepare_model_inputs_for_cp
 # ---------------------------------------------------------------------------
-def test_prepare_model_inputs_threads_real_per_layer_inputs():
-    # audio=False to avoid building the audio tower; the per-layer-input + KV-sharing
-    # machinery lives entirely in text_config and is unaffected by audio_config.
+def test_prepare_model_inputs_is_sharder_only_for_e_series():
+    # Sunk CP: the E-series hook is sharder-only too (per_layer_inputs is built +
+    # sliced in the forward, not pre-embedded here). audio=False avoids building
+    # the audio tower; the per-layer-input machinery lives in text_config.
     cfg = _cfg(audio=False)
     cfg.image_token_id = 99
     model = Gemma4ForConditionalGeneration(cfg, backend=_backend()).to(torch.float32)
-    ids = torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8]])
-    prepared = model.prepare_model_inputs_for_cp(input_ids=ids)
-    assert "per_layer_inputs" in prepared
-    pli = prepared["per_layer_inputs"]
-    # [B, S, num_hidden_layers, hidden_size_per_layer_input]
+    prepared = model.prepare_model_inputs_for_cp({"input_ids": torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8]])})
+    assert set(prepared) == {"cp_sharder"}
+    assert prepared["cp_sharder"].shard_batch == model._cp_shard_batch_aux_only
+
+
+def test_cp_sunk_prepare_inputs_slices_per_layer_inputs_on_seq_dim():
+    # The E-series 4D per_layer_inputs is built on the full sequence in-forward and
+    # contiguously sliced on the seq dim alongside inputs_embeds (Megatron-style).
+    cfg = _cfg(audio=False)
+    cfg.image_token_id = 99
+    model = Gemma4ForConditionalGeneration(cfg, backend=_backend()).to(torch.float32)
     tc = cfg.text_config
-    assert pli.shape == (1, ids.shape[1], tc.num_hidden_layers, tc.hidden_size_per_layer_input)
-    # and the model-owned batch-sharding callable is attached for cp_utils.
-    assert prepared["_cp_make_batch_fn"] == model._cp_shard_batch
+    cp_size, seq = 2, 8  # divisor 2*cp = 4 -> no pad; local = 4
+    model.cp_mesh = _FakeCPMesh(cp_size, 0)
+    prepared = model._cp_sunk_prepare_inputs(
+        input_ids=torch.arange(seq).view(1, seq) + 1,
+        pixel_values=None,
+        image_position_ids=None,
+        mm_token_type_ids=None,
+    )
+    local = seq // cp_size
+    assert prepared["inputs_embeds"].shape == (1, local, tc.hidden_size)
+    assert prepared["per_layer_inputs"].shape == (1, local, tc.num_hidden_layers, tc.hidden_size_per_layer_input)
+    # ring metadata is sliced to the same local length
+    assert prepared["mm_token_type_ids"].shape == (1, local)
+    assert prepared["_gemma4_vision_group_ids"].shape == (1, local)
 
 
 def test_prepare_per_layer_inputs_masks_image_tokens():

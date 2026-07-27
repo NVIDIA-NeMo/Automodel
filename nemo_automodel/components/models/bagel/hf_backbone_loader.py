@@ -21,9 +21,12 @@ import json
 import logging
 import math
 import pathlib
-from typing import Any, Dict
+from typing import TYPE_CHECKING, Any, Dict
 
 import torch
+
+if TYPE_CHECKING:
+    from nemo_automodel.components.models.bagel.configuration import BagelBackendConfig
 
 logger = logging.getLogger(__name__)
 
@@ -231,6 +234,7 @@ def build_bagel_from_hf_backbones(
     vae_config: Dict[str, int] | None,
     meta_init: bool = False,
     load_backbone_weights: bool = True,
+    backend: BagelBackendConfig | None = None,
 ) -> torch.nn.Module:
     """Build BAGEL from upstream Qwen/SigLIP backbone configs."""
     from transformers import Qwen2Config
@@ -292,9 +296,9 @@ def build_bagel_from_hf_backbones(
             from nemo_automodel.components.utils.model_utils import init_empty_weights
 
             with no_init_weights(), init_empty_weights():
-                model = BagelForUnifiedMultimodal(bagel_config)
+                model = BagelForUnifiedMultimodal(bagel_config, backend=backend)
         else:
-            model = BagelForUnifiedMultimodal(bagel_config)
+            model = BagelForUnifiedMultimodal(bagel_config, backend=backend)
     finally:
         torch.set_default_dtype(original_dtype)
 

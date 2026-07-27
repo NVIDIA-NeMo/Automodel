@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Two-rank CPU parity test for expert gradients under composed TP x EP.
+"""Scheduled two-rank CPU parity test for expert gradients under composed TP x EP.
 
 The custom-MoE tensor-parallel path keeps the token path (attention, router)
 replicated across TP ranks, so every TP rank feeds the same tokens into the
