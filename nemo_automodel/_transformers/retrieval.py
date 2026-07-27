@@ -27,6 +27,7 @@ from transformers.models.auto.modeling_auto import MODEL_FOR_SEQUENCE_CLASSIFICA
 from transformers.utils import logging
 
 from nemo_automodel._transformers.registry import ModelRegistry
+from nemo_automodel.components.checkpoint.addons import _maybe_save_custom_model_code
 from nemo_automodel.components.checkpoint.checkpointing import (
     _materialize_to_hf_views_for_save,
     _maybe_adapt_state_dict_to_hf,
@@ -361,6 +362,14 @@ def save_encoder_pretrained(model: nn.Module, save_directory: str, **kwargs) -> 
     state_dict = _maybe_adapt_state_dict_to_hf(model, model.state_dict())
     _materialize_to_hf_views_for_save(state_dict)
     model.model.save_pretrained(save_directory, state_dict=state_dict)
+    original_model_path = getattr(model, "name_or_path", None)
+    if not isinstance(original_model_path, str):
+        original_model_path = None
+    _maybe_save_custom_model_code(
+        original_model_path,
+        save_directory,
+        model_part=model.model,
+    )
 
 
 # HuggingFace model_type -> task -> bidirectional architecture class name in ModelRegistry

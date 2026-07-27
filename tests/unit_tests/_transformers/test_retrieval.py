@@ -15,13 +15,16 @@
 """Functional tests for retrieval backbone extraction."""
 
 import json
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 import torch.nn as nn
+from safetensors.torch import save_file
 from transformers import AutoModel, Mistral3Config, PretrainedConfig, PreTrainedModel
 
+from nemo_automodel.components.checkpoint.addons import ConsolidatedHFAddon
 from nemo_automodel.components.models.llama_bidirectional.model import (
     LlamaBidirectionalForSequenceClassification,
     LlamaBidirectionalModel,
@@ -38,34 +41,122 @@ def test_llama_nemotron_vl_supported_backbone_for_embedding():
 class _RemoteCodeConfig(PretrainedConfig):
     model_type = "remote_code_test"
 
+    def __init__(self, hidden_size: int = 4, **kwargs) -> None:
+        self.hidden_size = hidden_size
+        super().__init__(**kwargs)
+
 
 class _RemoteCodeModel(PreTrainedModel):
     config_class = _RemoteCodeConfig
 
+    def __init__(self, config: _RemoteCodeConfig) -> None:
+        super().__init__(config)
+        self.projection = nn.Linear(config.hidden_size, config.hidden_size)
+        self.post_init()
 
-def test_custom_encoder_preserves_matching_original_remote_code(tmp_path):
-    from nemo_automodel._transformers.retrieval import _init_encoder_common
+
+def _make_local_remote_code_model(source_dir) -> _RemoteCodeModel:
+    source_dir.mkdir(parents=True)
+    (source_dir / "configuration_remote.py").write_text(
+        """
+from transformers import PretrainedConfig
+
+
+class _RemoteCodeConfig(PretrainedConfig):
+    model_type = "remote_code_test"
+
+    def __init__(self, hidden_size=4, **kwargs):
+        self.hidden_size = hidden_size
+        super().__init__(**kwargs)
+""".lstrip()
+    )
+    (source_dir / "modeling_remote.py").write_text(
+        """
+import torch.nn as nn
+from transformers import PreTrainedModel
+
+from .configuration_remote import _RemoteCodeConfig
+
+
+class _RemoteCodeModel(PreTrainedModel):
+    config_class = _RemoteCodeConfig
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.projection = nn.Linear(config.hidden_size, config.hidden_size)
+        self.post_init()
+
+    def forward(self, hidden_states):
+        return self.projection(hidden_states)
+""".lstrip()
+    )
 
     config = _RemoteCodeConfig()
-    config.name_or_path = str(tmp_path / "original_checkpoint")
+    config.name_or_path = str(source_dir)
     config.auto_map = {
-        "AutoConfig": "configuration_remote.RemoteCodeConfig",
+        "AutoConfig": "configuration_remote._RemoteCodeConfig",
         "AutoModel": "modeling_remote._RemoteCodeModel",
-        "AutoProcessor": "processing_remote.RemoteCodeProcessor",
     }
-    original_auto_map = dict(config.auto_map)
-    model = _RemoteCodeModel(config)
-    encoder = nn.Module()
+    config.architectures = ["_RemoteCodeModel"]
+    return _RemoteCodeModel(config)
+
+
+def _assert_remote_code_round_trip(model: _RemoteCodeModel, checkpoint_dir) -> None:
+    assert (checkpoint_dir / "configuration_remote.py").is_file()
+    assert (checkpoint_dir / "modeling_remote.py").is_file()
+
+    reloaded = AutoModel.from_pretrained(checkpoint_dir, trust_remote_code=True)
+    assert type(reloaded).__name__ == "_RemoteCodeModel"
+    assert set(reloaded.state_dict()) == set(model.state_dict())
+    for key, tensor in model.state_dict().items():
+        assert torch.equal(reloaded.state_dict()[key], tensor)
+
+
+def test_direct_encoder_save_preserves_and_reloads_matching_remote_code(tmp_path):
+    from nemo_automodel._transformers.retrieval import BiEncoderModel, save_encoder_pretrained
+
+    source_dir = tmp_path / "original_checkpoint"
+    output_dir = tmp_path / "direct_export"
+    model = _make_local_remote_code_model(source_dir)
 
     with patch(
         "nemo_automodel._transformers.retrieval.ModelRegistry.has_retrieval_model",
         return_value=True,
     ):
-        _init_encoder_common(encoder, model)
+        encoder = BiEncoderModel(model)
 
-    assert encoder.name_or_path == config.name_or_path
-    assert config.architectures == ["_RemoteCodeModel"]
-    assert config.auto_map == original_auto_map
+    save_encoder_pretrained(encoder, str(output_dir))
+
+    assert encoder.name_or_path == str(source_dir)
+    _assert_remote_code_round_trip(model, output_dir)
+
+
+def test_consolidated_addon_preserves_and_reloads_matching_remote_code(tmp_path):
+    source_dir = tmp_path / "original_checkpoint"
+    metadata_dir = tmp_path / "model" / ".hf_metadata"
+    consolidated_dir = tmp_path / "model" / "consolidated"
+    metadata_dir.mkdir(parents=True)
+    consolidated_dir.mkdir(parents=True)
+    model = _make_local_remote_code_model(source_dir)
+    save_file(
+        {key: tensor.detach().clone().contiguous() for key, tensor in model.state_dict().items()},
+        consolidated_dir / "model.safetensors",
+    )
+
+    addon = ConsolidatedHFAddon()
+    addon.pre_save(
+        model_state=SimpleNamespace(model=[model]),
+        hf_metadata_dir=str(metadata_dir),
+        fqn_to_file_index_mapping={},
+        original_model_path=str(source_dir),
+        tokenizer=None,
+    )
+    addon.post_save(
+        consolidated_path=str(consolidated_dir),
+        hf_metadata_path=str(metadata_dir),
+    )
+
+    _assert_remote_code_round_trip(model, consolidated_dir)
 
 
 def test_custom_encoder_exports_local_code_when_remote_class_differs():
