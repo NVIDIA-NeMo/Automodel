@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""1-GPU stress test for the FlashAttention boundary-segment guard.
+"""Scheduled 1-GPU stress test for the FlashAttention boundary-segment guard.
 
 The left-straddling boundary document (``sk > sq``) is the layout that provoked
 asynchronous illegal-address reports in some FlashAttention builds, which

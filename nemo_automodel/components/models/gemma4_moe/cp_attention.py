@@ -1145,7 +1145,7 @@ def _gemma4_cp_manual_attention(
 ) -> torch.Tensor:
     """Gemma4-owned manual ring CP attention entry.
 
-    Plugs into cp_utils' generic ``run_cp_manual_attention`` seam: receives the
+    Plugs into context_parallel.utils' generic ``run_cp_manual_attention`` seam: receives the
     raw local (un-gathered) Q/K/V plus ``cp_mesh``, builds the ring context, and
     runs the p2p ring FlexAttention. K/V are rotated across CP ranks inside the
     ring autograd function -- they are never all-gathered.
@@ -1188,7 +1188,7 @@ def _gemma4_cp_manual_attention(
 def _install_gemma4_cp_ring_sdpa(attention_module: torch.nn.Module, cp_mesh) -> None:
     """Swap ``F.scaled_dot_product_attention`` -> Gemma4 ring CP attention on this module.
 
-    Gemma4 owns its CP attention end-to-end (it does not use cp_utils' generic CP
+    Gemma4 owns its CP attention end-to-end (it does not use context_parallel.utils' generic CP
     SDPA hooks). It installs its own ``@torch._dynamo.disable`` SDPA wrapper -- on
     the inner attention module so it also fires during gradient-checkpointing
     recompute -- that runs the p2p ring FlexAttention. The per-forward attention
@@ -1256,7 +1256,7 @@ def attach_gemma4_cp_ring_attention(attention_module: torch.nn.Module, *, use_ff
 
     Declares the metadata keys the ring needs and exposes ``setup_cp_attention(cp_mesh)``
     -- the model-owned CP-attention seam the parallelizer calls (with the CP mesh)
-    instead of cp_utils' generic SDPA hooks. ``run_cp_manual_attention`` is also bound
+    instead of context_parallel.utils' generic SDPA hooks. ``run_cp_manual_attention`` is also bound
     as the ring entry point.
 
     ``use_ffpa`` opts the (full-attention, head_dim=512) ring chunks into the FFPA

@@ -1611,11 +1611,12 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             meta = torch.load(meta_path, weights_only=False, map_location="cpu")
             self.runtime.global_step = int(meta.get("global_step", 0))
             self._resume_epoch = int(meta.get("epoch", 0))
-            # Align the regen launch cadence to the restored step so resume does not
-            # immediately fire a redundant cycle for an already-covered region.
-            regen_runner = getattr(self, "regen_runner", None)
-            if regen_runner is not None:
-                regen_runner.resume_from_step(self.runtime.global_step)
+            # Align the cadence-driven runners to the restored step so resume does
+            # not immediately fire a redundant launch for an already-covered region.
+            for runner_attr in ("regen_runner", "decode_eval_runner"):
+                runner = getattr(self, runner_attr, None)
+                if runner is not None:
+                    runner.resume_from_step(self.runtime.global_step)
             ids = meta.get("selected_token_ids")
             mask = meta.get("selected_token_mask")
             if ids is not None and mask is not None:

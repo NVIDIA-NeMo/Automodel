@@ -13,7 +13,6 @@
 # limitations under the License.
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.distributed.tensor import (
     DeviceMesh,
     DTensor,
@@ -26,6 +25,8 @@ from torch.distributed.tensor.parallel import (
     RowwiseParallel,
     SequenceParallel,
 )
+
+from nemo_automodel.shared.tp_linear import tp_linear_forward
 
 
 def _distribute_param(_module, name, device_mesh, src_data_rank, placements):
@@ -49,7 +50,9 @@ class TPLinear(nn.Linear):
     torch.bmm is a native 3-D op whose backward is also bmm -- no view is ever
     emitted.  DTensor has explicit strategies for bmm covering the ColwiseParallel
     (Replicate x Shard(2) -> Shard(2)) and RowwiseParallel (Shard(2) x Shard(1) ->
-    Partial) patterns.
+    Partial) patterns.  The exception is Inductor's async-TP mode: its fusion
+    pass recognizes reshape-mm-reshape but not bmm, so that mode emits the
+    former while every other compile path retains the DTensor-safe fallback.
 
     Note: expand(b, -1, -1) dispatches through DTensor's ShardingPropagator which
     caches via lru_cache keyed on DTensorSpec.  With dynamic shapes, b = x.shape[0]
@@ -64,18 +67,24 @@ class TPLinear(nn.Linear):
     """
 
     def forward(self, x):
-        # bmm avoids aten.view which cannot flatten a sharded dimension.
-        _x_needs_bmm = (
-            isinstance(x, DTensor) and x.dim() == 3 and any(isinstance(p, Shard) and p.dim < 2 for p in x.placements)
-        )
-        if not torch.compiler.is_compiling() and not _x_needs_bmm:
-            return F.linear(x, self.weight, self.bias)
-        if x.dim() == 3:
-            b = x.shape[0]
-            out = torch.bmm(x, self.weight.t().unsqueeze(0).expand(b, -1, -1))
-        else:
-            out = torch.mm(x, self.weight.t())
-        return out + self.bias if self.bias is not None else out
+        """Apply the linear layer through the shared TP-safe dispatch.
+
+        Args:
+            x (Tensor): Input activations of shape ``[B, S, in_features]``
+                (``B`` = batch, ``S`` = sequence) or ``[N, in_features]``
+                (``N`` = flattened tokens).  May be a DTensor: a 3-D DTensor
+                sharded on dim 0 or 1 (e.g. ``Shard(1)`` from sequence
+                parallelism) takes the ``torch.bmm`` path; replicated or
+                last-dimension-sharded inputs (``Shard(2)`` or ``Shard(-1)``)
+                take ``F.linear``, which under async-TP tracing is the fusable
+                native linear graph.
+
+        Returns:
+            Tensor: Output of shape ``[..., out_features]`` with the same
+            leading dimensions as ``x``; a DTensor if ``x`` and the weight
+            are DTensors.
+        """
+        return tp_linear_forward(x, self.weight, self.bias, mm_for_2d_compile=True)
 
 
 class ColwiseParallelLora(ColwiseParallel):

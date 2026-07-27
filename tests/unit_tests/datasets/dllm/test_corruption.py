@@ -258,3 +258,46 @@ class TestCorruptUniformRandom:
         input_ids, loss_mask = inputs
         noisy, _, _ = corrupt_uniform_random(input_ids, loss_mask, VOCAB_SIZE, block_size=8)
         assert noisy.dtype == input_ids.dtype
+
+
+class TestSeededGenerator:
+    """Seeded-generator contract shared by all mask-token corruption kernels.
+
+    The recipe passes a (step, dp_rank, microbatch)-seeded generator so that
+    corruption (a) reproduces exactly on checkpoint resume and (b) is identical
+    across ranks that share a batch — TP/CP peers hold the same dp_rank and must
+    feed identical noisy inputs into the sharded forward.
+    """
+
+    @pytest.mark.parametrize("kernel_kwargs", [{}, {"block_size": 8}])
+    def test_corrupt_blockwise_same_seed_is_identical(self, inputs, kernel_kwargs):
+        input_ids, loss_mask = inputs
+        out_a = corrupt_blockwise(
+            input_ids, loss_mask, MASK_TOKEN_ID, generator=torch.Generator().manual_seed(1234), **kernel_kwargs
+        )
+        out_b = corrupt_blockwise(
+            input_ids, loss_mask, MASK_TOKEN_ID, generator=torch.Generator().manual_seed(1234), **kernel_kwargs
+        )
+        for a, b in zip(out_a, out_b):
+            assert torch.equal(a, b)
+
+    def test_corrupt_uniform_same_seed_is_identical(self, inputs):
+        input_ids, loss_mask = inputs
+        out_a = corrupt_uniform(input_ids, loss_mask, MASK_TOKEN_ID, generator=torch.Generator().manual_seed(7))
+        out_b = corrupt_uniform(input_ids, loss_mask, MASK_TOKEN_ID, generator=torch.Generator().manual_seed(7))
+        for a, b in zip(out_a, out_b):
+            assert torch.equal(a, b)
+
+    def test_corrupt_uniform_different_seeds_differ(self, inputs):
+        input_ids, loss_mask = inputs
+        _, mask_a, _ = corrupt_uniform(input_ids, loss_mask, MASK_TOKEN_ID, generator=torch.Generator().manual_seed(7))
+        _, mask_b, _ = corrupt_uniform(input_ids, loss_mask, MASK_TOKEN_ID, generator=torch.Generator().manual_seed(8))
+        assert not torch.equal(mask_a, mask_b)
+
+    def test_corrupt_uniform_generator_does_not_consume_global_rng(self, inputs):
+        input_ids, loss_mask = inputs
+        torch.manual_seed(0)
+        expected = torch.rand(4)
+        torch.manual_seed(0)
+        corrupt_uniform(input_ids, loss_mask, MASK_TOKEN_ID, generator=torch.Generator().manual_seed(7))
+        assert torch.equal(torch.rand(4), expected)
