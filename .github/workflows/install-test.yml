@@ -178,8 +178,11 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Restore CUDA wheelhouse cache
-        id: cuda-wheelhouse-cache
+      # Keep the canonical wheelhouse on main. Copied PR branches restore it
+      # without creating duplicate branch-scoped multi-GB cache entries.
+      - name: Restore and save CUDA wheelhouse cache
+        id: cuda-wheelhouse-cache-main
+        if: github.ref == 'refs/heads/main'
         uses: actions/cache@v4
         with:
           path: ${{ env.WHEELHOUSE_DIR }}
@@ -188,8 +191,21 @@ jobs:
             install-test-cuda-wheelhouse-${{ runner.os }}-py${{ matrix.python-version }}-
             install-test-cuda-wheelhouse-${{ runner.os }}-
 
+      - name: Restore CUDA wheelhouse cache
+        id: cuda-wheelhouse-cache-branch
+        if: github.ref != 'refs/heads/main'
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.WHEELHOUSE_DIR }}
+          key: install-test-cuda-wheelhouse-${{ runner.os }}-py${{ matrix.python-version }}-${{ hashFiles('pyproject.toml', 'uv.lock', '.github/workflows/install-test.yml') }}
+          restore-keys: |
+            install-test-cuda-wheelhouse-${{ runner.os }}-py${{ matrix.python-version }}-
+            install-test-cuda-wheelhouse-${{ runner.os }}-
+
       - name: Build cached CUDA dependency wheels
-        if: steps.cuda-wheelhouse-cache.outputs.cache-hit != 'true'
+        if: |
+          steps.cuda-wheelhouse-cache-main.outputs.cache-hit != 'true'
+          && steps.cuda-wheelhouse-cache-branch.outputs.cache-hit != 'true'
         shell: bash -x -e -u -o pipefail {0}
         run: |
           python -m venv ./venv

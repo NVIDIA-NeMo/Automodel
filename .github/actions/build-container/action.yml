@@ -103,9 +103,21 @@ runs:
       id: setup-buildx
       uses: docker/setup-buildx-action@v3
 
-    - name: Restore BuildKit cache mounts
-      id: buildkit-cache
+    # Keep multi-GB cache ownership on main. Copied PR branches can restore
+    # main's cache without consuming repository storage with scoped copies.
+    - name: Restore and save BuildKit cache mounts
+      id: buildkit-cache-main
+      if: github.ref == 'refs/heads/main'
       uses: actions/cache@v4
+      with:
+        path: .buildkit-cache
+        # Compiled CUDA wheels are ABI-bound to the Dockerfile base image and lockfiles.
+        key: buildkit-cache-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles(inputs.dockerfile-path, 'docker/common/uv-pytorch.lock', 'uv.lock') }}
+
+    - name: Restore BuildKit cache mounts
+      id: buildkit-cache-branch
+      if: github.ref != 'refs/heads/main'
+      uses: actions/cache/restore@v4
       with:
         path: .buildkit-cache
         # Compiled CUDA wheels are ABI-bound to the Dockerfile base image and lockfiles.
@@ -119,7 +131,9 @@ runs:
         scratch-dir: .buildkit-cache/scratch
         cache-dir: .buildkit-cache
         dockerfile: ${{ inputs.dockerfile-path }}
-        skip-extraction: ${{ steps.buildkit-cache.outputs.cache-hit }}
+        # Branch runs are restore-only, so extracting their updated mounts
+        # after the build would create an archive that no step persists.
+        skip-extraction: ${{ github.ref != 'refs/heads/main' || steps.buildkit-cache-main.outputs.cache-hit == 'true' }}
 
     - name: Build and push
       uses: docker/build-push-action@v5

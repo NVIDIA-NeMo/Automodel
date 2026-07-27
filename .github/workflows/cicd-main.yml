@@ -351,9 +351,21 @@ jobs:
             echo "cache-key=amd64" | tee -a "$GITHUB_OUTPUT"
           fi
 
-      - name: Restore uv build cache
-        id: uv-build-cache
+      # Keep multi-GB cache ownership on main. Copied PR branches can restore
+      # main's cache without consuming repository storage with scoped copies.
+      - name: Restore and save uv build cache
+        id: uv-build-cache-main
+        if: github.ref == 'refs/heads/main'
         uses: actions/cache@v4
+        with:
+          path: .buildkit-cache/uv
+          # Compiled CUDA wheels are ABI-bound to the Dockerfile base image and lockfiles.
+          key: buildkit-uv-${{ runner.os }}-${{ steps.platform.outputs.cache-key }}-${{ hashFiles('docker/Dockerfile', 'docker/common/uv-pytorch.lock', 'uv.lock') }}
+
+      - name: Restore uv build cache
+        id: uv-build-cache-branch
+        if: github.ref != 'refs/heads/main'
+        uses: actions/cache/restore@v4
         with:
           path: .buildkit-cache/uv
           # Compiled CUDA wheels are ABI-bound to the Dockerfile base image and lockfiles.
@@ -369,7 +381,9 @@ jobs:
             {
               ".buildkit-cache/uv": "/opt/uv_cache"
             }
-          skip-extraction: ${{ steps.uv-build-cache.outputs.cache-hit }}
+          # Branch runs are restore-only, so extracting their updated mount
+          # after the build would create an archive that no step persists.
+          skip-extraction: ${{ github.ref != 'refs/heads/main' || steps.uv-build-cache-main.outputs.cache-hit == 'true' }}
 
       - name: Build and push
         uses: docker/build-push-action@v5
