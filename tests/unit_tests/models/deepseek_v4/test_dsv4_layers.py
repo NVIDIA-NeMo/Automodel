@@ -31,10 +31,15 @@ from nemo_automodel.components.models.deepseek_v4.cp import build_dsv4_cp_causal
 from nemo_automodel.components.models.deepseek_v4.kernels._tilelang import HAS_TILELANG
 from nemo_automodel.components.models.deepseek_v4.layers import (
     DeepseekV4Attention,
+    DeepseekV4CompressorLinear,
     DeepseekV4GroupedLinear,
     DeepseekV4HyperConnection,
+    DeepseekV4PositionEmbeddings,
     DeepseekV4RotaryEmbedding,
+    DeepseekV4TEGroupedLinear,
+    DeepseekV4TERowParallelLinear,
     _apply_partial_rope_interleaved,
+    _apply_q_head_norm_rope,
     _build_indexer_topk_compressed_mask,
     _rms_norm_last_dim,
     _yarn_correction_dim,
@@ -42,6 +47,7 @@ from nemo_automodel.components.models.deepseek_v4.layers import (
     _yarn_linear_ramp,
     build_causal_padding_mask,
     build_packed_causal_padding_mask,
+    dsv4_hc_post,
     eager_attention_with_sink,
 )
 from nemo_automodel.components.models.deepseek_v4.optimized_kernels import (
@@ -79,6 +85,66 @@ def _can_run_tilelang_sparse_attn() -> bool:
         and torch.cuda.is_available()
         and _cuda_device_capability() >= (8, 9)
     )
+
+
+class TestDeepseekV4CompressorLinear:
+    def test_cpu_keeps_fp32_master_and_bf16_forward_boundary(self):
+        torch.manual_seed(41)
+        projection = DeepseekV4CompressorLinear(
+            16,
+            8,
+            bias=False,
+            dtype=torch.float32,
+        )
+        inputs = torch.randn(2, 3, 16, dtype=torch.bfloat16, requires_grad=True)
+
+        actual = projection(inputs)
+        expected = torch.mm(
+            inputs.reshape(-1, 16).float(),
+            projection.weight.to(torch.bfloat16).float().T,
+        ).view(2, 3, 8)
+
+        assert projection.weight.dtype == torch.float32
+        assert actual.dtype == torch.float32
+        torch.testing.assert_close(actual, expected, atol=0.0, rtol=0.0)
+        actual.sum().backward()
+        assert projection.weight.grad is not None
+        assert projection.weight.grad.dtype == torch.float32
+        assert inputs.grad is not None
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA out_dtype support")
+    def test_cuda_matches_vllm_projection_boundary_and_backward(self):
+        torch.manual_seed(43)
+        projection = DeepseekV4CompressorLinear(
+            64,
+            32,
+            bias=False,
+            dtype=torch.float32,
+            device="cuda",
+        )
+        inputs = torch.randn(
+            2,
+            5,
+            64,
+            dtype=torch.bfloat16,
+            device="cuda",
+            requires_grad=True,
+        )
+
+        actual = projection(inputs)
+        expected = torch.mm(
+            inputs.reshape(-1, 64),
+            projection.weight.to(torch.bfloat16).T,
+            out_dtype=torch.float32,
+        ).view(2, 5, 32)
+
+        torch.testing.assert_close(actual, expected, atol=0.0, rtol=0.0)
+        actual.square().mean().backward()
+        assert projection.weight.grad is not None
+        assert projection.weight.grad.dtype == torch.float32
+        assert torch.isfinite(projection.weight.grad).all()
+        assert inputs.grad is not None
+        assert torch.isfinite(inputs.grad).all()
 
 
 def _can_run_tilelang_indexer() -> bool:
@@ -824,6 +890,114 @@ class TestDeepseekV4GroupedLinear:
         torch.testing.assert_close(out, out_ref)
 
 
+class TestDeepseekV4TEGroupedLinear:
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="TE grouped FP8 requires CUDA")
+    def test_block_fp8_accepts_fp32_quantizer_source_and_returns_bf16(self):
+        pytest.importorskip("transformer_engine")
+        from transformer_engine.common.recipe import Float8BlockScaling
+        from transformer_engine.pytorch.quantization import autocast
+
+        projection = DeepseekV4TEGroupedLinear(
+            in_features_per_group=256,
+            out_features=512,
+            n_groups=4,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        projection.reset_parameters()
+        x = torch.randn(2, 3, 4, 256, device="cuda", dtype=torch.float32, requires_grad=True)
+
+        with autocast(enabled=True, recipe=Float8BlockScaling()):
+            out = projection(x)
+        out.float().square().mean().backward()
+
+        assert out.dtype == torch.bfloat16
+        assert out.shape == (2, 3, 4, 128)
+        assert torch.isfinite(out).all()
+        assert x.grad is not None
+        assert x.grad.dtype == torch.float32
+        assert torch.isfinite(x.grad).all()
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="TE grouped FP8 requires CUDA")
+    def test_block_fp8_forward_backward_and_flat_state_dict(self):
+        pytest.importorskip("transformer_engine")
+        from transformer_engine.common.recipe import Float8BlockScaling
+        from transformer_engine.pytorch.quantization import autocast
+
+        torch.manual_seed(7)
+        projection = DeepseekV4TEGroupedLinear(
+            in_features_per_group=256,
+            out_features=512,
+            n_groups=4,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        projection.reset_parameters()
+        x = torch.randn(2, 3, 4, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+
+        with autocast(enabled=True, recipe=Float8BlockScaling()):
+            out = projection(x)
+        out.float().square().mean().backward()
+
+        assert out.shape == (2, 3, 4, 128)
+        assert torch.isfinite(out).all()
+        assert x.grad is not None and torch.isfinite(x.grad).all()
+        state = projection.state_dict()
+        assert state["weight"].shape == (512, 256)
+        assert not any(key.startswith("_linear.weight") for key in state)
+
+        reloaded = DeepseekV4TEGroupedLinear(
+            in_features_per_group=256,
+            out_features=512,
+            n_groups=4,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        reloaded.load_state_dict(state)
+        torch.testing.assert_close(reloaded.weight, projection.weight, atol=0.0, rtol=0.0)
+
+
+class TestDeepseekV4TERowParallelLinear:
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="TE grouped FP8 requires CUDA")
+    def test_block_fp8_forward_backward_and_flat_state_dict(self):
+        pytest.importorskip("transformer_engine")
+        from transformer_engine.common.recipe import Float8BlockScaling
+        from transformer_engine.pytorch.quantization import autocast
+
+        torch.manual_seed(11)
+        projection = DeepseekV4TERowParallelLinear(
+            in_features=1024,
+            out_features=256,
+            n_partitions=4,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        projection.reset_parameters()
+        x = torch.randn(2, 3, 1024, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+
+        with autocast(enabled=True, recipe=Float8BlockScaling()):
+            out = projection(x)
+        out.float().square().mean().backward()
+
+        assert out.dtype == torch.bfloat16
+        assert out.shape == (2, 3, 256)
+        assert torch.isfinite(out).all()
+        assert x.grad is not None and torch.isfinite(x.grad).all()
+        state = projection.state_dict()
+        assert state["weight"].shape == (256, 1024)
+        assert not any(key.startswith("_linear.weight") for key in state)
+
+        reloaded = DeepseekV4TERowParallelLinear(
+            in_features=1024,
+            out_features=256,
+            n_partitions=4,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        reloaded.load_state_dict(state)
+        torch.testing.assert_close(reloaded.weight, projection.weight, atol=0.0, rtol=0.0)
+
+
 class TestDeepseekV4HyperConnection:
     """``compute_weights`` returns the (pre, post, comb) tensors used at
     each HC site.  Shapes are deterministic given ``hc_mult`` and
@@ -891,6 +1065,25 @@ class TestDeepseekV4HyperConnection:
         col_sums = comb.sum(dim=-2)
         torch.testing.assert_close(row_sums, torch.ones_like(row_sums), rtol=0, atol=1e-2)
         torch.testing.assert_close(col_sums, torch.ones_like(col_sums), rtol=0, atol=1e-2)
+
+    def test_hc_post_keeps_coefficients_and_accumulation_fp32(self):
+        torch.manual_seed(17)
+        hidden_streams = torch.randn(2, 3, 4, 16, dtype=torch.bfloat16)
+        layer_output = torch.randn(2, 3, 16, dtype=torch.bfloat16)
+        post = torch.randn(2, 3, 4, dtype=torch.float32)
+        comb = torch.randn(2, 3, 4, 4, dtype=torch.float32)
+
+        actual = dsv4_hc_post(hidden_streams, layer_output, post, comb)
+        expected = (
+            post.unsqueeze(-1) * layer_output.float().unsqueeze(-2)
+            + torch.matmul(comb.transpose(-1, -2), hidden_streams.float())
+        ).to(torch.bfloat16)
+        legacy_bf16_coefficients = post.to(torch.bfloat16).unsqueeze(-1) * layer_output.unsqueeze(-2) + torch.matmul(
+            comb.transpose(-1, -2).to(torch.bfloat16), hidden_streams
+        )
+
+        torch.testing.assert_close(actual, expected, atol=0.0, rtol=0.0)
+        assert torch.count_nonzero(actual != legacy_bf16_coefficients) > 0
 
 
 class TestDeepseekV4OptimizedKernels:
@@ -1669,6 +1862,50 @@ class TestApplyPartialRopeInterleaved:
         torch.testing.assert_close(cos.grad, cos_ref.grad)
         torch.testing.assert_close(sin.grad, sin_ref.grad)
 
+    def test_q_head_norm_rope_keeps_fp32_until_final_bf16_cast(self):
+        torch.manual_seed(47)
+        bsz, heads, seq, rd, nope = 1, 3, 5, 8, 24
+        eps = 1e-6
+        q = torch.randn(
+            bsz,
+            heads,
+            seq,
+            nope + rd,
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+        cos, sin = self._make_cos_sin(bsz, seq, rd)
+
+        actual = _apply_q_head_norm_rope(q, cos, sin, rd, eps)
+        normalized_fp32 = torch.nn.functional.rms_norm(
+            q.float(),
+            (q.shape[-1],),
+            eps=eps,
+        )
+        expected = self._reference_apply(
+            normalized_fp32,
+            cos,
+            sin,
+            rd,
+        ).to(torch.bfloat16)
+
+        assert actual.dtype == torch.bfloat16
+        torch.testing.assert_close(actual, expected, atol=0.0, rtol=0.0)
+
+        # Guard the vLLM boundary specifically: an intermediate BF16
+        # normalized tensor is observably different for this input.
+        rounded_between_ops = _apply_partial_rope_interleaved(
+            torch.nn.functional.rms_norm(q, (q.shape[-1],), eps=eps),
+            cos,
+            sin,
+            rd,
+        )
+        assert torch.count_nonzero(actual != rounded_between_ops) > 0
+
+        actual.float().sum().backward()
+        assert q.grad is not None
+        assert torch.isfinite(q.grad.float()).all()
+
 
 class TestYaRNHelpers:
     """Sanity checks on the three pure-math helpers that build the YaRN
@@ -1714,7 +1951,7 @@ class TestYaRNHelpers:
 class TestDeepseekV4RotaryEmbeddingYaRN:
     """``DeepseekV4RotaryEmbedding`` with and without ``rope_scaling``.
 
-    DSV4-Flash uses YaRN on the compress-rope path only:
+    vLLM applies YaRN to both main and compress DSV4 rope paths:
         rope_theta=160000, factor=16, original_max_position_embeddings=65536,
         beta_fast=32, beta_slow=1.
     """
@@ -1734,6 +1971,30 @@ class TestDeepseekV4RotaryEmbeddingYaRN:
         )
         kwargs.update(overrides)
         return kwargs
+
+    def test_fp32_cache_is_pytree_opaque_to_fsdp_input_cast(self):
+        rope = DeepseekV4RotaryEmbedding(**self._yarn_kwargs())
+        positions = torch.arange(8).unsqueeze(0)
+        cache = rope(torch.empty(1, 8, 128, dtype=torch.bfloat16), positions)
+
+        assert isinstance(cache, DeepseekV4PositionEmbeddings)
+        cos, sin = cache
+        assert cos.dtype == torch.float32
+        assert sin.dtype == torch.float32
+
+        # FSDP2's cast_forward_inputs uses pytree tree_map_only. Ordinary
+        # tuples would have both tensors rounded here; the DSV4 holder must be
+        # treated as one leaf and keep the exact FP32 cache by identity.
+        from torch.utils._pytree import tree_map_only
+
+        mapped = tree_map_only(
+            torch.Tensor,
+            lambda tensor: tensor.to(torch.bfloat16),
+            cache,
+        )
+        assert mapped is cache
+        assert mapped.cos is cos
+        assert mapped.sin is sin
 
     def test_no_rope_scaling_is_plain_rope(self):
         """``rope_scaling=None`` ⇒ plain ``1 / theta^(2i/d)`` inv_freq."""
@@ -1844,10 +2105,7 @@ class TestDeepseekV4RotaryEmbeddingYaRN:
         torch.testing.assert_close(yarn.inv_freq, expected, rtol=0, atol=1e-7)
 
     def test_yarn_forward_returns_correct_shape_and_dtype(self):
-        """Smoke check: the YaRN-modified rotary still produces ``(cos, sin)``
-        sized to ``qk_rope_head_dim`` and downcasts to ``x.dtype`` if the
-        forward returns BF16-casted tensors.
-        """
+        """The YaRN rotary keeps vLLM's FP32 cos/sin-cache boundary."""
         rope = DeepseekV4RotaryEmbedding(**self._yarn_kwargs())
         bsz, seq = 2, 16
         x = torch.zeros(bsz, seq, dtype=torch.bfloat16)
@@ -1856,4 +2114,6 @@ class TestDeepseekV4RotaryEmbeddingYaRN:
         # rope_head_dim = head_dim * partial_rotary_factor = 64
         assert cos.shape == (bsz, seq, 64)
         assert sin.shape == (bsz, seq, 64)
+        assert cos.dtype == torch.float32
+        assert sin.dtype == torch.float32
         assert not torch.isnan(cos).any() and not torch.isnan(sin).any()

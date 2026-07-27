@@ -219,6 +219,12 @@ def _rename_hf_key(key: str) -> str:
 class DeepSeekV4StateDictAdapter(StateDictAdapter):
     """State dict adapter for DeepSeek V4."""
 
+    # MOLT's actor -> inference refit uses this protocol to materialize routed
+    # experts one at a time.  A full DSV4 routed-expert stack is several GiB,
+    # so gathering the EP-sharded DTensor before splitting can OOM even though
+    # each individual expert fits comfortably.
+    supports_streamed_expert_refit = True
+
     def __init__(
         self,
         config: DeepseekV4Config,
@@ -628,8 +634,10 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
         quantization = kwargs.get("quantization", False)
         exclude_key_regex = kwargs.get("exclude_key_regex", None)
 
-        # Split stacked gate_and_up_projs into per-expert w1 + w3
-        result = self._split_merged_expert(fqn, tensor)
+        # Split stacked gate_and_up_projs into per-expert w1 + w3.  The optional
+        # offset is used when a caller streams only a contiguous slice of the
+        # expert stack and must preserve the original global expert IDs.
+        result = self._split_merged_expert(fqn, tensor, expert_id_offset=kwargs.get("expert_id_offset"))
 
         if exclude_key_regex:
             result = [(k, v) for k, v in result if not re.match(exclude_key_regex, k)]
@@ -927,11 +935,18 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
         scale_expanded = scale_expanded[..., : fp4_vals.shape[-1]]
         return (fp4_vals * scale_expanded).to(dtype)
 
-    def _split_merged_expert(self, fqn: str, tensor: Any) -> list[tuple[str, Any]]:
+    def _split_merged_expert(
+        self,
+        fqn: str,
+        tensor: Any,
+        expert_id_offset: int | None = None,
+    ) -> list[tuple[str, Any]]:
         """Inverse of expert aggregation: split gate_and_up/down stacks into per-expert keys.
 
         Handles DTensor inputs (EP-sharded) by working on the local shard only,
-        emitting keys only for the experts owned by the current rank.
+        emitting keys only for the experts owned by the current rank.  For a
+        pre-gathered expert slice, ``expert_id_offset`` assigns its first row the
+        corresponding global expert ID.
         """
         gate_up_pat = re.compile(r"^(model\.layers\.(\d+)\.mlp\.experts)\.gate_and_up_projs$")
         down_pat = re.compile(r"^(model\.layers\.(\d+)\.mlp\.experts)\.down_projs$")
@@ -939,8 +954,12 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
         m = gate_up_pat.match(fqn)
         if m:
             layer_num = m.group(2)
-            n_total = self.moe_config.n_routed_experts
-            expert_tensors, expert_ids = split_experts_weights_dtensor_aware(tensor, n_total)
+            if expert_id_offset is None:
+                n_total = self.moe_config.n_routed_experts
+                expert_tensors, expert_ids = split_experts_weights_dtensor_aware(tensor, n_total)
+            else:
+                expert_tensors = list(tensor.unbind(0))
+                expert_ids = list(range(expert_id_offset, expert_id_offset + len(expert_tensors)))
             result = []
             for t, eid in zip(expert_tensors, expert_ids):
                 inter_dim = t.shape[-1] // 2
@@ -955,8 +974,12 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
         m = down_pat.match(fqn)
         if m:
             layer_num = m.group(2)
-            n_total = self.moe_config.n_routed_experts
-            expert_tensors, expert_ids = split_experts_weights_dtensor_aware(tensor, n_total)
+            if expert_id_offset is None:
+                n_total = self.moe_config.n_routed_experts
+                expert_tensors, expert_ids = split_experts_weights_dtensor_aware(tensor, n_total)
+            else:
+                expert_tensors = list(tensor.unbind(0))
+                expert_ids = list(range(expert_id_offset, expert_id_offset + len(expert_tensors)))
             result = []
             for t, eid in zip(expert_tensors, expert_ids):
                 result.append((f"layers.{layer_num}.ffn.experts.{eid}.w2.weight", t.T))

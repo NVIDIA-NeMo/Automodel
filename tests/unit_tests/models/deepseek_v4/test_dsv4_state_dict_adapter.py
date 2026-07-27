@@ -232,6 +232,34 @@ class TestDeepSeekV4StateDictAdapterToHF:
         keys = {k for k, _ in pairs}
         assert "layers.0.ffn.experts.0.w2.weight" in keys
 
+    def test_streamed_expert_slice_preserves_global_ids(self):
+        adapter = _make_adapter()
+        hidden, inter = 64, 32
+        gate_up = torch.randn(1, hidden, 2 * inter)
+        down = torch.randn(1, inter, hidden)
+
+        gate_up_pairs = adapter.convert_single_tensor_to_hf(
+            "model.layers.2.mlp.experts.gate_and_up_projs",
+            gate_up,
+            expert_id_offset=3,
+        )
+        down_pairs = adapter.convert_single_tensor_to_hf(
+            "model.layers.2.mlp.experts.down_projs",
+            down,
+            expert_id_offset=3,
+        )
+
+        assert {name for name, _ in gate_up_pairs} == {
+            "layers.2.ffn.experts.3.w1.weight",
+            "layers.2.ffn.experts.3.w3.weight",
+        }
+        assert {name for name, _ in down_pairs} == {
+            "layers.2.ffn.experts.3.w2.weight",
+        }
+        torch.testing.assert_close(gate_up_pairs[0][1], gate_up[0, :, :inter].T)
+        torch.testing.assert_close(gate_up_pairs[1][1], gate_up[0, :, inter:].T)
+        torch.testing.assert_close(down_pairs[0][1], down[0].T)
+
     def test_internal_key_to_hf_gate(self):
         adapter = _make_adapter()
         assert (

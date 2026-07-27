@@ -619,6 +619,34 @@ def swiglu_clamped_deepep(x, permuted_probs, limit: float):
     return (inter * permuted_probs).to(x.dtype)
 
 
+@torch.compiler.disable
+def swiglu_clamped_vllm_fp8(x: torch.Tensor, limit: float) -> torch.Tensor:
+    """Clamped SwiGLU with vLLM's H100 DeepGEMM FP8 rounding boundaries.
+
+    vLLM's fused ``silu_mul_per_token_group_quant_fp8_colmajor`` kernel
+    narrows the clamped gate/up values to the input dtype, evaluates SiLU in
+    FP32 and narrows it again, then multiplies the two BF16 operands before
+    FP8 quantization.  Keeping these otherwise easy-to-miss casts explicit is
+    required for actor/rollout parity.  Keep this function out of
+    ``torch.compile``: Inductor is otherwise allowed to fuse away the
+    observable BF16 materialization points.
+
+    Routing probabilities are deliberately not accepted here: vLLM applies
+    them to the down-projection output during unpermute/reduce.
+    """
+    gate, up = torch.chunk(x, 2, dim=-1)
+    gate = gate.float().clamp(max=limit).to(x.dtype)
+    up = up.float().clamp(min=-limit, max=limit).to(x.dtype)
+    silu = F.silu(gate.float()).to(x.dtype)
+    return (silu * up).to(x.dtype)
+
+
+@torch.compile(fullgraph=True, options={"max_autotune": True})
+def apply_vllm_moe_routing_weights(x: torch.Tensor, permuted_probs: torch.Tensor) -> torch.Tensor:
+    """Apply vLLM-style routing weights after the expert down projection."""
+    return (x.float() * permuted_probs.float()).to(x.dtype)
+
+
 def get_expert_activation_for_deepep(config: MoEConfig):
     """Return the DeepEP expert activation function selected by the MoE config."""
 
@@ -927,8 +955,6 @@ class GroupedExpertsTE(nn.Module):
             dispatcher_share_token_dispatcher: Whether to share a flex dispatcher communication manager across layers.
             dispatcher_async_dispatch: Whether DeepEP/UCCL-EP dispatch should run asynchronously.
         """
-        from transformer_engine.pytorch import GroupedLinear
-
         from nemo_automodel.components.models.common.utils import _patch_te_modules
 
         _patch_te_modules()
@@ -941,47 +967,55 @@ class GroupedExpertsTE(nn.Module):
         self.dim = config.dim
         self.moe_inter_dim = config.moe_inter_dim
         self.is_gated = is_gated_activation(config.expert_activation)
+        self.fp8_row_parallel_size = int(config.fp8_row_parallel_size)
+        self.partition_inter_dim = self.moe_inter_dim // self.fp8_row_parallel_size
         self.dispatcher_backend = dispatcher_backend
         self.dispatcher_num_sms = dispatcher_num_sms
         self.dispatcher_share_token_dispatcher = dispatcher_share_token_dispatcher
         self.dispatcher_async_dispatch = dispatcher_async_dispatch
 
-        # Gated (SwiGLU, Quick-GEGLU): out_features = moe_inter_dim * 2
-        # Non-gated (ReLU²): out_features = moe_inter_dim
-        gate_up_out_features = config.moe_inter_dim * 2 if self.is_gated else config.moe_inter_dim
-
-        # Create TE GroupedLinear layers with full expert count on meta device first
-        self.gate_up_linear = GroupedLinear(
-            num_gemms=config.n_routed_experts,
-            in_features=config.expert_dim,
-            out_features=gate_up_out_features,
-            bias=self.expert_bias,
-            params_dtype=config.dtype,
-            device="meta",
-        )
-        # down_linear: [moe_inter_dim] -> [dim]
-        self.down_linear = GroupedLinear(
-            num_gemms=config.n_routed_experts,
-            in_features=config.moe_inter_dim,
-            out_features=config.expert_dim,
-            bias=self.expert_bias,
-            params_dtype=config.dtype,
-            device="meta",
-        )
+        # A virtual TP partition is represented as another grouped GEMM for
+        # the same expert. This preserves the released full-weight state-dict
+        # shape while making the two FP8 GEMMs see exactly vLLM's local N/K.
+        self._make_grouped_linears(config.n_routed_experts, device="meta")
 
         self.expert_activation = get_expert_activation_for_deepep(config)
+        self.vllm_fp8_moe_semantics = bool(config.vllm_fp8_moe_semantics)
 
         # FP8 padding/unpadding for GEMM alignment (initialized with full expert count,
         # re-created in init_token_dispatcher with num_local_experts for EP)
         from transformer_engine.pytorch import Fp8Padding, Fp8Unpadding
 
-        self.fp8_padding = Fp8Padding(config.n_routed_experts)
-        self.fp8_unpadding = Fp8Unpadding(config.n_routed_experts)
+        num_compute_gemms = config.n_routed_experts * self.fp8_row_parallel_size
+        self.fp8_padding = Fp8Padding(num_compute_gemms)
+        self.fp8_unpadding = Fp8Unpadding(num_compute_gemms)
 
         self.token_dispatcher = None
         self.ep_mesh = None
         self.moe_mesh = None
         self.ep_rank = 0
+
+    def _make_grouped_linears(self, num_local_experts: int, device: torch.device | str) -> None:
+        from transformer_engine.pytorch import GroupedLinear
+
+        num_compute_gemms = num_local_experts * self.fp8_row_parallel_size
+        gate_up_out_features = self.partition_inter_dim * (2 if self.is_gated else 1)
+        self.gate_up_linear = GroupedLinear(
+            num_gemms=num_compute_gemms,
+            in_features=self.config.expert_dim,
+            out_features=gate_up_out_features,
+            bias=self.expert_bias,
+            params_dtype=self.config.dtype,
+            device=device,
+        )
+        self.down_linear = GroupedLinear(
+            num_gemms=num_compute_gemms,
+            in_features=self.partition_inter_dim,
+            out_features=self.config.expert_dim,
+            bias=self.expert_bias,
+            params_dtype=self.config.dtype,
+            device=device,
+        )
 
     def _get_stacked_weight(self, linear: "GroupedLinear", transpose: bool = False) -> torch.Tensor:
         weights = []
@@ -1043,9 +1077,53 @@ class GroupedExpertsTE(nn.Module):
     def set_moe_mesh(self, moe_mesh: Optional[DeviceMesh]) -> None:
         self.moe_mesh = self._normalize_moe_mesh(moe_mesh)
 
+    def _unpack_gate_up_weight(self, weight: torch.Tensor) -> torch.Tensor:
+        """Convert ``[expert, virtual_tp, dim, local_out]`` to checkpoint layout."""
+        weight = weight.view(
+            self.num_local_experts,
+            self.fp8_row_parallel_size,
+            self.config.expert_dim,
+            -1,
+        )
+        if not self.is_gated:
+            return weight.permute(0, 2, 1, 3).flatten(2)
+        gate, up = weight.chunk(2, dim=-1)
+        gate = gate.permute(0, 2, 1, 3).flatten(2)
+        up = up.permute(0, 2, 1, 3).flatten(2)
+        return torch.cat((gate, up), dim=-1)
+
+    def _pack_gate_up_weight(self, weight: torch.Tensor) -> torch.Tensor:
+        """Convert checkpoint layout to expert-major virtual-TP GEMMs."""
+        if not self.is_gated:
+            return (
+                weight.view(
+                    self.num_local_experts,
+                    self.config.expert_dim,
+                    self.fp8_row_parallel_size,
+                    self.partition_inter_dim,
+                )
+                .permute(0, 2, 1, 3)
+                .flatten(0, 1)
+            )
+        gate, up = weight.split(self.moe_inter_dim, dim=-1)
+        gate = gate.view(
+            self.num_local_experts,
+            self.config.expert_dim,
+            self.fp8_row_parallel_size,
+            self.partition_inter_dim,
+        ).permute(0, 2, 1, 3)
+        up = up.view(
+            self.num_local_experts,
+            self.config.expert_dim,
+            self.fp8_row_parallel_size,
+            self.partition_inter_dim,
+        ).permute(0, 2, 1, 3)
+        return torch.cat((gate, up), dim=-1).flatten(0, 1)
+
     @property
     def gate_and_up_projs(self) -> torch.Tensor:
-        tensor = self._to_ep_dtensor(self._get_stacked_weight(self.gate_up_linear, transpose=True))
+        tensor = self._get_stacked_weight(self.gate_up_linear, transpose=True)
+        tensor = self._to_ep_dtensor(self._unpack_gate_up_weight(tensor))
         return tensor
 
     @gate_and_up_projs.setter
@@ -1054,12 +1132,23 @@ class GroupedExpertsTE(nn.Module):
             return
         if isinstance(value, DTensor):
             value = value.to_local()
-        self._set_stacked_weight(self.gate_up_linear, value, transpose=True)
+        self._set_stacked_weight(
+            self.gate_up_linear,
+            self._pack_gate_up_weight(value),
+            transpose=True,
+        )
         self._weights_loaded_from_checkpoint = True
 
     @property
     def down_projs(self) -> torch.Tensor:
-        return self._to_ep_dtensor(self._get_stacked_weight(self.down_linear, transpose=True))
+        tensor = self._get_stacked_weight(self.down_linear, transpose=True)
+        tensor = tensor.view(
+            self.num_local_experts,
+            self.fp8_row_parallel_size,
+            self.partition_inter_dim,
+            self.config.expert_dim,
+        ).flatten(1, 2)
+        return self._to_ep_dtensor(tensor)
 
     @down_projs.setter
     def down_projs(self, value: Optional[torch.Tensor]) -> None:
@@ -1067,7 +1156,13 @@ class GroupedExpertsTE(nn.Module):
             return
         if isinstance(value, DTensor):
             value = value.to_local()
-        self._set_stacked_weight(self.down_linear, value, transpose=True)
+        packed = value.view(
+            self.num_local_experts,
+            self.fp8_row_parallel_size,
+            self.partition_inter_dim,
+            self.config.expert_dim,
+        ).flatten(0, 1)
+        self._set_stacked_weight(self.down_linear, packed, transpose=True)
         self._weights_loaded_from_checkpoint = True
 
     @property
@@ -1165,7 +1260,11 @@ class GroupedExpertsTE(nn.Module):
             gate_up_weight = state_dict[gate_up_key]
             if isinstance(gate_up_weight, DTensor):
                 gate_up_weight = gate_up_weight.to_local()
-            self._set_stacked_weight(self.gate_up_linear, gate_up_weight, transpose=True)
+            self._set_stacked_weight(
+                self.gate_up_linear,
+                self._pack_gate_up_weight(gate_up_weight),
+                transpose=True,
+            )
             self._weights_loaded_from_checkpoint = True
         else:
             missing_keys.append(gate_up_key)
@@ -1174,7 +1273,17 @@ class GroupedExpertsTE(nn.Module):
             down_weight = state_dict[down_key]
             if isinstance(down_weight, DTensor):
                 down_weight = down_weight.to_local()
-            self._set_stacked_weight(self.down_linear, down_weight, transpose=True)
+            packed_down_weight = down_weight.view(
+                self.num_local_experts,
+                self.fp8_row_parallel_size,
+                self.partition_inter_dim,
+                self.config.expert_dim,
+            ).flatten(0, 1)
+            self._set_stacked_weight(
+                self.down_linear,
+                packed_down_weight,
+                transpose=True,
+            )
             self._weights_loaded_from_checkpoint = True
         else:
             missing_keys.append(down_key)
@@ -1208,8 +1317,6 @@ class GroupedExpertsTE(nn.Module):
         Args:
             ep_mesh: Device mesh for expert parallelism.
         """
-        from transformer_engine.pytorch import GroupedLinear
-
         from nemo_automodel.components.models.common.utils import _patch_te_modules
 
         _patch_te_modules()
@@ -1223,27 +1330,7 @@ class GroupedExpertsTE(nn.Module):
             f"n_routed_experts ({self.config.n_routed_experts}) must be divisible by ep_size ({self.ep_size})"
         )
         self.num_local_experts = self.config.n_routed_experts // self.ep_size
-
-        gate_up_out_features = self.config.moe_inter_dim * 2 if self.is_gated else self.config.moe_inter_dim
-
-        self.gate_up_linear = GroupedLinear(
-            num_gemms=self.num_local_experts,
-            in_features=self.config.expert_dim,
-            out_features=gate_up_out_features,
-            bias=self.expert_bias,
-            params_dtype=self.config.dtype,
-            device="meta",
-        )
-
-        # down_linear: [moe_inter_dim] -> [dim]
-        self.down_linear = GroupedLinear(
-            num_gemms=self.num_local_experts,
-            in_features=self.config.moe_inter_dim,
-            out_features=self.config.expert_dim,
-            bias=self.expert_bias,
-            params_dtype=self.config.dtype,
-            device="meta",
-        )
+        self._make_grouped_linears(self.num_local_experts, device="meta")
 
         token_dispatcher_config = TokenDispatcherConfig(
             moe_router_topk=self.config.n_activated_experts,
@@ -1267,11 +1354,77 @@ class GroupedExpertsTE(nn.Module):
             ep_group=ep_mesh.get_group(),
         )
 
-        # Re-create FP8 padding/unpadding with num_local_experts for EP
+        # Re-create FP8 padding/unpadding for expert x virtual-TP GEMMs.
         from transformer_engine.pytorch import Fp8Padding, Fp8Unpadding
 
-        self.fp8_padding = Fp8Padding(self.num_local_experts)
-        self.fp8_unpadding = Fp8Unpadding(self.num_local_experts)
+        num_compute_gemms = self.num_local_experts * self.fp8_row_parallel_size
+        self.fp8_padding = Fp8Padding(num_compute_gemms)
+        self.fp8_unpadding = Fp8Unpadding(num_compute_gemms)
+
+    def _expand_virtual_tp_segments(
+        self,
+        tensor: torch.Tensor,
+        m_splits: list[int],
+    ) -> tuple[torch.Tensor, list[int]]:
+        if self.fp8_row_parallel_size == 1:
+            return tensor, m_splits
+        segments = tensor.split(m_splits, dim=0)
+        expanded = torch.cat(
+            [segment for segment in segments for _ in range(self.fp8_row_parallel_size)],
+            dim=0,
+        )
+        expanded_splits = [size for size in m_splits for _ in range(self.fp8_row_parallel_size)]
+        return expanded, expanded_splits
+
+    def _restore_virtual_tp_partials(
+        self,
+        tensor: torch.Tensor,
+        m_splits: list[int],
+    ) -> torch.Tensor:
+        """Return expert-token rows with an explicit virtual-TP axis."""
+        if self.fp8_row_parallel_size == 1:
+            return tensor
+        segments = tensor.split(m_splits, dim=0)
+        expert_partials = []
+        for expert_idx in range(self.num_local_experts):
+            start = expert_idx * self.fp8_row_parallel_size
+            expert_partials.append(
+                torch.stack(
+                    segments[start : start + self.fp8_row_parallel_size],
+                    dim=1,
+                )
+            )
+        return torch.cat(expert_partials, dim=0)
+
+    def _hybridep_partition_pack(self) -> int:
+        """Choose a conservative packed width for multinode HybridEP.
+
+        Its combine kernel holds four staged token buffers in shared memory.
+        Keeping the packed hidden width at or below 8192 fits the H100 kernel
+        even with multinode metadata, while grouping two DSV4 4096-wide
+        virtual-TP partials halves the number of combine launches.
+        """
+        max_pack = max(1, 8192 // self.config.expert_dim)
+        pack = min(self.fp8_row_parallel_size, max_pack)
+        while self.fp8_row_parallel_size % pack:
+            pack -= 1
+        return pack
+
+    def _unpermute_virtual_tp_partials(self, tensor: torch.Tensor) -> torch.Tensor:
+        """EP-combine virtual-TP partials while retaining their TP axis."""
+        if self.fp8_row_parallel_size == 1:
+            return self.token_dispatcher.token_unpermutation(tensor)
+        if self.dispatcher_backend == "hybridep":
+            pack = self._hybridep_partition_pack()
+            grouped = tensor.reshape(
+                tensor.shape[0],
+                self.fp8_row_parallel_size // pack,
+                pack * self.config.expert_dim,
+            )
+            grouped = self.token_dispatcher.token_unpermutation_partitions(grouped)
+            return grouped.reshape(-1, self.fp8_row_parallel_size, self.config.expert_dim)
+        tensor = self.token_dispatcher.token_unpermutation(tensor.flatten(1, 2))
+        return tensor.view(-1, self.fp8_row_parallel_size, self.config.expert_dim)
 
     def forward(
         self,
@@ -1299,32 +1452,66 @@ class GroupedExpertsTE(nn.Module):
 
         indices = indices.masked_fill(~token_mask.unsqueeze(-1), -1)
 
+        from transformer_engine.pytorch.quantization import FP8GlobalStateManager
+
+        fp8_active = FP8GlobalStateManager.is_fp8_enabled()
+        dispatch_hidden_states = x
+        dispatch_pack = self.fp8_row_parallel_size
+        if self.dispatcher_backend == "hybridep":
+            dispatch_pack = self._hybridep_partition_pack()
+        if dispatch_pack > 1:
+            # DeepEP combines all virtual-TP partials in one packed call.
+            # HybridEP uses a bounded pack so its multinode kernel stays below
+            # the device shared-memory limit.
+            dispatch_hidden_states = (
+                x.unsqueeze(1).expand(-1, dispatch_pack, -1).reshape(x.shape[0], -1).contiguous()
+            )
+
         (permuted_local_hidden_states, tokens_per_expert, permuted_probs) = self.token_dispatcher.token_permutation2(
-            hidden_states=x,
+            hidden_states=dispatch_hidden_states,
             num_local_tokens=x.size(0),
             token_probs=weights,
             token_indices=indices,
         )
+        if dispatch_pack > 1:
+            permuted_local_hidden_states = permuted_local_hidden_states.view(
+                -1,
+                dispatch_pack,
+                self.config.expert_dim,
+            )[:, 0].contiguous()
         permuted_probs = permuted_probs.unsqueeze(-1)
 
         if isinstance(tokens_per_expert, torch.Tensor):
             m_splits = tokens_per_expert.tolist()
         else:
             m_splits = list(tokens_per_expert)
+        permuted_local_hidden_states, compute_m_splits = self._expand_virtual_tp_segments(
+            permuted_local_hidden_states,
+            m_splits,
+        )
+        permuted_probs, _ = self._expand_virtual_tp_segments(
+            permuted_probs,
+            m_splits,
+        )
 
-        from transformer_engine.pytorch.quantization import FP8GlobalStateManager
-
-        fp8_active = FP8GlobalStateManager.is_fp8_enabled()
-        actual_m_splits = None
+        actual_m_splits = compute_m_splits
         if fp8_active:
-            actual_m_splits = m_splits
-            permuted_local_hidden_states, m_splits = self.fp8_padding(permuted_local_hidden_states, m_splits)
+            permuted_local_hidden_states, compute_m_splits = self.fp8_padding(
+                permuted_local_hidden_states,
+                actual_m_splits,
+            )
             permuted_probs, _ = self.fp8_padding(permuted_probs, actual_m_splits)
 
-        if sum(m_splits) > 0:
-            output1 = self.gate_up_linear(permuted_local_hidden_states, m_splits)
-            output1 = self.expert_activation(output1, permuted_probs)
-            output2 = self.down_linear(output1, m_splits)
+        if sum(compute_m_splits) > 0:
+            output1 = self.gate_up_linear(
+                permuted_local_hidden_states,
+                compute_m_splits,
+            )
+            if fp8_active and self.vllm_fp8_moe_semantics:
+                output1 = swiglu_clamped_vllm_fp8(output1, self.config.swiglu_limit)
+            else:
+                output1 = self.expert_activation(output1, permuted_probs)
+            output2 = self.down_linear(output1, compute_m_splits)
             # The down-projection bias must be weighted by the per-token routing probability
             # (permuted_probs), matching GroupedExperts ("expert_out + down_bias * w") and
             # GroupedExpertsDeepEP ("_apply_bias(output2, down_bias, ..., permuted_probs)").
@@ -1332,11 +1519,14 @@ class GroupedExpertsTE(nn.Module):
             # top-k expert contributions carries a full prob-independent bias that is then
             # summed in the combine step, producing a large systematic offset (e.g. gpt-oss-20b
             # step-0 loss ~8.2 vs the correct ~4.5). Add the missing (prob - 1) * down_bias term
-            # so the net down-bias contribution becomes prob * down_bias.
-            if self.expert_bias:
+            # so the net down-bias contribution becomes prob * down_bias. The vLLM path above
+            # weights the full down output, including bias, and needs no correction.
+            if fp8_active and self.vllm_fp8_moe_semantics:
+                output2 = apply_vllm_moe_routing_weights(output2, permuted_probs)
+            elif self.expert_bias:
                 down_bias = self._get_stacked_bias(self.down_linear)
                 if down_bias is not None:
-                    splits_t = torch.as_tensor(m_splits, device=output2.device)
+                    splits_t = torch.as_tensor(compute_m_splits, device=output2.device)
                     output2 = _apply_bias(output2, down_bias, splits_t, permuted_probs - 1.0)
         else:
             # Handle edge case: no tokens routed to local experts
@@ -1354,9 +1544,22 @@ class GroupedExpertsTE(nn.Module):
                 else:
                     return tensor
 
-            output1 = torch.matmul(x[0] * 0, to_local(self.gate_up_linear.weight0).T)
-            output1_ = self.expert_activation(output1, permuted_probs)
-            output2 = torch.matmul(output1_, to_local(self.down_linear.weight0).T)
+            # FSDP can keep the TE master parameters in FP32 while the model
+            # activations are BF16.  The normal GroupedLinear path performs
+            # that compute-dtype conversion internally, but this fallback
+            # bypasses GroupedLinear and therefore has to mirror it explicitly.
+            gate_up_weight0 = to_local(self.gate_up_linear.weight0).to(dtype=x.dtype)
+            # Keep the dispatcher's empty leading dimension.  Returning a
+            # single dummy row breaks TE moe_unpermute, whose row-id map is
+            # defined for an empty ``[0, hidden]`` expert output on this rank.
+            # Empty matmuls still retain an autograd edge to the parameters.
+            output1 = torch.matmul(permuted_local_hidden_states, gate_up_weight0.T)
+            if fp8_active and self.vllm_fp8_moe_semantics:
+                output1_ = swiglu_clamped_vllm_fp8(output1, self.config.swiglu_limit)
+            else:
+                output1_ = self.expert_activation(output1, permuted_probs)
+            down_weight0 = to_local(self.down_linear.weight0).to(dtype=output1_.dtype)
+            output2 = torch.matmul(output1_, down_weight0.T)
             all_expert_dependency = output2.new_zeros(())
             for grouped_linear in (self.gate_up_linear, self.down_linear):
                 for parameter in grouped_linear.parameters():
@@ -1367,11 +1570,10 @@ class GroupedExpertsTE(nn.Module):
                         )
             output2 = output2 + all_expert_dependency
 
-        if fp8_active and actual_m_splits is not None:
+        if fp8_active:
             output2 = self.fp8_unpadding(output2, actual_m_splits)
-
-        y = self.token_dispatcher.token_unpermutation(output2)
-        return y
+        output2 = self._restore_virtual_tp_partials(output2, actual_m_splits)
+        return self._unpermute_virtual_tp_partials(output2)
 
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
         """Initialize weights using reset_parameters()"""

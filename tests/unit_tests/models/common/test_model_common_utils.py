@@ -23,6 +23,9 @@ from torch import nn
 from nemo_automodel.components.models.common.utils import (
     BackendConfig,
     TEFp8Config,
+    _pad_te_fp8_linear_input,
+    _restore_te_fp8_linear_output,
+    _te_module_autocast,
     compute_lm_head_logits,
     get_is_first_microbatch,
     get_is_optim_step,
@@ -140,6 +143,61 @@ class TestIsFirstMicrobatch:
 
 
 class TestTEFp8Config:
+    def test_te_fp8_linear_padding_round_trip_and_gradient(self):
+        inp = torch.randn(1, 57, 16, requires_grad=True)
+
+        padded, state = _pad_te_fp8_linear_input(inp, fp8_enabled=True)
+        assert padded.shape == (64, 16)
+        output = padded @ torch.randn(16, 32)
+        restored = _restore_te_fp8_linear_output(output, state)
+
+        assert restored.shape == (1, 57, 32)
+        torch.testing.assert_close(restored, output[:57].reshape(1, 57, 32))
+        restored.sum().backward()
+        assert inp.grad is not None
+        assert torch.isfinite(inp.grad).all()
+
+    def test_te_fp8_linear_padding_is_noop_for_aligned_or_disabled_input(self):
+        aligned = torch.randn(2, 8, 16)
+        padded, state = _pad_te_fp8_linear_input(aligned, fp8_enabled=True)
+        assert padded is aligned
+        assert state is None
+
+        eight_aligned = torch.randn(1, 8, 16)
+        padded, state = _pad_te_fp8_linear_input(eight_aligned, fp8_enabled=True)
+        assert padded.shape == (16, 16)
+        assert state == ((1, 8), 8)
+
+        unaligned = torch.randn(1, 57, 16)
+        padded, state = _pad_te_fp8_linear_input(unaligned, fp8_enabled=False)
+        assert padded is unaligned
+        assert state is None
+
+    def test_te_module_autocast_is_local_to_mismatched_cuda_gemm(self):
+        module = nn.Linear(4, 4, bias=False, dtype=torch.float32)
+        inp = SimpleNamespace(is_cuda=True, dtype=torch.bfloat16)
+        sentinel = object()
+
+        with (
+            patch("nemo_automodel.components.models.common.utils.torch.is_autocast_enabled", return_value=False),
+            patch(
+                "nemo_automodel.components.models.common.utils.torch.autocast",
+                return_value=sentinel,
+            ) as autocast,
+        ):
+            assert _te_module_autocast(module, inp) is sentinel
+
+        autocast.assert_called_once_with(device_type="cuda", dtype=torch.bfloat16)
+
+    def test_te_module_autocast_skips_matching_parameters(self):
+        module = nn.Linear(4, 4, bias=False, dtype=torch.bfloat16)
+        inp = SimpleNamespace(is_cuda=True, dtype=torch.bfloat16)
+
+        with patch("nemo_automodel.components.models.common.utils.torch.autocast") as autocast:
+            assert isinstance(_te_module_autocast(module, inp), nullcontext)
+
+        autocast.assert_not_called()
+
     def test_default_recipe(self):
         cfg = TEFp8Config()
         assert cfg.recipe == "current"

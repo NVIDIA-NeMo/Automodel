@@ -33,6 +33,7 @@ from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.deepseek_v4 import fsdp as dsv4_fsdp
 from nemo_automodel.components.models.deepseek_v4 import model as dsv4_model_module
 from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
+from nemo_automodel.components.models.deepseek_v4.layers import DeepseekV4RotaryEmbedding
 from nemo_automodel.components.models.deepseek_v4.model import DeepseekV4ForCausalLM
 
 # ``MoE.forward`` (in ``nemo_automodel/components/moe/layers.py``)
@@ -142,6 +143,31 @@ def test_config_preserves_fp32_dtype_through_serialization_round_trip():
 
 
 class TestDeepseekV4ModelSmoke:
+    def test_main_rope_uses_vllm_yarn_parameters(self):
+        cfg = _tiny_config(num_hidden_layers=1, compress_ratios=[0])
+        model = _make_model(cfg)
+        expected = DeepseekV4RotaryEmbedding(
+            rope_theta=float(cfg.rope_theta),
+            head_dim=int(cfg.head_dim),
+            partial_rotary_factor=float(cfg.qk_rope_head_dim) / float(cfg.head_dim),
+            rope_scaling=cfg.rope_scaling,
+        )
+        plain = DeepseekV4RotaryEmbedding(
+            rope_theta=float(cfg.rope_theta),
+            head_dim=int(cfg.head_dim),
+            partial_rotary_factor=float(cfg.qk_rope_head_dim) / float(cfg.head_dim),
+            rope_scaling=None,
+        )
+
+        torch.testing.assert_close(model.model.rotary_emb.inv_freq, expected.inv_freq)
+        assert torch.count_nonzero(model.model.rotary_emb.inv_freq != plain.inv_freq) > 0
+
+    def test_dsv4_enables_vllm_fp8_moe_semantics_by_default(self):
+        model = _make_model(_tiny_config(num_hidden_layers=1, compress_ratios=[0]))
+
+        assert model.model.moe_config.vllm_fp8_moe_semantics is True
+        assert model.model.layers["0"].mlp.shared_experts.vllm_fp8_semantics is True
+
     def test_dsv4_hca_param_sync_group_uses_only_1d_mesh(self):
         named_hca_group = object()
         unnamed_hca_group = object()
@@ -217,6 +243,7 @@ class TestDeepseekV4ModelSmoke:
             param_dtype=torch.bfloat16,
             reduce_dtype=torch.float32,
             output_dtype=torch.bfloat16,
+            cast_forward_inputs=True,
         )
 
         dsv4_fsdp.fully_shard_deepseek_v4(
@@ -310,6 +337,7 @@ class TestDeepseekV4ModelSmoke:
             param_dtype=torch.bfloat16,
             reduce_dtype=torch.float32,
             output_dtype=torch.bfloat16,
+            cast_forward_inputs=True,
         )
         ignored_expert_params = set(block.mlp.experts.parameters())
 
@@ -338,6 +366,9 @@ class TestDeepseekV4ModelSmoke:
         for name in expected_fp32_modules:
             assert calls_by_name[name]["mp_policy"].param_dtype == torch.float32
             assert calls_by_name[name]["mp_policy"].reduce_dtype == torch.float32
+        assert calls_by_name["attn_hc"]["mp_policy"].cast_forward_inputs is False
+        assert calls_by_name["ffn_hc"]["mp_policy"].cast_forward_inputs is False
+        assert calls_by_name["self_attn.sinks_param"]["mp_policy"].cast_forward_inputs is True
 
         parent_ignored = calls_by_name["<block>"]["ignored_params"]
         assert ignored_expert_params.issubset(parent_ignored)
@@ -348,6 +379,38 @@ class TestDeepseekV4ModelSmoke:
         kwargs = {"reshard_after_forward": False, "mesh": object()}
 
         assert dsv4_fsdp._fp32_module_fsdp_kwargs(holder_type(), kwargs) is kwargs
+
+    def test_dsv4_fsdp_wraps_true_fp8_storage_dtype_island(self, monkeypatch):
+        class DeepseekV4Block(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.master = torch.nn.Linear(4, 4, bias=False, dtype=torch.float32)
+                self.master_2 = torch.nn.Linear(4, 4, bias=False, dtype=torch.float32)
+                self.te_projection = torch.nn.Linear(4, 4, bias=False, dtype=torch.bfloat16)
+
+        block = DeepseekV4Block()
+        calls = []
+
+        def fake_fully_shard(module, **kwargs):
+            calls.append((module, kwargs))
+            return module
+
+        monkeypatch.setattr(dsv4_fsdp, "fully_shard", fake_fully_shard)
+        policy = MixedPrecisionPolicy(
+            param_dtype=torch.bfloat16,
+            reduce_dtype=torch.float32,
+            output_dtype=torch.bfloat16,
+        )
+
+        dsv4_fsdp.fully_shard_deepseek_v4(
+            block,
+            mesh=object(),
+            mp_policy=policy,
+            offload_policy=object(),
+        )
+
+        assert [module for module, _kwargs in calls] == [block.te_projection, block]
+        assert calls[0][1]["mp_policy"].param_dtype == torch.bfloat16
 
     def test_reference_fp32_parameters_constructed_before_cast(self):
         cfg = _tiny_config(
@@ -540,8 +603,12 @@ class TestDeepseekV4ModelSmoke:
         assert gate.tid2eid.dtype == torch.int64
 
         gate.set_input_ids(torch.tensor([[1, 2, 3]]))
-        _, indices, _ = gate(torch.zeros(3, cfg.hidden_size), torch.ones(3, dtype=torch.bool))
+        weights, indices, _ = gate(
+            torch.zeros(3, cfg.hidden_size, dtype=torch.bfloat16),
+            torch.ones(3, dtype=torch.bool),
+        )
         assert indices.dtype == torch.long
+        assert weights.dtype == torch.float32
 
     def test_initialize_weights_builds_valid_hash_routes(self):
         cfg = _tiny_config(num_hidden_layers=1, num_hash_layers=1, compress_ratios=[0])
@@ -582,12 +649,17 @@ class TestDeepseekV4ModelSmoke:
             def __init__(self, comb):
                 super().__init__()
                 self.register_buffer("comb", comb)
+                self.kernel_backend = "torch"
 
-            def forward(self, hidden_streams):
+            def forward(self, hidden_streams, *, collapse=False):
                 bsz, seq, hc_mult = hidden_streams.shape[:3]
                 pre = torch.zeros(bsz, seq, hc_mult, dtype=torch.float32, device=hidden_streams.device)
                 post = torch.zeros_like(pre)
-                return pre, post, self.comb.expand(bsz, seq, -1, -1)
+                comb = self.comb.expand(bsz, seq, -1, -1)
+                if collapse:
+                    collapsed = (pre.unsqueeze(-1) * hidden_streams).sum(dim=-2)
+                    return collapsed, post, comb
+                return pre, post, comb
 
         class _ZeroAttention(torch.nn.Module):
             def forward(self, hidden_states, **kwargs):

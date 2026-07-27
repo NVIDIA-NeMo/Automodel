@@ -350,6 +350,7 @@ class _HybridEPManager(_DispatchManager):
         self.permute_fusion = permute_fusion
         self.moe_hybridep_num_sms = moe_hybridep_num_sms
         self.num_permuted_tokens = None
+        self.num_unpadded_tokens = None
 
         # Metadata
         self.token_probs: Optional[torch.Tensor] = None
@@ -405,6 +406,41 @@ class _HybridEPManager(_DispatchManager):
         async_finish: bool = True,  # noqa: ARG002 - not supported by HybridEP backend
         allocate_on_comm_stream: bool = True,  # noqa: ARG002 - not supported by HybridEP backend
     ) -> torch.Tensor:
+        # HybridEP gathers the dense routing map with
+        # ``all_gather_into_tensor``. Unlike DeepEP's index-based metadata path,
+        # that collective requires every EP rank to contribute the same number
+        # of rows. Packed RL/SFT microbatches can contain a different number of
+        # real tokens on each rank, so pad the private dispatcher inputs to the
+        # group maximum and remove those rows after combine. The zero routing
+        # rows are sent to no expert and therefore do not change model results.
+        self.num_unpadded_tokens = hidden_states.shape[0]
+        max_tokens = torch.tensor(
+            self.num_unpadded_tokens,
+            dtype=torch.int64,
+            device=hidden_states.device,
+        )
+        torch.distributed.all_reduce(max_tokens, op=torch.distributed.ReduceOp.MAX, group=self.group)
+        num_padding_tokens = int(max_tokens.item()) - self.num_unpadded_tokens
+        if num_padding_tokens:
+            hidden_states = torch.cat(
+                (hidden_states, hidden_states.new_zeros((num_padding_tokens, hidden_states.shape[1]))),
+                dim=0,
+            )
+            self.routing_map = torch.cat(
+                (
+                    self.routing_map,
+                    self.routing_map.new_zeros((num_padding_tokens, self.routing_map.shape[1])),
+                ),
+                dim=0,
+            )
+            self.token_probs = torch.cat(
+                (
+                    self.token_probs,
+                    self.token_probs.new_zeros((num_padding_tokens, self.token_probs.shape[1])),
+                ),
+                dim=0,
+            )
+
         # Reset num_permuted_tokens to None to avoid reusing cached state from a prior dispatch.
         # This can happen in non-reentrant activation checkpointing mode.
         self.num_permuted_tokens = None
@@ -439,9 +475,48 @@ class _HybridEPManager(_DispatchManager):
             num_permuted_tokens=self.num_permuted_tokens,
             pad_multiple=self.pad_multiple,
         )
+        hidden_states = hidden_states[: self.num_unpadded_tokens]
         self.handle = None
         self.num_permuted_tokens = None
+        self.num_unpadded_tokens = None
         return hidden_states
+
+    def combine_partitions(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Combine virtual-TP partials without widening the HybridEP token.
+
+        HybridEP records the dispatched hidden width in its handle, and its
+        multinode combine kernel keeps several full-width pipeline stages in
+        shared memory. Packing all virtual-TP partials into that width (for
+        example, TP8 * 4096 = 32768 for DSV4) cannot fit on H100. The routing
+        handle is read-only during combine, so reuse it for bounded groups of
+        partials and preserve the vLLM ordering: EP combine per TP partial,
+        then TP reduce.
+        """
+        if hidden_states.ndim != 3:
+            raise ValueError(
+                "HybridEP partitioned combine expects [tokens, partitions, hidden], "
+                f"got shape={tuple(hidden_states.shape)}"
+            )
+        handle = self.handle
+        if handle is None:
+            raise RuntimeError("HybridEP partitioned combine requires an active dispatch handle")
+
+        combined_partitions = [
+            hybrid_ep_combine(
+                x=hidden_states[:, partition_idx, :].contiguous(),
+                handle=handle,
+                num_permuted_tokens=self.num_permuted_tokens,
+                pad_multiple=self.pad_multiple,
+            )
+            for partition_idx in range(hidden_states.shape[1])
+        ]
+        combined_partitions = [
+            combined_partition[: self.num_unpadded_tokens] for combined_partition in combined_partitions
+        ]
+        self.handle = None
+        self.num_permuted_tokens = None
+        self.num_unpadded_tokens = None
+        return torch.stack(combined_partitions, dim=1)
 
     def get_dispatched_metadata(self) -> torch.Tensor:
         return None, self.dispatched_probs
@@ -800,4 +875,18 @@ class MoEFlexTokenDispatcher:
         hidden_states = self.combine_all_to_all(hidden_states, False, False)
         hidden_states = self.combine_postprocess(hidden_states)
 
+        return hidden_states
+
+    def token_unpermutation_partitions(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Restore separately-combined virtual-TP partials for HybridEP."""
+        if not isinstance(self._comm_manager, _HybridEPManager):
+            raise RuntimeError("Partitioned token unpermutation is only supported by HybridEP")
+        hidden_states = self.combine_preprocess(hidden_states)
+        hidden_states = self._comm_manager.combine_partitions(hidden_states)
+        expected_tokens = self.hidden_shape[0]
+        if hidden_states.shape[0] != expected_tokens:
+            raise RuntimeError(
+                "HybridEP partitioned combine restored an unexpected token count: "
+                f"got {hidden_states.shape[0]}, expected {expected_tokens}"
+            )
         return hidden_states

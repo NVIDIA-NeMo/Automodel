@@ -456,7 +456,10 @@ class HybridEPDispatch(torch.autograd.Function):
         """Backward pass of fused dispatch of the HybridEP backend."""
         handle = ctx.handle
         combined_hidden, combined_probs = _hybrid_ep_buffer.combine_with_unpermute(
-            hidden=grad_x, probs=grad_probs, handle=handle, pad_multiple=ctx.pad_multiple
+            hidden=grad_x.contiguous(),
+            probs=grad_probs.contiguous() if grad_probs is not None else None,
+            handle=handle,
+            pad_multiple=ctx.pad_multiple,
         )
         return combined_hidden, None, combined_probs, None, None, None, None, None, None
 
@@ -480,7 +483,10 @@ class HybridEPCombine(torch.autograd.Function):
         """Backward pass of fused combine of the HybridEP backend."""
         handle = ctx.handle
         dispatched_hidden, _, _, _, _ = _hybrid_ep_buffer.dispatch_with_permute(
-            hidden=grad_x,
+            # ``torch.stack``-based partitioned combines produce strided
+            # gradient views. HybridEP's C++ entrypoint requires contiguous
+            # token rows in both directions.
+            hidden=grad_x.contiguous(),
             scaling_factor=None,
             handle=handle,
             pad_multiple=ctx.pad_multiple,

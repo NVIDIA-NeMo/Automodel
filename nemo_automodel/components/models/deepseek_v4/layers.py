@@ -64,18 +64,30 @@ from torch.distributed.tensor import DTensor
 
 from nemo_automodel.components.models.common import (
     BackendConfig,
+    initialize_linear_module,
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
 from nemo_automodel.components.models.deepseek_v4.cp import (
     dsv4_cp_all_gather,
+    dsv4_cp_all_gather_fp8,
     dsv4_cp_all_gather_metadata,
     dsv4_cp_enabled,
     dsv4_cp_rank,
     dsv4_cp_size,
 )
+from nemo_automodel.components.models.deepseek_v4.fp8 import (
+    cat_dsv4_fp8_kv,
+    quantize_dsv4_indexer,
+    quantize_dsv4_kv,
+)
+from nemo_automodel.components.models.deepseek_v4.kernels.tilelang_hyperconnection import (
+    exact_mhc_post,
+    exact_mhc_prepare,
+)
 from nemo_automodel.components.models.deepseek_v4.optimized_kernels import (
     build_dsv4_sparse_topk_indices,
+    dsv4_fp8_sparse_attention,
     dsv4_indexer_scores,
     dsv4_sinkhorn_normalize,
     dsv4_sparse_attention,
@@ -174,6 +186,35 @@ def _apply_partial_rope_interleaved(
     return out
 
 
+def _apply_q_head_norm_rope(
+    q: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    rope_head_dim: int,
+    eps: float,
+    *,
+    use_tilelang: bool = False,
+) -> torch.Tensor:
+    """Apply DSV4 per-head Q RMSNorm and interleaved RoPE with one final cast.
+
+    vLLM's fused DSV4 Q/K-cache kernel loads the BF16 projection into FP32,
+    performs both the unweighted per-head RMSNorm and RoPE in FP32, and casts
+    back to BF16 only when it stores the final post-RoPE Q.  Materializing the
+    normalized Q in BF16 before RoPE changes the attention probabilities even
+    when the projection and KV inputs are bitwise identical.
+    """
+    if use_tilelang:
+        from nemo_automodel.components.models.deepseek_v4.kernels.tilelang_q_head_norm_rope import (
+            q_head_norm_rope_interface,
+        )
+
+        return q_head_norm_rope_interface(q, cos, sin, rope_head_dim, eps)
+
+    output_dtype = q.dtype
+    q = _rms_norm_last_dim(q.float(), eps)
+    return _apply_partial_rope_interleaved(q, cos, sin, rope_head_dim).to(output_dtype)
+
+
 def apply_rotary_pos_emb(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -221,6 +262,41 @@ def _yarn_linear_ramp(min_v: float, max_v: float, dim: int, device=None) -> torc
     return torch.clamp(linear, 0, 1)
 
 
+class DeepseekV4PositionEmbeddings:
+    """Pytree-opaque FP32 ``(cos, sin)`` holder for DSV4 RoPE.
+
+    FSDP2 mixed precision recursively casts every tensor in ordinary tuples
+    passed to a fully-sharded decoder block.  vLLM's fused DSV4 Q/K kernel,
+    however, reads an FP32 RoPE cache; letting FSDP round this pair to BF16
+    creates the first attention-boundary divergence even when Q and K are
+    otherwise bitwise identical.
+
+    A regular user class is a leaf to ``torch.utils._pytree``, so FSDP passes
+    this holder through unchanged.  It remains tuple-like for existing DSV4
+    call sites that unpack ``cos, sin = position_embeddings``.
+    """
+
+    __slots__ = ("cos", "sin")
+
+    def __init__(self, cos: torch.Tensor, sin: torch.Tensor):
+        self.cos = cos
+        self.sin = sin
+
+    def __iter__(self):
+        yield self.cos
+        yield self.sin
+
+    def __len__(self) -> int:
+        return 2
+
+    def __getitem__(self, index: int) -> torch.Tensor:
+        if index in (0, -2):
+            return self.cos
+        if index in (1, -1):
+            return self.sin
+        raise IndexError(index)
+
+
 class DeepseekV4RotaryEmbedding(nn.Module):
     """V4 rotary embedding.  Produces ``(cos, sin)`` sized to ``qk_rope_head_dim``
     (via ``partial_rotary_factor = qk_rope_head_dim / head_dim``), matching HF.
@@ -230,10 +306,9 @@ class DeepseekV4RotaryEmbedding(nn.Module):
     "beta_fast": ..., "beta_slow": ...}``), modify ``inv_freq`` per
     ``dsv4flash/inference/model.py:precompute_freqs_cis`` — frequency
     interpolation with a smooth linear ramp between beta_fast/beta_slow
-    correction dims.  Used by the compress-rope (theta=160000) on layers
-    with ``compress_ratio > 0``.  The main rope (theta=10000, used only on
-    sliding-window layers) gets ``rope_scaling=None`` because the reference
-    builds it with ``original_seq_len=0`` for those layers.
+    correction dims.  vLLM applies the checkpoint's YaRN parameters to both
+    the main rope (theta=10000) and compress rope (theta=160000); AutoModel
+    follows that inference boundary for rollout/training logprob parity.
     """
 
     inv_freq: torch.Tensor
@@ -265,7 +340,7 @@ class DeepseekV4RotaryEmbedding(nn.Module):
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
     @torch.no_grad()
-    def forward(self, x: torch.Tensor, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor, position_ids: torch.Tensor) -> DeepseekV4PositionEmbeddings:
         inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
         position_ids_expanded = position_ids[:, None, :].float()
         # Force fp32 for numerical stability.
@@ -274,7 +349,10 @@ class DeepseekV4RotaryEmbedding(nn.Module):
             emb = torch.cat((freqs, freqs), dim=-1)
             cos = emb.cos() * self.attention_scaling
             sin = emb.sin() * self.attention_scaling
-        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+        # vLLM's DSV4 fused Q/K-cache kernel reads an FP32 cos/sin cache.
+        # Rounding the cache to BF16 here changes both post-RoPE Q and K even
+        # though the projection inputs are bitwise identical.
+        return DeepseekV4PositionEmbeddings(cos, sin)
 
 
 class DeepseekV4GroupedLinear(nn.Linear):
@@ -285,8 +363,16 @@ class DeepseekV4GroupedLinear(nn.Linear):
     ``nn.Linear.weight`` still find it; ``forward`` does per-group bmm.
     """
 
-    def __init__(self, in_features_per_group: int, out_features: int, n_groups: int, bias: bool = False):
-        super().__init__(in_features_per_group, out_features, bias=bias)
+    def __init__(
+        self,
+        in_features_per_group: int,
+        out_features: int,
+        n_groups: int,
+        bias: bool = False,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
+    ):
+        super().__init__(in_features_per_group, out_features, bias=bias, device=device, dtype=dtype)
         self.n_groups = n_groups
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -298,6 +384,288 @@ class DeepseekV4GroupedLinear(nn.Linear):
         x = x.reshape(-1, self.n_groups, d_in).permute(1, 0, 2)
         y = torch.bmm(x, w.transpose(-1, -2)).permute(1, 0, 2)
         return y.reshape(*batch_shape, self.n_groups, out_per_group)
+
+
+class DeepseekV4TEGroupedLinear(nn.Module):
+    """TE block-FP8 grouped linear with the DSV4 checkpoint layout.
+
+    Transformer Engine stores grouped parameters as ``weight0`` ...
+    ``weight{n-1}``, while the released DSV4 checkpoint and vLLM use one
+    two-dimensional ``wo_a.weight`` tensor.  This wrapper preserves that
+    external state-dict contract and only reshapes at the TE boundary.
+    """
+
+    def __init__(
+        self,
+        in_features_per_group: int,
+        out_features: int,
+        n_groups: int,
+        bias: bool = False,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype = torch.bfloat16,
+    ):
+        super().__init__()
+        if bias:
+            raise ValueError("DeepseekV4TEGroupedLinear does not support bias")
+        if out_features % n_groups:
+            raise ValueError(f"out_features={out_features} must be divisible by n_groups={n_groups}")
+
+        from transformer_engine.pytorch import Fp8Padding, Fp8Unpadding, GroupedLinear
+
+        from nemo_automodel.components.models.common.utils import _patch_te_modules
+
+        _patch_te_modules()
+        self.in_features_per_group = in_features_per_group
+        self.out_features = out_features
+        self.n_groups = n_groups
+        self.out_features_per_group = out_features // n_groups
+        resolved_device = torch.empty(0).device if device is None else device
+        self._linear = GroupedLinear(
+            num_gemms=n_groups,
+            in_features=in_features_per_group,
+            out_features=self.out_features_per_group,
+            bias=False,
+            params_dtype=dtype,
+            device=resolved_device,
+        )
+        self._fp8_padding = Fp8Padding(n_groups)
+        self._fp8_unpadding = Fp8Unpadding(n_groups)
+
+    @property
+    def weight(self) -> torch.Tensor:
+        """Return the released-checkpoint view ``[groups * out, in]``."""
+        return torch.cat([getattr(self._linear, f"weight{i}") for i in range(self.n_groups)], dim=0)
+
+    @property
+    def bias(self) -> None:
+        return None
+
+    def reset_parameters(self, init_std: float = 0.02) -> None:
+        for i in range(self.n_groups):
+            nn.init.trunc_normal_(getattr(self._linear, f"weight{i}"), mean=0.0, std=init_std)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # TE consumes one row-major tensor whose GEMM rows are concatenated.
+        batch_shape = x.shape[:-2]
+        rows_per_group = x.numel() // (self.n_groups * self.in_features_per_group)
+        grouped_x = x.reshape(rows_per_group, self.n_groups, self.in_features_per_group).permute(1, 0, 2)
+        grouped_x = grouped_x.reshape(-1, self.in_features_per_group)
+
+        # NVTE block-scaling grouped GEMM requires aligned M splits.  TE's
+        # padding operators preserve a well-aligned backward layout as well.
+        from transformer_engine.pytorch.quantization import FP8GlobalStateManager
+
+        m_splits = [rows_per_group] * self.n_groups
+        fp8_active = FP8GlobalStateManager.is_fp8_enabled()
+        if fp8_active:
+            grouped_x, padded_m_splits = self._fp8_padding(grouped_x, m_splits)
+        else:
+            padded_m_splits = m_splits
+        # DSV4's FP8 wo_a boundary intentionally keeps inverse-RoPE output in
+        # FP32 until TE quantizes it. Native AMP tells TE to produce BF16 while
+        # leaving the FP32 source tensor intact for the block-128 quantizer.
+        # This matches vLLM's fused inverse-RoPE -> FP8 operation and avoids an
+        # otherwise observable BF16 rounding boundary before quantization.
+        if fp8_active and grouped_x.dtype == torch.float32:
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                grouped_y = self._linear(grouped_x, m_splits=padded_m_splits)
+        else:
+            grouped_y = self._linear(grouped_x, m_splits=padded_m_splits)
+        if fp8_active:
+            grouped_y = self._fp8_unpadding(grouped_y, m_splits)
+        grouped_y = grouped_y.view(self.n_groups, rows_per_group, self.out_features_per_group)
+        grouped_y = grouped_y.permute(1, 0, 2)
+        return grouped_y.reshape(*batch_shape, self.n_groups, self.out_features_per_group)
+
+    def state_dict(self, *args, destination=None, prefix="", keep_vars=False, **kwargs):
+        """Save a flat DSV4 ``weight`` instead of TE's per-GEMM parameters."""
+        if destination is None:
+            from collections import OrderedDict
+
+            destination = OrderedDict()
+            destination._metadata = OrderedDict()
+        if hasattr(destination, "_metadata"):
+            destination._metadata[prefix[:-1]] = {"version": self._version}
+        weight = self.weight
+        destination[f"{prefix}weight"] = weight if keep_vars else weight.detach()
+        destination[f"{prefix}_extra_state"] = self._linear.get_extra_state()
+        return destination
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        # Loading recurses into ``_linear`` after this method. Give the child
+        # its native per-GEMM keys directly; TE GroupedLinear's public loader
+        # accepts a stacked ``weight`` only when it is the root module, whereas
+        # PyTorch recursion validates the child's weight0..weightN parameters.
+        weight_key = f"{prefix}weight"
+        if weight_key in state_dict:
+            weight = state_dict.pop(weight_key)
+            expected_shape = (self.out_features, self.in_features_per_group)
+            if tuple(weight.shape) != expected_shape:
+                error_msgs.append(
+                    f"size mismatch for {weight_key}: expected {expected_shape}, got {tuple(weight.shape)}"
+                )
+            else:
+                grouped_weight = weight.view(
+                    self.n_groups,
+                    self.out_features_per_group,
+                    self.in_features_per_group,
+                )
+                for group_idx in range(self.n_groups):
+                    state_dict[f"{prefix}_linear.weight{group_idx}"] = grouped_weight[group_idx]
+        elif strict:
+            missing_keys.append(weight_key)
+
+        extra_state_key = f"{prefix}_extra_state"
+        child_extra_state_key = f"{prefix}_linear._extra_state"
+        state_dict[child_extra_state_key] = state_dict.pop(
+            extra_state_key,
+            self._linear.get_extra_state(),
+        )
+
+
+class DeepseekV4TERowParallelLinear(nn.Module):
+    """TE block-FP8 row-parallel equivalent with an FP32 local reduction.
+
+    vLLM shards DSV4 ``wo_b`` across tensor-parallel ranks. Each rank produces
+    one BF16 FP8-GEMM partial and NCCL accumulates those partials in FP32 before
+    returning BF16. A monolithic GEMM has a different accumulation tree even
+    when its quantized activations, weights, and scales are identical. This
+    wrapper reproduces that numerical boundary on an AutoModel TP1 actor while
+    retaining the released ``[out_features, in_features]`` checkpoint layout.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        n_partitions: int,
+        bias: bool = False,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype = torch.bfloat16,
+    ):
+        super().__init__()
+        if bias:
+            raise ValueError("DeepseekV4TERowParallelLinear does not support bias")
+        if in_features % n_partitions:
+            raise ValueError(f"in_features={in_features} must be divisible by n_partitions={n_partitions}")
+
+        from transformer_engine.pytorch import Fp8Padding, Fp8Unpadding, GroupedLinear
+
+        from nemo_automodel.components.models.common.utils import _patch_te_modules
+
+        _patch_te_modules()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.n_partitions = n_partitions
+        self.in_features_per_partition = in_features // n_partitions
+        resolved_device = torch.empty(0).device if device is None else device
+        self._linear = GroupedLinear(
+            num_gemms=n_partitions,
+            in_features=self.in_features_per_partition,
+            out_features=out_features,
+            bias=False,
+            params_dtype=dtype,
+            device=resolved_device,
+        )
+        self._fp8_padding = Fp8Padding(n_partitions)
+        self._fp8_unpadding = Fp8Unpadding(n_partitions)
+
+    @property
+    def weight(self) -> torch.Tensor:
+        """Return the released-checkpoint view ``[out, partitions * in]``."""
+        return torch.cat([getattr(self._linear, f"weight{i}") for i in range(self.n_partitions)], dim=1)
+
+    @property
+    def bias(self) -> None:
+        return None
+
+    def reset_parameters(self, init_std: float = 0.02) -> None:
+        for i in range(self.n_partitions):
+            nn.init.trunc_normal_(getattr(self._linear, f"weight{i}"), mean=0.0, std=init_std)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch_shape = x.shape[:-1]
+        rows = x.numel() // self.in_features
+        grouped_x = x.reshape(rows, self.n_partitions, self.in_features_per_partition)
+        grouped_x = grouped_x.permute(1, 0, 2).reshape(-1, self.in_features_per_partition)
+
+        from transformer_engine.pytorch.quantization import FP8GlobalStateManager
+
+        m_splits = [rows] * self.n_partitions
+        fp8_active = FP8GlobalStateManager.is_fp8_enabled()
+        if fp8_active:
+            grouped_x, padded_m_splits = self._fp8_padding(grouped_x, m_splits)
+        else:
+            padded_m_splits = m_splits
+        if fp8_active and grouped_x.dtype == torch.float32:
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                grouped_y = self._linear(grouped_x, m_splits=padded_m_splits)
+        else:
+            grouped_y = self._linear(grouped_x, m_splits=padded_m_splits)
+        if fp8_active:
+            grouped_y = self._fp8_unpadding(grouped_y, m_splits)
+        grouped_y = grouped_y.view(self.n_partitions, rows, self.out_features)
+        # Match vLLM/NCCL: BF16 local GEMM partials, FP32 reduction, BF16 output.
+        output = grouped_y.float().sum(dim=0).to(grouped_y.dtype)
+        return output.reshape(*batch_shape, self.out_features)
+
+    def state_dict(self, *args, destination=None, prefix="", keep_vars=False, **kwargs):
+        if destination is None:
+            from collections import OrderedDict
+
+            destination = OrderedDict()
+            destination._metadata = OrderedDict()
+        if hasattr(destination, "_metadata"):
+            destination._metadata[prefix[:-1]] = {"version": self._version}
+        weight = self.weight
+        destination[f"{prefix}weight"] = weight if keep_vars else weight.detach()
+        destination[f"{prefix}_extra_state"] = self._linear.get_extra_state()
+        return destination
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        weight_key = f"{prefix}weight"
+        if weight_key in state_dict:
+            weight = state_dict.pop(weight_key)
+            expected_shape = (self.out_features, self.in_features)
+            if tuple(weight.shape) != expected_shape:
+                error_msgs.append(
+                    f"size mismatch for {weight_key}: expected {expected_shape}, got {tuple(weight.shape)}"
+                )
+            else:
+                for partition_idx in range(self.n_partitions):
+                    start = partition_idx * self.in_features_per_partition
+                    state_dict[f"{prefix}_linear.weight{partition_idx}"] = weight.narrow(
+                        1,
+                        start,
+                        self.in_features_per_partition,
+                    )
+        elif strict:
+            missing_keys.append(weight_key)
+
+        extra_state_key = f"{prefix}_extra_state"
+        child_extra_state_key = f"{prefix}_linear._extra_state"
+        state_dict[child_extra_state_key] = state_dict.pop(
+            extra_state_key,
+            self._linear.get_extra_state(),
+        )
 
 
 class DeepseekV4TrainCache:
@@ -705,6 +1073,47 @@ class DeepseekV4FP32Parameter(nn.Module):
         return _full_tensor_if_dtensor(self.weight)
 
 
+class _DeepseekV4CompressorMM(torch.autograd.Function):
+    """Autograd for CUDA's BF16-input, FP32-output compressor GEMM."""
+
+    @staticmethod
+    def forward(ctx, input_bf16: torch.Tensor, weight_fp32: torch.Tensor) -> torch.Tensor:
+        weight_bf16 = weight_fp32.to(torch.bfloat16)
+        ctx.save_for_backward(input_bf16, weight_bf16)
+        return torch.mm(input_bf16, weight_bf16.T, out_dtype=torch.float32)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        input_bf16, weight_bf16 = ctx.saved_tensors
+        grad_output_fp32 = grad_output.float()
+        grad_input = torch.mm(grad_output_fp32, weight_bf16.float()).to(input_bf16.dtype)
+        grad_weight = torch.mm(grad_output_fp32.T, input_bf16.float())
+        return grad_input, grad_weight
+
+
+class DeepseekV4CompressorLinear(nn.Linear):
+    """FP32-master compressor projection with vLLM's BF16 GEMM boundary.
+
+    The released checkpoint stores compressor/indexer ``wkv`` and ``wgate``
+    weights in BF16 in vLLM, while training keeps FP32 optimizer masters.
+    Casting the masters back to BF16 only for the forward GEMM preserves the
+    optimizer state and prevents low FP32 mantissa bits from creating a model
+    difference after refit.  The output remains FP32, matching vLLM's
+    ``torch.mm(..., out_dtype=torch.float32)`` compressor projection.
+    """
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        input_bf16 = input.to(torch.bfloat16)
+        flat_input = input_bf16.reshape(-1, input_bf16.shape[-1])
+        if flat_input.device.type == "cuda":
+            output = _DeepseekV4CompressorMM.apply(flat_input, self.weight)
+        else:
+            # ``out_dtype`` is CUDA-only.  This reference path retains the
+            # BF16 boundary while keeping CPU-only unit tests executable.
+            output = torch.mm(flat_input.float(), self.weight.to(torch.bfloat16).float().T)
+        return output.view(*input.shape[:-1], self.out_features)
+
+
 class DeepseekV4Indexer(nn.Module):
     """HF PR 45616 port.  Picks the top-k compressed positions per query when
     ``compress_ratio == 4``.  Owns its own pool at ``index_head_dim`` plus a
@@ -715,6 +1124,7 @@ class DeepseekV4Indexer(nn.Module):
         super().__init__()
         self.backend = backend or BackendConfig()
         model_dtype = get_dtype(config.torch_dtype, torch.bfloat16)
+        linear_dtype = model_dtype if self.backend.linear == "te" else None
         self.compress_ratio = 4
         # Indexer's pool is always at compress_ratio==4, which means overlap mode
         # (matching the released checkpoint's ``indexer.compressor.{ape,wkv,wgate}``
@@ -725,14 +1135,31 @@ class DeepseekV4Indexer(nn.Module):
         self.rope_head_dim = config.qk_rope_head_dim
         self.index_topk = config.index_topk
         self.softmax_scale = self.head_dim**-0.5
+        self.fp8_indexer_activations = str(getattr(config, "kv_cache_dtype", "auto")) == "fp8_ds_mla"
         proj_dim = 2 * self.head_dim  # overlap mode
-        self.wkv = nn.Linear(config.hidden_size, proj_dim, bias=False, dtype=torch.float32)
-        self.wgate = nn.Linear(config.hidden_size, proj_dim, bias=False, dtype=torch.float32)
+        self.wkv = DeepseekV4CompressorLinear(
+            config.hidden_size,
+            proj_dim,
+            bias=False,
+            dtype=torch.float32,
+        )
+        self.wgate = DeepseekV4CompressorLinear(
+            config.hidden_size,
+            proj_dim,
+            bias=False,
+            dtype=torch.float32,
+        )
         self.ape_param = DeepseekV4FP32Parameter(torch.zeros(self.compress_ratio, proj_dim, dtype=torch.float32))
         self.kv_norm = initialize_rms_norm_module(
             "torch_fp32", self.head_dim, eps=config.rms_norm_eps, dtype=model_dtype
         )
-        self.wq_b = nn.Linear(config.q_lora_rank, self.n_heads * self.head_dim, bias=False)
+        self.wq_b = initialize_linear_module(
+            self.backend.linear,
+            config.q_lora_rank,
+            self.n_heads * self.head_dim,
+            bias=False,
+            dtype=linear_dtype,
+        )
         self.weights_proj = nn.Linear(config.hidden_size, self.n_heads, bias=False)
 
     @property
@@ -755,9 +1182,8 @@ class DeepseekV4Indexer(nn.Module):
         input_dtype = hidden_states.dtype
         batch, seq_len, _ = hidden_states.shape
         cp_active = dsv4_cp_enabled(cp_group)
-        hidden_states_fp32 = hidden_states.float()
-        kv = self.wkv(hidden_states_fp32)
-        gate = self.wgate(hidden_states_fp32)
+        kv = self.wkv(hidden_states)
+        gate = self.wgate(hidden_states)
         ready_kv, ready_gate, pool_base = cache.accumulate_windows(
             kv, gate, layer_idx, "indexer_state", self.compress_ratio, start_pos
         )
@@ -771,7 +1197,7 @@ class DeepseekV4Indexer(nn.Module):
             _pool_windows(
                 ready_kv,
                 ready_gate,
-                self.ape_param(hidden_states_fp32),
+                self.ape_param(hidden_states),
                 self.compress_ratio,
                 self.head_dim,
                 overlap=self.overlap,
@@ -798,11 +1224,20 @@ class DeepseekV4Indexer(nn.Module):
         q = self.wq_b(q_residual).view(batch, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         q = _apply_partial_rope(q, cos, sin, self.rope_head_dim).transpose(1, 2)
         weights = self.weights_proj(hidden_states).float() * (self.n_heads**-0.5)
+        index_q = q
+        index_k = pooled_kv
+        if self.fp8_indexer_activations:
+            # vLLM 0.21 applies two additional DSV4-only boundaries after
+            # RoPE: per-token/per-head FP8 Q and the FP8 indexer K cache,
+            # both with one power-of-two FP32 descale per 128 values. Keep
+            # their actual E4M3 storage through the TileLang score GEMM.
+            index_q = quantize_dsv4_indexer(q, backend="tilelang")
+            index_k = quantize_dsv4_indexer(pooled_kv, backend="tilelang")
         query_start = dsv4_cp_rank(cp_group) * seq_len if cp_active else 0
         query_total_len = dsv4_cp_size(cp_group) * seq_len if cp_active else None
         index_scores = dsv4_indexer_scores(
-            q,
-            pooled_kv,
+            index_q,
+            index_k,
             weights,
             compress_ratio=self.compress_ratio,
             softmax_scale=self.softmax_scale,
@@ -871,8 +1306,18 @@ class DeepseekV4Compressor(nn.Module):
         self.overlap = compress_ratio == 4
         coff = 2 if self.overlap else 1
         proj_dim = coff * head_dim
-        self.wkv = nn.Linear(config.hidden_size, proj_dim, bias=False, dtype=torch.float32)
-        self.wgate = nn.Linear(config.hidden_size, proj_dim, bias=False, dtype=torch.float32)
+        self.wkv = DeepseekV4CompressorLinear(
+            config.hidden_size,
+            proj_dim,
+            bias=False,
+            dtype=torch.float32,
+        )
+        self.wgate = DeepseekV4CompressorLinear(
+            config.hidden_size,
+            proj_dim,
+            bias=False,
+            dtype=torch.float32,
+        )
         self.ape_param = DeepseekV4FP32Parameter(torch.zeros(compress_ratio, proj_dim, dtype=torch.float32))
         self.kv_norm = initialize_rms_norm_module("torch_fp32", head_dim, eps=config.rms_norm_eps, dtype=model_dtype)
         self.indexer: DeepseekV4Indexer | None = (
@@ -922,9 +1367,8 @@ class DeepseekV4Compressor(nn.Module):
         input_dtype = hidden_states.dtype
         batch, seq_len, _ = hidden_states.shape
         cp_active = dsv4_cp_enabled(cp_group)
-        hidden_states_fp32 = hidden_states.float()
-        kv = self.wkv(hidden_states_fp32)
-        gate = self.wgate(hidden_states_fp32)
+        kv = self.wkv(hidden_states)
+        gate = self.wgate(hidden_states)
         ready_kv, ready_gate, pool_base = cache.accumulate_windows(
             kv, gate, layer_idx, "compressor_state", self.compress_ratio, start_pos
         )
@@ -964,7 +1408,7 @@ class DeepseekV4Compressor(nn.Module):
             _pool_windows(
                 ready_kv,
                 ready_gate,
-                self.ape_param(hidden_states_fp32),
+                self.ape_param(hidden_states),
                 self.compress_ratio,
                 self.head_dim,
                 overlap=self.overlap,
@@ -1083,6 +1527,7 @@ class DeepseekV4HyperConnection(nn.Module):
         hc_eps: float,
         rms_norm_eps: float,
         sinkhorn_backend: str = "torch",
+        kernel_backend: str = "torch",
     ):
         super().__init__()
         self.hc_mult = hc_mult
@@ -1090,6 +1535,7 @@ class DeepseekV4HyperConnection(nn.Module):
         self.hc_eps = hc_eps
         self.norm_eps = rms_norm_eps
         self.sinkhorn_backend = sinkhorn_backend
+        self.kernel_backend = kernel_backend
         mix = (2 + self.hc_mult) * self.hc_mult
         self.fn = nn.Parameter(torch.empty(mix, self.hc_mult * hidden_size, dtype=torch.float32))
         self.base = nn.Parameter(torch.empty(mix, dtype=torch.float32))
@@ -1142,8 +1588,64 @@ class DeepseekV4HyperConnection(nn.Module):
         )
         return pre, post, comb
 
-    def forward(self, hidden_streams: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        hidden_streams: torch.Tensor,
+        *,
+        collapse: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # Keep the collapsed path behind ``nn.Module.__call__``: FSDP2 attaches
+        # its parameter all-gather/reshard hooks there, so invoking
+        # ``self.prepare(...)`` directly from the parent would expose zero-size
+        # local shards for tiny parameters such as the 3-element HC scale.
+        if collapse:
+            return self.prepare(hidden_streams)
         return self.compute_weights(hidden_streams)
+
+    def prepare(self, hidden_streams: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return collapsed input and post/comb mixes for one HC site.
+
+        The DSV4 TileLang backend follows vLLM's DeepGEMM + TileLang forward
+        exactly. Other backends retain the portable PyTorch/TileKernels path.
+        """
+        if self.kernel_backend == "tilelang":
+            return exact_mhc_prepare(
+                hidden_streams,
+                self.fn,
+                self.scale,
+                self.base,
+                norm_eps=self.norm_eps,
+                pre_eps=self.hc_eps,
+                sinkhorn_eps=self.hc_eps,
+                post_mult_value=2.0,
+                sinkhorn_repeat=self.hc_sinkhorn_iters,
+            )
+        pre, post, comb = self.compute_weights(hidden_streams)
+        collapsed = (pre.unsqueeze(-1) * hidden_streams).sum(dim=-2).to(hidden_streams.dtype)
+        return collapsed, post, comb
+
+
+def dsv4_hc_post(
+    hidden_streams: torch.Tensor,
+    layer_output: torch.Tensor,
+    post: torch.Tensor,
+    comb: torch.Tensor,
+    *,
+    backend: str = "torch",
+) -> torch.Tensor:
+    """Apply the DSV4 HyperConnection expand mix with vLLM precision semantics.
+
+    vLLM's ``mhc_post`` TileLang kernel consumes the learned ``post`` and
+    Sinkhorn ``comb`` coefficients in fp32, accumulates in fp32, and casts the
+    resulting HC streams to bf16.  Casting the coefficients to the model dtype
+    before the mix loses materially more precision and compounds across the two
+    HC sites in every decoder layer.
+    """
+    if backend == "tilelang":
+        return exact_mhc_post(hidden_streams, layer_output, post, comb)
+    output = post.float().unsqueeze(-1) * layer_output.float().unsqueeze(-2)
+    output = output + torch.matmul(comb.transpose(-1, -2).float(), hidden_streams.float())
+    return output.to(hidden_streams.dtype)
 
 
 class DeepseekV4HyperHead(nn.Module):
@@ -1208,8 +1710,12 @@ class DeepseekV4Attention(nn.Module):
     def __init__(self, config: DeepseekV4Config, layer_idx: int, backend: BackendConfig | None = None):
         super().__init__()
         self.config = config
-        self.backend = backend or BackendConfig()
+        # Direct layer construction is used by CPU reference tests and external
+        # callers.  Preserve the pre-backend-integration behavior (plain torch
+        # linears) unless the owning model explicitly supplies its BackendConfig.
+        self.backend = backend or BackendConfig(linear="torch")
         model_dtype = get_dtype(config.torch_dtype, torch.bfloat16)
+        linear_dtype = model_dtype if self.backend.linear == "te" else None
         self.layer_idx = layer_idx
         self.compress_ratio = int(config.compress_ratios[layer_idx]) if config.compress_ratios else 0
         self.num_heads = config.num_attention_heads
@@ -1221,22 +1727,82 @@ class DeepseekV4Attention(nn.Module):
         self.attention_dropout = float(getattr(config, "attention_dropout", 0.0) or 0.0)
         self.is_causal = True
         self.scaling = self.head_dim**-0.5
+        self.kv_cache_dtype = str(getattr(config, "kv_cache_dtype", "auto"))
+        if self.kv_cache_dtype not in ("auto", "fp8_ds_mla"):
+            raise ValueError(
+                f"DeepseekV4Attention kv_cache_dtype must be 'auto' or 'fp8_ds_mla', got {self.kv_cache_dtype!r}"
+            )
+        if self.kv_cache_dtype == "fp8_ds_mla":
+            if self.backend.attn != "tilelang":
+                raise ValueError("kv_cache_dtype='fp8_ds_mla' requires backend.attn='tilelang'")
+            if self.head_dim != 512 or self.rope_head_dim != 64:
+                raise ValueError("kv_cache_dtype='fp8_ds_mla' requires DSV4 head_dim=512 and qk_rope_head_dim=64")
+            if self.backend.linear != "te" or self.backend.te_fp8 is None:
+                raise ValueError(
+                    "kv_cache_dtype='fp8_ds_mla' requires linear='te' and te_fp8 block scaling "
+                    "so projections and KV use one vLLM-compatible FP8 path"
+                )
+            recipe = self.backend.te_fp8.recipe
+            if (isinstance(recipe, str) and recipe != "block") or (
+                not isinstance(recipe, str) and recipe.__class__.__name__ != "Float8BlockScaling"
+            ):
+                raise ValueError("DeepSeek V4 true FP8 requires te_fp8.recipe='block'")
 
-        self.wq_a = nn.Linear(config.hidden_size, config.q_lora_rank, bias=False)
+        self.wq_a = initialize_linear_module(
+            self.backend.linear,
+            config.hidden_size,
+            config.q_lora_rank,
+            bias=False,
+            dtype=linear_dtype,
+        )
         self.q_norm = initialize_rms_norm_module(
             "torch_fp32", config.q_lora_rank, eps=config.rms_norm_eps, dtype=model_dtype
         )
-        self.wq_b = nn.Linear(config.q_lora_rank, self.num_heads * self.head_dim, bias=False)
-        self.wkv = nn.Linear(config.hidden_size, self.head_dim, bias=False)
+        self.wq_b = initialize_linear_module(
+            self.backend.linear,
+            config.q_lora_rank,
+            self.num_heads * self.head_dim,
+            bias=False,
+            dtype=linear_dtype,
+        )
+        self.wkv = initialize_linear_module(
+            self.backend.linear,
+            config.hidden_size,
+            self.head_dim,
+            bias=False,
+            dtype=linear_dtype,
+        )
         self.kv_norm = initialize_rms_norm_module(
             "torch_fp32", self.head_dim, eps=config.rms_norm_eps, dtype=model_dtype
         )
-        self.wo_a = DeepseekV4GroupedLinear(
+        grouped_linear_cls = DeepseekV4TEGroupedLinear if self.backend.linear == "te" else DeepseekV4GroupedLinear
+        self.wo_a = grouped_linear_cls(
             self.num_heads * self.head_dim // config.o_groups,
             config.o_groups * config.o_lora_rank,
             config.o_groups,
+            dtype=linear_dtype,
         )
-        self.wo_b = nn.Linear(config.o_groups * config.o_lora_rank, config.hidden_size, bias=False)
+        fp8_row_parallel_size = int(getattr(config, "fp8_row_parallel_size", 1) or 1)
+        if fp8_row_parallel_size < 1 or config.o_groups % fp8_row_parallel_size:
+            raise ValueError(
+                "DeepSeek V4 fp8_row_parallel_size must be a positive divisor "
+                f"of o_groups={config.o_groups}, got {fp8_row_parallel_size}"
+            )
+        if self.kv_cache_dtype == "fp8_ds_mla" and self.backend.linear == "te" and fp8_row_parallel_size > 1:
+            self.wo_b = DeepseekV4TERowParallelLinear(
+                config.o_groups * config.o_lora_rank,
+                config.hidden_size,
+                fp8_row_parallel_size,
+                dtype=linear_dtype,
+            )
+        else:
+            self.wo_b = initialize_linear_module(
+                self.backend.linear,
+                config.o_groups * config.o_lora_rank,
+                config.hidden_size,
+                bias=False,
+                dtype=linear_dtype,
+            )
         self.sinks_param = DeepseekV4FP32Parameter(torch.zeros(self.num_heads, dtype=torch.float32))
 
         self.compressor = (
@@ -1311,15 +1877,28 @@ class DeepseekV4Attention(nn.Module):
         q = self.wq_b(q_residual).view(batch, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
         kv = self.kv_norm(self.wkv(hidden_states)).view(batch, seq_len, 1, self.head_dim).transpose(1, 2)
 
-        # Per-head, non-learnable rsqrt on Q before RoPE (matches reference
-        # ``dsv4flash/inference/model.py:498``; missing from HF PR 45616).
-        q = _rms_norm_last_dim(q, self.config.rms_norm_eps)
-
-        q = _apply_partial_rope(q, cos, sin, self.rope_head_dim)
+        # Match vLLM's fused Q-norm/RoPE boundary: both operations stay in
+        # FP32 and Q is rounded to BF16 only once after RoPE.
+        q = _apply_q_head_norm_rope(
+            q,
+            cos,
+            sin,
+            self.rope_head_dim,
+            self.config.rms_norm_eps,
+            use_tilelang=self.kv_cache_dtype == "fp8_ds_mla" and self.backend.attn == "tilelang",
+        )
         kv = _apply_partial_rope(kv, cos, sin, self.rope_head_dim)
 
-        full_kv = dsv4_cp_all_gather(kv, dim=2, cp_group=cp_group) if cp_active else kv
-        vanilla_key_len = full_kv.shape[2]
+        fp8_full_kv = None
+        if self.kv_cache_dtype == "fp8_ds_mla":
+            fp8_full_kv = quantize_dsv4_kv(kv.squeeze(1).contiguous(), backend="tilelang")
+            if cp_active:
+                fp8_full_kv = dsv4_cp_all_gather_fp8(fp8_full_kv, dim=1, cp_group=cp_group)
+            full_kv = None
+            vanilla_key_len = fp8_full_kv.shape[1]
+        else:
+            full_kv = dsv4_cp_all_gather(kv, dim=2, cp_group=cp_group) if cp_active else kv
+            vanilla_key_len = full_kv.shape[2]
         n_pooled = 0
         indexer_topk: torch.LongTensor | None = None
 
@@ -1350,7 +1929,12 @@ class DeepseekV4Attention(nn.Module):
                 cp_group=cp_group,
             )
             n_pooled = pooled.shape[2]
-            full_kv = torch.cat([full_kv, pooled], dim=2)
+            if fp8_full_kv is not None:
+                pooled_fp8 = quantize_dsv4_kv(pooled.squeeze(1).contiguous(), backend="tilelang")
+                fp8_full_kv = cat_dsv4_fp8_kv((fp8_full_kv, pooled_fp8))
+            else:
+                assert full_kv is not None
+                full_kv = torch.cat([full_kv, pooled], dim=2)
 
             # Extend the additive 4D attention mask with a per-query
             # compressed-position mask so dense attention reproduces the
@@ -1373,51 +1957,53 @@ class DeepseekV4Attention(nn.Module):
                     # is unspecified, so use count-then-threshold instead.
                     compressed_mask = _build_indexer_topk_compressed_mask(attention_mask, indexer_topk, n_pooled)
                     if packed_seq_ids is not None and pooled_seq_ids is not None and pooled_positions is not None:
-                        q_seq = packed_seq_ids.to(device=full_kv.device, dtype=torch.long)
+                        q_seq = packed_seq_ids.to(device=kv.device, dtype=torch.long)
                         threshold = ((query_positions + 1) // self.compress_ratio).unsqueeze(-1)
                         allowed = (
                             (q_seq.unsqueeze(-1) > 0)
-                            & (q_seq.unsqueeze(-1) == pooled_seq_ids.to(full_kv.device).unsqueeze(1))
-                            & (pooled_positions.to(full_kv.device).unsqueeze(1) < threshold)
+                            & (q_seq.unsqueeze(-1) == pooled_seq_ids.to(kv.device).unsqueeze(1))
+                            & (pooled_positions.to(kv.device).unsqueeze(1) < threshold)
                         )
                         compressed_mask = torch.where(
                             allowed,
                             compressed_mask,
-                            torch.full((), min_val, dtype=attention_mask.dtype, device=full_kv.device),
+                            torch.full((), min_val, dtype=attention_mask.dtype, device=kv.device),
                         )
                 else:
                     threshold = (query_positions + 1) // self.compress_ratio
                     if packed_seq_ids is not None and pooled_seq_ids is not None and pooled_positions is not None:
-                        q_seq = packed_seq_ids.to(device=full_kv.device, dtype=torch.long)
+                        q_seq = packed_seq_ids.to(device=kv.device, dtype=torch.long)
                         allowed = (
                             (q_seq.unsqueeze(-1) > 0)
-                            & (q_seq.unsqueeze(-1) == pooled_seq_ids.to(full_kv.device).unsqueeze(1))
-                            & (pooled_positions.to(full_kv.device).unsqueeze(1) < threshold.unsqueeze(-1))
+                            & (q_seq.unsqueeze(-1) == pooled_seq_ids.to(kv.device).unsqueeze(1))
+                            & (pooled_positions.to(kv.device).unsqueeze(1) < threshold.unsqueeze(-1))
                         )
                     else:
-                        p_pos = torch.arange(n_pooled, device=full_kv.device)
+                        p_pos = torch.arange(n_pooled, device=kv.device)
                         allowed = p_pos.view(1, 1, n_pooled) < threshold.unsqueeze(-1)  # [B, S, P]
                     compressed_mask = torch.where(
                         allowed,
-                        torch.zeros((), dtype=attention_mask.dtype, device=full_kv.device),
-                        torch.full((), min_val, dtype=attention_mask.dtype, device=full_kv.device),
+                        torch.zeros((), dtype=attention_mask.dtype, device=kv.device),
+                        torch.full((), min_val, dtype=attention_mask.dtype, device=kv.device),
                     )
                 compressed_mask = compressed_mask.unsqueeze(1)  # [B, 1, S, P]
                 attention_mask = torch.cat([attention_mask, compressed_mask], dim=-1)
 
+        key_len = fp8_full_kv.shape[1] if fp8_full_kv is not None else full_kv.shape[2]
+
         # If a caller supplied a 4D mask shorter than full_kv but no compressor
         # ran (shouldn't happen, but kept for defense), fall back to neutral pad.
-        if attention_mask is not None and full_kv.shape[2] > attention_mask.shape[-1]:
-            attention_mask = F.pad(attention_mask, (0, full_kv.shape[2] - attention_mask.shape[-1]), value=0.0)
+        if attention_mask is not None and key_len > attention_mask.shape[-1]:
+            attention_mask = F.pad(attention_mask, (0, key_len - attention_mask.shape[-1]), value=0.0)
 
         attn_backend = _dsv4_kernel_backend(self.backend)
         if attn_backend == "tilelang":
             topk_idxs = build_dsv4_sparse_topk_indices(
                 batch_size=batch,
                 seq_len=seq_len,
-                key_len=full_kv.shape[2],
+                key_len=key_len,
                 window_size=self.sliding_window,
-                device=full_kv.device,
+                device=kv.device,
                 attention_mask=attention_mask,
                 compress_ratio=self.compress_ratio,
                 compressed_topk=indexer_topk,
@@ -1425,16 +2011,29 @@ class DeepseekV4Attention(nn.Module):
                 vanilla_key_len=vanilla_key_len,
                 q_positions=sparse_query_positions,
             )
-            attn_output = dsv4_sparse_attention(
-                q.transpose(1, 2).contiguous(),
-                full_kv.squeeze(1).contiguous(),
-                self.sinks_param(q),
-                topk_idxs,
-                self.scaling,
-                backend=attn_backend,
-            )
+            sparse_q = q.transpose(1, 2).contiguous()
+            if fp8_full_kv is not None:
+                attn_output = dsv4_fp8_sparse_attention(
+                    sparse_q,
+                    fp8_full_kv,
+                    self.sinks_param(q),
+                    topk_idxs,
+                    self.scaling,
+                )
+            else:
+                assert full_kv is not None
+                sparse_kv = full_kv.squeeze(1).contiguous()
+                attn_output = dsv4_sparse_attention(
+                    sparse_q,
+                    sparse_kv,
+                    self.sinks_param(q),
+                    topk_idxs,
+                    self.scaling,
+                    backend=attn_backend,
+                )
             attn_weights = None
         else:
+            assert full_kv is not None
             attn_output, attn_weights = eager_attention_with_sink(
                 self,
                 q,
@@ -1446,16 +2045,27 @@ class DeepseekV4Attention(nn.Module):
             )
             # eager_attention_with_sink returns [B, S, H, D] (already transposed).
 
-        # Inverse RoPE on the attention output (same (cos, -sin) conjugate pattern
-        # HF uses).  Reference: modular_deepseek_v4.py:607.
-        attn_output = _apply_partial_rope(attn_output.transpose(1, 2), cos, -sin, self.rope_head_dim).transpose(1, 2)
+        # Inverse RoPE on the attention output (same (cos, -sin) conjugate
+        # pattern HF uses). vLLM fuses FP32 inverse RoPE directly into the
+        # group-128 FP8 quantizer for wo_a. Keep that boundary in FP32 in the
+        # true-FP8 path; TE consumes the FP32 tensor under native AMP and
+        # quantizes it before producing BF16 GEMM output.
+        inverse_rope_input = attn_output.float() if self.kv_cache_dtype == "fp8_ds_mla" else attn_output
+        attn_output = _apply_partial_rope(
+            inverse_rope_input.transpose(1, 2),
+            cos,
+            -sin,
+            self.rope_head_dim,
+        ).transpose(1, 2)
 
         grouped = attn_output.reshape(batch, seq_len, -1).view(batch, seq_len, self.config.o_groups, -1)
         return self.wo_b(self.wo_a(grouped).flatten(2)), attn_weights
 
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
         for linear in (self.wq_a, self.wq_b, self.wkv, self.wo_b, self.wo_a):
-            if hasattr(linear, "weight"):
+            if isinstance(linear, (DeepseekV4TEGroupedLinear, DeepseekV4TERowParallelLinear)):
+                linear.reset_parameters(init_std)
+            elif hasattr(linear, "weight"):
                 nn.init.trunc_normal_(linear.weight, mean=0.0, std=init_std)
         for norm in (self.q_norm, self.kv_norm):
             norm.reset_parameters()

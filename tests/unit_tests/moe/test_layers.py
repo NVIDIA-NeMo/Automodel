@@ -25,12 +25,14 @@ from nemo_automodel.components.moe.experts import (
     GroupedExperts,
     GroupedExpertsDeepEP,
     GroupedExpertsTE,
+    swiglu_clamped_vllm_fp8,
 )
 from nemo_automodel.components.moe.layers import (
     MLP,
     FakeBalancedGate,
     Gate,
     MoE,
+    TERowParallelLinear,
 )
 from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 
@@ -142,6 +144,52 @@ class TestMLP:
 
         # Weights should have changed
         assert not torch.equal(mlp.gate_proj.weight.detach(), original_gate_weight)
+
+    @pytest.mark.skipif(SKIP_TE_TESTS, reason="vLLM FP8 semantics require TE FP8 autocast state on CUDA")
+    def test_shared_mlp_vllm_fp8_rounding(self, device):
+        """DSV4 shared experts preserve vLLM's BF16 activation boundaries."""
+        mlp = MLP(
+            64,
+            128,
+            backend="torch",
+            swiglu_limit=7.0,
+            vllm_fp8_semantics=True,
+        ).to(device)
+        x = (torch.randn(8, 64, dtype=torch.bfloat16, device=device) * 1.25).contiguous()
+
+        gate_up = torch.cat((mlp.gate_proj(x), mlp.up_proj(x)), dim=-1)
+        expected = mlp.down_proj(swiglu_clamped_vllm_fp8(gate_up, 7.0))
+        with patch(
+            "transformer_engine.pytorch.quantization.FP8GlobalStateManager.is_fp8_enabled",
+            return_value=True,
+        ):
+            actual = mlp(x)
+
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    @pytest.mark.skipif(SKIP_TE_TESTS, reason="virtual TP shared experts require TE on CUDA")
+    def test_shared_mlp_virtual_tp_state_dict_and_partials(self, device):
+        """Shared w2 retains its logical key while returning one partial per TP rank."""
+        with torch.device(device):
+            mlp = MLP(
+                64,
+                128,
+                backend="te",
+                swiglu_limit=7.0,
+                vllm_fp8_semantics=True,
+                fp8_row_parallel_size=2,
+            )
+        assert isinstance(mlp.down_proj, TERowParallelLinear)
+
+        state = mlp.state_dict()
+        logical_weight = torch.randn_like(state["down_proj.weight"])
+        state["down_proj.weight"] = logical_weight
+        mlp.load_state_dict(state)
+        torch.testing.assert_close(mlp.down_proj.weight, logical_weight, rtol=0, atol=0)
+
+        x = torch.randn(8, 128, dtype=torch.bfloat16, device=device)
+        partials = mlp.down_proj(x)
+        assert partials.shape == (8, 2, 64)
 
 
 class TestFakeBalancedGate:
@@ -1094,6 +1142,23 @@ class TestGate:
                 assert weights.dtype == input_dtype, (
                     f"Expected output dtype {input_dtype} but got {weights.dtype} with gate_precision={gate_precision}"
                 )
+
+    def test_vllm_fp8_semantics_preserves_fp32_routing_weights(self, moe_config, device):
+        """DeepSeek-V4 routing weights match vLLM's FP32 router output."""
+        moe_config.score_func = "sqrtsoftplus"
+        moe_config.norm_topk_prob = True
+        moe_config.route_scale = 1.5
+        moe_config.vllm_fp8_moe_semantics = True
+        gate = Gate(moe_config, gate_precision=torch.float32).to(device)
+
+        with torch.no_grad():
+            gate.weight.normal_(0, 0.02)
+
+        x = torch.randn(8, moe_config.dim, dtype=torch.bfloat16, device=device)
+        token_mask = torch.ones(8, dtype=torch.bool, device=device)
+        weights, _, _ = gate(x, token_mask, cp_mesh=None)
+
+        assert weights.dtype == torch.float32
 
     def test_gate_precision_with_sigmoid(self, moe_config, device):
         """Test Gate precision with sigmoid score function."""

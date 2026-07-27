@@ -50,6 +50,17 @@ class MoEConfig:
     # DeepSeek V4's official ``Expert.forward`` with ``swiglu_limit``.
     # Default 0.0 preserves the existing ``weighted_bias_swiglu_impl`` path.
     swiglu_limit: float = 0.0
+    # Match vLLM's H100 DeepGEMM FP8 expert boundary when true FP8 is active:
+    # clamped SwiGLU rounds at the same BF16 boundaries and routing weights
+    # are applied after the down projection.  The default keeps the existing
+    # semantics for every non-DSV4 model and for all BF16 execution.
+    vllm_fp8_moe_semantics: bool = False
+    # Reproduce the numerical tensor-parallel boundary of a rollout engine on
+    # a training actor that owns complete expert weights.  Each routed/shared
+    # expert keeps this many intermediate-dimension partials until the final
+    # MoE reduction.  DSV4 sets it to the vLLM TP size; all other models retain
+    # the existing monolithic path through the default value of one.
+    fp8_row_parallel_size: int = 1
     softmax_before_topk: bool = False
     dtype: str | torch.dtype = torch.bfloat16
     shared_expert_gate: bool = False
@@ -70,6 +81,18 @@ class MoEConfig:
     def __post_init__(self):
         if isinstance(self.dtype, str):
             self.dtype = dtype_from_str(self.dtype, default=torch.bfloat16)
+        self.fp8_row_parallel_size = int(self.fp8_row_parallel_size)
+        if self.fp8_row_parallel_size < 1:
+            raise ValueError("fp8_row_parallel_size must be positive")
+        if self.moe_inter_dim % self.fp8_row_parallel_size:
+            raise ValueError(
+                f"moe_inter_dim={self.moe_inter_dim} must be divisible by "
+                f"fp8_row_parallel_size={self.fp8_row_parallel_size}"
+            )
+        if self.fp8_row_parallel_size > 1 and self.expert_bias:
+            raise ValueError("virtual FP8 row parallelism does not support expert bias")
+        if self.fp8_row_parallel_size > 1 and self.moe_latent_size is not None:
+            raise ValueError("virtual FP8 row parallelism does not support latent MoE projections")
 
 
 @dataclass
