@@ -154,7 +154,7 @@ class VispecTrainerModule(nn.Module):
             # ``input_hidden_states[:, :1]`` below carries the same noise. The
             # reference attaches the augmentation to the train dataset, so every
             # read of the feature tensor within a step sees one identical draw.
-            input_hidden_states = self.feature_noise_config.apply(input_hidden_states)
+            input_hidden_states = self.feature_noise_config.apply(input_hidden_states, attention_mask)
         predicted_hidden_states = self.draft_model(
             inputs_embeds=inputs_embeds,
             target_hidden_states=input_hidden_states,
@@ -187,21 +187,23 @@ class VispecTrainerModule(nn.Module):
         # rollout contributes the same number of supervised positions, so the
         # mean of the per-rollout means is that same value, without holding a
         # ``mtp_steps + 1``-fold copy of the target distribution.
+        # Match the reference accuracy metric too: it covers the initial pass and
+        # every self-rollout, all of which supervise the same valid positions.
         prob_losses = []
         rank_losses = []
-        accuracy = valid_tokens.new_zeros((), dtype=torch.float32)
-        for index, rollout in enumerate(rollouts):
+        accuracies = []
+        target_ids = target_probs.argmax(dim=-1)
+        for rollout in rollouts:
             predicted_logits = self.compute_logits(rollout[valid_mask])
             predicted_probs = torch.softmax(predicted_logits, dim=-1, dtype=torch.float32)
             prob_losses.append(torch.abs(predicted_probs - target_probs).sum(dim=-1).mean())
             rank_losses.append(listmle_loss(predicted_logits, target_probs, self.rank_loss_topk))
-            if index == 0:
-                # Accuracy of the first (non-rollout) pass, over supervised positions.
-                correct = predicted_logits.argmax(dim=-1) == target_probs.argmax(dim=-1)
-                accuracy = correct.sum() / valid_tokens.clamp_min(1)
+            correct = (predicted_logits.argmax(dim=-1) == target_ids).sum()
+            accuracies.append(correct / valid_tokens.clamp_min(1))
 
         prob_loss = torch.stack(prob_losses).mean()
         rank_loss = torch.stack(rank_losses).mean()
+        accuracy = torch.stack(accuracies).mean()
         loss = self.prob_loss_weight * prob_loss + self.rank_loss_weight * rank_loss
 
         if valid_tokens == 0:

@@ -114,12 +114,24 @@ class TestFeatureNoiseConfig:
     def test_apply_stays_inside_the_half_width_and_does_not_mutate(self):
         torch.manual_seed(0)
         features = torch.zeros(1, 256, _HIDDEN)
+        attention_mask = torch.ones(1, 256)
         noise = FeatureNoiseConfig(std=0.2, reference_seq_len=512)
-        noised = noise.apply(features)
+        noised = noise.apply(features, attention_mask)
         assert noised is not features
         assert torch.equal(features, torch.zeros_like(features))
         assert noised.abs().max().item() <= noise.half_width(256)
 
+    def test_apply_uses_explicit_unpadded_sequence_length(self):
+        torch.manual_seed(0)
+        features = torch.zeros(1, 4096, _HIDDEN)
+        attention_mask = torch.zeros(1, 4096)
+        attention_mask[:, :1024] = 1
+        noise = FeatureNoiseConfig(std=0.2, reference_seq_len=512)
+        noised = noise.apply(features, attention_mask)
+        assert noised.abs().max().item() > noise.half_width(4096)
+        assert noised.abs().max().item() <= noise.half_width(1024)
+
     def test_zero_std_is_a_no_op(self):
         features = torch.randn(1, 8, _HIDDEN)
-        assert FeatureNoiseConfig(std=0.0).apply(features) is features
+        attention_mask = torch.ones(1, 8)
+        assert FeatureNoiseConfig(std=0.0).apply(features, attention_mask) is features

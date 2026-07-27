@@ -273,6 +273,22 @@ class TestTrainerModule:
         with_rollout = self._module(mtp_steps=2)(**inputs).loss
         assert not torch.isclose(without, with_rollout)
 
+    def test_accuracy_covers_initial_pass_and_all_rollouts(self):
+        module = self._module(mtp_steps=1)
+        inputs = self._inputs()
+        valid_tokens = int(inputs["loss_mask"].sum())
+        target_ids = inputs["target_logits"][inputs["loss_mask"].bool()].argmax(dim=-1)
+        first_logits = torch.full((valid_tokens, VOCAB), -10.0)
+        first_logits.scatter_(1, target_ids[:, None], 10.0)
+        rollout_logits = torch.full((valid_tokens, VOCAB), -10.0)
+        rollout_logits[torch.arange(valid_tokens), (target_ids + 1) % VOCAB] = 10.0
+        logits = iter((first_logits, rollout_logits))
+        module.compute_logits = lambda _: next(logits)
+
+        metrics = module(**inputs)
+
+        assert metrics.accuracy.item() == pytest.approx(0.5)
+
     def test_rejects_negative_mtp_steps(self):
         with pytest.raises(ValueError, match="mtp_steps must be >= 0"):
             VispecTrainerModule(_draft(), target_lm_head=nn.Linear(HIDDEN, VOCAB), mtp_steps=-1)

@@ -32,7 +32,7 @@ class FeatureNoiseConfig:
 
     EAGLE's reference implementation draws the perturbation as
     ``(rand_like(x) - 0.5) * std * reference_seq_len / T``, where ``T`` is the
-    sequence length of the batch. The half-width is therefore
+    effective (unpadded) sequence length of the batch. The half-width is therefore
     ``std / 2 * reference_seq_len / T``: it is calibrated at
     ``reference_seq_len`` and shrinks as the sequence grows, so a longer
     context is not perturbed proportionally harder. ViSpec inherits this
@@ -65,17 +65,22 @@ class FeatureNoiseConfig:
             return 0.5 * self.std
         return 0.5 * self.std * self.reference_seq_len / seq_len
 
-    def apply(self, features: torch.Tensor) -> torch.Tensor:
+    def apply(self, features: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         """Return ``features`` perturbed by the uniform draw.
 
         Args:
-            features: ``[B, T, H]`` target features handed to the draft. ``T``
-                sets the scale, matching the reference's ``tensor.shape[1]``.
+            features: Tensor of shape [batch, sequence, hidden] containing target
+                features handed to the draft.
+            attention_mask: Tensor of shape [batch, sequence]. Its longest
+                unpadded row sets the scale, so padding does not shrink the
+                perturbation.
 
         Returns:
-            A new tensor; ``features`` is not modified in place.
+            Tensor of shape [batch, sequence, hidden]. This is a new tensor;
+            ``features`` is not modified in place.
         """
-        half_width = self.half_width(features.shape[1])
+        effective_seq_len = max(1, int(attention_mask.sum(dim=-1).max().item()))
+        half_width = self.half_width(effective_seq_len)
         if half_width <= 0:
             return features
         # One RNG kernel into a fresh buffer, then one add, rather than the
@@ -178,7 +183,7 @@ class EagleTrainerModule(nn.Module):
             # ``target_hidden_states`` stays clean. No-op in eval
             # (``self.training`` is False), matching the reference, which
             # attaches the transform to the train dataset only.
-            input_hidden_states = self.feature_noise_config.apply(input_hidden_states)
+            input_hidden_states = self.feature_noise_config.apply(input_hidden_states, attention_mask)
         predicted_hidden_states = self.draft_model(
             input_ids=input_ids,
             target_hidden_states=input_hidden_states,
