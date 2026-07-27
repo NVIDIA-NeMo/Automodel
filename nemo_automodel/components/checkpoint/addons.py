@@ -559,6 +559,11 @@ def save_custom_model_code(
     When ``original_model_path`` is a local dir, copy its ``.py`` files. When it is an HF
     Hub ID, resolve its locally cached snapshot first. If no snapshot is available, fall
     back to custom code loaded through Transformers' dynamic-module cache.
+
+    Args:
+        original_model_path: Local model path or Hugging Face Hub ID that supplied the model.
+        hf_metadata_dir: Destination directory for the exported Python files.
+        model_part: Optional loaded model used to locate Transformers dynamic-module code.
     """
     copied: set[str] = set()
 
