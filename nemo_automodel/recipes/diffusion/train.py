@@ -465,6 +465,10 @@ def build_diffusion_pipeline(
 class TrainDiffusionRecipe(BaseRecipe):
     """Training recipe for diffusion models."""
 
+    # Class-level default so recipe methods can rely on the attribute even when
+    # setup() has not run; setup() overrides it when a `dmd2:` block is present.
+    _dmd2 = None
+
     def __init__(self, cfg):
         _reject_removed_diffusion_keys(cfg)
         self.cfg = cfg if isinstance(cfg, RecipeConfig) else RecipeConfig(cfg)

@@ -79,4 +79,7 @@ checkpoint:
   save_consolidated: final
   diffusers_compatible: true
 
-wandb: null
+wandb:
+  enable: false
+  project: qwen-image-dmd2
+  mode: online
