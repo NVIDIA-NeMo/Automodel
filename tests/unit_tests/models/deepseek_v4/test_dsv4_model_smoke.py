@@ -622,6 +622,31 @@ class TestDeepseekV4ModelSmoke:
 
         assert out.logits.shape == (1, 8, cfg.vocab_size)
 
+    def test_thd_cp1_accepts_standard_cu_seqlens(self, monkeypatch):
+        """A non-CP packed caller should not need to translate metadata for DSV4."""
+        cfg = _tiny_config(num_hidden_layers=0, compress_ratios=[])
+        model = _make_model(cfg)
+        captured = {}
+
+        def fake_packed_mask(seq_lens, seq_len, dtype, device, sliding_window=None):
+            captured["seq_lens"] = seq_lens
+            return torch.zeros(1, 1, seq_len, seq_len, dtype=dtype, device=device)
+
+        monkeypatch.setattr(dsv4_model_module, "build_packed_causal_padding_mask", fake_packed_mask)
+
+        cu_seqlens = torch.tensor([0, 3, 8], dtype=torch.int32)
+        with torch.no_grad():
+            out = model(
+                torch.ones(1, 8, dtype=torch.long),
+                position_ids=torch.tensor([[0, 1, 2, 0, 1, 2, 3, 4]]),
+                qkv_format="thd",
+                cu_seqlens=cu_seqlens,
+                cu_seqlens_padded=cu_seqlens,
+            )
+
+        assert out.logits.shape == (1, 8, cfg.vocab_size)
+        torch.testing.assert_close(captured["seq_lens"], torch.tensor([[3, 5]], dtype=torch.int32))
+
     def test_thd_cp_normalizes_packed_ids_and_derives_padding_mask(self, monkeypatch):
         cfg = _tiny_config(num_hidden_layers=0, compress_ratios=[])
         model = _make_model(cfg)
