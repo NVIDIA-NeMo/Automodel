@@ -18,9 +18,8 @@ from pathlib import Path
 
 import yaml
 
-from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.distributed.cp_vision_frame_shard import CpVisionFrameShardingConfig
-from nemo_automodel.recipes._typed_config import RecipeConfig
+from nemo_automodel.recipes._dist_utils import parse_distributed_section
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 CONFIG_PATH = REPO_ROOT / "examples/vlm_finetune/qwen3/qwen3_vl_8b_cp2_vision_frame_shard.yaml"
@@ -29,8 +28,12 @@ CONFIG_PATH = REPO_ROOT / "examples/vlm_finetune/qwen3/qwen3_vl_8b_cp2_vision_fr
 def test_qwen3_vl_cp2_example_enables_typed_vision_frame_sharding() -> None:
     """The runnable example selects dense Qwen3-VL, CP2, and the typed policy."""
     raw_config = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
-    config = RecipeConfig(ConfigNode(raw_config))
+    distributed = parse_distributed_section(raw_config["distributed"])
 
     assert raw_config["model"]["pretrained_model_name_or_path"] == "Qwen/Qwen3-VL-8B-Instruct"
     assert raw_config["distributed"]["cp_size"] == 2
-    assert config.cp_vision_frame_sharding == CpVisionFrameShardingConfig(enabled=True, min_tokens=0)
+    assert distributed["strategy_config"].multimodal.vision.frame_sharding == CpVisionFrameShardingConfig(
+        enabled=True,
+        mesh_dims=("cp",),
+        min_tokens=0,
+    )

@@ -16,7 +16,7 @@
 #
 # A/B on 8 GPUs (cp=2, dp=4):
 #   sharded  : automodel examples/vlm_finetune/qwen3/qwen3_vl_8b_cp2_vision_frame_shard.yaml --nproc-per-node 8
-#   baseline : automodel examples/vlm_finetune/qwen3/qwen3_vl_8b_cp2_vision_frame_shard.yaml --nproc-per-node 8 --distributed.cp_vision_frame_sharding.enabled false
+#   baseline : automodel examples/vlm_finetune/qwen3/qwen3_vl_8b_cp2_vision_frame_shard.yaml --nproc-per-node 8 --distributed.multimodal.vision.frame_sharding.enabled false
 
 recipe: FinetuneRecipeForVLM
 
@@ -63,9 +63,12 @@ distributed:
   ep_size: 1
   sequence_parallel: false
   activation_checkpointing: true
-  cp_vision_frame_sharding:
-    enabled: true
-    min_tokens: 0
+  multimodal:
+    vision:
+      frame_sharding:
+        enabled: true
+        mesh_dims: [cp]
+        min_tokens: 0
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy

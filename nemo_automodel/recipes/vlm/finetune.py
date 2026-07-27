@@ -47,7 +47,7 @@ from nemo_automodel._transformers import (
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches, resolve_get_rope_index
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.vlm.pp_media import stage_vlm_media_for_pp
-from nemo_automodel.components.distributed.config import DistributedSetup, MegatronFSDPConfig
+from nemo_automodel.components.distributed.config import DistributedSetup, FSDP2Config, MegatronFSDPConfig
 from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
 from nemo_automodel.components.distributed.context_parallel.magi import MagiState, setup_magi
 from nemo_automodel.components.distributed.cp_vision_frame_shard import (
@@ -124,10 +124,11 @@ def _validate_cp_vision_frame_sharding_support(
 
     model_name = type(model).__name__
     raise ValueError(
-        "distributed.cp_vision_frame_sharding.enabled=true requires a model-owned integration "
+        "distributed.multimodal.vision.frame_sharding.enabled=true requires a model-owned integration "
         f"for sharding vision frames over CP ranks, but {model_name} declares "
         "supports_cp_vision_frame_sharding=False. "
-        "Disable the policy with distributed.cp_vision_frame_sharding.enabled=false or use a supported model."
+        "Disable the policy with distributed.multimodal.vision.frame_sharding.enabled=false "
+        "or use a supported model."
     )
 
 
@@ -470,7 +471,11 @@ class FinetuneRecipeForVLM(BaseRecipe):
             self.moe_parallel_config,
             self.activation_checkpointing,
         ) = self._distributed_setup_attributes(self._create_distributed_setup())
-        self.cp_vision_frame_sharding = self.cfg.cp_vision_frame_sharding
+        self.cp_vision_frame_sharding = (
+            self.distributed_config.multimodal.vision.frame_sharding
+            if isinstance(self.distributed_config, FSDP2Config)
+            else CpVisionFrameShardingConfig()
+        )
 
         if not self._should_setup_training_components():
             return
@@ -812,17 +817,18 @@ class FinetuneRecipeForVLM(BaseRecipe):
     @contextmanager
     def _cp_vision_frame_sharding_context(self):
         """Publish the CP-only group while a VLM forward may run its vision tower."""
-        cp_active = (
-            self.device_mesh is not None
-            and "cp" in getattr(self.device_mesh, "mesh_dim_names", ())
-            and self.device_mesh["cp"].size() > 1
-        )
+        if self.device_mesh is None:
+            yield
+            return
+
+        mesh_dim = self.cp_vision_frame_sharding.mesh_dims[0]
+        cp_active = mesh_dim in self.device_mesh.mesh_dim_names and self.device_mesh[mesh_dim].size() > 1
         if not cp_active:
             yield
             return
 
         token = set_cp_vision_group(
-            self.device_mesh["cp"].get_group(),
+            self.device_mesh[mesh_dim].get_group(),
             config=self.cp_vision_frame_sharding,
         )
         try:

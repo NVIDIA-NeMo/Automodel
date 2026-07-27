@@ -463,3 +463,43 @@ def test_recipe_hook_contains_optional_eval_failures(caplog):
     recipe._maybe_run_decode_eval()
 
     assert "training continues" in caplog.text
+
+
+def test_resume_from_step_suppresses_immediate_relaunch(tmp_path):
+    """A resumed run must not re-eval a cadence region the pre-crash run covered.
+
+    ``_last_bucket`` starts at 0, so without this alignment ``due`` is true at the
+    first step after a resume, spending a whole eval (a detached engine server plus
+    its benchmark) on a region that already ran.
+    """
+    runner = DecodeEvalRunner(_config(tmp_path, every_steps=10))
+
+    assert runner.due(50) is True
+
+    runner.resume_from_step(50)
+
+    assert runner.due(50) is False
+    # Still inside the same cadence bucket.
+    assert runner.due(59) is False
+    # The next bucket boundary fires normally.
+    assert runner.due(60) is True
+
+
+def test_resume_from_step_keeps_a_collected_result_for_that_step(tmp_path):
+    """Resuming on a step whose eval finished must not discard its result.
+
+    ``maybe_launch`` clears the step's ``result.json`` before relaunching, so an
+    unaligned resume landing on that step recomputes a result it already had.
+    """
+    cfg = _config(tmp_path, every_steps=10)
+    step_dir = os.path.join(cfg.output_dir, "step_50")
+    os.makedirs(step_dir)
+    result_path = os.path.join(step_dir, "result.json")
+    with open(result_path, "w") as f:
+        json.dump({"step": 50, "accept_length": 2.5}, f)
+
+    runner = DecodeEvalRunner(cfg)
+    runner.resume_from_step(50)
+
+    assert runner.due(50) is False
+    assert os.path.exists(result_path)

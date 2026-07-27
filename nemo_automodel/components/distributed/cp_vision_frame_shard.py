@@ -85,6 +85,8 @@ class CpVisionFrameShardingConfig:
     Args:
         enabled: Enable vision frame sharding when a multi-rank CP group is published. Disabled
             by default so existing CP recipes retain their replicated vision behavior.
+        mesh_dims: Device-mesh dimensions across which frames are distributed. Only
+            ``("cp",)`` is currently supported.
         min_tokens: Minimum number of merged visual tokens required to use the sharded
             path. Smaller workloads stay replicated to avoid collective overhead.
         cost_alpha: Non-negative linear term in the partition cost
@@ -94,21 +96,25 @@ class CpVisionFrameShardingConfig:
     """
 
     enabled: bool = False
+    mesh_dims: tuple[Literal["cp"]] = ("cp",)
     min_tokens: int = 2048
     cost_alpha: int | Literal["auto"] | None = "auto"
 
     def __post_init__(self) -> None:
         """Validate the serialized policy fields."""
+        config_path = "distributed.multimodal.vision.frame_sharding"
         if not isinstance(self.enabled, bool):
-            raise TypeError("distributed.cp_vision_frame_sharding.enabled must be a boolean")
+            raise TypeError(f"{config_path}.enabled must be a boolean")
+        if not isinstance(self.mesh_dims, tuple):
+            raise TypeError(f"{config_path}.mesh_dims must be a list of mesh-dimension names")
+        if self.mesh_dims != ("cp",):
+            raise ValueError(f'{config_path}.mesh_dims currently supports only ["cp"]')
         if isinstance(self.min_tokens, bool) or not isinstance(self.min_tokens, int) or self.min_tokens < 0:
-            raise ValueError("distributed.cp_vision_frame_sharding.min_tokens must be a non-negative integer")
+            raise ValueError(f"{config_path}.min_tokens must be a non-negative integer")
         if self.cost_alpha not in (None, "auto") and (
             isinstance(self.cost_alpha, bool) or not isinstance(self.cost_alpha, int) or self.cost_alpha < 0
         ):
-            raise ValueError(
-                'distributed.cp_vision_frame_sharding.cost_alpha must be "auto", null, or a non-negative integer'
-            )
+            raise ValueError(f'{config_path}.cost_alpha must be "auto", null, or a non-negative integer')
 
 
 @dataclass(frozen=True)
@@ -649,7 +655,7 @@ def maybe_distribute_visual(
             _LOGGED_SMALL_FALLBACK = True
             logger.info(
                 "vision tower using replicated path for small visual workload "
-                "(tokens=%d < distributed.cp_vision_frame_sharding.min_tokens=%d)",
+                "(tokens=%d < distributed.multimodal.vision.frame_sharding.min_tokens=%d)",
                 n_real_tokens,
                 min_shard_tokens,
             )

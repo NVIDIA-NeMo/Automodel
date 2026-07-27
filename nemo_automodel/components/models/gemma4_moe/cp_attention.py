@@ -34,36 +34,12 @@ from nemo_automodel.components.attention.ffpa_attention import (
     _ffpa_varlen_fwd,
     _ffpa_varlen_ready,
 )
+from nemo_automodel.shared.torch_patches import (
+    patch_fsdp_accumulated_grad_guard as _patch_fsdp_accumulated_grad_guard,
+)
 
 logger = logging.getLogger(__name__)
 _GEMMA4_CP_FLEX_RING_OK_LOGGED = False
-
-
-def _patch_fsdp_accumulated_grad_guard() -> None:
-    """Guard ``FSDPParam.to_accumulated_grad_if_needed`` against uninitialized params.
-
-    On some torch builds that method reads ``self._unsharded_param`` (the lazily
-    set unsharded tensor) without first checking it exists. In FSDP2 post-backward
-    under fp32 grad-reduce, frozen / never-unsharded params (e.g. the frozen Gemma4
-    vision tower and embeddings) have no ``_unsharded_param`` yet and it raises
-    ``AttributeError``. Such params carry no grad to upcast anyway, so wrap the
-    method to skip them when uninitialized. No-op once applied / on fixed builds.
-    """
-    try:
-        from torch.distributed.fsdp._fully_shard._fsdp_param import FSDPParam
-    except Exception:
-        return
-    orig = FSDPParam.to_accumulated_grad_if_needed
-    if getattr(orig, "_gemma4_guarded", False):
-        return
-
-    def guarded(self):
-        if not hasattr(self, "_unsharded_param"):
-            return
-        return orig(self)
-
-    guarded._gemma4_guarded = True
-    FSDPParam.to_accumulated_grad_if_needed = guarded
 
 
 _patch_fsdp_accumulated_grad_guard()

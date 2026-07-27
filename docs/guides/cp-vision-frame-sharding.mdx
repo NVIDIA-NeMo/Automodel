@@ -34,10 +34,13 @@ Enable context parallelism and vision frame sharding under `distributed`:
 ```yaml
 distributed:
   cp_size: 2
-  cp_vision_frame_sharding:
-    enabled: true
-    min_tokens: 2048
-    cost_alpha: auto
+  multimodal:
+    vision:
+      frame_sharding:
+        enabled: true
+        mesh_dims: [cp]
+        min_tokens: 2048
+        cost_alpha: auto
 ```
 
 Vision frame sharding is disabled by default. A CP size greater than 1 and a supported model are
@@ -61,6 +64,7 @@ uv run automodel --nproc-per-node=8 \
 | Field | Default | Description |
 |---|---|---|
 | `enabled` | `false` | Enables vision frame sharding across the CP group. |
+| `mesh_dims` | `[cp]` | Selects the device-mesh dimensions used to distribute frames. Only `[cp]` is currently supported. |
 | `min_tokens` | `2048` | Uses the replicated path when the batch has fewer visual tokens than this threshold. Set it to `0` to always exercise vision frame sharding. |
 | `cost_alpha` | `auto` | Controls how frame cost is estimated for load balancing. `auto` uses the vision hidden size and is the recommended setting. A nonnegative integer overrides the inferred value; `0` uses a purely quadratic attention-cost estimate. |
 
@@ -102,7 +106,7 @@ line:
 ```bash
 uv run automodel --nproc-per-node=8 \
   examples/vlm_finetune/qwen3/qwen3_vl_8b_cp2_vision_frame_shard.yaml \
-  --distributed.cp_vision_frame_sharding.enabled false
+  --distributed.multimodal.vision.frame_sharding.enabled false
 ```
 
 Use the same seed, batch, and topology for both runs. Confirm that training remains stable,
