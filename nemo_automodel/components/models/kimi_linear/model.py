@@ -342,6 +342,11 @@ class KimiMLAAttention(nn.Module):
         if packed_context is not None and packed_context.cp_enabled:
             return self._forward_with_cp(hidden_states, packed_context)
         batch_size, seq_length = hidden_states.shape[:-1]
+        if attention_mask is None:
+            # Built here rather than in the backbone because sequence parallelism
+            # hands the backbone a sequence shard while this layer runs on the
+            # all-gathered sequence.
+            attention_mask = _make_causal_mask(hidden_states, packed_context, dtype=hidden_states.dtype)
         query_shape = (batch_size, seq_length, -1, self.q_head_dim)
         key_shape = (batch_size, seq_length, -1, self.qk_nope_head_dim + self.v_head_dim)
 
@@ -1044,15 +1049,12 @@ class KimiLinearModel(nn.Module):
             cu_seqlens=attn_kwargs.get("cu_seqlens"),
         )
         linear_attn_mask = self._update_linear_attn_mask(attention_mask, cache_position)
-        causal_mask = (
-            None
-            if packed_context is not None and packed_context.cp_enabled
-            else _make_causal_mask(inputs_embeds, packed_context, dtype=inputs_embeds.dtype)
-        )
         hidden_states = inputs_embeds
 
         for decoder_layer in self.layers.values():
-            layer_mask = linear_attn_mask if decoder_layer.is_linear_attn else causal_mask
+            # Full-attention layers build their own additive mask; see
+            # ``KimiMLAAttention.forward``.
+            layer_mask = linear_attn_mask if decoder_layer.is_linear_attn else None
             layer_padding_mask = padding_mask
             if decoder_layer.is_linear_attn and layer_mask is not None:
                 layer_padding_mask = layer_mask.bool().logical_not()
@@ -1100,12 +1102,16 @@ class KimiLinearForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     # Packed documents are masked by the model itself: MLA gets a document-blocked
     # causal mask and KDA resets its recurrent state on per-document ``cu_seqlens``.
     _owns_packed_attention = True
+    # The tensor-parallel plan shards the block boundaries (norms, output
+    # projections and the MoE output) along the sequence, so the custom-MoE path
+    # may enable sequence parallelism for this architecture.
+    _supports_sequence_parallel = True
 
     @dataclass(frozen=True)
     class ModelCapabilities:
         """Declared parallelism capabilities for Kimi Linear."""
 
-        supports_tp: bool = False
+        supports_tp: bool = True
         supports_cp: bool = True
         supports_pp: bool = False
         supports_ep: bool = True

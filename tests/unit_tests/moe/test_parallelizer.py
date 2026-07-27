@@ -2952,3 +2952,39 @@ def test_apply_cp_mixed_full_and_linear_attention(monkeypatch):
     te_attn.set_context_parallel_group.assert_called_once()
     # linear_attention block: cp_mesh attached
     assert linear_attn._cp_mesh is cp_mesh
+
+
+
+def test_resolve_moe_tp_plan_rejects_sequence_parallel_without_opt_in(monkeypatch):
+    """Custom MoE models must declare SP support before the boundary can be sharded."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+
+    class _Model:
+        pass
+
+    with pytest.raises(ValueError, match="sequence_parallel=True is not supported"):
+        P._resolve_moe_tp_plan(_Model(), sequence_parallel=True, tp_shard_plan=None, tp_size=2)
+
+
+def test_resolve_moe_tp_plan_forwards_sequence_parallel_to_the_registered_plan(monkeypatch):
+    """An opted-in model gets its plan built with the sequence-parallel flag set."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+
+    class _Model:
+        _supports_sequence_parallel = True
+
+    seen = {}
+
+    def _plan_factory(model, sequence_parallel):
+        seen["sequence_parallel"] = sequence_parallel
+        return {}
+
+    plans_stub = types.ModuleType("nemo_automodel.components.distributed.optimized_tp_plans")
+    plans_stub.PARALLELIZE_FUNCTIONS = {"_Model": _plan_factory}
+    plans_stub._get_class_qualname = lambda cls: cls.__name__
+    monkeypatch.setitem(sys.modules, "nemo_automodel.components.distributed.optimized_tp_plans", plans_stub)
+    monkeypatch.setattr(P, "_validate_moe_tp_plan", lambda plan, model: plan)
+
+    P._resolve_moe_tp_plan(_Model(), sequence_parallel=True, tp_shard_plan=None, tp_size=2)
+
+    assert seen["sequence_parallel"] is True
