@@ -59,6 +59,22 @@ redirects:
     destination: "/nemo/automodel/v0.4"
   - source: "/nemo/automodel/index"
     destination: "/nemo/automodel/v0.4"
+  # Legacy Sphinx page aliases. Keep these exact mappings before the version
+  # and global catch-alls so moved pages resolve in a single redirect.
+  - source: "/nemo/automodel/latest/guides/vlm/gemma4"
+    destination: "/nemo/automodel/latest/recipes-e2e-examples/gemma-4"
+  - source: "/nemo/automodel/latest/guides/omni/gemma3-3n"
+    destination: "/nemo/automodel/latest/recipes-e2e-examples/gemma-3-3n"
+  - source: "/nemo/automodel/latest/apidocs/nemo_automodel/nemo_automodel.components.moe.uccl_ep"
+    destination: "/nemo/automodel/latest/nemo-automodel/nemo_automodel/components/moe/uccl_ep"
+  - source: "/nemo/automodel/latest/apidocs/nemo_automodel/nemo_automodel.components.training.timers"
+    destination: "/nemo/automodel/latest/nemo-automodel/nemo_automodel/components/training/timers"
+  - source: "/nemo/automodel/latest/launcher/cluster"
+    destination: "/nemo/automodel/latest/job-launchers/slurm-cluster"
+  - source: "/nemo/automodel/nightly/performance-summary"
+    destination: "/nemo/automodel/nightly/performance/performance-summary"
+  - source: "/nemo/automodel/latest/guides/configuration"
+    destination: "/nemo/automodel/latest/get-started/configuration"
   # Version-root index.html / index — explicit because :path* does not match
   # the empty-path case (NVIDIA-NeMo/Curator#1938). Must fire before the
   # :path*/index.html catch-alls below.

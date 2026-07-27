@@ -23,7 +23,7 @@ The nightly scope uses only the recipes listed in [nightly_recipes.yml](nightly_
 | nemotron_nano_9b_squad | 00:25:00 | 1 | ✅ | ✅ | - |
 | nemotron_nano_v3_hellaswag | 00:15:00 | 1 | ✅ | ✅ | ✅ |
 | nemotron_super_v3_hellaswag | 00:15:00 | 4 | ✅ | ✅ | ✅ |
-| qwen3_moe_30b_hellaswag | 00:15:00 | 1 | ✅ | - | - |
+| qwen3_moe_30b_hellaswag | 00:20:00 | 1 | ✅ | - | - |
 | qwen3_moe_30b_te_deepep | 00:15:00 | 1 | ✅ | ✅ | ✅ |
 | step_3.5_flash_hellaswag_pp | 00:30:00 | 16 | - | - | - |
 

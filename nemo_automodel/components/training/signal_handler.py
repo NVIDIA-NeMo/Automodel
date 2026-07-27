@@ -15,10 +15,13 @@
 import logging
 import signal
 import types
+from collections.abc import Sequence
 from typing import Any, Optional
 
 import torch
 import torch.distributed
+
+SignalLike = int | str | signal.Signals
 
 
 def get_device(local_rank: Optional[int] = None) -> torch.device:
@@ -98,29 +101,44 @@ class DistributedSignalHandler:
     The original signal handler is restored upon exiting the context.
 
     Args:
-        sig: The signal number to handle (e.g., signal.SIGTERM).
-             Defaults to signal.SIGTERM.
+        sig: One or more signals to handle, each given as a signal number,
+            name (e.g. "SIGTERM"), or ``signal.Signals`` member. Accepts a
+            single value or a sequence. Defaults to signal.SIGTERM.
         group: Process group whose ranks participate in signal propagation.
             Defaults to the global process group.
     """
 
     def __init__(
         self,
-        sig: int = signal.SIGTERM,
+        sig: SignalLike | Sequence[SignalLike] = signal.SIGTERM,
         group: torch.distributed.ProcessGroup | None = None,
     ) -> None:
         """
         Constructor for the DistributedSignalHandler.
 
         Args:
-            sig (int, optional): The signal to handle. Defaults to signal.SIGTERM.
+            sig (SignalLike | Sequence[SignalLike], optional): One or more signals to handle,
+                each given as a signal number, name (e.g. "SIGTERM"), or ``signal.Signals``
+                member. Defaults to signal.SIGTERM.
             group: Process group whose ranks participate in signal propagation.
+                Defaults to the global process group.
         """
-        self.sig = sig
+        specs = sig if isinstance(sig, (list, tuple)) else [sig]
+        sigs = [resolve_signal(s) for s in specs]
+        if len(sigs) == 0:
+            raise ValueError("At least one signal must be provided")
+        if len(set(sigs)) != len(sigs):
+            raise ValueError(f"Duplicate signals provided: {[s.name for s in sigs]}")
+        self.sigs = sigs
         self.group = group
         self._signal_received = False
         self.released = False
-        self.original_handler = None
+        self.original_handlers = {}
+
+    @property
+    def sig(self) -> signal.Signals:
+        """Backward-compatible accessor for the first configured signal."""
+        return self.sigs[0]
 
     def signals_received(self) -> list[bool]:
         """
@@ -144,14 +162,15 @@ class DistributedSignalHandler:
         """
         self._signal_received = False
         self.released = False
-        self.original_handler = signal.getsignal(self.sig)
 
         def handler(signum: int, frame: Optional[Any]) -> None:
             logging.info("Received signal {}, initiating graceful stop".format(signum))
             self._signal_received = True
 
-        signal.signal(self.sig, handler)
-        logging.info("Signal handler installed for {}".format(self.sig))
+        for s in self.sigs:
+            self.original_handlers[s] = signal.getsignal(s)
+            signal.signal(s, handler)
+            logging.info("Signal handler installed for {}".format(s.name))
 
         return self
 
@@ -173,6 +192,48 @@ class DistributedSignalHandler:
         if self.released:
             return False
 
-        signal.signal(self.sig, self.original_handler)
+        for s, original in self.original_handlers.items():
+            signal.signal(s, original)
         self.released = True
         return True
+
+
+def resolve_signal(sig: SignalLike) -> signal.Signals:
+    """
+    Resolve a user-provided signal specification to "signal.Signals" member.
+
+    Accepts integers (e.g. "15"), "signal.Signals" members (e.g. "signal.SIGTERM")
+    and case-insensitive string names with or without the "SIG" prefix (e.g. "SIGTERM",
+    "sigusr1", "USR2"). String support allows the pre-emption signal to be configured from YAML.
+
+    Args:
+        sig: The signal specification to resolve.
+
+    Returns:
+        The corresponding "signal.Signals" member.
+
+    Raises:
+        ValueError: If the specification does not name a valid signal.
+        TypeError: If sig is not an int, str, or "signal.Signals".
+    """
+
+    if isinstance(sig, signal.Signals):
+        return sig
+    if isinstance(sig, bool):
+        # bool is a subclass of int; reject it before the int branch so
+        # True/False don't silently resolve to SIGHUP / an invalid number.
+        raise TypeError(f"Signal must be an int, str or signal.Signals, got bool: {sig!r}")
+    if isinstance(sig, int):
+        try:
+            return signal.Signals(sig)
+        except ValueError as e:
+            raise ValueError(f"Invalid signal number: {sig}") from e
+    if isinstance(sig, str):
+        name = sig.strip().upper()
+        if not name.startswith("SIG"):
+            name = "SIG" + name
+        try:
+            return signal.Signals[name]
+        except KeyError as e:
+            raise ValueError(f"Unknown signal name: {sig!r}") from e
+    raise TypeError(f"Signal must be an int, str or signal.Signals, got {type(sig).__name__}")

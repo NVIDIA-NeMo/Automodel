@@ -48,6 +48,7 @@ class _FakeDevice:  # noqa: D401, pylint: disable=too-few-public-methods
     def __str__(self):  # noqa: D401
         return self.type
 
+
 def test_to_local_if_dtensor_returns_local_tensor():
     """Ensure a *DTensor* is converted to its local shard."""
 
@@ -59,15 +60,15 @@ def test_to_local_if_dtensor_returns_local_tensor():
 
     assert out is local
 
+
 def test_to_local_if_dtensor_noop_for_regular_tensor():
     """Regular tensors should be returned unmodified."""
 
     tensor = torch.randn(3, 3)
     assert to_local_if_dtensor(tensor) is tensor
 
-@pytest.mark.parametrize("tensor_device", (
-    ["cpu", "cuda"] if torch.cuda.is_available() else ["cpu"]
-))
+
+@pytest.mark.parametrize("tensor_device", (["cpu", "cuda"] if torch.cuda.is_available() else ["cpu"]))
 def test_to_cpu_tensor(tensor_device: str):
     """*to_cpu* should return a CPU copy of plain tensors regardless of device."""
 
@@ -123,6 +124,7 @@ def test_to_cpu_passthrough_other_types():
     sentinel = object()
     assert to_cpu(sentinel) is sentinel
 
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required for *inf* norm path.")
 @pytest.mark.parametrize("pin_memory", [True, False])
 def test_get_cpu_state_dict_scalar(pin_memory):
@@ -136,6 +138,7 @@ def test_get_cpu_state_dict_scalar(pin_memory):
     assert list(out.keys()) == ["bias"]
     assert torch.allclose(out["bias"], bias)
     assert out["bias"].device.type == "cpu"
+
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required for *inf* norm path.")
 @pytest.mark.parametrize("pin_memory", [True, False])
