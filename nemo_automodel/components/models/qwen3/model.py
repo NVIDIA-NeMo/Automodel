@@ -65,6 +65,8 @@ class Qwen3Attention(HFQwen3Attention):
         super().__init__(config=config, layer_idx=layer_idx)
         self.backend = backend
         self.rope_fusion = backend.rope_fusion
+        self.attn_module = None
+        self.attn_func = None
         if backend.attn == "te":
             # Ordinary BSHD inputs retain the HuggingFace attention interface.
             self._te_thd_only = True
@@ -118,8 +120,7 @@ class Qwen3Attention(HFQwen3Attention):
             raise ValueError(f"THD attention requires hidden_states [T, H], got {tuple(hidden_states.shape)}.")
         if past_key_values is not None:
             raise ValueError("Packed THD attention does not support past_key_values.")
-        attn_module = getattr(self, "attn_module", None)
-        if attn_module is None:
+        if self.attn_module is None:
             raise ValueError("Packed THD attention requires backend.attn='te'.")
 
         token_count = hidden_states.shape[0]
@@ -154,7 +155,7 @@ class Qwen3Attention(HFQwen3Attention):
             window_size=window_size,
             **kwargs,
         )
-        attn_output = attn_module(query_states, key_states, value_states, **te_kwargs)
+        attn_output = self.attn_module(query_states, key_states, value_states, **te_kwargs)
         attn_output = postprocess_output_for_attn(attn_output, "te")
         return self.o_proj(attn_output.flatten(1)), None
 
@@ -375,7 +376,7 @@ class Qwen3ForCausalLM(HFCheckpointingMixin, Qwen3PreTrainedModel, GenerationMix
         self.lm_head = new_embeddings
 
     def tie_weights(self, *_args: object, **_kwargs: object) -> None:
-        if getattr(self.config, "tie_word_embeddings", False):
+        if self.config.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
 
     @can_return_tuple

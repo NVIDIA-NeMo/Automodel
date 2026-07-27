@@ -243,7 +243,7 @@ def test_packed_thd_rejects_non_te_attention(model_kind, monkeypatch):
     """THD must fail before silently treating packed documents as one sequence."""
     model = _build_model(model_kind, monkeypatch).eval()
     for layer in model.model.layers:
-        del layer.self_attn.attn_module
+        layer.self_attn.attn_module = None
 
     with pytest.raises(ValueError, match="requires backend.attn='te'"):
         model(

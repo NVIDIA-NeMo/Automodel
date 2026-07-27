@@ -91,6 +91,8 @@ class Qwen2Attention(nn.Module):
         self.rope_fusion = self.backend.rope_fusion
         self.rope_backend = self.backend.rope
         self._quack_apply_rotary_emb = None
+        self.attn_module = None
+        self.attn_func = None
         if self.rope_backend == "quack":
             available, apply_rotary_emb = safe_import_from(
                 "quack.rotary",
@@ -197,8 +199,7 @@ class Qwen2Attention(nn.Module):
         if is_thd:
             if past_key_values is not None:
                 raise ValueError("Packed THD attention does not support past_key_values.")
-            attn_module = getattr(self, "attn_module", None)
-            if attn_module is None:
+            if self.attn_module is None:
                 raise ValueError("Packed THD attention requires backend.attn='te'.")
             window_size = (-1, 0) if self.sliding_window is None else (self.sliding_window - 1, 0)
             query_states, key_states, value_states, te_kwargs = preprocess_args_and_kwargs_for_attn(
@@ -210,7 +211,7 @@ class Qwen2Attention(nn.Module):
                 window_size=window_size,
                 **kwargs,
             )
-            attn_output = attn_module(query_states, key_states, value_states, **te_kwargs)
+            attn_output = self.attn_module(query_states, key_states, value_states, **te_kwargs)
             attn_output = postprocess_output_for_attn(attn_output, "te")
             return self.o_proj(attn_output.flatten(1)), None
 

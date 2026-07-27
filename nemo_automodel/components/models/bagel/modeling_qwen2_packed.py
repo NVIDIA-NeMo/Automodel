@@ -392,9 +392,7 @@ class Qwen2MLP(nn.Module):
         self.down_proj = _initialize_linear(self.backend, self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
         # Fuse silu(gate)*up only when the activation is silu (BAGEL/Qwen2 default).
-        self._fuse_silu_mul = (
-            getattr(self.backend, "fused_swiglu", False) and getattr(config, "hidden_act", "silu") == "silu"
-        )
+        self._fuse_silu_mul = self.backend.fused_swiglu and config.hidden_act == "silu"
 
     def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
         gate = self.gate_proj(hidden_state)
