@@ -35,7 +35,7 @@ runs:
     - name: Get PR info
       id: get-pr-info
       if: startsWith(github.ref, 'refs/heads/pull-request/')
-      uses: nv-gha-runners/get-pr-info@main
+      uses: nv-gha-runners/get-pr-info@090577647b8ddc4e06e809e264f7881650ecdccf # main
 
     - name: Get merge commit sha
       shell: bash -x -e -u -o pipefail {0}
@@ -51,7 +51,7 @@ runs:
         echo "main=${SHA}" | tee -a "$GITHUB_OUTPUT"
 
     - name: Checkout
-      uses: actions/checkout@v6
+      uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
       with:
         ref: ${{ steps.sha.outputs.main }}
 
@@ -100,10 +100,10 @@ runs:
         echo "EOF" | tee -a $GITHUB_OUTPUT
 
     - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v3
+      uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
     - name: Build and push
-      uses: docker/build-push-action@v5
+      uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
       with:
         file: ${{ inputs.dockerfile-path }}
         push: true
