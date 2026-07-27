@@ -2538,8 +2538,8 @@ class TestSkipInitWeightsOnLoadGate:
         model.initialize_weights.assert_called_once()
 
 
-class TestConsolidatedIndexUnderPPWithoutSourceIndex:
-    """_maybe_build_consolidated_index else-branch (NVIDIA-NeMo/Automodel#1512)."""
+class TestConsolidatedIndexUnderPP:
+    """Global consolidated-index construction under pipeline parallelism."""
 
     def _make_checkpointer(self, tmp_path):
         # empty_cache is created but contains no HF snapshot directory, so
@@ -2639,6 +2639,72 @@ class TestConsolidatedIndexUnderPPWithoutSourceIndex:
                 if idx in indices_for_this_rank:
                     consolidated_keys.add(fqn)
         assert consolidated_keys == set(global_pre_shard_keys)
+
+    @pytest.mark.run_only_on("CPU")
+    def test_source_index_adds_adapter_created_keys_from_global_pre_shard_state(self, tmp_path):
+        """Every PP rank maps adapter-created keys that are absent from the source index."""
+        checkpointer = self._make_checkpointer(tmp_path)
+        source_mapping = {
+            "language_model.model.embed_tokens.weight": 1,
+            "language_model.model.layers.15.mlp.gate.weight": 2,
+        }
+        injected_bias = "language_model.model.layers.15.mlp.gate.e_score_correction_bias"
+        global_pre_shard_keys = [*source_mapping, injected_bias]
+        per_rank_state_dicts = [
+            {"language_model.model.embed_tokens.weight": torch.empty(0)},
+            {
+                "language_model.model.layers.15.mlp.gate.weight": torch.empty(0),
+                injected_bias: torch.empty(0),
+            },
+        ]
+        model_state = self._fake_model_state(global_pre_shard_keys)
+
+        with (
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._get_hf_safetensors_reference_path",
+                return_value="/fake/reference",
+            ),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing.get_fqn_to_file_index_mapping",
+                side_effect=lambda *_args, **_kwargs: dict(source_mapping),
+            ),
+        ):
+            per_rank_mappings = [
+                checkpointer._maybe_build_consolidated_index(model_state, state_dict)
+                for state_dict in per_rank_state_dicts
+            ]
+
+        expected_mapping = {**source_mapping, injected_bias: 2}
+        assert per_rank_mappings == [expected_mapping, expected_mapping]
+
+    @pytest.mark.run_only_on("CPU")
+    def test_global_pre_shard_state_does_not_readd_excluded_tied_lm_head(self, tmp_path):
+        """A global key list must not undo the local tied-weight alias exclusion."""
+        checkpointer = self._make_checkpointer(tmp_path)
+        source_mapping = {
+            "model.embed_tokens.weight": 1,
+            "lm_head.weight": 1,
+        }
+        model_state = self._fake_model_state(list(source_mapping))
+        model_state.has_local_tied_lm_head = True
+        model_state.lm_head_param_name = "lm_head.weight"
+
+        with (
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._get_hf_safetensors_reference_path",
+                return_value="/fake/reference",
+            ),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing.get_fqn_to_file_index_mapping",
+                return_value=dict(source_mapping),
+            ),
+        ):
+            mapping = checkpointer._maybe_build_consolidated_index(
+                model_state,
+                {"model.embed_tokens.weight": torch.empty(0)},
+            )
+
+        assert mapping == {"model.embed_tokens.weight": 1}
 
 
 # Tests for cloud storage path support (MSC integration)
