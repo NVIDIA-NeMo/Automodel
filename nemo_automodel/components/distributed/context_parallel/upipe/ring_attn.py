@@ -273,6 +273,9 @@ class RingComm:
         for req in self._reqs:
             req.wait()
 
+        # barrier is needed to ensure torch mem allocator properly clears the unused tensors
+        dist.barrier(group=self._process_group)
+
         self._reqs.clear()
         self._reqs = None
         self._ops.clear()
