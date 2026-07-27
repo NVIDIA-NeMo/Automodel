@@ -18,8 +18,9 @@
 #
 # Steps mirror examples/convergence/tulu3/models/<model>/run_te_fusedadam.md:
 #   1. train (config_resolver phase=convergence -> full 1000 steps, save consolidated)
-#   2. one-time, model-agnostic eval-env setup (setup_lm_eval.sh: uv + [vllm] +
-#      torchcodec removal + cutlass-dsl pin) -- idempotent, skipped if already built
+#   2. one-time, model-agnostic eval-env setup (setup_lm_eval.sh: uv + [vllm] with
+#      vllm/cutlass-dsl floors for the gemma4 FA4 kernel) + torchcodec removal --
+#      idempotent, skipped if already built
 #   3. eval + threshold gate (convergence_eval.py)
 #
 # Env required: CONFIG_PATH, PIPELINE_DIR, TEST_NAME, TEST_LEVEL, TEST_SCRIPT_PATH,
