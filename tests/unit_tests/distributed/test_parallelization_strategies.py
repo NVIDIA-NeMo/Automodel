@@ -1160,3 +1160,101 @@ class TestDeciLMNemotronNASValidation:
         )
 
         parallelizer_mod.validate_tp_mesh_for_nemotron_nas(model, tp_size=2)
+
+
+class TestQwenImageEditParallelizationStrategy:
+    """Tests for the Qwen image-edit whole-block checkpointing strategy."""
+
+    @staticmethod
+    def _tiny_transformer():
+        """Build a one-block upstream Qwen transformer without downloading weights."""
+        diffusers = pytest.importorskip("diffusers")
+        return diffusers.QwenImageTransformer2DModel(
+            patch_size=2,
+            in_channels=16,
+            out_channels=4,
+            num_layers=1,
+            attention_head_dim=8,
+            num_attention_heads=1,
+            joint_attention_dim=12,
+            axes_dims_rope=(2, 2, 4),
+            zero_cond_t=True,
+        )
+
+    def test_whole_block_checkpointing_preserves_canonical_state_dict(self):
+        """Keep upstream Diffusers keys and every dual-stream branch parameter."""
+        import torch
+        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
+
+        torch.manual_seed(9)
+        model = self._tiny_transformer()
+        expected_state = {name: tensor.clone() for name, tensor in model.state_dict().items()}
+
+        parallelizer_mod._apply_qwen_block_activation_checkpointing(model)
+        parallelizer_mod._apply_qwen_block_activation_checkpointing(model)
+
+        assert isinstance(model.transformer_blocks[0], CheckpointWrapper)
+        actual_state = model.state_dict()
+        assert actual_state.keys() == expected_state.keys()
+        for name, expected in expected_state.items():
+            torch.testing.assert_close(actual_state[name], expected)
+
+        expected_branch_parameters = {
+            "transformer_blocks.0.attn.to_q.weight",
+            "transformer_blocks.0.attn.add_q_proj.weight",
+            "transformer_blocks.0.img_mlp.net.0.proj.weight",
+            "transformer_blocks.0.txt_mlp.net.0.proj.weight",
+        }
+        assert expected_branch_parameters <= set(actual_state)
+
+    def test_strategy_checkpoints_blocks_before_standard_fsdp_flow(self, monkeypatch):
+        """Cover complete Qwen blocks before delegating to repository FSDP2."""
+        import torch
+        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
+
+        model = self._tiny_transformer()
+        delegated = {}
+
+        def fake_parallelize(self, model, *args, **kwargs):
+            """Capture the model handed to the standard distributed strategy."""
+            delegated["model"] = model
+            delegated.update(kwargs)
+            return model
+
+        monkeypatch.setattr(parallelizer_mod.DefaultParallelizationStrategy, "parallelize", fake_parallelize)
+        result = parallelizer_mod.QwenImageEditParallelizationStrategy().parallelize(
+            model=model,
+            device_mesh=object(),
+            activation_checkpointing=True,
+        )
+
+        assert result is model
+        assert delegated["model"] is model
+        assert delegated["activation_checkpointing"] is False
+        wrapped_block = model.transformer_blocks[0]
+        assert isinstance(wrapped_block, CheckpointWrapper)
+        inner_block = wrapped_block._checkpoint_wrapped_module
+        assert isinstance(inner_block.attn, torch.nn.Module)
+        assert isinstance(inner_block.img_mlp, torch.nn.Module)
+        assert isinstance(inner_block.txt_mlp, torch.nn.Module)
+
+    def test_strategy_is_statically_registered(self):
+        """Resolve the upstream transformer class name to the Qwen strategy."""
+        strategy = parallelizer_mod.PARALLELIZATION_STRATEGIES["QwenImageTransformer2DModel"]
+        assert isinstance(strategy, parallelizer_mod.QwenImageEditParallelizationStrategy)
+
+    def test_strategy_rejects_blocks_missing_text_branch(self):
+        """Prevent silent omission of Qwen text-MLP parameters from sharding."""
+        import torch
+
+        class IncompleteBlock(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.attn = torch.nn.Linear(2, 2)
+                self.img_mlp = torch.nn.Linear(2, 2)
+
+        model = torch.nn.Module()
+        model.transformer_blocks = torch.nn.ModuleList([IncompleteBlock()])
+
+        with pytest.raises(TypeError, match="txt_mlp"):
+            parallelizer_mod._validate_qwen_transformer_blocks(model)
