@@ -23,12 +23,14 @@ model:
 
 # Constant LR (no lr_scheduler block): the LTX-2.3 reference SFT schedule
 # resolves to a flat 2e-5 for the entire run.
-optim:
-  learning_rate: 2e-5  # LTX-2.3 reference SFT learning rate
-  clip_grad: 10.0  # reference SFT max grad-norm (recipe default is 1.0)
-  optimizer:
-    weight_decay: 0.01
-    betas: [0.9, 0.999]
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 2e-5  # LTX-2.3 reference SFT learning rate
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+
+clip_grad_norm:
+  max_norm: 10.0  # reference SFT max grad-norm (recipe default is 1.0)
 
 fsdp:
   dp_size: 8
@@ -65,7 +67,7 @@ step_scheduler:
   local_batch_size: 1
   global_batch_size: 8
   ckpt_every_steps: 1000
-  log_every: 10
+  log_remote_every_steps: 10
   # max_steps: null  # Set to limit training to a specific number of steps
 
 data:

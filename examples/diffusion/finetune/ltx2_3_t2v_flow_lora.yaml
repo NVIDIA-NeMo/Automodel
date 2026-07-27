@@ -37,12 +37,14 @@ peft:
 # Constant LR (no lr_scheduler block), grad clip 10.0: matches the LTX-2.3
 # reference SFT training setup. LoRA params are created in fp32 with fp32 Adam
 # state (param_dtype=None under PEFT), so no master-weight override is needed.
-optim:
-  learning_rate: 5e-5
-  clip_grad: 10.0  # reference SFT max grad-norm (recipe default is 1.0)
-  optimizer:
-    weight_decay: 0.01
-    betas: [0.9, 0.999]
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 5e-5
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+
+clip_grad_norm:
+  max_norm: 10.0  # reference SFT max grad-norm (recipe default is 1.0)
 
 # FSDP2 with param_dtype=None when LoRA enabled:
 #   base weights (bf16): sharded, no grad comms
@@ -82,7 +84,7 @@ step_scheduler:
   local_batch_size: 1
   global_batch_size: 8
   ckpt_every_steps: 1000
-  log_every: 10
+  log_remote_every_steps: 10
   # max_steps: null  # Set to limit training to a specific number of steps
 
 data:
