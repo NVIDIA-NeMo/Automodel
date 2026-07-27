@@ -47,7 +47,7 @@ distributed:
   activation_checkpointing: true
   mp_policy:
     param_dtype: bfloat16
-    reduce_dtype: bfloat16
+    reduce_dtype: float32
     output_dtype: bfloat16
     cast_forward_inputs: true
   pipeline:
