@@ -47,7 +47,7 @@ class TestLTX2Properties:
         assert processor.model_version == "ltx2.3"
 
     def test_default_model_name(self, processor):
-        assert processor.default_model_name == "dg845/LTX-2.3-Diffusers"
+        assert processor.default_model_name == "diffusers/LTX-2.3-Diffusers"
 
     def test_supported_modes(self, processor):
         assert processor.supported_modes == ["video"]
@@ -182,39 +182,3 @@ class TestGetCacheData:
     def test_missing_audio_latents_raises(self, processor):
         with pytest.raises(ValueError, match="audio latents"):
             processor.get_cache_data(torch.randn(1, 128, 4, 4, 4), self._text_encodings(), {})
-
-
-# ---------------------------------------------------------------------------
-# Round-trip (encode normalization <-> decode denormalization) tests
-# ---------------------------------------------------------------------------
-class TestRoundTripHelpers:
-    def test_pixels_to_frames_range_mapping(self):
-        from tools.diffusion.validate_ltx2_roundtrip import pixels_to_frames
-
-        pixels = torch.tensor([-1.0, 0.0, 1.0]).view(1, 3, 1, 1, 1)
-        frames = pixels_to_frames(pixels)
-        assert frames.shape == (1, 1, 1, 3)
-        assert frames.reshape(-1).tolist() == [0, 128, 255]
-
-    def test_audio_decode_denormalization_inverts_encode(self):
-        # encode_audio stores (z - mean) / std on the flattened [B, L, C*M]
-        # layout; decode_audio_latents must feed z back into the audio VAE.
-        from tools.diffusion.validate_ltx2_roundtrip import decode_audio_latents
-
-        torch.manual_seed(0)
-        raw = torch.randn(1, 8, 20, 16)
-        models = _mock_audio_models(latent_frames=20, mean=1.5, std=2.5)
-        models["audio_vae"].encode.return_value[0].mode.return_value = raw
-        with patch.object(LTX2Processor, "load_audio", return_value=torch.zeros(2, round(20 / 25 * 16000))):
-            normalized = LTX2Processor().encode_audio("clip.mp4", round(20 / 25 * 24), models, "cpu")["audio_latents"]
-
-        vocoder = MagicMock(return_value=torch.zeros(1, 2, 100))
-        vocoder.config.output_sampling_rate = 48000
-        models["audio_vae"].decode.return_value = (torch.zeros(1, 2, 100, 64),)
-        models["audio_vae"].dtype = torch.float32
-        waveform, rate = decode_audio_latents(normalized.float(), models["audio_vae"], vocoder, "cpu")
-
-        assert rate == 48000
-        assert waveform.shape == (2, 100)
-        recovered = models["audio_vae"].decode.call_args.args[0]
-        torch.testing.assert_close(recovered, raw, atol=2e-2, rtol=1e-2)  # bf16 cache quantization

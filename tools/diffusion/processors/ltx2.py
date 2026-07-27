@@ -94,7 +94,7 @@ class LTX2Processor(BaseVideoProcessor):
     @property
     def default_model_name(self) -> str:
         # Diffusers-layout conversion of Lightricks/LTX-2.3 (the official repo is weights-only).
-        return "dg845/LTX-2.3-Diffusers"
+        return "diffusers/LTX-2.3-Diffusers"
 
     @property
     def supported_modes(self) -> List[str]:
@@ -115,7 +115,7 @@ class LTX2Processor(BaseVideoProcessor):
         Load LTX-2.3 encoding components (all frozen).
 
         Args:
-            model_name: HuggingFace model path (e.g., 'dg845/LTX-2.3-Diffusers')
+            model_name: HuggingFace model path (e.g., 'diffusers/LTX-2.3-Diffusers')
             device: Device to load models on
 
         Returns:

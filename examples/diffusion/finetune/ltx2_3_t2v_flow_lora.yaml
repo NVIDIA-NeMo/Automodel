@@ -12,7 +12,7 @@ dist_env:
 
 model:
   # Diffusers-layout conversion of Lightricks/LTX-2.3 (the official repo is weights-only).
-  pretrained_model_name_or_path: "dg845/LTX-2.3-Diffusers"
+  pretrained_model_name_or_path: "diffusers/LTX-2.3-Diffusers"
   # Required when peft block is present — passed to auto_diffusion_pipeline
   # for model-specific setup (no pre-inject hook needed for LTX-2).
   model_type: "ltx2"

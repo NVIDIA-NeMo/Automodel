@@ -12,7 +12,7 @@ dist_env:
 
 model:
   # Diffusers-layout conversion of Lightricks/LTX-2.3 (the official repo is weights-only).
-  pretrained_model_name_or_path: "dg845/LTX-2.3-Diffusers"
+  pretrained_model_name_or_path: "diffusers/LTX-2.3-Diffusers"
   mode: "finetune"
   # fp32 sharded master weights with bf16 compute (FSDP2 casts gathered params
   # to compute_dtype): the reference SFT recipe trains this way, and at lr 2e-5
