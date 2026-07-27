@@ -103,8 +103,10 @@ class DLLMStrategy(ABC):
         """
         num_noise = 0
         num_supervised = 0
-        for batch in batches:
-            noisy_input_ids, noise_mask, p_mask = recipe._apply_corruption(batch["input_ids"], batch["loss_mask"])
+        for microbatch_idx, batch in enumerate(batches):
+            noisy_input_ids, noise_mask, p_mask = recipe._apply_corruption(
+                batch["input_ids"], batch["loss_mask"], microbatch_idx=microbatch_idx
+            )
             batch["_noisy_input_ids"] = noisy_input_ids
             batch["_noise_mask"] = noise_mask
             batch["_p_mask"] = p_mask
@@ -184,7 +186,7 @@ class MDLMStrategy(DLLMStrategy):
     def apply_corruption(
         self, input_ids, loss_mask, mask_token_id, *, eps, block_size, half_life_ratio, generator=None
     ):
-        return corrupt_uniform(input_ids, loss_mask, mask_token_id, eps=eps)
+        return corrupt_uniform(input_ids, loss_mask, mask_token_id, eps=eps, generator=generator)
 
     def prepare_batch(self, batch, noisy_input_ids, noise_mask, clean_input_ids):
         batch["input_ids"] = noisy_input_ids
@@ -214,7 +216,7 @@ class HybridStrategy(DLLMStrategy):
         self, input_ids, loss_mask, mask_token_id, *, eps, block_size, half_life_ratio, generator=None
     ):
         if block_size is None:
-            return corrupt_uniform(input_ids, loss_mask, mask_token_id, eps=eps)
+            return corrupt_uniform(input_ids, loss_mask, mask_token_id, eps=eps, generator=generator)
         return corrupt_blockwise(
             input_ids,
             loss_mask,
@@ -222,6 +224,7 @@ class HybridStrategy(DLLMStrategy):
             block_size=block_size,
             eps=eps,
             half_life_ratio=half_life_ratio if half_life_ratio is not None else 0.25,
+            generator=generator,
         )
 
     def prepare_batch(self, batch, noisy_input_ids, noise_mask, clean_input_ids):
@@ -816,27 +819,6 @@ class BlockDiffusionStrategy(DLLMStrategy):
             eps=eps,
             generator=generator,
         )
-
-    def pre_step(self, recipe, batches) -> tuple[int, int]:
-        """Per-microbatch corruption, threading ``microbatch_idx`` into the seed.
-
-        Same sidecar stashing as the base ``pre_step``, but passes ``microbatch_idx``
-        to ``recipe._apply_corruption`` so each grad-accum microbatch draws distinct,
-        resume-reproducible block-diffusion noise.
-        """
-        num_noise = 0
-        num_supervised = 0
-        for microbatch_idx, batch in enumerate(batches):
-            noisy_input_ids, noise_mask, p_mask = recipe._apply_corruption(
-                batch["input_ids"], batch["loss_mask"], microbatch_idx=microbatch_idx
-            )
-            batch["_noisy_input_ids"] = noisy_input_ids
-            batch["_noise_mask"] = noise_mask
-            batch["_p_mask"] = p_mask
-            batch["_clean_input_ids"] = batch["input_ids"].clone()
-            num_noise += int(noise_mask.sum().item())
-            num_supervised += int(batch["loss_mask"].sum().item())
-        return num_noise, num_supervised
 
     @staticmethod
     def split_prompt_response(

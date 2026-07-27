@@ -289,6 +289,20 @@ class DecodeEvalRunner:
         """Whether a new eval should launch at this optimizer step."""
         return global_step // self.config.every_steps > self._last_bucket
 
+    def resume_from_step(self, global_step: int) -> None:
+        """Align the launch cadence to a restored ``global_step`` after a resume.
+
+        Without this a resumed run starts with ``_last_bucket == 0`` and
+        :meth:`due` fires immediately, spending a full eval (a detached engine
+        server plus its benchmark, on the GPU the training run has just finished
+        reclaiming) on a cadence region that already ran before the checkpoint.
+        Landing on a step whose eval had completed is worse than redundant:
+        :meth:`maybe_launch` clears that step's result before relaunching, so a
+        collected result is discarded to recompute what it already held.
+        """
+        self._last_bucket = global_step // self.config.every_steps
+        self._launched_for_step = global_step
+
     def maybe_launch(self, global_step: int, draft_model) -> bool:
         """Snapshot the draft and launch the worker if the cadence is due and no eval is running."""
         if not self.due(global_step):

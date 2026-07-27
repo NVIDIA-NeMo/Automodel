@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -24,6 +25,7 @@ from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm
     _extract_custom_args,
     _finish_hf_reload_sync,
     _get_input_ids,
+    _hf_model_load_context,
     _hf_source_load_kwargs,
     _load_hf_fp8_dequantized_config,
     _post_load_dequant_max_memory,
@@ -74,6 +76,26 @@ def test_explicit_attention_implementation_is_preserved():
         )
 
     assert hf_kwargs["attn_implementation"] == "eager"
+
+
+@pytest.mark.parametrize(
+    ("trust_remote_code", "has_device_map", "expected_no_meta_calls"),
+    [(True, True, 0), (False, False, 0), (True, False, 1)],
+)
+def test_hf_model_load_context_keeps_meta_for_device_map(
+    trust_remote_code,
+    has_device_map,
+    expected_no_meta_calls,
+):
+    with patch("nemo_automodel._transformers.model_init.no_hf_meta_device") as no_hf_meta_device:
+        no_hf_meta_device.return_value = nullcontext()
+        with _hf_model_load_context(
+            trust_remote_code=trust_remote_code,
+            has_device_map=has_device_map,
+        ):
+            pass
+
+    assert no_hf_meta_device.call_count == expected_no_meta_calls
 
 
 @pytest.mark.parametrize(("offline", "expected_local_files_only"), [(None, False), ("1", True)])
