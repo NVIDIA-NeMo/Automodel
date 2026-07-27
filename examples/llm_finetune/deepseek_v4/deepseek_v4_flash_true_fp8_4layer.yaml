@@ -117,3 +117,8 @@ optimizer:
   # TE GroupedLinear expert parameters are regular tensors while the rest of
   # the FSDP model is DTensor-backed.
   foreach: false
+
+ci:
+  recipe_owner: huiyingl
+  time: "00:30:00"
+  nodes: 1
