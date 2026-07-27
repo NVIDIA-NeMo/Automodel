@@ -16,6 +16,8 @@
 
 import functools
 import logging
+from collections.abc import Callable
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 
 import torch
 import torch.nn as nn
@@ -104,6 +106,56 @@ def _get_moe_module(block: nn.Module) -> MoE | None:
         module = getattr(block, name, None)
         if isinstance(module, MoE):
             return module
+
+
+def _preserve_gate_load_during_recompute(
+    block: nn.Module,
+    context_fn: Callable[[], tuple[AbstractContextManager, AbstractContextManager]] | None = None,
+) -> Callable[[], tuple[AbstractContextManager, AbstractContextManager]] | None:
+    """Keep checkpoint recomputation from accumulating MoE gate load twice.
+
+    Activation checkpointing replays the block during backward. The gate's
+    cumulative expert load is optimizer-step state, so the replay must start
+    from the same state as the original forward without committing its update.
+    """
+    moe = _get_moe_module(block)
+    gate = getattr(moe, "gate", None)
+    if not isinstance(gate, nn.Module) or not hasattr(gate, "_cumulative_expert_load"):
+        return context_fn
+
+    def checkpoint_context_fn() -> tuple[AbstractContextManager, AbstractContextManager]:
+        forward_context, recompute_context = context_fn() if context_fn is not None else (nullcontext(), nullcontext())
+        load_before_forward = None
+        preserve_load = False
+
+        @contextmanager
+        def forward():
+            nonlocal load_before_forward, preserve_load
+            preserve_load = gate.training and getattr(gate, "bias_update_factor", 0) > 0
+            if preserve_load:
+                current_load = gate._cumulative_expert_load
+                load_before_forward = current_load.clone() if current_load is not None else None
+            with forward_context:
+                yield
+
+        @contextmanager
+        def recompute():
+            if not preserve_load:
+                with recompute_context:
+                    yield
+                return
+
+            load_after_forward = gate._cumulative_expert_load
+            gate._cumulative_expert_load = load_before_forward
+            try:
+                with recompute_context:
+                    yield
+            finally:
+                gate._cumulative_expert_load = load_after_forward
+
+        return forward(), recompute()
+
+    return checkpoint_context_fn
 
 
 def _get_model_moe_config(model: nn.Module):
@@ -428,7 +480,11 @@ def apply_ac(
 
             selective_context_fn = make_selective_checkpoint_context_fn()
             for parent_layers, layer_id, block in _iter_transformer_and_mtp_blocks(model):
-                block = ptd_checkpoint_wrapper(block, preserve_rng_state=True, context_fn=selective_context_fn)
+                block = ptd_checkpoint_wrapper(
+                    block,
+                    preserve_rng_state=True,
+                    context_fn=_preserve_gate_load_during_recompute(block, selective_context_fn),
+                )
                 # Tag so _apply_per_layer_compile compiles the wrapper OUTER (keeping the
                 # selective policy visible to the partitioner) instead of unwrapping and
                 # compiling the block inner, which would collapse selective AC into full
@@ -521,10 +577,14 @@ def apply_ac(
             block = ptd_checkpoint_wrapper(
                 block,
                 preserve_rng_state=True,
-                context_fn=selective_checkpointing_context_fn,
+                context_fn=_preserve_gate_load_during_recompute(block, selective_checkpointing_context_fn),
             )
         else:
-            block = ptd_checkpoint_wrapper(block, preserve_rng_state=True)
+            block = ptd_checkpoint_wrapper(
+                block,
+                preserve_rng_state=True,
+                context_fn=_preserve_gate_load_during_recompute(block),
+            )
 
         parent_layers.register_module(layer_id, block)
 
