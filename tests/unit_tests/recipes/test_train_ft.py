@@ -16,6 +16,7 @@ import logging
 import sys
 import types
 from contextlib import AbstractContextManager, nullcontext
+from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -45,7 +46,6 @@ from nemo_automodel.recipes.llm.train_ft import (
     _should_pack_validation,
     _supports_sequence_packing,
     build_model,
-    compute_trust_remote_code_from_model,
 )
 
 
@@ -155,6 +155,36 @@ class DummyMapDataset(torch.utils.data.Dataset):
 
     def shuffle(self, seed):
         return self
+
+
+class DummyConfiguredTokenizer:
+    """Test tokenizer factory with implementation-owned configuration."""
+
+    calls: dict[str, object] = {}
+    result: object = object()
+
+    @dataclass(frozen=True, kw_only=True)
+    class Config:
+        """Declarative test tokenizer configuration."""
+
+        revision: str
+        trust_remote_code: bool = False
+
+        def build(self) -> object:
+            """Build the configured test tokenizer."""
+            return DummyConfiguredTokenizer.from_pretrained(
+                revision=self.revision,
+                trust_remote_code=self.trust_remote_code,
+            )
+
+    @classmethod
+    def from_pretrained(cls, *, revision: str, trust_remote_code: bool) -> object:
+        """Capture construction arguments and return the configured test tokenizer."""
+        cls.calls = {
+            "revision": revision,
+            "trust_remote_code": trust_remote_code,
+        }
+        return cls.result
 
 
 def dl_factory_capture(**kwargs):  # returns a sentinel while exposing passed kwargs via attribute
@@ -983,7 +1013,11 @@ def _patch_setup_minimals(monkeypatch, patch_fn):
         ),
     )
     monkeypatch.setattr(RecipeConfig, "validation_dataloaders", property(lambda self: {}))
-    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft._build_tokenizer", lambda cfg_model, cfg_ds: ({}, None))
+    monkeypatch.setattr(
+        RecipeConfig,
+        "tokenizer",
+        property(lambda self: SimpleNamespace(build=lambda: None)),
+    )
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.ScopedRNG", lambda **kwargs: nullcontext())
     monkeypatch.setattr(
         "nemo_automodel.components.training.step_scheduler.StepSchedulerConfig.build",
@@ -1241,37 +1275,148 @@ def test_run_train_validation_loop_calls_gc_hook_once_per_step():
     trainer._maybe_collect_garbage.assert_called_once()
 
 
-def test_compute_trust_remote_code_prefers_cfg_flag():
-    cfg_model = ConfigNode({"trust_remote_code": False, "pretrained_model_name_or_path": "ignored"})
+def test_tokenizer_config_uses_model_fallback_and_direct_trust_policy():
+    from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 
-    with patch("nemo_automodel.recipes.llm.train_ft.resolve_trust_remote_code") as mock_resolve:
-        result = compute_trust_remote_code_from_model(cfg_model)
-
-    assert result is False
-    mock_resolve.assert_not_called()
-
-
-def test_compute_trust_remote_code_prefers_nested_config():
-    cfg_model = ConfigNode({"config": {"trust_remote_code": True}})
-
-    with patch("nemo_automodel.recipes.llm.train_ft.resolve_trust_remote_code") as mock_resolve:
-        result = compute_trust_remote_code_from_model(cfg_model)
-
-    assert result is True
-    mock_resolve.assert_not_called()
-
-
-def test_compute_trust_remote_code_falls_back_to_resolve():
-    cfg_model = ConfigNode({"pretrained_model_name_or_path": "nvidia/foo"})
+    tokenizer = object()
+    raw = ConfigNode(
+        {
+            "model": {"pretrained_model_name_or_path": "org/model", "trust_remote_code": False},
+            "dataset": {"_target_": DummyMapDataset},
+        }
+    )
 
     with patch(
-        "nemo_automodel.recipes.llm.train_ft.resolve_trust_remote_code",
-        return_value=True,
-    ) as mock_resolve:
-        result = compute_trust_remote_code_from_model(cfg_model)
+        "nemo_automodel._transformers.auto_tokenizer.NeMoAutoTokenizer.from_pretrained",
+        return_value=tokenizer,
+    ) as from_pretrained:
+        config = RecipeConfig(raw).tokenizer
+        assert isinstance(config, NeMoAutoTokenizer.Config)
+        built = config.build()
 
-    assert result is True
-    mock_resolve.assert_called_once_with("nvidia/foo")
+    assert built is tokenizer
+    from_pretrained.assert_called_once_with(
+        pretrained_model_name_or_path="org/model",
+        trust_remote_code=False,
+        force_default=False,
+        force_hf=False,
+    )
+
+
+def test_tokenizer_config_without_model_or_explicit_factory_is_disabled():
+    raw = ConfigNode({"dataset": {"_target_": DummyMapDataset}})
+
+    assert RecipeConfig(raw).tokenizer is None
+
+
+def test_tokenizer_config_uses_default_remote_code_policy_for_nvidia_model():
+    from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
+
+    raw = ConfigNode(
+        {
+            "model": {"pretrained_model_name_or_path": "nvidia/model"},
+            "dataset": {"_target_": DummyMapDataset},
+        }
+    )
+
+    config = RecipeConfig(raw).tokenizer
+    assert isinstance(config, NeMoAutoTokenizer.Config)
+    assert config.trust_remote_code is True
+
+
+def test_tokenizer_config_injects_nested_model_trust_into_dataset_factory():
+    raw = ConfigNode(
+        {
+            "model": {"config": {"trust_remote_code": True}},
+            "dataset": {
+                "_target_": DummyMapDataset,
+                "tokenizer": {"_target_": DummyConfiguredTokenizer.from_pretrained, "revision": "main"},
+            },
+        }
+    )
+
+    config = RecipeConfig(raw).tokenizer
+    assert isinstance(config, DummyConfiguredTokenizer.Config)
+    assert config.build() is DummyConfiguredTokenizer.result
+    assert DummyConfiguredTokenizer.calls == {"revision": "main", "trust_remote_code": True}
+
+
+def test_tokenizer_config_maps_hf_tokenizer_to_nemo_owned_config():
+    from transformers import AutoTokenizer as TransformersAutoTokenizer
+
+    from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
+
+    raw = ConfigNode(
+        {
+            "model": {"trust_remote_code": True},
+            "dataset": {
+                "_target_": DummyMapDataset,
+                "tokenizer": {
+                    "_target_": TransformersAutoTokenizer.from_pretrained,
+                    "pretrained_model_name_or_path": "org/tokenizer",
+                },
+            },
+        }
+    )
+
+    config = RecipeConfig(raw).tokenizer
+    assert isinstance(config, NeMoAutoTokenizer.Config)
+    assert config.pretrained_model_name_or_path == "org/tokenizer"
+    assert config.trust_remote_code is True
+    assert config.force_hf is True
+
+
+def test_tokenizer_config_rejects_factory_without_owned_config():
+    raw = ConfigNode(
+        {
+            "tokenizer": {"_target_": lambda: object()},
+            "dataset": {"_target_": DummyMapDataset},
+        }
+    )
+
+    with pytest.raises(TypeError, match="nested Config"):
+        _ = RecipeConfig(raw).tokenizer
+
+
+def test_tokenizer_config_explicit_dataset_null_overrides_top_level_factory():
+    top_level_factory = MagicMock(return_value=object())
+    raw = ConfigNode(
+        {
+            "model": {"pretrained_model_name_or_path": "org/model"},
+            "tokenizer": {"_target_": top_level_factory},
+            "dataset": {"_target_": DummyMapDataset, "tokenizer": None},
+        }
+    )
+
+    assert RecipeConfig(raw).tokenizer is None
+    top_level_factory.assert_not_called()
+
+
+def test_tokenizer_config_builds_top_level_processor_without_recipe_dispatch():
+    from transformers import AutoProcessor as TransformersAutoProcessor
+
+    from nemo_automodel._transformers.auto_processor import AutoProcessor
+
+    processor = object()
+    raw = ConfigNode(
+        {
+            "model": {"pretrained_model_name_or_path": "org/model", "trust_remote_code": True},
+            "tokenizer": {
+                "_target_": TransformersAutoProcessor.from_pretrained,
+                "pretrained_model_name_or_path": "org/processor",
+            },
+            "dataset": {"_target_": DummyMapDataset},
+        }
+    )
+
+    config = RecipeConfig(raw).tokenizer
+    assert isinstance(config, AutoProcessor.Config)
+    with patch("transformers.AutoProcessor.from_pretrained", return_value=processor) as from_pretrained:
+        assert config.build() is processor
+    from_pretrained.assert_called_once_with(
+        pretrained_model_name_or_path="org/processor",
+        trust_remote_code=False,
+    )
 
 
 # -----------------

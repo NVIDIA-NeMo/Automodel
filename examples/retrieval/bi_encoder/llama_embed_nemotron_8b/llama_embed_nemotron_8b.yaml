@@ -36,8 +36,9 @@ model:
   torch_dtype: bfloat16
 
 tokenizer:
-  _target_: transformers.AutoTokenizer.from_pretrained
+  _target_: nemo_automodel.NeMoAutoTokenizer.Config
   pretrained_model_name_or_path: meta-llama/Llama-3.1-8B
+  force_hf: true
 
 dataset:
   _target_: nemo_automodel.components.datasets.llm.retrieval_dataset.RetrievalDatasetConfig

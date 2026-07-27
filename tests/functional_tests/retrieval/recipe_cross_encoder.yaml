@@ -26,7 +26,7 @@ model:
   torch_dtype: bfloat16
 
 tokenizer:
-  _target_: nemo_automodel._transformers.auto_tokenizer.NeMoAutoTokenizer.from_pretrained
+  _target_: nemo_automodel.NeMoAutoTokenizer.Config
   pretrained_model_name_or_path: /home/TestData/automodel/llama-nemotron-embed-1b-v2/
   trust_remote_code: true
 
