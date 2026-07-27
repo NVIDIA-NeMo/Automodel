@@ -125,6 +125,22 @@ def test_fp32_config_constructs_all_floating_parameters_in_fp32():
     assert not mismatches
 
 
+def test_config_honors_canonical_dtype_argument():
+    config = DeepseekV4Config(dtype="float32")
+
+    assert config.dtype == torch.float32
+    assert config.torch_dtype == torch.float32
+
+
+def test_config_preserves_fp32_dtype_through_serialization_round_trip():
+    config = DeepseekV4Config(dtype="float32")
+
+    restored = DeepseekV4Config.from_dict(config.to_dict())
+
+    assert restored.dtype == torch.float32
+    assert restored.torch_dtype == torch.float32
+
+
 class TestDeepseekV4ModelSmoke:
     def test_dsv4_hca_param_sync_group_uses_only_1d_mesh(self):
         named_hca_group = object()
