@@ -180,26 +180,30 @@ def test_log_extra_train_metrics(caplog):
     assert "base_loss=2.3" in caplog.text
 
 
-def test_domino_wandb_metrics_include_head_diagnostics():
+def test_domino_train_sums_include_head_diagnostics():
     recipe = _recipe()
     metrics = SimpleNamespace(
-        accept_len=torch.tensor(2.5),
+        accept_len_sum=torch.tensor(5.0),
+        valid_blocks=torch.tensor(2.0),
+        valid_tokens=torch.tensor(10.0),
         final_loss=torch.tensor(0.9),
         base_loss=torch.tensor(1.2),
-        base_accuracy=torch.tensor(0.4),
-        base_accept_len=torch.tensor(1.8),
+        base_correct_tokens=torch.tensor(4.0),
+        base_accept_len_sum=torch.tensor(3.6),
         lambda_base=torch.tensor(0.25),
     )
 
-    values = recipe._extra_train_wandb_metrics(metrics)
+    values = recipe._extra_train_metric_sums(metrics)
 
+    # Every entry is (numerator, denominator) so the caller can average it over
+    # the same window as train/loss instead of reporting one micro-batch.
     assert values == {
-        "train/accept_len": 2.5,
-        "train/final_loss": pytest.approx(0.9),
-        "train/base_loss": pytest.approx(1.2),
-        "train/base_accuracy": pytest.approx(0.4),
-        "train/base_accept_len": pytest.approx(1.8),
-        "train/lambda_base": 0.25,
+        "train/accept_len": (pytest.approx(5.0), pytest.approx(2.0)),
+        "train/final_loss": (pytest.approx(0.9), 1.0),
+        "train/base_loss": (pytest.approx(1.2), 1.0),
+        "train/base_accuracy": (pytest.approx(4.0), pytest.approx(10.0)),
+        "train/base_accept_len": (pytest.approx(3.6), pytest.approx(2.0)),
+        "train/lambda_base": (pytest.approx(0.25), 1.0),
     }
 
 
