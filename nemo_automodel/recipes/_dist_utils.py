@@ -27,6 +27,7 @@ from typing import Any, Dict, Optional
 from nemo_automodel.components.distributed.config import (
     DistributedSetup,
     MoEParallelizerConfig,
+    MultimodalDistributedConfig,
     _resolve_strategy_config,
 )
 from nemo_automodel.components.distributed.mesh import ParallelismSizes
@@ -115,6 +116,13 @@ def parse_distributed_section(cfg_dict: dict) -> dict:
 
     # Everything still in *cfg* is forwarded to the strategy constructor.
     strategy_kwargs: Dict[str, Any] = cfg
+
+    # Coerce the serialized multimodal policy at the YAML boundary so the
+    # component layer only receives typed config objects.
+    if "multimodal" in strategy_kwargs:
+        multimodal_raw = strategy_kwargs["multimodal"]
+        if isinstance(multimodal_raw, dict):
+            strategy_kwargs["multimodal"] = MultimodalDistributedConfig(**multimodal_raw)
 
     # Instantiate mp_policy from YAML dict for the strategy config.
     # Follows the same ``_target_`` pattern used for MoE mp_policy below.

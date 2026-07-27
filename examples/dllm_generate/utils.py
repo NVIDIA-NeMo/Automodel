@@ -141,8 +141,8 @@ def load_model_and_tokenizer(checkpoint_path: str, sampler_name: str = "llada"):
 
     Args:
         checkpoint_path: Path to the HF-format checkpoint directory.
-        sampler_name: ``"llada"``, ``"llada2"``, or ``"nemotron"``. Adjusts
-            tokenizer setup and model construction kwargs for the chosen family.
+        sampler_name: ``"llada"``, ``"llada2"``, ``"nemotron"``, or ``"gemma"``.
+            Adjusts tokenizer setup and model construction for the chosen family.
 
     Returns:
         ``(model, tokenizer, mask_id, eos_id)``.
@@ -152,6 +152,49 @@ def load_model_and_tokenizer(checkpoint_path: str, sampler_name: str = "llada"):
     _patch_remote_code_compat()
 
     tokenizer = NeMoAutoTokenizer.from_pretrained(checkpoint_path, trust_remote_code=True)
+
+    if sampler_name == "gemma":
+        # DiffusionGemma generation runs through the diffusion sampler that
+        # ships with ``transformers`` (>= 5.11). Load the stock HF class
+        # directly: the NeMoAuto wrapper resolves this architecture to the
+        # Automodel *training* implementation, which has no ``generate``.
+        from transformers import DiffusionGemmaForBlockDiffusion
+
+        # DiffusionGemma SFT saves ONLY the trained decoder (state_dict_adapter:
+        # "frozen base ... is loaded separately"); the frozen encoder that reads
+        # the prompt is not exported. So load the FULL base model recorded in the
+        # checkpoint's config (``_name_or_path``) for a complete encoder, then
+        # overlay the fine-tuned decoder weights on top. bfloat16 explicitly:
+        # SFT consolidates fp32 master weights (104 GB for 26B) which cannot fit
+        # one GPU; "auto" would honor that dtype and offload to meta.
+        cfg_path = os.path.join(checkpoint_path, "config.json")
+        is_local_ckpt = os.path.isfile(cfg_path)
+        base_id = checkpoint_path
+        if is_local_ckpt:
+            import json
+
+            with open(cfg_path) as f:
+                base_id = json.load(f).get("_name_or_path", checkpoint_path)
+
+        model = DiffusionGemmaForBlockDiffusion.from_pretrained(base_id, dtype="bfloat16", device_map="cuda")
+
+        if is_local_ckpt and os.path.realpath(str(base_id)) != os.path.realpath(checkpoint_path):
+            import glob
+
+            from safetensors.torch import load_file
+
+            overlay = {}
+            for shard in sorted(glob.glob(os.path.join(checkpoint_path, "*.safetensors"))):
+                overlay.update(load_file(shard))
+            missing, unexpected = model.load_state_dict(overlay, strict=False)
+            # every fine-tuned tensor must land somewhere; encoder keys are absent
+            # from the overlay and correctly kept from the base.
+            if unexpected:
+                raise RuntimeError(f"fine-tuned decoder keys not found in base model: {unexpected[:5]}")
+            print(f"[gemma] overlaid {len(overlay)} fine-tuned decoder tensors onto base {base_id}")
+
+        return model.eval(), tokenizer, None, tokenizer.eos_token_id
+
     if sampler_name == "llada":
         if tokenizer.mask_token is None:
             tokenizer.add_special_tokens({"mask_token": "<|mdm_mask|>"})
@@ -182,6 +225,115 @@ def load_model_and_tokenizer(checkpoint_path: str, sampler_name: str = "llada"):
 
     eos_id = tokenizer.eos_token_id
     return model, tokenizer, mask_id, eos_id
+
+
+# Native Automodel DiffusionGemma module paths -> HF DiffusionGemmaForBlockDiffusion
+# paths. The two implementations share the same leaf modules (split q/k/v/o and
+# gate/up/down projections) but nest the layer stack differently, so LoRA
+# adapters trained on the native class need this re-parenting before the HF
+# class (the only one that ships ``generate()``) can inject them.
+GEMMA_ADAPTER_KEY_MAP = {"model.layers.": "model.decoder.layers."}
+
+
+def translate_adapter(adapter_path: str, key_map: dict[str, str]) -> str:
+    """Write a module-path-translated copy of a PEFT adapter checkpoint.
+
+    Only the key *addresses* change (tensor values are untouched); returns the
+    directory holding the translated copy.
+    """
+    import json
+    import tempfile
+
+    from safetensors.torch import load_file, save_file
+
+    def tr(key: str) -> str:
+        for old, new in key_map.items():
+            key = key.replace(old, new)
+        return key
+
+    out_dir = tempfile.mkdtemp(prefix="adapter_translated_")
+    tensors = load_file(os.path.join(adapter_path, "adapter_model.safetensors"))
+    save_file({tr(k): v for k, v in tensors.items()}, os.path.join(out_dir, "adapter_model.safetensors"))
+    with open(os.path.join(adapter_path, "adapter_config.json")) as f:
+        cfg = json.load(f)
+    if isinstance(cfg.get("target_modules"), list):
+        cfg["target_modules"] = [tr(t) for t in cfg["target_modules"]]
+    with open(os.path.join(out_dir, "adapter_config.json"), "w") as f:
+        json.dump(cfg, f, indent=2, sort_keys=True)
+    return out_dir
+
+
+def _manual_merge_lora(model, adapter_path: str) -> None:
+    """Merge a LoRA adapter into ``model``'s weights in place, without ``PeftModel``.
+
+    ``peft``'s ``PeftModel`` wrapper assumes a standard autoregressive
+    generation interface (``prepare_inputs_for_generation``) that the
+    DiffusionGemma class does not implement. Since merging is just
+    ``W += (alpha / r) * B @ A`` per adapted linear, do it directly against the
+    base ``state_dict`` so any model — diffusion or AR — can be adapted.
+    """
+    import json
+
+    from safetensors.torch import load_file
+
+    tensors = load_file(os.path.join(adapter_path, "adapter_model.safetensors"))
+    with open(os.path.join(adapter_path, "adapter_config.json")) as f:
+        cfg = json.load(f)
+    r = int(cfg["r"])
+    scale = float(cfg.get("lora_alpha", r)) / r
+
+    sd = model.state_dict()
+    bases = {k[: -len(".lora_A.weight")] for k in tensors if k.endswith(".lora_A.weight")}
+    merged = 0
+    for base in bases:
+        a = tensors[base + ".lora_A.weight"]
+        b = tensors[base + ".lora_B.weight"]
+        weight_key = base.replace("base_model.model.", "", 1) + ".weight"
+        if weight_key not in sd:
+            raise KeyError(f"adapter targets {weight_key!r} which is absent from the base model")
+        w = sd[weight_key]
+        delta = (b.to(torch.float32) @ a.to(torch.float32)) * scale
+        w.add_(delta.to(w.dtype).to(w.device))
+        merged += 1
+    if merged == 0:
+        raise ValueError("no LoRA modules found in adapter checkpoint")
+
+
+def merge_adapter(model, adapter_path: str, key_map: dict[str, str] | None = None):
+    """Merge a PEFT adapter checkpoint into the loaded base model for inference.
+
+    Automodel PEFT training writes ``adapter_model.safetensors`` plus an
+    HF-format ``adapter_config.json``. Adapters are merged into the base
+    weights and the PEFT wrapper is dropped, keeping the generation code path
+    identical to full-SFT checkpoints.
+
+    Args:
+        model: The loaded base model to merge into.
+        adapter_path: Directory with the adapter checkpoint.
+        key_map: Optional module-path translation applied first, for families
+            whose training implementation names modules differently from the
+            inference class (see ``GEMMA_ADAPTER_KEY_MAP``).
+    """
+    if key_map:
+        adapter_path = translate_adapter(adapter_path, key_map)
+
+    # DiffusionGemma (and other non-AR diffusion models) don't implement the
+    # standard generation interface (``prepare_inputs_for_generation``) that
+    # ``PeftModel`` assumes, so wrapping them fails. Detect that up front and
+    # merge the LoRA weights directly instead — checked BEFORE any peft
+    # wrapping so a partial injection can't corrupt the base state_dict.
+    try:
+        from peft import PeftModel
+    except ImportError:
+        _manual_merge_lora(model, adapter_path)
+        return model.eval()
+
+    if not hasattr(model, "prepare_inputs_for_generation"):
+        _manual_merge_lora(model, adapter_path)
+        return model.eval()
+
+    merged = PeftModel.from_pretrained(model, adapter_path).merge_and_unload()
+    return merged.eval()
 
 
 # ---------------------------------------------------------------------------

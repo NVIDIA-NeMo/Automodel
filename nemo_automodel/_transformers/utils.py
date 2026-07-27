@@ -409,7 +409,7 @@ def _patch_peft_prepare_inputs():
         from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM
 
         if not getattr(Qwen3ForCausalLM.forward, "__nemo_dtensor_logits_to_keep_patched__", False):
-            from transformers.modeling_outputs import CausalLMOutputWithPast  # noqa: WPS433
+            from transformers.modeling_outputs import CausalLMOutputWithPast
 
             _orig_forward = Qwen3ForCausalLM.forward
 

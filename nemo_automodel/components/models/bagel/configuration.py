@@ -51,6 +51,12 @@ class BagelBackendConfig:
 
     linear: Literal["torch", "te"] = "torch"
     rms_norm: Literal["torch", "torch_fp32", "te"] = "torch_fp32"
+    # Fuse silu(gate)*up into one compiled pointwise kernel in Qwen2MLP.
+    fused_swiglu: bool = False
+    # Fuse the RoPE rotate/mul/add into one compiled pointwise kernel in attention.
+    fused_rope: bool = False
+    # MLM-style grouped MoT routing: permute und/gen tokens into contiguous blocks once.
+    mot_grouped: bool = False
 
     def __post_init__(self) -> None:
         if self.linear not in {"torch", "te"}:
@@ -72,7 +78,7 @@ def resolve_bagel_backend(backend: Any = None) -> BagelBackendConfig:
         raise TypeError(f"BAGEL backend must be a mapping or BagelBackendConfig, got {type(backend)!r}")
 
     overrides = dict(backend)
-    unknown_fields = sorted(overrides.keys() - {"linear", "rms_norm"})
+    unknown_fields = sorted(overrides.keys() - {"linear", "rms_norm", "fused_swiglu", "fused_rope", "mot_grouped"})
     if unknown_fields:
         raise TypeError(f"Unknown BAGEL backend field(s): {unknown_fields}")
     return BagelBackendConfig(**overrides)

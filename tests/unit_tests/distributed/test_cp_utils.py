@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import contextlib
 from functools import partial
+from unittest import mock
 
 import pytest
 import torch
@@ -445,6 +446,73 @@ def test_attach_context_parallel_hooks_skips_non_self_attn():
     assert len(model.layers._forward_pre_hooks) == 0
     for layer in model.layers:
         assert len(layer._forward_pre_hooks) == 0
+
+
+def test_attach_te_context_parallel_configures_full_and_sliding_attention(monkeypatch):
+    """TE setup must configure TP independently and choose the CP communication mode."""
+
+    class _FakeDotProductAttention:
+        def __init__(self):
+            self.calls = []
+            self.tp_calls = []
+            self.num_attention_heads = 8
+            self.num_gqa_groups = 4
+            self.tp_size = 1
+            self.num_gqa_groups_per_partition = 4
+
+        def set_context_parallel_group(self, group, ranks, stream, *, cp_comm_type):
+            self.calls.append((group, ranks, stream, cp_comm_type))
+
+        def set_tensor_parallel_group(self, group):
+            self.tp_calls.append(group)
+
+    class _Attention(torch.nn.Module):
+        def __init__(self, sliding_window):
+            super().__init__()
+            self.attn_module = _FakeDotProductAttention()
+            self.sliding_window = sliding_window
+
+    class _Block(torch.nn.Module):
+        def __init__(self, sliding_window):
+            super().__init__()
+            self.self_attn = _Attention(sliding_window)
+
+    model = torch.nn.ModuleList([_Block(None), _Block(128)])
+    group = object()
+    stream = object()
+    cp_mesh = mock.MagicMock()
+    cp_mesh.size.return_value = 2
+    cp_mesh.get_group.return_value = group
+    tp_group = object()
+    tp_mesh = mock.MagicMock()
+    tp_mesh.size.return_value = 2
+    tp_mesh.get_group.return_value = tp_group
+
+    monkeypatch.setattr(
+        "nemo_automodel.shared.import_utils.safe_import_from",
+        lambda *_args: (True, _FakeDotProductAttention),
+    )
+    monkeypatch.setattr(torch.distributed, "get_process_group_ranks", lambda _group: [0, 1])
+    monkeypatch.setattr(torch.cuda, "Stream", lambda: stream)
+
+    configured = _cu.attach_te_context_parallel(model, cp_mesh, tp_mesh)
+
+    assert configured == 2
+    assert model[0].self_attn.attn_module.calls == [(group, [0, 1], stream, "p2p")]
+    assert model[1].self_attn.attn_module.calls == [(group, [0, 1], stream, "all_gather")]
+    for block in model:
+        assert block.self_attn.attn_module.tp_calls == [tp_group]
+        assert block.self_attn.attn_module.tp_size == 2
+        assert block.self_attn.attn_module.num_gqa_groups_per_partition == 2
+
+    tp_only_model = torch.nn.ModuleList([_Block(None)])
+    configured = _cu.attach_te_context_parallel(tp_only_model, tp_mesh=tp_mesh)
+
+    assert configured == 1
+    assert tp_only_model[0].self_attn.attn_module.calls == []
+    assert tp_only_model[0].self_attn.attn_module.tp_calls == [tp_group]
+    assert tp_only_model[0].self_attn.attn_module.tp_size == 2
+    assert tp_only_model[0].self_attn.attn_module.num_gqa_groups_per_partition == 2
 
 
 # ============================================================================

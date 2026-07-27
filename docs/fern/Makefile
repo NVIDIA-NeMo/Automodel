@@ -115,7 +115,8 @@ docs-mdx-check: docs-stitch
 docs-stitch:
 	@git -C "$(REPO_ROOT)" fetch --depth=1 origin $(ARCHIVE_REF) --quiet
 	@git -C "$(REPO_ROOT)" restore --source=FETCH_HEAD --worktree --no-overlay -- docs/fern/versions/v0.4/pages
-	@echo "Stitched frozen v0.4 pages from $(ARCHIVE_REF)."
+	@git -C "$(REPO_ROOT)" restore --source=FETCH_HEAD --worktree --no-overlay -- docs/fern/versions/v0.5/pages
+	@echo "Stitched frozen v0.4, v0.5 pages from $(ARCHIVE_REF)."
 
 # Wraps the autodoc generate step. If it fails (the most common cause is
 # the HTTP 403 from missing dashboard provisioning), print the recovery

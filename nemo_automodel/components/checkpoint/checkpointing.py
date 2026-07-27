@@ -44,6 +44,7 @@ from safetensors.torch import load as safetensors_load
 from safetensors.torch import load_file, save_file
 from safetensors.torch import save as safetensors_save
 from torch import nn
+from torch.distributed.checkpoint.storage import StorageReader, StorageWriter
 from torch.distributed.device_mesh import DeviceMesh
 from torch.nn.parallel import DistributedDataParallel
 
@@ -203,9 +204,7 @@ def _load_safetensors(path: str) -> dict[str, torch.Tensor]:
     return load_file(path)
 
 
-def _maybe_msc_reader(
-    path: str, storage_reader: Optional[_HuggingFaceStorageReader]
-) -> Optional[_HuggingFaceStorageReader]:
+def _maybe_msc_reader(path: str, storage_reader: StorageReader | None) -> StorageReader | None:
     """Return an MSC filesystem reader for ``msc://`` paths, else the given reader."""
     if storage_reader is None and is_cloud_path(path):
         _ensure_msc_available()
@@ -213,9 +212,7 @@ def _maybe_msc_reader(
     return storage_reader
 
 
-def _maybe_msc_writer(
-    path: str, storage_writer: Optional[_HuggingFaceStorageWriter]
-) -> Optional[_HuggingFaceStorageWriter]:
+def _maybe_msc_writer(path: str, storage_writer: StorageWriter | None) -> StorageWriter | None:
     """Return an MSC filesystem writer for ``msc://`` paths, else the given writer."""
     if storage_writer is None and is_cloud_path(path):
         _ensure_msc_available()
@@ -266,7 +263,7 @@ def _summarize_state_dict_key_diff(
 
 def _get_checkpoint_metadata_keys(
     path: str,
-    storage_reader: Optional[_HuggingFaceStorageReader] = None,
+    storage_reader: StorageReader | None = None,
 ) -> set[str]:
     """Return checkpoint FQNs present in metadata."""
     reader = storage_reader if storage_reader is not None else FileSystemReader(path)
@@ -1218,7 +1215,7 @@ class Checkpointer:
         self,
         state_dict: dict[str, torch.Tensor],
         path: str,
-        storage_reader: Optional[_HuggingFaceStorageReader] = None,
+        storage_reader: StorageReader | None = None,
         is_init_step: bool = False,
     ) -> dict[str, torch.Tensor]:
         """
@@ -1246,7 +1243,7 @@ class Checkpointer:
         return state_dict
 
     def _do_save(
-        self, state_dict: dict[str, torch.Tensor], path: str, storage_writer: Optional[_HuggingFaceStorageWriter] = None
+        self, state_dict: dict[str, torch.Tensor], path: str, storage_writer: StorageWriter | None = None
     ) -> Optional["AsyncSaveResponse"]:
         """
         Save a state dictionary to `path` using DCP or PEFT special-case logic.
@@ -1426,7 +1423,9 @@ fi
                 # some HF models like Moonlight-16B have non-persistent buffers in the base checkpoint
                 # however, HF initializes buffers with persistent=False, so we need to make sure these
                 # buffer keys are not saved during checkpointing
-                # The `_pre_shard_hf_state_dict_keys` attribute is set in the `apply_model_infrastructure` in auto_model.py
+                # The `_pre_shard_hf_state_dict_keys` attribute is set during parallelization: in
+                # `apply_model_infrastructure` (_transformers/infrastructure.py) for LLM/VLM models and in
+                # `_apply_parallelization` (_diffusers/auto_diffusion_pipeline.py) for diffusion pipelines.
                 keys_to_remove = list(set(fqn_to_file_index_mapping.keys()) - set(pre_shard_hf_state_dict_keys))
                 # Only drop lm_head from the save map when it is actually an alias
                 # of the embedding (e.g. single-rank tied case). PP last stages have
@@ -1469,31 +1468,29 @@ fi
         self, model_state: ModelState, state_dict: dict[str, torch.Tensor]
     ) -> Optional[dict[str, str]]:
         """
-        Build FQN to original HF safetensors dtype mapping for consolidated export.
+        Build FQN to target safetensors dtype mapping for consolidated export.
 
-        Returns None when the run started from config-only weights or the original HF
-        safetensors headers are not available. In that case consolidation keeps the
-        saved checkpoint dtype unless the user explicitly passes CAST_DTYPE to the
-        offline helper.
+        Original HF safetensors headers provide the baseline mapping when available.
+        Model-owned adapter overrides are applied even for config-only runs so
+        intrinsically fp32 tensors retain their required export dtype.
         """
         if not _should_write_hf_metadata(self.config):
             return None
 
+        model = _unwrap_ddp_model(model_state.model[0])
+        normalized_dtype_mapping: dict[str, str] = {}
         reference_path = _get_hf_safetensors_reference_path(
             self.config.model_cache_dir,
             self.config.model_repo_id,
         )
-        if not reference_path:
-            return None
-
-        model = model_state.model[0]
-        dtype_mapping = get_fqn_to_dtype_mapping(reference_path, getattr(model, "_checkpoint_conversion_mapping", None))
-        if not dtype_mapping:
-            return None
-
-        normalized_dtype_mapping = _normalize_dtype_mapping_to_state_dict_keys(
-            dtype_mapping, list(state_dict.keys()), getattr(model, "base_model_prefix", None)
-        )
+        if reference_path:
+            dtype_mapping = get_fqn_to_dtype_mapping(
+                reference_path, getattr(model, "_checkpoint_conversion_mapping", None)
+            )
+            if dtype_mapping:
+                normalized_dtype_mapping = _normalize_dtype_mapping_to_state_dict_keys(
+                    dtype_mapping, list(state_dict.keys()), getattr(model, "base_model_prefix", None)
+                )
         normalized_dtype_mapping = _apply_adapter_forced_dtype_mapping(model, state_dict, normalized_dtype_mapping)
         return normalized_dtype_mapping or None
 
@@ -1504,7 +1501,7 @@ fi
         fqn_to_dtype_mapping: Optional[dict[str, str]],
         model_path: str,
         consolidate_on_all_ranks: bool = False,
-    ) -> Optional[_HuggingFaceStorageWriter]:
+    ) -> StorageWriter | None:
         """
         Construct a Hugging Face storage writer for sharded safetensors.
 
@@ -1516,7 +1513,7 @@ fi
             consolidate_on_all_ranks: If True, consolidate on all ranks on the main process.
 
         Returns:
-            Configured `_HuggingFaceStorageWriter` or None for non-safetensors.
+            Configured storage writer or None for non-safetensors.
         """
         if self.config.model_save_format == SerializationFormat.SAFETENSORS:
             return _HuggingFaceStorageWriter(
@@ -1535,7 +1532,7 @@ fi
         key_mapping: Optional[dict[str, str]],
         is_init_step: bool = False,
         is_safetensors: bool | None = None,
-    ) -> Optional[_HuggingFaceStorageReader]:
+    ) -> StorageReader | None:
         """
         Construct a Hugging Face storage reader when loading safetensors or during init.
 
