@@ -55,4 +55,4 @@ def test_kimi_linear_registry_and_capabilities():
     assert capabilities.supports_ep
     assert not capabilities.supports_pp
     assert not capabilities.supports_tp
-    assert not capabilities.supports_cp
+    assert capabilities.supports_cp

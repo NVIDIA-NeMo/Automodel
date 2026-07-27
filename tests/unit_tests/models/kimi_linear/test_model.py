@@ -68,7 +68,7 @@ def _assert_floating_state_finite(model: torch.nn.Module) -> None:
 
 def test_update_moe_gate_bias_no_op_when_factor_zero():
     model = KimiLinearForCausalLM(_tiny_kimi_config(), backend=_backend_config())
-    moe_layer = model.model.layers["1"].block_sparse_moe
+    moe_layer = model.model.layers["1"].mlp
 
     assert moe_layer.gate.bias_update_factor == 0.0
     with patch.object(moe_layer.gate, "update_bias") as mock_update_bias:
@@ -94,7 +94,7 @@ def test_tiny_kimi_with_kda_initializes_fp32_params_when_fla_available():
 
 def test_kimi_moe_uses_hf_routing_numerics():
     model = KimiLinearForCausalLM(_tiny_kimi_config(), backend=_backend_config())
-    moe_layer = model.model.layers["1"].block_sparse_moe
+    moe_layer = model.model.layers["1"].mlp
 
     assert not moe_layer.gate.router_topk_sorted
     assert moe_layer.gate.router_weights_fp32
@@ -152,7 +152,7 @@ def test_hf_order_eval_moe_matches_standard_grouped_experts_path():
     model.initialize_weights(buffer_device=torch.device("cpu"), dtype=torch.float32)
     model.eval()
     moe_layer = model.model.layers["1"]
-    moe = moe_layer.block_sparse_moe
+    moe = moe_layer.mlp
     hidden_states = torch.randn(2, 3, model.config.hidden_size)
 
     with torch.inference_mode():
@@ -160,3 +160,88 @@ def test_hf_order_eval_moe_matches_standard_grouped_experts_path():
         standard = moe(hidden_states, None)
 
     torch.testing.assert_close(hf_order, standard, rtol=1e-5, atol=1e-6)
+
+
+def test_packed_mask_blocks_attention_across_documents():
+    torch.manual_seed(0)
+    model = KimiLinearForCausalLM(_tiny_kimi_config(), backend=_backend_config())
+    model.initialize_weights(buffer_device=torch.device("cpu"), dtype=torch.float32)
+    model.eval()
+
+    input_ids = torch.tensor([[3, 4, 5, 6, 7, 8]], dtype=torch.long)
+    attention_mask = torch.tensor([[1, 1, 1, 2, 2, 2]], dtype=torch.int32)
+    perturbed = input_ids.clone()
+    perturbed[0, 3:] = torch.tensor([11, 12, 13])
+
+    with torch.inference_mode():
+        baseline = model(input_ids=input_ids, attention_mask=attention_mask).logits
+        changed = model(input_ids=perturbed, attention_mask=attention_mask).logits
+
+    # Document 1 owns positions 0..2 and must not see the rewritten document 2.
+    torch.testing.assert_close(baseline[:, :3], changed[:, :3], rtol=1e-5, atol=1e-6)
+    assert not torch.allclose(baseline[:, 3:], changed[:, 3:])
+
+
+def test_padding_only_query_rows_stay_finite():
+    torch.manual_seed(0)
+    model = KimiLinearForCausalLM(_tiny_kimi_config(), backend=_backend_config())
+    model.initialize_weights(buffer_device=torch.device("cpu"), dtype=torch.float32)
+    model.eval()
+
+    input_ids = torch.tensor([[3, 4, 5, 0]], dtype=torch.long)
+    attention_mask = torch.tensor([[1, 1, 1, 0]], dtype=torch.int32)
+
+    with torch.inference_mode():
+        logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
+
+    assert torch.isfinite(logits).all()
+
+
+def test_prepare_model_inputs_for_cp_attaches_model_owned_sharding():
+    from nemo_automodel.components.models.kimi_linear.cp import shard_batch_for_kimi_cp
+
+    model = KimiLinearForCausalLM(_tiny_kimi_config(), backend=_backend_config())
+
+    updates = model.prepare_model_inputs_for_cp(input_ids=torch.zeros(1, 4, dtype=torch.long))
+
+    assert updates == {"_cp_make_batch_fn": shard_batch_for_kimi_cp}
+    assert model._owns_cp_attention is True
+
+
+def test_setup_cp_attention_records_mesh_on_every_attention_block():
+    _require_fla()
+    model = KimiLinearForCausalLM(_tiny_kimi_config(use_kda=True), backend=_backend_config())
+    sentinel = object()
+
+    for block in model.model.layers.values():
+        block.self_attn.setup_cp_attention(sentinel)
+
+    assert [block.self_attn._cp_mesh for block in model.model.layers.values()] == [sentinel, sentinel]
+
+
+def test_thd_packed_inputs_run_through_the_batched_layers():
+    """THD packing squeezes the batch axis off; the model must restore it."""
+    torch.manual_seed(0)
+    model = KimiLinearForCausalLM(_tiny_kimi_config(), backend=_backend_config())
+    model.initialize_weights(buffer_device=torch.device("cpu"), dtype=torch.float32)
+    model.eval()
+
+    input_ids = torch.tensor([[3, 4, 5, 6, 7, 8]], dtype=torch.long)
+    cu_seqlens = torch.tensor([[0, 3, 6]], dtype=torch.int32)
+
+    with torch.inference_mode():
+        thd = model(
+            input_ids=input_ids,
+            position_ids=torch.tensor([[0, 1, 2, 0, 1, 2]], dtype=torch.long),
+            qkv_format="thd",
+            cu_seqlens=cu_seqlens,
+        ).logits
+        bshd = model(
+            input_ids=input_ids,
+            attention_mask=torch.tensor([[1, 1, 1, 2, 2, 2]], dtype=torch.int32),
+        ).logits
+
+    assert thd.shape == (1, 6, model.vocab_size)
+    assert torch.isfinite(thd).all()
+    # Both routes describe the same two documents, so they must agree.
+    torch.testing.assert_close(thd, bshd, rtol=1e-5, atol=1e-6)
