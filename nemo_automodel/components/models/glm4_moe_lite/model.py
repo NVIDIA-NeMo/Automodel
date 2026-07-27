@@ -51,15 +51,15 @@ class Block(nn.Module):
 
         # Thread dtype from config.torch_dtype so the block's own params stay
         # aligned with the rest of the model (fp32 under fp32 master weights).
-        dtype = get_dtype((config.torch_dtype if "torch_dtype" in dir(config) else None), torch.bfloat16)
+        dtype = get_dtype(config.torch_dtype, torch.bfloat16)
 
         # GLM4-MoE-Lite uses mlp_layer_types to determine dense vs MoE layers
-        mlp_layer_types = config.mlp_layer_types if "mlp_layer_types" in dir(config) else None
+        mlp_layer_types = config.mlp_layer_types
         if mlp_layer_types is not None:
             is_moe_layer = mlp_layer_types[layer_idx] == "sparse"
         else:
             # Fallback to first_k_dense_replace pattern
-            first_k_dense_replace = config.first_k_dense_replace if "first_k_dense_replace" in dir(config) else 0
+            first_k_dense_replace = config.first_k_dense_replace
             is_moe_layer = layer_idx >= first_k_dense_replace
 
         if is_moe_layer:
@@ -124,7 +124,7 @@ class Glm4MoeLiteModel(nn.Module):
         # Resolve model dtype once; thread it explicitly to every sub-module
         # so fp32 master weights work even when construction is not wrapped in
         # local_torch_dtype().
-        model_dtype = get_dtype((config.torch_dtype if "torch_dtype" in dir(config) else None), torch.bfloat16)
+        model_dtype = get_dtype(config.torch_dtype, torch.bfloat16)
 
         # Map config -> MoE wrapper (same as GLM4 MoE)
         moe_defaults = dict(
@@ -281,7 +281,7 @@ class Glm4MoeLiteForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             moe_config=moe_config,
             moe_overrides=moe_overrides,
         )
-        model_dtype = get_dtype((config.torch_dtype if "torch_dtype" in dir(config) else None), torch.bfloat16)
+        model_dtype = get_dtype(config.torch_dtype, torch.bfloat16)
         self.lm_head = initialize_linear_module(
             self.backend.linear, config.hidden_size, config.vocab_size, bias=False, dtype=model_dtype
         )
@@ -314,9 +314,7 @@ class Glm4MoeLiteForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         **attn_kwargs: Any,
     ) -> CausalLMOutputWithPast:
         output_hidden_states = (
-            output_hidden_states
-            if output_hidden_states is not None
-            else (self.config.output_hidden_states if "output_hidden_states" in dir(self.config) else False)
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
 
         is_thd = "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd"

@@ -234,7 +234,7 @@ class MiMoV2FlashAttention(nn.Module):
         self.num_key_value_groups = self.num_attention_heads // self.num_key_value_heads
         self.attention_dropout = float(config.attention_dropout or 0.0)
         self.scaling = self.head_dim**-0.5
-        self.v_scale = config.attention_value_scale if "attention_value_scale" in dir(config) else None
+        self.v_scale = config.attention_value_scale
 
         dtype = get_dtype(config.torch_dtype, torch.bfloat16)
         self.q_proj = initialize_linear_module(
@@ -317,7 +317,7 @@ class MiMoV2FlashAttention(nn.Module):
         del buffer_device
         for linear in (self.q_proj, self.k_proj, self.v_proj, self.o_proj):
             nn.init.normal_(linear.weight, mean=0.0, std=init_std)
-            if (linear.bias if "bias" in dir(linear) else None) is not None:
+            if linear.bias is not None:
                 nn.init.zeros_(linear.bias)
         if self.attention_sink_bias is not None:
             nn.init.zeros_(self.attention_sink_bias)
@@ -332,9 +332,7 @@ class MiMoV2FlashBlock(nn.Module):
         self.attention_type = "sliding_attention" if is_swa else "full_attention"
         self.self_attn = MiMoV2FlashAttention(config, backend, is_swa=is_swa, layer_idx=layer_idx)
 
-        is_moe_layer = (config.n_routed_experts if "n_routed_experts" in dir(config) else None) is not None and bool(
-            config.moe_layer_freq[layer_idx]
-        )
+        is_moe_layer = config.n_routed_experts is not None and bool(config.moe_layer_freq[layer_idx])
         dtype = get_dtype(config.torch_dtype, torch.bfloat16)
         if is_moe_layer:
             self.mlp = MoE(moe_config, backend)
@@ -701,9 +699,7 @@ class MiMoV2FlashForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             ``logits`` and, when requested, ``hidden_states``.
         """
         output_hidden_states = (
-            output_hidden_states
-            if output_hidden_states is not None
-            else (self.config.output_hidden_states if "output_hidden_states" in dir(self.config) else False)
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
 
         hidden = self.model(
@@ -732,7 +728,7 @@ class MiMoV2FlashForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         """Keep the SWA rotary embedding on every PP stage."""
         text_model = text_model or self.model
         stage_modules = [list(modules) for modules in module_names_per_stage]
-        if (text_model.swa_rotary_emb if "swa_rotary_emb" in dir(text_model) else None) is not None:
+        if text_model.swa_rotary_emb is not None:
             fqn = f"{layers_prefix}swa_rotary_emb"
             for modules in stage_modules:
                 if fqn not in modules:

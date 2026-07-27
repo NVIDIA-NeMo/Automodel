@@ -27,6 +27,7 @@ from nemo_automodel.components.models.step3p5.model import (
     _keep_step_router_bias_fp32,
     parse_moe_layers_enum,
 )
+from nemo_automodel.components.moe.layers import Gate
 
 
 @dataclass
@@ -57,6 +58,7 @@ class TinyStepConfig:
     moe_router_activation: str = "softmax"
     moe_router_scaling_factor: float = 1.0
     use_moe_router_bias: bool = False
+    need_fp32_gate: bool = False
     share_expert_dims: int = 4
     swiglu_limits: list | None = None
     swiglu_limits_shared: list | None = None
@@ -95,9 +97,9 @@ def test_parse_moe_layers_enum_accepts_int_and_rejects_unknown():
 
 
 def test_keep_step_router_bias_fp32_updates_bias_and_master():
-    class GateLike(nn.Module):
+    class GateLike(Gate):
         def __init__(self):
-            super().__init__()
+            nn.Module.__init__(self)
             self.e_score_correction_bias = nn.Parameter(torch.ones(2, dtype=torch.bfloat16), requires_grad=False)
             self.e_score_correction_bias_master = nn.Parameter(
                 torch.ones(2, dtype=torch.bfloat16),

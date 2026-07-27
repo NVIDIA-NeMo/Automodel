@@ -17,6 +17,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+from transformers import PretrainedConfig
 from transformers.models.qwen3_vl_moe.configuration_qwen3_vl_moe import Qwen3VLMoeConfig, Qwen3VLMoeTextConfig
 from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
     Qwen3VLMoeForConditionalGeneration as HFQwen3VLMoeForConditionalGeneration,
@@ -308,20 +309,18 @@ class Qwen3VLMoeTextModelBackend(nn.Module):
         moe_defaults = dict(
             dim=config.hidden_size,
             inter_dim=config.intermediate_size,
-            moe_inter_dim=(
-                config.moe_intermediate_size if "moe_intermediate_size" in dir(config) else config.intermediate_size
-            ),
-            n_routed_experts=(config.num_experts if "num_experts" in dir(config) else 0),
+            moe_inter_dim=config.moe_intermediate_size,
+            n_routed_experts=config.num_experts,
             n_shared_experts=0,
-            n_activated_experts=(config.num_experts_per_tok if "num_experts_per_tok" in dir(config) else 1),
+            n_activated_experts=config.num_experts_per_tok,
             n_expert_groups=1,
             n_limited_groups=1,
             train_gate=True,
             gate_bias_update_factor=0.0,
             score_func="softmax",
             route_scale=1.0,
-            aux_loss_coeff=(config.router_aux_loss_coef if "router_aux_loss_coef" in dir(config) else 0.0),
-            norm_topk_prob=(config.norm_topk_prob if "norm_topk_prob" in dir(config) else False),
+            aux_loss_coeff=config.router_aux_loss_coef,
+            norm_topk_prob=config.norm_topk_prob,
             expert_bias=False,
             router_bias=False,
             expert_activation="swiglu",
@@ -457,6 +456,12 @@ class Qwen3VLMoeTextModelBackend(nn.Module):
 
 
 class Qwen3VLMoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLMoeForConditionalGeneration, MoEFSDPSyncMixin):
+    _vlm_pixel_values_chunks: list[torch.Tensor] | None = None
+    _vlm_image_grid_hws_chunks: list[torch.Tensor] | None = None
+    _vlm_pixel_values_videos_chunks: list[torch.Tensor] | None = None
+    _vlm_video_grid_thw_chunks: list[torch.Tensor] | None = None
+    _vlm_chunk_idx: int = 0
+
     """Qwen3-VL conditional generation model using the Qwen3-MoE backend components."""
 
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
@@ -511,10 +516,10 @@ class Qwen3VLMoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLMoeForCo
         # torch_dtype attribute, before constructing the HF parent (whose
         # vision encoder / multimodal code may read sub-config torch_dtype)
         # and our text backend.
-        top_dtype = config.torch_dtype if "torch_dtype" in dir(config) else None
+        top_dtype = config.torch_dtype
         if top_dtype is not None:
             for sub_cfg in vars(config).values():
-                if sub_cfg is not config and "torch_dtype" in dir(sub_cfg):
+                if sub_cfg is not config and isinstance(sub_cfg, PretrainedConfig):
                     sub_cfg.torch_dtype = top_dtype
 
         reject_unsupported_tie_word_embeddings(type(self), config)
@@ -523,21 +528,19 @@ class Qwen3VLMoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLMoeForCo
         self.backend = backend
         self.model.__class__ = Qwen3VLMoeModel
 
-        text_config = config.text_config if "text_config" in dir(config) else config
+        text_config = config.text_config
         moe_overrides = kwargs.pop("moe_overrides", None)
         self.model.language_model = Qwen3VLMoeTextModelBackend(
             text_config, backend=self.backend, moe_config=moe_config, moe_overrides=moe_overrides
         )
-        model_dtype = get_dtype(
-            (text_config.torch_dtype if "torch_dtype" in dir(text_config) else None), torch.bfloat16
-        )
+        model_dtype = get_dtype(text_config.torch_dtype, torch.bfloat16)
         self.lm_head = initialize_linear_module(
             self.backend.linear, text_config.hidden_size, text_config.vocab_size, bias=False, dtype=model_dtype
         )
         self.model.moe_config = self.model.language_model.moe_config
 
         self.vocab_size = text_config.vocab_size
-        pad_token_id = text_config.pad_token_id if "pad_token_id" in dir(text_config) else None
+        pad_token_id = text_config.pad_token_id
         self.pad_token_id = pad_token_id if pad_token_id is not None else -1
 
         if self.backend.enable_hf_state_dict_adapter:
@@ -585,11 +588,9 @@ class Qwen3VLMoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLMoeForCo
         output_hidden_states: bool | None = None,
         **kwargs: Any,
     ):
-        text_config = self.config.text_config if "text_config" in dir(self.config) else self.config
+        text_config = self.config.text_config
         output_hidden_states = (
-            output_hidden_states
-            if output_hidden_states is not None
-            else (text_config.output_hidden_states if "output_hidden_states" in dir(text_config) else False)
+            output_hidden_states if output_hidden_states is not None else text_config.output_hidden_states
         )
 
         # PP VLM support: retrieve pixel_values from stored chunks if not passed directly
@@ -604,14 +605,14 @@ class Qwen3VLMoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLMoeForCo
             has_image_tokens = False
             has_video_tokens = False
 
-        chunk_idx = vars(self).get("_vlm_chunk_idx", 0)
+        chunk_idx = self._vlm_chunk_idx
         consumed_vlm_chunk = False
 
         if pixel_values is None and has_image_tokens:
-            image_chunks = vars(self).get("_vlm_pixel_values_chunks")
+            image_chunks = self._vlm_pixel_values_chunks
             if image_chunks is not None and chunk_idx < len(image_chunks):
                 pixel_values = image_chunks[chunk_idx]
-                image_grid_chunks = vars(self).get("_vlm_image_grid_hws_chunks")
+                image_grid_chunks = self._vlm_image_grid_hws_chunks
                 if image_grid_chunks is not None and chunk_idx < len(image_grid_chunks):
                     image_grid_hws = image_grid_chunks[chunk_idx]
                     # Convert image_grid_hws [N, 2] to image_grid_thw [N, 3] by prepending T=1
@@ -628,10 +629,10 @@ class Qwen3VLMoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLMoeForCo
                 consumed_vlm_chunk = True
 
         if pixel_values_videos is None and has_video_tokens:
-            video_chunks = vars(self).get("_vlm_pixel_values_videos_chunks")
+            video_chunks = self._vlm_pixel_values_videos_chunks
             if video_chunks is not None and chunk_idx < len(video_chunks):
                 pixel_values_videos = video_chunks[chunk_idx]
-                video_grid_chunks = vars(self).get("_vlm_video_grid_thw_chunks")
+                video_grid_chunks = self._vlm_video_grid_thw_chunks
                 if video_grid_chunks is not None and chunk_idx < len(video_grid_chunks):
                     video_grid_thw = video_grid_chunks[chunk_idx]
                 kwargs["pixel_values_videos"] = pixel_values_videos
@@ -684,7 +685,7 @@ class Qwen3VLMoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLMoeForCo
         dtype: torch.dtype = torch.bfloat16,
     ) -> None:
         buffer_device = buffer_device or torch.device(f"cuda:{torch.cuda.current_device()}")
-        text_config = self.config.text_config if "text_config" in dir(self.config) else self.config
+        text_config = self.config.text_config
 
         with buffer_device:
             language_model = self.model.language_model

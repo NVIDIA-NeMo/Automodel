@@ -21,6 +21,7 @@ from typing import Any, Optional, Union
 
 import torch
 import torch.nn as nn
+from transformers import PretrainedConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from nemo_automodel.shared.import_utils import UnavailableError, UnavailableMeta
@@ -189,20 +190,18 @@ class Qwen3_5MoeBlock(Block):
             ]
             for linear in linear_list:
                 nn.init.trunc_normal_(linear.weight, mean=0.0, std=0.02)
-            if "reset_parameters" in dir(self.linear_attn.norm):
-                self.linear_attn.norm.reset_parameters()
-            else:
-                # HF Qwen3_5MoeRMSNormGated has no reset_parameters; manually reset weight to ones
-                self.linear_attn.norm.weight.data.fill_(1.0)
+            # HF Qwen3_5MoeRMSNormGated has no reset_parameters.
+            self.linear_attn.norm.weight.data.fill_(1.0)
         self.mlp.init_weights(buffer_device)
 
 
 def _resolve_mtp_num_layers(config: Any, override: int | None = None) -> int:
     if override is not None:
         return int(override)
-    value = config.num_nextn_predict_layers if "num_nextn_predict_layers" in dir(config) else None
+    config_values = config.to_dict()
+    value = config_values.get("num_nextn_predict_layers")
     if value is None:
-        value = config.mtp_num_hidden_layers if "mtp_num_hidden_layers" in dir(config) else 0
+        value = config_values.get("mtp_num_hidden_layers", 0)
     return int(value or 0)
 
 
@@ -241,15 +240,13 @@ def build_mtp_config_from_hf(
 
 def _make_mtp_block_config(config: Qwen3_5MoeTextConfig, layer_idx: int) -> Qwen3_5MoeTextConfig:
     mtp_config = copy.copy(config)
-    layer_types = list((config.layer_types if "layer_types" in dir(config) else []) or [])
+    layer_types = list(config.layer_types or [])
     if len(layer_types) <= layer_idx:
         fill = layer_types[-1] if layer_types else "full_attention"
         layer_types.extend([fill] * (layer_idx + 1 - len(layer_types)))
     layer_types[layer_idx] = "full_attention"
     mtp_config.layer_types = layer_types
-    mtp_config.num_hidden_layers = max(
-        int((config.num_hidden_layers if "num_hidden_layers" in dir(config) else 0) or 0), layer_idx + 1
-    )
+    mtp_config.num_hidden_layers = max(int(config.num_hidden_layers or 0), layer_idx + 1)
     return mtp_config
 
 
@@ -472,7 +469,7 @@ class Qwen3_5MoeModel(HFQwen3_5MoeModel):
                 else:
                     raise ValueError("inputs_embeds must be provided for pipeline stages without embed_tokens")
             media_tensor = pixel_values if pixel_values is not None else pixel_values_videos
-            if isinstance(media_tensor, torch.Tensor) and "rotary_pos_emb" in dir(self.visual):
+            if isinstance(media_tensor, torch.Tensor):
                 self.visual.rotary_pos_emb.to(media_tensor.device)
             return super().forward(
                 input_ids=None,
@@ -534,13 +531,13 @@ class Qwen3_5MoeTextModelBackend(nn.Module):
         if moe_config is not None and moe_overrides is not None:
             raise ValueError("Cannot pass both moe_config and moe_overrides; use one or the other.")
 
-        self.padding_idx = config.pad_token_id if "pad_token_id" in dir(config) else None
+        self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
         # Resolve model dtype once; thread explicitly to every sub-module so
         # fp32 master weights work even when construction is not wrapped in
         # local_torch_dtype().
-        model_dtype = get_dtype((config.torch_dtype if "torch_dtype" in dir(config) else None), torch.bfloat16)
+        model_dtype = get_dtype(config.torch_dtype, torch.bfloat16)
 
         # --------------- MoE config ---------------
         # Qwen3.5-MoE has MoE on every layer, with a shared expert + sigmoid gate.
@@ -558,7 +555,7 @@ class Qwen3_5MoeTextModelBackend(nn.Module):
             gate_bias_update_factor=0.0,
             score_func="softmax",
             route_scale=1.0,
-            aux_loss_coeff=(config.router_aux_loss_coef if "router_aux_loss_coef" in dir(config) else 0.001),
+            aux_loss_coeff=config.router_aux_loss_coef,
             norm_topk_prob=True,  # Qwen3.5-MoE always normalises topk weights
             expert_bias=False,
             router_bias=False,
@@ -626,7 +623,7 @@ class Qwen3_5MoeTextModelBackend(nn.Module):
         # along the sequence dimension (it keeps shape [B, S_global] while
         # hidden_states are [B, S_local]).  Both TE ring-attention and FLA CP
         # do not support padding masks, so we null them out.
-        if self._cp_enabled if "_cp_enabled" in dir(self) else False:
+        if self._cp_enabled:
             attention_mask = None
             padding_mask = None
 
@@ -704,6 +701,13 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
       * ``lm_head`` with NeMo backend linear
     """
 
+    _vlm_pixel_values_chunks: list[torch.Tensor] | None = None
+    _vlm_image_grid_hws_chunks: list[torch.Tensor] | None = None
+    _vlm_pixel_values_videos_chunks: list[torch.Tensor] | None = None
+    _vlm_video_grid_thw_chunks: list[torch.Tensor] | None = None
+    _vlm_chunk_idx: int = 0
+    _pp_return_hidden_states: bool = False
+
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
 
     # forward() pulls per-microbatch pixel_values from _vlm_pixel_values_chunks;
@@ -767,10 +771,10 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
         # torch_dtype attribute, before constructing the HF parent (whose
         # vision encoder / multimodal code may read sub-config torch_dtype) and
         # our text backend.
-        top_dtype = config.torch_dtype if "torch_dtype" in dir(config) else None
+        top_dtype = config.torch_dtype
         if top_dtype is not None:
             for sub_cfg in vars(config).values():
-                if sub_cfg is not config and "torch_dtype" in dir(sub_cfg):
+                if sub_cfg is not config and isinstance(sub_cfg, PretrainedConfig):
                     sub_cfg.torch_dtype = top_dtype
 
         reject_unsupported_tie_word_embeddings(type(self), config)
@@ -783,7 +787,7 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
         self.model.__class__ = Qwen3_5MoeModel
 
         # Replace HF text decoder with our NeMo backend
-        text_config = config.text_config if "text_config" in dir(config) else config
+        text_config = config.text_config
         moe_overrides = kwargs.pop("moe_overrides", None)
         self.model.language_model = Qwen3_5MoeTextModelBackend(
             text_config, backend=self.backend, moe_config=moe_config, moe_overrides=moe_overrides
@@ -795,7 +799,7 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
             text_config.hidden_size,
             text_config.vocab_size,
             bias=False,
-            dtype=get_dtype((text_config.torch_dtype if "torch_dtype" in dir(text_config) else None), torch.bfloat16),
+            dtype=get_dtype(text_config.torch_dtype, torch.bfloat16),
         )
 
         dtype = get_dtype(text_config.torch_dtype, torch.bfloat16)
@@ -831,7 +835,7 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
         self._keep_in_fp32_modules = keep_fp32
 
         self.vocab_size = text_config.vocab_size
-        pad_token_id = text_config.pad_token_id if "pad_token_id" in dir(text_config) else None
+        pad_token_id = text_config.pad_token_id
         self.pad_token_id = pad_token_id if pad_token_id is not None else -1
 
         # State dict adapter for checkpoint conversion
@@ -841,8 +845,7 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
                 self.model.language_model.moe_config,
                 self.backend,
                 dtype=dtype,
-                pretrained_model_name_or_path=(config._name_or_path if "_name_or_path" in dir(config) else None)
-                or (config.name_or_path if "name_or_path" in dir(config) else None),
+                pretrained_model_name_or_path=config._name_or_path or config.name_or_path,
             )
 
         # Wrap vision rotary embedding with fp32-safe version
@@ -915,8 +918,8 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
             if "mm_token_type_ids" in inspect.signature(self.model.get_rope_index).parameters:
                 if mm_token_type_ids is None:
                     mm_token_type_ids = torch.zeros_like(input_ids, dtype=torch.long)
-                    image_token_id = self.config.image_token_id if "image_token_id" in dir(self.config) else None
-                    video_token_id = self.config.video_token_id if "video_token_id" in dir(self.config) else None
+                    image_token_id = self.config.image_token_id
+                    video_token_id = self.config.video_token_id
                     if image_token_id is not None:
                         mm_token_type_ids = mm_token_type_ids.masked_fill(input_ids == image_token_id, 1)
                     if video_token_id is not None:
@@ -973,8 +976,7 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
 
         with cp_dispatcher_suspended(self.cp_mesh):
             if pixel_values is not None:
-                if "rotary_pos_emb" in dir(self.model.visual):
-                    self.model.visual.rotary_pos_emb.to(pixel_values.device)
+                self.model.visual.rotary_pos_emb.to(pixel_values.device)
                 image_outputs = self.model.get_image_features(pixel_values, image_grid_thw, return_dict=True)
                 image_embeds = torch.cat(image_outputs.pooler_output, dim=0).to(
                     inputs_embeds.device, inputs_embeds.dtype
@@ -987,8 +989,7 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
                 inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
 
             if pixel_values_videos is not None:
-                if "rotary_pos_emb" in dir(self.model.visual):
-                    self.model.visual.rotary_pos_emb.to(pixel_values_videos.device)
+                self.model.visual.rotary_pos_emb.to(pixel_values_videos.device)
                 video_outputs = self.model.get_video_features(pixel_values_videos, video_grid_thw, return_dict=True)
                 video_embeds = torch.cat(video_outputs.pooler_output, dim=0).to(
                     inputs_embeds.device, inputs_embeds.dtype
@@ -1019,7 +1020,7 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
         full-length. At ``cp_size == 1`` this reduces to the default symmetric
         shapes.
         """
-        text_config = self.config.text_config if "text_config" in dir(self.config) else self.config
+        text_config = self.config.text_config
         hidden_size = text_config.hidden_size
         vocab_size = text_config.vocab_size
 
@@ -1034,10 +1035,8 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
         else:
             inputs_meta = (torch.empty(microbatch_size, local_seq_len, hidden_size, device="meta", dtype=dtype),)
 
-        has_lm_head = (self.lm_head if "lm_head" in dir(self) else None) is not None
-        emits_hidden_states = (
-            self._pp_return_hidden_states if "_pp_return_hidden_states" in dir(self) else False
-        ) is True
+        has_lm_head = self.lm_head is not None
+        emits_hidden_states = self._pp_return_hidden_states is True
         if has_lm_head and not emits_hidden_states:
             outputs_meta = (torch.empty(microbatch_size, local_seq_len, vocab_size, device="meta", dtype=dtype),)
         else:
@@ -1058,11 +1057,9 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
         **kwargs: Any,
     ):
         # Resolve from the text/decoder sub-config for this VL model.
-        text_config = self.config.text_config if "text_config" in dir(self.config) else self.config
+        text_config = self.config.text_config
         output_hidden_states = (
-            output_hidden_states
-            if output_hidden_states is not None
-            else (text_config.output_hidden_states if "output_hidden_states" in dir(text_config) else False)
+            output_hidden_states if output_hidden_states is not None else text_config.output_hidden_states
         )
 
         # PP VLM support: retrieve pixel_values from stored chunks if not passed
@@ -1076,16 +1073,14 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
             (input_ids == image_token_id).any() or (input_ids == vision_start_token_id).any()
         )
 
-        chunk_idx = self._vlm_chunk_idx if "_vlm_chunk_idx" in dir(self) else 0
+        chunk_idx = self._vlm_chunk_idx
         consumed_vlm_chunk = False
 
         if pixel_values is None and has_media_tokens:
-            image_chunks = self._vlm_pixel_values_chunks if "_vlm_pixel_values_chunks" in dir(self) else None
+            image_chunks = self._vlm_pixel_values_chunks
             if image_chunks is not None and chunk_idx < len(image_chunks):
                 pixel_values = image_chunks[chunk_idx]
-                image_grid_chunks = (
-                    self._vlm_image_grid_hws_chunks if "_vlm_image_grid_hws_chunks" in dir(self) else None
-                )
+                image_grid_chunks = self._vlm_image_grid_hws_chunks
                 if image_grid_chunks is not None and chunk_idx < len(image_grid_chunks):
                     image_grid_hws = image_grid_chunks[chunk_idx]
                     if image_grid_hws is not None and image_grid_hws.numel() > 0:
@@ -1101,16 +1096,12 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
                 consumed_vlm_chunk = True
 
         if pixel_values_videos is None and has_media_tokens:
-            video_chunks = (
-                self._vlm_pixel_values_videos_chunks if "_vlm_pixel_values_videos_chunks" in dir(self) else None
-            )
+            video_chunks = self._vlm_pixel_values_videos_chunks
             if video_chunks is not None and chunk_idx < len(video_chunks):
                 video_chunk = video_chunks[chunk_idx]
                 if video_chunk.numel() > 0:
                     pixel_values_videos = video_chunk
-                    video_grid_chunks = (
-                        self._vlm_video_grid_thw_chunks if "_vlm_video_grid_thw_chunks" in dir(self) else None
-                    )
+                    video_grid_chunks = self._vlm_video_grid_thw_chunks
                     if video_grid_chunks is not None and chunk_idx < len(video_grid_chunks):
                         video_grid_thw = video_grid_chunks[chunk_idx]
                     kwargs["pixel_values_videos"] = pixel_values_videos
@@ -1134,10 +1125,8 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
         # pre-embed and stays differentiable (gradients reach embeddings/vision).
         cp_size = self.cp_mesh.size() if self.cp_mesh is not None else 1
         if cp_size > 1 and inputs_embeds is None and input_ids is not None and not torch.is_floating_point(input_ids):
-            is_first_stage = (
-                self.model.language_model.embed_tokens if "embed_tokens" in dir(self.model.language_model) else None
-            ) is not None
-            is_last_stage = (self.lm_head if "lm_head" in dir(self) else None) is not None
+            is_first_stage = self.model.language_model.embed_tokens is not None
+            is_last_stage = self.lm_head is not None
             if is_first_stage:
                 if not is_last_stage and (pixel_values is not None or pixel_values_videos is not None):
                     raise NotImplementedError(
@@ -1233,7 +1222,7 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
         dtype: torch.dtype = torch.bfloat16,
     ) -> None:
         buffer_device = buffer_device or _default_init_device()
-        text_config = self.config.text_config if "text_config" in dir(self.config) else self.config
+        text_config = self.config.text_config
 
         with buffer_device:
             language_model = self.model.language_model
@@ -1251,7 +1240,7 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
                     a=-cutoff_factor * final_out_std,
                     b=cutoff_factor * final_out_std,
                 )
-            mtp = self.mtp if "mtp" in dir(self) else None
+            mtp = self.mtp if isinstance(language_model, Qwen3_5MoeTextModelBackend) else None
             if mtp is not None:
                 for sublayer in mtp.layers:
                     sublayer.init_weights(buffer_device=buffer_device)

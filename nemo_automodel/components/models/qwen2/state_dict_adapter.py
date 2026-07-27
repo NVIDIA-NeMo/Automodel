@@ -56,7 +56,7 @@ class Qwen2StateDictAdapter:
         # HF keys match model keys directly.
         # Only need to handle tied lm_head weights.
         custom_state_dict = dict(hf_state_dict)
-        if self.config.tie_word_embeddings if "tie_word_embeddings" in dir(self.config) else True:
+        if self.config.tie_word_embeddings:
             embed_key = "model.embed_tokens.weight"
             lm_head_key = "lm_head.weight"
             if lm_head_key not in custom_state_dict and embed_key in custom_state_dict:

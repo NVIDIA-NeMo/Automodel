@@ -46,9 +46,9 @@ class HYV3Attention(nn.Module):
 
         self.num_heads = config.num_attention_heads
         self.num_kv_heads = config.num_key_value_heads
-        self.head_dim = config.head_dim if "head_dim" in dir(config) else config.hidden_size // self.num_heads
+        self.head_dim = config.head_dim
 
-        attention_bias = config.attention_bias if "attention_bias" in dir(config) else False
+        attention_bias = config.attention_bias
 
         self.q_proj = initialize_linear_module(
             backend.linear, config.hidden_size, self.num_heads * self.head_dim, attention_bias
@@ -132,7 +132,7 @@ class HYV3Attention(nn.Module):
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02):
         for linear in (self.q_proj, self.k_proj, self.v_proj, self.o_proj):
             nn.init.trunc_normal_(linear.weight, mean=0.0, std=init_std)
-            if "bias" in dir(linear) and linear.bias is not None:
+            if linear.bias is not None:
                 nn.init.zeros_(linear.bias)
         for norm in (self.q_norm, self.k_norm):
             norm.reset_parameters()

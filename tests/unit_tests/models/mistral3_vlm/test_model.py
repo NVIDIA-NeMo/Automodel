@@ -30,6 +30,7 @@ import pytest
 import torch
 import torch.nn as nn
 from transformers import Mistral3Config
+from transformers.utils.quantization_config import FineGrainedFP8Config
 
 from nemo_automodel.components.models.common.tie_word_embeddings import TieSupport, reject_tie_word_embeddings_flip
 from nemo_automodel.components.models.mistral3_vlm.model import (
@@ -44,44 +45,45 @@ from nemo_automodel.components.models.mistral3_vlm.state_dict_adapter import (
 # --------------------------------------------------------------------------- #
 # supports_config                                                             #
 # --------------------------------------------------------------------------- #
+def _config(
+    *,
+    quantization_config=None,
+    text_model_type: str = "ministral3",
+    num_hidden_layers: int = 2,
+) -> Mistral3Config:
+    return Mistral3Config(
+        text_config={"model_type": text_model_type, "num_hidden_layers": num_hidden_layers},
+        vision_config={},
+        quantization_config=quantization_config,
+    )
+
+
 class TestSupportsConfig:
     """Claim FP8-native and dequantized Mistral3 VLM configs."""
 
     def test_fp8_mistral3_vlm_config_supported_via_dict(self):
-        cfg = SimpleNamespace(
-            text_config=SimpleNamespace(model_type="ministral3"),
-            quantization_config={"quant_method": "fp8"},
-        )
+        cfg = _config(quantization_config={"quant_method": "fp8"})
         assert Mistral3FP8VLMForConditionalGeneration.supports_config(cfg) is True
 
     def test_fp8_mistral3_vlm_config_supported_via_object(self):
-        cfg = SimpleNamespace(
-            text_config=SimpleNamespace(model_type="ministral3"),
-            quantization_config=SimpleNamespace(quant_method="fp8"),
-        )
+        cfg = _config(quantization_config=FineGrainedFP8Config())
         assert Mistral3FP8VLMForConditionalGeneration.supports_config(cfg) is True
 
     def test_no_text_config_rejected(self):
-        cfg = SimpleNamespace(quantization_config={"quant_method": "fp8"})
-        # text_config is None → reject (text_config attr missing → getattr returns None)
+        cfg = _config(quantization_config={"quant_method": "fp8"})
+        cfg.text_config = None
         assert Mistral3FP8VLMForConditionalGeneration.supports_config(cfg) is False
 
     def test_text_config_other_model_type_rejected(self):
-        cfg = SimpleNamespace(
-            text_config=SimpleNamespace(model_type="llama"),
-            quantization_config={"quant_method": "fp8"},
-        )
+        cfg = _config(quantization_config={"quant_method": "fp8"}, text_model_type="llama")
         assert Mistral3FP8VLMForConditionalGeneration.supports_config(cfg) is False
 
     def test_no_quantization_config_supported_for_dequantized_checkpoint(self):
-        cfg = SimpleNamespace(text_config=SimpleNamespace(model_type="ministral3"))
+        cfg = _config()
         assert Mistral3FP8VLMForConditionalGeneration.supports_config(cfg) is True
 
     def test_non_fp8_quantization_method_rejected(self):
-        cfg = SimpleNamespace(
-            text_config=SimpleNamespace(model_type="ministral3"),
-            quantization_config={"quant_method": "awq"},
-        )
+        cfg = _config(quantization_config={"quant_method": "awq"})
         assert Mistral3FP8VLMForConditionalGeneration.supports_config(cfg) is False
 
 
@@ -107,6 +109,11 @@ def _make_dummy_init_super():
         captured["config"] = config
         # Minimal nn.Module bookkeeping so subsequent attribute access doesn't fail.
         nn.Module.__init__(self)
+        self.config = config
+        self.model = nn.Module()
+        self.model.language_model = nn.Module()
+        self.model.language_model.embed_tokens = nn.Embedding(2, 2)
+        self.lm_head = nn.Linear(2, 2, bias=False)
 
     return _init, captured
 
@@ -132,35 +139,32 @@ class TestInitFlipsDequantize:
 
     def test_dict_quantization_config_dequantize_set_true(self, patched_super_init):
         qc = {"quant_method": "fp8"}
-        cfg = SimpleNamespace(quantization_config=qc)
+        cfg = _config(quantization_config=qc)
         Mistral3FP8VLMForConditionalGeneration(cfg)
         assert qc["dequantize"] is True
 
     def test_object_quantization_config_dequantize_set_true(self, patched_super_init):
-        qc = SimpleNamespace(quant_method="fp8")
-        cfg = SimpleNamespace(quantization_config=qc)
+        qc = FineGrainedFP8Config()
+        cfg = _config(quantization_config=qc)
         Mistral3FP8VLMForConditionalGeneration(cfg)
         assert qc.dequantize is True
 
     def test_no_quantization_config_does_not_crash(self, patched_super_init):
-        cfg = SimpleNamespace(quantization_config=None)
+        cfg = _config()
         Mistral3FP8VLMForConditionalGeneration(cfg)  # should not raise
 
 
 class TestInitAttachesAdapter:
     def test_state_dict_adapter_for_vlm_full(self, patched_super_init):
         qc = {"quant_method": "fp8"}
-        cfg = SimpleNamespace(quantization_config=qc)
+        cfg = _config(quantization_config=qc)
         m = Mistral3FP8VLMForConditionalGeneration(cfg)
         assert isinstance(m.state_dict_adapter, Mistral3FP8StateDictAdapter)
         assert m.state_dict_adapter._layout_name == "vlm_full"
 
     def test_state_dict_adapter_uses_identity_layout_for_mistral_medium_35(self, patched_super_init):
         qc = {"quant_method": "fp8"}
-        cfg = SimpleNamespace(
-            text_config=SimpleNamespace(model_type="ministral3", num_hidden_layers=88),
-            quantization_config=qc,
-        )
+        cfg = _config(quantization_config=qc, num_hidden_layers=88)
         m = Mistral3FP8VLMForConditionalGeneration(cfg)
         assert isinstance(m.state_dict_adapter, Mistral3FP8StateDictAdapter)
         assert m.state_dict_adapter._layout_name == "vlm_full_identity"
@@ -177,13 +181,18 @@ class TestInitRegistersRotaryHooks:
         # with inv_freq buffers — that's what our hook iterates over.
         def _init_with_rotaries(self, config):
             nn.Module.__init__(self)
+            self.config = config
+            self.model = nn.Module()
+            self.model.language_model = nn.Module()
+            self.model.language_model.embed_tokens = nn.Embedding(2, 2)
+            self.lm_head = nn.Linear(2, 2, bias=False)
             self.text_rotary = nn.Module()
             self.text_rotary.register_buffer("inv_freq", torch.zeros(4), persistent=False)
             self.vision_rotary = nn.Module()
             self.vision_rotary.register_buffer("inv_freq", torch.zeros(4), persistent=False)
 
         with patch.object(Mistral3ForConditionalGeneration, "__init__", _init_with_rotaries):
-            m = Mistral3FP8VLMForConditionalGeneration(SimpleNamespace(quantization_config=None))
+            m = Mistral3FP8VLMForConditionalGeneration(_config())
 
         # Both rotary modules got the one-shot reinit pre-hook registered.
         assert len(m.text_rotary._forward_pre_hooks) == 1

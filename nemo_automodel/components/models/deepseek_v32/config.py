@@ -50,6 +50,7 @@ class DeepseekV32Config(PretrainedConfig):
         tie_word_embeddings: bool = False,
         rope_theta: float = 10000.0,
         rope_scaling: dict | None = None,
+        rope_parameters: dict | None = None,
         attention_bias: bool = False,
         attention_dropout: float = 0.0,
         num_experts_per_tok: int = 8,
@@ -92,6 +93,7 @@ class DeepseekV32Config(PretrainedConfig):
         self.use_cache = use_cache
         self.rope_theta = rope_theta
         self.rope_scaling = rope_scaling
+        self.rope_parameters = rope_parameters if rope_parameters is not None else rope_scaling
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
         self.num_experts_per_tok = num_experts_per_tok

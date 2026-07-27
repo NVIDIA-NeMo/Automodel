@@ -14,6 +14,7 @@
 
 import gc
 import weakref
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
@@ -467,10 +468,10 @@ class TestConvertMoePackedTensors:
         adapter = self._make_adapter()
 
         class FakeDTensor:
-            def __init__(self, tensor, placements="P", device_mesh="M"):
+            def __init__(self, tensor, placements=(), device_mesh=None):
                 self.tensor = tensor
                 self.placements = placements
-                self.device_mesh = device_mesh
+                self.device_mesh = device_mesh or SimpleNamespace(mesh_dim_names=())
 
             @property
             def shape(self):
@@ -528,6 +529,7 @@ class TestConvertMoePackedTensors:
 
         with (
             patch("torch.cuda.is_available", return_value=False),
+            patch("torch.distributed.tensor.DTensor", FakeDTensor),
             patch("torch.distributed.tensor.empty", create=True, side_effect=fake_empty),
         ):
             out = adapter._convert_moe_packed_tensors(blocks, scales, dtype=torch.float32, rows_per_chunk=4)
@@ -544,10 +546,10 @@ class TestConvertMoePackedTensors:
         adapter = self._make_adapter()
 
         class FakeDTensor:
-            def __init__(self, tensor, placements="P", device_mesh="M"):
+            def __init__(self, tensor, placements=(), device_mesh=None):
                 self.tensor = tensor
                 self.placements = placements
-                self.device_mesh = device_mesh
+                self.device_mesh = device_mesh or SimpleNamespace(mesh_dim_names=())
 
             @property
             def shape(self):
@@ -606,6 +608,7 @@ class TestConvertMoePackedTensors:
 
         with (
             patch("torch.cuda.is_available", return_value=False),
+            patch("torch.distributed.tensor.DTensor", FakeDTensor),
             patch("torch.distributed.tensor.empty", create=True, side_effect=fake_empty),
         ):
             out = adapter._convert_moe_packed_tensors(blocks, scales, dtype=torch.float32, rows_per_chunk=1)

@@ -84,15 +84,13 @@ class LlamaAttention(nn.Module):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
-        self.head_dim = (
-            config.head_dim if "head_dim" in dir(config) else config.hidden_size // config.num_attention_heads
-        )
+        self.head_dim = config.head_dim
         self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
         self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
         self.is_causal = True
-        self.rope_fusion = backend.rope_fusion if "rope_fusion" in dir(backend) else False
-        self.rope_backend = backend.rope if "rope" in dir(backend) else "torch"
+        self.rope_fusion = backend.rope_fusion
+        self.rope_backend = backend.rope
         self._quack_apply_rotary_emb = None
         if self.rope_backend == "quack":
             available, apply_rotary_emb = safe_import_from(
@@ -465,16 +463,16 @@ class LlamaForCausalLM(HFCheckpointingMixin, LlamaPreTrainedModel):
         # Transformers v5 does not reliably tie this custom model from the
         # dict-shaped _tied_weights_keys alone. Explicitly honor the config
         # flag after initialization.
-        if config.tie_word_embeddings if "tie_word_embeddings" in dir(config) else False:
+        if config.tie_word_embeddings:
             self.tie_weights()
 
         # Convert to configured dtype if specified
-        if "torch_dtype" in dir(config) and config.torch_dtype is not None:
-            self.to(dtype=config.torch_dtype)
+        if config.dtype is not None:
+            self.to(dtype=config.dtype)
 
         if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
             print(f"[LlamaForCausalLM] Attention implementation: {self.config._attn_implementation}")
-            print(f"[LlamaForCausalLM] torch_dtype: {self.config.torch_dtype}")
+            print(f"[LlamaForCausalLM] dtype: {self.config.dtype}")
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
@@ -489,7 +487,7 @@ class LlamaForCausalLM(HFCheckpointingMixin, LlamaPreTrainedModel):
         self.lm_head = new_embeddings
 
     def tie_weights(self, *_args: object, **_kwargs: object) -> None:
-        if self.config.tie_word_embeddings if "tie_word_embeddings" in dir(self.config) else False:
+        if self.config.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
 
     def set_decoder(self, decoder):

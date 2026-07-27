@@ -27,11 +27,11 @@ from typing import Any
 def is_hy_mt2_config(config: Any) -> bool:
     """Return whether *config* describes Tencent's Hy-MT2-30B-A3B checkpoint."""
     return (
-        (config.model_type if "model_type" in dir(config) else None) == "hy_v3"
-        and (config.hidden_size if "hidden_size" in dir(config) else None) == 2048
-        and (config.num_hidden_layers if "num_hidden_layers" in dir(config) else None) == 48
-        and (config.num_experts if "num_experts" in dir(config) else None) == 128
-        and (config.expert_hidden_dim if "expert_hidden_dim" in dir(config) else None) == 768
-        and (config.moe_intermediate_size if "moe_intermediate_size" in dir(config) else None) == 768
-        and "enable_lm_head_fp32" in dir(config)
+        config.model_type == "hy_v3"
+        and config.hidden_size == 2048
+        and config.num_hidden_layers == 48
+        and config.num_experts == 128
+        and config.expert_hidden_dim == 768
+        and config.moe_intermediate_size == 768
+        and config.to_dict().get("enable_lm_head_fp32", False)
     )

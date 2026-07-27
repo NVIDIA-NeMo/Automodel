@@ -57,7 +57,7 @@ from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 def _resolve_thinker_config(config: Qwen2_5OmniConfig | Qwen2_5OmniThinkerConfig) -> Qwen2_5OmniThinkerConfig:
     """Return the thinker sub-config regardless of whether a full Omni or
     Thinker-only config was passed in."""
-    if "thinker_config" in dir(config) and config.thinker_config is not None:
+    if isinstance(config, Qwen2_5OmniConfig):
         return config.thinker_config
     return config
 
@@ -125,14 +125,11 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
         # exception-propagation tuple. Delete the dead embedding here so it
         # never enters the optimizer; ``Qwen2_5OmniStateDictAdapter.from_hf``
         # also strips the matching HF checkpoint key.
-        if "audio_tower" in dir(self) and "audio_bos_eos_token" in dir(self.audio_tower):
-            del self.audio_tower.audio_bos_eos_token
+        del self.audio_tower.audio_bos_eos_token
 
         self.backend = backend or BackendConfig()
-        text_config = thinker_config.text_config if "text_config" in dir(thinker_config) else thinker_config
-        torch_dtype = (text_config.torch_dtype if "torch_dtype" in dir(text_config) else None) or (
-            thinker_config.torch_dtype if "torch_dtype" in dir(thinker_config) else None
-        )
+        text_config = thinker_config.text_config
+        torch_dtype = text_config.torch_dtype or thinker_config.torch_dtype
         dtype = get_dtype(torch_dtype, torch.bfloat16) if torch_dtype is not None else torch.bfloat16
 
         if self.backend.enable_hf_state_dict_adapter:
@@ -194,9 +191,7 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
             ``output_hidden_states`` is set, else ``None``).
         """
         output_hidden_states = (
-            output_hidden_states
-            if output_hidden_states is not None
-            else (self.config.output_hidden_states if "output_hidden_states" in dir(self.config) else False)
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
 
         if inputs_embeds is None:

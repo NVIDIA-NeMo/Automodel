@@ -158,6 +158,6 @@ class HyMT2StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
         checkpoint, but the filter is kept as a defensive no-op so the
         adapter remains symmetric with ``HYV3StateDictAdapter``.
         """
-        num_hidden = self.config.num_hidden_layers if "num_hidden_layers" in dir(self.config) else 48
+        num_hidden = self.config.num_hidden_layers
         m = re.match(r"(?:model\.)?layers\.(\d+)\.", key)
         return bool(m and int(m.group(1)) >= num_hidden)

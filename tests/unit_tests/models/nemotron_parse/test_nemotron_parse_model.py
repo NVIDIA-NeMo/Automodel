@@ -45,6 +45,10 @@ def test_nemotron_parse_forward_with_stub_encoder(monkeypatch):
         def to_dict(self):
             return {"patch_size": self.patch_size, "max_resolution": self.max_resolution}
 
+        def update(self, values):
+            for key, value in values.items():
+                self.__dict__[key] = value
+
     # Avoid downloading RADIO config (which requires open_clip) by returning a stub.
     dummy_encoder_config = DummyEncoderConfig()
     monkeypatch.setattr(np_model.AutoConfig, "from_pretrained", lambda *args, **kwargs: dummy_encoder_config)
@@ -124,6 +128,10 @@ def test_nemotron_parse_external_loss(monkeypatch):
 
         def to_dict(self):
             return {"patch_size": self.patch_size, "max_resolution": self.max_resolution}
+
+        def update(self, values):
+            for key, value in values.items():
+                self.__dict__[key] = value
 
     dummy_encoder_config = DummyEncoderConfig()
     monkeypatch.setattr(np_model.AutoConfig, "from_pretrained", lambda *args, **kwargs: dummy_encoder_config)

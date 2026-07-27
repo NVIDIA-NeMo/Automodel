@@ -36,6 +36,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.attention.flex_attention import create_block_mask
+from transformers import PreTrainedModel
 
 from nemo_automodel.components.models.bagel.attention_masks import create_sparse_mask
 from nemo_automodel.components.models.bagel.configuration import (
@@ -87,13 +88,13 @@ def _prepare_config_for_stage(config: BagelConfig) -> None:
     stage-dependent config mutations that its direct ``from_pretrained`` path
     used to do before ``BagelModel`` is built.
     """
-    stage = config.stage if "stage" in dir(config) else None
+    stage = config.stage
     if stage is not None:
         stage_int = _stage_to_int(stage)
         config.stage = stage_int
         if stage_int == 1:
             config.visual_gen = False
-            if (config.text_config.layer_module if "layer_module" in dir(config.text_config) else None) is None:
+            if config.text_config.layer_module is None:
                 config.text_config.layer_module = "Qwen2DecoderLayer"
         else:
             config.visual_gen = True
@@ -101,7 +102,7 @@ def _prepare_config_for_stage(config: BagelConfig) -> None:
             # keys have slots in the module tree. Some serialized configs may
             # carry ``layer_module=null``.
             config.text_config.layer_module = "Qwen2MoTDecoderLayer"
-    elif (config.text_config.layer_module if "layer_module" in dir(config.text_config) else None) is None:
+    elif config.text_config.layer_module is None:
         config.text_config.layer_module = "Qwen2MoTDecoderLayer" if config.visual_gen else "Qwen2DecoderLayer"
 
     # BAGEL applies a select-layer offset so the effective ViT has
@@ -109,7 +110,7 @@ def _prepare_config_for_stage(config: BagelConfig) -> None:
     # checkpoint carries the offset count, so apply this before constructing
     # the tower. Mark the config to avoid accidental double-application.
     if config.vision_config is not None:
-        if not (config._bagel_vit_select_layer_applied if "_bagel_vit_select_layer_applied" in dir(config) else False):
+        if not config._bagel_vit_select_layer_applied:
             effective_layers = config.vision_config.num_hidden_layers + 1 + config.vit_select_layer
             if effective_layers != config.vision_config.num_hidden_layers:
                 logger.info(
@@ -264,9 +265,7 @@ class BagelForUnifiedMultimodal(HFCheckpointingMixin, nn.Module):
         # Convenience: cached scalars mirrored from the nested text config.
         self.hidden_size = config.text_config.hidden_size
         self.num_heads = config.text_config.num_attention_heads
-        self.use_moe = "Mo" in (
-            config.text_config.layer_module if "layer_module" in dir(config.text_config) else "Qwen2DecoderLayer"
-        )
+        self.use_moe = "Mo" in config.text_config.layer_module
 
     def initialize_weights(self) -> None:
         """Initialize BAGEL weights after AM materializes a ``from_config`` model.
@@ -279,19 +278,13 @@ class BagelForUnifiedMultimodal(HFCheckpointingMixin, nn.Module):
         """
 
         def _mark_hf_uninitialized(module: nn.Module) -> None:
-            if "_is_hf_initialized" in dir(module):
-                module._is_hf_initialized = False
+            module._is_hf_initialized = False
 
         def _initialize_hf_subtree(module: nn.Module, name: str) -> None:
+            if not isinstance(module, PreTrainedModel):
+                raise TypeError(f"{name} must be a transformers.PreTrainedModel, got {type(module)!r}")
             module.apply(_mark_hf_uninitialized)
-            if "post_init" in dir(module):
-                module.post_init()
-            elif "init_weights" in dir(module):
-                module.init_weights()
-            elif "_init_weights" in dir(module):
-                module.apply(module._init_weights)
-            else:
-                raise AttributeError(f"{name} does not provide a HF-compatible weight initializer")
+            module.post_init()
 
         _initialize_hf_subtree(self.model.language_model, "language_model")
 
@@ -385,7 +378,7 @@ class BagelForUnifiedMultimodal(HFCheckpointingMixin, nn.Module):
     @classmethod
     def supports_config(cls, config: Any) -> bool:
         """Return ``True`` if this custom class supports ``config``."""
-        return (config.model_type if "model_type" in dir(config) else None) == BagelConfig.model_type
+        return config.model_type == BagelConfig.model_type
 
     # ------------------------------------------------------------------
     # Convenience accessors used by the parallelizer / state-dict adapter.

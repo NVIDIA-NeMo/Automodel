@@ -111,7 +111,7 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
         self._cp_mesh = None
         # HF created bare ``A_log``/``dt_bias`` in ``_parameters``; move them into a
         # native fp32 ``SSMGate`` submodule (built directly, not relocated at runtime).
-        install_ssm_gate(self, fp32_dtype=_resolve_ssm_dtype(config))
+        install_ssm_gate(self, fp32_dtype=_resolve_ssm_dtype(config.to_dict().get("mamba_ssm_dtype")))
 
     def _compute_gate(self, a: torch.Tensor) -> torch.Tensor:
         """Compute the gating value ``g`` via the fp32 ``SSMGate`` submodule.
@@ -651,13 +651,12 @@ def install_ssm_gate(mod, fp32_dtype=torch.float32):
     return gate
 
 
-def _resolve_ssm_dtype(config):
-    """Resolve the fp32 storage dtype for the SSM-gating params from ``config``.
+def _resolve_ssm_dtype(ssm_dtype: str | torch.dtype | None) -> torch.dtype:
+    """Resolve the storage dtype for the SSM-gating params.
 
-    Honors ``mamba_ssm_dtype`` when present; otherwise defaults to AutoModel's
-    fp32 training-storage contract for ``A_log``/``dt_bias``.
+    Defaults to AutoModel's fp32 training-storage contract for
+    ``A_log``/``dt_bias``.
     """
-    ssm_dtype = config.mamba_ssm_dtype if "mamba_ssm_dtype" in dir(config) else None
     if isinstance(ssm_dtype, str):
         ssm_dtype = dtype_from_str(ssm_dtype)
     return ssm_dtype or torch.float32

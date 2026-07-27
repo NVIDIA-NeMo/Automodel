@@ -213,7 +213,11 @@ def test_prepare_inputs_embeds_debug_logging(monkeypatch):
 class FakeInnerModel(nn.Module):
     def __init__(self):
         super().__init__()
-        self.language_model = SimpleNamespace(embed_tokens=nn.Embedding(4, 8), rotary_emb=SimpleNamespace(device=None))
+        self.language_model = SimpleNamespace(
+            embed_tokens=nn.Embedding(4, 8),
+            rotary_emb=SimpleNamespace(device=None),
+            layers=nn.ModuleList([nn.Identity(), nn.Identity()]),
+        )
         self.last_kwargs = None
 
     def get_multimodal_embeddings(self, **kwargs):

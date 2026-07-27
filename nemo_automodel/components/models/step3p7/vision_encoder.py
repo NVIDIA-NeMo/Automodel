@@ -325,15 +325,15 @@ class StepRoboticsVisionEncoder(nn.Module):
         self.num_hidden_layers = config.layers
         self.patch_size = config.patch_size
         self.image_size = config.image_size
-        self.use_cls_token = config.use_cls_token if "use_cls_token" in dir(config) else False
-        self.use_rope2d = config.use_rope2d if "use_rope2d" in dir(config) else True
-        self.use_abs_posemb = config.use_abs_posemb if "use_abs_posemb" in dir(config) else True
+        self.use_cls_token = config.use_cls_token
+        self.use_rope2d = config.use_rope2d
+        self.use_abs_posemb = config.use_abs_posemb
         self.layer_norm_eps = config.layer_norm_eps
-        self.mlp_ratio = config.mlp_ratio if "mlp_ratio" in dir(config) else 8960 / 1536
-        self.ls_init_value = config.ls_init_value if "ls_init_value" in dir(config) else None
+        self.mlp_ratio = config.mlp_ratio
+        self.ls_init_value = config.ls_init_value
         self.hidden_act = config.hidden_act
-        self.use_ln_pre = config.use_ln_pre if "use_ln_pre" in dir(config) else False
-        self.use_ln_post = config.use_ln_post if "use_ln_post" in dir(config) else True
+        self.use_ln_pre = config.use_ln_pre
+        self.use_ln_post = config.use_ln_post
 
         # Patch embedding.
         self.conv1 = nn.Conv2d(
@@ -378,13 +378,11 @@ class StepRoboticsVisionEncoder(nn.Module):
             use_cls_token=self.use_cls_token,
             use_rope2d=self.use_rope2d,
             rope_kwargs={
-                "rope_theta": (config.rope_theta if "rope_theta" in dir(config) else 10000),
-                "rope_max_freq": (config.rope_max_freq if "rope_max_freq" in dir(config) else 10),
-                "rope_num_freqs": (config.rope_num_freqs if "rope_num_freqs" in dir(config) else 1),
-                "rope_theta_rescale_factor": (
-                    config.rope_theta_rescale_factor if "rope_theta_rescale_factor" in dir(config) else 1.0
-                ),
-                "rope_freqs_for": (config.rope_freqs_for if "rope_freqs_for" in dir(config) else "lang"),
+                "rope_theta": config.rope_theta,
+                "rope_max_freq": config.rope_max_freq,
+                "rope_num_freqs": config.rope_num_freqs,
+                "rope_theta_rescale_factor": config.rope_theta_rescale_factor,
+                "rope_freqs_for": config.rope_freqs_for,
             },
         )
         self.vit_downsampler1 = nn.Conv2d(self.hidden_size, self.hidden_size * 2, kernel_size=3, stride=2, padding=1)

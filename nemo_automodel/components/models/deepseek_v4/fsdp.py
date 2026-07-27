@@ -16,7 +16,10 @@ from __future__ import annotations
 
 import torch
 from torch import nn
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
+
+from nemo_automodel.components.models.deepseek_v4.layers import DeepseekV4Compressor
 
 _DSV4_CLASS_NAMES = {
     "DeepseekV4ForCausalLM",
@@ -57,18 +60,7 @@ def _hca_param_sync_group_from_1d_mesh(mesh):
     if mesh is None:
         return None
 
-    mesh_ndim = mesh.ndim if "ndim" in dir(mesh) else None
-    mesh_shape = mesh.shape if "shape" in dir(mesh) else None
-    mesh_dim_names = mesh.mesh_dim_names if "mesh_dim_names" in dir(mesh) else None
-    if mesh_ndim is not None:
-        is_1d_mesh = mesh_ndim == 1
-    elif mesh_shape is not None:
-        is_1d_mesh = len(mesh_shape) == 1
-    elif mesh_dim_names is not None:
-        is_1d_mesh = len(mesh_dim_names) == 1
-    else:
-        return None
-    if not is_1d_mesh:
+    if mesh.ndim != 1:
         return None
 
     try:
@@ -92,27 +84,14 @@ def _has_fsdp_state(module: nn.Module) -> bool:
     return _get_module_fsdp_state(module) is not None
 
 
-def _module_config_model_type(module: nn.Module) -> str | None:
-    return (
-        (module.config if "config" in dir(module) else None).model_type
-        if "model_type" in dir((module.config if "config" in dir(module) else None))
-        else None
-    )
-
-
 def _is_deepseek_v4_module(module: nn.Module) -> bool:
-    if module.__class__.__name__ in _DSV4_CLASS_NAMES or _module_config_model_type(module) == "deepseek_v4":
+    if module.__class__.__name__ in _DSV4_CLASS_NAMES:
         return True
 
-    wrapped = module._checkpoint_wrapped_module if "_checkpoint_wrapped_module" in dir(module) else None
-    if wrapped is not None and _is_deepseek_v4_module(wrapped):
-        return True
+    if isinstance(module, CheckpointWrapper):
+        return _is_deepseek_v4_module(module._checkpoint_wrapped_module)
 
-    return any(
-        sub.__class__.__name__ in _DSV4_CLASS_NAMES or _module_config_model_type(sub) == "deepseek_v4"
-        for sub in module.modules()
-        if sub is not module
-    )
+    return any(sub.__class__.__name__ in _DSV4_CLASS_NAMES for sub in module.modules() if sub is not module)
 
 
 def _floating_param_dtypes(module: nn.Module) -> set[torch.dtype]:
@@ -192,12 +171,11 @@ def _fp32_module_fsdp_kwargs(module: nn.Module, fsdp_kwargs: dict) -> dict:
 def _attach_hca_param_sync_group(module: nn.Module, mesh) -> None:
     process_group = _hca_param_sync_group_from_1d_mesh(mesh)
     for submodule in module.modules():
-        setter = submodule._set_hca_param_sync_group if "_set_hca_param_sync_group" in dir(submodule) else None
-        if submodule.__class__.__name__ == "DeepseekV4Compressor" and setter is not None:
+        if isinstance(submodule, DeepseekV4Compressor):
             # The FSDP2 mesh is only known while wrapping. Bind its parameter
             # sync group narrowly to the DeepSeek-V4 HCA compressor instead of
             # adding public config.
-            setter(process_group)
+            submodule._set_hca_param_sync_group(process_group)
 
 
 def fully_shard_deepseek_v4(module: nn.Module, mesh, mp_policy, offload_policy=None, **fsdp_kwargs):

@@ -59,15 +59,13 @@ class BagelBackendConfig:
             raise ValueError(f"Unsupported BAGEL RMSNorm backend: {self.rms_norm!r}")
 
 
-def resolve_bagel_backend(backend: Any = None) -> BagelBackendConfig:
+def resolve_bagel_backend(backend: Mapping[str, Any] | BagelBackendConfig | None = None) -> BagelBackendConfig:
     """Resolve a mapping against BAGEL's stable torch defaults."""
     if backend is None:
         return BagelBackendConfig()
     if isinstance(backend, BagelBackendConfig):
         return backend
 
-    if "to_dict" in dir(backend):
-        backend = backend.to_dict()
     if not isinstance(backend, Mapping):
         raise TypeError(f"BAGEL backend must be a mapping or BagelBackendConfig, got {type(backend)!r}")
 
@@ -99,17 +97,18 @@ def _coerce_text_config(cfg: Union[Dict[str, Any], Qwen2Config, None]) -> Qwen2C
 
     # Defaults for BAGEL-specific attrs (safe to always apply - caller may
     # override before/after this helper runs).
-    if not "qk_norm" in dir(cfg):
+    config_values = cfg.to_dict()
+    if "qk_norm" not in config_values:
         cfg.qk_norm = True
-    if (cfg.layer_module if "layer_module" in dir(cfg) else None) is None:
+    if config_values.get("layer_module") is None:
         cfg.layer_module = "Qwen2DecoderLayer"
-    if not "freeze_und" in dir(cfg):
+    if "freeze_und" not in config_values:
         cfg.freeze_und = False
 
     # pad_token_id: Qwen2Config's default is None, which Qwen2Model tolerates
     # (nn.Embedding accepts padding_idx=None). The packed training path reads
     # it as a scalar, so we fall back to the BAGEL-7B-MoT value when missing.
-    if (cfg.pad_token_id if "pad_token_id" in dir(cfg) else None) is None:
+    if cfg.pad_token_id is None:
         cfg.pad_token_id = 151643
 
     return cfg
@@ -214,7 +213,7 @@ class BagelConfig(PretrainedConfig):
         self.timestep_shift = timestep_shift
 
         super().__init__(pad_token_id=pad_token_id, **kwargs)
-        if not (self.architectures if "architectures" in dir(self) else None):
+        if not self.architectures:
             self.architectures = ["BagelForUnifiedMultimodal"]
 
     # Checkpoint-named read aliases (so downstream code can do either

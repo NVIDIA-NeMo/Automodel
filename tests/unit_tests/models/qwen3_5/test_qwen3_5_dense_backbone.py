@@ -166,22 +166,13 @@ class TestSSMGateParamDescriptor:
 
 class TestResolveSSMDtype:
     def test_default_is_fp32(self):
-        class Cfg:
-            pass
-
-        assert _resolve_ssm_dtype(Cfg()) == torch.float32
+        assert _resolve_ssm_dtype(None) == torch.float32
 
     def test_string_dtype_resolved(self):
-        class Cfg:
-            mamba_ssm_dtype = "float32"
-
-        assert _resolve_ssm_dtype(Cfg()) == torch.float32
+        assert _resolve_ssm_dtype("float32") == torch.float32
 
     def test_explicit_dtype_passthrough(self):
-        class Cfg:
-            mamba_ssm_dtype = torch.float32
-
-        assert _resolve_ssm_dtype(Cfg()) == torch.float32
+        assert _resolve_ssm_dtype(torch.float32) == torch.float32
 
 
 # ---------------------------------------------------------------------------

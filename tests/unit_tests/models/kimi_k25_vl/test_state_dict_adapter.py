@@ -12,10 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from unittest.mock import MagicMock, PropertyMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+from torch.distributed.tensor import DTensor
 
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.kimi_k25_vl.model import KimiK25VLConfig
@@ -41,7 +42,7 @@ class TestDequantizeInt4:
         # Create packed weights (8 INT4 values per int32)
         # Use values in int32 range (-2^31 to 2^31-1)
         packed_in = in_features // 8
-        weight_packed = torch.randint(-2**31, 2**31, (out_features, packed_in), dtype=torch.int32)
+        weight_packed = torch.randint(-(2**31), 2**31, (out_features, packed_in), dtype=torch.int32)
 
         # Create scale (one per group)
         num_groups = in_features // group_size
@@ -110,7 +111,9 @@ class TestQuantizeToInt4:
         weight_packed, weight_scale, weight_shape = quantize_to_int4(weight, group_size=group_size)
 
         # Dequantize
-        weight_recovered = dequantize_int4(weight_packed, weight_scale, weight_shape, group_size=group_size, device="cpu")
+        weight_recovered = dequantize_int4(
+            weight_packed, weight_scale, weight_shape, group_size=group_size, device="cpu"
+        )
 
         # Check approximate recovery (INT4 quantization has significant error)
         # We just check the values are in reasonable range
@@ -331,7 +334,7 @@ class TestDequantizeInt4Extended:
 
         for group_size in [16, 32, 64]:
             packed_in = in_features // 8
-            weight_packed = torch.randint(-2**31, 2**31, (out_features, packed_in), dtype=torch.int32)
+            weight_packed = torch.randint(-(2**31), 2**31, (out_features, packed_in), dtype=torch.int32)
 
             num_groups = in_features // group_size
             weight_scale = torch.rand(out_features, num_groups, dtype=torch.float16) * 0.1
@@ -350,7 +353,6 @@ class TestDequantizeInt4Extended:
         packed_in = in_features // 8
         weight_packed = torch.zeros(out_features, packed_in, dtype=torch.int32)
 
-        num_groups = in_features // group_size
         # Use distinct scales for each group
         weight_scale = torch.tensor([[1.0, 2.0]] * out_features, dtype=torch.float16)
         weight_shape = torch.tensor([out_features, in_features], dtype=torch.int64)
@@ -368,7 +370,7 @@ class TestDequantizeInt4Extended:
         group_size = 32
 
         packed_in = in_features // 8
-        weight_packed = torch.randint(-2**31, 2**31, (out_features, packed_in), dtype=torch.int32)
+        weight_packed = torch.randint(-(2**31), 2**31, (out_features, packed_in), dtype=torch.int32)
 
         num_groups = in_features // group_size
         # Flatten scale to 1D
@@ -433,7 +435,9 @@ class TestQuantizeToInt4Extended:
         weight = torch.randn(out_features, in_features, dtype=torch.float32) * 0.5
 
         weight_packed, weight_scale, weight_shape = quantize_to_int4(weight, group_size=group_size)
-        weight_recovered = dequantize_int4(weight_packed, weight_scale, weight_shape, group_size=group_size, device="cpu")
+        weight_recovered = dequantize_int4(
+            weight_packed, weight_scale, weight_shape, group_size=group_size, device="cpu"
+        )
 
         # Check basic properties - shape preserved
         assert weight_recovered.shape == weight.shape
@@ -595,7 +599,7 @@ class TestKimiK25VLStateDictAdapterFromHFExtended:
         packed_in = in_features // 8
         num_groups = in_features // group_size
 
-        weight_packed = torch.randint(-2**31, 2**31, (out_features, packed_in), dtype=torch.int32)
+        weight_packed = torch.randint(-(2**31), 2**31, (out_features, packed_in), dtype=torch.int32)
         weight_scale = torch.rand(out_features, num_groups, dtype=torch.float16) * 0.1
         weight_shape = torch.tensor([out_features, in_features], dtype=torch.int64)
 
@@ -801,7 +805,7 @@ class TestDTensorQuantization:
 
     def test_dtensor_quantization_shapes_calculation(self):
         """Test INT4 quantization shape calculations for DTensor."""
-        out_features, in_features = 2048, 7168
+        in_features = 7168
         group_size = 32
 
         # INT4 packing: 8 values per int32
@@ -951,7 +955,7 @@ class TestDequantOneLogic:
 
         # All parts exist
         state_dict = {
-            f"{base}_packed": torch.randint(-2**31, 2**31, (16, 8), dtype=torch.int32),
+            f"{base}_packed": torch.randint(-(2**31), 2**31, (16, 8), dtype=torch.int32),
             f"{base}_scale": torch.rand(16, 2, dtype=torch.float16) * 0.1,
             f"{base}_shape": torch.tensor([16, 64], dtype=torch.int64),
         }
@@ -978,7 +982,7 @@ class TestDequantOneLogic:
         packed_in = in_features // 8
         num_groups = in_features // group_size
 
-        weight_packed = torch.randint(-2**31, 2**31, (out_features, packed_in), dtype=torch.int32)
+        weight_packed = torch.randint(-(2**31), 2**31, (out_features, packed_in), dtype=torch.int32)
         weight_scale = torch.rand(out_features, num_groups, dtype=torch.float16) * 0.1
         weight_shape = torch.tensor([out_features, in_features], dtype=torch.int64)
 
@@ -1234,7 +1238,7 @@ class TestQuantizeOffsetBinary:
         weight_packed, weight_scale, weight_shape = quantize_to_int4(weight, group_size=group_size)
 
         shifts = torch.arange(8) * 4
-        unpacked = ((weight_packed.unsqueeze(-1) >> shifts) & 0xF)
+        unpacked = (weight_packed.unsqueeze(-1) >> shifts) & 0xF
         unpacked_flat = unpacked.reshape(out_features, in_features)
 
         assert unpacked_flat.min() >= 0
@@ -1249,7 +1253,7 @@ class TestQuantizeOffsetBinary:
         weight_packed, weight_scale, _ = quantize_to_int4(weight, group_size=group_size)
 
         shifts = torch.arange(8) * 4
-        unpacked = ((weight_packed.unsqueeze(-1) >> shifts) & 0xF)
+        unpacked = (weight_packed.unsqueeze(-1) >> shifts) & 0xF
         unpacked_flat = unpacked.reshape(out_features, in_features)
 
         assert (unpacked_flat == 8).all(), f"Expected all 8s for zero weights, got {unpacked_flat}"
@@ -1261,7 +1265,9 @@ class TestQuantizeOffsetBinary:
 
         weight = torch.randn(out_features, in_features, dtype=torch.float32) * 0.5
         weight_packed, weight_scale, weight_shape = quantize_to_int4(weight, group_size=group_size)
-        weight_recovered = dequantize_int4(weight_packed, weight_scale, weight_shape, group_size=group_size, device="cpu")
+        weight_recovered = dequantize_int4(
+            weight_packed, weight_scale, weight_shape, group_size=group_size, device="cpu"
+        )
 
         max_error = (weight_recovered.float() - weight).abs().max().item()
         assert max_error < 1.0, f"Max quantization error {max_error} too large for offset binary"
@@ -1387,20 +1393,15 @@ class TestConvertSingleTensorToHFQuantizationPaths:
         mock_mesh = MagicMock()
         mock_placements = [MagicMock()]
 
-        mock_dtensor = MagicMock()
-        mock_dtensor._local_tensor = local_data
+        mock_dtensor = MagicMock(spec=DTensor)
+        mock_dtensor.to_local.return_value = local_data
         mock_dtensor.placements = mock_placements
         mock_dtensor.device_mesh = mock_mesh
-        type(mock_dtensor).__name__ = "DTensor"
 
         sentinel_packed = MagicMock(name="packed_dtensor")
         sentinel_scale = MagicMock(name="scale_dtensor")
 
-        with patch(
-            "torch.distributed.tensor.DTensor"
-        ) as MockDTensor:
-            MockDTensor.from_local = MagicMock(side_effect=[sentinel_packed, sentinel_scale])
-
+        with patch.object(DTensor, "from_local", side_effect=[sentinel_packed, sentinel_scale]) as mock_from_local:
             result = adapter.convert_single_tensor_to_hf(fqn, mock_dtensor, quantization=True)
 
         vals = {r[0]: r[1] for r in result}
@@ -1409,7 +1410,7 @@ class TestConvertSingleTensorToHFQuantizationPaths:
 
         assert vals[packed_key] is sentinel_packed
         assert vals[scale_key] is sentinel_scale
-        assert MockDTensor.from_local.call_count == 2
+        assert mock_from_local.call_count == 2
 
-        first_call_mesh = MockDTensor.from_local.call_args_list[0][0][1]
+        first_call_mesh = mock_from_local.call_args_list[0][0][1]
         assert first_call_mesh is mock_mesh

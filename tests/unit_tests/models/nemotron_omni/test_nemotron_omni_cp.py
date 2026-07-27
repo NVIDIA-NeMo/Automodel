@@ -77,6 +77,7 @@ def _make_omni_stub(*, with_sound_encoder: bool = True):
     CP path touches. Vision/video/sound encoders are stubs producing constants."""
     self = object.__new__(NemotronOmniForConditionalGeneration)
     nn.Module.__init__(self)
+    self.config = SimpleNamespace(llm_config=SimpleNamespace(output_hidden_states=False))
     self.img_context_token_id = IMG_TOKEN_ID
     self.sound_context_token_id = SOUND_TOKEN_ID
     self.language_model = _StubLanguageModel()

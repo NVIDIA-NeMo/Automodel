@@ -64,7 +64,7 @@ def _reset_qwen_qk_norms_for_hf_backbone(language_model) -> int:
     )
     for name, module in language_model.named_modules():
         logical_name = _normalize_wrapped_param_name(name)
-        if logical_name.endswith(qk_norm_suffixes) and "weight" in dir(module):
+        if logical_name.endswith(qk_norm_suffixes):
             module.weight.data.fill_(1.0)
             reset_count += 1
     return reset_count
@@ -196,17 +196,17 @@ def initialize_bagel_non_backbone_weights(model: torch.nn.Module, *, seed: int) 
         _copy_full_tensor(module.pos_embed, value)
 
     with torch.no_grad():
-        if model.config.visual_gen if "visual_gen" in dir(model.config) else False:
+        if model.config.visual_gen:
             bagel.time_embedder.apply(_reset_linear)
             bagel.vae2llm.apply(_reset_linear)
             bagel.llm2vae.apply(_reset_linear)
             _init_position_embedding(bagel.latent_pos_embed)
 
-        if model.config.visual_und if "visual_und" in dir(model.config) else False:
+        if model.config.visual_und:
             bagel.connector.apply(_reset_linear)
             _init_position_embedding(bagel.vit_pos_embed)
 
-        if model.config.visual_gen if "visual_gen" in dir(model.config) else False:
+        if model.config.visual_gen:
             torch.nn.init.constant_(bagel.llm2vae.weight, 0.0)
             torch.nn.init.constant_(bagel.llm2vae.bias, 0.0)
 
@@ -252,8 +252,8 @@ def build_bagel_from_hf_backbones(
     visual_und = bool(model_cfg.get("visual_und", True))
     if visual_und and vit_path is None:
         raise ValueError("model.init_mode='hf_backbones' with visual_und=True requires model.vit_path")
-    if "to_dict" in dir(vae_config):
-        vae_config = vae_config.to_dict()
+    if vae_config is not None:
+        vae_config = dict(vae_config)
 
     llm_config = Qwen2Config.from_pretrained(llm_path)
     default_layer_module = "Qwen2MoTDecoderLayer" if visual_gen else "Qwen2DecoderLayer"

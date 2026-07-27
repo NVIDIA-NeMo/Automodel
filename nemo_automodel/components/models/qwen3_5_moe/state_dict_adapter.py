@@ -122,7 +122,7 @@ class Qwen3_5MoeStateDictAdapter(StateDictAdapter):
         """Return whether MTP experts are stored as split or grouped HF tensors."""
         layout = self.mtp_expert_hf_layout
         if layout is None:
-            config_layout = self.config.mtp_expert_hf_layout if "mtp_expert_hf_layout" in dir(self.config) else None
+            config_layout = self.config.mtp_expert_hf_layout
             layout = config_layout if isinstance(config_layout, str) else None
 
         if layout is not None:

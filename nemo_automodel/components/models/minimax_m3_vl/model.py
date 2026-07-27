@@ -85,19 +85,17 @@ def build_moe_config(config: Any, dtype: torch.dtype) -> MoEConfig:
         n_limited_groups=0,
         train_gate=True,
         gate_bias_update_factor=1e-3,
-        score_func="sigmoid"
-        if str((config.scoring_func if "scoring_func" in dir(config) else "sigmoid")).lower() != "softmax"
-        else "softmax",
-        route_scale=float((config.routed_scaling_factor if "routed_scaling_factor" in dir(config) else 1.0)),
+        score_func="sigmoid" if str(config.scoring_func).lower() != "softmax" else "softmax",
+        route_scale=float(config.routed_scaling_factor),
         aux_loss_coeff=0.0,
         norm_topk_prob=True,
         router_bias=False,
         expert_bias=False,
         expert_activation="swigluoai",
-        activation_alpha=float((config.swiglu_alpha if "swiglu_alpha" in dir(config) else 1.702)),
-        activation_limit=float((config.swiglu_limit if "swiglu_limit" in dir(config) else 7.0)),
+        activation_alpha=float(config.swiglu_alpha),
+        activation_limit=float(config.swiglu_limit),
         softmax_before_topk=False,
-        force_e_score_correction_bias=bool((config.use_routing_bias if "use_routing_bias" in dir(config) else True)),
+        force_e_score_correction_bias=bool(config.use_routing_bias),
         dtype=dtype,
     )
 
@@ -121,13 +119,9 @@ class MiniMaxM3TextModel(nn.Module):
         if self.backend.gate_precision is None:
             self.backend.gate_precision = torch.float32
         self.config = config
-        self.config.num_experts = (
-            config.num_local_experts
-            if "num_local_experts" in dir(config)
-            else (config.num_experts if "num_experts" in dir(config) else None)
-        )
+        self.config.num_experts = config.num_local_experts
 
-        dtype = get_dtype((config.torch_dtype if "torch_dtype" in dir(config) else "bfloat16"), torch.bfloat16)
+        dtype = get_dtype(config.torch_dtype, torch.bfloat16)
         self.moe_config = moe_config or build_moe_config(config, dtype)
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, dtype=dtype)
@@ -136,21 +130,11 @@ class MiniMaxM3TextModel(nn.Module):
         for layer_id in range(config.num_hidden_layers):
             self.layers[str(layer_id)] = Block(layer_id, config, self.moe_config, backend)
 
-        gemma = config.use_gemma_norm if "use_gemma_norm" in dir(config) else False
+        gemma = config.use_gemma_norm
         self.norm = MiniMaxM3RMSNorm(config.hidden_size, eps=config.rms_norm_eps, gemma=gemma)
 
         self.max_seq_len = config.max_position_embeddings
-        self.head_dim = (
-            config.head_dim if "head_dim" in dir(config) else config.hidden_size // config.num_attention_heads
-        )
-
-        if not "rope_parameters" in dir(config) or config.rope_parameters is None:
-            rotary_dim = config.rotary_dim if "rotary_dim" in dir(config) else self.head_dim
-            config.rope_parameters = {
-                "rope_theta": (config.rope_theta if "rope_theta" in dir(config) else 5000000.0),
-                "rope_type": "default",
-                "partial_rotary_factor": rotary_dim / self.head_dim,
-            }
+        self.head_dim = config.head_dim
 
         base, rope_scaling, partial_rotary_factor = get_rope_config(config)
         self.rotary_emb = RotaryEmbedding(
@@ -166,7 +150,7 @@ class MiniMaxM3TextModel(nn.Module):
         )
 
         # Multi-token prediction (DeepSeek-V3 style); shares the main lm_head.
-        num_mtp = int((config.num_mtp_modules if "num_mtp_modules" in dir(config) else 0) or 0)
+        num_mtp = int(config.num_mtp_modules or 0)
         self.mtp = MiniMaxM3MTP(config, self.moe_config, backend, num_mtp) if num_mtp > 0 else None
 
     def make_freqs_cis(self, position_ids: torch.Tensor, **attn_kwargs: Any) -> torch.Tensor:
@@ -307,7 +291,7 @@ class MiniMaxM3SparseForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMix
                 self.config,
                 self.model.moe_config,
                 self.backend,
-                dtype=get_dtype((config.torch_dtype if "torch_dtype" in dir(config) else "bfloat16"), torch.bfloat16),
+                dtype=get_dtype(config.torch_dtype, torch.bfloat16),
             )
 
     def get_input_embeddings(self):
@@ -387,6 +371,12 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
     positions, then run through the (sparse/dense MoE) language model + lm_head.
     """
 
+    _vlm_pixel_values_chunks: list[torch.Tensor] | None = None
+    _vlm_image_grid_hws_chunks: list[torch.Tensor] | None = None
+    _vlm_pixel_values_videos_chunks: list[torch.Tensor] | None = None
+    _vlm_video_grid_thw_chunks: list[torch.Tensor] | None = None
+    _vlm_chunk_idx: int = 0
+
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
 
     # Pipeline-parallel routing: keep this VLM's own forward (which splices vision
@@ -463,9 +453,7 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
             config.projector_hidden_size,
             projector_hidden_act=config.projector_hidden_act,
             multimodal_projector_bias=config.multimodal_projector_bias,
-            patch_merge_bias=(
-                config.patch_merge_bias if "patch_merge_bias" in dir(config) else config.multimodal_projector_bias
-            ),
+            patch_merge_bias=config.patch_merge_bias,
         )
         self.image_token_index = config.image_token_index
         self.video_token_index = config.video_token_index
@@ -475,9 +463,7 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
                 config,
                 self.model.moe_config,
                 self.backend,
-                dtype=get_dtype(
-                    (text_config.torch_dtype if "torch_dtype" in dir(text_config) else "bfloat16"), torch.bfloat16
-                ),
+                dtype=get_dtype(text_config.torch_dtype, torch.bfloat16),
             )
 
     @property
@@ -509,7 +495,7 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
         encoders. Map both back to M3's actual paths so per-stage module nulling
         keeps/drops the correct submodules.
         """
-        if (self.model.mtp if "mtp" in dir(self.model) else None) is not None:
+        if self.model.mtp is not None:
             raise NotImplementedError(
                 "MiniMax M3 VL does not support MTP modules under pipeline parallelism yet; "
                 "set text_config.num_mtp_modules=0 for pp_size>1 runs."
@@ -534,7 +520,7 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
         """True when this is a partial pipeline stage (some text modules nulled)."""
         if self.lm_head is None:
             return True
-        if (self.model.embed_tokens if "embed_tokens" in dir(self.model) else None) is None:
+        if self.model.embed_tokens is None:
             return True
         try:
             return len(self.model.layers) != int(self.config.text_config.num_hidden_layers)
@@ -586,11 +572,7 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
             # Logits follow lm_head's own param dtype, which may diverge from the
             # model dtype if lm_head is ever kept in fp32 (_keep_in_fp32_modules);
             # deriving it here keeps the schedule's output buffer correctly sized.
-            head_dtype = (
-                (self.lm_head.weight if "weight" in dir(self.lm_head) else None).dtype
-                if "dtype" in dir((self.lm_head.weight if "weight" in dir(self.lm_head) else None))
-                else dtype
-            )
+            head_dtype = self.lm_head.weight.dtype
             outputs_meta = (torch.empty(microbatch_size, local_seq_len, vocab_size, device="meta", dtype=head_dtype),)
         else:
             outputs_meta = (meta(microbatch_size, local_seq_len, hidden_size),)
@@ -705,14 +687,7 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
         # splitter nulling the mtp module) and is_pp_stage, so it fires for both the
         # auto-generated split (also caught earlier in customize_pipeline_stage_modules)
         # and a manually supplied module_fqns_per_model_part that bypasses that hook.
-        if (
-            is_pp_stage
-            and int(
-                (self.config.text_config.num_mtp_modules if "num_mtp_modules" in dir(self.config.text_config) else 0)
-                or 0
-            )
-            > 0
-        ):
+        if is_pp_stage and int(self.config.text_config.num_mtp_modules or 0) > 0:
             raise NotImplementedError(
                 "MiniMax M3 VL does not support MTP modules under pipeline parallelism yet; "
                 "set text_config.num_mtp_modules=0 for pp_size>1 runs."
@@ -724,27 +699,21 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
         # embedding so vision features still get spliced (mirrors KimiVL/Step3p7).
         # `_vlm_image_grid_hws_chunks` holds M3's image_grid_thw values (the PP media
         # prep stores whatever grid the model emits under that key), so no reshape.
-        chunks = self._vlm_pixel_values_chunks if "_vlm_pixel_values_chunks" in dir(self) else None
+        chunks = self._vlm_pixel_values_chunks
         if (
             pixel_values is None
             and pixel_values_videos is None
             and input_ids is not None
             and not torch.is_floating_point(input_ids)
-            and (
-                chunks is not None
-                or (self._vlm_pixel_values_videos_chunks if "_vlm_pixel_values_videos_chunks" in dir(self) else None)
-                is not None
-            )
+            and (chunks is not None or self._vlm_pixel_values_videos_chunks is not None)
         ):
-            chunk_idx = self._vlm_chunk_idx if "_vlm_chunk_idx" in dir(self) else 0
+            chunk_idx = self._vlm_chunk_idx
             consumed = False
             if chunks is not None and (input_ids == self.image_token_index).any() and chunk_idx < len(chunks):
                 pixel_values = chunks[chunk_idx]
                 image_grid_thw = self._vlm_image_grid_hws_chunks[chunk_idx]
                 consumed = True
-            video_chunks = (
-                self._vlm_pixel_values_videos_chunks if "_vlm_pixel_values_videos_chunks" in dir(self) else None
-            )
+            video_chunks = self._vlm_pixel_values_videos_chunks
             if (
                 video_chunks is not None
                 and (input_ids == self.video_token_index).any()

@@ -248,14 +248,14 @@ class Qwen3NextAttention(nn.Module):
 
         self.num_heads = config.num_attention_heads
         self.num_kv_heads = config.num_key_value_heads
-        self.head_dim = config.head_dim if "head_dim" in dir(config) else config.hidden_size // self.num_heads
+        self.head_dim = config.head_dim
         self.num_key_value_groups = self.num_heads // self.num_kv_heads
 
         # Thread dtype explicitly from config.torch_dtype so callers that do
         # not wrap construction in local_torch_dtype() still get a dtype that
         # matches the model's declared dtype (fp32 under fp32 master weights,
         # bf16 otherwise).
-        dtype = get_dtype((config.torch_dtype if "torch_dtype" in dir(config) else None), torch.bfloat16)
+        dtype = get_dtype(config.torch_dtype, torch.bfloat16)
 
         # Query projection outputs 2x size for gating
         self.q_proj = initialize_linear_module(

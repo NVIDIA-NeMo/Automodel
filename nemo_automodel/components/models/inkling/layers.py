@@ -46,6 +46,7 @@ except ImportError as exc:  # transformers < 5.14 does not ship the Inkling mode
 
 from nemo_automodel.components.models.common.utils import BackendConfig
 from nemo_automodel.components.moe.config import MoEConfig
+from nemo_automodel.components.moe.experts import GroupedExperts, GroupedExpertsDeepEP, GroupedExpertsTE
 from nemo_automodel.components.moe.layers import MoE
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
@@ -162,7 +163,7 @@ def build_inkling_moe_config(text_config, backend: BackendConfig) -> MoEConfig:
     Returns:
         MoEConfig: Configuration for the routed grouped experts.
     """
-    model_dtype = get_dtype((text_config.torch_dtype if "torch_dtype" in dir(text_config) else None), torch.bfloat16)
+    model_dtype = get_dtype(text_config.torch_dtype, torch.bfloat16)
     return MoEConfig(
         dim=text_config.hidden_size,
         inter_dim=text_config.intermediate_size,
@@ -218,7 +219,7 @@ class InklingGate(nn.Module):
         self.top_k = config.num_experts_per_tok
         self.gate_precision = gate_precision
 
-        model_dtype = get_dtype((config.torch_dtype if "torch_dtype" in dir(config) else None), torch.bfloat16)
+        model_dtype = get_dtype(config.torch_dtype, torch.bfloat16)
         self.weight = nn.Parameter(torch.empty(self.n_total_experts, config.hidden_size, dtype=model_dtype))
         self.global_scale = nn.Parameter(torch.ones(1, dtype=model_dtype))
         # Keep the trained correction bias in a callable fp32 FSDP unit. Calling
@@ -295,7 +296,7 @@ class InklingDenseMLP(nn.Module):
 
     def __init__(self, config) -> None:
         super().__init__()
-        model_dtype = get_dtype((config.torch_dtype if "torch_dtype" in dir(config) else None), torch.bfloat16)
+        model_dtype = get_dtype(config.torch_dtype, torch.bfloat16)
         self.gate_up_proj = nn.Parameter(
             torch.empty(config.hidden_size, 2 * config.intermediate_size, dtype=model_dtype)
         )
@@ -337,7 +338,7 @@ class InklingSharedExperts(nn.Module):
         super().__init__()
         self.n_shared_experts = config.n_shared_experts
         intermediate_dim = config.moe_intermediate_size
-        model_dtype = get_dtype((config.torch_dtype if "torch_dtype" in dir(config) else None), torch.bfloat16)
+        model_dtype = get_dtype(config.torch_dtype, torch.bfloat16)
         self.gate_up_proj = nn.Parameter(
             torch.empty(config.n_shared_experts, config.hidden_size, 2 * intermediate_dim, dtype=model_dtype)
         )
@@ -386,10 +387,9 @@ class InklingMoE(MoE):
         self.shared_expert_gate = None
 
         # Inkling stores routed gate/up channels as [g0, u0, g1, u1, ...].
-        # All expert implementations expose one of these activation attributes.
-        if "expert_activation_grouped" in dir(self.experts):
+        if isinstance(self.experts, GroupedExperts):
             self.experts.expert_activation_grouped = inkling_swiglu
-        if "expert_activation" in dir(self.experts):
+        elif isinstance(self.experts, (GroupedExpertsDeepEP, GroupedExpertsTE)):
             self.experts.expert_activation = inkling_swiglu
 
     def forward(self, hidden_states: torch.Tensor, padding_mask: torch.Tensor | None = None) -> torch.Tensor:

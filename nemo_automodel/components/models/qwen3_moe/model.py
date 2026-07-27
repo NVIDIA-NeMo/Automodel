@@ -50,13 +50,13 @@ class Block(nn.Module):
 
         # Thread dtype from config.torch_dtype so the block's own params stay
         # aligned with the rest of the model (fp32 under fp32 master weights).
-        dtype = get_dtype((config.torch_dtype if "torch_dtype" in dir(config) else None), torch.bfloat16)
+        dtype = get_dtype(config.torch_dtype, torch.bfloat16)
 
         # Qwen3-MoE sparsifies every decoder_sparse_step layer, unless in mlp_only_layers
         is_moe_layer = (
-            (layer_idx not in (config.mlp_only_layers if "mlp_only_layers" in dir(config) else []))
-            and ((config.num_experts if "num_experts" in dir(config) else 0) > 0)
-            and ((layer_idx + 1) % (config.decoder_sparse_step if "decoder_sparse_step" in dir(config) else 1) == 0)
+            (layer_idx not in config.mlp_only_layers)
+            and (config.num_experts > 0)
+            and ((layer_idx + 1) % config.decoder_sparse_step == 0)
         )
         if is_moe_layer:
             self.mlp = MoE(moe_config, backend)
@@ -130,7 +130,7 @@ class Qwen3MoeModel(nn.Module):
         # Resolve model dtype once from config.torch_dtype and thread it
         # explicitly into every sub-module so fp32 master weights work even
         # when construction is not wrapped in local_torch_dtype().
-        model_dtype = get_dtype((config.torch_dtype if "torch_dtype" in dir(config) else None), torch.bfloat16)
+        model_dtype = get_dtype(config.torch_dtype, torch.bfloat16)
 
         # Map HF Qwen3 MoE config -> our MoE wrapper
         # Qwen config fields from example config:
@@ -138,20 +138,18 @@ class Qwen3MoeModel(nn.Module):
         moe_defaults = dict(
             dim=config.hidden_size,
             inter_dim=config.intermediate_size,
-            moe_inter_dim=(
-                config.moe_intermediate_size if "moe_intermediate_size" in dir(config) else config.intermediate_size
-            ),
-            n_routed_experts=(config.num_experts if "num_experts" in dir(config) else 0),
+            moe_inter_dim=config.moe_intermediate_size,
+            n_routed_experts=config.num_experts,
             n_shared_experts=0,
-            n_activated_experts=(config.num_experts_per_tok if "num_experts_per_tok" in dir(config) else 1),
+            n_activated_experts=config.num_experts_per_tok,
             n_expert_groups=0,
             n_limited_groups=0,
             train_gate=True,
             gate_bias_update_factor=0.0,
             score_func="softmax",  # Qwen3 uses softmax topk routing
             route_scale=1.0,
-            aux_loss_coeff=(config.router_aux_loss_coef if "router_aux_loss_coef" in dir(config) else 0.0),
-            norm_topk_prob=(config.norm_topk_prob if "norm_topk_prob" in dir(config) else False),
+            aux_loss_coeff=config.router_aux_loss_coef,
+            norm_topk_prob=config.norm_topk_prob,
             expert_bias=False,
             router_bias=False,
             expert_activation="swiglu",
@@ -172,9 +170,7 @@ class Qwen3MoeModel(nn.Module):
 
         # Rotary embedding cache compatible with our rope_utils functions
         self.max_seq_len = config.max_position_embeddings
-        self.head_dim = (
-            config.head_dim if "head_dim" in dir(config) else config.hidden_size // config.num_attention_heads
-        )
+        self.head_dim = config.head_dim
 
         base, rope_scaling, _ = get_rope_config(config)
 
@@ -297,7 +293,7 @@ class Qwen3MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         self.backend = backend or BackendConfig()
         moe_overrides = kwargs.pop("moe_overrides", None)
         self.model = Qwen3MoeModel(config, backend=self.backend, moe_config=moe_config, moe_overrides=moe_overrides)
-        model_dtype = get_dtype((config.torch_dtype if "torch_dtype" in dir(config) else None), torch.bfloat16)
+        model_dtype = get_dtype(config.torch_dtype, torch.bfloat16)
         self.lm_head = initialize_linear_module(
             self.backend.linear, config.hidden_size, config.vocab_size, bias=False, dtype=model_dtype
         )
@@ -330,9 +326,7 @@ class Qwen3MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         **attn_kwargs: Any,
     ) -> CausalLMOutputWithPast:
         output_hidden_states = (
-            output_hidden_states
-            if output_hidden_states is not None
-            else (self.config.output_hidden_states if "output_hidden_states" in dir(self.config) else False)
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
 
         is_thd = attn_kwargs.get("qkv_format") == "thd"

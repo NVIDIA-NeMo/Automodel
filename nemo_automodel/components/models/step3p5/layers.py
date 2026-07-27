@@ -75,22 +75,13 @@ class Step3p5RotaryEmbedding(nn.Module):
             self.base = rope_theta
 
         # Get per-layer partial_rotary_factor
-        partial_rotary_factors = config.partial_rotary_factors if "partial_rotary_factors" in dir(config) else None
+        partial_rotary_factors = config.partial_rotary_factors
         if partial_rotary_factors is not None:
             self.partial_rotary_factor = partial_rotary_factors[layer_idx]
         else:
             self.partial_rotary_factor = 1.0
 
-        # Compute head_dim for this layer based on attention settings
-        layer_types = config.layer_types if "layer_types" in dir(config) else []
-        is_sliding = layer_types and layer_types[layer_idx] == "sliding_attention"
-
-        if is_sliding:
-            num_heads = config.attention_other_setting.get("num_attention_heads", config.num_attention_heads)
-        else:
-            num_heads = config.num_attention_heads
-
-        self.head_dim = config.head_dim if "head_dim" in dir(config) else config.hidden_size // num_heads
+        self.head_dim = config.head_dim
         self.rotary_dim = int(self.head_dim * self.partial_rotary_factor)
         self.max_position_embeddings = config.max_position_embeddings
 
@@ -154,7 +145,7 @@ class Step3p5MLP(nn.Module):
         self.intermediate_size = intermediate_size or config.intermediate_size
         self.swiglu_limit = swiglu_limit
 
-        dtype = get_dtype((config.torch_dtype if "torch_dtype" in dir(config) else None), torch.bfloat16)
+        dtype = get_dtype(config.torch_dtype, torch.bfloat16)
         self.gate_proj = initialize_linear_module(
             backend.linear, self.hidden_size, self.intermediate_size, bias=False, dtype=dtype
         )
@@ -197,7 +188,7 @@ class Step3p5Attention(nn.Module):
         self.backend = backend
 
         # Determine attention configuration based on layer_types
-        layer_types = config.layer_types if "layer_types" in dir(config) else []
+        layer_types = config.layer_types
         is_sliding = layer_types and layer_types[layer_idx] == "sliding_attention"
 
         if is_sliding:
@@ -209,12 +200,12 @@ class Step3p5Attention(nn.Module):
             self.num_kv_heads = config.num_attention_groups
             self.sliding_window = None
 
-        self.head_dim = config.head_dim if "head_dim" in dir(config) else config.hidden_size // self.num_heads
+        self.head_dim = config.head_dim
         self.num_kv_groups = self.num_heads // self.num_kv_heads
 
         # Projections
-        attention_bias = config.attention_bias if "attention_bias" in dir(config) else False
-        dtype = get_dtype((config.torch_dtype if "torch_dtype" in dir(config) else None), torch.bfloat16)
+        attention_bias = config.attention_bias
+        dtype = get_dtype(config.torch_dtype, torch.bfloat16)
         self.q_proj = initialize_linear_module(
             backend.linear, config.hidden_size, self.num_heads * self.head_dim, attention_bias, dtype=dtype
         )
@@ -233,9 +224,7 @@ class Step3p5Attention(nn.Module):
         self.k_norm = Step3p5RMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
         # Optional head-wise attention gate
-        self.use_head_wise_attn_gate = (
-            config.use_head_wise_attn_gate if "use_head_wise_attn_gate" in dir(config) else False
-        )
+        self.use_head_wise_attn_gate = config.use_head_wise_attn_gate
         if self.use_head_wise_attn_gate:
             self.g_proj = initialize_linear_module(
                 backend.linear, config.hidden_size, self.num_heads, bias=False, dtype=dtype
@@ -248,7 +237,7 @@ class Step3p5Attention(nn.Module):
 
         # Check if RoPE should be applied for this layer
         # Empty list or None means all layers use RoPE
-        use_rope_layers = config.use_rope_layers if "use_rope_layers" in dir(config) else None
+        use_rope_layers = config.use_rope_layers
         if use_rope_layers is not None and len(use_rope_layers) > layer_idx:
             self.use_rope = use_rope_layers[layer_idx]
         else:
@@ -353,7 +342,7 @@ class Step3p5Attention(nn.Module):
 
         for linear in linear_list:
             nn.init.trunc_normal_(linear.weight, mean=0.0, std=init_std)
-            if "bias" in dir(linear) and linear.bias is not None:
+            if linear.bias is not None:
                 nn.init.zeros_(linear.bias)
 
         for norm in (self.q_norm, self.k_norm):

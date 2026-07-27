@@ -144,7 +144,7 @@ class Step3p7Model(nn.Module):
             return param.dtype, param.device
         except StopIteration:
             dtype = get_dtype(
-                (self.config.text_config.torch_dtype if "torch_dtype" in dir(self.config.text_config) else "bfloat16"),
+                self.config.text_config.torch_dtype,
                 torch.bfloat16,
             )
             return dtype, torch.device(f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else "cpu")
@@ -325,6 +325,12 @@ class Step3p7Model(nn.Module):
 class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     """Native Step3.7 VLM implementation for MedPix fine-tuning with EP and PP."""
 
+    _vlm_pixel_values_chunks: list[torch.Tensor] | None = None
+    _vlm_patch_pixel_values_chunks: list[torch.Tensor] | None = None
+    _vlm_num_patches_chunks: list[torch.Tensor] | None = None
+    _vlm_patch_newline_mask_chunks: list[torch.Tensor] | None = None
+    _vlm_chunk_idx: int = 0
+
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
 
     _keep_in_fp32_modules = ["rotary_emb"]
@@ -390,9 +396,9 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
             bias=False,
         )
         self.vocab_size = config.text_config.vocab_size
-        self.pad_token_id = config.text_config.pad_token_id if "pad_token_id" in dir(config.text_config) else None
+        self.pad_token_id = config.text_config.pad_token_id
         dtype = get_dtype(
-            (config.text_config.torch_dtype if "torch_dtype" in dir(config.text_config) else "bfloat16"),
+            config.text_config.torch_dtype,
             torch.bfloat16,
         )
 
@@ -474,7 +480,7 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
 
         hidden_shape = (microbatch_size, local_seq_len, self.config.text_config.hidden_size)
         vocab_shape = (microbatch_size, local_seq_len, self.config.text_config.vocab_size)
-        mtp_depth = int((self.mtp_config.num_layers if "num_layers" in dir(self.mtp_config) else 0) or 0)
+        mtp_depth = int(self.mtp_config.num_layers or 0)
 
         def meta(shape: tuple[int, ...]) -> torch.Tensor:
             return torch.empty(*shape, device="meta", dtype=dtype)
@@ -492,13 +498,11 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
     def _is_pipeline_parallel_stage(self) -> bool:
         if self.lm_head is None:
             return True
-        language_model = self.model.language_model if "language_model" in dir(self.model) else None
+        language_model = self.model.language_model
         if language_model is None:
             return False
-        if (language_model.embed_tokens if "embed_tokens" in dir(language_model) else None) is None:
+        if language_model.embed_tokens is None:
             return True
-        if not "layers" in dir(language_model):
-            return False
         try:
             return len(language_model.layers) != int(self.config.text_config.num_hidden_layers)
         except TypeError:
@@ -563,13 +567,7 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
         **kwargs: Any,
     ) -> torch.Tensor | Step3p7CausalLMOutput:
         output_hidden_states = (
-            output_hidden_states
-            if output_hidden_states is not None
-            else (
-                self.config.text_config.output_hidden_states
-                if "output_hidden_states" in dir(self.config.text_config)
-                else False
-            )
+            output_hidden_states if output_hidden_states is not None else self.config.text_config.output_hidden_states
         )
 
         is_pp_stage = self._is_pipeline_parallel_stage()
@@ -584,23 +582,19 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
             and (input_ids == self.config.image_token_id).any()
         )
 
-        chunk_idx = self._vlm_chunk_idx if "_vlm_chunk_idx" in dir(self) else 0
+        chunk_idx = self._vlm_chunk_idx
         consumed_vlm_chunk = False
         if pixel_values is None and has_image_tokens:
-            image_chunks = self._vlm_pixel_values_chunks if "_vlm_pixel_values_chunks" in dir(self) else None
+            image_chunks = self._vlm_pixel_values_chunks
             if image_chunks is not None and chunk_idx < len(image_chunks):
                 kwargs["pixel_values"] = image_chunks[chunk_idx]
-                patch_chunks = (
-                    self._vlm_patch_pixel_values_chunks if "_vlm_patch_pixel_values_chunks" in dir(self) else None
-                )
+                patch_chunks = self._vlm_patch_pixel_values_chunks
                 if patch_chunks is not None and chunk_idx < len(patch_chunks):
                     kwargs["patch_pixel_values"] = patch_chunks[chunk_idx]
-                num_patches_chunks = self._vlm_num_patches_chunks if "_vlm_num_patches_chunks" in dir(self) else None
+                num_patches_chunks = self._vlm_num_patches_chunks
                 if num_patches_chunks is not None and chunk_idx < len(num_patches_chunks):
                     kwargs["num_patches"] = num_patches_chunks[chunk_idx]
-                newline_chunks = (
-                    self._vlm_patch_newline_mask_chunks if "_vlm_patch_newline_mask_chunks" in dir(self) else None
-                )
+                newline_chunks = self._vlm_patch_newline_mask_chunks
                 if newline_chunks is not None and chunk_idx < len(newline_chunks):
                     kwargs["patch_newline_mask"] = newline_chunks[chunk_idx]
                 consumed_vlm_chunk = True
@@ -653,8 +647,7 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
             and inputs_embeds is None
             and input_ids is not None
             and input_ids.dtype not in (torch.float16, torch.bfloat16, torch.float32)
-            and (self.model.language_model.embed_tokens if "embed_tokens" in dir(self.model.language_model) else None)
-            is not None
+            and self.model.language_model.embed_tokens is not None
         ):
             if is_pp_stage and self.lm_head is None and kwargs.get("pixel_values") is not None:
                 raise NotImplementedError(
@@ -684,9 +677,7 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
         if need_mtp_source_embeds and inputs_embeds is None and input_ids is not None:
             if input_ids.dtype in (torch.float16, torch.bfloat16, torch.float32):
                 inputs_embeds = input_ids
-            elif (
-                self.model.language_model.embed_tokens if "embed_tokens" in dir(self.model.language_model) else None
-            ) is not None:
+            elif self.model.language_model.embed_tokens is not None:
                 multimodal_embeddings = self.model.get_multimodal_embeddings(
                     pixel_values=kwargs.get("pixel_values", None),
                     patch_pixel_values=kwargs.get("patch_pixel_values", None),
@@ -741,10 +732,7 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
                 mtp_kwargs["embed_fn"] = self.model.language_model.embed_tokens
             mtp_per_depth_logits = self.mtp(**mtp_kwargs)
         elif pp_mtp_enabled and self.lm_head is not None:
-            mtp_per_depth_logits = [
-                logits.new_empty(logits.shape)
-                for _ in range(int((self.mtp_config.num_layers if "num_layers" in dir(self.mtp_config) else 0) or 0))
-            ]
+            mtp_per_depth_logits = [logits.new_empty(logits.shape) for _ in range(int(self.mtp_config.num_layers or 0))]
 
         if is_pp_stage:
             if pp_mtp_enabled:

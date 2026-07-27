@@ -126,6 +126,7 @@ class TestDeepseekV4ModelSmoke:
         shape_only_hca_group = object()
 
         class NamedOneDimMesh:
+            ndim = 1
             mesh_dim_names = ("dp",)
 
             def size(self):
@@ -149,6 +150,7 @@ class TestDeepseekV4ModelSmoke:
             ndim = 2
 
         class ShapeOnlyOneDimMesh:
+            ndim = 1
             shape = (2,)
 
             def size(self):
@@ -158,6 +160,7 @@ class TestDeepseekV4ModelSmoke:
                 return shape_only_hca_group
 
         class TwoDimMesh:
+            ndim = 2
             mesh_dim_names = ("dp", "tp")
 
         assert dsv4_fsdp._hca_param_sync_group_from_1d_mesh(None) is None
@@ -247,6 +250,7 @@ class TestDeepseekV4ModelSmoke:
         hca_group = object()
 
         class FakeMesh:
+            ndim = 1
             mesh_dim_names = ("dp",)
 
             def size(self):
@@ -615,6 +619,7 @@ class TestDeepseekV4ModelSmoke:
         model = DeepseekV4ForCausalLM.__new__(DeepseekV4ForCausalLM)
         torch.nn.Module.__init__(model)
         model.model = _HiddenStage()
+        model.config = _tiny_config()
         model.lm_head = None
         model.mtp = None
         model.mtp_config = MTPConfig()

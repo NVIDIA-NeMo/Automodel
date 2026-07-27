@@ -327,26 +327,24 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
         # ---------------------------------------------------------------
         llm_config = config.llm_config
         vision_config = config.vision_config
-        sound_config = config.sound_config if "sound_config" in dir(config) else None
+        sound_config = config.sound_config
 
         # Store key VLM parameters
-        self.force_image_size = config.force_image_size if "force_image_size" in dir(config) else 512
-        self.patch_size = config.patch_size if "patch_size" in dir(config) else 16
-        self.downsample_ratio = config.downsample_ratio if "downsample_ratio" in dir(config) else 0.5
-        self.ps_version = config.ps_version if "ps_version" in dir(config) else "v2"
-        self.img_context_token_id = config.img_context_token_id if "img_context_token_id" in dir(config) else 18
-        self.video_context_token_id = (
-            config.video_context_token_id if "video_context_token_id" in dir(config) else 131081
-        )
-        self.sound_context_token_id = config.sound_context_token_id if "sound_context_token_id" in dir(config) else 27
+        self.force_image_size = config.force_image_size
+        self.patch_size = config.patch_size
+        self.downsample_ratio = config.downsample_ratio
+        self.ps_version = config.ps_version
+        self.img_context_token_id = config.img_context_token_id
+        self.video_context_token_id = config.video_context_token_id
+        self.sound_context_token_id = config.sound_context_token_id
 
         self.num_image_token = int((self.force_image_size // self.patch_size) ** 2 * (self.downsample_ratio**2))
         logger.info(f"NemotronOmni: num_image_token={self.num_image_token}")
         logger.info(f"NemotronOmni: ps_version={self.ps_version}")
         logger.info(f"NemotronOmni: img_context_token_id={self.img_context_token_id}")
 
-        vit_hidden_size = config.vit_hidden_size if "vit_hidden_size" in dir(config) else 1280
-        projector_hidden_size = config.projector_hidden_size if "projector_hidden_size" in dir(config) else 20480
+        vit_hidden_size = config.vit_hidden_size
+        projector_hidden_size = config.projector_hidden_size
         llm_hidden_size = llm_config.hidden_size
 
         # ---------------------------------------------------------------
@@ -363,7 +361,7 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
         # 2. Vision Encoder (RADIO v2.5-H from HF)
         # ---------------------------------------------------------------
         logger.info("NemotronOmni: Creating RADIO vision encoder from HF config...")
-        dtype = get_dtype((llm_config.torch_dtype if "torch_dtype" in dir(llm_config) else None), torch.bfloat16)
+        dtype = get_dtype(llm_config.torch_dtype, torch.bfloat16)
         # FIX: Force timm to use eager (math) attention instead of fused SDPA
         # for the RADIO ViT. This ensures numerical parity with the HF model
         # which also uses eager attention. The timm Attention class reads this
@@ -374,18 +372,14 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
         self.vision_model = AutoModel.from_config(vision_config, trust_remote_code=True)
         _timm_set_fused_attn(True)  # Restore default for any subsequent timm usage
         # WAR for transformers issue 38358
-        if "model" in dir(self.vision_model) and "_init_weights" in dir(self.vision_model.model):
-            self.vision_model.model._initialize_weights = self.vision_model.model._init_weights
+        self.vision_model.model._initialize_weights = self.vision_model.model._init_weights
         # Make preprocessor external (required by RADIO)
-        if "radio_model" in dir(self.vision_model):
-            self.vision_model.radio_model.make_preprocessor_external()
+        self.vision_model.radio_model.make_preprocessor_external()
 
         # 3D patch projector for temporally-packed video frames. Only present when the
         # checkpoint ships a `patch_generator.video_embedder` weight (i.e. v3+).
-        self.video_temporal_patch_dim = (
-            config.video_temporal_patch_size if "video_temporal_patch_size" in dir(config) else None
-        )
-        if self.video_temporal_patch_dim is not None and "radio_model" in dir(self.vision_model):
+        self.video_temporal_patch_dim = config.video_temporal_patch_size
+        if self.video_temporal_patch_dim is not None:
             pg = self.vision_model.radio_model.model.patch_generator
             pg.video_embedder = nn.Linear(
                 in_features=self.video_temporal_patch_dim * 3 * pg.patch_size * pg.patch_size,
@@ -418,11 +412,9 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
         # 4. Audio Encoder (Parakeet from HF) + Sound Projector
         # ---------------------------------------------------------------
         if sound_config is not None:
-            sound_hidden_size = sound_config.hidden_size if "hidden_size" in dir(sound_config) else 1024
-            sound_proj_hidden_size = (
-                sound_config.projection_hidden_size if "projection_hidden_size" in dir(sound_config) else 4096
-            )
-            sound_proj_bias = sound_config.projection_bias if "projection_bias" in dir(sound_config) else False
+            sound_hidden_size = sound_config.hidden_size
+            sound_proj_hidden_size = sound_config.projection_hidden_size
+            sound_proj_bias = sound_config.projection_bias
 
             logger.info("NemotronOmni: Creating Parakeet sound encoder...")
             try:
@@ -430,40 +422,18 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
 
                 # Build ParakeetEncoderConfig from sound_config
                 parakeet_config_dict = {
-                    "attention_bias": (sound_config.attention_bias if "attention_bias" in dir(sound_config) else False),
+                    "attention_bias": sound_config.attention_bias,
                     "hidden_size": sound_hidden_size,
-                    "num_attention_heads": (
-                        sound_config.num_attention_heads if "num_attention_heads" in dir(sound_config) else 8
-                    ),
-                    "num_hidden_layers": (
-                        sound_config.num_hidden_layers if "num_hidden_layers" in dir(sound_config) else 24
-                    ),
-                    "intermediate_size": (
-                        sound_config.intermediate_size if "intermediate_size" in dir(sound_config) else 4096
-                    ),
-                    "conv_kernel_size": (
-                        sound_config.conv_kernel_size if "conv_kernel_size" in dir(sound_config) else 9
-                    ),
-                    "convolution_bias": (
-                        sound_config.convolution_bias if "convolution_bias" in dir(sound_config) else False
-                    ),
-                    "subsampling_conv_channels": (
-                        sound_config.subsampling_conv_channels
-                        if "subsampling_conv_channels" in dir(sound_config)
-                        else 256
-                    ),
-                    "subsampling_conv_kernel_size": (
-                        sound_config.subsampling_conv_kernel_size
-                        if "subsampling_conv_kernel_size" in dir(sound_config)
-                        else 3
-                    ),
-                    "subsampling_conv_stride": (
-                        sound_config.subsampling_conv_stride if "subsampling_conv_stride" in dir(sound_config) else 2
-                    ),
-                    "subsampling_factor": (
-                        sound_config.subsampling_factor if "subsampling_factor" in dir(sound_config) else 8
-                    ),
-                    "num_mel_bins": (sound_config.num_mel_bins if "num_mel_bins" in dir(sound_config) else 128),
+                    "num_attention_heads": sound_config.num_attention_heads,
+                    "num_hidden_layers": sound_config.num_hidden_layers,
+                    "intermediate_size": sound_config.intermediate_size,
+                    "conv_kernel_size": sound_config.conv_kernel_size,
+                    "convolution_bias": sound_config.convolution_bias,
+                    "subsampling_conv_channels": sound_config.subsampling_conv_channels,
+                    "subsampling_conv_kernel_size": sound_config.subsampling_conv_kernel_size,
+                    "subsampling_conv_stride": sound_config.subsampling_conv_stride,
+                    "subsampling_factor": sound_config.subsampling_factor,
+                    "num_mel_bins": sound_config.num_mel_bins,
                 }
                 parakeet_config = ParakeetEncoderConfig(**parakeet_config_dict)
                 self.sound_encoder = ParakeetEncoder(parakeet_config).to(dtype)
@@ -691,7 +661,7 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
             # HF RADIO returns either a RadioOutput namedtuple or a dict when
             # adaptors are configured. `.features` is the per-patch features
             # (N, L, C) layout with feature_fmt='NLC'.
-            feats = out.features if "features" in dir(out) else None
+            feats = out.features
             if feats is None:
                 # Backbone dict variant.
                 feats = out["backbone"].features if isinstance(out, dict) else out[1]
@@ -888,14 +858,8 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
         # Resolve from the text/decoder sub-config (the top-level NemotronOmni
         # config has no output_hidden_states; the recipe toggles it on llm_config).
         if output_hidden_states is None:
-            llm_config = (
-                (self.config if "config" in dir(self) else None).llm_config
-                if "llm_config" in dir((self.config if "config" in dir(self) else None))
-                else None
-            )
-            output_hidden_states = (
-                llm_config.output_hidden_states if "output_hidden_states" in dir(llm_config) else False
-            )
+            llm_config = self.config.llm_config
+            output_hidden_states = llm_config.output_hidden_states
 
         # Caller pre-supplied inputs_embeds (CP path: prepare_model_inputs_for_cp
         # ran the multimodal scatter on the un-sharded sequence before

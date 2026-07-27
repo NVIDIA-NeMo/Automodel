@@ -121,7 +121,7 @@ class DeepseekV32Indexer(nn.Module):
 
         self.backend = backend
         linear_impl = backend.linear
-        dtype = get_dtype((config.torch_dtype if "torch_dtype" in dir(config) else None), torch.bfloat16)
+        dtype = get_dtype(config.torch_dtype, torch.bfloat16)
 
         # Project Q from q_lora residual -> num_heads * head_dim
         self.wq_b = initialize_linear_module(
@@ -269,8 +269,7 @@ class DeepseekV32Indexer(nn.Module):
 
     def init_weights(self, init_std: float = 0.02):
         for module in [self.wq_b, self.wk, self.weights_proj]:
-            if "weight" in dir(module):
-                nn.init.trunc_normal_(module.weight, mean=0.0, std=init_std)
+            nn.init.trunc_normal_(module.weight, mean=0.0, std=init_std)
         self.k_norm.reset_parameters()
 
 
@@ -291,9 +290,7 @@ class DeepseekV32MLA(nn.Module):
         self.kv_lora_rank = config.kv_lora_rank
         self.qk_nope_head_dim = config.qk_nope_head_dim
         self.qk_rope_head_dim = config.qk_rope_head_dim
-        self.qk_head_dim = (
-            config.qk_head_dim if "qk_head_dim" in dir(config) else (self.qk_nope_head_dim + self.qk_rope_head_dim)
-        )
+        self.qk_head_dim = config.qk_head_dim
         self.v_head_dim = config.v_head_dim
         self.index_topk = config.index_topk
 
@@ -304,7 +301,7 @@ class DeepseekV32MLA(nn.Module):
         rms_norm_impl = backend.rms_norm
 
         hidden_size = config.hidden_size
-        dtype = get_dtype((config.torch_dtype if "torch_dtype" in dir(config) else None), torch.bfloat16)
+        dtype = get_dtype(config.torch_dtype, torch.bfloat16)
 
         # V3.2 always uses q_lora (q_lora_rank is not None)
         self.q_a_proj = initialize_linear_module(
@@ -349,7 +346,7 @@ class DeepseekV32MLA(nn.Module):
         )
         self.softmax_scale = self.qk_head_dim**-0.5
 
-        rope_parameters = config.rope_parameters if "rope_parameters" in dir(config) else config.rope_scaling
+        rope_parameters = config.rope_parameters
         if rope_parameters and all(
             map(lambda x: x in rope_parameters, ["factor", "mscale", "original_max_position_embeddings"])
         ):

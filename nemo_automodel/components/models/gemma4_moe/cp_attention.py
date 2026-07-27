@@ -54,15 +54,16 @@ def _patch_fsdp_accumulated_grad_guard() -> None:
     except Exception:
         return
     orig = FSDPParam.to_accumulated_grad_if_needed
-    if orig._gemma4_guarded if "_gemma4_guarded" in dir(orig) else False:
+    if orig.__module__ == __name__ and orig.__name__ == "guarded":
         return
 
     def guarded(self):
-        if not "_unsharded_param" in dir(self):
+        try:
+            self._unsharded_param
+        except AttributeError:
             return
         return orig(self)
 
-    guarded._gemma4_guarded = True
     FSDPParam.to_accumulated_grad_if_needed = guarded
 
 
@@ -134,11 +135,7 @@ def _cached_block_mask(key, build):
 
 
 def _compiled_flex_attention(attention_module: torch.nn.Module):
-    compiled = (
-        attention_module._gemma4_cp_compiled_flex_attn
-        if "_gemma4_cp_compiled_flex_attn" in dir(attention_module)
-        else None
-    )
+    compiled = attention_module._gemma4_cp_compiled_flex_attn
     if compiled is None:
         from torch.nn.attention.flex_attention import flex_attention
 
@@ -851,11 +848,11 @@ def _ring_use_ffpa_varlen(attention_module: torch.nn.Module, ctx: Any) -> bool:
     map drives the varlen ``cu_seqlens``); Gemma4's manual CP batch always attaches
     one, so it is the sole FFPA path real CP training takes.
     """
-    if not (attention_module._gemma4_cp_use_ffpa if "_gemma4_cp_use_ffpa" in dir(attention_module) else False):
+    if not attention_module._gemma4_cp_use_ffpa:
         return False
     if not ctx.is_causal:
         return False
-    if (attention_module.sliding_window if "sliding_window" in dir(attention_module) else None) is not None:
+    if attention_module.sliding_window is not None:
         return False
     if ctx.metadata.get("_packed_seq_ids") is None:
         return False
@@ -1161,10 +1158,8 @@ def _gemma4_cp_manual_attention(
     if query.shape[1] != key.shape[1]:
         enable_gqa = True
 
-    local_metadata = attention_module._cp_manual_metadata if "_cp_manual_metadata" in dir(attention_module) else {}
-    metadata_seq_dims = (
-        attention_module._cp_manual_metadata_seq_dims if "_cp_manual_metadata_seq_dims" in dir(attention_module) else {}
-    )
+    local_metadata = attention_module._cp_manual_metadata
+    metadata_seq_dims = attention_module._cp_manual_metadata_seq_dims
     ctx = CPRingAttentionContext(
         module=attention_module,
         query=query,
@@ -1203,9 +1198,7 @@ def _install_gemma4_cp_ring_sdpa(attention_module: torch.nn.Module, cp_mesh) -> 
     import torch.nn.functional as F_module
 
     original_sdpa = F_module.scaled_dot_product_attention
-    metadata_keys = (
-        attention_module._cp_manual_metadata_keys if "_cp_manual_metadata_keys" in dir(attention_module) else ()
-    )
+    metadata_keys = attention_module._cp_manual_metadata_keys
 
     @torch._dynamo.disable
     def _ring_sdpa(
@@ -1233,7 +1226,7 @@ def _install_gemma4_cp_ring_sdpa(attention_module: torch.nn.Module, cp_mesh) -> 
         # back to that for any key the caller didn't pass so the ring can still
         # build the vision-bidirectional / packed masks. Persisted across the step
         # (not cleared by the post-hook) so it survives activation-checkpoint recompute.
-        fallback = module._cp_dense_metadata if "_cp_dense_metadata" in dir(module) else None
+        fallback = module._cp_dense_metadata
         if fallback:
             for name in metadata_keys:
                 if captured.get(name) is None:
@@ -1271,6 +1264,10 @@ def attach_gemma4_cp_ring_attention(attention_module: torch.nn.Module, *, use_ff
     the FFPA kernel is unavailable.
     """
     attention_module._gemma4_cp_use_ffpa = bool(use_ffpa)
+    attention_module._gemma4_cp_compiled_flex_attn = None
+    attention_module._cp_dense_metadata = {}
+    attention_module._cp_manual_metadata = {}
+    attention_module._cp_uses_attention_hook = False
     attention_module._cp_manual_metadata_keys = (
         "mm_token_type_ids",
         "_packed_seq_ids",

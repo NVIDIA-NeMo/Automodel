@@ -17,6 +17,7 @@ class MockMiniMaxM2Config:
     head_dim: int = 16
     rms_norm_eps: float = 1e-6
     use_qk_norm: bool = True
+    torch_dtype: str = "bfloat16"
 
 
 @pytest.fixture

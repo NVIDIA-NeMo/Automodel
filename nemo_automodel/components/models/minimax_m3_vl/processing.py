@@ -58,7 +58,7 @@ def build_minimax_m3_vl_processor(pretrained_model_name_or_path: str, **kwargs) 
         The processor with a non-``None`` ``chat_template`` when one is available.
     """
     processor = AutoProcessor.from_pretrained(pretrained_model_name_or_path, **kwargs)
-    if (processor.chat_template if "chat_template" in dir(processor) else None) is None:
+    if processor.chat_template is None:
         template_path = _resolve_chat_template_path(pretrained_model_name_or_path, **kwargs)
         if template_path is not None:
             with open(template_path, encoding="utf-8") as f:

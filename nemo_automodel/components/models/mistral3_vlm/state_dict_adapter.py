@@ -105,11 +105,11 @@ def _config_attr(config: Any | None, attr: str) -> Any:
     if config is None:
         return None
     if attr == "text_config":
-        return config.text_config if "text_config" in dir(config) else None
+        return config.text_config
     if attr == "model_type":
-        return config.model_type if "model_type" in dir(config) else None
+        return config.model_type
     if attr == "num_hidden_layers":
-        return config.num_hidden_layers if "num_hidden_layers" in dir(config) else None
+        return config.num_hidden_layers
     raise ValueError(f"Unsupported config attribute: {attr}")
 
 

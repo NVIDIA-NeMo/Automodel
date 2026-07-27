@@ -69,20 +69,18 @@ def test_registry_resolves_to_thinker_class():
 
 def test_resolve_thinker_config_unwraps_full_omni_config():
     """``_resolve_thinker_config`` returns the thinker sub-config when given the full Omni config."""
-    from nemo_automodel.components.models.qwen2_5_omni.model import _resolve_thinker_config
-
-    class FakeThinker:
-        torch_dtype = None
-
-    class FakeOmni:
-        thinker_config = FakeThinker()
-
-    assert _resolve_thinker_config(FakeOmni()) is FakeOmni().thinker_config.__class__ or isinstance(
-        _resolve_thinker_config(FakeOmni()), FakeThinker
+    from transformers.models.qwen2_5_omni.configuration_qwen2_5_omni import (
+        Qwen2_5OmniConfig,
+        Qwen2_5OmniThinkerConfig,
     )
 
+    from nemo_automodel.components.models.qwen2_5_omni.model import _resolve_thinker_config
+
+    full_config = Qwen2_5OmniConfig()
+    assert _resolve_thinker_config(full_config) is full_config.thinker_config
+
     # If a thinker config is passed directly, it should be returned untouched.
-    thinker_only = FakeThinker()
+    thinker_only = Qwen2_5OmniThinkerConfig()
     assert _resolve_thinker_config(thinker_only) is thinker_only
 
 

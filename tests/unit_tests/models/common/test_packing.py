@@ -125,9 +125,7 @@ class TestGetAttnImplementation:
         assert get_attn_implementation(cfg) == "te"
 
     def test_from_attn_implementation(self):
-        cfg = MagicMock()
-        del cfg.backend
-        cfg.get.return_value = "flash_attention_2"
+        cfg = {"attn_implementation": "flash_attention_2"}
         assert get_attn_implementation(cfg) == "flash_attention_2"
 
     def test_default_sdpa(self):

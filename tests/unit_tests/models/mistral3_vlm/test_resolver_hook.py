@@ -20,8 +20,9 @@ and dequantized Mistral3 VLM configs and dispatches to
 ``Mistral3FP8VLMForConditionalGeneration``.
 """
 
-from types import SimpleNamespace
 from unittest.mock import patch
+
+from transformers import Mistral3Config
 
 # Importing the package installs the hook (idempotent).
 import nemo_automodel.components.models.mistral3_vlm  # noqa: F401
@@ -32,34 +33,30 @@ from nemo_automodel.components.models.mistral3_vlm.model import (
 
 
 def _make_fp8_mistral3_cfg():
-    return SimpleNamespace(
-        text_config=SimpleNamespace(model_type="ministral3"),
+    return Mistral3Config(
+        text_config={"model_type": "ministral3"},
+        vision_config={},
         quantization_config={"quant_method": "fp8"},
     )
 
 
 def _make_non_mistral3_cfg():
-    return SimpleNamespace(
-        text_config=SimpleNamespace(model_type="llama"),
+    return Mistral3Config(
+        text_config={"model_type": "llama"},
+        vision_config={},
         quantization_config={"quant_method": "fp8"},
     )
 
 
 def _make_dequantized_mistral3_cfg():
-    return SimpleNamespace(text_config=SimpleNamespace(model_type="ministral3"))
+    return Mistral3Config(text_config={"model_type": "ministral3"}, vision_config={})
 
 
 class TestHookInstallation:
-    def test_hook_installed_marker(self):
-        # Idempotent guard: re-importing must not stack hooks.
-        assert (
-            getattr(
-                _mi._resolve_custom_model_cls_for_config,
-                "_mistral3_vlm_hook_installed",
-                False,
-            )
-            is True
-        )
+    def test_hook_installed_identity(self):
+        resolver = _mi._resolve_custom_model_cls_for_config
+        assert resolver.__module__ == "nemo_automodel.components.models.mistral3_vlm"
+        assert resolver.__name__ == "_patched"
 
     def test_reimport_is_idempotent(self):
         before = _mi._resolve_custom_model_cls_for_config

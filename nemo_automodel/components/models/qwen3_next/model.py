@@ -58,10 +58,11 @@ class Block(nn.Module):
         elif self.layer_type == "full_attention":
             self.self_attn = Qwen3NextAttention(config, layer_idx, backend)
 
+        config_values = config.to_dict()
         is_moe_layer = (
-            (layer_idx not in (config.mlp_only_layers if "mlp_only_layers" in dir(config) else []))
-            and ((config.num_experts if "num_experts" in dir(config) else 0) > 0)
-            and ((layer_idx + 1) % (config.decoder_sparse_step if "decoder_sparse_step" in dir(config) else 1) == 0)
+            (layer_idx not in config_values.get("mlp_only_layers", []))
+            and (config_values.get("num_experts", 0) > 0)
+            and ((layer_idx + 1) % config_values.get("decoder_sparse_step", 1) == 0)
         )
         if is_moe_layer:
             self.mlp = MoE(moe_config, backend)
@@ -72,7 +73,7 @@ class Block(nn.Module):
                 config.hidden_size,
                 config.intermediate_size,
                 backend.linear,
-                dtype=get_dtype((config.torch_dtype if "torch_dtype" in dir(config) else None), torch.bfloat16),
+                dtype=get_dtype(config.torch_dtype, torch.bfloat16),
             )
 
         self.input_layernorm = Qwen3NextRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -153,7 +154,7 @@ class Qwen3NextModel(nn.Module):
         # Resolve model dtype from config.torch_dtype once; thread it
         # explicitly into every sub-module so fp32 master weights work even
         # when construction is not wrapped in local_torch_dtype().
-        model_dtype = get_dtype((config.torch_dtype if "torch_dtype" in dir(config) else None), torch.bfloat16)
+        model_dtype = get_dtype(config.torch_dtype, torch.bfloat16)
 
         # Map HF Qwen3Next MoE config -> our MoE wrapper
         moe_defaults = dict(
@@ -193,9 +194,7 @@ class Qwen3NextModel(nn.Module):
 
         # Rotary embedding cache compatible with our rope_utils functions
         self.max_seq_len = config.max_position_embeddings
-        self.head_dim = (
-            config.head_dim if "head_dim" in dir(config) else config.hidden_size // config.num_attention_heads
-        )
+        self.head_dim = config.head_dim
         base, rope_scaling, partial_rotary_factor = get_rope_config(config)
 
         self.rotary_emb = RotaryEmbedding(
@@ -310,7 +309,7 @@ class Qwen3NextForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         self.backend = backend or BackendConfig()
         moe_overrides = kwargs.pop("moe_overrides", None)
         self.model = Qwen3NextModel(config, backend=self.backend, moe_config=moe_config, moe_overrides=moe_overrides)
-        model_dtype = get_dtype((config.torch_dtype if "torch_dtype" in dir(config) else None), torch.bfloat16)
+        model_dtype = get_dtype(config.torch_dtype, torch.bfloat16)
         self.lm_head = initialize_linear_module(
             self.backend.linear, config.hidden_size, config.vocab_size, bias=False, dtype=model_dtype
         )
@@ -349,9 +348,7 @@ class Qwen3NextForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         **attn_kwargs: Any,
     ) -> CausalLMOutputWithPast:
         output_hidden_states = (
-            output_hidden_states
-            if output_hidden_states is not None
-            else (self.config.output_hidden_states if "output_hidden_states" in dir(self.config) else False)
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
 
         is_thd = attn_kwargs.get("qkv_format") == "thd"

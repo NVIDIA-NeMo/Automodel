@@ -303,11 +303,12 @@ class TestInit:
         with pytest.raises(AssertionError, match="backbone_hidden_size"):
             Gemma4WithDrafter(b, d)
 
-    def test_drafter_missing_backbone_attr_is_tolerated(self):
+    def test_drafter_missing_backbone_attr_is_rejected(self):
         b = _StubBase(hidden=8)
         d = _StubDrafter(hidden=4, backbone_hidden=8, with_backbone_attr=False)
         # No assert when the drafter config has no ``backbone_hidden_size``.
-        Gemma4WithDrafter(b, d)
+        with pytest.raises(AttributeError, match="backbone_hidden_size"):
+            Gemma4WithDrafter(b, d)
 
 
 # ---------------------------------------------------------------------------
@@ -319,10 +320,10 @@ class TestGetBaseTextConfig:
         cfg = Gemma4WithDrafter._get_base_text_config(b)
         assert cfg.hidden_size == 8
 
-    def test_returns_config_when_flat(self):
+    def test_rejects_flat_config(self):
         b = _StubBase(hidden=8, config_with_text=False)
-        cfg = Gemma4WithDrafter._get_base_text_config(b)
-        assert cfg.hidden_size == 8
+        with pytest.raises(AttributeError, match="text_config"):
+            Gemma4WithDrafter._get_base_text_config(b)
 
     def test_raises_when_config_is_none(self):
         b = _StubBase(no_config=True)
@@ -472,19 +473,19 @@ class TestPassThroughs:
         assert comp.audio_tower is b.audio_tower
         assert comp.language_model is b.language_model
 
-    def test_vision_audio_language_absent_returns_none(self):
-        """When the base does not own these attributes the pass-throughs
-        must return ``None`` (not raise) so multimodal-aware recipe code
-        keeps probing successfully."""
+    def test_vision_audio_language_absent_is_contract_error(self):
         b = _StubBase(
             include_vision_tower=False,
             include_audio_tower=False,
             include_language_model=False,
         )
         comp = Gemma4WithDrafter(b, _StubDrafter())
-        assert comp.vision_tower is None
-        assert comp.audio_tower is None
-        assert comp.language_model is None
+        with pytest.raises(AttributeError, match="vision_tower"):
+            _ = comp.vision_tower
+        with pytest.raises(AttributeError, match="audio_tower"):
+            _ = comp.audio_tower
+        with pytest.raises(AttributeError, match="language_model"):
+            _ = comp.language_model
 
     def test_get_rope_index_dispatches(self):
         comp, _, _ = _make_composite()

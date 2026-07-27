@@ -55,11 +55,11 @@ class Glm4MoeAttention(nn.Module):
 
         self.num_heads = config.num_attention_heads
         self.num_kv_heads = config.num_key_value_heads
-        self.head_dim = config.head_dim if "head_dim" in dir(config) else config.hidden_size // self.num_heads
+        self.head_dim = config.head_dim
         self.use_qk_norm = config.use_qk_norm
-        self.partial_rotary_factor = config.partial_rotary_factor if "partial_rotary_factor" in dir(config) else 0.5
+        self.partial_rotary_factor = config.partial_rotary_factor
 
-        dtype = get_dtype((config.torch_dtype if "torch_dtype" in dir(config) else None), torch.bfloat16)
+        dtype = get_dtype(config.torch_dtype, torch.bfloat16)
 
         self.q_proj = initialize_linear_module(
             backend.linear, config.hidden_size, self.num_heads * self.head_dim, config.attention_bias, dtype=dtype

@@ -32,6 +32,7 @@ This is the same approach used by LlamaFactory.
 """
 
 import logging
+from collections.abc import Mapping
 
 import torch
 import torch.nn.functional as F
@@ -134,11 +135,7 @@ def _passthrough_create_causal_mask(
     through.  For other backends, pass through packed masks but delegate
     normal 2D masks to HF.
     """
-    if (
-        config is not None
-        and (config._attn_implementation if "_attn_implementation" in dir(config) else None)
-        in _FLASH_ATTN_IMPLEMENTATIONS
-    ):
+    if config is not None and config._attn_implementation in _FLASH_ATTN_IMPLEMENTATIONS:
         return attention_mask
 
     if attention_mask is not None:
@@ -165,10 +162,10 @@ def get_attn_implementation(cfg_model):
 
     Custom models store it in ``backend.attn``; HF models use ``attn_implementation``.
     """
-    if cfg_model is not None and "backend" in dir(cfg_model) and "attn" in dir(cfg_model.backend):
-        return cfg_model.backend.attn
-    if cfg_model is not None:
+    if isinstance(cfg_model, Mapping):
         return cfg_model.get("attn_implementation", "sdpa")
+    if cfg_model is not None:
+        return cfg_model.backend.attn
     return "sdpa"
 
 
@@ -195,22 +192,19 @@ def _patch_preprocess_mask_arguments_for_packing() -> None:
             "indexed mask values would enable cross-document attention."
         ) from exc
 
-    if (
-        masking_utils._nemo_automodel_packing_preprocess_patched
-        if "_nemo_automodel_packing_preprocess_patched" in dir(masking_utils)
-        else False
-    ):
-        return
-
-    original_preprocess = (
-        masking_utils._preprocess_mask_arguments if "_preprocess_mask_arguments" in dir(masking_utils) else None
-    )
-    if original_preprocess is None:
+    try:
+        original_preprocess = masking_utils._preprocess_mask_arguments
+    except AttributeError as exc:
         raise RuntimeError(
             "Cannot enable FA2 neat packing because transformers.masking_utils has no "
             f"_preprocess_mask_arguments in transformers {transformers.__version__}. Refusing to "
             "continue because losing indexed mask values would enable cross-document attention."
-        )
+        ) from exc
+    if (
+        original_preprocess.__module__ == __name__
+        and original_preprocess.__name__ == "_patched_preprocess_mask_arguments"
+    ):
+        return
 
     # A 4D mask takes Transformers' immediate pass-through branch, so this
     # constant-size probe verifies the private call and return contract without
@@ -261,9 +255,7 @@ def _patch_preprocess_mask_arguments_for_packing() -> None:
         """
         config = kwargs.get("config", args[0] if len(args) > 0 else None)
         attention_mask = kwargs.get("attention_mask", args[2] if len(args) > 2 else None)
-        attn_impl = (config._attn_implementation if "_attn_implementation" in dir(config) else None) or (
-            config._attn_implementation_internal if "_attn_implementation_internal" in dir(config) else None
-        )
+        attn_impl = config._attn_implementation or config._attn_implementation_internal
         if attn_impl in _FLASH_ATTN_IMPLEMENTATIONS and is_indexed_packed_mask(attention_mask):
             return (
                 preprocess_result_template[0],
@@ -273,7 +265,6 @@ def _patch_preprocess_mask_arguments_for_packing() -> None:
         return original_preprocess(*args, **kwargs)
 
     masking_utils._preprocess_mask_arguments = _patched_preprocess_mask_arguments
-    masking_utils._nemo_automodel_packing_preprocess_patched = True
 
 
 # Model modules whose ``create_causal_mask`` must be patched for neat packing.
@@ -315,7 +306,13 @@ def configure_packing(attn_implementation: str = "sdpa") -> None:
     # import time, so we must patch each module individually.
     for mod_name in _PACKING_PATCH_MODULES:
         mod = sys.modules.get(mod_name)
-        if mod is not None and "create_causal_mask" in dir(mod):
+        if mod is None:
+            continue
+        try:
+            mod.create_causal_mask
+        except AttributeError:
+            continue
+        else:
             mod.create_causal_mask = _passthrough_create_causal_mask
 
     logger.info(

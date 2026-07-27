@@ -229,6 +229,7 @@ def test_setup_cp_attention_installs_model_owned_sdpa_swap(monkeypatch):
 # ---------------------------------------------------------------------------
 def test_compiled_flex_attention_is_cached():
     module = torch.nn.Linear(2, 2)
+    cpa.attach_gemma4_cp_ring_attention(module)
     sentinel = object()
     with mock.patch("torch.compile", return_value=sentinel) as compile_mock:
         first = cpa._compiled_flex_attention(module)
@@ -403,6 +404,9 @@ def _flex_module(sliding_window=None, use_bidirectional_attention=None):
         sliding_window=sliding_window,
         config=SimpleNamespace(use_bidirectional_attention=use_bidirectional_attention),
         _gemma4_cp_compiled_flex_attn=_eager_flex,
+        _gemma4_cp_use_ffpa=False,
+        _cp_manual_metadata={},
+        _cp_manual_metadata_seq_dims={},
     )
     return module
 
@@ -814,8 +818,8 @@ def test_fsdp_guard_skips_uninitialized_and_runs_orig_and_is_idempotent(monkeypa
     p._unsharded_param = object()
     assert p.to_accumulated_grad_if_needed() == "ran"
     assert calls["n"] == 1
-    # Marked guarded; a second patch is a no-op (does not double-wrap).
-    assert FakeFSDPParam.to_accumulated_grad_if_needed._gemma4_guarded is True
+    # Function identity makes a second patch a no-op (does not double-wrap).
+    assert FakeFSDPParam.to_accumulated_grad_if_needed.__name__ == "guarded"
     wrapped = FakeFSDPParam.to_accumulated_grad_if_needed
     cpa._patch_fsdp_accumulated_grad_guard()
     assert FakeFSDPParam.to_accumulated_grad_if_needed is wrapped

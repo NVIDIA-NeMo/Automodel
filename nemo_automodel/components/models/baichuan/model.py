@@ -564,7 +564,7 @@ class BaichuanForCausalLM(HFCheckpointingMixin, BaichuanPreTrainedModel, Generat
             shift_logits = shift_logits.view(-1, self.config.vocab_size)
             shift_labels = shift_labels.view(-1).to(shift_logits.device)
             loss = loss_fct(shift_logits, shift_labels)
-            z_loss_weight = self.config.z_loss_weight if "z_loss_weight" in dir(self.config) else 0
+            z_loss_weight = self.config.z_loss_weight
             if z_loss_weight:
                 softmax_normalizer = shift_logits.max(-1).values ** 2
                 loss = loss + z_loss_weight * softmax_normalizer.mean()

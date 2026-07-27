@@ -126,7 +126,11 @@ class Ernie4_5_MoeStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapt
         else:
             key = self._native_key_to_hf(fqn)
             value = tensor
-            if key.endswith(".mlp.moe_statics.e_score_correction_bias") and "ndim" in dir(value) and value.ndim == 1:
+            if (
+                key.endswith(".mlp.moe_statics.e_score_correction_bias")
+                and isinstance(value, torch.Tensor)
+                and value.ndim == 1
+            ):
                 value = value.unsqueeze(0)
             result = [(key, value)]
 

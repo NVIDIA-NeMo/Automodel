@@ -65,7 +65,8 @@ def test_fully_shard_wraps_experts_before_the_layer(monkeypatch):
     monkeypatch.setattr(dg4_fsdp, "_has_fsdp_state", lambda m: False)
 
     experts = nn.Linear(4, 4)
-    layer = nn.Module()
+    layer = dg4_fsdp.DiffusionGemmaMoEDecoderLayer.__new__(dg4_fsdp.DiffusionGemmaMoEDecoderLayer)
+    nn.Module.__init__(layer)
     layer.moe = nn.Module()
     layer.moe.experts = experts
 

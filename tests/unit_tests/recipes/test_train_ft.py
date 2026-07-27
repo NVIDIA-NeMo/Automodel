@@ -455,7 +455,7 @@ def test_deepseek_v4_cp_local_seq_multiple_uses_compress_ratios():
     cfg = SimpleNamespace(model_type="deepseek_v4", compress_ratios=[0, 4, 128])
     model = SimpleNamespace(config=cfg)
 
-    assert dsv4_cp_local_seq_multiple(model) == 128
+    assert dsv4_cp_local_seq_multiple(model.config) == 128
 
 
 def test_deepseek_v4_cp_local_seq_multiple_handles_ratio4_only():

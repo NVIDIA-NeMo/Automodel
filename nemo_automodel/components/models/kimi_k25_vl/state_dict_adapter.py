@@ -17,6 +17,7 @@ import re
 from typing import Any, Optional
 
 import torch
+from torch.distributed.tensor import DTensor
 
 from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
 from nemo_automodel.components.models.common import BackendConfig
@@ -48,8 +49,8 @@ def dequantize_int4(
         device: Target device for computation
     """
 
-    is_packed_dtensor = "device_mesh" in dir(weight_packed)
-    is_scale_dtensor = "device_mesh" in dir(weight_scale)
+    is_packed_dtensor = isinstance(weight_packed, torch.distributed.tensor.DTensor)
+    is_scale_dtensor = isinstance(weight_scale, torch.distributed.tensor.DTensor)
 
     if is_packed_dtensor:
         weight_packed = weight_packed.to_local()
@@ -221,23 +222,13 @@ class KimiK25VLStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
 
         if quantization:
             quantized_result = []
-            device_mesh = kwargs.get("device_mesh", None)
 
             for key, value in result:
                 if self._is_quantized_expert_key(key):
-                    from torch.distributed.tensor import DTensor, Shard
-
-                    local_tensor_attr = vars(value).get("_local_tensor")
-                    is_dtensor = local_tensor_attr is not None or str(type(value).__name__) == "DTensor"
+                    is_dtensor = isinstance(value, DTensor)
                     base = key[:-7] if key.endswith(".weight") else key
 
-                    local_tensor = (
-                        local_tensor_attr
-                        if local_tensor_attr is not None
-                        else value.to_local()
-                        if is_dtensor
-                        else value
-                    )
+                    local_tensor = value.to_local() if is_dtensor else value
                     is_meta = local_tensor.is_meta
 
                     if is_meta:
@@ -253,8 +244,8 @@ class KimiK25VLStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
                         shape = shape.to(local_tensor.device)
 
                     if is_dtensor and not is_meta:
-                        placements = value.placements if "placements" in dir(value) else [Shard(0)]
-                        mesh = value.device_mesh if "device_mesh" in dir(value) else device_mesh
+                        placements = value.placements
+                        mesh = value.device_mesh
                         if mesh is not None:
                             packed = DTensor.from_local(packed, mesh, placements)
                             scale = DTensor.from_local(scale, mesh, placements)

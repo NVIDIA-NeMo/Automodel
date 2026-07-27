@@ -98,8 +98,8 @@ class MiniMaxM3MLP(nn.Module):
 
     def __init__(self, config: Any, intermediate_size: int, backend: BackendConfig):
         super().__init__()
-        self.alpha = float((config.swiglu_alpha if "swiglu_alpha" in dir(config) else 1.702))
-        self.limit = float((config.swiglu_limit if "swiglu_limit" in dir(config) else 7.0))
+        self.alpha = float(config.swiglu_alpha)
+        self.limit = float(config.swiglu_limit)
         self.gate_proj = initialize_linear_module(backend.linear, config.hidden_size, intermediate_size, bias=False)
         self.up_proj = initialize_linear_module(backend.linear, config.hidden_size, intermediate_size, bias=False)
         self.down_proj = initialize_linear_module(backend.linear, intermediate_size, config.hidden_size, bias=False)
@@ -336,7 +336,7 @@ class MiniMaxM3Indexer(nn.Module):
         self.init_blocks = sparse_cfg.get("sparse_init_block", 0)
         self.local_blocks = sparse_cfg.get("sparse_local_block", 1)
         self.score_type = sparse_cfg.get("sparse_score_type", "max")
-        gemma = config.use_gemma_norm if "use_gemma_norm" in dir(config) else False
+        gemma = config.use_gemma_norm
 
         self.index_q_proj = initialize_linear_module(
             backend.linear, config.hidden_size, self.num_index_heads * self.index_head_dim, bias=False
@@ -400,18 +400,16 @@ class MiniMaxM3Attention(nn.Module):
         self.backend = backend
         self.num_heads = config.num_attention_heads
         self.num_kv_heads = config.num_key_value_heads
-        self.head_dim = (config.head_dim if "head_dim" in dir(config) else None) or config.hidden_size // self.num_heads
-        self.use_qk_norm = config.use_qk_norm if "use_qk_norm" in dir(config) else False
+        self.head_dim = config.head_dim or config.hidden_size // self.num_heads
+        self.use_qk_norm = config.use_qk_norm
         self.is_sparse_attention_layer = is_sparse_attention_layer
-        gemma = config.use_gemma_norm if "use_gemma_norm" in dir(config) else False
+        gemma = config.use_gemma_norm
 
         # Fail loudly on unsupported configs: M3 does not implement the attention
         # output gate, and only per-head QK norm is supported (the only mode the
         # sparse index branch is valid for).
-        assert not (config.attention_output_gate if "attention_output_gate" in dir(config) else False), (
-            "MiniMax M3 attention_output_gate is not implemented"
-        )
-        qk_norm_type = config.qk_norm_type if "qk_norm_type" in dir(config) else "per_head"
+        assert not config.attention_output_gate, "MiniMax M3 attention_output_gate is not implemented"
+        qk_norm_type = config.qk_norm_type
         if self.use_qk_norm or is_sparse_attention_layer:
             assert qk_norm_type == "per_head", f"MiniMax M3 only supports qk_norm_type='per_head', got {qk_norm_type!r}"
 
@@ -537,7 +535,7 @@ class Block(nn.Module):
 
         # Sparse-attention layers are selected by sparse_attention_config's
         # ``sparse_attention_freq`` (layers 0-2 are dense, 3-59 sparse for M3).
-        sparse_cfg = config.sparse_attention_config if "sparse_attention_config" in dir(config) else None
+        sparse_cfg = config.sparse_attention_config
         if sparse_cfg is not None and sparse_cfg.get("use_sparse_attention", True):
             sparse_freq = sparse_cfg.get("sparse_attention_freq")
             is_sparse_attention_layer = sparse_freq is None or sparse_freq[layer_idx] != 0
@@ -566,18 +564,14 @@ class Block(nn.Module):
         else:
             self.self_attn = MiniMaxM3Attention(config, backend, is_sparse_attention_layer=is_sparse_attention_layer)
 
-        moe_layer_freq = config.moe_layer_freq if "moe_layer_freq" in dir(config) else None
+        moe_layer_freq = config.moe_layer_freq
         self.is_moe_layer = True if moe_layer_freq is None else moe_layer_freq[layer_idx] != 0
 
         if self.is_moe_layer:
             self.mlp = MoE(moe_config, backend)
-            n_shared = (config.n_shared_experts if "n_shared_experts" in dir(config) else 0) or 0
+            n_shared = config.n_shared_experts or 0
             if n_shared > 0:
-                shared_inter = (
-                    config.shared_intermediate_size
-                    if "shared_intermediate_size" in dir(config)
-                    else config.intermediate_size
-                ) * n_shared
+                shared_inter = config.shared_intermediate_size * n_shared
                 self.shared_experts = MiniMaxM3MLP(config, shared_inter, backend)
             else:
                 self.shared_experts = None
@@ -585,7 +579,7 @@ class Block(nn.Module):
             self.mlp = MiniMaxM3MLP(config, config.dense_intermediate_size, backend)
             self.shared_experts = None
 
-        gemma = config.use_gemma_norm if "use_gemma_norm" in dir(config) else False
+        gemma = config.use_gemma_norm
         self.input_layernorm = MiniMaxM3RMSNorm(config.hidden_size, eps=config.rms_norm_eps, gemma=gemma)
         self.post_attention_layernorm = MiniMaxM3RMSNorm(config.hidden_size, eps=config.rms_norm_eps, gemma=gemma)
 

@@ -29,6 +29,7 @@ from nemo_automodel.components.models.common import (
     initialize_linear_module,
     initialize_rms_norm_module,
 )
+from nemo_automodel.components.moe.layers import Gate
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
@@ -49,12 +50,12 @@ class NemotronV3Attention(nn.Module):
         self.num_key_value_heads = config.num_key_value_heads
         self.head_dim = config.head_dim
         self.hidden_size = config.hidden_size
-        self.attention_bias = config.attention_bias if "attention_bias" in dir(config) else False
-        self.attention_dropout = config.attention_dropout if "attention_dropout" in dir(config) else 0.0
+        self.attention_bias = config.attention_bias
+        self.attention_dropout = config.attention_dropout
         # Cached for debug-print role disambiguation (backbone vs mtp sublayer).
-        self.num_hidden_layers = int((config.num_hidden_layers if "num_hidden_layers" in dir(config) else 0))
+        self.num_hidden_layers = int(config.num_hidden_layers)
 
-        dtype = get_dtype((config.torch_dtype if "torch_dtype" in dir(config) else None), torch.bfloat16)
+        dtype = get_dtype(config.torch_dtype, torch.bfloat16)
         self.q_proj = initialize_linear_module(
             self.backend.linear,
             self.hidden_size,
@@ -600,7 +601,7 @@ class NemotronV3Mamba2Mixer(nn.Module):
         with buffer_device:
             # dt_bias: inverse softplus initialization
             # Check _no_reinit flag to avoid re-initializing if called multiple times
-            if not (self.dt_bias._no_reinit if "_no_reinit" in dir(self.dt_bias) else False):
+            if not self.dt_bias._no_reinit:
                 dt_bias_local = _to_local(self.dt_bias)
                 local_num_heads = dt_bias_local.shape[0]
                 dt = torch.exp(
@@ -652,14 +653,14 @@ class NemotronV3Block(nn.Module):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
-        self.residual_in_fp32 = config.residual_in_fp32 if "residual_in_fp32" in dir(config) else False
+        self.residual_in_fp32 = config.residual_in_fp32
 
         # RMSNorm
         self.norm = initialize_rms_norm_module(
             backend.rms_norm,
             config.hidden_size,
             eps=config.layer_norm_epsilon,
-            dtype=get_dtype((config.torch_dtype if "torch_dtype" in dir(config) else None), torch.bfloat16),
+            dtype=get_dtype(config.torch_dtype, torch.bfloat16),
         )
 
         # Determine layer type from config
@@ -681,8 +682,8 @@ class NemotronV3Block(nn.Module):
                 inter_dim=config.intermediate_size,
                 backend=backend.linear,
                 dtype=dtype,
-                activation=(config.mlp_hidden_act if "mlp_hidden_act" in dir(config) else "relu2"),
-                bias=(config.mlp_bias if "mlp_bias" in dir(config) else False),
+                activation=config.mlp_hidden_act,
+                bias=config.mlp_bias,
             )
         elif self.block_type == "moe":
             from nemo_automodel.components.moe.layers import MoE
@@ -783,10 +784,8 @@ class NemotronV3Block(nn.Module):
             buffer_device: Device for buffer initialization (used by MLP/MoE)
         """
         num_hidden_layers = self.config.num_hidden_layers
-        rescale_prenorm_residual = (
-            self.config.rescale_prenorm_residual if "rescale_prenorm_residual" in dir(self.config) else True
-        )
-        init_std = self.config.initializer_range if "initializer_range" in dir(self.config) else 0.02
+        rescale_prenorm_residual = self.config.rescale_prenorm_residual
+        init_std = self.config.initializer_range
 
         # Initialize norm
         self.norm.reset_parameters()
@@ -808,15 +807,15 @@ class NemotronV3Block(nn.Module):
             self.mixer.init_weights(buffer_device=buffer_device, init_std=init_std)
 
             # Override gate weight with normal (not trunc_normal) for backward compat
-            if "weight" in dir(self.mixer.gate):
+            if isinstance(self.mixer.gate, Gate):
                 nn.init.normal_(self.mixer.gate.weight, mean=0.0, std=init_std)
-            if "bias" in dir(self.mixer.gate) and self.mixer.gate.bias is not None:
-                nn.init.zeros_(self.mixer.gate.bias)
+                if self.mixer.gate.bias is not None:
+                    nn.init.zeros_(self.mixer.gate.bias)
 
             # Zero expert biases
-            if "gate_up_proj_bias" in dir(self.mixer.experts) and self.mixer.experts.gate_up_proj_bias is not None:
+            if self.mixer.experts.gate_up_proj_bias is not None:
                 nn.init.zeros_(self.mixer.experts.gate_up_proj_bias)
-            if "down_proj_bias" in dir(self.mixer.experts) and self.mixer.experts.down_proj_bias is not None:
+            if self.mixer.experts.down_proj_bias is not None:
                 nn.init.zeros_(self.mixer.experts.down_proj_bias)
 
             # Zero shared expert biases

@@ -1007,7 +1007,11 @@ class TestDeepseekV4OptimizedKernels:
             training = False
 
             def __init__(self, sinks):
-                self.sinks = sinks
+                self._sinks = sinks
+
+            def sinks_param(self, reference):
+                del reference
+                return self._sinks
 
         def packed_attention(q_, kv_, sinks_):
             attention_mask = build_packed_causal_padding_mask(
@@ -1307,8 +1311,12 @@ class TestDeepseekV4OptimizedKernels:
             num_key_value_groups = heads
 
             def __init__(self, sinks):
-                self.sinks = sinks
+                self._sinks = sinks
                 self.training = False
+
+            def sinks_param(self, reference):
+                del reference
+                return self._sinks
 
         expected, expected_grads = _run_forward_backward(
             lambda q_, kv_, sinks_: eager_attention_with_sink(
