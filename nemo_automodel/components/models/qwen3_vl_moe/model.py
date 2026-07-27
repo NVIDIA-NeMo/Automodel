@@ -57,8 +57,8 @@ class Fp32SafeQwen3VLMoeTextRotaryEmbedding(Qwen3VLMoeTextRotaryEmbedding):
         }
         result = super()._apply(fn, recurse=recurse)
         for name, fp32_buffer in fp32_buffers.items():
-            current = getattr(self, name)
-            self.register_buffer(name, fp32_buffer.to(device=current.device), persistent=False)
+            buffer = self.get_buffer(name)
+            self.register_buffer(name, fp32_buffer.to(device=buffer.device), persistent=False)
         return result
 
 
@@ -73,8 +73,8 @@ class Fp32SafeQwen3VLMoeVisionRotaryEmbedding(Qwen3VLMoeVisionRotaryEmbedding):
         }
         result = super()._apply(fn, recurse=recurse)
         for name, fp32_buffer in fp32_buffers.items():
-            current = getattr(self, name)
-            self.register_buffer(name, fp32_buffer.to(device=current.device), persistent=False)
+            buffer = self.get_buffer(name)
+            self.register_buffer(name, fp32_buffer.to(device=buffer.device), persistent=False)
         return result
 
 
@@ -234,6 +234,7 @@ class Qwen3VLMoeModel(HFQwen3VLMoeModel):
                 deepstack_visual_embeds = deepstack_video_embeds
 
             # Compute mRoPE position_ids if not pre-computed
+            self.rope_deltas = None
             if position_ids is None:
                 mm_token_type_ids = kwargs.get("mm_token_type_ids", None)
                 attention_mask_tensor = (
@@ -263,7 +264,7 @@ class Qwen3VLMoeModel(HFQwen3VLMoeModel):
             return Qwen3VLMoeModelOutputWithPast(
                 last_hidden_state=outputs.last_hidden_state,
                 past_key_values=None,
-                rope_deltas=getattr(self, "rope_deltas", None),
+                rope_deltas=self.rope_deltas,
             )
 
         outputs = self.language_model(
@@ -296,13 +297,13 @@ class Qwen3VLMoeTextModelBackend(nn.Module):
         if moe_config is not None and moe_overrides is not None:
             raise ValueError("Cannot pass both moe_config and moe_overrides; use one or the other.")
 
-        self.padding_idx = getattr(config, "pad_token_id", None)
+        self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
         # Resolve model dtype once; thread it explicitly to every sub-module
         # so fp32 master weights work even when construction is not wrapped in
         # local_torch_dtype().
-        model_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+        model_dtype = get_dtype(config.dtype, torch.bfloat16)
 
         moe_defaults = dict(
             dim=config.hidden_size,
