@@ -607,39 +607,57 @@ class Checkpointer:
 
     @torch.no_grad()
     def save_optimizer(
-        self, optimizer: torch.optim.Optimizer, model: nn.Module, weights_path: str, scheduler: Optional[Any] = None
+        self,
+        optimizer: torch.optim.Optimizer | list[torch.optim.Optimizer],
+        model: nn.Module | list[nn.Module],
+        weights_path: str,
+        scheduler: Optional[Any] = None,
     ) -> None:
         """
         Save optimizer (and optional scheduler) state to `weights_path/optim` using DCP.
 
         Args:
-            optimizer: Optimizer whose state will be saved.
-            model: Model providing partitioning context for the optimizer wrapper.
+            optimizer: Optimizer or per-model-part optimizers whose state will be saved.
+            model: Model or pipeline model parts providing partitioning context.
             weights_path: Base directory for checkpoints.
             scheduler: Optional LR scheduler to include.
         """
         optimizer_path = os.path.join(weights_path, "optim")
         _ensure_dirs(optimizer_path, process_group=self.process_group)
         optimizer_state = OptimizerState(
-            model, optimizer, scheduler, is_peft=self.config.is_peft, cpu_offload=self.config.cpu_offload
+            model,
+            optimizer,
+            scheduler,
+            is_peft=self.config.is_peft,
+            cpu_offload=self.config.cpu_offload,
+            has_expert_parallelism=self.moe_mesh is not None,
         )
         state_dict = optimizer_state.state_dict()
         self._optim_ctx.future = self._do_save(state_dict, optimizer_path)
 
     def load_optimizer(
-        self, optimizer: torch.optim.Optimizer, model: nn.Module, weights_path: str, scheduler: Optional[Any] = None
+        self,
+        optimizer: torch.optim.Optimizer | list[torch.optim.Optimizer],
+        model: nn.Module | list[nn.Module],
+        weights_path: str,
+        scheduler: Optional[Any] = None,
     ) -> None:
         """
         Load optimizer (and optional scheduler) state from `weights_path/optim` using DCP.
 
         Args:
-            optimizer: Optimizer to populate.
-            model: Model providing partitioning context for the optimizer wrapper.
+            optimizer: Optimizer or per-model-part optimizers to populate.
+            model: Model or pipeline model parts providing partitioning context.
             weights_path: Base directory for checkpoints.
             scheduler: Optional LR scheduler to populate.
         """
         optimizer_state = OptimizerState(
-            model, optimizer, scheduler, is_peft=self.config.is_peft, cpu_offload=self.config.cpu_offload
+            model,
+            optimizer,
+            scheduler,
+            is_peft=self.config.is_peft,
+            cpu_offload=self.config.cpu_offload,
+            has_expert_parallelism=self.moe_mesh is not None,
         )
         state_dict = optimizer_state.state_dict()
         self._do_load(state_dict, os.path.join(weights_path, "optim"))
