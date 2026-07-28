@@ -101,7 +101,7 @@ if [[ "$HAS_ROBUSTNESS" == "true" ]]; then
   esac
 
   ROBUSTNESS_CMD="${CMD} --tee 3 --log-dir $TEST_DIR/robustness_logs \
-    -m pytest --tb=short ${ROBUSTNESS_TEST_SCRIPT} \
+    -m pytest -rP --tb=short ${ROBUSTNESS_TEST_SCRIPT} \
     --config ${RESOLVED_ROBUSTNESS_CONFIG}"
 
   echo "============================================"
