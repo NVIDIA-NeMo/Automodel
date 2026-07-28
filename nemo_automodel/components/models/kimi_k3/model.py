@@ -1532,6 +1532,9 @@ class KimiK3TextModel(nn.Module):
         padding_mask: torch.Tensor | None = None,
         cache_position: torch.Tensor | None = None,
         kimi_packed_context: KimiPackedContext | None = None,
+        kimi_packed_doc_ids: torch.Tensor | None = None,
+        kimi_packed_seq_start: int = 0,
+        kimi_packed_cp_size: int = 1,
         **attn_kwargs: Any,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Run the Kimi Linear decoder.
@@ -1549,6 +1552,10 @@ class KimiK3TextModel(nn.Module):
             kimi_packed_context: Optional document layout attached by
                 :func:`~nemo_automodel.components.models.kimi_k3.cp.shard_batch_for_kimi_cp`;
                 required under context parallelism and otherwise derived here.
+            kimi_packed_doc_ids: Pipeline-safe global document map used to
+                reconstruct ``kimi_packed_context`` after microbatch chunking.
+            kimi_packed_seq_start: Global offset of this CP rank's sequence shard.
+            kimi_packed_cp_size: Number of context-parallel sequence shards.
             **attn_kwargs: Additional attention kwargs used by packed or THD execution.
 
         Returns:
@@ -1572,11 +1579,21 @@ class KimiK3TextModel(nn.Module):
         if cache_position is None:
             cache_position = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device)
 
-        packed_context = kimi_packed_context or _packed_context_from_inputs(
-            inputs_embeds,
-            attention_mask=attention_mask,
-            cu_seqlens=attn_kwargs.get("cu_seqlens"),
-        )
+        if kimi_packed_context is not None and kimi_packed_doc_ids is not None:
+            raise ValueError("Pass either kimi_packed_context or pipeline-safe Kimi CP metadata, not both.")
+        packed_context = kimi_packed_context
+        if packed_context is None and kimi_packed_doc_ids is not None:
+            packed_context = KimiPackedContext(
+                doc_ids=kimi_packed_doc_ids,
+                seq_start=kimi_packed_seq_start,
+                cp_size=kimi_packed_cp_size,
+            )
+        if packed_context is None:
+            packed_context = _packed_context_from_inputs(
+                inputs_embeds,
+                attention_mask=attention_mask,
+                cu_seqlens=attn_kwargs.get("cu_seqlens"),
+            )
         linear_attn_mask = self._update_linear_attn_mask(attention_mask, cache_position)
         causal_mask = (
             None

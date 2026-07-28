@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import torch
+from torch.distributed.pipelining.microbatch import split_args_kwargs_into_chunks
 
 from nemo_automodel.components.distributed.context_parallel.sharder import ContextParallelSharder
 from nemo_automodel.components.models.kimi_k3.cp import shard_batch_for_kimi_cp
@@ -72,8 +73,30 @@ def test_kimi_cp_sharder_keeps_contiguous_tokens_and_global_document_map():
     assert local_batch["position_ids"].tolist() == [[4, 5, 6, 7]]
     assert local_batch["padding_mask"].tolist() == [[False, False, True, True]]
     assert "attention_mask" not in local_batch
-    assert local_batch["kimi_packed_context"].doc_ids.tolist() == [[1, 1, 1, 1, 1, 1, 0, 0]]
-    assert local_batch["kimi_packed_context"].seq_start == 4
-    assert local_batch["kimi_packed_context"].cp_size == 2
+    assert local_batch["kimi_packed_doc_ids"].tolist() == [[1, 1, 1, 1, 1, 1, 0, 0]]
+    assert local_batch["kimi_packed_seq_start"] == 4
+    assert local_batch["kimi_packed_cp_size"] == 2
     assert layout.original_seq_len == 8
     assert layout.padded_seq_len == 8
+
+
+def test_pipeline_microbatches_chunk_kimi_document_map():
+    batch = {
+        "input_ids": torch.arange(16).reshape(2, 8),
+        "labels": torch.arange(16).reshape(2, 8),
+        "attention_mask": torch.tensor(
+            [
+                [1, 1, 1, 1, 1, 1, 0, 0],
+                [1, 1, 1, 1, 0, 0, 0, 0],
+            ]
+        ),
+    }
+    _, local_batch, _ = shard_batch_for_kimi_cp(_FakeCPMesh(), None, batch)
+
+    _, microbatches = split_args_kwargs_into_chunks((), local_batch, chunks=2)
+
+    assert len(microbatches) == 2
+    assert [microbatch["input_ids"].shape for microbatch in microbatches] == [(1, 4), (1, 4)]
+    assert [microbatch["kimi_packed_doc_ids"].shape for microbatch in microbatches] == [(1, 8), (1, 8)]
+    assert microbatches[0]["kimi_packed_doc_ids"].tolist() == [[1, 1, 1, 1, 1, 1, 0, 0]]
+    assert microbatches[1]["kimi_packed_doc_ids"].tolist() == [[1, 1, 1, 1, 0, 0, 0, 0]]

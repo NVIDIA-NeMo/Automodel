@@ -509,15 +509,17 @@ def shard_batch_for_kimi_cp(cp_mesh, tp_mesh, batch: dict, *, loss_mask=None, pa
     # encodes that only in the document map, so mirror it into ``padding_mask``.
     batch.setdefault("padding_mask", doc_ids <= _PAD_DOC_ID)
 
-    batch["kimi_packed_context"] = KimiPackedContext(
-        doc_ids=doc_ids,
-        seq_start=0 if cp_mesh is None else cp_mesh.get_local_rank() * (seq_len // cp_size),
-        cp_size=cp_size,
-    )
+    seq_start = 0 if cp_mesh is None else cp_mesh.get_local_rank() * (seq_len // cp_size)
+    # Keep CP metadata as ordinary batch fields until it reaches the model.
+    # Pipeline schedules chunk tensor kwargs along batch dim but replicate
+    # arbitrary dataclasses, so carrying KimiPackedContext itself would leave
+    # every microbatch with the full batch's document map.
+    batch["kimi_packed_doc_ids"] = doc_ids
+    batch["kimi_packed_seq_start"] = seq_start
+    batch["kimi_packed_cp_size"] = cp_size
 
     if cp_size > 1:
         local_seq_len = seq_len // cp_size
-        seq_start = batch["kimi_packed_context"].seq_start
         seq_end = seq_start + local_seq_len
         for key in ("input_ids", "labels", "position_ids", "padding_mask"):
             if key in batch:
