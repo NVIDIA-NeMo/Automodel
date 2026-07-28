@@ -13,10 +13,7 @@ from tokenizers import AddedToken
 from transformers.convert_slow_tokenizer import bytes_to_unicode
 from transformers.tokenization_utils import PreTrainedTokenizer
 
-try:
-    from .encoding import build_chat_segments, is_batched_conversation
-except ImportError:  # pragma: no cover - supports direct file execution/import.
-    from encoding_k3 import build_chat_segments, is_batched_conversation
+from .encoding import build_chat_segments, is_batched_conversation
 
 logger = getLogger(__name__)
 VOCAB_FILES_NAMES = {"vocab_file": "tiktoken.model"}

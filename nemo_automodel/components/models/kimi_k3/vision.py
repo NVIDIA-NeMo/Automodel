@@ -32,16 +32,11 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import activations
 
 try:
     from transformers.activations import PytorchGELUTanh
 except ImportError:
-    from transformers.activations import GELUTanh
-
-    activations.PytorchGELUTanh = GELUTanh
-    PytorchGELUTanh = GELUTanh
-from transformers.activations import PytorchGELUTanh
+    from transformers.activations import GELUTanh as PytorchGELUTanh
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import is_flash_attn_2_available
 
