@@ -4002,6 +4002,7 @@ diffusion-kernels = [
     { name = "torchvision", marker = "sys_platform == 'never'" },
 ]
 diffusion-media = [
+    { name = "av" },
     { name = "imageio-ffmpeg" },
     { name = "opencv-python-headless" },
 ]
@@ -4021,6 +4022,7 @@ fla = [
 ]
 media = [
     { name = "albumentations" },
+    { name = "av" },
     { name = "decord", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
     { name = "imageio-ffmpeg" },
     { name = "opencv-python-headless" },
@@ -4108,6 +4110,7 @@ test = [
 requires-dist = [
     { name = "albumentations", marker = "extra == 'vlm-media'" },
     { name = "apache-tvm-ffi", marker = "extra == 'cuda'", specifier = "<=0.1.11" },
+    { name = "av", marker = "extra == 'diffusion-media'" },
     { name = "backoff", marker = "extra == 'vlm'" },
     { name = "bitsandbytes", marker = "extra == 'cuda-source'" },
     { name = "boto3", marker = "extra == 's3'", specifier = ">=1.34" },

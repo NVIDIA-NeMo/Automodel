@@ -176,6 +176,7 @@ vlm-media = [
     "qwen-vl-utils",
 ]
 diffusion-media = [
+    "av",  # PyAV: audio decoding for LTX-2 video+audio preprocessing
     "imageio-ffmpeg",
     "opencv-python-headless==4.10.0.84",  # cv2: diffusion preprocessing entry point (also in vlm-media)
 ]
