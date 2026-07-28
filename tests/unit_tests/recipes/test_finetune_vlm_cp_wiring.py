@@ -184,6 +184,31 @@ class _ScheduleSpy:
             losses.append(torch.tensor(1.25))
 
 
+class _PPSpy(SimpleNamespace):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.step_batches = []
+
+    def step(self, model_input, *, target=None, losses=None, **kwargs):
+        """Record and forward an AutoPipeline step.
+
+        Args:
+            model_input: Tensor of shape [batch, ...] containing the first
+                pipeline stage's input.
+            target: Optional tensor of shape [batch, sequence] containing loss
+                targets.
+            losses: Optional mutable list populated with scalar loss tensors.
+            **kwargs: Keyword schedule inputs. Tensor values have arbitrary
+                model-defined layouts.
+
+        Returns:
+            The value returned by the schedule spy.
+        """
+        self.step_batches.append(dict(kwargs))
+        schedule_args = (model_input,) if self.info.has_first_stage else ()
+        return self.info.schedule.step(*schedule_args, target=target, losses=losses, **kwargs)
+
+
 def test_forward_backward_step_pp_cp_first_stage_sunk_keeps_input_ids_full(monkeypatch):
     """Sunk model on the FIRST PP stage under CP: the sharder-only hook is invoked
     (consumes nothing), so input_ids stays full-length, update_seq_len sees the
@@ -201,7 +226,7 @@ def test_forward_backward_step_pp_cp_first_stage_sunk_keeps_input_ids_full(monke
     recipe.distributed_config = SimpleNamespace(defer_fsdp_grad_sync=True)
     recipe.model_parts = [model]
     recipe.pp_enabled = True
-    recipe.pp = SimpleNamespace(
+    recipe.pp = _PPSpy(
         pp_microbatch_size=2,
         info=SimpleNamespace(
             has_first_stage=True,
@@ -253,6 +278,7 @@ def test_forward_backward_step_pp_cp_first_stage_sunk_keeps_input_ids_full(monke
     assert tuple(seen_cp_batch["input_ids"].shape) == (2, 6)
     assert "inputs_embeds" not in seen_cp_batch
     assert seq_lens == [6]
+    assert [set(call.keys()) for call in recipe.pp.step_batches] == [{"pixel_values"}]
     assert len(schedule.calls) == 1
     assert tuple(schedule.calls[0]["model_input"].shape) == (2, 6)
     assert torch.equal(schedule.calls[0]["target"], labels)
@@ -286,7 +312,7 @@ def _run_nonfirst_stage_fbstep(monkeypatch, model):
     recipe.distributed_config = SimpleNamespace(defer_fsdp_grad_sync=True)
     recipe.model_parts = [model]
     recipe.pp_enabled = True
-    recipe.pp = SimpleNamespace(
+    recipe.pp = _PPSpy(
         pp_microbatch_size=2,
         info=SimpleNamespace(
             has_first_stage=False,
@@ -325,7 +351,7 @@ def _run_nonfirst_stage_fbstep(monkeypatch, model):
     FinetuneRecipeForVLM._forward_backward_step(
         recipe, 0, batch, loss_buffer=[], num_label_tokens=labels.numel(), num_batches=1
     )
-    return seen_cp_batch, seq_lens
+    return seen_cp_batch, seq_lens, recipe.pp.step_batches, schedule.calls
 
 
 def test_forward_backward_step_pp_cp_sunk_model_nonfirst_stage_invokes_hook_keeps_input_ids_full(monkeypatch):
@@ -335,7 +361,7 @@ def test_forward_backward_step_pp_cp_sunk_model_nonfirst_stage_invokes_hook_keep
     the generic sharder would produce, which would ÷cp a second time and truncate
     the inter-stage hidden (the text-decoder RoPE size mismatch)."""
     model = _SunkSpyVLM()
-    seen_cp_batch, seq_lens = _run_nonfirst_stage_fbstep(monkeypatch, model)
+    seen_cp_batch, seq_lens, step_batches, schedule_calls = _run_nonfirst_stage_fbstep(monkeypatch, model)
 
     # Hook invoked on the non-first stage (this is the fix).
     assert len(model.calls) == 1
@@ -344,6 +370,8 @@ def test_forward_backward_step_pp_cp_sunk_model_nonfirst_stage_invokes_hook_keep
     assert tuple(seen_cp_batch["input_ids"].shape) == (2, 6)
     # All pp ranks feed the FULL seq_len to update_seq_len.
     assert seq_lens == [6]
+    assert step_batches == [{}]
+    assert schedule_calls[0]["model_input"] is None
 
 
 class _FakePPModel:
