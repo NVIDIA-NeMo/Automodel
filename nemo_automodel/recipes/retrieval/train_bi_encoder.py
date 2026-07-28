@@ -38,7 +38,10 @@ from nemo_automodel.components.optim.precision_warnings import warn_if_torch_ada
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
 from nemo_automodel.components.utils.compile_utils import build_compile_config
-from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config
+from nemo_automodel.recipes._dist_utils import (
+    create_distributed_setup_from_config,
+    shard_optimizers_for_megatron_fsdp,
+)
 from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 from nemo_automodel.shared.te_patches import apply_te_patches
@@ -283,7 +286,15 @@ class TrainBiEncoderRecipe(BaseRecipe):
 
         param_groups = self._build_optimizer_param_groups()
         optimizer = self.cfg.optimizer.build_from_param_groups(param_groups, device_mesh=self.device_mesh)
-        self.optimizer = [optimizer]
+        # Megatron-FSDP ZeRO-1/2/3 requires registering the separately-built optimizer with the
+        # already-wrapped MegatronFSDP model (mirrors the LLM recipe train_ft.py). Without this,
+        # the deferred grad-sync / optimized-weight install hooks are never wired up. Assign
+        # self.optimizer exactly once so BaseRecipe.__setattr__ state-tracking does not reject a
+        # second "optimizer" registration.
+        allow_megatron_fsdp_sharding = getattr(self.cfg.optimizer, "supports_megatron_fsdp_sharding", True)
+        self.optimizer = shard_optimizers_for_megatron_fsdp(
+            self.model_parts[0], [optimizer], self.distributed_config, allow=allow_megatron_fsdp_sharding
+        )
         warn_if_torch_adam_with_bf16_params(
             optimizer=self.optimizer,
             is_peft=self.peft_config is not None,

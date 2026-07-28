@@ -206,7 +206,11 @@ def test_teacher_worker_serves_each_wave_until_stop(monkeypatch, recipe_module, 
 
 @pytest.mark.parametrize("recipe_module,recipe_cls,_", _RECIPE_CASES)
 def test_teacher_forward_separate_materializes_logits(monkeypatch, recipe_module, recipe_cls, _):
-    monkeypatch.setattr(recipe_module, "make_cp_batch_and_ctx", lambda mesh, batch, **kwargs: (nullcontext, batch))
+    monkeypatch.setattr(
+        recipe_module,
+        "ContextParallelSharder",
+        lambda model, mesh, batch, **kwargs: SimpleNamespace(shard=lambda actual: (nullcontext, actual)),
+    )
     materialized = []
     monkeypatch.setattr(
         recipe_module,

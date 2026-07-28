@@ -411,6 +411,12 @@ class BaseRecipe:
             if is_dist_initialized:
                 _dist_barrier(getattr(getattr(self, "mesh_context", None), "process_group", None))
 
+        # Staging holds the source buffers until it completes, so drain it before
+        # reclaiming memory below. Waiting here (rather than right after the save)
+        # overlaps staging with the config write, barrier, and symlink update.
+        if self.checkpointer.config.wait_for_staging:
+            self.checkpointer.maybe_wait_for_staging()
+
         # Release NCCL workspace and DCP gather scratch back to the allocator.
         # Without this, the next training step's backward sees a fragmented
         # heap (~74 GB still resident on tight 14B FSDP2 runs) and OOMs.

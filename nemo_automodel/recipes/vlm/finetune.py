@@ -48,9 +48,9 @@ from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.vlm.pp_media import stage_vlm_media_for_pp
 from nemo_automodel.components.distributed.config import DistributedSetup, MegatronFSDPConfig
-from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
+from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
+from nemo_automodel.components.distributed.context_parallel.magi import MagiState, setup_magi
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
-from nemo_automodel.components.distributed.magi_attn_utils import MagiState, setup_magi
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
@@ -445,7 +445,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         # MagiAttention (FFA) backend for the language backbone; the vision tower
         # stays on SDPA. Enabled via model.attn_implementation="magi" (HF VLMs) or
         # model.backend.attn="magi" (custom VLMs, e.g. qwen3_vl_moe).
-        self.magi = setup_magi(self.cfg, self.device_mesh, label="VLM language backbone")
+        self.magi = setup_magi(self.cfg, self.device_mesh, domain="vlm", label="VLM language backbone")
 
         if self.dist_env.is_main and self.cfg.wandb is not None:
             suppress_wandb_log_messages()
@@ -559,12 +559,12 @@ class FinetuneRecipeForVLM(BaseRecipe):
         # training silently degrades mRoPE to plain 1D positions.
         get_rope_index = resolve_get_rope_index(self.model_parts[0])
         pp_n_microbatches = None
-        pp_cp_preembed = (
-            self.pp_enabled
-            and self.mesh_context.cp_size > 1
-            and hasattr(self.model_parts[0], "prepare_model_inputs_for_cp")
-        )
-        if self.pp_enabled and not pp_cp_preembed:
+        # Under PP, media is staged per microbatch: every VLM here embeds + shards
+        # inside its own forward and pulls media from the PP side channel, so raw
+        # pixel_values/image_grid_thw must not ride schedule.step -- otherwise torch
+        # pipelining row-chunks them independently and the vision RoPE positions
+        # desync (156-vs-160 patch mismatch).
+        if self.pp_enabled:
             pp_n_microbatches = self.pp.pp_batch_size // self.pp.pp_microbatch_size
 
         dataloader_config = self.cfg.vlm_dataloader
@@ -784,48 +784,44 @@ class FinetuneRecipeForVLM(BaseRecipe):
     ):
         batch = {k: _move_to_device(v, self.dist_env.device) for k, v in batch.items()}
 
-        # Routed through __call__ so FSDP2 forward pre-hook fires and
-        # unshards the vision tower's weights before the embed/scatter.
-        _model = self.model_parts[0]
+        # Single CP dispatch (magi / model-owned / generic). The pre-embed hook is
+        # a plain method call (prepare_model_inputs_for_cp): sharder-only, it
+        # touches no weights and consumes nothing. Invoke it on EVERY pp stage so
+        # its aux-only sharder keeps input_ids full-length everywhere; otherwise
+        # non-first stages hit the generic round-robin sharder, feed an
+        # already-local seq_len to update_seq_len, and get_pipeline_stage_metas
+        # ÷cp a second time -> the inter-stage hidden truncates to S/cp²
+        # (text-decoder RoPE size mismatch).
+        _is_first_or_no_pp = not self.pp_enabled or getattr(self.pp.info, "has_first_stage", False)
         _cp_active = (
             self.device_mesh is not None
             and "cp" in getattr(self.device_mesh, "mesh_dim_names", ())
             and self.device_mesh["cp"].size() > 1
         )
-        if _cp_active and hasattr(_model, "prepare_model_inputs_for_cp"):
-            if not self.pp_enabled or getattr(self.pp.info, "has_first_stage", False):
-                mm_kwargs = {k: batch[k] for k in VLM_INPUT_KEYS if batch.get(k) is not None}
-                prepared = _model(_pre_embed_only=True, **mm_kwargs)
-                for k in VLM_INPUT_KEYS:
+        if _cp_active and not _is_first_or_no_pp and hasattr(self.model_parts[0], "prepare_model_inputs_for_cp"):
+            # Non-first PP stages don't embed; drop raw multimodal inputs so their
+            # forwards see only text.
+            for k in VLM_INPUT_KEYS:
+                if k != "input_ids":
                     batch.pop(k, None)
-                batch.update(prepared)
-            else:
-                for k in VLM_INPUT_KEYS:
-                    if k != "input_ids":
-                        batch.pop(k, None)
-
-        if self.magi.enabled:
-            # magi manages the language-backbone attention itself (vision stays on
-            # SDPA); skip the torch-native DTensor CP context.
-            train_ctx, batch = self.magi.prepare_vlm_batch(
-                self.model_parts[0], batch
-            )  # pragma: no cover - requires GPU + magi_attention
-        elif batch.get("qkv_format", None) == "thd":
-            # THD packed VLM inputs use TE sequence metadata even without context parallelism.
-            if self.mesh_context.cp_size > 1:
-                raise NotImplementedError(
-                    "THD packing (packing_format='thd') for VLM currently supports cp_size=1 only; "
-                    "context-parallel THD for mRoPE VLMs is not yet implemented."
-                )
-            padding_id = getattr(getattr(self.processor, "tokenizer", None), "pad_token_id", 0) or 0
-            train_ctx, batch = make_cp_batch_and_ctx(
-                self.device_mesh,
-                batch,
-                use_te=True,
-                padding_token_id=padding_id,
+        # THD packed VLM inputs (qkv_format='thd' from the packing collator) use TE
+        # sequence metadata even without context parallelism (#3052); CP over THD for
+        # mRoPE VLMs is not implemented.
+        _use_te_vlm = batch.get("qkv_format", None) == "thd"
+        if _use_te_vlm and self.mesh_context.cp_size > 1:
+            raise NotImplementedError(
+                "THD packing (packing_format='thd') for VLM currently supports cp_size=1 only; "
+                "context-parallel THD for mRoPE VLMs is not yet implemented."
             )
-        else:
-            train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch)
+        _padding_id = getattr(getattr(getattr(self, "processor", None), "tokenizer", None), "pad_token_id", 0) or 0
+        cp_sharder = ContextParallelSharder(
+            self.model_parts[0],
+            self.device_mesh,
+            batch,
+            padding_token_id=_padding_id,
+            invoke_pre_embed=True,
+        )
+        train_ctx, batch = cp_sharder.shard(batch)
         labels = batch.pop("labels")
 
         if self.pp_enabled:
@@ -1112,22 +1108,13 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 }
                 num_label_tokens = (batch["labels"] != -100).sum().item()
 
-                _model = self.model_parts[0]
-                _cp_active = (
-                    self.device_mesh is not None
-                    and "cp" in getattr(self.device_mesh, "mesh_dim_names", ())
-                    and self.device_mesh["cp"].size() > 1
-                    and not self.pp_enabled
+                cp_sharder = ContextParallelSharder(
+                    self.model_parts[0],
+                    self.device_mesh,
+                    batch,
+                    invoke_pre_embed=not self.pp_enabled,
                 )
-                if _cp_active and hasattr(_model, "prepare_model_inputs_for_cp"):
-                    mm_kwargs = {k: batch[k] for k in VLM_INPUT_KEYS if batch.get(k) is not None}
-                    with torch.no_grad():
-                        prepared = _model(_pre_embed_only=True, **mm_kwargs)
-                    for k in VLM_INPUT_KEYS:
-                        batch.pop(k, None)
-                    batch.update(prepared)
-
-                train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch)
+                train_ctx, batch = cp_sharder.shard(batch)
                 labels = batch.pop("labels")
                 with train_ctx():
                     batch = filter_forward_kwargs(self.model_parts[0], batch)

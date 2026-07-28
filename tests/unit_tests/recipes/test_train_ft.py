@@ -325,33 +325,69 @@ def test_validation_dataloaders_skip_packing_without_pack_size():
 @pytest.mark.parametrize("attn", ["magi", "te", "sdpa"])
 def test_should_pack_validation_for_explicit_thd_collater(attn):
     collate_fn = "nemo_automodel.components.datasets.utils.packed_sequence_thd_collater"
+    dataset = {"_target_": "tests.unit_tests.recipes.test_train_ft.DummyMapDataset"}
     cfg = RecipeConfig(
         ConfigNode(
             {
                 "model": {"backend": {"attn": attn}},
+                "dataset": dataset,
                 "dataloader": {"collate_fn": collate_fn},
+                "validation_dataset": dataset,
                 "validation_dataloader": {"collate_fn": collate_fn},
                 "packed_sequence": {"packed_sequence_size": 1024},
             }
         )
     )
 
-    assert _should_pack_validation(cfg, nn.Module()) is True
+    assert _should_pack_validation(cfg.dataloader, cfg.validation_dataloaders["default"], nn.Module()) is True
 
 
 def test_should_not_pack_validation_without_pack_size():
-    cfg = RecipeConfig(ConfigNode({"model": {}, "packed_sequence": {"packed_sequence_size": 0}}))
+    dataset = {"_target_": "tests.unit_tests.recipes.test_train_ft.DummyMapDataset"}
+    cfg = RecipeConfig(
+        ConfigNode(
+            {
+                "dataset": dataset,
+                "validation_dataset": dataset,
+                "packed_sequence": {"packed_sequence_size": 0},
+            }
+        )
+    )
 
-    assert _should_pack_validation(cfg, nn.Module()) is False
+    assert _should_pack_validation(cfg.dataloader, cfg.validation_dataloaders["default"], nn.Module()) is False
+
+
+@pytest.mark.parametrize(("attn", "expected"), [("magi", True), ("te", True), ("sdpa", False)])
+def test_should_pack_validation_for_live_model_backend(attn, expected):
+    collate_fn = "nemo_automodel.components.datasets.utils.packed_sequence_thd_collater"
+    dataset = {"_target_": "tests.unit_tests.recipes.test_train_ft.DummyMapDataset"}
+    cfg = RecipeConfig(
+        ConfigNode(
+            {
+                "dataset": dataset,
+                "dataloader": {"collate_fn": collate_fn},
+                "validation_dataset": dataset,
+                "validation_dataloader": {},
+                "packed_sequence": {"packed_sequence_size": 1024},
+            }
+        )
+    )
+    model = nn.Module()
+    model.backend = SimpleNamespace(attn=attn)
+
+    assert _should_pack_validation(cfg.dataloader, cfg.validation_dataloaders["default"], model) is expected
 
 
 def test_should_pack_validation_when_model_requires_training_layout():
     collate_fn = "nemo_automodel.components.datasets.utils.packed_sequence_thd_collater"
+    dataset = {"_target_": "tests.unit_tests.recipes.test_train_ft.DummyMapDataset"}
     cfg = RecipeConfig(
         ConfigNode(
             {
                 "model": {"backend": {"attn": "sdpa"}},
+                "dataset": dataset,
                 "dataloader": {"collate_fn": collate_fn},
+                "validation_dataset": dataset,
                 "validation_dataloader": {},
                 "packed_sequence": {"packed_sequence_size": 1024},
             }
@@ -362,7 +398,14 @@ def test_should_pack_validation_when_model_requires_training_layout():
         def should_pack_validation_with_training(self):
             return True
 
-    assert _should_pack_validation(cfg, ModelRequiresPackedValidation()) is True
+    assert (
+        _should_pack_validation(
+            cfg.dataloader,
+            cfg.validation_dataloaders["default"],
+            ModelRequiresPackedValidation(),
+        )
+        is True
+    )
 
 
 class DummyLinear(nn.Module):
@@ -1271,10 +1314,6 @@ def _create_minimal_recipe_for_pp_test(monkeypatch, pp_info):
     )
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.setup_logging", lambda: None)
 
-    # Mock helper functions to avoid needing full config
-    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft._uses_te_dot_product_attention", lambda cfg: False)
-    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft._uses_thd_collater", lambda cfg: False)
-
     # Create the recipe without calling setup
     recipe = TrainFinetuneRecipeForNextTokenPrediction(cfg)
 
@@ -1283,7 +1322,16 @@ def _create_minimal_recipe_for_pp_test(monkeypatch, pp_info):
     object.__setattr__(recipe, "dist_env", SimpleNamespace(device=torch.device("cpu"), rank=0, is_main=True))
     object.__setattr__(recipe, "device_mesh", None)
     object.__setattr__(recipe, "pp_enabled", True)
-    object.__setattr__(recipe, "pp", SimpleNamespace(info=pp_info, update_seq_len=lambda seq_len: None))
+    object.__setattr__(
+        recipe,
+        "pp",
+        SimpleNamespace(
+            info=pp_info,
+            pp_batch_size=1,
+            pp_microbatch_size=1,
+            update_seq_len=lambda seq_len: None,
+        ),
+    )
     object.__setattr__(recipe, "tokenizer", SimpleNamespace(pad_token_id=0))
     object.__setattr__(recipe, "te_fp8", None)
 
@@ -1297,10 +1345,10 @@ def test_forward_backward_step_pp_uses_eval_for_validation(monkeypatch):
     pp_info = MockPPInfo(has_first_stage=True, has_last_stage=True)
     recipe = _create_minimal_recipe_for_pp_test(monkeypatch, pp_info)
 
-    # Mock make_cp_batch_and_ctx to return a no-op context manager
+    # Mock _make_cp_batch_and_ctx to return a no-op context manager
     monkeypatch.setattr(
-        "nemo_automodel.recipes.llm.train_ft.make_cp_batch_and_ctx",
-        lambda device_mesh, batch, **kwargs: (nullcontext, batch),
+        "nemo_automodel.components.distributed.context_parallel.utils._make_cp_batch_and_ctx",
+        lambda device_mesh, batch, *args, **kwargs: (nullcontext, batch, None),
     )
 
     # Create a minimal batch
@@ -1331,10 +1379,10 @@ def test_forward_backward_step_pp_uses_step_for_training(monkeypatch):
     pp_info = MockPPInfo(has_first_stage=True, has_last_stage=True)
     recipe = _create_minimal_recipe_for_pp_test(monkeypatch, pp_info)
 
-    # Mock make_cp_batch_and_ctx to return a no-op context manager
+    # Mock _make_cp_batch_and_ctx to return a no-op context manager
     monkeypatch.setattr(
-        "nemo_automodel.recipes.llm.train_ft.make_cp_batch_and_ctx",
-        lambda device_mesh, batch, **kwargs: (nullcontext, batch),
+        "nemo_automodel.components.distributed.context_parallel.utils._make_cp_batch_and_ctx",
+        lambda device_mesh, batch, *args, **kwargs: (nullcontext, batch, None),
     )
 
     # Create a minimal batch
@@ -1365,10 +1413,10 @@ def test_forward_backward_step_pp_non_first_stage_uses_eval_for_validation(monke
     pp_info = MockPPInfo(has_first_stage=False, has_last_stage=True)
     recipe = _create_minimal_recipe_for_pp_test(monkeypatch, pp_info)
 
-    # Mock make_cp_batch_and_ctx to return a no-op context manager
+    # Mock _make_cp_batch_and_ctx to return a no-op context manager
     monkeypatch.setattr(
-        "nemo_automodel.recipes.llm.train_ft.make_cp_batch_and_ctx",
-        lambda device_mesh, batch, **kwargs: (nullcontext, batch),
+        "nemo_automodel.components.distributed.context_parallel.utils._make_cp_batch_and_ctx",
+        lambda device_mesh, batch, *args, **kwargs: (nullcontext, batch, None),
     )
 
     # Create a minimal batch
@@ -1401,10 +1449,10 @@ def test_forward_backward_step_pp_non_first_stage_uses_step_for_training(monkeyp
     pp_info = MockPPInfo(has_first_stage=False, has_last_stage=True)
     recipe = _create_minimal_recipe_for_pp_test(monkeypatch, pp_info)
 
-    # Mock make_cp_batch_and_ctx to return a no-op context manager
+    # Mock _make_cp_batch_and_ctx to return a no-op context manager
     monkeypatch.setattr(
-        "nemo_automodel.recipes.llm.train_ft.make_cp_batch_and_ctx",
-        lambda device_mesh, batch, **kwargs: (nullcontext, batch),
+        "nemo_automodel.components.distributed.context_parallel.utils._make_cp_batch_and_ctx",
+        lambda device_mesh, batch, *args, **kwargs: (nullcontext, batch, None),
     )
 
     # Create a minimal batch
@@ -1463,10 +1511,10 @@ def test_run_validation_epoch_pp_sends_loss_from_last_stage_to_main(monkeypatch)
 
     monkeypatch.setattr(recipe, "_dp_allreduce", mock_dp_allreduce)
 
-    # Mock make_cp_batch_and_ctx
+    # Mock _make_cp_batch_and_ctx
     monkeypatch.setattr(
-        "nemo_automodel.recipes.llm.train_ft.make_cp_batch_and_ctx",
-        lambda device_mesh, batch, **kwargs: (nullcontext, batch),
+        "nemo_automodel.components.distributed.context_parallel.utils._make_cp_batch_and_ctx",
+        lambda device_mesh, batch, *args, **kwargs: (nullcontext, batch, None),
     )
 
     # Mock ScopedRNG
@@ -1525,8 +1573,8 @@ def test_run_validation_epoch_pp_main_rank_receives_from_last_stage(monkeypatch)
     monkeypatch.setattr(recipe, "_dp_allreduce", mock_dp_allreduce)
 
     monkeypatch.setattr(
-        "nemo_automodel.recipes.llm.train_ft.make_cp_batch_and_ctx",
-        lambda device_mesh, batch, **kwargs: (nullcontext, batch),
+        "nemo_automodel.components.distributed.context_parallel.utils._make_cp_batch_and_ctx",
+        lambda device_mesh, batch, *args, **kwargs: (nullcontext, batch, None),
     )
 
     monkeypatch.setattr(
@@ -2001,9 +2049,6 @@ class TestRunTrainOptimStepSetsMoEScale:
             lambda *a, **k: SimpleNamespace(world_size=1, is_main=True, device=torch.device("cpu"), rank=0),
         )
         monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.setup_logging", lambda: None)
-        monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft._uses_te_dot_product_attention", lambda cfg: False)
-        monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft._uses_thd_collater", lambda cfg: False)
-
         recipe = TrainFinetuneRecipeForNextTokenPrediction(cfg)
 
         object.__setattr__(recipe, "dist_env", SimpleNamespace(device=torch.device("cpu"), rank=0, is_main=True))
@@ -2397,8 +2442,6 @@ def test_forward_backward_step_model_cp_hook(monkeypatch, cp_size, uses_thd, sup
         lambda *a, **k: SimpleNamespace(world_size=1, is_main=True, device=torch.device("cpu"), rank=0),
     )
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.setup_logging", lambda: None)
-    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft._uses_te_dot_product_attention", lambda cfg: False)
-    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft._uses_thd_collater", lambda cfg: uses_thd)
     recipe = TrainFinetuneRecipeForNextTokenPrediction(cfg)
 
     class _CPModel(nn.Module):
@@ -2407,10 +2450,20 @@ def test_forward_backward_step_model_cp_hook(monkeypatch, cp_size, uses_thd, sup
             self.lin = nn.Linear(4, 8)
             self.prepared = False
 
-        def prepare_model_inputs_for_cp(self, input_ids, **kwargs):
+        def prepare_model_inputs_for_cp(self, batch, **kwargs):
             self.prepared = True
             self.num_chunks = kwargs.get("num_chunks")
-            return {}
+            from nemo_automodel.components.distributed.context_parallel.sharder import (
+                ContextParallelSharder,
+                contiguous_local_indices,
+            )
+
+            return {
+                "cp_sharder": ContextParallelSharder(
+                    shard_batch=lambda cp_mesh, tp_mesh, batch, **k: (nullcontext, batch, None),
+                    local_token_global_indices=contiguous_local_indices,
+                )
+            }
 
         def forward(self, **batch):
             logits = self.lin(batch["input_ids"].float())
@@ -2418,8 +2471,26 @@ def test_forward_backward_step_model_cp_hook(monkeypatch, cp_size, uses_thd, sup
 
     model = _CPModel()
     model.supports_thd = supports_thd
+
+    # The hook gate reads the CP size from the mesh (the runtime truth), not
+    # from the config: fake a mesh whose "cp" dim matches the parametrization.
+    class _FakeSubMesh:
+        def __init__(self, size):
+            self._size = size
+
+        def size(self):
+            return self._size
+
+        def get_group(self):
+            return None
+
+        def get_local_rank(self):
+            return 0
+
+    fake_mesh = {"cp": _FakeSubMesh(cp_size)}
+    fake_mesh = type("_FakeDeviceMesh", (dict,), {"mesh_dim_names": ("cp",)})(fake_mesh)
     object.__setattr__(recipe, "dist_env", SimpleNamespace(device=torch.device("cpu"), rank=0, is_main=True))
-    object.__setattr__(recipe, "device_mesh", None)
+    object.__setattr__(recipe, "device_mesh", fake_mesh)
     object.__setattr__(recipe, "pp_enabled", False)
     object.__setattr__(recipe, "magi", SimpleNamespace(enabled=False))
     object.__setattr__(recipe, "tokenizer", SimpleNamespace(pad_token_id=0))
@@ -2437,8 +2508,8 @@ def test_forward_backward_step_model_cp_hook(monkeypatch, cp_size, uses_thd, sup
         return logits.mean()
 
     monkeypatch.setattr(
-        "nemo_automodel.recipes.llm.train_ft.make_cp_batch_and_ctx",
-        lambda device_mesh, batch, **k: (nullcontext, batch),
+        "nemo_automodel.components.distributed.context_parallel.utils._make_cp_batch_and_ctx",
+        lambda device_mesh, batch, *a, **k: (nullcontext, batch, None),
     )
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.calculate_loss", _fake_calc_loss)
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.get_final_hidden_states", lambda out: None)
@@ -2446,6 +2517,8 @@ def test_forward_backward_step_model_cp_hook(monkeypatch, cp_size, uses_thd, sup
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.filter_forward_kwargs", lambda model, batch: batch)
 
     batch = {"input_ids": torch.randn(1, 4, 4), "labels": torch.zeros(1, 4, dtype=torch.long)}
+    if uses_thd:
+        batch["qkv_format"] = "thd"
     loss_buffer = []
     recipe._forward_backward_step(
         idx=0, batch=batch, loss_buffer=loss_buffer, num_label_tokens=None, num_batches=1, is_train=True
@@ -2456,5 +2529,6 @@ def test_forward_backward_step_model_cp_hook(monkeypatch, cp_size, uses_thd, sup
     assert captured["logits_is_tensor"]
     assert len(loss_buffer) == 1
     assert torch.isfinite(loss_buffer[0]).all()
+    # backward through the local loss populated grads
     assert model.lin.weight.grad is not None
     assert torch.isfinite(model.lin.weight.grad).all()

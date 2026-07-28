@@ -254,7 +254,7 @@ def _patch_preprocess_mask_arguments_for_packing() -> None:
         attn_impl = getattr(config, "_attn_implementation", None) or getattr(
             config, "_attn_implementation_internal", None
         )
-        if attn_impl == "flash_attention_2" and is_indexed_packed_mask(attention_mask):
+        if attn_impl in _FLASH_ATTN_IMPLEMENTATIONS and is_indexed_packed_mask(attention_mask):
             return (
                 preprocess_result_template[0],
                 attention_mask,
@@ -281,7 +281,7 @@ _PACKING_PATCH_MODULES = [
 
 
 def configure_packing(attn_implementation: str = "sdpa") -> None:
-    """Apply monkey-patches for packed-sequence training with flash_attention_2.
+    """Apply monkey-patches for packed-sequence training with flash attention.
 
     Only patches when ``attn_implementation`` is a flash-attention variant
     (``flash_attention_2`` / ``flash_attention_3`` / ``flash_attention_4``);

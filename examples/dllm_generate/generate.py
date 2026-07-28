@@ -19,6 +19,8 @@ Provides ``DLLMSampler`` (core logic) with preset subclasses:
 - ``LLaDASampler``: no-cache, full-forward defaults.
 - ``LLaDA2Sampler``: built-in block-refinement generation defaults.
 - ``NemotronLabsDLLMSampler``: KV-cache block-diffusion defaults.
+- ``DiffusionGemmaSampler``: built-in HF diffusion-sampler defaults
+  (entropy-bounded denoising with adaptive stopping).
 
 Usage
 -----
@@ -43,13 +45,28 @@ Nemotron-Labs-Diffusion generation::
         --prompt "What is 2+2?" \
         --sampler nemotron
 
+Generate from a LoRA (PEFT) checkpoint — any sampler::
+
+    python examples/dllm_generate/generate.py \
+        --checkpoint <base model id or SFT checkpoint> \
+        --adapter <lora checkpoint dir> \
+        --prompt "Explain what a neural network is." \
+        --sampler llada
+
+DiffusionGemma generation::
+
+    python examples/dllm_generate/generate.py \
+        --checkpoint <path> \
+        --prompt "Explain what a neural network is." \
+        --sampler gemma
+
 Override preset defaults::
 
     python examples/dllm_generate/generate.py \
         --checkpoint <path> \
         --sampler nemotron --temperature 0.5 --steps 2048
 
-Infilling (LLaDA and Nemotron samplers)::
+Infilling (LLaDA sampler)::
 
     python examples/dllm_generate/generate.py \
         --checkpoint <path> \
@@ -75,9 +92,11 @@ from typing import Optional
 
 import torch
 from utils import (
+    GEMMA_ADAPTER_KEY_MAP,
     get_num_transfer_tokens,
     get_transfer_index,
     load_model_and_tokenizer,
+    merge_adapter,
     resolve_checkpoint,
     trim_response,
 )
@@ -241,7 +260,14 @@ class DLLMSampler:
                     cur[transfer_idx] = x0[transfer_idx]
                     x[:, block_slice] = cur
                 else:
+                    # Restrict the candidate set to the current block BEFORE top-k
+                    # selection (matching the official LLaDA sampler and the KV-cache
+                    # branch above). Out-of-window positions must never win transfer
+                    # slots: cancelling them after selection leaves the block's
+                    # schedule underfilled, stranding mask tokens in the output.
                     mask_idx = x == self.mask_id
+                    mask_idx[:, :block_start] = False
+                    mask_idx[:, block_end:] = False
                     logits = self.model(x, attention_mask=attention_mask).logits
                     x0, transfer_idx = get_transfer_index(
                         logits,
@@ -252,9 +278,6 @@ class DLLMSampler:
                         num_transfer_tokens=num_transfer_tokens[:, i],
                         threshold=cfg.threshold,
                     )
-                    for j in range(B):
-                        transfer_idx[j, :block_start] = False
-                        transfer_idx[j, block_end:] = False
                     x[transfer_idx] = x0[transfer_idx]
 
                 if cfg.eos_token_id is not None:
@@ -335,7 +358,13 @@ class DLLMSampler:
 
             transfer_schedule = get_num_transfer_tokens(block_mask, steps_per_block)
             for s in range(transfer_schedule.size(1)):
+                # Restrict the candidate set to this block's window BEFORE top-k
+                # (see the analogous fix in ``sample``): out-of-window masks must
+                # not steal transfer slots from the block's schedule.
                 mask_full = x == self.mask_id
+                for j in range(B):
+                    mask_full[j, :start] = False
+                    mask_full[j, start + widths[j] :] = False
                 logits = self.model(x, attention_mask=attention_mask).logits
                 x0, transfer_index = get_transfer_index(
                     logits,
@@ -345,9 +374,6 @@ class DLLMSampler:
                     x,
                     num_transfer_tokens=transfer_schedule[:, s],
                 )
-                for j in range(B):
-                    transfer_index[j, :start] = False
-                    transfer_index[j, start + widths[j] :] = False
                 x[transfer_index] = x0[transfer_index]
 
         return x
@@ -413,10 +439,29 @@ class NemotronLabsDLLMSampler(DLLMSampler):
     )
 
 
+class DiffusionGemmaSampler(DLLMSampler):
+    """Config-preset holder for DiffusionGemma generation.
+
+    DiffusionGemma ships its own diffusion sampler inside ``transformers``
+    (entropy-bounded denoising with adaptive stopping over canvas blocks), so
+    the CLI in ``main`` routes generation through ``model.generate(...)`` via
+    :func:`generate_gemma`. The inherited mask-based ``sample`` method is
+    unused on this path; only ``max_new_tokens`` and ``steps`` (mapped to the
+    sampler's ``max_denoising_steps``) are forwarded — the remaining sampler
+    hyperparameters keep their upstream defaults.
+    """
+
+    default_config = SamplerConfig(
+        steps=48,  # transformers DiffusionGemmaGenerationConfig.max_denoising_steps default
+        max_new_tokens=256,  # transformers DiffusionGemmaGenerationConfig default
+    )
+
+
 SAMPLERS = {
     "llada": LLaDASampler,
     "llada2": LLaDA2Sampler,
     "nemotron": NemotronLabsDLLMSampler,
+    "gemma": DiffusionGemmaSampler,
 }
 
 
@@ -450,6 +495,35 @@ def generate_llada2(model, tokenizer, inputs, config: SamplerConfig, mask_id: in
             mask_id=mask_id,
         )
         sequences.append(tokenizer.decode(generated[0], skip_special_tokens=True))
+    return sequences
+
+
+@torch.no_grad()
+def generate_gemma(model, tokenizer, inputs, config: SamplerConfig, eos_id: int) -> list[str]:
+    """Generate one DiffusionGemma response per prompt with the model's built-in sampler.
+
+    DiffusionGemma's ``generate`` (shipped with ``transformers``) performs
+    entropy-bounded denoising with adaptive stopping over canvas blocks.
+    Returned sequences include the prompt (with post-EOS positions padded),
+    so only the tail is decoded.
+    """
+    if eos_id is None:
+        raise ValueError("DiffusionGemma generation requires a tokenizer EOS token ID")
+
+    pad_id = tokenizer.pad_token_id if getattr(tokenizer, "pad_token_id", None) is not None else eos_id
+    device = getattr(model, "device", None) or next(model.parameters()).device
+    sequences = []
+    for prompt_ids in inputs:
+        prompt_tensor = torch.as_tensor(prompt_ids, dtype=torch.long, device=device).unsqueeze(0)
+        out = model.generate(
+            input_ids=prompt_tensor,
+            max_new_tokens=config.max_new_tokens,
+            max_denoising_steps=config.steps,
+            eos_token_id=eos_id,
+            pad_token_id=pad_id,
+        )
+        generated = out.sequences[0, prompt_tensor.shape[1] :]
+        sequences.append(tokenizer.decode(generated, skip_special_tokens=True))
     return sequences
 
 
@@ -501,11 +575,20 @@ def main():
     )
     parser.add_argument("--raw", action="store_true", help="No chat template")
     parser.add_argument("--infill", action="store_true", help="Infilling mode")
+    parser.add_argument(
+        "--adapter",
+        default=None,
+        help="Path to a PEFT (LoRA) adapter checkpoint dir; merged into the base --checkpoint model before generation",
+    )
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
     if args.infill and args.sampler == "llada2":
         parser.error("--infill is not supported by the LLaDA2 generation path")
+    if args.infill and args.sampler == "nemotron":
+        parser.error("--infill is not supported by the Nemotron generation path (the tokenizer has no mask token)")
+    if args.infill and args.sampler == "gemma":
+        parser.error("--infill is not supported by the DiffusionGemma generation path")
 
     try:
         checkpoint_path = resolve_checkpoint(args.checkpoint)
@@ -518,6 +601,13 @@ def main():
         torch.cuda.manual_seed_all(args.seed)
 
     model, tokenizer, mask_id, eos_id = load_model_and_tokenizer(checkpoint_path, sampler_name=args.sampler)
+
+    if args.adapter:
+        print(f"Merging adapter: {args.adapter}")
+        # DiffusionGemma trains on the native Automodel implementation but
+        # generates through the HF class; re-parent the adapter module paths.
+        key_map = GEMMA_ADAPTER_KEY_MAP if args.sampler == "gemma" else None
+        model = merge_adapter(model, args.adapter, key_map=key_map)
 
     overrides = {}
     for key in [
@@ -600,11 +690,29 @@ def main():
             # ``generate`` implementation. It returns generated-only IDs and
             # currently supports one prompt per call.
             sequences = generate_llada2(model, tokenizer, inputs, sampler.default_config, mask_id, eos_id)
+        elif args.sampler == "gemma":
+            # DiffusionGemma ships its own diffusion sampler in ``transformers``
+            # (entropy-bounded denoising with adaptive stopping); route through it.
+            sequences = generate_gemma(model, tokenizer, inputs, sampler.default_config, eos_id)
         else:
             # LLaDA path: LLaDA checkpoints don't ship a built-in ``generate``
             # method, so fall back to the standalone ``DLLMSampler`` here.
-            outputs = sampler.sample(inputs)
-            sequences = trim_response(tokenizer, outputs.tolist(), inputs)
+            #
+            # ``sample()``'s batched EOS-stop and block windows assume every row has
+            # the longest prompt (the canvas is one rectangle sized to
+            # ``max_prompt_len``). With unequal-length prompts that strands the
+            # shorter rows: their tail EOS-fill reads as an early stop, one row
+            # finishing halts refinement for the whole batch, and their block
+            # windows are anchored past the real prompt. When an ``eos_token_id`` is
+            # active, decode one prompt at a time (B=1) so shorter prompts still
+            # complete. Inert for the current LLaDA preset (``eos_token_id=None``);
+            # guards the EOS-stop path once a preset sets it (e.g. I-DLM).
+            if len(inputs) > 1 and sampler.default_config.eos_token_id is not None:
+                outputs = [sampler.sample([inp]) for inp in inputs]
+                sequences = [trim_response(tokenizer, o.tolist(), [inp])[0] for o, inp in zip(outputs, inputs)]
+            else:
+                outputs = sampler.sample(inputs)
+                sequences = trim_response(tokenizer, outputs.tolist(), inputs)
         for i, (prompt, response) in enumerate(zip(args.prompt, sequences)):
             print(f"\n{'─' * 80}\n[Prompt {i}] {prompt}\n{'─' * 80}")
             print(response.strip() or "<empty>")

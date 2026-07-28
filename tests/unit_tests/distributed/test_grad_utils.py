@@ -93,15 +93,14 @@ def spawn_threads_and_init_comms(func=None, *, timeout=5, world_size=1):
     def wrapper(*args, **kwargs):  # noqa: D401
         torch._C._distributed_c10d._set_thread_isolation_mode(True)
         try:
-            threads = _run_test_method_with_multi_threads(
-                world_size, lambda: func(self, *args, **kwargs)
-            )
+            threads = _run_test_method_with_multi_threads(world_size, lambda: func(self, *args, **kwargs))
             # join and error handling
             MultiThreadedTestCase._join_threads(threads, func)
         finally:
             torch._C._distributed_c10d._set_thread_isolation_mode(False)
 
     return wrapper
+
 
 @pytest.fixture(autouse=True)
 def _patch_distributed(monkeypatch):
@@ -119,6 +118,7 @@ def _patch_distributed(monkeypatch):
 
     # Stub out process-group initialisation so *DeviceMesh* does not error.
     import importlib
+
     c10d = importlib.import_module("torch.distributed.distributed_c10d")
 
     monkeypatch.setattr(c10d, "init_process_group", lambda *a, **k: None, raising=False)
@@ -141,6 +141,7 @@ def _patch_tensor_cuda(monkeypatch):
     if not torch.cuda.is_available():
         monkeypatch.setattr(torch.Tensor, "cuda", lambda self, *a, **k: self, raising=False)
 
+
 def _make_param(data: Iterable[float] | torch.Tensor, *, requires_grad: bool = True) -> torch.Tensor:
     """Helper constructing a parameter tensor and attaching matching gradient."""
 
@@ -149,8 +150,10 @@ def _make_param(data: Iterable[float] | torch.Tensor, *, requires_grad: bool = T
     tensor.grad = tensor.clone().detach() if requires_grad else None  # type: ignore[attr-defined]
     return tensor
 
+
 @pytest.mark.parametrize(
-    "max_grad_norm,total_norm,scaling_expected", [(1.0, 5.0, 0.2), (10.0, 5.0, 1.0)],
+    "max_grad_norm,total_norm,scaling_expected",
+    [(1.0, 5.0, 0.2), (10.0, 5.0, 1.0)],
 )
 def test_clip_grad_by_total_norm_scaling(max_grad_norm: float, total_norm: float, scaling_expected: float):
     """Gradients should be scaled **iff** *clip_coeff < 1*.
@@ -192,6 +195,7 @@ def test_clip_grad_by_total_norm_single_tensor_input():
 
     scaling = 2.0 / (4.0 + 1e-6)
     assert torch.allclose(param.grad, original_grad * scaling)
+
 
 # The threaded PG wrapper ensures *DeviceMesh* can operate without a real backend.
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required for *inf* norm path.")
