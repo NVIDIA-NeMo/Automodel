@@ -1371,20 +1371,67 @@ class TrainDSparkRecipe(BaseRecipe):
         return True
 
     def _run_eval(self):
+        """Evaluate the draft on the validation stream.
+
+        Reports the loss and the acceptance diagnostics that decide whether the
+        draft is worth serving: the per-position ``accept_rate@k``, its aggregate,
+        the expected accepted block length ``tau``, and the confidence head's
+        calibration against the measured acceptance. Every batch already computes
+        these (:class:`DSparkStepMetrics`); training reduces them over a log
+        window and validation over the whole split, both as unreduced
+        numerator/denominator sums so the ratio is formed once, after the
+        data-parallel reduction, rather than averaged over per-rank ratios.
+
+        Returns:
+            The metric dict, or None when no validation dataloader is configured.
+            Diagnostics whose denominator is zero (no confidence head, or no
+            teacher signal) are omitted rather than reported as zero, which would
+            read as collapsed acceptance.
+        """
         if self.val_dataloader is None:
             return None
         self.trainer_module.eval()
-        total_loss = torch.zeros((), device=self.device)
-        total_batches = torch.zeros((), device=self.device)
+        # [loss, batches, tau_num, tau_den, conf_abs_err_num, conf_bias_num,
+        #  conf_cumprod_bias_num, conf_diag_den]
+        scalars = torch.zeros(8, device=self.device)
+        accept_pos_num = torch.zeros(self.block_size, device=self.device)
+        accept_pos_den = torch.zeros(self.block_size, device=self.device)
         with torch.no_grad():
             for batch in self.val_dataloader:
                 metrics = self._forward_batch(batch)
-                total_loss += metrics.loss.detach()
-                total_batches += 1
-        total_loss = self._dp_allreduce(total_loss)
-        total_batches = self._dp_allreduce(total_batches)
+                scalars += torch.stack(
+                    [
+                        metrics.loss.detach(),
+                        torch.ones((), device=self.device),
+                        metrics.tau_num.detach(),
+                        metrics.tau_den.detach(),
+                        metrics.confidence_abs_error_num.detach(),
+                        metrics.confidence_bias_num.detach(),
+                        metrics.confidence_cumprod_bias_num.detach(),
+                        metrics.confidence_diag_den.detach(),
+                    ]
+                ).to(scalars.dtype)
+                accept_pos_num += metrics.accept_rate_per_pos_num.detach().to(accept_pos_num.dtype)
+                accept_pos_den += metrics.accept_rate_per_pos_den.detach().to(accept_pos_den.dtype)
+
+        reduced = self._dp_allreduce(torch.cat([scalars, accept_pos_num, accept_pos_den]))
+        w = reduced[: scalars.numel()].tolist()
+        pos_num = reduced[scalars.numel() : scalars.numel() + self.block_size]
+        pos_den = reduced[scalars.numel() + self.block_size :]
         self.trainer_module.train()
-        return {"val_loss": (total_loss / total_batches.clamp_min(1)).item()}
+
+        eval_metrics = {"val_loss": w[0] / max(1.0, w[1])}
+        accept_den = pos_den.sum().item()
+        if accept_den > 0:
+            eval_metrics["accept_rate"] = pos_num.sum().item() / accept_den
+            _add_accept_rate_per_position(eval_metrics, pos_num, pos_den)
+        if w[3] > 0:
+            eval_metrics["tau"] = w[2] / w[3]
+        if w[7] > 0:
+            eval_metrics["confidence_abs_error"] = w[4] / w[7]
+            eval_metrics["confidence_bias"] = w[5] / w[7]
+            eval_metrics["confidence_cumprod_bias"] = w[6] / w[7]
+        return eval_metrics
 
     def _wandb_log(self, data: dict, step: int) -> None:
         """Log rank-zero metrics when a W&B run is active."""
@@ -1608,8 +1655,17 @@ class TrainDSparkRecipe(BaseRecipe):
                     msg = f"Finished epoch {epoch_idx + 1}/{self.num_epochs} completed_steps={completed_steps}"
                     if eval_metrics is not None:
                         msg += f" val_loss={eval_metrics['val_loss']:.4f}"
+                        for key in ("accept_rate", "tau"):
+                            if key in eval_metrics:
+                                msg += f" val_{key}={eval_metrics[key]:.4f}"
                         self._wandb_log(
-                            {"val/loss": eval_metrics["val_loss"], "val/epoch": epoch_idx},
+                            {
+                                **{
+                                    ("val/loss" if key == "val_loss" else f"val/{key}"): value
+                                    for key, value in eval_metrics.items()
+                                },
+                                "val/epoch": epoch_idx,
+                            },
                             step=self.runtime.global_step,
                         )
                     logger.info(msg)
