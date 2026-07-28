@@ -148,7 +148,7 @@ torchrun --nproc-per-node=8 examples/retrieval/bi_encoder/finetune.py --config e
 ```
 
 The default batch settings use one local batch on each of eight GPUs, so they do not use gradient accumulation and
-`distributed.static_graph: true` is appropriate. If you reduce the GPU count without reducing `global_batch_size`,
+thus `distributed.static_graph: true` is appropriate. If you reduce the GPU count without reducing `global_batch_size`,
 the resulting run uses more than one gradient accumulation step. Update the DDP settings as follows:
 
 ```yaml
