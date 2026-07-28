@@ -48,6 +48,7 @@ from torch import nn
 from torch.distributed.checkpoint.storage import StorageReader, StorageWriter
 from torch.distributed.device_mesh import DeviceMesh
 from torch.nn.parallel import DistributedDataParallel
+from torch.serialization import MAP_LOCATION, FileLike
 
 from nemo_automodel.components.checkpoint._backports.consolidate_hf_safetensors import (
     consolidate_safetensors_files_on_every_rank,
@@ -92,37 +93,68 @@ _DEFAULT_HF_CONSOLIDATED_SHARD_SIZE_BYTES = 5 * 1024**3
 logger = logging.getLogger(__name__)
 
 
-def _format_restricted_load_error(path: Any, description: str) -> str:
+def _format_restricted_load_error(f: FileLike) -> str:
     return (
-        f"Refusing to load {description} from {path!r} with pickle-based torch.load. "
-        "The file is not compatible with torch.load(weights_only=True), and loading it with "
+        f"Refusing to load torch artifact from {f!r} with pickle-based torch.load. "
+        "The artifact is not compatible with torch.load(weights_only=True), and loading it with "
         "weights_only=False can execute code. Migrate the artifact in a restricted environment."
     )
 
 
-def safe_torch_load(
-    path: Any,
+def load_torch_checkpoint(
+    f: FileLike,
+    map_location: MAP_LOCATION = None,
+    pickle_module: Any = None,
     *,
-    map_location: Any = None,
-    description: str = "checkpoint state",
+    weights_only: bool | None = None,
+    mmap: bool | None = None,
+    **pickle_load_args: Any,
 ) -> Any:
-    """Load a torch artifact with restricted unpickling.
+    """Load a torch checkpoint with restricted unpickling by default.
 
     Args:
-        path: File path or binary file object accepted by ``torch.load``.
+        f: File path or binary file object accepted by ``torch.load``.
         map_location: Device remapping accepted by ``torch.load``.
-        description: Artifact description included in failure messages.
+        pickle_module: Module used to unpickle metadata and objects.
+        weights_only: When ``False``, explicitly opt into unrestricted pickle loading.
+            ``None`` and ``True`` use restricted loading.
+        mmap: Whether to memory-map tensor storages from a file path.
+        **pickle_load_args: Additional arguments forwarded to the unpickler.
 
     Returns:
-        The restricted-deserialized artifact.
+        The deserialized checkpoint.
 
     Raises:
-        RuntimeError: If the artifact requires pickle-based object construction.
+        RuntimeError: If restricted loading rejects the artifact.
     """
+    if weights_only is False:
+        logger.warning(
+            "Loading torch artifact from %r with weights_only=False. This can execute code; "
+            "only load checkpoints from a trusted source.",
+            f,
+        )
+        # B614 is suppressed only for explicit caller opt-in to trusted legacy checkpoints.
+        # Remove this branch when pickle-based checkpoint compatibility is no longer supported.
+        return torch.load(  # nosec B614
+            f,
+            map_location=map_location,
+            pickle_module=pickle_module,
+            weights_only=False,
+            mmap=mmap,
+            **pickle_load_args,
+        )
+
     try:
-        return torch.load(path, map_location=map_location, weights_only=True)
+        return torch.load(
+            f,
+            map_location=map_location,
+            pickle_module=pickle_module,
+            weights_only=True,
+            mmap=mmap,
+            **pickle_load_args,
+        )
     except pickle.UnpicklingError as err:
-        raise RuntimeError(_format_restricted_load_error(path, description)) from err
+        raise RuntimeError(_format_restricted_load_error(f)) from err
 
 
 # NOTE [nemotron-singlegpu-lora]: the branches tagged with this marker below exist to make
@@ -1196,9 +1228,8 @@ class Checkpointer:
         """
         state_dir = os.path.join(path, state_name)
         state.load_state_dict(
-            safe_torch_load(
+            load_torch_checkpoint(
                 os.path.join(state_dir, f"{state_name}_dp_rank_{self.dp_rank}.pt"),
-                description=f"{state_name} state",
             )
         )
 
@@ -2379,10 +2410,9 @@ def _load_hf_bin_checkpoint(model_path: str) -> Optional[dict[str, torch.Tensor]
         return None
 
     if os.path.isfile(model_path):
-        return safe_torch_load(
+        return load_torch_checkpoint(
             model_path,
             map_location="cpu",
-            description="Hugging Face .bin checkpoint",
         )
 
     # Sharded: read the index and load each shard
@@ -2401,10 +2431,9 @@ def _load_hf_bin_checkpoint(model_path: str) -> Optional[dict[str, torch.Tensor]
             bin_path = os.path.join(model_path, filename)
             if not os.path.isfile(bin_path):
                 continue
-            shard = safe_torch_load(
+            shard = load_torch_checkpoint(
                 bin_path,
                 map_location="cpu",
-                description="Hugging Face .bin checkpoint shard",
             )
             out.update(shard)
             loaded_files.add(filename)
@@ -2413,19 +2442,17 @@ def _load_hf_bin_checkpoint(model_path: str) -> Optional[dict[str, torch.Tensor]
     # Single file
     single = os.path.join(model_path, "pytorch_model.bin")
     if os.path.isfile(single):
-        return safe_torch_load(
+        return load_torch_checkpoint(
             single,
             map_location="cpu",
-            description="Hugging Face .bin checkpoint",
         )
 
     # Glob fallback
     out = {}
     for bin_path in sorted(glob.glob(os.path.join(model_path, "*.bin"))):
-        shard = safe_torch_load(
+        shard = load_torch_checkpoint(
             bin_path,
             map_location="cpu",
-            description="Hugging Face .bin checkpoint shard",
         )
         out.update(shard)
     return out if out else None

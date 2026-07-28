@@ -1181,7 +1181,7 @@ def test_load_hf_bin_checkpoint_rejects_pickled_module(tmp_path):
     checkpoint_path = tmp_path / "pytorch_model.bin"
     torch.save(torch.nn.Linear(2, 2), checkpoint_path)
 
-    with pytest.raises(RuntimeError, match="Refusing to load Hugging Face .bin checkpoint"):
+    with pytest.raises(RuntimeError, match="Refusing to load torch artifact"):
         _load_hf_bin_checkpoint(str(checkpoint_path))
 
 

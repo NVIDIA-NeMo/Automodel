@@ -43,7 +43,7 @@ from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel.components.checkpoint.checkpointing import (
     Checkpointer,
     CheckpointingConfig,
-    safe_torch_load,
+    load_torch_checkpoint,
     save_config,
 )
 from nemo_automodel.components.checkpoint.utils import find_latest_checkpoint, resolve_restore_from_to_checkpoint_dir
@@ -711,10 +711,9 @@ class TrainDFlashRecipe(BaseRecipe):
         """Restore DFlash meta: global_step and epoch, and validate mask_token_id."""
         meta_path = os.path.join(ckpt_dir, "dflash_meta.pt")
         if os.path.exists(meta_path):
-            meta = safe_torch_load(
+            meta = load_torch_checkpoint(
                 meta_path,
                 map_location="cpu",
-                description="DFlash metadata",
             )
             self.runtime.global_step = int(meta.get("global_step", 0))
             self._resume_epoch = int(meta.get("epoch", 0))
