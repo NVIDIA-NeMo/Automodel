@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any, Optional, Union
 
 import torch
@@ -328,12 +329,12 @@ class Ernie4_5_MoeModel(nn.Module):
     ):
         super().__init__()
         self.config = config
-        self.backend = backend
         # HF disables autocast for ERNIE's router projection and computes the
         # routing probabilities in fp32. Keep the same default while preserving
         # an explicit backend override.
-        if self.backend.gate_precision is None:
-            self.backend.gate_precision = torch.float32
+        if backend.gate_precision is None:
+            backend = replace(backend, gate_precision=torch.float32)
+        self.backend = backend
         if moe_config is not None and moe_overrides is not None:
             raise ValueError("Cannot pass both moe_config and moe_overrides; use one or the other.")
 
@@ -536,6 +537,7 @@ class Ernie4_5_MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin)
     _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
     _keep_in_fp32_modules_strict = ["mlp.gate.weight", "mlp.gate.e_score_correction_bias"]
+    _keep_in_fp32_modules = ["rotary_emb"]
 
     @classmethod
     def get_capabilities(cls, config) -> ModelCapabilities:

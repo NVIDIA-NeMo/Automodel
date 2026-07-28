@@ -23,6 +23,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+import torch.nn.functional as F
 from transformers.models.ernie4_5_moe.configuration_ernie4_5_moe import Ernie4_5_MoeConfig
 
 from nemo_automodel.components.distributed.config import FSDP2Config
@@ -94,6 +95,21 @@ def _worker(rank: int, port: int) -> None:
                 if parameter.is_floating_point():
                     parameter.normal_(mean=0.0, std=0.02)
 
+        moe = model.model.layers["1"].mlp
+        router_input = torch.randn(8, model.config.hidden_size, device=rank, dtype=torch.bfloat16)
+        token_mask = torch.ones(router_input.shape[0], device=rank, dtype=torch.bool)
+        with torch.no_grad():
+            reference_scores = F.linear(router_input.float(), moe.gate.weight)
+            reference_probabilities = reference_scores.softmax(dim=-1)
+            reference_choice_scores = reference_probabilities + moe.gate.e_score_correction_bias
+            reference_indices = reference_choice_scores.topk(moe.gate.topk, dim=-1).indices
+            reference_weights = reference_probabilities.gather(1, reference_indices)
+            reference_weights /= reference_weights.sum(dim=-1, keepdim=True) + 1e-20
+            reference_weights = reference_weights.to(torch.bfloat16)
+            actual_weights, actual_indices, _ = moe.gate(router_input, token_mask, cp_mesh=None)
+        torch.testing.assert_close(actual_indices, reference_indices, rtol=0, atol=0)
+        torch.testing.assert_close(actual_weights, reference_weights, rtol=0, atol=0)
+
         mesh_context = MeshContext.build(
             FSDP2Config(),
             ParallelismSizes(dp_size=_WORLD_SIZE, ep_size=_WORLD_SIZE),
@@ -107,7 +123,6 @@ def _worker(rank: int, port: int) -> None:
             **mesh_context.parallelize_axis_kwargs(),
         )
 
-        moe = model.model.layers["1"].mlp
         assert moe.gate.weight.dtype == torch.float32
         assert moe.gate.e_score_correction_bias.dtype == torch.float32
         assert moe.experts.gate_and_up_projs.dtype == torch.bfloat16

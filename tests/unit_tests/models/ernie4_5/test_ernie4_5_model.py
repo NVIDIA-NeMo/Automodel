@@ -219,7 +219,8 @@ class TestErnie4_5_MoeModel:
     def test_gate_precision_defaults_to_fp32(self, moe_hf_config, backend_config):
         assert backend_config.gate_precision is None
         model = Ernie4_5_MoeModel(moe_hf_config, backend_config)
-        assert backend_config.gate_precision == torch.float32
+        assert backend_config.gate_precision is None
+        assert model.backend.gate_precision == torch.float32
         assert model.layers["1"].mlp.gate.gate_precision == torch.float32
 
     def test_gate_precision_respects_explicit_override(self, moe_hf_config, backend_config):
@@ -443,9 +444,11 @@ class TestErnie4_5_MoeForCausalLM:
 
         assert "mlp.gate.weight" in model._keep_in_fp32_modules_strict
         assert "mlp.gate.e_score_correction_bias" in model._keep_in_fp32_modules_strict
+        assert "rotary_emb" in model._keep_in_fp32_modules
         assert moe.gate.weight.dtype == torch.float32
         assert moe.gate.e_score_correction_bias.dtype == torch.float32
         assert moe.experts.gate_and_up_projs.dtype == torch.bfloat16
+        assert model.model.rotary_emb.inv_freq.dtype == torch.float32
 
         reference_weight = torch.linspace(
             -0.1234567,
@@ -470,6 +473,7 @@ class TestErnie4_5_MoeForCausalLM:
         assert moe.gate.weight.dtype == torch.float32
         assert moe.gate.e_score_correction_bias.dtype == torch.float32
         assert moe.experts.gate_and_up_projs.dtype == torch.bfloat16
+        assert model.model.rotary_emb.inv_freq.dtype == torch.float32
 
 
 # ---------------------------------------------------------------------------

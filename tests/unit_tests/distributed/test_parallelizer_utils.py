@@ -228,9 +228,27 @@ def test_mp_policy_with_param_dtype_copies_policy():
 
     assert copied_policy is not mp_policy
     assert copied_policy.param_dtype == torch.float32
-    assert copied_policy.reduce_dtype == mp_policy.reduce_dtype
-    assert copied_policy.output_dtype == mp_policy.output_dtype
+    assert copied_policy.reduce_dtype == torch.float32
+    assert copied_policy.output_dtype == torch.float32
+    assert copied_policy.cast_forward_inputs is False
     assert mp_policy.param_dtype == torch.bfloat16
+
+
+def test_mp_policy_with_bf16_param_dtype_preserves_policy():
+    mp_policy = MixedPrecisionPolicy(
+        param_dtype=torch.float32,
+        reduce_dtype=torch.float32,
+        output_dtype=torch.bfloat16,
+        cast_forward_inputs=True,
+    )
+
+    copied_policy = _mp_policy_with_param_dtype(mp_policy, torch.bfloat16)
+
+    assert copied_policy is not mp_policy
+    assert copied_policy.param_dtype == torch.bfloat16
+    assert copied_policy.reduce_dtype == torch.float32
+    assert copied_policy.output_dtype == torch.bfloat16
+    assert copied_policy.cast_forward_inputs is True
 
 
 def test_fully_shard_by_dtype_no_params(monkeypatch):
@@ -592,6 +610,48 @@ def test_fully_shard_by_dtype_excludes_ep_params_and_uses_custom_sharder():
     assert calls[1][1]["mp_policy"].param_dtype == torch.bfloat16
     assert calls[1][1]["ignored_params"] == expert_params
     assert all(module is not block.experts for module, _ in calls)
+
+
+def test_fully_shard_by_dtype_fp32_holder_uses_full_fp32_policy():
+    """Callable fp32 holders keep fp32 inputs, reductions, and outputs under FSDP."""
+
+    class Fp32Holder(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.zeros(4, dtype=torch.float32))
+
+        def forward(self, value: torch.Tensor) -> torch.Tensor:
+            return value.float() * self.weight
+
+    class HybridBlock(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.input_projection = nn.Linear(4, 4, bias=False).to(torch.bfloat16)
+            self.output_projection = nn.Linear(4, 4, bias=False).to(torch.bfloat16)
+            self._fp32_params = Fp32Holder()
+
+    block = HybridBlock()
+    calls: list[tuple[nn.Module, dict]] = []
+
+    fully_shard_by_dtype(
+        block,
+        mesh=object(),
+        mp_policy=MixedPrecisionPolicy(
+            param_dtype=torch.bfloat16,
+            reduce_dtype=torch.bfloat16,
+            output_dtype=torch.bfloat16,
+            cast_forward_inputs=True,
+        ),
+        offload_policy=object(),
+        fp32_compute_module_names=("_fp32_params",),
+        fully_shard_fn=lambda module, **kwargs: calls.append((module, kwargs)),
+    )
+
+    holder_policy = next(kwargs["mp_policy"] for module, kwargs in calls if module is block._fp32_params)
+    assert holder_policy.param_dtype == torch.float32
+    assert holder_policy.reduce_dtype == torch.float32
+    assert holder_policy.output_dtype == torch.float32
+    assert holder_policy.cast_forward_inputs is False
 
 
 def test_fully_shard_by_dtype_ignored_params_do_not_change_uniform_storage_fallback():

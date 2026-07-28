@@ -99,7 +99,7 @@ def iter_maximal_uniform_dtype_subtrees(
 def _group_params_by_dtype(
     layer: nn.Module,
     dtype_of: Optional[Callable[[torch.Tensor], torch.dtype]] = None,
-    ignored_params: Optional[Set[nn.Parameter]] = None,
+    ignored_params: set[nn.Parameter] | None = None,
 ) -> Dict[torch.dtype, List[nn.Parameter]]:
     if dtype_of is None:
         dtype_of = lambda t: t.dtype
@@ -127,8 +127,8 @@ def _fully_shard(
     mp_policy: Optional[MixedPrecisionPolicy],
     offload_policy: Optional[OffloadPolicy],
     reshard_after_forward: bool | int | None = None,
-    ignored_params: Optional[Set[nn.Parameter]] = None,
-    fully_shard_fn: Optional[Callable[..., object]] = None,
+    ignored_params: set[nn.Parameter] | None = None,
+    fully_shard_fn: Callable[..., None] | None = None,
 ) -> None:
     if isinstance(module, nn.ModuleList):
         for layer in module:
@@ -159,8 +159,8 @@ def _call_fully_shard(
     mp_policy: Optional[MixedPrecisionPolicy],
     offload_policy: Optional[OffloadPolicy],
     reshard_after_forward: bool | int | None = None,
-    ignored_params: Optional[Set[nn.Parameter]] = None,
-    fully_shard_fn: Optional[Callable[..., object]] = None,
+    ignored_params: set[nn.Parameter] | None = None,
+    fully_shard_fn: Callable[..., None] | None = None,
 ) -> None:
     if fully_shard_fn is None:
         fully_shard_fn = fully_shard
@@ -190,6 +190,10 @@ def _mp_policy_with_param_dtype(
         return None
     mp_policy_copy = copy(mp_policy)
     object.__setattr__(mp_policy_copy, "param_dtype", param_dtype)
+    if param_dtype == torch.float32:
+        object.__setattr__(mp_policy_copy, "reduce_dtype", torch.float32)
+        object.__setattr__(mp_policy_copy, "output_dtype", torch.float32)
+        object.__setattr__(mp_policy_copy, "cast_forward_inputs", False)
     return mp_policy_copy
 
 
@@ -197,7 +201,7 @@ def _make_compute_dtype_fn(
     module: nn.Module,
     mp_policy: Optional[MixedPrecisionPolicy],
     fp32_compute_module_names: Tuple[str, ...],
-    ignored_params: Optional[Set[nn.Parameter]] = None,
+    ignored_params: set[nn.Parameter] | None = None,
 ) -> Callable[[torch.Tensor], torch.dtype]:
     """Build the per-parameter *compute* dtype resolver used to group FSDP units.
 
@@ -265,8 +269,8 @@ def fully_shard_by_dtype(
     offload_policy: Optional[OffloadPolicy],
     fp32_compute_module_names: Tuple[str, ...] = (),
     reshard_after_forward: bool | int | None = None,
-    ignored_params: Optional[Set[nn.Parameter]] = None,
-    fully_shard_fn: Optional[Callable[..., object]] = None,
+    ignored_params: set[nn.Parameter] | None = None,
+    fully_shard_fn: Callable[..., None] | None = None,
 ) -> None:
     """Fully shard a module so every parameter computes in its required dtype.
 
@@ -358,8 +362,8 @@ def fully_shard_by_dtype(
             )
         )
         selected_subtrees = [
-            (path, mod, key)
-            for path, mod, key in uniform_subtrees
+            (path, key, subtree)
+            for path, subtree, key in uniform_subtrees
             if (len(grouped_params) == 2 and key == least_items_key) or len(grouped_params) > 2
         ]
 
@@ -367,7 +371,7 @@ def fully_shard_by_dtype(
         expected_param_ids = {id(param) for key in expected_keys for param in grouped_params[key]}
         covered_param_ids = {
             id(param)
-            for _, subtree, _ in selected_subtrees
+            for _, _, subtree in selected_subtrees
             for param in subtree.parameters()
             if id(param) not in ignored_param_ids
         }
@@ -379,7 +383,7 @@ def fully_shard_by_dtype(
                 f"{', '.join(unresolved_names)}. Place them in a dedicated parameter-owning module."
             )
 
-        for path, _, key in selected_subtrees:
+        for path, key, _ in selected_subtrees:
             subtree_kwargs = {
                 "mesh": mesh,
                 "mp_policy": _mp_policy_with_param_dtype(mp_policy, key[1]),
