@@ -18,6 +18,7 @@ import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import numpy as np
 import pytest
 import torch
 import torch.nn as nn
@@ -230,6 +231,20 @@ def test_ministral3_biencoder_processor_merges_biencoder_batch(pixtral_processor
     assert output["d_pixel_values"].shape[0] == 2
     assert output["d_image_sizes"].tolist() == [[4, 4], [4, 4]]
     assert torch.equal(output["labels"], torch.zeros(2, dtype=torch.long))
+
+
+def test_ministral3_biencoder_processor_returns_numpy_batch(pixtral_processor):
+    features = [
+        {"question": "Question 0", "doc_text": ["Doc 0", "Doc 1"], "doc_image": ["", ""]},
+        {"question": "Question 1", "doc_text": ["Doc 2", "Doc 3"], "doc_image": ["", ""]},
+    ]
+
+    output = pixtral_processor.process_queries_documents_biencoder(features, return_tensors="np")
+
+    assert isinstance(output["q_input_ids"], np.ndarray)
+    assert isinstance(output["d_input_ids"], np.ndarray)
+    assert isinstance(output["labels"], np.ndarray)
+    np.testing.assert_array_equal(output["labels"], np.zeros(2, dtype=np.int64))
 
 
 def test_ministral3_bidirectional_model_init_and_mask():

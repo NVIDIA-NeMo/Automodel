@@ -21,6 +21,7 @@ import os
 from io import BytesIO
 from typing import Any, Literal
 
+import numpy as np
 import torch
 from PIL import Image
 from transformers import BatchEncoding, PixtralProcessor
@@ -161,7 +162,12 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
             batch["image_sizes"] = None
         return batch
 
-    def process_queries_documents_biencoder(self, features: list[dict[str, Any]], **kwargs: Any) -> dict[str, Any]:
+    def process_queries_documents_biencoder(
+        self,
+        features: list[dict[str, Any]],
+        return_tensors: Literal["pt", "np"] = "pt",
+        **kwargs: Any,
+    ) -> dict[str, Any]:
         """Process grouped retrieval examples into the bi-encoder batch format."""
         queries = []
         pos_neg_text_batch = []
@@ -171,13 +177,14 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
             pos_neg_text_batch.extend(feature["doc_text"])
             pos_neg_image_batch.extend(feature["doc_image"])
 
-        query_batch_dict = self.process_queries(queries, **kwargs)
+        query_batch_dict = self.process_queries(queries, return_tensors=return_tensors, **kwargs)
         doc_batch_dict = self.process_documents(
             {"images": pos_neg_image_batch, "texts": pos_neg_text_batch},
+            return_tensors=return_tensors,
             **kwargs,
         )
         merged_batch_dict = self.merge_batch_dict(query_batch_dict, doc_batch_dict)
-        return self.add_dummy_labels(queries, merged_batch_dict)
+        return self.add_dummy_labels(queries, merged_batch_dict, return_tensors=return_tensors)
 
     def merge_batch_dict(self, query_batch_dict: dict[str, Any], doc_batch_dict: dict[str, Any]) -> dict[str, Any]:
         """Prefix and merge query/document processor outputs."""
@@ -188,9 +195,30 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
             merged_batch_dict[f"d_{key}"] = value
         return merged_batch_dict
 
-    def add_dummy_labels(self, questions: list[str], merged_batch_dict: dict[str, Any]) -> dict[str, Any]:
-        """Add dummy labels expected by the retrieval training loop."""
-        merged_batch_dict["labels"] = torch.zeros(len(questions), dtype=torch.long)
+    def add_dummy_labels(
+        self,
+        questions: list[str],
+        merged_batch_dict: dict[str, Any],
+        *,
+        return_tensors: Literal["pt", "np"] = "pt",
+    ) -> dict[str, Any]:
+        """Add dummy labels expected by the retrieval training loop.
+
+        Args:
+            questions: Query strings defining the batch size.
+            merged_batch_dict: Merged processor output. Tensor or NumPy array values may have arbitrary shapes and
+                are preserved without modification.
+            return_tensors: Backend for the labels, ``"pt"`` or ``"np"``.
+
+        Returns:
+            The input mapping, mutated in place with integer labels of shape [batch].
+        """
+        if return_tensors == "pt":
+            merged_batch_dict["labels"] = torch.zeros(len(questions), dtype=torch.long)
+        elif return_tensors == "np":
+            merged_batch_dict["labels"] = np.zeros(len(questions), dtype=np.int64)
+        else:
+            raise ValueError(f"Invalid return_tensors: {return_tensors!r}. Must be 'pt' or 'np'.")
         return merged_batch_dict
 
     def _process_text(
