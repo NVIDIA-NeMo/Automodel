@@ -43,14 +43,13 @@ import torch
 import torch.nn as nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.nn.functional import scaled_dot_product_attention
-from transformers import Qwen2Config
 from transformers.activations import ACT2FN
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import ModelOutput
 
 from nemo_automodel.components.attention.flex_attention import FlexAttention
-from nemo_automodel.components.models.bagel.configuration import BagelBackendConfig
+from nemo_automodel.components.models.bagel.configuration import BagelBackendConfig, BagelTextConfig
 from nemo_automodel.components.models.common import (
     initialize_linear_module,
     initialize_rms_norm_module,
@@ -67,6 +66,7 @@ __all__ = [
     "Qwen2MoTDecoderLayer",
     "Qwen2Model",
     "Qwen2ForCausalLM",
+    "Qwen2Config",
     "NaiveCache",
     "BaseNavitOutputWithPast",
 ]
@@ -83,6 +83,7 @@ _HAS_FLASH_ATTN, _flash_attn_varlen_func = safe_import_from(
 
 logger = logging.getLogger(__name__)
 _WARNED_INDEX_PUT_DTYPE_CASTS: set[tuple[torch.dtype, torch.dtype]] = set()
+Qwen2Config = BagelTextConfig
 
 
 def _flash_attn_varlen(*args, **kwargs):
@@ -460,8 +461,6 @@ class _PackedAttentionBase(nn.Module):
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.max_position_embeddings = config.max_position_embeddings
         self.rope_theta = _extract_rope_config(config).get("rope_theta", 10000.0)
-        # BAGEL's Qwen2Config extension fields — read with safe defaults so this
-        # port accepts a vanilla transformers.Qwen2Config as well.
         self.is_causal = config.is_causal
         self.attention_dropout = config.attention_dropout
 
@@ -1378,19 +1377,6 @@ class Qwen2Model(Qwen2PreTrainedModel):
     """
 
     def __init__(self, config: Qwen2Config, backend: Optional[BagelBackendConfig] = None) -> None:
-        config_values = config.to_dict()
-        if "qk_norm" not in config_values:
-            config.qk_norm = True
-        if config_values.get("layer_module") is None:
-            config.layer_module = "Qwen2DecoderLayer"
-        if "freeze_und" not in config_values:
-            config.freeze_und = False
-        if "is_causal" not in config_values:
-            config.is_causal = True
-        if "partial_rotary_factor" not in config_values:
-            config.partial_rotary_factor = 1.0
-        if "rope_parameters" not in config_values:
-            config.rope_parameters = None
         super().__init__(config)
         self.backend = backend or BagelBackendConfig()
         self.padding_idx = config.pad_token_id

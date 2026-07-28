@@ -25,18 +25,108 @@ import inspect
 from types import SimpleNamespace
 
 import pytest
+from transformers.configuration_utils import PretrainedConfig
 
 
 def test_bagel_imports() -> None:
     from nemo_automodel.components.models.bagel import (
         BagelConfig,
         BagelForUnifiedMultimodal,
+        BagelTextConfig,
+        BagelVAEConfig,
     )
     from nemo_automodel.recipes.multimodal.finetune import FinetuneRecipeForMultimodal
 
     assert inspect.isclass(BagelConfig)
+    assert inspect.isclass(BagelTextConfig)
+    assert inspect.isclass(BagelVAEConfig)
     assert inspect.isclass(BagelForUnifiedMultimodal)
     assert inspect.isclass(FinetuneRecipeForMultimodal)
+
+
+def test_bagel_config_uses_typed_nested_configs_and_parent_serializer(tmp_path) -> None:
+    from nemo_automodel.components.models.bagel.configuration import BagelConfig, BagelTextConfig, BagelVAEConfig
+
+    cfg = BagelConfig(
+        text_config={
+            "vocab_size": 32,
+            "hidden_size": 64,
+            "intermediate_size": 128,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "pad_token_id": None,
+            "rope_theta": 10000.0,
+        },
+        vae_config={"z_channels": 16, "downsample": 8},
+    )
+
+    assert isinstance(cfg.text_config, BagelTextConfig)
+    assert isinstance(cfg.llm_config, BagelTextConfig)
+    assert cfg.text_config.qk_norm is True
+    assert cfg.text_config.layer_module == "Qwen2DecoderLayer"
+    assert cfg.text_config.freeze_und is False
+    assert cfg.text_config.is_causal is True
+    assert cfg.text_config.partial_rotary_factor == 1.0
+    assert cfg.text_config.pad_token_id == 151643
+    assert isinstance(cfg.vae_config, BagelVAEConfig)
+    assert cfg.vae_config.z_channels == 16
+    assert cfg.vae_config.downsample == 8
+    assert BagelConfig.to_dict is PretrainedConfig.to_dict
+
+    serialized = cfg.to_dict()
+
+    assert serialized["text_config"]["qk_norm"] is True
+    assert serialized["text_config"]["layer_module"] == "Qwen2DecoderLayer"
+    assert serialized["text_config"]["freeze_und"] is False
+    assert serialized["text_config"]["is_causal"] is True
+    assert serialized["text_config"]["partial_rotary_factor"] == 1.0
+    assert serialized["text_config"]["pad_token_id"] == 151643
+    assert serialized["vae_config"]["z_channels"] == 16
+    assert serialized["vae_config"]["downsample"] == 8
+
+    cfg.save_pretrained(tmp_path)
+    restored = BagelConfig.from_pretrained(tmp_path)
+
+    assert isinstance(restored.text_config, BagelTextConfig)
+    assert isinstance(restored.vae_config, BagelVAEConfig)
+    assert restored.text_config.pad_token_id == 151643
+    assert restored.vae_config.z_channels == 16
+    assert restored.vae_config.downsample == 8
+
+
+def test_bagel_config_rejects_stock_qwen2_config() -> None:
+    from transformers import Qwen2Config
+
+    from nemo_automodel.components.models.bagel.configuration import BagelConfig
+
+    with pytest.raises(TypeError, match="BagelTextConfig"):
+        BagelConfig(text_config=Qwen2Config())
+
+
+def test_bagel_text_config_loads_vanilla_qwen_config(tmp_path) -> None:
+    from transformers import Qwen2Config
+
+    from nemo_automodel.components.models.bagel.configuration import BagelTextConfig
+
+    Qwen2Config(
+        vocab_size=32,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+    ).save_pretrained(tmp_path)
+
+    cfg = BagelTextConfig.from_pretrained(tmp_path)
+
+    assert isinstance(cfg, BagelTextConfig)
+    assert cfg.qk_norm is True
+    assert cfg.layer_module == "Qwen2DecoderLayer"
+    assert cfg.freeze_und is False
+    assert cfg.is_causal is True
+    assert cfg.partial_rotary_factor == 1.0
+    assert cfg.pad_token_id == 151643
 
 
 def test_bagel_stage2_config_selects_mot_decoder() -> None:
@@ -62,6 +152,40 @@ def test_bagel_stage1_config_drops_generation_path() -> None:
 
     assert cfg.visual_gen is False
     assert cfg.text_config.layer_module == "Qwen2DecoderLayer"
+
+
+def test_bagel_model_construction_does_not_mutate_input_config(monkeypatch) -> None:
+    import nemo_automodel.components.models.bagel.model as bagel_model
+
+    cfg = bagel_model.BagelConfig(
+        visual_und=False,
+        visual_gen=False,
+        stage=2,
+        text_config={
+            "vocab_size": 32,
+            "hidden_size": 16,
+            "intermediate_size": 32,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 2,
+        },
+    )
+
+    class _FakeBagelModel:
+        def __init__(self, config, backend=None) -> None:
+            self.config = config
+            self.backend = backend
+
+    monkeypatch.setattr(bagel_model, "BagelModel", _FakeBagelModel)
+
+    model = bagel_model.BagelForUnifiedMultimodal(cfg)
+
+    assert cfg.stage == 2
+    assert cfg.visual_gen is False
+    assert cfg.text_config.layer_module == "Qwen2DecoderLayer"
+    assert model.config.stage == 2
+    assert model.config.visual_gen is True
+    assert model.config.text_config.layer_module == "Qwen2MoTDecoderLayer"
 
 
 def test_bagel_rejects_tied_word_embeddings() -> None:

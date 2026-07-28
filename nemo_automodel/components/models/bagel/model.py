@@ -26,6 +26,7 @@ FSDP double-root issue that bites us with PreTrainedModel-derived roots.
 
 from __future__ import annotations
 
+import copy
 import logging
 import os
 import pathlib
@@ -108,19 +109,17 @@ def _prepare_config_for_stage(config: BagelConfig) -> None:
     # BAGEL applies a select-layer offset so the effective ViT has
     # ``vit_config.num_hidden_layers + 1 + vit_select_layer`` layers. The
     # checkpoint carries the offset count, so apply this before constructing
-    # the tower. Mark the config to avoid accidental double-application.
+    # the tower.
     if config.vision_config is not None:
-        if not config._bagel_vit_select_layer_applied:
-            effective_layers = config.vision_config.num_hidden_layers + 1 + config.vit_select_layer
-            if effective_layers != config.vision_config.num_hidden_layers:
-                logger.info(
-                    "BagelConfig: adjusting vision_config.num_hidden_layers %d -> %d (vit_select_layer=%d).",
-                    config.vision_config.num_hidden_layers,
-                    effective_layers,
-                    config.vit_select_layer,
-                )
-                config.vision_config.num_hidden_layers = effective_layers
-            config._bagel_vit_select_layer_applied = True
+        effective_layers = config.vision_config.num_hidden_layers + 1 + config.vit_select_layer
+        if effective_layers != config.vision_config.num_hidden_layers:
+            logger.info(
+                "BagelConfig: adjusting vision_config.num_hidden_layers %d -> %d (vit_select_layer=%d).",
+                config.vision_config.num_hidden_layers,
+                effective_layers,
+                config.vit_select_layer,
+            )
+            config.vision_config.num_hidden_layers = effective_layers
         config.vision_config.rope = config.vit_rope
 
 
@@ -185,16 +184,15 @@ class BagelModel(nn.Module):
         # container; the recipe owns the frozen VAE and hands ``padded_latent``
         # to forward.
         if config.visual_gen:
-            vae_cfg = config.vae_config or {}
-            try:
-                latent_channel = int(vae_cfg["z_channels"])
-                downsample = int(vae_cfg["downsample"])
-            except (KeyError, TypeError, ValueError) as e:
+            vae_cfg = config.vae_config
+            if vae_cfg is None or vae_cfg.z_channels is None or vae_cfg.downsample is None:
                 raise ValueError(
                     "visual_gen=True requires config.vae_config to carry "
                     "'z_channels' and 'downsample'. Recipe should load the VAE "
                     f"checkpoint first and populate these. (got {vae_cfg!r})"
-                ) from e
+                )
+            latent_channel = int(vae_cfg.z_channels)
+            downsample = int(vae_cfg.downsample)
             self.latent_patch_size = config.latent_patch_size
             self.timestep_shift = config.timestep_shift
             self.latent_downsample = downsample * config.latent_patch_size
@@ -243,6 +241,7 @@ class BagelForUnifiedMultimodal(HFCheckpointingMixin, nn.Module):
         # constructs this class directly. Reads the nested text_config tie flag via
         # the resolver's get_text_config fallback (BagelConfig has no top-level flag).
         reject_unsupported_tie_word_embeddings(type(self), config)
+        config = copy.deepcopy(config)
         _prepare_config_for_stage(config)
         self.config = config
         self.backend = resolve_bagel_backend(backend)

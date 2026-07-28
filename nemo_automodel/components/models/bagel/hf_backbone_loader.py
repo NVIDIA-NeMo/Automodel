@@ -21,12 +21,22 @@ import json
 import logging
 import math
 import pathlib
-from typing import TYPE_CHECKING, Any, Dict
+from collections.abc import Mapping
+from typing import TYPE_CHECKING, Any, Protocol
 
 import torch
 
 if TYPE_CHECKING:
-    from nemo_automodel.components.models.bagel.configuration import BagelBackendConfig
+    from nemo_automodel.components.models.bagel.configuration import BagelBackendConfig, BagelVAEConfig
+
+
+class _ModelConfigWithGet(Protocol):
+    """Recipe config boundary used by the HF-backbone initialization path."""
+
+    def get(self, key: str, default: Any = None) -> Any:
+        """Return a model config value."""
+        ...
+
 
 logger = logging.getLogger(__name__)
 
@@ -211,7 +221,7 @@ def initialize_bagel_non_backbone_weights(model: torch.nn.Module, *, seed: int) 
             torch.nn.init.constant_(bagel.llm2vae.bias, 0.0)
 
 
-def load_bagel_hf_backbone_weights(model: torch.nn.Module, model_cfg: Any) -> None:
+def load_bagel_hf_backbone_weights(model: torch.nn.Module, model_cfg: _ModelConfigWithGet) -> None:
     """Load Qwen/SigLIP HF backbone weights into an already-built BAGEL model."""
     llm_path = model_cfg.get("llm_path", None)
     vit_path = model_cfg.get("vit_path", None)
@@ -229,17 +239,15 @@ def load_bagel_hf_backbone_weights(model: torch.nn.Module, model_cfg: Any) -> No
 
 def build_bagel_from_hf_backbones(
     *,
-    model_cfg: Any,
+    model_cfg: _ModelConfigWithGet,
     stage: int,
-    vae_config: Dict[str, int] | None,
+    vae_config: Mapping[str, int] | "BagelVAEConfig" | None,
     meta_init: bool = False,
     load_backbone_weights: bool = True,
     backend: BagelBackendConfig | None = None,
 ) -> torch.nn.Module:
     """Build BAGEL from upstream Qwen/SigLIP backbone configs."""
-    from transformers import Qwen2Config
-
-    from nemo_automodel.components.models.bagel.configuration import BagelConfig
+    from nemo_automodel.components.models.bagel.configuration import BagelConfig, BagelTextConfig
     from nemo_automodel.components.models.bagel.model import BagelForUnifiedMultimodal
     from nemo_automodel.shared.utils import dtype_from_str
 
@@ -252,10 +260,10 @@ def build_bagel_from_hf_backbones(
     visual_und = bool(model_cfg.get("visual_und", True))
     if visual_und and vit_path is None:
         raise ValueError("model.init_mode='hf_backbones' with visual_und=True requires model.vit_path")
-    if vae_config is not None:
+    if isinstance(vae_config, Mapping):
         vae_config = dict(vae_config)
 
-    llm_config = Qwen2Config.from_pretrained(llm_path)
+    llm_config = BagelTextConfig.from_pretrained(llm_path)
     default_layer_module = "Qwen2MoTDecoderLayer" if visual_gen else "Qwen2DecoderLayer"
     llm_config.layer_module = model_cfg.get("layer_module", default_layer_module)
     llm_config.qk_norm = bool(model_cfg.get("llm_qk_norm", True))

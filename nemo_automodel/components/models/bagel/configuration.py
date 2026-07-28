@@ -37,7 +37,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Dict, Literal, Optional, Union
+from typing import Any, Literal
 
 from transformers import Qwen2Config
 from transformers.configuration_utils import PretrainedConfig
@@ -82,52 +82,70 @@ def resolve_bagel_backend(backend: Mapping[str, Any] | BagelBackendConfig | None
     return BagelBackendConfig(**overrides)
 
 
-def _coerce_text_config(cfg: Union[Dict[str, Any], Qwen2Config, None]) -> Qwen2Config:
-    """Coerce ``cfg`` into a ``Qwen2Config`` with BAGEL's extra attributes set.
+BagelLayerModule = Literal["Qwen2DecoderLayer", "Qwen2MoTDecoderLayer"]
 
-    BAGEL adds three attributes to Qwen2Config that aren't part of stock
-    transformers:
-    * ``qk_norm`` (bool, default True for BAGEL-7B-MoT)
-    * ``layer_module`` (``"Qwen2DecoderLayer"`` or ``"Qwen2MoTDecoderLayer"``)
-    * ``freeze_und`` (bool, default False)
 
-    We also ensure ``pad_token_id`` is populated. Some checkpoint configs omit
-    it, and transformers 5.x raises ``AttributeError`` on missing config attrs.
-    """
+class BagelTextConfig(Qwen2Config):
+    """Qwen2 text config with BAGEL's packed/MoT extension fields."""
+
+    qk_norm: bool = True
+    layer_module: BagelLayerModule | None = "Qwen2DecoderLayer"
+    freeze_und: bool = False
+    is_causal: bool = True
+    partial_rotary_factor: float = 1.0
+    pad_token_id: int | None = 151643
+
+    def __post_init__(self, **kwargs: Any) -> None:
+        super().__post_init__(**kwargs)
+        if self.pad_token_id is None:
+            self.pad_token_id = 151643
+        if self.layer_module not in (None, "Qwen2DecoderLayer", "Qwen2MoTDecoderLayer"):
+            raise ValueError(
+                "BAGEL text_config.layer_module must be "
+                "'Qwen2DecoderLayer', 'Qwen2MoTDecoderLayer', or None "
+                f"(got {self.layer_module!r})."
+            )
+
+
+class BagelVAEConfig(PretrainedConfig):
+    """VAE metadata consumed by BAGEL's visual-generation path."""
+
+    model_type = "bagel_vae"
+
+    z_channels: int | None = None
+    downsample: int | None = None
+
+
+def _coerce_text_config(cfg: Mapping[str, Any] | BagelTextConfig | None) -> BagelTextConfig:
+    """Coerce ``cfg`` into BAGEL's typed Qwen2 text config."""
     if cfg is None:
-        cfg = Qwen2Config()
-    elif isinstance(cfg, dict):
-        cfg = Qwen2Config(**cfg)
-    elif not isinstance(cfg, Qwen2Config):
-        raise TypeError(f"text_config must be dict / Qwen2Config / None (got {type(cfg).__name__})")
-
-    # Defaults for BAGEL-specific attrs (safe to always apply - caller may
-    # override before/after this helper runs).
-    config_values = cfg.to_dict()
-    if "qk_norm" not in config_values:
-        cfg.qk_norm = True
-    if config_values.get("layer_module") is None:
-        cfg.layer_module = "Qwen2DecoderLayer"
-    if "freeze_und" not in config_values:
-        cfg.freeze_und = False
-
-    # pad_token_id: Qwen2Config's default is None, which Qwen2Model tolerates
-    # (nn.Embedding accepts padding_idx=None). The packed training path reads
-    # it as a scalar, so we fall back to the BAGEL-7B-MoT value when missing.
-    if cfg.pad_token_id is None:
-        cfg.pad_token_id = 151643
-
+        return BagelTextConfig()
+    if isinstance(cfg, Mapping):
+        return BagelTextConfig(**dict(cfg))
+    if not isinstance(cfg, BagelTextConfig):
+        raise TypeError(f"text_config must be a mapping / BagelTextConfig / None (got {type(cfg).__name__})")
     return cfg
 
 
-def _coerce_vision_config(cfg: Union[Dict[str, Any], SiglipVisionConfig, None]) -> Optional[SiglipVisionConfig]:
+def _coerce_vision_config(cfg: Mapping[str, Any] | SiglipVisionConfig | None) -> SiglipVisionConfig | None:
     """Coerce ``cfg`` into a ``SiglipVisionConfig`` (our ``rope``-flag variant)."""
     if cfg is None:
         return None
-    if isinstance(cfg, dict):
-        return SiglipVisionConfig(**cfg)
+    if isinstance(cfg, Mapping):
+        return SiglipVisionConfig(**dict(cfg))
     if not isinstance(cfg, SiglipVisionConfig):
-        raise TypeError(f"vision_config must be dict / SiglipVisionConfig / None (got {type(cfg).__name__})")
+        raise TypeError(f"vision_config must be a mapping / SiglipVisionConfig / None (got {type(cfg).__name__})")
+    return cfg
+
+
+def _coerce_vae_config(cfg: Mapping[str, Any] | BagelVAEConfig | None) -> BagelVAEConfig | None:
+    """Coerce ``cfg`` into BAGEL's typed VAE metadata config."""
+    if cfg is None:
+        return None
+    if isinstance(cfg, Mapping):
+        return BagelVAEConfig(**dict(cfg))
+    if not isinstance(cfg, BagelVAEConfig):
+        raise TypeError(f"vae_config must be a mapping / BagelVAEConfig / None (got {type(cfg).__name__})")
     return cfg
 
 
@@ -144,15 +162,20 @@ class BagelConfig(PretrainedConfig):
     """
 
     model_type = "bagel"
+    sub_configs = {
+        "text_config": BagelTextConfig,
+        "vision_config": SiglipVisionConfig,
+        "vae_config": BagelVAEConfig,
+    }
 
     def __init__(
         self,
-        vision_config: Union[Dict[str, Any], SiglipVisionConfig, None] = None,
-        text_config: Union[Dict[str, Any], Qwen2Config, None] = None,
+        vision_config: Mapping[str, Any] | SiglipVisionConfig | None = None,
+        text_config: Mapping[str, Any] | BagelTextConfig | None = None,
         *,
         visual_und: bool = True,
         visual_gen: bool = False,
-        stage: Union[int, str, None] = None,
+        stage: int | str | None = None,
         llm_path: str = "",
         vit_path: str = "",
         vae_path: str = "",
@@ -170,9 +193,9 @@ class BagelConfig(PretrainedConfig):
         timestep_shift: float = 1.0,
         pad_token_id: int = 151643,
         # Checkpoint aliases.
-        llm_config: Union[Dict[str, Any], Qwen2Config, None] = None,
-        vit_config: Union[Dict[str, Any], SiglipVisionConfig, None] = None,
-        vae_config: Union[Dict[str, Any], None] = None,
+        llm_config: Mapping[str, Any] | BagelTextConfig | None = None,
+        vit_config: Mapping[str, Any] | SiglipVisionConfig | None = None,
+        vae_config: Mapping[str, Any] | BagelVAEConfig | None = None,
         **kwargs: Any,
     ) -> None:
         # Resolve aliases: if both are passed and conflict, prefer the AM name.
@@ -183,10 +206,7 @@ class BagelConfig(PretrainedConfig):
 
         self.text_config = _coerce_text_config(text_config)
         self.vision_config = _coerce_vision_config(vision_config)
-
-        # VAE config is a bare dict: it only carries the autoencoder
-        # metadata needed by the visual-generation path.
-        self.vae_config = vae_config or {}
+        self.vae_config = _coerce_vae_config(vae_config)
 
         self.visual_und = visual_und
         self.visual_gen = visual_gen
@@ -225,28 +245,17 @@ class BagelConfig(PretrainedConfig):
     # Checkpoint-named read aliases (so downstream code can do either
     # ``config.llm_config`` or ``config.text_config`` interchangeably).
     @property
-    def llm_config(self) -> Qwen2Config:
+    def llm_config(self) -> BagelTextConfig:
         return self.text_config
 
     @llm_config.setter
-    def llm_config(self, value: Qwen2Config) -> None:
-        self.text_config = value
+    def llm_config(self, value: Mapping[str, Any] | BagelTextConfig | None) -> None:
+        self.text_config = _coerce_text_config(value)
 
     @property
-    def vit_config(self) -> Optional[SiglipVisionConfig]:
+    def vit_config(self) -> SiglipVisionConfig | None:
         return self.vision_config
 
     @vit_config.setter
-    def vit_config(self, value: Optional[SiglipVisionConfig]) -> None:
-        self.vision_config = value
-
-    # ------------------------------------------------------------------
-    # Serialization: PretrainedConfig.to_dict is naive about nested configs,
-    # so we hand-serialize them (matches LlavaOneVisionConfig.to_dict).
-    # ------------------------------------------------------------------
-    def to_dict(self) -> Dict[str, Any]:
-        output = super().to_dict()
-        output.pop("_bagel_vit_select_layer_applied", None)
-        output["text_config"] = self.text_config.to_dict() if self.text_config is not None else None
-        output["vision_config"] = self.vision_config.to_dict() if self.vision_config is not None else None
-        return output
+    def vit_config(self, value: Mapping[str, Any] | SiglipVisionConfig | None) -> None:
+        self.vision_config = _coerce_vision_config(value)
