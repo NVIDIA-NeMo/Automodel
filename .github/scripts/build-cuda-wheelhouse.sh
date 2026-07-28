@@ -18,17 +18,35 @@ set -euxo pipefail
 
 : "${TORCH_CU_INDEX:?TORCH_CU_INDEX must be set}"
 : "${WHEELHOUSE_DIR:?WHEELHOUSE_DIR must be set}"
+: "${PYTHON_VERSION:?PYTHON_VERSION must be set}"
+: "${PLATFORM_MACHINE:?PLATFORM_MACHINE must be set}"
+: "${SYS_PLATFORM:?SYS_PLATFORM must be set}"
+
+lock_args=(
+  --lock uv.lock
+  --torch-index "${TORCH_CU_INDEX}"
+  --python-version "${PYTHON_VERSION}"
+  --platform-machine "${PLATFORM_MACHINE}"
+  --sys-platform "${SYS_PLATFORM}"
+)
 
 python -m venv ./venv
 
 . ./venv/bin/activate
 
-python -m pip install --upgrade pip
-python -m pip install --index-url "${TORCH_CU_INDEX}" "torch>=2.9.0"
-python -m pip install numpy packaging psutil pybind11 setuptools wheel wheel_stub
+build_tools="$(
+  python scripts/cuda_wheelhouse_lock.py --output build-tools "${lock_args[@]}"
+)"
+mapfile -t build_tool_requirements <<< "${build_tools}"
+python -m pip install "${build_tool_requirements[@]}"
+
+torch_requirement="$(
+  python scripts/cuda_wheelhouse_lock.py --output torch "${lock_args[@]}"
+)"
+python -m pip install --index-url "${TORCH_CU_INDEX}" "${torch_requirement}"
 
 requirements="$(
-  python .github/scripts/cuda-wheelhouse-requirements.py
+  python scripts/cuda_wheelhouse_lock.py --output wheels "${lock_args[@]}"
 )"
 mapfile -t wheelhouse_requirements <<< "${requirements}"
 

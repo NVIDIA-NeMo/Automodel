@@ -171,6 +171,9 @@ jobs:
     env:
       WHEELHOUSE_DIR: /tmp/cuda-wheelhouse
       TORCH_CUDA_ARCH_LIST: "9.0 10.0 12.0"
+      PLATFORM_MACHINE: x86_64
+      PYTHON_VERSION: ${{ matrix.python-version }}
+      SYS_PLATFORM: linux
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -182,27 +185,22 @@ jobs:
 
       - name: Compute CUDA wheelhouse cache key
         id: cuda-wheelhouse-key
-        env:
-          PYTHON_VERSION: ${{ matrix.python-version }}
         shell: bash
         run: |
-          requirements="$(
-            python .github/scripts/cuda-wheelhouse-requirements.py --json
-          )"
           fingerprint="$(
-            {
-              printf '%s\n' \
-                "schema=v2" \
-                "runner_os=${RUNNER_OS}" \
-                "python_version=${PYTHON_VERSION}" \
-                "cuda_container_image=${CUDA_CONTAINER_IMAGE}" \
-                "torch_cu_index=${TORCH_CU_INDEX}" \
-                "torch_cuda_arch_list=${TORCH_CUDA_ARCH_LIST}" \
-                "requirements=${requirements}"
-              sha256sum .github/scripts/build-cuda-wheelhouse.sh
-            } | sha256sum | cut -d' ' -f1
+            python scripts/cuda_wheelhouse_lock.py \
+              --output fingerprint \
+              --lock uv.lock \
+              --torch-index "${TORCH_CU_INDEX}" \
+              --python-version "${PYTHON_VERSION}" \
+              --platform-machine "${PLATFORM_MACHINE}" \
+              --sys-platform "${SYS_PLATFORM}" \
+              --runner-os "${RUNNER_OS}" \
+              --cuda-container-image "${CUDA_CONTAINER_IMAGE}" \
+              --torch-cuda-arch-list "${TORCH_CUDA_ARCH_LIST}" \
+              --build-script .github/scripts/build-cuda-wheelhouse.sh
           )"
-          echo "key=install-test-cuda-wheelhouse-v2-${RUNNER_OS}-py${PYTHON_VERSION}-${fingerprint}" >> "$GITHUB_OUTPUT"
+          echo "key=install-test-cuda-wheelhouse-v3-${RUNNER_OS}-py${PYTHON_VERSION}-${fingerprint}" >> "$GITHUB_OUTPUT"
 
       # Keep the canonical wheelhouse on main. Copied PR branches restore it
       # without creating duplicate branch-scoped multi-GB cache entries.
@@ -293,14 +291,31 @@ jobs:
           export PIP_FIND_LINKS="${WHEELHOUSE_DIR}"
           export PIP_PREFER_BINARY=1
 
-          pip install --upgrade pip
-
           PIP_ARGS=()
 
           if [[ $EXTRA == *"fa"* || $EXTRA == *"cuda"* || $EXTRA == *"all"* ]]; then
-            pip install --find-links "${PIP_FIND_LINKS}" --index-url ${TORCH_CU_INDEX} "torch>=2.9.0"
-            pip install --find-links "${PIP_FIND_LINKS}" numpy packaging psutil pybind11 setuptools wheel wheel_stub
-            PIP_ARGS=(--no-build-isolation)
+            LOCK_ARGS=(
+              --lock uv.lock
+              --torch-index "${TORCH_CU_INDEX}"
+              --python-version "${{ matrix.python-version }}"
+              --platform-machine x86_64
+              --sys-platform linux
+            )
+            TORCH_REQUIREMENT="$(
+              python scripts/cuda_wheelhouse_lock.py --output torch "${LOCK_ARGS[@]}"
+            )"
+            BUILD_TOOLS="$(
+              python scripts/cuda_wheelhouse_lock.py --output build-tools "${LOCK_ARGS[@]}"
+            )"
+            mapfile -t BUILD_TOOL_REQUIREMENTS <<< "${BUILD_TOOLS}"
+            CONSTRAINTS_FILE="${RUNNER_TEMP}/cuda-wheelhouse-constraints.txt"
+            python scripts/cuda_wheelhouse_lock.py \
+              --output constraints \
+              "${LOCK_ARGS[@]}" > "${CONSTRAINTS_FILE}"
+
+            pip install --find-links "${PIP_FIND_LINKS}" "${BUILD_TOOL_REQUIREMENTS[@]}"
+            pip install --find-links "${PIP_FIND_LINKS}" --index-url ${TORCH_CU_INDEX} "${TORCH_REQUIREMENT}"
+            PIP_ARGS=(--no-build-isolation --constraint "${CONSTRAINTS_FILE}")
             export TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0"
           fi
 
