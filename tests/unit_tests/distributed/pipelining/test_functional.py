@@ -927,7 +927,10 @@ class TestPrecomputeStageShapes:
 
         mock_stage1 = self._make_stage(is_first=True, is_last=False, has_lm_head=False)
         mock_stage2 = self._make_stage(is_first=False, is_last=True, has_lm_head=True)
-        mock_split_stages.return_value = ([mock_stage1, mock_stage2], [Mock(), Mock()])
+        mock_split_stages.return_value = (
+            [mock_stage1, mock_stage2],
+            [mock_stage1.submod, mock_stage2.submod],
+        )
         mock_build_schedule.return_value = Mock()
         mock_parallelize_fn = Mock(side_effect=lambda model_part, **_kwargs: model_part)
 
