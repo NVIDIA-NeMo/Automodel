@@ -18,7 +18,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 import torch.nn as nn
-from torch.distributed.pipelining.microbatch import split_args_kwargs_into_chunks
+from torch.distributed.pipelining.microbatch import TensorChunkSpec, split_args_kwargs_into_chunks
 
 from nemo_automodel.components.distributed.pipelining.autopipeline import AutoPipeline
 from nemo_automodel.components.distributed.pipelining.functional import (
@@ -231,8 +231,48 @@ class _KwargsChunkHookPart(nn.Module):
         return {key: dim for key, dim in self.chunk_dims.items() if key in kwargs}
 
 
+class _UnknownKwargsChunkHookPart(nn.Module):
+    def get_pipeline_kwargs_chunk_dims(self, kwargs):
+        return {"unknown": 0}
+
+
+class _KwargsChunkSchedule:
+    def __init__(self, *, fail_on_step: bool = False):
+        self._kwargs_chunk_spec = None
+        self.fail_on_step = fail_on_step
+        self.kwargs_chunk_spec_during_step = None
+        self.kwargs_split = None
+
+    def step(self, *args, target=None, losses=None, **kwargs):
+        """Split schedule inputs using the chunk spec active during the call.
+
+        Args:
+            *args: Positional schedule inputs. Tensor values have arbitrary
+                model-defined layouts.
+            target: Optional tensor of shape [batch, sequence] containing loss
+                targets.
+            losses: Optional mutable list populated with scalar loss tensors.
+            **kwargs: Keyword schedule inputs. Tensor values have arbitrary
+                model-defined layouts.
+
+        Returns:
+            A sentinel string identifying the schedule result.
+        """
+        del target, losses
+        self.kwargs_chunk_spec_during_step = self._kwargs_chunk_spec
+        if self.fail_on_step:
+            raise RuntimeError("schedule failed")
+        _, self.kwargs_split = split_args_kwargs_into_chunks(
+            args,
+            kwargs,
+            2,
+            kwargs_chunk_spec=self._kwargs_chunk_spec,
+        )
+        return "schedule-result"
+
+
 class TestAutoPipelineKwargsChunkSpec:
-    def _pipeline_with_parts(self, *parts: nn.Module):
+    def _pipeline_with_parts(self, *parts: nn.Module, schedule=None):
         ap = AutoPipeline(
             world_mesh=FakeDeviceMesh(),
             pp_axis_name="pp",
@@ -241,12 +281,12 @@ class TestAutoPipelineKwargsChunkSpec:
             pp_batch_size=2,
             device=torch.device("cpu"),
         )
-        ap._info.schedule = types.SimpleNamespace(_kwargs_chunk_spec=None)
+        ap._info.schedule = schedule or _KwargsChunkSchedule()
         ap._info.model_parts = list(parts)
         return ap
 
-    def test_model_hook_splits_mrope_position_ids_on_batch_axis(self):
-        """Model-owned PP chunk hook keeps all mRoPE axes in every microbatch."""
+    def test_step_splits_mrope_position_ids_on_model_owned_batch_axis(self):
+        """AutoPipeline.step keeps all mRoPE axes in every microbatch."""
         input_ids = torch.zeros(2, 8, dtype=torch.long)
         position_ids = torch.arange(8, dtype=torch.long).view(1, 1, -1).expand(3, 2, -1).clone()
         kwargs = {
@@ -259,14 +299,10 @@ class TestAutoPipelineKwargsChunkSpec:
         assert default_kwargs_split[0]["position_ids"].shape == (2, 2, 8)
 
         ap = self._pipeline_with_parts(_KwargsChunkHookPart({"position_ids": 1}))
-        ap.configure_schedule_kwargs_chunk_spec(kwargs)
+        result = ap.step(input_ids, **kwargs)
 
-        _, fixed_kwargs_split = split_args_kwargs_into_chunks(
-            (input_ids,),
-            kwargs,
-            2,
-            kwargs_chunk_spec=ap.info.schedule._kwargs_chunk_spec,
-        )
+        fixed_kwargs_split = ap.info.schedule.kwargs_split
+        assert result == "schedule-result"
         assert fixed_kwargs_split[0]["position_ids"].shape == (3, 1, 8)
         assert fixed_kwargs_split[1]["position_ids"].shape == (3, 1, 8)
         torch.testing.assert_close(fixed_kwargs_split[0]["position_ids"], position_ids[:, :1])
@@ -274,23 +310,44 @@ class TestAutoPipelineKwargsChunkSpec:
         assert fixed_kwargs_split[0]["attention_mask"].shape == (1, 8)
         assert fixed_kwargs_split[0]["qkv_format"] == "thd"
         assert fixed_kwargs_split[1]["qkv_format"] == "thd"
-
-    def test_no_model_hook_uses_pytorch_default_chunking(self):
-        ap = self._pipeline_with_parts(nn.Module())
-        ap.info.schedule._kwargs_chunk_spec = {"stale": object()}
-
-        ap.configure_schedule_kwargs_chunk_spec({"attention_mask": torch.ones(2, 8)})
-
         assert ap.info.schedule._kwargs_chunk_spec is None
 
-    def test_conflicting_model_hook_dims_raise(self):
+    def test_step_without_model_hook_uses_pytorch_default_chunking(self):
+        ap = self._pipeline_with_parts(nn.Module())
+
+        ap.step(torch.zeros(2, 8), attention_mask=torch.ones(2, 8))
+
+        assert ap.info.schedule.kwargs_chunk_spec_during_step is None
+        assert ap.info.schedule.kwargs_split[0]["attention_mask"].shape == (1, 8)
+        assert ap.info.schedule._kwargs_chunk_spec is None
+
+    def test_only_canonical_model_part_supplies_chunk_policy(self):
         ap = self._pipeline_with_parts(
-            _KwargsChunkHookPart({"position_ids": 0}),
             _KwargsChunkHookPart({"position_ids": 1}),
+            _KwargsChunkHookPart({"position_ids": 0}),
         )
 
-        with pytest.raises(ValueError, match="Conflicting PP chunk dims"):
-            ap.configure_schedule_kwargs_chunk_spec({"position_ids": torch.zeros(3, 2, 8)})
+        ap.step(torch.zeros(2, 8), position_ids=torch.zeros(3, 2, 8))
+
+        assert ap.info.schedule.kwargs_split[0]["position_ids"].shape == (3, 1, 8)
+
+    def test_step_restores_schedule_chunk_spec_after_failure(self):
+        schedule = _KwargsChunkSchedule(fail_on_step=True)
+        original_chunk_spec = {"position_ids": TensorChunkSpec(0)}
+        schedule._kwargs_chunk_spec = original_chunk_spec
+        ap = self._pipeline_with_parts(_KwargsChunkHookPart({"position_ids": 1}), schedule=schedule)
+
+        with pytest.raises(RuntimeError, match="schedule failed"):
+            ap.step(torch.zeros(2, 8), position_ids=torch.zeros(3, 2, 8))
+
+        assert schedule.kwargs_chunk_spec_during_step["position_ids"].split_dim == 1
+        assert schedule._kwargs_chunk_spec is original_chunk_spec
+
+    def test_model_hook_cannot_configure_unknown_kwarg(self):
+        ap = self._pipeline_with_parts(_UnknownKwargsChunkHookPart())
+
+        with pytest.raises(ValueError, match="unknown kwarg"):
+            ap.step(torch.zeros(2, 8), attention_mask=torch.ones(2, 8))
 
 
 # -----------------------------

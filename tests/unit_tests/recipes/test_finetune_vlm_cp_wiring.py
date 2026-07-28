@@ -122,17 +122,25 @@ class _ScheduleSpy:
 class _PPSpy(SimpleNamespace):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.kwargs_chunk_spec_batches = []
+        self.step_batches = []
 
-    def configure_schedule_kwargs_chunk_spec(self, kwargs):
-        """Record schedule kwarg chunk-spec inputs.
+    def step(self, *args, target=None, losses=None, **kwargs):
+        """Record and forward an AutoPipeline step.
 
         Args:
-            kwargs: Mapping of keyword inputs passed to the PP schedule after
-                model input and labels are removed. Tensor values keep the same
-                arbitrary shapes and axis order that ``schedule.step`` receives.
+            *args: Positional schedule inputs. Tensor values have arbitrary
+                model-defined layouts.
+            target: Optional tensor of shape [batch, sequence] containing loss
+                targets.
+            losses: Optional mutable list populated with scalar loss tensors.
+            **kwargs: Keyword schedule inputs. Tensor values have arbitrary
+                model-defined layouts.
+
+        Returns:
+            The value returned by the schedule spy.
         """
-        self.kwargs_chunk_spec_batches.append(dict(kwargs))
+        self.step_batches.append(dict(kwargs))
+        return self.info.schedule.step(*args, target=target, losses=losses, **kwargs)
 
 
 def test_forward_backward_step_pp_cp_first_stage_sunk_keeps_input_ids_full(monkeypatch):
@@ -203,7 +211,7 @@ def test_forward_backward_step_pp_cp_first_stage_sunk_keeps_input_ids_full(monke
     assert tuple(seen_cp_batch["input_ids"].shape) == (2, 6)
     assert "inputs_embeds" not in seen_cp_batch
     assert seq_lens == [6]
-    assert [set(call.keys()) for call in recipe.pp.kwargs_chunk_spec_batches] == [{"pixel_values"}]
+    assert [set(call.keys()) for call in recipe.pp.step_batches] == [{"pixel_values"}]
     assert len(schedule.calls) == 1
     assert tuple(schedule.calls[0]["model_input"].shape) == (2, 6)
     assert torch.equal(schedule.calls[0]["target"], labels)
@@ -275,7 +283,7 @@ def _run_nonfirst_stage_fbstep(monkeypatch, model):
     FinetuneRecipeForVLM._forward_backward_step(
         recipe, 0, batch, loss_buffer=[], num_label_tokens=labels.numel(), num_batches=1
     )
-    return seen_cp_batch, seq_lens, recipe.pp.kwargs_chunk_spec_batches
+    return seen_cp_batch, seq_lens, recipe.pp.step_batches
 
 
 def test_forward_backward_step_pp_cp_sunk_model_nonfirst_stage_invokes_hook_keeps_input_ids_full(monkeypatch):
@@ -285,7 +293,7 @@ def test_forward_backward_step_pp_cp_sunk_model_nonfirst_stage_invokes_hook_keep
     the generic sharder would produce, which would ÷cp a second time and truncate
     the inter-stage hidden (the text-decoder RoPE size mismatch)."""
     model = _SunkSpyVLM()
-    seen_cp_batch, seq_lens, kwargs_chunk_spec_batches = _run_nonfirst_stage_fbstep(monkeypatch, model)
+    seen_cp_batch, seq_lens, step_batches = _run_nonfirst_stage_fbstep(monkeypatch, model)
 
     # Hook invoked on the non-first stage (this is the fix).
     assert len(model.calls) == 1
@@ -294,7 +302,7 @@ def test_forward_backward_step_pp_cp_sunk_model_nonfirst_stage_invokes_hook_keep
     assert tuple(seen_cp_batch["input_ids"].shape) == (2, 6)
     # All pp ranks feed the FULL seq_len to update_seq_len.
     assert seq_lens == [6]
-    assert kwargs_chunk_spec_batches == [{}]
+    assert step_batches == [{}]
 
 
 class _FakePPModel:
