@@ -380,7 +380,10 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
 
             # Match the training-loop lifecycle: record one complete eager
             # optimizer step, then capture outside the measured iteration.
-            self._capture_partial_cuda_graphs_after_eager_step()
+            graph_manager = getattr(self, "partial_cuda_graph_manager", None)
+            if graph_manager is not None and getattr(self, "_partial_cuda_graph_capture_pending", False):
+                graph_manager.capture()
+                self._partial_cuda_graph_capture_pending = False
 
             # Synchronize num_label_tokens across DP ranks
             num_label_tokens_tensor = torch.tensor(num_label_tokens, dtype=torch.long, device=device)
@@ -605,7 +608,10 @@ def main(config_path=None):
         recipe.setup()
         recipe.run_benchmark()
     finally:
-        recipe._close_partial_cuda_graphs()
+        graph_manager = getattr(recipe, "partial_cuda_graph_manager", None)
+        if graph_manager is not None:
+            graph_manager.close()
+            recipe.partial_cuda_graph_manager = None
 
 
 if __name__ == "__main__":

@@ -19,69 +19,50 @@ import pytest
 from torch import nn
 
 import nemo_automodel.components.cuda_graphs.partial as partial_graphs
-from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
+from nemo_automodel.recipes.llm.train_ft import (
+    TrainFinetuneRecipeForNextTokenPrediction,
+    _build_partial_cuda_graph_manager,
+)
 
 
 def _bare_recipe() -> TrainFinetuneRecipeForNextTokenPrediction:
     return TrainFinetuneRecipeForNextTokenPrediction.__new__(TrainFinetuneRecipeForNextTokenPrediction)
 
 
-def test_setup_forwards_runtime_safety_context(monkeypatch):
-    recipe = _bare_recipe()
-    model_parts = [nn.Linear(2, 2)]
+def test_builder_forwards_runtime_safety_context(monkeypatch):
+    model = nn.Linear(2, 2)
+    model.backend = SimpleNamespace(cuda_graph_modules=["te_dpa"])
+    model_parts = [model]
     manager = SimpleNamespace(capture=MagicMock())
-    recipe.model_parts = model_parts
-    recipe.activation_checkpointing = True
-    recipe.pp_enabled = False
     discover = MagicMock(return_value=manager)
     monkeypatch.setattr(partial_graphs.PartialCudaGraphManager, "from_model_parts", discover)
 
-    recipe._setup_partial_cuda_graphs()
+    result = _build_partial_cuda_graph_manager(
+        model_parts,
+        activation_checkpointing=True,
+        pipeline_parallel=False,
+    )
 
     discover.assert_called_once_with(
         model_parts,
         activation_checkpointing=True,
         pipeline_parallel=False,
     )
-    assert recipe.partial_cuda_graph_manager is manager
-    assert recipe._partial_cuda_graph_capture_pending is True
+    assert result is manager
 
 
-def test_setup_is_inert_when_no_scope_is_enabled(monkeypatch):
-    recipe = _bare_recipe()
-    recipe.model_parts = [nn.Linear(2, 2)]
-    recipe.activation_checkpointing = False
-    recipe.pp_enabled = False
-    monkeypatch.setattr(partial_graphs.PartialCudaGraphManager, "from_model_parts", MagicMock(return_value=None))
+def test_builder_does_not_use_manager_when_no_scope_is_enabled(monkeypatch):
+    discover = MagicMock()
+    monkeypatch.setattr(partial_graphs.PartialCudaGraphManager, "from_model_parts", discover)
 
-    recipe._setup_partial_cuda_graphs()
+    result = _build_partial_cuda_graph_manager(
+        [nn.Linear(2, 2)],
+        activation_checkpointing=False,
+        pipeline_parallel=False,
+    )
 
-    assert recipe.partial_cuda_graph_manager is None
-    assert recipe._partial_cuda_graph_capture_pending is False
-
-
-def test_capture_runs_once_and_changes_no_optimizer_contract():
-    manager = SimpleNamespace(capture=MagicMock())
-    recipe = _bare_recipe()
-    recipe.partial_cuda_graph_manager = manager
-    recipe._partial_cuda_graph_capture_pending = True
-
-    recipe._capture_partial_cuda_graphs_after_eager_step()
-    recipe._capture_partial_cuda_graphs_after_eager_step()
-
-    manager.capture.assert_called_once_with()
-    assert recipe._partial_cuda_graph_capture_pending is False
-
-
-def test_failed_capture_remains_pending_for_fail_closed_shutdown():
-    recipe = _bare_recipe()
-    recipe.partial_cuda_graph_manager = SimpleNamespace(capture=MagicMock(side_effect=RuntimeError("capture failed")))
-    recipe._partial_cuda_graph_capture_pending = True
-
-    with pytest.raises(RuntimeError, match="capture failed"):
-        recipe._capture_partial_cuda_graphs_after_eager_step()
-
-    assert recipe._partial_cuda_graph_capture_pending is True
+    assert result is None
+    discover.assert_not_called()
 
 
 def test_training_loop_captures_after_first_complete_step_and_closes():

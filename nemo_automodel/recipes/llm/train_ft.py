@@ -399,6 +399,34 @@ def _build_pp_collate_wrapper(cfg_model, pp_enabled: bool):
     return wrapper
 
 
+def _build_partial_cuda_graph_manager(
+    model_parts: list[nn.Module],
+    *,
+    activation_checkpointing: bool,
+    pipeline_parallel: bool,
+) -> PartialCudaGraphManager | None:
+    """Build partial CUDA-graph state only for explicitly enabled model backends.
+
+    Args:
+        model_parts: Fully initialized model roots or pipeline-local model parts.
+        activation_checkpointing: Whether PyTorch activation checkpointing is enabled.
+        pipeline_parallel: Whether pipeline parallelism is enabled.
+
+    Returns:
+        An armed manager when any backend selects CUDA-graph scopes, otherwise ``None``.
+    """
+    enabled = any(
+        bool(getattr(getattr(model_part, "backend", None), "cuda_graph_modules", ())) for model_part in model_parts
+    )
+    if not enabled:
+        return None
+    return PartialCudaGraphManager.from_model_parts(
+        model_parts,
+        activation_checkpointing=activation_checkpointing,
+        pipeline_parallel=pipeline_parallel,
+    )
+
+
 # ---------------------------------------------------------------------------
 #  Trainer class – orchestration only
 # ---------------------------------------------------------------------------
@@ -771,43 +799,19 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # Optionally resume
         self.load_checkpoint(restore_from)
 
-        # Install lightweight call recorders only after model/optimizer state is
-        # final. The manager owns all feature eligibility checks (including PP
-        # and activation-checkpointing restrictions).
-        self._setup_partial_cuda_graphs()
-        torch.cuda.empty_cache()
-
-        # Log step scheduler details
-        self._log_step_scheduler_details(self.step_scheduler)
-
-    def _setup_partial_cuda_graphs(self) -> None:
-        """Discover opt-in graph targets and arm first-step eager recording."""
-        self.partial_cuda_graph_manager = PartialCudaGraphManager.from_model_parts(
+        # Match TorchTitan's pass gate: only construct CUDA-graph state when
+        # the model backend explicitly enables at least one graph scope.
+        self.partial_cuda_graph_manager = _build_partial_cuda_graph_manager(
             self.model_parts,
             activation_checkpointing=bool(self.activation_checkpointing),
             pipeline_parallel=bool(self.pp_enabled),
         )
-        self._partial_cuda_graph_capture_pending = self.partial_cuda_graph_manager is not None
+        if self.partial_cuda_graph_manager is not None:
+            self._partial_cuda_graph_capture_pending = True
+        torch.cuda.empty_cache()
 
-    def _capture_partial_cuda_graphs_after_eager_step(self) -> None:
-        """Capture once, after a complete eager forward/backward/optimizer step."""
-        # Some recipe subclasses and focused tests construct an instance via
-        # ``__new__``. Missing state is equivalent to the opt-in being disabled.
-        if not getattr(self, "_partial_cuda_graph_capture_pending", False):
-            return
-        assert self.partial_cuda_graph_manager is not None
-        self.partial_cuda_graph_manager.capture()
-        self._partial_cuda_graph_capture_pending = False
-
-    def _close_partial_cuda_graphs(self) -> None:
-        """Destroy partial graphs before model or distributed state is torn down."""
-        manager = getattr(self, "partial_cuda_graph_manager", None)
-        if manager is None:
-            self._partial_cuda_graph_capture_pending = False
-            return
-        manager.close()
-        self.partial_cuda_graph_manager = None
-        self._partial_cuda_graph_capture_pending = False
+        # Log step scheduler details
+        self._log_step_scheduler_details(self.step_scheduler)
 
     def _collect_moe_load_balance(self):
         """Collect MoE load balance metrics with DP all-reduce.
@@ -943,7 +947,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     # Capture outside the microbatch loop and only after the
                     # eager optimizer step has completed. This leaves no
                     # pending checkpoint recomputation or GA backward work.
-                    self._capture_partial_cuda_graphs_after_eager_step()
+                    graph_manager = getattr(self, "partial_cuda_graph_manager", None)
+                    if graph_manager is not None and getattr(self, "_partial_cuda_graph_capture_pending", False):
+                        graph_manager.capture()
+                        self._partial_cuda_graph_capture_pending = False
                     # Collect MoE load balance metrics (all ranks participate in all-reduce)
                     self._collect_moe_load_balance()
                     # log
@@ -972,7 +979,11 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     self._maybe_collect_garbage()
         finally:
             try:
-                self._close_partial_cuda_graphs()
+                graph_manager = getattr(self, "partial_cuda_graph_manager", None)
+                if graph_manager is not None:
+                    graph_manager.close()
+                    self.partial_cuda_graph_manager = None
+                self._partial_cuda_graph_capture_pending = False
             finally:
                 if pbar is not None:
                     pbar.close()
@@ -1553,7 +1564,10 @@ def main(config_path=None):
         trainer.setup()
         trainer.run_train_validation_loop()
     finally:
-        trainer._close_partial_cuda_graphs()
+        graph_manager = getattr(trainer, "partial_cuda_graph_manager", None)
+        if graph_manager is not None:
+            graph_manager.close()
+            trainer.partial_cuda_graph_manager = None
 
 
 if __name__ == "__main__":
