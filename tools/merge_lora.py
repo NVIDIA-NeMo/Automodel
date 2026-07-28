@@ -211,7 +211,7 @@ def merge_lora(
             the class is inferred from the adapter's ``task_type``.
     """
     from peft import PeftModel
-    from transformers import AutoTokenizer
+    from transformers import AutoProcessor, AutoTokenizer
 
     auto_cls = _resolve_auto_cls(adapter_path, model_class)
     torch_dtype = getattr(torch, dtype)
@@ -259,6 +259,13 @@ def merge_lora(
 
     if qlora:
         _clean_quantization_config(output_dir)
+
+    try:
+        processor = AutoProcessor.from_pretrained(base_model, trust_remote_code=trust_remote_code)
+        processor.save_pretrained(output_dir)
+        logger.info("Processor saved to %s", output_dir)
+    except Exception as e:
+        logger.info("No processor saved; continuing with tokenizer-only output: %s", e)
 
     if save_tokenizer:
         try:
