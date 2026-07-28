@@ -127,5 +127,12 @@ ci:
   env_vars:
     # Record every collective per rank and dump the buffer when the watchdog
     # trips, so a hang names the stuck collective instead of dying silently.
+    # TORCH_NCCL_TRACE_BUFFER_SIZE is deprecated in torch 2.13 and is ignored
+    # (the flight recorder stays disabled); TORCH_FR_BUFFER_SIZE replaces it.
+    # Both are set so this works on either side of the rename.
+    TORCH_FR_BUFFER_SIZE: "2000"
     TORCH_NCCL_TRACE_BUFFER_SIZE: "2000"
     TORCH_NCCL_DUMP_ON_TIMEOUT: "1"
+    # Print the Python stack of every rank when the watchdog trips, which is
+    # what identifies the call site that let some ranks run ahead.
+    TORCH_NCCL_DESYNC_DEBUG: "1"
