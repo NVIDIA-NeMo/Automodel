@@ -92,6 +92,10 @@ jobs:
            --enable=bad-builtin \
            --bad-functions=getattr,setattr,hasattr \
            nemo_automodel/components/models/
+      - name: Reject unsafe PyTorch loads
+        run: |
+          source ./venv/bin/activate
+          uv run --active bandit -r app.py nemo_automodel examples scripts tools tutorials -t B614
 
   import_linting:
     runs-on: ${{ vars.LINT_AND_INSTALL_TEST_RUNNER || 'ubuntu-latest' }}
