@@ -603,10 +603,15 @@ def _init_single_process_group():
 
 @pytest.fixture(scope="module")
 def trivial_pg():
+    process_group_already_initialized = torch.distributed.is_initialized()
     pg = _init_single_process_group()
     if pg is None:
         pytest.skip("torch.distributed not available")
-    return pg
+    try:
+        yield pg
+    finally:
+        if not process_group_already_initialized and torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
 
 
 class TestIDLMLossDTensor:
