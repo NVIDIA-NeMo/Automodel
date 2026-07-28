@@ -41,6 +41,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+from nemo_automodel.components.checkpoint.utils import is_checkpoint_incomplete
 from nemo_automodel.recipes.llm.train_eagle1 import TrainEagle1Recipe
 from nemo_automodel.recipes.llm.train_eagle3 import TrainEagle3Recipe
 
@@ -448,7 +449,7 @@ def test_eagle_async_checkpoint_retention_prunes_completed_window(tmp_path, reci
 
 
 # ---------------------------------------------------------------------------
-# save_checkpoint: FileExistsError when checkpoint dir already exists
+# save_checkpoint: leftover checkpoint dir from an interrupted save
 # ---------------------------------------------------------------------------
 
 
@@ -476,15 +477,23 @@ def test_eagle1_final_checkpoint_saved_before_close(tmp_path):
     assert events == [("final", 1), ("finalize", None), ("close", None)]
 
 
-def test_eagle1_save_checkpoint_raises_on_existing_dir(tmp_path):
-    """save_checkpoint raises FileExistsError if the target checkpoint dir already exists."""
+def test_eagle1_save_checkpoint_replaces_interrupted_dir(tmp_path):
+    """A leftover directory from an interrupted save is replaced instead of aborting the re-save.
+
+    A resumed run recomputes the interrupted step and targets the same directory
+    name, so failing here would stall the job at that step for every subsequent
+    resume window.
+    """
     recipe = _bare_eagle1_recipe(tmp_path)
     recipe.runtime.global_step = 5
-    ckpt_path = os.path.join(recipe.checkpoint_config.checkpoint_dir, "epoch_1_step_5")
-    os.makedirs(ckpt_path, exist_ok=True)
+    ckpt_path = Path(recipe.checkpoint_config.checkpoint_dir) / "epoch_1_step_5"
+    ckpt_path.mkdir(parents=True, exist_ok=True)
+    (ckpt_path / "stale.txt").write_text("left behind by the interrupted save")
 
-    with pytest.raises(FileExistsError):
-        recipe.save_checkpoint(epoch=1, step=5)
+    recipe.save_checkpoint(epoch=1, step=5)
+
+    assert not (ckpt_path / "stale.txt").exists()
+    assert not is_checkpoint_incomplete(ckpt_path)
 
 
 # ---------------------------------------------------------------------------

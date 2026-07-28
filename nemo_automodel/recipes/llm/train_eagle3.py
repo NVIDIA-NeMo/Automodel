@@ -1407,10 +1407,9 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         best_metric_name = next(iter(val_loss.keys())) if val_loss and len(val_loss) == 1 else best_metric_key
         best_val_metric = val_loss.get(best_metric_name) if val_loss else None
 
+        self._reserve_checkpoint_dir(path)
+
         if is_rank_0:
-            if os.path.exists(path):
-                raise FileExistsError(f"Checkpoint directory {path} already exists")
-            os.makedirs(path, exist_ok=True)
             loss_dict: dict[str, float] = {}
             if train_loss is not None:
                 loss_dict["train_loss"] = float(train_loss)
@@ -1463,7 +1462,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             )
         else:
             if is_rank_0:
-                self._update_latest_symlink(path)
+                self._publish_checkpoint(path)
                 if best_val_metric is not None:
                     self._update_best_symlink(path, float(best_val_metric), best_metric_name)
                 self._prune_old_checkpoints()

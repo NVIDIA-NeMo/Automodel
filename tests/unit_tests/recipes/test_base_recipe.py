@@ -20,7 +20,12 @@ import pytest
 import torch
 import torch.nn as nn
 
-from nemo_automodel.components.checkpoint.utils import find_latest_checkpoint, read_checkpoint_pointer
+from nemo_automodel.components.checkpoint.utils import (
+    find_latest_checkpoint,
+    is_checkpoint_incomplete,
+    mark_checkpoint_incomplete,
+    read_checkpoint_pointer,
+)
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.recipes.base_recipe import BaseRecipe, is_distributed_stateful
@@ -183,6 +188,28 @@ def _checkpoint_dir_names(path):
     """Return AutoModel checkpoint directory names under path sorted by step."""
     names = [p.name for p in path.glob("epoch_*_step_*") if p.is_dir()]
     return sorted(names, key=lambda name: int(name.rsplit("_", maxsplit=1)[1]))
+
+
+def _simulate_interrupted_save(checkpoint_dir, step, epoch=0):
+    """Create the on-disk remains of a save that died before publishing.
+
+    Mirrors what a wall-clock kill leaves behind mid-save: the step directory
+    exists and carries the in-progress marker, the model shard is half written,
+    and ``optim/`` was never reached.
+
+    Args:
+        checkpoint_dir: Checkpoint root the recipe writes into.
+        step: Step of the interrupted save.
+        epoch: Epoch of the interrupted save.
+
+    Returns:
+        Path of the leftover checkpoint directory.
+    """
+    leftover = checkpoint_dir / f"epoch_{epoch}_step_{step}"
+    (leftover / "model").mkdir(parents=True)
+    (leftover / "model" / "model.pt").write_bytes(b"truncated")
+    mark_checkpoint_incomplete(leftover)
+    return leftover
 
 
 class _ToyRecipe(BaseRecipe):
@@ -780,6 +807,147 @@ def test_step_scheduler_log_includes_checkpoint_retention_policy(tmp_path, caplo
 
     assert "inactive because checkpointing is disabled" in caplog.text
     assert "keeping the most recent" not in caplog.text
+
+
+def test_save_checkpoint_replaces_interrupted_checkpoint_dir(tmp_path):
+    """Re-saving a step whose previous save was interrupted replaces the leftover directory.
+
+    Checkpoint directory names are derived from the step, so a resumed run
+    recomputes the interrupted step and lands on the same path. Treating that as
+    fatal aborted rank 0 while the other ranks blocked in the next collective,
+    and every later resume window repeated the same collision.
+    """
+    recipe_inst = _ToyRecipe(tmp_path)
+    leftover = _simulate_interrupted_save(tmp_path, step=100)
+
+    x = torch.randn(4, 2)
+    loss = recipe_inst.model(x).sum()
+    loss.backward()
+    recipe_inst.optimizer.step()
+    weight_at_step_100 = recipe_inst.model.weight.clone()
+    recipe_inst.save_checkpoint(epoch=0, step=100, train_loss=float(loss.item()))
+
+    assert not is_checkpoint_incomplete(leftover)
+    assert (leftover / "optim").is_dir()
+    assert (leftover / "model" / "model.pt").read_bytes() != b"truncated"
+
+    recipe_inst.model.weight.data.add_(42.0)
+    recipe_inst.load_checkpoint(restore_from="LATEST")
+    assert torch.allclose(recipe_inst.model.weight, weight_at_step_100)
+
+
+def test_save_checkpoint_cleanup_failure_is_reported_before_rank_0_raises(tmp_path, monkeypatch):
+    """Rank 0 publishes an unremovable leftover through the reduction before it raises.
+
+    Raising ahead of that collective is what left the remaining ranks blocked
+    until the cluster reaped the job.
+    """
+    recipe_inst = _ToyRecipe(tmp_path)
+    _simulate_interrupted_save(tmp_path, step=100)
+    events = []
+
+    def fail_rmtree(path):
+        events.append("rmtree")
+        raise OSError("device or resource busy")
+
+    def record_all_reduce(tensor, op=None, group=None):
+        events.append(("all_reduce", int(tensor.item())))
+
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True, raising=False)
+    monkeypatch.setattr(torch.distributed, "all_reduce", record_all_reduce, raising=False)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False, raising=False)
+    monkeypatch.setattr("nemo_automodel.recipes.base_recipe.shutil.rmtree", fail_rmtree)
+
+    with pytest.raises(RuntimeError, match="could not be removed") as excinfo:
+        recipe_inst.save_checkpoint(epoch=0, step=100, train_loss=1.0)
+
+    assert events == ["rmtree", ("all_reduce", 1)]
+    assert isinstance(excinfo.value.__cause__, OSError)
+
+
+def test_save_checkpoint_cleanup_failure_aborts_non_zero_ranks(tmp_path, monkeypatch):
+    """A rank that did not perform the cleanup still aborts when rank 0's cleanup failed."""
+    recipe_inst = _ToyRecipe(tmp_path)
+
+    def rank_0_reported_failure(tensor, op=None, group=None):
+        tensor.fill_(1)
+
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True, raising=False)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 1, raising=False)
+    monkeypatch.setattr(torch.distributed, "all_reduce", rank_0_reported_failure, raising=False)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False, raising=False)
+
+    with pytest.raises(RuntimeError, match="could not be removed"):
+        recipe_inst.save_checkpoint(epoch=0, step=100, train_loss=1.0)
+
+    assert not (tmp_path / "epoch_0_step_100").exists()
+
+
+def test_checkpoint_dir_is_marked_incomplete_while_the_save_is_in_flight(tmp_path, monkeypatch):
+    """The in-progress marker covers the whole save window so an interruption stays detectable."""
+    recipe_inst = _ToyRecipe(tmp_path)
+    observed_during_save = []
+    original_save_optimizer = recipe_inst.checkpointer.save_optimizer
+
+    def record_then_save(optimizer, model, weights_path, scheduler=None):
+        observed_during_save.append(is_checkpoint_incomplete(weights_path))
+        return original_save_optimizer(optimizer, model, weights_path, scheduler)
+
+    monkeypatch.setattr(recipe_inst.checkpointer, "save_optimizer", record_then_save)
+    recipe_inst.save_checkpoint(epoch=0, step=100, train_loss=1.0)
+
+    assert observed_during_save == [True]
+    assert not is_checkpoint_incomplete(tmp_path / "epoch_0_step_100")
+
+
+def test_async_checkpoint_stays_incomplete_until_it_is_published(tmp_path):
+    """An async save is only resumable once the deferred publication runs.
+
+    ``LATEST`` for an async save is advanced on the following call, so a job
+    killed in between leaves a directory that resume must skip.
+    """
+    recipe_inst = _ToyRecipe(tmp_path)
+    config = recipe_inst.checkpointer.config
+    if not hasattr(config, "is_async"):
+        raise ValueError("CheckpointingConfig has no field 'is_async'")
+    config.is_async = True
+
+    recipe_inst.save_checkpoint(epoch=0, step=100, train_loss=1.0)
+
+    checkpoint = tmp_path / "epoch_0_step_100"
+    assert is_checkpoint_incomplete(checkpoint)
+    assert find_latest_checkpoint(tmp_path) is None
+
+    recipe_inst._complete_pending_checkpoint()
+
+    assert not is_checkpoint_incomplete(checkpoint)
+    assert os.path.basename(str(find_latest_checkpoint(tmp_path))) == "epoch_0_step_100"
+
+
+def test_find_latest_checkpoint_skips_interrupted_checkpoint(tmp_path):
+    """Without a LATEST pointer the step scan must not resume from an interrupted save."""
+    (tmp_path / "epoch_0_step_100").mkdir()
+    _simulate_interrupted_save(tmp_path, step=200)
+
+    latest = find_latest_checkpoint(tmp_path)
+
+    assert latest is not None
+    assert latest.name == "epoch_0_step_100"
+
+
+def test_checkpoint_retention_evicts_interrupted_checkpoint_dir(tmp_path):
+    """An interrupted checkpoint never occupies a retention slot and is not left behind."""
+    recipe_inst = _ToyRecipe(tmp_path, max_recent_checkpoints=2)
+    _simulate_interrupted_save(tmp_path, step=400)
+
+    for step in [100, 200, 300]:
+        x = torch.randn(4, 2)
+        loss = recipe_inst.model(x).sum()
+        loss.backward()
+        recipe_inst.optimizer.step()
+        recipe_inst.save_checkpoint(epoch=0, step=step, train_loss=float(loss.item()))
+
+    assert _checkpoint_dir_names(tmp_path) == ["epoch_0_step_200", "epoch_0_step_300"]
 
 
 def test_checkpoint_retention_max_recent_one_preserves_latest_resume(tmp_path):

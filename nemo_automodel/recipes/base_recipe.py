@@ -45,10 +45,13 @@ except ImportError:
 
 from nemo_automodel.components.checkpoint.checkpointing import save_config
 from nemo_automodel.components.checkpoint.utils import (
+    clear_checkpoint_incomplete,
     find_latest_checkpoint,
     find_pointer_protected_checkpoints,
     format_missing_checkpoint_dir_error,
+    is_checkpoint_incomplete,
     list_automodel_checkpoints,
+    mark_checkpoint_incomplete,
     read_checkpoint_metric,
     read_checkpoint_pointer,
     resolve_restore_from_to_checkpoint_dir,
@@ -230,6 +233,72 @@ class BaseRecipe:
         for key in keys:
             tracked.discard(key)
 
+    def _reserve_checkpoint_dir(self, path: str) -> None:
+        """Clear any leftover checkpoint directory and reserve ``path`` for this save.
+
+        Checkpoint directory names are derived from the step, so a run that
+        resumes after an interrupted save recomputes the same step and targets a
+        directory that already exists on disk. Removing the leftover keeps the
+        re-save idempotent instead of aborting the job at the same step forever.
+
+        The removal runs on rank 0, and its outcome is reduced across ranks so a
+        failed cleanup raises everywhere rather than killing rank 0 and leaving
+        the remaining ranks blocked in the next collective.
+
+        Args:
+            path: Checkpoint directory for the current step.
+
+        Raises:
+            RuntimeError: If a pre-existing checkpoint directory could not be removed.
+        """
+        is_dist_initialized = torch.distributed.is_initialized()
+        is_rank_0 = not is_dist_initialized or torch.distributed.get_rank() == 0
+        cleanup_error: OSError | None = None
+
+        if is_rank_0 and os.path.exists(path):
+            if is_checkpoint_incomplete(path):
+                logger.warning("Removing checkpoint directory %s left behind by an interrupted save", path)
+            else:
+                logger.warning("Overwriting existing checkpoint directory %s", path)
+            try:
+                shutil.rmtree(path)
+            except OSError as exc:
+                # Recorded instead of raised here: rank 0 has to reach the reduction
+                # below so the failure aborts every rank instead of stranding them.
+                cleanup_error = exc
+
+        cleanup_failed = torch.tensor([int(cleanup_error is not None)], dtype=torch.int32)
+        if is_dist_initialized:
+            if torch.cuda.is_available():
+                cleanup_failed = cleanup_failed.cuda()
+            torch.distributed.all_reduce(
+                cleanup_failed,
+                op=torch.distributed.ReduceOp.MAX,
+                group=getattr(getattr(self, "mesh_context", None), "process_group", None),
+            )
+        if bool(cleanup_failed.item()):
+            raise RuntimeError(
+                f"Checkpoint directory {path} already exists and could not be removed. "
+                "Remove it manually or point checkpoint.checkpoint_dir at a fresh directory."
+            ) from cleanup_error
+
+        if is_rank_0:
+            os.makedirs(path, exist_ok=True)
+            mark_checkpoint_incomplete(path)
+
+    def _publish_checkpoint(self, path: str) -> None:
+        """Mark a fully written checkpoint as complete and advance the LATEST pointer.
+
+        This is the point at which a checkpoint becomes eligible for resume, so
+        the in-progress marker is cleared here and nowhere else.
+        Only called on rank 0.
+
+        Args:
+            path: Checkpoint directory whose components have all been written.
+        """
+        clear_checkpoint_incomplete(path)
+        self._update_latest_symlink(path)
+
     def save_checkpoint(
         self,
         epoch: int,
@@ -273,10 +342,9 @@ class BaseRecipe:
         best_metric_name = next(iter(val_loss.keys())) if val_loss and len(val_loss) == 1 else best_metric_key
         best_val_metric = val_loss[best_metric_name] if val_loss else None
 
+        self._reserve_checkpoint_dir(path)
+
         if is_rank_0:
-            if os.path.exists(path):
-                raise FileExistsError(f"Checkpoint directory {path} already exists")
-            os.makedirs(path, exist_ok=True)
             logger.info("Saving checkpoint to %s", path)
 
             def to_item(x):
@@ -404,7 +472,7 @@ class BaseRecipe:
         else:
             # Sync: update immediately
             if is_rank_0:
-                self._update_latest_symlink(path)
+                self._publish_checkpoint(path)
                 if best_val_metric is not None:
                     self._update_best_symlink(path, float(best_val_metric), best_metric_name)
                 self._prune_old_checkpoints()
@@ -436,7 +504,7 @@ class BaseRecipe:
         process_group = getattr(getattr(self, "mesh_context", None), "process_group", None)
         if prev_pending is not None:
             if is_rank_0:
-                self._update_latest_symlink(prev_pending)
+                self._publish_checkpoint(prev_pending)
             setattr(self, "_last_pending_checkpoint_dir", None)
             if is_dist_initialized:
                 _dist_barrier(process_group)
@@ -548,7 +616,10 @@ class BaseRecipe:
         except (OSError, UnicodeError):
             logger.warning("Failed to scan checkpoint pointers in %s; skipping pruning", ckpt_root, exc_info=True)
             return
-        retained_window = set(checkpoints[-max_recent_checkpoints:])
+        # Directories left behind by an interrupted save are never resumable, so they
+        # must not consume a retention slot and must not survive as orphans either.
+        complete_checkpoints = [checkpoint for checkpoint in checkpoints if not is_checkpoint_incomplete(checkpoint)]
+        retained_window = set(complete_checkpoints[-max_recent_checkpoints:])
         checkpoints_to_delete = [
             checkpoint for checkpoint in checkpoints if checkpoint not in retained_window | protected_checkpoints
         ]

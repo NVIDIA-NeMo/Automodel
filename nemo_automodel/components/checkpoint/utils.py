@@ -41,6 +41,7 @@ from nemo_automodel.shared.tied_weights import (
 logger = logging.getLogger(__name__)
 _AUTOMODEL_CHECKPOINT_RE = re.compile(r"^epoch_\d+_step_(\d+)$")
 _CHECKPOINT_STEP_RE = re.compile(r"step_(\d+)$")
+_INCOMPLETE_CHECKPOINT_MARKER = ".incomplete"
 
 
 def get_rank_safe() -> int:
@@ -122,6 +123,42 @@ def _list_existing_checkpoints(ckpt_root: Path) -> list[Path]:
 def list_automodel_checkpoints(ckpt_root: Path) -> list[Path]:
     """Return canonical AutoModel ``epoch_<E>_step_<S>`` checkpoint directories."""
     return [path for path in _list_existing_checkpoints(ckpt_root) if _AUTOMODEL_CHECKPOINT_RE.fullmatch(path.name)]
+
+
+def mark_checkpoint_incomplete(checkpoint_dir: str | Path) -> None:
+    """Mark a checkpoint directory as still being written.
+
+    A save that is interrupted (wall-clock limit, preemption, OOM) leaves the
+    directory behind with only some of its components written. The marker makes
+    that state observable so a resumed run neither loads nor retains it; it is
+    removed by :func:`clear_checkpoint_incomplete` once the checkpoint is
+    published.
+
+    Args:
+        checkpoint_dir: Directory of the checkpoint being written.
+    """
+    (Path(checkpoint_dir) / _INCOMPLETE_CHECKPOINT_MARKER).touch(exist_ok=True)
+
+
+def clear_checkpoint_incomplete(checkpoint_dir: str | Path) -> None:
+    """Clear the marker written by :func:`mark_checkpoint_incomplete`.
+
+    Args:
+        checkpoint_dir: Directory of the checkpoint that finished writing.
+    """
+    (Path(checkpoint_dir) / _INCOMPLETE_CHECKPOINT_MARKER).unlink(missing_ok=True)
+
+
+def is_checkpoint_incomplete(checkpoint_dir: str | Path) -> bool:
+    """Return whether a checkpoint directory was left behind by an interrupted save.
+
+    Args:
+        checkpoint_dir: Directory to inspect.
+
+    Returns:
+        True when the in-progress marker is still present.
+    """
+    return (Path(checkpoint_dir) / _INCOMPLETE_CHECKPOINT_MARKER).exists()
 
 
 def _resolve_checkpoint_pointer_target(ckpt_root: Path, raw_target: str) -> Path | None:
@@ -280,6 +317,10 @@ def find_latest_checkpoint(checkpoint_dir: str | Path) -> str | Path | None:
       1) Valid LATEST symlink or txt file under checkpoint_dir
       2) Highest step directory under checkpoint_dir whose name ends in ``step_<N>``
 
+    Directories left behind by an interrupted save are skipped by the step-scan
+    fallback; without that, a run whose first save was interrupted (so no LATEST
+    pointer exists yet) would resume from a partially written checkpoint.
+
     Returns:
         Path (or str) of the latest checkpoint directory, or None.
     """
@@ -291,7 +332,7 @@ def find_latest_checkpoint(checkpoint_dir: str | Path) -> str | Path | None:
     if latest is not None and latest.is_dir():
         return os.fspath(latest)
 
-    checkpoint_files = _list_existing_checkpoints(root)
+    checkpoint_files = [path for path in _list_existing_checkpoints(root) if not is_checkpoint_incomplete(path)]
     if not checkpoint_files:
         return
 

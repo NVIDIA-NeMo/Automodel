@@ -58,6 +58,26 @@ NeMo AutoModel automatically creates symbolic links in the checkpoint directory 
 
 These symbolic links eliminate the need to manually track checkpoint names or search through directories to find the best model. When validation is enabled in your training run, both links are automatically maintained and updated as training progresses.
 
+## Interrupted Saves
+
+A save can be cut short by a wall-clock limit, a preemption, or an out-of-memory error, which leaves a partially written `epoch_<E>_step_<S>` directory behind. NeMo AutoModel marks each checkpoint directory as in progress while it is being written and clears the mark only after every component is saved and the checkpoint is published. Directories left by an interrupted save therefore stay marked, which determines how they are treated:
+
+- **Resume skips them.** `LATEST` is advanced only at publication, and the step-order fallback used when no `LATEST` pointer exists ignores marked directories. Training resumes from the most recent complete checkpoint.
+- **The next save of that step replaces them.** Checkpoint directory names are derived from the step, so the resumed run targets the same directory when it reaches that step again. NeMo AutoModel removes the leftover directory, logs a warning, and writes the new checkpoint in its place.
+- **Retention does not preserve them.** When `max_recent_checkpoints` is set, a marked directory never occupies a slot in the recent window.
+
+<Warning>
+
+Replacement applies to any existing checkpoint directory, not only to marked ones. If you resume from an older checkpoint with `restore_from` and training runs past a step that already has a complete checkpoint, that checkpoint is removed and rewritten with the recomputed state. NeMo AutoModel logs a warning that distinguishes the two cases. Copy checkpoints you need to keep to a separate directory, or set a different `checkpoint.checkpoint_dir` for the new run.
+
+</Warning>
+
+<Note>
+
+Asynchronous saves are published on the following save call, so a job that stops in between leaves the last checkpoint marked as in progress even though its files are complete. Resume falls back to the previous published checkpoint in that case.
+
+</Note>
+
 ## Checkpoint Retention
 
 By default, NeMo AutoModel keeps all intermediate checkpoints. To limit disk usage when checkpoints are saved frequently, configure a bounded recent-checkpoint window:
