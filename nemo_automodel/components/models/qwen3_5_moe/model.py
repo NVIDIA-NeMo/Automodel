@@ -190,8 +190,11 @@ class Qwen3_5MoeBlock(Block):
             ]
             for linear in linear_list:
                 nn.init.trunc_normal_(linear.weight, mean=0.0, std=0.02)
-            # HF Qwen3_5MoeRMSNormGated has no reset_parameters.
-            self.linear_attn.norm.weight.data.fill_(1.0)
+            try:
+                self.linear_attn.norm.reset_parameters()
+            except AttributeError:
+                # HF Qwen3_5MoeRMSNormGated has no reset_parameters; manually reset weight to ones.
+                self.linear_attn.norm.weight.data.fill_(1.0)
         self.mlp.init_weights(buffer_device)
 
 
@@ -528,16 +531,30 @@ class Qwen3_5MoeTextModelBackend(nn.Module):
         super().__init__()
         self.backend = backend
         self.config = config
+        self._cp_enabled = False
+        self._cp_mesh = None
         if moe_config is not None and moe_overrides is not None:
             raise ValueError("Cannot pass both moe_config and moe_overrides; use one or the other.")
 
-        self.padding_idx = config.pad_token_id
+        try:
+            self.padding_idx = config.pad_token_id
+        except AttributeError:
+            self.padding_idx = None
         self.vocab_size = config.vocab_size
 
         # Resolve model dtype once; thread explicitly to every sub-module so
         # fp32 master weights work even when construction is not wrapped in
         # local_torch_dtype().
-        model_dtype = get_dtype(config.torch_dtype, torch.bfloat16)
+        try:
+            torch_dtype = config.torch_dtype
+        except AttributeError:
+            torch_dtype = None
+        model_dtype = get_dtype(torch_dtype, torch.bfloat16)
+
+        try:
+            router_aux_loss_coef = config.router_aux_loss_coef
+        except AttributeError:
+            router_aux_loss_coef = 0.001
 
         # --------------- MoE config ---------------
         # Qwen3.5-MoE has MoE on every layer, with a shared expert + sigmoid gate.
@@ -555,7 +572,7 @@ class Qwen3_5MoeTextModelBackend(nn.Module):
             gate_bias_update_factor=0.0,
             score_func="softmax",
             route_scale=1.0,
-            aux_loss_coeff=config.router_aux_loss_coef,
+            aux_loss_coeff=router_aux_loss_coef,
             norm_topk_prob=True,  # Qwen3.5-MoE always normalises topk weights
             expert_bias=False,
             router_bias=False,

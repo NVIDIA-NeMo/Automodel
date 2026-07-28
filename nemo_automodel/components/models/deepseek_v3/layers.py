@@ -47,7 +47,10 @@ class MLA(nn.Module):
         self.kv_lora_rank = config.kv_lora_rank
         self.qk_nope_head_dim = config.qk_nope_head_dim
         self.qk_rope_head_dim = config.qk_rope_head_dim
-        self.qk_head_dim = config.qk_head_dim
+        try:
+            self.qk_head_dim = config.qk_head_dim
+        except AttributeError:
+            self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         self.v_head_dim = config.v_head_dim
 
         self.backend = backend
@@ -57,7 +60,11 @@ class MLA(nn.Module):
         rms_norm_impl = backend.rms_norm
 
         hidden_size = config.hidden_size
-        dtype = get_dtype(config.torch_dtype, torch.bfloat16)
+        try:
+            torch_dtype = config.torch_dtype
+        except AttributeError:
+            torch_dtype = None
+        dtype = get_dtype(torch_dtype, torch.bfloat16)
 
         if self.q_lora_rank is None:
             self.q_proj = initialize_linear_module(
@@ -112,7 +119,13 @@ class MLA(nn.Module):
         )
         self.softmax_scale = self.qk_head_dim**-0.5
 
-        rope_parameters = config.rope_parameters
+        try:
+            rope_parameters = config.rope_parameters
+        except AttributeError:
+            try:
+                rope_parameters = config.rope_scaling
+            except AttributeError:
+                rope_parameters = None
         if rope_parameters and all(
             map(lambda x: x in rope_parameters, ["factor", "mscale", "original_max_position_embeddings"])
         ):

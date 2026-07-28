@@ -268,7 +268,10 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         backend: BackendConfig | None = None,
         **kwargs,
     ):
-        base_config = config.thinker_config
+        try:
+            base_config = config.thinker_config
+        except AttributeError:
+            base_config = config
         backend = backend or BackendConfig()
         reject_unsupported_tie_word_embeddings(type(self), config)
 
@@ -279,36 +282,60 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         # every nested sub-config that exposes a torch_dtype attribute (both
         # the top-level and the thinker sub-config) so the HF parent, our
         # text backend, and any HF vision / multimodal code agree.
-        top_dtype = config.torch_dtype
+        try:
+            top_dtype = config.torch_dtype
+        except AttributeError:
+            top_dtype = None
         if top_dtype is not None:
             for parent in (config, base_config):
                 for sub_cfg in vars(parent).values():
                     if sub_cfg is not parent and isinstance(sub_cfg, PretrainedConfig):
                         sub_cfg.torch_dtype = top_dtype
-            if base_config is not config and base_config.torch_dtype != top_dtype:
+            try:
+                base_torch_dtype = base_config.torch_dtype
+            except AttributeError:
+                base_torch_dtype = None
+            if base_config is not config and base_torch_dtype != top_dtype:
                 base_config.torch_dtype = top_dtype
 
         super().__init__(base_config)
 
         self.backend = backend
 
-        text_config = base_config.text_config
+        try:
+            text_config = base_config.text_config
+        except AttributeError:
+            text_config = base_config
         moe_overrides = kwargs.pop("moe_overrides", None)
         self.model = Qwen3OmniMoeThinkerTextModel(
             text_config, backend=self.backend, moe_config=moe_config, moe_overrides=moe_overrides
         )
-        model_dtype = get_dtype(text_config.torch_dtype, torch.bfloat16)
+        try:
+            text_torch_dtype = text_config.torch_dtype
+        except AttributeError:
+            text_torch_dtype = None
+        model_dtype = get_dtype(text_torch_dtype, torch.bfloat16)
         self.lm_head = initialize_linear_module(
             self.backend.linear, text_config.hidden_size, text_config.vocab_size, bias=False, dtype=model_dtype
         )
 
         self.vocab_size = text_config.vocab_size
-        self.pad_token_id = base_config.pad_token_id if base_config.pad_token_id is not None else -1
-        self.spatial_merge_size = base_config.vision_config.spatial_merge_size
+        try:
+            pad_token_id = base_config.pad_token_id
+        except AttributeError:
+            pad_token_id = None
+        self.pad_token_id = pad_token_id if pad_token_id is not None else -1
+        try:
+            self.spatial_merge_size = base_config.vision_config.spatial_merge_size
+        except AttributeError:
+            self.spatial_merge_size = 2
         self.rope_deltas = None
         self.num_experts = text_config.num_experts
         self.num_experts_per_tok = text_config.num_experts_per_tok
-        self.router_aux_loss_coef = text_config.router_aux_loss_coef
+        try:
+            self.router_aux_loss_coef = text_config.router_aux_loss_coef
+        except AttributeError:
+            self.router_aux_loss_coef = 0.0
 
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = Qwen3OmniMoeStateDictAdapter(

@@ -48,10 +48,20 @@ class HyMT2Attention(nn.Module):
 
         self.num_heads = config.num_attention_heads
         self.num_kv_heads = config.num_key_value_heads
-        self.head_dim = config.head_dim
-        self.qk_norm_enabled = bool(config.qk_norm)
+        try:
+            self.head_dim = config.head_dim
+        except AttributeError:
+            self.head_dim = config.hidden_size // self.num_heads
+        try:
+            qk_norm = config.qk_norm
+        except AttributeError:
+            qk_norm = True
+        self.qk_norm_enabled = bool(qk_norm)
 
-        attention_bias = config.attention_bias
+        try:
+            attention_bias = config.attention_bias
+        except AttributeError:
+            attention_bias = False
 
         self.q_proj = initialize_linear_module(
             backend.linear, config.hidden_size, self.num_heads * self.head_dim, attention_bias

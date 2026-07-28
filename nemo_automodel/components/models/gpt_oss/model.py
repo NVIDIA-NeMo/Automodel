@@ -108,7 +108,20 @@ class GptOssModel(nn.Module):
         # Resolve model dtype once; thread it explicitly to every sub-module
         # so fp32 master weights work even when construction is not wrapped
         # in local_torch_dtype().
-        model_dtype = get_dtype(config.torch_dtype, torch.bfloat16)
+        try:
+            torch_dtype = config.torch_dtype
+        except AttributeError:
+            torch_dtype = None
+        model_dtype = get_dtype(torch_dtype, torch.bfloat16)
+
+        try:
+            norm_topk_prob = config.norm_topk_prob
+        except AttributeError:
+            norm_topk_prob = False
+        try:
+            swiglu_limit = config.swiglu_limit
+        except AttributeError:
+            swiglu_limit = 7.0
 
         # GPT-OSS is MoE everywhere; set shared experts to 0 to disable shared path in our MoE wrapper.
         moe_defaults = dict(
@@ -125,12 +138,12 @@ class GptOssModel(nn.Module):
             score_func="softmax",
             route_scale=1.0,
             aux_loss_coeff=config.router_aux_loss_coef,
-            norm_topk_prob=config.norm_topk_prob,
+            norm_topk_prob=norm_topk_prob,
             expert_bias=True,
             router_bias=True,
             expert_activation="quick_geglu",
             activation_alpha=1.702,
-            activation_limit=config.swiglu_limit,
+            activation_limit=swiglu_limit,
             dtype=model_dtype,
         )
         if moe_overrides:
@@ -147,7 +160,10 @@ class GptOssModel(nn.Module):
 
         # Rotary embedding cached at model-level (inv_freq + concentration via YaRN/NTK-by-parts)
         self.max_seq_len = config.max_position_embeddings
-        self.head_dim = config.head_dim
+        try:
+            self.head_dim = config.head_dim
+        except AttributeError:
+            self.head_dim = config.hidden_size // config.num_attention_heads
         rope_theta, rope_scaling, _ = get_rope_config(config)
         self.rotary_emb = RotaryEmbedding(
             head_dim=self.head_dim,

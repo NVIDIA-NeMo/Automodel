@@ -145,7 +145,11 @@ class Step3p5MLP(nn.Module):
         self.intermediate_size = intermediate_size or config.intermediate_size
         self.swiglu_limit = swiglu_limit
 
-        dtype = get_dtype(config.torch_dtype, torch.bfloat16)
+        try:
+            torch_dtype = config.torch_dtype
+        except AttributeError:
+            torch_dtype = None
+        dtype = get_dtype(torch_dtype, torch.bfloat16)
         self.gate_proj = initialize_linear_module(
             backend.linear, self.hidden_size, self.intermediate_size, bias=False, dtype=dtype
         )
@@ -188,7 +192,10 @@ class Step3p5Attention(nn.Module):
         self.backend = backend
 
         # Determine attention configuration based on layer_types
-        layer_types = config.layer_types
+        try:
+            layer_types = config.layer_types
+        except AttributeError:
+            layer_types = []
         is_sliding = layer_types and layer_types[layer_idx] == "sliding_attention"
 
         if is_sliding:
@@ -200,12 +207,22 @@ class Step3p5Attention(nn.Module):
             self.num_kv_heads = config.num_attention_groups
             self.sliding_window = None
 
-        self.head_dim = config.head_dim
+        try:
+            self.head_dim = config.head_dim
+        except AttributeError:
+            self.head_dim = config.hidden_size // self.num_heads
         self.num_kv_groups = self.num_heads // self.num_kv_heads
 
         # Projections
-        attention_bias = config.attention_bias
-        dtype = get_dtype(config.torch_dtype, torch.bfloat16)
+        try:
+            attention_bias = config.attention_bias
+        except AttributeError:
+            attention_bias = False
+        try:
+            torch_dtype = config.torch_dtype
+        except AttributeError:
+            torch_dtype = None
+        dtype = get_dtype(torch_dtype, torch.bfloat16)
         self.q_proj = initialize_linear_module(
             backend.linear, config.hidden_size, self.num_heads * self.head_dim, attention_bias, dtype=dtype
         )

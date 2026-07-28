@@ -42,6 +42,20 @@ logger = logging.getLogger(__name__)
 _FLASH_ATTN_IMPLEMENTATIONS = ("flash_attention_2", "flash_attention_3", "flash_attention_4")
 
 
+def _attention_impl_from_config(config) -> str | None:
+    """Read Transformers' public or private attention implementation marker."""
+    if config is None:
+        return None
+    try:
+        attn_impl = config._attn_implementation
+    except AttributeError:
+        try:
+            return config._attn_implementation_internal
+        except AttributeError:
+            return None
+    return attn_impl
+
+
 def get_seqlens_in_batch(attention_mask: torch.Tensor) -> torch.Tensor:
     """Extract per-document sequence lengths from an indexed attention mask.
 
@@ -135,7 +149,7 @@ def _passthrough_create_causal_mask(
     through.  For other backends, pass through packed masks but delegate
     normal 2D masks to HF.
     """
-    if config is not None and config._attn_implementation in _FLASH_ATTN_IMPLEMENTATIONS:
+    if _attention_impl_from_config(config) in _FLASH_ATTN_IMPLEMENTATIONS:
         return attention_mask
 
     if attention_mask is not None:
@@ -162,11 +176,17 @@ def get_attn_implementation(cfg_model):
 
     Custom models store it in ``backend.attn``; HF models use ``attn_implementation``.
     """
+    if cfg_model is None:
+        return "sdpa"
     if isinstance(cfg_model, Mapping):
         return cfg_model.get("attn_implementation", "sdpa")
-    if cfg_model is not None:
+    try:
         return cfg_model.backend.attn
-    return "sdpa"
+    except AttributeError:
+        try:
+            return cfg_model.attn_implementation
+        except AttributeError:
+            return "sdpa"
 
 
 def _patch_preprocess_mask_arguments_for_packing() -> None:
@@ -255,7 +275,7 @@ def _patch_preprocess_mask_arguments_for_packing() -> None:
         """
         config = kwargs.get("config", args[0] if len(args) > 0 else None)
         attention_mask = kwargs.get("attention_mask", args[2] if len(args) > 2 else None)
-        attn_impl = config._attn_implementation or config._attn_implementation_internal
+        attn_impl = _attention_impl_from_config(config)
         if attn_impl in _FLASH_ATTN_IMPLEMENTATIONS and is_indexed_packed_mask(attention_mask):
             return (
                 preprocess_result_template[0],

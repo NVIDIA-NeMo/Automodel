@@ -49,6 +49,27 @@ from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
+def _text_config_or_self(config):
+    try:
+        return config.text_config
+    except AttributeError:
+        return config
+
+
+def _optional_text_config(config):
+    try:
+        return config.text_config
+    except AttributeError:
+        return None
+
+
+def _model_type(config) -> str | None:
+    try:
+        return config.model_type
+    except AttributeError:
+        return None
+
+
 def _get_llama_4_attn_scale(position_ids: torch.Tensor, beta: float, max_position_embeddings: int) -> torch.Tensor:
     """Position-dependent attention scaling for long-context extrapolation (Llama 4 / Mistral 4)."""
     scaling = 1 + beta * torch.log(1 + torch.floor(position_ids.float() / max_position_embeddings))
@@ -327,7 +348,7 @@ class Mistral4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         **kwargs,
     ):
         # Extract text_config if this is a multimodal wrapper config
-        text_config = config.text_config
+        text_config = _text_config_or_self(config)
         return cls(text_config, moe_config, backend, **kwargs)
 
     @classmethod
@@ -354,7 +375,7 @@ class Mistral4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         # before unwrapping to text_config below.
         reject_unsupported_tie_word_embeddings(type(self), config)
         # Extract text_config if this is a multimodal wrapper config
-        config = config.text_config
+        config = _text_config_or_self(config)
         self.config = config
         self.backend = backend or BackendConfig()
         moe_overrides = kwargs.pop("moe_overrides", None)
@@ -695,8 +716,8 @@ if _HF_MISTRAL3_AVAILABLE:
         @classmethod
         def supports_config(cls, config) -> bool:
             """Only handle configs whose text backbone is Mistral4 (MoE + MLA)."""
-            text_config = config.text_config
-            return text_config is not None and text_config.model_type == "mistral4"
+            text_config = _optional_text_config(config)
+            return text_config is not None and _model_type(text_config) == "mistral4"
 
         @classmethod
         def from_config(

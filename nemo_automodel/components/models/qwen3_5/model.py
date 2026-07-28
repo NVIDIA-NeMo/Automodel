@@ -405,7 +405,10 @@ class Qwen3_5DenseBlock(Block):
                 self.linear_attn.out_proj,
             ):
                 nn.init.trunc_normal_(linear.weight, mean=0.0, std=0.02)
-            self.linear_attn.norm.reset_parameters()
+            try:
+                self.linear_attn.norm.reset_parameters()
+            except AttributeError:
+                self.linear_attn.norm.weight.data.fill_(1.0)
         self.mlp.init_weights(buffer_device)
 
 

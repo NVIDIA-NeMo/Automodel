@@ -94,24 +94,40 @@ class Block(nn.Module):
         self.config = config
 
         # Handle need_fp32_gate config for MoE gate precision
-        if config.need_fp32_gate and backend.gate_precision is None:
+        try:
+            need_fp32_gate = config.need_fp32_gate
+        except AttributeError:
+            need_fp32_gate = False
+        if need_fp32_gate and backend.gate_precision is None:
             backend.gate_precision = torch.float32
 
         # Attention
         self.self_attn = Step3p5Attention(config, layer_idx, backend)
 
         # Determine attention type for this layer
-        layer_types = config.layer_types
+        try:
+            layer_types = config.layer_types
+        except AttributeError:
+            layer_types = []
         self.attention_type = layer_types[layer_idx] if layer_types else "full_attention"
 
         # Determine if this is an MoE layer
-        moe_layers_enum = config.moe_layers_enum
+        try:
+            moe_layers_enum = config.moe_layers_enum
+        except AttributeError:
+            moe_layers_enum = None
         moe_layers = parse_moe_layers_enum(moe_layers_enum, config.num_hidden_layers)
         self.is_moe_layer = layer_idx in moe_layers
 
         # Get swiglu limits for this layer
-        swiglu_limits_shared = config.swiglu_limits_shared
-        swiglu_limits = config.swiglu_limits
+        try:
+            swiglu_limits_shared = config.swiglu_limits_shared
+        except AttributeError:
+            swiglu_limits_shared = None
+        try:
+            swiglu_limits = config.swiglu_limits
+        except AttributeError:
+            swiglu_limits = None
 
         swiglu_limit_shared = None
         if swiglu_limits_shared and swiglu_limits_shared[layer_idx]:
@@ -153,7 +169,15 @@ class Block(nn.Module):
 
             # Shared expert with its own intermediate size and swiglu limit
             # HF uses share_expert_dims (plural), but we also support share_expert_dim for compatibility
-            share_expert_dim = config.share_expert_dims or config.share_expert_dim
+            try:
+                share_expert_dim = config.share_expert_dims
+            except AttributeError:
+                share_expert_dim = None
+            if share_expert_dim is None:
+                try:
+                    share_expert_dim = config.share_expert_dim
+                except AttributeError:
+                    share_expert_dim = config.intermediate_size
             self.share_expert = Step3p5MLP(
                 config,
                 backend,
@@ -247,32 +271,55 @@ class Step3p5Model(nn.Module):
         self.config.num_experts = config.moe_num_experts
 
         # Build MoE config from Step3p5 config
-        use_router_bias = config.use_moe_router_bias
-        router_activation = config.moe_router_activation
+        try:
+            use_router_bias = config.use_moe_router_bias
+        except AttributeError:
+            use_router_bias = False
+        try:
+            router_activation = config.moe_router_activation
+        except AttributeError:
+            router_activation = "softmax"
         if use_router_bias and router_activation == "sigmoid":
             score_func = "sigmoid_with_bias"
         else:
             score_func = "sigmoid" if router_activation == "sigmoid" else "softmax"
 
+        try:
+            moe_intermediate_size = config.moe_intermediate_size
+        except AttributeError:
+            moe_intermediate_size = config.intermediate_size
+        try:
+            moe_top_k = config.moe_top_k
+        except AttributeError:
+            moe_top_k = 2
+        try:
+            moe_router_scaling_factor = config.moe_router_scaling_factor
+        except AttributeError:
+            moe_router_scaling_factor = 1.0
+        try:
+            torch_dtype = config.torch_dtype
+        except AttributeError:
+            torch_dtype = "bfloat16"
+
         moe_defaults = dict(
             dim=config.hidden_size,
             inter_dim=config.intermediate_size,
-            moe_inter_dim=config.moe_intermediate_size,
+            moe_inter_dim=moe_intermediate_size,
             n_routed_experts=self.config.num_experts,
             n_shared_experts=0,  # Step3p5 handles shared experts separately
-            n_activated_experts=config.moe_top_k,
+            n_activated_experts=moe_top_k,
             n_expert_groups=0,
             n_limited_groups=0,
             train_gate=True,
             gate_bias_update_factor=0.0,
             score_func=score_func,
-            route_scale=config.moe_router_scaling_factor,
+            route_scale=moe_router_scaling_factor,
             aux_loss_coeff=0.0,
             norm_topk_prob=True,
             router_bias=False,
             expert_bias=False,
             expert_activation="swiglu",
-            dtype=get_dtype(config.torch_dtype, torch.bfloat16),
+            dtype=get_dtype(torch_dtype, torch.bfloat16),
             force_e_score_correction_bias=use_router_bias,
         )
         if moe_overrides:
@@ -283,7 +330,7 @@ class Step3p5Model(nn.Module):
         self.embed_tokens = nn.Embedding(
             config.vocab_size,
             config.hidden_size,
-            dtype=get_dtype(config.torch_dtype, torch.bfloat16),
+            dtype=get_dtype(torch_dtype, torch.bfloat16),
         )
 
         # Transformer blocks
@@ -301,10 +348,16 @@ class Step3p5Model(nn.Module):
             rope_theta = rope_theta[0]
 
         self.max_seq_len = config.max_position_embeddings
-        self.head_dim = config.head_dim
+        try:
+            self.head_dim = config.head_dim
+        except AttributeError:
+            self.head_dim = config.hidden_size // config.num_attention_heads
 
         # Get partial_rotary_factor for the first layer (used for RotaryEmbedding initialization)
-        partial_rotary_factors = config.partial_rotary_factors
+        try:
+            partial_rotary_factors = config.partial_rotary_factors
+        except AttributeError:
+            partial_rotary_factors = None
         partial_rotary_factor = partial_rotary_factors[0] if partial_rotary_factors else 1.0
 
         _, rope_scaling, _ = get_rope_config(config)
@@ -321,7 +374,10 @@ class Step3p5Model(nn.Module):
         )
 
         # Check if model has sliding window attention
-        layer_types = config.layer_types
+        try:
+            layer_types = config.layer_types
+        except AttributeError:
+            layer_types = []
         self.has_sliding_layers = "sliding_attention" in layer_types
 
     def _apply(self, fn):
@@ -460,7 +516,11 @@ class Step3p5ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         self.backend = backend or BackendConfig()
         moe_overrides = kwargs.pop("moe_overrides", None)
         self.model = Step3p5Model(config, backend=self.backend, moe_config=moe_config, moe_overrides=moe_overrides)
-        model_dtype = get_dtype(config.torch_dtype, torch.bfloat16)
+        try:
+            torch_dtype = config.torch_dtype
+        except AttributeError:
+            torch_dtype = None
+        model_dtype = get_dtype(torch_dtype, torch.bfloat16)
         self.lm_head = initialize_linear_module(
             self.backend.linear, config.hidden_size, config.vocab_size, bias=False, dtype=model_dtype
         )
@@ -518,9 +578,11 @@ class Step3p5ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             :class:`~transformers.modeling_outputs.CausalLMOutputWithPast` with ``logits`` and,
             when ``output_hidden_states`` is set, the final ``hidden_states``.
         """
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        )
+        if output_hidden_states is None:
+            try:
+                output_hidden_states = self.config.output_hidden_states
+            except AttributeError:
+                output_hidden_states = False
 
         is_thd = attn_kwargs.get("qkv_format") == "thd"
         if is_thd:

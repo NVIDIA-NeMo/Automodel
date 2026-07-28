@@ -135,7 +135,39 @@ class _Gemma4KVShareHolder:
 
 def _kv_sharing_active(text_config) -> bool:
     """True if the (dense) text config uses gemma4 kv-sharing (E2B/E4B)."""
-    return int(text_config.num_kv_shared_layers or 0) > 0
+    try:
+        num_kv_shared_layers = text_config.num_kv_shared_layers
+    except AttributeError:
+        num_kv_shared_layers = 0
+    return int(num_kv_shared_layers or 0) > 0
+
+
+def _attn_implementation(config) -> str | None:
+    try:
+        return config._attn_implementation
+    except AttributeError:
+        return None
+
+
+def _text_config_or_self(config):
+    try:
+        return config.text_config
+    except AttributeError:
+        return config
+
+
+def _cp_enabled(module) -> bool:
+    try:
+        return bool(module._cp_enabled)
+    except AttributeError:
+        return False
+
+
+def _uses_cp_attention_hook(module) -> bool:
+    try:
+        return bool(module._cp_uses_attention_hook)
+    except AttributeError:
+        return False
 
 
 from .state_dict_adapter import Gemma4MoEStateDictAdapter
@@ -377,9 +409,9 @@ class Gemma4MoEDecoderLayer(nn.Module):
         # for configs without kv-sharing (e.g. 26B-A4B) it stays empty.
         attn_kwargs = kwargs
         if (
-            self.config._attn_implementation == "flex_attention"
+            _attn_implementation(self.config) == "flex_attention"
             and self.self_attn.head_dim > 256
-            and "kernel_options" not in kwargs
+            and ("kernel_options" not in kwargs)
         ):
             attn_kwargs = {
                 **kwargs,
@@ -394,7 +426,7 @@ class Gemma4MoEDecoderLayer(nn.Module):
                     "num_warps": 4,
                 },
             }
-        if padding_mask is not None and self.self_attn._cp_uses_attention_hook:
+        if padding_mask is not None and _uses_cp_attention_hook(self.self_attn):
             attn_kwargs = {**attn_kwargs, "padding_mask": padding_mask}
         x, _ = self.self_attn(
             hidden_states=x,
@@ -408,7 +440,7 @@ class Gemma4MoEDecoderLayer(nn.Module):
             mm_token_type_ids=mm_token_type_ids,
             **attn_kwargs,
         )
-        if self.config._attn_implementation == "flex_attention" and padding_mask is not None:
+        if _attn_implementation(self.config) == "flex_attention" and padding_mask is not None:
             x = x.masked_fill(padding_mask[..., None], 0)
         x = self.post_attention_layernorm(x)
         x = residual + x
@@ -513,7 +545,10 @@ def _build_unpacked_gemma4_causal_mask_mapping(
     """
     from transformers.models.gemma4 import modeling_gemma4
 
-    legacy_mask_mapping = modeling_gemma4.create_causal_mask_mapping
+    try:
+        legacy_mask_mapping = modeling_gemma4.create_causal_mask_mapping
+    except AttributeError:
+        legacy_mask_mapping = None
     if legacy_mask_mapping is not None:
         return legacy_mask_mapping(
             config=config,
@@ -980,7 +1015,7 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
             raise UnavailableError("transformers.models.gemma4 is not available.")
         config = Gemma4Config.from_pretrained(pretrained_model_name_or_path)
         # #2208: fused bf16 SDPA NaNs on Hopper; run SDPA in fp32 instead.
-        attn_impl = kwargs.get("attn_implementation") or config._attn_implementation
+        attn_impl = kwargs.get("attn_implementation") or _attn_implementation(config)
         if attn_impl == "sdpa":
             enable_gemma4_sdpa_fp32()
         return cls.from_config(config, *model_args, **kwargs)
@@ -996,7 +1031,7 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
         submesh, so the install is fully model-owned -- no framework dispatch is
         required.
         """
-        if self._cp_enabled:
+        if _cp_enabled(self):
             return
         self._cp_enabled = True
         for module in self.modules():
@@ -1166,19 +1201,27 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
         output_hidden_states: Optional[bool] = None,
         **kwargs: Any,
     ):
-        output_hidden_states = output_hidden_states if output_hidden_states is not None else self.config.text_config
+        text_config = _text_config_or_self(self.config)
+        if output_hidden_states is None:
+            try:
+                output_hidden_states = bool(text_config.output_hidden_states)
+            except AttributeError:
+                output_hidden_states = False
 
         if cache_position is None:
             if input_ids is not None:
                 seq_len = input_ids.shape[-1]
                 cache_position = torch.arange(seq_len, device=input_ids.device)
-            elif inputs_embeds is not None:
-                seq_len = inputs_embeds.shape[1]
-                cache_position = torch.arange(seq_len, device=inputs_embeds.device)
+        elif inputs_embeds is not None:
+            seq_len = inputs_embeds.shape[1]
+            cache_position = torch.arange(seq_len, device=inputs_embeds.device)
 
-        text_config = self.config.text_config
-        cp_enabled = self._cp_enabled
-        if not text_config.enable_moe_block:
+        cp_enabled = _cp_enabled(self)
+        try:
+            enable_moe_block = text_config.enable_moe_block
+        except AttributeError:
+            enable_moe_block = False
+        if not enable_moe_block:
             per_layer_inputs = kwargs.pop("per_layer_inputs", None)
             if cp_enabled:
                 if input_ids is None and inputs_embeds is None:
@@ -1230,7 +1273,7 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
                 # Left set (not cleared) so the activation-checkpoint recompute in
                 # backward sees the same metadata; each CP forward overwrites it.
                 for _mod in self.modules():
-                    if _mod._cp_uses_attention_hook:
+                    if _uses_cp_attention_hook(_mod):
                         _mod._cp_dense_metadata = cp_meta
 
                 text_outputs = self.model.language_model(
@@ -1390,8 +1433,17 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
         input_ids: torch.Tensor,
         special_image_mask: torch.Tensor,
     ) -> torch.Tensor | None:
-        language_model = self.model.language_model
-        if language_model is None or not language_model.hidden_size_per_layer_input:
+        try:
+            language_model = self.model.language_model
+        except AttributeError:
+            language_model = None
+        if language_model is None:
+            return None
+        try:
+            hidden_size_per_layer_input = language_model.hidden_size_per_layer_input
+        except AttributeError:
+            hidden_size_per_layer_input = None
+        if not hidden_size_per_layer_input:
             return None
 
         pad_token_id = self._get_text_pad_token_id()
@@ -1399,16 +1451,28 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
         return language_model.get_per_layer_inputs(llm_input_ids, None)
 
     def _get_text_pad_token_id(self) -> int:
-        pad_token_id = self.pad_token_id
+        try:
+            pad_token_id = self.pad_token_id
+        except AttributeError:
+            pad_token_id = None
         if pad_token_id is None or pad_token_id < 0:
             cfg = self.config
-            cfg_text = cfg.text_config
-            pad_token_id = cfg_text.pad_token_id
+            cfg_text = _text_config_or_self(cfg)
+            try:
+                pad_token_id = cfg_text.pad_token_id
+            except AttributeError:
+                pad_token_id = None
         if pad_token_id is None or pad_token_id < 0:
-            eos_token_id = self.config.eos_token_id
+            try:
+                eos_token_id = self.config.eos_token_id
+            except AttributeError:
+                eos_token_id = None
             if eos_token_id is None:
-                cfg_text = self.config.text_config
-                eos_token_id = cfg_text.eos_token_id if cfg_text else None
+                cfg_text = _text_config_or_self(self.config)
+                try:
+                    eos_token_id = cfg_text.eos_token_id if cfg_text else None
+                except AttributeError:
+                    eos_token_id = None
             if isinstance(eos_token_id, (list, tuple)):
                 eos_token_id = eos_token_id[0]
             pad_token_id = eos_token_id

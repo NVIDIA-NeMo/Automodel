@@ -82,7 +82,11 @@ def is_gated_delta_net_fp32_param_key(key: str, param_names: tuple[str, ...] = F
 
 def has_gated_delta_net_fp32_checkpoint_contract(hf_config: object) -> bool:
     """Return whether ``hf_config`` belongs to an architecture with fp32 GDN params."""
-    architectures = hf_config.architectures or ()
+    try:
+        architectures = hf_config.architectures
+    except AttributeError:
+        architectures = ()
+    architectures = architectures or ()
     return any(arch in GDN_FP32_CHECKPOINT_ARCHITECTURES for arch in architectures)
 
 
