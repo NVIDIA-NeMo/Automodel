@@ -100,4 +100,8 @@ def test_flex_block_mask_matches_sdpa_outputs(block_size):
     block_mask = create_idlm_block_mask(L, block_size, valid_mask, device=device, use_compile=False)
     out_flex = flex_attention(q, k, v, block_mask=block_mask)
 
-    assert torch.allclose(out_sdpa, out_flex, atol=1e-5), f"max diff {(out_sdpa - out_flex).abs().max().item():.3e}"
+    # flex_attention and SDPA use different kernels (and TF32 on recent GPUs), so
+    # their outputs agree only up to kernel fp precision (~1e-3), not bit-exactly.
+    # The mask *patterns* are identical (see the equality checks above); a real mask
+    # bug would show O(0.1-1) diffs, so this tolerance still catches those.
+    assert torch.allclose(out_sdpa, out_flex, atol=2e-3, rtol=1e-2), f"max diff {(out_sdpa - out_flex).abs().max().item():.3e}"
