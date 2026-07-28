@@ -103,6 +103,8 @@ def _permute_tokens_for_grouped_mm(
     token_mask: torch.Tensor,
     n_local_experts: int,
     experts_start_idx: int,
+    *,
+    return_slot_ids: bool = False,
 ):
     """Permute tokens by expert assignment and compute offs for torch._grouped_mm.
 
@@ -111,6 +113,8 @@ def _permute_tokens_for_grouped_mm(
 
     Returns:
         sorted_token_ids: Token indices sorted by expert assignment.
+        sorted_slot_ids: When requested, flattened ``[token, top-k]`` assignment
+            indices in the same order.
         sorted_weights: Routing weights in the same sorted order.
         tokens_per_expert: Count of tokens per local expert.
         offs: Cumulative token counts (int32) for torch._grouped_mm.
@@ -142,6 +146,9 @@ def _permute_tokens_for_grouped_mm(
     tokens_per_expert = torch.bincount(sorted_expert_ids, minlength=n_local_experts)
     offs = tokens_per_expert.cumsum(dim=0).to(torch.int32)
 
+    if return_slot_ids:
+        sorted_slot_ids = local_mask.nonzero(as_tuple=True)[0][sort_order]
+        return sorted_token_ids, sorted_slot_ids, sorted_weights, tokens_per_expert, offs
     return sorted_token_ids, sorted_weights, tokens_per_expert, offs
 
 
@@ -504,12 +511,19 @@ class GroupedExperts(nn.Module):
         experts_start_idx,
     ):
         """Grouped GEMM forward path using torch._grouped_mm."""
-        sorted_token_ids, sorted_weights, tokens_per_expert, offs = _permute_tokens_for_grouped_mm(
+        (
+            sorted_token_ids,
+            sorted_slot_ids,
+            sorted_weights,
+            tokens_per_expert,
+            offs,
+        ) = _permute_tokens_for_grouped_mm(
             indices,
             weights,
             token_mask,
             n_local_experts,
             experts_start_idx,
+            return_slot_ids=True,
         )
 
         output_shape = (x.shape[0], weights.shape[1], x.shape[1]) if self.apply_router_weight_after_down else x.shape
@@ -553,21 +567,10 @@ class GroupedExperts(nn.Module):
                     self.expert_activation_grouped,
                     use_mxfp8=self.use_mxfp8,
                 )
-            if self.apply_router_weight_after_down:
-                output2 = output2.float() * permuted_probs.float()
 
             if self.apply_router_weight_after_down:
-                sorted_expert_ids = torch.repeat_interleave(
-                    torch.arange(
-                        experts_start_idx,
-                        experts_start_idx + n_local_experts,
-                        device=indices.device,
-                    ),
-                    tokens_per_expert,
-                )
-                sorted_top_ids = (indices[sorted_token_ids] == sorted_expert_ids.unsqueeze(1)).to(torch.int64).argmax(1)
-                slot_ids = sorted_token_ids * weights.shape[1] + sorted_top_ids
-                scatter_ids = slot_ids.unsqueeze(1).expand_as(output2)
+                output2 = output2.float() * permuted_probs.float()
+                scatter_ids = sorted_slot_ids.unsqueeze(1).expand_as(output2)
                 y.view(-1, x.size(1)).scatter_add_(0, scatter_ids, output2.float())
             else:
                 scatter_ids = sorted_token_ids.unsqueeze(1).expand_as(output2)
@@ -846,9 +849,7 @@ class GroupedExpertsDeepEP(nn.Module):
             token_indices=indices,
         )
         permuted_probs = permuted_probs.unsqueeze(-1)
-        activation_probs = (
-            torch.ones_like(permuted_probs) if self.apply_router_weight_after_down else permuted_probs
-        )
+        activation_probs = torch.ones_like(permuted_probs) if self.apply_router_weight_after_down else permuted_probs
 
         # Cast expert weights to the activation dtype so that fp32-stored
         # parameters (e.g. under fp32 master weights) still work with kernels
