@@ -41,16 +41,30 @@ class _ObjectiveConfig(dict):
     __getattr__ = dict.__getitem__
 
 
-def _objective(*, student_update_freq: int = 5) -> _QwenImageDMD2Objective:
+def _objective(
+    *,
+    student_update_freq: int = 5,
+    guidance_scale: float | None = None,
+    gan_loss_weight_gen: float = 0.03,
+    ema: SimpleNamespace | None = None,
+    **cfg_values,
+) -> _QwenImageDMD2Objective:
     config = SimpleNamespace(
         student_update_freq=student_update_freq,
-        guidance_scale=None,
-        gan_loss_weight_gen=0.03,
-        ema=None,
+        guidance_scale=guidance_scale,
+        gan_loss_weight_gen=gan_loss_weight_gen,
+        ema=ema,
     )
     fastgen = SimpleNamespace(DMDConfig=Mock(return_value=config))
     with patch.object(dmd2_module, "_require_qwen_fastgen", return_value=(fastgen, None, None)):
-        return _QwenImageDMD2Objective(_ObjectiveConfig())
+        return _QwenImageDMD2Objective(_ObjectiveConfig(**cfg_values))
+
+
+def _configure_recipe(values: dict, optimizer: object | None = None) -> SimpleNamespace:
+    cfg = Mock()
+    cfg.get.side_effect = lambda key, default=None: values.get(key, default)
+    cfg.optimizer = optimizer
+    return SimpleNamespace(cfg=cfg)
 
 
 def _linear() -> torch.nn.Linear:
@@ -304,3 +318,356 @@ def test_qwen_image_dmd2_yaml_uses_the_native_trainer_contract():
     dataloader = config["data"]["dataloader"]
     assert dataloader["_target_"].endswith("build_text_to_image_multiresolution_dataloader")
     assert "negative_prompt_embedding_path" not in dataloader
+
+
+def test_require_qwen_fastgen_returns_modules_or_points_to_dmd2_extra():
+    modules = {
+        "modelopt.torch.fastgen": SimpleNamespace(),
+        "modelopt.torch.fastgen.discriminators": SimpleNamespace(),
+        "modelopt.torch.fastgen.plugins.qwen_image": SimpleNamespace(),
+    }
+    with patch.object(dmd2_module, "safe_import", side_effect=lambda name: (True, modules[name])):
+        assert dmd2_module._require_qwen_fastgen() == tuple(modules.values())
+
+    def _missing_qwen(name):
+        return name != "modelopt.torch.fastgen.plugins.qwen_image", modules[name]
+
+    with patch.object(dmd2_module, "safe_import", side_effect=_missing_qwen):
+        with pytest.raises(ImportError, match="uv sync --extra dmd2"):
+            dmd2_module._require_qwen_fastgen()
+
+
+def test_load_negative_prompt_embedding_rejects_missing_and_non_finite_files(tmp_path):
+    with pytest.raises(FileNotFoundError, match="does not exist"):
+        _load_negative_prompt_embedding(str(tmp_path / "absent.pt"))
+
+    path = tmp_path / "negative.pt"
+    torch.save(torch.full((2, 3), torch.inf), path)
+    with pytest.raises(ValueError, match="non-finite"):
+        _load_negative_prompt_embedding(str(path))
+
+
+def test_init_rejects_nonpositive_student_update_freq():
+    with pytest.raises(ValueError, match="student_update_freq"):
+        _objective(student_update_freq=0)
+
+
+@pytest.mark.parametrize(
+    ("values", "match"),
+    [
+        ({"model.mode": "pretrain"}, "model.mode=finetune"),
+        ({"peft": {}}, "full-parameter"),
+        ({"ddp": {}, "fsdp": {}}, "does not support DDP"),
+        ({}, "does not support DDP"),
+        ({"fsdp": {"tp_size": 2, "cp_size": 2}}, "tp_size=2, cp_size=2"),
+        ({"fsdp": {}, "data.dataloader.train_text_encoder": True}, "precomputed text embeddings"),
+        ({"fsdp": {}, "model.stage": "high_noise"}, "model.stage"),
+        ({"fsdp": {}, "model.transformer_engine_fp8": True}, "Transformer Engine FP8"),
+    ],
+)
+def test_configure_rejects_unsupported_topologies(values, match):
+    with pytest.raises(ValueError, match=match):
+        _objective().configure(_configure_recipe({"model.mode": "finetune", **values}, optimizer=object()))
+
+
+def test_configure_requires_native_optimizer_and_resumable_ema():
+    recipe = _configure_recipe({"model.mode": "finetune", "fsdp": {}}, optimizer=None)
+    with pytest.raises(ValueError, match="top-level `optimizer`"):
+        _objective().configure(recipe)
+
+    recipe.cfg.optimizer = object()
+    with pytest.raises(ValueError, match="fsdp2=true and mode=full_tensor"):
+        _objective(ema=SimpleNamespace(fsdp2=False, mode="full_tensor")).configure(recipe)
+
+    _objective(ema=SimpleNamespace(fsdp2=True, mode="full_tensor")).configure(recipe)
+
+
+def test_build_lr_scheduler_handles_streaming_and_missing_budgets():
+    objective = _objective(student_update_freq=5)
+    assert objective.build_lr_scheduler(SimpleNamespace(cfg=SimpleNamespace(lr_scheduler=None))) is None
+
+    lr_scheduler_config = Mock()
+    recipe = SimpleNamespace(
+        cfg=SimpleNamespace(lr_scheduler=lr_scheduler_config),
+        optimizer=[Mock()],
+        step_scheduler=SimpleNamespace(epoch_len=None, num_epochs=1, max_steps=7),
+    )
+    objective.build_lr_scheduler(recipe)
+    lr_scheduler_config.build.assert_called_once_with(recipe.optimizer, recipe.step_scheduler, total_steps=2)
+
+    recipe.step_scheduler.max_steps = None
+    with pytest.raises(ValueError, match="positive outer-step budget"):
+        objective.build_lr_scheduler(recipe)
+
+
+def _setup_recipe(cfg_optimizer: Mock) -> SimpleNamespace:
+    return SimpleNamespace(
+        model=_linear(),
+        optimizer=[torch.optim.SGD(_linear().parameters(), lr=0.1)],
+        device=torch.device("cpu"),
+        compute_dtype=torch.float32,
+        model_dtype=torch.float32,
+        cpu_offload=False,
+        model_id="Qwen/Qwen-Image",
+        attention_backend=None,
+        transformer_engine_linear=False,
+        transformer_engine_fp8=False,
+        fuse_qkv_projections=False,
+        compact_fused_qkv_projections=False,
+        active_transformer=None,
+        device_mesh=None,
+        cfg=SimpleNamespace(optimizer=cfg_optimizer, get=lambda key, default=None: {"fsdp": {}}.get(key, default)),
+    )
+
+
+def _cfg_optimizer() -> Mock:
+    cfg_optimizer = Mock()
+    cfg_optimizer.build.side_effect = lambda model, device_mesh=None: [torch.optim.SGD(model.parameters(), lr=0.1)]
+    return cfg_optimizer
+
+
+def test_setup_builds_auxiliaries_discriminator_and_checkpoint_state(tmp_path):
+    negative_path = tmp_path / "negative.pt"
+    torch.save(torch.zeros(3, 4), negative_path)
+    objective = _objective(
+        guidance_scale=4.0,
+        negative_prompt_embedding_path=str(negative_path),
+        discriminator=SimpleNamespace(to_dict=lambda: {"feature_indices": [1]}),
+    )
+    discriminator = _linear()
+    fastgen_discriminators = SimpleNamespace(Discriminator_ImageDiT=Mock(return_value=discriminator))
+    qwen_fastgen = SimpleNamespace(QwenImageDMDPipeline=Mock(return_value=SimpleNamespace(ema=None)))
+    recipe = _setup_recipe(_cfg_optimizer())
+
+    def _build_pipeline(**kwargs):
+        assert kwargs["model_id"] == "Qwen/Qwen-Image"
+        return SimpleNamespace(transformer=_linear()), None
+
+    with (
+        patch.object(dmd2_module, "_require_qwen_fastgen", return_value=(None, fastgen_discriminators, qwen_fastgen)),
+        patch.object(dmd2_module, "build_diffusion_pipeline", side_effect=_build_pipeline) as build_pipeline,
+    ):
+        objective.setup(recipe)
+
+    assert build_pipeline.call_count == 2
+    assert objective.teacher is not None and not objective.teacher.training
+    assert not any(parameter.requires_grad for parameter in objective.teacher.parameters())
+    assert objective.fake_score is not None and objective.fake_score.training
+    assert all(parameter.requires_grad for parameter in objective.fake_score.parameters())
+    torch.testing.assert_close(objective.negative_prompt_embedding, torch.zeros(3, 4))
+
+    fastgen_discriminators.Discriminator_ImageDiT.assert_called_once_with(feature_indices=[1])
+    assert objective.discriminator is discriminator
+    assert objective.student_optimizer is recipe.optimizer[0]
+    assert recipe.cfg.optimizer.build.call_count == 2  # fake score + discriminator
+
+    qwen_fastgen.QwenImageDMDPipeline.assert_called_once_with(
+        student=recipe.model,
+        teacher=objective.teacher,
+        fake_score=objective.fake_score,
+        config=objective.modelopt_config,
+        discriminator=discriminator,
+    )
+    assert objective._fake_score_state is not None
+    assert objective._fake_score_optimizer_state is not None
+    assert objective._discriminator_state is not None
+    assert objective._discriminator_optimizer_state is not None
+
+
+def test_setup_requires_negative_embedding_path_when_cfg_is_enabled():
+    objective = _objective(guidance_scale=4.0)
+    with patch.object(dmd2_module, "_require_qwen_fastgen", return_value=(None, None, None)):
+        with pytest.raises(ValueError, match="negative_prompt_embedding_path"):
+            objective.setup(SimpleNamespace())
+
+
+def test_setup_requires_discriminator_arguments_when_gan_is_enabled():
+    objective = _objective(gan_loss_weight_gen=0.03)
+    recipe = _setup_recipe(_cfg_optimizer())
+    with (
+        patch.object(dmd2_module, "_require_qwen_fastgen", return_value=(None, None, None)),
+        patch.object(
+            dmd2_module,
+            "build_diffusion_pipeline",
+            side_effect=lambda **_kwargs: (SimpleNamespace(transformer=_linear()), None),
+        ),
+    ):
+        with pytest.raises(ValueError, match="dmd2.discriminator"):
+            objective.setup(recipe)
+
+
+def test_after_restore_validates_student_scheduler_phase_boundary():
+    objective = _objective(student_update_freq=5)
+    objective.after_restore(SimpleNamespace(lr_scheduler=None))
+
+    recipe = SimpleNamespace(
+        lr_scheduler=[SimpleNamespace(num_steps=2)],
+        step_scheduler=SimpleNamespace(step=7),
+    )
+    objective.after_restore(recipe)
+
+    recipe.lr_scheduler[0].num_steps = 1
+    with pytest.raises(ValueError, match="inconsistent student LR scheduler"):
+        objective.after_restore(recipe)
+
+
+def test_train_batch_group_rejects_empty_group_and_requires_setup():
+    objective, recipe, *_ = _training_fixture()
+    with pytest.raises(RuntimeError, match="empty gradient-accumulation group"):
+        objective.train_batch_group(recipe, [], global_step=0)
+
+    with pytest.raises(RuntimeError, match="has not been set up"):
+        _objective().state_dict()
+
+
+@pytest.mark.parametrize("student_phase", [True, False])
+def test_train_batch_group_raises_on_non_finite_losses(student_phase):
+    objective, recipe, batch_group, modelopt_pipeline, _ = _training_fixture()
+    nan_loss = {"total": torch.tensor(torch.nan, requires_grad=True)}
+    if student_phase:
+        modelopt_pipeline.compute_student_loss.side_effect = lambda *_args, **_kwargs: nan_loss
+        match = "student"
+    else:
+        modelopt_pipeline.compute_discriminator_loss.side_effect = lambda *_args, **_kwargs: nan_loss
+        match = "discriminator"
+
+    with (
+        patch.object(dmd2_module, "prepare_for_grad_accumulation"),
+        patch.object(dmd2_module, "prepare_for_final_backward"),
+        patch.object(dmd2_module, "prepare_after_first_microbatch"),
+    ):
+        with pytest.raises(FloatingPointError, match=match):
+            objective.train_batch_group(recipe, batch_group, global_step=0 if student_phase else 1)
+
+
+def test_only_optimizer_unwraps_single_instances_and_rejects_groups():
+    optimizer = torch.optim.SGD(_linear().parameters(), lr=0.1)
+    assert _QwenImageDMD2Objective._only_optimizer(optimizer, "student") is optimizer
+    assert _QwenImageDMD2Objective._only_optimizer([optimizer], "student") is optimizer
+    with pytest.raises(ValueError, match="one student optimizer, got 2"):
+        _QwenImageDMD2Objective._only_optimizer([optimizer, optimizer], "student")
+
+
+def test_prepare_batch_promotes_unbatched_embeddings_and_masks():
+    objective = _objective()
+    recipe = SimpleNamespace(device=torch.device("cpu"), compute_dtype=torch.float32)
+    batch = {
+        "image_latents": torch.zeros(1, 1, 2, 2),
+        "text_embeddings": torch.zeros(5, 4),
+        "text_embeddings_mask": torch.ones(5, dtype=torch.long),
+    }
+    _, noise, text_embeddings, text_mask, negative, negative_mask = objective._prepare_batch(recipe, batch)
+    assert text_embeddings.shape == (1, 5, 4)
+    assert text_mask.shape == (1, 5)
+    assert noise.shape == (1, 1, 2, 2)
+    assert negative is None and negative_mask is None
+
+
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    [
+        ({"text_embeddings_mask": None}, "requires text_embeddings_mask"),
+        ({"image_latents": torch.zeros(1, 2, 2)}, r"image_latents \[B,C,H,W\]"),
+        ({"text_embeddings_mask": torch.ones(1, 3, dtype=torch.long)}, "matching text_embeddings"),
+    ],
+)
+def test_prepare_batch_rejects_malformed_batches(overrides, match):
+    objective = _objective()
+    recipe = SimpleNamespace(device=torch.device("cpu"), compute_dtype=torch.float32)
+    batch = {
+        "image_latents": torch.zeros(1, 1, 2, 2),
+        "text_embeddings": torch.zeros(1, 5, 4),
+        "text_embeddings_mask": torch.ones(1, 5, dtype=torch.long),
+    }
+    batch.update(overrides)
+    batch = {key: value for key, value in batch.items() if value is not None}
+    with pytest.raises(ValueError, match=match):
+        objective._prepare_batch(recipe, batch)
+
+
+def test_prepare_batch_rejects_mismatched_negative_embedding_width():
+    objective = _objective()
+    objective.negative_prompt_embedding = torch.zeros(3, 8)
+    recipe = SimpleNamespace(device=torch.device("cpu"), compute_dtype=torch.float32)
+    batch = {
+        "image_latents": torch.zeros(1, 1, 2, 2),
+        "text_embeddings": torch.zeros(1, 5, 4),
+        "text_embeddings_mask": torch.ones(1, 5, dtype=torch.long),
+    }
+    with pytest.raises(ValueError, match="dimensions must match"):
+        objective._prepare_batch(recipe, batch)
+
+
+def test_prepare_batch_attaches_feature_capture_once_per_latent_shape():
+    objective = _objective()
+    objective.teacher = object()
+    objective.discriminator = SimpleNamespace(feature_indices={3, 1})
+    qwen_fastgen = SimpleNamespace(attach_feature_capture=Mock())
+    recipe = SimpleNamespace(device=torch.device("cpu"), compute_dtype=torch.float32)
+    batch = {
+        "image_latents": torch.zeros(1, 1, 2, 4),
+        "text_embeddings": torch.zeros(1, 5, 4),
+        "text_embeddings_mask": torch.ones(1, 5, dtype=torch.long),
+    }
+
+    with patch.object(dmd2_module, "_require_qwen_fastgen", return_value=(None, None, qwen_fastgen)):
+        objective._prepare_batch(recipe, batch)
+        objective._prepare_batch(recipe, batch)
+
+    qwen_fastgen.attach_feature_capture.assert_called_once_with(
+        objective.teacher,
+        feature_indices=[1, 3],
+        h_lat=2,
+        w_lat=4,
+    )
+    assert objective._feature_capture_shape == (2, 4)
+
+
+def test_discriminator_broadcast_replicates_rank_zero_tensors():
+    objective, recipe, *_ = _training_fixture()
+    recipe._get_dp_group_size = Mock(return_value=2)
+    recipe._get_dp_group = Mock(return_value=object())
+
+    with (
+        patch.object(dmd2_module.dist, "is_initialized", return_value=True),
+        patch.object(dmd2_module.dist, "broadcast") as broadcast,
+    ):
+        objective._broadcast_discriminator(recipe)
+
+    tensors = [*objective.discriminator.parameters(), *objective.discriminator.buffers()]
+    assert broadcast.call_count == len(tensors)
+    for call in broadcast.call_args_list:
+        assert call.kwargs["src"] == 0
+
+
+class _StopSetup(Exception):
+    pass
+
+
+def test_native_trainer_setup_constructs_and_configures_dmd2_objective():
+    from nemo_automodel.components.config.loader import ConfigNode
+    from nemo_automodel.recipes.diffusion import train as train_module
+
+    recipe = TrainDiffusionRecipe(
+        ConfigNode(
+            {
+                "model": {"pretrained_model_name_or_path": "Qwen/Qwen-Image"},
+                "fsdp": {},
+                "dmd2": {"modelopt_config": {"student_update_freq": 5}},
+            }
+        )
+    )
+    objective = Mock()
+    objective.configure.side_effect = _StopSetup
+    objective_cls = Mock(return_value=objective)
+
+    with (
+        patch.object(train_module, "initialize_distributed", return_value=SimpleNamespace(is_main=False)),
+        patch.object(dmd2_module, "_QwenImageDMD2Objective", objective_cls),
+        pytest.raises(_StopSetup),
+    ):
+        recipe.setup()
+
+    assert objective_cls.call_count == 1
+    objective.configure.assert_called_once_with(recipe)
+    assert recipe._dmd2 is objective
