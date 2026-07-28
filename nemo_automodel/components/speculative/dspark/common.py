@@ -11,11 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import logging
 from dataclasses import dataclass
 from typing import Optional
 
 import torch
 from torch import nn
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -80,6 +83,29 @@ def validate_target_layer_ids(layer_ids, num_target_layers: int):
         )
         assert previous is None or layer_id > previous, "target_layer_ids must be strictly increasing."
         previous = layer_id
+
+    # The standard SGLang runtime captures aux/context features via
+    # ``set_eagle3_layers_to_capture`` (effectively capturing the input of layer
+    # ``id + 1``), so it cannot produce a feature for ``-1`` (no capture point) or
+    # for the last layer ``end`` (capture point ``num_target_layers`` does not
+    # exist in a ``0..end`` decoder loop, and SGLang exposes the post-norm hidden
+    # only as a separate last-hidden, never as an aux slot). A checkpoint trained
+    # with these ids still serves with AutoModel's own ``spec_generate`` (which
+    # follows the HuggingFace ``output_hidden_states`` convention), but not on the
+    # standard SGLang runtime. Warn rather than fail: the ids are valid for
+    # AutoModel, only unservable on SGLang.
+    sglang_unsupported = sorted({layer_id for layer_id in layer_ids if layer_id == -1 or layer_id == end})
+    if sglang_unsupported:
+        logger.warning(
+            "target_layer_ids %s include %s, which the standard SGLang runtime cannot capture "
+            "(-1 is the embedding and the last layer %d is post-norm; neither has an SGLang aux "
+            "capture point). A drafter trained with these ids serves with AutoModel's spec_generate "
+            "but not on standard SGLang; keep target_layer_ids within [0, %d] for SGLang deployment.",
+            layer_ids,
+            sglang_unsupported,
+            end,
+            end - 1,
+        )
     return layer_ids
 
 

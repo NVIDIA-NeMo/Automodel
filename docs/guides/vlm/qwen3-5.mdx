@@ -5,35 +5,42 @@ position: 13
 ---
 ## Introduction
 
-[Qwen/Qwen3.5-397B-A17B](https://huggingface.co/Qwen/Qwen3.5-397B-A17B) is the latest vision-language model in the Qwen series developed by Alibaba. It’s a 397B-parameter (17B active) hybrid MoE model that uses a repeated layout of Gated DeltaNet and Gated Attention blocks, each paired with sparse MoE (512 experts; 10 routed + 1 shared active). Qwen3.5 is a major upgrade that unifies vision+language, boosts efficiency and multilingual coverage, delivering higher performance at lower latency/cost for developers and enterprises. Qwen3.5-397B-A17B shows competitive benchmark performance across knowledge, reasoning, coding, and agent tasks.
+[Qwen/Qwen3.5-397B-A17B](https://huggingface.co/Qwen/Qwen3.5-397B-A17B) is a vision-language model in the Qwen series developed by Alibaba. It is a 397B-parameter hybrid MoE model with 17B active parameters. The model repeats Gated DeltaNet and Gated Attention blocks, each paired with a sparse MoE layer that has 512 experts, including 10 routed experts and one active shared expert. Qwen3.5 combines vision and language capabilities, expands multilingual coverage, and improves efficiency. Qwen3.5-397B-A17B shows competitive benchmark performance across knowledge, reasoning, coding, and agent tasks.
 <p align="center">
   <img src="https://raw.githubusercontent.com/NVIDIA-NeMo/Automodel/main/docs/guides/vlm/qwen3_5scores.png" alt="Qwen3.5 benchmark" width="500" />
 </p>
 
-This guide walks you through fine-tuning Qwen3.5 on a medical Visual Question Answering task using NVIDIA NeMo Automodel. You will learn how to prepare the dataset, launch training on a Slurm cluster, and inspect the results.
+This guide describes how to fine-tune Qwen3.5 for a medical visual question answering task using NVIDIA NeMo AutoModel. It covers preparing the dataset, launching training on a Slurm cluster, and inspecting the results.
 
-To set up your environment to run NeMo Automodel, follow the [installation guide](https://github.com/NVIDIA-NeMo/Automodel#-install-nemo-automodel).
+To set up your environment to run NeMo AutoModel, follow the [installation guide](https://github.com/NVIDIA-NeMo/Automodel#-install-nemo-automodel).
 
-## Data
+## Prepare the Data
 
 ### MedPix-VQA Dataset
 
-We use the [MedPix-VQA](https://huggingface.co/datasets/mmoukouba/MedPix-VQA) dataset, a comprehensive medical Visual Question Answering dataset containing radiological images paired with question-answer pairs for medical image interpretation.
+This guide uses the [MedPix-VQA](https://huggingface.co/datasets/mmoukouba/MedPix-VQA) dataset. This medical visual question answering dataset contains radiological images paired with questions and answers for medical image interpretation.
 
-- **20,500 total examples** (85% train / 15% validation)
+The dataset includes:
+
+- **20,500 total examples** (85% training and 15% validation)
 - **Columns**: `image_id`, `mode`, `case_id`, `question`, `answer`
 
-For a full walkthrough of how MedPix-VQA is preprocessed and integrated into NeMo Automodel—including the chat-template conversion and collate functions—see the [Multi-Modal Dataset Guide](/datasets/multi-modal-dataset).
+For details about how MedPix-VQA is preprocessed and integrated into NeMo AutoModel, including chat-template conversion and collate functions, see the [Multi-Modal Dataset Guide](/datasets/multi-modal-dataset).
 
 ## Launch Training
 
-We provide a ready-to-use recipe at [`examples/vlm_finetune/qwen3_5_moe/qwen3_5_moe_medpix.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5_moe/qwen3_5_moe_medpix.yaml). This recipe is configured to run on 32 x 8 H100 nodes.
+A ready-to-use recipe is available at [`examples/vlm_finetune/qwen3_5_moe/qwen3_5_moe_medpix.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5_moe/qwen3_5_moe_medpix.yaml). This recipe is configured for 32 nodes with eight NVIDIA H100 GPUs per node.
 
-NeMo Automodel supports several ways to launch training—via the Automodel CLI with Slurm, interactive sessions, `torchrun`, and more. For full details on all launch options (Slurm batch jobs, multi-node configuration, environment variables, etc.), see the [Run on a Cluster](/job-launchers/slurm-cluster) guide.
+<Info>
+Long-context Qwen3.5 runs can require prewarming during setup even when later training steps fit in memory. This occurs because first-use CUDA and communicator allocations overlap with the first backward-pass memory peak. The short-context MedPix recipe does not enable prewarming by default. If a longer hybrid-attention MoE run fails only during its first step, see [Prewarm One-Time CUDA Initialization](/get-started/configuration#prewarm-one-time-cuda-initialization). Enable only the warmup that matches the failure signature. This behavior alone does not establish support for a specific context length.
+
+</Info>
+
+NeMo AutoModel supports several methods for launching training, including the AutoModel CLI with Slurm, interactive sessions, and `torchrun`. For details about all launch options, including Slurm batch jobs, multi-node configs, and environment variables, see the [Run on a Cluster](/job-launchers/slurm-cluster) guide.
 
 ### Standalone Slurm Script
 
-We also provide a standalone Slurm script example for Qwen3.5. Before running it, ensure your cluster environment is configured following the [Run on a Cluster](/job-launchers/slurm-cluster) guide. Then submit the job with the following command:
+The following example provides a standalone Slurm script for Qwen3.5. Before running it, configure your cluster environment according to the [Run on a Cluster](/job-launchers/slurm-cluster) guide. Then submit the job:
 
 ```bash
 export TRANSFORMERS_OFFLINE=1
@@ -58,7 +65,7 @@ srun --output=output.out \
 
 ## Training Results
 
-The training loss curves for Qwen3.5-VL fine-tuned on MedPix-VQA are shown below.
+The following figure shows the training loss curves for Qwen3.5-VL fine-tuned on MedPix-VQA.
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/NVIDIA-NeMo/Automodel/main/docs/guides/vlm/qwen3_5.png" alt="Qwen3.5-VL Training Loss Curve" width="500" />

@@ -35,6 +35,10 @@ from nemo_automodel.components.models.common import (
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.tie_word_embeddings import (
+    TieSupport,
+    reject_unsupported_tie_word_embeddings,
+)
 from nemo_automodel.components.models.ernie4_5.rope_utils import Ernie4_5RotaryEmbedding, apply_rotary_pos_emb
 from nemo_automodel.components.models.ernie4_5.state_dict_adapter import (
     Ernie4_5_MoeStateDictAdapter,
@@ -411,6 +415,8 @@ class Ernie4_5_MoeModel(nn.Module):
 class Ernie4_5ForCausalLM(HFCheckpointingMixin, nn.Module):
     """Dense ERNIE 4.5 causal language model."""
 
+    # Both shipped ERNIE-4.5 checkpoints are tied; untied is not a validated path.
+    tie_word_embeddings_support: TieSupport = TieSupport.TIED_ONLY
     supports_gradient_checkpointing = True
     _skip_init_weights_on_load = True
     _nemo_tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
@@ -444,6 +450,7 @@ class Ernie4_5ForCausalLM(HFCheckpointingMixin, nn.Module):
     ):
         super().__init__()
         self.config = config
+        reject_unsupported_tie_word_embeddings(type(self), config)
         self.backend = backend or BackendConfig()
         self.model = Ernie4_5Model(config, self.backend)
         self.vocab_size = config.vocab_size
@@ -515,6 +522,8 @@ class Ernie4_5ForCausalLM(HFCheckpointingMixin, nn.Module):
 class Ernie4_5_MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     """ERNIE 4.5 MoE causal language model with AutoModel EP support."""
 
+    # Both shipped ERNIE-4.5 checkpoints are tied; untied is not a validated path.
+    tie_word_embeddings_support: TieSupport = TieSupport.TIED_ONLY
     supports_gradient_checkpointing = True
     _skip_init_weights_on_load = True
     _nemo_tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
@@ -569,6 +578,7 @@ class Ernie4_5_MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin)
     ):
         super().__init__()
         self.config = config
+        reject_unsupported_tie_word_embeddings(type(self), config)
         self.backend = backend or BackendConfig()
         moe_overrides = kwargs.pop("moe_overrides", None)
         self.model = Ernie4_5_MoeModel(

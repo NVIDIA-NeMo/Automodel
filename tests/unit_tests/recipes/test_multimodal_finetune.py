@@ -41,3 +41,42 @@ def test_bagel_auto_model_path_uses_distributed_setup_kwarg():
         }
         & keywords
     )
+
+
+def test_bagel_finalizes_pending_checkpoint_before_closing_checkpointer():
+    """Async BAGEL checkpoints must be published before the checkpointer closes."""
+    from types import SimpleNamespace
+
+    from nemo_automodel.recipes.multimodal.finetune import FinetuneRecipeForMultimodal
+
+    events = []
+    recipe = FinetuneRecipeForMultimodal.__new__(FinetuneRecipeForMultimodal)
+    recipe.model = SimpleNamespace(train=lambda: events.append("train"))
+    recipe.step_scheduler = SimpleNamespace(epochs=[])
+    recipe.metric_logger_train = SimpleNamespace(close=lambda: events.append("train_logger_close"))
+    recipe.metric_logger_valid = SimpleNamespace(close=lambda: events.append("valid_logger_close"))
+    recipe.checkpointer = SimpleNamespace(close=lambda: events.append("checkpointer_close"))
+    recipe._finalize_pending_checkpoint = lambda: events.append("finalize")
+
+    FinetuneRecipeForMultimodal.run_train_validation_loop(recipe)
+
+    assert events == ["train", "train_logger_close", "valid_logger_close", "finalize", "checkpointer_close"]
+
+
+def test_bagel_dataloader_resolved_through_recipeconfig():
+    """The recipe stores a raw ConfigNode, but ``bagel_dataloader`` is a typed
+    RecipeConfig property. It must be accessed via ``RecipeConfig(self.cfg)`` — a bare
+    ``self.cfg.bagel_dataloader`` raises AttributeError on a ConfigNode (the real CLI
+    entry hands the recipe a raw ConfigNode), which breaks every BAGEL run in ``setup``.
+    """
+    recipe_path = Path(__file__).resolve().parents[3] / "nemo_automodel/recipes/multimodal/finetune.py"
+    tree = ast.parse(recipe_path.read_text())
+
+    accesses = [node for node in ast.walk(tree) if isinstance(node, ast.Attribute) and node.attr == "bagel_dataloader"]
+    assert accesses, "expected a bagel_dataloader access in the recipe"
+    for node in accesses:
+        assert (
+            isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Name)
+            and node.value.func.id == "RecipeConfig"
+        ), "bagel_dataloader must be resolved via RecipeConfig(self.cfg), not accessed on a raw ConfigNode"

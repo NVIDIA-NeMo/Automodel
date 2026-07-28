@@ -1040,13 +1040,22 @@ class TestDeepseekV4OptimizedKernels:
                 outputs.append(torch.cat(batch_outputs, dim=1))
             return torch.cat(outputs, dim=0)
 
-        expected, expected_grads = _run_forward_backward(unpacked_attention, (q, kv, sinks), grad)
-        actual, actual_grads = _run_forward_backward(packed_attention, (q, kv, sinks), grad)
+        previous_matmul_precision = torch.get_float32_matmul_precision()
+        if device == "cuda":
+            # Packed and unpacked inputs select different matmul kernels. Use IEEE
+            # FP32 so this test measures attention equivalence rather than TF32
+            # rounding differences between those kernels.
+            torch.set_float32_matmul_precision("highest")
+        try:
+            expected, expected_grads = _run_forward_backward(unpacked_attention, (q, kv, sinks), grad)
+            actual, actual_grads = _run_forward_backward(packed_attention, (q, kv, sinks), grad)
 
-        rtol, atol = (1e-4, 1e-5) if device == "cuda" else (1e-5, 1e-6)
-        torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
-        for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
-            torch.testing.assert_close(actual_grad, expected_grad, rtol=rtol, atol=atol)
+            rtol, atol = (1e-4, 1e-5) if device == "cuda" else (1e-5, 1e-6)
+            torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
+            for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
+                torch.testing.assert_close(actual_grad, expected_grad, rtol=rtol, atol=atol)
+        finally:
+            torch.set_float32_matmul_precision(previous_matmul_precision)
 
     def test_sinkhorn_torch_backend_matches_reference(self):
         torch.manual_seed(123)

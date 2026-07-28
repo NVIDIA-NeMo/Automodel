@@ -15,6 +15,7 @@
 import json
 import logging
 import os
+from dataclasses import dataclass
 from typing import Any, Dict, List, Union
 
 from datasets import Dataset, concatenate_datasets
@@ -429,3 +430,34 @@ def make_retrieval_dataset(
     logging.info(f"Created {data_type} dataset with {len(dataset)} examples")
 
     return dataset
+
+
+@dataclass
+class InlineRetrievalDatasetConfig:
+    """Construction-time configuration for inline retrieval datasets."""
+
+    data_dir_list: list[str] | str
+    model_type: str = "bi_encoder"
+    data_type: str = "train"
+    n_passages: int = 5
+    eval_negative_size: int | None = None
+    seed: int = 42
+    do_shuffle: bool = False
+    max_train_samples: int | None = None
+    train_data_select_offset: int = 0
+    use_dataset_instruction: bool = False
+
+    def build(self) -> Dataset:
+        """Build the inline retrieval dataset from this config."""
+        return make_retrieval_dataset(
+            data_dir_list=self.data_dir_list,
+            model_type=self.model_type,
+            data_type=self.data_type,
+            n_passages=self.n_passages,
+            eval_negative_size=self.eval_negative_size,
+            seed=self.seed,
+            do_shuffle=self.do_shuffle,
+            max_train_samples=self.max_train_samples,
+            train_data_select_offset=self.train_data_select_offset,
+            use_dataset_instruction=self.use_dataset_instruction,
+        )

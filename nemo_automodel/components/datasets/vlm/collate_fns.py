@@ -424,6 +424,18 @@ def build_labels_from_template(
     processor_type = type(processor).__name__
     tokenizer = getattr(processor, "tokenizer", processor)
 
+    # Inkling closes an assistant message before emitting a separate sampling
+    # terminator. Label through the first sampling terminator, which also keeps
+    # subsequent padding (using the same token id) masked.
+    if processor_type == "InklingProcessor":
+        marker_tokens = ("<|message_model|>", "<|content_text|>")
+        assistant_marker = [tokenizer.convert_tokens_to_ids(token) for token in marker_tokens]
+        stop_id = tokenizer.convert_tokens_to_ids("<|content_model_end_sampling|>")
+        if all(token_id is not None and token_id != tokenizer.unk_token_id for token_id in assistant_marker) and (
+            stop_id is not None and stop_id != tokenizer.unk_token_id
+        ):
+            return _build_labels_from_markers(input_ids_batch, assistant_marker, stop_id)
+
     # ------------------------------------------------------------------
     # Fast path: Qwen-family processors with <|im_start|>/<|im_end|>.
     # ------------------------------------------------------------------
@@ -1256,7 +1268,7 @@ def default_collate_fn(
             (e.g. Gemma4 thinking-channel injection) to transform the
             tokenized batch and the prefix tokens without duplicating the rest of the pipeline.
     """
-    if not HAVE_QWEN_VL_UTILS:
+    if not HAVE_QWEN_VL_UTILS and type(processor).__name__ != "InklingProcessor":
         raise ImportError(MISSING_QWEN_VL_UTILS_MSG)
 
     conversations = _ensure_rgb([example["conversation"] for example in examples])
@@ -1325,6 +1337,10 @@ def default_collate_fn(
     if any(c > 0 for c in video_counts):
         batch["n_videos_per_sample"] = torch.tensor(video_counts, dtype=torch.long)
 
+    pixel_values = batch.get("pixel_values")
+    image_token_id = getattr(processor, "image_token_id", None)
+    if image_token_id is not None and pixel_values is not None and pixel_values.dim() == 5:
+        batch["num_patches"] = (batch["input_ids"] == image_token_id).sum(dim=-1)
     return batch
 
 
@@ -1492,10 +1508,13 @@ def neat_packed_vlm_collater(
     use_flash = attn_implementation == "flash_attention_2"
 
     # Determine pad target: fixed max_length or batch-dynamic
-    batch_max = max(
-        x["input_ids"].shape[-1] if isinstance(x["input_ids"], torch.Tensor) else len(x["input_ids"]) for x in batch
+    max_len = (
+        max_length
+        if max_length is not None
+        else max(
+            x["input_ids"].shape[-1] if isinstance(x["input_ids"], torch.Tensor) else len(x["input_ids"]) for x in batch
+        )
     )
-    max_len = max_length if max_length is not None else batch_max
 
     def _pad_1d(tensor, pad_value, target_len):
         """Pad a 1D tensor to target_len."""
@@ -1574,6 +1593,110 @@ def neat_packed_vlm_collater(
         result["n_images_per_sample"] = torch.tensor(image_counts, dtype=torch.long)
     if any(c > 0 for c in video_counts):
         result["n_videos_per_sample"] = torch.tensor(video_counts, dtype=torch.long)
+
+    return result
+
+
+def packed_sequence_thd_vlm_collater(
+    batch: list[dict],
+    padding_idx: int = 0,
+    max_length: int | None = None,
+    seq_lens_padding_value: int = -1000,
+) -> dict:
+    """Collater for neat-packed VLM sequences in THD (Transformer Engine) format.
+
+    VLM counterpart of ``packed_sequence_thd_collater`` (text-only,
+    ``datasets/utils.py``). Packs arrive with variable lengths (no pre-padding)
+    from ``neat_pack_dataset_vlm``. This collater pads text tensors to a common
+    length and stacks them to ``[batch, seq]``; derives per-document real lengths
+    (``seq_lens``) from the indexed ``attention_mask`` (values 1, 2, ... per
+    sub-sequence, 0 = padding) and folds each sample's trailing pad into its last
+    document for ``seq_lens_padded``; keeps the mRoPE ``[3, seq]`` layout as
+    ``[3, batch, seq]``; concatenates media tensors; and emits ``qkv_format='thd'``.
+
+    Args:
+        batch: List of packed sample dicts. Each holds ``input_ids``/``labels``/
+            ``attention_mask`` of shape ``[seq]`` (mask indexed by sub-sequence),
+            ``position_ids`` of shape ``[seq]`` (1D) or ``[3, seq]`` (mRoPE), and
+            optional media tensors (``pixel_values`` ``[num_patches, dim]``,
+            ``image_grid_thw`` ``[num_images, 3]``, video/second-per-grid analogues).
+        padding_idx: Token ID used to pad ``input_ids`` (default 0).
+        max_length: If set, pad every sample to this fixed length; else pad to the
+            longest pack in the batch.
+        seq_lens_padding_value: Sentinel to right-pad ragged ``seq_lens`` rows
+            (default -1000); filtered downstream in ``process_input_for_thd``.
+
+    Returns:
+        Dict with ``input_ids``/``labels`` ``[batch, seq]``, ``position_ids``
+        ``[batch, seq]`` or ``[3, batch, seq]``, ``seq_lens``/``seq_lens_padded``
+        ``[batch, max_packs]``, ``qkv_format='thd'``, and concatenated media tensors.
+    """
+    if not batch:
+        return {}
+
+    from nemo_automodel.components.datasets.utils import pad_within_micro
+
+    LABEL_PAD = -100
+
+    batch_max = max(
+        x["input_ids"].shape[-1] if isinstance(x["input_ids"], torch.Tensor) else len(x["input_ids"]) for x in batch
+    )
+    max_len = max_length if max_length is not None else batch_max
+
+    def _pad_seq(tensor, pad_value, target_len, seq_dim=-1):
+        """Pad ``tensor`` along ``seq_dim`` to ``target_len`` with ``pad_value``."""
+        t = torch.as_tensor(tensor)
+        pad_len = target_len - t.shape[seq_dim]
+        if pad_len <= 0:
+            return t
+        shape = list(t.shape)
+        shape[seq_dim] = pad_len
+        return torch.cat([t, torch.full(shape, pad_value, dtype=t.dtype)], dim=seq_dim)
+
+    input_ids = torch.stack([_pad_seq(x["input_ids"], padding_idx, max_len) for x in batch])
+    labels = torch.stack([_pad_seq(x["labels"], LABEL_PAD, max_len) for x in batch])
+
+    seq_lens_list: list[list[int]] = []
+    seq_lens_padded_list: list[list[int]] = []
+    for x in batch:
+        am = torch.as_tensor(x["attention_mask"]).to(torch.long)
+        real_len = int(am.shape[0])
+        doc_lens = torch.bincount(am)[1:].tolist()
+        if not doc_lens:
+            doc_lens = [real_len]
+        padded = list(doc_lens)
+        padded[-1] += max_len - real_len
+        seq_lens_list.append(doc_lens)
+        seq_lens_padded_list.append(padded)
+
+    seq_lens = torch.LongTensor(pad_within_micro(seq_lens_list, seq_lens_padding_value))
+    seq_lens_padded = torch.LongTensor(pad_within_micro(seq_lens_padded_list, seq_lens_padding_value))
+
+    pos_sample = torch.as_tensor(batch[0]["position_ids"])
+    if pos_sample.ndim == 2:
+        # mRoPE [n_rope, seq]: pad along the seq axis, then stack on a new batch axis.
+        position_ids = torch.stack([_pad_seq(x["position_ids"], 0, max_len, seq_dim=1) for x in batch], dim=1)
+    else:
+        position_ids = torch.stack([_pad_seq(x["position_ids"], 0, max_len) for x in batch])
+
+    result: Dict[str, Any] = {
+        "input_ids": input_ids,
+        "labels": labels,
+        "position_ids": position_ids,
+        "seq_lens": seq_lens,
+        "seq_lens_padded": seq_lens_padded,
+        "qkv_format": "thd",
+    }
+
+    for key in ("pixel_values", "pixel_values_videos"):
+        tensors = [x[key] for x in batch if key in x and x[key] is not None]
+        if tensors:
+            result[key] = torch.cat(tensors, dim=0).to(torch.bfloat16)
+
+    for key in ("image_grid_thw", "image_position_ids", "video_grid_thw", "second_per_grid_ts"):
+        tensors = [x[key] for x in batch if key in x and x[key] is not None]
+        if tensors:
+            result[key] = torch.cat(tensors, dim=0)
 
     return result
 

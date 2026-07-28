@@ -16,8 +16,8 @@
 save and restore iteration state across checkpoint boundaries.
 
 The test creates a small synthetic retrieval dataset, builds a
-StatefulDataLoader via the retrieval recipe's ``build_dataloader``, advances
-it a few batches, checkpoints the state, then creates a fresh dataloader,
+``StatefulDataLoader`` via ``RecipeConfig.dataloader.build()``, advances it a
+few batches, checkpoints the state, then creates a fresh dataloader,
 loads the state, and asserts that the next batch matches the expected one.
 
 Launch (single-GPU is sufficient):
@@ -35,11 +35,12 @@ import torch.distributed as dist
 
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 from nemo_automodel.components.config.loader import ConfigNode
-from nemo_automodel.recipes.retrieval.train_bi_encoder import build_dataloader
+from nemo_automodel.recipes._typed_config import RecipeConfig
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _init_dist():
     """Ensure torch.distributed is initialized (torchrun sets env vars)."""
@@ -54,9 +55,7 @@ def _write_test_data(path: Path, n_samples: int = 20) -> None:
             entry = {
                 "query": f"What is question number {i}?",
                 "pos_doc": f"This is the positive passage for question {i}.",
-                "neg_doc": [
-                    f"Negative passage {j} for question {i}." for j in range(4)
-                ],
+                "neg_doc": [f"Negative passage {j} for question {i}." for j in range(4)],
             }
             f.write(json.dumps(entry) + "\n")
 
@@ -132,11 +131,12 @@ def _build_retrieval_dataloader(data_file: str, model_type: str, tokenizer, batc
             "pad_to_multiple_of": 8,
         }
 
-    cfg_dl = ConfigNode(
+    cfg = ConfigNode(
         {
-            "_target_": "torchdata.stateful_dataloader.StatefulDataLoader",
             "dataset": {
-                "_target_": "nemo_automodel.components.datasets.llm.retrieval_dataset_inline.make_retrieval_dataset",
+                "_target_": (
+                    "nemo_automodel.components.datasets.llm.retrieval_dataset_inline.InlineRetrievalDatasetConfig"
+                ),
                 "model_type": model_type,
                 "data_dir_list": [data_file],
                 "data_type": "train",
@@ -144,17 +144,20 @@ def _build_retrieval_dataloader(data_file: str, model_type: str, tokenizer, batc
                 "seed": seed,
                 "do_shuffle": True,
             },
-            "collate_fn": collate_kwargs,
-            "shuffle": True,
-            "num_workers": 0,
+            "dataloader": {
+                "collate_fn": collate_kwargs,
+                "batch_size": batch_size,
+                "shuffle": True,
+                "num_workers": 0,
+            },
+            "seed": seed,
         }
     )
 
-    return build_dataloader(
-        cfg_dl,
+    dataloader_config = RecipeConfig(cfg).dataloader
+    assert dataloader_config is not None
+    return dataloader_config.build(
         tokenizer=tokenizer,
-        seed=seed,
-        batch_size=batch_size,
         dp_rank=0,
         dp_world_size=1,
     )
@@ -167,9 +170,7 @@ def _tensors_equal(batch_a: dict, batch_b: dict) -> None:
     )
     for k in batch_a:
         if isinstance(batch_a[k], torch.Tensor):
-            assert torch.all(batch_a[k] == batch_b[k]), (
-                f"Tensor mismatch on key '{k}'"
-            )
+            assert torch.all(batch_a[k] == batch_b[k]), f"Tensor mismatch on key '{k}'"
 
 
 # ---------------------------------------------------------------------------

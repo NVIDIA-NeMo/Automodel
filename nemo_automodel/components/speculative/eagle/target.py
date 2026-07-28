@@ -168,7 +168,7 @@ class HFEagle3TargetModel(Eagle3TargetBackend):
         self.cp_mesh = cp_mesh
         self._cp_size = cp_mesh.size() if cp_mesh is not None else 1
         if self._cp_size > 1:
-            from nemo_automodel.components.distributed.cp_utils import attach_context_parallel_hooks
+            from nemo_automodel.components.distributed.context_parallel.utils import attach_context_parallel_hooks
             from nemo_automodel.components.speculative.target_cp import attach_cp_kv_gather_hooks
 
             attach_context_parallel_hooks(self.model)
@@ -191,12 +191,26 @@ class HFEagle3TargetModel(Eagle3TargetBackend):
                 f"Expected {len(self.aux_layer_ids)} captured aux layers but got {len(captured)}: {sorted(captured)}"
             )
 
+    def _num_hidden_layers(self) -> int:
+        """Return the target's decoder depth.
+
+        Multimodal targets (e.g. ``Gemma4ForConditionalGeneration``) carry no
+        top-level ``num_hidden_layers``; the text backbone's depth lives on
+        ``config.text_config``. Text-only targets (and the lightweight config
+        stubs used in tests) expose ``num_hidden_layers`` directly.
+        """
+        config = self.model.config
+        text_config = getattr(config, "text_config", None)
+        if text_config is not None and getattr(text_config, "num_hidden_layers", None) is not None:
+            return text_config.num_hidden_layers
+        return config.num_hidden_layers
+
     def _default_aux_layer_ids(self) -> list[int]:
-        return default_eagle3_aux_layer_ids(self.model.config.num_hidden_layers)
+        return default_eagle3_aux_layer_ids(self._num_hidden_layers())
 
     def _validate_aux_layer_ids(self, aux_layer_ids: Sequence[int]) -> list[int]:
         """Validate aux-layer selection before any forward hooks are registered."""
-        return validate_eagle3_aux_layer_ids(aux_layer_ids, self.model.config.num_hidden_layers)
+        return validate_eagle3_aux_layer_ids(aux_layer_ids, self._num_hidden_layers())
 
     def _get_transformer_layers(self) -> list[nn.Module]:
         """Return decoder layers as an ordered list indexable by integer.
@@ -208,11 +222,21 @@ class HFEagle3TargetModel(Eagle3TargetBackend):
         ``register_forward_hook`` calls.
         """
         # Common HF causal-LM layouts:
-        #   model.model.layers              (Llama, Qwen, Mistral, Gemma, Phi, ...)
-        #   model.layers                    (some VLM text backbones exposed directly)
-        #   model.transformer.h             (GPT2 / Falcon-style)
+        #   model.model.layers                     (Llama, Qwen, Mistral, Gemma, Phi, ...)
+        #   model.model.language_model.layers      (multimodal wrappers: Gemma4ForConditionalGeneration)
+        #   model.language_model.layers            (some VLM text backbones nested one level up)
+        #   model.layers                           (some VLM text backbones exposed directly)
+        #   model.transformer.h                    (GPT2 / Falcon-style)
         if hasattr(self.model, "model") and hasattr(self.model.model, "layers"):
             container = self.model.model.layers
+        elif (
+            hasattr(self.model, "model")
+            and hasattr(self.model.model, "language_model")
+            and hasattr(self.model.model.language_model, "layers")
+        ):
+            container = self.model.model.language_model.layers
+        elif hasattr(self.model, "language_model") and hasattr(self.model.language_model, "layers"):
+            container = self.model.language_model.layers
         elif hasattr(self.model, "layers"):
             container = self.model.layers
         elif hasattr(self.model, "transformer") and hasattr(self.model.transformer, "h"):

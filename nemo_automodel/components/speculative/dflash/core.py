@@ -90,11 +90,77 @@ class NoValidAnchorsError(ValueError):
 
 @dataclass
 class DFlashStepMetrics:
-    """Per-step training outputs for the DFlash draft."""
+    """Per-step training outputs for the DFlash draft.
+
+    Attributes:
+        loss: Scalar tensor containing the differentiable training loss.
+        loss_weight: Scalar tensor containing the effective loss denominator.
+        accuracy: Scalar tensor containing greedy token accuracy.
+        valid_tokens: Scalar tensor containing the supervised-token count.
+        correct_tokens: Scalar tensor containing the greedy-correct token count.
+        accept_len: Scalar tensor containing mean bonus-token-inclusive acceptance length.
+        accept_len_sum: Scalar tensor containing the additive acceptance-length sum.
+        valid_blocks: Scalar tensor containing the number of evaluated draft blocks.
+
+    The count and sum fields retain the additive statistics needed for
+    token-weighted, distributed validation. Averaging ``accuracy`` or
+    ``accept_len`` per micro-batch would bias batches with fewer valid tokens or blocks.
+    """
 
     loss: torch.Tensor
+    loss_weight: torch.Tensor
     accuracy: torch.Tensor
     valid_tokens: torch.Tensor
+    correct_tokens: torch.Tensor
+    accept_len: torch.Tensor
+    accept_len_sum: torch.Tensor
+    valid_blocks: torch.Tensor
+
+
+def compute_accept_len(
+    pred_ids_4d: torch.Tensor,
+    target_ids_4d: torch.Tensor,
+    valid_mask_4d: torch.Tensor,
+) -> torch.Tensor:
+    """Count consecutive accepted predictions for every draft block.
+
+    Args:
+        pred_ids_4d: Long tensor of shape ``[batch, blocks, depth]``.
+        target_ids_4d: Long tensor of shape ``[batch, blocks, depth]``.
+        valid_mask_4d: Bool tensor of shape ``[batch, blocks, depth]``.
+
+    Returns:
+        Float tensor of shape ``[batch, blocks]`` containing the accepted draft
+        tokens before the first mismatch. Invalid positions do not truncate the
+        prefix and do not contribute to its length.
+    """
+    correct = (pred_ids_4d == target_ids_4d) | (~valid_mask_4d)
+    accept_prefix = correct.long().cumprod(dim=2) * valid_mask_4d.long()
+    return accept_prefix.sum(dim=2).float()
+
+
+def compute_acceptance_stats(
+    pred_ids_4d: torch.Tensor,
+    target_ids_4d: torch.Tensor,
+    valid_mask_4d: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return mean, sum, and count for bonus-token-inclusive acceptance length.
+
+    Args:
+        pred_ids_4d: Long tensor of shape ``[batch, blocks, depth]``.
+        target_ids_4d: Long tensor of shape ``[batch, blocks, depth]``.
+        valid_mask_4d: Bool tensor of shape ``[batch, blocks, depth]``.
+
+    Returns:
+        Three scalar tensors: mean acceptance length, its additive sum, and the
+        number of blocks containing at least one valid drafted token.
+    """
+    block_accept = compute_accept_len(pred_ids_4d, target_ids_4d, valid_mask_4d)
+    valid_block_mask = valid_mask_4d.any(dim=2)
+    valid_blocks = valid_block_mask.sum()
+    accept_len_sum = ((block_accept + 1.0) * valid_block_mask).sum()
+    accept_len = accept_len_sum / valid_blocks.clamp_min(1).float()
+    return accept_len, accept_len_sum, valid_blocks
 
 
 _DFLASH_LOSS_TYPES = ("dflash", "variable_prefix")
@@ -493,12 +559,33 @@ class DFlashTrainerModule(nn.Module):
         assert loss_fn is not None, "loss_fn is always constructed for loss_type='dflash'"
         loss_out = loss_fn(pred_logits, pred_targets, pred_mask, num_tokens=None, block_size=bs)
 
+        loss_weights = pred_mask.view(bsz, n, bs - 1)
+        if self.loss_decay_gamma is not None:
+            depth_weights = torch.exp(
+                -torch.arange(bs - 1, device=pred_mask.device, dtype=pred_mask.dtype) / self.loss_decay_gamma
+            )
+            loss_weights = loss_weights * depth_weights
+        loss_weight = loss_weights.sum()
+
         count_per_pos = loss_out.draft_count_per_pos
         valid_tokens = count_per_pos.sum()
-        accuracy = loss_out.draft_correct_per_pos.sum() / (valid_tokens + 1e-6)
+        correct_tokens = loss_out.draft_correct_per_pos.sum()
+        accuracy = correct_tokens / valid_tokens.clamp_min(1)
+        accept_len, accept_len_sum, valid_blocks = compute_acceptance_stats(
+            pred_logits.argmax(dim=-1).view(bsz, n, bs - 1),
+            pred_targets.view(bsz, n, bs - 1),
+            pred_mask.view(bsz, n, bs - 1).bool(),
+        )
 
         return DFlashStepMetrics(
-            loss=loss_out.total_loss, accuracy=accuracy.detach(), valid_tokens=valid_tokens.detach()
+            loss=loss_out.total_loss,
+            loss_weight=loss_weight.detach(),
+            accuracy=accuracy.detach(),
+            valid_tokens=valid_tokens.detach(),
+            correct_tokens=correct_tokens.detach(),
+            accept_len=accept_len.detach(),
+            accept_len_sum=accept_len_sum.detach(),
+            valid_blocks=valid_blocks.detach(),
         )
 
     def _variable_prefix_loss(
@@ -553,6 +640,17 @@ class DFlashTrainerModule(nn.Module):
         loss = (token_nll * weights).sum() / (weights.sum() + 1e-6)
 
         valid_tokens = supervised.sum()
-        correct = ((logits.argmax(dim=-1) == target_ids).float() * supervised).sum()
-        accuracy = correct / (valid_tokens + 1e-6)
-        return DFlashStepMetrics(loss=loss, accuracy=accuracy.detach(), valid_tokens=valid_tokens.detach())
+        pred_ids = logits.argmax(dim=-1)
+        correct = ((pred_ids == target_ids).float() * supervised).sum()
+        accuracy = correct / valid_tokens.clamp_min(1)
+        accept_len, accept_len_sum, valid_blocks = compute_acceptance_stats(pred_ids, target_ids, supervised.bool())
+        return DFlashStepMetrics(
+            loss=loss,
+            loss_weight=weights.sum().detach(),
+            accuracy=accuracy.detach(),
+            valid_tokens=valid_tokens.detach(),
+            correct_tokens=correct.detach(),
+            accept_len=accept_len.detach(),
+            accept_len_sum=accept_len_sum.detach(),
+            valid_blocks=valid_blocks.detach(),
+        )
