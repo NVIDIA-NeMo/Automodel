@@ -90,6 +90,7 @@ def _validate_kimi_k3_gates(
     backend: str,
     cp_size: int,
     tp_size: int,
+    pp_size: int,
     packed_sequence_size: int,
     parallel_drafting: bool,
     target_force_hf: bool,
@@ -100,6 +101,7 @@ def _validate_kimi_k3_gates(
         backend: ``recipe_args.target_model_backend``.
         cp_size: ``distributed.cp_size``.
         tp_size: ``distributed.tp_size``.
+        pp_size: ``distributed.pp_size``.
         packed_sequence_size: ``recipe_args.packed_sequence_size``.
         parallel_drafting: ``recipe_args.parallel_drafting`` (P-EAGLE).
         target_force_hf: ``recipe_args.target_force_hf``.
@@ -120,6 +122,14 @@ def _validate_kimi_k3_gates(
             "Kimi K3 EAGLE-3 training supports neither context nor tensor parallelism; "
             "shard the target with expert parallelism (distributed.ep_size) and set cp_size=tp_size=1."
         )
+    if pp_size > 1:
+        # Online supervision hooks one complete target forward: a pipelined target holds
+        # only its stage's layers (keyed by global index), so aux-layer capture either
+        # raises a KeyError or silently captures nothing.
+        raise NotImplementedError(
+            "Pipeline parallelism (distributed.pp_size > 1) is not supported for the Kimi K3 "
+            "EAGLE-3 target; the aux hidden states are captured from one non-pipelined forward."
+        )
     if packed_sequence_size > 0:
         # K3 owns packed attention itself (its document layout comes from the 2D mask /
         # cu_seqlens), while the EAGLE-3 wrapper hands packed batches a [B, 1, T, T]
@@ -138,7 +148,10 @@ def _build_kimi_k3_target_backend(recipe_cfg) -> BackendConfig:
         linear="torch",
         rms_norm="torch_fp32",
         rope_fusion=False,
-        dispatcher=str(recipe_cfg.get("target_dispatcher", "hybridep")),
+        # ``torch`` is the dispatcher K3's own SFT reference config runs expert parallelism
+        # with; the DeepEP-family dispatchers need a matching DeepEP build, so they are opt-in
+        # through ``target_dispatcher`` rather than the default.
+        dispatcher=str(recipe_cfg.get("target_dispatcher", "torch")),
         experts=str(recipe_cfg.get("target_experts", "torch_mm")),
         enable_hf_state_dict_adapter=True,
         enable_fsdp_optimizations=bool(recipe_cfg.get("target_enable_fsdp_optimizations", True)),
@@ -977,6 +990,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                 backend=backend,
                 cp_size=cp_size,
                 tp_size=tp_size,
+                pp_size=int(self.cfg.get("distributed.pp_size", 1) or 1),
                 packed_sequence_size=int(packed_sequence_size or 0),
                 parallel_drafting=bool(recipe_cfg.get("parallel_drafting", False)),
                 target_force_hf=bool(recipe_cfg.get("target_force_hf", False)),

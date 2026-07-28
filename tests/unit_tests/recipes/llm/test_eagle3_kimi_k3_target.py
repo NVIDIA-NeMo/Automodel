@@ -64,6 +64,7 @@ def _gate_kwargs(**overrides):
         backend="colocated",
         cp_size=1,
         tp_size=1,
+        pp_size=1,
         packed_sequence_size=0,
         parallel_drafting=False,
         target_force_hf=False,
@@ -88,16 +89,16 @@ def test_text_config_model_type_is_the_dispatch_key():
 
 def test_backend_defaults_to_expert_parallel_fp32_norm():
     backend = _build_kimi_k3_target_backend(_Cfg())
-    assert (backend.attn, backend.dispatcher, backend.experts) == ("eager", "hybridep", "torch_mm")
+    assert (backend.attn, backend.dispatcher, backend.experts) == ("eager", "torch", "torch_mm")
     assert backend.rms_norm == "torch_fp32"
     assert backend.enable_hf_state_dict_adapter and not backend.rope_fusion
 
 
 def test_backend_honors_overrides():
     backend = _build_kimi_k3_target_backend(
-        _Cfg(target_dispatcher="torch", target_experts="te_grouped_mm", target_enable_fsdp_optimizations=False)
+        _Cfg(target_dispatcher="deepep", target_experts="gmm", target_enable_fsdp_optimizations=False)
     )
-    assert (backend.dispatcher, backend.experts) == ("torch", "te_grouped_mm")
+    assert (backend.dispatcher, backend.experts) == ("deepep", "gmm")
     assert not backend.enable_fsdp_optimizations
 
 
@@ -134,6 +135,11 @@ def test_gates_reject_context_and_tensor_parallelism(key):
         _validate_kimi_k3_gates(**_gate_kwargs(**{key: 2}))
 
 
+def test_gates_reject_pipeline_parallelism():
+    with pytest.raises(NotImplementedError, match="Pipeline parallelism"):
+        _validate_kimi_k3_gates(**_gate_kwargs(pp_size=8))
+
+
 def test_gates_reject_sequence_packing():
     with pytest.raises(NotImplementedError, match="Sequence packing"):
         _validate_kimi_k3_gates(**_gate_kwargs(packed_sequence_size=4096))
@@ -161,4 +167,4 @@ def test_builds_text_only_causal_lm_from_config():
     assert kwargs["load_base_model"] is True
     assert kwargs["torch_dtype"] is torch.bfloat16
     assert kwargs["distributed_setup"] is recipe.dist_setup
-    assert kwargs["backend"].dispatcher == "hybridep"
+    assert kwargs["backend"].dispatcher == "torch"

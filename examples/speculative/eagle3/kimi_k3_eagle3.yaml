@@ -51,7 +51,7 @@ recipe_args:
   # Frozen-target backend knobs, shown with their defaults. Uncomment to retune the
   # target's expert dispatch per cluster.
   # target_attn_backend: eager
-  # target_dispatcher: hybridep
+  # target_dispatcher: torch      # deepep / hybridep when that build is available
   # target_experts: torch_mm
   # target_enable_fsdp_optimizations: true
 
