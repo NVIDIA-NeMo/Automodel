@@ -20,7 +20,7 @@ independent of specific model implementations through the ModelAdapter abstracti
 
 Features:
 - Model-agnostic design via ModelAdapter protocol
-- Various timestep sampling strategies (uniform, logit_normal, mode, lognorm)
+- Various timestep sampling strategies (uniform, logit_normal, mode, lognorm, beta)
 - Flow shift transformation
 - Sigma clamping for finetuning
 - Loss weighting
@@ -123,6 +123,9 @@ class FlowMatchingPipeline:
         logit_std: float = 1.0,
         # Mix sampling parameters
         mix_uniform_ratio: float = 0.1,
+        # Beta distribution parameters
+        beta_alpha: float = 2.5,
+        beta_beta: float = 1.5,
         # Sigma sampling mode
         use_sigma_noise: bool = True,
         # Sigma clamping for finetuning (pretrain uses [0.0, 1.0])
@@ -148,12 +151,15 @@ class FlowMatchingPipeline:
                 - "mode": Mode-based sampling
                 - "lognorm": Log-normal based sampling
                 - "mix": Mix of lognorm and uniform
+                - "beta": Beta-distributed sigma without flow shifting
             flow_shift: Shift parameter for timestep transformation
             i2v_prob: Probability of using image-to-video conditioning
             cfg_dropout_prob: Probability of dropping text embeddings for CFG training
             logit_mean: Mean for logit-normal distribution
             logit_std: Std for logit-normal distribution
             mix_uniform_ratio: Ratio of uniform samples when using mix
+            beta_alpha: Positive alpha shape parameter for beta sampling
+            beta_beta: Positive beta shape parameter for beta sampling
             use_sigma_noise: Whether to use shifted sigma-noise sampling. If False,
                 sample sigma uniformly without flow shift ("uniform_no_shift")
             sigma_min: Minimum sigma (0.0 for pretrain)
@@ -176,6 +182,10 @@ class FlowMatchingPipeline:
         self.logit_mean = logit_mean
         self.logit_std = logit_std
         self.mix_uniform_ratio = mix_uniform_ratio
+        self.beta_alpha = float(beta_alpha)
+        self.beta_beta = float(beta_beta)
+        if self.beta_alpha <= 0 or self.beta_beta <= 0:
+            raise ValueError("beta_alpha and beta_beta must both be positive")
         self.use_sigma_noise = use_sigma_noise
         self.sigma_min = sigma_min
         self.sigma_max = sigma_max
@@ -242,6 +252,14 @@ class FlowMatchingPipeline:
             sigma = torch.clamp(sigma, self.sigma_min, self.sigma_max)
             timesteps = sigma * self.num_train_timesteps
             return sigma, timesteps, "uniform_no_shift"
+
+        if self.timestep_sampling == "beta":
+            alpha = torch.full((batch_size,), self.beta_alpha, dtype=torch.float32, device=device)
+            beta = torch.full((batch_size,), self.beta_beta, dtype=torch.float32, device=device)
+            sigma = torch.distributions.Beta(alpha, beta).sample()
+            sigma = torch.clamp(sigma, self.sigma_min, self.sigma_max)
+            timesteps = sigma * self.num_train_timesteps
+            return sigma, timesteps, "beta"
 
         # Determine if we should use uniform (for mix strategy)
         use_uniform = self.timestep_sampling == "uniform" or (
@@ -332,7 +350,7 @@ class FlowMatchingPipeline:
             loss_weight: Applied weights
             loss_mask: Loss mask from batch (or None if not present)
         """
-        loss = nn.functional.mse_loss(model_pred.float(), target.float(), reduction="none")
+        loss = self.model_adapter.compute_loss(model_pred, target)
         loss_mask = batch.get("loss_mask") if batch is not None else None
 
         if self.use_loss_weighting:
@@ -603,18 +621,23 @@ def create_adapter(adapter_type: str, **kwargs) -> ModelAdapter:
     Factory function to create a model adapter by name.
 
     Args:
-        adapter_type: Type of adapter ("hunyuan", "simple", "flux", "flux2", "qwen_image")
+        adapter_type: Type of adapter ("hunyuan", "simple", "flux", "flux2", "qwen_image", "qwen_image_edit")
         **kwargs: Additional arguments passed to the adapter constructor
 
     Returns:
         ModelAdapter instance
     """
+    # Imported lazily: the adapter is owned by the model package, and importing
+    # it here at module scope would load the Qwen model code for every recipe.
+    from nemo_automodel.components.models.qwen_image_edit.adapter import QwenImageEditAdapter
+
     adapters = {
         "hunyuan": HunyuanAdapter,
         "simple": SimpleAdapter,
         "flux": FluxAdapter,
         "flux2": Flux2Adapter,
         "qwen_image": QwenImageAdapter,
+        "qwen_image_edit": QwenImageEditAdapter,
     }
 
     if adapter_type not in adapters:
