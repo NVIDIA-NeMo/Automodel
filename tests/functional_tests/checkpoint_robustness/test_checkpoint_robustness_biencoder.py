@@ -19,7 +19,8 @@ next-token logits, so we compare checkpoint fidelity using cosine similarity ins
 KL divergence.
 
 Launch: torchrun --nproc-per-node=<N> -m pytest <this_file> -c <config.yaml>
-    [--cosine_threshold <float>] [--check_resume]
+    [--cosine_threshold <float>] [--hf_cosine_threshold <float>]
+    [--check_hf_reload] [--check_resume]
 """
 
 from __future__ import annotations
@@ -34,23 +35,29 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from PIL import Image
 
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.recipes.retrieval.train_bi_encoder import TrainBiEncoderRecipe
+from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm import (
+    _finish_hf_reload_sync,
+    _prepare_hf_reload_sync,
+)
 
 # Default test sentence for embedding extraction
 _DEFAULT_PROMPT = "The quick brown fox jumps over the lazy dog"
 
 
-def _extract_custom_args(argv):
+def _extract_custom_args(argv: list[str]) -> tuple[dict[str, str | bool], list[str]]:
     """Separate test-specific CLI flags from config parser arguments."""
     custom_keys = {
         "--cosine_threshold",
+        "--hf_cosine_threshold",
         "--resume_loss_threshold",
     }
-    boolean_keys = {"--check_resume"}
-    custom = {}
-    remaining = []
+    boolean_keys = {"--check_hf_reload", "--check_resume"}
+    custom: dict[str, str | bool] = {}
+    remaining: list[str] = []
     i = 0
     while i < len(argv):
         if argv[i] in custom_keys:
@@ -62,6 +69,28 @@ def _extract_custom_args(argv):
         else:
             remaining.append(argv[i])
             i += 1
+
+    config_path = None
+    for index, arg in enumerate(remaining):
+        if arg == "--config" and index + 1 < len(remaining):
+            config_path = remaining[index + 1]
+            break
+    if config_path:
+        import yaml
+
+        with open(config_path) as f:
+            raw_cfg = yaml.safe_load(f)
+        ci_robustness = raw_cfg.get("ci", {}).get("checkpoint_robustness") or {}
+        for cli_key in custom_keys | boolean_keys:
+            key = cli_key.lstrip("-")
+            if key in custom or key not in ci_robustness:
+                continue
+            value = ci_robustness[key]
+            if isinstance(value, bool):
+                if value:
+                    custom[key] = True
+            else:
+                custom[key] = str(value)
     return custom, remaining
 
 
@@ -89,6 +118,18 @@ def _get_embeddings(model, tokenizer, prompt: str, device) -> torch.Tensor:
     return embeddings.float().cpu()
 
 
+def _get_hf_style_embeddings(model, prompt: str) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return query and image-document embeddings from a raw HF-compatible backbone."""
+    model = getattr(model, "module", model)
+    backbone = getattr(model, "model", model)
+    backbone.eval()
+    image = Image.new("RGB", (64, 64), color=(32, 96, 160))
+    with torch.no_grad():
+        query_embeddings = backbone.encode_queries([prompt])
+        document_embeddings = backbone.encode_documents(images=[image])
+    return query_embeddings.float().cpu(), document_embeddings.float().cpu()
+
+
 def _cosine_similarity(ref: torch.Tensor, cand: torch.Tensor) -> float:
     """Compute cosine similarity between two embedding tensors."""
     return F.cosine_similarity(ref.flatten().unsqueeze(0), cand.flatten().unsqueeze(0)).item()
@@ -108,6 +149,8 @@ def test_checkpoint_robustness_biencoder():
     custom_args, config_argv = _extract_custom_args(sys.argv[1:])
     sys.argv = [sys.argv[0]] + config_argv
     cosine_threshold = float(custom_args.get("cosine_threshold", "0.999"))
+    hf_cosine_threshold = float(custom_args.get("hf_cosine_threshold", "0.999"))
+    check_hf_reload = bool(custom_args.get("check_hf_reload", False))
     check_resume = bool(custom_args.get("check_resume", False))
     resume_loss_threshold = float(custom_args.get("resume_loss_threshold", "5e-3"))
 
@@ -131,6 +174,10 @@ def test_checkpoint_robustness_biencoder():
     device = next(trainer.model_parts[0].parameters()).device
     tokenizer = trainer.tokenizer
     reference_embeddings = _get_embeddings(trainer.model_parts[0], tokenizer, _DEFAULT_PROMPT, device)
+    hf_reference_query = None
+    hf_reference_document = None
+    if check_hf_reload:
+        hf_reference_query, hf_reference_document = _get_hf_style_embeddings(trainer.model_parts[0], _DEFAULT_PROMPT)
     if _rank0():
         print(f"\n[Phase 2] Reference embedding shape: {reference_embeddings.shape}")
         print(f"[Phase 2] Reference embedding norm: {reference_embeddings.norm().item():.6f}")
@@ -173,7 +220,51 @@ def test_checkpoint_robustness_biencoder():
     _barrier()
 
     # ------------------------------------------------------------------
-    # Phase 4 (optional): Training resumption -- verify loss continuity
+    # Phase 4 (optional): Reload with vanilla Hugging Face AutoModel
+    # ------------------------------------------------------------------
+    if check_hf_reload:
+        hf_reload_sync_paths = _prepare_hf_reload_sync(cfg)
+        hf_reload_error = None
+        if _rank0():
+            try:
+                from transformers import AutoModel
+
+                assert hf_reference_query is not None
+                assert hf_reference_document is not None
+                hf_model = AutoModel.from_pretrained(
+                    str(consolidated_dir),
+                    trust_remote_code=True,
+                    torch_dtype=torch.bfloat16,
+                    attn_implementation="flash_attention_2",
+                ).to(device)
+                hf_query, hf_document = _get_hf_style_embeddings(hf_model, _DEFAULT_PROMPT)
+                query_cosine_sim = _cosine_similarity(hf_reference_query, hf_query)
+                document_cosine_sim = _cosine_similarity(hf_reference_document, hf_document)
+                print(
+                    f"\n[Phase 4] HF reload query cosine similarity: {query_cosine_sim:.6f}; "
+                    f"image-document cosine similarity: {document_cosine_sim:.6f} "
+                    f"(threshold: {hf_cosine_threshold})"
+                )
+                if query_cosine_sim < hf_cosine_threshold:
+                    hf_reload_error = (
+                        f"HF-reloaded query embedding cosine similarity too low: "
+                        f"{query_cosine_sim:.6f} < threshold {hf_cosine_threshold}"
+                    )
+                if document_cosine_sim < hf_cosine_threshold:
+                    document_error = (
+                        f"HF-reloaded image-document embedding cosine similarity too low: "
+                        f"{document_cosine_sim:.6f} < threshold {hf_cosine_threshold}"
+                    )
+                    hf_reload_error = "\n".join(filter(None, (hf_reload_error, document_error)))
+                del hf_model
+                torch.cuda.empty_cache()
+            except Exception as exc:
+                hf_reload_error = f"Vanilla HF reload failed: {type(exc).__name__}: {exc}"
+        hf_reload_error = _finish_hf_reload_sync(hf_reload_sync_paths, hf_reload_error)
+        assert hf_reload_error is None, hf_reload_error
+
+    # ------------------------------------------------------------------
+    # Phase 5 (optional): Training resumption -- verify loss continuity
     # ------------------------------------------------------------------
     if check_resume:
         # Baseline: fresh continuous run for max_steps+3, saving losses
@@ -212,8 +303,8 @@ def test_checkpoint_robustness_biencoder():
         # Compare losses at the overlapping steps
         resume_jsonl = checkpoint_dir / "training.jsonl"
         if _rank0():
-            assert baseline_losses, "Phase 4: baseline_losses is empty -- no steps to compare"
-            assert resume_jsonl.exists(), f"Phase 4: {resume_jsonl} not found"
+            assert baseline_losses, "Phase 5: baseline_losses is empty -- no steps to compare"
+            assert resume_jsonl.exists(), f"Phase 5: {resume_jsonl} not found"
 
             resume_losses = {}
             with open(resume_jsonl) as f:
@@ -229,20 +320,17 @@ def test_checkpoint_robustness_biencoder():
                     bl = baseline_losses[step]
                     rl = resume_losses[step]
                     diff = abs(bl - rl)
-                    print(
-                        f"[Phase 4] Step {step}: baseline_loss={bl:.6f}, "
-                        f"resume_loss={rl:.6f}, diff={diff:.6e}"
-                    )
+                    print(f"[Phase 5] Step {step}: baseline_loss={bl:.6f}, resume_loss={rl:.6f}, diff={diff:.6e}")
                     assert diff < resume_loss_threshold, (
                         f"Contrastive loss mismatch after resume at step {step}: "
                         f"baseline={bl:.6f}, resume={rl:.6f}, diff={diff:.6e}"
                     )
 
             assert matched_steps > 0, (
-                f"Phase 4: no overlapping steps found between baseline ({sorted(baseline_losses.keys())}) "
+                f"Phase 5: no overlapping steps found between baseline ({sorted(baseline_losses.keys())}) "
                 f"and resume ({sorted(resume_losses.keys())})"
             )
-            print(f"[Phase 4] Training resumption verified ({matched_steps} steps compared)")
+            print(f"[Phase 5] Training resumption verified ({matched_steps} steps compared)")
 
         del resume_trainer
         torch.cuda.empty_cache()
