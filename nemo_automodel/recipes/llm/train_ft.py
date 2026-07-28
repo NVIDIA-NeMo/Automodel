@@ -415,7 +415,11 @@ def _build_partial_cuda_graph_manager(
     Returns:
         An armed manager when any backend selects CUDA-graph scopes, otherwise ``None``.
     """
-    enabled = any(model_part.backend.cuda_graph.modules for model_part in model_parts)
+    enabled = any(
+        model_part.backend.cuda_graph.modules
+        for model_part in model_parts
+        if getattr(model_part, "backend", None) is not None
+    )
     if not enabled:
         return None
     return PartialCudaGraphManager.from_model_parts(

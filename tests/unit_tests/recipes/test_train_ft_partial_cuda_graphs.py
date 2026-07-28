@@ -54,11 +54,9 @@ def test_builder_forwards_runtime_safety_context(monkeypatch):
 def test_builder_does_not_use_manager_when_no_scope_is_enabled(monkeypatch):
     discover = MagicMock()
     monkeypatch.setattr(partial_graphs.PartialCudaGraphManager, "from_model_parts", discover)
-    model = nn.Linear(2, 2)
-    model.backend = BackendConfig()
 
     result = _build_partial_cuda_graph_manager(
-        [model],
+        [nn.Linear(2, 2)],
         activation_checkpointing=False,
         pipeline_parallel=False,
     )
