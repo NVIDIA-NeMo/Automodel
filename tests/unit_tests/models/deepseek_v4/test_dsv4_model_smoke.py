@@ -102,13 +102,6 @@ def _make_model(config: DeepseekV4Config) -> DeepseekV4ForCausalLM:
         experts="torch_mm",
     )
     model = DeepseekV4ForCausalLM(config, backend=backend)
-    # The model mixes per-module dtype defaults (``embed_tokens`` is built bf16
-    # via the now-deprecated ``config.torch_dtype`` path; bare ``nn.Linear``
-    # sub-modules pick up the global fp32 default).  Force everything to a
-    # single fp32 dtype for the smoke test so matmuls don't hit dtype mismatch.
-    # ``DeepseekV4HyperConnection`` keeps its parameters in fp32 explicitly —
-    # ``model.float()`` is a no-op for those.
-    model = model.float()
     # Zero all float params: Gate/GroupedExperts use torch.empty (uninitialized memory
     # that may contain NaN bit patterns). initialize_weights() is not called in smoke tests.
     with torch.no_grad():
@@ -117,6 +110,36 @@ def _make_model(config: DeepseekV4Config) -> DeepseekV4ForCausalLM:
                 p.zero_()
     model.eval()
     return model
+
+
+def test_fp32_config_constructs_all_floating_parameters_in_fp32():
+    """An fp32 config must not leave RMSNorm weights in the bf16 helper default."""
+    config = _tiny_config(num_hidden_layers=1, num_hash_layers=0, compress_ratios=[4])
+    model = _make_model(config)
+
+    mismatches = {
+        name: param.dtype
+        for name, param in model.named_parameters()
+        if param.is_floating_point() and param.dtype != torch.float32
+    }
+
+    assert not mismatches
+
+
+def test_config_honors_canonical_dtype_argument():
+    config = DeepseekV4Config(dtype="float32")
+
+    assert config.dtype == torch.float32
+    assert config.torch_dtype == torch.float32
+
+
+def test_config_preserves_fp32_dtype_through_serialization_round_trip():
+    config = DeepseekV4Config(dtype="float32")
+
+    restored = DeepseekV4Config.from_dict(config.to_dict())
+
+    assert restored.dtype == torch.float32
+    assert restored.torch_dtype == torch.float32
 
 
 class TestDeepseekV4ModelSmoke:
@@ -170,7 +193,7 @@ class TestDeepseekV4ModelSmoke:
         assert dsv4_fsdp._hca_param_sync_group_from_1d_mesh(TwoDimMesh()) is None
         assert dsv4_fsdp._hca_param_sync_group_from_1d_mesh(NamedOneDimMesh()) is named_hca_group
 
-    def test_dsv4_fsdp_attaches_hca_group_before_all_fp32_fast_path(self, monkeypatch):
+    def test_dsv4_fsdp_uses_bf16_compute_for_uniform_fp32_master_weights(self, monkeypatch):
         cfg = _tiny_config(num_hidden_layers=1, num_hash_layers=0, compress_ratios=[128])
         model = _make_model(cfg)
         block = model.model.layers["0"]
@@ -208,6 +231,35 @@ class TestDeepseekV4ModelSmoke:
         )
 
         assert block.self_attn.compressor._hca_param_sync_group is hca_group
+        assert calls[-1][0] is block
+        assert calls[-1][1]["mp_policy"].param_dtype == torch.bfloat16
+        assert calls[-1][1]["mp_policy"].reduce_dtype == torch.float32
+        assert any(module is not block and kwargs["mp_policy"].param_dtype == torch.float32 for module, kwargs in calls)
+
+    def test_dsv4_fsdp_preserves_explicit_all_fp32_compute_fast_path(self, monkeypatch):
+        cfg = _tiny_config(num_hidden_layers=1, num_hash_layers=0, compress_ratios=[128])
+        block = _make_model(cfg).model.layers["0"]
+        calls = []
+
+        def fake_fully_shard(module, **kwargs):
+            calls.append((module, kwargs))
+            return module
+
+        monkeypatch.setattr(dsv4_fsdp, "fully_shard", fake_fully_shard)
+
+        input_policy = MixedPrecisionPolicy(
+            param_dtype=torch.float32,
+            reduce_dtype=torch.float32,
+            output_dtype=torch.float32,
+        )
+
+        dsv4_fsdp.fully_shard_deepseek_v4(
+            block,
+            mesh=object(),
+            mp_policy=input_policy,
+            offload_policy=object(),
+        )
+
         assert len(calls) == 1
         assert calls[0][0] is block
         assert calls[0][1]["mp_policy"].param_dtype == torch.float32
@@ -647,6 +699,31 @@ class TestDeepseekV4ModelSmoke:
             )
 
         assert out.logits.shape == (1, 8, cfg.vocab_size)
+
+    def test_thd_cp1_accepts_standard_cu_seqlens(self, monkeypatch):
+        """A non-CP packed caller should not need to translate metadata for DSV4."""
+        cfg = _tiny_config(num_hidden_layers=0, compress_ratios=[])
+        model = _make_model(cfg)
+        captured = {}
+
+        def fake_packed_mask(seq_lens, seq_len, dtype, device, sliding_window=None):
+            captured["seq_lens"] = seq_lens
+            return torch.zeros(1, 1, seq_len, seq_len, dtype=dtype, device=device)
+
+        monkeypatch.setattr(dsv4_model_module, "build_packed_causal_padding_mask", fake_packed_mask)
+
+        cu_seqlens = torch.tensor([0, 3, 8], dtype=torch.int32)
+        with torch.no_grad():
+            out = model(
+                torch.ones(1, 8, dtype=torch.long),
+                position_ids=torch.tensor([[0, 1, 2, 0, 1, 2, 3, 4]]),
+                qkv_format="thd",
+                cu_seqlens=cu_seqlens,
+                cu_seqlens_padded=cu_seqlens,
+            )
+
+        assert out.logits.shape == (1, 8, cfg.vocab_size)
+        torch.testing.assert_close(captured["seq_lens"], torch.tensor([[3, 5]], dtype=torch.int32))
 
     def test_thd_cp_normalizes_packed_ids_and_derives_padding_mask(self, monkeypatch):
         cfg = _tiny_config(num_hidden_layers=0, compress_ratios=[])

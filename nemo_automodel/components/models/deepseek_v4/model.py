@@ -116,6 +116,39 @@ class DeepseekV4CausalLMOutput(CausalLMOutputWithPast):
     mtp_loss_scaling_factor: Optional[float] = None
 
 
+def _seq_lens_from_cu_seqlens(cu_seqlens: torch.Tensor, name: str) -> torch.Tensor:
+    """Convert standard THD cumulative offsets to DSV4's per-row lengths."""
+    if not isinstance(cu_seqlens, torch.Tensor) or cu_seqlens.dim() not in (1, 2):
+        raise ValueError(f"`{name}` must be a rank-1 or rank-2 tensor.")
+    if cu_seqlens.shape[-1] < 2:
+        raise ValueError(f"`{name}` must contain at least the initial and final offsets.")
+
+    seq_lens = torch.diff(cu_seqlens, dim=-1)
+    return seq_lens.unsqueeze(0) if seq_lens.dim() == 1 else seq_lens
+
+
+def _normalize_thd_packing_metadata(attn_kwargs: dict[str, Any]) -> None:
+    """Accept standard THD offsets at the DSV4 model boundary.
+
+    DSV4 internally uses ``seq_lens`` to build document-aware masks. Packed
+    callers commonly provide the equivalent ``cu_seqlens`` representation, so
+    normalize it here when context parallelism has not already produced native
+    padded-BSHD lengths.
+    """
+    if attn_kwargs.get("qkv_format") != "thd":
+        return
+
+    if attn_kwargs.get("seq_lens") is None and attn_kwargs.get("cu_seqlens") is not None:
+        attn_kwargs["seq_lens"] = _seq_lens_from_cu_seqlens(attn_kwargs["cu_seqlens"], "cu_seqlens")
+
+    if attn_kwargs.get("seq_lens_padded") is None:
+        cu_seqlens_padded = attn_kwargs.get("cu_seqlens_padded")
+        if cu_seqlens_padded is not None:
+            attn_kwargs["seq_lens_padded"] = _seq_lens_from_cu_seqlens(cu_seqlens_padded, "cu_seqlens_padded")
+        elif attn_kwargs.get("seq_lens") is not None:
+            attn_kwargs["seq_lens_padded"] = attn_kwargs["seq_lens"]
+
+
 class DeepseekV4Block(nn.Module):
     """Single transformer block for DeepSeek V4.
 
@@ -486,6 +519,7 @@ class DeepseekV4Model(nn.Module):
         # Build the 4D additive causal+padding+SWA mask.  Same band-diagonal
         # pattern HF's ``create_sliding_window_causal_mask`` produces; every
         # layer in the released DSV4-Flash was trained under it.
+        _normalize_thd_packing_metadata(attn_kwargs)
         sliding_window = int(self.config.sliding_window or 0) or None
         packed_seq_lens = None
         if attn_kwargs.get("qkv_format") == "thd":
