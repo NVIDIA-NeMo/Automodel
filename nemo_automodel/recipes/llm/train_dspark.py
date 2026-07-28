@@ -112,9 +112,12 @@ from nemo_automodel.recipes.base_recipe import (
 from nemo_automodel.recipes.llm._dspark_target_build import (
     build_deepseek_v4_target,
     build_glm_5_2_target,
+    distributed_section_dict,
     gather_full_weight_module,
     repair_glm_5_2_qk_rope_head_dim,
     resolve_reduced_target_layers,
+    unsupported_parallel_axes,
+    validate_dspark_parallelism_axes,
 )
 from nemo_automodel.recipes.llm._spec_train_utils import (
     apply_draft_compile,
@@ -368,19 +371,6 @@ def _validate_cached_dspark_manifest(
         )
 
 
-def _distributed_section_dict(cfg) -> dict:
-    """Return the ``distributed:`` section of a top-level recipe config as a plain dict.
-
-    A missing block yields ``{}``, i.e. the default FSDP2 configuration; this keeps the
-    fail-loud missing-block contract of ``create_distributed_setup_from_config`` intact
-    for callers that require an explicit block.
-    """
-    section = cfg.get("distributed", None)
-    if section is None:
-        return {}
-    return section.to_dict() if hasattr(section, "to_dict") else dict(section)
-
-
 def _add_accept_rate_per_position(
     metrics: dict[str, float],
     accept_num: torch.Tensor,
@@ -428,7 +418,7 @@ class TrainDSparkRecipe(BaseRecipe):
         # Reuse the canonical distributed-section parser (strategy case-folding, YAML-null
         # axis defaulting) instead of re-reading the raw block, so the gate cannot drift
         # from what create_distributed_setup_from_config later builds.
-        parsed = parse_distributed_section(_distributed_section_dict(self.cfg))
+        parsed = parse_distributed_section(distributed_section_dict(self.cfg))
         if self.dist_env.world_size <= 1 or not isinstance(parsed["strategy_config"], FSDP2Config):
             if self.dist_env.is_main:
                 logger.warning(
@@ -439,17 +429,13 @@ class TrainDSparkRecipe(BaseRecipe):
                     self.dist_env.world_size,
                 )
             return False
-        unsupported = {
-            axis: parsed[axis]
-            for axis in ("tp_size", "pp_size", "cp_size", "ep_size", "dp_replicate_size")
-            if (parsed[axis] or 1) != 1
-        }
+        # tp_size / pp_size are rejected for every DSpark run by
+        # validate_dspark_parallelism_axes, so only the remaining axes are checked here.
+        unsupported = unsupported_parallel_axes(parsed, ("cp_size", "ep_size", "dp_replicate_size"))
         if unsupported:
             raise ValueError(
                 f"recipe_args.shard_dense_target=true only supports a pure FSDP2 data-parallel "
-                f"topology (tp_size=pp_size=cp_size=ep_size=dp_replicate_size=1), got {unsupported}. "
-                f"DSpark's hidden-state capture needs one non-pipelined model call per rank "
-                f"(pp_size>1 builds an AutoPipeline the target wrapper cannot run), the remaining "
+                f"topology (cp_size=ep_size=dp_replicate_size=1), got {unsupported}. Those "
                 f"model-parallel axes are unsupported for the frozen dense target, and HSDP "
                 f"replication re-replicates the target, defeating the sharding."
             )
@@ -501,6 +487,8 @@ class TrainDSparkRecipe(BaseRecipe):
                 "Sequence packing (packed_sequence_size>0) is only supported on the online text-only "
                 "DSpark path; the VLM and cached-target paths do not carry the packing metadata."
             )
+
+        validate_dspark_parallelism_axes(self.cfg)
 
         # Context parallelism (long-context memory relief): shard only the frozen
         # target forward along the sequence and gather the captured hidden states
