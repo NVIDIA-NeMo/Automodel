@@ -632,7 +632,7 @@ class TrainEagle1Recipe(BaseRecipe):
             legacy = os.path.join(ckpt_dir, "eagle1_meta.pt")
             meta_path = legacy if os.path.exists(legacy) else meta_path
         if os.path.exists(meta_path):
-            meta = torch.load(meta_path, weights_only=False, map_location="cpu")
+            meta = torch.load(meta_path, weights_only=True, map_location="cpu")
             self.runtime.global_step = int(meta.get("global_step", 0))
             self._resume_epoch = int(meta.get("epoch", 0))
 

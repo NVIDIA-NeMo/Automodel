@@ -16,6 +16,7 @@ import io
 import json
 import logging
 import os
+import pickle
 from contextlib import ExitStack
 from datetime import timedelta
 from types import SimpleNamespace
@@ -47,6 +48,7 @@ from nemo_automodel.components.checkpoint.checkpointing import (
     _ensure_dirs,
     _equally_divide_layers,
     _is_custom_model,
+    _load_hf_bin_checkpoint,
     _model_has_dtensors,
     _new_gloo_process_group,
     _normalize_dtype_mapping_to_state_dict_keys,
@@ -1161,6 +1163,27 @@ class TestModelHasDtensors:
         """If all parameters are regular tensors, returns False."""
         model = torch.nn.Sequential(torch.nn.Linear(4, 4), torch.nn.Linear(4, 4))
         assert _model_has_dtensors(model) is False
+
+
+def test_load_hf_bin_checkpoint_loads_tensor_state_dict(tmp_path):
+    """Hugging Face bin checkpoints load when they contain tensor state."""
+    checkpoint_path = tmp_path / "pytorch_model.bin"
+    expected = {"weight": torch.arange(4)}
+    torch.save(expected, checkpoint_path)
+
+    actual = _load_hf_bin_checkpoint(str(checkpoint_path))
+
+    assert actual is not None
+    torch.testing.assert_close(actual["weight"], expected["weight"])
+
+
+def test_load_hf_bin_checkpoint_rejects_pickled_module(tmp_path):
+    """Hugging Face bin loading rejects arbitrary pickled Python objects."""
+    checkpoint_path = tmp_path / "pytorch_model.bin"
+    torch.save(torch.nn.Linear(2, 2), checkpoint_path)
+
+    with pytest.raises(pickle.UnpicklingError, match="Weights only load failed"):
+        _load_hf_bin_checkpoint(str(checkpoint_path))
 
 
 # =============================================================================

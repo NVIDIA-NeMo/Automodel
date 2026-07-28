@@ -642,7 +642,7 @@ class BaseRecipe:
                 # we only save the tokenizer for consolidated checkpoints for downstream use
                 continue
             else:
-                obj.load_state_dict(torch.load(os.path.join(ckpt_dir, f"{key}.pt"), weights_only=False))
+                obj.load_state_dict(torch.load(os.path.join(ckpt_dir, f"{key}.pt"), weights_only=True))
 
         return model, optimizer, scheduler
 

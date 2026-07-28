@@ -734,8 +734,7 @@ class Checkpointer:
             )
         ):
             t0 = time.monotonic()
-            weights_only = not _is_remote_code_model(model_state.model[0])
-            state_dict_from_disk = _load_hf_checkpoint_preserving_dtype(model_path, weights_only=weights_only)
+            state_dict_from_disk = _load_hf_checkpoint_preserving_dtype(model_path)
             t_disk = time.monotonic()
             if state_dict_from_disk is not None:
                 state_dict_from_disk = _maybe_adapt_state_dict_from_hf(
@@ -1163,7 +1162,7 @@ class Checkpointer:
         """
         state_dir = os.path.join(path, state_name)
         state.load_state_dict(
-            torch.load(os.path.join(state_dir, f"{state_name}_dp_rank_{self.dp_rank}.pt"), weights_only=False)
+            torch.load(os.path.join(state_dir, f"{state_name}_dp_rank_{self.dp_rank}.pt"), weights_only=True)
         )
 
     def save_distributed_state(self, state: Any, state_name: str, path: str) -> None:
@@ -2272,14 +2271,7 @@ def _is_custom_model(module: nn.Module) -> bool:
     )
 
 
-def _is_remote_code_model(module: nn.Module) -> bool:
-    """True if the model was loaded with trust_remote_code (HF dynamic modules)."""
-    return any("transformers_modules" in (c.__module__ or "") for c in type(module).__mro__)
-
-
-def _load_hf_checkpoint_preserving_dtype(
-    model_path: str, weights_only: bool = True
-) -> Optional[dict[str, torch.Tensor]]:
+def _load_hf_checkpoint_preserving_dtype(model_path: str) -> Optional[dict[str, torch.Tensor]]:
     """
     Load a HuggingFace checkpoint into a new state dict so tensor dtypes
     match the checkpoint (e.g. bf16). Used when loading the base model so FSDP sees
@@ -2289,11 +2281,10 @@ def _load_hf_checkpoint_preserving_dtype(
 
     Args:
         model_path: Path to checkpoint file or directory.
-        weights_only: Forwarded to ``torch.load`` when loading ``.bin`` files.
     """
 
     if _is_bin_checkpoint(model_path):
-        return _load_hf_bin_checkpoint(model_path, weights_only=weights_only)
+        return _load_hf_bin_checkpoint(model_path)
     elif _is_safetensors_checkpoint(model_path):
         return _load_hf_safetensors_checkpoint(model_path)
     return None
@@ -2336,7 +2327,7 @@ def _load_hf_safetensors_checkpoint(model_path: str) -> Optional[dict[str, torch
 load_hf_safetensors_state_dict = _load_hf_safetensors_checkpoint
 
 
-def _load_hf_bin_checkpoint(model_path: str, weights_only: bool = True) -> Optional[dict[str, torch.Tensor]]:
+def _load_hf_bin_checkpoint(model_path: str) -> Optional[dict[str, torch.Tensor]]:
     """
     Load a HuggingFace .bin checkpoint into a state dict.
 
@@ -2346,17 +2337,12 @@ def _load_hf_bin_checkpoint(model_path: str, weights_only: bool = True) -> Optio
 
     Args:
         model_path: Path to checkpoint file or directory.
-        weights_only: Passed to ``torch.load``.  Default ``True`` for safety;
-            set to ``False`` for remote-code models whose checkpoints may
-            contain custom pickled objects.
     """
     if not _is_bin_checkpoint(model_path):
         return None
 
-    load_kwargs = dict(map_location="cpu", weights_only=weights_only)
-
     if os.path.isfile(model_path):
-        return torch.load(model_path, **load_kwargs)
+        return torch.load(model_path, map_location="cpu", weights_only=True)
 
     # Sharded: read the index and load each shard
     index_file = os.path.join(model_path, "pytorch_model.bin.index.json")
@@ -2374,7 +2360,7 @@ def _load_hf_bin_checkpoint(model_path: str, weights_only: bool = True) -> Optio
             bin_path = os.path.join(model_path, filename)
             if not os.path.isfile(bin_path):
                 continue
-            shard = torch.load(bin_path, **load_kwargs)
+            shard = torch.load(bin_path, map_location="cpu", weights_only=True)
             out.update(shard)
             loaded_files.add(filename)
         return out if out else None
@@ -2382,12 +2368,12 @@ def _load_hf_bin_checkpoint(model_path: str, weights_only: bool = True) -> Optio
     # Single file
     single = os.path.join(model_path, "pytorch_model.bin")
     if os.path.isfile(single):
-        return torch.load(single, **load_kwargs)
+        return torch.load(single, map_location="cpu", weights_only=True)
 
     # Glob fallback
     out = {}
     for bin_path in sorted(glob.glob(os.path.join(model_path, "*.bin"))):
-        shard = torch.load(bin_path, **load_kwargs)
+        shard = torch.load(bin_path, map_location="cpu", weights_only=True)
         out.update(shard)
     return out if out else None
 

@@ -20,7 +20,7 @@ import numpy as np
 import pytest
 import torch
 
-from nemo_automodel.components.training.rng import ScopedRNG, init_all_rng
+from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG, init_all_rng
 
 
 def _next_values():
@@ -117,6 +117,20 @@ def test_stateful_rng_restores_state():
     # NumPy & torch states are numpy arrays / tensors – use dedicated checks
     assert all(np.array_equal(a, b) for a, b in zip(pre_state[1][1:], post_state[1][1:]))
     assert torch.equal(pre_state[2], post_state[2])
+
+
+def test_stateful_rng_round_trips_with_restricted_torch_load(tmp_path):
+    """RNG checkpoints contain only values supported by restricted unpickling."""
+    init_all_rng(314)
+    rng = StatefulRNG(314)
+    checkpoint = tmp_path / "rng.pt"
+    torch.save(rng.state_dict(), checkpoint)
+
+    expected = _next_values()
+    loaded_state = torch.load(checkpoint, weights_only=True)
+    rng.load_state_dict(loaded_state)
+
+    assert _next_values() == expected
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")

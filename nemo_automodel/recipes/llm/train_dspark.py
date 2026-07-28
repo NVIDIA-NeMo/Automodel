@@ -1245,7 +1245,7 @@ class TrainDSparkRecipe(BaseRecipe):
         """Restore DSpark meta: global_step and epoch, and validate mask_token_id."""
         meta_path = os.path.join(ckpt_dir, "dspark_meta.pt")
         if os.path.exists(meta_path):
-            meta = torch.load(meta_path, weights_only=False, map_location="cpu")
+            meta = torch.load(meta_path, weights_only=True, map_location="cpu")
             self.runtime.global_step = int(meta.get("global_step", 0))
             self._resume_epoch = int(meta.get("epoch", 0))
             # ``mask_token_id`` comes only from the resume YAML (it is not restored
