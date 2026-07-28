@@ -133,4 +133,4 @@ ci:
     metric: prompt_level_strict_acc
     baseline: 0.5287
     stderr: 0.0215
-    k: 2
+    k: 3                                 # gemma4 has larger variance
