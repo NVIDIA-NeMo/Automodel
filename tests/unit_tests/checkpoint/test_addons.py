@@ -104,20 +104,9 @@ def test_save_custom_model_code_noop_for_none_or_non_dir(tmp_path):
 
 
 def test_align_exported_processor_with_original_model_code_preserves_runtime_settings(tmp_path):
-    original_dir = tmp_path / "original"
     output_dir = tmp_path / "export"
-    original_dir.mkdir()
     output_dir.mkdir()
 
-    original_auto_map = {
-        "AutoConfig": "configuration_source.SourceConfig",
-        "AutoModel": "modeling_source.SourceModel",
-        "AutoProcessor": "processing_source.SourceProcessor",
-    }
-    (original_dir / "config.json").write_text(json.dumps({"auto_map": original_auto_map}))
-    (original_dir / "processor_config.json").write_text(
-        json.dumps({"auto_map": {"AutoProcessor": "processing_source.SourceProcessor"}})
-    )
     (output_dir / "processing_source.py").write_text("class SourceProcessor: pass\n")
     (output_dir / "processor.py").write_text("class TrainingProcessor: pass\n")
     (output_dir / "processor_config.json").write_text(
@@ -131,10 +120,11 @@ def test_align_exported_processor_with_original_model_code_preserves_runtime_set
     (output_dir / "tokenizer_config.json").write_text(
         json.dumps({"auto_map": {"AutoProcessor": "processor.TrainingProcessor"}})
     )
-    model_part = SimpleNamespace(config=SimpleNamespace(auto_map=original_auto_map.copy()))
+    model_part = SimpleNamespace(
+        _export_processor_auto_map="processing_source.SourceProcessor",
+    )
 
     _align_exported_processor_with_original_model_code(
-        str(original_dir),
         str(output_dir),
         model_part,
     )
@@ -147,40 +137,17 @@ def test_align_exported_processor_with_original_model_code_preserves_runtime_set
     assert (output_dir / "processor.py").exists()
 
 
-def test_align_exported_processor_does_not_replace_processor_for_different_model_code(tmp_path):
-    original_dir = tmp_path / "original"
+def test_align_exported_processor_requires_explicit_model_opt_in(tmp_path):
     output_dir = tmp_path / "export"
-    original_dir.mkdir()
     output_dir.mkdir()
 
-    (original_dir / "config.json").write_text(
-        json.dumps(
-            {
-                "auto_map": {
-                    "AutoModel": "modeling_source.SourceModel",
-                    "AutoProcessor": "processing_source.SourceProcessor",
-                }
-            }
-        )
-    )
-    (original_dir / "processor_config.json").write_text(
-        json.dumps({"auto_map": {"AutoProcessor": "processing_source.SourceProcessor"}})
-    )
     (output_dir / "processing_source.py").write_text("class SourceProcessor: pass\n")
     (output_dir / "processor_config.json").write_text(
         json.dumps({"auto_map": {"AutoProcessor": "processor.TrainingProcessor"}})
     )
-    model_part = SimpleNamespace(
-        config=SimpleNamespace(
-            auto_map={
-                "AutoModel": "model.TrainingModel",
-                "AutoProcessor": "processor.TrainingProcessor",
-            }
-        )
-    )
+    model_part = SimpleNamespace()
 
     _align_exported_processor_with_original_model_code(
-        str(original_dir),
         str(output_dir),
         model_part,
     )
@@ -225,7 +192,11 @@ def test_consolidated_addon_realigns_processor_after_save_pretrained(tmp_path):
             with open(os.path.join(save_directory, "processor.py"), "w") as f:
                 f.write("class TrainingProcessor: pass\n")
 
-    model_part = SimpleNamespace(config=_Config(), generation_config=None)
+    model_part = SimpleNamespace(
+        config=_Config(),
+        generation_config=None,
+        _export_processor_auto_map="processing_source.SourceProcessor",
+    )
     ConsolidatedHFAddon().pre_save(
         model_state=SimpleNamespace(model=[model_part]),
         hf_metadata_dir=str(output_dir),

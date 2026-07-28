@@ -128,7 +128,6 @@ class ConsolidatedHFAddon:
             if tokenizer is not None:
                 tokenizer.save_pretrained(hf_metadata_dir)
                 _align_exported_processor_with_original_model_code(
-                    original_model_path,
                     hf_metadata_dir,
                     model_part,
                 )
@@ -210,7 +209,6 @@ class PeftAddon:
             if tokenizer is not None:
                 tokenizer.save_pretrained(model_path)
                 _align_exported_processor_with_original_model_code(
-                    original_model_path,
                     model_path,
                     model_part,
                 )
@@ -533,11 +531,10 @@ def _auto_map_code_is_present(auto_map_value, output_dir: str) -> bool:
 
 
 def _align_exported_processor_with_original_model_code(
-    original_model_path: str | None,
     output_dir: str,
     model_part: nn.Module | None,
 ) -> None:
-    """Keep an exported remote-code model and processor on the same code version.
+    """Apply an explicit model request to export its paired processor code.
 
     ``tokenizer.save_pretrained`` writes the active training processor's
     ``AutoProcessor`` mapping. Retrieval models can intentionally preserve the
@@ -545,39 +542,16 @@ def _align_exported_processor_with_original_model_code(
     Automodel processor. In that case, mixing the newer processor with the
     original model can break inference even when their class names match.
 
-    When the active model metadata still points to the original checkpoint's
-    ``AutoModel*`` implementation, restore only the original ``AutoProcessor``
-    code reference after saving the processor. Runtime settings written by the
-    active processor (for example ``max_input_tiles``) remain unchanged.
+    Models opt in by setting ``_export_processor_auto_map`` on the model passed
+    to the checkpointer. The addon does not infer intent from generic Hugging
+    Face metadata, so other custom-code models are unaffected by default.
+    Runtime settings written by the active processor (for example
+    ``max_input_tiles``) remain unchanged.
     """
-    if original_model_path is None or model_part is None or not os.path.isdir(original_model_path):
+    if model_part is None:
         return
 
-    original_config = _load_json_dict(os.path.join(original_model_path, "config.json"))
-    active_config = getattr(model_part, "config", None)
-    original_auto_map = original_config.get("auto_map") if original_config is not None else None
-    active_auto_map = getattr(active_config, "auto_map", None)
-    if not isinstance(original_auto_map, dict) or not isinstance(active_auto_map, dict):
-        return
-
-    # Only align the processor when export deliberately retained the original
-    # model implementation. This avoids replacing a processor for models whose
-    # active Automodel implementation differs from the base checkpoint.
-    uses_original_model_code = any(
-        key.startswith("AutoModel") and active_auto_map.get(key) == value for key, value in original_auto_map.items()
-    )
-    if not uses_original_model_code:
-        return
-
-    original_processor_config = _load_json_dict(os.path.join(original_model_path, "processor_config.json"))
-    original_processor_auto_map = (
-        original_processor_config.get("auto_map") if original_processor_config is not None else None
-    )
-    processor_ref = (
-        original_processor_auto_map.get("AutoProcessor")
-        if isinstance(original_processor_auto_map, dict)
-        else original_auto_map.get("AutoProcessor")
-    )
+    processor_ref = getattr(model_part, "_export_processor_auto_map", None)
     if processor_ref is None or not _auto_map_code_is_present(processor_ref, output_dir):
         return
 

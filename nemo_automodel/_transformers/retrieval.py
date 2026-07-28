@@ -399,6 +399,11 @@ def _init_encoder_common(encoder: nn.Module, model: PreTrainedModel) -> None:
     remote_code_source = _get_matching_remote_code_source(model, model.config)
     if remote_code_source is not None:
         encoder.name_or_path = remote_code_source
+        if getattr(model, "_export_original_processor_with_remote_code", False):
+            auto_map = getattr(model.config, "auto_map", None)
+            processor_ref = auto_map.get("AutoProcessor") if isinstance(auto_map, dict) else None
+            if processor_ref is not None:
+                encoder._export_processor_auto_map = processor_ref
     elif ModelRegistry.has_retrieval_model(model.__class__.__name__):
         encoder.name_or_path = os.path.dirname(inspect.getfile(type(model)))
     else:

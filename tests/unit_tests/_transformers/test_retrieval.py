@@ -197,6 +197,26 @@ def test_custom_encoder_exports_local_code_when_remote_class_differs():
     }
 
 
+def test_matching_remote_code_model_can_opt_in_to_export_its_paired_processor():
+    from nemo_automodel._transformers.retrieval import _init_encoder_common
+
+    config = _RemoteCodeConfig()
+    config.name_or_path = "/original/checkpoint"
+    config.auto_map = {
+        "AutoConfig": "configuration_remote._RemoteCodeConfig",
+        "AutoModel": "modeling_remote._RemoteCodeModel",
+        "AutoProcessor": "processing_remote.RemoteProcessor",
+    }
+    model = _RemoteCodeModel(config)
+    model._export_original_processor_with_remote_code = True
+    encoder = nn.Module()
+
+    _init_encoder_common(encoder, model)
+
+    assert encoder.name_or_path == "/original/checkpoint"
+    assert encoder._export_processor_auto_map == "processing_remote.RemoteProcessor"
+
+
 def _tiny_mistral3_vlm_config(text_model_type: str) -> Mistral3Config:
     """Build a tiny Mistral3 VLM config with a selectable text backbone."""
     text_config = {

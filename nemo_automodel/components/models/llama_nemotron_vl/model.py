@@ -633,6 +633,9 @@ class LlamaNemotronVLModel(PreTrainedModel):
     _supports_flash_attn_2 = True  # transformers < 4.54
     _supports_flash_attn = True  # transformers >= 4.54
     _supports_sdpa = True
+    # The original remote-code model and processor form a standalone serving
+    # package. Keep them paired when retrieval export preserves that model code.
+    _export_original_processor_with_remote_code = True
 
     @classmethod
     def from_pretrained(
