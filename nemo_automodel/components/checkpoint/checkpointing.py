@@ -88,6 +88,15 @@ from nemo_automodel.components.checkpoint.config import CheckpointingConfig, Sav
 _CONSOLIDATED_SIZE_WARNING_THRESHOLD_BYTES = 50 * 1024**3
 _DEFAULT_HF_CONSOLIDATED_SHARD_SIZE_BYTES = 5 * 1024**3
 
+_GEMMA4_UNIFIED_HF_EXPORT_KEY_RENAMES = {
+    "embed_vision.patch_ln1": "vision_embedder.patch_ln1",
+    "embed_vision.patch_dense": "vision_embedder.patch_dense",
+    "embed_vision.patch_ln2": "vision_embedder.patch_ln2",
+    "embed_vision.pos_embedding": "vision_embedder.pos_embedding",
+    "embed_vision.pos_norm": "vision_embedder.pos_norm",
+    "embed_vision.multimodal_embedder.embedding_projection": "embed_vision.embedding_projection",
+}
+
 logger = logging.getLogger(__name__)
 
 
@@ -2175,10 +2184,37 @@ def _maybe_adapt_state_dict_to_hf(
     """
     Custom models use state dict adapters to convert the state dict to the Hugging Face format.
     """
-    adapter = getattr(_unwrap_ddp_model(model_part), "state_dict_adapter", None)
+    model_part = _unwrap_ddp_model(model_part)
+    adapter = getattr(model_part, "state_dict_adapter", None)
     if adapter:
-        return adapter.to_hf(state_dict, exclude_key_regex=r".*_extra_state.*", quantization=quantization, **kwargs)
+        state_dict = adapter.to_hf(
+            state_dict,
+            exclude_key_regex=r".*_extra_state.*",
+            quantization=quantization,
+            **kwargs,
+        )
+    if getattr(getattr(model_part, "config", None), "model_type", None) == "gemma4_unified":
+        state_dict = _rename_gemma4_unified_state_dict_to_hf(state_dict)
     return state_dict
+
+
+def _rename_gemma4_unified_state_dict_to_hf(
+    state_dict: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    """Restore Gemma4 Unified checkpoint keys from model FQNs to HF FQNs."""
+    renamed_state_dict: dict[str, torch.Tensor] = {}
+    for key, tensor in state_dict.items():
+        prefix = "model." if key.startswith("model.") else ""
+        unprefixed_key = key[len(prefix) :]
+        for model_key, hf_key in _GEMMA4_UNIFIED_HF_EXPORT_KEY_RENAMES.items():
+            if unprefixed_key == model_key or unprefixed_key.startswith(f"{model_key}."):
+                unprefixed_key = f"{hf_key}{unprefixed_key[len(model_key) :]}"
+                break
+        renamed_key = f"{prefix}{unprefixed_key}"
+        if renamed_key in renamed_state_dict:
+            raise ValueError(f"Gemma4 Unified HF export key collision for {renamed_key!r}")
+        renamed_state_dict[renamed_key] = tensor
+    return renamed_state_dict
 
 
 def _materialize_to_hf_views_for_save(state_dict: dict[str, torch.Tensor]) -> None:

@@ -47,6 +47,7 @@ from nemo_automodel.components.checkpoint.checkpointing import (
     _ensure_dirs,
     _equally_divide_layers,
     _is_custom_model,
+    _maybe_adapt_state_dict_to_hf,
     _model_has_dtensors,
     _new_gloo_process_group,
     _normalize_dtype_mapping_to_state_dict_keys,
@@ -70,6 +71,67 @@ from nemo_automodel.components.checkpoint.utils import (
 CLOUD_PATH_MODEL = "msc://bucket/step-100/model"
 CLOUD_PATH_OPTIM = "msc://bucket/step-100/optim"
 LOCAL_PATH_MODEL = "/ckpts/step-100/model"
+
+
+class TestGemma4UnifiedHFExportKeys:
+    @pytest.mark.parametrize(
+        ("model_key", "hf_key"),
+        [
+            ("embed_vision.patch_ln1.weight", "vision_embedder.patch_ln1.weight"),
+            ("embed_vision.patch_dense.bias", "vision_embedder.patch_dense.bias"),
+            ("embed_vision.patch_ln2.weight", "vision_embedder.patch_ln2.weight"),
+            ("embed_vision.pos_embedding", "vision_embedder.pos_embedding"),
+            ("embed_vision.pos_norm.bias", "vision_embedder.pos_norm.bias"),
+            (
+                "embed_vision.multimodal_embedder.embedding_projection.weight",
+                "embed_vision.embedding_projection.weight",
+            ),
+            (
+                "model.embed_vision.multimodal_embedder.embedding_projection.weight",
+                "model.embed_vision.embedding_projection.weight",
+            ),
+        ],
+    )
+    def test_restores_hf_checkpoint_key(self, model_key, hf_key):
+        model = SimpleNamespace(config=SimpleNamespace(model_type="gemma4_unified"))
+        tensor = torch.ones(1)
+
+        result = _maybe_adapt_state_dict_to_hf(model, {model_key: tensor})
+
+        assert result == {hf_key: tensor}
+
+    def test_applies_rename_after_state_dict_adapter(self):
+        tensor = torch.ones(1)
+
+        class Adapter:
+            def to_hf(self, state_dict, **kwargs):
+                assert kwargs["exclude_key_regex"] == r".*_extra_state.*"
+                return {"embed_vision.multimodal_embedder.embedding_projection.weight": state_dict["projection"]}
+
+        model = SimpleNamespace(
+            config=SimpleNamespace(model_type="gemma4_unified"),
+            state_dict_adapter=Adapter(),
+        )
+
+        result = _maybe_adapt_state_dict_to_hf(model, {"projection": tensor})
+
+        assert result == {"embed_vision.embedding_projection.weight": tensor}
+
+    def test_preserves_internal_keys_for_other_model_types(self):
+        model = SimpleNamespace(config=SimpleNamespace(model_type="gemma4"))
+        state_dict = {"embed_vision.multimodal_embedder.embedding_projection.weight": torch.ones(1)}
+
+        assert _maybe_adapt_state_dict_to_hf(model, state_dict) is state_dict
+
+    def test_rejects_export_key_collision(self):
+        model = SimpleNamespace(config=SimpleNamespace(model_type="gemma4_unified"))
+        state_dict = {
+            "embed_vision.embedding_projection.weight": torch.ones(1),
+            "embed_vision.multimodal_embedder.embedding_projection.weight": torch.zeros(1),
+        }
+
+        with pytest.raises(ValueError, match="HF export key collision"):
+            _maybe_adapt_state_dict_to_hf(model, state_dict)
 
 
 class TestConsolidationProcessGroup:
