@@ -46,7 +46,14 @@ The shipped example configs only cover a subset.
 - **gpt-oss** (`GptOssForCausalLM`): EAGLE-3 only, via a dedicated draft class.
 - **DeepSeek-V3** (`DeepseekV3ForCausalLM`): EAGLE-3 only, via a dedicated MLA
   draft class (eager attention; sequence packing not supported yet).
-- **DFlash / Domino / JetSpec**: `Qwen3ForCausalLM`, `Qwen3MoeForCausalLM`.
+- **DFlash / Domino / JetSpec**: `Qwen3ForCausalLM`, `Qwen3MoeForCausalLM`. All
+  DFlash-family recipes reject `distributed.pp_size > 1`: online hidden-state
+  capture hooks one complete, non-pipelined target forward.
+- **DFlash on Kimi K3** (`KimiK3ForCausalLM`, `KimiK3ForConditionalGeneration`):
+  via a dedicated dense MLA draft class. Plain DFlash only (Domino's projector
+  head is Qwen3-only), and it requires `attention_backend: sdpa`; sequence
+  packing and context parallelism are rejected, because K3 owns both itself.
+  See `dflash/README_kimi_k3.md`.
 - **DSpark**: `Qwen3ForCausalLM`, `Qwen3MoeForCausalLM`,
   `DeepseekV4ForCausalLM`, GLM-5.2 (`GlmMoeDsaForCausalLM`), Gemma4
   (`Gemma4ForConditionalGeneration`, `Gemma4UnifiedForConditionalGeneration`),

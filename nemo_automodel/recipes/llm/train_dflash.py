@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""DFlash draft-model training recipe (Qwen3-style targets).
+"""DFlash draft-model training recipe (Qwen3-style and Kimi K3 targets).
 
 DFlash drafts a whole block of tokens in parallel via MASK-token denoising
 conditioned on the frozen target's hidden states (see
@@ -36,7 +36,6 @@ import torch.distributed as dist
 from huggingface_hub import constants as hf_constants
 from torch.nn.parallel import DistributedDataParallel
 from transformers import AutoConfig
-from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
 from nemo_automodel._transformers import NeMoAutoModelForCausalLM
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
@@ -54,7 +53,7 @@ from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.wandb_utils import init_wandb_run, suppress_wandb_log_messages
 from nemo_automodel.components.speculative.dflash.core import DFlashTrainerModule, NoValidAnchorsError
 from nemo_automodel.components.speculative.dflash.draft_qwen3 import build_target_layer_ids
-from nemo_automodel.components.speculative.dflash.registry import resolve_dflash_draft_spec
+from nemo_automodel.components.speculative.dflash.registry import DFlashDraftSpec, resolve_dflash_draft_spec
 from nemo_automodel.components.speculative.dflash.target import HFDFlashTargetModel
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config
@@ -146,7 +145,7 @@ def _submesh_or_none(device_mesh, name: str):
 
 
 class TrainDFlashRecipe(BaseRecipe):
-    """Recipe for DFlash draft-model training on Qwen3-style dense / MoE targets."""
+    """Recipe for DFlash draft-model training on Qwen3-style dense / MoE and Kimi K3 targets."""
 
     def __init__(self, cfg):
         self.cfg = cfg
@@ -164,18 +163,22 @@ class TrainDFlashRecipe(BaseRecipe):
         raise_if_peft_configured(self.cfg, type(self).__name__)
 
         target_path = recipe_cfg.target_model_name_or_path
-        target_config = AutoConfig.from_pretrained(
+        checkpoint_config = AutoConfig.from_pretrained(
             target_path, trust_remote_code=recipe_cfg.get("trust_remote_code", False)
         )
-        architectures = getattr(target_config, "architectures", []) or []
+        architectures = getattr(checkpoint_config, "architectures", []) or []
         draft_spec = resolve_dflash_draft_spec(architectures)
+        # DFlash captures hidden states from the text backbone only, so every depth /
+        # vocab lookup below uses the text config. ``get_text_config`` unwraps a
+        # multimodal wrapper (Kimi K3's) and returns a text-only config unchanged.
+        target_config = checkpoint_config.get_text_config()
 
         self.tokenizer = NeMoAutoTokenizer.from_pretrained(
             target_path, trust_remote_code=recipe_cfg.get("trust_remote_code", False)
         )
         self.compute_dtype = torch.bfloat16 if self.device.type == "cuda" else torch.float32
 
-        self.target_model = self._build_target_model(recipe_cfg, target_path)
+        self.target_model = self._build_target_model(recipe_cfg, target_path, draft_spec)
 
         # Resolve the captured target layers once and share them between the
         # target wrapper (what to capture) and the draft config (the ``fc`` input
@@ -196,6 +199,14 @@ class TrainDFlashRecipe(BaseRecipe):
         # packing metadata (position_ids / seq_lens / doc_remaining) the loader emits.
         packed_sequence_size = int(recipe_cfg.get("packed_sequence_size", 0) or 0)
         if packed_sequence_size > 0:
+            if getattr(self.target_model, "_owns_packed_attention", False):
+                raise NotImplementedError(
+                    f"Sequence packing (packed_sequence_size>0) is not supported for a "
+                    f"{type(self.target_model).__name__} DFlash target: it declares _owns_packed_attention "
+                    "and consumes its own packing metadata, not the block-causal additive mask the DFlash "
+                    "target wrapper builds, so document boundaries would be silently dropped. "
+                    "Set packed_sequence_size=0."
+                )
             _validate_packing_gates(
                 cp_size=int(self.cfg.get("distributed.cp_size", 1) or 1),
                 target_attn_impl=getattr(self.target_model.config, "_attn_implementation", None) or "",
@@ -232,25 +243,25 @@ class TrainDFlashRecipe(BaseRecipe):
                 dp_mesh=self.dp_mesh,
             )
 
-        # DFlash draft config: a small non-causal Qwen3 stack that reuses the
-        # target's architecture defaults (head_dim, rope_theta, rms_norm_eps, ...).
-        draft_config = target_config.to_dict()
-        draft_config["architectures"] = ["Qwen3DFlashDraftModel"]
-        draft_config["num_hidden_layers"] = draft_num_hidden_layers
-        # ``layer_types``/``max_window_layers`` are sized to the target's depth;
-        # rebuild them for the (shallower) draft. The DFlash attention never uses
-        # sliding windows, so every draft layer is full attention.
-        draft_config["layer_types"] = ["full_attention"] * draft_num_hidden_layers
-        draft_config["max_window_layers"] = draft_num_hidden_layers
-        draft_config["num_target_layers"] = num_target_layers
-        draft_config["block_size"] = self.block_size
-        draft_config["dflash_config"] = self._build_dflash_config(recipe_cfg, target_layer_ids)
         # A single knob drives both the trainer's mask format and the draft's
         # attention function -- they must agree (a flex BlockMask only works with
-        # the flex attention fn, a dense bool mask only with sdpa/eager).
+        # the flex attention fn, a dense bool mask only with sdpa/eager), so the
+        # draft spec declares which backends its draft class can run.
         attention_backend = recipe_cfg.get("attention_backend", "flex_attention")
-        draft_config_obj = Qwen3Config.from_dict(draft_config)
-        draft_config_obj._attn_implementation = attention_backend
+        if attention_backend not in draft_spec.attention_backends:
+            raise ValueError(
+                f"{draft_spec.draft_cls.__name__} does not support "
+                f"recipe_args.attention_backend={attention_backend!r}; "
+                f"supported: {list(draft_spec.attention_backends)}."
+            )
+        draft_config_obj = draft_spec.build_draft_config(
+            target_config,
+            num_draft_layers=draft_num_hidden_layers,
+            num_target_layers=num_target_layers,
+            block_size=self.block_size,
+            dflash_config=self._build_dflash_config(recipe_cfg, target_layer_ids),
+            attention_backend=attention_backend,
+        )
         self.draft_model = draft_spec.draft_cls(draft_config_obj).to(device=self.device, dtype=self.compute_dtype)
         # Optional FP8 draft compute, in place (see apply_draft_fp8); must precede the DDP wrap.
         apply_draft_fp8(self.draft_model, self.cfg.get("fp8", None))
@@ -329,8 +340,12 @@ class TrainDFlashRecipe(BaseRecipe):
                 default_name=type(self).__name__.lower() + "_" + str(target_path).rstrip("/").split("/")[-1],
             )
 
-    def _build_target_model(self, recipe_cfg, target_path: str) -> torch.nn.Module:
+    def _build_target_model(self, recipe_cfg, target_path: str, draft_spec: DFlashDraftSpec) -> torch.nn.Module:
         """Load the frozen (optionally tensor-parallel) target model.
+
+        ``draft_spec.build_target_kwargs`` supplies any architecture-specific
+        ``from_pretrained`` arguments (Kimi K3 pins the text-only architecture and
+        an expert-parallel backend); it is empty for a Qwen3-shaped target.
 
         With a ``distributed:`` section and ``tp_size>1`` the target is sharded
         in place by ``from_pretrained`` (its FSDP2 parallelize plan); the small
@@ -348,6 +363,7 @@ class TrainDFlashRecipe(BaseRecipe):
         )
         if target_attn_implementation is not None:
             target_kwargs["attn_implementation"] = target_attn_implementation
+        target_kwargs.update(draft_spec.build_target_kwargs(recipe_cfg))
         self.dist_setup = None
         self.device_mesh = None
         self.dp_mesh = None
@@ -361,6 +377,15 @@ class TrainDFlashRecipe(BaseRecipe):
             self.dp_mesh = _submesh_or_none(self.device_mesh, "dp")
             self.cp_mesh = _submesh_or_none(self.device_mesh, "cp")
             target_kwargs["distributed_setup"] = self.dist_setup
+            if int(self.cfg.get("distributed.pp_size", 1) or 1) > 1:
+                # Hidden-state capture hooks one complete target forward; a pipelined
+                # target runs its stages under a schedule instead, so the hooks would
+                # fire on a subset of ranks with partial activations.
+                raise NotImplementedError(
+                    "Pipeline parallelism (pp_size>1) is not supported for a DFlash target: "
+                    "hidden-state capture needs one non-pipelined target forward. Shard the frozen "
+                    "target with ep_size / tp_size instead."
+                )
             # CP gathers the target's captured layers back to the full sequence; that
             # gather does not yet handle a TP-sharded (DTensor) sequence, so the two
             # can't be combined. TP alone (draft replicated over "dp") is fine.
@@ -377,6 +402,16 @@ class TrainDFlashRecipe(BaseRecipe):
             # when flash-attn is installed), which would bypass the hook and leave each rank
             # attending only its own shard.
             if cp_size > 1:
+                # Checked first: the force_hf / sdpa gates below would otherwise report a
+                # misleading error for a target that can never use this CP path at all.
+                if not draft_spec.supports_context_parallel:
+                    raise NotImplementedError(
+                        f"Context parallelism (cp_size>1) is not supported for a "
+                        f"{draft_spec.draft_cls.__name__} DFlash target: the target shards the sequence "
+                        "itself and bypasses the CP key/value-gather hook, so the captured hidden states "
+                        "would stay sequence-sharded. Set cp_size=1 and shard the frozen target with "
+                        "ep_size / tp_size instead."
+                    )
                 if not bool(recipe_cfg.get("target_force_hf", False)):
                     raise NotImplementedError(
                         "Context parallelism (cp_size>1) requires recipe_args.target_force_hf=true so the "
