@@ -19,6 +19,7 @@ import pytest
 from torch import nn
 
 import nemo_automodel.components.cuda_graphs.partial as partial_graphs
+from nemo_automodel.components.models.common import BackendConfig, CudaGraphConfig
 from nemo_automodel.recipes.llm.train_ft import (
     TrainFinetuneRecipeForNextTokenPrediction,
     _build_partial_cuda_graph_manager,
@@ -31,7 +32,7 @@ def _bare_recipe() -> TrainFinetuneRecipeForNextTokenPrediction:
 
 def test_builder_forwards_runtime_safety_context(monkeypatch):
     model = nn.Linear(2, 2)
-    model.backend = SimpleNamespace(cuda_graph=SimpleNamespace(modules=["te_dpa"]))
+    model.backend = BackendConfig(attn="te", cuda_graph=CudaGraphConfig(modules=["te_dpa"]))
     model_parts = [model]
     manager = SimpleNamespace(capture=MagicMock())
     discover = MagicMock(return_value=manager)
@@ -54,9 +55,11 @@ def test_builder_forwards_runtime_safety_context(monkeypatch):
 def test_builder_does_not_use_manager_when_no_scope_is_enabled(monkeypatch):
     discover = MagicMock()
     monkeypatch.setattr(partial_graphs.PartialCudaGraphManager, "from_model_parts", discover)
+    model = nn.Linear(2, 2)
+    model.backend = BackendConfig()
 
     result = _build_partial_cuda_graph_manager(
-        [nn.Linear(2, 2)],
+        [model],
         activation_checkpointing=False,
         pipeline_parallel=False,
     )

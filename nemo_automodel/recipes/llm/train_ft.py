@@ -415,11 +415,7 @@ def _build_partial_cuda_graph_manager(
     Returns:
         An armed manager when any backend selects CUDA-graph scopes, otherwise ``None``.
     """
-    enabled = any(
-        model_part.backend.cuda_graph.modules
-        for model_part in model_parts
-        if getattr(model_part, "backend", None) is not None
-    )
+    enabled = any(model_part.backend.cuda_graph.modules for model_part in model_parts)
     if not enabled:
         return None
     return PartialCudaGraphManager.from_model_parts(
@@ -949,9 +945,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     # Capture outside the microbatch loop and only after the
                     # eager optimizer step has completed. This leaves no
                     # pending checkpoint recomputation or GA backward work.
-                    graph_manager = getattr(self, "partial_cuda_graph_manager", None)
-                    if graph_manager is not None and getattr(self, "_partial_cuda_graph_capture_pending", False):
-                        graph_manager.capture()
+                    if self.partial_cuda_graph_manager is not None and self._partial_cuda_graph_capture_pending:
+                        self.partial_cuda_graph_manager.capture()
                         self._partial_cuda_graph_capture_pending = False
                     # Collect MoE load balance metrics (all ranks participate in all-reduce)
                     self._collect_moe_load_balance()
@@ -981,9 +976,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     self._maybe_collect_garbage()
         finally:
             try:
-                graph_manager = getattr(self, "partial_cuda_graph_manager", None)
-                if graph_manager is not None:
-                    graph_manager.close()
+                if self.partial_cuda_graph_manager is not None:
+                    self.partial_cuda_graph_manager.close()
                     self.partial_cuda_graph_manager = None
                 self._partial_cuda_graph_capture_pending = False
             finally:
@@ -1566,9 +1560,8 @@ def main(config_path=None):
         trainer.setup()
         trainer.run_train_validation_loop()
     finally:
-        graph_manager = getattr(trainer, "partial_cuda_graph_manager", None)
-        if graph_manager is not None:
-            graph_manager.close()
+        if trainer.partial_cuda_graph_manager is not None:
+            trainer.partial_cuda_graph_manager.close()
             trainer.partial_cuda_graph_manager = None
 
 

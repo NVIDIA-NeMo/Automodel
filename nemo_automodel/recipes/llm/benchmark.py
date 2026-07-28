@@ -380,9 +380,8 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
 
             # Match the training-loop lifecycle: record one complete eager
             # optimizer step, then capture outside the measured iteration.
-            graph_manager = getattr(self, "partial_cuda_graph_manager", None)
-            if graph_manager is not None and getattr(self, "_partial_cuda_graph_capture_pending", False):
-                graph_manager.capture()
+            if self.partial_cuda_graph_manager is not None and self._partial_cuda_graph_capture_pending:
+                self.partial_cuda_graph_manager.capture()
                 self._partial_cuda_graph_capture_pending = False
 
             # Synchronize num_label_tokens across DP ranks
@@ -429,9 +428,8 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
 
             self._maybe_collect_garbage()
 
-        graph_manager = getattr(self, "partial_cuda_graph_manager", None)
-        if graph_manager is not None:
-            graph_manager.log_stats("benchmark")
+        if self.partial_cuda_graph_manager is not None:
+            self.partial_cuda_graph_manager.log_stats("benchmark")
 
         # Final summary
         self._log_benchmark_summary(steps, warmup_steps, peak_tflops, rank)
@@ -608,9 +606,8 @@ def main(config_path=None):
         recipe.setup()
         recipe.run_benchmark()
     finally:
-        graph_manager = getattr(recipe, "partial_cuda_graph_manager", None)
-        if graph_manager is not None:
-            graph_manager.close()
+        if recipe.partial_cuda_graph_manager is not None:
+            recipe.partial_cuda_graph_manager.close()
             recipe.partial_cuda_graph_manager = None
 
 
