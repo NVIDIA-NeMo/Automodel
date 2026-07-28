@@ -648,6 +648,7 @@ class BaseRecipe:
                 obj.load_state_dict(
                     load_torch_ckpt(
                         os.path.join(ckpt_dir, f"{key}.pt"),
+                        weights_only=not self.checkpointer.config.allow_legacy_pickle_restore,
                     )
                 )
 

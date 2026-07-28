@@ -1249,6 +1249,7 @@ class TrainDSparkRecipe(BaseRecipe):
             meta = load_torch_ckpt(
                 meta_path,
                 map_location="cpu",
+                weights_only=not self.checkpoint_config.allow_legacy_pickle_restore,
             )
             self.runtime.global_step = int(meta.get("global_step", 0))
             self._resume_epoch = int(meta.get("epoch", 0))

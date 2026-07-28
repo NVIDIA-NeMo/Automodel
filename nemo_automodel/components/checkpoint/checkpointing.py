@@ -1230,6 +1230,7 @@ class Checkpointer:
         state.load_state_dict(
             load_torch_ckpt(
                 os.path.join(state_dir, f"{state_name}_dp_rank_{self.dp_rank}.pt"),
+                weights_only=not self.config.allow_legacy_pickle_restore,
             )
         )
 

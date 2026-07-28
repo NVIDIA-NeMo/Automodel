@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import random
+from dataclasses import dataclass
 from typing import TypedDict
 
 import numpy as np
@@ -59,6 +60,16 @@ class _RNGState(TypedDict):
     cuda_rng_state: list[torch.Tensor]
 
 
+@dataclass
+class RNGState:
+    """Legacy RNG state kept for trusted pickle-based checkpoint restores."""
+
+    random_rng_state: tuple[int, tuple[int, ...], float | None]
+    np_rng_state: tuple[str, np.ndarray, int, int, float]
+    torch_rng_state: torch.Tensor
+    cuda_rng_state: list[torch.Tensor]
+
+
 def _get_rng_state() -> _RNGState:
     """Get current RNG states.
 
@@ -79,12 +90,20 @@ def _get_rng_state() -> _RNGState:
     }
 
 
-def _restore_rng_state(state: _RNGState) -> None:
+def _restore_rng_state(state: _RNGState | RNGState) -> None:
     """Restore RNG states from a saved state.
 
     Args:
-        state: RNG states represented only by primitives and tensors.
+        state: Current weights-only-safe RNG state or legacy RNG state loaded
+            from a trusted pickle-based checkpoint.
     """
+    if isinstance(state, RNGState):
+        random.setstate(state.random_rng_state)
+        np.random.set_state(state.np_rng_state)
+        torch.set_rng_state(state.torch_rng_state)
+        torch.cuda.set_rng_state_all(state.cuda_rng_state)
+        return
+
     random.setstate(state["random_rng_state"])
     np.random.set_state(
         (
@@ -122,7 +141,7 @@ class StatefulRNG:
         """
         return _get_rng_state()
 
-    def load_state_dict(self, state: _RNGState) -> None:  # pragma: no cover
+    def load_state_dict(self, state: _RNGState | RNGState) -> None:  # pragma: no cover
         """Restore RNG states from a saved state.
 
         Args:

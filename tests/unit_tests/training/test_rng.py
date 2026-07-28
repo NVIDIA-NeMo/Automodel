@@ -20,7 +20,7 @@ import numpy as np
 import pytest
 import torch
 
-from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG, init_all_rng
+from nemo_automodel.components.training.rng import RNGState, ScopedRNG, StatefulRNG, init_all_rng
 
 
 def _next_values():
@@ -129,6 +129,23 @@ def test_stateful_rng_round_trips_with_restricted_torch_load(tmp_path):
     expected = _next_values()
     loaded_state = torch.load(checkpoint, weights_only=True)
     rng.load_state_dict(loaded_state)
+
+    assert _next_values() == expected
+
+
+def test_stateful_rng_restores_legacy_rng_state():
+    """Legacy RNG state produces the same next values after restoration."""
+    init_all_rng(2718)
+    legacy_state = RNGState(
+        random_rng_state=random.getstate(),
+        np_rng_state=np.random.get_state(),
+        torch_rng_state=torch.get_rng_state(),
+        cuda_rng_state=torch.cuda.get_rng_state_all(),
+    )
+    expected = _next_values()
+
+    rng = StatefulRNG(999)
+    rng.load_state_dict(legacy_state)
 
     assert _next_values() == expected
 
