@@ -15,7 +15,6 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-import pytest
 from torch import nn
 
 import nemo_automodel.components.cuda_graphs.partial as partial_graphs
@@ -104,13 +103,13 @@ def test_training_loop_captures_after_first_complete_step_and_closes():
     recipe._collect_moe_load_balance = lambda: None
     recipe.log_train_metrics = lambda _metrics: None
     recipe._update_progress_bar = lambda _pbar, _metrics: None
-    recipe._make_progress_bar = lambda: None
+    recipe._make_progress_bar = lambda: SimpleNamespace(close=lambda: events.append("progress-close"))
     recipe.val_dataloaders = {}
     recipe.save_checkpoint = lambda *_args, **_kwargs: None
     recipe._maybe_collect_garbage = lambda: None
-    recipe.metric_logger_train = SimpleNamespace(close=lambda: None)
+    recipe.metric_logger_train = SimpleNamespace(close=lambda: events.append("metrics-close"))
     recipe.metric_logger_valid = {}
-    recipe.checkpointer = SimpleNamespace(close=lambda: None)
+    recipe.checkpointer = SimpleNamespace(close=lambda: events.append("checkpointer-close"))
     recipe.best_metric_key = "default"
 
     recipe.run_train_validation_loop()
@@ -119,37 +118,10 @@ def test_training_loop_captures_after_first_complete_step_and_closes():
         ("train-step", ("step-0",)),
         "capture",
         ("train-step", ("step-1",)),
+        "progress-close",
+        "metrics-close",
+        "checkpointer-close",
         "close",
     ]
     assert recipe.partial_cuda_graph_manager is None
-
-
-def test_training_loop_closes_graphs_when_a_step_raises():
-    events = []
-
-    class _OneStepScheduler:
-        step = 0
-        epoch = 0
-        epochs = [0]
-
-        def set_epoch(self, epoch):
-            self.epoch = epoch
-
-        def __iter__(self):
-            yield ["failing-step"]
-
-    recipe = _bare_recipe()
-    recipe.model_parts = [nn.Linear(2, 2)]
-    recipe.step_scheduler = _OneStepScheduler()
-    recipe.max_grad_norm = 1.0
-    recipe.partial_cuda_graph_manager = SimpleNamespace(close=lambda: events.append("close"))
-    recipe._partial_cuda_graph_capture_pending = False
-    recipe._enable_qat_if_delayed = lambda _step: None
-    recipe._run_train_optim_step = MagicMock(side_effect=RuntimeError("step failed"))
-    recipe._make_progress_bar = lambda: None
-
-    with pytest.raises(RuntimeError, match="step failed"):
-        recipe.run_train_validation_loop()
-
-    assert events == ["close"]
-    assert recipe.partial_cuda_graph_manager is None
+    assert not recipe._partial_cuda_graph_capture_pending

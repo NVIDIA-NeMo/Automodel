@@ -975,14 +975,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         )
                     self._maybe_collect_garbage()
         finally:
-            try:
-                if self.partial_cuda_graph_manager is not None:
-                    self.partial_cuda_graph_manager.close()
-                    self.partial_cuda_graph_manager = None
-                self._partial_cuda_graph_capture_pending = False
-            finally:
-                if pbar is not None:
-                    pbar.close()
+            if pbar is not None:
+                pbar.close()
         # Close JSONL loggers after training loop completes
         self.metric_logger_train.close()
         for v in self.metric_logger_valid.values():
@@ -993,6 +987,11 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # Mark the MLflow run KILLED if training exited via SIGTERM.
         if self.step_scheduler.sigterm_flag:
             end_mlflow_active_run_as_killed()
+
+        if self.partial_cuda_graph_manager is not None:
+            self.partial_cuda_graph_manager.close()
+            self.partial_cuda_graph_manager = None
+        self._partial_cuda_graph_capture_pending = False
 
     # ------------------ helpers ------------------
     def _forward_backward_step(
@@ -1556,13 +1555,8 @@ def main(config_path=None):
         config_path = pathlib.Path(__file__).parent.resolve() / "llama_3_2_1b_hellaswag.yaml"
     cfg = parse_args_and_load_config(config_path)
     trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
-    try:
-        trainer.setup()
-        trainer.run_train_validation_loop()
-    finally:
-        if trainer.partial_cuda_graph_manager is not None:
-            trainer.partial_cuda_graph_manager.close()
-            trainer.partial_cuda_graph_manager = None
+    trainer.setup()
+    trainer.run_train_validation_loop()
 
 
 if __name__ == "__main__":
