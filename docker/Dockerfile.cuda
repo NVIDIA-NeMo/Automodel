@@ -105,7 +105,7 @@ for backend in ${EP_BACKENDS}; do
     venv="/opt/venvs/${backend}"
     export UV_PROJECT_ENVIRONMENT="${venv}"
     export LD_LIBRARY_PATH="${base_ld_library_path}"
-    unset EP_NCCL_ROOT_DIR EP_NVSHMEM_ROOT_DIR NCCL_DIR NVSHMEM_DIR LD_PRELOAD
+    unset CUDNN_HOME CUDNN_PATH EP_NCCL_ROOT_DIR EP_NVSHMEM_ROOT_DIR NCCL_DIR NVSHMEM_DIR LD_PRELOAD
 
     # Install Torch/NCCL/NVSHMEM first so DeepEP's build can use their headers
     # and libraries. The second sync builds only the selected DeepEP variant.
@@ -131,11 +131,15 @@ def package_root(package_name: str, library_name: str) -> Path:
     raise RuntimeError(f"{library_name} was not found in {package_name}")
 
 
+cudnn_root = package_root(f"nvidia-cudnn-{cuda_suffix}", "libcudnn")
 nvshmem_root = package_root(f"nvidia-nvshmem-{cuda_suffix}", "libnvshmem_host")
 nccl_root = package_root(f"nvidia-nccl-{cuda_suffix}", "libnccl")
-library_dirs = [nvshmem_root / "lib", nccl_root / "lib"]
+library_dirs = [cudnn_root / "lib", nvshmem_root / "lib", nccl_root / "lib"]
 
 exports = {
+    "CUDNN_HOME": str(cudnn_root),
+    "CUDNN_PATH": str(cudnn_root),
+    "CUDNN_RUNTIME_ROOT": str(cudnn_root),
     "EP_NVSHMEM_ROOT_DIR": str(nvshmem_root),
     "LD_LIBRARY_PATH": ":".join(str(path) for path in library_dirs),
     "NCCL_RUNTIME_ROOT": str(nccl_root),
@@ -159,15 +163,18 @@ PY
 
     runtime_dir="/opt/ep-runtime/${backend}"
     mkdir -p "${runtime_dir}/lib"
+    ln -sfn "${CUDNN_RUNTIME_ROOT}" "${runtime_dir}/cudnn"
     ln -sfn "${NVSHMEM_RUNTIME_ROOT}" "${runtime_dir}/nvshmem"
     ln -sfn "${NCCL_RUNTIME_ROOT}" "${runtime_dir}/nccl"
-    find "${NVSHMEM_RUNTIME_ROOT}/lib" "${NCCL_RUNTIME_ROOT}/lib" \
+    find "${CUDNN_RUNTIME_ROOT}/lib" "${NVSHMEM_RUNTIME_ROOT}/lib" "${NCCL_RUNTIME_ROOT}/lib" \
         -maxdepth 1 -type f -name '*.so*' -exec ln -sfn '{}' "${runtime_dir}/lib/" \;
 
     {
-        printf 'unset EP_NCCL_ROOT_DIR EP_NVSHMEM_ROOT_DIR NCCL_DIR NVSHMEM_DIR LD_PRELOAD\n'
+        printf 'unset CUDNN_HOME CUDNN_PATH EP_NCCL_ROOT_DIR EP_NVSHMEM_ROOT_DIR NCCL_DIR NVSHMEM_DIR LD_PRELOAD\n'
         printf 'export UV_PROJECT_ENVIRONMENT=%q\n' "${venv}"
         printf 'export PATH=%q:$PATH\n' "${venv}/bin"
+        printf 'export CUDNN_HOME=%q\n' "${CUDNN_RUNTIME_ROOT}"
+        printf 'export CUDNN_PATH=%q\n' "${CUDNN_RUNTIME_ROOT}"
         printf 'export EP_NVSHMEM_ROOT_DIR=%q\n' "${NVSHMEM_RUNTIME_ROOT}"
         printf 'export LD_LIBRARY_PATH=%q:$LD_LIBRARY_PATH\n' "${runtime_dir}/lib"
         printf 'export LD_PRELOAD=%q\n' "${runtime_dir}/lib/libnccl.so.2"
@@ -201,7 +208,7 @@ for backend in ${EP_BACKENDS}; do
     else
         cuda_extra=${CUDA_EXTRA}
     fi
-    unset EP_NCCL_ROOT_DIR EP_NVSHMEM_ROOT_DIR NCCL_DIR NVSHMEM_DIR LD_PRELOAD
+    unset CUDNN_HOME CUDNN_PATH EP_NCCL_ROOT_DIR EP_NVSHMEM_ROOT_DIR NCCL_DIR NVSHMEM_DIR LD_PRELOAD
     export LD_LIBRARY_PATH="/usr/local/cuda/lib64:/usr/lib/$(gcc -dumpmachine)"
     source "/opt/ep-envs/${backend}.sh"
     uv sync ${UV_SYNC_ARGS} --extra "${cuda_extra}" --extra "${backend}"
