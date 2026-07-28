@@ -318,13 +318,18 @@ class LocalFeatureStore(FeatureStore):
                     # cannot disturb what release()'s gc sweep might
                     # subsequently do.
                     out[name] = tensor.clone()
-            self._handle_refs[ref.sample_id] += 1
+            # Track this handle's identity so a re-release of the same
+            # handle is a true no-op (the previous per-sample counter
+            # silently double-decremented when two siblings were live
+            # for one sample). The :class:`StoreHandle` mints a unique
+            # ``handle_id`` at construction; see ``store.py``.
             handle = StoreHandle(store=self, sample_id=ref.sample_id, ref=ref)
+            self._handle_refs[handle.handle_id] = ref.sample_id
             logger.debug(
-                "LocalFeatureStore get sample_id=%s device=%s handles=%d",
+                "LocalFeatureStore get sample_id=%s device=%s handle_id=%s",
                 ref.sample_id,
                 target_device,
-                self._handle_refs[ref.sample_id],
+                handle.handle_id,
             )
             return out, handle
 
@@ -334,27 +339,41 @@ class LocalFeatureStore(FeatureStore):
                 f"StoreHandle was issued by a different store (id {id(handle.store):x}), cannot release it here"
             )
         with self._lock:
-            count = self._handle_refs.get(handle.sample_id, 0)
-            if count <= 0:
-                logger.debug("LocalFeatureStore release sample_id=%s is a no-op (already released)", handle.sample_id)
+            # Per-handle-id idempotency: re-releasing the same handle is
+            # a no-op, even if a sibling handle is still outstanding for
+            # the same sample. ``_handle_refs`` is keyed by handle_id and
+            # removed on first release; subsequent lookups miss.
+            sample_id = self._handle_refs.pop(handle.handle_id, None)
+            if sample_id is None:
+                logger.debug(
+                    "LocalFeatureStore release handle_id=%s sample_id=%s is a no-op (already released)",
+                    handle.handle_id,
+                    handle.sample_id,
+                )
                 return
-            count -= 1
-            # Refcounts: drop the storage only when the last outstanding
-            # handle is released, so concurrent readers of the same sample
-            # each get their own tensors and see them vanish at the same
-            # point.
-            if count == 0:
-                tensors = self._storage.pop(handle.sample_id, None)
+            if sample_id != handle.sample_id:
+                # Defensive: if a future refactor ever mixes the
+                # identity, do not silently drop the wrong storage.
+                logger.warning(
+                    "LocalFeatureStore release handle_id=%s sample_id mismatch (%s != %s); ignoring",
+                    handle.handle_id,
+                    sample_id,
+                    handle.sample_id,
+                )
+                return
+            # Drop storage when the last outstanding handle for this
+            # sample goes away.
+            siblings = [hid for hid, sid in self._handle_refs.items() if sid == sample_id]
+            if not siblings:
+                tensors = self._storage.pop(sample_id, None)
                 if tensors is not None:
                     bytes_in = sum(self._tensor_bytes(t) for t in tensors.values())
                     self._resident_bytes -= bytes_in
-                self._handle_refs.pop(handle.sample_id, None)
-            else:
-                self._handle_refs[handle.sample_id] = count
             logger.debug(
-                "LocalFeatureStore release sample_id=%s remaining_handles=%d resident=%d",
-                handle.sample_id,
-                count,
+                "LocalFeatureStore release sample_id=%s handle_id=%s remaining_siblings=%d resident=%d",
+                sample_id,
+                handle.handle_id,
+                len(siblings),
                 self._resident_bytes,
             )
 

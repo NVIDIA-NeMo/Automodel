@@ -42,6 +42,7 @@ import dataclasses
 import logging
 from dataclasses import dataclass
 from enum import Enum
+from types import MappingProxyType
 from typing import Any, Mapping, NoReturn
 
 import torch
@@ -198,8 +199,19 @@ class SampleRef:
                 f"SampleRef num_tokens/estimated_bytes must be non-negative, got "
                 f"num_tokens={self.num_tokens} estimated_bytes={self.estimated_bytes}"
             )
+        # Deep-freeze the mappings so a caller that grabs the underlying
+        # dict (via ``ref.feature_keys`` / ``ref.feature_specs``) cannot
+        # mutate it -- including inserting a :class:`torch.Tensor`, which
+        # would silently break the advertised immutable tensor-free
+        # control-plane contract. ``MappingProxyType`` raises
+        # ``TypeError`` on ``__setitem__`` / ``__delitem__``.
+        object.__setattr__(self, "feature_keys", MappingProxyType(dict(self.feature_keys)))
+        object.__setattr__(self, "feature_specs", MappingProxyType(dict(self.feature_specs)))
         # The ref itself must be tensor-free; the contract is enforceable at
-        # construction time so a misbehaving producer fails fast.
+        # construction time so a misbehaving producer fails fast. Run after
+        # the deep-freeze so a tensor that snuck into the original dict is
+        # still caught (the proxy is read-only but a pre-existing tensor
+        # would have been copied in via ``dict(...)``).
         assert_no_tensors(self, path="SampleRef")
 
     def feature_names(self) -> tuple[str, ...]:

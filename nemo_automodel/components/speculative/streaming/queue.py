@@ -42,14 +42,27 @@ inspecting the queue internals.
 
 from __future__ import annotations
 
+import itertools
 import logging
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable
 
 from nemo_automodel.components.speculative.streaming.refs import SampleRef
 from nemo_automodel.components.speculative.streaming.store import FeatureStore, StoreHealth
+
+# Module-level counter for unique :class:`Lease` identities. Each
+# :meth:`SampleRefQueue.acquire` call consumes one; a stale ACK for an
+# old lease no longer matches the live lease's id and is rejected
+# before any internal state mutates.
+_lease_id_counter = itertools.count()
+
+
+def _next_lease_id() -> int:
+    """Mint a fresh :attr:`Lease.lease_id` (module-level counter)."""
+    return next(_lease_id_counter)
+
 
 logger = logging.getLogger(__name__)
 
@@ -72,15 +85,21 @@ class VisibilityTimeout:
             raise ValueError(f"VisibilityTimeout.seconds must be positive, got {self.seconds}")
 
 
-@dataclass
+@dataclass(frozen=True)
 class Lease:
     """Handle to a leased :class:`SampleRef`.
+
+    Each :meth:`SampleRefQueue.acquire` call mints a fresh :class:`Lease`
+    with a unique :attr:`lease_id`. The queue's :meth:`ack` and
+    :meth:`fail` verify the lease identity before mutating internal
+    state, so a late ACK for a stale (reclaimed) lease cannot pop a
+    newer active lease for the same ``sample_id``.
 
     Attributes:
         ref: The leased reference -- the only sanctioned way to materialize
             its tensors is :meth:`FeatureStore.get`, which returns a
             :class:`~nemo_automodel.components.speculative.streaming.store.StoreHandle`
-            the consumer hands to :meth:`FeatureStore.release` once it is
+            the consumer must hand to :meth:`FeatureStore.release` once it is
             done with them.
         deadline: Monotonic-clock timestamp at which this lease is
             considered orphaned. Used by
@@ -89,11 +108,16 @@ class Lease:
             this lease, kept here so the consumer can introspect it.
         redelivery_count: Number of times this ref has been leased and
             re-leased (PR 4 uses it for retry telemetry). Starts at 0.
+        lease_id: Per-acquire unique identifier. The queue uses it as
+            the key in ``_outstanding`` and verifies it before any
+            ack/fail mutation.
     """
 
     ref: SampleRef
     deadline: float
     visibility_timeout: VisibilityTimeout
+    redelivery_count: int = 0
+    lease_id: int = field(default_factory=_next_lease_id)
     redelivery_count: int = 0
 
 
@@ -157,7 +181,21 @@ class SampleRefQueue:
         self._on_resume = on_resume
         self._lock = threading.Lock()
         self._pending: list[SampleRef] = []  # FIFO of refs ready to lease
-        self._outstanding: dict[str, Lease] = {}  # sample_id -> active lease
+        # O(1) duplicate-id guard for put / put_blocks_until_below /
+        # fail / reclaim_expired. Entries are added on put and removed
+        # when the corresponding ref is consumed (acked, reclaimed,
+        # or popped by acquire).
+        self._pending_seen: set[str] = set()
+        # Outstanding leases keyed by Lease.lease_id. The previous
+        # ``sample_id -> Lease`` map silently let a late ACK pop a
+        # newer active lease for the same sample (e.g. after reclaim
+        # and redelivery); the lease-id key forces ``ack`` / ``fail``
+        # to verify the identity before any state mutates.
+        self._outstanding: dict[int, Lease] = {}
+        # Reverse index ``sample_id -> lease_id`` so the duplicate-id
+        # check on ``put`` stays O(1) instead of scanning ``_pending``.
+        # Reset when a lease ends (acked, failed, or reclaimed).
+        self._active_by_sample: dict[str, int] = {}
         self._sample_counters: dict[str, int] = {}  # sample_id -> redelivery count
         self._producer_paused = False
         self._put_cv = threading.Condition(self._lock)
@@ -212,9 +250,10 @@ class SampleRefQueue:
         with self._lock:
             if self._closed:
                 raise RuntimeError("SampleRefQueue is closed; no further puts accepted")
-            if ref.sample_id in self._outstanding or ref.sample_id in (r.sample_id for r in self._pending):
-                raise ValueError(f"sample_id {ref.sample_id!r} already present in queue (or outstanding)")
+            if ref.sample_id in self._pending_seen or ref.sample_id in self._active_by_sample:
+                raise ValueError(f"sample_id {ref.sample_id!r} already present in queue (pending or outstanding)")
             self._pending.append(ref)
+            self._pending_seen.add(ref.sample_id)
             self._sample_counters.setdefault(ref.sample_id, 0)
             logger.debug("SampleRefQueue put sample_id=%s pending=%d", ref.sample_id, len(self._pending))
 
@@ -244,6 +283,13 @@ class SampleRefQueue:
             with self._put_cv:
                 if self._closed:
                     raise RuntimeError("SampleRefQueue is closed while put was waiting on backpressure")
+                # Atomic duplicate-id check, in line with the regular
+                # put() path. A producer that retries the same ref would
+                # otherwise double-enqueue and the second acquire would
+                # overwrite _outstanding[sample_id] (now keyed by
+                # lease_id), breaking lease accounting.
+                if ref.sample_id in self._pending_seen or ref.sample_id in self._active_by_sample:
+                    raise ValueError(f"sample_id {ref.sample_id!r} already present in queue (pending or outstanding)")
                 health = self._store.health()
                 if self._producer_paused:
                     if self._should_resume(health):
@@ -259,6 +305,7 @@ class SampleRefQueue:
                             except Exception:
                                 logger.exception("on_resume callback raised; continuing")
                         self._pending.append(ref)
+                        self._pending_seen.add(ref.sample_id)
                         self._sample_counters.setdefault(ref.sample_id, 0)
                         logger.debug(
                             "SampleRefQueue put sample_id=%s pending=%d",
@@ -281,6 +328,7 @@ class SampleRefQueue:
                                 logger.exception("on_pause callback raised; continuing")
                     else:
                         self._pending.append(ref)
+                        self._pending_seen.add(ref.sample_id)
                         self._sample_counters.setdefault(ref.sample_id, 0)
                         logger.debug(
                             "SampleRefQueue put sample_id=%s pending=%d",
@@ -318,14 +366,17 @@ class SampleRefQueue:
                 if not self._pending:
                     return None
             ref = self._pending.pop(0)
+            self._pending_seen.discard(ref.sample_id)
             now = time.monotonic()
             deadline = now + self._vt.seconds
             redelivery = self._sample_counters.get(ref.sample_id, 0)
             lease = Lease(ref=ref, deadline=deadline, visibility_timeout=self._vt, redelivery_count=redelivery)
-            self._outstanding[ref.sample_id] = lease
+            self._outstanding[lease.lease_id] = lease
+            self._active_by_sample[ref.sample_id] = lease.lease_id
             logger.debug(
-                "SampleRefQueue acquire sample_id=%s redelivery=%d outstanding=%d",
+                "SampleRefQueue acquire sample_id=%s lease_id=%s redelivery=%d outstanding=%d",
                 ref.sample_id,
+                lease.lease_id,
                 redelivery,
                 len(self._outstanding),
             )
@@ -334,19 +385,42 @@ class SampleRefQueue:
     def ack(self, lease: Lease) -> None:
         """Mark a leased ref as successfully consumed and free its queue slot.
 
+        Verifies :attr:`Lease.lease_id` matches the live outstanding
+        entry for ``lease.ref.sample_id``: a stale ACK for a lease
+        that has been reclaimed and re-leased is rejected (logged,
+        ignored) so the new consumer's live lease is not popped by
+        accident.
+
         Does NOT touch the store -- the consumer's :meth:`FeatureStore.get`
         return value carries a :class:`~nemo_automodel.components.speculative.streaming.store.StoreHandle`
         that the consumer must hand to :meth:`FeatureStore.release` to drop
         the tensors. The queue's responsibility ends at "lease no longer held".
         """
         with self._lock:
-            active = self._outstanding.pop(lease.ref.sample_id, None)
+            active = self._outstanding.get(lease.lease_id)
             if active is None:
+                # Stale ACK: this lease was reclaimed (or already acked).
+                # The new active lease for this sample -- if any -- is
+                # untouched.
                 logger.debug(
-                    "SampleRefQueue ack for sample_id=%s is a no-op (no outstanding lease)",
+                    "SampleRefQueue ack for sample_id=%s lease_id=%s is a no-op (stale or already acked)",
                     lease.ref.sample_id,
+                    lease.lease_id,
                 )
                 return
+            # Identity must match -- ``active`` is keyed by lease_id so
+            # this is the live lease. Defensive ``is`` check catches
+            # any future code path that re-keys outstanding by sample_id.
+            if active is not lease:
+                logger.warning(
+                    "SampleRefQueue ack lease_id mismatch (sample_id=%s expected_id=%s got_id=%s); ignoring",
+                    lease.ref.sample_id,
+                    active.lease_id,
+                    lease.lease_id,
+                )
+                return
+            del self._outstanding[lease.lease_id]
+            self._active_by_sample.pop(lease.ref.sample_id, None)
             # Drop the per-sample redelivery counter so it cannot grow
             # without bound across a long streaming run. ``fail`` and
             # ``reclaim_expired`` re-set the counter when they re-add a
@@ -360,23 +434,37 @@ class SampleRefQueue:
     def fail(self, lease: Lease) -> None:
         """Return a leased ref to the pending queue, without dropping its tensors.
 
-        The ref will be leased again (its :attr:`Lease.redelivery_count`
+        Verifies the lease identity before re-enqueuing: a stale
+        ``fail`` for a lease that has been reclaimed is a no-op. The
+        ref will be leased again (its :attr:`Lease.redelivery_count`
         increments). Re-delivery is what makes the pipeline fault-tolerant
         to a transient consumer error -- a permanently bad ref is the
         consumer's problem (drop it after a bounded retry budget).
         """
         with self._lock:
-            active = self._outstanding.pop(lease.ref.sample_id, None)
+            active = self._outstanding.get(lease.lease_id)
             if active is None:
                 logger.debug(
-                    "SampleRefQueue fail for sample_id=%s is a no-op (no outstanding lease)",
+                    "SampleRefQueue fail for sample_id=%s lease_id=%s is a no-op (stale or already failed)",
                     lease.ref.sample_id,
+                    lease.lease_id,
                 )
                 return
+            if active is not lease:
+                logger.warning(
+                    "SampleRefQueue fail lease_id mismatch (sample_id=%s expected_id=%s got_id=%s); ignoring",
+                    lease.ref.sample_id,
+                    active.lease_id,
+                    lease.lease_id,
+                )
+                return
+            del self._outstanding[lease.lease_id]
+            self._active_by_sample.pop(lease.ref.sample_id, None)
             self._sample_counters[lease.ref.sample_id] = active.redelivery_count + 1
             # Place at the tail so a freshly-failed sample does not jump
             # ahead of samples still waiting their first try.
             self._pending.append(active.ref)
+            self._pending_seen.add(active.ref.sample_id)
             self._put_cv.notify_all()
 
     # --- background reclaim -------------------------------------------------
@@ -390,21 +478,28 @@ class SampleRefQueue:
         returns 0 most of the time.
         """
         now = time.monotonic()
-        reclaimed: list[str] = []
+        reclaimed: list[Lease] = []
         with self._lock:
-            for sample_id, lease in list(self._outstanding.items()):
+            for lease_id, lease in list(self._outstanding.items()):
                 if lease.deadline <= now:
-                    reclaimed.append(sample_id)
-                    self._sample_counters[sample_id] = lease.redelivery_count + 1
-                    # Re-enqueue at the tail so any fresh pending work is
-                    # preferred over reclaimed stuff.
-                    self._pending.append(lease.ref)
-            for sample_id in reclaimed:
-                self._outstanding.pop(sample_id, None)
+                    reclaimed.append(lease)
+            for lease in reclaimed:
+                self._outstanding.pop(lease.lease_id, None)
+                self._active_by_sample.pop(lease.ref.sample_id, None)
+                self._sample_counters[lease.ref.sample_id] = lease.redelivery_count + 1
+                # Re-enqueue at the tail so any fresh pending work is
+                # preferred over reclaimed stuff.
+                self._pending.append(lease.ref)
+                self._pending_seen.add(lease.ref.sample_id)
             if reclaimed:
                 self._put_cv.notify_all()
         if reclaimed:
-            logger.warning("SampleRefQueue reclaimed %d expired leases: %s", len(reclaimed), reclaimed[:8])
+            sample_ids = [lease.ref.sample_id for lease in reclaimed[:8]]
+            logger.warning(
+                "SampleRefQueue reclaimed %d expired leases: %s",
+                len(reclaimed),
+                sample_ids,
+            )
         return len(reclaimed)
 
     # --- introspection ------------------------------------------------------

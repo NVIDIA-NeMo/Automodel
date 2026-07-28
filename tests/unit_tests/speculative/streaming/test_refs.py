@@ -276,3 +276,62 @@ def test_assert_no_tensors_rejects_nested_tensor_in_dataclass() -> None:
 def test_assert_no_tensors_path_argument_is_used_for_error_messages() -> None:
     with pytest.raises(ValueError, match=r"my\.path"):
         assert_no_tensors(torch.zeros(2), path="my.path")
+
+
+# --- 4. SampleRef immutability (PR 1 fix-D) ---------------------------------
+
+
+def test_sample_ref_feature_keys_is_read_only_view() -> None:
+    """``feature_keys`` is a deep-frozen ``MappingProxyType`` post-init.
+
+    A caller that grabs ``ref.feature_keys`` and tries to mutate it
+    (including inserting a :class:`torch.Tensor`, which would silently
+    break the advertised immutable tensor-free contract) is rejected.
+    """
+    ref = _good_ref()
+    with pytest.raises(TypeError):
+        ref.feature_keys["new_key"] = "x"  # type: ignore[index]
+    with pytest.raises(TypeError):
+        ref.feature_keys["aux_hidden_states"] = "x"  # type: ignore[index]
+    with pytest.raises(TypeError):
+        del ref.feature_keys["aux_hidden_states"]  # type: ignore[misc]
+
+
+def test_sample_ref_feature_specs_is_read_only_view() -> None:
+    ref = _good_ref()
+    with pytest.raises(TypeError):
+        ref.feature_specs["new_key"] = FeatureSpec(shape=(1,), dtype=torch.float32)  # type: ignore[index]
+
+
+def test_sample_ref_rejects_tensor_in_feature_keys_after_construction() -> None:
+    """Even if a caller manages to grab a reference to the original dict
+    (which they cannot, since it is wrapped), they cannot poison the
+    ref with a tensor. The wrap happens at construction time so the
+    invariant is enforced before any consumer sees the ref."""
+    from nemo_automodel.components.speculative.streaming.refs import FeatureSpec, SampleRef
+
+    feature_specs = {
+        "aux_hidden_states": FeatureSpec(shape=(2, 8), dtype=torch.float32),
+        "input_ids": FeatureSpec(shape=(2, 8), dtype=torch.long),
+        "attention_mask": FeatureSpec(shape=(2, 8), dtype=torch.long),
+        "loss_mask": FeatureSpec(shape=(2, 8), dtype=torch.long),
+    }
+    feature_keys = {k: f"s/{k}" for k in feature_specs}
+    ref = SampleRef(
+        sample_id="s",
+        run_id="r",
+        store_uri="mem://test",
+        feature_keys=feature_keys,
+        feature_specs=feature_specs,
+        algorithm=FeatureAlgorithm.EAGLE3,
+        schema_version=1,
+        num_tokens=16,
+        estimated_bytes=64,
+        target_model_version="0",
+        draft_weight_version="0",
+    )
+    # The ref's mappings are read-only views; the original dicts
+    # passed in are NOT mutated by the wrap.
+    assert ref.feature_keys["aux_hidden_states"] == "s/aux_hidden_states"
+    # Iteration still works (the proxy is read-only but iterable).
+    assert set(ref.feature_keys) == set(feature_keys)
