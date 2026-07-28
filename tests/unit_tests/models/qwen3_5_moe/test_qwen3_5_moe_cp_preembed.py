@@ -198,6 +198,21 @@ class TestPipelineStageMetas:
         assert ins[0].shape == (2, 5) and outs[0].shape == (2, 5, 32)
 
 
+class TestPipelineKwargsChunkDims:
+    def test_mrope_position_ids_split_on_batch_axis(self):
+        model = _build_model()
+
+        assert model.get_pipeline_kwargs_chunk_dims({"position_ids": torch.zeros(3, 2, 8)}) == {"position_ids": 1}
+        assert model.get_pipeline_kwargs_chunk_dims({"position_ids": torch.zeros(4, 2, 8)}) == {"position_ids": 1}
+
+    def test_batch_major_position_ids_keep_default(self):
+        model = _build_model()
+
+        assert model.get_pipeline_kwargs_chunk_dims({"position_ids": torch.zeros(2, 8)}) == {}
+        assert model.get_pipeline_kwargs_chunk_dims({"position_ids": torch.zeros(2, 2, 8)}) == {}
+        assert model.get_pipeline_kwargs_chunk_dims({}) == {}
+
+
 def _build_inner_model():
     """Barebones Qwen3_5MoeModel with stubbed language_model and no vision encoder."""
     model = Qwen3_5MoeModel.__new__(Qwen3_5MoeModel)

@@ -99,6 +99,7 @@ class TestCheckpointingConfig:
             is_peft=False,
         )
         assert cfg.is_async is False
+        assert cfg.allow_legacy_pickle_restore is False
         assert cfg.dequantize_base_checkpoint is None
         assert cfg.single_rank_consolidation is False
         assert cfg.staging_dir is None
@@ -107,6 +108,16 @@ class TestCheckpointingConfig:
         assert cfg.best_metric_key == "default"
         assert cfg.consolidation_timeout_minutes == 30
         assert cfg.max_recent_checkpoints is None
+
+    def test_allow_legacy_pickle_restore_override(self):
+        cfg = CheckpointingConfig(allow_legacy_pickle_restore=True)
+
+        assert cfg.allow_legacy_pickle_restore is True
+
+    @pytest.mark.parametrize("invalid_value", [None, 0, 1, "false", "true"])
+    def test_allow_legacy_pickle_restore_must_be_boolean(self, invalid_value):
+        with pytest.raises(ValueError, match="allow_legacy_pickle_restore must be a boolean"):
+            CheckpointingConfig(allow_legacy_pickle_restore=invalid_value)
 
     def test_consolidation_timeout_override(self):
         cfg = CheckpointingConfig(consolidation_timeout_minutes=45)

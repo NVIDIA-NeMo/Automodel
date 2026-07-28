@@ -854,6 +854,19 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
         fp32_safe_rotary.to(rotary.inv_freq.device)
         vision_model.rotary_pos_emb = fp32_safe_rotary
 
+    def get_pipeline_kwargs_chunk_dims(self, kwargs: dict[str, Any]) -> dict[str, int]:
+        """Return model-owned PP microbatch split dims for keyword inputs.
+
+        Qwen3.5-MoE mRoPE position ids can arrive as ``[T/H/W, batch, seq]`` or
+        ``[text/T/H/W, batch, seq]``. The PP schedule must split that tensor on
+        the batch axis, while all standard batch-major kwargs keep the framework
+        default.
+        """
+        position_ids = kwargs.get("position_ids")
+        if isinstance(position_ids, torch.Tensor) and position_ids.ndim == 3 and position_ids.shape[0] in (3, 4):
+            return {"position_ids": 1}
+        return {}
+
     def prepare_model_inputs_for_cp(
         self,
         batch: dict[str, Any],

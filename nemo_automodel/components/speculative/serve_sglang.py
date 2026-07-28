@@ -120,11 +120,8 @@ def _load_safetensors_save_file() -> Callable[..., None]:
 
 
 def _torch_load(path: Path) -> Any:
-    """Load a torch pickle, preferring ``weights_only=True`` when supported."""
-    try:
-        return torch.load(path, map_location="cpu", weights_only=True)
-    except TypeError:
-        return torch.load(path, map_location="cpu")
+    """Load a torch checkpoint with restricted unpickling."""
+    return torch.load(path, map_location="cpu", weights_only=True)
 
 
 def _rewrite_config_for_sglang(
