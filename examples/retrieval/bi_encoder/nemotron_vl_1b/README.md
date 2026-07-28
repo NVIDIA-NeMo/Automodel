@@ -146,3 +146,7 @@ multi-node training on a Slurm cluster, use `sbatch`.
 ```bash
 torchrun --nproc-per-node=8 examples/retrieval/bi_encoder/finetune.py --config examples/retrieval/bi_encoder/nemotron_vl_1b/nemotron_vl_1b_example.yaml
 ```
+
+The default batch settings use one local batch on each of eight GPUs, so they do not use gradient accumulation and
+`distributed.static_graph: true` is appropriate. If you reduce the GPU count without reducing `global_batch_size`,
+set `distributed.static_graph: false` because the resulting run uses more than one gradient accumulation step.
