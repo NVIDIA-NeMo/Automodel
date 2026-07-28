@@ -18,7 +18,7 @@ import pytest
 import torch
 from torch import nn
 
-import nemo_automodel.recipes.llm.partial_cuda_graphs as partial_graphs
+import nemo_automodel.components.cuda_graphs.partial as partial_graphs
 
 
 class _RouterCore(nn.Module):

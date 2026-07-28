@@ -37,10 +37,10 @@ from torch.distributed.fsdp import FSDPModule, fully_shard
 from torch.distributed.tensor import DTensor
 from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 
+from nemo_automodel.components.cuda_graphs import PartialCudaGraphManager
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.gpt_oss.rope_utils import RotaryEmbedding, position_ids_to_freqs_cis
 from nemo_automodel.components.models.qwen3_moe.layers import Qwen3MoeAttention
-from nemo_automodel.recipes.llm.partial_cuda_graphs import PartialCudaGraphManager
 
 HIDDEN_SIZE = 64
 HEAD_DIM = 16

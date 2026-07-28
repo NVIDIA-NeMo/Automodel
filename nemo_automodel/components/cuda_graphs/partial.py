@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Scoped partial CUDA graphs for fixed-shape attention and MoE preprocessing.
+"""Component-owned partial CUDA graphs for fixed-shape attention and MoE preprocessing.
 
 Attention, the parameterless router core, and HybridEP metadata preprocessing
 may be captured. Dynamic dispatch, expert compute, and combine remain eager.
@@ -31,6 +31,7 @@ from torch import nn
 from torch.utils._pytree import tree_flatten, tree_unflatten
 
 from nemo_automodel.shared.import_utils import safe_import_from, safe_import_te
+from nemo_automodel.shared.model_utils import iter_transformer_and_mtp_blocks
 
 logger = logging.getLogger(__name__)
 
@@ -807,15 +808,13 @@ _GRAPH_MODULE_SPECS = {
 
 
 def _discover_blocks(model: nn.Module) -> list[_DiscoveredBlock]:
-    """Discover main-stack and MTP blocks using the shared MoE traversal."""
+    """Discover main-stack and MTP blocks using shared structural traversal."""
     from torch.distributed.fsdp import FSDPModule
-
-    from nemo_automodel.components.moe.parallelizer import _iter_transformer_and_mtp_blocks
 
     label = _model_label(model)
     mtp_layers = getattr(getattr(model, "mtp", None), "layers", None)
     blocks = []
-    for parent_layers, layer_id, wrapped_block in _iter_transformer_and_mtp_blocks(model):
+    for parent_layers, layer_id, wrapped_block in iter_transformer_and_mtp_blocks(model):
         block = _unwrap_checkpoint_wrappers(wrapped_block)
         capture_owner = wrapped_block if isinstance(wrapped_block, FSDPModule) else None
         is_mtp = parent_layers is mtp_layers

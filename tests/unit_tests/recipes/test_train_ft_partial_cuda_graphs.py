@@ -18,7 +18,7 @@ from unittest.mock import MagicMock
 import pytest
 from torch import nn
 
-import nemo_automodel.recipes.llm.partial_cuda_graphs as partial_graphs
+import nemo_automodel.components.cuda_graphs.partial as partial_graphs
 from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
 
 

@@ -55,6 +55,7 @@ from nemo_automodel._transformers.infrastructure import (
 from nemo_automodel._transformers.mfu import AutoMFU
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
+from nemo_automodel.components.cuda_graphs import PartialCudaGraphManager
 from nemo_automodel.components.datasets.loader import DataloaderConfig
 from nemo_automodel.components.distributed.config import DistributedSetup, FSDP2Config, MegatronFSDPConfig
 from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
@@ -781,8 +782,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
     def _setup_partial_cuda_graphs(self) -> None:
         """Discover opt-in graph targets and arm first-step eager recording."""
-        from nemo_automodel.recipes.llm.partial_cuda_graphs import PartialCudaGraphManager
-
         self.partial_cuda_graph_manager = PartialCudaGraphManager.from_model_parts(
             self.model_parts,
             activation_checkpointing=bool(self.activation_checkpointing),
