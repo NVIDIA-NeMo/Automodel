@@ -226,7 +226,11 @@ def test_keep_hf_modules_in_fp32_uses_strict_dtype_plan_and_restores_class_state
     TinyModel(TinyConfig()).save_pretrained(tmp_path)
     plain = TinyModel.from_pretrained(tmp_path, dtype=torch.bfloat16)
     hf_config = SimpleNamespace(architectures=["Qwen3_5MoeForConditionalGeneration"])
-    assert _hf_fp32_module_names(hf_config) == ("A_log", "dt_bias")
+    with patch(
+        "nemo_automodel._transformers.model_init._resolve_custom_model_cls_for_config",
+        return_value=None,
+    ):
+        assert _hf_fp32_module_names(hf_config) == ("A_log", "dt_bias")
     with _keep_hf_modules_in_fp32(hf_config):
         assert set(PreTrainedModel._keep_in_fp32_modules_strict) >= {"A_log", "dt_bias"}
         strict = TinyModel.from_pretrained(tmp_path, dtype=torch.bfloat16)
@@ -238,8 +242,36 @@ def test_keep_hf_modules_in_fp32_uses_strict_dtype_plan_and_restores_class_state
     assert strict.dt_bias.dtype == torch.float32
 
 
+def test_hf_fp32_module_names_includes_generic_model_strict_contract():
+    class TinyAutoModel:
+        _keep_in_fp32_modules_strict = ["rotary_emb", "router.e_score_correction_bias"]
+
+    hf_config = SimpleNamespace(architectures=["TinyForCausalLM"])
+    with patch(
+        "nemo_automodel._transformers.model_init._resolve_custom_model_cls_for_config",
+        return_value=TinyAutoModel,
+    ):
+        assert _hf_fp32_module_names(hf_config) == ("rotary_emb", "router.e_score_correction_bias")
+
+
+def test_hf_fp32_module_names_combines_gdn_and_generic_contracts_without_duplicates():
+    class TinyAutoModel:
+        _keep_in_fp32_modules_strict = ["A_log", "rotary_emb"]
+
+    hf_config = SimpleNamespace(architectures=["Qwen3_5MoeForConditionalGeneration"])
+    with patch(
+        "nemo_automodel._transformers.model_init._resolve_custom_model_cls_for_config",
+        return_value=TinyAutoModel,
+    ):
+        assert _hf_fp32_module_names(hf_config) == ("A_log", "dt_bias", "rotary_emb")
+
+
 def test_hf_fp32_module_names_is_empty_without_model_contract():
-    assert _hf_fp32_module_names(SimpleNamespace(architectures=["LlamaForCausalLM"])) == ()
+    with patch(
+        "nemo_automodel._transformers.model_init._resolve_custom_model_cls_for_config",
+        return_value=None,
+    ):
+        assert _hf_fp32_module_names(SimpleNamespace(architectures=["LlamaForCausalLM"])) == ()
 
 
 def test_source_load_parity_failure_is_returned_for_later_reporting():

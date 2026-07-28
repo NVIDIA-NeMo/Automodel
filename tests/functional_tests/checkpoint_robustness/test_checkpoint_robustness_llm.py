@@ -443,14 +443,18 @@ def _release_model_memory() -> None:
 
 def _hf_fp32_module_names(hf_config: object) -> tuple[str, ...]:
     """Infer vanilla-HF fp32 names from AutoModel's model-owned checkpoint contract."""
+    from nemo_automodel._transformers.model_init import _resolve_custom_model_cls_for_config
     from nemo_automodel.components.models.common.gated_delta_net_fp32 import (
         FP32_GDN_PARAM_NAMES,
         has_gated_delta_net_fp32_checkpoint_contract,
     )
 
-    if has_gated_delta_net_fp32_checkpoint_contract(hf_config):
-        return FP32_GDN_PARAM_NAMES
-    return ()
+    module_names = list(FP32_GDN_PARAM_NAMES) if has_gated_delta_net_fp32_checkpoint_contract(hf_config) else []
+    model_cls = _resolve_custom_model_cls_for_config(hf_config)
+    for name in getattr(model_cls, "_keep_in_fp32_modules_strict", None) or ():
+        if name not in module_names:
+            module_names.append(name)
+    return tuple(module_names)
 
 
 @contextmanager
