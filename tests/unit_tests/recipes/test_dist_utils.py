@@ -27,6 +27,7 @@ from nemo_automodel.components.distributed.config import (
     FSDP2Config,
     MegatronFSDPConfig,
     MoEParallelizerConfig,
+    MultimodalDistributedConfig,
 )
 from nemo_automodel.components.distributed.mesh import MeshAxisName, MeshContext, ParallelismSizes
 from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
@@ -445,6 +446,24 @@ class TestValidation:
         cfg = {"strategy": "fsdp2", meta_key: "value"}
         result = parse_distributed_section(cfg)
         assert isinstance(result["strategy_config"], FSDP2Config)
+
+    @pytest.mark.parametrize("policy", ["root", "per_layer", "replicate"])
+    def test_fsdp2_accepts_frozen_multimodal_sharding(self, policy):
+        result = parse_distributed_section({"strategy": "fsdp2", "multimodal": {"frozen_sharding": policy}})
+        assert result["strategy_config"].multimodal.frozen_sharding == policy
+
+    def test_fsdp2_defaults_frozen_multimodal_sharding_to_root(self):
+        result = parse_distributed_section({"strategy": "fsdp2"})
+        assert result["strategy_config"].multimodal == MultimodalDistributedConfig(frozen_sharding="root")
+
+    @pytest.mark.parametrize("policy", ["off", "shard"])
+    def test_fsdp2_rejects_unknown_frozen_multimodal_sharding(self, policy):
+        with pytest.raises(ValueError, match="distributed.multimodal.frozen_sharding"):
+            parse_distributed_section({"strategy": "fsdp2", "multimodal": {"frozen_sharding": policy}})
+
+    def test_fsdp2_rejects_unmerged_flat_frozen_multimodal_sharding_key(self):
+        with pytest.raises(ValueError, match="frozen_multimodal_sharding"):
+            parse_distributed_section({"strategy": "fsdp2", "frozen_multimodal_sharding": "root"})
 
 
 # ---------------------------------------------------------------------------
