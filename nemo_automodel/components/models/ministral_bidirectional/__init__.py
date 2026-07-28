@@ -23,5 +23,7 @@ from nemo_automodel.components.models.ministral_bidirectional.processor import M
 __all__ = [
     "Ministral3BidirectionalModel",
     "Ministral3BidirectionalConfig",
+    "Mistral3BidirectionalModel",
+    "Mistral3BidirectionalConfig",
     "Mistral3BiEncoderProcessor",
 ]
