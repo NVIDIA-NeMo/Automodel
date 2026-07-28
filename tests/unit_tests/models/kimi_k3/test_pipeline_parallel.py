@@ -23,6 +23,7 @@ from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.kimi_k3.config import KimiK3Config, KimiK3TextConfig
 from nemo_automodel.components.models.kimi_k3.model import (
     KimiK3ForCausalLM,
+    KimiK3MoE,
     _partition_attn_residual_blocks,
 )
 
@@ -122,7 +123,7 @@ def test_customize_pipeline_modules_places_vision_on_first_stage():
 def _tiny_config(
     *,
     num_hidden_layers: int = 4,
-    attn_res_block_size: int = 2,
+    attn_res_block_size: int | None = 2,
 ) -> KimiK3TextConfig:
     return KimiK3TextConfig(
         vocab_size=64,
@@ -213,6 +214,58 @@ def test_pipeline_stage_weight_initialization_handles_pruned_modules():
     last_stage = KimiK3ForCausalLM(_tiny_config(), backend=_torch_backend())
     last_stage.model.embed_tokens = None
     last_stage.initialize_weights(torch.device("cpu"), dtype=torch.float32)
+
+
+def test_weight_initialization_and_forward_without_attention_residuals():
+    model = KimiK3ForCausalLM(
+        _tiny_config(num_hidden_layers=1, attn_res_block_size=None),
+        backend=_torch_backend(),
+    )
+    assert model.model.use_attn_residuals is False
+    assert not hasattr(model.model, "output_attn_res_norm")
+    assert not hasattr(model.model, "output_attn_res_proj")
+
+    model.initialize_weights(torch.device("cpu"), dtype=torch.float32)
+    model.eval()
+    with torch.no_grad():
+        logits = model(torch.tensor([[1, 2, 3, 4]])).logits
+
+    assert torch.isfinite(logits).all()
+
+
+@pytest.mark.parametrize("experts_backend", ["torch", "torch_mm"])
+def test_k3_moe_training_forward_matches_reference_order(experts_backend):
+    torch.manual_seed(5)
+    config = _tiny_config(num_hidden_layers=1, attn_res_block_size=1)
+    config.first_k_dense_replace = 0
+    config.num_experts = 4
+    config.num_experts_per_token = 2
+    config.num_expert_group = 2
+    config.topk_group = 1
+    backend = _torch_backend()
+    backend.experts = experts_backend
+
+    model = KimiK3ForCausalLM(config, backend=backend)
+    model.initialize_weights(torch.device("cpu"), dtype=torch.float32)
+    moe = model.model.layers["0"].mlp
+    assert isinstance(moe, KimiK3MoE)
+    assert moe.experts.apply_router_weight_after_down is True
+
+    hidden_states = torch.randn(2, 3, config.hidden_size)
+    token_mask = torch.ones(hidden_states.numel() // config.hidden_size, dtype=torch.bool)
+    weights, indices, _ = moe.gate(hidden_states.flatten(0, 1), token_mask)
+    assert weights.dtype == torch.float32
+    assert weights.shape == indices.shape == (6, 2)
+
+    moe.eval()
+    with torch.no_grad():
+        reference = moe(hidden_states)
+    moe.train()
+    with torch.no_grad():
+        actual = moe(hidden_states)
+
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, reference, rtol=1e-5, atol=1e-6)
 
 
 def test_two_pipeline_stage_handoff_matches_full_model():

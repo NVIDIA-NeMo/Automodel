@@ -1293,10 +1293,7 @@ class KimiDecoderLayer(nn.Module):
         self.input_layernorm.reset_parameters()
         self.post_attention_layernorm.reset_parameters()
         self.self_attn.init_weights(buffer_device, init_std)
-        if self.is_moe_layer:
-            self.mlp.init_weights(buffer_device, init_std)
-        else:
-            self.mlp.init_weights(buffer_device, init_std)
+        self.mlp.init_weights(buffer_device, init_std)
         if self.use_attn_residuals:
             self.self_attention_res_norm.reset_parameters()
             self.mlp_res_norm.reset_parameters()
@@ -1585,10 +1582,11 @@ class KimiK3TextModel(nn.Module):
                     self.embed_tokens.weight[self.padding_idx].zero_()
             if self.norm is not None:
                 self.norm.reset_parameters()
-            if self.output_attn_res_norm is not None:
-                self.output_attn_res_norm.reset_parameters()
-            if self.output_attn_res_proj is not None:
-                nn.init.normal_(self.output_attn_res_proj.weight, mean=0.0, std=init_std)
+            if self.use_attn_residuals:
+                if self.output_attn_res_norm is not None:
+                    self.output_attn_res_norm.reset_parameters()
+                if self.output_attn_res_proj is not None:
+                    nn.init.normal_(self.output_attn_res_proj.weight, mean=0.0, std=init_std)
         for layer in self.layers.values():
             layer.init_weights(buffer_device, init_std)
 
