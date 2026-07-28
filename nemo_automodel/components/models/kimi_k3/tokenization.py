@@ -1,4 +1,5 @@
 # Copyright 2025-2026 The Moonshot AI Team. All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 # Distributed under the Kimi K3 License in KIMI_K3_LICENSE.
 
 import os
