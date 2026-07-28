@@ -97,7 +97,7 @@ def _build_model(device: torch.device, *, graph: bool) -> _AttentionModel:
         linear="torch",
         rms_norm="torch",
         rope_fusion=False,
-        cuda_graph_modules=["attn"] if graph else [],
+        cuda_graph={"modules": ["attn"] if graph else []},
     )
     config = Qwen3MoeConfig(
         hidden_size=HIDDEN_SIZE,

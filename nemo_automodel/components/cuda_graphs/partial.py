@@ -849,17 +849,17 @@ def _select_graph_targets(
     """Select graph targets while rejecting shared/repeated physical call sites."""
     if not candidates:
         raise RuntimeError(
-            f"cuda_graph_modules includes {module_name!r}, but no layer exposes a graphable {module_name} boundary"
+            f"cuda_graph.modules includes {module_name!r}, but no layer exposes a graphable {module_name} boundary"
         )
     if repeated_mtp_layer and any(block.is_mtp for block, _target in candidates):
         raise RuntimeError(
-            f"cuda_graph_modules={module_name!r} cannot capture repeated-layer MTP: one physical "
+            f"cuda_graph.modules={module_name!r} cannot capture repeated-layer MTP: one physical "
             f"{module_name} target is invoked multiple times before backward and requires graph replicas or ring slots"
         )
     target_ids = [id(target) for _block, target in candidates]
     if len(target_ids) != len(set(target_ids)):
         raise RuntimeError(
-            f"cuda_graph_modules={module_name!r} selected a shared physical target more than once; "
+            f"cuda_graph.modules={module_name!r} selected a shared physical target more than once; "
             "shared/repeated modules require independent graph replicas"
         )
     return {block.name: target for block, target in candidates}
@@ -883,7 +883,9 @@ class PartialCudaGraphManager:
     ) -> PartialCudaGraphManager | None:
         """Discover graph targets from an already-built training model."""
         enabled_parts = [
-            part for part in model_parts if bool(getattr(getattr(part, "backend", None), "cuda_graph_modules", []))
+            part
+            for part in model_parts
+            if getattr(part, "backend", None) is not None and part.backend.cuda_graph.modules
         ]
         if not enabled_parts:
             return None
@@ -893,13 +895,13 @@ class PartialCudaGraphManager:
                 "pipeline chunks can overwrite static graph buffers with in-flight microbatches"
             )
         if activation_checkpointing:
-            if any("attn" in part.backend.cuda_graph_modules for part in enabled_parts):
+            if any("attn" in part.backend.cuda_graph.modules for part in enabled_parts):
                 raise RuntimeError(
                     "Whole-attention CUDA graphs do not support activation checkpointing; "
                     "use te_dpa or disable activation checkpointing"
                 )
             if any(
-                "moe_router" in part.backend.cuda_graph_modules or "moe_preprocess" in part.backend.cuda_graph_modules
+                "moe_router" in part.backend.cuda_graph.modules or "moe_preprocess" in part.backend.cuda_graph.modules
                 for part in enabled_parts
             ):
                 raise RuntimeError(
@@ -912,7 +914,7 @@ class PartialCudaGraphManager:
             )
         model = model_parts[0]
         backend = model.backend
-        cuda_graph_modules = set(backend.cuda_graph_modules)
+        cuda_graph_modules = set(backend.cuda_graph.modules)
         blocks = _discover_blocks(model)
         entries: list[_PartialGraphEntry] = []
 

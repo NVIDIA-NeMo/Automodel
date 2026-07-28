@@ -17,7 +17,7 @@ import logging
 import pytest
 import torch
 
-from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.common import BackendConfig, CudaGraphConfig
 from nemo_automodel.components.moe.config import MoEConfig
 
 
@@ -398,7 +398,12 @@ class TestBackendConfigRopeFusionDisabled:
 
 class TestBackendConfigPartialCudaGraphs:
     def test_empty_module_list_disables_cuda_graphs(self):
-        assert BackendConfig().cuda_graph_modules == []
+        assert BackendConfig().cuda_graph.modules == []
+
+    def test_mapping_is_normalized_to_typed_config(self):
+        config = BackendConfig(attn="te", cuda_graph={"modules": ["te_dpa"]})
+
+        assert config.cuda_graph == CudaGraphConfig(modules=["te_dpa"])
 
     def test_accepts_megatron_moe_module_names(self):
         modules = ["attn", "moe_router", "moe_preprocess"]
@@ -408,41 +413,53 @@ class TestBackendConfigPartialCudaGraphs:
             rms_norm="torch",
             rope_fusion=False,
             dispatcher="hybridep",
-            cuda_graph_modules=modules,
+            cuda_graph=CudaGraphConfig(modules=modules),
         )
 
-        assert config.cuda_graph_modules == modules
+        assert config.cuda_graph.modules == modules
 
     @pytest.mark.parametrize("modules", ["te_dpa", ("te_dpa",)])
     def test_modules_must_be_a_list(self, modules):
         with pytest.raises(TypeError, match="must be a list"):
-            BackendConfig(cuda_graph_modules=modules)
+            CudaGraphConfig(modules=modules)
 
     def test_module_names_must_be_strings(self):
         with pytest.raises(TypeError, match="entries must be strings"):
-            BackendConfig(cuda_graph_modules=[1])
+            CudaGraphConfig(modules=[1])
 
     def test_rejects_unknown_or_duplicate_modules(self):
-        with pytest.raises(ValueError, match="Unsupported cuda_graph_modules"):
-            BackendConfig(cuda_graph_modules=["mlp"])
+        with pytest.raises(ValueError, match=r"Unsupported cuda_graph\.modules"):
+            CudaGraphConfig(modules=["mlp"])
         with pytest.raises(ValueError, match="must not contain duplicates"):
-            BackendConfig(attn="te", cuda_graph_modules=["te_dpa", "te_dpa"])
+            CudaGraphConfig(modules=["te_dpa", "te_dpa"])
         with pytest.raises(ValueError, match="cannot contain both"):
-            BackendConfig(attn="te", cuda_graph_modules=["attn", "te_dpa"])
+            CudaGraphConfig(modules=["attn", "te_dpa"])
 
     @pytest.mark.parametrize("module", ["attn", "te_dpa"])
     def test_attention_requires_te_backend(self, module):
         with pytest.raises(ValueError, match="requires attn='te'"):
             BackendConfig(
                 attn="sdpa",
-                cuda_graph_modules=[module],
+                cuda_graph=CudaGraphConfig(modules=[module]),
             )
 
     def test_whole_attention_requires_mixed_pytorch_te_backend(self):
         with pytest.raises(ValueError, match="requires linear='torch'"):
-            BackendConfig(attn="te", linear="te", rms_norm="torch", rope_fusion=False, cuda_graph_modules=["attn"])
+            BackendConfig(
+                attn="te",
+                linear="te",
+                rms_norm="torch",
+                rope_fusion=False,
+                cuda_graph=CudaGraphConfig(modules=["attn"]),
+            )
         with pytest.raises(ValueError, match="requires rms_norm='torch'"):
-            BackendConfig(attn="te", linear="torch", rms_norm="te", rope_fusion=False, cuda_graph_modules=["attn"])
+            BackendConfig(
+                attn="te",
+                linear="torch",
+                rms_norm="te",
+                rope_fusion=False,
+                cuda_graph=CudaGraphConfig(modules=["attn"]),
+            )
 
     def test_whole_attention_uses_resolved_rope_fusion_value(self, caplog):
         with caplog.at_level(logging.WARNING):
@@ -451,17 +468,17 @@ class TestBackendConfigPartialCudaGraphs:
                 linear="torch",
                 rms_norm="torch",
                 rope_fusion=True,
-                cuda_graph_modules=["attn"],
+                cuda_graph=CudaGraphConfig(modules=["attn"]),
             )
 
         assert config.rope_fusion is False
-        assert config.cuda_graph_modules == ["attn"]
+        assert config.cuda_graph.modules == ["attn"]
 
     def test_preprocess_requires_router_and_hybridep(self):
         with pytest.raises(ValueError, match="requires 'moe_router'"):
-            BackendConfig(cuda_graph_modules=["moe_preprocess"])
+            CudaGraphConfig(modules=["moe_preprocess"])
         with pytest.raises(ValueError, match="requires dispatcher='hybridep'"):
             BackendConfig(
                 dispatcher="deepep",
-                cuda_graph_modules=["moe_router", "moe_preprocess"],
+                cuda_graph=CudaGraphConfig(modules=["moe_router", "moe_preprocess"]),
             )

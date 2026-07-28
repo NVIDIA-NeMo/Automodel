@@ -31,7 +31,7 @@ def _bare_recipe() -> TrainFinetuneRecipeForNextTokenPrediction:
 
 def test_builder_forwards_runtime_safety_context(monkeypatch):
     model = nn.Linear(2, 2)
-    model.backend = SimpleNamespace(cuda_graph_modules=["te_dpa"])
+    model.backend = SimpleNamespace(cuda_graph=SimpleNamespace(modules=["te_dpa"]))
     model_parts = [model]
     manager = SimpleNamespace(capture=MagicMock())
     discover = MagicMock(return_value=manager)

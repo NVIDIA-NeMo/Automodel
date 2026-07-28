@@ -77,7 +77,7 @@ class _Model(nn.Module):
         if preprocess:
             cuda_graph_modules.append("moe_preprocess")
         self.backend = SimpleNamespace(
-            cuda_graph_modules=cuda_graph_modules,
+            cuda_graph=SimpleNamespace(modules=cuda_graph_modules),
         )
         self.model = nn.Module()
         self.model.layers = nn.ModuleDict({str(index): _Layer() for index in range(layer_count)})

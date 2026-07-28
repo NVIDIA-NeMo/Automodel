@@ -663,7 +663,7 @@ class MoE(nn.Module):
             self.gate = FakeBalancedGate(config, noise=backend.fake_gate_noise)
         else:
             self.gate = Gate(config, gate_precision=backend.gate_precision)
-            self.gate.use_routing_core = "moe_router" in backend.cuda_graph_modules
+            self.gate.use_routing_core = "moe_router" in backend.cuda_graph.modules
         if backend.dispatcher in ("deepep", "hybridep", "uccl_ep") and get_world_size_safe() == 1:
             warnings.warn(
                 f"'{backend.dispatcher}' dispatcher is enabled in config, but world size is 1. "
