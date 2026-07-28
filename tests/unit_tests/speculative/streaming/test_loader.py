@@ -201,7 +201,30 @@ def test_loader_release_previous_on_next_pull(queue, store, backend) -> None:
 
 
 def test_loader_stops_when_queue_drains(queue, store) -> None:
+    """The loader raises ``StopIteration`` only when the queue is closed AND drained.
+
+    The loader's fix-PR-2 contract: an open-but-empty queue keeps the
+    loader polling (a transient empty poll). Closing the queue
+    transitions to the drained state and ``__next__`` raises
+    ``StopIteration`` on the next pull.
+    """
     loader = FeatureDataLoader(queue, store)
+    queue.close()
+    with pytest.raises(StopIteration):
+        next(iter(loader))
+
+
+def test_loader_keeps_polling_on_open_empty_queue(queue, store) -> None:
+    """On a transient empty poll, the loader sleeps and re-acquires.
+
+    A producer that pauses briefly must NOT terminate the trainer's
+    iteration loop. The loader only stops when ``queue.is_closed`` is
+    ``True`` -- the canonical signal introduced in PR 1's review fix.
+    The test below bounds the polling window via a small acquire poll
+    interval so we don't hang the suite.
+    """
+    loader = FeatureDataLoader(queue, store, acquire_poll_interval=0.01)
+    queue.close()  # signal shutdown so the test exits cleanly
     with pytest.raises(StopIteration):
         next(iter(loader))
 

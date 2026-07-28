@@ -106,11 +106,30 @@ def validate_eagle3_ref(ref: SampleRef) -> None:
             f"present={sorted(keys)}"
         )
     has_logits = "logits" in keys
-    has_draft = "target_probs" in keys and "position_mask" in keys
-    if has_logits == has_draft:
+    has_target_probs = "target_probs" in keys
+    has_position_mask = "position_mask" in keys
+    # The draft-vocab encoding is a pair: both keys must be present
+    # together. ``target_probs`` without ``position_mask`` (or vice
+    # versa) silently picks the full-logits path in the loader while
+    # the producer meant the draft-vocab path -- a misroute the
+    # loader cannot recover from.
+    if has_target_probs != has_position_mask:
         raise ValueError(
-            "EAGLE-3 ref must carry exactly one supervision encoding: 'logits' "
-            "alone, or 'target_probs' + 'position_mask' together. "
+            "EAGLE-3 ref carries a partial draft-vocab encoding: 'target_probs' "
+            "and 'position_mask' must be present together (or both absent). "
+            f"Present feature_specs={sorted(keys)}"
+        )
+    # Mixing the two encodings is similarly disallowed.
+    if has_logits and (has_target_probs or has_position_mask):
+        raise ValueError(
+            "EAGLE-3 ref carries both 'logits' and draft-vocab features; choose "
+            f"exactly one supervision encoding. Present feature_specs={sorted(keys)}"
+        )
+    # No supervision encoding at all is also a hard error.
+    if not has_logits and not has_target_probs:
+        raise ValueError(
+            "EAGLE-3 ref carries no supervision encoding; provide 'logits' or "
+            "the 'target_probs' + 'position_mask' pair. "
             f"Present feature_specs={sorted(keys)}"
         )
     if ref.schema_version != EAGLE3_SCHEMA_VERSION:

@@ -31,6 +31,7 @@ unaffected by the loader's lifecycle.
 from __future__ import annotations
 
 import logging
+import time
 
 import torch
 
@@ -74,14 +75,18 @@ class FeatureDataLoader:
         store: FeatureStore,
         *,
         algorithm=None,
+        acquire_poll_interval: float = 0.05,
     ) -> None:
         from nemo_automodel.components.speculative.streaming.refs import FeatureAlgorithm
 
         if algorithm is None:
             algorithm = FeatureAlgorithm.EAGLE3
+        if acquire_poll_interval <= 0:
+            raise ValueError(f"acquire_poll_interval must be positive, got {acquire_poll_interval}")
         self._queue = queue
         self._store = store
         self._algorithm = algorithm
+        self._acquire_poll_interval = acquire_poll_interval
         self._pending_lease: Lease | None = None
         self._pending_handle: StoreHandle | None = None
         self._closed = False
@@ -93,9 +98,19 @@ class FeatureDataLoader:
         self._release_pending()
         if self._closed:
             raise StopIteration
+        # The queue returns ``None`` for two distinct cases that the
+        # consumer must distinguish: transient empty poll (the producer
+        # is briefly behind) vs shutdown-drained. ``queue.is_closed``
+        # is the canonical signal. Loop on the transient case; raise
+        # ``StopIteration`` only when the queue has actually shut down.
         lease = self._queue.acquire()
-        if lease is None:
-            raise StopIteration
+        while lease is None:
+            if self._queue.is_closed:
+                raise StopIteration
+            time.sleep(self._acquire_poll_interval)
+            if self._closed:
+                raise StopIteration
+            lease = self._queue.acquire()
         ref = lease.ref
         if ref.algorithm is not self._algorithm:
             self._queue.fail(lease)

@@ -201,13 +201,66 @@ def test_validate_rejects_missing_core_feature(missing) -> None:
 
 
 def test_validate_rejects_neither_supervision() -> None:
-    with pytest.raises(ValueError, match="exactly one supervision encoding"):
+    with pytest.raises(ValueError, match="no supervision encoding"):
         validate_eagle3_ref(_ref(include_logits=False, include_draft=False))
 
 
 def test_validate_rejects_both_supervisions() -> None:
-    with pytest.raises(ValueError, match="exactly one supervision encoding"):
+    with pytest.raises(ValueError, match="both 'logits' and draft-vocab features"):
         validate_eagle3_ref(_ref(include_logits=True, include_draft=True))
+
+
+def test_validate_rejects_partial_draft_vocab_target_probs_only() -> None:
+    """target_probs without position_mask (or vice versa) is a hard error.
+
+    The loader's branch on ``has_target_probs and has_position_mask``
+    would silently take the logits path; the consumer would then
+    project draft-vocab features that were never actually produced.
+    """
+    ref = _partial_ref(extra_keys=("target_probs",))
+    with pytest.raises(ValueError, match="partial draft-vocab encoding"):
+        validate_eagle3_ref(ref)
+
+
+def test_validate_rejects_partial_draft_vocab_position_mask_only() -> None:
+    ref = _partial_ref(extra_keys=("position_mask",))
+    with pytest.raises(ValueError, match="partial draft-vocab encoding"):
+        validate_eagle3_ref(ref)
+
+
+def _partial_ref(*, extra_keys: tuple[str, ...]) -> SampleRef:
+    """Build a :class:`SampleRef` with EAGLE3 core + ``extra_keys`` (no supervision)."""
+    feature_keys: dict[str, str] = {
+        "aux_hidden_states": "s/aux_hidden_states",
+        "input_ids": "s/input_ids",
+        "attention_mask": "s/attention_mask",
+        "loss_mask": "s/loss_mask",
+    }
+    feature_specs: dict[str, FeatureSpec] = {
+        "aux_hidden_states": FeatureSpec(shape=(2, 8), dtype=torch.float32),
+        "input_ids": FeatureSpec(shape=(2, 8), dtype=torch.long),
+        "attention_mask": FeatureSpec(shape=(2, 8), dtype=torch.long),
+        "loss_mask": FeatureSpec(shape=(2, 8), dtype=torch.long),
+    }
+    for k in extra_keys:
+        feature_keys[k] = f"s/{k}"
+        if k == "position_mask":
+            feature_specs[k] = FeatureSpec(shape=(2, 8), dtype=torch.bool)
+        else:
+            feature_specs[k] = FeatureSpec(shape=(2, 8, 16), dtype=torch.float32)
+    ref = object.__new__(SampleRef)
+    object.__setattr__(ref, "sample_id", "s")
+    object.__setattr__(ref, "run_id", "r")
+    object.__setattr__(ref, "store_uri", "mem://test")
+    object.__setattr__(ref, "feature_keys", feature_keys)
+    object.__setattr__(ref, "feature_specs", feature_specs)
+    object.__setattr__(ref, "algorithm", FeatureAlgorithm.EAGLE3)
+    object.__setattr__(ref, "schema_version", 1)
+    object.__setattr__(ref, "num_tokens", 16)
+    object.__setattr__(ref, "estimated_bytes", 64)
+    object.__setattr__(ref, "target_model_version", "0")
+    object.__setattr__(ref, "draft_weight_version", "0")
+    return ref
 
 
 def test_validate_constant_draft_supervision_lists_target_probs_and_position_mask() -> None:
