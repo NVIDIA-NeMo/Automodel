@@ -103,6 +103,7 @@ lr_scheduler:
 
 ci:
   vllm_deploy: true
+  vllm_deploy_known_issue_id: DEP-596
   recipe_owner: akoumpa
   time: "00:20:00"
   checkpoint_robustness:

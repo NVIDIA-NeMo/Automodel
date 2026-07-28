@@ -99,6 +99,7 @@ VLM_INPUT_KEYS: tuple[str, ...] = (
     "image_embeds",
     # Video
     "pixel_values_videos",
+    "video_grid_thw",
     # Audio / sound
     "sound_features",
     "sound_attention_mask",

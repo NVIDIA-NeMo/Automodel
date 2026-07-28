@@ -9,7 +9,9 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event.label.name || 'main' }}-${{ github.event_name }}
-  cancel-in-progress: true
+  # PR updates can supersede stale runs, but main must finish populating the
+  # canonical CUDA wheelhouse cache used by every copied PR branch.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   TORCH_CU_INDEX: https://download.pytorch.org/whl/cu130
@@ -169,6 +171,9 @@ jobs:
     env:
       WHEELHOUSE_DIR: /tmp/cuda-wheelhouse
       TORCH_CUDA_ARCH_LIST: "9.0 10.0 12.0"
+      PLATFORM_MACHINE: x86_64
+      PYTHON_VERSION: ${{ matrix.python-version }}
+      SYS_PLATFORM: linux
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -178,18 +183,36 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      - name: Compute CUDA wheelhouse cache key
+        id: cuda-wheelhouse-key
+        shell: bash
+        run: |
+          fingerprint="$(
+            python scripts/cuda_wheelhouse_lock.py \
+              --output fingerprint \
+              --lock uv.lock \
+              --torch-index "${TORCH_CU_INDEX}" \
+              --python-version "${PYTHON_VERSION}" \
+              --platform-machine "${PLATFORM_MACHINE}" \
+              --sys-platform "${SYS_PLATFORM}" \
+              --runner-os "${RUNNER_OS}" \
+              --cuda-container-image "${CUDA_CONTAINER_IMAGE}" \
+              --torch-cuda-arch-list "${TORCH_CUDA_ARCH_LIST}" \
+              --build-script .github/scripts/build-cuda-wheelhouse.sh
+          )"
+          echo "key=install-test-cuda-wheelhouse-v3-${RUNNER_OS}-py${PYTHON_VERSION}-${fingerprint}" >> "$GITHUB_OUTPUT"
+
       # Keep the canonical wheelhouse on main. Copied PR branches restore it
       # without creating duplicate branch-scoped multi-GB cache entries.
+      # Use exact keys only: pip wheel cannot incrementally consume an older
+      # wheelhouse, so a prefix fallback downloads gigabytes before rebuilding.
       - name: Restore and save CUDA wheelhouse cache
         id: cuda-wheelhouse-cache-main
         if: github.ref == 'refs/heads/main'
         uses: actions/cache@v4
         with:
           path: ${{ env.WHEELHOUSE_DIR }}
-          key: install-test-cuda-wheelhouse-${{ runner.os }}-py${{ matrix.python-version }}-${{ hashFiles('pyproject.toml', 'uv.lock', '.github/workflows/install-test.yml') }}
-          restore-keys: |
-            install-test-cuda-wheelhouse-${{ runner.os }}-py${{ matrix.python-version }}-
-            install-test-cuda-wheelhouse-${{ runner.os }}-
+          key: ${{ steps.cuda-wheelhouse-key.outputs.key }}
 
       - name: Restore CUDA wheelhouse cache
         id: cuda-wheelhouse-cache-branch
@@ -197,33 +220,14 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: ${{ env.WHEELHOUSE_DIR }}
-          key: install-test-cuda-wheelhouse-${{ runner.os }}-py${{ matrix.python-version }}-${{ hashFiles('pyproject.toml', 'uv.lock', '.github/workflows/install-test.yml') }}
-          restore-keys: |
-            install-test-cuda-wheelhouse-${{ runner.os }}-py${{ matrix.python-version }}-
-            install-test-cuda-wheelhouse-${{ runner.os }}-
+          key: ${{ steps.cuda-wheelhouse-key.outputs.key }}
 
       - name: Build cached CUDA dependency wheels
         if: |
           steps.cuda-wheelhouse-cache-main.outputs.cache-hit != 'true'
           && steps.cuda-wheelhouse-cache-branch.outputs.cache-hit != 'true'
         shell: bash -x -e -u -o pipefail {0}
-        run: |
-          python -m venv ./venv
-
-          . ./venv/bin/activate
-
-          pip install --upgrade pip
-          pip install --index-url ${TORCH_CU_INDEX} "torch>=2.9.0"
-          pip install numpy packaging psutil pybind11 setuptools wheel wheel_stub
-
-          mkdir -p "${WHEELHOUSE_DIR}"
-          pip wheel --no-deps --no-build-isolation --wheel-dir "${WHEELHOUSE_DIR}" \
-            causal-conv1d \
-            "flash-attn<=2.8.3" \
-            mamba-ssm \
-            nv-grouped-gemm \
-            transformer-engine-torch \
-            "transformer-engine[pytorch]>=2.14.1"
+        run: .github/scripts/build-cuda-wheelhouse.sh
 
       - name: Verify CUDA wheelhouse contents
         shell: bash -x -e -u -o pipefail {0}
@@ -287,14 +291,31 @@ jobs:
           export PIP_FIND_LINKS="${WHEELHOUSE_DIR}"
           export PIP_PREFER_BINARY=1
 
-          pip install --upgrade pip
-
           PIP_ARGS=()
 
           if [[ $EXTRA == *"fa"* || $EXTRA == *"cuda"* || $EXTRA == *"all"* ]]; then
-            pip install --find-links "${PIP_FIND_LINKS}" --index-url ${TORCH_CU_INDEX} "torch>=2.9.0"
-            pip install --find-links "${PIP_FIND_LINKS}" numpy packaging psutil pybind11 setuptools wheel wheel_stub
-            PIP_ARGS=(--no-build-isolation)
+            LOCK_ARGS=(
+              --lock uv.lock
+              --torch-index "${TORCH_CU_INDEX}"
+              --python-version "${{ matrix.python-version }}"
+              --platform-machine x86_64
+              --sys-platform linux
+            )
+            TORCH_REQUIREMENT="$(
+              python scripts/cuda_wheelhouse_lock.py --output torch "${LOCK_ARGS[@]}"
+            )"
+            BUILD_TOOLS="$(
+              python scripts/cuda_wheelhouse_lock.py --output build-tools "${LOCK_ARGS[@]}"
+            )"
+            mapfile -t BUILD_TOOL_REQUIREMENTS <<< "${BUILD_TOOLS}"
+            CONSTRAINTS_FILE="${RUNNER_TEMP}/cuda-wheelhouse-constraints.txt"
+            python scripts/cuda_wheelhouse_lock.py \
+              --output constraints \
+              "${LOCK_ARGS[@]}" > "${CONSTRAINTS_FILE}"
+
+            pip install --find-links "${PIP_FIND_LINKS}" "${BUILD_TOOL_REQUIREMENTS[@]}"
+            pip install --find-links "${PIP_FIND_LINKS}" --index-url ${TORCH_CU_INDEX} "${TORCH_REQUIREMENT}"
+            PIP_ARGS=(--no-build-isolation --constraint "${CONSTRAINTS_FILE}")
             export TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0"
           fi
 
