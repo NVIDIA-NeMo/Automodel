@@ -64,6 +64,7 @@ class KimiPackedContext:
 
     def __post_init__(self) -> None:
         self._cu_seqlens: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        self._has_multiple_documents: bool | None = None
 
     @property
     def cp_enabled(self) -> bool:
@@ -77,6 +78,13 @@ class KimiPackedContext:
             return self.doc_ids
         local_len = self.doc_ids.shape[1] // self.cp_size
         return self.doc_ids[:, self.seq_start : self.seq_start + local_len]
+
+    @property
+    def has_multiple_documents(self) -> bool:
+        """Whether any batch row contains more than one non-padding document."""
+        if self._has_multiple_documents is None:
+            self._has_multiple_documents = bool((self.doc_ids > 1).any().item())
+        return self._has_multiple_documents
 
     def row_cu_seqlens(self, row: int) -> tuple[torch.Tensor, torch.Tensor]:
         """Return the global segment boundaries of one batch row.

@@ -28,6 +28,11 @@ import torch.nn.functional as F
 from torch import nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
+from nemo_automodel.components.attention.utils import (
+    initialize_attn_module_and_func,
+    postprocess_output_for_attn,
+    preprocess_args_and_kwargs_for_attn,
+)
 from nemo_automodel.components.distributed.init_utils import get_world_size_safe
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
@@ -339,10 +344,11 @@ class KimiK3MLP(nn.Module):
 class KimiMLAAttention(nn.Module):
     """Kimi MLA full-attention layer copied from the HF reference math."""
 
-    def __init__(self, config: KimiK3TextConfig, layer_idx: int) -> None:
+    def __init__(self, config: KimiK3TextConfig, layer_idx: int, backend: BackendConfig) -> None:
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
+        self.backend = backend
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.num_key_value_heads = config.num_key_value_heads
@@ -393,6 +399,25 @@ class KimiMLAAttention(nn.Module):
                 bias=False,
                 dtype=dtype,
             )
+        self.attn_module = None
+        self.attn_func = None
+        if backend.attn != "eager":
+            if backend.attn not in ("te", "sdpa"):
+                raise ValueError(f"Kimi K3 MLA does not support backend.attn={backend.attn!r}.")
+            attention_kwargs = (
+                {"attention_dropout": self.attention_dropout} if backend.attn == "te" else {}
+            )
+            self.attn_module, self.attn_func = initialize_attn_module_and_func(
+                attn_impl=backend.attn,
+                num_attention_heads=self.num_heads,
+                num_qk_channels=self.q_head_dim,
+                num_v_channels=self.v_head_dim,
+                softmax_scale=self.scaling,
+                attn_mask_type="causal",
+                qkv_format="bshd",
+                num_gqa_groups=self.num_key_value_heads,
+                **attention_kwargs,
+            )
         self._cp_mesh = None
 
     def setup_cp_attention(self, cp_mesh) -> None:
@@ -409,6 +434,7 @@ class KimiMLAAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
+        padding_mask: torch.Tensor | None = None,
         packed_context: "KimiPackedContext | None" = None,
         **kwargs: Any,
     ) -> torch.Tensor:
@@ -418,6 +444,7 @@ class KimiMLAAttention(nn.Module):
             hidden_states: Tensor of shape [batch, sequence, hidden]; the sequence axis
                 holds this rank's contiguous shard under context parallelism.
             attention_mask: Optional additive attention mask of shape [batch, 1, sequence, sequence].
+            padding_mask: Optional boolean mask of shape [batch, sequence], where true marks padding.
             packed_context: Optional document layout of the batch, required under
                 context parallelism.
             **kwargs: Extra attention options accepted for HF compatibility.
@@ -453,13 +480,52 @@ class KimiMLAAttention(nn.Module):
 
         key_states, value_states = self._expand_key_value_groups(key_states, value_states, seq_length)
 
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) * self.scaling
-        if attention_mask is not None:
-            attn_weights = attn_weights + attention_mask[:, :, :, : key_states.shape[-2]]
-        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        attn_weights = F.dropout(attn_weights, p=self.attention_dropout, training=self.training)
-        attn_output = torch.matmul(attn_weights, value_states)
-        attn_output = attn_output.transpose(1, 2).contiguous().reshape(batch_size, seq_length, -1)
+        if self.backend.attn == "eager":
+            attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) * self.scaling
+            if attention_mask is not None:
+                attn_weights = attn_weights + attention_mask[:, :, :, : key_states.shape[-2]]
+            attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+            attn_weights = F.dropout(attn_weights, p=self.attention_dropout, training=self.training)
+            attn_output = torch.matmul(attn_weights, value_states).transpose(1, 2).contiguous()
+        else:
+            query_states = query_states.transpose(1, 2).contiguous()
+            key_states = key_states.transpose(1, 2).contiguous()
+            value_states = value_states.transpose(1, 2).contiguous()
+
+            if packed_context is not None and packed_context.has_multiple_documents:
+                if self.backend.attn != "te":
+                    backend_attention_mask = attention_mask
+                    query_states, key_states, value_states, attention_kwargs = (
+                        preprocess_args_and_kwargs_for_attn(
+                            query_states,
+                            key_states,
+                            value_states,
+                            backend_attention_mask,
+                            self.backend.attn,
+                        )
+                    )
+                else:
+                    if attention_mask is None:
+                        raise ValueError("Packed K3 MLA attention requires an additive attention mask.")
+                    attention_kwargs = {
+                        "attention_mask": attention_mask.ne(0),
+                        "attn_mask_type": "arbitrary",
+                    }
+            else:
+                backend_attention_mask = padding_mask.logical_not() if padding_mask is not None else None
+                query_states, key_states, value_states, attention_kwargs = preprocess_args_and_kwargs_for_attn(
+                    query_states,
+                    key_states,
+                    value_states,
+                    backend_attention_mask,
+                    self.backend.attn,
+                )
+            if self.backend.attn == "sdpa":
+                attention_kwargs["dropout_p"] = self.attention_dropout if self.training else 0.0
+            attn_output = self.attn_func(query_states, key_states, value_states, **attention_kwargs)
+            attn_output = postprocess_output_for_attn(attn_output, self.backend.attn)
+
+        attn_output = attn_output.reshape(batch_size, seq_length, -1)
         if self.use_output_gate:
             attn_output = attn_output * self.g_proj(hidden_states).sigmoid()
         return self.o_proj(attn_output)
@@ -1156,7 +1222,9 @@ class KimiDecoderLayer(nn.Module):
             and layer_idx % getattr(config, "moe_layer_freq", 1) == 0
         )
         self.self_attn = (
-            KimiDeltaAttention(config, layer_idx) if self.is_linear_attn else KimiMLAAttention(config, layer_idx)
+            KimiDeltaAttention(config, layer_idx)
+            if self.is_linear_attn
+            else KimiMLAAttention(config, layer_idx, backend)
         )
 
         dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
@@ -1216,7 +1284,12 @@ class KimiDecoderLayer(nn.Module):
 
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(hidden_states=hidden_states, attention_mask=attention_mask, **attn_kwargs)
+        hidden_states = self.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            padding_mask=padding_mask,
+            **attn_kwargs,
+        )
         hidden_states = residual + hidden_states
 
         residual = hidden_states
@@ -1270,6 +1343,7 @@ class KimiDecoderLayer(nn.Module):
         attention_output = self.self_attn(
             hidden_states=self.input_layernorm(hidden_states),
             attention_mask=attention_mask,
+            padding_mask=padding_mask,
             **attn_kwargs,
         )
         prefix_sum = attention_output if prefix_sum is None else prefix_sum + attention_output
