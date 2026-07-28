@@ -446,6 +446,124 @@ def test_queue_hysteresis_preserves_state_in_band(store: LocalFeatureStore) -> N
     assert pause_log == []
 
 
+# --- 9. lease identity (PR 1 fix-A) ------------------------------------------
+
+
+def test_lease_id_is_unique_per_acquire(store: LocalFeatureStore) -> None:
+    """Each :meth:`acquire` mints a fresh :attr:`Lease.lease_id`.
+
+    Distinct identities are what let :meth:`ack` / :meth:`fail` tell a
+    live lease from a stale one after reclaim-and-redeliver.
+    """
+    q = SampleRefQueue(store)
+    ref = _put(store, "s1", n_floats=64)
+    q.put(ref)
+    lease1 = q.acquire()
+    q.fail(lease1)
+    lease2 = q.acquire()
+    assert lease1 is not None and lease2 is not None
+    assert lease1.lease_id != lease2.lease_id
+
+
+def test_stale_ack_does_not_pop_a_newer_active_lease(store: LocalFeatureStore) -> None:
+    """A late ACK for a reclaimed lease must not pop the new active lease.
+
+    Sequence: acquire s1 -> fail (re-enqueue, counter++) -> visibility
+    reclaim (re-enqueue with new lease_id) -> first consumer's stale
+    ACK arrives -> it must NOT pop the second consumer's active lease.
+    """
+    q = SampleRefQueue(store, visibility_timeout=VisibilityTimeout(seconds=0.05))
+    ref = _put(store, "s1", n_floats=64)
+    q.put(ref)
+
+    lease1 = q.acquire()
+    assert lease1 is not None
+    q.fail(lease1)  # re-enqueued, redelivery_count=1
+
+    lease2 = q.acquire()
+    assert lease2 is not None
+    assert lease2.lease_id != lease1.lease_id
+
+    # Consumer 1 finally ACKs -- this is stale (lease1 was already
+    # failed and lease2 is the live one).
+    q.ack(lease1)
+
+    # lease2 is still live.
+    assert lease2.lease_id in q._outstanding  # noqa: SLF001
+    # And lease2 still hands out its ref.
+    assert q.outstanding_count() == 1
+
+
+def test_stale_fail_does_not_pop_a_newer_active_lease(store: LocalFeatureStore) -> None:
+    """Same identity guarantee for the ``fail`` path."""
+    q = SampleRefQueue(store)
+    ref = _put(store, "s1", n_floats=64)
+    q.put(ref)
+    lease1 = q.acquire()
+    assert lease1 is not None
+    q.fail(lease1)  # lease1 -> pending; counter=1; the live lease for s1 is gone
+    # Now a consumer tries to fail a second time -- this is stale.
+    q.fail(lease1)
+    # lease1 was the only one outstanding; after the first fail it was
+    # popped; the second is a no-op.
+    # A subsequent acquire hands out the re-enqueued ref with a NEW
+    # lease_id, not lease1's.
+    lease2 = q.acquire()
+    assert lease2 is not None
+    assert lease2.lease_id != lease1.lease_id
+
+
+def test_ack_for_unknown_lease_id_is_noop(store: LocalFeatureStore) -> None:
+    """An ACK for a lease that was never issued is silently ignored.
+
+    ``ack`` keys by ``lease_id``; an unknown id means there is no live
+    lease to pop. The new identity-based dispatch also rejects it
+    rather than silently accepting.
+    """
+    from dataclasses import replace
+
+    q = SampleRefQueue(store)
+    ref = _put(store, "s1", n_floats=64)
+    q.put(ref)
+    lease = q.acquire()
+    assert lease is not None
+    q.ack(lease)
+    # A second ack with the same lease_id is a no-op (already gone).
+    q.ack(lease)
+    # A forged lease with a different id (e.g. one never minted) is also a no-op.
+    fake = replace(lease, lease_id=lease.lease_id + 999)
+    q.ack(fake)
+    assert q.outstanding_count() == 0
+
+
+# --- 10. put_blocks_until_below duplicate check (PR 1 fix-B) ---------------
+
+
+def test_put_blocks_until_below_rejects_duplicate_sample_id(store: LocalFeatureStore) -> None:
+    """The blocking put path performs the same duplicate-id check as :meth:`put`."""
+    q = SampleRefQueue(store)
+    ref = _put(store, "s1", n_floats=64)
+    q.put(ref)
+    # Second put on the same sample_id via the blocking path must
+    # raise -- the ref is currently pending, regardless of pause state.
+    with pytest.raises(ValueError, match="already present"):
+        q.put_blocks_until_below(ref)
+
+
+def test_put_blocks_until_below_rejects_duplicate_while_outstanding(store: LocalFeatureStore) -> None:
+    q = SampleRefQueue(store)
+    ref = _put(store, "s1", n_floats=64)
+    q.put(ref)
+    lease = q.acquire()  # now in outstanding, not pending
+    assert lease is not None
+    with pytest.raises(ValueError, match="already present"):
+        q.put_blocks_until_below(ref)
+    q.ack(lease)
+
+
+# --- 11. close -------------------------------------------------------------
+
+
 def test_queue_close_after_close_is_safe(store: LocalFeatureStore) -> None:
     q = SampleRefQueue(store)
     q.close()

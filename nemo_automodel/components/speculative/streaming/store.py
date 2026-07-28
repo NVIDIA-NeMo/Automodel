@@ -35,28 +35,47 @@ consumers, and alternate backends share one obvious surface to extend:
 
 from __future__ import annotations
 
+import itertools
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Mapping
 
 import torch
 
 from nemo_automodel.components.speculative.streaming.refs import FeatureAlgorithm, SampleRef
 
+# Module-level counter for unique :class:`StoreHandle` identities. Each
+# ``get()`` call mints a fresh :attr:`StoreHandle.handle_id`; ``release``
+# uses it to ensure idempotency (re-releasing the same handle is a
+# no-op) and to prevent one handle's re-release from decrementing a
+# sibling handle's count.
+_handle_id_counter = itertools.count()
+
+
+def _next_handle_id() -> int:
+    """Mint a fresh :attr:`StoreHandle.handle_id` (module-level counter)."""
+    return next(_handle_id_counter)
+
 
 @dataclass(frozen=True)
 class StoreHandle:
     """Opaque token the consumer must return to :meth:`FeatureStore.release`.
 
-    Holds the producing store, the sample id, and the originating :class:`SampleRef`
-    so :meth:`release` can both free the cached tensors and decrement the
-    resident-byte counter. Treated as opaque by callers -- ``release`` is the
-    only sanctioned way to dispose of one.
+    Each :meth:`FeatureStore.get` mints a fresh handle with a unique
+    :attr:`handle_id`. Two ``get`` calls on the same sample return two
+    distinct handles; :meth:`FeatureStore.release` matches against
+    ``handle_id`` so releasing one handle twice (or releasing a stale
+    handle after a sibling has been acquired) cannot decrement a
+    sibling's outstanding count.
+
+    Holds the producing store, the sample id, the originating
+    :class:`SampleRef`, and the per-``get`` handle identity.
     """
 
     store: "FeatureStore"
     sample_id: str
     ref: SampleRef
+    handle_id: int = field(default_factory=_next_handle_id)
 
 
 @dataclass(frozen=True)

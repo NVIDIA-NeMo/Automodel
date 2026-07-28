@@ -283,3 +283,69 @@ def test_local_store_gc_is_a_noop_for_local_but_returns_count() -> None:
     store = LocalFeatureStore(max_samples=4, max_bytes=1024 * 1024)
     _put(store, "s1", n_bytes=64)
     assert store.gc() == 0
+
+
+# --- 6. handle identity (PR 1 fix-C) ----------------------------------------
+
+
+def test_local_store_handles_for_same_sample_have_distinct_identities() -> None:
+    """Two ``get`` calls on the same sample return two distinct handles.
+
+    The distinct ``handle_id`` is what makes ``release`` idempotent
+    per-handle: re-releasing one handle does not affect a sibling.
+    """
+    store = LocalFeatureStore(max_samples=4, max_bytes=1024 * 1024)
+    ref = _put(store, "s1", n_bytes=64)
+    _, h1 = store.get(ref)
+    _, h2 = store.get(ref)
+    assert h1.handle_id != h2.handle_id
+    assert h1.sample_id == h2.sample_id == ref.sample_id
+
+
+def test_local_store_releasing_one_handle_twice_does_not_decrement_sibling() -> None:
+    """The reported bug: re-releasing the same handle while a sibling is
+    outstanding used to decrement the per-sample count twice and
+    drop the storage while another handle was still live. Per-handle
+    identity fixes this -- the second release is a no-op."""
+    store = LocalFeatureStore(max_samples=4, max_bytes=1024 * 1024)
+    ref = _put(store, "s1", n_bytes=64)
+    _, h1 = store.get(ref)
+    _, h2 = store.get(ref)
+    assert store.health().sample_count == 1
+
+    store.release(h1)
+    assert store.health().sample_count == 1  # h2 still alive
+
+    # Re-release h1 (e.g. consumer error / replayed ack): the per-handle
+    # dispatch must NOT count this as another decrement.
+    store.release(h1)
+    assert store.health().sample_count == 1  # h2 still alive, no double-decrement
+
+    # Releasing h2 legitimately clears the storage.
+    store.release(h2)
+    assert store.health().sample_count == 0
+
+
+def test_local_store_release_unknown_handle_id_is_noop() -> None:
+    """A handle that the store never minted (or already released) is a no-op.
+
+    Cross-store handles raise :class:`ValueError` (the existing
+    contract); a same-store but unknown handle_id is silently ignored
+    so an idempotent ``release`` call is safe.
+    """
+    from dataclasses import replace
+
+    store = LocalFeatureStore(max_samples=4, max_bytes=1024 * 1024)
+    ref = _put(store, "s1", n_bytes=64)
+    _, h = store.get(ref)
+    # Forge a same-store handle with an unknown handle_id by mutating
+    # the field via dataclasses.replace (the field is frozen; replace
+    # builds a new instance).
+    fake = replace(h, handle_id=h.handle_id + 999)
+    assert fake.store is store
+    # release() on a same-store but unknown handle_id is a no-op.
+    store.release(fake)
+    # The real handle still works.
+    assert store.health().sample_count == 1
+    store.release(h)
+    assert store.health().sample_count == 0
