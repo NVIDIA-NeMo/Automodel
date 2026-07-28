@@ -100,7 +100,13 @@ if [[ "$HAS_ROBUSTNESS" == "true" ]]; then
       ;;
   esac
 
-  ROBUSTNESS_CMD="${CMD} --tee 3 --log-dir $TEST_DIR/robustness_logs \
+  ROBUSTNESS_LAUNCH_CMD="$CMD"
+  if [[ "$CMD" == torchrun* ]]; then
+    # A completed rendezvous cannot be reused reliably by the second torchrun.
+    ROBUSTNESS_LAUNCH_CMD="${CMD/--rdzv_id=${SLURM_JOB_ID}/--rdzv_id=${SLURM_JOB_ID}-robustness}"
+  fi
+
+  ROBUSTNESS_CMD="${ROBUSTNESS_LAUNCH_CMD} --tee 3 --log-dir $TEST_DIR/robustness_logs \
     -m pytest --tb=short ${ROBUSTNESS_TEST_SCRIPT} \
     --config ${RESOLVED_ROBUSTNESS_CONFIG}"
 
@@ -109,6 +115,9 @@ if [[ "$HAS_ROBUSTNESS" == "true" ]]; then
   echo "============================================"
   ROBUSTNESS_START=$SECONDS
 
+  # Repeated model teardown/reload phases can fragment the CUDA allocator
+  # before the resume-training check. Preserve any caller-provided setting.
+  export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
   eval $ROBUSTNESS_CMD
   ROBUSTNESS_EXIT_CODE=$?
 

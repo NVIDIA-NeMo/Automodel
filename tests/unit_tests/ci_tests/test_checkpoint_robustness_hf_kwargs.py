@@ -25,8 +25,10 @@ from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm
     _extract_custom_args,
     _finish_hf_reload_sync,
     _get_input_ids,
+    _hf_fp32_module_names,
     _hf_model_load_context,
     _hf_source_load_kwargs,
+    _keep_hf_modules_in_fp32,
     _load_hf_fp8_dequantized_config,
     _post_load_dequant_max_memory,
     _record_deferred_failure,
@@ -77,6 +79,21 @@ def test_explicit_attention_implementation_is_preserved():
         )
 
     assert hf_kwargs["attn_implementation"] == "eager"
+
+
+def test_hf_source_load_kwargs_passes_grouped_experts_implementation():
+    hf_kwargs = _hf_source_load_kwargs(
+        {},
+        pretrained_model_name_or_path="model-path",
+        source_dtype=torch.bfloat16,
+        trust_remote_code=False,
+        experts_implementation="grouped_mm",
+        device=torch.device("cpu"),
+        hf_device_map_auto=False,
+    )
+
+    assert hf_kwargs["experts_implementation"] == "grouped_mm"
+    assert hf_kwargs["trust_remote_code"] is False
 
 
 @pytest.mark.parametrize(
@@ -186,6 +203,77 @@ def test_extract_custom_args_accepts_hf_source_post_load_dequantize():
     assert remaining == ["--other-arg"]
 
 
+def test_keep_hf_modules_in_fp32_uses_strict_dtype_plan_and_restores_class_state(tmp_path):
+    from transformers import PretrainedConfig, PreTrainedModel
+
+    class TinyConfig(PretrainedConfig):
+        model_type = "checkpoint-robustness-gdn-dtype-test"
+
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self._experts_implementation_internal = "eager"
+
+    class TinyModel(PreTrainedModel):
+        config_class = TinyConfig
+
+        def __init__(self, config):
+            super().__init__(config)
+            self.A_log = torch.nn.Parameter(torch.tensor([1.234567]))
+            self.dt_bias = torch.nn.Parameter(torch.tensor([0.25]))
+            self.post_init()
+
+    previous = getattr(PreTrainedModel, "_keep_in_fp32_modules_strict", None)
+    TinyModel(TinyConfig()).save_pretrained(tmp_path)
+    plain = TinyModel.from_pretrained(tmp_path, dtype=torch.bfloat16)
+    hf_config = SimpleNamespace(architectures=["Qwen3_5MoeForConditionalGeneration"])
+    with patch(
+        "nemo_automodel._transformers.model_init._resolve_custom_model_cls_for_config",
+        return_value=None,
+    ):
+        assert _hf_fp32_module_names(hf_config) == ("A_log", "dt_bias")
+    with _keep_hf_modules_in_fp32(hf_config):
+        assert set(PreTrainedModel._keep_in_fp32_modules_strict) >= {"A_log", "dt_bias"}
+        strict = TinyModel.from_pretrained(tmp_path, dtype=torch.bfloat16)
+
+    assert PreTrainedModel._keep_in_fp32_modules_strict == previous
+    assert plain.A_log.dtype == torch.bfloat16
+    assert plain.dt_bias.dtype == torch.bfloat16
+    assert strict.A_log.dtype == torch.float32
+    assert strict.dt_bias.dtype == torch.float32
+
+
+def test_hf_fp32_module_names_includes_generic_model_strict_contract():
+    class TinyAutoModel:
+        _keep_in_fp32_modules_strict = ["rotary_emb", "router.e_score_correction_bias"]
+
+    hf_config = SimpleNamespace(architectures=["TinyForCausalLM"])
+    with patch(
+        "nemo_automodel._transformers.model_init._resolve_custom_model_cls_for_config",
+        return_value=TinyAutoModel,
+    ):
+        assert _hf_fp32_module_names(hf_config) == ("rotary_emb", "router.e_score_correction_bias")
+
+
+def test_hf_fp32_module_names_combines_gdn_and_generic_contracts_without_duplicates():
+    class TinyAutoModel:
+        _keep_in_fp32_modules_strict = ["A_log", "rotary_emb"]
+
+    hf_config = SimpleNamespace(architectures=["Qwen3_5MoeForConditionalGeneration"])
+    with patch(
+        "nemo_automodel._transformers.model_init._resolve_custom_model_cls_for_config",
+        return_value=TinyAutoModel,
+    ):
+        assert _hf_fp32_module_names(hf_config) == ("A_log", "dt_bias", "rotary_emb")
+
+
+def test_hf_fp32_module_names_is_empty_without_model_contract():
+    with patch(
+        "nemo_automodel._transformers.model_init._resolve_custom_model_cls_for_config",
+        return_value=None,
+    ):
+        assert _hf_fp32_module_names(SimpleNamespace(architectures=["LlamaForCausalLM"])) == ()
+
+
 def test_source_load_parity_failure_is_returned_for_later_reporting():
     reference_logits = torch.tensor([[[2.0, -2.0], [1.0, -1.0]]])
     candidate_logits = -reference_logits
@@ -193,7 +281,7 @@ def test_source_load_parity_failure_is_returned_for_later_reporting():
     failure = _compare_source_load_parity(
         (reference_logits, None, None),
         candidate_logits,
-        SimpleNamespace(),
+        None,
         source_load_kl_threshold=0.0,
         source_load_mean_kl_threshold=0.0,
         source_load_cosine_threshold=1.0,
@@ -209,7 +297,7 @@ def test_source_load_parity_success_returns_no_deferred_failure():
     failure = _compare_source_load_parity(
         (logits, None, None),
         logits.clone(),
-        SimpleNamespace(),
+        None,
         source_load_kl_threshold=0.0,
         source_load_mean_kl_threshold=0.0,
         source_load_cosine_threshold=1.0,
