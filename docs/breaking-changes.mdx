@@ -7,6 +7,8 @@ position: 6
 
 ### Frozen Multimodal FSDP2 Modules Default to Root Sharding
 
+{/* docs-review-start: frozen-multimodal-fsdp-policy */}
+
 Fully frozen vision/audio towers and multimodal projectors now default to the `root` FSDP2 policy. Previously, dense
 frozen vision towers commonly used per-layer FSDP units. Root ownership keeps the collective sequence aligned when
 some ranks execute a modality branch and other ranks skip it, but it can increase peak unshard memory.
@@ -24,6 +26,8 @@ distributed:
 times and in the same order on every microbatch. Use `replicate` instead to avoid those collectives while keeping a
 full copy of the frozen parameters on every rank. See [YAML Configuration](/development/configuration) for all three
 policies and the `wrap_outer_model` constraint.
+
+{/* docs-review-end: frozen-multimodal-fsdp-policy */}
 
 ### FSDP2 Default `reduce_dtype` Is Now `float32`
 
