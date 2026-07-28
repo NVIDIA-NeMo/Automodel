@@ -1426,6 +1426,62 @@ class GroupedExpertsTE(nn.Module):
         tensor = self.token_dispatcher.token_unpermutation(tensor.flatten(1, 2))
         return tensor.view(-1, self.fp8_row_parallel_size, self.config.expert_dim)
 
+    def _unpermute_vllm_weighted_partials(
+        self,
+        tensor: torch.Tensor,
+        route_slots: torch.Tensor,
+        weights: torch.Tensor,
+    ) -> torch.Tensor:
+        """Match vLLM's FP32 weighted top-k reduction with HybridEP.
+
+        HybridEP combines BF16 expert rows with an FP32 accumulator, but it
+        cannot apply FP32 routing weights inside that accumulator.  Weighting
+        each expert row before combine therefore introduces an extra BF16
+        materialization that vLLM's fused unpermute-and-reduce does not have.
+
+        Keep every top-k slot separate through HybridEP, then multiply the
+        restored BF16 expert rows by their original FP32 weights and reduce
+        top-k locally in FP32.  ``route_slots`` is communication metadata only;
+        routing-weight gradients flow through ``weights`` at the final
+        reduction.
+        """
+        had_virtual_tp_axis = tensor.ndim == 3
+        if not had_virtual_tp_axis:
+            tensor = tensor.unsqueeze(1)
+        if tensor.ndim != 3:
+            raise ValueError(
+                f"vLLM-weighted HybridEP combine expects [routes, virtual_tp, hidden], got shape={tuple(tensor.shape)}"
+            )
+
+        topk = weights.shape[-1]
+        valid_slots = (route_slots >= 0) & (route_slots < topk)
+        safe_slots = route_slots.clamp(min=0, max=topk - 1)
+        slot_mask = F.one_hot(safe_slots, num_classes=topk).to(torch.bool)
+        slot_mask = slot_mask & valid_slots.unsqueeze(-1)
+        separated = tensor.unsqueeze(1).masked_fill(
+            ~slot_mask[:, :, None, None],
+            0,
+        )
+
+        pack = self._hybridep_partition_pack()
+        num_lanes = topk * self.fp8_row_parallel_size
+        grouped = separated.reshape(
+            separated.shape[0],
+            num_lanes // pack,
+            pack * self.config.expert_dim,
+        )
+        grouped = self.token_dispatcher.token_unpermutation_partitions(grouped)
+        restored = grouped.reshape(
+            -1,
+            topk,
+            self.fp8_row_parallel_size,
+            self.config.expert_dim,
+        )
+        weighted = (restored.float() * weights.float()[:, :, None, None]).sum(dim=1).to(tensor.dtype)
+        if had_virtual_tp_axis:
+            return weighted
+        return weighted[:, 0]
+
     def forward(
         self,
         x: torch.Tensor,
@@ -1455,6 +1511,7 @@ class GroupedExpertsTE(nn.Module):
         from transformer_engine.pytorch.quantization import FP8GlobalStateManager
 
         fp8_active = FP8GlobalStateManager.is_fp8_enabled()
+        vllm_weighted_hybridep = fp8_active and self.vllm_fp8_moe_semantics and self.dispatcher_backend == "hybridep"
         dispatch_hidden_states = x
         dispatch_pack = self.fp8_row_parallel_size
         if self.dispatcher_backend == "hybridep":
@@ -1463,28 +1520,58 @@ class GroupedExpertsTE(nn.Module):
             # DeepEP combines all virtual-TP partials in one packed call.
             # HybridEP uses a bounded pack so its multinode kernel stays below
             # the device shared-memory limit.
-            dispatch_hidden_states = (
-                x.unsqueeze(1).expand(-1, dispatch_pack, -1).reshape(x.shape[0], -1).contiguous()
-            )
+            dispatch_hidden_states = x.unsqueeze(1).expand(-1, dispatch_pack, -1).reshape(x.shape[0], -1).contiguous()
 
+        if vllm_weighted_hybridep:
+            if dispatch_pack < 2:
+                raise RuntimeError("vLLM-order HybridEP MoE reduction requires a spare dispatch lane")
+            # HybridEP converts probabilities to an expert-dense matrix, so
+            # that payload cannot safely carry a top-k slot number.  Expert
+            # compute consumes only the first of the two dispatch lanes.  Put
+            # the original expert list in the otherwise-unused second lane;
+            # matching it against the destination expert recovers the exact
+            # top-k slot without widening the 8192-element HybridEP handle.
+            dispatch_hidden_states = dispatch_hidden_states.view(
+                x.shape[0],
+                dispatch_pack,
+                self.config.expert_dim,
+            ).clone()
+            dispatch_hidden_states[:, 1, : indices.shape[-1]] = (indices + 1).to(dispatch_hidden_states.dtype)
+            dispatch_hidden_states = dispatch_hidden_states.flatten(1, 2)
         (permuted_local_hidden_states, tokens_per_expert, permuted_probs) = self.token_dispatcher.token_permutation2(
             hidden_states=dispatch_hidden_states,
             num_local_tokens=x.size(0),
             token_probs=weights,
             token_indices=indices,
         )
+        dispatched_topk_indices = None
         if dispatch_pack > 1:
-            permuted_local_hidden_states = permuted_local_hidden_states.view(
+            dispatched_lanes = permuted_local_hidden_states.view(
                 -1,
                 dispatch_pack,
                 self.config.expert_dim,
-            )[:, 0].contiguous()
+            )
+            if vllm_weighted_hybridep:
+                dispatched_topk_indices = dispatched_lanes[:, 1, : indices.shape[-1]].round().to(torch.long) - 1
+            permuted_local_hidden_states = dispatched_lanes[:, 0].contiguous()
         permuted_probs = permuted_probs.unsqueeze(-1)
 
         if isinstance(tokens_per_expert, torch.Tensor):
             m_splits = tokens_per_expert.tolist()
         else:
             m_splits = list(tokens_per_expert)
+        route_slots = None
+        if vllm_weighted_hybridep:
+            local_expert_ids = torch.arange(
+                self.ep_rank * self.num_local_experts,
+                (self.ep_rank + 1) * self.num_local_experts,
+                dtype=torch.long,
+                device=indices.device,
+            ).repeat_interleave(torch.as_tensor(m_splits, dtype=torch.long, device=indices.device))
+            slot_matches = dispatched_topk_indices == local_expert_ids.unsqueeze(-1)
+            if not bool(slot_matches.any(dim=-1).all()):
+                raise RuntimeError("HybridEP-dispatched route did not match its carried top-k expert list")
+            route_slots = slot_matches.to(torch.int64).argmax(dim=-1)
         permuted_local_hidden_states, compute_m_splits = self._expand_virtual_tp_segments(
             permuted_local_hidden_states,
             m_splits,
@@ -1521,7 +1608,7 @@ class GroupedExpertsTE(nn.Module):
             # step-0 loss ~8.2 vs the correct ~4.5). Add the missing (prob - 1) * down_bias term
             # so the net down-bias contribution becomes prob * down_bias. The vLLM path above
             # weights the full down output, including bias, and needs no correction.
-            if fp8_active and self.vllm_fp8_moe_semantics:
+            if fp8_active and self.vllm_fp8_moe_semantics and not vllm_weighted_hybridep:
                 output2 = apply_vllm_moe_routing_weights(output2, permuted_probs)
             elif self.expert_bias:
                 down_bias = self._get_stacked_bias(self.down_linear)
@@ -1573,6 +1660,12 @@ class GroupedExpertsTE(nn.Module):
         if fp8_active:
             output2 = self.fp8_unpadding(output2, actual_m_splits)
         output2 = self._restore_virtual_tp_partials(output2, actual_m_splits)
+        if vllm_weighted_hybridep:
+            return self._unpermute_vllm_weighted_partials(
+                output2,
+                route_slots,
+                weights,
+            )
         return self._unpermute_virtual_tp_partials(output2)
 
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:

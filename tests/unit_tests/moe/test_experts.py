@@ -1311,6 +1311,56 @@ class TestGroupedExpertsTE:
         dispatcher.token_unpermutation_partitions.assert_called_once()
         torch.testing.assert_close(unpermuted, partials, rtol=0, atol=0)
 
+        dispatcher.reset_mock()
+        route_to_token = torch.tensor([0, 0, 1, 1], device=device)
+
+        def combine_topk_partitions(value):
+            combined = torch.zeros(
+                2,
+                *value.shape[1:],
+                dtype=torch.float32,
+                device=value.device,
+            )
+            return combined.index_add(0, route_to_token, value.float()).to(value.dtype)
+
+        dispatcher.token_unpermutation_partitions.side_effect = combine_topk_partitions
+        topk_partials = torch.randn(
+            4,
+            experts.fp8_row_parallel_size,
+            te_moe_config.dim,
+            dtype=te_moe_config.dtype,
+            device=device,
+            requires_grad=True,
+        )
+        route_slots = torch.tensor([0, 1, 0, 1], device=device)
+        routing_weights = torch.tensor(
+            [[0.25, 0.75], [0.4, 0.6]],
+            dtype=torch.float32,
+            device=device,
+            requires_grad=True,
+        )
+        weighted = experts._unpermute_vllm_weighted_partials(
+            topk_partials,
+            route_slots,
+            routing_weights,
+        )
+        expected = torch.stack(
+            (
+                topk_partials[0].float() * routing_weights[0, 0] + topk_partials[1].float() * routing_weights[0, 1],
+                topk_partials[2].float() * routing_weights[1, 0] + topk_partials[3].float() * routing_weights[1, 1],
+            )
+        ).to(te_moe_config.dtype)
+        torch.testing.assert_close(weighted, expected, rtol=0, atol=0)
+        grouped_topk = dispatcher.token_unpermutation_partitions.call_args.args[0]
+        assert grouped_topk.shape == (
+            4,
+            te_moe_config.n_activated_experts * experts.fp8_row_parallel_size // 2,
+            2 * te_moe_config.dim,
+        )
+        weighted.float().sum().backward()
+        assert topk_partials.grad is not None
+        assert routing_weights.grad is not None
+
     def test_grouped_experts_te_bias_properties(self, te_moe_config_with_bias):
         """Test bias property getters and setters."""
         from nemo_automodel.components.moe.experts import GroupedExpertsTE
