@@ -461,10 +461,11 @@ gradient_accumulation_steps = global_batch_size / (local_batch_size * data_paral
 For the supported data-parallel FSDP2 configuration, `data_parallel_size` is the total GPU count. For example, two
 8-GPU nodes have `data_parallel_size: 16`.
 
-For DDP recipes, keep `distributed.static_graph: false` whenever `gradient_accumulation_steps > 1`. Recalculate the
-accumulation steps after changing the GPU count, `global_batch_size`, or `local_batch_size`. When the result is `1` and
-the model follows the same execution path on every iteration, you can set `distributed.static_graph: true` to reduce
-DDP overhead.
+For DDP recipes, keep `distributed.static_graph: false` whenever `gradient_accumulation_steps > 1`. If the model
+contains parameters that do not contribute to the loss, also set `distributed.find_unused_parameters: true` when the
+static graph is disabled. Recalculate the accumulation steps after changing the GPU count, `global_batch_size`, or
+`local_batch_size`. When the result is `1` and the model follows the same execution path on every iteration, you can
+set `distributed.static_graph: true` to reduce DDP overhead.
 
 `local_batch_size` is the number of query groups per rank. For memory pressure, reduce
 `step_scheduler.local_batch_size` first, then sequence lengths (`q_max_len`, `p_max_len`, or `rerank_max_length`), then

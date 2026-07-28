@@ -120,14 +120,12 @@ ci:
       - path: hf://nvidia/embed-nemotron-dataset-v1/MIRACL
         num_samples: 5000
     dataloader.num_workers: 0
-    distributed.static_graph: false
     lr_scheduler.lr_warmup_steps: 2
   checkpoint_robustness:
     dataset.data_dir_list:
       - path: hf://nvidia/embed-nemotron-dataset-v1/MIRACL
         num_samples: 5000
     dataloader.num_workers: 0
-    distributed.static_graph: false
     lr_scheduler.lr_warmup_steps: 1
     step_scheduler.global_batch_size: 8
     step_scheduler.local_batch_size: 1
