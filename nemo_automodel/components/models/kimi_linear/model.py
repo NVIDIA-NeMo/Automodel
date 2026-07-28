@@ -28,6 +28,10 @@ from torch import nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from nemo_automodel.components.distributed.activation_checkpointing import unwrap_checkpoint_wrapper
+from nemo_automodel.components.distributed.context_parallel.sharder import (
+    ContextParallelSharder,
+    contiguous_local_indices,
+)
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.packing import get_unpad_data, is_indexed_packed_mask
@@ -1242,7 +1246,7 @@ class KimiLinearForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             output_hidden_states=output_hidden_states,
         )
 
-    def prepare_model_inputs_for_cp(self, input_ids: torch.Tensor | None = None, **kwargs: Any) -> dict[str, Any]:
+    def prepare_model_inputs_for_cp(self, batch: dict[str, Any], *, num_chunks: int = 1) -> dict[str, Any]:
         """Hand the recipe Kimi Linear's own context-parallel batch sharding.
 
         KDA's recurrent state (and FLA's CP kernels) require every rank to own one
@@ -1250,15 +1254,22 @@ class KimiLinearForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         load-balanced ``context_parallel`` sharding with
         :func:`~nemo_automodel.components.models.kimi_linear.cp.shard_batch_for_kimi_cp`.
 
-        Args:
-            input_ids: Token ids of the unsharded batch; accepted for interface parity.
-            **kwargs: Additional recipe arguments; accepted for interface parity.
+        The returned sharder is handed back to the CP dispatch under the
+        ``"cp_sharder"`` key.
 
-        Returns:
-            Batch updates carrying the model-owned sharding callable.
+        Args:
+            batch: The full-sequence batch; left intact, the sharder shards it.
+            num_chunks: Accepted for hook-signature parity; unused, because Kimi
+                Linear shards the ``[batch, sequence]`` layout directly.
         """
-        del input_ids, kwargs
-        return {"_cp_make_batch_fn": shard_batch_for_kimi_cp}
+        del batch, num_chunks
+        return {
+            "cp_sharder": ContextParallelSharder(
+                shard_batch=shard_batch_for_kimi_cp,
+                # Contiguous over the token axis: rank r keeps [r * S/cp, (r + 1) * S/cp).
+                local_token_global_indices=contiguous_local_indices,
+            )
+        }
 
     def update_moe_gate_bias(self) -> None:
         self.model.update_moe_gate_bias()

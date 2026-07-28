@@ -22,7 +22,8 @@ layers, so context parallelism has to satisfy both at once:
   (rank ``r`` owns ``[r * S / cp, (r + 1) * S / cp)``) and take document
   boundaries through ``cu_seqlens``. PyTorch's default load-balanced
   ``context_parallel`` layout (head/tail chunk swap) does not satisfy that, so
-  Kimi Linear owns its batch sharding through ``_cp_make_batch_fn``.
+  Kimi Linear owns its batch sharding through its own
+  :class:`~nemo_automodel.components.distributed.context_parallel.sharder.ContextParallelSharder`.
 * MLA attends globally. Under the contiguous layout each rank all-gathers the
   *compressed* KV latent (``kv_lora_rank + qk_rope_head_dim`` values per token,
   roughly an order of magnitude smaller than the expanded per-head K/V) and runs
@@ -43,6 +44,8 @@ from typing import Any
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+
+from nemo_automodel.components.distributed.context_parallel.sharder import ShardLayout
 
 _PAD_DOC_ID = 0
 
@@ -444,12 +447,12 @@ def _global_doc_ids_from_batch(batch: dict, seq_len: int, device: torch.device) 
 def shard_batch_for_kimi_cp(cp_mesh, tp_mesh, batch: dict, *, loss_mask=None, padding_token_id: int = 0):
     """Shard a batch contiguously across the context-parallel mesh for Kimi Linear.
 
-    Attached to the batch as ``_cp_make_batch_fn`` by
-    :meth:`KimiLinearForCausalLM.prepare_model_inputs_for_cp` and invoked by
-    ``cp_utils.make_cp_batch_and_ctx`` instead of the default load-balanced
-    ``context_parallel`` path. Every rank starts from the same full batch, keeps
-    the ``[seq_start, seq_end)`` slice of each sequence-aligned tensor, and gets
-    the (unsharded) global document-id map needed by the KDA and MLA layers.
+    The :attr:`~nemo_automodel.components.distributed.context_parallel.sharder.ContextParallelSharder.shard_batch`
+    implementation returned by :meth:`KimiLinearForCausalLM.prepare_model_inputs_for_cp`,
+    used instead of the default load-balanced ``context_parallel`` path. Every rank
+    starts from the same full batch, keeps the ``[seq_start, seq_end)`` slice of each
+    sequence-aligned tensor, and gets the (unsharded) global document-id map needed
+    by the KDA and MLA layers.
 
     Args:
         cp_mesh: One-dimensional context-parallel mesh, or None.
@@ -460,8 +463,11 @@ def shard_batch_for_kimi_cp(cp_mesh, tp_mesh, batch: dict, *, loss_mask=None, pa
         padding_token_id: Token id used when padding ``input_ids``.
 
     Returns:
-        A pair of ``(context_factory, batch)``; the context factory is a null
+        ``(context_factory, batch, ShardLayout)``; the context factory is a null
         context because the transport lives in the Kimi Linear layers themselves.
+        The layout reports the pre-pad and post-pad global sequence lengths, so the
+        sharder's token verbs shard and gather side tensors on this same
+        contiguous layout.
     """
     del tp_mesh
     cp_size = 1 if cp_mesh is None else cp_mesh.size()
@@ -484,6 +490,7 @@ def shard_batch_for_kimi_cp(cp_mesh, tp_mesh, batch: dict, *, loss_mask=None, pa
         batch["position_ids"] = batch["position_ids"].expand(input_ids.shape[0], -1).contiguous()
 
     pad_len = (-seq_len) % cp_size
+    padded_seq_len = seq_len + pad_len
     if pad_len:
         pad_values = {"input_ids": padding_token_id, "labels": -100, "padding_mask": True}
         for key, pad_value in pad_values.items():
@@ -493,7 +500,6 @@ def shard_batch_for_kimi_cp(cp_mesh, tp_mesh, batch: dict, *, loss_mask=None, pa
         doc_ids = _pad_sequence_dim(doc_ids, 1, pad_len, _PAD_DOC_ID)
         if loss_mask is not None:
             loss_mask = _pad_sequence_dim(loss_mask, 1, pad_len, 0)
-        seq_len += pad_len
 
     # The MoE router needs to know which tokens are padding; the packed collater
     # encodes that only in the document map, so mirror it into ``padding_mask``.
@@ -501,12 +507,12 @@ def shard_batch_for_kimi_cp(cp_mesh, tp_mesh, batch: dict, *, loss_mask=None, pa
 
     batch["kimi_packed_context"] = KimiPackedContext(
         doc_ids=doc_ids,
-        seq_start=0 if cp_mesh is None else cp_mesh.get_local_rank() * (seq_len // cp_size),
+        seq_start=0 if cp_mesh is None else cp_mesh.get_local_rank() * (padded_seq_len // cp_size),
         cp_size=cp_size,
     )
 
     if cp_size > 1:
-        local_seq_len = seq_len // cp_size
+        local_seq_len = padded_seq_len // cp_size
         seq_start = batch["kimi_packed_context"].seq_start
         seq_end = seq_start + local_seq_len
         for key in ("input_ids", "labels", "position_ids", "padding_mask"):
@@ -517,4 +523,4 @@ def shard_batch_for_kimi_cp(cp_mesh, tp_mesh, batch: dict, *, loss_mask=None, pa
     elif loss_mask is not None:
         batch["loss_mask"] = loss_mask
 
-    return contextlib.nullcontext, batch
+    return contextlib.nullcontext, batch, ShardLayout(original_seq_len=seq_len, padded_seq_len=padded_seq_len)

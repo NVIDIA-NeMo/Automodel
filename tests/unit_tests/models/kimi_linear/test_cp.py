@@ -101,7 +101,7 @@ def test_document_causal_mask_shifts_queries_by_global_offset():
 def test_shard_batch_keeps_contiguous_slice_per_rank():
     shards = []
     for rank in range(2):
-        _, batch = shard_batch_for_kimi_cp(_FakeCPMesh(2, rank), None, _batch(seq_len=8))
+        _, batch, _ = shard_batch_for_kimi_cp(_FakeCPMesh(2, rank), None, _batch(seq_len=8))
         shards.append(batch)
 
     assert shards[0]["input_ids"].tolist() == [[0, 1, 2, 3]]
@@ -114,7 +114,9 @@ def test_shard_batch_keeps_contiguous_slice_per_rank():
 
 
 def test_shard_batch_pads_sequence_up_to_cp_size():
-    context_factory, batch = shard_batch_for_kimi_cp(_FakeCPMesh(4, 3), None, _batch(seq_len=6), padding_token_id=7)
+    context_factory, batch, layout = shard_batch_for_kimi_cp(
+        _FakeCPMesh(4, 3), None, _batch(seq_len=6), padding_token_id=7
+    )
 
     assert isinstance(context_factory(), contextlib.nullcontext)
     assert batch["input_ids"].shape == (1, 2)
@@ -122,13 +124,15 @@ def test_shard_batch_pads_sequence_up_to_cp_size():
     assert batch["input_ids"].tolist() == [[7, 7]]
     assert batch["labels"].tolist() == [[-100, -100]]
     assert batch["kimi_packed_context"].doc_ids[0, -2:].tolist() == [_PAD_DOC_ID, _PAD_DOC_ID]
+    # The sharder's token verbs pad side tensors against this reported layout.
+    assert (layout.original_seq_len, layout.padded_seq_len) == (6, 8)
 
 
 def test_shard_batch_derives_documents_from_indexed_mask():
     batch = _batch(seq_len=8)
     batch["attention_mask"] = torch.tensor([[1, 1, 1, 2, 2, 2, 2, 0]], dtype=torch.int32)
 
-    _, sharded = shard_batch_for_kimi_cp(_FakeCPMesh(2, 0), None, batch)
+    _, sharded, _ = shard_batch_for_kimi_cp(_FakeCPMesh(2, 0), None, batch)
 
     assert "attention_mask" not in sharded
     assert sharded["kimi_packed_context"].doc_ids.tolist() == [[1, 1, 1, 2, 2, 2, 2, 0]]
@@ -141,7 +145,7 @@ def test_shard_batch_drops_thd_metadata_that_no_longer_matches():
     batch["cu_seqlens"] = torch.tensor([0, 5, 8], dtype=torch.int32)
     batch["qkv_format"] = "thd"
 
-    _, sharded = shard_batch_for_kimi_cp(_FakeCPMesh(2, 1), None, batch)
+    _, sharded, _ = shard_batch_for_kimi_cp(_FakeCPMesh(2, 1), None, batch)
 
     assert not {"seq_lens", "cu_seqlens", "qkv_format"} & set(sharded)
     assert sharded["kimi_packed_context"].doc_ids.tolist() == [[1, 1, 1, 1, 1, 2, 2, 2]]
@@ -150,7 +154,7 @@ def test_shard_batch_drops_thd_metadata_that_no_longer_matches():
 def test_shard_batch_without_cp_mesh_is_a_no_op():
     batch = _batch(seq_len=6)
 
-    _, sharded = shard_batch_for_kimi_cp(None, None, batch)
+    _, sharded, _ = shard_batch_for_kimi_cp(None, None, batch)
 
     assert sharded["input_ids"].shape == (1, 6)
     assert not sharded["kimi_packed_context"].cp_enabled
@@ -172,7 +176,7 @@ def test_local_doc_ids_selects_the_rank_slice():
 def test_shard_batch_shards_loss_mask_with_labels(cp_size):
     loss_mask = torch.ones(1, 8, dtype=torch.long)
 
-    _, sharded = shard_batch_for_kimi_cp(_FakeCPMesh(cp_size, 0), None, _batch(seq_len=8), loss_mask=loss_mask)
+    _, sharded, _ = shard_batch_for_kimi_cp(_FakeCPMesh(cp_size, 0), None, _batch(seq_len=8), loss_mask=loss_mask)
 
     assert sharded["loss_mask"].shape == (1, 8 // cp_size)
 
@@ -224,7 +228,7 @@ def test_shard_batch_gives_the_trailing_rank_an_all_padding_shard():
     batch["attention_mask"] = torch.tensor([[1, 1, 1, 1, 0, 0, 0, 0]], dtype=torch.int32)
     batch["labels"] = torch.tensor([[1, 2, 3, 4, -100, -100, -100, -100]])
 
-    _, sharded = shard_batch_for_kimi_cp(_FakeCPMesh(2, 1), None, batch)
+    _, sharded, _ = shard_batch_for_kimi_cp(_FakeCPMesh(2, 1), None, batch)
 
     context = sharded["kimi_packed_context"]
     assert context.local_doc_ids.tolist() == [[0, 0, 0, 0]]

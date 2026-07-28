@@ -8,6 +8,7 @@ import torch
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.kimi_linear.config import KimiLinearConfig
 from nemo_automodel.components.models.kimi_linear.model import KimiLinearForCausalLM
+from tests.unit_tests.models.kimi_linear.test_cp import _FakeCPMesh
 
 
 def _tiny_kimi_config(*, use_kda: bool = False) -> KimiLinearConfig:
@@ -197,15 +198,52 @@ def test_padding_only_query_rows_stay_finite():
     assert torch.isfinite(logits).all()
 
 
-def test_prepare_model_inputs_for_cp_attaches_model_owned_sharding():
+def test_prepare_model_inputs_for_cp_returns_contiguous_cp_sharder():
+    from nemo_automodel.components.distributed.context_parallel.sharder import contiguous_local_indices
     from nemo_automodel.components.models.kimi_linear.cp import shard_batch_for_kimi_cp
 
     model = KimiLinearForCausalLM(_tiny_kimi_config(), backend=_backend_config())
 
-    updates = model.prepare_model_inputs_for_cp(input_ids=torch.zeros(1, 4, dtype=torch.long))
+    updates = model.prepare_model_inputs_for_cp({"input_ids": torch.zeros(1, 4, dtype=torch.long)})
 
-    assert updates == {"_cp_make_batch_fn": shard_batch_for_kimi_cp}
+    assert set(updates) == {"cp_sharder"}
+    sharder = updates["cp_sharder"]
+    assert sharder.shard_batch is shard_batch_for_kimi_cp
+    # KDA's recurrent state needs contiguous per-rank slices, not the
+    # load-balanced head/tail layout the framework uses by default.
+    assert sharder.local_token_global_indices is contiguous_local_indices
     assert model._owns_cp_attention is True
+
+
+class _StubDeviceMesh(dict):
+    """Minimal ``cp``-only device mesh, as the CP dispatch indexes it."""
+
+    def __init__(self, cp_size: int, cp_rank: int = 0) -> None:
+        super().__init__()
+        self["cp"] = _FakeCPMesh(cp_size, cp_rank)
+        self.mesh_dim_names = ["cp"]
+
+
+def test_cp_dispatch_shards_kimi_batch_contiguously_not_load_balanced():
+    """The generic CP dispatch must pick up Kimi's sharder, not the default layout.
+
+    Kimi's KDA layers are silently wrong under the framework's default head/tail
+    round-robin layout, so this asserts the public sharder entry point resolves
+    the model hook and produces contiguous rank-1 tokens plus the document map.
+    """
+    from nemo_automodel.components.distributed.context_parallel.sharder import ContextParallelSharder
+
+    model = KimiLinearForCausalLM(_tiny_kimi_config(), backend=_backend_config())
+    input_ids = torch.arange(8, dtype=torch.long).unsqueeze(0)
+    batch = {"input_ids": input_ids, "labels": input_ids.clone()}
+
+    sharder = ContextParallelSharder(model, _StubDeviceMesh(cp_size=2, cp_rank=1), batch)
+    _, sharded = sharder.shard(batch)
+
+    # Contiguous second half, not the round-robin head/tail pair ([2, 3, 4, 5]).
+    assert sharded["input_ids"].tolist() == [[4, 5, 6, 7]]
+    assert sharded["kimi_packed_context"].seq_start == 4
+    assert sharder.shard_layout.padded_seq_len == 8
 
 
 def test_setup_cp_attention_records_mesh_on_every_attention_block():
