@@ -58,6 +58,50 @@ logger = logging.getLogger(__name__)
 _CP_STREAM = None
 
 
+def _prepare_deepep_v2_buffer(
+    model_parts: list[nn.Module],
+    batches: list[dict[str, object]],
+    device: torch.device,
+) -> None:
+    """Set a common ElasticBuffer capacity before a non-pipeline global batch."""
+    from nemo_automodel.components.moe.megatron.fused_a2a import init_deepep_v2_buffer
+
+    experts = next(
+        (
+            module
+            for model_part in model_parts
+            for module in model_part.modules()
+            if isinstance(module, GroupedExpertsDeepEP)
+        ),
+        None,
+    )
+    if experts is None or experts.dispatcher_backend != "deepep_v2":
+        return
+
+    local_capacity = max(
+        (
+            input_ids.numel()
+            for batch in batches
+            if (input_ids := batch.get("input_ids")) is not None and isinstance(input_ids, torch.Tensor)
+        ),
+        default=0,
+    )
+    if local_capacity == 0:
+        return
+
+    group = experts.token_dispatcher.group
+    capacity = torch.tensor(local_capacity, dtype=torch.int64, device=device)
+    if group.size() > 1:
+        torch.distributed.all_reduce(capacity, op=torch.distributed.ReduceOp.MAX, group=group)
+    num_max_tokens_per_rank = 1 << (capacity.item() - 1).bit_length()
+    init_deepep_v2_buffer(
+        group,
+        num_max_tokens_per_rank,
+        experts.config.expert_dim,
+        experts.config.n_activated_experts,
+    )
+
+
 def _moe_shard_placement(param):
     """FSDP shard placement for grouped-expert params.
 
