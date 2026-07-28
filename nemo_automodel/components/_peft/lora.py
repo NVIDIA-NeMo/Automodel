@@ -21,7 +21,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributed.tensor import DTensor
-from torch.distributed.tensor.placement_types import Shard as _Shard
 
 from nemo_automodel.components._peft.lora_experts import GroupedExpertsDeepEPLoRA, GroupedExpertsLoRA
 from nemo_automodel.components._peft.lora_kernel import (
@@ -32,6 +31,7 @@ from nemo_automodel.components._peft.lora_kernel import (
 from nemo_automodel.components._peft.module_matcher import ModuleMatcher
 from nemo_automodel.components.moe.layers import GroupedExperts, GroupedExpertsDeepEP, GroupedExpertsTE
 from nemo_automodel.shared.import_utils import safe_import, safe_import_te
+from nemo_automodel.shared.tp_linear import tp_linear_forward
 from nemo_automodel.shared.utils import dtype_from_str
 
 HAS_BNB, bitsandbytes = safe_import("bitsandbytes")
@@ -285,10 +285,19 @@ class LinearLoRA(nn.Linear):
         The result of the original linear transformation is combined with the LoRA output.
 
         Args:
-            x (Tensor): Input tensor of shape (batch_size, in_features).
+            x (Tensor): Input activations of shape ``[B, S, in_features]``
+                (``B`` = batch, ``S`` = sequence) or ``[N, in_features]``
+                (``N`` = flattened tokens).  May be a DTensor: a 3-D DTensor
+                sharded on dim 0 or 1 (e.g. ``Shard(1)`` from sequence
+                parallelism) routes the base projection through ``torch.bmm``;
+                replicated or last-dimension-sharded inputs (``Shard(2)`` or
+                ``Shard(-1)``) take ``F.linear``, which under async-TP tracing
+                is the fusable native linear graph.
 
         Returns:
-            Tensor: Output tensor of shape (batch_size, out_features).
+            Tensor: Output of shape ``[..., out_features]`` with the same
+            leading dimensions as ``x``; a DTensor if ``x`` and the weights
+            are DTensors.
         """
         # pylint: disable=C0115,C0116
         # If LinearLoRA is used to monkey-patch a nn.Linear module, we want to use nn.Linear's
@@ -302,21 +311,7 @@ class LinearLoRA(nn.Linear):
             bias = self.bias
             if bias is not None and bias.numel() == 0:
                 bias = None
-            # bmm avoids aten.view which cannot flatten a sharded dimension.
-            # F.linear calls view([b,s,h]->[b*s,h]) which fails when dim 0/1 is sharded
-            # (sequence parallelism) or during AOT-autograd tracing with compile.
-            _x_needs_bmm = (
-                isinstance(x, DTensor)
-                and x.dim() == 3
-                and any(isinstance(p, _Shard) and p.dim < 2 for p in x.placements)
-            )
-            if torch.compiler.is_compiling() or _x_needs_bmm:
-                b = x.shape[0]
-                res = torch.bmm(x, self.weight.t().unsqueeze(0).expand(b, -1, -1))
-                if bias is not None:
-                    res = res + bias
-            else:
-                res = F.linear(x, self.weight, bias)
+            res = tp_linear_forward(x, self.weight, bias, mm_for_2d_compile=False)
 
         if not self.use_dora:
             if self.dropout_position == "pre":

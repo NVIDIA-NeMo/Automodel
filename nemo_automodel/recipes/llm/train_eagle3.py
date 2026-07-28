@@ -35,7 +35,6 @@ from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
 from nemo_automodel.components.checkpoint.checkpointing import (
     CheckpointingConfig,
-    is_legacy_pickle_restore_allowed,
     load_hf_safetensors_state_dict,
     safe_torch_load,
     save_config,
@@ -1613,16 +1612,16 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             meta = safe_torch_load(
                 meta_path,
                 map_location="cpu",
-                allow_legacy_pickle_restore=is_legacy_pickle_restore_allowed(self),
                 description="EAGLE metadata",
             )
             self.runtime.global_step = int(meta.get("global_step", 0))
             self._resume_epoch = int(meta.get("epoch", 0))
-            # Align the regen launch cadence to the restored step so resume does not
-            # immediately fire a redundant cycle for an already-covered region.
-            regen_runner = getattr(self, "regen_runner", None)
-            if regen_runner is not None:
-                regen_runner.resume_from_step(self.runtime.global_step)
+            # Align the cadence-driven runners to the restored step so resume does
+            # not immediately fire a redundant launch for an already-covered region.
+            for runner_attr in ("regen_runner", "decode_eval_runner"):
+                runner = getattr(self, runner_attr, None)
+                if runner is not None:
+                    runner.resume_from_step(self.runtime.global_step)
             ids = meta.get("selected_token_ids")
             mask = meta.get("selected_token_mask")
             if ids is not None and mask is not None:

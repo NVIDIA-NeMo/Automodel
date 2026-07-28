@@ -202,12 +202,22 @@ def fully_shard_deepseek_v4(module: nn.Module, mesh, mp_policy, offload_policy=N
     This is intentionally model-specific.  DeepSeek-V4 keeps a small set of
     reference-sensitive tensors in fp32, while the existing DeepEP path expects
     the transformer block itself to remain the main FSDP unit.
+
+    Uniform fp32 storage does not necessarily mean fp32 compute: full-parameter
+    training commonly keeps fp32 master weights while the FSDP mixed-precision
+    policy requests bf16 compute.  In that case, preserve fp32 compute only for
+    the explicitly listed reference-sensitive islands and let the parent block
+    use the caller's bf16 policy.
     """
     is_dsv4 = _is_deepseek_v4_module(module)
     if is_dsv4:
         _attach_hca_param_sync_group(module, mesh)
 
-    if _floating_param_dtypes(module) == {torch.float32}:
+    policy_param_dtype = getattr(mp_policy, "param_dtype", None)
+    use_all_fp32_fast_path = _floating_param_dtypes(module) == {torch.float32} and (
+        not is_dsv4 or policy_param_dtype in (None, torch.float32)
+    )
+    if use_all_fp32_fast_path:
         fsdp_kwargs = _fp32_module_fsdp_kwargs(module, fsdp_kwargs)
         return _fully_shard_once(
             module,

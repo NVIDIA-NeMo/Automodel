@@ -44,7 +44,6 @@ except ImportError:
     from transformers.tokenization_utils import PreTrainedTokenizerBase
 
 from nemo_automodel.components.checkpoint.checkpointing import (
-    is_legacy_pickle_restore_allowed,
     safe_torch_load,
     save_config,
 )
@@ -649,7 +648,6 @@ class BaseRecipe:
                 obj.load_state_dict(
                     safe_torch_load(
                         os.path.join(ckpt_dir, f"{key}.pt"),
-                        allow_legacy_pickle_restore=is_legacy_pickle_restore_allowed(self),
                         description=f"{key} state",
                     )
                 )

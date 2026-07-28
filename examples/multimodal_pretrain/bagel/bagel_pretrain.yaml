@@ -27,9 +27,13 @@ tokenizer:
 
 model:
   # Transformer Engine is enabled for BAGEL's language-model Linear and RMSNorm layers.
+  # mot_grouped / fused_swiglu / fused_rope are throughput optimizations (see BagelBackendConfig).
   backend:
     linear: te
     rms_norm: te
+    mot_grouped: true
+    fused_swiglu: true
+    fused_rope: true
   init_mode: hf_backbones
   stage: 2
   llm_path: Qwen/Qwen2.5-7B-Instruct

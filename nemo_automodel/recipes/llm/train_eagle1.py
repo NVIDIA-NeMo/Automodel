@@ -33,7 +33,6 @@ from nemo_automodel._transformers import NeMoAutoModelForCausalLM
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel.components.checkpoint.checkpointing import (
     CheckpointingConfig,
-    is_legacy_pickle_restore_allowed,
     safe_torch_load,
     save_config,
 )
@@ -637,7 +636,6 @@ class TrainEagle1Recipe(BaseRecipe):
             meta = safe_torch_load(
                 meta_path,
                 map_location="cpu",
-                allow_legacy_pickle_restore=is_legacy_pickle_restore_allowed(self),
                 description="EAGLE metadata",
             )
             self.runtime.global_step = int(meta.get("global_step", 0))

@@ -12,15 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
-import random
+from pathlib import Path
 
-import numpy as np
 import pytest
 import torch
 
 from nemo_automodel.components.checkpoint.checkpointing import safe_torch_load
-from nemo_automodel.components.training.rng import RNGState
+
+
+def _touch_marker(marker_path: str) -> None:
+    Path(marker_path).touch()
 
 
 class _TouchPayload:
@@ -28,7 +29,7 @@ class _TouchPayload:
         self.marker_path = marker_path
 
     def __reduce__(self):
-        return (os.system, (f"touch {self.marker_path}",))
+        return (_touch_marker, (self.marker_path,))
 
 
 def test_safe_torch_load_rejects_pickle_payload_without_execution(tmp_path):
@@ -49,21 +50,3 @@ def test_safe_torch_load_allows_tensor_only_checkpoint(tmp_path):
     loaded = safe_torch_load(checkpoint)
 
     torch.testing.assert_close(loaded["weight"], torch.arange(3))
-
-
-def test_safe_torch_load_legacy_pickle_requires_explicit_opt_in(tmp_path):
-    checkpoint = tmp_path / "legacy_rng.pt"
-    legacy_state = RNGState(
-        random_rng_state=random.getstate(),
-        np_rng_state=np.random.get_state(),
-        torch_rng_state=torch.get_rng_state(),
-        cuda_rng_state=torch.cuda.get_rng_state_all(),
-    )
-    torch.save(legacy_state, checkpoint)
-
-    with pytest.raises(RuntimeError, match="allow_legacy_pickle_restore"):
-        safe_torch_load(checkpoint)
-
-    loaded = safe_torch_load(checkpoint, allow_legacy_pickle_restore=True)
-
-    assert isinstance(loaded, RNGState)

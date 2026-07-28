@@ -43,7 +43,6 @@ from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel.components.checkpoint.checkpointing import (
     Checkpointer,
     CheckpointingConfig,
-    is_legacy_pickle_restore_allowed,
     safe_torch_load,
     save_config,
 )
@@ -462,9 +461,16 @@ class TrainDFlashRecipe(BaseRecipe):
     def _log_extra_train_metrics(self, epoch_idx: int) -> None:
         """Hook for subclasses to log extra per-step metrics at a log point (no-op here)."""
 
-    def _extra_train_wandb_metrics(self, metrics) -> dict[str, float]:
-        """Return algorithm-specific W&B metrics for one training step."""
-        return {"train/accept_len": float(metrics.accept_len)}
+    def _extra_train_metric_sums(self, metrics) -> dict[str, tuple[float, float]]:
+        """Return algorithm-specific training numerator and denominator pairs.
+
+        These are accumulated over the micro-batches between two log points and
+        divided at the log point, the same way ``train/loss`` and
+        ``train/accuracy`` are, so every curve on the dashboard covers the same
+        window. Returning the per-micro-batch mean instead would report a single
+        micro-batch out of ``log_every_steps * grad_accumulation_steps``.
+        """
+        return {"train/accept_len": (float(metrics.accept_len_sum), float(metrics.valid_blocks))}
 
     def _extra_eval_metric_sums(self, metrics) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
         """Return additional validation numerator and denominator pairs.
@@ -708,7 +714,6 @@ class TrainDFlashRecipe(BaseRecipe):
             meta = safe_torch_load(
                 meta_path,
                 map_location="cpu",
-                allow_legacy_pickle_restore=is_legacy_pickle_restore_allowed(self),
                 description="DFlash metadata",
             )
             self.runtime.global_step = int(meta.get("global_step", 0))
@@ -844,6 +849,7 @@ class TrainDFlashRecipe(BaseRecipe):
                 running_loss = 0.0
                 running_acc = 0.0
                 running_micro = 0
+                running_extra: dict[str, list[float]] = {}
                 epoch_loss = 0.0
                 micro_step = 0
                 pending_micro_batches = 0
@@ -891,6 +897,13 @@ class TrainDFlashRecipe(BaseRecipe):
                     running_loss += metrics.loss.detach().item()
                     running_acc += metrics.accuracy.detach().item()
                     running_micro += 1
+                    # Accumulated here, past the skip ``continue`` above, so a
+                    # micro-batch excluded from loss/accuracy is excluded from
+                    # these too.
+                    for name, (numerator, denominator) in self._extra_train_metric_sums(metrics).items():
+                        totals = running_extra.setdefault(name, [0.0, 0.0])
+                        totals[0] += numerator
+                        totals[1] += denominator
                     epoch_loss += metrics.loss.detach().item()
                     micro_step += 1
                     pending_micro_batches += 1
@@ -937,11 +950,18 @@ class TrainDFlashRecipe(BaseRecipe):
                                     "train/lr": current_lr,
                                     "train/epoch": epoch_idx,
                                 }
-                                wandb_data.update(self._extra_train_wandb_metrics(metrics))
+                                wandb_data.update(
+                                    {
+                                        name: numerator / denominator
+                                        for name, (numerator, denominator) in running_extra.items()
+                                        if denominator > 0
+                                    }
+                                )
                                 self._wandb_log(wandb_data, step=self.runtime.global_step)
                             running_loss = 0.0
                             running_acc = 0.0
                             running_micro = 0
+                            running_extra.clear()
 
                 # Flush the trailing partial accumulation window (see EAGLE recipes
                 # for the rescale rationale).

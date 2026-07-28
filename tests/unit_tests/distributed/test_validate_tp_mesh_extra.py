@@ -25,10 +25,10 @@ from __future__ import annotations
 
 import builtins
 import sys
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
-from unittest.mock import MagicMock
 
 from nemo_automodel.components.distributed.parallelizer import validate_tp_mesh
 
@@ -44,7 +44,8 @@ def _install_fake_gemma3(monkeypatch):
     ``validate_tp_mesh``; no actual functionality is required.
     """
 
-    import sys, types  # Local import to avoid polluting global namespace
+    import sys  # Local import to avoid polluting global namespace
+    import types
 
     module_chain = [
         "transformers",
