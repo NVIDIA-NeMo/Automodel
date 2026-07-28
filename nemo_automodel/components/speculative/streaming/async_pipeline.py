@@ -17,18 +17,21 @@
 :class:`AsyncFeaturePipeline` wraps a :class:`FeatureProducer` and a
 :class:`SampleRefQueue` and runs the target forward in a background
 thread, pushing every produced :class:`SampleRef` onto the queue
-through :meth:`SampleRefQueue.put_blocks_until_below` so the queue's
-HWM/LWM hysteresis governs the producer's pacing.
+through :meth:`SampleRefQueue.put_blocks_until_below`. The queue's
+HWM/LWM hysteresis governs the producer's pacing against the
+consumer.
 
-The trainer-side :class:`~nemo_automodel.components.speculative.streaming.loader.FeatureDataLoader`
-iterates the queue; the trainer consumes ``Eagle3TargetBatch`` instances.
-The queue is filled by a background thread rather than by the trainer's
-main thread, so target-side forward and draft-side backward overlap.
+The trainer-side code iterates ``FeatureDataLoader`` against the
+queue; the trainer consumes ``Eagle3TargetBatch`` instances. The
+queue is now filled by a background thread rather than by the
+trainer's main thread, so target-side forward and draft-side backward
+overlap.
 
-Distributed-training note: the pipeline is per-rank. Each rank owns its own
-:class:`FeatureProducer`, :class:`SampleRefQueue`, and :class:`FeatureStore`;
-FSDP / CP / EP happen inside the trainer's forward / backward. Cross-rank
-sample routing is handled above this layer.
+Distributed-training note: the pipeline is per-rank. Each rank owns
+its own :class:`FeatureProducer`, :class:`SampleRefQueue`, and
+:class:`FeatureStore`; FSDP / CP / EP happen inside the trainer's
+forward / backward. Cross-rank coordination (DP resharding) is
+tracked separately.
 """
 
 from __future__ import annotations
@@ -41,6 +44,7 @@ import torch
 
 from nemo_automodel.components.speculative.streaming.producer import FeatureProducer
 from nemo_automodel.components.speculative.streaming.queue import SampleRefQueue
+from nemo_automodel.components.speculative.streaming.store import FeatureStore
 
 logger = logging.getLogger(__name__)
 
@@ -63,9 +67,9 @@ class AsyncFeaturePipeline:
     """Run a :class:`FeatureProducer` in a background thread, draining a prompt source.
 
     Args:
-        producer: The :class:`FeatureProducer` to invoke on each prompt.
-            It carries the wrapped target backend, the store, and the
-            per-call metadata.
+        producer: The :class:`FeatureProducer` to invoke on each
+            prompt. It carries the wrapped target backend, the store,
+            and the per-call metadata.
         queue: The :class:`SampleRefQueue` to push the resulting
             :class:`SampleRef` onto. The queue's HWM/LWM hysteresis
             paces the producer against the consumer.
@@ -95,6 +99,7 @@ class AsyncFeaturePipeline:
         queue: SampleRefQueue,
         prompt_source: PromptSource | Iterator[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
         *,
+        store: "FeatureStore | None" = None,
         poll_interval: float = 0.1,
         stop_on_exhausted: bool = True,
     ) -> None:
@@ -111,6 +116,21 @@ class AsyncFeaturePipeline:
         else:
             self._iterator = None
             self._prompt_source = prompt_source
+        # The store is what the producer's ``put`` writes into and what
+        # ``health()`` reports against. We need it directly so the
+        # pre-produce gate can check ``low_watermark_hit``; the queue
+        # wraps the same store, but reaching into ``_store`` would
+        # couple this class to a private attribute. Accept an explicit
+        # ``store`` argument, defaulting to ``None`` and resolved
+        # against ``queue`` if missing.
+        if store is None:
+            store = getattr(queue, "_store", None)
+        if store is None or not isinstance(store, FeatureStore):
+            raise ValueError(
+                "AsyncFeaturePipeline requires a FeatureStore; pass it via `store=...` "
+                "or bind the queue's `FeatureStore` through SampleRefQueue.__init__."
+            )
+        self._store = store
         self._poll_interval = poll_interval
         self._stop_on_exhausted = stop_on_exhausted
         self._thread: threading.Thread | None = None
@@ -129,16 +149,13 @@ class AsyncFeaturePipeline:
         # only when the iterator yields the full 3-tuple.
         if isinstance(value, tuple) and len(value) == 3:
             return value
-        if isinstance(value, tuple) and len(value) == 6:
-            return value
         if isinstance(value, torch.Tensor):
             attn = torch.ones_like(value, dtype=torch.long)
             loss = torch.ones_like(value, dtype=torch.long)
             return value, attn, loss
         raise TypeError(
-            f"prompt iterator must yield (input_ids, attention_mask, loss_mask) or a six-tuple "
-            f"with packing metadata (position_ids, seq_lens, doc_remaining), or a single "
-            f"Tensor; got {type(value).__name__} of length {len(value) if isinstance(value, tuple) else 'n/a'}"
+            f"prompt iterator must yield (input_ids, attention_mask, loss_mask) or a single "
+            f"Tensor; got {type(value).__name__}"
         )
 
     def start(self) -> None:
@@ -203,42 +220,49 @@ class AsyncFeaturePipeline:
                     if self._stop_event.wait(timeout=self._poll_interval):
                         break
                     continue
-                packing_kwargs = {}
-                if isinstance(prompt, tuple) and len(prompt) == 6:
-                    input_ids, attention_mask, loss_mask, position_ids, seq_lens, doc_remaining = prompt
-                    packing_kwargs = {
-                        "position_ids": position_ids,
-                        "seq_lens": seq_lens,
-                        "doc_remaining": doc_remaining,
-                    }
-                else:
-                    input_ids, attention_mask, loss_mask = prompt
+                # Gate before the forward pass: the producer's
+                # ``store.put`` runs inside ``produce`` and writes the
+                # ref to the store synchronously. Producing while the
+                # store is already over its high watermark would leave
+                # the ref in the store with no consumer awareness (not
+                # yet enqueued), and the queue's ``put_blocks_until_below``
+                # would pause waiting for a consumer to drain a ref it
+                # does not know about. Wait until the store reports
+                # headroom before burning a forward pass.
+                self._wait_for_capacity()
+                if self._stop_event.is_set():
+                    break
+                input_ids, attention_mask, loss_mask = prompt
                 ref = self._producer.produce(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     loss_mask=loss_mask,
-                    **packing_kwargs,
                 )
-                # put_blocks_until_below honors the queue's HWM/LWM
-                # hysteresis; a fast producer here naturally blocks
-                # when the store is at high watermark.
-                try:
-                    self._queue.put_blocks_until_below(
-                        ref,
-                        poll_interval=self._poll_interval,
-                        abort_when=self._stop_event.is_set,
-                    )
-                except RuntimeError as e:
-                    if self._stop_event.is_set() and (
-                        "aborted during shutdown" in str(e) or "closed while put was waiting" in str(e)
-                    ):
-                        break
-                    raise
+                self._queue.put_blocks_until_below(
+                    ref,
+                    poll_interval=self._poll_interval,
+                )
         except BaseException as e:  # noqa: BLE001 -- capture then re-raise from stop()
             logger.exception("AsyncFeaturePipeline background thread failed")
             self._error = e
         finally:
             self._queue.close()
+
+    def _wait_for_capacity(self) -> None:
+        """Block the producer thread until the store reports headroom.
+
+        Headroom is "resident_bytes <= low_watermark_bytes", which is
+        the same condition the queue's resume decision uses
+        (PR 1's hysteresis). Waits on ``stop_event`` so shutdown is
+        responsive. Polls at :attr:`_poll_interval` so a busy
+        consumer is observed promptly.
+        """
+        while not self._stop_event.is_set():
+            health = self._store.health()
+            if health.low_watermark_hit:
+                return
+            if self._stop_event.wait(timeout=self._poll_interval):
+                return
 
 
 __all__ = ["AsyncFeaturePipeline", "PromptSource"]
