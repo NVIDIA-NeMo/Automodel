@@ -107,6 +107,17 @@ _DEEPEP_V2_HANDLE_TENSOR_FIELDS = (
 )
 
 
+class _DeepEPV2Handle:
+    """Pair an ElasticBuffer handle with the dispatch autograd context that owns it."""
+
+    def __init__(self, handle, dispatch_ctx):
+        self.handle = handle
+        self.dispatch_ctx = dispatch_ctx
+
+    def __getattr__(self, name):
+        return getattr(self.handle, name)
+
+
 def _is_nvshmem_available() -> bool:
     """Check if DeepEP was compiled with NVSHMEM support.
 
@@ -252,6 +263,7 @@ def init_deepep_v2_buffer(
 def _save_deepep_v2_handle(ctx, handle) -> None:
     """Save ElasticBuffer handle tensors for non-reentrant checkpoint replay."""
     ctx.handle = handle
+    ctx.handle_restored = False
     ctx.handle_tensor_fields = tuple(
         field for field in _DEEPEP_V2_HANDLE_TENSOR_FIELDS if getattr(handle, field, None) is not None
     )
@@ -260,8 +272,11 @@ def _save_deepep_v2_handle(ctx, handle) -> None:
 
 def _restore_deepep_v2_handle(ctx):
     """Restore checkpoint-recomputed tensors onto the original ElasticBuffer handle."""
+    if ctx.handle_restored:
+        return ctx.handle
     for field, tensor in zip(ctx.handle_tensor_fields, ctx.saved_tensors, strict=True):
         setattr(ctx.handle, field, tensor)
+    ctx.handle_restored = True
     return ctx.handle
 
 
@@ -471,7 +486,7 @@ class DeepEPV2FusedDispatch(torch.autograd.Function):
         _save_deepep_v2_handle(ctx, handle)
         tokens_per_expert = torch.as_tensor(handle.num_recv_tokens_per_expert_list, dtype=torch.int64)
 
-        return (recv_x, recv_token_indices, recv_token_probs, tokens_per_expert, handle)
+        return (recv_x, recv_token_indices, recv_token_probs, tokens_per_expert, _DeepEPV2Handle(handle, ctx))
 
     @staticmethod
     def backward(
@@ -544,9 +559,15 @@ class DeepEPV2FusedCombine(torch.autograd.Function):
             ``[num_max_tokens_per_rank, hidden_size]`` restored to the source ranks.
         """
         del group
+        if isinstance(handle, _DeepEPV2Handle):
+            native_handle = handle.handle
+            ctx.dispatch_ctx = handle.dispatch_ctx
+        else:
+            native_handle = handle
+            ctx.dispatch_ctx = None
         combined_x, _, after_event = _deepep_v2_buffer.combine(
             x.contiguous(),
-            handle=handle,
+            handle=native_handle,
             num_sms=_deepep_v2_num_sms,
             num_qps=_deepep_v2_num_qps,
             async_with_compute_stream=async_finish,
@@ -557,7 +578,8 @@ class DeepEPV2FusedCombine(torch.autograd.Function):
 
         ctx.async_finish = async_finish
         ctx.allocate_on_comm_stream = allocate_on_comm_stream
-        _save_deepep_v2_handle(ctx, handle)
+        if ctx.dispatch_ctx is None:
+            _save_deepep_v2_handle(ctx, native_handle)
         return combined_x, None
 
     @staticmethod
@@ -572,7 +594,7 @@ class DeepEPV2FusedCombine(torch.autograd.Function):
             Gradients aligned to the forward inputs; ``grad_x`` is
             ``[num_recv_tokens, hidden_size]``, the rest are ``None``.
         """
-        handle = _restore_deepep_v2_handle(ctx)
+        handle = _restore_deepep_v2_handle(ctx.dispatch_ctx or ctx)
         grad_x, _, _, _, after_event = _deepep_v2_buffer.dispatch(
             grad_output.contiguous(),
             handle=handle,

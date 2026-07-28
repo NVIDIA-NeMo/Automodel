@@ -352,7 +352,35 @@ def test_deepep_v2_combine_uses_process_global_buffer(monkeypatch):
     )
 
     assert torch.equal(combined_x, torch.full((2, 256), 3.0))
-    assert buffer.combine_handles == [handle]
+    assert buffer.combine_handles == [handle.handle]
+
+
+def test_deepep_v2_checkpoint_recompute_stops_before_combine(monkeypatch):
+    _reset_fake_state(monkeypatch)
+    group = _FakeGroup()
+    x = torch.ones(2, 256, requires_grad=True)
+    token_indices = torch.tensor([[0], [1]], dtype=torch.int64)
+    token_probs = torch.ones(2, 1, requires_grad=True)
+
+    def layer(hidden_states, probs):
+        recv_x, _, recv_probs, _, handle = fused_a2a.DeepEPV2FusedDispatch.apply(
+            hidden_states,
+            token_indices,
+            probs,
+            2,
+            group,
+            False,
+            False,
+        )
+        expert_x = recv_x * recv_probs.square()
+        combined_x, _ = fused_a2a.DeepEPV2FusedCombine.apply(expert_x, group, handle, False, False)
+        return combined_x
+
+    checkpoint(layer, x, token_probs, use_reentrant=False).sum().backward()
+
+    buffer = fused_a2a._deepep_v2_buffer
+    assert len(buffer.combine_handles) == 2
+    assert buffer.combine_handles[0] is buffer.dispatch_handles[0]
 
 
 def test_deepep_v2_uses_tuned_resources_in_forward_and_backward(monkeypatch):
