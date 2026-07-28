@@ -36,7 +36,9 @@ step_scheduler:
 
 dist_env:
   backend: nccl
-  timeout_minutes: 60
+  # Must stay below ci.time, otherwise a collective hang is killed by SLURM before
+  # the NCCL watchdog can report which collective is stuck.
+  timeout_minutes: 10
 
 rng:
   _target_: nemo_automodel.components.training.rng.StatefulRNG
@@ -118,5 +120,12 @@ freeze_config:
 
 ci:
   recipe_owner: athitten
-  time: "00:30:00"
+  # Raised from 00:30:00 so the 10-minute NCCL watchdog fires and writes its
+  # flight-recorder dump inside the SLURM allocation.
+  time: "00:45:00"
   nodes: 4
+  env_vars:
+    # Record every collective per rank and dump the buffer when the watchdog
+    # trips, so a hang names the stuck collective instead of dying silently.
+    TORCH_NCCL_TRACE_BUFFER_SIZE: "2000"
+    TORCH_NCCL_DUMP_ON_TIMEOUT: "1"
