@@ -648,6 +648,135 @@ class TestMergeLoraFunction:
 
     @patch("tools.merge_lora.gc")
     @patch("tools.merge_lora.torch")
+    def test_vlm_processor_artifacts_are_reloadable(self, mock_torch, mock_gc, tmp_path):
+        """The merged output contains VLM processor artifacts that AutoProcessor can reload."""
+        from tokenizers import Tokenizer
+        from tokenizers.models import WordLevel
+        from tokenizers.pre_tokenizers import Whitespace
+        from transformers import (
+            AutoProcessor,
+            Idefics3ImageProcessor,
+            Idefics3Processor,
+            PreTrainedTokenizerFast,
+        )
+
+        from tools.merge_lora import merge_lora
+
+        mock_torch.float16 = torch.float16
+
+        tokenizer_backend = Tokenizer(
+            WordLevel(
+                vocab={"<pad>": 0, "<s>": 1, "</s>": 2, "<unk>": 3, "a": 4},
+                unk_token="<unk>",
+            )
+        )
+        tokenizer_backend.pre_tokenizer = Whitespace()
+        tokenizer = PreTrainedTokenizerFast(
+            tokenizer_object=tokenizer_backend,
+            unk_token="<unk>",
+            pad_token="<pad>",
+            bos_token="<s>",
+            eos_token="</s>",
+        )
+        image_processor = Idefics3ImageProcessor(
+            size={"longest_edge": 32},
+            max_image_size={"longest_edge": 16},
+            do_image_splitting=False,
+        )
+        base_dir = tmp_path / "base"
+        Idefics3Processor(
+            image_processor=image_processor,
+            tokenizer=tokenizer,
+            image_seq_len=4,
+        ).save_pretrained(base_dir)
+
+        mock_model = self._make_mock_model()
+        mock_peft_model = MagicMock()
+        mock_peft_model.merge_and_unload.return_value = mock_model
+
+        mock_auto = MagicMock()
+        mock_auto.__name__ = "AutoModelForMultimodalLM"
+        mock_auto.from_pretrained.return_value = mock_model
+        mock_peft_cls = MagicMock()
+        mock_peft_cls.from_pretrained.return_value = mock_peft_model
+        mock_tokenizer_cls = MagicMock()
+        mock_tokenizer_cls.from_pretrained.return_value = MagicMock()
+
+        output_dir = tmp_path / "out"
+        with patch("tools.merge_lora._resolve_auto_cls", return_value=mock_auto):
+            with patch.dict(
+                "sys.modules",
+                {
+                    "peft": MagicMock(PeftModel=mock_peft_cls),
+                    "nemo_automodel._transformers.auto_tokenizer": MagicMock(NeMoAutoTokenizer=mock_tokenizer_cls),
+                },
+            ):
+                merge_lora(
+                    base_model=str(base_dir),
+                    adapter_path="/fake/adapter",
+                    output_dir=str(output_dir),
+                    dtype="float16",
+                    device="cpu",
+                    save_tokenizer=True,
+                )
+
+        reloaded = AutoProcessor.from_pretrained(output_dir)
+        assert isinstance(reloaded, Idefics3Processor)
+        assert isinstance(reloaded.image_processor, Idefics3ImageProcessor)
+        assert reloaded.image_seq_len == 4
+        assert reloaded.image_processor.size["longest_edge"] == 32
+        assert reloaded.image_processor.max_image_size["longest_edge"] == 16
+
+    @patch("tools.merge_lora.gc")
+    @patch("tools.merge_lora.torch")
+    def test_processor_load_failure_falls_back_to_tokenizer(self, mock_torch, mock_gc, tmp_path):
+        """A processor load failure still allows tokenizer artifacts to be saved."""
+        from tools.merge_lora import merge_lora
+
+        mock_torch.float16 = torch.float16
+
+        mock_model = self._make_mock_model()
+        mock_peft_model = MagicMock()
+        mock_peft_model.merge_and_unload.return_value = mock_model
+
+        mock_auto = MagicMock()
+        mock_auto.__name__ = "AutoModelForCausalLM"
+        mock_auto.from_pretrained.return_value = mock_model
+        mock_peft_cls = MagicMock()
+        mock_peft_cls.from_pretrained.return_value = mock_peft_model
+
+        mock_processor_cls = MagicMock()
+        mock_processor_cls.from_pretrained.side_effect = ValueError("no processor")
+
+        mock_tokenizer = MagicMock()
+        mock_tokenizer_cls = MagicMock()
+        mock_tokenizer_cls.from_pretrained.return_value = mock_tokenizer
+
+        with patch("tools.merge_lora._resolve_auto_cls", return_value=mock_auto):
+            with patch.dict(
+                "sys.modules",
+                {
+                    "peft": MagicMock(PeftModel=mock_peft_cls),
+                    "transformers": MagicMock(
+                        AutoTokenizer=mock_tokenizer_cls,
+                        AutoProcessor=mock_processor_cls,
+                    ),
+                },
+            ):
+                merge_lora(
+                    base_model="/fake/text-model",
+                    adapter_path="/fake/adapter",
+                    output_dir=str(tmp_path / "out"),
+                    dtype="float16",
+                    device="cpu",
+                    save_tokenizer=True,
+                )
+
+        mock_processor_cls.from_pretrained.assert_called_once()
+        mock_tokenizer.save_pretrained.assert_called_once()
+
+    @patch("tools.merge_lora.gc")
+    @patch("tools.merge_lora.torch")
     def test_lora_merge_tokenizer_failure_is_warning(self, mock_torch, mock_gc, tmp_path):
         """If tokenizer save fails, merge_lora logs a warning but does not raise."""
         from tools.merge_lora import merge_lora
