@@ -42,7 +42,11 @@ except ImportError:
     # < v5
     from transformers.tokenization_utils import PreTrainedTokenizerBase
 
-from nemo_automodel.components.checkpoint.checkpointing import save_config, save_losses
+from nemo_automodel.components.checkpoint.checkpointing import (
+    load_torch_ckpt,
+    save_config,
+    save_losses,
+)
 from nemo_automodel.components.checkpoint.utils import (
     checkpoint_lifecycle_is_supported,
     clear_checkpoint_incomplete,
@@ -763,7 +767,12 @@ class BaseRecipe:
                 # we only save the tokenizer for consolidated checkpoints for downstream use
                 continue
             else:
-                obj.load_state_dict(torch.load(os.path.join(ckpt_dir, f"{key}.pt"), weights_only=False))
+                obj.load_state_dict(
+                    load_torch_ckpt(
+                        os.path.join(ckpt_dir, f"{key}.pt"),
+                        weights_only=not self.checkpointer.config.allow_legacy_pickle_restore,
+                    )
+                )
 
         return model, optimizer, scheduler
 

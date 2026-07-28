@@ -50,6 +50,7 @@ from nemo_automodel.recipes.llm.train_eagle3 import TrainEagle3Recipe
 class _StubCheckpointConfig:
     enabled: bool
     checkpoint_dir: str
+    allow_legacy_pickle_restore: bool = False
 
 
 def _build_stub_checkpointer(tmp_path) -> MagicMock:

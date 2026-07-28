@@ -35,6 +35,7 @@ from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
 from nemo_automodel.components.checkpoint.checkpointing import (
     CheckpointingConfig,
     load_hf_safetensors_state_dict,
+    load_torch_ckpt,
     save_config,
     save_losses,
 )
@@ -1605,7 +1606,11 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             legacy = os.path.join(ckpt_dir, "eagle3_meta.pt")
             meta_path = legacy if os.path.exists(legacy) else meta_path
         if os.path.exists(meta_path):
-            meta = torch.load(meta_path, weights_only=False, map_location="cpu")
+            meta = load_torch_ckpt(
+                meta_path,
+                map_location="cpu",
+                weights_only=not self.checkpoint_config.allow_legacy_pickle_restore,
+            )
             self.runtime.global_step = int(meta.get("global_step", 0))
             self._resume_epoch = int(meta.get("epoch", 0))
             # Align the cadence-driven runners to the restored step so resume does
