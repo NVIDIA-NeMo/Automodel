@@ -21,14 +21,13 @@ import os
 from io import BytesIO
 from typing import Any, Literal
 
-import requests
 import torch
 from PIL import Image
 from transformers import BatchEncoding, PixtralProcessor
 
 
 def load_image(image: Any) -> Image.Image:
-    """Load an image from a PIL object, local path, URL, base64 string, or bytes."""
+    """Load an image from a PIL object, local path, base64 string, or bytes."""
     if isinstance(image, Image.Image):
         return image
     if isinstance(image, str) and os.path.exists(image):
@@ -39,8 +38,7 @@ def load_image(image: Any) -> Image.Image:
         if "base64" in image:
             return Image.open(BytesIO(base64.b64decode(image["base64"])))
         if "url" in image:
-            response = requests.get(image["url"])
-            return Image.open(BytesIO(response.content))
+            raise ValueError("Remote image URLs are not supported; use disk_path, base64, or bytes.")
         if "bytes" in image:
             return Image.open(BytesIO(image["bytes"]))
     raise ValueError(f"Invalid image: {image}")

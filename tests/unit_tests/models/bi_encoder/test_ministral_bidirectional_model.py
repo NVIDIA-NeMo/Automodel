@@ -34,7 +34,7 @@ from nemo_automodel.components.models.ministral_bidirectional.model import (
     Ministral3BidirectionalModel,
     Mistral3BidirectionalModel,
 )
-from nemo_automodel.components.models.ministral_bidirectional.processor import Mistral3BiEncoderProcessor
+from nemo_automodel.components.models.ministral_bidirectional.processor import Mistral3BiEncoderProcessor, load_image
 
 
 def tiny_bidirectional_config() -> Ministral3BidirectionalConfig:
@@ -183,6 +183,11 @@ def test_ministral3_biencoder_processor_processes_mixed_image_text_documents(pix
     assert call["texts"][0].startswith("passage: [IMG]")
     assert call["texts"][0].endswith("[IMG_END] Image doc")
     assert call["texts"][1] == "passage: Text doc"
+
+
+def test_ministral3_biencoder_processor_rejects_remote_image_urls():
+    with pytest.raises(ValueError, match="Remote image URLs are not supported"):
+        load_image({"url": "https://example.com/image.png"})
 
 
 def test_ministral3_biencoder_processor_forwards_image_longest_edge(monkeypatch):
