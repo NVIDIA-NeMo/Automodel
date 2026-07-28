@@ -13,12 +13,15 @@
 # limitations under the License.
 
 import math
+from unittest.mock import patch
 
 import pytest
 import torch
 
 from nemo_automodel.components.models.gpt_oss.rope_utils import (
     RotaryEmbedding,
+    _apply_rotary_emb_qk_torch,
+    _get_compiled_rotary_emb_qk,
     apply_rotary_emb,
     apply_rotary_emb_qk,
     position_ids_to_freqs_cis,
@@ -30,6 +33,23 @@ def device():
     if torch.cuda.is_available():
         return torch.device(f"cuda:{torch.cuda.current_device()}")
     return torch.device("cpu")
+
+
+class TestCompiledRotaryEmb:
+    def teardown_method(self):
+        _get_compiled_rotary_emb_qk.cache_clear()
+
+    def test_preserves_eager_precision_casts(self):
+        compiled = object()
+        with patch("torch.compile", return_value=compiled) as compile_mock:
+            assert _get_compiled_rotary_emb_qk() is compiled
+
+        _, kwargs = compile_mock.call_args
+        assert kwargs["options"] == {"emulate_precision_casts": True}
+
+    def test_falls_back_when_option_is_unsupported(self):
+        with patch("torch.compile", side_effect=RuntimeError("unsupported")):
+            assert _get_compiled_rotary_emb_qk() is _apply_rotary_emb_qk_torch
 
 
 class TestApplyRotaryEmb:
