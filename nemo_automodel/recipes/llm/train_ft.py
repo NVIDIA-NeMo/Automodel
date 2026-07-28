@@ -71,6 +71,7 @@ from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.components.loss.mtp import calculate_mtp_loss
 from nemo_automodel.components.loss.utils import _get_lm_head_weight, calculate_loss
 from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
+from nemo_automodel.components.moe.parallelizer import _prepare_deepep_v2_buffer
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
 from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
@@ -1093,6 +1094,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             batches: List of batches of training data.
             max_grad_norm: Gradient clipping norm. Optional, if None will not clip gradients.
         """
+        if not self.pp_enabled:
+            _prepare_deepep_v2_buffer(self.model_parts, batches, self.dist_env.device)
 
         num_label_tokens = torch.tensor(
             sum((batch["labels"] != -100).sum().item() for batch in batches), dtype=torch.long
@@ -1258,6 +1261,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             total_num_label_tokens = 0
 
             for batch in val_dataloader:
+                if not self.pp_enabled:
+                    _prepare_deepep_v2_buffer(self.model_parts, [batch], self.dist_env.device)
                 loss_buffer = []
                 num_label_tokens = (batch["labels"] != -100).sum().item()
                 self._forward_backward_step(

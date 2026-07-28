@@ -61,6 +61,7 @@ class _FakeHandle:
 class _FakeElasticBuffer:
     def __init__(self, _group, **kwargs):
         self.constructed_with_num_bytes = "num_bytes" in kwargs
+        self.num_max_tokens_per_rank = kwargs["num_max_tokens_per_rank"]
         self.allow_hybrid_mode = kwargs.get("allow_hybrid_mode", True)
         self.allow_multiple_reduction = kwargs.get("allow_multiple_reduction", True)
         self.prefer_overlap_with_compute = kwargs.get("prefer_overlap_with_compute", True)
@@ -76,7 +77,7 @@ class _FakeElasticBuffer:
         if handle is None:
             handle = _FakeHandle(
                 topk_idx,
-                kwargs["num_max_tokens_per_rank"],
+                kwargs.get("num_max_tokens_per_rank", self.num_max_tokens_per_rank),
                 kwargs["num_sms"],
             )
             self.dispatch_handles.append(handle)
@@ -259,6 +260,38 @@ def test_deepep_v2_buffer_initialization_is_idempotent(monkeypatch):
     same_buffer = _init_test_deepep_v2_buffer(group, num_max_tokens_per_rank=4096, hidden=256, num_topk=2)
 
     assert same_buffer is buffer
+
+
+def test_deepep_v2_buffer_grows_at_a_synchronized_boundary(monkeypatch):
+    _reset_fake_state(monkeypatch)
+    group = _FakeGroup()
+
+    old_buffer = _init_test_deepep_v2_buffer(group, num_max_tokens_per_rank=2048, hidden=256, num_topk=2)
+    new_buffer = _init_test_deepep_v2_buffer(group, num_max_tokens_per_rank=4096, hidden=256, num_topk=2)
+
+    assert old_buffer.destroyed is True
+    assert new_buffer is not old_buffer
+    assert new_buffer.num_max_tokens_per_rank == 4096
+
+
+def test_deepep_v2_dispatch_uses_buffer_default_capacity(monkeypatch):
+    _reset_fake_state(monkeypatch)
+    group = _FakeGroup()
+    buffer = _init_test_deepep_v2_buffer(group, num_max_tokens_per_rank=8, hidden=256, num_topk=1)
+    token_indices = torch.tensor([[0], [1], [0], [1], [0]], dtype=torch.int64)
+
+    *_, handle = fused_a2a.DeepEPV2FusedDispatch.apply(
+        torch.zeros(5, 256),
+        token_indices,
+        torch.ones(5, 1),
+        2,
+        group,
+        False,
+        False,
+    )
+
+    assert "num_max_tokens_per_rank" not in buffer.dispatch_kwargs[0]
+    assert handle.num_max_tokens_per_rank == 8
 
 
 def test_deepep_v2_dispatch_reuses_process_global_buffer(monkeypatch):

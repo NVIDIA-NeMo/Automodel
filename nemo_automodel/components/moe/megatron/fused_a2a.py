@@ -219,13 +219,15 @@ def init_deepep_v2_buffer(
     hidden: int,
     num_topk: int,
 ) -> None:
-    """Initialize the process-global DeepEP V2 ElasticBuffer."""
+    """Initialize or grow the process-global DeepEP V2 ElasticBuffer."""
     global _deepep_v2_buffer
 
     if hidden % 256 != 0:
         raise ValueError(f"DeepEP V2 requires a hidden dimension divisible by 256, got {hidden}.")
     if _deepep_v2_buffer is not None:
-        return
+        if _deepep_v2_buffer.num_max_tokens_per_rank >= num_max_tokens_per_rank:
+            return
+        destroy_deepep_v2_buffer()
 
     _warmup_deepep_v2_group(group)
     # GDAKI allocates num_allocated_qps * num_scaleout_ranks * 2 QPs per rank. The
@@ -439,8 +441,12 @@ class DeepEPV2FusedDispatch(torch.autograd.Function):
             where ``recv_x`` is ``[num_recv_tokens, hidden_size]`` packed per local expert.
         """
         num_topk = token_indices.shape[1]
-        num_max_tokens_per_rank = x.size(0)
         if _deepep_v2_buffer is None:
+            num_max_tokens_per_rank = x.size(0)
+            if torch.distributed.is_initialized() and group.size() > 1:
+                capacity = torch.tensor(num_max_tokens_per_rank, dtype=torch.int64, device=x.device)
+                torch.distributed.all_reduce(capacity, op=torch.distributed.ReduceOp.MAX, group=group)
+                num_max_tokens_per_rank = capacity.item()
             init_deepep_v2_buffer(
                 group,
                 num_max_tokens_per_rank,
@@ -452,7 +458,6 @@ class DeepEPV2FusedDispatch(torch.autograd.Function):
             topk_idx=token_indices,
             topk_weights=token_probs,
             num_experts=num_experts,
-            num_max_tokens_per_rank=num_max_tokens_per_rank,
             num_sms=_deepep_v2_num_sms,
             num_qps=_deepep_v2_num_qps,
             async_with_compute_stream=async_finish,
