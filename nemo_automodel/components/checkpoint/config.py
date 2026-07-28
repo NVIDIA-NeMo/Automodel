@@ -108,6 +108,8 @@ class CheckpointingConfig:
     is_async: bool = False
     wait_for_staging: bool = False  # block on async staging before freeing memory; no effect unless is_async
     cpu_offload: bool = False  # If True, move DCP model and optimizer state dict tensors to CPU before saving.
+    # Permit pickle-based loading of legacy training state. Enable only for checkpoints from a trusted source.
+    allow_legacy_pickle_restore: bool = False
     dequantize_base_checkpoint: bool | None = None
     original_model_root_dir: str | None = None
     skip_task_head_prefixes_for_base_model: list[str] | None = (
@@ -131,6 +133,8 @@ class CheckpointingConfig:
         """Resolve the cache dir, enforce PEFT constraints, and coerce the save format/mode."""
         if self.consolidation_timeout_minutes <= 0:
             raise ValueError("checkpoint.consolidation_timeout_minutes must be greater than 0")
+        if not isinstance(self.allow_legacy_pickle_restore, bool):
+            raise ValueError("checkpoint.allow_legacy_pickle_restore must be a boolean")
 
         if self.model_cache_dir is None:
             self.model_cache_dir = hf_constants.HF_HUB_CACHE

@@ -27,6 +27,7 @@ from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy
 
 from nemo_automodel._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
+from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.flow_matching.pipeline import FlowMatchingPipeline, create_adapter
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
@@ -340,7 +341,7 @@ def build_diffusion_pipeline(
             - Optional: pipeline_cls, load_full_pipeline
         peft_cfg: PeftConfig instance or None. When provided, only LoRA params
             are trained; base weights are frozen and sharded by FSDP2 for memory.
-        model_type: "flux" | "wan" | "hunyuan". Required when peft_cfg is provided.
+        model_type: "flux" | "flux2" | "wan" | "hunyuan" | "ltx2". Required when peft_cfg is provided.
         active_transformer: For two-transformer pipelines (Wan2.2), select which
             transformer to finetune. ``"transformer"`` (default for Wan2.2 = high-noise)
             or ``"transformer_2"`` (low-noise). The unused transformer is dropped
@@ -580,6 +581,7 @@ class TrainDiffusionRecipe(BaseRecipe):
             )
 
         self.cpu_offload = fsdp_cfg.get("cpu_offload", False) if fsdp_cfg else False
+        self.defer_fsdp_grad_sync = fsdp_cfg.get("defer_fsdp_grad_sync", True) if fsdp_cfg else True
 
         # Flow matching configuration
         self.adapter_type = fm_cfg.get("adapter_type", "simple")
@@ -588,6 +590,8 @@ class TrainDiffusionRecipe(BaseRecipe):
         self.logit_std = fm_cfg.get("logit_std", 1.0)
         self.flow_shift = fm_cfg.get("flow_shift", 3.0)
         self.mix_uniform_ratio = fm_cfg.get("mix_uniform_ratio", 0.1)
+        self.beta_alpha = fm_cfg.get("beta_alpha", 2.5)
+        self.beta_beta = fm_cfg.get("beta_beta", 1.5)
         self.use_sigma_noise = fm_cfg.get("use_sigma_noise", True)
         self.sigma_min = fm_cfg.get("sigma_min", 0.0)
         self.sigma_max = fm_cfg.get("sigma_max", 1.0)
@@ -656,7 +660,8 @@ class TrainDiffusionRecipe(BaseRecipe):
         self.model_type = self.cfg.get("model.model_type", None)
         if self.peft_cfg is not None and not self.model_type:
             raise ValueError(
-                "model.model_type must be set when peft config is provided. Options: 'flux', 'flux2', 'wan', 'hunyuan'"
+                "model.model_type must be set when peft config is provided. "
+                "Options: 'flux', 'flux2', 'wan', 'hunyuan', 'ltx2'"
             )
 
         lora_status = (
@@ -841,6 +846,8 @@ class TrainDiffusionRecipe(BaseRecipe):
             logit_mean=self.logit_mean,
             logit_std=self.logit_std,
             mix_uniform_ratio=self.mix_uniform_ratio,
+            beta_alpha=self.beta_alpha,
+            beta_beta=self.beta_beta,
             use_sigma_noise=self.use_sigma_noise,
             sigma_min=self.sigma_min,
             sigma_max=self.sigma_max,
@@ -905,35 +912,42 @@ class TrainDiffusionRecipe(BaseRecipe):
                 prepare_for_grad_accumulation([self.model], pp_enabled=False)
                 num_microbatches = len(batch_group)
                 for microbatch_idx, micro_batch in enumerate(batch_group):
-                    if microbatch_idx == num_microbatches - 1:
+                    is_final_microbatch = microbatch_idx == num_microbatches - 1
+                    if is_final_microbatch:
                         prepare_for_final_backward([self.model], pp_enabled=False)
 
-                    try:
-                        with self._transformer_engine_fp8_context():
-                            _, average_weighted_loss, _, _ = self.flow_matching_pipeline.step(
-                                model=self.model,
-                                batch=micro_batch,
-                                device=self.device,
-                                dtype=self.compute_dtype,
-                                global_step=global_step,
-                                collect_metrics=False,
-                                check_loss=self.check_loss,
-                            )
-                    except Exception as exc:
-                        logging.info(f"[ERROR] Training step failed at epoch {epoch}, step {num_steps}: {exc}")
-                        video_shape = micro_batch.get("video_latents", torch.tensor([])).shape
-                        text_shape = micro_batch.get("text_embeddings", torch.tensor([])).shape
-                        logging.info(f"[DEBUG] Batch shapes - video: {video_shape}, text: {text_shape}")
-                        raise
+                    sync_context = get_sync_ctx(
+                        self.model,
+                        is_final_microbatch,
+                        defer_fsdp_grad_sync=self.defer_fsdp_grad_sync,
+                    )
+                    with sync_context:
+                        try:
+                            with self._transformer_engine_fp8_context():
+                                _, average_weighted_loss, _, _ = self.flow_matching_pipeline.step(
+                                    model=self.model,
+                                    batch=micro_batch,
+                                    device=self.device,
+                                    dtype=self.compute_dtype,
+                                    global_step=global_step,
+                                    collect_metrics=False,
+                                    check_loss=self.check_loss,
+                                )
+                        except Exception as exc:
+                            logging.info(f"[ERROR] Training step failed at epoch {epoch}, step {num_steps}: {exc}")
+                            video_shape = micro_batch.get("video_latents", torch.tensor([])).shape
+                            text_shape = micro_batch.get("text_embeddings", torch.tensor([])).shape
+                            logging.info(f"[DEBUG] Batch shapes - video: {video_shape}, text: {text_shape}")
+                            raise
 
-                    # Use average_weighted_loss for backprop (scalar for gradient accumulation).
-                    # With CP, every peer computes the full-sequence loss on the gathered
-                    # output, so each rank's backward yields a partial gradient (its
-                    # sequence chunk's contribution); FSDP2 then mean-reduces over the
-                    # dp_shard_cp mesh. Scaling the loss by cp_size turns that mean into
-                    # a sum over CP peers and a mean over DP ranks, matching the
-                    # single-GPU gradient (verified numerically against a 1-GPU baseline).
-                    (average_weighted_loss * self.cp_size / num_microbatches).backward()
+                        # Use average_weighted_loss for backprop (scalar for gradient accumulation).
+                        # With CP, every peer computes the full-sequence loss on the gathered
+                        # output, so each rank's backward yields a partial gradient (its
+                        # sequence chunk's contribution); FSDP2 then mean-reduces over the
+                        # dp_shard_cp mesh. Scaling the loss by cp_size turns that mean into
+                        # a sum over CP peers and a mean over DP ranks, matching the
+                        # single-GPU gradient (verified numerically against a 1-GPU baseline).
+                        (average_weighted_loss * self.cp_size / num_microbatches).backward()
                     micro_losses.append(average_weighted_loss.detach())
 
                     if microbatch_idx == 0:

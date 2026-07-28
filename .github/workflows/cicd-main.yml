@@ -81,6 +81,10 @@ jobs:
           uv run --active ruff --version
           uv run --active ruff check --verbose .
           uv run --active ruff format --check --verbose .
+      - name: Reject unsafe PyTorch loads
+        run: |
+          source ./venv/bin/activate
+          uv run --active bandit -r app.py nemo_automodel examples scripts tools tutorials -t B614
 
   import_linting:
     runs-on: ${{ vars.LINT_AND_INSTALL_TEST_RUNNER || 'ubuntu-latest' }}

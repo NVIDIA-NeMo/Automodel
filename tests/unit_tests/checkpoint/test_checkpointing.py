@@ -16,11 +16,13 @@ import io
 import json
 import logging
 import os
+import random
 from contextlib import ExitStack
 from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
+import numpy as np
 import pytest
 import torch
 import torch.distributed.checkpoint as dcp
@@ -47,6 +49,7 @@ from nemo_automodel.components.checkpoint.checkpointing import (
     _ensure_dirs,
     _equally_divide_layers,
     _is_custom_model,
+    _load_hf_bin_checkpoint,
     _model_has_dtensors,
     _new_gloo_process_group,
     _normalize_dtype_mapping_to_state_dict_keys,
@@ -66,10 +69,40 @@ from nemo_automodel.components.checkpoint.utils import (
     has_local_tied_lm_head,
     materialize_missing_tied_lm_head,
 )
+from nemo_automodel.components.training.rng import RNGState, StatefulRNG, init_all_rng
 
 CLOUD_PATH_MODEL = "msc://bucket/step-100/model"
 CLOUD_PATH_OPTIM = "msc://bucket/step-100/optim"
 LOCAL_PATH_MODEL = "/ckpts/step-100/model"
+
+
+def test_load_on_dp_ranks_requires_opt_in_for_legacy_rng_state(tmp_path):
+    """Legacy RNG checkpoints restore only with the trusted-pickle opt-in."""
+    init_all_rng(123)
+    legacy_state = RNGState(
+        random_rng_state=random.getstate(),
+        np_rng_state=np.random.get_state(),
+        torch_rng_state=torch.get_rng_state(),
+        cuda_rng_state=torch.cuda.get_rng_state_all(),
+    )
+    expected = (random.random(), np.random.rand(), torch.rand(1).item())
+    state_dir = tmp_path / "rng"
+    state_dir.mkdir()
+    torch.save(legacy_state, state_dir / "rng_dp_rank_0.pt")
+
+    rng = StatefulRNG(999)
+    restricted = CheckpointingConfig(checkpoint_dir=tmp_path, save_consolidated=False).build(0, 0, 0)
+    with pytest.raises(RuntimeError, match="Refusing to load torch artifact"):
+        restricted.load_on_dp_ranks(rng, "rng", str(tmp_path))
+
+    legacy = CheckpointingConfig(
+        checkpoint_dir=tmp_path,
+        save_consolidated=False,
+        allow_legacy_pickle_restore=True,
+    ).build(0, 0, 0)
+    legacy.load_on_dp_ranks(rng, "rng", str(tmp_path))
+
+    assert (random.random(), np.random.rand(), torch.rand(1).item()) == expected
 
 
 class TestConsolidationProcessGroup:
@@ -1161,6 +1194,27 @@ class TestModelHasDtensors:
         """If all parameters are regular tensors, returns False."""
         model = torch.nn.Sequential(torch.nn.Linear(4, 4), torch.nn.Linear(4, 4))
         assert _model_has_dtensors(model) is False
+
+
+def test_load_hf_bin_checkpoint_loads_tensor_state_dict(tmp_path):
+    """Hugging Face bin checkpoints load when they contain tensor state."""
+    checkpoint_path = tmp_path / "pytorch_model.bin"
+    expected = {"weight": torch.arange(4)}
+    torch.save(expected, checkpoint_path)
+
+    actual = _load_hf_bin_checkpoint(str(checkpoint_path))
+
+    assert actual is not None
+    torch.testing.assert_close(actual["weight"], expected["weight"])
+
+
+def test_load_hf_bin_checkpoint_rejects_pickled_module(tmp_path):
+    """Hugging Face bin loading rejects arbitrary pickled Python objects."""
+    checkpoint_path = tmp_path / "pytorch_model.bin"
+    torch.save(torch.nn.Linear(2, 2), checkpoint_path)
+
+    with pytest.raises(RuntimeError, match="Refusing to load torch artifact"):
+        _load_hf_bin_checkpoint(str(checkpoint_path))
 
 
 # =============================================================================
