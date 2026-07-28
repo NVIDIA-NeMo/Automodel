@@ -750,6 +750,7 @@ class GroupedExpertsDeepEP(nn.Module):
         self.dispatcher_num_sms = dispatcher_num_sms
         self.dispatcher_share_token_dispatcher = dispatcher_share_token_dispatcher
         self.dispatcher_async_dispatch = dispatcher_async_dispatch
+        self.apply_router_weight_after_down = False
 
         # Allocate projection tensor - size depends on whether activation is gated
         # Gated (SwiGLU, Quick-GEGLU): [n_experts, dim, 2*inter_dim]
@@ -845,6 +846,9 @@ class GroupedExpertsDeepEP(nn.Module):
             token_indices=indices,
         )
         permuted_probs = permuted_probs.unsqueeze(-1)
+        activation_probs = (
+            torch.ones_like(permuted_probs) if self.apply_router_weight_after_down else permuted_probs
+        )
 
         # Cast expert weights to the activation dtype so that fp32-stored
         # parameters (e.g. under fp32 master weights) still work with kernels
@@ -876,17 +880,22 @@ class GroupedExpertsDeepEP(nn.Module):
                     # block scale -> nan (seen on gpt-oss). The bias-add stays a bf16
                     # separate add (torchao v0.17.0 has no bias arg). bf16 path unchanged.
                     output1 = _apply_bias(output1, gate_up_proj_bias, tokens_per_expert)
-                    output1 = self.expert_activation(output1, permuted_probs)
+                    output1 = self.expert_activation(output1, activation_probs)
                     output2 = grouped_mm(output1, down_projs, offs)
                     down_bias = self.down_proj_bias.to_local()
-                    output2 = _apply_bias(output2, down_bias, tokens_per_expert, permuted_probs)
+                    output2 = _apply_bias(
+                        output2,
+                        down_bias,
+                        tokens_per_expert,
+                        None if self.apply_router_weight_after_down else permuted_probs,
+                    )
                 else:
                     output2 = _torch_mm_experts_fwd(
                         permuted_local_hidden_states,
                         gate_and_up_projs,
                         down_projs,
                         tokens_per_expert_gpu,
-                        permuted_probs,
+                        activation_probs,
                         self.expert_activation,
                         use_mxfp8=self.use_mxfp8,
                     )
@@ -903,16 +912,26 @@ class GroupedExpertsDeepEP(nn.Module):
                     gate_up_proj_bias = self.gate_up_proj_bias.to_local().to(compute_dtype)
                     output1 = _apply_bias(output1, gate_up_proj_bias, tokens_per_expert)
 
-                output1 = self.expert_activation(output1, permuted_probs)
+                output1 = self.expert_activation(output1, activation_probs)
                 output2 = ops.gmm(output1, down_projs, tokens_per_expert, trans_b=False)
 
                 if self.expert_bias:
                     down_bias = self.down_proj_bias.to_local().to(compute_dtype)
-                    output2 = _apply_bias(output2, down_bias, tokens_per_expert, permuted_probs)
+                    output2 = _apply_bias(
+                        output2,
+                        down_bias,
+                        tokens_per_expert,
+                        None if self.apply_router_weight_after_down else permuted_probs,
+                    )
         else:
             output1 = torch.matmul(x[0] * 0, gate_and_up_projs[0])
-            output1_ = self.expert_activation(output1, permuted_probs)
+            output1_ = self.expert_activation(output1, activation_probs)
             output2 = torch.matmul(output1_, down_projs[0])
+
+        if self.apply_router_weight_after_down:
+            # HybridEP/DeepEP combine expects the expert activation dtype. Keep
+            # the multiply in fp32, then cast each routed expert output back.
+            output2 = (output2.float() * permuted_probs.float()).to(compute_dtype)
 
         y = self.token_dispatcher.token_unpermutation(output2)
         return y

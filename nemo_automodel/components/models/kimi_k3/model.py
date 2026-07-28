@@ -28,6 +28,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
+from nemo_automodel.components.distributed.init_utils import get_world_size_safe
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.packing import get_unpad_data, is_indexed_packed_mask
@@ -49,7 +50,7 @@ from nemo_automodel.components.models.kimi_k3.cp import (
 )
 from nemo_automodel.components.models.kimi_k3.state_dict_adapter import KimiK3StateDictAdapter
 from nemo_automodel.components.moe.config import MoEConfig
-from nemo_automodel.components.moe.experts import GroupedExperts
+from nemo_automodel.components.moe.experts import GroupedExperts, GroupedExpertsDeepEP
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import Gate, MoE
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
@@ -980,6 +981,26 @@ class KimiK3GroupedExperts(GroupedExperts):
         )
 
 
+class KimiK3GroupedExpertsDeepEP(GroupedExpertsDeepEP):
+    """HybridEP/DeepEP grouped experts with K3's SiTU ordering."""
+
+    def __init__(self, config: MoEConfig, backend: BackendConfig, text_config: KimiK3TextConfig) -> None:
+        super().__init__(
+            config,
+            backend=backend,
+            dispatcher_backend=backend.dispatcher,
+            dispatcher_num_sms=backend.dispatcher_num_sms,
+            dispatcher_share_token_dispatcher=backend.dispatcher_share_token_dispatcher,
+            dispatcher_async_dispatch=backend.dispatcher_async_dispatch,
+        )
+        self.apply_router_weight_after_down = True
+        self.expert_activation = partial(
+            _weighted_situ,
+            beta=text_config.activation_situ_beta or 1.0,
+            linear_beta=text_config.activation_situ_linear_beta,
+        )
+
+
 class KimiK3MoE(MoE):
     """K3 routed experts with latent projections and a SiTU shared expert."""
 
@@ -990,7 +1011,10 @@ class KimiK3MoE(MoE):
         self.n_routed_experts = moe_config.n_routed_experts
         self.n_activated_experts = moe_config.n_activated_experts
         self.gate = KimiK3Gate(moe_config, gate_precision=torch.float32)
-        self.experts = KimiK3GroupedExperts(moe_config, backend, config)
+        if backend.dispatcher in ("deepep", "hybridep", "uccl_ep") and get_world_size_safe() > 1:
+            self.experts = KimiK3GroupedExpertsDeepEP(moe_config, backend, config)
+        else:
+            self.experts = KimiK3GroupedExperts(moe_config, backend, config)
         shared_intermediate = config.moe_intermediate_size * (config.num_shared_experts or 0)
         self.shared_experts = (
             KimiK3MLP(config, intermediate_size=shared_intermediate, dtype=moe_config.dtype)
