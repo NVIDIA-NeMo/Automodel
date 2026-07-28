@@ -21,6 +21,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.autograd.graph import saved_tensors_hooks
 from torch.distributed.tensor import DeviceMesh, DTensor, Replicate, Shard, distribute_tensor
+from torch.utils.checkpoint import CheckpointPolicy, checkpoint, create_selective_checkpoint_contexts
 
 from nemo_automodel.components._peft.lora import (
     LinearLoRA,
@@ -223,6 +224,36 @@ def test_memory_efficient_lora_with_residual_matches_legacy_forward_and_backward
     assert torch.allclose(lora_A.grad, lora_A_ref.grad)
     assert torch.allclose(lora_B.grad, lora_B_ref.grad)
     assert torch.allclose(res.grad, res_ref.grad)
+
+
+def test_memory_efficient_lora_with_residual_is_selective_checkpoint_safe():
+    """Selective AC may cache the fallback matmul output before residual addition."""
+    torch.manual_seed(1234)
+    x = torch.randn(5, 16, requires_grad=True)
+    lora_A = torch.randn(4, 16, requires_grad=True)
+    lora_B = torch.randn(12, 4, requires_grad=True)
+    res = torch.randn(5, 12, requires_grad=True)
+
+    def context_fn():
+        def save_every_op(ctx, func, *args, **kwargs):
+            return CheckpointPolicy.MUST_SAVE
+
+        return create_selective_checkpoint_contexts(save_every_op)
+
+    output = checkpoint(
+        lambda x_, lora_A_, lora_B_, res_: apply_memory_efficient_lora(
+            x_, lora_A_, lora_B_, 2.0, False, res_
+        ),
+        x,
+        lora_A,
+        lora_B,
+        res,
+        use_reentrant=False,
+        context_fn=context_fn,
+    )
+    output.sum().backward()
+
+    assert all(tensor.grad is not None for tensor in (x, lora_A, lora_B, res))
 
 
 def test_memory_efficient_lora_saves_less_forward_state():
