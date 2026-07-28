@@ -16,6 +16,9 @@
 
 import functools
 import logging
+import weakref
+from collections.abc import Callable
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 
 import torch
 import torch.nn as nn
@@ -35,7 +38,20 @@ from nemo_automodel.components.moe.layers import (
     MoE,
 )
 from nemo_automodel.components.moe.tp_plan_validation import _validate_moe_tp_plan
+from nemo_automodel.shared.multimodal_fsdp import (
+    MULTIMODAL_TOWER_NAMES,
+    FrozenMultimodalSharding,
+    ignored_params_for_root,
+    iter_multimodal_modules,
+    module_is_fully_frozen,
+    module_parameters,
+    normalize_frozen_multimodal_sharding,
+    shard_multimodal_module,
+)
 from nemo_automodel.shared.tied_weights import ensure_tied_lm_head
+from nemo_automodel.shared.torch_patches import (
+    patch_fsdp_accumulated_grad_guard as _patch_fsdp_accumulated_grad_guard,
+)
 from nemo_automodel.shared.utils import dtype_from_str
 
 logger = logging.getLogger(__name__)
@@ -104,6 +120,50 @@ def _get_moe_module(block: nn.Module) -> MoE | None:
         module = getattr(block, name, None)
         if isinstance(module, MoE):
             return module
+
+
+def _preserve_gate_load_during_recompute(
+    block: nn.Module,
+    context_fn: Callable[[], tuple[AbstractContextManager, AbstractContextManager]] | None = None,
+) -> Callable[[], tuple[AbstractContextManager, AbstractContextManager]] | None:
+    """Keep checkpoint recomputation from accumulating MoE gate load twice.
+
+    Activation checkpointing replays the block during backward. The gate's
+    cumulative expert load is optimizer-step state, so the replay must start
+    from the same state as the original forward without committing its update.
+    """
+    moe = _get_moe_module(block)
+    gate = getattr(moe, "gate", None)
+    if not isinstance(gate, nn.Module) or not hasattr(gate, "_cumulative_expert_load"):
+        return context_fn
+    gate_ref = weakref.ref(gate)
+
+    def checkpoint_context_fn() -> tuple[AbstractContextManager, AbstractContextManager]:
+        forward_context, recompute_context = context_fn() if context_fn is not None else (nullcontext(), nullcontext())
+        gate = gate_ref()
+        preserve_load = gate is not None and gate.training and getattr(gate, "bias_update_factor", 0) > 0
+        current_load = gate._cumulative_expert_load if preserve_load else None
+        load_before_forward = current_load.clone() if current_load is not None else None
+
+        @contextmanager
+        def recompute():
+            gate = gate_ref()
+            if not preserve_load or gate is None:
+                with recompute_context:
+                    yield
+                return
+
+            load_after_forward = gate._cumulative_expert_load
+            gate._cumulative_expert_load = load_before_forward
+            try:
+                with recompute_context:
+                    yield
+            finally:
+                gate._cumulative_expert_load = load_after_forward
+
+        return forward_context, recompute()
+
+    return checkpoint_context_fn
 
 
 def _get_model_moe_config(model: nn.Module):
@@ -269,14 +329,9 @@ def apply_ep(model: nn.Module, ep_mesh: DeviceMesh, moe_mesh: DeviceMesh | None 
             )
 
 
-_MULTIMODAL_TOWER_ATTRS = (
-    "visual",
-    "vision_tower",
-    "vision_model",
-    "vit_model",
-    "audio_tower",
-    "audio_model",
-)
+# Alias of the shared tower taxonomy. Previously a private copy that had drifted
+# from the other multimodal name lists in the tree.
+_MULTIMODAL_TOWER_ATTRS = MULTIMODAL_TOWER_NAMES
 
 
 def _has_trainable_multimodal_tower(model: nn.Module) -> bool:
@@ -377,9 +432,9 @@ def apply_ac(
 
     Args:
         model: The model to apply activation checkpointing to.
-        ignore_router: If True (the default), saves the MoE router output so the dispatch
-            is not recomputed under activation checkpointing (avoids a CheckpointError from
-            non-deterministic re-routing on recompute). If False, a warning is emitted.
+        ignore_router: If True (the default), saves the MoE router projection and top-k
+            outputs so recompute preserves expert assignments (avoids a CheckpointError from
+            non-deterministic re-routing changing dispatch shapes). If False, a warning is emitted.
         hidden_size: Hidden dimension size. If None, derived from model.config.hidden_size.
         num_experts: Number of routed experts. If None, derived from moe_config.n_routed_experts
             first, then falls back to model.config attributes.
@@ -414,7 +469,7 @@ def apply_ac(
             "different number of tokens per expert than the forward pass and crash with "
             "torch.utils.checkpoint.CheckpointError ('Recomputed values ... have different "
             "metadata'). Set ignore_router_for_ac=True (the default) to save the router "
-            "output and keep routing consistent across recompute."
+            "projection and top-k outputs and keep routing consistent across recompute."
         )
 
     if selective:
@@ -428,7 +483,11 @@ def apply_ac(
 
             selective_context_fn = make_selective_checkpoint_context_fn()
             for parent_layers, layer_id, block in _iter_transformer_and_mtp_blocks(model):
-                block = ptd_checkpoint_wrapper(block, preserve_rng_state=True, context_fn=selective_context_fn)
+                block = ptd_checkpoint_wrapper(
+                    block,
+                    preserve_rng_state=True,
+                    context_fn=_preserve_gate_load_during_recompute(block, selective_context_fn),
+                )
                 # Tag so _apply_per_layer_compile compiles the wrapper OUTER (keeping the
                 # selective policy visible to the partitioner) instead of unwrapping and
                 # compiling the block inner, which would collapse selective AC into full
@@ -484,8 +543,10 @@ def apply_ac(
             return len(args) >= 2 and args[1].shape == (num_experts, hidden_size)
         return False
 
+    router_topk = getattr(getattr(torch.ops.aten, "topk", None), "default", None)
+
     def _custom_policy(ctx, func, *args, **kwargs):
-        if _is_router_projection(func, args):
+        if (router_topk is not None and func == router_topk) or _is_router_projection(func, args):
             return CheckpointPolicy.MUST_SAVE
         return CheckpointPolicy.PREFER_RECOMPUTE
 
@@ -521,10 +582,14 @@ def apply_ac(
             block = ptd_checkpoint_wrapper(
                 block,
                 preserve_rng_state=True,
-                context_fn=selective_checkpointing_context_fn,
+                context_fn=_preserve_gate_load_during_recompute(block, selective_checkpointing_context_fn),
             )
         else:
-            block = ptd_checkpoint_wrapper(block, preserve_rng_state=True)
+            block = ptd_checkpoint_wrapper(
+                block,
+                preserve_rng_state=True,
+                context_fn=_preserve_gate_load_during_recompute(block),
+            )
 
         parent_layers.register_module(layer_id, block)
 
@@ -580,8 +645,14 @@ def apply_fsdp(
     reshard_after_forward: bool = False,
     lm_head_precision: str | torch.dtype | None = None,
     wrap_outer_model: bool = True,
-):
+    frozen_multimodal_sharding: FrozenMultimodalSharding = "root",
+) -> None:
     """Apply FSDP wrapping to MoE transformer blocks and model-level modules."""
+    frozen_multimodal_sharding = normalize_frozen_multimodal_sharding(frozen_multimodal_sharding)
+    # MoE normally keeps fully frozen skipped towers with an always-run root,
+    # but trainable multimodal towers still get standalone FSDP units. Install
+    # the same lazy-state guard as dense FSDP for modality-free batches.
+    _patch_fsdp_accumulated_grad_guard()
 
     if isinstance(lm_head_precision, str):
         lm_head_precision = dtype_from_str(lm_head_precision, default=None)
@@ -614,6 +685,39 @@ def apply_fsdp(
         _model = model
     # Prefer nested text modules when present (VLM models)
     _model = get_text_module(_model)
+
+    multimodal_modules: list[tuple[str, nn.Module, set[nn.Parameter], bool]] = []
+    for module_name, module in iter_multimodal_modules(model):
+        module_params = set(module_parameters(module))
+        if module_params:
+            multimodal_modules.append((module_name, module, module_params, module_is_fully_frozen(module)))
+
+    frozen_multimodal_modules = [
+        (module_name, module_params)
+        for module_name, _, module_params, is_fully_frozen in multimodal_modules
+        if is_fully_frozen
+    ]
+    if frozen_multimodal_sharding == "root" and not wrap_outer_model and model is not _model:
+        inner_root_params = set(module_parameters(_model))
+        unowned_module_names = [
+            module_name
+            for module_name, module_params in frozen_multimodal_modules
+            if not module_params.issubset(inner_root_params)
+        ]
+        if unowned_module_names:
+            raise ValueError(
+                "distributed.multimodal.frozen_sharding='root' requires wrap_outer_model=True when fully frozen "
+                f"multimodal modules are outside the inner text FSDP root: {', '.join(unowned_module_names)}. "
+                "Set wrap_outer_model=True, or choose distributed.multimodal.frozen_sharding='per_layer' with "
+                "collective-uniform modality execution, or distributed.multimodal.frozen_sharding='replicate'."
+            )
+    if frozen_multimodal_sharding == "per_layer" and frozen_multimodal_modules:
+        logger.warning(
+            "distributed.multimodal.frozen_sharding='per_layer' selected for %s. Every rank in the FSDP group "
+            "must execute or skip these modules the same number of times and in the same order on every "
+            "microbatch; rank-asymmetric modality execution can hang or desynchronize FSDP collectives.",
+            ", ".join(module_name for module_name, _ in frozen_multimodal_modules),
+        )
 
     # MTP auxiliary-head blocks keep their EP-sharded experts un-resharded
     # (reshard_after_forward=False) even when the backbone reshards. The MTP head is
@@ -714,18 +818,32 @@ def apply_fsdp(
             lm_head_precision,
         )
 
-    # TODO: properly handle all possible multimodal component names
-    if hasattr(model, "audio_tower") and model.audio_tower is not None:
-        if any(param.requires_grad for param in model.audio_tower.parameters()):
-            fully_shard_default(model.audio_tower)
+    ignored_multimodal_params: set[nn.Parameter] = set()
+    for module_name, module, module_params, is_fully_frozen in multimodal_modules:
+        if not is_fully_frozen:
+            # Trainable multimodal modules keep normal standalone sharding; this
+            # policy is intentionally limited to fully frozen modules.
+            #
+            # NOTE: this is wider than pre-#2763, which sharded only top-level
+            # ``audio_tower``/``visual``. Narrowing it back is NOT safe: with
+            # ``wrap_outer_model=False`` a trainable multimodal module on the
+            # outer model would then land in no FSDP unit at all, losing
+            # gradient reduction across DP ranks (covered by
+            # test_apply_fsdp_without_outer_root_allows_supported_multimodal_policies).
+            # ``moe/fsdp_mixin.py::_iter_fsdp_modules`` reuses the same shared
+            # multimodal taxonomy so every unit created here also participates
+            # in the gradient-accumulation sync state machine.
+            fully_shard_default(module)
+        elif frozen_multimodal_sharding == "per_layer":
+            shard_multimodal_module(module, fully_shard_default)
         else:
-            logging.info("Skipping FSDP wrap for frozen audio tower")
-
-    if hasattr(model, "visual") and model.visual is not None:
-        if any(param.requires_grad for param in model.visual.parameters()):
-            fully_shard_default(model.visual)
-        else:
-            logging.info("Skipping FSDP wrap for frozen visual tower")
+            logger.info(
+                "Keeping frozen multimodal module %s at FSDP policy %s",
+                module_name,
+                frozen_multimodal_sharding,
+            )
+            if frozen_multimodal_sharding == "replicate":
+                ignored_multimodal_params.update(module_params)
 
     if tied_embeddings_cross_fsdp_roots and wrap_outer_model and model is not _model:
         logger.info(
@@ -739,11 +857,11 @@ def apply_fsdp(
                 "wrap_outer_model=False cannot preserve that parameter in one FSDP root. "
                 "Use wrap_outer_model=True or untie the embeddings explicitly."
             )
-        fully_shard_default(_model)
+        fully_shard_default(_model, ignored_params=ignored_params_for_root(_model, ignored_multimodal_params))
 
-    # If model has a nested structure (outer model wrapping inner _model), wrap the outer model if requested
+    # If model has a nested structure (outer model wrapping inner _model), wrap the outer model if requested.
     if wrap_outer_model and model is not _model:
-        fully_shard_default(model)
+        fully_shard_default(model, ignored_params=ignored_params_for_root(model, ignored_multimodal_params))
 
 
 def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p2p"):
@@ -851,7 +969,8 @@ def parallelize_model(
     tp_shard_plan: dict[str, ParallelStyle] | str | None = None,
     sequence_parallel: bool = False,
     enable_async_tensor_parallel: bool = False,
-):
+    frozen_multimodal_sharding: FrozenMultimodalSharding = "root",
+) -> None:
     """Apply tensor, context, expert, activation-checkpointing, and FSDP parallelism."""
 
     tp_enabled = tp_axis_name is not None and world_mesh[tp_axis_name].size() > 1
@@ -944,4 +1063,5 @@ def parallelize_model(
             reshard_after_forward=reshard_after_forward,
             lm_head_precision=lm_head_precision,
             wrap_outer_model=wrap_outer_model,
+            frozen_multimodal_sharding=frozen_multimodal_sharding,
         )

@@ -33,6 +33,7 @@ from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm
     _wait_for_hf_reload_rank0,
 )
 from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_vlm import _get_vlm_input_ids
+from tests.functional_tests.checkpoint_robustness.test_checkpoint_vllm_deploy import _tokenize_for_generation
 
 
 @pytest.mark.parametrize(
@@ -155,6 +156,27 @@ def test_get_vlm_input_ids_uses_processor_tokenizer(monkeypatch, offline, expect
         trust_remote_code=True,
         local_files_only=expected_local_files_only,
     )
+
+
+def test_vllm_deploy_tokenization_omits_token_type_ids():
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from tokenizers.pre_tokenizers import Whitespace
+    from transformers import PreTrainedTokenizerFast
+
+    backend = Tokenizer(WordLevel({"[UNK]": 0, "hello": 1, "world": 2}, unk_token="[UNK]"))
+    backend.pre_tokenizer = Whitespace()
+    tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend, unk_token="[UNK]")
+    tokenizer.model_input_names = ["input_ids", "token_type_ids", "attention_mask"]
+
+    default_inputs = tokenizer("hello world", return_tensors="pt")
+    generation_inputs = _tokenize_for_generation(tokenizer, "hello world", torch.device("cpu"))
+
+    assert "token_type_ids" in default_inputs
+    assert set(generation_inputs) == {"input_ids", "attention_mask"}
+    torch.testing.assert_close(generation_inputs["input_ids"], default_inputs["input_ids"])
+    torch.testing.assert_close(generation_inputs["attention_mask"], default_inputs["attention_mask"])
+    assert generation_inputs["input_ids"].device.type == "cpu"
 
 
 def test_extract_custom_args_accepts_hf_source_post_load_dequantize():
