@@ -242,6 +242,9 @@ class Gate(nn.Module):
         self.n_experts = config.n_routed_experts
         self.topk = config.n_activated_experts
         self.softmax_before_topk = config.softmax_before_topk
+        self.router_topk_sorted = config.router_topk_sorted
+        self.router_weights_fp32 = config.router_weights_fp32
+        self.router_weight_uses_score_correction_bias = config.router_weight_uses_score_correction_bias
         self.n_groups = config.n_expert_groups
         self.topk_groups = config.n_limited_groups
         self.score_func = config.score_func
@@ -329,11 +332,11 @@ class Gate(nn.Module):
             if self.softmax_before_topk:
                 scores = scores.softmax(dim=-1, dtype=self.gate_precision or torch.float32)
                 original_scores = scores
-                indices = torch.topk(scores, k=self.topk, dim=-1)[1]
+                indices = torch.topk(scores, k=self.topk, dim=-1, sorted=self.router_topk_sorted)[1]
                 indices = replay_selection(self.router_replay, indices)
                 weights = scores.gather(1, indices)
             else:
-                values, indices = torch.topk(scores, k=self.topk, dim=-1)
+                values, indices = torch.topk(scores, k=self.topk, dim=-1, sorted=self.router_topk_sorted)
                 replayed = replay_selection(self.router_replay, indices)
                 if replayed is not indices:
                     # Replay swapped the selection: re-gather the values for the
@@ -360,11 +363,11 @@ class Gate(nn.Module):
                 scores_for_choice = scores_for_choice.view(x.size(0), self.n_groups, -1)
                 group_scores = scores_for_choice.topk(2, dim=-1)[0].sum(dim=-1)
 
-                group_idx = group_scores.topk(self.topk_groups, dim=-1)[1]
+                group_idx = group_scores.topk(self.topk_groups, dim=-1, sorted=self.router_topk_sorted)[1]
                 mask = torch.zeros_like(scores_for_choice[..., 0]).scatter_(1, group_idx, True)
                 scores_for_choice = (scores_for_choice * mask.unsqueeze(-1)).flatten(1)
 
-            indices = torch.topk(scores_for_choice, self.topk, dim=-1)[1]
+            indices = torch.topk(scores_for_choice, self.topk, dim=-1, sorted=self.router_topk_sorted)[1]
             indices = replay_selection(self.router_replay, indices)
             # Final weights gathered from UNBIASED softmax scores
             weights = original_scores.gather(1, indices)
@@ -376,7 +379,7 @@ class Gate(nn.Module):
             if self.e_score_correction_bias is not None:
                 scores = scores + self.e_score_correction_bias
 
-            indices = torch.topk(scores, self.topk, dim=-1)[1]
+            indices = torch.topk(scores, self.topk, dim=-1, sorted=self.router_topk_sorted)[1]
             indices = replay_selection(self.router_replay, indices)
             weights = original_scores.gather(1, indices)
         elif self.score_func == "sigmoid_with_bias":
@@ -390,14 +393,19 @@ class Gate(nn.Module):
             if self.n_groups > 1:
                 scores_for_choice = scores_for_choice.view(x.size(0), self.n_groups, -1)
                 group_scores = scores_for_choice.topk(2, dim=-1)[0].sum(dim=-1)
-                group_idx = torch.topk(group_scores, k=self.topk_groups, dim=-1, sorted=False)[1]
+                group_idx = torch.topk(
+                    group_scores,
+                    k=self.topk_groups,
+                    dim=-1,
+                    sorted=self.router_topk_sorted,
+                )[1]
                 group_mask = torch.zeros_like(group_scores).scatter_(1, group_idx, 1)
                 score_mask = group_mask.unsqueeze(-1).expand_as(scores_for_choice).reshape(x.size(0), -1)
                 scores_for_choice = scores_for_choice.reshape(x.size(0), -1).masked_fill(
                     ~score_mask.bool(), float("-inf")
                 )
 
-            indices = torch.topk(scores_for_choice, k=self.topk, dim=-1, sorted=False)[1]
+            indices = torch.topk(scores_for_choice, k=self.topk, dim=-1, sorted=self.router_topk_sorted)[1]
             indices = replay_selection(self.router_replay, indices)
             weights = original_scores.gather(1, indices)
         else:
@@ -407,6 +415,8 @@ class Gate(nn.Module):
             # Add correction bias to balance tokens across gates.
             if self.e_score_correction_bias is not None:
                 scores = scores + self.e_score_correction_bias
+                if self.router_weight_uses_score_correction_bias:
+                    original_scores = scores
 
             if self.n_groups > 1:
                 scores = scores.view(x.size(0), self.n_groups, -1)
@@ -415,11 +425,11 @@ class Gate(nn.Module):
                 else:
                     group_scores = scores.topk(2, dim=-1)[0].sum(dim=-1)
 
-                indices = group_scores.topk(self.topk_groups, dim=-1)[1]
+                indices = group_scores.topk(self.topk_groups, dim=-1, sorted=self.router_topk_sorted)[1]
                 mask = torch.zeros_like(scores[..., 0]).scatter_(1, indices, True)
                 scores = (scores * mask.unsqueeze(-1)).flatten(1)
 
-            indices = torch.topk(scores, self.topk, dim=-1)[1]
+            indices = torch.topk(scores, self.topk, dim=-1, sorted=self.router_topk_sorted)[1]
             indices = replay_selection(self.router_replay, indices)
             weights = original_scores.gather(1, indices)
 
@@ -431,7 +441,7 @@ class Gate(nn.Module):
 
         weights = weights * self.route_scale
 
-        if self.gate_precision is not None:
+        if self.gate_precision is not None and not self.router_weights_fp32:
             weights = weights.to(dtype=original_dtype)
             original_scores = original_scores.to(dtype=original_dtype)
 
@@ -458,6 +468,8 @@ class Gate(nn.Module):
         if self._track_load_balance and aux_loss is not None:
             self._last_aux_loss = aux_loss.detach()
 
+        if self.router_weights_fp32:
+            return weights.float(), indices, aux_loss
         return weights.type_as(x), indices, aux_loss
 
     def update_bias(self) -> None:

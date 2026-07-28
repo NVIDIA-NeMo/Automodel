@@ -208,6 +208,105 @@ class TestSwigluClampedDeepEP:
         assert out.shape == (2, 4)
 
 
+class TestGroupedExpertsRouteWeightAfterDown:
+    """Tests for Kimi-style expert output weighting."""
+
+    def _tiny_config(self, *, route_weight_after_down_proj: bool = True, expert_activation: str = "swiglu"):
+        return MoEConfig(
+            n_routed_experts=2,
+            n_shared_experts=0,
+            n_activated_experts=2,
+            n_expert_groups=1,
+            n_limited_groups=1,
+            train_gate=True,
+            gate_bias_update_factor=0.0,
+            aux_loss_coeff=0.0,
+            score_func="sigmoid",
+            route_scale=1.0,
+            dim=2,
+            inter_dim=4,
+            moe_inter_dim=2,
+            norm_topk_prob=False,
+            router_bias=False,
+            expert_bias=True,
+            expert_activation=expert_activation,
+            route_weight_after_down_proj=route_weight_after_down_proj,
+            dtype=torch.float32,
+        )
+
+    def test_loop_matches_reference_weight_after_down_projection(self):
+        config = self._tiny_config()
+        experts = GroupedExperts(config)
+        with torch.no_grad():
+            experts.gate_and_up_projs.copy_(
+                torch.tensor(
+                    [
+                        [[1.0, 0.0, 0.5, 0.0], [0.0, 1.0, 0.0, 0.5]],
+                        [[0.25, -0.5, 1.0, 0.25], [0.75, 0.5, -0.25, 1.0]],
+                    ]
+                )
+            )
+            experts.down_projs.copy_(
+                torch.tensor(
+                    [
+                        [[1.0, 0.5], [-0.25, 0.75]],
+                        [[0.5, -1.0], [1.25, 0.25]],
+                    ]
+                )
+            )
+            experts.gate_up_proj_bias.copy_(torch.tensor([[0.1, -0.2, 0.3, -0.4], [0.2, 0.1, -0.1, 0.4]]))
+            experts.down_proj_bias.copy_(torch.tensor([[0.05, -0.1], [-0.2, 0.15]]))
+
+        x = torch.tensor([[1.0, -2.0], [0.5, 1.5], [-1.0, 0.25]])
+        weights = torch.tensor([[0.2, 0.7], [0.4, 0.3], [0.9, 0.1]])
+        indices = torch.tensor([[0, 1], [1, 0], [0, 1]])
+        token_mask = torch.ones(x.shape[0], dtype=torch.bool)
+
+        output = experts(x, token_mask, weights, indices)
+
+        expected = torch.zeros_like(x)
+        for token_idx in range(x.shape[0]):
+            for top_idx in range(indices.shape[1]):
+                expert_idx = indices[token_idx, top_idx]
+                gate_up = x[token_idx : token_idx + 1] @ experts.gate_and_up_projs[expert_idx]
+                gate_up = gate_up + experts.gate_up_proj_bias[expert_idx]
+                gate, up = torch.chunk(gate_up, 2, dim=-1)
+                expert_out = torch.nn.functional.silu(gate) * up
+                expert_out = expert_out @ experts.down_projs[expert_idx]
+                expert_out = expert_out + experts.down_proj_bias[expert_idx]
+                expected[token_idx] += expert_out.squeeze(0) * weights[token_idx, top_idx]
+
+        torch.testing.assert_close(output, expected)
+
+    def test_default_down_bias_stays_weighted_by_route(self):
+        config = self._tiny_config(route_weight_after_down_proj=False)
+        experts = GroupedExperts(config)
+        with torch.no_grad():
+            experts.gate_and_up_projs.zero_()
+            experts.down_projs.zero_()
+            experts.gate_up_proj_bias.zero_()
+            experts.down_proj_bias.copy_(torch.tensor([[1.0, -2.0], [3.0, 4.0]]))
+
+        x = torch.tensor([[0.5, -1.0], [1.5, 2.0]])
+        weights = torch.tensor([[0.2, 0.7], [0.4, 0.3]])
+        indices = torch.tensor([[0, 1], [1, 0]])
+        token_mask = torch.ones(x.shape[0], dtype=torch.bool)
+
+        output = experts(x, token_mask, weights, indices)
+
+        expected = torch.stack(
+            [
+                experts.down_proj_bias[0] * weights[0, 0] + experts.down_proj_bias[1] * weights[0, 1],
+                experts.down_proj_bias[1] * weights[1, 0] + experts.down_proj_bias[0] * weights[1, 1],
+            ]
+        )
+        torch.testing.assert_close(output, expected)
+
+    def test_route_weight_after_down_projection_requires_swiglu(self):
+        with pytest.raises(ValueError, match="supports only swiglu"):
+            GroupedExperts(self._tiny_config(expert_activation="relu2"))
+
+
 class TestGroupedExpertsZeroActiveExperts:
     """Test GroupedExperts handling of zero active local experts.
 
@@ -727,6 +826,13 @@ class TestGroupedExpertsForwardLoopDTensorBias:
 class TestGroupedExpertsDeepEP:
     """Test GroupedExpertsDeepEP module."""
 
+    def test_grouped_experts_deepep_rejects_route_weight_after_down_projection(self, moe_config):
+        """DeepEP must fail loudly until it implements post-down-projection route weights."""
+        moe_config.route_weight_after_down_proj = True
+
+        with pytest.raises(ValueError, match="GroupedExpertsDeepEP"):
+            GroupedExpertsDeepEP(moe_config)
+
     def test_grouped_experts_deepep_init(self, moe_config):
         """Test GroupedExpertsDeepEP initialization."""
         experts = GroupedExpertsDeepEP(moe_config)
@@ -1036,6 +1142,16 @@ class TestNonGatedActivations:
             swiglu_config.dim,
             swiglu_config.moe_inter_dim * 2,
         )
+
+
+def test_grouped_experts_te_rejects_route_weight_after_down_projection_without_te_import(moe_config):
+    """TE must fail loudly before importing optional TE when route weights would be applied incorrectly."""
+    from nemo_automodel.components.moe.experts import GroupedExpertsTE
+
+    moe_config.route_weight_after_down_proj = True
+
+    with pytest.raises(ValueError, match="GroupedExpertsTE"):
+        GroupedExpertsTE(moe_config)
 
 
 @pytest.mark.skipif(SKIP_TE_TESTS, reason="TransformerEngine and CUDA required")
