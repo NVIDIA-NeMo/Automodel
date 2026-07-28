@@ -206,6 +206,17 @@ class TestDenseTextBackbone:
         assert hasattr(backbone.layers["1"], "linear_attn")
         assert hasattr(backbone.layers["1"].linear_attn, "_fp32_params")
 
+    def test_init_weights_resets_linear_attention_norm_weight(self):
+        cfg = _tiny_config(layer_types=("linear_attention",))
+        backbone = Qwen3_5DenseTextBackbone(cfg, _backend())
+        block = backbone.layers["0"]
+        nn.init.zeros_(block.linear_attn.norm.weight)
+
+        with torch.no_grad():
+            block.init_weights(torch.device("cpu"))
+
+        torch.testing.assert_close(block.linear_attn.norm.weight, torch.ones_like(block.linear_attn.norm.weight))
+
     def test_forward_shape_full_attention(self):
         cfg = _tiny_config(layer_types=("full_attention",))
         backbone = Qwen3_5DenseTextBackbone(cfg, _backend())
