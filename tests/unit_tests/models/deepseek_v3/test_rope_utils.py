@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import math
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -21,9 +22,49 @@ from nemo_automodel.components.models.deepseek_v3.rope_utils import (
     apply_rotary_emb,
     apply_rotary_emb_qk,
     freqs_cis_from_position_ids,
+    mla_softmax_scale,
     precompute_freqs_cis,
     yarn_get_mscale,
 )
+
+
+class TestMlaSoftmaxScale:
+    """Tests for the shared MLA softmax scale (base scale + YaRN mscale correction)."""
+
+    @staticmethod
+    def _config(rope_parameters, max_position_embeddings=4096):
+        return SimpleNamespace(rope_parameters=rope_parameters, max_position_embeddings=max_position_embeddings)
+
+    def test_plain_scale_without_rope_parameters(self):
+        assert mla_softmax_scale(self._config(None), 64) == pytest.approx(64**-0.5)
+
+    def test_plain_scale_for_a_default_rope(self):
+        config = self._config({"rope_theta": 10000.0, "rope_type": "default"})
+        assert mla_softmax_scale(config, 64) == pytest.approx(64**-0.5)
+
+    def test_yarn_spec_applies_mscale_squared(self):
+        config = self._config(
+            {"factor": 4.0, "mscale": 1.0, "original_max_position_embeddings": 1024},
+            max_position_embeddings=4096,
+        )
+        mscale = yarn_get_mscale(4.0, 1.0)
+        assert mla_softmax_scale(config, 64) == pytest.approx(64**-0.5 * mscale * mscale)
+
+    def test_mscale_is_uncorrected_within_the_original_window(self):
+        """Inside the original context the raw mscale is used, not the log-scaled one."""
+        config = self._config(
+            {"factor": 4.0, "mscale": 2.0, "original_max_position_embeddings": 4096},
+            max_position_embeddings=4096,
+        )
+        assert mla_softmax_scale(config, 64) == pytest.approx(64**-0.5 * 4.0)
+
+    def test_falls_back_to_rope_scaling_on_older_configs(self):
+        config = SimpleNamespace(
+            rope_scaling={"factor": 4.0, "mscale": 1.0, "original_max_position_embeddings": 1024},
+            max_position_embeddings=4096,
+        )
+        mscale = yarn_get_mscale(4.0, 1.0)
+        assert mla_softmax_scale(config, 64) == pytest.approx(64**-0.5 * mscale * mscale)
 
 
 class TestYarnGetMscale:
@@ -331,11 +372,13 @@ class TestFreqsCisFromPositionIds:
         seq_len = 4
         head_dim = 32
 
-        position_ids = torch.tensor([
-            [0, 1, 2, 3],      # Sequential
-            [0, 0, 1, 1],      # Repeated
-            [10, 20, 30, 40],  # Large gaps
-        ])
+        position_ids = torch.tensor(
+            [
+                [0, 1, 2, 3],  # Sequential
+                [0, 0, 1, 1],  # Repeated
+                [10, 20, 30, 40],  # Large gaps
+            ]
+        )
         freqs = torch.randn(head_dim // 2)
 
         freqs_cis = freqs_cis_from_position_ids(position_ids, freqs)
@@ -403,10 +446,7 @@ class TestFreqsCisWithContextParallel:
             if len(indices) > 1:
                 # All tokens at this position should have identical freqs_cis
                 for i in range(1, len(indices)):
-                    torch.testing.assert_close(
-                        freqs_cis_rank[0, indices[0]],
-                        freqs_cis_rank[0, indices[i]]
-                    )
+                    torch.testing.assert_close(freqs_cis_rank[0, indices[0]], freqs_cis_rank[0, indices[i]])
 
     def test_freqs_cis_cp_with_variable_sequence_lengths(self):
         """Test freqs_cis with variable-length sequences and CP splitting"""
@@ -523,9 +563,7 @@ class TestIntegration:
 
         # Packed sequences: 3 sequences of lengths [3, 4, 5]
         # Position IDs restart for each sequence
-        position_ids = torch.tensor([
-            [0, 1, 2, 0, 1, 2, 3, 0, 1, 2, 3, 4]
-        ])
+        position_ids = torch.tensor([[0, 1, 2, 0, 1, 2, 3, 0, 1, 2, 3, 4]])
 
         # Precompute frequencies
         freqs = precompute_freqs_cis(head_dim, max_seq_len, rope_theta, rope_scaling=None)
@@ -694,9 +732,7 @@ class TestFreqsCisFromPositionIdsFusedRope:
         position_ids = torch.arange(seq_len).unsqueeze(0).expand(batch_size, seq_len)
         freqs = torch.randn(head_dim // 2)
 
-        freqs_cis = freqs_cis_from_position_ids(
-            position_ids, freqs, qkv_format="bshd", for_fused_rope=False
-        )
+        freqs_cis = freqs_cis_from_position_ids(position_ids, freqs, qkv_format="bshd", for_fused_rope=False)
 
         # Non-fused should return complex exponentials with shape (B, T, D/2)
         assert freqs_cis.shape == (batch_size, seq_len, head_dim // 2)
@@ -711,9 +747,7 @@ class TestFreqsCisFromPositionIdsFusedRope:
         position_ids = torch.arange(seq_len).unsqueeze(0).expand(batch_size, seq_len)
         freqs = torch.randn(head_dim // 2)
 
-        freqs_cis = freqs_cis_from_position_ids(
-            position_ids, freqs, qkv_format="bshd", for_fused_rope=True
-        )
+        freqs_cis = freqs_cis_from_position_ids(position_ids, freqs, qkv_format="bshd", for_fused_rope=True)
 
         # Fused rope expects shape (T, 1, 1, D) where D = head_dim (angles duplicated)
         assert freqs_cis.shape == (seq_len, 1, 1, head_dim)
@@ -727,9 +761,7 @@ class TestFreqsCisFromPositionIdsFusedRope:
         position_ids = torch.arange(seq_len)
         freqs = torch.randn(head_dim // 2)
 
-        freqs_cis = freqs_cis_from_position_ids(
-            position_ids, freqs, qkv_format="thd", for_fused_rope=False
-        )
+        freqs_cis = freqs_cis_from_position_ids(position_ids, freqs, qkv_format="thd", for_fused_rope=False)
 
         # Non-fused thd should return complex exponentials with shape (T, D/2)
         assert freqs_cis.shape == (seq_len, head_dim // 2)
@@ -743,9 +775,7 @@ class TestFreqsCisFromPositionIdsFusedRope:
         position_ids = torch.arange(seq_len)
         freqs = torch.randn(head_dim // 2)
 
-        freqs_cis = freqs_cis_from_position_ids(
-            position_ids, freqs, qkv_format="thd", for_fused_rope=True
-        )
+        freqs_cis = freqs_cis_from_position_ids(position_ids, freqs, qkv_format="thd", for_fused_rope=True)
 
         # Fused rope with thd expects shape (T, 1, 1, D) where D = head_dim
         assert freqs_cis.shape == (seq_len, 1, 1, head_dim)
@@ -759,9 +789,7 @@ class TestFreqsCisFromPositionIdsFusedRope:
         position_ids = torch.arange(seq_len).unsqueeze(0)
         freqs = torch.ones(head_dim // 2) * 0.1
 
-        freqs_cis = freqs_cis_from_position_ids(
-            position_ids, freqs, qkv_format="bshd", for_fused_rope=True
-        )
+        freqs_cis = freqs_cis_from_position_ids(position_ids, freqs, qkv_format="bshd", for_fused_rope=True)
 
         # Shape should be (T, 1, 1, head_dim)
         assert freqs_cis.shape == (seq_len, 1, 1, head_dim)
@@ -769,7 +797,7 @@ class TestFreqsCisFromPositionIdsFusedRope:
         # Angles should be interleaved: [a0, a0, a1, a1, a2, a2, ...]
         # Even indices and odd indices should be equal (each angle is duplicated consecutively)
         even_indices = freqs_cis[:, 0, 0, 0::2]  # a0, a1, a2, ...
-        odd_indices = freqs_cis[:, 0, 0, 1::2]   # a0, a1, a2, ...
+        odd_indices = freqs_cis[:, 0, 0, 1::2]  # a0, a1, a2, ...
         torch.testing.assert_close(even_indices, odd_indices)
 
     def test_fused_thd_uses_sequential_positions(self):
@@ -781,9 +809,7 @@ class TestFreqsCisFromPositionIdsFusedRope:
         position_ids = torch.tensor([0, 1, 0, 1, 2, 0, 1, 2])
         freqs = torch.ones(head_dim // 2) * 0.1
 
-        freqs_cis = freqs_cis_from_position_ids(
-            position_ids, freqs, qkv_format="thd", for_fused_rope=True
-        )
+        freqs_cis = freqs_cis_from_position_ids(position_ids, freqs, qkv_format="thd", for_fused_rope=True)
 
         # Shape should be (T, 1, 1, head_dim)
         assert freqs_cis.shape == (seq_len, 1, 1, head_dim)
@@ -807,9 +833,7 @@ class TestFreqsCisFromPositionIdsFusedRope:
         position_ids = torch.tensor([0, 1, 0, 1, 2, 0, 1, 2])
         freqs = torch.ones(head_dim // 2) * 0.1
 
-        freqs_cis = freqs_cis_from_position_ids(
-            position_ids, freqs, qkv_format="thd", for_fused_rope=False
-        )
+        freqs_cis = freqs_cis_from_position_ids(position_ids, freqs, qkv_format="thd", for_fused_rope=False)
 
         # Shape should be (T, D/2) for non-fused thd
         assert freqs_cis.shape == (seq_len, head_dim // 2)
@@ -832,9 +856,7 @@ class TestFreqsCisFromPositionIdsFusedRope:
         position_ids = torch.arange(seq_len).unsqueeze(0).expand(batch_size, seq_len)
         freqs = torch.randn(head_dim // 2)
 
-        freqs_cis = freqs_cis_from_position_ids(
-            position_ids, freqs, qkv_format="bshd", for_fused_rope=False
-        )
+        freqs_cis = freqs_cis_from_position_ids(position_ids, freqs, qkv_format="bshd", for_fused_rope=False)
 
         # All complex numbers should have magnitude 1
         magnitudes = torch.abs(freqs_cis)

@@ -24,6 +24,35 @@ def yarn_get_mscale(scale=1, mscale=1):
     return 0.1 * mscale * math.log(scale) + 1.0
 
 
+def mla_softmax_scale(config, qk_head_dim: int) -> float:
+    """MLA attention scale ``qk_head_dim ** -0.5``, with the YaRN ``mscale`` correction.
+
+    When the rotary parameters carry a full YaRN spec (``factor`` / ``mscale`` /
+    ``original_max_position_embeddings``) and the context was extended past the original
+    window, the scale is multiplied by ``mscale ** 2`` -- the DeepSeek-V3 MLA convention
+    that GLM-5.2 inherits. Shared so a draft model trained on a target's hidden states
+    cannot drift from the target's attention temperature.
+
+    Args:
+        config: Model config exposing ``rope_parameters`` (or the older ``rope_scaling``)
+            and ``max_position_embeddings``.
+        qk_head_dim: Query/key head dimension the scale is derived from.
+
+    Returns:
+        The softmax scale to pass to the attention kernel.
+    """
+    scale = float(qk_head_dim**-0.5)
+    rope_parameters = config.rope_parameters if hasattr(config, "rope_parameters") else config.rope_scaling
+    if not rope_parameters or not all(
+        key in rope_parameters for key in ("factor", "mscale", "original_max_position_embeddings")
+    ):
+        return scale
+    mscale = rope_parameters["mscale"]
+    if config.max_position_embeddings > rope_parameters["original_max_position_embeddings"]:
+        mscale = yarn_get_mscale(rope_parameters["factor"], mscale)
+    return scale * mscale * mscale
+
+
 def precompute_freqs_cis(
     qk_rope_head_dim: int,
     max_seq_len: int,
