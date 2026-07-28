@@ -193,6 +193,9 @@ def _mp_policy_with_param_dtype(
     if param_dtype == torch.float32:
         object.__setattr__(mp_policy_copy, "reduce_dtype", torch.float32)
         object.__setattr__(mp_policy_copy, "output_dtype", torch.float32)
+        # FP32 compute modules own any required input cast. Casting at the nested
+        # FSDP boundary changes the module-visible input dtype and can make an
+        # activation-checkpoint recompute disagree with the original forward.
         object.__setattr__(mp_policy_copy, "cast_forward_inputs", False)
     return mp_policy_copy
 
@@ -294,7 +297,9 @@ def fully_shard_by_dtype(
     Args:
         fp32_compute_module_names: Parameter/buffer name substrings that must compute in
             fp32 (e.g. ``("_fp32_params",)`` for Qwen3.5's GatedDeltaNet fp32 holder).
-            Sourced from the model's ``_keep_in_fp32_modules_strict``.
+            Sourced from the model's ``_keep_in_fp32_modules_strict``. Matched callable
+            modules must cast their own inputs when required; their nested FP32 FSDP
+            units preserve the parent activation dtype at the module boundary.
         reshard_after_forward: Optional FSDP2 reshard override for this module.
             ``None`` leaves the caller's default FSDP2 behavior unchanged.
         ignored_params: Parameters already owned by another FSDP or parallelism

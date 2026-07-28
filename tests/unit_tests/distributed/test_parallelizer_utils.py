@@ -613,7 +613,7 @@ def test_fully_shard_by_dtype_excludes_ep_params_and_uses_custom_sharder():
 
 
 def test_fully_shard_by_dtype_fp32_holder_uses_full_fp32_policy():
-    """Callable fp32 holders keep fp32 inputs, reductions, and outputs under FSDP."""
+    """Callable fp32 holders keep fp32 parameters, reductions, and outputs under FSDP."""
 
     class Fp32Holder(nn.Module):
         def __init__(self):
