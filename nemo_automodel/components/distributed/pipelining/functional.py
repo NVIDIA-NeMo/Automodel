@@ -328,10 +328,17 @@ def _precompute_stage_shapes(
         microbatch_size: Microbatch size used by the pipeline schedule.
         seq_len: Sequence length of the input data.
     """
-    if stages and not hasattr(stages[0], "_configure_outputs_meta"):
-        logger.info(
-            "PipelineStage no longer exposes _configure_outputs_meta; using PyTorch's dynamic stage metadata inference"
-        )
+    # Bail out only when the stage exposes neither metadata API ``_set_stage_metas``
+    # can drive. PyTorch 2.13 dropped ``_configure_outputs_meta`` in favor of
+    # ``_user_meta``; probing for the old name alone would skip the precompute on
+    # every 2.13 run and hand every step back to PyTorch's serial O(num_stages)
+    # P2P shape inference, which this function exists to eliminate.
+    first_stage = stages[0] if stages else None
+    if first_stage is not None and not (
+        callable(getattr(first_stage, "_configure_outputs_meta", None))
+        or getattr(first_stage, "_user_meta", None) is not None
+    ):
+        logger.info("PipelineStage exposes no supported metadata API; using PyTorch's dynamic stage metadata inference")
         return
 
     hidden_size, vocab_size = _get_hidden_and_vocab_size(model_config)
