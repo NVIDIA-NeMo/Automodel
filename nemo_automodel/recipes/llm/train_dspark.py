@@ -512,8 +512,8 @@ class TrainDSparkRecipe(BaseRecipe):
         # target forward along the sequence and gather the captured hidden states
         # back to the full sequence, so the draft's anchor/block masks stay intact.
         # Restricted to the dense Qwen3-style target -- the DeepSeek V4 / GLM-5.2 /
-        # Gemma4 / MiniMax M3 targets already run under their own expert-parallel /
-        # FSDP mesh, which CP is not composed with here.
+        # Gemma4 / MiniMax M3 / Kimi K3 targets already run under their own
+        # expert-parallel / FSDP mesh, which CP is not composed with here.
         cp_size = int(self.cfg.get("distributed.cp_size", 1) or 1)
         if cp_size > 1:
             if (
@@ -525,9 +525,8 @@ class TrainDSparkRecipe(BaseRecipe):
             ):
                 raise NotImplementedError(
                     "Context parallelism (cp_size>1) is only supported for the dense Qwen3-style DSpark "
-                    "target; the DeepSeek V4 / GLM-5.2 / Gemma4 / MiniMax M3 targets already run under "
-                    "their own expert-parallel / FSDP mesh. Kimi K3 uses the same restriction. "
-                    "Set cp_size=1 for those."
+                    "target; the DeepSeek V4 / GLM-5.2 / Gemma4 / MiniMax M3 / Kimi K3 targets already "
+                    "run under their own expert-parallel / FSDP mesh. Set cp_size=1 for those."
                 )
             # The CP hook intercepts the target's F.scaled_dot_product_attention call, so
             # the target must run HuggingFace SDPA: force_hf picks the HF class and
@@ -862,9 +861,9 @@ class TrainDSparkRecipe(BaseRecipe):
                     self.cached_target_path,
                 )
 
-        # The Qwen3 / Gemma4 drafts consume a flex_attention BlockMask during training.
-        # The DeepSeek V4 and GLM-5.2 drafts instead consume a dense additive mask
-        # (the DFlash SDPA path), so they are exempt from the flex_attention requirement.
+        # The Qwen3 / Gemma4 / MiniMax M3 drafts consume a flex_attention BlockMask during
+        # training. The DeepSeek V4, GLM-5.2, and Kimi K3 drafts instead consume a dense
+        # additive mask (the DFlash SDPA path), so they are exempt from the requirement.
         attention_backend = recipe_cfg.get("attention_backend", "flex_attention")
         if (
             not (is_deepseek_v4_target or is_glm_5_2_target or is_kimi_k3_target)
@@ -875,7 +874,7 @@ class TrainDSparkRecipe(BaseRecipe):
         markov_rank = int(recipe_cfg.get("markov_rank", 256))
 
         if is_deepseek_v4_target or is_glm_5_2_target or is_gemma4_target or is_minimax_m3_target or is_kimi_k3_target:
-            # Gemma4, DeepSeek V4, GLM-5.2, and MiniMax M3 drafts share one typed
+            # Gemma4, DeepSeek V4, GLM-5.2, MiniMax M3, and Kimi K3 drafts share one typed
             # draft-config builder that takes the same DSpark model-args bundle.
             margs = _DraftArgs(
                 num_draft_layers=draft_num_hidden_layers,

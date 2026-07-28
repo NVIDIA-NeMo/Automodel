@@ -29,9 +29,11 @@ distributed:
     wrap_outer_model: false
 
 recipe_args:
-  target_model_name_or_path: /llm-align/liuchonghan/models/Kimi-K3
-  train_data_path: /llm-align/liuchonghan/datasets/frankleeeee/PerfectBlend-Regenerated-Llama-3.1-8B-Instruct/messages
-  output_dir: /llm-align/liuchonghan/runs/kimi-k3-dspark
+  target_model_name_or_path: moonshotai/Kimi-K3
+  # Or a local checkout of the same checkpoint:
+  # target_model_name_or_path: /path/to/Kimi-K3
+  train_data_path: /path/to/open-perfectblend-direct-clean   # <-- messages-format SFT data
+  output_dir: ./outputs/dspark_kimi_k3_perfectblend
   seq_length: 4096
   micro_batch_size: 1
   grad_accumulation_steps: 8
@@ -47,6 +49,8 @@ recipe_args:
   target_layer_ids: [90, 91, 92]
   freeze_embeddings: true
 
+  # Frozen-target backend knobs; these repeat build_kimi_k3_backend's defaults and are
+  # spelled out here because they are the fields most often retuned per cluster.
   target_attn_backend: eager
   target_dispatcher: hybridep
   target_experts: torch_mm
@@ -74,7 +78,7 @@ optimizer:
 
 checkpoint:
   enabled: true
-  checkpoint_dir: /llm-align/liuchonghan/runs/kimi-k3-dspark/checkpoints
+  checkpoint_dir: ./outputs/dspark_kimi_k3_perfectblend/checkpoints
   model_save_format: safetensors
   save_consolidated: final
   dequantize_base_checkpoint: true

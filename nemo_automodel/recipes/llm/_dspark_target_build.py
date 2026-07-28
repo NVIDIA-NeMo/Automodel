@@ -14,8 +14,8 @@
 
 """Shared builders for the large expert-parallel / FSDP DSpark targets.
 
-DeepSeek V4 and GLM-5.2 targets are too large to load on a single 8x80GB node, so
-both the online training recipe (``train_dspark.py``) and the distributed offline
+DeepSeek V4, GLM-5.2, and Kimi K3 targets are too large to load on a single 8x80GB
+node, so both the online training recipe (``train_dspark.py``) and the distributed offline
 precompute (``precompute_dspark_dist.py``) load them frozen through the same
 expert-parallel / FSDP distributed path: ``create_distributed_setup_from_config``
 builds the ``device_mesh`` + ``moe_mesh`` from the recipe's ``distributed:`` block
@@ -47,7 +47,7 @@ logger = logging.getLogger(__name__)
 def gather_full_weight_module(module):
     """Return an object exposing a full (non-DTensor) ``.weight`` tensor.
 
-    The expert-parallel / FSDP-sharded DeepSeek V4 / GLM-5.2 targets store
+    The expert-parallel / FSDP-sharded DeepSeek V4 / GLM-5.2 / Kimi K3 targets store
     ``embed_tokens`` and ``lm_head`` weights as DTensors, while a draft (or the
     offline cache) wants plain tensors. Gather the sharded weight to a full tensor
     first (an all-gather, so every rank must call this in lockstep); non-sharded
@@ -271,7 +271,22 @@ def build_glm_5_2_target(
 
 
 def build_kimi_k3_backend(recipe_cfg) -> BackendConfig:
-    """Build the backend used by the frozen expert-parallel Kimi K3 target."""
+    """Build the backend used by the frozen expert-parallel Kimi K3 target.
+
+    Mirrors :func:`build_glm_5_2_backend`: the hybrid-EP token dispatcher shards the
+    routed experts and the HF state-dict adapter maps (and dequantizes, when the base
+    checkpoint is FP8) the HF weights on load. ``target_experts`` defaults to
+    ``torch_mm`` (like the V4 and GLM DSpark backends) because ``gmm`` needs the
+    optional ``grouped_gemm`` package, which the current AutoModel image does not ship.
+
+    Two fields differ from the GLM backend by design:
+
+    - ``attn`` defaults to ``eager`` and is inert for this target: ``KimiK3ForCausalLM``
+      never reads ``backend.attn`` (its MLA and KDA layers each have a fixed attention
+      path), so the field only records that no fused-kernel build is required.
+    - no ``gate_precision`` override is passed, because ``KimiK3ForCausalLM`` already
+      defaults ``backend.gate_precision`` to ``torch.float32`` itself.
+    """
     return BackendConfig(
         attn=str(recipe_cfg.get("target_attn_backend", "eager")),
         linear="torch",
@@ -294,7 +309,23 @@ def build_kimi_k3_target(
     recipe_cfg,
     trust_remote_code: bool,
 ):
-    """Load Kimi K3 as a frozen expert-parallel target for online DSpark training."""
+    """Load Kimi K3 as a frozen, expert-parallel / FSDP target for online DSpark training.
+
+    Mirrors :func:`build_glm_5_2_target`: an expert-parallel / FSDP distributed setup
+    (derived from ``cfg``'s ``distributed`` block) shards the routed experts across
+    ranks, and the model is built with ``from_config`` + ``load_base_model=True`` so the
+    ``target_num_hidden_layers`` reduction survives (``from_pretrained`` would re-read
+    the checkpoint's own config and rebuild the full-depth target, which OOMs on one
+    node). Unlike GLM, the config may be the multimodal ``kimi_k3`` wrapper, so the text
+    sub-config is unwrapped and re-tagged as ``KimiK3ForCausalLM``: DSpark captures
+    hidden states from the text backbone only.
+
+    The forward-hook hidden-state capture needs one non-pipelined ``model(...)`` call,
+    so ``pp_size`` must be 1 in the recipe's ``distributed:`` block; use a larger
+    ``ep_size`` instead of PP to shard the parameter memory.
+
+    Returns ``(text_config, target_model, distributed_setup)``.
+    """
     if device.type != "cuda":
         raise RuntimeError(
             "Kimi K3 DSpark target requires CUDA: the target is loaded with the "

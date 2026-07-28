@@ -155,8 +155,9 @@ def _build_target(
 ):
     """Build the frozen target for capture, dispatching on model type.
 
-    DeepSeek V4 / GLM-5.2 load through the sharded EP/FSDP path; other single-process
-    text targets (Qwen3, Gemma4) load replicated for data-parallel throughput.
+    DeepSeek V4 / GLM-5.2 / Kimi K3 load through the sharded EP/FSDP path; other
+    single-process text targets (Qwen3, Gemma4) load replicated for data-parallel
+    throughput.
     Returns ``(target_config, target_model)``.
     """
     if model_type in _MINIMAX_M3_MODEL_TYPES:

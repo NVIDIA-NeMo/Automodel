@@ -27,7 +27,12 @@ from nemo_automodel.components.speculative.dspark.markov_head import build_marko
 
 
 class KimiK3DSparkAttention(nn.Module):
-    """Dense non-causal K3 MLA over target context and a parallel noise block."""
+    """Dense non-causal K3 MLA over target context and a parallel noise block.
+
+    K3 MLA keeps one K/V per query head (``num_key_value_heads == num_attention_heads``),
+    like GLM-5.2's MLA, so there is no GQA group repeat: ``kv_b_proj`` already emits one
+    ``qk_nope_head_dim + v_head_dim`` slice per query head.
+    """
 
     def __init__(self, config, layer_idx: int):
         super().__init__()
@@ -35,7 +40,10 @@ class KimiK3DSparkAttention(nn.Module):
         self.layer_idx = int(layer_idx)
         self.num_heads = int(config.num_attention_heads)
         self.num_key_value_heads = int(config.num_key_value_heads)
-        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+        assert self.num_key_value_heads == self.num_heads, (
+            "Kimi K3 DSpark MLA expects one K/V head per query head, got "
+            f"num_key_value_heads={self.num_key_value_heads} vs num_attention_heads={self.num_heads}."
+        )
         self.q_lora_rank = config.q_lora_rank
         self.kv_lora_rank = int(config.kv_lora_rank)
         self.qk_nope_head_dim = int(config.qk_nope_head_dim)
@@ -97,7 +105,7 @@ class KimiK3DSparkAttention(nn.Module):
         key_states = key_states.view(
             batch_size,
             key_value_length,
-            self.num_key_value_heads,
+            self.num_heads,
             self.qk_nope_head_dim + self.v_head_dim,
         ).transpose(1, 2)
         key_states, value_states = torch.split(
@@ -108,7 +116,6 @@ class KimiK3DSparkAttention(nn.Module):
         key_rotary_states = key_rotary_states.view(batch_size, 1, key_value_length, self.qk_rope_head_dim)
         key_rotary_states = key_rotary_states.expand(*key_states.shape[:-1], -1)
         key_states = torch.cat([key_states, key_rotary_states], dim=-1)
-        key_states, value_states = self._expand_key_value_groups(key_states, value_states)
 
         attention_weights = torch.matmul(query_states, key_states.transpose(2, 3)) * self.scaling
         if attention_mask is not None:
@@ -124,33 +131,6 @@ class KimiK3DSparkAttention(nn.Module):
         if self.use_output_gate:
             attention_output = attention_output * self.g_proj(hidden_states).sigmoid()
         return self.o_proj(attention_output)
-
-    def _expand_key_value_groups(
-        self,
-        key_states: torch.Tensor,
-        value_states: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.num_key_value_groups == 1:
-            return key_states, value_states
-        batch_size, _, sequence_length, _ = key_states.shape
-        key_states = key_states[:, :, None].expand(
-            batch_size,
-            self.num_key_value_heads,
-            self.num_key_value_groups,
-            sequence_length,
-            self.q_head_dim,
-        )
-        value_states = value_states[:, :, None].expand(
-            batch_size,
-            self.num_key_value_heads,
-            self.num_key_value_groups,
-            sequence_length,
-            self.v_head_dim,
-        )
-        return (
-            key_states.reshape(batch_size, self.num_heads, sequence_length, self.q_head_dim),
-            value_states.reshape(batch_size, self.num_heads, sequence_length, self.v_head_dim),
-        )
 
 
 class KimiK3DSparkDecoderLayer(nn.Module):
