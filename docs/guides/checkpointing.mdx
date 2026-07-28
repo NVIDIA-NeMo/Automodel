@@ -78,6 +78,12 @@ Asynchronous saves are published on the following save call, so a job that stops
 
 </Note>
 
+<Note>
+
+The in-progress marker and the leftover-directory cleanup are local filesystem operations, so neither applies when `checkpoint.checkpoint_dir` uses `msc://` storage. This matches the existing local-only scope of automatic checkpoint discovery and bounded retention on remote paths. Set `checkpoint.restore_from` explicitly when resuming a run whose checkpoints live on `msc://`.
+
+</Note>
+
 ## Checkpoint Retention
 
 By default, NeMo AutoModel keeps all intermediate checkpoints. To limit disk usage when checkpoints are saved frequently, configure a bounded recent-checkpoint window:

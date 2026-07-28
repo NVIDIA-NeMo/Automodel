@@ -45,6 +45,7 @@ except ImportError:
 
 from nemo_automodel.components.checkpoint.checkpointing import save_config
 from nemo_automodel.components.checkpoint.utils import (
+    checkpoint_lifecycle_is_supported,
     clear_checkpoint_incomplete,
     find_latest_checkpoint,
     find_pointer_protected_checkpoints,
@@ -241,50 +242,79 @@ class BaseRecipe:
         directory that already exists on disk. Removing the leftover keeps the
         re-save idempotent instead of aborting the job at the same step forever.
 
-        The removal runs on rank 0, and its outcome is reduced across ranks so a
-        failed cleanup raises everywhere rather than killing rank 0 and leaving
-        the remaining ranks blocked in the next collective.
+        Every filesystem step runs on rank 0 -- removing the leftover, creating the
+        directory, and writing the in-progress marker -- and all of them are covered
+        by a single reduction, so any failure raises on every rank rather than
+        killing rank 0 and leaving the others blocked in the next collective.
+
+        ``msc://`` checkpoint roots are object storage with no local directory to
+        reserve, so the whole step is skipped there.
 
         Args:
             path: Checkpoint directory for the current step.
 
         Raises:
-            RuntimeError: If a pre-existing checkpoint directory could not be removed.
+            RuntimeError: If the checkpoint directory could not be prepared.
         """
         is_dist_initialized = torch.distributed.is_initialized()
         is_rank_0 = not is_dist_initialized or torch.distributed.get_rank() == 0
-        cleanup_error: OSError | None = None
 
-        if is_rank_0 and os.path.exists(path):
-            if is_checkpoint_incomplete(path):
-                logger.warning("Removing checkpoint directory %s left behind by an interrupted save", path)
-            else:
-                logger.warning("Overwriting existing checkpoint directory %s", path)
+        if not checkpoint_lifecycle_is_supported(path):
+            if is_rank_0:
+                logger.warning(
+                    "Checkpoint directory %s is remote storage; leftover-directory cleanup and "
+                    "interrupted-save detection are unavailable for it",
+                    path,
+                )
+            return
+
+        setup_error: OSError | None = None
+        if is_rank_0:
             try:
-                shutil.rmtree(path)
+                if os.path.exists(path):
+                    if is_checkpoint_incomplete(path):
+                        logger.warning("Removing checkpoint directory %s left behind by an interrupted save", path)
+                    else:
+                        logger.warning("Overwriting existing checkpoint directory %s", path)
+                    shutil.rmtree(path)
+                os.makedirs(path, exist_ok=True)
+                mark_checkpoint_incomplete(path)
             except OSError as exc:
                 # Recorded instead of raised here: rank 0 has to reach the reduction
                 # below so the failure aborts every rank instead of stranding them.
-                cleanup_error = exc
+                logger.exception("Failed to prepare checkpoint directory %s", path)
+                setup_error = exc
 
-        cleanup_failed = torch.tensor([int(cleanup_error is not None)], dtype=torch.int32)
+        if self._any_rank_failed(setup_error is not None, is_dist_initialized):
+            raise RuntimeError(
+                f"Checkpoint directory {path} could not be prepared. Remove it manually or "
+                "point checkpoint.checkpoint_dir at a fresh directory."
+            ) from setup_error
+
+    def _any_rank_failed(self, failed: bool, is_dist_initialized: bool) -> bool:
+        """Reduce a local failure flag so every rank agrees on whether to abort.
+
+        Checkpoint bookkeeping runs on rank 0 alone. Raising there without telling
+        the other ranks leaves them blocked in the next collective until the cluster
+        reaps the job, so the flag is max-reduced and every rank raises together.
+
+        Args:
+            failed: Whether this rank observed a failure.
+            is_dist_initialized: Whether a process group is available to reduce over.
+
+        Returns:
+            True when any participating rank reported a failure.
+        """
+        flag = torch.tensor([int(failed)], dtype=torch.int32)
         if is_dist_initialized:
             if torch.cuda.is_available():
-                cleanup_failed = cleanup_failed.cuda()
+                flag = flag.cuda()
             torch.distributed.all_reduce(
-                cleanup_failed,
+                flag,
                 op=torch.distributed.ReduceOp.MAX,
                 group=getattr(getattr(self, "mesh_context", None), "process_group", None),
             )
-        if bool(cleanup_failed.item()):
-            raise RuntimeError(
-                f"Checkpoint directory {path} already exists and could not be removed. "
-                "Remove it manually or point checkpoint.checkpoint_dir at a fresh directory."
-            ) from cleanup_error
-
-        if is_rank_0:
-            os.makedirs(path, exist_ok=True)
-            mark_checkpoint_incomplete(path)
+        return bool(flag.item())
 
     def _publish_checkpoint(self, path: str) -> None:
         """Mark a fully written checkpoint as complete and advance the LATEST pointer.
@@ -293,10 +323,23 @@ class BaseRecipe:
         the in-progress marker is cleared here and nowhere else.
         Only called on rank 0.
 
+        A failure to clear the marker is logged rather than raised, because raising
+        on rank 0 alone would strand the other ranks in the next collective. LATEST
+        is then left where it is, so the checkpoint stays flagged incomplete and
+        resume falls back to the previous complete one.
+
         Args:
             path: Checkpoint directory whose components have all been written.
         """
-        clear_checkpoint_incomplete(path)
+        try:
+            clear_checkpoint_incomplete(path)
+        except OSError:
+            logger.exception(
+                "Failed to clear the in-progress marker on %s; leaving LATEST unchanged so resume "
+                "falls back to the previous complete checkpoint",
+                path,
+            )
+            return
         self._update_latest_symlink(path)
 
     def save_checkpoint(

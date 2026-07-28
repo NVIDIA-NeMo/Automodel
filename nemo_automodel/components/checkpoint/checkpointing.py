@@ -74,6 +74,7 @@ from nemo_automodel.components.checkpoint.utils import (
     get_safetensors_index_total_size,
     get_tied_lm_head_source_names,
     get_world_size_safe,
+    is_cloud_path,
     is_rank_0,
     materialize_missing_tied_lm_head,
 )
@@ -157,11 +158,6 @@ def _apply_adapter_forced_dtype_mapping(
         if fqn in state_dict_key_set:
             normalized[fqn] = dtype_str
     return normalized
-
-
-def is_cloud_path(path: str) -> bool:
-    """Check if path is a cloud storage path (MSC)."""
-    return path.startswith("msc://")
 
 
 def _ensure_msc_available() -> None:

@@ -25,6 +25,7 @@ from nemo_automodel.components.checkpoint.utils import (
     is_checkpoint_incomplete,
     mark_checkpoint_incomplete,
     read_checkpoint_pointer,
+    resolve_restore_from_to_checkpoint_dir,
 )
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
@@ -858,7 +859,7 @@ def test_save_checkpoint_cleanup_failure_is_reported_before_rank_0_raises(tmp_pa
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False, raising=False)
     monkeypatch.setattr("nemo_automodel.recipes.base_recipe.shutil.rmtree", fail_rmtree)
 
-    with pytest.raises(RuntimeError, match="could not be removed") as excinfo:
+    with pytest.raises(RuntimeError, match="could not be prepared") as excinfo:
         recipe_inst.save_checkpoint(epoch=0, step=100, train_loss=1.0)
 
     assert events == ["rmtree", ("all_reduce", 1)]
@@ -877,7 +878,7 @@ def test_save_checkpoint_cleanup_failure_aborts_non_zero_ranks(tmp_path, monkeyp
     monkeypatch.setattr(torch.distributed, "all_reduce", rank_0_reported_failure, raising=False)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False, raising=False)
 
-    with pytest.raises(RuntimeError, match="could not be removed"):
+    with pytest.raises(RuntimeError, match="could not be prepared"):
         recipe_inst.save_checkpoint(epoch=0, step=100, train_loss=1.0)
 
     assert not (tmp_path / "epoch_0_step_100").exists()
@@ -933,6 +934,138 @@ def test_find_latest_checkpoint_skips_interrupted_checkpoint(tmp_path):
 
     assert latest is not None
     assert latest.name == "epoch_0_step_100"
+
+
+def test_find_latest_checkpoint_skips_interrupted_pointer_target(tmp_path):
+    """A LATEST pointer aimed at an interrupted save falls back to the newest complete checkpoint.
+
+    Re-saving a step that LATEST already targets rewrites that directory in
+    place, so an interruption there leaves the pointer aimed at a partial
+    checkpoint. Returning it would resume from half-written state.
+    """
+    complete = tmp_path / "epoch_0_step_50"
+    complete.mkdir()
+    interrupted = _simulate_interrupted_save(tmp_path, step=100)
+    os.symlink(interrupted.name, tmp_path / "LATEST")
+
+    latest = find_latest_checkpoint(tmp_path)
+
+    assert latest is not None
+    assert os.path.basename(str(latest)) == "epoch_0_step_50"
+
+
+def test_find_latest_checkpoint_returns_none_when_only_pointer_target_is_interrupted(tmp_path):
+    """With no complete checkpoint to fall back to, auto-resume starts fresh instead of loading a partial one."""
+    interrupted = _simulate_interrupted_save(tmp_path, step=100)
+    os.symlink(interrupted.name, tmp_path / "LATEST")
+
+    assert find_latest_checkpoint(tmp_path) is None
+
+
+def test_restore_from_pointer_skips_interrupted_target(tmp_path):
+    """An explicit pointer restore does not resolve to a checkpoint an interrupted save left partial."""
+    complete = tmp_path / "epoch_0_step_50"
+    complete.mkdir()
+    interrupted = _simulate_interrupted_save(tmp_path, step=100)
+    os.symlink(interrupted.name, tmp_path / "LATEST")
+
+    resolved = resolve_restore_from_to_checkpoint_dir(tmp_path, "LATEST")
+
+    assert os.path.basename(str(resolved)) == "epoch_0_step_50"
+
+
+def test_save_checkpoint_directory_creation_failure_aborts_every_rank(tmp_path, monkeypatch):
+    """A rank-0 failure creating the checkpoint directory aborts collectively, not just on rank 0.
+
+    ``os.makedirs`` and the marker write happen after the leftover cleanup; an
+    I/O error there must reach the same reduction, otherwise rank 0 dies while
+    its peers block in the next collective.
+    """
+    recipe_inst = _ToyRecipe(tmp_path)
+    events = []
+
+    def fail_makedirs(path, exist_ok=False):
+        events.append("makedirs")
+        raise OSError("read-only file system")
+
+    def record_all_reduce(tensor, op=None, group=None):
+        events.append(("all_reduce", int(tensor.item())))
+
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True, raising=False)
+    monkeypatch.setattr(torch.distributed, "all_reduce", record_all_reduce, raising=False)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False, raising=False)
+    monkeypatch.setattr("nemo_automodel.recipes.base_recipe.os.makedirs", fail_makedirs)
+
+    with pytest.raises(RuntimeError, match="could not be prepared") as excinfo:
+        recipe_inst.save_checkpoint(epoch=0, step=100, train_loss=1.0)
+
+    assert events == ["makedirs", ("all_reduce", 1)]
+    assert isinstance(excinfo.value.__cause__, OSError)
+
+
+def test_save_checkpoint_marker_write_failure_aborts_every_rank(tmp_path, monkeypatch):
+    """A rank-0 failure writing the in-progress marker aborts collectively."""
+    recipe_inst = _ToyRecipe(tmp_path)
+    events = []
+
+    def fail_mark(checkpoint_dir):
+        events.append("mark")
+        raise OSError("disk quota exceeded")
+
+    def record_all_reduce(tensor, op=None, group=None):
+        events.append(("all_reduce", int(tensor.item())))
+
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True, raising=False)
+    monkeypatch.setattr(torch.distributed, "all_reduce", record_all_reduce, raising=False)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False, raising=False)
+    monkeypatch.setattr("nemo_automodel.recipes.base_recipe.mark_checkpoint_incomplete", fail_mark)
+
+    with pytest.raises(RuntimeError, match="could not be prepared"):
+        recipe_inst.save_checkpoint(epoch=0, step=100, train_loss=1.0)
+
+    assert events == ["mark", ("all_reduce", 1)]
+
+
+def test_publish_checkpoint_marker_clear_failure_does_not_raise(tmp_path, monkeypatch, caplog):
+    """A failed marker clear leaves LATEST alone instead of killing rank 0.
+
+    ``_publish_checkpoint`` runs on rank 0 only, so raising there would strand
+    the other ranks. The checkpoint stays flagged incomplete, which resume
+    already handles by falling back to the previous complete checkpoint.
+    """
+    recipe_inst = _ToyRecipe(tmp_path)
+
+    def fail_clear(checkpoint_dir):
+        raise OSError("stale file handle")
+
+    monkeypatch.setattr("nemo_automodel.recipes.base_recipe.clear_checkpoint_incomplete", fail_clear)
+
+    with caplog.at_level(logging.ERROR):
+        recipe_inst.save_checkpoint(epoch=0, step=100, train_loss=1.0)
+
+    assert "Failed to clear the in-progress marker" in caplog.text
+    assert read_checkpoint_pointer(tmp_path, "LATEST") is None
+    assert is_checkpoint_incomplete(tmp_path / "epoch_0_step_100")
+    assert find_latest_checkpoint(tmp_path) is None
+
+
+def test_checkpoint_lifecycle_skipped_for_remote_checkpoint_dir(tmp_path, monkeypatch):
+    """Remote checkpoint roots get no local marker file and no local directory cleanup.
+
+    ``msc://`` paths are object storage; treating them as local paths would write
+    the marker into a bogus ``msc:/...`` directory relative to the working
+    directory while leaving the real checkpoint untouched.
+    """
+    recipe_inst = _ToyRecipe(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    removed = []
+    monkeypatch.setattr("nemo_automodel.recipes.base_recipe.shutil.rmtree", lambda path: removed.append(path))
+
+    recipe_inst._reserve_checkpoint_dir("msc://bucket/run/epoch_0_step_100")
+
+    assert removed == []
+    assert not (tmp_path / "msc:").exists()
+    assert is_checkpoint_incomplete("msc://bucket/run/epoch_0_step_100") is False
 
 
 def test_checkpoint_retention_evicts_interrupted_checkpoint_dir(tmp_path):
