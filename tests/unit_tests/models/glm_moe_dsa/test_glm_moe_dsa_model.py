@@ -581,6 +581,40 @@ class TestIndexShare:
         assert isinstance(out, tuple) and len(out) == 2
         assert out[1].dtype == torch.float32  # carry-out emitted as float32
 
+    @pytest.mark.parametrize("is_last_stage", [False, True])
+    def test_pp_stage_carry_in_gradient_is_dense(self, config, backend_config, device, is_last_stage):
+        # torch.distributed.pipelining sizes the previous stage's backward P2P recv buffer with
+        # torch.empty_strided(shape, stride) taken from grad(carry_in)'s stride. A stride-0
+        # expanded gradient (what `carry.sum() * 0.0` produces) makes irecv raise
+        # "Tensors for P2P must be non-overlapping and dense", so the zero-weight autograd link
+        # must hand back a contiguous gradient on both the non-last and the last stage.
+        model = GlmMoeDsaForCausalLM(config, backend=backend_config).to(device)
+        model.model.embed_tokens = None  # not first stage -> carry_in is a real stage input
+        if not is_last_stage:
+            model.lm_head = None
+
+        seq_len, topk = 4, 8
+
+        def fake_model_forward(input_ids, *, prev_topk_indices=None, **kw):
+            # [1, seq_len, hidden] carried from input_ids so `hidden` stays grad-bearing.
+            return input_ids * 2.0, torch.zeros(1, seq_len, topk, dtype=torch.int64, device=device)
+
+        carry_in = torch.zeros(1, seq_len, topk, dtype=torch.float32, device=device, requires_grad=True)
+        hidden_in = torch.randn(1, seq_len, config.hidden_size, dtype=torch.bfloat16, device=device).requires_grad_()
+        with patch.object(model.model, "forward", new=fake_model_forward):
+            out = model(hidden_in, carry_in)
+
+        outputs = [out] if is_last_stage else list(out)
+        (carry_grad,) = torch.autograd.grad(outputs, [carry_in], [torch.ones_like(o) for o in outputs])
+        assert carry_grad.shape == carry_in.shape
+        assert torch.count_nonzero(carry_grad) == 0  # the zero link must not perturb gradients
+        # The exact allocation torch.distributed.pipelining makes for the backward P2P recv buffer;
+        # contiguous is the non-overlapping-and-dense layout NCCL requires for irecv.
+        recv_buffer = torch.empty_strided(
+            carry_grad.shape, carry_grad.stride(), dtype=carry_grad.dtype, device=carry_grad.device
+        )
+        assert recv_buffer.is_contiguous(), f"grad(carry_in) stride {carry_grad.stride()} is not dense"
+
 
 class TestUpdateMoeGateBias:
     def test_updates_every_local_moe_gate_via_outer_model(self, config, backend_config):

@@ -44,6 +44,25 @@ from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
+def _zero_with_dense_grad(tensor: torch.Tensor) -> torch.Tensor:
+    """Return a ``0.0`` scalar that keeps ``tensor`` in autograd with a *dense* gradient.
+
+    Scaling first makes the multiply's backward allocate a fresh contiguous zero tensor.
+    Reducing first (``tensor.sum() * 0.0``) instead hands back a stride-0 expanded gradient,
+    and since the pipeline's backward P2P recv buffer is allocated from that reported stride,
+    NCCL fails with ``ValueError: Tensors for P2P must be non-overlapping and dense``.
+
+    Args:
+        tensor: Float tensor of arbitrary shape; only its autograd edge, shape, and
+            dtype are used.
+
+    Returns:
+        0-dim tensor holding ``0.0`` with ``tensor``'s dtype, connected to ``tensor``
+        so that ``tensor`` receives a contiguous all-zero gradient.
+    """
+    return (tensor * 0.0).sum()
+
+
 class Block(nn.Module):
     def __init__(self, layer_idx: int, config: GlmMoeDsaConfig, moe_config: MoEConfig, backend: BackendConfig):
         super().__init__()
@@ -523,22 +542,24 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             # torch.distributed.pipelining treats every float inter-stage tensor as an activation
             # and demands a gradient for it on backward. We add zero-weight autograd links so the
             # carry it RECEIVES and the carry it SENDS both get a DEFINED (zero) gradient instead of
-            # ``None`` — values are unchanged (``+ x.sum() * 0.0``).
+            # ``None`` — values are unchanged (``+ _zero_with_dense_grad(x)``). The carry-in link
+            # must keep grad(carry_in) contiguous, since that gradient's stride is what sizes the
+            # previous stage's P2P recv buffer; see _zero_with_dense_grad.
             if self.lm_head is not None:
                 # Last stage: emit logits for the pipeline loss.
                 logits = compute_lm_head_logits(self.lm_head, hidden, logits_to_keep, is_thd=is_thd).logits
                 if carry_in is not None:
-                    logits = logits + (carry_in.float().sum() * 0.0).to(logits.dtype)
+                    logits = logits + _zero_with_dense_grad(carry_in).to(logits.dtype)
                 return logits
             # Non-last stage: emit (hidden, float32 top-k carry) to the next stage. The tensors are
             # already in the backend's natural pipeline shape (THD: [T, H] + [T, 1, topk]; bshd:
             # [B, S, H] + [B, S, topk]) per get_pipeline_stage_metas, so no reshape is needed.
             # (THD requires packed_sequence_size >= index_topk so the tilelang top-k width matches
             # the meta's min(index_topk, seq_len).)
-            zero_from_hidden = hidden.float().sum() * 0.0  # connected to grad-bearing hidden
+            zero_from_hidden = _zero_with_dense_grad(hidden).float()  # connected to grad-bearing hidden
             carry_out = topk_indices.to(torch.float32) + zero_from_hidden  # requires grad, value unchanged
             if carry_in is not None:
-                hidden = hidden + (carry_in.float().sum() * 0.0).to(hidden.dtype)  # defines grad(carry_in)
+                hidden = hidden + _zero_with_dense_grad(carry_in).to(hidden.dtype)  # defines grad(carry_in)
             return hidden, carry_out
 
         return compute_lm_head_logits(
