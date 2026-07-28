@@ -95,7 +95,7 @@ checkpoint:
 
 `max_recent_checkpoints` sets the number of checkpoint directories in the recent window, ordered by step. It is not a hard limit on the total number of checkpoint directories.
 
-Checkpoint-root pointers protect their targets in addition to the recent window. These pointers include `LATEST`, `LOWEST_VAL`, other top-level symbolic links, and `.txt` fallback pointer files. This behavior supports reliable resumption from the latest checkpoint and preserves explicitly referenced checkpoints, such as the best validation checkpoint. Checkpoints left behind by an interrupted save are the one exception: they are never protected, because a pointer to an unusable checkpoint would pin it indefinitely. Such a checkpoint is deleted and its pointer removed.
+Checkpoint-root pointers protect their targets in addition to the recent window. These pointers include `LATEST`, `LOWEST_VAL`, other top-level symbolic links, and `.txt` fallback pointer files. This behavior supports reliable resumption from the latest checkpoint and preserves explicitly referenced checkpoints, such as the best validation checkpoint. Checkpoints left behind by an interrupted save are the one exception: they are never protected, because a pointer to an unusable checkpoint would pin it indefinitely. Such a checkpoint is deleted, and any pointer left dangling by that deletion is removed. Pointers whose target still exists are never touched.
 
 For example, set `max_recent_checkpoints: 2` to retain the two most recent checkpoints. If `LOWEST_VAL` points to an older checkpoint, NeMo AutoModel also retains the `LOWEST_VAL` target.
 

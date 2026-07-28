@@ -49,6 +49,7 @@ from nemo_automodel.components.checkpoint.checkpointing import (
 )
 from nemo_automodel.components.checkpoint.utils import (
     clear_checkpoint_incomplete,
+    find_checkpoint_pointers,
     find_latest_checkpoint,
     find_pointer_protected_checkpoints,
     format_missing_checkpoint_dir_error,
@@ -638,11 +639,24 @@ class BaseRecipe:
         if os.path.exists(txt_path):
             os.remove(txt_path)
 
-    def _remove_stale_checkpoint_pointer(self, link_name: str) -> None:
-        """Remove a checkpoint pointer when its target no longer exists."""
-        target = read_checkpoint_pointer(self.checkpointer.config.checkpoint_dir, link_name)
-        if target is not None and not target.is_dir():
-            self._remove_checkpoint_pointer(link_name)
+    def _remove_stale_checkpoint_pointers(self) -> None:
+        """Remove every top-level checkpoint pointer whose target no longer exists.
+
+        Covers user-created pointers as well as LATEST and LOWEST_VAL, because
+        retention deletes checkpoints that any of them may target. A pointer is
+        removed only once its target no longer exists, so a pointer aimed at a
+        live checkpoint, or at a file inside one, is left alone.
+        """
+        ckpt_root = Path(self.checkpointer.config.checkpoint_dir)
+        try:
+            pointers = find_checkpoint_pointers(ckpt_root)
+        except (OSError, UnicodeError):
+            logger.warning("Failed to scan checkpoint pointers in %s", ckpt_root, exc_info=True)
+            return
+        for link_name, target in pointers.items():
+            if not target.exists():
+                self._remove_checkpoint_pointer(link_name)
+                logger.info("Removed checkpoint pointer %s; its target no longer exists", link_name)
 
     def _prune_old_checkpoints(self) -> None:
         """Prune old checkpoint directories according to checkpoint.max_recent_checkpoints."""
@@ -676,15 +690,20 @@ class BaseRecipe:
             else:
                 logger.info("Pruned old checkpoint directory %s", checkpoint)
 
-        self._remove_stale_checkpoint_pointer("LATEST")
-        self._remove_stale_checkpoint_pointer("LOWEST_VAL")
+        self._remove_stale_checkpoint_pointers()
 
     def _initialize_best_val_loss_from_pointer(self, metric_key: str | None) -> None:
-        """Initialize best validation loss from the existing LOWEST_VAL pointer after resume."""
+        """Initialize best validation loss from the existing LOWEST_VAL pointer after resume.
+
+        A target left behind by an interrupted save is skipped. Its ``losses.json``
+        records a metric belonging to a checkpoint the run can never restore, and
+        seeding the baseline from it would hold LOWEST_VAL below every later
+        checkpoint even after retention removes that target.
+        """
         if self._best_val_loss != float("inf"):
             return
         target = read_checkpoint_pointer(self.checkpointer.config.checkpoint_dir, "LOWEST_VAL")
-        if target is None or not target.is_dir():
+        if target is None or not target.is_dir() or is_checkpoint_incomplete(target):
             return
         existing_best = read_checkpoint_metric(target, metric_key)
         if existing_best is not None:

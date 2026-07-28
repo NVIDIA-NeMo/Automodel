@@ -235,15 +235,25 @@ def _is_checkpoint_pointer_text_file(path: Path, mode: int) -> bool:
     return stat.S_ISREG(mode) and path.suffix == ".txt" and path.stem.isupper()
 
 
-def find_pointer_protected_checkpoints(ckpt_root: Path, checkpoints: list[Path]) -> set[Path]:
-    """Return checkpoints targeted by top-level symlinks or symlink fallback text files."""
-    protected = set()
+def find_checkpoint_pointers(ckpt_root: Path) -> dict[str, Path]:
+    """Return every top-level checkpoint pointer and the target it resolves to.
+
+    Covers both symlink pointers and their ``.txt`` fallbacks, keyed by pointer
+    name (``LATEST``, ``LOWEST_VAL``, or any user-created pointer). The ``.txt``
+    suffix is stripped so both spellings share one key.
+
+    Args:
+        ckpt_root: Checkpoint root directory to scan.
+
+    Returns:
+        Mapping of pointer name to resolved target path. Targets are not checked
+        for existence.
+    """
+    pointers: dict[str, Path] = {}
     if not ckpt_root.exists():
-        return protected
+        return pointers
 
-    entries = list(ckpt_root.iterdir())
-
-    for entry in entries:
+    for entry in ckpt_root.iterdir():
         raw_target = None
         entry_mode = entry.lstat().st_mode
         if stat.S_ISLNK(entry_mode):
@@ -252,8 +262,15 @@ def find_pointer_protected_checkpoints(ckpt_root: Path, checkpoints: list[Path])
             raw_target = entry.read_text().strip()
 
         target = _resolve_checkpoint_pointer_target(ckpt_root, raw_target) if raw_target else None
-        if target is None:
-            continue
+        if target is not None:
+            pointers[entry.stem if entry.suffix == ".txt" else entry.name] = target
+    return pointers
+
+
+def find_pointer_protected_checkpoints(ckpt_root: Path, checkpoints: list[Path]) -> set[Path]:
+    """Return checkpoints targeted by top-level symlinks or symlink fallback text files."""
+    protected = set()
+    for target in find_checkpoint_pointers(ckpt_root).values():
         for checkpoint in checkpoints:
             if _checkpoint_contains_target(checkpoint, target):
                 protected.add(checkpoint)

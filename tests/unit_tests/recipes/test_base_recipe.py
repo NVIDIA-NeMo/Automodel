@@ -1162,6 +1162,58 @@ def test_checkpoint_retention_deletes_interrupted_checkpoint_a_pointer_targets(t
     assert read_checkpoint_pointer(tmp_path, "LOWEST_VAL") is None
 
 
+def test_interrupted_lowest_val_target_does_not_poison_best_metric_tracking(tmp_path):
+    """A marked LOWEST_VAL target must not seed the best-metric baseline.
+
+    Its ``losses.json`` records a metric the run can never restore. Seeding
+    ``_best_val_loss`` from it leaves the cached value below every later
+    checkpoint, so LOWEST_VAL is never recreated even after pruning removes the
+    marked target and its pointer.
+    """
+    recipe_inst = _ToyRecipe(tmp_path, max_recent_checkpoints=2)
+    interrupted = _simulate_interrupted_save(tmp_path, step=100)
+    (interrupted / "losses.json").write_text('{"val_loss": 0.1}')
+    recipe_inst._update_checkpoint_symlink("LOWEST_VAL", str(interrupted))
+
+    for step, val in [(200, 0.2), (300, 0.15)]:
+        x = torch.randn(4, 2)
+        loss = recipe_inst.model(x).sum()
+        loss.backward()
+        recipe_inst.optimizer.step()
+        recipe_inst.save_checkpoint(epoch=0, step=step, train_loss=float(loss.item()), val_loss={"val_loss": val})
+
+    best = read_checkpoint_pointer(tmp_path, "LOWEST_VAL")
+    assert best is not None, "LOWEST_VAL was never recreated after the marked target was pruned"
+    assert best.name == "epoch_0_step_300"
+    assert recipe_inst._best_val_loss == 0.15
+
+
+def test_retention_removes_custom_pointers_left_dangling_by_pruning(tmp_path):
+    """Any pointer AutoModel invalidates by deleting its target is cleaned up.
+
+    The protection scan covers arbitrary top-level pointers, so dropping
+    protection for a marked checkpoint can strand a user's own pointer. Only
+    already-broken pointers are removed; a pointer with a live target is kept.
+    """
+    recipe_inst = _ToyRecipe(tmp_path, max_recent_checkpoints=1)
+    interrupted = _simulate_interrupted_save(tmp_path, step=100)
+    recipe_inst._update_checkpoint_symlink("PINNED", str(interrupted))
+    kept = tmp_path / "epoch_0_step_150"
+    kept.mkdir()
+    recipe_inst._update_checkpoint_symlink("KEPT", str(kept))
+
+    x = torch.randn(4, 2)
+    loss = recipe_inst.model(x).sum()
+    loss.backward()
+    recipe_inst.optimizer.step()
+    recipe_inst.save_checkpoint(epoch=0, step=200, train_loss=float(loss.item()))
+
+    assert not (tmp_path / "epoch_0_step_100").exists()
+    assert read_checkpoint_pointer(tmp_path, "PINNED") is None
+    # A pointer whose target survived is untouched.
+    assert read_checkpoint_pointer(tmp_path, "KEPT") is not None
+
+
 def test_checkpoint_retention_still_protects_complete_pointer_target(tmp_path):
     """Pointer protection is unchanged for checkpoints that completed normally."""
     recipe_inst = _ToyRecipe(tmp_path, max_recent_checkpoints=1)
