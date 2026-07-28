@@ -215,9 +215,9 @@ def test_build_checkpointer_logs_retention_policy(tmp_path, monkeypatch, caplog)
     monkeypatch.setattr(train_dspark, "Checkpointer", FakeCheckpointer)
     obj = TrainDSparkRecipe.__new__(TrainDSparkRecipe)
     obj.cfg = SimpleNamespace(
-        get=lambda key, default=None: {"checkpoint_dir": str(tmp_path), "max_recent_checkpoints": 1}
-        if key == "checkpoint"
-        else default
+        get=lambda key, default=None: (
+            {"checkpoint_dir": str(tmp_path), "max_recent_checkpoints": 1} if key == "checkpoint" else default
+        )
     )
     obj.output_dir = tmp_path
     obj.draft_model = SimpleNamespace(state_dict=lambda: {"weight": torch.zeros(1)})
@@ -1184,6 +1184,12 @@ def test_dspark_load_extra_state_restores_step_and_epoch(tmp_path):
 
 
 def test_dspark_load_extra_state_raises_on_mask_token_id_mismatch(tmp_path):
+    """A resume YAML whose mask_token_id disagrees with the checkpoint must fail loudly.
+
+    The draft's ``embed_tokens`` row at this id is the learned "predict here"
+    signal, so resuming at a different id trains against an untrained row and
+    degrades acceptance silently.
+    """
     ckpt_dir = _write_dspark_meta(tmp_path, mask_token_id=7)
     obj = _dspark_resume_self(mask_token_id=99)
     with pytest.raises(ValueError, match="mask_token_id mismatch on resume"):
@@ -1191,6 +1197,7 @@ def test_dspark_load_extra_state_raises_on_mask_token_id_mismatch(tmp_path):
 
 
 def test_dspark_load_extra_state_accepts_legacy_meta_without_mask_token_id(tmp_path):
+    """Checkpoints saved before mask_token_id was persisted skip the check."""
     torch.save({"global_step": 3, "epoch": 1}, tmp_path / "dspark_meta.pt")
     obj = _dspark_resume_self(mask_token_id=99)
     TrainDSparkRecipe._load_extra_state(obj, str(tmp_path))
