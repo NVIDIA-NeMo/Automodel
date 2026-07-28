@@ -22,7 +22,7 @@ SEP_TOKEN = "<|sep|>"
 END_OF_MSG_TOKEN = "<|end_of_msg|>"
 IMAGE_PLACEHOLDER = "<|kimi_image_placeholder|>"
 
-_VALID_THINKING_EFFORTS = {"low", "high", "max"}
+_VALID_THINKING_EFFORTS = {"low", "medium", "high", "max"}
 
 
 @dataclass(frozen=True)
@@ -498,8 +498,8 @@ def build_chat_segments(
         segments.extend(_render_tool_declare(tools))
 
     thinking_effort = kwargs.get("thinking_effort")
-    if thinking and thinking_effort is not None:
-        assert thinking_effort in _VALID_THINKING_EFFORTS, (
+    if thinking and thinking_effort is not None and thinking_effort not in _VALID_THINKING_EFFORTS:
+        raise ValueError(
             f"Unsupported thinking_effort={thinking_effort!r}; supported values are {sorted(_VALID_THINKING_EFFORTS)}."
         )
     if thinking and thinking_effort in _VALID_THINKING_EFFORTS:
