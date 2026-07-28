@@ -124,12 +124,12 @@ class _PPSpy(SimpleNamespace):
         super().__init__(**kwargs)
         self.step_batches = []
 
-    def step(self, *args, target=None, losses=None, **kwargs):
+    def step(self, model_input, *, target=None, losses=None, **kwargs):
         """Record and forward an AutoPipeline step.
 
         Args:
-            *args: Positional schedule inputs. Tensor values have arbitrary
-                model-defined layouts.
+            model_input: Tensor of shape [batch, ...] containing the first
+                pipeline stage's input.
             target: Optional tensor of shape [batch, sequence] containing loss
                 targets.
             losses: Optional mutable list populated with scalar loss tensors.
@@ -140,7 +140,8 @@ class _PPSpy(SimpleNamespace):
             The value returned by the schedule spy.
         """
         self.step_batches.append(dict(kwargs))
-        return self.info.schedule.step(*args, target=target, losses=losses, **kwargs)
+        schedule_args = (model_input,) if self.info.has_first_stage else ()
+        return self.info.schedule.step(*schedule_args, target=target, losses=losses, **kwargs)
 
 
 def test_forward_backward_step_pp_cp_first_stage_sunk_keeps_input_ids_full(monkeypatch):
@@ -283,7 +284,7 @@ def _run_nonfirst_stage_fbstep(monkeypatch, model):
     FinetuneRecipeForVLM._forward_backward_step(
         recipe, 0, batch, loss_buffer=[], num_label_tokens=labels.numel(), num_batches=1
     )
-    return seen_cp_batch, seq_lens, recipe.pp.step_batches
+    return seen_cp_batch, seq_lens, recipe.pp.step_batches, schedule.calls
 
 
 def test_forward_backward_step_pp_cp_sunk_model_nonfirst_stage_invokes_hook_keeps_input_ids_full(monkeypatch):
@@ -293,7 +294,7 @@ def test_forward_backward_step_pp_cp_sunk_model_nonfirst_stage_invokes_hook_keep
     the generic sharder would produce, which would ÷cp a second time and truncate
     the inter-stage hidden (the text-decoder RoPE size mismatch)."""
     model = _SunkSpyVLM()
-    seen_cp_batch, seq_lens, step_batches = _run_nonfirst_stage_fbstep(monkeypatch, model)
+    seen_cp_batch, seq_lens, step_batches, schedule_calls = _run_nonfirst_stage_fbstep(monkeypatch, model)
 
     # Hook invoked on the non-first stage (this is the fix).
     assert len(model.calls) == 1
@@ -303,6 +304,7 @@ def test_forward_backward_step_pp_cp_sunk_model_nonfirst_stage_invokes_hook_keep
     # All pp ranks feed the FULL seq_len to update_seq_len.
     assert seq_lens == [6]
     assert step_batches == [{}]
+    assert schedule_calls[0]["model_input"] is None
 
 
 class _FakePPModel:

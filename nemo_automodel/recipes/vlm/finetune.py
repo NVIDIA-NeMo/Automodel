@@ -843,10 +843,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 self._maybe_set_pp_first_stage_embed_input_meta(model_input)
 
                 with stage_vlm_media_for_pp(self.pp, self.model_parts, batch):
-                    if self.pp.info.has_first_stage:
-                        self.pp.step(model_input, target=targets, losses=losses, **batch)
-                    else:
-                        self.pp.step(target=targets, losses=losses, **batch)
+                    self.pp.step(model_input, target=targets, losses=losses, **batch)
 
             if self.pp.info.has_last_stage:
                 local_loss = torch.sum(torch.stack(losses))

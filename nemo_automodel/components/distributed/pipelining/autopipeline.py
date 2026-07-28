@@ -264,7 +264,8 @@ class AutoPipeline:
 
     def step(
         self,
-        *args: Any,
+        model_input: torch.Tensor,
+        *,
         target: torch.Tensor | None = None,
         losses: list[torch.Tensor] | None = None,
         **kwargs: Any,
@@ -272,8 +273,8 @@ class AutoPipeline:
         """Run one pipeline schedule step with model-owned input chunking.
 
         Args:
-            *args: Positional schedule inputs. Tensor layouts are defined by the
-                model's pipeline-stage forward contract.
+            model_input: Tensor of shape [batch, ...] containing the first
+                pipeline stage's input. Ignored on ranks without the first stage.
             target: Tensor with a model-defined target layout, or ``None`` on
                 ranks without the last pipeline stage.
             losses: Mutable list populated with scalar loss tensors, or ``None``
@@ -289,14 +290,15 @@ class AutoPipeline:
         if schedule is None:
             raise RuntimeError("AutoPipeline.build() must be called before running a PP schedule step")
 
+        schedule_args = (model_input,) if self._info.has_first_stage else ()
         kwargs_chunk_spec = self._get_schedule_kwargs_chunk_spec(kwargs)
         if kwargs_chunk_spec is None:
-            return schedule.step(*args, target=target, losses=losses, **kwargs)
+            return schedule.step(*schedule_args, target=target, losses=losses, **kwargs)
 
         previous_kwargs_chunk_spec = schedule._kwargs_chunk_spec
         schedule._kwargs_chunk_spec = kwargs_chunk_spec
         try:
-            return schedule.step(*args, target=target, losses=losses, **kwargs)
+            return schedule.step(*schedule_args, target=target, losses=losses, **kwargs)
         finally:
             schedule._kwargs_chunk_spec = previous_kwargs_chunk_spec
 

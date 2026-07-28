@@ -1546,12 +1546,12 @@ class _MockAutoPipeline:
         # variable-length VLM batches.
         return None
 
-    def step(self, *args, target=None, losses=None, **kwargs):
+    def step(self, model_input, *, target=None, losses=None, **kwargs):
         """Record and forward an AutoPipeline step.
 
         Args:
-            *args: Positional schedule inputs. Tensor values have arbitrary
-                model-defined layouts.
+            model_input: Tensor of shape [batch, ...] containing the first
+                pipeline stage's input.
             target: Optional tensor of shape [batch, sequence] containing loss
                 targets.
             losses: Optional mutable list populated with scalar loss tensors.
@@ -1562,7 +1562,8 @@ class _MockAutoPipeline:
             The value returned by the schedule mock.
         """
         self.step_batches.append(dict(kwargs))
-        return self.info.schedule.step(*args, target=target, losses=losses, **kwargs)
+        schedule_args = (model_input,) if self.info.has_first_stage else ()
+        return self.info.schedule.step(*schedule_args, target=target, losses=losses, **kwargs)
 
 
 def _create_pp_recipe(model=None):

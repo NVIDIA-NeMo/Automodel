@@ -240,6 +240,7 @@ class _KwargsChunkSchedule:
     def __init__(self, *, fail_on_step: bool = False):
         self._kwargs_chunk_spec = None
         self.fail_on_step = fail_on_step
+        self.args_during_step = None
         self.kwargs_chunk_spec_during_step = None
         self.kwargs_split = None
 
@@ -259,6 +260,7 @@ class _KwargsChunkSchedule:
             A sentinel string identifying the schedule result.
         """
         del target, losses
+        self.args_during_step = args
         self.kwargs_chunk_spec_during_step = self._kwargs_chunk_spec
         if self.fail_on_step:
             raise RuntimeError("schedule failed")
@@ -272,7 +274,7 @@ class _KwargsChunkSchedule:
 
 
 class TestAutoPipelineKwargsChunkSpec:
-    def _pipeline_with_parts(self, *parts: nn.Module, schedule=None):
+    def _pipeline_with_parts(self, *parts: nn.Module, schedule=None, has_first_stage: bool = True):
         ap = AutoPipeline(
             world_mesh=FakeDeviceMesh(),
             pp_axis_name="pp",
@@ -283,6 +285,7 @@ class TestAutoPipelineKwargsChunkSpec:
         )
         ap._info.schedule = schedule or _KwargsChunkSchedule()
         ap._info.model_parts = list(parts)
+        ap._info.has_first_stage = has_first_stage
         return ap
 
     def test_step_splits_mrope_position_ids_on_model_owned_batch_axis(self):
@@ -310,6 +313,7 @@ class TestAutoPipelineKwargsChunkSpec:
         assert fixed_kwargs_split[0]["attention_mask"].shape == (1, 8)
         assert fixed_kwargs_split[0]["qkv_format"] == "thd"
         assert fixed_kwargs_split[1]["qkv_format"] == "thd"
+        assert ap.info.schedule.args_during_step == (input_ids,)
         assert ap.info.schedule._kwargs_chunk_spec is None
 
     def test_step_without_model_hook_uses_pytorch_default_chunking(self):
@@ -330,6 +334,14 @@ class TestAutoPipelineKwargsChunkSpec:
         ap.step(torch.zeros(2, 8), position_ids=torch.zeros(3, 2, 8))
 
         assert ap.info.schedule.kwargs_split[0]["position_ids"].shape == (3, 1, 8)
+
+    def test_nonfirst_stage_ignores_model_input(self):
+        ap = self._pipeline_with_parts(nn.Module(), has_first_stage=False)
+
+        ap.step(torch.zeros(2, 8), attention_mask=torch.ones(2, 8))
+
+        assert ap.info.schedule.args_during_step == ()
+        assert ap.info.schedule.kwargs_split[0]["attention_mask"].shape == (1, 8)
 
     def test_step_restores_schedule_chunk_spec_after_failure(self):
         schedule = _KwargsChunkSchedule(fail_on_step=True)
