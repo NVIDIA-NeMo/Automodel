@@ -127,6 +127,11 @@ class ConsolidatedHFAddon:
             # save the tokenizer
             if tokenizer is not None:
                 tokenizer.save_pretrained(hf_metadata_dir)
+                _align_exported_processor_with_original_model_code(
+                    original_model_path,
+                    hf_metadata_dir,
+                    model_part,
+                )
 
             # save the fqn_to_file_index_mapping file
             with open(os.path.join(hf_metadata_dir, FQN_TO_FILE_INDEX_MAPPING_FILENAME), "w") as f:
@@ -204,6 +209,11 @@ class PeftAddon:
             # save the tokenizer
             if tokenizer is not None:
                 tokenizer.save_pretrained(model_path)
+                _align_exported_processor_with_original_model_code(
+                    original_model_path,
+                    model_path,
+                    model_part,
+                )
             # save in HF format. Only keys that are needed for PEFT module loading will be saved here.
             with open(os.path.join(model_path, "adapter_config.json"), "w") as f:
                 json.dump(hf_peft_config, f, indent=2, sort_keys=True)
@@ -495,6 +505,95 @@ def _save_original_config_json(original_model_path: str, hf_metadata_dir: str, c
     dst = os.path.join(hf_metadata_dir, config_name)
     with open(dst, "w") as f:
         json.dump(cfg, f, indent=2)
+
+
+def _load_json_dict(path: str) -> dict | None:
+    """Load a JSON object, returning ``None`` for missing or malformed files."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            value = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _auto_map_code_is_present(auto_map_value, output_dir: str) -> bool:
+    """Return whether an ``auto_map`` value references Python code in ``output_dir``."""
+    refs = auto_map_value if isinstance(auto_map_value, (list, tuple)) else [auto_map_value]
+    for ref in refs:
+        if not isinstance(ref, str) or "." not in ref:
+            continue
+        # Hub auto_map values can include a ``repo_id--`` prefix. The copied local
+        # module uses only the module portion after that prefix.
+        module_ref = ref.rsplit("--", 1)[-1].rsplit(".", 1)[0]
+        module_path = os.path.join(output_dir, *module_ref.split(".")) + ".py"
+        if os.path.isfile(module_path):
+            return True
+    return False
+
+
+def _align_exported_processor_with_original_model_code(
+    original_model_path: str | None,
+    output_dir: str,
+    model_part: nn.Module | None,
+) -> None:
+    """Keep an exported remote-code model and processor on the same code version.
+
+    ``tokenizer.save_pretrained`` writes the active training processor's
+    ``AutoProcessor`` mapping. Retrieval models can intentionally preserve the
+    original checkpoint's standalone model code while training with a newer
+    Automodel processor. In that case, mixing the newer processor with the
+    original model can break inference even when their class names match.
+
+    When the active model metadata still points to the original checkpoint's
+    ``AutoModel*`` implementation, restore only the original ``AutoProcessor``
+    code reference after saving the processor. Runtime settings written by the
+    active processor (for example ``max_input_tiles``) remain unchanged.
+    """
+    if original_model_path is None or model_part is None or not os.path.isdir(original_model_path):
+        return
+
+    original_config = _load_json_dict(os.path.join(original_model_path, "config.json"))
+    active_config = getattr(model_part, "config", None)
+    original_auto_map = original_config.get("auto_map") if original_config is not None else None
+    active_auto_map = getattr(active_config, "auto_map", None)
+    if not isinstance(original_auto_map, dict) or not isinstance(active_auto_map, dict):
+        return
+
+    # Only align the processor when export deliberately retained the original
+    # model implementation. This avoids replacing a processor for models whose
+    # active Automodel implementation differs from the base checkpoint.
+    uses_original_model_code = any(
+        key.startswith("AutoModel") and active_auto_map.get(key) == value for key, value in original_auto_map.items()
+    )
+    if not uses_original_model_code:
+        return
+
+    original_processor_config = _load_json_dict(os.path.join(original_model_path, "processor_config.json"))
+    original_processor_auto_map = (
+        original_processor_config.get("auto_map") if original_processor_config is not None else None
+    )
+    processor_ref = (
+        original_processor_auto_map.get("AutoProcessor")
+        if isinstance(original_processor_auto_map, dict)
+        else original_auto_map.get("AutoProcessor")
+    )
+    if processor_ref is None or not _auto_map_code_is_present(processor_ref, output_dir):
+        return
+
+    for config_name in ("processor_config.json", "tokenizer_config.json"):
+        config_path = os.path.join(output_dir, config_name)
+        exported_config = _load_json_dict(config_path)
+        if exported_config is None:
+            continue
+        exported_auto_map = exported_config.get("auto_map")
+        if not isinstance(exported_auto_map, dict):
+            exported_auto_map = {}
+            exported_config["auto_map"] = exported_auto_map
+        exported_auto_map["AutoProcessor"] = processor_ref
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump(exported_config, f, indent=2)
+            f.write("\n")
 
 
 # Symbols some trust_remote_code models import at module load that newer transformers
