@@ -16,6 +16,8 @@ import types
 
 import pytest
 
+from nemo_automodel._transformers.registry import _CUSTOM_CONFIG_REGISTRATIONS
+
 
 def _new_registry_instance(registry_module):
     """Create a fresh registry with an empty auto_map for testing."""
@@ -208,6 +210,92 @@ def test_step3p7_registry_and_custom_config_registration():
     )
     assert CONFIG_MAPPING["step3p5v"].__name__ == "Step3p5VConfig"
     assert CONFIG_MAPPING["step3p7"].__name__ == "Step3p7Config"
+
+
+def test_resolve_custom_config_cls_uses_registry_for_non_builtin(monkeypatch):
+    from nemo_automodel._transformers import registry as reg
+
+    class FakeConfig:
+        pass
+
+    fake_module = types.SimpleNamespace(FakeConfig=FakeConfig)
+    monkeypatch.setitem(reg._CUSTOM_CONFIG_REGISTRATIONS, "am_future", ("fake.config_module", "FakeConfig"))
+    monkeypatch.setattr(
+        reg.importlib, "import_module", lambda name: fake_module if name == "fake.config_module" else None
+    )
+
+    assert reg.resolve_custom_config_cls("am_future") is FakeConfig
+
+
+def test_resolve_custom_config_cls_returns_none_for_unregistered_model_type():
+    from nemo_automodel._transformers import registry as reg
+
+    assert reg.resolve_custom_config_cls("not_registered") is None
+
+
+def test_custom_config_overrides_default_to_registered_models_except_verified_opt_outs():
+    from nemo_automodel._transformers import registry as reg
+
+    assert reg._CUSTOM_CONFIG_OVERRIDES_BUILTIN == set(reg._CUSTOM_CONFIG_REGISTRATIONS) - {"mistral4"}
+
+
+def test_resolve_custom_config_cls_defers_to_builtin_only_when_opted_out(monkeypatch):
+    from nemo_automodel._transformers import registry as reg
+
+    monkeypatch.setitem(reg._CUSTOM_CONFIG_REGISTRATIONS, "bert", ("fake.config_module", "FakeConfig"))
+    monkeypatch.setattr(reg, "_CUSTOM_CONFIG_OVERRIDES_BUILTIN", set())
+
+    assert reg.resolve_custom_config_cls("bert") is None
+
+
+def test_resolve_custom_config_cls_overrides_transformers_builtin_by_default(monkeypatch):
+    from nemo_automodel._transformers import registry as reg
+
+    class FakeConfig:
+        pass
+
+    fake_module = types.SimpleNamespace(FakeConfig=FakeConfig)
+    monkeypatch.setitem(reg._CUSTOM_CONFIG_REGISTRATIONS, "bert", ("fake.config_module", "FakeConfig"))
+    monkeypatch.setattr(reg, "_CUSTOM_CONFIG_OVERRIDES_BUILTIN", {"bert"})
+    monkeypatch.setattr(
+        reg.importlib, "import_module", lambda name: fake_module if name == "fake.config_module" else None
+    )
+
+    assert reg.resolve_custom_config_cls("bert") is FakeConfig
+
+
+def test_resolve_custom_config_cls_returns_none_when_registered_import_fails(monkeypatch):
+    from nemo_automodel._transformers import registry as reg
+
+    def raise_import_error(name):
+        raise ImportError(name)
+
+    monkeypatch.setitem(reg._CUSTOM_CONFIG_REGISTRATIONS, "am_broken", ("fake.missing_module", "MissingConfig"))
+    monkeypatch.setattr(reg, "_CUSTOM_CONFIG_OVERRIDES_BUILTIN", {"am_broken"})
+    monkeypatch.setattr(reg.importlib, "import_module", raise_import_error)
+
+    assert reg.resolve_custom_config_cls("am_broken") is None
+
+
+@pytest.mark.parametrize("model_type", sorted(_CUSTOM_CONFIG_REGISTRATIONS))
+def test_registered_config_wins_over_transformers_builtin(model_type):
+    """A registered model_type must resolve to Automodel's config, not the built-in.
+
+    A registration means the custom model reads fields only our config provides,
+    so a transformers release that starts shipping the same ``model_type`` must
+    not silently take over. Model types absent from
+    ``_CUSTOM_CONFIG_OVERRIDES_BUILTIN`` opt out to the transformers-native config.
+    """
+    from nemo_automodel._transformers import registry as reg
+
+    if model_type not in reg._CUSTOM_CONFIG_OVERRIDES_BUILTIN:
+        pytest.skip(f"{model_type} is verified to run on the transformers built-in config")
+
+    resolved = reg.resolve_custom_config_cls(model_type)
+    assert resolved is not None, f"{model_type} resolves to no config class"
+    assert resolved.__module__.startswith("nemo_automodel"), (
+        f"{model_type} resolves to {resolved.__module__}.{resolved.__name__}, not Automodel's config"
+    )
 
 
 def test_resolve_custom_model_cls_found():
@@ -420,8 +508,9 @@ def test_minimax_m3_vl_config_overrides_transformers_builtin():
     names as ours). The skip-if-built-in registration then handed the native
     config to our custom MiniMaxM3SparseForConditionalGeneration, whose vision
     encoder reads ``config.rope_theta`` that the native vision config does not
-    carry -> AttributeError at model init. ``_CUSTOM_CONFIG_OVERRIDES_BUILTIN``
-    forces our config class for such model_types.
+    carry -> AttributeError at model init. Automodel now prefers registered
+    local config classes by default; only model_types absent from
+    ``_CUSTOM_CONFIG_OVERRIDES_BUILTIN`` opt out to the transformers-native config.
     """
     from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 

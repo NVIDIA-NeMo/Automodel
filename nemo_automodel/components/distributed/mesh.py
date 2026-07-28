@@ -163,7 +163,10 @@ class MeshContext:
         """DP axis names for FSDP mesh slicing."""
         if self.device_mesh is not None:
             names = self.device_mesh.mesh_dim_names
-            if MeshAxisName.DP_REPLICATE in names and MeshAxisName.DP_SHARD_CP in names:
+            if (
+                MeshAxisName.DP_REPLICATE in names
+                and _get_axis_size(self.device_mesh, MeshAxisName.DP_SHARD_CP, default=None) is not None
+            ):
                 return (MeshAxisName.DP_REPLICATE, MeshAxisName.DP_SHARD_CP)
         return (MeshAxisName.DP_SHARD_CP,)
 

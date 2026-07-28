@@ -26,6 +26,12 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+from nemo_automodel.components.distributed.context_parallel.sharder import (
+    ContextParallelSharder,
+    round_robin_local_indices,
+    shard_batch_aux_only,
+    shard_sequence_for_cp_round_robin,
+)
 from nemo_automodel.components.models.common import (
     BackendConfig,
     get_rope_config,
@@ -395,6 +401,10 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
     # (MXFP8 -> bf16), so skip HF random init on load. This also avoids the
     # stage-divergent DTensor collectives in initialize_weights() under sharding/PP.
     _skip_init_weights_on_load = True
+    # CP submesh, installed by the MoE parallelizer's apply_cp when context
+    # parallelism is active; None (default) means the forward embeds and shards
+    # nothing for CP. See prepare_model_inputs_for_cp / forward.
+    cp_mesh = None
 
     @dataclass(frozen=True)
     class ModelCapabilities:
@@ -529,13 +539,26 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
     ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
         """Per-stage input/output meta tensors for the PP schedule's shape inference.
 
-        First stage consumes token ids ``[mb, seq]``; later stages consume hidden
-        states ``[mb, seq, hidden]``. The final stage (owning ``lm_head``) emits
-        logits ``[mb, seq, vocab]``; earlier stages emit hidden states.
+        First stage consumes the FULL token ids ``[mb, seq]``; later stages
+        consume hidden states. The final stage (owning ``lm_head``) emits logits;
+        earlier stages emit hidden states.
+
+        Under context parallelism the first stage embeds the full sequence and
+        shards it to this rank's round-robin chunk pair inside forward
+        (see :func:`shard_sequence_for_cp_round_robin`), so every stage output and every
+        later-stage input carries the LOCAL (padded-to-``2*cp`` then ``//cp``)
+        sequence length while the first stage's input stays full-length. At
+        ``cp_size == 1`` the lengths coincide and the layout is symmetric.
         """
         text_config = self.config.text_config
         hidden_size = text_config.hidden_size
         vocab_size = text_config.vocab_size
+
+        cp_size = self.cp_mesh.size() if self.cp_mesh is not None else 1
+        local_seq_len = seq_len
+        if cp_size > 1:
+            padded_seq_len = seq_len + (-seq_len) % (2 * cp_size)
+            local_seq_len = padded_seq_len // cp_size
 
         def meta(*shape: int) -> torch.Tensor:
             return torch.empty(*shape, device="meta", dtype=dtype)
@@ -545,16 +568,16 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
         if is_first:
             inputs_meta = (torch.empty(microbatch_size, seq_len, device="meta", dtype=torch.long),)
         else:
-            inputs_meta = (meta(microbatch_size, seq_len, hidden_size),)
+            inputs_meta = (meta(microbatch_size, local_seq_len, hidden_size),)
 
         if self.lm_head is not None:
             # Logits follow lm_head's own param dtype, which may diverge from the
             # model dtype if lm_head is ever kept in fp32 (_keep_in_fp32_modules);
             # deriving it here keeps the schedule's output buffer correctly sized.
             head_dtype = getattr(getattr(self.lm_head, "weight", None), "dtype", dtype)
-            outputs_meta = (torch.empty(microbatch_size, seq_len, vocab_size, device="meta", dtype=head_dtype),)
+            outputs_meta = (torch.empty(microbatch_size, local_seq_len, vocab_size, device="meta", dtype=head_dtype),)
         else:
-            outputs_meta = (meta(microbatch_size, seq_len, hidden_size),)
+            outputs_meta = (meta(microbatch_size, local_seq_len, hidden_size),)
         return inputs_meta, outputs_meta
 
     @staticmethod
@@ -571,7 +594,16 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
         grid_thw,
         token_index: int,
     ) -> torch.Tensor:
-        features = self.vision_tower(pixel_values, self._to_grid_list(grid_thw))
+        # The vision tower's bidirectional patch attention is not CP-sharded; when
+        # this embed+splice runs in-forward under an active CP ring context it must
+        # suspend the ring dispatcher, or torch's load-balanced ring SDPA rejects
+        # the non-causal attention. No-op when CP is inactive.
+        from nemo_automodel.components.distributed.context_parallel.utils import (
+            cp_dispatcher_suspended,  # noqa: PLC0415
+        )
+
+        with cp_dispatcher_suspended(self.cp_mesh):
+            features = self.vision_tower(pixel_values, self._to_grid_list(grid_thw))
         mask = input_ids == token_index
         expected = int(mask.sum().item())
         if features.shape[0] != expected:
@@ -611,36 +643,32 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
 
     def prepare_model_inputs_for_cp(
         self,
-        input_ids: torch.Tensor,
+        batch: dict[str, Any],
         *,
-        pixel_values: torch.Tensor | None = None,
-        image_grid_thw=None,
-        pixel_values_videos: torch.Tensor | None = None,
-        video_grid_thw=None,
-        **_: Any,
-    ) -> dict[str, torch.Tensor]:
-        """Merge vision features into token embeddings BEFORE context-parallel sequence
-        sharding.
+        num_chunks: int = 1,
+    ) -> dict[str, Any]:
+        """Return a sharder-only CP backend; embed + splice + shard happen in forward.
 
-        The VLM recipe calls ``model(_pre_embed_only=True, **mm_kwargs)`` when
-        ``cp_size > 1`` so the ``input_ids == image_token_index`` splice runs on the full,
-        un-sharded sequence; the returned ``inputs_embeds`` is then sequence-sharded by the
-        recipe. Mirrors ``step3p7``/``kimi_k25_vl``. Defining this method is also the opt-in
-        signal the recipe checks (``hasattr(model, "prepare_model_inputs_for_cp")``).
+        The returned :class:`ContextParallelSharder` round-robin-shards only the
+        no-grad aux streams (labels/position_ids/loss_mask/padding_mask) via
+        :func:`shard_batch_aux_only`, leaving ``input_ids`` and the multimodal inputs
+        full-length; the forward then embeds + splices and calls
+        :func:`shard_sequence_for_cp_round_robin` per microbatch, so embeddings and vision stay
+        trainable under CP. Nothing is consumed here.
+        Defining this method is the opt-in signal the recipe checks
+        (``hasattr(model, "prepare_model_inputs_for_cp")``).
+
+        Args:
+            batch: The full-sequence batch; left intact (nothing consumed).
+            num_chunks: Accepted for hook-signature parity; unused (round-robin CP).
         """
-        inputs_embeds = self._embed_and_splice(
-            input_ids,
-            pixel_values=pixel_values,
-            image_grid_thw=image_grid_thw,
-            pixel_values_videos=pixel_values_videos,
-            video_grid_thw=video_grid_thw,
-        )
-        # Detach: the recipe hands this to torch's context_parallel, which shards
-        # buffers via in-place resize_() and rejects tensors that require grad. The
-        # sharded buffer is fed back into forward() (which rebuilds the autograd graph
-        # from there), and the embeddings/vision tower are frozen for CP runs, so
-        # detaching here loses no gradient.
-        return {"inputs_embeds": inputs_embeds.detach()}
+        del batch, num_chunks
+        return {
+            "cp_sharder": ContextParallelSharder(
+                shard_batch=shard_batch_aux_only,
+                local_token_global_indices=round_robin_local_indices,
+            )
+        }
 
     def forward(
         self,
@@ -655,20 +683,6 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
         inputs_embeds: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> torch.Tensor:
-        # CP pre-embed: the recipe calls model(_pre_embed_only=True, **mm_kwargs) when
-        # cp_size>1 to splice vision into inputs_embeds before the batch is sequence-
-        # sharded. Return early with {"inputs_embeds": ...}; no PP/MTP/decoder work here.
-        if kwargs.pop("_pre_embed_only", False):
-            if input_ids is None:
-                raise ValueError("MiniMax M3 VL CP pre-embedding requires input_ids.")
-            return self.prepare_model_inputs_for_cp(
-                input_ids,
-                pixel_values=pixel_values,
-                image_grid_thw=image_grid_thw,
-                pixel_values_videos=pixel_values_videos,
-                video_grid_thw=video_grid_thw,
-            )
-
         is_pp_stage = self._is_pipeline_parallel_stage()
 
         # Authoritative MTP-under-PP guard: keyed on the config (which survives the
@@ -713,6 +727,15 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
             if consumed:
                 self._vlm_chunk_idx = chunk_idx + 1
 
+        cp_size = self.cp_mesh.size() if self.cp_mesh is not None else 1
+
+        # Media under CP×PP rides the same per-microbatch side channel as cp1×PP:
+        # stage_vlm_media_for_pp stashed grid-aware pixel chunks (pulled just above),
+        # and the embed + vision splice below runs on this microbatch's FULL sequence
+        # before shard_sequence_for_cp_round_robin shards it. So the CP shard composes with the
+        # media staging without changing the stage metas (the first-stage input is
+        # still input_ids [mb, S]; media never enters the stage tensor stream).
+
         # Pipeline stages after the first receive the previous stage's hidden
         # states in the input_ids slot (a float tensor); route them straight to
         # the text model (no embedding / vision splicing on non-first stages).
@@ -728,6 +751,11 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
                 pixel_values_videos=pixel_values_videos,
                 video_grid_thw=video_grid_thw,
             )
+            # Per-microbatch CP: keep this rank's round-robin chunk pair of the
+            # freshly embedded full sequence (aux streams + ring-SDPA context aligned
+            # by shard_batch_aux_only). Differentiable: gradients reach embeddings/vision.
+            if cp_size > 1:
+                inputs_embeds, _, _ = shard_sequence_for_cp_round_robin(self.cp_mesh, inputs_embeds, seq_dim=1)
 
         hidden = self.model(
             None,

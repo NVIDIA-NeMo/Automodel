@@ -98,7 +98,7 @@ def _uses_magi_attention(model: "nn.Module") -> bool:
     """True when the model uses the MagiAttention (FFA / context-parallel) backend.
 
     MagiAttention implements context parallelism via its own load-balancing
-    dispatch (see ``components/distributed/magi_attn_utils.py``), so it supports CP.
+    dispatch (see ``components/distributed/context_parallel/magi.py``), so it supports CP.
     """
     backend = getattr(model, "backend", None)
     return getattr(backend, "attn", None) == "magi"
@@ -346,7 +346,7 @@ class ModelSupports:
 
         MagiAttention dispatches the packed sequence across the CP group with its
         own load-balancing solver and a per-document varlen mask, so it supports
-        CP + packing (see ``magi_attn_utils.magi_prepare_packed_cp``). Models
+        CP + packing (see ``context_parallel.magi.magi_prepare_packed_cp``). Models
         with native THD support own their packed CP path in TileLang attention.
         Models that own their CP end to end (``_owns_cp_attention``) shard the
         packed batch themselves and carry document boundaries into every layer."""

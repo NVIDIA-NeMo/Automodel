@@ -134,6 +134,8 @@ def _compute_base_stage(test_folder: str, config: Path, has_robustness: bool) ->
     """Pick the GitLab CI stage for a base recipe job."""
     if "benchmark" in test_folder:
         return "performance"
+    if test_folder == "llm_pretrain":
+        return "pretrain"
     if "benchmark" in config.stem:
         return "benchmark"
     if test_folder.startswith("diffusion"):
@@ -246,6 +248,9 @@ def generate_job(
     # vLLM deploy variant. `ci.vllm_deploy_known_issue_id` suppresses just this
     # variant (base job still runs) -- use for bugs that only manifest in vllm deploy.
     if ci_config.get("vllm_deploy") and not ci_config.get("vllm_deploy_known_issue_id"):
+        vllm_deploy_vars = {}
+        if "vllm_deploy_time" in ci_config:
+            vllm_deploy_vars["TIME"] = DQ(str(ci_config["vllm_deploy_time"]))
         variants.append(
             (
                 "_vllm_deploy",
@@ -254,6 +259,7 @@ def generate_job(
                     scope,
                     extends=".vllm_deploy_test",
                     stage="peft_vllm_deploy" if "peft" in config.stem else "sft_vllm_deploy",
+                    extra_vars=vllm_deploy_vars,
                     allow_failure=recipe_allow_failure,
                     known_issue_id=known_issue_id,
                 ),
