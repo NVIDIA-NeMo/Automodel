@@ -76,6 +76,7 @@ from nemo_automodel.components.speculative.dspark.config import (
     build_deepseek_v4_draft_config,
     build_gemma4_draft_config,
     build_glm_5_2_draft_config,
+    build_kimi_k3_draft_config,
     build_minimax_m3_draft_config,
 )
 from nemo_automodel.components.speculative.dspark.core import DSparkTrainerModule
@@ -92,6 +93,9 @@ from nemo_automodel.components.speculative.dspark.target_utils import (
 )
 from nemo_automodel.components.speculative.dspark.target_utils import (
     GLM_5_2_MODEL_TYPE as _GLM_5_2_MODEL_TYPE,
+)
+from nemo_automodel.components.speculative.dspark.target_utils import (
+    KIMI_K3_MODEL_TYPES as _KIMI_K3_MODEL_TYPES,
 )
 from nemo_automodel.components.speculative.dspark.target_utils import (
     MINIMAX_M3_MODEL_TYPES as _MINIMAX_M3_MODEL_TYPES,
@@ -112,6 +116,7 @@ from nemo_automodel.recipes.base_recipe import (
 from nemo_automodel.recipes.llm._dspark_target_build import (
     build_deepseek_v4_target,
     build_glm_5_2_target,
+    build_kimi_k3_target,
     gather_full_weight_module,
     repair_glm_5_2_qk_rope_head_dim,
     resolve_reduced_target_layers,
@@ -486,6 +491,7 @@ class TrainDSparkRecipe(BaseRecipe):
         is_glm_5_2_target = target_model_type == _GLM_5_2_MODEL_TYPE
         is_gemma4_target = target_model_type in _GEMMA4_MODEL_TYPES
         is_minimax_m3_target = target_model_type in _MINIMAX_M3_MODEL_TYPES
+        is_kimi_k3_target = target_model_type in _KIMI_K3_MODEL_TYPES
         self.cached_target_path = recipe_cfg.get("cached_target_path", None)
         is_multimodal = bool(recipe_cfg.get("multimodal", False))
         if is_multimodal and not is_minimax_m3_target:
@@ -510,11 +516,18 @@ class TrainDSparkRecipe(BaseRecipe):
         # FSDP mesh, which CP is not composed with here.
         cp_size = int(self.cfg.get("distributed.cp_size", 1) or 1)
         if cp_size > 1:
-            if is_deepseek_v4_target or is_glm_5_2_target or is_gemma4_target or is_minimax_m3_target:
+            if (
+                is_deepseek_v4_target
+                or is_glm_5_2_target
+                or is_gemma4_target
+                or is_minimax_m3_target
+                or is_kimi_k3_target
+            ):
                 raise NotImplementedError(
                     "Context parallelism (cp_size>1) is only supported for the dense Qwen3-style DSpark "
                     "target; the DeepSeek V4 / GLM-5.2 / Gemma4 / MiniMax M3 targets already run under "
-                    "their own expert-parallel / FSDP mesh. Set cp_size=1 for those."
+                    "their own expert-parallel / FSDP mesh. Kimi K3 uses the same restriction. "
+                    "Set cp_size=1 for those."
                 )
             # The CP hook intercepts the target's F.scaled_dot_product_attention call, so
             # the target must run HuggingFace SDPA: force_hf picks the HF class and
@@ -662,6 +675,28 @@ class TrainDSparkRecipe(BaseRecipe):
                     target_config.num_hidden_layers = n_reduced
                 self.target_model = None
             architectures = list(getattr(target_config, "architectures", None) or ["GlmMoeDsaForCausalLM"])
+        elif is_kimi_k3_target:
+            if self.cached_target_path is None:
+                target_config, self.target_model, self.distributed_setup = build_kimi_k3_target(
+                    cfg=self.cfg,
+                    world_size=self.dist_env.world_size,
+                    device=self.device,
+                    compute_dtype=self.compute_dtype,
+                    target_path=target_path,
+                    recipe_cfg=recipe_cfg,
+                    trust_remote_code=trust_remote_code,
+                )
+            else:
+                target_config = AutoConfig.from_pretrained(target_path, trust_remote_code=trust_remote_code)
+                target_config = getattr(target_config, "text_config", target_config)
+                n_reduced = resolve_reduced_target_layers(
+                    target_config.num_hidden_layers,
+                    recipe_cfg.get("target_num_hidden_layers", None),
+                )
+                if n_reduced is not None:
+                    target_config.num_hidden_layers = n_reduced
+                self.target_model = None
+            architectures = ["KimiK3ForCausalLM"]
         else:
             target_config = AutoConfig.from_pretrained(target_path, trust_remote_code=trust_remote_code)
             architectures = getattr(target_config, "architectures", []) or []
@@ -831,12 +866,15 @@ class TrainDSparkRecipe(BaseRecipe):
         # The DeepSeek V4 and GLM-5.2 drafts instead consume a dense additive mask
         # (the DFlash SDPA path), so they are exempt from the flex_attention requirement.
         attention_backend = recipe_cfg.get("attention_backend", "flex_attention")
-        if not (is_deepseek_v4_target or is_glm_5_2_target) and attention_backend != "flex_attention":
+        if (
+            not (is_deepseek_v4_target or is_glm_5_2_target or is_kimi_k3_target)
+            and attention_backend != "flex_attention"
+        ):
             raise ValueError(f"DSpark training requires attention_backend='flex_attention', got {attention_backend!r}.")
         confidence_head_alpha = float(recipe_cfg.get("confidence_head_alpha", 1.0))
         markov_rank = int(recipe_cfg.get("markov_rank", 256))
 
-        if is_deepseek_v4_target or is_glm_5_2_target or is_gemma4_target or is_minimax_m3_target:
+        if is_deepseek_v4_target or is_glm_5_2_target or is_gemma4_target or is_minimax_m3_target or is_kimi_k3_target:
             # Gemma4, DeepSeek V4, GLM-5.2, and MiniMax M3 drafts share one typed
             # draft-config builder that takes the same DSpark model-args bundle.
             margs = _DraftArgs(
@@ -858,6 +896,8 @@ class TrainDSparkRecipe(BaseRecipe):
                 # The GLM draft is always dense and fixes _attn_implementation to "sdpa"
                 # inside the builder, so it is not overridden by attention_backend.
                 draft_config_obj = build_glm_5_2_draft_config(target_config, margs)
+            elif is_kimi_k3_target:
+                draft_config_obj = build_kimi_k3_draft_config(target_config, margs)
             elif is_minimax_m3_target:
                 # MiniMax M3 draft is built from the target's text sub-config (text_config).
                 draft_config_obj = build_minimax_m3_draft_config(target_config, margs)

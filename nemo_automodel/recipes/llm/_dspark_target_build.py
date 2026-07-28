@@ -270,11 +270,80 @@ def build_glm_5_2_target(
     return target_config, target_model, distributed_setup
 
 
+def build_kimi_k3_backend(recipe_cfg) -> BackendConfig:
+    """Build the backend used by the frozen expert-parallel Kimi K3 target."""
+    return BackendConfig(
+        attn=str(recipe_cfg.get("target_attn_backend", "eager")),
+        linear="torch",
+        rms_norm="torch_fp32",
+        rope_fusion=False,
+        dispatcher=str(recipe_cfg.get("target_dispatcher", "hybridep")),
+        experts=str(recipe_cfg.get("target_experts", "torch_mm")),
+        enable_hf_state_dict_adapter=True,
+        enable_fsdp_optimizations=bool(recipe_cfg.get("target_enable_fsdp_optimizations", True)),
+    )
+
+
+def build_kimi_k3_target(
+    *,
+    cfg: Any,
+    world_size: int,
+    device: torch.device,
+    compute_dtype: torch.dtype,
+    target_path: str,
+    recipe_cfg,
+    trust_remote_code: bool,
+):
+    """Load Kimi K3 as a frozen expert-parallel target for online DSpark training."""
+    if device.type != "cuda":
+        raise RuntimeError(
+            "Kimi K3 DSpark target requires CUDA: the target is loaded with the "
+            "expert-parallel / FSDP distributed path."
+        )
+    target_config = AutoConfig.from_pretrained(target_path, trust_remote_code=trust_remote_code)
+    text_config = getattr(target_config, "text_config", target_config)
+    n_reduced = resolve_reduced_target_layers(
+        text_config.num_hidden_layers,
+        recipe_cfg.get("target_num_hidden_layers", None),
+    )
+    if n_reduced is not None:
+        logger.warning(
+            "Reducing the Kimi K3 target from %d to %d layers "
+            "(target_num_hidden_layers): diagnostic/CI only, not a usable cache.",
+            text_config.num_hidden_layers,
+            n_reduced,
+        )
+        text_config.num_hidden_layers = n_reduced
+        text_config.linear_attn_config = {
+            **text_config.linear_attn_config,
+            "kda_layers": [
+                layer_idx for layer_idx in text_config.linear_attn_config["kda_layers"] if layer_idx <= n_reduced
+            ],
+            "full_attn_layers": [
+                layer_idx for layer_idx in text_config.linear_attn_config["full_attn_layers"] if layer_idx <= n_reduced
+            ],
+        }
+    text_config.architectures = ["KimiK3ForCausalLM"]
+    text_config.name_or_path = target_path
+    distributed_setup = create_distributed_setup_from_config(cfg, world_size=world_size)
+    target_model = NeMoAutoModelForCausalLM.from_config(
+        config=text_config,
+        backend=build_kimi_k3_backend(recipe_cfg),
+        distributed_setup=distributed_setup,
+        load_base_model=True,
+        torch_dtype=compute_dtype,
+        trust_remote_code=trust_remote_code,
+    )
+    return text_config, target_model, distributed_setup
+
+
 __all__ = [
     "build_deepseek_v4_backend",
     "build_deepseek_v4_target",
     "build_glm_5_2_backend",
     "build_glm_5_2_target",
+    "build_kimi_k3_backend",
+    "build_kimi_k3_target",
     "gather_full_weight_module",
     "repair_glm_5_2_qk_rope_head_dim",
     "resolve_reduced_target_layers",
