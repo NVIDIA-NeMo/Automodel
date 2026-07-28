@@ -413,9 +413,11 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
             :class:`~transformers.modeling_outputs.CausalLMOutputWithPast`
             carrying the final hidden states when ``output_hidden_states`` is set.
         """
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        )
+        if output_hidden_states is None:
+            try:
+                output_hidden_states = self.config.output_hidden_states
+            except AttributeError:
+                output_hidden_states = False
         if "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd":
             input_ids, position_ids, padding_mask, attn_kwargs = squeeze_input_for_thd(
                 input_ids, position_ids, padding_mask, attn_kwargs

@@ -313,9 +313,11 @@ class Glm4MoeLiteForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         output_hidden_states: Optional[bool] = None,
         **attn_kwargs: Any,
     ) -> CausalLMOutputWithPast:
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        )
+        if output_hidden_states is None:
+            try:
+                output_hidden_states = self.config.output_hidden_states
+            except AttributeError:
+                output_hidden_states = False
 
         is_thd = "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd"
         if is_thd:

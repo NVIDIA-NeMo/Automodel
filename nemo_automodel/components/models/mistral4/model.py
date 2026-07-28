@@ -85,7 +85,13 @@ class Mistral4MLA(MLA):
 
     def __init__(self, config, backend: BackendConfig):
         super().__init__(config, backend)
-        rope_parameters = config.rope_parameters
+        try:
+            rope_parameters = config.rope_parameters
+        except AttributeError:
+            try:
+                rope_parameters = config.rope_scaling
+            except AttributeError:
+                rope_parameters = None
         self.llama_4_scaling_beta = rope_parameters.get("llama_4_scaling_beta") if rope_parameters else None
         self.llama_4_orig_max_pos = rope_parameters.get("original_max_position_embeddings") if rope_parameters else None
 
@@ -417,9 +423,11 @@ class Mistral4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         output_hidden_states: Optional[bool] = None,
         **attn_kwargs: Any,
     ) -> CausalLMOutputWithPast:
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        )
+        if output_hidden_states is None:
+            try:
+                output_hidden_states = self.config.output_hidden_states
+            except AttributeError:
+                output_hidden_states = False
 
         is_thd = attn_kwargs.get("qkv_format") == "thd"
         if is_thd:
