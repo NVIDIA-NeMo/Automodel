@@ -30,6 +30,7 @@ _VALID_THINKING_EFFORTS = {"low", "medium", "high", "max"}
 class EncodeSegment:
     text: str
     allow_special: bool = False
+    is_assistant: bool = False
 
 
 class _ImagePromptState:
@@ -66,6 +67,17 @@ def _control(text: str) -> list[EncodeSegment]:
 
 def _text(text: Any) -> list[EncodeSegment]:
     return _segment(text, allow_special=False)
+
+
+def _mark_assistant(segments: list[EncodeSegment]) -> list[EncodeSegment]:
+    return [
+        EncodeSegment(
+            text=segment.text,
+            allow_special=segment.allow_special,
+            is_assistant=True,
+        )
+        for segment in segments
+    ]
 
 
 def _append_text(
@@ -566,9 +578,10 @@ def build_chat_segments(
             if message.get("name"):
                 attrs.append(("name", message["name"]))
             segments.extend(_open_tag("message", attrs))
-            segments.extend(_render_assistant_segments(message, image_state, thinking))
-            segments.extend(_close_tag("message"))
-            segments.extend(_end_of_msg())
+            assistant_segments = _render_assistant_segments(message, image_state, thinking)
+            assistant_segments.extend(_close_tag("message"))
+            assistant_segments.extend(_end_of_msg())
+            segments.extend(_mark_assistant(assistant_segments))
 
     tool_choice = kwargs.get("tool_choice")
     if tool_choice == "required":
