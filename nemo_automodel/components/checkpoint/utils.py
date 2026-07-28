@@ -139,14 +139,9 @@ def mark_checkpoint_incomplete(checkpoint_dir: str | Path) -> None:
     removed by :func:`clear_checkpoint_incomplete` once the checkpoint is
     published.
 
-    The marker is a local filesystem file, so it is skipped for ``msc://``
-    checkpoint directories; see :func:`checkpoint_lifecycle_is_supported`.
-
     Args:
         checkpoint_dir: Directory of the checkpoint being written.
     """
-    if is_cloud_path(checkpoint_dir):
-        return
     (Path(checkpoint_dir) / _INCOMPLETE_CHECKPOINT_MARKER).touch(exist_ok=True)
 
 
@@ -156,15 +151,11 @@ def clear_checkpoint_incomplete(checkpoint_dir: str | Path) -> None:
     Args:
         checkpoint_dir: Directory of the checkpoint that finished writing.
     """
-    if is_cloud_path(checkpoint_dir):
-        return
     (Path(checkpoint_dir) / _INCOMPLETE_CHECKPOINT_MARKER).unlink(missing_ok=True)
 
 
 def is_checkpoint_incomplete(checkpoint_dir: str | Path) -> bool:
     """Return whether a checkpoint directory was left behind by an interrupted save.
-
-    Always ``False`` for ``msc://`` directories, which carry no marker.
 
     Args:
         checkpoint_dir: Directory to inspect.
@@ -172,26 +163,7 @@ def is_checkpoint_incomplete(checkpoint_dir: str | Path) -> bool:
     Returns:
         True when the in-progress marker is still present.
     """
-    if is_cloud_path(checkpoint_dir):
-        return False
     return (Path(checkpoint_dir) / _INCOMPLETE_CHECKPOINT_MARKER).exists()
-
-
-def checkpoint_lifecycle_is_supported(checkpoint_dir: str | Path) -> bool:
-    """Return whether interrupted-save detection and cleanup work for this checkpoint root.
-
-    The leftover-directory cleanup and the in-progress marker are local
-    filesystem operations. ``msc://`` roots are object storage and are not
-    covered, matching the existing local-only behaviour of
-    :func:`find_latest_checkpoint` and checkpoint retention.
-
-    Args:
-        checkpoint_dir: Checkpoint root or checkpoint directory to inspect.
-
-    Returns:
-        True when the directory lives on a local filesystem.
-    """
-    return not is_cloud_path(checkpoint_dir)
 
 
 def _resolve_checkpoint_pointer_target(ckpt_root: Path, raw_target: str) -> Path | None:

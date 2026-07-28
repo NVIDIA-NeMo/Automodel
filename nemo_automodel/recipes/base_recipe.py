@@ -48,7 +48,6 @@ from nemo_automodel.components.checkpoint.checkpointing import (
     save_losses,
 )
 from nemo_automodel.components.checkpoint.utils import (
-    checkpoint_lifecycle_is_supported,
     clear_checkpoint_incomplete,
     find_latest_checkpoint,
     find_pointer_protected_checkpoints,
@@ -250,11 +249,8 @@ class BaseRecipe:
         by a single reduction, so any failure raises on every rank rather than
         killing rank 0 and leaving the others blocked in the next collective.
 
-        For ``msc://`` roots only the leftover cleanup and the marker are skipped,
-        since both are local filesystem operations. Directory creation still runs:
-        the rest of the save path writes rank-0 files under ``path`` with plain
-        ``open``/``torch.save``, so removing it would turn a remote save into a
-        rank-0 ``FileNotFoundError`` and hang the other ranks.
+        ``checkpoint.checkpoint_dir`` is validated to be a local filesystem path, so
+        every step here is a plain filesystem operation.
 
         Args:
             path: Checkpoint directory for the current step.
@@ -264,27 +260,18 @@ class BaseRecipe:
         """
         is_dist_initialized = torch.distributed.is_initialized()
         is_rank_0 = not is_dist_initialized or torch.distributed.get_rank() == 0
-        lifecycle_supported = checkpoint_lifecycle_is_supported(path)
-
-        if not lifecycle_supported and is_rank_0:
-            logger.warning(
-                "Checkpoint directory %s is remote storage; leftover-directory cleanup and "
-                "interrupted-save detection are unavailable for it",
-                path,
-            )
 
         setup_error: OSError | None = None
         if is_rank_0:
             try:
-                if lifecycle_supported and os.path.exists(path):
+                if os.path.exists(path):
                     if is_checkpoint_incomplete(path):
                         logger.warning("Removing checkpoint directory %s left behind by an interrupted save", path)
                     else:
                         logger.warning("Overwriting existing checkpoint directory %s", path)
                     shutil.rmtree(path)
                 os.makedirs(path, exist_ok=True)
-                if lifecycle_supported:
-                    mark_checkpoint_incomplete(path)
+                mark_checkpoint_incomplete(path)
             except OSError as exc:
                 # Recorded instead of raised here: rank 0 has to reach the reduction
                 # below so the failure aborts every rank instead of stranding them.
@@ -671,8 +658,12 @@ class BaseRecipe:
             logger.warning("Failed to scan checkpoint pointers in %s; skipping pruning", ckpt_root, exc_info=True)
             return
         # Directories left behind by an interrupted save are never resumable, so they
-        # must not consume a retention slot and must not survive as orphans either.
+        # must not consume a retention slot and must not survive as orphans either. A
+        # pointer aimed at one must not keep it alive: re-saving a step that LOWEST_VAL
+        # already targets and then being interrupted leaves the pointer protecting an
+        # unusable checkpoint. The dangling pointer is dropped after deletion below.
         complete_checkpoints = [checkpoint for checkpoint in checkpoints if not is_checkpoint_incomplete(checkpoint)]
+        protected_checkpoints -= {checkpoint for checkpoint in checkpoints if is_checkpoint_incomplete(checkpoint)}
         retained_window = set(complete_checkpoints[-max_recent_checkpoints:])
         checkpoints_to_delete = [
             checkpoint for checkpoint in checkpoints if checkpoint not in retained_window | protected_checkpoints

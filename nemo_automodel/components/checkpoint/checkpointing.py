@@ -1775,9 +1775,9 @@ def save_losses(losses: dict[str, Any], weights_path: str) -> None:
     """Write checkpoint loss metadata to ``weights_path/losses.json``.
 
     Mirrors :func:`save_config` so the file lands in the checkpoint directory for
-    both local and ``msc://`` roots. Failures are logged rather than raised: this
-    is metadata written on rank 0 only, so raising would strand the other ranks
-    in the next collective.
+    both local and ``msc://`` roots. Every failure is logged rather than raised,
+    including a missing ``multistorageclient``: this is metadata written on rank 0
+    only, so raising would strand the other ranks in the next collective.
 
     Args:
         losses: Loss values to record. Values must be JSON-serializable.
@@ -1792,7 +1792,7 @@ def save_losses(losses: dict[str, Any], weights_path: str) -> None:
         else:
             with open(losses_path, "w") as f:
                 json.dump(losses, f)
-    except (TypeError, ValueError, OSError):
+    except (TypeError, ValueError, OSError, ImportError):
         logger.warning("Failed to write checkpoint loss metadata to %s", losses_path, exc_info=True)
 
 

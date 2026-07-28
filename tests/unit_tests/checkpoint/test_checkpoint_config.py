@@ -134,13 +134,33 @@ class TestCheckpointingConfig:
         with pytest.raises(ValueError, match="checkpoint.max_recent_checkpoints must be unset or a positive integer"):
             CheckpointingConfig(max_recent_checkpoints=invalid_value)
 
-    def test_max_recent_checkpoints_rejects_msc_checkpoint_dir(self):
-        with pytest.raises(ValueError, match="max_recent_checkpoints is only supported for local checkpoint"):
-            CheckpointingConfig(
-                checkpoint_dir="msc://bucket/checkpoints",
-                save_consolidated=False,
-                max_recent_checkpoints=1,
-            )
+    @pytest.mark.parametrize(
+        "extra_kwargs",
+        [
+            {},
+            {"max_recent_checkpoints": 1},
+            {"save_consolidated": "final"},
+            {"save_consolidated": False},
+        ],
+    )
+    def test_rejects_msc_checkpoint_dir(self, extra_kwargs):
+        """Remote checkpoint roots are rejected up front, whatever else is configured.
+
+        Training checkpoints write RNG, dataloader, and recipe metadata with
+        torch.save and publish LATEST and LOWEST_VAL as local symlinks, so a
+        remote root fails partway through the save on rank 0 and hangs the rest.
+        """
+        with pytest.raises(ValueError, match="does not support remote storage"):
+            CheckpointingConfig(checkpoint_dir="msc://bucket/checkpoints", **extra_kwargs)
+
+    def test_accepts_local_checkpoint_dir_with_retention(self):
+        """The rejection is scoped to remote roots; local paths keep working."""
+        cfg = CheckpointingConfig(
+            checkpoint_dir="/tmp/checkpoints",
+            save_consolidated=False,
+            max_recent_checkpoints=1,
+        )
+        assert cfg.max_recent_checkpoints == 1
 
     def test_importable_from_checkpointing(self):
         """Verify backward compat: import from checkpointing.py still works."""

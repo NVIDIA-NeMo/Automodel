@@ -1051,35 +1051,6 @@ def test_publish_checkpoint_marker_clear_failure_does_not_raise(tmp_path, monkey
     assert find_latest_checkpoint(tmp_path) is None
 
 
-def test_save_checkpoint_completes_for_remote_checkpoint_dir(tmp_path, monkeypatch):
-    """The whole save path works for an msc:// root, not just the reserve step.
-
-    Skipping local directory creation for remote roots must not leave later
-    rank-0 writes without a directory: losses.json is written before the first
-    barrier, so a FileNotFoundError there would strand every other rank.
-    """
-    recipe_inst = _ToyRecipe(tmp_path)
-    config = recipe_inst.checkpointer.config
-    if not hasattr(config, "checkpoint_dir"):
-        raise ValueError("CheckpointingConfig has no field 'checkpoint_dir'")
-    config.checkpoint_dir = "msc://bucket/run"
-    monkeypatch.chdir(tmp_path)
-    written = {}
-
-    def fake_save_losses(losses, weights_path):
-        written[weights_path] = losses
-
-    monkeypatch.setattr("nemo_automodel.recipes.base_recipe.save_losses", fake_save_losses)
-    monkeypatch.setattr("nemo_automodel.recipes.base_recipe.save_config", lambda config, weights_path: None)
-
-    recipe_inst.save_checkpoint(epoch=0, step=100, train_loss=1.0)
-
-    assert written == {"msc://bucket/run/epoch_0_step_100": {"train_loss": 1.0}}
-    # The remote checkpoint carries no marker: it is a local filesystem file and
-    # would never reach object storage.
-    assert is_checkpoint_incomplete("msc://bucket/run/epoch_0_step_100") is False
-
-
 def test_save_losses_writes_json_for_local_checkpoint_dir(tmp_path):
     """The loss metadata helper still lands next to a local checkpoint."""
     save_losses({"train_loss": 1.5, "val_loss": 0.25}, str(tmp_path))
@@ -1152,24 +1123,102 @@ def test_async_marker_clear_failure_leaves_best_pointer_untouched(tmp_path, monk
     assert read_checkpoint_pointer(tmp_path, "LOWEST_VAL") is None
 
 
-def test_checkpoint_lifecycle_skipped_for_remote_checkpoint_dir(tmp_path, monkeypatch):
-    """Remote checkpoint roots get no local marker file and no local directory cleanup.
+def test_save_losses_does_not_raise_when_multistorageclient_is_missing(tmp_path, monkeypatch, caplog):
+    """A missing MSC install warns instead of raising ImportError on rank 0.
 
-    ``msc://`` paths are object storage; treating them as local paths would write
-    the marker into a bogus ``msc:/...`` directory relative to the working
-    directory while leaving the real checkpoint untouched.
+    ``save_losses`` runs on rank 0 before a barrier, so any escaping exception
+    strands the other ranks. Remote roots are rejected at config construction,
+    but the helper must not be the one to break that contract.
+    """
+    import nemo_automodel.components.checkpoint.checkpointing as checkpointing_module
+
+    monkeypatch.setattr(checkpointing_module, "MSC_AVAILABLE", False, raising=False)
+
+    with caplog.at_level(logging.WARNING):
+        save_losses({"train_loss": 1.0}, "msc://bucket/run/epoch_0_step_1")
+
+    assert "Failed to write checkpoint loss metadata" in caplog.text
+
+
+def test_checkpoint_retention_deletes_interrupted_checkpoint_a_pointer_targets(tmp_path):
+    """A pointer must not keep an interrupted checkpoint alive, and is dropped with it.
+
+    Re-saving a step that LOWEST_VAL already targets and then being interrupted
+    leaves the pointer aimed at a checkpoint that can never be restored. Pointer
+    protection would otherwise pin it forever and break the documented retention
+    window.
+    """
+    recipe_inst = _ToyRecipe(tmp_path, max_recent_checkpoints=1)
+    interrupted = _simulate_interrupted_save(tmp_path, step=100)
+    recipe_inst._update_checkpoint_symlink("LOWEST_VAL", str(interrupted))
+
+    x = torch.randn(4, 2)
+    loss = recipe_inst.model(x).sum()
+    loss.backward()
+    recipe_inst.optimizer.step()
+    recipe_inst.save_checkpoint(epoch=0, step=200, train_loss=float(loss.item()))
+
+    assert _checkpoint_dir_names(tmp_path) == ["epoch_0_step_200"]
+    assert read_checkpoint_pointer(tmp_path, "LOWEST_VAL") is None
+
+
+def test_checkpoint_retention_still_protects_complete_pointer_target(tmp_path):
+    """Pointer protection is unchanged for checkpoints that completed normally."""
+    recipe_inst = _ToyRecipe(tmp_path, max_recent_checkpoints=1)
+    complete = tmp_path / "epoch_0_step_100"
+    complete.mkdir()
+    recipe_inst._update_checkpoint_symlink("LOWEST_VAL", str(complete))
+
+    x = torch.randn(4, 2)
+    loss = recipe_inst.model(x).sum()
+    loss.backward()
+    recipe_inst.optimizer.step()
+    recipe_inst.save_checkpoint(epoch=0, step=200, train_loss=float(loss.item()))
+
+    assert _checkpoint_dir_names(tmp_path) == ["epoch_0_step_100", "epoch_0_step_200"]
+    assert read_checkpoint_pointer(tmp_path, "LOWEST_VAL") is not None
+
+
+@pytest.mark.parametrize("is_async", [False, True])
+@pytest.mark.parametrize("restore_source", ["auto", "LATEST", "explicit"])
+def test_interrupted_save_lifecycle_resumes_from_the_last_complete_checkpoint(tmp_path, is_async, restore_source):
+    """Across sync/async saves and restore sources, resume never lands on a partial checkpoint.
+
+    Saves step 100 normally, then simulates an interruption while re-saving it,
+    which is the reported failure: the resumed run recomputes step 100 and the
+    leftover directory is what it must not load.
     """
     recipe_inst = _ToyRecipe(tmp_path)
-    monkeypatch.chdir(tmp_path)
-    removed = []
-    monkeypatch.setattr("nemo_automodel.recipes.base_recipe.shutil.rmtree", lambda path: removed.append(path))
+    config = recipe_inst.checkpointer.config
+    if not hasattr(config, "is_async"):
+        raise ValueError("CheckpointingConfig has no field 'is_async'")
+    config.is_async = is_async
 
-    recipe_inst._reserve_checkpoint_dir("msc://bucket/run/epoch_0_step_100")
+    x = torch.randn(4, 2)
+    loss = recipe_inst.model(x).sum()
+    loss.backward()
+    recipe_inst.optimizer.step()
+    weight_at_step_100 = recipe_inst.model.weight.clone()
+    recipe_inst.save_checkpoint(epoch=0, step=100, train_loss=float(loss.item()))
+    if is_async:
+        recipe_inst._complete_pending_checkpoint()
 
-    # No local cleanup and no marker for a remote root; directory creation still
-    # runs because later rank-0 writes in the save path depend on it.
-    assert removed == []
-    assert is_checkpoint_incomplete("msc://bucket/run/epoch_0_step_100") is False
+    # The re-save of step 100 is interrupted after the directory is reserved.
+    checkpoint = tmp_path / "epoch_0_step_100"
+    mark_checkpoint_incomplete(checkpoint)
+
+    recipe_inst.model.weight.data.add_(42.0)
+    if restore_source == "auto":
+        assert find_latest_checkpoint(tmp_path) is None
+        recipe_inst.load_checkpoint()
+        # No complete checkpoint remains, so training legitimately starts fresh.
+        assert not torch.allclose(recipe_inst.model.weight, weight_at_step_100)
+    elif restore_source == "LATEST":
+        assert resolve_restore_from_to_checkpoint_dir(tmp_path, "LATEST") is None
+    else:
+        # An explicit directory is the user's own choice and is still honoured.
+        recipe_inst.load_checkpoint(restore_from="epoch_0_step_100")
+        assert torch.allclose(recipe_inst.model.weight, weight_at_step_100)
 
 
 def test_checkpoint_retention_evicts_interrupted_checkpoint_dir(tmp_path):
