@@ -18,7 +18,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from nemo_automodel.components.checkpoint.checkpointing import load_torch_checkpoint
+from nemo_automodel.components.checkpoint.checkpointing import load_torch_ckpt
 
 
 def _touch_marker(marker_path: str) -> None:
@@ -33,32 +33,32 @@ class _TouchPayload:
         return (_touch_marker, (self.marker_path,))
 
 
-def test_load_torch_checkpoint_rejects_pickle_payload_without_execution(tmp_path):
+def test_load_torch_ckpt_rejects_pickle_payload_without_execution(tmp_path):
     marker = tmp_path / "executed"
     checkpoint = tmp_path / "payload.pt"
     torch.save(_TouchPayload(str(marker)), checkpoint)
 
     with pytest.raises(RuntimeError, match="Refusing to load"):
-        load_torch_checkpoint(checkpoint)
+        load_torch_ckpt(checkpoint)
 
     assert not marker.exists()
 
 
-def test_load_torch_checkpoint_allows_tensor_only_checkpoint(tmp_path):
+def test_load_torch_ckpt_allows_tensor_only_checkpoint(tmp_path):
     checkpoint = tmp_path / "state.pt"
     torch.save({"weight": torch.arange(3)}, checkpoint)
 
-    loaded = load_torch_checkpoint(checkpoint, map_location="cpu", mmap=True)
+    loaded = load_torch_ckpt(checkpoint, map_location="cpu", mmap=True)
 
     torch.testing.assert_close(loaded["weight"], torch.arange(3))
 
 
-def test_load_torch_checkpoint_allows_explicit_pickle_opt_in(tmp_path, caplog):
+def test_load_torch_ckpt_allows_explicit_pickle_opt_in(tmp_path, caplog):
     marker = tmp_path / "executed"
     checkpoint = tmp_path / "payload.pt"
     torch.save(_TouchPayload(str(marker)), checkpoint)
 
-    loaded = load_torch_checkpoint(
+    loaded = load_torch_ckpt(
         checkpoint,
         pickle_module=pickle,
         weights_only=False,

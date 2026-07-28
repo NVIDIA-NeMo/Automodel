@@ -101,7 +101,7 @@ def _format_restricted_load_error(f: FileLike) -> str:
     )
 
 
-def load_torch_checkpoint(
+def load_torch_ckpt(
     f: FileLike,
     map_location: MAP_LOCATION = None,
     pickle_module: Any = None,
@@ -1228,7 +1228,7 @@ class Checkpointer:
         """
         state_dir = os.path.join(path, state_name)
         state.load_state_dict(
-            load_torch_checkpoint(
+            load_torch_ckpt(
                 os.path.join(state_dir, f"{state_name}_dp_rank_{self.dp_rank}.pt"),
             )
         )
@@ -2410,7 +2410,7 @@ def _load_hf_bin_checkpoint(model_path: str) -> Optional[dict[str, torch.Tensor]
         return None
 
     if os.path.isfile(model_path):
-        return load_torch_checkpoint(
+        return load_torch_ckpt(
             model_path,
             map_location="cpu",
         )
@@ -2431,7 +2431,7 @@ def _load_hf_bin_checkpoint(model_path: str) -> Optional[dict[str, torch.Tensor]
             bin_path = os.path.join(model_path, filename)
             if not os.path.isfile(bin_path):
                 continue
-            shard = load_torch_checkpoint(
+            shard = load_torch_ckpt(
                 bin_path,
                 map_location="cpu",
             )
@@ -2442,7 +2442,7 @@ def _load_hf_bin_checkpoint(model_path: str) -> Optional[dict[str, torch.Tensor]
     # Single file
     single = os.path.join(model_path, "pytorch_model.bin")
     if os.path.isfile(single):
-        return load_torch_checkpoint(
+        return load_torch_ckpt(
             single,
             map_location="cpu",
         )
@@ -2450,7 +2450,7 @@ def _load_hf_bin_checkpoint(model_path: str) -> Optional[dict[str, torch.Tensor]
     # Glob fallback
     out = {}
     for bin_path in sorted(glob.glob(os.path.join(model_path, "*.bin"))):
-        shard = load_torch_checkpoint(
+        shard = load_torch_ckpt(
             bin_path,
             map_location="cpu",
         )

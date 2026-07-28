@@ -43,7 +43,7 @@ from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel.components.checkpoint.checkpointing import (
     Checkpointer,
     CheckpointingConfig,
-    load_torch_checkpoint,
+    load_torch_ckpt,
     save_config,
 )
 from nemo_automodel.components.checkpoint.utils import find_latest_checkpoint, resolve_restore_from_to_checkpoint_dir
@@ -1246,7 +1246,7 @@ class TrainDSparkRecipe(BaseRecipe):
         """Restore DSpark meta: global_step and epoch, and validate mask_token_id."""
         meta_path = os.path.join(ckpt_dir, "dspark_meta.pt")
         if os.path.exists(meta_path):
-            meta = load_torch_checkpoint(
+            meta = load_torch_ckpt(
                 meta_path,
                 map_location="cpu",
             )

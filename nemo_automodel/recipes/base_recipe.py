@@ -44,7 +44,7 @@ except ImportError:
     from transformers.tokenization_utils import PreTrainedTokenizerBase
 
 from nemo_automodel.components.checkpoint.checkpointing import (
-    load_torch_checkpoint,
+    load_torch_ckpt,
     save_config,
 )
 from nemo_automodel.components.checkpoint.utils import (
@@ -646,7 +646,7 @@ class BaseRecipe:
                 continue
             else:
                 obj.load_state_dict(
-                    load_torch_checkpoint(
+                    load_torch_ckpt(
                         os.path.join(ckpt_dir, f"{key}.pt"),
                     )
                 )
