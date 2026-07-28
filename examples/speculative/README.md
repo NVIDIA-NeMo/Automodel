@@ -46,6 +46,10 @@ The shipped example configs only cover a subset.
 - **gpt-oss** (`GptOssForCausalLM`): EAGLE-3 only, via a dedicated draft class.
 - **DeepSeek-V3** (`DeepseekV3ForCausalLM`): EAGLE-3 only, via a dedicated MLA
   draft class (eager attention; sequence packing not supported yet).
+- **Kimi K3** (`KimiK3ForCausalLM`, `KimiK3ForConditionalGeneration`): EAGLE-3
+  only, via a dedicated NoPE-MLA draft class (eager attention; no context or
+  tensor parallelism and no sequence packing, see
+  `eagle3/README_kimi_k3.md`).
 - **DFlash / Domino / JetSpec**: `Qwen3ForCausalLM`, `Qwen3MoeForCausalLM`.
 - **DSpark**: `Qwen3ForCausalLM`, `Qwen3MoeForCausalLM`,
   `DeepseekV4ForCausalLM`, GLM-5.2 (`GlmMoeDsaForCausalLM`), Gemma4
@@ -505,8 +509,8 @@ Implementation:
 ```
 nemo_automodel/components/speculative/
   eagle/        core(.py/_v12), draft_llama(.py/_v12), draft_gpt_oss,
-                draft_deepseek, backend, registry, target(.py/_v12),
-                peagle_*, remote/
+                draft_deepseek, draft_kimi_k3, backend, registry,
+                target(.py/_v12), peagle_*, remote/
   dflash/       core, domino_core, jetspec_core, draft_qwen3, registry, target
   dspark/       core, draft_qwen3, draft_deepseek_v4, draft_glm_5_2,
                 draft_gemma4, draft_minimax_m3, markov_head, registry, target

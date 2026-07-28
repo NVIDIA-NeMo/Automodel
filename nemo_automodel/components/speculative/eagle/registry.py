@@ -43,6 +43,7 @@ from transformers import PreTrainedModel
 from nemo_automodel.components.speculative.eagle.draft_deepseek import DeepseekV3Eagle3DraftModel
 from nemo_automodel.components.speculative.eagle.draft_gemma import Gemma4Eagle3DraftModel
 from nemo_automodel.components.speculative.eagle.draft_gpt_oss import GptOssEagle3DraftModel
+from nemo_automodel.components.speculative.eagle.draft_kimi_k3 import KimiK3Eagle3DraftModel
 from nemo_automodel.components.speculative.eagle.draft_llama import LlamaEagle3DraftModel
 from nemo_automodel.components.speculative.eagle.draft_llama_v12 import LlamaEagleDraftModel
 
@@ -96,6 +97,17 @@ EAGLE3_DRAFT_REGISTRY["DeepseekV3ForCausalLM"] = DraftSpec(draft_cls=DeepseekV3E
 # under ``model.language_model.layers`` (handled by the target wrapper's
 # ``_get_transformer_layers``). Only EAGLE-3 is wired up.
 EAGLE3_DRAFT_REGISTRY["Gemma4ForConditionalGeneration"] = DraftSpec(draft_cls=Gemma4Eagle3DraftModel)
+
+# Kimi K3 target: a hybrid KDA / MLA backbone whose full-attention layers use NoPE
+# MLA with an output gate and a SiTU MLP, so neither the dense draft nor the
+# DeepSeek MLA draft (which always rotates the rope slice) fits -- see
+# ``draft_kimi_k3.py``. The draft mirrors one MLA layer and drops KDA, the routed
+# experts and the attention-residual mixer. Both the text-only checkpoint
+# (``KimiK3ForCausalLM``) and the vision-language one (``KimiK3ForConditionalGeneration``,
+# whose decoder config is nested under ``config.text_config``) map to it; the draft
+# is text-only in either case. Only EAGLE-3 is wired up.
+EAGLE3_DRAFT_REGISTRY["KimiK3ForCausalLM"] = DraftSpec(draft_cls=KimiK3Eagle3DraftModel)
+EAGLE3_DRAFT_REGISTRY["KimiK3ForConditionalGeneration"] = DraftSpec(draft_cls=KimiK3Eagle3DraftModel)
 
 
 EAGLE1_DRAFT_REGISTRY: dict[str, DraftSpec] = {
