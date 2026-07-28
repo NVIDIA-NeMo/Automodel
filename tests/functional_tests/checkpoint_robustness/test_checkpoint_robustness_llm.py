@@ -882,7 +882,18 @@ def _get_logits_pp(trainer, input_ids, device) -> torch.Tensor:
 
     captured = [None]
 
-    def _capture_loss_fn(logits, target, **_):
+    def _capture_loss_fn(output, target, **_):
+        """Capture the main logits from a pipeline loss input.
+
+        Args:
+            output: Tensor of shape [microbatch, sequence, vocab], or an MTP tuple whose first element has that shape.
+            target: Tensor of shape [microbatch, sequence]. Unused.
+            **_: Unused loss keyword arguments.
+
+        Returns:
+            Scalar zero tensor on the logits device.
+        """
+        logits = output[0] if isinstance(output, tuple) else output
         captured[0] = logits.detach().float().clone()
         return logits.new_tensor(0.0, dtype=logits.dtype)
 
