@@ -209,8 +209,11 @@ def _install_torch_and_layers_stubs(monkeypatch):
     utils_checkpoint_stub.CheckpointPolicy = CheckpointPolicy
     utils_checkpoint_stub.create_selective_checkpoint_contexts = create_selective_checkpoint_contexts
 
-    # ops.aten.mm.default sentinel
-    aten = types.SimpleNamespace(mm=types.SimpleNamespace(default=object()))
+    # Router ops used by the targeted activation-checkpointing policy.
+    aten = types.SimpleNamespace(
+        mm=types.SimpleNamespace(default=object()),
+        topk=types.SimpleNamespace(default=object()),
+    )
     torch_stub.ops = types.SimpleNamespace(aten=aten)
 
     # dtype and device classes for type annotations
@@ -597,7 +600,7 @@ def test_apply_ac_uses_generic_wrapper_even_when_block_local_checkpointing_is_av
     assert model.layers.registered["0"] is wrapped
 
 
-def test_apply_ac_custom_policy_respects_hidden_and_expert_dims(monkeypatch):
+def test_apply_ac_custom_policy_saves_router_projection_and_topk(monkeypatch):
     P = _import_parallelizer_with_stubs(monkeypatch)
 
     captured_policy = None
@@ -630,10 +633,12 @@ def test_apply_ac_custom_policy_respects_hidden_and_expert_dims(monkeypatch):
 
     policy = captured_policy
     must_save = policy(None, torch_stub.ops.aten.mm.default, object(), rhs_match)
+    must_save_topk = policy(None, torch_stub.ops.aten.topk.default, object(), 2)
     prefer_recompute_shape = policy(None, torch_stub.ops.aten.mm.default, object(), rhs_mismatch)
     prefer_recompute_func = policy(None, object(), object(), rhs_match)
 
     assert must_save == P.CheckpointPolicy.MUST_SAVE
+    assert must_save_topk == P.CheckpointPolicy.MUST_SAVE
     assert prefer_recompute_shape == P.CheckpointPolicy.PREFER_RECOMPUTE
     assert prefer_recompute_func == P.CheckpointPolicy.PREFER_RECOMPUTE
 
