@@ -846,9 +846,7 @@ class GroupedExpertsDeepEP(nn.Module):
             token_indices=indices,
         )
         permuted_probs = permuted_probs.unsqueeze(-1)
-        activation_probs = (
-            torch.ones_like(permuted_probs) if self.apply_router_weight_after_down else permuted_probs
-        )
+        activation_probs = torch.ones_like(permuted_probs) if self.apply_router_weight_after_down else permuted_probs
 
         # Cast expert weights to the activation dtype so that fp32-stored
         # parameters (e.g. under fp32 master weights) still work with kernels

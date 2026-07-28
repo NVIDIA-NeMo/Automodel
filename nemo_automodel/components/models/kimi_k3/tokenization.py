@@ -316,9 +316,7 @@ class TikTokenTokenizer(PreTrainedTokenizer):
                 if difference < 0:
                     raise ValueError("K3 assistant mask is longer than its padded input IDs.")
                 padding_values = [0] * difference
-                padded_masks.append(
-                    padding_values + mask if self.padding_side == "left" else mask + padding_values
-                )
+                padded_masks.append(padding_values + mask if self.padding_side == "left" else mask + padding_values)
             batch["assistant_masks"] = padded_masks
         if return_tensors is not None:
             batch = BatchEncoding(batch, tensor_type=return_tensors)

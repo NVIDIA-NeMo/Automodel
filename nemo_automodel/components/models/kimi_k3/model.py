@@ -404,9 +404,7 @@ class KimiMLAAttention(nn.Module):
         if backend.attn != "eager":
             if backend.attn not in ("te", "sdpa"):
                 raise ValueError(f"Kimi K3 MLA does not support backend.attn={backend.attn!r}.")
-            attention_kwargs = (
-                {"attention_dropout": self.attention_dropout} if backend.attn == "te" else {}
-            )
+            attention_kwargs = {"attention_dropout": self.attention_dropout} if backend.attn == "te" else {}
             self.attn_module, self.attn_func = initialize_attn_module_and_func(
                 attn_impl=backend.attn,
                 num_attention_heads=self.num_heads,
@@ -495,14 +493,12 @@ class KimiMLAAttention(nn.Module):
             if packed_context is not None and packed_context.has_multiple_documents:
                 if self.backend.attn != "te":
                     backend_attention_mask = attention_mask
-                    query_states, key_states, value_states, attention_kwargs = (
-                        preprocess_args_and_kwargs_for_attn(
-                            query_states,
-                            key_states,
-                            value_states,
-                            backend_attention_mask,
-                            self.backend.attn,
-                        )
+                    query_states, key_states, value_states, attention_kwargs = preprocess_args_and_kwargs_for_attn(
+                        query_states,
+                        key_states,
+                        value_states,
+                        backend_attention_mask,
+                        self.backend.attn,
                     )
                 else:
                     if attention_mask is None:
