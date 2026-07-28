@@ -29,6 +29,7 @@ from nemo_automodel.components.moe.experts import (
     GroupedExpertsDeepEP,
     _apply_bias,
     _permute_tokens_for_grouped_mm,
+    _moe_accumulator_dtype,
     _torch_mm_experts_fwd,
     get_expert_activation_for_deepep,
     is_gated_activation,
@@ -67,6 +68,89 @@ def moe_config():
         activation_limit=7.0,
         dtype=torch.bfloat16,
     )
+
+
+def test_moe_accumulator_dtype_keeps_fp32_when_grad_enabled():
+    x = torch.empty(2, 3, dtype=torch.bfloat16)
+
+    with torch.enable_grad():
+        assert _moe_accumulator_dtype(x) == torch.float32
+
+
+def test_moe_accumulator_dtype_uses_input_dtype_without_grad():
+    x = torch.empty(2, 3, dtype=torch.bfloat16)
+
+    with torch.no_grad():
+        assert _moe_accumulator_dtype(x) == torch.bfloat16
+
+
+@pytest.mark.parametrize("use_torch_mm", [False, True])
+def test_grouped_experts_no_grad_forward_preserves_input_dtype(moe_config, device, use_torch_mm):
+    if use_torch_mm and not torch.cuda.is_available():
+        pytest.skip("CUDA required for torch._grouped_mm")
+
+    backend = BackendConfig(experts="torch_mm", dispatcher="torch") if use_torch_mm else None
+    experts = GroupedExperts(moe_config, backend=backend).to(device)
+    with torch.no_grad():
+        for parameter in experts.parameters():
+            parameter.normal_(0, 0.02)
+
+    num_tokens = 8
+    x = torch.randn(num_tokens, moe_config.dim, dtype=torch.bfloat16, device=device)
+    token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+    weights = torch.rand(
+        num_tokens,
+        moe_config.n_activated_experts,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    indices = torch.randint(
+        0,
+        moe_config.n_routed_experts,
+        (num_tokens, moe_config.n_activated_experts),
+        device=device,
+    )
+
+    with torch.no_grad():
+        output = experts(x, token_mask, weights, indices)
+
+    assert output.dtype == x.dtype
+    assert output.shape == x.shape
+
+
+def test_grouped_experts_no_grad_output_stays_close_to_grad_enabled(moe_config, device):
+    torch.manual_seed(17)
+    experts = GroupedExperts(moe_config).to(device)
+    with torch.no_grad():
+        for parameter in experts.parameters():
+            parameter.normal_(0, 0.01)
+
+    num_tokens = 8
+    x = torch.randn(num_tokens, moe_config.dim, dtype=torch.bfloat16, device=device) * 0.1
+    token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+    weights = (
+        torch.rand(
+            num_tokens,
+            moe_config.n_activated_experts,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        * 0.1
+    )
+    indices = torch.randint(
+        0,
+        moe_config.n_routed_experts,
+        (num_tokens, moe_config.n_activated_experts),
+        device=device,
+    )
+
+    with torch.enable_grad():
+        grad_enabled_output = experts(x, token_mask, weights, indices).detach()
+    with torch.no_grad():
+        no_grad_output = experts(x, token_mask, weights, indices)
+
+    assert no_grad_output.dtype == x.dtype
+    torch.testing.assert_close(no_grad_output, grad_enabled_output, atol=5e-2, rtol=5e-2)
 
 
 class TestActivationFunctions:
