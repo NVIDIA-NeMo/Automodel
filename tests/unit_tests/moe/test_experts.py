@@ -29,6 +29,7 @@ from nemo_automodel.components.moe.experts import (
     GroupedExpertsDeepEP,
     _apply_bias,
     _permute_tokens_for_grouped_mm,
+    _scatter_add_chunked,
     _torch_mm_experts_fwd,
     get_expert_activation_for_deepep,
     is_gated_activation,
@@ -67,6 +68,21 @@ def moe_config():
         activation_limit=7.0,
         dtype=torch.bfloat16,
     )
+
+
+@pytest.mark.parametrize("chunk_tokens", [1, 2, 32])
+def test_scatter_add_chunked_matches_full_scatter(chunk_tokens):
+    src = (torch.arange(18, dtype=torch.float32).reshape(6, 3) / 10).to(torch.bfloat16)
+    token_ids = torch.tensor([0, 2, 1, 2, 0, 3])
+    index = token_ids.unsqueeze(1).expand_as(src)
+
+    expected = torch.zeros(4, 3, dtype=torch.float32)
+    expected.scatter_add_(0, index, src.float())
+
+    actual = torch.zeros_like(expected)
+    _scatter_add_chunked(actual, index, src, chunk_tokens=chunk_tokens)
+
+    torch.testing.assert_close(actual, expected)
 
 
 class TestActivationFunctions:
