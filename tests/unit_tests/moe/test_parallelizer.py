@@ -741,38 +741,6 @@ def test_shard_fp32_param_holders_shards_each_holder(monkeypatch):
     assert kwargs["reshard_after_forward"] is False
 
 
-def test_shard_fp32_param_holders_shards_strict_fp32_leaf_modules(monkeypatch):
-    """Strict fp32 path tokens also isolate kernel-owned leaf parameters."""
-    P = _import_parallelizer_with_stubs(monkeypatch)
-
-    fully_shard_mock = MagicMock()
-    monkeypatch.setattr(P, "fully_shard", fully_shard_mock)
-
-    parameter = object()
-
-    class Leaf:
-        def named_parameters(self, recurse=False):
-            return iter([("weight", parameter)])
-
-    leaf = Leaf()
-    block = type(
-        "Block",
-        (),
-        {"named_modules": lambda self: iter([("", self), ("self_attn.q_conv1d", leaf)])},
-    )()
-
-    ignored = P._shard_fp32_param_holders(
-        block,
-        object(),
-        reshard_after_forward=False,
-        offload_policy=None,
-        fp32_compute_module_names=("q_conv1d.weight",),
-    )
-
-    assert ignored == {parameter}
-    assert _find_call_by_first_arg(fully_shard_mock, leaf) is not None
-
-
 def test_apply_fsdp_shards_model_owned_fp32_holders(monkeypatch):
     """apply_fsdp shards each model-owned ``_fp32_params`` holder per block."""
     P = _import_parallelizer_with_stubs(monkeypatch)

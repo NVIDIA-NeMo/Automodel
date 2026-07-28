@@ -16,8 +16,26 @@ import torch
 
 from nemo_automodel.components.models.kimi_k3.state_dict_adapter import (
     KimiK3StateDictAdapter,
+    _route_kda_fp32_holder,
+    _strip_kda_fp32_holder,
     dequantize_mxfp4,
 )
+
+
+def test_kda_fp32_holder_keys_round_trip_to_hf_layout():
+    hf_to_native = {
+        "model.layers.9.self_attn.A_log": "model.layers.9.self_attn._fp32_params.A_log",
+        "model.layers.9.self_attn.dt_bias": "model.layers.9.self_attn._fp32_params.dt_bias",
+        "model.layers.9.self_attn.q_conv1d.weight": ("model.layers.9.self_attn.q_conv1d._fp32_params.weight"),
+        "model.layers.9.self_attn.k_conv1d.weight": ("model.layers.9.self_attn.k_conv1d._fp32_params.weight"),
+        "model.layers.9.self_attn.v_conv1d.weight": ("model.layers.9.self_attn.v_conv1d._fp32_params.weight"),
+        "model.layers.9.self_attn.o_norm.weight": "model.layers.9.self_attn.o_norm._fp32_params.weight",
+    }
+
+    for hf_key, native_key in hf_to_native.items():
+        assert _route_kda_fp32_holder(hf_key) == native_key
+        assert _route_kda_fp32_holder(native_key) == native_key
+        assert _strip_kda_fp32_holder(native_key) == hf_key
 
 
 def test_mxfp4_load_dequantizes_directly_into_noncontiguous_model_view():

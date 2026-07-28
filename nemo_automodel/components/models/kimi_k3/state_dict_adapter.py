@@ -43,6 +43,8 @@ _FP32_KEY_PARTS = (
     "o_norm.weight",
 )
 _KDA_FP32_HOLDER = re.compile(r"(\.self_attn)\._fp32_params\.")
+_KDA_FP32_OP_HOLDER = re.compile(r"(\.self_attn\.(?:q_conv1d|k_conv1d|v_conv1d|o_norm))\._fp32_params\.")
+_KDA_FP32_OP_PARAM = re.compile(r"(\.self_attn\.(?:q_conv1d|k_conv1d|v_conv1d|o_norm))\.(weight)$")
 _KDA_FP32_PARAM_NAMES = ("A_log", "dt_bias")
 _MXFP4_VALUES = (
     0.0,
@@ -94,13 +96,17 @@ def _upcast_fp32_state_tensor(key: str, value: Any) -> Any:
 
 
 def _strip_kda_fp32_holder(key: str) -> str:
+    key = _KDA_FP32_OP_HOLDER.sub(r"\1.", key)
     return _KDA_FP32_HOLDER.sub(r"\1.", key)
 
 
 def _route_kda_fp32_holder(key: str) -> str:
-    if not key.endswith(_KDA_FP32_PARAM_NAMES):
-        return key
     if "._fp32_params." in key:
+        return key
+    routed = _KDA_FP32_OP_PARAM.sub(r"\1._fp32_params.\2", key)
+    if routed != key:
+        return routed
+    if not key.endswith(_KDA_FP32_PARAM_NAMES):
         return key
     if ".self_attn." not in key:
         return key

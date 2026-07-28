@@ -590,6 +590,27 @@ class _KimiKDAFp32Param:
         raise AttributeError(f"{type(obj).__name__} has no KDA fp32 parameter {self.name!r}.")
 
 
+class _KimiFp32Module(nn.Module):
+    """Keep a callable FLA operator in its own fp32 FSDP unit."""
+
+    def __init__(self, module: nn.Module) -> None:
+        super().__init__()
+        self._fp32_params = module
+
+    @property
+    def weight(self) -> nn.Parameter:
+        """Expose the wrapped weight under the reference module API."""
+        return self._fp32_params.weight
+
+    def reset_parameters(self) -> None:
+        """Reset the wrapped operator."""
+        self._fp32_params.reset_parameters()
+
+    def forward(self, *args: Any, **kwargs: Any) -> Any:
+        """Run the operator while its fp32 FSDP unit is unsharded."""
+        return self._fp32_params(*args, **kwargs)
+
+
 class KimiKDAFp32Params(nn.Module):
     """Own KDA recurrent-decay parameters and compute the FP32 decay gate."""
 
@@ -651,23 +672,29 @@ class KimiDeltaAttention(nn.Module):
         self.q_proj = nn.Linear(self.hidden_size, projection_k_size, bias=False, dtype=dtype)
         self.k_proj = nn.Linear(self.hidden_size, projection_k_size, bias=False, dtype=dtype)
         self.v_proj = nn.Linear(self.hidden_size, projection_size, bias=False, dtype=dtype)
-        self.q_conv1d = ShortConvolution(
-            hidden_size=projection_k_size,
-            kernel_size=self.conv_size,
-            activation="silu",
-            dtype=torch.float32,
+        self.q_conv1d = _KimiFp32Module(
+            ShortConvolution(
+                hidden_size=projection_k_size,
+                kernel_size=self.conv_size,
+                activation="silu",
+                dtype=torch.float32,
+            )
         )
-        self.k_conv1d = ShortConvolution(
-            hidden_size=projection_k_size,
-            kernel_size=self.conv_size,
-            activation="silu",
-            dtype=torch.float32,
+        self.k_conv1d = _KimiFp32Module(
+            ShortConvolution(
+                hidden_size=projection_k_size,
+                kernel_size=self.conv_size,
+                activation="silu",
+                dtype=torch.float32,
+            )
         )
-        self.v_conv1d = ShortConvolution(
-            hidden_size=projection_size,
-            kernel_size=self.conv_size,
-            activation="silu",
-            dtype=torch.float32,
+        self.v_conv1d = _KimiFp32Module(
+            ShortConvolution(
+                hidden_size=projection_size,
+                kernel_size=self.conv_size,
+                activation="silu",
+                dtype=torch.float32,
+            )
         )
 
         self._fp32_params = KimiKDAFp32Params(self.num_heads, projection_size)
@@ -681,11 +708,13 @@ class KimiDeltaAttention(nn.Module):
         else:
             self.g_a_proj = nn.Linear(self.hidden_size, self.head_dim, bias=False, dtype=dtype)
             self.g_b_proj = nn.Linear(self.head_dim, projection_size, bias=False, dtype=dtype)
-        self.o_norm = FusedRMSNormGated(
-            self.head_dim,
-            eps=config.rms_norm_eps,
-            activation="sigmoid",
-            dtype=torch.float32,
+        self.o_norm = _KimiFp32Module(
+            FusedRMSNormGated(
+                self.head_dim,
+                eps=config.rms_norm_eps,
+                activation="sigmoid",
+                dtype=torch.float32,
+            )
         )
         self.o_proj = nn.Linear(projection_size, self.hidden_size, bias=False, dtype=dtype)
         self._cp_mesh = None
@@ -1547,12 +1576,8 @@ class KimiK3ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     _keep_in_fp32_modules = [
         "_fp32_params",
         "e_score_correction_bias",
-        "q_conv1d",
-        "k_conv1d",
-        "v_conv1d",
-        "o_norm",
     ]
-    _keep_in_fp32_modules_strict = _keep_in_fp32_modules
+    _keep_in_fp32_modules_strict = ["_fp32_params"]
     # Kimi Linear owns context parallelism end to end: it shards the batch itself
     # (contiguous slices, as FLA's CP kernels require) and each layer type carries
     # its own transport, so CP does not depend on the attention backend.
