@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import getpass
-import json
 import logging
 import math
 import os
@@ -43,7 +42,7 @@ except ImportError:
     # < v5
     from transformers.tokenization_utils import PreTrainedTokenizerBase
 
-from nemo_automodel.components.checkpoint.checkpointing import save_config
+from nemo_automodel.components.checkpoint.checkpointing import save_config, save_losses
 from nemo_automodel.components.checkpoint.utils import (
     checkpoint_lifecycle_is_supported,
     clear_checkpoint_incomplete,
@@ -247,8 +246,11 @@ class BaseRecipe:
         by a single reduction, so any failure raises on every rank rather than
         killing rank 0 and leaving the others blocked in the next collective.
 
-        ``msc://`` checkpoint roots are object storage with no local directory to
-        reserve, so the whole step is skipped there.
+        For ``msc://`` roots only the leftover cleanup and the marker are skipped,
+        since both are local filesystem operations. Directory creation still runs:
+        the rest of the save path writes rank-0 files under ``path`` with plain
+        ``open``/``torch.save``, so removing it would turn a remote save into a
+        rank-0 ``FileNotFoundError`` and hang the other ranks.
 
         Args:
             path: Checkpoint directory for the current step.
@@ -258,27 +260,27 @@ class BaseRecipe:
         """
         is_dist_initialized = torch.distributed.is_initialized()
         is_rank_0 = not is_dist_initialized or torch.distributed.get_rank() == 0
+        lifecycle_supported = checkpoint_lifecycle_is_supported(path)
 
-        if not checkpoint_lifecycle_is_supported(path):
-            if is_rank_0:
-                logger.warning(
-                    "Checkpoint directory %s is remote storage; leftover-directory cleanup and "
-                    "interrupted-save detection are unavailable for it",
-                    path,
-                )
-            return
+        if not lifecycle_supported and is_rank_0:
+            logger.warning(
+                "Checkpoint directory %s is remote storage; leftover-directory cleanup and "
+                "interrupted-save detection are unavailable for it",
+                path,
+            )
 
         setup_error: OSError | None = None
         if is_rank_0:
             try:
-                if os.path.exists(path):
+                if lifecycle_supported and os.path.exists(path):
                     if is_checkpoint_incomplete(path):
                         logger.warning("Removing checkpoint directory %s left behind by an interrupted save", path)
                     else:
                         logger.warning("Overwriting existing checkpoint directory %s", path)
                     shutil.rmtree(path)
                 os.makedirs(path, exist_ok=True)
-                mark_checkpoint_incomplete(path)
+                if lifecycle_supported:
+                    mark_checkpoint_incomplete(path)
             except OSError as exc:
                 # Recorded instead of raised here: rank 0 has to reach the reduction
                 # below so the failure aborts every rank instead of stranding them.
@@ -316,7 +318,7 @@ class BaseRecipe:
             )
         return bool(flag.item())
 
-    def _publish_checkpoint(self, path: str) -> None:
+    def _publish_checkpoint(self, path: str) -> bool:
         """Mark a fully written checkpoint as complete and advance the LATEST pointer.
 
         This is the point at which a checkpoint becomes eligible for resume, so
@@ -325,22 +327,28 @@ class BaseRecipe:
 
         A failure to clear the marker is logged rather than raised, because raising
         on rank 0 alone would strand the other ranks in the next collective. LATEST
-        is then left where it is, so the checkpoint stays flagged incomplete and
-        resume falls back to the previous complete one.
+        is then left where it is and the caller must skip every other pointer and
+        retention update, so no pointer ends up aimed at a checkpoint that still
+        reads as incomplete.
 
         Args:
             path: Checkpoint directory whose components have all been written.
+
+        Returns:
+            True when the checkpoint was published and dependent pointer and
+            retention updates may proceed.
         """
         try:
             clear_checkpoint_incomplete(path)
         except OSError:
             logger.exception(
-                "Failed to clear the in-progress marker on %s; leaving LATEST unchanged so resume "
-                "falls back to the previous complete checkpoint",
+                "Failed to clear the in-progress marker on %s; leaving the checkpoint pointers "
+                "unchanged so resume falls back to the previous complete checkpoint",
                 path,
             )
-            return
+            return False
         self._update_latest_symlink(path)
+        return True
 
     def save_checkpoint(
         self,
@@ -404,11 +412,7 @@ class BaseRecipe:
                     loss_dict["val_loss"] = val_loss[key]
                 else:
                     loss_dict.update(val_loss)
-            with open(os.path.join(path, "losses.json"), "w") as f:
-                try:
-                    json.dump({k: to_item(v) for k, v in loss_dict.items()}, f)
-                except (TypeError, ValueError, OSError):
-                    logger.warning("Failed to write checkpoint loss metadata to %s", f.name, exc_info=True)
+            save_losses({k: to_item(v) for k, v in loss_dict.items()}, path)
 
         if is_dist_initialized:
             _dist_barrier(getattr(getattr(self, "mesh_context", None), "process_group", None))
@@ -514,8 +518,7 @@ class BaseRecipe:
             )
         else:
             # Sync: update immediately
-            if is_rank_0:
-                self._publish_checkpoint(path)
+            if is_rank_0 and self._publish_checkpoint(path):
                 if best_val_metric is not None:
                     self._update_best_symlink(path, float(best_val_metric), best_metric_name)
                 self._prune_old_checkpoints()
@@ -545,15 +548,19 @@ class BaseRecipe:
         is_dist_initialized = torch.distributed.is_initialized()
         is_rank_0 = not is_dist_initialized or torch.distributed.get_rank() == 0
         process_group = getattr(getattr(self, "mesh_context", None), "process_group", None)
+        # Gates the pointer and retention updates below. Only rank 0 publishes, and only
+        # rank 0 acts on this flag; the barriers stay unconditional so ranks keep the same
+        # collective sequence whether or not publication succeeded.
+        published = True
         if prev_pending is not None:
             if is_rank_0:
-                self._publish_checkpoint(prev_pending)
+                published = self._publish_checkpoint(prev_pending)
             setattr(self, "_last_pending_checkpoint_dir", None)
             if is_dist_initialized:
                 _dist_barrier(process_group)
 
         if prev_best_pending is not None:
-            if is_rank_0 and prev_best_pending.get("val") is not None:
+            if is_rank_0 and published and prev_best_pending.get("val") is not None:
                 self._update_best_symlink(
                     prev_best_pending["path"],
                     float(prev_best_pending["val"]),
@@ -563,7 +570,7 @@ class BaseRecipe:
             if is_dist_initialized:
                 _dist_barrier(process_group)
 
-        if is_rank_0:
+        if is_rank_0 and published:
             self._prune_old_checkpoints()
         if is_dist_initialized:
             _dist_barrier(process_group)

@@ -14,6 +14,7 @@
 
 import gc
 import glob
+import json
 import logging
 import os
 import time
@@ -1694,6 +1695,31 @@ def save_config(config: dict[str, Any], weights_path: str) -> None:
     else:
         with open(config_path, "w") as f:
             yaml.dump(config, f, sort_keys=False, default_flow_style=False)
+
+
+def save_losses(losses: dict[str, Any], weights_path: str) -> None:
+    """Write checkpoint loss metadata to ``weights_path/losses.json``.
+
+    Mirrors :func:`save_config` so the file lands in the checkpoint directory for
+    both local and ``msc://`` roots. Failures are logged rather than raised: this
+    is metadata written on rank 0 only, so raising would strand the other ranks
+    in the next collective.
+
+    Args:
+        losses: Loss values to record. Values must be JSON-serializable.
+        weights_path: Checkpoint directory.
+    """
+    losses_path = os.path.join(weights_path, "losses.json")
+    try:
+        if is_cloud_path(weights_path):
+            _ensure_msc_available()
+            with msc.open(losses_path, "w") as f:
+                json.dump(losses, f)
+        else:
+            with open(losses_path, "w") as f:
+                json.dump(losses, f)
+    except (TypeError, ValueError, OSError):
+        logger.warning("Failed to write checkpoint loss metadata to %s", losses_path, exc_info=True)
 
 
 def _ensure_dirs(*dirs: Optional[str], process_group: torch.distributed.ProcessGroup | None = None) -> None:

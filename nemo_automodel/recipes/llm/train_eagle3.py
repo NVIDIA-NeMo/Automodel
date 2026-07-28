@@ -16,7 +16,6 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import pathlib
@@ -37,6 +36,7 @@ from nemo_automodel.components.checkpoint.checkpointing import (
     CheckpointingConfig,
     load_hf_safetensors_state_dict,
     save_config,
+    save_losses,
 )
 from nemo_automodel.components.checkpoint.utils import find_latest_checkpoint, resolve_restore_from_to_checkpoint_dir
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
@@ -1417,8 +1417,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                 for k, v in val_loss.items():
                     loss_dict[k] = float(v)
             if loss_dict:
-                with open(os.path.join(path, "losses.json"), "w") as f:
-                    json.dump(loss_dict, f)
+                save_losses(loss_dict, path)
         if is_dist_initialized:
             dist.barrier()
 
@@ -1461,8 +1460,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                 },
             )
         else:
-            if is_rank_0:
-                self._publish_checkpoint(path)
+            if is_rank_0 and self._publish_checkpoint(path):
                 if best_val_metric is not None:
                     self._update_best_symlink(path, float(best_val_metric), best_metric_name)
                 self._prune_old_checkpoints()

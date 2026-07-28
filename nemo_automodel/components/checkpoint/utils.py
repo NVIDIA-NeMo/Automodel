@@ -296,18 +296,30 @@ def resolve_restore_from_to_checkpoint_dir(checkpoint_dir: str | Path, restore_f
     Returns:
         - str: resolved checkpoint directory
         - None: if restore_from='LATEST' but no checkpoint found (caller should start fresh)
+
+    Raises:
+        RuntimeError: If a named pointer other than LATEST targets a checkpoint that an
+            interrupted save left incomplete.
     """
     # Handle checkpoint-root pointers such as LATEST and LOWEST_VAL. A pointer whose
-    # target an interrupted save left incomplete is not resumable, so it is skipped
-    # here: LATEST then falls back to the most recent complete checkpoint below, and
-    # any other pointer fails loudly rather than restoring a partial checkpoint.
+    # target an interrupted save left incomplete is not resumable. LATEST falls back
+    # to the most recent complete checkpoint below; any other pointer raises, because
+    # falling through would return the pointer path itself, which resolves straight
+    # back to the incomplete target.
     if os.path.sep not in restore_from and not os.path.isabs(restore_from):
         pointed_checkpoint = read_checkpoint_pointer(checkpoint_dir, restore_from)
         if pointed_checkpoint is not None and pointed_checkpoint.is_dir():
             if not is_checkpoint_incomplete(pointed_checkpoint):
                 return os.fspath(pointed_checkpoint)
+            if restore_from.upper() != "LATEST":
+                raise RuntimeError(
+                    f"checkpoint.restore_from={restore_from!r} points at {pointed_checkpoint}, which an "
+                    "interrupted save left incomplete. Set checkpoint.restore_from to a complete "
+                    "checkpoint directory, or remove the pointer to fall back to the most recent one."
+                )
             logger.warning(
-                "checkpoint.restore_from=%r points at %s, which an interrupted save left incomplete",
+                "checkpoint.restore_from=%r points at %s, which an interrupted save left incomplete; "
+                "falling back to the most recent complete checkpoint",
                 restore_from,
                 pointed_checkpoint,
             )
