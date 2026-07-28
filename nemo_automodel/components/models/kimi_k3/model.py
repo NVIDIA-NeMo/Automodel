@@ -1959,23 +1959,45 @@ class KimiK3ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             output_hidden_states=output_hidden_states,
         )
 
-    def prepare_model_inputs_for_cp(self, input_ids: torch.Tensor | None = None, **kwargs: Any) -> dict[str, Any]:
-        """Hand the recipe Kimi Linear's own context-parallel batch sharding.
+    def prepare_model_inputs_for_cp(
+        self,
+        batch: dict[str, Any],
+        *,
+        num_chunks: int = 1,
+    ) -> dict[str, Any]:
+        """Hand the recipe Kimi K3's own context-parallel batch sharding.
 
         KDA's recurrent state (and FLA's CP kernels) require every rank to own one
-        contiguous slice of the sequence, so Kimi Linear replaces the default
-        load-balanced ``context_parallel`` sharding with
+        contiguous slice of the sequence, so Kimi K3 replaces the default
+        load-balanced context-parallel sharding with
         :func:`~nemo_automodel.components.models.kimi_k3.cp.shard_batch_for_kimi_cp`.
 
         Args:
-            input_ids: Token ids of the unsharded batch; accepted for interface parity.
-            **kwargs: Additional recipe arguments; accepted for interface parity.
+            batch: Full-sequence batch; left untouched until the returned sharder runs.
+            num_chunks: Accepted for CP hook signature parity; K3 uses one contiguous shard.
 
         Returns:
-            Batch updates carrying the model-owned sharding callable.
+            Batch updates carrying the model-owned context-parallel sharder.
         """
-        del input_ids, kwargs
-        return {"_cp_make_batch_fn": shard_batch_for_kimi_cp}
+        from nemo_automodel.components.distributed.context_parallel.sharder import (  # noqa: PLC0415
+            ContextParallelSharder,
+            contiguous_local_indices,
+        )
+
+        cp_mesh = getattr(self, "cp_mesh", None)
+        if cp_mesh is None:
+            raise RuntimeError("Kimi K3 context-parallel input preparation requires a CP mesh.")
+        for module in self.modules():
+            if isinstance(module, (KimiMLAAttention, KimiDeltaAttention)):
+                module.setup_cp_attention(cp_mesh)
+
+        del batch, num_chunks
+        return {
+            "cp_sharder": ContextParallelSharder(
+                shard_batch=shard_batch_for_kimi_cp,
+                local_token_global_indices=contiguous_local_indices,
+            )
+        }
 
     def update_moe_gate_bias(self) -> None:
         self.model.update_moe_gate_bias()
