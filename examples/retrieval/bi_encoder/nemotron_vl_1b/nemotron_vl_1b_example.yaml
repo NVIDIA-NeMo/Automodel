@@ -111,7 +111,7 @@ wandb:
 
 ci:
   recipe_owner: yuhez
-  time: "02:00:00"
+  time: "00:45:00"
   nodes: 1
   nightly:
     # CI uses the public text corpus; checkpoint robustness separately tests
