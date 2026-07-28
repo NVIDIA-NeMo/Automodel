@@ -1268,8 +1268,6 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
                 input_ids, position_ids, padding_mask, kwargs
             )
             attention_mask = None
-            if padding_mask is not None:
-                kwargs["padding_mask"] = padding_mask
 
         # Context-parallel: embed + vision-splice the full sequence, then select
         # the packed contiguous shard or the ordinary round-robin chunk pair.
