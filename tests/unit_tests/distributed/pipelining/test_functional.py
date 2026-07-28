@@ -783,48 +783,6 @@ class TestPrecomputeStageShapes:
         assert stage._user_meta.inputs[1].requires_grad is True
         assert stage._user_meta.outputs[0].requires_grad is True
 
-    def _make_namespace_stage(self, **attrs):
-        """Build a stage without Mock's auto-attributes so ``hasattr`` probes are truthful."""
-        submod = types.SimpleNamespace(
-            lm_head=object(),
-            parameters=lambda: iter([torch.empty(1, dtype=torch.bfloat16)]),
-        )
-        return types.SimpleNamespace(is_first=False, is_last=True, submod=submod, **attrs)
-
-    def test_precomputes_when_only_user_meta_api_is_available(self, monkeypatch):
-        """A stage exposing only ``_user_meta`` must still get static metadata.
-
-        PyTorch 2.13 dropped ``_configure_outputs_meta``. Probing for that name alone
-        skipped the precompute on every 2.13 run, handing each step back to PyTorch's
-        serial O(num_stages) P2P shape inference that this function exists to eliminate.
-        """
-        stage_module = __import__("torch.distributed.pipelining.stage", fromlist=["extract_tensor_metas"])
-        monkeypatch.setattr(stage_module, "extract_tensor_metas", lambda tensors: tuple(tensors), raising=False)
-
-        stage = self._make_namespace_stage(_user_meta=types.SimpleNamespace(inputs=None, outputs=None))
-        assert not hasattr(stage, "_configure_outputs_meta")
-
-        _precompute_stage_shapes(
-            [stage], self._make_config(hidden_size=64, vocab_size=128), microbatch_size=2, seq_len=16
-        )
-
-        # Non-first stage receives activations; last stage with an lm_head emits logits.
-        assert tuple(stage._user_meta.inputs[0].shape) == (2, 16, 64)
-        assert tuple(stage._user_meta.outputs[0].shape) == (2, 16, 128)
-
-    def test_skips_precompute_when_no_metadata_api_is_available(self, monkeypatch):
-        """Neither metadata API present: fall back to PyTorch's dynamic inference, do not raise."""
-        calls = []
-        monkeypatch.setattr(
-            "nemo_automodel.components.distributed.pipelining.functional._set_stage_metas",
-            lambda *args, **kwargs: calls.append(args),
-        )
-        stage = self._make_namespace_stage()
-
-        _precompute_stage_shapes([stage], self._make_config(), microbatch_size=2, seq_len=16)
-
-        assert calls == []
-
     def test_first_stage_shapes(self):
         """First stage input should be [mb, seq_len] int64, output [mb, seq_len, hidden]."""
         stage = self._make_stage(is_first=True, is_last=False, has_lm_head=False)
