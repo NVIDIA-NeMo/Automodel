@@ -127,6 +127,11 @@ def _worker(rank: int, port: int) -> None:
         assert moe.gate.e_score_correction_bias.dtype == torch.float32
         assert moe.experts.gate_and_up_projs.dtype == torch.bfloat16
 
+        with torch.no_grad():
+            sharded_weights, sharded_indices, _ = moe.gate(router_input, token_mask, cp_mesh=None)
+        torch.testing.assert_close(sharded_indices, reference_indices, rtol=0, atol=0)
+        torch.testing.assert_close(sharded_weights, reference_weights, rtol=0, atol=0)
+
         input_ids = torch.tensor([[1, 2, 3, 4]], device=rank)
         logits = model(input_ids).logits
         loss = logits.float().square().mean()
