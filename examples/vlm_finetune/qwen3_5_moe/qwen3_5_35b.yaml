@@ -122,6 +122,10 @@ ci:
     check_source_load_parity: true
     experts_implementation: grouped_mm
     hf_device_map_auto: true
+    # Qwen3.5 BF16 parity has known model/backend drift: AutoModel applies routing
+    # weights before down_proj while HF applies them after, and DeepEP combine uses
+    # different reduction numerics from HF grouped_mm's FP32 reshape-and-sum.
+    # Focused parity runs measured max/mean source KL of ~0.068/~0.0086 (AM-711).
     hf_kl_threshold: 1e-1
     loss_fn._target_: nemo_automodel.components.loss.chunked_ce.ChunkedCrossEntropy
     model.backend.experts: torch_mm
