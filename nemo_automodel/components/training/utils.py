@@ -124,6 +124,17 @@ def _clip_grad_norm_impl(
         if target_device is not None:
             break
     if target_device is None:
+        # A valid pipeline stage can have no local trainable gradients (for
+        # example, a frozen output-only stage). It must still participate in
+        # the PP norm reduction on the process group's device.
+        for p in parameters:
+            local_param = p.to_local() if isinstance(p, DTensor) else p
+            if local_param.device.type != "meta":
+                target_device = local_param.device
+                break
+    if target_device is None and pp_mesh is not None and pp_mesh.device_type == "cuda":
+        target_device = torch.device("cuda", torch.cuda.current_device())
+    if target_device is None:
         target_device = torch.device("cpu")
 
     # Compute norm for each sharding group using a scalar-first reduction:

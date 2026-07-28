@@ -531,13 +531,19 @@ def apply_ac(
     _apply_multimodal_tower_ac(model, scopes)
 
 
-def _shard_fp32_param_holders(block, fsdp_mesh, reshard_after_forward, offload_policy):
-    """Shard each ``_fp32_params`` holder in ``block`` as its own fp32 FSDP unit.
+def _shard_fp32_param_holders(
+    block,
+    fsdp_mesh,
+    reshard_after_forward,
+    offload_policy,
+    fp32_compute_module_names: tuple[str, ...] = (),
+):
+    """Shard each model-owned fp32 parameter module as its own FSDP unit.
 
-    Model implementations own the architecture-specific decision to create these
-    holders (for example Qwen3.5/Qwen3-Next GatedDeltaNet ``A_log``/``dt_bias``).
-    FSDP only treats the holder as a dtype-uniform fp32 unit and excludes its params
-    from the block's bf16 FSDP unit.
+    ``_fp32_params`` holders cover most hybrid models. Some external kernels own
+    fp32 parameters directly on leaf modules, such as K3's short convolutions and
+    fused gated RMSNorm. Those leaves are selected through the model's
+    ``_keep_in_fp32_modules_strict`` path tokens.
 
     Returns the set of holder parameters to exclude from the block's FSDP wrap.
     Blocks that do not expose ``named_modules`` (e.g. non-``nn.Module`` test
@@ -553,9 +559,18 @@ def _shard_fp32_param_holders(block, fsdp_mesh, reshard_after_forward, offload_p
     )
     ignored: set = set()
     for name, sub in block.named_modules():
-        if not name.endswith("_fp32_params"):
+        is_holder = name.endswith("_fp32_params")
+        direct_named_params = list(sub.named_parameters(recurse=False)) if hasattr(sub, "named_parameters") else []
+        matches_strict_path = any(
+            token in f"{name}.{param_name}"
+            for param_name, _ in direct_named_params
+            for token in fp32_compute_module_names
+        )
+        if not is_holder and not matches_strict_path:
             continue
-        holder_params = list(sub.parameters(recurse=False))
+        holder_params = [parameter for _, parameter in direct_named_params]
+        if not holder_params and hasattr(sub, "parameters"):
+            holder_params = list(sub.parameters(recurse=False))
         if not holder_params:
             continue
         fully_shard(
@@ -607,6 +622,7 @@ def apply_fsdp(
         mp_policy=mp_policy,
         offload_policy=offload_policy,
     )
+    fp32_compute_module_names = tuple(getattr(model, "_keep_in_fp32_modules_strict", None) or ())
 
     if hasattr(model, "model") and model.model is not None:
         _model = model.model
@@ -657,7 +673,13 @@ def apply_fsdp(
 
         # Shard model-owned fp32 holders on their own and exclude their params from
         # the block's FSDP unit to keep the block dtype-uniform.
-        fp32_ignored = _shard_fp32_param_holders(block, fsdp_mesh, reshard_after_forward, offload_policy)
+        fp32_ignored = _shard_fp32_param_holders(
+            block,
+            fsdp_mesh,
+            reshard_after_forward,
+            offload_policy,
+            fp32_compute_module_names,
+        )
         if fp32_ignored:
             ignored_params = (ignored_params or set()) | fp32_ignored
         fully_shard_default(block, ignored_params=ignored_params)

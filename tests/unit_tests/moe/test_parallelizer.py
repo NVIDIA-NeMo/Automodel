@@ -319,6 +319,28 @@ def _import_parallelizer_with_stubs(monkeypatch):
     shared_utils_stub.dtype_from_str = lambda val, default=None: default
     monkeypatch.setitem(sys.modules, "nemo_automodel.shared.utils", shared_utils_stub)
 
+    tied_weights_stub = types.ModuleType("nemo_automodel.shared.tied_weights")
+    tied_weights_stub.ensure_tied_lm_head = lambda model: None
+    monkeypatch.setitem(sys.modules, "nemo_automodel.shared.tied_weights", tied_weights_stub)
+
+    activation_checkpointing_stub = types.ModuleType("nemo_automodel.components.distributed.activation_checkpointing")
+    activation_checkpointing_stub.ensure_profiler_ops_sac_ignored = lambda: None
+    monkeypatch.setitem(
+        sys.modules,
+        "nemo_automodel.components.distributed.activation_checkpointing",
+        activation_checkpointing_stub,
+    )
+
+    distributed_config_stub = types.ModuleType("nemo_automodel.components.distributed.config")
+    distributed_config_stub.normalize_activation_checkpointing_scope = lambda value: (
+        (value,) if isinstance(value, str) else tuple(value or ("all",))
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "nemo_automodel.components.distributed.config",
+        distributed_config_stub,
+    )
+
     parallel_styles_stub = types.ModuleType("nemo_automodel.components.distributed.parallel_styles")
     parallel_styles_stub.translate_to_lora = lambda style: style
     monkeypatch.setitem(
@@ -717,6 +739,38 @@ def test_shard_fp32_param_holders_shards_each_holder(monkeypatch):
     _, kwargs = holder_call
     assert kwargs["mesh"] is mesh
     assert kwargs["reshard_after_forward"] is False
+
+
+def test_shard_fp32_param_holders_shards_strict_fp32_leaf_modules(monkeypatch):
+    """Strict fp32 path tokens also isolate kernel-owned leaf parameters."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+
+    fully_shard_mock = MagicMock()
+    monkeypatch.setattr(P, "fully_shard", fully_shard_mock)
+
+    parameter = object()
+
+    class Leaf:
+        def named_parameters(self, recurse=False):
+            return iter([("weight", parameter)])
+
+    leaf = Leaf()
+    block = type(
+        "Block",
+        (),
+        {"named_modules": lambda self: iter([("", self), ("self_attn.q_conv1d", leaf)])},
+    )()
+
+    ignored = P._shard_fp32_param_holders(
+        block,
+        object(),
+        reshard_after_forward=False,
+        offload_policy=None,
+        fp32_compute_module_names=("q_conv1d.weight",),
+    )
+
+    assert ignored == {parameter}
+    assert _find_call_by_first_arg(fully_shard_mock, leaf) is not None
 
 
 def test_apply_fsdp_shards_model_owned_fp32_holders(monkeypatch):
