@@ -392,9 +392,9 @@ deep_ep = [
   # Last pre-v2 commit on DeepEP main. This includes the NVSHMEM 3.5+ state
   # layout compatibility fix from deepseek-ai/DeepEP#564.
   { git = "https://github.com/deepseek-ai/DeepEP.git", rev = "567632dd59810d77b3cc05553df953cc0f779799", marker = "sys_platform == 'linux'", extra = "deepep_v1" },
-  # Current DeepEP main, used by the v2 elastic Buffer path (`dispatcher:
-  # deepep_v2`) and by the default `moe` extra.
-  { git = "https://github.com/deepseek-ai/DeepEP.git", rev = "dd758caf451848bd150e1046af3d0a73e5fff38d", marker = "sys_platform == 'linux'", extra = "deepep_v2" },
+  # DeepEP v2 pinned immediately before 099d5f2, used by the elastic Buffer
+  # path (`dispatcher: deepep_v2`) and by the default `moe` extra.
+  { git = "https://github.com/deepseek-ai/DeepEP.git", rev = "af9a0403188392824fc3057452822235873e0612", marker = "sys_platform == 'linux'", extra = "deepep_v2" },
   # HybridEP fork used by `dispatcher: hybridep`.
   { git = "https://github.com/deepseek-ai/DeepEP.git", rev = "e0a5b1d9848ab3e7b4a67842bf06f067bfac67f8", marker = "sys_platform == 'linux'", extra = "hybridep" },
 ]
