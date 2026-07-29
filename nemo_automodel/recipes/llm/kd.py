@@ -509,6 +509,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         with train_ctx(), torch.no_grad():
             if self.pp_enabled:
                 input_ids = batch.pop("input_ids")
+                self.teacher_pp.update_seq_len(input_ids.shape[1])
                 batch_filtered = {
                     key: value
                     for key, value in batch.items()
