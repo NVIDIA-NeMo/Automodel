@@ -160,6 +160,8 @@ class Mistral3BidirectionalConfig(Mistral3Config):
                 self.text_config.pooling = value
 
     def __init__(self, pooling: str = "avg", temperature: float = 1.0, **kwargs) -> None:
+        if temperature <= 0:
+            raise ValueError("temperature must be > 0")
         super().__init__(**kwargs)
         self.pooling = pooling
         self.temperature = temperature

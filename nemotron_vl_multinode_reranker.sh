@@ -22,7 +22,11 @@ echo "SLURM_GPUS_PER_NODE=${SLURM_GPUS_PER_NODE:-<unset>}"
 echo "SLURM_NNODES=${SLURM_NNODES:-<unset>} SLURM_JOB_NUM_NODES=${SLURM_JOB_NUM_NODES:-<unset>}"
 echo "SLURM_NTASKS=${SLURM_NTASKS:-<unset>} SLURM_NTASKS_PER_NODE=${SLURM_NTASKS_PER_NODE:-<unset>}"
 
-CONFIG_YAML=$1
+if [[ -z "${1:-}" ]]; then
+  echo "Usage: sbatch nemotron_vl_multinode_reranker.sh <config_yaml>"
+  exit 2
+fi
+CONFIG_YAML="$1"
 echo "Config YAML: ${CONFIG_YAML}"
 
 CONT=/lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/03_sqsh/nvidia-nemo-automodel-26.04.00.sqsh

@@ -25,7 +25,6 @@ from typing import Any, List, Optional, Tuple, Union
 
 from datasets import Dataset, concatenate_datasets, load_dataset
 from huggingface_hub import HfApi, hf_hub_download
-from PIL import Image
 
 EXAMPLE_TEMPLATE = {"text": "", "image": "", "nr_ocr": ""}
 
@@ -146,6 +145,8 @@ class VDRDataset(AbstractDataset):
         self.docid2idx = docid2idx
 
     def get_document_by_id(self, id):
+        from PIL import Image
+
         example = deepcopy(EXAMPLE_TEMPLATE)
         example["image"] = Image.open(io.BytesIO(self.data[self.docid2idx[id]]["image"]["bytes"]))
         return example

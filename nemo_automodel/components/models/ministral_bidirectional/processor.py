@@ -436,7 +436,11 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
         if "image_sizes" not in batch:
             batch["image_sizes"] = None
         if features and "num_labels" in features[0]:
-            batch["labels"] = torch.zeros(int(features[0]["num_labels"]), dtype=torch.long)
+            num_queries = int(features[0]["num_labels"])
+            if return_tensors == "pt":
+                batch["labels"] = torch.zeros(num_queries, dtype=torch.long)
+            else:
+                batch["labels"] = np.zeros(num_queries, dtype=np.int64)
 
         return batch
 
