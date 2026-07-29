@@ -353,7 +353,9 @@ def _import_parallelizer_with_stubs(monkeypatch):
     distributed_stub = types.ModuleType("nemo_automodel.components.distributed")
     distributed_stub.__path__ = []
     config_stub = types.ModuleType("nemo_automodel.components.distributed.config")
-    config_stub.normalize_activation_checkpointing_scope = lambda scope: (scope,) if isinstance(scope, str) else tuple(scope)
+    config_stub.normalize_activation_checkpointing_scope = lambda scope: (
+        (scope,) if isinstance(scope, str) else tuple(scope)
+    )
     pipelining_stub = types.ModuleType("nemo_automodel.components.distributed.pipelining")
     pipelining_stub.__path__ = []
     pipelining_config_stub = types.ModuleType("nemo_automodel.components.distributed.pipelining.config")
@@ -388,6 +390,28 @@ def _import_parallelizer_with_stubs(monkeypatch):
     shared_utils_stub = types.ModuleType("nemo_automodel.shared.utils")
     shared_utils_stub.dtype_from_str = lambda val, default=None: default
     monkeypatch.setitem(sys.modules, "nemo_automodel.shared.utils", shared_utils_stub)
+
+    tied_weights_stub = types.ModuleType("nemo_automodel.shared.tied_weights")
+    tied_weights_stub.ensure_tied_lm_head = lambda model: None
+    monkeypatch.setitem(sys.modules, "nemo_automodel.shared.tied_weights", tied_weights_stub)
+
+    activation_checkpointing_stub = types.ModuleType("nemo_automodel.components.distributed.activation_checkpointing")
+    activation_checkpointing_stub.ensure_profiler_ops_sac_ignored = lambda: None
+    monkeypatch.setitem(
+        sys.modules,
+        "nemo_automodel.components.distributed.activation_checkpointing",
+        activation_checkpointing_stub,
+    )
+
+    distributed_config_stub = types.ModuleType("nemo_automodel.components.distributed.config")
+    distributed_config_stub.normalize_activation_checkpointing_scope = lambda value: (
+        (value,) if isinstance(value, str) else tuple(value or ("all",))
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "nemo_automodel.components.distributed.config",
+        distributed_config_stub,
+    )
 
     parallel_styles_stub = types.ModuleType("nemo_automodel.components.distributed.parallel_styles")
     parallel_styles_stub.translate_to_lora = lambda style: style
