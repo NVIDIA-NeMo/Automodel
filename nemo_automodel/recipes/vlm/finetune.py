@@ -904,10 +904,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 self._maybe_set_pp_first_stage_embed_input_meta(model_input)
 
                 with stage_vlm_media_for_pp(self.pp, self.model_parts, batch):
-                    if self.pp.info.has_first_stage:
-                        self.pp.info.schedule.step(model_input, target=targets, losses=losses, **batch)
-                    else:
-                        self.pp.info.schedule.step(target=targets, losses=losses, **batch)
+                    self.pp.step(model_input, target=targets, losses=losses, **batch)
 
             if self.pp.info.has_last_stage:
                 local_loss = torch.sum(torch.stack(losses))
@@ -1188,9 +1185,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                         logits=getattr(out, "logits", out),
                         labels=labels,
                         model=self.model_parts[0],
-                        hidden_states=out.hidden_states[-1]
-                        if getattr(out, "hidden_states", None) is not None
-                        else None,
+                        hidden_states=get_final_hidden_states(out),
                         num_label_tokens=num_label_tokens,
                     )
                     # Mirror training: include the drafter term so validation

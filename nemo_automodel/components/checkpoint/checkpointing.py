@@ -16,6 +16,7 @@ import gc
 import glob
 import logging
 import os
+import pickle
 import time
 from dataclasses import dataclass
 from datetime import timedelta
@@ -47,6 +48,7 @@ from torch import nn
 from torch.distributed.checkpoint.storage import StorageReader, StorageWriter
 from torch.distributed.device_mesh import DeviceMesh
 from torch.nn.parallel import DistributedDataParallel
+from torch.serialization import MAP_LOCATION, FileLike
 
 from nemo_automodel.components.checkpoint._backports.consolidate_hf_safetensors import (
     consolidate_safetensors_files_on_every_rank,
@@ -89,6 +91,70 @@ _CONSOLIDATED_SIZE_WARNING_THRESHOLD_BYTES = 50 * 1024**3
 _DEFAULT_HF_CONSOLIDATED_SHARD_SIZE_BYTES = 5 * 1024**3
 
 logger = logging.getLogger(__name__)
+
+
+def _format_restricted_load_error(f: FileLike) -> str:
+    return (
+        f"Refusing to load torch artifact from {f!r} with pickle-based torch.load. "
+        "The artifact is not compatible with torch.load(weights_only=True), and loading it with "
+        "weights_only=False can execute code. Migrate the artifact in a restricted environment."
+    )
+
+
+def load_torch_ckpt(
+    f: FileLike,
+    map_location: MAP_LOCATION = None,
+    pickle_module: Any = None,
+    *,
+    weights_only: bool | None = None,
+    mmap: bool | None = None,
+    **pickle_load_args: Any,
+) -> Any:
+    """Load a torch checkpoint with restricted unpickling by default.
+
+    Args:
+        f: File path or binary file object accepted by ``torch.load``.
+        map_location: Device remapping accepted by ``torch.load``.
+        pickle_module: Module used to unpickle metadata and objects.
+        weights_only: When ``False``, explicitly opt into unrestricted pickle loading.
+            ``None`` and ``True`` use restricted loading.
+        mmap: Whether to memory-map tensor storages from a file path.
+        **pickle_load_args: Additional arguments forwarded to the unpickler.
+
+    Returns:
+        The deserialized checkpoint.
+
+    Raises:
+        RuntimeError: If restricted loading rejects the artifact.
+    """
+    if weights_only is False:
+        logger.warning(
+            "Loading torch artifact from %r with weights_only=False. This can execute code; "
+            "only load checkpoints from a trusted source.",
+            f,
+        )
+        # B614 is suppressed only for explicit caller opt-in to trusted legacy checkpoints.
+        # Remove this branch when pickle-based checkpoint compatibility is no longer supported.
+        return torch.load(  # nosec B614
+            f,
+            map_location=map_location,
+            pickle_module=pickle_module,
+            weights_only=False,
+            mmap=mmap,
+            **pickle_load_args,
+        )
+
+    try:
+        return torch.load(
+            f,
+            map_location=map_location,
+            pickle_module=pickle_module,
+            weights_only=True,
+            mmap=mmap,
+            **pickle_load_args,
+        )
+    except pickle.UnpicklingError as err:
+        raise RuntimeError(_format_restricted_load_error(f)) from err
 
 
 # NOTE [nemotron-singlegpu-lora]: the branches tagged with this marker below exist to make
@@ -604,39 +670,67 @@ class Checkpointer:
 
     @torch.no_grad()
     def save_optimizer(
-        self, optimizer: torch.optim.Optimizer, model: nn.Module, weights_path: str, scheduler: Optional[Any] = None
+        self,
+        optimizer: torch.optim.Optimizer | list[torch.optim.Optimizer],
+        model: nn.Module | list[nn.Module],
+        weights_path: str,
+        scheduler: Optional[Any] = None,
+        *,
+        optimizer_part_ids: list[int] | None = None,
     ) -> None:
         """
         Save optimizer (and optional scheduler) state to `weights_path/optim` using DCP.
 
         Args:
-            optimizer: Optimizer whose state will be saved.
-            model: Model providing partitioning context for the optimizer wrapper.
+            optimizer: Optimizer or per-model-part optimizers whose state will be saved.
+            model: Model or pipeline model parts providing partitioning context.
             weights_path: Base directory for checkpoints.
             scheduler: Optional LR scheduler to include.
+            optimizer_part_ids: Global pipeline-stage indices corresponding to
+                per-model-part optimizers.
         """
         optimizer_path = os.path.join(weights_path, "optim")
         _ensure_dirs(optimizer_path, process_group=self.process_group)
         optimizer_state = OptimizerState(
-            model, optimizer, scheduler, is_peft=self.config.is_peft, cpu_offload=self.config.cpu_offload
+            model,
+            optimizer,
+            scheduler,
+            is_peft=self.config.is_peft,
+            cpu_offload=self.config.cpu_offload,
+            has_expert_parallelism=self.moe_mesh is not None,
+            optimizer_part_ids=optimizer_part_ids,
         )
         state_dict = optimizer_state.state_dict()
         self._optim_ctx.future = self._do_save(state_dict, optimizer_path)
 
     def load_optimizer(
-        self, optimizer: torch.optim.Optimizer, model: nn.Module, weights_path: str, scheduler: Optional[Any] = None
+        self,
+        optimizer: torch.optim.Optimizer | list[torch.optim.Optimizer],
+        model: nn.Module | list[nn.Module],
+        weights_path: str,
+        scheduler: Optional[Any] = None,
+        *,
+        optimizer_part_ids: list[int] | None = None,
     ) -> None:
         """
         Load optimizer (and optional scheduler) state from `weights_path/optim` using DCP.
 
         Args:
-            optimizer: Optimizer to populate.
-            model: Model providing partitioning context for the optimizer wrapper.
+            optimizer: Optimizer or per-model-part optimizers to populate.
+            model: Model or pipeline model parts providing partitioning context.
             weights_path: Base directory for checkpoints.
             scheduler: Optional LR scheduler to populate.
+            optimizer_part_ids: Global pipeline-stage indices corresponding to
+                per-model-part optimizers.
         """
         optimizer_state = OptimizerState(
-            model, optimizer, scheduler, is_peft=self.config.is_peft, cpu_offload=self.config.cpu_offload
+            model,
+            optimizer,
+            scheduler,
+            is_peft=self.config.is_peft,
+            cpu_offload=self.config.cpu_offload,
+            has_expert_parallelism=self.moe_mesh is not None,
+            optimizer_part_ids=optimizer_part_ids,
         )
         state_dict = optimizer_state.state_dict()
         self._do_load(state_dict, os.path.join(weights_path, "optim"))
@@ -734,8 +828,7 @@ class Checkpointer:
             )
         ):
             t0 = time.monotonic()
-            weights_only = not _is_remote_code_model(model_state.model[0])
-            state_dict_from_disk = _load_hf_checkpoint_preserving_dtype(model_path, weights_only=weights_only)
+            state_dict_from_disk = _load_hf_checkpoint_preserving_dtype(model_path)
             t_disk = time.monotonic()
             if state_dict_from_disk is not None:
                 state_dict_from_disk = _maybe_adapt_state_dict_from_hf(
@@ -1163,7 +1256,10 @@ class Checkpointer:
         """
         state_dir = os.path.join(path, state_name)
         state.load_state_dict(
-            torch.load(os.path.join(state_dir, f"{state_name}_dp_rank_{self.dp_rank}.pt"), weights_only=False)
+            load_torch_ckpt(
+                os.path.join(state_dir, f"{state_name}_dp_rank_{self.dp_rank}.pt"),
+                weights_only=not self.config.allow_legacy_pickle_restore,
+            )
         )
 
     def save_distributed_state(self, state: Any, state_name: str, path: str) -> None:
@@ -1397,6 +1493,7 @@ fi
         if not _should_write_hf_metadata(self.config):
             return None
         model = model_state.model[0]
+        excluded_keys: set[str] = set()
         # we first need to find the FQN -> .safetensors mapping
         reference_path = _get_hf_safetensors_reference_path(
             self.config.model_cache_dir,
@@ -1432,6 +1529,7 @@ fi
                 # `uses_tied_lm_head=True` but must still persist their own lm_head.
                 if getattr(model_state, "has_local_tied_lm_head", False):
                     keys_to_remove.append(model_state.lm_head_param_name)
+                excluded_keys.update(keys_to_remove)
                 for key in keys_to_remove:
                     fqn_to_file_index_mapping.pop(key, None)
         else:
@@ -1454,14 +1552,18 @@ fi
                     num_shards,
                 )
 
-        # Add any missing keys from the model_state_dict
-        # These will go to the same file as the last file (or file 1 for single-file models)
+        # Add any missing keys from the global pre-shard HF state dict and the current state dict.
+        # These will go to the same file as the last file (or file 1 for single-file models).
+        # The global keys keep mappings complete under PP, while the current keys preserve
+        # parameters registered after parallelization, such as test- or application-owned weights.
         # Use default of 1 when mapping is empty (e.g., encoder models with different key prefixes)
         default_index = max(fqn_to_file_index_mapping.values()) if fqn_to_file_index_mapping else 1
 
         # add any additional keys that are not in the base checkpoint
-        for fqn in list(state_dict.keys()):
-            fqn_to_file_index_mapping[fqn] = fqn_to_file_index_mapping.get(fqn, default_index)
+        additional_keys = dict.fromkeys([*(pre_shard_hf_state_dict_keys or ()), *state_dict])
+        for fqn in additional_keys:
+            if fqn not in excluded_keys:
+                fqn_to_file_index_mapping[fqn] = fqn_to_file_index_mapping.get(fqn, default_index)
         return fqn_to_file_index_mapping
 
     def _maybe_build_original_dtype_mapping(
@@ -2272,14 +2374,7 @@ def _is_custom_model(module: nn.Module) -> bool:
     )
 
 
-def _is_remote_code_model(module: nn.Module) -> bool:
-    """True if the model was loaded with trust_remote_code (HF dynamic modules)."""
-    return any("transformers_modules" in (c.__module__ or "") for c in type(module).__mro__)
-
-
-def _load_hf_checkpoint_preserving_dtype(
-    model_path: str, weights_only: bool = True
-) -> Optional[dict[str, torch.Tensor]]:
+def _load_hf_checkpoint_preserving_dtype(model_path: str) -> Optional[dict[str, torch.Tensor]]:
     """
     Load a HuggingFace checkpoint into a new state dict so tensor dtypes
     match the checkpoint (e.g. bf16). Used when loading the base model so FSDP sees
@@ -2289,11 +2384,10 @@ def _load_hf_checkpoint_preserving_dtype(
 
     Args:
         model_path: Path to checkpoint file or directory.
-        weights_only: Forwarded to ``torch.load`` when loading ``.bin`` files.
     """
 
     if _is_bin_checkpoint(model_path):
-        return _load_hf_bin_checkpoint(model_path, weights_only=weights_only)
+        return _load_hf_bin_checkpoint(model_path)
     elif _is_safetensors_checkpoint(model_path):
         return _load_hf_safetensors_checkpoint(model_path)
     return None
@@ -2336,7 +2430,7 @@ def _load_hf_safetensors_checkpoint(model_path: str) -> Optional[dict[str, torch
 load_hf_safetensors_state_dict = _load_hf_safetensors_checkpoint
 
 
-def _load_hf_bin_checkpoint(model_path: str, weights_only: bool = True) -> Optional[dict[str, torch.Tensor]]:
+def _load_hf_bin_checkpoint(model_path: str) -> Optional[dict[str, torch.Tensor]]:
     """
     Load a HuggingFace .bin checkpoint into a state dict.
 
@@ -2346,17 +2440,15 @@ def _load_hf_bin_checkpoint(model_path: str, weights_only: bool = True) -> Optio
 
     Args:
         model_path: Path to checkpoint file or directory.
-        weights_only: Passed to ``torch.load``.  Default ``True`` for safety;
-            set to ``False`` for remote-code models whose checkpoints may
-            contain custom pickled objects.
     """
     if not _is_bin_checkpoint(model_path):
         return None
 
-    load_kwargs = dict(map_location="cpu", weights_only=weights_only)
-
     if os.path.isfile(model_path):
-        return torch.load(model_path, **load_kwargs)
+        return load_torch_ckpt(
+            model_path,
+            map_location="cpu",
+        )
 
     # Sharded: read the index and load each shard
     index_file = os.path.join(model_path, "pytorch_model.bin.index.json")
@@ -2374,7 +2466,10 @@ def _load_hf_bin_checkpoint(model_path: str, weights_only: bool = True) -> Optio
             bin_path = os.path.join(model_path, filename)
             if not os.path.isfile(bin_path):
                 continue
-            shard = torch.load(bin_path, **load_kwargs)
+            shard = load_torch_ckpt(
+                bin_path,
+                map_location="cpu",
+            )
             out.update(shard)
             loaded_files.add(filename)
         return out if out else None
@@ -2382,12 +2477,18 @@ def _load_hf_bin_checkpoint(model_path: str, weights_only: bool = True) -> Optio
     # Single file
     single = os.path.join(model_path, "pytorch_model.bin")
     if os.path.isfile(single):
-        return torch.load(single, **load_kwargs)
+        return load_torch_ckpt(
+            single,
+            map_location="cpu",
+        )
 
     # Glob fallback
     out = {}
     for bin_path in sorted(glob.glob(os.path.join(model_path, "*.bin"))):
-        shard = torch.load(bin_path, **load_kwargs)
+        shard = load_torch_ckpt(
+            bin_path,
+            map_location="cpu",
+        )
         out.update(shard)
     return out if out else None
 
