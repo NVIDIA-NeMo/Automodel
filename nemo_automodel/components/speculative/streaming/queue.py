@@ -118,7 +118,6 @@ class Lease:
     visibility_timeout: VisibilityTimeout
     redelivery_count: int = 0
     lease_id: int = field(default_factory=_next_lease_id)
-    redelivery_count: int = 0
 
 
 class SampleRefQueue:

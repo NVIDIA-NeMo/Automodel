@@ -156,6 +156,28 @@ def test_local_store_refcounts_handle_until_last_release() -> None:
     assert store.health().resident_bytes == 0
 
 
+def test_local_store_put_does_not_seed_handle_bookkeeping() -> None:
+    """put must not leave a per-sample entry in the handle table.
+
+    Regression: put previously seeded ``_handle_refs[sample_id] = 0`` on every
+    put -- an entry only get()/release() should ever create and drop. Because
+    release pops by ``handle_id``, that string-keyed seed was never removed, so
+    a long stream of unique sample_ids grew ``_handle_refs`` without bound. The
+    table must track only live get() handles.
+    """
+    store = LocalFeatureStore(max_samples=None, max_bytes=1024 * 1024)
+    for i in range(5):
+        _put(store, f"s{i}", n_bytes=64)
+    # No handles handed out yet: the table stays empty despite the puts.
+    assert store._handle_refs == {}
+
+    ref = _put(store, "s5", n_bytes=64)
+    _, handle = store.get(ref)
+    assert len(store._handle_refs) == 1  # exactly the one live handle
+    store.release(handle)
+    assert store._handle_refs == {}  # back to empty once released
+
+
 def test_local_store_release_is_idempotent() -> None:
     store = LocalFeatureStore(max_samples=4, max_bytes=1024 * 1024)
     ref = _put(store, "s1", n_bytes=128)

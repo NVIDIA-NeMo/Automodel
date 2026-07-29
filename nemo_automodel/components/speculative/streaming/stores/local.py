@@ -91,7 +91,7 @@ class LocalFeatureStore(FeatureStore):
         # The lock that guards every public method.
         self._lock = threading.Lock()
         self._storage: dict[str, dict[str, torch.Tensor]] = {}
-        self._handle_refs: dict[str, int] = {}  # sample_id -> outstanding get() handle count
+        self._handle_refs: dict[int, str] = {}  # handle_id -> sample_id (one entry per live get() handle)
         self._resident_bytes = 0
         self._closed = False
 
@@ -237,7 +237,6 @@ class LocalFeatureStore(FeatureStore):
             # the source tensor cannot disturb what we just stored, and so the
             # bytes counted in resident_bytes match what we hand out later.
             self._storage[sample_id] = {name: t.detach().clone().contiguous() for name, t in tensors.items()}
-            self._handle_refs[sample_id] = 0
             self._resident_bytes += bytes_in
             logger.debug(
                 "LocalFeatureStore put sample_id=%s features=%d bytes=%d resident=%d",
