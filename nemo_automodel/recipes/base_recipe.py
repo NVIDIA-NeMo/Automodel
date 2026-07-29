@@ -18,6 +18,7 @@ import math
 import os
 import shutil
 import socket
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
@@ -49,7 +50,6 @@ from nemo_automodel.components.checkpoint.checkpointing import (
 )
 from nemo_automodel.components.checkpoint.utils import (
     clear_checkpoint_incomplete,
-    find_checkpoint_pointers,
     find_latest_checkpoint,
     find_pointer_protected_checkpoints,
     format_missing_checkpoint_dir_error,
@@ -238,52 +238,79 @@ class BaseRecipe:
             tracked.discard(key)
 
     def _reserve_checkpoint_dir(self, path: str) -> None:
-        """Clear any leftover checkpoint directory and reserve ``path`` for this save.
+        """Reserve ``path`` for this save, replacing a leftover from an interrupted save.
 
-        Checkpoint directory names are derived from the step, so a run that
-        resumes after an interrupted save recomputes the same step and targets a
-        directory that already exists on disk. Removing the leftover keeps the
-        re-save idempotent instead of aborting the job at the same step forever.
+        Checkpoint directory names are derived from the step, so a run that resumes
+        after an interrupted save recomputes that step and targets a directory that
+        already exists. Only a directory still carrying the in-progress marker is
+        replaced: it holds a checkpoint that was never published and can never be
+        restored, so re-saving over it loses nothing.
 
-        Every filesystem step runs on rank 0 -- removing the leftover, creating the
-        directory, and writing the in-progress marker -- and all of them are covered
-        by a single reduction, so any failure raises on every rank rather than
-        killing rank 0 and leaving the others blocked in the next collective.
-
-        ``checkpoint.checkpoint_dir`` is validated to be a local filesystem path, so
-        every step here is a plain filesystem operation.
+        A directory holding a published checkpoint is never overwritten. Doing so
+        would destroy a restorable checkpoint and silently change what any pointer
+        aimed at it resolves to, so the save aborts on every rank instead.
 
         Args:
             path: Checkpoint directory for the current step.
 
         Raises:
-            RuntimeError: If the checkpoint directory could not be prepared.
+            FileExistsError: If ``path`` already holds a published checkpoint.
+            RuntimeError: If the directory could not be prepared.
         """
         is_dist_initialized = torch.distributed.is_initialized()
         is_rank_0 = not is_dist_initialized or torch.distributed.get_rank() == 0
 
-        setup_error: OSError | None = None
+        # Decided on rank 0 and reduced, so the refusal is unanimous instead of a
+        # rank-0-only raise that would strand the other ranks in the next collective.
+        holds_published = is_rank_0 and os.path.exists(path) and not is_checkpoint_incomplete(path)
+        if self._any_rank_failed(holds_published, is_dist_initialized):
+            raise FileExistsError(
+                f"Checkpoint directory {path} already holds a published checkpoint. Remove it, or point "
+                "checkpoint.checkpoint_dir at a fresh directory, before re-running this step."
+            )
+
+        def reserve() -> None:
+            if os.path.exists(path):
+                logger.warning("Replacing checkpoint directory %s left behind by an interrupted save", path)
+                shutil.rmtree(path)
+            os.makedirs(path, exist_ok=True)
+            mark_checkpoint_incomplete(path)
+
+        self._run_rank_0_checkpoint_step(reserve, f"prepare checkpoint directory {path}")
+
+    def _run_rank_0_checkpoint_step(self, operation: Callable[[], None], description: str) -> None:
+        """Run a rank-0 checkpoint filesystem step and abort every rank if it fails.
+
+        Checkpoint bookkeeping runs on rank 0 alone, and every such step is followed
+        by a collective. Letting an exception escape on rank 0 leaves the other ranks
+        blocked there until the cluster reaps the job, so the outcome is reduced:
+        either every rank continues or every rank raises.
+
+        Every rank-0 filesystem mutation in the checkpoint lifecycle goes through
+        here, so the invariant holds by construction rather than per call site.
+
+        Args:
+            operation: Filesystem work to run on rank 0. Not called on other ranks.
+            description: Step name used in the log line and the error message.
+
+        Raises:
+            RuntimeError: If rank 0 could not complete the step.
+        """
+        is_dist_initialized = torch.distributed.is_initialized()
+        is_rank_0 = not is_dist_initialized or torch.distributed.get_rank() == 0
+
+        failed = False
         if is_rank_0:
             try:
-                if os.path.exists(path):
-                    if is_checkpoint_incomplete(path):
-                        logger.warning("Removing checkpoint directory %s left behind by an interrupted save", path)
-                    else:
-                        logger.warning("Overwriting existing checkpoint directory %s", path)
-                    shutil.rmtree(path)
-                os.makedirs(path, exist_ok=True)
-                mark_checkpoint_incomplete(path)
-            except OSError as exc:
-                # Recorded instead of raised here: rank 0 has to reach the reduction
-                # below so the failure aborts every rank instead of stranding them.
-                logger.exception("Failed to prepare checkpoint directory %s", path)
-                setup_error = exc
+                operation()
+            except OSError:
+                # Recorded instead of raised: rank 0 has to reach the reduction below
+                # so the failure aborts every rank instead of stranding them.
+                logger.exception("Failed to %s", description)
+                failed = True
 
-        if self._any_rank_failed(setup_error is not None, is_dist_initialized):
-            raise RuntimeError(
-                f"Checkpoint directory {path} could not be prepared. Remove it manually or "
-                "point checkpoint.checkpoint_dir at a fresh directory."
-            ) from setup_error
+        if self._any_rank_failed(failed, is_dist_initialized):
+            raise RuntimeError(f"Failed to {description}; see the rank 0 log for the underlying error.")
 
     def _any_rank_failed(self, failed: bool, is_dist_initialized: bool) -> bool:
         """Reduce a local failure flag so every rank agrees on whether to abort.
@@ -310,37 +337,18 @@ class BaseRecipe:
             )
         return bool(flag.item())
 
-    def _publish_checkpoint(self, path: str) -> bool:
+    def _publish_checkpoint(self, path: str) -> None:
         """Mark a fully written checkpoint as complete and advance the LATEST pointer.
 
-        This is the point at which a checkpoint becomes eligible for resume, so
-        the in-progress marker is cleared here and nowhere else.
-        Only called on rank 0.
-
-        A failure to clear the marker is logged rather than raised, because raising
-        on rank 0 alone would strand the other ranks in the next collective. LATEST
-        is then left where it is and the caller must skip every other pointer and
-        retention update, so no pointer ends up aimed at a checkpoint that still
-        reads as incomplete.
+        This is the point at which a checkpoint becomes eligible for resume, so the
+        in-progress marker is cleared here and nowhere else. Runs on rank 0 inside
+        :meth:`_run_rank_0_checkpoint_step`, which reports any failure to every rank.
 
         Args:
             path: Checkpoint directory whose components have all been written.
-
-        Returns:
-            True when the checkpoint was published and dependent pointer and
-            retention updates may proceed.
         """
-        try:
-            clear_checkpoint_incomplete(path)
-        except OSError:
-            logger.exception(
-                "Failed to clear the in-progress marker on %s; leaving the checkpoint pointers "
-                "unchanged so resume falls back to the previous complete checkpoint",
-                path,
-            )
-            return False
+        clear_checkpoint_incomplete(path)
         self._update_latest_symlink(path)
-        return True
 
     def save_checkpoint(
         self,
@@ -431,11 +439,17 @@ class BaseRecipe:
             elif is_distributed_stateful(getattr(self, key)):
                 self.checkpointer.save_distributed_state(getattr(self, key), key, path)
             else:
-                if is_rank_0:
-                    torch.save(
+                # Rank-0 write followed by collectives, so it goes through the same
+                # guard: a failure here must abort every rank, not just this one.
+                # The tracked-state names are identical on every rank, so the loop
+                # issues the same reductions everywhere.
+                self._run_rank_0_checkpoint_step(
+                    lambda key=key: torch.save(
                         getattr(self, key).state_dict(),
                         os.path.join(path, f"{key}.pt"),
-                    )
+                    ),
+                    f"write {key} state to {path}",
+                )
 
         # For multi-stage PP models, use checkpointer directly to handle all parts
         # For single models, use save_pretrained for HF-compatible API
@@ -515,11 +529,15 @@ class BaseRecipe:
                 },
             )
         else:
-            # Sync: update immediately
-            if is_rank_0 and self._publish_checkpoint(path):
+            # Sync: update immediately. The whole block is one rank-0 step so a
+            # failure anywhere in it aborts every rank rather than only rank 0.
+            def publish() -> None:
+                self._publish_checkpoint(path)
                 if best_val_metric is not None:
                     self._update_best_symlink(path, float(best_val_metric), best_metric_name)
                 self._prune_old_checkpoints()
+
+            self._run_rank_0_checkpoint_step(publish, f"publish checkpoint {path}")
             if is_dist_initialized:
                 _dist_barrier(getattr(getattr(self, "mesh_context", None), "process_group", None))
 
@@ -544,32 +562,35 @@ class BaseRecipe:
             return
 
         is_dist_initialized = torch.distributed.is_initialized()
-        is_rank_0 = not is_dist_initialized or torch.distributed.get_rank() == 0
         process_group = getattr(getattr(self, "mesh_context", None), "process_group", None)
-        # Gates the pointer and retention updates below. Only rank 0 publishes, and only
-        # rank 0 acts on this flag; the barriers stay unconditional so ranks keep the same
-        # collective sequence whether or not publication succeeded.
-        published = True
+        # Every branch below is gated on state that is set identically on all ranks, so
+        # the collective sequence matches even when validation metrics only exist on
+        # rank 0. Rank-0-only conditions live inside the step callbacks instead.
         if prev_pending is not None:
-            if is_rank_0:
-                published = self._publish_checkpoint(prev_pending)
+            self._run_rank_0_checkpoint_step(
+                lambda: self._publish_checkpoint(prev_pending), f"publish checkpoint {prev_pending}"
+            )
             setattr(self, "_last_pending_checkpoint_dir", None)
             if is_dist_initialized:
                 _dist_barrier(process_group)
 
         if prev_best_pending is not None:
-            if is_rank_0 and published and prev_best_pending.get("val") is not None:
+
+            def update_best() -> None:
+                if prev_best_pending.get("val") is None:
+                    return
                 self._update_best_symlink(
                     prev_best_pending["path"],
                     float(prev_best_pending["val"]),
                     prev_best_pending.get("metric_key"),
                 )
+
+            self._run_rank_0_checkpoint_step(update_best, "update the LOWEST_VAL pointer")
             setattr(self, "_last_pending_best_checkpoint_info", None)
             if is_dist_initialized:
                 _dist_barrier(process_group)
 
-        if is_rank_0 and published:
-            self._prune_old_checkpoints()
+        self._run_rank_0_checkpoint_step(self._prune_old_checkpoints, "prune old checkpoints")
         if is_dist_initialized:
             _dist_barrier(process_group)
 
@@ -645,24 +666,11 @@ class BaseRecipe:
         if os.path.exists(txt_path):
             os.remove(txt_path)
 
-    def _remove_stale_checkpoint_pointers(self) -> None:
-        """Remove every top-level checkpoint pointer whose target no longer exists.
-
-        Covers user-created pointers as well as LATEST and LOWEST_VAL, because
-        retention deletes checkpoints that any of them may target. A pointer is
-        removed only once its target no longer exists, so a pointer aimed at a
-        live checkpoint, or at a file inside one, is left alone.
-        """
-        ckpt_root = Path(self.checkpointer.config.checkpoint_dir)
-        try:
-            pointers = find_checkpoint_pointers(ckpt_root)
-        except (OSError, UnicodeError):
-            logger.warning("Failed to scan checkpoint pointers in %s", ckpt_root, exc_info=True)
-            return
-        for link_name, target in pointers.items():
-            if not target.exists():
-                self._remove_checkpoint_pointer(link_name)
-                logger.info("Removed checkpoint pointer %s; its target no longer exists", link_name)
+    def _remove_stale_checkpoint_pointer(self, link_name: str) -> None:
+        """Remove a checkpoint pointer when its target no longer exists."""
+        target = read_checkpoint_pointer(self.checkpointer.config.checkpoint_dir, link_name)
+        if target is not None and not target.is_dir():
+            self._remove_checkpoint_pointer(link_name)
 
     def _prune_old_checkpoints(self) -> None:
         """Prune old checkpoint directories according to checkpoint.max_recent_checkpoints."""
@@ -677,13 +685,9 @@ class BaseRecipe:
         except (OSError, UnicodeError):
             logger.warning("Failed to scan checkpoint pointers in %s; skipping pruning", ckpt_root, exc_info=True)
             return
-        # Directories left behind by an interrupted save are never resumable, so they
-        # must not consume a retention slot and must not survive as orphans either. A
-        # pointer aimed at one must not keep it alive: re-saving a step that LOWEST_VAL
-        # already targets and then being interrupted leaves the pointer protecting an
-        # unusable checkpoint. The dangling pointer is dropped after deletion below.
+        # A directory left behind by an interrupted save is not resumable, so it must not
+        # consume a retention slot; being outside the window it is then pruned as an orphan.
         complete_checkpoints = [checkpoint for checkpoint in checkpoints if not is_checkpoint_incomplete(checkpoint)]
-        protected_checkpoints -= {checkpoint for checkpoint in checkpoints if is_checkpoint_incomplete(checkpoint)}
         retained_window = set(complete_checkpoints[-max_recent_checkpoints:])
         checkpoints_to_delete = [
             checkpoint for checkpoint in checkpoints if checkpoint not in retained_window | protected_checkpoints
@@ -696,7 +700,8 @@ class BaseRecipe:
             else:
                 logger.info("Pruned old checkpoint directory %s", checkpoint)
 
-        self._remove_stale_checkpoint_pointers()
+        self._remove_stale_checkpoint_pointer("LATEST")
+        self._remove_stale_checkpoint_pointer("LOWEST_VAL")
 
     def _initialize_best_val_loss_from_pointer(self, metric_key: str | None) -> None:
         """Initialize best validation loss from the existing LOWEST_VAL pointer after resume.

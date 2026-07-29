@@ -69,15 +69,22 @@ def test_finalize_with_no_pending_only_waits():
 def test_finalize_uses_recipe_process_group(monkeypatch):
     process_group = object()
     barriers = []
+    reduce_groups = []
     r = _recipe(pending="/ckpt/epoch_1_step_10", best_pending=None)
     r.mesh_context = SimpleNamespace(process_group=process_group)
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
     monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
     monkeypatch.setattr(torch.distributed, "barrier", lambda group=None: barriers.append(group))
+    monkeypatch.setattr(
+        torch.distributed, "all_reduce", lambda tensor, op=None, group=None: reduce_groups.append(group)
+    )
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
 
     r._finalize_pending_checkpoint()
 
     assert barriers == [process_group, process_group]
+    # Rank-0 filesystem steps report their outcome over the same group.
+    assert reduce_groups == [process_group, process_group]
 
 
 def test_finalize_is_noop_when_checkpointing_disabled():

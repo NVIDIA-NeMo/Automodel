@@ -41,7 +41,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from nemo_automodel.components.checkpoint.utils import is_checkpoint_incomplete
+from nemo_automodel.components.checkpoint.utils import is_checkpoint_incomplete, mark_checkpoint_incomplete
 from nemo_automodel.recipes.llm.train_eagle1 import TrainEagle1Recipe
 from nemo_automodel.recipes.llm.train_eagle3 import TrainEagle3Recipe
 
@@ -490,11 +490,26 @@ def test_eagle1_save_checkpoint_replaces_interrupted_dir(tmp_path):
     ckpt_path = Path(recipe.checkpoint_config.checkpoint_dir) / "epoch_1_step_5"
     ckpt_path.mkdir(parents=True, exist_ok=True)
     (ckpt_path / "stale.txt").write_text("left behind by the interrupted save")
+    mark_checkpoint_incomplete(ckpt_path)
 
     recipe.save_checkpoint(epoch=1, step=5)
 
     assert not (ckpt_path / "stale.txt").exists()
     assert not is_checkpoint_incomplete(ckpt_path)
+
+
+def test_eagle1_save_checkpoint_refuses_to_overwrite_published_dir(tmp_path):
+    """A directory without the marker holds a published checkpoint and is not reclaimed."""
+    recipe = _bare_eagle1_recipe(tmp_path)
+    recipe.runtime.global_step = 5
+    ckpt_path = Path(recipe.checkpoint_config.checkpoint_dir) / "epoch_1_step_5"
+    ckpt_path.mkdir(parents=True, exist_ok=True)
+    (ckpt_path / "published.txt").write_text("a complete checkpoint")
+
+    with pytest.raises(FileExistsError, match="already holds a published checkpoint"):
+        recipe.save_checkpoint(epoch=1, step=5)
+
+    assert (ckpt_path / "published.txt").exists()
 
 
 # ---------------------------------------------------------------------------

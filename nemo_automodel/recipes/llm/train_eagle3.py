@@ -1461,10 +1461,14 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                 },
             )
         else:
-            if is_rank_0 and self._publish_checkpoint(path):
+            # One rank-0 step, so a failure anywhere in it aborts every rank.
+            def publish() -> None:
+                self._publish_checkpoint(path)
                 if best_val_metric is not None:
                     self._update_best_symlink(path, float(best_val_metric), best_metric_name)
                 self._prune_old_checkpoints()
+
+            self._run_rank_0_checkpoint_step(publish, f"publish checkpoint {path}")
             if is_dist_initialized:
                 dist.barrier()
 

@@ -63,12 +63,12 @@ These symbolic links eliminate the need to manually track checkpoint names or se
 A save can be cut short by a wall-clock limit, a preemption, or an out-of-memory error, which leaves a partially written `epoch_<E>_step_<S>` directory behind. NeMo AutoModel marks each checkpoint directory as in progress while it is being written and clears the mark only after every component is saved and the checkpoint is published. Directories left by an interrupted save therefore stay marked, which determines how they are treated:
 
 - **Resume skips them.** `LATEST` is advanced only at publication, and both the pointer lookup and the step-order fallback ignore marked directories. Training resumes from the most recent complete checkpoint. Setting `checkpoint.restore_from` to a different pointer, such as `LOWEST_VAL`, whose target is marked raises an error instead of silently restoring a different checkpoint than you asked for.
-- **The next save of that step replaces them.** Checkpoint directory names are derived from the step, so the resumed run targets the same directory when it reaches that step again. NeMo AutoModel removes the leftover directory, logs a warning, and writes the new checkpoint in its place.
-- **Retention does not preserve them.** When `max_recent_checkpoints` is set, a marked directory never occupies a slot in the recent window.
+- **The next save of that step replaces them.** Checkpoint directory names are derived from the step, so the resumed run targets the same directory when it reaches that step again. Because the marked directory holds a checkpoint that was never published, NeMo AutoModel removes it, logs a warning, and writes the new checkpoint in its place.
+- **Retention does not preserve them.** When `max_recent_checkpoints` is set, a marked directory never occupies a slot in the recent window, so it is pruned as an orphan.
 
 <Warning>
 
-Replacement applies to any existing checkpoint directory, not only to marked ones. If you resume from an older checkpoint with `restore_from` and training runs past a step that already has a complete checkpoint, that checkpoint is removed and rewritten with the recomputed state. NeMo AutoModel logs a warning that distinguishes the two cases. Copy checkpoints you need to keep to a separate directory, or set a different `checkpoint.checkpoint_dir` for the new run.
+Only marked directories are replaced. A published checkpoint is never overwritten: if you resume from an older checkpoint with `restore_from` and training runs past a step that already has a published checkpoint, the save fails with `FileExistsError` rather than discarding it. Remove that directory, or point `checkpoint.checkpoint_dir` at a fresh directory, before re-running the step.
 
 </Warning>
 
@@ -95,7 +95,7 @@ checkpoint:
 
 `max_recent_checkpoints` sets the number of checkpoint directories in the recent window, ordered by step. It is not a hard limit on the total number of checkpoint directories.
 
-Checkpoint-root pointers protect their targets in addition to the recent window. These pointers include `LATEST`, `LOWEST_VAL`, other top-level symbolic links, and `.txt` fallback pointer files. This behavior supports reliable resumption from the latest checkpoint and preserves explicitly referenced checkpoints, such as the best validation checkpoint. Checkpoints left behind by an interrupted save are the one exception: they are never protected, because a pointer to an unusable checkpoint would pin it indefinitely. Such a checkpoint is deleted, and any pointer left dangling by that deletion is removed. Pointers whose target still exists are never touched.
+Checkpoint-root pointers protect their targets in addition to the recent window. These pointers include `LATEST`, `LOWEST_VAL`, other top-level symbolic links, and `.txt` fallback pointer files. This behavior supports reliable resumption from the latest checkpoint and preserves explicitly referenced checkpoints, such as the best validation checkpoint.
 
 For example, set `max_recent_checkpoints: 2` to retain the two most recent checkpoints. If `LOWEST_VAL` points to an older checkpoint, NeMo AutoModel also retains the `LOWEST_VAL` target.
 
