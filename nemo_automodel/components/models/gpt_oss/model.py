@@ -52,7 +52,7 @@ class Block(nn.Module):
             config, backend, use_sliding_attention=config.layer_types[layer_idx] == "sliding_attention"
         )
         self.mlp = MoE(moe_config, backend)
-        dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+        dtype = get_dtype(config.torch_dtype, torch.bfloat16)
         self.input_layernorm = initialize_rms_norm_module(
             backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, dtype=dtype
         )
@@ -108,7 +108,20 @@ class GptOssModel(nn.Module):
         # Resolve model dtype once; thread it explicitly to every sub-module
         # so fp32 master weights work even when construction is not wrapped
         # in local_torch_dtype().
-        model_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+        try:
+            torch_dtype = config.torch_dtype
+        except AttributeError:
+            torch_dtype = None
+        model_dtype = get_dtype(torch_dtype, torch.bfloat16)
+
+        try:
+            norm_topk_prob = config.norm_topk_prob
+        except AttributeError:
+            norm_topk_prob = False
+        try:
+            swiglu_limit = config.swiglu_limit
+        except AttributeError:
+            swiglu_limit = 7.0
 
         # GPT-OSS is MoE everywhere; set shared experts to 0 to disable shared path in our MoE wrapper.
         moe_defaults = dict(
@@ -125,12 +138,12 @@ class GptOssModel(nn.Module):
             score_func="softmax",
             route_scale=1.0,
             aux_loss_coeff=config.router_aux_loss_coef,
-            norm_topk_prob=getattr(config, "norm_topk_prob", False),
+            norm_topk_prob=norm_topk_prob,
             expert_bias=True,
             router_bias=True,
             expert_activation="quick_geglu",
             activation_alpha=1.702,
-            activation_limit=getattr(config, "swiglu_limit", 7.0),
+            activation_limit=swiglu_limit,
             dtype=model_dtype,
         )
         if moe_overrides:
@@ -147,7 +160,10 @@ class GptOssModel(nn.Module):
 
         # Rotary embedding cached at model-level (inv_freq + concentration via YaRN/NTK-by-parts)
         self.max_seq_len = config.max_position_embeddings
-        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        try:
+            self.head_dim = config.head_dim
+        except AttributeError:
+            self.head_dim = config.hidden_size // config.num_attention_heads
         rope_theta, rope_scaling, _ = get_rope_config(config)
         self.rotary_emb = RotaryEmbedding(
             head_dim=self.head_dim,
@@ -263,7 +279,7 @@ class GptOssForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         self.backend = backend or BackendConfig(attn="flex")
         moe_overrides = kwargs.pop("moe_overrides", None)
         self.model = GptOssModel(config, backend=self.backend, moe_config=moe_config, moe_overrides=moe_overrides)
-        model_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+        model_dtype = get_dtype(config.torch_dtype, torch.bfloat16)
         self.lm_head = initialize_linear_module(
             self.backend.linear, config.hidden_size, config.vocab_size, bias=False, dtype=model_dtype
         )
@@ -314,9 +330,7 @@ class GptOssForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             ``CausalLMOutputWithPast`` with ``logits`` and optional ``hidden_states``.
         """
         output_hidden_states = (
-            output_hidden_states
-            if output_hidden_states is not None
-            else getattr(self.config, "output_hidden_states", False)
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
 
         is_thd = attn_kwargs.get("qkv_format") == "thd" or (

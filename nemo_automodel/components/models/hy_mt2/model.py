@@ -74,7 +74,10 @@ def _resolve_score_func(config: Any) -> str:
     ``e_score_correction_bias`` plus expert-group routing, which Hy-MT2 does
     not use (n_expert_groups=0).
     """
-    use_sigmoid = bool(getattr(config, "moe_router_use_sigmoid", True))
+    try:
+        use_sigmoid = bool(config.moe_router_use_sigmoid)
+    except AttributeError:
+        use_sigmoid = True
     return "sigmoid" if use_sigmoid else "softmax"
 
 
@@ -85,7 +88,10 @@ class Block(nn.Module):
         super().__init__()
         self.self_attn = HyMT2Attention(config, backend)
 
-        first_k_dense = getattr(config, "first_k_dense_replace", 1)
+        try:
+            first_k_dense = config.first_k_dense_replace
+        except AttributeError:
+            first_k_dense = 1
         if layer_idx < first_k_dense:
             self.mlp = MLP(config.hidden_size, config.intermediate_size, backend.linear)
         else:
@@ -117,15 +123,9 @@ class Block(nn.Module):
         )
         x = x + attn_out
 
-        mlp_out = self._mlp(x=self.post_attention_layernorm(x), padding_mask=padding_mask)
+        mlp_out = self.mlp(self.post_attention_layernorm(x), padding_mask=padding_mask)
         x = x + mlp_out
         return x
-
-    def _mlp(self, x: torch.Tensor, padding_mask: torch.Tensor | None) -> torch.Tensor:
-        if isinstance(self.mlp, MLP):
-            return self.mlp(x)
-        assert isinstance(self.mlp, MoE)
-        return self.mlp(x, padding_mask)
 
     def init_weights(self, buffer_device: torch.device):
         for norm in (self.input_layernorm, self.post_attention_layernorm):
@@ -161,39 +161,63 @@ class HyMT2Model(nn.Module):
         # the on-disk config. Prefer ``expert_hidden_dim`` when present
         # (matches the field name used by the HF reference for the expert MLP
         # hidden dim); fall back to ``moe_intermediate_size`` otherwise.
-        moe_inter = getattr(config, "expert_hidden_dim", None)
+        try:
+            moe_inter = config.expert_hidden_dim
+        except AttributeError:
+            moe_inter = None
         if moe_inter is None:
             moe_inter = config.moe_intermediate_size
+
+        try:
+            num_shared_experts = config.num_shared_experts
+        except AttributeError:
+            num_shared_experts = 0
+        try:
+            router_scaling_factor = config.router_scaling_factor
+        except AttributeError:
+            router_scaling_factor = 1.0
+        try:
+            route_norm = config.route_norm
+        except AttributeError:
+            route_norm = True
+        try:
+            moe_router_enable_expert_bias = config.moe_router_enable_expert_bias
+        except AttributeError:
+            moe_router_enable_expert_bias = False
 
         moe_defaults = dict(
             dim=config.hidden_size,
             inter_dim=config.intermediate_size,
             moe_inter_dim=moe_inter,
             n_routed_experts=config.num_experts,
-            n_shared_experts=getattr(config, "num_shared_experts", 0),
+            n_shared_experts=num_shared_experts,
             n_activated_experts=config.num_experts_per_tok,
             n_expert_groups=0,
             n_limited_groups=0,
             train_gate=True,
             gate_bias_update_factor=0.0,
             score_func=_resolve_score_func(config),
-            route_scale=getattr(config, "router_scaling_factor", 1.0),
+            route_scale=router_scaling_factor,
             aux_loss_coeff=0.0,
-            norm_topk_prob=getattr(config, "route_norm", True),
+            norm_topk_prob=route_norm,
             expert_bias=False,
             router_bias=False,
             expert_activation="swiglu",
             softmax_before_topk=False,
             # Ensures e_score_correction_bias buffer is created so HF
             # checkpoints with ``expert_bias`` load cleanly.
-            force_e_score_correction_bias=getattr(config, "moe_router_enable_expert_bias", False),
+            force_e_score_correction_bias=moe_router_enable_expert_bias,
         )
         if moe_overrides:
             moe_defaults.update(moe_overrides)
         self.moe_config = moe_config or MoEConfig(**moe_defaults)
 
+        try:
+            torch_dtype = config.torch_dtype
+        except AttributeError:
+            torch_dtype = None
         self.embed_tokens = nn.Embedding(
-            config.vocab_size, config.hidden_size, dtype=get_dtype(config.torch_dtype, torch.bfloat16)
+            config.vocab_size, config.hidden_size, dtype=get_dtype(torch_dtype, torch.bfloat16)
         )
         self.layers = torch.nn.ModuleDict()
         for layer_id in range(config.num_hidden_layers):
@@ -201,7 +225,10 @@ class HyMT2Model(nn.Module):
         self.norm = initialize_rms_norm_module(backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps)
 
         self.max_seq_len = config.max_position_embeddings
-        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        try:
+            self.head_dim = config.head_dim
+        except AttributeError:
+            self.head_dim = config.hidden_size // config.num_attention_heads
 
         base, rope_scaling, _ = get_rope_config(config)
 
@@ -336,18 +363,26 @@ class HyMT2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         moe_overrides = kwargs.pop("moe_overrides", None)
         self.model = HyMT2Model(config, backend=self.backend, moe_config=moe_config, moe_overrides=moe_overrides)
         self.lm_head = initialize_linear_module(self.backend.linear, config.hidden_size, config.vocab_size, bias=False)
+        try:
+            torch_dtype = config.torch_dtype
+        except AttributeError:
+            torch_dtype = None
         # In-model fp32 fallback for the lm_head matmul. The preferred wiring
         # is the YAML ``distributed.moe.lm_head_precision: float32``, which
         # the MoE parallelizer enables via ``MixedPrecisionPolicy``. When that
         # path is not used, ``enable_lm_head_fp32`` in the model config still
         # triggers the in-forward upcast.
-        self._enable_lm_head_fp32 = bool(getattr(config, "enable_lm_head_fp32", False))
+        try:
+            enable_lm_head_fp32 = config.enable_lm_head_fp32
+        except AttributeError:
+            enable_lm_head_fp32 = False
+        self._enable_lm_head_fp32 = bool(enable_lm_head_fp32)
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = HyMT2StateDictAdapter(
                 self.config,
                 self.model.moe_config,
                 self.backend,
-                dtype=get_dtype(config.torch_dtype, torch.bfloat16),
+                dtype=get_dtype(torch_dtype, torch.bfloat16),
             )
 
     def get_input_embeddings(self):
@@ -394,11 +429,11 @@ class HyMT2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             ``logits`` and, when ``output_hidden_states`` is set, the final
             ``hidden_states``.
         """
-        output_hidden_states = (
-            output_hidden_states
-            if output_hidden_states is not None
-            else getattr(self.config, "output_hidden_states", False)
-        )
+        if output_hidden_states is None:
+            try:
+                output_hidden_states = bool(self.config.output_hidden_states)
+            except AttributeError:
+                output_hidden_states = False
 
         is_thd = "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd"
         if is_thd:
@@ -437,8 +472,7 @@ class HyMT2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     def update_moe_gate_bias(self) -> None:
         with torch.no_grad():
             for block in self.model.layers.values():
-                if isinstance(block.mlp, MoE) and block.mlp.gate.bias_update_factor > 0:
-                    block.mlp.gate.update_bias()
+                block.mlp.update_gate_bias()
 
     @torch.no_grad()
     def initialize_weights(

@@ -152,7 +152,7 @@ class TestBlock:
         freqs = torch.zeros(1, seq, HEAD_DIM, device=device)
         with (
             patch.object(block.self_attn, "forward", return_value=torch.zeros_like(x)) as mock_attn,
-            patch.object(block, "_mlp", return_value=torch.zeros_like(x)) as mock_mlp,
+            patch.object(block.mlp, "forward", return_value=torch.zeros_like(x)) as mock_mlp,
         ):
             out = block(x, freqs_cis=freqs)
         assert out.shape == x.shape
@@ -166,13 +166,13 @@ class TestBlock:
         mask = torch.tensor([[1, 1, 0]], dtype=torch.bool, device=device)
         with (
             patch.object(block.self_attn, "forward", return_value=torch.zeros_like(x)),
-            patch.object(block, "_mlp", return_value=torch.zeros_like(x)) as mock_mlp,
+            patch.object(block.mlp, "forward", return_value=torch.zeros_like(x)) as mock_mlp,
         ):
             block(x, freqs_cis=freqs, attention_mask=mask)
         _, kwargs = mock_mlp.call_args
         torch.testing.assert_close(kwargs["padding_mask"], mask.logical_not())
 
-    def test_mlp_wrapper_dense_path(self, config, moe_config, backend_config, device):
+    def test_mlp_dense_path(self, config, moe_config, backend_config, device):
         config.first_k_dense_replace = 1
         block = (
             Block(layer_idx=0, config=config, moe_config=moe_config, backend=backend_config)
@@ -180,7 +180,7 @@ class TestBlock:
             .to(torch.bfloat16)
         )
         x = torch.randn(2, 4, HIDDEN, device=device, dtype=torch.bfloat16)
-        out = block._mlp(x, padding_mask=None)
+        out = block.mlp(x, padding_mask=None)
         assert out.shape == x.shape
 
     def test_init_weights_invokes_subcomponents(self, config, moe_config, backend_config, device):

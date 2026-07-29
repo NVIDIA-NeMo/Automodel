@@ -38,6 +38,7 @@ from transformers.models.llava.modeling_llava import LlavaCausalLMOutputWithPast
 
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
+from nemo_automodel.shared.utils import dtype_from_str
 
 LOGGER = logging.getLogger(__name__)
 
@@ -164,6 +165,7 @@ try:
 
     FLASH_ATTN_AVAILABLE = True
 except ImportError:
+    flash_attn_varlen_func = None
     FLASH_ATTN_AVAILABLE = False
 
 
@@ -467,7 +469,7 @@ class MoonViT3dPretrainedModel(nn.Module):
         )
 
         activation = lambda x: F.gelu(x, approximate="tanh")
-        attn_impl = getattr(config, "_attn_implementation", "flash_attention_2")
+        attn_impl = config._attn_implementation
         block_cfg = {
             "num_heads": config.num_attention_heads,
             "hidden_dim": config.hidden_size,
@@ -886,6 +888,10 @@ class KimiK25VLModel(nn.Module):
 class KimiK25VLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     """KimiK25VL model with backend-aware DeepseekV3 language model."""
 
+    _vlm_pixel_values_chunks: list[torch.Tensor] | None = None
+    _vlm_image_grid_hws_chunks: list[torch.Tensor] | None = None
+    _vlm_chunk_idx: int = 0
+
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
 
     # RoPE freqs/inv_freq must stay fp32: from_pretrained casts the model to bf16 and
@@ -929,7 +935,7 @@ class KimiK25VLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDP
         num_hidden_layers_override = kwargs.pop("num_hidden_layers", None)
 
         if isinstance(torch_dtype, str):
-            torch_dtype = getattr(torch, torch_dtype) if torch_dtype != "auto" else torch.bfloat16
+            torch_dtype = dtype_from_str(torch_dtype, torch.bfloat16) if torch_dtype != "auto" else torch.bfloat16
 
         if config is None:
             config = KimiK25VLConfig.from_pretrained(pretrained_model_name_or_path)
@@ -943,7 +949,7 @@ class KimiK25VLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDP
             )
             config.text_config.num_hidden_layers = num_hidden_layers_override
 
-        num_layers = getattr(config.text_config, "num_hidden_layers", 61)
+        num_layers = config.text_config.num_hidden_layers
         LOGGER.info(f"Model config has {num_layers} layers")
 
         config.torch_dtype = torch_dtype
@@ -968,7 +974,7 @@ class KimiK25VLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDP
         )
 
         self.vocab_size = config.text_config.vocab_size
-        self.pad_token_id = getattr(config.text_config, "pad_token_id", -1) or -1
+        self.pad_token_id = config.text_config.pad_token_id or -1
         self.media_placeholder_token_id = config.media_placeholder_token_id
 
         if self.backend.enable_hf_state_dict_adapter:
@@ -976,7 +982,10 @@ class KimiK25VLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDP
                 config,
                 self.moe_config,
                 self.backend,
-                dtype=get_dtype(getattr(config.text_config, "torch_dtype", None), torch.bfloat16),
+                dtype=get_dtype(
+                    config.text_config.torch_dtype,
+                    torch.bfloat16,
+                ),
             )
 
     @property
@@ -1020,24 +1029,18 @@ class KimiK25VLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDP
     ):
         # Resolve from the text/decoder sub-config (the language model produces text logits).
         output_hidden_states = (
-            output_hidden_states
-            if output_hidden_states is not None
-            else getattr(self.config.text_config, "output_hidden_states", False)
+            output_hidden_states if output_hidden_states is not None else self.config.text_config.output_hidden_states
         )
 
         # Retrieve pre-chunked VLM inputs from model attributes (set by finetune.py for PP)
-        if (
-            pixel_values is None
-            and hasattr(self, "_vlm_pixel_values_chunks")
-            and self._vlm_pixel_values_chunks is not None
-        ):
+        if pixel_values is None and self._vlm_pixel_values_chunks is not None:
             has_media_tokens = (
                 input_ids is not None
                 and self.media_placeholder_token_id is not None
                 and (input_ids == self.media_placeholder_token_id).any()
             )
             if has_media_tokens:
-                chunk_idx = getattr(self, "_vlm_chunk_idx", 0)
+                chunk_idx = self._vlm_chunk_idx
                 if chunk_idx < len(self._vlm_pixel_values_chunks):
                     pixel_values = self._vlm_pixel_values_chunks[chunk_idx]
                     # Recipe stores as image_grid_hws [N, 2], convert to grid_thws [N, 3] (prepend T=1)
@@ -1085,7 +1088,7 @@ class KimiK25VLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDP
             return_dict = False
         # Return a bare tensor only in the legacy default path. When hidden states are
         # requested we must return a ModelOutput so the final hidden states travel with
-        # the output (callers read getattr(out, "logits", out), so this stays compatible).
+        # the output (callers read out.logits, so this stays compatible).
         if not return_dict and not output_hidden_states:
             return logits
 

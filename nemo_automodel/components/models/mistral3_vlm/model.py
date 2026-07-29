@@ -75,7 +75,7 @@ def _rotary_reinit_self_hook(module, args, kwargs):
     (YaRN) and Pixtral (2D patch positions) produce the right values this
     way, since we defer to the class's authoritative init logic.
     """
-    if getattr(module, "_mistral3_fp8_rotary_reinit_done", False):
+    if module._mistral3_fp8_rotary_reinit_done:
         return
     # Pick a device that has real storage. Prefer a buffer with non-meta
     # device (rotary modules typically have `inv_freq` buffer only).
@@ -151,10 +151,13 @@ class Mistral3FP8VLMForConditionalGeneration(_HFMistral3ForConditionalGeneration
         # the linear swap by flipping ``dequantize=True`` on the config
         # (see transformers/integrations/finegrained_fp8.py:742, which early-
         # returns from replace_with_fp8_linear when dequantize is truthy).
-        # ``apply_model_infrastructure`` still sees hasattr(config,
-        # 'quantization_config'), so ``dequantize_base_checkpoint`` is set
-        # to True and our adapter's ``to_hf(quantization=True)`` path runs.
-        qc = getattr(config, "quantization_config", None)
+        # ``apply_model_infrastructure`` still sees ``quantization_config``,
+        # so ``dequantize_base_checkpoint`` is set to True and our adapter's
+        # ``to_hf(quantization=True)`` path runs.
+        config_values = config.to_dict()
+        if "quantization_config" not in config_values:
+            config.quantization_config = None
+        qc = config.quantization_config
         if qc is not None:
             if isinstance(qc, dict):
                 qc["dequantize"] = True
@@ -183,13 +186,13 @@ class Mistral3FP8VLMForConditionalGeneration(_HFMistral3ForConditionalGeneration
         # invoked directly — the PP schedule dispatches stage sub-modules
         # individually and rotary runs inside each attention layer.
         for sub in self.modules():
-            if "inv_freq" in getattr(sub, "_buffers", {}):
+            if "inv_freq" in sub._buffers:
                 sub._mistral3_fp8_rotary_reinit_done = False
                 sub.register_forward_pre_hook(_rotary_reinit_self_hook, with_kwargs=True, prepend=True)
 
     def tie_weights(self, *_args: object, **_kwargs: object) -> None:
         """Tie ``lm_head`` to the active text embedding when requested."""
-        if getattr(getattr(self, "config", None), "tie_word_embeddings", False):
+        if self.config.tie_word_embeddings:
             self.lm_head.weight = self.model.language_model.embed_tokens.weight
 
     def forward(
@@ -242,11 +245,9 @@ class Mistral3FP8VLMForConditionalGeneration(_HFMistral3ForConditionalGeneration
             with ``logits``, optional ``loss``, ``past_key_values``, and (when
             ``output_hidden_states`` is set) the final ``hidden_states`` tensor.
         """
-        text_config = getattr(self.config, "text_config", self.config)
+        text_config = self.config.text_config
         output_hidden_states = (
-            output_hidden_states
-            if output_hidden_states is not None
-            else getattr(text_config, "output_hidden_states", False)
+            output_hidden_states if output_hidden_states is not None else text_config.output_hidden_states
         )
 
         outputs = self.model(
@@ -288,11 +289,12 @@ class Mistral3FP8VLMForConditionalGeneration(_HFMistral3ForConditionalGeneration
         == 'fp8'``. Consolidated checkpoints are saved in BF16 without the
         source FP8 metadata and still require this class's rotary-buffer reinit.
         """
-        text_config = getattr(config, "text_config", None)
-        if text_config is None or getattr(text_config, "model_type", None) != "ministral3":
+        config_values = config.to_dict()
+        text_config = config.text_config
+        if text_config is None or text_config.model_type != "ministral3":
             return False
-        qc = getattr(config, "quantization_config", None)
+        qc = config_values.get("quantization_config")
         if qc is None:
             return True
-        method = qc.get("quant_method") if isinstance(qc, dict) else getattr(qc, "quant_method", None)
+        method = qc.get("quant_method") if isinstance(qc, dict) else qc.quant_method
         return method == "fp8"

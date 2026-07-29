@@ -82,7 +82,11 @@ def is_gated_delta_net_fp32_param_key(key: str, param_names: tuple[str, ...] = F
 
 def has_gated_delta_net_fp32_checkpoint_contract(hf_config: object) -> bool:
     """Return whether ``hf_config`` belongs to an architecture with fp32 GDN params."""
-    architectures = getattr(hf_config, "architectures", None) or ()
+    try:
+        architectures = hf_config.architectures
+    except AttributeError:
+        architectures = ()
+    architectures = architectures or ()
     return any(arch in GDN_FP32_CHECKPOINT_ARCHITECTURES for arch in architectures)
 
 
@@ -97,9 +101,9 @@ def upcast_gated_delta_net_fp32_state_tensor(
     """
     if not is_gated_delta_net_fp32_param_key(key, param_names):
         return tensor
-    if getattr(tensor, "dtype", None) == torch.float32:
+    if tensor.dtype == torch.float32:
         return tensor
-    is_floating_point = getattr(tensor, "is_floating_point", None)
+    is_floating_point = tensor.is_floating_point
     if callable(is_floating_point) and is_floating_point():
         return tensor.to(dtype=torch.float32)
     return tensor
@@ -113,7 +117,7 @@ def forced_gated_delta_net_fp32_dtype_mapping(
     for key, tensor in state_dict.items():
         if not is_gated_delta_net_fp32_param_key(key, param_names):
             continue
-        is_floating_point = getattr(tensor, "is_floating_point", None)
+        is_floating_point = tensor.is_floating_point
         if callable(is_floating_point) and is_floating_point():
             forced[key] = "F32"
     return forced

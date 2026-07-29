@@ -26,6 +26,7 @@ FSDP double-root issue that bites us with PreTrainedModel-derived roots.
 
 from __future__ import annotations
 
+import copy
 import logging
 import os
 import pathlib
@@ -36,6 +37,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.attention.flex_attention import create_block_mask
+from transformers import PreTrainedModel
 
 from nemo_automodel.components.models.bagel.attention_masks import create_sparse_mask
 from nemo_automodel.components.models.bagel.configuration import (
@@ -87,13 +89,13 @@ def _prepare_config_for_stage(config: BagelConfig) -> None:
     stage-dependent config mutations that its direct ``from_pretrained`` path
     used to do before ``BagelModel`` is built.
     """
-    stage = getattr(config, "stage", None)
+    stage = config.stage
     if stage is not None:
         stage_int = _stage_to_int(stage)
         config.stage = stage_int
         if stage_int == 1:
             config.visual_gen = False
-            if getattr(config.text_config, "layer_module", None) is None:
+            if config.text_config.layer_module is None:
                 config.text_config.layer_module = "Qwen2DecoderLayer"
         else:
             config.visual_gen = True
@@ -101,25 +103,23 @@ def _prepare_config_for_stage(config: BagelConfig) -> None:
             # keys have slots in the module tree. Some serialized configs may
             # carry ``layer_module=null``.
             config.text_config.layer_module = "Qwen2MoTDecoderLayer"
-    elif getattr(config.text_config, "layer_module", None) is None:
+    elif config.text_config.layer_module is None:
         config.text_config.layer_module = "Qwen2MoTDecoderLayer" if config.visual_gen else "Qwen2DecoderLayer"
 
     # BAGEL applies a select-layer offset so the effective ViT has
     # ``vit_config.num_hidden_layers + 1 + vit_select_layer`` layers. The
     # checkpoint carries the offset count, so apply this before constructing
-    # the tower. Mark the config to avoid accidental double-application.
+    # the tower.
     if config.vision_config is not None:
-        if not getattr(config, "_bagel_vit_select_layer_applied", False):
-            effective_layers = config.vision_config.num_hidden_layers + 1 + config.vit_select_layer
-            if effective_layers != config.vision_config.num_hidden_layers:
-                logger.info(
-                    "BagelConfig: adjusting vision_config.num_hidden_layers %d -> %d (vit_select_layer=%d).",
-                    config.vision_config.num_hidden_layers,
-                    effective_layers,
-                    config.vit_select_layer,
-                )
-                config.vision_config.num_hidden_layers = effective_layers
-            config._bagel_vit_select_layer_applied = True
+        effective_layers = config.vision_config.num_hidden_layers + 1 + config.vit_select_layer
+        if effective_layers != config.vision_config.num_hidden_layers:
+            logger.info(
+                "BagelConfig: adjusting vision_config.num_hidden_layers %d -> %d (vit_select_layer=%d).",
+                config.vision_config.num_hidden_layers,
+                effective_layers,
+                config.vit_select_layer,
+            )
+            config.vision_config.num_hidden_layers = effective_layers
         config.vision_config.rope = config.vit_rope
 
 
@@ -184,16 +184,15 @@ class BagelModel(nn.Module):
         # container; the recipe owns the frozen VAE and hands ``padded_latent``
         # to forward.
         if config.visual_gen:
-            vae_cfg = config.vae_config or {}
-            try:
-                latent_channel = int(vae_cfg["z_channels"])
-                downsample = int(vae_cfg["downsample"])
-            except (KeyError, TypeError, ValueError) as e:
+            vae_cfg = config.vae_config
+            if vae_cfg is None or vae_cfg.z_channels is None or vae_cfg.downsample is None:
                 raise ValueError(
                     "visual_gen=True requires config.vae_config to carry "
                     "'z_channels' and 'downsample'. Recipe should load the VAE "
                     f"checkpoint first and populate these. (got {vae_cfg!r})"
-                ) from e
+                )
+            latent_channel = int(vae_cfg.z_channels)
+            downsample = int(vae_cfg.downsample)
             self.latent_patch_size = config.latent_patch_size
             self.timestep_shift = config.timestep_shift
             self.latent_downsample = downsample * config.latent_patch_size
@@ -242,6 +241,7 @@ class BagelForUnifiedMultimodal(HFCheckpointingMixin, nn.Module):
         # constructs this class directly. Reads the nested text_config tie flag via
         # the resolver's get_text_config fallback (BagelConfig has no top-level flag).
         reject_unsupported_tie_word_embeddings(type(self), config)
+        config = copy.deepcopy(config)
         _prepare_config_for_stage(config)
         self.config = config
         self.backend = resolve_bagel_backend(backend)
@@ -264,7 +264,7 @@ class BagelForUnifiedMultimodal(HFCheckpointingMixin, nn.Module):
         # Convenience: cached scalars mirrored from the nested text config.
         self.hidden_size = config.text_config.hidden_size
         self.num_heads = config.text_config.num_attention_heads
-        self.use_moe = "Mo" in getattr(config.text_config, "layer_module", "Qwen2DecoderLayer")
+        self.use_moe = "Mo" in config.text_config.layer_module
 
     def initialize_weights(self) -> None:
         """Initialize BAGEL weights after AM materializes a ``from_config`` model.
@@ -277,19 +277,13 @@ class BagelForUnifiedMultimodal(HFCheckpointingMixin, nn.Module):
         """
 
         def _mark_hf_uninitialized(module: nn.Module) -> None:
-            if hasattr(module, "_is_hf_initialized"):
-                module._is_hf_initialized = False
+            module._is_hf_initialized = False
 
         def _initialize_hf_subtree(module: nn.Module, name: str) -> None:
+            if not isinstance(module, PreTrainedModel):
+                raise TypeError(f"{name} must be a transformers.PreTrainedModel, got {type(module)!r}")
             module.apply(_mark_hf_uninitialized)
-            if hasattr(module, "post_init"):
-                module.post_init()
-            elif hasattr(module, "init_weights"):
-                module.init_weights()
-            elif hasattr(module, "_init_weights"):
-                module.apply(module._init_weights)
-            else:
-                raise AttributeError(f"{name} does not provide a HF-compatible weight initializer")
+            module.post_init()
 
         _initialize_hf_subtree(self.model.language_model, "language_model")
 
@@ -303,10 +297,17 @@ class BagelForUnifiedMultimodal(HFCheckpointingMixin, nn.Module):
                 module.reset_parameters()
 
         bagel_only_modules = []
-        for name in ("connector", "vit_pos_embed", "time_embedder", "vae2llm", "llm2vae", "latent_pos_embed"):
-            module = getattr(self.model, name, None)
-            if module is not None:
-                bagel_only_modules.append(module)
+        if self.config.visual_und:
+            bagel_only_modules.extend((self.model.connector, self.model.vit_pos_embed))
+        if self.config.visual_gen:
+            bagel_only_modules.extend(
+                (
+                    self.model.time_embedder,
+                    self.model.vae2llm,
+                    self.model.llm2vae,
+                    self.model.latent_pos_embed,
+                )
+            )
         for module in bagel_only_modules:
             module.apply(_init_bagel_module)
 
@@ -376,7 +377,7 @@ class BagelForUnifiedMultimodal(HFCheckpointingMixin, nn.Module):
     @classmethod
     def supports_config(cls, config: Any) -> bool:
         """Return ``True`` if this custom class supports ``config``."""
-        return getattr(config, "model_type", None) == BagelConfig.model_type
+        return config.model_type == BagelConfig.model_type
 
     # ------------------------------------------------------------------
     # Convenience accessors used by the parallelizer / state-dict adapter.

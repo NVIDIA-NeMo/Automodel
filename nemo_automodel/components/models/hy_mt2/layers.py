@@ -48,10 +48,20 @@ class HyMT2Attention(nn.Module):
 
         self.num_heads = config.num_attention_heads
         self.num_kv_heads = config.num_key_value_heads
-        self.head_dim = getattr(config, "head_dim", config.hidden_size // self.num_heads)
-        self.qk_norm_enabled = bool(getattr(config, "qk_norm", True))
+        try:
+            self.head_dim = config.head_dim
+        except AttributeError:
+            self.head_dim = config.hidden_size // self.num_heads
+        try:
+            qk_norm = config.qk_norm
+        except AttributeError:
+            qk_norm = True
+        self.qk_norm_enabled = bool(qk_norm)
 
-        attention_bias = getattr(config, "attention_bias", False)
+        try:
+            attention_bias = config.attention_bias
+        except AttributeError:
+            attention_bias = False
 
         self.q_proj = initialize_linear_module(
             backend.linear, config.hidden_size, self.num_heads * self.head_dim, attention_bias
@@ -139,7 +149,7 @@ class HyMT2Attention(nn.Module):
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02):
         for linear in (self.q_proj, self.k_proj, self.v_proj, self.o_proj):
             nn.init.trunc_normal_(linear.weight, mean=0.0, std=init_std)
-            if hasattr(linear, "bias") and linear.bias is not None:
+            if linear.bias is not None:
                 nn.init.zeros_(linear.bias)
         if self.q_norm is not None:
             self.q_norm.reset_parameters()

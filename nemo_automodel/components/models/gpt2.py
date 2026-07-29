@@ -51,7 +51,6 @@ It is, however, perfectly suitable for forward/backward passes, fine-tuning,
 and next-token prediction.
 """
 
-import math
 from typing import Any
 
 import torch
@@ -86,19 +85,9 @@ class CausalSelfAttention(nn.Module):
         q, k, v = qkv.unbind(dim=2)
         q, k, v = (t.transpose(1, 2) for t in (q, k, v))  # (B, n_head, T, head_dim)
 
-        # Use torch's optimized SDPA when available (PyTorch ≥2.0)
-        if hasattr(F, "scaled_dot_product_attention"):
-            attn_output = F.scaled_dot_product_attention(
-                q, k, v, dropout_p=self.attn_dropout, is_causal=True
-            )  # (B, n_head, T, head_dim)
-        else:
-            # Fallback implementation with an explicit causal mask
-            scores = q @ k.transpose(-2, -1) / math.sqrt(self.head_dim)
-            causal_mask = torch.tril(torch.ones(seq_len, seq_len, device=x.device, dtype=torch.bool))
-            scores = scores.masked_fill(~causal_mask, float("-inf"))
-            attn_weights = F.softmax(scores, dim=-1)
-            attn_weights = F.dropout(attn_weights, p=self.attn_dropout, training=self.training)
-            attn_output = attn_weights @ v  # (B, n_head, T, head_dim)
+        attn_output = F.scaled_dot_product_attention(
+            q, k, v, dropout_p=self.attn_dropout, is_causal=True
+        )  # (B, n_head, T, head_dim)
 
         # Merge heads
         attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, seq_len, self.embed_dim)

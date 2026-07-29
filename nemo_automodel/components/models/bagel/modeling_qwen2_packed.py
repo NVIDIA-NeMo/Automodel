@@ -43,14 +43,13 @@ import torch
 import torch.nn as nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.nn.functional import scaled_dot_product_attention
-from transformers import Qwen2Config
 from transformers.activations import ACT2FN
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import ModelOutput
 
 from nemo_automodel.components.attention.flex_attention import FlexAttention
-from nemo_automodel.components.models.bagel.configuration import BagelBackendConfig
+from nemo_automodel.components.models.bagel.configuration import BagelBackendConfig, BagelTextConfig
 from nemo_automodel.components.models.common import (
     initialize_linear_module,
     initialize_rms_norm_module,
@@ -67,6 +66,7 @@ __all__ = [
     "Qwen2MoTDecoderLayer",
     "Qwen2Model",
     "Qwen2ForCausalLM",
+    "Qwen2Config",
     "NaiveCache",
     "BaseNavitOutputWithPast",
 ]
@@ -83,6 +83,7 @@ _HAS_FLASH_ATTN, _flash_attn_varlen_func = safe_import_from(
 
 logger = logging.getLogger(__name__)
 _WARNED_INDEX_PUT_DTYPE_CASTS: set[tuple[torch.dtype, torch.dtype]] = set()
+Qwen2Config = BagelTextConfig
 
 
 def _flash_attn_varlen(*args, **kwargs):
@@ -202,7 +203,7 @@ def _apply_qk_norm(
         Tensor of shape ``[tokens, heads, head_dim]`` with the same layout as
         ``hidden_states``.
     """
-    weight = getattr(norm, "weight", None)
+    weight = norm.weight
     if backend.rms_norm == "te" and hidden_states.dtype == torch.float32 and weight is not None:
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
         return weight.float() * hidden_states * torch.rsqrt(variance + eps)
@@ -218,7 +219,7 @@ def _extract_rope_config(config: Qwen2Config) -> dict:
     dict on Qwen2Config (Llama still keeps the old layout). AM's container runs
     transformers 5.x, so we normalize here instead of hard-coding one schema.
     """
-    rope_params = getattr(config, "rope_parameters", None)
+    rope_params = config.rope_parameters
     if rope_params:
         return dict(rope_params)
     try:
@@ -240,8 +241,8 @@ def _compute_default_rope_parameters(
     """Local "default" RoPE init — transformers 5.x dropped it from ROPE_INIT_FUNCTIONS."""
     rope_params = _extract_rope_config(config)
     base = rope_params.get("rope_theta", 10000.0)
-    dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
-    partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
+    dim = config.hidden_size // config.num_attention_heads
+    partial_rotary_factor = config.partial_rotary_factor
     dim = int(dim * partial_rotary_factor)
     inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.int64).to(device=device, dtype=torch.float32) / dim))
     return inv_freq, 1.0
@@ -392,9 +393,7 @@ class Qwen2MLP(nn.Module):
         self.down_proj = _initialize_linear(self.backend, self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
         # Fuse silu(gate)*up only when the activation is silu (BAGEL/Qwen2 default).
-        self._fuse_silu_mul = (
-            getattr(self.backend, "fused_swiglu", False) and getattr(config, "hidden_act", "silu") == "silu"
-        )
+        self._fuse_silu_mul = self.backend.fused_swiglu and config.hidden_act == "silu"
 
     def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
         gate = self.gate_proj(hidden_state)
@@ -462,9 +461,7 @@ class _PackedAttentionBase(nn.Module):
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.max_position_embeddings = config.max_position_embeddings
         self.rope_theta = _extract_rope_config(config).get("rope_theta", 10000.0)
-        # BAGEL's Qwen2Config extension fields — read with safe defaults so this
-        # port accepts a vanilla transformers.Qwen2Config as well.
-        self.is_causal = getattr(config, "is_causal", True)
+        self.is_causal = config.is_causal
         self.attention_dropout = config.attention_dropout
 
         if (self.head_dim * self.num_heads) != self.hidden_size:
@@ -492,7 +489,7 @@ class PackedAttention(_PackedAttentionBase):
         backend: Optional[BagelBackendConfig] = None,
     ) -> None:
         super().__init__(config, layer_idx, backend=backend)
-        if getattr(config, "qk_norm", False):
+        if config.qk_norm:
             self.q_norm = _initialize_rms_norm(self.backend, self.head_dim, config.rms_norm_eps)
             self.k_norm = _initialize_rms_norm(self.backend, self.head_dim, config.rms_norm_eps)
         else:
@@ -655,7 +652,7 @@ class PackedAttentionMoT(_PackedAttentionBase):
         backend: Optional[BagelBackendConfig] = None,
     ) -> None:
         super().__init__(config, layer_idx, backend=backend)
-        if getattr(config, "qk_norm", False):
+        if config.qk_norm:
             self.q_norm = _initialize_rms_norm(self.backend, self.head_dim, config.rms_norm_eps)
             self.k_norm = _initialize_rms_norm(self.backend, self.head_dim, config.rms_norm_eps)
             self.q_norm_moe_gen = _initialize_rms_norm(self.backend, self.head_dim, config.rms_norm_eps)
@@ -695,7 +692,9 @@ class PackedAttentionMoT(_PackedAttentionBase):
         mot_perm: Optional[torch.LongTensor] = None,
         mot_inv: Optional[torch.LongTensor] = None,
     ) -> torch.Tensor:
-        freeze_und = getattr(self.config, "freeze_und", False)
+        packed_sequence_und = packed_sequence[packed_und_token_indexes]
+        packed_sequence_gen = packed_sequence[packed_gen_token_indexes]
+        freeze_und = self.config.freeze_und
 
         if mot_perm is not None:
             # MLM-style: und tokens are [:Lund], gen tokens [Lund:] — slice + concat, no gather/scatter.
@@ -1156,7 +1155,7 @@ class Qwen2MoTDecoderLayer(nn.Module):
         super().__init__()
         self.backend = backend or BagelBackendConfig()
         self.hidden_size = config.hidden_size
-        self.freeze_und = getattr(config, "freeze_und", False)
+        self.freeze_und = config.freeze_und
 
         self.self_attn = attn_module(config, layer_idx, backend=self.backend)
 
@@ -1382,7 +1381,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
         self.backend = backend or BagelBackendConfig()
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
-        layer_module_name = getattr(config, "layer_module", "Qwen2DecoderLayer")
+        layer_module_name = config.layer_module
         self.use_moe = "Mo" in layer_module_name
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
@@ -1422,7 +1421,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
         mot_perm: Optional[torch.LongTensor] = None,
         mot_inv: Optional[torch.LongTensor] = None,
     ) -> torch.Tensor:
-        freeze_und = getattr(self.config, "freeze_und", False)
+        freeze_und = self.config.freeze_und
         if freeze_und:
             if mot_perm is not None and packed_und_token_indexes is not None:
                 lund = packed_und_token_indexes.shape[0]

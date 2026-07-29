@@ -58,7 +58,7 @@ class Block(nn.Module):
         self.self_attn = HYV3Attention(config, backend)
 
         # Layers 0..(first_k_dense_replace-1) are dense; the rest are MoE.
-        first_k_dense = getattr(config, "first_k_dense_replace", 1)
+        first_k_dense = config.first_k_dense_replace
         if layer_idx < first_k_dense:
             self.mlp = MLP(config.hidden_size, config.intermediate_size, backend.linear)
         else:
@@ -90,15 +90,9 @@ class Block(nn.Module):
         )
         x = x + attn_out
 
-        mlp_out = self._mlp(x=self.post_attention_layernorm(x), padding_mask=padding_mask)
+        mlp_out = self.mlp(self.post_attention_layernorm(x), padding_mask=padding_mask)
         x = x + mlp_out
         return x
-
-    def _mlp(self, x: torch.Tensor, padding_mask: torch.Tensor | None) -> torch.Tensor:
-        if isinstance(self.mlp, MLP):
-            return self.mlp(x)
-        assert isinstance(self.mlp, MoE)
-        return self.mlp(x, padding_mask)
 
     def init_weights(self, buffer_device: torch.device):
         for norm in (self.input_layernorm, self.post_attention_layernorm):
@@ -127,22 +121,22 @@ class HYV3Model(nn.Module):
             inter_dim=config.intermediate_size,
             moe_inter_dim=config.moe_intermediate_size,
             n_routed_experts=config.num_experts,
-            n_shared_experts=getattr(config, "num_shared_experts", 0),
+            n_shared_experts=config.num_shared_experts,
             n_activated_experts=config.num_experts_per_tok,
             n_expert_groups=0,
             n_limited_groups=0,
             train_gate=True,
             gate_bias_update_factor=0.0,
             score_func="sigmoid",
-            route_scale=getattr(config, "router_scaling_factor", 1.0),
+            route_scale=config.router_scaling_factor,
             aux_loss_coeff=0.0,
-            norm_topk_prob=getattr(config, "route_norm", False),
+            norm_topk_prob=config.route_norm,
             expert_bias=False,
             router_bias=False,
             expert_activation="swiglu",
             softmax_before_topk=False,
             # Ensures e_score_correction_bias buffer is created so HF checkpoints load cleanly
-            force_e_score_correction_bias=getattr(config, "moe_router_enable_expert_bias", False),
+            force_e_score_correction_bias=config.moe_router_enable_expert_bias,
         )
         if moe_overrides:
             moe_defaults.update(moe_overrides)
@@ -157,7 +151,7 @@ class HYV3Model(nn.Module):
         self.norm = initialize_rms_norm_module(backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps)
 
         self.max_seq_len = config.max_position_embeddings
-        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        self.head_dim = config.head_dim
 
         base, rope_scaling, _ = get_rope_config(config)
 
@@ -322,9 +316,7 @@ class HYV3ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             and, when ``output_hidden_states`` is set, the final ``hidden_states``.
         """
         output_hidden_states = (
-            output_hidden_states
-            if output_hidden_states is not None
-            else getattr(self.config, "output_hidden_states", False)
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
 
         is_thd = attn_kwargs.get("qkv_format") == "thd"
@@ -349,8 +341,7 @@ class HYV3ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     def update_moe_gate_bias(self) -> None:
         with torch.no_grad():
             for block in self.model.layers.values():
-                if isinstance(block.mlp, MoE) and block.mlp.gate.bias_update_factor > 0:
-                    block.mlp.gate.update_bias()
+                block.mlp.update_gate_bias()
 
     @torch.no_grad()
     def initialize_weights(

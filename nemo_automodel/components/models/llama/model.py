@@ -89,7 +89,7 @@ class LlamaAttention(nn.Module):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
-        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        self.head_dim = config.head_dim
         self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
         self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
@@ -98,6 +98,8 @@ class LlamaAttention(nn.Module):
         self.rope_fusion = self.backend.rope_fusion
         self.rope_backend = self.backend.rope
         self._quack_apply_rotary_emb = None
+        self.attn_module = None
+        self.attn_func = None
         if self.rope_backend == "quack":
             available, apply_rotary_emb = safe_import_from(
                 "quack.rotary",
@@ -213,8 +215,7 @@ class LlamaAttention(nn.Module):
         if is_thd:
             if past_key_values is not None:
                 raise ValueError("Packed THD attention does not support past_key_values.")
-            attn_module = getattr(self, "attn_module", None)
-            if attn_module is None:
+            if self.attn_module is None:
                 raise ValueError("Packed THD attention requires backend.attn='te'.")
             query_states, key_states, value_states, te_kwargs = preprocess_args_and_kwargs_for_attn(
                 query_states,
@@ -224,7 +225,7 @@ class LlamaAttention(nn.Module):
                 "te",
                 **kwargs,
             )
-            attn_output = attn_module(query_states, key_states, value_states, **te_kwargs)
+            attn_output = self.attn_module(query_states, key_states, value_states, **te_kwargs)
             attn_output = postprocess_output_for_attn(attn_output, "te")
             return self.o_proj(attn_output.flatten(1)), None
 
@@ -580,16 +581,16 @@ class LlamaForCausalLM(HFCheckpointingMixin, LlamaPreTrainedModel):
         # Transformers v5 does not reliably tie this custom model from the
         # dict-shaped _tied_weights_keys alone. Explicitly honor the config
         # flag after initialization.
-        if getattr(config, "tie_word_embeddings", False):
+        if config.tie_word_embeddings:
             self.tie_weights()
 
         # Convert to configured dtype if specified
-        if hasattr(config, "torch_dtype") and config.torch_dtype is not None:
-            self.to(dtype=config.torch_dtype)
+        if config.dtype is not None:
+            self.to(dtype=config.dtype)
 
         if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
             print(f"[LlamaForCausalLM] Attention implementation: {self.config._attn_implementation}")
-            print(f"[LlamaForCausalLM] torch_dtype: {self.config.torch_dtype}")
+            print(f"[LlamaForCausalLM] dtype: {self.config.dtype}")
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
@@ -604,7 +605,7 @@ class LlamaForCausalLM(HFCheckpointingMixin, LlamaPreTrainedModel):
         self.lm_head = new_embeddings
 
     def tie_weights(self, *_args: object, **_kwargs: object) -> None:
-        if getattr(self.config, "tie_word_embeddings", False):
+        if self.config.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
 
     def set_decoder(self, decoder):

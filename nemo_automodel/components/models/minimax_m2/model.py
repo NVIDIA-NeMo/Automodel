@@ -21,7 +21,6 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from nemo_automodel.components.models.common import (
     BackendConfig,
-    get_rope_config,
     initialize_linear_module,
     initialize_rms_norm_module,
 )
@@ -48,7 +47,7 @@ class Block(nn.Module):
         self.self_attn = MiniMaxM2Attention(config, backend)
         self.mlp = MoE(moe_config, backend)
 
-        dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+        dtype = get_dtype(config.torch_dtype, torch.bfloat16)
         self.input_layernorm = initialize_rms_norm_module(
             backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, dtype=dtype
         )
@@ -103,15 +102,15 @@ class MiniMaxM2Model(nn.Module):
         if moe_config is not None and moe_overrides is not None:
             raise ValueError("Cannot pass both moe_config and moe_overrides; use one or the other.")
         # Keep compatibility with generic MoE utilities that read config.num_experts.
-        self.config.num_experts = getattr(config, "num_local_experts", getattr(config, "num_experts", None))
+        self.config.num_experts = config.num_local_experts
 
-        score_func = getattr(config, "scoring_func", "sigmoid")
+        score_func = config.scoring_func
         score_func = "softmax" if str(score_func).lower() == "softmax" else "sigmoid"
 
         # Resolve model dtype once; thread explicitly to every sub-module so
         # fp32 master weights work even when construction is not wrapped in
         # local_torch_dtype().
-        model_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+        model_dtype = get_dtype(config.torch_dtype, torch.bfloat16)
 
         moe_defaults = dict(
             dim=config.hidden_size,
@@ -150,17 +149,22 @@ class MiniMaxM2Model(nn.Module):
         )
 
         self.max_seq_len = config.max_position_embeddings
-        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        self.head_dim = config.head_dim
 
-        if not hasattr(config, "rope_parameters") or config.rope_parameters is None:
-            rotary_dim = getattr(config, "rotary_dim", self.head_dim)
-            config.rope_parameters = {
-                "rope_theta": getattr(config, "rope_theta", 5000000.0),
+        config_values = config.to_dict()
+        rope_parameters = config_values.get("rope_parameters")
+        if rope_parameters is None:
+            rotary_dim = config_values.get("rotary_dim", self.head_dim)
+            rope_parameters = {
+                "rope_theta": config.rope_theta,
                 "rope_type": "default",
                 "partial_rotary_factor": rotary_dim / self.head_dim,
             }
 
-        base, rope_scaling, partial_rotary_factor = get_rope_config(config)
+        self.rope_parameters = rope_parameters
+        base = self.rope_parameters["rope_theta"]
+        rope_scaling = self.rope_parameters
+        partial_rotary_factor = rope_parameters.get("partial_rotary_factor", 1.0)
         self.rotary_emb = RotaryEmbedding(
             head_dim=self.head_dim,
             base=base,
@@ -286,7 +290,7 @@ class MiniMaxM2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             moe_config=moe_config,
             moe_overrides=moe_overrides,
         )
-        model_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+        model_dtype = get_dtype(config.torch_dtype, torch.bfloat16)
         self.lm_head = initialize_linear_module(
             self.backend.linear, config.hidden_size, config.vocab_size, bias=False, dtype=model_dtype
         )
@@ -338,9 +342,7 @@ class MiniMaxM2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             and, when ``output_hidden_states`` is set, the final ``hidden_states``.
         """
         output_hidden_states = (
-            output_hidden_states
-            if output_hidden_states is not None
-            else getattr(self.config, "output_hidden_states", False)
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
 
         is_thd = "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd"

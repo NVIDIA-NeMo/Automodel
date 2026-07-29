@@ -15,7 +15,15 @@
 """BAGEL mixed-modal LLM (Qwen2 + SigLIP-NaViT + MoT shell)."""
 
 from nemo_automodel.components.models.bagel.autoencoder import AutoEncoder, AutoEncoderParams, load_bagel_autoencoder
-from nemo_automodel.components.models.bagel.configuration import BagelConfig
+from nemo_automodel.components.models.bagel.configuration import BagelConfig, BagelTextConfig, BagelVAEConfig
 from nemo_automodel.components.models.bagel.model import BagelForUnifiedMultimodal
 
-__all__ = ["AutoEncoder", "AutoEncoderParams", "BagelConfig", "BagelForUnifiedMultimodal", "load_bagel_autoencoder"]
+__all__ = [
+    "AutoEncoder",
+    "AutoEncoderParams",
+    "BagelConfig",
+    "BagelTextConfig",
+    "BagelVAEConfig",
+    "BagelForUnifiedMultimodal",
+    "load_bagel_autoencoder",
+]

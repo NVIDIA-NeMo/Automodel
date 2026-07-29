@@ -56,7 +56,7 @@ class Block(nn.Module):
 
         # Thread dtype from config.torch_dtype so the block's own params stay
         # aligned with the rest of the model (fp32 under fp32 master weights).
-        dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+        dtype = get_dtype(config.torch_dtype, torch.bfloat16)
 
         if not self.is_moe_layer:
             self.mlp = MLP(config.hidden_size, config.intermediate_size, backend.linear, dtype=dtype)
@@ -142,7 +142,7 @@ class DeepseekV3Model(nn.Module):
         # Resolve model dtype once; thread it explicitly to every sub-module
         # so fp32 master weights work even when construction is not wrapped in
         # local_torch_dtype().
-        model_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+        model_dtype = get_dtype(config.torch_dtype, torch.bfloat16)
 
         moe_defaults = dict(
             dim=config.hidden_size,
@@ -234,8 +234,7 @@ class DeepseekV3Model(nn.Module):
     def update_moe_gate_bias(self) -> None:
         with torch.no_grad():
             for _, block in self.layers.named_children():
-                if isinstance(block.mlp, MoE):
-                    block.mlp.gate.update_bias()
+                block.mlp.update_gate_bias()
 
     @torch.no_grad()
     def init_weights(self, buffer_device: torch.device | None = None) -> None:
@@ -318,7 +317,7 @@ class DeepseekV3ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             moe_config=moe_config,
             moe_overrides=moe_overrides,
         )
-        model_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+        model_dtype = get_dtype(config.torch_dtype, torch.bfloat16)
         self.lm_head = initialize_linear_module(
             self.backend.linear, config.hidden_size, config.vocab_size, bias=False, dtype=model_dtype
         )
@@ -369,9 +368,7 @@ class DeepseekV3ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             when ``output_hidden_states`` is set, the final ``hidden_states``.
         """
         output_hidden_states = (
-            output_hidden_states
-            if output_hidden_states is not None
-            else getattr(self.config, "output_hidden_states", False)
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
 
         is_thd = "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd"
@@ -396,8 +393,7 @@ class DeepseekV3ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     def update_moe_gate_bias(self) -> None:
         with torch.no_grad():
             for _, block in self.model.layers.named_children():
-                if isinstance(block.mlp, MoE):
-                    block.mlp.gate.update_bias()
+                block.mlp.update_gate_bias()
 
     @torch.no_grad()
     def initialize_weights(

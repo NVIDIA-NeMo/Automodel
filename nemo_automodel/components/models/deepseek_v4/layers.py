@@ -316,10 +316,12 @@ class DeepseekV4TrainCache:
         self.indexer_state: list[dict] = []
 
     def _branch_state(self, state_key: str, layer_idx: int) -> dict:
-        store = getattr(self, state_key, None)
-        if store is None:
-            store = []
-            setattr(self, state_key, store)
+        if state_key == "compressor_state":
+            store = self.compressor_state
+        elif state_key == "indexer_state":
+            store = self.indexer_state
+        else:
+            raise ValueError(f"Unsupported DeepSeek V4 cache branch: {state_key}")
         while len(store) <= layer_idx:
             store.append({"buffer_kv": None, "buffer_gate": None, "pooled": None})
         return store[layer_idx]
@@ -656,10 +658,7 @@ def eager_attention_with_sink(
     attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
     if attention_mask is not None:
         attn_weights = attn_weights + attention_mask[:, :, :, : attn_weights.shape[-1]]
-    if hasattr(module, "sinks_param"):
-        sinks = module.sinks_param(query)
-    else:
-        sinks = module.sinks
+    sinks = module.sinks_param(query)
     sinks = sinks.reshape(1, -1, 1, 1).expand(query.shape[0], -1, query.shape[-2], -1)
     combined = torch.cat([attn_weights, sinks.to(attn_weights.dtype)], dim=-1)
     combined = combined - combined.max(dim=-1, keepdim=True).values
@@ -1207,6 +1206,7 @@ class DeepseekV4Attention(nn.Module):
 
     def __init__(self, config: DeepseekV4Config, layer_idx: int, backend: BackendConfig | None = None):
         super().__init__()
+        self._cp_group = None
         self.config = config
         self.backend = backend or BackendConfig()
         model_dtype = get_dtype(config.torch_dtype, torch.bfloat16)
@@ -1217,8 +1217,8 @@ class DeepseekV4Attention(nn.Module):
         self.num_key_value_groups = config.num_attention_heads
         self.head_dim = config.head_dim
         self.rope_head_dim = config.qk_rope_head_dim
-        self.sliding_window = int(getattr(config, "sliding_window", 128) or 128)
-        self.attention_dropout = float(getattr(config, "attention_dropout", 0.0) or 0.0)
+        self.sliding_window = int(config.sliding_window or 128)
+        self.attention_dropout = float(config.attention_dropout or 0.0)
         self.is_causal = True
         self.scaling = self.head_dim**-0.5
 
@@ -1269,7 +1269,7 @@ class DeepseekV4Attention(nn.Module):
         position_ids: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        cp_group = kwargs.get("_dsv4_cp_group") or getattr(self, "_cp_group", None)
+        cp_group = kwargs.get("_dsv4_cp_group") or self._cp_group
         cp_active = dsv4_cp_enabled(cp_group)
         packed_seq_ids = kwargs.get("packed_seq_ids")
         if packed_seq_ids is not None and packed_seq_ids.dim() == 1:
@@ -1455,8 +1455,7 @@ class DeepseekV4Attention(nn.Module):
 
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
         for linear in (self.wq_a, self.wq_b, self.wkv, self.wo_b, self.wo_a):
-            if hasattr(linear, "weight"):
-                nn.init.trunc_normal_(linear.weight, mean=0.0, std=init_std)
+            nn.init.trunc_normal_(linear.weight, mean=0.0, std=init_std)
         for norm in (self.q_norm, self.kv_norm):
             norm.reset_parameters()
         nn.init.zeros_(self.sinks_param.weight)

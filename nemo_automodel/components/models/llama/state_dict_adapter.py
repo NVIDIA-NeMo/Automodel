@@ -57,7 +57,7 @@ class LlamaStateDictAdapter:
         # Only need to handle tied lm_head weights.
         custom_state_dict = dict(hf_state_dict)
         # Default False to match __init__/tie_weights (config always carries the flag).
-        if getattr(self.config, "tie_word_embeddings", False):
+        if self.config.tie_word_embeddings:
             embed_key = "model.embed_tokens.weight"
             lm_head_key = "lm_head.weight"
             if lm_head_key not in custom_state_dict and embed_key in custom_state_dict:

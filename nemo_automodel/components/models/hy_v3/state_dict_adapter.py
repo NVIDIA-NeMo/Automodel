@@ -200,6 +200,6 @@ class HYV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
 
     def _is_mtp_key(self, key: str) -> bool:
         """Return True if *key* belongs to an MTP layer (index >= num_hidden_layers)."""
-        num_hidden = getattr(self.config, "num_hidden_layers", 80)
+        num_hidden = self.config.num_hidden_layers
         m = re.match(r"(?:model\.)?layers\.(\d+)\.", key)
         return bool(m and int(m.group(1)) >= num_hidden)

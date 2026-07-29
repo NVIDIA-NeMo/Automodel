@@ -23,9 +23,10 @@ logger = logging.getLogger(__name__)
 
 def _install_resolver_hook() -> None:
     """Prepend an FP8-Mistral3 VLM check to _resolve_custom_model_cls_for_config."""
-    if getattr(_mi._resolve_custom_model_cls_for_config, "_mistral3_vlm_hook_installed", False):
+    resolver = _mi._resolve_custom_model_cls_for_config
+    if resolver.__module__ == __name__ and resolver.__name__ == "_patched":
         return
-    _orig_resolve = _mi._resolve_custom_model_cls_for_config
+    _orig_resolve = resolver
 
     def _patched(config):
         try:
@@ -40,7 +41,6 @@ def _install_resolver_hook() -> None:
             logger.debug("Mistral3 VLM FP8 resolver raised", exc_info=True)
         return _orig_resolve(config)
 
-    _patched._mistral3_vlm_hook_installed = True  # type: ignore[attr-defined]
     _mi._resolve_custom_model_cls_for_config = _patched
 
 

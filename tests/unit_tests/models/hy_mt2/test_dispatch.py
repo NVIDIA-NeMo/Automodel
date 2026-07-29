@@ -15,16 +15,15 @@
 """Tests for the Hy-MT2 config-shape fingerprint and its routing through the
 shared ``_resolve_custom_model_cls_for_config`` entry point."""
 
-from types import SimpleNamespace
+from transformers import PretrainedConfig
 
 from nemo_automodel._transformers.model_init import _resolve_custom_model_cls_for_config
 from nemo_automodel.components.models.hy_mt2.dispatch import is_hy_mt2_config
 
 
-def _hy_mt2_config() -> SimpleNamespace:
-    return SimpleNamespace(
+def _hy_mt2_config() -> PretrainedConfig:
+    config = PretrainedConfig(
         architectures=["HYV3ForCausalLM"],
-        model_type="hy_v3",
         hidden_size=2048,
         num_hidden_layers=48,
         num_experts=128,
@@ -32,17 +31,20 @@ def _hy_mt2_config() -> SimpleNamespace:
         moe_intermediate_size=768,
         enable_lm_head_fp32=True,
     )
+    config.model_type = "hy_v3"
+    return config
 
 
-def _hy3_preview_config() -> SimpleNamespace:
-    return SimpleNamespace(
+def _hy3_preview_config() -> PretrainedConfig:
+    config = PretrainedConfig(
         architectures=["HYV3ForCausalLM"],
-        model_type="hy_v3",
         hidden_size=4096,
         num_hidden_layers=80,
         num_experts=192,
         moe_intermediate_size=1536,
     )
+    config.model_type = "hy_v3"
+    return config
 
 
 class TestIsHyMT2Config:

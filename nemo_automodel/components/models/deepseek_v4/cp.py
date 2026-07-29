@@ -33,7 +33,7 @@ def _lcm(a: int, b: int) -> int:
     return abs(a * b) // math.gcd(a, b) if a and b else max(a, b)
 
 
-def dsv4_cp_local_seq_multiple(model_or_config) -> int:
+def dsv4_cp_local_seq_multiple(config) -> int:
     """Required per-CP-rank sequence-length multiple for DSV4 Miles-style CP.
 
     Compress-ratio layers constrain how the sequence may be split across CP ranks:
@@ -41,8 +41,7 @@ def dsv4_cp_local_seq_multiple(model_or_config) -> int:
     cross-window overlap so they need ``2*R``. The returned value is the LCM across
     all configured ``compress_ratios`` (1 when none are configured).
     """
-    config = getattr(model_or_config, "config", model_or_config)
-    ratios = [int(r) for r in (getattr(config, "compress_ratios", None) or []) if int(r) > 0]
+    ratios = [int(r) for r in (config.compress_ratios or []) if int(r) > 0]
     multiple = 1
     for ratio in ratios:
         required = 2 * ratio if ratio == 4 else ratio

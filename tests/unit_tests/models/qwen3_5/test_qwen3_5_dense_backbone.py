@@ -166,22 +166,13 @@ class TestSSMGateParamDescriptor:
 
 class TestResolveSSMDtype:
     def test_default_is_fp32(self):
-        class Cfg:
-            pass
-
-        assert _resolve_ssm_dtype(Cfg()) == torch.float32
+        assert _resolve_ssm_dtype(None) == torch.float32
 
     def test_string_dtype_resolved(self):
-        class Cfg:
-            mamba_ssm_dtype = "float32"
-
-        assert _resolve_ssm_dtype(Cfg()) == torch.float32
+        assert _resolve_ssm_dtype("float32") == torch.float32
 
     def test_explicit_dtype_passthrough(self):
-        class Cfg:
-            mamba_ssm_dtype = torch.float32
-
-        assert _resolve_ssm_dtype(Cfg()) == torch.float32
+        assert _resolve_ssm_dtype(torch.float32) == torch.float32
 
 
 # ---------------------------------------------------------------------------
@@ -214,6 +205,17 @@ class TestDenseTextBackbone:
         # an fp32 SSMGate holder; the full-attention block does not.
         assert hasattr(backbone.layers["1"], "linear_attn")
         assert hasattr(backbone.layers["1"].linear_attn, "_fp32_params")
+
+    def test_init_weights_resets_linear_attention_norm_weight(self):
+        cfg = _tiny_config(layer_types=("linear_attention",))
+        backbone = Qwen3_5DenseTextBackbone(cfg, _backend())
+        block = backbone.layers["0"]
+        nn.init.zeros_(block.linear_attn.norm.weight)
+
+        with torch.no_grad():
+            block.init_weights(torch.device("cpu"))
+
+        torch.testing.assert_close(block.linear_attn.norm.weight, torch.ones_like(block.linear_attn.norm.weight))
 
     def test_forward_shape_full_attention(self):
         cfg = _tiny_config(layer_types=("full_attention",))

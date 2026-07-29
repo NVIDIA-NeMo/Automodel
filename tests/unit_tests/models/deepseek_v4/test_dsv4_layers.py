@@ -34,6 +34,7 @@ from nemo_automodel.components.models.deepseek_v4.layers import (
     DeepseekV4GroupedLinear,
     DeepseekV4HyperConnection,
     DeepseekV4RotaryEmbedding,
+    DeepseekV4TrainCache,
     _apply_partial_rope_interleaved,
     _build_indexer_topk_compressed_mask,
     _rms_norm_last_dim,
@@ -58,6 +59,23 @@ from nemo_automodel.components.models.deepseek_v4.optimized_kernels import (
 )
 
 _MILES_INDEXER_REQUIRED_DYNAMIC_SMEM_BYTES = 229376
+
+
+class TestDeepseekV4TrainCache:
+    def test_branch_state_uses_explicit_cache_stores(self):
+        cache = DeepseekV4TrainCache()
+
+        compressor_state = cache._branch_state("compressor_state", 1)
+        indexer_state = cache._branch_state("indexer_state", 0)
+
+        assert compressor_state is cache.compressor_state[1]
+        assert indexer_state is cache.indexer_state[0]
+
+    def test_branch_state_rejects_unknown_store(self):
+        cache = DeepseekV4TrainCache()
+
+        with pytest.raises(ValueError, match="Unsupported DeepSeek V4 cache branch"):
+            cache._branch_state("unknown_state", 0)
 
 
 def _cuda_device_capability() -> tuple[int, int]:
@@ -989,7 +1007,11 @@ class TestDeepseekV4OptimizedKernels:
             training = False
 
             def __init__(self, sinks):
-                self.sinks = sinks
+                self._sinks = sinks
+
+            def sinks_param(self, reference):
+                del reference
+                return self._sinks
 
         def packed_attention(q_, kv_, sinks_):
             attention_mask = build_packed_causal_padding_mask(
@@ -1289,8 +1311,12 @@ class TestDeepseekV4OptimizedKernels:
             num_key_value_groups = heads
 
             def __init__(self, sinks):
-                self.sinks = sinks
+                self._sinks = sinks
                 self.training = False
+
+            def sinks_param(self, reference):
+                del reference
+                return self._sinks
 
         expected, expected_grads = _run_forward_backward(
             lambda q_, kv_, sinks_: eager_attention_with_sink(

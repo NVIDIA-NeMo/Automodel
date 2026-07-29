@@ -255,7 +255,7 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
           5. Re-prefix MTP keys: ``model.layers.{k}.*`` -> ``mtp.layers.{k}.*``.
         """
         N = self.config.num_hidden_layers
-        num_mtp = int(getattr(self.config, "num_nextn_predict_layers", 0) or 0)
+        num_mtp = int(self.config.num_nextn_predict_layers or 0)
         # HF V4 emits both prefixed (``model.layers.{N+k}.*`` for self_attn /
         # mlp / norms) and unprefixed (``layers.{N+k}.*`` for V4 fusion-only
         # modules eh_proj / enorm / hnorm / final_layernorm) MTP keys, so the
@@ -488,7 +488,7 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
         import json as _json
         import os as _os
 
-        ckpt_path = getattr(self.config, "_name_or_path", None) or getattr(self.config, "name_or_path", None)
+        ckpt_path = self.config._name_or_path or self.config.name_or_path
         if not ckpt_path:
             return 0
         cfg_json = _os.path.join(ckpt_path, "config.json")
@@ -517,7 +517,7 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
         # overridden) model config — we need to match the on-disk layout.
         num_hash_layers = self._checkpoint_num_hash_layers()
         if num_hash_layers <= 0:
-            num_hash_layers = int(getattr(self.config, "num_hash_layers", 0) or 0)
+            num_hash_layers = int(self.config.num_hash_layers or 0)
         if num_hash_layers <= 0:
             return state_dict
         hash_layer_ids = {str(i) for i in range(num_hash_layers)}
@@ -870,7 +870,7 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
         return self._checkpoint_expert_quant_layout_cache
 
     def _detect_checkpoint_expert_quant_layout(self) -> _ExpertQuantLayout:
-        ckpt_path = getattr(self.config, "_name_or_path", None) or getattr(self.config, "name_or_path", None)
+        ckpt_path = self.config._name_or_path or self.config.name_or_path
         if not ckpt_path:
             return _ExpertQuantLayout.FP4
 

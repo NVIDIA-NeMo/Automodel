@@ -82,7 +82,7 @@ class Qwen2Attention(nn.Module):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
-        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        self.head_dim = config.hidden_size // config.num_attention_heads
         self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
         self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
@@ -91,6 +91,8 @@ class Qwen2Attention(nn.Module):
         self.rope_fusion = self.backend.rope_fusion
         self.rope_backend = self.backend.rope
         self._quack_apply_rotary_emb = None
+        self.attn_module = None
+        self.attn_func = None
         if self.rope_backend == "quack":
             available, apply_rotary_emb = safe_import_from(
                 "quack.rotary",
@@ -197,8 +199,7 @@ class Qwen2Attention(nn.Module):
         if is_thd:
             if past_key_values is not None:
                 raise ValueError("Packed THD attention does not support past_key_values.")
-            attn_module = getattr(self, "attn_module", None)
-            if attn_module is None:
+            if self.attn_module is None:
                 raise ValueError("Packed THD attention requires backend.attn='te'.")
             window_size = (-1, 0) if self.sliding_window is None else (self.sliding_window - 1, 0)
             query_states, key_states, value_states, te_kwargs = preprocess_args_and_kwargs_for_attn(
@@ -210,7 +211,7 @@ class Qwen2Attention(nn.Module):
                 window_size=window_size,
                 **kwargs,
             )
-            attn_output = attn_module(query_states, key_states, value_states, **te_kwargs)
+            attn_output = self.attn_module(query_states, key_states, value_states, **te_kwargs)
             attn_output = postprocess_output_for_attn(attn_output, "te")
             return self.o_proj(attn_output.flatten(1)), None
 
@@ -249,7 +250,7 @@ class Qwen2SeparateMLP(nn.Module):
 
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
-        mlp_bias = getattr(config, "mlp_bias", False)
+        mlp_bias = config.to_dict().get("mlp_bias", False)
         self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=mlp_bias)
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=mlp_bias)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=mlp_bias)
@@ -551,16 +552,16 @@ class Qwen2ForCausalLM(HFCheckpointingMixin, Qwen2PreTrainedModel):
 
         # Tie weights if specified in config (standard for Qwen2/Llama)
         # Must be done after post_init() to ensure embed_tokens is initialized
-        if getattr(config, "tie_word_embeddings", True):
+        if config.tie_word_embeddings:
             self.tie_weights()
 
         # Convert to configured dtype if specified
-        if hasattr(config, "torch_dtype") and config.torch_dtype is not None:
-            self.to(dtype=config.torch_dtype)
+        if config.dtype is not None:
+            self.to(dtype=config.dtype)
 
         if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
             print(f"[Qwen2ForCausalLM] Attention implementation: {self.config._attn_implementation}")
-            print(f"[Qwen2ForCausalLM] torch_dtype: {self.config.torch_dtype}")
+            print(f"[Qwen2ForCausalLM] dtype: {self.config.dtype}")
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
@@ -578,7 +579,7 @@ class Qwen2ForCausalLM(HFCheckpointingMixin, Qwen2PreTrainedModel):
         # Transformers v5 does not reliably tie this custom model from the
         # dict-shaped _tied_weights_keys alone; honor the config flag explicitly
         # (mirrors LlamaForCausalLM).
-        if getattr(self.config, "tie_word_embeddings", False):
+        if self.config.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
 
     @can_return_tuple

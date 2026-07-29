@@ -83,7 +83,7 @@ class _SSMGateParam:
     def __get__(self, obj, owner=None):
         if obj is None:
             return self
-        return getattr(obj._fp32_params, self.name)
+        return obj._fp32_params.get_parameter(self.name)
 
 
 class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
@@ -111,7 +111,7 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
         self._cp_mesh = None
         # HF created bare ``A_log``/``dt_bias`` in ``_parameters``; move them into a
         # native fp32 ``SSMGate`` submodule (built directly, not relocated at runtime).
-        install_ssm_gate(self, fp32_dtype=_resolve_ssm_dtype(config))
+        install_ssm_gate(self, fp32_dtype=_resolve_ssm_dtype(config.to_dict().get("mamba_ssm_dtype")))
 
     def _compute_gate(self, a: torch.Tensor) -> torch.Tensor:
         """Compute the gating value ``g`` via the fp32 ``SSMGate`` submodule.
@@ -646,18 +646,17 @@ def install_ssm_gate(mod, fp32_dtype=torch.float32):
         param = mod._parameters.pop(pname)
         if param.dtype != fp32_dtype:
             param.data = param.data.to(fp32_dtype)
-        setattr(gate, pname, param)  # overwrite the freshly-built empty param
+        gate.register_parameter(pname, param)
     mod.add_module("_fp32_params", gate)
     return gate
 
 
-def _resolve_ssm_dtype(config):
-    """Resolve the fp32 storage dtype for the SSM-gating params from ``config``.
+def _resolve_ssm_dtype(ssm_dtype: str | torch.dtype | None) -> torch.dtype:
+    """Resolve the storage dtype for the SSM-gating params.
 
-    Honors ``mamba_ssm_dtype`` when present; otherwise defaults to AutoModel's
-    fp32 training-storage contract for ``A_log``/``dt_bias``.
+    Defaults to AutoModel's fp32 training-storage contract for
+    ``A_log``/``dt_bias``.
     """
-    ssm_dtype = getattr(config, "mamba_ssm_dtype", None)
     if isinstance(ssm_dtype, str):
         ssm_dtype = dtype_from_str(ssm_dtype)
     return ssm_dtype or torch.float32

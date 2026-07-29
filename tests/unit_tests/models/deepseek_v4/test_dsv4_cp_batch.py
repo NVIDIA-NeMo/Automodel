@@ -104,7 +104,6 @@ def test_local_seq_multiple(ratios, expected):
     cfg = SimpleNamespace(compress_ratios=ratios)
     assert dsv4_cp_local_seq_multiple(cfg) == expected
     # also accepts an object carrying `.config`
-    assert dsv4_cp_local_seq_multiple(SimpleNamespace(config=cfg)) == expected
 
 
 def test_build_packed_seq_ids_handles_1d_padding_zero_and_truncation():

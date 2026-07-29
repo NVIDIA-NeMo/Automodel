@@ -5,17 +5,16 @@ from __future__ import annotations
 import pytest
 import torch
 import torch.nn as nn
-from transformers import Qwen2Config
 
-from nemo_automodel.components.models.bagel.configuration import resolve_bagel_backend
+from nemo_automodel.components.models.bagel.configuration import BagelTextConfig, resolve_bagel_backend
 from nemo_automodel.components.models.bagel.modeling_qwen2_packed import (
     Qwen2ForCausalLM,
     _apply_qk_norm,
 )
 
 
-def _config() -> Qwen2Config:
-    config = Qwen2Config(
+def _config() -> BagelTextConfig:
+    return BagelTextConfig(
         vocab_size=32,
         hidden_size=64,
         intermediate_size=128,
@@ -25,9 +24,8 @@ def _config() -> Qwen2Config:
         max_position_embeddings=64,
         rms_norm_eps=1e-6,
         attention_dropout=0.0,
+        pad_token_id=0,
     )
-    config.qk_norm = True
-    return config
 
 
 def test_partial_backend_mapping_inherits_bagel_defaults() -> None:

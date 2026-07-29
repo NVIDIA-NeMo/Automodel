@@ -133,8 +133,8 @@ class Gemma4WithDrafter(nn.Module, HFCheckpointingMixin):
         # The drafter's pre_projection layer expects ``2 * backbone_hidden_size``
         # features (concatenation of base embed and base final hidden state).
         base_text_config = self._get_base_text_config(base)
-        drafter_config = getattr(drafter, "config", None)
-        if drafter_config is not None and hasattr(drafter_config, "backbone_hidden_size"):
+        drafter_config = drafter.config
+        if drafter_config is not None:
             assert drafter_config.backbone_hidden_size == base_text_config.hidden_size, (
                 f"drafter.config.backbone_hidden_size ({drafter_config.backbone_hidden_size}) "
                 f"must match base text_config.hidden_size ({base_text_config.hidden_size})"
@@ -190,19 +190,19 @@ class Gemma4WithDrafter(nn.Module, HFCheckpointingMixin):
         #    released drafter's centroids are learned via K-means clustering of
         #    the embedding table, not joint SFT.
         if self.drafter_num_steps == 1:
-            post_proj = getattr(self.drafter, "post_projection", None)
+            post_proj = self.drafter.post_projection
             if post_proj is not None:
                 for p in post_proj.parameters():
                     p.requires_grad_(False)
-        masked_embedding = getattr(self.drafter, "masked_embedding", None)
+        masked_embedding = self.drafter.masked_embedding
         if masked_embedding is not None:
-            centroids = getattr(masked_embedding, "centroids", None)
+            centroids = masked_embedding.centroids
             if centroids is not None:
                 for p in centroids.parameters():
                     p.requires_grad_(False)
 
         if self.base_activation_checkpointing:
-            enable_fn = getattr(self.base, "gradient_checkpointing_enable", None)
+            enable_fn = self.base.gradient_checkpointing_enable
             if enable_fn is None:
                 raise RuntimeError(
                     "base_activation_checkpointing=True but the base model does not expose "
@@ -213,10 +213,10 @@ class Gemma4WithDrafter(nn.Module, HFCheckpointingMixin):
 
     @staticmethod
     def _get_base_text_config(base: nn.Module):
-        cfg = getattr(base, "config", None)
+        cfg = base.config
         if cfg is None:
             raise ValueError("base model has no `config` attribute")
-        return cfg.text_config if hasattr(cfg, "text_config") else cfg
+        return cfg.text_config
 
     # ------------------------------------------------------------------
     # Construction
@@ -322,7 +322,7 @@ class Gemma4WithDrafter(nn.Module, HFCheckpointingMixin):
                 "PEFT (LoRA/QLoRA) for joint base + drafter fine-tuning is not "
                 "supported yet. Run full SFT or open an issue."
             )
-        if device_mesh is not None and "cp" in getattr(device_mesh, "mesh_dim_names", ()):
+        if device_mesh is not None and "cp" in device_mesh.mesh_dim_names:
             if device_mesh["cp"].size() > 1:
                 raise ValueError(
                     "Context parallelism is not supported with Gemma4WithDrafter "
@@ -333,10 +333,8 @@ class Gemma4WithDrafter(nn.Module, HFCheckpointingMixin):
         # separate mesh / config kwargs. Apply the same pp/cp guards to it so the
         # KV-sharing invariant holds regardless of which entry point is used.
         if distributed_setup is not None:
-            mesh_context = getattr(distributed_setup, "mesh_context", None)
-            if getattr(distributed_setup, "pipeline_config", None) is not None or (
-                mesh_context is not None and mesh_context.pp_size > 1
-            ):
+            mesh_context = distributed_setup.mesh_context
+            if distributed_setup.pipeline_config is not None or (mesh_context is not None and mesh_context.pp_size > 1):
                 raise ValueError(
                     "Pipeline parallelism is not supported with Gemma4WithDrafter "
                     "(the KV-sharing path between base and drafter is not pipeline-safe). "
@@ -465,7 +463,7 @@ class Gemma4WithDrafter(nn.Module, HFCheckpointingMixin):
         )
 
         logits_base = base_out.logits
-        hidden_states = getattr(base_out, "hidden_states", None)
+        hidden_states = base_out.hidden_states
         if hidden_states is None:
             raise RuntimeError(
                 "Base model did not return `hidden_states`. Ensure `output_hidden_states=True` "
@@ -474,7 +472,7 @@ class Gemma4WithDrafter(nn.Module, HFCheckpointingMixin):
             )
         h_final = hidden_states[-1]
 
-        shared_kv = getattr(base_out, "shared_kv_states", None)
+        shared_kv = base_out.shared_kv_states
         if shared_kv is None:
             raise RuntimeError(
                 "Base model did not return `shared_kv_states`. Ensure transformers TOT "
@@ -559,18 +557,18 @@ class Gemma4WithDrafter(nn.Module, HFCheckpointingMixin):
 
     @property
     def vision_tower(self):
-        return getattr(self.base, "vision_tower", None)
+        return self.base.vision_tower
 
     @property
     def audio_tower(self):
-        return getattr(self.base, "audio_tower", None)
+        return self.base.audio_tower
 
     @property
     def language_model(self):
-        return getattr(self.base, "language_model", None)
+        return self.base.language_model
 
     def get_rope_index(self, *args, **kwargs):
-        fn = getattr(self.base, "get_rope_index", None)
+        fn = self.base.get_rope_index
         if fn is None:
             raise AttributeError("base model does not expose `get_rope_index`")
         return fn(*args, **kwargs)

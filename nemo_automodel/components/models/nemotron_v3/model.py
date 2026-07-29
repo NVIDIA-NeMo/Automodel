@@ -112,7 +112,7 @@ class NemotronV3Model(nn.Module):
             shared_expert_inter_dim=config.moe_shared_expert_intermediate_size,
             shared_expert_activation="relu2",  # Use ReLU² for shared experts
             force_e_score_correction_bias=True,  # NemotronV3 checkpoint has this buffer
-            moe_latent_size=getattr(config, "moe_latent_size", None),
+            moe_latent_size=config.to_dict().get("moe_latent_size"),
         )
         if moe_overrides:
             moe_defaults.update(moe_overrides)
@@ -158,7 +158,7 @@ class NemotronV3Model(nn.Module):
         # Get embeddings (PP-aware: a trimmed mid-stage has embed_tokens=None
         # and receives the prior stage's hidden states as input_ids).
         if inputs_embeds is None:
-            if getattr(self, "embed_tokens", None) is not None:
+            if self.embed_tokens is not None:
                 if input_ids is None:
                     raise ValueError("input_ids must be provided if inputs_embeds is not provided")
                 hidden_states = self.embed_tokens(input_ids)
@@ -171,7 +171,7 @@ class NemotronV3Model(nn.Module):
 
         # TE natively supports THD; squeeze to [T, H] so attention layers
         # pick the THD branch. SDPA/flex only support 4D BSHD.
-        _attn_impl = getattr(getattr(self, "backend", None), "attn", None)
+        _attn_impl = self.backend.attn
         squeezed_for_thd = False
         if (
             kwargs.get("qkv_format") == "thd"
@@ -251,7 +251,7 @@ class NemotronV3Model(nn.Module):
             )
 
         # Norm is None on non-last PP stages (splitter trims it).
-        if getattr(self, "norm", None) is not None:
+        if self.norm is not None:
             hidden_states = self.norm(hidden_states)
 
         if squeezed_for_thd:
@@ -270,9 +270,9 @@ class NemotronV3Model(nn.Module):
             buffer_device: Device to use for buffer initialization
         """
         with buffer_device:
-            if getattr(self, "embed_tokens", None) is not None:
+            if self.embed_tokens is not None:
                 nn.init.normal_(self.embed_tokens.weight, mean=0.0, std=self.config.initializer_range)
-            if getattr(self, "norm", None) is not None:
+            if self.norm is not None:
                 self.norm.reset_parameters()
 
         for block in self.layers.values():
@@ -473,14 +473,14 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
             checkpoint_wrapper,
         )
 
-        if getattr(self, "_gradient_checkpointing", False):
+        if self._gradient_checkpointing:
             return
 
         def _wrap(block):
             return checkpoint_wrapper(block, checkpoint_impl=CheckpointImpl.NO_REENTRANT, preserve_rng_state=True)
 
         containers = [self.model.layers]
-        if self.mtp is not None and getattr(self.mtp, "layers", None) is not None:
+        if self.mtp is not None and self.mtp.layers is not None:
             containers.append(self.mtp.layers)
         for layers in containers:
             for layer_id, block in list(layers.named_children()):
@@ -491,10 +491,10 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
         """Unwrap any checkpoint-wrapped blocks (inverse of ``gradient_checkpointing_enable``)."""
         from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
 
-        if not getattr(self, "_gradient_checkpointing", False):
+        if not self._gradient_checkpointing:
             return
         containers = [self.model.layers]
-        if self.mtp is not None and getattr(self.mtp, "layers", None) is not None:
+        if self.mtp is not None and self.mtp.layers is not None:
             containers.append(self.mtp.layers)
         for layers in containers:
             for layer_id, block in list(layers.named_children()):
@@ -510,22 +510,20 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
         (c) ``model.layers`` count diverges from ``config.num_hidden_layers``
         is sufficient — the PP splitter nulls these attributes when trimming.
 
-        The checks use ``hasattr`` to distinguish "splitter nulled the
-        attribute" (attribute present, value is None) from "caller replaced
-        ``self.model`` with a stub that doesn't declare the attribute"
-        (attribute absent). Tests that swap in stub inner modules should not
-        be misclassified as PP stages.
+        The checks distinguish "splitter nulled the attribute" (attribute
+        present, value is None) from "caller replaced ``self.model`` with a
+        stub that doesn't declare the attribute" (attribute absent). Tests
+        that swap in stub inner modules should not be misclassified as PP
+        stages.
         """
         if self.lm_head is None:
             return True
-        if hasattr(self.model, "embed_tokens") and self.model.embed_tokens is None:
+        if self.model.embed_tokens is None:
             return True
-        if hasattr(self.model, "layers"):
-            try:
-                return len(self.model.layers) != int(self.config.num_hidden_layers)
-            except TypeError:
-                return False
-        return False
+        try:
+            return len(self.model.layers) != int(self.config.num_hidden_layers)
+        except TypeError:
+            return False
 
     def _build_mtp_embed_inputs_for_pp(self, input_ids: torch.Tensor) -> tuple[torch.Tensor, ...]:
         """Build the per-depth rolled-token embeddings on the first PP stage.
@@ -543,7 +541,7 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
             ``[B, S, hidden]`` embeddings for depths 1..D (i.e. for predicting
             tokens shifted left by 1..D positions).
         """
-        if getattr(self.model, "embed_tokens", None) is None:
+        if self.model.embed_tokens is None:
             raise ValueError("First PP stage must own embed_tokens to build MTP embeddings")
         if input_ids.dtype not in (torch.int32, torch.int64, torch.long):
             raise ValueError("First PP stage must receive token ids to build MTP embeddings")
@@ -594,7 +592,7 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
         forward signature is exercised on every microbatch.
         """
         hidden_shape = (microbatch_size, seq_len, self.config.hidden_size)
-        mtp_depth = int(getattr(self.mtp_config, "num_layers", 0) or 0)
+        mtp_depth = int(self.mtp_config.num_layers or 0)
 
         def meta(shape: tuple[int, ...], d: torch.dtype = dtype) -> torch.Tensor:
             return torch.empty(*shape, device="meta", dtype=d)
@@ -696,9 +694,9 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
                 ``1 + D + 1`` when MTP is enabled, else ``logits`` alone.
         """
         is_pp_stage = self._is_pipeline_parallel_stage()
-        is_first_stage = getattr(self.model, "embed_tokens", None) is not None
+        is_first_stage = self.model.embed_tokens is not None
         has_lm_head = self.lm_head is not None
-        mtp_depth = int(getattr(self.mtp_config, "num_layers", 0) or 0)
+        mtp_depth = int(self.mtp_config.num_layers or 0)
         pp_mtp_enabled = is_pp_stage and self.mtp_config.enabled
 
         # Neat-packed SDPA: convert _packed_seq_ids (1-based [B,S] int, 0=pad)
@@ -711,11 +709,7 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
             if padding_mask is None:
                 padding_mask = _packed_seq_ids == 0
 
-        output_hidden_states = (
-            output_hidden_states
-            if output_hidden_states is not None
-            else getattr(self.config, "output_hidden_states", False)
-        )
+        output_hidden_states = output_hidden_states if output_hidden_states is not None else self.output_hidden_states
 
         # Stash pre-squeeze [B, S] input_ids: the MTP embed tuple must be
         # built AFTER self.model() runs (FSDP2 root lazy-init requires the
@@ -736,7 +730,7 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
 
         # Squeezing to [T, H] only helps TE; SDPA/flex need 4D BSHD. Keep
         # is_thd true regardless so the post-forward unsqueeze still fires.
-        _attn_impl = getattr(getattr(self, "backend", None), "attn", None)
+        _attn_impl = self.backend.attn
         is_thd = kwargs.get("qkv_format") == "thd"
         squeeze_for_thd = is_thd and _attn_impl == "te"
         if squeeze_for_thd and is_first_stage:

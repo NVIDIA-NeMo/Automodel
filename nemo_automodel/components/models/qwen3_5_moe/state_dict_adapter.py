@@ -181,7 +181,10 @@ class Qwen3_5MoeStateDictAdapter(StateDictAdapter):
         """Resolve and remember whether MTP experts use split or grouped HF keys."""
         layout = self.mtp_expert_hf_layout
         if layout is None:
-            config_layout = getattr(self.config, "mtp_expert_hf_layout", None)
+            try:
+                config_layout = self.config.mtp_expert_hf_layout
+            except AttributeError:
+                config_layout = None
             layout = config_layout if isinstance(config_layout, str) else None
 
         configured_layout = None
@@ -196,12 +199,21 @@ class Qwen3_5MoeStateDictAdapter(StateDictAdapter):
         if configured_layout is not None:
             return configured_layout
 
+        config_model_paths = []
+        try:
+            config_model_paths.append(self.config._name_or_path)
+        except AttributeError:
+            pass
+        try:
+            config_model_paths.append(self.config.name_or_path)
+        except AttributeError:
+            pass
+
         inferred_layout = _infer_mtp_expert_hf_layout(checkpoint_keys) if checkpoint_keys is not None else None
         if checkpoint_keys is None and not self._local_checkpoint_layout_checked:
             self._local_checkpoint_layout_checked = True
             model_paths = [self.pretrained_model_name_or_path]
-            for attr in ("_name_or_path", "name_or_path"):
-                value = getattr(self.config, attr, None)
+            for value in config_model_paths:
                 if isinstance(value, str) and value:
                     model_paths.append(value)
             for model_path in model_paths:
@@ -215,8 +227,7 @@ class Qwen3_5MoeStateDictAdapter(StateDictAdapter):
             return self._inferred_mtp_expert_hf_layout
 
         model_names = [self.pretrained_model_name_or_path]
-        for attr in ("_name_or_path", "name_or_path"):
-            value = getattr(self.config, attr, None)
+        for value in config_model_paths:
             if isinstance(value, str) and value:
                 model_names.append(value)
 

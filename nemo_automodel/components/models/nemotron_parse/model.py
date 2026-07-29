@@ -84,6 +84,8 @@ class NemotronParseTextConfig(PretrainedConfig):
         add_cross_attention: bool = True,
         is_decoder: bool = True,
         max_sequence_length: int = 9000,
+        num_extra_heads: int = 0,
+        class_token_start_idx: int = 50000,
         **kwargs,
     ):
         # Populate special token ids on the config so downstream components
@@ -123,6 +125,8 @@ class NemotronParseTextConfig(PretrainedConfig):
         self.hidden_size = self.d_model
         self.num_attention_heads = self.encoder_attention_heads
         self.max_sequence_length = max_sequence_length
+        self.num_extra_heads = num_extra_heads
+        self.class_token_start_idx = class_token_start_idx
 
 
 class NemotronParseEncoderConfig(PretrainedConfig):
@@ -143,10 +147,6 @@ class NemotronParseEncoderConfig(PretrainedConfig):
         self.max_resolution = max_resolution
         self.preferred_resolution = preferred_resolution or [768, 768]
         self.torch_dtype = torch_dtype
-        # Store any additional args from the original RADIO config
-        for key, value in kwargs.items():
-            if not hasattr(self, key):
-                setattr(self, key, value)
 
 
 class NemotronParseConfig(PretrainedConfig):
@@ -167,6 +167,8 @@ class NemotronParseConfig(PretrainedConfig):
         image_size: List[int] = None,
         is_encoder_decoder: bool = True,
         max_sequence_length: int = 9000,
+        num_extra_heads: int = 0,
+        class_token_start_idx: int = 50000,
         **kwargs,
     ):
         super().__init__(
@@ -188,9 +190,8 @@ class NemotronParseConfig(PretrainedConfig):
             radio_model_path = encoder.get("_name_or_path", "nvidia/C-RADIOv2-H")
             self.encoder = AutoConfig.from_pretrained(radio_model_path, trust_remote_code=True)
             # Update with any overrides from encoder dict
-            for key, value in encoder.items():
-                if hasattr(self.encoder, key):
-                    setattr(self.encoder, key, value)
+            known_overrides = {key: value for key, value in encoder.items() if key in self.encoder.to_dict()}
+            self.encoder.update(known_overrides)
         else:
             self.encoder = PretrainedConfig()
 
@@ -200,6 +201,8 @@ class NemotronParseConfig(PretrainedConfig):
         self.vocab_size = self.decoder.vocab_size
         self.is_encoder_decoder = is_encoder_decoder
         self.max_sequence_length = max_sequence_length
+        self.num_extra_heads = num_extra_heads
+        self.class_token_start_idx = class_token_start_idx
 
     def to_dict(self):
         output = super().to_dict()
@@ -463,7 +466,7 @@ class NemotronParseForConditionalGeneration(HFCheckpointingMixin, NemotronParseP
 
         self.lm_head = nn.Linear(config.decoder.d_model, config.decoder.vocab_size, bias=False, dtype=torch.bfloat16)
 
-        num_extra_heads = getattr(config, "num_extra_heads", 0)
+        num_extra_heads = config.num_extra_heads
         self.decoder.extra_heads = nn.ModuleList(
             [
                 nn.Linear(config.decoder.d_model, config.decoder.d_model, dtype=torch.bfloat16)
@@ -477,7 +480,7 @@ class NemotronParseForConditionalGeneration(HFCheckpointingMixin, NemotronParseP
             ]
         )
 
-        self.class_token_indx_start = getattr(config, "class_token_start_idx", 50000)
+        self.class_token_indx_start = config.class_token_start_idx
         self.post_init()
 
     def get_encoder(self):
@@ -518,9 +521,7 @@ class NemotronParseForConditionalGeneration(HFCheckpointingMixin, NemotronParseP
         # Whether to surface the final decoder hidden states (input to lm_head) so
         # downstream fused-linear-cross-entropy can read them off the output.
         return_final_hidden_states = (
-            output_hidden_states
-            if output_hidden_states is not None
-            else getattr(self.config.decoder, "output_hidden_states", False)
+            output_hidden_states if output_hidden_states is not None else self.config.decoder.output_hidden_states
         )
         kwargs_encoder = {k: v for k, v in kwargs.items() if not k.startswith("decoder_")}
         kwargs_decoder = {k[len("decoder_") :]: v for k, v in kwargs.items() if k.startswith("decoder_")}
@@ -574,8 +575,8 @@ class NemotronParseForConditionalGeneration(HFCheckpointingMixin, NemotronParseP
             decoder_attentions=decoder_outputs.attentions,
             cross_attentions=decoder_outputs.cross_attentions,
             encoder_last_hidden_state=encoder_outputs.last_hidden_state,
-            encoder_hidden_states=getattr(encoder_outputs, "hidden_states", None),
-            encoder_attentions=getattr(encoder_outputs, "attentions", None),
+            encoder_hidden_states=encoder_outputs.hidden_states,
+            encoder_attentions=encoder_outputs.attentions,
         )
         # Expose the final decoder hidden states under ``hidden_states`` for fused
         # cross-entropy. Item assignment (not attribute set) registers the key so

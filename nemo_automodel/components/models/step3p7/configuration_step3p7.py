@@ -51,6 +51,11 @@ class StepRoboticsVisionEncoderConfig(PretrainedConfig):
         use_abs_posemb=True,
         use_rope2d=True,
         ls_init_value=0.1,
+        rope_theta: float = 10000,
+        rope_max_freq: float = 10,
+        rope_num_freqs: int = 1,
+        rope_theta_rescale_factor: float = 1.0,
+        rope_freqs_for: str = "lang",
         **kwargs,
     ):
         self.width = width
@@ -71,6 +76,11 @@ class StepRoboticsVisionEncoderConfig(PretrainedConfig):
         self.use_ln_post = use_ln_post
         self.use_abs_posemb = use_abs_posemb
         self.use_rope2d = use_rope2d
+        self.rope_theta = rope_theta
+        self.rope_max_freq = rope_max_freq
+        self.rope_num_freqs = rope_num_freqs
+        self.rope_theta_rescale_factor = rope_theta_rescale_factor
+        self.rope_freqs_for = rope_freqs_for
         super().__init__(**kwargs)
 
 
@@ -245,7 +255,7 @@ class Step3p7TextConfig(PretrainedConfig):
 
     def to_dict(self):
         output = _json_safe_value(super().to_dict())
-        torch_dtype = getattr(self, "torch_dtype", None)
+        torch_dtype = self.torch_dtype
         if torch_dtype is not None:
             output["torch_dtype"] = _json_safe_value(torch_dtype)
         return output

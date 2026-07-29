@@ -65,6 +65,7 @@ class MiniMaxM3VLTextConfig(PretrainedConfig):
         rope_theta: float = 5000000.0,
         rotary_dim: int = 64,
         partial_rotary_factor: float = 0.5,
+        rope_parameters: Optional[dict] = None,
         hidden_act: str = "swigluoai",
         use_qk_norm: bool = True,
         qk_norm_type: str = "per_head",
@@ -103,6 +104,11 @@ class MiniMaxM3VLTextConfig(PretrainedConfig):
         self.rope_theta = rope_theta
         self.rotary_dim = rotary_dim
         self.partial_rotary_factor = partial_rotary_factor
+        self.rope_parameters = rope_parameters or {
+            "rope_theta": rope_theta,
+            "rope_type": "default",
+            "partial_rotary_factor": partial_rotary_factor,
+        }
         self.hidden_act = hidden_act
         self.use_qk_norm = use_qk_norm
         self.qk_norm_type = qk_norm_type

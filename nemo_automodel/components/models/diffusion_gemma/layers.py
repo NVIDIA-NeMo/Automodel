@@ -207,12 +207,10 @@ def _build_moe_config(config: DiffusionGemmaTextConfig, moe_config: MoEConfig | 
     # recipe requests an fp32 master (model.torch_dtype: float32). That left AdamW
     # optimizing bf16 expert params (the "trainable bf16 params" warning) while the
     # rest of the model was fp32. Thread the configured dtype through here.
-    cfg_dtype = getattr(config, "torch_dtype", None)
-    if isinstance(cfg_dtype, str):
-        from nemo_automodel.shared.utils import dtype_from_str
+    cfg_dtype = config.dtype
+    from nemo_automodel.shared.utils import dtype_from_str
 
-        cfg_dtype = dtype_from_str(cfg_dtype, torch.bfloat16)
-    expert_dtype = cfg_dtype if isinstance(cfg_dtype, torch.dtype) else torch.bfloat16
+    expert_dtype = dtype_from_str(cfg_dtype, torch.bfloat16)
     return MoEConfig(
         dim=config.hidden_size,
         inter_dim=config.intermediate_size,

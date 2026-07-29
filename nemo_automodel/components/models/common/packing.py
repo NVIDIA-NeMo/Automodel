@@ -32,6 +32,7 @@ This is the same approach used by LlamaFactory.
 """
 
 import logging
+from collections.abc import Mapping
 
 import torch
 import torch.nn.functional as F
@@ -39,6 +40,20 @@ import torch.nn.functional as F
 logger = logging.getLogger(__name__)
 
 _FLASH_ATTN_IMPLEMENTATIONS = ("flash_attention_2", "flash_attention_3", "flash_attention_4")
+
+
+def _attention_impl_from_config(config) -> str | None:
+    """Read Transformers' public or private attention implementation marker."""
+    if config is None:
+        return None
+    try:
+        attn_impl = config._attn_implementation
+    except AttributeError:
+        try:
+            return config._attn_implementation_internal
+        except AttributeError:
+            return None
+    return attn_impl
 
 
 def get_seqlens_in_batch(attention_mask: torch.Tensor) -> torch.Tensor:
@@ -134,7 +149,7 @@ def _passthrough_create_causal_mask(
     through.  For other backends, pass through packed masks but delegate
     normal 2D masks to HF.
     """
-    if config is not None and getattr(config, "_attn_implementation", None) in _FLASH_ATTN_IMPLEMENTATIONS:
+    if _attention_impl_from_config(config) in _FLASH_ATTN_IMPLEMENTATIONS:
         return attention_mask
 
     if attention_mask is not None:
@@ -161,11 +176,17 @@ def get_attn_implementation(cfg_model):
 
     Custom models store it in ``backend.attn``; HF models use ``attn_implementation``.
     """
-    if cfg_model is not None and hasattr(cfg_model, "backend") and hasattr(cfg_model.backend, "attn"):
-        return cfg_model.backend.attn
-    if cfg_model is not None:
+    if cfg_model is None:
+        return "sdpa"
+    if isinstance(cfg_model, Mapping):
         return cfg_model.get("attn_implementation", "sdpa")
-    return "sdpa"
+    try:
+        return cfg_model.backend.attn
+    except AttributeError:
+        try:
+            return cfg_model.attn_implementation
+        except AttributeError:
+            return "sdpa"
 
 
 def _patch_preprocess_mask_arguments_for_packing() -> None:
@@ -191,16 +212,19 @@ def _patch_preprocess_mask_arguments_for_packing() -> None:
             "indexed mask values would enable cross-document attention."
         ) from exc
 
-    if getattr(masking_utils, "_nemo_automodel_packing_preprocess_patched", False):
-        return
-
-    original_preprocess = getattr(masking_utils, "_preprocess_mask_arguments", None)
-    if original_preprocess is None:
+    try:
+        original_preprocess = masking_utils._preprocess_mask_arguments
+    except AttributeError as exc:
         raise RuntimeError(
             "Cannot enable FA2 neat packing because transformers.masking_utils has no "
             f"_preprocess_mask_arguments in transformers {transformers.__version__}. Refusing to "
             "continue because losing indexed mask values would enable cross-document attention."
-        )
+        ) from exc
+    if (
+        original_preprocess.__module__ == __name__
+        and original_preprocess.__name__ == "_patched_preprocess_mask_arguments"
+    ):
+        return
 
     # A 4D mask takes Transformers' immediate pass-through branch, so this
     # constant-size probe verifies the private call and return contract without
@@ -251,9 +275,7 @@ def _patch_preprocess_mask_arguments_for_packing() -> None:
         """
         config = kwargs.get("config", args[0] if len(args) > 0 else None)
         attention_mask = kwargs.get("attention_mask", args[2] if len(args) > 2 else None)
-        attn_impl = getattr(config, "_attn_implementation", None) or getattr(
-            config, "_attn_implementation_internal", None
-        )
+        attn_impl = _attention_impl_from_config(config)
         if attn_impl in _FLASH_ATTN_IMPLEMENTATIONS and is_indexed_packed_mask(attention_mask):
             return (
                 preprocess_result_template[0],
@@ -263,7 +285,6 @@ def _patch_preprocess_mask_arguments_for_packing() -> None:
         return original_preprocess(*args, **kwargs)
 
     masking_utils._preprocess_mask_arguments = _patched_preprocess_mask_arguments
-    masking_utils._nemo_automodel_packing_preprocess_patched = True
 
 
 # Model modules whose ``create_causal_mask`` must be patched for neat packing.
@@ -305,7 +326,13 @@ def configure_packing(attn_implementation: str = "sdpa") -> None:
     # import time, so we must patch each module individually.
     for mod_name in _PACKING_PATCH_MODULES:
         mod = sys.modules.get(mod_name)
-        if mod is not None and hasattr(mod, "create_causal_mask"):
+        if mod is None:
+            continue
+        try:
+            mod.create_causal_mask
+        except AttributeError:
+            continue
+        else:
             mod.create_causal_mask = _passthrough_create_causal_mask
 
     logger.info(

@@ -77,7 +77,7 @@ class DeepseekV4MTPBlock(nn.Module):
         self.hnorm = initialize_rms_norm_module(backend.rms_norm, H, eps=eps, dtype=dtype)
 
         mtp_attn_cfg = copy.copy(config)
-        ratios = getattr(config, "compress_ratios", None)
+        ratios = config.compress_ratios
         if ratios is None:
             mtp_attn_cfg.compress_ratios = None
         else:
@@ -93,7 +93,7 @@ class DeepseekV4MTPBlock(nn.Module):
         hc_kwargs = dict(
             hc_mult=config.hc_mult,
             hidden_size=H,
-            hc_sinkhorn_iters=int(getattr(config, "hc_sinkhorn_iters", 20) or 20),
+            hc_sinkhorn_iters=int(config.hc_sinkhorn_iters or 20),
             hc_eps=float(config.hc_eps),
             rms_norm_eps=float(eps),
         )
@@ -175,7 +175,7 @@ class DeepseekV4MTPBlock(nn.Module):
 
     @torch.no_grad()
     def init_weights(self, buffer_device: torch.device | None = None) -> None:
-        init_std = float(getattr(self.config, "initializer_range", 0.02))
+        init_std = float(self.config.initializer_range)
         self.enorm.reset_parameters()
         self.hnorm.reset_parameters()
         self.input_layernorm.reset_parameters()
@@ -266,7 +266,7 @@ class DeepseekV4MTPModule(nn.Module):
 
 def build_mtp_config_from_hf(config, *, loss_scaling_factor: float = 0.1) -> MTPConfig:
     """Build an MTPConfig from a DeepseekV4Config."""
-    num_layers = int(getattr(config, "num_nextn_predict_layers", 0) or 0)
+    num_layers = int(config.num_nextn_predict_layers or 0)
     return MTPConfig(
         num_layers=num_layers, layer_pattern="*" if num_layers > 0 else "", loss_scaling_factor=loss_scaling_factor
     )

@@ -51,15 +51,15 @@ class Block(nn.Module):
 
         # Thread dtype from config.torch_dtype so the block's own params stay
         # aligned with the rest of the model (fp32 under fp32 master weights).
-        dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+        dtype = get_dtype(config.torch_dtype, torch.bfloat16)
 
         # GLM4-MoE-Lite uses mlp_layer_types to determine dense vs MoE layers
-        mlp_layer_types = getattr(config, "mlp_layer_types", None)
+        mlp_layer_types = config.mlp_layer_types
         if mlp_layer_types is not None:
             is_moe_layer = mlp_layer_types[layer_idx] == "sparse"
         else:
             # Fallback to first_k_dense_replace pattern
-            first_k_dense_replace = getattr(config, "first_k_dense_replace", 0)
+            first_k_dense_replace = config.first_k_dense_replace
             is_moe_layer = layer_idx >= first_k_dense_replace
 
         if is_moe_layer:
@@ -95,16 +95,9 @@ class Block(nn.Module):
         )
         x = x + attn_out
 
-        mlp_out = self._mlp(x=self.post_attention_layernorm(x), padding_mask=padding_mask)
+        mlp_out = self.mlp(self.post_attention_layernorm(x), padding_mask=padding_mask)
         x = x + mlp_out
         return x
-
-    def _mlp(self, x: torch.Tensor, padding_mask: torch.Tensor | None) -> torch.Tensor:
-        if isinstance(self.mlp, MLP):
-            return self.mlp(x)
-        else:
-            assert isinstance(self.mlp, MoE)
-            return self.mlp(x, padding_mask)
 
     def init_weights(self, buffer_device: torch.device):
         for norm in (self.input_layernorm, self.post_attention_layernorm):
@@ -131,7 +124,7 @@ class Glm4MoeLiteModel(nn.Module):
         # Resolve model dtype once; thread it explicitly to every sub-module
         # so fp32 master weights work even when construction is not wrapped in
         # local_torch_dtype().
-        model_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+        model_dtype = get_dtype(config.torch_dtype, torch.bfloat16)
 
         # Map config -> MoE wrapper (same as GLM4 MoE)
         moe_defaults = dict(
@@ -288,7 +281,7 @@ class Glm4MoeLiteForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             moe_config=moe_config,
             moe_overrides=moe_overrides,
         )
-        model_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+        model_dtype = get_dtype(config.torch_dtype, torch.bfloat16)
         self.lm_head = initialize_linear_module(
             self.backend.linear, config.hidden_size, config.vocab_size, bias=False, dtype=model_dtype
         )
@@ -320,11 +313,11 @@ class Glm4MoeLiteForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         output_hidden_states: Optional[bool] = None,
         **attn_kwargs: Any,
     ) -> CausalLMOutputWithPast:
-        output_hidden_states = (
-            output_hidden_states
-            if output_hidden_states is not None
-            else getattr(self.config, "output_hidden_states", False)
-        )
+        if output_hidden_states is None:
+            try:
+                output_hidden_states = self.config.output_hidden_states
+            except AttributeError:
+                output_hidden_states = False
 
         is_thd = "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd"
         if is_thd:
@@ -365,10 +358,7 @@ class Glm4MoeLiteForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
 
         cast_model_to_dtype(self, dtype)
         for layer in self.model.layers.values():
-            if isinstance(layer.mlp, MoE):
-                layer.mlp.gate.e_score_correction_bias = torch.zeros(
-                    (self.config.n_routed_experts), dtype=torch.float32
-                ).to(buffer_device)
+            layer.mlp.reset_gate_correction_bias(buffer_device)
 
 
 ModelClass = Glm4MoeLiteForCausalLM

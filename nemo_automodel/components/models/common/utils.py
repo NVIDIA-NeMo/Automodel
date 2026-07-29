@@ -121,12 +121,12 @@ class TEFp8Config:
         it is returned directly.  String values ``"current"``, ``"block"``, and
         ``"mxfp8"`` are mapped to the corresponding TE recipe class.
         """
-        if not HAVE_TE:
-            return None
-
         # Pass through pre-built recipe objects directly
         if not isinstance(self.recipe, str):
             return self.recipe
+
+        if not HAVE_TE:
+            return None
 
         from transformer_engine.common.recipe import Float8BlockScaling, Float8CurrentScaling
 
@@ -632,7 +632,10 @@ def yield_fp32_model(model: nn.Module, restore_dtype: torch.dtype | None = None)
 
 
 def _get_strict_fp32_module_keywords(model: nn.Module) -> list[str]:
-    val = getattr(model, "_keep_in_fp32_modules_strict", None)
+    try:
+        val = model._keep_in_fp32_modules_strict
+    except AttributeError:
+        return []
     if not isinstance(val, (list, set, tuple)):
         return []
     return list(dict.fromkeys(val))
@@ -651,8 +654,16 @@ def _get_fp32_module_keywords(model: nn.Module) -> list[str]:
         De-duplicated list of module-name keywords to keep in fp32.
     """
     keywords: list[str] = []
-    for attr in ("_keep_in_fp32_modules_strict", "_keep_in_fp32_modules"):
-        val = getattr(model, attr, None)
+    values = []
+    try:
+        values.append(model._keep_in_fp32_modules_strict)
+    except AttributeError:
+        pass
+    try:
+        values.append(model._keep_in_fp32_modules)
+    except AttributeError:
+        pass
+    for val in values:
         # HuggingFace's PreTrainedModel.__init__ normalizes a class-level
         # list[str] into an instance-level set[str], so accept both (and tuple).
         if isinstance(val, (list, set, tuple)):

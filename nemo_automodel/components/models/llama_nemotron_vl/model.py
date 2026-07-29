@@ -287,7 +287,7 @@ class LlamaBidirectionalModel(LlamaModel):
             )
 
         # Fallback for transformers < 5.0
-        if getattr(self.config, "_attn_implementation", None) == "flash_attention_2":
+        if self.config._attn_implementation == "flash_attention_2":
             has_masked_tokens = (attention_mask == 0).any()
             return attention_mask if has_masked_tokens else None
 
@@ -409,21 +409,11 @@ class LlamaNemotronVLModel(PreTrainedModel):
     ):
         super().__init__(config)
 
-        # Propagate attn_implementation to sub-configs for transformers < 4.56
-        # which lacks set_attn_implementation. In 4.56+, set_attn_implementation
-        # handles this automatically using the sub_configs declared on the config class.
-        if not hasattr(PreTrainedModel, "set_attn_implementation"):
-            parent_attn = getattr(config, "_attn_implementation", None)
-            if parent_attn is not None:
-                for sub_config in (config.vision_config, config.llm_config):
-                    if getattr(sub_config, "_attn_implementation_autoset", False):
-                        sub_config._attn_implementation = parent_attn
-                        sub_config._attn_implementation_autoset = False
-
         # Calculate image token count
         image_size = config.force_image_size or config.vision_config.image_size
-        if hasattr(config.vision_config, "grid_size"):
-            grid_size = config.vision_config.grid_size
+        vision_config_values = config.vision_config.to_dict()
+        grid_size = vision_config_values.get("grid_size")
+        if grid_size is not None:
             self.patch_size = 14
             self.num_image_token = int((grid_size * config.downsample_ratio) ** 2)
         else:
@@ -598,19 +588,18 @@ class LlamaNemotronVLModel(PreTrainedModel):
         logits = None
         loss = None
 
-        if hasattr(outputs, "logits"):
-            logits = outputs.logits
-            if labels is not None:
-                # Shift so that tokens < n predict n
-                shift_logits = logits[..., :-1, :].contiguous()
-                shift_labels = labels[..., 1:].contiguous()
-                # Flatten the tokens
-                loss_fct = CrossEntropyLoss()
-                shift_logits = shift_logits.view(-1, self.language_model.config.vocab_size)
-                shift_labels = shift_labels.view(-1)
-                # Enable model parallelism
-                shift_labels = shift_labels.to(shift_logits.device)
-                loss = loss_fct(shift_logits, shift_labels)
+        logits = outputs.logits
+        if labels is not None:
+            # Shift so that tokens < n predict n
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            # Flatten the tokens
+            loss_fct = CrossEntropyLoss()
+            shift_logits = shift_logits.view(-1, self.language_model.config.vocab_size)
+            shift_labels = shift_labels.view(-1)
+            # Enable model parallelism
+            shift_labels = shift_labels.to(shift_logits.device)
+            loss = loss_fct(shift_logits, shift_labels)
 
         if not return_dict:
             output = (logits,) + outputs[1:]
@@ -645,8 +634,7 @@ class LlamaNemotronVLModel(PreTrainedModel):
         # Extract features from vision encoder
         if self.select_layer == -1:
             vit_embeds = self.vision_model(pixel_values=pixel_values, output_hidden_states=False, return_dict=True)
-            if hasattr(vit_embeds, "last_hidden_state"):
-                vit_embeds = vit_embeds.last_hidden_state
+            vit_embeds = vit_embeds.last_hidden_state
         else:
             vit_embeds = self.vision_model(
                 pixel_values=pixel_values, output_hidden_states=True, return_dict=True

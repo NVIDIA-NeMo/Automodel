@@ -52,7 +52,9 @@ def enable_gemma4_sdpa_fp32() -> None:
         ALL_ATTENTION_FUNCTIONS["sdpa"] = sdpa_fp32_attention_forward
     except Exception:
         pass
-    for attr in ("_global_mapping", "_local_mapping"):
-        mapping = getattr(ALL_ATTENTION_FUNCTIONS, attr, None)
+    for mapping in (
+        vars(ALL_ATTENTION_FUNCTIONS).get("_global_mapping"),
+        vars(ALL_ATTENTION_FUNCTIONS).get("_local_mapping"),
+    ):
         if isinstance(mapping, dict) and "sdpa" in mapping:
             mapping["sdpa"] = sdpa_fp32_attention_forward

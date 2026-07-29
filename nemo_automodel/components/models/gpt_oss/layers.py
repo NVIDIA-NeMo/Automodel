@@ -54,7 +54,7 @@ class GptOssAttention(nn.Module):
         self.head_dim = config.head_dim
         self.hidden_size = config.hidden_size
 
-        dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+        dtype = get_dtype(config.torch_dtype, torch.bfloat16)
 
         self.q_proj = initialize_linear_module(
             backend.linear, self.hidden_size, self.num_attention_heads * self.head_dim, bias=True, dtype=dtype

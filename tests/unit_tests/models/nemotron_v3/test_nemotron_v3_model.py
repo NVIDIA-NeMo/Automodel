@@ -406,12 +406,17 @@ class TestNemotronHForCausalLM:
         with pytest.raises(ValueError, match="input_ids must be provided if inputs_embeds is not provided"):
             model()
 
-    def _build_stub_inner_model(self, hidden):
+    def _build_stub_inner_model(self, hidden, num_hidden_layers):
         """Tiny ``nn.Module`` whose forward returns a fixed tensor.  Lets us
         replace ``NemotronHForCausalLM.model`` (an ``nn.Module``) without
         tripping ``nn.Module.__setattr__``'s child-module type check."""
 
         class _StubInner(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.embed_tokens = torch.nn.Identity()
+                self.layers = torch.nn.ModuleList(torch.nn.Identity() for _ in range(num_hidden_layers))
+
             def forward(self, *args, **kwargs):
                 return hidden
 
@@ -437,7 +442,7 @@ class TestNemotronHForCausalLM:
         seq_len = 8
         # Stand in for the inner forward that unsqueezed back to [1, T, H].
         stub_hidden = torch.randn(1, seq_len, config.hidden_size, dtype=torch.bfloat16)
-        model.model = self._build_stub_inner_model(stub_hidden)
+        model.model = self._build_stub_inner_model(stub_hidden, config.num_hidden_layers)
 
         inputs_embeds = torch.randn(1, seq_len, config.hidden_size, dtype=torch.bfloat16)
         position_ids = torch.arange(seq_len, dtype=torch.long).unsqueeze(0)
@@ -471,7 +476,7 @@ class TestNemotronHForCausalLM:
         seq_len = 8
         # Stand in for the inner forward that returned 2D hidden_states.
         stub_hidden = torch.randn(seq_len, config.hidden_size, dtype=torch.bfloat16)
-        model.model = self._build_stub_inner_model(stub_hidden)
+        model.model = self._build_stub_inner_model(stub_hidden, config.num_hidden_layers)
 
         input_ids = torch.randint(0, config.vocab_size, (1, seq_len))
         position_ids = torch.arange(seq_len, dtype=torch.long).unsqueeze(0)

@@ -64,36 +64,36 @@ def _ensure_indexed(values: Any, index: int, value: Any) -> list[Any]:
 def _make_mtp_block_config(config: Any, layer_idx: int, depth: int) -> Any:
     """Return a shallow config copy patched for a dense sliding-attention MTP layer."""
     mtp_cfg = copy.copy(config)
-    mtp_cfg.num_hidden_layers = max(int(getattr(config, "num_hidden_layers", 0) or 0), layer_idx + 1)
+    mtp_cfg.num_hidden_layers = max(int(config.num_hidden_layers or 0), layer_idx + 1)
     mtp_cfg.moe_layers_enum = ()
 
-    mtp_layer_types = getattr(config, "mtp_layer_types", None)
+    mtp_layer_types = config.mtp_layer_types
     layer_type = _get_indexed_value(mtp_layer_types, depth, "sliding_attention")
-    mtp_cfg.layer_types = _ensure_indexed(getattr(config, "layer_types", None), layer_idx, layer_type)
+    mtp_cfg.layer_types = _ensure_indexed(config.layer_types, layer_idx, layer_type)
 
-    mtp_swiglu_limits = getattr(config, "mtp_swiglu_limits", None)
+    mtp_swiglu_limits = config.mtp_swiglu_limits
     mtp_cfg.swiglu_limits = _ensure_indexed(
-        getattr(config, "swiglu_limits", None),
+        config.swiglu_limits,
         layer_idx,
         _get_indexed_value(mtp_swiglu_limits, depth, 0.0),
     )
 
-    mtp_swiglu_limits_shared = getattr(config, "mtp_swiglu_limits_shared", None)
+    mtp_swiglu_limits_shared = config.mtp_swiglu_limits_shared
     mtp_cfg.swiglu_limits_shared = _ensure_indexed(
-        getattr(config, "swiglu_limits_shared", None),
+        config.swiglu_limits_shared,
         layer_idx,
         _get_indexed_value(mtp_swiglu_limits_shared, depth, 0.0),
     )
 
-    mtp_partial_rotary_factors = getattr(config, "mtp_partial_rotary_factors", None)
+    mtp_partial_rotary_factors = config.mtp_partial_rotary_factors
     mtp_cfg.partial_rotary_factors = _ensure_indexed(
-        getattr(config, "partial_rotary_factors", None),
+        config.partial_rotary_factors,
         layer_idx,
         _get_indexed_value(mtp_partial_rotary_factors, depth, 1.0),
     )
 
-    mtp_rope_theta = getattr(config, "mtp_rope_theta", None)
-    rope_theta = getattr(config, "rope_theta", 10000.0)
+    mtp_rope_theta = config.mtp_rope_theta
+    rope_theta = config.rope_theta
     if isinstance(rope_theta, (list, tuple)) or mtp_rope_theta is not None:
         mtp_cfg.rope_theta = _ensure_indexed(
             rope_theta if isinstance(rope_theta, (list, tuple)) else None,
@@ -101,10 +101,10 @@ def _make_mtp_block_config(config: Any, layer_idx: int, depth: int) -> Any:
             _get_indexed_value(mtp_rope_theta, depth, 10000.0),
         )
 
-    mtp_use_rope_layers = getattr(config, "mtp_use_rope_layers", None)
-    if getattr(config, "use_rope_layers", None) is not None or mtp_use_rope_layers is not None:
+    mtp_use_rope_layers = config.mtp_use_rope_layers
+    if config.use_rope_layers is not None or mtp_use_rope_layers is not None:
         mtp_cfg.use_rope_layers = _ensure_indexed(
-            getattr(config, "use_rope_layers", None),
+            config.use_rope_layers,
             layer_idx,
             _get_indexed_value(mtp_use_rope_layers, depth, True),
         )
@@ -219,7 +219,7 @@ class Step3p5MTPModule(nn.Module):
         if not mtp_config.enabled:
             raise ValueError("Step3p5MTPModule constructed with disabled MTPConfig")
         self.mtp_config = mtp_config
-        base_layer_idx = int(getattr(config, "mtp_base_layer_idx", config.num_hidden_layers))
+        base_layer_idx = int(config.mtp_base_layer_idx)
         self.layers = nn.ModuleList(
             [
                 Step3p5MTPBlock(
@@ -275,7 +275,7 @@ class Step3p5MTPModule(nn.Module):
 
 def build_mtp_config_from_hf(config: Any, *, loss_scaling_factor: float = 0.1) -> MTPConfig:
     """Build Step MTP runtime config from HF-style config fields."""
-    num_layers = int(getattr(config, "num_nextn_predict_layers", 0) or 0)
+    num_layers = int(config.num_nextn_predict_layers or 0)
     return MTPConfig(
         num_layers=num_layers,
         layer_pattern="*" if num_layers > 0 else "",

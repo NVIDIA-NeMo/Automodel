@@ -50,19 +50,19 @@ class Block(nn.Module):
         # IndexShare: per-layer indexer mode from `config.indexer_types`. A "shared" layer
         # owns no indexer and reuses the previous "full" layer's top-k selection. Absent the
         # field (e.g. GLM-5.1, which runs a full indexer every layer), every layer is "full".
-        indexer_types = getattr(config, "indexer_types", None)
+        indexer_types = config.indexer_types
         self.skip_topk = indexer_types is not None and indexer_types[layer_idx] == "shared"
         self.self_attn = GlmMoeDsaMLA(config, backend, skip_topk=self.skip_topk)
 
         # Thread dtype from config.torch_dtype so the block's own params stay
         # aligned with the rest of the model (fp32 under fp32 master weights).
-        dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+        dtype = get_dtype(config.torch_dtype, torch.bfloat16)
 
-        mlp_layer_types = getattr(config, "mlp_layer_types", None)
+        mlp_layer_types = config.mlp_layer_types
         if mlp_layer_types is not None:
             is_moe_layer = mlp_layer_types[layer_idx] == "sparse"
         else:
-            first_k_dense_replace = getattr(config, "first_k_dense_replace", 0)
+            first_k_dense_replace = config.first_k_dense_replace
             is_moe_layer = layer_idx >= first_k_dense_replace
 
         if is_moe_layer:
@@ -107,16 +107,9 @@ class Block(nn.Module):
         )
         x = x + attn_out
 
-        mlp_out = self._mlp(x=self.post_attention_layernorm(x), padding_mask=padding_mask)
+        mlp_out = self.mlp(self.post_attention_layernorm(x), padding_mask=padding_mask)
         x = x + mlp_out
         return x, topk_indices
-
-    def _mlp(self, x: torch.Tensor, padding_mask: torch.Tensor | None) -> torch.Tensor:
-        if isinstance(self.mlp, MLP):
-            return self.mlp(x)
-        else:
-            assert isinstance(self.mlp, MoE)
-            return self.mlp(x, padding_mask)
 
     def init_weights(self, buffer_device: torch.device):
         for norm in (self.input_layernorm, self.post_attention_layernorm):
@@ -143,7 +136,7 @@ class GlmMoeDsaModel(nn.Module):
         # Resolve model dtype once; thread it explicitly to every sub-module
         # so fp32 master weights work even when construction is not wrapped in
         # local_torch_dtype().
-        model_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+        model_dtype = get_dtype(config.torch_dtype, torch.bfloat16)
 
         moe_defaults = dict(
             dim=config.hidden_size,
@@ -181,12 +174,10 @@ class GlmMoeDsaModel(nn.Module):
         self.max_seq_len = config.max_position_embeddings
         self.qk_rope_head_dim = config.qk_rope_head_dim
 
-        if hasattr(config, "rope_parameters") and config.rope_parameters is not None:
-            rope_theta = config.rope_parameters["rope_theta"]
-        else:
-            rope_theta = config.rope_theta
+        rope_parameters = config.to_dict().get("rope_parameters")
+        rope_theta = rope_parameters["rope_theta"] if rope_parameters is not None else config.rope_theta
 
-        rope_scaling = getattr(config, "rope_scaling", None)
+        rope_scaling = config.rope_scaling
 
         self.freqs = precompute_freqs_cis(
             qk_rope_head_dim=self.qk_rope_head_dim,
@@ -317,7 +308,7 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             moe_config=moe_config,
             moe_overrides=moe_overrides,
         )
-        model_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+        model_dtype = get_dtype(config.torch_dtype, torch.bfloat16)
         self.lm_head = initialize_linear_module(
             self.backend.linear, config.hidden_size, config.vocab_size, bias=False, dtype=model_dtype
         )
@@ -344,7 +335,7 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
 
     def should_pack_validation_with_training(self) -> bool:
         """GLM DSA TileLang kernels require validation to use the THD packed layout."""
-        return getattr(self.backend, "attn", None) == "tilelang"
+        return self.backend.attn == "tilelang"
 
     def prepare_model_inputs_for_cp(
         self,
@@ -365,7 +356,7 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             contiguous_local_indices,
         )
 
-        if getattr(self.backend, "attn", None) != "tilelang":
+        if self.backend.attn != "tilelang":
             raise NotImplementedError("GLM DSA context parallelism is implemented only for backend.attn='tilelang'.")
 
         cp_sharder = ContextParallelSharder(
@@ -477,9 +468,7 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         """
 
         output_hidden_states = (
-            output_hidden_states
-            if output_hidden_states is not None
-            else getattr(self.config, "output_hidden_states", False)
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
 
         # Carry-in arrives as float32 (see get_pipeline_stage_metas, where the pipeline recv
@@ -565,10 +554,7 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
 
         self.to(dtype)
         for layer in self.model.layers.values():
-            if isinstance(layer.mlp, MoE):
-                layer.mlp.gate.e_score_correction_bias = torch.zeros(
-                    (self.config.n_routed_experts), dtype=torch.float32
-                ).to(buffer_device)
+            layer.mlp.reset_gate_correction_bias(buffer_device)
 
 
 ModelClass = GlmMoeDsaForCausalLM

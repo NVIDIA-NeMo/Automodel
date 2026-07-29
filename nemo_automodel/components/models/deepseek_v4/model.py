@@ -177,8 +177,8 @@ class DeepseekV4Block(nn.Module):
         # tid2eid lookup table instead of the score-based generic Gate.
         # Swap after MoE construction so the rest of MoE (experts, shared
         # experts, etc.) keeps its standard layout.
-        self.is_hash_routing_layer = layer_idx < int(getattr(config, "num_hash_layers", 0) or 0)
-        if self.is_hash_routing_layer and not backend.fake_balanced_gate:
+        self.is_hash_routing_layer = layer_idx < config.num_hash_layers and not backend.fake_balanced_gate
+        if self.is_hash_routing_layer:
             self.mlp.gate = DeepseekV4HashGate(config, moe_config)
         self.input_layernorm = initialize_rms_norm_module(
             backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, dtype=model_dtype
@@ -195,7 +195,7 @@ class DeepseekV4Block(nn.Module):
         hc_kwargs = dict(
             hc_mult=config.hc_mult,
             hidden_size=config.hidden_size,
-            hc_sinkhorn_iters=int(getattr(config, "hc_sinkhorn_iters", 20) or 20),
+            hc_sinkhorn_iters=int(config.hc_sinkhorn_iters or 20),
             hc_eps=float(config.hc_eps),
             rms_norm_eps=float(config.rms_norm_eps),
             sinkhorn_backend=_dsv4_sinkhorn_backend(backend),
@@ -251,7 +251,7 @@ class DeepseekV4Block(nn.Module):
 
         # Hash-routing layers need the current batch's input_ids to do the
         # tid2eid lookup; stash it on the gate just before the MoE call.
-        if self.is_hash_routing_layer and isinstance(self.mlp.gate, DeepseekV4HashGate):
+        if self.is_hash_routing_layer:
             self.mlp.gate.set_input_ids(input_ids)
         mlp_out = self.mlp(self.post_attention_layernorm(collapsed), padding_mask)
         dtype = x.dtype
@@ -262,7 +262,7 @@ class DeepseekV4Block(nn.Module):
         self.post_attention_layernorm.reset_parameters()
         self.self_attn.init_weights(buffer_device, init_std=init_std)
         self.mlp.init_weights(buffer_device, init_std=init_std)
-        if isinstance(self.mlp.gate, DeepseekV4HashGate):
+        if self.is_hash_routing_layer:
             self.mlp.gate.init_weights(init_std=init_std)
         self.attn_hc.init_weights(init_std)
         self.ffn_hc.init_weights(init_std)
@@ -401,7 +401,7 @@ class DeepseekV4Model(nn.Module):
             dtype=get_dtype(config.torch_dtype, torch.bfloat16),
             # V4 Flash routed experts use clamped SwiGLU (gate.max=limit,
             # up.±limit) in FP32 — see reference model.py Expert.forward.
-            swiglu_limit=float(getattr(config, "swiglu_limit", 0.0) or 0.0),
+            swiglu_limit=float(config.swiglu_limit or 0.0),
         )
         if moe_overrides:
             moe_defaults.update(moe_overrides)
@@ -443,7 +443,7 @@ class DeepseekV4Model(nn.Module):
         # to the compress-rope path: when compress_ratio>0 it uses
         # ``original_seq_len=args.original_seq_len`` and theta=compress_rope_theta;
         # otherwise ``original_seq_len=0`` (YaRN disabled) and theta=rope_theta.
-        rope_scaling = getattr(config, "rope_scaling", None)
+        rope_scaling = config.rope_scaling
         self.rotary_emb = DeepseekV4RotaryEmbedding(
             rope_theta=float(config.rope_theta),
             head_dim=int(config.head_dim),
@@ -451,7 +451,7 @@ class DeepseekV4Model(nn.Module):
             rope_scaling=None,
         )
         self.rotary_emb_compress = DeepseekV4RotaryEmbedding(
-            rope_theta=float(getattr(config, "compress_rope_theta", 160000.0) or 160000.0),
+            rope_theta=float(config.compress_rope_theta or 160000.0),
             head_dim=int(config.head_dim),
             partial_rotary_factor=partial_rotary_factor,
             rope_scaling=rope_scaling,
@@ -520,7 +520,7 @@ class DeepseekV4Model(nn.Module):
         # pattern HF's ``create_sliding_window_causal_mask`` produces; every
         # layer in the released DSV4-Flash was trained under it.
         _normalize_thd_packing_metadata(attn_kwargs)
-        sliding_window = int(getattr(self.config, "sliding_window", 0) or 0) or None
+        sliding_window = int(self.config.sliding_window or 0) or None
         packed_seq_lens = None
         if attn_kwargs.get("qkv_format") == "thd":
             # THD packing uses seq_lens_padded to keep pack/CP padding inside a
@@ -621,9 +621,9 @@ class DeepseekV4Model(nn.Module):
         # apply the shared RMSNorm.  Both modules live ONLY on the last PP
         # stage (intermediate stages keep h at 4D so the next stage can
         # consume it).  Matches HF PR 45616's ``DeepseekV4Model.forward``.
-        if getattr(self, "hc_head", None) is not None:
+        if self.hc_head is not None:
             h = self.hc_head(h)
-        if getattr(self, "norm", None) is not None:
+        if self.norm is not None:
             h = self.norm(h)
         if return_hc_hidden:
             if mtp_hc_hidden is None:
@@ -634,13 +634,12 @@ class DeepseekV4Model(nn.Module):
     def update_moe_gate_bias(self) -> None:
         with torch.no_grad():
             for block in self.layers.values():
-                if isinstance(block.mlp, MoE):
-                    block.mlp.gate.update_bias()
+                block.mlp.update_gate_bias()
 
     @torch.no_grad()
     def init_weights(self, buffer_device: torch.device | None = None) -> None:
         buffer_device = buffer_device or torch.device(f"cuda:{torch.cuda.current_device()}")
-        init_std = float(getattr(self.config, "initializer_range", 0.02))
+        init_std = float(self.config.initializer_range)
         with buffer_device:
             if self.embed_tokens is not None:
                 nn.init.normal_(self.embed_tokens.weight)
@@ -798,10 +797,10 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             if fqn not in modules:
                 modules.append(fqn)
 
-        if getattr(text_model, "rotary_emb_compress", None) is not None:
+        if text_model.rotary_emb_compress is not None:
             for modules in stage_modules:
                 append_once(modules, f"{layers_prefix}rotary_emb_compress")
-        if getattr(text_model, "hc_head", None) is not None:
+        if text_model.hc_head is not None:
             append_once(stage_modules[-1], f"{layers_prefix}hc_head")
         if self.mtp is not None:
             append_once(stage_modules[-1], "mtp")
@@ -820,7 +819,7 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
 
         hidden_shape = (microbatch_size, seq_len, self.config.hidden_size)
         hc_hidden_shape = (microbatch_size, seq_len, self.config.hc_mult, self.config.hidden_size)
-        mtp_depth = int(getattr(self.mtp_config, "num_layers", 0) or 0)
+        mtp_depth = int(self.mtp_config.num_layers or 0)
 
         def meta(shape: tuple[int, ...]) -> torch.Tensor:
             return torch.empty(*shape, device="meta", dtype=dtype)
@@ -836,7 +835,7 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
 
         if self.lm_head is not None:
             output_meta = meta((microbatch_size, seq_len, self.config.vocab_size))
-        elif getattr(self.model, "norm", None) is not None:
+        elif self.model.norm is not None:
             output_meta = meta(hidden_shape)
         else:
             output_meta = meta(hc_hidden_shape if self.config.hc_mult > 1 else hidden_shape)
@@ -846,7 +845,7 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     def _is_pipeline_parallel_stage(self) -> bool:
         if self.lm_head is None:
             return True
-        if getattr(self.model, "embed_tokens", None) is None:
+        if self.model.embed_tokens is None:
             return True
         try:
             return len(self.model.layers) != int(self.config.num_hidden_layers)
@@ -854,7 +853,7 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             return False
 
     def _build_mtp_embed_inputs_for_pp(self, input_ids: torch.Tensor) -> tuple[torch.Tensor, ...]:
-        if getattr(self.model, "embed_tokens", None) is None:
+        if self.model.embed_tokens is None:
             raise ValueError("First PP stage must own embed_tokens to build MTP embeddings")
         if input_ids.dtype not in (torch.int32, torch.int64, torch.long):
             raise ValueError("First PP stage must receive token ids to build MTP embeddings")
@@ -911,7 +910,7 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         **attn_kwargs: Any,
     ) -> "DeepseekV4CausalLMOutput" | tuple[torch.Tensor, ...] | torch.Tensor:
         if output_hidden_states is None:
-            output_hidden_states = getattr(getattr(self, "config", None), "output_hidden_states", False)
+            output_hidden_states = self.config.output_hidden_states
 
         is_pp_stage = self._is_pipeline_parallel_stage()
         pp_mtp_enabled = is_pp_stage and self.mtp_config.enabled
@@ -959,7 +958,7 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             batch_size = hidden_states.shape[0]
             if position_ids is None:
                 position_ids = torch.arange(seq_len, device=hidden_states.device).unsqueeze(0).expand(batch_size, -1)
-            sliding_window = int(getattr(self.config, "sliding_window", 0) or 0) or None
+            sliding_window = int(self.config.sliding_window or 0) or None
             cp_group = attn_kwargs.get("_dsv4_cp_group")
             if dsv4_cp_enabled(cp_group):
                 cp_padding_mask = padding_mask

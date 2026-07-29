@@ -58,10 +58,11 @@ class Block(nn.Module):
         elif self.layer_type == "full_attention":
             self.self_attn = Qwen3NextAttention(config, layer_idx, backend)
 
+        config_values = config.to_dict()
         is_moe_layer = (
-            (layer_idx not in getattr(config, "mlp_only_layers", []))
-            and (getattr(config, "num_experts", 0) > 0)
-            and ((layer_idx + 1) % getattr(config, "decoder_sparse_step", 1) == 0)
+            (layer_idx not in config_values.get("mlp_only_layers", []))
+            and (config_values.get("num_experts", 0) > 0)
+            and ((layer_idx + 1) % config_values.get("decoder_sparse_step", 1) == 0)
         )
         if is_moe_layer:
             self.mlp = MoE(moe_config, backend)
@@ -72,7 +73,7 @@ class Block(nn.Module):
                 config.hidden_size,
                 config.intermediate_size,
                 backend.linear,
-                dtype=get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16),
+                dtype=get_dtype(config.torch_dtype, torch.bfloat16),
             )
 
         self.input_layernorm = Qwen3NextRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -106,7 +107,16 @@ class Block(nn.Module):
             )
         x = x + attn_out
 
-        mlp_out = self._mlp(x=self.post_attention_layernorm(x), padding_mask=padding_mask)
+        mlp_input = self.post_attention_layernorm(x)
+        # ``self.mlp`` may be wrapped by activation checkpointing (submodule-level
+        # AC), so inspect the underlying module to pick the dense (no padding_mask)
+        # vs MoE (padding_mask) call signature, but invoke the wrapped module.
+        mlp = unwrap_checkpoint_wrapper(self.mlp)
+        if isinstance(mlp, MLP):
+            mlp_out = self.mlp(mlp_input)
+        else:
+            assert isinstance(mlp, MoE)
+            mlp_out = self.mlp(mlp_input, padding_mask)
         x = x + mlp_out
         return x
 
@@ -117,9 +127,8 @@ class Block(nn.Module):
         mlp = unwrap_checkpoint_wrapper(self.mlp)
         if isinstance(mlp, MLP):
             return self.mlp(x)
-        else:
-            assert isinstance(mlp, MoE)
-            return self.mlp(x, padding_mask)
+        assert isinstance(mlp, MoE)
+        return self.mlp(x, padding_mask)
 
     def init_weights(self, buffer_device: torch.device):
         for norm in (self.input_layernorm, self.post_attention_layernorm):
@@ -155,7 +164,7 @@ class Qwen3NextModel(nn.Module):
         # Resolve model dtype from config.torch_dtype once; thread it
         # explicitly into every sub-module so fp32 master weights work even
         # when construction is not wrapped in local_torch_dtype().
-        model_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+        model_dtype = get_dtype(config.torch_dtype, torch.bfloat16)
 
         # Map HF Qwen3Next MoE config -> our MoE wrapper
         moe_defaults = dict(
@@ -195,7 +204,7 @@ class Qwen3NextModel(nn.Module):
 
         # Rotary embedding cache compatible with our rope_utils functions
         self.max_seq_len = config.max_position_embeddings
-        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        self.head_dim = config.head_dim
         base, rope_scaling, partial_rotary_factor = get_rope_config(config)
 
         self.rotary_emb = RotaryEmbedding(
@@ -310,11 +319,13 @@ class Qwen3NextForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         self.backend = backend or BackendConfig()
         moe_overrides = kwargs.pop("moe_overrides", None)
         self.model = Qwen3NextModel(config, backend=self.backend, moe_config=moe_config, moe_overrides=moe_overrides)
-        model_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+        model_dtype = get_dtype(config.torch_dtype, torch.bfloat16)
         self.lm_head = initialize_linear_module(
             self.backend.linear, config.hidden_size, config.vocab_size, bias=False, dtype=model_dtype
         )
-        keep_fp32 = list(getattr(self, "_keep_in_fp32_modules", None) or [])
+        keep_fp32 = list(
+            (vars(self).get("_keep_in_fp32_modules") or vars(type(self)).get("_keep_in_fp32_modules")) or []
+        )
         if "_fp32_params" not in keep_fp32:
             keep_fp32.append("_fp32_params")
         self._keep_in_fp32_modules = keep_fp32
@@ -347,9 +358,7 @@ class Qwen3NextForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         **attn_kwargs: Any,
     ) -> CausalLMOutputWithPast:
         output_hidden_states = (
-            output_hidden_states
-            if output_hidden_states is not None
-            else getattr(self.config, "output_hidden_states", False)
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
 
         is_thd = attn_kwargs.get("qkv_format") == "thd"

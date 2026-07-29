@@ -167,7 +167,7 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
         # (e.g. when loading the first N layers of a larger checkpoint for a
         # downsized smoke run). The matcher tolerates both ``backbone.layers.{i}``
         # and ``model.layers.{i}`` since the prefix is normalized after this.
-        num_layers = int(getattr(self.config, "num_hidden_layers", 0) or 0)
+        num_layers = int(self.config.num_hidden_layers or 0)
         if num_layers > 0:
             layer_idx_pattern = re.compile(r"^(?:backbone|model)\.layers\.(\d+)\.")
             for key in list(hf_state_dict.keys()):

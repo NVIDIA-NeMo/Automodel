@@ -325,15 +325,15 @@ class StepRoboticsVisionEncoder(nn.Module):
         self.num_hidden_layers = config.layers
         self.patch_size = config.patch_size
         self.image_size = config.image_size
-        self.use_cls_token = getattr(config, "use_cls_token", False)
-        self.use_rope2d = getattr(config, "use_rope2d", True)
-        self.use_abs_posemb = getattr(config, "use_abs_posemb", True)
+        self.use_cls_token = config.use_cls_token
+        self.use_rope2d = config.use_rope2d
+        self.use_abs_posemb = config.use_abs_posemb
         self.layer_norm_eps = config.layer_norm_eps
-        self.mlp_ratio = getattr(config, "mlp_ratio", 8960 / 1536)
-        self.ls_init_value = getattr(config, "ls_init_value", None)
+        self.mlp_ratio = config.mlp_ratio
+        self.ls_init_value = config.ls_init_value
         self.hidden_act = config.hidden_act
-        self.use_ln_pre = getattr(config, "use_ln_pre", False)
-        self.use_ln_post = getattr(config, "use_ln_post", True)
+        self.use_ln_pre = config.use_ln_pre
+        self.use_ln_post = config.use_ln_post
 
         # Patch embedding.
         self.conv1 = nn.Conv2d(
@@ -378,11 +378,11 @@ class StepRoboticsVisionEncoder(nn.Module):
             use_cls_token=self.use_cls_token,
             use_rope2d=self.use_rope2d,
             rope_kwargs={
-                "rope_theta": getattr(config, "rope_theta", 10000),
-                "rope_max_freq": getattr(config, "rope_max_freq", 10),
-                "rope_num_freqs": getattr(config, "rope_num_freqs", 1),
-                "rope_theta_rescale_factor": getattr(config, "rope_theta_rescale_factor", 1.0),
-                "rope_freqs_for": getattr(config, "rope_freqs_for", "lang"),
+                "rope_theta": config.rope_theta,
+                "rope_max_freq": config.rope_max_freq,
+                "rope_num_freqs": config.rope_num_freqs,
+                "rope_theta_rescale_factor": config.rope_theta_rescale_factor,
+                "rope_freqs_for": config.rope_freqs_for,
             },
         )
         self.vit_downsampler1 = nn.Conv2d(self.hidden_size, self.hidden_size * 2, kernel_size=3, stride=2, padding=1)

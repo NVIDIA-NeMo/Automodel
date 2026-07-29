@@ -119,7 +119,7 @@ class TestBlock:
 
         with (
             patch.object(block.self_attn, "forward", return_value=torch.zeros_like(x)) as mock_attn,
-            patch.object(block, "_mlp", return_value=torch.zeros_like(x)) as mock_mlp,
+            patch.object(block.mlp, "forward", return_value=torch.zeros_like(x)) as mock_mlp,
         ):
             out = block(x, freqs_cis=freqs_cis)
 
@@ -137,22 +137,20 @@ class TestBlock:
 
         with (
             patch.object(block.self_attn, "forward", return_value=torch.zeros_like(x)) as mock_attn,
-            patch.object(block, "_mlp", return_value=torch.zeros_like(x)) as mock_mlp,
+            patch.object(block.mlp, "forward", return_value=torch.zeros_like(x)) as mock_mlp,
         ):
             block(x, freqs_cis=freqs_cis, attention_mask=attention_mask)
 
         mock_attn.assert_called_once()
-        _, kwargs = mock_mlp.call_args
-        padding_mask = kwargs.get("padding_mask")
-        assert padding_mask is not None
+        padding_mask = mock_mlp.call_args.args[1]
         torch.testing.assert_close(padding_mask, attention_mask.logical_not())
 
-    def test_mlp_wrapper_handles_mlp_instance(self, qwen_config, backend_config):
+    def test_mlp_handles_mlp_instance(self, qwen_config, backend_config):
         block = Block(layer_idx=0, config=qwen_config, moe_config=magic_moe_config(qwen_config), backend=backend_config)
         block.mlp = MLP(dim=qwen_config.hidden_size, inter_dim=qwen_config.intermediate_size, backend="torch")
         x = torch.randn(2, 4, qwen_config.hidden_size).to(torch.bfloat16)
 
-        out = block._mlp(x, padding_mask=None)
+        out = block.mlp(x)
 
         assert out.shape == x.shape
 

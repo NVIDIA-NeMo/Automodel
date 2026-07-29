@@ -110,7 +110,7 @@ def _cached_block_mask(key, build):
 
 
 def _compiled_flex_attention(attention_module: torch.nn.Module):
-    compiled = getattr(attention_module, "_gemma4_cp_compiled_flex_attn", None)
+    compiled = attention_module._gemma4_cp_compiled_flex_attn
     if compiled is None:
         from torch.nn.attention.flex_attention import flex_attention
 
@@ -145,7 +145,7 @@ def _base_gemma4_cp_mask(attention_module: torch.nn.Module, ctx: Any, q_idx, kv_
     else:
         allowed = kv_global_idx <= q_global_idx
 
-    sliding_window = getattr(attention_module, "sliding_window", None)
+    sliding_window = attention_module.sliding_window
     if sliding_window is not None:
         allowed = allowed & ((q_global_idx - kv_global_idx) < sliding_window)
     return allowed
@@ -281,10 +281,8 @@ def _run_gemma4_flex_chunk(
     if vision_group_ids_kv is None and metadata_chunk.get("mm_token_type_ids") is not None:
         vision_group_ids_kv = gemma4_vision_group_ids(metadata_chunk["mm_token_type_ids"])
 
-    sliding_window = getattr(attention_module, "sliding_window", None)
-    config_uses_vision_bidir = (
-        getattr(getattr(attention_module, "config", None), "use_bidirectional_attention", None) == "vision"
-    )
+    sliding_window = attention_module.sliding_window
+    config_uses_vision_bidir = attention_module.config.use_bidirectional_attention == "vision"
     use_vision_bidirectional = (
         sliding_window is not None
         and config_uses_vision_bidir
@@ -362,7 +360,7 @@ def _run_gemma4_flex_chunk(
                 break
         _block_mask_set_generation(gen_obj)
         block_mask_key = (
-            getattr(attention_module, "sliding_window", None),
+            sliding_window,
             bool(ctx.is_causal),
             int(ctx.seq_global_start),
             int(kv_global_start),
@@ -825,11 +823,11 @@ def _ring_use_ffpa_varlen(attention_module: torch.nn.Module, ctx: Any) -> bool:
     map drives the varlen ``cu_seqlens``); Gemma4's manual CP batch always attaches
     one, so it is the sole FFPA path real CP training takes.
     """
-    if not getattr(attention_module, "_gemma4_cp_use_ffpa", False):
+    if not attention_module._gemma4_cp_use_ffpa:
         return False
     if not ctx.is_causal:
         return False
-    if getattr(attention_module, "sliding_window", None) is not None:
+    if attention_module.sliding_window is not None:
         return False
     if ctx.metadata.get("_packed_seq_ids") is None:
         return False
@@ -1135,8 +1133,8 @@ def _gemma4_cp_manual_attention(
     if query.shape[1] != key.shape[1]:
         enable_gqa = True
 
-    local_metadata = getattr(attention_module, "_cp_manual_metadata", {})
-    metadata_seq_dims = getattr(attention_module, "_cp_manual_metadata_seq_dims", {})
+    local_metadata = attention_module._cp_manual_metadata
+    metadata_seq_dims = attention_module._cp_manual_metadata_seq_dims
     ctx = CPRingAttentionContext(
         module=attention_module,
         query=query,
@@ -1175,7 +1173,7 @@ def _install_gemma4_cp_ring_sdpa(attention_module: torch.nn.Module, cp_mesh) -> 
     import torch.nn.functional as F_module
 
     original_sdpa = F_module.scaled_dot_product_attention
-    metadata_keys = getattr(attention_module, "_cp_manual_metadata_keys", ())
+    metadata_keys = attention_module._cp_manual_metadata_keys
 
     @torch._dynamo.disable
     def _ring_sdpa(
@@ -1203,7 +1201,7 @@ def _install_gemma4_cp_ring_sdpa(attention_module: torch.nn.Module, cp_mesh) -> 
         # back to that for any key the caller didn't pass so the ring can still
         # build the vision-bidirectional / packed masks. Persisted across the step
         # (not cleared by the post-hook) so it survives activation-checkpoint recompute.
-        fallback = getattr(module, "_cp_dense_metadata", None)
+        fallback = module._cp_dense_metadata
         if fallback:
             for name in metadata_keys:
                 if captured.get(name) is None:
@@ -1241,6 +1239,10 @@ def attach_gemma4_cp_ring_attention(attention_module: torch.nn.Module, *, use_ff
     the FFPA kernel is unavailable.
     """
     attention_module._gemma4_cp_use_ffpa = bool(use_ffpa)
+    attention_module._gemma4_cp_compiled_flex_attn = None
+    attention_module._cp_dense_metadata = {}
+    attention_module._cp_manual_metadata = {}
+    attention_module._cp_uses_attention_hook = False
     attention_module._cp_manual_metadata_keys = (
         "mm_token_type_ids",
         "_packed_seq_ids",

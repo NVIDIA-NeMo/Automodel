@@ -57,8 +57,12 @@ from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 def _resolve_thinker_config(config: Qwen2_5OmniConfig | Qwen2_5OmniThinkerConfig) -> Qwen2_5OmniThinkerConfig:
     """Return the thinker sub-config regardless of whether a full Omni or
     Thinker-only config was passed in."""
-    if hasattr(config, "thinker_config") and config.thinker_config is not None:
-        return config.thinker_config
+    try:
+        thinker_config = config.thinker_config
+    except AttributeError:
+        return config
+    if thinker_config is not None:
+        return thinker_config
     return config
 
 
@@ -125,12 +129,25 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
         # exception-propagation tuple. Delete the dead embedding here so it
         # never enters the optimizer; ``Qwen2_5OmniStateDictAdapter.from_hf``
         # also strips the matching HF checkpoint key.
-        if hasattr(self, "audio_tower") and hasattr(self.audio_tower, "audio_bos_eos_token"):
+        try:
             del self.audio_tower.audio_bos_eos_token
+        except AttributeError:
+            pass
 
         self.backend = backend or BackendConfig()
-        text_config = thinker_config.text_config if hasattr(thinker_config, "text_config") else thinker_config
-        torch_dtype = getattr(text_config, "torch_dtype", None) or getattr(thinker_config, "torch_dtype", None)
+        try:
+            text_config = thinker_config.text_config
+        except AttributeError:
+            text_config = thinker_config
+        try:
+            torch_dtype = text_config.torch_dtype
+        except AttributeError:
+            torch_dtype = None
+        if torch_dtype is None:
+            try:
+                torch_dtype = thinker_config.torch_dtype
+            except AttributeError:
+                torch_dtype = None
         dtype = get_dtype(torch_dtype, torch.bfloat16) if torch_dtype is not None else torch.bfloat16
 
         if self.backend.enable_hf_state_dict_adapter:
@@ -192,9 +209,7 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
             ``output_hidden_states`` is set, else ``None``).
         """
         output_hidden_states = (
-            output_hidden_states
-            if output_hidden_states is not None
-            else getattr(self.config, "output_hidden_states", False)
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
 
         if inputs_embeds is None:

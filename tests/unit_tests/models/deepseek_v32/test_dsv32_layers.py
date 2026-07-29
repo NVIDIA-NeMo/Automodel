@@ -12,38 +12,41 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib.util
 import sys
 import types
-import importlib.util
+from unittest.mock import Mock, patch
+
 import pytest
 import torch
-from unittest.mock import Mock, patch, MagicMock
 
 # Check if fast_hadamard_transform is available
 HADAMARD_AVAILABLE = False
 try:
     from fast_hadamard_transform import hadamard_transform  # noqa: F401
+
     HADAMARD_AVAILABLE = True
 except ImportError:
     # Mock fast_hadamard_transform before importing deepseek_v32 modules
-    if 'fast_hadamard_transform' not in sys.modules:
-        mock_hadamard = types.ModuleType('fast_hadamard_transform')
-        mock_hadamard.__spec__ = importlib.util.spec_from_loader('fast_hadamard_transform', loader=None)
+    if "fast_hadamard_transform" not in sys.modules:
+        mock_hadamard = types.ModuleType("fast_hadamard_transform")
+        mock_hadamard.__spec__ = importlib.util.spec_from_loader("fast_hadamard_transform", loader=None)
         mock_hadamard.hadamard_transform = lambda x, scale: x
-        sys.modules['fast_hadamard_transform'] = mock_hadamard
+        sys.modules["fast_hadamard_transform"] = mock_hadamard
 
+from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.deepseek_v32.config import DeepseekV32Config
 from nemo_automodel.components.models.deepseek_v32.layers import (
     DeepseekV32Indexer,
     DeepseekV32MLA,
     _rotate_activation,
 )
-from nemo_automodel.components.models.common import BackendConfig
 
 # Skip Transformer Engine tests by default unless explicitly enabled
 TE_AVAILABLE = False
 try:
     import transformer_engine  # noqa: F401
+
     TE_AVAILABLE = True
 except ImportError:
     pass
@@ -86,6 +89,7 @@ class TestDeepseekV32IndexerInit:
 
         for key, value in overrides.items():
             setattr(config, key, value)
+        config.rope_parameters = config.rope_scaling
         return config
 
     @patch("nemo_automodel.components.models.deepseek_v32.layers.initialize_linear_module")
@@ -117,7 +121,7 @@ class TestDeepseekV32IndexerInit:
         indexer = DeepseekV32Indexer(config, backend)
 
         # Should have k_norm as LayerNorm
-        assert hasattr(indexer, 'k_norm')
+        assert hasattr(indexer, "k_norm")
         assert isinstance(indexer.k_norm, torch.nn.LayerNorm)
 
     @patch("nemo_automodel.components.models.deepseek_v32.layers.initialize_linear_module")
@@ -131,9 +135,9 @@ class TestDeepseekV32IndexerInit:
         indexer = DeepseekV32Indexer(config, backend)
 
         # Should have wq_b, wk, and weights_proj
-        assert hasattr(indexer, 'wq_b')
-        assert hasattr(indexer, 'wk')
-        assert hasattr(indexer, 'weights_proj')
+        assert hasattr(indexer, "wq_b")
+        assert hasattr(indexer, "wk")
+        assert hasattr(indexer, "weights_proj")
 
 
 class TestDeepseekV32MLAInit:
@@ -148,6 +152,7 @@ class TestDeepseekV32MLAInit:
         config.qk_head_dim = 32
         config.v_head_dim = 32
         config.rope_scaling = None
+        config.rope_parameters = None
         config.max_position_embeddings = 4096
 
         # Indexer config
@@ -157,6 +162,7 @@ class TestDeepseekV32MLAInit:
 
         for key, value in overrides.items():
             setattr(config, key, value)
+        config.rope_parameters = config.rope_scaling
         return config
 
     @patch("nemo_automodel.components.models.deepseek_v32.layers.initialize_linear_module")
@@ -174,18 +180,18 @@ class TestDeepseekV32MLAInit:
         mla = DeepseekV32MLA(config, backend)
 
         # V3.2 always uses q_lora
-        assert hasattr(mla, 'q_a_proj')
-        assert hasattr(mla, 'q_b_proj')
-        assert hasattr(mla, 'q_a_layernorm')
+        assert hasattr(mla, "q_a_proj")
+        assert hasattr(mla, "q_b_proj")
+        assert hasattr(mla, "q_a_layernorm")
 
         # Check other components
-        assert hasattr(mla, 'kv_a_proj_with_mqa')
-        assert hasattr(mla, 'kv_a_layernorm')
-        assert hasattr(mla, 'kv_b_proj')
-        assert hasattr(mla, 'o_proj')
+        assert hasattr(mla, "kv_a_proj_with_mqa")
+        assert hasattr(mla, "kv_a_layernorm")
+        assert hasattr(mla, "kv_b_proj")
+        assert hasattr(mla, "o_proj")
 
         # Check indexer
-        assert hasattr(mla, 'indexer')
+        assert hasattr(mla, "indexer")
         assert isinstance(mla.indexer, DeepseekV32Indexer)
 
     @patch("nemo_automodel.components.models.deepseek_v32.layers.initialize_linear_module")
@@ -217,15 +223,8 @@ class TestDeepseekV32MLAInit:
     @patch("nemo_automodel.components.models.deepseek_v32.layers.initialize_attn_module_and_func")
     def test_mla_with_rope_scaling(self, mock_init_attn, mock_init_rms, mock_init_linear, mock_yarn_get_mscale):
         """Test MLA with rope_scaling configuration."""
-        rope_scaling = {
-            "factor": 2.0,
-            "mscale": 1.0,
-            "original_max_position_embeddings": 4096
-        }
-        config = self.create_mock_config(
-            rope_scaling=rope_scaling,
-            max_position_embeddings=8192
-        )
+        rope_scaling = {"factor": 2.0, "mscale": 1.0, "original_max_position_embeddings": 4096}
+        config = self.create_mock_config(rope_scaling=rope_scaling, max_position_embeddings=8192)
         backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch")
 
         mock_init_linear.return_value = Mock()
@@ -253,6 +252,7 @@ class TestDeepseekV32MLASparseMask:
         config.qk_head_dim = 32
         config.v_head_dim = 32
         config.rope_scaling = None
+        config.rope_parameters = None
         config.max_position_embeddings = 4096
         config.index_n_heads = 4
         config.index_head_dim = 32
@@ -260,6 +260,7 @@ class TestDeepseekV32MLASparseMask:
 
         for key, value in overrides.items():
             setattr(config, key, value)
+        config.rope_parameters = config.rope_scaling
         return config
 
     @patch("nemo_automodel.components.models.deepseek_v32.layers.initialize_linear_module")
@@ -365,6 +366,7 @@ class TestDeepseekV32MLAInitWeights:
         config.qk_head_dim = 32
         config.v_head_dim = 32
         config.rope_scaling = None
+        config.rope_parameters = None
         config.max_position_embeddings = 4096
         config.index_n_heads = 4
         config.index_head_dim = 32
@@ -372,6 +374,7 @@ class TestDeepseekV32MLAInitWeights:
 
         for key, value in overrides.items():
             setattr(config, key, value)
+        config.rope_parameters = config.rope_scaling
         return config
 
     @patch("torch.nn.init.trunc_normal_")
@@ -380,10 +383,13 @@ class TestDeepseekV32MLAInitWeights:
         config = self.create_mock_config()
         backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch")
 
-        with patch("nemo_automodel.components.models.deepseek_v32.layers.initialize_linear_module") as mock_init_linear, \
-             patch("nemo_automodel.components.models.deepseek_v32.layers.initialize_rms_norm_module") as mock_init_rms, \
-             patch("nemo_automodel.components.models.deepseek_v32.layers.initialize_attn_module_and_func") as mock_init_attn:
-
+        with (
+            patch("nemo_automodel.components.models.deepseek_v32.layers.initialize_linear_module") as mock_init_linear,
+            patch("nemo_automodel.components.models.deepseek_v32.layers.initialize_rms_norm_module") as mock_init_rms,
+            patch(
+                "nemo_automodel.components.models.deepseek_v32.layers.initialize_attn_module_and_func"
+            ) as mock_init_attn,
+        ):
             mock_linear = Mock()
             mock_linear.weight = torch.randn(64, 256)
             mock_linear.reset_parameters = Mock()
@@ -423,6 +429,7 @@ class TestDeepseekV32IndexerInitWeights:
 
         for key, value in overrides.items():
             setattr(config, key, value)
+        config.rope_parameters = config.rope_scaling
         return config
 
     @patch("torch.nn.init.trunc_normal_")
@@ -583,6 +590,7 @@ class TestDeepseekV32MLAForward:
         config.qk_head_dim = 16
         config.v_head_dim = 16
         config.rope_scaling = None
+        config.rope_parameters = None
         config.max_position_embeddings = 4096
         config.index_n_heads = 4
         config.index_head_dim = 16
@@ -687,6 +695,7 @@ class TestBuildSparseMaskWithAttentionMask:
         config.qk_head_dim = 32
         config.v_head_dim = 32
         config.rope_scaling = None
+        config.rope_parameters = None
         config.max_position_embeddings = 4096
         config.index_n_heads = 4
         config.index_head_dim = 32

@@ -245,6 +245,7 @@ class TestEmbedAndSpliceForCP:
     def test_video_features_scattered_into_embeds(self):
         """pixel_values_videos path: video features replace video-token embeddings."""
         model = _build_model(video_token_id=88)
+        model.model.visual = types.SimpleNamespace(rotary_pos_emb=types.SimpleNamespace(to=lambda device: None))
 
         feat = torch.full((1, 4), 3.0)  # one video token, hidden=4
         model.model.get_video_features = lambda pixel_values_videos, video_grid_thw=None, return_dict=True: (

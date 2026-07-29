@@ -398,7 +398,7 @@ class LagunaAttention(nn.Module):
         self.attention_dropout = float(config.attention_dropout or 0.0)
         self.is_causal = True
 
-        layer_types = getattr(config, "layer_types", None)
+        layer_types = config.layer_types
         self.attention_type = layer_types[layer_idx] if layer_types is not None else "full_attention"
         self.is_sliding = self.attention_type == "sliding_attention"
         self.sliding_window = config.sliding_window if self.is_sliding else None
@@ -494,7 +494,7 @@ class LagunaAttention(nn.Module):
         query_states, key_states = _apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         attention_interface: Callable = _eager_attention_forward
-        attn_impl = getattr(self.config, "_attn_implementation", "eager")
+        attn_impl = self.config._attn_implementation
         if attn_impl == "sdpa":
             attention_interface = _sdpa_attention_forward
         elif attn_impl != "eager":
@@ -532,7 +532,7 @@ class LagunaAttention(nn.Module):
             if linear is None:
                 continue
             nn.init.normal_(linear.weight, mean=0.0, std=init_std)
-            if getattr(linear, "bias", None) is not None:
+            if linear.bias is not None:
                 nn.init.zeros_(linear.bias)
         self.q_norm.reset_parameters()
         self.k_norm.reset_parameters()
@@ -599,10 +599,7 @@ class LagunaBlock(nn.Module):
 
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        if isinstance(self.mlp, MoE):
-            hidden_states = self.mlp(hidden_states, padding_mask)
-        else:
-            hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states, padding_mask=padding_mask)
         return residual + hidden_states
 
     def init_weights(self, buffer_device: torch.device) -> None:
@@ -689,7 +686,7 @@ class LagunaModel(nn.Module):
         else:
             self.rotary_emb = LagunaRotaryEmbedding(config)
 
-        if getattr(config, "swa_rope_parameters", None) is not None:
+        if config.swa_rope_parameters is not None:
             self.swa_rotary_emb = LagunaRotaryEmbedding(_config_with_rope(config, config.swa_rope_parameters))
         else:
             self.swa_rotary_emb = None
@@ -925,8 +922,7 @@ class LagunaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
 
     def update_moe_gate_bias(self) -> None:
         for layer in self.model.layers.values():
-            if isinstance(layer.mlp, MoE) and layer.mlp.gate.bias_update_factor > 0:
-                layer.mlp.gate.update_bias()
+            layer.mlp.update_gate_bias()
 
     def forward(
         self,
@@ -966,9 +962,7 @@ class LagunaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         if past_key_values is not None or use_cache:
             raise NotImplementedError("LagunaForCausalLM currently supports training forwards without KV cache.")
         output_hidden_states = (
-            output_hidden_states
-            if output_hidden_states is not None
-            else getattr(self.config, "output_hidden_states", False)
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         hidden = self.model(
             input_ids=input_ids,

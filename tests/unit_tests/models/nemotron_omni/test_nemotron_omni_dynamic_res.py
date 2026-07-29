@@ -39,10 +39,10 @@ class _StubVisionModel(nn.Module):
         b, _, h, w = img.shape
         assert b == 1, "extract_feature_dynamic should crop to one image at a time"
         self.received_shapes.append((h, w))
-        l = (h // self.patch_size) * (w // self.patch_size)
+        sequence_length = (h // self.patch_size) * (w // self.patch_size)
         # Encode (h, w) into the features so callers can verify per-image
         # routing without relying on order.
-        feats = torch.full((1, l, self.c_feat), float(h * 1000 + w), dtype=torch.float32)
+        feats = torch.full((1, sequence_length, self.c_feat), float(h * 1000 + w), dtype=torch.float32)
         return SimpleNamespace(features=feats)
 
 
@@ -57,6 +57,7 @@ def _make_model_stub(*, patch_size=2, downsample_ratio=0.5, c_feat=16, img_token
     (RADIO + LM construction)."""
     self = object.__new__(NemotronOmniForConditionalGeneration)
     nn.Module.__init__(self)
+    self.config = SimpleNamespace(llm_config=SimpleNamespace(output_hidden_states=False))
     self.patch_size = patch_size
     self.downsample_ratio = downsample_ratio
     self.img_context_token_id = img_token_id
@@ -140,9 +141,7 @@ def test_extract_feature_dynamic_accepts_list_sizes():
 
     pixel_values = torch.zeros(1, 3, 8, 8)
     out_list = model.extract_feature_dynamic(pixel_values, [(8, 8)])
-    out_tensor = model.extract_feature_dynamic(
-        pixel_values, torch.tensor([[8, 8]], dtype=torch.long)
-    )
+    out_tensor = model.extract_feature_dynamic(pixel_values, torch.tensor([[8, 8]], dtype=torch.long))
     assert out_list.shape == out_tensor.shape
 
 
@@ -174,13 +173,24 @@ class _StubLM(nn.Module):
     def get_input_embeddings(self):
         return self.embed
 
-    def forward(self, *, input_ids=None, attention_mask=None, position_ids=None,
-                inputs_embeds=None, labels=None, use_cache=None,
-                output_attentions=None, output_hidden_states=None,
-                return_dict=None, **kwargs):
+    def forward(
+        self,
+        *,
+        input_ids=None,
+        attention_mask=None,
+        position_ids=None,
+        inputs_embeds=None,
+        labels=None,
+        use_cache=None,
+        output_attentions=None,
+        output_hidden_states=None,
+        return_dict=None,
+        **kwargs,
+    ):
         # Capture the post-injection embeddings so the test can assert on them.
         self.captured_inputs_embeds = inputs_embeds.detach().clone()
         from transformers.modeling_outputs import CausalLMOutputWithPast
+
         return CausalLMOutputWithPast(loss=None, logits=inputs_embeds)
 
 
@@ -200,11 +210,10 @@ def test_forward_dynamic_res_branch_fills_image_slots():
     img = 18
     txt = 5
     input_ids = torch.tensor(
-        [[txt, img, img, img, img, txt],
-         [img, img, img, txt, txt, txt]],
+        [[txt, img, img, img, img, txt], [img, img, img, txt, txt, txt]],
         dtype=torch.long,
     )
-    text_mask = (input_ids != img)
+    text_mask = input_ids != img
 
     # Two images, padded to 12x12. img 1 real size 8x8, img 2 real size 4x12.
     # After dynamic pixel-shuffle:

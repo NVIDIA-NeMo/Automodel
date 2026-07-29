@@ -23,6 +23,8 @@ from typing import Any
 import torch
 from torch import nn
 
+from nemo_automodel.components._peft.lora import LinearLoRA
+
 # Try to import fast_hadamard_transform, fall back to torch implementation
 try:
     from fast_hadamard_transform import hadamard_transform
@@ -180,7 +182,7 @@ class GlmMoeDsaIndexer(nn.Module):
 
         self.backend = backend
         linear_impl = backend.linear
-        dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+        dtype = get_dtype(config.torch_dtype, torch.bfloat16)
 
         # Project Q from q_lora residual -> num_heads * head_dim
         self.wq_b = initialize_linear_module(
@@ -364,8 +366,7 @@ class GlmMoeDsaIndexer(nn.Module):
 
     def init_weights(self, init_std: float = 0.02):
         for module in [self.wq_b, self.wk, self.weights_proj]:
-            if hasattr(module, "weight"):
-                nn.init.trunc_normal_(module.weight, mean=0.0, std=init_std)
+            nn.init.trunc_normal_(module.weight, mean=0.0, std=init_std)
         self.k_norm.reset_parameters()
 
 
@@ -398,9 +399,7 @@ class GlmMoeDsaMLA(nn.Module):
         self.kv_lora_rank = config.kv_lora_rank
         self.qk_nope_head_dim = config.qk_nope_head_dim
         self.qk_rope_head_dim = config.qk_rope_head_dim
-        self.qk_head_dim = (
-            config.qk_head_dim if hasattr(config, "qk_head_dim") else (self.qk_nope_head_dim + self.qk_rope_head_dim)
-        )
+        self.qk_head_dim = config.qk_head_dim
         self.v_head_dim = config.v_head_dim
         self.index_topk = config.index_topk
 
@@ -411,7 +410,7 @@ class GlmMoeDsaMLA(nn.Module):
         rms_norm_impl = backend.rms_norm
 
         hidden_size = config.hidden_size
-        dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+        dtype = get_dtype(config.torch_dtype, torch.bfloat16)
 
         # GLM-5.2 always uses q_lora (q_lora_rank is not None)
         self.q_a_proj = initialize_linear_module(
@@ -456,7 +455,7 @@ class GlmMoeDsaMLA(nn.Module):
         )
         self.softmax_scale = self.qk_head_dim**-0.5
 
-        rope_parameters = config.rope_parameters if hasattr(config, "rope_parameters") else config.rope_scaling
+        rope_parameters = config.rope_parameters
         if rope_parameters and all(
             map(lambda x: x in rope_parameters, ["factor", "mscale", "original_max_position_embeddings"])
         ):
@@ -662,9 +661,10 @@ class GlmMoeDsaMLA(nn.Module):
                     "TileLang DSA sparse attention requires THD/packed sequences (qkv_format='thd'); "
                     f"got '{qkv_format}'. Use backend.attn in {{te, sdpa}} for the bshd dense path."
                 )
-            materialize_effective_weight = getattr(self.kv_b_proj, "materialize_effective_weight", None)
             kv_b_weight = (
-                materialize_effective_weight() if materialize_effective_weight is not None else self.kv_b_proj.weight
+                self.kv_b_proj.materialize_effective_weight()
+                if isinstance(self.kv_b_proj, LinearLoRA)
+                else self.kv_b_proj.weight
             )
             w = kv_b_weight.view(self.n_heads, self.qk_nope_head_dim + self.v_head_dim, self.kv_lora_rank)
             w_kc = w[:, : self.qk_nope_head_dim, :]

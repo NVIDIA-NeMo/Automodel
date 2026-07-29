@@ -12,9 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from types import SimpleNamespace
-
 import torch
+from transformers.models.ernie4_5.configuration_ernie4_5 import Ernie4_5Config
 
 from nemo_automodel.components.models.ernie4_5.rope_utils import (
     Ernie4_5RotaryEmbedding,
@@ -94,11 +93,12 @@ def _make_config(
     rope_theta: float = 500000.0,
     rope_parameters: dict | None = None,
 ):
-    cfg = SimpleNamespace(
+    rope_parameters = dict(rope_parameters or {})
+    rope_parameters.setdefault("rope_theta", rope_theta)
+    cfg = Ernie4_5Config(
         head_dim=head_dim,
         num_attention_heads=num_attention_heads,
         hidden_size=hidden_size,
-        rope_theta=rope_theta,
         rope_parameters=rope_parameters,
     )
     return cfg

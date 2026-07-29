@@ -49,6 +49,7 @@ class Qwen3VLForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLForConditio
 
     tie_word_embeddings_support: TieSupport = TieSupport.BOTH
     _tied_weights_keys = {"lm_head.weight": "model.language_model.embed_tokens.weight"}
+    cp_mesh = None
 
     @dataclass(frozen=True)
     class ModelCapabilities:
@@ -72,7 +73,7 @@ class Qwen3VLForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLForConditio
 
     def tie_weights(self, *_args: object, **_kwargs: object) -> None:
         """Tie the language head to the active text embedding when configured."""
-        if getattr(self.config, "tie_word_embeddings", False):
+        if self.config.tie_word_embeddings:
             self.lm_head.weight = self.model.language_model.embed_tokens.weight
 
     def _prepare_visual_inputs_for_cp(
@@ -278,7 +279,7 @@ class Qwen3VLForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLForConditio
             TypeError: If ``visual_pos_masks`` is not boolean.
             ValueError: If mask and DeepStack shapes are inconsistent.
         """
-        cp_mesh = getattr(self, "cp_mesh", None)
+        cp_mesh = self.cp_mesh
         local_inputs, _, _ = shard_sequence_for_cp_round_robin(cp_mesh, inputs_embeds, seq_dim=1)
         if visual_pos_masks is None:
             return local_inputs, None, None
@@ -346,7 +347,7 @@ class Qwen3VLForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLForConditio
         ``visual_pos_masks`` of shape ``[batch, local_sequence]``, and DeepStack
         tensors of shape ``[local_visual_tokens, hidden]``.
         """
-        cp_mesh = getattr(self, "cp_mesh", None)
+        cp_mesh = self.cp_mesh
         cp_size = cp_mesh.size() if cp_mesh is not None else 1
         if cp_size <= 1:
             return super().forward(

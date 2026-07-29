@@ -321,12 +321,12 @@ class LLaVAOneVision1_5_ForConditionalGeneration(HFCheckpointingMixin, nn.Module
         self.config = config
         reject_unsupported_tie_word_embeddings(type(self), config)
         if attn_implementation is None:
-            attn_implementation = getattr(config, "_attn_implementation", None) or "eager"
+            attn_implementation = config._attn_implementation or "eager"
         self.model = LLaVAOneVision1_5_Model(config, attn_implementation=attn_implementation)
         self.lm_head = nn.Linear(self.model.text_config.hidden_size, self.model.text_config.vocab_size, bias=False)
         self.vocab_size = self.model.text_config.vocab_size
-        self.image_token_id = getattr(config, "image_token_id", 151655)
-        self.video_token_id = getattr(config, "video_token_id", 151656)
+        self.image_token_id = config.image_token_id
+        self.video_token_id = config.video_token_id
 
         from nemo_automodel.components.models.llava_onevision.state_dict_adapter import (
             LlavaOneVisionStateDictAdapter,
@@ -376,9 +376,7 @@ class LLaVAOneVision1_5_ForConditionalGeneration(HFCheckpointingMixin, nn.Module
         **kwargs,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         output_hidden_states = (
-            output_hidden_states
-            if output_hidden_states is not None
-            else getattr(self.model.text_config, "output_hidden_states", False)
+            output_hidden_states if output_hidden_states is not None else self.model.text_config.output_hidden_states
         )
 
         outputs = self.model(
@@ -409,7 +407,7 @@ class LLaVAOneVision1_5_ForConditionalGeneration(HFCheckpointingMixin, nn.Module
         return CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
-            past_key_values=getattr(outputs, "past_key_values", None),
+            past_key_values=outputs.past_key_values,
             hidden_states=hidden_states if output_hidden_states else None,
-            attentions=getattr(outputs, "attentions", None),
+            attentions=outputs.attentions,
         )

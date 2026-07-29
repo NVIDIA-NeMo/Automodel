@@ -353,7 +353,9 @@ def _import_parallelizer_with_stubs(monkeypatch):
     distributed_stub = types.ModuleType("nemo_automodel.components.distributed")
     distributed_stub.__path__ = []
     config_stub = types.ModuleType("nemo_automodel.components.distributed.config")
-    config_stub.normalize_activation_checkpointing_scope = lambda scope: (scope,) if isinstance(scope, str) else tuple(scope)
+    config_stub.normalize_activation_checkpointing_scope = (
+        lambda scope: (scope,) if isinstance(scope, str) else tuple(scope)
+    )
     pipelining_stub = types.ModuleType("nemo_automodel.components.distributed.pipelining")
     pipelining_stub.__path__ = []
     pipelining_config_stub = types.ModuleType("nemo_automodel.components.distributed.pipelining.config")

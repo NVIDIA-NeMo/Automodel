@@ -130,7 +130,7 @@ class DiffusionGemmaBackbone(nn.Module):
         super().__init__()
         self.config = config
         self.backend = backend
-        self.padding_idx = getattr(config, "pad_token_id", None)
+        self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.layer_types = config.layer_types
 
@@ -395,20 +395,16 @@ class DiffusionGemmaForBlockDiffusion(HFCheckpointingMixin, MoEFSDPSyncMixin, Pr
         # non-eager value for this class, so pin eager here (the BackendConfig.attn
         # setting governs NeMo's own kernels, not HF's attn dispatch).
         config._attn_implementation = "eager"
-        if getattr(config, "text_config", None) is not None:
+        if config.text_config is not None:
             config.text_config._attn_implementation = "eager"
 
         super().__init__(config)
         self.backend = backend or BackendConfig()
         text_config = config.text_config
         self.text_config = text_config
-        self.canvas_length = int(getattr(config, "canvas_length", 256))
-        self.self_conditioning = bool(
-            self_conditioning if self_conditioning is not None else getattr(config, "self_conditioning", True)
-        )
-        self.freeze_router = bool(
-            freeze_router if freeze_router is not None else getattr(config, "freeze_router", True)
-        )
+        self.canvas_length = int(config.canvas_length)
+        self.self_conditioning = bool(config.self_conditioning if self_conditioning is None else self_conditioning)
+        self.freeze_router = bool(config.freeze_router if freeze_router is None else freeze_router)
         self.final_logit_softcapping = text_config.final_logit_softcapping
         self.vocab_size = text_config.vocab_size
 
@@ -428,7 +424,7 @@ class DiffusionGemmaForBlockDiffusion(HFCheckpointingMixin, MoEFSDPSyncMixin, Pr
                 text_config,
                 self.model.moe_config,
                 self.backend,
-                dtype=dtype_from_str(getattr(text_config, "torch_dtype", None), torch.bfloat16),
+                dtype=dtype_from_str(text_config.dtype, torch.bfloat16),
             )
 
         if self.freeze_router:
@@ -461,13 +457,11 @@ class DiffusionGemmaForBlockDiffusion(HFCheckpointingMixin, MoEFSDPSyncMixin, Pr
         for layer in self.model.layers.values():
             gate = layer.moe.gate
             gate.train_gate = False
-            for name in ("proj", "scale"):
-                param = getattr(gate, name, None)
-                if isinstance(param, nn.Module):
-                    for p in param.parameters():
-                        p.requires_grad_(False)
-                elif isinstance(param, torch.Tensor):
-                    param.requires_grad_(False)
+            # proj is nn.Linear
+            for p in gate.proj.parameters():
+                p.requires_grad_(False)
+            # scale is nn.Parameter
+            gate.scale.requires_grad_(False)
 
     @torch.no_grad()
     def initialize_weights(
@@ -486,12 +480,10 @@ class DiffusionGemmaForBlockDiffusion(HFCheckpointingMixin, MoEFSDPSyncMixin, Pr
         params). Honor the requested dtype instead.
         """
         if dtype is None:
-            cfg_dtype = getattr(self.config, "torch_dtype", None)
-            if isinstance(cfg_dtype, str):
-                from nemo_automodel.shared.utils import dtype_from_str
+            from nemo_automodel.shared.utils import dtype_from_str
 
-                cfg_dtype = dtype_from_str(cfg_dtype, torch.bfloat16)
-            dtype = cfg_dtype if isinstance(cfg_dtype, torch.dtype) else torch.bfloat16
+            dtype = dtype_from_str(self.config.dtype, torch.bfloat16)
+
         buffer_device = buffer_device or torch.device(f"cuda:{torch.cuda.current_device()}")
         with buffer_device:
             for layer in self.model.layers.values():

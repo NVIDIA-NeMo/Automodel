@@ -40,10 +40,10 @@ class MiniMaxM2Attention(nn.Module):
 
         self.num_heads = config.num_attention_heads
         self.num_kv_heads = config.num_key_value_heads
-        self.head_dim = getattr(config, "head_dim", None) or config.hidden_size // self.num_heads
-        self.use_qk_norm = getattr(config, "use_qk_norm", False)
+        self.head_dim = config.head_dim or config.hidden_size // self.num_heads
+        self.use_qk_norm = config.use_qk_norm
 
-        dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+        dtype = get_dtype(config.torch_dtype, torch.bfloat16)
 
         self.q_proj = initialize_linear_module(
             backend.linear,
@@ -164,7 +164,7 @@ class MiniMaxM2Attention(nn.Module):
         linear_list = [self.q_proj, self.k_proj, self.v_proj, self.o_proj]
         for linear in linear_list:
             nn.init.trunc_normal_(linear.weight, mean=0.0, std=init_std)
-            if hasattr(linear, "bias") and linear.bias is not None:
+            if linear.bias is not None:
                 nn.init.zeros_(linear.bias)
         if self.q_norm is not None:
             self.q_norm.reset_parameters()
