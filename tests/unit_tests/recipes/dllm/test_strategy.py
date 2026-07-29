@@ -350,6 +350,98 @@ class TestIDLMStrategy:
         assert (noisy[:, 8:] == 999).all()
         assert (noisy[:, :8] == input_ids[:, :8]).all()
 
+    def test_setup_extra_rejects_context_parallel(self, strategy):
+        recipe = types.SimpleNamespace(
+            distributed_config=types.SimpleNamespace(cp_size=2),
+            model_parts=[
+                types.SimpleNamespace(config=types.SimpleNamespace(_attn_implementation="sdpa", vocab_size=1000))
+            ],
+            mask_token_id=1,
+        )
+        with pytest.raises(ValueError, match="context parallelism"):
+            strategy.setup_extra(recipe)
+
+    def test_setup_extra_rejects_flash_attention_2(self, strategy):
+        recipe = types.SimpleNamespace(
+            distributed_config=types.SimpleNamespace(cp_size=1),
+            model_parts=[
+                types.SimpleNamespace(
+                    config=types.SimpleNamespace(_attn_implementation="flash_attention_2", vocab_size=1000)
+                )
+            ],
+            mask_token_id=1,
+        )
+        with pytest.raises(ValueError, match="FlashAttention-2 ignores 4D masks"):
+            strategy.setup_extra(recipe)
+
+    def test_prepare_batch_assigns_noisy_input_ids(self, strategy):
+        # Unused on the I-DLM path but kept correct: it stashes the noisy ids.
+        batch = {"input_ids": torch.zeros(1, 4, dtype=torch.long)}
+        noisy = torch.ones(1, 4, dtype=torch.long)
+        out = strategy.prepare_batch(batch, noisy, None, None)
+        assert out is batch
+        assert torch.equal(out["input_ids"], noisy)
+
+    def test_forward_backward_concats_and_backprops(self, strategy):
+        """End-to-end I-DLM microbatch on CPU: single ``[x_t | x_0]`` concat
+        forward, two-CE loss, and a real backward (is_train=True, dense sdpa
+        mask). Omitting ``attention_mask`` also exercises the all-ones fallback.
+        """
+        torch.manual_seed(0)
+        vocab, seq_len, mask_id = 32, 6, 31
+        loss_fn = strategy.create_loss_fn({"block_length": 2, "clean_loss_weight": 0.2})
+
+        class _TinyModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.embed = torch.nn.Embedding(vocab, 8)
+                self.head = torch.nn.Linear(8, vocab)
+                self.config = types.SimpleNamespace(_attn_implementation="sdpa")
+
+            def forward(self, input_ids, attention_mask=None, position_ids=None, use_cache=False):
+                return types.SimpleNamespace(logits=self.head(self.embed(input_ids)))
+
+        model = _TinyModel()
+        recipe = types.SimpleNamespace(
+            dist_env=types.SimpleNamespace(device=torch.device("cpu")),
+            model_parts=[model],
+            distributed_config=types.SimpleNamespace(defer_fsdp_grad_sync=True, autocast_dtype=None),
+            te_fp8=None,
+            device_mesh=None,
+            dllm_loss_fn=loss_fn,
+            _dllm_loss_buffer=[],
+            _get_dp_group_size=lambda include_cp=True: 1.0,
+        )
+        clean = torch.randint(0, vocab, (1, seq_len))
+        noise_mask = torch.zeros(1, seq_len, dtype=torch.bool)
+        noise_mask[:, seq_len // 2 :] = True  # supervise + mask the response half
+        noisy = clean.clone()
+        noisy[noise_mask] = mask_id
+        batch = {
+            "_clean_input_ids": clean,
+            "_noisy_input_ids": noisy,
+            "_noise_mask": noise_mask,
+            "loss_mask": torch.ones(1, seq_len, dtype=torch.long),
+        }
+        loss_buffer = []
+
+        strategy.forward_backward(
+            recipe,
+            0,
+            batch,
+            loss_buffer=loss_buffer,
+            num_diffusion_tokens=int(noise_mask.sum()),
+            num_batches=1,
+            is_train=True,
+        )
+
+        assert len(loss_buffer) == 1
+        assert torch.isfinite(loss_buffer[0])
+        assert len(recipe._dllm_loss_buffer) == 1
+        # is_train=True ran a real backward: draft params carry finite grads.
+        grads = [p.grad for p in model.parameters() if p.grad is not None]
+        assert grads and all(torch.isfinite(g).all() for g in grads)
+
 
 # ---------------------------------------------------------------------------
 # DFlashStrategy — anchor-block sampling (CPU, no model loading)
