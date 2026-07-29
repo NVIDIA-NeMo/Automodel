@@ -41,6 +41,7 @@ from nemo_automodel.components.speculative.streaming.eagle3 import (
     validate_eagle3_ref,
 )
 from nemo_automodel.components.speculative.streaming.queue import Lease, SampleRefQueue
+from nemo_automodel.components.speculative.streaming.refs import FeatureAlgorithm
 from nemo_automodel.components.speculative.streaming.store import FeatureStore, StoreHandle
 
 logger = logging.getLogger(__name__)
@@ -74,11 +75,9 @@ class FeatureDataLoader:
         queue: SampleRefQueue,
         store: FeatureStore,
         *,
-        algorithm=None,
+        algorithm: FeatureAlgorithm | None = None,
         acquire_poll_interval: float = 0.05,
     ) -> None:
-        from nemo_automodel.components.speculative.streaming.refs import FeatureAlgorithm
-
         if algorithm is None:
             algorithm = FeatureAlgorithm.EAGLE3
         if acquire_poll_interval <= 0:

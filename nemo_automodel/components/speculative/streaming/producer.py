@@ -37,6 +37,7 @@ from typing import Callable
 import torch
 import torch.nn as nn
 
+from nemo_automodel.components.speculative.eagle.backend import Eagle3TargetBackend
 from nemo_automodel.components.speculative.eagle.target import Eagle3TargetBatch
 from nemo_automodel.components.speculative.streaming.eagle3 import (
     EAGLE3_SCHEMA_VERSION,
@@ -53,19 +54,18 @@ from nemo_automodel.components.speculative.streaming.store import FeatureStore
 logger = logging.getLogger(__name__)
 
 
-def _resolve_algorithm(backend) -> FeatureAlgorithm:
+def _resolve_algorithm(backend: object) -> FeatureAlgorithm:
     """Pick the producer-side :class:`FeatureAlgorithm` for a backend.
 
-    Each algorithm-specific backend class declares its algorithm by name
-    suffix (``*Eagle3TargetModel``, ``*DFlashTargetModel``, ...); the
-    helper centralizes the dispatch so adding a new algorithm is a
-    one-line change here.
+    Dispatch on the backend's base class, not its class-name string: every
+    Eagle3 target variant (HF, runner, vLLM, SGLang, remote) subclasses
+    :class:`Eagle3TargetBackend`, so this survives renames, subclassing, and
+    wrapping. Adding a new algorithm is a one-line ``isinstance`` branch here.
     """
-    name = type(backend).__name__
-    if name.endswith("Eagle3TargetModel"):
+    if isinstance(backend, Eagle3TargetBackend):
         return FeatureAlgorithm.EAGLE3
     raise ValueError(
-        f"FeatureProducer cannot infer FeatureAlgorithm from backend of type {name!r}; "
+        f"FeatureProducer cannot infer FeatureAlgorithm from backend of type {type(backend).__name__!r}; "
         f"pass algorithm=... explicitly to override"
     )
 
@@ -100,7 +100,7 @@ class FeatureProducer:
 
     def __init__(
         self,
-        target_backend,
+        target_backend: Eagle3TargetBackend,
         store: FeatureStore,
         *,
         run_id: str,

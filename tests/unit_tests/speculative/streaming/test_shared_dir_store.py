@@ -188,6 +188,33 @@ def test_shared_dir_store_release_is_idempotent(store) -> None:
     store.release(h)
 
 
+def test_shared_dir_store_releasing_one_handle_twice_does_not_decrement_sibling(store, tmp_path) -> None:
+    """Re-releasing one handle must not unlink a sibling handle's file.
+
+    Regression: release used to decrement a per-sample counter, so releasing
+    ``h1`` twice dropped the count to zero and unlinked ``s1``'s file while
+    ``h2`` was still outstanding -- a later get() for that sample then raised
+    KeyError. Per-handle-id tracking makes the replayed release a true no-op.
+    """
+    ref = _put(store, "s1", n_floats=128)
+    file_path = tmp_path / "store" / "s1.safetensors"
+    _, h1 = store.get(ref)
+    _, h2 = store.get(ref)
+    assert h1.handle_id != h2.handle_id
+
+    store.release(h1)
+    assert file_path.is_file()  # h2 still outstanding
+
+    # Replayed release of h1 (consumer error / retried ack) must be a no-op,
+    # not a second decrement that unlinks the file while h2 is live.
+    store.release(h1)
+    assert file_path.is_file()
+
+    # Releasing h2 legitimately unlinks the file.
+    store.release(h2)
+    assert not file_path.exists()
+
+
 # --- 4. health + watermarks -------------------------------------------------
 
 

@@ -125,11 +125,12 @@ class SharedDirFeatureStore(FeatureStore):
         # Files this store instance put, keyed by sample_id. Tracks
         # ownership so ``close`` only unlinks files we wrote.
         self._owned_files: dict[str, int] = {}
-        # Track per-file handle refcount so concurrent get() calls on
-        # the same sample each get their own tensors and the file
-        # deletes only after the last release -- mirrors
-        # ``LocalFeatureStore``'s consume-once semantics.
-        self._handle_refs: dict[str, int] = {}
+        # Live get() handles keyed by handle_id -> sample_id, so concurrent
+        # get() calls on the same sample each get their own handle, the file
+        # deletes only after the last one drops, and a re-released handle
+        # cannot decrement a sibling -- mirrors ``LocalFeatureStore``'s
+        # per-handle-id consume-once semantics.
+        self._handle_refs: dict[int, str] = {}
         self._closed = False
 
     @property
@@ -227,7 +228,6 @@ class SharedDirFeatureStore(FeatureStore):
                 )
             bytes_written = self._atomic_write(path, tensors)
             self._owned_files[sample_id] = bytes_written
-            self._handle_refs[sample_id] = 0
             logger.debug(
                 "SharedDirFeatureStore put sample_id=%s bytes=%d resident=%d",
                 sample_id,
@@ -294,13 +294,13 @@ class SharedDirFeatureStore(FeatureStore):
                 tensor = tensor.clone()
             out[name] = tensor
         with self._lock:
-            self._handle_refs[ref.sample_id] = self._handle_refs.get(ref.sample_id, 0) + 1
             handle = StoreHandle(store=self, sample_id=ref.sample_id, ref=ref)
+            self._handle_refs[handle.handle_id] = ref.sample_id
             logger.debug(
-                "SharedDirFeatureStore get sample_id=%s device=%s handles=%d",
+                "SharedDirFeatureStore get sample_id=%s device=%s handle_id=%s",
                 ref.sample_id,
                 target_device,
-                self._handle_refs[ref.sample_id],
+                handle.handle_id,
             )
             return out, handle
 
@@ -310,31 +310,47 @@ class SharedDirFeatureStore(FeatureStore):
                 f"StoreHandle was issued by a different store (id {id(handle.store):x}), cannot release it here"
             )
         with self._lock:
-            count = self._handle_refs.get(handle.sample_id, 0)
-            if count <= 0:
+            # Per-handle-id idempotency: re-releasing the same handle is a
+            # no-op even while a sibling handle for the same sample is live.
+            # ``_handle_refs`` is keyed by handle_id and popped on first
+            # release, so a replayed release misses and cannot unlink a
+            # sibling's file.
+            sample_id = self._handle_refs.pop(handle.handle_id, None)
+            if sample_id is None:
                 logger.debug(
-                    "SharedDirFeatureStore release sample_id=%s is a no-op (already released)",
+                    "SharedDirFeatureStore release handle_id=%s sample_id=%s is a no-op (already released)",
+                    handle.handle_id,
                     handle.sample_id,
                 )
                 return
-            count -= 1
-            if count == 0:
-                path = self._path_for(handle.sample_id)
-                self._owned_files.pop(handle.sample_id, None)
-                self._handle_refs.pop(handle.sample_id, None)
+            if sample_id != handle.sample_id:
+                # Defensive: if a future refactor ever mixes the identity,
+                # do not silently unlink the wrong sample's file.
+                logger.warning(
+                    "SharedDirFeatureStore release handle_id=%s sample_id mismatch (%s != %s); ignoring",
+                    handle.handle_id,
+                    sample_id,
+                    handle.sample_id,
+                )
+                return
+            # Unlink the file once the last outstanding handle for this
+            # sample is dropped.
+            siblings = [hid for hid, sid in self._handle_refs.items() if sid == sample_id]
+            if not siblings:
+                path = self._path_for(sample_id)
+                self._owned_files.pop(sample_id, None)
                 try:
                     os.unlink(path)
                 except FileNotFoundError:
                     pass
                 except OSError:
                     logger.exception("SharedDirFeatureStore unlink failed for %s; ignoring", path)
-            else:
-                self._handle_refs[handle.sample_id] = count
             _, resident_bytes = self._directory_residency()
             logger.debug(
-                "SharedDirFeatureStore release sample_id=%s remaining_handles=%d resident=%d",
-                handle.sample_id,
-                count,
+                "SharedDirFeatureStore release sample_id=%s handle_id=%s remaining_siblings=%d resident=%d",
+                sample_id,
+                handle.handle_id,
+                len(siblings),
                 resident_bytes,
             )
 
@@ -362,7 +378,7 @@ class SharedDirFeatureStore(FeatureStore):
         with self._lock:
             if self._closed:
                 return
-            outstanding = sum(count for count in self._handle_refs.values() if count > 0)
+            outstanding = len(self._handle_refs)
             if outstanding:
                 raise RuntimeError(
                     f"SharedDirFeatureStore.close() called with {outstanding} outstanding handle(s); "
