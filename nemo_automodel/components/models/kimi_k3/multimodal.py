@@ -57,6 +57,10 @@ def _projector_config(config: KimiK3Config) -> SimpleNamespace:
 class KimiK3ForConditionalGeneration(KimiK3ForCausalLM):
     """Kimi K3 MoonViT3d tower, projector, and native KDA/MLA language model."""
 
+    # The multimodal wrapper uses the same Kimi Linear execution path as its
+    # language backbone, including its model-owned CP and pipeline staging.
+    ModelCapabilities = KimiK3ForCausalLM.ModelCapabilities
+
     @classmethod
     def from_config(
         cls,
