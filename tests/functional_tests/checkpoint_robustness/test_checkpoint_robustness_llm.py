@@ -1069,6 +1069,13 @@ def _rank0() -> bool:
     return not dist.is_initialized() or dist.get_rank() == 0
 
 
+def _report_phase(message: str) -> None:
+    """Write a timestamped rank-0 phase marker outside pytest output capture."""
+    if _preinit_global_rank() == 0:
+        stream = sys.__stdout__ or sys.stdout
+        print(f"[checkpoint_robustness][{time.strftime('%H:%M:%S')}] {message}", file=stream, flush=True)
+
+
 def _barrier():
     if dist.is_initialized():
         dist.barrier()
@@ -1154,6 +1161,7 @@ def run_checkpoint_robustness(
 
     source_load_reference = None
     if check_source_load_parity:
+        _report_phase("Phase 0: starting vanilla-HF source-load reference")
         source_load_reference = _prepare_source_load_reference(
             cfg,
             input_ids,
@@ -1164,14 +1172,18 @@ def run_checkpoint_robustness(
             hf_source_post_load_dequantize=hf_source_post_load_dequantize,
         )
         _barrier()
+        _report_phase("Phase 0: vanilla-HF source-load reference complete")
 
     # Phase 1: Construct the model, optionally compare it against the raw HF
     # source-load reference, then train and checkpoint.
     torch.cuda.reset_peak_memory_stats()
+    _report_phase("Phase 1: starting initial trainer setup")
     trainer = recipe_cls(cfg)
     trainer.setup()
+    _report_phase("Phase 1: initial trainer setup complete")
 
     if check_source_load_parity:
+        _report_phase("Phase 0: starting constructed-trainer parity forward")
         device = next(trainer.model_parts[0].parameters()).device
         trainer_source_logits = _get_logits(trainer.model_parts[0], input_ids, device, trainer=trainer)
         source_load_failure = _compare_source_load_parity(
@@ -1188,6 +1200,7 @@ def run_checkpoint_robustness(
         if _rank0():
             _cleanup_source_load_sync(cfg)
         _barrier()
+        _report_phase("Phase 0: constructed-trainer parity forward complete")
 
         # Do not train with a model that has already run a no-grad parity
         # forward. FSDP2 and non-reentrant activation-checkpoint wrappers keep
@@ -1199,10 +1212,14 @@ def run_checkpoint_robustness(
         del trainer
         _barrier()
         cfg = parse_args_and_load_config()
+        _report_phase("Phase 1: starting fresh trainer setup after source parity")
         trainer = recipe_cls(cfg)
         trainer.setup()
+        _report_phase("Phase 1: fresh trainer setup complete")
 
+    _report_phase("Phase 1: starting train and checkpoint")
     trainer.run_train_validation_loop()
+    _report_phase("Phase 1: train and checkpoint complete")
 
     # Memory tracking after training
     peak_vram_gb = torch.cuda.max_memory_allocated() / 1024**3
@@ -1215,8 +1232,10 @@ def run_checkpoint_robustness(
         assert peak_cpu_gb <= max_cpu_gb, f"Peak CPU RSS {peak_cpu_gb:.2f} GB exceeds threshold {max_cpu_gb:.2f} GB"
 
     # Phase 2: Capture reference logits before teardown
+    _report_phase("Phase 2: starting reference-logits capture")
     device = next(trainer.model_parts[0].parameters()).device
     reference_logits = _get_logits(trainer.model_parts[0], input_ids, device, trainer=trainer)
+    _report_phase("Phase 2: reference-logits capture complete")
 
     # Locate the Phase 1 checkpoint used by the reload and resume checks.
     checkpoint_dir = Path(cfg.checkpoint.checkpoint_dir)
@@ -1279,10 +1298,14 @@ def run_checkpoint_robustness(
     if not is_peft:
         cfg.model.pretrained_model_name_or_path = str(consolidated_dir)
         cfg.checkpoint.enabled = False
+    _report_phase("Phase 3: starting AutoModel reload setup")
     restored_trainer = recipe_cls(cfg)
     restored_trainer.setup()
+    _report_phase("Phase 3: AutoModel reload setup complete")
 
+    _report_phase("Phase 3: starting restored-logits capture")
     restored_logits = _get_logits(restored_trainer.model_parts[0], input_ids, device, trainer=restored_trainer)
+    _report_phase("Phase 3: restored-logits capture complete")
 
     kl_restored = _kl_divergence_from_logits(reference_logits, restored_logits)
     max_kl_restored = kl_restored.max().item()
@@ -1300,6 +1323,7 @@ def run_checkpoint_robustness(
     del restored_trainer
 
     # Phase 4: Load into vanilla HF (rank 0 only)
+    _report_phase("Phase 4: starting vanilla-HF reload")
     hf_reload_sync_paths = _prepare_hf_reload_sync(cfg)
 
     hf_reload_error = None
@@ -1439,9 +1463,11 @@ def run_checkpoint_robustness(
 
     hf_reload_error = _finish_hf_reload_sync(hf_reload_sync_paths, hf_reload_error)
     _record_deferred_failure(deferred_failures, "Phase 4 HF reload parity", hf_reload_error)
+    _report_phase("Phase 4: vanilla-HF reload complete")
 
     # Phase 5 (optional): Cross-TP — reload consolidated with a different TP size
     if cross_tp_size > 0 and not is_peft:
+        _report_phase("Phase 5: starting cross-TP reload")
         cfg = parse_args_and_load_config()
         cfg.model.pretrained_model_name_or_path = str(consolidated_dir)
         cfg.checkpoint.enabled = False
@@ -1470,6 +1496,7 @@ def run_checkpoint_robustness(
         _release_recipe_memory(cross_tp_trainer)
         del cross_tp_trainer
         _barrier()
+        _report_phase("Phase 5: cross-TP reload complete")
 
     # Phase 6 (optional): Training resumption — verify loss continuity
     # Phase 1 trained for max_steps (e.g. 5) and checkpointed. We now train a fresh baseline
@@ -1481,6 +1508,7 @@ def run_checkpoint_robustness(
         import tempfile
 
         # Baseline: fresh continuous run for max_steps+3, saving losses to a temp dir
+        _report_phase("Phase 6: starting continuous-baseline setup")
         baseline_dir = tempfile.mkdtemp(prefix="resume_baseline_")
         cfg = parse_args_and_load_config()
         original_max_steps = cfg.step_scheduler.max_steps
@@ -1496,7 +1524,9 @@ def run_checkpoint_robustness(
             cfg.lr_scheduler.lr_decay_steps = original_max_steps
         baseline_trainer = recipe_cls(cfg)
         baseline_trainer.setup()
+        _report_phase("Phase 6: continuous-baseline setup complete; starting training")
         baseline_trainer.run_train_validation_loop()
+        _report_phase("Phase 6: continuous-baseline training complete")
 
         baseline_losses = {}
         baseline_jsonl = Path(baseline_dir) / "training.jsonl"
@@ -1512,12 +1542,15 @@ def run_checkpoint_robustness(
         shutil.rmtree(baseline_dir, ignore_errors=True)
 
         # Resume: reload from Phase 1 checkpoint and train to resume_max_steps.
+        _report_phase("Phase 6: starting resume setup and checkpoint load")
         cfg = parse_args_and_load_config()
         cfg.checkpoint.restore_from = str(ckpt_step_dir)
         cfg.step_scheduler.max_steps = resume_max_steps
         resume_trainer = recipe_cls(cfg)
         resume_trainer.setup()
+        _report_phase("Phase 6: resume setup and checkpoint load complete; starting training")
         resume_trainer.run_train_validation_loop()
+        _report_phase("Phase 6: resumed training complete")
 
         # Compare losses at the overlapping steps
         resume_jsonl = checkpoint_dir / "training.jsonl"
@@ -1555,6 +1588,7 @@ def run_checkpoint_robustness(
         _release_recipe_memory(resume_trainer)
         del resume_trainer
         _barrier()
+        _report_phase("Phase 6: resume comparison complete")
 
     # Skip the atexit-registered destroy_process_group() call. MoE models with expert
     # parallelism create NCCL sub-groups (DeepEP) that leave pending collective state,
@@ -1570,6 +1604,7 @@ def run_checkpoint_robustness(
         raise AssertionError(
             "Checkpoint robustness completed with deferred failures:\n\n" + "\n\n".join(deferred_failures)
         )
+    _report_phase("All enabled phases complete")
 
 
 def test_checkpoint_robustness() -> None:
