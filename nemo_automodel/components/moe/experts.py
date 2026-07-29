@@ -485,12 +485,9 @@ class GroupedExperts(nn.Module):
         if active_local_experts == 0:
             dummy_x = torch.zeros_like(x[0]).unsqueeze(0)
             gate_and_up_out = dummy_x @ gate_and_up_projs[0]
-            dummy_weight = weights[0, 0, None].unsqueeze(0)
-            activation_weight = torch.ones_like(dummy_weight) if self.apply_router_weight_after_down else dummy_weight
-            activated = self.expert_activation_grouped(gate_and_up_out, activation_weight)
+            activated = self.expert_activation_grouped(gate_and_up_out, weights[0, 0, None].unsqueeze(0))
             expert_out = activated @ down_projs[0]
             if self.apply_router_weight_after_down:
-                expert_out = expert_out.float() * dummy_weight.float()
                 y[0, 0] += expert_out[0]
             else:
                 y[0] += expert_out[0]
@@ -578,12 +575,9 @@ class GroupedExperts(nn.Module):
         else:
             # Dummy computation for gradient flow
             output1 = torch.matmul(x[0] * 0, gate_and_up_projs[0])
-            dummy_weight = weights[0, 0, None].unsqueeze(0)
-            activation_weight = torch.ones_like(dummy_weight) if self.apply_router_weight_after_down else dummy_weight
-            output1_ = self.expert_activation_grouped(output1, activation_weight)
+            output1_ = self.expert_activation_grouped(output1, weights[0, 0, None].unsqueeze(0))
             output2 = torch.matmul(output1_, down_projs[0])
             if self.apply_router_weight_after_down:
-                output2 = output2.float() * dummy_weight.float()
                 y[0, 0] += output2[0]
             else:
                 y[0] += output2[0]
