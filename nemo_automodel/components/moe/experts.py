@@ -353,7 +353,7 @@ class GroupedExperts(nn.Module):
                 return torch.cat(gathered, dim=0)
 
             x = _all_gather_dim0_var(x, differentiable=True)
-            weights = _all_gather_dim0_var(weights.float(), differentiable=False)
+            weights = _all_gather_dim0_var(weights.float(), differentiable=True)
             indices = _all_gather_dim0_var(indices, differentiable=False)
             token_mask = _all_gather_dim0_var(token_mask, differentiable=False)
 
