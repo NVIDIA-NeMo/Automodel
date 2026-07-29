@@ -304,6 +304,9 @@ jobs:
             TORCH_REQUIREMENT="$(
               python scripts/cuda_wheelhouse_lock.py --output torch "${LOCK_ARGS[@]}"
             )"
+            TORCHVISION_REQUIREMENT="$(
+              python scripts/cuda_wheelhouse_lock.py --output torchvision "${LOCK_ARGS[@]}"
+            )"
             BUILD_TOOLS="$(
               python scripts/cuda_wheelhouse_lock.py --output build-tools "${LOCK_ARGS[@]}"
             )"
@@ -314,7 +317,11 @@ jobs:
               "${LOCK_ARGS[@]}" > "${CONSTRAINTS_FILE}"
 
             pip install --find-links "${PIP_FIND_LINKS}" "${BUILD_TOOL_REQUIREMENTS[@]}"
-            pip install --find-links "${PIP_FIND_LINKS}" --index-url ${TORCH_CU_INDEX} "${TORCH_REQUIREMENT}"
+            pip install \
+              --find-links "${PIP_FIND_LINKS}" \
+              --index-url "${TORCH_CU_INDEX}" \
+              "${TORCH_REQUIREMENT}" \
+              "${TORCHVISION_REQUIREMENT}"
             PIP_ARGS=(--no-build-isolation --constraint "${CONSTRAINTS_FILE}")
             export TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0"
           fi
