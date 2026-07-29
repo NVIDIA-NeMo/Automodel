@@ -20,6 +20,16 @@ import torch
 from transformers import DataCollatorWithPadding, PreTrainedTokenizerBase, ProcessorMixin
 from transformers.file_utils import PaddingStrategy
 
+from nemo_automodel.components.models.llama_nemotron_vl import LlamaNemotronVLProcessor
+from nemo_automodel.components.models.ministral_bidirectional import Mistral3BiEncoderProcessor
+
+MODELS_WITH_PROCESSOR = {
+    "llama_nemotron_vl": LlamaNemotronVLProcessor,
+    "mistral3": Mistral3BiEncoderProcessor,
+    "mistral3_bidirec": Mistral3BiEncoderProcessor,
+    "ministral3": Mistral3BiEncoderProcessor,
+    "ministral3_bidirec": Mistral3BiEncoderProcessor
+}
 
 def _doc_id_str_to_int64(doc_id: str) -> int:
     """Stable 63-bit int for corpus doc id strings (for in-batch duplicate masking)."""

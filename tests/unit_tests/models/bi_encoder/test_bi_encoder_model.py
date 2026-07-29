@@ -19,7 +19,7 @@ import torch
 
 import nemo_automodel._transformers.auto_model as am
 import nemo_automodel.recipes.retrieval.train_bi_encoder as tbe
-from nemo_automodel._transformers.retrieval import BiEncoderModel, CrossEncoderModel
+from nemo_automodel._transformers.retrieval import BiEncoderModel, CrossEncoderModel, _dummy_vision_sum
 from nemo_automodel.recipes.retrieval.train_bi_encoder import (
     TrainBiEncoderRecipe,
     distributed_maxsim_scores_and_labels,
@@ -91,6 +91,51 @@ class _ToyBackboneWithoutDummyFlag(torch.nn.Module):
         return _ToyBackboneOutput(hidden_state)
 
 
+class _ToyVisionBackboneWithoutDummyFlag(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.config = SimpleNamespace(name_or_path="")
+        self.vision_tower = torch.nn.Conv2d(3, 1, kernel_size=1, bias=False)
+        self.dummy_pixel_values = None
+        self.dummy_image_sizes = None
+
+    def get_image_features(self, pixel_values, image_sizes, return_dict=True):
+        self.dummy_pixel_values = pixel_values
+        self.dummy_image_sizes = image_sizes
+        return SimpleNamespace(pooler_output=(self.vision_tower(pixel_values),))
+
+    def forward(self, input_ids, attention_mask, return_dict=True, output_hidden_states=True):
+        hidden_state = input_ids.float().unsqueeze(-1).expand(*input_ids.shape, 2)
+        return _ToyBackboneOutput(hidden_state)
+
+
+class _ToyMistralLikeVisionTower(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.patch_size = (14, 16)
+
+
+class _ToyMistralLikeVisionBackbone(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.config = SimpleNamespace(name_or_path="", spatial_merge_size=2)
+        self.vision_tower = _ToyMistralLikeVisionTower()
+        self.dummy_pixel_values = None
+        self.dummy_image_sizes = None
+        self.merged_token_count = None
+
+    def get_image_features(self, pixel_values, image_sizes, return_dict=True):
+        self.dummy_pixel_values = pixel_values
+        self.dummy_image_sizes = image_sizes
+        patch_height, patch_width = self.vision_tower.patch_size
+        merged_height = image_sizes[0, 0].item() // (patch_height * self.config.spatial_merge_size)
+        merged_width = image_sizes[0, 1].item() // (patch_width * self.config.spatial_merge_size)
+        self.merged_token_count = merged_height * merged_width
+        if self.merged_token_count <= 1:
+            raise RuntimeError("dummy image must produce more than one merged token")
+        return SimpleNamespace(pooler_output=(pixel_values.sum().reshape(1),))
+
+
 def _apply_common_mocks(monkeypatch):
     """Mock CUDA-dependent infrastructure so tests run without a GPU."""
     monkeypatch.setattr(am, "instantiate_infrastructure", lambda **kwargs: (None, None, None, None))
@@ -148,6 +193,30 @@ def test_from_pretrained_happy_path(monkeypatch):
     assert last_kwargs["do_distributed_inbatch_negative"] is True
     assert last_kwargs["detach_distributed_inbatch_negatives"] is False
     assert last_kwargs["some_other_kwarg"] == "x"
+
+
+def test_from_pretrained_prefers_dtype_over_deprecated_torch_dtype_default(monkeypatch):
+    last_kwargs = {}
+
+    def fake_build(**kwargs):
+        nonlocal last_kwargs
+        last_kwargs = kwargs
+        return DummyModel()
+
+    _apply_common_mocks(monkeypatch)
+    monkeypatch.setattr(BiEncoderModel, "build", staticmethod(fake_build))
+    monkeypatch.setattr(am, "apply_model_infrastructure", lambda model, **kwargs: model)
+
+    model = am.NeMoAutoModelBiEncoder.from_pretrained(
+        pretrained_model_name_or_path="some/path",
+        dtype="bfloat16",
+        use_liger_kernel=False,
+        use_sdpa_patching=False,
+    )
+
+    assert isinstance(model, DummyModel)
+    assert last_kwargs["dtype"] == "bfloat16"
+    assert "torch_dtype" not in last_kwargs
 
 
 def _assert_retries_without_liger(monkeypatch, build_model_cls, auto_model_cls):
@@ -282,6 +351,37 @@ def test_bi_encoder_drops_run_dummy_vision_when_backbone_does_not_support_it():
 
     assert backbone.received_kwargs == {"return_dict": True, "output_hidden_states": True}
     assert embeddings.shape == (1, 2)
+
+
+def test_bi_encoder_runs_zero_contribution_dummy_vision_for_full_vlm_backbone():
+    backbone = _ToyVisionBackboneWithoutDummyFlag()
+    model = BiEncoderModel(backbone, pooling="avg", l2_normalize=False)
+    model.train()
+
+    embeddings = model(
+        {
+            "input_ids": torch.tensor([[1, 2]]),
+            "attention_mask": torch.tensor([[1, 1]]),
+            "run_dummy_vision": True,
+        }
+    )
+    embeddings.sum().backward()
+
+    assert embeddings.shape == (1, 2)
+    assert backbone.dummy_pixel_values.shape == (1, 3, 32, 32)
+    assert torch.equal(backbone.dummy_image_sizes, torch.tensor([[32, 32]]))
+    assert backbone.vision_tower.weight.grad is not None
+
+
+def test_dummy_vision_sum_uses_multiple_merged_tokens_for_mistral3_like_backbone():
+    backbone = _ToyMistralLikeVisionBackbone()
+
+    dummy_sum = _dummy_vision_sum(backbone)
+
+    assert dummy_sum is not None
+    assert backbone.dummy_pixel_values.shape == (1, 3, 56, 64)
+    assert torch.equal(backbone.dummy_image_sizes, torch.tensor([[56, 64]]))
+    assert backbone.merged_token_count == 4
 
 
 def test_maxsim_scores_and_labels_masks_padding_before_maxsim():

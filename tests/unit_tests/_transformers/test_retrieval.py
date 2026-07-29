@@ -15,6 +15,7 @@
 """Functional tests for retrieval backbone extraction."""
 
 import json
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest

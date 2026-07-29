@@ -47,6 +47,15 @@ def _extract_submodel(model: nn.Module, extract_submodel: str) -> PreTrainedMode
     return extracted_model
 
 
+def _get_submodule_parent_and_attr(model: nn.Module, submodule_path: str) -> tuple[nn.Module, str]:
+    """Return the parent module and final attribute name for a dotted submodule path."""
+    attrs = submodule_path.split(".")
+    parent = model
+    for attr in attrs[:-1]:
+        parent = getattr(parent, attr)
+    return parent, attrs[-1]
+
+
 def _get_supported_backbone_class(model_type: str, task: str) -> type[nn.Module] | None:
     """Return the registered retrieval backbone class for a model type and task."""
     task_map = SUPPORTED_BACKBONES.get(model_type.lower())
@@ -196,6 +205,66 @@ def tanh_int8_quantize(x: torch.Tensor) -> torch.Tensor:
     y = 127.0 * torch.tanh(x) + 0.5
     return _ste_floor(y)
 
+def _get_module_device_dtype(module: nn.Module) -> tuple[torch.device, torch.dtype]:
+    """Return a real device/dtype pair from a module's parameters or buffers."""
+    for parameter in module.parameters():
+        return parameter.device, parameter.dtype
+    for buffer in module.buffers():
+        return buffer.device, buffer.dtype
+    return torch.device("cpu"), torch.float32
+
+
+def _sum_nested_tensors(value) -> torch.Tensor | None:
+    """Sum tensors from nested model outputs so they can contribute a zero gradient."""
+    if isinstance(value, torch.Tensor):
+        return value.sum()
+    if isinstance(value, (list, tuple)):
+        total = None
+        for item in value:
+            item_sum = _sum_nested_tensors(item)
+            if item_sum is not None:
+                total = item_sum if total is None else total + item_sum
+        return total
+    return None
+
+
+def _dummy_vision_sum(model: nn.Module) -> torch.Tensor | None:
+    """Run a one-image dummy vision path for VLMs that expose get_image_features()."""
+    if not hasattr(model, "get_image_features") or not hasattr(model, "vision_tower"):
+        return None
+
+    vision_tower = model.vision_tower
+    device, dtype = _get_module_device_dtype(vision_tower)
+    patch_size = getattr(vision_tower, "patch_size", None)
+    if patch_size is None:
+        patch_size = getattr(getattr(vision_tower, "config", None), "patch_size", 16)
+    spatial_merge_size = getattr(getattr(model, "config", None), "spatial_merge_size", 1)
+    if isinstance(patch_size, (list, tuple)):
+        patch_height, patch_width = patch_size
+    else:
+        patch_height = patch_width = patch_size
+    if isinstance(spatial_merge_size, (list, tuple)):
+        spatial_merge_height, spatial_merge_width = spatial_merge_size
+    else:
+        spatial_merge_height = spatial_merge_width = spatial_merge_size
+
+    # HF Mistral3 squeezes projected image features; keep more than one merged token
+    # so that the token dimension survives before its split-by-image step.
+    image_height = int(patch_height) * int(spatial_merge_height) * 2
+    image_width = int(patch_width) * int(spatial_merge_width) * 2
+
+    dummy_pixels = torch.zeros(1, 3, image_height, image_width, device=device, dtype=dtype)
+    dummy_image_sizes = torch.tensor([[image_height, image_width]], device=device, dtype=torch.long)
+    dummy_outputs = model.get_image_features(
+        pixel_values=dummy_pixels,
+        image_sizes=dummy_image_sizes,
+        return_dict=True,
+    )
+    dummy_sum = _sum_nested_tensors(getattr(dummy_outputs, "pooler_output", None))
+    if dummy_sum is None:
+        dummy_sum = _sum_nested_tensors(dummy_outputs)
+    return dummy_sum
+
 
 def configure_encoder_metadata(model: PreTrainedModel, config) -> None:
     """Configure HuggingFace consolidated checkpoint metadata on a model.
@@ -278,13 +347,14 @@ def build_encoder_backbone(
         logger.info(f"Loading {model_name_or_path} with HuggingFace Auto classes to extract {extract_submodel}")
         model = AutoModel.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code, **hf_kwargs)
         extracted_model = _extract_submodel(model, extract_submodel)
-        return _build_backbone_from_extracted_submodel(
+        extracted_model = _build_backbone_from_extracted_submodel(
             extracted_model,
             task=task,
             pooling=pooling,
             num_labels=num_labels,
             temperature=temperature,
         )
+        return extracted_model    
 
     BidirectionalModelClass = _get_supported_backbone_class(model_type, task)
     if BidirectionalModelClass is not None:
@@ -351,6 +421,9 @@ _LLAMA_TASKS = {
     "embedding": "LlamaBidirectionalModel",
     "score": "LlamaBidirectionalForSequenceClassification",
 }
+_MISTRAL3_BIDIREC_TASKS = {
+    "embedding": "Mistral3BidirectionalModel",
+}
 _MINISTRAL3_BIDIREC_TASKS = {
     "embedding": "Ministral3BidirectionalModel",
 }
@@ -360,6 +433,8 @@ _LLAMA_NEMOTRON_VL_TASKS = {
 SUPPORTED_BACKBONES = {
     "llama": _LLAMA_TASKS,
     "llama_bidirec": _LLAMA_TASKS,
+    "mistral3": _MISTRAL3_BIDIREC_TASKS,
+    "mistral3_bidirec": _MISTRAL3_BIDIREC_TASKS,
     "ministral3": _MINISTRAL3_BIDIREC_TASKS,
     "ministral3_bidirec": _MINISTRAL3_BIDIREC_TASKS,
     "llama_nemotron_vl": _LLAMA_NEMOTRON_VL_TASKS,
@@ -468,6 +543,10 @@ class BiEncoderModel(nn.Module):
         model_inputs = {k: v for k, v in input_dict.items() if k not in ["kd_labels", "run_dummy_vision"]}
         if "run_dummy_vision" in forward_args and "run_dummy_vision" in input_dict:
             model_inputs["run_dummy_vision"] = input_dict["run_dummy_vision"]
+        dummy_vision_sum = None
+        if "run_dummy_vision" not in forward_args and input_dict.get("run_dummy_vision") is not False:
+            if self.training and model_inputs.get("pixel_values") is None:
+                dummy_vision_sum = _dummy_vision_sum(self.model)
 
         outputs = self.model(
             **model_inputs,
@@ -479,6 +558,8 @@ class BiEncoderModel(nn.Module):
             hidden_state = outputs.last_hidden_state
         else:
             hidden_state = outputs.hidden_states[-1]
+        if dummy_vision_sum is not None:
+            hidden_state = hidden_state + dummy_vision_sum.to(hidden_state.dtype) * 0.0
 
         embeds = pool(
             last_hidden_states=hidden_state,

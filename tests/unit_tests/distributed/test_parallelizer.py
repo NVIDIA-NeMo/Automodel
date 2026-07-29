@@ -2627,6 +2627,33 @@ class TestExtractModelLayers:
         assert len(groups["language"]) == 3
         assert result == groups["language"]
 
+    def test_retrieval_wrapper_unwraps_private_mistral3_vdr_layers(self):
+        """The private Mistral3 VDR wrapper exposes language and vision layers."""
+
+        class Mistral3BidirectionalModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.language_model = nn.Module()
+                self.language_model.layers = nn.ModuleList([_FakeLayer() for _ in range(4)])
+                self.vision_tower = nn.Module()
+                self.vision_tower.transformer = nn.Module()
+                self.vision_tower.transformer.layers = nn.ModuleList([_FakeLayer() for _ in range(2)])
+
+        class BiEncoderModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = Mistral3BidirectionalModel()
+
+        model = BiEncoderModel()
+
+        groups = _extract_model_layer_groups(model)
+        result = _extract_model_layers(model)
+
+        assert set(groups) == {"language", "vision"}
+        assert len(groups["language"]) == 4
+        assert len(groups["vision"]) == 2
+        assert result == groups["language"] + groups["vision"]
+
     def test_activation_checkpointing_scope_filtering(self):
         language = [_FakeLayer(), _FakeLayer()]
         vision = [_FakeLayer()]
