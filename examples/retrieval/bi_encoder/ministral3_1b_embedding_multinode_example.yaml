@@ -198,7 +198,7 @@ lr_scheduler:
 
 checkpoint:
   enabled: true
-  checkpoint_dir: /lustre/fsw/portfolios/datascience/users/gmoreira/model_checkpoints/ministral3_1b_vl/ministral3_1b_all_fsdp2_lr1e5_stage2_image_text_20260728_v3
+  checkpoint_dir: .outputs/ministral3_1b_all_fsdp2_lr1e5_stage2_image_text_20260728_v3
   model_save_format: safetensors
   save_consolidated: final
   #restore_from: /lustre/fsw/portfolios/datascience/users/gmoreira/model_checkpoints/ministral3_3b_vl/ministral3_3b_fp8_ac_all_fsdp2_lr2e6-20260713/epoch_0_step_1856
@@ -218,6 +218,6 @@ wandb:
   project: Inform-simlm-embedding
   entity: nvidia-merlin
   name: ministral3_1b_vl_encoder_multinode_ac_all_fsdp2_3rd_round_image_text_lr1e5-20260721_v1
-  enable: true
+  enable: false
 #   save_dir: <your_wandb_save_dir> 
 
