@@ -1331,16 +1331,18 @@ class TestMoE:
     def test_moe_forwards_dispatcher_config_to_experts(self, moe_config, backend_config):
         """MoE should pass BackendConfig dispatcher knobs to flex dispatcher experts."""
         backend_config.experts = "torch_mm"
-        backend_config.dispatcher = "deepep"
+        backend_config.dispatcher = "deepep_v2"
         backend_config.dispatcher_num_sms = 12
+        backend_config.dispatcher_num_qps = 65
         backend_config.dispatcher_share_token_dispatcher = False
         backend_config.dispatcher_async_dispatch = True
         with patch("nemo_automodel.components.moe.layers.get_world_size_safe", return_value=2):
             moe = MoE(moe_config, backend_config)
 
         assert isinstance(moe.experts, GroupedExpertsDeepEP)
-        assert moe.experts.dispatcher_backend == "deepep"
+        assert moe.experts.dispatcher_backend == "deepep_v2"
         assert moe.experts.dispatcher_num_sms == 12
+        assert moe.experts.dispatcher_num_qps == 65
         assert moe.experts.dispatcher_share_token_dispatcher is False
         assert moe.experts.dispatcher_async_dispatch is True
 

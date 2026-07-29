@@ -639,7 +639,8 @@ class MoE(nn.Module):
             self.gate = FakeBalancedGate(config, noise=backend.fake_gate_noise)
         else:
             self.gate = Gate(config, gate_precision=backend.gate_precision)
-        if backend.dispatcher in ("deepep", "hybridep", "uccl_ep") and get_world_size_safe() == 1:
+        ep_dispatchers = ("deepep", "deepep_v2", "hybridep", "uccl_ep")
+        if backend.dispatcher in ep_dispatchers and get_world_size_safe() == 1:
             warnings.warn(
                 f"'{backend.dispatcher}' dispatcher is enabled in config, but world size is 1. "
                 "Expert parallelism requires multiple GPUs. Falling back to standard GroupedExperts.",
@@ -647,13 +648,14 @@ class MoE(nn.Module):
                 stacklevel=2,
             )
             self.experts = GroupedExperts(config, backend=backend)
-        elif backend.dispatcher in ("deepep", "hybridep", "uccl_ep"):
+        elif backend.dispatcher in ep_dispatchers:
             if backend.experts in ("gmm", "torch_mm", "torch_mm_mxfp8"):
                 self.experts = GroupedExpertsDeepEP(
                     config,
                     backend=backend,
                     dispatcher_backend=backend.dispatcher,
                     dispatcher_num_sms=backend.dispatcher_num_sms,
+                    dispatcher_num_qps=backend.dispatcher_num_qps,
                     dispatcher_share_token_dispatcher=backend.dispatcher_share_token_dispatcher,
                     dispatcher_async_dispatch=backend.dispatcher_async_dispatch,
                 )
@@ -664,6 +666,7 @@ class MoE(nn.Module):
                     backend=backend,
                     dispatcher_backend=backend.dispatcher,
                     dispatcher_num_sms=backend.dispatcher_num_sms,
+                    dispatcher_num_qps=backend.dispatcher_num_qps,
                     dispatcher_share_token_dispatcher=backend.dispatcher_share_token_dispatcher,
                     dispatcher_async_dispatch=backend.dispatcher_async_dispatch,
                 )

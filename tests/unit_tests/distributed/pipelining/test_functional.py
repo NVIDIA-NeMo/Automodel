@@ -927,8 +927,12 @@ class TestPrecomputeStageShapes:
 
         mock_stage1 = self._make_stage(is_first=True, is_last=False, has_lm_head=False)
         mock_stage2 = self._make_stage(is_first=False, is_last=True, has_lm_head=True)
-        mock_split_stages.return_value = ([mock_stage1, mock_stage2], [Mock(), Mock()])
+        mock_split_stages.return_value = (
+            [mock_stage1, mock_stage2],
+            [mock_stage1.submod, mock_stage2.submod],
+        )
         mock_build_schedule.return_value = Mock()
+        mock_parallelize_fn = Mock(side_effect=lambda model_part, **_kwargs: model_part)
 
         pipeline_model(
             model=mock_model,
@@ -943,6 +947,7 @@ class TestPrecomputeStageShapes:
             local_batch_size=8,
             device=torch.device("cuda:0"),
             seq_len=16,
+            parallelize_fn=mock_parallelize_fn,
         )
 
         # Verify shapes were precomputed
@@ -950,6 +955,7 @@ class TestPrecomputeStageShapes:
         assert mock_stage1.inputs_meta[0].shape == (2, 16)  # input_ids for first stage
         assert mock_stage2.inputs_meta is not None
         assert mock_stage2.inputs_meta[0].shape == (2, 16, 64)  # hidden_states
+        assert all(call.kwargs["num_max_tokens_per_rank"] == 32 for call in mock_parallelize_fn.call_args_list)
         mock_warmup_neighbors.assert_called_once_with(mock_stage1)
 
     @patch("nemo_automodel.components.distributed.pipelining.functional.split_model_into_stages")

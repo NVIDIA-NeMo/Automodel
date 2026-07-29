@@ -49,6 +49,9 @@ distributed:
   sequence_parallel: false
   activation_checkpointing: true
 
+  moe:
+    wrap_outer_model: false
+
   pipeline:
     pp_schedule: interleaved1f1b
     pp_microbatch_size: 2
@@ -76,6 +79,7 @@ model:
     rope_fusion: true
     experts: gmm
     dispatcher: deepep
+    dispatcher_num_sms: 20
     fake_balanced_gate: true
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true

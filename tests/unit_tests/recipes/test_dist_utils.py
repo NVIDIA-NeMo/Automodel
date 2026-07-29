@@ -696,6 +696,55 @@ class TestCreateDistributedSetupFromConfigWorldSizeAutoDetect:
         assert result.strategy_config.activation_checkpointing is False
         assert result.activation_checkpointing is True
 
+    def test_non_pp_moe_token_capacity_is_inferred(self, patched_mesh):
+        result = create_distributed_setup_from_config(
+            ConfigNode(
+                {
+                    "distributed": {"strategy": "fsdp2", "ep_size": 8, "moe": {}},
+                    "step_scheduler": {"local_batch_size": 4},
+                    "dataset": {"seq_len": 4096},
+                }
+            ),
+            world_size=8,
+        )
+
+        assert result.moe_parallel_config.num_max_tokens_per_rank == 16384
+
+    def test_non_pp_moe_token_capacity_uses_packed_sequence_size(self, patched_mesh):
+        result = create_distributed_setup_from_config(
+            ConfigNode(
+                {
+                    "distributed": {"strategy": "fsdp2", "ep_size": 8, "moe": {}},
+                    "step_scheduler": {"local_batch_size": 2},
+                    "packed_sequence": {"packed_sequence_size": 4096},
+                    "dataset": {"seq_len": 8192},
+                }
+            ),
+            world_size=8,
+        )
+
+        assert result.moe_parallel_config.num_max_tokens_per_rank == 8192
+
+    def test_pp_moe_token_capacity_is_left_to_pipeline(self, patched_mesh):
+        result = create_distributed_setup_from_config(
+            ConfigNode(
+                {
+                    "distributed": {
+                        "strategy": "fsdp2",
+                        "ep_size": 8,
+                        "pp_size": 2,
+                        "pipeline": {},
+                        "moe": {},
+                    },
+                    "step_scheduler": {"local_batch_size": 4},
+                    "dataset": {"seq_len": 4096},
+                }
+            ),
+            world_size=16,
+        )
+
+        assert result.moe_parallel_config.num_max_tokens_per_rank is None
+
     def test_top_level_dist_env_timeout_passed_to_mesh(self, patched_mesh):
         create_distributed_setup_from_config(
             {

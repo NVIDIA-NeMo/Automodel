@@ -17,7 +17,11 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from nemo_automodel.components.moe.megatron.token_dispatcher import _HybridEPManager
+from nemo_automodel.components.moe.megatron.token_dispatcher import (
+    MoEFlexTokenDispatcher,
+    TokenDispatcherConfig,
+    _HybridEPManager,
+)
 
 
 @pytest.fixture
@@ -98,3 +102,64 @@ class TestIndicesToMultihot:
         assert routing_map.shape == (1, 8)
         assert routing_map.sum() == 2
         assert routing_map[0, 0] and routing_map[0, 7]
+
+
+class _FakeGroup:
+    def size(self):
+        return 2
+
+
+class _FakeDeepepManager:
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+
+@pytest.fixture
+def reset_deepep_dispatcher_state(monkeypatch):
+    from nemo_automodel.components.moe.megatron import token_dispatcher
+
+    v2_dispatch = object()
+    v2_combine = object()
+    v2_num_qps = []
+    monkeypatch.setattr(MoEFlexTokenDispatcher, "shared_deepep_manager", None)
+    monkeypatch.setattr(MoEFlexTokenDispatcher, "shared_deepep_v2_manager", None)
+    monkeypatch.setattr(token_dispatcher, "_DeepepManager", _FakeDeepepManager)
+    monkeypatch.setattr(token_dispatcher, "deepep_v2_fused_dispatch", v2_dispatch)
+    monkeypatch.setattr(token_dispatcher, "deepep_v2_fused_combine", v2_combine)
+    monkeypatch.setattr(token_dispatcher, "set_deepep_num_sms", lambda _num_sms: None)
+    monkeypatch.setattr(token_dispatcher, "set_deepep_v2_num_sms", lambda _num_sms: None)
+    monkeypatch.setattr(token_dispatcher, "set_deepep_v2_num_qps", v2_num_qps.append)
+    return v2_dispatch, v2_combine, v2_num_qps
+
+
+def _build_dispatcher(backend: str) -> MoEFlexTokenDispatcher:
+    config = TokenDispatcherConfig(
+        moe_flex_dispatcher_backend=backend,
+        moe_router_topk=2,
+        num_moe_experts=8,
+        moe_deepep_num_qps=33,
+        moe_share_token_dispatcher=False,
+    )
+    return MoEFlexTokenDispatcher(
+        num_local_experts=4,
+        local_expert_indices=[0, 1, 2, 3],
+        config=config,
+        ep_group=_FakeGroup(),
+    )
+
+
+class TestMoEFlexTokenDispatcherDeepEPSelection:
+    def test_deepep_uses_legacy_manager(self, reset_deepep_dispatcher_state):
+        dispatcher = _build_dispatcher("deepep")
+
+        assert isinstance(dispatcher._comm_manager, _FakeDeepepManager)
+        assert "_dispatch_fn" not in dispatcher._comm_manager.kwargs
+
+    def test_deepep_v2_uses_elastic_manager(self, reset_deepep_dispatcher_state):
+        v2_dispatch, v2_combine, v2_num_qps = reset_deepep_dispatcher_state
+        dispatcher = _build_dispatcher("deepep_v2")
+
+        assert isinstance(dispatcher._comm_manager, _FakeDeepepManager)
+        assert dispatcher._comm_manager.kwargs["_dispatch_fn"] is v2_dispatch
+        assert dispatcher._comm_manager.kwargs["_combine_fn"] is v2_combine
+        assert v2_num_qps == [33]

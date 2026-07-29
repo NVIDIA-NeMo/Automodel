@@ -69,6 +69,7 @@ class ParallelizeFnProtocol(Protocol):
         tp_axis_name: str | None = None,
         ep_axis_name: str | None = None,
         ep_shard_axis_names: tuple[str, ...] | None = None,
+        num_max_tokens_per_rank: int | None = None,
     ) -> None: ...
 
 
@@ -907,6 +908,7 @@ def pipeline_model(
                 tp_axis_name=tp_axis_name,
                 ep_axis_name=ep_axis_name,
                 ep_shard_axis_names=ep_shard_axis_names,
+                num_max_tokens_per_rank=microbatch_size * seq_len if seq_len is not None else None,
             )
             model_parts[i] = m
             stages[i].submod = m
