@@ -986,7 +986,10 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             cp_zigzag=bool(recipe_cfg.get("cp_zigzag", False)),
         )
         _validate_tp_gates(tp_size, backend, cp_size)
-        if draft_base_config.model_type == KIMI_K3_MODEL_TYPE:
+        # ``draft_base_config`` is None on the paths that never build a draft
+        # (the non-colocated backends dispatch before reading it), so the K3
+        # gate has to tolerate its absence.
+        if getattr(draft_base_config, "model_type", None) == KIMI_K3_MODEL_TYPE:
             _validate_kimi_k3_gates(
                 backend=backend,
                 cp_size=cp_size,
