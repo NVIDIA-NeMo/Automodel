@@ -54,29 +54,6 @@ def apply_rotary_emb(
         return torch.cat((o1, o2), dim=-1)
 
 
-def _apply_rotary_emb_qk_torch(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
-
-
-@functools.cache
-def _get_compiled_rotary_emb_qk():
-    """Compile RoPE without changing eager BF16 rounding."""
-    try:
-        return torch.compile(
-            _apply_rotary_emb_qk_torch,
-            fullgraph=True,
-            dynamic=False,
-            options={"emulate_precision_casts": True},
-        )
-    except (RuntimeError, TypeError):
-        return _apply_rotary_emb_qk_torch
-
-
 class RotaryEmbedding(torch.nn.Module):
     def __init__(
         self,
@@ -200,9 +177,9 @@ def apply_rotary_emb_qk(
         return q, k
     else:
         cos, sin = freqs_cis.split(freqs_cis.shape[-1] // 2, dim=-1)
-        if q.is_cuda:
-            return _get_compiled_rotary_emb_qk()(q, k, cos, sin)
-        return _apply_rotary_emb_qk_torch(q, k, cos, sin)
+        q = apply_rotary_emb(q, cos, sin)
+        k = apply_rotary_emb(k, cos, sin)
+        return q, k
 
 
 @torch.no_grad()
