@@ -785,6 +785,7 @@ def apply_fsdp(
             _out.weight = _inp.weight
 
     embed_tokens = getattr(_model, "embed_tokens", None)
+    embed_norm = getattr(_model, "embed_norm", None)
     inner_lm_head = getattr(_model, "lm_head", None)
     outer_lm_head = getattr(model, "lm_head", None) if model is not _model else None
     lm_head = inner_lm_head or outer_lm_head
@@ -793,6 +794,10 @@ def apply_fsdp(
 
     if embed_tokens is not None and not tied_input_output_embeddings:
         fully_shard_default(embed_tokens)
+
+    # The outer VLM forward calls embed_norm before the text FSDP root.
+    if embed_norm is not None:
+        fully_shard_default(embed_norm)
 
     if lm_head is not None and not tied_input_output_embeddings:
         # Use custom mixed precision policy for lm_head if lm_head_precision is specified

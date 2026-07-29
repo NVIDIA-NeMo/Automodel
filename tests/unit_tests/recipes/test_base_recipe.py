@@ -96,16 +96,18 @@ def _patch_checkpoint_ops(monkeypatch):
                 return
             model.load_state_dict(torch.load(os.path.join(model_path, "model.pt"), weights_only=False))
 
-        def save_optimizer(self, optimizer, model, weights_path, scheduler=None):
+        def save_optimizer(self, optimizer, model, weights_path, scheduler=None, *, optimizer_part_ids=None):
             """Save optimizer state dict."""
+            del model, optimizer_part_ids
             if optimizer is None:
                 return
             optim_dir = os.path.join(weights_path, "optim")
             os.makedirs(optim_dir, exist_ok=True)
             torch.save(optimizer.state_dict(), os.path.join(optim_dir, "optimizer.pt"))
 
-        def load_optimizer(self, optimizer, model, weights_path, scheduler=None):
+        def load_optimizer(self, optimizer, model, weights_path, scheduler=None, *, optimizer_part_ids=None):
             """Load optimizer state dict."""
+            del model, scheduler, optimizer_part_ids
             if optimizer is None:
                 return
             optim_path = os.path.join(weights_path, "optim")
@@ -280,6 +282,20 @@ def test_dp_allreduce_uses_world_group_without_device_mesh(tmp_path, monkeypatch
     assert len(calls) == 1
     assert calls[0][0] == torch.distributed.ReduceOp.SUM
     assert calls[0][1] is None
+
+
+def test_optimizer_checkpoint_part_ids_use_global_pipeline_stage_indices(tmp_path):
+    recipe_inst = _ToyRecipe(tmp_path)
+    recipe_inst.pp = SimpleNamespace(
+        info=SimpleNamespace(
+            stages=[
+                SimpleNamespace(stage_index=3),
+                SimpleNamespace(stage_index=11),
+            ]
+        )
+    )
+
+    assert recipe_inst._get_optimizer_checkpoint_part_ids() == [3, 11]
 
 
 def test_find_latest_checkpoint(tmp_path):
