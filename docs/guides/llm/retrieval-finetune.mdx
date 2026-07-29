@@ -303,7 +303,6 @@ distributed:
 ```
 
 For a cross-encoder, change `recipe`, `model._target_`, `dataset.model_type`, and `dataloader.collate_fn`
-to the cross-encoder values shown below. Also set `model.num_labels: 1`, set the loss temperature under
 to the cross-encoder values in the following example. Also set `model.num_labels: 1`, set the loss temperature under
 `model.temperature`, replace `q_max_len` and `p_max_len` with `rerank_max_length` in the collator, and use a separate
 `checkpoint.checkpoint_dir` such as `./output/llama3_2_1b_cross_encoder/checkpoints`.
@@ -534,10 +533,6 @@ for RAG candidate generation, evaluate against a fixed held-out corpus and qrels
 
 AutoModel does not currently provide a one-command full-corpus retrieval evaluator in this guide. Use your existing
 information retrieval evaluation stack or a small script around the consolidated checkpoint. Report enough run details
-to make the result repeatable: query count, corpus size, qrels source, judged and unjudged handling, exact versus ANN
-search settings, K values, baseline checkpoint, and whether you used confidence intervals or significance tests. At
-minimum, make these script inputs explicit: a consolidated bi-encoder checkpoint, a corpus table with stable document
-IDs, a query table with stable query IDs, qrels keyed by those IDs, the query and passage prefixes and maximum lengths,
 to make the result repeatable. Include the query count, corpus size, qrels source, judged and unjudged handling, exact
 or ANN search settings, K values, and baseline checkpoint. State whether you used confidence intervals or significance
 tests. At minimum, specify a consolidated bi-encoder checkpoint, corpus and query tables with stable IDs, and qrels
@@ -558,9 +553,6 @@ but might not update during a short basic verification test:
 tail -f ./output/llama3_2_1b_encoder/checkpoints/training.jsonl
 ```
 
-Use standard output and error as the live per-step signals today. Watch `loss`, `grad_norm`, learning rate, GPU
-memory, and step time
-before scaling to a longer run. On preempted or timed-out jobs, recent buffered JSONL metrics may be missing even when
 Use standard output and error as the live per-step signals today. Watch `loss`, `grad_norm`, learning rate, GPU memory,
 and step time before scaling to a longer run. On preempted or timed-out jobs, recent buffered JSONL metrics might be
 missing even when standard output and error showed them.
@@ -754,10 +746,8 @@ direct Hugging Face and mining loads expect a real exported model path. If your 
 symlink, read that file and substitute the resolved checkpoint directory before calling `from_pretrained()` or
 `mine_hard_negatives.py`.
 
-PEFT/LoRA runs save adapter artifacts under the checkpoint `model/` directory instead of the full consolidated export
-path above. Resume LoRA training from the AutoModel checkpoint directory. If you need a standalone checkpoint for
-PEFT runs using LoRA save adapter artifacts under the checkpoint `model/` directory instead of the previously described full
-consolidated export path. Resume LoRA training from the AutoModel checkpoint directory. If you need a standalone
+PEFT runs using LoRA save adapter artifacts under the checkpoint `model/` directory instead of the previously described
+full consolidated export path. Resume LoRA training from the AutoModel checkpoint directory. If you need a standalone
 checkpoint for inference or mining, first produce a Hugging Face-loadable merged encoder with your adapter workflow.
 
 The `LATEST` symlink points to the most recent checkpoint when it is valid. To resume from the latest resolved

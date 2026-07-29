@@ -1,9 +1,5 @@
 # Fine-Tune the Llama Nemotron VL 1B Embedding Model
 
-This example shows how to fine-tune an embedding model for visual document retrieval:
-[nvidia/llama-nemotron-embed-vl-1b-v2](https://huggingface.co/nvidia/llama-nemotron-embed-vl-1b-v2). The model can
-embed document pages as image, text, or combined image-text inputs. Documents can be retrieved given a user query in
-text form. The model supports page images containing text, tables, charts, and infographics. Review the model's
 This example shows how to fine-tune the
 [nvidia/llama-nemotron-embed-vl-1b-v2](https://huggingface.co/nvidia/llama-nemotron-embed-vl-1b-v2)
 model for visual document retrieval. The model embeds document pages supplied
@@ -38,7 +34,6 @@ details, refer to the
       "neg_doc": [
         {"id": "69560"},
         {"id": "112685"},
-        {"id": "5132"}, ...
         {"id": "5132"}
       ]
     }
@@ -49,24 +44,24 @@ details, refer to the
 The `corpus` path points to a directory that contains the corpus in Parquet format, with a field for the document ID.
 The `data` key contains the training samples for contrastive learning: the question, positive samples (`pos_doc`), and
 negative samples (`neg_doc`). The positive and negative samples are document IDs from the corpus and can represent
-document page images or chunks of text (passages).
+document page images or text passages.
 
 ### Prepare the ColPali Source Data
 
 Run
 [`prepare_dataset_for_vdr/convert_colpali_dataset_for_training.ipynb`](../prepare_dataset_for_vdr/convert_colpali_dataset_for_training.ipynb)
-to prepare the ColPali example. The notebook:
+to prepare the ColPali example. The notebook performs the following tasks:
 
-1. Downloads a [train set](https://huggingface.co/datasets/Tevatron/colpali) with mined hard negatives and its
+1. Downloads a [training set](https://huggingface.co/datasets/Tevatron/colpali) with mined hard negatives and its
    [corpus](https://huggingface.co/datasets/Tevatron/colpali-corpus).
 2. Writes the corpus as local Parquet shards and writes `colpali_train.json` in AutoModel's corpus ID-based schema.
 
-These files are the source data for both loading paths below. The notebook does not create normalized Arrow; that is a
-separate CPU preparation step for full-scale training.
+These files are the source data for both loading methods in this guide. The notebook does not create normalized Arrow
+data. That process is a separate CPU preparation step for full-scale training.
 
 After the notebook finishes, open [`nemotron_vl_1b_example.yaml`](nemotron_vl_1b_example.yaml) and replace the ColPali
 path in `dataset.data_dir_list` with the generated `colpali_train.json` path. The example also includes the
-[MIRACL train set](https://huggingface.co/datasets/nvidia/embed-nemotron-dataset-v1/viewer/MIRACL) for multilingual
+[MIRACL training set](https://huggingface.co/datasets/nvidia/embed-nemotron-dataset-v1/viewer/MIRACL) for multilingual
 text retrieval. Use `num_samples` to control how many examples to load from each source.
 
 ### Choose How Training Loads the Prepared Data
@@ -110,12 +105,12 @@ dataset:
   n_passages: 5
 ```
 
-Starting GPU training directly from a large image corpus can leave every allocated GPU waiting while the corpus is
-loaded and its dataset cache is built. Normalizing on CPU moves that work before the GPU allocation.
+Starting GPU training directly from a large image corpus can leave every allocated GPU waiting while the corpus loads
+and its dataset cache builds. Normalizing on CPU completes that work before GPU allocation.
 
 #### Load the Source Data Directly for Small Runs
 
-For a small verification run or a small dataset, skip normalization and keep the original dataset config. It reads the
+For a small verification run or dataset, skip normalization and keep the original dataset config. The loader reads the
 notebook's JSON and corpus files directly:
 
 ```yaml
@@ -131,8 +126,8 @@ dataset:
   n_passages: 5
 ```
 
-The direct path is usually sufficient for text-only retrieval. If its initial startup is slow, the retrieval data tools
-also provide a CPU cache-warming script that keeps this dataset configuration unchanged.
+The direct path is usually sufficient for text-only retrieval. If startup is slow, the retrieval data tools also provide
+a CPU cache-warming script that keeps this dataset config unchanged.
 
 If you have a Weights & Biases (W&B) account, configure the YAML file to log training metrics during training:
 
@@ -154,9 +149,10 @@ multi-node training on a Slurm cluster, use `sbatch`.
 torchrun --nproc-per-node=8 examples/retrieval/bi_encoder/finetune.py --config examples/retrieval/bi_encoder/nemotron_vl_1b/nemotron_vl_1b_example.yaml
 ```
 
-The default batch settings use one local batch on each of eight GPUs, so they do not use gradient accumulation and
-thus `distributed.static_graph: true` is appropriate. If you reduce the GPU count without reducing `global_batch_size`,
-the resulting run uses more than one gradient accumulation step. Update the DDP settings as follows:
+The default batch settings use one local batch on each of eight GPUs, so gradient accumulation is disabled and
+`distributed.static_graph: true` is appropriate. If you reduce the GPU count without reducing `global_batch_size`, the
+resulting run uses more than one gradient accumulation step. Update the distributed data parallel (DDP) settings as
+follows:
 
 ```yaml
 distributed:
