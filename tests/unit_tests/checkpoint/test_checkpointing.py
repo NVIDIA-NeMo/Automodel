@@ -16,11 +16,13 @@ import io
 import json
 import logging
 import os
+import random
 from contextlib import ExitStack
 from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
+import numpy as np
 import pytest
 import torch
 import torch.distributed.checkpoint as dcp
@@ -47,6 +49,7 @@ from nemo_automodel.components.checkpoint.checkpointing import (
     _ensure_dirs,
     _equally_divide_layers,
     _is_custom_model,
+    _load_hf_bin_checkpoint,
     _maybe_adapt_state_dict_to_hf,
     _model_has_dtensors,
     _new_gloo_process_group,
@@ -67,6 +70,7 @@ from nemo_automodel.components.checkpoint.utils import (
     has_local_tied_lm_head,
     materialize_missing_tied_lm_head,
 )
+from nemo_automodel.components.training.rng import RNGState, StatefulRNG, init_all_rng
 
 CLOUD_PATH_MODEL = "msc://bucket/step-100/model"
 CLOUD_PATH_OPTIM = "msc://bucket/step-100/optim"
@@ -132,6 +136,35 @@ class TestGemma4UnifiedHFExportKeys:
 
         with pytest.raises(ValueError, match="HF export key collision"):
             _maybe_adapt_state_dict_to_hf(model, state_dict)
+
+
+def test_load_on_dp_ranks_requires_opt_in_for_legacy_rng_state(tmp_path):
+    """Legacy RNG checkpoints restore only with the trusted-pickle opt-in."""
+    init_all_rng(123)
+    legacy_state = RNGState(
+        random_rng_state=random.getstate(),
+        np_rng_state=np.random.get_state(),
+        torch_rng_state=torch.get_rng_state(),
+        cuda_rng_state=torch.cuda.get_rng_state_all(),
+    )
+    expected = (random.random(), np.random.rand(), torch.rand(1).item())
+    state_dir = tmp_path / "rng"
+    state_dir.mkdir()
+    torch.save(legacy_state, state_dir / "rng_dp_rank_0.pt")
+
+    rng = StatefulRNG(999)
+    restricted = CheckpointingConfig(checkpoint_dir=tmp_path, save_consolidated=False).build(0, 0, 0)
+    with pytest.raises(RuntimeError, match="Refusing to load torch artifact"):
+        restricted.load_on_dp_ranks(rng, "rng", str(tmp_path))
+
+    legacy = CheckpointingConfig(
+        checkpoint_dir=tmp_path,
+        save_consolidated=False,
+        allow_legacy_pickle_restore=True,
+    ).build(0, 0, 0)
+    legacy.load_on_dp_ranks(rng, "rng", str(tmp_path))
+
+    assert (random.random(), np.random.rand(), torch.rand(1).item()) == expected
 
 
 class TestConsolidationProcessGroup:
@@ -1223,6 +1256,27 @@ class TestModelHasDtensors:
         """If all parameters are regular tensors, returns False."""
         model = torch.nn.Sequential(torch.nn.Linear(4, 4), torch.nn.Linear(4, 4))
         assert _model_has_dtensors(model) is False
+
+
+def test_load_hf_bin_checkpoint_loads_tensor_state_dict(tmp_path):
+    """Hugging Face bin checkpoints load when they contain tensor state."""
+    checkpoint_path = tmp_path / "pytorch_model.bin"
+    expected = {"weight": torch.arange(4)}
+    torch.save(expected, checkpoint_path)
+
+    actual = _load_hf_bin_checkpoint(str(checkpoint_path))
+
+    assert actual is not None
+    torch.testing.assert_close(actual["weight"], expected["weight"])
+
+
+def test_load_hf_bin_checkpoint_rejects_pickled_module(tmp_path):
+    """Hugging Face bin loading rejects arbitrary pickled Python objects."""
+    checkpoint_path = tmp_path / "pytorch_model.bin"
+    torch.save(torch.nn.Linear(2, 2), checkpoint_path)
+
+    with pytest.raises(RuntimeError, match="Refusing to load torch artifact"):
+        _load_hf_bin_checkpoint(str(checkpoint_path))
 
 
 # =============================================================================
@@ -2600,8 +2654,8 @@ class TestSkipInitWeightsOnLoadGate:
         model.initialize_weights.assert_called_once()
 
 
-class TestConsolidatedIndexUnderPPWithoutSourceIndex:
-    """_maybe_build_consolidated_index else-branch (NVIDIA-NeMo/Automodel#1512)."""
+class TestConsolidatedIndexUnderPP:
+    """Global consolidated-index construction under pipeline parallelism."""
 
     def _make_checkpointer(self, tmp_path):
         # empty_cache is created but contains no HF snapshot directory, so
@@ -2701,6 +2755,97 @@ class TestConsolidatedIndexUnderPPWithoutSourceIndex:
                 if idx in indices_for_this_rank:
                     consolidated_keys.add(fqn)
         assert consolidated_keys == set(global_pre_shard_keys)
+
+    @pytest.mark.run_only_on("CPU")
+    def test_source_index_adds_adapter_created_keys_from_global_pre_shard_state(self, tmp_path):
+        """Every PP rank maps adapter-created keys that are absent from the source index."""
+        checkpointer = self._make_checkpointer(tmp_path)
+        source_mapping = {
+            "language_model.model.embed_tokens.weight": 1,
+            "language_model.model.layers.15.mlp.gate.weight": 2,
+        }
+        injected_bias = "language_model.model.layers.15.mlp.gate.e_score_correction_bias"
+        global_pre_shard_keys = [*source_mapping, injected_bias]
+        per_rank_state_dicts = [
+            {"language_model.model.embed_tokens.weight": torch.empty(0)},
+            {
+                "language_model.model.layers.15.mlp.gate.weight": torch.empty(0),
+                injected_bias: torch.empty(0),
+            },
+        ]
+        model_state = self._fake_model_state(global_pre_shard_keys)
+
+        with (
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._get_hf_safetensors_reference_path",
+                return_value="/fake/reference",
+            ),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing.get_fqn_to_file_index_mapping",
+                side_effect=lambda *_args, **_kwargs: dict(source_mapping),
+            ),
+        ):
+            per_rank_mappings = [
+                checkpointer._maybe_build_consolidated_index(model_state, state_dict)
+                for state_dict in per_rank_state_dicts
+            ]
+
+        expected_mapping = {**source_mapping, injected_bias: 2}
+        assert per_rank_mappings == [expected_mapping, expected_mapping]
+
+    @pytest.mark.run_only_on("CPU")
+    def test_source_index_preserves_key_registered_after_parallelization(self, tmp_path):
+        """The live state dict supplements global keys for parameters registered after setup."""
+        checkpointer = self._make_checkpointer(tmp_path)
+        source_mapping = {"model.embed_tokens.weight": 1}
+        model_state = self._fake_model_state(list(source_mapping))
+        state_dict = {
+            "model.embed_tokens.weight": torch.empty(0),
+            "model.scalar_weight": torch.tensor(3.14159),
+        }
+
+        with (
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._get_hf_safetensors_reference_path",
+                return_value="/fake/reference",
+            ),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing.get_fqn_to_file_index_mapping",
+                return_value=dict(source_mapping),
+            ),
+        ):
+            mapping = checkpointer._maybe_build_consolidated_index(model_state, state_dict)
+
+        assert mapping == {**source_mapping, "model.scalar_weight": 1}
+
+    @pytest.mark.run_only_on("CPU")
+    def test_global_pre_shard_state_does_not_readd_excluded_tied_lm_head(self, tmp_path):
+        """A global key list must not undo the local tied-weight alias exclusion."""
+        checkpointer = self._make_checkpointer(tmp_path)
+        source_mapping = {
+            "model.embed_tokens.weight": 1,
+            "lm_head.weight": 1,
+        }
+        model_state = self._fake_model_state(list(source_mapping))
+        model_state.has_local_tied_lm_head = True
+        model_state.lm_head_param_name = "lm_head.weight"
+
+        with (
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._get_hf_safetensors_reference_path",
+                return_value="/fake/reference",
+            ),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing.get_fqn_to_file_index_mapping",
+                return_value=dict(source_mapping),
+            ),
+        ):
+            mapping = checkpointer._maybe_build_consolidated_index(
+                model_state,
+                {"model.embed_tokens.weight": torch.empty(0)},
+            )
+
+        assert mapping == {"model.embed_tokens.weight": 1}
 
 
 # Tests for cloud storage path support (MSC integration)
