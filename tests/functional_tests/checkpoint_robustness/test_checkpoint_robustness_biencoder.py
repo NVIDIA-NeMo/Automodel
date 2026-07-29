@@ -275,6 +275,9 @@ def test_checkpoint_robustness_biencoder():
         cfg.step_scheduler.max_steps = resume_max_steps
         cfg.checkpoint.checkpoint_dir = baseline_dir
         cfg.checkpoint.enabled = False
+        # Match the LR schedule used to create the checkpoint. Otherwise, extending
+        # max_steps also extends the baseline decay and changes its first five updates.
+        cfg.lr_scheduler.lr_decay_steps = original_max_steps
         baseline_trainer = TrainBiEncoderRecipe(cfg)
         baseline_trainer.setup()
         baseline_trainer.run_train_validation_loop()
