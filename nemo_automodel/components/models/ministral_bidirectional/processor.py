@@ -86,7 +86,17 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
         self.query_prefix = query_prefix
         self.passage_prefix = passage_prefix
         self.padding = padding
-        self.image_longest_edge = image_longest_edge
+        if image_longest_edge is not None:
+            self.image_longest_edge = image_longest_edge
+
+    @property
+    def image_longest_edge(self) -> int | None:
+        """Return the canonical longest edge used by the image processor."""
+        return self.image_processor.size.get("longest_edge")
+
+    @image_longest_edge.setter
+    def image_longest_edge(self, value: int | None) -> None:
+        self.image_processor.size["longest_edge"] = value
 
     def process_queries(
         self,
@@ -235,8 +245,6 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
             padding = self.padding
         if truncation and max_length is None:
             max_length = getattr(self.tokenizer, "model_max_length", None)
-        if images is not None and self.image_longest_edge is not None and "size" not in kwargs:
-            kwargs["size"] = {"longest_edge": self.image_longest_edge}
 
         return self(
             images=images,

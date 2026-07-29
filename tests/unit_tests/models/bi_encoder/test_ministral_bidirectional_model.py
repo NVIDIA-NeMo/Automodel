@@ -23,6 +23,7 @@ import pytest
 import torch
 import torch.nn as nn
 from PIL import Image
+from transformers import PixtralImageProcessor
 from transformers.models.mistral3.modeling_mistral3 import Mistral3Model
 from transformers.processing_utils import ProcessorMixin
 
@@ -108,8 +109,9 @@ class FakePixtralTokenizer:
 class FakePixtralImageProcessor:
     model_input_names = ["pixel_values"]
 
-    def __init__(self):
+    def __init__(self, size=None):
         self.calls = []
+        self.size = size if size is not None else {"longest_edge": 1540}
 
     def __call__(self, images, **kwargs):
         if not isinstance(images, list):
@@ -191,7 +193,7 @@ def test_ministral3_biencoder_processor_rejects_remote_image_urls():
         load_image({"url": "https://example.com/image.png"})
 
 
-def test_ministral3_biencoder_processor_forwards_image_longest_edge(monkeypatch):
+def test_ministral3_biencoder_processor_canonicalizes_image_longest_edge(monkeypatch):
     monkeypatch.setattr(ProcessorMixin, "check_argument_for_proper_class", lambda *args, **kwargs: None)
     image_processor = FakePixtralImageProcessor()
     processor = Mistral3BiEncoderProcessor(
@@ -205,7 +207,69 @@ def test_ministral3_biencoder_processor_forwards_image_longest_edge(monkeypatch)
 
     processor.process_documents({"images": [image], "texts": ["Image doc"]})
 
-    assert image_processor.calls[-1]["kwargs"]["size"] == {"longest_edge": 448}
+    assert processor.image_longest_edge == 448
+    assert image_processor.size == {"longest_edge": 448}
+    assert "size" not in image_processor.calls[-1]["kwargs"]
+
+
+def test_ministral3_biencoder_processor_preserves_nested_longest_edge(monkeypatch):
+    monkeypatch.setattr(ProcessorMixin, "check_argument_for_proper_class", lambda *args, **kwargs: None)
+    image_processor = FakePixtralImageProcessor(size={"longest_edge": 1540})
+
+    processor = Mistral3BiEncoderProcessor(
+        image_processor=image_processor,
+        tokenizer=FakePixtralTokenizer(),
+        patch_size=4,
+    )
+
+    assert processor.image_longest_edge == 1540
+    assert image_processor.size == {"longest_edge": 1540}
+
+
+def test_ministral3_biencoder_processor_attribute_and_call_overrides(monkeypatch):
+    monkeypatch.setattr(ProcessorMixin, "check_argument_for_proper_class", lambda *args, **kwargs: None)
+    image_processor = FakePixtralImageProcessor()
+    processor = Mistral3BiEncoderProcessor(
+        image_processor=image_processor,
+        tokenizer=FakePixtralTokenizer(),
+        patch_size=4,
+    )
+    image = Image.new("RGB", (4, 4), (255, 0, 0))
+
+    processor.image_longest_edge = 336
+    processor.process_documents(
+        {"images": [image], "texts": ["Image doc"]},
+        size={"longest_edge": 224},
+    )
+
+    assert image_processor.size == {"longest_edge": 336}
+    assert processor.image_longest_edge == 336
+    assert image_processor.calls[-1]["kwargs"]["size"] == {"longest_edge": 224}
+
+
+@pytest.mark.parametrize(
+    ("processor_config", "expected_longest_edge"),
+    [
+        ({}, 1540),
+        ({"image_longest_edge": 448}, 448),
+    ],
+)
+def test_ministral3_biencoder_processor_serializes_only_nested_longest_edge(
+    monkeypatch,
+    processor_config,
+    expected_longest_edge,
+):
+    monkeypatch.setattr(ProcessorMixin, "check_argument_for_proper_class", lambda *args, **kwargs: None)
+    image_processor = PixtralImageProcessor(size={"longest_edge": 1540})
+    processor = Mistral3BiEncoderProcessor.from_args_and_dict(
+        [image_processor, FakePixtralTokenizer()],
+        processor_config,
+    )
+
+    serialized = json.loads(processor.to_json_string())
+
+    assert "image_longest_edge" not in serialized
+    assert serialized["image_processor"]["size"] == {"longest_edge": expected_longest_edge}
 
 
 def test_ministral3_biencoder_processor_merges_biencoder_batch(pixtral_processor):
