@@ -19,6 +19,9 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_biencoder import (
+    _extract_custom_args as _extract_biencoder_custom_args,
+)
 from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm import (
     _compare_source_load_parity,
     _dequantize_hf_fp8_weights_in_place,
@@ -461,6 +464,29 @@ def test_hf_reload_wait_has_separate_timeout(tmp_path, monkeypatch):
 
 def test_hf_reload_finish_returns_error_without_distributed_sync():
     assert _finish_hf_reload_sync(None, "HF parity failed") == "HF parity failed"
+
+
+def test_biencoder_robustness_reads_hf_reload_settings_from_config(tmp_path):
+    config_path = tmp_path / "recipe.yaml"
+    config_path.write_text(
+        "ci:\n"
+        "  checkpoint_robustness:\n"
+        "    check_hf_reload: true\n"
+        "    check_resume: true\n"
+        "    cosine_threshold: 0.998\n"
+        "    hf_cosine_threshold: 0.997\n"
+        "    dataloader.num_workers: 0\n"
+    )
+
+    custom, remaining = _extract_biencoder_custom_args(["--config", str(config_path)])
+
+    assert custom == {
+        "check_hf_reload": True,
+        "check_resume": True,
+        "cosine_threshold": "0.998",
+        "hf_cosine_threshold": "0.997",
+    }
+    assert remaining == ["--config", str(config_path)]
 
 
 def test_record_deferred_failure_preserves_all_comparison_failures():
