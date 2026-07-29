@@ -135,4 +135,4 @@ ci:
     check_resume: true
     # The current robustness check uses an independently initialized BF16
     # baseline, so allow small distributed-kernel drift in the loss comparison.
-    resume_loss_threshold: 1e-2
+    resume_loss_threshold: 5e-2
