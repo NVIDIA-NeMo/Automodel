@@ -4,7 +4,12 @@ This example shows how to fine-tune an embedding model for visual document retri
 [nvidia/llama-nemotron-embed-vl-1b-v2](https://huggingface.co/nvidia/llama-nemotron-embed-vl-1b-v2). The model can
 embed document pages as image, text, or combined image-text inputs. Documents can be retrieved given a user query in
 text form. The model supports page images containing text, tables, charts, and infographics. Review the model's
-performance on the
+This example shows how to fine-tune the
+[nvidia/llama-nemotron-embed-vl-1b-v2](https://huggingface.co/nvidia/llama-nemotron-embed-vl-1b-v2)
+model for visual document retrieval. The model embeds document pages supplied
+as images, text, or combined image and text inputs. Documents can be retrieved
+from a user query in text form. The model supports page images that contain
+text, tables, charts, and infographics. Review the model's performance on the
 [vision document retrieval and text retrieval benchmarks](https://huggingface.co/nvidia/llama-nemotron-embed-vl-1b-v2#evaluation-results).
 
 ## Fine-Tune for Domain Adaptation
@@ -34,7 +39,9 @@ details, refer to the
         {"id": "69560"},
         {"id": "112685"},
         {"id": "5132"}, ...
-    }, ...
+        {"id": "5132"}
+      ]
+    }
   ]
 }
 ```
