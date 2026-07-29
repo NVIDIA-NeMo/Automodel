@@ -131,6 +131,17 @@ def test_kd_yamls_use_torch_optim_with_fp32_student_storage():
         assert cfg["teacher_model"]["torch_dtype"] == "bfloat16"
 
 
+def test_teacher_pp_example_has_enough_microbatches_for_all_stages():
+    cfg = yaml.safe_load(
+        (_REPO_ROOT / "examples/llm_kd/llama3_2/llama3_2_1b_kd_separate_mesh_teacher_pp2.yaml").read_text()
+    )
+    local_batch_size = cfg["step_scheduler"]["local_batch_size"]
+    teacher = cfg["teacher_distributed"]
+    num_microbatches = local_batch_size // teacher["pipeline"]["pp_microbatch_size"]
+
+    assert num_microbatches >= teacher["pp_size"]
+
+
 def test_loss_comparator_rejects_mismatched_kd_settings():
     baseline = {
         "step": 0,

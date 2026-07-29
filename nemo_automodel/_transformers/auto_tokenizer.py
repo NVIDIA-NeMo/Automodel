@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib
 import logging
 from typing import Callable, Optional, Type, Union
 
@@ -30,6 +31,9 @@ def _get_model_type(pretrained_model_name_or_path: str, trust_remote_code: bool 
         The model_type string, or None if it cannot be determined
     """
     try:
+        # Ensure AutoModel's local custom configs are registered before asking
+        # AutoConfig to inspect a checkpoint that advertises remote code.
+        importlib.import_module("nemo_automodel._transformers.registry")
         from transformers import AutoConfig
 
         config = AutoConfig.from_pretrained(pretrained_model_name_or_path, trust_remote_code=trust_remote_code)
