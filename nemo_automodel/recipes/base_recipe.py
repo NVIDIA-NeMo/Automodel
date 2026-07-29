@@ -70,6 +70,11 @@ from nemo_automodel.recipes._typed_config import RecipeConfig
 
 logger = logging.getLogger(__name__)
 
+# Suffix for the directory a checkpoint reservation builds before renaming it into
+# place. Chosen so the name does not end in ``step_<N>`` and therefore never matches
+# the checkpoint listings in ``components.checkpoint.utils``.
+_RESERVATION_STAGING_SUFFIX = ".reserving-"
+
 
 def has_load_restore_state(object):
     """
@@ -250,6 +255,13 @@ class BaseRecipe:
         would destroy a restorable checkpoint and silently change what any pointer
         aimed at it resolves to, so the save aborts on every rank instead.
 
+        Reservation is itself failure-atomic. The absence of the marker is what
+        makes a directory look published, so ``path`` must never exist without one:
+        the directory is built complete with its marker under a staging name and
+        renamed into place. A reservation that fails, or whose process dies partway,
+        leaves only a staging directory, which the checkpoint listings ignore and
+        the next reservation of the same step clears.
+
         Args:
             path: Checkpoint directory for the current step.
 
@@ -273,8 +285,19 @@ class BaseRecipe:
             if os.path.exists(path):
                 logger.warning("Replacing checkpoint directory %s left behind by an interrupted save", path)
                 shutil.rmtree(path)
-            os.makedirs(path, exist_ok=True)
-            mark_checkpoint_incomplete(path)
+
+            parent = os.path.dirname(path)
+            staging_prefix = f"{os.path.basename(path)}{_RESERVATION_STAGING_SUFFIX}"
+            if os.path.isdir(parent):
+                for entry in os.listdir(parent):
+                    if entry.startswith(staging_prefix):
+                        shutil.rmtree(os.path.join(parent, entry), ignore_errors=True)
+
+            staging = f"{path}{_RESERVATION_STAGING_SUFFIX}{uuid4().hex}"
+            os.makedirs(staging)
+            mark_checkpoint_incomplete(staging)
+            # Atomic within a filesystem, so `path` is never observable without its marker.
+            os.rename(staging, path)
 
         self._run_rank_0_checkpoint_step(reserve, f"prepare checkpoint directory {path}")
 
@@ -294,23 +317,27 @@ class BaseRecipe:
             description: Step name used in the log line and the error message.
 
         Raises:
-            RuntimeError: If rank 0 could not complete the step.
+            RuntimeError: If rank 0 could not complete the step. On rank 0 the
+                original exception is chained as the cause.
         """
         is_dist_initialized = torch.distributed.is_initialized()
         is_rank_0 = not is_dist_initialized or torch.distributed.get_rank() == 0
 
-        failed = False
+        failure: Exception | None = None
         if is_rank_0:
             try:
                 operation()
-            except OSError:
-                # Recorded instead of raised: rank 0 has to reach the reduction below
-                # so the failure aborts every rank instead of stranding them.
+            except Exception as exc:
+                # Deliberately broad, and neither swallowed nor re-raised here: the
+                # steps reach state_dict(), torch.save, and pointer publication, which
+                # raise RuntimeError and pickling errors as well as OSError. Anything
+                # escaping at this point would kill rank 0 while its peers block in the
+                # next collective, so it is recorded and reported through the reduction.
                 logger.exception("Failed to %s", description)
-                failed = True
+                failure = exc
 
-        if self._any_rank_failed(failed, is_dist_initialized):
-            raise RuntimeError(f"Failed to {description}; see the rank 0 log for the underlying error.")
+        if self._any_rank_failed(failure is not None, is_dist_initialized):
+            raise RuntimeError(f"Failed to {description}; see the rank 0 log for the underlying error.") from failure
 
     def _any_rank_failed(self, failed: bool, is_dist_initialized: bool) -> bool:
         """Reduce a local failure flag so every rank agrees on whether to abort.

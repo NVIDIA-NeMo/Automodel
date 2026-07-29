@@ -25,13 +25,18 @@ from nemo_automodel.components.checkpoint.checkpointing import save_losses
 from nemo_automodel.components.checkpoint.utils import (
     find_latest_checkpoint,
     is_checkpoint_incomplete,
+    list_automodel_checkpoints,
     mark_checkpoint_incomplete,
     read_checkpoint_pointer,
     resolve_restore_from_to_checkpoint_dir,
 )
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.recipes.base_recipe import BaseRecipe, is_distributed_stateful
+from nemo_automodel.recipes.base_recipe import (
+    _RESERVATION_STAGING_SUFFIX,
+    BaseRecipe,
+    is_distributed_stateful,
+)
 
 try:
     import expecttest
@@ -1069,6 +1074,85 @@ def test_pointer_unlink_failure_during_pruning_aborts_every_rank(tmp_path, monke
         recipe_inst.save_checkpoint(epoch=0, step=100, train_loss=1.0)
 
     assert reduce_calls[-1] == 1
+
+
+def test_failed_reservation_leaves_no_resumable_checkpoint(tmp_path, monkeypatch):
+    """A reservation that fails must not leave a directory that looks published.
+
+    The absence of the marker is what distinguishes a published checkpoint from an
+    unpublished one, so a directory created without its marker would be resumed from
+    as if complete, and would then block every later save of that step.
+    """
+    recipe_inst = _ToyRecipe(tmp_path)
+
+    def fail_mark(checkpoint_dir):
+        raise OSError("disk quota exceeded")
+
+    monkeypatch.setattr("nemo_automodel.recipes.base_recipe.mark_checkpoint_incomplete", fail_mark)
+
+    with pytest.raises(RuntimeError, match="Failed to prepare"):
+        recipe_inst.save_checkpoint(epoch=0, step=100, train_loss=1.0)
+
+    assert not (tmp_path / "epoch_0_step_100").exists()
+    assert find_latest_checkpoint(tmp_path) is None
+
+    # The step stays saveable once the underlying problem clears.
+    monkeypatch.undo()
+    recipe_inst.save_checkpoint(epoch=0, step=100, train_loss=1.0)
+    assert os.path.basename(str(find_latest_checkpoint(tmp_path))) == "epoch_0_step_100"
+
+
+def test_reservation_staging_directory_is_ignored_and_cleaned_up(tmp_path):
+    """A staging directory left by a reservation that died is invisible, then cleared.
+
+    Reservation builds the marked directory under a staging name and renames it into
+    place, so a process that stops midway leaves the staging directory rather than an
+    unmarked checkpoint.
+    """
+    stale = tmp_path / f"epoch_0_step_100{_RESERVATION_STAGING_SUFFIX}deadbeef"
+    stale.mkdir()
+
+    assert find_latest_checkpoint(tmp_path) is None
+    assert list_automodel_checkpoints(tmp_path) == []
+
+    recipe_inst = _ToyRecipe(tmp_path)
+    recipe_inst.save_checkpoint(epoch=0, step=100, train_loss=1.0)
+
+    assert not stale.exists()
+    assert os.path.basename(str(find_latest_checkpoint(tmp_path))) == "epoch_0_step_100"
+
+
+def test_rank_0_non_oserror_failure_aborts_every_rank(tmp_path, monkeypatch):
+    """A non-OSError raised by a rank-0 step is still reported to every rank.
+
+    The steps reach ``state_dict()``, ``torch.save``, and pointer publication, which
+    raise RuntimeError and pickling errors as well as OSError. Catching only OSError
+    let those escape on rank 0 while its peers blocked in the next collective.
+    """
+    recipe_inst = _ToyRecipe(tmp_path)
+    reduce_calls = []
+
+    def fail_torch_save(*args, **kwargs):
+        raise RuntimeError("PytorchStreamWriter failed writing file")
+
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True, raising=False)
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_reduce",
+        lambda tensor, op=None, group=None: reduce_calls.append(int(tensor.item())),
+        raising=False,
+    )
+    monkeypatch.setattr(torch.distributed, "barrier", lambda group=None: None, raising=False)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False, raising=False)
+    monkeypatch.setattr("nemo_automodel.recipes.base_recipe.torch.save", fail_torch_save)
+
+    with pytest.raises(RuntimeError, match="Failed to write custom_state state") as excinfo:
+        recipe_inst.save_checkpoint(epoch=0, step=100, train_loss=1.0)
+
+    assert reduce_calls[-1] == 1
+    # The original failure is preserved on the rank that observed it.
+    assert isinstance(excinfo.value.__cause__, RuntimeError)
+    assert "PytorchStreamWriter" in str(excinfo.value.__cause__)
 
 
 def test_rank_0_failure_aborts_ranks_that_did_not_perform_it(tmp_path, monkeypatch):

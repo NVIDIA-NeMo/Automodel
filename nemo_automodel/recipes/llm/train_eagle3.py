@@ -1440,12 +1440,16 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         self.checkpointer.save_optimizer(self.optimizer, draft_model, path, self.lr_scheduler)
         self.checkpointer.save_on_dp_ranks(self.rng, "rng", path)
 
-        if is_rank_0:
+        # Rank-0 writes followed by collectives, so they go through the same guard:
+        # a failure here must abort every rank rather than only this one.
+        def write_recipe_metadata() -> None:
             self._save_extra_state(path, epoch=epoch)
             try:
                 save_config(self.cfg.raw_config, path)
             except (AttributeError, OSError) as e:
                 logger.warning("Failed to save config snapshot: %s", e)
+
+        self._run_rank_0_checkpoint_step(write_recipe_metadata, f"write recipe metadata to {path}")
         if is_dist_initialized:
             dist.barrier()
 
