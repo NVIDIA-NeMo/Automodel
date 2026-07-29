@@ -1076,6 +1076,39 @@ def test_pointer_unlink_failure_during_pruning_aborts_every_rank(tmp_path, monke
     assert reduce_calls[-1] == 1
 
 
+@pytest.mark.parametrize("failure_point", ["latest_pointer", "marker_clear"])
+def test_failed_publication_leaves_checkpoint_unpublished_and_replaceable(tmp_path, monkeypatch, failure_point):
+    """A partially completed publication never exposes or wedges the new checkpoint.
+
+    Publication has two filesystem mutations: move ``LATEST`` while the directory
+    is marked, then clear the marker. If either fails, resume must select the prior
+    checkpoint and a later save of the failed step must be able to replace it.
+    """
+    recipe_inst = _ToyRecipe(tmp_path)
+    recipe_inst.save_checkpoint(epoch=0, step=50, train_loss=1.0)
+
+    def fail(*args, **kwargs):
+        raise OSError("injected publication failure")
+
+    with monkeypatch.context() as patch:
+        if failure_point == "latest_pointer":
+            patch.setattr(recipe_inst, "_update_latest_symlink", fail)
+        else:
+            patch.setattr("nemo_automodel.recipes.base_recipe.clear_checkpoint_incomplete", fail)
+
+        with pytest.raises(RuntimeError, match="Failed to publish checkpoint"):
+            recipe_inst.save_checkpoint(epoch=0, step=100, train_loss=1.0)
+
+    failed_checkpoint = tmp_path / "epoch_0_step_100"
+    assert is_checkpoint_incomplete(failed_checkpoint)
+    assert os.path.basename(str(find_latest_checkpoint(tmp_path))) == "epoch_0_step_50"
+
+    recipe_inst.save_checkpoint(epoch=0, step=100, train_loss=1.0)
+
+    assert not is_checkpoint_incomplete(failed_checkpoint)
+    assert os.path.basename(str(find_latest_checkpoint(tmp_path))) == "epoch_0_step_100"
+
+
 def test_failed_reservation_leaves_no_resumable_checkpoint(tmp_path, monkeypatch):
     """A reservation that fails must not leave a directory that looks published.
 
@@ -1202,6 +1235,16 @@ def test_restore_from_named_pointer_rejects_interrupted_target(tmp_path):
         resolve_restore_from_to_checkpoint_dir(tmp_path, "LOWEST_VAL")
 
 
+@pytest.mark.parametrize("path_kind", ["name", "absolute"])
+def test_restore_from_directory_rejects_interrupted_checkpoint(tmp_path, path_kind):
+    """An explicit directory cannot bypass the incomplete-checkpoint marker."""
+    interrupted = _simulate_interrupted_save(tmp_path, step=100)
+    restore_from = interrupted.name if path_kind == "name" else os.fspath(interrupted)
+
+    with pytest.raises(RuntimeError, match="left incomplete"):
+        resolve_restore_from_to_checkpoint_dir(tmp_path, restore_from)
+
+
 def test_save_losses_does_not_raise_when_multistorageclient_is_missing(tmp_path, monkeypatch, caplog):
     """A missing MSC install warns instead of raising ImportError on rank 0.
 
@@ -1299,9 +1342,9 @@ def test_interrupted_save_lifecycle_resumes_from_the_last_complete_checkpoint(tm
     elif restore_source == "LATEST":
         assert resolve_restore_from_to_checkpoint_dir(tmp_path, "LATEST") is None
     else:
-        # An explicit directory is the user's own choice and is still honoured.
-        recipe_inst.load_checkpoint(restore_from="epoch_0_step_100")
-        assert torch.allclose(recipe_inst.model.weight, weight_at_step_100)
+        with pytest.raises(RuntimeError, match="left incomplete"):
+            recipe_inst.load_checkpoint(restore_from="epoch_0_step_100")
+        assert not torch.allclose(recipe_inst.model.weight, weight_at_step_100)
 
 
 def test_checkpoint_retention_evicts_interrupted_checkpoint_dir(tmp_path):

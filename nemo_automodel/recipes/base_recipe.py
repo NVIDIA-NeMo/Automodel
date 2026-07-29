@@ -367,15 +367,16 @@ class BaseRecipe:
     def _publish_checkpoint(self, path: str) -> None:
         """Mark a fully written checkpoint as complete and advance the LATEST pointer.
 
-        This is the point at which a checkpoint becomes eligible for resume, so the
-        in-progress marker is cleared here and nowhere else. Runs on rank 0 inside
+        ``LATEST`` is moved while the checkpoint is still marked, then clearing the
+        marker commits publication. If either operation fails, resume still ignores
+        the marked checkpoint and a later save can replace it. Runs on rank 0 inside
         :meth:`_run_rank_0_checkpoint_step`, which reports any failure to every rank.
 
         Args:
             path: Checkpoint directory whose components have all been written.
         """
-        clear_checkpoint_incomplete(path)
         self._update_latest_symlink(path)
+        clear_checkpoint_incomplete(path)
 
     def save_checkpoint(
         self,

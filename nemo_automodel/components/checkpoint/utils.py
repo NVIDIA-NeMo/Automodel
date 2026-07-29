@@ -270,8 +270,8 @@ def resolve_restore_from_to_checkpoint_dir(checkpoint_dir: str | Path, restore_f
         - None: if restore_from='LATEST' but no checkpoint found (caller should start fresh)
 
     Raises:
-        RuntimeError: If a named pointer other than LATEST targets a checkpoint that an
-            interrupted save left incomplete.
+        RuntimeError: If restore_from selects a checkpoint that an interrupted save
+            left incomplete.
     """
     # Handle checkpoint-root pointers such as LATEST and LOWEST_VAL. A pointer whose
     # target an interrupted save left incomplete is not resumable. LATEST falls back
@@ -301,8 +301,16 @@ def resolve_restore_from_to_checkpoint_dir(checkpoint_dir: str | Path, restore_f
     # If restore_from is just a directory name (no path separator), treat it as
     # relative to checkpoint_dir. Otherwise use as-is (absolute or relative path).
     if os.path.sep not in restore_from and not os.path.isabs(restore_from):
-        return os.path.join(checkpoint_dir, restore_from)
-    return restore_from
+        resolved_checkpoint = os.path.join(checkpoint_dir, restore_from)
+    else:
+        resolved_checkpoint = restore_from
+
+    if is_checkpoint_incomplete(resolved_checkpoint):
+        raise RuntimeError(
+            f"checkpoint.restore_from={restore_from!r} resolves to {resolved_checkpoint}, which an interrupted "
+            "save left incomplete. Set checkpoint.restore_from to a complete checkpoint directory."
+        )
+    return resolved_checkpoint
 
 
 def format_missing_checkpoint_dir_error(checkpoint_dir: str, restore_from: str, resolved_ckpt_dir: str) -> str:
