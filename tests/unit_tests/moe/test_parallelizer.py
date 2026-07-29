@@ -68,12 +68,27 @@ class LayerContainer:
 
 
 class DummyModel:
-    def __init__(self, blocks, embed_tokens=None, lm_head=None, audio_tower=None, visual=None):
+    def __init__(self, blocks, embed_tokens=None, embed_norm=None, lm_head=None, audio_tower=None, visual=None):
         self.layers = LayerContainer(blocks)
         self.embed_tokens = embed_tokens
+        self.embed_norm = embed_norm
         self.lm_head = lm_head
         self.audio_tower = audio_tower
         self.visual = visual
+
+    def parameters(self):
+        """Aggregate child parameters like ``nn.Module.parameters()``."""
+        for child in (
+            self.layers,
+            self.embed_tokens,
+            self.embed_norm,
+            self.lm_head,
+            self.audio_tower,
+            self.visual,
+        ):
+            child_parameters = getattr(child, "parameters", None)
+            if callable(child_parameters):
+                yield from child_parameters()
 
 
 def _install_torch_and_layers_stubs(monkeypatch):
@@ -90,9 +105,28 @@ def _install_torch_and_layers_stubs(monkeypatch):
     class Module:
         pass
 
+    # Real containers, so production code can use plain ``isinstance`` checks and
+    # runtime ``torch.Tensor`` annotations instead of defensive ``getattr``.
+    # Without these the stub silently changes container-detection behavior, and
+    # modules annotated with ``torch.Tensor`` (e.g. ``shared/tied_weights.py``)
+    # only import when some earlier test happened to cache them under real torch.
+    class ModuleList(list):
+        def named_children(self):
+            return [(str(i), child) for i, child in enumerate(self)]
+
+    class ModuleDict(dict):
+        def named_children(self):
+            return list(self.items())
+
+    class Tensor:
+        pass
+
     nn_stub.Parameter = Parameter
     nn_stub.Module = Module
+    nn_stub.ModuleList = ModuleList
+    nn_stub.ModuleDict = ModuleDict
     torch_stub.nn = nn_stub
+    torch_stub.Tensor = Tensor
 
     # cuda submodule
     cuda_stub = types.ModuleType("torch.cuda")
@@ -130,10 +164,16 @@ def _install_torch_and_layers_stubs(monkeypatch):
         def __init__(self, *args, **kwargs):
             pass
 
+    class CPUOffloadPolicy:
+        def __init__(self, *args, **kwargs):
+            pass
+
     class OffloadPolicy:
         def __init__(self, *args, **kwargs):
             pass
 
+    fsdp_stub.MixedPrecisionPolicy = MixedPrecisionPolicy
+    fsdp_stub.CPUOffloadPolicy = CPUOffloadPolicy
     fsdp_fully_stub.MixedPrecisionPolicy = MixedPrecisionPolicy
     fsdp_fully_stub.OffloadPolicy = OffloadPolicy
 
@@ -174,7 +214,15 @@ def _install_torch_and_layers_stubs(monkeypatch):
     def checkpoint_wrapper(*args, **kwargs):
         return args[0]
 
+    class CheckpointImpl:
+        NO_REENTRANT = "no_reentrant"
+        REENTRANT = "reentrant"
+
     cpw_stub.checkpoint_wrapper = checkpoint_wrapper
+    # components/distributed/activation_checkpointing.py imports this at module
+    # scope; without it that module only imports when an earlier test happened to
+    # cache it under real torch, making this file order-dependent.
+    cpw_stub.CheckpointImpl = CheckpointImpl
 
     # utils module hierarchy
     utils_stub = types.ModuleType("torch.utils")
@@ -209,8 +257,11 @@ def _install_torch_and_layers_stubs(monkeypatch):
     utils_checkpoint_stub.CheckpointPolicy = CheckpointPolicy
     utils_checkpoint_stub.create_selective_checkpoint_contexts = create_selective_checkpoint_contexts
 
-    # ops.aten.mm.default sentinel
-    aten = types.SimpleNamespace(mm=types.SimpleNamespace(default=object()))
+    # Router ops used by the targeted activation-checkpointing policy.
+    aten = types.SimpleNamespace(
+        mm=types.SimpleNamespace(default=object()),
+        topk=types.SimpleNamespace(default=object()),
+    )
     torch_stub.ops = types.SimpleNamespace(aten=aten)
 
     # dtype and device classes for type annotations
@@ -220,8 +271,12 @@ def _install_torch_and_layers_stubs(monkeypatch):
     class device:
         pass
 
+    class Tensor:
+        pass
+
     torch_stub.dtype = dtype
     torch_stub.device = device
+    torch_stub.Tensor = Tensor
 
     # common dtypes referenced by code
     torch_stub.bfloat16 = object()
@@ -285,6 +340,7 @@ def _import_parallelizer_with_stubs(monkeypatch):
         "nemo_automodel.components.moe.layers",
         "nemo_automodel.components.moe.experts",
         "nemo_automodel.components.distributed.pipelining",
+        "nemo_automodel.components.distributed.pipelining.config",
         "nemo_automodel.components.distributed.pipelining.hf_utils",
         "nemo_automodel.components.distributed.mesh_utils",
     ]:
@@ -293,9 +349,20 @@ def _import_parallelizer_with_stubs(monkeypatch):
 
     _install_torch_and_layers_stubs(monkeypatch)
 
-    # Stub the pipelining module and hf_utils
+    # Stub the distributed package, config normalization, pipelining module, and hf_utils.
+    distributed_stub = types.ModuleType("nemo_automodel.components.distributed")
+    distributed_stub.__path__ = []
+    config_stub = types.ModuleType("nemo_automodel.components.distributed.config")
+    config_stub.normalize_activation_checkpointing_scope = lambda scope: (
+        (scope,) if isinstance(scope, str) else tuple(scope)
+    )
     pipelining_stub = types.ModuleType("nemo_automodel.components.distributed.pipelining")
+    pipelining_stub.__path__ = []
+    pipelining_config_stub = types.ModuleType("nemo_automodel.components.distributed.pipelining.config")
     hf_utils_stub = types.ModuleType("nemo_automodel.components.distributed.pipelining.hf_utils")
+
+    class PipelineConfig:
+        pass
 
     def get_text_module(model):
         """Return model.model if exists, otherwise model."""
@@ -303,10 +370,15 @@ def _import_parallelizer_with_stubs(monkeypatch):
             return model.model
         return model
 
+    pipelining_config_stub.PipelineConfig = PipelineConfig
     hf_utils_stub.get_text_module = get_text_module
+    pipelining_stub.config = pipelining_config_stub
     pipelining_stub.hf_utils = hf_utils_stub
 
+    monkeypatch.setitem(sys.modules, "nemo_automodel.components.distributed", distributed_stub)
+    monkeypatch.setitem(sys.modules, "nemo_automodel.components.distributed.config", config_stub)
     monkeypatch.setitem(sys.modules, "nemo_automodel.components.distributed.pipelining", pipelining_stub)
+    monkeypatch.setitem(sys.modules, "nemo_automodel.components.distributed.pipelining.config", pipelining_config_stub)
     monkeypatch.setitem(sys.modules, "nemo_automodel.components.distributed.pipelining.hf_utils", hf_utils_stub)
 
     mesh_utils_stub = types.ModuleType("nemo_automodel.components.distributed.mesh_utils")
@@ -318,6 +390,28 @@ def _import_parallelizer_with_stubs(monkeypatch):
     shared_utils_stub = types.ModuleType("nemo_automodel.shared.utils")
     shared_utils_stub.dtype_from_str = lambda val, default=None: default
     monkeypatch.setitem(sys.modules, "nemo_automodel.shared.utils", shared_utils_stub)
+
+    tied_weights_stub = types.ModuleType("nemo_automodel.shared.tied_weights")
+    tied_weights_stub.ensure_tied_lm_head = lambda model: None
+    monkeypatch.setitem(sys.modules, "nemo_automodel.shared.tied_weights", tied_weights_stub)
+
+    activation_checkpointing_stub = types.ModuleType("nemo_automodel.components.distributed.activation_checkpointing")
+    activation_checkpointing_stub.ensure_profiler_ops_sac_ignored = lambda: None
+    monkeypatch.setitem(
+        sys.modules,
+        "nemo_automodel.components.distributed.activation_checkpointing",
+        activation_checkpointing_stub,
+    )
+
+    distributed_config_stub = types.ModuleType("nemo_automodel.components.distributed.config")
+    distributed_config_stub.normalize_activation_checkpointing_scope = lambda value: (
+        (value,) if isinstance(value, str) else tuple(value or ("all",))
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "nemo_automodel.components.distributed.config",
+        distributed_config_stub,
+    )
 
     parallel_styles_stub = types.ModuleType("nemo_automodel.components.distributed.parallel_styles")
     parallel_styles_stub.translate_to_lora = lambda style: style
@@ -543,7 +637,7 @@ def test_apply_ac_warns_when_router_is_recomputed(monkeypatch):
     assert logger_mock.warning.call_count == 1
     assert "ignore_router_for_ac" in logger_mock.warning.call_args[0][0]
 
-    # ignore_router=True (the default) saves the router output -> no warning.
+    # ignore_router=True (the default) saves the router projection and top-k outputs -> no warning.
     logger_mock.reset_mock()
     P.apply_ac(DummyModel([DummyBlock()]), ignore_router=True, hidden_size=7168, num_experts=256)
     logger_mock.warning.assert_not_called()
@@ -575,7 +669,7 @@ def test_apply_ac_uses_generic_wrapper_even_when_block_local_checkpointing_is_av
     assert model.layers.registered["0"] is wrapped
 
 
-def test_apply_ac_custom_policy_respects_hidden_and_expert_dims(monkeypatch):
+def test_apply_ac_custom_policy_saves_router_projection_and_topk(monkeypatch):
     P = _import_parallelizer_with_stubs(monkeypatch)
 
     captured_policy = None
@@ -608,10 +702,12 @@ def test_apply_ac_custom_policy_respects_hidden_and_expert_dims(monkeypatch):
 
     policy = captured_policy
     must_save = policy(None, torch_stub.ops.aten.mm.default, object(), rhs_match)
+    must_save_topk = policy(None, torch_stub.ops.aten.topk.default, object(), 2)
     prefer_recompute_shape = policy(None, torch_stub.ops.aten.mm.default, object(), rhs_mismatch)
     prefer_recompute_func = policy(None, object(), object(), rhs_match)
 
     assert must_save == P.CheckpointPolicy.MUST_SAVE
+    assert must_save_topk == P.CheckpointPolicy.MUST_SAVE
     assert prefer_recompute_shape == P.CheckpointPolicy.PREFER_RECOMPUTE
     assert prefer_recompute_func == P.CheckpointPolicy.PREFER_RECOMPUTE
 
@@ -642,8 +738,9 @@ def test_apply_fsdp_calls_with_ignored_params_and_shard_for_experts(monkeypatch)
 
     block = DummyBlock(mlp=DummyMoE())
     embed = object()
+    embed_norm = object()
     lm = object()
-    model = DummyModel([block], embed_tokens=embed, lm_head=lm)
+    model = DummyModel([block], embed_tokens=embed, embed_norm=embed_norm, lm_head=lm)
 
     fsdp_mesh = type("Mesh", (), {"size": lambda self: 2})()
     ep_shard_mesh = type("Mesh", (), {"size": lambda self: 2})()
@@ -677,15 +774,37 @@ def test_apply_fsdp_calls_with_ignored_params_and_shard_for_experts(monkeypatch)
     ignored = block_kwargs.get("ignored_params")
     assert isinstance(ignored, set) and len(ignored) == len(list(experts.parameters()))
 
-    # embed, lm_head and model should also be sharded on fsdp_mesh
+    # embed, post-embedding norm, lm_head and model should also be sharded on fsdp_mesh
     embed_call = _find_call_by_first_arg(fully_shard_mock, embed)
     assert embed_call is not None and embed_call[1]["mesh"] is fsdp_mesh
+
+    embed_norm_call = _find_call_by_first_arg(fully_shard_mock, embed_norm)
+    assert embed_norm_call is not None and embed_norm_call[1]["mesh"] is fsdp_mesh
 
     lm_call = _find_call_by_first_arg(fully_shard_mock, lm)
     assert lm_call is not None and lm_call[1]["mesh"] is fsdp_mesh
 
     model_call = _find_call_by_first_arg(fully_shard_mock, model)
     assert model_call is not None and model_call[1]["mesh"] is fsdp_mesh
+
+
+def test_apply_fsdp_installs_accumulated_grad_guard(monkeypatch):
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    monkeypatch.setattr(P, "MoE", DummyMoE)
+    guard_mock = MagicMock()
+    fully_shard_mock = MagicMock()
+    monkeypatch.setattr(P, "_patch_fsdp_accumulated_grad_guard", guard_mock)
+    monkeypatch.setattr(P, "fully_shard", fully_shard_mock)
+    monkeypatch.setattr(P, "MixedPrecisionPolicy", MagicMock(return_value="MP_POLICY"))
+
+    P.apply_fsdp(
+        model=DummyModel([DummyBlock(mlp=DummyMoE())]),
+        fsdp_mesh=object(),
+        ep_enabled=False,
+        ep_shard_enabled=False,
+    )
+
+    guard_mock.assert_called_once_with()
 
 
 def test_shard_fp32_param_holders_shards_each_holder(monkeypatch):
@@ -868,14 +987,17 @@ def test_apply_fsdp_handles_multimodal_components(monkeypatch, audio_trainable, 
     monkeypatch.setattr(P, "MixedPrecisionPolicy", MagicMock(return_value="MP_POLICY"))
 
     logging_mock = MagicMock()
-    monkeypatch.setattr(P.logging, "info", logging_mock)
+    monkeypatch.setattr(P.logger, "info", logging_mock)
 
     class Tower:
         def __init__(self, requires_grad):
-            self._params = [types.SimpleNamespace(requires_grad=requires_grad)]
+            self._params = [DummyParam(requires_grad=requires_grad)]
 
         def parameters(self):
             return iter(self._params)
+
+        def named_children(self):
+            return []
 
     audio_tower = Tower(audio_trainable)
     visual_tower = Tower(visual_trainable)
@@ -890,15 +1012,205 @@ def test_apply_fsdp_handles_multimodal_components(monkeypatch, audio_trainable, 
         ep_shard_mesh=None,
     )
 
-    audio_call = _find_call_by_first_arg(fully_shard_mock, audio_tower)
-    visual_call = _find_call_by_first_arg(fully_shard_mock, visual_tower)
-    assert (audio_call is not None) == audio_trainable
-    assert (visual_call is not None) == visual_trainable
-
+    assert (_find_call_by_first_arg(fully_shard_mock, audio_tower) is not None) == audio_trainable
+    assert (_find_call_by_first_arg(fully_shard_mock, visual_tower) is not None) == visual_trainable
     if not audio_trainable:
-        logging_mock.assert_any_call("Skipping FSDP wrap for frozen audio tower")
+        logging_mock.assert_any_call(
+            "Keeping frozen multimodal module %s at FSDP policy %s",
+            "audio_tower",
+            "root",
+        )
     if not visual_trainable:
-        logging_mock.assert_any_call("Skipping FSDP wrap for frozen visual tower")
+        logging_mock.assert_any_call(
+            "Keeping frozen multimodal module %s at FSDP policy %s",
+            "visual",
+            "root",
+        )
+
+
+@pytest.mark.parametrize(
+    "frozen_multimodal_sharding, expected_tower_sharded, expected_ignored_params",
+    [
+        ("root", False, None),
+        ("per_layer", True, None),
+        ("replicate", False, "frozen"),
+    ],
+)
+def test_apply_fsdp_applies_nested_frozen_multimodal_policy(
+    monkeypatch, frozen_multimodal_sharding, expected_tower_sharded, expected_ignored_params
+):
+    """Gemma4-style nested towers honor root, per-layer, and replicate policies."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    monkeypatch.setattr(P, "MoE", DummyMoE)
+
+    fully_shard_mock = MagicMock()
+    monkeypatch.setattr(P, "fully_shard", fully_shard_mock)
+    monkeypatch.setattr(P, "MixedPrecisionPolicy", MagicMock(return_value="MP_POLICY"))
+
+    def vlm_get_text_module(module):
+        return module.language_model if hasattr(module, "language_model") else module
+
+    monkeypatch.setattr(P, "get_text_module", vlm_get_text_module)
+
+    class TreeModule:
+        def __init__(self, params=None, **children):
+            self._params = params or []
+            self._children = children
+            for name, child in children.items():
+                setattr(self, name, child)
+
+        def parameters(self):
+            for param in self._params:
+                yield param
+            for child in self._children.values():
+                parameters = getattr(child, "parameters", None)
+                if callable(parameters):
+                    yield from parameters()
+
+        def named_children(self):
+            return list(self._children.items())
+
+        def named_modules(self):
+            yield "", self
+            for child_name, child in self._children.items():
+                yield child_name, child
+                child_named_modules = getattr(child, "named_modules", None)
+                if not callable(child_named_modules):
+                    continue
+                for sub_name, submodule in child_named_modules():
+                    if sub_name:
+                        yield f"{child_name}.{sub_name}", submodule
+
+    block = DummyBlock(mlp=DummyMoE())
+    shared_weight = DummyParam(requires_grad=True)
+    vision_param = DummyParam(requires_grad=False)
+    embed_vision_param = DummyParam(requires_grad=False)
+
+    embed_tokens = types.SimpleNamespace(weight=shared_weight)
+    lm_head = types.SimpleNamespace(weight=shared_weight)
+    language_model = DummyModel([block], embed_tokens=embed_tokens)
+    language_model.parameters = lambda: iter([shared_weight])
+    language_model.named_modules = lambda: iter([("", language_model)])
+
+    vision_tower = TreeModule(params=[vision_param])
+    embed_vision = TreeModule(params=[embed_vision_param])
+    inner_model = TreeModule(language_model=language_model, vision_tower=vision_tower, embed_vision=embed_vision)
+    outer_model = TreeModule(model=inner_model)
+    outer_model.lm_head = lm_head
+
+    P.apply_fsdp(
+        model=outer_model,
+        fsdp_mesh=object(),
+        ep_enabled=True,
+        ep_shard_enabled=False,
+        ep_shard_mesh=None,
+        wrap_outer_model=True,
+        frozen_multimodal_sharding=frozen_multimodal_sharding,
+    )
+
+    assert (_find_call_by_first_arg(fully_shard_mock, vision_tower) is not None) is expected_tower_sharded
+    assert (_find_call_by_first_arg(fully_shard_mock, embed_vision) is not None) is expected_tower_sharded
+    assert _find_call_by_first_arg(fully_shard_mock, language_model) is None
+
+    outer_call = _find_call_by_first_arg(fully_shard_mock, outer_model)
+    assert outer_call is not None
+    ignored_params = outer_call[1].get("ignored_params")
+    if expected_ignored_params is None:
+        assert ignored_params is None
+    else:
+        assert ignored_params == {vision_param, embed_vision_param}
+
+
+def test_apply_fsdp_rejects_root_policy_without_an_owner_for_frozen_multimodal_params(monkeypatch):
+    """A nested frozen tower cannot use root policy when the outer root is disabled."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    monkeypatch.setattr(P, "MoE", DummyMoE)
+    monkeypatch.setattr(P, "fully_shard", MagicMock())
+    monkeypatch.setattr(P, "MixedPrecisionPolicy", MagicMock(return_value="MP_POLICY"))
+
+    class Tower:
+        def __init__(self):
+            self._params = [DummyParam(requires_grad=False)]
+
+        def parameters(self):
+            return iter(self._params)
+
+    class OuterModel:
+        def __init__(self):
+            self.model = DummyModel([DummyBlock()])
+            self.vision_tower = Tower()
+
+        def named_modules(self):
+            yield "", self
+            yield "vision_tower", self.vision_tower
+
+    with pytest.raises(ValueError, match="requires wrap_outer_model=True.*vision_tower"):
+        P.apply_fsdp(
+            model=OuterModel(),
+            fsdp_mesh=object(),
+            ep_enabled=False,
+            ep_shard_enabled=False,
+            wrap_outer_model=False,
+            frozen_multimodal_sharding="root",
+        )
+
+
+@pytest.mark.parametrize(
+    "frozen_multimodal_sharding, tower_trainable, expected_tower_sharded",
+    [
+        ("per_layer", False, True),
+        ("replicate", False, False),
+        ("root", True, True),
+    ],
+)
+def test_apply_fsdp_without_outer_root_allows_supported_multimodal_policies(
+    monkeypatch,
+    frozen_multimodal_sharding,
+    tower_trainable,
+    expected_tower_sharded,
+):
+    """Per-layer, replicate, and trainable towers do not require an outer root."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    monkeypatch.setattr(P, "MoE", DummyMoE)
+    fully_shard_mock = MagicMock()
+    monkeypatch.setattr(P, "fully_shard", fully_shard_mock)
+    monkeypatch.setattr(P, "MixedPrecisionPolicy", MagicMock(return_value="MP_POLICY"))
+
+    class Tower:
+        def __init__(self):
+            self._params = [
+                DummyParam(requires_grad=False),
+                DummyParam(requires_grad=tower_trainable),
+            ]
+
+        def parameters(self):
+            return iter(self._params)
+
+        def named_children(self):
+            return []
+
+    class OuterModel:
+        def __init__(self):
+            self.model = DummyModel([DummyBlock()])
+            self.vision_tower = Tower()
+
+        def named_modules(self):
+            yield "", self
+            yield "vision_tower", self.vision_tower
+
+    model = OuterModel()
+    P.apply_fsdp(
+        model=model,
+        fsdp_mesh=object(),
+        ep_enabled=False,
+        ep_shard_enabled=False,
+        wrap_outer_model=False,
+        frozen_multimodal_sharding=frozen_multimodal_sharding,
+    )
+
+    assert (_find_call_by_first_arg(fully_shard_mock, model.vision_tower) is not None) is expected_tower_sharded
+    assert _find_call_by_first_arg(fully_shard_mock, model.model) is not None
+    assert _find_call_by_first_arg(fully_shard_mock, model) is None
 
 
 class MeshView:
@@ -1015,6 +1327,30 @@ def test_parallelize_model_calls_subsystems_and_validates(monkeypatch):
     assert ep_enabled is True
     assert ep_shard_enabled is True
     assert ep_shard_mesh_arg.size() == 2
+    assert kwargs.get("frozen_multimodal_sharding") == "root"
+
+
+def test_parallelize_model_passes_frozen_multimodal_sharding_to_apply_fsdp(monkeypatch):
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    apply_fsdp_mock = MagicMock()
+    monkeypatch.setattr(P, "apply_ep", MagicMock())
+    monkeypatch.setattr(P, "apply_ac", MagicMock())
+    monkeypatch.setattr(P, "apply_fsdp", apply_fsdp_mock)
+
+    world_mesh = FakeWorldMesh({"dp": 2, ("dp",): 2}, mesh_dim_names=["dp"])
+    model = type("Outer", (), {"moe_config": type("MC", (), {"n_routed_experts": 4})()})()
+
+    P.parallelize_model(
+        model=model,
+        world_mesh=world_mesh,
+        moe_mesh=None,
+        dp_axis_names=("dp",),
+        frozen_multimodal_sharding="replicate",
+    )
+
+    apply_fsdp_mock.assert_called_once()
+    _, kwargs = apply_fsdp_mock.call_args
+    assert kwargs["frozen_multimodal_sharding"] == "replicate"
 
 
 def test_parallelize_model_accepts_top_level_moe_config(monkeypatch):
