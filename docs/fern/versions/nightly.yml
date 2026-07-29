@@ -164,6 +164,9 @@ navigation:
             path: ../../model-coverage/llm/openbmb/minicpm.mdx
           - page: "Moonlight"
             path: ../../model-coverage/llm/moonshotai/moonlight.mdx
+          - page: "Kimi K3"
+            path: ../../model-coverage/llm/moonshotai/kimi-k3.mdx
+            slug: kimi-k3
           - page: "Seed (ByteDance)"
             path: ../../model-coverage/llm/bytedance-seed/seed.mdx
           - page: "Solar Pro"
