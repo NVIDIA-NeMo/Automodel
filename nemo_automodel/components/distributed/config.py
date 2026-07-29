@@ -170,6 +170,10 @@ class DistributedSetup:
 class MoEParallelizerConfig:
     """Configuration for MoE model parallelization (EP + FSDP settings)."""
 
+    # Runtime-only shape hint inferred by recipe setup. This is excluded from
+    # __init__ so it cannot become a user-configured dispatcher knob.
+    num_max_tokens_per_rank: int | None = field(default=None, init=False, repr=False)
+
     # Default True: under activation checkpointing the MoE router projection and top-k outputs
     # must be saved rather than recomputed. Recomputing tied top-k selections can route a
     # different number of tokens per expert than the forward pass, which makes

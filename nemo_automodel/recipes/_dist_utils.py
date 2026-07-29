@@ -48,6 +48,27 @@ _PARALLELISM_DEFAULTS: Dict[str, Any] = {
 }
 
 
+def _infer_num_max_tokens_per_rank(cfg: Any, *, pp_enabled: bool) -> int | None:
+    """Infer the static non-PP token capacity used by MoE communication buffers."""
+    if cfg is None or pp_enabled:
+        return None
+
+    if isinstance(cfg, dict):
+        local_batch_size = (cfg.get("step_scheduler") or {}).get("local_batch_size")
+        packed_sequence_size = (cfg.get("packed_sequence") or {}).get("packed_sequence_size", 0)
+        sequence_length = packed_sequence_size or (cfg.get("dataset") or {}).get("seq_len")
+    else:
+        local_batch_size = cfg.get("step_scheduler.local_batch_size")
+        packed_sequence_size = cfg.get("packed_sequence.packed_sequence_size", 0)
+        sequence_length = packed_sequence_size or cfg.get("dataset.seq_len")
+
+    if not isinstance(local_batch_size, int) or local_batch_size <= 0:
+        return None
+    if not isinstance(sequence_length, int) or sequence_length <= 0:
+        return None
+    return local_batch_size * sequence_length
+
+
 def _normalize_activation_checkpointing(value: Any) -> bool | str:
     """Normalize YAML activation checkpointing values.
 
@@ -380,11 +401,17 @@ def create_distributed_setup_from_config(
 
     mesh_timeout_minutes = timeout_minutes if timeout_minutes is not None else _dist_env_timeout_minutes(cfg)
     parsed = parse_distributed_section(cfg_dict)
+    moe_parallel_config = parsed["moe_parallel_config"]
+    if moe_parallel_config is not None:
+        moe_parallel_config.num_max_tokens_per_rank = _infer_num_max_tokens_per_rank(
+            cfg,
+            pp_enabled=parsed["pp_enabled"],
+        )
     return DistributedSetup.build(
         strategy=parsed["strategy_config"],
         parallelism_sizes=parsed["parallelism_sizes"],
         pipeline_config=parsed["pipeline_config"],
-        moe_parallel_config=parsed["moe_parallel_config"],
+        moe_parallel_config=moe_parallel_config,
         activation_checkpointing=parsed["activation_checkpointing"],
         world_size=world_size,
         timeout_minutes=mesh_timeout_minutes,
