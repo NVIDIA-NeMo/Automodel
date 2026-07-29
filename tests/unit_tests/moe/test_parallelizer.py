@@ -68,16 +68,24 @@ class LayerContainer:
 
 
 class DummyModel:
-    def __init__(self, blocks, embed_tokens=None, lm_head=None, audio_tower=None, visual=None):
+    def __init__(self, blocks, embed_tokens=None, embed_norm=None, lm_head=None, audio_tower=None, visual=None):
         self.layers = LayerContainer(blocks)
         self.embed_tokens = embed_tokens
+        self.embed_norm = embed_norm
         self.lm_head = lm_head
         self.audio_tower = audio_tower
         self.visual = visual
 
     def parameters(self):
         """Aggregate child parameters like ``nn.Module.parameters()``."""
-        for child in (self.layers, self.embed_tokens, self.lm_head, self.audio_tower, self.visual):
+        for child in (
+            self.layers,
+            self.embed_tokens,
+            self.embed_norm,
+            self.lm_head,
+            self.audio_tower,
+            self.visual,
+        ):
             child_parameters = getattr(child, "parameters", None)
             if callable(child_parameters):
                 yield from child_parameters()
@@ -706,8 +714,9 @@ def test_apply_fsdp_calls_with_ignored_params_and_shard_for_experts(monkeypatch)
 
     block = DummyBlock(mlp=DummyMoE())
     embed = object()
+    embed_norm = object()
     lm = object()
-    model = DummyModel([block], embed_tokens=embed, lm_head=lm)
+    model = DummyModel([block], embed_tokens=embed, embed_norm=embed_norm, lm_head=lm)
 
     fsdp_mesh = type("Mesh", (), {"size": lambda self: 2})()
     ep_shard_mesh = type("Mesh", (), {"size": lambda self: 2})()
@@ -741,9 +750,12 @@ def test_apply_fsdp_calls_with_ignored_params_and_shard_for_experts(monkeypatch)
     ignored = block_kwargs.get("ignored_params")
     assert isinstance(ignored, set) and len(ignored) == len(list(experts.parameters()))
 
-    # embed, lm_head and model should also be sharded on fsdp_mesh
+    # embed, post-embedding norm, lm_head and model should also be sharded on fsdp_mesh
     embed_call = _find_call_by_first_arg(fully_shard_mock, embed)
     assert embed_call is not None and embed_call[1]["mesh"] is fsdp_mesh
+
+    embed_norm_call = _find_call_by_first_arg(fully_shard_mock, embed_norm)
+    assert embed_norm_call is not None and embed_norm_call[1]["mesh"] is fsdp_mesh
 
     lm_call = _find_call_by_first_arg(fully_shard_mock, lm)
     assert lm_call is not None and lm_call[1]["mesh"] is fsdp_mesh
