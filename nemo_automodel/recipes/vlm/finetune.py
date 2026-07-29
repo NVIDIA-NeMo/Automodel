@@ -612,7 +612,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         from nemo_automodel.components.models.common.packing import configure_packing, get_attn_implementation
 
         packing_attn_implementation = dataloader_config.resolve_packing_attn_implementation(
-            model_attn_implementation=get_attn_implementation(self.cfg.model),
+            model_attn_implementation=get_attn_implementation(self.cfg.model, model=self.model_parts[0]),
             cp_size=self.mesh_context.cp_size,
         )
         if dataloader_config.packing is not None and dataloader_config.packing.packing_format != "thd":
