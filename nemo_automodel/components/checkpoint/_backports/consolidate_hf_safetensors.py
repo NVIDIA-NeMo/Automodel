@@ -937,6 +937,58 @@ def consolidate_safetensors_files(
     logger.info("Done consolidating. Took %.2f secs.", time.time() - start_time)
 
 
+def _raise_if_any_rank_failed(
+    local_exception: Exception | None,
+    local_failure: str | None,
+    distributed: bool,
+    rank: int,
+    world_size: int,
+    process_group: Optional[dist.ProcessGroup],
+) -> None:
+    """
+    Share per-rank consolidation failures across ranks and raise if any rank failed.
+
+    In a multi-rank run this also acts as a barrier, so callers can rely on every rank having
+    finished the preceding step once this returns.
+
+    Args:
+        local_exception: Exception raised on this rank, if any.
+        local_failure: Human-readable description of this rank's failure, if any.
+        distributed: Whether a distributed environment is initialized.
+        rank: Rank of the current process within ``process_group``.
+        world_size: Number of ranks in ``process_group``.
+        process_group: Process group the synchronization collective runs on.
+
+    Raises:
+        RuntimeError: If any rank reported a failure, or if the failures could not be
+            synchronized across ranks.
+    """
+    if distributed and world_size > 1:
+        failures: list[str | None] = [None] * world_size
+        try:
+            dist.all_gather_object(failures, local_failure, group=process_group)
+        except Exception as exc:
+            if local_exception is not None:
+                raise RuntimeError(
+                    f"Safetensors consolidation failed on {local_failure}, and rank {rank} could not synchronize "
+                    f"the failure across ranks: {type(exc).__name__}: {exc}"
+                ) from local_exception
+            raise RuntimeError(
+                "Failed to synchronize safetensors consolidation status across ranks. A peer may have exited before "
+                "reporting its original exception; inspect the first failing rank's traceback. "
+                f"Synchronization error: {type(exc).__name__}: {exc}"
+            ) from exc
+
+        reported_failures = [failure for failure in failures if failure is not None]
+        if reported_failures:
+            message = "Safetensors consolidation failed before final synchronization: " + " | ".join(reported_failures)
+            if local_exception is not None:
+                raise RuntimeError(message) from local_exception
+            raise RuntimeError(message)
+    elif local_exception is not None:
+        raise local_exception
+
+
 def consolidate_safetensors_files_on_every_rank(
     input_dir: str,
     output_dir: str,
@@ -1044,10 +1096,19 @@ def consolidate_safetensors_files_on_every_rank(
                 cast_dtype=cast_dtype,
                 fqn_to_dtype_mapping=fqn_to_dtype_mapping,
             )
+    except Exception as exc:
+        local_exception = exc
+        local_failure = f"rank {rank} while {operation}: {type(exc).__name__}: {exc}"
 
-        # Write overall model.index.safetensors.json file with weight map (rank 0 only)
-        if rank == 0:
-            operation = "writing the consolidated safetensors index"
+    # Doubles as a barrier: the index must not be published before every rank has written
+    # its assigned shards.
+    _raise_if_any_rank_failed(local_exception, local_failure, distributed, rank, world_size, process_group)
+
+    # Write overall model.index.safetensors.json file with weight map (rank 0 only)
+    local_exception = None
+    local_failure = None
+    if rank == 0:
+        try:
             _write_overall_metadata_file_from_shards(
                 input_dir,
                 output_dir,
@@ -1055,34 +1116,10 @@ def consolidate_safetensors_files_on_every_rank(
                 cast_dtype,
                 fqn_to_dtype_mapping,
             )
-    except Exception as exc:
-        local_exception = exc
-        local_failure = f"rank {rank} while {operation}: {type(exc).__name__}: {exc}"
-
-    if distributed and world_size > 1:
-        failures: list[str | None] = [None] * world_size
-        try:
-            dist.all_gather_object(failures, local_failure, group=process_group)
         except Exception as exc:
-            if local_exception is not None:
-                raise RuntimeError(
-                    f"Safetensors consolidation failed on {local_failure}, and rank {rank} could not synchronize "
-                    f"the failure across ranks: {type(exc).__name__}: {exc}"
-                ) from local_exception
-            raise RuntimeError(
-                "Failed to synchronize safetensors consolidation status across ranks. A peer may have exited before "
-                "reporting its original exception; inspect the first failing rank's traceback. "
-                f"Synchronization error: {type(exc).__name__}: {exc}"
-            ) from exc
-
-        reported_failures = [failure for failure in failures if failure is not None]
-        if reported_failures:
-            message = "Safetensors consolidation failed before final synchronization: " + " | ".join(reported_failures)
-            if local_exception is not None:
-                raise RuntimeError(message) from local_exception
-            raise RuntimeError(message)
-    elif local_exception is not None:
-        raise local_exception
+            local_exception = exc
+            local_failure = f"rank {rank} while writing the consolidated safetensors index: {type(exc).__name__}: {exc}"
+    _raise_if_any_rank_failed(local_exception, local_failure, distributed, rank, world_size, process_group)
 
     logger.debug(
         "Rank %d: Done consolidating. Processed %d unique indices in %.2f secs.",
