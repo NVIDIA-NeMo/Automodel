@@ -304,7 +304,7 @@ def test_k3_moe_training_forward_matches_reference_order(experts_backend):
     moe = model.model.layers["0"].mlp
     assert isinstance(moe, KimiK3MoE)
     assert type(moe.experts) is GroupedExperts
-    assert moe.experts.apply_router_weight_after_down is True
+    assert moe.experts.config.apply_router_weight_after_down is True
 
     hidden_states = torch.randn(2, 3, config.hidden_size)
     token_mask = torch.ones(hidden_states.numel() // config.hidden_size, dtype=torch.bool)
@@ -336,7 +336,7 @@ def test_k3_moe_uses_shared_flex_dispatcher_experts(monkeypatch):
 
     assert type(moe.experts) is GroupedExpertsDeepEP
     assert moe.experts.dispatcher_backend == "hybridep"
-    assert moe.experts.apply_router_weight_after_down is True
+    assert moe.experts.config.apply_router_weight_after_down is True
 
 
 def test_two_pipeline_stage_handoff_matches_full_model():

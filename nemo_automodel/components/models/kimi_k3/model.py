@@ -1056,9 +1056,6 @@ class KimiK3MoE(MoE):
         else:
             self.experts = GroupedExperts(moe_config, backend=backend)
             self.experts.expert_activation_grouped = expert_activation
-        # The checkpoint reference rounds each BF16 expert output before applying
-        # its FP32 router weight and reducing the top-k outputs.
-        self.experts.apply_router_weight_after_down = True
         shared_intermediate = config.moe_intermediate_size * (config.num_shared_experts or 0)
         self.shared_experts = (
             KimiK3MLP(config, intermediate_size=shared_intermediate, dtype=moe_config.dtype)
@@ -1377,6 +1374,9 @@ def _build_moe_config(
         router_bias=False,
         expert_bias=False,
         expert_activation="swiglu",
+        # The checkpoint reference rounds each BF16 expert output before applying
+        # its FP32 router weight and reducing the top-k outputs.
+        apply_router_weight_after_down=True,
         dtype=model_dtype,
         shared_expert_gate=False,
         shared_expert_inter_dim=config.moe_intermediate_size,
