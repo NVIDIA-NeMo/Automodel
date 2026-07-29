@@ -105,8 +105,6 @@ For diagnosis, safety behavior, verification steps, and performance impact, see 
 
 ### Frozen Multimodal FSDP Policy
 
-{/* docs-review-start: frozen-multimodal-fsdp-policy */}
-
 FSDP2 uses the correctness-first `root` policy for fully frozen vision/audio towers and multimodal projectors:
 
 ```yaml
@@ -123,8 +121,6 @@ The supported policies are:
 - `replicate`: frozen multimodal parameters are excluded from FSDP and copied on every rank. This removes their collectives at the cost of higher per-rank parameter memory.
 
 This setting does not change modules that contain any trainable parameters. For nested MoE/VLM models, `root` requires `distributed.moe.wrap_outer_model: true` when a fully frozen multimodal module is outside the inner text-model FSDP root. Use `per_layer` or `replicate` if the outer model must remain unwrapped.
-
-{/* docs-review-end: frozen-multimodal-fsdp-policy */}
 
 ## Interpolate Environment Variables in YAML
 
