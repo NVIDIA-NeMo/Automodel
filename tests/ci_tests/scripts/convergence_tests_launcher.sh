@@ -46,12 +46,12 @@ RESOLVED_FINETUNE_CONFIG=$($CONFIG_RESOLVER \
   --output "$TEST_DIR/finetune_config.yaml")
 
 export WANDB_API_KEY="${WANDB_AUTOMODEL_API_KEY}"
-# wandb stays disabled in CI (recipes ship `wandb.enable: false`). Enabling it made every job
-# fail: WANDB_AUTOMODEL_API_KEY lacks write access to the recipes' `Nemo-automodel` entity, so
-# wandb.init() raises `CommError: user does not have models write access for this org` on rank0,
-# which then strands the other ranks at the checkpoint-consolidation gloo barrier until the
-# 1800s timeout. Re-enable via `--wandb.enable true` on the training command below only once the
-# key has write access to that entity.
+# Enable wandb in CI: the recipes ship `wandb.enable: false` (example-yaml linter requirement), so
+# flip it on via `--wandb.enable true` on the training command below. Logs to each recipe's entity/
+# project (Nemo-automodel / automodel_convergence_runs). Requires WANDB_AUTOMODEL_API_KEY to have
+# write access to that entity -- otherwise wandb.init() raises `CommError: user does not have models
+# write access for this org` on rank0 and strands the other ranks at the checkpoint-consolidation
+# gloo barrier until the 1800s timeout.
 
 # Entry script by recipe type. Convergence recipes live under examples/convergence/
 # (mixed LLM/VLM), so the path-based heuristic templates use does not apply -- pick the
@@ -95,7 +95,7 @@ echo "============================================"
 echo "[convergence] Training ${TEST_NAME}..."
 echo "============================================"
 TRAIN_START=$SECONDS
-eval "${CMD} ${TEST_SCRIPT_PATH} --config ${RESOLVED_FINETUNE_CONFIG} ${FINETUNE_ARGS:-}"
+eval "${CMD} ${TEST_SCRIPT_PATH} --config ${RESOLVED_FINETUNE_CONFIG} --wandb.enable true ${FINETUNE_ARGS:-}"
 TRAIN_EXIT_CODE=$?
 echo "{\"test\":\"${TEST_NAME}\",\"phase\":\"train\",\"seconds\":$((SECONDS - TRAIN_START))}" >> "$TEST_DIR/timing.jsonl"
 if [[ "$TRAIN_EXIT_CODE" -ne 0 ]]; then
