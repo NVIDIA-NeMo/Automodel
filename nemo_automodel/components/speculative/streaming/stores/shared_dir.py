@@ -248,7 +248,10 @@ class SharedDirFeatureStore(FeatureStore):
             algorithm=algorithm,
             schema_version=schema_version,
             num_tokens=num_tokens,
-            estimated_bytes=bytes_written,
+            # Logical tensor bytes, not bytes_written: estimated_bytes is the
+            # backend-independent SampleRef contract; on-disk residency (header
+            # + padding) is tracked via _owned_files for backpressure.
+            estimated_bytes=bytes_in,
             target_model_version=target_model_version,
             draft_weight_version=draft_weight_version,
         )

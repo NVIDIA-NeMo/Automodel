@@ -92,6 +92,26 @@ def test_shared_dir_store_round_trip(store, tmp_path) -> None:
     assert not file_path.exists()
 
 
+def test_shared_dir_store_estimated_bytes_is_logical_not_file_size(store, tmp_path) -> None:
+    """SampleRef.estimated_bytes must be the logical tensor bytes.
+
+    The field is documented (refs.py) as the sum of every feature's
+    ``numel() * dtype_bytes`` and LocalFeatureStore populates it that way. The
+    shared-dir backend previously set it to the on-disk safetensors file size
+    (logical bytes + JSON header + alignment padding), so the same field
+    carried two meanings across backends. Keep it backend-independent; on-disk
+    residency is tracked separately for backpressure.
+    """
+    features = _eagle3_features(128)
+    expected_logical = sum(t.numel() * t.element_size() for t in features.values())
+    ref = _put(store, "s1", n_floats=128)
+    assert ref.estimated_bytes == expected_logical
+    # The on-disk file is strictly larger (safetensors header + alignment), so
+    # this also proves estimated_bytes is not the file size.
+    on_disk = (tmp_path / "store" / "s1.safetensors").stat().st_size
+    assert on_disk > ref.estimated_bytes
+
+
 def test_shared_dir_store_get_returns_detached_copies(store) -> None:
     ref = _put(store, "s1", n_floats=64)
     out, handle = store.get(ref)
