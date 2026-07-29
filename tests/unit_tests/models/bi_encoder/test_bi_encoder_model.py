@@ -280,7 +280,7 @@ def test_bi_encoder_drops_run_dummy_vision_when_backbone_does_not_support_it():
         }
     )
 
-    assert backbone.received_kwargs == {"return_dict": True, "output_hidden_states": True}
+    assert backbone.received_kwargs == {"return_dict": True, "output_hidden_states": False}
     assert embeddings.shape == (1, 2)
 
 
@@ -418,7 +418,7 @@ def test_forward_backward_step_disables_query_dummy_vision_but_keeps_passage_dum
 
     recipe._forward_backward_step(0, batch, loss_buffer=[], num_batches=1, is_train=True)
 
-    assert model.run_dummy_vision_flags == [False, True]
+    assert model.run_dummy_vision_flags == [True, False]
 
 
 def test_validation_epoch_supports_multi_vector_pooling():

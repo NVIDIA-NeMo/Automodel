@@ -12,8 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-examples_dir: retrieval
 
-configs:
-  - bi_encoder/llama3_2_1b.yaml
-  - bi_encoder/nemotron_vl_1b/nemotron_vl_1b_optimized.yaml
+def test_patch_is_packed_sequence_for_training_returns_false_when_helper_is_missing(monkeypatch):
+    import transformers.modeling_flash_attention_utils as fa_utils
+
+    from nemo_automodel.components.distributed.fsdp2 import _patch_is_packed_sequence_for_training
+
+    monkeypatch.delattr(fa_utils, "_is_packed_sequence", raising=False)
+    monkeypatch.delattr(fa_utils, "_is_packed_sequence_patched", raising=False)
+
+    assert _patch_is_packed_sequence_for_training() is False
+    assert not getattr(fa_utils, "_is_packed_sequence_patched", False)

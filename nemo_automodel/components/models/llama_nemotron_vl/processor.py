@@ -536,6 +536,15 @@ class LlamaNemotronVLProcessor(ProcessorMixin):
             return_tensors=return_tensors,
         )
 
+        image_token_indices = None
+        if return_tensors == "pt" and pil_images_by_idx:
+            img_context_token_id = self.tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN)
+            selected = (model_inputs["input_ids"] == img_context_token_id).nonzero(as_tuple=False)
+            if selected.numel() > 0:
+                image_token_indices = selected[:, 0] * model_inputs["input_ids"].shape[1] + selected[:, 1]
+            else:
+                image_token_indices = torch.empty(0, dtype=torch.long)
+
         if pixel_values_layout == "flat_tiles":
             pixel_values_list = [pv for pv in pixel_values_list if pv is not None]
             if len(pixel_values_list) > 1:
@@ -566,6 +575,8 @@ class LlamaNemotronVLProcessor(ProcessorMixin):
             "attention_mask": model_inputs["attention_mask"],
             "pixel_values": pixel_values_return_value,
         }
+        if image_token_indices is not None:
+            batch_docs["image_token_indices"] = image_token_indices
 
         return batch_docs
 

@@ -146,3 +146,89 @@ multi-node training on a Slurm cluster, use `sbatch`.
 ```bash
 torchrun --nproc-per-node=8 examples/retrieval/bi_encoder/finetune.py --config examples/retrieval/bi_encoder/nemotron_vl_1b/nemotron_vl_1b_example.yaml
 ```
+
+### Use the Optimized Configuration
+
+For better training performance, use [nemotron_vl_1b_optimized.yaml](nemotron_vl_1b_optimized.yaml). It trains the
+same model and uses the same data format as the base example, while enabling:
+
+- An optimized Llama backend with Transformer Engine fused QKV and MLP projections.
+- Optimized Transformer Engine SigLIP encoder layers, with the unused SigLIP pooling head disabled.
+- Bidirectional attention masks prepared by the data loader instead of during every training step.
+
+On the reference workload, the optimized configuration reduced step time by about 15% and increased per-GPU
+throughput by about 18% compared with `nemotron_vl_1b_example.yaml`, while producing comparable loss values. The
+model-specific switches are grouped under `model.optimization_config`, while bidirectional mask preparation is under
+`bi_encoder_optimization`. Use the base example when you prefer the simplest configuration.
+
+The configuration uses `global_batch_size: 64` and `local_batch_size: 2`. On one 8-GPU node, this means four gradient
+accumulation steps per optimizer step, so the file sets `distributed.static_graph: false`. Set the allocator option
+before launching on 80 GB GPUs:
+
+```bash
+export PYTORCH_ALLOC_CONF=expandable_segments:True
+torchrun --nproc-per-node=8 examples/retrieval/bi_encoder/finetune.py --config examples/retrieval/bi_encoder/nemotron_vl_1b/nemotron_vl_1b_optimized.yaml
+```
+
+With 4 nodes and 8 GPUs per node, the same batch settings require no gradient accumulation. For that launch, enable
+the DDP static-graph optimization:
+
+```yaml
+distributed:
+  strategy: ddp
+  static_graph: true
+```
+
+Keep `static_graph: false` for any setup that uses more than one gradient accumulation step.
+
+Note that `torchrun --nproc-per-node` launches a single node. For multi-node runs, submit through your cluster scheduler (e.g., `sbatch` on Slurm), as described in the base example above.
+
+### Choose a GPU Budget
+
+The optimized config keeps `global_batch_size=64` fixed. Adjust it to your available GPUs with these options:
+
+1. **Gradient accumulation**: Whenever `local_batch_size × GPUs` is smaller than `global_batch_size`, the recipe uses
+   `global_batch_size / (local_batch_size × GPUs)` accumulation steps automatically.
+2. **Activation checkpointing**: If you want to use fewer GPUs with a larger `local_batch_size`, enable
+   `distributed.activation_checkpointing: true`. Use `activation_checkpointing_scope: vision` to checkpoint only the
+   vision tower, or `activation_checkpointing_scope: all` to checkpoint the full model. This uses less memory at the
+   cost of additional computation. See [Use Gradient (Activation) Checkpointing](https://docs.nvidia.com/nemo/automodel/latest/guides/gradient-checkpointing.html).
+
+Measured reference points on 80GB GPUs (262k-sample VL retrieval workload, no gradient accumulation in any row):
+
+| GPUs | local/global batch | Activation ckpt. | Samples/s per GPU | Peak mem/GPU | Approx. epoch |
+| ---: | ---: | --- | ---: | ---: | ---: |
+| 64 (8 nodes) | 1/64 | no | ~1.95 | ~50GiB | ~35m |
+| 32 (4 nodes) | 2/64 | no | ~2.20 | ~70GiB | ~62m |
+| 8 (1 node) | 8/64 | vision tower only | ~2.11 | ~80GiB | ~4.3h |
+| 4 | 16/64 | full model | ~2.05 | ~61GiB | ~8.9h |
+
+Per-GPU efficiency peaks at the 32-GPU `local_batch_size=2` configuration, and the single-node setups stay close to it (within ~5-7%) even with activation-checkpointing recompute. All three are meaningfully more GPU-hour-efficient than the 64-GPU `local_batch_size=1` run. Using fewer GPUs costs wall-clock time but almost no total GPU-hours.
+
+For maximum throughput on one 8-GPU node, override the optimized config with `local_batch_size=8` and checkpoint only the vision tower:
+
+```yaml
+step_scheduler:
+  global_batch_size: 64
+  local_batch_size: 8
+
+distributed:
+  strategy: ddp
+  static_graph: true
+  activation_checkpointing: true
+  activation_checkpointing_scope: vision
+```
+
+For example, to run on 4 GPUs, checkpoint the full model and raise `local_batch_size` to 16:
+
+```yaml
+step_scheduler:
+  global_batch_size: 64
+  local_batch_size: 16
+
+distributed:
+  strategy: ddp
+  static_graph: true
+  activation_checkpointing: true
+  activation_checkpointing_scope: all
+```

@@ -22,13 +22,19 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import AutoConfig, AutoModel, AutoModelForSequenceClassification, PreTrainedModel
+from transformers import AutoConfig, AutoModel, AutoModelForSequenceClassification, PretrainedConfig, PreTrainedModel
 from transformers.models.auto.modeling_auto import MODEL_FOR_SEQUENCE_CLASSIFICATION_MAPPING
 from transformers.utils import logging
 
 from nemo_automodel._transformers.registry import ModelRegistry
+from nemo_automodel.components.checkpoint.addons import save_custom_model_code
+from nemo_automodel.components.checkpoint.checkpointing import (
+    _materialize_to_hf_views_for_save,
+    _maybe_adapt_state_dict_to_hf,
+)
 from nemo_automodel.components.loss.intermediate_distill import LayerCapture
 from nemo_automodel.components.models.common.bidirectional import EncoderStateDictAdapter
+from nemo_automodel.components.utils.model_utils import apply_parameter_freezing
 
 logger = logging.get_logger(__name__)
 
@@ -179,14 +185,33 @@ def pool(last_hidden_states: torch.Tensor, attention_mask: torch.Tensor, pool_ty
     return emb
 
 
-def configure_encoder_metadata(model: PreTrainedModel, config) -> None:
+def _get_matching_remote_code_source(model: PreTrainedModel, config: PretrainedConfig) -> str | None:
+    """Return the original checkpoint path when its remote code implements the active model class."""
+    auto_map = getattr(config, "auto_map", None)
+    if not isinstance(auto_map, dict):
+        return None
+
+    encoder_class_name = model.__class__.__name__
+    auto_model_key = (
+        "AutoModelForSequenceClassification" if "ForSequenceClassification" in encoder_class_name else "AutoModel"
+    )
+    model_reference = auto_map.get(auto_model_key)
+    if not isinstance(model_reference, str) or model_reference.rsplit(".", 1)[-1] != encoder_class_name:
+        return None
+
+    source = getattr(config, "name_or_path", "")
+    return source or None
+
+
+def configure_encoder_metadata(model: PreTrainedModel, config: PretrainedConfig) -> None:
     """Configure HuggingFace consolidated checkpoint metadata on a model.
 
-    Sets ``config.architectures`` unconditionally.  For custom retrieval
-    architectures registered in :class:`ModelRegistry`, also writes
-    ``config.auto_map`` so that the saved checkpoint can be reloaded via
-    HuggingFace Auto classes.  Standard HF models already have their own
-    auto-resolution and do not need ``auto_map`` entries.
+    Sets ``config.architectures`` unconditionally. For custom retrieval
+    architectures registered in :class:`ModelRegistry`, preserves an existing
+    remote-code ``auto_map`` when it implements the active model class. Otherwise,
+    writes an ``auto_map`` for the local retrieval implementation so the saved
+    checkpoint can be reloaded via HuggingFace Auto classes. Standard HF models
+    already have their own auto-resolution and do not need ``auto_map`` entries.
 
     Args:
         model: The backbone ``PreTrainedModel`` instance.
@@ -195,9 +220,12 @@ def configure_encoder_metadata(model: PreTrainedModel, config) -> None:
     encoder_class_name = model.__class__.__name__
     config.architectures = [encoder_class_name]
 
-    # Only set auto_map for custom retrieval architectures.
-    # Standard HF models don't need auto_map pointing to a local model.py.
-    if ModelRegistry.has_retrieval_model(encoder_class_name):
+    # Converted retrieval backbones need auto_map to point to their local implementation.
+    # A matching original remote-code package is already portable and should remain unchanged.
+    if (
+        ModelRegistry.has_retrieval_model(encoder_class_name)
+        and _get_matching_remote_code_source(model, config) is None
+    ):
         config_class_name = config.__class__.__name__
         config_module = config.__class__.__module__.rsplit(".", 1)[-1]
         model_module = model.__class__.__module__.rsplit(".", 1)[-1]
@@ -253,6 +281,12 @@ def build_encoder_backbone(
         ValueError: If the task is unsupported for a known model type, or the
             architecture class is missing from :class:`ModelRegistry`.
     """
+    # ``te`` is a NeMo extension handled after model construction by the
+    # infrastructure layer. Transformers must see SDPA while loading the
+    # retrieval backbone, otherwise it rejects the extension value before TE
+    # injection can run.
+    if hf_kwargs.get("attn_implementation") == "te":
+        hf_kwargs["attn_implementation"] = "sdpa"
     config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code)
     model_type = getattr(config, "model_type", "")
 
@@ -325,7 +359,17 @@ def save_encoder_pretrained(model: nn.Module, save_directory: str, **kwargs) -> 
         return
 
     logger.info(f"Saving encoder model to {save_directory}")
-    model.model.save_pretrained(save_directory)
+    state_dict = _maybe_adapt_state_dict_to_hf(model, model.state_dict())
+    _materialize_to_hf_views_for_save(state_dict)
+    model.model.save_pretrained(save_directory, state_dict=state_dict)
+    original_model_path = getattr(model, "name_or_path", None)
+    if not isinstance(original_model_path, str):
+        original_model_path = None
+    save_custom_model_code(
+        original_model_path,
+        save_directory,
+        model_part=model.model,
+    )
 
 
 # HuggingFace model_type -> task -> bidirectional architecture class name in ModelRegistry
@@ -352,11 +396,20 @@ def _init_encoder_common(encoder: nn.Module, model: PreTrainedModel) -> None:
     """Shared init for BiEncoderModel and CrossEncoderModel."""
     encoder.model = model
     encoder.config = model.config
-    if ModelRegistry.has_retrieval_model(model.__class__.__name__):
+    remote_code_source = _get_matching_remote_code_source(model, model.config)
+    if remote_code_source is not None:
+        encoder.name_or_path = remote_code_source
+        if getattr(model, "_export_original_processor_with_remote_code", False):
+            auto_map = getattr(model.config, "auto_map", None)
+            processor_ref = auto_map.get("AutoProcessor") if isinstance(auto_map, dict) else None
+            if processor_ref is not None:
+                encoder._export_processor_auto_map = processor_ref
+    elif ModelRegistry.has_retrieval_model(model.__class__.__name__):
         encoder.name_or_path = os.path.dirname(inspect.getfile(type(model)))
     else:
         encoder.name_or_path = getattr(model.config, "name_or_path", "")
-    encoder.state_dict_adapter = EncoderStateDictAdapter()
+    adapter_factory = getattr(model, "get_encoder_state_dict_adapter", None)
+    encoder.state_dict_adapter = adapter_factory() if callable(adapter_factory) else EncoderStateDictAdapter()
     configure_encoder_metadata(model, model.config)
 
 
@@ -398,10 +451,13 @@ class BiEncoderModel(nn.Module):
             raise ValueError("task must be specified when calling build()")
 
         logger.info(f"Building BiEncoderModel from {model_name_or_path}")
+        freeze_config = hf_kwargs.pop("freeze_config", None)
 
         backbone = build_encoder_backbone(
             model_name_or_path, effective_task, trust_remote_code=trust_remote_code, pooling=pooling, **hf_kwargs
         )
+        if freeze_config is not None:
+            apply_parameter_freezing(backbone, freeze_config)
 
         return cls(
             model=backbone,
@@ -437,13 +493,15 @@ class BiEncoderModel(nn.Module):
         outputs = self.model(
             **model_inputs,
             return_dict=True,
-            output_hidden_states=True,
+            output_hidden_states=False,
         )
 
-        if hasattr(outputs, "last_hidden_state"):
+        if hasattr(outputs, "last_hidden_state") and outputs.last_hidden_state is not None:
             hidden_state = outputs.last_hidden_state
-        else:
+        elif outputs.hidden_states is not None:
             hidden_state = outputs.hidden_states[-1]
+        else:
+            raise RuntimeError("encoder model did not return a final hidden state for pooling")
 
         embeds = pool(
             last_hidden_states=hidden_state,

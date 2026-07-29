@@ -12,18 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 from torch import nn
 
 from nemo_automodel.components.checkpoint.addons import (
+    ConsolidatedHFAddon,
+    _align_exported_processor_with_original_model_code,
     _extract_target_modules,
     _group_barrier,
     _is_group_rank_0,
-    _maybe_save_custom_model_code,
     _maybe_strip_quantization_config,
+    save_custom_model_code,
 )
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState
 
@@ -54,7 +58,7 @@ def _write(path: str, content: str) -> None:
         f.write(content)
 
 
-def test_maybe_save_custom_model_code_copies_py_files_and_structure(tmp_path):
+def test_save_custom_model_code_copies_py_files_and_structure(tmp_path):
     # Arrange: create a nested source tree with .py and non-.py files
     src_root = tmp_path / "src_model_code"
     dst_root = tmp_path / "hf_meta"
@@ -71,7 +75,7 @@ def test_maybe_save_custom_model_code_copies_py_files_and_structure(tmp_path):
         _write(os.path.join(src_root, rel), content)
 
     # Act
-    _maybe_save_custom_model_code(str(src_root), str(dst_root))
+    save_custom_model_code(str(src_root), str(dst_root))
 
     # Assert: .py files copied with preserved structure; non-.py and __init__.py ignored
     assert (dst_root / "main.py").exists()
@@ -84,19 +88,128 @@ def test_maybe_save_custom_model_code_copies_py_files_and_structure(tmp_path):
         assert "def foo()" in f.read()
 
 
-def test_maybe_save_custom_model_code_noop_for_none_or_non_dir(tmp_path):
+def test_save_custom_model_code_noop_for_none_or_non_dir(tmp_path):
     dst_root = tmp_path / "hf_meta"
     dst_root.mkdir(parents=True)
 
     # None input should be a no-op
-    _maybe_save_custom_model_code(None, str(dst_root))
+    save_custom_model_code(None, str(dst_root))
     assert list(dst_root.rglob("*.py")) == []
 
     # Non-directory input should be a no-op
     some_file = tmp_path / "not_a_dir.txt"
     some_file.write_text("hello")
-    _maybe_save_custom_model_code(str(some_file), str(dst_root))
+    save_custom_model_code(str(some_file), str(dst_root))
     assert list(dst_root.rglob("*.py")) == []
+
+
+def test_align_exported_processor_with_original_model_code_preserves_runtime_settings(tmp_path):
+    output_dir = tmp_path / "export"
+    output_dir.mkdir()
+
+    (output_dir / "processing_source.py").write_text("class SourceProcessor: pass\n")
+    (output_dir / "processor.py").write_text("class TrainingProcessor: pass\n")
+    (output_dir / "processor_config.json").write_text(
+        json.dumps(
+            {
+                "auto_map": {"AutoProcessor": "processor.TrainingProcessor"},
+                "max_input_tiles": 2,
+            }
+        )
+    )
+    (output_dir / "tokenizer_config.json").write_text(
+        json.dumps({"auto_map": {"AutoProcessor": "processor.TrainingProcessor"}})
+    )
+    model_part = SimpleNamespace(
+        _export_processor_auto_map="processing_source.SourceProcessor",
+    )
+
+    _align_exported_processor_with_original_model_code(
+        str(output_dir),
+        model_part,
+    )
+
+    processor_config = json.loads((output_dir / "processor_config.json").read_text())
+    tokenizer_config = json.loads((output_dir / "tokenizer_config.json").read_text())
+    assert processor_config["auto_map"]["AutoProcessor"] == "processing_source.SourceProcessor"
+    assert tokenizer_config["auto_map"]["AutoProcessor"] == "processing_source.SourceProcessor"
+    assert processor_config["max_input_tiles"] == 2
+    assert (output_dir / "processor.py").exists()
+
+
+def test_align_exported_processor_requires_explicit_model_opt_in(tmp_path):
+    output_dir = tmp_path / "export"
+    output_dir.mkdir()
+
+    (output_dir / "processing_source.py").write_text("class SourceProcessor: pass\n")
+    (output_dir / "processor_config.json").write_text(
+        json.dumps({"auto_map": {"AutoProcessor": "processor.TrainingProcessor"}})
+    )
+    model_part = SimpleNamespace()
+
+    _align_exported_processor_with_original_model_code(
+        str(output_dir),
+        model_part,
+    )
+
+    processor_config = json.loads((output_dir / "processor_config.json").read_text())
+    assert processor_config["auto_map"]["AutoProcessor"] == "processor.TrainingProcessor"
+
+
+def test_consolidated_addon_realigns_processor_after_save_pretrained(tmp_path):
+    original_dir = tmp_path / "original"
+    output_dir = tmp_path / "export"
+    original_dir.mkdir()
+    output_dir.mkdir()
+
+    original_auto_map = {
+        "AutoModel": "modeling_source.SourceModel",
+        "AutoProcessor": "processing_source.SourceProcessor",
+    }
+    (original_dir / "config.json").write_text(json.dumps({"auto_map": original_auto_map}))
+    (original_dir / "processor_config.json").write_text(
+        json.dumps({"auto_map": {"AutoProcessor": "processing_source.SourceProcessor"}})
+    )
+    (original_dir / "processing_source.py").write_text("class SourceProcessor: pass\n")
+
+    class _Config(dict):
+        def __init__(self):
+            super().__init__(auto_map=original_auto_map)
+            self.auto_map = original_auto_map.copy()
+
+    class _TrainingProcessor:
+        def save_pretrained(self, save_directory):
+            with open(os.path.join(save_directory, "processor_config.json"), "w") as f:
+                json.dump(
+                    {
+                        "auto_map": {"AutoProcessor": "processor.TrainingProcessor"},
+                        "max_input_tiles": 2,
+                    },
+                    f,
+                )
+            with open(os.path.join(save_directory, "tokenizer_config.json"), "w") as f:
+                json.dump({"auto_map": {"AutoProcessor": "processor.TrainingProcessor"}}, f)
+            with open(os.path.join(save_directory, "processor.py"), "w") as f:
+                f.write("class TrainingProcessor: pass\n")
+
+    model_part = SimpleNamespace(
+        config=_Config(),
+        generation_config=None,
+        _export_processor_auto_map="processing_source.SourceProcessor",
+    )
+    ConsolidatedHFAddon().pre_save(
+        model_state=SimpleNamespace(model=[model_part]),
+        hf_metadata_dir=str(output_dir),
+        tokenizer=_TrainingProcessor(),
+        fqn_to_file_index_mapping={},
+        original_model_path=str(original_dir),
+    )
+
+    processor_config = json.loads((output_dir / "processor_config.json").read_text())
+    tokenizer_config = json.loads((output_dir / "tokenizer_config.json").read_text())
+    assert processor_config["auto_map"]["AutoProcessor"] == "processing_source.SourceProcessor"
+    assert tokenizer_config["auto_map"]["AutoProcessor"] == "processing_source.SourceProcessor"
+    assert processor_config["max_input_tiles"] == 2
 
 
 def test_model_state_keeps_lm_head_when_storage_not_shared():

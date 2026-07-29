@@ -19,6 +19,8 @@ import shutil
 from typing import TYPE_CHECKING, Protocol
 
 import torch
+from huggingface_hub import snapshot_download
+from huggingface_hub.errors import HFValidationError, LocalEntryNotFoundError
 from torch import nn
 
 from nemo_automodel.components.checkpoint._backports.hf_utils import (
@@ -82,7 +84,7 @@ class ConsolidatedHFAddon:
         # Perform save operations on rank 0
         if _is_group_rank_0(process_group):
             # if the HF model has custom model code, we need to save it as part of the checkpoint
-            _maybe_save_custom_model_code(original_model_path, hf_metadata_dir, model_part=model_part)
+            save_custom_model_code(original_model_path, hf_metadata_dir, model_part=model_part)
             # save the config.json file
             if hasattr(model_part, "config"):
                 v4_compatible = kwargs.get("v4_compatible", False)
@@ -125,6 +127,10 @@ class ConsolidatedHFAddon:
             # save the tokenizer
             if tokenizer is not None:
                 tokenizer.save_pretrained(hf_metadata_dir)
+                _align_exported_processor_with_original_model_code(
+                    hf_metadata_dir,
+                    model_part,
+                )
 
             # save the fqn_to_file_index_mapping file
             with open(os.path.join(hf_metadata_dir, FQN_TO_FILE_INDEX_MAPPING_FILENAME), "w") as f:
@@ -198,10 +204,14 @@ class PeftAddon:
         if _is_group_rank_0(process_group):
             # if the HF model has custom model code, we need to save it as part of the checkpoint
             model_part = model_state.model[0] if model_state is not None else None
-            _maybe_save_custom_model_code(original_model_path, model_path, model_part=model_part)
+            save_custom_model_code(original_model_path, model_path, model_part=model_part)
             # save the tokenizer
             if tokenizer is not None:
                 tokenizer.save_pretrained(model_path)
+                _align_exported_processor_with_original_model_code(
+                    model_path,
+                    model_part,
+                )
             # save in HF format. Only keys that are needed for PEFT module loading will be saved here.
             with open(os.path.join(model_path, "adapter_config.json"), "w") as f:
                 json.dump(hf_peft_config, f, indent=2, sort_keys=True)
@@ -495,6 +505,71 @@ def _save_original_config_json(original_model_path: str, hf_metadata_dir: str, c
         json.dump(cfg, f, indent=2)
 
 
+def _load_json_dict(path: str) -> dict | None:
+    """Load a JSON object, returning ``None`` for missing or malformed files."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            value = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _auto_map_code_is_present(auto_map_value, output_dir: str) -> bool:
+    """Return whether an ``auto_map`` value references Python code in ``output_dir``."""
+    refs = auto_map_value if isinstance(auto_map_value, (list, tuple)) else [auto_map_value]
+    for ref in refs:
+        if not isinstance(ref, str) or "." not in ref:
+            continue
+        # Hub auto_map values can include a ``repo_id--`` prefix. The copied local
+        # module uses only the module portion after that prefix.
+        module_ref = ref.rsplit("--", 1)[-1].rsplit(".", 1)[0]
+        module_path = os.path.join(output_dir, *module_ref.split(".")) + ".py"
+        if os.path.isfile(module_path):
+            return True
+    return False
+
+
+def _align_exported_processor_with_original_model_code(
+    output_dir: str,
+    model_part: nn.Module | None,
+) -> None:
+    """Apply an explicit model request to export its paired processor code.
+
+    ``tokenizer.save_pretrained`` writes the active training processor's
+    ``AutoProcessor`` mapping. Retrieval models can intentionally preserve the
+    original checkpoint's standalone model code while training with a newer
+    Automodel processor. In that case, mixing the newer processor with the
+    original model can break inference even when their class names match.
+
+    Models opt in by setting ``_export_processor_auto_map`` on the model passed
+    to the checkpointer. The addon does not infer intent from generic Hugging
+    Face metadata, so other custom-code models are unaffected by default.
+    Runtime settings written by the active processor (for example
+    ``max_input_tiles``) remain unchanged.
+    """
+    if model_part is None:
+        return
+
+    processor_ref = getattr(model_part, "_export_processor_auto_map", None)
+    if processor_ref is None or not _auto_map_code_is_present(processor_ref, output_dir):
+        return
+
+    for config_name in ("processor_config.json", "tokenizer_config.json"):
+        config_path = os.path.join(output_dir, config_name)
+        exported_config = _load_json_dict(config_path)
+        if exported_config is None:
+            continue
+        exported_auto_map = exported_config.get("auto_map")
+        if not isinstance(exported_auto_map, dict):
+            exported_auto_map = {}
+            exported_config["auto_map"] = exported_auto_map
+        exported_auto_map["AutoProcessor"] = processor_ref
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump(exported_config, f, indent=2)
+            f.write("\n")
+
+
 # Symbols some trust_remote_code models import at module load that newer transformers
 # removed. Map symbol -> (module, fallback literal) so a consolidated checkpoint reloads
 # under a deploy container whose transformers dropped them (e.g. DeciLM/Nemotron-Super
@@ -546,7 +621,7 @@ def _apply_transformers_compat_guards(py_path: str) -> None:
             f.writelines(out)
 
 
-def _maybe_save_custom_model_code(
+def save_custom_model_code(
     original_model_path: str | None,
     hf_metadata_dir: str,
     model_part: nn.Module | None = None,
@@ -555,10 +630,13 @@ def _maybe_save_custom_model_code(
     Save the custom model code if it exists. This function preserves the original directory structure.
 
     When ``original_model_path`` is a local dir, copy its ``.py`` files. When it is an HF
-    hub id (e.g. ``nvidia/Nemotron-Flash-1B``) and the loaded model has ``auto_map`` custom
-    code, copy the ``.py`` files from the cached ``transformers_modules`` directory so the
-    consolidated checkpoint carries ``modeling_*.py`` locally and reloads without needing
-    ``trust_remote_code=True``.
+    Hub ID, resolve its locally cached snapshot first. If no snapshot is available, fall
+    back to custom code loaded through Transformers' dynamic-module cache.
+
+    Args:
+        original_model_path: Local model path or Hugging Face Hub ID that supplied the model.
+        hf_metadata_dir: Destination directory for the exported Python files.
+        model_part: Optional loaded model used to locate Transformers dynamic-module code.
     """
     copied: set[str] = set()
 
@@ -575,14 +653,21 @@ def _maybe_save_custom_model_code(
             _apply_transformers_compat_guards(dst_path)
             copied.add(dst_path)
 
-    if original_model_path is not None:
-        if os.path.isfile(original_model_path):
-            dst_path = os.path.join(hf_metadata_dir, os.path.basename(original_model_path))
+    resolved_model_path = original_model_path
+    if original_model_path is not None and not os.path.exists(original_model_path):
+        try:
+            resolved_model_path = snapshot_download(original_model_path, local_files_only=True)
+        except (HFValidationError, LocalEntryNotFoundError, OSError):
+            resolved_model_path = None
+
+    if resolved_model_path is not None:
+        if os.path.isfile(resolved_model_path):
+            dst_path = os.path.join(hf_metadata_dir, os.path.basename(resolved_model_path))
             os.makedirs(hf_metadata_dir, exist_ok=True)
-            shutil.copy2(original_model_path, dst_path)
+            shutil.copy2(resolved_model_path, dst_path)
             copied.add(dst_path)
-        elif os.path.isdir(original_model_path):
-            _copy_py_tree(original_model_path)
+        elif os.path.isdir(resolved_model_path):
+            _copy_py_tree(resolved_model_path)
 
     # Fallback: HF hub id path — resolve custom code via the model class's module file.
     # Needed for trust_remote_code models (e.g. Nemotron-Flash) so reloads from the

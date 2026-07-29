@@ -30,6 +30,7 @@ phases:
     step_scheduler.max_steps: 50
     step_scheduler.ckpt_every_steps: 50
     step_scheduler.val_every_steps: 50
+    lr_scheduler.lr_warmup_steps: 2
 
   release: *nightly_defaults
 
@@ -37,6 +38,7 @@ phases:
     step_scheduler.max_steps: 200
     step_scheduler.ckpt_every_steps: 200
     step_scheduler.val_every_steps: 200
+    lr_scheduler.lr_warmup_steps: 20
     wandb.entity: Nemo-automodel
     wandb.dir: /tmp/wandb/
 
@@ -50,6 +52,7 @@ phases:
     step_scheduler.val_every_steps: 5
     step_scheduler.global_batch_size: 32
     step_scheduler.local_batch_size: 2
+    lr_scheduler.lr_warmup_steps: 1
     checkpoint.enabled: true
     checkpoint.model_save_format: safetensors
     checkpoint.save_consolidated: true
@@ -113,14 +116,17 @@ computed:
 # resolved YAML's ci.<phase> block but does not apply them to the top-level.
 fixture_keys:
   checkpoint_robustness:
+    - check_hf_reload
     - check_source_load_parity
     - check_fused_qkv_keys
     - check_phantom_keys
     - check_resume
     - cross_tp_kl_threshold
     - cross_tp_size
+    - cosine_threshold
     - experts_implementation
     - hf_device_map_auto
+    - hf_cosine_threshold
     - hf_kl_threshold
     - kl_threshold
     - hf_source_post_load_dequantize

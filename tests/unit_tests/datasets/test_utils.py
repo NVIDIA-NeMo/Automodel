@@ -417,6 +417,104 @@ def test_create_causal_mask_mapping_uses_inputs_embeds_keyword() -> None:
     assert "input_embeds" not in mock_create_causal.call_args.kwargs
 
 
+def test_create_bidirectional_mask_for_batch_flash_attention_fallback(monkeypatch):
+    monkeypatch.setattr(sftp, "_HAS_NATIVE_BIDIRECTIONAL_MASK", False)
+    config = SimpleNamespace(_attn_implementation="flash_attention_2", torch_dtype=torch.bfloat16)
+
+    assert sftp.create_bidirectional_mask_for_batch(config, None) is None
+
+    existing_mask = torch.ones((1, 1, 2, 2), dtype=torch.bool)
+    assert sftp.create_bidirectional_mask_for_batch(config, existing_mask) is existing_mask
+
+    all_visible = torch.ones((2, 3), dtype=torch.long)
+    assert sftp.create_bidirectional_mask_for_batch(config, all_visible) is None
+
+    padded = torch.tensor([[1, 1, 0], [1, 1, 1]], dtype=torch.long)
+    mask = sftp.create_bidirectional_mask_for_batch(config, padded)
+
+    assert torch.equal(mask, padded)
+
+
+def test_create_bidirectional_mask_for_batch_delegates_to_native_mask(monkeypatch):
+    captured = {}
+
+    def fake_create_bidirectional_mask(model_config, input_embeds, attention_mask):
+        captured["model_config"] = model_config
+        captured["input_embeds_shape"] = tuple(input_embeds.shape)
+        captured["input_embeds_dtype"] = input_embeds.dtype
+        captured["attention_mask"] = attention_mask
+        return "native-mask"
+
+    monkeypatch.setattr(sftp, "_HAS_NATIVE_BIDIRECTIONAL_MASK", True)
+    monkeypatch.setattr(sftp, "create_bidirectional_mask", fake_create_bidirectional_mask)
+    config = SimpleNamespace(torch_dtype="torch.bfloat16")
+    attention_mask = torch.ones((2, 3), dtype=torch.long)
+
+    mask = sftp.create_bidirectional_mask_for_batch(config, attention_mask)
+
+    assert mask == "native-mask"
+    assert captured == {
+        "model_config": config,
+        "input_embeds_shape": (2, 3, 1),
+        "input_embeds_dtype": torch.bfloat16,
+        "attention_mask": attention_mask,
+    }
+
+
+def test_create_bidirectional_mask_for_batch_uses_4d_fallback(monkeypatch):
+    captured = {}
+
+    def fake_prepare_4d_attention_mask(attention_mask, dtype):
+        captured["attention_mask"] = attention_mask
+        captured["dtype"] = dtype
+        return "4d-mask"
+
+    monkeypatch.setattr(sftp, "_HAS_NATIVE_BIDIRECTIONAL_MASK", False)
+    monkeypatch.setattr(sftp, "_prepare_4d_attention_mask", fake_prepare_4d_attention_mask, raising=False)
+    config = SimpleNamespace(_attn_implementation="sdpa", dtype="float16")
+    attention_mask = torch.ones((2, 3), dtype=torch.long)
+
+    mask = sftp.create_bidirectional_mask_for_batch(config, attention_mask)
+
+    assert mask == "4d-mask"
+    assert captured == {"attention_mask": attention_mask, "dtype": torch.float16}
+
+
+def test_add_bidirectional_masks_to_retrieval_batch_marks_precomputed_masks(monkeypatch):
+    monkeypatch.setattr(sftp, "_HAS_NATIVE_BIDIRECTIONAL_MASK", False)
+    config = SimpleNamespace(_attn_implementation="flash_attention_2", torch_dtype=torch.bfloat16)
+    q_attention_mask = torch.tensor([[1, 1, 0]], dtype=torch.long)
+    d_attention_mask = torch.ones((2, 4), dtype=torch.long)
+    batch = {
+        "q_attention_mask": q_attention_mask,
+        "d_attention_mask": d_attention_mask,
+        "labels": torch.zeros(1, dtype=torch.long),
+    }
+
+    result = sftp.add_bidirectional_masks_to_retrieval_batch(batch, config)
+
+    assert result is batch
+    assert torch.equal(result["q_bidirectional_mask"], q_attention_mask)
+    assert result["q_bidirectional_mask_precomputed"] is True
+    assert result["d_bidirectional_mask"] is None
+    assert result["d_bidirectional_mask_precomputed"] is True
+    assert torch.equal(result["labels"], torch.zeros(1, dtype=torch.long))
+
+
+def test_add_bidirectional_masks_to_retrieval_batch_skips_missing_prefixes(monkeypatch):
+    monkeypatch.setattr(sftp, "_HAS_NATIVE_BIDIRECTIONAL_MASK", False)
+    batch = {"q_attention_mask": torch.ones((1, 2), dtype=torch.long)}
+
+    result = sftp.add_bidirectional_masks_to_retrieval_batch(
+        batch,
+        SimpleNamespace(_attn_implementation="flash_attention_2"),
+    )
+
+    assert result is batch
+    assert "q_bidirectional_mask" in result
+    assert "d_bidirectional_mask" not in result
+
+
 class TestPackedSequenceTHDCollater:
     """Tests for packed_sequence_thd_collater function."""
 
