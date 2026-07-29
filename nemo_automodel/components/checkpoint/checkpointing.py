@@ -618,6 +618,7 @@ class Checkpointer:
             device_mesh=self.moe_mesh,
             v4_compatible=self.config.v4_compatible,
         )
+        state_dict = _maybe_rename_gemma4_unified_keys(model_state.model[0], state_dict, to_hf=True)
         # MoE adapters return non-contiguous views; safetensors.save rejects those.
         _materialize_to_hf_views_for_save(state_dict)
         # Build the consolidated model.safetensors.index.json if needed
@@ -905,6 +906,11 @@ class Checkpointer:
             quantization=self.config.dequantize_base_checkpoint,
             device_mesh=self.moe_mesh,
         )
+        # Resuming from a DCP checkpoint we wrote: its shards carry HF FQNs, so the load
+        # destinations must too. Base-model init instead relies on the storage reader's
+        # key_mapping, which already translates the checkpoint keys.
+        if not is_init_step:
+            state_dict = _maybe_rename_gemma4_unified_keys(model_state.model[0], state_dict, to_hf=True)
 
         compat_tied_lm_head_source_key: str | None = None
         lm_head_param_name = getattr(model_state, "lm_head_param_name", None)
@@ -1000,6 +1006,8 @@ class Checkpointer:
         if compat_tied_lm_head_source_key is not None and isinstance(lm_head_param_name, str):
             state_dict[lm_head_param_name] = state_dict.pop(compat_tied_lm_head_source_key)
 
+        if not is_init_step:
+            state_dict = _maybe_rename_gemma4_unified_keys(model_state.model[0], state_dict, to_hf=False)
         state_dict = _maybe_adapt_state_dict_from_hf(model_state.model[0], state_dict, moe_mesh=self.moe_mesh)
         expected_keys_for_diff = {k for k in expected_keys if not k.endswith("_extra_state")}
         loaded_keys_for_diff = {k for k in state_dict if not k.endswith("_extra_state")}
@@ -2295,22 +2303,51 @@ def _maybe_adapt_state_dict_to_hf(
             quantization=quantization,
             **kwargs,
         )
-    if getattr(getattr(model_part, "config", None), "model_type", None) == "gemma4_unified":
-        state_dict = _rename_gemma4_unified_state_dict_to_hf(state_dict)
     return state_dict
 
 
-def _rename_gemma4_unified_state_dict_to_hf(
-    state_dict: dict[str, torch.Tensor],
+def _maybe_rename_gemma4_unified_keys(
+    model_part: nn.Module, state_dict: dict[str, torch.Tensor], to_hf: bool
 ) -> dict[str, torch.Tensor]:
-    """Restore Gemma4 Unified checkpoint keys from model FQNs to HF FQNs."""
+    """Translate Gemma4 Unified keys between model FQNs and the HF checkpoint layout.
+
+    Transformers renames six Gemma4 Unified vision keys while loading a checkpoint, so the
+    in-memory FQNs differ from the names the original HF checkpoint uses. ``gemma4_unified`` is
+    HF-native and has no ``state_dict_adapter``, so nothing else reverses those renames: without
+    this, saved checkpoints (both the DCP shards and the consolidated safetensors merged from
+    them) carry internal names such as
+    ``embed_vision.multimodal_embedder.embedding_projection.weight``.
+
+    This is only applied on the save and DCP-resume paths, which read and write checkpoints
+    Automodel itself produced. Loading a base HF checkpoint goes through the storage reader's
+    ``key_mapping`` (built from the model's ``_checkpoint_conversion_mapping``), which already
+    performs the HF-to-model translation; renaming there too would double-transform the keys.
+
+    Args:
+        model_part: Model part whose ``config.model_type`` selects the renaming.
+        state_dict: State dict to translate.
+        to_hf: If True, rename model FQNs to HF FQNs; otherwise apply the inverse.
+
+    Returns:
+        The translated state dict, or ``state_dict`` unchanged for other model types.
+
+    Raises:
+        ValueError: If two source keys collide on the same renamed key.
+    """
+    if getattr(getattr(_unwrap_ddp_model(model_part), "config", None), "model_type", None) != "gemma4_unified":
+        return state_dict
+    if to_hf:
+        renames = _GEMMA4_UNIFIED_HF_EXPORT_KEY_RENAMES
+    else:
+        renames = {hf_key: model_key for model_key, hf_key in _GEMMA4_UNIFIED_HF_EXPORT_KEY_RENAMES.items()}
+
     renamed_state_dict: dict[str, torch.Tensor] = {}
     for key, tensor in state_dict.items():
         prefix = "model." if key.startswith("model.") else ""
         unprefixed_key = key[len(prefix) :]
-        for model_key, hf_key in _GEMMA4_UNIFIED_HF_EXPORT_KEY_RENAMES.items():
-            if unprefixed_key == model_key or unprefixed_key.startswith(f"{model_key}."):
-                unprefixed_key = f"{hf_key}{unprefixed_key[len(model_key) :]}"
+        for source_key, target_key in renames.items():
+            if unprefixed_key == source_key or unprefixed_key.startswith(f"{source_key}."):
+                unprefixed_key = f"{target_key}{unprefixed_key[len(source_key) :]}"
                 break
         renamed_key = f"{prefix}{unprefixed_key}"
         if renamed_key in renamed_state_dict:
