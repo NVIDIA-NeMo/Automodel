@@ -29,6 +29,7 @@ from nemo_automodel.components.models.kimi_k3.model import (
     KimiMLAAttention,
     _partition_attn_residual_blocks,
 )
+from nemo_automodel.components.moe.experts import GroupedExperts, GroupedExpertsDeepEP
 
 
 def _torch_backend() -> BackendConfig:
@@ -302,6 +303,7 @@ def test_k3_moe_training_forward_matches_reference_order(experts_backend):
     model.initialize_weights(torch.device("cpu"), dtype=torch.float32)
     moe = model.model.layers["0"].mlp
     assert isinstance(moe, KimiK3MoE)
+    assert type(moe.experts) is GroupedExperts
     assert moe.experts.apply_router_weight_after_down is True
 
     hidden_states = torch.randn(2, 3, config.hidden_size)
@@ -319,6 +321,22 @@ def test_k3_moe_training_forward_matches_reference_order(experts_backend):
 
     assert torch.isfinite(actual).all()
     torch.testing.assert_close(actual, reference, rtol=1e-5, atol=1e-6)
+
+
+def test_k3_moe_uses_shared_flex_dispatcher_experts(monkeypatch):
+    config = _tiny_config(num_hidden_layers=1, attn_res_block_size=1)
+    config.first_k_dense_replace = 0
+    backend = _torch_backend()
+    backend.experts = "torch_mm"
+    backend.dispatcher = "hybridep"
+    monkeypatch.setattr(kimi_k3_model, "get_world_size_safe", lambda: 2)
+
+    model = KimiK3ForCausalLM(config, backend=backend)
+    moe = model.model.layers["0"].mlp
+
+    assert type(moe.experts) is GroupedExpertsDeepEP
+    assert moe.experts.dispatcher_backend == "hybridep"
+    assert moe.experts.apply_router_weight_after_down is True
 
 
 def test_two_pipeline_stage_handoff_matches_full_model():

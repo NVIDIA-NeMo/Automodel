@@ -1028,41 +1028,6 @@ class KimiK3Gate(Gate):
         return weights * self.route_scale, indices, None
 
 
-class KimiK3GroupedExperts(GroupedExperts):
-    """Grouped expert parameters with the K3 SiTU activation."""
-
-    def __init__(self, config: MoEConfig, backend: BackendConfig, text_config: KimiK3TextConfig) -> None:
-        super().__init__(config, backend=backend)
-        # The checkpoint reference rounds each BF16 expert output before applying
-        # its FP32 router weight and reducing the top-k outputs.
-        self.apply_router_weight_after_down = True
-        self.expert_activation_grouped = partial(
-            _weighted_situ,
-            beta=text_config.activation_situ_beta or 1.0,
-            linear_beta=text_config.activation_situ_linear_beta,
-        )
-
-
-class KimiK3GroupedExpertsDeepEP(GroupedExpertsDeepEP):
-    """HybridEP/DeepEP grouped experts with K3's SiTU ordering."""
-
-    def __init__(self, config: MoEConfig, backend: BackendConfig, text_config: KimiK3TextConfig) -> None:
-        super().__init__(
-            config,
-            backend=backend,
-            dispatcher_backend=backend.dispatcher,
-            dispatcher_num_sms=backend.dispatcher_num_sms,
-            dispatcher_share_token_dispatcher=backend.dispatcher_share_token_dispatcher,
-            dispatcher_async_dispatch=backend.dispatcher_async_dispatch,
-        )
-        self.apply_router_weight_after_down = True
-        self.expert_activation = partial(
-            _weighted_situ,
-            beta=text_config.activation_situ_beta or 1.0,
-            linear_beta=text_config.activation_situ_linear_beta,
-        )
-
-
 class KimiK3MoE(MoE):
     """K3 routed experts with latent projections and a SiTU shared expert."""
 
@@ -1073,10 +1038,27 @@ class KimiK3MoE(MoE):
         self.n_routed_experts = moe_config.n_routed_experts
         self.n_activated_experts = moe_config.n_activated_experts
         self.gate = KimiK3Gate(moe_config, gate_precision=torch.float32)
+        expert_activation = partial(
+            _weighted_situ,
+            beta=config.activation_situ_beta or 1.0,
+            linear_beta=config.activation_situ_linear_beta,
+        )
         if backend.dispatcher in ("deepep", "hybridep", "uccl_ep") and get_world_size_safe() > 1:
-            self.experts = KimiK3GroupedExpertsDeepEP(moe_config, backend, config)
+            self.experts = GroupedExpertsDeepEP(
+                moe_config,
+                backend=backend,
+                dispatcher_backend=backend.dispatcher,
+                dispatcher_num_sms=backend.dispatcher_num_sms,
+                dispatcher_share_token_dispatcher=backend.dispatcher_share_token_dispatcher,
+                dispatcher_async_dispatch=backend.dispatcher_async_dispatch,
+            )
+            self.experts.expert_activation = expert_activation
         else:
-            self.experts = KimiK3GroupedExperts(moe_config, backend, config)
+            self.experts = GroupedExperts(moe_config, backend=backend)
+            self.experts.expert_activation_grouped = expert_activation
+        # The checkpoint reference rounds each BF16 expert output before applying
+        # its FP32 router weight and reducing the top-k outputs.
+        self.experts.apply_router_weight_after_down = True
         shared_intermediate = config.moe_intermediate_size * (config.num_shared_experts or 0)
         self.shared_experts = (
             KimiK3MLP(config, intermediate_size=shared_intermediate, dtype=moe_config.dtype)
