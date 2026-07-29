@@ -131,8 +131,7 @@ class RecipeConfig:
     """Typed view over the YAML config consumed by recipes.
 
     ``wandb``, ``mlflow``, ``step_scheduler``, ``lr_scheduler``, ``optimizer``,
-    ``loss_fn`` and ``checkpoint`` are exposed as typed objects that own a
-    ``.build(...)`` (``optimizer`` is an
+    ``loss_fn`` and ``checkpoint`` are exposed as typed objects (``optimizer`` is an
     :class:`~nemo_automodel.components.optim.optimizer.OptimizerConfig`,
     ``checkpoint`` a
     :class:`~nemo_automodel.components.checkpoint.config.CheckpointingConfig`);

@@ -17,15 +17,19 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.nn.functional as F
 from torch import nn
 
+import nemo_automodel.components.models.kimi_k3.model as kimi_k3_model
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.kimi_k3.config import KimiK3Config, KimiK3TextConfig
 from nemo_automodel.components.models.kimi_k3.model import (
     KimiK3ForCausalLM,
     KimiK3MoE,
+    KimiMLAAttention,
     _partition_attn_residual_blocks,
 )
+from nemo_automodel.components.moe.experts import GroupedExperts, GroupedExpertsDeepEP
 
 
 def _torch_backend() -> BackendConfig:
@@ -233,6 +237,56 @@ def test_weight_initialization_and_forward_without_attention_residuals():
     assert torch.isfinite(logits).all()
 
 
+def test_k3_mla_uses_te_backend_and_matches_eager(monkeypatch):
+    torch.manual_seed(3)
+    config = _tiny_config(num_hidden_layers=1, attn_res_block_size=None)
+    eager = KimiMLAAttention(config, layer_idx=0, backend=_torch_backend())
+    captured = {}
+
+    def fake_initialize_attn_module_and_func(**kwargs):
+        captured.update(kwargs)
+
+        def attention(query, key, value, **attention_kwargs):
+            assert attention_kwargs["window_size"] == (-1, 0)
+            output = F.scaled_dot_product_attention(
+                query.transpose(1, 2),
+                key.transpose(1, 2),
+                value.transpose(1, 2),
+                is_causal=True,
+                scale=kwargs["softmax_scale"],
+            )
+            return output.transpose(1, 2)
+
+        return nn.Identity(), attention
+
+    monkeypatch.setattr(
+        kimi_k3_model,
+        "initialize_attn_module_and_func",
+        fake_initialize_attn_module_and_func,
+    )
+    te_backend = _torch_backend()
+    te_backend.attn = "te"
+    te = KimiMLAAttention(config, layer_idx=0, backend=te_backend)
+    te.load_state_dict(eager.state_dict())
+
+    hidden_states = torch.randn(2, 6, config.hidden_size)
+    min_value = torch.finfo(hidden_states.dtype).min
+    attention_mask = torch.triu(
+        torch.full((6, 6), min_value, dtype=hidden_states.dtype),
+        diagonal=1,
+    )[None, None]
+    eager.eval()
+    te.eval()
+    with torch.no_grad():
+        expected = eager(hidden_states, attention_mask=attention_mask)
+        actual = te(hidden_states, attention_mask=attention_mask)
+
+    assert captured["attn_impl"] == "te"
+    assert captured["num_qk_channels"] == config.qk_nope_head_dim + config.qk_rope_head_dim
+    assert captured["num_v_channels"] == config.v_head_dim
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+
+
 @pytest.mark.parametrize("experts_backend", ["torch", "torch_mm"])
 def test_k3_moe_training_forward_matches_reference_order(experts_backend):
     torch.manual_seed(5)
@@ -249,7 +303,8 @@ def test_k3_moe_training_forward_matches_reference_order(experts_backend):
     model.initialize_weights(torch.device("cpu"), dtype=torch.float32)
     moe = model.model.layers["0"].mlp
     assert isinstance(moe, KimiK3MoE)
-    assert moe.experts.apply_router_weight_after_down is True
+    assert type(moe.experts) is GroupedExperts
+    assert moe.experts.config.apply_router_weight_after_down is True
 
     hidden_states = torch.randn(2, 3, config.hidden_size)
     token_mask = torch.ones(hidden_states.numel() // config.hidden_size, dtype=torch.bool)
@@ -266,6 +321,22 @@ def test_k3_moe_training_forward_matches_reference_order(experts_backend):
 
     assert torch.isfinite(actual).all()
     torch.testing.assert_close(actual, reference, rtol=1e-5, atol=1e-6)
+
+
+def test_k3_moe_uses_shared_flex_dispatcher_experts(monkeypatch):
+    config = _tiny_config(num_hidden_layers=1, attn_res_block_size=1)
+    config.first_k_dense_replace = 0
+    backend = _torch_backend()
+    backend.experts = "torch_mm"
+    backend.dispatcher = "hybridep"
+    monkeypatch.setattr(kimi_k3_model, "get_world_size_safe", lambda: 2)
+
+    model = KimiK3ForCausalLM(config, backend=backend)
+    moe = model.model.layers["0"].mlp
+
+    assert type(moe.experts) is GroupedExpertsDeepEP
+    assert moe.experts.dispatcher_backend == "hybridep"
+    assert moe.experts.config.apply_router_weight_after_down is True
 
 
 def test_two_pipeline_stage_handoff_matches_full_model():

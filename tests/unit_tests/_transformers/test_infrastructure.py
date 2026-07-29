@@ -115,6 +115,7 @@ def test_moe_infrastructure_forwards_fsdp2_tp_sequence_and_offload_settings():
     manager.mp_policy = object()
     manager.reshard_after_forward = True
     manager.enable_async_tensor_parallel = False
+    manager.frozen_multimodal_sharding = "replicate"
     mesh = SimpleNamespace(ep_size=2)
 
     with (
@@ -134,6 +135,7 @@ def test_moe_infrastructure_forwards_fsdp2_tp_sequence_and_offload_settings():
     assert parallelize_fn.keywords["mp_policy"] is manager.mp_policy
     assert parallelize_fn.keywords["reshard_after_forward"] is True
     assert parallelize_fn.keywords["enable_async_tensor_parallel"] is False
+    assert parallelize_fn.keywords["frozen_multimodal_sharding"] == "replicate"
 
 
 # =============================================================================
