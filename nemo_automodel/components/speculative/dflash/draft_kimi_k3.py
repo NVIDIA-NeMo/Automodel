@@ -65,8 +65,8 @@ class KimiK3DFlashAttention(KimiMLAAttention):
     target's ``_expand_key_value_groups`` is not needed here.
     """
 
-    def __init__(self, config: KimiK3TextConfig, layer_idx: int) -> None:
-        super().__init__(config, layer_idx)
+    def __init__(self, config: KimiK3TextConfig, layer_idx: int, backend: BackendConfig) -> None:
+        super().__init__(config, layer_idx, backend)
         if self.num_key_value_heads != self.num_heads:
             raise ValueError(
                 "Kimi K3 DFlash MLA expects one K/V head per query head, got "
@@ -150,9 +150,9 @@ class KimiK3DFlashAttention(KimiMLAAttention):
 class KimiK3DFlashDecoderLayer(nn.Module):
     """Pre-norm K3 MLA block over ``[context | noise]`` followed by a dense SiTU MLP."""
 
-    def __init__(self, config: KimiK3TextConfig, layer_idx: int) -> None:
+    def __init__(self, config: KimiK3TextConfig, layer_idx: int, backend: BackendConfig) -> None:
         super().__init__()
-        self.self_attn = KimiK3DFlashAttention(config, layer_idx)
+        self.self_attn = KimiK3DFlashAttention(config, layer_idx, backend)
         self.mlp = KimiK3MLP(config)
         self.input_layernorm = KimiRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = KimiRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -212,8 +212,13 @@ class KimiK3DFlashDraftModel(nn.Module):
                 build_target_layer_ids(config.num_target_layers, config.num_hidden_layers),
             )
         )
+        # The draft replaces the MLA forward with its own SDPA path over the
+        # dense DFlash mask, so the only thing the parent's backend selects here
+        # is which extra attention modules it builds at init: "eager" builds
+        # none, which is what this subclass needs.
+        backend = BackendConfig(attn="eager", linear="torch", rms_norm="torch", rope_fusion=False)
         self.layers = nn.ModuleList(
-            [KimiK3DFlashDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+            [KimiK3DFlashDecoderLayer(config, layer_idx, backend) for layer_idx in range(config.num_hidden_layers)]
         )
         self.norm = KimiRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.fc = nn.Linear(len(self.target_layer_ids) * config.hidden_size, config.hidden_size, bias=False)
