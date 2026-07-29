@@ -422,9 +422,11 @@ def test_expert_parallel_partition_fn_shards_and_dispatcher(monkeypatch):
         def __init__(self):
             super().__init__()
             self.dispatch_called_with = None
+            self.dispatcher_backend = "deepep_v2"
+            self.config = types.SimpleNamespace(expert_dim=256, n_activated_experts=8)
 
-        def init_token_dispatcher(self, ep_mesh, num_max_tokens_per_rank=None):
-            self.dispatch_called_with = (ep_mesh, num_max_tokens_per_rank)
+        def init_token_dispatcher(self, ep_mesh):
+            self.dispatch_called_with = ep_mesh
 
         # override register_parameter to avoid strict type checks
         def register_parameter(self, name, param):
@@ -445,9 +447,15 @@ def test_expert_parallel_partition_fn_shards_and_dispatcher(monkeypatch):
     monkeypatch.setattr(P, "Shard", fake_shard)
     monkeypatch.setattr(P, "distribute_tensor", distribute_tensor_mock)
 
+    init_buffer_mock = MagicMock()
+    fused_a2a_stub = types.ModuleType("nemo_automodel.components.moe.megatron.fused_a2a")
+    fused_a2a_stub.init_deepep_v2_buffer = init_buffer_mock
+    monkeypatch.setitem(sys.modules, "nemo_automodel.components.moe.megatron.fused_a2a", fused_a2a_stub)
+
     ep = P.ExpertParallel(num_max_tokens_per_rank=4096)
     module = DummyGrouped()
-    device_mesh = type("Mesh", (), {"ndim": 1})()
+    ep_group = object()
+    device_mesh = type("Mesh", (), {"ndim": 1, "get_group": lambda self: ep_group})()
 
     # original parameter should exist
     assert any(True for _ in module.named_parameters(recurse=False))
@@ -463,7 +471,8 @@ def test_expert_parallel_partition_fn_shards_and_dispatcher(monkeypatch):
         assert isinstance(args[2], list) and args[2][0] is shard_sentinel
 
     # dispatcher must be initialized
-    assert module.dispatch_called_with == (device_mesh, 4096)
+    assert module.dispatch_called_with is device_mesh
+    init_buffer_mock.assert_called_once_with(ep_group, 4096, 256, 8)
 
 
 def test_expert_parallel_partition_fn_preserves_requires_grad(monkeypatch):

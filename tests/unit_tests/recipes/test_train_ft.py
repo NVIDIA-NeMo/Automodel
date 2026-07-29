@@ -38,7 +38,6 @@ from nemo_automodel.components.distributed.utils import dp_eval_sample_shard
 from nemo_automodel.components.eval.tool_call_evaluator import ToolCallAccuracyEvaluator
 from nemo_automodel.components.loss.mtp import PipelineCausalLMLoss
 from nemo_automodel.components.models.deepseek_v4.cp import dsv4_cp_local_seq_multiple
-from nemo_automodel.components.moe.parallelizer import _prepare_deepep_v2_buffer
 from nemo_automodel.components.optim.optimizer import build_optimizer_config
 from nemo_automodel.recipes._typed_config import RecipeConfig, _as_dict, _callable_and_kwargs
 from nemo_automodel.recipes.llm.train_ft import (
@@ -108,33 +107,6 @@ def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft):
     kwargs.pop("restore_from", None)
     derived = {"model_repo_id": model_repo_id, "model_cache_dir": cache_dir, "is_peft": is_peft}
     return CheckpointingConfig(**{**derived, **kwargs})
-
-
-def test_prepare_deepep_v2_buffer_uses_global_batch_high_water_mark(monkeypatch):
-    from nemo_automodel.components.moe.experts import GroupedExpertsDeepEP
-    from nemo_automodel.components.moe.megatron import fused_a2a
-
-    experts = GroupedExpertsDeepEP.__new__(GroupedExpertsDeepEP)
-    nn.Module.__init__(experts)
-    experts.dispatcher_backend = "deepep_v2"
-    experts.config = SimpleNamespace(expert_dim=256, n_activated_experts=8)
-    experts.token_dispatcher = SimpleNamespace(group=SimpleNamespace(size=lambda: 8))
-    calls = []
-
-    def all_reduce(capacity, **_kwargs):
-        capacity.fill_(5000)
-
-    monkeypatch.setitem(_prepare_deepep_v2_buffer.__globals__, "GroupedExpertsDeepEP", GroupedExpertsDeepEP)
-    monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
-    monkeypatch.setattr(fused_a2a, "init_deepep_v2_buffer", lambda *args: calls.append(args))
-
-    _prepare_deepep_v2_buffer(
-        [nn.Sequential(experts)],
-        [{"input_ids": torch.zeros(2, 1024)}, {"input_ids": torch.zeros(2, 1536)}],
-        torch.device("cpu"),
-    )
-
-    assert calls == [(experts.token_dispatcher.group, 8192, 256, 8)]
 
 
 class DummyIterableDataset(IterableDataset):  # noqa: D401

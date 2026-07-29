@@ -720,11 +720,7 @@ class GroupedExpertsDeepEP(nn.Module):
 
         self.expert_activation = get_expert_activation_for_deepep(config)
 
-    def init_token_dispatcher(
-        self,
-        ep_mesh: DeviceMesh,
-        num_max_tokens_per_rank: int | None = None,
-    ) -> None:
+    def init_token_dispatcher(self, ep_mesh: DeviceMesh):
         self.ep_size = ep_mesh.size()
         self.ep_rank = ep_mesh.get_local_rank()
         ep_group = ep_mesh.get_group()
@@ -757,15 +753,6 @@ class GroupedExpertsDeepEP(nn.Module):
         )
         if self.dispatcher_backend == "deepep":
             self._init_deepep_buffer(ep_group)
-        elif self.dispatcher_backend == "deepep_v2" and num_max_tokens_per_rank is not None:
-            from nemo_automodel.components.moe.megatron.fused_a2a import init_deepep_v2_buffer
-
-            init_deepep_v2_buffer(
-                ep_group,
-                num_max_tokens_per_rank,
-                self.config.expert_dim,
-                self.config.n_activated_experts,
-            )
 
     def _init_deepep_buffer(self, ep_group: dist.ProcessGroup) -> None:
         """Initialize DeepEP communication buffers before activation checkpointing."""
