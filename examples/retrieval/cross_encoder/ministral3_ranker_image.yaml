@@ -12,8 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Run with:
-# torchrun --nproc-per-node=8 examples/retrieval/cross_encoder/finetune.py --config examples/retrieval/cross_encoder/ministral3_ranker_image.yaml
+# To run this recipe:
+#   automodel examples/retrieval/cross_encoder/ministral3_ranker_image.yaml --nproc-per-node 8
+# Adjust --nproc-per-node to the number of GPUs available on your machine.
 
 recipe: TrainCrossEncoderRecipe
 
@@ -40,7 +41,7 @@ model:
   pooling: avg
   use_liger_kernel: true
   use_sdpa_patching: true
-  dtype: bfloat16
+  torch_dtype: bfloat16
   attn_implementation: flash_attention_2
 
 tokenizer:
@@ -51,30 +52,30 @@ tokenizer:
   pad_to_multiple_of: 8
   image_longest_edge: 1540
 
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.retrieval_dataset.RetrievalDatasetConfig
+  model_type: cross_encoder
+  data_dir_list:
+    - path: /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/01_datasets/03_training_datasets/docvqa_smolvlm_iteration2_mined_data_39302.json
+      num_samples: 20000
+    - path: /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/01_datasets/03_training_datasets/tatdqa_smolvlm_iteration1_mined_data_13188.json
+      num_samples: 10000
+    - path: /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/01_datasets/03_training_datasets/arxiv_qa_smolvlm_iteration1_mined_data_9949.json
+      num_samples: 9000
+    - path: /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/01_datasets/03_training_datasets/colpali_train_mined_filtered_docvqa_IVQA_68855_synthetic_prompt_1_remined.json
+      num_samples: 30000
+    - path: /lustre/fsw/portfolios/llmservice/users/ronaya/synthetic_query_generation/mined/infovqa_top05_nanovl_ronay3_8k_fixed_mined.json
+      num_samples: 8000
+    - path: /lustre/fsw/portfolios/llmservice/users/ronaya/synthetic_query_generation/mined/vdr_en_top05_nanovl_ronay3_42k_fixed_mined.json
+      num_samples: 40000
+  data_type: train
+  n_passages: 4
+  seed: 42
+  do_shuffle: true
+
 dataloader:
-  _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  dataset:
-    _target_: nemo_automodel.components.datasets.llm.make_retrieval_dataset
-    model_type: cross_encoder
-    data_dir_list:
-      - path: /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/01_datasets/03_training_datasets/docvqa_smolvlm_iteration2_mined_data_39302.json
-        num_samples: 20000
-      - path: /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/01_datasets/03_training_datasets/tatdqa_smolvlm_iteration1_mined_data_13188.json
-        num_samples: 10000
-      - path: /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/01_datasets/03_training_datasets/arxiv_qa_smolvlm_iteration1_mined_data_9949.json
-        num_samples: 9000
-      - path: /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/01_datasets/03_training_datasets/colpali_train_mined_filtered_docvqa_IVQA_68855_synthetic_prompt_1_remined.json 
-        num_samples: 30000
-      - path: /lustre/fsw/portfolios/llmservice/users/ronaya/synthetic_query_generation/mined/infovqa_top05_nanovl_ronay3_8k_fixed_mined.json 
-        num_samples: 8000
-      - path: /lustre/fsw/portfolios/llmservice/users/ronaya/synthetic_query_generation/mined/vdr_en_top05_nanovl_ronay3_42k_fixed_mined.json 
-        num_samples: 40000
-    data_type: train
-    n_passages: 4
-    seed: 42
-    do_shuffle: true
   collate_fn:
-    _target_: nemo_automodel.components.datasets.llm.make_vision_collator_from_processor_method
+    _target_: nemo_automodel.components.datasets.llm.ProcessorMethodCollator
     collator_fn_name: process_queries_documents_crossencoder
   shuffle: true
   num_workers: 4
