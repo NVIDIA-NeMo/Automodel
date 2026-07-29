@@ -402,13 +402,11 @@ class GroupedExperts(nn.Module):
                 experts_end_idx,
             )
 
-        # Gradient anchor
         if ep_size > 1:
             # Keep the differentiable all-gather path attached to x without materializing a full-size zero tensor.
             y.add_(x.sum(dtype=torch.float32) * 0.0)
 
-        # Variable-length reduce: all_reduce + narrow to original per-rank token boundaries
-        if ep_size > 1:
+            # Reduce and narrow to the original per-rank token boundaries.
             y = dist_nn_f.all_reduce(y, op=dist.ReduceOp.SUM, group=ep_group)
             start = sum(gathered_lens[:ep_rank])
             y = y.narrow(0, start, local_num_tokens).contiguous()
