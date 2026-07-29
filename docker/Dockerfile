@@ -176,6 +176,7 @@ RUN --mount=type=cache,target=/opt/uv_cache,sharing=locked \
     MAGI_ATTENTION_BUILD_COMPUTE_CAPABILITY="90,100" \
         MAGI_ATTENTION_PREBUILD_FFA=0 \
         MAX_JOBS=8 \
+        UV_CONCURRENT_INSTALLS=8 \
         uv sync --extra $AUTOMODEL_INSTALL --all-groups $UV_SYNC_ARGS && \
     python -c "import importlib.metadata as m; import magi_attention; print('magi-attention', m.version('magi-attention'))"
 
