@@ -16,6 +16,7 @@ concurrency:
 env:
   TORCH_CU_INDEX: https://download.pytorch.org/whl/cu130
   CUDA_CONTAINER_IMAGE: nvcr.io/nvidia/cuda-dl-base:26.04-cuda13.2-devel-ubuntu24.04
+  CUDA_WHEELHOUSE_REGISTRY: ghcr.io/nvidia-nemo/automodel-cuda-wheelhouse
 
 jobs:
   pre-flight:
@@ -157,6 +158,12 @@ jobs:
   cuda-wheelhouse:
     runs-on: linux-amd64-cpu16
     name: Build CUDA wheelhouse - Python${{ matrix.python-version }} - AMD64/Linux - NGC CUDA
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      reference: ${{ steps.cuda-wheelhouse-ref.outputs.reference }}
+      registry-hit: ${{ steps.restore-cuda-wheelhouse.outputs.registry-hit }}
     container:
       image: ${{ needs.setup-install-image.outputs.cuda_image }}
     environment: nemo-ci
@@ -183,8 +190,8 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Compute CUDA wheelhouse cache key
-        id: cuda-wheelhouse-key
+      - name: Compute CUDA wheelhouse reference
+        id: cuda-wheelhouse-ref
         shell: bash
         run: |
           fingerprint="$(
@@ -200,32 +207,43 @@ jobs:
               --torch-cuda-arch-list "${TORCH_CUDA_ARCH_LIST}" \
               --build-script .github/scripts/build-cuda-wheelhouse.sh
           )"
-          echo "key=install-test-cuda-wheelhouse-v3-${RUNNER_OS}-py${PYTHON_VERSION}-${fingerprint}" >> "$GITHUB_OUTPUT"
+          tag="v3-${RUNNER_OS,,}-py${PYTHON_VERSION}-${fingerprint}"
+          echo "reference=${CUDA_WHEELHOUSE_REGISTRY}:${tag}" >> "$GITHUB_OUTPUT"
 
-      # Keep the canonical wheelhouse on main. Copied PR branches restore it
-      # without creating duplicate branch-scoped multi-GB cache entries.
-      # Use exact keys only: pip wheel cannot incrementally consume an older
-      # wheelhouse, so a prefix fallback downloads gigabytes before rebuilding.
-      - name: Restore and save CUDA wheelhouse cache
-        id: cuda-wheelhouse-cache-main
-        if: github.ref == 'refs/heads/main'
-        uses: actions/cache@v4
+      - name: Install regctl
+        uses: regclient/actions/regctl-installer@c70ad64367908075211b10dcd2ab9fad4bfa1816
         with:
-          path: ${{ env.WHEELHOUSE_DIR }}
-          key: ${{ steps.cuda-wheelhouse-key.outputs.key }}
+          release: v0.11.5
 
-      - name: Restore CUDA wheelhouse cache
-        id: cuda-wheelhouse-cache-branch
-        if: github.ref != 'refs/heads/main'
-        uses: actions/cache/restore@v4
-        with:
-          path: ${{ env.WHEELHOUSE_DIR }}
-          key: ${{ steps.cuda-wheelhouse-key.outputs.key }}
+      - name: Log in to GHCR
+        env:
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          printf '%s' "${REGISTRY_TOKEN}" |
+            regctl registry login ghcr.io --user "${GITHUB_ACTOR}" --pass-stdin
+
+      # The fingerprint is the complete ABI key, so only an exact OCI tag may
+      # be restored. GitHub Actions cache is intentionally not used here:
+      # wheelhouses are multi-GB and compete for the repository's 10 GB cache.
+      - name: Restore CUDA wheelhouse from GHCR
+        id: restore-cuda-wheelhouse
+        env:
+          WHEELHOUSE_REFERENCE: ${{ steps.cuda-wheelhouse-ref.outputs.reference }}
+        shell: bash
+        run: |
+          if regctl manifest head "${WHEELHOUSE_REFERENCE}" >/dev/null 2>&1; then
+            archive="${RUNNER_TEMP}/cuda-wheelhouse.tar"
+            regctl artifact get "${WHEELHOUSE_REFERENCE}" > "${archive}"
+            mkdir -p "${WHEELHOUSE_DIR}"
+            tar -xf "${archive}" -C "${WHEELHOUSE_DIR}"
+            echo "registry-hit=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "registry-hit=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Build cached CUDA dependency wheels
-        if: |
-          steps.cuda-wheelhouse-cache-main.outputs.cache-hit != 'true'
-          && steps.cuda-wheelhouse-cache-branch.outputs.cache-hit != 'true'
+        if: steps.restore-cuda-wheelhouse.outputs.registry-hit != 'true'
         shell: bash -x -e -u -o pipefail {0}
         run: .github/scripts/build-cuda-wheelhouse.sh
 
@@ -247,6 +265,54 @@ jobs:
           path: ${{ env.WHEELHOUSE_DIR }}/*.whl
           if-no-files-found: error
           retention-days: 1
+
+  publish-cuda-wheelhouse:
+    runs-on: ubuntu-latest
+    name: Publish CUDA wheelhouse to GHCR
+    needs: [cuda-wheelhouse]
+    if: |
+      github.ref == 'refs/heads/main'
+      && needs.cuda-wheelhouse.outputs.registry-hit != 'true'
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Download CUDA wheelhouse
+        uses: actions/download-artifact@v7
+        with:
+          name: cuda-wheelhouse-py3.12
+          path: /tmp/cuda-wheelhouse
+
+      - name: Install regctl
+        uses: regclient/actions/regctl-installer@c70ad64367908075211b10dcd2ab9fad4bfa1816
+        with:
+          release: v0.11.5
+
+      - name: Log in to GHCR
+        env:
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          printf '%s' "${REGISTRY_TOKEN}" |
+            regctl registry login ghcr.io --user "${GITHUB_ACTOR}" --pass-stdin
+
+      - name: Publish immutable CUDA wheelhouse
+        env:
+          WHEELHOUSE_REFERENCE: ${{ needs.cuda-wheelhouse.outputs.reference }}
+        shell: bash
+        run: |
+          if regctl manifest head "${WHEELHOUSE_REFERENCE}" >/dev/null 2>&1; then
+            echo "Wheelhouse already published by another main run: ${WHEELHOUSE_REFERENCE}"
+            exit 0
+          fi
+
+          archive="${RUNNER_TEMP}/cuda-wheelhouse.tar"
+          tar -cf "${archive}" -C /tmp/cuda-wheelhouse .
+          regctl artifact put \
+            --artifact-type application/vnd.nvidia.automodel.cuda-wheelhouse.v1 \
+            --annotation "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
+            --annotation "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            "${WHEELHOUSE_REFERENCE}" < "${archive}"
 
   ngc-cuda-test-pip:
     runs-on: linux-amd64-cpu16
