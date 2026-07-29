@@ -471,10 +471,9 @@ class GroupedExperts(nn.Module):
                 expert_out = expert_out + (
                     expert_down_proj_bias if self.apply_router_weight_after_down else expert_down_proj_bias * w
                 )
-            if self.apply_router_weight_after_down:
-                expert_out = expert_out.float() * w.float()
 
             if self.apply_router_weight_after_down:
+                expert_out = expert_out.float() * w.float()
                 slot_ids = idx * weights.shape[1] + top
                 slot_ids_b = slot_ids[:, None].expand(-1, x.size(1))
                 y.view(-1, x.size(1)).scatter_add_(dim=0, index=slot_ids_b, src=expert_out.float())
