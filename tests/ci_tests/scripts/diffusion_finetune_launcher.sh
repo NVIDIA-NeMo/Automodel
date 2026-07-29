@@ -45,11 +45,26 @@ case "$RECIPE_NAME" in
         INFER_NUM_FRAMES=5
         PREPROCESS_EXTRA_ARGS="--target_frames 13"
         ;;
+    wan2_2_t2v_flow*)
+        MEDIA_TYPE="video"
+        PROCESSOR="wan2.2"
+        GENERATE_CONFIG="examples/diffusion/generate/configs/generate_wan22.yaml"
+        MODEL_NAME="Wan-AI/Wan2.2-T2V-A14B-Diffusers"
+        INFER_NUM_FRAMES=9
+        PREPROCESS_EXTRA_ARGS=""
+        ;;
     flux_t2i_flow*)
         MEDIA_TYPE="image"
         PROCESSOR="flux"
         GENERATE_CONFIG="examples/diffusion/generate/configs/generate_flux.yaml"
         MODEL_NAME="black-forest-labs/FLUX.1-dev"
+        PREPROCESS_EXTRA_ARGS=""
+        ;;
+    flux2_t2i_flow*)
+        MEDIA_TYPE="image"
+        PROCESSOR="flux2"
+        GENERATE_CONFIG="examples/diffusion/generate/configs/generate_flux2.yaml"
+        MODEL_NAME="black-forest-labs/FLUX.2-dev"
         PREPROCESS_EXTRA_ARGS=""
         ;;
     qwen_image_t2i_flow*)
