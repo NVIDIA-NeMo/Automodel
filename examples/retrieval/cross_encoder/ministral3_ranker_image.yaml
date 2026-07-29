@@ -111,7 +111,7 @@ lr_scheduler:
 
 checkpoint:
   enabled: true
-  checkpoint_dir: /lustre/fsw/portfolios/llmservice/users/ronaya/model_checkpoints/ministral3_reranker_lr2e6_gbs256_cosine_t002_tpn4_le_1540_0727
+  checkpoint_dir: /lustre/fsw/portfolios/llmservice/users/ronaya/model_checkpoints/ministral3_reranker_lr2e6_gbs256_cosine_t002_tpn4_le_1540_0729
   model_save_format: safetensors
   save_consolidated: final
 
@@ -127,5 +127,5 @@ distributed:
 wandb:
   project: inform-simlm-reranking
   entity: nvidia-merlin
-  name: ministral3_reranker_lr2e6_gbs256_cosine_t002_tpn4_le_1540_0727
+  name: ministral3_reranker_lr2e6_gbs256_cosine_t002_tpn4_le_1540_0729
   enable: true

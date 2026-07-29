@@ -105,7 +105,7 @@ class WikiSSNQDataset(AbstractDataset):
     def get_document_by_id(self, id):
         example = deepcopy(EXAMPLE_TEMPLATE)
         doc = self.data[self.docid2idx[id]]
-        # example["text"] = doc["text"]
+        example["text"] = doc["text"]
         example["image"] = doc["image"]
         if "nr_ocr" in doc:
             example["nr_ocr"] = doc["nr_ocr"]
