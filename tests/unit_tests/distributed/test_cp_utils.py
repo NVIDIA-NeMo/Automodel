@@ -582,6 +582,38 @@ def test_make_cp_batch_for_te_basic(monkeypatch):
     assert result["cu_seqlens"].dtype == torch.int32
 
 
+def test_make_cp_batch_for_te_multi_chunk(monkeypatch):
+    """The num_chunks > 1 path shards and stacks every pipeline chunk.
+
+    Covers the per-chunk shard call, which the single-chunk test does not reach.
+    """
+    cp_mesh = _DummySubMesh(size=2)
+
+    batch = {
+        "input_ids": torch.tensor([[1, 2, 3, 4], [5, 6, 7, 8]]),
+        "labels": torch.tensor([[10, 20, 30, 40], [50, 60, 70, 80]]),
+        "position_ids": torch.tensor([[0, 1, 2, 3], [0, 1, 2, 3]]),
+        "seq_lens": torch.tensor([[4], [4]]),
+        "seq_lens_padded": torch.tensor([[4], [4]]),
+    }
+
+    class MockTex:
+        @staticmethod
+        def thd_get_partitioned_indices(cu_seqlens_padded, total_tokens, cp_size, cp_rank):
+            return torch.arange(total_tokens)
+
+    import sys
+
+    sys.modules["transformer_engine_torch"] = MockTex
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: 0)
+
+    result = _cu.make_cp_batch_for_te(cp_mesh=cp_mesh, batch=batch, num_chunks=2)
+
+    assert result["qkv_format"] == "thd"
+    assert result["input_ids"].shape[0] == 2
+    assert result["padding_mask"].shape == result["input_ids"].shape
+
+
 def test_shard_thd_chunk_skips_missing_padding_mask(monkeypatch):
     """Test that _shard_thd_chunk_for_te handles missing padding_mask gracefully."""
     cp_mesh = _DummySubMesh(size=2)

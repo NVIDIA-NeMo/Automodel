@@ -43,7 +43,10 @@ except ImportError:
     # < v5
     from transformers.tokenization_utils import PreTrainedTokenizerBase
 
-from nemo_automodel.components.checkpoint.checkpointing import save_config
+from nemo_automodel.components.checkpoint.checkpointing import (
+    load_torch_ckpt,
+    save_config,
+)
 from nemo_automodel.components.checkpoint.utils import (
     find_latest_checkpoint,
     find_pointer_protected_checkpoints,
@@ -381,7 +384,13 @@ class BaseRecipe:
         for opt in optimizers:
             if hasattr(opt, "synchronize_for_checkpoint"):
                 opt.synchronize_for_checkpoint()
-        self.checkpointer.save_optimizer(optimizer, model, path, scheduler)
+        self.checkpointer.save_optimizer(
+            optimizer,
+            model,
+            path,
+            scheduler,
+            optimizer_part_ids=self._get_optimizer_checkpoint_part_ids(),
+        )
         save_config(config.raw_config, path)
         if is_dist_initialized:
             _dist_barrier(getattr(getattr(self, "mesh_context", None), "process_group", None))
@@ -642,7 +651,12 @@ class BaseRecipe:
                 # we only save the tokenizer for consolidated checkpoints for downstream use
                 continue
             else:
-                obj.load_state_dict(torch.load(os.path.join(ckpt_dir, f"{key}.pt"), weights_only=False))
+                obj.load_state_dict(
+                    load_torch_ckpt(
+                        os.path.join(ckpt_dir, f"{key}.pt"),
+                        weights_only=not self.checkpointer.config.allow_legacy_pickle_restore,
+                    )
+                )
 
         return model, optimizer, scheduler
 
@@ -740,7 +754,13 @@ class BaseRecipe:
             candidate.load_pretrained(ckpt_dir, checkpointer=self.checkpointer)
         else:
             self.checkpointer.load_model(model, os.path.join(ckpt_dir, "model"))
-        self.checkpointer.load_optimizer(optimizer, model, ckpt_dir, scheduler)
+        self.checkpointer.load_optimizer(
+            optimizer,
+            model,
+            ckpt_dir,
+            scheduler,
+            optimizer_part_ids=self._get_optimizer_checkpoint_part_ids(),
+        )
 
     def _log_experiment_details(self):
         """Log metadata and config on main rank using YAML markers."""
@@ -980,6 +1000,16 @@ class BaseRecipe:
         if dm is None or "pp" not in dm.mesh_dim_names or dm["pp"].size() == 1:
             return None
         return dm["pp"].get_group()
+
+    def _get_optimizer_checkpoint_part_ids(self) -> list[int] | None:
+        """Return globally unique stage indices for local pipeline optimizers."""
+        pipeline = getattr(self, "pp", None)
+        if pipeline is None:
+            return None
+        stages = pipeline.info.stages
+        if stages is None:
+            raise RuntimeError("Pipeline optimizer checkpointing requires AutoPipeline.build() to complete first.")
+        return [stage.stage_index for stage in stages]
 
     def _dp_allreduce(self, tensor, op=dist.ReduceOp.SUM, include_cp: bool = False):
         dp_group = self._get_dp_group(include_cp=include_cp)

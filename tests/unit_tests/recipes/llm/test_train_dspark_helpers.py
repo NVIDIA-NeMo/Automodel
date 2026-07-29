@@ -1021,6 +1021,7 @@ def _dspark_resume_self(mask_token_id=7):
         runtime=SimpleNamespace(global_step=0),
         _resume_epoch=0,
         mask_token_id=mask_token_id,
+        checkpoint_config=SimpleNamespace(allow_legacy_pickle_restore=False),
     )
 
 

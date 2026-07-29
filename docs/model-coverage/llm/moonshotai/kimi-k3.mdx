@@ -1,0 +1,62 @@
+---
+title: "Kimi K3"
+description: "Fine-tune the Kimi K3 text model with FSDP2, expert parallelism, pipeline parallelism, and context parallelism on NVIDIA GB200."
+---
+[Kimi K3](https://huggingface.co/moonshotai/Kimi-K3) is Moonshot AI's 2.8T-parameter, 104B-active Mixture-of-Experts model. NeMo AutoModel provides a native implementation of the text model and loads its public checkpoint without `trust_remote_code`.
+
+<Warning>
+Kimi K3 training in NeMo AutoModel is currently validated only on NVIDIA GB200 systems.
+</Warning>
+
+<Info>
+
+| | |
+|---|---|
+| **Task** | Text Generation (MoE, hybrid attention) |
+| **Architecture** | `KimiK3ForCausalLM` |
+| **Parameters** | 2.8T total / 104B activated |
+| **Layers** | 93 (69 KDA + 24 Gated MLA) |
+| **Context Length** | 1,048,576 tokens |
+| **HF Org** | [moonshotai](https://huggingface.co/moonshotai) |
+
+</Info>
+
+## Architecture
+
+- Hybrid attention alternates groups of three Kimi Delta Attention (KDA) layers with a Gated Multi-head Latent Attention (MLA) layer.
+- Attention Residuals operate over 12-layer blocks. Pipeline stages preserve these block boundaries and carry the residual state between stages.
+- Stable LatentMoE routes each token to 16 of 896 routed experts and includes two shared experts. The expert MLPs use SiTU-GLU.
+- The released checkpoint uses MXFP4 weights. The example recipe dequantizes the base checkpoint while loading it for BF16 training.
+
+## Parallelism
+
+| Parallelism | Validated Configuration |
+|---|---|
+| FSDP2 | Full-parameter training |
+| Expert Parallelism | EP32 |
+| Pipeline Parallelism | PP8 with Attention Residual block-aligned stages |
+| Context Parallelism | CP2 full-model loss parity at 2K sequence length |
+
+The combined EP32 and PP8 configuration is validated on 256 GB200 GPUs.
+
+## Example Recipe
+
+| Recipe | Description |
+|---|---|
+| [k3_hellaswag.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/kimi/k3_hellaswag.yaml) | 100-step full-parameter SFT on HellaSwag with FSDP2, EP32, and PP8 |
+
+## Run the Recipe
+
+Allocate 64 GB200 nodes with four GPUs per node through your cluster launcher, then run:
+
+```bash
+uv run automodel --nproc-per-node=4 examples/llm_finetune/kimi/k3_hellaswag.yaml
+```
+
+See the [Slurm Launcher Guide](/job-launchers/slurm-cluster) for multi-node setup and the [Large MoE Fine-Tuning Guide](/recipes-e2e-examples/large-moe-fine-tuning) for distributed MoE configuration.
+
+## References
+
+- [Kimi K3 model card](https://huggingface.co/moonshotai/Kimi-K3)
+- [Kimi K3 technical report](https://github.com/MoonshotAI/Kimi-K3/blob/main/k3_tech_report.pdf)
+- [NeMo AutoModel Kimi K3 implementation](https://github.com/NVIDIA-NeMo/Automodel/pull/3259)

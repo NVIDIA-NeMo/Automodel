@@ -28,6 +28,12 @@ import torch.nn.functional as F
 from torch import nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
+from nemo_automodel.components.attention.utils import (
+    initialize_attn_module_and_func,
+    postprocess_output_for_attn,
+    preprocess_args_and_kwargs_for_attn,
+)
+from nemo_automodel.components.distributed.init_utils import get_world_size_safe
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.packing import get_unpad_data, is_indexed_packed_mask
@@ -49,7 +55,7 @@ from nemo_automodel.components.models.kimi_k3.cp import (
 )
 from nemo_automodel.components.models.kimi_k3.state_dict_adapter import KimiK3StateDictAdapter
 from nemo_automodel.components.moe.config import MoEConfig
-from nemo_automodel.components.moe.experts import GroupedExperts
+from nemo_automodel.components.moe.experts import GroupedExperts, GroupedExpertsDeepEP
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import Gate, MoE
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
@@ -338,10 +344,11 @@ class KimiK3MLP(nn.Module):
 class KimiMLAAttention(nn.Module):
     """Kimi MLA full-attention layer copied from the HF reference math."""
 
-    def __init__(self, config: KimiK3TextConfig, layer_idx: int) -> None:
+    def __init__(self, config: KimiK3TextConfig, layer_idx: int, backend: BackendConfig) -> None:
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
+        self.backend = backend
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.num_key_value_heads = config.num_key_value_heads
@@ -392,6 +399,23 @@ class KimiMLAAttention(nn.Module):
                 bias=False,
                 dtype=dtype,
             )
+        self.attn_module = None
+        self.attn_func = None
+        if backend.attn != "eager":
+            if backend.attn not in ("te", "sdpa"):
+                raise ValueError(f"Kimi K3 MLA does not support backend.attn={backend.attn!r}.")
+            attention_kwargs = {"attention_dropout": self.attention_dropout} if backend.attn == "te" else {}
+            self.attn_module, self.attn_func = initialize_attn_module_and_func(
+                attn_impl=backend.attn,
+                num_attention_heads=self.num_heads,
+                num_qk_channels=self.q_head_dim,
+                num_v_channels=self.v_head_dim,
+                softmax_scale=self.scaling,
+                attn_mask_type="causal",
+                qkv_format="bshd",
+                num_gqa_groups=self.num_key_value_heads,
+                **attention_kwargs,
+            )
         self._cp_mesh = None
 
     def setup_cp_attention(self, cp_mesh) -> None:
@@ -408,6 +432,7 @@ class KimiMLAAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
+        padding_mask: torch.Tensor | None = None,
         packed_context: "KimiPackedContext | None" = None,
         **kwargs: Any,
     ) -> torch.Tensor:
@@ -417,6 +442,7 @@ class KimiMLAAttention(nn.Module):
             hidden_states: Tensor of shape [batch, sequence, hidden]; the sequence axis
                 holds this rank's contiguous shard under context parallelism.
             attention_mask: Optional additive attention mask of shape [batch, 1, sequence, sequence].
+            padding_mask: Optional boolean mask of shape [batch, sequence], where true marks padding.
             packed_context: Optional document layout of the batch, required under
                 context parallelism.
             **kwargs: Extra attention options accepted for HF compatibility.
@@ -452,13 +478,50 @@ class KimiMLAAttention(nn.Module):
 
         key_states, value_states = self._expand_key_value_groups(key_states, value_states, seq_length)
 
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) * self.scaling
-        if attention_mask is not None:
-            attn_weights = attn_weights + attention_mask[:, :, :, : key_states.shape[-2]]
-        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        attn_weights = F.dropout(attn_weights, p=self.attention_dropout, training=self.training)
-        attn_output = torch.matmul(attn_weights, value_states)
-        attn_output = attn_output.transpose(1, 2).contiguous().reshape(batch_size, seq_length, -1)
+        if self.backend.attn == "eager":
+            attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) * self.scaling
+            if attention_mask is not None:
+                attn_weights = attn_weights + attention_mask[:, :, :, : key_states.shape[-2]]
+            attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+            attn_weights = F.dropout(attn_weights, p=self.attention_dropout, training=self.training)
+            attn_output = torch.matmul(attn_weights, value_states).transpose(1, 2).contiguous()
+        else:
+            query_states = query_states.transpose(1, 2).contiguous()
+            key_states = key_states.transpose(1, 2).contiguous()
+            value_states = value_states.transpose(1, 2).contiguous()
+
+            if packed_context is not None and packed_context.has_multiple_documents:
+                if self.backend.attn != "te":
+                    backend_attention_mask = attention_mask
+                    query_states, key_states, value_states, attention_kwargs = preprocess_args_and_kwargs_for_attn(
+                        query_states,
+                        key_states,
+                        value_states,
+                        backend_attention_mask,
+                        self.backend.attn,
+                    )
+                else:
+                    if attention_mask is None:
+                        raise ValueError("Packed K3 MLA attention requires an additive attention mask.")
+                    attention_kwargs = {
+                        "attention_mask": attention_mask.ne(0),
+                        "attn_mask_type": "arbitrary",
+                    }
+            else:
+                backend_attention_mask = padding_mask.logical_not() if padding_mask is not None else None
+                query_states, key_states, value_states, attention_kwargs = preprocess_args_and_kwargs_for_attn(
+                    query_states,
+                    key_states,
+                    value_states,
+                    backend_attention_mask,
+                    self.backend.attn,
+                )
+            if self.backend.attn == "sdpa":
+                attention_kwargs["dropout_p"] = self.attention_dropout if self.training else 0.0
+            attn_output = self.attn_func(query_states, key_states, value_states, **attention_kwargs)
+            attn_output = postprocess_output_for_attn(attn_output, self.backend.attn)
+
+        attn_output = attn_output.reshape(batch_size, seq_length, -1)
         if self.use_output_gate:
             attn_output = attn_output * self.g_proj(hidden_states).sigmoid()
         return self.o_proj(attn_output)
@@ -965,21 +1028,6 @@ class KimiK3Gate(Gate):
         return weights * self.route_scale, indices, None
 
 
-class KimiK3GroupedExperts(GroupedExperts):
-    """Grouped expert parameters with the K3 SiTU activation."""
-
-    def __init__(self, config: MoEConfig, backend: BackendConfig, text_config: KimiK3TextConfig) -> None:
-        super().__init__(config, backend=backend)
-        # The checkpoint reference rounds each BF16 expert output before applying
-        # its FP32 router weight and reducing the top-k outputs.
-        self.apply_router_weight_after_down = True
-        self.expert_activation_grouped = partial(
-            _weighted_situ,
-            beta=text_config.activation_situ_beta or 1.0,
-            linear_beta=text_config.activation_situ_linear_beta,
-        )
-
-
 class KimiK3MoE(MoE):
     """K3 routed experts with latent projections and a SiTU shared expert."""
 
@@ -990,7 +1038,24 @@ class KimiK3MoE(MoE):
         self.n_routed_experts = moe_config.n_routed_experts
         self.n_activated_experts = moe_config.n_activated_experts
         self.gate = KimiK3Gate(moe_config, gate_precision=torch.float32)
-        self.experts = KimiK3GroupedExperts(moe_config, backend, config)
+        expert_activation = partial(
+            _weighted_situ,
+            beta=config.activation_situ_beta or 1.0,
+            linear_beta=config.activation_situ_linear_beta,
+        )
+        if backend.dispatcher in ("deepep", "hybridep", "uccl_ep") and get_world_size_safe() > 1:
+            self.experts = GroupedExpertsDeepEP(
+                moe_config,
+                backend=backend,
+                dispatcher_backend=backend.dispatcher,
+                dispatcher_num_sms=backend.dispatcher_num_sms,
+                dispatcher_share_token_dispatcher=backend.dispatcher_share_token_dispatcher,
+                dispatcher_async_dispatch=backend.dispatcher_async_dispatch,
+            )
+            self.experts.expert_activation = expert_activation
+        else:
+            self.experts = GroupedExperts(moe_config, backend=backend)
+            self.experts.expert_activation_grouped = expert_activation
         shared_intermediate = config.moe_intermediate_size * (config.num_shared_experts or 0)
         self.shared_experts = (
             KimiK3MLP(config, intermediate_size=shared_intermediate, dtype=moe_config.dtype)
@@ -1132,7 +1197,9 @@ class KimiDecoderLayer(nn.Module):
             and layer_idx % getattr(config, "moe_layer_freq", 1) == 0
         )
         self.self_attn = (
-            KimiDeltaAttention(config, layer_idx) if self.is_linear_attn else KimiMLAAttention(config, layer_idx)
+            KimiDeltaAttention(config, layer_idx)
+            if self.is_linear_attn
+            else KimiMLAAttention(config, layer_idx, backend)
         )
 
         dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
@@ -1192,7 +1259,12 @@ class KimiDecoderLayer(nn.Module):
 
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(hidden_states=hidden_states, attention_mask=attention_mask, **attn_kwargs)
+        hidden_states = self.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            padding_mask=padding_mask,
+            **attn_kwargs,
+        )
         hidden_states = residual + hidden_states
 
         residual = hidden_states
@@ -1246,6 +1318,7 @@ class KimiDecoderLayer(nn.Module):
         attention_output = self.self_attn(
             hidden_states=self.input_layernorm(hidden_states),
             attention_mask=attention_mask,
+            padding_mask=padding_mask,
             **attn_kwargs,
         )
         prefix_sum = attention_output if prefix_sum is None else prefix_sum + attention_output
@@ -1301,6 +1374,9 @@ def _build_moe_config(
         router_bias=False,
         expert_bias=False,
         expert_activation="swiglu",
+        # The checkpoint reference rounds each BF16 expert output before applying
+        # its FP32 router weight and reducing the top-k outputs.
+        apply_router_weight_after_down=True,
         dtype=model_dtype,
         shared_expert_gate=False,
         shared_expert_inter_dim=config.moe_intermediate_size,
@@ -1434,6 +1510,9 @@ class KimiK3TextModel(nn.Module):
         padding_mask: torch.Tensor | None = None,
         cache_position: torch.Tensor | None = None,
         kimi_packed_context: KimiPackedContext | None = None,
+        kimi_packed_doc_ids: torch.Tensor | None = None,
+        kimi_packed_seq_start: int = 0,
+        kimi_packed_cp_size: int = 1,
         **attn_kwargs: Any,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Run the Kimi Linear decoder.
@@ -1451,6 +1530,10 @@ class KimiK3TextModel(nn.Module):
             kimi_packed_context: Optional document layout attached by
                 :func:`~nemo_automodel.components.models.kimi_k3.cp.shard_batch_for_kimi_cp`;
                 required under context parallelism and otherwise derived here.
+            kimi_packed_doc_ids: Pipeline-safe global document map used to
+                reconstruct ``kimi_packed_context`` after microbatch chunking.
+            kimi_packed_seq_start: Global offset of this CP rank's sequence shard.
+            kimi_packed_cp_size: Number of context-parallel sequence shards.
             **attn_kwargs: Additional attention kwargs used by packed or THD execution.
 
         Returns:
@@ -1474,11 +1557,21 @@ class KimiK3TextModel(nn.Module):
         if cache_position is None:
             cache_position = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device)
 
-        packed_context = kimi_packed_context or _packed_context_from_inputs(
-            inputs_embeds,
-            attention_mask=attention_mask,
-            cu_seqlens=attn_kwargs.get("cu_seqlens"),
-        )
+        if kimi_packed_context is not None and kimi_packed_doc_ids is not None:
+            raise ValueError("Pass either kimi_packed_context or pipeline-safe Kimi CP metadata, not both.")
+        packed_context = kimi_packed_context
+        if packed_context is None and kimi_packed_doc_ids is not None:
+            packed_context = KimiPackedContext(
+                doc_ids=kimi_packed_doc_ids,
+                seq_start=kimi_packed_seq_start,
+                cp_size=kimi_packed_cp_size,
+            )
+        if packed_context is None:
+            packed_context = _packed_context_from_inputs(
+                inputs_embeds,
+                attention_mask=attention_mask,
+                cu_seqlens=attn_kwargs.get("cu_seqlens"),
+            )
         linear_attn_mask = self._update_linear_attn_mask(attention_mask, cache_position)
         causal_mask = (
             None
@@ -1861,23 +1954,45 @@ class KimiK3ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             output_hidden_states=output_hidden_states,
         )
 
-    def prepare_model_inputs_for_cp(self, input_ids: torch.Tensor | None = None, **kwargs: Any) -> dict[str, Any]:
-        """Hand the recipe Kimi Linear's own context-parallel batch sharding.
+    def prepare_model_inputs_for_cp(
+        self,
+        batch: dict[str, Any],
+        *,
+        num_chunks: int = 1,
+    ) -> dict[str, Any]:
+        """Hand the recipe Kimi K3's own context-parallel batch sharding.
 
         KDA's recurrent state (and FLA's CP kernels) require every rank to own one
-        contiguous slice of the sequence, so Kimi Linear replaces the default
-        load-balanced ``context_parallel`` sharding with
+        contiguous slice of the sequence, so Kimi K3 replaces the default
+        load-balanced context-parallel sharding with
         :func:`~nemo_automodel.components.models.kimi_k3.cp.shard_batch_for_kimi_cp`.
 
         Args:
-            input_ids: Token ids of the unsharded batch; accepted for interface parity.
-            **kwargs: Additional recipe arguments; accepted for interface parity.
+            batch: Full-sequence batch; left untouched until the returned sharder runs.
+            num_chunks: Accepted for CP hook signature parity; K3 uses one contiguous shard.
 
         Returns:
-            Batch updates carrying the model-owned sharding callable.
+            Batch updates carrying the model-owned context-parallel sharder.
         """
-        del input_ids, kwargs
-        return {"_cp_make_batch_fn": shard_batch_for_kimi_cp}
+        from nemo_automodel.components.distributed.context_parallel.sharder import (  # noqa: PLC0415
+            ContextParallelSharder,
+            contiguous_local_indices,
+        )
+
+        cp_mesh = getattr(self, "cp_mesh", None)
+        if cp_mesh is None:
+            raise RuntimeError("Kimi K3 context-parallel input preparation requires a CP mesh.")
+        for module in self.modules():
+            if isinstance(module, (KimiMLAAttention, KimiDeltaAttention)):
+                module.setup_cp_attention(cp_mesh)
+
+        del batch, num_chunks
+        return {
+            "cp_sharder": ContextParallelSharder(
+                shard_batch=shard_batch_for_kimi_cp,
+                local_token_global_indices=contiguous_local_indices,
+            )
+        }
 
     def update_moe_gate_bias(self) -> None:
         self.model.update_moe_gate_bias()

@@ -43,6 +43,8 @@ class MoEConfig:
     router_bias: bool = False
     expert_bias: bool = False
     expert_activation: Literal["swiglu", "swigluoai", "quick_geglu", "geglu", "relu2"] = "swiglu"
+    # Preserve models whose low-precision numerics require routing after the down projection.
+    apply_router_weight_after_down: bool = False
     activation_alpha: float = 1.702
     activation_limit: float = 7.0
     # When > 0, ``expert_activation="swiglu"`` dispatches to a clamped FP32
