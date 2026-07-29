@@ -139,7 +139,7 @@ class TestMoELoRAToHF:
         tensor = torch.randn(N_EXPERTS, DIM, LORA_DIM)
         fqn = "model.layers.0.mlp.experts.lora_gate_and_up_A"
 
-        result = adapter._convert_single_merged_expert_to_hf_split_experts(fqn, tensor)
+        result = adapter._convert_single_merged_expert_to_hf_split_experts(fqn, tensor, v4_compatible=True)
 
         assert result is not None
         keys = [k for k, _ in result]
@@ -153,7 +153,7 @@ class TestMoELoRAToHF:
         tensor = torch.randn(N_EXPERTS, DIM, LORA_DIM)
         fqn = "model.layers.0.mlp.experts.lora_gate_and_up_A"
 
-        result = dict(adapter._convert_single_merged_expert_to_hf_split_experts(fqn, tensor))
+        result = dict(adapter._convert_single_merged_expert_to_hf_split_experts(fqn, tensor, v4_compatible=True))
 
         for eid in range(N_EXPERTS):
             gate_A = result[f"model.layers.0.mlp.experts.{eid}.gate_proj.lora_A.weight"]
@@ -171,7 +171,7 @@ class TestMoELoRAToHF:
         tensor = torch.randn(N_EXPERTS, LORA_DIM, 2 * MOE_INTER_DIM)
         fqn = "model.layers.0.mlp.experts.lora_gate_and_up_B"
 
-        result = dict(adapter._convert_single_merged_expert_to_hf_split_experts(fqn, tensor))
+        result = dict(adapter._convert_single_merged_expert_to_hf_split_experts(fqn, tensor, v4_compatible=True))
 
         for eid in range(N_EXPERTS):
             gate_B = result[f"model.layers.0.mlp.experts.{eid}.gate_proj.lora_B.weight"]
@@ -187,7 +187,7 @@ class TestMoELoRAToHF:
         tensor = torch.randn(N_EXPERTS, MOE_INTER_DIM, LORA_DIM)
         fqn = "model.layers.0.mlp.experts.lora_down_A"
 
-        result = dict(adapter._convert_single_merged_expert_to_hf_split_experts(fqn, tensor))
+        result = dict(adapter._convert_single_merged_expert_to_hf_split_experts(fqn, tensor, v4_compatible=True))
 
         for eid in range(N_EXPERTS):
             down_A = result[f"model.layers.0.mlp.experts.{eid}.down_proj.lora_A.weight"]
@@ -199,7 +199,7 @@ class TestMoELoRAToHF:
         tensor = torch.randn(N_EXPERTS, LORA_DIM, DIM)
         fqn = "model.layers.0.mlp.experts.lora_down_B"
 
-        result = dict(adapter._convert_single_merged_expert_to_hf_split_experts(fqn, tensor))
+        result = dict(adapter._convert_single_merged_expert_to_hf_split_experts(fqn, tensor, v4_compatible=True))
 
         for eid in range(N_EXPERTS):
             down_B = result[f"model.layers.0.mlp.experts.{eid}.down_proj.lora_B.weight"]
@@ -212,7 +212,7 @@ class TestMoELoRAToHF:
         tensor = torch.randn(N_EXPERTS, DIM, LORA_DIM)
         fqn = "base_model.model.model.layers.0.mlp.experts.lora_gate_and_up_A"
 
-        result = dict(adapter._convert_single_merged_expert_to_hf_split_experts(fqn, tensor))
+        result = dict(adapter._convert_single_merged_expert_to_hf_split_experts(fqn, tensor, v4_compatible=True))
 
         assert "base_model.model.model.layers.0.mlp.experts.0.gate_proj.lora_A.weight" in result
 
@@ -236,14 +236,18 @@ class TestMoELoRAToHF:
 class TestMoELoRAFromHF:
     """Verify _recombine_lora_expert_keys correctly recombines per-expert LoRA keys."""
 
-    def test_round_trip_lora_gate_and_up_A(self):
+    def test_round_trip_lora_gate_and_up_A_v4(self):
         adapter = _Adapter()
         original = torch.randn(N_EXPERTS, DIM, LORA_DIM)
 
-        # to_hf
-        hf = dict(adapter._convert_single_merged_expert_to_hf_split_experts(
-            "model.layers.0.mlp.experts.lora_gate_and_up_A", original,
-        ))
+        # to_hf (v4 mode)
+        hf = dict(
+            adapter._convert_single_merged_expert_to_hf_split_experts(
+                "model.layers.0.mlp.experts.lora_gate_and_up_A",
+                original,
+                v4_compatible=True,
+            )
+        )
 
         # from_hf
         result = adapter._recombine_lora_expert_keys(hf)
@@ -252,13 +256,17 @@ class TestMoELoRAFromHF:
         assert key in result
         torch.testing.assert_close(result[key], original)
 
-    def test_round_trip_lora_gate_and_up_B(self):
+    def test_round_trip_lora_gate_and_up_B_v4(self):
         adapter = _Adapter()
         original = torch.randn(N_EXPERTS, LORA_DIM, 2 * MOE_INTER_DIM)
 
-        hf = dict(adapter._convert_single_merged_expert_to_hf_split_experts(
-            "model.layers.0.mlp.experts.lora_gate_and_up_B", original,
-        ))
+        hf = dict(
+            adapter._convert_single_merged_expert_to_hf_split_experts(
+                "model.layers.0.mlp.experts.lora_gate_and_up_B",
+                original,
+                v4_compatible=True,
+            )
+        )
 
         result = adapter._recombine_lora_expert_keys(hf)
 
@@ -266,13 +274,17 @@ class TestMoELoRAFromHF:
         assert key in result
         torch.testing.assert_close(result[key], original)
 
-    def test_round_trip_lora_down_A(self):
+    def test_round_trip_lora_down_A_v4(self):
         adapter = _Adapter()
         original = torch.randn(N_EXPERTS, MOE_INTER_DIM, LORA_DIM)
 
-        hf = dict(adapter._convert_single_merged_expert_to_hf_split_experts(
-            "model.layers.0.mlp.experts.lora_down_A", original,
-        ))
+        hf = dict(
+            adapter._convert_single_merged_expert_to_hf_split_experts(
+                "model.layers.0.mlp.experts.lora_down_A",
+                original,
+                v4_compatible=True,
+            )
+        )
 
         result = adapter._recombine_lora_expert_keys(hf)
 
@@ -280,13 +292,17 @@ class TestMoELoRAFromHF:
         assert key in result
         torch.testing.assert_close(result[key], original)
 
-    def test_round_trip_lora_down_B(self):
+    def test_round_trip_lora_down_B_v4(self):
         adapter = _Adapter()
         original = torch.randn(N_EXPERTS, LORA_DIM, DIM)
 
-        hf = dict(adapter._convert_single_merged_expert_to_hf_split_experts(
-            "model.layers.0.mlp.experts.lora_down_B", original,
-        ))
+        hf = dict(
+            adapter._convert_single_merged_expert_to_hf_split_experts(
+                "model.layers.0.mlp.experts.lora_down_B",
+                original,
+                v4_compatible=True,
+            )
+        )
 
         result = adapter._recombine_lora_expert_keys(hf)
 
@@ -294,15 +310,15 @@ class TestMoELoRAFromHF:
         assert key in result
         torch.testing.assert_close(result[key], original)
 
-    def test_round_trip_all_lora_keys_with_prefix(self):
-        """Full round-trip for all 4 LoRA parameter types, with PEFT prefix."""
+    def test_round_trip_all_lora_keys_with_prefix_v4(self):
+        """Full round-trip for all 4 LoRA parameter types, with PEFT prefix (v4 mode)."""
         adapter = _Adapter()
         original = _make_grouped_lora_state_dict(prefix="base_model.model.")
 
-        # to_hf: convert all keys
+        # to_hf: convert all keys (v4 mode)
         hf_sd = {}
         for fqn, tensor in original.items():
-            converted = adapter._convert_single_merged_expert_to_hf_split_experts(fqn, tensor)
+            converted = adapter._convert_single_merged_expert_to_hf_split_experts(fqn, tensor, v4_compatible=True)
             if converted:
                 for k, v in converted:
                     hf_sd[k] = v
@@ -322,6 +338,33 @@ class TestMoELoRAFromHF:
         # Verify all original keys are restored
         for k, v in original.items():
             assert k in result, f"Missing key after round-trip: {k}"
+            torch.testing.assert_close(result[k], v, msg=f"Value mismatch for {k}")
+
+    def test_round_trip_v5_paramwrapper(self):
+        """Test v5 ParamWrapper round-trip for all 4 LoRA types."""
+        adapter = _Adapter()
+        original = _make_grouped_lora_state_dict(prefix="base_model.model.")
+
+        # to_hf: convert to ParamWrapper (v5) format
+        pw_sd = {}
+        for fqn, tensor in original.items():
+            converted = adapter._convert_single_merged_expert_to_hf_split_experts(fqn, tensor, v4_compatible=False)
+            if converted:
+                for k, v in converted:
+                    pw_sd[k] = v
+            else:
+                pw_sd[fqn] = tensor
+
+        # Verify ParamWrapper format: keys use lora_[AB].weight pattern
+        for fqn in pw_sd:
+            assert "lora_A.weight" in fqn or "lora_B.weight" in fqn, f"Unexpected key: {fqn}"
+
+        # from_hf: convert back (via _convert_paramwrapper_to_native)
+        result = adapter._convert_paramwrapper_to_native(pw_sd)
+
+        # Verify all original keys are restored
+        for k, v in original.items():
+            assert k in result, f"Missing key after v5 round-trip: {k}"
             torch.testing.assert_close(result[k], v, msg=f"Value mismatch for {k}")
 
     def test_passthrough_non_lora_keys(self):
@@ -359,10 +402,10 @@ class TestMoELoRAFromHF:
 class TestExtractTargetModulesWithMoELoRA:
     """Verify that _extract_target_modules includes per-expert HF module names."""
 
-    def test_includes_per_expert_projections(self):
+    def test_includes_per_expert_projections_v4(self):
         model = _make_tiny_moe_model()
 
-        target_modules = _extract_target_modules(model)
+        target_modules = _extract_target_modules(model, v4_compatible=True)
 
         for layer_idx in range(N_LAYERS):
             for eid in range(N_EXPERTS):
@@ -371,10 +414,10 @@ class TestExtractTargetModulesWithMoELoRA:
                 assert f"{base}.up_proj" in target_modules, f"Missing {base}.up_proj"
                 assert f"{base}.down_proj" in target_modules, f"Missing {base}.down_proj"
 
-    def test_no_grouped_lora_names_in_targets(self):
+    def test_no_grouped_lora_names_in_targets_v4(self):
         model = _make_tiny_moe_model()
 
-        target_modules = _extract_target_modules(model)
+        target_modules = _extract_target_modules(model, v4_compatible=True)
 
         for name in target_modules:
             assert "lora_gate_and_up" not in name
@@ -391,12 +434,20 @@ class TestExtractTargetModulesWithMoELoRA:
 # ---------------------------------------------------------------------------
 
 
-def _convert_grouped_to_hf(grouped_sd):
-    """Helper: convert a grouped LoRA state dict to per-expert HF format."""
+def _convert_grouped_to_hf(grouped_sd, v4_compatible=True):
+    """Helper: convert a grouped LoRA state dict to HF format.
+
+    Args:
+        grouped_sd: Grouped native LoRA state dict.
+        v4_compatible: If True, produce per-expert split format (v4).
+            If False, produce ParamWrapper fused format (v5).
+    """
     adapter_obj = _Adapter()
     hf_sd = {}
     for fqn, tensor in grouped_sd.items():
-        converted = adapter_obj._convert_single_merged_expert_to_hf_split_experts(fqn, tensor)
+        converted = adapter_obj._convert_single_merged_expert_to_hf_split_experts(
+            fqn, tensor, v4_compatible=v4_compatible
+        )
         if converted:
             for k, v in converted:
                 hf_sd[k] = v
@@ -437,6 +488,7 @@ def _make_hf_expert_model():
 def _write_adapter_dir(tmp_path, hf_lora_sd, lora_r, lora_alpha, target_modules):
     """Persist adapter_model.safetensors + adapter_config.json to *tmp_path*."""
     import json
+
     from safetensors.torch import save_file
 
     save_file(hf_lora_sd, str(tmp_path / "adapter_model.safetensors"))
@@ -523,8 +575,7 @@ class TestMoELoRASaveRestoreMergeHF:
 
         expected = N_LAYERS * N_EXPERTS * 3  # gate, up, down per expert
         assert changed == expected, (
-            f"Expected all {expected} expert weight tensors to change after merge, "
-            f"got {changed}"
+            f"Expected all {expected} expert weight tensors to change after merge, got {changed}"
         )
 
     # ---- test: merged weights equal base + B @ A * scale exactly ----

@@ -303,30 +303,23 @@ def _get_automodel_peft_metadata(peft_config: "PeftConfig") -> dict:
     return result
 
 
-def _is_qwen3_moe(model: nn.Module) -> bool:
-    """Check whether *model* uses the Qwen3 MoE state-dict adapter."""
-    adapter = getattr(model, "state_dict_adapter", None)
-    if adapter is None:
-        return False
-    from nemo_automodel.components.models.qwen3_moe.state_dict_adapter import Qwen3MoeStateDictAdapter
-
-    return isinstance(adapter, Qwen3MoeStateDictAdapter)
-
-
 def _extract_target_parameters(model: "nn.Module | list[nn.Module]", v4_compatible: bool = False) -> list[str]:
     """Extract ``target_parameters`` for PEFT v0.18+ ParamWrapper format.
 
-    Returns fused expert parameter paths for Qwen3 MoE when not in legacy mode,
-    or an empty list otherwise.
+    Returns fused expert parameter paths for MoE models using
+    ``MoESplitExpertsStateDictMixin`` when not in legacy mode, or an empty list
+    otherwise.
 
     ``model`` may be a single module or a list of PP parts; the check is a
     per-model-class property, so the first part is representative.
     """
-    model = model[0] if isinstance(model, (list, tuple)) else model
+    model_part = model[0] if isinstance(model, (list, tuple)) else model
     if v4_compatible:
         return []
-    if _is_qwen3_moe(model):
-        return ["mlp.experts.gate_up_proj", "mlp.experts.down_proj"]
+    adapter = getattr(model_part, "state_dict_adapter", None)
+    if adapter is not None and isinstance(adapter, MoESplitExpertsStateDictMixin):
+        expert_segment = adapter._expert_path_segment
+        return [f"{expert_segment}.gate_up_proj", f"{expert_segment}.down_proj"]
     return []
 
 
@@ -343,8 +336,10 @@ def _extract_target_modules(
     compatibility with vLLM, TensorRT-LLM, and HF PEFT.
 
     For MoE expert LoRA, grouped 3-D adapter parameters are expanded to
-    per-expert HF projection names unless the model is Qwen3 MoE in
-    non-legacy mode (where ``target_parameters`` is used instead).
+    per-expert HF projection names when in v4-compatible mode (where
+    per-expert ``target_modules`` are used).  In v5 mode (``v4_compatible=False``)
+    the expansion is skipped because ``target_parameters`` provides the
+    fused ParamWrapper paths instead.
 
     Strips ``_orig_mod.`` (torch.compile) and ``_checkpoint_wrapped_module.``
     (activation checkpointing) prefixes from module names.
@@ -386,14 +381,14 @@ def _extract_target_modules(
 
     # MoE expert LoRA: adapter weights are nn.Parameter (not nn.Module) so
     # they don't appear in named_modules(). Expand to per-expert HF names,
-    # unless Qwen3 MoE in non-legacy mode (uses target_parameters instead).
-    # The mixin / qwen3 checks are per-model-class properties (identical across
-    # all PP parts), so check the first part.
+    # unless we are in v5 mode (v4_compatible=False) where fused
+    # target_parameters are used instead. The mixin check is a
+    # per-model-class property (identical across all PP parts), so check the
+    # first part.
     _has_split_expert_mixin = hasattr(model_parts[0], "state_dict_adapter") and isinstance(
         model_parts[0].state_dict_adapter, MoESplitExpertsStateDictMixin
     )
-    _skip_for_qwen3 = not v4_compatible and _is_qwen3_moe(model_parts[0])
-    if _has_split_expert_mixin and not _skip_for_qwen3:
+    if _has_split_expert_mixin and v4_compatible:
         seen_expert_groups: set[tuple[str, str]] = set()
         for _mp in model_parts:
             for name, param in _mp.named_parameters():
