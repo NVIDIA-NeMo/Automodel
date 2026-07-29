@@ -1328,7 +1328,14 @@ class TestPrecomputeStageShapesModelHook:
         stage_module = __import__("torch.distributed.pipelining.stage", fromlist=["extract_tensor_metas"])
 
         def extract_tensor_metas(tensors):
-            """Capture metadata for tensors with arbitrary leading dimensions."""
+            """Capture shape metadata for tensors of arbitrary rank.
+
+            Args:
+                tensors: Tensors of shape [...], with arbitrary ranks and no constrained axes.
+
+            Returns:
+                Tuple of metadata records preserving each tensor's shape, dtype, and requires-grad state.
+            """
             return tuple(
                 types.SimpleNamespace(shape=tensor.shape, dtype=tensor.dtype, requires_grad=tensor.requires_grad)
                 for tensor in tensors
