@@ -15,7 +15,12 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from nemo_automodel.components.loss.te_parallel_ce import TEParallelCrossEntropy, HAVE_TE_PARALLEL_CE, MISSING_TE_PARALLEL_CE_MSG
+from nemo_automodel.components.loss.te_parallel_ce import (
+    HAVE_TE_PARALLEL_CE,
+    MISSING_TE_PARALLEL_CE_MSG,
+    TEParallelCrossEntropy,
+)
+
 
 @pytest.mark.skipif(not HAVE_TE_PARALLEL_CE, reason=MISSING_TE_PARALLEL_CE_MSG)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -41,7 +46,9 @@ def test_te_parallel_cross_entropy(reduction, ignore_index):
     # Measure memory for PyTorch implementation
     torch.cuda.reset_peak_memory_stats()
     with torch.amp.autocast(device_type="cuda", dtype=dtype):
-        pytorch_loss = F.cross_entropy(logits.view(-1, vocab_size), targets.view(-1), reduction=reduction, ignore_index=ignore_index)
+        pytorch_loss = F.cross_entropy(
+            logits.view(-1, vocab_size), targets.view(-1), reduction=reduction, ignore_index=ignore_index
+        )
         if reduction == "none":
             pytorch_loss = pytorch_loss.view(batch_size, seq_length)
 
@@ -49,6 +56,7 @@ def test_te_parallel_cross_entropy(reduction, ignore_index):
 
     torch.cuda.empty_cache()
     import gc
+
     gc.collect()
 
     # Measure memory for TE implementation
@@ -79,6 +87,7 @@ def test_te_parallel_cross_entropy(reduction, ignore_index):
         assert torch.allclose(te_loss, pytorch_loss, rtol=1e-2, atol=1e-2), (
             f"Loss mismatch with reduction={reduction}: PyTorch={pytorch_loss}, TE={te_loss}"
         )
+
 
 @pytest.mark.skipif(not HAVE_TE_PARALLEL_CE, reason=MISSING_TE_PARALLEL_CE_MSG)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -148,3 +157,25 @@ def test_te_parallel_cross_entropy_invalid_reduction_raises():
     with torch.amp.autocast(device_type="cuda", dtype=dtype):
         with pytest.raises(ValueError, match=r"Invalid reduction:"):
             TEParallelCrossEntropy(reduction="not-a-valid-reduction")(logits, targets)
+
+
+def test_te_parallel_cross_entropy_applies_per_token_weights(monkeypatch):
+    """The TE wrapper applies objective multipliers before sum normalization."""
+    from nemo_automodel.components.loss import te_parallel_ce as te_parallel_ce_mod
+
+    monkeypatch.setattr(te_parallel_ce_mod, "HAVE_TE_PARALLEL_CE", True)
+    monkeypatch.setattr(
+        te_parallel_ce_mod,
+        "parallel_cross_entropy",
+        lambda *args, **kwargs: torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
+    )
+    loss_weights = torch.tensor([[0.5, 0.5], [1.5, 1.5]])
+
+    loss = te_parallel_ce_mod.TEParallelCrossEntropy(reduction="sum")(
+        torch.randn(2, 2, 3),
+        torch.zeros(2, 2, dtype=torch.long),
+        num_label_tokens=4,
+        loss_weights=loss_weights,
+    )
+
+    assert loss.item() == pytest.approx((0.5 + 1.0 + 4.5 + 6.0) / 4)

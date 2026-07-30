@@ -163,6 +163,30 @@ def test_chunked_cross_entropy_gradient_parity_with_reference():
     torch.testing.assert_close(logits.grad, reference_logits.grad, rtol=1e-6, atol=1e-7)
 
 
+def test_chunked_cross_entropy_weighted_gradient_parity_with_reference():
+    """Weighted sum path must match the per-token PyTorch loss and gradient."""
+    torch.manual_seed(11)
+    logits = torch.randn(9, 6, requires_grad=True)
+    reference_logits = logits.detach().clone().requires_grad_()
+    labels = torch.tensor([0, 1, 2, -100, 3, 4, 5, 0, 1])
+    loss_weights = torch.tensor([0.5, 0.5, 0.5, 0.5, 1.5, 1.5, 1.5, 1.5, 1.5])
+
+    loss = ChunkedCrossEntropy(chunk_len=4)(
+        logits,
+        labels,
+        num_label_tokens=8,
+        loss_weights=loss_weights,
+    )
+    reference = (
+        F.cross_entropy(reference_logits, labels, ignore_index=-100, reduction="none") * loss_weights
+    ).sum() / 8
+
+    torch.testing.assert_close(loss, reference, rtol=1e-6, atol=1e-7)
+    loss.backward()
+    reference.backward()
+    torch.testing.assert_close(logits.grad, reference_logits.grad, rtol=1e-6, atol=1e-7)
+
+
 def test_chunked_cross_entropy_sum_path_saves_no_fp32_activations():
     """The sum path must save only the original-dtype logits for backward (no fp32 upcasts)."""
     torch.manual_seed(29)
