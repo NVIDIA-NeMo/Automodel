@@ -40,3 +40,10 @@ def test_cuda_wheelhouse_uses_exact_oci_reference_without_actions_cache():
     assert "regctl manifest head" in cuda_job_text
     assert "${fingerprint}" in cuda_job_text
     assert cuda_job["outputs"]["reference"] == "${{ steps.cuda-wheelhouse-ref.outputs.reference }}"
+
+
+def test_install_summary_does_not_treat_skipped_publisher_as_failure():
+    summary_run = _jobs()["install-test-summary"]["steps"][1]["run"]
+
+    assert '"failure","cancelled","timed_out","action_required","startup_failure"' in summary_run
+    assert '.conclusion != "success"' not in summary_run

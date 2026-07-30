@@ -32,6 +32,88 @@ jobs:
         run: |
           echo "cuda_image=${CUDA_CONTAINER_IMAGE}" >> "$GITHUB_OUTPUT"
 
+  # Temporary proof job for PR #3289. It promotes the wheelhouse built by the
+  # first PR run so the final read-only PR workflow can prove an exact OCI hit.
+  # Remove this job after the registry round-trip has been validated.
+  bootstrap-cuda-wheelhouse-proof:
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/pull-request/3289'
+    permissions:
+      actions: read
+      contents: read
+      packages: write
+    env:
+      PLATFORM_MACHINE: x86_64
+      PYTHON_VERSION: "3.12"
+      SYS_PLATFORM: linux
+      TORCH_CUDA_ARCH_LIST: "9.0 10.0 12.0"
+      SOURCE_RUN_ID: "30459865595"
+      WHEELHOUSE_DIR: /tmp/cuda-wheelhouse
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Download previously verified CUDA wheelhouse
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh run download "${SOURCE_RUN_ID}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --name "cuda-wheelhouse-py${PYTHON_VERSION}" \
+            --dir "${WHEELHOUSE_DIR}"
+
+      - name: Compute CUDA wheelhouse reference
+        id: cuda-wheelhouse-ref
+        shell: bash
+        run: |
+          fingerprint="$(
+            python scripts/cuda_wheelhouse_lock.py \
+              --output fingerprint \
+              --lock uv.lock \
+              --torch-index "${TORCH_CU_INDEX}" \
+              --python-version "${PYTHON_VERSION}" \
+              --platform-machine "${PLATFORM_MACHINE}" \
+              --sys-platform "${SYS_PLATFORM}" \
+              --runner-os "${RUNNER_OS}" \
+              --cuda-container-image "${CUDA_CONTAINER_IMAGE}" \
+              --torch-cuda-arch-list "${TORCH_CUDA_ARCH_LIST}" \
+              --build-script .github/scripts/build-cuda-wheelhouse.sh
+          )"
+          tag="v3-${RUNNER_OS,,}-py${PYTHON_VERSION}-${fingerprint}"
+          echo "reference=${CUDA_WHEELHOUSE_REGISTRY}:${tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Install regctl
+        uses: regclient/actions/regctl-installer@c70ad64367908075211b10dcd2ab9fad4bfa1816
+        with:
+          release: v0.11.5
+
+      - name: Log in to GHCR
+        env:
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          printf '%s' "${REGISTRY_TOKEN}" |
+            regctl registry login ghcr.io --user "${GITHUB_ACTOR}" --pass-stdin
+
+      - name: Publish proof wheelhouse
+        env:
+          WHEELHOUSE_REFERENCE: ${{ steps.cuda-wheelhouse-ref.outputs.reference }}
+        shell: bash
+        run: |
+          if regctl manifest head "${WHEELHOUSE_REFERENCE}" >/dev/null 2>&1; then
+            echo "Wheelhouse already exists: ${WHEELHOUSE_REFERENCE}"
+            exit 0
+          fi
+
+          archive="${RUNNER_TEMP}/cuda-wheelhouse.tar"
+          tar -cf "${archive}" -C "${WHEELHOUSE_DIR}" .
+          regctl artifact put \
+            --artifact-type application/vnd.nvidia.automodel.cuda-wheelhouse.v1 \
+            --annotation "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
+            --annotation "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            "${WHEELHOUSE_REFERENCE}" < "${archive}"
+
   pip-test:
     runs-on: ${{ matrix.arch }}
     name: Pip - Python${{ matrix.python-version }} - ${{ matrix.arch == 'ubuntu-latest' && 'AMD64/Linux' || (matrix.arch == 'ubuntu-24.04-arm' && 'ARM64/Linux' || 'ARM64/Darwin') }} - No CUDA
@@ -483,7 +565,9 @@ jobs:
           RUN_ID: ${{ github.run_id }}
           SKIPPING_IS_ALLOWED: ${{ needs.pre-flight.outputs.docs_only == 'true' || needs.pre-flight.outputs.is_deployment_workflow == 'true' }}
         run: |
-          FAILED_JOBS=$(gh run view $GITHUB_RUN_ID --json jobs --jq '[.jobs[] | select(.status == "completed" and .conclusion != "success")] | length') || echo 0
+          FAILURE_CONCLUSIONS='["failure","cancelled","timed_out","action_required","startup_failure"]'
+          FAILED_JOBS=$(gh run view $GITHUB_RUN_ID --json jobs --jq \
+            "[.jobs[] | select(.status == \"completed\" and (.conclusion as \$c | ${FAILURE_CONCLUSIONS} | index(\$c)))] | length") || echo 0
 
           if [ "${FAILED_JOBS:-0}" -eq 0 ] || [ "$SKIPPING_IS_ALLOWED" == "true" ]; then
               echo "✅ All previous jobs completed successfully"
@@ -491,6 +575,7 @@ jobs:
           else
               echo "❌ Found $FAILED_JOBS failed job(s)"
               # Show which jobs failed
-              gh run view $GITHUB_RUN_ID --json jobs --jq '.jobs[] | select(.status == "completed" and .conclusion != "success") | .name'
+              gh run view $GITHUB_RUN_ID --json jobs --jq \
+                ".jobs[] | select(.status == \"completed\" and (.conclusion as \$c | ${FAILURE_CONCLUSIONS} | index(\$c))) | .name"
               exit 1
           fi
