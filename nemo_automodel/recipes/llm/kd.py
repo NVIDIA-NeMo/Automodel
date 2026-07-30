@@ -813,19 +813,19 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             self._ce_loss_buffer.append(ce_loss)
             self._kd_loss_buffer.append(kd_loss)
 
-        grad_norm = 0
-        # Clip gradients **after** any rescaling.
-        # TODO(@boxiangw): Fix TP gradient clipping
-        if max_grad_norm is not None:
-            if not self.device_mesh or self.device_mesh["tp"].size() == 1:
-                grad_norm = torch.nn.utils.clip_grad_norm_(
-                    [p for p in self.model_parts[0].parameters() if p.requires_grad], max_grad_norm
-                )
-                if hasattr(grad_norm, "full_tensor"):
-                    grad_norm = grad_norm.full_tensor()  # collect the summed grad norm across ranks
-
-            if isinstance(grad_norm, torch.Tensor):
-                grad_norm = grad_norm.item()
+        grad_norm = scale_grads_and_clip_grad_norm(
+            max_grad_norm,
+            self.model_parts,
+            norm_type=2.0,
+            pp_enabled=False,
+            device_mesh=self.device_mesh,
+            moe_mesh=self.moe_mesh,
+            ep_axis_name="ep" if self.moe_mesh is not None and "ep" in self.moe_mesh.mesh_dim_names else None,
+            pp_axis_name=None,
+            foreach=True,
+            num_label_tokens=num_label_tokens,
+            dp_group_size=self._get_dp_group_size(include_cp=True),
+        )
 
         self.checkpointer.maybe_wait_for_staging()
         for opt in self.optimizer:
