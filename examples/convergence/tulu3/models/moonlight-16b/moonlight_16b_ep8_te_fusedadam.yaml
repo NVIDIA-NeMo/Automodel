@@ -112,3 +112,32 @@ optimizer:
 moe_metrics:
   enabled: true
   mode: brief
+
+wandb:
+  enable: false
+  entity: Nemo-automodel
+  project: automodel_convergence_runs
+  name: moonlight_16b_ep8_te_fusedadam
+  dir: /tmp/wandb
+
+# ── Weekly Tulu-3 convergence CI (train 1000 steps -> IFEval -> threshold gate) ──
+# convergence_tests_launcher.sh reads downstream_eval and passes iff
+# |CI IFEval prompt_level_strict_acc - baseline| < k * stderr. baseline/stderr are
+# from our measured run (see models/moonlight-16b/run_te_fusedadam.md).
+ci:
+  recipe_owner: athitten
+  nodes: 1
+  time: "02:00:00"                     # full 1000-step train + IFEval
+  convergence:
+    step_scheduler.max_steps: 1000     # phases.convergence abbreviates to 200; restore full run
+  downstream_eval:
+    tasks: ifeval
+    tokenizer: moonshotai/Moonlight-16B-A3B
+    tp_size: 1
+    dp_size: 1
+    extra_model_args: "trust_remote_code=True"
+    gen_kwargs: "until=<|im_end|>"      # Moonlight assistant turns end with <|im_end|>
+    metric: prompt_level_strict_acc
+    baseline: 0.5250
+    stderr: 0.0215
+    k: 2
