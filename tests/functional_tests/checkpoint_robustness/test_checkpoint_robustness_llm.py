@@ -14,7 +14,7 @@
 
 """Train -> checkpoint -> reload via automodel & vanilla HF from consolidated, verify logits match via KL divergence.
 
-Launch: torchrun --nproc-per-node=<N> -m pytest <this_file> -c <config.yaml>
+Launch: torchrun --nproc-per-node=<N> <this_file> --config <config.yaml>
     [--kl_threshold <float>] [--hf_kl_threshold <float>]
     [--cross_tp_size <int>] [--cross_tp_kl_threshold <float>]
     [--tokenizer_name <str>]
@@ -37,11 +37,29 @@ from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from pathlib import Path
 
+_IMPORT_WATCHDOG_SECONDS = int(os.environ.get("CHECKPOINT_ROBUSTNESS_IMPORT_WATCHDOG_SECONDS", "0"))
+
+
+def _report_module_import(message: str) -> None:
+    """Write a rank-0 marker while the checkpoint harness module is importing."""
+    if _IMPORT_WATCHDOG_SECONDS > 0 and int(os.environ.get("RANK", "0")) == 0:
+        stream = sys.__stdout__ or sys.stdout
+        print(f"[checkpoint_robustness][{time.strftime('%H:%M:%S')}] {message}", file=stream, flush=True)
+
+
+if _IMPORT_WATCHDOG_SECONDS > 0 and int(os.environ.get("RANK", "0")) == 0:
+    _report_module_import("Module preflight: importing third-party dependencies")
+    _watchdog_stream = sys.__stderr__ or sys.stderr
+    faulthandler.enable(file=_watchdog_stream)
+    faulthandler.dump_traceback_later(_IMPORT_WATCHDOG_SECONDS, repeat=True, file=_watchdog_stream)
+
 import datasets
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch.distributed.tensor import DTensor
+
+_report_module_import("Module preflight: third-party imports complete; importing AutoModel modules")
 
 from nemo_automodel.components.checkpoint.checkpointing import (
     _MODELS_REQUIRING_BUFFER_REINIT,
@@ -52,6 +70,8 @@ from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
 from nemo_automodel.shared.utils import dtype_from_str
+
+_report_module_import("Module preflight: AutoModel imports complete")
 
 datasets.disable_caching()
 
