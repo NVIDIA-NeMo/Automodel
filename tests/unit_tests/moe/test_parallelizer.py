@@ -1330,6 +1330,28 @@ def test_parallelize_model_calls_subsystems_and_validates(monkeypatch):
     assert kwargs.get("frozen_multimodal_sharding") == "root"
 
 
+def test_parallelize_model_wraps_experts_on_singleton_ep_shard_mesh(monkeypatch):
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    apply_fsdp_mock = MagicMock()
+    monkeypatch.setattr(P, "apply_ep", MagicMock())
+    monkeypatch.setattr(P, "apply_fsdp", apply_fsdp_mock)
+
+    world_mesh = FakeWorldMesh({"dp": 2, ("dp",): 2}, mesh_dim_names=["dp"])
+    moe_mesh = FakeMoeMesh({"ep": 2, ("ep_shard",): 1})
+    model = type("Outer", (), {"moe_config": type("MC", (), {"n_routed_experts": 4})()})()
+
+    P.parallelize_model(
+        model=model,
+        world_mesh=world_mesh,
+        moe_mesh=moe_mesh,
+        dp_axis_names=("dp",),
+        ep_axis_name="ep",
+        ep_shard_axis_names=("ep_shard",),
+    )
+
+    assert apply_fsdp_mock.call_args.kwargs["ep_shard_enabled"] is True
+
+
 def test_parallelize_model_passes_frozen_multimodal_sharding_to_apply_fsdp(monkeypatch):
     P = _import_parallelizer_with_stubs(monkeypatch)
     apply_fsdp_mock = MagicMock()
