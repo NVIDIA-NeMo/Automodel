@@ -42,8 +42,12 @@ def test_glm_5_2_lora_config_contract() -> None:
     assert config.validation_dataset.truncation is True
     assert config.validation_dataset.padding is False
     assert config.packed_sequence.packed_sequence_size == 4096
+    assert config.distributed.reshard_after_forward is True
     assert config.step_scheduler.global_batch_size % (
         config.step_scheduler.local_batch_size * config.distributed.ep_size
     ) == 0
     assert config.dataloader.collate_fn is packed_sequence_thd_collater
     assert config.validation_dataloader.collate_fn is packed_sequence_thd_collater
+    release_overrides = config.ci.release.to_dict()
+    assert "step_scheduler.max_steps" not in release_overrides
+    assert release_overrides["packed_sequence.max_packs"] == 6400

@@ -29,7 +29,7 @@ distributed:
   ep_size: 128
   sequence_parallel: false
   activation_checkpointing: true
-  reshard_after_forward: false
+  reshard_after_forward: true
   moe:
     reshard_after_forward: true
     wrap_outer_model: false
@@ -157,3 +157,5 @@ ci:
   recipe_owner: shahafwa
   nodes: 16
   time: "00:20:00"
+  release:
+    packed_sequence.max_packs: 6400
