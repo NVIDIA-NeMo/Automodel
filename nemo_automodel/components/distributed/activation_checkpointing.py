@@ -28,10 +28,11 @@ parallelizer file stays small.
 import logging
 import os
 from collections.abc import Callable
-from contextlib import AbstractContextManager, nullcontext
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import List
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     CheckpointImpl,
@@ -40,7 +41,11 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.utils.checkpoint import CheckpointPolicy, create_selective_checkpoint_contexts
 
+from nemo_automodel.shared.import_utils import get_torch_version
+
 logger = logging.getLogger(__name__)
+
+_TORCH_PROFILER_SAC_IGNORE_MIN_VERSION = (2, 13)
 
 
 def unwrap_checkpoint_wrapper(module: nn.Module) -> nn.Module:
@@ -253,8 +258,43 @@ def _maybe_trace_selective_ac_decision(func, decision, is_alternating: bool, *, 
     logger.info("[selective-ac] %s -> %s", key, verdict)
 
 
+def ensure_profiler_ops_sac_ignored() -> None:
+    """Keep ``torch.ops.profiler`` record-function ops out of SAC's op replay.
+
+    torch 2.13's FSDP2 runs its pre/post-forward hooks under
+    ``torch.autograd.profiler.record_function``, which emits dispatchable
+    ``torch.ops.profiler._record_function_*`` ops. When an FSDP module boundary
+    sits inside a selective-activation-checkpointed region (e.g. MoE experts
+    sharded separately inside a checkpointed decoder block), those hooks fire a
+    different number of times during the backward recompute than during the
+    forward. SAC replays the forward op stream by per-op invocation index, so
+    the extra profiler op shifts the stream and training fails with
+    ``profiler._record_function_enter_new.default invocation index N
+    encountered during backward but not found in storage``.
+
+    Range ops carry no tensors SAC could cache or restore; adding them to
+    ``SAC_IGNORED_OPS`` only removes them from the replay accounting (they
+    still execute). No-op before torch 2.13 and on torch builds without
+    ``SAC_IGNORED_OPS`` or the profiler op namespace.
+    """
+    if get_torch_version().release < _TORCH_PROFILER_SAC_IGNORE_MIN_VERSION:
+        return
+
+    sac_ignored = getattr(torch.utils.checkpoint, "SAC_IGNORED_OPS", None)
+    profiler_ops = getattr(torch.ops, "profiler", None)
+    if sac_ignored is None or profiler_ops is None:
+        return
+    for packet_name in ("_record_function_enter", "_record_function_enter_new", "_record_function_exit"):
+        packet = getattr(profiler_ops, packet_name, None)
+        if packet is None:
+            continue
+        for overload_name in packet.overloads():
+            sac_ignored.add(getattr(packet, overload_name))
+
+
 def make_selective_checkpoint_context_fn():
     """Build a TorchTitan-style selective activation checkpointing context."""
+    ensure_profiler_ops_sac_ignored()
 
     def selective_checkpointing_context_fn():
         # Count matmuls separately for the forward and recompute passes. torch
@@ -309,29 +349,44 @@ def _disable_dynamo_lru_cache() -> None:
         logger.debug("Could not disable dynamo LRU cache for selective AC + compile.", exc_info=True)
 
 
+@contextmanager
+def _restore_sdpa_state(sdpa: Callable, backends: list[SDPBackend]):
+    """Temporarily restore the SDPA callable and backend set captured during forward."""
+    backward_sdpa = F.scaled_dot_product_attention
+    F.scaled_dot_product_attention = sdpa
+    try:
+        with sdpa_kernel(backends):
+            yield
+    finally:
+        F.scaled_dot_product_attention = backward_sdpa
+
+
 def sdpa_backend_snapshot_context_fn() -> tuple[AbstractContextManager, AbstractContextManager]:
-    """Snapshot the ambient SDPA backend set and restore it on checkpoint recompute.
+    """Snapshot the ambient SDPA state and restore it on checkpoint recompute.
 
     A ``context_fn`` for non-reentrant ``checkpoint_wrapper``: torch's
     non-reentrant checkpoint invokes it at region entry on every checkpointed
-    forward, so the flags read here are exactly the backends the forward runs
-    under. Checkpoint recompute faults if and only if the effective SDPA
-    backend set differs between the forward and the backward-time replay (the
-    two passes then save different tensors and the wrapper's determinism check
-    raises ``CheckpointError``). Re-pinning the forward-time set during the
-    recompute therefore gives parity by construction: a no-op in clean
-    environments, and correct under ambient backend forcing (an
-    ``sdpa_kernel`` pin or module-level backend toggling) that is active at
-    forward time but does not span the recompute. Caveat: forcing toggled
-    *inside* the checkpointed region between attention calls is not captured,
-    because the snapshot is taken once at region entry.
+    forward, so the state read here is exactly what the forward runs under.
+    Both the enabled backend set and ``F.scaled_dot_product_attention`` are
+    restored during recompute. The callable matters for context parallelism:
+    a VLM vision tower temporarily suspends CP's ring-SDPA monkeypatch, and
+    checkpoint recompute occurs after that forward-only suspension has exited.
+    Replaying under the captured callable keeps bidirectional vision attention
+    local while restoring the backward-time CP dispatcher after recompute.
+
+    Re-pinning the forward-time backend set also prevents checkpoint metadata
+    mismatches when ambient backend forcing (an ``sdpa_kernel`` pin or
+    module-level backend toggling) is active at forward time but does not span
+    recompute. State toggled *inside* the checkpointed region between attention
+    calls is not captured because the snapshot is taken once at region entry.
 
     Returns:
         ``(forward_ctx, recompute_ctx)``: a no-op context for the checkpoint
-        forward, and an ``sdpa_kernel`` context restoring the captured backend
+        forward, and a context restoring the captured SDPA callable and backend
         set for the backward-time recompute.
     """
-    captured = [
+    captured_sdpa = F.scaled_dot_product_attention
+    captured_backends = [
         backend
         for enabled, backend in (
             (torch.backends.cuda.flash_sdp_enabled(), SDPBackend.FLASH_ATTENTION),
@@ -341,7 +396,17 @@ def sdpa_backend_snapshot_context_fn() -> tuple[AbstractContextManager, Abstract
         )
         if enabled
     ]
-    return nullcontext(), sdpa_kernel(captured)
+    return nullcontext(), _restore_sdpa_state(captured_sdpa, captured_backends)
+
+
+def _registered_child_name(module: nn.Module, attr: str, child: nn.Module) -> str | None:
+    """Return the registered name for a child reached through an attribute."""
+    if module._modules.get(attr) is child:
+        return attr
+    for child_name, registered_child in module._modules.items():
+        if registered_child is child:
+            return child_name
+    return None
 
 
 def _wrap_first_existing_attr(
@@ -351,14 +416,19 @@ def _wrap_first_existing_attr(
     skip: bool = False,
     context_fn: Callable[[], tuple[AbstractContextManager, AbstractContextManager]] | None = None,
 ) -> int:
-    """Checkpoint-wrap the first matching child attr on ``module``."""
+    """Checkpoint-wrap the first matching registered child attr on ``module``."""
     if skip:
         return 0
     checkpoint_kwargs = {} if context_fn is None else {"context_fn": context_fn}
     for attr in attr_names:
         child = getattr(module, attr, None)
         if isinstance(child, nn.Module):
-            setattr(module, attr, checkpoint_wrapper(child, **checkpoint_kwargs))
+            child_name = _registered_child_name(module, attr, child)
+            if child_name is None:
+                continue
+            if hasattr(child, "_checkpoint_wrapped_module"):
+                return 0
+            setattr(module, child_name, checkpoint_wrapper(child, **checkpoint_kwargs))
             return 1
     return 0
 
@@ -367,7 +437,9 @@ def apply_submodule_checkpointing(
     layers: List[nn.Module],
     has_kv_sharing: bool,
     *,
-    context_fn: Callable[[], tuple[AbstractContextManager, AbstractContextManager]] | None = None,
+    context_fn: Callable[[], tuple[AbstractContextManager, AbstractContextManager]] | None = (
+        sdpa_backend_snapshot_context_fn
+    ),
 ) -> None:
     """Wrap a transformer block's sub-modules with ``checkpoint_wrapper``.
 
@@ -382,11 +454,10 @@ def apply_submodule_checkpointing(
     Args:
         layers: Transformer decoder layers to wrap (mutated in place).
         has_kv_sharing: Whether the model reuses K/V across layers via the cache.
-        context_fn: Optional factory returning ``(forward_ctx, recompute_ctx)``
-            for the attention and MLP checkpoint wrappers (e.g.
-            ``sdpa_backend_snapshot_context_fn``). Norm wrappers stay plain:
-            they dispatch no SDPA, so their recompute cannot diverge on
-            backend state.
+        context_fn: Factory returning ``(forward_ctx, recompute_ctx)`` for the
+            attention and MLP checkpoint wrappers. Defaults to restoring the
+            forward-time SDPA state; pass ``None`` to disable it. Norm wrappers
+            stay plain because they dispatch no SDPA.
     """
     wrapped_counts: dict[str, int] = {
         "mlp": 0,
@@ -399,7 +470,12 @@ def apply_submodule_checkpointing(
         wrapped_counts["mlp"] += _wrap_first_existing_attr(layer, ("mlp", "feed_forward", "ffn"), context_fn=context_fn)
         wrapped_counts["attention"] += _wrap_first_existing_attr(
             layer,
-            ("self_attn", "attention", "attn"),
+            # "linear_attn" covers hybrid linear-attention blocks (e.g. Qwen3-Next /
+            # Qwen3.5 Gated DeltaNet layers), which name their mixer "linear_attn"
+            # rather than "self_attn". Without it those layers are never wrapped and
+            # long-context training OOMs. A hybrid block has either "self_attn" or
+            # "linear_attn" (never both), so first-match wrapping stays unambiguous.
+            ("self_attn", "attention", "attn", "linear_attn"),
             skip=has_kv_sharing,
             context_fn=context_fn,
         )

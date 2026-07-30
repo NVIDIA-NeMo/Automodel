@@ -563,7 +563,11 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
             self.base_lr = float(optimizer.param_groups[0]["lr"])
 
         # -- dataset + dataloader ----------------------------------------
-        dataloader_config = self.cfg.bagel_dataloader
+        # The recipe holds a raw ConfigNode; ``bagel_dataloader`` is a typed
+        # RecipeConfig property, so resolve it through a RecipeConfig view here
+        # (rather than wrapping self.cfg, which would break the ConfigNode-style
+        # optimizer/wandb access used elsewhere in this recipe).
+        dataloader_config = RecipeConfig(self.cfg).bagel_dataloader
         if dataloader_config is None:
             raise ValueError("BAGEL training requires dataset and dataloader configs")
         dataloader_build = dataloader_config.build(
@@ -969,7 +973,7 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
         self.metric_logger_train.close()
         self.metric_logger_valid.close()
         if self.checkpointer is not None:
-            self.checkpointer.close()
+            self._finalize_and_close_checkpointer()
 
     # ------------------------------------------------------------------
     # Logging helpers shared with FinetuneRecipeForVLM so BAGEL can keep its

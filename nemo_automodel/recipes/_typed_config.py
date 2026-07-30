@@ -19,9 +19,10 @@ The YAML→typed coercion happens **here**, at the recipe input boundary
 recipe body only ever sees typed component configs and calls
 ``self.cfg.<section>.build(...)`` directly.
 
-Known sections are exposed as cached, typed attributes that own a ``build()``:
-``wandb``/``mlflow``/``step_scheduler``/``lr_scheduler``/``prewarm`` map to
-component config dataclasses; the ``optimizer`` and ``loss_fn`` blocks resolve to a component
+Known sections are exposed as cached, typed attributes that own a ``build()`` or
+``apply()``: ``wandb``/``mlflow``/``step_scheduler``/``lr_scheduler``/``prewarm``/
+``embedding_row_repair`` map to component config dataclasses; the ``optimizer``
+and ``loss_fn`` blocks resolve to a component
 :class:`~nemo_automodel.components.optim.optimizer.OptimizerConfig` /
 :class:`~nemo_automodel.components.loss.loss.LossConfig` via
 ``build_optimizer_config`` / ``build_loss_config`` (which own a ``build()``),
@@ -59,6 +60,7 @@ if TYPE_CHECKING:
     from nemo_automodel.components.loss.loss import LossConfig
     from nemo_automodel.components.loss.mtp import MTPLossConfig
     from nemo_automodel.components.optim.optimizer import OptimizerConfig
+    from nemo_automodel.components.training.embedding_row_repair import EmbeddingRowRepairConfig
     from nemo_automodel.components.training.prewarm import PrewarmConfig
 
 # Keys present in the YAML ``step_scheduler:`` block that are runtime args passed
@@ -129,8 +131,7 @@ class RecipeConfig:
     """Typed view over the YAML config consumed by recipes.
 
     ``wandb``, ``mlflow``, ``step_scheduler``, ``lr_scheduler``, ``optimizer``,
-    ``loss_fn`` and ``checkpoint`` are exposed as typed objects that own a
-    ``.build(...)`` (``optimizer`` is an
+    ``loss_fn`` and ``checkpoint`` are exposed as typed objects (``optimizer`` is an
     :class:`~nemo_automodel.components.optim.optimizer.OptimizerConfig`,
     ``checkpoint`` a
     :class:`~nemo_automodel.components.checkpoint.config.CheckpointingConfig`);
@@ -326,17 +327,25 @@ class RecipeConfig:
     @staticmethod
     def _resolve_vlm_processor(node: Any) -> "VlmProcessorConfig":
         """Resolve an optional processor section into its typed component config."""
-        from nemo_automodel.components.datasets.vlm.loader import VlmProcessorConfig
+        from nemo_automodel.components.datasets.vlm.loader import VlmProcessorConfig, VlmVideoProcessorConfig
 
         if node is None:
             return VlmProcessorConfig()
         kwargs = _as_dict(node)
+        video_processor_node = kwargs.pop("video_processor", None)
+        video_processor = None
+        if video_processor_node is not None:
+            video_factory, video_kwargs = _callable_and_kwargs(video_processor_node)
+            if not callable(video_factory):
+                raise TypeError(f"VLM video processor _target_ must resolve to a callable, got {video_factory!r}")
+            video_processor = VlmVideoProcessorConfig(factory=video_factory, kwargs=video_kwargs)
+
         target = kwargs.pop("_target_", None)
         if target is None:
-            return VlmProcessorConfig(kwargs=kwargs)
+            return VlmProcessorConfig(kwargs=kwargs, video_processor=video_processor)
         if not callable(target):
             raise TypeError(f"VLM processor _target_ must resolve to a callable, got {target!r}")
-        return VlmProcessorConfig(factory=target, kwargs=kwargs)
+        return VlmProcessorConfig(factory=target, kwargs=kwargs, video_processor=video_processor)
 
     @classmethod
     def resolve_vlm_dataloader(
@@ -605,6 +614,13 @@ class RecipeConfig:
 
         node = self._raw.get("prewarm", None)
         return PrewarmConfig(**_section_kwargs(node)) if node else None
+
+    @cached_property
+    def embedding_row_repair(self) -> "EmbeddingRowRepairConfig | None":
+        from nemo_automodel.components.training.embedding_row_repair import EmbeddingRowRepairConfig
+
+        node = self._raw.get("embedding_row_repair", None)
+        return EmbeddingRowRepairConfig(**_section_kwargs(node)) if node else None
 
     @cached_property
     def checkpoint(self) -> "CheckpointingConfig":

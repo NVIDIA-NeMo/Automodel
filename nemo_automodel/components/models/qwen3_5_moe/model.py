@@ -17,6 +17,7 @@
 import copy
 import inspect
 from dataclasses import dataclass
+from functools import partial
 from typing import Any, Optional, Union
 
 import torch
@@ -60,6 +61,18 @@ except ModuleNotFoundError:
     Qwen3_5MoeVisionRotaryEmbedding = _make_missing("Qwen3_5MoeVisionRotaryEmbedding")
     HFQwen3_5MoeModel = _make_missing("Qwen3_5MoeModel")
 
+from nemo_automodel.components.distributed.context_parallel.sharder import (
+    ContextParallelSharder,
+    contiguous_local_indices,
+    round_robin_local_indices,
+    shard_batch_aux_only,
+    shard_sequence_for_cp_contiguous,
+    shard_sequence_for_cp_round_robin,
+)
+from nemo_automodel.components.distributed.cp_vision_frame_shard import (
+    cp_vision_frame_sharding_active,
+    maybe_distribute_visual,
+)
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.mtp import MTPConfig, MTPModule, roll_tensor
@@ -68,7 +81,7 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
     reject_unsupported_tie_word_embeddings,
 )
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype, compute_lm_head_logits
-from nemo_automodel.components.models.qwen3_next.layers import Qwen3NextRMSNorm
+from nemo_automodel.components.models.qwen3_next.layers import Qwen3NextAttention, Qwen3NextRMSNorm
 from nemo_automodel.components.models.qwen3_next.model import Block
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MoEConfig
@@ -87,6 +100,46 @@ class Qwen3_5MoeCausalLMOutputWithPast(CausalLMOutputWithPast):
     mtp_loss_scaling_factor: float | None = None
 
 
+class _Qwen3_5MoeAttention(Qwen3NextAttention):
+    """Qwen3.5-MoE full attention with packed block-diagonal CP dispatch."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._base_attn_func = self.attn_func
+        self.attn_func = self._dispatch_attention
+
+    def _dispatch_attention(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        **attn_kwargs: Any,
+    ) -> torch.Tensor:
+        """Route preprocessed QKV through packed CP or the configured backend.
+
+        Args:
+            query: Query states of shape ``[batch, heads, local_sequence, head_dim]``.
+            key: Key states of shape ``[batch, kv_heads, local_sequence, head_dim]``.
+            value: Value states with the same layout as ``key``.
+            **attn_kwargs: Keyword arguments produced by the parent attention's
+                backend preprocessing.
+
+        Returns:
+            Attention output of shape
+            ``[batch, heads, local_sequence, head_dim]``.
+        """
+        from nemo_automodel.components.distributed.blockdiag_cp import (
+            cp_blockdiag_sdpa,
+            current_blockdiag_cp_state,
+        )
+
+        if current_blockdiag_cp_state() is not None:
+            if self.backend.attn != "sdpa":
+                raise ValueError("Qwen3.5-MoE packed context parallelism requires model.backend.attn='sdpa'")
+            return cp_blockdiag_sdpa(query, key, value, **attn_kwargs)
+        return self._base_attn_func(query, key, value, **attn_kwargs)
+
+
 class Qwen3_5MoeBlock(Block):
     """Block that uses the Qwen3.5-MoE native GatedDeltaNet (separate in_proj_qkv,
     in_proj_z, in_proj_b, in_proj_a)"""
@@ -96,6 +149,8 @@ class Qwen3_5MoeBlock(Block):
         # Replace the Qwen3Next fused GatedDeltaNet with CP-aware variant
         if self.layer_type == "linear_attention":
             self.linear_attn = CPAwareGatedDeltaNet(config, layer_idx)
+        elif self.layer_type == "full_attention":
+            self.self_attn = _Qwen3_5MoeAttention(config, layer_idx, backend)
 
     def forward(
         self,
@@ -620,7 +675,10 @@ class Qwen3_5MoeTextModelBackend(nn.Module):
         # do not support padding masks, so we null them out.
         if getattr(self, "_cp_enabled", False):
             attention_mask = None
-            padding_mask = None
+            from nemo_automodel.components.distributed.blockdiag_cp import current_blockdiag_cp_state
+
+            if current_blockdiag_cp_state() is None:
+                padding_mask = None
 
         if padding_mask is None and attention_mask is not None:
             if attention_mask.ndim <= 2:
@@ -701,15 +759,23 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
     # forward() pulls per-microbatch pixel_values from _vlm_pixel_values_chunks;
     # patch_hf_model_for_pp must not replace it under PP.
     _pp_keep_self_forward: bool = True
+    # CP submesh, installed by Qwen3_5ParallelizationStrategy when context
+    # parallelism is active; None means the forward embeds and shards nothing for CP.
+    cp_mesh = None
 
     @dataclass(frozen=True)
     class ModelCapabilities:
         """Declared parallelism capabilities for this model class."""
 
         supports_tp: bool = False
-        supports_cp: bool = False
+        # CP is supported via the CP-aware GatedDeltaNet linear attention + ring
+        # SDPA on the full-attention layers; the forward embeds and round-robin
+        # shards its own sequence (see prepare_model_inputs_for_cp / forward).
+        supports_cp: bool = True
         supports_pp: bool = True
         supports_ep: bool = True
+        supports_thd: bool = False
+        supports_cp_vision_frame_sharding: bool = True
 
     @classmethod
     def from_config(
@@ -842,24 +908,97 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
         fp32_safe_rotary.to(rotary.inv_freq.device)
         vision_model.rotary_pos_emb = fp32_safe_rotary
 
+    def _encode_vision_for_cp(
+        self,
+        pixel_values: torch.Tensor,
+        grid_thw: torch.Tensor,
+        *,
+        is_video: bool,
+    ) -> torch.Tensor:
+        """Encode one modality into flat, entry-ordered visual tokens under CP.
+
+        Args:
+            pixel_values: Patch rows of shape ``[total_patch_rows, patch_dim]``
+                for all image or video entries, frame-contiguous in entry order.
+            grid_thw: Per-entry temporal/height/width grids of shape
+                ``[num_entries, 3]``.
+            is_video: Whether the replicated fallback uses the video feature
+                helper instead of the image feature helper.
+
+        Returns:
+            Flat merged-token embeddings of shape ``[visual_tokens, hidden]``
+            in original entry order. When CP vision frame sharding is active, each
+            rank computes a frame partition and the differentiable gather
+            reconstructs this replicated output.
+        """
+        if cp_vision_frame_sharding_active():
+            return maybe_distribute_visual(
+                self.model.visual, pixel_values.type(self.model.visual.dtype), grid_thw
+            ).pooler_output
+        if is_video:
+            outputs = self.model.get_video_features(pixel_values, grid_thw, return_dict=True)
+        else:
+            outputs = self.model.get_image_features(pixel_values, grid_thw, return_dict=True)
+        return torch.cat(outputs.pooler_output, dim=0)
+
+    def get_pipeline_kwargs_chunk_dims(self, kwargs: dict[str, Any]) -> dict[str, int]:
+        """Return model-owned PP microbatch split dims for keyword inputs.
+
+        Qwen3.5-MoE mRoPE position ids can arrive as ``[T/H/W, batch, seq]`` or
+        ``[text/T/H/W, batch, seq]``. The PP schedule must split that tensor on
+        the batch axis, while all standard batch-major kwargs keep the framework
+        default.
+        """
+        position_ids = kwargs.get("position_ids")
+        if isinstance(position_ids, torch.Tensor) and position_ids.ndim == 3 and position_ids.shape[0] in (3, 4):
+            return {"position_ids": 1}
+        return {}
+
     def prepare_model_inputs_for_cp(
         self,
-        input_ids: torch.Tensor,
+        batch: dict[str, Any],
         *,
-        attention_mask: torch.Tensor | None = None,
-        position_ids: torch.Tensor | None = None,
-        pixel_values: torch.Tensor | None = None,
-        pixel_values_videos: torch.Tensor | None = None,
-        image_grid_thw: torch.Tensor | None = None,
-        image_grid_hws: torch.Tensor | None = None,
-        video_grid_thw: torch.Tensor | None = None,
-        mm_token_type_ids: torch.Tensor | None = None,
-        **kwargs: Any,
-    ) -> dict[str, torch.Tensor]:
-        """Build full-sequence multimodal embeddings and mRoPE positions before CP sharding."""
+        num_chunks: int = 1,
+    ) -> dict[str, Any]:
+        """Return a sharder-only CP backend plus the full-sequence mRoPE positions.
+
+        Embedding and the VLM->LM multimodal scatter now run inside ``forward``
+        per microbatch (see :meth:`_embed_and_splice_for_cp`), so this hook only
+        computes the mRoPE ``position_ids`` on the full (unsharded) sequence via
+        ``get_rope_index`` and returns them with a
+        :class:`ContextParallelSharder`. Packed SDPA batches select contiguous
+        block-diagonal CP; ordinary batches retain the round-robin sharder.
+        ``input_ids`` and media stay in the batch for the forward, while
+        ``mm_token_type_ids`` is consumed here (only ``get_rope_index`` needs it).
+
+        Args:
+            batch: The full-sequence batch. Tensor fields consumed here are
+                ``input_ids`` of shape ``[batch, sequence]``, optional
+                ``attention_mask`` of shape ``[batch, sequence]`` or
+                ``[batch, 1, sequence, sequence]``, optional ``position_ids``
+                of shape ``[axes, batch, sequence]``, and image/video grids of
+                shape ``[num_entries, 2 or 3]``.
+            num_chunks: Accepted for hook-signature parity; unused.
+
+        Returns:
+            A mapping containing the selected ``cp_sharder``, full-sequence
+            ``position_ids`` of shape ``[axes, batch, sequence]``, a consumed
+            ``mm_token_type_ids=None``, and any promoted ``image_grid_thw`` of
+            shape ``[num_entries, 3]``.
+        """
+        input_ids = batch.get("input_ids")
         if input_ids is None:
             raise ValueError("Qwen3.5-MoE CP pre-embedding requires input_ids.")
+        attention_mask = batch.get("attention_mask")
+        position_ids = batch.get("position_ids")
+        image_grid_thw = batch.get("image_grid_thw")
+        image_grid_hws = batch.get("image_grid_hws")
+        video_grid_thw = batch.get("video_grid_thw")
+        mm_token_type_ids = batch.get("mm_token_type_ids")
 
+        # Normalize a [N, 2] H/W grid to the [N, 3] T/H/W grid get_rope_index and
+        # the forward's embed path expect; write it back so the forward reads it.
+        promoted: dict[str, Any] = {}
         if image_grid_thw is None and image_grid_hws is not None and image_grid_hws.numel() > 0:
             if image_grid_hws.shape[-1] == 2:
                 ones = torch.ones(
@@ -871,32 +1010,7 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
                 image_grid_thw = torch.cat([ones, image_grid_hws], dim=-1)
             else:
                 image_grid_thw = image_grid_hws
-
-        inputs_embeds = self.get_input_embeddings()(input_ids)
-
-        if pixel_values is not None:
-            if hasattr(self.model.visual, "rotary_pos_emb"):
-                self.model.visual.rotary_pos_emb.to(pixel_values.device)
-            image_outputs = self.model.get_image_features(pixel_values, image_grid_thw, return_dict=True)
-            image_embeds = torch.cat(image_outputs.pooler_output, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
-            image_mask, _ = self.model.get_placeholder_mask(
-                input_ids,
-                inputs_embeds=inputs_embeds,
-                image_features=image_embeds,
-            )
-            inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
-
-        if pixel_values_videos is not None:
-            if hasattr(self.model.visual, "rotary_pos_emb"):
-                self.model.visual.rotary_pos_emb.to(pixel_values_videos.device)
-            video_outputs = self.model.get_video_features(pixel_values_videos, video_grid_thw, return_dict=True)
-            video_embeds = torch.cat(video_outputs.pooler_output, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
-            _, video_mask = self.model.get_placeholder_mask(
-                input_ids,
-                inputs_embeds=inputs_embeds,
-                video_features=video_embeds,
-            )
-            inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
+            promoted = {"image_grid_thw": image_grid_thw, "image_grid_hws": None}
 
         if position_ids is None:
             rope_kwargs = {
@@ -917,7 +1031,136 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
             position_ids, rope_deltas = self.model.get_rope_index(input_ids, **rope_kwargs)
             self.model.rope_deltas = rope_deltas
 
-        return {"inputs_embeds": inputs_embeds, "position_ids": position_ids}
+        packed_seq_ids = batch.get("_packed_seq_ids")
+        uses_blockdiag_cp = isinstance(packed_seq_ids, torch.Tensor) or (
+            isinstance(attention_mask, torch.Tensor) and attention_mask.ndim == 4
+        )
+        if uses_blockdiag_cp and self.backend.attn != "sdpa":
+            raise ValueError("Qwen3.5-MoE packed context parallelism requires model.backend.attn='sdpa'")
+        if uses_blockdiag_cp:
+            from nemo_automodel.components.distributed.blockdiag_cp import make_cp_blockdiag_batch_and_ctx
+
+            cp_sharder = ContextParallelSharder(
+                shard_batch=partial(make_cp_blockdiag_batch_and_ctx, shard_primary=False),
+                local_token_global_indices=contiguous_local_indices,
+            )
+        else:
+            cp_sharder = ContextParallelSharder(
+                shard_batch=shard_batch_aux_only,
+                local_token_global_indices=round_robin_local_indices,
+            )
+
+        return {
+            "cp_sharder": cp_sharder,
+            "position_ids": position_ids,
+            "mm_token_type_ids": None,
+            **promoted,
+        }
+
+    def _embed_and_splice_for_cp(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        pixel_values: torch.Tensor | None,
+        pixel_values_videos: torch.Tensor | None,
+        image_grid_thw: torch.Tensor | None,
+        video_grid_thw: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Embed token ids and splice image/video features into the embeddings.
+
+        The VLM->LM multimodal scatter runs on the full (unsharded) sequence
+        inside the forward before the CP sequence shard, identical to the
+        pre-CP-refactor pre-embed.
+
+        Args:
+            input_ids: Token ids ``[batch, sequence]`` (full, unsharded).
+            pixel_values: Optional packed image patches for HF vision encoding.
+            pixel_values_videos: Optional packed video patches.
+            image_grid_thw: Per-image ``[num_images, 3]`` T/H/W grid.
+            video_grid_thw: Per-video ``[num_videos, 3]`` T/H/W grid.
+
+        Returns:
+            ``inputs_embeds`` of shape ``[batch, sequence, hidden]`` with image /
+            video features scattered into their placeholder positions.
+        """
+        inputs_embeds = self.get_input_embeddings()(input_ids)
+
+        # The HF visual tower's bidirectional attention is not CP-sharded; when this
+        # splice runs in-forward under an active CP ring context it must suspend the
+        # ring dispatcher, or torch's load-balanced ring SDPA all-gathers the vision
+        # Q/K/V and rejects the non-causal attention. No-op when CP is inactive.
+        from nemo_automodel.components.distributed.context_parallel.utils import (
+            cp_dispatcher_suspended,  # noqa: PLC0415
+        )
+
+        with cp_dispatcher_suspended(self.cp_mesh):
+            if pixel_values is not None:
+                if hasattr(self.model.visual, "rotary_pos_emb"):
+                    self.model.visual.rotary_pos_emb.to(pixel_values.device)
+                image_embeds = self._encode_vision_for_cp(pixel_values, image_grid_thw, is_video=False).to(
+                    inputs_embeds.device, inputs_embeds.dtype
+                )
+                image_mask, _ = self.model.get_placeholder_mask(
+                    input_ids,
+                    inputs_embeds=inputs_embeds,
+                    image_features=image_embeds,
+                )
+                inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+
+            if pixel_values_videos is not None:
+                if hasattr(self.model.visual, "rotary_pos_emb"):
+                    self.model.visual.rotary_pos_emb.to(pixel_values_videos.device)
+                video_embeds = self._encode_vision_for_cp(pixel_values_videos, video_grid_thw, is_video=True).to(
+                    inputs_embeds.device, inputs_embeds.dtype
+                )
+                _, video_mask = self.model.get_placeholder_mask(
+                    input_ids,
+                    inputs_embeds=inputs_embeds,
+                    video_features=video_embeds,
+                )
+                inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
+
+        return inputs_embeds
+
+    def get_pipeline_stage_metas(
+        self,
+        *,
+        is_first: bool,
+        microbatch_size: int,
+        seq_len: int,
+        dtype: torch.dtype,
+    ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
+        """Per-stage input/output meta tensors for the PP schedule's shape inference.
+
+        Matches the framework default except that under context parallelism the
+        first stage embeds the full sequence and shards it in forward, so every
+        stage output and later-stage input carries the LOCAL (padded-to-``2*cp``
+        then ``//cp``) sequence length while the first-stage input stays
+        full-length. At ``cp_size == 1`` this reduces to the default symmetric
+        shapes.
+        """
+        text_config = getattr(self.config, "text_config", self.config)
+        hidden_size = text_config.hidden_size
+        vocab_size = text_config.vocab_size
+
+        cp_size = self.cp_mesh.size() if self.cp_mesh is not None else 1
+        local_seq_len = seq_len
+        if cp_size > 1:
+            padded_seq_len = seq_len + (-seq_len) % (2 * cp_size)
+            local_seq_len = padded_seq_len // cp_size
+
+        if is_first:
+            inputs_meta = (torch.empty(microbatch_size, seq_len, device="meta", dtype=torch.long),)
+        else:
+            inputs_meta = (torch.empty(microbatch_size, local_seq_len, hidden_size, device="meta", dtype=dtype),)
+
+        has_lm_head = getattr(self, "lm_head", None) is not None
+        emits_hidden_states = getattr(self, "_pp_return_hidden_states", False) is True
+        if has_lm_head and not emits_hidden_states:
+            outputs_meta = (torch.empty(microbatch_size, local_seq_len, vocab_size, device="meta", dtype=dtype),)
+        else:
+            outputs_meta = (torch.empty(microbatch_size, local_seq_len, hidden_size, device="meta", dtype=dtype),)
+        return inputs_meta, outputs_meta
 
     def forward(
         self,
@@ -932,14 +1175,37 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
         output_hidden_states: Optional[bool] = None,
         **kwargs: Any,
     ):
-        if kwargs.pop("_pre_embed_only", False):
-            return self.prepare_model_inputs_for_cp(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                **kwargs,
-            )
+        """Run Qwen3.5-MoE VLM generation with model-owned CP embedding.
 
+        Args:
+            input_ids: Token ids of shape ``[batch, sequence]``. Under CP this
+                remains full-length until multimodal features are spliced.
+            position_ids: Optional mRoPE positions of shape
+                ``[axes, batch, sequence]``; under CP, ``sequence`` is local.
+            attention_mask: Optional mask of shape ``[batch, sequence]`` or
+                ``[batch, 1, sequence, sequence]``.
+            padding_mask: Optional local padding mask of shape
+                ``[batch, sequence]`` where ``True`` marks padding.
+            inputs_embeds: Optional embeddings of shape
+                ``[batch, sequence, hidden]``.
+            cache_position: Optional token positions of shape ``[sequence]``.
+            logits_to_keep: Number of trailing logits to retain, or indices of
+                shape ``[kept_sequence]``.
+            output_hidden_states: Whether to expose final decoder states for the
+                fused loss path.
+            **kwargs: Model inputs including image/video patch rows of shape
+                ``[total_patch_rows, patch_dim]``, their grids of shape
+                ``[num_entries, 3]``, and optional packed document ids of shape
+                ``[batch, sequence]``.
+
+        Returns:
+            A causal-LM output whose logits have shape
+            ``[batch, sequence, vocab]`` (or ``[batch, sequence, hidden]`` on a
+            non-final pipeline stage), whose requested hidden states have shape
+            ``[batch, sequence, hidden]``, and whose optional MTP tensors each
+            have shape ``[batch, sequence, hidden]``. Under CP, ``sequence`` is
+            the local padded shard.
+        """
         # Resolve from the text/decoder sub-config for this VL model.
         text_config = self.config.text_config if hasattr(self.config, "text_config") else self.config
         output_hidden_states = (
@@ -1002,12 +1268,43 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
                 input_ids, position_ids, padding_mask, kwargs
             )
             attention_mask = None
-            if padding_mask is not None:
-                kwargs["padding_mask"] = padding_mask
+
+        # Context-parallel: embed + vision-splice the full sequence, then select
+        # the packed contiguous shard or the ordinary round-robin chunk pair.
+        # Auxiliary streams and mRoPE positions already use the matching layout.
+        cp_size = self.cp_mesh.size() if self.cp_mesh is not None else 1
+        if cp_size > 1 and inputs_embeds is None and input_ids is not None and not torch.is_floating_point(input_ids):
+            is_first_stage = getattr(self.model.language_model, "embed_tokens", None) is not None
+            is_last_stage = getattr(self, "lm_head", None) is not None
+            if is_first_stage:
+                if not is_last_stage and (pixel_values is not None or pixel_values_videos is not None):
+                    raise NotImplementedError(
+                        "Qwen3.5-MoE does not support image/video microbatch chunking under combined "
+                        "pipeline + context parallelism; use a text-only batch for cp>1 and pp>1."
+                    )
+                inputs_embeds = self._embed_and_splice_for_cp(
+                    input_ids,
+                    pixel_values=pixel_values,
+                    pixel_values_videos=pixel_values_videos,
+                    image_grid_thw=image_grid_thw,
+                    video_grid_thw=video_grid_thw,
+                )
+                from nemo_automodel.components.distributed.blockdiag_cp import current_blockdiag_cp_state
+
+                if current_blockdiag_cp_state() is not None:
+                    inputs_embeds, _, _ = shard_sequence_for_cp_contiguous(self.cp_mesh, inputs_embeds, seq_dim=1)
+                else:
+                    inputs_embeds, _, _ = shard_sequence_for_cp_round_robin(self.cp_mesh, inputs_embeds, seq_dim=1)
+                input_ids = None
+                # The media was consumed into inputs_embeds; drop it so self.model
+                # does not re-splice into the already-sharded embeddings.
+                for media_key in ("pixel_values", "pixel_values_videos", "image_grid_thw", "video_grid_thw"):
+                    kwargs.pop(media_key, None)
 
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
+            padding_mask=padding_mask,
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
             cache_position=cache_position,
@@ -1105,8 +1402,8 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
 
         # Skip the SSM-gating holders so they keep fp32 storage (master weights):
         # cast_model_to_dtype cannot reliably restore fp32 once FSDP2-sharded, so it
-        # detaches them and never casts them. Each holder is its own fp32 FSDP group
-        # (moe/parallelizer._shard_fp32_param_holders), so this is dtype-uniform-safe.
+        # detaches them and never casts them. The MoE parallelizer's dtype-aware
+        # sharder places each holder in its own fp32 FSDP group.
         cast_model_to_dtype(self, dtype, skip_modules=("_fp32_params",))
 
         with buffer_device:

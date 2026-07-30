@@ -19,6 +19,7 @@ import pytest
 import torch
 from torch import nn
 
+from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.recipes.llm import kd as llm_kd
 from nemo_automodel.recipes.vlm import kd as vlm_kd
 
@@ -50,6 +51,34 @@ _RECIPE_CASES = (
         id="vlm",
     ),
 )
+
+
+@pytest.mark.parametrize("recipe_module,recipe_cls,parent_cls", _RECIPE_CASES)
+def test_kd_setup_defaults_torch_optimizer_storage_to_fp32(monkeypatch, recipe_module, recipe_cls, parent_cls):
+    class SetupStopped(Exception):
+        pass
+
+    cfg = ConfigNode(
+        {
+            "model": {},
+            "teacher_model": {},
+            "optimizer": {"_target_": "torch.optim.AdamW", "lr": 0.01},
+        }
+    )
+
+    def stop_parent_setup(self):
+        raise SetupStopped
+
+    monkeypatch.setattr(recipe_module, "_verify_tokenizer_compatibility", lambda *args, **kwargs: None)
+    monkeypatch.setattr(parent_cls, "setup", stop_parent_setup)
+
+    recipe = object.__new__(recipe_cls)
+    recipe.cfg = cfg
+
+    with pytest.raises(SetupStopped):
+        recipe.setup()
+
+    assert cfg.model.torch_dtype == "float32"
 
 
 @pytest.mark.parametrize("recipe_module,recipe_cls,_", _RECIPE_CASES)
@@ -177,7 +206,11 @@ def test_teacher_worker_serves_each_wave_until_stop(monkeypatch, recipe_module, 
 
 @pytest.mark.parametrize("recipe_module,recipe_cls,_", _RECIPE_CASES)
 def test_teacher_forward_separate_materializes_logits(monkeypatch, recipe_module, recipe_cls, _):
-    monkeypatch.setattr(recipe_module, "make_cp_batch_and_ctx", lambda mesh, batch, **kwargs: (nullcontext, batch))
+    monkeypatch.setattr(
+        recipe_module,
+        "ContextParallelSharder",
+        lambda model, mesh, batch, **kwargs: SimpleNamespace(shard=lambda actual: (nullcontext, actual)),
+    )
     materialized = []
     monkeypatch.setattr(
         recipe_module,
@@ -195,6 +228,49 @@ def test_teacher_forward_separate_materializes_logits(monkeypatch, recipe_module
 
     assert logits.shape == (1, 2, 4)
     assert materialized == [(None, 2)]
+
+
+def test_llm_teacher_pp_updates_stage_shapes_for_variable_length_waves(monkeypatch):
+    monkeypatch.setattr(
+        llm_kd,
+        "ContextParallelSharder",
+        lambda model, mesh, batch, **kwargs: SimpleNamespace(shard=lambda actual: (nullcontext, actual)),
+    )
+    monkeypatch.setattr(llm_kd, "materialize_teacher_logits", lambda logits, **kwargs: logits)
+
+    calls = []
+
+    def schedule_eval(input_ids, **kwargs):
+        calls.append(("eval", input_ids.shape[1]))
+
+    teacher_model = SimpleNamespace(_teacher_logits_capture=[None])
+    teacher_pp = SimpleNamespace(
+        info=SimpleNamespace(
+            has_first_stage=True,
+            has_last_stage=True,
+            schedule=SimpleNamespace(eval=schedule_eval),
+        ),
+        update_seq_len=lambda sequence_length: calls.append(("update", sequence_length)),
+    )
+    recipe = object.__new__(llm_kd.KnowledgeDistillationRecipeForNextTokenPrediction)
+    recipe.kd_mesh_bridge = SimpleNamespace(move_to_device=lambda batch: batch)
+    recipe.device_mesh = None
+    recipe.teacher_model = teacher_model
+    recipe.teacher_pp = teacher_pp
+    recipe.pp_enabled = True
+
+    for sequence_length in (195, 186):
+        teacher_model._teacher_logits_capture[0] = [torch.ones(1, sequence_length, 4)]
+        logits = recipe._teacher_forward_separate(
+            {
+                "input_ids": torch.ones(1, sequence_length, dtype=torch.long),
+                "attention_mask": torch.ones(1, sequence_length, dtype=torch.long),
+                "labels": torch.ones(1, sequence_length, dtype=torch.long),
+            }
+        )
+        assert logits.shape == (1, sequence_length, 4)
+
+    assert calls == [("update", 195), ("eval", 195), ("update", 186), ("eval", 186)]
 
 
 @pytest.mark.parametrize("recipe_module,recipe_cls,base_cls", _RECIPE_CASES)

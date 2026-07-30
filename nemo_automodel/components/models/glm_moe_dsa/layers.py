@@ -662,7 +662,11 @@ class GlmMoeDsaMLA(nn.Module):
                     "TileLang DSA sparse attention requires THD/packed sequences (qkv_format='thd'); "
                     f"got '{qkv_format}'. Use backend.attn in {{te, sdpa}} for the bshd dense path."
                 )
-            w = self.kv_b_proj.weight.view(self.n_heads, self.qk_nope_head_dim + self.v_head_dim, self.kv_lora_rank)
+            materialize_effective_weight = getattr(self.kv_b_proj, "materialize_effective_weight", None)
+            kv_b_weight = (
+                materialize_effective_weight() if materialize_effective_weight is not None else self.kv_b_proj.weight
+            )
+            w = kv_b_weight.view(self.n_heads, self.qk_nope_head_dim + self.v_head_dim, self.kv_lora_rank)
             w_kc = w[:, : self.qk_nope_head_dim, :]
             w_vc = w[:, self.qk_nope_head_dim :, :]
             q_absorbed = torch.einsum("thd,hdc->thc", q_nope, w_kc.to(q_nope.dtype))

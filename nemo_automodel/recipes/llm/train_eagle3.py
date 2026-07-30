@@ -36,8 +36,10 @@ from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
 from nemo_automodel.components.checkpoint.checkpointing import (
     CheckpointingConfig,
     load_hf_safetensors_state_dict,
+    load_torch_ckpt,
     save_config,
 )
+from nemo_automodel.components.checkpoint.utils import find_latest_checkpoint, resolve_restore_from_to_checkpoint_dir
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.llm.eagle3 import (
     build_eagle3_dataloader,
@@ -63,12 +65,7 @@ from nemo_automodel.components.speculative.regen_loop import RegenRunner, resolv
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.utils.model_utils import print_trainable_parameters
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config
-from nemo_automodel.recipes.base_recipe import (
-    BaseRecipe,
-    _find_latest_checkpoint,
-    _is_checkpoint_model_config_compatible,
-    _resolve_restore_from_to_ckpt_dir,
-)
+from nemo_automodel.recipes.base_recipe import BaseRecipe, _is_checkpoint_model_config_compatible
 from nemo_automodel.recipes.llm._spec_train_utils import (
     apply_draft_compile,
     apply_draft_fp8,
@@ -1368,6 +1365,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             pp_rank=0,
             moe_mesh=None,
         )
+        self._log_checkpoint_retention_policy(self.checkpoint_config)
 
     def _module(self):
         return (
@@ -1401,30 +1399,14 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             return
         self.checkpointer.async_wait()
 
-        prev_pending = getattr(self, "_last_pending_checkpoint_dir", None)
-        prev_best_pending = getattr(self, "_last_pending_best_checkpoint_info", None)
+        self._complete_pending_checkpoint()
 
         ckpt_root = self.checkpoint_config.checkpoint_dir
         path = os.path.join(str(ckpt_root), f"epoch_{epoch}_step_{step}")
         is_dist_initialized = dist.is_initialized()
         is_rank_0 = (not is_dist_initialized) or dist.get_rank() == 0
-        best_val_metric = (
-            val_loss.get(next(iter(val_loss.keys())) if len(val_loss) == 1 else best_metric_key) if val_loss else None
-        )
-
-        if prev_pending is not None:
-            if is_rank_0:
-                self._update_latest_symlink(prev_pending)
-            setattr(self, "_last_pending_checkpoint_dir", None)
-            if is_dist_initialized:
-                dist.barrier()
-
-        if prev_best_pending is not None:
-            if is_rank_0 and prev_best_pending.get("val") is not None:
-                self._update_best_symlink(prev_best_pending["path"], float(prev_best_pending["val"]))
-            setattr(self, "_last_pending_best_checkpoint_info", None)
-            if is_dist_initialized:
-                dist.barrier()
+        best_metric_name = next(iter(val_loss.keys())) if val_loss and len(val_loss) == 1 else best_metric_key
+        best_val_metric = val_loss.get(best_metric_name) if val_loss else None
 
         if is_rank_0:
             if os.path.exists(path):
@@ -1471,13 +1453,21 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
 
         if getattr(self.checkpointer.config, "is_async", False):
             setattr(self, "_last_pending_checkpoint_dir", path)
-            if best_val_metric is not None:
-                setattr(self, "_last_pending_best_checkpoint_info", {"path": path, "val": float(best_val_metric)})
+            setattr(
+                self,
+                "_last_pending_best_checkpoint_info",
+                {
+                    "path": path,
+                    "val": float(best_val_metric) if best_val_metric is not None else None,
+                    "metric_key": best_metric_name,
+                },
+            )
         else:
             if is_rank_0:
                 self._update_latest_symlink(path)
                 if best_val_metric is not None:
-                    self._update_best_symlink(path, float(best_val_metric))
+                    self._update_best_symlink(path, float(best_val_metric), best_metric_name)
+                self._prune_old_checkpoints()
             if is_dist_initialized:
                 dist.barrier()
 
@@ -1567,7 +1557,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         ckpt_root = self.checkpoint_config.checkpoint_dir
 
         if restore_from:
-            ckpt_dir = _resolve_restore_from_to_ckpt_dir(ckpt_root, restore_from)
+            ckpt_dir = resolve_restore_from_to_checkpoint_dir(ckpt_root, restore_from)
             if ckpt_dir is None:
                 if is_rank_0:
                     logger.warning("restore_from='LATEST' but no checkpoint found in %s", ckpt_root)
@@ -1575,7 +1565,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             if not os.path.isdir(ckpt_dir):
                 raise FileNotFoundError(f"Checkpoint directory does not exist: {ckpt_dir}")
         else:
-            auto = _find_latest_checkpoint(ckpt_root)
+            auto = find_latest_checkpoint(ckpt_root)
             if auto is None:
                 return
             ckpt_dir = str(auto)
@@ -1619,14 +1609,19 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             legacy = os.path.join(ckpt_dir, "eagle3_meta.pt")
             meta_path = legacy if os.path.exists(legacy) else meta_path
         if os.path.exists(meta_path):
-            meta = torch.load(meta_path, weights_only=False, map_location="cpu")
+            meta = load_torch_ckpt(
+                meta_path,
+                map_location="cpu",
+                weights_only=not self.checkpoint_config.allow_legacy_pickle_restore,
+            )
             self.runtime.global_step = int(meta.get("global_step", 0))
             self._resume_epoch = int(meta.get("epoch", 0))
-            # Align the regen launch cadence to the restored step so resume does not
-            # immediately fire a redundant cycle for an already-covered region.
-            regen_runner = getattr(self, "regen_runner", None)
-            if regen_runner is not None:
-                regen_runner.resume_from_step(self.runtime.global_step)
+            # Align the cadence-driven runners to the restored step so resume does
+            # not immediately fire a redundant launch for an already-covered region.
+            for runner_attr in ("regen_runner", "decode_eval_runner"):
+                runner = getattr(self, runner_attr, None)
+                if runner is not None:
+                    runner.resume_from_step(self.runtime.global_step)
             ids = meta.get("selected_token_ids")
             mask = meta.get("selected_token_mask")
             if ids is not None and mask is not None:
@@ -1738,6 +1733,9 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         loop returns, and ``initialize_distributed`` already destroys it at
         process exit.
         """
+        if getattr(self, "checkpointer", None) is not None:
+            _best_effort("finalizing pending checkpoint", self._finalize_pending_checkpoint)
+            _best_effort("closing checkpointer", self.checkpointer.close)
         if getattr(self, "target_wrapper", None) is not None:
             _best_effort("closing target backend", self.target_wrapper.close)
         if getattr(self, "decode_eval_runner", None) is not None:

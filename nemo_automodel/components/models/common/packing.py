@@ -38,6 +38,8 @@ import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
 
+_FLASH_ATTN_IMPLEMENTATIONS = ("flash_attention_2", "flash_attention_3", "flash_attention_4")
+
 
 def get_seqlens_in_batch(attention_mask: torch.Tensor) -> torch.Tensor:
     """Extract per-document sequence lengths from an indexed attention mask.
@@ -128,10 +130,11 @@ def _passthrough_create_causal_mask(
 ):
     """Replacement for ``create_causal_mask`` that passes through packed masks.
 
-    FA2 handles masking internally, so always pass through.  For non-FA2
-    backends, pass through packed masks but delegate normal 2D masks to HF.
+    Flash attention (FA2/FA3/FA4) handles masking internally, so always pass
+    through.  For other backends, pass through packed masks but delegate
+    normal 2D masks to HF.
     """
-    if config is not None and getattr(config, "_attn_implementation", None) == "flash_attention_2":
+    if config is not None and getattr(config, "_attn_implementation", None) in _FLASH_ATTN_IMPLEMENTATIONS:
         return attention_mask
 
     if attention_mask is not None:
@@ -153,13 +156,54 @@ def _passthrough_create_causal_mask(
     )
 
 
-def get_attn_implementation(cfg_model):
+def _model_attn_implementation(model) -> str | None:
+    """Return the packing-relevant attention backend an already-built model runs with.
+
+    ``model.config._attn_implementation`` is a Transformers *dispatch key*, whose
+    vocabulary is wider than the mask layouts packing knows about: when flash
+    attention is requested but only the ``kernels`` package provides it,
+    Transformers records a kernels-hub id instead of the mainline name. Those ids
+    are mapped back so a model genuinely running varlen flash attention is packed
+    as such. Any key that still names no known layout yields ``None``, leaving the
+    caller on the configured value.
+    """
+    # DDP does not proxy attribute access to the model it wraps, so read through it.
+    model = getattr(model, "module", model)
+    attn_implementation = getattr(getattr(model, "config", None), "_attn_implementation", None)
+    if attn_implementation in _FLASH_ATTN_IMPLEMENTATIONS or attn_implementation in ("sdpa", "eager"):
+        return attn_implementation
+    try:
+        from transformers.modeling_flash_attention_utils import FLASH_ATTN_KERNEL_FALLBACK
+    except ImportError:
+        return None
+    for mainline, kernel_id in FLASH_ATTN_KERNEL_FALLBACK.items():
+        if kernel_id == attn_implementation:
+            return mainline
+    return None
+
+
+def get_attn_implementation(cfg_model, model=None) -> str:
     """Determine the attention backend from model config.
 
     Custom models store it in ``backend.attn``; HF models use ``attn_implementation``.
+
+    Args:
+        cfg_model: Model config node, which records what was *requested*.
+        model: Optional already-built model, preferred over ``cfg_model`` for HF
+            models because it records what was actually *resolved*. Model
+            construction may pick a different backend than the config asks for:
+            packed runs are force-switched onto flash attention
+            (``_apply_preload_overrides``), an unavailable backend is downgraded
+            on retry, and an omitted key defaults to flash attention rather than
+            to sdpa. None of those are written back to the config. An HF model
+            configured with ``te`` reports ``sdpa`` here, which is what it runs
+            with TE attention injected on top.
     """
     if cfg_model is not None and hasattr(cfg_model, "backend") and hasattr(cfg_model.backend, "attn"):
         return cfg_model.backend.attn
+    resolved = _model_attn_implementation(model)
+    if resolved is not None:
+        return resolved
     if cfg_model is not None:
         return cfg_model.get("attn_implementation", "sdpa")
     return "sdpa"
@@ -251,7 +295,7 @@ def _patch_preprocess_mask_arguments_for_packing() -> None:
         attn_impl = getattr(config, "_attn_implementation", None) or getattr(
             config, "_attn_implementation_internal", None
         )
-        if attn_impl == "flash_attention_2" and is_indexed_packed_mask(attention_mask):
+        if attn_impl in _FLASH_ATTN_IMPLEMENTATIONS and is_indexed_packed_mask(attention_mask):
             return (
                 preprocess_result_template[0],
                 attention_mask,
@@ -266,6 +310,8 @@ def _patch_preprocess_mask_arguments_for_packing() -> None:
 # Model modules whose ``create_causal_mask`` must be patched for neat packing.
 # TODO: perhaps its for ALL models.
 _PACKING_PATCH_MODULES = [
+    "transformers.models.llama.modeling_llama",
+    "transformers.models.qwen3.modeling_qwen3",
     "transformers.models.qwen2.modeling_qwen2",
     "transformers.models.qwen2_5_vl.modeling_qwen2_5_vl",
     "transformers.models.qwen2_vl.modeling_qwen2_vl",
@@ -276,14 +322,17 @@ _PACKING_PATCH_MODULES = [
 
 
 def configure_packing(attn_implementation: str = "sdpa") -> None:
-    """Apply monkey-patches for packed-sequence training with flash_attention_2.
+    """Apply monkey-patches for packed-sequence training with flash attention.
 
-    Only patches when ``attn_implementation == "flash_attention_2"``.
+    Only patches when ``attn_implementation`` is a flash-attention variant
+    (``flash_attention_2`` / ``flash_attention_3`` / ``flash_attention_4``);
+    transformers routes all three through the same varlen wrapper, so the
+    ``_get_unpad_data`` patch applies uniformly.
 
     Args:
         attn_implementation: The attention implementation used by the model.
     """
-    if attn_implementation != "flash_attention_2":
+    if attn_implementation not in _FLASH_ATTN_IMPLEMENTATIONS:
         return
 
     import sys

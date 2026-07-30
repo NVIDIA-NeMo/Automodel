@@ -3088,10 +3088,25 @@ class TestNeatPackedVlmCollaterAttnImpl:
         # SDPA produces 4D block-causal mask
         assert result["attention_mask"].ndim == 4
 
+    def test_sdpa_cp_keeps_compact_document_ids(self):
+        from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
+
+        batch = [self._make_packed_sample(16, 0)]
+        result = neat_packed_vlm_collater(
+            batch,
+            max_length=32,
+            attn_implementation="sdpa",
+            materialize_4d_mask=False,
+        )
+
+        assert result["attention_mask"].shape == (1, 32)
+        assert torch.equal(result["_packed_seq_ids"], result["attention_mask"])
+        assert result["_packed_seq_ids"][0, 16:].eq(0).all()
+
     def test_single_sequence_omits_packed_seq_ids(self):
         """A single (unpacked) sequence carries no ``_packed_seq_ids``; the all-gather
         CP path synthesizes the trivial one-document map downstream (see
-        ``cp_utils._synthesize_single_document_seq_ids``)."""
+        ``context_parallel.utils._synthesize_single_document_seq_ids``)."""
         from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
 
         batch = [self._make_packed_sample(4, 0)]
