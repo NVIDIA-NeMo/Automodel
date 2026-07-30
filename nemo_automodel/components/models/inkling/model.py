@@ -74,6 +74,12 @@ except ImportError:  # transformers < 5.14 ships neither symbol set
     create_sliding_window_causal_mask = _make_missing("create_sliding_window_causal_mask")
     _INKLING_HF_AVAILABLE = False
 
+from nemo_automodel.components.distributed.context_parallel.sharder import (
+    ContextParallelSharder,
+    contiguous_local_indices,
+    shard_batch_contiguous,
+    shard_sequence_for_cp_contiguous,
+)
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.tie_word_embeddings import (
@@ -85,11 +91,19 @@ from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
+from .cp import gather_padding_mask
 from .state_dict_adapter import InklingStateDictAdapter
 
 if _INKLING_HF_AVAILABLE:
-    from .layers import InklingDenseMLP, InklingMoE, InklingShortConvolution, build_inkling_moe_config
+    from .layers import (
+        InklingAttention,
+        InklingDenseMLP,
+        InklingMoE,
+        InklingShortConvolution,
+        build_inkling_moe_config,
+    )
 else:
+    InklingAttention = _make_missing("InklingAttention")
     InklingDenseMLP = _make_missing("InklingDenseMLP")
     InklingMoE = _make_missing("InklingMoE")
     InklingShortConvolution = _make_missing("InklingShortConvolution")
@@ -102,13 +116,32 @@ class InklingTextModel(HFInklingTextModel):
     def forward(
         self,
         input_ids: torch.LongTensor | None = None,
-        attention_mask: torch.Tensor | dict[str, torch.Tensor] | None = None,
+        attention_mask: torch.Tensor | dict[str, torch.Tensor | None] | None = None,
         position_ids: torch.LongTensor | None = None,
         past_key_values: Any | None = None,
         inputs_embeds: torch.FloatTensor | None = None,
         use_cache: bool | None = None,
         **kwargs: Any,
     ) -> BaseModelOutputWithPast:
+        """Run the Inkling decoder, including model-owned sequence sharding.
+
+        Args:
+            input_ids: Optional token tensor of shape ``[batch, sequence]``.
+            attention_mask: Optional tensor mask or per-attention-type mask
+                mapping. Tensor masks cover ``[batch, sequence]``.
+            position_ids: Optional tensor of shape ``[batch, sequence]``.
+            past_key_values: Optional inference cache; unsupported with CP.
+            inputs_embeds: Optional tensor of shape
+                ``[batch, sequence, hidden]``.
+            use_cache: Whether to create or update an inference cache.
+            kwargs: Transformers decoder options. Under CP, ``padding_mask`` is
+                a local boolean tensor of shape ``[batch, local_sequence]``.
+
+        Returns:
+            Decoder output whose last hidden state has shape
+            ``[batch, local_sequence, hidden]`` under CP and
+            ``[batch, sequence, hidden]`` otherwise.
+        """
         if inputs_embeds is None:
             if self.embed_tokens is None:
                 if input_ids is None or not input_ids.dtype.is_floating_point:
@@ -122,16 +155,55 @@ class InklingTextModel(HFInklingTextModel):
         elif input_ids is not None:
             raise ValueError("You must provide exactly one of input_ids or inputs_embeds")
 
+        cp_mesh = getattr(self, "cp_mesh", None)
+        cp_active = cp_mesh is not None and cp_mesh.size() > 1
+        local_indices = None
+        if cp_active:
+            full_sequence = inputs_embeds.shape[1]
+            inputs_embeds, local_indices, _ = shard_sequence_for_cp_contiguous(
+                cp_mesh,
+                inputs_embeds,
+                seq_dim=1,
+            )
+            padding_mask = kwargs.pop("padding_mask", None)
+            if padding_mask is not None and padding_mask.shape[1] == full_sequence:
+                padding_mask = shard_sequence_for_cp_contiguous(
+                    cp_mesh,
+                    padding_mask,
+                    seq_dim=1,
+                    pad_value=True,
+                )[0]
+            kwargs["inkling_ulysses_padding_mask"] = gather_padding_mask(
+                padding_mask,
+                cp_mesh.get_group(),
+            )
+            causal_mask_mapping = {
+                "full_attention": None,
+                "sliding_attention": None,
+                "linear_attention": None if padding_mask is None else ~padding_mask,
+            }
+
         use_cache = getattr(self.config, "use_cache", False) if use_cache is None else use_cache
+        if cp_active and use_cache:
+            raise NotImplementedError("Inkling context parallelism supports training without a KV cache.")
         if use_cache and past_key_values is None:
             past_key_values = DynamicCache(config=self.config)
 
         if position_ids is None:
-            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
-            position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen_tokens
+            if local_indices is not None:
+                position_ids = local_indices
+            else:
+                past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+                position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen_tokens
             position_ids = position_ids.unsqueeze(0)
+        elif cp_active and position_ids.shape[-1] == full_sequence:
+            position_ids = shard_sequence_for_cp_contiguous(
+                cp_mesh,
+                position_ids,
+                seq_dim=position_ids.ndim - 1,
+            )[0]
 
-        if not isinstance(causal_mask_mapping := attention_mask, dict):
+        if not cp_active and not isinstance(causal_mask_mapping := attention_mask, dict):
             mask_kwargs = {
                 "config": self.config,
                 "inputs_embeds": inputs_embeds,
@@ -189,12 +261,15 @@ class InklingForConditionalGeneration(HFCheckpointingMixin, HFInklingForConditio
     # Short convolutions and router correction bias use callable fp32 holders.
     _keep_in_fp32_modules_strict = ["_fp32_params"]
 
+    # The SDPA recipe setting selects the regular CP1 path; CP uses model-owned FlexAttention.
+    _supports_cp_sdpa = True
+
     @dataclass(frozen=True)
     class ModelCapabilities:
         """Declared parallelism capabilities for this model class."""
 
         supports_tp: bool = False
-        supports_cp: bool = False
+        supports_cp: bool = True
         supports_pp: bool = True
         supports_ep: bool = True
 
@@ -257,6 +332,7 @@ class InklingForConditionalGeneration(HFCheckpointingMixin, HFInklingForConditio
         # layout. This lets distributed checkpoint loading write through
         # transpose views instead of allocating converted expert tensors.
         for layer in self.model.language_model.layers:
+            layer.self_attn = InklingAttention._from_hf(layer.self_attn)
             layer.self_attn.k_sconv = InklingShortConvolution(layer.self_attn.k_sconv)
             layer.self_attn.v_sconv = InklingShortConvolution(layer.self_attn.v_sconv)
             layer.attn_sconv = InklingShortConvolution(layer.attn_sconv)
@@ -279,6 +355,90 @@ class InklingForConditionalGeneration(HFCheckpointingMixin, HFInklingForConditio
         # Normalize inherited and replacement modules here while retaining the
         # short convolutions and router correction-bias holders in strict fp32.
         cast_model_to_dtype(self, model_dtype)
+
+    def setup_cp_attention(self, cp_mesh: Any) -> None:
+        """Configure Ulysses attention and short-convolution halo exchange."""
+        group = cp_mesh.get_group()
+        if getattr(self, "_inkling_cp_group", None) is group:
+            return
+        self.cp_mesh = cp_mesh
+        self.model.language_model.cp_mesh = cp_mesh
+        for module in self.modules():
+            setup = getattr(module, "setup_context_parallel", None)
+            if callable(setup):
+                setup(group)
+        self._inkling_cp_group = group
+        self._cp_enabled = cp_mesh.size() > 1
+
+    def _disable_fsdp_backward_prefetch(self) -> None:
+        """Avoid double-buffering large expert FSDP units."""
+        if getattr(self, "_inkling_fsdp_prefetch_disabled", False):
+            return
+        units = [
+            module for module in self.modules() if callable(getattr(module, "set_modules_to_backward_prefetch", None))
+        ]
+        for unit in units:
+            unit.set_modules_to_backward_prefetch([unit])
+        self._inkling_fsdp_prefetch_disabled = bool(units)
+
+    def _cp_shard_batch_aux_only(
+        self,
+        cp_mesh,
+        tp_mesh,
+        batch: dict[str, Any],
+        *,
+        loss_mask: torch.Tensor | None = None,
+        padding_token_id: int = 0,
+    ):
+        """Configure CP and shard only auxiliary sequence tensors.
+
+        Args:
+            cp_mesh: Context-parallel device mesh.
+            tp_mesh: Optional tensor-parallel device mesh.
+            batch: Full-sequence batch. Tensor values such as ``input_ids`` and
+                ``labels`` have shape ``[batch, sequence]``.
+            loss_mask: Optional tensor of shape ``[batch, sequence]``.
+            padding_token_id: Value used for input padding.
+
+        Returns:
+            Context factory, mutated batch with local auxiliary tensors, and its
+            contiguous shard layout.
+        """
+        self.setup_cp_attention(cp_mesh)
+        return shard_batch_contiguous(
+            cp_mesh,
+            tp_mesh,
+            batch,
+            loss_mask=loss_mask,
+            padding_token_id=padding_token_id,
+            shard_primary=False,
+        )
+
+    def prepare_model_inputs_for_cp(
+        self,
+        batch: dict[str, Any],
+        *,
+        num_chunks: int = 1,
+    ) -> dict[str, Any]:
+        """Select Inkling's aux-only contiguous Ulysses sharder.
+
+        Args:
+            batch: Full-sequence batch whose ``input_ids`` tensor has shape
+                ``[batch, sequence]``.
+            num_chunks: Accepted for the shared hook contract; unused.
+
+        Returns:
+            Mapping containing the model-owned context-parallel sharder.
+        """
+        del num_chunks
+        if batch.get("input_ids") is None and batch.get("inputs_embeds") is None:
+            raise ValueError("Inkling context parallelism requires input_ids or inputs_embeds.")
+        return {
+            "cp_sharder": ContextParallelSharder(
+                shard_batch=self._cp_shard_batch_aux_only,
+                local_token_global_indices=contiguous_local_indices,
+            )
+        }
 
     def customize_pipeline_stage_modules(
         self,
@@ -332,8 +492,36 @@ class InklingForConditionalGeneration(HFCheckpointingMixin, HFInklingForConditio
         logits_to_keep: int | torch.Tensor = 0,
         **kwargs: Any,
     ) -> Any:
-        """Run the standard Inkling forward or its pipeline-stage equivalent."""
+        """Run Inkling with optional multimodal inputs and context parallelism.
+
+        Args:
+            input_ids: Optional token tensor of shape ``[batch, sequence]``.
+            pixel_values: Optional image tensor in processor-defined layout.
+            attention_mask: Optional tensor of shape ``[batch, sequence]``.
+            position_ids: Optional tensor of shape ``[batch, sequence]``.
+            past_key_values: Optional inference cache; unsupported with CP.
+            audio_input_ids: Optional audio token tensor.
+            audio_input_ids_mask: Optional mask matching ``audio_input_ids``.
+            inputs_embeds: Optional tensor of shape
+                ``[batch, sequence, hidden]``.
+            labels: Optional target tensor of shape ``[batch, sequence]``.
+            use_cache: Whether to create or update an inference cache.
+            logits_to_keep: Number or indices of sequence logits to retain.
+            kwargs: Additional Transformers forward options. Under CP,
+                ``padding_mask`` is shaped ``[batch, local_sequence]``.
+
+        Returns:
+            Transformers model output with local-sequence logits under CP, or a
+            pipeline-stage tensor.
+        """
+        self._disable_fsdp_backward_prefetch()
         language_model = self.model.language_model
+        if getattr(self, "_cp_enabled", False):
+            attention_mask = {
+                "full_attention": None,
+                "sliding_attention": None,
+                "linear_attention": None,
+            }
         if not isinstance(language_model.layers, nn.ModuleDict):
             return super().forward(
                 input_ids=input_ids,

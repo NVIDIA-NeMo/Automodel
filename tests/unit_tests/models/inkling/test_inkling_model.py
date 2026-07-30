@@ -36,7 +36,8 @@ from nemo_automodel.components.datasets.vlm.collate_fns import (  # noqa: E402
 )
 from nemo_automodel.components.models.common import BackendConfig  # noqa: E402
 from nemo_automodel.components.models.common.tie_word_embeddings import TieSupport  # noqa: E402
-from nemo_automodel.components.models.inkling.layers import InklingDenseMLP, InklingMoE  # noqa: E402
+from nemo_automodel.components.models.inkling.cp import _get_block_mask  # noqa: E402
+from nemo_automodel.components.models.inkling.layers import InklingAttention, InklingDenseMLP, InklingMoE  # noqa: E402
 from nemo_automodel.components.models.inkling.model import InklingForConditionalGeneration  # noqa: E402
 from nemo_automodel.components.models.inkling.state_dict_adapter import _interleave  # noqa: E402
 
@@ -61,6 +62,60 @@ def test_sparse_layers_use_inkling_moe():
             assert not isinstance(layer.mlp, HFInklingMoE)
         else:
             assert isinstance(layer.mlp, InklingDenseMLP)
+
+
+def test_inkling_declares_context_parallel_support():
+    _, _, nemo = _build_models()
+
+    assert InklingForConditionalGeneration.ModelCapabilities.supports_cp
+    assert InklingForConditionalGeneration._supports_cp_sdpa
+    assert all(isinstance(layer.self_attn, InklingAttention) for layer in nemo.model.language_model.layers)
+
+
+def test_inkling_selects_aux_only_contiguous_cp_sharder():
+    _, _, nemo = _build_models()
+    batch = {
+        "input_ids": torch.ones(1, 16, dtype=torch.long),
+        "labels": torch.ones(1, 16, dtype=torch.long),
+    }
+
+    prepared = nemo.prepare_model_inputs_for_cp(batch)
+
+    assert set(prepared) == {"cp_sharder"}
+    assert prepared["cp_sharder"].local_token_global_indices is not None
+
+
+def test_inkling_disables_fsdp_backward_prefetch():
+    class FSDPUnit(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.targets = None
+
+        def set_modules_to_backward_prefetch(self, targets):
+            self.targets = targets
+
+    _, _, nemo = _build_models()
+    unit = FSDPUnit()
+    nemo.add_module("test_fsdp_unit", unit)
+
+    nemo._disable_fsdp_backward_prefetch()
+
+    assert unit.targets == [unit]
+
+
+@pytest.mark.parametrize("sliding_window", [None, 512])
+def test_inkling_block_mask_scales_by_blocks(sliding_window):
+    sequence_length = 65536
+    padding_mask = torch.zeros(1, sequence_length, dtype=torch.bool)
+
+    block_mask = _get_block_mask(
+        padding_mask,
+        sequence_length=sequence_length,
+        sliding_window=sliding_window,
+        device=torch.device("cpu"),
+    )
+
+    assert block_mask.kv_indices.shape == (1, 1, sequence_length // 128, sequence_length // 128)
 
 
 def test_pretrained_load_skips_redundant_full_model_initialization():

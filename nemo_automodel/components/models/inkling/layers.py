@@ -28,10 +28,14 @@ from __future__ import annotations
 from typing import Any
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
 try:
+    from transformers.models.inkling.modeling_inkling import (
+        InklingAttention as HFInklingAttention,
+    )
     from transformers.models.inkling.modeling_inkling import (
         apply_mask_to_padding_states,
         causal_conv1d_fn,
@@ -48,6 +52,71 @@ from nemo_automodel.components.models.common.utils import BackendConfig
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.layers import MoE
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
+
+from .cp import inkling_ulysses_attention
+
+
+class InklingAttention(HFInklingAttention):
+    """Inkling attention with a FlexAttention Ulysses path."""
+
+    @classmethod
+    def _from_hf(cls, source: HFInklingAttention) -> "InklingAttention":
+        """Reuse an initialized Transformers attention module without copying its tensors."""
+        with torch.device("meta"):
+            target = cls(source.config, source.layer_idx)
+        target._modules = source._modules
+        target._parameters = source._parameters
+        target._buffers = source._buffers
+        target.train(source.training)
+        target._cp_group = None
+        return target
+
+    def setup_context_parallel(self, group: dist.ProcessGroup | None) -> None:
+        """Set the context-parallel process group used by Ulysses."""
+        self._cp_group = group
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        conv_mask: torch.Tensor | None = None,
+        past_key_values: Any | None = None,
+        **kwargs: Any,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Run regular attention or Ulysses when a CP group is active.
+
+        Args:
+            hidden_states: Tensor of shape ``[batch, local_sequence, hidden]``.
+            attention_mask: Optional additive or boolean attention mask used by
+                the regular non-CP path.
+            conv_mask: Optional boolean tensor of shape
+                ``[batch, local_sequence]`` where True marks retained tokens.
+            past_key_values: Optional inference cache; unsupported by Ulysses.
+            kwargs: Transformers attention options. Under Ulysses,
+                ``inkling_ulysses_padding_mask`` may contain a boolean tensor of
+                shape ``[batch, global_sequence]`` where True marks padding.
+
+        Returns:
+            Local attention output of shape
+            ``[batch, local_sequence, hidden]`` and optional attention weights.
+        """
+        group = self._cp_group
+        if group is None or dist.get_world_size(group) <= 1:
+            return super().forward(
+                hidden_states,
+                attention_mask,
+                conv_mask=conv_mask,
+                past_key_values=past_key_values,
+                **kwargs,
+            )
+        return inkling_ulysses_attention(
+            self,
+            hidden_states,
+            conv_mask=conv_mask,
+            padding_mask=kwargs.pop("inkling_ulysses_padding_mask", None),
+            group=group,
+            past_key_values=past_key_values,
+        )
 
 
 class _InklingShortConvolutionFP32(nn.Module):
@@ -68,6 +137,7 @@ class _InklingShortConvolutionFP32(nn.Module):
         hidden_states: torch.Tensor,
         past_key_values: Any | None = None,
         conv_mask: torch.Tensor | None = None,
+        cp_group: dist.ProcessGroup | None = None,
         **kwargs: Any,
     ) -> torch.Tensor:
         """Apply the causal short convolution with a residual connection.
@@ -80,6 +150,9 @@ class _InklingShortConvolutionFP32(nn.Module):
                 in place during incremental decoding.
             conv_mask: Optional boolean padding mask of shape ``[batch, sequence]``
                 that zeroes padded positions before the convolution.
+            cp_group: Optional context-parallel process group. Each rank owns one
+                contiguous sequence shard when set.
+            kwargs: Optional Transformers convolution arguments.
 
         Returns:
             torch.Tensor: Tensor of shape ``[batch, sequence, hidden]`` (input plus
@@ -90,6 +163,28 @@ class _InklingShortConvolutionFP32(nn.Module):
         seq_len = hidden_states.shape[1]
         hidden_states = hidden_states.transpose(1, 2)
         weight = self.weight.squeeze(1)
+
+        if cp_group is not None and dist.get_world_size(cp_group) > 1:
+            if past_key_values is not None:
+                raise NotImplementedError("Inkling context parallelism does not support convolution caches.")
+            if kwargs.get("seq_idx") is not None:
+                raise NotImplementedError("Inkling context parallelism supports padded sequences, not packed seq_idx.")
+            halo_width = self.conv_kernel_size - 1
+            if seq_len < halo_width:
+                raise ValueError(
+                    f"Local sequence length {seq_len} must be at least the short-convolution halo {halo_width}."
+                )
+            from torch.distributed.nn.functional import all_gather
+
+            rank = dist.get_rank(cp_group)
+            tails = all_gather(hidden_states[..., -halo_width:].contiguous(), group=cp_group)
+            halo = tails[0] * 0 if rank == 0 else tails[rank - 1]
+            hidden_states = F.conv1d(
+                torch.cat((halo, hidden_states), dim=-1),
+                weight.unsqueeze(1),
+                groups=hidden_states.shape[1],
+            )
+            return hidden_states.transpose(1, 2) + residual
 
         use_precomputed_states = past_key_values is not None and past_key_values.has_previous_state(
             self.layer_idx, self.conv_idx
@@ -118,12 +213,18 @@ class InklingShortConvolution(nn.Module):
     def __init__(self, source: nn.Module) -> None:
         super().__init__()
         self._fp32_params = _InklingShortConvolutionFP32(source)
+        self._cp_group = None
+
+    def setup_context_parallel(self, group: dist.ProcessGroup | None) -> None:
+        """Set the group used to exchange the causal left halo."""
+        self._cp_group = group
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         past_key_values: Any | None = None,
         conv_mask: torch.Tensor | None = None,
+        cp_group: dist.ProcessGroup | None = None,
         **kwargs: Any,
     ) -> torch.Tensor:
         """Run the short convolution in fp32 and cast the result back.
@@ -132,6 +233,9 @@ class InklingShortConvolution(nn.Module):
             hidden_states: Tensor of shape ``[batch, sequence, hidden]``.
             past_key_values: Optional cache holding the per-layer conv state.
             conv_mask: Optional boolean padding mask of shape ``[batch, sequence]``.
+            cp_group: Optional group overriding the configured context-parallel
+                process group.
+            kwargs: Optional Transformers convolution arguments.
 
         Returns:
             torch.Tensor: Tensor of shape ``[batch, sequence, hidden]`` in the input
@@ -142,6 +246,7 @@ class InklingShortConvolution(nn.Module):
             hidden_states.float(),
             past_key_values=past_key_values,
             conv_mask=conv_mask,
+            cp_group=self._cp_group if cp_group is None else cp_group,
             **kwargs,
         )
         return output.to(dtype=input_dtype)
@@ -271,6 +376,7 @@ class InklingGate(nn.Module):
         return
 
 
+@torch.compile(fullgraph=True, options={"max_autotune": True})
 def inkling_swiglu(hidden_states: torch.Tensor, routing_weights: torch.Tensor) -> torch.Tensor:
     """Apply SwiGLU to Inkling's interleaved ``[gate, up]`` projection layout.
 
