@@ -15,7 +15,25 @@
 import pytest
 
 from nemo_automodel.components.models.kimi_k3.encoding import build_chat_segments
-from nemo_automodel.components.models.kimi_k3.tokenization import TikTokenTokenizer
+from nemo_automodel.components.models.kimi_k3.tokenization import TikTokenTokenizer, _build_kimi_k3_pat_str
+
+
+def test_kimi_k3_tokenizer_pattern_matches_reference_regex():
+    reference_pattern = "|".join(
+        [
+            r"""[\p{Han}]+""",
+            r"""[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]*[\p{Ll}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?""",
+            r"""[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]+[\p{Ll}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?""",
+            r"""\p{N}{1,3}""",
+            r""" ?[^\s\p{L}\p{N}]+[\r\n]*""",
+            r"""\s*[\r\n]+""",
+            r"""\s+(?!\S)""",
+            r"""\s+""",
+        ]
+    )
+
+    assert _build_kimi_k3_pat_str() == reference_pattern
+    assert "pat_str" not in TikTokenTokenizer.__dict__
 
 
 def test_medium_thinking_effort_is_rendered():
