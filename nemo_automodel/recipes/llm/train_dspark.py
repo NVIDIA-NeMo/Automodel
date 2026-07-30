@@ -1115,6 +1115,7 @@ class TrainDSparkRecipe(BaseRecipe):
         if checkpointer is None or not checkpointer.config.enabled:
             return
         self.checkpointer.async_wait()
+        self.checkpointer.lifecycle.complete_pending()
 
         ckpt_root = self.checkpoint_config.checkpoint_dir
         path = os.path.join(str(ckpt_root), f"epoch_{epoch}_step_{step}")
@@ -1123,9 +1124,7 @@ class TrainDSparkRecipe(BaseRecipe):
         best_metric_name = next(iter(val_loss.keys())) if val_loss and len(val_loss) == 1 else best_metric_key
         best_val_metric = val_loss.get(best_metric_name) if val_loss else None
 
-        self._complete_pending_checkpoint()
-
-        self._reserve_checkpoint_dir(path)
+        self.checkpointer.lifecycle.reserve(path)
 
         if is_rank_0:
             loss_dict: dict[str, float] = {}
@@ -1164,32 +1163,25 @@ class TrainDSparkRecipe(BaseRecipe):
             except (AttributeError, OSError) as e:
                 logger.warning("Failed to save config snapshot: %s", e)
 
-        self._run_rank_0_checkpoint_step(write_recipe_metadata, f"write recipe metadata to {path}")
+        self.checkpointer.lifecycle.run_coordinator_step(
+            write_recipe_metadata,
+            description=f"write recipe metadata to {path}",
+        )
         if is_dist_initialized:
             dist.barrier()
 
         if getattr(self.checkpointer.config, "is_async", False):
-            setattr(self, "_last_pending_checkpoint_dir", path)
-            setattr(
-                self,
-                "_last_pending_best_checkpoint_info",
-                {
-                    "path": path,
-                    "val": float(best_val_metric) if best_val_metric is not None else None,
-                    "metric_key": best_metric_name,
-                },
+            self.checkpointer.lifecycle.defer_publication(
+                path,
+                best_val_metric=float(best_val_metric) if best_val_metric is not None else None,
+                metric_key=best_metric_name,
             )
         else:
-            # One rank-0 step, so a failure anywhere in it aborts every rank.
-            def publish() -> None:
-                self._publish_checkpoint(path)
-                if best_val_metric is not None:
-                    self._update_best_symlink(path, float(best_val_metric), best_metric_name)
-                self._prune_old_checkpoints()
-
-            self._run_rank_0_checkpoint_step(publish, f"publish checkpoint {path}")
-            if is_dist_initialized:
-                dist.barrier()
+            self.checkpointer.lifecycle.publish(
+                path,
+                best_val_metric=float(best_val_metric) if best_val_metric is not None else None,
+                metric_key=best_metric_name,
+            )
 
     def _save_extra_state(self, path: str, epoch: int) -> None:
         """Persist DSpark meta: global_step, epoch, block_size, mask, and target layers."""

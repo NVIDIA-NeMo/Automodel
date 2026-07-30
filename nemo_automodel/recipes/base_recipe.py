@@ -14,14 +14,10 @@
 
 import getpass
 import logging
-import math
 import os
-import shutil
 import socket
-from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
-from uuid import uuid4
 
 import torch
 
@@ -49,16 +45,7 @@ from nemo_automodel.components.checkpoint.checkpointing import (
     save_losses,
 )
 from nemo_automodel.components.checkpoint.utils import (
-    clear_checkpoint_incomplete,
     find_latest_checkpoint,
-    find_pointer_protected_checkpoints,
-    format_missing_checkpoint_dir_error,
-    is_checkpoint_incomplete,
-    is_cloud_path,
-    list_automodel_checkpoints,
-    mark_checkpoint_incomplete,
-    read_checkpoint_metric,
-    read_checkpoint_pointer,
     resolve_restore_from_to_checkpoint_dir,
 )
 from nemo_automodel.components.config.loader import ConfigNode, config_to_yaml_str
@@ -70,11 +57,6 @@ from nemo_automodel.components.training.step_scheduler import StepScheduler
 from nemo_automodel.recipes._typed_config import RecipeConfig
 
 logger = logging.getLogger(__name__)
-
-# Suffix for the directory a checkpoint reservation builds before renaming it into
-# place. Chosen so the name does not end in ``step_<N>`` and therefore never matches
-# the checkpoint listings in ``components.checkpoint.utils``.
-_RESERVATION_STAGING_SUFFIX = ".reserving-"
 
 
 def has_load_restore_state(object):
@@ -214,10 +196,6 @@ class BaseRecipe:
         if "__state_tracked" not in self.__dict__:
             self.__dict__["__state_tracked"] = set()
 
-        # Initialize best checkpoint tracking
-        if "_best_val_loss" not in self.__dict__:
-            self.__dict__["_best_val_loss"] = float("inf")
-
         # Track stateful objects unless they are validation/eval components.
         should_track = (
             is_model(value)
@@ -242,167 +220,6 @@ class BaseRecipe:
             return
         for key in keys:
             tracked.discard(key)
-
-    def _reserve_checkpoint_dir(self, path: str) -> None:
-        """Reserve ``path`` for this save, replacing a leftover from an interrupted save.
-
-        Checkpoint directory names are derived from the step, so a run that resumes
-        after an interrupted save recomputes that step and targets a directory that
-        already exists. Only a directory still carrying the in-progress marker is
-        replaced: it holds a checkpoint that was never published and can never be
-        restored, so re-saving over it loses nothing.
-
-        A directory holding a published checkpoint is never overwritten. Doing so
-        would destroy a restorable checkpoint and silently change what any pointer
-        aimed at it resolves to, so the save aborts on every rank instead.
-
-        Reservation is itself failure-atomic. The absence of the marker is what
-        makes a directory look published, so ``path`` must never exist without one:
-        the directory is built complete with its marker under a staging name and
-        renamed into place. A reservation that fails, or whose process dies partway,
-        leaves only a staging directory, which the checkpoint listings ignore and
-        the next reservation of the same step clears.
-
-        ``msc://`` roots retain their existing DCP behavior. The local shadow
-        directory needed by recipe metadata is created, but the filesystem-only
-        marker, stale-directory replacement, and failure-atomic rename are skipped.
-
-        Args:
-            path: Checkpoint directory for the current step.
-
-        Raises:
-            FileExistsError: If ``path`` already holds a published checkpoint.
-            RuntimeError: If the directory could not be prepared.
-        """
-        is_dist_initialized = torch.distributed.is_initialized()
-        is_rank_0 = not is_dist_initialized or torch.distributed.get_rank() == 0
-
-        if is_cloud_path(path):
-
-            def prepare_remote_metadata_dir() -> None:
-                logger.warning(
-                    "Checkpoint directory %s uses MSC storage; interrupted-save detection and "
-                    "automatic stale-directory replacement are unavailable",
-                    path,
-                )
-                # Preserve the established recipe behavior: DCP shards are written
-                # through MSC, while rank-0 recipe metadata uses this local shadow.
-                os.makedirs(path, exist_ok=True)
-
-            self._run_rank_0_checkpoint_step(
-                prepare_remote_metadata_dir,
-                f"prepare local recipe metadata directory for remote checkpoint {path}",
-            )
-            return
-
-        # Decided on rank 0 and reduced, so the refusal is unanimous instead of a
-        # rank-0-only raise that would strand the other ranks in the next collective.
-        holds_published = is_rank_0 and os.path.exists(path) and not is_checkpoint_incomplete(path)
-        if self._any_rank_failed(holds_published, is_dist_initialized):
-            raise FileExistsError(
-                f"Checkpoint directory {path} already holds a published checkpoint. Remove it, or point "
-                "checkpoint.checkpoint_dir at a fresh directory, before re-running this step."
-            )
-
-        def reserve() -> None:
-            if os.path.exists(path):
-                logger.warning("Replacing checkpoint directory %s left behind by an interrupted save", path)
-                shutil.rmtree(path)
-
-            parent = os.path.dirname(path)
-            staging_prefix = f"{os.path.basename(path)}{_RESERVATION_STAGING_SUFFIX}"
-            if os.path.isdir(parent):
-                for entry in os.listdir(parent):
-                    if entry.startswith(staging_prefix):
-                        shutil.rmtree(os.path.join(parent, entry), ignore_errors=True)
-
-            staging = f"{path}{_RESERVATION_STAGING_SUFFIX}{uuid4().hex}"
-            os.makedirs(staging)
-            mark_checkpoint_incomplete(staging)
-            # Atomic within a filesystem, so `path` is never observable without its marker.
-            os.rename(staging, path)
-
-        self._run_rank_0_checkpoint_step(reserve, f"prepare checkpoint directory {path}")
-
-    def _run_rank_0_checkpoint_step(self, operation: Callable[[], None], description: str) -> None:
-        """Run a rank-0 checkpoint filesystem step and abort every rank if it fails.
-
-        Checkpoint bookkeeping runs on rank 0 alone, and every such step is followed
-        by a collective. Letting an exception escape on rank 0 leaves the other ranks
-        blocked there until the cluster reaps the job, so the outcome is reduced:
-        either every rank continues or every rank raises.
-
-        Every rank-0 filesystem mutation in the checkpoint lifecycle goes through
-        here, so the invariant holds by construction rather than per call site.
-
-        Args:
-            operation: Filesystem work to run on rank 0. Not called on other ranks.
-            description: Step name used in the log line and the error message.
-
-        Raises:
-            RuntimeError: If rank 0 could not complete the step. On rank 0 the
-                original exception is chained as the cause.
-        """
-        is_dist_initialized = torch.distributed.is_initialized()
-        is_rank_0 = not is_dist_initialized or torch.distributed.get_rank() == 0
-
-        failure: Exception | None = None
-        if is_rank_0:
-            try:
-                operation()
-            except Exception as exc:
-                # Deliberately broad, and neither swallowed nor re-raised here: the
-                # steps reach state_dict(), torch.save, and pointer publication, which
-                # raise RuntimeError and pickling errors as well as OSError. Anything
-                # escaping at this point would kill rank 0 while its peers block in the
-                # next collective, so it is recorded and reported through the reduction.
-                logger.exception("Failed to %s", description)
-                failure = exc
-
-        if self._any_rank_failed(failure is not None, is_dist_initialized):
-            raise RuntimeError(f"Failed to {description}; see the rank 0 log for the underlying error.") from failure
-
-    def _any_rank_failed(self, failed: bool, is_dist_initialized: bool) -> bool:
-        """Reduce a local failure flag so every rank agrees on whether to abort.
-
-        Checkpoint bookkeeping runs on rank 0 alone. Raising there without telling
-        the other ranks leaves them blocked in the next collective until the cluster
-        reaps the job, so the flag is max-reduced and every rank raises together.
-
-        Args:
-            failed: Whether this rank observed a failure.
-            is_dist_initialized: Whether a process group is available to reduce over.
-
-        Returns:
-            True when any participating rank reported a failure.
-        """
-        flag = torch.tensor([int(failed)], dtype=torch.int32)
-        if is_dist_initialized:
-            if torch.cuda.is_available():
-                flag = flag.cuda()
-            torch.distributed.all_reduce(
-                flag,
-                op=torch.distributed.ReduceOp.MAX,
-                group=getattr(getattr(self, "mesh_context", None), "process_group", None),
-            )
-        return bool(flag.item())
-
-    def _publish_checkpoint(self, path: str) -> None:
-        """Mark a fully written checkpoint as complete and advance the LATEST pointer.
-
-        ``LATEST`` is moved while the checkpoint is still marked, then clearing the
-        marker commits publication. If either operation fails, resume still ignores
-        the marked checkpoint and a later save can replace it. Runs on rank 0 inside
-        :meth:`_run_rank_0_checkpoint_step`, which reports any failure to every rank.
-        MSC roots keep their pre-existing local pointer behavior and do not use a
-        filesystem marker.
-
-        Args:
-            path: Checkpoint directory whose components have all been written.
-        """
-        self._update_latest_symlink(path)
-        if not is_cloud_path(path):
-            clear_checkpoint_incomplete(path)
 
     def save_checkpoint(
         self,
@@ -429,7 +246,7 @@ class BaseRecipe:
 
         # Wait for any in-flight checkpoint (async case) to complete
         self.checkpointer.async_wait()
-        self._complete_pending_checkpoint()
+        self.checkpointer.lifecycle.complete_pending()
 
         # Free GPU caches before DCP's gather-and-write. DCP allocates NCCL
         # workspace and materializes DTensor shards on GPU; with CPU-offloaded
@@ -447,7 +264,7 @@ class BaseRecipe:
         best_metric_name = next(iter(val_loss.keys())) if val_loss and len(val_loss) == 1 else best_metric_key
         best_val_metric = val_loss[best_metric_name] if val_loss else None
 
-        self._reserve_checkpoint_dir(path)
+        self.checkpointer.lifecycle.reserve(path)
 
         if is_rank_0:
             logger.info("Saving checkpoint to %s", path)
@@ -497,12 +314,12 @@ class BaseRecipe:
                 # guard: a failure here must abort every rank, not just this one.
                 # The tracked-state names are identical on every rank, so the loop
                 # issues the same reductions everywhere.
-                self._run_rank_0_checkpoint_step(
+                self.checkpointer.lifecycle.run_coordinator_step(
                     lambda key=key: torch.save(
                         getattr(self, key).state_dict(),
                         os.path.join(path, f"{key}.pt"),
                     ),
-                    f"write {key} state to {path}",
+                    description=f"write {key} state to {path}",
                 )
 
         # For multi-stage PP models, use checkpointer directly to handle all parts
@@ -569,31 +386,17 @@ class BaseRecipe:
 
         # Update latest symlink according to sync/async behavior
         if getattr(self.checkpointer.config, "is_async", False):
-            # Async: defer symlink publication until the next call (after async_wait completes).
-            # Store a best-publish record on every rank so _complete_pending_checkpoint has a uniform
-            # barrier sequence even when validation metrics are only present on rank 0.
-            setattr(self, "_last_pending_checkpoint_dir", path)
-            setattr(
-                self,
-                "_last_pending_best_checkpoint_info",
-                {
-                    "path": path,
-                    "val": float(best_val_metric) if best_val_metric is not None else None,
-                    "metric_key": best_metric_name,
-                },
+            self.checkpointer.lifecycle.defer_publication(
+                path,
+                best_val_metric=float(best_val_metric) if best_val_metric is not None else None,
+                metric_key=best_metric_name,
             )
         else:
-            # Sync: update immediately. The whole block is one rank-0 step so a
-            # failure anywhere in it aborts every rank rather than only rank 0.
-            def publish() -> None:
-                self._publish_checkpoint(path)
-                if best_val_metric is not None:
-                    self._update_best_symlink(path, float(best_val_metric), best_metric_name)
-                self._prune_old_checkpoints()
-
-            self._run_rank_0_checkpoint_step(publish, f"publish checkpoint {path}")
-            if is_dist_initialized:
-                _dist_barrier(getattr(getattr(self, "mesh_context", None), "process_group", None))
+            self.checkpointer.lifecycle.publish(
+                path,
+                best_val_metric=float(best_val_metric) if best_val_metric is not None else None,
+                metric_key=best_metric_name,
+            )
 
         # Staging holds the source buffers until it completes, so drain it before
         # reclaiming memory below. Waiting here (rather than right after the save)
@@ -608,216 +411,12 @@ class BaseRecipe:
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
 
-    def _complete_pending_checkpoint(self) -> None:
-        """Publish a completed async checkpoint and apply retention."""
-        prev_pending = getattr(self, "_last_pending_checkpoint_dir", None)
-        prev_best_pending = getattr(self, "_last_pending_best_checkpoint_info", None)
-        if prev_pending is None and prev_best_pending is None:
-            return
-
-        is_dist_initialized = torch.distributed.is_initialized()
-        process_group = getattr(getattr(self, "mesh_context", None), "process_group", None)
-        # Every branch below is gated on state that is set identically on all ranks, so
-        # the collective sequence matches even when validation metrics only exist on
-        # rank 0. Rank-0-only conditions live inside the step callbacks instead.
-        if prev_pending is not None:
-            self._run_rank_0_checkpoint_step(
-                lambda: self._publish_checkpoint(prev_pending), f"publish checkpoint {prev_pending}"
-            )
-            setattr(self, "_last_pending_checkpoint_dir", None)
-            if is_dist_initialized:
-                _dist_barrier(process_group)
-
-        if prev_best_pending is not None:
-
-            def update_best() -> None:
-                if prev_best_pending.get("val") is None:
-                    return
-                self._update_best_symlink(
-                    prev_best_pending["path"],
-                    float(prev_best_pending["val"]),
-                    prev_best_pending.get("metric_key"),
-                )
-
-            self._run_rank_0_checkpoint_step(update_best, "update the LOWEST_VAL pointer")
-            setattr(self, "_last_pending_best_checkpoint_info", None)
-            if is_dist_initialized:
-                _dist_barrier(process_group)
-
-        self._run_rank_0_checkpoint_step(self._prune_old_checkpoints, "prune old checkpoints")
-        if is_dist_initialized:
-            _dist_barrier(process_group)
-
-    def _finalize_pending_checkpoint(self) -> None:
-        """Wait for the final async checkpoint, publish it, and apply retention."""
-        checkpointer = getattr(self, "checkpointer", None)
-        if checkpointer is None:
-            return
-        config = getattr(checkpointer, "config", None)
-        if config is not None and not getattr(config, "enabled", True):
-            return
-        async_wait = getattr(checkpointer, "async_wait", None)
-        if async_wait is None:
-            return
-        async_wait()
-        self._complete_pending_checkpoint()
-
     def _finalize_and_close_checkpointer(self) -> None:
         """Finalize pending checkpoint publication and always close the checkpointer."""
         checkpointer = getattr(self, "checkpointer", None)
         if checkpointer is None:
             return
-        try:
-            self._finalize_pending_checkpoint()
-        finally:
-            checkpointer.close()
-
-    def _update_checkpoint_symlink(self, link_name: str, target_dir: str) -> None:
-        """
-        Create or update a symlink named `link_name` under the checkpoint root
-        that points to `target_dir`.
-        Assumes caller ensures rank 0 if needed.
-        """
-        ckpt_root = self.checkpointer.config.checkpoint_dir
-        link_path = os.path.join(ckpt_root, link_name)
-        txt_path = f"{link_path}.txt"
-
-        ckpt_root_abs = os.path.abspath(ckpt_root)
-        target_abs = os.path.abspath(target_dir)
-        relative_target = os.path.relpath(target_abs, start=ckpt_root_abs)
-        temp_path = os.path.join(ckpt_root, f".{link_name}.{uuid4().hex}.tmp")
-        try:
-            try:
-                os.symlink(relative_target, temp_path)
-            except OSError:
-                if os.path.lexists(temp_path):
-                    os.remove(temp_path)
-                # Fallback: publish a text pointer when symbolic links are not supported.
-                with open(temp_path, "x") as f:
-                    f.write(relative_target)
-                    f.flush()
-                    os.fsync(f.fileno())
-                os.replace(temp_path, txt_path)
-                temp_path = ""
-                if os.path.lexists(link_path):
-                    os.remove(link_path)
-            else:
-                os.replace(temp_path, link_path)
-                temp_path = ""
-                if os.path.exists(txt_path):
-                    os.remove(txt_path)
-        finally:
-            if temp_path and os.path.lexists(temp_path):
-                os.remove(temp_path)
-
-    def _remove_checkpoint_pointer(self, link_name: str) -> None:
-        """Remove a checkpoint pointer symlink and fallback text file."""
-        ckpt_root = self.checkpointer.config.checkpoint_dir
-        link_path = os.path.join(ckpt_root, link_name)
-        if os.path.lexists(link_path):
-            os.remove(link_path)
-        txt_path = f"{link_path}.txt"
-        if os.path.exists(txt_path):
-            os.remove(txt_path)
-
-    def _remove_stale_checkpoint_pointer(self, link_name: str) -> None:
-        """Remove a checkpoint pointer when its target no longer exists."""
-        target = read_checkpoint_pointer(self.checkpointer.config.checkpoint_dir, link_name)
-        if target is not None and not target.is_dir():
-            self._remove_checkpoint_pointer(link_name)
-
-    def _prune_old_checkpoints(self) -> None:
-        """Prune old checkpoint directories according to checkpoint.max_recent_checkpoints."""
-        max_recent_checkpoints = getattr(self.checkpointer.config, "max_recent_checkpoints", None)
-        if max_recent_checkpoints is None:
-            return
-
-        ckpt_root = Path(self.checkpointer.config.checkpoint_dir)
-        checkpoints = list_automodel_checkpoints(ckpt_root)
-        try:
-            protected_checkpoints = find_pointer_protected_checkpoints(ckpt_root, checkpoints)
-        except (OSError, UnicodeError):
-            logger.warning("Failed to scan checkpoint pointers in %s; skipping pruning", ckpt_root, exc_info=True)
-            return
-        # A directory left behind by an interrupted save is not resumable, so it must not
-        # consume a retention slot; being outside the window it is then pruned as an orphan.
-        complete_checkpoints = [checkpoint for checkpoint in checkpoints if not is_checkpoint_incomplete(checkpoint)]
-        retained_window = set(complete_checkpoints[-max_recent_checkpoints:])
-        checkpoints_to_delete = [
-            checkpoint for checkpoint in checkpoints if checkpoint not in retained_window | protected_checkpoints
-        ]
-        for checkpoint in checkpoints_to_delete:
-            try:
-                shutil.rmtree(checkpoint)
-            except OSError:
-                logger.warning("Failed to prune old checkpoint directory %s", checkpoint, exc_info=True)
-            else:
-                logger.info("Pruned old checkpoint directory %s", checkpoint)
-
-        self._remove_stale_checkpoint_pointer("LATEST")
-        self._remove_stale_checkpoint_pointer("LOWEST_VAL")
-
-    def _initialize_best_val_loss_from_pointer(self, metric_key: str | None) -> None:
-        """Initialize best validation loss from the existing LOWEST_VAL pointer after resume.
-
-        A target left behind by an interrupted save is skipped. Its ``losses.json``
-        records a metric belonging to a checkpoint the run can never restore, and
-        seeding the baseline from it would hold LOWEST_VAL below every later
-        checkpoint even after retention removes that target.
-        """
-        if self._best_val_loss != float("inf"):
-            return
-        target = read_checkpoint_pointer(self.checkpointer.config.checkpoint_dir, "LOWEST_VAL")
-        if target is None or not target.is_dir() or is_checkpoint_incomplete(target):
-            return
-        existing_best = read_checkpoint_metric(target, metric_key)
-        if existing_best is not None:
-            self._best_val_loss = existing_best
-
-    def _update_latest_symlink(self, target_dir: str) -> None:
-        """
-        Create or update a symlink named "latest" under the checkpoint root
-        that points to `target_dir`.
-        Only called on rank 0.
-        """
-        self._update_checkpoint_symlink("LATEST", target_dir)
-
-    def _update_best_symlink(self, target_dir: str, val_loss: float, metric_key: str | None = None) -> None:
-        """
-        Create or update a symlink named "LOWEST_VAL" under the checkpoint root
-        that points to the checkpoint with the lowest validation loss.
-        Only called on rank 0.
-        """
-        if not math.isfinite(val_loss):
-            logger.warning("Ignoring non-finite validation metric for checkpoint %s: %s", target_dir, val_loss)
-            return
-        self._initialize_best_val_loss_from_pointer(metric_key)
-        # Update best checkpoint if this one is better
-        if val_loss < self._best_val_loss:
-            self._best_val_loss = val_loss
-            self._update_checkpoint_symlink("LOWEST_VAL", target_dir)
-            logging.info(
-                f"Updated LOWEST_VAL checkpoint symlink to {os.path.basename(target_dir)} (val_loss={val_loss:.4f})"
-            )
-
-    def _validate_checkpoint_dir_exists(self, ckpt_dir: str, restore_from: str, is_rank_0: bool) -> None:
-        """Validate resolved checkpoint directory exists; raise FileNotFoundError with a helpful message."""
-        if os.path.exists(ckpt_dir):
-            return
-
-        # Build helpful error message on rank 0
-        if is_rank_0:
-            error_msg = format_missing_checkpoint_dir_error(
-                checkpoint_dir=self.checkpointer.config.checkpoint_dir,
-                restore_from=restore_from,
-                resolved_ckpt_dir=ckpt_dir,
-            )
-        else:
-            error_msg = f"Checkpoint directory does not exist: {ckpt_dir}"
-
-        # Ensure all ranks fail together (before raising)
-        _dist_barrier(getattr(getattr(self, "mesh_context", None), "process_group", None))
-        raise FileNotFoundError(error_msg)
+        checkpointer.finalize()
 
     def _load_checkpoint_tracked_state(self, ckpt_dir: str):
         """Load tracked state and return (model, optimizer, scheduler) for downstream loader calls."""
@@ -885,7 +484,7 @@ class BaseRecipe:
                         f"{self.checkpointer.config.checkpoint_dir}. Starting fresh."
                     )
                 return
-            self._validate_checkpoint_dir_exists(ckpt_dir, restore_from=restore_from, is_rank_0=is_rank_0)
+            self.checkpointer.lifecycle.validate_checkpoint_dir_exists(ckpt_dir, restore_from)
         else:
             # Auto-detect latest checkpoint
             ckpt_dir = find_latest_checkpoint(self.checkpointer.config.checkpoint_dir)

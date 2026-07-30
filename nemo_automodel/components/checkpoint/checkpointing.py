@@ -67,6 +67,7 @@ from nemo_automodel.components.checkpoint.conversion_mapping import (
     get_combined_key_mapping,
     requires_tensor_merging,
 )
+from nemo_automodel.components.checkpoint.lifecycle import CheckpointLifecycle
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, OptimizerState
 from nemo_automodel.components.checkpoint.utils import (
     ensure_tied_lm_head,
@@ -516,6 +517,7 @@ class Checkpointer:
         self.tp_rank = tp_rank
         self.pp_rank = pp_rank
         self.process_group = process_group
+        self.lifecycle = CheckpointLifecycle(config=config, process_group=process_group)
 
         # async specific variables
         self._model_ctx = _AsyncSaveContext(stager=None, process_group=None, future=None, staging_active=False)
@@ -1303,6 +1305,15 @@ class Checkpointer:
                     context.process_group = None
             if consolidation_process_group is not None:
                 torch.distributed.destroy_process_group(consolidation_process_group)
+
+    def finalize(self) -> None:
+        """Publish any final async checkpoint and close owned resources."""
+        try:
+            if self.config.enabled:
+                self.async_wait()
+                self.lifecycle.complete_pending()
+        finally:
+            self.close()
 
     def _do_load(
         self,

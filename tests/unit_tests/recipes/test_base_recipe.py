@@ -22,6 +22,10 @@ import torch
 import torch.nn as nn
 
 from nemo_automodel.components.checkpoint.checkpointing import save_losses
+from nemo_automodel.components.checkpoint.lifecycle import (
+    _RESERVATION_STAGING_SUFFIX,
+    CheckpointLifecycle,
+)
 from nemo_automodel.components.checkpoint.utils import (
     find_latest_checkpoint,
     is_checkpoint_incomplete,
@@ -32,11 +36,7 @@ from nemo_automodel.components.checkpoint.utils import (
 )
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.recipes.base_recipe import (
-    _RESERVATION_STAGING_SUFFIX,
-    BaseRecipe,
-    is_distributed_stateful,
-)
+from nemo_automodel.recipes.base_recipe import BaseRecipe, is_distributed_stateful
 
 try:
     import expecttest
@@ -52,7 +52,7 @@ def _mock_single_rank(monkeypatch):
     Pretend we are running in a single-process, non-distributed setup.
     """
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False, raising=False)
-    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0, raising=False)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: 0, raising=False)
     yield
 
 
@@ -67,12 +67,24 @@ def _patch_checkpoint_ops(monkeypatch):
     class MockCheckpointer:
         """Mock Checkpointer for testing."""
 
-        def __init__(self, config, dp_rank, tp_rank, pp_rank, moe_mesh=None):
+        def __init__(
+            self,
+            config,
+            dp_rank,
+            tp_rank,
+            pp_rank,
+            moe_mesh=None,
+            process_group=None,
+            pp_group=None,
+        ):
             self.config = config
             self.dp_rank = dp_rank
             self.tp_rank = tp_rank
             self.pp_rank = pp_rank
             self.moe_mesh = moe_mesh
+            self.process_group = process_group
+            self.pp_group = pp_group
+            self.lifecycle = CheckpointLifecycle(config=config, process_group=process_group)
             self.distributed_saves = []
             self.distributed_loads = []
             self.staging_waits = 0
@@ -121,6 +133,16 @@ def _patch_checkpoint_ops(monkeypatch):
         def async_wait(self):
             """No-op for tests to satisfy BaseRecipe interface."""
             return
+
+        def close(self):
+            """No-op for tests to satisfy BaseRecipe interface."""
+            return
+
+        def finalize(self):
+            """Publish pending test checkpoints and close."""
+            self.async_wait()
+            self.lifecycle.complete_pending()
+            self.close()
 
         def maybe_wait_for_staging(self):
             """Record calls that wait for asynchronous checkpoint staging."""
@@ -895,7 +917,7 @@ def test_async_checkpoint_stays_incomplete_until_it_is_published(tmp_path):
     assert is_checkpoint_incomplete(checkpoint)
     assert find_latest_checkpoint(tmp_path) is None
 
-    recipe_inst._complete_pending_checkpoint()
+    recipe_inst.checkpointer.lifecycle.complete_pending()
 
     assert not is_checkpoint_incomplete(checkpoint)
     assert os.path.basename(str(find_latest_checkpoint(tmp_path))) == "epoch_0_step_100"
@@ -1036,7 +1058,7 @@ def test_rank_0_filesystem_failure_aborts_every_rank(tmp_path, monkeypatch, fail
     monkeypatch.setattr(torch.distributed, "all_reduce", record_all_reduce, raising=False)
     monkeypatch.setattr(torch.distributed, "barrier", lambda group=None: None, raising=False)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False, raising=False)
-    monkeypatch.setattr(f"nemo_automodel.recipes.base_recipe.{failing_operation}", fail)
+    monkeypatch.setattr(f"nemo_automodel.components.checkpoint.lifecycle.{failing_operation}", fail)
 
     with pytest.raises(RuntimeError, match="Failed to (prepare|publish)"):
         recipe_inst.save_checkpoint(epoch=0, step=100, train_loss=1.0)
@@ -1059,7 +1081,7 @@ def test_pointer_unlink_failure_during_pruning_aborts_every_rank(tmp_path, monke
     def fail_remove(link_name):
         raise OSError("read-only file system")
 
-    monkeypatch.setattr(recipe_inst, "_remove_checkpoint_pointer", fail_remove)
+    monkeypatch.setattr(recipe_inst.checkpointer.lifecycle, "_remove_checkpoint_pointer", fail_remove)
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True, raising=False)
     monkeypatch.setattr(
         torch.distributed,
@@ -1092,9 +1114,9 @@ def test_failed_publication_leaves_checkpoint_unpublished_and_replaceable(tmp_pa
 
     with monkeypatch.context() as patch:
         if failure_point == "latest_pointer":
-            patch.setattr(recipe_inst, "_update_latest_symlink", fail)
+            patch.setattr(recipe_inst.checkpointer.lifecycle, "_update_checkpoint_pointer", fail)
         else:
-            patch.setattr("nemo_automodel.recipes.base_recipe.clear_checkpoint_incomplete", fail)
+            patch.setattr("nemo_automodel.components.checkpoint.lifecycle.clear_checkpoint_incomplete", fail)
 
         with pytest.raises(RuntimeError, match="Failed to publish checkpoint"):
             recipe_inst.save_checkpoint(epoch=0, step=100, train_loss=1.0)
@@ -1121,7 +1143,7 @@ def test_failed_reservation_leaves_no_resumable_checkpoint(tmp_path, monkeypatch
     def fail_mark(checkpoint_dir):
         raise OSError("disk quota exceeded")
 
-    monkeypatch.setattr("nemo_automodel.recipes.base_recipe.mark_checkpoint_incomplete", fail_mark)
+    monkeypatch.setattr("nemo_automodel.components.checkpoint.lifecycle.mark_checkpoint_incomplete", fail_mark)
 
     with pytest.raises(RuntimeError, match="Failed to prepare"):
         recipe_inst.save_checkpoint(epoch=0, step=100, train_loss=1.0)
@@ -1196,7 +1218,7 @@ def test_rank_0_failure_aborts_ranks_that_did_not_perform_it(tmp_path, monkeypat
         tensor.fill_(1)
 
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True, raising=False)
-    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 1, raising=False)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: 1, raising=False)
     monkeypatch.setattr(torch.distributed, "all_reduce", rank_0_reported_failure, raising=False)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False, raising=False)
 
@@ -1270,12 +1292,12 @@ def test_checkpoint_lifecycle_is_skipped_for_msc_checkpoint_dir(tmp_path, monkey
     def fail(*args, **kwargs):
         raise AssertionError("filesystem-only lifecycle operation used for MSC checkpoint")
 
-    monkeypatch.setattr("nemo_automodel.recipes.base_recipe.shutil.rmtree", fail)
-    monkeypatch.setattr("nemo_automodel.recipes.base_recipe.mark_checkpoint_incomplete", fail)
+    monkeypatch.setattr("nemo_automodel.components.checkpoint.lifecycle.shutil.rmtree", fail)
+    monkeypatch.setattr("nemo_automodel.components.checkpoint.lifecycle.mark_checkpoint_incomplete", fail)
 
     with caplog.at_level(logging.WARNING):
-        recipe_inst._reserve_checkpoint_dir(remote_checkpoint)
-        recipe_inst._reserve_checkpoint_dir(remote_checkpoint)
+        recipe_inst.checkpointer.lifecycle.reserve(remote_checkpoint)
+        recipe_inst.checkpointer.lifecycle.reserve(remote_checkpoint)
 
     assert (tmp_path / "msc:" / "bucket" / "run" / "epoch_0_step_100").is_dir()
     assert is_checkpoint_incomplete(remote_checkpoint) is False
@@ -1288,16 +1310,20 @@ def test_publish_msc_checkpoint_does_not_clear_local_marker(tmp_path, monkeypatc
     remote_checkpoint = "msc://bucket/run/epoch_0_step_100"
     published = []
 
-    monkeypatch.setattr(recipe_inst, "_update_latest_symlink", published.append)
+    monkeypatch.setattr(
+        recipe_inst.checkpointer.lifecycle,
+        "_update_checkpoint_pointer",
+        lambda link_name, target_dir: published.append((link_name, target_dir)),
+    )
 
     def fail_clear(*args, **kwargs):
         raise AssertionError("filesystem marker clear used for MSC checkpoint")
 
-    monkeypatch.setattr("nemo_automodel.recipes.base_recipe.clear_checkpoint_incomplete", fail_clear)
+    monkeypatch.setattr("nemo_automodel.components.checkpoint.lifecycle.clear_checkpoint_incomplete", fail_clear)
 
-    recipe_inst._publish_checkpoint(remote_checkpoint)
+    recipe_inst.checkpointer.lifecycle._publish_checkpoint(remote_checkpoint)
 
-    assert published == [remote_checkpoint]
+    assert published == [("LATEST", remote_checkpoint)]
 
 
 def test_interrupted_lowest_val_target_does_not_poison_best_metric_tracking(tmp_path):
@@ -1311,7 +1337,7 @@ def test_interrupted_lowest_val_target_does_not_poison_best_metric_tracking(tmp_
     recipe_inst = _ToyRecipe(tmp_path, max_recent_checkpoints=2)
     interrupted = _simulate_interrupted_save(tmp_path, step=100)
     (interrupted / "losses.json").write_text('{"val_loss": 0.1}')
-    recipe_inst._update_checkpoint_symlink("LOWEST_VAL", str(interrupted))
+    recipe_inst.checkpointer.lifecycle._update_checkpoint_pointer("LOWEST_VAL", str(interrupted))
 
     for step, val in [(200, 0.2), (300, 0.15)]:
         x = torch.randn(4, 2)
@@ -1323,7 +1349,7 @@ def test_interrupted_lowest_val_target_does_not_poison_best_metric_tracking(tmp_
     best = read_checkpoint_pointer(tmp_path, "LOWEST_VAL")
     assert best is not None, "LOWEST_VAL was never recreated after the marked target was pruned"
     assert best.name == "epoch_0_step_300"
-    assert recipe_inst._best_val_loss == 0.15
+    assert recipe_inst.checkpointer.lifecycle._best_val_loss == 0.15
 
 
 def test_checkpoint_retention_still_protects_complete_pointer_target(tmp_path):
@@ -1331,7 +1357,7 @@ def test_checkpoint_retention_still_protects_complete_pointer_target(tmp_path):
     recipe_inst = _ToyRecipe(tmp_path, max_recent_checkpoints=1)
     complete = tmp_path / "epoch_0_step_100"
     complete.mkdir()
-    recipe_inst._update_checkpoint_symlink("LOWEST_VAL", str(complete))
+    recipe_inst.checkpointer.lifecycle._update_checkpoint_pointer("LOWEST_VAL", str(complete))
 
     x = torch.randn(4, 2)
     loss = recipe_inst.model(x).sum()
@@ -1365,7 +1391,7 @@ def test_interrupted_save_lifecycle_resumes_from_the_last_complete_checkpoint(tm
     weight_at_step_100 = recipe_inst.model.weight.clone()
     recipe_inst.save_checkpoint(epoch=0, step=100, train_loss=float(loss.item()))
     if is_async:
-        recipe_inst._complete_pending_checkpoint()
+        recipe_inst.checkpointer.lifecycle.complete_pending()
 
     # The re-save of step 100 is interrupted after the directory is reserved.
     checkpoint = tmp_path / "epoch_0_step_100"
@@ -1524,7 +1550,10 @@ def test_checkpoint_retention_preserves_arbitrary_checkpoint_pointer_target(tmp_
         recipe_inst.optimizer.step()
         recipe_inst.save_checkpoint(epoch=0, step=step, train_loss=float(loss.item()))
         if step == 100:
-            recipe_inst._update_checkpoint_symlink("PINNED", str(tmp_path / "epoch_0_step_100"))
+            recipe_inst.checkpointer.lifecycle._update_checkpoint_pointer(
+                "PINNED",
+                str(tmp_path / "epoch_0_step_100"),
+            )
 
     assert _checkpoint_dir_names(tmp_path) == ["epoch_0_step_100", "epoch_0_step_300"]
     assert (tmp_path / "PINNED").exists(follow_symlinks=False) or (tmp_path / "PINNED.txt").exists()
@@ -1541,7 +1570,10 @@ def test_checkpoint_retention_preserves_pointer_to_file_inside_checkpoint(tmp_pa
         recipe_inst.optimizer.step()
         recipe_inst.save_checkpoint(epoch=0, step=step, train_loss=float(loss.item()))
         if step == 100:
-            recipe_inst._update_checkpoint_symlink("PINNED_FILE", str(tmp_path / "epoch_0_step_100" / "losses.json"))
+            recipe_inst.checkpointer.lifecycle._update_checkpoint_pointer(
+                "PINNED_FILE",
+                str(tmp_path / "epoch_0_step_100" / "losses.json"),
+            )
 
     assert _checkpoint_dir_names(tmp_path) == ["epoch_0_step_100", "epoch_0_step_300"]
 
@@ -1567,14 +1599,20 @@ def test_checkpoint_retention_pointer_scan_failure_skips_pruning(tmp_path, monke
     recipe_inst = _ToyRecipe(tmp_path, max_recent_checkpoints=1)
     for step in [100, 200, 300]:
         (tmp_path / f"epoch_0_step_{step}").mkdir()
-    recipe_inst._update_checkpoint_symlink("PINNED", str(tmp_path / "epoch_0_step_100"))
+    recipe_inst.checkpointer.lifecycle._update_checkpoint_pointer(
+        "PINNED",
+        str(tmp_path / "epoch_0_step_100"),
+    )
 
     def fail_pointer_scan(_ckpt_root, _checkpoints):
         raise OSError("pointer scan failed")
 
-    monkeypatch.setattr("nemo_automodel.recipes.base_recipe.find_pointer_protected_checkpoints", fail_pointer_scan)
+    monkeypatch.setattr(
+        "nemo_automodel.components.checkpoint.lifecycle.find_pointer_protected_checkpoints",
+        fail_pointer_scan,
+    )
     with caplog.at_level(logging.WARNING):
-        recipe_inst._prune_old_checkpoints()
+        recipe_inst.checkpointer.lifecycle._prune_old_checkpoints()
 
     assert _checkpoint_dir_names(tmp_path) == [
         "epoch_0_step_100",
@@ -1589,7 +1627,10 @@ def test_checkpoint_retention_pointer_classification_failure_skips_pruning(tmp_p
     recipe_inst = _ToyRecipe(tmp_path, max_recent_checkpoints=1)
     for step in [100, 200, 300]:
         (tmp_path / f"epoch_0_step_{step}").mkdir()
-    recipe_inst._update_checkpoint_symlink("PINNED", str(tmp_path / "epoch_0_step_100"))
+    recipe_inst.checkpointer.lifecycle._update_checkpoint_pointer(
+        "PINNED",
+        str(tmp_path / "epoch_0_step_100"),
+    )
     path_type = type(tmp_path)
     real_lstat = path_type.lstat
 
@@ -1600,7 +1641,7 @@ def test_checkpoint_retention_pointer_classification_failure_skips_pruning(tmp_p
 
     monkeypatch.setattr(path_type, "lstat", fail_pinned_lstat)
 
-    recipe_inst._prune_old_checkpoints()
+    recipe_inst.checkpointer.lifecycle._prune_old_checkpoints()
 
     assert _checkpoint_dir_names(tmp_path) == [
         "epoch_0_step_100",
@@ -1618,12 +1659,12 @@ def test_non_finite_restored_best_metric_does_not_block_future_best(tmp_path, no
     old_checkpoint.mkdir()
     new_checkpoint.mkdir()
     (old_checkpoint / "losses.json").write_text(f'{{"val_loss": {non_finite_value}}}')
-    recipe_inst._update_checkpoint_symlink("LOWEST_VAL", str(old_checkpoint))
+    recipe_inst.checkpointer.lifecycle._update_checkpoint_pointer("LOWEST_VAL", str(old_checkpoint))
 
-    recipe_inst._update_best_symlink(str(new_checkpoint), 0.5, "val_loss")
+    recipe_inst.checkpointer.lifecycle._update_best_checkpoint(str(new_checkpoint), 0.5, "val_loss")
 
     assert read_checkpoint_pointer(tmp_path, "LOWEST_VAL") == new_checkpoint
-    assert recipe_inst._best_val_loss == 0.5
+    assert recipe_inst.checkpointer.lifecycle._best_val_loss == 0.5
 
 
 @pytest.mark.parametrize("malformed_losses", ["null", "42", "[]", '{"val_loss": 1' + "0" * 400 + "}"])
@@ -1635,12 +1676,12 @@ def test_malformed_restored_best_metric_does_not_block_future_best(tmp_path, mal
     old_checkpoint.mkdir()
     new_checkpoint.mkdir()
     (old_checkpoint / "losses.json").write_text(malformed_losses)
-    recipe_inst._update_checkpoint_symlink("LOWEST_VAL", str(old_checkpoint))
+    recipe_inst.checkpointer.lifecycle._update_checkpoint_pointer("LOWEST_VAL", str(old_checkpoint))
 
-    recipe_inst._update_best_symlink(str(new_checkpoint), 0.5, "val_loss")
+    recipe_inst.checkpointer.lifecycle._update_best_checkpoint(str(new_checkpoint), 0.5, "val_loss")
 
     assert read_checkpoint_pointer(tmp_path, "LOWEST_VAL") == new_checkpoint
-    assert recipe_inst._best_val_loss == 0.5
+    assert recipe_inst.checkpointer.lifecycle._best_val_loss == 0.5
 
 
 def test_non_utf8_restored_best_metric_does_not_block_future_best(tmp_path):
@@ -1651,12 +1692,12 @@ def test_non_utf8_restored_best_metric_does_not_block_future_best(tmp_path):
     old_checkpoint.mkdir()
     new_checkpoint.mkdir()
     (old_checkpoint / "losses.json").write_bytes(b"\xff")
-    recipe_inst._update_checkpoint_symlink("LOWEST_VAL", str(old_checkpoint))
+    recipe_inst.checkpointer.lifecycle._update_checkpoint_pointer("LOWEST_VAL", str(old_checkpoint))
 
-    recipe_inst._update_best_symlink(str(new_checkpoint), 0.5, "val_loss")
+    recipe_inst.checkpointer.lifecycle._update_best_checkpoint(str(new_checkpoint), 0.5, "val_loss")
 
     assert read_checkpoint_pointer(tmp_path, "LOWEST_VAL") == new_checkpoint
-    assert recipe_inst._best_val_loss == 0.5
+    assert recipe_inst.checkpointer.lifecycle._best_val_loss == 0.5
 
 
 @pytest.mark.parametrize("non_finite_value", [float("nan"), float("inf"), float("-inf")])
@@ -1667,12 +1708,12 @@ def test_non_finite_live_metric_does_not_replace_best_pointer(tmp_path, non_fini
     new_checkpoint = tmp_path / "epoch_0_step_200"
     old_checkpoint.mkdir()
     new_checkpoint.mkdir()
-    recipe_inst._update_best_symlink(str(old_checkpoint), 0.5, "val_loss")
+    recipe_inst.checkpointer.lifecycle._update_best_checkpoint(str(old_checkpoint), 0.5, "val_loss")
 
-    recipe_inst._update_best_symlink(str(new_checkpoint), non_finite_value, "val_loss")
+    recipe_inst.checkpointer.lifecycle._update_best_checkpoint(str(new_checkpoint), non_finite_value, "val_loss")
 
     assert read_checkpoint_pointer(tmp_path, "LOWEST_VAL") == old_checkpoint
-    assert recipe_inst._best_val_loss == 0.5
+    assert recipe_inst.checkpointer.lifecycle._best_val_loss == 0.5
 
 
 def test_checkpoint_pointer_replace_failure_preserves_existing_target(tmp_path, monkeypatch):
@@ -1682,7 +1723,7 @@ def test_checkpoint_pointer_replace_failure_preserves_existing_target(tmp_path, 
     new_checkpoint = tmp_path / "epoch_0_step_200"
     old_checkpoint.mkdir()
     new_checkpoint.mkdir()
-    recipe_inst._update_checkpoint_symlink("LATEST", str(old_checkpoint))
+    recipe_inst.checkpointer.lifecycle._update_checkpoint_pointer("LATEST", str(old_checkpoint))
     real_replace = os.replace
 
     def fail_latest_replace(source, destination):
@@ -1693,7 +1734,7 @@ def test_checkpoint_pointer_replace_failure_preserves_existing_target(tmp_path, 
     monkeypatch.setattr(os, "replace", fail_latest_replace)
 
     with pytest.raises(OSError, match="filesystem full"):
-        recipe_inst._update_checkpoint_symlink("LATEST", str(new_checkpoint))
+        recipe_inst.checkpointer.lifecycle._update_checkpoint_pointer("LATEST", str(new_checkpoint))
 
     assert read_checkpoint_pointer(tmp_path, "LATEST") == old_checkpoint
     assert not list(tmp_path.glob(".LATEST.*.tmp"))
@@ -1744,7 +1785,7 @@ def test_checkpoint_retention_prune_failure_is_nonfatal(tmp_path, monkeypatch):
     def fail_rmtree(_path):
         raise OSError("checkpoint is busy")
 
-    monkeypatch.setattr("nemo_automodel.recipes.base_recipe.shutil.rmtree", fail_rmtree)
+    monkeypatch.setattr("nemo_automodel.components.checkpoint.lifecycle.shutil.rmtree", fail_rmtree)
 
     x = torch.randn(4, 2)
     loss = recipe_inst.model(x).sum()
@@ -1784,7 +1825,7 @@ def test_checkpoint_retention_async_finalization_prunes_pending_checkpoint(tmp_p
 
     assert _checkpoint_dir_names(tmp_path) == ["epoch_0_step_100", "epoch_0_step_200"]
 
-    recipe_inst._finalize_pending_checkpoint()
+    recipe_inst.checkpointer.finalize()
 
     assert _checkpoint_dir_names(tmp_path) == ["epoch_0_step_200"]
     assert (tmp_path / "LATEST").exists(follow_symlinks=False) or (tmp_path / "LATEST.txt").exists()
@@ -1849,7 +1890,7 @@ class TestMakeProgressBar:
 
     def test_returns_none_on_non_rank0(self, monkeypatch):
         monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
-        monkeypatch.setattr(torch.distributed, "get_rank", lambda: 1)
+        monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: 1)
         r = _make_fake_recipe()
         assert r._make_progress_bar() is None
 

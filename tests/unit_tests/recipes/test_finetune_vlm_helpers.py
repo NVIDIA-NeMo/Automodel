@@ -1574,7 +1574,6 @@ def _create_pp_recipe(model=None):
     recipe = object.__new__(FinetuneRecipeForVLM)
     # Initialize __dict__ directly to bypass BaseRecipe.__setattr__ tracking
     recipe.__dict__["__state_tracked"] = set()
-    recipe.__dict__["_best_val_loss"] = float("inf")
     recipe.__dict__["dist_env"] = SimpleNamespace(device="cpu")
     recipe.__dict__["device_mesh"] = None
     recipe.__dict__["moe_mesh"] = None
@@ -2253,7 +2252,6 @@ def _create_non_pp_recipe(model, device="cpu"):
     recipe = object.__new__(FinetuneRecipeForVLM)
     # Initialize __dict__ directly to bypass BaseRecipe.__setattr__ tracking
     recipe.__dict__["__state_tracked"] = set()
-    recipe.__dict__["_best_val_loss"] = float("inf")
     recipe.__dict__["dist_env"] = SimpleNamespace(device=device)
     recipe.__dict__["device_mesh"] = None
     recipe.__dict__["moe_mesh"] = None
