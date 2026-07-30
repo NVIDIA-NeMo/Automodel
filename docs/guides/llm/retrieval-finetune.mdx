@@ -53,7 +53,7 @@ Before running the examples:
 The examples use `automodel`. From a source checkout, prefix these commands with `uv run`. For direct `torchrun`
 commands, use `uv run torchrun ...` from a source checkout or activate an installed environment first.
 
-Run a one-GPU basic verification test first. The timestamped checkpoint directory keeps this command from silently
+Run a single-GPU basic verification test first. The timestamped checkpoint directory keeps this command from silently
 resuming or appending metrics to an older run:
 
 ```bash
@@ -108,7 +108,7 @@ Choose the recipe that matches your retrieval stage:
 
 The following table compares the recipe components:
 
-| Component | Bi-encoder | Cross-encoder |
+| Component | Bi-Encoder | Cross-Encoder |
 |-----------|------------|---------------|
 | Recipe | `TrainBiEncoderRecipe` | `TrainCrossEncoderRecipe` |
 | Model target | `nemo_automodel.NeMoAutoModelBiEncoder.from_pretrained` | `nemo_automodel.NeMoAutoModelCrossEncoder.from_pretrained` |
@@ -121,7 +121,7 @@ query-passage pair into one sequence and predicts a score for each candidate pas
 
 The following table summarizes the supported model families and their effective retrieval keyword arguments:
 
-| Model `config.model_type` | Bi-encoder behavior | Cross-encoder behavior | Effective retrieval keyword arguments |
+| Model `config.model_type` | Bi-Encoder Behavior | Cross-Encoder Behavior | Effective Retrieval Keyword Arguments |
 |---------------------------|---------------------|------------------------|----------------------------|
 | `llama`, `llama_bidirec` | Uses `LlamaBidirectionalModel` | Uses `LlamaBidirectionalForSequenceClassification` | Bi-encoder: `pooling`, wrapper-level `l2_normalize`, and top-level recipe `temperature`. Cross-encoder: `pooling`, `num_labels`, and `temperature` on the Llama scoring config. |
 | `ministral3`, `ministral3_bidirec` | Uses `Ministral3BidirectionalModel` | Direct cross-encoder scoring is not supported by the custom retrieval registry today. Use a different direct cross-encoder backbone. | Bi-encoder: `pooling`, wrapper-level `l2_normalize`, and top-level recipe `temperature`. |
@@ -137,7 +137,7 @@ classification for cross-encoder scoring.
 
 Treat unregistered decoder-only fallback models as an architecture experiment, not just a drop-in model swap. Registered
 retrieval backbones such as the Llama bidirectional path use retrieval-specific attention behavior. A vanilla
-Hugging Face `AutoModel` fallback can keep the source model's original causal behavior, which may be lower quality for
+Hugging Face `AutoModel` fallback can keep the source model's original causal behavior, which might be lower quality for
 symmetric embedding retrieval.
 
 ## Prepare Data
@@ -145,7 +145,7 @@ symmetric embedding retrieval.
 Use the retrieval dataset format described in [Retrieval Dataset](/datasets/retrieval-dataset). Choose the data path that
 matches the workflow you need:
 
-| Data path | Use when | Notes |
+| Data Path | Use When | Notes |
 |-----------|----------|-------|
 | `hf://` AutoModel retrieval schema | You want a tutorial run or shared public dataset | Requires an AutoModel-style HF subset with a companion corpus split. |
 | Inline JSONL | You want a small custom run without hard-negative mining | Documents are embedded directly in each record. Pure inline records do not provide document IDs for same-document masking. |
@@ -165,19 +165,20 @@ for local and Slurm CPU commands.
 
 The key field requirements differ by source:
 
-| Source | Required query field | Required document fields |
+| Source | Required Query Field | Required Document Fields |
 |--------|----------------------|--------------------------|
 | Corpus ID JSON | `question` | `question_id`, `corpus_id`, non-empty `pos_doc`, and present `neg_doc` |
 | `hf://` AutoModel schema | `question` | Non-empty `pos_doc`. `neg_doc` is optional in the source but required before training with negatives. |
-| Inline JSONL | `query` or `question` | non-empty `pos_doc`, and present `neg_doc` |
+| Inline JSONL | `query` or `question` | Non-empty `pos_doc`, and present `neg_doc` |
 
-`neg_doc` must be present for local JSON and JSONL sources. It may be `[]` only when `n_passages: 1`. When
+`neg_doc` must be present for local JSON and JSONL sources. It can be `[]` only when `n_passages: 1`. When
 `n_passages > 1`, provide at least one negative.
 
 <Warning>
 `n_passages: 1` is useful for schema checks or custom negative strategies, but it is not a good default training setup.
 The standard bi-encoder and cross-encoder recipes need at least one negative candidate for meaningful contrastive or
 reranking supervision, unless you add a custom strategy such as qrels-aware in-batch negatives.
+
 </Warning>
 
 For quick custom experiments, inline JSONL is the simplest format. `RetrievalDatasetConfig` selects the inline loading
@@ -302,8 +303,8 @@ distributed:
 ```
 
 For a cross-encoder, change `recipe`, `model._target_`, `dataset.model_type`, and `dataloader.collate_fn`
-to the cross-encoder values shown below. Also set `model.num_labels: 1`, set the loss temperature under
-`model.temperature`, replace `q_max_len` / `p_max_len` with `rerank_max_length` in the collator, and use a separate
+to the cross-encoder values in the following example. Also set `model.num_labels: 1`, set the loss temperature under
+`model.temperature`, replace `q_max_len` and `p_max_len` with `rerank_max_length` in the collator, and use a separate
 `checkpoint.checkpoint_dir` such as `./output/llama3_2_1b_cross_encoder/checkpoints`.
 
 ## Configure a Bi-Encoder
@@ -461,18 +462,25 @@ gradient_accumulation_steps = global_batch_size / (local_batch_size * data_paral
 For the supported data-parallel FSDP2 configuration, `data_parallel_size` is the total GPU count. For example, two
 8-GPU nodes have `data_parallel_size: 16`.
 
+For Distributed Data Parallel (DDP) recipes, keep `distributed.static_graph: false` whenever
+`gradient_accumulation_steps > 1`. If the model
+contains parameters that do not contribute to the loss, also set `distributed.find_unused_parameters: true` when the
+static graph is disabled. Recalculate the accumulation steps after changing the GPU count, `global_batch_size`, or
+`local_batch_size`. When the result is `1` and the model follows the same execution path on every iteration, you can
+set `distributed.static_graph: true` to reduce DDP overhead.
+
 `local_batch_size` is the number of query groups per rank. For memory pressure, reduce
 `step_scheduler.local_batch_size` first, then sequence lengths (`q_max_len`, `p_max_len`, or `rerank_max_length`), then
 `n_passages`. Bi-encoders scale memory with query length plus `local_batch_size * n_passages` passage sequences.
 Cross-encoders scale with `local_batch_size * n_passages` combined query-passage sequences.
 
 Current retrieval datasets are map-style datasets loaded in each process, not streaming distributed inputs. Pre-cache
-Hugging Face data on each node or use a shared cache, and budget CPU RAM and local disk per rank for corpus-backed datasets.
+Hugging Face data on each node or use a shared cache. Budget CPU RAM and local disk per rank for corpus-backed datasets.
 
 ## Add Validation
 
 Both examples include commented `validation_dataset` and `validation_dataloader` blocks. Enable them when you have a
-held-out retrieval file. Use `RetrievalDatasetConfig` for every supported source; it selects the loading path from the
+held-out retrieval file. Use `RetrievalDatasetConfig` for every supported source. It selects the loading path from the
 source URI and file extension. This corpus-backed example mirrors the shipped configs:
 
 ```yaml
@@ -525,11 +533,10 @@ for RAG candidate generation, evaluate against a fixed held-out corpus and qrels
 
 AutoModel does not currently provide a one-command full-corpus retrieval evaluator in this guide. Use your existing
 information retrieval evaluation stack or a small script around the consolidated checkpoint. Report enough run details
-to make the result repeatable: query count, corpus size, qrels source, judged and unjudged handling, exact versus ANN
-search settings, K values, baseline checkpoint, and whether you used confidence intervals or significance tests. At
-minimum, make these script inputs explicit: a consolidated bi-encoder checkpoint, a corpus table with stable document
-IDs, a query table with stable query IDs, qrels keyed by those IDs, the query and passage prefixes and maximum lengths,
-and the K values to report.
+to make the result repeatable. Include the query count, corpus size, qrels source, judged and unjudged handling, exact
+or ANN search settings, K values, and baseline checkpoint. State whether you used confidence intervals or significance
+tests. At minimum, specify a consolidated bi-encoder checkpoint, corpus and query tables with stable IDs, and qrels
+keyed by those IDs. Also specify the query and passage prefixes, maximum lengths, and K values to report.
 
 For cross-encoders, freeze a first-stage retriever, rerank its top-K candidates, and report reranking metrics on that
 same candidate set. Also report first-stage candidate recall or coverage: if a query's positive document is missing
@@ -540,16 +547,15 @@ cross-encoder candidate-group validation directly to full-corpus bi-encoder metr
 
 Training metrics are written to `training.jsonl` under `checkpoint.checkpoint_dir`. The file logger buffers records in
 chunks before writing and flushes the remaining records on close, so `tail -f` is useful for completed or longer runs
-but may not update during a short basic verification test:
+but might not update during a short basic verification test:
 
 ```bash
 tail -f ./output/llama3_2_1b_encoder/checkpoints/training.jsonl
 ```
 
-Use standard output and error as the live per-step signals today. Watch `loss`, `grad_norm`, learning rate, GPU
-memory, and step time
-before scaling to a longer run. On preempted or timed-out jobs, recent buffered JSONL metrics may be missing even when
-standard output and error showed them.
+Use standard output and error as the live per-step signals today. Watch `loss`, `grad_norm`, learning rate, GPU memory,
+and step time before scaling to a longer run. On preempted or timed-out jobs, recent buffered JSONL metrics might be
+missing even when standard output and error showed them.
 
 The examples include a commented `wandb` block. Enable it when you want remote tracking, and tune
 `step_scheduler.log_remote_every_steps` to control remote logging cadence.
@@ -718,7 +724,7 @@ checkpoint:
   save_consolidated: true
 ```
 
-Each save creates a versioned directory such as:
+Each save creates a versioned directory. The following path is an example:
 
 ```text
 ./output/llama3_2_1b_encoder/checkpoints/epoch_0_step_499/
@@ -728,7 +734,8 @@ Checkpoint directory names use the scheduler step at save time. The saved schedu
 for exact paths prefer the `Saving checkpoint to ...` log line or the `LATEST` pointer over hand-constructing a step
 number.
 
-With `save_consolidated: true` and full fine-tuning, AutoModel also writes a Hugging Face-compatible model under:
+With `save_consolidated: true` and full fine-tuning, AutoModel also writes a Hugging Face-compatible model under the
+following path:
 
 ```text
 ./output/llama3_2_1b_encoder/checkpoints/epoch_0_step_499/model/consolidated/
@@ -739,9 +746,9 @@ direct Hugging Face and mining loads expect a real exported model path. If your 
 symlink, read that file and substitute the resolved checkpoint directory before calling `from_pretrained()` or
 `mine_hard_negatives.py`.
 
-PEFT/LoRA runs save adapter artifacts under the checkpoint `model/` directory instead of the full consolidated export
-path above. Resume LoRA training from the AutoModel checkpoint directory. If you need a standalone checkpoint for
-inference or mining, first produce a Hugging Face-loadable merged encoder with your adapter workflow.
+PEFT runs using LoRA save adapter artifacts under the checkpoint `model/` directory instead of the previously described
+full consolidated export path. Resume LoRA training from the AutoModel checkpoint directory. If you need a standalone
+checkpoint for inference or mining, first produce a Hugging Face-loadable merged encoder with your adapter workflow.
 
 The `LATEST` symlink points to the most recent checkpoint when it is valid. To resume from the latest resolved
 checkpoint, set:

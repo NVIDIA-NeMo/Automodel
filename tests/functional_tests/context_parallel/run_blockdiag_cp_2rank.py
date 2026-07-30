@@ -175,7 +175,7 @@ def _run_case(cp_mesh, device, backend, exch, dtype, seg_lens, pad):
     configure_cp_varlen(attn_backend=backend, kv_exchange=exch)
     x_cp = x_data.clone().requires_grad_(True)
     batch = {"inputs_embeds": x_cp, "_packed_seq_ids": doc_ids.clone()}
-    ctx, sharded = make_cp_blockdiag_batch_and_ctx(cp_mesh, None, batch)
+    ctx, sharded, _ = make_cp_blockdiag_batch_and_ctx(cp_mesh, None, batch)
     x_loc = sharded["inputs_embeds"]  # [B, local_len, E], differentiable slice of x_cp
     with ctx():
         step_state = bd_state._CP_BLOCKDIAG_STATE.get()
