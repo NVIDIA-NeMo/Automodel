@@ -1200,6 +1200,13 @@ def _release_recipe_memory(recipe) -> None:
         return
     _start_preflight_watchdog()
     try:
+        if torch.cuda.is_available():
+            _report_phase("Teardown: synchronizing pending CUDA work")
+            torch.cuda.synchronize()
+            _report_phase("Teardown: pending CUDA work synchronized")
+        _barrier()
+        _report_phase("Teardown: all ranks synchronized")
+
         _report_phase("Teardown: clearing optimizer state")
         optimizers = getattr(recipe, "optimizer", None)
         if not isinstance(optimizers, (list, tuple)):
@@ -1210,12 +1217,24 @@ def _release_recipe_memory(recipe) -> None:
                 opt.param_groups.clear()
             except Exception:
                 pass
-        _report_phase("Teardown: optimizer state cleared; dropping recipe references")
-        recipe.model_parts = None
+        _report_phase("Teardown: optimizer state cleared; dropping schedulers")
         recipe.optimizer = None
         if getattr(recipe, "lr_scheduler", None) is not None:
             recipe.lr_scheduler = None
-        _report_phase("Teardown: recipe references dropped; starting Python GC")
+        if getattr(recipe, "step_scheduler", None) is not None:
+            recipe.step_scheduler = None
+
+        _report_phase("Teardown: schedulers dropped; dropping dataloaders")
+        for attr_name in ("dataloader", "val_dataloader", "val_dataloaders"):
+            if hasattr(recipe, attr_name):
+                setattr(recipe, attr_name, None)
+
+        _report_phase("Teardown: dataloaders dropped; dropping pipeline and model")
+        recipe.model_parts = None
+        if getattr(recipe, "pp", None) is not None:
+            recipe.pp = None
+
+        _report_phase("Teardown: pipeline and model dropped; starting Python GC")
         gc.collect()
         _report_phase("Teardown: Python GC complete")
         if torch.cuda.is_available():
