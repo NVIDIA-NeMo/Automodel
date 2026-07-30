@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import gc
-import logging
 import re
 from typing import Any, Optional
 
@@ -28,8 +27,6 @@ from nemo_automodel.components.moe.state_dict_utils import (
     should_load_expert_for_rank,
     split_experts_weights_dtensor_aware,
 )
-
-logger = logging.getLogger(__name__)
 
 # Native LoRA suffixes for grouped MoE expert tensors
 _LORA_EXPERT_SUFFIXES = ("lora_gate_and_up_A", "lora_gate_and_up_B", "lora_down_A", "lora_down_B")
@@ -263,16 +260,24 @@ class MoESplitExpertsStateDictMixin:
         expert_segment = self._expert_path_segment
         suffix = fqn.rsplit(".", 1)[-1]
 
+        # PEFT ParamWrapper nesting: target_parameters are sorted alphabetically
+        # and wrapped in order. The FIRST wrapped becomes the OUTER ParamWrapper.
+        # "down_proj" < "gate_up_proj", so down_proj is outer (no base_layer prefix)
+        # and gate_up_proj is inner (has base_layer prefix).
         if suffix == "lora_gate_and_up_B":
+            # (E, r, 2*I) -> (r*E, 2*I)
             out = tensor.reshape(-1, tensor.shape[2]).contiguous()
             pw_suffix = "base_layer.lora_A.weight"
         elif suffix == "lora_gate_and_up_A":
+            # (E, H, r) -> permute(1,2,0) -> (H, r, E) -> (H, r*E)
             out = tensor.permute(1, 2, 0).contiguous().reshape(tensor.shape[1], -1)
             pw_suffix = "base_layer.lora_B.weight"
         elif suffix == "lora_down_B":
+            # (E, r, H) -> (r*E, H)
             out = tensor.reshape(-1, tensor.shape[2]).contiguous()
             pw_suffix = "lora_A.weight"
         elif suffix == "lora_down_A":
+            # (E, I, r) -> permute(1,2,0) -> (I, r, E) -> (I, r*E)
             out = tensor.permute(1, 2, 0).contiguous().reshape(tensor.shape[1], -1)
             pw_suffix = "lora_B.weight"
         else:
@@ -297,6 +302,7 @@ class MoESplitExpertsStateDictMixin:
         expert_segment = re.escape(self._expert_path_segment)
         n_experts = self.moe_config.n_routed_experts
 
+        # Detect ParamWrapper keys
         pw_pattern = re.compile(
             rf"(?P<prefix>.*)layers\.(?P<layer>\d+)\.{expert_segment}\."
             rf"(?P<pw_suffix>(?:base_layer\.)?lora_[AB]\.weight)$"
@@ -311,10 +317,13 @@ class MoESplitExpertsStateDictMixin:
                 continue
 
             pw_suffix = m.group("pw_suffix")
+            # Preserve the full prefix from the input key (e.g. "base_model.model.model.")
+            # so downstream prefix stripping (_drop_outer_prefix) works correctly.
             prefix = m.group("prefix")
             layer_num = m.group("layer")
             base_key = f"{prefix}layers.{layer_num}.{self._expert_path_segment}"
 
+            # down_proj is outer (no base_layer), gate_up_proj is inner (base_layer)
             if pw_suffix == "lora_A.weight":
                 # (r*E, H) -> (E, r, H) = lora_down_B
                 r = tensor.shape[0] // n_experts

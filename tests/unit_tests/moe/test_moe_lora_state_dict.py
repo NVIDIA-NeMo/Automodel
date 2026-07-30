@@ -18,12 +18,17 @@ Verifies that GroupedExpertsLoRA adapter weights are correctly converted to
 per-expert HF PEFT format and back, enabling merge via AutoPeftModelForCausalLM.
 """
 
+import re
+
 import pytest
 import torch
 import torch.nn as nn
 
 from nemo_automodel.components._peft.lora import PeftConfig, apply_lora_to_linear_modules
-from nemo_automodel.components.checkpoint.addons import _extract_target_modules
+from nemo_automodel.components.checkpoint.addons import (
+    _extract_target_modules,
+    _extract_target_parameters,
+)
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.layers import GroupedExperts
 from nemo_automodel.components.moe.state_dict_mixin import MoESplitExpertsStateDictMixin
@@ -422,6 +427,60 @@ class TestExtractTargetModulesWithMoELoRA:
         for name in target_modules:
             assert "lora_gate_and_up" not in name
             assert "lora_down" not in name
+
+
+class TestExtractTargetsV5Defaults:
+    """v5 (``v4_compatible=False``) is the production default.
+
+    The v4 tests above all pass ``v4_compatible=True``, so the defaults that
+    actually ship were unasserted: ``target_parameters`` carries the fused
+    ParamWrapper paths and ``target_modules`` skips the per-expert expansion.
+    CPU-only — none of this touches a device.
+    """
+
+    def test_target_parameters_are_the_fused_expert_paths(self):
+        model = _make_tiny_moe_model()
+
+        assert _extract_target_parameters(model) == [
+            "mlp.experts.gate_up_proj",
+            "mlp.experts.down_proj",
+        ]
+
+    def test_target_parameters_empty_in_v4_mode(self):
+        """v4 expresses experts through target_modules instead."""
+        model = _make_tiny_moe_model()
+
+        assert _extract_target_parameters(model, v4_compatible=True) == []
+
+    def test_no_per_expert_expansion_in_v5(self):
+        """The v4 path emits layers.N.mlp.experts.<eid>.*; v5 must not."""
+        model = _make_tiny_moe_model()
+
+        target_modules = _extract_target_modules(model)
+
+        assert not [n for n in target_modules if re.search(r"experts\.\d+\.", n)]
+
+    def test_v4_and_v5_are_mutually_exclusive(self):
+        """Exactly one of the two mechanisms describes the experts."""
+        model = _make_tiny_moe_model()
+
+        v5_modules = _extract_target_modules(model)
+        v5_params = _extract_target_parameters(model)
+        v4_modules = _extract_target_modules(model, v4_compatible=True)
+        v4_params = _extract_target_parameters(model, v4_compatible=True)
+
+        assert v5_params and not v5_modules
+        assert v4_modules and not v4_params
+
+    def test_target_parameters_empty_without_a_moe_adapter(self):
+        """A non-MoE model must not gain fused expert paths."""
+        assert _extract_target_parameters(nn.Module()) == []
+
+    def test_accepts_a_list_of_pp_parts(self):
+        """Under PP the caller passes this rank's stages; the first is representative."""
+        model = _make_tiny_moe_model()
+
+        assert _extract_target_parameters([model]) == _extract_target_parameters(model)
 
 
 # ---------------------------------------------------------------------------
