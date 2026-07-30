@@ -50,7 +50,6 @@ model:
     rms_norm: torch_fp32
     rope_fusion: false
     experts: torch_mm
-    experts_storage: fp8
     dispatcher: hybridep
     gate_precision: float32
     fake_balanced_gate: false
