@@ -1932,13 +1932,19 @@ class TestPermuteTokensForGroupedMM:
         weights = torch.tensor([[0.7, 0.3]], device=device)
         token_mask = torch.ones(1, dtype=torch.bool, device=device)
 
-        sorted_ids, sorted_weights, tpe, offs = _permute_tokens_for_grouped_mm(
-            indices, weights, token_mask, n_local_experts=2, experts_start_idx=0
+        sorted_ids, sorted_slots, sorted_weights, tpe, offs = _permute_tokens_for_grouped_mm(
+            indices,
+            weights,
+            token_mask,
+            n_local_experts=2,
+            experts_start_idx=0,
+            return_slot_ids=True,
         )
 
         # Sorted by expert: expert 0 first (weight 0.3), expert 1 second (weight 0.7)
         assert tpe[0].item() == 1  # expert 0
         assert tpe[1].item() == 1  # expert 1
+        torch.testing.assert_close(sorted_slots, torch.tensor([1, 0], device=device))
         torch.testing.assert_close(sorted_weights[0], torch.tensor(0.3, device=device))
         torch.testing.assert_close(sorted_weights[1], torch.tensor(0.7, device=device))
 

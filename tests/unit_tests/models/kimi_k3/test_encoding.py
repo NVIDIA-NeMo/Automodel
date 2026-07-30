@@ -15,6 +15,7 @@
 import pytest
 
 from nemo_automodel.components.models.kimi_k3.encoding import build_chat_segments
+from nemo_automodel.components.models.kimi_k3.tokenization import TikTokenTokenizer
 
 
 def test_medium_thinking_effort_is_rendered():
@@ -33,3 +34,52 @@ def test_invalid_thinking_effort_raises_value_error():
             [{"role": "user", "content": "Hello"}],
             thinking_effort="extreme",
         )
+
+
+def test_assistant_segments_produce_direct_token_loss_mask():
+    segments = build_chat_segments(
+        [
+            {"role": "user", "content": "Question"},
+            {"role": "assistant", "content": "Answer"},
+        ],
+        add_generation_prompt=False,
+        thinking=False,
+    )
+    tokenizer = object.__new__(TikTokenTokenizer)
+    tokenizer._encode_text_piece = lambda text, allow_special_tokens: list(text.encode())
+
+    token_ids, assistant_mask = tokenizer._encode_chat_segments(
+        segments,
+        return_assistant_tokens_mask=True,
+    )
+    rendered = "".join(segment.text for segment in segments)
+    assistant_start = rendered.index("<|open|>response")
+
+    assert len(token_ids) == len(assistant_mask)
+    assert not any(assistant_mask[:assistant_start])
+    assert all(assistant_mask[assistant_start:])
+
+
+def test_single_chat_return_dict_is_not_batched(monkeypatch):
+    tokenizer = object.__new__(TikTokenTokenizer)
+    monkeypatch.setattr(
+        tokenizer,
+        "pad",
+        lambda *args, **kwargs: {
+            "input_ids": [[11, 12, 99]],
+            "attention_mask": [[1, 1, 0]],
+        },
+    )
+
+    output = tokenizer._format_chat_token_output(
+        [[11, 12]],
+        is_batched=False,
+        padding="max_length",
+        max_length=3,
+        return_dict=True,
+        assistant_masks=[[0, 1]],
+    )
+
+    assert output["input_ids"] == [11, 12, 99]
+    assert output["attention_mask"] == [1, 1, 0]
+    assert output["assistant_masks"] == [0, 1, 0]

@@ -13,6 +13,7 @@ from tiktoken.load import load_tiktoken_bpe
 from tokenizers import AddedToken
 from transformers.convert_slow_tokenizer import bytes_to_unicode
 from transformers.tokenization_utils import PreTrainedTokenizer
+from transformers.tokenization_utils_base import BatchEncoding
 
 from .encoding import build_chat_segments, is_batched_conversation
 
@@ -136,6 +137,10 @@ class TikTokenTokenizer(PreTrainedTokenizer):
             if i in self.decoder:
                 self.encoder[self.decoder[i]] = i
 
+        # K3 renders XTML natively instead of evaluating this Jinja string. The
+        # generation block advertises direct assistant-mask support to generic
+        # Transformers/ChatDataset callers.
+        kwargs.setdefault("chat_template", "{% generation %}{% endgeneration %}")
         super().__init__(
             bos_token=bos_token,
             eos_token=eos_token,
@@ -247,15 +252,25 @@ class TikTokenTokenizer(PreTrainedTokenizer):
                     current_slice_len = 1
         yield s[slice_start:]
 
-    def _encode_chat_segments(self, segments) -> List[int]:
+    def _encode_chat_segments(
+        self,
+        segments,
+        *,
+        return_assistant_tokens_mask: bool = False,
+    ) -> List[int] | tuple[List[int], List[int]]:
         token_ids: List[int] = []
+        assistant_mask: List[int] = []
         for segment in segments:
-            token_ids.extend(
-                self._encode_text_piece(
-                    segment.text,
-                    allow_special_tokens=segment.allow_special,
-                )
+            segment_ids = self._encode_text_piece(
+                segment.text,
+                allow_special_tokens=segment.allow_special,
             )
+            token_ids.extend(segment_ids)
+            if return_assistant_tokens_mask:
+                assistant_mask.extend([int(segment.is_assistant)] * len(segment_ids))
+
+        if return_assistant_tokens_mask:
+            return token_ids, assistant_mask
         return token_ids
 
     @staticmethod
@@ -274,8 +289,13 @@ class TikTokenTokenizer(PreTrainedTokenizer):
         max_length: Optional[int] = None,
         return_tensors=None,
         return_dict: bool = False,
+        assistant_masks: Optional[List[List[int]]] = None,
     ):
         encoded_inputs = [self._truncate(ids, truncation=truncation, max_length=max_length) for ids in encoded_inputs]
+        if assistant_masks is not None:
+            assistant_masks = [
+                self._truncate(mask, truncation=truncation, max_length=max_length) for mask in assistant_masks
+            ]
 
         needs_batch_encoding = is_batched or padding or return_tensors is not None or return_dict
         if not needs_batch_encoding:
@@ -287,10 +307,23 @@ class TikTokenTokenizer(PreTrainedTokenizer):
             padding=padding,
             max_length=max_length if padding else None,
             return_attention_mask=True,
-            return_tensors=return_tensors,
+            return_tensors=None,
         )
+        if assistant_masks is not None:
+            padded_masks = []
+            for mask, input_ids in zip(assistant_masks, batch["input_ids"], strict=True):
+                difference = len(input_ids) - len(mask)
+                if difference < 0:
+                    raise ValueError("K3 assistant mask is longer than its padded input IDs.")
+                padding_values = [0] * difference
+                padded_masks.append(padding_values + mask if self.padding_side == "left" else mask + padding_values)
+            batch["assistant_masks"] = padded_masks
+        if return_tensors is not None:
+            batch = BatchEncoding(batch, tensor_type=return_tensors)
 
         if return_dict:
+            if not is_batched and return_tensors is None:
+                return BatchEncoding({key: value[0] for key, value in batch.items()})
             return batch
         if is_batched:
             return batch["input_ids"]
@@ -340,13 +373,14 @@ class TikTokenTokenizer(PreTrainedTokenizer):
         conversation,
         tools: Optional[list[dict]] = None,
         tokenize: bool = False,
-        add_generation_prompt: bool = True,
+        add_generation_prompt: bool = False,
         thinking: bool = True,
         padding=False,
         truncation: bool = False,
         max_length: Optional[int] = None,
         return_tensors=None,
         return_dict: bool = False,
+        return_assistant_tokens_mask: bool = False,
         **kwargs,
     ):
         # Tokenizer-level rendering reorders tool result messages to match
@@ -377,7 +411,20 @@ class TikTokenTokenizer(PreTrainedTokenizer):
             rendered = ["".join(segment.text for segment in segments) for segments in segment_batches]
             return rendered if is_batched else rendered[0]
 
-        encoded_inputs = [self._encode_chat_segments(segments) for segments in segment_batches]
+        encoded_inputs: List[List[int]] = []
+        assistant_masks: Optional[List[List[int]]] = [] if return_assistant_tokens_mask else None
+        for segments in segment_batches:
+            encoded = self._encode_chat_segments(
+                segments,
+                return_assistant_tokens_mask=return_assistant_tokens_mask,
+            )
+            if return_assistant_tokens_mask:
+                token_ids, assistant_mask = encoded
+                encoded_inputs.append(token_ids)
+                assert assistant_masks is not None
+                assistant_masks.append(assistant_mask)
+            else:
+                encoded_inputs.append(encoded)
         return self._format_chat_token_output(
             encoded_inputs,
             is_batched=is_batched,
@@ -386,4 +433,5 @@ class TikTokenTokenizer(PreTrainedTokenizer):
             max_length=max_length,
             return_tensors=return_tensors,
             return_dict=return_dict,
+            assistant_masks=assistant_masks,
         )

@@ -9,7 +9,9 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event.label.name || 'main' }}-${{ github.event_name }}
-  cancel-in-progress: true
+  # PR updates can supersede stale runs, but main must finish populating the
+  # canonical CUDA wheelhouse cache used by every copied PR branch.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   TORCH_CU_INDEX: https://download.pytorch.org/whl/cu130
@@ -17,7 +19,7 @@ env:
 
 jobs:
   pre-flight:
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.64.2
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@d211550f7cfe04e657ed568ce28bef620457b94f # v0.64.2
 
   setup-install-image:
     runs-on: ubuntu-latest
@@ -43,10 +45,10 @@ jobs:
         python-version: ["3.10", "3.11", "3.12"]
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: ${{ matrix.python-version }}
 
@@ -59,7 +61,7 @@ jobs:
           pip install "."
 
       - name: Checkout check-imports
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           repository: NVIDIA-NeMo/FW-CI-templates
           ref: v0.39.0
@@ -87,10 +89,10 @@ jobs:
         python-version: ["3.12"]
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: ${{ matrix.python-version }}
 
@@ -107,7 +109,7 @@ jobs:
           python -m pip install --upgrade pip
 
       - name: Set up UV
-        uses: astral-sh/setup-uv@v1
+        uses: astral-sh/setup-uv@162b8acf397cb069dec09a3f5a9847cf71cfa46a # v1
         with:
           version: 0.9.26
 
@@ -135,12 +137,12 @@ jobs:
 
           export PATH="./bin/:$PATH"
 
-          uv sync --link-mode copy --locked --all-groups --extra all
+          uv sync --link-mode copy --locked --all-groups --no-group magi --extra all
 
           uv pip install --no-deps -e .
 
       - name: Checkout check-imports
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           repository: NVIDIA-NeMo/FW-CI-templates
           ref: v0.39.0
@@ -169,61 +171,63 @@ jobs:
     env:
       WHEELHOUSE_DIR: /tmp/cuda-wheelhouse
       TORCH_CUDA_ARCH_LIST: "9.0 10.0 12.0"
+      PLATFORM_MACHINE: x86_64
+      PYTHON_VERSION: ${{ matrix.python-version }}
+      SYS_PLATFORM: linux
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: ${{ matrix.python-version }}
 
+      - name: Compute CUDA wheelhouse cache key
+        id: cuda-wheelhouse-key
+        shell: bash
+        run: |
+          fingerprint="$(
+            python scripts/cuda_wheelhouse_lock.py \
+              --output fingerprint \
+              --lock uv.lock \
+              --torch-index "${TORCH_CU_INDEX}" \
+              --python-version "${PYTHON_VERSION}" \
+              --platform-machine "${PLATFORM_MACHINE}" \
+              --sys-platform "${SYS_PLATFORM}" \
+              --runner-os "${RUNNER_OS}" \
+              --cuda-container-image "${CUDA_CONTAINER_IMAGE}" \
+              --torch-cuda-arch-list "${TORCH_CUDA_ARCH_LIST}" \
+              --build-script .github/scripts/build-cuda-wheelhouse.sh
+          )"
+          echo "key=install-test-cuda-wheelhouse-v3-${RUNNER_OS}-py${PYTHON_VERSION}-${fingerprint}" >> "$GITHUB_OUTPUT"
+
       # Keep the canonical wheelhouse on main. Copied PR branches restore it
       # without creating duplicate branch-scoped multi-GB cache entries.
+      # Use exact keys only: pip wheel cannot incrementally consume an older
+      # wheelhouse, so a prefix fallback downloads gigabytes before rebuilding.
       - name: Restore and save CUDA wheelhouse cache
         id: cuda-wheelhouse-cache-main
         if: github.ref == 'refs/heads/main'
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ${{ env.WHEELHOUSE_DIR }}
-          key: install-test-cuda-wheelhouse-${{ runner.os }}-py${{ matrix.python-version }}-${{ hashFiles('pyproject.toml', 'uv.lock', '.github/workflows/install-test.yml') }}
-          restore-keys: |
-            install-test-cuda-wheelhouse-${{ runner.os }}-py${{ matrix.python-version }}-
-            install-test-cuda-wheelhouse-${{ runner.os }}-
+          key: ${{ steps.cuda-wheelhouse-key.outputs.key }}
 
       - name: Restore CUDA wheelhouse cache
         id: cuda-wheelhouse-cache-branch
         if: github.ref != 'refs/heads/main'
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ${{ env.WHEELHOUSE_DIR }}
-          key: install-test-cuda-wheelhouse-${{ runner.os }}-py${{ matrix.python-version }}-${{ hashFiles('pyproject.toml', 'uv.lock', '.github/workflows/install-test.yml') }}
-          restore-keys: |
-            install-test-cuda-wheelhouse-${{ runner.os }}-py${{ matrix.python-version }}-
-            install-test-cuda-wheelhouse-${{ runner.os }}-
+          key: ${{ steps.cuda-wheelhouse-key.outputs.key }}
 
       - name: Build cached CUDA dependency wheels
         if: |
           steps.cuda-wheelhouse-cache-main.outputs.cache-hit != 'true'
           && steps.cuda-wheelhouse-cache-branch.outputs.cache-hit != 'true'
         shell: bash -x -e -u -o pipefail {0}
-        run: |
-          python -m venv ./venv
-
-          . ./venv/bin/activate
-
-          pip install --upgrade pip
-          pip install --index-url ${TORCH_CU_INDEX} "torch>=2.9.0"
-          pip install numpy packaging psutil pybind11 setuptools wheel wheel_stub
-
-          mkdir -p "${WHEELHOUSE_DIR}"
-          pip wheel --no-deps --no-build-isolation --wheel-dir "${WHEELHOUSE_DIR}" \
-            causal-conv1d \
-            "flash-attn<=2.8.3" \
-            mamba-ssm \
-            nv-grouped-gemm \
-            transformer-engine-torch \
-            "transformer-engine[pytorch]>=2.14.1"
+        run: .github/scripts/build-cuda-wheelhouse.sh
 
       - name: Verify CUDA wheelhouse contents
         shell: bash -x -e -u -o pipefail {0}
@@ -237,7 +241,7 @@ jobs:
           test -n "$(ls -1 "${WHEELHOUSE_DIR}"/transformer_engine_torch*.whl 2>/dev/null)"
 
       - name: Upload CUDA wheelhouse artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: cuda-wheelhouse-py${{ matrix.python-version }}
           path: ${{ env.WHEELHOUSE_DIR }}/*.whl
@@ -264,10 +268,10 @@ jobs:
       WHEELHOUSE_DIR: /tmp/cuda-wheelhouse
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Download cached CUDA wheelhouse
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           name: cuda-wheelhouse-py${{ matrix.python-version }}
           path: ${{ env.WHEELHOUSE_DIR }}
@@ -287,21 +291,45 @@ jobs:
           export PIP_FIND_LINKS="${WHEELHOUSE_DIR}"
           export PIP_PREFER_BINARY=1
 
-          pip install --upgrade pip
-
           PIP_ARGS=()
 
           if [[ $EXTRA == *"fa"* || $EXTRA == *"cuda"* || $EXTRA == *"all"* ]]; then
-            pip install --find-links "${PIP_FIND_LINKS}" --index-url ${TORCH_CU_INDEX} "torch>=2.9.0"
-            pip install --find-links "${PIP_FIND_LINKS}" numpy packaging psutil pybind11 setuptools wheel wheel_stub
-            PIP_ARGS=(--no-build-isolation)
+            LOCK_ARGS=(
+              --lock uv.lock
+              --torch-index "${TORCH_CU_INDEX}"
+              --python-version "${{ matrix.python-version }}"
+              --platform-machine x86_64
+              --sys-platform linux
+            )
+            TORCH_REQUIREMENT="$(
+              python scripts/cuda_wheelhouse_lock.py --output torch "${LOCK_ARGS[@]}"
+            )"
+            TORCHVISION_REQUIREMENT="$(
+              python scripts/cuda_wheelhouse_lock.py --output torchvision "${LOCK_ARGS[@]}"
+            )"
+            BUILD_TOOLS="$(
+              python scripts/cuda_wheelhouse_lock.py --output build-tools "${LOCK_ARGS[@]}"
+            )"
+            mapfile -t BUILD_TOOL_REQUIREMENTS <<< "${BUILD_TOOLS}"
+            CONSTRAINTS_FILE="${RUNNER_TEMP}/cuda-wheelhouse-constraints.txt"
+            python scripts/cuda_wheelhouse_lock.py \
+              --output constraints \
+              "${LOCK_ARGS[@]}" > "${CONSTRAINTS_FILE}"
+
+            pip install --find-links "${PIP_FIND_LINKS}" "${BUILD_TOOL_REQUIREMENTS[@]}"
+            pip install \
+              --find-links "${PIP_FIND_LINKS}" \
+              --index-url "${TORCH_CU_INDEX}" \
+              "${TORCH_REQUIREMENT}" \
+              "${TORCHVISION_REQUIREMENT}"
+            PIP_ARGS=(--no-build-isolation --constraint "${CONSTRAINTS_FILE}")
             export TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0"
           fi
 
           pip install --find-links "${PIP_FIND_LINKS}" ${PIP_ARGS[@]} .$EXTRA
 
       - name: Checkout check-imports
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           repository: NVIDIA-NeMo/FW-CI-templates
           ref: v0.39.0
@@ -327,10 +355,10 @@ jobs:
         arch: ["${{ vars.LINT_AND_INSTALL_TEST_RUNNER || 'ubuntu-latest' }}", "macos-latest"]
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Set up UV
-        uses: astral-sh/setup-uv@v1
+        uses: astral-sh/setup-uv@162b8acf397cb069dec09a3f5a9847cf71cfa46a # v1
         with:
           version: 0.9.26
 
@@ -349,12 +377,12 @@ jobs:
 
           uv sync --link-mode copy --locked --only-group build
 
-          uv sync --link-mode copy --locked --all-groups
+          uv sync --link-mode copy --locked --all-groups --no-group magi
 
           uv pip install --no-deps -e .
 
       - name: Checkout check-imports
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           repository: NVIDIA-NeMo/FW-CI-templates
           ref: v0.39.0
@@ -379,7 +407,7 @@ jobs:
       && !cancelled()
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Get workflow result
         id: result

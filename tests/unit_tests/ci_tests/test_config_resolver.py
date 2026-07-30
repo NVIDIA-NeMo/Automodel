@@ -365,6 +365,8 @@ def test_vlm_checkpoint_robustness_recipes_resolve(tmp_path, recipe_path):
     assert resolved["checkpoint"]["save_consolidated"] is True
     assert robustness["check_source_load_parity"] is True
     assert robustness["tokenizer_name"] == resolved["model"]["pretrained_model_name_or_path"]
+    if Path(recipe_path).stem == "gemma4_26b_a4b_moe":
+        assert resolved["distributed"]["multimodal"]["frozen_sharding"] == "replicate"
     pp_size = resolved["distributed"].get("pp_size", 1)
     pp_microbatch_size = resolved["distributed"].get("pipeline", {}).get("pp_microbatch_size", 1)
     assert resolved["step_scheduler"]["local_batch_size"] // pp_microbatch_size >= pp_size
@@ -374,12 +376,47 @@ def test_vlm_checkpoint_robustness_recipes_resolve(tmp_path, recipe_path):
         assert robustness["hf_source_post_load_dequantize"] is True
     if Path(recipe_path).stem == "qwen3_vl_moe_30b_te_deepep":
         assert robustness["resume_loss_threshold"] == 1e-2
+    if Path(recipe_path).stem == "qwen3_5_35b":
+        assert robustness["experts_implementation"] == "grouped_mm"
+        for key in (
+            "hf_keep_in_fp32_modules",
+            "resume_loss_threshold",
+        ):
+            assert key not in robustness
+        assert robustness["hf_kl_threshold"] == 1e-1
+        assert robustness["source_load_cosine_threshold"] == 0.9985
+        assert robustness["source_load_kl_threshold"] == 1e-1
+        assert robustness["source_load_mean_kl_threshold"] == 1e-2
+        assert resolved["loss_fn"]["_target_"] == (
+            "nemo_automodel.components.loss.chunked_ce.ChunkedCrossEntropy"
+        )
+        assert resolved["model"]["backend"]["experts"] == "torch_mm"
+        assert resolved["step_scheduler"]["global_batch_size"] == 16
+        assert resolved["step_scheduler"]["local_batch_size"] == 1
     assert "known_issue_id" not in resolved["ci"]
     assert "allow_failure" not in resolved["ci"]
     assert "check_source_load_parity" not in resolved
     assert "hf_device_map_auto" not in resolved
     assert "hf_source_post_load_dequantize" not in resolved
     assert "tokenizer_name" not in resolved
+
+
+@pytest.mark.parametrize(
+    "recipe_path",
+    [
+        "examples/long_context_validation/gemma4_31B/gemma4_31b_base_coderforge_cp8_64k_1e5_800steps.yaml",
+        "examples/vlm_finetune/gemma4/gemma4_31b_tulu3_text_cp8_16k.yaml",
+        "examples/vlm_finetune/gemma4/gemma4_e4b_tulu3_text_cp16_64k.yaml",
+        "examples/vlm_finetune/gemma4_joint_drafter/gemma4_4b_joint_drafter_tulu_magicoder_mix.yaml",
+        "examples/vlm_finetune/gemma4_joint_drafter/gemma4_31b_joint_drafter_tulu_magicoder_mix.yaml",
+    ],
+)
+def test_rank_uniform_text_only_vlm_recipes_opt_into_per_layer(recipe_path):
+    """Text-only recipes may retain the faster legacy sharding when every rank skips the frozen tower."""
+    resolved = yaml.load((REPO_ROOT / recipe_path).read_text())
+
+    assert resolved["freeze_config"]["freeze_vision_tower"] is True
+    assert resolved["distributed"]["multimodal"]["frozen_sharding"] == "per_layer"
 
 
 def test_end_to_end_dry_run_does_not_write(tmp_path, synthetic_recipe):
