@@ -26,7 +26,9 @@ Launch: torchrun --nproc-per-node=<N> -m pytest <this_file> -c <config.yaml>
 
 from __future__ import annotations
 
+import faulthandler
 import gc
+import json
 import os
 import sys
 import time
@@ -521,6 +523,75 @@ def _source_load_sync_paths(cfg) -> tuple[Path, Path, Path]:
     checkpoint_dir = Path(cfg.checkpoint.checkpoint_dir)
     sync_dir = checkpoint_dir.parent / f".source_load_parity_{_source_load_run_id()}"
     return sync_dir, sync_dir / "done", sync_dir / "fail"
+
+
+def _input_ids_sync_paths(cfg) -> tuple[Path, Path, Path, Path]:
+    """Return pre-init input-ID payload and status paths."""
+    checkpoint_dir = Path(cfg.checkpoint.checkpoint_dir)
+    sync_dir = checkpoint_dir.parent / f".checkpoint_robustness_input_ids_{_source_load_run_id()}"
+    return sync_dir, sync_dir / "input_ids.json", sync_dir / "done", sync_dir / "fail"
+
+
+def _wait_for_input_ids_rank0(done_path: Path, fail_path: Path) -> None:
+    """Wait for rank 0 to tokenize the checkpoint-robustness prompt."""
+    timeout_s = int(os.environ.get("CHECKPOINT_INPUT_IDS_TIMEOUT_SECONDS", "1800"))
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if done_path.exists():
+            return
+        if fail_path.exists():
+            raise RuntimeError(f"Rank 0 input-ID loading failed:\n{fail_path.read_text()}")
+        time.sleep(5)
+    raise TimeoutError(f"Timed out waiting {timeout_s}s for rank 0 input-ID loading")
+
+
+def _load_input_ids_once(
+    cfg,
+    input_ids_loader: Callable[[str | None], list[int]],
+    tokenizer_name: str | None,
+) -> list[int]:
+    """Load dynamic input IDs once before distributed initialization.
+
+    The tokenizer and processor imports are I/O-heavy on shared filesystems.
+    Loading on every worker can turn a cold import into a multi-node import
+    storm, so rank 0 writes the small result for the other ranks to read.
+    """
+    if tokenizer_name is None or _preinit_world_size() == 1:
+        return input_ids_loader(tokenizer_name)
+
+    sync_dir, payload_path, done_path, fail_path = _input_ids_sync_paths(cfg)
+    if _preinit_global_rank() != 0:
+        _wait_for_input_ids_rank0(done_path, fail_path)
+        return [int(token_id) for token_id in json.loads(payload_path.read_text())]
+
+    sync_dir.mkdir(parents=True, exist_ok=True)
+    payload_path.unlink(missing_ok=True)
+    done_path.unlink(missing_ok=True)
+    fail_path.unlink(missing_ok=True)
+    try:
+        input_ids = input_ids_loader(tokenizer_name)
+        temporary_payload_path = payload_path.with_suffix(".tmp")
+        temporary_payload_path.write_text(json.dumps(input_ids))
+        temporary_payload_path.replace(payload_path)
+    except Exception:
+        fail_path.write_text(traceback.format_exc())
+        raise
+    else:
+        done_path.write_text("ok\n")
+        return input_ids
+
+
+def _cleanup_input_ids_sync(cfg) -> None:
+    """Best-effort cleanup of pre-init input-ID synchronization files."""
+    sync_dir, payload_path, done_path, fail_path = _input_ids_sync_paths(cfg)
+    if not sync_dir.exists():
+        return
+    for path in (payload_path, payload_path.with_suffix(".tmp"), done_path, fail_path):
+        path.unlink(missing_ok=True)
+    try:
+        sync_dir.rmdir()
+    except OSError:
+        pass
 
 
 def _wait_for_source_load_rank0(done_path: Path, fail_path: Path) -> None:
@@ -1076,6 +1147,20 @@ def _report_phase(message: str) -> None:
         print(f"[checkpoint_robustness][{time.strftime('%H:%M:%S')}] {message}", file=stream, flush=True)
 
 
+def _start_preflight_watchdog() -> None:
+    """Schedule repeated rank-0 tracebacks if checkpoint preflight stalls."""
+    if _preinit_global_rank() == 0:
+        stream = sys.__stderr__ or sys.stderr
+        faulthandler.enable(file=stream)
+        faulthandler.dump_traceback_later(300, repeat=True, file=stream)
+
+
+def _stop_preflight_watchdog() -> None:
+    """Cancel the checkpoint-preflight traceback timer on success."""
+    if _preinit_global_rank() == 0:
+        faulthandler.cancel_dump_traceback_later()
+
+
 def _barrier():
     if dist.is_initialized():
         dist.barrier()
@@ -1156,8 +1241,13 @@ def run_checkpoint_robustness(
     source_load_cosine_threshold = float(custom_args.get("source_load_cosine_threshold", "0.9999"))
     deferred_failures: list[str] = []
 
-    input_ids = input_ids_loader(tokenizer_name)
+    _report_phase("Preflight: parsing resolved config")
     cfg = parse_args_and_load_config()
+    _report_phase("Preflight: resolved config parsed")
+    _report_phase("Preflight: loading prompt input IDs")
+    input_ids = _load_input_ids_once(cfg, input_ids_loader, tokenizer_name)
+    _report_phase("Preflight: prompt input IDs ready")
+    _stop_preflight_watchdog()
 
     source_load_reference = None
     if check_source_load_parity:
@@ -1181,6 +1271,11 @@ def run_checkpoint_robustness(
     trainer = recipe_cls(cfg)
     trainer.setup()
     _report_phase("Phase 1: initial trainer setup complete")
+    if tokenizer_name is not None and dist.is_initialized() and dist.get_world_size() > 1:
+        _barrier()
+        if _rank0():
+            _cleanup_input_ids_sync(cfg)
+        _barrier()
 
     if check_source_load_parity:
         _report_phase("Phase 0: starting constructed-trainer parity forward")
@@ -1609,12 +1704,18 @@ def run_checkpoint_robustness(
 
 def test_checkpoint_robustness() -> None:
     """Run checkpoint robustness with the LLM finetune recipe."""
-    from transformers import AutoModelForCausalLM
+    _start_preflight_watchdog()
+    try:
+        _report_phase("Preflight: importing AutoModelForCausalLM")
+        from transformers import AutoModelForCausalLM
 
-    run_checkpoint_robustness(
-        recipe_cls=TrainFinetuneRecipeForNextTokenPrediction,
-        hf_model_cls=AutoModelForCausalLM,
-    )
+        _report_phase("Preflight: AutoModelForCausalLM import complete")
+        run_checkpoint_robustness(
+            recipe_cls=TrainFinetuneRecipeForNextTokenPrediction,
+            hf_model_cls=AutoModelForCausalLM,
+        )
+    finally:
+        _stop_preflight_watchdog()
 
 
 if __name__ == "__main__":

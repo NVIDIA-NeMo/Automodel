@@ -19,6 +19,9 @@ import os
 from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm import (
     _DEFAULT_INPUT_IDS,
     _DEFAULT_PROMPT,
+    _report_phase,
+    _start_preflight_watchdog,
+    _stop_preflight_watchdog,
     run_checkpoint_robustness,
 )
 
@@ -41,15 +44,23 @@ def _get_vlm_input_ids(processor_name: str | None) -> list[int]:
 
 def test_checkpoint_robustness_vlm() -> None:
     """Run checkpoint robustness with the VLM finetune recipe and text-only logits."""
-    from transformers import AutoModelForImageTextToText
+    _start_preflight_watchdog()
+    try:
+        _report_phase("Preflight: importing AutoModelForImageTextToText")
+        from transformers import AutoModelForImageTextToText
 
-    from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM
+        _report_phase("Preflight: AutoModelForImageTextToText import complete")
+        _report_phase("Preflight: importing FinetuneRecipeForVLM")
+        from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM
 
-    run_checkpoint_robustness(
-        recipe_cls=FinetuneRecipeForVLM,
-        hf_model_cls=AutoModelForImageTextToText,
-        input_ids_loader=_get_vlm_input_ids,
-    )
+        _report_phase("Preflight: FinetuneRecipeForVLM import complete")
+        run_checkpoint_robustness(
+            recipe_cls=FinetuneRecipeForVLM,
+            hf_model_cls=AutoModelForImageTextToText,
+            input_ids_loader=_get_vlm_input_ids,
+        )
+    finally:
+        _stop_preflight_watchdog()
 
 
 if __name__ == "__main__":

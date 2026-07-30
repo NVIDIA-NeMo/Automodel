@@ -14,7 +14,7 @@
 
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -30,6 +30,7 @@ from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm
     _hf_source_load_kwargs,
     _keep_hf_modules_in_fp32,
     _load_hf_fp8_dequantized_config,
+    _load_input_ids_once,
     _post_load_dequant_max_memory,
     _record_deferred_failure,
     _wait_for_hf_reload_rank0,
@@ -173,6 +174,37 @@ def test_get_vlm_input_ids_uses_processor_tokenizer(monkeypatch, offline, expect
         trust_remote_code=True,
         local_files_only=expected_local_files_only,
     )
+
+
+def test_load_input_ids_once_shares_rank0_result(tmp_path, monkeypatch):
+    cfg = SimpleNamespace(checkpoint=SimpleNamespace(checkpoint_dir=tmp_path / "checkpoints"))
+    rank0_loader = Mock(return_value=[31, 32, 33])
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    monkeypatch.setenv("SLURM_JOB_ID", "input-id-test")
+    monkeypatch.setenv("RANK", "0")
+
+    assert _load_input_ids_once(cfg, rank0_loader, "model/tokenizer") == [31, 32, 33]
+    rank0_loader.assert_called_once_with("model/tokenizer")
+
+    rank1_loader = Mock(side_effect=AssertionError("nonzero rank must not load the tokenizer"))
+    monkeypatch.setenv("RANK", "1")
+
+    assert _load_input_ids_once(cfg, rank1_loader, "model/tokenizer") == [31, 32, 33]
+    rank1_loader.assert_not_called()
+
+
+def test_load_input_ids_once_propagates_rank0_failure(tmp_path, monkeypatch):
+    cfg = SimpleNamespace(checkpoint=SimpleNamespace(checkpoint_dir=tmp_path / "checkpoints"))
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    monkeypatch.setenv("SLURM_JOB_ID", "input-id-failure-test")
+    monkeypatch.setenv("RANK", "0")
+
+    with pytest.raises(ValueError, match="tokenizer failed"):
+        _load_input_ids_once(cfg, Mock(side_effect=ValueError("tokenizer failed")), "model/tokenizer")
+
+    monkeypatch.setenv("RANK", "1")
+    with pytest.raises(RuntimeError, match="Rank 0 input-ID loading failed"):
+        _load_input_ids_once(cfg, Mock(), "model/tokenizer")
 
 
 def test_vllm_deploy_tokenization_omits_token_type_ids():
