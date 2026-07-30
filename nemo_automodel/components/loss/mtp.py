@@ -41,6 +41,7 @@ def calculate_mtp_loss(
     cu_seqlens: Optional[torch.Tensor] = None,
     seq_idx: Optional[torch.Tensor] = None,
     lm_weight: Optional[torch.Tensor] = None,
+    loss_weights: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Compute the DeepSeek-V3 Multi-Token Prediction auxiliary loss.
 
@@ -72,6 +73,8 @@ def calculate_mtp_loss(
         lm_weight: Optional caller-materialized LM-head weight. Supplying this
             lets the main loss and all MTP depths share one DTensor
             ``full_tensor()`` gather on the FusedLinearCrossEntropy path.
+        loss_weights: Optional per-token objective multipliers matching
+            ``labels.shape``.
 
     Returns:
         Scalar MTP loss with autograd graph.
@@ -154,6 +157,7 @@ def calculate_mtp_loss(
                 labels=masked,
                 model=model,
                 num_label_tokens=num_label_tokens,
+                loss_weights=loss_weights,
             )
         elif isinstance(loss_fn, FusedLinearCrossEntropy):
             depth_loss = calculate_loss(
@@ -163,6 +167,7 @@ def calculate_mtp_loss(
                 model=model,
                 lm_weight=lm_weight,
                 num_label_tokens=num_label_tokens,
+                loss_weights=loss_weights,
             )
         else:
             lm_head = _get_lm_head_module(model)
@@ -174,6 +179,7 @@ def calculate_mtp_loss(
                 labels=masked,
                 model=model,
                 num_label_tokens=num_label_tokens,
+                loss_weights=loss_weights,
             )
         total = total + depth_loss
 

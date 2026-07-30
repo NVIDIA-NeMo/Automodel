@@ -312,6 +312,68 @@ If you want to add weights to the dataset blends, you can do so by passing in a 
 
 </Tip>
 
+### Balance Sampling and Domain Objectives
+
+Sampling weights control how often a domain appears in a batch. They do not
+need to be the same as the domain's desired contribution to the optimization
+objective. Configure both values with `domain_mixture`:
+
+```yaml
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.megatron_dataset.MegatronPretraining
+  paths:
+    - "70"
+    - /data/web/processed_text_document
+    - "30"
+    - /data/code/processed_text_document
+  # Keep the tokenizer, sequence length, split, and index mapping settings
+  # from the complete recipe above.
+
+domain_mixture:
+  domains:
+    # Order must match the weighted paths above.
+    - name: web
+      sampling_weight: 0.70
+      objective_weight: 0.50
+    - name: code
+      sampling_weight: 0.30
+      objective_weight: 0.50
+
+# Add one validation dataset per domain. The suffix becomes the domain name.
+validation_dataset_web:
+  _target_: nemo_automodel.components.datasets.llm.megatron_dataset.MegatronPretraining
+  paths: /data/web/processed_text_document
+  # Use the validation settings from the complete recipe above.
+
+validation_dataset_code:
+  _target_: nemo_automodel.components.datasets.llm.megatron_dataset.MegatronPretraining
+  paths: /data/code/processed_text_document
+  # Use the validation settings from the complete recipe above.
+
+checkpoint:
+  best_metric_key: weighted
+```
+
+For a domain with normalized sampling weight \(q_i\) and objective weight
+\(w_i\), the recipe multiplies each supervised token loss by \(w_i / q_i\).
+This keeps one optimizer and learning-rate schedule while making the expected
+training loss equal to the requested weighted domain objective. The recipe
+logs achieved supervised-token fractions for each domain, reports every
+per-domain validation loss, and reports their objective-weighted aggregate as
+`weighted`.
+
+The `sampling_weight` values must match the explicit weights in
+the `MegatronPretraining` dataset's `dataset.paths`, and domain order must
+match the blend order. JSON blend files and implicit unweighted blends are not
+supported. Sequence packing is not supported with `domain_mixture` because
+packed batches do not currently preserve per-token domain IDs. Pipeline
+parallelism is also not currently supported because its target contract does
+not carry per-token objective weights. Context parallelism is disabled until
+its distributed gradient contract is covered by parity tests. The configured
+loss must use `reduction: sum`; the built-in masked, fused-linear, chunked, and
+Transformer Engine parallel cross-entropy losses accept these objective
+weights.
+
 ## Load Large Models
 In distributed training, the typical model-loading pipeline has each GPU load the entire model and then retain only the shard it needs. This approach becomes problematic when the model size exceeds the memory capacity of a single GPU. For instance, a 70B-parameter model requires about 140GB of memory for its parameters when using the BF16 data type (2 bytes per parameter). Since most widely used GPUs are limited to 80GB, the full model cannot be directly loaded onto a single device.
 

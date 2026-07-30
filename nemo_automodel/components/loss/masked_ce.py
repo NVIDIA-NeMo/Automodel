@@ -43,6 +43,7 @@ class MaskedCrossEntropy(nn.Module):
         labels: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
         num_label_tokens: Optional[int] = None,
+        loss_weights: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Compute the masked cross-entropy loss between logits and targets.
@@ -56,6 +57,10 @@ class MaskedCrossEntropy(nn.Module):
             mask (torch.Tensor, optional): A tensor that masks the loss computation. Items marked with
                 1 will be used to calculate loss, otherwise ignored. Must be broadcastable to the shape
                 of the loss. Defaults to None.
+            num_label_tokens: Optional global supervised-token count used to
+                normalize a sum-reduced loss.
+            loss_weights: Optional per-token multipliers with the same shape as
+                ``labels``. Only supported with ``reduction="sum"``.
 
         Returns:
             torch.Tensor: The computed loss as a scalar tensor.
@@ -63,6 +68,17 @@ class MaskedCrossEntropy(nn.Module):
         # this may happen with CPUOffloadPolicy
         if labels.device != logits.device:
             labels = labels.to(logits.device)  # pragma: no cover
+        labels_shape = labels.shape
+        if loss_weights is not None:
+            if self.reduction != "sum":
+                raise ValueError("loss_weights is only supported when reduction is 'sum'")
+            if loss_weights.shape != labels_shape:
+                raise ValueError(
+                    f"loss_weights.shape must match labels.shape, got {tuple(loss_weights.shape)} "
+                    f"and {tuple(labels_shape)}"
+                )
+            loss_weights = loss_weights.reshape(-1).to(device=logits.device, dtype=torch.float32)
+
         # reshape to (N, C) and (N,) respectively
         logits = logits.view(-1, logits.size(-1))
         labels = labels.view(-1)
@@ -81,9 +97,13 @@ class MaskedCrossEntropy(nn.Module):
         if isinstance(labels, DTensor):
             labels = labels.full_tensor()
 
-        loss = F.cross_entropy(logits, labels, reduction=self.reduction)
+        reduction = "none" if loss_weights is not None else self.reduction
+        loss = F.cross_entropy(logits, labels, ignore_index=self.ignore_index, reduction=reduction)
+        if loss_weights is not None:
+            loss = (loss * loss_weights).sum()
         if num_label_tokens is not None:
-            assert self.reduction == "sum", "num_label_tokens is only supported when reduction is 'sum'"
+            if self.reduction != "sum":
+                raise ValueError("num_label_tokens is only supported when reduction is 'sum'")
             if num_label_tokens == 0:
                 return loss * 0.0
             loss = loss / num_label_tokens

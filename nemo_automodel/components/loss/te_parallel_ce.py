@@ -137,6 +137,7 @@ class TEParallelCrossEntropy:
         labels: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
         num_label_tokens: Optional[int] = None,
+        loss_weights: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Compute parallel cross entropy loss that matches PyTorch's cross_entropy behavior.
@@ -146,6 +147,8 @@ class TEParallelCrossEntropy:
             labels: Target labels. Shape: [B, T]
             mask: Mask to apply to the loss. Shape: [B, T]
             num_label_tokens (int): The number of non-padding tokens.
+            loss_weights: Optional per-token multipliers matching
+                ``labels.shape``. Only supported with ``reduction="sum"``.
 
         Returns:
             Computed loss tensor
@@ -168,6 +171,16 @@ class TEParallelCrossEntropy:
         if HAVE_DTENSOR and isinstance(labels, DTensor):
             labels = labels.to_local()
 
+        if loss_weights is not None:
+            if self.reduction != "sum":
+                raise ValueError("loss_weights is only supported when reduction is 'sum'")
+            if loss_weights.shape != labels.shape:
+                raise ValueError(
+                    f"loss_weights.shape must match labels.shape, got {tuple(loss_weights.shape)} "
+                    f"and {tuple(labels.shape)}"
+                )
+            loss_weights = loss_weights.to(device=logits.device, dtype=torch.float32)
+
         if mask is not None:
             with torch.no_grad():
                 if mask.device != labels.device:
@@ -179,6 +192,8 @@ class TEParallelCrossEntropy:
 
         # Compute TE parallel cross entropy
         te_loss = parallel_cross_entropy(logits, labels, 0.0, reduce_loss, tp_group, self.ignore_index)
+        if loss_weights is not None:
+            te_loss = te_loss * loss_weights
 
         # Apply reduction
         if self.reduction == "none" or self.reduction == "mean":
@@ -186,7 +201,7 @@ class TEParallelCrossEntropy:
         elif self.reduction == "sum":
             loss = te_loss.sum()
             if num_label_tokens is not None:
-                loss = loss / num_label_tokens
+                loss = loss * 0.0 if num_label_tokens == 0 else loss / num_label_tokens
             return loss
         else:
             raise ValueError(f"Invalid reduction: {self.reduction}. Must be one of 'none', 'mean', 'sum'")
