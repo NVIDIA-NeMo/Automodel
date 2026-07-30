@@ -17,6 +17,7 @@
 from pathlib import Path
 
 from nemo_automodel.components.config.loader import load_yaml_config
+from nemo_automodel.components.datasets.utils import packed_sequence_thd_collater
 from nemo_automodel.components.models.common import BackendConfig
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
@@ -36,3 +37,5 @@ def test_glm_5_2_lora_backend_config_instantiates() -> None:
     assert config.step_scheduler.global_batch_size % (
         config.step_scheduler.local_batch_size * config.distributed.ep_size
     ) == 0
+    assert config.dataloader.collate_fn is packed_sequence_thd_collater
+    assert config.validation_dataloader.collate_fn is packed_sequence_thd_collater

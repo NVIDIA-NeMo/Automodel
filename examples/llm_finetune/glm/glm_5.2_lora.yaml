@@ -118,9 +118,7 @@ packed_sequence:
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn:
-    _target_: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
-    pad_seq_len_divisible: 4096
+  collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
   shuffle: true
   drop_last: false
   num_workers: 0
@@ -128,9 +126,7 @@ dataloader:
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn:
-    _target_: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
-    pad_seq_len_divisible: 4096
+  collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
   shuffle: false
   drop_last: false
   num_workers: 0
