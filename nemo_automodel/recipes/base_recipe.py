@@ -54,6 +54,7 @@ from nemo_automodel.components.checkpoint.utils import (
     find_pointer_protected_checkpoints,
     format_missing_checkpoint_dir_error,
     is_checkpoint_incomplete,
+    is_cloud_path,
     list_automodel_checkpoints,
     mark_checkpoint_incomplete,
     read_checkpoint_metric,
@@ -262,6 +263,10 @@ class BaseRecipe:
         leaves only a staging directory, which the checkpoint listings ignore and
         the next reservation of the same step clears.
 
+        ``msc://`` roots retain their existing DCP behavior. The local shadow
+        directory needed by recipe metadata is created, but the filesystem-only
+        marker, stale-directory replacement, and failure-atomic rename are skipped.
+
         Args:
             path: Checkpoint directory for the current step.
 
@@ -271,6 +276,24 @@ class BaseRecipe:
         """
         is_dist_initialized = torch.distributed.is_initialized()
         is_rank_0 = not is_dist_initialized or torch.distributed.get_rank() == 0
+
+        if is_cloud_path(path):
+
+            def prepare_remote_metadata_dir() -> None:
+                logger.warning(
+                    "Checkpoint directory %s uses MSC storage; interrupted-save detection and "
+                    "automatic stale-directory replacement are unavailable",
+                    path,
+                )
+                # Preserve the established recipe behavior: DCP shards are written
+                # through MSC, while rank-0 recipe metadata uses this local shadow.
+                os.makedirs(path, exist_ok=True)
+
+            self._run_rank_0_checkpoint_step(
+                prepare_remote_metadata_dir,
+                f"prepare local recipe metadata directory for remote checkpoint {path}",
+            )
+            return
 
         # Decided on rank 0 and reduced, so the refusal is unanimous instead of a
         # rank-0-only raise that would strand the other ranks in the next collective.
@@ -371,12 +394,15 @@ class BaseRecipe:
         marker commits publication. If either operation fails, resume still ignores
         the marked checkpoint and a later save can replace it. Runs on rank 0 inside
         :meth:`_run_rank_0_checkpoint_step`, which reports any failure to every rank.
+        MSC roots keep their pre-existing local pointer behavior and do not use a
+        filesystem marker.
 
         Args:
             path: Checkpoint directory whose components have all been written.
         """
         self._update_latest_symlink(path)
-        clear_checkpoint_incomplete(path)
+        if not is_cloud_path(path):
+            clear_checkpoint_incomplete(path)
 
     def save_checkpoint(
         self,

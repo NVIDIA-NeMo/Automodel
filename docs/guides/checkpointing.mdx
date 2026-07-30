@@ -80,7 +80,16 @@ Checkpoint saves are synchronous by default and are published before training co
 
 <Warning>
 
-`checkpoint.checkpoint_dir` must be a local or shared filesystem path. Setting it to an `msc://` remote storage URI raises `ValueError` at startup. Training checkpoints write RNG, dataloader, and recipe metadata with `torch.save`, and publish the `LATEST` and `LOWEST_VAL` pointers as local symbolic links; neither works on object storage, so a remote root fails partway through a save. Loading a base model from remote storage is unaffected.
+`msc://` paths use NVIDIA MultiStorageClient (MSC) object storage. NeMo AutoModel supports them for sharded Distributed Checkpoint (DCP) model and optimizer data when `checkpoint.save_consolidated` is `false`. However, a full recipe checkpoint is not self-contained in object storage: RNG, dataloader, and other recipe state written with `torch.save`, plus the `LATEST` and `LOWEST_VAL` pointers, remain local to the training environment. The interrupted-save marker and automatic stale-directory replacement described above also require a local filesystem and are unavailable for `msc://` roots.
+
+Use a local or shared filesystem checkpoint directory when you need a portable, exact training resume. If you use an `msc://` checkpoint directory for DCP data, configure it as follows:
+
+```yaml
+checkpoint:
+  checkpoint_dir: msc://bucket/path
+  save_consolidated: false
+  max_recent_checkpoints: null
+```
 
 </Warning>
 
@@ -107,6 +116,8 @@ Leave the value unset, or set it to `null`, to keep all intermediate checkpoints
 checkpoint:
   max_recent_checkpoints: null
 ```
+
+Bounded retention supports only local filesystem checkpoint directories. If `checkpoint.checkpoint_dir` uses `msc://` storage, leave `max_recent_checkpoints` unset.
 
 ## Safetensors
 To ensure seamless integration with the Hugging Face ecosystem, NeMo AutoModel saves checkpoints in the [Safetensors](https://github.com/safetensors/safetensors) format. Safetensors is a memory-safe, zero-copy alternative to Python's pickle (PyTorch .bin). Hugging Face Transformers supports Safetensors natively, and Safetensors offers safety and performance advantages over Python pickle-based approaches.

@@ -1249,8 +1249,7 @@ def test_save_losses_does_not_raise_when_multistorageclient_is_missing(tmp_path,
     """A missing MSC install warns instead of raising ImportError on rank 0.
 
     ``save_losses`` runs on rank 0 before a barrier, so any escaping exception
-    strands the other ranks. Remote roots are rejected at config construction,
-    but the helper must not be the one to break that contract.
+    strands the other ranks.
     """
     import nemo_automodel.components.checkpoint.checkpointing as checkpointing_module
 
@@ -1260,6 +1259,45 @@ def test_save_losses_does_not_raise_when_multistorageclient_is_missing(tmp_path,
         save_losses({"train_loss": 1.0}, "msc://bucket/run/epoch_0_step_1")
 
     assert "Failed to write checkpoint loss metadata" in caplog.text
+
+
+def test_checkpoint_lifecycle_is_skipped_for_msc_checkpoint_dir(tmp_path, monkeypatch, caplog):
+    """MSC DCP checkpoints keep their existing behavior without local lifecycle markers."""
+    recipe_inst = _ToyRecipe(tmp_path)
+    remote_checkpoint = "msc://bucket/run/epoch_0_step_100"
+    monkeypatch.chdir(tmp_path)
+
+    def fail(*args, **kwargs):
+        raise AssertionError("filesystem-only lifecycle operation used for MSC checkpoint")
+
+    monkeypatch.setattr("nemo_automodel.recipes.base_recipe.shutil.rmtree", fail)
+    monkeypatch.setattr("nemo_automodel.recipes.base_recipe.mark_checkpoint_incomplete", fail)
+
+    with caplog.at_level(logging.WARNING):
+        recipe_inst._reserve_checkpoint_dir(remote_checkpoint)
+        recipe_inst._reserve_checkpoint_dir(remote_checkpoint)
+
+    assert (tmp_path / "msc:" / "bucket" / "run" / "epoch_0_step_100").is_dir()
+    assert is_checkpoint_incomplete(remote_checkpoint) is False
+    assert "interrupted-save detection and automatic stale-directory replacement are unavailable" in caplog.text
+
+
+def test_publish_msc_checkpoint_does_not_clear_local_marker(tmp_path, monkeypatch):
+    """MSC publication keeps the legacy local pointer but skips the filesystem-only commit marker."""
+    recipe_inst = _ToyRecipe(tmp_path)
+    remote_checkpoint = "msc://bucket/run/epoch_0_step_100"
+    published = []
+
+    monkeypatch.setattr(recipe_inst, "_update_latest_symlink", published.append)
+
+    def fail_clear(*args, **kwargs):
+        raise AssertionError("filesystem marker clear used for MSC checkpoint")
+
+    monkeypatch.setattr("nemo_automodel.recipes.base_recipe.clear_checkpoint_incomplete", fail_clear)
+
+    recipe_inst._publish_checkpoint(remote_checkpoint)
+
+    assert published == [remote_checkpoint]
 
 
 def test_interrupted_lowest_val_target_does_not_poison_best_metric_tracking(tmp_path):

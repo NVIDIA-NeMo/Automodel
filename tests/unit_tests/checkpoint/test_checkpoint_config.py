@@ -134,24 +134,31 @@ class TestCheckpointingConfig:
         with pytest.raises(ValueError, match="checkpoint.max_recent_checkpoints must be unset or a positive integer"):
             CheckpointingConfig(max_recent_checkpoints=invalid_value)
 
-    @pytest.mark.parametrize(
-        "extra_kwargs",
-        [
-            {},
-            {"max_recent_checkpoints": 1},
-            {"save_consolidated": "final"},
-            {"save_consolidated": False},
-        ],
-    )
-    def test_rejects_msc_checkpoint_dir(self, extra_kwargs):
-        """Remote checkpoint roots are rejected up front, whatever else is configured.
+    def test_max_recent_checkpoints_rejects_msc_checkpoint_dir(self):
+        with pytest.raises(ValueError, match="max_recent_checkpoints is only supported for local checkpoint"):
+            CheckpointingConfig(
+                checkpoint_dir="msc://bucket/checkpoints",
+                save_consolidated=False,
+                max_recent_checkpoints=1,
+            )
 
-        Training checkpoints write RNG, dataloader, and recipe metadata with
-        torch.save and publish LATEST and LOWEST_VAL as local symlinks, so a
-        remote root fails partway through the save on rank 0 and hangs the rest.
-        """
-        with pytest.raises(ValueError, match="does not support remote storage"):
-            CheckpointingConfig(checkpoint_dir="msc://bucket/checkpoints", **extra_kwargs)
+    @pytest.mark.parametrize("save_consolidated", [True, "final", "every"])
+    def test_consolidated_export_rejects_msc_checkpoint_dir(self, save_consolidated):
+        with pytest.raises(ValueError, match="not compatible with remote cloud storage"):
+            CheckpointingConfig(
+                checkpoint_dir="msc://bucket/checkpoints",
+                save_consolidated=save_consolidated,
+            )
+
+    def test_accepts_msc_dcp_checkpoint_dir(self):
+        cfg = CheckpointingConfig(
+            checkpoint_dir="msc://bucket/checkpoints",
+            save_consolidated=False,
+        )
+
+        assert cfg.checkpoint_dir == "msc://bucket/checkpoints"
+        assert cfg.save_consolidated.value == "false"
+        assert cfg.max_recent_checkpoints is None
 
     def test_accepts_local_checkpoint_dir_with_retention(self):
         """The rejection is scoped to remote roots; local paths keep working."""

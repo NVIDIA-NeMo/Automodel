@@ -152,26 +152,18 @@ class CheckpointingConfig:
             self.model_save_format = "safetensors"
             self.save_consolidated = SaveConsolidatedMode.FINAL
 
-        # Training checkpoints are not writable to object storage. Only the DCP model and
-        # optimizer shards and config.yaml are MSC-aware; RNG, dataloader, and recipe
-        # metadata go through torch.save, and the LATEST and LOWEST_VAL pointers are local
-        # symlinks. Saving to msc:// therefore fails partway through with a rank-0 error
-        # that hangs the remaining ranks, so reject it up front. Every rank builds this
-        # config identically, so the failure is collective and happens before training.
-        if is_cloud_path(self.checkpoint_dir):
-            raise ValueError(
-                f"checkpoint.checkpoint_dir does not support remote storage ('{self.checkpoint_dir}'). "
-                "Training checkpoints write RNG, dataloader, and recipe metadata with torch.save and "
-                "publish the LATEST and LOWEST_VAL pointers as local symlinks, neither of which works "
-                "on msc:// object storage. Use a local or shared filesystem path."
-            )
-
-        if self.max_recent_checkpoints is not None and (
-            isinstance(self.max_recent_checkpoints, bool)
-            or not isinstance(self.max_recent_checkpoints, int)
-            or self.max_recent_checkpoints < 1
-        ):
-            raise ValueError("checkpoint.max_recent_checkpoints must be unset or a positive integer")
+        if self.max_recent_checkpoints is not None:
+            if (
+                isinstance(self.max_recent_checkpoints, bool)
+                or not isinstance(self.max_recent_checkpoints, int)
+                or self.max_recent_checkpoints < 1
+            ):
+                raise ValueError("checkpoint.max_recent_checkpoints must be unset or a positive integer")
+            if is_cloud_path(self.checkpoint_dir):
+                raise ValueError(
+                    "checkpoint.max_recent_checkpoints is only supported for local checkpoint directories; "
+                    "unset it when checkpoint.checkpoint_dir uses msc:// storage"
+                )
 
         # Convert a raw string such as "safetensors" into the right Enum.
         formats = [v.value for v in SerializationFormat]
@@ -182,6 +174,15 @@ class CheckpointingConfig:
 
         # Normalize legacy bools and string aliases to a consolidated export mode.
         self.save_consolidated = _normalize_save_consolidated(self.save_consolidated)
+
+        # Consolidated HF safetensors export needs local filesystem semantics and is not
+        # supported on msc:// cloud storage paths; use DCP (save_consolidated=false) instead.
+        if self.save_consolidated != SaveConsolidatedMode.FALSE and is_cloud_path(self.checkpoint_dir):
+            raise ValueError(
+                f"Consolidated safetensors export (save_consolidated={self.save_consolidated.value}) is not "
+                f"compatible with remote cloud storage paths ('{self.checkpoint_dir}'). Set save_consolidated=false "
+                f"to use DCP format with MSC cloud storage instead."
+            )
 
         if self.save_consolidated != SaveConsolidatedMode.FALSE and not self.is_peft:
             if self.model_save_format != SerializationFormat.SAFETENSORS:
