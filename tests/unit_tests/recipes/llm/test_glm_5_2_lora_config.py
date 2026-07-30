@@ -33,3 +33,6 @@ def test_glm_5_2_lora_backend_config_instantiates() -> None:
     assert backend.attn == "tilelang"
     assert backend.experts == "torch_mm"
     assert backend.dispatcher == "hybridep"
+    assert config.step_scheduler.global_batch_size % (
+        config.step_scheduler.local_batch_size * config.distributed.ep_size
+    ) == 0

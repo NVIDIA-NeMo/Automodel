@@ -13,7 +13,7 @@ seed: 42
 longalign: false
 
 step_scheduler:
-  global_batch_size: 32
+  global_batch_size: 128
   local_batch_size: 1
   ckpt_every_steps: 25
   val_every_steps: 5
