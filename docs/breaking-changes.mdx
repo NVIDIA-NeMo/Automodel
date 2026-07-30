@@ -7,7 +7,7 @@ position: 6
 
 ### Frozen Multimodal FSDP2 Modules Default to Root Sharding
 
-Fully frozen vision/audio towers and multimodal projectors now default to the `root` FSDP2 policy. Previously, dense
+Fully frozen vision and audio towers and multimodal projectors now default to the `root` FSDP2 policy. Previously, dense
 frozen vision towers commonly used per-layer FSDP units. Root ownership keeps the collective sequence aligned when
 some ranks execute a modality branch and other ranks skip it, but it can increase peak unshard memory.
 
@@ -27,7 +27,7 @@ policies and the `wrap_outer_model` constraint.
 
 ### FSDP2 Default `reduce_dtype` Is Now `float32`
 
-The default [`MixedPrecisionPolicy`](https://docs.pytorch.org/docs/stable/distributed.fsdp.fully_shard.html) built by `FSDP2Config` now uses `reduce_dtype=torch.float32` instead of `torch.bfloat16`. Forward/backward compute still uses `param_dtype=torch.bfloat16`, but gradient reduction now accumulates in fp32 to reduce communication-rounding error at larger data-parallel world sizes.
+The default [`MixedPrecisionPolicy`](https://docs.pytorch.org/docs/stable/distributed.fsdp.fully_shard.html) built by `FSDP2Config` now uses `reduce_dtype=torch.float32` instead of `torch.bfloat16`. Forward/backward compute still uses `param_dtype=torch.bfloat16`, but gradient reduction now accumulates in FP32 to reduce communication-rounding error at larger data-parallel world sizes.
 
 To restore the previous behavior, override the policy explicitly:
 
@@ -97,15 +97,15 @@ entirely within the YAML config file rather than through CLI arguments.
 
 | Launcher | YAML section |
 |---|---|
-| Kubernetes (via SkyPilot) | `skypilot:` with `cloud: kubernetes` |
+| Kubernetes (through SkyPilot) | `skypilot:` with `cloud: kubernetes` |
 | NeMo Run | `nemo_run:` |
 
 If neither section is present, the job runs locally (interactive mode).
 
-### SLURM: Script-Based Submission
+### Slurm: Script-Based Submission
 
-The `slurm:` YAML section and all related fields have been removed. SLURM
-jobs are now submitted with `sbatch` directly, using a self-contained sbatch
+The `slurm:` YAML section and all related fields have been removed. Slurm
+jobs are now submitted with `sbatch` directly, using a self-contained `sbatch`
 script. Copy the reference template and adapt it to your cluster:
 
 ```bash
@@ -117,7 +117,7 @@ sbatch my_cluster.sub
 The script runs `torchrun -m nemo_automodel.cli.app` on each node, which
 detects the distributed environment and executes the recipe in-process.
 All cluster-specific configuration lives in the sbatch script where you can
-see and edit it directly.
+edit it directly.
 
 ### CLI Install Extra
 
@@ -136,7 +136,7 @@ to be installed separately.
 
 ### Media Dependencies Are Opt-In
 
-The FFmpeg-bearing media dependencies (OpenCV, decord, the Qwen vision utils, and
+The FFmpeg-bearing media dependencies (OpenCV, decord, the Qwen vision utilities, and
 imageio-ffmpeg) are now opt-in extras, installed neither by default nor in the
 Docker container.
 
@@ -149,15 +149,15 @@ uv pip install "nemo-automodel[diffusion,diffusion-media]"  # diffusion preproce
 
 Two consequences when upgrading:
 
-- `[vlm]` alone no longer trains Qwen2.5-VL, Qwen3-Omni, or Mistral VLMs — add `vlm-media`.
-- `[all]` no longer includes the media extras — add them with `uv pip install "nemo-automodel[media]"` in the activated environment.
+- `[vlm]` alone no longer trains Qwen2.5-VL, Qwen3-Omni, or Mistral VLMs. Add `vlm-media`.
+- `[all]` no longer includes the media extras. Add them with `uv pip install "nemo-automodel[media]"` in the activated environment.
 
 See the [Installation Guide](/get-started/installation#media-extras-video--image-decode) for details.
 
 ### CLI Module Lives Inside the Package
 
-The CLI entry-point lives at `nemo_automodel/cli/app.py` and is registered as
-the `automodel` / `am` console entry-points. A thin convenience wrapper
+The CLI entry point lives at `nemo_automodel/cli/app.py` and is registered as
+the `automodel` or `am` console entry points. A thin convenience wrapper
 (`app.py`) at the repository root is available for running from a source
 checkout but is **not** installed as part of the package.
 
