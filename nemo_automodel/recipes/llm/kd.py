@@ -63,6 +63,7 @@ from nemo_automodel.components.training.signal_handler import DistributedSignalH
 from nemo_automodel.components.training.utils import (
     ScopedModuleOffloading,
     count_tail_padding,
+    get_expert_tp_replication_factor,
     prepare_after_first_microbatch,
     prepare_for_final_backward,
     prepare_for_grad_accumulation,
@@ -825,6 +826,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             foreach=True,
             num_label_tokens=num_label_tokens,
             dp_group_size=self._get_dp_group_size(include_cp=True),
+            expert_tp_replication_factor=get_expert_tp_replication_factor(self.model_parts, self.device_mesh),
         )
 
         self.checkpointer.maybe_wait_for_staging()
@@ -921,6 +923,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             foreach=True,
             num_label_tokens=num_label_tokens,
             dp_group_size=self._get_dp_group_size(include_cp=True),
+            expert_tp_replication_factor=get_expert_tp_replication_factor(self.model_parts, self.device_mesh),
         )
 
         self.checkpointer.maybe_wait_for_staging()
