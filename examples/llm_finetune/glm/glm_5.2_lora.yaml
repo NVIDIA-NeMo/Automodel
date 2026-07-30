@@ -154,7 +154,7 @@ lr_scheduler:
 
 ci:
   # cp_size(1) with ep_size(128) => 128 GPUs => 16 nodes (8 H100/node).
-  recipe_owner: shahafwa
+  recipe_owner: HuiyingLi
   nodes: 16
   time: "00:20:00"
   release:
