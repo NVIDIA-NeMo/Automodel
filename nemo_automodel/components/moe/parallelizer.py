@@ -38,6 +38,7 @@ from nemo_automodel.components.moe.layers import (
     MoE,
 )
 from nemo_automodel.components.moe.tp_plan_validation import _validate_moe_tp_plan
+from nemo_automodel.shared.model_utils import iter_transformer_and_mtp_blocks
 from nemo_automodel.shared.multimodal_fsdp import (
     MULTIMODAL_TOWER_NAMES,
     FrozenMultimodalSharding,
@@ -97,22 +98,6 @@ def _get_cp_stream() -> torch.cuda.Stream:
     if _CP_STREAM is None:
         _CP_STREAM = torch.cuda.Stream()
     return _CP_STREAM
-
-
-def _iter_transformer_and_mtp_blocks(model: nn.Module):
-    inner = model.model if hasattr(model, "model") and model.model is not None else model
-    text_model = get_text_module(inner)
-
-    layers = getattr(text_model, "layers", None)
-    if layers is not None:
-        for layer_id, block in layers.named_children():
-            yield layers, layer_id, block
-
-    mtp = getattr(model, "mtp", None)
-    mtp_layers = getattr(mtp, "layers", None)
-    if mtp_layers is not None:
-        for layer_id, block in mtp_layers.named_children():
-            yield mtp_layers, layer_id, block
 
 
 def _get_moe_module(block: nn.Module) -> MoE | None:
@@ -361,7 +346,7 @@ def _apply_multimodal_tower_ac(model: nn.Module, scopes: tuple[str, ...]) -> Non
     """Checkpoint trainable multimodal (vision/audio) tower blocks on the expert-parallel path.
 
     ``apply_ac`` iterates only the text/MTP decoder stack
-    (``_iter_transformer_and_mtp_blocks``), and the generic FSDP2 scope
+    (``iter_transformer_and_mtp_blocks``), and the generic FSDP2 scope
     handling does not run for expert-parallel configs, so a trainable vision
     tower would otherwise keep every activation. Reuses the per-model
     layer-group mapping from the dense parallelizer and applies the same
@@ -482,7 +467,7 @@ def apply_ac(
             )
 
             selective_context_fn = make_selective_checkpoint_context_fn()
-            for parent_layers, layer_id, block in _iter_transformer_and_mtp_blocks(model):
+            for parent_layers, layer_id, block in iter_transformer_and_mtp_blocks(model):
                 block = ptd_checkpoint_wrapper(
                     block,
                     preserve_rng_state=True,
@@ -575,7 +560,7 @@ def apply_ac(
     if mtp_repeated and mtp_block_ids:
         logger.info("Skipping activation checkpointing on %d weight-tied MTP head block(s)", len(mtp_block_ids))
 
-    for parent_layers, layer_id, block in _iter_transformer_and_mtp_blocks(model):
+    for parent_layers, layer_id, block in iter_transformer_and_mtp_blocks(model):
         if mtp_repeated and id(block) in mtp_block_ids:
             continue
         if ignore_router:
@@ -900,7 +885,7 @@ def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p
     #     M3's block-sparse DSA) -> installs its own CP attention + mask handling
     #     (model-owned, like TE/DSV4).
     # Any other (non-TE, non-model-owned) attention is not supported under CP here.
-    for _parent, _layer_id, block in _iter_transformer_and_mtp_blocks(model):
+    for _parent, _layer_id, block in iter_transformer_and_mtp_blocks(model):
         layer_type = getattr(block, "layer_type", getattr(block, "attention_type", "full_attention"))
 
         if layer_type in ("full_attention", "sliding_attention"):
