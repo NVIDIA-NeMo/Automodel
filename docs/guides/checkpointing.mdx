@@ -74,7 +74,7 @@ Only marked directories are replaced. A published checkpoint is never overwritte
 
 <Note>
 
-Asynchronous saves are published on the following save call, so a job that stops in between leaves the last checkpoint marked as in progress even though its files are complete. Resume falls back to the previous published checkpoint in that case.
+Checkpoint saves are synchronous by default and are published before training continues. With opt-in asynchronous checkpointing (`checkpoint.is_async: true`), the next save call or a clean training shutdown waits for the background write and publishes the checkpoint. If the job terminates before either point, the pending checkpoint stays marked as in progress—even if its file writes finished—and resume uses the previous published checkpoint.
 
 </Note>
 
@@ -363,7 +363,7 @@ Mount additional host directories for datasets and the Hugging Face model cache 
 
 ## Enable Asynchronous Checkpointing
 
-NeMo AutoModel can write checkpoints asynchronously to reduce training stalls caused by I/O. When enabled, checkpoint writes are scheduled in the background using PyTorch Distributed Checkpointing's async API while training continues.
+Checkpointing is synchronous by default. NeMo AutoModel can instead write checkpoints asynchronously to reduce training stalls caused by I/O. When enabled, checkpoint writes are scheduled in the background using PyTorch Distributed Checkpointing's async API while training continues.
 
 - **Enable** (YAML):
   ```yaml
@@ -373,7 +373,7 @@ NeMo AutoModel can write checkpoints asynchronously to reduce training stalls ca
 - **Enable** (CLI): add `--checkpoint.is_async True` to your run command.
 - **Requirements**: PyTorch ≥ 2.9.0. If an older version is detected, async mode is automatically disabled.
 - **Behavior**: At most one checkpoint is written at a time. The next save waits for the previous write to finish.
-- **Publication**: The `LATEST` symbolic link is updated after the asynchronous save completes. For intermediate checkpoints, publication can be deferred until the next save call. Before shutting down, each recipe waits for the final asynchronous checkpoint and publishes `LATEST` before closing the checkpointer.
+- **Publication**: The next save call waits for and publishes the previous asynchronous checkpoint. On clean shutdown, each recipe waits for and publishes the final checkpoint before closing the checkpointer. A forced termination before either point can leave a finished background write unpublished, as described in [Interrupted Saves](#interrupted-saves).
 - **PEFT**: Adapter model files are written synchronously on rank 0; optimizer states can still be written asynchronously.
 
 ## Preemption Checkpointing
