@@ -41,7 +41,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       # `fern check` validates that every path: referenced by docs.yml / the
       # version YAMLs exists on disk. The frozen v0.4 pages are archived off main,
@@ -51,9 +51,10 @@ jobs:
         with:
           archived-versions: |
             v0.4=docs-archive
+            v0.5=docs-archive
 
       - name: Setup Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: '20'
 

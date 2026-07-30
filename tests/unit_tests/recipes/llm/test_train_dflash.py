@@ -417,6 +417,7 @@ def _load_extra_state_self(mask_token_id=7):
         runtime=SimpleNamespace(global_step=0),
         _resume_epoch=0,
         mask_token_id=mask_token_id,
+        checkpoint_config=SimpleNamespace(allow_legacy_pickle_restore=False),
     )
 
 
@@ -499,3 +500,41 @@ def test_build_trainer_module_loss_type_null_falls_back_to_default():
     recipe = _bare_dflash_recipe()
     module = recipe._build_trainer_module("sdpa", {"loss_type": None})
     assert module.loss_type == "dflash"
+
+
+def test_train_metric_sums_are_additive_not_per_micro_batch():
+    """``train/accept_len`` must be reported over the same window as ``train/loss``.
+
+    Returning ``metrics.accept_len`` (the per-micro-batch mean) reported a single
+    micro-batch out of ``log_every_steps * grad_accumulation_steps``, so the
+    curve was a far noisier sample than the loss curve drawn beside it.
+    """
+    recipe = _bare_dflash_recipe()
+    window = [
+        SimpleNamespace(accept_len_sum=torch.tensor(6.0), valid_blocks=torch.tensor(4.0)),
+        SimpleNamespace(accept_len_sum=torch.tensor(1.0), valid_blocks=torch.tensor(1.0)),
+    ]
+
+    totals = [0.0, 0.0]
+    for metrics in window:
+        numerator, denominator = recipe._extra_train_metric_sums(metrics)["train/accept_len"]
+        totals[0] += numerator
+        totals[1] += denominator
+
+    # Block-weighted over the window (7/5), not the last micro-batch's 1.0.
+    assert totals[0] / totals[1] == pytest.approx(7.0 / 5.0)
+    assert recipe._extra_train_metric_sums(window[-1])["train/accept_len"] == (
+        pytest.approx(1.0),
+        pytest.approx(1.0),
+    )
+
+
+def test_train_metric_sums_denominator_can_be_zero():
+    """A micro-batch with no evaluated blocks must not be averaged into the window.
+
+    The log point divides only when the accumulated denominator is positive, so a
+    zero here has to survive as a zero rather than raising or silently counting.
+    """
+    recipe = _bare_dflash_recipe()
+    metrics = SimpleNamespace(accept_len_sum=torch.tensor(0.0), valid_blocks=torch.tensor(0.0))
+    assert recipe._extra_train_metric_sums(metrics)["train/accept_len"] == (0.0, 0.0)

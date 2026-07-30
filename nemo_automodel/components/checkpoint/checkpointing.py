@@ -16,6 +16,8 @@ import gc
 import glob
 import logging
 import os
+import pickle
+import threading
 import time
 from dataclasses import dataclass
 from datetime import timedelta
@@ -44,8 +46,10 @@ from safetensors.torch import load as safetensors_load
 from safetensors.torch import load_file, save_file
 from safetensors.torch import save as safetensors_save
 from torch import nn
+from torch.distributed.checkpoint.storage import StorageReader, StorageWriter
 from torch.distributed.device_mesh import DeviceMesh
 from torch.nn.parallel import DistributedDataParallel
+from torch.serialization import MAP_LOCATION, FileLike
 
 from nemo_automodel.components.checkpoint._backports.consolidate_hf_safetensors import (
     consolidate_safetensors_files_on_every_rank,
@@ -88,6 +92,70 @@ _CONSOLIDATED_SIZE_WARNING_THRESHOLD_BYTES = 50 * 1024**3
 _DEFAULT_HF_CONSOLIDATED_SHARD_SIZE_BYTES = 5 * 1024**3
 
 logger = logging.getLogger(__name__)
+
+
+def _format_restricted_load_error(f: FileLike) -> str:
+    return (
+        f"Refusing to load torch artifact from {f!r} with pickle-based torch.load. "
+        "The artifact is not compatible with torch.load(weights_only=True), and loading it with "
+        "weights_only=False can execute code. Migrate the artifact in a restricted environment."
+    )
+
+
+def load_torch_ckpt(
+    f: FileLike,
+    map_location: MAP_LOCATION = None,
+    pickle_module: Any = None,
+    *,
+    weights_only: bool | None = None,
+    mmap: bool | None = None,
+    **pickle_load_args: Any,
+) -> Any:
+    """Load a torch checkpoint with restricted unpickling by default.
+
+    Args:
+        f: File path or binary file object accepted by ``torch.load``.
+        map_location: Device remapping accepted by ``torch.load``.
+        pickle_module: Module used to unpickle metadata and objects.
+        weights_only: When ``False``, explicitly opt into unrestricted pickle loading.
+            ``None`` and ``True`` use restricted loading.
+        mmap: Whether to memory-map tensor storages from a file path.
+        **pickle_load_args: Additional arguments forwarded to the unpickler.
+
+    Returns:
+        The deserialized checkpoint.
+
+    Raises:
+        RuntimeError: If restricted loading rejects the artifact.
+    """
+    if weights_only is False:
+        logger.warning(
+            "Loading torch artifact from %r with weights_only=False. This can execute code; "
+            "only load checkpoints from a trusted source.",
+            f,
+        )
+        # B614 is suppressed only for explicit caller opt-in to trusted legacy checkpoints.
+        # Remove this branch when pickle-based checkpoint compatibility is no longer supported.
+        return torch.load(  # nosec B614
+            f,
+            map_location=map_location,
+            pickle_module=pickle_module,
+            weights_only=False,
+            mmap=mmap,
+            **pickle_load_args,
+        )
+
+    try:
+        return torch.load(
+            f,
+            map_location=map_location,
+            pickle_module=pickle_module,
+            weights_only=True,
+            mmap=mmap,
+            **pickle_load_args,
+        )
+    except pickle.UnpicklingError as err:
+        raise RuntimeError(_format_restricted_load_error(f)) from err
 
 
 # NOTE [nemotron-singlegpu-lora]: the branches tagged with this marker below exist to make
@@ -203,9 +271,7 @@ def _load_safetensors(path: str) -> dict[str, torch.Tensor]:
     return load_file(path)
 
 
-def _maybe_msc_reader(
-    path: str, storage_reader: Optional[_HuggingFaceStorageReader]
-) -> Optional[_HuggingFaceStorageReader]:
+def _maybe_msc_reader(path: str, storage_reader: StorageReader | None) -> StorageReader | None:
     """Return an MSC filesystem reader for ``msc://`` paths, else the given reader."""
     if storage_reader is None and is_cloud_path(path):
         _ensure_msc_available()
@@ -213,9 +279,7 @@ def _maybe_msc_reader(
     return storage_reader
 
 
-def _maybe_msc_writer(
-    path: str, storage_writer: Optional[_HuggingFaceStorageWriter]
-) -> Optional[_HuggingFaceStorageWriter]:
+def _maybe_msc_writer(path: str, storage_writer: StorageWriter | None) -> StorageWriter | None:
     """Return an MSC filesystem writer for ``msc://`` paths, else the given writer."""
     if storage_writer is None and is_cloud_path(path):
         _ensure_msc_available()
@@ -266,7 +330,7 @@ def _summarize_state_dict_key_diff(
 
 def _get_checkpoint_metadata_keys(
     path: str,
-    storage_reader: Optional[_HuggingFaceStorageReader] = None,
+    storage_reader: StorageReader | None = None,
 ) -> set[str]:
     """Return checkpoint FQNs present in metadata."""
     reader = storage_reader if storage_reader is not None else FileSystemReader(path)
@@ -466,7 +530,7 @@ class Checkpointer:
             self._optim_ctx.stager = DefaultStager()
             self._model_ctx.process_group = _new_gloo_process_group(process_group)
             self._optim_ctx.process_group = _new_gloo_process_group(process_group)
-        elif (
+        if (
             torch.distributed.is_initialized()
             and torch.distributed.get_world_size(group=process_group) > 1
             and _should_write_hf_metadata(self.config)
@@ -479,6 +543,8 @@ class Checkpointer:
                 process_group,
                 timeout=timedelta(minutes=self.config.consolidation_timeout_minutes),
             )
+        self._consolidation_thread: threading.Thread | None = None
+        self._consolidation_error: BaseException | None = None
 
         self._addons = []
         if _should_write_hf_metadata(self.config):
@@ -521,10 +587,15 @@ class Checkpointer:
 
         # Because this call lies outside of the dcp save call, we need to consolidate on all ranks on the main process
         # of all ranks, which lies on the critical path. Therefore, we can only do this outside of async mode.
+        # In async mode the same distributed consolidation is deferred to a background thread on every rank that
+        # waits for the async upload to finish, instead of the storage writer's single-rank finish() consolidation.
         # If single_rank_consolidation is set, we skip distributed consolidation and let rank 0 handle it
         # via the storage writer's finish() method - useful for Unity Catalog Volumes.
         consolidate_on_all_ranks = (
             should_write_consolidated and not self.config.is_async and not self.config.single_rank_consolidation
+        )
+        defer_consolidation = (
+            should_write_consolidated and self.config.is_async and not self.config.single_rank_consolidation
         )
         consolidation_process_group = (
             self._consolidation_process_group if self._consolidation_process_group is not None else self.process_group
@@ -576,7 +647,11 @@ class Checkpointer:
         self._maybe_write_offline_consolidation_script(model_dir)
 
         storage_writer = self._get_storage_writer(
-            consolidated_dir, fqn_to_file_index_mapping, fqn_to_dtype_mapping, model_dir, consolidate_on_all_ranks
+            consolidated_dir,
+            fqn_to_file_index_mapping,
+            fqn_to_dtype_mapping,
+            model_dir,
+            consolidate_on_all_ranks or defer_consolidation,
         )
         self._model_ctx.future = self._do_save(state_dict, model_dir, storage_writer)
 
@@ -603,43 +678,80 @@ class Checkpointer:
                     _maybe_rename_index_for_diffusers(consolidated_dir)
             if is_rank_0():
                 logger.info("Successfully exported consolidated HF safetensors to %s.", consolidated_dir)
+        elif defer_consolidation:
+            self._schedule_deferred_consolidation(
+                self._model_ctx.future,
+                model_dir,
+                consolidated_dir,
+                fqn_to_file_index_mapping,
+                fqn_to_dtype_mapping,
+                consolidation_process_group,
+            )
         self._maybe_log_final_offline_consolidation_hint(model_dir, is_final_checkpoint)
 
     @torch.no_grad()
     def save_optimizer(
-        self, optimizer: torch.optim.Optimizer, model: nn.Module, weights_path: str, scheduler: Optional[Any] = None
+        self,
+        optimizer: torch.optim.Optimizer | list[torch.optim.Optimizer],
+        model: nn.Module | list[nn.Module],
+        weights_path: str,
+        scheduler: Optional[Any] = None,
+        *,
+        optimizer_part_ids: list[int] | None = None,
     ) -> None:
         """
         Save optimizer (and optional scheduler) state to `weights_path/optim` using DCP.
 
         Args:
-            optimizer: Optimizer whose state will be saved.
-            model: Model providing partitioning context for the optimizer wrapper.
+            optimizer: Optimizer or per-model-part optimizers whose state will be saved.
+            model: Model or pipeline model parts providing partitioning context.
             weights_path: Base directory for checkpoints.
             scheduler: Optional LR scheduler to include.
+            optimizer_part_ids: Global pipeline-stage indices corresponding to
+                per-model-part optimizers.
         """
         optimizer_path = os.path.join(weights_path, "optim")
         _ensure_dirs(optimizer_path, process_group=self.process_group)
         optimizer_state = OptimizerState(
-            model, optimizer, scheduler, is_peft=self.config.is_peft, cpu_offload=self.config.cpu_offload
+            model,
+            optimizer,
+            scheduler,
+            is_peft=self.config.is_peft,
+            cpu_offload=self.config.cpu_offload,
+            has_expert_parallelism=self.moe_mesh is not None,
+            optimizer_part_ids=optimizer_part_ids,
         )
         state_dict = optimizer_state.state_dict()
         self._optim_ctx.future = self._do_save(state_dict, optimizer_path)
 
     def load_optimizer(
-        self, optimizer: torch.optim.Optimizer, model: nn.Module, weights_path: str, scheduler: Optional[Any] = None
+        self,
+        optimizer: torch.optim.Optimizer | list[torch.optim.Optimizer],
+        model: nn.Module | list[nn.Module],
+        weights_path: str,
+        scheduler: Optional[Any] = None,
+        *,
+        optimizer_part_ids: list[int] | None = None,
     ) -> None:
         """
         Load optimizer (and optional scheduler) state from `weights_path/optim` using DCP.
 
         Args:
-            optimizer: Optimizer to populate.
-            model: Model providing partitioning context for the optimizer wrapper.
+            optimizer: Optimizer or per-model-part optimizers to populate.
+            model: Model or pipeline model parts providing partitioning context.
             weights_path: Base directory for checkpoints.
             scheduler: Optional LR scheduler to populate.
+            optimizer_part_ids: Global pipeline-stage indices corresponding to
+                per-model-part optimizers.
         """
         optimizer_state = OptimizerState(
-            model, optimizer, scheduler, is_peft=self.config.is_peft, cpu_offload=self.config.cpu_offload
+            model,
+            optimizer,
+            scheduler,
+            is_peft=self.config.is_peft,
+            cpu_offload=self.config.cpu_offload,
+            has_expert_parallelism=self.moe_mesh is not None,
+            optimizer_part_ids=optimizer_part_ids,
         )
         state_dict = optimizer_state.state_dict()
         self._do_load(state_dict, os.path.join(weights_path, "optim"))
@@ -737,8 +849,7 @@ class Checkpointer:
             )
         ):
             t0 = time.monotonic()
-            weights_only = not _is_remote_code_model(model_state.model[0])
-            state_dict_from_disk = _load_hf_checkpoint_preserving_dtype(model_path, weights_only=weights_only)
+            state_dict_from_disk = _load_hf_checkpoint_preserving_dtype(model_path)
             t_disk = time.monotonic()
             if state_dict_from_disk is not None:
                 state_dict_from_disk = _maybe_adapt_state_dict_from_hf(
@@ -992,16 +1103,22 @@ class Checkpointer:
         #   init.zeros_(module.weight[module.padding_idx]) on the embedding layer, which
         #   triggers DTensor redistribute and fails with sharded (TP) embeddings.
         # - NemotronHForCausalLM: the HF remote code's _init_weights uses dt_bias.copy_()
-        #   which fails with DTensors. This applies to:
-        #   - v2 (non-MoE, no n_routed_experts): always uses HF remote code.
-        #   - v3 (MoE, has n_routed_experts) with force_hf=True: also uses HF remote code
-        #     (detected via model.backbone attribute). When force_hf=False, v3 uses our custom
-        #     implementation (model.model with ModuleDict layers) which handles this correctly.
+        #   which fails with DTensors. This applies to the HF-remote-code path only
+        #   (detected via the model.backbone attribute), for both:
+        #   - dense/v2 (no n_routed_experts) under force_hf=True, and
+        #   - v3 (MoE, has n_routed_experts) under force_hf=True.
+        #   With force_hf=False, both dense and v3 use our custom implementation
+        #   (model.model with ModuleDict layers), which runs its own initialize_weights
+        #   correctly, so the skip must NOT apply there.
         try:
             model_class = model.config.architectures[0]
         except Exception:
             model_class = ""
-        is_nemotron_v2 = model_class == "NemotronHForCausalLM" and not getattr(model.config, "n_routed_experts", None)
+        is_nemotron_v2 = (
+            model_class == "NemotronHForCausalLM"
+            and not getattr(model.config, "n_routed_experts", None)
+            and hasattr(model, "backbone")  # HF remote-code path only; custom dense runs its own init
+        )
         is_nemotron_v3_hf = (
             model_class == "NemotronHForCausalLM"
             and getattr(model.config, "n_routed_experts", None)  # is Nemotron V3
@@ -1128,14 +1245,89 @@ class Checkpointer:
 
     def async_wait(self) -> None:
         """
-        Wait for the async save to finish.
+        Wait for the async save (and any deferred consolidation) to finish.
         """
         if self._model_ctx.future is not None:
             self._model_ctx.future.upload_completion.result()
             self._model_ctx.future = None
+            self._release_async_stager(self._model_ctx)
         if self._optim_ctx.future is not None:
             self._optim_ctx.future.upload_completion.result()
             self._optim_ctx.future = None
+            self._release_async_stager(self._optim_ctx)
+        self._join_deferred_consolidation()
+
+    @staticmethod
+    def _release_async_stager(context: _AsyncSaveContext) -> None:
+        """Close a completed async stager so the next save uses a fresh instance."""
+        if context.stager is not None:
+            context.stager.close()
+            context.stager = None
+
+    def _schedule_deferred_consolidation(
+        self,
+        future: "AsyncSaveResponse | None",
+        model_dir: str,
+        consolidated_dir: str,
+        fqn_to_index_mapping: dict[str, int] | None,
+        fqn_to_dtype_mapping: dict[str, str] | None,
+        process_group: "torch.distributed.ProcessGroup | None",
+    ) -> None:
+        """
+        Consolidate HF safetensors on a background thread once the async upload completes.
+
+        Every rank schedules the same distributed consolidation used in sync mode, so the
+        shards written by the async save are merged in parallel across ranks without
+        blocking the training loop. Collectives inside the consolidation run on the
+        dedicated Gloo group created at init.
+
+        Args:
+            future: Async save response whose ``upload_completion`` gates the consolidation.
+            model_dir: Directory holding the sharded safetensors written by the async save.
+            consolidated_dir: Output directory for the consolidated HF safetensors.
+            fqn_to_index_mapping: Mapping from tensor FQN to consolidated output file index.
+            fqn_to_dtype_mapping: Optional mapping from tensor FQN to original HF dtype string.
+            process_group: Group the consolidation collectives run on; the same one the
+                synchronous path and the save addons use.
+        """
+        self._join_deferred_consolidation()
+
+        def _consolidate() -> None:
+            try:
+                if future is not None:
+                    future.upload_completion.result()
+                consolidate_safetensors_files_on_every_rank(
+                    input_dir=model_dir,
+                    output_dir=consolidated_dir,
+                    fqn_to_index_mapping=fqn_to_index_mapping,
+                    num_threads=5,
+                    use_staging=self.config.staging_dir is not None,
+                    staging_dir=self.config.staging_dir,
+                    fqn_to_dtype_mapping=fqn_to_dtype_mapping,
+                    process_group=process_group,
+                )
+                if self.config.diffusers_compatible and is_rank_0():
+                    _maybe_rename_index_for_diffusers(consolidated_dir)
+                if is_rank_0():
+                    logger.info("Successfully exported consolidated HF safetensors to %s.", consolidated_dir)
+            except BaseException as e:  # noqa: B036 - re-raised on the main thread in async_wait
+                self._consolidation_error = e
+
+        self._consolidation_thread = threading.Thread(
+            target=_consolidate, name="hf-safetensors-consolidation", daemon=True
+        )
+        self._consolidation_thread.start()
+
+    def _join_deferred_consolidation(self) -> None:
+        """Wait for a pending background consolidation and surface its error, if any."""
+        thread = self._consolidation_thread
+        if thread is not None:
+            thread.join()
+            self._consolidation_thread = None
+        if self._consolidation_error is not None:
+            error = self._consolidation_error
+            self._consolidation_error = None
+            raise error
 
     def save_on_dp_ranks(self, state: Any, state_name: str, path: str) -> None:
         """
@@ -1166,7 +1358,10 @@ class Checkpointer:
         """
         state_dir = os.path.join(path, state_name)
         state.load_state_dict(
-            torch.load(os.path.join(state_dir, f"{state_name}_dp_rank_{self.dp_rank}.pt"), weights_only=False)
+            load_torch_ckpt(
+                os.path.join(state_dir, f"{state_name}_dp_rank_{self.dp_rank}.pt"),
+                weights_only=not self.config.allow_legacy_pickle_restore,
+            )
         )
 
     def save_distributed_state(self, state: Any, state_name: str, path: str) -> None:
@@ -1218,7 +1413,7 @@ class Checkpointer:
         self,
         state_dict: dict[str, torch.Tensor],
         path: str,
-        storage_reader: Optional[_HuggingFaceStorageReader] = None,
+        storage_reader: StorageReader | None = None,
         is_init_step: bool = False,
     ) -> dict[str, torch.Tensor]:
         """
@@ -1246,7 +1441,7 @@ class Checkpointer:
         return state_dict
 
     def _do_save(
-        self, state_dict: dict[str, torch.Tensor], path: str, storage_writer: Optional[_HuggingFaceStorageWriter] = None
+        self, state_dict: dict[str, torch.Tensor], path: str, storage_writer: StorageWriter | None = None
     ) -> Optional["AsyncSaveResponse"]:
         """
         Save a state dictionary to `path` using DCP or PEFT special-case logic.
@@ -1280,6 +1475,8 @@ class Checkpointer:
 
         if self.config.is_async:
             ctx = self._model_ctx if is_model else self._optim_ctx
+            if ctx.stager is None:
+                ctx.stager = DefaultStager()
             ret = dcp.async_save(
                 state_dict,
                 checkpoint_id=path,
@@ -1400,6 +1597,7 @@ fi
         if not _should_write_hf_metadata(self.config):
             return None
         model = model_state.model[0]
+        excluded_keys: set[str] = set()
         # we first need to find the FQN -> .safetensors mapping
         reference_path = _get_hf_safetensors_reference_path(
             self.config.model_cache_dir,
@@ -1435,6 +1633,7 @@ fi
                 # `uses_tied_lm_head=True` but must still persist their own lm_head.
                 if getattr(model_state, "has_local_tied_lm_head", False):
                     keys_to_remove.append(model_state.lm_head_param_name)
+                excluded_keys.update(keys_to_remove)
                 for key in keys_to_remove:
                     fqn_to_file_index_mapping.pop(key, None)
         else:
@@ -1457,14 +1656,18 @@ fi
                     num_shards,
                 )
 
-        # Add any missing keys from the model_state_dict
-        # These will go to the same file as the last file (or file 1 for single-file models)
+        # Add any missing keys from the global pre-shard HF state dict and the current state dict.
+        # These will go to the same file as the last file (or file 1 for single-file models).
+        # The global keys keep mappings complete under PP, while the current keys preserve
+        # parameters registered after parallelization, such as test- or application-owned weights.
         # Use default of 1 when mapping is empty (e.g., encoder models with different key prefixes)
         default_index = max(fqn_to_file_index_mapping.values()) if fqn_to_file_index_mapping else 1
 
         # add any additional keys that are not in the base checkpoint
-        for fqn in list(state_dict.keys()):
-            fqn_to_file_index_mapping[fqn] = fqn_to_file_index_mapping.get(fqn, default_index)
+        additional_keys = dict.fromkeys([*(pre_shard_hf_state_dict_keys or ()), *state_dict])
+        for fqn in additional_keys:
+            if fqn not in excluded_keys:
+                fqn_to_file_index_mapping[fqn] = fqn_to_file_index_mapping.get(fqn, default_index)
         return fqn_to_file_index_mapping
 
     def _maybe_build_original_dtype_mapping(
@@ -1503,8 +1706,8 @@ fi
         fqn_to_index_mapping: Optional[dict[str, int]],
         fqn_to_dtype_mapping: Optional[dict[str, str]],
         model_path: str,
-        consolidate_on_all_ranks: bool = False,
-    ) -> Optional[_HuggingFaceStorageWriter]:
+        consolidation_handled_externally: bool = False,
+    ) -> StorageWriter | None:
         """
         Construct a Hugging Face storage writer for sharded safetensors.
 
@@ -1513,16 +1716,18 @@ fi
             fqn_to_index_mapping: Optional mapping from FQN to shard index.
             fqn_to_dtype_mapping: Optional mapping from FQN to original HF safetensors dtype string.
             model_path: Path where the model checkpoint is saved.
-            consolidate_on_all_ranks: If True, consolidate on all ranks on the main process.
+            consolidation_handled_externally: If True, consolidation happens outside the writer
+                (inline on all ranks in sync mode, or on a background thread in async mode), so
+                the writer's own finish() consolidation is disabled.
 
         Returns:
-            Configured `_HuggingFaceStorageWriter` or None for non-safetensors.
+            Configured storage writer or None for non-safetensors.
         """
         if self.config.model_save_format == SerializationFormat.SAFETENSORS:
             return _HuggingFaceStorageWriter(
                 path=model_path,
                 save_sharded=True,
-                consolidated_output_path=consolidated_output_path if not consolidate_on_all_ranks else None,
+                consolidated_output_path=consolidated_output_path if not consolidation_handled_externally else None,
                 fqn_to_index_mapping=fqn_to_index_mapping,
                 fqn_to_dtype_mapping=fqn_to_dtype_mapping,
                 staging_dir=self.config.staging_dir,
@@ -1535,7 +1740,7 @@ fi
         key_mapping: Optional[dict[str, str]],
         is_init_step: bool = False,
         is_safetensors: bool | None = None,
-    ) -> Optional[_HuggingFaceStorageReader]:
+    ) -> StorageReader | None:
         """
         Construct a Hugging Face storage reader when loading safetensors or during init.
 
@@ -2275,14 +2480,7 @@ def _is_custom_model(module: nn.Module) -> bool:
     )
 
 
-def _is_remote_code_model(module: nn.Module) -> bool:
-    """True if the model was loaded with trust_remote_code (HF dynamic modules)."""
-    return any("transformers_modules" in (c.__module__ or "") for c in type(module).__mro__)
-
-
-def _load_hf_checkpoint_preserving_dtype(
-    model_path: str, weights_only: bool = True
-) -> Optional[dict[str, torch.Tensor]]:
+def _load_hf_checkpoint_preserving_dtype(model_path: str) -> Optional[dict[str, torch.Tensor]]:
     """
     Load a HuggingFace checkpoint into a new state dict so tensor dtypes
     match the checkpoint (e.g. bf16). Used when loading the base model so FSDP sees
@@ -2292,11 +2490,10 @@ def _load_hf_checkpoint_preserving_dtype(
 
     Args:
         model_path: Path to checkpoint file or directory.
-        weights_only: Forwarded to ``torch.load`` when loading ``.bin`` files.
     """
 
     if _is_bin_checkpoint(model_path):
-        return _load_hf_bin_checkpoint(model_path, weights_only=weights_only)
+        return _load_hf_bin_checkpoint(model_path)
     elif _is_safetensors_checkpoint(model_path):
         return _load_hf_safetensors_checkpoint(model_path)
     return None
@@ -2339,7 +2536,7 @@ def _load_hf_safetensors_checkpoint(model_path: str) -> Optional[dict[str, torch
 load_hf_safetensors_state_dict = _load_hf_safetensors_checkpoint
 
 
-def _load_hf_bin_checkpoint(model_path: str, weights_only: bool = True) -> Optional[dict[str, torch.Tensor]]:
+def _load_hf_bin_checkpoint(model_path: str) -> Optional[dict[str, torch.Tensor]]:
     """
     Load a HuggingFace .bin checkpoint into a state dict.
 
@@ -2349,17 +2546,15 @@ def _load_hf_bin_checkpoint(model_path: str, weights_only: bool = True) -> Optio
 
     Args:
         model_path: Path to checkpoint file or directory.
-        weights_only: Passed to ``torch.load``.  Default ``True`` for safety;
-            set to ``False`` for remote-code models whose checkpoints may
-            contain custom pickled objects.
     """
     if not _is_bin_checkpoint(model_path):
         return None
 
-    load_kwargs = dict(map_location="cpu", weights_only=weights_only)
-
     if os.path.isfile(model_path):
-        return torch.load(model_path, **load_kwargs)
+        return load_torch_ckpt(
+            model_path,
+            map_location="cpu",
+        )
 
     # Sharded: read the index and load each shard
     index_file = os.path.join(model_path, "pytorch_model.bin.index.json")
@@ -2377,7 +2572,10 @@ def _load_hf_bin_checkpoint(model_path: str, weights_only: bool = True) -> Optio
             bin_path = os.path.join(model_path, filename)
             if not os.path.isfile(bin_path):
                 continue
-            shard = torch.load(bin_path, **load_kwargs)
+            shard = load_torch_ckpt(
+                bin_path,
+                map_location="cpu",
+            )
             out.update(shard)
             loaded_files.add(filename)
         return out if out else None
@@ -2385,12 +2583,18 @@ def _load_hf_bin_checkpoint(model_path: str, weights_only: bool = True) -> Optio
     # Single file
     single = os.path.join(model_path, "pytorch_model.bin")
     if os.path.isfile(single):
-        return torch.load(single, **load_kwargs)
+        return load_torch_ckpt(
+            single,
+            map_location="cpu",
+        )
 
     # Glob fallback
     out = {}
     for bin_path in sorted(glob.glob(os.path.join(model_path, "*.bin"))):
-        shard = torch.load(bin_path, **load_kwargs)
+        shard = load_torch_ckpt(
+            bin_path,
+            map_location="cpu",
+        )
         out.update(shard)
     return out if out else None
 

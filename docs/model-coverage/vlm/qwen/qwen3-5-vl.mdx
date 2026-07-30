@@ -36,6 +36,7 @@ Qwen3.5-VL is Alibaba Cloud's next-generation vision language model series, incl
 | [qwen3_5_9b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5/qwen3_5_9b.yaml) | MedPix-VQA | SFT — Qwen3.5-VL 9B on MedPix |
 | [qwen3_5_moe_medpix.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5_moe/qwen3_5_moe_medpix.yaml) | MedPix-VQA | SFT — Qwen3.5-MoE on MedPix |
 | [qwen3_5_35b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5_moe/qwen3_5_35b.yaml) | MedPix-VQA | SFT — Qwen3.5 35B on MedPix |
+| [qwen3_5_122b_128k_ep8cp32.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5_moe/qwen3_5_122b_128k_ep8cp32.yaml) | MedPix-VQA | SFT — Qwen3.5-MoE 122B with EP8, CP32, 128K packing, and a trainable vision tower |
 | [qwen3_6_27b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5/qwen3_6_27b.yaml) | MedPix-VQA | SFT — Qwen3.6-27B on MedPix |
 | [qwen3_6_35b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5_moe/qwen3_6_35b.yaml) | MedPix-VQA | SFT — Qwen3.6 35B-A3B on MedPix |
 
@@ -89,6 +90,24 @@ See the [Installation Guide](/get-started/installation) and [VLM Fine-Tuning Gui
 ## Fine-Tuning
 
 See the [VLM Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n).
+
+### Validated Large-Model, Long-Context Scale
+
+The Qwen3.5-MoE VLM training path has been validated at both
+**397-billion-parameter model scale** and **128K context length**.
+Qwen3.5-397B-A17B completed a 10-step end-to-end training run on 256 H100 GPUs
+with FSDP2, CP64, EP64, packed sequences, full activation checkpointing, and a
+trainable vision tower. The workload mixed text, image, and video data and
+included genuine examples of approximately 120K tokens.
+
+The run maintained finite, decreasing loss, validating the training mechanics
+for this combined large-model and long-context regime. It is not a model
+convergence result. A public 397B recipe is not currently included; use the
+122B EP8/CP32 recipe as the closest published reference.
+
+Dense Qwen3.5 and Qwen3.5-MoE support context-parallel vision frame sharding. The
+Qwen3.5-MoE path composes expert and context parallelism with packed sequences; see the
+[Context-Parallel Vision Frame Sharding guide](/development/cp-vision-frame-sharding).
 
 ## Hugging Face Model Cards
 

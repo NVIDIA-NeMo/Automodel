@@ -99,11 +99,15 @@ def iter_maximal_uniform_dtype_subtrees(
 def _group_params_by_dtype(
     layer: nn.Module,
     dtype_of: Optional[Callable[[torch.Tensor], torch.dtype]] = None,
+    ignored_params: set[nn.Parameter] | None = None,
 ) -> Dict[torch.dtype, List[nn.Parameter]]:
     if dtype_of is None:
         dtype_of = lambda t: t.dtype
+    ignored_param_ids = {id(param) for param in ignored_params or ()}
     ans: Dict[torch.dtype, List[nn.Parameter]] = {}
     for name, param in layer.named_parameters():
+        if id(param) in ignored_param_ids:
+            continue
         dtype = dtype_of(param)
         if dtype not in ans:
             ans[dtype] = []
@@ -123,19 +127,59 @@ def _fully_shard(
     mp_policy: Optional[MixedPrecisionPolicy],
     offload_policy: Optional[OffloadPolicy],
     reshard_after_forward: bool | int | None = None,
+    ignored_params: set[nn.Parameter] | None = None,
+    fully_shard_fn: Callable[..., None] | None = None,
 ) -> None:
     if isinstance(module, nn.ModuleList):
         for layer in module:
-            _fully_shard(layer, mesh, mp_policy, offload_policy, reshard_after_forward)
+            _fully_shard(
+                layer,
+                mesh,
+                mp_policy,
+                offload_policy,
+                reshard_after_forward,
+                ignored_params,
+                fully_shard_fn,
+            )
     else:
-        kwargs = {
-            "mesh": mesh,
-            "mp_policy": mp_policy,
-            "offload_policy": offload_policy,
-        }
-        if reshard_after_forward is not None:
-            kwargs["reshard_after_forward"] = reshard_after_forward
-        fully_shard(module, **kwargs)
+        _call_fully_shard(
+            module,
+            mesh,
+            mp_policy,
+            offload_policy,
+            reshard_after_forward,
+            ignored_params,
+            fully_shard_fn,
+        )
+
+
+def _call_fully_shard(
+    module: nn.Module,
+    mesh: DeviceMesh,
+    mp_policy: Optional[MixedPrecisionPolicy],
+    offload_policy: Optional[OffloadPolicy],
+    reshard_after_forward: bool | int | None = None,
+    ignored_params: set[nn.Parameter] | None = None,
+    fully_shard_fn: Callable[..., None] | None = None,
+) -> None:
+    if fully_shard_fn is None:
+        fully_shard_fn = fully_shard
+
+    kwargs = {
+        "mesh": mesh,
+        "mp_policy": mp_policy,
+        "offload_policy": offload_policy,
+    }
+    if reshard_after_forward is not None:
+        kwargs["reshard_after_forward"] = reshard_after_forward
+
+    if ignored_params:
+        module_param_ids = {id(param) for param in module.parameters()}
+        module_ignored_params = {param for param in ignored_params if id(param) in module_param_ids}
+        if module_ignored_params:
+            kwargs["ignored_params"] = module_ignored_params
+
+    fully_shard_fn(module, **kwargs)
 
 
 def _mp_policy_with_param_dtype(
@@ -146,6 +190,13 @@ def _mp_policy_with_param_dtype(
         return None
     mp_policy_copy = copy(mp_policy)
     object.__setattr__(mp_policy_copy, "param_dtype", param_dtype)
+    if param_dtype == torch.float32:
+        object.__setattr__(mp_policy_copy, "reduce_dtype", torch.float32)
+        object.__setattr__(mp_policy_copy, "output_dtype", torch.float32)
+        # FP32 compute modules own any required input cast. Casting at the nested
+        # FSDP boundary changes the module-visible input dtype and can make an
+        # activation-checkpoint recompute disagree with the original forward.
+        object.__setattr__(mp_policy_copy, "cast_forward_inputs", False)
     return mp_policy_copy
 
 
@@ -153,6 +204,7 @@ def _make_compute_dtype_fn(
     module: nn.Module,
     mp_policy: Optional[MixedPrecisionPolicy],
     fp32_compute_module_names: Tuple[str, ...],
+    ignored_params: set[nn.Parameter] | None = None,
 ) -> Callable[[torch.Tensor], torch.dtype]:
     """Build the per-parameter *compute* dtype resolver used to group FSDP units.
 
@@ -184,13 +236,18 @@ def _make_compute_dtype_fn(
     # The policy fallback only represents "fp32 master weights -> compute in policy
     # dtype" when the module's floating storage is uniform. If storage is already
     # mixed, unhinted params keep their storage dtype instead (see precedence above).
-    floating_storage_dtypes = {t.dtype for t in (*module.parameters(), *module.buffers()) if t.dtype.is_floating_point}
+    ignored_param_ids = {id(param) for param in ignored_params or ()}
+    floating_storage_dtypes = {
+        tensor.dtype
+        for tensor in (*module.parameters(), *module.buffers())
+        if id(tensor) not in ignored_param_ids and tensor.dtype.is_floating_point
+    }
     storage_is_uniform = len(floating_storage_dtypes) <= 1
 
     pinned_ids: Set[int] = set()
     if fp32_compute_module_names:
         for name, tensor in (*module.named_parameters(), *module.named_buffers()):
-            if any(token in name for token in fp32_compute_module_names):
+            if id(tensor) not in ignored_param_ids and any(token in name for token in fp32_compute_module_names):
                 pinned_ids.add(id(tensor))
 
     def compute_dtype_of(t: torch.Tensor) -> torch.dtype:
@@ -215,6 +272,8 @@ def fully_shard_by_dtype(
     offload_policy: Optional[OffloadPolicy],
     fp32_compute_module_names: Tuple[str, ...] = (),
     reshard_after_forward: bool | int | None = None,
+    ignored_params: set[nn.Parameter] | None = None,
+    fully_shard_fn: Callable[..., None] | None = None,
 ) -> None:
     """Fully shard a module so every parameter computes in its required dtype.
 
@@ -238,11 +297,25 @@ def fully_shard_by_dtype(
     Args:
         fp32_compute_module_names: Parameter/buffer name substrings that must compute in
             fp32 (e.g. ``("_fp32_params",)`` for Qwen3.5's GatedDeltaNet fp32 holder).
-            Sourced from the model's ``_keep_in_fp32_modules_strict``.
+            Sourced from the model's ``_keep_in_fp32_modules_strict``. Matched callable
+            modules must cast their own inputs when required; their nested FP32 FSDP
+            units preserve the parent activation dtype at the module boundary.
         reshard_after_forward: Optional FSDP2 reshard override for this module.
             ``None`` leaves the caller's default FSDP2 behavior unchanged.
+        ignored_params: Parameters already owned by another FSDP or parallelism
+            unit. They are excluded from dtype grouping and forwarded to the
+            enclosing FSDP unit.
+        fully_shard_fn: Optional model-specific replacement for ``fully_shard``.
+            Every FSDP unit created by this function uses this callback.
     """
-    compute_dtype_of = _make_compute_dtype_fn(module, mp_policy, fp32_compute_module_names)
+    ignored_params = set(ignored_params or ())
+    ignored_param_ids = {id(param) for param in ignored_params}
+    compute_dtype_of = _make_compute_dtype_fn(
+        module,
+        mp_policy,
+        fp32_compute_module_names,
+        ignored_params=ignored_params,
+    )
 
     # FSDP2 requires every param group to be uniform in *storage* (original) dtype
     # -- ``_init_mp_dtypes`` asserts ``{p.orig_dtype}`` is a singleton -- while a group's
@@ -255,42 +328,98 @@ def fully_shard_by_dtype(
 
     # calling _group_params_by_dtype is not optimal here, because we may
     # end up with two traversals over the module, but this code is not in the hot path.
-    grouped_params = _group_params_by_dtype(module, dtype_of=group_key_of)
+    grouped_params = _group_params_by_dtype(
+        module,
+        dtype_of=group_key_of,
+        ignored_params=ignored_params,
+    )
     if len(grouped_params) == 0:
+        if ignored_params:
+            _call_fully_shard(
+                module,
+                mesh,
+                mp_policy,
+                offload_policy,
+                reshard_after_forward,
+                ignored_params,
+                fully_shard_fn,
+            )
         return
     elif len(grouped_params) == 1:
         key = next(iter(grouped_params))
-        kwargs = {
-            "mesh": mesh,
-            "mp_policy": _mp_policy_with_param_dtype(mp_policy, key[1]),
-            "offload_policy": offload_policy,
-        }
-        if reshard_after_forward is not None:
-            kwargs["reshard_after_forward"] = reshard_after_forward
-        fully_shard(module, **kwargs)
+        _call_fully_shard(
+            module,
+            mesh,
+            _mp_policy_with_param_dtype(mp_policy, key[1]),
+            offload_policy,
+            reshard_after_forward,
+            ignored_params,
+            fully_shard_fn,
+        )
     else:
         least_items_key = min(grouped_params.items(), key=lambda x: len(x[1]))[0]
-        for path, mod, key in iter_maximal_uniform_dtype_subtrees(
-            module,
-            tensor_pred=torch.is_floating_point,
-            dtype_of=group_key_of,
-            return_paths=True,
-        ):
-            if (len(grouped_params) == 2 and key == least_items_key) or len(grouped_params) > 2:
-                _fully_shard(
-                    _get_module_from_path(module, path),
-                    mesh=mesh,
-                    mp_policy=_mp_policy_with_param_dtype(mp_policy, key[1]),
-                    offload_policy=offload_policy,
-                    reshard_after_forward=reshard_after_forward,
-                )
+        uniform_subtrees = list(
+            iter_maximal_uniform_dtype_subtrees(
+                module,
+                tensor_pred=lambda tensor: torch.is_floating_point(tensor) and id(tensor) not in ignored_param_ids,
+                dtype_of=group_key_of,
+                return_paths=True,
+            )
+        )
+        selected_subtrees = [
+            (path, key, subtree)
+            for path, subtree, key in uniform_subtrees
+            if (len(grouped_params) == 2 and key == least_items_key) or len(grouped_params) > 2
+        ]
+
+        expected_keys = {least_items_key} if len(grouped_params) == 2 else set(grouped_params)
+        expected_param_ids = {id(param) for key in expected_keys for param in grouped_params[key]}
+        covered_param_ids = {
+            id(param)
+            for _, _, subtree in selected_subtrees
+            for param in subtree.parameters()
+            if id(param) not in ignored_param_ids
+        }
+        unresolved_param_ids = expected_param_ids - covered_param_ids
+        if unresolved_param_ids:
+            unresolved_names = [name for name, param in module.named_parameters() if id(param) in unresolved_param_ids]
+            raise ValueError(
+                "FSDP could not isolate parameters with a distinct dtype from siblings in the same module: "
+                f"{', '.join(unresolved_names)}. Place them in a dedicated parameter-owning module."
+            )
+
+        for path, key, _ in selected_subtrees:
+            subtree_kwargs = {
+                "mesh": mesh,
+                "mp_policy": _mp_policy_with_param_dtype(mp_policy, key[1]),
+                "offload_policy": offload_policy,
+                "reshard_after_forward": reshard_after_forward,
+            }
+            if ignored_params:
+                subtree_kwargs["ignored_params"] = ignored_params
+            if fully_shard_fn is not None:
+                subtree_kwargs["fully_shard_fn"] = fully_shard_fn
+            _fully_shard(_get_module_from_path(module, path), **subtree_kwargs)
         if len(grouped_params) == 2:
             parent_key = next(key for key in grouped_params if key != least_items_key)
-            kwargs = {
-                "mesh": mesh,
-                "mp_policy": _mp_policy_with_param_dtype(mp_policy, parent_key[1]),
-                "offload_policy": offload_policy,
-            }
-            if reshard_after_forward is not None:
-                kwargs["reshard_after_forward"] = reshard_after_forward
-            fully_shard(module, **kwargs)
+            _call_fully_shard(
+                module,
+                mesh,
+                _mp_policy_with_param_dtype(mp_policy, parent_key[1]),
+                offload_policy,
+                reshard_after_forward,
+                ignored_params,
+                fully_shard_fn,
+            )
+        elif ignored_params:
+            # Preserve the caller's FSDP ownership boundary after every managed
+            # parameter has been assigned to a dtype-specific child unit.
+            _call_fully_shard(
+                module,
+                mesh,
+                mp_policy,
+                offload_policy,
+                reshard_after_forward,
+                ignored_params,
+                fully_shard_fn,
+            )
