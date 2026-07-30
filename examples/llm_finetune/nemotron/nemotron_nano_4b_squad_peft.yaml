@@ -111,8 +111,9 @@ lr_scheduler:
 
 ci:
   vllm_deploy: true
-  recipe_owner: stanley1208
+  recipe_owner: akoumpa  # stanley1208 original committer
   time: "00:25:00"
+  nodes: 1
   checkpoint_robustness:
     vllm_merge_lora: true  # vLLM can't serve LoRA on fused mamba layers; deploy the merged adapter instead
     kl_threshold: 5e-3
