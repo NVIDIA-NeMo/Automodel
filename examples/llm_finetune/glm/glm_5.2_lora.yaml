@@ -158,4 +158,5 @@ ci:
   nodes: 16
   time: "00:20:00"
   release:
-    packed_sequence.max_packs: 6400
+    step_scheduler.max_steps: 20
+    packed_sequence.max_packs: 2560
