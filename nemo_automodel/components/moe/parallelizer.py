@@ -32,6 +32,7 @@ from torch.distributed.tensor import Shard, distribute_module, distribute_tensor
 from torch.distributed.tensor.parallel import ParallelStyle, parallelize_module
 from torch.utils.checkpoint import CheckpointPolicy, create_selective_checkpoint_contexts
 
+from nemo_automodel.components.distributed import parallelizer_utils
 from nemo_automodel.components.distributed.pipelining.hf_utils import get_text_module
 from nemo_automodel.components.moe.experts import GroupedExpertsDeepEP, GroupedExpertsTE
 from nemo_automodel.components.moe.layers import (
@@ -596,44 +597,6 @@ def apply_ac(
     _apply_multimodal_tower_ac(model, scopes)
 
 
-def _shard_fp32_param_holders(block, fsdp_mesh, reshard_after_forward, offload_policy):
-    """Shard each ``_fp32_params`` holder in ``block`` as its own fp32 FSDP unit.
-
-    Model implementations own the architecture-specific decision to create these
-    holders (for example Qwen3.5/Qwen3-Next GatedDeltaNet ``A_log``/``dt_bias``).
-    FSDP only treats the holder as a dtype-uniform fp32 unit and excludes its params
-    from the block's bf16 FSDP unit.
-
-    Returns the set of holder parameters to exclude from the block's FSDP wrap.
-    Blocks that do not expose ``named_modules`` (e.g. non-``nn.Module`` test
-    stubs) cannot hold fp32 holders, so an empty set is returned.
-    """
-    if not hasattr(block, "named_modules"):
-        return set()
-    fp32_mp_policy = MixedPrecisionPolicy(
-        param_dtype=torch.float32,
-        reduce_dtype=torch.float32,
-        output_dtype=torch.float32,
-        cast_forward_inputs=False,
-    )
-    ignored: set = set()
-    for name, sub in block.named_modules():
-        if not name.endswith("_fp32_params"):
-            continue
-        holder_params = list(sub.parameters(recurse=False))
-        if not holder_params:
-            continue
-        fully_shard(
-            sub,
-            mesh=fsdp_mesh,
-            reshard_after_forward=reshard_after_forward,
-            mp_policy=fp32_mp_policy,
-            offload_policy=offload_policy,
-        )
-        ignored.update(holder_params)
-    return ignored
-
-
 def apply_fsdp(
     model: torch.nn.Module,
     fsdp_mesh: DeviceMesh,
@@ -664,6 +627,7 @@ def apply_fsdp(
             output_dtype=torch.bfloat16,
             cast_forward_inputs=True,
         )
+    fp32_compute_module_names = tuple(getattr(model, "_keep_in_fp32_modules_strict", None) or ())
 
     fully_shard_impl = fully_shard
     if _is_deepseek_v4_model(model):
@@ -759,12 +723,18 @@ def apply_fsdp(
         if isinstance(moe_module, MoE) and ep_enabled:
             ignored_params = set(moe_module.experts.parameters())
 
-        # Shard model-owned fp32 holders on their own and exclude their params from
-        # the block's FSDP unit to keep the block dtype-uniform.
-        fp32_ignored = _shard_fp32_param_holders(block, fsdp_mesh, reshard_after_forward, offload_policy)
-        if fp32_ignored:
-            ignored_params = (ignored_params or set()) | fp32_ignored
-        fully_shard_default(block, ignored_params=ignored_params)
+        # Reuse the dense dtype-aware path for model-owned fp32 contracts while
+        # leaving EP-owned experts out of the block's dtype and FSDP ownership.
+        parallelizer_utils.fully_shard_by_dtype(
+            block,
+            mesh=fsdp_mesh,
+            mp_policy=mp_policy,
+            offload_policy=offload_policy,
+            fp32_compute_module_names=fp32_compute_module_names,
+            reshard_after_forward=reshard_after_forward,
+            ignored_params=ignored_params,
+            fully_shard_fn=fully_shard_impl,
+        )
 
     # Re-establish weight tying before detecting it: a device/dtype move during
     # from_pretrained (HF replaces param tensors) can silently break a tie set in
