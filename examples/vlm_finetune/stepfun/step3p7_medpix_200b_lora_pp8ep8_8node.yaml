@@ -148,6 +148,8 @@ wandb:
 ci:
   # pp_size(8) * ep_size(8) = 64 GPUs => 8 nodes (8 H100/node).
   nodes: 8
+  # torchrun starts eight workers inside each Slurm task; provide two CPU cores per worker.
+  cpus_per_task: 16
   time: "01:30:00"
   checkpoint_robustness:
     # PP=8 with pp_microbatch_size=1 requires at least eight pipeline microbatches.

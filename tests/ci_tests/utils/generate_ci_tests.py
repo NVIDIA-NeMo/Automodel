@@ -120,6 +120,7 @@ def detect_yml_configurations(automodel_dir: str, scope: str, test_folder: str) 
 CI_KEY_TO_VAR = {
     "time": "TIME",
     "nodes": "TEST_NODE_COUNT",
+    "cpus_per_task": "CPUS_PER_TASK",
     "node_multiplier": "NODE_MULTIPLIER",
     "max_steps": "MAX_STEPS",
     "local_batch_size": "LOCAL_BATCH_SIZE",

@@ -115,6 +115,9 @@ if [[ "$HAS_ROBUSTNESS" == "true" ]]; then
 
   echo "============================================"
   echo "[checkpoint_robustness] Running robustness test..."
+  echo "[checkpoint_robustness] CPU context: SLURM_CPUS_PER_TASK=${SLURM_CPUS_PER_TASK:-unset}" \
+    "OMP_NUM_THREADS=${OMP_NUM_THREADS:-unset}" \
+    "Cpus_allowed_list=$(awk '/Cpus_allowed_list/ {print $2}' /proc/self/status)"
   echo "============================================"
   ROBUSTNESS_START=$SECONDS
 

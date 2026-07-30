@@ -52,3 +52,18 @@ ci:
 
     assert jobs[""]["variables"]["TIME"] == "00:25:00"
     assert jobs["_vllm_deploy"]["variables"]["TIME"] == "00:30:00"
+
+
+def test_generate_cpus_per_task_override(tmp_path):
+    config = Path("model_peft.yaml")
+    (tmp_path / config).write_text(
+        """
+ci:
+  cpus_per_task: 16
+""",
+        encoding="utf-8",
+    )
+
+    jobs = dict(generate_job(config, {}, "nightly", "llm_finetune", str(tmp_path)))
+
+    assert jobs[""]["variables"]["CPUS_PER_TASK"] == 16
