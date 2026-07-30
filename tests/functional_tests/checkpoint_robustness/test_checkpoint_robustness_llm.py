@@ -1384,7 +1384,13 @@ def run_checkpoint_robustness(
         original_quantization_config = _raw_qc
 
     _release_recipe_memory(trainer)
-    del trainer
+    _start_preflight_watchdog()
+    try:
+        _report_phase("Teardown: deleting initial trainer")
+        del trainer
+        _report_phase("Teardown: initial trainer deleted")
+    finally:
+        _stop_preflight_watchdog()
 
     # Phase 3: Reload AutoModel from the consolidated checkpoint.
     # Phantom key check: scan consolidated safetensors for leaked quantization keys
