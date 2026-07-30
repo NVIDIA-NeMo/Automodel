@@ -15,6 +15,7 @@
 """Train -> checkpoint -> reload via automodel & vanilla HF from consolidated, verify logits match via KL divergence.
 
 Launch: torchrun --nproc-per-node=<N> -m <this_module> --config <config.yaml>
+    [--isolated_phase <train_and_save|automodel_reload|resume_baseline|resume>]
     [--kl_threshold <float>] [--hf_kl_threshold <float>]
     [--cross_tp_size <int>] [--cross_tp_kl_threshold <float>]
     [--tokenizer_name <str>]
@@ -36,6 +37,10 @@ import traceback
 from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from nemo_automodel.recipes.base_recipe import BaseRecipe
 
 _IMPORT_WATCHDOG_SECONDS = int(os.environ.get("CHECKPOINT_ROBUSTNESS_IMPORT_WATCHDOG_SECONDS", "0"))
 
@@ -67,8 +72,6 @@ from nemo_automodel.components.checkpoint.checkpointing import (
 )
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.config.loader import ConfigNode
-from nemo_automodel.recipes.base_recipe import BaseRecipe
-from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
 from nemo_automodel.shared.utils import dtype_from_str
 
 _report_module_import("Module preflight: AutoModel imports complete")
@@ -85,6 +88,7 @@ def _extract_custom_args(argv):
     custom_keys = {
         "--kl_threshold",
         "--hf_kl_threshold",
+        "--isolated_phase",
         "--cross_tp_size",
         "--cross_tp_kl_threshold",
         "--experts_implementation",
@@ -104,6 +108,7 @@ def _extract_custom_args(argv):
         "--check_resume",
         "--hf_device_map_auto",
         "--hf_source_post_load_dequantize",
+        "--no_check_resume",
         "--skip_hf_reload",
     }
     custom = {}
@@ -134,6 +139,8 @@ def _extract_custom_args(argv):
             raw_cfg = yaml.safe_load(f)
         ci_robustness = raw_cfg.get("ci", {}).get("checkpoint_robustness") or {}
         no_check_resume = ci_robustness.pop("no_check_resume", False)
+        if no_check_resume:
+            custom["no_check_resume"] = True
         for k, v in ci_robustness.items():
             if k not in custom:
                 if "." in k:
@@ -1198,51 +1205,300 @@ def _release_recipe_memory(recipe) -> None:
     """
     if recipe is None:
         return
-    _start_preflight_watchdog()
-    try:
-        if torch.cuda.is_available():
-            _report_phase("Teardown: synchronizing pending CUDA work")
-            torch.cuda.synchronize()
-            _report_phase("Teardown: pending CUDA work synchronized")
-        _barrier()
-        _report_phase("Teardown: all ranks synchronized")
+    optimizers = getattr(recipe, "optimizer", None)
+    if not isinstance(optimizers, (list, tuple)):
+        optimizers = [optimizers] if optimizers is not None else []
+    for opt in optimizers:
+        try:
+            opt.state.clear()
+            opt.param_groups.clear()
+        except Exception:
+            pass
+    recipe.model_parts = None
+    recipe.optimizer = None
+    if getattr(recipe, "lr_scheduler", None) is not None:
+        recipe.lr_scheduler = None
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
-        _report_phase("Teardown: clearing optimizer state")
-        optimizers = getattr(recipe, "optimizer", None)
-        if not isinstance(optimizers, (list, tuple)):
-            optimizers = [optimizers] if optimizers is not None else []
-        for opt in optimizers:
-            try:
-                opt.state.clear()
-                opt.param_groups.clear()
-            except Exception:
-                pass
-        _report_phase("Teardown: optimizer state cleared; dropping schedulers")
-        recipe.optimizer = None
-        if getattr(recipe, "lr_scheduler", None) is not None:
-            recipe.lr_scheduler = None
-        if getattr(recipe, "step_scheduler", None) is not None:
-            recipe.step_scheduler = None
 
-        _report_phase("Teardown: schedulers dropped; dropping dataloaders")
-        for attr_name in ("dataloader", "val_dataloader", "val_dataloaders"):
-            if hasattr(recipe, attr_name):
-                setattr(recipe, attr_name, None)
+def _checkpoint_paths(cfg) -> tuple[Path, Path, Path]:
+    """Locate the latest checkpoint and its consolidated model directory."""
+    checkpoint_dir = Path(cfg.checkpoint.checkpoint_dir)
+    ckpt_step_dirs = sorted(checkpoint_dir.glob("epoch_*_step_*"))
+    assert ckpt_step_dirs, f"No checkpoint subdirectories found under {checkpoint_dir}"
+    ckpt_step_dir = ckpt_step_dirs[-1]
+    return checkpoint_dir, ckpt_step_dir, ckpt_step_dir / "model" / "consolidated"
 
-        _report_phase("Teardown: dataloaders dropped; dropping pipeline and model")
-        recipe.model_parts = None
-        if getattr(recipe, "pp", None) is not None:
-            recipe.pp = None
 
-        _report_phase("Teardown: pipeline and model dropped; starting Python GC")
-        gc.collect()
-        _report_phase("Teardown: Python GC complete")
-        if torch.cuda.is_available():
-            _report_phase("Teardown: releasing cached CUDA memory")
-            torch.cuda.empty_cache()
-            _report_phase("Teardown: cached CUDA memory released")
-    finally:
+def _robustness_artifact_dir(cfg) -> Path:
+    """Return the shared directory used to pass small artifacts between isolated phases."""
+    return Path(cfg.checkpoint.checkpoint_dir) / ".checkpoint_robustness"
+
+
+def _disable_distributed_atexit_teardown() -> None:
+    """Let process exit reclaim distributed resources after an isolated phase."""
+    import atexit
+
+    from nemo_automodel.components.distributed.init_utils import destroy_global_state
+
+    atexit.unregister(destroy_global_state)
+
+
+def _raise_distributed_failure(failure_message: str | None) -> None:
+    """Raise the same phase failure on every initialized distributed rank."""
+    if dist.is_initialized():
+        payload = [failure_message]
+        dist.broadcast_object_list(payload, src=0)
+        failure_message = payload[0]
+    if failure_message is not None:
+        raise AssertionError(failure_message)
+
+
+def _run_process_isolated_checkpoint_phase(
+    phase: str,
+    *,
+    custom_args: dict,
+    recipe_cls: type[BaseRecipe],
+    input_ids_loader: Callable[[str | None], list[int]],
+) -> None:
+    """Run one large-model checkpoint phase and then return directly to the launcher.
+
+    The launcher starts every phase in a fresh distributed process group. This
+    mirrors a real checkpoint restart and avoids relying on Python object
+    destruction to release an entire trainer graph before constructing another.
+
+    Args:
+        phase: Isolated checkpoint phase selected by the launcher.
+        custom_args: Test-specific values extracted from the resolved recipe.
+        recipe_cls: Recipe class used for training, reload, and resume.
+        input_ids_loader: Domain-specific prompt tokenizer.
+    """
+    supported_phases = {"train_and_save", "automodel_reload", "resume_baseline", "resume"}
+    if phase not in supported_phases:
+        raise ValueError(f"Unsupported isolated checkpoint phase {phase!r}; expected one of {sorted(supported_phases)}")
+    if custom_args.get("check_source_load_parity", False):
+        raise ValueError("Process-isolated checkpoint mode does not yet support check_source_load_parity")
+    if not custom_args.get("skip_hf_reload", False):
+        raise ValueError("Process-isolated checkpoint mode currently requires skip_hf_reload=true")
+    if int(custom_args.get("cross_tp_size", "0")) > 0:
+        raise ValueError("Process-isolated checkpoint mode does not yet support cross_tp_size")
+    if custom_args.get("no_check_resume", False):
+        raise ValueError("Process-isolated checkpoint mode requires the resume phases")
+
+    _disable_distributed_atexit_teardown()
+    cfg = parse_args_and_load_config()
+    tokenizer_name = custom_args.get("tokenizer_name", None)
+
+    if phase == "train_and_save":
+        _report_phase("Isolated train/save: loading prompt input IDs")
+        input_ids = _load_input_ids_once(cfg, input_ids_loader, tokenizer_name)
         _stop_preflight_watchdog()
+
+        torch.cuda.reset_peak_memory_stats()
+        _report_phase("Isolated train/save: starting trainer setup")
+        trainer = recipe_cls(cfg)
+        trainer.setup()
+        _report_phase("Isolated train/save: trainer setup complete")
+        if tokenizer_name is not None and dist.is_initialized() and dist.get_world_size() > 1:
+            _barrier()
+            if _rank0():
+                _cleanup_input_ids_sync(cfg)
+            _barrier()
+
+        _report_phase("Isolated train/save: starting training and checkpoint")
+        trainer.run_train_validation_loop()
+        _report_phase("Isolated train/save: training and checkpoint complete")
+
+        peak_vram_gb = torch.cuda.max_memory_allocated() / 1024**3
+        peak_cpu_gb = _rss_gb()
+        if _rank0():
+            print(f"\n[Memory] Peak VRAM: {peak_vram_gb:.2f} GB, Peak CPU RSS: {peak_cpu_gb:.2f} GB")
+        max_vram_gb = float(custom_args.get("max_vram_gb", "0"))
+        max_cpu_gb = float(custom_args.get("max_cpu_gb", "0"))
+        if max_vram_gb > 0:
+            assert peak_vram_gb <= max_vram_gb, (
+                f"Peak VRAM {peak_vram_gb:.2f} GB exceeds threshold {max_vram_gb:.2f} GB"
+            )
+        if max_cpu_gb > 0:
+            assert peak_cpu_gb <= max_cpu_gb, f"Peak CPU RSS {peak_cpu_gb:.2f} GB exceeds threshold {max_cpu_gb:.2f} GB"
+
+        _report_phase("Isolated train/save: capturing reference logits")
+        device = next(trainer.model_parts[0].parameters()).device
+        reference_logits = _get_logits(trainer.model_parts[0], input_ids, device, trainer=trainer)
+        _checkpoint_paths(cfg)
+        if _rank0():
+            artifact_dir = _robustness_artifact_dir(cfg)
+            artifact_dir.mkdir(parents=True, exist_ok=True)
+            torch.save(reference_logits, artifact_dir / "reference_logits.pt")
+        _barrier()
+        _report_phase("Isolated train/save: reference logits persisted; exiting phase")
+        return
+
+    if phase == "automodel_reload":
+        _report_phase("Isolated AutoModel reload: loading prompt input IDs")
+        input_ids = _load_input_ids_once(cfg, input_ids_loader, tokenizer_name)
+        checkpoint_dir, ckpt_step_dir, consolidated_dir = _checkpoint_paths(cfg)
+        reference_path = _robustness_artifact_dir(cfg) / "reference_logits.pt"
+        assert reference_path.exists(), f"Reference logits not found at {reference_path}"
+        is_peft = hasattr(cfg, "peft")
+
+        if custom_args.get("check_phantom_keys", False) and _rank0():
+            from safetensors import safe_open
+
+            assert consolidated_dir.exists(), f"Phantom key check: {consolidated_dir} does not exist"
+            sf_files = sorted(consolidated_dir.glob("*.safetensors"))
+            assert sf_files, f"Phantom key check: no .safetensors files in {consolidated_dir}"
+            for sf_path in sf_files:
+                with safe_open(str(sf_path), framework="pt") as f:
+                    for key in f.keys():
+                        assert "_blocks" not in key, f"Phantom mxfp4 key leaked: {key} in {sf_path.name}"
+                        assert "_scales" not in key, f"Phantom mxfp4 key leaked: {key} in {sf_path.name}"
+
+        if not is_peft:
+            if _rank0():
+                from transformers import AutoConfig
+
+                _prepopulate_hf_dynamic_modules_cache(consolidated_dir)
+                try:
+                    AutoConfig.from_pretrained(str(consolidated_dir), trust_remote_code=True)
+                except Exception:
+                    pass
+            cfg.model.pretrained_model_name_or_path = str(consolidated_dir)
+            cfg.checkpoint.enabled = False
+
+        _stop_preflight_watchdog()
+        _report_phase("Isolated AutoModel reload: starting trainer setup")
+        restored_trainer = recipe_cls(cfg)
+        restored_trainer.setup()
+        _report_phase("Isolated AutoModel reload: trainer setup complete")
+        if tokenizer_name is not None and dist.is_initialized() and dist.get_world_size() > 1:
+            _barrier()
+            if _rank0():
+                _cleanup_input_ids_sync(cfg)
+            _barrier()
+
+        device = next(restored_trainer.model_parts[0].parameters()).device
+        restored_logits = _get_logits(
+            restored_trainer.model_parts[0],
+            input_ids,
+            device,
+            trainer=restored_trainer,
+        )
+        failure_message = None
+        if _rank0():
+            reference_logits = torch.load(reference_path, map_location="cpu", weights_only=True)
+            max_kl_restored = _kl_divergence_from_logits(reference_logits, restored_logits).max().item()
+            tp_size = _tp_size_from_argv(sys.argv[1:])
+            default_threshold = "1e-5" if tp_size > 1 else "0"
+            kl_threshold = float(custom_args.get("kl_threshold", default_threshold))
+            print(f"\n[Isolated AutoModel reload] max KL: {max_kl_restored:.6e} (threshold: {kl_threshold:.6e})")
+            if max_kl_restored > kl_threshold:
+                failure_message = (
+                    "KL divergence between original and automodel-from-consolidated too large: "
+                    f"max per-token KL = {max_kl_restored:.6e} > threshold {kl_threshold:.6e}"
+                )
+        _raise_distributed_failure(failure_message)
+        _report_phase(
+            f"Isolated AutoModel reload: parity complete for {ckpt_step_dir.relative_to(checkpoint_dir)}; exiting phase"
+        )
+        return
+
+    original_max_steps = cfg.step_scheduler.max_steps
+    resume_max_steps = original_max_steps + 3
+    artifact_dir = _robustness_artifact_dir(cfg)
+    baseline_losses_path = artifact_dir / "baseline_losses.json"
+
+    if phase == "resume_baseline":
+        baseline_dir = artifact_dir / "resume_baseline"
+        cfg.step_scheduler.max_steps = resume_max_steps
+        cfg.checkpoint.checkpoint_dir = str(baseline_dir)
+        cfg.checkpoint.enabled = False
+        if hasattr(cfg, "lr_scheduler") and cfg.lr_scheduler is not None:
+            cfg.lr_scheduler.lr_decay_steps = original_max_steps
+
+        _stop_preflight_watchdog()
+        _report_phase("Isolated resume baseline: starting trainer setup")
+        baseline_trainer = recipe_cls(cfg)
+        baseline_trainer.setup()
+        _report_phase("Isolated resume baseline: setup complete; starting training")
+        baseline_trainer.run_train_validation_loop()
+        _report_phase("Isolated resume baseline: training complete")
+
+        failure_message = None
+        if _rank0():
+            baseline_losses = {}
+            baseline_jsonl = baseline_dir / "training.jsonl"
+            if baseline_jsonl.exists():
+                with baseline_jsonl.open() as f:
+                    for line in f:
+                        entry = json.loads(line)
+                        if entry["step"] >= original_max_steps:
+                            baseline_losses[entry["step"]] = entry["loss"]
+            if not baseline_losses:
+                failure_message = "Isolated resume baseline produced no post-checkpoint losses"
+            else:
+                artifact_dir.mkdir(parents=True, exist_ok=True)
+                baseline_losses_path.write_text(json.dumps(baseline_losses, sort_keys=True))
+        _raise_distributed_failure(failure_message)
+        _report_phase("Isolated resume baseline: losses persisted; exiting phase")
+        return
+
+    checkpoint_dir, ckpt_step_dir, _ = _checkpoint_paths(cfg)
+    assert baseline_losses_path.exists(), f"Baseline losses not found at {baseline_losses_path}"
+    cfg.checkpoint.restore_from = str(ckpt_step_dir)
+    cfg.step_scheduler.max_steps = resume_max_steps
+
+    _stop_preflight_watchdog()
+    _report_phase("Isolated resume: starting setup and optimizer checkpoint load")
+    resume_trainer = recipe_cls(cfg)
+    resume_trainer.setup()
+    _report_phase("Isolated resume: checkpoint load complete; starting training")
+    resume_trainer.run_train_validation_loop()
+    _report_phase("Isolated resume: training complete")
+
+    failure_message = None
+    if _rank0():
+        baseline_losses = {int(step): loss for step, loss in json.loads(baseline_losses_path.read_text()).items()}
+        resume_jsonl = checkpoint_dir / "training.jsonl"
+        if not resume_jsonl.exists():
+            failure_message = f"Isolated resume log not found at {resume_jsonl}"
+        else:
+            resume_losses = {}
+            with resume_jsonl.open() as f:
+                for line in f:
+                    entry = json.loads(line)
+                    if entry["step"] in baseline_losses:
+                        resume_losses[entry["step"]] = entry["loss"]
+
+            matched_steps = 0
+            is_peft = hasattr(cfg, "peft")
+            resume_loss_threshold = float(custom_args.get("resume_loss_threshold", "5e-3"))
+            for step in sorted(baseline_losses):
+                if step not in resume_losses:
+                    continue
+                matched_steps += 1
+                baseline_loss = baseline_losses[step]
+                resume_loss = resume_losses[step]
+                difference = abs(baseline_loss - resume_loss)
+                print(
+                    f"[Isolated resume] Step {step}: baseline_loss={baseline_loss:.6f}, "
+                    f"resume_loss={resume_loss:.6f}, diff={difference:.6e}"
+                )
+                if not is_peft and difference >= resume_loss_threshold:
+                    failure_message = (
+                        f"SFT loss mismatch after resume at step {step}: baseline={baseline_loss:.6f}, "
+                        f"resume={resume_loss:.6f}, diff={difference:.6e}"
+                    )
+                    break
+            if failure_message is None and matched_steps == 0:
+                failure_message = (
+                    f"No overlapping steps between baseline ({sorted(baseline_losses)}) "
+                    f"and resume ({sorted(resume_losses)})"
+                )
+    _raise_distributed_failure(failure_message)
+    _report_phase("Isolated resume: optimizer save/load/resume verified; exiting phase")
 
 
 def run_checkpoint_robustness(
@@ -1260,6 +1516,15 @@ def run_checkpoint_robustness(
     """
     custom_args, config_argv = _extract_custom_args(sys.argv[1:])
     sys.argv = [sys.argv[0]] + config_argv
+    isolated_phase = custom_args.get("isolated_phase")
+    if isolated_phase is not None:
+        _run_process_isolated_checkpoint_phase(
+            str(isolated_phase),
+            custom_args=custom_args,
+            recipe_cls=recipe_cls,
+            input_ids_loader=input_ids_loader,
+        )
+        return
     # When tensor parallelism is active the forward pass uses row-parallel
     # all-reduces and cuBLASLt plan caches whose order of accumulation is
     # process-dependent; this produces ULP-level bf16 drift between the
@@ -1765,6 +2030,10 @@ def test_checkpoint_robustness() -> None:
         from transformers import AutoModelForCausalLM
 
         _report_phase("Preflight: AutoModelForCausalLM import complete")
+        _report_phase("Preflight: importing TrainFinetuneRecipeForNextTokenPrediction")
+        from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
+
+        _report_phase("Preflight: TrainFinetuneRecipeForNextTokenPrediction import complete")
         run_checkpoint_robustness(
             recipe_cls=TrainFinetuneRecipeForNextTokenPrediction,
             hf_model_cls=AutoModelForCausalLM,

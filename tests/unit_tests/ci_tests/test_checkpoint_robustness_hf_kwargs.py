@@ -238,6 +238,13 @@ def test_extract_custom_args_accepts_hf_source_post_load_dequantize():
     assert remaining == ["--other-arg"]
 
 
+def test_extract_custom_args_accepts_isolated_phase():
+    custom, remaining = _extract_custom_args(["--isolated_phase", "train_and_save", "--other-arg"])
+
+    assert custom["isolated_phase"] == "train_and_save"
+    assert remaining == ["--other-arg"]
+
+
 def test_keep_hf_modules_in_fp32_uses_strict_dtype_plan_and_restores_class_state(tmp_path):
     from transformers import PretrainedConfig, PreTrainedModel
 

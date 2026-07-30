@@ -52,3 +52,21 @@ ci:
 
     assert jobs[""]["variables"]["TIME"] == "00:25:00"
     assert jobs["_vllm_deploy"]["variables"]["TIME"] == "00:30:00"
+
+
+def test_generate_checkpoint_robustness_process_isolation(tmp_path):
+    config = Path("large_lora.yaml")
+    (tmp_path / config).write_text(
+        """
+ci:
+  checkpoint_robustness:
+    process_isolation: true
+    skip_hf_reload: true
+""",
+        encoding="utf-8",
+    )
+
+    jobs = dict(generate_job(config, {}, "release", "llm_finetune", str(tmp_path)))
+
+    assert jobs[""]["variables"]["HAS_ROBUSTNESS"] == "true"
+    assert jobs[""]["variables"]["CHECKPOINT_ROBUSTNESS_PROCESS_ISOLATION"] == "true"

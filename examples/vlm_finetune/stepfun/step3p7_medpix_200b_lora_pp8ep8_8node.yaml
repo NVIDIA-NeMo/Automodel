@@ -153,11 +153,8 @@ ci:
     # PP=8 with pp_microbatch_size=1 requires at least eight pipeline microbatches.
     step_scheduler.global_batch_size: 64
     step_scheduler.local_batch_size: 8
-    # The harness tears down and rebuilds trainers in one process; avoid persistent
-    # multiprocessing workers blocking the inter-phase dataloader shutdown.
-    dataloader.num_workers: 0
-    dataloader.persistent_workers: false
-    validation_dataloader.num_workers: 0
+    # Match a real restart and let each large trainer exit before the next one starts.
+    process_isolation: true
     hf_kl_threshold: 2e-2
     skip_hf_reload: true
     tokenizer_name: stepfun-ai/Step-3.7-Flash

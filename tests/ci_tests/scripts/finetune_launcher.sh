@@ -109,10 +109,6 @@ if [[ "$HAS_ROBUSTNESS" == "true" ]]; then
     ROBUSTNESS_LAUNCH_CMD="${CMD/--rdzv_id=${SLURM_JOB_ID}/--rdzv_id=${SLURM_JOB_ID}-robustness}"
   fi
 
-  ROBUSTNESS_CMD="${ROBUSTNESS_LAUNCH_CMD} --tee 3 --log-dir $TEST_DIR/robustness_logs \
-    -m ${ROBUSTNESS_TEST_MODULE} \
-    --config ${RESOLVED_ROBUSTNESS_CONFIG}"
-
   echo "============================================"
   echo "[checkpoint_robustness] Running robustness test..."
   echo "[checkpoint_robustness] CPU context: SLURM_CPUS_PER_TASK=${SLURM_CPUS_PER_TASK:-unset}" \
@@ -125,8 +121,43 @@ if [[ "$HAS_ROBUSTNESS" == "true" ]]; then
   # before the resume-training check. Preserve any caller-provided setting.
   export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
   export CHECKPOINT_ROBUSTNESS_IMPORT_WATCHDOG_SECONDS=300
-  eval $ROBUSTNESS_CMD
-  ROBUSTNESS_EXIT_CODE=$?
+  ROBUSTNESS_EXIT_CODE=0
+
+  if [[ "${CHECKPOINT_ROBUSTNESS_PROCESS_ISOLATION:-false}" == "true" ]]; then
+    # A real checkpoint restart crosses a process boundary. Large distributed
+    # recipes also retain enough CUDA, PP, scheduler, and dataloader ownership
+    # that rebuilding several trainers in one interpreter is not reliable.
+    for ROBUSTNESS_PHASE in train_and_save automodel_reload resume_baseline resume; do
+      PHASE_LAUNCH_CMD="$ROBUSTNESS_LAUNCH_CMD"
+      if [[ "$PHASE_LAUNCH_CMD" == torchrun* ]]; then
+        PHASE_LAUNCH_CMD="${PHASE_LAUNCH_CMD/--rdzv_id=${SLURM_JOB_ID}-robustness/--rdzv_id=${SLURM_JOB_ID}-robustness-${ROBUSTNESS_PHASE}}"
+        PHASE_LAUNCH_ARGS="--tee 3 --log-dir $TEST_DIR/robustness_logs/${ROBUSTNESS_PHASE}"
+      else
+        PHASE_LAUNCH_ARGS=""
+      fi
+      ROBUSTNESS_CMD="${PHASE_LAUNCH_CMD} ${PHASE_LAUNCH_ARGS} \
+        -m ${ROBUSTNESS_TEST_MODULE} \
+        --isolated_phase ${ROBUSTNESS_PHASE} \
+        --config ${RESOLVED_ROBUSTNESS_CONFIG}"
+      echo "[checkpoint_robustness] Starting isolated phase: ${ROBUSTNESS_PHASE}"
+      eval $ROBUSTNESS_CMD
+      ROBUSTNESS_EXIT_CODE=$?
+      if [[ "$ROBUSTNESS_EXIT_CODE" -ne 0 ]]; then
+        break
+      fi
+    done
+  else
+    if [[ "$ROBUSTNESS_LAUNCH_CMD" == torchrun* ]]; then
+      ROBUSTNESS_LAUNCH_ARGS="--tee 3 --log-dir $TEST_DIR/robustness_logs"
+    else
+      ROBUSTNESS_LAUNCH_ARGS=""
+    fi
+    ROBUSTNESS_CMD="${ROBUSTNESS_LAUNCH_CMD} ${ROBUSTNESS_LAUNCH_ARGS} \
+      -m ${ROBUSTNESS_TEST_MODULE} \
+      --config ${RESOLVED_ROBUSTNESS_CONFIG}"
+    eval $ROBUSTNESS_CMD
+    ROBUSTNESS_EXIT_CODE=$?
+  fi
 
   ROBUSTNESS_ELAPSED=$((SECONDS - ROBUSTNESS_START))
   echo "{\"test\":\"${TEST_NAME}\",\"phase\":\"robustness\",\"seconds\":${ROBUSTNESS_ELAPSED}}" >> $TEST_DIR/timing.jsonl

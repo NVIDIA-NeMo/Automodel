@@ -128,6 +128,7 @@ fixture_keys:
     - kl_threshold
     - hf_source_post_load_dequantize
     - no_check_resume
+    - process_isolation
     - resume_loss_threshold
     - skip_hf_reload
     - source_load_cosine_threshold
