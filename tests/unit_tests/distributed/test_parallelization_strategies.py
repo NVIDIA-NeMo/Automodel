@@ -25,6 +25,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor.parallel import ColwiseParallel
 
 from nemo_automodel.components.distributed import parallelizer as parallelizer_mod
+from nemo_automodel.components.distributed.activation_checkpointing import sdpa_backend_snapshot_context_fn
 
 # Import the components under test
 from nemo_automodel.components.distributed.parallelizer import (
@@ -207,7 +208,7 @@ def mock_distributed_env(monkeypatch):
     # Mock checkpoint wrapper. Sub-module/whole-block wrapping now lives in
     # activation_checkpointing.py and calls that module's checkpoint_wrapper, so
     # patch it there too.
-    checkpoint_wrapper_mock = MagicMock(side_effect=lambda x: x)
+    checkpoint_wrapper_mock = MagicMock(side_effect=lambda x, **_kwargs: x)
     monkeypatch.setattr(
         "nemo_automodel.components.distributed.parallelizer.checkpoint_wrapper", checkpoint_wrapper_mock, raising=False
     )
@@ -380,8 +381,8 @@ class TestDefaultParallelizationStrategy:
 
         # Check that checkpoint_wrapper was called with all expected attributes
         expected_calls = [
-            call(mock_layer.mlp),
-            call(mock_layer.self_attn),
+            call(mock_layer.mlp, context_fn=sdpa_backend_snapshot_context_fn),
+            call(mock_layer.self_attn, context_fn=sdpa_backend_snapshot_context_fn),
             call(mock_layer.input_layernorm),
             call(mock_layer.post_attention_layernorm),
         ]

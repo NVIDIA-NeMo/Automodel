@@ -268,7 +268,10 @@ def _load_registered_custom_config(pretrained_model_name_or_path, attn_implement
     if not isinstance(model_type, str):
         return None
 
-    config_cls = resolve_custom_config_cls(model_type)
+    architectures = config_dict.get("architectures")
+    config_cls = resolve_custom_config_cls(
+        model_type, architectures if isinstance(architectures, (list, tuple)) else None
+    )
     if config_cls is None:
         return None
 

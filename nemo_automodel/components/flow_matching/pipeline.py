@@ -42,6 +42,7 @@ from .adapters import (
     Flux2Adapter,
     FluxAdapter,
     HunyuanAdapter,
+    LTX2Adapter,
     ModelAdapter,
     QwenImageAdapter,
     SimpleAdapter,
@@ -495,6 +496,12 @@ class FlowMatchingPipeline:
             self.compute_loss(model_pred, target, sigma, batch)
         )
 
+        # Adapter-owned extra losses (e.g. a second modality stream); added
+        # before the safety check so anomalies in those streams are caught too.
+        aux_losses = self.model_adapter.auxiliary_losses(inputs)
+        if aux_losses:
+            average_weighted_loss = average_weighted_loss + sum(aux_losses.values())
+
         # Safety check
         if check_loss and (torch.isnan(average_weighted_loss) or average_weighted_loss > 100):
             logger.error(f"[ERROR] Loss explosion! Loss={average_weighted_loss.item():.3f}")
@@ -529,6 +536,8 @@ class FlowMatchingPipeline:
                 "task_type": task_type,
                 "data_type": data_type,
             }
+            if aux_losses:
+                metrics.update({name: value.item() for name, value in aux_losses.items()})
 
         return weighted_loss, average_weighted_loss, loss_mask, metrics
 
@@ -621,7 +630,8 @@ def create_adapter(adapter_type: str, **kwargs) -> ModelAdapter:
     Factory function to create a model adapter by name.
 
     Args:
-        adapter_type: Type of adapter ("hunyuan", "simple", "flux", "flux2", "qwen_image", "qwen_image_edit")
+        adapter_type: Type of adapter ("hunyuan", "simple", "flux", "flux2", "qwen_image",
+            "qwen_image_edit", "ltx2")
         **kwargs: Additional arguments passed to the adapter constructor
 
     Returns:
@@ -638,6 +648,7 @@ def create_adapter(adapter_type: str, **kwargs) -> ModelAdapter:
         "flux2": Flux2Adapter,
         "qwen_image": QwenImageAdapter,
         "qwen_image_edit": QwenImageEditAdapter,
+        "ltx2": LTX2Adapter,
     }
 
     if adapter_type not in adapters:

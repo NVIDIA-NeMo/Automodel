@@ -427,6 +427,80 @@ def test_kimi_k2_config_loads_without_trust_remote_code(tmp_path):
     assert cfg.architectures == ["DeepseekV3ForCausalLM"]
 
 
+@pytest.mark.parametrize(
+    ("model_type", "expected_config_name"),
+    [
+        ("kimi_linear", "KimiK3TextConfig"),
+        ("kimi_k3", "KimiK3Config"),
+    ],
+)
+def test_kimi_k3_configs_load_without_transformers_builtin(
+    tmp_path,
+    monkeypatch,
+    model_type,
+    expected_config_name,
+):
+    """Kimi K3 checkpoint model types resolve to local configs on stale Transformers."""
+    import json
+
+    from transformers import AutoConfig
+    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
+    from nemo_automodel._transformers import registry as reg
+    from nemo_automodel.components.models.kimi_k3 import config as kimi_config
+
+    expected_config = getattr(kimi_config, expected_config_name)
+    monkeypatch.delitem(CONFIG_MAPPING._mapping, model_type, raising=False)
+    assert reg.resolve_custom_config_cls(model_type) is expected_config
+
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": model_type}))
+    cfg = AutoConfig.from_pretrained(tmp_path, trust_remote_code=False)
+
+    assert isinstance(cfg, expected_config)
+    assert cfg.model_type == model_type
+
+
+def test_kimi_linear_model_type_disambiguates_on_architectures(monkeypatch):
+    """Kimi Linear and the Kimi K3 text backbone share ``model_type: kimi_linear``."""
+    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
+    from nemo_automodel._transformers import registry as reg
+    from nemo_automodel.components.models.kimi_k3.config import KimiK3TextConfig
+    from nemo_automodel.components.models.kimi_linear.config import KimiLinearConfig
+
+    monkeypatch.delitem(CONFIG_MAPPING._mapping, "kimi_linear", raising=False)
+
+    assert reg.resolve_custom_config_cls("kimi_linear", ["KimiLinearForCausalLM"]) is KimiLinearConfig
+    assert reg.resolve_custom_config_cls("kimi_linear", ["KimiK3ForCausalLM"]) is KimiK3TextConfig
+    # An unknown or absent architecture keeps the model_type default.
+    assert reg.resolve_custom_config_cls("kimi_linear", ["SomethingElse"]) is KimiK3TextConfig
+    assert reg.resolve_custom_config_cls("kimi_linear") is KimiK3TextConfig
+
+
+def test_kimi_linear_checkpoint_config_resolves_through_get_hf_config(tmp_path):
+    """A Kimi Linear checkpoint must load KimiLinearConfig, not the K3 text config."""
+    import json
+
+    from nemo_automodel._transformers.model_init import get_hf_config
+    from nemo_automodel.components.models.kimi_linear.config import KimiLinearConfig
+
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "kimi_linear",
+                "architectures": ["KimiLinearForCausalLM"],
+                "num_hidden_layers": 2,
+                "hidden_size": 64,
+                "vocab_size": 256,
+            }
+        )
+    )
+
+    cfg = get_hf_config(tmp_path, attn_implementation="eager")
+
+    assert isinstance(cfg, KimiLinearConfig)
+
+
 def test_kimi_k25_arch_alias_in_model_arch_mapping():
     """KimiK25ForConditionalGeneration (checkpoint arch) must map to KimiK25VLForConditionalGeneration."""
     from nemo_automodel._transformers.registry import MODEL_ARCH_MAPPING

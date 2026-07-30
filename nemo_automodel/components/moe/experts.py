@@ -97,32 +97,14 @@ def is_gated_activation(activation: str) -> bool:
     return activation in ("swiglu", "swigluoai", "quick_geglu", "geglu")
 
 
-def _unweighted_swiglu(input: torch.Tensor, *, swiglu_limit: float = 0.0) -> torch.Tensor:
-    """Apply SwiGLU to fused gate/up projections without routing weights.
-
-    Args:
-        input: Fused gate/up tensor of shape [..., 2 * inter], with arbitrary leading dimensions. The last
-            dimension is split into gate and up halves of size inter.
-        swiglu_limit: Optional clamp applied to gate/up before activation; disabled when <= 0.
-
-    Returns:
-        Tensor of shape [..., inter].
-    """
-    gate, up = torch.chunk(input, 2, dim=-1)
-    if swiglu_limit > 0.0:
-        dtype = input.dtype
-        gate = gate.float().clamp(max=swiglu_limit)
-        up = up.float().clamp(min=-swiglu_limit, max=swiglu_limit)
-        return (F.silu(gate) * up).to(dtype)
-    return F.silu(gate) * up
-
-
 def _permute_tokens_for_grouped_mm(
     indices: torch.Tensor,
     weights: torch.Tensor,
     token_mask: torch.Tensor,
     n_local_experts: int,
     experts_start_idx: int,
+    *,
+    return_slot_ids: bool = False,
 ):
     """Permute tokens by expert assignment and compute offs for torch._grouped_mm.
 
@@ -131,6 +113,8 @@ def _permute_tokens_for_grouped_mm(
 
     Returns:
         sorted_token_ids: Token indices sorted by expert assignment.
+        sorted_slot_ids: When requested, flattened ``[token, top-k]`` assignment
+            indices in the same order.
         sorted_weights: Routing weights in the same sorted order.
         tokens_per_expert: Count of tokens per local expert.
         offs: Cumulative token counts (int32) for torch._grouped_mm.
@@ -162,6 +146,9 @@ def _permute_tokens_for_grouped_mm(
     tokens_per_expert = torch.bincount(sorted_expert_ids, minlength=n_local_experts)
     offs = tokens_per_expert.cumsum(dim=0).to(torch.int32)
 
+    if return_slot_ids:
+        sorted_slot_ids = local_mask.nonzero(as_tuple=True)[0][sort_order]
+        return sorted_token_ids, sorted_slot_ids, sorted_weights, tokens_per_expert, offs
     return sorted_token_ids, sorted_weights, tokens_per_expert, offs
 
 
@@ -246,11 +233,7 @@ class GroupedExperts(nn.Module):
         self.config = config
         self.n_routed_experts = config.n_routed_experts
         self.expert_bias = config.expert_bias
-        self.route_weight_after_down_proj = config.route_weight_after_down_proj
         self.is_gated = is_gated_activation(config.expert_activation)
-        if self.route_weight_after_down_proj and config.expert_activation != "swiglu":
-            raise ValueError("route_weight_after_down_proj currently supports only swiglu experts.")
-        self.swiglu_limit = config.swiglu_limit
         # "torch_mm_mxfp8" dispatches identically to "torch_mm" but routes the grouped
         # GEMMs through torchao's MXFP8 kernel (see _torch_mm_experts_fwd).
         self.use_torch_mm = backend is not None and backend.experts in ("torch_mm", "torch_mm_mxfp8")
@@ -418,17 +401,17 @@ class GroupedExperts(nn.Module):
                 experts_end_idx,
             )
 
-        # Gradient anchor
         if ep_size > 1:
             # Keep the differentiable all-gather path attached to x without materializing a full-size zero tensor.
             y.add_(x.sum(dtype=torch.float32) * 0.0)
 
-        # Variable-length reduce: all_reduce + narrow to original per-rank token boundaries
-        if ep_size > 1:
+            # Reduce and narrow to the original per-rank token boundaries.
             y = dist_nn_f.all_reduce(y, op=dist.ReduceOp.SUM, group=ep_group)
             start = sum(gathered_lens[:ep_rank])
             y = y.narrow(0, start, local_num_tokens).contiguous()
 
+        if self.config.apply_router_weight_after_down:
+            y = y.sum(dim=1)
         return y.to(input_dtype)
 
     def _forward_loop(
@@ -446,7 +429,10 @@ class GroupedExperts(nn.Module):
         experts_end_idx,
     ):
         """Per-expert loop forward path using gather/scatter."""
-        y = torch.zeros(x.shape, dtype=torch.float32, device=x.device)
+        output_shape = (
+            (x.shape[0], weights.shape[1], x.shape[1]) if self.config.apply_router_weight_after_down else x.shape
+        )
+        y = torch.zeros(output_shape, dtype=torch.float32, device=x.device)
 
         active_local_experts = 0
         for i in range(experts_start_idx, experts_end_idx):
@@ -475,36 +461,34 @@ class GroupedExperts(nn.Module):
             # Weighted activation (routing weight applied BETWEEN up and down projections)
             # Uses WeightedSwiGLUFunction with float32 backward precision
             w = weights[idx, top, None]
-            if self.route_weight_after_down_proj:
-                activated = _unweighted_swiglu(gate_and_up_out, swiglu_limit=self.swiglu_limit)
-            else:
-                activated = self.expert_activation_grouped(gate_and_up_out, w)
+            activation_weight = torch.ones_like(w) if self.config.apply_router_weight_after_down else w
+            activated = self.expert_activation_grouped(gate_and_up_out, activation_weight)
 
             # Down projection
             expert_out = activated @ down_proj
             if expert_down_proj_bias is not None:
-                if self.route_weight_after_down_proj:
-                    expert_out = expert_out + expert_down_proj_bias
-                else:
-                    expert_out = expert_out + expert_down_proj_bias * w
-            if self.route_weight_after_down_proj:
-                expert_out = expert_out * w
+                expert_out = expert_out + (
+                    expert_down_proj_bias if self.config.apply_router_weight_after_down else expert_down_proj_bias * w
+                )
 
-            y.scatter_add_(dim=0, index=idx_b, src=expert_out.float())
+            if self.config.apply_router_weight_after_down:
+                expert_out = expert_out.float() * w.float()
+                slot_ids = idx * weights.shape[1] + top
+                slot_ids_b = slot_ids[:, None].expand(-1, x.size(1))
+                y.view(-1, x.size(1)).scatter_add_(dim=0, index=slot_ids_b, src=expert_out.float())
+            else:
+                y.scatter_add_(dim=0, index=idx_b, src=expert_out.float())
 
         # Dummy computation for gradient flow when no tokens routed locally
         if active_local_experts == 0:
             dummy_x = torch.zeros_like(x[0]).unsqueeze(0)
             gate_and_up_out = dummy_x @ gate_and_up_projs[0]
-            dummy_weight = weights[0, 0, None].unsqueeze(0)
-            if self.route_weight_after_down_proj:
-                activated = _unweighted_swiglu(gate_and_up_out, swiglu_limit=self.swiglu_limit)
-            else:
-                activated = self.expert_activation_grouped(gate_and_up_out, dummy_weight)
+            activated = self.expert_activation_grouped(gate_and_up_out, weights[0, 0, None].unsqueeze(0))
             expert_out = activated @ down_projs[0]
-            if self.route_weight_after_down_proj:
-                expert_out = expert_out * dummy_weight
-            y[0] += expert_out[0]
+            if self.config.apply_router_weight_after_down:
+                y[0, 0] += expert_out[0]
+            else:
+                y[0] += expert_out[0]
 
         return y
 
@@ -522,19 +506,32 @@ class GroupedExperts(nn.Module):
         experts_start_idx,
     ):
         """Grouped GEMM forward path using torch._grouped_mm."""
-        sorted_token_ids, sorted_weights, tokens_per_expert, offs = _permute_tokens_for_grouped_mm(
+        (
+            sorted_token_ids,
+            sorted_slot_ids,
+            sorted_weights,
+            tokens_per_expert,
+            offs,
+        ) = _permute_tokens_for_grouped_mm(
             indices,
             weights,
             token_mask,
             n_local_experts,
             experts_start_idx,
+            return_slot_ids=True,
         )
 
-        y = torch.zeros(x.shape, dtype=torch.float32, device=x.device)
+        output_shape = (
+            (x.shape[0], weights.shape[1], x.shape[1]) if self.config.apply_router_weight_after_down else x.shape
+        )
+        y = torch.zeros(output_shape, dtype=torch.float32, device=x.device)
 
         if tokens_per_expert.sum() > 0:
             permuted_x = x[sorted_token_ids]
             permuted_probs = sorted_weights.unsqueeze(-1)
+            activation_probs = (
+                torch.ones_like(permuted_probs) if self.config.apply_router_weight_after_down else permuted_probs
+            )
 
             if self.expert_bias:
                 # torch._grouped_mm does not support bias yet (raises
@@ -549,43 +546,41 @@ class GroupedExperts(nn.Module):
                 grouped_mm = select_grouped_mm(self.use_mxfp8)
                 output1 = grouped_mm(permuted_x, gate_and_up_projs, offs)
                 output1 = _apply_bias(output1, gate_up_proj_bias, tokens_per_expert)
-                if self.route_weight_after_down_proj:
-                    output1 = _unweighted_swiglu(output1, swiglu_limit=self.swiglu_limit)
-                else:
-                    output1 = self.expert_activation_grouped(output1, permuted_probs)
+                output1 = self.expert_activation_grouped(output1, activation_probs)
                 output2 = grouped_mm(output1, down_projs, offs)
-                if self.route_weight_after_down_proj:
-                    output2 = _apply_bias(output2, down_proj_bias, tokens_per_expert)
-                    output2 = output2 * permuted_probs
-                else:
-                    output2 = _apply_bias(output2, down_proj_bias, tokens_per_expert, permuted_probs)
+                output2 = _apply_bias(
+                    output2,
+                    down_proj_bias,
+                    tokens_per_expert,
+                    None if self.config.apply_router_weight_after_down else permuted_probs,
+                )
             else:
                 output2 = _torch_mm_experts_fwd(
                     permuted_x,
                     gate_and_up_projs,
                     down_projs,
                     tokens_per_expert,
-                    permuted_probs,
+                    activation_probs,
                     self.expert_activation_grouped,
                     use_mxfp8=self.use_mxfp8,
-                    route_weight_after_down_proj=self.route_weight_after_down_proj,
-                    swiglu_limit=self.swiglu_limit,
                 )
 
-            scatter_ids = sorted_token_ids.unsqueeze(1).expand_as(output2)
-            y.scatter_add_(0, scatter_ids, output2.float())
+            if self.config.apply_router_weight_after_down:
+                output2 = output2.float() * permuted_probs.float()
+                scatter_ids = sorted_slot_ids.unsqueeze(1).expand_as(output2)
+                y.view(-1, x.size(1)).scatter_add_(0, scatter_ids, output2.float())
+            else:
+                scatter_ids = sorted_token_ids.unsqueeze(1).expand_as(output2)
+                y.scatter_add_(0, scatter_ids, output2.float())
         else:
             # Dummy computation for gradient flow
             output1 = torch.matmul(x[0] * 0, gate_and_up_projs[0])
-            dummy_weight = weights[0, 0, None].unsqueeze(0)
-            if self.route_weight_after_down_proj:
-                output1_ = _unweighted_swiglu(output1, swiglu_limit=self.swiglu_limit)
-            else:
-                output1_ = self.expert_activation_grouped(output1, dummy_weight)
+            output1_ = self.expert_activation_grouped(output1, weights[0, 0, None].unsqueeze(0))
             output2 = torch.matmul(output1_, down_projs[0])
-            if self.route_weight_after_down_proj:
-                output2 = output2 * dummy_weight
-            y[0] += output2[0]
+            if self.config.apply_router_weight_after_down:
+                y[0, 0] += output2[0]
+            else:
+                y[0] += output2[0]
 
         return y
 
@@ -742,12 +737,6 @@ class GroupedExpertsDeepEP(nn.Module):
         super().__init__()
 
         self.config = config
-        if config.route_weight_after_down_proj:
-            raise ValueError(
-                "route_weight_after_down_proj is not supported by GroupedExpertsDeepEP. "
-                "Use BackendConfig(dispatcher='torch') or implement post-down-projection routing weights "
-                "for the DeepEP expert backend."
-            )
         # "torch_mm_mxfp8" dispatches identically to "torch_mm" but routes the grouped
         # GEMMs through torchao's MXFP8 kernel (see _torch_mm_experts_fwd).
         self.use_torch_mm = backend is not None and backend.experts in ("torch_mm", "torch_mm_mxfp8")
@@ -853,6 +842,9 @@ class GroupedExpertsDeepEP(nn.Module):
             token_indices=indices,
         )
         permuted_probs = permuted_probs.unsqueeze(-1)
+        activation_probs = (
+            torch.ones_like(permuted_probs) if self.config.apply_router_weight_after_down else permuted_probs
+        )
 
         # Cast expert weights to the activation dtype so that fp32-stored
         # parameters (e.g. under fp32 master weights) still work with kernels
@@ -884,17 +876,22 @@ class GroupedExpertsDeepEP(nn.Module):
                     # block scale -> nan (seen on gpt-oss). The bias-add stays a bf16
                     # separate add (torchao v0.17.0 has no bias arg). bf16 path unchanged.
                     output1 = _apply_bias(output1, gate_up_proj_bias, tokens_per_expert)
-                    output1 = self.expert_activation(output1, permuted_probs)
+                    output1 = self.expert_activation(output1, activation_probs)
                     output2 = grouped_mm(output1, down_projs, offs)
                     down_bias = self.down_proj_bias.to_local()
-                    output2 = _apply_bias(output2, down_bias, tokens_per_expert, permuted_probs)
+                    output2 = _apply_bias(
+                        output2,
+                        down_bias,
+                        tokens_per_expert,
+                        None if self.config.apply_router_weight_after_down else permuted_probs,
+                    )
                 else:
                     output2 = _torch_mm_experts_fwd(
                         permuted_local_hidden_states,
                         gate_and_up_projs,
                         down_projs,
                         tokens_per_expert_gpu,
-                        permuted_probs,
+                        activation_probs,
                         self.expert_activation,
                         use_mxfp8=self.use_mxfp8,
                     )
@@ -911,16 +908,26 @@ class GroupedExpertsDeepEP(nn.Module):
                     gate_up_proj_bias = self.gate_up_proj_bias.to_local().to(compute_dtype)
                     output1 = _apply_bias(output1, gate_up_proj_bias, tokens_per_expert)
 
-                output1 = self.expert_activation(output1, permuted_probs)
+                output1 = self.expert_activation(output1, activation_probs)
                 output2 = ops.gmm(output1, down_projs, tokens_per_expert, trans_b=False)
 
                 if self.expert_bias:
                     down_bias = self.down_proj_bias.to_local().to(compute_dtype)
-                    output2 = _apply_bias(output2, down_bias, tokens_per_expert, permuted_probs)
+                    output2 = _apply_bias(
+                        output2,
+                        down_bias,
+                        tokens_per_expert,
+                        None if self.config.apply_router_weight_after_down else permuted_probs,
+                    )
         else:
             output1 = torch.matmul(x[0] * 0, gate_and_up_projs[0])
-            output1_ = self.expert_activation(output1, permuted_probs)
+            output1_ = self.expert_activation(output1, activation_probs)
             output2 = torch.matmul(output1_, down_projs[0])
+
+        if self.config.apply_router_weight_after_down:
+            # HybridEP/DeepEP combine expects the expert activation dtype. Keep
+            # the multiply in fp32, then cast each routed expert output back.
+            output2 = (output2.float() * permuted_probs.float()).to(compute_dtype)
 
         y = self.token_dispatcher.token_unpermutation(output2)
         return y
@@ -937,8 +944,6 @@ def _torch_mm_experts_fwd(
     permuted_probs,
     activation_fn,
     use_mxfp8=False,
-    route_weight_after_down_proj=False,
-    swiglu_limit=0.0,
 ):
     # torchao's MXFP8 quantizer (mx_tensor.to_mx) strictly asserts is_contiguous() on each
     # operand it quantizes, unlike torch._grouped_mm. select_grouped_mm returns a wrapper
@@ -947,13 +952,8 @@ def _torch_mm_experts_fwd(
     offs = tokens_per_expert.cumsum(dim=0).to(torch.int32)
     grouped_mm = select_grouped_mm(use_mxfp8)
     output1 = grouped_mm(hidden_states, gate_and_up_projs, offs)
-    if route_weight_after_down_proj:
-        output1 = _unweighted_swiglu(output1, swiglu_limit=swiglu_limit)
-    else:
-        output1 = activation_fn(output1, permuted_probs)
+    output1 = activation_fn(output1, permuted_probs)
     output2 = grouped_mm(output1, down_projs, offs)
-    if route_weight_after_down_proj:
-        output2 = output2 * permuted_probs
     return output2
 
 
@@ -993,11 +993,14 @@ class GroupedExpertsTE(nn.Module):
             dispatcher_share_token_dispatcher: Whether to share a flex dispatcher communication manager across layers.
             dispatcher_async_dispatch: Whether DeepEP/UCCL-EP dispatch should run asynchronously.
         """
-        if config.route_weight_after_down_proj:
+        if config.apply_router_weight_after_down:
+            # GroupedExperts and GroupedExpertsDeepEP fold the router weight in after the
+            # down projection; this backend applies it inside the activation instead, which
+            # silently changes the numerics the flag exists to preserve. Fail loudly rather
+            # than train a model on the wrong reduction order.
             raise ValueError(
-                "route_weight_after_down_proj is not supported by GroupedExpertsTE. "
-                "Use BackendConfig(dispatcher='torch') or implement post-down-projection routing weights "
-                "for the TE expert backend."
+                "apply_router_weight_after_down is not supported by GroupedExpertsTE. "
+                "Use BackendConfig(experts='torch_mm') or the DeepEP expert backend."
             )
 
         from transformer_engine.pytorch import GroupedLinear

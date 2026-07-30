@@ -351,6 +351,7 @@ class TestRecipeInternals:
         recipe.target_wrapper = HFEagleTargetModel(target)
         recipe.output_dir = tmp_path
         recipe.runtime = SimpleNamespace(global_step=5)
+        recipe.checkpoint_config = SimpleNamespace(enabled=False, allow_legacy_pickle_restore=False)
         recipe.grad_accumulation_steps = 1
         recipe.max_grad_norm = 1.0
         recipe.num_epochs = 1

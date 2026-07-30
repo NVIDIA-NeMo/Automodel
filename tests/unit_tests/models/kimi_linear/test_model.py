@@ -100,7 +100,7 @@ def test_kimi_moe_uses_hf_routing_numerics():
     assert not moe_layer.gate.router_topk_sorted
     assert moe_layer.gate.router_weights_fp32
     assert moe_layer.gate.router_weight_uses_score_correction_bias
-    assert moe_layer.experts.route_weight_after_down_proj
+    assert moe_layer.experts.config.apply_router_weight_after_down
 
 
 def test_kimi_defaults_gate_precision_without_mutating_backend_config():

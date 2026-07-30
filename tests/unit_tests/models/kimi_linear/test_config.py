@@ -1,9 +1,12 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 import pytest
-from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 
-from nemo_automodel._transformers.registry import _CUSTOM_CONFIG_REGISTRATIONS, MODEL_ARCH_MAPPING
+from nemo_automodel._transformers.registry import (
+    _CUSTOM_CONFIG_ARCH_REGISTRATIONS,
+    MODEL_ARCH_MAPPING,
+    resolve_custom_config_cls,
+)
 from nemo_automodel.components.models.kimi_linear.config import KimiLinearConfig
 from nemo_automodel.components.models.kimi_linear.model import KimiLinearForCausalLM
 
@@ -45,11 +48,13 @@ def test_kimi_linear_registry_and_capabilities():
         "nemo_automodel.components.models.kimi_linear.model",
         "KimiLinearForCausalLM",
     )
-    assert _CUSTOM_CONFIG_REGISTRATIONS["kimi_linear"] == (
+    # The Kimi K3 text backbone publishes the same model_type, so the architecture
+    # name is what selects this config (see _CUSTOM_CONFIG_ARCH_REGISTRATIONS).
+    assert _CUSTOM_CONFIG_ARCH_REGISTRATIONS["kimi_linear"]["KimiLinearForCausalLM"] == (
         "nemo_automodel.components.models.kimi_linear.config",
         "KimiLinearConfig",
     )
-    assert CONFIG_MAPPING["kimi_linear"] is KimiLinearConfig
+    assert resolve_custom_config_cls("kimi_linear", ["KimiLinearForCausalLM"]) is KimiLinearConfig
 
     capabilities = KimiLinearForCausalLM.ModelCapabilities()
     assert capabilities.supports_ep

@@ -211,7 +211,7 @@ class TestSwigluClampedDeepEP:
 class TestGroupedExpertsRouteWeightAfterDown:
     """Tests for Kimi-style expert output weighting."""
 
-    def _tiny_config(self, *, route_weight_after_down_proj: bool = True, expert_activation: str = "swiglu"):
+    def _tiny_config(self, *, apply_router_weight_after_down: bool = True, expert_activation: str = "swiglu"):
         return MoEConfig(
             n_routed_experts=2,
             n_shared_experts=0,
@@ -230,7 +230,7 @@ class TestGroupedExpertsRouteWeightAfterDown:
             router_bias=False,
             expert_bias=True,
             expert_activation=expert_activation,
-            route_weight_after_down_proj=route_weight_after_down_proj,
+            apply_router_weight_after_down=apply_router_weight_after_down,
             dtype=torch.float32,
         )
 
@@ -279,7 +279,7 @@ class TestGroupedExpertsRouteWeightAfterDown:
         torch.testing.assert_close(output, expected)
 
     def test_default_down_bias_stays_weighted_by_route(self):
-        config = self._tiny_config(route_weight_after_down_proj=False)
+        config = self._tiny_config(apply_router_weight_after_down=False)
         experts = GroupedExperts(config)
         with torch.no_grad():
             experts.gate_and_up_projs.zero_()
@@ -301,10 +301,6 @@ class TestGroupedExpertsRouteWeightAfterDown:
             ]
         )
         torch.testing.assert_close(output, expected)
-
-    def test_route_weight_after_down_projection_requires_swiglu(self):
-        with pytest.raises(ValueError, match="supports only swiglu"):
-            GroupedExperts(self._tiny_config(expert_activation="relu2"))
 
 
 class TestGroupedExpertsZeroActiveExperts:
@@ -826,13 +822,6 @@ class TestGroupedExpertsForwardLoopDTensorBias:
 class TestGroupedExpertsDeepEP:
     """Test GroupedExpertsDeepEP module."""
 
-    def test_grouped_experts_deepep_rejects_route_weight_after_down_projection(self, moe_config):
-        """DeepEP must fail loudly until it implements post-down-projection route weights."""
-        moe_config.route_weight_after_down_proj = True
-
-        with pytest.raises(ValueError, match="GroupedExpertsDeepEP"):
-            GroupedExpertsDeepEP(moe_config)
-
     def test_grouped_experts_deepep_init(self, moe_config):
         """Test GroupedExpertsDeepEP initialization."""
         experts = GroupedExpertsDeepEP(moe_config)
@@ -1144,11 +1133,11 @@ class TestNonGatedActivations:
         )
 
 
-def test_grouped_experts_te_rejects_route_weight_after_down_projection_without_te_import(moe_config):
+def test_grouped_experts_te_rejects_router_weight_after_down_without_te_import(moe_config):
     """TE must fail loudly before importing optional TE when route weights would be applied incorrectly."""
     from nemo_automodel.components.moe.experts import GroupedExpertsTE
 
-    moe_config.route_weight_after_down_proj = True
+    moe_config.apply_router_weight_after_down = True
 
     with pytest.raises(ValueError, match="GroupedExpertsTE"):
         GroupedExpertsTE(moe_config)
@@ -2048,13 +2037,19 @@ class TestPermuteTokensForGroupedMM:
         weights = torch.tensor([[0.7, 0.3]], device=device)
         token_mask = torch.ones(1, dtype=torch.bool, device=device)
 
-        sorted_ids, sorted_weights, tpe, offs = _permute_tokens_for_grouped_mm(
-            indices, weights, token_mask, n_local_experts=2, experts_start_idx=0
+        sorted_ids, sorted_slots, sorted_weights, tpe, offs = _permute_tokens_for_grouped_mm(
+            indices,
+            weights,
+            token_mask,
+            n_local_experts=2,
+            experts_start_idx=0,
+            return_slot_ids=True,
         )
 
         # Sorted by expert: expert 0 first (weight 0.3), expert 1 second (weight 0.7)
         assert tpe[0].item() == 1  # expert 0
         assert tpe[1].item() == 1  # expert 1
+        torch.testing.assert_close(sorted_slots, torch.tensor([1, 0], device=device))
         torch.testing.assert_close(sorted_weights[0], torch.tensor(0.3, device=device))
         torch.testing.assert_close(sorted_weights[1], torch.tensor(0.7, device=device))
 

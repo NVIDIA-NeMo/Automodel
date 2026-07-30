@@ -16,6 +16,7 @@
 import importlib
 import logging
 from collections import OrderedDict
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Dict, Tuple, Type, Union
@@ -105,6 +106,14 @@ MODEL_ARCH_MAPPING = OrderedDict(
         (
             "KimiK25VLForConditionalGeneration",
             ("nemo_automodel.components.models.kimi_k25_vl.model", "KimiK25VLForConditionalGeneration"),
+        ),
+        (
+            "KimiK3ForConditionalGeneration",
+            ("nemo_automodel.components.models.kimi_k3.multimodal", "KimiK3ForConditionalGeneration"),
+        ),
+        (
+            "KimiK3ForCausalLM",
+            ("nemo_automodel.components.models.kimi_k3.model", "KimiK3ForCausalLM"),
         ),
         (
             "KimiVLForConditionalGeneration",
@@ -267,6 +276,10 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ("nemo_automodel.components.models.qwen3_vl_moe.model", "Qwen3VLMoeForConditionalGeneration"),
         ),
         (
+            "Qwen3VLForConditionalGeneration",
+            ("nemo_automodel.components.models.qwen3_vl.model", "Qwen3VLForConditionalGeneration"),
+        ),
+        (
             "Qwen3_5MoeForConditionalGeneration",
             ("nemo_automodel.components.models.qwen3_5_moe.model", "Qwen3_5MoeForConditionalGeneration"),
         ),
@@ -303,7 +316,8 @@ _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
     "inkling_mm_model": ("nemo_automodel.components.models.inkling.configuration", "InklingConfig"),
     "kimi_k2": ("nemo_automodel.components.models.kimi_k2.config", "KimiK2Config"),
     "kimi_k25": ("nemo_automodel.components.models.kimi_k25_vl.model", "KimiK25VLConfig"),
-    "kimi_linear": ("nemo_automodel.components.models.kimi_linear.config", "KimiLinearConfig"),
+    "kimi_k3": ("nemo_automodel.components.models.kimi_k3.config", "KimiK3Config"),
+    "kimi_linear": ("nemo_automodel.components.models.kimi_k3.config", "KimiK3TextConfig"),
     "kimi_vl": ("nemo_automodel.components.models.kimivl.model", "KimiVLConfig"),
     "laguna": ("nemo_automodel.components.models.laguna.config", "LagunaConfig"),
     "llavaonevision1_5": ("nemo_automodel.components.models.llava_onevision.model", "Llavaonevision1_5Config"),
@@ -312,6 +326,20 @@ _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
     "mistral4": ("nemo_automodel.components.models.mistral4.configuration", "Mistral4Config"),
     "step3p5v": ("nemo_automodel.components.models.step3p7.configuration_step3p7", "Step3p5VConfig"),
     "step3p7": ("nemo_automodel.components.models.step3p7.configuration_step3p7", "Step3p7Config"),
+}
+
+# Some model_types are published by more than one checkpoint family: Moonshot's
+# Kimi Linear release and the Kimi K3 text backbone both ship
+# ``model_type: "kimi_linear"``, so the architecture name is the only field that
+# tells them apart. Entries here win over ``_CUSTOM_CONFIG_REGISTRATIONS`` when
+# the caller knows the checkpoint's architectures; a config without
+# ``architectures``, or with one that is not listed, keeps the model_type
+# default (which is also what the eager ``AutoConfig`` registration uses, since
+# that path only sees the model_type).
+_CUSTOM_CONFIG_ARCH_REGISTRATIONS: Dict[str, Dict[str, Tuple[str, str]]] = {
+    "kimi_linear": {
+        "KimiLinearForCausalLM": ("nemo_automodel.components.models.kimi_linear.config", "KimiLinearConfig"),
+    },
 }
 
 # model_types whose custom model implementation should win over a transformers
@@ -331,8 +359,20 @@ _CUSTOM_CONFIG_OVERRIDES_BUILTIN = {
 }
 
 
-def resolve_custom_config_cls(model_type: str) -> Type[PretrainedConfig] | None:
-    """Resolve Automodel's preferred config class for ``model_type`` if one applies."""
+def resolve_custom_config_cls(
+    model_type: str, architectures: Sequence[str] | None = None
+) -> Type[PretrainedConfig] | None:
+    """Resolve Automodel's preferred config class for ``model_type`` if one applies.
+
+    Args:
+        model_type: The checkpoint's ``model_type``.
+        architectures: The checkpoint's ``architectures``, when known. Used to pick
+            between config classes that share a ``model_type`` (see
+            ``_CUSTOM_CONFIG_ARCH_REGISTRATIONS``).
+
+    Returns:
+        The config class to use, or ``None`` when the stock Transformers config applies.
+    """
     if model_type not in _CUSTOM_CONFIG_REGISTRATIONS:
         return None
 
@@ -342,7 +382,9 @@ def resolve_custom_config_cls(model_type: str) -> Type[PretrainedConfig] | None:
     if is_builtin and model_type not in _CUSTOM_CONFIG_OVERRIDES_BUILTIN:
         return None
 
-    module_path, cls_name = _CUSTOM_CONFIG_REGISTRATIONS[model_type]
+    arch_registrations = _CUSTOM_CONFIG_ARCH_REGISTRATIONS.get(model_type, {})
+    registration = next((arch_registrations[arch] for arch in architectures or () if arch in arch_registrations), None)
+    module_path, cls_name = registration or _CUSTOM_CONFIG_REGISTRATIONS[model_type]
     try:
         mod = importlib.import_module(module_path)
         return getattr(mod, cls_name)

@@ -947,7 +947,9 @@ def _build_moe_config(
         router_topk_sorted=False,
         router_weights_fp32=True,
         router_weight_uses_score_correction_bias=True,
-        route_weight_after_down_proj=True,
+        # The reference implementation rounds each BF16 expert output before applying
+        # its router weight and reducing the top-k outputs.
+        apply_router_weight_after_down=True,
         dtype=model_dtype,
         shared_expert_gate=False,
         shared_expert_inter_dim=config.moe_intermediate_size,

@@ -563,7 +563,7 @@ class TestGetHfConfigCustomRegistry:
         assert isinstance(result, RegistryConfig)
         assert result.hidden_size == 123
         assert result.output_hidden_states is True
-        mock_resolve.assert_called_once_with("am_future")
+        mock_resolve.assert_called_once_with("am_future", ["FutureForCausalLM"])
         mock_auto_config.assert_not_called()
 
     def test_unknown_custom_config_falls_back_to_auto_config(self):
