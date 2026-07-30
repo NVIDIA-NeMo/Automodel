@@ -24,8 +24,8 @@ REPO_ROOT = Path(__file__).resolve().parents[4]
 CONFIG_PATH = REPO_ROOT / "examples" / "llm_finetune" / "glm" / "glm_5.2_lora.yaml"
 
 
-def test_glm_5_2_lora_backend_config_instantiates() -> None:
-    """The example's backend block must instantiate through the production config loader."""
+def test_glm_5_2_lora_config_contract() -> None:
+    """The example must preserve its backend, topology, and sequence-length contract."""
     config = load_yaml_config(CONFIG_PATH)
 
     backend = config.model.backend.instantiate()
@@ -34,6 +34,14 @@ def test_glm_5_2_lora_backend_config_instantiates() -> None:
     assert backend.attn == "tilelang"
     assert backend.experts == "torch_mm"
     assert backend.dispatcher == "hybridep"
+    assert config.model.pretrained_model_name_or_path == "zai-org/GLM-5.2"
+    assert config.dataset.seq_length == 4096
+    assert config.dataset.truncation is True
+    assert config.dataset.padding is False
+    assert config.validation_dataset.seq_length == 4096
+    assert config.validation_dataset.truncation is True
+    assert config.validation_dataset.padding is False
+    assert config.packed_sequence.packed_sequence_size == 4096
     assert config.step_scheduler.global_batch_size % (
         config.step_scheduler.local_batch_size * config.distributed.ep_size
     ) == 0

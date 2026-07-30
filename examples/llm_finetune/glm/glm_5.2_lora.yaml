@@ -41,7 +41,7 @@ dist_env:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: ${oc.env:GLM52_MODEL_PATH,zai-org/GLM-5.2}
+  pretrained_model_name_or_path: zai-org/GLM-5.2
   trust_remote_code: true
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
@@ -94,8 +94,8 @@ dataset:
   path_or_dataset_id: allenai/tulu-3-sft-mixture
   split: train[:100000]
   shuffle_seed: 42
-  truncation: false
-  seq_length: 200704
+  truncation: true
+  seq_length: 4096
   padding: false
   tokenizer:
     _target_: transformers.AutoTokenizer.from_pretrained
@@ -106,15 +106,15 @@ validation_dataset:
   path_or_dataset_id: allenai/tulu-3-sft-mixture
   split: train[100000:100064]
   shuffle_seed: 42
-  truncation: false
-  seq_length: 200704
+  truncation: true
+  seq_length: 4096
   padding: false
   tokenizer:
     _target_: transformers.AutoTokenizer.from_pretrained
     pretrained_model_name_or_path: zai-org/GLM-5.2
 
 packed_sequence:
-  packed_sequence_size: 0
+  packed_sequence_size: 4096
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
