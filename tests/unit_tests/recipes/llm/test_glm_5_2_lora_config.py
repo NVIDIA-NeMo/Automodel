@@ -49,7 +49,7 @@ def test_glm_5_2_lora_config_contract() -> None:
     )
     assert config.dataloader.collate_fn is packed_sequence_thd_collater
     assert config.validation_dataloader.collate_fn is packed_sequence_thd_collater
-    assert config.ci.time == "00:20:00"
+    assert config.ci.time == "00:25:00"
     release_overrides = config.ci.release.to_dict()
     assert release_overrides["step_scheduler.max_steps"] == 20
     assert release_overrides["packed_sequence.max_packs"] == 2560

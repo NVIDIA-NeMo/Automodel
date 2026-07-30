@@ -156,7 +156,7 @@ ci:
   # cp_size(1) with ep_size(128) => 128 GPUs => 16 nodes (8 H100/node).
   recipe_owner: HuiyingLi
   nodes: 16
-  time: "00:20:00"
+  time: "00:25:00"
   release:
     step_scheduler.max_steps: 20
     packed_sequence.max_packs: 2560
