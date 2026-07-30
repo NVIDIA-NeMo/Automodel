@@ -1198,22 +1198,32 @@ def _release_recipe_memory(recipe) -> None:
     """
     if recipe is None:
         return
-    optimizers = getattr(recipe, "optimizer", None)
-    if not isinstance(optimizers, (list, tuple)):
-        optimizers = [optimizers] if optimizers is not None else []
-    for opt in optimizers:
-        try:
-            opt.state.clear()
-            opt.param_groups.clear()
-        except Exception:
-            pass
-    recipe.model_parts = None
-    recipe.optimizer = None
-    if getattr(recipe, "lr_scheduler", None) is not None:
-        recipe.lr_scheduler = None
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    _start_preflight_watchdog()
+    try:
+        _report_phase("Teardown: clearing optimizer state")
+        optimizers = getattr(recipe, "optimizer", None)
+        if not isinstance(optimizers, (list, tuple)):
+            optimizers = [optimizers] if optimizers is not None else []
+        for opt in optimizers:
+            try:
+                opt.state.clear()
+                opt.param_groups.clear()
+            except Exception:
+                pass
+        _report_phase("Teardown: optimizer state cleared; dropping recipe references")
+        recipe.model_parts = None
+        recipe.optimizer = None
+        if getattr(recipe, "lr_scheduler", None) is not None:
+            recipe.lr_scheduler = None
+        _report_phase("Teardown: recipe references dropped; starting Python GC")
+        gc.collect()
+        _report_phase("Teardown: Python GC complete")
+        if torch.cuda.is_available():
+            _report_phase("Teardown: releasing cached CUDA memory")
+            torch.cuda.empty_cache()
+            _report_phase("Teardown: cached CUDA memory released")
+    finally:
+        _stop_preflight_watchdog()
 
 
 def run_checkpoint_robustness(
