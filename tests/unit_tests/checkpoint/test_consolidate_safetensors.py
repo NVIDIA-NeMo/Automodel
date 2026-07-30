@@ -471,6 +471,13 @@ def test_resolve_dtype_cast_accepts_aliases_and_none():
 @pytest.mark.run_only_on("CPU")
 def test_every_rank_consolidation_uses_supplied_group_for_failure_sync():
     process_group = MagicMock()
+    call_order = []
+
+    def _record_sync(*args, **kwargs):
+        call_order.append("sync")
+
+    def _record_index_write(*args, **kwargs):
+        call_order.append("index")
 
     with (
         patch(
@@ -490,14 +497,16 @@ def test_every_rank_consolidation_uses_supplied_group_for_failure_sync():
             return_value=2,
         ) as get_world_size,
         patch(
-            "nemo_automodel.components.checkpoint._backports.consolidate_hf_safetensors.dist.all_gather_object"
+            "nemo_automodel.components.checkpoint._backports.consolidate_hf_safetensors.dist.all_gather_object",
+            side_effect=_record_sync,
         ) as all_gather_object,
         patch(
             "nemo_automodel.components.checkpoint._backports.consolidate_hf_safetensors._consolidate_safetensors_files"
         ),
         patch(
             "nemo_automodel.components.checkpoint._backports.consolidate_hf_safetensors."
-            "_write_overall_metadata_file_from_shards"
+            "_write_overall_metadata_file_from_shards",
+            side_effect=_record_index_write,
         ),
     ):
         consolidate_safetensors_files_on_every_rank(
@@ -509,11 +518,14 @@ def test_every_rank_consolidation_uses_supplied_group_for_failure_sync():
 
     get_rank.assert_called_once_with(group=process_group)
     get_world_size.assert_called_once_with(group=process_group)
-    all_gather_object.assert_called_once()
-    failures, local_failure = all_gather_object.call_args.args
-    assert failures == [None, None]
-    assert local_failure is None
-    assert all_gather_object.call_args.kwargs == {"group": process_group}
+    assert all_gather_object.call_count == 2
+    for call in all_gather_object.call_args_list:
+        failures, local_failure = call.args
+        assert failures == [None, None]
+        assert local_failure is None
+        assert call.kwargs == {"group": process_group}
+    # The index is published only after every rank has finished writing its assigned shards.
+    assert call_order == ["sync", "index", "sync"]
 
 
 @pytest.mark.run_only_on("CPU")

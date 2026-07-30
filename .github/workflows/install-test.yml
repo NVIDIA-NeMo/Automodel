@@ -20,7 +20,7 @@ env:
 
 jobs:
   pre-flight:
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.64.2
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@d211550f7cfe04e657ed568ce28bef620457b94f # v0.64.2
 
   setup-install-image:
     runs-on: ubuntu-latest
@@ -46,10 +46,10 @@ jobs:
         python-version: ["3.10", "3.11", "3.12"]
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: ${{ matrix.python-version }}
 
@@ -62,7 +62,7 @@ jobs:
           pip install "."
 
       - name: Checkout check-imports
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           repository: NVIDIA-NeMo/FW-CI-templates
           ref: v0.39.0
@@ -90,10 +90,10 @@ jobs:
         python-version: ["3.12"]
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: ${{ matrix.python-version }}
 
@@ -110,7 +110,7 @@ jobs:
           python -m pip install --upgrade pip
 
       - name: Set up UV
-        uses: astral-sh/setup-uv@v1
+        uses: astral-sh/setup-uv@162b8acf397cb069dec09a3f5a9847cf71cfa46a # v1
         with:
           version: 0.9.26
 
@@ -143,7 +143,7 @@ jobs:
           uv pip install --no-deps -e .
 
       - name: Checkout check-imports
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           repository: NVIDIA-NeMo/FW-CI-templates
           ref: v0.39.0
@@ -183,10 +183,10 @@ jobs:
       SYS_PLATFORM: linux
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: ${{ matrix.python-version }}
 
@@ -259,7 +259,7 @@ jobs:
           test -n "$(ls -1 "${WHEELHOUSE_DIR}"/transformer_engine_torch*.whl 2>/dev/null)"
 
       - name: Upload CUDA wheelhouse artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: cuda-wheelhouse-py${{ matrix.python-version }}
           path: ${{ env.WHEELHOUSE_DIR }}/*.whl
@@ -278,7 +278,7 @@ jobs:
       packages: write
     steps:
       - name: Download CUDA wheelhouse
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           name: cuda-wheelhouse-py3.12
           path: /tmp/cuda-wheelhouse
@@ -334,10 +334,10 @@ jobs:
       WHEELHOUSE_DIR: /tmp/cuda-wheelhouse
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Download cached CUDA wheelhouse
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           name: cuda-wheelhouse-py${{ matrix.python-version }}
           path: ${{ env.WHEELHOUSE_DIR }}
@@ -395,7 +395,7 @@ jobs:
           pip install --find-links "${PIP_FIND_LINKS}" ${PIP_ARGS[@]} .$EXTRA
 
       - name: Checkout check-imports
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           repository: NVIDIA-NeMo/FW-CI-templates
           ref: v0.39.0
@@ -421,10 +421,10 @@ jobs:
         arch: ["${{ vars.LINT_AND_INSTALL_TEST_RUNNER || 'ubuntu-latest' }}", "macos-latest"]
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Set up UV
-        uses: astral-sh/setup-uv@v1
+        uses: astral-sh/setup-uv@162b8acf397cb069dec09a3f5a9847cf71cfa46a # v1
         with:
           version: 0.9.26
 
@@ -448,7 +448,7 @@ jobs:
           uv pip install --no-deps -e .
 
       - name: Checkout check-imports
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           repository: NVIDIA-NeMo/FW-CI-templates
           ref: v0.39.0
@@ -473,7 +473,7 @@ jobs:
       && !cancelled()
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Get workflow result
         id: result

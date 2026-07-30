@@ -50,6 +50,35 @@ def _build_causal_mask(
     return causal + expanded
 
 
+def resolve_attention_bias(config: PretrainedConfig) -> tuple[bool, bool]:
+    """Resolve ``(qkv_bias, o_proj_bias)`` from the two upstream conventions.
+
+    ``attention_bias`` is the Llama-style flag and biases all four projections.
+    ``qkv_bias`` is the Qwen-style flag EAGLE's own reference reads, and biases
+    q/k/v only, leaving ``o_proj`` bias-free. Neither field exists on a plain
+    Llama / Phi-3 / Qwen3 config, so an unset config keeps the bias-free
+    projections this draft has always built and its checkpoints round-trip.
+
+    Args:
+        config: The draft config.
+
+    Returns:
+        Whether q/k/v carry a bias, and whether ``o_proj`` does.
+    """
+    attention_bias = bool(getattr(config, "attention_bias", False))
+    return attention_bias or bool(getattr(config, "qkv_bias", False)), attention_bias
+
+
+def resolve_fc_bias(config: PretrainedConfig) -> bool:
+    """Return whether the feature-fusion projections carry a bias.
+
+    EAGLE's reference builds its ``fc`` with a bias (its ``bias=True`` default);
+    this draft has always been bias-free, so the field defaults to that and only
+    a config that opts in changes the parameter set.
+    """
+    return bool(getattr(config, "fc_bias", False))
+
+
 class EagleLlamaAttention(nn.Module):
     """Standard Llama-style self attention for the EAGLE-1/2 draft."""
 
@@ -62,18 +91,11 @@ class EagleLlamaAttention(nn.Module):
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.scaling = self.head_dim**-0.5
 
-        self.q_proj = nn.Linear(
-            config.hidden_size, self.num_heads * self.head_dim, bias=getattr(config, "attention_bias", False)
-        )
-        self.k_proj = nn.Linear(
-            config.hidden_size, self.num_key_value_heads * self.head_dim, bias=getattr(config, "attention_bias", False)
-        )
-        self.v_proj = nn.Linear(
-            config.hidden_size, self.num_key_value_heads * self.head_dim, bias=getattr(config, "attention_bias", False)
-        )
-        self.o_proj = nn.Linear(
-            self.num_heads * self.head_dim, config.hidden_size, bias=getattr(config, "attention_bias", False)
-        )
+        qkv_bias, o_proj_bias = resolve_attention_bias(config)
+        self.q_proj = nn.Linear(config.hidden_size, self.num_heads * self.head_dim, bias=qkv_bias)
+        self.k_proj = nn.Linear(config.hidden_size, self.num_key_value_heads * self.head_dim, bias=qkv_bias)
+        self.v_proj = nn.Linear(config.hidden_size, self.num_key_value_heads * self.head_dim, bias=qkv_bias)
+        self.o_proj = nn.Linear(self.num_heads * self.head_dim, config.hidden_size, bias=o_proj_bias)
         self.rotary_emb = LlamaRotaryEmbedding(config)
 
     def _repeat_kv(self, tensor: torch.Tensor) -> torch.Tensor:
@@ -178,7 +200,7 @@ class LlamaEagleDraftModel(PreTrainedModel):
         super().__init__(config)
         if self.builds_token_embeddings:
             self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
-        self.fc = nn.Linear(config.hidden_size * 2, config.hidden_size, bias=False)
+        self.fc = nn.Linear(config.hidden_size * 2, config.hidden_size, bias=resolve_fc_bias(config))
         num_layers = max(1, int(getattr(config, "draft_num_hidden_layers", config.num_hidden_layers)))
         self.layers = nn.ModuleList([EagleLlamaDecoderLayer(config) for _ in range(num_layers)])
         self.norm = initialize_rms_norm_module("torch", config.hidden_size, eps=config.rms_norm_eps)
