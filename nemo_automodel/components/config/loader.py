@@ -174,6 +174,10 @@ class _OrigValueStr(str):
         obj._no_env_resolve = True
         return obj
 
+    def __reduce_ex__(self, protocol: int) -> tuple[type["_OrigValueStr"], tuple[str, str]]:
+        """Preserve the resolved and original values when copying this string."""
+        return type(self), (str(self), self._orig_value)
+
 
 def resolve_yaml_env_vars(obj: Any) -> Any:
     """Resolve env var references inside a YAML-loaded container.
