@@ -365,13 +365,13 @@ class TestInitializeWeightsOnTrimmedStage:
 
 
 # ---------------------------------------------------------------------------
-# MoE FSDP iterator on a trimmed stage
+# Shared model-block iterator on a trimmed stage
 # ---------------------------------------------------------------------------
 
 
-class TestMoEIterOnTrimmedStage:
+class TestModelBlockIteratorOnTrimmedStage:
     def test_iter_skips_absent_mtp(self, backend):
-        from nemo_automodel.components.moe.parallelizer import _iter_transformer_and_mtp_blocks
+        from nemo_automodel.shared.model_utils import iter_transformer_and_mtp_blocks
 
         model, _ = _make_model(backend, mtp_layers=1, mtp_layers_block_type=["attention", "moe"])
         # Mimic a middle stage that holds backbone layers but no mtp.
@@ -380,7 +380,7 @@ class TestMoEIterOnTrimmedStage:
         model.model.norm = None
         model.mtp = None
 
-        yielded = list(_iter_transformer_and_mtp_blocks(model))
+        yielded = list(iter_transformer_and_mtp_blocks(model))
         # Only backbone layers should be iterated; no MTP-side blocks.
         assert len(yielded) == len(model.model.layers)
         for parent_layers, layer_id, _block in yielded:
