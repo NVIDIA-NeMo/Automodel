@@ -630,6 +630,7 @@ class TestQwen3_5MoeForConditionalGeneration:
         assert squeeze_args[1] is position_ids
         assert squeeze_args[2] is padding_mask
         assert squeeze_args[3]["qkv_format"] == "thd"
+        assert mock_model_forward.call_args.kwargs["padding_mask"] is squeezed_padding_mask
 
     def test_initialize_weights_invokes_language_model(self, vl_config, backend_config, moe_config):
         model = Qwen3_5MoeForConditionalGeneration(vl_config, backend=backend_config, moe_config=moe_config)

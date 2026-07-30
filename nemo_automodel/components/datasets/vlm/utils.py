@@ -202,6 +202,36 @@ def _preload_media(example, processor=None, preserve_video_metadata=False):
                             processor,
                             frame_indices=item.get("frame_indices"),
                         )
+                elif isinstance(vid, (list, tuple)) and vid and all(isinstance(f, str) for f in vid):
+                    # Pre-extracted frame sequence: every entry is an image path,
+                    # so frames load directly -- no video decoder required.
+                    temporal_patch_size = 2
+                    if processor is not None and hasattr(processor, "video_processor"):
+                        temporal_patch_size = getattr(processor.video_processor, "temporal_patch_size", 2)
+                    frames = [Image.open(f).convert("RGB") for f in vid]
+                    indices = list(range(len(frames)))
+                    # Pad to temporal_patch_size alignment by repeating the last
+                    # frame, mirroring the decord path above.
+                    remainder = len(indices) % temporal_patch_size
+                    if remainder != 0:
+                        pad = temporal_patch_size - remainder
+                        frames.extend([frames[-1]] * pad)
+                        indices.extend([indices[-1]] * pad)
+                    item["video"] = frames
+                    if preserve_video_metadata:
+                        fps = item.get("fps")
+                        if fps is None and processor is not None and hasattr(processor, "video_processor"):
+                            fps = getattr(processor.video_processor, "fps", None)
+                        if fps is None:
+                            raise ValueError(
+                                "fps is required for pre-extracted frame sequences when "
+                                "preserve_video_metadata is enabled, but none could be resolved. "
+                                "Set an 'fps' field on the video content item, or configure 'fps' "
+                                "on the processor's video_processor so that correct timestamps can "
+                                "be built for the extracted frames."
+                            )
+                        item["_video_fps"] = fps
+                        item["_frame_indices"] = indices
     return example
 
 
@@ -304,3 +334,37 @@ def process_text_batch(
         )
 
     return batch
+
+
+def set_image_pixel_bounds(processor, *, max_pixels: int | None = None, min_pixels: int | None = None) -> None:
+    """Clamp a VLM processor's per-image resolution.
+
+    A draft-training batch is truncated to ``seq_length`` and the assistant turn
+    the draft is supervised on sits at the *end* of the sequence. Qwen VL
+    processors default to a per-image ``max_pixels`` large enough to emit more
+    vision tokens than the whole budget, in which case truncation removes the
+    assistant turn outright, the label scan finds no assistant marker, and the
+    resulting ``loss_mask`` is all zeros.
+
+    Answer regeneration must apply the same bounds as training: the answer is
+    conditioned on whatever resolution the target saw, so regenerating at a
+    higher one supervises the draft against an image it never gets.
+
+    Args:
+        processor: A HuggingFace processor; a no-op when it has no image processor.
+        max_pixels: Per-image pixel ceiling, or None to keep the default.
+        min_pixels: Per-image pixel floor, or None to keep the default.
+    """
+    image_processor = getattr(processor, "image_processor", None)
+    if image_processor is None:
+        return
+    for attribute, value in (("max_pixels", max_pixels), ("min_pixels", min_pixels)):
+        if value is None:
+            continue
+        setattr(image_processor, attribute, int(value))
+        # transformers >= 5 reads the bounds off ``size`` when it is present,
+        # falling back to the flat attributes only when it is not.
+        size = getattr(image_processor, "size", None)
+        if isinstance(size, dict) and attribute in size:
+            size[attribute] = int(value)
+        logger.info("Capped processor %s at %d", attribute, int(value))

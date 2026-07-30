@@ -656,7 +656,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         ):
             from nemo_automodel.components.models.common.packing import configure_packing, get_attn_implementation
 
-            attn_implementation = get_attn_implementation(self.cfg.model)
+            attn_implementation = get_attn_implementation(self.cfg.model, model=self.model_parts[0])
             configure_packing(attn_implementation=attn_implementation)
         collate_wrapper = _build_pp_collate_wrapper(self.cfg.model, self.pp_enabled)
 

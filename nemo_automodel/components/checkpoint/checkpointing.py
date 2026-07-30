@@ -17,6 +17,7 @@ import glob
 import logging
 import os
 import pickle
+import threading
 import time
 from dataclasses import dataclass
 from datetime import timedelta
@@ -529,7 +530,7 @@ class Checkpointer:
             self._optim_ctx.stager = DefaultStager()
             self._model_ctx.process_group = _new_gloo_process_group(process_group)
             self._optim_ctx.process_group = _new_gloo_process_group(process_group)
-        elif (
+        if (
             torch.distributed.is_initialized()
             and torch.distributed.get_world_size(group=process_group) > 1
             and _should_write_hf_metadata(self.config)
@@ -542,6 +543,8 @@ class Checkpointer:
                 process_group,
                 timeout=timedelta(minutes=self.config.consolidation_timeout_minutes),
             )
+        self._consolidation_thread: threading.Thread | None = None
+        self._consolidation_error: BaseException | None = None
 
         self._addons = []
         if _should_write_hf_metadata(self.config):
@@ -584,10 +587,15 @@ class Checkpointer:
 
         # Because this call lies outside of the dcp save call, we need to consolidate on all ranks on the main process
         # of all ranks, which lies on the critical path. Therefore, we can only do this outside of async mode.
+        # In async mode the same distributed consolidation is deferred to a background thread on every rank that
+        # waits for the async upload to finish, instead of the storage writer's single-rank finish() consolidation.
         # If single_rank_consolidation is set, we skip distributed consolidation and let rank 0 handle it
         # via the storage writer's finish() method - useful for Unity Catalog Volumes.
         consolidate_on_all_ranks = (
             should_write_consolidated and not self.config.is_async and not self.config.single_rank_consolidation
+        )
+        defer_consolidation = (
+            should_write_consolidated and self.config.is_async and not self.config.single_rank_consolidation
         )
         consolidation_process_group = (
             self._consolidation_process_group if self._consolidation_process_group is not None else self.process_group
@@ -639,7 +647,11 @@ class Checkpointer:
         self._maybe_write_offline_consolidation_script(model_dir)
 
         storage_writer = self._get_storage_writer(
-            consolidated_dir, fqn_to_file_index_mapping, fqn_to_dtype_mapping, model_dir, consolidate_on_all_ranks
+            consolidated_dir,
+            fqn_to_file_index_mapping,
+            fqn_to_dtype_mapping,
+            model_dir,
+            consolidate_on_all_ranks or defer_consolidation,
         )
         self._model_ctx.future = self._do_save(state_dict, model_dir, storage_writer)
 
@@ -666,43 +678,80 @@ class Checkpointer:
                     _maybe_rename_index_for_diffusers(consolidated_dir)
             if is_rank_0():
                 logger.info("Successfully exported consolidated HF safetensors to %s.", consolidated_dir)
+        elif defer_consolidation:
+            self._schedule_deferred_consolidation(
+                self._model_ctx.future,
+                model_dir,
+                consolidated_dir,
+                fqn_to_file_index_mapping,
+                fqn_to_dtype_mapping,
+                consolidation_process_group,
+            )
         self._maybe_log_final_offline_consolidation_hint(model_dir, is_final_checkpoint)
 
     @torch.no_grad()
     def save_optimizer(
-        self, optimizer: torch.optim.Optimizer, model: nn.Module, weights_path: str, scheduler: Optional[Any] = None
+        self,
+        optimizer: torch.optim.Optimizer | list[torch.optim.Optimizer],
+        model: nn.Module | list[nn.Module],
+        weights_path: str,
+        scheduler: Optional[Any] = None,
+        *,
+        optimizer_part_ids: list[int] | None = None,
     ) -> None:
         """
         Save optimizer (and optional scheduler) state to `weights_path/optim` using DCP.
 
         Args:
-            optimizer: Optimizer whose state will be saved.
-            model: Model providing partitioning context for the optimizer wrapper.
+            optimizer: Optimizer or per-model-part optimizers whose state will be saved.
+            model: Model or pipeline model parts providing partitioning context.
             weights_path: Base directory for checkpoints.
             scheduler: Optional LR scheduler to include.
+            optimizer_part_ids: Global pipeline-stage indices corresponding to
+                per-model-part optimizers.
         """
         optimizer_path = os.path.join(weights_path, "optim")
         _ensure_dirs(optimizer_path, process_group=self.process_group)
         optimizer_state = OptimizerState(
-            model, optimizer, scheduler, is_peft=self.config.is_peft, cpu_offload=self.config.cpu_offload
+            model,
+            optimizer,
+            scheduler,
+            is_peft=self.config.is_peft,
+            cpu_offload=self.config.cpu_offload,
+            has_expert_parallelism=self.moe_mesh is not None,
+            optimizer_part_ids=optimizer_part_ids,
         )
         state_dict = optimizer_state.state_dict()
         self._optim_ctx.future = self._do_save(state_dict, optimizer_path)
 
     def load_optimizer(
-        self, optimizer: torch.optim.Optimizer, model: nn.Module, weights_path: str, scheduler: Optional[Any] = None
+        self,
+        optimizer: torch.optim.Optimizer | list[torch.optim.Optimizer],
+        model: nn.Module | list[nn.Module],
+        weights_path: str,
+        scheduler: Optional[Any] = None,
+        *,
+        optimizer_part_ids: list[int] | None = None,
     ) -> None:
         """
         Load optimizer (and optional scheduler) state from `weights_path/optim` using DCP.
 
         Args:
-            optimizer: Optimizer to populate.
-            model: Model providing partitioning context for the optimizer wrapper.
+            optimizer: Optimizer or per-model-part optimizers to populate.
+            model: Model or pipeline model parts providing partitioning context.
             weights_path: Base directory for checkpoints.
             scheduler: Optional LR scheduler to populate.
+            optimizer_part_ids: Global pipeline-stage indices corresponding to
+                per-model-part optimizers.
         """
         optimizer_state = OptimizerState(
-            model, optimizer, scheduler, is_peft=self.config.is_peft, cpu_offload=self.config.cpu_offload
+            model,
+            optimizer,
+            scheduler,
+            is_peft=self.config.is_peft,
+            cpu_offload=self.config.cpu_offload,
+            has_expert_parallelism=self.moe_mesh is not None,
+            optimizer_part_ids=optimizer_part_ids,
         )
         state_dict = optimizer_state.state_dict()
         self._do_load(state_dict, os.path.join(weights_path, "optim"))
@@ -1190,14 +1239,89 @@ class Checkpointer:
 
     def async_wait(self) -> None:
         """
-        Wait for the async save to finish.
+        Wait for the async save (and any deferred consolidation) to finish.
         """
         if self._model_ctx.future is not None:
             self._model_ctx.future.upload_completion.result()
             self._model_ctx.future = None
+            self._release_async_stager(self._model_ctx)
         if self._optim_ctx.future is not None:
             self._optim_ctx.future.upload_completion.result()
             self._optim_ctx.future = None
+            self._release_async_stager(self._optim_ctx)
+        self._join_deferred_consolidation()
+
+    @staticmethod
+    def _release_async_stager(context: _AsyncSaveContext) -> None:
+        """Close a completed async stager so the next save uses a fresh instance."""
+        if context.stager is not None:
+            context.stager.close()
+            context.stager = None
+
+    def _schedule_deferred_consolidation(
+        self,
+        future: "AsyncSaveResponse | None",
+        model_dir: str,
+        consolidated_dir: str,
+        fqn_to_index_mapping: dict[str, int] | None,
+        fqn_to_dtype_mapping: dict[str, str] | None,
+        process_group: "torch.distributed.ProcessGroup | None",
+    ) -> None:
+        """
+        Consolidate HF safetensors on a background thread once the async upload completes.
+
+        Every rank schedules the same distributed consolidation used in sync mode, so the
+        shards written by the async save are merged in parallel across ranks without
+        blocking the training loop. Collectives inside the consolidation run on the
+        dedicated Gloo group created at init.
+
+        Args:
+            future: Async save response whose ``upload_completion`` gates the consolidation.
+            model_dir: Directory holding the sharded safetensors written by the async save.
+            consolidated_dir: Output directory for the consolidated HF safetensors.
+            fqn_to_index_mapping: Mapping from tensor FQN to consolidated output file index.
+            fqn_to_dtype_mapping: Optional mapping from tensor FQN to original HF dtype string.
+            process_group: Group the consolidation collectives run on; the same one the
+                synchronous path and the save addons use.
+        """
+        self._join_deferred_consolidation()
+
+        def _consolidate() -> None:
+            try:
+                if future is not None:
+                    future.upload_completion.result()
+                consolidate_safetensors_files_on_every_rank(
+                    input_dir=model_dir,
+                    output_dir=consolidated_dir,
+                    fqn_to_index_mapping=fqn_to_index_mapping,
+                    num_threads=5,
+                    use_staging=self.config.staging_dir is not None,
+                    staging_dir=self.config.staging_dir,
+                    fqn_to_dtype_mapping=fqn_to_dtype_mapping,
+                    process_group=process_group,
+                )
+                if self.config.diffusers_compatible and is_rank_0():
+                    _maybe_rename_index_for_diffusers(consolidated_dir)
+                if is_rank_0():
+                    logger.info("Successfully exported consolidated HF safetensors to %s.", consolidated_dir)
+            except BaseException as e:  # noqa: B036 - re-raised on the main thread in async_wait
+                self._consolidation_error = e
+
+        self._consolidation_thread = threading.Thread(
+            target=_consolidate, name="hf-safetensors-consolidation", daemon=True
+        )
+        self._consolidation_thread.start()
+
+    def _join_deferred_consolidation(self) -> None:
+        """Wait for a pending background consolidation and surface its error, if any."""
+        thread = self._consolidation_thread
+        if thread is not None:
+            thread.join()
+            self._consolidation_thread = None
+        if self._consolidation_error is not None:
+            error = self._consolidation_error
+            self._consolidation_error = None
+            raise error
 
     def save_on_dp_ranks(self, state: Any, state_name: str, path: str) -> None:
         """
@@ -1345,6 +1469,8 @@ class Checkpointer:
 
         if self.config.is_async:
             ctx = self._model_ctx if is_model else self._optim_ctx
+            if ctx.stager is None:
+                ctx.stager = DefaultStager()
             ret = dcp.async_save(
                 state_dict,
                 checkpoint_id=path,
@@ -1465,6 +1591,7 @@ fi
         if not _should_write_hf_metadata(self.config):
             return None
         model = model_state.model[0]
+        excluded_keys: set[str] = set()
         # we first need to find the FQN -> .safetensors mapping
         reference_path = _get_hf_safetensors_reference_path(
             self.config.model_cache_dir,
@@ -1500,6 +1627,7 @@ fi
                 # `uses_tied_lm_head=True` but must still persist their own lm_head.
                 if getattr(model_state, "has_local_tied_lm_head", False):
                     keys_to_remove.append(model_state.lm_head_param_name)
+                excluded_keys.update(keys_to_remove)
                 for key in keys_to_remove:
                     fqn_to_file_index_mapping.pop(key, None)
         else:
@@ -1522,14 +1650,18 @@ fi
                     num_shards,
                 )
 
-        # Add any missing keys from the model_state_dict
-        # These will go to the same file as the last file (or file 1 for single-file models)
+        # Add any missing keys from the global pre-shard HF state dict and the current state dict.
+        # These will go to the same file as the last file (or file 1 for single-file models).
+        # The global keys keep mappings complete under PP, while the current keys preserve
+        # parameters registered after parallelization, such as test- or application-owned weights.
         # Use default of 1 when mapping is empty (e.g., encoder models with different key prefixes)
         default_index = max(fqn_to_file_index_mapping.values()) if fqn_to_file_index_mapping else 1
 
         # add any additional keys that are not in the base checkpoint
-        for fqn in list(state_dict.keys()):
-            fqn_to_file_index_mapping[fqn] = fqn_to_file_index_mapping.get(fqn, default_index)
+        additional_keys = dict.fromkeys([*(pre_shard_hf_state_dict_keys or ()), *state_dict])
+        for fqn in additional_keys:
+            if fqn not in excluded_keys:
+                fqn_to_file_index_mapping[fqn] = fqn_to_file_index_mapping.get(fqn, default_index)
         return fqn_to_file_index_mapping
 
     def _maybe_build_original_dtype_mapping(
@@ -1568,7 +1700,7 @@ fi
         fqn_to_index_mapping: Optional[dict[str, int]],
         fqn_to_dtype_mapping: Optional[dict[str, str]],
         model_path: str,
-        consolidate_on_all_ranks: bool = False,
+        consolidation_handled_externally: bool = False,
     ) -> StorageWriter | None:
         """
         Construct a Hugging Face storage writer for sharded safetensors.
@@ -1578,7 +1710,9 @@ fi
             fqn_to_index_mapping: Optional mapping from FQN to shard index.
             fqn_to_dtype_mapping: Optional mapping from FQN to original HF safetensors dtype string.
             model_path: Path where the model checkpoint is saved.
-            consolidate_on_all_ranks: If True, consolidate on all ranks on the main process.
+            consolidation_handled_externally: If True, consolidation happens outside the writer
+                (inline on all ranks in sync mode, or on a background thread in async mode), so
+                the writer's own finish() consolidation is disabled.
 
         Returns:
             Configured storage writer or None for non-safetensors.
@@ -1587,7 +1721,7 @@ fi
             return _HuggingFaceStorageWriter(
                 path=model_path,
                 save_sharded=True,
-                consolidated_output_path=consolidated_output_path if not consolidate_on_all_ranks else None,
+                consolidated_output_path=consolidated_output_path if not consolidation_handled_externally else None,
                 fqn_to_index_mapping=fqn_to_index_mapping,
                 fqn_to_dtype_mapping=fqn_to_dtype_mapping,
                 staging_dir=self.config.staging_dir,

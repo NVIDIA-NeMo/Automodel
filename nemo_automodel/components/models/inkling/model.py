@@ -148,9 +148,19 @@ class InklingTextModel(HFInklingTextModel):
         hidden_states = inputs_embeds
         layers = self.layers.values() if isinstance(self.layers, nn.ModuleDict) else self.layers
         for decoder_layer in layers:
+            attention_type = getattr(decoder_layer, "attention_type", None)
+            if attention_type is None:
+                # Transformers 5.14 renamed this field and uses Inkling layer types.
+                layer_type = decoder_layer.layer_type
+                if layer_type == "hybrid":
+                    attention_type = "full_attention"
+                elif layer_type == "hybrid_sliding":
+                    attention_type = "sliding_attention"
+                else:
+                    raise ValueError(f"Unsupported Inkling layer type: {layer_type!r}")
             hidden_states = decoder_layer(
                 hidden_states,
-                attention_mask=causal_mask_mapping[decoder_layer.attention_type],
+                attention_mask=causal_mask_mapping[attention_type],
                 conv_mask=causal_mask_mapping["linear_attention"],
                 past_key_values=past_key_values,
                 **kwargs,

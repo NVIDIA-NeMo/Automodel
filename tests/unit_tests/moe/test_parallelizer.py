@@ -68,16 +68,24 @@ class LayerContainer:
 
 
 class DummyModel:
-    def __init__(self, blocks, embed_tokens=None, lm_head=None, audio_tower=None, visual=None):
+    def __init__(self, blocks, embed_tokens=None, embed_norm=None, lm_head=None, audio_tower=None, visual=None):
         self.layers = LayerContainer(blocks)
         self.embed_tokens = embed_tokens
+        self.embed_norm = embed_norm
         self.lm_head = lm_head
         self.audio_tower = audio_tower
         self.visual = visual
 
     def parameters(self):
         """Aggregate child parameters like ``nn.Module.parameters()``."""
-        for child in (self.layers, self.embed_tokens, self.lm_head, self.audio_tower, self.visual):
+        for child in (
+            self.layers,
+            self.embed_tokens,
+            self.embed_norm,
+            self.lm_head,
+            self.audio_tower,
+            self.visual,
+        ):
             child_parameters = getattr(child, "parameters", None)
             if callable(child_parameters):
                 yield from child_parameters()
@@ -345,7 +353,9 @@ def _import_parallelizer_with_stubs(monkeypatch):
     distributed_stub = types.ModuleType("nemo_automodel.components.distributed")
     distributed_stub.__path__ = []
     config_stub = types.ModuleType("nemo_automodel.components.distributed.config")
-    config_stub.normalize_activation_checkpointing_scope = lambda scope: (scope,) if isinstance(scope, str) else tuple(scope)
+    config_stub.normalize_activation_checkpointing_scope = lambda scope: (
+        (scope,) if isinstance(scope, str) else tuple(scope)
+    )
     pipelining_stub = types.ModuleType("nemo_automodel.components.distributed.pipelining")
     pipelining_stub.__path__ = []
     pipelining_config_stub = types.ModuleType("nemo_automodel.components.distributed.pipelining.config")
@@ -380,6 +390,28 @@ def _import_parallelizer_with_stubs(monkeypatch):
     shared_utils_stub = types.ModuleType("nemo_automodel.shared.utils")
     shared_utils_stub.dtype_from_str = lambda val, default=None: default
     monkeypatch.setitem(sys.modules, "nemo_automodel.shared.utils", shared_utils_stub)
+
+    tied_weights_stub = types.ModuleType("nemo_automodel.shared.tied_weights")
+    tied_weights_stub.ensure_tied_lm_head = lambda model: None
+    monkeypatch.setitem(sys.modules, "nemo_automodel.shared.tied_weights", tied_weights_stub)
+
+    activation_checkpointing_stub = types.ModuleType("nemo_automodel.components.distributed.activation_checkpointing")
+    activation_checkpointing_stub.ensure_profiler_ops_sac_ignored = lambda: None
+    monkeypatch.setitem(
+        sys.modules,
+        "nemo_automodel.components.distributed.activation_checkpointing",
+        activation_checkpointing_stub,
+    )
+
+    distributed_config_stub = types.ModuleType("nemo_automodel.components.distributed.config")
+    distributed_config_stub.normalize_activation_checkpointing_scope = lambda value: (
+        (value,) if isinstance(value, str) else tuple(value or ("all",))
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "nemo_automodel.components.distributed.config",
+        distributed_config_stub,
+    )
 
     parallel_styles_stub = types.ModuleType("nemo_automodel.components.distributed.parallel_styles")
     parallel_styles_stub.translate_to_lora = lambda style: style
@@ -706,8 +738,9 @@ def test_apply_fsdp_calls_with_ignored_params_and_shard_for_experts(monkeypatch)
 
     block = DummyBlock(mlp=DummyMoE())
     embed = object()
+    embed_norm = object()
     lm = object()
-    model = DummyModel([block], embed_tokens=embed, lm_head=lm)
+    model = DummyModel([block], embed_tokens=embed, embed_norm=embed_norm, lm_head=lm)
 
     fsdp_mesh = type("Mesh", (), {"size": lambda self: 2})()
     ep_shard_mesh = type("Mesh", (), {"size": lambda self: 2})()
@@ -741,9 +774,12 @@ def test_apply_fsdp_calls_with_ignored_params_and_shard_for_experts(monkeypatch)
     ignored = block_kwargs.get("ignored_params")
     assert isinstance(ignored, set) and len(ignored) == len(list(experts.parameters()))
 
-    # embed, lm_head and model should also be sharded on fsdp_mesh
+    # embed, post-embedding norm, lm_head and model should also be sharded on fsdp_mesh
     embed_call = _find_call_by_first_arg(fully_shard_mock, embed)
     assert embed_call is not None and embed_call[1]["mesh"] is fsdp_mesh
+
+    embed_norm_call = _find_call_by_first_arg(fully_shard_mock, embed_norm)
+    assert embed_norm_call is not None and embed_norm_call[1]["mesh"] is fsdp_mesh
 
     lm_call = _find_call_by_first_arg(fully_shard_mock, lm)
     assert lm_call is not None and lm_call[1]["mesh"] is fsdp_mesh
