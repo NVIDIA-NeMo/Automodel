@@ -87,11 +87,13 @@ class WandbConfig:
         import wandb
         from wandb import Settings
 
-        named = {
-            config_field.name: value
-            for config_field in fields(self)
-            if config_field.name != "extra" and (value := getattr(self, config_field.name)) is not None
-        }
+        named = {}
+        for config_field in fields(self):
+            if config_field.name == "extra":
+                continue
+            value = getattr(self, config_field.name)
+            if value is not None:
+                named[config_field.name] = value
         # ``extra`` (e.g. mode/dir) is forwarded verbatim; named fields win on collision.
         kwargs = {**self.extra, **named}
         if kwargs.get("name", "") == "" and model_name:
