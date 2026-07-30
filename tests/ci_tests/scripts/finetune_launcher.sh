@@ -93,13 +93,13 @@ if [[ "$HAS_ROBUSTNESS" == "true" ]]; then
     --phase checkpoint_robustness \
     --output "$TEST_DIR/robustness_config.yaml")
 
-  ROBUSTNESS_TEST_SCRIPT="tests/functional_tests/checkpoint_robustness/test_checkpoint_robustness_llm.py"
+  ROBUSTNESS_TEST_MODULE="tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm"
   case "$CONFIG_PATH" in
     *retrieval/bi_encoder/*)
-      ROBUSTNESS_TEST_SCRIPT="tests/functional_tests/checkpoint_robustness/test_checkpoint_robustness_biencoder.py"
+      ROBUSTNESS_TEST_MODULE="tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_biencoder"
       ;;
     *vlm_finetune*)
-      ROBUSTNESS_TEST_SCRIPT="tests/functional_tests/checkpoint_robustness/test_checkpoint_robustness_vlm.py"
+      ROBUSTNESS_TEST_MODULE="tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_vlm"
       ;;
   esac
 
@@ -110,7 +110,7 @@ if [[ "$HAS_ROBUSTNESS" == "true" ]]; then
   fi
 
   ROBUSTNESS_CMD="${ROBUSTNESS_LAUNCH_CMD} --tee 3 --log-dir $TEST_DIR/robustness_logs \
-    ${ROBUSTNESS_TEST_SCRIPT} \
+    -m ${ROBUSTNESS_TEST_MODULE} \
     --config ${RESOLVED_ROBUSTNESS_CONFIG}"
 
   echo "============================================"

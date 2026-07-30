@@ -14,7 +14,7 @@
 
 """Train -> checkpoint -> reload via automodel & vanilla HF from consolidated, verify logits match via KL divergence.
 
-Launch: torchrun --nproc-per-node=<N> <this_file> --config <config.yaml>
+Launch: torchrun --nproc-per-node=<N> -m <this_module> --config <config.yaml>
     [--kl_threshold <float>] [--hf_kl_threshold <float>]
     [--cross_tp_size <int>] [--cross_tp_kl_threshold <float>]
     [--tokenizer_name <str>]
