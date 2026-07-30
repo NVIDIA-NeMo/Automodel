@@ -69,7 +69,9 @@ from nemo_automodel.components.distributed.activation_checkpointing import (
     is_selective_activation_checkpointing,
 )
 from nemo_automodel.components.distributed.config import (
+    ActivationCheckpointingModules,
     ActivationCheckpointingScope,
+    normalize_activation_checkpointing_modules,
     normalize_activation_checkpointing_scope,
 )
 from nemo_automodel.components.distributed.mesh_utils import get_fsdp_dp_mesh
@@ -261,6 +263,7 @@ class ParallelizationStrategy(ABC):
         tp_mesh_name: str = "tp",
         reshard_after_forward: Optional[bool] = None,
         activation_checkpointing_scope: ActivationCheckpointingScope | None = "all",
+        activation_checkpointing_modules: ActivationCheckpointingModules | None = "all",
         frozen_multimodal_sharding: FrozenMultimodalSharding = "root",
         **kwargs,
     ) -> nn.Module:
@@ -290,6 +293,7 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
         fsdp2_forward_prefetch_depth: int = 1,
         reshard_after_forward: Optional[bool] = None,
         activation_checkpointing_scope: ActivationCheckpointingScope | None = "all",
+        activation_checkpointing_modules: ActivationCheckpointingModules | None = "all",
         frozen_multimodal_sharding: FrozenMultimodalSharding = "root",
         fully_shard_fn=None,
     ) -> nn.Module:
@@ -384,6 +388,7 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
                 layer_groups,
                 activation_checkpointing_scope,
             )
+            ac_modules = normalize_activation_checkpointing_modules(activation_checkpointing_modules)
 
             if is_selective_activation_checkpointing(activation_checkpointing):
                 apply_selective_checkpointing_to_layers(
@@ -399,8 +404,27 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
                 # no_grad, causing AOT autograd to trace a forward-only graph that drops LoRA
                 # (and other trainable) weight gradients.  Wrapping must happen BEFORE FSDP2
                 # sharding so the module structure is stable when fully_shard() indexes params.
+                if ac_modules == ("all",):
+                    checkpoint_attrs = ("self_attn", "attention", "attn", "linear_attn", "mlp", "feed_forward", "ffn")
+                else:
+                    checkpoint_attrs = ()
+                    if "attention" in ac_modules:
+                        checkpoint_attrs += ("self_attn", "attention", "attn", "linear_attn")
+                    if "mlp" in ac_modules:
+                        checkpoint_attrs += ("mlp", "feed_forward", "ffn")
+                    if "norm" in ac_modules:
+                        checkpoint_attrs += (
+                            "input_layernorm",
+                            "attention_norm",
+                            "layer_norm1",
+                            "norm1",
+                            "post_attention_layernorm",
+                            "ffn_norm",
+                            "layer_norm2",
+                            "norm2",
+                        )
                 for layer in ac_layers:
-                    for attr in ("self_attn", "attention", "attn", "linear_attn", "mlp", "feed_forward", "ffn"):
+                    for attr in checkpoint_attrs:
                         m = getattr(layer, attr, None)
                         if m is not None:
                             setattr(layer, attr, checkpoint_wrapper(m, checkpoint_impl=CheckpointImpl.NO_REENTRANT))
@@ -410,10 +434,14 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
                     layer_groups,
                     ac_scopes,
                     enable_compile=enable_compile,
-                ):
+                ) and ac_modules == ("all",):
                     model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": True})
                 else:
-                    apply_submodule_checkpointing(ac_layers, _has_kv_sharing)
+                    apply_submodule_checkpointing(
+                        ac_layers,
+                        _has_kv_sharing,
+                        activation_checkpointing_modules=ac_modules,
+                    )
 
         # Set up mixed precision policy
         if not mp_policy:
@@ -2318,6 +2346,7 @@ def fsdp2_strategy_parallelize(
     fsdp2_forward_prefetch_depth: int = 1,
     reshard_after_forward: Optional[bool] = None,
     activation_checkpointing_scope: ActivationCheckpointingScope | None = "all",
+    activation_checkpointing_modules: ActivationCheckpointingModules | None = "all",
     frozen_multimodal_sharding: FrozenMultimodalSharding = "root",
 ):
     """
@@ -2350,6 +2379,8 @@ def fsdp2_strategy_parallelize(
             Used when data parallel shard is enabled. Defaults to "dp_shard_cp".
         tp_mesh_name (str): Key name for the tensor parallel mesh in device_mesh.
             Defaults to "tp".
+        activation_checkpointing_modules: Which decoder submodules to wrap for
+            non-selective submodule activation checkpointing.
         frozen_multimodal_sharding: Whether fully frozen multimodal modules are
             owned by the root FSDP unit (``"root"``), sharded normally
             (``"per_layer"``), or excluded from FSDP and copied on every rank
@@ -2383,6 +2414,7 @@ def fsdp2_strategy_parallelize(
         fsdp2_forward_prefetch_depth=fsdp2_forward_prefetch_depth,
         reshard_after_forward=reshard_after_forward,
         activation_checkpointing_scope=activation_checkpointing_scope,
+        activation_checkpointing_modules=activation_checkpointing_modules,
         frozen_multimodal_sharding=frozen_multimodal_sharding,
     )
 

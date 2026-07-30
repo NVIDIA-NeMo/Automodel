@@ -53,11 +53,13 @@ if TYPE_CHECKING:
 # Type aliases for API signatures.
 ActivationCheckpointingMode = Union[bool, Literal["full", "selective"]]
 ActivationCheckpointingScope = Union[str, List[str], Tuple[str, ...]]
+ActivationCheckpointingModules = Union[str, List[str], Tuple[str, ...]]
 DistributedStrategyConfig = Union["FSDP2Config", "MegatronFSDPConfig", "DDPConfig"]
 # Backwards-compatible alias for external / type-checking references.
 DistributedConfig = DistributedStrategyConfig
 
 _VALID_ACTIVATION_CHECKPOINTING_SCOPES = {"all", "language", "vision", "audio", "multimodal"}
+_VALID_ACTIVATION_CHECKPOINTING_MODULES = {"all", "attention", "mlp", "norm"}
 
 
 def normalize_activation_checkpointing_scope(value: Any) -> Tuple[str, ...]:
@@ -93,6 +95,52 @@ def normalize_activation_checkpointing_scope(value: Any) -> Tuple[str, ...]:
     if "all" in scopes and len(scopes) > 1:
         raise ValueError("activation_checkpointing_scope='all' cannot be combined with other scopes.")
     return tuple(scopes)
+
+
+def normalize_activation_checkpointing_modules(value: Any) -> Tuple[str, ...]:
+    """Validate and normalize activation-checkpointing submodule selectors."""
+    if value is None:
+        return ("all",)
+    if isinstance(value, str):
+        raw_parts = value.lower().replace("-", "_").replace("+", ",").split(",")
+    elif isinstance(value, (list, tuple, set)):
+        raw_parts = []
+        for item in value:
+            if not isinstance(item, str):
+                raise ValueError("activation_checkpointing_modules entries must be strings.")
+            raw_parts.extend(item.lower().replace("-", "_").replace("+", ",").split(","))
+    else:
+        raise ValueError("activation_checkpointing_modules must be a string or list of strings.")
+
+    aliases = {
+        "default": "all",
+        "auto": "all",
+        "attn": "attention",
+        "self_attn": "attention",
+        "linear_attn": "attention",
+        "moe": "mlp",
+        "ffn": "mlp",
+        "feed_forward": "mlp",
+        "layernorm": "norm",
+        "layer_norm": "norm",
+        "norms": "norm",
+    }
+    modules: list[str] = []
+    for part in raw_parts:
+        module = aliases.get(part.strip(), part.strip())
+        if not module:
+            continue
+        if module not in _VALID_ACTIVATION_CHECKPOINTING_MODULES:
+            valid = ", ".join(sorted(_VALID_ACTIVATION_CHECKPOINTING_MODULES))
+            raise ValueError(f"activation_checkpointing_modules must use only: {valid}. Got {part!r}.")
+        if module not in modules:
+            modules.append(module)
+
+    if not modules:
+        return ("all",)
+    if "all" in modules and len(modules) > 1:
+        raise ValueError("activation_checkpointing_modules='all' cannot be combined with other modules.")
+    return tuple(modules)
 
 
 @dataclass(frozen=True)
@@ -272,6 +320,11 @@ class FSDP2Config:
             selects every extracted group. Scoped values such as
             ``"language"``, ``"vision"``, and ``"multimodal"`` are filtered
             to trainable layers before generic wrapping.
+        activation_checkpointing_modules (str | list[str]): Which decoder
+            submodules to wrap for non-selective submodule activation
+            checkpointing. ``"all"`` keeps the existing attention, MLP, and
+            norm wrapping; values such as ``"mlp"`` checkpoint only the
+            feed-forward/MoE path.
         defer_fsdp_grad_sync (bool): Defer FSDP gradient sync to final micro-batch.
         reshard_after_forward (Optional[bool]): Override layer-level FSDP2 resharding.
             ``None`` preserves AutoModel's heuristic: pipeline-parallel layers do
@@ -315,6 +368,7 @@ class FSDP2Config:
     autocast_dtype: Optional[torch.dtype] = None
     activation_checkpointing: ActivationCheckpointingMode = False
     activation_checkpointing_scope: ActivationCheckpointingScope = "all"
+    activation_checkpointing_modules: ActivationCheckpointingModules = "all"
     defer_fsdp_grad_sync: bool = True
     reshard_after_forward: Optional[bool] = None
     enable_async_tensor_parallel: bool = False
@@ -337,6 +391,9 @@ class FSDP2Config:
             )
         self.activation_checkpointing_scope = normalize_activation_checkpointing_scope(
             self.activation_checkpointing_scope
+        )
+        self.activation_checkpointing_modules = normalize_activation_checkpointing_modules(
+            self.activation_checkpointing_modules
         )
         if not isinstance(self.multimodal, MultimodalDistributedConfig):
             raise TypeError("FSDP2Config.multimodal must be a MultimodalDistributedConfig instance.")
@@ -440,6 +497,7 @@ class DDPConfig:
 
     activation_checkpointing: ActivationCheckpointingMode = False
     activation_checkpointing_scope: ActivationCheckpointingScope = "all"
+    activation_checkpointing_modules: ActivationCheckpointingModules = "all"
     broadcast_buffers: bool = False
     find_unused_parameters: bool = False
     static_graph: bool = False
@@ -450,6 +508,9 @@ class DDPConfig:
     def __post_init__(self):
         self.activation_checkpointing_scope = normalize_activation_checkpointing_scope(
             self.activation_checkpointing_scope
+        )
+        self.activation_checkpointing_modules = normalize_activation_checkpointing_modules(
+            self.activation_checkpointing_modules
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -493,11 +554,15 @@ def _resolve_strategy_config(
 
 
 __all__ = [
+    "ActivationCheckpointingMode",
+    "ActivationCheckpointingModules",
+    "ActivationCheckpointingScope",
     "DDPConfig",
     "DistributedSetup",
     "DistributedStrategyConfig",
     "FSDP2Config",
     "MegatronFSDPConfig",
     "MoEParallelizerConfig",
+    "normalize_activation_checkpointing_modules",
     "normalize_activation_checkpointing_scope",
 ]

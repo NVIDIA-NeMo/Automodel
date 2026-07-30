@@ -58,6 +58,7 @@ class DDPManager:
         # Extract config fields for easy access
         self.activation_checkpointing = config.activation_checkpointing
         self.activation_checkpointing_scope = config.activation_checkpointing_scope
+        self.activation_checkpointing_modules = config.activation_checkpointing_modules
         self.broadcast_buffers = config.broadcast_buffers
         self.find_unused_parameters = config.find_unused_parameters
         self.static_graph = config.static_graph
@@ -120,10 +121,16 @@ class DDPManager:
                         layer_groups,
                         self.activation_checkpointing_scope,
                     )
-                    if _should_use_hf_native_gradient_checkpointing(model, layer_groups, ac_scopes):
+                    if _should_use_hf_native_gradient_checkpointing(
+                        model, layer_groups, ac_scopes
+                    ) and self.activation_checkpointing_modules == ("all",):
                         model.gradient_checkpointing_enable()
                     else:
-                        apply_submodule_checkpointing(layers, detect_kv_sharing_and_maybe_disable_cache(model))
+                        apply_submodule_checkpointing(
+                            layers,
+                            detect_kv_sharing_and_maybe_disable_cache(model),
+                            activation_checkpointing_modules=self.activation_checkpointing_modules,
+                        )
             return model
 
         if self.activation_checkpointing:
@@ -140,7 +147,11 @@ class DDPManager:
                     layer_groups,
                     self.activation_checkpointing_scope,
                 )
-                apply_submodule_checkpointing(layers, has_kv_sharing)
+                apply_submodule_checkpointing(
+                    layers,
+                    has_kv_sharing,
+                    activation_checkpointing_modules=self.activation_checkpointing_modules,
+                )
 
         ddp_kwargs = {
             "device_ids": [self.device] if self.device.type == "cuda" else None,

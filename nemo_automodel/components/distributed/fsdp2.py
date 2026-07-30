@@ -104,6 +104,7 @@ class FSDP2Manager:
         self.offload_policy = config.offload_policy
         self.activation_checkpointing = config.activation_checkpointing
         self.activation_checkpointing_scope = config.activation_checkpointing_scope
+        self.activation_checkpointing_modules = config.activation_checkpointing_modules
         self.defer_fsdp_grad_sync = config.defer_fsdp_grad_sync
         self.reshard_after_forward = config.reshard_after_forward
         self.enable_async_tensor_parallel = config.enable_async_tensor_parallel
@@ -146,10 +147,14 @@ class FSDP2Manager:
                         layer_groups,
                         ac_scopes,
                         enable_compile=self.enable_compile,
-                    ):
+                    ) and self.activation_checkpointing_modules == ("all",):
                         model.gradient_checkpointing_enable()
                     else:
-                        apply_submodule_checkpointing(layers, detect_kv_sharing_and_maybe_disable_cache(model))
+                        apply_submodule_checkpointing(
+                            layers,
+                            detect_kv_sharing_and_maybe_disable_cache(model),
+                            activation_checkpointing_modules=self.activation_checkpointing_modules,
+                        )
             return model
 
         if self.config.patch_is_packed_sequence:
@@ -170,6 +175,7 @@ class FSDP2Manager:
             fsdp2_forward_prefetch_depth=self.fsdp2_forward_prefetch_depth,
             reshard_after_forward=self.reshard_after_forward,
             activation_checkpointing_scope=self.activation_checkpointing_scope,
+            activation_checkpointing_modules=self.activation_checkpointing_modules,
             frozen_multimodal_sharding=self.frozen_multimodal_sharding,
         )
 

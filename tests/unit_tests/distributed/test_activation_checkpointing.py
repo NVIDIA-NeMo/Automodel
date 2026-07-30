@@ -227,6 +227,16 @@ def test_submodule_checkpointing_wraps_linear_attn_mixer():
     assert ac.unwrap_checkpoint_wrapper(block.linear_attn) is inner
 
 
+def test_submodule_checkpointing_can_wrap_mlp_only():
+    """Module-selective AC can avoid attention and norm recompute while checkpointing MLP."""
+    block = _SdpaVisionBlock()
+
+    ac.apply_submodule_checkpointing([block], has_kv_sharing=False, activation_checkpointing_modules="mlp")
+
+    assert not isinstance(block.attn, CheckpointWrapper)
+    assert isinstance(block.mlp, CheckpointWrapper)
+
+
 def test_submodule_checkpointing_preserves_canonical_state_dict_keys_for_property_aliases():
     class Mixer(nn.Module):
         def __init__(self):

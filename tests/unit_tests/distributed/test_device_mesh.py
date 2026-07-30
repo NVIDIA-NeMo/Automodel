@@ -22,6 +22,7 @@ from nemo_automodel.components.distributed.config import (
     FSDP2Config,
     MegatronFSDPConfig,
     MoEParallelizerConfig,
+    normalize_activation_checkpointing_modules,
     normalize_activation_checkpointing_scope,
 )
 from nemo_automodel.components.distributed.mesh import MeshAxisName, MeshContext, ParallelismSizes
@@ -140,6 +141,27 @@ def test_activation_checkpointing_scope_normalization(value, expected):
 def test_activation_checkpointing_scope_normalization_rejects_invalid_values(value):
     with pytest.raises(ValueError, match="activation_checkpointing_scope"):
         normalize_activation_checkpointing_scope(value)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (None, ("all",)),
+        ("mlp", ("mlp",)),
+        ("moe+attn", ("mlp", "attention")),
+        (["layernorm", "feed-forward"], ("norm", "mlp")),
+    ],
+)
+def test_activation_checkpointing_modules_normalization(value, expected):
+    assert normalize_activation_checkpointing_modules(value) == expected
+    assert FSDP2Config(activation_checkpointing_modules=value).activation_checkpointing_modules == expected
+    assert DDPConfig(activation_checkpointing_modules=value).activation_checkpointing_modules == expected
+
+
+@pytest.mark.parametrize("value", ["all+mlp", "router", "decoder", [1]])
+def test_activation_checkpointing_modules_normalization_rejects_invalid_values(value):
+    with pytest.raises(ValueError, match="activation_checkpointing_modules"):
+        normalize_activation_checkpointing_modules(value)
 
 
 def test_distributed_setup_config_rejects_unknown_strategy():

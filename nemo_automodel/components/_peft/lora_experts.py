@@ -328,7 +328,7 @@ class GroupedExpertsLoRA(GroupedExperts):
 
         y = torch.zeros(x.shape, dtype=torch.float32, device=x.device)
 
-        if tokens_per_expert.sum() > 0:
+        if sorted_token_ids.numel() > 0:
             permuted_x = x[sorted_token_ids]
             permuted_probs = sorted_weights.unsqueeze(-1)
 
@@ -340,7 +340,7 @@ class GroupedExpertsLoRA(GroupedExperts):
             output1 = torch._grouped_mm(permuted_x, gate_and_up_projs, offs=offs)
             lora_out1_A = torch._grouped_mm(permuted_x, lora_gate_and_up_A, offs=offs)
             lora_out1 = torch._grouped_mm(lora_out1_A, lora_gate_and_up_B, offs=offs)
-            output1 = output1 + lora_out1 * self.scale
+            output1.add_(lora_out1, alpha=self.scale)
 
             if self.expert_bias:
                 output1 = _apply_bias(output1, gate_up_proj_bias, tokens_per_expert)
@@ -351,7 +351,7 @@ class GroupedExpertsLoRA(GroupedExperts):
             output2 = torch._grouped_mm(output1, down_projs, offs=offs)
             lora_out2_A = torch._grouped_mm(output1, lora_down_A, offs=offs)
             lora_out2 = torch._grouped_mm(lora_out2_A, lora_down_B, offs=offs)
-            output2 = output2 + lora_out2 * self.scale
+            output2.add_(lora_out2, alpha=self.scale)
 
             if self.expert_bias:
                 output2 = _apply_bias(output2, down_proj_bias, tokens_per_expert, permuted_probs)
@@ -513,7 +513,7 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
         lora_down_A = _to_grouped_mm_operand(self.lora_down_A, compute_dtype)
         lora_down_B = _to_grouped_mm_operand(self.lora_down_B, compute_dtype)
 
-        if torch.count_nonzero(tokens_per_expert) > 0:
+        if permuted_local_hidden_states.size(0) > 0:
             if self.use_torch_mm:
                 lora_gate_and_up_A, lora_gate_and_up_B = _pad_lora_rank_for_grouped_mm(
                     lora_gate_and_up_A, lora_gate_and_up_B
@@ -528,7 +528,7 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
                 output1 = torch._grouped_mm(permuted_local_hidden_states, gate_and_up_projs, offs=offs)
                 lora_out1_A = torch._grouped_mm(permuted_local_hidden_states, lora_gate_and_up_A, offs=offs)
                 lora_out1 = torch._grouped_mm(lora_out1_A, lora_gate_and_up_B, offs=offs)
-                output1 = output1 + lora_out1 * self.scale
+                output1.add_(lora_out1, alpha=self.scale)
 
                 if self.expert_bias:
                     gate_up_proj_bias = _to_local(self.gate_up_proj_bias)
@@ -540,7 +540,7 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
                 output2 = torch._grouped_mm(output1, down_projs, offs=offs)
                 lora_out2_A = torch._grouped_mm(output1, lora_down_A, offs=offs)
                 lora_out2 = torch._grouped_mm(lora_out2_A, lora_down_B, offs=offs)
-                output2 = output2 + lora_out2 * self.scale
+                output2.add_(lora_out2, alpha=self.scale)
 
                 if self.expert_bias:
                     down_bias = _to_local(self.down_proj_bias)
@@ -560,7 +560,7 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
                     trans_b=False,
                 )
                 lora_out1 = ops.gmm(lora_out1_A, lora_gate_and_up_B, tokens_per_expert, trans_b=False)
-                output1 = output1 + lora_out1 * self.scale
+                output1.add_(lora_out1, alpha=self.scale)
 
                 if self.expert_bias:
                     gate_up_proj_bias = _to_local(self.gate_up_proj_bias)
@@ -572,7 +572,7 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
                 output2 = ops.gmm(output1, down_projs, tokens_per_expert, trans_b=False)
                 lora_out2_A = ops.gmm(output1, lora_down_A, tokens_per_expert, trans_b=False)
                 lora_out2 = ops.gmm(lora_out2_A, lora_down_B, tokens_per_expert, trans_b=False)
-                output2 = output2 + lora_out2 * self.scale
+                output2.add_(lora_out2, alpha=self.scale)
 
                 if self.expert_bias:
                     down_bias = _to_local(self.down_proj_bias)
