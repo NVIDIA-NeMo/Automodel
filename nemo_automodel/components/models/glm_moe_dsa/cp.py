@@ -25,7 +25,10 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
     ShardLayout,
     contiguous_local_indices,
 )
-from nemo_automodel.components.distributed.thd_utils import split_batch_into_thd_chunks
+from nemo_automodel.components.distributed.thd_utils import (
+    split_batch_into_thd_chunks,
+    thd_padding_mask_from_token_ids,
+)
 
 
 def glm_dsa_cp_enabled(cp_group) -> bool:
@@ -82,7 +85,13 @@ def _slice_thd_chunk_for_cp(
         out["max_seqlen"] = chunk["max_seqlen"].to(torch.int32).contiguous()
     if "cu_seqlens_padded" in chunk:
         out["cu_seqlens_padded"] = chunk["cu_seqlens_padded"].to(torch.int32).contiguous()
-    out["padding_mask"] = (out["input_ids"] == padding_token_id).bool().contiguous()
+    # Slice the pack-derived mask rather than re-deriving it from token values:
+    # GLM's pad id is <|endoftext|>, which is also its first eos_token_id, so a
+    # value comparison would drop every document-final eos from the MoE experts.
+    if "padding_mask" in chunk:
+        out["padding_mask"] = chunk["padding_mask"].index_select(0, query_indices).bool().contiguous()
+    else:
+        out["padding_mask"] = thd_padding_mask_from_token_ids(out["input_ids"], padding_token_id).contiguous()
     return out  # type: ignore[return-value]
 
 

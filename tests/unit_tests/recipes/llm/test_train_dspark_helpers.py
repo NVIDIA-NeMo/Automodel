@@ -1014,3 +1014,49 @@ def test_should_shard_dense_target_allows_explicit_unit_or_null_axes():
         cfg={"distributed": {"strategy": "fsdp2", "tp_size": 1, "pp_size": None, "cp_size": 1, "ep_size": None}}
     )
     assert recipe._should_shard_dense_target({"shard_dense_target": True}) is True
+
+
+def _dspark_resume_self(mask_token_id=7):
+    return SimpleNamespace(
+        runtime=SimpleNamespace(global_step=0),
+        _resume_epoch=0,
+        mask_token_id=mask_token_id,
+        checkpoint_config=SimpleNamespace(allow_legacy_pickle_restore=False),
+    )
+
+
+def _write_dspark_meta(tmp_path, **fields):
+    meta = {"global_step": 5, "epoch": 2, "block_size": 16, "num_anchors": 512, "target_layer_ids": [1, 2]}
+    meta.update(fields)
+    torch.save(meta, tmp_path / "dspark_meta.pt")
+    return str(tmp_path)
+
+
+def test_dspark_load_extra_state_restores_step_and_epoch(tmp_path):
+    ckpt_dir = _write_dspark_meta(tmp_path, mask_token_id=7)
+    obj = _dspark_resume_self(mask_token_id=7)
+    TrainDSparkRecipe._load_extra_state(obj, ckpt_dir)
+    assert obj.runtime.global_step == 5
+    assert obj._resume_epoch == 2
+
+
+def test_dspark_load_extra_state_raises_on_mask_token_id_mismatch(tmp_path):
+    """A resume YAML whose mask_token_id disagrees with the checkpoint must fail loudly.
+
+    The draft's ``embed_tokens`` row at this id is the learned "predict here"
+    signal, so resuming at a different id trains against an untrained row and
+    degrades acceptance silently.
+    """
+    ckpt_dir = _write_dspark_meta(tmp_path, mask_token_id=7)
+    obj = _dspark_resume_self(mask_token_id=99)
+    with pytest.raises(ValueError, match="mask_token_id mismatch on resume"):
+        TrainDSparkRecipe._load_extra_state(obj, ckpt_dir)
+
+
+def test_dspark_load_extra_state_accepts_legacy_meta_without_mask_token_id(tmp_path):
+    """Checkpoints saved before mask_token_id was persisted skip the check."""
+    torch.save({"global_step": 3, "epoch": 1}, tmp_path / "dspark_meta.pt")
+    obj = _dspark_resume_self(mask_token_id=99)
+    TrainDSparkRecipe._load_extra_state(obj, str(tmp_path))
+    assert obj.runtime.global_step == 3
+    assert obj._resume_epoch == 1

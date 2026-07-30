@@ -427,6 +427,39 @@ def test_kimi_k2_config_loads_without_trust_remote_code(tmp_path):
     assert cfg.architectures == ["DeepseekV3ForCausalLM"]
 
 
+@pytest.mark.parametrize(
+    ("model_type", "expected_config_name"),
+    [
+        ("kimi_linear", "KimiK3TextConfig"),
+        ("kimi_k3", "KimiK3Config"),
+    ],
+)
+def test_kimi_k3_configs_load_without_transformers_builtin(
+    tmp_path,
+    monkeypatch,
+    model_type,
+    expected_config_name,
+):
+    """Kimi K3 checkpoint model types resolve to local configs on stale Transformers."""
+    import json
+
+    from transformers import AutoConfig
+    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
+    from nemo_automodel._transformers import registry as reg
+    from nemo_automodel.components.models.kimi_k3 import config as kimi_config
+
+    expected_config = getattr(kimi_config, expected_config_name)
+    monkeypatch.delitem(CONFIG_MAPPING._mapping, model_type, raising=False)
+    assert reg.resolve_custom_config_cls(model_type) is expected_config
+
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": model_type}))
+    cfg = AutoConfig.from_pretrained(tmp_path, trust_remote_code=False)
+
+    assert isinstance(cfg, expected_config)
+    assert cfg.model_type == model_type
+
+
 def test_kimi_k25_arch_alias_in_model_arch_mapping():
     """KimiK25ForConditionalGeneration (checkpoint arch) must map to KimiK25VLForConditionalGeneration."""
     from nemo_automodel._transformers.registry import MODEL_ARCH_MAPPING
