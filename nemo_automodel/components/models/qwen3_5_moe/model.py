@@ -1402,8 +1402,8 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
 
         # Skip the SSM-gating holders so they keep fp32 storage (master weights):
         # cast_model_to_dtype cannot reliably restore fp32 once FSDP2-sharded, so it
-        # detaches them and never casts them. Each holder is its own fp32 FSDP group
-        # (moe/parallelizer._shard_fp32_param_holders), so this is dtype-uniform-safe.
+        # detaches them and never casts them. The MoE parallelizer's dtype-aware
+        # sharder places each holder in its own fp32 FSDP group.
         cast_model_to_dtype(self, dtype, skip_modules=("_fp32_params",))
 
         with buffer_device:
