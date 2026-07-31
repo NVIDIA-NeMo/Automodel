@@ -130,25 +130,6 @@ RUN if [ "$INSTALL_UCCL_EP" = "True" ]; then \
     rm -f /opt/setup_uccl_ep.sh; \
     fi
 
-# Address base image CVE
-RUN pip install "aiohttp>=3.13.3" \
-        "black>=26.3.1" \
-        "GitPython>=3.1.50" \
-        "jaraco-context>=6.1.0" \
-        "jupyter-server>=2.18.0" \
-        "jupyterlab>=4.5.7" \
-        "mistune>=3.2.1" \
-        "nbconvert>=7.17.0" \
-        "notebook>=7.5.6" \
-        "onnx>=1.21.0" \
-        "pillow>=12.2.0" \
-        "protobuf>=6.33.5" \
-        "setuptools>=80.10.2" \
-        "tornado>=6.5.5" \
-        "urllib3>=2.7.0" && \
-    pip uninstall -y nvidia-dali-cuda130 wandb && \
-    rm -rf /opt/pytorch/pytorch/third_party/onnx
-
 # ---- Wheel builders: compile the heavy AOT source packages off the uv-sync path so they
 # build in parallel with uv sync and don't recompile on every uv.lock bump. FROM pytorch = base torch ABI.
 FROM pytorch AS torchao_builder
@@ -201,6 +182,25 @@ RUN pip install --no-cache-dir --no-deps /tmp/wheels/*.whl && \
         { [ -e "$FA2_DIR/cute" ] || ln -s "$VENV_CUTE" "$FA2_DIR/cute"; }; \
     fi && \
     rm -rf /tmp/wheels
+
+# Address base image CVE
+RUN pip install "aiohttp>=3.13.3" \
+        "black>=26.3.1" \
+        "GitPython>=3.1.50" \
+        "jaraco-context>=6.1.0" \
+        "jupyter-server>=2.18.0" \
+        "jupyterlab>=4.5.7" \
+        "mistune>=3.2.1" \
+        "nbconvert>=7.17.0" \
+        "notebook>=7.5.6" \
+        "onnx>=1.21.0" \
+        "pillow>=12.2.0" \
+        "protobuf>=6.33.5" \
+        "setuptools>=80.10.2" \
+        "tornado>=6.5.5" \
+        "urllib3>=2.7.0" && \
+    pip uninstall -y nvidia-dali-cuda130 wandb && \
+    rm -rf /opt/pytorch/pytorch/third_party/onnx
 
 COPY pyproject.toml uv.lock /opt/Automodel/
 COPY nemo_automodel/__init__.py nemo_automodel/package_info.py /opt/Automodel/nemo_automodel/
