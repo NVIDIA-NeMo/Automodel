@@ -50,9 +50,9 @@ import argparse
 import hashlib
 import json
 import logging
+import multiprocessing
 import os
 import traceback
-from multiprocessing import Pool
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Protocol, Tuple, runtime_checkable
 
@@ -391,10 +391,12 @@ def preprocess_dataset(
     # Split images across GPUs
     chunks = [image_files[i::num_gpus] for i in range(num_gpus)]
 
-    # Process with one worker per GPU
+    # Process with one worker per GPU. Workers use CUDA, and module imports can
+    # initialize CUDA in this parent process, so fork-based workers would fail
+    # with "Cannot re-initialize CUDA in forked subprocess"; spawn is required.
     all_metadata = []
 
-    with Pool(processes=num_gpus) as pool:
+    with multiprocessing.get_context("spawn").Pool(processes=num_gpus) as pool:
         args = [
             (gpu_id, chunks[gpu_id], str(output_dir), processor_name, model_name, verify, caption_cache, max_pixels)
             for gpu_id in range(num_gpus)
@@ -1052,10 +1054,12 @@ def preprocess_video_dataset(
     # Split videos across GPUs
     chunks = [video_files[i::num_gpus] for i in range(num_gpus)]
 
-    # Process with one worker per GPU
+    # Process with one worker per GPU. Workers use CUDA, and module imports can
+    # initialize CUDA in this parent process, so fork-based workers would fail
+    # with "Cannot re-initialize CUDA in forked subprocess"; spawn is required.
     all_metadata = []
 
-    with Pool(processes=num_gpus) as pool:
+    with multiprocessing.get_context("spawn").Pool(processes=num_gpus) as pool:
         args = [
             (
                 gpu_id,
