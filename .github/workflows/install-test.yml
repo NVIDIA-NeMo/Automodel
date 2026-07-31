@@ -373,7 +373,8 @@ jobs:
 
           export PATH="${UV_PROJECT_ENVIRONMENT}/bin/:$PATH"
 
-          uv venv ${UV_PROJECT_ENVIRONMENT} --system-site-packages
+          # Validate a regular uv environment; NGC jobs intentionally reuse system packages.
+          uv venv ${UV_PROJECT_ENVIRONMENT}
 
           uv sync --link-mode copy --locked --only-group build
 
