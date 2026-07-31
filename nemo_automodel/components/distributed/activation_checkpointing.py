@@ -146,22 +146,29 @@ def _build_selective_ac_save_ops() -> frozenset:
 
     # Compute ops the partitioner list may not classify as compute-intensive.
     compute_ops = _existing_ops(
-        _resolve_torch_op("aten.mm"),
-        _resolve_torch_op("aten.addmm"),
-        _resolve_torch_op("aten.bmm"),
-        _resolve_torch_op("aten.linear"),
-        _resolve_torch_op("aten._scaled_mm"),
-        _resolve_torch_op("aten._scaled_dot_product_cudnn_attention"),
-        _resolve_torch_op("aten._scaled_dot_product_efficient_attention"),
-        _resolve_torch_op("aten._scaled_dot_product_flash_attention"),
-        _resolve_torch_op("aten._scaled_dot_product_flash_attention_for_cpu"),
-        _resolve_torch_op("aten._scaled_dot_product_fused_attention_overrideable"),
-        _resolve_torch_op("aten.scaled_dot_product_attention"),
-        _resolve_torch_op("aten._flex_attention"),
-        # topk is saved to keep MoE expert assignments stable across recompute;
-        # max is saved for low-precision scaling factors.
-        _resolve_torch_op("aten.topk"),
-        _resolve_torch_op("aten.max"),
+        *list(
+            map(
+                _resolve_torch_op,
+                [
+                    "aten.mm",
+                    "aten.addmm",
+                    "aten.bmm",
+                    "aten.linear",
+                    "aten._scaled_mm",
+                    "aten._scaled_dot_product_cudnn_attention",
+                    "aten._scaled_dot_product_efficient_attention",
+                    "aten._scaled_dot_product_flash_attention",
+                    "aten._scaled_dot_product_flash_attention_for_cpu",
+                    "aten._scaled_dot_product_fused_attention_overrideable",
+                    "aten.scaled_dot_product_attention",
+                    "aten._flex_attention",
+                    # topk is saved to keep MoE expert assignments stable across recompute;
+                    # max is saved for low-precision scaling factors.
+                    "aten.topk",
+                    "aten.max",
+                ],
+            )
+        ),
         # FlexAttention HOP and the inductor compiled-graph HOP (present only when
         # torch.compile is used); custom torch_attn varlen backend.
         _resolve_op_attr(torch, "_higher_order_ops.flex_attention"),
@@ -173,10 +180,17 @@ def _build_selective_ac_save_ops() -> frozenset:
 
     # Communication ops whose outputs should be saved to avoid re-communication.
     comm_ops = _existing_ops(
-        _resolve_torch_op("aten.all_to_all_single"),
-        _resolve_torch_op("aten.reduce_scatter_tensor"),
-        _resolve_torch_op("_c10d_functional.all_to_all_single"),
-        _resolve_torch_op("_c10d_functional.reduce_scatter_tensor"),
+        *list(
+            map(
+                _resolve_torch_op,
+                [
+                    "aten.all_to_all_single",
+                    "aten.reduce_scatter_tensor",
+                    "_c10d_functional.all_to_all_single",
+                    "_c10d_functional.reduce_scatter_tensor",
+                ],
+            )
+        ),
         # Optional expert-parallel comm backends.
         _resolve_op_attr(torch.ops, "deepep.dispatch.default"),
         _resolve_op_attr(torch.ops, "deepep.combine.default"),
