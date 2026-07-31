@@ -58,6 +58,7 @@ from nemo_automodel.components.loggers.metric_logger import MetricsSample
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.loss.utils import calculate_loss
 from nemo_automodel.components.optim.precision_warnings import resolve_storage_dtype
+from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
 from nemo_automodel.components.training.rng import ScopedRNG
 from nemo_automodel.components.training.signal_handler import DistributedSignalHandler
 from nemo_automodel.components.training.utils import (
@@ -640,11 +641,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
 
             # Student forward.
             student_batch = filter_forward_kwargs(model, batch)
-            student_keep_last = isinstance(self.loss_fn, FusedLinearCrossEntropy)
-            if student_keep_last:
-                student_out = model(logits_to_keep=1, **student_batch)
-            else:
-                student_out = model(**student_batch)
+            student_out = model(**student_batch)
 
             student_logits = getattr(student_out, "logits", student_out)  # shape (B, S, V)
             if separate_teacher_logits is not None:
@@ -659,7 +656,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                     logits=student_logits,
                     labels=labels,
                     model=model,
-                    hidden_states=student_out.hidden_states[-1] if "hidden_states" in student_out else None,
+                    hidden_states=get_final_hidden_states(student_out),
                     num_label_tokens=num_label_tokens,
                 )
 
