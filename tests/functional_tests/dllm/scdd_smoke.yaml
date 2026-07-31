@@ -36,7 +36,7 @@ seed: 42
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: hf-internal-testing/tiny-random-MistralForCausalLM
+  pretrained_model_name_or_path: hf-internal-testing/tiny-random-LlamaForCausalLM
   torch_dtype: float32
 
 checkpoint:
@@ -53,7 +53,7 @@ loss_fn:
 
 dllm:
   mode: scdd
-  # The tiny Mistral tokenizer has no mask token; reserve the last vocab slot,
+  # The tiny Llama tokenizer has no mask token; reserve the last vocab slot,
   # exactly as a real SCDD run would reserve the checkpoint's [MASK] id.
   mask_token_id: 31999
   vocab_size: 32000
@@ -78,7 +78,7 @@ dataset:
   # assistant turn is tagged and the answer-only loss mask is populated.
   chat_template: examples/dllm_sft/llada_chat_template.jinja
   tokenizer:
-    pretrained_model_name_or_path: hf-internal-testing/tiny-random-MistralForCausalLM
+    pretrained_model_name_or_path: hf-internal-testing/tiny-random-LlamaForCausalLM
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader

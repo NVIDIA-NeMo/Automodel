@@ -28,7 +28,7 @@ fi
 # scdd wiring runs on one GPU, not to converge. Override the model with
 # SCDD_SMOKE_MODEL to smoke a real dLLM checkpoint instead (its vocab size must
 # then be passed via --dllm.vocab_size and its mask id via --dllm.mask_token_id).
-SCDD_SMOKE_MODEL=${SCDD_SMOKE_MODEL:-hf-internal-testing/tiny-random-MistralForCausalLM}
+SCDD_SMOKE_MODEL=${SCDD_SMOKE_MODEL:-hf-internal-testing/tiny-random-LlamaForCausalLM}
 
 python \
 -m pytest $PYTEST_S_FLAG tests/functional_tests/training/test_scdd_smoke.py \
