@@ -554,6 +554,12 @@ def _resolve_cp_sharder(
                 seq_lens_padding_value=seq_lens_padding_value,
                 return_local_indices=True,
             )
+            if local_indices is not None:
+                # Models that splice non-text features after the framework THD
+                # partition need the exact global-token map used for Q/K/V.
+                # Keeping it in the prepared batch avoids recomputing TE's
+                # document-aware load-balanced partition in model code.
+                prepped["_thd_local_indices"] = local_indices
             layout = None
             if local_indices is not None:
                 layout = ShardLayout(
@@ -862,5 +868,25 @@ def _shard_thd_chunk_for_te(
         output_batch["padding_mask"] = thd_padding_mask_from_token_ids(
             output_batch["input_ids"], padding_token_id
         ).contiguous()
+
+    # Preserve non-token payloads needed by multimodal models. The THD core
+    # consumes the sequence metadata below; media tensors/lists and model-owned
+    # maps must survive the CP partition and remain replicated on every rank.
+    consumed = {
+        "attention_mask",
+        "cu_seqlens",
+        "cu_seqlens_padded",
+        "input_ids",
+        "labels",
+        "max_seqlen",
+        "padding_mask",
+        "position_ids",
+        "qkv_format",
+        "seq_lens",
+        "seq_lens_padded",
+    }
+    for key, value in batch.items():
+        if key not in consumed and key not in output_batch:
+            output_batch[key] = value
 
     return output_batch, local_indices
