@@ -556,7 +556,7 @@ class IDLMSampler(DLLMSampler):
 
 
 class SCDDSampler(DLLMSampler):
-    """SCDD ancestral sampler (arXiv:2603.02230).
+    """SCDD ancestral sampler (openreview.net/forum?id=zQKlzKB6I9).
 
     Where the absorbing samplers commit tokens irreversibly — each step unmasks
     a few positions and never revisits them — SCDD resamples *every* generated

@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# SCDD (Self-Correcting Discrete Diffusion, arXiv:2603.02230) fine-tuning of a
+# SCDD (Self-Correcting Discrete Diffusion) fine-tuning of a
+# https://openreview.net/forum?id=zQKlzKB6I9
 # LLaDA checkpoint. The forward process mixes absorbing [MASK] noise with
 # uniform token transitions, so the model is trained to overwrite wrong tokens
 # in its own context instead of only filling masks. Decode with
