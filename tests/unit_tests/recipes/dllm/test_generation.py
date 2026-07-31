@@ -600,3 +600,32 @@ def test_scdd_schedule_flags_reach_the_sampler_config(monkeypatch):
     )
     with pytest.raises(_Captured):
         main()
+
+
+def test_scdd_zero_temperature_collapses_the_denoiser():
+    """``temperature=0`` must give a one-hot distribution over the argmax and
+    never put mass on [MASK] — the path the final residual-mask denoise uses."""
+    mask_id = 9
+    sampler = SCDDSampler(_FakeSCDDDenoiser(target=7), mask_id=mask_id, eos_id=0)
+    x = torch.tensor([[1, mask_id, mask_id]])
+    attention_mask = torch.ones_like(x)
+
+    log_p = sampler._denoiser_log_probs(x, attention_mask, 0.0)
+    probs = log_p.exp()
+
+    assert torch.allclose(probs.sum(-1), torch.ones(1, 3), atol=1e-5)
+    assert (probs.argmax(-1) == 7).all()
+    assert torch.allclose(probs[..., mask_id], torch.zeros(1, 3)), "[MASK] must be outside the domain"
+
+
+def test_scdd_degenerate_schedule_still_terminates():
+    """uniform_ratio=0 removes the correction channel, which makes the
+    visible-token posterior unreachable; the sampler must fall back to keeping
+    the current token rather than handing multinomial an all-zero row."""
+    mask_id = 9
+    sampler = SCDDSampler(
+        _FakeSCDDDenoiser(target=7), mask_id=mask_id, eos_id=0, steps=4, max_new_tokens=4, uniform_ratio=0.0
+    )
+    out = sampler.sample([[1]])
+    assert out.shape == (1, 5)
+    assert (out == mask_id).sum().item() == 0
