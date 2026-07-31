@@ -75,13 +75,8 @@ RUN if [ "$INSTALL_TE" = "True" ]; then \
     cd ../ && rm -rf TransformerEngine; \
     fi
 
-# Install HybridEP / DeepEP. Build with apt rdma-core v60 (so build==runtime libibverbs)
-# and RDMA_CORE_HOME symlinked to the system install; create the libnvshmem_host.so->.so.3
-# symlink required for DeepEP fabric handle ops; use the nvshmem wheel 3.6.5 and pin
-# DEEPEP_COMMIT to 42144303 (== 17cfb817 + DeepEP #638), which pads the HybridEP
-# max_num_of_tokens_per_rank up to the combine-kernel chunk size so a per-rank token
-# count that is not a multiple of 64 (e.g. 672) no longer fails the combine-kernel
-# static_assert (MAX_NUM_OF_TOKENS_PER_RANK % NUM_OF_TOKENS_PER_CHUNK == 0).
+# Install HybridEP / DeepEP: apt rdma-core v60 (build==runtime libibverbs), nvshmem wheel 3.6.5.
+# DEEPEP_COMMIT = 17cfb817 + DeepEP #638, padding max_num_of_tokens_per_rank to the combine-kernel chunk size.
 COPY docker/common/deepep.patch /opt/deepep.patch
 ARG DEEPEP_COMMIT=42144303752422ade37f24bca9e2dde12df70e09
 ENV HYBRID_EP_MULTINODE=1
@@ -180,29 +175,8 @@ RUN --mount=type=cache,target=/opt/uv_cache,sharing=locked \
         uv sync --extra $AUTOMODEL_INSTALL --all-groups $UV_SYNC_ARGS && \
     python -c "import importlib.metadata as m; import magi_attention; print('magi-attention', m.version('magi-attention'))"
 
-# MXFP8 MoE training (experts="torch_mm_mxfp8"): the NGC PyTorch base does not bundle
-# torchao and uv-pytorch.toml gates it off (sys_platform=='never'), so `uv sync` skips
-# it. Install explicitly AFTER the sync so it is not pruned.
-#
-# Build FROM SOURCE (not `pip install torchao==0.14.0`): the MXFP8 grouped-GEMM path
-# needs the compiled mxfp8 CUDA kernels (torchao/csrc/cuda/mx_kernels), but PyPI ships
-# only a kernel-less `py3-none-any` wheel and an x86_64-only compiled wheel — no
-# aarch64 wheel and no sdist. On the sbsa/aarch64 build the pip wheel would silently
-# omit the kernels and MXFP8 would fall back to bf16 at runtime. setup.py has no
-# x86-only gate and cross-compiles the sm_100a kernels from the CUDA toolkit version
-# (build_for_sm100a = CUDA>=12.8; base is CUDA 13.x), so source builds on both arches.
-# --no-build-isolation reuses the container's torch ABI.
-# Pin v0.17.0 (NOT v0.14.1): v0.14.1's forward quantizes via EAGER unfused to_mx (no CUDA
-# kernel, ~49ms/iter) — a ~2.5x regression vs bf16. v0.17.0's forward is fully kernelized
-# (triton_to_mxfp8_dim0 for both activation and weight + device-side scale swizzle); it is
-# the torchao blog version (~1.43x MoE-layer speedup). NOT main: main's forward additionally
-# needs the nvidia-cutlass-dsl runtime for its CuTeDSL activation kernel, which this image
-# does not install (and _SM100_KERNELS_AVAILABLE doesn't gate it -> runtime crash); v0.17.0
-# is triton-only with no extra dep. CUTLASS is a git submodule the mxfp8 kernels need, so
-# clone with --recurse-submodules (pip's git+ submodule handling is unreliable). setup.py
-# self-gates the mxfp8/cutlass sm_100a kernels on CUDA>=12.8 and hardcodes their gencode
-# flags; TORCH_CUDA_ARCH_LIST + MAX_JOBS mirror the in-image DeepEP source build (above) to
-# cover torchao's other CUDAExtensions and bound the heavy CUTLASS sm_100 compile.
+# torchao MXFP8 MoE (experts="torch_mm_mxfp8"): not in the NGC base, gated off in uv-pytorch.toml, so install after uv sync.
+# Build from source w/ submodules (PyPI wheels omit mxfp8 CUDA kernels on aarch64); pin v0.17.0 (v0.14.1 ~2.5x slower; main needs nvidia-cutlass-dsl).
 RUN git clone --depth 1 --branch v0.17.0 --recurse-submodules --shallow-submodules \
         https://github.com/pytorch/ao.git /tmp/torchao && \
     TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" MAX_JOBS=8 \
@@ -210,31 +184,12 @@ RUN git clone --depth 1 --branch v0.17.0 --recurse-submodules --shallow-submodul
     rm -rf /tmp/torchao
 
 # ---- FlashAttention-3 (Hopper-only) + FlashAttention-4 (Hopper + Blackwell) ----
-# Installed AFTER uv sync (same reason as torchao: not resolvable by uv), and
-# with `pip` -- NOT `uv pip` -- like the torchao stage above: uv resolves against
-# the venv only and would reinstall torch from PyPI over the base image's torch
-# (FA3's sdist declares a torch dependency; pip sees the system-site torch and
-# leaves it alone; --no-deps additionally guards FA3). Verification uses dist
-# metadata because transformers' is_flash_attn_*_available() requires a visible
-# GPU, which docker builds do not have.
-# FA3 kernels are SM90a-locked (Hopper ISA; they do NOT run on SM100) -- Blackwell
-# is served by FA4, whose CuTe-DSL kernels JIT-compile per-arch at runtime
-# (Sm90 and Sm100 kernel classes ship in the package; no build-time arch work).
-# FA4 must be co-located with flash-attn's `flash_attn` package: it installs the
-# `flash_attn.cute` subpackage, which FA2's __init__.py shadows if the two live in
-# different site-packages prefixes (the PYTORCH_IMAGE base puts flash-attn in
-# /usr/local dist-packages while uv installs to /opt/venv).
-# INSTALL_FA4 defaults to false: flash-attn-4 requires apache-tvm-ffi>=0.1.12,
-# which conflicts with the tilelang-pinned apache-tvm-ffi<=0.1.11 (pyproject cuda
-# extra) -- enabling FA4 disables backend.attn="tilelang" until tilelang ships a
-# release built against ffi 0.1.12.
+# Installed after uv sync via pip --no-deps (uv would clobber base torch); FA4 off by default (apache-tvm-ffi>=0.1.12 conflicts with tilelang pin <=0.1.11).
 ARG FLASH_ATTN_REF=002cce0a1
 ARG INSTALL_FA3=true
 ARG INSTALL_FA4=false
-# TARGETARCH is provided by buildx. FA3 is skipped on arm64 automatically: the
-# arm64 image targets GB200 (Blackwell), where the SM90a-only FA3 kernels are
-# dead weight, and CI cross-builds arm64 under QEMU where the ~25 min nvcc
-# compile is impractical.
+# TARGETARCH (from buildx): FA3 auto-skipped on arm64 — arm64 targets GB200 (Blackwell) where
+# SM90a-only FA3 is dead weight, and QEMU cross-builds make the ~25 min nvcc compile impractical.
 ARG TARGETARCH
 RUN if [ "$TARGETARCH" = "arm64" ]; then INSTALL_FA3=false; fi && \
     if [ "$INSTALL_FA3" = "true" ] || [ "$INSTALL_FA4" = "true" ]; then \
