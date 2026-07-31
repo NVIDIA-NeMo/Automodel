@@ -149,9 +149,58 @@ RUN pip install "aiohttp>=3.13.3" \
     pip uninstall -y nvidia-dali-cuda130 wandb && \
     rm -rf /opt/pytorch/pytorch/third_party/onnx
 
+# ---- Wheel builders: compile the heavy AOT source packages off the uv-sync path so they
+# build in parallel with uv sync and don't recompile on every uv.lock bump. FROM pytorch = base torch ABI.
+FROM pytorch AS torchao_builder
+# torchao MXFP8: build w/ submodules (PyPI wheels omit mxfp8 CUDA kernels on aarch64); pin v0.17.0 (v0.14.1 ~2.5x slower; main needs nvidia-cutlass-dsl).
+ARG TORCHAO_REF=v0.17.0
+RUN mkdir -p /wheels && \
+    git clone --depth 1 --branch ${TORCHAO_REF} --recurse-submodules --shallow-submodules \
+        https://github.com/pytorch/ao.git /tmp/torchao && \
+    TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" MAX_JOBS=8 \
+        pip wheel --no-cache-dir --no-build-isolation --no-deps -w /wheels /tmp/torchao && \
+    rm -rf /tmp/torchao
+
+# FA3 (Hopper-only, SM90a-locked, ~25 min nvcc) + FA4 cute (Blackwell, lightweight). arm64 -> skip FA3: GB200 target, QEMU cross-build impractical.
+FROM pytorch AS fa_builder
+ARG FLASH_ATTN_REF=002cce0a1
+ARG INSTALL_FA3=true
+ARG INSTALL_FA4=false
+ARG TARGETARCH
+RUN mkdir -p /wheels && \
+    if [ "$TARGETARCH" = "arm64" ]; then INSTALL_FA3=false; fi && \
+    if [ "$INSTALL_FA3" = "true" ] || [ "$INSTALL_FA4" = "true" ]; then \
+        git clone --filter=blob:none https://github.com/Dao-AILab/flash-attention.git /tmp/fa && \
+        cd /tmp/fa && git checkout ${FLASH_ATTN_REF} && \
+        git submodule update --init csrc/cutlass; \
+    fi && \
+    if [ "$INSTALL_FA3" = "true" ]; then \
+        cd /tmp/fa/hopper && \
+        FLASH_ATTENTION_DISABLE_SM80=TRUE MAX_JOBS=$(nproc) NVCC_THREADS=2 \
+        pip wheel --no-cache-dir --no-build-isolation --no-deps -w /wheels . ; \
+    fi && \
+    if [ "$INSTALL_FA4" = "true" ]; then \
+        pip wheel --no-cache-dir --no-deps -w /wheels /tmp/fa/flash_attn/cute ; \
+    fi && \
+    rm -rf /tmp/fa
+
 FROM automodel_dep as automodel_final
 
 WORKDIR /opt/Automodel
+
+# torchao MXFP8 + FA3/FA4: prebuilt wheels from the *_builder stages, installed into system site-packages
+# before uv sync — pip targets system deps, uv the venv (torchao/FA gated `never`), so uv sync won't prune or shadow them.
+COPY --from=torchao_builder /wheels /tmp/wheels/
+COPY --from=fa_builder /wheels /tmp/wheels/
+ARG INSTALL_FA4=false
+RUN pip install --no-cache-dir --no-deps /tmp/wheels/*.whl && \
+    if [ "$INSTALL_FA4" = "true" ]; then \
+        pip install --no-cache-dir "nvidia-cutlass-dsl[cu13]==4.6.0.dev0" && \
+        FA2_DIR=$(python -c "import flash_attn, os; print(os.path.dirname(flash_attn.__file__))") && \
+        VENV_CUTE=/opt/venv/lib/python3.12/site-packages/flash_attn/cute && \
+        { [ -e "$FA2_DIR/cute" ] || ln -s "$VENV_CUTE" "$FA2_DIR/cute"; }; \
+    fi && \
+    rm -rf /tmp/wheels
 
 COPY pyproject.toml uv.lock /opt/Automodel/
 COPY nemo_automodel/__init__.py nemo_automodel/package_info.py /opt/Automodel/nemo_automodel/
@@ -174,43 +223,6 @@ RUN --mount=type=cache,target=/opt/uv_cache,sharing=locked \
         UV_CONCURRENT_INSTALLS=8 \
         uv sync --extra $AUTOMODEL_INSTALL --all-groups $UV_SYNC_ARGS && \
     python -c "import importlib.metadata as m; import magi_attention; print('magi-attention', m.version('magi-attention'))"
-
-# torchao MXFP8 MoE (experts="torch_mm_mxfp8"): not in the NGC base, gated off in uv-pytorch.toml, so install after uv sync.
-# Build from source w/ submodules (PyPI wheels omit mxfp8 CUDA kernels on aarch64); pin v0.17.0 (v0.14.1 ~2.5x slower; main needs nvidia-cutlass-dsl).
-RUN git clone --depth 1 --branch v0.17.0 --recurse-submodules --shallow-submodules \
-        https://github.com/pytorch/ao.git /tmp/torchao && \
-    TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" MAX_JOBS=8 \
-        pip install --no-cache-dir --no-build-isolation /tmp/torchao && \
-    rm -rf /tmp/torchao
-
-# ---- FlashAttention-3 (Hopper-only) + FlashAttention-4 (Hopper + Blackwell) ----
-# Installed after uv sync via pip --no-deps (uv would clobber base torch); FA4 off by default (apache-tvm-ffi>=0.1.12 conflicts with tilelang pin <=0.1.11).
-ARG FLASH_ATTN_REF=002cce0a1
-ARG INSTALL_FA3=true
-ARG INSTALL_FA4=false
-# TARGETARCH (from buildx): FA3 auto-skipped on arm64 — arm64 targets GB200 (Blackwell) where
-# SM90a-only FA3 is dead weight, and QEMU cross-builds make the ~25 min nvcc compile impractical.
-ARG TARGETARCH
-RUN if [ "$TARGETARCH" = "arm64" ]; then INSTALL_FA3=false; fi && \
-    if [ "$INSTALL_FA3" = "true" ] || [ "$INSTALL_FA4" = "true" ]; then \
-        git clone --filter=blob:none https://github.com/Dao-AILab/flash-attention.git /tmp/fa && \
-        cd /tmp/fa && git checkout ${FLASH_ATTN_REF} && \
-        git submodule update --init csrc/cutlass; \
-    fi && \
-    if [ "$INSTALL_FA3" = "true" ]; then \
-        cd /tmp/fa/hopper && \
-        FLASH_ATTENTION_DISABLE_SM80=TRUE MAX_JOBS=$(nproc) NVCC_THREADS=2 \
-        pip install --no-cache-dir --no-build-isolation --no-deps . && \
-        python -c "import importlib.metadata as m; print('flash-attn-3', m.version('flash-attn-3'))"; \
-    fi && \
-    if [ "$INSTALL_FA4" = "true" ]; then \
-        pip install --no-cache-dir /tmp/fa/flash_attn/cute "nvidia-cutlass-dsl[cu13]==4.6.0.dev0" && \
-        FA2_DIR=$(python -c "import flash_attn, os; print(os.path.dirname(flash_attn.__file__))") && \
-        VENV_CUTE=/opt/venv/lib/python3.12/site-packages/flash_attn/cute && \
-        { [ -e "$FA2_DIR/cute" ] || ln -s "$VENV_CUTE" "$FA2_DIR/cute"; } && \
-        python -c "import importlib.metadata as m; print('flash-attn-4', m.version('flash-attn-4'))"; \
-    fi && \
-    rm -rf /tmp/fa
 
 # Persistent disk cache for FA4's CuTe-DSL JIT (amortizes kernel compiles across restarts)
 ENV FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1
