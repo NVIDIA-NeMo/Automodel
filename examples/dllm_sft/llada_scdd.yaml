@@ -1,0 +1,125 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# SCDD (Self-Correcting Discrete Diffusion, arXiv:2603.02230) fine-tuning of a
+# LLaDA checkpoint. The forward process mixes absorbing [MASK] noise with
+# uniform token transitions, so the model is trained to overwrite wrong tokens
+# in its own context instead of only filling masks. Decode with
+#   python examples/dllm_generate/generate.py --sampler scdd ...
+# passing the same uniform_ratio / schedule_shape / schedule_peak used here.
+
+recipe: DiffusionLMSFTRecipe
+
+step_scheduler:
+  global_batch_size: 32
+  local_batch_size: 4
+  ckpt_every_steps: 500
+  val_every_steps: 500
+  max_steps: null
+  num_epochs: 5
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 10
+
+seed: 42
+
+wandb:
+  enable: false
+  project: dllm-scdd
+  name: am-llada-scdd_run
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: GSAI-ML/LLaDA-8B-Base
+  torch_dtype: float32
+  trust_remote_code: true
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: dllm_checkpoints/llada_scdd/
+  model_save_format: safetensors
+  save_consolidated: final  # final step exports the consolidated HF dir generate.py loads
+
+distributed:
+  strategy: fsdp2
+  dp_size: none
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  sequence_parallel: false
+  activation_checkpointing: false
+  mp_policy:
+    param_dtype: bfloat16
+    reduce_dtype: float32
+    output_dtype: float32
+  autocast_dtype: bfloat16
+  offload_policy: null
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dllm:
+  mode: scdd
+  mask_token_id: 126336
+  # Required by the uniform-transition channel: replacements are drawn over the
+  # vocabulary minus [MASK] and the clean token.
+  vocab_size: 126464
+  eps: 0.001
+  # Discrete diffusion steps T. The ELBO compares each sampled time t against
+  # the previous grid point t - 1/T.
+  num_timesteps: 1000
+  # Peak share of uniform (correctable) noise relative to retained tokens.
+  # 0 degenerates the objective to plain MDLM.
+  uniform_ratio: 0.1
+  schedule_shape: 1.0
+  schedule_peak: 0.5
+  supervise_padding: true
+
+optimizer:
+  _target_: torch.optim.AdamW
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  lr: 2.0e-5
+  weight_decay: 0.0
+
+clip_grad_norm:
+  max_norm: 1.0
+
+lr_scheduler:
+  lr_decay_style: cosine
+  init_lr: 0.0
+  min_lr: 0.0
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
+  path_or_dataset_id: allenai/tulu-3-sft-mixture
+  split: train
+  shuffle_seed: 42
+  seq_length: 1024
+  truncation: true
+  unshifted: true
+  # LLaDA-8B-Base ships a generation-only chat template that unconditionally
+  # appends an assistant prompt and lacks {% generation %} tags, breaking answer-mask
+  # extraction on multi-turn samples. Use a Llama-3 template with generation tags so
+  # the tokenizer returns the assistant mask directly (supervises response + EOS).
+  chat_template: examples/dllm_sft/llada_chat_template.jinja
+  tokenizer:
+    pretrained_model_name_or_path: GSAI-ML/LLaDA-8B-Base
+    trust_remote_code: true
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  group_by_length: true
