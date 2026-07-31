@@ -161,10 +161,12 @@ def _init_worker(processor_name: str, model_name: str, gpu_id: int, max_pixels: 
     """Initialize worker process with models on assigned GPU."""
     global _worker_models, _worker_processor, _worker_calculator, _worker_device
 
-    # Set CUDA_VISIBLE_DEVICES to isolate this GPU for the worker process.
-    # After this, the selected GPU becomes cuda:0 (not cuda:{gpu_id}).
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-    _worker_device = "cuda:0"
+    # Select the GPU explicitly rather than via CUDA_VISIBLE_DEVICES: in a
+    # spawned worker the module re-imports can touch the CUDA driver before
+    # this function runs, after which CUDA_VISIBLE_DEVICES is ignored and
+    # every worker would land on GPU 0.
+    torch.cuda.set_device(gpu_id)
+    _worker_device = f"cuda:{gpu_id}"
 
     _worker_processor = ProcessorRegistry.get(processor_name)
     _worker_models = _worker_processor.load_models(model_name, _worker_device)
@@ -440,9 +442,12 @@ def _init_video_worker(
     """Initialize video worker process with models on assigned GPU."""
     global _worker_models, _worker_processor, _worker_calculator, _worker_device, _worker_config
 
-    # Set CUDA_VISIBLE_DEVICES to isolate this GPU for the worker process.
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-    _worker_device = "cuda:0"
+    # Select the GPU explicitly rather than via CUDA_VISIBLE_DEVICES: in a
+    # spawned worker the module re-imports can touch the CUDA driver before
+    # this function runs, after which CUDA_VISIBLE_DEVICES is ignored and
+    # every worker would land on GPU 0.
+    torch.cuda.set_device(gpu_id)
+    _worker_device = f"cuda:{gpu_id}"
     _worker_config = video_config
 
     _worker_processor = ProcessorRegistry.get(processor_name)
