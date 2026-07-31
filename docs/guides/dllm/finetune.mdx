@@ -43,6 +43,7 @@ The following table lists the supported models, their training modes, loss funct
 |---|---|---|---|---|
 | LLaDA | `mdlm` | MDLM cross-entropy | Standalone full-forward denoising without a key-value (KV) cache | [llada_sft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/llada_sft.yaml) |
 | LLaDA2 | `mdlm` | MDLM cross-entropy | Built-in block-refinement generation | [llada2_sft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/llada2_sft.yaml) |
+| SCDD (LLaDA backbone) | `scdd` | Self-correcting discrete-diffusion NELBO (denoise + correction terms) | Ancestral sampling over the whole canvas, with per-step self-correction | [llada_scdd.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/llada_scdd.yaml) |
 | Nemotron-Labs-Diffusion | `hybrid` | Diffusion and AR (alpha-weighted) | Block diffusion with KV cache | [nemotron_labs_diffusion_sft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/nemotron_labs_diffusion_sft.yaml) |
 | DiffusionGemma | `block_diffusion` | Flat block-diffusion cross-entropy and encoder AR | Built-in Hugging Face diffusion sampler (entropy-bounded denoising) | [diffusion_gemma_sft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/diffusion_gemma_sft.yaml) |
 | DFlash | `dflash` | Decay-weighted cross-entropy (Equation 4) | Training only (decoding occurs in the speculative-decoding stack) | [dflash_sft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/dflash_sft.yaml) |
@@ -79,6 +80,7 @@ The recipe uses a **strategy pattern** to handle differences between model famil
 | Mode | Strategy | Description |
 |------|----------|-------------|
 | `mdlm` | `MDLMStrategy` | LLaDA-style: model receives corrupted tokens, MDLM cross-entropy loss |
+| `scdd` | `SCDDStrategy` | SCDD: absorbing `[MASK]` noise mixed with uniform token transitions, trained with the self-correcting NELBO |
 | `hybrid` | `HybridStrategy` | Nemotron-Labs-Diffusion-style: model receives clean tokens and `masked_indices`, with combined diffusion and AR loss |
 | `block_diffusion` | `BlockDiffusionStrategy` | DiffusionGemma-style: uniform random-token corruption over a response canvas, with flat cross-entropy and co-trained encoder AR loss |
 | `dflash` | `DFlashStrategy` | DFlash: frozen target LM provides hidden states, and the draft model trains with decay-weighted loss |
@@ -102,6 +104,50 @@ dllm:
 dataset:
   unshifted: true             # Required for dLLM training
 ```
+
+### Configure SCDD
+
+SCDD ([arXiv:2603.02230](https://arxiv.org/abs/2603.02230)) trains self-correction into the model
+instead of bolting it on at inference. Its forward process mixes the usual absorbing `[MASK]` noise
+with **uniform token transitions**, so the model is trained on contexts that contain
+wrong-but-plausible tokens and learns to overwrite them. The objective adds a correction term at
+every visible position on top of the familiar denoising term at `[MASK]` positions, which is what
+lets the sampler decode many tokens per step without the quality collapse a pure absorbing model
+shows under parallel decoding.
+
+Because the objective covers every supervised position (corrupted or not), the loss denominator is
+the supervised-token count, not the corrupted-token count.
+
+Refer to [`llada_scdd.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/llada_scdd.yaml)
+for the full working configuration. The following example shows the key dLLM-specific sections.
+
+```yaml
+model:
+  pretrained_model_name_or_path: GSAI-ML/LLaDA-8B-Base
+  torch_dtype: float32
+  trust_remote_code: true
+
+dllm:
+  mode: scdd
+  mask_token_id: 126336       # LLaDA mask token
+  vocab_size: 126464          # Required: the uniform channel samples over the vocabulary
+  eps: 0.001                  # Minimum diffusion time
+  num_timesteps: 1000         # Discrete diffusion steps T
+  uniform_ratio: 0.1          # Peak uniform-noise share (0 degenerates to MDLM)
+  schedule_shape: 1.0
+  schedule_peak: 0.5
+
+dataset:
+  unshifted: true
+```
+
+Decode SCDD checkpoints with `--sampler scdd`, passing the same `uniform_ratio`, `schedule_shape`,
+and `schedule_peak` used during training — the sampler rebuilds the reverse posterior from that
+schedule, so a mismatch degrades generation.
+
+The SCDD loss upcasts logits to fp32 and holds roughly two extra logits-sized tensors while it sums
+over the vocabulary. Scale sequence length with FSDP2 sharding and a smaller local batch rather than
+by growing the micro-batch.
 
 ### Configure Nemotron-Labs-Diffusion
 
@@ -132,7 +178,7 @@ The following table describes the key configuration fields for dLLM fine-tuning.
 
 | Field | Description |
 |-------|-------------|
-| `dllm.mode` | Training strategy (`mdlm`, `hybrid`, `block_diffusion`, `dflash`, or `idlm`) |
+| `dllm.mode` | Training strategy (`mdlm`, `scdd`, `hybrid`, `block_diffusion`, `dflash`, or `idlm`) |
 | `dllm.mask_token_id` | Token ID used for masking (`126336` for LLaDA, `156895` for LLaDA2.1, `100` for Nemotron-Labs-Diffusion) |
 | `dllm.eps` | Minimum corruption ratio to avoid zero-corruption samples |
 | `dllm.block_size` | When set, use blockwise corruption (otherwise uniform). Hybrid mode only. |
@@ -141,6 +187,11 @@ The following table describes the key configuration fields for dLLM fine-tuning.
 | `dllm.block_length` | Diffusion block size for the I-DLM block-diffusion mask (paper curriculum 1→2→3). I-DLM mode only |
 | `dllm.clean_loss_weight` | Fixed `α` on the clean-copy verification CE (paper `0.2`). I-DLM mode only |
 | `dllm.auto_balance_clean_loss` | Replaces `α` with `(CE_noisy/CE_clean).detach()` (paper Equation 2, b3 stage). I-DLM mode only |
+| `dllm.vocab_size` | Vocabulary size, including `[MASK]`. Required by `scdd` and `block_diffusion`, whose corruption draws replacement tokens over the vocabulary. |
+| `dllm.num_timesteps` | Number of discrete diffusion steps `T` in the SCDD NELBO (default `1000`). SCDD mode only. |
+| `dllm.uniform_ratio` | Peak share of uniform (correctable) noise. `0` degenerates SCDD to plain MDLM. SCDD mode only. |
+| `dllm.schedule_shape` | Shape mass of the uniform-noise bump; larger values concentrate the noise near the peak. SCDD mode only. |
+| `dllm.schedule_peak` | Time in `(0, 1)` at which the uniform-noise ratio peaks. SCDD mode only. |
 | `dataset.unshifted` | Must be `true` for dLLM. Disables the autoregressive input and target shift. |
 
 ### Configure DFlash
@@ -270,6 +321,13 @@ torchrun --nproc-per-node=8 \
     -c examples/dllm_sft/llada2_sft.yaml
 ```
 
+### Fine-Tune with SCDD
+
+```bash
+uv run automodel finetune dllm \
+    -c examples/dllm_sft/llada_scdd.yaml
+```
+
 ### Fine-Tune with DFlash
 
 ```bash
@@ -296,7 +354,7 @@ torchrun --nproc-per-node=8 \
 
 ## Run Inference
 
-The generation script ([`generate.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_generate/generate.py)) supports chat and raw generation. Select the sampler that matches the trained family by using the `--sampler {llada,llada2,nemotron,gemma,idlm}` argument. Infilling (`--infill`) is available with the `llada` sampler only.
+The generation script ([`generate.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_generate/generate.py)) supports chat and raw generation. Select the sampler that matches the trained family by using the `--sampler {llada,scdd,llada2,nemotron,gemma,idlm}` argument. Infilling (`--infill`) is available with the `llada` sampler only.
 
 The `--checkpoint` argument accepts several path types, including a path to a `consolidated/` directory, a step directory such as `.../epoch_0_step_499`, or the top-level checkpoint directory. The script automatically resolves the path to `LATEST/model/consolidated/`. Training with the provided example configs automatically writes this consolidated Hugging Face-format directory at the final checkpoint (`checkpoint.save_consolidated: final`). You can pass the directory printed at the end of training directly to `--checkpoint`.
 
@@ -307,6 +365,23 @@ python examples/dllm_generate/generate.py \
     --checkpoint <path> \
     --prompt "Explain what a neural network is." \
     --sampler llada
+```
+
+### Generate with SCDD
+
+The SCDD sampler resamples every generated position at each step from the exact reverse posterior,
+so a token it now believes is wrong can be replaced. `--uniform_ratio`, `--schedule_shape`, and
+`--schedule_peak` must match the training configuration. `--block_size`, `--remasking`,
+`--threshold`, and KV caching do not apply.
+
+```bash
+uv run python examples/dllm_generate/generate.py \
+    --checkpoint dllm_checkpoints/llada_scdd/<step>/model/consolidated \
+    --prompt "Explain what a neural network is." \
+    --sampler scdd \
+    --steps 128 \
+    --max_new_tokens 128 \
+    --uniform_ratio 0.1
 ```
 
 ### Generate with LLaDA2
