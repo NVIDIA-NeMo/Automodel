@@ -1,9 +1,9 @@
 ---
 title: "Inkling"
-description: "Fine-tune Thinking Machines Lab's 975B multimodal MoE model with pipeline and expert parallelism."
+description: "Fine-tune Thinking Machines Lab's Inkling multimodal MoE family with pipeline and expert parallelism."
 ---
 
-[Inkling](https://huggingface.co/thinkingmachines/Inkling) is a multimodal Mixture-of-Experts model from Thinking Machines Lab. It accepts text, image, video, and audio inputs and generates text.
+[Inkling](https://huggingface.co/thinkingmachines/Inkling) is a multimodal Mixture-of-Experts model family from Thinking Machines Lab. The models accept text, image, video, and audio inputs and generate text. NeMo AutoModel supports both the 975B Inkling checkpoint and the 276B [Inkling-Small](https://huggingface.co/thinkingmachines/Inkling-Small) checkpoint.
 
 <Info>
 
@@ -11,7 +11,7 @@ description: "Fine-tune Thinking Machines Lab's 975B multimodal MoE model with p
 |---|---|
 | **Task** | Image-Text-to-Text / Audio-Text-to-Text |
 | **Architecture** | `InklingForConditionalGeneration` |
-| **Parameters** | 975B total / 41B active |
+| **Parameters** | Inkling: 975B total / 41B active; Inkling-Small: 276B total / 12B active |
 | **Precision** | BF16 |
 | **HF Org** | [thinkingmachines](https://huggingface.co/thinkingmachines) |
 
@@ -19,24 +19,31 @@ description: "Fine-tune Thinking Machines Lab's 975B multimodal MoE model with p
 
 ## Architecture
 
-Inkling uses a 66-layer decoder with hybrid local and global attention. Each sparse feed-forward layer routes a token to 6 of 256 experts and also evaluates 2 shared experts. Images and video use a hierarchical patch encoder, while audio uses discrete dMel tokens.
+Inkling uses a 66-layer decoder with hybrid local and global attention. Inkling-Small uses the same model family with 42 decoder layers and hidden size 4096. Local attention uses a 512-token sliding window, and every sixth layer uses global attention. Both variants use eight key-value heads and short convolutions with kernel size four.
 
-NeMo AutoModel retains the checkpoint's fused expert layout and supports pipeline parallelism and expert parallelism for full-parameter fine-tuning.
+Each sparse feed-forward layer routes a token to 6 of 256 experts and also evaluates 2 shared experts. Images and video use a hierarchical patch encoder, while audio uses discrete dMel tokens.
+
+NeMo AutoModel retains the checkpoint's fused expert layout and supports expert parallelism for both variants. The full Inkling recipe also uses pipeline parallelism.
 
 ## Example HF Models
 
 | Model | HF ID |
 |---|---|
 | Inkling BF16 | [`thinkingmachines/Inkling`](https://huggingface.co/thinkingmachines/Inkling) |
+| Inkling-Small | [`thinkingmachines/Inkling-Small`](https://huggingface.co/thinkingmachines/Inkling-Small) |
 
 ## Example Recipes
 
 | Recipe | Dataset | Description |
 |---|---|---|
 | [inkling_medpix.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/inkling/inkling_medpix.yaml) | MedPix-VQA | Full SFT with PP8 and EP32 |
+| [Inkling_small_medpix_ep64.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/inkling/Inkling_small_medpix_ep64.yaml) | MedPix-VQA | Full SFT with EP64 on 64 H100 GPUs |
 
-The model requires a multi-node launch. Adjust the data, pipeline, and expert-parallel dimensions to the available cluster before running the recipe.
+Both recipes require a multi-node launch. Adjust the data and parallel dimensions to the available cluster before running a recipe.
+
+The Inkling-Small EP64 recipe completed 100 training steps on 64 H100 GPUs with microbatch size 1, global batch size 64, and 512-token MedPix samples. It uses FSDP2, activation checkpointing, HybridEP dispatch, and no context or pipeline parallelism.
 
 ## Hugging Face Model Card
 
 - [thinkingmachines/Inkling](https://huggingface.co/thinkingmachines/Inkling)
+- [thinkingmachines/Inkling-Small](https://huggingface.co/thinkingmachines/Inkling-Small)

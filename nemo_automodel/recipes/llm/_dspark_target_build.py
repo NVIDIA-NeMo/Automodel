@@ -44,6 +44,63 @@ from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_con
 logger = logging.getLogger(__name__)
 
 
+def distributed_section_dict(cfg) -> dict:
+    """Return the ``distributed:`` section of a top-level recipe config as a plain dict.
+
+    A missing block yields ``{}``, i.e. the default FSDP2 configuration; this keeps the
+    fail-loud missing-block contract of ``create_distributed_setup_from_config`` intact
+    for callers that require an explicit block.
+    """
+    section = cfg.get("distributed", None)
+    if section is None:
+        return {}
+    return section.to_dict() if hasattr(section, "to_dict") else dict(section)
+
+
+def unsupported_parallel_axes(sizes: dict, axes: tuple[str, ...]) -> dict[str, int]:
+    """Return the entries of ``axes`` whose parallelism size is not 1.
+
+    Reads a raw ``distributed:`` section or a ``parse_distributed_section`` result the
+    same way: an absent key and an explicit YAML null (``tp_size:``) both mean 1.
+    """
+    resolved = {axis: int(sizes.get(axis) or 1) for axis in axes}
+    return {axis: size for axis, size in resolved.items() if size != 1}
+
+
+def validate_dspark_parallelism_axes(cfg) -> None:
+    """Reject the model-parallel axes the DSpark entrypoints cannot honor.
+
+    Both the training recipe and the distributed precompute replicate their work per
+    rank and shard the dataset by rank, so only data-parallel-shaped topologies are
+    correct. Two axes break that silently rather than loudly:
+
+    - ``tp_size > 1``: every rank of a tensor-parallel group must run the target on the
+      SAME micro-batch, but the sampler hands each rank a different one, so the target's
+      sharded attention and MLPs combine activations from unrelated samples.
+    - ``pp_size > 1``: the target is loaded as an ``AutoPipeline`` instead of a module,
+      which the forward-hook hidden-state capture in ``HFDSparkTargetModel`` cannot run.
+
+    Shard a large target with ``ep_size`` / FSDP instead. Context parallelism has its own
+    (supported) path in the training recipe.
+
+    Args:
+        cfg: The top-level recipe config.
+
+    Raises:
+        NotImplementedError: if ``distributed.tp_size`` or ``distributed.pp_size`` > 1.
+    """
+    # Read the raw section rather than parse_distributed_section: the parser rejects
+    # pp_size>1 without a `pipeline` block before this gate could report the axis.
+    unsupported = unsupported_parallel_axes(distributed_section_dict(cfg), ("tp_size", "pp_size"))
+    if unsupported:
+        raise NotImplementedError(
+            f"DSpark does not support {unsupported}: a tensor-parallel target is fed a different "
+            f"micro-batch on each rank of its TP group, and a pipelined target is an AutoPipeline "
+            f"the forward-hook hidden-state capture cannot run. Set tp_size=pp_size=1 and shard a "
+            f"large target with ep_size / FSDP instead."
+        )
+
+
 def gather_full_weight_module(module):
     """Return an object exposing a full (non-DTensor) ``.weight`` tensor.
 
@@ -375,7 +432,10 @@ __all__ = [
     "build_glm_5_2_target",
     "build_kimi_k3_backend",
     "build_kimi_k3_target",
+    "distributed_section_dict",
     "gather_full_weight_module",
     "repair_glm_5_2_qk_rope_head_dim",
     "resolve_reduced_target_layers",
+    "unsupported_parallel_axes",
+    "validate_dspark_parallelism_axes",
 ]
