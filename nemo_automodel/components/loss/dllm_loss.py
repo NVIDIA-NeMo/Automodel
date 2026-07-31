@@ -20,12 +20,20 @@ uniformly without branching on model type.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import NamedTuple, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributed.tensor import DTensor
+
+# Probability floor used throughout the SCDD schedule/ELBO. Quantities that are
+# exactly zero at the schedule boundaries (rho -> 1 gives a zero uniform base)
+# are clamped to this before a log, which keeps every term finite; the resulting
+# bias is far below fp32 resolution and the affected terms carry a zero
+# coefficient anyway.
+_SCDD_TINY = 1e-30
 
 
 def _compute_per_token_nll(
@@ -127,6 +135,7 @@ class MDLMCrossEntropyLoss(nn.Module):
         num_diffusion_tokens: Optional[int] = None,
         num_ar_tokens: Optional[int] = None,
         causal_logits: Optional[torch.Tensor] = None,
+        noisy_input_ids: Optional[torch.Tensor] = None,
     ) -> DLLMLossOutput:
         """Compute the MDLM cross-entropy loss.
 
@@ -138,6 +147,8 @@ class MDLMCrossEntropyLoss(nn.Module):
             loss_mask: Supervised positions mask, shape ``[B, L]``.
             num_diffusion_tokens: If provided, used for global normalization
                 (total supervised tokens across all grad-acc microbatches).
+            noisy_input_ids: Ignored (the absorbing kernel needs only
+                ``noise_mask``), shape ``[B, L]`` when supplied.
 
         Returns:
             :class:`DLLMLossOutput` where ``total_loss == dllm_loss``.
@@ -157,6 +168,297 @@ class MDLMCrossEntropyLoss(nn.Module):
         # Normalize by total supervised tokens
         if num_diffusion_tokens is not None:
             loss = loss / max(num_diffusion_tokens, 1)
+
+        return DLLMLossOutput(total_loss=loss, dllm_loss=loss.detach().clone())
+
+
+@dataclass(frozen=True)
+class SCDDSchedule:
+    """Marginal of the SCDD forward process at a diffusion time.
+
+    SCDD (Self-Correcting Discrete Diffusion, arXiv:2603.02230) generalises the
+    absorbing masked-diffusion forward process by mixing in uniform transitions,
+    so the denoiser sees corrupted-but-plausible tokens during training and
+    learns to *correct* them rather than only to fill ``[MASK]``. The marginal
+    of a clean token ``x`` at time ``t`` is
+
+    .. math::
+        q(z_t \\mid x) = \\gamma_t\\bigl(\\rho_t x + (1-\\rho_t) u\\bigr)
+                        + (1-\\gamma_t)\\,m
+
+    where ``u`` is uniform over the non-``[MASK]`` vocabulary and ``m`` is the
+    absorbing ``[MASK]`` state.
+
+    Attributes:
+        clean_mass: ``gamma_t * rho_t`` — probability the token is *retained*,
+            shape ``[batch]``.
+        uniform_mass: ``gamma_t * (1 - rho_t)`` — probability the token was
+            redrawn from the uniform distribution, shape ``[batch]``.
+        absorbed_mass: ``1 - gamma_t`` — probability the token is ``[MASK]``,
+            shape ``[batch]``.
+        gamma: Probability the token is not ``[MASK]``, shape ``[batch]``.
+        rho: Probability the token is retained given that it is not ``[MASK]``,
+            shape ``[batch]``.
+    """
+
+    clean_mass: torch.Tensor
+    uniform_mass: torch.Tensor
+    absorbed_mass: torch.Tensor
+    gamma: torch.Tensor
+    rho: torch.Tensor
+
+
+def scdd_schedule(
+    t: torch.Tensor,
+    *,
+    max_ratio: float,
+    gamma_shape: float,
+    t_peak: float,
+) -> SCDDSchedule:
+    """Evaluate the SCDD forward-process marginal at diffusion time *t*.
+
+    The uniform-noise mass follows a Beta-shaped bump ``c(t) = B t^a (1-t)^b``
+    with ``a = gamma_shape * t_peak`` and ``b = gamma_shape * (1 - t_peak)``,
+    normalised so that its ratio against the retained mass peaks at *max_ratio*
+    at ``t = t_peak``. The retained mass decays linearly, giving the closed form
+
+    ``clean = (1-t)/(1+c)``, ``uniform = c/(1+c)``, ``absorbed = t/(1+c)``.
+
+    Both ``rho`` and ``gamma`` are monotonically decreasing in *t*, which is what
+    makes ``[MASK]`` an absorbing state of the induced Markov chain (no
+    remasking during sampling).
+
+    Args:
+        t: Diffusion times in ``[0, 1]``, shape ``[batch]``. Values outside the
+            unit interval are clamped (fractional powers of a negative base are
+            undefined).
+        max_ratio: Peak uniform-to-retained mass ratio, in ``[0, 1)``. ``0``
+            degenerates the process to pure absorbing masked diffusion (MDLM).
+        gamma_shape: Total shape mass of the bump; larger values concentrate the
+            uniform noise around *t_peak*.
+        t_peak: Time in ``(0, 1)`` at which the uniform-noise ratio peaks.
+
+    Returns:
+        The :class:`SCDDSchedule` at *t*; every field has shape ``[batch]``.
+    """
+    if not 0.0 <= max_ratio < 1.0:
+        raise ValueError(f"scdd_schedule requires 0 <= max_ratio < 1 (got {max_ratio})")
+    if not 0.0 < t_peak < 1.0:
+        raise ValueError(f"scdd_schedule requires 0 < t_peak < 1 (got {t_peak})")
+
+    t = t.clamp(0.0, 1.0)
+    a = gamma_shape * t_peak
+    b = gamma_shape * (1.0 - t_peak)
+    peak = (t_peak**a) * ((1.0 - t_peak) ** b)
+    scale = (max_ratio / (1.0 - max_ratio)) / peak
+
+    c = scale * torch.pow(t, a) * torch.pow(1.0 - t, b)
+    clean_mass = (1.0 - t) / (1.0 + c)
+    uniform_mass = c / (1.0 + c)
+    absorbed_mass = 1.0 - clean_mass - uniform_mass
+    gamma = clean_mass + uniform_mass
+    rho = clean_mass / gamma.clamp(min=_SCDD_TINY)
+
+    return SCDDSchedule(
+        clean_mass=clean_mass,
+        uniform_mass=uniform_mass,
+        absorbed_mass=absorbed_mass,
+        gamma=gamma,
+        rho=rho,
+    )
+
+
+class SCDDLoss(nn.Module):
+    """Discrete-time NELBO for SCDD (arXiv:2603.02230).
+
+    The forward process mixes an absorbing ``[MASK]`` channel with uniform
+    transitions (see :func:`scdd_schedule`), so a position at time ``t`` is
+    either ``[MASK]`` or a possibly-wrong non-``[MASK]`` token. The two cases
+    contribute different terms to the ELBO:
+
+    * ``z_t = [MASK]`` — the familiar denoising term, the reverse-KL mass that
+      the model must place on the clean token when it un-absorbs.
+    * ``z_t != [MASK]`` — the **correction** term, the reverse KL of the true
+      posterior against the model posterior at an already-visible token. This is
+      what trains the model to overwrite its own earlier mistakes, and it is
+      scored at every non-``[MASK]`` supervised position, including uncorrupted
+      ones (where it vanishes only in the degenerate ``max_ratio = 0`` limit).
+
+    Both terms are scaled by ``num_timesteps`` so the loss is the discrete-time
+    NELBO per token rather than a per-step increment.
+
+    Setting ``max_ratio = 0`` removes the uniform channel entirely and the loss
+    reduces exactly to the MDLM objective ``-log p(x_0) / t`` at masked
+    positions with zero correction term — the invariant the unit tests pin.
+
+    The model output is re-parameterised as a distribution over non-``[MASK]``
+    tokens (the ``[MASK]`` logit is driven to ``-inf`` before the log-softmax),
+    matching the SCDD backbone parameterisation: the denoiser never predicts the
+    absorbing state.
+
+    Note:
+        Peak activation cost is roughly two extra fp32 tensors of the logits'
+        size, so scale the local batch or sequence with tensor/context
+        parallelism rather than growing the micro-batch.
+    """
+
+    def __init__(
+        self,
+        mask_token_id: int,
+        num_timesteps: int = 1000,
+        max_ratio: float = 0.1,
+        gamma_shape: float = 1.0,
+        t_peak: float = 0.5,
+    ):
+        """Initialise the SCDD loss.
+
+        Args:
+            mask_token_id: Token ID of the absorbing ``[MASK]`` state.
+            num_timesteps: Number of discrete diffusion steps ``T``; the loss is
+                the ``T``-step NELBO and the reverse step is ``1/T``.
+            max_ratio: Peak uniform-to-retained mass ratio of the forward
+                process (``0`` degenerates to MDLM).
+            gamma_shape: Shape mass of the uniform-noise bump.
+            t_peak: Time at which the uniform-noise ratio peaks.
+        """
+        super().__init__()
+        if num_timesteps < 1:
+            raise ValueError(f"SCDDLoss requires num_timesteps >= 1 (got {num_timesteps})")
+        self.mask_token_id = int(mask_token_id)
+        self.num_timesteps = int(num_timesteps)
+        self.max_ratio = float(max_ratio)
+        self.gamma_shape = float(gamma_shape)
+        self.t_peak = float(t_peak)
+
+    def forward(
+        self,
+        logits: torch.Tensor,
+        target_ids: torch.Tensor,
+        noise_mask: torch.Tensor,
+        p_mask: torch.Tensor,
+        loss_mask: torch.Tensor,
+        loss_mask_ar: torch.Tensor | None = None,
+        num_diffusion_tokens: int | None = None,
+        num_ar_tokens: int | None = None,
+        causal_logits: torch.Tensor | None = None,
+        noisy_input_ids: torch.Tensor | None = None,
+    ) -> DLLMLossOutput:
+        """Compute the SCDD discrete-time NELBO.
+
+        Args:
+            logits: Model output logits, shape ``[batch, sequence, vocab]``.
+            target_ids: Clean token IDs ``x_0``, shape ``[batch, sequence]``.
+            noise_mask: Boolean mask of corrupted positions, shape
+                ``[batch, sequence]``. Ignored — the SCDD ELBO is supported on
+                every supervised position, corrupted or not.
+            p_mask: Per-position diffusion time ``t``, shape
+                ``[batch, sequence]``, constant along the sequence axis (the
+                SCDD forward process draws one ``t`` per sequence). This is the
+                contract with
+                :meth:`~nemo_automodel.recipes.dllm.strategy.SCDDStrategy.apply_corruption`,
+                which samples ``t`` on the ``1/T`` grid and broadcasts it here;
+                unlike the absorbing kernels this slot carries the time itself,
+                because the ELBO weights need the full schedule at ``t`` and at
+                the previous grid point.
+            loss_mask: Supervised positions mask, shape ``[batch, sequence]``.
+            loss_mask_ar: Ignored (SCDD has no autoregressive term).
+            num_diffusion_tokens: If provided, the global supervised-token count
+                used as the normalisation denominator (summed across grad-acc
+                microbatches). If ``None``, normalises by the local supervised
+                count.
+            num_ar_tokens: Ignored (SCDD has no autoregressive term).
+            causal_logits: Ignored (SCDD has no autoregressive term).
+            noisy_input_ids: Corrupted token IDs ``z_t`` the model was fed, shape
+                ``[batch, sequence]``. Required: the correction term is a
+                function of the visible token, which cannot be recovered from
+                ``noise_mask`` alone.
+
+        Returns:
+            :class:`DLLMLossOutput` where ``total_loss == dllm_loss``.
+        """
+        del noise_mask, loss_mask_ar, num_ar_tokens, causal_logits
+
+        if noisy_input_ids is None:
+            raise ValueError("SCDDLoss requires noisy_input_ids (the corrupted tokens z_t seen by the model).")
+
+        if isinstance(logits, DTensor):
+            logits = logits.full_tensor()
+        z_t = noisy_input_ids.to(logits.device)
+        x_0 = target_ids.to(logits.device)
+
+        vocab = logits.size(-1)
+        # Domain of the denoiser: every token except the absorbing state.
+        num_states = vocab - 1
+
+        # --- schedule at t and at the previous grid point s = t - 1/T ---
+        step = 1.0 / self.num_timesteps
+        t = p_mask[:, 0].to(torch.float32).clamp(0.0, 1.0)  # [batch]
+        s = (t - step).clamp(min=0.0)
+        sched_t = scdd_schedule(t, max_ratio=self.max_ratio, gamma_shape=self.gamma_shape, t_peak=self.t_peak)
+        sched_s = scdd_schedule(s, max_ratio=self.max_ratio, gamma_shape=self.gamma_shape, t_peak=self.t_peak)
+
+        rho_t, rho_s = sched_t.rho, sched_s.rho
+        rho_s_safe = rho_s.clamp(min=_SCDD_TINY)
+        # Backward transition of the retained/uniform split between s and t.
+        clean_transition = rho_t / rho_s_safe
+        uniform_transition = (rho_s - rho_t) / rho_s_safe
+        # Fraction of the absorbed mass released over one reverse step.
+        unmask_coeff = (sched_s.gamma - sched_t.gamma) / (1.0 - sched_t.gamma).clamp(min=_SCDD_TINY)
+        base_s = (1.0 - rho_s) / num_states
+        base_t = (1.0 - rho_t) / num_states
+
+        # --- SCDD parameterisation: log p_theta over non-[MASK] tokens ---
+        # Out-of-place fill: ``logits`` may alias a tensor the caller still owns.
+        mask_col = torch.tensor([self.mask_token_id], device=logits.device)
+        logits = logits.index_fill(-1, mask_col, float("-inf"))
+        log_p = torch.log_softmax(logits.float(), dim=-1)  # [batch, sequence, vocab]
+        del logits
+
+        # log of the per-token posterior numerator at s:
+        #   log( base_s + rho_s * p_theta(v) )
+        log_term = torch.logaddexp(
+            base_s.clamp(min=_SCDD_TINY).log()[:, None, None].expand_as(log_p),
+            rho_s.clamp(min=_SCDD_TINY).log()[:, None, None] + log_p,
+        )  # [batch, sequence, vocab]
+
+        # Sum over the non-[MASK] domain. The [MASK] column is subtracted rather
+        # than zeroed in place, which avoids a second logits-sized tensor; it is
+        # finite because the log arguments are floored.
+        sum_log = log_term.sum(dim=-1) - log_term[:, :, self.mask_token_id]  # [batch, sequence]
+        log_at_x0 = log_term.gather(-1, x_0.unsqueeze(-1)).squeeze(-1)  # [batch, sequence]
+        log_at_zt = log_term.gather(-1, z_t.unsqueeze(-1)).squeeze(-1)  # [batch, sequence]
+        del log_term
+
+        # --- z_t == [MASK]: standard denoising term ---
+        absorbed_loss = -unmask_coeff[:, None] * (base_s[:, None] * sum_log + rho_s[:, None] * log_at_x0)
+
+        # --- z_t != [MASK]: correction term ---
+        log_p_zt = log_p.gather(-1, z_t.unsqueeze(-1)).squeeze(-1)  # [batch, sequence]
+        del log_p
+        log_denom = torch.logaddexp(
+            base_t.clamp(min=_SCDD_TINY).log()[:, None].expand_as(log_p_zt),
+            rho_t.clamp(min=_SCDD_TINY).log()[:, None] + log_p_zt,
+        )  # [batch, sequence]
+
+        # Expectation of log(q/p) over z_s ~ q(. | z_t, x_0), expanded into the
+        # four (uniform|retained) x (x_0|z_t) coefficient blocks.
+        retained = (z_t == x_0).to(log_denom.dtype)  # [batch, sequence]
+        coeff_uniform = (uniform_transition / num_states)[:, None]
+        coeff_clean = clean_transition[:, None]
+        total = (
+            (base_s[:, None] * coeff_uniform) * (sum_log - num_states * log_denom)
+            + (rho_s[:, None] * coeff_uniform) * (log_at_x0 - log_denom)
+            + (base_s[:, None] * coeff_clean) * (log_at_zt - log_denom)
+            + (rho_s[:, None] * coeff_clean * retained) * (log_at_x0 - log_denom)
+        )
+        correction_loss = -total / (base_t[:, None] + rho_t[:, None] * retained).clamp(min=_SCDD_TINY)
+
+        per_token = torch.where(z_t == self.mask_token_id, absorbed_loss, correction_loss) * self.num_timesteps
+
+        mask = loss_mask.bool().to(per_token.dtype)
+        loss = (per_token * mask).sum()
+        denom = num_diffusion_tokens if num_diffusion_tokens is not None else int(mask.sum().item())
+        loss = loss / max(denom, 1)
 
         return DLLMLossOutput(total_loss=loss, dllm_loss=loss.detach().clone())
 
@@ -200,6 +502,7 @@ class BlockDiffusionCrossEntropyLoss(nn.Module):
         num_diffusion_tokens: Optional[int] = None,
         num_ar_tokens: Optional[int] = None,
         causal_logits: Optional[torch.Tensor] = None,
+        noisy_input_ids: Optional[torch.Tensor] = None,
     ) -> DLLMLossOutput:
         """Compute the flat block-diffusion cross-entropy loss.
 
@@ -213,6 +516,8 @@ class BlockDiffusionCrossEntropyLoss(nn.Module):
                 used as the normalization denominator (summed across grad-acc
                 microbatches). If ``None``, normalizes by the local corrupted
                 count in this microbatch.
+            noisy_input_ids: Ignored (the flat loss scores the clean targets),
+                shape ``[B, L]`` when supplied.
 
         Returns:
             :class:`DLLMLossOutput` where ``total_loss == dllm_loss`` (no AR).
@@ -266,6 +571,7 @@ class HybridDiffusionLLMLoss(nn.Module):
         num_diffusion_tokens: Optional[int] = None,
         num_ar_tokens: Optional[int] = None,
         causal_logits: Optional[torch.Tensor] = None,
+        noisy_input_ids: Optional[torch.Tensor] = None,
     ) -> DLLMLossOutput:
         """Compute the hybrid diffusion + AR loss.
 
@@ -282,6 +588,8 @@ class HybridDiffusionLLMLoss(nn.Module):
             num_ar_tokens: Total AR label tokens for normalization.
             causal_logits: Optional separate AR logits, shape ``[B, L, V]``.
                 When provided, avoids the concat/split of the legacy layout.
+            noisy_input_ids: Ignored (the model applies masking internally),
+                shape ``[B, L]`` when supplied.
 
         Returns:
             :class:`DLLMLossOutput` with combined ``total_loss`` and the pure
