@@ -358,6 +358,7 @@ def build_dataloader(
             get_rope_index=get_rope_index,
             packing_attn_implementation=packing_attn_implementation,
             pp_n_microbatches=pp_n_microbatches,
+            cp_size=cp_size,
         )
     return result.dataloader, result.processor
 
@@ -590,6 +591,11 @@ class FinetuneRecipeForVLM(BaseRecipe):
             self.cfg.prewarm.apply(
                 model_parts=self.model_parts,
                 device=self.dist_env.device,
+                batch_size=(
+                    self.pp.pp_microbatch_size
+                    if self.pp is not None
+                    else self.cfg.get("step_scheduler.local_batch_size", 1)
+                ),
                 pp_mesh=(self.device_mesh["pp"] if self.pp_enabled and self.device_mesh is not None else None),
             )
 
@@ -612,7 +618,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         from nemo_automodel.components.models.common.packing import configure_packing, get_attn_implementation
 
         packing_attn_implementation = dataloader_config.resolve_packing_attn_implementation(
-            model_attn_implementation=get_attn_implementation(self.cfg.model),
+            model_attn_implementation=get_attn_implementation(self.cfg.model, model=self.model_parts[0]),
             cp_size=self.mesh_context.cp_size,
         )
         if dataloader_config.packing is not None and dataloader_config.packing.packing_format != "thd":
@@ -629,6 +635,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 get_rope_index=get_rope_index,
                 packing_attn_implementation=packing_attn_implementation,
                 pp_n_microbatches=pp_n_microbatches,
+                cp_size=self.mesh_context.cp_size,
             )
         self.dataloader = dataloader_build.dataloader
         self.processor = dataloader_build.processor
@@ -646,6 +653,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
                     dataset_build_context=validation_build_context,
                     get_rope_index=get_rope_index,
+                    cp_size=self.mesh_context.cp_size,
                 )
             self.val_dataloader = validation_build.dataloader
 
@@ -1185,9 +1193,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                         logits=getattr(out, "logits", out),
                         labels=labels,
                         model=self.model_parts[0],
-                        hidden_states=out.hidden_states[-1]
-                        if getattr(out, "hidden_states", None) is not None
-                        else None,
+                        hidden_states=get_final_hidden_states(out),
                         num_label_tokens=num_label_tokens,
                     )
                     # Mirror training: include the drafter term so validation

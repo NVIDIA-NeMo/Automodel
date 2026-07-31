@@ -783,6 +783,20 @@ class TestPrecomputeStageShapes:
         assert stage._user_meta.inputs[1].requires_grad is True
         assert stage._user_meta.outputs[0].requires_grad is True
 
+    def test_unsupported_pipeline_stage_api_uses_dynamic_metadata_inference(self):
+        """PipelineStage APIs without a static metadata hook retain the dynamic fallback."""
+
+        class _Submod:
+            pass
+
+        stage = types.SimpleNamespace(is_first=True, submod=_Submod())
+        config = self._make_config(hidden_size=64, vocab_size=128)
+
+        _precompute_stage_shapes([stage], config, microbatch_size=2, seq_len=16)
+
+        assert not hasattr(stage, "inputs_meta")
+        assert not hasattr(stage, "_outputs_meta")
+
     def test_first_stage_shapes(self):
         """First stage input should be [mb, seq_len] int64, output [mb, seq_len, hidden]."""
         stage = self._make_stage(is_first=True, is_last=False, has_lm_head=False)
@@ -1306,6 +1320,54 @@ class TestResetPpStageShapes:
 
 class TestPrecomputeStageShapesModelHook:
     """Models with non-standard PP tensor contracts can provide their own metas."""
+
+    def test_new_pipeline_api_preserves_value_sensitive_carry_metadata(self, monkeypatch):
+        """PyTorch's new metadata API must keep model-declared index-carry tensors static."""
+        import torch.nn as nn
+
+        stage_module = __import__("torch.distributed.pipelining.stage", fromlist=["extract_tensor_metas"])
+
+        def extract_tensor_metas(tensors):
+            """Capture shape metadata for tensors of arbitrary rank.
+
+            Args:
+                tensors: Tensors of shape [...], with arbitrary ranks and no constrained axes.
+
+            Returns:
+                Tuple of metadata records preserving each tensor's shape, dtype, and requires-grad state.
+            """
+            return tuple(
+                types.SimpleNamespace(shape=tensor.shape, dtype=tensor.dtype, requires_grad=tensor.requires_grad)
+                for tensor in tensors
+            )
+
+        monkeypatch.setattr(stage_module, "extract_tensor_metas", extract_tensor_metas, raising=False)
+
+        class _Submod(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.register_parameter("_dummy", nn.Parameter(torch.empty(1, dtype=torch.bfloat16)))
+
+            def get_pipeline_stage_metas(self, *, is_first, microbatch_size, seq_len, dtype):
+                assert not is_first
+                hidden = torch.empty(microbatch_size, seq_len, 64, device="meta", dtype=dtype)
+                topk_indices = torch.empty(microbatch_size, seq_len, 8, device="meta", dtype=torch.float32)
+                return (hidden, topk_indices), (hidden, topk_indices)
+
+        stage = types.SimpleNamespace(
+            is_first=False,
+            submod=_Submod(),
+            _user_meta=types.SimpleNamespace(inputs=None, outputs=None),
+        )
+        config = types.SimpleNamespace(hidden_size=64, vocab_size=128)
+
+        _precompute_stage_shapes([stage], config, microbatch_size=2, seq_len=16)
+
+        assert [meta.shape for meta in stage._user_meta.inputs] == [(2, 16, 64), (2, 16, 8)]
+        assert [meta.dtype for meta in stage._user_meta.inputs] == [torch.bfloat16, torch.float32]
+        assert all(meta.requires_grad for meta in stage._user_meta.inputs)
+        assert [meta.shape for meta in stage._user_meta.outputs] == [(2, 16, 64), (2, 16, 8)]
+        assert all(meta.requires_grad for meta in stage._user_meta.outputs)
 
     def test_uses_model_supplied_pipeline_stage_metas(self):
         import torch.nn as nn

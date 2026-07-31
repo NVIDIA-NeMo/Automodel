@@ -25,6 +25,7 @@ def _lock_contents(
     *,
     unrelated_version: str = "1.0.0",
     torch_version: str = "2.10.0+cu130",
+    torchvision_version: str = "0.25.0+cu130",
     causal_conv1d_version: str = "1.6.0",
     packaging_version: str = "25.0",
 ) -> str:
@@ -39,6 +40,7 @@ def _lock_contents(
         "pybind11": "3.0.1",
         "setuptools": "80.10.2",
         "torch": torch_version,
+        "torchvision": torchvision_version,
         "transformer-engine": "2.15.0",
         "transformer-engine-cu13": "2.15.0",
         "transformer-engine-torch": "2.15.0",
@@ -46,7 +48,7 @@ def _lock_contents(
     }
     packages = []
     for name, version in versions.items():
-        registry = _TORCH_INDEX if name == "torch" else "https://pypi.org/simple"
+        registry = _TORCH_INDEX if name in {"torch", "torchvision"} else "https://pypi.org/simple"
         packages.append(
             "\n".join(
                 (
@@ -93,10 +95,12 @@ def test_lock_manifest_pins_build_and_runtime_requirements(tmp_path):
     )
 
     assert locked_inputs["torch"] == "torch==2.10.0+cu130"
+    assert locked_inputs["torchvision"] == "torchvision==0.25.0+cu130"
     assert "causal-conv1d==1.6.0" in locked_inputs["wheels"]
     assert "numpy==1.26.4" in locked_inputs["build_tools"]
     assert set(locked_inputs["build_tools"]) <= set(locked_inputs["constraints"])
     assert "torch==2.10.0+cu130" in locked_inputs["constraints"]
+    assert "torchvision==0.25.0+cu130" in locked_inputs["constraints"]
 
 
 def test_unrelated_lock_change_preserves_cache_fingerprint(tmp_path):
@@ -109,6 +113,13 @@ def test_unrelated_lock_change_preserves_cache_fingerprint(tmp_path):
 def test_torch_lock_change_invalidates_cache_fingerprint(tmp_path):
     baseline = _fingerprint(tmp_path, torch_version="2.10.0+cu130")
     updated = _fingerprint(tmp_path, torch_version="2.11.0+cu130")
+
+    assert updated != baseline
+
+
+def test_torchvision_lock_change_invalidates_cache_fingerprint(tmp_path):
+    baseline = _fingerprint(tmp_path, torchvision_version="0.25.0+cu130")
+    updated = _fingerprint(tmp_path, torchvision_version="0.26.0+cu130")
 
     assert updated != baseline
 
