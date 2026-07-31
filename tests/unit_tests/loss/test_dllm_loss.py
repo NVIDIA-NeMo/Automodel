@@ -1130,3 +1130,73 @@ class TestSCDDLossDistributed:
         mesh = init_device_mesh("cpu", (1,))
         sharded = loss_fn(logits=distribute_tensor(logits, mesh, [Shard(-1)]), **common).total_loss
         torch.testing.assert_close(sharded, plain, rtol=1e-5, atol=1e-6)
+
+
+class TestSCDDLossChunking:
+    """The chunked vocabulary reduction must be numerically transparent.
+
+    The ELBO needs the model's probability of every non-[MASK] token, so it
+    cannot use a fused cross-entropy kernel; the vocab-sized work is instead
+    checkpointed in position chunks. Chunking changes peak memory, never the
+    result — each position is independent.
+    """
+
+    @staticmethod
+    def _inputs(seed=20):
+        """Build a batch big enough that a small chunk size spans the batch axis.
+
+        Returns tensors of shape ``[4, 16, V]``, ``[4, 16]`` x 3 and ``[4, 16]``.
+        """
+        torch.manual_seed(seed)
+        big_b, big_l = 4, 16
+        logits = torch.randn(big_b, big_l, V)
+        x0 = torch.randint(0, V - 1, (big_b, big_l))
+        z_t = x0.clone()
+        z_t[:, ::3] = SCDD_MASK_ID
+        z_t[:, 1::3] = (x0[:, 1::3] + 7) % (V - 1)
+        loss_mask = torch.ones(big_b, big_l, dtype=torch.long)
+        p_mask = torch.rand(big_b, 1).clamp(0.05, 0.95).expand(big_b, big_l).contiguous()
+        return logits, x0, z_t, loss_mask, p_mask
+
+    def _run(self, chunk_size, logits, x0, z_t, loss_mask, p_mask):
+        logits = logits.clone().requires_grad_(True)
+        loss_fn = SCDDLoss(
+            mask_token_id=SCDD_MASK_ID, num_timesteps=1000, max_ratio=0.15, chunk_size=chunk_size
+        )
+        out = loss_fn(
+            logits=logits,
+            target_ids=x0,
+            noise_mask=z_t != x0,
+            p_mask=p_mask,
+            loss_mask=loss_mask,
+            noisy_input_ids=z_t,
+            num_diffusion_tokens=int(loss_mask.sum()),
+        )
+        out.total_loss.backward()
+        return out.total_loss.detach(), logits.grad
+
+    @pytest.mark.parametrize("chunk_size", [1, 7, 32, 1024])
+    def test_matches_the_unchunked_result(self, chunk_size):
+        """Chunk boundaries that split a sequence, align with it, and exceed the
+        whole batch must all give the same loss and the same gradient."""
+        args = self._inputs()
+        ref_loss, ref_grad = self._run(None, *args)
+        loss, grad = self._run(chunk_size, *args)
+        torch.testing.assert_close(loss, ref_loss, rtol=1e-6, atol=1e-7)
+        torch.testing.assert_close(grad, ref_grad, rtol=1e-5, atol=1e-7)
+
+    def test_gradient_reaches_every_supervised_position(self):
+        """Checkpoint recompute must not drop gradient for chunks after the
+        first — a stale-boundary bug would leave later positions at zero."""
+        logits, x0, z_t, loss_mask, p_mask = self._inputs(seed=21)
+        _, grad = self._run(7, logits, x0, z_t, loss_mask, p_mask)
+        per_position = grad.abs().sum(dim=-1)
+        assert (per_position > 0).all(), f"zero-gradient positions: {(per_position == 0).nonzero().tolist()}"
+
+    def test_rejects_nonpositive_chunk_size(self):
+        with pytest.raises(ValueError, match="chunk_len"):
+            SCDDLoss(mask_token_id=SCDD_MASK_ID, chunk_size=0)
+
+    def test_defaults_to_chunking(self):
+        assert SCDDLoss(mask_token_id=SCDD_MASK_ID).chunk_size == 1024
+        assert SCDDLoss(mask_token_id=SCDD_MASK_ID, chunk_size=None).chunk_size is None

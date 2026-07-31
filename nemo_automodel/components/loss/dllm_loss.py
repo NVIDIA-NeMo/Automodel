@@ -28,6 +28,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributed.tensor import DTensor
 
+from nemo_automodel.components.loss.chunked_ce import _validate_chunk_len
+
 # Probability floor used throughout the SCDD schedule/ELBO. Quantities that are
 # exactly zero at the schedule boundaries (rho -> 1 gives a zero uniform base)
 # are clamped to this before a log, which keeps every term finite; the resulting
@@ -297,10 +299,13 @@ class SCDDLoss(nn.Module):
     matching the SCDD backbone parameterisation: the denoiser never predicts the
     absorbing state.
 
-    Note:
-        Peak activation cost is roughly two extra fp32 tensors of the logits'
-        size, so scale the local batch or sequence with tensor/context
-        parallelism rather than growing the micro-batch.
+    Unlike the absorbing losses, the ELBO needs the model's probability of
+    *every* non-``[MASK]`` token, so it cannot be reduced by a fused
+    cross-entropy kernel. The vocabulary-sized work is instead done in position
+    chunks wrapped in :func:`torch.utils.checkpoint` (the same treatment
+    :meth:`DFlashDecayLoss.forward_fused` gives its LM-head projection), so the
+    two ``[positions, vocab]`` fp32 intermediates are recomputed in backward and
+    peak activation is one chunk rather than the whole batch.
     """
 
     def __init__(
@@ -310,6 +315,7 @@ class SCDDLoss(nn.Module):
         max_ratio: float = 0.1,
         gamma_shape: float = 1.0,
         t_peak: float = 0.5,
+        chunk_size: int | None = 1024,
     ):
         """Initialise the SCDD loss.
 
@@ -321,6 +327,12 @@ class SCDDLoss(nn.Module):
                 process (``0`` degenerates to MDLM).
             gamma_shape: Shape mass of the uniform-noise bump.
             t_peak: Time at which the uniform-noise ratio peaks.
+            chunk_size: Number of positions whose vocabulary-sized terms are
+                computed at once, each chunk wrapped in
+                :func:`torch.utils.checkpoint`. Smaller means lower peak memory
+                and more recompute. ``None`` computes every position in one
+                shot with no checkpointing — numerically identical, but it holds
+                two fp32 ``[batch * sequence, vocab]`` tensors at once.
         """
         super().__init__()
         if num_timesteps < 1:
@@ -330,6 +342,70 @@ class SCDDLoss(nn.Module):
         self.max_ratio = float(max_ratio)
         self.gamma_shape = float(gamma_shape)
         self.t_peak = float(t_peak)
+        # Same positive-int contract the chunked cross-entropy kernel uses.
+        self.chunk_size = None if chunk_size is None else _validate_chunk_len(chunk_size)
+
+    @staticmethod
+    def _vocab_terms(
+        logits_chunk: torch.Tensor,
+        x_0_chunk: torch.Tensor,
+        z_t_chunk: torch.Tensor,
+        log_base_s_chunk: torch.Tensor,
+        log_rho_s_chunk: torch.Tensor,
+        mask_token_id: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Reduce one position chunk over the vocabulary axis.
+
+        This is the only part of the ELBO whose working set scales with the
+        vocabulary, so it is the part the caller wraps in
+        :func:`torch.utils.checkpoint`: the two ``[chunk, vocab]`` fp32
+        intermediates are then recomputed in backward instead of held. Every
+        position is independent, so chunking is exact.
+
+        Args:
+            logits_chunk: Model logits, shape ``[chunk, vocab]``.
+            x_0_chunk: Clean token IDs, shape ``[chunk]``.
+            z_t_chunk: Corrupted token IDs seen by the model, shape ``[chunk]``.
+            log_base_s_chunk: ``log`` of the uniform base mass at ``s``, shape
+                ``[chunk]``.
+            log_rho_s_chunk: ``log`` of the retained-mass ratio at ``s``, shape
+                ``[chunk]``.
+            mask_token_id: Token ID of the absorbing ``[MASK]`` state.
+
+        Returns:
+            Tuple of ``(sum_log, log_at_x0, log_at_zt, log_p_zt)``, each of
+            shape ``[chunk]``:
+
+            * ``sum_log`` — the posterior numerator summed over the non-``[MASK]``
+              domain.
+            * ``log_at_x0`` / ``log_at_zt`` — that numerator at the clean and at
+              the corrupted token.
+            * ``log_p_zt`` — the denoiser's log-probability of the corrupted token.
+        """
+        # Driving the [MASK] logit to -inf removes the absorbing state from the
+        # denoiser's domain. The fill is done in the logits' own dtype so only
+        # the float() cast below pays vocabulary-sized fp32.
+        mask_col = torch.tensor([mask_token_id], device=logits_chunk.device)
+        logits_chunk = logits_chunk.index_fill(-1, mask_col, float("-inf")).float()  # [chunk, vocab]
+        log_denom = torch.logsumexp(logits_chunk, dim=-1)  # [chunk]
+
+        # log p_theta(v) = logits(v) - logsumexp(logits), so the log-softmax
+        # never has to be materialised: its per-position normaliser folds into a
+        # scalar shift, and it is only needed pointwise at z_t.
+        shift = log_rho_s_chunk - log_denom  # [chunk]
+        log_term = torch.logaddexp(
+            log_base_s_chunk[:, None].expand_as(logits_chunk),
+            shift[:, None] + logits_chunk,
+        )  # [chunk, vocab] — log( base_s + rho_s * p_theta(v) )
+
+        # At the [MASK] column the logit is -inf, so the term collapses to
+        # log(base_s): excluding that column from the vocabulary sum is a scalar
+        # subtraction, not a gather.
+        sum_log = log_term.sum(dim=-1) - log_base_s_chunk
+        log_at_x0 = log_term.gather(-1, x_0_chunk[:, None]).squeeze(-1)
+        log_at_zt = log_term.gather(-1, z_t_chunk[:, None]).squeeze(-1)
+        log_p_zt = logits_chunk.gather(-1, z_t_chunk[:, None]).squeeze(-1) - log_denom
+        return sum_log, log_at_x0, log_at_zt, log_p_zt
 
     def forward(
         self,
@@ -408,34 +484,40 @@ class SCDDLoss(nn.Module):
         base_s = (1.0 - rho_s) / num_states
         base_t = (1.0 - rho_t) / num_states
 
-        # --- SCDD parameterisation: log p_theta over non-[MASK] tokens ---
-        # Out-of-place fill: ``logits`` may alias a tensor the caller still owns.
-        mask_col = torch.tensor([self.mask_token_id], device=logits.device)
-        logits = logits.index_fill(-1, mask_col, float("-inf"))
-        log_p = torch.log_softmax(logits.float(), dim=-1)  # [batch, sequence, vocab]
+        # --- vocabulary-sized work, one position chunk at a time ---
+        batch, seq_len = x_0.shape
+        # Broadcast the per-sequence schedule onto positions so a chunk can span
+        # the batch boundary.
+        log_base_s = base_s.clamp(min=_SCDD_TINY).log().repeat_interleave(seq_len)  # [batch * sequence]
+        log_rho_s = rho_s.clamp(min=_SCDD_TINY).log().repeat_interleave(seq_len)  # [batch * sequence]
+        flat_logits = logits.reshape(-1, vocab)
+        flat_x0 = x_0.reshape(-1)
+        flat_zt = z_t.reshape(-1)
         del logits
 
-        # log of the per-token posterior numerator at s:
-        #   log( base_s + rho_s * p_theta(v) )
-        log_term = torch.logaddexp(
-            base_s.clamp(min=_SCDD_TINY).log()[:, None, None].expand_as(log_p),
-            rho_s.clamp(min=_SCDD_TINY).log()[:, None, None] + log_p,
-        )  # [batch, sequence, vocab]
-
-        # Sum over the non-[MASK] domain. The [MASK] column is subtracted rather
-        # than zeroed in place, which avoids a second logits-sized tensor; it is
-        # finite because the log arguments are floored.
-        sum_log = log_term.sum(dim=-1) - log_term[:, :, self.mask_token_id]  # [batch, sequence]
-        log_at_x0 = log_term.gather(-1, x_0.unsqueeze(-1)).squeeze(-1)  # [batch, sequence]
-        log_at_zt = log_term.gather(-1, z_t.unsqueeze(-1)).squeeze(-1)  # [batch, sequence]
-        del log_term
+        num_positions = flat_logits.size(0)
+        chunk = num_positions if self.chunk_size is None else self.chunk_size
+        parts = []
+        for start in range(0, num_positions, chunk):
+            end = start + chunk
+            args = (
+                flat_logits[start:end],
+                flat_x0[start:end],
+                flat_zt[start:end],
+                log_base_s[start:end],
+                log_rho_s[start:end],
+                self.mask_token_id,
+            )
+            if self.chunk_size is None:
+                parts.append(self._vocab_terms(*args))
+            else:
+                parts.append(torch.utils.checkpoint.checkpoint(self._vocab_terms, *args, use_reentrant=False))
+        sum_log, log_at_x0, log_at_zt, log_p_zt = (torch.cat(term).reshape(batch, seq_len) for term in zip(*parts))
 
         # --- z_t == [MASK]: standard denoising term ---
         absorbed_loss = -unmask_coeff[:, None] * (base_s[:, None] * sum_log + rho_s[:, None] * log_at_x0)
 
         # --- z_t != [MASK]: correction term ---
-        log_p_zt = log_p.gather(-1, z_t.unsqueeze(-1)).squeeze(-1)  # [batch, sequence]
-        del log_p
         log_denom = torch.logaddexp(
             base_t.clamp(min=_SCDD_TINY).log()[:, None].expand_as(log_p_zt),
             rho_t.clamp(min=_SCDD_TINY).log()[:, None] + log_p_zt,
