@@ -218,7 +218,19 @@ class _GateRoutingCore(nn.Module):
     """
 
     def forward(self, scores: torch.Tensor, gate: "Gate") -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-        """Select experts and compute routing probabilities from projected scores."""
+        """Select experts and compute routing probabilities from projected scores.
+
+        Args:
+            scores: Tensor of shape [tokens, num_experts] containing projected router logits.
+            gate: Owning gate whose routing policy is applied to ``scores``.
+
+        Returns:
+            Tuple containing:
+                - weights: Tensor of shape [tokens, top_k] containing selected-expert routing weights.
+                - indices: Tensor of shape [tokens, top_k] containing selected expert ids.
+                - original_scores: Tensor of shape [tokens, num_experts] containing the full expert scores used
+                  for load-balancing statistics.
+        """
         return gate._route_scores(scores)
 
 
@@ -309,7 +321,18 @@ class Gate(nn.Module):
         self.use_routing_core = False
 
     def _route_scores(self, scores: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-        """Apply fixed-shape expert selection and probability math to router logits."""
+        """Apply fixed-shape expert selection and probability math to router logits.
+
+        Args:
+            scores: Tensor of shape [tokens, num_experts] containing projected router logits.
+
+        Returns:
+            Tuple containing:
+                - weights: Tensor of shape [tokens, top_k] containing selected-expert routing weights.
+                - indices: Tensor of shape [tokens, top_k] containing selected expert ids.
+                - original_scores: Tensor of shape [tokens, num_experts] containing the full expert scores used
+                  for load-balancing statistics.
+        """
         num_tokens = scores.size(0)
 
         if self.score_func == "softmax":
