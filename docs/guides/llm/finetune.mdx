@@ -734,6 +734,8 @@ distributed:
   sequence_parallel: false # when true, extends TP to also shard activations along
                           # the sequence dimension for additional memory savings
 
+{/* docs-review-start: mamba-ssd-prewarm */}
+
 # Setup Prewarms (optional)
 # Moves selected one-time CUDA and NCCL initialization work out of the first
 # training step. Leave disabled unless the corresponding lazy initialization
@@ -743,6 +745,8 @@ prewarm:
   fla_gdn_autotune: false  # autotune FLA gated-delta-net Triton kernels during setup
   mamba_ssd_autotune: false # autotune Mamba SSD Triton kernels during setup
   comm_groups: false       # initialize grad-norm communication groups during setup
+
+{/* docs-review-end: mamba-ssd-prewarm */}
 
 # Random Number Generator
 # The recipe constructs its checkpointable, rank-aware StatefulRNG from this seed.

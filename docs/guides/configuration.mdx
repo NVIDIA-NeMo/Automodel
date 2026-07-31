@@ -65,6 +65,8 @@ The `distributed:` section is **not** instantiated using `_target_`. Recipes par
 
 ## Prewarm One-Time CUDA Initialization
 
+{/* docs-review-start: mamba-ssd-prewarm */}
+
 The LLM training, LLM fine-tuning, and VLM fine-tuning recipes accept an optional `prewarm:` section:
 
 ```yaml
@@ -90,6 +92,8 @@ Adding GPUs helps only when it sufficiently reduces the relevant per-rank tensor
 Triton reuses an autotuned configuration according to each kernel's explicit cache key. The Mamba SSD warmup therefore matches the real head, state, group, chunk, and dtype geometry but uses batch size 1 and two chunks. Batch size and sequence length change the launch grid and activation footprint, but they are not cache keys in the pinned Mamba SSD kernels. Keeping those dimensions small is intentional: using the full training batch and sequence would recreate the peak-memory condition that setup prewarming is meant to avoid.
 
 </Info>
+
+{/* docs-review-end: mamba-ssd-prewarm */}
 
 ## Repair Near-Zero Input Embeddings
 
