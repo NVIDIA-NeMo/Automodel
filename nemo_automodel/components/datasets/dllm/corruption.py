@@ -19,6 +19,7 @@ Provides masking strategies for dLLM SFT:
 - ``corrupt_blockwise``: per-block weighted corruption with exponential position bias
 - ``corrupt_uniform_random``: per-block random-token (D3PM-uniform) corruption
 - ``corrupt_all_masked``: deterministic all-masked corruption (I-DLM)
+- ``corrupt_mix``: two-channel absorbing + uniform-transition corruption (SCDD)
 """
 
 from __future__ import annotations
@@ -149,6 +150,105 @@ def corrupt_all_masked(
     noisy_input_ids = torch.where(noise_mask, mask_token_id, input_ids)
     p_mask = torch.ones_like(input_ids, dtype=torch.float32)
     return noisy_input_ids, noise_mask, p_mask
+
+
+def corrupt_mix(
+    input_ids: torch.Tensor,
+    loss_mask: torch.Tensor,
+    mask_token_id: int,
+    vocab_size: int,
+    *,
+    mask_prob: torch.Tensor,
+    uniform_prob: torch.Tensor,
+    generator: torch.Generator | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Two-channel absorbing + uniform-transition corruption.
+
+    Each supervised position independently lands in exactly one of three states,
+    drawn from a single uniform variate so the two channels are mutually
+    exclusive:
+
+    * ``[MASK]`` with probability ``mask_prob`` (the absorbing channel),
+    * a **different** non-``[MASK]`` token with probability ``uniform_prob``
+      (the uniform-transition channel), drawn uniformly over the
+      ``vocab_size - 2`` tokens that are neither ``[MASK]`` nor the clean token,
+    * unchanged otherwise.
+
+    This is the forward kernel that gives a diffusion LM corrupted-but-plausible
+    context to correct, as opposed to the pure absorbing kernel of
+    :func:`corrupt_uniform` where every corrupted position is visibly ``[MASK]``.
+    Callers own the schedule that turns a diffusion time into the two
+    probabilities; this function applies whatever it is given.
+
+    The replacement token is drawn by sampling an index over ``vocab_size - 2``
+    and shifting it past the two excluded ids, so peak memory stays
+    ``O(batch * sequence)`` rather than materialising a ``[batch, sequence,
+    vocab]`` probability table.
+
+    Args:
+        input_ids: Clean token IDs, shape ``[batch, sequence]``.
+        loss_mask: Binary mask of supervised positions, shape
+            ``[batch, sequence]``. Only supervised positions are ever corrupted.
+        mask_token_id: Token ID of the absorbing ``[MASK]`` state.
+        vocab_size: Vocabulary size, including ``[MASK]``. Must be at least 3.
+        mask_prob: Per-sequence absorbing probability, shape ``[batch]`` or
+            ``[batch, 1]`` (broadcast over positions).
+        uniform_prob: Per-sequence uniform-transition probability, same shape as
+            *mask_prob*. ``mask_prob + uniform_prob`` must not exceed 1.
+        generator: Optional ``torch.Generator`` (on ``input_ids.device``) used for
+            ALL random draws (the channel variate and the replacement tokens).
+            Pass a step-seeded generator so the corruption is a deterministic
+            function of the training step and reproduces exactly on checkpoint
+            resume; ``None`` falls back to the global RNG (not resume-safe).
+
+    Returns:
+        Tuple of ``(noisy_input_ids, noise_mask)``, each of shape
+        ``[batch, sequence]``.
+
+        * ``noisy_input_ids`` — ``input_ids`` with absorbed positions replaced by
+          ``mask_token_id`` and transitioned positions replaced by a different
+          non-``[MASK]`` token.
+        * ``noise_mask`` — bool mask of positions changed by either channel.
+
+        No ``p_mask`` is returned: the two probabilities alone do not determine
+        the loss weight for a mixed kernel, so the caller supplies whatever
+        per-position quantity its loss needs.
+
+    Note:
+        Supervised positions whose clean token already **is** ``mask_token_id``
+        are never routed to the uniform channel (there would be no well-defined
+        "different non-``[MASK]``" replacement); they may still be absorbed,
+        which leaves them unchanged and hence out of ``noise_mask``.
+    """
+    if vocab_size < 3:
+        raise ValueError(f"corrupt_mix requires vocab_size >= 3 (got {vocab_size})")
+
+    B, L = input_ids.shape
+    device = input_ids.device
+
+    mask_prob = mask_prob.reshape(B, 1).to(torch.float32)
+    uniform_prob = uniform_prob.reshape(B, 1).to(torch.float32)
+
+    # One variate per position splits the two channels without double-drawing.
+    u = torch.rand((B, L), device=device, generator=generator)
+    supervised = loss_mask.bool()
+    absorbed = (u < mask_prob) & supervised
+    transitioned = (u >= mask_prob) & (u < mask_prob + uniform_prob) & supervised
+    transitioned &= input_ids != mask_token_id
+
+    # Uniform over the vocabulary minus {mask_token_id, input_ids}: draw over
+    # vocab_size - 2 slots, then shift past each excluded id in sorted order.
+    draw = torch.randint(0, vocab_size - 2, (B, L), device=device, dtype=input_ids.dtype, generator=generator)
+    mask_id_t = torch.full_like(input_ids, mask_token_id)
+    lo = torch.minimum(input_ids, mask_id_t)
+    hi = torch.maximum(input_ids, mask_id_t)
+    draw = draw + (draw >= lo).to(draw.dtype)
+    draw = draw + (draw >= hi).to(draw.dtype)
+
+    noisy_input_ids = torch.where(absorbed, mask_id_t, input_ids)
+    noisy_input_ids = torch.where(transitioned, draw, noisy_input_ids)
+
+    return noisy_input_ids, absorbed | transitioned
 
 
 def corrupt_blockwise(
