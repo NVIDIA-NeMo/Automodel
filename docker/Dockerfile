@@ -130,26 +130,25 @@ RUN if [ "$INSTALL_UCCL_EP" = "True" ]; then \
     rm -f /opt/setup_uccl_ep.sh; \
     fi
 
-# ---- Wheel builders: compile the heavy AOT source packages off the uv-sync path (cached across uv.lock bumps).
-# FROM automodel_dep so they run after TE/DeepEP/bitsandbytes; MAX_JOBS capped so torchao||FA3 don't OOM the builder.
-FROM automodel_dep AS torchao_builder
+# ---- Wheel builder: compile the heavy AOT source packages off the uv-sync path (cached across uv.lock bumps).
+# torchao then FA3/FA4 as sequential steps so each compiles alone at full MAX_JOBS — no cross-compile OOM. FA3 is the long pole.
+FROM automodel_dep AS wheel_builder
+
 # torchao MXFP8: build w/ submodules (PyPI wheels omit mxfp8 CUDA kernels on aarch64); pin v0.17.0 (v0.14.1 ~2.5x slower; main needs nvidia-cutlass-dsl).
 ARG TORCHAO_REF=v0.17.0
 RUN mkdir -p /wheels && \
     git clone --depth 1 --branch ${TORCHAO_REF} --recurse-submodules --shallow-submodules \
         https://github.com/pytorch/ao.git /tmp/torchao && \
-    TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" MAX_JOBS=4 \
+    TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" MAX_JOBS=8 \
         pip wheel --no-cache-dir --no-build-isolation --no-deps -w /wheels /tmp/torchao && \
     rm -rf /tmp/torchao
 
 # FA3 (Hopper-only, SM90a-locked, ~25 min nvcc) + FA4 cute (Blackwell, lightweight). arm64 -> skip FA3: GB200 target, QEMU cross-build impractical.
-FROM automodel_dep AS fa_builder
 ARG FLASH_ATTN_REF=002cce0a1
 ARG INSTALL_FA3=true
 ARG INSTALL_FA4=false
 ARG TARGETARCH
-RUN mkdir -p /wheels && \
-    if [ "$TARGETARCH" = "arm64" ]; then INSTALL_FA3=false; fi && \
+RUN if [ "$TARGETARCH" = "arm64" ]; then INSTALL_FA3=false; fi && \
     if [ "$INSTALL_FA3" = "true" ] || [ "$INSTALL_FA4" = "true" ]; then \
         git clone --filter=blob:none https://github.com/Dao-AILab/flash-attention.git /tmp/fa && \
         cd /tmp/fa && git checkout ${FLASH_ATTN_REF} && \
@@ -157,7 +156,7 @@ RUN mkdir -p /wheels && \
     fi && \
     if [ "$INSTALL_FA3" = "true" ]; then \
         cd /tmp/fa/hopper && \
-        FLASH_ATTENTION_DISABLE_SM80=TRUE MAX_JOBS=4 NVCC_THREADS=2 \
+        FLASH_ATTENTION_DISABLE_SM80=TRUE MAX_JOBS=$(nproc) NVCC_THREADS=2 \
         pip wheel --no-cache-dir --no-build-isolation --no-deps -w /wheels . ; \
     fi && \
     if [ "$INSTALL_FA4" = "true" ]; then \
@@ -169,10 +168,9 @@ FROM automodel_dep as automodel_final
 
 WORKDIR /opt/Automodel
 
-# torchao MXFP8 + FA3/FA4: prebuilt wheels from the *_builder stages, installed into system site-packages
+# torchao MXFP8 + FA3/FA4: prebuilt wheels from the wheel_builder stage, installed into system site-packages
 # before uv sync — pip targets system deps, uv the venv (torchao/FA gated `never`), so uv sync won't prune or shadow them.
-COPY --from=torchao_builder /wheels /tmp/wheels/
-COPY --from=fa_builder /wheels /tmp/wheels/
+COPY --from=wheel_builder /wheels /tmp/wheels/
 ARG INSTALL_FA4=false
 RUN pip install --no-cache-dir --no-deps /tmp/wheels/*.whl && \
     if [ "$INSTALL_FA4" = "true" ]; then \
