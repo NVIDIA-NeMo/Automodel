@@ -60,19 +60,7 @@ Use these compact answer patterns for common questions:
   Do not treat VLM onboarding as a pure causal-LM path or skip processor/image
   tests.
 
-For MoE state-dict questions, always include the safety checklist:
-
-- Map router tensors separately from expert tensors.
-- Preserve routed-expert index order; never sort, drop, merge, or silently
-  reshape expert weights to make loading pass.
-- Map gate, up, and down projections explicitly, including combined projection
-  layouts and shared experts when present.
-- Add adapter key-map tests and tiny-config numerical equivalence tests before
-  relying on full checkpoint loading.
-
-For VLM questions, explicitly check `vision_config`, `text_config`, the
-conditional-generation architecture, text backbone, vision tower, projector,
-processor assumptions, registry entry, and tiny image-text tests.
+For MoE state-dict and VLM questions, apply the checklists in Sections 2.4 and 2.5.
 
 ## Routing Boundary
 
