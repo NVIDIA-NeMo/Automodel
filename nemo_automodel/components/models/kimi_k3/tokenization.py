@@ -19,7 +19,8 @@ from .encoding import build_chat_segments, is_batched_conversation
 
 logger = getLogger(__name__)
 VOCAB_FILES_NAMES = {"vocab_file": "tiktoken.model"}
-_REGEX_SET_INTERSECTION = "&" * 2
+# Fern autodoc emits literal ampersands as invalid MDX.
+_REGEX_SET_INTERSECTION = chr(38) * 2
 _NON_HAN_UPPER_OR_MARK = r"""[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}""" + _REGEX_SET_INTERSECTION + r"""[^\p{Han}]]"""
 _NON_HAN_LOWER_OR_MARK = r"""[\p{Ll}\p{Lm}\p{Lo}\p{M}""" + _REGEX_SET_INTERSECTION + r"""[^\p{Han}]]"""
 
