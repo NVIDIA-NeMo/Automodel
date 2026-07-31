@@ -34,8 +34,14 @@ This package owns:
 - :class:`~nemo_automodel.components.speculative.streaming.queue.SampleRefQueue`
   -- the metadata-only lease/ack/fail queue between producers and consumers
   with visibility-timeout reclaim and watermark-based backpressure.
+- :class:`~nemo_automodel.components.speculative.streaming.producer.FeatureProducer`
+  and :class:`~nemo_automodel.components.speculative.streaming.loader.FeatureDataLoader`
+  -- the EAGLE-3 produce and consume sides that turn a target forward into
+  refs and refs back into ``Eagle3TargetBatch`` instances.
 """
 
+from nemo_automodel.components.speculative.streaming.loader import FeatureDataLoader
+from nemo_automodel.components.speculative.streaming.producer import FeatureProducer
 from nemo_automodel.components.speculative.streaming.queue import (
     Lease,
     SampleRefQueue,
@@ -56,6 +62,8 @@ from nemo_automodel.components.speculative.streaming.stores.local import LocalFe
 
 __all__ = [
     "FeatureAlgorithm",
+    "FeatureDataLoader",
+    "FeatureProducer",
     "FeatureSpec",
     "FeatureStore",
     "Lease",
