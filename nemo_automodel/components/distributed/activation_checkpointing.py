@@ -258,6 +258,18 @@ def _maybe_trace_selective_ac_decision(func, decision, is_alternating: bool, *, 
     logger.info("[selective-ac] %s -> %s", key, verdict)
 
 
+def ignore_sac_ops(ops: list[object | None]) -> None:
+    """Add available operators to PyTorch's selective-AC ignore set.
+
+    Args:
+        ops: Operators that should execute outside SAC replay accounting.
+            Entries may be ``None`` when an optional operator is unavailable.
+    """
+    sac_ignored = getattr(torch.utils.checkpoint, "SAC_IGNORED_OPS", None)
+    if sac_ignored is not None:
+        sac_ignored.update(op for op in ops if op is not None)
+
+
 def ensure_profiler_ops_sac_ignored() -> None:
     """Keep ``torch.ops.profiler`` record-function ops out of SAC's op replay.
 
@@ -280,16 +292,17 @@ def ensure_profiler_ops_sac_ignored() -> None:
     if get_torch_version().release < _TORCH_PROFILER_SAC_IGNORE_MIN_VERSION:
         return
 
-    sac_ignored = getattr(torch.utils.checkpoint, "SAC_IGNORED_OPS", None)
     profiler_ops = getattr(torch.ops, "profiler", None)
-    if sac_ignored is None or profiler_ops is None:
+    if profiler_ops is None:
         return
+    ops_to_ignore = []
     for packet_name in ("_record_function_enter", "_record_function_enter_new", "_record_function_exit"):
         packet = getattr(profiler_ops, packet_name, None)
         if packet is None:
             continue
         for overload_name in packet.overloads():
-            sac_ignored.add(getattr(packet, overload_name))
+            ops_to_ignore.append(getattr(packet, overload_name))
+    ignore_sac_ops(ops_to_ignore)
 
 
 def ensure_fsdp_ops_sac_ignored() -> None:
@@ -302,28 +315,22 @@ def ensure_fsdp_ops_sac_ignored() -> None:
     normally when needed instead of being indexed against the forward's
     selective-AC op stream.
     """
-    sac_ignored = getattr(torch.utils.checkpoint, "SAC_IGNORED_OPS", None)
-    if sac_ignored is None:
-        return
-    for op_name in ("all_gather_copy_in", "split_with_sizes_copy", "chunk_cat", "copy_"):
-        op = _resolve_torch_op("fsdp", op_name)
-        if op is not None:
-            sac_ignored.add(op)
-    all_gather = _resolve_torch_op("c10d", "_allgather_base_")
-    if all_gather is not None:
-        sac_ignored.add(all_gather)
     # FSDP's all-gather copy-out allocates per-parameter outputs and views the
     # flat communication buffer. When forward prefetch has already unsharded
     # the parameters, these setup ops occur only during recomputation. They do
     # not produce model activations: the FSDP copy ops populate the allocations.
-    for op_name, overload_name in (
-        ("empty", "memory_format"),
-        ("empty_like", "default"),
-        ("view", "default"),
-    ):
-        op = _resolve_torch_op("aten", op_name, overload_name)
-        if op is not None:
-            sac_ignored.add(op)
+    ignore_sac_ops(
+        [
+            _resolve_torch_op("fsdp", "all_gather_copy_in"),
+            _resolve_torch_op("fsdp", "split_with_sizes_copy"),
+            _resolve_torch_op("fsdp", "chunk_cat"),
+            _resolve_torch_op("fsdp", "copy_"),
+            _resolve_torch_op("c10d", "_allgather_base_"),
+            _resolve_torch_op("aten", "empty", "memory_format"),
+            _resolve_torch_op("aten", "empty_like"),
+            _resolve_torch_op("aten", "view"),
+        ]
+    )
 
 
 def make_selective_checkpoint_context_fn():

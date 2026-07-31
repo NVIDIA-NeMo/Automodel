@@ -497,6 +497,15 @@ def _sac_context_factory():
     return lambda: create_selective_checkpoint_contexts(policy)
 
 
+def test_ignore_sac_ops_adds_available_ops(monkeypatch):
+    sac_ignored = set()
+    monkeypatch.setattr(torch.utils.checkpoint, "SAC_IGNORED_OPS", sac_ignored, raising=False)
+
+    ac.ignore_sac_ops([torch.ops.aten.sin.default, None, torch.ops.aten.cos.default])
+
+    assert sac_ignored == {torch.ops.aten.sin.default, torch.ops.aten.cos.default}
+
+
 def test_profiler_ops_sac_ignore_skips_before_torch_2_13(monkeypatch):
     sac_ignored = set()
     monkeypatch.setattr(ac, "get_torch_version", lambda: Version("2.12.0"))
