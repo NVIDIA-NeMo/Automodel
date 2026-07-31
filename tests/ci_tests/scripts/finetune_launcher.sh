@@ -123,7 +123,9 @@ if [[ "$HAS_ROBUSTNESS" == "true" ]]; then
     # A real checkpoint restart crosses a process boundary. Large distributed
     # recipes also retain enough CUDA, PP, scheduler, and dataloader ownership
     # that rebuilding several trainers in one interpreter is not reliable.
-    for ROBUSTNESS_PHASE in train_and_save automodel_reload resume_baseline resume; do
+    read -r -a ROBUSTNESS_PHASES <<< \
+      "${CHECKPOINT_ROBUSTNESS_PHASES:-train_and_save automodel_reload resume_baseline resume}"
+    for ROBUSTNESS_PHASE in "${ROBUSTNESS_PHASES[@]}"; do
       PHASE_LAUNCH_CMD="$ROBUSTNESS_LAUNCH_CMD"
       if [[ "$PHASE_LAUNCH_CMD" == torchrun* ]]; then
         PHASE_LAUNCH_CMD="${PHASE_LAUNCH_CMD/--rdzv_id=${SLURM_JOB_ID}-robustness/--rdzv_id=${SLURM_JOB_ID}-robustness-${ROBUSTNESS_PHASE}}"

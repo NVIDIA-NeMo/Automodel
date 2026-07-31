@@ -28,6 +28,7 @@ Launch: torchrun --nproc-per-node=<N> -m <this_module> --config <config.yaml>
 from __future__ import annotations
 
 import gc
+import hashlib
 import json
 import os
 import sys
@@ -285,6 +286,27 @@ def _kl_divergence_from_logits(reference_logits: torch.Tensor, candidate_logits:
 def _cosine_similarity_from_logits(reference_logits: torch.Tensor, candidate_logits: torch.Tensor) -> float:
     """Cosine similarity over flattened float32 logits."""
     return F.cosine_similarity(reference_logits.flatten().float(), candidate_logits.flatten().float(), dim=0).item()
+
+
+def _trainable_parameter_digests(model_parts: list[torch.nn.Module]) -> dict[str, dict[str, object]]:
+    """Hash every rank-local trainable parameter for exact PEFT save/reload comparison."""
+    digests: dict[str, dict[str, object]] = {}
+    for part_index, model_part in enumerate(model_parts):
+        for name, parameter in model_part.named_parameters():
+            if not parameter.requires_grad:
+                continue
+            local_parameter = parameter.detach()
+            if isinstance(local_parameter, DTensor):
+                local_parameter = local_parameter.to_local()
+            cpu_parameter = local_parameter.contiguous().cpu()
+            raw_bytes = cpu_parameter.view(torch.uint8).numpy()
+            key = f"part_{part_index}:{name.replace('_checkpoint_wrapped_module.', '')}"
+            digests[key] = {
+                "dtype": str(cpu_parameter.dtype),
+                "shape": list(cpu_parameter.shape),
+                "sha256": hashlib.sha256(raw_bytes).hexdigest(),
+            }
+    return digests
 
 
 def _materialize_config_value(value):
@@ -1292,12 +1314,19 @@ def _run_process_isolated_checkpoint_phase(
         device = next(trainer.model_parts[0].parameters()).device
         reference_logits = _get_logits(trainer.model_parts[0], input_ids, device, trainer=trainer)
         _checkpoint_paths(cfg)
+        artifact_dir = _robustness_artifact_dir(cfg)
         if _rank0():
-            artifact_dir = _robustness_artifact_dir(cfg)
             artifact_dir.mkdir(parents=True, exist_ok=True)
             torch.save(reference_logits, artifact_dir / "reference_logits.pt")
         _barrier()
-        _report_phase("Isolated train/save: reference logits persisted; exiting phase")
+        if hasattr(cfg, "peft"):
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            trainable_digests = _trainable_parameter_digests(trainer.model_parts)
+            (artifact_dir / f"trainable_parameter_digests_rank_{rank}.json").write_text(
+                json.dumps(trainable_digests, sort_keys=True)
+            )
+            _barrier()
+        _report_phase("Isolated train/save: reference artifacts persisted; exiting phase")
         return
 
     if phase == "automodel_reload":
@@ -1341,6 +1370,45 @@ def _run_process_isolated_checkpoint_phase(
             if _rank0():
                 _cleanup_input_ids_sync(cfg)
             _barrier()
+
+        if is_peft:
+            artifact_dir = _robustness_artifact_dir(cfg)
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            expected_digests_path = artifact_dir / f"trainable_parameter_digests_rank_{rank}.json"
+            local_digest_failure = None
+            if not expected_digests_path.exists():
+                local_digest_failure = f"rank {rank}: missing trainable-parameter digest {expected_digests_path}"
+            else:
+                expected_digests = json.loads(expected_digests_path.read_text())
+                restored_digests = _trainable_parameter_digests(restored_trainer.model_parts)
+                if restored_digests != expected_digests:
+                    missing = sorted(set(expected_digests) - set(restored_digests))
+                    unexpected = sorted(set(restored_digests) - set(expected_digests))
+                    mismatched = sorted(
+                        key
+                        for key in set(expected_digests) & set(restored_digests)
+                        if expected_digests[key] != restored_digests[key]
+                    )
+                    local_digest_failure = (
+                        f"rank {rank}: trainable parameters differ after reload; missing={missing[:5]}, "
+                        f"unexpected={unexpected[:5]}, mismatched={mismatched[:5]}"
+                    )
+
+            digest_failures = [local_digest_failure]
+            if dist.is_initialized():
+                digest_failures = [None] * dist.get_world_size()
+                dist.all_gather_object(digest_failures, local_digest_failure)
+            failure_message = None
+            if _rank0():
+                failures = [failure for failure in digest_failures if failure is not None]
+                if failures:
+                    failure_message = "Trainable PEFT parameter fingerprint mismatch:\n" + "\n".join(failures)
+                else:
+                    print(
+                        f"[Isolated AutoModel reload] exact trainable-parameter fingerprints matched on "
+                        f"{len(digest_failures)} ranks"
+                    )
+            _raise_distributed_failure(failure_message)
 
         device = next(restored_trainer.model_parts[0].parameters()).device
         restored_logits = _get_logits(

@@ -2938,6 +2938,35 @@ def test_vlm_setup_applies_prewarm_config(monkeypatch):
     assert pp_mesh is None
 
 
+def test_vlm_setup_threads_pp_group_to_checkpointer(monkeypatch):
+    cfg = _minimal_vlm_cfg(cp_size=1, rope_fusion=False)
+    _patch_vlm_setup_minimals(monkeypatch, cp_size=1)
+    pp_group = object()
+    build_kwargs = {}
+    checkpoint_config = SimpleNamespace(checkpoint_dir="ckpts", model_state_dict_keys=None)
+
+    def _build_checkpointer(**kwargs):
+        build_kwargs.update(kwargs)
+        return SimpleNamespace(
+            config=checkpoint_config,
+            load_base_model=lambda *args, **kwargs: None,
+            maybe_wait_for_staging=lambda: None,
+            close=lambda: None,
+        )
+
+    checkpoint_config.build = _build_checkpointer
+    monkeypatch.setattr(
+        "nemo_automodel.recipes._typed_config.RecipeConfig.checkpoint",
+        property(lambda self: checkpoint_config),
+    )
+    monkeypatch.setattr(FinetuneRecipeForVLM, "_get_pp_group", lambda self: pp_group)
+
+    trainer = FinetuneRecipeForVLM(cfg)
+    trainer.setup()
+
+    assert build_kwargs["pp_group"] is pp_group
+
+
 def test_vlm_rope_fusion_disabled_when_cp_gt_1(monkeypatch):
     """rope_fusion should be set to False during VLM setup when cp_size > 1."""
     cfg = _minimal_vlm_cfg(cp_size=2, rope_fusion=True)

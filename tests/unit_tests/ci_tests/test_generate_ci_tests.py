@@ -59,6 +59,8 @@ def test_generate_checkpoint_robustness_process_isolation(tmp_path):
     (tmp_path / config).write_text(
         """
 ci:
+  env_vars:
+    CHECKPOINT_ROBUSTNESS_PHASES: "train_and_save automodel_reload"
   checkpoint_robustness:
     process_isolation: true
     skip_hf_reload: true
@@ -70,3 +72,4 @@ ci:
 
     assert jobs[""]["variables"]["HAS_ROBUSTNESS"] == "true"
     assert jobs[""]["variables"]["CHECKPOINT_ROBUSTNESS_PROCESS_ISOLATION"] == "true"
+    assert jobs[""]["variables"]["CHECKPOINT_ROBUSTNESS_PHASES"] == "train_and_save automodel_reload"

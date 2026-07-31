@@ -36,6 +36,7 @@ from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm
     _load_input_ids_once,
     _post_load_dequant_max_memory,
     _record_deferred_failure,
+    _trainable_parameter_digests,
     _wait_for_hf_reload_rank0,
 )
 from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_vlm import _get_vlm_input_ids
@@ -243,6 +244,24 @@ def test_extract_custom_args_accepts_isolated_phase():
 
     assert custom["isolated_phase"] == "train_and_save"
     assert remaining == ["--other-arg"]
+
+
+def test_trainable_parameter_digests_hash_only_trainable_parameters():
+    first_part = torch.nn.Linear(2, 2, bias=False)
+    second_part = torch.nn.Linear(2, 1, bias=False)
+    second_part.weight.requires_grad_(False)
+    with torch.no_grad():
+        first_part.weight.copy_(torch.tensor([[1.0, 2.0], [3.0, 4.0]]))
+
+    before = _trainable_parameter_digests([first_part, second_part])
+    with torch.no_grad():
+        first_part.weight[0, 0] = 5.0
+    after = _trainable_parameter_digests([first_part, second_part])
+
+    assert set(before) == {"part_0:weight"}
+    assert before["part_0:weight"]["dtype"] == "torch.float32"
+    assert before["part_0:weight"]["shape"] == [2, 2]
+    assert before["part_0:weight"]["sha256"] != after["part_0:weight"]["sha256"]
 
 
 def test_keep_hf_modules_in_fp32_uses_strict_dtype_plan_and_restores_class_state(tmp_path):
