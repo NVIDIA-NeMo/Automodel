@@ -915,7 +915,9 @@ class Checkpointer:
         state_dict = _maybe_adapt_state_dict_to_hf(
             model_state.model[0],
             state_dict,
-            quantization=self.config.dequantize_base_checkpoint,
+            # Training checkpoints are saved from the dequantized native model.
+            # Only base-checkpoint initialization needs FP8 scale destinations.
+            quantization=bool(is_init_step and self.config.dequantize_base_checkpoint),
             device_mesh=self.moe_mesh,
         )
 

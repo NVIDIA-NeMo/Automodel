@@ -1314,6 +1314,103 @@ def test_load_model_uses_state_dict_adapter_from_ddp_module(tmp_path):
     torch.testing.assert_close(encoder.model.weight, checkpoint_weight)
 
 
+@pytest.mark.parametrize(("is_init_step", "expected_quantization"), [(True, True), (False, False)])
+def test_load_model_only_requests_quantized_adapter_keys_for_base_checkpoint(
+    tmp_path, is_init_step, expected_quantization
+):
+    """FP8 source metadata is requested for base initialization, not training resume."""
+    model = torch.nn.Linear(2, 2, bias=False)
+    adapter = MagicMock()
+    model_state_dict = model.state_dict()
+    adapter.to_hf.return_value = model_state_dict
+    adapter.from_hf.return_value = model_state_dict
+    model.state_dict_adapter = adapter
+
+    config = CheckpointingConfig(
+        checkpoint_dir=str(tmp_path),
+        model_cache_dir=str(tmp_path / "cache"),
+        model_repo_id="test/model",
+        save_consolidated=False,
+        dequantize_base_checkpoint=True,
+    )
+    with patch("torch.distributed.is_initialized", return_value=False):
+        checkpointer = Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0)
+
+    with (
+        patch("os.path.exists", return_value=True),
+        patch("nemo_automodel.components.checkpoint.checkpointing._is_safetensors_checkpoint", return_value=False),
+        patch("nemo_automodel.components.checkpoint.checkpointing._is_bin_checkpoint", return_value=False),
+        patch.object(checkpointer, "_get_storage_reader", return_value=None),
+        patch.object(checkpointer, "_do_load", return_value=model_state_dict),
+    ):
+        checkpointer.load_model(model, model_path=str(tmp_path / "model"), is_init_step=is_init_step)
+
+    assert adapter.to_hf.call_args.kwargs["quantization"] is expected_quantization
+
+
+def test_training_checkpoint_resume_ignores_base_fp8_metadata(tmp_path):
+    """A dequantized training checkpoint resumes without source-only FP8 scale keys."""
+
+    class QuantizedSourceAdapter:
+        def to_hf(self, state_dict: dict[str, torch.Tensor], **kwargs: object) -> dict[str, torch.Tensor]:
+            """Convert model state while optionally requesting source FP8 metadata.
+
+            Args:
+                state_dict: Mapping whose tensor values have arbitrary model-defined shapes.
+                **kwargs: Adapter options, including whether source quantization metadata is required.
+
+            Returns:
+                Mapping whose tensor values preserve the input tensors' model-defined shapes,
+                plus a scalar source-only activation scale when quantization is requested.
+            """
+            converted = dict(state_dict)
+            if kwargs.get("quantization", False):
+                converted["weight_activation_scale"] = torch.ones(())
+            return converted
+
+        def from_hf(
+            self,
+            state_dict: dict[str, torch.Tensor],
+            device_mesh: object | None = None,
+        ) -> dict[str, torch.Tensor]:
+            """Convert loaded state back to the native model mapping.
+
+            Args:
+                state_dict: Mapping whose tensor values have arbitrary model-defined shapes.
+                device_mesh: Optional mesh describing the tensors' distributed placements.
+
+            Returns:
+                Mapping whose tensor values preserve the input tensors' model-defined shapes.
+            """
+            return {key: value for key, value in state_dict.items() if key != "weight_activation_scale"}
+
+    model = torch.nn.Linear(2, 2, bias=False)
+    model.state_dict_adapter = QuantizedSourceAdapter()
+    expected_weight = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    with torch.no_grad():
+        model.weight.copy_(expected_weight)
+
+    config = CheckpointingConfig(
+        checkpoint_dir=str(tmp_path),
+        model_save_format="torch_save",
+        model_cache_dir=str(tmp_path / "cache"),
+        model_repo_id="test/model",
+        save_consolidated=False,
+        dequantize_base_checkpoint=True,
+    )
+    with patch("torch.distributed.is_initialized", return_value=False):
+        checkpointer = Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0)
+
+    checkpoint_path = tmp_path / "step_1"
+    checkpointer.save_model(model, str(checkpoint_path))
+    with torch.no_grad():
+        model.weight.zero_()
+
+    checkpointer.load_model(model, str(checkpoint_path / "model"))
+
+    torch.testing.assert_close(model.weight, expected_weight)
+
+
 # =============================================================================
 # Tests for load_model: custom model uses DCP path, not the fast safetensors path
 # =============================================================================

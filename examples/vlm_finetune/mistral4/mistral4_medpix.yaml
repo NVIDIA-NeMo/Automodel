@@ -119,7 +119,8 @@ wandb:
 ci:
   recipe_owner: akoumpa
   nodes: 4
-  time: "00:30:00"
+  # Checkpoint robustness reaches resume close to 30 minutes on EOS.
+  time: "01:00:00"
   checkpoint_robustness:
     # PP=4 with pp_microbatch_size=1 requires at least four pipeline microbatches.
     step_scheduler.local_batch_size: 4
