@@ -15,7 +15,7 @@ metadata:
 ## Purpose
 
 This skill guides implementation of new model architectures in NeMo AutoModel. Follow the five phases in order.
-<!-- NVSkills signature refresh requested for AM-519. -->
+<!-- NVSkills signature refresh requested after PR #2998 (2026-07-31). -->
 
 ## Instructions
 
