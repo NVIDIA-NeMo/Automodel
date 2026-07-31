@@ -148,11 +148,23 @@ wandb:
 ci:
   # pp_size(8) * ep_size(8) = 64 GPUs => 8 nodes (8 H100/node).
   nodes: 8
-  time: "01:30:00"
+  time: "00:35:00"
+  env_vars:
+    CHECKPOINT_ROBUSTNESS_PHASES: "train_and_save automodel_reload"
+    CHECKPOINT_ROBUSTNESS_ALL_RANK_WATCHDOG: "1"
+    CHECKPOINT_ROBUSTNESS_LOAD_DIAGNOSTICS: "1"
+    CHECKPOINT_ROBUSTNESS_WATCHDOG_SECONDS: "300"
+    TORCH_NCCL_ASYNC_ERROR_HANDLING: "1"
+    TORCH_NCCL_DESYNC_DEBUG: "1"
+    TORCH_NCCL_DUMP_ON_TIMEOUT: "1"
+    TORCH_NCCL_TRACE_BUFFER_SIZE: "2000"
   checkpoint_robustness:
     # PP=8 with pp_microbatch_size=1 requires at least eight pipeline microbatches.
     step_scheduler.global_batch_size: 64
     step_scheduler.local_batch_size: 8
+    # One optimizer step is enough to materialize Adam state for the reload diagnostic.
+    step_scheduler.max_steps: 1
+    step_scheduler.ckpt_every_steps: 1
     # Match a real restart and let each large trainer exit before the next one starts.
     process_isolation: true
     hf_kl_threshold: 2e-2

@@ -660,6 +660,17 @@ class BaseRecipe:
 
         return model, optimizer, scheduler
 
+    def _checkpoint_debug_marker(self, message: str) -> None:
+        """Emit an all-rank checkpoint marker for the temporary Step3.7 diagnostic run."""
+        if os.environ.get("CHECKPOINT_ROBUSTNESS_LOAD_DIAGNOSTICS", "0") != "1":
+            return
+        rank = dist.get_rank() if dist.is_initialized() else int(os.environ.get("RANK", "0"))
+        world_size = dist.get_world_size() if dist.is_initialized() else int(os.environ.get("WORLD_SIZE", "1"))
+        print(
+            f"[checkpoint_load][{datetime.now().strftime('%H:%M:%S')}][rank={rank}/{world_size}] {message}",
+            flush=True,
+        )
+
     def load_checkpoint(self, restore_from: str | None = None):
         """
         Loads checkpoint with automatic compatibility checking.
@@ -677,7 +688,12 @@ class BaseRecipe:
                          - "epoch_0_step_100": Subdirectory name (relative to checkpoint_dir)
                          - "./path/to/checkpoint": Absolute or relative path
         """
+        self._checkpoint_debug_marker(
+            f"load_checkpoint entered: restore_from={restore_from!r} "
+            f"checkpoint_dir={self.checkpointer.config.checkpoint_dir}"
+        )
         if not self.checkpointer.config.enabled:
+            self._checkpoint_debug_marker("checkpointing disabled; returning")
             if _is_rank_0() and restore_from is not None:
                 print("Enable checkpointing to resume from a checkpoint, skipping...", flush=True)
             return
@@ -685,7 +701,9 @@ class BaseRecipe:
         is_rank_0 = _is_rank_0()
 
         if restore_from:
+            self._checkpoint_debug_marker("resolving explicit checkpoint")
             ckpt_dir = resolve_restore_from_to_checkpoint_dir(self.checkpointer.config.checkpoint_dir, restore_from)
+            self._checkpoint_debug_marker(f"explicit checkpoint resolved: {ckpt_dir}")
             if ckpt_dir is None:
                 # LATEST keyword with no checkpoints found
                 if is_rank_0:
@@ -694,10 +712,14 @@ class BaseRecipe:
                         f"{self.checkpointer.config.checkpoint_dir}. Starting fresh."
                     )
                 return
+            self._checkpoint_debug_marker("validating explicit checkpoint directory")
             self._validate_checkpoint_dir_exists(ckpt_dir, restore_from=restore_from, is_rank_0=is_rank_0)
+            self._checkpoint_debug_marker("explicit checkpoint directory validated")
         else:
             # Auto-detect latest checkpoint
+            self._checkpoint_debug_marker("discovering latest checkpoint")
             ckpt_dir = find_latest_checkpoint(self.checkpointer.config.checkpoint_dir)
+            self._checkpoint_debug_marker(f"latest checkpoint discovery complete: {ckpt_dir}")
             if ckpt_dir is None:
                 return
             ckpt_dir = str(ckpt_dir)
@@ -709,7 +731,9 @@ class BaseRecipe:
         #  - Explicitly requested checkpoints still proceed (user's intent).
         cfg = getattr(self, "cfg", None)
         if cfg is not None:
+            self._checkpoint_debug_marker("checking checkpoint config compatibility")
             ok, reason = _is_checkpoint_model_config_compatible(cfg, ckpt_dir)
+            self._checkpoint_debug_marker(f"checkpoint config compatibility complete: ok={ok} reason={reason}")
             if not ok:
                 if not restore_from:
                     # Auto-detected: skip restore to avoid loading stale/incompatible checkpoints.
@@ -734,7 +758,9 @@ class BaseRecipe:
         if is_rank_0:
             print(f"Loading checkpoint from {ckpt_dir}", flush=True)
 
+        self._checkpoint_debug_marker("loading tracked recipe state")
         model, optimizer, scheduler = self._load_checkpoint_tracked_state(ckpt_dir)
+        self._checkpoint_debug_marker("tracked recipe state load complete")
 
         # Composite models (e.g. ``Gemma4WithDrafter``) save weights to multiple
         # HF-format sub-directories instead of a single ``model/`` dir. Dispatch
@@ -751,9 +777,13 @@ class BaseRecipe:
         if isinstance(candidate, DistributedDataParallel):
             candidate = candidate.module
         if hasattr(candidate, "load_pretrained") and hasattr(candidate.load_pretrained, "__func__"):
+            self._checkpoint_debug_marker("loading model through composite load_pretrained")
             candidate.load_pretrained(ckpt_dir, checkpointer=self.checkpointer)
         else:
+            self._checkpoint_debug_marker("loading model checkpoint")
             self.checkpointer.load_model(model, os.path.join(ckpt_dir, "model"))
+        self._checkpoint_debug_marker("model checkpoint load complete")
+        self._checkpoint_debug_marker("loading optimizer checkpoint")
         self.checkpointer.load_optimizer(
             optimizer,
             model,
@@ -761,6 +791,7 @@ class BaseRecipe:
             scheduler,
             optimizer_part_ids=self._get_optimizer_checkpoint_part_ids(),
         )
+        self._checkpoint_debug_marker("optimizer checkpoint load complete")
 
     def _log_experiment_details(self):
         """Log metadata and config on main rank using YAML markers."""

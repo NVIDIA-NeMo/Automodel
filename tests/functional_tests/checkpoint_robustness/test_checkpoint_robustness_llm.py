@@ -1175,16 +1175,19 @@ def _report_phase(message: str) -> None:
 
 
 def _start_preflight_watchdog() -> None:
-    """Schedule repeated rank-0 tracebacks if checkpoint preflight stalls."""
-    if _preinit_global_rank() == 0:
+    """Schedule repeated tracebacks if checkpoint preflight or reload stalls."""
+    all_ranks = os.environ.get("CHECKPOINT_ROBUSTNESS_ALL_RANK_WATCHDOG", "0") == "1"
+    if all_ranks or _preinit_global_rank() == 0:
         stream = sys.__stderr__ or sys.stderr
         faulthandler.enable(file=stream)
-        faulthandler.dump_traceback_later(300, repeat=True, file=stream)
+        watchdog_seconds = int(os.environ.get("CHECKPOINT_ROBUSTNESS_WATCHDOG_SECONDS", "300"))
+        faulthandler.dump_traceback_later(watchdog_seconds, repeat=True, file=stream)
 
 
 def _stop_preflight_watchdog() -> None:
     """Cancel the checkpoint-preflight traceback timer on success."""
-    if _preinit_global_rank() == 0:
+    all_ranks = os.environ.get("CHECKPOINT_ROBUSTNESS_ALL_RANK_WATCHDOG", "0") == "1"
+    if all_ranks or _preinit_global_rank() == 0:
         faulthandler.cancel_dump_traceback_later()
 
 
@@ -1368,10 +1371,10 @@ def _run_process_isolated_checkpoint_phase(
             cfg.model.pretrained_model_name_or_path = str(consolidated_dir)
             cfg.checkpoint.enabled = False
 
-        _stop_preflight_watchdog()
         _report_phase("Isolated AutoModel reload: starting trainer setup")
         restored_trainer = recipe_cls(cfg)
         restored_trainer.setup()
+        _stop_preflight_watchdog()
         _report_phase("Isolated AutoModel reload: trainer setup complete")
         if tokenizer_name is not None and dist.is_initialized() and dist.get_world_size() > 1:
             _barrier()

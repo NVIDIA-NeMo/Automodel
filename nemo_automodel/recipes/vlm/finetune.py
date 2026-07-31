@@ -680,15 +680,21 @@ class FinetuneRecipeForVLM(BaseRecipe):
         restore_from = self.cfg.get("checkpoint.restore_from", None)
 
         # Initialize JSONL loggers
+        self._checkpoint_debug_marker("VLM setup: creating training metric logger")
         self.metric_logger_train = build_metric_logger(
             pathlib.Path(self.checkpointer.config.checkpoint_dir) / "training.jsonl"
         )
+        self._checkpoint_debug_marker("VLM setup: training metric logger created")
+        self._checkpoint_debug_marker("VLM setup: creating validation metric logger")
         self.metric_logger_valid = build_metric_logger(
             pathlib.Path(self.checkpointer.config.checkpoint_dir) / "validation.jsonl"
         )
+        self._checkpoint_debug_marker("VLM setup: validation metric logger created")
 
         # Optionally resume
+        self._checkpoint_debug_marker("VLM setup: entering checkpoint restore")
         self.load_checkpoint(restore_from)
+        self._checkpoint_debug_marker("VLM setup: checkpoint restore complete")
 
         # Log step scheduler details
         self._log_step_scheduler_details(self.step_scheduler)
