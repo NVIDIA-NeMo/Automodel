@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import logging
+import os
 from functools import partial
 from typing import Any, Optional
 
@@ -242,7 +243,8 @@ def _set_peft_state_dict(model: torch.nn.Module, state_dict: dict[str, Any]) -> 
     # Strip _checkpoint_wrapped_module. from FQNs to match DCP's normalization.
     # Without this, activation checkpointing causes key mismatches on reload.
     param_dict = {name.replace("_checkpoint_wrapped_module.", ""): param for name, param in model.named_parameters()}
-    loaded, skipped = 0, 0
+    loaded_names: set[str] = set()
+    skipped = 0
 
     for name, saved_tensor in state_dict.items():
         if name not in param_dict:
@@ -263,12 +265,28 @@ def _set_peft_state_dict(model: torch.nn.Module, state_dict: dict[str, Any]) -> 
             param.data.to_local().copy_(local_shard)
         else:
             param.data.copy_(saved_tensor.to(param.data.device))
-        loaded += 1
+        loaded_names.add(name)
 
-    if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
-        import logging
-
-        logging.getLogger(__name__).info(f"_set_peft_state_dict: loaded {loaded} params, skipped {skipped} keys")
+    expected_names = {name for name, param in param_dict.items() if param.requires_grad}
+    missing_names = sorted(expected_names - loaded_names)
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    diagnostics_enabled = os.environ.get("CHECKPOINT_ROBUSTNESS_LOAD_DIAGNOSTICS", "0") == "1"
+    if diagnostics_enabled or rank == 0:
+        logging.getLogger(__name__).info(
+            "_set_peft_state_dict: rank=%d expected=%d loaded=%d missing=%d skipped=%d",
+            rank,
+            len(expected_names),
+            len(loaded_names),
+            len(missing_names),
+            skipped,
+        )
+    if missing_names:
+        logging.getLogger(__name__).warning(
+            "_set_peft_state_dict: rank=%d did not restore %d trainable parameters; first missing keys: %s",
+            rank,
+            len(missing_names),
+            missing_names[:5],
+        )
 
 
 def _drop_outer_prefix(sd: dict[str, Any], prefix: str = _PREFIX) -> None:
