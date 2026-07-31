@@ -1,0 +1,85 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Single-GPU SCDD smoke: a few optimizer steps of the `scdd` dLLM strategy on a
+# tiny public checkpoint and a committed 64-row chat fixture, so the whole path
+# (corruption -> bidirectional forward -> SCDD NELBO -> backward -> step) runs in
+# seconds without a large download. Real training configs live in
+# examples/dllm_sft/ -- this one exists to prove the wiring, not to converge.
+
+recipe: DiffusionLMSFTRecipe
+
+step_scheduler:
+  global_batch_size: 4
+  local_batch_size: 2
+  max_steps: 3
+  num_epochs: 1
+  ckpt_every_steps: 1000
+  val_every_steps: 1000
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 5
+
+seed: 42
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: hf-internal-testing/tiny-random-MistralForCausalLM
+  torch_dtype: float32
+
+checkpoint:
+  enabled: false
+
+distributed:
+  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
+  dp_size: none
+  tp_size: 1
+  cp_size: 1
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dllm:
+  mode: scdd
+  # The tiny Mistral tokenizer has no mask token; reserve the last vocab slot,
+  # exactly as a real SCDD run would reserve the checkpoint's [MASK] id.
+  mask_token_id: 31999
+  vocab_size: 32000
+  eps: 0.001
+  num_timesteps: 1000
+  uniform_ratio: 0.1
+  schedule_shape: 1.0
+  schedule_peak: 0.5
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1.0e-4
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
+  path_or_dataset_id: tests/functional_tests/dllm/scdd_smoke_data.jsonl
+  seq_length: 64
+  padding: max_length
+  truncation: true
+  unshifted: true
+  # The tiny test tokenizer ships no chat template; reuse the LLaDA one so the
+  # assistant turn is tagged and the answer-only loss mask is populated.
+  chat_template: examples/dllm_sft/llada_chat_template.jinja
+  tokenizer:
+    pretrained_model_name_or_path: hf-internal-testing/tiny-random-MistralForCausalLM
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
