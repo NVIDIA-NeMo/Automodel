@@ -373,8 +373,8 @@ jobs:
 
           export PATH="${UV_PROJECT_ENVIRONMENT}/bin/:$PATH"
 
-          # Validate a regular uv environment; NGC jobs intentionally reuse system packages.
-          uv venv ${UV_PROJECT_ENVIRONMENT}
+          # Keep runner packages isolated, but seed pip for the check-imports action.
+          uv venv ${UV_PROJECT_ENVIRONMENT} --seed
 
           uv sync --link-mode copy --locked --only-group build
 
