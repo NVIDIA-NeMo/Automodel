@@ -31,11 +31,13 @@ This package provides that implementation, split by responsibility:
 
 Integration follows the model-owned CP convention of
 :func:`nemo_automodel.components.distributed.cp_utils.make_cp_batch_and_ctx`: a model
-attaches :func:`make_cp_blockdiag_batch_and_ctx` to the batch as ``_cp_make_batch_fn``
-and routes its softmax attention through :func:`cp_blockdiag_sdpa` while the returned
-context is active. For ``cp_size == 1`` packed runs, the model scopes the varlen SDPA
-patch to its attention forwards with :func:`attach_cp1_packed_varlen_hooks` and arms
-the per-forward state with :func:`enable_cp1_packed_varlen` /
+returns a
+:class:`~nemo_automodel.components.distributed.context_parallel.sharder.ContextParallelSharder`
+whose batch verb is :func:`make_cp_blockdiag_batch_and_ctx`, and routes its softmax
+attention through :func:`cp_blockdiag_sdpa` while the returned context is active.
+For ``cp_size == 1`` packed runs, the model scopes the varlen SDPA patch to its
+attention forwards with :func:`attach_cp1_packed_varlen_hooks` and arms the
+per-forward state with :func:`enable_cp1_packed_varlen` /
 :func:`disable_cp1_packed_varlen`.
 
 Only these integration entry points are exported; everything else (knob
@@ -51,11 +53,17 @@ from nemo_automodel.components.distributed.blockdiag_cp.packed import (
     enable_cp1_packed_varlen,
 )
 from nemo_automodel.components.distributed.blockdiag_cp.runtime import cp_blockdiag_sdpa
-from nemo_automodel.components.distributed.blockdiag_cp.state import configure_cp_varlen
+from nemo_automodel.components.distributed.blockdiag_cp.state import (
+    BlockdiagCpModelState,
+    configure_cp_varlen,
+    current_blockdiag_cp_state,
+)
 
 __all__ = [
     "attach_cp1_packed_varlen_hooks",
+    "BlockdiagCpModelState",
     "configure_cp_varlen",
+    "current_blockdiag_cp_state",
     "cp_blockdiag_sdpa",
     "cp1_packed_varlen_backend",
     "disable_cp1_packed_varlen",

@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import pickle
+import threading
 import time
 from dataclasses import dataclass
 from datetime import timedelta
@@ -528,7 +529,7 @@ class Checkpointer:
             self._optim_ctx.stager = DefaultStager()
             self._model_ctx.process_group = _new_gloo_process_group(process_group)
             self._optim_ctx.process_group = _new_gloo_process_group(process_group)
-        elif (
+        if (
             torch.distributed.is_initialized()
             and torch.distributed.get_world_size(group=process_group) > 1
             and _should_write_hf_metadata(self.config)
@@ -541,6 +542,8 @@ class Checkpointer:
                 process_group,
                 timeout=timedelta(minutes=self.config.consolidation_timeout_minutes),
             )
+        self._consolidation_thread: threading.Thread | None = None
+        self._consolidation_error: BaseException | None = None
 
         self._addons = []
         if _should_write_hf_metadata(self.config):
@@ -583,10 +586,15 @@ class Checkpointer:
 
         # Because this call lies outside of the dcp save call, we need to consolidate on all ranks on the main process
         # of all ranks, which lies on the critical path. Therefore, we can only do this outside of async mode.
+        # In async mode the same distributed consolidation is deferred to a background thread on every rank that
+        # waits for the async upload to finish, instead of the storage writer's single-rank finish() consolidation.
         # If single_rank_consolidation is set, we skip distributed consolidation and let rank 0 handle it
         # via the storage writer's finish() method - useful for Unity Catalog Volumes.
         consolidate_on_all_ranks = (
             should_write_consolidated and not self.config.is_async and not self.config.single_rank_consolidation
+        )
+        defer_consolidation = (
+            should_write_consolidated and self.config.is_async and not self.config.single_rank_consolidation
         )
         consolidation_process_group = (
             self._consolidation_process_group if self._consolidation_process_group is not None else self.process_group
@@ -638,7 +646,11 @@ class Checkpointer:
         self._maybe_write_offline_consolidation_script(model_dir)
 
         storage_writer = self._get_storage_writer(
-            consolidated_dir, fqn_to_file_index_mapping, fqn_to_dtype_mapping, model_dir, consolidate_on_all_ranks
+            consolidated_dir,
+            fqn_to_file_index_mapping,
+            fqn_to_dtype_mapping,
+            model_dir,
+            consolidate_on_all_ranks or defer_consolidation,
         )
         self._model_ctx.future = self._do_save(state_dict, model_dir, storage_writer)
 
@@ -665,6 +677,15 @@ class Checkpointer:
                     _maybe_rename_index_for_diffusers(consolidated_dir)
             if is_rank_0():
                 logger.info("Successfully exported consolidated HF safetensors to %s.", consolidated_dir)
+        elif defer_consolidation:
+            self._schedule_deferred_consolidation(
+                self._model_ctx.future,
+                model_dir,
+                consolidated_dir,
+                fqn_to_file_index_mapping,
+                fqn_to_dtype_mapping,
+                consolidation_process_group,
+            )
         self._maybe_log_final_offline_consolidation_hint(model_dir, is_final_checkpoint)
 
     @torch.no_grad()
@@ -1081,16 +1102,22 @@ class Checkpointer:
         #   init.zeros_(module.weight[module.padding_idx]) on the embedding layer, which
         #   triggers DTensor redistribute and fails with sharded (TP) embeddings.
         # - NemotronHForCausalLM: the HF remote code's _init_weights uses dt_bias.copy_()
-        #   which fails with DTensors. This applies to:
-        #   - v2 (non-MoE, no n_routed_experts): always uses HF remote code.
-        #   - v3 (MoE, has n_routed_experts) with force_hf=True: also uses HF remote code
-        #     (detected via model.backbone attribute). When force_hf=False, v3 uses our custom
-        #     implementation (model.model with ModuleDict layers) which handles this correctly.
+        #   which fails with DTensors. This applies to the HF-remote-code path only
+        #   (detected via the model.backbone attribute), for both:
+        #   - dense/v2 (no n_routed_experts) under force_hf=True, and
+        #   - v3 (MoE, has n_routed_experts) under force_hf=True.
+        #   With force_hf=False, both dense and v3 use our custom implementation
+        #   (model.model with ModuleDict layers), which runs its own initialize_weights
+        #   correctly, so the skip must NOT apply there.
         try:
             model_class = model.config.architectures[0]
         except Exception:
             model_class = ""
-        is_nemotron_v2 = model_class == "NemotronHForCausalLM" and not getattr(model.config, "n_routed_experts", None)
+        is_nemotron_v2 = (
+            model_class == "NemotronHForCausalLM"
+            and not getattr(model.config, "n_routed_experts", None)
+            and hasattr(model, "backbone")  # HF remote-code path only; custom dense runs its own init
+        )
         is_nemotron_v3_hf = (
             model_class == "NemotronHForCausalLM"
             and getattr(model.config, "n_routed_experts", None)  # is Nemotron V3
@@ -1217,14 +1244,89 @@ class Checkpointer:
 
     def async_wait(self) -> None:
         """
-        Wait for the async save to finish.
+        Wait for the async save (and any deferred consolidation) to finish.
         """
         if self._model_ctx.future is not None:
             self._model_ctx.future.upload_completion.result()
             self._model_ctx.future = None
+            self._release_async_stager(self._model_ctx)
         if self._optim_ctx.future is not None:
             self._optim_ctx.future.upload_completion.result()
             self._optim_ctx.future = None
+            self._release_async_stager(self._optim_ctx)
+        self._join_deferred_consolidation()
+
+    @staticmethod
+    def _release_async_stager(context: _AsyncSaveContext) -> None:
+        """Close a completed async stager so the next save uses a fresh instance."""
+        if context.stager is not None:
+            context.stager.close()
+            context.stager = None
+
+    def _schedule_deferred_consolidation(
+        self,
+        future: "AsyncSaveResponse | None",
+        model_dir: str,
+        consolidated_dir: str,
+        fqn_to_index_mapping: dict[str, int] | None,
+        fqn_to_dtype_mapping: dict[str, str] | None,
+        process_group: "torch.distributed.ProcessGroup | None",
+    ) -> None:
+        """
+        Consolidate HF safetensors on a background thread once the async upload completes.
+
+        Every rank schedules the same distributed consolidation used in sync mode, so the
+        shards written by the async save are merged in parallel across ranks without
+        blocking the training loop. Collectives inside the consolidation run on the
+        dedicated Gloo group created at init.
+
+        Args:
+            future: Async save response whose ``upload_completion`` gates the consolidation.
+            model_dir: Directory holding the sharded safetensors written by the async save.
+            consolidated_dir: Output directory for the consolidated HF safetensors.
+            fqn_to_index_mapping: Mapping from tensor FQN to consolidated output file index.
+            fqn_to_dtype_mapping: Optional mapping from tensor FQN to original HF dtype string.
+            process_group: Group the consolidation collectives run on; the same one the
+                synchronous path and the save addons use.
+        """
+        self._join_deferred_consolidation()
+
+        def _consolidate() -> None:
+            try:
+                if future is not None:
+                    future.upload_completion.result()
+                consolidate_safetensors_files_on_every_rank(
+                    input_dir=model_dir,
+                    output_dir=consolidated_dir,
+                    fqn_to_index_mapping=fqn_to_index_mapping,
+                    num_threads=5,
+                    use_staging=self.config.staging_dir is not None,
+                    staging_dir=self.config.staging_dir,
+                    fqn_to_dtype_mapping=fqn_to_dtype_mapping,
+                    process_group=process_group,
+                )
+                if self.config.diffusers_compatible and is_rank_0():
+                    _maybe_rename_index_for_diffusers(consolidated_dir)
+                if is_rank_0():
+                    logger.info("Successfully exported consolidated HF safetensors to %s.", consolidated_dir)
+            except BaseException as e:  # noqa: B036 - re-raised on the main thread in async_wait
+                self._consolidation_error = e
+
+        self._consolidation_thread = threading.Thread(
+            target=_consolidate, name="hf-safetensors-consolidation", daemon=True
+        )
+        self._consolidation_thread.start()
+
+    def _join_deferred_consolidation(self) -> None:
+        """Wait for a pending background consolidation and surface its error, if any."""
+        thread = self._consolidation_thread
+        if thread is not None:
+            thread.join()
+            self._consolidation_thread = None
+        if self._consolidation_error is not None:
+            error = self._consolidation_error
+            self._consolidation_error = None
+            raise error
 
     def save_on_dp_ranks(self, state: Any, state_name: str, path: str) -> None:
         """
@@ -1381,6 +1483,8 @@ class Checkpointer:
 
         if self.config.is_async:
             ctx = self._model_ctx if is_model else self._optim_ctx
+            if ctx.stager is None:
+                ctx.stager = DefaultStager()
             ret = dcp.async_save(
                 state_dict,
                 checkpoint_id=path,
@@ -1610,7 +1714,7 @@ fi
         fqn_to_index_mapping: Optional[dict[str, int]],
         fqn_to_dtype_mapping: Optional[dict[str, str]],
         model_path: str,
-        consolidate_on_all_ranks: bool = False,
+        consolidation_handled_externally: bool = False,
     ) -> StorageWriter | None:
         """
         Construct a Hugging Face storage writer for sharded safetensors.
@@ -1620,7 +1724,9 @@ fi
             fqn_to_index_mapping: Optional mapping from FQN to shard index.
             fqn_to_dtype_mapping: Optional mapping from FQN to original HF safetensors dtype string.
             model_path: Path where the model checkpoint is saved.
-            consolidate_on_all_ranks: If True, consolidate on all ranks on the main process.
+            consolidation_handled_externally: If True, consolidation happens outside the writer
+                (inline on all ranks in sync mode, or on a background thread in async mode), so
+                the writer's own finish() consolidation is disabled.
 
         Returns:
             Configured storage writer or None for non-safetensors.
@@ -1629,7 +1735,7 @@ fi
             return _HuggingFaceStorageWriter(
                 path=model_path,
                 save_sharded=True,
-                consolidated_output_path=consolidated_output_path if not consolidate_on_all_ranks else None,
+                consolidated_output_path=consolidated_output_path if not consolidation_handled_externally else None,
                 fqn_to_index_mapping=fqn_to_index_mapping,
                 fqn_to_dtype_mapping=fqn_to_dtype_mapping,
                 staging_dir=self.config.staging_dir,
