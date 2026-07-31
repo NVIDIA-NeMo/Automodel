@@ -60,11 +60,11 @@ def unwrap_checkpoint_wrapper(module: nn.Module) -> nn.Module:
     return getattr(module, "_checkpoint_wrapped_module", module)
 
 
-def _resolve_torch_op(namespace: str, name: str, overload: str = "default"):
-    """Resolve ``torch.ops.<namespace>.<name>.<overload>``, or ``None`` if absent."""
-    ns = getattr(torch.ops, namespace, None)
-    packet = getattr(ns, name, None) if ns is not None else None
-    return getattr(packet, overload, None) if packet is not None else None
+def _resolve_torch_op(dotted_path: str):
+    """Resolve a dotted ``torch.ops`` path, defaulting to the ``default`` overload."""
+    if dotted_path.count(".") == 1:
+        dotted_path = f"{dotted_path}.default"
+    return _resolve_op_attr(torch.ops, dotted_path)
 
 
 def _resolve_op_attr(root: object, dotted_path: str):
@@ -95,10 +95,10 @@ def _existing_ops(*ops):
 # would recompute every expert GEMM, matching full checkpointing and giving no
 # speedup while still paying the policy overhead.
 _SELECTIVE_AC_MATMUL_OPS = _existing_ops(
-    _resolve_torch_op("aten", "mm"),
-    _resolve_torch_op("aten", "linear"),
-    _resolve_torch_op("aten", "_grouped_mm"),
-    _resolve_torch_op("aten", "_scaled_grouped_mm"),
+    _resolve_torch_op("aten.mm"),
+    _resolve_torch_op("aten.linear"),
+    _resolve_torch_op("aten._grouped_mm"),
+    _resolve_torch_op("aten._scaled_grouped_mm"),
 )
 
 
@@ -146,22 +146,22 @@ def _build_selective_ac_save_ops() -> frozenset:
 
     # Compute ops the partitioner list may not classify as compute-intensive.
     compute_ops = _existing_ops(
-        _resolve_torch_op("aten", "mm"),
-        _resolve_torch_op("aten", "addmm"),
-        _resolve_torch_op("aten", "bmm"),
-        _resolve_torch_op("aten", "linear"),
-        _resolve_torch_op("aten", "_scaled_mm"),
-        _resolve_torch_op("aten", "_scaled_dot_product_cudnn_attention"),
-        _resolve_torch_op("aten", "_scaled_dot_product_efficient_attention"),
-        _resolve_torch_op("aten", "_scaled_dot_product_flash_attention"),
-        _resolve_torch_op("aten", "_scaled_dot_product_flash_attention_for_cpu"),
-        _resolve_torch_op("aten", "_scaled_dot_product_fused_attention_overrideable"),
-        _resolve_torch_op("aten", "scaled_dot_product_attention"),
-        _resolve_torch_op("aten", "_flex_attention"),
+        _resolve_torch_op("aten.mm"),
+        _resolve_torch_op("aten.addmm"),
+        _resolve_torch_op("aten.bmm"),
+        _resolve_torch_op("aten.linear"),
+        _resolve_torch_op("aten._scaled_mm"),
+        _resolve_torch_op("aten._scaled_dot_product_cudnn_attention"),
+        _resolve_torch_op("aten._scaled_dot_product_efficient_attention"),
+        _resolve_torch_op("aten._scaled_dot_product_flash_attention"),
+        _resolve_torch_op("aten._scaled_dot_product_flash_attention_for_cpu"),
+        _resolve_torch_op("aten._scaled_dot_product_fused_attention_overrideable"),
+        _resolve_torch_op("aten.scaled_dot_product_attention"),
+        _resolve_torch_op("aten._flex_attention"),
         # topk is saved to keep MoE expert assignments stable across recompute;
         # max is saved for low-precision scaling factors.
-        _resolve_torch_op("aten", "topk"),
-        _resolve_torch_op("aten", "max"),
+        _resolve_torch_op("aten.topk"),
+        _resolve_torch_op("aten.max"),
         # FlexAttention HOP and the inductor compiled-graph HOP (present only when
         # torch.compile is used); custom torch_attn varlen backend.
         _resolve_op_attr(torch, "_higher_order_ops.flex_attention"),
@@ -173,10 +173,10 @@ def _build_selective_ac_save_ops() -> frozenset:
 
     # Communication ops whose outputs should be saved to avoid re-communication.
     comm_ops = _existing_ops(
-        _resolve_torch_op("aten", "all_to_all_single"),
-        _resolve_torch_op("aten", "reduce_scatter_tensor"),
-        _resolve_torch_op("_c10d_functional", "all_to_all_single"),
-        _resolve_torch_op("_c10d_functional", "reduce_scatter_tensor"),
+        _resolve_torch_op("aten.all_to_all_single"),
+        _resolve_torch_op("aten.reduce_scatter_tensor"),
+        _resolve_torch_op("_c10d_functional.all_to_all_single"),
+        _resolve_torch_op("_c10d_functional.reduce_scatter_tensor"),
         # Optional expert-parallel comm backends.
         _resolve_op_attr(torch.ops, "deepep.dispatch.default"),
         _resolve_op_attr(torch.ops, "deepep.combine.default"),
@@ -191,7 +191,7 @@ def _build_selective_ac_save_ops() -> frozenset:
 
 _SELECTIVE_AC_MUST_SAVE_OPS = _build_selective_ac_save_ops()
 
-_SELECTIVE_AC_TO_COPY_OP = _resolve_torch_op("aten", "_to_copy")
+_SELECTIVE_AC_TO_COPY_OP = _resolve_torch_op("aten._to_copy")
 
 
 def is_selective_activation_checkpointing(activation_checkpointing: object) -> bool:
@@ -320,16 +320,21 @@ def ensure_fsdp_ops_sac_ignored() -> None:
     # the parameters, these setup ops occur only during recomputation. They do
     # not produce model activations: the FSDP copy ops populate the allocations.
     ignore_sac_ops(
-        [
-            _resolve_torch_op("fsdp", "all_gather_copy_in"),
-            _resolve_torch_op("fsdp", "split_with_sizes_copy"),
-            _resolve_torch_op("fsdp", "chunk_cat"),
-            _resolve_torch_op("fsdp", "copy_"),
-            _resolve_torch_op("c10d", "_allgather_base_"),
-            _resolve_torch_op("aten", "empty", "memory_format"),
-            _resolve_torch_op("aten", "empty_like"),
-            _resolve_torch_op("aten", "view"),
-        ]
+        list(
+            map(
+                _resolve_torch_op,
+                [
+                    "fsdp.all_gather_copy_in",
+                    "fsdp.split_with_sizes_copy",
+                    "fsdp.chunk_cat",
+                    "fsdp.copy_",
+                    "c10d._allgather_base_",
+                    "aten.empty.memory_format",
+                    "aten.empty_like",
+                    "aten.view",
+                ],
+            )
+        )
     )
 
 
