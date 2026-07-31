@@ -46,14 +46,23 @@ from tests.functional_tests.checkpoint_robustness.test_checkpoint_vllm_deploy im
 def test_get_logits_pp_pads_prompt_to_static_stage_sequence_length(metadata_api):
     class _Schedule:
         def __init__(self):
-            self._loss_fn = lambda *_args, **_kwargs: None
+            self._loss_fn = None
             self.ids = None
             self.attention_mask = None
 
         def eval(self, ids, *, target, losses, attention_mask):
+            """Capture a padded pipeline batch and invoke the active loss callback.
+
+            Args:
+                ids: Tensor of shape [batch, sequence].
+                target: Tensor of shape [batch, sequence].
+                losses: Optional list populated by the pipeline loss callback.
+                attention_mask: Tensor of shape [batch, sequence].
+            """
             self.ids = ids
             self.attention_mask = attention_mask
             logits = torch.zeros(ids.shape[0], ids.shape[1], 7)
+            assert self._loss_fn is not None
             self._loss_fn(logits, target)
 
     class _PipelineMesh:
