@@ -983,6 +983,16 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                             best_metric_key=self.best_metric_key,
                         )
                     self._maybe_collect_garbage()
+        except BaseException:
+            if self.partial_cuda_graph_manager is not None:
+                try:
+                    self.partial_cuda_graph_manager.close()
+                except Exception:
+                    logger.exception("Failed to close partial CUDA graphs after a training-loop error")
+                finally:
+                    self.partial_cuda_graph_manager = None
+            self._partial_cuda_graph_capture_pending = False
+            raise
         finally:
             if pbar is not None:
                 pbar.close()
