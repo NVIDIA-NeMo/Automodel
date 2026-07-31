@@ -28,6 +28,7 @@ from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm
     _extract_custom_args,
     _finish_hf_reload_sync,
     _get_input_ids,
+    _get_logits_pp,
     _hf_fp32_module_names,
     _hf_model_load_context,
     _hf_source_load_kwargs,
@@ -39,6 +40,66 @@ from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm
 )
 from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_vlm import _get_vlm_input_ids
 from tests.functional_tests.checkpoint_robustness.test_checkpoint_vllm_deploy import _tokenize_for_generation
+
+
+@pytest.mark.parametrize("metadata_api", ["legacy", "user"])
+def test_get_logits_pp_pads_prompt_to_static_stage_sequence_length(metadata_api):
+    class _Schedule:
+        def __init__(self):
+            self._loss_fn = lambda *_args, **_kwargs: None
+            self.ids = None
+            self.attention_mask = None
+
+        def eval(self, ids, *, target, losses, attention_mask):
+            self.ids = ids
+            self.attention_mask = attention_mask
+            logits = torch.zeros(ids.shape[0], ids.shape[1], 7)
+            self._loss_fn(logits, target)
+
+    class _PipelineMesh:
+        @staticmethod
+        def get_group():
+            return object()
+
+        @staticmethod
+        def size():
+            return 1
+
+    if metadata_api == "legacy":
+        stage = SimpleNamespace(inputs_meta=(torch.empty(1, 16),))
+    else:
+        tensor_meta = SimpleNamespace(shape=torch.Size([1, 16]))
+        stage = SimpleNamespace(_user_meta=SimpleNamespace(inputs=(tensor_meta,), outputs=()))
+
+    schedule = _Schedule()
+    trainer = SimpleNamespace(
+        pp=SimpleNamespace(
+            pp_seq_len=None,
+            info=SimpleNamespace(
+                schedule=schedule,
+                stages=[stage],
+                has_first_stage=True,
+                has_last_stage=True,
+            ),
+        ),
+        pipeline_config=SimpleNamespace(pp_batch_size=1),
+        model_parts=[SimpleNamespace(eval=lambda: None, config=SimpleNamespace(vocab_size=7))],
+        device_mesh={"pp": _PipelineMesh()},
+        cfg=SimpleNamespace(get=lambda *_args: None),
+    )
+
+    with (
+        patch(
+            "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm.dist.get_global_rank",
+            return_value=0,
+        ),
+        patch("tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm.dist.broadcast"),
+    ):
+        logits = _get_logits_pp(trainer, [11, 12, 13], torch.device("cpu"))
+
+    assert schedule.ids.tolist() == [[11, 12, 13] + [0] * 13]
+    assert schedule.attention_mask.shape == (1, 16)
+    assert logits.shape == (1, 3, 7)
 
 
 @pytest.mark.parametrize(
