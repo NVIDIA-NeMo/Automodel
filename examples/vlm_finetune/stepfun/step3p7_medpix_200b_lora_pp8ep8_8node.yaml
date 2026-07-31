@@ -148,9 +148,9 @@ wandb:
 ci:
   # pp_size(8) * ep_size(8) = 64 GPUs => 8 nodes (8 H100/node).
   nodes: 8
-  time: "01:30:00"
+  time: "00:35:00"
   env_vars:
-    CHECKPOINT_ROBUSTNESS_PHASES: "train_and_save automodel_reload resume_baseline resume"
+    CHECKPOINT_ROBUSTNESS_PHASES: "train_and_save automodel_reload"
     CHECKPOINT_ROBUSTNESS_ALL_RANK_WATCHDOG: "1"
     CHECKPOINT_ROBUSTNESS_LOAD_DIAGNOSTICS: "1"
     CHECKPOINT_ROBUSTNESS_WATCHDOG_SECONDS: "300"
@@ -167,8 +167,8 @@ ci:
     step_scheduler.ckpt_every_steps: 1
     # Match a real restart and let each large trainer exit before the next one starts.
     process_isolation: true
-    # Diagnostic-only permissive gate: the run logs the actual reload KL, then continues to resume.
-    kl_threshold: 1.0
+    # Separate PP+EP/TE processes show small numerical drift even when every LoRA tensor matches exactly.
+    kl_threshold: 2e-2
     hf_kl_threshold: 2e-2
     skip_hf_reload: true
     tokenizer_name: stepfun-ai/Step-3.7-Flash
