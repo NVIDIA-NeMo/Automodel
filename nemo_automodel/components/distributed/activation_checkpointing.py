@@ -297,9 +297,10 @@ def ensure_fsdp_ops_sac_ignored() -> None:
 
     FSDP2 can prefetch an inner module's parameters before a checkpointed
     forward, while backward-time recomputation must unshard them from inside
-    the checkpointed region. Its copy-in/copy-out ops are runtime parameter
-    management, not model activations, and must execute normally when needed
-    instead of being indexed against the forward's selective-AC op stream.
+    the checkpointed region. Its copy-in/copy-out and c10d all-gather ops are
+    runtime parameter management, not model activations, and must execute
+    normally when needed instead of being indexed against the forward's
+    selective-AC op stream.
     """
     sac_ignored = getattr(torch.utils.checkpoint, "SAC_IGNORED_OPS", None)
     if sac_ignored is None:
@@ -308,6 +309,9 @@ def ensure_fsdp_ops_sac_ignored() -> None:
         op = _resolve_torch_op("fsdp", op_name)
         if op is not None:
             sac_ignored.add(op)
+    all_gather = _resolve_torch_op("c10d", "_allgather_base_")
+    if all_gather is not None:
+        sac_ignored.add(all_gather)
 
 
 def make_selective_checkpoint_context_fn():

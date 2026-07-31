@@ -203,7 +203,7 @@ def test_recompute_only_fsdp_unshard_op_bypasses_selective_ac_replay(monkeypatch
 
 
 def test_fsdp_runtime_ops_are_all_ignored_by_selective_ac(monkeypatch):
-    """All FSDP2 copy-in/copy-out custom ops must bypass SAC replay accounting."""
+    """FSDP2 copy and all-gather ops must bypass SAC replay accounting."""
     import torch.distributed.fsdp._fully_shard._fsdp_collectives  # noqa: F401
     import torch.distributed.fsdp._fully_shard._fsdp_param  # noqa: F401
 
@@ -217,6 +217,7 @@ def test_fsdp_runtime_ops_are_all_ignored_by_selective_ac(monkeypatch):
         torch.ops.fsdp.split_with_sizes_copy.default,
         torch.ops.fsdp.chunk_cat.default,
         torch.ops.fsdp.copy_.default,
+        torch.ops.c10d._allgather_base_.default,
     }
     assert expected <= sac_ignored
 
