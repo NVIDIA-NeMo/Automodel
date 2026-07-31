@@ -312,12 +312,18 @@ def ensure_fsdp_ops_sac_ignored() -> None:
     all_gather = _resolve_torch_op("c10d", "_allgather_base_")
     if all_gather is not None:
         sac_ignored.add(all_gather)
-    # FSDP's all-gather copy-out views the flat communication buffer and its
-    # per-parameter outputs. When forward prefetch has already unsharded the
-    # parameters, those alias-only views occur only during recomputation.
-    view = _resolve_torch_op("aten", "view")
-    if view is not None:
-        sac_ignored.add(view)
+    # FSDP's all-gather copy-out allocates per-parameter outputs and views the
+    # flat communication buffer. When forward prefetch has already unsharded
+    # the parameters, these setup ops occur only during recomputation. They do
+    # not produce model activations: the FSDP copy ops populate the allocations.
+    for op_name, overload_name in (
+        ("empty", "memory_format"),
+        ("empty_like", "default"),
+        ("view", "default"),
+    ):
+        op = _resolve_torch_op("aten", op_name, overload_name)
+        if op is not None:
+            sac_ignored.add(op)
 
 
 def make_selective_checkpoint_context_fn():

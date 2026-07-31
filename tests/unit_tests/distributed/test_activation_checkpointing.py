@@ -174,13 +174,15 @@ def test_recompute_only_fsdp_unshard_op_bypasses_selective_ac_replay(monkeypatch
     import torch.distributed.fsdp._fully_shard._fsdp_collectives  # noqa: F401
 
     fsdp_copy_in = torch.ops.fsdp.all_gather_copy_in.default
+    fsdp_empty = torch.ops.aten.empty.memory_format
+    fsdp_empty_like = torch.ops.aten.empty_like.default
     fsdp_view = torch.ops.aten.view.default
     sac_ignored = set(torch.utils.checkpoint.SAC_IGNORED_OPS)
     monkeypatch.setattr(torch.utils.checkpoint, "SAC_IGNORED_OPS", sac_ignored)
     ac.ensure_fsdp_ops_sac_ignored()
 
     def policy(ctx, func, *args, **kwargs):
-        if func in (fsdp_copy_in, fsdp_view):
+        if func in (fsdp_copy_in, fsdp_empty, fsdp_empty_like, fsdp_view):
             return CheckpointPolicy.MUST_SAVE
         return CheckpointPolicy.PREFER_RECOMPUTE
 
@@ -192,6 +194,7 @@ def test_recompute_only_fsdp_unshard_op_bypasses_selective_ac_replay(monkeypatch
     def checkpointed_module(x: torch.Tensor) -> torch.Tensor:
         if fsdp_state["unsharded"]:
             all_gather_output = torch.empty_like(x)
+            torch.empty(x.shape, dtype=x.dtype, device=x.device)
             fsdp_copy_in([x.detach()], all_gather_output, [x.numel()], x.numel(), 0)
             x = x.view(-1)
         fsdp_state["unsharded"] = True
@@ -220,6 +223,8 @@ def test_fsdp_runtime_ops_are_all_ignored_by_selective_ac(monkeypatch):
         torch.ops.fsdp.chunk_cat.default,
         torch.ops.fsdp.copy_.default,
         torch.ops.c10d._allgather_base_.default,
+        torch.ops.aten.empty.memory_format,
+        torch.ops.aten.empty_like.default,
         torch.ops.aten.view.default,
     }
     assert expected <= sac_ignored
