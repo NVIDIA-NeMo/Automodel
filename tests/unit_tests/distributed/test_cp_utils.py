@@ -514,7 +514,6 @@ def test_attach_te_context_parallel_configures_full_and_sliding_attention(monkey
     assert tp_only_model[0].self_attn.attn_module.tp_size == 2
     assert tp_only_model[0].self_attn.attn_module.num_gqa_groups_per_partition == 2
 
-
 # ============================================================================
 # Tests for make_cp_batch_for_te
 # ============================================================================
@@ -538,6 +537,8 @@ def test_make_cp_batch_for_te_basic(monkeypatch):
         "position_ids": position_ids,
         "seq_lens": seq_lens,
         "seq_lens_padded": seq_lens_padded,
+        "pixel_values": torch.randn(1, 3, 8, 12),
+        "_global_vision_mask": input_ids == 7,
     }
 
     def mock_get_rank(group=None):
@@ -580,6 +581,8 @@ def test_make_cp_batch_for_te_basic(monkeypatch):
 
     # Verify cu_seqlens are properly formatted
     assert result["cu_seqlens"].dtype == torch.int32
+    assert result["pixel_values"] is batch["pixel_values"]
+    assert result["_global_vision_mask"] is batch["_global_vision_mask"]
 
 
 def test_make_cp_batch_for_te_multi_chunk(monkeypatch):
@@ -778,6 +781,7 @@ def test_magi_state_is_derived_from_live_model():
 def test_sharder_constructor_derives_te_from_model_and_thd_from_batch(monkeypatch):
     """A TE model and THD batch resolve a sharder without recipe-owned flags."""
     seen = {}
+    local_indices = torch.tensor([1, 0])
 
     def fake_make_cp_batch_for_te(
         cp_mesh, batch, *, padding_token_id, qkv_format, num_chunks, seq_lens_padding_value, return_local_indices=False
@@ -785,7 +789,7 @@ def test_sharder_constructor_derives_te_from_model_and_thd_from_batch(monkeypatc
         seen.update(
             cp_mesh=cp_mesh, pad=padding_token_id, fmt=qkv_format, chunks=num_chunks, sent=seq_lens_padding_value
         )
-        return ({"thd": True}, None) if return_local_indices else {"thd": True}
+        return ({"thd": True}, local_indices) if return_local_indices else {"thd": True}
 
     monkeypatch.setattr(_cu, "make_cp_batch_for_te", fake_make_cp_batch_for_te)
 
@@ -802,7 +806,8 @@ def test_sharder_constructor_derives_te_from_model_and_thd_from_batch(monkeypatc
     assert not seen
     ctx, batch = sharder.shard(batch)
     assert ctx is contextlib.nullcontext
-    assert batch == {"thd": True}
+    assert batch["thd"] is True
+    assert batch["_thd_local_indices"] is local_indices
     assert seen["cp_mesh"] is device_mesh["cp"]
     assert (seen["pad"], seen["fmt"], seen["chunks"], seen["sent"]) == (7, "thd", 3, -1000)
 
