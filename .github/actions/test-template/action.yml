@@ -140,7 +140,7 @@ runs:
         echo -e "\033[1;34m└──────────────────────────────────────────────────────────────────────────┘\033[0m"
 
     - name: Run main script
-      uses: nick-fields/retry@v3
+      uses: nick-fields/retry@ce71cc2ab81d554ebbe88c79ab5975992d79ba08 # v3
       id: run-main-script
       continue-on-error: ${{ inputs.is-optional == 'true' }}
       with:
@@ -206,7 +206,7 @@ runs:
         fi
 
     - name: Upload artifacts
-      uses: actions/upload-artifact@v6
+      uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
       if: ${{ steps.check.outputs.coverage_report != 'none' }}
       with:
         name: ${{ steps.check.outputs.coverage_report }}

@@ -1966,9 +1966,10 @@ class TestActivationCheckpointingKVSharing:
             rejects non-Module values when replacing a registered child module.
             """
 
-            def __init__(self, inner):
+            def __init__(self, inner, context_fn=None):
                 super().__init__()
                 self._inner = inner
+                self._context_fn = context_fn
 
             @property
             def _checkpoint_wrapped_module(self):

@@ -19,6 +19,35 @@ from .encoding import build_chat_segments, is_batched_conversation
 
 logger = getLogger(__name__)
 VOCAB_FILES_NAMES = {"vocab_file": "tiktoken.model"}
+# Fern autodoc emits literal ampersands as invalid MDX.
+_REGEX_SET_INTERSECTION = chr(38) * 2
+_NON_HAN_UPPER_OR_MARK = r"""[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}""" + _REGEX_SET_INTERSECTION + r"""[^\p{Han}]]"""
+_NON_HAN_LOWER_OR_MARK = r"""[\p{Ll}\p{Lm}\p{Lo}\p{M}""" + _REGEX_SET_INTERSECTION + r"""[^\p{Han}]]"""
+
+
+def _build_kimi_k3_pat_str() -> str:
+    """Build the Kimi K3 tiktoken regex without exposing raw set intersections to autodoc."""
+
+    return "|".join(
+        [
+            r"""[\p{Han}]+""",
+            r"""[^\r\n\p{L}\p{N}]?"""
+            + _NON_HAN_UPPER_OR_MARK
+            + r"""*"""
+            + _NON_HAN_LOWER_OR_MARK
+            + r"""+(?i:'s|'t|'re|'ve|'m|'ll|'d)?""",
+            r"""[^\r\n\p{L}\p{N}]?"""
+            + _NON_HAN_UPPER_OR_MARK
+            + r"""+"""
+            + _NON_HAN_LOWER_OR_MARK
+            + r"""*(?i:'s|'t|'re|'ve|'m|'ll|'d)?""",
+            r"""\p{N}{1,3}""",
+            r""" ?[^\s\p{L}\p{N}]+[\r\n]*""",
+            r"""\s*[\r\n]+""",
+            r"""\s+(?!\S)""",
+            r"""\s+""",
+        ]
+    )
 
 
 class TikTokenTokenizer(PreTrainedTokenizer):
@@ -53,19 +82,6 @@ class TikTokenTokenizer(PreTrainedTokenizer):
 
     num_reserved_special_tokens = 256
 
-    pat_str = "|".join(
-        [
-            r"""[\p{Han}]+""",
-            r"""[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]*[\p{Ll}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?""",
-            r"""[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]+[\p{Ll}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?""",
-            r"""\p{N}{1,3}""",
-            r""" ?[^\s\p{L}\p{N}]+[\r\n]*""",
-            r"""\s*[\r\n]+""",
-            r"""\s+(?!\S)""",
-            r"""\s+""",
-        ]
-    )
-
     def __init__(
         self,
         vocab_file,
@@ -99,6 +115,7 @@ class TikTokenTokenizer(PreTrainedTokenizer):
         self.vocab_file = vocab_file
         mergeable_ranks = load_tiktoken_bpe(vocab_file)
         num_base_tokens = len(mergeable_ranks)
+        self.pat_str = _build_kimi_k3_pat_str()
         self.special_tokens = {
             special_tokens_mapping.get(i, f"<|reserved_token_{i}|>"): i
             for i in range(num_base_tokens, num_base_tokens + self.num_reserved_special_tokens)

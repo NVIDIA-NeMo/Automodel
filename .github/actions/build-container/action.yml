@@ -35,7 +35,7 @@ runs:
     - name: Get PR info
       id: get-pr-info
       if: startsWith(github.ref, 'refs/heads/pull-request/')
-      uses: nv-gha-runners/get-pr-info@main
+      uses: nv-gha-runners/get-pr-info@090577647b8ddc4e06e809e264f7881650ecdccf # main
 
     - name: Get merge commit sha
       shell: bash -x -e -u -o pipefail {0}
@@ -51,7 +51,7 @@ runs:
         echo "main=${SHA}" | tee -a "$GITHUB_OUTPUT"
 
     - name: Checkout
-      uses: actions/checkout@v6
+      uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       with:
         ref: ${{ steps.sha.outputs.main }}
 
@@ -101,14 +101,14 @@ runs:
 
     - name: Set up Docker Buildx
       id: setup-buildx
-      uses: docker/setup-buildx-action@v3
+      uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
     # Keep multi-GB cache ownership on main. Copied PR branches can restore
     # main's cache without consuming repository storage with scoped copies.
     - name: Restore and save BuildKit cache mounts
       id: buildkit-cache-main
       if: github.ref == 'refs/heads/main'
-      uses: actions/cache@v4
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
       with:
         path: .buildkit-cache
         # Compiled CUDA wheels are ABI-bound to the Dockerfile base image and lockfiles.
@@ -117,7 +117,7 @@ runs:
     - name: Restore BuildKit cache mounts
       id: buildkit-cache-branch
       if: github.ref != 'refs/heads/main'
-      uses: actions/cache/restore@v4
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
       with:
         path: .buildkit-cache
         # Compiled CUDA wheels are ABI-bound to the Dockerfile base image and lockfiles.
@@ -136,7 +136,7 @@ runs:
         skip-extraction: ${{ github.ref != 'refs/heads/main' || steps.buildkit-cache-main.outputs.cache-hit == 'true' }}
 
     - name: Build and push
-      uses: docker/build-push-action@v5
+      uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
       with:
         file: ${{ inputs.dockerfile-path }}
         push: true

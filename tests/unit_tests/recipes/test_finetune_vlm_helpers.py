@@ -2922,8 +2922,8 @@ def test_vlm_setup_applies_prewarm_config(monkeypatch):
     _patch_vlm_setup_minimals(monkeypatch, cp_size=1)
     calls = []
 
-    def _record_apply(self, *, model_parts, device, pp_mesh=None):
-        calls.append((self, model_parts, device, pp_mesh))
+    def _record_apply(self, *, model_parts, device, batch_size, pp_mesh=None):
+        calls.append((self, model_parts, device, batch_size, pp_mesh))
 
     monkeypatch.setattr("nemo_automodel.components.training.prewarm.PrewarmConfig.apply", _record_apply)
 
@@ -2931,10 +2931,11 @@ def test_vlm_setup_applies_prewarm_config(monkeypatch):
     trainer.setup()
 
     assert len(calls) == 1
-    prewarm, model_parts, device, pp_mesh = calls[0]
+    prewarm, model_parts, device, batch_size, pp_mesh = calls[0]
     assert prewarm.comm_groups is True
     assert model_parts == trainer.model_parts
     assert device == torch.device("cpu")
+    assert batch_size == 1
     assert pp_mesh is None
 
 
