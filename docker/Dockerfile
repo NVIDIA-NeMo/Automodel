@@ -130,20 +130,20 @@ RUN if [ "$INSTALL_UCCL_EP" = "True" ]; then \
     rm -f /opt/setup_uccl_ep.sh; \
     fi
 
-# ---- Wheel builders: compile the heavy AOT source packages off the uv-sync path so they
-# build in parallel with uv sync and don't recompile on every uv.lock bump. FROM pytorch = base torch ABI.
-FROM pytorch AS torchao_builder
+# ---- Wheel builders: compile the heavy AOT source packages off the uv-sync path (cached across uv.lock bumps).
+# FROM automodel_dep so they run after TE/DeepEP/bitsandbytes; MAX_JOBS capped so torchao||FA3 don't OOM the builder.
+FROM automodel_dep AS torchao_builder
 # torchao MXFP8: build w/ submodules (PyPI wheels omit mxfp8 CUDA kernels on aarch64); pin v0.17.0 (v0.14.1 ~2.5x slower; main needs nvidia-cutlass-dsl).
 ARG TORCHAO_REF=v0.17.0
 RUN mkdir -p /wheels && \
     git clone --depth 1 --branch ${TORCHAO_REF} --recurse-submodules --shallow-submodules \
         https://github.com/pytorch/ao.git /tmp/torchao && \
-    TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" MAX_JOBS=8 \
+    TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" MAX_JOBS=4 \
         pip wheel --no-cache-dir --no-build-isolation --no-deps -w /wheels /tmp/torchao && \
     rm -rf /tmp/torchao
 
 # FA3 (Hopper-only, SM90a-locked, ~25 min nvcc) + FA4 cute (Blackwell, lightweight). arm64 -> skip FA3: GB200 target, QEMU cross-build impractical.
-FROM pytorch AS fa_builder
+FROM automodel_dep AS fa_builder
 ARG FLASH_ATTN_REF=002cce0a1
 ARG INSTALL_FA3=true
 ARG INSTALL_FA4=false
@@ -157,7 +157,7 @@ RUN mkdir -p /wheels && \
     fi && \
     if [ "$INSTALL_FA3" = "true" ]; then \
         cd /tmp/fa/hopper && \
-        FLASH_ATTENTION_DISABLE_SM80=TRUE MAX_JOBS=$(nproc) NVCC_THREADS=2 \
+        FLASH_ATTENTION_DISABLE_SM80=TRUE MAX_JOBS=4 NVCC_THREADS=2 \
         pip wheel --no-cache-dir --no-build-isolation --no-deps -w /wheels . ; \
     fi && \
     if [ "$INSTALL_FA4" = "true" ]; then \
