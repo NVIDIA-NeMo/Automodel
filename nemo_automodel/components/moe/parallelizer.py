@@ -545,11 +545,13 @@ def apply_ac(
         return create_selective_checkpoint_contexts(_custom_policy)
 
     from nemo_automodel.components.distributed.activation_checkpointing import (
+        ensure_fsdp_ops_sac_ignored,
         ensure_profiler_ops_sac_ignored,
         transformer_engine_attention_backend_snapshot_context_fn,
     )
 
     ensure_profiler_ops_sac_ignored()
+    ensure_fsdp_ops_sac_ignored()
 
     def _with_attention_backend_snapshot(context_fn=None):
         return functools.partial(transformer_engine_attention_backend_snapshot_context_fn, context_fn)

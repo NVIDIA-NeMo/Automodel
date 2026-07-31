@@ -169,6 +169,58 @@ def test_transformer_engine_attention_cache_snapshot_preserves_checkpoint_op_seq
     assert attention_cache["backend"] == cache_after_forward["backend"]
 
 
+def test_recompute_only_fsdp_unshard_op_bypasses_selective_ac_replay(monkeypatch):
+    """FSDP prefetch may make copy-in recompute-only; it must execute outside SAC indexing."""
+    import torch.distributed.fsdp._fully_shard._fsdp_collectives  # noqa: F401
+
+    fsdp_copy_in = torch.ops.fsdp.all_gather_copy_in.default
+    sac_ignored = set(torch.utils.checkpoint.SAC_IGNORED_OPS)
+    monkeypatch.setattr(torch.utils.checkpoint, "SAC_IGNORED_OPS", sac_ignored)
+    ac.ensure_fsdp_ops_sac_ignored()
+
+    def policy(ctx, func, *args, **kwargs):
+        if func == fsdp_copy_in:
+            return CheckpointPolicy.MUST_SAVE
+        return CheckpointPolicy.PREFER_RECOMPUTE
+
+    def selective_context_fn():
+        return create_selective_checkpoint_contexts(policy)
+
+    fsdp_state = {"unsharded": False}
+
+    def checkpointed_module(x: torch.Tensor) -> torch.Tensor:
+        if fsdp_state["unsharded"]:
+            all_gather_output = torch.empty_like(x)
+            fsdp_copy_in([x.detach()], all_gather_output, [x.numel()], x.numel(), 0)
+        fsdp_state["unsharded"] = True
+        return x.sin()
+
+    x = torch.randn(8, requires_grad=True)
+    out = checkpoint(checkpointed_module, x, use_reentrant=False, context_fn=selective_context_fn)
+    out.sum().backward()
+
+    assert torch.allclose(x.grad, x.detach().cos())
+
+
+def test_fsdp_runtime_ops_are_all_ignored_by_selective_ac(monkeypatch):
+    """All FSDP2 copy-in/copy-out custom ops must bypass SAC replay accounting."""
+    import torch.distributed.fsdp._fully_shard._fsdp_collectives  # noqa: F401
+    import torch.distributed.fsdp._fully_shard._fsdp_param  # noqa: F401
+
+    sac_ignored = set()
+    monkeypatch.setattr(torch.utils.checkpoint, "SAC_IGNORED_OPS", sac_ignored)
+
+    ac.ensure_fsdp_ops_sac_ignored()
+
+    expected = {
+        torch.ops.fsdp.all_gather_copy_in.default,
+        torch.ops.fsdp.split_with_sizes_copy.default,
+        torch.ops.fsdp.chunk_cat.default,
+        torch.ops.fsdp.copy_.default,
+    }
+    assert expected <= sac_ignored
+
+
 def test_submodule_checkpointing_with_snapshot_context_reruns_recompute_under_forward_backends():
     """Recompute must rerun under the forward-time SDPA backend set even after the pin exits."""
     block = _SdpaVisionBlock()

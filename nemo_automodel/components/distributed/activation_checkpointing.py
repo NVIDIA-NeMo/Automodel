@@ -292,9 +292,28 @@ def ensure_profiler_ops_sac_ignored() -> None:
             sac_ignored.add(getattr(packet, overload_name))
 
 
+def ensure_fsdp_ops_sac_ignored() -> None:
+    """Keep FSDP2 parameter-lifecycle ops out of SAC's saved-op replay.
+
+    FSDP2 can prefetch an inner module's parameters before a checkpointed
+    forward, while backward-time recomputation must unshard them from inside
+    the checkpointed region. Its copy-in/copy-out ops are runtime parameter
+    management, not model activations, and must execute normally when needed
+    instead of being indexed against the forward's selective-AC op stream.
+    """
+    sac_ignored = getattr(torch.utils.checkpoint, "SAC_IGNORED_OPS", None)
+    if sac_ignored is None:
+        return
+    for op_name in ("all_gather_copy_in", "split_with_sizes_copy", "chunk_cat", "copy_"):
+        op = _resolve_torch_op("fsdp", op_name)
+        if op is not None:
+            sac_ignored.add(op)
+
+
 def make_selective_checkpoint_context_fn():
     """Build a TorchTitan-style selective activation checkpointing context."""
     ensure_profiler_ops_sac_ignored()
+    ensure_fsdp_ops_sac_ignored()
 
     def selective_checkpointing_context_fn():
         # Count matmuls separately for the forward and recompute passes. torch
