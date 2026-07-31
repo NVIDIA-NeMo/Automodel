@@ -15,6 +15,7 @@
 """Tests for dLLM strategies (MDLMStrategy, SCDDStrategy, HybridStrategy, DFlashStrategy) and get_dllm_strategy."""
 
 import types
+from pathlib import Path
 
 import pytest
 import torch
@@ -37,6 +38,9 @@ from nemo_automodel.recipes.dllm.strategy import (
     _build_target_layer_ids,
     get_dllm_strategy,
 )
+
+
+REPO_ROOT = Path(__file__).resolve().parents[4]
 
 
 def test_get_dllm_strategy_rejects_unknown_mode():
@@ -1239,3 +1243,35 @@ def test_scdd_corruption_and_loss_agree_on_the_p_mask_contract():
     assert torch.isfinite(out.total_loss)
     out.total_loss.backward()
     assert torch.isfinite(logits.grad).all() and logits.grad.abs().sum() > 0
+
+
+def test_scdd_create_loss_fn_threads_chunk_size():
+    """The loss's memory knob must be reachable from the recipe YAML, including
+    the explicit ``null`` that turns chunking off."""
+    strategy = SCDDStrategy()
+    base = {"vocab_size": SCDD_VOCAB, "mask_token_id": SCDD_MASK_ID}
+    assert strategy.create_loss_fn(base).chunk_size == 1024
+    assert strategy.create_loss_fn({**base, "chunk_size": 256}).chunk_size == 256
+    assert strategy.create_loss_fn({**base, "chunk_size": None}).chunk_size is None
+
+
+def test_shipped_scdd_recipe_builds_its_strategy_and_loss():
+    """The go-to recipe must stay loadable: a typo in dllm.mode or a schedule key
+    would otherwise only surface on an 8-GPU run."""
+    import yaml
+
+    config_path = REPO_ROOT / "examples" / "dllm_sft" / "llada_scdd.yaml"
+    cfg = yaml.safe_load(config_path.read_text())
+    dllm_cfg = cfg["dllm"]
+
+    strategy = get_dllm_strategy(dllm_cfg["mode"])
+    assert isinstance(strategy, SCDDStrategy)
+    loss_fn = strategy.create_loss_fn(dllm_cfg)
+    assert isinstance(loss_fn, SCDDLoss)
+    # Schedule values are the authors' released scdd_pu_0.1 checkpoint config.
+    assert (loss_fn.num_timesteps, loss_fn.max_ratio) == (1000, 0.1)
+    assert (loss_fn.gamma_shape, loss_fn.t_peak) == (1.0, 0.5)
+    assert loss_fn.max_ratio > 0, "uniform_ratio 0 would silently degenerate SCDD to MDLM"
+    # The mask id must be inside the vocabulary the uniform channel samples over.
+    assert 0 <= dllm_cfg["mask_token_id"] < dllm_cfg["vocab_size"]
+    assert cfg["distributed"]["cp_size"] == 1, "SCDD rejects context parallelism"
