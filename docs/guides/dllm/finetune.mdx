@@ -141,13 +141,18 @@ dataset:
   unshifted: true
 ```
 
+The schedule values above are taken from the config shipped with the authors' released
+`scdd_pu_0.1` checkpoint. Their only other released setting differs solely in `uniform_ratio: 0.2`,
+so that is the first knob to sweep.
+
 Decode SCDD checkpoints with `--sampler scdd`, passing the same `uniform_ratio`, `schedule_shape`,
 and `schedule_peak` used during training — the sampler rebuilds the reverse posterior from that
 schedule, so a mismatch degrades generation.
 
-The SCDD loss upcasts logits to fp32 and holds roughly two extra logits-sized tensors while it sums
-over the vocabulary. Scale sequence length with FSDP2 sharding and a smaller local batch rather than
-by growing the micro-batch.
+Unlike the absorbing losses, the SCDD objective needs the model's probability for every
+non-`[MASK]` token, so it cannot use a fused cross-entropy kernel. That vocabulary reduction runs in
+checkpointed chunks of `dllm.chunk_size` positions, which keeps its fp32 intermediates off the
+backward tape. Lower `chunk_size` before reducing sequence length if the loss runs out of memory.
 
 ### Configure Nemotron-Labs-Diffusion
 
@@ -192,6 +197,7 @@ The following table describes the key configuration fields for dLLM fine-tuning.
 | `dllm.uniform_ratio` | Peak share of uniform (correctable) noise. `0` degenerates SCDD to plain MDLM. SCDD mode only. |
 | `dllm.schedule_shape` | Shape mass of the uniform-noise bump; larger values concentrate the noise near the peak. SCDD mode only. |
 | `dllm.schedule_peak` | Time in `(0, 1)` at which the uniform-noise ratio peaks. SCDD mode only. |
+| `dllm.chunk_size` | Positions per checkpointed chunk of the SCDD loss's vocabulary reduction. Lower it first if the loss runs out of memory; `null` disables chunking. SCDD mode only. |
 | `dataset.unshifted` | Must be `true` for dLLM. Disables the autoregressive input and target shift. |
 
 ### Configure DFlash

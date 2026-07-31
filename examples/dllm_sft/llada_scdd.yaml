@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,27 +12,60 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# SCDD (Self-Correcting Discrete Diffusion) fine-tuning of a
-# https://openreview.net/forum?id=zQKlzKB6I9
-# LLaDA checkpoint. The forward process mixes absorbing [MASK] noise with
-# uniform token transitions, so the model is trained to overwrite wrong tokens
-# in its own context instead of only filling masks. Decode with
-#   python examples/dllm_generate/generate.py --sampler scdd ...
-# passing the same uniform_ratio / schedule_shape / schedule_peak used here.
+# SCDD (Self-Correcting Discrete Diffusion) fine-tuning of LLaDA-8B.
+# Paper: https://openreview.net/forum?id=zQKlzKB6I9
+#
+# The forward process mixes absorbing [MASK] noise with uniform token
+# transitions, so the model trains on contexts holding wrong-but-plausible
+# tokens and learns to overwrite them. That self-correction is what sustains
+# quality when many positions are decoded per step.
+#
+# Scope note: the paper *pretrains* GPT-2-scale DiT backbones from scratch with
+# this objective. This recipe instead applies it as SFT on LLaDA-8B, which was
+# pretrained with the pure absorbing kernel, so fine-tuning has to teach
+# self-correction on top of an absorbing-only prior. Treat the schedule settings
+# below as a starting point, not as reproduced paper numbers.
+#
+# The forward-process block below is taken from the config shipped with the
+# authors' released checkpoint (laaaarrywang/SCDD, configs/scdd_pu_0.1.yaml):
+# T=1000, ratio 0.1, gamma 1, t_peak 0.5, sampling_eps 1e-3. Their only other
+# released setting (scdd_pu_0.2.yaml) differs solely in ratio: 0.2 -- every other
+# field is identical, so ratio is the one schedule knob worth sweeping first.
+#
+# Their optimizer settings are NOT copied here: lr 5e-4, weight_decay 0.02,
+# eps 1e-9, global batch 256, sequence length 512 all belong to a from-scratch
+# pretraining run of a 90M-parameter DiT. The values below mirror llada_sft.yaml
+# instead, so an SCDD run is directly comparable against the MDLM baseline on the
+# same 8B model and data.
+#
+# Known gap: the authors' runs keep an EMA of the weights (decay 0.9999) and
+# evaluate the EMA copy. AutoModel ships ``components/training/ema.py``, but the
+# dLLM recipe does not wire it, so there is no ``ema:`` key to set here; expect
+# somewhat noisier samples than the released checkpoints until it is threaded in.
+#
+# Usage (8-GPU single node):
+#   python -m torch.distributed.run --nproc-per-node=8 \
+#       nemo_automodel/recipes/dllm/train_ft.py \
+#       -c examples/dllm_sft/llada_scdd.yaml
+#
+# Decode with the matching sampler, passing the same schedule:
+#   python examples/dllm_generate/generate.py \
+#       --checkpoint <consolidated dir> --sampler scdd \
+#       --uniform_ratio 0.1 --schedule_shape 1.0 --schedule_peak 0.5
 
 recipe: DiffusionLMSFTRecipe
 
 step_scheduler:
-  global_batch_size: 32
-  local_batch_size: 4
+  global_batch_size: 32    # per-device 1 x grad-accum 4 x 8 GPUs
+  local_batch_size: 1
   ckpt_every_steps: 500
   val_every_steps: 500
   max_steps: null
-  num_epochs: 5
+  num_epochs: 2
 
 dist_env:
   backend: nccl
-  timeout_minutes: 10
+  timeout_minutes: 30
 
 seed: 42
 
@@ -44,7 +77,7 @@ wandb:
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: GSAI-ML/LLaDA-8B-Base
-  torch_dtype: float32
+  torch_dtype: float32     # fp32 master weights; compute stays bf16 via mp_policy
   trust_remote_code: true
 
 checkpoint:
@@ -57,42 +90,58 @@ distributed:
   strategy: fsdp2
   dp_size: none
   tp_size: 1
-  cp_size: 1
+  cp_size: 1               # SCDD does not support context parallelism (SCDDStrategy raises)
   pp_size: 1
   sequence_parallel: false
-  activation_checkpointing: false
+  activation_checkpointing: true   # 8B full FT; trade compute for memory
   mp_policy:
     param_dtype: bfloat16
     reduce_dtype: float32
     output_dtype: float32
   autocast_dtype: bfloat16
   offload_policy: null
+  # Per-layer FSDP2 prefetch overlaps all-gather / reduce-scatter with compute.
+  enable_fsdp2_prefetch: true
+  fsdp2_forward_prefetch_depth: 1
+  fsdp2_backward_prefetch_depth: 2
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
+# mode: scdd selects SCDDStrategy -- mixed absorbing + uniform corruption scored
+# by the discrete-time SCDD NELBO. The ELBO is supported at every supervised
+# position (corrupted or not), so the loss denominator is the supervised-token
+# count rather than the corrupted-token count.
 dllm:
   mode: scdd
-  mask_token_id: 126336
-  # Required by the uniform-transition channel: replacements are drawn over the
-  # vocabulary minus [MASK] and the clean token.
+  mask_token_id: 126336    # LLaDA <|mdm_mask|>
+  # Required: the uniform channel draws replacements over the vocabulary minus
+  # [MASK] and the clean token, and the ELBO normalises over that same domain.
+  # Must equal the model's vocab_size -- SCDDStrategy.setup_extra rejects a mismatch.
   vocab_size: 126464
-  eps: 0.001
-  # Discrete diffusion steps T. The ELBO compares each sampled time t against
-  # the previous grid point t - 1/T.
-  num_timesteps: 1000
-  # Peak share of uniform (correctable) noise relative to retained tokens.
-  # 0 degenerates the objective to plain MDLM.
+  # --- schedule: verbatim from the released scdd_pu_0.1 checkpoint config ---
+  eps: 0.001               # their training.sampling_eps
+  num_timesteps: 1000      # their T; the ELBO compares t against t - 1/T
+  # Peak share of uniform (correctable) noise -- their forward.ratio. 0
+  # degenerates the objective to plain MDLM. The authors release 0.1 and 0.2;
+  # start at 0.1 when fine-tuning an absorbing-pretrained checkpoint, it being
+  # the smaller shift away from LLaDA's prior.
   uniform_ratio: 0.1
-  schedule_shape: 1.0
-  schedule_peak: 0.5
+  schedule_shape: 1.0      # their forward.gamma; larger concentrates noise at the peak
+  schedule_peak: 0.5       # their forward.t_peak
+  # Positions per checkpointed chunk of the loss's vocabulary reduction. The
+  # SCDD ELBO needs p_theta over the whole vocabulary, so it cannot use a fused
+  # cross-entropy; chunking keeps the two [chunk, vocab] fp32 intermediates off
+  # the backward tape. Lower this first if the loss runs out of memory; null
+  # disables chunking.
+  chunk_size: 1024
   supervise_padding: true
 
 optimizer:
   _target_: torch.optim.AdamW
   betas: [0.9, 0.999]
   eps: 1.0e-8
-  lr: 2.0e-5
+  lr: 2.0e-5               # matches llada_sft.yaml so SCDD vs MDLM stays comparable
   weight_decay: 0.0
 
 clip_grad_norm:
@@ -102,6 +151,7 @@ lr_scheduler:
   lr_decay_style: cosine
   init_lr: 0.0
   min_lr: 0.0
+  lr_warmup_steps: 200
 
 dataset:
   _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset

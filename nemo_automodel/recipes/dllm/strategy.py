@@ -261,6 +261,10 @@ class SCDDStrategy(DLLMStrategy):
         self._max_ratio = float(dllm_cfg.get("uniform_ratio", 0.1))
         self._gamma_shape = float(dllm_cfg.get("schedule_shape", 1.0))
         self._t_peak = float(dllm_cfg.get("schedule_peak", 0.5))
+        # Positions per checkpointed chunk of the loss's vocabulary reduction;
+        # ``null`` in YAML disables chunking. This is the memory knob for long
+        # sequences on a large vocabulary.
+        chunk_size = dllm_cfg.get("chunk_size", 1024)
         # mask_token_id may still be unresolved here (the recipe falls back to
         # the tokenizer); setup_extra below installs the resolved value.
         return SCDDLoss(
@@ -269,6 +273,7 @@ class SCDDStrategy(DLLMStrategy):
             max_ratio=self._max_ratio,
             gamma_shape=self._gamma_shape,
             t_peak=self._t_peak,
+            chunk_size=None if chunk_size is None else int(chunk_size),
         )
 
     def setup_extra(self, recipe) -> None:
