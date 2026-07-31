@@ -107,7 +107,7 @@ def test_training_loop_captures_after_first_complete_step_and_closes():
     recipe._maybe_collect_garbage = lambda: None
     recipe.metric_logger_train = SimpleNamespace(close=lambda: events.append("metrics-close"))
     recipe.metric_logger_valid = {}
-    recipe.checkpointer = SimpleNamespace(close=lambda: events.append("checkpointer-close"))
+    recipe.checkpointer = SimpleNamespace(finalize=lambda: events.append("checkpointer-finalize"))
     recipe.best_metric_key = "default"
 
     recipe.run_train_validation_loop()
@@ -118,7 +118,7 @@ def test_training_loop_captures_after_first_complete_step_and_closes():
         ("train-step", ("step-1",)),
         "progress-close",
         "metrics-close",
-        "checkpointer-close",
+        "checkpointer-finalize",
         "close",
     ]
     assert recipe.partial_cuda_graph_manager is None
