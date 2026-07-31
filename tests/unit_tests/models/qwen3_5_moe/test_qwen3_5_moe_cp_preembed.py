@@ -1,13 +1,13 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""CPU-only tests for Qwen3.5-MoE CP pre-embedding (PR #2432).
+"""CPU-only tests for Qwen3.5-MoE model-owned context parallelism.
 
-``prepare_model_inputs_for_cp`` builds full-sequence multimodal embeddings and
-mRoPE positions *before* context-parallel sharding, plus a dense ``seq_index``
-the linear-attention layers need. Instantiating the full VL model is expensive,
-so we build a barebones instance via ``__new__`` and stub the heavy submodules
-(visual encoder, rope-index helper, embedding table).
+``prepare_model_inputs_for_cp`` selects a sharder and computes full-sequence
+mRoPE positions without touching weights. Embedding, multimodal splicing, and
+the primary sequence shard happen inside ``forward``. Instantiating the full VL
+model is expensive, so these tests build a barebones instance via ``__new__``
+and stub the heavy submodules.
 """
 
 from __future__ import annotations
@@ -23,10 +23,11 @@ pytest.importorskip("transformers.models.qwen3_5_moe")
 from nemo_automodel.components.models.qwen3_5_moe.model import (
     Qwen3_5MoeForConditionalGeneration,
     Qwen3_5MoeModel,
+    _Qwen3_5MoeAttention,
 )
 
 
-def _build_model(*, rope_index=None, image_token_id=None, video_token_id=None):
+def _build_model(*, rope_index=None, image_token_id=None, video_token_id=None, attn_backend="te"):
     """Build a barebones Qwen3_5MoeForConditionalGeneration with stubbed deps."""
     model = Qwen3_5MoeForConditionalGeneration.__new__(Qwen3_5MoeForConditionalGeneration)
     nn.Module.__init__(model)
@@ -57,7 +58,14 @@ def _build_model(*, rope_index=None, image_token_id=None, video_token_id=None):
         image_token_id=image_token_id,
         video_token_id=video_token_id,
     )
+    model.backend = types.SimpleNamespace(attn=attn_backend)
     return model
+
+
+def test_declares_cp_vision_frame_sharding_support():
+    capabilities = Qwen3_5MoeForConditionalGeneration.ModelCapabilities()
+
+    assert capabilities.supports_cp_vision_frame_sharding is True
 
 
 class TestPrepareModelInputsForCP:
@@ -92,6 +100,64 @@ class TestPrepareModelInputsForCP:
         model = _build_model()
         out = model.prepare_model_inputs_for_cp({"input_ids": torch.tensor([[5, 6, 7, 8]])})
         assert "input_ids" not in out
+
+    def test_sdpa_selects_contiguous_blockdiag_sharder(self):
+        from nemo_automodel.components.distributed.blockdiag_cp import make_cp_blockdiag_batch_and_ctx
+        from nemo_automodel.components.distributed.context_parallel.sharder import contiguous_local_indices
+
+        model = _build_model(attn_backend="sdpa")
+        out = model.prepare_model_inputs_for_cp(
+            {
+                "input_ids": torch.tensor([[5, 6, 7, 8]]),
+                "_packed_seq_ids": torch.tensor([[1, 1, 2, 2]]),
+            }
+        )
+
+        sharder = out["cp_sharder"]
+        assert sharder.shard_batch.func is make_cp_blockdiag_batch_and_ctx
+        assert sharder.shard_batch.keywords == {"shard_primary": False}
+        assert sharder.local_token_global_indices is contiguous_local_indices
+
+    def test_nonpacked_sdpa_keeps_round_robin_sharder(self):
+        from nemo_automodel.components.distributed.context_parallel.sharder import (
+            round_robin_local_indices,
+            shard_batch_aux_only,
+        )
+
+        model = _build_model(attn_backend="sdpa")
+        out = model.prepare_model_inputs_for_cp(
+            {
+                "input_ids": torch.tensor([[5, 6, 7, 8]]),
+                "attention_mask": torch.ones(1, 4, dtype=torch.long),
+            }
+        )
+
+        sharder = out["cp_sharder"]
+        assert sharder.shard_batch is shard_batch_aux_only
+        assert sharder.local_token_global_indices is round_robin_local_indices
+
+    def test_single_document_4d_mask_selects_blockdiag_sharder(self):
+        from nemo_automodel.components.distributed.blockdiag_cp import make_cp_blockdiag_batch_and_ctx
+
+        model = _build_model(attn_backend="sdpa")
+        out = model.prepare_model_inputs_for_cp(
+            {
+                "input_ids": torch.tensor([[5, 6, 7, 8]]),
+                "attention_mask": torch.ones(1, 1, 4, 4, dtype=torch.bool).tril(),
+            }
+        )
+
+        assert out["cp_sharder"].shard_batch.func is make_cp_blockdiag_batch_and_ctx
+
+    def test_packed_te_rejected(self):
+        model = _build_model(attn_backend="te")
+        with pytest.raises(ValueError, match="packed context parallelism requires model.backend.attn='sdpa'"):
+            model.prepare_model_inputs_for_cp(
+                {
+                    "input_ids": torch.tensor([[5, 6, 7, 8]]),
+                    "_packed_seq_ids": torch.tensor([[1, 1, 2, 2]]),
+                }
+            )
 
     def test_existing_position_ids_not_recomputed(self):
         called = {"count": 0}
@@ -167,6 +233,88 @@ class TestEmbedAndSpliceForCP:
         )
         assert torch.allclose(emb[0, 1], torch.full((4,), 8.0))  # image token overwritten
         assert torch.allclose(emb[0, 0], torch.full((4,), 5.0))  # text token untouched
+
+    def test_image_features_use_frame_sharding_when_active(self, monkeypatch):
+        from nemo_automodel.components.models.qwen3_5_moe import model as model_module
+
+        model = _build_model(image_token_id=99)
+        model.model.visual = types.SimpleNamespace(dtype=torch.bfloat16)
+        feat = torch.full((1, 4), 8.0)
+        calls = []
+
+        def _distribute(visual, pixel_values, grid_thw):
+            calls.append((visual, pixel_values, grid_thw))
+            return types.SimpleNamespace(pooler_output=feat)
+
+        monkeypatch.setattr(model_module, "cp_vision_frame_sharding_active", lambda: True)
+        monkeypatch.setattr(model_module, "maybe_distribute_visual", _distribute)
+
+        grid = torch.tensor([[1, 2, 2]])
+        got = model._encode_vision_for_cp(torch.zeros(1, 3, 2, 2), grid, is_video=False)
+
+        assert got is feat
+        assert len(calls) == 1
+        assert calls[0][0] is model.model.visual
+        assert calls[0][1].dtype == torch.bfloat16
+        assert calls[0][2] is grid
+
+
+class TestPackedCPDispatch:
+    def test_full_attention_routes_through_blockdiag_sdpa(self, monkeypatch):
+        from nemo_automodel.components.distributed import blockdiag_cp
+        from nemo_automodel.components.models.qwen3_next import layers as qwen3_next_layers
+
+        attention = _Qwen3_5MoeAttention.__new__(_Qwen3_5MoeAttention)
+        nn.Module.__init__(attention)
+        attention.backend = types.SimpleNamespace(attn="sdpa", rope_fusion=False)
+        attention.head_dim = 2
+        attention.q_proj = nn.Linear(4, 8, bias=False)
+        attention.k_proj = nn.Linear(4, 4, bias=False)
+        attention.v_proj = nn.Linear(4, 4, bias=False)
+        attention.o_proj = nn.Linear(4, 4, bias=False)
+        attention.q_norm = nn.Identity()
+        attention.k_norm = nn.Identity()
+        attention._base_attn_func = lambda *args, **kwargs: pytest.fail("stock SDPA ran during block-diagonal CP")
+        attention.attn_func = attention._dispatch_attention
+
+        calls = []
+
+        def _cp_sdpa(q, k, v, **kwargs):
+            calls.append((q, k, v, kwargs))
+            return q
+
+        monkeypatch.setattr(qwen3_next_layers, "apply_rotary_emb_qk", lambda q, k, *args, **kwargs: (q, k))
+        monkeypatch.setattr(blockdiag_cp, "current_blockdiag_cp_state", lambda: {"row_offset": 0})
+        monkeypatch.setattr(blockdiag_cp, "cp_blockdiag_sdpa", _cp_sdpa)
+
+        x = torch.randn(1, 3, 4)
+        out = attention(x, freqs_cis=torch.zeros(3, 1, 3, 2))
+
+        assert out.shape == x.shape
+        assert len(calls) == 1
+        assert calls[0][0].shape == (1, 2, 3, 2)
+        assert calls[0][3]["is_causal"] is True
+
+    def test_gdn_forward_receives_active_blockdiag_state(self, monkeypatch):
+        from nemo_automodel.components.distributed import blockdiag_cp
+        from nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn import CPAwareGatedDeltaNet
+
+        module = CPAwareGatedDeltaNet.__new__(CPAwareGatedDeltaNet)
+        nn.Module.__init__(module)
+        module._cp_mesh = _FakeCPMesh(2)
+        captured = {}
+
+        def _forward_with_cp(self, hidden_states, **kwargs):
+            captured.update(kwargs)
+            return hidden_states
+
+        module._forward_with_cp = types.MethodType(_forward_with_cp, module)
+        state = {"doc_ids": torch.tensor([[1, 1, 2, 2]])}
+        monkeypatch.setattr(blockdiag_cp, "current_blockdiag_cp_state", lambda: state)
+
+        hidden = torch.randn(1, 2, 4)
+        assert module(hidden) is hidden
+        assert captured["blockdiag_state"] is state
 
 
 class _FakeCPMesh:

@@ -522,7 +522,7 @@ def make_unimm_chat_dataset(path_or_dataset="Yirany/UniMM-Chat", split="train", 
     return [format(example) for example in dataset]
 
 
-def _convert_sharegpt_to_conversation(
+def convert_sharegpt_to_conversation(
     example,
     columns=None,
     tags=None,
@@ -641,6 +641,14 @@ def _convert_sharegpt_to_conversation(
         result["_text_tokens"] = example["_text_tokens"]
 
     return result
+
+
+# The parser was private, but it is also the contract the ViSpec regeneration
+# script checks its output against (it verifies the prompt it writes rebuilds the
+# prompt it generated under). A caller outside this module needs a name that is
+# not declared unstable, so the public spelling above is canonical and this alias
+# keeps the existing in-module callers and their tests unchanged.
+_convert_sharegpt_to_conversation = convert_sharegpt_to_conversation
 
 
 def _load_json_or_jsonl(file_path):

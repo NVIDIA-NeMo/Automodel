@@ -91,6 +91,7 @@ from nemo_automodel.recipes.llm._dspark_target_build import (
     build_deepseek_v4_target,
     build_glm_5_2_target,
     gather_full_weight_module,
+    validate_dspark_parallelism_axes,
 )
 
 logger = logging.getLogger(__name__)
@@ -213,6 +214,9 @@ def _make_sync_max_steps(world_size: int, device: torch.device):
 
 def run(cfg) -> int:
     """Load the (possibly sharded) target and write the distributed DSpark cache."""
+    # The precompute runs the same forward-hook capture and rank-sharded data split as
+    # training, so it rejects the same model-parallel axes, before any weights load.
+    validate_dspark_parallelism_axes(cfg)
     dist_env = initialize_distributed(
         backend=cfg.get("dist_env", {}).get("backend", "nccl"),
         timeout_minutes=cfg.get("dist_env", {}).get("timeout_minutes", 30),

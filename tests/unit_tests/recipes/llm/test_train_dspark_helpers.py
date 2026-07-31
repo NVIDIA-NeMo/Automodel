@@ -55,6 +55,8 @@ from nemo_automodel.recipes.llm._dspark_target_build import (
     gather_full_weight_module,
     repair_glm_5_2_qk_rope_head_dim,
     resolve_reduced_target_layers,
+    unsupported_parallel_axes,
+    validate_dspark_parallelism_axes,
 )
 from nemo_automodel.recipes.llm.train_dspark import (
     TrainDSparkRecipe,
@@ -998,11 +1000,11 @@ def test_should_shard_dense_target_ignored_on_ddp():
     assert recipe._should_shard_dense_target({"shard_dense_target": True}) is False
 
 
-@pytest.mark.parametrize("axis", ["tp_size", "pp_size", "cp_size", "ep_size", "dp_replicate_size"])
+@pytest.mark.parametrize("axis", ["cp_size", "ep_size", "dp_replicate_size"])
 def test_should_shard_dense_target_rejects_non_pure_dp_axes(axis):
-    # Only a pure FSDP2 data-parallel topology is supported: pp_size>1 builds an
-    # AutoPipeline the target wrapper cannot run, tp/cp/ep are untested here, and
-    # HSDP replication (dp_replicate_size>1) re-replicates the target.
+    # Only a pure FSDP2 data-parallel topology is supported: cp/ep are untested here and
+    # HSDP replication (dp_replicate_size>1) re-replicates the target. tp_size / pp_size
+    # are rejected earlier for every run by validate_dspark_parallelism_axes.
     recipe = _make_shard_recipe(cfg={"distributed": {"strategy": "fsdp2", axis: 2}})
     with pytest.raises(ValueError, match=axis):
         recipe._should_shard_dense_target({"shard_dense_target": True})
@@ -1060,3 +1062,52 @@ def test_dspark_load_extra_state_accepts_legacy_meta_without_mask_token_id(tmp_p
     TrainDSparkRecipe._load_extra_state(obj, str(tmp_path))
     assert obj.runtime.global_step == 3
     assert obj._resume_epoch == 1
+
+
+def test_parallelism_axes_allow_data_and_expert_parallel_topologies():
+    """The supported DSpark topologies (pure DP, EP-sharded target, CP) pass the gate."""
+    for section in (
+        {},
+        {"ep_size": 8},
+        {"tp_size": 1, "pp_size": 1, "cp_size": 2, "ep_size": 1},
+        # explicit YAML nulls (``tp_size:``) must read as the default 1
+        {"tp_size": None, "pp_size": None},
+    ):
+        validate_dspark_parallelism_axes(ConfigNode({"distributed": section}))
+
+
+def test_parallelism_axes_allow_missing_distributed_block():
+    validate_dspark_parallelism_axes(ConfigNode({}))
+
+
+@pytest.mark.parametrize(
+    "section",
+    [
+        {"tp_size": 2},
+        {"pp_size": 2},
+        {"tp_size": 2, "pp_size": 4},
+    ],
+)
+def test_parallelism_axes_reject_tensor_and_pipeline_parallelism(section):
+    """tp_size/pp_size > 1 corrupt the supervision silently, so they must fail loudly.
+
+    A TP group's ranks each get a different micro-batch from the rank-sharded
+    sampler, and a pipelined target is an AutoPipeline the hidden-state capture
+    hooks cannot run.
+    """
+    with pytest.raises(NotImplementedError, match="DSpark does not support"):
+        validate_dspark_parallelism_axes(ConfigNode({"distributed": section}))
+
+
+def test_parallelism_axes_error_names_the_offending_axes():
+    with pytest.raises(NotImplementedError) as excinfo:
+        validate_dspark_parallelism_axes(ConfigNode({"distributed": {"tp_size": 4, "ep_size": 8}}))
+    message = str(excinfo.value)
+    assert "{'tp_size': 4}" in message
+
+
+def test_unsupported_parallel_axes_reads_absent_and_null_sizes_as_one():
+    """Shared by the up-front gate and the shard_dense_target gate, so both agree."""
+    assert unsupported_parallel_axes({}, ("tp_size", "pp_size")) == {}
+    assert unsupported_parallel_axes({"tp_size": None}, ("tp_size",)) == {}
+    assert unsupported_parallel_axes({"cp_size": 2, "ep_size": 1}, ("cp_size", "ep_size")) == {"cp_size": 2}
