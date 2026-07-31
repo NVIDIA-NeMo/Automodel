@@ -39,7 +39,7 @@ import random
 import shutil
 import time
 import warnings
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import numpy as np
 import torch
@@ -61,6 +61,9 @@ from nemo_automodel.components.training.step_scheduler import StepScheduler  # n
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config  # noqa: E402
 from nemo_automodel.recipes._typed_config import RecipeConfig  # noqa: E402
 from nemo_automodel.recipes.base_recipe import BaseRecipe  # noqa: E402
+
+if TYPE_CHECKING:
+    from torch.distributed.device_mesh import DeviceMesh
 
 try:
     from pydantic.warnings import UnsupportedFieldAttributeWarning
@@ -262,7 +265,13 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
     """
 
     def __init__(self, cfg):
-        self.cfg = cfg
+        """Initialize the recipe with configuration.
+
+        Args:
+            cfg: Recipe configuration. May be a raw ``ConfigNode`` or an
+                already-coerced ``RecipeConfig`` — the wrapper is idempotent.
+        """
+        self.cfg = cfg if isinstance(cfg, RecipeConfig) else RecipeConfig(cfg)
         self._throughput_window_start: float | None = None
         self._throughput_token_window = 0.0
         self._throughput_step_window = 0
@@ -270,7 +279,7 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
         self._last_train_steps_per_sec = 0.0
         self._last_tokens_per_step = 0.0
         self._vae_path: str | None = None
-        self.vae_encode_micro_batch_size = int(cfg.get("model.vae_encode_micro_batch_size", 0) or 0)
+        self.vae_encode_micro_batch_size = int(self.cfg.get("model.vae_encode_micro_batch_size", 0) or 0)
         if self.vae_encode_micro_batch_size < 0:
             raise ValueError("model.vae_encode_micro_batch_size must be >= 0")
 
@@ -351,6 +360,29 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
             load_bagel_hf_backbone_weights(model, self.cfg.model)
         return model
 
+    def _build_optimizers(
+        self, model: torch.nn.Module, *, device_mesh: DeviceMesh | None
+    ) -> list[torch.optim.Optimizer]:
+        """Build the training optimizers from the typed ``optimizer`` config.
+
+        Args:
+            model: Model to optimize. ``OptimizerConfig.build`` selects the
+                trainable parameters, so frozen backbones and the frozen VAE
+                stay out of the optimizer.
+            device_mesh: Device mesh used for parallelism-aware optimizer
+                options, or ``None`` when training on a single device.
+
+        Returns:
+            One optimizer per model part; BAGEL always has a single part.
+        """
+        if self.cfg.optimizer is None:
+            raise ValueError("BAGEL training requires an 'optimizer' config section")
+        return self.cfg.optimizer.build(
+            model,
+            device_mesh=device_mesh,
+            is_peft=self.cfg.get("peft", None) is not None,
+        )
+
     def _use_sharded_model_ema(self, *, ema_impl: str, model_init_mode: str) -> bool:
         """Resolve the EMA implementation choice."""
         if ema_impl == "shadow":
@@ -410,9 +442,14 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
         self.rng = StatefulRNG(seed=self.global_seed, ranked=True)
 
         # -- wandb --------------------------------------------------------
-        if self.dist_env.is_main and hasattr(self.cfg, "wandb"):
+        # ``wandb.enable: false`` is dropped by the CLI parser, so a missing
+        # section and a disabled one both resolve to ``None`` here.
+        if self.dist_env.is_main and self.cfg.wandb is not None:
             suppress_wandb_log_messages()
-            run = self._build_wandb()
+            run = self.cfg.wandb.build(
+                run_config=self.cfg.to_dict(),
+                model_name=_resolve_bagel_artifact_path(self.cfg) or "bagel",
+            )
             logging.info("Running run at %s", run.url)
 
         self._log_experiment_details()
@@ -540,10 +577,7 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
             self.ema = None
 
         # -- optimizer ----------------------------------------------------
-        opt_cfg = self.cfg.optimizer
-        trainable_params = [p for p in model.parameters() if p.requires_grad]
-        optimizer = opt_cfg.instantiate(params=trainable_params)
-        self.optimizer = [optimizer]
+        self.optimizer = self._build_optimizers(model, device_mesh=self.device_mesh)
 
         # -- LR scheduler (constant with warmup; BAGEL-style) ------------
         lr_cfg = self.cfg.get("lr_scheduler", None)
@@ -555,19 +589,15 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
                     f"FinetuneRecipeForMultimodal only supports constant schedule with warmup; got {schedule!r}"
                 )
             self.warmup_steps = warmup_steps
-            self.base_lr = float(optimizer.param_groups[0]["lr"])
+            self.base_lr = float(self.optimizer[0].param_groups[0]["lr"])
             self._use_lr_warmup = True
         else:
             self._use_lr_warmup = False
             self.warmup_steps = 0
-            self.base_lr = float(optimizer.param_groups[0]["lr"])
+            self.base_lr = float(self.optimizer[0].param_groups[0]["lr"])
 
         # -- dataset + dataloader ----------------------------------------
-        # The recipe holds a raw ConfigNode; ``bagel_dataloader`` is a typed
-        # RecipeConfig property, so resolve it through a RecipeConfig view here
-        # (rather than wrapping self.cfg, which would break the ConfigNode-style
-        # optimizer/wandb access used elsewhere in this recipe).
-        dataloader_config = RecipeConfig(self.cfg).bagel_dataloader
+        dataloader_config = self.cfg.bagel_dataloader
         if dataloader_config is None:
             raise ValueError("BAGEL training requires dataset and dataloader configs")
         dataloader_build = dataloader_config.build(
@@ -979,22 +1009,6 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
     # Logging helpers shared with FinetuneRecipeForVLM so BAGEL can keep its
     # dedicated packed-sequence training loop without inheriting VLM behavior.
     # ------------------------------------------------------------------
-    def _build_wandb(self):
-        assert self.cfg.get("wandb", None) is not None
-        from wandb import Settings
-
-        kwargs = self.cfg.wandb.to_dict()
-        if kwargs.get("name", "") == "":
-            # default name: model basename.
-            mp = _resolve_bagel_artifact_path(self.cfg) or "bagel"
-            kwargs["name"] = "_".join(str(mp).split("/")[-2:])
-        run = wandb.init(
-            **kwargs,
-            config=self.cfg.to_dict(),
-            settings=Settings(silent=True),
-        )
-        return run
-
     def log_train_metrics(self, log_data) -> None:
         if not self.dist_env.is_main:
             return

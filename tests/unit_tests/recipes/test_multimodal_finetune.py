@@ -15,6 +15,21 @@
 import ast
 from pathlib import Path
 
+import pytest
+import torch
+
+from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
+from nemo_automodel.components.config.loader import ConfigNode
+from nemo_automodel.components.datasets.multimodal.loader import BagelDataloaderConfig
+from nemo_automodel.components.loggers.loggers import WandbConfig
+from nemo_automodel.recipes._typed_config import RecipeConfig
+from nemo_automodel.recipes.multimodal.finetune import FinetuneRecipeForMultimodal
+from nemo_automodel.recipes.multimodal.pretrain import PretrainRecipeForMultimodal
+
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+_SFT_CONFIG = "examples/multimodal_finetune/bagel/bagel_sft.yaml"
+_PRETRAIN_CONFIG = "examples/multimodal_pretrain/bagel/bagel_pretrain.yaml"
+
 
 def test_bagel_auto_model_path_uses_distributed_setup_kwarg():
     """BAGEL's AutoModel path must match the shared VLM build_model API."""
@@ -63,20 +78,85 @@ def test_bagel_finalizes_pending_checkpoint_before_closing_checkpointer():
     assert events == ["train", "train_logger_close", "valid_logger_close", "finalize", "checkpointer_close"]
 
 
-def test_bagel_dataloader_resolved_through_recipeconfig():
-    """The recipe stores a raw ConfigNode, but ``bagel_dataloader`` is a typed
-    RecipeConfig property. It must be accessed via ``RecipeConfig(self.cfg)`` — a bare
-    ``self.cfg.bagel_dataloader`` raises AttributeError on a ConfigNode (the real CLI
-    entry hands the recipe a raw ConfigNode), which breaks every BAGEL run in ``setup``.
-    """
-    recipe_path = Path(__file__).resolve().parents[3] / "nemo_automodel/recipes/multimodal/finetune.py"
-    tree = ast.parse(recipe_path.read_text())
+@pytest.mark.parametrize(
+    ("config_path", "recipe_cls"),
+    [
+        (_SFT_CONFIG, FinetuneRecipeForMultimodal),
+        (_PRETRAIN_CONFIG, PretrainRecipeForMultimodal),
+    ],
+)
+def test_bagel_recipe_resolves_typed_sections_from_shipped_config(config_path, recipe_cls):
+    """The parser hands the recipe a raw ConfigNode; setup() consumes typed sections.
 
-    accesses = [node for node in ast.walk(tree) if isinstance(node, ast.Attribute) and node.attr == "bagel_dataloader"]
-    assert accesses, "expected a bagel_dataloader access in the recipe"
-    for node in accesses:
-        assert (
-            isinstance(node.value, ast.Call)
-            and isinstance(node.value.func, ast.Name)
-            and node.value.func.id == "RecipeConfig"
-        ), "bagel_dataloader must be resolved via RecipeConfig(self.cfg), not accessed on a raw ConfigNode"
+    Both shipped YAMLs must therefore resolve ``bagel_dataloader`` while the
+    sections the recipe still reads as raw nodes keep delegating.
+    """
+    recipe = recipe_cls(parse_args_and_load_config(_REPO_ROOT / config_path))
+
+    assert isinstance(recipe.cfg, RecipeConfig)
+
+    dataloader_config = recipe.cfg.bagel_dataloader
+    assert isinstance(dataloader_config, BagelDataloaderConfig)
+    assert dataloader_config.num_workers == 1
+    assert dataloader_config.pin_memory is True
+    assert dataloader_config.prefetch_factor == 2
+
+    # Sections without a typed accessor still resolve against the raw node.
+    assert recipe.cfg.get("step_scheduler.local_batch_size", None) == 1
+    assert recipe.cfg.model.get("stage", None) == recipe.cfg.get("model.stage", None)
+
+
+def test_bagel_recipe_wrapping_is_idempotent():
+    """Re-entrant construction (recipe -> recipe) must not double-wrap the config."""
+    raw = parse_args_and_load_config(_REPO_ROOT / _SFT_CONFIG)
+    recipe = FinetuneRecipeForMultimodal(FinetuneRecipeForMultimodal(raw).cfg)
+
+    assert recipe.cfg.bagel_dataloader.num_workers == 1
+
+
+def test_bagel_recipe_builds_optimizer_over_trainable_params_only():
+    """The typed optimizer config owns construction and skips frozen parameters."""
+    recipe = FinetuneRecipeForMultimodal(parse_args_and_load_config(_REPO_ROOT / _SFT_CONFIG))
+
+    model = torch.nn.Sequential(torch.nn.Linear(4, 4), torch.nn.Linear(4, 4))
+    model[1].requires_grad_(False)
+
+    optimizers = recipe._build_optimizers(model, device_mesh=None)
+
+    assert len(optimizers) == 1
+    assert isinstance(optimizers[0], torch.optim.AdamW)
+    (param_group,) = optimizers[0].param_groups
+    assert param_group["lr"] == pytest.approx(2.0e-5)
+    assert tuple(param_group["betas"]) == (0.9, 0.95)
+    # The shipped YAML disables foreach; the typed path must forward it verbatim.
+    assert param_group["foreach"] is False
+    assert [id(p) for p in param_group["params"]] == [id(p) for p in model[0].parameters()]
+
+
+def test_bagel_recipe_optimizer_build_requires_an_optimizer_section():
+    """A config without an ``optimizer:`` block fails with an actionable error."""
+    recipe = FinetuneRecipeForMultimodal(ConfigNode({"model": {"stage": 1}}))
+
+    with pytest.raises(ValueError, match="optimizer"):
+        recipe._build_optimizers(torch.nn.Linear(4, 4), device_mesh=None)
+
+
+def test_bagel_recipe_skips_wandb_when_shipped_config_disables_it():
+    """``wandb.enable: false`` is dropped by the parser, so setup() must see ``None``."""
+    recipe = FinetuneRecipeForMultimodal(parse_args_and_load_config(_REPO_ROOT / _SFT_CONFIG))
+
+    assert recipe.cfg.get("wandb", None) is None
+    assert recipe.cfg.wandb is None
+
+
+def test_bagel_recipe_resolves_typed_wandb_when_enabled():
+    """Enabling W&B yields the typed config setup() builds the run from."""
+    raw = parse_args_and_load_config(_REPO_ROOT / _SFT_CONFIG, ["--wandb.enable", "true"])
+    recipe = FinetuneRecipeForMultimodal(raw)
+
+    wandb_config = recipe.cfg.wandb
+    assert isinstance(wandb_config, WandbConfig)
+    assert wandb_config.project == "bagel-finetuning"
+    assert wandb_config.name == "bagel_7b_mot_sft"
+    # Non-field wandb.init kwargs stay available for the run.
+    assert wandb_config.extra["mode"] == "disabled"
