@@ -176,7 +176,8 @@ class MDLMCrossEntropyLoss(nn.Module):
 class SCDDSchedule:
     """Marginal of the SCDD forward process at a diffusion time.
 
-    SCDD (Self-Correcting Discrete Diffusion, arXiv:2603.02230) generalises the
+    SCDD (Self-Correcting Discrete Diffusion, openreview.net/forum?id=zQKlzKB6I9)
+    generalises the
     absorbing masked-diffusion forward process by mixing in uniform transitions,
     so the denoiser sees corrupted-but-plausible tokens during training and
     learns to *correct* them rather than only to fill ``[MASK]``. The marginal
@@ -269,7 +270,7 @@ def scdd_schedule(
 
 
 class SCDDLoss(nn.Module):
-    """Discrete-time NELBO for SCDD (arXiv:2603.02230).
+    """Discrete-time NELBO for SCDD (openreview.net/forum?id=zQKlzKB6I9).
 
     The forward process mixes an absorbing ``[MASK]`` channel with uniform
     transitions (see :func:`scdd_schedule`), so a position at time ``t`` is

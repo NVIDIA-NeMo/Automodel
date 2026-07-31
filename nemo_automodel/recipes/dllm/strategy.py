@@ -204,7 +204,9 @@ class MDLMStrategy(DLLMStrategy):
 
 
 class SCDDStrategy(DLLMStrategy):
-    """Strategy for SCDD (Self-Correcting Discrete Diffusion, arXiv:2603.02230).
+    """Strategy for SCDD (Self-Correcting Discrete Diffusion).
+
+    Paper: https://openreview.net/forum?id=zQKlzKB6I9
 
     SCDD generalises MDLM by adding a uniform-transition channel to the
     absorbing forward process, so the denoiser is trained on contexts that
