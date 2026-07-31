@@ -794,6 +794,7 @@ class Checkpointer:
             is_init_step=is_init_step,
             skip_task_head_prefixes=getattr(self.config, "skip_task_head_prefixes_for_base_model", None),
             cpu_offload=self.config.cpu_offload,
+            has_expert_parallelism=self.moe_mesh is not None,
         )
 
         # Check if this model requires tensor merging (e.g., Mixtral with grouped experts)

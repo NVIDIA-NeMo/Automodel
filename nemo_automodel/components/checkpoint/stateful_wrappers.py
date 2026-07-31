@@ -343,6 +343,8 @@ class ModelState:
         skip_task_head_prefixes: list[str] | None = None,
         cpu_offload: bool = False,
         pp_group: "torch.distributed.ProcessGroup | None" = None,
+        *,
+        has_expert_parallelism: bool = False,
     ):
         """
         Initialize a ModelState instance for distributed checkpointing.
@@ -369,6 +371,10 @@ class ModelState:
                 every PP stage's layers (not just the local stage's). Required
                 for correct PEFT saves under pipeline parallelism; ignored for
                 non-PEFT models and no-op when ``pp_size == 1``.
+            has_expert_parallelism: Whether the distributed topology uses expert
+                parallelism. This runtime topology signal keeps PEFT loading on
+                the same path across pipeline ranks, including stages without a
+                local expert module.
         """
         self.model = [model] if isinstance(model, torch.nn.Module) else model
         self.uses_tied_lm_head = is_tied_word_embeddings(self.model[0])
@@ -382,6 +388,7 @@ class ModelState:
         self.skip_task_head_prefixes = skip_task_head_prefixes or []
         self.cpu_offload = cpu_offload
         self.pp_group = pp_group
+        self.has_expert_parallelism = has_expert_parallelism
 
     def _refresh_local_tied_lm_head(self) -> None:
         """Refresh tied-head metadata after DCP has normalized module state."""
@@ -487,11 +494,14 @@ class ModelState:
             _drop_outer_prefix(state_dict, "base_model.model.")
             # DoRA: reverse the HF PEFT key rename so DCP can match model params
             _rename_dora_keys_from_hf(state_dict)
-            # @akoumpa: I'm not sure about this code.
             # For EP models, DCP's set_model_state_dict silently skips EP-sharded
             # LoRA params (strict=False hides the FQN mismatch caused by custom
             # expert state_dict() keys like gate_up_linear.weight0). Bypass DCP.
-            if _has_expert_parallelism(self.model[0]):
+            # Use the global topology signal first: under PP, some ranks may not
+            # own an expert layer, and choosing from local modules would make
+            # ranks enter different DCP collectives. Inspect every local model
+            # part as a fallback for callers that do not provide the topology.
+            if self.has_expert_parallelism or any(_has_expert_parallelism(part) for part in self.model):
                 for model_part in self.model:
                     _set_peft_state_dict(model_part, state_dict)
                 return
