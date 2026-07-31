@@ -27,7 +27,6 @@ Launch: torchrun --nproc-per-node=<N> -m <this_module> --config <config.yaml>
 
 from __future__ import annotations
 
-import faulthandler
 import gc
 import json
 import os
@@ -42,29 +41,11 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from nemo_automodel.recipes.base_recipe import BaseRecipe
 
-_IMPORT_WATCHDOG_SECONDS = int(os.environ.get("CHECKPOINT_ROBUSTNESS_IMPORT_WATCHDOG_SECONDS", "0"))
-
-
-def _report_module_import(message: str) -> None:
-    """Write a rank-0 marker while the checkpoint harness module is importing."""
-    if _IMPORT_WATCHDOG_SECONDS > 0 and int(os.environ.get("RANK", "0")) == 0:
-        stream = sys.__stdout__ or sys.stdout
-        print(f"[checkpoint_robustness][{time.strftime('%H:%M:%S')}] {message}", file=stream, flush=True)
-
-
-if _IMPORT_WATCHDOG_SECONDS > 0 and int(os.environ.get("RANK", "0")) == 0:
-    _report_module_import("Module preflight: importing third-party dependencies")
-    _watchdog_stream = sys.__stderr__ or sys.stderr
-    faulthandler.enable(file=_watchdog_stream)
-    faulthandler.dump_traceback_later(_IMPORT_WATCHDOG_SECONDS, repeat=True, file=_watchdog_stream)
-
 import datasets
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch.distributed.tensor import DTensor
-
-_report_module_import("Module preflight: third-party imports complete; importing AutoModel modules")
 
 from nemo_automodel.components.checkpoint.checkpointing import (
     _MODELS_REQUIRING_BUFFER_REINIT,
@@ -73,8 +54,6 @@ from nemo_automodel.components.checkpoint.checkpointing import (
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.shared.utils import dtype_from_str
-
-_report_module_import("Module preflight: AutoModel imports complete")
 
 datasets.disable_caching()
 
@@ -1168,24 +1147,10 @@ def _rank0() -> bool:
 
 
 def _report_phase(message: str) -> None:
-    """Write a timestamped rank-0 phase marker outside pytest output capture."""
+    """Report high-level checkpoint-robustness progress on rank 0."""
     if _preinit_global_rank() == 0:
         stream = sys.__stdout__ or sys.stdout
         print(f"[checkpoint_robustness][{time.strftime('%H:%M:%S')}] {message}", file=stream, flush=True)
-
-
-def _start_preflight_watchdog() -> None:
-    """Schedule repeated rank-0 tracebacks if checkpoint preflight stalls."""
-    if _preinit_global_rank() == 0:
-        stream = sys.__stderr__ or sys.stderr
-        faulthandler.enable(file=stream)
-        faulthandler.dump_traceback_later(300, repeat=True, file=stream)
-
-
-def _stop_preflight_watchdog() -> None:
-    """Cancel the checkpoint-preflight traceback timer on success."""
-    if _preinit_global_rank() == 0:
-        faulthandler.cancel_dump_traceback_later()
 
 
 def _barrier():
@@ -1294,7 +1259,6 @@ def _run_process_isolated_checkpoint_phase(
     if phase == "train_and_save":
         _report_phase("Isolated train/save: loading prompt input IDs")
         input_ids = _load_input_ids_once(cfg, input_ids_loader, tokenizer_name)
-        _stop_preflight_watchdog()
 
         torch.cuda.reset_peak_memory_stats()
         _report_phase("Isolated train/save: starting trainer setup")
@@ -1368,7 +1332,6 @@ def _run_process_isolated_checkpoint_phase(
             cfg.model.pretrained_model_name_or_path = str(consolidated_dir)
             cfg.checkpoint.enabled = False
 
-        _stop_preflight_watchdog()
         _report_phase("Isolated AutoModel reload: starting trainer setup")
         restored_trainer = recipe_cls(cfg)
         restored_trainer.setup()
@@ -1418,7 +1381,6 @@ def _run_process_isolated_checkpoint_phase(
         if hasattr(cfg, "lr_scheduler") and cfg.lr_scheduler is not None:
             cfg.lr_scheduler.lr_decay_steps = original_max_steps
 
-        _stop_preflight_watchdog()
         _report_phase("Isolated resume baseline: starting trainer setup")
         baseline_trainer = recipe_cls(cfg)
         baseline_trainer.setup()
@@ -1450,7 +1412,6 @@ def _run_process_isolated_checkpoint_phase(
     cfg.checkpoint.restore_from = str(ckpt_step_dir)
     cfg.step_scheduler.max_steps = resume_max_steps
 
-    _stop_preflight_watchdog()
     _report_phase("Isolated resume: starting setup and optimizer checkpoint load")
     resume_trainer = recipe_cls(cfg)
     resume_trainer.setup()
@@ -1555,13 +1516,8 @@ def run_checkpoint_robustness(
     source_load_cosine_threshold = float(custom_args.get("source_load_cosine_threshold", "0.9999"))
     deferred_failures: list[str] = []
 
-    _report_phase("Preflight: parsing resolved config")
     cfg = parse_args_and_load_config()
-    _report_phase("Preflight: resolved config parsed")
-    _report_phase("Preflight: loading prompt input IDs")
     input_ids = _load_input_ids_once(cfg, input_ids_loader, tokenizer_name)
-    _report_phase("Preflight: prompt input IDs ready")
-    _stop_preflight_watchdog()
 
     source_load_reference = None
     if check_source_load_parity:
@@ -1668,13 +1624,7 @@ def run_checkpoint_robustness(
         original_quantization_config = _raw_qc
 
     _release_recipe_memory(trainer)
-    _start_preflight_watchdog()
-    try:
-        _report_phase("Teardown: deleting initial trainer")
-        del trainer
-        _report_phase("Teardown: initial trainer deleted")
-    finally:
-        _stop_preflight_watchdog()
+    del trainer
 
     # Phase 3: Reload AutoModel from the consolidated checkpoint.
     # Phantom key check: scan consolidated safetensors for leaked quantization keys
@@ -2024,22 +1974,14 @@ def run_checkpoint_robustness(
 
 def test_checkpoint_robustness() -> None:
     """Run checkpoint robustness with the LLM finetune recipe."""
-    _start_preflight_watchdog()
-    try:
-        _report_phase("Preflight: importing AutoModelForCausalLM")
-        from transformers import AutoModelForCausalLM
+    from transformers import AutoModelForCausalLM
 
-        _report_phase("Preflight: AutoModelForCausalLM import complete")
-        _report_phase("Preflight: importing TrainFinetuneRecipeForNextTokenPrediction")
-        from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
+    from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
 
-        _report_phase("Preflight: TrainFinetuneRecipeForNextTokenPrediction import complete")
-        run_checkpoint_robustness(
-            recipe_cls=TrainFinetuneRecipeForNextTokenPrediction,
-            hf_model_cls=AutoModelForCausalLM,
-        )
-    finally:
-        _stop_preflight_watchdog()
+    run_checkpoint_robustness(
+        recipe_cls=TrainFinetuneRecipeForNextTokenPrediction,
+        hf_model_cls=AutoModelForCausalLM,
+    )
 
 
 if __name__ == "__main__":

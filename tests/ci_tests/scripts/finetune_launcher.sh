@@ -111,16 +111,12 @@ if [[ "$HAS_ROBUSTNESS" == "true" ]]; then
 
   echo "============================================"
   echo "[checkpoint_robustness] Running robustness test..."
-  echo "[checkpoint_robustness] CPU context: SLURM_CPUS_PER_TASK=${SLURM_CPUS_PER_TASK:-unset}" \
-    "OMP_NUM_THREADS=${OMP_NUM_THREADS:-unset}" \
-    "Cpus_allowed_list=$(awk '/Cpus_allowed_list/ {print $2}' /proc/self/status)"
   echo "============================================"
   ROBUSTNESS_START=$SECONDS
 
   # Repeated model teardown/reload phases can fragment the CUDA allocator
   # before the resume-training check. Preserve any caller-provided setting.
   export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
-  export CHECKPOINT_ROBUSTNESS_IMPORT_WATCHDOG_SECONDS=300
   ROBUSTNESS_EXIT_CODE=0
 
   if [[ "${CHECKPOINT_ROBUSTNESS_PROCESS_ISOLATION:-false}" == "true" ]]; then
