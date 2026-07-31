@@ -170,16 +170,17 @@ def test_transformer_engine_attention_cache_snapshot_preserves_checkpoint_op_seq
 
 
 def test_recompute_only_fsdp_unshard_op_bypasses_selective_ac_replay(monkeypatch):
-    """FSDP prefetch may make copy-in recompute-only; it must execute outside SAC indexing."""
+    """FSDP prefetch may make unshard ops recompute-only; they must bypass SAC indexing."""
     import torch.distributed.fsdp._fully_shard._fsdp_collectives  # noqa: F401
 
     fsdp_copy_in = torch.ops.fsdp.all_gather_copy_in.default
+    fsdp_view = torch.ops.aten.view.default
     sac_ignored = set(torch.utils.checkpoint.SAC_IGNORED_OPS)
     monkeypatch.setattr(torch.utils.checkpoint, "SAC_IGNORED_OPS", sac_ignored)
     ac.ensure_fsdp_ops_sac_ignored()
 
     def policy(ctx, func, *args, **kwargs):
-        if func == fsdp_copy_in:
+        if func in (fsdp_copy_in, fsdp_view):
             return CheckpointPolicy.MUST_SAVE
         return CheckpointPolicy.PREFER_RECOMPUTE
 
@@ -192,6 +193,7 @@ def test_recompute_only_fsdp_unshard_op_bypasses_selective_ac_replay(monkeypatch
         if fsdp_state["unsharded"]:
             all_gather_output = torch.empty_like(x)
             fsdp_copy_in([x.detach()], all_gather_output, [x.numel()], x.numel(), 0)
+            x = x.view(-1)
         fsdp_state["unsharded"] = True
         return x.sin()
 
@@ -218,6 +220,7 @@ def test_fsdp_runtime_ops_are_all_ignored_by_selective_ac(monkeypatch):
         torch.ops.fsdp.chunk_cat.default,
         torch.ops.fsdp.copy_.default,
         torch.ops.c10d._allgather_base_.default,
+        torch.ops.aten.view.default,
     }
     assert expected <= sac_ignored
 
