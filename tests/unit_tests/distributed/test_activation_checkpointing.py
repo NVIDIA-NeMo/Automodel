@@ -24,7 +24,7 @@ from packaging.version import Version
 from torch import nn
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper, checkpoint_wrapper
 from torch.nn.attention import SDPBackend, sdpa_kernel
-from torch.utils.checkpoint import CheckpointError
+from torch.utils.checkpoint import CheckpointError, CheckpointPolicy, checkpoint, create_selective_checkpoint_contexts
 
 from nemo_automodel.components.distributed import activation_checkpointing as ac
 
@@ -131,6 +131,42 @@ def test_snapshot_context_fn_recompute_ctx_restores_captured_backend_set():
             assert _sdp_backend_state() == _MATH_ONLY
         # The backward-time ambient state is restored once the recompute exits.
         assert _sdp_backend_state() == (True, True, False, False)
+
+
+def test_transformer_engine_attention_cache_snapshot_preserves_checkpoint_op_sequence(monkeypatch):
+    """TE cache population must not add an aten.ne.Tensor only during recompute."""
+    attention_cache = {"attention_params": None, "backend": None}
+    monkeypatch.setattr(ac, "_get_transformer_engine_attention_backend_cache", lambda: attention_cache)
+
+    def policy(ctx, func, *args, **kwargs):
+        if func == torch.ops.aten.ne.Tensor:
+            return CheckpointPolicy.MUST_SAVE
+        return CheckpointPolicy.PREFER_RECOMPUTE
+
+    def selective_context_fn():
+        return create_selective_checkpoint_contexts(policy)
+
+    def attention(x: torch.Tensor) -> torch.Tensor:
+        params = x.detach()
+        if attention_cache["attention_params"] is None or params != attention_cache["attention_params"]:
+            attention_cache["attention_params"] = params
+            attention_cache["backend"] = "fused"
+        return x.sin()
+
+    x = torch.randn(8, requires_grad=True)
+    out = checkpoint(
+        attention,
+        x,
+        use_reentrant=False,
+        context_fn=lambda: ac.transformer_engine_attention_backend_snapshot_context_fn(selective_context_fn),
+    )
+    cache_after_forward = dict(attention_cache)
+
+    out.sum().backward()
+
+    assert torch.allclose(x.grad, x.detach().cos())
+    assert attention_cache["attention_params"] is cache_after_forward["attention_params"]
+    assert attention_cache["backend"] == cache_after_forward["backend"]
 
 
 def test_submodule_checkpointing_with_snapshot_context_reruns_recompute_under_forward_backends():

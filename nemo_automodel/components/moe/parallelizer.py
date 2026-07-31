@@ -465,14 +465,19 @@ def apply_ac(
             from nemo_automodel.components.distributed.activation_checkpointing import (
                 SELECTIVE_AC_WRAPPER_FLAG,
                 make_selective_checkpoint_context_fn,
+                transformer_engine_attention_backend_snapshot_context_fn,
             )
 
             selective_context_fn = make_selective_checkpoint_context_fn()
+            attention_context_fn = functools.partial(
+                transformer_engine_attention_backend_snapshot_context_fn,
+                selective_context_fn,
+            )
             for parent_layers, layer_id, block in iter_transformer_and_mtp_blocks(model):
                 block = ptd_checkpoint_wrapper(
                     block,
                     preserve_rng_state=True,
-                    context_fn=_preserve_gate_load_during_recompute(block, selective_context_fn),
+                    context_fn=_preserve_gate_load_during_recompute(block, attention_context_fn),
                 )
                 # Tag so _apply_per_layer_compile compiles the wrapper OUTER (keeping the
                 # selective policy visible to the partitioner) instead of unwrapping and
@@ -539,9 +544,15 @@ def apply_ac(
     def selective_checkpointing_context_fn():
         return create_selective_checkpoint_contexts(_custom_policy)
 
-    from nemo_automodel.components.distributed.activation_checkpointing import ensure_profiler_ops_sac_ignored
+    from nemo_automodel.components.distributed.activation_checkpointing import (
+        ensure_profiler_ops_sac_ignored,
+        transformer_engine_attention_backend_snapshot_context_fn,
+    )
 
     ensure_profiler_ops_sac_ignored()
+
+    def _with_attention_backend_snapshot(context_fn=None):
+        return functools.partial(transformer_engine_attention_backend_snapshot_context_fn, context_fn)
 
     # Weight-tied (use_repeated_layer) MTP head blocks must NOT be activation
     # checkpointed: the single physical block is recomputed once per MTP depth in
@@ -568,13 +579,16 @@ def apply_ac(
             block = ptd_checkpoint_wrapper(
                 block,
                 preserve_rng_state=True,
-                context_fn=_preserve_gate_load_during_recompute(block, selective_checkpointing_context_fn),
+                context_fn=_preserve_gate_load_during_recompute(
+                    block,
+                    _with_attention_backend_snapshot(selective_checkpointing_context_fn),
+                ),
             )
         else:
             block = ptd_checkpoint_wrapper(
                 block,
                 preserve_rng_state=True,
-                context_fn=_preserve_gate_load_during_recompute(block),
+                context_fn=_preserve_gate_load_during_recompute(block, _with_attention_backend_snapshot()),
             )
 
         parent_layers.register_module(layer_id, block)

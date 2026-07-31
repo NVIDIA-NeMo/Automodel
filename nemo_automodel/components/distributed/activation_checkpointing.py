@@ -41,7 +41,7 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.utils.checkpoint import CheckpointPolicy, create_selective_checkpoint_contexts
 
-from nemo_automodel.shared.import_utils import get_torch_version
+from nemo_automodel.shared.import_utils import get_torch_version, safe_import
 
 logger = logging.getLogger(__name__)
 
@@ -397,6 +397,66 @@ def sdpa_backend_snapshot_context_fn() -> tuple[AbstractContextManager, Abstract
         if enabled
     ]
     return nullcontext(), _restore_sdpa_state(captured_sdpa, captured_backends)
+
+
+def _get_transformer_engine_attention_backend_cache() -> dict | None:
+    """Return Transformer Engine's attention-backend cache when available."""
+    available, dot_product_attention = safe_import(
+        "transformer_engine.pytorch.attention.dot_product_attention.dot_product_attention"
+    )
+    if not available:
+        return None
+    cache = getattr(dot_product_attention, "_attention_backends", None)
+    return cache if isinstance(cache, dict) else None
+
+
+@contextmanager
+def _restore_transformer_engine_attention_backend_cache(
+    cache: dict,
+    captured_cache: dict,
+    recompute_context: AbstractContextManager,
+):
+    """Restore the forward-entry TE attention cache only for recomputation."""
+    backward_cache = dict(cache)
+    cache.clear()
+    cache.update(captured_cache)
+    try:
+        with recompute_context:
+            yield
+    finally:
+        cache.clear()
+        cache.update(backward_cache)
+
+
+def transformer_engine_attention_backend_snapshot_context_fn(
+    context_fn: Callable[[], tuple[AbstractContextManager, AbstractContextManager]] | None = None,
+) -> tuple[AbstractContextManager, AbstractContextManager]:
+    """Snapshot Transformer Engine's attention-backend cache for checkpoint replay.
+
+    Transformer Engine caches the parameters and result of attention-backend
+    selection in module-global state. A checkpointed forward can populate that
+    cache, so backward-time recomputation would otherwise enter a different
+    parameter-comparison branch and dispatch a different aten op sequence. The
+    cache is restored to its forward-entry state for recomputation, then reset
+    to the state owned by the surrounding backward pass.
+
+    Args:
+        context_fn: Optional checkpoint context factory to compose inside the
+            cache restoration, such as a selective activation-checkpoint policy.
+
+    Returns:
+        ``(forward_ctx, recompute_ctx)`` with the supplied forward context and a
+        recompute context that restores the captured Transformer Engine cache.
+    """
+    forward_context, recompute_context = context_fn() if context_fn is not None else (nullcontext(), nullcontext())
+    cache = _get_transformer_engine_attention_backend_cache()
+    if cache is None:
+        return forward_context, recompute_context
+    return forward_context, _restore_transformer_engine_attention_backend_cache(
+        cache,
+        dict(cache),
+        recompute_context,
+    )
 
 
 def _registered_child_name(module: nn.Module, attr: str, child: nn.Module) -> str | None:
