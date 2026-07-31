@@ -648,6 +648,7 @@ def test_shard_thd_chunk_skips_missing_padding_mask(monkeypatch):
 
     assert "input_ids" in result
     assert "attention_mask" not in result
+    assert "cu_seqlens_padded" not in result
     # the partition IS the local-token global index map (mock returns arange)
     assert torch.equal(local_indices, torch.arange(4))
 

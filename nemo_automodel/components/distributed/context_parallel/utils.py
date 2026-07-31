@@ -847,17 +847,26 @@ def _shard_thd_chunk_for_te(
         if key in batch:
             batch[key] = batch[key].index_select(0, local_indices)
 
+    # Keep model-owned payloads (for example VLM media) by default. Only remove
+    # source metadata that is invalid after the THD CP conversion; the update
+    # below replaces every transformed field with its authoritative local value.
+    output_batch = batch.copy()
+    output_batch.pop("attention_mask", None)
+    output_batch.pop("cu_seqlens_padded", None)
+
     max_seqlen = (filtered_cu_seqlens_padded[1:] - filtered_cu_seqlens_padded[:-1]).max().item()
-    output_batch = {
-        "input_ids": batch["input_ids"].to(torch.int64).contiguous(),
-        "labels": batch["labels"].to(torch.int64).contiguous(),
-        "position_ids": batch["position_ids"].to(torch.int64).contiguous(),
-        "cu_seqlens": cu_seqlens_padded.to(torch.int32).contiguous(),
-        "max_seqlen": torch.tensor(max_seqlen).to(torch.int32).to(device=cu_seqlens_padded.device),
-        "qkv_format": qkv_format,
-        "cp_size": cp_size,
-        "cp_rank": cp_rank,
-    }
+    output_batch.update(
+        {
+            "input_ids": batch["input_ids"].to(torch.int64).contiguous(),
+            "labels": batch["labels"].to(torch.int64).contiguous(),
+            "position_ids": batch["position_ids"].to(torch.int64).contiguous(),
+            "cu_seqlens": cu_seqlens_padded.to(torch.int32).contiguous(),
+            "max_seqlen": torch.tensor(max_seqlen).to(torch.int32).to(device=cu_seqlens_padded.device),
+            "qkv_format": qkv_format,
+            "cp_size": cp_size,
+            "cp_rank": cp_rank,
+        }
+    )
 
     # Already partitioned above with the same local_indices as input_ids. Only
     # fall back to the token-value comparison when the caller supplied no mask;
@@ -868,25 +877,5 @@ def _shard_thd_chunk_for_te(
         output_batch["padding_mask"] = thd_padding_mask_from_token_ids(
             output_batch["input_ids"], padding_token_id
         ).contiguous()
-
-    # Preserve non-token payloads needed by multimodal models. The THD core
-    # consumes the sequence metadata below; media tensors/lists and model-owned
-    # maps must survive the CP partition and remain replicated on every rank.
-    consumed = {
-        "attention_mask",
-        "cu_seqlens",
-        "cu_seqlens_padded",
-        "input_ids",
-        "labels",
-        "max_seqlen",
-        "padding_mask",
-        "position_ids",
-        "qkv_format",
-        "seq_lens",
-        "seq_lens_padded",
-    }
-    for key, value in batch.items():
-        if key not in consumed and key not in output_batch:
-            output_batch[key] = value
 
     return output_batch, local_indices
