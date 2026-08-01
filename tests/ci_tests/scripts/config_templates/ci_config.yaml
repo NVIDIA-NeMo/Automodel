@@ -122,6 +122,7 @@ fixture_keys:
     - cross_tp_size
     - cosine_threshold
     - experts_implementation
+    - hf_adapter_ignored_key_prefix
     - hf_device_map_auto
     - hf_device_map_cpu_max_memory_gib
     - hf_device_map_max_memory_gib
