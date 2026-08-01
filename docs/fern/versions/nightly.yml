@@ -51,9 +51,6 @@ navigation:
       - page: "Release Log"
         path: ../../model-coverage/latest-models.mdx
         slug: release-log
-      - page: "Troubleshooting Models and First Runs"
-        path: ../../model-coverage/troubleshooting.mdx
-        slug: troubleshooting
       - section: "Large Language Models"
         slug: large-language-models
         contents:
@@ -315,6 +312,9 @@ navigation:
           - page: "Llama (Bidirectional)"
             path: ../../model-coverage/reranker/nvidia/llama-bidirectional.mdx
             slug: llama-bidirectional
+      - page: "Troubleshooting"
+        path: ../../model-coverage/troubleshooting.mdx
+        slug: troubleshooting
   - section: "Recipes & E2E Examples"
     slug: recipes-e2e-examples
     contents:
