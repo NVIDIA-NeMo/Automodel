@@ -2,10 +2,9 @@
 title: "Kimi Linear"
 description: ""
 ---
-[Kimi Linear](https://huggingface.co/moonshotai/Kimi-Linear-48B-A3B-Instruct) is a hybrid-attention Mixture-of-Experts language model from Moonshot AI. Most layers use Kimi Delta Attention (KDA), a gated linear-attention variant with a recurrent state, and the remaining layers use full Multi-head Latent Attention (MLA). NeMo AutoModel ships a native `KimiLinearForCausalLM` implementation with expert parallelism, packed sequences, and context parallelism.
+[Kimi Linear](https://huggingface.co/moonshotai/Kimi-Linear-48B-A3B-Instruct) is a hybrid-attention Mixture-of-Experts language model from Moonshot AI. Most layers use Kimi Delta Attention (KDA), a gated linear-attention variant with a recurrent state, and the remaining layers use full Multi-Head Latent Attention (MLA). NeMo AutoModel ships a native `KimiLinearForCausalLM` implementation with expert parallelism, packed sequences, and context parallelism.
 
 <Info>
-
 | | |
 |---|---|
 | **Task** | Text Generation (hybrid linear attention, MoE) |
@@ -31,10 +30,10 @@ description: ""
 |---|---|
 | FSDP2 | Default sharding strategy for the recipes below |
 | Expert parallelism (EP) | Shards the MoE experts across ranks |
-| Context parallelism (CP) | Contiguous per-rank sequence shards; KDA passes its recurrent state rank to rank, MLA gathers the compressed KV latent |
+| Context parallelism (CP) | Contiguous per-rank sequence shards. KDA passes its recurrent state from rank to rank, and MLA gathers the compressed KV latent |
 | Packed sequences | Document boundaries from the THD collater are honored by both layer types, including under CP |
 
-## Example HF Models
+## Example Hugging Face Models
 
 | Model | HF ID |
 |---|---|
@@ -49,7 +48,7 @@ description: ""
 
 ## Try with NeMo AutoModel
 
-**1. Clone and install from source** ([full instructions](/get-started/installation)):
+1. Clone and install from source. For full instructions, refer to [Installation](/get-started/installation):
 
 ```bash
 git clone https://github.com/NVIDIA-NeMo/Automodel.git
@@ -57,14 +56,14 @@ cd Automodel
 uv sync --locked --all-groups --all-extras
 ```
 
-**2. Run the recipe** from inside the repo:
+2. Run the recipe from inside the repository:
 
 ```bash
 uv run automodel --nproc-per-node=8 examples/llm_finetune/kimi/kimi_linear_48b_a3b_hellaswag.yaml
 ```
 
 <Accordion title="Run with Docker">
-**1. Pull the container** and mount a checkpoint directory:
+1. Pull the container and mount a checkpoint directory:
 
 ```bash
 docker run --gpus all -it --rm \
@@ -73,24 +72,24 @@ docker run --gpus all -it --rm \
   nvcr.io/nvidia/nemo-automodel:26.06.00
 ```
 
-**2.** Navigate to the AutoModel directory (where the recipes are):
+2. Navigate to the AutoModel directory where the recipes are located:
 
 ```bash
 cd /opt/Automodel
 ```
 
-**3. Run the recipe**:
+3. Run the recipe:
 
 ```bash
 automodel --nproc-per-node=8 examples/llm_finetune/kimi/kimi_linear_48b_a3b_hellaswag.yaml
 ```
 </Accordion>
 
-See the [Installation Guide](/get-started/installation) and [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft).
+Refer to the [Installation Guide](/get-started/installation) and the [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft).
 
 ## Fine-Tuning
 
-See the [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft).
+Refer to the [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft).
 
 ## Hugging Face Model Cards
 
