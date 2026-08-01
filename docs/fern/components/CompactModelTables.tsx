@@ -12,7 +12,15 @@ export function CompactModelTables({ children }: CompactModelTablesProps) {
   return (
     <div className="compact-model-tables">
       <style>{`
+        .compact-model-tables .fern-table-root {
+          width: fit-content !important;
+          max-width: 100%;
+        }
+
         .compact-model-tables .fern-table {
+          width: max-content !important;
+          min-width: 0 !important;
+          max-width: 100%;
           table-layout: auto !important;
         }
 

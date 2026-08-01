@@ -19,20 +19,20 @@
   },
   {
     "date": "2026-07-28",
-    "model": "Kimi K3",
-    "hf_model_id": "moonshotai/Kimi-K3",
-    "docs_page": "/model-coverage/large-language-models/kimi-k3",
-    "type": "LLM",
-    "recipe": "examples/llm_finetune/kimi/k3_hellaswag.yaml",
-    "brev_status": "planned"
-  },
-  {
-    "date": "2026-07-28",
     "model": "LTX-2.3",
     "hf_model_id": "diffusers/LTX-2.3-Diffusers",
     "docs_page": "/model-coverage/diffusion/overview",
     "type": "Diffusion",
     "recipe": "examples/diffusion/finetune/ltx2_3_t2v_flow.yaml",
+    "brev_status": "planned"
+  },
+  {
+    "date": "2026-07-27",
+    "model": "Kimi K3",
+    "hf_model_id": "moonshotai/Kimi-K3",
+    "docs_page": "/model-coverage/large-language-models/kimi-k3",
+    "type": "LLM",
+    "recipe": "examples/llm_finetune/kimi/k3_hellaswag.yaml",
     "brev_status": "planned"
   },
   {
@@ -69,15 +69,6 @@
     "docs_page": "/model-coverage/large-language-models/glm-5-moe-dsa",
     "type": "LLM",
     "recipe": "examples/llm_finetune/glm/glm_5.2_tulu3_32k_tilelang_cp8.yaml",
-    "brev_status": "planned"
-  },
-  {
-    "date": "2026-06-20",
-    "model": "Nemotron-3 Nano 4B",
-    "hf_model_id": "nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16",
-    "docs_page": "/model-coverage/large-language-models/nemotron-h",
-    "type": "LLM",
-    "recipe": "examples/llm_finetune/nemotron/nemotron_nano_4b_squad_peft.yaml",
     "brev_status": "planned"
   },
   {
@@ -348,6 +339,15 @@
     "docs_page": "/model-coverage/reranking-models/llama-bidirectional",
     "type": "Reranking",
     "recipe": "examples/retrieval/cross_encoder/llama3_2_1b.yaml",
+    "brev_status": "planned"
+  },
+  {
+    "date": "2026-03-30",
+    "model": "Nemotron-3 Nano 4B",
+    "hf_model_id": "nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16",
+    "docs_page": "/model-coverage/large-language-models/nemotron-h",
+    "type": "LLM",
+    "recipe": "examples/llm_finetune/nemotron/nemotron_nano_4b_squad_peft.yaml",
     "brev_status": "planned"
   },
   {

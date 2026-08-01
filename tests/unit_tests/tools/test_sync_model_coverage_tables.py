@@ -338,7 +338,7 @@ def test_model_release_catalog_requires_recipe(tmp_path):
         _load_model_releases(catalog_path, tmp_path)
 
 
-def test_model_release_catalog_uses_recipe_creation_date_not_modification_date(tmp_path):
+def test_model_release_catalog_uses_first_yaml_for_model_id(tmp_path):
     subprocess.run(["git", "init", "-q", "-b", "main", str(tmp_path)], check=True)
     (tmp_path / "README.md").write_text("test repository\n", encoding="utf-8")
     subprocess.run(["git", "-C", str(tmp_path), "add", "README.md"], check=True)
@@ -361,9 +361,10 @@ def test_model_release_catalog_uses_recipe_creation_date_not_modification_date(t
     subprocess.run(["git", "-C", str(tmp_path), "checkout", "-q", "-b", "feature"], check=True)
 
     (tmp_path / "examples").mkdir()
-    recipe_path = "examples/model.yaml"
-    (tmp_path / recipe_path).write_text("model: created\n", encoding="utf-8")
-    subprocess.run(["git", "-C", str(tmp_path), "add", recipe_path], check=True)
+    first_recipe_path = "examples/first.yaml"
+    selected_recipe_path = "examples/selected.yaml"
+    (tmp_path / first_recipe_path).write_text("model: org/model\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(tmp_path), "add", first_recipe_path], check=True)
 
     def commit(message: str, timestamp: str) -> None:
         subprocess.run(
@@ -385,9 +386,10 @@ def test_model_release_catalog_uses_recipe_creation_date_not_modification_date(t
             env={**os.environ, "GIT_COMMITTER_DATE": timestamp},
         )
 
-    commit("add recipe", "2026-07-29T12:00:00Z")
-    (tmp_path / recipe_path).write_text("model: modified\n", encoding="utf-8")
-    commit("modify recipe", "2026-07-30T12:00:00Z")
+    commit("add first model recipe", "2026-07-29T12:00:00Z")
+    (tmp_path / selected_recipe_path).write_text("model: org/model\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(tmp_path), "add", selected_recipe_path], check=True)
+    commit("add selected model recipe", "2026-07-30T12:00:00Z")
 
     catalog = [
         {
@@ -396,14 +398,14 @@ def test_model_release_catalog_uses_recipe_creation_date_not_modification_date(t
             "hf_model_id": "org/model",
             "docs_page": "/model-coverage/model",
             "type": "LLM",
-            "recipe": recipe_path,
+            "recipe": selected_recipe_path,
             "brev_status": "planned",
         }
     ]
     catalog_path = tmp_path / "model-releases.json"
     catalog_path.write_text(json.dumps(catalog), encoding="utf-8")
 
-    with pytest.raises(ValueError, match="recipe 'examples/model.yaml' was created on 2026-07-29"):
+    with pytest.raises(ValueError, match="first YAML was created on 2026-07-29"):
         _load_model_releases(catalog_path, tmp_path)
 
 
