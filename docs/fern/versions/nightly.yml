@@ -359,6 +359,7 @@ navigation:
             contents:
               - page: "LLaVA-OneVision"
                 path: ../../model-coverage/vlm/lmms-lab/llava-onevision.mdx
+                slug: llava-onevision
           - section: "Hugging Face"
             slug: huggingface
             contents:

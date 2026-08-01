@@ -228,6 +228,8 @@ redirects:
     destination: "/nemo/automodel/nightly/model-coverage/vision-language-models/llava-hf/llava"
   - source: "/nemo/automodel/nightly/model-coverage/vision-language-models/llava-onevision"
     destination: "/nemo/automodel/nightly/model-coverage/vision-language-models/lmms-lab/llava-onevision"
+  - source: "/nemo/automodel/nightly/model-coverage/vision-language-models/l-la-va-one-vision"
+    destination: "/nemo/automodel/nightly/model-coverage/vision-language-models/lmms-lab/llava-onevision"
   - source: "/nemo/automodel/nightly/model-coverage/vision-language-models/minimax-m3"
     destination: "/nemo/automodel/nightly/model-coverage/vision-language-models/minimax/minimax-m3"
   - source: "/nemo/automodel/nightly/model-coverage/vision-language-models/ministral3-vl"
