@@ -106,6 +106,32 @@ def test_model_release_docs_pages_exist_in_nightly_navigation():
     assert not missing_pages, f"Model release docs pages missing from nightly navigation: {missing_pages}"
 
 
+def test_embedding_and_reranking_catalog_lists_documented_models():
+    repo_root = Path(__file__).parents[3]
+    releases = json.loads((repo_root / "docs" / "model-coverage" / "model-releases.json").read_text(encoding="utf-8"))
+    models_by_type = {
+        model_type: {release["hf_model_id"] for release in releases if release["type"] == model_type}
+        for model_type in ("Embedding", "Reranking")
+    }
+
+    assert models_by_type == {
+        "Embedding": {
+            "meta-llama/Llama-3.1-8B",
+            "meta-llama/Llama-3.2-1B",
+            "mistralai/Ministral-3-3B-Base-2512",
+            "mistralai/Ministral-3-3B-Instruct-2512",
+            "nvidia/llama-embed-nemotron-8b",
+            "nvidia/llama-nemotron-embed-1b-v2",
+            "nvidia/llama-nemotron-embed-vl-1b-v2",
+        },
+        "Reranking": {
+            "meta-llama/Llama-3.1-8B",
+            "meta-llama/Llama-3.2-1B",
+            "nvidia/llama-nemotron-rerank-1b-v2",
+        },
+    }
+
+
 def test_sync_tables_writes_release_log_homepage_and_registry(tmp_path):
     (tmp_path / "docs" / "model-coverage").mkdir(parents=True)
     (tmp_path / "nemo_automodel" / "_transformers").mkdir(parents=True)
@@ -119,21 +145,21 @@ def test_sync_tables_writes_release_log_homepage_and_registry(tmp_path):
             "model": "Documentation Model",
             "hf_model_id": "org/documentation-model",
             "docs_page": "/model-coverage/vision-language-models/documentation-model",
-            "modality": "VLM",
+            "type": "VLM",
             "recipe": shared_recipe,
             "brev_status": "available",
             "brev_url": "https://brev.nvidia.com/launchable/deploy/now?launchableID=test",
         }
     ]
-    for modality in ("Omni", "dLLM", "Multimodal", "Diffusion", "Encoder-Decoder", "Retriever"):
-        modality_slug = modality.lower().replace(" ", "-")
+    for model_type in ("Omni", "dLLM", "Multimodal", "Diffusion", "Encoder-Decoder", "Embedding", "Reranking"):
+        type_slug = model_type.lower().replace(" ", "-")
         releases.append(
             {
                 "date": "2026-07-31",
-                "model": f"{modality} Model",
-                "hf_model_id": f"org/{modality_slug}-model",
-                "docs_page": f"/model-coverage/{modality_slug}/model",
-                "modality": modality,
+                "model": f"{model_type} Model",
+                "hf_model_id": f"org/{type_slug}-model",
+                "docs_page": f"/model-coverage/{type_slug}/model",
+                "type": model_type,
                 "recipe": shared_recipe,
                 "brev_status": "planned",
             }
@@ -147,7 +173,7 @@ def test_sync_tables_writes_release_log_homepage_and_registry(tmp_path):
                 "model": f"Model {index}",
                 "hf_model_id": f"org/model-{index}",
                 "docs_page": f"/model-coverage/large-language-models/model-{index}",
-                "modality": "LLM",
+                "type": "LLM",
                 "recipe": recipe_path,
                 "brev_status": "planned",
             }
@@ -188,7 +214,8 @@ def test_sync_tables_writes_release_log_homepage_and_registry(tmp_path):
         "Multimodal",
         "Diffusion",
         "Encoder-Decoder",
-        "Retriever",
+        "Embedding",
+        "Reranking",
     ]
     assert re.findall(r'<Tab title="([^"]+)">', release_log) == expected_tabs
     homepage = (tmp_path / "docs" / "index.mdx").read_text(encoding="utf-8")
@@ -226,7 +253,7 @@ def test_model_release_catalog_rejects_non_chronological_entries(tmp_path):
             "model": "Older Model",
             "hf_model_id": "org/older-model",
             "docs_page": "/model-coverage/large-language-models/older-model",
-            "modality": "LLM",
+            "type": "LLM",
             "recipe": recipe_path,
             "brev_status": "unavailable",
         },
@@ -235,7 +262,7 @@ def test_model_release_catalog_rejects_non_chronological_entries(tmp_path):
             "model": "Newer Model",
             "hf_model_id": "org/newer-model",
             "docs_page": "/model-coverage/large-language-models/newer-model",
-            "modality": "LLM",
+            "type": "LLM",
             "recipe": recipe_path,
             "brev_status": "planned",
         },
@@ -254,7 +281,7 @@ def test_model_release_catalog_requires_iso_date_format(tmp_path):
             "model": "Model",
             "hf_model_id": "org/model",
             "docs_page": "/model-coverage/large-language-models/model",
-            "modality": "LLM",
+            "type": "LLM",
             "recipe": None,
             "brev_status": "planned",
         }
@@ -273,7 +300,7 @@ def test_model_release_catalog_requires_version_agnostic_docs_page(tmp_path):
             "model": "Model",
             "hf_model_id": "org/model",
             "docs_page": "https://docs.nvidia.com/nemo/automodel/nightly/model",
-            "modality": "LLM",
+            "type": "LLM",
             "recipe": None,
             "brev_status": "planned",
         }
@@ -292,7 +319,7 @@ def test_model_release_catalog_requires_recipe(tmp_path):
             "model": "Model",
             "hf_model_id": "org/model",
             "docs_page": "/model-coverage/large-language-models/model",
-            "modality": "LLM",
+            "type": "LLM",
             "recipe": None,
             "brev_status": "planned",
         }
@@ -302,6 +329,30 @@ def test_model_release_catalog_requires_recipe(tmp_path):
 
     with pytest.raises(ValueError, match="field 'recipe' must be a non-empty Markdown-safe string"):
         _load_model_releases(catalog_path, tmp_path)
+
+
+def test_model_release_catalog_allows_same_hf_model_for_different_types(tmp_path):
+    (tmp_path / "examples").mkdir()
+    recipe_path = "examples/model.yaml"
+    (tmp_path / recipe_path).write_text("model: test\n", encoding="utf-8")
+    catalog = [
+        {
+            "date": "2026-07-30",
+            "model": f"Model {model_type}",
+            "hf_model_id": "org/model",
+            "docs_page": "/model-coverage/model",
+            "type": model_type,
+            "recipe": recipe_path,
+            "brev_status": "planned",
+        }
+        for model_type in ("LLM", "Embedding", "Reranking")
+    ]
+    catalog_path = tmp_path / "model-releases.json"
+    catalog_path.write_text(json.dumps(catalog), encoding="utf-8")
+
+    releases = _load_model_releases(catalog_path, tmp_path)
+
+    assert [release.model_type for release in releases] == ["LLM", "Embedding", "Reranking"]
 
 
 def test_sync_tables_check_rejects_stale_generated_release_log(tmp_path):
@@ -318,7 +369,7 @@ def test_sync_tables_check_rejects_stale_generated_release_log(tmp_path):
                 "model": f"Model {index}",
                 "hf_model_id": f"org/model-{index}",
                 "docs_page": f"/model-coverage/large-language-models/model-{index}",
-                "modality": "LLM",
+                "type": "LLM",
                 "recipe": recipe_path,
                 "brev_status": "planned",
             }

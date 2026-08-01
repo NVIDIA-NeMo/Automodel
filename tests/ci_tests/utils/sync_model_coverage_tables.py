@@ -35,7 +35,7 @@ HF_MODEL_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 RELEASE_DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 RECIPE_PATH_PATTERN = re.compile(r"^examples/[A-Za-z0-9_./-]+\.yaml$")
 DOCS_PAGE_PATTERN = re.compile(r"^/[a-z0-9][a-z0-9/-]*$")
-MODALITY_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9 -]*$")
+MODEL_TYPE_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9 -]*$")
 MARKDOWN_UNSAFE_PATTERN = re.compile(r"[\[\]|<>`\r\n]")
 REPOSITORY_URL = "https://github.com/NVIDIA-NeMo/Automodel/blob/main"
 _BrevStatus = Literal["available", "planned", "unavailable"]
@@ -47,7 +47,7 @@ class _ModelRelease:
     model: str
     hf_model_id: str
     docs_page: str
-    modality: str
+    model_type: str
     recipe: str
     brev_status: _BrevStatus
     brev_url: str | None
@@ -82,7 +82,7 @@ def _load_model_releases(catalog_path: Path, repo_root: Path) -> list[_ModelRele
 
     releases = []
     seen_models = set()
-    seen_hf_model_ids = set()
+    seen_hf_model_types = set()
     previous_date: str | None = None
     for index, raw_entry in enumerate(raw_entries, start=1):
         if not isinstance(raw_entry, dict):
@@ -92,16 +92,14 @@ def _load_model_releases(catalog_path: Path, repo_root: Path) -> list[_ModelRele
             "model",
             "hf_model_id",
             "docs_page",
-            "modality",
+            "type",
             "recipe",
             "brev_status",
             "brev_url",
         }
         if unknown_fields:
             raise ValueError(f"Model release {index} has unknown fields: {', '.join(sorted(unknown_fields))}")
-        missing_fields = {"date", "model", "hf_model_id", "docs_page", "modality", "recipe", "brev_status"} - set(
-            raw_entry
-        )
+        missing_fields = {"date", "model", "hf_model_id", "docs_page", "type", "recipe", "brev_status"} - set(raw_entry)
         if missing_fields:
             raise ValueError(f"Model release {index} is missing fields: {', '.join(sorted(missing_fields))}")
 
@@ -121,19 +119,23 @@ def _load_model_releases(catalog_path: Path, repo_root: Path) -> list[_ModelRele
         model = _require_catalog_text(raw_entry, "model", index)
         hf_model_id = _require_catalog_text(raw_entry, "hf_model_id", index)
         docs_page = _require_catalog_text(raw_entry, "docs_page", index)
-        modality = _require_catalog_text(raw_entry, "modality", index)
+        model_type = _require_catalog_text(raw_entry, "type", index)
         if not HF_MODEL_ID_PATTERN.fullmatch(hf_model_id):
             raise ValueError(f"Model release {index} has invalid Hugging Face model ID {hf_model_id!r}")
         if not DOCS_PAGE_PATTERN.fullmatch(docs_page) or "//" in docs_page or ".." in docs_page:
             raise ValueError(f"Model release {index} has invalid version-agnostic docs page {docs_page!r}")
-        if not MODALITY_PATTERN.fullmatch(modality):
-            raise ValueError(f"Model release {index} has invalid modality {modality!r}")
+        if not MODEL_TYPE_PATTERN.fullmatch(model_type):
+            raise ValueError(f"Model release {index} has invalid type {model_type!r}")
         if model in seen_models:
             raise ValueError(f"Model release catalog contains duplicate model {model!r}")
-        if hf_model_id in seen_hf_model_ids:
-            raise ValueError(f"Model release catalog contains duplicate Hugging Face model ID {hf_model_id!r}")
+        hf_model_type = (hf_model_id, model_type)
+        if hf_model_type in seen_hf_model_types:
+            raise ValueError(
+                f"Model release catalog contains duplicate Hugging Face model ID {hf_model_id!r} "
+                f"for type {model_type!r}"
+            )
         seen_models.add(model)
-        seen_hf_model_ids.add(hf_model_id)
+        seen_hf_model_types.add(hf_model_type)
 
         recipe = _require_catalog_text(raw_entry, "recipe", index)
         recipe_path = Path(recipe)
@@ -175,7 +177,7 @@ def _load_model_releases(catalog_path: Path, repo_root: Path) -> list[_ModelRele
                 model=model,
                 hf_model_id=hf_model_id,
                 docs_page=docs_page,
-                modality=modality,
+                model_type=model_type,
                 recipe=recipe,
                 brev_status=brev_status,
                 brev_url=brev_url,
@@ -196,13 +198,13 @@ def _render_model_with_recipe(release: _ModelRelease) -> str:
 
 def _render_release_table(releases: list[_ModelRelease]) -> str:
     table_rows = [
-        f"| {release.release_date} | {release.modality} | {_render_model_with_recipe(release)} |"
+        f"| {release.release_date} | {release.model_type} | {_render_model_with_recipe(release)} |"
         for release in releases
     ]
 
     return "\n".join(
         [
-            "| Date | Modality | Model |",
+            "| Date | Type | Model |",
             "|------|----------|-------|",
             *table_rows,
         ]
@@ -213,7 +215,7 @@ def _render_release_tabs(releases: list[_ModelRelease]) -> str:
     if len(releases) < TABLE_ROW_COUNT:
         raise ValueError(f"Model release catalog contains only {len(releases)} releases")
 
-    preferred_modalities = (
+    preferred_types = (
         "LLM",
         "VLM",
         "Omni",
@@ -221,18 +223,20 @@ def _render_release_tabs(releases: list[_ModelRelease]) -> str:
         "Multimodal",
         "Diffusion",
         "Encoder-Decoder",
-        "Retriever",
+        "Embedding",
+        "Reranking",
     )
-    preferred_modality_order = {modality: index for index, modality in enumerate(preferred_modalities)}
-    modalities = sorted(
-        {release.modality for release in releases},
-        key=lambda modality: (
-            preferred_modality_order.get(modality, len(preferred_modality_order)),
-            modality.casefold(),
+    preferred_type_order = {model_type: index for index, model_type in enumerate(preferred_types)}
+    model_types = sorted(
+        {release.model_type for release in releases},
+        key=lambda model_type: (
+            preferred_type_order.get(model_type, len(preferred_type_order)),
+            model_type.casefold(),
         ),
     )
     tabs = [("All", releases)] + [
-        (modality, [release for release in releases if release.modality == modality]) for modality in modalities
+        (model_type, [release for release in releases if release.model_type == model_type])
+        for model_type in model_types
     ]
     tab_blocks = [
         "\n".join([f'<Tab title="{title}">', "", _render_release_table(tab_releases[:TABLE_ROW_COUNT]), "", "</Tab>"])

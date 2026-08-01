@@ -4,7 +4,7 @@
     "model": "Inkling / Inkling-Small",
     "hf_model_id": "thinkingmachines/Inkling-Small",
     "docs_page": "/model-coverage/vision-language-models/inkling",
-    "modality": "VLM",
+    "type": "VLM",
     "recipe": "examples/vlm_finetune/inkling/Inkling_small_medpix_ep64.yaml",
     "brev_status": "planned"
   },
@@ -13,7 +13,7 @@
     "model": "Nemotron-3 Nano 4B",
     "hf_model_id": "nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16",
     "docs_page": "/model-coverage/large-language-models/nemotron-h",
-    "modality": "LLM",
+    "type": "LLM",
     "recipe": "examples/llm_finetune/nemotron/nemotron_nano_4b_squad_peft.yaml",
     "brev_status": "planned"
   },
@@ -22,7 +22,7 @@
     "model": "T5",
     "hf_model_id": "google-t5/t5-small",
     "docs_page": "/model-coverage/overview",
-    "modality": "Encoder-Decoder",
+    "type": "Encoder-Decoder",
     "recipe": "examples/llm_finetune/t5/t5_small_squad.yaml",
     "brev_status": "planned"
   },
@@ -31,7 +31,7 @@
     "model": "Kimi K3",
     "hf_model_id": "moonshotai/Kimi-K3",
     "docs_page": "/model-coverage/large-language-models/kimi-k3",
-    "modality": "LLM",
+    "type": "LLM",
     "recipe": "examples/llm_finetune/kimi/k3_hellaswag.yaml",
     "brev_status": "planned"
   },
@@ -40,7 +40,7 @@
     "model": "LTX-2.3",
     "hf_model_id": "diffusers/LTX-2.3-Diffusers",
     "docs_page": "/model-coverage/diffusion/overview",
-    "modality": "Diffusion",
+    "type": "Diffusion",
     "recipe": "examples/diffusion/finetune/ltx2_3_t2v_flow.yaml",
     "brev_status": "planned"
   },
@@ -49,7 +49,7 @@
     "model": "Qwen-Image-Edit-2511",
     "hf_model_id": "Qwen/Qwen-Image-Edit-2511",
     "docs_page": "/model-coverage/diffusion/qwen-image",
-    "modality": "Diffusion",
+    "type": "Diffusion",
     "recipe": "examples/diffusion/finetune/qwen_image_edit_2511_flow.yaml",
     "brev_status": "planned"
   },
@@ -58,7 +58,7 @@
     "model": "Laguna-S-2.1",
     "hf_model_id": "poolside/Laguna-S-2.1",
     "docs_page": "/model-coverage/large-language-models/laguna",
-    "modality": "LLM",
+    "type": "LLM",
     "recipe": "examples/llm_finetune/laguna/laguna_s_2p1_hellaswag_ep16.yaml",
     "brev_status": "planned"
   },
@@ -66,8 +66,8 @@
     "date": "2026-06-27",
     "model": "Llama Nemotron Embed VL 1B v2",
     "hf_model_id": "nvidia/llama-nemotron-embed-vl-1b-v2",
-    "docs_page": "/model-coverage/embedding-models/llama-bidirectional",
-    "modality": "Retriever",
+    "docs_page": "/model-coverage/embedding-models/overview",
+    "type": "Embedding",
     "recipe": "examples/retrieval/bi_encoder/nemotron_vl_1b/nemotron_vl_1b_example.yaml",
     "brev_status": "planned"
   },
@@ -76,7 +76,7 @@
     "model": "GLM-5.2",
     "hf_model_id": "zai-org/GLM-5.2",
     "docs_page": "/model-coverage/large-language-models/glm-5-moe-dsa",
-    "modality": "LLM",
+    "type": "LLM",
     "recipe": "examples/llm_finetune/glm/glm_5.2_tulu3_32k_tilelang_cp8.yaml",
     "brev_status": "planned"
   },
@@ -85,7 +85,7 @@
     "model": "MiniMax-M3",
     "hf_model_id": "MiniMaxAI/MiniMax-M3",
     "docs_page": "/model-coverage/vision-language-models/minimax-m3",
-    "modality": "VLM",
+    "type": "VLM",
     "recipe": "examples/vlm_finetune/minimax_m3/minimax_m3_vl_sft_ep32pp4.yaml",
     "brev_status": "planned"
   },
@@ -94,7 +94,7 @@
     "model": "DiffusionGemma 26B-A4B",
     "hf_model_id": "google/diffusiongemma-26B-A4B-it",
     "docs_page": "/model-coverage/dllm/diffusiongemma",
-    "modality": "dLLM",
+    "type": "dLLM",
     "recipe": "examples/dllm_sft/diffusion_gemma_sft.yaml",
     "brev_status": "planned"
   },
@@ -103,7 +103,7 @@
     "model": "FLUX.2-dev",
     "hf_model_id": "black-forest-labs/FLUX.2-dev",
     "docs_page": "/model-coverage/diffusion/overview",
-    "modality": "Diffusion",
+    "type": "Diffusion",
     "recipe": "examples/diffusion/finetune/flux2_t2i_flow.yaml",
     "brev_status": "planned"
   },
@@ -112,7 +112,7 @@
     "model": "BAGEL",
     "hf_model_id": "ByteDance-Seed/BAGEL-7B-MoT",
     "docs_page": "/model-coverage/multimodal/bagel",
-    "modality": "Multimodal",
+    "type": "Multimodal",
     "recipe": "examples/multimodal_finetune/bagel/bagel_sft.yaml",
     "brev_status": "planned"
   },
@@ -121,7 +121,7 @@
     "model": "Falcon H1",
     "hf_model_id": "tiiuae/Falcon-H1-7B-Instruct",
     "docs_page": "/model-coverage/large-language-models/overview",
-    "modality": "LLM",
+    "type": "LLM",
     "recipe": "examples/llm_finetune/falcon/falcon_h1_7b_instruct_squad.yaml",
     "brev_status": "planned"
   },
@@ -130,7 +130,7 @@
     "model": "Nemotron-3 Ultra-550B-A55B",
     "hf_model_id": "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16",
     "docs_page": "/recipes-e2e-examples/nemotron-3-ultra",
-    "modality": "LLM",
+    "type": "LLM",
     "recipe": "examples/llm_finetune/nemotron/nemotron_ultra_v3_hellaswag_peft.yaml",
     "brev_status": "planned"
   },
@@ -139,7 +139,7 @@
     "model": "Gemma 4 12B",
     "hf_model_id": "google/gemma-4-12B",
     "docs_page": "/model-coverage/large-language-models/gemma",
-    "modality": "LLM",
+    "type": "LLM",
     "recipe": "examples/llm_finetune/gemma/gemma_4_12b_hellaswag.yaml",
     "brev_status": "planned"
   },
@@ -148,7 +148,7 @@
     "model": "MiniCPM5-1B",
     "hf_model_id": "openbmb/MiniCPM5-1B",
     "docs_page": "/model-coverage/large-language-models/minicpm",
-    "modality": "LLM",
+    "type": "LLM",
     "recipe": "examples/llm_finetune/minicpm/minicpm5_1b_squad.yaml",
     "brev_status": "planned"
   },
@@ -157,7 +157,7 @@
     "model": "Qwen2.5-Omni",
     "hf_model_id": "Qwen/Qwen2.5-Omni-3B",
     "docs_page": "/model-coverage/omni/qwen2-5-omni",
-    "modality": "Omni",
+    "type": "Omni",
     "recipe": "examples/audio_finetune/qwen2_5_omni_asr/ami_sft_3b.yaml",
     "brev_status": "planned"
   },
@@ -166,7 +166,7 @@
     "model": "Hy-MT2-30B-A3B",
     "hf_model_id": "tencent/Hy-MT2-30B-A3B",
     "docs_page": "/model-coverage/large-language-models/hy-mt2",
-    "modality": "LLM",
+    "type": "LLM",
     "recipe": "examples/llm_finetune/hy_mt2/hy_mt2_30b_a3b_sft.yaml",
     "brev_status": "planned"
   },
@@ -175,7 +175,7 @@
     "model": "Step-3.7-Flash",
     "hf_model_id": "stepfun-ai/Step-3.7-Flash",
     "docs_page": "/model-coverage/vision-language-models/step-3-7-flash",
-    "modality": "VLM",
+    "type": "VLM",
     "recipe": "examples/vlm_finetune/stepfun/step3p7_medpix_200b_ep32pp4.yaml",
     "brev_status": "planned"
   },
@@ -184,8 +184,17 @@
     "model": "Wan 2.2 T2V-A14B (two-stage)",
     "hf_model_id": "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
     "docs_page": "/model-coverage/diffusion/wan-2-2-t2v-a14b",
-    "modality": "Diffusion",
+    "type": "Diffusion",
     "recipe": "examples/diffusion/finetune/wan2_2_t2v_flow.yaml",
+    "brev_status": "planned"
+  },
+  {
+    "date": "2026-05-21",
+    "model": "Llama Nemotron Embed 1B v2",
+    "hf_model_id": "nvidia/llama-nemotron-embed-1b-v2",
+    "docs_page": "/model-coverage/embedding-models/llama-bidirectional",
+    "type": "Embedding",
+    "recipe": "examples/retrieval/bi_encoder/llama3_2_1b.yaml",
     "brev_status": "planned"
   },
   {
@@ -193,7 +202,7 @@
     "model": "Ling 2.0",
     "hf_model_id": "inclusionAI/Ling-mini-2.0",
     "docs_page": "/model-coverage/large-language-models/ling-2-0",
-    "modality": "LLM",
+    "type": "LLM",
     "recipe": "examples/llm_finetune/ling/ling_mini_2_0_squad.yaml",
     "brev_status": "planned"
   },
@@ -202,7 +211,7 @@
     "model": "ERNIE 4.5",
     "hf_model_id": "baidu/ERNIE-4.5-21B-A3B-PT",
     "docs_page": "/model-coverage/large-language-models/ernie-4-5",
-    "modality": "LLM",
+    "type": "LLM",
     "recipe": "examples/llm_finetune/ernie4_5/ernie4_5_21b_a3b_hellaswag.yaml",
     "brev_status": "planned"
   },
@@ -211,7 +220,7 @@
     "model": "MiMo-V2-Flash",
     "hf_model_id": "XiaomiMiMo/MiMo-V2-Flash",
     "docs_page": "/model-coverage/large-language-models/mimo-v2-flash",
-    "modality": "LLM",
+    "type": "LLM",
     "recipe": "examples/llm_finetune/mimo_v2_flash/mimo_v2_flash_hellaswag.yaml",
     "brev_status": "planned"
   },
@@ -220,7 +229,7 @@
     "model": "Mistral Medium 3.5",
     "hf_model_id": "mistralai/Mistral-Medium-3.5-128B",
     "docs_page": "/model-coverage/vision-language-models/mistral-medium-3-5",
-    "modality": "VLM",
+    "type": "VLM",
     "recipe": "examples/vlm_finetune/mistral3p5/mistral3p5_128b_medpix.yaml",
     "brev_status": "planned"
   },
@@ -229,8 +238,26 @@
     "model": "Hy3-preview",
     "hf_model_id": "tencent/Hy3-preview",
     "docs_page": "/model-coverage/large-language-models/hy3-preview",
-    "modality": "LLM",
+    "type": "LLM",
     "recipe": "examples/llm_finetune/hy_v3/hy3_preview_deepep.yaml",
+    "brev_status": "planned"
+  },
+  {
+    "date": "2026-04-28",
+    "model": "Ministral 3 3B Base Embedding",
+    "hf_model_id": "mistralai/Ministral-3-3B-Base-2512",
+    "docs_page": "/model-coverage/embedding-models/ministral3-bidirectional",
+    "type": "Embedding",
+    "recipe": "examples/retrieval/bi_encoder/ministral3_3b_instruct.yaml",
+    "brev_status": "planned"
+  },
+  {
+    "date": "2026-04-28",
+    "model": "Ministral 3 3B Instruct Embedding",
+    "hf_model_id": "mistralai/Ministral-3-3B-Instruct-2512",
+    "docs_page": "/model-coverage/embedding-models/ministral3-bidirectional",
+    "type": "Embedding",
+    "recipe": "examples/retrieval/bi_encoder/ministral3_3b_instruct.yaml",
     "brev_status": "planned"
   },
   {
@@ -238,7 +265,7 @@
     "model": "DeepSeek V4 Flash",
     "hf_model_id": "deepseek-ai/DeepSeek-V4-Flash",
     "docs_page": "/model-coverage/large-language-models/deepseek-v4-flash",
-    "modality": "LLM",
+    "type": "LLM",
     "recipe": "examples/llm_finetune/deepseek_v4/deepseek_v4_flash_hellaswag.yaml",
     "brev_status": "planned"
   },
@@ -247,7 +274,7 @@
     "model": "Qwen3.6-27B",
     "hf_model_id": "Qwen/Qwen3.6-27B",
     "docs_page": "/model-coverage/vision-language-models/qwen3-5-vl",
-    "modality": "VLM",
+    "type": "VLM",
     "recipe": "examples/vlm_finetune/qwen3_5/qwen3_6_27b.yaml",
     "brev_status": "planned"
   },
@@ -256,7 +283,7 @@
     "model": "LLaVA-OneVision-1.5 (4B / 8B)",
     "hf_model_id": "lmms-lab/LLaVA-OneVision-1.5-4B-Instruct",
     "docs_page": "/model-coverage/vision-language-models/llava-onevision",
-    "modality": "VLM",
+    "type": "VLM",
     "recipe": "examples/vlm_finetune/llava_onevision/llava_ov_1_5_4b_finetune.yaml",
     "brev_status": "planned"
   },
@@ -265,7 +292,7 @@
     "model": "Qwen3.6 MoE",
     "hf_model_id": "Qwen/Qwen3.6-35B-A3B",
     "docs_page": "/model-coverage/vision-language-models/qwen3-5-vl",
-    "modality": "VLM",
+    "type": "VLM",
     "recipe": "examples/vlm_finetune/qwen3_5_moe/qwen3_6_35b.yaml",
     "brev_status": "planned"
   },
@@ -274,7 +301,7 @@
     "model": "MiniMax-M2.7",
     "hf_model_id": "MiniMaxAI/MiniMax-M2.7",
     "docs_page": "/model-coverage/large-language-models/minimax-m2",
-    "modality": "LLM",
+    "type": "LLM",
     "recipe": "examples/llm_finetune/minimax_m2/minimax_m2.7_hellaswag_pp.yaml",
     "brev_status": "unavailable"
   },
@@ -283,7 +310,7 @@
     "model": "GLM-5.1",
     "hf_model_id": "zai-org/GLM-5.1",
     "docs_page": "/model-coverage/large-language-models/glm-5-moe-dsa",
-    "modality": "LLM",
+    "type": "LLM",
     "recipe": "examples/llm_finetune/glm/glm_5.1_hellaswag_pp.yaml",
     "brev_status": "planned"
   },
@@ -292,8 +319,35 @@
     "model": "Gemma 4",
     "hf_model_id": "google/gemma-4-E4B-it",
     "docs_page": "/model-coverage/vision-language-models/gemma-4",
-    "modality": "VLM",
+    "type": "VLM",
     "recipe": "examples/vlm_finetune/gemma4/gemma4_4b.yaml",
+    "brev_status": "planned"
+  },
+  {
+    "date": "2026-03-30",
+    "model": "Llama Nemotron Rerank 1B v2",
+    "hf_model_id": "nvidia/llama-nemotron-rerank-1b-v2",
+    "docs_page": "/model-coverage/reranking-models/llama-bidirectional",
+    "type": "Reranking",
+    "recipe": "examples/retrieval/cross_encoder/llama3_2_1b.yaml",
+    "brev_status": "planned"
+  },
+  {
+    "date": "2026-03-30",
+    "model": "Llama 3.2 1B Reranking",
+    "hf_model_id": "meta-llama/Llama-3.2-1B",
+    "docs_page": "/model-coverage/reranking-models/llama-bidirectional",
+    "type": "Reranking",
+    "recipe": "examples/retrieval/cross_encoder/llama3_2_1b.yaml",
+    "brev_status": "planned"
+  },
+  {
+    "date": "2026-03-30",
+    "model": "Llama 3.1 8B Reranking",
+    "hf_model_id": "meta-llama/Llama-3.1-8B",
+    "docs_page": "/model-coverage/reranking-models/llama-bidirectional",
+    "type": "Reranking",
+    "recipe": "examples/retrieval/cross_encoder/llama3_2_1b.yaml",
     "brev_status": "planned"
   },
   {
@@ -301,7 +355,7 @@
     "model": "Mistral Small 4",
     "hf_model_id": "mistralai/Mistral-Small-4-119B-2603",
     "docs_page": "/model-coverage/vision-language-models/mistral-small-4",
-    "modality": "VLM",
+    "type": "VLM",
     "recipe": "examples/vlm_finetune/mistral4/mistral4_medpix.yaml",
     "brev_status": "planned"
   },
@@ -310,7 +364,7 @@
     "model": "Nemotron Super v3",
     "hf_model_id": "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16",
     "docs_page": "/model-coverage/large-language-models/nemotron-h",
-    "modality": "LLM",
+    "type": "LLM",
     "recipe": "examples/llm_finetune/nemotron/nemotron_super_v3_hellaswag.yaml",
     "brev_status": "planned"
   },
@@ -319,7 +373,7 @@
     "model": "GLM-5",
     "hf_model_id": "zai-org/GLM-5",
     "docs_page": "/model-coverage/large-language-models/glm-5-moe-dsa",
-    "modality": "LLM",
+    "type": "LLM",
     "recipe": "examples/llm_finetune/glm/glm_5_hellaswag_pp.yaml",
     "brev_status": "planned"
   },
@@ -328,7 +382,7 @@
     "model": "FLUX.1-dev",
     "hf_model_id": "black-forest-labs/FLUX.1-dev",
     "docs_page": "/model-coverage/diffusion/flux-1-dev",
-    "modality": "Diffusion",
+    "type": "Diffusion",
     "recipe": "examples/diffusion/finetune/flux_t2i_flow.yaml",
     "brev_status": "planned"
   },
@@ -337,7 +391,7 @@
     "model": "Wan 2.1 T2V",
     "hf_model_id": "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
     "docs_page": "/model-coverage/diffusion/wan-2-1-t2v",
-    "modality": "Diffusion",
+    "type": "Diffusion",
     "recipe": "examples/diffusion/finetune/wan2_1_t2v_flow.yaml",
     "brev_status": "planned"
   },
@@ -346,7 +400,7 @@
     "model": "HunyuanVideo 1.5",
     "hf_model_id": "hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v",
     "docs_page": "/model-coverage/diffusion/hunyuanvideo-1-5",
-    "modality": "Diffusion",
+    "type": "Diffusion",
     "recipe": "examples/diffusion/finetune/hunyuan_t2v_flow.yaml",
     "brev_status": "planned"
   },
@@ -355,7 +409,7 @@
     "model": "Qwen3.5 (0.8B – 9B)",
     "hf_model_id": "Qwen/Qwen3.5-9B",
     "docs_page": "/model-coverage/vision-language-models/qwen3-5-vl",
-    "modality": "VLM",
+    "type": "VLM",
     "recipe": "examples/vlm_finetune/qwen3_5/qwen3_5_9b.yaml",
     "brev_status": "planned"
   },
@@ -364,7 +418,7 @@
     "model": "Qwen3.5 MoE",
     "hf_model_id": "Qwen/Qwen3.5-397B-A17B",
     "docs_page": "/model-coverage/vision-language-models/qwen3-5-vl",
-    "modality": "VLM",
+    "type": "VLM",
     "recipe": "examples/vlm_finetune/qwen3_5_moe/qwen3_5_moe_medpix.yaml",
     "brev_status": "planned"
   },
@@ -373,7 +427,7 @@
     "model": "MiniMax-M2.5",
     "hf_model_id": "MiniMaxAI/MiniMax-M2.5",
     "docs_page": "/model-coverage/large-language-models/minimax-m2",
-    "modality": "LLM",
+    "type": "LLM",
     "recipe": "examples/llm_finetune/minimax_m2/minimax_m2.5_hellaswag_pp.yaml",
     "brev_status": "planned"
   },
@@ -382,7 +436,7 @@
     "model": "GLM-4.7-Flash",
     "hf_model_id": "zai-org/GLM-4.7-Flash",
     "docs_page": "/model-coverage/large-language-models/glm-4-moe-glm-4-5-glm-4-7",
-    "modality": "LLM",
+    "type": "LLM",
     "recipe": "examples/llm_finetune/glm/glm_4.7_flash_te_packed_sequence.yaml",
     "brev_status": "planned"
   },
@@ -391,7 +445,7 @@
     "model": "MiniMax-M2.1",
     "hf_model_id": "MiniMaxAI/MiniMax-M2",
     "docs_page": "/model-coverage/large-language-models/minimax-m2",
-    "modality": "LLM",
+    "type": "LLM",
     "recipe": "examples/llm_finetune/minimax_m2/minimax_m2.1_hellaswag_pp.yaml",
     "brev_status": "planned"
   },
@@ -400,7 +454,7 @@
     "model": "Qwen3-VL-235B",
     "hf_model_id": "Qwen/Qwen3-VL-235B-A22B-Instruct",
     "docs_page": "/model-coverage/vision-language-models/qwen3-vl-qwen3-vl-moe",
-    "modality": "VLM",
+    "type": "VLM",
     "recipe": "examples/vlm_finetune/qwen3/qwen3_vl_moe_235b.yaml",
     "brev_status": "planned"
   },
@@ -409,7 +463,7 @@
     "model": "GLM-4.7",
     "hf_model_id": "zai-org/GLM-4.7",
     "docs_page": "/model-coverage/large-language-models/glm-4-moe-glm-4-5-glm-4-7",
-    "modality": "LLM",
+    "type": "LLM",
     "recipe": "examples/llm_finetune/glm/glm_4.7_te_deepep.yaml",
     "brev_status": "planned"
   },
@@ -418,7 +472,7 @@
     "model": "Step-3.5-Flash",
     "hf_model_id": "stepfun-ai/Step-3.5-Flash",
     "docs_page": "/model-coverage/large-language-models/step-3-5",
-    "modality": "LLM",
+    "type": "LLM",
     "recipe": "examples/llm_finetune/stepfun/step_3.5_flash_hellaswag_pp.yaml",
     "brev_status": "planned"
   },
@@ -427,7 +481,7 @@
     "model": "DeepSeek-V3.2",
     "hf_model_id": "deepseek-ai/DeepSeek-V3.2",
     "docs_page": "/model-coverage/large-language-models/deepseek-v3",
-    "modality": "LLM",
+    "type": "LLM",
     "recipe": "examples/llm_finetune/deepseek_v32/deepseek_v32_hellaswag_pp.yaml",
     "brev_status": "planned"
   },
@@ -436,7 +490,7 @@
     "model": "Kimi-K2.5 VL",
     "hf_model_id": "moonshotai/Kimi-K2.5",
     "docs_page": "/model-coverage/vision-language-models/kimi-vl",
-    "modality": "VLM",
+    "type": "VLM",
     "recipe": "examples/vlm_finetune/kimi/kimi25vl_medpix.yaml",
     "brev_status": "planned"
   },
@@ -445,7 +499,7 @@
     "model": "Kimi-VL",
     "hf_model_id": "moonshotai/Kimi-VL-A3B-Instruct",
     "docs_page": "/model-coverage/vision-language-models/kimi-vl",
-    "modality": "VLM",
+    "type": "VLM",
     "recipe": "examples/vlm_finetune/kimi/kimi2vl_cordv2.yaml",
     "brev_status": "planned"
   },
@@ -454,7 +508,7 @@
     "model": "Nemotron Flash 1B",
     "hf_model_id": "nvidia/Nemotron-Flash-1B",
     "docs_page": "/model-coverage/large-language-models/nemotron-flash",
-    "modality": "LLM",
+    "type": "LLM",
     "recipe": "examples/llm_finetune/nemotron_flash/nemotron_flash_1b_squad.yaml",
     "brev_status": "planned"
   },
@@ -463,7 +517,7 @@
     "model": "Nemotron Parse v1.1",
     "hf_model_id": "nvidia/NVIDIA-Nemotron-Parse-v1.1",
     "docs_page": "/model-coverage/vision-language-models/nemotron-parse",
-    "modality": "VLM",
+    "type": "VLM",
     "recipe": "examples/vlm_finetune/nemotron/nemotron_parse_v1_1.yaml",
     "brev_status": "available",
     "brev_url": "https://brev.nvidia.com/launchable/deploy/now?launchableID=env-3C6LDKU2DfOvpVTFhjw3YQ4djPM"
@@ -473,8 +527,17 @@
     "model": "Devstral-Small-2512",
     "hf_model_id": "mistralai/Devstral-Small-2-24B-Instruct-2512",
     "docs_page": "/model-coverage/large-language-models/ministral3-devstral",
-    "modality": "LLM",
+    "type": "LLM",
     "recipe": "examples/llm_finetune/devstral/devstral2_small_2512_squad.yaml",
+    "brev_status": "planned"
+  },
+  {
+    "date": "2025-12-16",
+    "model": "Llama Embed Nemotron 8B",
+    "hf_model_id": "nvidia/llama-embed-nemotron-8b",
+    "docs_page": "/model-coverage/embedding-models/llama-bidirectional",
+    "type": "Embedding",
+    "recipe": "examples/retrieval/bi_encoder/llama_embed_nemotron_8b/llama_embed_nemotron_8b.yaml",
     "brev_status": "planned"
   },
   {
@@ -482,7 +545,7 @@
     "model": "Nemotron-3-Nano-30B-A3B",
     "hf_model_id": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8",
     "docs_page": "/model-coverage/large-language-models/nemotron-h",
-    "modality": "LLM",
+    "type": "LLM",
     "recipe": "examples/llm_finetune/nemotron/nemotron_nano_v3_hellaswag.yaml",
     "brev_status": "planned"
   },
@@ -491,7 +554,7 @@
     "model": "Ministral 3 (3B / 8B / 14B)",
     "hf_model_id": "mistralai/Ministral-8B-Instruct-2410",
     "docs_page": "/model-coverage/vision-language-models/ministral3-vl",
-    "modality": "VLM",
+    "type": "VLM",
     "recipe": "examples/vlm_finetune/mistral/ministral3_8b_medpix.yaml",
     "brev_status": "planned"
   },
@@ -500,7 +563,7 @@
     "model": "GLM-4.5-Air",
     "hf_model_id": "zai-org/GLM-4.5-Air",
     "docs_page": "/model-coverage/large-language-models/glm-4-moe-glm-4-5-glm-4-7",
-    "modality": "LLM",
+    "type": "LLM",
     "recipe": "examples/llm_finetune/glm/glm_4.5_air_te_deepep.yaml",
     "brev_status": "planned"
   },
@@ -509,8 +572,26 @@
     "model": "InternVL 3.5",
     "hf_model_id": "OpenGVLab/InternVL3_5-4B",
     "docs_page": "/model-coverage/vision-language-models/internvl",
-    "modality": "VLM",
+    "type": "VLM",
     "recipe": "examples/vlm_finetune/internvl/internvl_3_5_4b.yaml",
+    "brev_status": "planned"
+  },
+  {
+    "date": "2025-11-18",
+    "model": "Llama 3.2 1B Embedding",
+    "hf_model_id": "meta-llama/Llama-3.2-1B",
+    "docs_page": "/model-coverage/embedding-models/llama-bidirectional",
+    "type": "Embedding",
+    "recipe": "examples/retrieval/bi_encoder/llama3_2_1b.yaml",
+    "brev_status": "planned"
+  },
+  {
+    "date": "2025-11-18",
+    "model": "Llama 3.1 8B Embedding",
+    "hf_model_id": "meta-llama/Llama-3.1-8B",
+    "docs_page": "/model-coverage/embedding-models/llama-bidirectional",
+    "type": "Embedding",
+    "recipe": "examples/retrieval/bi_encoder/llama_embed_nemotron_8b/llama_embed_nemotron_8b.yaml",
     "brev_status": "planned"
   },
   {
@@ -518,7 +599,7 @@
     "model": "Qwen3-Omni",
     "hf_model_id": "Qwen/Qwen3-30B-A3B",
     "docs_page": "/model-coverage/omni/qwen3-omni",
-    "modality": "Omni",
+    "type": "Omni",
     "recipe": "examples/vlm_finetune/qwen3/qwen3_omni_moe_30b_te_deepep.yaml",
     "brev_status": "planned"
   },
@@ -527,7 +608,7 @@
     "model": "Qwen3-Next",
     "hf_model_id": "Qwen/Qwen3-235B-A22B",
     "docs_page": "/model-coverage/large-language-models/qwen3-next",
-    "modality": "LLM",
+    "type": "LLM",
     "recipe": "examples/llm_finetune/qwen/qwen3_next_te_deepep.yaml",
     "brev_status": "planned"
   },
@@ -536,7 +617,7 @@
     "model": "Qwen3-VL (4B / 8B)",
     "hf_model_id": "Qwen/Qwen3-VL-8B-Instruct",
     "docs_page": "/model-coverage/vision-language-models/qwen3-vl-qwen3-vl-moe",
-    "modality": "VLM",
+    "type": "VLM",
     "recipe": "examples/vlm_finetune/qwen3/qwen3_vl_4b_instruct_rdr.yaml",
     "brev_status": "planned"
   },
@@ -545,7 +626,7 @@
     "model": "Mixtral 8x7B",
     "hf_model_id": "mistralai/Mixtral-8x7B-Instruct-v0.1",
     "docs_page": "/model-coverage/large-language-models/mixtral",
-    "modality": "LLM",
+    "type": "LLM",
     "recipe": "examples/llm_finetune/mistral/mixtral-8x7b-v0-1_squad.yaml",
     "brev_status": "planned"
   },
@@ -554,7 +635,7 @@
     "model": "DeepSeek-V3",
     "hf_model_id": "deepseek-ai/DeepSeek-V3",
     "docs_page": "/model-coverage/large-language-models/deepseek-v3",
-    "modality": "LLM",
+    "type": "LLM",
     "recipe": "examples/llm_pretrain/deepseekv3_pretrain.yaml",
     "brev_status": "planned"
   },
@@ -563,7 +644,7 @@
     "model": "GPT-OSS 20B / 120B",
     "hf_model_id": "openai/gpt-oss-20b",
     "docs_page": "/model-coverage/large-language-models/gpt-oss",
-    "modality": "LLM",
+    "type": "LLM",
     "recipe": "examples/llm_finetune/gpt_oss/gpt_oss_20b.yaml",
     "brev_status": "planned"
   },
@@ -572,7 +653,7 @@
     "model": "Moonlight 16B",
     "hf_model_id": "moonshotai/Moonlight-16B-A3B",
     "docs_page": "/model-coverage/large-language-models/moonlight",
-    "modality": "LLM",
+    "type": "LLM",
     "recipe": "examples/llm_finetune/moonlight/moonlight_16b_te.yaml",
     "brev_status": "planned"
   },
@@ -581,7 +662,7 @@
     "model": "Mistral / Mistral-Nemo",
     "hf_model_id": "mistralai/Mistral-7B-v0.1",
     "docs_page": "/model-coverage/large-language-models/mistral",
-    "modality": "LLM",
+    "type": "LLM",
     "recipe": "examples/llm_finetune/mistral/mistral_7b_squad.yaml",
     "brev_status": "planned"
   },
@@ -590,7 +671,7 @@
     "model": "Qwen2 / Qwen2.5",
     "hf_model_id": "Qwen/Qwen2.5-7B",
     "docs_page": "/model-coverage/large-language-models/qwen2",
-    "modality": "LLM",
+    "type": "LLM",
     "recipe": "examples/llm_finetune/qwen/qwen2_5_7b_squad.yaml",
     "brev_status": "planned"
   },
@@ -599,7 +680,7 @@
     "model": "Gemma 2 / 3",
     "hf_model_id": "google/gemma-2-9b-it",
     "docs_page": "/model-coverage/large-language-models/gemma",
-    "modality": "LLM",
+    "type": "LLM",
     "recipe": "examples/llm_finetune/gemma/gemma_2_9b_it_squad.yaml",
     "brev_status": "planned"
   },
@@ -608,7 +689,7 @@
     "model": "Phi 2 / 3 / 4",
     "hf_model_id": "microsoft/phi-4",
     "docs_page": "/model-coverage/large-language-models/phi-3-phi-4",
-    "modality": "LLM",
+    "type": "LLM",
     "recipe": "examples/llm_finetune/phi/phi_4_squad.yaml",
     "brev_status": "planned"
   },
@@ -617,7 +698,7 @@
     "model": "Granite 3.x",
     "hf_model_id": "ibm-granite/granite-3.3-2b-instruct",
     "docs_page": "/model-coverage/large-language-models/granite",
-    "modality": "LLM",
+    "type": "LLM",
     "recipe": "examples/llm_finetune/granite/granite_3_3_2b_instruct_squad.yaml",
     "brev_status": "planned"
   },
@@ -626,7 +707,7 @@
     "model": "OLMo 2",
     "hf_model_id": "allenai/OLMo-2-0425-1B-Instruct",
     "docs_page": "/model-coverage/large-language-models/olmo2",
-    "modality": "LLM",
+    "type": "LLM",
     "recipe": "examples/llm_finetune/olmo/olmo_2_0425_1b_instruct_squad.yaml",
     "brev_status": "planned"
   },
@@ -635,7 +716,7 @@
     "model": "Seed-Coder / Seed-OSS",
     "hf_model_id": "ByteDance-Seed/Seed-Coder-8B-Instruct",
     "docs_page": "/model-coverage/large-language-models/seed-bytedance",
-    "modality": "LLM",
+    "type": "LLM",
     "recipe": "examples/llm_finetune/seed/seed_coder_8b_instruct_squad.yaml",
     "brev_status": "planned"
   },
@@ -644,7 +725,7 @@
     "model": "Baichuan 2",
     "hf_model_id": "baichuan-inc/Baichuan2-7B-Chat",
     "docs_page": "/model-coverage/large-language-models/baichuan-baichuan2",
-    "modality": "LLM",
+    "type": "LLM",
     "recipe": "examples/llm_finetune/baichuan/baichuan_2_7b_squad.yaml",
     "brev_status": "planned"
   },
@@ -653,7 +734,7 @@
     "model": "Cohere Command-R",
     "hf_model_id": "CohereForAI/c4ai-command-r-v01",
     "docs_page": "/model-coverage/large-language-models/command-r",
-    "modality": "LLM",
+    "type": "LLM",
     "recipe": "examples/llm_finetune/cohere/cohere_command_r_7b_squad.yaml",
     "brev_status": "planned"
   },
@@ -662,7 +743,7 @@
     "model": "StarCoder 2",
     "hf_model_id": "bigcode/starcoder2-3b",
     "docs_page": "/model-coverage/large-language-models/starcoder2",
-    "modality": "LLM",
+    "type": "LLM",
     "recipe": "examples/llm_finetune/starcoder/starcoder_2_7b_squad.yaml",
     "brev_status": "planned"
   },
@@ -671,7 +752,7 @@
     "model": "Falcon 3",
     "hf_model_id": "tiiuae/Falcon3-7B-Instruct",
     "docs_page": "/model-coverage/large-language-models/falcon",
-    "modality": "LLM",
+    "type": "LLM",
     "recipe": "examples/llm_finetune/falcon/falcon3_7b_instruct_squad.yaml",
     "brev_status": "planned"
   },
@@ -680,7 +761,7 @@
     "model": "GLM-4 / GLM-4-MoE",
     "hf_model_id": "zai-org/glm-4-9b-chat-hf",
     "docs_page": "/model-coverage/large-language-models/glm-4",
-    "modality": "LLM",
+    "type": "LLM",
     "recipe": "examples/llm_finetune/glm/glm_4_9b_chat_hf_squad.yaml",
     "brev_status": "planned"
   },
@@ -689,7 +770,7 @@
     "model": "Qwen3 / Qwen3-MoE",
     "hf_model_id": "Qwen/Qwen3-0.6B",
     "docs_page": "/model-coverage/large-language-models/qwen3",
-    "modality": "LLM",
+    "type": "LLM",
     "recipe": "examples/llm_finetune/qwen/qwen3_0p6b_hellaswag.yaml",
     "brev_status": "planned"
   },
@@ -698,7 +779,7 @@
     "model": "Gemma 3 VL",
     "hf_model_id": "google/gemma-3-4b-it",
     "docs_page": "/model-coverage/vision-language-models/gemma-3-vl-gemma-3n",
-    "modality": "VLM",
+    "type": "VLM",
     "recipe": "examples/vlm_finetune/gemma3/gemma3_vl_4b_cord_v2.yaml",
     "brev_status": "planned"
   },
@@ -707,7 +788,7 @@
     "model": "Gemma 3n",
     "hf_model_id": "google/gemma-3n-e4b-it",
     "docs_page": "/model-coverage/vision-language-models/gemma-3-vl-gemma-3n",
-    "modality": "VLM",
+    "type": "VLM",
     "recipe": "examples/vlm_finetune/gemma3n/gemma3n_vl_4b_medpix.yaml",
     "brev_status": "planned"
   },
@@ -716,7 +797,7 @@
     "model": "Llama 3.x",
     "hf_model_id": "meta-llama/Llama-3.2-1B",
     "docs_page": "/model-coverage/large-language-models/llama",
-    "modality": "LLM",
+    "type": "LLM",
     "recipe": "examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml",
     "brev_status": "planned"
   },
@@ -725,7 +806,7 @@
     "model": "Qwen2.5-VL",
     "hf_model_id": "Qwen/Qwen2.5-VL-7B-Instruct",
     "docs_page": "/model-coverage/vision-language-models/qwen2-5-vl",
-    "modality": "VLM",
+    "type": "VLM",
     "recipe": "examples/vlm_finetune/qwen2_5/qwen2_5_vl_3b_rdr.yaml",
     "brev_status": "planned"
   },
@@ -734,7 +815,7 @@
     "model": "Phi-4-multimodal",
     "hf_model_id": "microsoft/Phi-4-multimodal-instruct",
     "docs_page": "/model-coverage/omni/phi-4-multimodal",
-    "modality": "Omni",
+    "type": "Omni",
     "recipe": "examples/vlm_finetune/phi4/phi4_mm_cv17.yaml",
     "brev_status": "planned"
   }
