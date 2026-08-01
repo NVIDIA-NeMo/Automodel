@@ -20,6 +20,7 @@ Launch: torchrun --nproc-per-node=<N> -m pytest <this_file> -c <config.yaml>
     [--tokenizer_name <str>]
     [--source_load_kl_threshold <float>] [--source_load_mean_kl_threshold <float>]
     [--check_source_load_parity] [--check_fused_qkv_keys] [--check_phantom_keys] [--check_resume]
+    [--check_repeat_forward_parity]
     [--hf_source_post_load_dequantize]
     [--max_vram_gb <float>] [--max_cpu_gb <float>]
 """
@@ -80,6 +81,7 @@ def _extract_custom_args(argv):
         "--check_fused_qkv_keys",
         "--check_phantom_keys",
         "--check_resume",
+        "--check_repeat_forward_parity",
         "--hf_device_map_auto",
         "--hf_source_post_load_dequantize",
         "--skip_hf_reload",
@@ -277,6 +279,49 @@ def _kl_divergence_from_logits(reference_logits: torch.Tensor, candidate_logits:
 def _cosine_similarity_from_logits(reference_logits: torch.Tensor, candidate_logits: torch.Tensor) -> float:
     """Cosine similarity over flattened float32 logits."""
     return F.cosine_similarity(reference_logits.flatten().float(), candidate_logits.flatten().float(), dim=0).item()
+
+
+def _report_distributed_logits_diagnostic(
+    label: str,
+    reference_logits: torch.Tensor,
+    candidate_logits: torch.Tensor,
+    device: torch.device,
+) -> None:
+    """Report same-rank repeat parity and candidate agreement with global rank 0.
+
+    Args:
+        label: Human-readable diagnostic label.
+        reference_logits: Reference logits of shape [batch, sequence, vocab] on CPU.
+        candidate_logits: Candidate logits of shape [batch, sequence, vocab] on CPU.
+        device: Local CUDA device used for NCCL diagnostics.
+    """
+    same_rank_kl = _kl_divergence_from_logits(reference_logits, candidate_logits).max().item()
+    same_rank_max_abs = (reference_logits.float() - candidate_logits.float()).abs().max().item()
+    local_metrics = torch.tensor([same_rank_kl, same_rank_max_abs], device=device, dtype=torch.float64)
+
+    if not dist.is_initialized():
+        print(f"[{label}] same-rank max KL={same_rank_kl:.8e}; same-rank max abs={same_rank_max_abs:.8e}")
+        return
+
+    same_rank_metrics = [torch.empty_like(local_metrics) for _ in range(dist.get_world_size())]
+    dist.all_gather(same_rank_metrics, local_metrics)
+
+    candidate_device = candidate_logits.to(device)
+    rank0_candidate = torch.empty_like(candidate_device)
+    if dist.get_rank() == 0:
+        rank0_candidate.copy_(candidate_device)
+    dist.broadcast(rank0_candidate, src=0)
+    versus_rank0_kl = _kl_divergence_from_logits(rank0_candidate, candidate_device).max().item()
+    versus_rank0_max_abs = (rank0_candidate - candidate_device).abs().max().item()
+    cross_rank_metrics_local = torch.tensor([versus_rank0_kl, versus_rank0_max_abs], device=device, dtype=torch.float64)
+    cross_rank_metrics = [torch.empty_like(cross_rank_metrics_local) for _ in range(dist.get_world_size())]
+    dist.all_gather(cross_rank_metrics, cross_rank_metrics_local)
+
+    if _rank0():
+        same_rank_values = [tuple(metric.cpu().tolist()) for metric in same_rank_metrics]
+        cross_rank_values = [tuple(metric.cpu().tolist()) for metric in cross_rank_metrics]
+        print(f"[{label}] same-rank (max KL, max abs) by global rank: {same_rank_values}")
+        print(f"[{label}] candidate-vs-rank0 (max KL, max abs) by global rank: {cross_rank_values}")
 
 
 def _materialize_config_value(value):
@@ -1132,6 +1177,7 @@ def run_checkpoint_robustness(
     check_fused_qkv_keys = bool(custom_args.get("check_fused_qkv_keys", False))
     check_phantom_keys = bool(custom_args.get("check_phantom_keys", False))
     check_resume = bool(custom_args.get("check_resume", False))
+    check_repeat_forward_parity = bool(custom_args.get("check_repeat_forward_parity", False))
     resume_loss_threshold = float(custom_args.get("resume_loss_threshold", "5e-3"))
     hf_device_map_auto = bool(custom_args.get("hf_device_map_auto", False))
     hf_source_post_load_dequantize = bool(custom_args.get("hf_source_post_load_dequantize", False))
@@ -1210,6 +1256,15 @@ def run_checkpoint_robustness(
     # Phase 2: Capture reference logits before teardown
     device = next(trainer.model_parts[0].parameters()).device
     reference_logits = _get_logits(trainer.model_parts[0], input_ids, device, trainer=trainer)
+    if check_repeat_forward_parity:
+        repeated_reference_logits = _get_logits(trainer.model_parts[0], input_ids, device, trainer=trainer)
+        _report_distributed_logits_diagnostic(
+            "Phase 2 repeat forward",
+            reference_logits,
+            repeated_reference_logits,
+            device,
+        )
+        del repeated_reference_logits
 
     # Locate the Phase 1 checkpoint used by the reload and resume checks.
     checkpoint_dir = Path(cfg.checkpoint.checkpoint_dir)
@@ -1276,6 +1331,17 @@ def run_checkpoint_robustness(
     restored_trainer.setup()
 
     restored_logits = _get_logits(restored_trainer.model_parts[0], input_ids, device, trainer=restored_trainer)
+    if check_repeat_forward_parity:
+        repeated_restored_logits = _get_logits(
+            restored_trainer.model_parts[0], input_ids, device, trainer=restored_trainer
+        )
+        _report_distributed_logits_diagnostic(
+            "Phase 3 repeat forward",
+            restored_logits,
+            repeated_restored_logits,
+            device,
+        )
+        del repeated_restored_logits
 
     kl_restored = _kl_divergence_from_logits(reference_logits, restored_logits)
     max_kl_restored = kl_restored.max().item()

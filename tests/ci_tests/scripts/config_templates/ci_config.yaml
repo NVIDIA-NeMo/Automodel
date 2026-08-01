@@ -118,6 +118,7 @@ fixture_keys:
     - check_fused_qkv_keys
     - check_phantom_keys
     - check_resume
+    - check_repeat_forward_parity
     - cross_tp_kl_threshold
     - cross_tp_size
     - cosine_threshold
