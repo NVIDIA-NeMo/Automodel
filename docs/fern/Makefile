@@ -23,7 +23,7 @@ REPO_ROOT := $(shell git rev-parse --show-toplevel)
 
 .DEFAULT_GOAL := help
 
-.PHONY: help docs docs-login docs-check docs-preview docs-publish docs-generate-library docs-stitch docs-mdx-check docs-model-table docs-model-table-check
+.PHONY: help docs docs-login docs-check docs-preview docs-publish docs-generate-library docs-stitch docs-mdx-check docs-model-tables
 
 help:
 	@echo ""
@@ -38,8 +38,7 @@ help:
 	@echo "  make docs-stitch            Restore frozen backward-version pages from the $(ARCHIVE_REF) branch"
 	@echo "  make docs-check             Run MDX syntax validation + 'fern check'"
 	@echo "  make docs-mdx-check         Run MDX syntax validation"
-	@echo "  make docs-model-table       Sync the homepage's latest-model table from the release log"
-	@echo "  make docs-model-table-check Verify that the generated latest-model table is current"
+	@echo "  make docs-model-tables      Generate release-log and model-registry tables"
 	@echo "  make docs-preview           Build a shared preview URL on *.docs.buildwithfern.com (needs DOCS_FERN_TOKEN)"
 	@echo "  make docs-publish           Trigger the 'Publish Fern Docs' workflow on origin/main"
 	@echo "  make docs-generate-library  Regenerate the autodoc library reference under product-docs/"
@@ -97,19 +96,16 @@ docs-login:
 # `fern docs dev` then serves the site on localhost:3002. Re-run `make docs` only
 # when the library source changes — for prose-only iteration, `fern docs dev`
 # alone is enough after the first generate.
-docs: docs-stitch docs-generate-library
+docs: docs-model-tables docs-stitch docs-generate-library
 	fern docs dev
 
-docs-check: docs-model-table-check docs-mdx-check
+docs-check: docs-mdx-check
 	fern check
 
-docs-model-table:
-	node "$(REPO_ROOT)/tools/sync_latest_model_table.mjs"
+docs-model-tables:
+	python3 "$(REPO_ROOT)/tools/sync_model_coverage_tables.py"
 
-docs-model-table-check:
-	node "$(REPO_ROOT)/tools/sync_latest_model_table.mjs" --check
-
-docs-mdx-check: docs-stitch
+docs-mdx-check: docs-model-tables docs-stitch
 	@tmp_dir="$$(mktemp -d)"; \
 	trap 'rm -rf "$$tmp_dir"' EXIT; \
 	printf '%s\n' '{"private":true,"type":"module"}' > "$$tmp_dir/package.json"; \
@@ -149,7 +145,7 @@ docs-generate-library:
 # Shared preview hosted at <repo-slug>.docs.buildwithfern.com — useful for sharing a
 # work-in-progress link before merge. Requires DOCS_FERN_TOKEN in the environment
 # (org secret of the same name is wired into CI).
-docs-preview: docs-stitch docs-generate-library
+docs-preview: docs-model-tables docs-stitch docs-generate-library
 	fern generate --docs --preview
 
 # Trigger the Publish Fern Docs workflow on origin/main via workflow_dispatch.

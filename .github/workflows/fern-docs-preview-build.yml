@@ -30,6 +30,8 @@ on:
   pull_request:
     paths:
       - 'docs/**'
+      - 'nemo_automodel/_transformers/registry.py'
+      - 'tools/sync_model_coverage_tables.py'
       - '.github/workflows/fern-docs-preview-build.yml'
 
 permissions:
@@ -55,6 +57,9 @@ jobs:
           archived-versions: |
             v0.4=docs-archive
             v0.5=docs-archive
+
+      - name: Generate model coverage tables
+        run: python3 tools/sync_model_coverage_tables.py
 
       - name: Save PR metadata
         env:

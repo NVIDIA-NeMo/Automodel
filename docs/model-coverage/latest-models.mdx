@@ -5,7 +5,7 @@ position: 2
 ---
 A reverse-chronological log of every model added to NeMo AutoModel. The **Recipe** column links to a working example YAML you can run immediately.
 
-This table is the canonical source for the **Latest Model Support** table on the documentation homepage. The homepage shows the nine newest entries with runnable repository recipes. After adding a model, run `node tools/sync_latest_model_table.mjs`; CI verifies that the generated homepage excerpt stays current.
+This table is the canonical source for the **Latest Model Support** table on the documentation homepage. The homepage shows the nine newest entries with runnable repository recipes. Local previews, CI previews, and production publishes regenerate the homepage excerpt automatically with `python3 tools/sync_model_coverage_tables.py`.
 
 See the [Model Coverage Overview](/model-coverage/overview) for release summaries, and the [LLM](/model-coverage/large-language-models/overview) / [VLM](/model-coverage/vision-language-models/overview) / [Multimodal](/model-coverage/multimodal/overview) / [Omni](/model-coverage/omni/overview) / [Diffusion](/model-coverage/diffusion/overview) pages for the full architecture listings.
 

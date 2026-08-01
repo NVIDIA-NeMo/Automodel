@@ -58,8 +58,8 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Validate latest model table
-        run: node tools/sync_latest_model_table.mjs --check
+      - name: Generate model coverage tables
+        run: python3 tools/sync_model_coverage_tables.py
 
       - name: Validate MDX syntax
         run: |

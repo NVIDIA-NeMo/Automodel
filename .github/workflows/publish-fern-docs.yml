@@ -29,6 +29,8 @@ on:
       - main
     paths:
       - 'docs/**'
+      - 'nemo_automodel/_transformers/registry.py'
+      - 'tools/sync_model_coverage_tables.py'
     tags:
       - 'docs/v*'
   workflow_dispatch: {}
@@ -56,6 +58,9 @@ jobs:
           archived-versions: |
             v0.4=docs-archive
             v0.5=docs-archive
+
+      - name: Generate model coverage tables
+        run: python3 tools/sync_model_coverage_tables.py
 
       - name: Setup Node.js
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6

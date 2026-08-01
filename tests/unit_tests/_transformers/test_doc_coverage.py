@@ -90,6 +90,16 @@ def _repo_root() -> pathlib.Path:
     return pathlib.Path(__file__).resolve().parents[3]
 
 
+def _without_generated_registry_table(content: str) -> str:
+    start_marker = "{/* BEGIN GENERATED MODEL ARCHITECTURES */}"
+    end_marker = "{/* END GENERATED MODEL ARCHITECTURES */}"
+    start = content.find(start_marker)
+    end = content.find(end_marker)
+    if start == -1 or end == -1:
+        return content
+    return content[:start] + content[end + len(end_marker) :]
+
+
 def test_every_registered_arch_has_model_coverage_doc():
     """Every architecture in ``MODEL_ARCH_MAPPING`` must be mentioned in at
     least one ``docs/model-coverage/*.mdx`` file, either by its own name or by
@@ -103,7 +113,7 @@ def test_every_registered_arch_has_model_coverage_doc():
     docs_dir = _repo_root() / "docs" / "model-coverage"
     assert docs_dir.is_dir(), f"docs/model-coverage/ not found at {docs_dir}"
 
-    md_contents = [p.read_text(encoding="utf-8") for p in docs_dir.rglob("*.mdx")]
+    md_contents = [_without_generated_registry_table(p.read_text(encoding="utf-8")) for p in docs_dir.rglob("*.mdx")]
     assert md_contents, "No .mdx files found under docs/model-coverage/"
 
     missing = []
@@ -127,33 +137,6 @@ def test_every_registered_arch_has_model_coverage_doc():
         )
 
 
-def test_every_registered_arch_appears_in_a_supported_models_table():
-    """Every registered architecture must appear in a modality index table.
-
-    Model cards can mention implementation details outside their supported-model
-    tables, so the broader model-card check above cannot detect table drift.
-    Requiring the exact registry key in an ``*/index.mdx`` file makes a newly
-    registered architecture fail CI until the user-facing table is updated.
-    """
-    from nemo_automodel._transformers.registry import MODEL_ARCH_MAPPING
-
-    docs_dir = _repo_root() / "docs" / "model-coverage"
-    table_rows = [
-        line
-        for path in docs_dir.glob("*/index.mdx")
-        for line in path.read_text(encoding="utf-8").splitlines()
-        if line.startswith("|")
-    ]
-    assert table_rows, "No modality tables found under docs/model-coverage/"
-
-    missing = [arch_name for arch_name in MODEL_ARCH_MAPPING if not any(f"`{arch_name}`" in row for row in table_rows)]
-    assert not missing, (
-        "The following registered architectures are absent from every supported-models table:\n"
-        + "\n".join(f"  - {arch_name}" for arch_name in missing)
-        + "\n\nAdd each exact architecture name to the appropriate docs/model-coverage/*/index.mdx table."
-    )
-
-
 def test_doc_arch_aliases_target_strings_appear_in_docs():
     """Every value in ``_DOC_ARCH_ALIASES`` must literally appear in some
     ``docs/model-coverage/*.mdx`` file.
@@ -163,7 +146,7 @@ def test_doc_arch_aliases_target_strings_appear_in_docs():
     undocumented and the doc-coverage check becomes a no-op for that entry.
     """
     docs_dir = _repo_root() / "docs" / "model-coverage"
-    md_contents = [p.read_text(encoding="utf-8") for p in docs_dir.rglob("*.mdx")]
+    md_contents = [_without_generated_registry_table(p.read_text(encoding="utf-8")) for p in docs_dir.rglob("*.mdx")]
 
     bad = []
     for arch, needle in _DOC_ARCH_ALIASES.items():
