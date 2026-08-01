@@ -20,45 +20,51 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-# The Inkling model ships in transformers >= 5.14; skip the whole module when the
-# installed transformers build predates it (e.g. the pinned release on main).
-pytest.importorskip("transformers.models.inkling", reason="transformers build without the Inkling model")
-
-from transformers.models.inkling.configuration_inkling import InklingConfig  # noqa: E402
-from transformers.models.inkling.modeling_inkling import (  # noqa: E402
-    InklingForConditionalGeneration as HFInklingForConditionalGeneration,
-)
-from transformers.models.inkling.modeling_inkling import InklingMoE as HFInklingMoE  # noqa: E402
-
-from nemo_automodel.components.datasets.vlm.collate_fns import (  # noqa: E402
+from nemo_automodel.components.datasets.vlm.collate_fns import (
     build_labels_from_template,
     default_collate_fn,
 )
-from nemo_automodel.components.models.common import BackendConfig  # noqa: E402
-from nemo_automodel.components.models.common.tie_word_embeddings import TieSupport  # noqa: E402
-from nemo_automodel.components.models.inkling.layers import InklingDenseMLP, InklingMoE  # noqa: E402
-from nemo_automodel.components.models.inkling.model import InklingForConditionalGeneration  # noqa: E402
-from nemo_automodel.components.models.inkling.state_dict_adapter import _interleave  # noqa: E402
+from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.common.tie_word_embeddings import TieSupport
+from nemo_automodel.components.models.inkling.configuration import InklingConfig
+from nemo_automodel.components.models.inkling.layers import InklingDenseMLP, InklingMoE
+from nemo_automodel.components.models.inkling.model import InklingForConditionalGeneration
+from nemo_automodel.components.models.inkling.state_dict_adapter import _interleave
 
-from .parity_check_inkling import build_tiny_config  # noqa: E402
+from .parity_check_inkling import build_tiny_config
+
+
+def _build_native_model():
+    cfg = build_tiny_config()
+    backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch", experts="torch", dispatcher="torch")
+    nemo = InklingForConditionalGeneration.from_config(cfg, backend=backend).to(dtype=torch.float32).eval()
+    return cfg, nemo
 
 
 def _build_models():
-    cfg = build_tiny_config()
-    hf = HFInklingForConditionalGeneration(cfg).to(dtype=torch.float32).eval()
-    backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch", experts="torch")
-    nemo = InklingForConditionalGeneration.from_config(cfg, backend=backend).to(dtype=torch.float32).eval()
+    pytest.importorskip(
+        "transformers.models.inkling",
+        reason="Reference parity requires a development Transformers build with Inkling",
+    )
+    from transformers.models.inkling.configuration_inkling import InklingConfig as HFInklingConfig
+    from transformers.models.inkling.modeling_inkling import (
+        InklingForConditionalGeneration as HFInklingForConditionalGeneration,
+    )
+
+    cfg, nemo = _build_native_model()
+    hf_config = HFInklingConfig.from_dict(cfg.to_dict())
+    hf = HFInklingForConditionalGeneration(hf_config).to(dtype=torch.float32).eval()
     return cfg, hf, nemo
 
 
 def test_sparse_layers_use_inkling_moe():
-    cfg, _, nemo = _build_models()
+    cfg, nemo = _build_native_model()
     layers = nemo.model.language_model.layers
     mlp_types = cfg.text_config.mlp_layer_types
     for i, layer in enumerate(layers):
         if mlp_types[i] == "sparse":
             assert isinstance(layer.mlp, InklingMoE)
-            assert not isinstance(layer.mlp, HFInklingMoE)
+            assert type(layer.mlp).__module__ == "nemo_automodel.components.models.inkling.layers"
         else:
             assert isinstance(layer.mlp, InklingDenseMLP)
 
@@ -117,18 +123,164 @@ def test_requested_dtype_preserves_strict_fp32_modules():
     )
 
 
+def test_native_multimodal_forward_and_backward_are_finite():
+    cfg, model = _build_native_model()
+    model.initialize_weights(buffer_device=torch.device("cpu"))
+    model.train()
+    input_ids = torch.randint(0, cfg.text_config.vocab_size - 2, (1, 12))
+    input_ids[0, 2] = cfg.image_token_id
+    vision = cfg.vision_config
+    pixel_values = torch.randn(
+        1,
+        vision.temporal_patch_size,
+        vision.patch_size,
+        vision.patch_size,
+        vision.num_channels,
+    )
+
+    logits = model(
+        input_ids=input_ids,
+        pixel_values=pixel_values,
+        attention_mask=torch.ones_like(input_ids),
+        use_cache=False,
+    ).logits
+    assert logits.shape == (1, 12, cfg.text_config.vocab_size)
+    assert torch.isfinite(logits).all()
+
+    logits.float().square().mean().backward()
+    assert torch.isfinite(model.model.language_model.embed_tokens.weight.grad).all()
+    sparse_layer = model.model.language_model.layers[2].mlp
+    assert torch.isfinite(sparse_layer.gate.weight.grad).all()
+
+
+def test_native_cached_decode_matches_full_sequence():
+    cfg, model = _build_native_model()
+    model.initialize_weights(buffer_device=torch.device("cpu"))
+    torch.manual_seed(7)
+    input_ids = torch.randint(0, cfg.text_config.vocab_size, (1, 12))
+    attention_mask = torch.ones_like(input_ids)
+
+    with torch.no_grad():
+        full_logits = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False).logits
+        cache = None
+        cached_logits = []
+        for token_idx in range(input_ids.shape[1]):
+            outputs = model(
+                input_ids=input_ids[:, token_idx : token_idx + 1],
+                attention_mask=attention_mask[:, : token_idx + 1],
+                past_key_values=cache,
+                use_cache=True,
+            )
+            cache = outputs.past_key_values
+            cached_logits.append(outputs.logits)
+
+    torch.testing.assert_close(torch.cat(cached_logits, dim=1), full_logits, rtol=1e-4, atol=1e-5)
+
+
+def test_sdpa_matches_eager_for_batched_inputs():
+    cfg, eager_model = _build_native_model()
+    eager_model.initialize_weights(buffer_device=torch.device("cpu"))
+    sdpa_cfg = build_tiny_config()
+    sdpa_cfg.text_config._attn_implementation = "sdpa"
+    backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch", experts="torch", dispatcher="torch")
+    sdpa_model = InklingForConditionalGeneration.from_config(sdpa_cfg, backend=backend).float().eval()
+    sdpa_model.load_state_dict(eager_model.state_dict())
+    input_ids = torch.randint(0, cfg.text_config.vocab_size, (2, 20))
+    attention_mask = torch.ones_like(input_ids)
+
+    with torch.no_grad():
+        eager_logits = eager_model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False).logits
+        sdpa_logits = sdpa_model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False).logits
+
+    assert sdpa_model.model.language_model.layers[0].self_attn.attention_backend == "sdpa"
+    torch.testing.assert_close(sdpa_logits, eager_logits, rtol=1e-4, atol=1e-5)
+
+
+def test_native_state_dict_roundtrip_is_exact():
+    _, model = _build_native_model()
+    model.initialize_weights(buffer_device=torch.device("cpu"))
+    native_state = model.state_dict()
+    raw_state = model.state_dict_adapter.to_hf(native_state)
+    roundtrip_state = model.state_dict_adapter.from_hf(raw_state)
+
+    assert set(roundtrip_state) == set(native_state)
+    for key, value in native_state.items():
+        assert torch.equal(value, roundtrip_state[key]), f"round-trip mismatch for {key}"
+
+
 def test_processor_builder_configures_padding(monkeypatch):
     from nemo_automodel.components.models.inkling import processing
 
+    class FakeProcessor:
+        @classmethod
+        def get_processor_dict(cls, *_args, **_kwargs):
+            return {"image_processor": {}, "feature_extractor": {}}, {}
+
+        def __init__(self, feature_extractor, image_processor, tokenizer, **_kwargs):
+            self.feature_extractor = feature_extractor
+            self.image_processor = image_processor
+            self.tokenizer = tokenizer
+
     tokenizer = SimpleNamespace(eos_token_id=None, pad_token_id=None, eos_token=None, pad_token=None)
-    expected = SimpleNamespace(tokenizer=tokenizer)
-    monkeypatch.setattr(processing.AutoProcessor, "from_pretrained", lambda *_args, **_kwargs: expected)
+    monkeypatch.setattr(processing, "InklingProcessor", FakeProcessor)
+    monkeypatch.setattr(processing, "InklingFeatureExtractor", lambda **_kwargs: "feature")
+    monkeypatch.setattr(processing, "InklingImageProcessor", lambda **_kwargs: "image")
+    monkeypatch.setattr(processing.AutoTokenizer, "from_pretrained", lambda *_args, **_kwargs: tokenizer)
 
     actual = processing.build_inkling_processor("thinkingmachines/Inkling")
 
-    assert actual is expected
+    assert isinstance(actual, FakeProcessor)
+    assert actual.feature_extractor == "feature"
+    assert actual.image_processor == "image"
     assert tokenizer.eos_token == "<|content_model_end_sampling|>"
     assert tokenizer.pad_token == tokenizer.eos_token
+
+
+def test_native_processor_expands_image_and_audio_placeholders():
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from tokenizers.pre_tokenizers import WhitespaceSplit
+    from transformers import PreTrainedTokenizerFast
+
+    from nemo_automodel.components.models.inkling.feature_extraction import InklingFeatureExtractor
+    from nemo_automodel.components.models.inkling.image_processing import InklingImageProcessor
+    from nemo_automodel.components.models.inkling.processing import InklingProcessor
+
+    vocab = {
+        "[UNK]": 0,
+        "[PAD]": 1,
+        "<|unused_200054|>": 2,
+        "<|unused_200053|>": 3,
+        "<|content_image|>": 4,
+        "<|content_audio_input|>": 5,
+    }
+    tokenizer_backend = Tokenizer(WordLevel(vocab=vocab, unk_token="[UNK]"))
+    tokenizer_backend.pre_tokenizer = WhitespaceSplit()
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=tokenizer_backend,
+        unk_token="[UNK]",
+        pad_token="[PAD]",
+    )
+    tokenizer.add_special_tokens({"additional_special_tokens": list(vocab)[2:]})
+    processor = InklingProcessor(
+        InklingFeatureExtractor(feature_size=8, sampling_rate=1600, audio_token_duration_s=0.05),
+        InklingImageProcessor(size={"height": 8, "width": 8}),
+        tokenizer,
+    )
+
+    outputs = processor(
+        text=["<|unused_200054|> <|unused_200053|>"],
+        images=[torch.rand(3, 9, 15)],
+        audio=[torch.randn(160)],
+        sampling_rate=1600,
+        return_tensors="pt",
+    )
+
+    assert outputs.pixel_values.shape == (4, 2, 8, 8, 3)
+    assert outputs.audio_input_ids.shape == (1, 2, 8)
+    assert outputs.audio_input_ids_mask.shape == (1, 2)
+    assert (outputs.input_ids == processor.image_token_id).sum() == 4
+    assert (outputs.input_ids == processor.audio_token_id).sum() == 2
 
 
 def test_inkling_collator_does_not_require_qwen_vl_utils(monkeypatch):
