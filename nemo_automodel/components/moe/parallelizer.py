@@ -36,6 +36,7 @@ from nemo_automodel.components.distributed import parallelizer_utils
 from nemo_automodel.components.distributed.pipelining.hf_utils import get_text_module
 from nemo_automodel.components.moe.experts import GroupedExpertsDeepEP, GroupedExpertsTE
 from nemo_automodel.components.moe.layers import (
+    Gate,
     MoE,
 )
 from nemo_automodel.components.moe.tp_plan_validation import _validate_moe_tp_plan
@@ -682,6 +683,12 @@ def apply_fsdp(
 
     for block in _iter_moe_blocks(model, _model):
         moe_module = _get_moe_module(block)
+        gate = getattr(moe_module, "gate", None)
+        if isinstance(gate, Gate):
+            # FSDP2 does not convert buffers to DTensors. Give the learned
+            # load-balancing bias the same DP/CP mesh used for dense state so
+            # every replica applies one globally consistent routing update.
+            gate._set_expert_load_mesh(fsdp_mesh)
         experts_reshard_after_forward = False if id(block) in mtp_block_ids else reshard_after_forward
         if isinstance(moe_module, MoE) and ep_shard_enabled:
             # Apply FSDP on dim=1 for grouped experts since we may have more
