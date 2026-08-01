@@ -15,7 +15,7 @@
 """Train -> checkpoint -> reload via automodel & vanilla HF from consolidated, verify logits match via KL divergence.
 
 Launch: torchrun --nproc-per-node=<N> -m <this_module> --config <config.yaml>
-    [--isolated_phase <train_and_save|automodel_reload|resume_baseline|resume>]
+    [--isolated_phase <train_and_save|automodel_reload|hf_reload|resume_baseline|resume>]
     [--kl_threshold <float>] [--hf_kl_threshold <float>]
     [--cross_tp_size <int>] [--cross_tp_kl_threshold <float>]
     [--tokenizer_name <str>]
@@ -36,6 +36,7 @@ import time
 import traceback
 from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager, nullcontext
+from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -72,6 +73,7 @@ def _extract_custom_args(argv):
         "--cross_tp_size",
         "--cross_tp_kl_threshold",
         "--experts_implementation",
+        "--hf_device_map_max_memory_gib",
         "--tokenizer_name",
         "--max_vram_gb",
         "--max_cpu_gb",
@@ -266,6 +268,19 @@ def _post_load_dequant_max_memory() -> dict[int, int]:
     }
 
 
+def _hf_device_map_max_memory(max_memory_gib: str | float | None) -> dict[int, str] | None:
+    """Build an optional per-GPU cap for vanilla-HF automatic placement."""
+    if max_memory_gib is None:
+        return None
+    max_memory_gib = float(max_memory_gib)
+    if max_memory_gib <= 0:
+        raise ValueError("hf_device_map_max_memory_gib must be positive")
+    device_count = torch.cuda.device_count()
+    if device_count == 0:
+        raise RuntimeError("hf_device_map_max_memory_gib requires at least one visible CUDA device")
+    return {index: f"{max_memory_gib:g}GiB" for index in range(device_count)}
+
+
 def _rss_gb() -> float:
     """Current RSS in GB from /proc/self/statm."""
     page_size = os.sysconf("SC_PAGE_SIZE")
@@ -331,6 +346,37 @@ def _model_kwargs_from_config(model_cfg: ConfigNode) -> dict:
         for k, v in model_cfg.__dict__.items()
         if k not in ("_target_", "raise_on_missing_attr", "_raw_config", "_original_strings")
     }
+
+
+def _resolve_hf_model_class(
+    pretrained_model_name_or_path: str | Path,
+    default_model_cls: type,
+    *,
+    revision: str | None = None,
+    token: str | bool | None = None,
+) -> type:
+    """Honor a checkpoint's advertised HF auto-model class when the VLM default is absent."""
+    from transformers import AutoModelForCausalLM, AutoModelForImageTextToText, PretrainedConfig
+
+    config_kwargs: dict[str, str | bool] = {
+        "local_files_only": os.environ.get("HF_HUB_OFFLINE", "0") == "1",
+    }
+    if revision is not None:
+        config_kwargs["revision"] = revision
+    if token is not None:
+        config_kwargs["token"] = token
+    config_dict, _ = PretrainedConfig.get_config_dict(pretrained_model_name_or_path, **config_kwargs)
+    auto_map = config_dict.get("auto_map") or {}
+    if not auto_map or default_model_cls.__name__ in auto_map:
+        return default_model_cls
+
+    supported_classes = {
+        model_cls.__name__: model_cls for model_cls in (AutoModelForImageTextToText, AutoModelForCausalLM)
+    }
+    advertised_classes = [model_cls for name, model_cls in supported_classes.items() if name in auto_map]
+    if len(advertised_classes) == 1:
+        return advertised_classes[0]
+    return default_model_cls
 
 
 def _resolve_source_load_dtype(model_kwargs: dict) -> torch.dtype:
@@ -784,6 +830,12 @@ def _prepare_source_load_reference_rank0(
     model_kwargs = _model_kwargs_from_config(cfg.model)
     original_pretrained_path = model_kwargs.get("pretrained_model_name_or_path")
     assert original_pretrained_path is not None, "source-load parity requires model.pretrained_model_name_or_path"
+    hf_model_cls = _resolve_hf_model_class(
+        original_pretrained_path,
+        hf_model_cls,
+        revision=model_kwargs.get("revision"),
+        token=model_kwargs.get("token"),
+    )
     source_dtype = _resolve_source_load_dtype(model_kwargs)
     trust_remote_code = trust_remote_code or bool(model_kwargs.get("trust_remote_code", False))
 
@@ -1223,6 +1275,176 @@ def _checkpoint_paths(cfg) -> tuple[Path, Path, Path]:
     return checkpoint_dir, ckpt_step_dir, ckpt_step_dir / "model" / "consolidated"
 
 
+def _materialize_hf_quantization_config(cfg):
+    """Materialize a YAML quantization subtree for vanilla-HF loading."""
+    raw_quantization_config = getattr(cfg.model, "quantization_config", None)
+    if raw_quantization_config is not None and hasattr(raw_quantization_config, "instantiate"):
+        try:
+            return raw_quantization_config.instantiate()
+        except Exception:
+            return None
+    return raw_quantization_config
+
+
+def _run_vanilla_hf_reload(
+    cfg,
+    input_ids: list[int],
+    reference_logits: torch.Tensor,
+    *,
+    hf_model_cls: type,
+    custom_args: dict,
+) -> str | None:
+    """Load the saved model with vanilla HF and compare its logits.
+
+    Args:
+        cfg: Resolved checkpoint-robustness recipe configuration.
+        input_ids: Token IDs for one text-only parity prompt.
+        reference_logits: Tensor of shape [batch, sequence, vocab] captured before checkpoint save.
+        hf_model_cls: Hugging Face auto-model class used for the reload.
+        custom_args: Checkpoint-robustness fixture settings.
+
+    Returns:
+        An error message when loading or parity fails, otherwise ``None``.
+    """
+    try:
+        _, ckpt_step_dir, consolidated_dir = _checkpoint_paths(cfg)
+        is_peft = hasattr(cfg, "peft")
+        original_pretrained_path = cfg.model.pretrained_model_name_or_path
+        model_kwargs = _model_kwargs_from_config(cfg.model)
+        original_quantization_config = _materialize_hf_quantization_config(cfg)
+        trust_remote_code = bool(custom_args.get("trust_remote_code", False))
+        experts_implementation = custom_args.get("experts_implementation", None)
+        hf_device_map_auto = bool(custom_args.get("hf_device_map_auto", False))
+        check_fused_qkv_keys = bool(custom_args.get("check_fused_qkv_keys", False))
+        hf_kl_threshold = float(custom_args.get("hf_kl_threshold", "5e-3"))
+        device = torch.device("cuda", torch.cuda.current_device())
+        config_path = original_pretrained_path if is_peft else consolidated_dir
+        hf_model_cls = _resolve_hf_model_class(
+            config_path,
+            hf_model_cls,
+            revision=model_kwargs.get("revision"),
+            token=model_kwargs.get("token"),
+        )
+
+        hf_kwargs = dict(
+            torch_dtype=torch.bfloat16,
+            trust_remote_code=trust_remote_code,
+            local_files_only=os.environ.get("HF_HUB_OFFLINE", "0") == "1",
+        )
+        # Remote-code models can ship attention names that transformers 5.x
+        # rejects. Select a supported implementation while keeping Nemotron-H
+        # off HF's incompatible FlashAttention varlen path.
+        if trust_remote_code and "attn_implementation" not in hf_kwargs:
+            hf_kwargs["attn_implementation"] = _get_trust_remote_code_attn_implementation(config_path)
+        if experts_implementation and not trust_remote_code:
+            hf_kwargs["experts_implementation"] = experts_implementation
+            hf_kwargs["trust_remote_code"] = False
+        if hf_device_map_auto:
+            hf_kwargs["device_map"] = "auto"
+            max_memory = _hf_device_map_max_memory(custom_args.get("hf_device_map_max_memory_gib"))
+            if max_memory is not None:
+                hf_kwargs["max_memory"] = max_memory
+        if original_quantization_config is not None:
+            hf_kwargs["quantization_config"] = original_quantization_config
+        else:
+            fp8_config = _load_hf_fp8_dequantized_config(
+                config_path,
+                trust_remote_code=trust_remote_code,
+            )
+            if fp8_config is not None:
+                hf_kwargs["config"] = fp8_config
+        hf_config = hf_kwargs.get("config")
+        if hf_config is None:
+            hf_config = _load_hf_config(
+                config_path,
+                trust_remote_code=trust_remote_code,
+            )
+        # Load the reference model straight onto the target GPU. Materialising a
+        # 14B checkpoint on CPU and then ``.to(device)`` costs ~50-225s, and that
+        # rank-0-only stall trips the NCCL watchdog while the other ranks idle at
+        # a collective. ``device_map`` places weights on GPUs directly.
+        if "device_map" not in hf_kwargs and not trust_remote_code and original_quantization_config is None:
+            hf_kwargs["device_map"] = {"": device}
+
+        model_load_context = _hf_model_load_context(
+            trust_remote_code=trust_remote_code,
+            has_device_map="device_map" in hf_kwargs,
+        )
+
+        if is_peft:
+            from peft import PeftModel
+
+            with model_load_context, _keep_hf_modules_in_fp32(hf_config):
+                if "device_map" in hf_kwargs:
+                    base_model = hf_model_cls.from_pretrained(original_pretrained_path, **hf_kwargs)
+                else:
+                    base_model = _fix_meta_rotary_embeddings(
+                        hf_model_cls.from_pretrained(original_pretrained_path, **hf_kwargs)
+                    ).to(device)
+            _reinit_rotary_per_module(base_model, device)
+            if trust_remote_code:
+                from nemo_automodel._transformers.v4_patches.rotary import (
+                    fix_rotary_embeddings,
+                    should_fix_rotary_embeddings,
+                )
+
+                if should_fix_rotary_embeddings([base_model]):
+                    fix_rotary_embeddings([base_model])
+            peft_model = PeftModel.from_pretrained(base_model, str(ckpt_step_dir / "model"))
+            hf_logits = _get_logits(peft_model, input_ids, device)
+
+            if check_fused_qkv_keys:
+                from safetensors import safe_open
+
+                adapter_path = ckpt_step_dir / "model" / "adapter_model.safetensors"
+                assert adapter_path.exists(), f"adapter_model.safetensors not found at {adapter_path}"
+                with safe_open(str(adapter_path), framework="pt") as f:
+                    adapter_keys = list(f.keys())
+                combined_keys = [key for key in adapter_keys if "qkv_proj" in key or "gate_up_proj" in key]
+                assert not combined_keys, (
+                    f"Fused QKV check failed: adapter_model.safetensors contains combined projection keys: "
+                    f"{combined_keys}"
+                )
+                print(f"[Fused QKV] No combined projection keys in adapter ({len(adapter_keys)} keys checked) ✓")
+
+            del peft_model, base_model
+        else:
+            _prepopulate_hf_dynamic_modules_cache(consolidated_dir)
+            with model_load_context, _keep_hf_modules_in_fp32(hf_config):
+                if "device_map" in hf_kwargs:
+                    hf_model = hf_model_cls.from_pretrained(str(consolidated_dir), **hf_kwargs)
+                else:
+                    hf_model = _fix_meta_rotary_embeddings(
+                        hf_model_cls.from_pretrained(str(consolidated_dir), **hf_kwargs)
+                    ).to(device)
+            _reinit_rotary_per_module(hf_model, device)
+            if trust_remote_code:
+                from nemo_automodel._transformers.v4_patches.rotary import (
+                    fix_rotary_embeddings,
+                    should_fix_rotary_embeddings,
+                )
+
+                if should_fix_rotary_embeddings([hf_model]):
+                    fix_rotary_embeddings([hf_model])
+            hf_logits = _get_logits(hf_model, input_ids, device)
+            del hf_model
+
+        max_kl_hf = _kl_divergence_from_logits(reference_logits, hf_logits).max().item()
+        print(f"[HF reload] HF-loaded max KL: {max_kl_hf:.6e} (threshold: {hf_kl_threshold:.6e})")
+        hf_reload_error = None
+        if max_kl_hf > hf_kl_threshold:
+            hf_reload_error = (
+                "KL divergence between original and HF-loaded model too large: "
+                f"max per-token KL = {max_kl_hf:.6e} > threshold {hf_kl_threshold:.6e}"
+            )
+        del hf_logits
+        _release_model_memory()
+        return hf_reload_error
+    except Exception as exc:
+        _release_model_memory()
+        return f"Vanilla HF reload failed: {type(exc).__name__}: {exc}\n{traceback.format_exc()}"
+
+
 def _robustness_artifact_dir(cfg) -> Path:
     """Return the shared directory used to pass small artifacts between isolated phases."""
     return Path(cfg.checkpoint.checkpoint_dir) / ".checkpoint_robustness"
@@ -1252,6 +1474,7 @@ def _run_process_isolated_checkpoint_phase(
     *,
     custom_args: dict,
     recipe_cls: type[BaseRecipe],
+    hf_model_cls: type,
     input_ids_loader: Callable[[str | None], list[int]],
 ) -> None:
     """Run one large-model checkpoint phase and then return directly to the launcher.
@@ -1264,15 +1487,14 @@ def _run_process_isolated_checkpoint_phase(
         phase: Isolated checkpoint phase selected by the launcher.
         custom_args: Test-specific values extracted from the resolved recipe.
         recipe_cls: Recipe class used for training, reload, and resume.
+        hf_model_cls: Hugging Face auto-model class used for vanilla-HF reload.
         input_ids_loader: Domain-specific prompt tokenizer.
     """
-    supported_phases = {"train_and_save", "automodel_reload", "resume_baseline", "resume"}
+    supported_phases = {"train_and_save", "automodel_reload", "hf_reload", "resume_baseline", "resume"}
     if phase not in supported_phases:
         raise ValueError(f"Unsupported isolated checkpoint phase {phase!r}; expected one of {sorted(supported_phases)}")
     if custom_args.get("check_source_load_parity", False):
         raise ValueError("Process-isolated checkpoint mode does not yet support check_source_load_parity")
-    if not custom_args.get("skip_hf_reload", False):
-        raise ValueError("Process-isolated checkpoint mode currently requires skip_hf_reload=true")
     if int(custom_args.get("cross_tp_size", "0")) > 0:
         raise ValueError("Process-isolated checkpoint mode does not yet support cross_tp_size")
     if custom_args.get("no_check_resume", False):
@@ -1281,6 +1503,46 @@ def _run_process_isolated_checkpoint_phase(
     _disable_distributed_atexit_teardown()
     cfg = parse_args_and_load_config()
     tokenizer_name = custom_args.get("tokenizer_name", None)
+
+    if phase == "hf_reload":
+        if custom_args.get("skip_hf_reload", False):
+            raise ValueError("Process-isolated hf_reload conflicts with skip_hf_reload=true")
+
+        _report_phase("Isolated vanilla-HF reload: loading prompt input IDs")
+        input_ids = _load_input_ids_once(cfg, input_ids_loader, tokenizer_name)
+
+        # The HF model is sharded by one rank-0 process over all GPUs on its
+        # node. A CPU process group keeps the remaining workers synchronized
+        # without reserving CUDA memory or starting a long NCCL wait.
+        dist.init_process_group(
+            backend="gloo",
+            timeout=timedelta(minutes=cfg.get("dist_env", {}).get("timeout_minutes", 1)),
+        )
+        if tokenizer_name is not None:
+            _barrier()
+            if _rank0():
+                _cleanup_input_ids_sync(cfg)
+            _barrier()
+
+        reference_path = _robustness_artifact_dir(cfg) / "reference_logits.pt"
+        hf_reload_sync_paths = _prepare_hf_reload_sync(cfg)
+        hf_reload_error = None
+        if _rank0():
+            if not reference_path.exists():
+                hf_reload_error = f"Reference logits not found at {reference_path}"
+            else:
+                reference_logits = torch.load(reference_path, map_location="cpu", weights_only=True)
+                hf_reload_error = _run_vanilla_hf_reload(
+                    cfg,
+                    input_ids,
+                    reference_logits,
+                    hf_model_cls=hf_model_cls,
+                    custom_args=custom_args,
+                )
+        hf_reload_error = _finish_hf_reload_sync(hf_reload_sync_paths, hf_reload_error)
+        _raise_distributed_failure(hf_reload_error)
+        _report_phase("Isolated vanilla-HF reload: parity complete; exiting phase")
+        return
 
     if phase == "train_and_save":
         _report_phase("Isolated train/save: loading prompt input IDs")
@@ -1555,6 +1817,7 @@ def run_checkpoint_robustness(
             str(isolated_phase),
             custom_args=custom_args,
             recipe_cls=recipe_cls,
+            hf_model_cls=hf_model_cls,
             input_ids_loader=input_ids_loader,
         )
         return
@@ -1567,7 +1830,6 @@ def run_checkpoint_robustness(
     _tp_size = _tp_size_from_argv(config_argv)
     _default_kl_threshold = "1e-5" if _tp_size > 1 else "0"
     kl_threshold = float(custom_args.get("kl_threshold", _default_kl_threshold))
-    hf_kl_threshold = float(custom_args.get("hf_kl_threshold", "5e-3"))
     cross_tp_size = int(custom_args.get("cross_tp_size", "0"))
     cross_tp_kl_threshold = float(custom_args.get("cross_tp_kl_threshold", "5e-3"))
     trust_remote_code = bool(custom_args.get("trust_remote_code", False))
@@ -1575,7 +1837,6 @@ def run_checkpoint_robustness(
     tokenizer_name = custom_args.get("tokenizer_name", None)
     max_vram_gb = float(custom_args.get("max_vram_gb", "0"))
     max_cpu_gb = float(custom_args.get("max_cpu_gb", "0"))
-    check_fused_qkv_keys = bool(custom_args.get("check_fused_qkv_keys", False))
     check_phantom_keys = bool(custom_args.get("check_phantom_keys", False))
     check_resume = bool(custom_args.get("check_resume", False))
     resume_loss_threshold = float(custom_args.get("resume_loss_threshold", "5e-3"))
@@ -1682,18 +1943,6 @@ def run_checkpoint_robustness(
     consolidated_dir = ckpt_step_dir / "model" / "consolidated"
 
     is_peft = hasattr(cfg, "peft")
-    original_pretrained_path = cfg.model.pretrained_model_name_or_path
-    # Materialize an explicit YAML quantization subtree for the vanilla HF
-    # reload. Passing ConfigNode directly would recurse in HF's deepcopy.
-    # Source FP8 configs without an override are detected and dequantized below.
-    _raw_qc = getattr(cfg.model, "quantization_config", None)
-    if _raw_qc is not None and hasattr(_raw_qc, "instantiate"):
-        try:
-            original_quantization_config = _raw_qc.instantiate()
-        except Exception:
-            original_quantization_config = None
-    else:
-        original_quantization_config = _raw_qc
 
     _release_recipe_memory(trainer)
     del trainer
@@ -1768,135 +2017,13 @@ def run_checkpoint_robustness(
         if _rank0():
             print("[Phase 4] Skipped (ci.checkpoint_robustness.skip_hf_reload=true).")
     elif _rank0():
-        config_path = original_pretrained_path if is_peft else consolidated_dir
-        hf_kwargs = dict(
-            torch_dtype=torch.bfloat16,
-            trust_remote_code=trust_remote_code,
-            local_files_only=os.environ.get("HF_HUB_OFFLINE", "0") == "1",
+        hf_reload_error = _run_vanilla_hf_reload(
+            cfg,
+            input_ids,
+            reference_logits,
+            hf_model_cls=hf_model_cls,
+            custom_args=custom_args,
         )
-        # Remote-code models can ship attention names that transformers 5.x
-        # rejects. Select a supported implementation while keeping Nemotron-H
-        # off HF's incompatible FlashAttention varlen path.
-        if trust_remote_code and "attn_implementation" not in hf_kwargs:
-            hf_kwargs["attn_implementation"] = _get_trust_remote_code_attn_implementation(config_path)
-        if experts_implementation and not trust_remote_code:
-            hf_kwargs["experts_implementation"] = experts_implementation
-            hf_kwargs["trust_remote_code"] = False
-        if hf_device_map_auto:
-            hf_kwargs["device_map"] = "auto"
-        if original_quantization_config is not None:
-            hf_kwargs["quantization_config"] = original_quantization_config
-        else:
-            fp8_config = _load_hf_fp8_dequantized_config(
-                config_path,
-                trust_remote_code=trust_remote_code,
-            )
-            if fp8_config is not None:
-                hf_kwargs["config"] = fp8_config
-        hf_config = hf_kwargs.get("config")
-        if hf_config is None:
-            hf_config = _load_hf_config(
-                config_path,
-                trust_remote_code=trust_remote_code,
-            )
-        # Load the reference model straight onto the target GPU. Materialising a
-        # 14B checkpoint on CPU and then ``.to(device)`` costs ~50-225s, and that
-        # rank-0-only stall trips the NCCL watchdog while the other ranks idle at
-        # the post-phase ``_barrier()`` below (the failure mode this test hit on
-        # large models). ``device_map`` places weights on the GPU directly (~12s).
-        # Remote-code models without device-map placement need real-device init;
-        # standard-HF loads can be placed directly through a fixed device map.
-        if "device_map" not in hf_kwargs and not trust_remote_code and original_quantization_config is None:
-            hf_kwargs["device_map"] = {"": device}
-
-        model_load_context = _hf_model_load_context(
-            trust_remote_code=trust_remote_code,
-            has_device_map="device_map" in hf_kwargs,
-        )
-
-        if is_peft:
-            from peft import PeftModel
-
-            with model_load_context, _keep_hf_modules_in_fp32(hf_config):
-                if "device_map" in hf_kwargs:
-                    base_model = hf_model_cls.from_pretrained(original_pretrained_path, **hf_kwargs)
-                else:
-                    base_model = _fix_meta_rotary_embeddings(
-                        hf_model_cls.from_pretrained(original_pretrained_path, **hf_kwargs)
-                    ).to(device)
-            # Re-init non-persistent rotary buffers for ``model_type`` values
-            # in ``_MODELS_REQUIRING_BUFFER_REINIT`` (``nemotron-nas``,
-            # ``gemma3``) — their ``inv_freq`` is computed in ``__init__`` and
-            # never written to the checkpoint; meta-device init leaves
-            # garbage values after ``from_pretrained``.
-            _reinit_rotary_per_module(base_model, device)
-            # For Nemotron-Flash (``model_type=="nemotron_flash"``) the
-            # ``inv_freq`` buffer also lands garbage under HF load but its
-            # NTK formula is non-standard, so route through the dedicated
-            # ``fix_rotary_embeddings`` patch which installs Flash's own NTK
-            # formula and mirrors Flash's native forward.
-            if trust_remote_code:
-                from nemo_automodel._transformers.v4_patches.rotary import (
-                    fix_rotary_embeddings,
-                    should_fix_rotary_embeddings,
-                )
-
-                if should_fix_rotary_embeddings([base_model]):
-                    fix_rotary_embeddings([base_model])
-            peft_model = PeftModel.from_pretrained(base_model, str(ckpt_step_dir / "model"))
-            hf_logits = _get_logits(peft_model, input_ids, device)
-
-            # PEFT fused QKV key verification
-            if check_fused_qkv_keys:
-                from safetensors import safe_open
-
-                adapter_path = ckpt_step_dir / "model" / "adapter_model.safetensors"
-                assert adapter_path.exists(), f"adapter_model.safetensors not found at {adapter_path}"
-                with safe_open(str(adapter_path), framework="pt") as f:
-                    adapter_keys = list(f.keys())
-                combined_keys = [k for k in adapter_keys if "qkv_proj" in k or "gate_up_proj" in k]
-                assert len(combined_keys) == 0, (
-                    f"Fused QKV check failed: adapter_model.safetensors contains combined projection keys: "
-                    f"{combined_keys}"
-                )
-                print(f"[Fused QKV] No combined projection keys in adapter ({len(adapter_keys)} keys checked) ✓")
-
-            del peft_model, base_model
-        else:
-            _prepopulate_hf_dynamic_modules_cache(consolidated_dir)
-            with model_load_context, _keep_hf_modules_in_fp32(hf_config):
-                if "device_map" in hf_kwargs:
-                    hf_model = hf_model_cls.from_pretrained(str(consolidated_dir), **hf_kwargs)
-                else:
-                    hf_model = _fix_meta_rotary_embeddings(
-                        hf_model_cls.from_pretrained(str(consolidated_dir), **hf_kwargs)
-                    ).to(device)
-            # Re-init non-persistent rotary buffers for nemotron-nas / gemma3
-            # (``_MODELS_REQUIRING_BUFFER_REINIT`` allow-list). See PEFT branch
-            # above for details.
-            _reinit_rotary_per_module(hf_model, device)
-            # For Nemotron-Flash: install NTK inv_freq via dedicated patch.
-            if trust_remote_code:
-                from nemo_automodel._transformers.v4_patches.rotary import (
-                    fix_rotary_embeddings,
-                    should_fix_rotary_embeddings,
-                )
-
-                if should_fix_rotary_embeddings([hf_model]):
-                    fix_rotary_embeddings([hf_model])
-            hf_logits = _get_logits(hf_model, input_ids, device)
-            del hf_model
-
-        kl_hf = _kl_divergence_from_logits(reference_logits, hf_logits)
-        max_kl_hf = kl_hf.max().item()
-        print(f"[Phase 4] HF-loaded max KL: {max_kl_hf:.6e} (threshold: {hf_kl_threshold:.6e})")
-        if max_kl_hf > hf_kl_threshold:
-            hf_reload_error = (
-                "KL divergence between original and HF-loaded model too large: "
-                f"max per-token KL = {max_kl_hf:.6e} > threshold {hf_kl_threshold:.6e}"
-            )
-        del hf_logits
-        _release_model_memory()
 
     hf_reload_error = _finish_hf_reload_sync(hf_reload_sync_paths, hf_reload_error)
     _record_deferred_failure(deferred_failures, "Phase 4 HF reload parity", hf_reload_error)

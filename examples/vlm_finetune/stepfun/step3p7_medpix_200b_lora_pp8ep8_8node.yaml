@@ -150,7 +150,7 @@ ci:
   nodes: 8
   time: "00:35:00"
   env_vars:
-    CHECKPOINT_ROBUSTNESS_PHASES: "train_and_save automodel_reload"
+    CHECKPOINT_ROBUSTNESS_PHASES: "train_and_save automodel_reload hf_reload"
   checkpoint_robustness:
     # PP=8 with pp_microbatch_size=1 requires at least eight pipeline microbatches.
     step_scheduler.global_batch_size: 64
@@ -160,7 +160,12 @@ ci:
     step_scheduler.ckpt_every_steps: 1
     # Match a real restart and let each large trainer exit before the next one starts.
     process_isolation: true
-    # Exact trainable-parameter fingerprints guard checkpoint integrity; this allows backend drift.
+    # Exact trainable-parameter fingerprints guard checkpoint integrity; these allow backend drift.
     kl_threshold: 2e-2
-    skip_hf_reload: true
+    hf_kl_threshold: 2e-2
+    # Vanilla HF needs remote model code and shards the 403 GB base over rank 0's local GPU node.
+    trust_remote_code: true
+    hf_device_map_auto: true
+    # The BF16 base fits on seven H100s at this cap, leaving at least 24 GiB/GPU for the forward pass.
+    hf_device_map_max_memory_gib: 55
     tokenizer_name: stepfun-ai/Step-3.7-Flash
