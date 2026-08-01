@@ -121,6 +121,7 @@ fixture_keys:
     - check_repeat_forward_parity
     - check_gate_bias_parity
     - check_state_fingerprint_parity
+    - check_dcp_reload_parity
     - cross_tp_kl_threshold
     - cross_tp_size
     - cosine_threshold

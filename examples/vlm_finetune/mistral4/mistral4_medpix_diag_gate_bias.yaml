@@ -128,6 +128,7 @@ ci:
     check_repeat_forward_parity: true
     check_gate_bias_parity: true
     check_state_fingerprint_parity: true
+    check_dcp_reload_parity: true
     hf_device_map_auto: true
     # Transformers' load-time dequantization leaves Mistral4 expert weights in
     # FP8, while native forward requires an optional kernel absent from CI.

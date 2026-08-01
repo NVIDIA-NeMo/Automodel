@@ -279,6 +279,13 @@ def test_extract_custom_args_accepts_hf_source_post_load_dequantize():
     assert remaining == ["--other-arg"]
 
 
+def test_extract_custom_args_accepts_dcp_reload_parity():
+    custom, remaining = _extract_custom_args(["--check_dcp_reload_parity", "--other-arg"])
+
+    assert custom == {"check_dcp_reload_parity": True}
+    assert remaining == ["--other-arg"]
+
+
 def test_keep_hf_modules_in_fp32_uses_strict_dtype_plan_and_restores_class_state(tmp_path):
     from transformers import PretrainedConfig, PreTrainedModel
 

@@ -21,6 +21,7 @@ Launch: torchrun --nproc-per-node=<N> -m pytest <this_file> -c <config.yaml>
     [--source_load_kl_threshold <float>] [--source_load_mean_kl_threshold <float>]
     [--check_source_load_parity] [--check_fused_qkv_keys] [--check_phantom_keys] [--check_resume]
     [--check_repeat_forward_parity] [--check_gate_bias_parity] [--check_state_fingerprint_parity]
+    [--check_dcp_reload_parity]
     [--hf_source_post_load_dequantize]
     [--max_vram_gb <float>] [--max_cpu_gb <float>]
 """
@@ -84,6 +85,7 @@ def _extract_custom_args(argv):
         "--check_repeat_forward_parity",
         "--check_gate_bias_parity",
         "--check_state_fingerprint_parity",
+        "--check_dcp_reload_parity",
         "--hf_device_map_auto",
         "--hf_source_post_load_dequantize",
         "--skip_hf_reload",
@@ -1360,6 +1362,7 @@ def run_checkpoint_robustness(
     check_repeat_forward_parity = bool(custom_args.get("check_repeat_forward_parity", False))
     check_gate_bias_parity = bool(custom_args.get("check_gate_bias_parity", False))
     check_state_fingerprint_parity = bool(custom_args.get("check_state_fingerprint_parity", False))
+    check_dcp_reload_parity = bool(custom_args.get("check_dcp_reload_parity", False))
     resume_loss_threshold = float(custom_args.get("resume_loss_threshold", "5e-3"))
     hf_device_map_auto = bool(custom_args.get("hf_device_map_auto", False))
     hf_source_post_load_dequantize = bool(custom_args.get("hf_source_post_load_dequantize", False))
@@ -1719,6 +1722,45 @@ def run_checkpoint_robustness(
 
         _release_recipe_memory(cross_tp_trainer)
         del cross_tp_trainer
+        _barrier()
+
+    # Optional diagnostic control: load the native DCP training checkpoint into
+    # a fresh distributed runtime and compare it with both the in-memory Phase 2
+    # model and the consolidated Phase 3 reload. If both fresh loads move by the
+    # same amount while their state fingerprints remain exact, the delta belongs
+    # to distributed execution setup rather than checkpoint consolidation.
+    if check_dcp_reload_parity and not is_peft:
+        cfg = parse_args_and_load_config()
+        cfg.checkpoint.restore_from = str(ckpt_step_dir)
+        dcp_reload_trainer = recipe_cls(cfg)
+        dcp_reload_trainer.setup()
+
+        if reference_state_samples is not None:
+            _report_state_fingerprint_diagnostic(
+                "Phase 2-to-DCP state fingerprint", reference_state_samples, dcp_reload_trainer
+            )
+
+        dcp_device = next(dcp_reload_trainer.model_parts[0].parameters()).device
+        dcp_reload_logits = _get_logits(
+            dcp_reload_trainer.model_parts[0], input_ids, dcp_device, trainer=dcp_reload_trainer
+        )
+        _report_distributed_logits_diagnostic(
+            "DCP reload control",
+            reference_logits,
+            dcp_reload_logits,
+            dcp_device,
+        )
+        max_kl_dcp = _kl_divergence_from_logits(reference_logits, dcp_reload_logits).max().item()
+        max_kl_consolidated_to_dcp = _kl_divergence_from_logits(restored_logits, dcp_reload_logits).max().item()
+        if _rank0():
+            print(
+                "[DCP reload control] "
+                f"Phase 2-to-DCP max KL: {max_kl_dcp:.6e}; "
+                f"consolidated-to-DCP max KL: {max_kl_consolidated_to_dcp:.6e}"
+            )
+
+        _release_recipe_memory(dcp_reload_trainer)
+        del dcp_reload_trainer, dcp_reload_logits
         _barrier()
 
     # Phase 6 (optional): Training resumption — verify loss continuity
