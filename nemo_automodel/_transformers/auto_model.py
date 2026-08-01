@@ -683,8 +683,8 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 Accepts both SDPBackend enum values and string names (e.g.
                 ``["flash_attention", "efficient_attention"]``). When ``None``,
                 auto-selects based on CP and activation checkpointing.
-            torch_dtype (str | torch.dtype | Literal["auto"], default="auto"):
-                Data type passed to the underlying `from_pretrained` call.
+            torch_dtype (str | torch.dtype):
+                Data type passed to the underlying `from_pretrained` call. Defaults to `auto`.
             attn_implementation (str, optional):
                 Specifies which attention implementation to use (e.g.,
                 ``"flash_attention_2"``, ``"eager"``). Only applied when the
@@ -812,8 +812,8 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 The configuration object used to build the model.
                 If config is passed as a string (e.g., model-id / local checkpoint),
                 it will create a config internally using AutoConfig.
-            torch_dtype (str | torch.dtype, default="auto"):
-                Data type for model parameters. If "auto", defaults to ``torch.bfloat16``.
+            torch_dtype (str | torch.dtype):
+                Data type for model parameters. Defaults to `auto`, which selects ``torch.bfloat16``.
         """
         _reject_separate_distributed_kwargs(kwargs)
         setup = _resolve_distributed_setup(
