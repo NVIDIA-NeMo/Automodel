@@ -20,7 +20,7 @@ Launch: torchrun --nproc-per-node=<N> -m pytest <this_file> -c <config.yaml>
     [--tokenizer_name <str>]
     [--source_load_kl_threshold <float>] [--source_load_mean_kl_threshold <float>]
     [--check_source_load_parity] [--check_fused_qkv_keys] [--check_phantom_keys] [--check_resume]
-    [--check_repeat_forward_parity]
+    [--check_repeat_forward_parity] [--check_gate_bias_parity]
     [--hf_source_post_load_dequantize]
     [--max_vram_gb <float>] [--max_cpu_gb <float>]
 """
@@ -82,6 +82,7 @@ def _extract_custom_args(argv):
         "--check_phantom_keys",
         "--check_resume",
         "--check_repeat_forward_parity",
+        "--check_gate_bias_parity",
         "--hf_device_map_auto",
         "--hf_source_post_load_dequantize",
         "--skip_hf_reload",
@@ -322,6 +323,64 @@ def _report_distributed_logits_diagnostic(
         cross_rank_values = [tuple(metric.cpu().tolist()) for metric in cross_rank_metrics]
         print(f"[{label}] same-rank (max KL, max abs) by global rank: {same_rank_values}")
         print(f"[{label}] candidate-vs-rank0 (max KL, max abs) by global rank: {cross_rank_values}")
+
+
+def _report_gate_bias_diagnostic(label: str, trainer) -> None:
+    """Report score-correction bias agreement within each pipeline stage."""
+    local_biases = {}
+    for part_index, model_part in enumerate(trainer.model_parts):
+        for name, buffer in model_part.named_buffers():
+            if not name.endswith("e_score_correction_bias"):
+                continue
+            value = buffer.full_tensor() if isinstance(buffer, DTensor) else buffer
+            local_biases[f"part{part_index}.{name}"] = value.detach().float().cpu()
+
+    pp_rank = trainer.device_mesh["pp"].get_local_rank() if trainer.pp_enabled else 0
+    ep_rank = trainer.moe_mesh["ep"].get_local_rank() if trainer.moe_mesh is not None else 0
+    payload = {
+        "global_rank": dist.get_rank() if dist.is_initialized() else 0,
+        "pp_rank": pp_rank,
+        "ep_rank": ep_rank,
+        "biases": local_biases,
+    }
+
+    if not dist.is_initialized():
+        print(f"[{label}] local gate-bias tensors: {len(local_biases)}")
+        return
+
+    gathered = [None] * dist.get_world_size()
+    dist.all_gather_object(gathered, payload)
+    if not _rank0():
+        return
+
+    metrics = []
+    for stage_rank in sorted({entry["pp_rank"] for entry in gathered}):
+        stage_entries = sorted(
+            (entry for entry in gathered if entry["pp_rank"] == stage_rank), key=lambda entry: entry["ep_rank"]
+        )
+        reference = stage_entries[0]
+        reference_names = set(reference["biases"])
+        for entry in stage_entries:
+            names = reference_names & set(entry["biases"])
+            max_abs = max(
+                ((reference["biases"][name] - entry["biases"][name]).abs().max().item() for name in names),
+                default=0.0,
+            )
+            local_abs_max = max(
+                (bias.abs().max().item() for bias in entry["biases"].values()),
+                default=0.0,
+            )
+            metrics.append(
+                (
+                    entry["global_rank"],
+                    entry["pp_rank"],
+                    entry["ep_rank"],
+                    len(entry["biases"]),
+                    max_abs,
+                    local_abs_max,
+                )
+            )
+    print(f"[{label}] (global rank, PP, EP, tensors, max abs vs EP0, local abs max): {metrics}")
 
 
 def _materialize_config_value(value):
@@ -1178,6 +1237,7 @@ def run_checkpoint_robustness(
     check_phantom_keys = bool(custom_args.get("check_phantom_keys", False))
     check_resume = bool(custom_args.get("check_resume", False))
     check_repeat_forward_parity = bool(custom_args.get("check_repeat_forward_parity", False))
+    check_gate_bias_parity = bool(custom_args.get("check_gate_bias_parity", False))
     resume_loss_threshold = float(custom_args.get("resume_loss_threshold", "5e-3"))
     hf_device_map_auto = bool(custom_args.get("hf_device_map_auto", False))
     hf_source_post_load_dequantize = bool(custom_args.get("hf_source_post_load_dequantize", False))
@@ -1255,6 +1315,8 @@ def run_checkpoint_robustness(
 
     # Phase 2: Capture reference logits before teardown
     device = next(trainer.model_parts[0].parameters()).device
+    if check_gate_bias_parity:
+        _report_gate_bias_diagnostic("Phase 2 gate bias", trainer)
     reference_logits = _get_logits(trainer.model_parts[0], input_ids, device, trainer=trainer)
     if check_repeat_forward_parity:
         repeated_reference_logits = _get_logits(trainer.model_parts[0], input_ids, device, trainer=trainer)
@@ -1330,6 +1392,8 @@ def run_checkpoint_robustness(
     restored_trainer = recipe_cls(cfg)
     restored_trainer.setup()
 
+    if check_gate_bias_parity:
+        _report_gate_bias_diagnostic("Phase 3 gate bias", restored_trainer)
     restored_logits = _get_logits(restored_trainer.model_parts[0], input_ids, device, trainer=restored_trainer)
     if check_repeat_forward_parity:
         repeated_restored_logits = _get_logits(
