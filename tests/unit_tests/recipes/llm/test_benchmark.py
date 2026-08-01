@@ -151,6 +151,7 @@ def mock_recipe(mock_config, monkeypatch):
         recipe.wandb_run = None
         recipe.partial_cuda_graph_manager = None
         recipe._partial_cuda_graph_capture_pending = False
+        recipe._partial_cuda_graph_paged_stash_enabled = False
         recipe.step_scheduler = SimpleNamespace(step=0, gc_every_steps=None)
         recipe._dp_allreduce = MagicMock(side_effect=lambda x, include_cp=False: x)
         recipe.device_mesh = None
@@ -471,6 +472,10 @@ class TestBenchmarkingRecipeRunBenchmark:
         graph_manager = MagicMock()
         mock_recipe.partial_cuda_graph_manager = graph_manager
         mock_recipe._partial_cuda_graph_capture_pending = True
+        mock_recipe._partial_cuda_graph_paged_stash_enabled = True
+        stash_manager = MagicMock()
+        stash_manager.is_active = False
+        stash_manager.check_overflow.return_value = torch.zeros(1, dtype=torch.int64)
 
         # Mock _forward_backward_step to append loss to loss_buffer
         def mock_forward_backward_step(ga_step_idx, batch, loss_buffer=None, **kwargs):
@@ -504,12 +509,20 @@ class TestBenchmarkingRecipeRunBenchmark:
             )
         )
 
-        with patch("torch.distributed.barrier"):
+        with (
+            patch("torch.distributed.barrier"),
+            patch(
+                "nemo_automodel.components.moe.paged_stash.get_paged_stash_manager",
+                return_value=stash_manager,
+            ),
+        ):
             mock_recipe.run_benchmark()
 
             # Should be called 30 times (once per iteration)
             assert mock_recipe.optimizer[0].step.call_count == 30
+            stash_manager.prepare.assert_called_once_with()
             graph_manager.capture.assert_called_once_with()
+            stash_manager.finish_iteration.assert_called_once_with()
             assert mock_recipe._partial_cuda_graph_capture_pending is False
 
     def test_run_benchmark_calls_gc_hook_per_iteration(self, mock_recipe):
@@ -581,6 +594,7 @@ class TestBenchmarkingRecipeHelpers:
         recipe = MagicMock()
         graph_manager = MagicMock()
         recipe.partial_cuda_graph_manager = graph_manager
+        recipe._partial_cuda_graph_paged_stash_enabled = False
         recipe.setup.side_effect = RuntimeError("setup failed")
 
         with (

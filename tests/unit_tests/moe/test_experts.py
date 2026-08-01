@@ -1045,6 +1045,7 @@ class TestGroupedExpertsTECudaGraphMetadata:
         torch.nn.Module.__init__(experts)
         experts.config = config
         experts.cuda_graph_moe_capacity_factor = capacity_factor
+        experts.cuda_graph_moe_paged_stash = False
         return experts
 
     class _FakeGroupedLinear(torch.nn.Module):
