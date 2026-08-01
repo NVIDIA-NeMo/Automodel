@@ -287,6 +287,23 @@ def test_lm_head_alias_check_skips_nonstandard_embedding_accessor():
     assert _lm_head_embedding_aliased(InputDependentEmbeddingModel()) is None
 
 
+def test_lm_head_alias_check_skips_wrapper_around_input_dependent_accessor():
+    class InputDependentEmbeddingModel(torch.nn.Module):
+        def get_input_embeddings(self, input_ids):
+            raise AssertionError("input-dependent accessor must not be called")
+
+    class WrapperModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = InputDependentEmbeddingModel()
+            self.lm_head = torch.nn.Linear(2, 2, bias=False)
+
+        def get_input_embeddings(self):
+            return self.model.get_input_embeddings()
+
+    assert _lm_head_embedding_aliased(WrapperModel()) is None
+
+
 def test_peft_no_split_modules_are_normalized_for_accelerate():
     model = SimpleNamespace(_no_split_modules={"SecondLayer", "FirstLayer"})
 

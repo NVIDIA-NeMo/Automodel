@@ -171,7 +171,7 @@ ci:
     # Vanilla HF needs remote model code and shards the 403 GB base over rank 0's local GPU node.
     trust_remote_code: true
     hf_device_map_auto: true
-    # Keep overflow in RAM: PEFT cannot update Step-3.7's conversion-mapped disk-offload index.
-    hf_device_map_max_memory_gib: 65
-    hf_device_map_cpu_max_memory_gib: 64
+    # Keep overflow in RAM and leave GPU headroom for PEFT's adapter re-dispatch.
+    hf_device_map_max_memory_gib: 55
+    hf_device_map_cpu_max_memory_gib: 128
     tokenizer_name: stepfun-ai/Step-3.7-Flash
