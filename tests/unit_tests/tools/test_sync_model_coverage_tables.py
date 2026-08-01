@@ -42,15 +42,38 @@ def _fern_slug(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", value).strip("-")
 
 
-def _collect_fern_routes(items: list[dict[str, object]], parents: tuple[str, ...] = ()) -> set[str]:
+def _frontmatter_slug(path: Path) -> str | None:
+    document = path.read_text(encoding="utf-8")
+    if not document.startswith("---\n"):
+        return None
+    closing = document.find("\n---\n", 4)
+    if closing == -1:
+        return None
+    frontmatter = yaml.safe_load(document[4:closing]) or {}
+    slug = frontmatter.get("slug")
+    return str(slug).strip("/") if slug else None
+
+
+def _collect_fern_routes(
+    items: list[dict[str, object]],
+    parents: tuple[str, ...] = (),
+    config_dir: Path | None = None,
+) -> set[str]:
     routes = set()
     for item in items:
         if "section" in item:
             slug = str(item.get("slug", _fern_slug(str(item["section"]))))
-            routes.update(_collect_fern_routes(item.get("contents", []), (*parents, slug)))
+            routes.update(_collect_fern_routes(item.get("contents", []), (*parents, slug), config_dir))
         elif "page" in item:
-            slug = str(item.get("slug", _fern_slug(str(item["page"]))))
-            routes.add("/" + "/".join((*parents, slug)))
+            page_path = item.get("path")
+            frontmatter_slug = None
+            if config_dir is not None and isinstance(page_path, str):
+                frontmatter_slug = _frontmatter_slug((config_dir / page_path).resolve())
+            if frontmatter_slug:
+                routes.add("/" + frontmatter_slug)
+            else:
+                slug = str(item.get("slug", _fern_slug(str(item["page"]))))
+                routes.add("/" + "/".join((*parents, slug)))
     return routes
 
 
@@ -100,19 +123,21 @@ def test_generated_registry_table_replaces_the_marked_block():
 def test_model_release_docs_pages_exist_in_nightly_navigation():
     repo_root = Path(__file__).parents[3]
     releases = json.loads((repo_root / "docs" / "model-coverage" / "model-releases.json").read_text(encoding="utf-8"))
-    navigation = yaml.safe_load((repo_root / "docs" / "fern" / "versions" / "nightly.yml").read_text(encoding="utf-8"))[
-        "navigation"
-    ]
+    config_path = repo_root / "docs" / "fern" / "versions" / "nightly.yml"
+    navigation = yaml.safe_load(config_path.read_text(encoding="utf-8"))["navigation"]
 
-    missing_pages = sorted({release["docs_page"] for release in releases} - _collect_fern_routes(navigation))
+    missing_pages = sorted(
+        {release["docs_page"] for release in releases} - _collect_fern_routes(navigation, config_dir=config_path.parent)
+    )
 
     assert not missing_pages, f"Model release docs pages missing from nightly navigation: {missing_pages}"
 
 
-def test_model_coverage_navigation_includes_org_slugs():
+def test_model_coverage_pages_use_org_slugs_without_nesting_sidebar():
     repo_root = Path(__file__).parents[3]
-    navigation = yaml.safe_load((repo_root / "docs" / "fern" / "versions" / "nightly.yml").read_text())["navigation"]
-    offenders: list[tuple[str, str, str]] = []
+    config_path = repo_root / "docs" / "fern" / "versions" / "nightly.yml"
+    navigation = yaml.safe_load(config_path.read_text(encoding="utf-8"))["navigation"]
+    offenders: list[str] = []
 
     def visit(items: list[dict[str, object]], parent_slugs: tuple[str, ...] = ()) -> None:
         for item in items:
@@ -131,16 +156,40 @@ def test_model_coverage_navigation_includes_org_slugs():
             if len(relative_parts) != 3:
                 continue
 
-            expected_org = relative_parts[1]
+            category, expected_org = relative_parts[:2]
+            frontmatter_slug = _frontmatter_slug((config_path.parent / path).resolve())
             actual_parent = parent_slugs[-1] if parent_slugs else "<none>"
-            if actual_parent != expected_org:
-                offenders.append((path, expected_org, actual_parent))
+            if frontmatter_slug is None or f"/{expected_org}/" not in f"/{frontmatter_slug}/":
+                offenders.append(f"{path}: frontmatter slug does not include organization {expected_org!r}")
+            if actual_parent == expected_org:
+                offenders.append(f"{path}: organization {expected_org!r} must not be a sidebar section")
+            if category == "llm" and (
+                frontmatter_slug is None or not frontmatter_slug.startswith("model-coverage/large-language-models/")
+            ):
+                offenders.append(f"{path}: unexpected LLM slug {frontmatter_slug!r}")
 
     visit(navigation)
 
-    assert not offenders, "Model coverage pages must be nested under their organization slug:\n" + "\n".join(
-        f"  - {path}: expected {expected_org!r}, got {actual_parent!r}"
-        for path, expected_org, actual_parent in offenders
+    assert not offenders, "Model coverage organization URL/sidebar violations:\n" + "\n".join(
+        f"  - {offender}" for offender in offenders
+    )
+
+
+def test_model_coverage_internal_links_resolve_to_nightly_routes():
+    repo_root = Path(__file__).parents[3]
+    config_path = repo_root / "docs" / "fern" / "versions" / "nightly.yml"
+    navigation = yaml.safe_load(config_path.read_text(encoding="utf-8"))["navigation"]
+    routes = _collect_fern_routes(navigation, config_dir=config_path.parent)
+    broken_links: list[tuple[Path, str]] = []
+
+    for page in (repo_root / "docs" / "model-coverage").rglob("*.mdx"):
+        document = page.read_text(encoding="utf-8")
+        for link in re.findall(r"\]\((/model-coverage/[^)#?]+)", document):
+            if link.rstrip("/") not in routes:
+                broken_links.append((page.relative_to(repo_root), link))
+
+    assert not broken_links, "Model coverage links missing from nightly routes:\n" + "\n".join(
+        f"  - {page}: {link}" for page, link in broken_links
     )
 
 

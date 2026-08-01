@@ -21,7 +21,7 @@
     "date": "2026-07-28",
     "model": "LTX-2.3",
     "hf_model_id": "diffusers/LTX-2.3-Diffusers",
-    "docs_page": "/model-coverage/diffusion/overview",
+    "docs_page": "/model-coverage/diffusion/diffusers/ltx-2-3",
     "type": "Diffusion",
     "recipe": "examples/diffusion/finetune/ltx2_3_t2v_flow.yaml",
     "brev_status": "planned"
@@ -93,7 +93,7 @@
     "date": "2026-06-09",
     "model": "FLUX.2-dev",
     "hf_model_id": "black-forest-labs/FLUX.2-dev",
-    "docs_page": "/model-coverage/diffusion/overview",
+    "docs_page": "/model-coverage/diffusion/black-forest-labs/flux-2-dev",
     "type": "Diffusion",
     "recipe": "examples/diffusion/finetune/flux2_t2i_flow.yaml",
     "brev_status": "planned"
@@ -129,7 +129,7 @@
     "date": "2026-06-03",
     "model": "Gemma 4 12B",
     "hf_model_id": "google/gemma-4-12B",
-    "docs_page": "/model-coverage/large-language-models/google/gemma",
+    "docs_page": "/model-coverage/large-language-models/google/gemma-4",
     "type": "LLM",
     "recipe": "examples/llm_finetune/gemma/gemma_4_12b_hellaswag.yaml",
     "brev_status": "planned"
@@ -253,7 +253,7 @@
   },
   {
     "date": "2026-04-25",
-    "model": "DeepSeek V4 Flash",
+    "model": "DeepSeek-V4 Flash",
     "hf_model_id": "deepseek-ai/DeepSeek-V4-Flash",
     "docs_page": "/model-coverage/large-language-models/deepseek-ai/deepseek-v4-flash",
     "type": "LLM",
@@ -264,7 +264,7 @@
     "date": "2026-04-22",
     "model": "Qwen3.6-27B",
     "hf_model_id": "Qwen/Qwen3.6-27B",
-    "docs_page": "/model-coverage/vision-language-models/qwen/qwen3-5-vl",
+    "docs_page": "/model-coverage/vision-language-models/qwen/qwen3-6-vl",
     "type": "VLM",
     "recipe": "examples/vlm_finetune/qwen3_5/qwen3_6_27b.yaml",
     "brev_status": "planned"
@@ -282,7 +282,7 @@
     "date": "2026-04-16",
     "model": "Qwen3.6 MoE",
     "hf_model_id": "Qwen/Qwen3.6-35B-A3B",
-    "docs_page": "/model-coverage/vision-language-models/qwen/qwen3-5-vl",
+    "docs_page": "/model-coverage/vision-language-models/qwen/qwen3-6-vl",
     "type": "VLM",
     "recipe": "examples/vlm_finetune/qwen3_5_moe/qwen3_6_35b.yaml",
     "brev_status": "planned"
@@ -677,9 +677,9 @@
   },
   {
     "date": "2025-08-27",
-    "model": "Gemma 2 / 3",
+    "model": "Gemma 2 9B IT",
     "hf_model_id": "google/gemma-2-9b-it",
-    "docs_page": "/model-coverage/large-language-models/google/gemma",
+    "docs_page": "/model-coverage/large-language-models/google/gemma-2",
     "type": "LLM",
     "recipe": "examples/llm_finetune/gemma/gemma_2_9b_it_squad.yaml",
     "brev_status": "planned"

@@ -16,14 +16,14 @@ description: ""
 - **Diffusion.** Fine-tune and generate with FLUX.2-dev, Qwen-Image, and Wan
   2.2 T2V-A14B; updated FLUX, Hunyuan, and Wan 2.1 recipes add LoRA and
   throughput improvements.
-- **Large-scale MoE.** Run DeepSeek V4 with TileLang kernels, train MoE models
+- **Large-scale MoE.** Run DeepSeek-V4 with TileLang kernels, train MoE models
   with MXFP8 on GB200, and use context parallelism for Qwen3.5/3.6 MoE VLMs.
 
 ### New and Expanded Model Support
 
 #### LLM and MoE
 
-- **DeepSeek V4 Flash:** A native model and checkpoint adapter; HellaSwag
+- **DeepSeek-V4 Flash:** A native model and checkpoint adapter; HellaSwag
   full-SFT, LoRA, and packed-sequence recipes; and large-scale TileLang PP/EP
   recipes. The implementation covers hash routing, hyper-connections,
   sparse/compressed attention, FP4/FP8 checkpoint loading, and multi-token
@@ -173,9 +173,9 @@ description: ""
   uses Transformer Engine grouped linear layers.
 - **Cross-entropy kernels:** Fused linear cross-entropy for custom models and
   a CUDA Triton implementation of EAGLE soft-target cross-entropy.
-- **DeepSeek V4 kernels:** TileLang implementations for sparse MLA, the
+- **DeepSeek-V4 kernels:** TileLang implementations for sparse MLA, the
   lightning indexer, and MHC Sinkhorn. The CUDA environment installs TileLang
-  and TileKernels for the DeepSeek V4 recipes.
+  and TileKernels for the DeepSeek-V4 recipes.
 - **Large-checkpoint loading:** Memory-mapped local HF DCP reads let each rank
   map only its requested tensor slice instead of copying full tensors into host
   RAM.
@@ -191,7 +191,7 @@ description: ""
   broadcast, unused-parameter, and gradient-bucket-view controls; FSDP2
   `reshard_after_forward`; and averaged retrieval-loss logging.
 - Added runnable examples for agent SFT, EAGLE/DFlash, dLLM, diffusion, ASR,
-  retrieval, DeepSeek V4, Gemma 4, Qwen3.6, Nemotron Ultra, and Bagel.
+  retrieval, DeepSeek-V4, Gemma 4, Qwen3.6, Nemotron Ultra, and Bagel.
 - Added NeMo-Run as a managed job launcher alongside local, Slurm, SkyPilot,
   and Kubernetes workflows.
 

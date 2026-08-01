@@ -1,6 +1,7 @@
 ---
 title: "Gemma 4"
 description: ""
+slug: model-coverage/vision-language-models/google/gemma-4
 ---
 [Gemma 4](https://ai.google.dev/gemma) is Google's next-generation multimodal Gemma family, supporting image-text inputs with a Mixture-of-Experts (MoE) language backbone at larger scales. NeMo AutoModel replaces the HF-native dense matmul over experts with the NeMo `GroupedExperts` backend, enabling Expert Parallelism (EP) through the standard MoE parallelizer.
 

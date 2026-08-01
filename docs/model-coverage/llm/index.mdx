@@ -25,7 +25,11 @@ NeMo AutoModel supports the [AutoModelForCausalLM](https://huggingface.co/transf
 | Owner | Model Family | Architectures |
 |---|---|---|
 | Meta | [Llama](/model-coverage/large-language-models/meta/llama) | `LlamaForCausalLM` |
-| Google | [Gemma](/model-coverage/large-language-models/google/gemma) | `GemmaForCausalLM`, `Gemma2ForCausalLM`, `Gemma3ForCausalLM` |
+| Google | [Gemma 1](/model-coverage/large-language-models/google/gemma-1) | `GemmaForCausalLM` |
+| Google | [Gemma 2](/model-coverage/large-language-models/google/gemma-2) | `Gemma2ForCausalLM` |
+| Google | [Gemma 3](/model-coverage/large-language-models/google/gemma-3) | `Gemma3ForCausalLM` |
+| Google | [Gemma 4](/model-coverage/large-language-models/google/gemma-4) | `Gemma4ForConditionalGeneration` |
+| Google | [FunctionGemma](/model-coverage/large-language-models/google/functiongemma) | `Gemma3ForCausalLM` |
 | Qwen / Alibaba Cloud | [Qwen2](/model-coverage/large-language-models/qwen/qwen2) | `Qwen2ForCausalLM` |
 | Qwen / Alibaba Cloud | [Qwen2 MoE](/model-coverage/large-language-models/qwen/qwen2-moe) | `Qwen2MoeForCausalLM` |
 | Qwen / Alibaba Cloud | [Qwen3](/model-coverage/large-language-models/qwen/qwen3) | `Qwen3ForCausalLM` |
@@ -33,11 +37,12 @@ NeMo AutoModel supports the [AutoModelForCausalLM](https://huggingface.co/transf
 | Qwen / Alibaba Cloud | [Qwen3-Next](/model-coverage/large-language-models/qwen/qwen3-next) | `Qwen3NextForCausalLM` |
 | Baidu | [ERNIE 4.5](/model-coverage/large-language-models/baidu/ernie-4-5) | `Ernie4_5ForCausalLM`, `Ernie4_5_MoeForCausalLM` |
 | DeepSeek | [DeepSeek](/model-coverage/large-language-models/deepseek-ai/deepseek) | `DeepseekForCausalLM` |
-| DeepSeek | [DeepSeek-V3](/model-coverage/large-language-models/deepseek-ai/deepseek-ai/deepseek-v3) | `DeepseekV3ForCausalLM`, `DeepseekV32ForCausalLM` |
-| DeepSeek | [DeepSeek V4 Flash](/model-coverage/large-language-models/deepseek-ai/deepseek-ai/deepseek-v4-flash) | `DeepseekV4ForCausalLM` |
+| DeepSeek | [DeepSeek-V3](/model-coverage/large-language-models/deepseek-ai/deepseek-v3) | `DeepseekV3ForCausalLM`, `DeepseekV32ForCausalLM` |
+| DeepSeek | [DeepSeek-V4 Flash](/model-coverage/large-language-models/deepseek-ai/deepseek-v4-flash) | `DeepseekV4ForCausalLM` |
+| DeepSeek | [DeepSeek-V4 Pro](/model-coverage/large-language-models/deepseek-ai/deepseek-v4-pro) | `DeepseekV4ForCausalLM` |
 | Mistral AI | [Mistral](/model-coverage/large-language-models/mistralai/mistral) | `MistralForCausalLM` |
 | Mistral AI | [Mixtral](/model-coverage/large-language-models/mistralai/mixtral) | `MixtralForCausalLM` |
-| Mistral AI | [Ministral3 / Devstral](/model-coverage/large-language-models/mistralai/mistralai/ministral3-devstral) | `Ministral3ForCausalLM`, `Mistral3ForConditionalGeneration` |
+| Mistral AI | [Ministral3 / Devstral](/model-coverage/large-language-models/mistralai/ministral3-devstral) | `Ministral3ForCausalLM`, `Mistral3ForConditionalGeneration` |
 | Microsoft | [Phi](/model-coverage/large-language-models/microsoft/phi) | `PhiForCausalLM` |
 | Microsoft | [Phi-3 / Phi-4](/model-coverage/large-language-models/microsoft/phi-3-phi-4) | `Phi3ForCausalLM` |
 | Microsoft | [Phi-3-Small](/model-coverage/large-language-models/microsoft/phi-3-small) | `Phi3SmallForCausalLM` |
@@ -76,6 +81,7 @@ NeMo AutoModel supports the [AutoModelForCausalLM](https://huggingface.co/transf
 | Upstage | [Solar Pro](/model-coverage/large-language-models/upstage/solar-pro) | `SolarForCausalLM` |
 | OrionStar | [Orion](/model-coverage/large-language-models/orionstar/orion) | `OrionForCausalLM` |
 | Stability AI | [StableLM](/model-coverage/large-language-models/stabilityai/stablelm) | `StableLmForCausalLM` |
+| Google | [T5](/model-coverage/large-language-models/google-t5/t5) | `T5ForConditionalGeneration` |
 | Stepfun AI | [Step-3.5](/model-coverage/large-language-models/stepfun-ai/step-3-5) | `Step3p5ForCausalLM` |
 | Parasail AI | [GritLM](/model-coverage/large-language-models/parasail-ai/gritlm) | `GritLM` |
 | Tencent | [Hy3-preview](/model-coverage/large-language-models/tencent/hy3-preview) | `HYV3ForCausalLM` |
