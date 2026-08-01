@@ -63,7 +63,7 @@
     "brev_status": "planned"
   },
   {
-    "date": "2026-06-27",
+    "date": "2026-06-26",
     "model": "Llama Nemotron Embed VL 1B v2",
     "hf_model_id": "nvidia/llama-nemotron-embed-vl-1b-v2",
     "docs_page": "/model-coverage/embedding-models/overview",
@@ -72,7 +72,7 @@
     "brev_status": "planned"
   },
   {
-    "date": "2026-06-21",
+    "date": "2026-06-23",
     "model": "GLM-5.2",
     "hf_model_id": "zai-org/GLM-5.2",
     "docs_page": "/model-coverage/large-language-models/glm-5-moe-dsa",
@@ -99,7 +99,7 @@
     "brev_status": "planned"
   },
   {
-    "date": "2026-06-09",
+    "date": "2026-06-10",
     "model": "FLUX.2-dev",
     "hf_model_id": "black-forest-labs/FLUX.2-dev",
     "docs_page": "/model-coverage/diffusion/overview",
@@ -123,6 +123,15 @@
     "docs_page": "/model-coverage/large-language-models/overview",
     "type": "LLM",
     "recipe": "examples/llm_finetune/falcon/falcon_h1_7b_instruct_squad.yaml",
+    "brev_status": "planned"
+  },
+  {
+    "date": "2026-06-08",
+    "model": "Wan 2.2 T2V-A14B (two-stage)",
+    "hf_model_id": "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+    "docs_page": "/model-coverage/diffusion/wan-2-2-t2v-a14b",
+    "type": "Diffusion",
+    "recipe": "examples/diffusion/finetune/wan2_2_t2v_flow.yaml",
     "brev_status": "planned"
   },
   {
@@ -171,7 +180,7 @@
     "brev_status": "planned"
   },
   {
-    "date": "2026-05-27",
+    "date": "2026-05-28",
     "model": "Step-3.7-Flash",
     "hf_model_id": "stepfun-ai/Step-3.7-Flash",
     "docs_page": "/model-coverage/vision-language-models/step-3-7-flash",
@@ -181,20 +190,20 @@
   },
   {
     "date": "2026-05-21",
-    "model": "Wan 2.2 T2V-A14B (two-stage)",
-    "hf_model_id": "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
-    "docs_page": "/model-coverage/diffusion/wan-2-2-t2v-a14b",
-    "type": "Diffusion",
-    "recipe": "examples/diffusion/finetune/wan2_2_t2v_flow.yaml",
+    "model": "Ministral 3 3B Base Embedding",
+    "hf_model_id": "mistralai/Ministral-3-3B-Base-2512",
+    "docs_page": "/model-coverage/embedding-models/ministral3-bidirectional",
+    "type": "Embedding",
+    "recipe": "examples/retrieval/bi_encoder/ministral3_3b_instruct.yaml",
     "brev_status": "planned"
   },
   {
     "date": "2026-05-21",
-    "model": "Llama Nemotron Embed 1B v2",
-    "hf_model_id": "nvidia/llama-nemotron-embed-1b-v2",
-    "docs_page": "/model-coverage/embedding-models/llama-bidirectional",
+    "model": "Ministral 3 3B Instruct Embedding",
+    "hf_model_id": "mistralai/Ministral-3-3B-Instruct-2512",
+    "docs_page": "/model-coverage/embedding-models/ministral3-bidirectional",
     "type": "Embedding",
-    "recipe": "examples/retrieval/bi_encoder/llama3_2_1b.yaml",
+    "recipe": "examples/retrieval/bi_encoder/ministral3_3b_instruct.yaml",
     "brev_status": "planned"
   },
   {
@@ -243,25 +252,7 @@
     "brev_status": "planned"
   },
   {
-    "date": "2026-04-28",
-    "model": "Ministral 3 3B Base Embedding",
-    "hf_model_id": "mistralai/Ministral-3-3B-Base-2512",
-    "docs_page": "/model-coverage/embedding-models/ministral3-bidirectional",
-    "type": "Embedding",
-    "recipe": "examples/retrieval/bi_encoder/ministral3_3b_instruct.yaml",
-    "brev_status": "planned"
-  },
-  {
-    "date": "2026-04-28",
-    "model": "Ministral 3 3B Instruct Embedding",
-    "hf_model_id": "mistralai/Ministral-3-3B-Instruct-2512",
-    "docs_page": "/model-coverage/embedding-models/ministral3-bidirectional",
-    "type": "Embedding",
-    "recipe": "examples/retrieval/bi_encoder/ministral3_3b_instruct.yaml",
-    "brev_status": "planned"
-  },
-  {
-    "date": "2026-04-25",
+    "date": "2026-04-27",
     "model": "DeepSeek V4 Flash",
     "hf_model_id": "deepseek-ai/DeepSeek-V4-Flash",
     "docs_page": "/model-coverage/large-language-models/deepseek-v4-flash",
@@ -297,7 +288,7 @@
     "brev_status": "planned"
   },
   {
-    "date": "2026-04-12",
+    "date": "2026-04-11",
     "model": "MiniMax-M2.7",
     "hf_model_id": "MiniMaxAI/MiniMax-M2.7",
     "docs_page": "/model-coverage/large-language-models/minimax-m2",
@@ -325,6 +316,15 @@
   },
   {
     "date": "2026-03-30",
+    "model": "Llama Nemotron Embed 1B v2",
+    "hf_model_id": "nvidia/llama-nemotron-embed-1b-v2",
+    "docs_page": "/model-coverage/embedding-models/llama-bidirectional",
+    "type": "Embedding",
+    "recipe": "examples/retrieval/bi_encoder/llama3_2_1b.yaml",
+    "brev_status": "planned"
+  },
+  {
+    "date": "2026-03-30",
     "model": "Llama Nemotron Rerank 1B v2",
     "hf_model_id": "nvidia/llama-nemotron-rerank-1b-v2",
     "docs_page": "/model-coverage/reranking-models/llama-bidirectional",
@@ -348,6 +348,33 @@
     "docs_page": "/model-coverage/reranking-models/llama-bidirectional",
     "type": "Reranking",
     "recipe": "examples/retrieval/cross_encoder/llama3_2_1b.yaml",
+    "brev_status": "planned"
+  },
+  {
+    "date": "2026-03-30",
+    "model": "Llama Embed Nemotron 8B",
+    "hf_model_id": "nvidia/llama-embed-nemotron-8b",
+    "docs_page": "/model-coverage/embedding-models/llama-bidirectional",
+    "type": "Embedding",
+    "recipe": "examples/retrieval/bi_encoder/llama_embed_nemotron_8b/llama_embed_nemotron_8b.yaml",
+    "brev_status": "planned"
+  },
+  {
+    "date": "2026-03-30",
+    "model": "Llama 3.2 1B Embedding",
+    "hf_model_id": "meta-llama/Llama-3.2-1B",
+    "docs_page": "/model-coverage/embedding-models/llama-bidirectional",
+    "type": "Embedding",
+    "recipe": "examples/retrieval/bi_encoder/llama3_2_1b.yaml",
+    "brev_status": "planned"
+  },
+  {
+    "date": "2026-03-30",
+    "model": "Llama 3.1 8B Embedding",
+    "hf_model_id": "meta-llama/Llama-3.1-8B",
+    "docs_page": "/model-coverage/embedding-models/llama-bidirectional",
+    "type": "Embedding",
+    "recipe": "examples/retrieval/bi_encoder/llama_embed_nemotron_8b/llama_embed_nemotron_8b.yaml",
     "brev_status": "planned"
   },
   {
@@ -414,7 +441,7 @@
     "brev_status": "planned"
   },
   {
-    "date": "2026-02-16",
+    "date": "2026-02-15",
     "model": "Qwen3.5 MoE",
     "hf_model_id": "Qwen/Qwen3.5-397B-A17B",
     "docs_page": "/model-coverage/vision-language-models/qwen3-5-vl",
@@ -441,7 +468,7 @@
     "brev_status": "planned"
   },
   {
-    "date": "2026-02-09",
+    "date": "2026-02-08",
     "model": "MiniMax-M2.1",
     "hf_model_id": "MiniMaxAI/MiniMax-M2",
     "docs_page": "/model-coverage/large-language-models/minimax-m2",
@@ -459,24 +486,6 @@
     "brev_status": "planned"
   },
   {
-    "date": "2026-02-06",
-    "model": "GLM-4.7",
-    "hf_model_id": "zai-org/GLM-4.7",
-    "docs_page": "/model-coverage/large-language-models/glm-4-moe-glm-4-5-glm-4-7",
-    "type": "LLM",
-    "recipe": "examples/llm_finetune/glm/glm_4.7_te_deepep.yaml",
-    "brev_status": "planned"
-  },
-  {
-    "date": "2026-02-06",
-    "model": "Step-3.5-Flash",
-    "hf_model_id": "stepfun-ai/Step-3.5-Flash",
-    "docs_page": "/model-coverage/large-language-models/step-3-5",
-    "type": "LLM",
-    "recipe": "examples/llm_finetune/stepfun/step_3.5_flash_hellaswag_pp.yaml",
-    "brev_status": "planned"
-  },
-  {
     "date": "2026-02-05",
     "model": "DeepSeek-V3.2",
     "hf_model_id": "deepseek-ai/DeepSeek-V3.2",
@@ -487,6 +496,15 @@
   },
   {
     "date": "2026-02-04",
+    "model": "Step-3.5-Flash",
+    "hf_model_id": "stepfun-ai/Step-3.5-Flash",
+    "docs_page": "/model-coverage/large-language-models/step-3-5",
+    "type": "LLM",
+    "recipe": "examples/llm_finetune/stepfun/step_3.5_flash_hellaswag_pp.yaml",
+    "brev_status": "planned"
+  },
+  {
+    "date": "2026-01-31",
     "model": "Kimi-K2.5 VL",
     "hf_model_id": "moonshotai/Kimi-K2.5",
     "docs_page": "/model-coverage/vision-language-models/kimi-vl",
@@ -501,6 +519,24 @@
     "docs_page": "/model-coverage/vision-language-models/kimi-vl",
     "type": "VLM",
     "recipe": "examples/vlm_finetune/kimi/kimi2vl_cordv2.yaml",
+    "brev_status": "planned"
+  },
+  {
+    "date": "2026-01-29",
+    "model": "Nemotron-3-Nano-30B-A3B",
+    "hf_model_id": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8",
+    "docs_page": "/model-coverage/large-language-models/nemotron-h",
+    "type": "LLM",
+    "recipe": "examples/llm_finetune/nemotron/nemotron_nano_v3_hellaswag.yaml",
+    "brev_status": "planned"
+  },
+  {
+    "date": "2026-01-27",
+    "model": "GLM-4.7",
+    "hf_model_id": "zai-org/GLM-4.7",
+    "docs_page": "/model-coverage/large-language-models/glm-4-moe-glm-4-5-glm-4-7",
+    "type": "LLM",
+    "recipe": "examples/llm_finetune/glm/glm_4.7_te_deepep.yaml",
     "brev_status": "planned"
   },
   {
@@ -532,24 +568,6 @@
     "brev_status": "planned"
   },
   {
-    "date": "2025-12-16",
-    "model": "Llama Embed Nemotron 8B",
-    "hf_model_id": "nvidia/llama-embed-nemotron-8b",
-    "docs_page": "/model-coverage/embedding-models/llama-bidirectional",
-    "type": "Embedding",
-    "recipe": "examples/retrieval/bi_encoder/llama_embed_nemotron_8b/llama_embed_nemotron_8b.yaml",
-    "brev_status": "planned"
-  },
-  {
-    "date": "2025-12-15",
-    "model": "Nemotron-3-Nano-30B-A3B",
-    "hf_model_id": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8",
-    "docs_page": "/model-coverage/large-language-models/nemotron-h",
-    "type": "LLM",
-    "recipe": "examples/llm_finetune/nemotron/nemotron_nano_v3_hellaswag.yaml",
-    "brev_status": "planned"
-  },
-  {
     "date": "2025-12-05",
     "model": "Ministral 3 (3B / 8B / 14B)",
     "hf_model_id": "mistralai/Ministral-8B-Instruct-2410",
@@ -577,25 +595,7 @@
     "brev_status": "planned"
   },
   {
-    "date": "2025-11-18",
-    "model": "Llama 3.2 1B Embedding",
-    "hf_model_id": "meta-llama/Llama-3.2-1B",
-    "docs_page": "/model-coverage/embedding-models/llama-bidirectional",
-    "type": "Embedding",
-    "recipe": "examples/retrieval/bi_encoder/llama3_2_1b.yaml",
-    "brev_status": "planned"
-  },
-  {
-    "date": "2025-11-18",
-    "model": "Llama 3.1 8B Embedding",
-    "hf_model_id": "meta-llama/Llama-3.1-8B",
-    "docs_page": "/model-coverage/embedding-models/llama-bidirectional",
-    "type": "Embedding",
-    "recipe": "examples/retrieval/bi_encoder/llama_embed_nemotron_8b/llama_embed_nemotron_8b.yaml",
-    "brev_status": "planned"
-  },
-  {
-    "date": "2025-11-10",
+    "date": "2025-11-11",
     "model": "Qwen3-Omni",
     "hf_model_id": "Qwen/Qwen3-30B-A3B",
     "docs_page": "/model-coverage/omni/qwen3-omni",
@@ -640,7 +640,7 @@
     "brev_status": "planned"
   },
   {
-    "date": "2025-09-23",
+    "date": "2025-09-24",
     "model": "GPT-OSS 20B / 120B",
     "hf_model_id": "openai/gpt-oss-20b",
     "docs_page": "/model-coverage/large-language-models/gpt-oss",

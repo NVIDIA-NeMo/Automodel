@@ -13,7 +13,9 @@
 # limitations under the License.
 
 import json
+import os
 import re
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -333,6 +335,48 @@ def test_model_release_catalog_requires_recipe(tmp_path):
     catalog_path.write_text(json.dumps(catalog), encoding="utf-8")
 
     with pytest.raises(ValueError, match="field 'recipe' must be a non-empty Markdown-safe string"):
+        _load_model_releases(catalog_path, tmp_path)
+
+
+def test_model_release_catalog_requires_recipe_addition_date(tmp_path):
+    (tmp_path / "examples").mkdir()
+    recipe_path = "examples/model.yaml"
+    (tmp_path / recipe_path).write_text("model: test\n", encoding="utf-8")
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "add", recipe_path], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(tmp_path),
+            "-c",
+            "user.name=Test User",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-q",
+            "-m",
+            "add recipe",
+            "--date=2026-07-29T12:00:00Z",
+        ],
+        check=True,
+        env={**os.environ, "GIT_COMMITTER_DATE": "2026-07-29T12:00:00Z"},
+    )
+    catalog = [
+        {
+            "date": "2026-07-30",
+            "model": "Model",
+            "hf_model_id": "org/model",
+            "docs_page": "/model-coverage/model",
+            "type": "LLM",
+            "recipe": recipe_path,
+            "brev_status": "planned",
+        }
+    ]
+    catalog_path = tmp_path / "model-releases.json"
+    catalog_path.write_text(json.dumps(catalog), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="recipe 'examples/model.yaml' was added on 2026-07-29"):
         _load_model_releases(catalog_path, tmp_path)
 
 
