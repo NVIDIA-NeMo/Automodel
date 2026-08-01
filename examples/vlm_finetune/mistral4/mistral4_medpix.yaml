@@ -125,6 +125,12 @@ ci:
     # PP=4 with pp_microbatch_size=1 requires at least four pipeline microbatches.
     step_scheduler.local_batch_size: 4
     check_source_load_parity: true
+    # Native TE/SDPA and vanilla HF follow different BF16 execution paths.
+    # Keep checkpoint reload parity exact while bounding the stable implementation delta.
+    source_load_kl_threshold: 1e-2
+    source_load_mean_kl_threshold: 2e-3
+    source_load_cosine_threshold: 0.999
+    hf_kl_threshold: 5e-2
     hf_device_map_auto: true
     # Transformers' load-time dequantization leaves Mistral4 expert weights in
     # FP8, while native forward requires an optional kernel absent from CI.
