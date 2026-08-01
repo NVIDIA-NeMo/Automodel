@@ -58,6 +58,9 @@ jobs:
         with:
           node-version: '20'
 
+      - name: Validate latest model table
+        run: node tools/sync_latest_model_table.mjs --check
+
       - name: Validate MDX syntax
         run: |
           mdx_lint_dir="${RUNNER_TEMP}/mdx-lint"

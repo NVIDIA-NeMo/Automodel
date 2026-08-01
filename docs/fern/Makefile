@@ -23,7 +23,7 @@ REPO_ROOT := $(shell git rev-parse --show-toplevel)
 
 .DEFAULT_GOAL := help
 
-.PHONY: help docs docs-login docs-check docs-preview docs-publish docs-generate-library docs-stitch docs-mdx-check
+.PHONY: help docs docs-login docs-check docs-preview docs-publish docs-generate-library docs-stitch docs-mdx-check docs-model-table docs-model-table-check
 
 help:
 	@echo ""
@@ -38,6 +38,8 @@ help:
 	@echo "  make docs-stitch            Restore frozen backward-version pages from the $(ARCHIVE_REF) branch"
 	@echo "  make docs-check             Run MDX syntax validation + 'fern check'"
 	@echo "  make docs-mdx-check         Run MDX syntax validation"
+	@echo "  make docs-model-table       Sync the homepage's latest-model table from the release log"
+	@echo "  make docs-model-table-check Verify that the generated latest-model table is current"
 	@echo "  make docs-preview           Build a shared preview URL on *.docs.buildwithfern.com (needs DOCS_FERN_TOKEN)"
 	@echo "  make docs-publish           Trigger the 'Publish Fern Docs' workflow on origin/main"
 	@echo "  make docs-generate-library  Regenerate the autodoc library reference under product-docs/"
@@ -98,8 +100,14 @@ docs-login:
 docs: docs-stitch docs-generate-library
 	fern docs dev
 
-docs-check: docs-mdx-check
+docs-check: docs-model-table-check docs-mdx-check
 	fern check
+
+docs-model-table:
+	node "$(REPO_ROOT)/tools/sync_latest_model_table.mjs"
+
+docs-model-table-check:
+	node "$(REPO_ROOT)/tools/sync_latest_model_table.mjs" --check
 
 docs-mdx-check: docs-stitch
 	@tmp_dir="$$(mktemp -d)"; \
