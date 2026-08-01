@@ -171,6 +171,6 @@ ci:
     # Vanilla HF needs remote model code and shards the 403 GB base over rank 0's local GPU node.
     trust_remote_code: true
     hf_device_map_auto: true
-    # The BF16 base fits on seven H100s at this cap, leaving at least 24 GiB/GPU for the forward pass.
-    hf_device_map_max_memory_gib: 55
+    # Keep the BF16 base in GPU memory: PEFT cannot update Step-3.7's remote-code disk-offload index.
+    hf_device_map_max_memory_gib: 65
     tokenizer_name: stepfun-ai/Step-3.7-Flash
