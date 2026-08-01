@@ -60,15 +60,16 @@ class TikTokenTokenizer(PreTrainedTokenizer):
     Args:
         vocab_file (`str`):
             The path to the Tiktoken model file.
-        bos_token (`str` or `tokenizers.AddedToken`, *optional*, defaults to `"<|begin_of_text|>",`):
-            The beginning of sequence token that was used during pretraining. Can be used a sequence classifier token.
-        eos_token (`str` or `tokenizers.AddedToken`, *optional*, defaults to `"<|end_of_text|>"`):
-            The end of sequence token.
-        unk_token (`str` or `tokenizers.AddedToken`, *optional*, defaults to `"<|reserved_special_token_249|>"`):
+        bos_token (`str` or `tokenizers.AddedToken`, *optional*):
+            The beginning of sequence token that was used during pretraining. Defaults to `[BOS]`. Can be used as a
+            sequence classifier token.
+        eos_token (`str` or `tokenizers.AddedToken`, *optional*):
+            The end of sequence token. Defaults to `[EOS]`.
+        unk_token (`str` or `tokenizers.AddedToken`, *optional*):
             The unknown token. A token that is not in the vocabulary cannot be converted to an ID and is set to be this
-            token instead. The second to last item in special_tokens.
-        pad_token (`str` or `tokenizers.AddedToken`, *optional*, defaults to `"<|reserved_special_token_250|>"`):
-            The token used for padding, for example when batching sequences of different lengths.
+            token instead. Defaults to `None`.
+        pad_token (`str` or `tokenizers.AddedToken`, *optional*):
+            The token used for padding, for example when batching sequences of different lengths. Defaults to `None`.
         additional_special_tokens (list of `str`, *optional*):
             A tuple or a list of additional tokens, which will be marked as `special`, meaning that they will be
             skipped when decoding if `skip_special_tokens` is set to `True`.
