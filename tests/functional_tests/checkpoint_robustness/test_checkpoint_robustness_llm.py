@@ -528,7 +528,12 @@ def _lm_head_embedding_aliased(model) -> bool | None:
         # Some extension callables do not expose an inspectable signature. Let
         # the normal zero-argument accessor path handle those implementations.
         pass
-    embeddings = get_input_embeddings()
+    try:
+        embeddings = get_input_embeddings()
+    except TypeError:
+        # Some wrappers expose a zero-argument accessor but delegate to an
+        # input-dependent inner model, so storage aliasing is not observable.
+        return None
     if embeddings is None or not hasattr(lm_head, "weight") or not hasattr(embeddings, "weight"):
         return None
     lm_head_weight = lm_head.weight
