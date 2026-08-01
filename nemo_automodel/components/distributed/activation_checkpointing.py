@@ -25,6 +25,7 @@ other way around -- so the dependency stays one-directional and the central
 parallelizer file stays small.
 """
 
+import functools
 import logging
 import os
 from collections.abc import Callable
@@ -703,7 +704,10 @@ def apply_selective_checkpointing_to_layers(
     # LRU cache to keep graph selection stable across pipeline microbatches.
     if enable_compile:
         _disable_dynamo_lru_cache()
-    context_fn = make_selective_checkpoint_context_fn()
+    context_fn = functools.partial(
+        transformer_engine_attention_backend_snapshot_context_fn,
+        make_selective_checkpoint_context_fn(),
+    )
     for i, layer in enumerate(layers):
         wrapped_layer = checkpoint_wrapper(
             layer,

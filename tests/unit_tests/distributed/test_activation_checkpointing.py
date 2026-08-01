@@ -133,33 +133,41 @@ def test_snapshot_context_fn_recompute_ctx_restores_captured_backend_set():
         assert _sdp_backend_state() == (True, True, False, False)
 
 
-def test_transformer_engine_attention_cache_snapshot_preserves_checkpoint_op_sequence(monkeypatch):
-    """TE cache population must not add an aten.ne.Tensor only during recompute."""
+def test_selective_checkpointing_to_layers_preserves_transformer_engine_attention_cache(monkeypatch):
+    """The shared selective-AC wrapper must preserve TE's checkpoint op sequence."""
     attention_cache = {"attention_params": None, "backend": None}
     monkeypatch.setattr(ac, "_get_transformer_engine_attention_backend_cache", lambda: attention_cache)
+    monkeypatch.setattr(
+        ac,
+        "_SELECTIVE_AC_MUST_SAVE_OPS",
+        ac._SELECTIVE_AC_MUST_SAVE_OPS | {torch.ops.aten.ne.Tensor},
+    )
 
-    def policy(ctx, func, *args, **kwargs):
-        if func == torch.ops.aten.ne.Tensor:
-            return CheckpointPolicy.MUST_SAVE
-        return CheckpointPolicy.PREFER_RECOMPUTE
+    class Attention(nn.Module):
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            """Run a cache-dependent attention stand-in.
 
-    def selective_context_fn():
-        return create_selective_checkpoint_contexts(policy)
+            Args:
+                x: Tensor of shape [features].
 
-    def attention(x: torch.Tensor) -> torch.Tensor:
-        params = x.detach()
-        if attention_cache["attention_params"] is None or params != attention_cache["attention_params"]:
-            attention_cache["attention_params"] = params
-            attention_cache["backend"] = "fused"
-        return x.sin()
+            Returns:
+                Tensor of shape [features].
+            """
+            params = x.detach()
+            if attention_cache["attention_params"] is None or params != attention_cache["attention_params"]:
+                attention_cache["attention_params"] = params
+                attention_cache["backend"] = "fused"
+            return x.sin()
+
+    model = nn.Module()
+    model.attention = Attention()
+    layers = [model.attention]
+    ac.apply_selective_checkpointing_to_layers(model, layers, has_kv_sharing=False)
+    assert isinstance(model.attention, CheckpointWrapper)
+    assert layers[0] is model.attention
 
     x = torch.randn(8, requires_grad=True)
-    out = checkpoint(
-        attention,
-        x,
-        use_reentrant=False,
-        context_fn=lambda: ac.transformer_engine_attention_backend_snapshot_context_fn(selective_context_fn),
-    )
+    out = model.attention(x)
     cache_after_forward = dict(attention_cache)
 
     out.sum().backward()
@@ -192,6 +200,14 @@ def test_recompute_only_fsdp_unshard_op_bypasses_selective_ac_replay(monkeypatch
     fsdp_state = {"unsharded": False}
 
     def checkpointed_module(x: torch.Tensor) -> torch.Tensor:
+        """Run a checkpointed FSDP-unshard stand-in.
+
+        Args:
+            x: Tensor of shape [features].
+
+        Returns:
+            Tensor of shape [features].
+        """
         if fsdp_state["unsharded"]:
             all_gather_output = torch.empty_like(x)
             torch.empty(x.shape, dtype=x.dtype, device=x.device)
