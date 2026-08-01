@@ -142,6 +142,13 @@ def test_hf_device_map_max_memory_caps_each_visible_gpu():
     assert max_memory == {index: "55GiB" for index in range(8)}
 
 
+def test_hf_device_map_max_memory_includes_optional_cpu_overflow():
+    with patch("torch.cuda.device_count", return_value=8):
+        max_memory = _hf_device_map_max_memory("65", "64")
+
+    assert max_memory == {**{index: "65GiB" for index in range(8)}, "cpu": "64GiB"}
+
+
 @pytest.mark.parametrize(
     ("model_type", "expected_attn_implementation"),
     [("nemotron_h", "eager"), ("step3p7", "eager"), ("nemotron_flash", "flash_attention_2")],
