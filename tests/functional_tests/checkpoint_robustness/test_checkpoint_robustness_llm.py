@@ -15,7 +15,7 @@
 """Train -> checkpoint -> reload via automodel & vanilla HF from consolidated, verify logits match via KL divergence.
 
 Launch: torchrun --nproc-per-node=<N> -m <this_module> --config <config.yaml>
-    [--isolated_phase <train_and_save|automodel_reload|hf_reload|resume_baseline|resume>]
+    [--isolated_phase <source_load_reference|source_load_parity|train_and_save|automodel_reload|hf_reload|resume_baseline|resume>]
     [--kl_threshold <float>] [--hf_kl_threshold <float>]
     [--cross_tp_size <int>] [--cross_tp_kl_threshold <float>]
     [--tokenizer_name <str>]
@@ -1446,6 +1446,12 @@ def _robustness_artifact_dir(cfg) -> Path:
     return Path(cfg.checkpoint.checkpoint_dir) / ".checkpoint_robustness"
 
 
+def _source_load_artifact_paths(cfg) -> tuple[Path, Path]:
+    """Return the persisted Phase 0 reference-logit and metadata paths."""
+    artifact_dir = _robustness_artifact_dir(cfg)
+    return artifact_dir / "source_load_reference_logits.pt", artifact_dir / "source_load_reference_metadata.json"
+
+
 def _disable_distributed_atexit_teardown() -> None:
     """Let process exit reclaim distributed resources after an isolated phase."""
     import atexit
@@ -1462,6 +1468,9 @@ def _raise_distributed_failure(failure_message: str | None) -> None:
         dist.broadcast_object_list(payload, src=0)
         failure_message = payload[0]
     if failure_message is not None:
+        if _preinit_global_rank() == 0:
+            phase_marker = failure_message.partition("\n")[0]
+            print(f"[checkpoint_robustness][phase-error] {phase_marker}", file=sys.stderr, flush=True)
         raise AssertionError(failure_message)
 
 
@@ -1486,11 +1495,17 @@ def _run_process_isolated_checkpoint_phase(
         hf_model_cls: Hugging Face auto-model class used for vanilla-HF reload.
         input_ids_loader: Domain-specific prompt tokenizer.
     """
-    supported_phases = {"train_and_save", "automodel_reload", "hf_reload", "resume_baseline", "resume"}
+    supported_phases = {
+        "source_load_reference",
+        "source_load_parity",
+        "train_and_save",
+        "automodel_reload",
+        "hf_reload",
+        "resume_baseline",
+        "resume",
+    }
     if phase not in supported_phases:
         raise ValueError(f"Unsupported isolated checkpoint phase {phase!r}; expected one of {sorted(supported_phases)}")
-    if custom_args.get("check_source_load_parity", False):
-        raise ValueError("Process-isolated checkpoint mode does not yet support check_source_load_parity")
     if int(custom_args.get("cross_tp_size", "0")) > 0:
         raise ValueError("Process-isolated checkpoint mode does not yet support cross_tp_size")
     if custom_args.get("no_check_resume", False):
@@ -1499,6 +1514,95 @@ def _run_process_isolated_checkpoint_phase(
     _disable_distributed_atexit_teardown()
     cfg = parse_args_and_load_config()
     tokenizer_name = custom_args.get("tokenizer_name", None)
+
+    if phase == "source_load_reference":
+        if not custom_args.get("check_source_load_parity", False):
+            raise ValueError("Isolated source_load_reference requires check_source_load_parity=true")
+
+        _report_phase("Isolated Phase 0a source load: loading prompt input IDs")
+        input_ids = _load_input_ids_once(cfg, input_ids_loader, tokenizer_name)
+        _report_phase("Isolated Phase 0a source load: starting vanilla-HF reference load")
+        source_load_reference = _prepare_source_load_reference(
+            cfg,
+            input_ids,
+            hf_model_cls=hf_model_cls,
+            trust_remote_code=bool(custom_args.get("trust_remote_code", False)),
+            experts_implementation=custom_args.get("experts_implementation", None),
+            hf_device_map_auto=bool(custom_args.get("hf_device_map_auto", False)),
+            hf_source_post_load_dequantize=bool(custom_args.get("hf_source_post_load_dequantize", False)),
+        )
+        if _preinit_global_rank() == 0:
+            assert source_load_reference is not None, "rank 0 source-load reference was not captured"
+            reference_logits, hf_aliased, explicit_tie_word_embeddings = source_load_reference
+            reference_path, metadata_path = _source_load_artifact_paths(cfg)
+            reference_path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(reference_logits, reference_path)
+            metadata_path.write_text(
+                json.dumps(
+                    {
+                        "explicit_tie_word_embeddings": explicit_tie_word_embeddings,
+                        "hf_aliased": hf_aliased,
+                    },
+                    sort_keys=True,
+                )
+            )
+        _report_phase("Isolated Phase 0a source load: reference persisted; exiting phase")
+        return
+
+    if phase == "source_load_parity":
+        if not custom_args.get("check_source_load_parity", False):
+            raise ValueError("Isolated source_load_parity requires check_source_load_parity=true")
+
+        _report_phase("Isolated Phase 0b source parity: loading prompt input IDs")
+        input_ids = _load_input_ids_once(cfg, input_ids_loader, tokenizer_name)
+        reference_path, metadata_path = _source_load_artifact_paths(cfg)
+        assert reference_path.exists(), f"Source-load reference logits not found at {reference_path}"
+        assert metadata_path.exists(), f"Source-load reference metadata not found at {metadata_path}"
+
+        source_trainer = recipe_cls(cfg)
+        source_trainer.setup()
+        _report_phase("Isolated Phase 0b source parity: trainer setup complete; starting parity forward")
+        if tokenizer_name is not None and dist.is_initialized() and dist.get_world_size() > 1:
+            _barrier()
+            if _rank0():
+                _cleanup_input_ids_sync(cfg)
+            _barrier()
+
+        device = next(source_trainer.model_parts[0].parameters()).device
+        trainer_source_logits = _get_logits(
+            source_trainer.model_parts[0],
+            input_ids,
+            device,
+            trainer=source_trainer,
+        )
+        source_load_reference = None
+        if _rank0():
+            metadata = json.loads(metadata_path.read_text())
+            source_load_reference = (
+                torch.load(reference_path, map_location="cpu", weights_only=True),
+                metadata["hf_aliased"],
+                metadata["explicit_tie_word_embeddings"],
+            )
+        source_load_failure = _compare_source_load_parity(
+            source_load_reference,
+            trainer_source_logits,
+            _lm_head_embedding_aliased(source_trainer.model_parts[0]),
+            source_load_kl_threshold=float(custom_args.get("source_load_kl_threshold", "5e-3")),
+            source_load_mean_kl_threshold=float(custom_args.get("source_load_mean_kl_threshold", "1e-3")),
+            source_load_cosine_threshold=float(custom_args.get("source_load_cosine_threshold", "0.9999")),
+        )
+        _barrier()
+        if _rank0():
+            _cleanup_source_load_sync(cfg)
+        _barrier()
+        if source_load_failure is not None:
+            source_load_failure = (
+                "CHECKPOINT_ROBUSTNESS_PHASE_FAILURE "
+                f"phase=source_load_parity check=source_load_parity\n{source_load_failure}"
+            )
+        _raise_distributed_failure(source_load_failure)
+        _report_phase("Isolated Phase 0b source parity: comparison complete; exiting phase")
+        return
 
     if phase == "hf_reload":
         if custom_args.get("skip_hf_reload", False):
@@ -1536,6 +1640,10 @@ def _run_process_isolated_checkpoint_phase(
                     custom_args=custom_args,
                 )
         hf_reload_error = _finish_hf_reload_sync(hf_reload_sync_paths, hf_reload_error)
+        if hf_reload_error is not None:
+            hf_reload_error = (
+                f"CHECKPOINT_ROBUSTNESS_PHASE_FAILURE phase=hf_reload check=hf_reload_parity\n{hf_reload_error}"
+            )
         _raise_distributed_failure(hf_reload_error)
         _report_phase("Isolated vanilla-HF reload: parity complete; exiting phase")
         return
@@ -1664,7 +1772,11 @@ def _run_process_isolated_checkpoint_phase(
             if _rank0():
                 failures = [failure for failure in digest_failures if failure is not None]
                 if failures:
-                    failure_message = "Trainable PEFT parameter fingerprint mismatch:\n" + "\n".join(failures)
+                    failure_message = (
+                        "CHECKPOINT_ROBUSTNESS_PHASE_FAILURE "
+                        "phase=automodel_reload check=trainable_parameter_fingerprint\n"
+                        "Trainable PEFT parameter fingerprint mismatch:\n" + "\n".join(failures)
+                    )
                 else:
                     print(
                         f"[Isolated AutoModel reload] exact trainable-parameter fingerprints matched on "
@@ -1689,7 +1801,8 @@ def _run_process_isolated_checkpoint_phase(
             print(f"\n[Isolated AutoModel reload] max KL: {max_kl_restored:.6e} (threshold: {kl_threshold:.6e})")
             if max_kl_restored > kl_threshold:
                 failure_message = (
-                    "KL divergence between original and automodel-from-consolidated too large: "
+                    "CHECKPOINT_ROBUSTNESS_PHASE_FAILURE phase=automodel_reload check=logit_kl\n"
+                    "KL divergence between original and AutoModel checkpoint reload too large: "
                     f"max per-token KL = {max_kl_restored:.6e} > threshold {kl_threshold:.6e}"
                 )
         _raise_distributed_failure(failure_message)
