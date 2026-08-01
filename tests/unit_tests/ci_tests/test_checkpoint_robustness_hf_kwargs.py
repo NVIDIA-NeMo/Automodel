@@ -33,8 +33,10 @@ from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm
     _hf_model_load_context,
     _hf_source_load_kwargs,
     _keep_hf_modules_in_fp32,
+    _lm_head_embedding_aliased,
     _load_hf_fp8_dequantized_config,
     _load_input_ids_once,
+    _normalize_peft_no_split_modules,
     _post_load_dequant_max_memory,
     _raise_distributed_failure,
     _record_deferred_failure,
@@ -145,6 +147,26 @@ def test_hf_model_load_context_keeps_meta_for_device_map(
             pass
 
     assert no_hf_meta_device.call_count == expected_no_meta_calls
+
+
+def test_lm_head_alias_check_skips_nonstandard_embedding_accessor():
+    class InputDependentEmbeddingModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lm_head = torch.nn.Linear(2, 2, bias=False)
+
+        def get_input_embeddings(self, input_ids):
+            raise AssertionError("input-dependent accessor must not be called")
+
+    assert _lm_head_embedding_aliased(InputDependentEmbeddingModel()) is None
+
+
+def test_peft_no_split_modules_are_normalized_for_accelerate():
+    model = SimpleNamespace(_no_split_modules={"SecondLayer", "FirstLayer"})
+
+    _normalize_peft_no_split_modules(model)
+
+    assert model._no_split_modules == ["FirstLayer", "SecondLayer"]
 
 
 @pytest.mark.parametrize(("offline", "expected_local_files_only"), [(None, False), ("1", True)])
