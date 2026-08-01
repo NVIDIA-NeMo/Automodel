@@ -20,7 +20,7 @@ Launch: torchrun --nproc-per-node=<N> -m pytest <this_file> -c <config.yaml>
     [--tokenizer_name <str>]
     [--source_load_kl_threshold <float>] [--source_load_mean_kl_threshold <float>]
     [--check_source_load_parity] [--check_fused_qkv_keys] [--check_phantom_keys] [--check_resume]
-    [--check_repeat_forward_parity] [--check_gate_bias_parity]
+    [--check_repeat_forward_parity] [--check_gate_bias_parity] [--check_state_fingerprint_parity]
     [--hf_source_post_load_dequantize]
     [--max_vram_gb <float>] [--max_cpu_gb <float>]
 """
@@ -83,6 +83,7 @@ def _extract_custom_args(argv):
         "--check_resume",
         "--check_repeat_forward_parity",
         "--check_gate_bias_parity",
+        "--check_state_fingerprint_parity",
         "--hf_device_map_auto",
         "--hf_source_post_load_dequantize",
         "--skip_hf_reload",
@@ -381,6 +382,113 @@ def _report_gate_bias_diagnostic(label: str, trainer) -> None:
                 )
             )
     print(f"[{label}] (global rank, PP, EP, tensors, max abs vs EP0, local abs max): {metrics}")
+
+
+def _sample_local_tensor(tensor: torch.Tensor, sample_count: int = 64) -> dict[str, object]:
+    """Capture deterministic local samples without gathering a full distributed tensor."""
+    local = tensor.to_local() if isinstance(tensor, DTensor) else tensor
+    local_shape = tuple(local.shape)
+    flat_local = local.detach().reshape(-1)
+    if flat_local.numel() == 0:
+        samples = torch.empty(0, dtype=torch.float32)
+    elif flat_local.numel() <= sample_count:
+        samples = flat_local.float().cpu().clone()
+    else:
+        indices = torch.linspace(0, flat_local.numel() - 1, steps=sample_count, device=flat_local.device).long()
+        samples = flat_local.index_select(0, indices).float().cpu()
+    return {
+        "global_shape": tuple(tensor.shape),
+        "local_shape": local_shape,
+        "dtype": str(tensor.dtype),
+        "samples": samples,
+    }
+
+
+def _capture_local_state_samples(trainer) -> dict[str, dict[str, object]]:
+    """Sample every local parameter and buffer for a same-rank reload comparison."""
+    samples = {}
+    for part_index, model_part in enumerate(trainer.model_parts):
+        for kind, named_tensors in (
+            ("parameter", model_part.named_parameters()),
+            ("buffer", model_part.named_buffers()),
+        ):
+            for name, tensor in named_tensors:
+                samples[f"part{part_index}.{kind}.{name}"] = _sample_local_tensor(tensor)
+    return samples
+
+
+def _compare_local_state_samples(
+    reference: dict[str, dict[str, object]],
+    candidate: dict[str, dict[str, object]],
+) -> dict[str, object]:
+    """Summarize sampled state changes, emphasizing expert parameters."""
+    reference_names = set(reference)
+    candidate_names = set(candidate)
+    mismatches = []
+    for name in sorted(reference_names & candidate_names):
+        ref_entry = reference[name]
+        cand_entry = candidate[name]
+        metadata_matches = all(
+            ref_entry[field] == cand_entry[field] for field in ("global_shape", "local_shape", "dtype")
+        )
+        ref_samples = ref_entry["samples"]
+        cand_samples = cand_entry["samples"]
+        values_match = metadata_matches and torch.equal(ref_samples, cand_samples)
+        if values_match:
+            continue
+        if metadata_matches and ref_samples.shape == cand_samples.shape and ref_samples.numel() > 0:
+            max_abs = (ref_samples - cand_samples).abs().max().item()
+            unequal = int(torch.ne(ref_samples, cand_samples).sum().item())
+        else:
+            max_abs = float("inf")
+            unequal = max(ref_samples.numel(), cand_samples.numel())
+        mismatches.append(
+            {
+                "name": name,
+                "max_abs": max_abs,
+                "unequal_samples": unequal,
+                "reference": (ref_entry["global_shape"], ref_entry["local_shape"], ref_entry["dtype"]),
+                "candidate": (cand_entry["global_shape"], cand_entry["local_shape"], cand_entry["dtype"]),
+            }
+        )
+
+    mismatches.sort(key=lambda entry: entry["max_abs"], reverse=True)
+    expert_mismatches = sum(".experts." in entry["name"] for entry in mismatches)
+    return {
+        "reference_tensors": len(reference),
+        "candidate_tensors": len(candidate),
+        "missing": sorted(reference_names - candidate_names)[:20],
+        "extra": sorted(candidate_names - reference_names)[:20],
+        "mismatches": len(mismatches),
+        "expert_mismatches": expert_mismatches,
+        "nonexpert_mismatches": len(mismatches) - expert_mismatches,
+        "largest": mismatches[:20],
+    }
+
+
+def _report_state_fingerprint_diagnostic(
+    label: str,
+    reference: dict[str, dict[str, object]],
+    trainer,
+) -> None:
+    """Report same-rank parameter and buffer samples before and after reload."""
+    payload = _compare_local_state_samples(reference, _capture_local_state_samples(trainer))
+    payload.update(
+        {
+            "global_rank": dist.get_rank() if dist.is_initialized() else 0,
+            "pp_rank": trainer.device_mesh["pp"].get_local_rank() if trainer.pp_enabled else 0,
+            "ep_rank": trainer.moe_mesh["ep"].get_local_rank() if trainer.moe_mesh is not None else 0,
+        }
+    )
+    if not dist.is_initialized():
+        print(f"[{label}] {payload}")
+        return
+
+    gathered = [None] * dist.get_world_size()
+    dist.all_gather_object(gathered, payload)
+    if _rank0():
+        for entry in gathered:
+            print(f"[{label}] {entry}")
 
 
 def _materialize_config_value(value):
@@ -1238,6 +1346,7 @@ def run_checkpoint_robustness(
     check_resume = bool(custom_args.get("check_resume", False))
     check_repeat_forward_parity = bool(custom_args.get("check_repeat_forward_parity", False))
     check_gate_bias_parity = bool(custom_args.get("check_gate_bias_parity", False))
+    check_state_fingerprint_parity = bool(custom_args.get("check_state_fingerprint_parity", False))
     resume_loss_threshold = float(custom_args.get("resume_loss_threshold", "5e-3"))
     hf_device_map_auto = bool(custom_args.get("hf_device_map_auto", False))
     hf_source_post_load_dequantize = bool(custom_args.get("hf_source_post_load_dequantize", False))
@@ -1327,6 +1436,7 @@ def run_checkpoint_robustness(
             device,
         )
         del repeated_reference_logits
+    reference_state_samples = _capture_local_state_samples(trainer) if check_state_fingerprint_parity else None
 
     # Locate the Phase 1 checkpoint used by the reload and resume checks.
     checkpoint_dir = Path(cfg.checkpoint.checkpoint_dir)
@@ -1394,6 +1504,10 @@ def run_checkpoint_robustness(
 
     if check_gate_bias_parity:
         _report_gate_bias_diagnostic("Phase 3 gate bias", restored_trainer)
+    if reference_state_samples is not None:
+        _report_state_fingerprint_diagnostic(
+            "Phase 2-to-3 state fingerprint", reference_state_samples, restored_trainer
+        )
     restored_logits = _get_logits(restored_trainer.model_parts[0], input_ids, device, trainer=restored_trainer)
     if check_repeat_forward_parity:
         repeated_restored_logits = _get_logits(

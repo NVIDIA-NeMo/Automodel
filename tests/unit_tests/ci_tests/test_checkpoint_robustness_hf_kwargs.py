@@ -23,6 +23,8 @@ from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_bie
     _extract_custom_args as _extract_biencoder_custom_args,
 )
 from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm import (
+    _capture_local_state_samples,
+    _compare_local_state_samples,
     _compare_source_load_parity,
     _dequantize_hf_fp8_weights_in_place,
     _extract_custom_args,
@@ -566,3 +568,22 @@ def test_record_deferred_failure_preserves_all_comparison_failures():
     _record_deferred_failure(failures, "Phase 4 HF reload parity", "HF parity failed")
 
     assert failures == ["Phase 4 HF reload parity:\nHF parity failed"]
+
+
+def test_local_state_samples_name_changed_expert_weights():
+    reference_model = torch.nn.Module()
+    reference_model.experts = torch.nn.Linear(4, 3, bias=False)
+    candidate_model = torch.nn.Module()
+    candidate_model.experts = torch.nn.Linear(4, 3, bias=False)
+    candidate_model.load_state_dict(reference_model.state_dict())
+    reference = _capture_local_state_samples(SimpleNamespace(model_parts=[reference_model]))
+
+    with torch.no_grad():
+        candidate_model.experts.weight[0, 0].add_(1)
+    candidate = _capture_local_state_samples(SimpleNamespace(model_parts=[candidate_model]))
+    comparison = _compare_local_state_samples(reference, candidate)
+
+    assert comparison["mismatches"] == 1
+    assert comparison["expert_mismatches"] == 1
+    assert comparison["nonexpert_mismatches"] == 0
+    assert comparison["largest"][0]["name"] == "part0.parameter.experts.weight"
