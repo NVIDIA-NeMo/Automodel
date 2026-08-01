@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 import logging
 from collections import deque
 from collections.abc import Callable
@@ -270,10 +271,26 @@ def apply_cache_compatibility_patches():
         def _find_embedding_source(model):
             """Resolve the weight name of the input embedding layer.
 
-            Prefer get_input_embeddings() (explicit HF contract), fall back
-            to scanning for the first nn.Embedding in the module tree.
+            Prefer a no-argument get_input_embeddings() (the explicit HF
+            contract), then scan for the first nn.Embedding in the module tree.
             """
-            embed = model.get_input_embeddings()
+            get_input_embeddings = model.get_input_embeddings
+            try:
+                parameters = inspect.signature(get_input_embeddings).parameters.values()
+            except (TypeError, ValueError):
+                embed = get_input_embeddings()
+            else:
+                has_required_argument = any(
+                    parameter.default is inspect.Parameter.empty
+                    and parameter.kind
+                    in (
+                        inspect.Parameter.POSITIONAL_ONLY,
+                        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                        inspect.Parameter.KEYWORD_ONLY,
+                    )
+                    for parameter in parameters
+                )
+                embed = None if has_required_argument else get_input_embeddings()
             if embed is not None:
                 for name, module in model.named_modules():
                     if module is embed:
