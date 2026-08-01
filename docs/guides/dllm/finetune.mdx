@@ -322,7 +322,7 @@ enabling `auto_balance_clean_loss` at the b3 stage.
 ### Fine-Tune LLaDA2
 
 ```bash
-torchrun --nproc-per-node=8 \
+uv run torchrun --nproc-per-node=8 \
     examples/dllm_sft/finetune.py \
     -c examples/dllm_sft/llada2_sft.yaml
 ```
@@ -330,7 +330,7 @@ torchrun --nproc-per-node=8 \
 ### Fine-Tune with SCDD
 
 ```bash
-torchrun --nproc-per-node=8 \
+uv run torchrun --nproc-per-node=8 \
     examples/dllm_sft/finetune.py \
     -c examples/dllm_sft/llada_scdd.yaml
 ```
@@ -338,7 +338,7 @@ torchrun --nproc-per-node=8 \
 ### Fine-Tune with DFlash
 
 ```bash
-torchrun --nproc-per-node=8 \
+uv run torchrun --nproc-per-node=8 \
     examples/dllm_sft/finetune.py \
     -c examples/dllm_sft/dflash_sft.yaml
 ```
@@ -346,7 +346,7 @@ torchrun --nproc-per-node=8 \
 ### Fine-Tune with I-DLM
 
 ```bash
-torchrun --nproc-per-node=8 \
+uv run torchrun --nproc-per-node=8 \
     nemo_automodel/recipes/dllm/train_ft.py \
     -c examples/dllm_sft/qwen3_8b_idlm.yaml
 ```
@@ -354,7 +354,7 @@ torchrun --nproc-per-node=8 \
 ### Fine-Tune Nemotron-Labs-Diffusion
 
 ```bash
-torchrun --nproc-per-node=8 \
+uv run torchrun --nproc-per-node=8 \
     nemo_automodel/recipes/dllm/train_ft.py \
     -c examples/dllm_sft/nemotron_labs_diffusion_sft.yaml
 ```
@@ -368,7 +368,7 @@ The `--checkpoint` argument accepts several path types, including a path to a `c
 ### Generate with LLaDA
 
 ```bash
-python examples/dllm_generate/generate.py \
+uv run python examples/dllm_generate/generate.py \
     --checkpoint <path> \
     --prompt "Explain what a neural network is." \
     --sampler llada
@@ -382,7 +382,7 @@ so a token it now believes is wrong can be replaced. `--uniform_ratio`, `--sched
 `--threshold`, and KV caching do not apply.
 
 ```bash
-python examples/dllm_generate/generate.py \
+uv run python examples/dllm_generate/generate.py \
     --checkpoint dllm_checkpoints/llada_scdd/<step>/model/consolidated \
     --prompt "Explain what a neural network is." \
     --sampler scdd \
@@ -396,7 +396,7 @@ python examples/dllm_generate/generate.py \
 LLaDA2 generation calls the model's built-in block-refinement `generate()` method.
 
 ```bash
-python examples/dllm_generate/generate.py \
+uv run python examples/dllm_generate/generate.py \
     --checkpoint <path> \
     --prompt "Explain what a neural network is." \
     --sampler llada2 \
@@ -409,7 +409,7 @@ python examples/dllm_generate/generate.py \
 ### Generate with Nemotron-Labs-Diffusion
 
 ```bash
-python examples/dllm_generate/generate.py \
+uv run python examples/dllm_generate/generate.py \
     --checkpoint <path> \
     --prompt "Explain what a neural network is." \
     --sampler nemotron
@@ -421,7 +421,7 @@ DiffusionGemma generation calls the diffusion sampler that ships with `transform
 (entropy-bounded denoising with adaptive stopping).
 
 ```bash
-python examples/dllm_generate/generate.py \
+uv run python examples/dllm_generate/generate.py \
     --checkpoint <path> \
     --prompt "Explain what a neural network is." \
     --sampler gemma
