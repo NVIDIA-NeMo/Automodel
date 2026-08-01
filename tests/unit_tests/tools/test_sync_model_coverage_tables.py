@@ -13,7 +13,9 @@
 # limitations under the License.
 
 import json
+import os
 import re
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -333,6 +335,75 @@ def test_model_release_catalog_requires_recipe(tmp_path):
     catalog_path.write_text(json.dumps(catalog), encoding="utf-8")
 
     with pytest.raises(ValueError, match="field 'recipe' must be a non-empty Markdown-safe string"):
+        _load_model_releases(catalog_path, tmp_path)
+
+
+def test_model_release_catalog_uses_recipe_creation_date_not_modification_date(tmp_path):
+    subprocess.run(["git", "init", "-q", "-b", "main", str(tmp_path)], check=True)
+    (tmp_path / "README.md").write_text("test repository\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "README.md"], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(tmp_path),
+            "-c",
+            "user.name=Test User",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-q",
+            "-m",
+            "initialize repository",
+        ],
+        check=True,
+    )
+    subprocess.run(["git", "-C", str(tmp_path), "checkout", "-q", "-b", "feature"], check=True)
+
+    (tmp_path / "examples").mkdir()
+    recipe_path = "examples/model.yaml"
+    (tmp_path / recipe_path).write_text("model: created\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(tmp_path), "add", recipe_path], check=True)
+
+    def commit(message: str, timestamp: str) -> None:
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(tmp_path),
+                "-c",
+                "user.name=Test User",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-q",
+                "-am",
+                message,
+                f"--date={timestamp}",
+            ],
+            check=True,
+            env={**os.environ, "GIT_COMMITTER_DATE": timestamp},
+        )
+
+    commit("add recipe", "2026-07-29T12:00:00Z")
+    (tmp_path / recipe_path).write_text("model: modified\n", encoding="utf-8")
+    commit("modify recipe", "2026-07-30T12:00:00Z")
+
+    catalog = [
+        {
+            "date": "2026-07-30",
+            "model": "Model",
+            "hf_model_id": "org/model",
+            "docs_page": "/model-coverage/model",
+            "type": "LLM",
+            "recipe": recipe_path,
+            "brev_status": "planned",
+        }
+    ]
+    catalog_path = tmp_path / "model-releases.json"
+    catalog_path.write_text(json.dumps(catalog), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="recipe 'examples/model.yaml' was created on 2026-07-29"):
         _load_model_releases(catalog_path, tmp_path)
 
 
