@@ -116,6 +116,97 @@ def detect_yml_configurations(automodel_dir: str, scope: str, test_folder: str) 
     return _discover_via_recipe_list(automodel_dir, scope, test_folder)
 
 
+def _slurm_time_seconds(value: str) -> int:
+    """Convert an HH:MM:SS Slurm duration to seconds."""
+    try:
+        hours, minutes, seconds = (int(part) for part in value.split(":"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid Slurm duration {value!r}; expected HH:MM:SS") from exc
+    if hours < 0 or not 0 <= minutes < 60 or not 0 <= seconds < 60:
+        raise ValueError(f"Invalid Slurm duration {value!r}; expected HH:MM:SS")
+    return hours * 3600 + minutes * 60 + seconds
+
+
+def _rolling_release_weight(automodel_dir: str, config: Path) -> int:
+    """Estimate node-seconds for a release recipe and its generated variants."""
+    with open(Path(automodel_dir) / config, "r", encoding="utf-8") as f:
+        ci_config = (yaml.load(f) or {}).get("ci") or {}
+
+    nodes = int(ci_config.get("nodes", 1))
+    if nodes <= 0:
+        raise ValueError(f"Invalid ci.nodes={nodes!r} in {config}; expected a positive integer")
+    weight = nodes * _slurm_time_seconds(str(ci_config.get("time", "00:10:00")))
+    if ci_config.get("vllm_deploy") and not ci_config.get("vllm_deploy_known_issue_id"):
+        weight += _slurm_time_seconds(str(ci_config.get("vllm_deploy_time", "00:10:00")))
+    return weight
+
+
+def _is_rolling_release_candidate(
+    automodel_dir: str,
+    config: Path,
+    config_override: Dict[str, Any],
+) -> bool:
+    """Return whether a release-only recipe is runnable before shard assignment."""
+    config_path = Path(automodel_dir) / config
+    if not config_path.is_file():
+        return False
+
+    exempt_models = set(config_override.get("exempt_models") or [])
+    exempt_configs = set(config_override.get("exempt_configs") or [])
+    if config.parent.name in exempt_models or config.stem in exempt_configs:
+        return False
+
+    with open(config_path, "r", encoding="utf-8") as f:
+        ci_config = (yaml.load(f) or {}).get("ci") or {}
+    return not (ci_config.get("known_issue_id") and not ci_config.get("allow_failure"))
+
+
+def _select_rolling_release_configs(
+    automodel_dir: str,
+    test_folder: str,
+    nightly_configs: list[Path],
+    config_override: Dict[str, Any],
+    shard_count: int,
+    shard_index: int,
+) -> list[Path]:
+    """Select one deterministic, cost-balanced shard of release-only recipes."""
+    if shard_count <= 0:
+        raise ValueError(f"rolling release shard count must be positive, got {shard_count}")
+    if not 0 <= shard_index < shard_count:
+        raise ValueError(f"rolling release shard index must be in [0, {shard_count}), got {shard_index}")
+
+    nightly_set = set(nightly_configs)
+    release_configs = detect_yml_configurations(automodel_dir, "release", test_folder)
+    candidates = [
+        config
+        for config in release_configs
+        if config not in nightly_set and _is_rolling_release_candidate(automodel_dir, config, config_override)
+    ]
+
+    shard_configs: list[list[Path]] = [[] for _ in range(shard_count)]
+    shard_weights = [0] * shard_count
+    weighted_configs = sorted(
+        ((_rolling_release_weight(automodel_dir, config), config) for config in candidates),
+        key=lambda item: (-item[0], str(item[1])),
+    )
+    for weight, config in weighted_configs:
+        target_shard = min(
+            range(shard_count),
+            key=lambda index: (shard_weights[index], len(shard_configs[index]), index),
+        )
+        shard_configs[target_shard].append(config)
+        shard_weights[target_shard] += weight
+
+    selected = sorted(shard_configs[shard_index])
+    print(
+        f"Selected rolling release shard {shard_index}/{shard_count}: "
+        f"{len(selected)} of {len(candidates)} release-only recipes "
+        f"({shard_weights[shard_index] / 60:.0f} node-minutes)",
+        file=sys.stderr,
+    )
+    return selected
+
+
 # Recipe ci: section keys mapped to the CI variables they populate on the base job.
 CI_KEY_TO_VAR = {
     "time": "TIME",
@@ -293,14 +384,23 @@ def generate_job(
     return variants
 
 
-def generate_pipeline(automodel_dir: str, scope: str, test_folder: str) -> Dict[str, Any]:
+def generate_pipeline(
+    automodel_dir: str,
+    scope: str,
+    test_folder: str,
+    *,
+    rolling_release_shards: int = 0,
+    rolling_release_shard: int = 0,
+) -> Dict[str, Any]:
     """
     Generate a complete CI test pipeline YAML for the given test folder and scope.
 
     Args:
         automodel_dir: Path to the Automodel directory
         scope: Scope of the testing (nightly, release, convergence)
-        test_folder: Name of the test folder under Automodel/examples
+        test_folder: Name of the test folder under Automodel/examples.
+        rolling_release_shards: Number of cost-balanced release-only shards to overlay on nightly.
+        rolling_release_shard: Zero-based release-only shard to overlay on nightly.
 
     Returns:
         pipeline: Dictionary defining the CI test pipeline
@@ -309,8 +409,23 @@ def generate_pipeline(automodel_dir: str, scope: str, test_folder: str) -> Dict[
     with open(override_path, "r", encoding="utf-8") as f:
         config_override = yaml.load(f) or {}
 
+    if not rolling_release_shards and rolling_release_shard:
+        raise ValueError("rolling release shard requires a positive rolling release shard count")
+    if rolling_release_shards and scope != "nightly":
+        raise ValueError("rolling release shards can only be added to the nightly scope")
+
     # Empty yml_configs is fine -- some (folder, scope) combos have no recipes.
     yml_configs = detect_yml_configurations(automodel_dir, scope, test_folder)
+    if rolling_release_shards:
+        rolling_configs = _select_rolling_release_configs(
+            automodel_dir,
+            test_folder,
+            yml_configs,
+            config_override,
+            rolling_release_shards,
+            rolling_release_shard,
+        )
+        yml_configs = list(dict.fromkeys([*yml_configs, *rolling_configs]))
 
     exempt_models = set(config_override.get("exempt_models") or [])
     exempt_configs = set(config_override.get("exempt_configs") or [])
@@ -346,9 +461,27 @@ def main():
     parser.add_argument("--automodel-dir", type=str, required=True, help="Path to Automodel directory")
     parser.add_argument("--scope", type=_normalize_scope, required=True, help="Scope of the tests (nightly, release)")
     parser.add_argument("--test-folder", type=str, required=True, help="Target folder to search")
+    parser.add_argument(
+        "--rolling-release-shards",
+        type=int,
+        default=0,
+        help="Number of cost-balanced release-only shards to overlay on nightly (0 disables the overlay)",
+    )
+    parser.add_argument(
+        "--rolling-release-shard",
+        type=int,
+        default=0,
+        help="Zero-based release-only shard to overlay on nightly",
+    )
     args = parser.parse_args()
 
-    pipeline = generate_pipeline(args.automodel_dir, args.scope, args.test_folder)
+    pipeline = generate_pipeline(
+        args.automodel_dir,
+        args.scope,
+        args.test_folder,
+        rolling_release_shards=args.rolling_release_shards,
+        rolling_release_shard=args.rolling_release_shard,
+    )
     with open(f"generated_automodel_{args.test_folder}_tests.yml", "w") as f:
         yaml.dump(pipeline, f)
     job_count = sum(1 for k in pipeline if k != "include")

@@ -30,6 +30,15 @@ ci_tests/
 - **release** -- All recipe YAMLs in auto-discovered folders, or recipes listed
   in `release_recipes.yml` for explicitly managed folders such as `llm_pretrain`
 
+Nightly generation can additionally include one rolling shard of the release-only
+recipes. `--rolling-release-shards 5 --rolling-release-shard N` keeps every
+explicit nightly recipe and adds shard `N` of the recipes in `release` but not
+`nightly`. Shards are deterministic and balanced using each recipe's declared
+`ci.nodes * ci.time`; generated variants such as vLLM deployment are included in
+the estimate. Overrides and blocking known issues are applied before assignment.
+The default shard count is zero, so existing pipelines are unchanged unless the
+rolling overlay is explicitly enabled.
+
 **Stage assignment** is based on recipe type and configuration:
 
 | Stage | Criteria |
