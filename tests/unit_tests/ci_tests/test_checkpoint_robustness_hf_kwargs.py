@@ -23,6 +23,7 @@ from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_bie
     _extract_custom_args as _extract_biencoder_custom_args,
 )
 from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm import (
+    _assert_peft_adapter_matches_checkpoint,
     _compare_source_load_parity,
     _dequantize_hf_fp8_weights_in_place,
     _extract_custom_args,
@@ -38,6 +39,7 @@ from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm
     _load_input_ids_once,
     _normalize_peft_no_split_modules,
     _patch_remote_masking_api_compatibility,
+    _peft_adapter_dispatch_kwargs,
     _post_load_dequant_max_memory,
     _raise_distributed_failure,
     _record_deferred_failure,
@@ -78,6 +80,57 @@ def test_hf_device_map_max_memory_includes_optional_cpu_overflow():
         max_memory = _hf_device_map_max_memory("65", "64")
 
     assert max_memory == {**{index: "65GiB" for index in range(8)}, "cpu": "64GiB"}
+
+
+def test_peft_adapter_dispatch_reuses_base_model_placement_constraints():
+    max_memory = {0: "55GiB", "cpu": "128GiB"}
+
+    dispatch_kwargs = _peft_adapter_dispatch_kwargs(
+        {
+            "device_map": "auto",
+            "max_memory": max_memory,
+            "torch_dtype": torch.bfloat16,
+            "trust_remote_code": True,
+        }
+    )
+
+    assert dispatch_kwargs == {"device_map": "auto", "max_memory": max_memory}
+
+
+def test_peft_adapter_dispatch_is_empty_without_a_base_device_map():
+    assert _peft_adapter_dispatch_kwargs({"torch_dtype": torch.bfloat16}) == {}
+
+
+def test_peft_adapter_fingerprints_match_saved_safetensors(tmp_path):
+    from safetensors.torch import save_file
+
+    adapter_path = tmp_path / "adapter_model.safetensors"
+    saved_state = {
+        "base_model.model.layer.lora_A.weight": torch.tensor([[1.0, 2.0]], dtype=torch.bfloat16),
+        "base_model.model.layer.lora_B.weight": torch.tensor([[3.0], [4.0]], dtype=torch.bfloat16),
+    }
+    save_file(saved_state, adapter_path)
+
+    with patch(
+        "peft.get_peft_model_state_dict", return_value={key: value.clone() for key, value in saved_state.items()}
+    ):
+        matched = _assert_peft_adapter_matches_checkpoint(Mock(), adapter_path)
+
+    assert matched == 2
+
+
+def test_peft_adapter_fingerprints_report_tensor_mismatch(tmp_path):
+    from safetensors.torch import save_file
+
+    adapter_path = tmp_path / "adapter_model.safetensors"
+    key = "base_model.model.layer.lora_A.weight"
+    save_file({key: torch.tensor([[1.0, 2.0]], dtype=torch.bfloat16)}, adapter_path)
+
+    with (
+        patch("peft.get_peft_model_state_dict", return_value={key: torch.tensor([[1.0, 3.0]], dtype=torch.bfloat16)}),
+        pytest.raises(AssertionError, match="adapter tensor mismatch"),
+    ):
+        _assert_peft_adapter_matches_checkpoint(Mock(), adapter_path)
 
 
 def test_remote_masking_api_compatibility_drops_removed_cache_position(monkeypatch):
@@ -394,6 +447,13 @@ def test_extract_custom_args_accepts_isolated_phase():
     custom, remaining = _extract_custom_args(["--isolated_phase", "train_and_save", "--other-arg"])
 
     assert custom["isolated_phase"] == "train_and_save"
+    assert remaining == ["--other-arg"]
+
+
+def test_extract_custom_args_accepts_skip_hf_logit_parity():
+    custom, remaining = _extract_custom_args(["--skip_hf_logit_parity", "--other-arg"])
+
+    assert custom["skip_hf_logit_parity"] is True
     assert remaining == ["--other-arg"]
 
 
