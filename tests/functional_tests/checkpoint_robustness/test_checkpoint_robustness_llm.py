@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import gc
 import hashlib
+import inspect
 import json
 import os
 import sys
@@ -482,6 +483,16 @@ def _lm_head_embedding_aliased(model) -> bool | None:
     get_input_embeddings = getattr(model, "get_input_embeddings", None)
     if lm_head is None or get_input_embeddings is None:
         return None
+    try:
+        inspect.signature(get_input_embeddings).bind()
+    except TypeError:
+        # Some remote-code VLMs require input IDs to select an embedding path.
+        # That accessor cannot provide the storage-only alias check used here.
+        return None
+    except ValueError:
+        # Some extension callables do not expose an inspectable signature. Let
+        # the normal zero-argument accessor path handle those implementations.
+        pass
     embeddings = get_input_embeddings()
     if embeddings is None or not hasattr(lm_head, "weight") or not hasattr(embeddings, "weight"):
         return None
@@ -497,6 +508,15 @@ def _lm_head_embedding_aliased(model) -> bool | None:
     if lm_head_ptr == 0 or embedding_ptr == 0:
         return None
     return lm_head_ptr == embedding_ptr
+
+
+def _normalize_peft_no_split_modules(model) -> None:
+    """Adapt Transformers 5 device-map metadata to the PEFT/Accelerate contract."""
+    no_split_modules = getattr(model, "_no_split_modules", None)
+    if isinstance(no_split_modules, set):
+        # Transformers 5 normalizes this metadata to a set, while the
+        # PEFT/Accelerate versions in CI expect a list or tuple.
+        model._no_split_modules = sorted(no_split_modules)
 
 
 def _explicit_tie_word_embeddings(config) -> bool | None:
@@ -1389,6 +1409,7 @@ def _run_vanilla_hf_reload(
 
                 if should_fix_rotary_embeddings([base_model]):
                     fix_rotary_embeddings([base_model])
+            _normalize_peft_no_split_modules(base_model)
             peft_model = PeftModel.from_pretrained(base_model, str(ckpt_step_dir / "model"))
             hf_logits = _get_logits(peft_model, input_ids, device)
 
