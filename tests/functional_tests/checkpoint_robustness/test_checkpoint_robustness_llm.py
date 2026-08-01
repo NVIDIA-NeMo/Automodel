@@ -269,8 +269,11 @@ def _post_load_dequant_max_memory() -> dict[int, int]:
     }
 
 
-def _hf_device_map_max_memory(max_memory_gib: str | float | None) -> dict[int, str] | None:
-    """Build an optional per-GPU cap for vanilla-HF automatic placement."""
+def _hf_device_map_max_memory(
+    max_memory_gib: str | float | None,
+    cpu_max_memory_gib: str | float | None = None,
+) -> dict[int | str, str] | None:
+    """Build optional GPU and CPU caps for vanilla-HF automatic placement."""
     if max_memory_gib is None:
         return None
     max_memory_gib = float(max_memory_gib)
@@ -279,7 +282,13 @@ def _hf_device_map_max_memory(max_memory_gib: str | float | None) -> dict[int, s
     device_count = torch.cuda.device_count()
     if device_count == 0:
         raise RuntimeError("hf_device_map_max_memory_gib requires at least one visible CUDA device")
-    return {index: f"{max_memory_gib:g}GiB" for index in range(device_count)}
+    max_memory: dict[int | str, str] = {index: f"{max_memory_gib:g}GiB" for index in range(device_count)}
+    if cpu_max_memory_gib is not None:
+        cpu_max_memory_gib = float(cpu_max_memory_gib)
+        if cpu_max_memory_gib <= 0:
+            raise ValueError("hf_device_map_cpu_max_memory_gib must be positive")
+        max_memory["cpu"] = f"{cpu_max_memory_gib:g}GiB"
+    return max_memory
 
 
 def _rss_gb() -> float:
@@ -1363,9 +1372,13 @@ def _run_vanilla_hf_reload(
             hf_kwargs["trust_remote_code"] = False
         if hf_device_map_auto:
             hf_kwargs["device_map"] = "auto"
-            max_memory = _hf_device_map_max_memory(custom_args.get("hf_device_map_max_memory_gib"))
+            max_memory = _hf_device_map_max_memory(
+                custom_args.get("hf_device_map_max_memory_gib"),
+                custom_args.get("hf_device_map_cpu_max_memory_gib"),
+            )
             if max_memory is not None:
                 hf_kwargs["max_memory"] = max_memory
+                print(f"[HF reload] Automatic device-map memory limits: {max_memory}")
         if original_quantization_config is not None:
             hf_kwargs["quantization_config"] = original_quantization_config
         else:
@@ -1403,6 +1416,11 @@ def _run_vanilla_hf_reload(
                     base_model = _fix_meta_rotary_embeddings(
                         hf_model_cls.from_pretrained(original_pretrained_path, **hf_kwargs)
                     ).to(device)
+            placement_counts: dict[str, int] = {}
+            for placement in getattr(base_model, "hf_device_map", {}).values():
+                placement_name = str(placement)
+                placement_counts[placement_name] = placement_counts.get(placement_name, 0) + 1
+            print(f"[HF reload] Base-model device-map placements: {placement_counts}")
             _reinit_rotary_per_module(base_model, device)
             if trust_remote_code:
                 from nemo_automodel._transformers.v4_patches.rotary import (

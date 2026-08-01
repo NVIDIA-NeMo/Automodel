@@ -123,6 +123,7 @@ fixture_keys:
     - cosine_threshold
     - experts_implementation
     - hf_device_map_auto
+    - hf_device_map_cpu_max_memory_gib
     - hf_device_map_max_memory_gib
     - hf_cosine_threshold
     - hf_kl_threshold
