@@ -247,7 +247,7 @@ def _render_release_tabs(releases: list[_ModelRelease], *, row_limit: int | None
         )
         for title, tab_releases in tabs
     ]
-    return "\n\n".join(["<Tabs>", *tab_blocks, "</Tabs>"])
+    return "\n\n".join(["<CompactModelTables>", "<Tabs>", *tab_blocks, "</Tabs>", "</CompactModelTables>"])
 
 
 def _render_release_log_table(releases: list[_ModelRelease]) -> str:
