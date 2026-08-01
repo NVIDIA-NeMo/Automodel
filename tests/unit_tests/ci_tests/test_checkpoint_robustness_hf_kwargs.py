@@ -141,7 +141,7 @@ def test_hf_device_map_max_memory_caps_each_visible_gpu():
 
 @pytest.mark.parametrize(
     ("model_type", "expected_attn_implementation"),
-    [("nemotron_h", "eager"), ("nemotron_flash", "flash_attention_2")],
+    [("nemotron_h", "eager"), ("step3p7", "eager"), ("nemotron_flash", "flash_attention_2")],
 )
 def test_remote_code_attention_implementation(model_type, expected_attn_implementation):
     with patch(
