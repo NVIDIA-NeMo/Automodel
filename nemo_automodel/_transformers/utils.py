@@ -271,14 +271,15 @@ def apply_cache_compatibility_patches():
         def _find_embedding_source(model):
             """Resolve the weight name of the input embedding layer.
 
-            Prefer a no-argument get_input_embeddings() (the explicit HF
-            contract), then scan for the first nn.Embedding in the module tree.
+            Try the no-argument get_input_embeddings() HF contract, then scan
+            for the first nn.Embedding in the module tree.
             """
             get_input_embeddings = model.get_input_embeddings
+            call_get_input_embeddings = True
             try:
                 parameters = inspect.signature(get_input_embeddings).parameters.values()
             except (TypeError, ValueError):
-                embed = get_input_embeddings()
+                pass
             else:
                 has_required_argument = any(
                     parameter.default is inspect.Parameter.empty
@@ -290,7 +291,15 @@ def apply_cache_compatibility_patches():
                     )
                     for parameter in parameters
                 )
-                embed = None if has_required_argument else get_input_embeddings()
+                call_get_input_embeddings = not has_required_argument
+            embed = None
+            if call_get_input_embeddings:
+                try:
+                    embed = get_input_embeddings()
+                except TypeError:
+                    # Some remote-code wrappers expose the standard zero-argument
+                    # signature but delegate to an input-dependent inner accessor.
+                    pass
             if embed is not None:
                 for name, module in model.named_modules():
                     if module is embed:
