@@ -255,3 +255,14 @@ def test_no_mixed_precision_policy_falls_back_to_storage(monkeypatch):
     assert resolved["in_proj.weight"] == torch.float32
     assert resolved["out_proj.weight"] == torch.float32
     assert resolved["_fp32_params.A_log"] == torch.float32
+
+
+def test_intrinsic_fp32_holder_models_declare_strict_pin():
+    """Models with the _fp32_params holder must list it in
+    _keep_in_fp32_modules_strict; the MoE parallelizer keys the fp32 compute
+    pin on that list, so a missing entry silently drops A_log/dt_bias to bf16."""
+    from nemo_automodel.components.models.qwen3_5_moe.model import Qwen3_5MoeForConditionalGeneration
+    from nemo_automodel.components.models.qwen3_next.model import Qwen3NextForCausalLM
+
+    for cls in (Qwen3_5MoeForConditionalGeneration, Qwen3NextForCausalLM):
+        assert "_fp32_params" in getattr(cls, "_keep_in_fp32_modules_strict", [])
