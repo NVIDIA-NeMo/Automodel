@@ -205,7 +205,7 @@ def _render_release_table(releases: list[_ModelRelease]) -> str:
     return "\n".join(
         [
             "| Date | Type | Model |",
-            "|------|----------|-------|",
+            "|:-----|:-----|:-----|",
             *table_rows,
         ]
     )

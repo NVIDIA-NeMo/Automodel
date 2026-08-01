@@ -225,6 +225,7 @@ def test_sync_tables_writes_release_log_homepage_and_registry(tmp_path):
     for tab in expected_tabs:
         assert len(_tab_table_rows(homepage, tab)) <= 9
     for document in (release_log, homepage):
+        assert document.count("|:-----|:-----|:-----|") == len(expected_tabs)
         assert "Documentation only" not in document
     assert len(_tab_table_rows(homepage, "All")) == 9
     assert len(_tab_table_rows(homepage, "LLM")) == 9
