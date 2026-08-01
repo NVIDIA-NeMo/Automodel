@@ -1424,6 +1424,7 @@ def run_checkpoint_robustness(
 
     # Phase 2: Capture reference logits before teardown
     device = next(trainer.model_parts[0].parameters()).device
+    reference_state_samples = _capture_local_state_samples(trainer) if check_state_fingerprint_parity else None
     if check_gate_bias_parity:
         _report_gate_bias_diagnostic("Phase 2 gate bias", trainer)
     reference_logits = _get_logits(trainer.model_parts[0], input_ids, device, trainer=trainer)
@@ -1436,7 +1437,6 @@ def run_checkpoint_robustness(
             device,
         )
         del repeated_reference_logits
-    reference_state_samples = _capture_local_state_samples(trainer) if check_state_fingerprint_parity else None
 
     # Locate the Phase 1 checkpoint used by the reload and resume checks.
     checkpoint_dir = Path(cfg.checkpoint.checkpoint_dir)
