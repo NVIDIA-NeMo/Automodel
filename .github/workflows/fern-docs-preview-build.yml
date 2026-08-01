@@ -69,6 +69,9 @@ jobs:
         run: |
           mkdir -p preview-metadata
           echo "$PR_NUMBER" > preview-metadata/pr_number
+          # The trusted workflow_run job executes from main until this workflow
+          # change is merged, so keep its legacy head_ref input SHA-specific.
+          echo "preview/$(echo "$HEAD_SHA" | cut -c1-12)" > preview-metadata/head_ref
           echo "$HEAD_SHA" > preview-metadata/head_sha
           git diff --name-only "origin/${BASE_REF}...HEAD" -- '*.mdx' > preview-metadata/changed_mdx_files 2>/dev/null || true
 

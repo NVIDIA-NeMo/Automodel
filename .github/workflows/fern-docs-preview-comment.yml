@@ -71,7 +71,7 @@ jobs:
           # before the preview build; the version navs mount it via
           # `folder: ../product-docs/...` and `generate --docs` fatals without it.
           npx -y "fern-api@$fern_version" docs md generate
-          PREVIEW_ID="pr-$(echo "$HEAD_SHA" | cut -c1-12)"
+          PREVIEW_ID="preview/$(echo "$HEAD_SHA" | cut -c1-12)"
           OUTPUT=$(npx -y "fern-api@$fern_version" generate --docs --preview --id "$PREVIEW_ID" 2>&1)
           echo "$OUTPUT"
           URL=$(echo "$OUTPUT" | grep -oP 'Published docs to \K.*(?= \()')
