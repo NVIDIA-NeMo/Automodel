@@ -175,14 +175,16 @@ def test_model_coverage_pages_use_org_slugs_without_nesting_sidebar():
     )
 
 
-def test_model_coverage_internal_links_resolve_to_nightly_routes():
+def test_internal_model_coverage_links_resolve_to_nightly_routes():
     repo_root = Path(__file__).parents[3]
     config_path = repo_root / "docs" / "fern" / "versions" / "nightly.yml"
     navigation = yaml.safe_load(config_path.read_text(encoding="utf-8"))["navigation"]
     routes = _collect_fern_routes(navigation, config_dir=config_path.parent)
     broken_links: list[tuple[Path, str]] = []
 
-    for page in (repo_root / "docs" / "model-coverage").rglob("*.mdx"):
+    for page in (repo_root / "docs").rglob("*.mdx"):
+        if "fern/versions" in page.relative_to(repo_root).as_posix():
+            continue
         document = page.read_text(encoding="utf-8")
         for link in re.findall(r"\]\((/model-coverage/[^)#?]+)", document):
             if link.rstrip("/") not in routes:

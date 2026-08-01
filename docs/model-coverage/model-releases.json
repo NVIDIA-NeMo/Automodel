@@ -129,8 +129,8 @@
     "date": "2026-06-03",
     "model": "Gemma 4 12B",
     "hf_model_id": "google/gemma-4-12B",
-    "docs_page": "/model-coverage/large-language-models/google/gemma-4",
-    "type": "LLM",
+    "docs_page": "/model-coverage/vision-language-models/google/gemma-4",
+    "type": "VLM",
     "recipe": "examples/llm_finetune/gemma/gemma_4_12b_hellaswag.yaml",
     "brev_status": "planned"
   },

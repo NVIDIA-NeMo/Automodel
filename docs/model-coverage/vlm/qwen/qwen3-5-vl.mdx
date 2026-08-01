@@ -98,8 +98,11 @@ included genuine examples of approximately 120K tokens.
 
 The run maintained finite, decreasing loss, validating the training mechanics
 for this combined large-model and long-context regime. It is not a model
-convergence result. A public 397B recipe is not currently included; use the
-122B EP8/CP32 recipe as the closest published reference.
+convergence result. The public
+[397B recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5_moe/qwen3_5_moe_medpix.yaml)
+provides a starting configuration for that checkpoint; use the
+[122B EP8/CP32 recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5_moe/qwen3_5_122b_128k_ep8cp32.yaml)
+as the published 128K long-context reference.
 
 Dense Qwen3.5 and Qwen3.5-MoE support context-parallel vision frame sharding. The
 Qwen3.5-MoE path composes expert and context parallelism with packed sequences; see the

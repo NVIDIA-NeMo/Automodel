@@ -25,8 +25,20 @@ slug: model-coverage/large-language-models/deepseek-ai/deepseek-v4-pro
 
 ## Run the Recipe
 
+This configuration uses PP8 and EP64 across 512 GPUs (64 nodes with 8 H100 GPUs
+per node), so it is not a single-node example. Launch it through Slurm or an
+external `torchrun` environment using the topology declared in the recipe. For
+example, after setting the rendezvous host and port for your cluster:
+
 ```bash
-uv run automodel --nproc-per-node=8 examples/llm_finetune/deepseek_v4/deepseek_v4_pro_hellaswag_all_tilelang_pp8_ep64_20steps.yaml
+torchrun --nproc-per-node=8 \
+  --nnodes=64 \
+  --rdzv-backend=c10d \
+  --rdzv-endpoint="${MASTER_ADDR}:${MASTER_PORT}" \
+  -m nemo_automodel.recipes.llm.train_ft \
+  -c examples/llm_finetune/deepseek_v4/deepseek_v4_pro_hellaswag_all_tilelang_pp8_ep64_20steps.yaml
 ```
 
-This large-model recipe requires multi-node parallelism. See the [Launcher Guide](/job-launchers/slurm-cluster) and [Large MoE Fine-Tuning Guide](/recipes-e2e-examples/large-moe-fine-tuning).
+See the [Launcher Guide](/job-launchers/slurm-cluster) for cluster-specific
+setup and the [Large MoE Fine-Tuning Guide](/recipes-e2e-examples/large-moe-fine-tuning)
+for the full multi-node environment setup.

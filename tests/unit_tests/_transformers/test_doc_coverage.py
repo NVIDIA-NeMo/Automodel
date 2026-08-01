@@ -71,11 +71,10 @@ _DOC_ARCH_ALIASES = {
     # (``Qwen2_5_VLForConditionalGeneration``); the Qwen2.5-VL page still uses
     # the pre-rename spelling.
     "Qwen2_5_VLForConditionalGeneration": "Qwen2_5VLForConditionalGeneration",
-    # Qwen3-Omni, Qwen3-VL and Qwen3.5-VL are documented with the VL-facing
-    # arch name; the registry wires their MoE backbones under these keys.
+    # Qwen3-Omni and Qwen3-VL are documented with the VL-facing arch name; the
+    # registry wires their MoE backbones under these keys.
     "Qwen3OmniMoeForConditionalGeneration": "Qwen3OmniForConditionalGeneration",
     "Qwen3VLMoeForConditionalGeneration": "Qwen3VLForConditionalGeneration",
-    "Qwen3_5MoeForConditionalGeneration": "Qwen3_5MoeVLForConditionalGeneration",
     # Dense Qwen3.5 text/VL backbone; grouped with the VL variants on the
     # Qwen3.5-VL page.
     "Qwen3_5ForCausalLM": "Qwen3.5",

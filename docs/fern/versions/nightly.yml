@@ -66,10 +66,6 @@ navigation:
             path: ../../model-coverage/llm/google/gemma-1.mdx
           - page: "Gemma 2"
             path: ../../model-coverage/llm/google/gemma-2.mdx
-          - page: "Gemma 3"
-            path: ../../model-coverage/llm/google/gemma-3.mdx
-          - page: "Gemma 4"
-            path: ../../model-coverage/llm/google/gemma-4.mdx
           - page: "FunctionGemma"
             path: ../../model-coverage/llm/google/functiongemma.mdx
           - page: "Qwen2"
@@ -216,7 +212,7 @@ navigation:
             path: ../../model-coverage/vlm/moonshotai/kimi-k3.mdx
           - page: "Inkling"
             path: ../../model-coverage/vlm/thinkingmachines/inkling.mdx
-          - page: "Gemma 3 VL / Gemma 3n"
+          - page: "Gemma 3 / Gemma 3n"
             path: ../../model-coverage/vlm/google/gemma3-vl.mdx
             slug: gemma-3-vl-gemma-3n
           - page: "Gemma 4"

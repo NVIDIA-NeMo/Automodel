@@ -1,6 +1,6 @@
 ---
 title: "Gemma 4"
-description: ""
+description: "Supported Gemma 4 checkpoints and NeMo AutoModel recipes."
 slug: model-coverage/vision-language-models/google/gemma-4
 ---
 [Gemma 4](https://ai.google.dev/gemma) is Google's next-generation multimodal Gemma family, supporting image-text inputs with a Mixture-of-Experts (MoE) language backbone at larger scales. NeMo AutoModel replaces the HF-native dense matmul over experts with the NeMo `GroupedExperts` backend, enabling Expert Parallelism (EP) through the standard MoE parallelizer.
@@ -10,7 +10,7 @@ slug: model-coverage/vision-language-models/google/gemma-4
 | | |
 |---|---|
 | **Task** | Image-Text-to-Text |
-| **Architecture** | `Gemma4ForConditionalGeneration` |
+| **Architecture** | `Gemma4UnifiedForConditionalGeneration`, `Gemma4ForConditionalGeneration` |
 | **Parameters** | 2B – 31B (dense) · 26B-A4B (MoE) |
 | **HF Org** | [google](https://huggingface.co/google) |
 
@@ -18,6 +18,7 @@ slug: model-coverage/vision-language-models/google/gemma-4
 
 ## Available Models
 
+- **Gemma 4 12B** (unified multimodal)
 - **Gemma 4 E2B IT** (VL, dense, kv-shared layers)
 - **Gemma 4 E4B IT** (VL, dense, kv-shared layers), **Gemma 4 E4B IT Assistant** (Assistant/drafter model for MTP)
 - **Gemma 4 31B IT** (VL, dense)
@@ -25,6 +26,7 @@ slug: model-coverage/vision-language-models/google/gemma-4
 
 ## Architecture
 
+- `Gemma4UnifiedForConditionalGeneration` — unified 12B model
 - `Gemma4ForConditionalGeneration`
 - `Gemma4AssistantForCausalLM` (MTP drafter / assistant head for speculative decoding; co-trainable with the target Gemma 4 base using `Gemma4WithDrafter`)
 
@@ -32,6 +34,7 @@ slug: model-coverage/vision-language-models/google/gemma-4
 
 | Model | HF ID |
 |---|---|
+| Gemma 4 12B | [`google/gemma-4-12B`](https://huggingface.co/google/gemma-4-12B) |
 | Gemma 4 E2B IT | [`google/gemma-4-E2B-it`](https://huggingface.co/google/gemma-4-E2B-it) |
 | Gemma 4 E4B IT | [`google/gemma-4-E4B-it`](https://huggingface.co/google/gemma-4-E4B-it) |
 | Gemma 4 31B IT | [`google/gemma-4-31B-it`](https://huggingface.co/google/gemma-4-31B-it) |
@@ -41,6 +44,7 @@ slug: model-coverage/vision-language-models/google/gemma-4
 
 | Recipe | Description |
 |---|---|
+| [gemma_4_12b_hellaswag.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gemma/gemma_4_12b_hellaswag.yaml) | SFT — Gemma 4 12B on HellaSwag |
 | [gemma4_2b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_2b.yaml) | SFT — Gemma 4 E2B on MedPix |
 | [gemma4_2b_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_2b_peft.yaml) | LoRA — Gemma 4 E2B on MedPix |
 | [gemma4_4b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_4b.yaml) | SFT — Gemma 4 E4B on MedPix |
@@ -100,6 +104,7 @@ See the [VLM Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n).
 
 ## Hugging Face Model Cards
 
+- [google/gemma-4-12B](https://huggingface.co/google/gemma-4-12B)
 - [google/gemma-4-E2B-it](https://huggingface.co/google/gemma-4-E2B-it)
 - [google/gemma-4-E4B-it](https://huggingface.co/google/gemma-4-E4B-it)
 - [google/gemma-4-31B-it](https://huggingface.co/google/gemma-4-31B-it)
