@@ -756,6 +756,11 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
 
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
 
+    # Pin the SSM-gating holder to fp32 *compute* as well as storage: the MoE
+    # parallelizer reads only _keep_in_fp32_modules_strict, so A_log/dt_bias
+    # would otherwise fall to the policy dtype (bf16). See NVIDIA-NeMo/Automodel#3327.
+    _keep_in_fp32_modules_strict = ["_fp32_params"]
+
     # forward() pulls per-microbatch pixel_values from _vlm_pixel_values_chunks;
     # patch_hf_model_for_pp must not replace it under PP.
     _pp_keep_self_forward: bool = True
