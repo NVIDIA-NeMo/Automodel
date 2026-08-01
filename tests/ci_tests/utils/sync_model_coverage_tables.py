@@ -217,8 +217,13 @@ def _render_release_table(releases: list[_ModelRelease]) -> str:
 
 
 def _render_release_log_table(releases: list[_ModelRelease]) -> str:
+    preferred_modality_order = {"LLM": 0, "VLM": 1}
     modalities = sorted(
-        {release.modality for release in releases}, key=lambda modality: (modality != "LLM", modality.casefold())
+        {release.modality for release in releases},
+        key=lambda modality: (
+            preferred_modality_order.get(modality, len(preferred_modality_order)),
+            modality.casefold(),
+        ),
     )
     tabs = [("All", releases)] + [
         (modality, [release for release in releases if release.modality == modality]) for modality in modalities

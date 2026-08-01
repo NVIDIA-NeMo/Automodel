@@ -159,9 +159,7 @@ def test_sync_tables_writes_release_log_homepage_and_registry(tmp_path):
         "[Documentation-model](/model-coverage/vision-language-models/documentation-model) "
         "(Documentation only) |"
     ) in release_log
-    assert '<Tab title="All">' in release_log
-    assert '<Tab title="LLM">' in release_log
-    assert '<Tab title="VLM">' in release_log
+    assert re.findall(r'<Tab title="([^"]+)">', release_log) == ["All", "LLM", "VLM"]
     llm_tab = release_log.split('<Tab title="LLM">', 1)[1].split("</Tab>", 1)[0]
     vlm_tab = release_log.split('<Tab title="VLM">', 1)[1].split("</Tab>", 1)[0]
     assert "[Model-0](/model-coverage/large-language-models/model-0)" in llm_tab
