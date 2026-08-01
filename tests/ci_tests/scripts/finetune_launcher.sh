@@ -125,7 +125,28 @@ if [[ "$HAS_ROBUSTNESS" == "true" ]]; then
     # that rebuilding several trainers in one interpreter is not reliable.
     read -r -a ROBUSTNESS_PHASES <<< \
       "${CHECKPOINT_ROBUSTNESS_PHASES:-train_and_save automodel_reload resume_baseline resume}"
+    # Preserve the old harness's deferred-comparison behavior: record a failed
+    # parity phase, continue independent phases, and return the first failure
+    # only after every reachable phase has reported a result.
+    ROBUSTNESS_PHASE_RESULTS=()
+    ROBUSTNESS_FAILED_PHASES=""
+    SOURCE_LOAD_REFERENCE_FAILED=false
+    TRAIN_AND_SAVE_FAILED=false
+    RESUME_BASELINE_FAILED=false
     for ROBUSTNESS_PHASE in "${ROBUSTNESS_PHASES[@]}"; do
+      if [[ "$ROBUSTNESS_PHASE" == "source_load_parity" && "$SOURCE_LOAD_REFERENCE_FAILED" == "true" ]]; then
+        ROBUSTNESS_PHASE_RESULTS+=("${ROBUSTNESS_PHASE}|SKIP|-|0|source_load_reference_failed")
+        continue
+      fi
+      if [[ "$TRAIN_AND_SAVE_FAILED" == "true" ]]; then
+        ROBUSTNESS_PHASE_RESULTS+=("${ROBUSTNESS_PHASE}|SKIP|-|0|train_and_save_failed")
+        continue
+      fi
+      if [[ "$ROBUSTNESS_PHASE" == "resume" && "$RESUME_BASELINE_FAILED" == "true" ]]; then
+        ROBUSTNESS_PHASE_RESULTS+=("${ROBUSTNESS_PHASE}|SKIP|-|0|resume_baseline_failed")
+        continue
+      fi
+
       PHASE_LAUNCH_CMD="$ROBUSTNESS_LAUNCH_CMD"
       if [[ "$PHASE_LAUNCH_CMD" == torchrun* ]]; then
         PHASE_LAUNCH_CMD="${PHASE_LAUNCH_CMD/--rdzv_id=${SLURM_JOB_ID}-robustness/--rdzv_id=${SLURM_JOB_ID}-robustness-${ROBUSTNESS_PHASE}}"
@@ -138,12 +159,51 @@ if [[ "$HAS_ROBUSTNESS" == "true" ]]; then
         --isolated_phase ${ROBUSTNESS_PHASE} \
         --config ${RESOLVED_ROBUSTNESS_CONFIG}"
       echo "[checkpoint_robustness] Starting isolated phase: ${ROBUSTNESS_PHASE}"
+      ROBUSTNESS_PHASE_START=$SECONDS
       eval $ROBUSTNESS_CMD
-      ROBUSTNESS_EXIT_CODE=$?
-      if [[ "$ROBUSTNESS_EXIT_CODE" -ne 0 ]]; then
-        break
+      ROBUSTNESS_PHASE_EXIT_CODE=$?
+      ROBUSTNESS_PHASE_ELAPSED=$((SECONDS - ROBUSTNESS_PHASE_START))
+      if [[ "$ROBUSTNESS_PHASE_EXIT_CODE" -eq 0 ]]; then
+        ROBUSTNESS_PHASE_RESULTS+=("${ROBUSTNESS_PHASE}|PASS|0|${ROBUSTNESS_PHASE_ELAPSED}|-")
+        continue
+      fi
+
+      ROBUSTNESS_PHASE_RESULTS+=(
+        "${ROBUSTNESS_PHASE}|FAIL|${ROBUSTNESS_PHASE_EXIT_CODE}|${ROBUSTNESS_PHASE_ELAPSED}|phase_process_failed"
+      )
+      if [[ "$ROBUSTNESS_EXIT_CODE" -eq 0 ]]; then
+        ROBUSTNESS_EXIT_CODE=$ROBUSTNESS_PHASE_EXIT_CODE
+      fi
+      if [[ -z "$ROBUSTNESS_FAILED_PHASES" ]]; then
+        ROBUSTNESS_FAILED_PHASES="$ROBUSTNESS_PHASE"
+      else
+        ROBUSTNESS_FAILED_PHASES="${ROBUSTNESS_FAILED_PHASES},${ROBUSTNESS_PHASE}"
+      fi
+      if [[ "$ROBUSTNESS_PHASE" == "source_load_reference" ]]; then
+        SOURCE_LOAD_REFERENCE_FAILED=true
+      elif [[ "$ROBUSTNESS_PHASE" == "train_and_save" ]]; then
+        TRAIN_AND_SAVE_FAILED=true
+      elif [[ "$ROBUSTNESS_PHASE" == "resume_baseline" ]]; then
+        RESUME_BASELINE_FAILED=true
+      fi
+      if [[ "${SLURM_PROCID:-0}" == "0" ]]; then
+        echo "[checkpoint_robustness][phase-failure] phase=${ROBUSTNESS_PHASE} exit_code=${ROBUSTNESS_PHASE_EXIT_CODE}"
       fi
     done
+
+    if [[ "${SLURM_PROCID:-0}" == "0" ]]; then
+      echo "[checkpoint_robustness] Isolated phase result summary:"
+      for ROBUSTNESS_PHASE_RESULT in "${ROBUSTNESS_PHASE_RESULTS[@]}"; do
+        IFS="|" read -r RESULT_PHASE RESULT_STATUS RESULT_EXIT_CODE RESULT_SECONDS RESULT_REASON <<< \
+          "$ROBUSTNESS_PHASE_RESULT"
+        echo "[checkpoint_robustness][phase-result] phase=${RESULT_PHASE} status=${RESULT_STATUS} exit_code=${RESULT_EXIT_CODE} seconds=${RESULT_SECONDS} reason=${RESULT_REASON}"
+      done
+      if [[ "$ROBUSTNESS_EXIT_CODE" -eq 0 ]]; then
+        echo "[checkpoint_robustness][result] status=PASS"
+      else
+        echo "[checkpoint_robustness][result] status=FAIL failed_phases=${ROBUSTNESS_FAILED_PHASES}"
+      fi
+    fi
   else
     if [[ "$ROBUSTNESS_LAUNCH_CMD" == torchrun* ]]; then
       ROBUSTNESS_LAUNCH_ARGS="--tee 3 --log-dir $TEST_DIR/robustness_logs"

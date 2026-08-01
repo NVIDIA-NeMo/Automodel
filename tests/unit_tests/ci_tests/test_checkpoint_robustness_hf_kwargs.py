@@ -37,6 +37,7 @@ from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm
     _load_hf_fp8_dequantized_config,
     _load_input_ids_once,
     _post_load_dequant_max_memory,
+    _raise_distributed_failure,
     _record_deferred_failure,
     _resolve_hf_model_class,
     _run_process_isolated_checkpoint_phase,
@@ -341,6 +342,22 @@ def test_extract_custom_args_accepts_isolated_phase():
     assert remaining == ["--other-arg"]
 
 
+def test_distributed_failure_prints_stable_phase_marker(monkeypatch, capsys):
+    monkeypatch.setenv("RANK", "0")
+    failure = (
+        "CHECKPOINT_ROBUSTNESS_PHASE_FAILURE phase=automodel_reload check=logit_kl\n"
+        "max per-token KL exceeded its threshold"
+    )
+
+    with pytest.raises(AssertionError, match="max per-token KL exceeded"):
+        _raise_distributed_failure(failure)
+
+    assert capsys.readouterr().err == (
+        "[checkpoint_robustness][phase-error] "
+        "CHECKPOINT_ROBUSTNESS_PHASE_FAILURE phase=automodel_reload check=logit_kl\n"
+    )
+
+
 def test_process_isolated_hf_reload_runs_rank0_hf_loader(tmp_path):
     artifact_dir = tmp_path / ".checkpoint_robustness"
     artifact_dir.mkdir()
@@ -404,6 +421,142 @@ def test_process_isolated_hf_reload_runs_rank0_hf_loader(tmp_path):
     )
     raise_distributed_failure.assert_called_once_with(None)
     recipe_cls.assert_not_called()
+
+
+def test_process_isolated_source_load_reference_persists_hf_artifacts(tmp_path):
+    cfg = SimpleNamespace(checkpoint=SimpleNamespace(checkpoint_dir=tmp_path))
+    reference_logits = torch.randn(1, 2, 3)
+    source_reference = (reference_logits, False, False)
+    recipe_cls = Mock()
+    hf_model_cls = Mock()
+    custom_args = {
+        "check_source_load_parity": True,
+        "hf_device_map_auto": True,
+        "trust_remote_code": True,
+    }
+
+    with (
+        patch(
+            "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm.parse_args_and_load_config",
+            return_value=cfg,
+        ),
+        patch(
+            "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm."
+            "_disable_distributed_atexit_teardown"
+        ),
+        patch(
+            "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm._load_input_ids_once",
+            return_value=[11, 12],
+        ),
+        patch(
+            "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm."
+            "_prepare_source_load_reference",
+            return_value=source_reference,
+        ) as prepare_source_load,
+    ):
+        _run_process_isolated_checkpoint_phase(
+            "source_load_reference",
+            custom_args=custom_args,
+            recipe_cls=recipe_cls,
+            hf_model_cls=hf_model_cls,
+            input_ids_loader=Mock(),
+        )
+
+    prepare_source_load.assert_called_once_with(
+        cfg,
+        [11, 12],
+        hf_model_cls=hf_model_cls,
+        trust_remote_code=True,
+        experts_implementation=None,
+        hf_device_map_auto=True,
+        hf_source_post_load_dequantize=False,
+    )
+    persisted_logits = torch.load(
+        tmp_path / ".checkpoint_robustness" / "source_load_reference_logits.pt",
+        map_location="cpu",
+        weights_only=True,
+    )
+    torch.testing.assert_close(persisted_logits, reference_logits)
+    assert (
+        tmp_path / ".checkpoint_robustness" / "source_load_reference_metadata.json"
+    ).read_text() == '{"explicit_tie_word_embeddings": false, "hf_aliased": false}'
+    recipe_cls.assert_not_called()
+
+
+def test_process_isolated_source_load_parity_compares_persisted_reference(tmp_path):
+    artifact_dir = tmp_path / ".checkpoint_robustness"
+    artifact_dir.mkdir()
+    reference_logits = torch.randn(1, 2, 3)
+    torch.save(reference_logits, artifact_dir / "source_load_reference_logits.pt")
+    (artifact_dir / "source_load_reference_metadata.json").write_text(
+        '{"explicit_tie_word_embeddings": false, "hf_aliased": false}'
+    )
+    cfg = SimpleNamespace(checkpoint=SimpleNamespace(checkpoint_dir=tmp_path))
+    candidate_logits = torch.randn(1, 2, 3)
+    model_part = torch.nn.Linear(2, 2, bias=False)
+    source_trainer = SimpleNamespace(model_parts=[model_part], setup=Mock())
+    recipe_cls = Mock(return_value=source_trainer)
+    custom_args = {
+        "check_source_load_parity": True,
+        "source_load_kl_threshold": "4e-2",
+        "source_load_mean_kl_threshold": "1e-2",
+        "source_load_cosine_threshold": "0.9985",
+    }
+
+    with (
+        patch(
+            "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm.parse_args_and_load_config",
+            return_value=cfg,
+        ),
+        patch(
+            "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm."
+            "_disable_distributed_atexit_teardown"
+        ),
+        patch(
+            "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm._load_input_ids_once",
+            return_value=[11, 12],
+        ),
+        patch(
+            "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm._get_logits",
+            return_value=candidate_logits,
+        ),
+        patch(
+            "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm._lm_head_embedding_aliased",
+            return_value=False,
+        ),
+        patch(
+            "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm._compare_source_load_parity",
+            return_value=None,
+        ) as compare_source_load,
+        patch(
+            "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm._cleanup_source_load_sync"
+        ) as cleanup_source_load,
+        patch("tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm._barrier"),
+        patch(
+            "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm._raise_distributed_failure"
+        ) as raise_distributed_failure,
+    ):
+        _run_process_isolated_checkpoint_phase(
+            "source_load_parity",
+            custom_args=custom_args,
+            recipe_cls=recipe_cls,
+            hf_model_cls=Mock(),
+            input_ids_loader=Mock(),
+        )
+
+    recipe_cls.assert_called_once_with(cfg)
+    source_trainer.setup.assert_called_once_with()
+    compare_args = compare_source_load.call_args
+    torch.testing.assert_close(compare_args.args[0][0], reference_logits)
+    assert compare_args.args[0][1:] == (False, False)
+    assert compare_args.args[1:] == (candidate_logits, False)
+    assert compare_args.kwargs == {
+        "source_load_kl_threshold": 4e-2,
+        "source_load_mean_kl_threshold": 1e-2,
+        "source_load_cosine_threshold": 0.9985,
+    }
+    cleanup_source_load.assert_called_once_with(cfg)
+    raise_distributed_failure.assert_called_once_with(None)
 
 
 def test_trainable_parameter_digests_hash_only_trainable_parameters():
