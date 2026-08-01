@@ -211,10 +211,7 @@ def _render_release_table(releases: list[_ModelRelease]) -> str:
     )
 
 
-def _render_release_tabs(releases: list[_ModelRelease]) -> str:
-    if len(releases) < TABLE_ROW_COUNT:
-        raise ValueError(f"Model release catalog contains only {len(releases)} releases")
-
+def _render_release_tabs(releases: list[_ModelRelease], *, row_limit: int | None = None) -> str:
     preferred_types = (
         "LLM",
         "VLM",
@@ -239,7 +236,15 @@ def _render_release_tabs(releases: list[_ModelRelease]) -> str:
         for model_type in model_types
     ]
     tab_blocks = [
-        "\n".join([f'<Tab title="{title}">', "", _render_release_table(tab_releases[:TABLE_ROW_COUNT]), "", "</Tab>"])
+        "\n".join(
+            [
+                f'<Tab title="{title}">',
+                "",
+                _render_release_table(tab_releases if row_limit is None else tab_releases[:row_limit]),
+                "",
+                "</Tab>",
+            ]
+        )
         for title, tab_releases in tabs
     ]
     return "\n\n".join(["<Tabs>", *tab_blocks, "</Tabs>"])
@@ -250,7 +255,11 @@ def _render_release_log_table(releases: list[_ModelRelease]) -> str:
 
 
 def _render_homepage_table(releases: list[_ModelRelease]) -> str:
-    return "\n\n".join([HOMEPAGE_START_MARKER, _render_release_tabs(releases), HOMEPAGE_END_MARKER])
+    if len(releases) < TABLE_ROW_COUNT:
+        raise ValueError(f"Model release catalog contains only {len(releases)} releases")
+    return "\n\n".join(
+        [HOMEPAGE_START_MARKER, _render_release_tabs(releases, row_limit=TABLE_ROW_COUNT), HOMEPAGE_END_MARKER]
+    )
 
 
 def _parse_registry_entries(source: str) -> list[tuple[str, str, str]]:

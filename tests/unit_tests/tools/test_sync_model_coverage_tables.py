@@ -220,12 +220,14 @@ def test_sync_tables_writes_release_log_homepage_and_registry(tmp_path):
     assert re.findall(r'<Tab title="([^"]+)">', release_log) == expected_tabs
     homepage = (tmp_path / "docs" / "index.mdx").read_text(encoding="utf-8")
     assert re.findall(r'<Tab title="([^"]+)">', homepage) == expected_tabs
+    assert len(_tab_table_rows(release_log, "All")) == len(releases)
+    assert len(_tab_table_rows(release_log, "LLM")) == 10
+    for tab in expected_tabs:
+        assert len(_tab_table_rows(homepage, tab)) <= 9
     for document in (release_log, homepage):
-        for tab in expected_tabs:
-            assert len(_tab_table_rows(document, tab)) <= 9
         assert "Documentation only" not in document
-    assert len(_tab_table_rows(release_log, "All")) == 9
-    assert len(_tab_table_rows(release_log, "LLM")) == 9
+    assert len(_tab_table_rows(homepage, "All")) == 9
+    assert len(_tab_table_rows(homepage, "LLM")) == 9
     llm_tab = release_log.split('<Tab title="LLM">', 1)[1].split("</Tab>", 1)[0]
     vlm_tab = release_log.split('<Tab title="VLM">', 1)[1].split("</Tab>", 1)[0]
     assert "[Model-0](/model-coverage/large-language-models/model-0)" in llm_tab
