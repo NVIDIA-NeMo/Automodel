@@ -1,0 +1,332 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Generate model-coverage tables from their canonical repository sources."""
+
+import argparse
+import ast
+import json
+import re
+from dataclasses import dataclass
+from datetime import date
+from pathlib import Path
+from typing import Literal, cast
+from urllib.parse import urlparse
+
+HOMEPAGE_ROW_COUNT = 9
+HOMEPAGE_START_MARKER = "{/* BEGIN GENERATED LATEST MODEL SUPPORT */}"
+HOMEPAGE_END_MARKER = "{/* END GENERATED LATEST MODEL SUPPORT */}"
+RELEASE_LOG_START_MARKER = "{/* BEGIN GENERATED MODEL RELEASE LOG */}"
+RELEASE_LOG_END_MARKER = "{/* END GENERATED MODEL RELEASE LOG */}"
+REGISTRY_START_MARKER = "{/* BEGIN GENERATED MODEL ARCHITECTURES */}"
+REGISTRY_END_MARKER = "{/* END GENERATED MODEL ARCHITECTURES */}"
+HF_MODEL_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+RELEASE_DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+RECIPE_PATH_PATTERN = re.compile(r"^examples/[A-Za-z0-9_./-]+\.yaml$")
+MARKDOWN_UNSAFE_PATTERN = re.compile(r"[\[\]|<>`\r\n]")
+REPOSITORY_URL = "https://github.com/NVIDIA-NeMo/Automodel/blob/main"
+_BrevStatus = Literal["available", "planned", "unavailable"]
+
+
+@dataclass(frozen=True)
+class _ModelRelease:
+    release_date: str
+    model: str
+    hf_model_id: str
+    modality: str
+    recipe: str | None
+    brev_status: _BrevStatus
+    brev_url: str | None
+
+
+def _replace_generated_block(document: str, start_marker: str, end_marker: str, generated_block: str) -> str:
+    start = document.find(start_marker)
+    end = document.find(end_marker)
+    if start == -1 or end == -1 or end < start:
+        raise ValueError(f"Expected one ordered marker pair: {start_marker}, {end_marker}")
+    if document.find(start_marker, start + len(start_marker)) != -1:
+        raise ValueError(f"Found multiple start markers: {start_marker}")
+    if document.find(end_marker, end + len(end_marker)) != -1:
+        raise ValueError(f"Found multiple end markers: {end_marker}")
+    return document[:start] + generated_block + document[end + len(end_marker) :]
+
+
+def _require_catalog_text(raw_entry: dict[str, object], field: str, index: int) -> str:
+    value = raw_entry.get(field)
+    if not isinstance(value, str) or not value or MARKDOWN_UNSAFE_PATTERN.search(value):
+        raise ValueError(f"Model release {index} field {field!r} must be a non-empty Markdown-safe string")
+    return value
+
+
+def _load_model_releases(catalog_path: Path, repo_root: Path) -> list[_ModelRelease]:
+    try:
+        raw_entries = json.loads(catalog_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"Could not read model release catalog {catalog_path}: {error}") from error
+    if not isinstance(raw_entries, list) or not raw_entries:
+        raise ValueError("Model release catalog must contain a non-empty JSON list")
+
+    releases = []
+    seen_models = set()
+    seen_hf_model_ids = set()
+    previous_date: str | None = None
+    for index, raw_entry in enumerate(raw_entries, start=1):
+        if not isinstance(raw_entry, dict):
+            raise ValueError(f"Model release {index} must be a JSON object")
+        unknown_fields = set(raw_entry) - {
+            "date",
+            "model",
+            "hf_model_id",
+            "modality",
+            "recipe",
+            "brev_status",
+            "brev_url",
+        }
+        if unknown_fields:
+            raise ValueError(f"Model release {index} has unknown fields: {', '.join(sorted(unknown_fields))}")
+        missing_fields = {"date", "model", "hf_model_id", "modality", "recipe", "brev_status"} - set(raw_entry)
+        if missing_fields:
+            raise ValueError(f"Model release {index} is missing fields: {', '.join(sorted(missing_fields))}")
+
+        release_date = _require_catalog_text(raw_entry, "date", index)
+        if not RELEASE_DATE_PATTERN.fullmatch(release_date):
+            raise ValueError(f"Model release {index} date must use YYYY-MM-DD: {release_date!r}")
+        try:
+            date.fromisoformat(release_date)
+        except ValueError as error:
+            raise ValueError(f"Model release {index} has invalid date {release_date!r}") from error
+        if previous_date is not None and previous_date < release_date:
+            raise ValueError(
+                f"Model release catalog is not reverse chronological at {previous_date} then {release_date}"
+            )
+        previous_date = release_date
+
+        model = _require_catalog_text(raw_entry, "model", index)
+        hf_model_id = _require_catalog_text(raw_entry, "hf_model_id", index)
+        modality = _require_catalog_text(raw_entry, "modality", index)
+        if not HF_MODEL_ID_PATTERN.fullmatch(hf_model_id):
+            raise ValueError(f"Model release {index} has invalid Hugging Face model ID {hf_model_id!r}")
+        if model in seen_models:
+            raise ValueError(f"Model release catalog contains duplicate model {model!r}")
+        if hf_model_id in seen_hf_model_ids:
+            raise ValueError(f"Model release catalog contains duplicate Hugging Face model ID {hf_model_id!r}")
+        seen_models.add(model)
+        seen_hf_model_ids.add(hf_model_id)
+
+        recipe_value = raw_entry.get("recipe")
+        if recipe_value is not None and not isinstance(recipe_value, str):
+            raise ValueError(f"Model release {index} recipe must be a string or null")
+        recipe = recipe_value
+        if recipe is not None:
+            recipe_path = Path(recipe)
+            if (
+                MARKDOWN_UNSAFE_PATTERN.search(recipe)
+                or recipe_path.is_absolute()
+                or not RECIPE_PATH_PATTERN.fullmatch(recipe)
+                or not recipe_path.parts
+                or recipe_path.parts[0] != "examples"
+                or ".." in recipe_path.parts
+                or recipe_path.suffix != ".yaml"
+            ):
+                raise ValueError(f"Model release {index} has invalid recipe path {recipe!r}")
+            if not (repo_root / recipe_path).is_file():
+                raise ValueError(f"Recipe for {model} does not exist in this checkout: {recipe}")
+
+        brev_status_value = raw_entry.get("brev_status")
+        if brev_status_value not in {"available", "planned", "unavailable"}:
+            raise ValueError(f"Model release {index} has invalid Brev status {brev_status_value!r}")
+        brev_status = cast(_BrevStatus, brev_status_value)
+        brev_url_value = raw_entry.get("brev_url")
+        if brev_url_value is not None and not isinstance(brev_url_value, str):
+            raise ValueError(f"Model release {index} Brev URL must be a string or absent")
+        brev_url = brev_url_value
+        if brev_status == "available":
+            parsed_brev_url = urlparse(brev_url or "")
+            if (
+                parsed_brev_url.scheme != "https"
+                or parsed_brev_url.netloc != "brev.nvidia.com"
+                or MARKDOWN_UNSAFE_PATTERN.search(brev_url or "")
+                or any(character in (brev_url or "") for character in {'"', "<", ">"})
+            ):
+                raise ValueError(f"Model release {index} requires an https://brev.nvidia.com URL")
+        elif brev_url is not None:
+            raise ValueError(f"Model release {index} has a Brev URL but status is {brev_status!r}")
+
+        releases.append(
+            _ModelRelease(
+                release_date=release_date,
+                model=model,
+                hf_model_id=hf_model_id,
+                modality=modality,
+                recipe=recipe,
+                brev_status=brev_status,
+                brev_url=brev_url,
+            )
+        )
+    return releases
+
+
+def _render_recipe_link(release: _ModelRelease) -> str:
+    if release.recipe is None:
+        return "Documentation only"
+    return f"[{Path(release.recipe).name}]({REPOSITORY_URL}/{release.recipe})"
+
+
+def _render_release_log_table(releases: list[_ModelRelease]) -> str:
+    table_rows = []
+    for release in releases:
+        hf_model = f"[`{release.hf_model_id}`](https://huggingface.co/{release.hf_model_id})"
+        if release.brev_status == "available":
+            brev = (
+                f'<a href="{release.brev_url}"><img src="https://brev-assets.s3.us-west-1.amazonaws.com/'
+                'nv-lb-dark.svg" alt="Launch on Brev" height="23" /></a>'
+            )
+        elif release.brev_status == "planned":
+            brev = "🚧"
+        else:
+            brev = ""
+        table_rows.append(
+            f"| {release.release_date} | {release.model} | {hf_model} | {release.modality} | "
+            f"{_render_recipe_link(release)} | {brev} |"
+        )
+
+    return "\n".join(
+        [
+            RELEASE_LOG_START_MARKER,
+            "| Date | Model | HF Model ID | Modality | Recipe | Try on Brev |",
+            "|------|-------|-------------|----------|--------|------|",
+            *table_rows,
+            RELEASE_LOG_END_MARKER,
+        ]
+    )
+
+
+def _render_homepage_table(releases: list[_ModelRelease]) -> str:
+    runnable_releases = [release for release in releases if release.recipe is not None]
+    if len(runnable_releases) < HOMEPAGE_ROW_COUNT:
+        raise ValueError(f"Model release catalog contains only {len(runnable_releases)} runnable recipes")
+
+    table_rows = [
+        f"| {release.release_date} | {release.modality} | "
+        f"[{release.model}](https://huggingface.co/{release.hf_model_id}) ({_render_recipe_link(release)}) |"
+        for release in runnable_releases[:HOMEPAGE_ROW_COUNT]
+    ]
+
+    return "\n".join(
+        [
+            HOMEPAGE_START_MARKER,
+            "| Date | Modality | Model |",
+            "|------|----------|-------|",
+            *table_rows,
+            HOMEPAGE_END_MARKER,
+        ]
+    )
+
+
+def _parse_registry_entries(source: str) -> list[tuple[str, str, str]]:
+    tree = ast.parse(source)
+    mapping_value: ast.AST | None = None
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        if any(isinstance(target, ast.Name) and target.id == "MODEL_ARCH_MAPPING" for target in node.targets):
+            mapping_value = node.value
+            break
+
+    if not isinstance(mapping_value, ast.Call) or not isinstance(mapping_value.func, ast.Name):
+        raise ValueError("MODEL_ARCH_MAPPING must be an OrderedDict call")
+    if mapping_value.func.id != "OrderedDict" or len(mapping_value.args) != 1:
+        raise ValueError("MODEL_ARCH_MAPPING must contain one OrderedDict sequence")
+
+    raw_entries = ast.literal_eval(mapping_value.args[0])
+    entries = []
+    for architecture, specification in raw_entries:
+        if not isinstance(architecture, str) or not isinstance(specification, tuple) or len(specification) < 2:
+            raise ValueError("Every MODEL_ARCH_MAPPING entry must contain an architecture and module/class tuple")
+        module_path, class_name = specification[:2]
+        if not isinstance(module_path, str) or not isinstance(class_name, str):
+            raise ValueError(f"Invalid registry target for {architecture}")
+        entries.append((architecture, module_path, class_name))
+    return sorted(entries, key=lambda entry: entry[0].casefold())
+
+
+def _render_registry_table(entries: list[tuple[str, str, str]]) -> str:
+    table_rows = [
+        f"| `{architecture}` | `{module_path}.{class_name}` |" for architecture, module_path, class_name in entries
+    ]
+    return "\n".join(
+        [
+            REGISTRY_START_MARKER,
+            "| Checkpoint Architecture | NeMo Implementation |",
+            "|---|---|",
+            *table_rows,
+            REGISTRY_END_MARKER,
+        ]
+    )
+
+
+def _generate_tables(repo_root: Path) -> dict[Path, str]:
+    release_catalog_path = repo_root / "docs" / "model-coverage" / "model-releases.json"
+    release_log_path = repo_root / "docs" / "model-coverage" / "latest-models.mdx"
+    homepage_path = repo_root / "docs" / "index.mdx"
+    overview_path = repo_root / "docs" / "model-coverage" / "overview.mdx"
+    registry_path = repo_root / "nemo_automodel" / "_transformers" / "registry.py"
+
+    release_log = release_log_path.read_text(encoding="utf-8")
+    homepage = homepage_path.read_text(encoding="utf-8")
+    overview = overview_path.read_text(encoding="utf-8")
+    registry_source = registry_path.read_text(encoding="utf-8")
+
+    releases = _load_model_releases(release_catalog_path, repo_root)
+    generated_release_log = _render_release_log_table(releases)
+    generated_homepage = _render_homepage_table(releases)
+    generated_registry = _render_registry_table(_parse_registry_entries(registry_source))
+    return {
+        release_log_path: _replace_generated_block(
+            release_log, RELEASE_LOG_START_MARKER, RELEASE_LOG_END_MARKER, generated_release_log
+        ),
+        homepage_path: _replace_generated_block(
+            homepage, HOMEPAGE_START_MARKER, HOMEPAGE_END_MARKER, generated_homepage
+        ),
+        overview_path: _replace_generated_block(
+            overview, REGISTRY_START_MARKER, REGISTRY_END_MARKER, generated_registry
+        ),
+    }
+
+
+def _sync_tables(repo_root: Path, *, check: bool) -> list[Path]:
+    generated_documents = _generate_tables(repo_root)
+    changed_paths = [
+        path for path, generated in generated_documents.items() if path.read_text(encoding="utf-8") != generated
+    ]
+    if check and changed_paths:
+        changed = ", ".join(str(path.relative_to(repo_root)) for path in changed_paths)
+        raise ValueError(f"Generated model-coverage tables are stale: {changed}")
+    if not check:
+        for path in changed_paths:
+            path.write_text(generated_documents[path], encoding="utf-8")
+    return changed_paths
+
+
+def main() -> None:
+    """Generate model-coverage tables in the repository checkout."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--check", action="store_true", help="fail instead of writing when generated output is stale")
+    args = parser.parse_args()
+    repo_root = Path(__file__).resolve().parents[3]
+    _sync_tables(repo_root, check=args.check)
+
+
+if __name__ == "__main__":
+    main()

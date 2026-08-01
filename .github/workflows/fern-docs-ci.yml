@@ -59,7 +59,7 @@ jobs:
           node-version: '20'
 
       - name: Generate model coverage tables
-        run: python3 tools/sync_model_coverage_tables.py
+        run: python3 tests/ci_tests/utils/sync_model_coverage_tables.py
 
       - name: Validate MDX syntax
         run: |

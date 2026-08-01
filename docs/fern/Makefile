@@ -103,7 +103,7 @@ docs-check: docs-mdx-check
 	fern check
 
 docs-model-tables:
-	python3 "$(REPO_ROOT)/tools/sync_model_coverage_tables.py"
+	python3 "$(REPO_ROOT)/tests/ci_tests/utils/sync_model_coverage_tables.py"
 
 docs-mdx-check: docs-model-tables docs-stitch
 	@tmp_dir="$$(mktemp -d)"; \
