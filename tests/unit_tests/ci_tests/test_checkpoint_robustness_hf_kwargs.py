@@ -44,6 +44,7 @@ from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm
     _run_process_isolated_checkpoint_phase,
     _trainable_parameter_digests,
     _wait_for_hf_reload_rank0,
+    _wait_for_source_load_artifacts,
 )
 from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_vlm import _get_vlm_input_ids
 from tests.functional_tests.checkpoint_robustness.test_checkpoint_vllm_deploy import _tokenize_for_generation
@@ -244,6 +245,36 @@ def test_load_input_ids_once_shares_rank0_result(tmp_path, monkeypatch):
     assert _load_input_ids_once(cfg, rank1_loader, "model/tokenizer") == [31, 32, 33]
     rank1_loader.assert_not_called()
 
+    rank0_reuse_loader = Mock(side_effect=AssertionError("rank 0 must reuse the published input IDs"))
+    monkeypatch.setenv("RANK", "0")
+
+    assert _load_input_ids_once(cfg, rank0_reuse_loader, "model/tokenizer") == [31, 32, 33]
+    rank0_reuse_loader.assert_not_called()
+
+
+def test_load_input_ids_once_waits_for_payload_visibility(tmp_path, monkeypatch):
+    cfg = SimpleNamespace(checkpoint=SimpleNamespace(checkpoint_dir=tmp_path / "checkpoints"))
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    monkeypatch.setenv("SLURM_JOB_ID", "input-id-visibility-test")
+    monkeypatch.delenv("SLURM_STEP_ID", raising=False)
+    monkeypatch.delenv("SLURM_RESTART_COUNT", raising=False)
+    monkeypatch.setenv("RANK", "1")
+    sync_dir = tmp_path / ".checkpoint_robustness_input_ids_slurm_input-id-visibility-test_step_0"
+    sync_dir.mkdir()
+    (sync_dir / "done").write_text("ok\n")
+
+    def publish_payload(_seconds):
+        (sync_dir / "input_ids.json").write_text("[41, 42, 43]")
+
+    loader = Mock(side_effect=AssertionError("nonzero rank must not load the tokenizer"))
+    with patch(
+        "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm.time.sleep",
+        side_effect=publish_payload,
+    ):
+        assert _load_input_ids_once(cfg, loader, "model/tokenizer") == [41, 42, 43]
+
+    loader.assert_not_called()
+
 
 def test_load_input_ids_once_propagates_rank0_failure(tmp_path, monkeypatch):
     cfg = SimpleNamespace(checkpoint=SimpleNamespace(checkpoint_dir=tmp_path / "checkpoints"))
@@ -433,6 +464,29 @@ def test_process_isolated_source_load_reference_persists_hf_artifacts(tmp_path):
         tmp_path / ".checkpoint_robustness" / "source_load_reference_metadata.json"
     ).read_text() == '{"explicit_tie_word_embeddings": false, "hf_aliased": false}'
     recipe_cls.assert_not_called()
+
+
+def test_wait_for_source_load_artifacts_waits_for_both_files(tmp_path):
+    reference_path = tmp_path / "reference.pt"
+    metadata_path = tmp_path / "metadata.json"
+    fail_path = tmp_path / "fail"
+    sleep_calls = 0
+
+    def publish_artifacts(_seconds):
+        nonlocal sleep_calls
+        sleep_calls += 1
+        if sleep_calls == 1:
+            reference_path.write_bytes(b"reference")
+        else:
+            metadata_path.write_text("{}")
+
+    with patch(
+        "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm.time.sleep",
+        side_effect=publish_artifacts,
+    ):
+        _wait_for_source_load_artifacts(reference_path, metadata_path, fail_path)
+
+    assert sleep_calls == 2
 
 
 def test_process_isolated_source_load_parity_compares_persisted_reference(tmp_path):
