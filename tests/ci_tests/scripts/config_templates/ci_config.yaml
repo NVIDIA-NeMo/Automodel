@@ -134,6 +134,7 @@ fixture_keys:
     - process_isolation
     - resume_loss_threshold
     - skip_hf_reload
+    - skip_automodel_logit_parity
     - skip_hf_logit_parity
     - source_load_cosine_threshold
     - source_load_kl_threshold

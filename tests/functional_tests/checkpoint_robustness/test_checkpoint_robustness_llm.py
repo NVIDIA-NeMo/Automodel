@@ -21,7 +21,7 @@ Launch: torchrun --nproc-per-node=<N> -m <this_module> --config <config.yaml>
     [--tokenizer_name <str>]
     [--source_load_kl_threshold <float>] [--source_load_mean_kl_threshold <float>]
     [--check_source_load_parity] [--check_fused_qkv_keys] [--check_phantom_keys] [--check_resume]
-    [--skip_hf_logit_parity] [--hf_adapter_ignored_key_prefix <str>]
+    [--skip_automodel_logit_parity] [--skip_hf_logit_parity] [--hf_adapter_ignored_key_prefix <str>]
     [--hf_source_post_load_dequantize]
     [--max_vram_gb <float>] [--max_cpu_gb <float>]
 """
@@ -96,6 +96,7 @@ def _extract_custom_args(argv):
         "--hf_source_post_load_dequantize",
         "--no_check_resume",
         "--skip_hf_reload",
+        "--skip_automodel_logit_parity",
         "--skip_hf_logit_parity",
     }
     custom = {}
@@ -295,15 +296,21 @@ def _hf_device_map_max_memory(
     return max_memory
 
 
-def _peft_adapter_dispatch_kwargs(hf_kwargs: dict[str, object]) -> dict[str, object]:
-    """Reuse the base-model placement constraints when PEFT dispatches the adapter model.
+def _peft_adapter_load_kwargs(hf_kwargs: dict[str, object]) -> dict[str, object]:
+    """Build PEFT adapter-load arguments for an AutoModel checkpoint.
 
     PEFT removes Accelerate's base-model hooks and dispatches the wrapped model
     again when any base module is CPU- or disk-offloaded. Without the original
     limits, that second pass sizes its map from GPUs that already contain the
     base model and can overcommit them while reattaching hooks.
+
+    AutoModel already saves adapter keys in the final HF namespace. Disable the
+    base checkpoint's conversion map so PEFT does not remap those keys again.
     """
-    return {key: hf_kwargs[key] for key in ("device_map", "max_memory") if key in hf_kwargs}
+    return {
+        "key_mapping": {},
+        **{key: hf_kwargs[key] for key in ("device_map", "max_memory") if key in hf_kwargs},
+    }
 
 
 def _patch_remote_masking_api_compatibility() -> None:
@@ -1574,7 +1581,7 @@ def _run_vanilla_hf_reload(
                 base_model,
                 str(ckpt_step_dir / "model"),
                 autocast_adapter_dtype=False,
-                **_peft_adapter_dispatch_kwargs(hf_kwargs),
+                **_peft_adapter_load_kwargs(hf_kwargs),
             )
             adapter_path = ckpt_step_dir / "model" / "adapter_model.safetensors"
             matched_adapter_tensors, ignored_adapter_tensors = _assert_peft_adapter_matches_checkpoint(
@@ -2036,7 +2043,12 @@ def _run_process_isolated_checkpoint_phase(
             default_threshold = "1e-5" if tp_size > 1 else "0"
             kl_threshold = float(custom_args.get("kl_threshold", default_threshold))
             print(f"\n[Isolated AutoModel reload] max KL: {max_kl_restored:.6e} (threshold: {kl_threshold:.6e})")
-            if max_kl_restored > kl_threshold:
+            if custom_args.get("skip_automodel_logit_parity", False):
+                print(
+                    "[Isolated AutoModel reload] Cross-process logit KL is informational; "
+                    "exact trainable-parameter fingerprints are the checkpoint-integrity gate"
+                )
+            elif max_kl_restored > kl_threshold:
                 failure_message = (
                     "CHECKPOINT_ROBUSTNESS_PHASE_FAILURE phase=automodel_reload check=logit_kl\n"
                     "KL divergence between original and AutoModel checkpoint reload too large: "

@@ -40,7 +40,7 @@ from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm
     _load_input_ids_once,
     _normalize_peft_no_split_modules,
     _patch_remote_masking_api_compatibility,
-    _peft_adapter_dispatch_kwargs,
+    _peft_adapter_load_kwargs,
     _post_load_dequant_max_memory,
     _raise_distributed_failure,
     _record_deferred_failure,
@@ -152,10 +152,10 @@ def test_hf_device_map_max_memory_includes_optional_cpu_overflow():
     assert max_memory == {**{index: "65GiB" for index in range(8)}, "cpu": "64GiB"}
 
 
-def test_peft_adapter_dispatch_reuses_base_model_placement_constraints():
+def test_peft_adapter_load_reuses_base_model_placement_constraints_without_key_conversion():
     max_memory = {0: "55GiB", "cpu": "128GiB"}
 
-    dispatch_kwargs = _peft_adapter_dispatch_kwargs(
+    load_kwargs = _peft_adapter_load_kwargs(
         {
             "device_map": "auto",
             "max_memory": max_memory,
@@ -164,11 +164,11 @@ def test_peft_adapter_dispatch_reuses_base_model_placement_constraints():
         }
     )
 
-    assert dispatch_kwargs == {"device_map": "auto", "max_memory": max_memory}
+    assert load_kwargs == {"key_mapping": {}, "device_map": "auto", "max_memory": max_memory}
 
 
-def test_peft_adapter_dispatch_is_empty_without_a_base_device_map():
-    assert _peft_adapter_dispatch_kwargs({"torch_dtype": torch.bfloat16}) == {}
+def test_peft_adapter_load_disables_key_conversion_without_a_base_device_map():
+    assert _peft_adapter_load_kwargs({"torch_dtype": torch.bfloat16}) == {"key_mapping": {}}
 
 
 def test_peft_adapter_fingerprints_match_saved_safetensors(tmp_path):
@@ -594,6 +594,13 @@ def test_extract_custom_args_accepts_skip_hf_logit_parity():
     custom, remaining = _extract_custom_args(["--skip_hf_logit_parity", "--other-arg"])
 
     assert custom["skip_hf_logit_parity"] is True
+    assert remaining == ["--other-arg"]
+
+
+def test_extract_custom_args_accepts_skip_automodel_logit_parity():
+    custom, remaining = _extract_custom_args(["--skip_automodel_logit_parity", "--other-arg"])
+
+    assert custom["skip_automodel_logit_parity"] is True
     assert remaining == ["--other-arg"]
 
 
