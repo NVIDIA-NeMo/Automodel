@@ -64,13 +64,11 @@ jobs:
       - name: Save PR metadata
         env:
           PR_NUMBER: ${{ github.event.pull_request.number }}
-          HEAD_REF: ${{ github.head_ref }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           BASE_REF: ${{ github.base_ref }}
         run: |
           mkdir -p preview-metadata
           echo "$PR_NUMBER" > preview-metadata/pr_number
-          echo "$HEAD_REF" > preview-metadata/head_ref
           echo "$HEAD_SHA" > preview-metadata/head_sha
           git diff --name-only "origin/${BASE_REF}...HEAD" -- '*.mdx' > preview-metadata/changed_mdx_files 2>/dev/null || true
 

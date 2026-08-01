@@ -50,7 +50,6 @@ jobs:
         id: metadata
         run: |
           echo "pr_number=$(cat preview-metadata/pr_number)" >> "$GITHUB_OUTPUT"
-          echo "head_ref=$(cat preview-metadata/head_ref)" >> "$GITHUB_OUTPUT"
           echo "head_sha=$(cat preview-metadata/head_sha)" >> "$GITHUB_OUTPUT"
 
       - name: Setup Node.js
@@ -62,7 +61,6 @@ jobs:
         id: generate-docs
         env:
           FERN_TOKEN: ${{ secrets.DOCS_FERN_TOKEN }}
-          HEAD_REF: ${{ steps.metadata.outputs.head_ref }}
           HEAD_SHA: ${{ steps.metadata.outputs.head_sha }}
         working-directory: ./docs/fern
         run: |
@@ -73,7 +71,7 @@ jobs:
           # before the preview build; the version navs mount it via
           # `folder: ../product-docs/...` and `generate --docs` fatals without it.
           npx -y "fern-api@$fern_version" docs md generate
-          PREVIEW_ID="${HEAD_REF}-$(echo "$HEAD_SHA" | cut -c1-12)"
+          PREVIEW_ID=$(echo "$HEAD_SHA" | cut -c1-12)
           OUTPUT=$(npx -y "fern-api@$fern_version" generate --docs --preview --id "$PREVIEW_ID" 2>&1)
           echo "$OUTPUT"
           URL=$(echo "$OUTPUT" | grep -oP 'Published docs to \K.*(?= \()')
