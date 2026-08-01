@@ -405,12 +405,11 @@ def _get_trust_remote_code_attn_implementation(
         config_kwargs["token"] = token
     config = AutoConfig.from_pretrained(pretrained_model_name_or_path, **config_kwargs)
 
-    # Nemotron-H remote-code checkpoints do not share optimized attention backend
-    # support: FlashAttention fails in Nemotron-3 Super's varlen path, while
-    # Nemotron-Nano v2 declares SDPA unsupported. Eager is their common HF
-    # reference path. Other remote-code models (notably Nemotron-Flash) still
-    # require FA2.
-    return "eager" if config.model_type == "nemotron_h" else "flash_attention_2"
+    # Remote-code checkpoints do not share optimized attention backend support:
+    # Nemotron-H has incompatible FA2/SDPA paths, and Step-3.7 explicitly rejects
+    # FA2. Eager is their common HF reference path. Other remote-code models
+    # (notably Nemotron-Flash) still require FA2.
+    return "eager" if config.model_type in {"nemotron_h", "step3p7"} else "flash_attention_2"
 
 
 def _hf_source_load_kwargs(
