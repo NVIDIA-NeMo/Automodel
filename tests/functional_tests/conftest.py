@@ -150,6 +150,7 @@ _BOOLEAN_OVERRIDES = [
     "check_resume",
     "hf_device_map_auto",
     "hf_source_post_load_dequantize",
+    "skip_automodel_logit_parity",
     "skip_hf_logit_parity",
 ]
 

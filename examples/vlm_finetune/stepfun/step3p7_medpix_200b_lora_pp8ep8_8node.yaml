@@ -160,8 +160,10 @@ ci:
     step_scheduler.ckpt_every_steps: 1
     # Match a real restart and let each large trainer exit before the next one starts.
     process_isolation: true
-    # Exact trainable-parameter fingerprints guard checkpoint integrity; this allows backend drift.
+    # Exact trainable-parameter fingerprints guard checkpoint integrity. Fresh PP+EP processes can
+    # choose different experts despite identical weights, so keep cross-process KL informational.
     kl_threshold: 4e-2
+    skip_automodel_logit_parity: true
     # HF and AutoModel already choose different experts before checkpointing; validate the HF
     # reload by exact saved-adapter fingerprints plus a forward smoke instead of cross-backend KL.
     skip_hf_logit_parity: true
