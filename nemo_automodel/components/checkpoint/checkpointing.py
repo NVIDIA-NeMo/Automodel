@@ -87,7 +87,6 @@ if TYPE_CHECKING:
 
 
 from nemo_automodel.components.checkpoint.config import CheckpointingConfig, SaveConsolidatedMode, _is_geq_torch_2_9
-from nemo_automodel.components.models.gemma4_unified.hf_key_renames import maybe_rename_gemma4_unified_keys
 
 _CONSOLIDATED_SIZE_WARNING_THRESHOLD_BYTES = 50 * 1024**3
 _DEFAULT_HF_CONSOLIDATED_SHARD_SIZE_BYTES = 5 * 1024**3
@@ -327,6 +326,35 @@ def _summarize_state_dict_key_diff(
         "missing_examples": missing[:limit],
         "unexpected_examples": unexpected[:limit],
     }
+
+
+def _checkpoint_predates_state_dict_adapter(
+    native_state_dict: dict[str, Any],
+    adapted_state_dict: dict[str, Any],
+    checkpoint_keys: set[str],
+) -> bool:
+    """True if the checkpoint stores model FQNs where the adapter now produces HF FQNs.
+
+    A model that gains a ``state_dict_adapter`` starts writing the adapter's Hugging Face
+    names into its checkpoints, but checkpoints written before that carry the model's own
+    names. Both key sets are compared against the checkpoint so a resume can keep using the
+    names it was written with. Only the keys the adapter actually renames are considered,
+    and the decision is unanimous by construction: every renamed key must be present under
+    the model names and absent under the Hugging Face names.
+
+    Args:
+        native_state_dict: Load destination before the adapter's ``to_hf``.
+        adapted_state_dict: The same destination after ``to_hf``.
+        checkpoint_keys: FQNs the checkpoint's metadata reports.
+
+    Returns:
+        True if the checkpoint must be loaded with the model FQNs.
+    """
+    native_only = set(native_state_dict) - set(adapted_state_dict)
+    adapted_only = set(adapted_state_dict) - set(native_state_dict)
+    if not native_only or not adapted_only:
+        return False
+    return native_only <= checkpoint_keys and not (adapted_only & checkpoint_keys)
 
 
 def _get_checkpoint_metadata_keys(
@@ -618,7 +646,6 @@ class Checkpointer:
             device_mesh=self.moe_mesh,
             v4_compatible=self.config.v4_compatible,
         )
-        state_dict = maybe_rename_gemma4_unified_keys(_unwrap_ddp_model(model_state.model[0]), state_dict, to_hf=True)
         # MoE adapters return non-contiguous views; safetensors.save rejects those.
         _materialize_to_hf_views_for_save(state_dict)
         # Build the consolidated model.safetensors.index.json if needed
@@ -913,19 +940,30 @@ class Checkpointer:
 
         # MoE adapters return views into model storage; DCP writes safetensors
         # data straight through them and from_hf skips the rebuild.
+        native_state_dict = state_dict
         state_dict = _maybe_adapt_state_dict_to_hf(
             model_state.model[0],
             state_dict,
             quantization=self.config.dequantize_base_checkpoint,
             device_mesh=self.moe_mesh,
         )
-        # Resuming from a DCP checkpoint we wrote: its shards carry HF FQNs, so the load
-        # destinations must too. Base-model init instead relies on the storage reader's
-        # key_mapping, which already translates the checkpoint keys.
-        if not is_init_step:
-            state_dict = maybe_rename_gemma4_unified_keys(
-                _unwrap_ddp_model(model_state.model[0]), state_dict, to_hf=True
+        # A DCP checkpoint written before the model gained its adapter stores the model's own
+        # FQNs, so the adapter-converted destination keys would not match it.
+        loaded_with_native_keys = False
+        if has_state_dict_adapter and not is_init_step:
+            loaded_with_native_keys = _checkpoint_predates_state_dict_adapter(
+                native_state_dict,
+                state_dict,
+                _get_checkpoint_metadata_keys(model_path, storage_reader),
             )
+            if loaded_with_native_keys:
+                logging.warning(
+                    "Checkpoint %s stores the model's own parameter names, not the Hugging Face "
+                    "names its state dict adapter produces. Loading it with the model names; "
+                    "checkpoints saved from now on use the Hugging Face names.",
+                    model_path,
+                )
+                state_dict = native_state_dict
 
         compat_tied_lm_head_source_key: str | None = None
         lm_head_param_name = getattr(model_state, "lm_head_param_name", None)
@@ -1021,11 +1059,8 @@ class Checkpointer:
         if compat_tied_lm_head_source_key is not None and isinstance(lm_head_param_name, str):
             state_dict[lm_head_param_name] = state_dict.pop(compat_tied_lm_head_source_key)
 
-        if not is_init_step:
-            state_dict = maybe_rename_gemma4_unified_keys(
-                _unwrap_ddp_model(model_state.model[0]), state_dict, to_hf=False
-            )
-        state_dict = _maybe_adapt_state_dict_from_hf(model_state.model[0], state_dict, moe_mesh=self.moe_mesh)
+        if not loaded_with_native_keys:
+            state_dict = _maybe_adapt_state_dict_from_hf(model_state.model[0], state_dict, moe_mesh=self.moe_mesh)
         expected_keys_for_diff = {k for k in expected_keys if not k.endswith("_extra_state")}
         loaded_keys_for_diff = {k for k in state_dict if not k.endswith("_extra_state")}
         # MoE experts load in-place via strided views into model storage (DCP writes through

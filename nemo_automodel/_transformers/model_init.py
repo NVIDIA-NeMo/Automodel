@@ -72,6 +72,10 @@ from nemo_automodel.components.models.common.utils import (
     initialize_linear_module,
     initialize_rms_norm_module,
 )
+from nemo_automodel.components.models.gemma4_unified.state_dict_adapter import (
+    GEMMA4_UNIFIED_MODEL_TYPE,
+    Gemma4UnifiedStateDictAdapter,
+)
 from nemo_automodel.components.utils.model_utils import resolve_trust_remote_code, skip_random_init
 from nemo_automodel.shared.utils import dtype_from_str
 
@@ -1119,6 +1123,25 @@ def _apply_backend_module_overrides(model: torch.nn.Module, backend: BackendConf
                 pending.append(child)
 
 
+def _maybe_attach_hf_native_state_dict_adapter(model) -> None:
+    """Attach a state dict adapter to HF-native models whose FQNs differ from their checkpoint.
+
+    Models implemented under ``components/models`` own their adapter. A few HF-native models
+    are loaded by Transformers under FQNs that do not match the names in their own checkpoint,
+    so they need an adapter too; without one the checkpointer would write those internal names
+    into the exported checkpoint. Attaching it here keeps the checkpointer model-agnostic.
+
+    Args:
+        model: Freshly built model. Left untouched when it is not one of these model types
+            or already carries an adapter.
+    """
+    if getattr(model, "state_dict_adapter", None) is not None:
+        return
+    if getattr(getattr(model, "config", None), "model_type", None) != GEMMA4_UNIFIED_MODEL_TYPE:
+        return
+    model.state_dict_adapter = Gemma4UnifiedStateDictAdapter()
+
+
 def _init_model(
     cls,
     pretrained_model_name_or_path_or_config,
@@ -1143,6 +1166,8 @@ def _init_model(
         *model_args,
         **kwargs,
     )
+    if not is_custom_model:
+        _maybe_attach_hf_native_state_dict_adapter(model)
     if is_custom_model and requested_backend is not None:
         _apply_backend_module_overrides(model, requested_backend)
         if not hasattr(model, "backend"):

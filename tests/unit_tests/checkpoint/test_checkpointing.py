@@ -45,12 +45,12 @@ from nemo_automodel.components.checkpoint.checkpointing import (
     Checkpointer,
     CheckpointingConfig,
     SaveConsolidatedMode,
+    _checkpoint_predates_state_dict_adapter,
     _divide_keys_by_size,
     _ensure_dirs,
     _equally_divide_layers,
     _is_custom_model,
     _load_hf_bin_checkpoint,
-    _maybe_adapt_state_dict_to_hf,
     _model_has_dtensors,
     _new_gloo_process_group,
     _normalize_dtype_mapping_to_state_dict_keys,
@@ -70,7 +70,6 @@ from nemo_automodel.components.checkpoint.utils import (
     has_local_tied_lm_head,
     materialize_missing_tied_lm_head,
 )
-from nemo_automodel.components.models.gemma4_unified.hf_key_renames import maybe_rename_gemma4_unified_keys
 from nemo_automodel.components.training.rng import RNGState, StatefulRNG, init_all_rng
 
 CLOUD_PATH_MODEL = "msc://bucket/step-100/model"
@@ -78,27 +77,34 @@ CLOUD_PATH_OPTIM = "msc://bucket/step-100/optim"
 LOCAL_PATH_MODEL = "/ckpts/step-100/model"
 
 
-class TestGemma4UnifiedHFExportKeys:
-    def test_state_dict_adapter_no_longer_triggers_the_rename(self):
-        """The rename is applied at the call sites, not inside the adapter helper."""
-        tensor = torch.ones(1)
+class TestCheckpointPredatesStateDictAdapter:
+    """A model that gains an adapter must still resume from checkpoints written without it."""
 
-        class Adapter:
-            def to_hf(self, state_dict, **kwargs):
-                assert kwargs["exclude_key_regex"] == r".*_extra_state.*"
-                return {"embed_vision.multimodal_embedder.embedding_projection.weight": state_dict["projection"]}
+    NATIVE = {"embed_vision.multimodal_embedder.embedding_projection.weight": torch.ones(1)}
+    ADAPTED = {"embed_vision.embedding_projection.weight": torch.ones(1)}
 
-        model = SimpleNamespace(
-            config=SimpleNamespace(model_type="gemma4_unified"),
-            state_dict_adapter=Adapter(),
-        )
+    def test_detects_pre_adapter_checkpoint(self):
+        assert _checkpoint_predates_state_dict_adapter(self.NATIVE, self.ADAPTED, set(self.NATIVE))
 
-        adapted = _maybe_adapt_state_dict_to_hf(model, {"projection": tensor})
+    def test_ignores_checkpoint_written_with_adapter_keys(self):
+        assert not _checkpoint_predates_state_dict_adapter(self.NATIVE, self.ADAPTED, set(self.ADAPTED))
 
-        assert adapted == {"embed_vision.multimodal_embedder.embedding_projection.weight": tensor}
-        assert maybe_rename_gemma4_unified_keys(model, adapted, to_hf=True) == {
-            "embed_vision.embedding_projection.weight": tensor
-        }
+    def test_ignores_checkpoint_carrying_both_layouts(self):
+        """Ambiguous checkpoints keep the adapter keys rather than silently reverting."""
+        both = set(self.NATIVE) | set(self.ADAPTED)
+        assert not _checkpoint_predates_state_dict_adapter(self.NATIVE, self.ADAPTED, both)
+
+    def test_ignores_adapter_that_renames_nothing(self):
+        passthrough = {"lm_head.weight": torch.ones(1)}
+        assert not _checkpoint_predates_state_dict_adapter(passthrough, passthrough, set(passthrough))
+
+    def test_requires_every_renamed_key_to_be_present(self):
+        native = dict(self.NATIVE)
+        native["embed_vision.pos_norm.weight"] = torch.ones(1)
+        adapted = dict(self.ADAPTED)
+        adapted["vision_embedder.pos_norm.weight"] = torch.ones(1)
+
+        assert not _checkpoint_predates_state_dict_adapter(native, adapted, set(self.NATIVE))
 
 
 def test_load_on_dp_ranks_requires_opt_in_for_legacy_rng_state(tmp_path):
