@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Train -> checkpoint -> reload via automodel & vanilla HF from consolidated, verify logits match via KL divergence.
+"""Train, checkpoint, and validate AutoModel and vanilla-HF reloads.
 
 Launch: torchrun --nproc-per-node=<N> -m <this_module> --config <config.yaml>
     [--isolated_phase <source_load_reference|source_load_parity|train_and_save|automodel_reload|hf_reload|resume_baseline|resume>]
@@ -21,6 +21,7 @@ Launch: torchrun --nproc-per-node=<N> -m <this_module> --config <config.yaml>
     [--tokenizer_name <str>]
     [--source_load_kl_threshold <float>] [--source_load_mean_kl_threshold <float>]
     [--check_source_load_parity] [--check_fused_qkv_keys] [--check_phantom_keys] [--check_resume]
+    [--skip_hf_logit_parity]
     [--hf_source_post_load_dequantize]
     [--max_vram_gb <float>] [--max_cpu_gb <float>]
 """
@@ -94,6 +95,7 @@ def _extract_custom_args(argv):
         "--hf_source_post_load_dequantize",
         "--no_check_resume",
         "--skip_hf_reload",
+        "--skip_hf_logit_parity",
     }
     custom = {}
     remaining = []
@@ -292,6 +294,17 @@ def _hf_device_map_max_memory(
     return max_memory
 
 
+def _peft_adapter_dispatch_kwargs(hf_kwargs: dict[str, object]) -> dict[str, object]:
+    """Reuse the base-model placement constraints when PEFT dispatches the adapter model.
+
+    PEFT removes Accelerate's base-model hooks and dispatches the wrapped model
+    again when any base module is CPU- or disk-offloaded. Without the original
+    limits, that second pass sizes its map from GPUs that already contain the
+    base model and can overcommit them while reattaching hooks.
+    """
+    return {key: hf_kwargs[key] for key in ("device_map", "max_memory") if key in hf_kwargs}
+
+
 def _patch_remote_masking_api_compatibility() -> None:
     """Allow remote model code to pass masking kwargs removed by Transformers."""
     import transformers.masking_utils as masking_utils
@@ -339,6 +352,20 @@ def _cosine_similarity_from_logits(reference_logits: torch.Tensor, candidate_log
     return F.cosine_similarity(reference_logits.flatten().float(), candidate_logits.flatten().float(), dim=0).item()
 
 
+def _tensor_digest(tensor: torch.Tensor) -> dict[str, object]:
+    """Return exact dtype, shape, and byte-level SHA-256 metadata for a tensor."""
+    local_tensor = tensor.detach()
+    if isinstance(local_tensor, DTensor):
+        local_tensor = local_tensor.to_local()
+    cpu_tensor = local_tensor.contiguous().cpu()
+    raw_bytes = cpu_tensor.view(torch.uint8).numpy()
+    return {
+        "dtype": str(cpu_tensor.dtype),
+        "shape": list(cpu_tensor.shape),
+        "sha256": hashlib.sha256(raw_bytes).hexdigest(),
+    }
+
+
 def _trainable_parameter_digests(model_parts: list[torch.nn.Module]) -> dict[str, dict[str, object]]:
     """Hash every rank-local trainable parameter for exact PEFT save/reload comparison."""
     digests: dict[str, dict[str, object]] = {}
@@ -346,18 +373,38 @@ def _trainable_parameter_digests(model_parts: list[torch.nn.Module]) -> dict[str
         for name, parameter in model_part.named_parameters():
             if not parameter.requires_grad:
                 continue
-            local_parameter = parameter.detach()
-            if isinstance(local_parameter, DTensor):
-                local_parameter = local_parameter.to_local()
-            cpu_parameter = local_parameter.contiguous().cpu()
-            raw_bytes = cpu_parameter.view(torch.uint8).numpy()
             key = f"part_{part_index}:{name.replace('_checkpoint_wrapped_module.', '')}"
-            digests[key] = {
-                "dtype": str(cpu_parameter.dtype),
-                "shape": list(cpu_parameter.shape),
-                "sha256": hashlib.sha256(raw_bytes).hexdigest(),
-            }
+            digests[key] = _tensor_digest(parameter)
     return digests
+
+
+def _assert_peft_adapter_matches_checkpoint(peft_model: torch.nn.Module, adapter_path: Path) -> int:
+    """Verify that vanilla PEFT loaded every saved adapter tensor exactly."""
+    from peft import get_peft_model_state_dict
+    from safetensors import safe_open
+
+    assert adapter_path.exists(), f"adapter_model.safetensors not found at {adapter_path}"
+    loaded_adapter = get_peft_model_state_dict(peft_model)
+    with safe_open(str(adapter_path), framework="pt") as saved_adapter:
+        expected_keys = set(saved_adapter.keys())
+        loaded_keys = set(loaded_adapter)
+        missing = sorted(expected_keys - loaded_keys)
+        unexpected = sorted(loaded_keys - expected_keys)
+        assert not missing and not unexpected, (
+            f"Vanilla PEFT adapter key mismatch: missing={missing[:10]}, unexpected={unexpected[:10]}"
+        )
+
+        mismatches = []
+        for key in sorted(expected_keys):
+            expected_digest = _tensor_digest(saved_adapter.get_tensor(key))
+            loaded_digest = _tensor_digest(loaded_adapter[key])
+            if expected_digest != loaded_digest:
+                mismatches.append(f"{key}: checkpoint={expected_digest}, loaded={loaded_digest}")
+                if len(mismatches) == 10:
+                    break
+
+    assert not mismatches, "Vanilla PEFT adapter tensor mismatch:\n" + "\n".join(mismatches)
+    return len(expected_keys)
 
 
 def _materialize_config_value(value):
@@ -1361,7 +1408,7 @@ def _run_vanilla_hf_reload(
     hf_model_cls: type,
     custom_args: dict,
 ) -> str | None:
-    """Load the saved model with vanilla HF and compare its logits.
+    """Load the saved model with vanilla HF and validate its adapter and forward pass.
 
     Args:
         cfg: Resolved checkpoint-robustness recipe configuration.
@@ -1384,6 +1431,7 @@ def _run_vanilla_hf_reload(
         experts_implementation = custom_args.get("experts_implementation", None)
         hf_device_map_auto = bool(custom_args.get("hf_device_map_auto", False))
         check_fused_qkv_keys = bool(custom_args.get("check_fused_qkv_keys", False))
+        skip_hf_logit_parity = bool(custom_args.get("skip_hf_logit_parity", False))
         hf_kl_threshold = float(custom_args.get("hf_kl_threshold", "5e-3"))
         device = torch.device("cuda", torch.cuda.current_device())
         config_path = original_pretrained_path if is_peft else consolidated_dir
@@ -1468,14 +1516,20 @@ def _run_vanilla_hf_reload(
                 if should_fix_rotary_embeddings([base_model]):
                     fix_rotary_embeddings([base_model])
             _normalize_peft_no_split_modules(base_model)
-            peft_model = PeftModel.from_pretrained(base_model, str(ckpt_step_dir / "model"))
+            peft_model = PeftModel.from_pretrained(
+                base_model,
+                str(ckpt_step_dir / "model"),
+                autocast_adapter_dtype=False,
+                **_peft_adapter_dispatch_kwargs(hf_kwargs),
+            )
+            adapter_path = ckpt_step_dir / "model" / "adapter_model.safetensors"
+            matched_adapter_tensors = _assert_peft_adapter_matches_checkpoint(peft_model, adapter_path)
+            print(f"[HF reload] Exact saved-adapter fingerprints matched ({matched_adapter_tensors} tensors)")
             hf_logits = _get_logits(peft_model, input_ids, device)
 
             if check_fused_qkv_keys:
                 from safetensors import safe_open
 
-                adapter_path = ckpt_step_dir / "model" / "adapter_model.safetensors"
-                assert adapter_path.exists(), f"adapter_model.safetensors not found at {adapter_path}"
                 with safe_open(str(adapter_path), framework="pt") as f:
                     adapter_keys = list(f.keys())
                 combined_keys = [key for key in adapter_keys if "qkv_proj" in key or "gate_up_proj" in key]
@@ -1507,14 +1561,17 @@ def _run_vanilla_hf_reload(
             hf_logits = _get_logits(hf_model, input_ids, device)
             del hf_model
 
-        max_kl_hf = _kl_divergence_from_logits(reference_logits, hf_logits).max().item()
-        print(f"[HF reload] HF-loaded max KL: {max_kl_hf:.6e} (threshold: {hf_kl_threshold:.6e})")
         hf_reload_error = None
-        if max_kl_hf > hf_kl_threshold:
-            hf_reload_error = (
-                "KL divergence between original and HF-loaded model too large: "
-                f"max per-token KL = {max_kl_hf:.6e} > threshold {hf_kl_threshold:.6e}"
-            )
+        if skip_hf_logit_parity:
+            print("[HF reload] Forward smoke passed; cross-implementation logit KL comparison skipped by config")
+        else:
+            max_kl_hf = _kl_divergence_from_logits(reference_logits, hf_logits).max().item()
+            print(f"[HF reload] HF-loaded max KL: {max_kl_hf:.6e} (threshold: {hf_kl_threshold:.6e})")
+            if max_kl_hf > hf_kl_threshold:
+                hf_reload_error = (
+                    "KL divergence between original and HF-loaded model too large: "
+                    f"max per-token KL = {max_kl_hf:.6e} > threshold {hf_kl_threshold:.6e}"
+                )
         del hf_logits
         _release_model_memory()
         return hf_reload_error

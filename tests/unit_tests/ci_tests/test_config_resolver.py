@@ -309,6 +309,7 @@ def test_end_to_end_fixture_keys_not_applied_as_overrides(tmp_path):
         "ci:\n"
         "  checkpoint_robustness:\n"
         "    check_source_load_parity: true             # fixture arg, must NOT become top-level\n"
+        "    skip_hf_logit_parity: true                 # fixture arg, must NOT become top-level\n"
         "    hf_kl_threshold: 5e-3                       # fixture arg, must NOT become top-level\n"
         "    source_load_kl_threshold: 1e-2              # fixture arg, must NOT become top-level\n"
         "    source_load_mean_kl_threshold: 1e-3         # fixture arg, must NOT become top-level\n"
@@ -327,12 +328,14 @@ def test_end_to_end_fixture_keys_not_applied_as_overrides(tmp_path):
     # and do NOT pollute the top level.
     assert "hf_kl_threshold" not in resolved
     assert "check_source_load_parity" not in resolved
+    assert "skip_hf_logit_parity" not in resolved
     assert "source_load_kl_threshold" not in resolved
     assert "source_load_mean_kl_threshold" not in resolved
     assert "source_load_cosine_threshold" not in resolved
     assert "tokenizer_name" not in resolved
     assert resolved["ci"]["checkpoint_robustness"]["hf_kl_threshold"] == 5e-3
     assert resolved["ci"]["checkpoint_robustness"]["check_source_load_parity"] is True
+    assert resolved["ci"]["checkpoint_robustness"]["skip_hf_logit_parity"] is True
     assert resolved["ci"]["checkpoint_robustness"]["source_load_kl_threshold"] == 1e-2
     assert resolved["ci"]["checkpoint_robustness"]["source_load_mean_kl_threshold"] == 1e-3
     assert resolved["ci"]["checkpoint_robustness"]["source_load_cosine_threshold"] == 0.999
@@ -387,9 +390,7 @@ def test_vlm_checkpoint_robustness_recipes_resolve(tmp_path, recipe_path):
         assert robustness["source_load_cosine_threshold"] == 0.9985
         assert robustness["source_load_kl_threshold"] == 1e-1
         assert robustness["source_load_mean_kl_threshold"] == 1e-2
-        assert resolved["loss_fn"]["_target_"] == (
-            "nemo_automodel.components.loss.chunked_ce.ChunkedCrossEntropy"
-        )
+        assert resolved["loss_fn"]["_target_"] == ("nemo_automodel.components.loss.chunked_ce.ChunkedCrossEntropy")
         assert resolved["model"]["backend"]["experts"] == "torch_mm"
         assert resolved["step_scheduler"]["global_batch_size"] == 16
         assert resolved["step_scheduler"]["local_batch_size"] == 1
