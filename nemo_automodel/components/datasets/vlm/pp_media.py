@@ -330,6 +330,14 @@ def _will_run_forward_metadata_inference(pp: Any) -> bool:
     if first_stage is None or hasattr(first_stage, "_configure_outputs_meta"):
         return False
 
+    # Static metadata installed by ``_precompute_stage_shapes`` makes PyTorch skip the
+    # probe entirely. Claiming otherwise arms the cursor reset against the first *real*
+    # microbatch instead, so every later microbatch re-reads media chunk 0 and the media
+    # silently desynchronizes from the text it belongs to.
+    user_meta = getattr(first_stage, "_user_meta", None)
+    if getattr(user_meta, "inputs", None) is not None:
+        return False
+
     if hasattr(schedule, "_stage_forward_initialized"):
         return not schedule._stage_forward_initialized
     if hasattr(schedule, "_stages_forward_initialized"):
