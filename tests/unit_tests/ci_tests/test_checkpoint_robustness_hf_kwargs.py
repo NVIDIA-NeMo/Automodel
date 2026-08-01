@@ -143,6 +143,34 @@ def test_peft_adapter_fingerprints_allow_configured_hf_unsupported_prefix(tmp_pa
     assert ignored == 1
 
 
+def test_peft_adapter_fingerprints_read_accelerate_offload_backing_tensor(tmp_path):
+    from safetensors.torch import save_file
+
+    class OffloadedPeftModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layer = torch.nn.Module()
+            self.layer.lora_A = torch.nn.ModuleDict({"default": torch.nn.Linear(2, 1, bias=False, device="meta")})
+            self.layer._hf_hook = SimpleNamespace(
+                hooks=(
+                    SimpleNamespace(
+                        weights_map={"lora_A.default.weight": torch.tensor([[1.0, 2.0]], dtype=torch.bfloat16)}
+                    ),
+                )
+            )
+
+    adapter_path = tmp_path / "adapter_model.safetensors"
+    key = "layer.lora_A.weight"
+    save_file({key: torch.tensor([[1.0, 2.0]], dtype=torch.bfloat16)}, adapter_path)
+    model = OffloadedPeftModel()
+
+    with patch("peft.get_peft_model_state_dict", return_value={key: torch.empty(1, 2, device="meta")}):
+        matched, ignored = _assert_peft_adapter_matches_checkpoint(model, adapter_path)
+
+    assert matched == 1
+    assert ignored == 0
+
+
 def test_peft_adapter_fingerprints_reject_missing_key_outside_configured_prefix(tmp_path):
     from safetensors.torch import save_file
 

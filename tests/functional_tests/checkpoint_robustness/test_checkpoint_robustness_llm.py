@@ -379,6 +379,37 @@ def _trainable_parameter_digests(model_parts: list[torch.nn.Module]) -> dict[str
     return digests
 
 
+def _accelerate_offloaded_tensor(model: torch.nn.Module, parameter_name: str) -> torch.Tensor:
+    """Read a meta parameter's backing tensor from its nearest Accelerate offload hook."""
+
+    def hooks(hook):
+        for child_hook in getattr(hook, "hooks", (hook,)):
+            if child_hook is hook:
+                yield hook
+            else:
+                yield from hooks(child_hook)
+
+    name_parts = parameter_name.split(".")
+    for module_end in range(len(name_parts) - 1, -1, -1):
+        module_name = ".".join(name_parts[:module_end])
+        local_name = ".".join(name_parts[module_end:])
+        module = model if not module_name else model.get_submodule(module_name)
+        hf_hook = getattr(module, "_hf_hook", None)
+        if hf_hook is None:
+            continue
+        for hook in hooks(hf_hook):
+            weights_map = getattr(hook, "weights_map", None)
+            if weights_map is None:
+                continue
+            try:
+                tensor = weights_map[local_name]
+            except KeyError:
+                continue
+            assert not tensor.is_meta, f"Accelerate backing tensor is still meta for {parameter_name}"
+            return tensor
+    raise AssertionError(f"No Accelerate backing tensor found for meta parameter {parameter_name}")
+
+
 def _assert_peft_adapter_matches_checkpoint(
     peft_model: torch.nn.Module,
     adapter_path: Path,
@@ -390,6 +421,14 @@ def _assert_peft_adapter_matches_checkpoint(
 
     assert adapter_path.exists(), f"adapter_model.safetensors not found at {adapter_path}"
     loaded_adapter = get_peft_model_state_dict(peft_model)
+    normalized_parameter_names = {}
+    if any(tensor.is_meta for tensor in loaded_adapter.values()):
+        for parameter_name, _ in peft_model.named_parameters():
+            name_parts = parameter_name.split(".")
+            if "lora_" not in parameter_name or len(name_parts) < 2:
+                continue
+            normalized_name = ".".join((*name_parts[:-2], name_parts[-1]))
+            normalized_parameter_names[normalized_name] = parameter_name
     with safe_open(str(adapter_path), framework="pt") as saved_adapter:
         expected_keys = set(saved_adapter.keys())
         loaded_keys = set(loaded_adapter)
@@ -407,7 +446,11 @@ def _assert_peft_adapter_matches_checkpoint(
         matched_keys = expected_keys - set(ignored_missing)
         for key in sorted(matched_keys):
             expected_digest = _tensor_digest(saved_adapter.get_tensor(key))
-            loaded_digest = _tensor_digest(loaded_adapter[key])
+            loaded_tensor = loaded_adapter[key]
+            if loaded_tensor.is_meta:
+                assert key in normalized_parameter_names, f"No PEFT parameter found for meta adapter tensor {key}"
+                loaded_tensor = _accelerate_offloaded_tensor(peft_model, normalized_parameter_names[key])
+            loaded_digest = _tensor_digest(loaded_tensor)
             if expected_digest != loaded_digest:
                 mismatches.append(f"{key}: checkpoint={expected_digest}, loaded={loaded_digest}")
                 if len(mismatches) == 10:
