@@ -507,7 +507,7 @@ class Qwen3_5MoeModel(HFQwen3_5MoeModel):
             embed_tokens = self.get_input_embeddings()
             if inputs_embeds is None:
                 if embed_tokens is not None:
-                    inputs_embeds = self.language_model(input_ids=input_ids, _pre_embed_only=True)
+                    inputs_embeds = embed_tokens(input_ids)
                 elif (
                     input_ids is not None
                     and isinstance(input_ids, torch.Tensor)
@@ -651,15 +651,6 @@ class Qwen3_5MoeTextModelBackend(nn.Module):
     ) -> Qwen3_5MoeModelOutputWithPast:
         if past_key_values is not None or use_cache:
             raise NotImplementedError("KV cache is not supported for the Qwen3.5-MoE backend implementation.")
-
-        if attn_kwargs.pop("_pre_embed_only", False):
-            if inputs_embeds is not None:
-                return inputs_embeds
-            if input_ids is None:
-                raise ValueError("Either input_ids or inputs_embeds must be provided")
-            if self.embed_tokens is None:
-                raise ValueError("inputs_embeds must be provided for pipeline stages without embed_tokens")
-            return self.embed_tokens(input_ids)
 
         if inputs_embeds is None:
             if input_ids is None:

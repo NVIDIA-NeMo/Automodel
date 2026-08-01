@@ -709,7 +709,10 @@ class TestQwen3_5MoeModelVLPath:
             batch, seq_len, vl_config.text_config.hidden_size, device=device, dtype=model_dtype
         )
 
-        with patch.object(HFQwen3_5MoeModel, "forward", return_value=mock_output) as mock_hf_forward:
+        with (
+            patch.object(HFQwen3_5MoeModel, "forward", return_value=mock_output) as mock_hf_forward,
+            patch.object(core.language_model, "forward") as mock_language_forward,
+        ):
             result = core.forward(
                 input_ids=input_ids,
                 pixel_values=pixel_values,
@@ -717,6 +720,7 @@ class TestQwen3_5MoeModelVLPath:
             )
 
         mock_hf_forward.assert_called_once()
+        mock_language_forward.assert_not_called()
         kw = mock_hf_forward.call_args.kwargs
         assert kw["pixel_values"] is pixel_values
         assert kw["input_ids"] is None
@@ -886,17 +890,6 @@ class TestTextModelBackendInputsEmbedsPath:
 
         assert isinstance(output, Qwen3_5MoeModelOutputWithPast)
         assert output.last_hidden_state.shape == (batch, seq_len, text_config.hidden_size)
-
-    def test_pre_embed_only_returns_embeddings(self, text_config, backend_config, moe_config, device):
-        """VLM wrappers can enter the backend FSDP root before using embed_tokens."""
-        model = Qwen3_5MoeTextModelBackend(text_config, backend=backend_config, moe_config=moe_config).to(device)
-
-        input_ids = torch.randint(0, text_config.vocab_size, (2, 3), device=device)
-
-        output = model(input_ids=input_ids, _pre_embed_only=True)
-
-        expected = model.embed_tokens(input_ids)
-        torch.testing.assert_close(output, expected)
 
     def test_forward_requires_inputs_embeds_when_embed_tokens_absent(
         self, text_config, backend_config, moe_config, device
