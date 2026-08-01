@@ -38,6 +38,7 @@ import traceback
 from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from datetime import timedelta
+from functools import wraps
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -289,6 +290,31 @@ def _hf_device_map_max_memory(
             raise ValueError("hf_device_map_cpu_max_memory_gib must be positive")
         max_memory["cpu"] = f"{cpu_max_memory_gib:g}GiB"
     return max_memory
+
+
+def _patch_remote_masking_api_compatibility() -> None:
+    """Allow remote model code to pass masking kwargs removed by Transformers."""
+    import transformers.masking_utils as masking_utils
+
+    for function_name in ("create_causal_mask", "create_sliding_window_causal_mask"):
+        mask_function = getattr(masking_utils, function_name)
+        if getattr(mask_function, "_nemo_removed_kwargs_patched", False):
+            continue
+        parameters = inspect.signature(mask_function).parameters.values()
+        accepts_cache_position = any(
+            parameter.name == "cache_position" or parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters
+        )
+        if accepts_cache_position:
+            continue
+
+        @wraps(mask_function)
+        def compatible_mask_function(*args, _mask_function=mask_function, **kwargs):
+            kwargs.pop("cache_position", None)
+            return _mask_function(*args, **kwargs)
+
+        compatible_mask_function._nemo_removed_kwargs_patched = True  # type: ignore[attr-defined]
+        setattr(masking_utils, function_name, compatible_mask_function)
 
 
 def _rss_gb() -> float:
@@ -861,6 +887,7 @@ def _prepare_source_load_reference_rank0(
     from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 
     apply_cache_compatibility_patches()
+    _patch_remote_masking_api_compatibility()
 
     model_kwargs = _model_kwargs_from_config(cfg.model)
     original_pretrained_path = model_kwargs.get("pretrained_model_name_or_path")
@@ -1338,6 +1365,7 @@ def _run_vanilla_hf_reload(
         An error message when loading or parity fails, otherwise ``None``.
     """
     try:
+        _patch_remote_masking_api_compatibility()
         _, ckpt_step_dir, consolidated_dir = _checkpoint_paths(cfg)
         is_peft = hasattr(cfg, "peft")
         original_pretrained_path = cfg.model.pretrained_model_name_or_path

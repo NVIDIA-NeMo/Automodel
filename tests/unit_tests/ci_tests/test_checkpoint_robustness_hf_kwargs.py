@@ -37,6 +37,7 @@ from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm
     _load_hf_fp8_dequantized_config,
     _load_input_ids_once,
     _normalize_peft_no_split_modules,
+    _patch_remote_masking_api_compatibility,
     _post_load_dequant_max_memory,
     _raise_distributed_failure,
     _record_deferred_failure,
@@ -77,6 +78,53 @@ def test_hf_device_map_max_memory_includes_optional_cpu_overflow():
         max_memory = _hf_device_map_max_memory("65", "64")
 
     assert max_memory == {**{index: "65GiB" for index in range(8)}, "cpu": "64GiB"}
+
+
+def test_remote_masking_api_compatibility_drops_removed_cache_position(monkeypatch):
+    import transformers.masking_utils as masking_utils
+
+    calls = []
+
+    def create_mask(config, inputs_embeds, attention_mask, past_key_values, position_ids=None):
+        calls.append((config, inputs_embeds, attention_mask, past_key_values, position_ids))
+        return "mask"
+
+    monkeypatch.setattr(masking_utils, "create_causal_mask", create_mask)
+    monkeypatch.setattr(masking_utils, "create_sliding_window_causal_mask", create_mask)
+
+    _patch_remote_masking_api_compatibility()
+    _patch_remote_masking_api_compatibility()
+
+    for function_name in ("create_causal_mask", "create_sliding_window_causal_mask"):
+        result = getattr(masking_utils, function_name)(
+            "config",
+            "inputs",
+            "attention",
+            "cache",
+            position_ids="positions",
+            cache_position="removed-argument",
+        )
+        assert result == "mask"
+
+    assert calls == [
+        ("config", "inputs", "attention", "cache", "positions"),
+        ("config", "inputs", "attention", "cache", "positions"),
+    ]
+
+
+def test_remote_masking_api_compatibility_preserves_supported_api(monkeypatch):
+    import transformers.masking_utils as masking_utils
+
+    def create_mask(config, inputs_embeds, attention_mask, past_key_values, cache_position=None):
+        return cache_position
+
+    monkeypatch.setattr(masking_utils, "create_causal_mask", create_mask)
+    monkeypatch.setattr(masking_utils, "create_sliding_window_causal_mask", create_mask)
+
+    _patch_remote_masking_api_compatibility()
+
+    assert masking_utils.create_causal_mask is create_mask
+    assert masking_utils.create_sliding_window_causal_mask is create_mask
 
 
 @pytest.mark.parametrize(
