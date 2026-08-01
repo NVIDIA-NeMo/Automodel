@@ -14,6 +14,7 @@
 
 import importlib.util
 import logging
+import math
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -160,12 +161,18 @@ class CudaGraphConfig:
     Attributes:
         modules: Per-layer modules to capture with Transformer Engine, following
             Megatron Core's module names. AutoModel supports whole ``attn``,
-            ``moe_router``, and ``moe_preprocess`` scopes, plus the
+            ``moe``, ``moe_router``, and ``moe_preprocess`` scopes, plus the
             AutoModel-specific narrow ``te_dpa`` scope. An empty list disables
-            CUDA graphs.
+            CUDA graphs. The ``moe`` scope captures dispatch, local TE experts,
+            and combine after eager routing.
+        moe_capacity_factor: Drop-and-pad capacity relative to the average
+            number of routed tokens per expert. Required by, and only valid
+            with, the ``moe`` graph scope. Capacity limiting may drop routed
+            expert assignments when an expert is overloaded.
     """
 
-    modules: list[Literal["attn", "te_dpa", "moe_router", "moe_preprocess"]] = field(default_factory=list)
+    modules: list[Literal["attn", "te_dpa", "moe", "moe_router", "moe_preprocess"]] = field(default_factory=list)
+    moe_capacity_factor: float | None = None
 
     def __post_init__(self) -> None:
         """Validate the declarative CUDA-graph configuration."""
@@ -173,7 +180,7 @@ class CudaGraphConfig:
             raise TypeError("cuda_graph.modules must be a list")
         if not all(isinstance(module, str) for module in self.modules):
             raise TypeError("cuda_graph.modules entries must be strings")
-        supported_modules = {"attn", "te_dpa", "moe_router", "moe_preprocess"}
+        supported_modules = {"attn", "te_dpa", "moe", "moe_router", "moe_preprocess"}
         unknown_modules = set(self.modules) - supported_modules
         if unknown_modules:
             raise ValueError(
@@ -186,6 +193,16 @@ class CudaGraphConfig:
             raise ValueError("cuda_graph.modules cannot contain both 'attn' and 'te_dpa'")
         if "moe_preprocess" in self.modules and "moe_router" not in self.modules:
             raise ValueError("'moe_preprocess' in cuda_graph.modules requires 'moe_router'")
+        if self.moe_capacity_factor is not None:
+            if not math.isfinite(self.moe_capacity_factor) or self.moe_capacity_factor <= 0:
+                raise ValueError("cuda_graph.moe_capacity_factor must be positive and finite")
+            if "moe" not in self.modules:
+                raise ValueError("cuda_graph.moe_capacity_factor requires 'moe' in cuda_graph.modules")
+        if "moe" in self.modules:
+            if self.moe_capacity_factor is None:
+                raise ValueError("'moe' in cuda_graph.modules requires cuda_graph.moe_capacity_factor")
+            if any(scope in self.modules for scope in ("moe_router", "moe_preprocess")):
+                raise ValueError("'moe' in cuda_graph.modules cannot be combined with moe_router or moe_preprocess")
 
 
 @dataclass(kw_only=True)
@@ -298,6 +315,16 @@ class BackendConfig:
         if isinstance(self.gate_precision, str):
             self.gate_precision = dtype_from_str(self.gate_precision, default=None)
 
+        graph_modules = self.cuda_graph.modules
+        moe_cuda_graph_enabled = "moe" in graph_modules
+        if moe_cuda_graph_enabled:
+            if self.experts != "te":
+                raise ValueError("'moe' in cuda_graph.modules requires experts='te'")
+            if self.dispatcher not in ("torch", "hybridep"):
+                raise ValueError("'moe' in cuda_graph.modules currently requires dispatcher='torch' or 'hybridep'")
+            if self.te_fp8 is not None:
+                raise ValueError("'moe' in cuda_graph.modules currently supports BF16 TE GroupedLinear only")
+
         # enable_deepep was removed. It is no longer honored; warn (once, on rank 0) if a stale
         # config still sets it so the user migrates to explicit dispatcher/experts. The field is
         # retained only so loading an old config does not crash this kw_only dataclass.
@@ -312,7 +339,12 @@ class BackendConfig:
             self.enable_deepep = None
 
         # Backward compatibility
-        if self.experts in ("te", "gmm") and self.dispatcher not in ("deepep", "hybridep", "uccl_ep"):
+        local_fixed_te_moe = self.experts == "te" and self.dispatcher == "torch" and moe_cuda_graph_enabled
+        if (
+            self.experts in ("te", "gmm")
+            and self.dispatcher not in ("deepep", "hybridep", "uccl_ep")
+            and not local_fixed_te_moe
+        ):
             if (
                 torch.distributed.is_initialized() and torch.distributed.get_rank() == 0
             ) or not torch.distributed.is_initialized():
@@ -324,7 +356,6 @@ class BackendConfig:
             self.dispatcher = "torch"
             self.experts = "torch_mm"
 
-        graph_modules = self.cuda_graph.modules
         attention_graph_modules = {"attn", "te_dpa"}.intersection(graph_modules)
         if attention_graph_modules and self.attn != "te":
             raise ValueError(f"{sorted(attention_graph_modules)} in cuda_graph.modules requires attn='te'")

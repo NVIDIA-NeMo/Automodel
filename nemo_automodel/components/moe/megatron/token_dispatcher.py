@@ -321,34 +321,79 @@ class _DeepepManager(_DispatchManager):
 
 
 class _HybridEPMetadataProcessor(nn.Module):
-    """Fixed-shape conversion from top-k metadata to HybridEP metadata."""
+    """Convert top-k metadata and optionally drop-and-pad it to fixed capacity."""
 
     def __init__(self, *, num_experts: int, permute_fusion: bool):
         super().__init__()
         self.num_experts = num_experts
         self.permute_fusion = permute_fusion
+        self.expert_capacity: Optional[int] = None
+
+    def set_expert_capacity(self, expert_capacity: int) -> None:
+        """Select exactly this many source-token slots for every global expert."""
+        if expert_capacity <= 0:
+            raise ValueError("HybridEP expert capacity must be positive")
+        if self.expert_capacity is not None and self.expert_capacity != expert_capacity:
+            raise RuntimeError(
+                "HybridEP expert capacity changed after initialization: "
+                f"expected {self.expert_capacity}, got {expert_capacity}. "
+                "Fixed-capacity MoE CUDA graphs are fail-closed on dynamic token-count changes."
+            )
+        self.expert_capacity = expert_capacity
 
     def forward(self, token_indices: torch.Tensor, token_probs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Convert compact top-k indices and probabilities to multihot tensors."""
-        if self.permute_fusion:
-            return fused_indices_to_multihot(token_indices, token_probs, self.num_experts)
+        """Convert compact top-k metadata to dense HybridEP routing tensors.
 
-        batch_size = token_indices.shape[0]
-        routing_map = torch.zeros(
-            (batch_size, self.num_experts),
-            dtype=torch.bool,
-            device=token_indices.device,
+        Args:
+            token_indices: Tensor of shape [tokens, top_k] containing global expert ids, with
+                negative values indicating masked or dropped assignments.
+            token_probs: Tensor of shape [tokens, top_k] containing routing probabilities.
+
+        Returns:
+            Tuple containing:
+                - routing_map: Boolean tensor of shape [tokens, num_experts].
+                - multihot_probs: Tensor of shape [tokens, num_experts] retaining gradients
+                  to selected routing probabilities.
+        """
+        if self.permute_fusion:
+            routing_map, multihot_probs = fused_indices_to_multihot(token_indices, token_probs, self.num_experts)
+        else:
+            batch_size = token_indices.shape[0]
+            valid = (token_indices >= 0) & (token_indices < self.num_experts)
+            safe_indices = token_indices.clamp(min=0, max=self.num_experts - 1)
+            routing_counts = torch.zeros(
+                (batch_size, self.num_experts),
+                dtype=torch.int32,
+                device=token_indices.device,
+            ).scatter_add(1, safe_indices, valid.to(torch.int32))
+            routing_map = routing_counts > 0
+            multihot_probs = torch.zeros(
+                (batch_size, self.num_experts),
+                dtype=torch.float,
+                device=token_indices.device,
+            ).scatter_add(1, safe_indices, token_probs.float() * valid)
+
+        if self.expert_capacity is None:
+            return routing_map, multihot_probs
+
+        if self.expert_capacity > token_indices.shape[0]:
+            raise RuntimeError(
+                "HybridEP expert capacity cannot exceed the number of source tokens: "
+                f"capacity={self.expert_capacity}, tokens={token_indices.shape[0]}"
+            )
+
+        # Match Megatron's drop-and-pad contract: retain the highest-probability
+        # assignments and use zero-probability token slots to fill every expert to
+        # exactly the same source capacity. HybridEP can then allocate and dispatch a
+        # constant number of rows without a CPU synchronization.
+        _, capacity_indices = torch.topk(
+            multihot_probs,
+            k=self.expert_capacity,
+            dim=0,
+            sorted=False,
         )
-        multihot_probs = torch.zeros(
-            (batch_size, self.num_experts),
-            dtype=torch.float,
-            device=token_indices.device,
-        )
-        mask = token_indices != -1
-        valid_indices = token_indices[mask]
-        row_indices = torch.arange(batch_size, device=token_indices.device).repeat_interleave(mask.sum(dim=1))
-        routing_map[row_indices, valid_indices] = True
-        multihot_probs[row_indices, valid_indices] = token_probs[mask]
+        routing_map = torch.zeros_like(routing_map).scatter(0, capacity_indices, True)
+        multihot_probs = multihot_probs * routing_map
         return routing_map, multihot_probs
 
 
@@ -383,6 +428,7 @@ class _HybridEPManager(_DispatchManager):
         self.permute_fusion = permute_fusion
         self.moe_hybridep_num_sms = moe_hybridep_num_sms
         self.num_permuted_tokens = None
+        self.expert_capacity: Optional[int] = None
 
         # Metadata
         self.token_probs: Optional[torch.Tensor] = None
@@ -396,6 +442,25 @@ class _HybridEPManager(_DispatchManager):
                 "HybridEP is not installed. Please install HybridEP package from "
                 "https://github.com/deepseek-ai/DeepEP/tree/hybrid-ep."
             )
+
+    def set_expert_capacity(self, expert_capacity: int) -> None:
+        """Configure the fixed receive shape used by drop-and-pad routing."""
+        if expert_capacity <= 0:
+            raise ValueError("HybridEP expert capacity must be positive")
+        if self.expert_capacity is not None and self.expert_capacity != expert_capacity:
+            raise RuntimeError(
+                "HybridEP expert capacity changed after initialization: "
+                f"expected {self.expert_capacity}, got {expert_capacity}. "
+                "Fixed-capacity MoE CUDA graphs are fail-closed on dynamic token-count changes."
+            )
+        self.expert_capacity = expert_capacity
+        ep_size = self.group.size()
+        self.num_permuted_tokens = expert_capacity * ep_size * self.num_local_experts
+        self.tokens_per_expert = torch.full(
+            (self.num_local_experts,),
+            expert_capacity * ep_size,
+            dtype=torch.long,
+        )
 
     def setup_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor):
         """Process routing map and probabilities to prepare dispatch metadata."""
@@ -438,9 +503,10 @@ class _HybridEPManager(_DispatchManager):
         async_finish: bool = True,  # noqa: ARG002 - not supported by HybridEP backend
         allocate_on_comm_stream: bool = True,  # noqa: ARG002 - not supported by HybridEP backend
     ) -> torch.Tensor:
-        # Reset num_permuted_tokens to None to avoid reusing cached state from a prior dispatch.
-        # This can happen in non-reentrant activation checkpointing mode.
-        self.num_permuted_tokens = None
+        # Dynamic routing must not reuse a prior receive size. Drop-and-pad routing
+        # deliberately preserves its statically configured receive size.
+        if self.expert_capacity is None:
+            self.num_permuted_tokens = None
         if self.token_probs.dtype != torch.float32:
             self.token_probs = self.token_probs.float()
         dispatched_hidden, self.dispatched_probs, _, tokens_per_expert, self.handle = hybrid_ep_dispatch(
@@ -455,8 +521,9 @@ class _HybridEPManager(_DispatchManager):
             pad_multiple=self.pad_multiple,
         )
 
-        self.tokens_per_expert = tokens_per_expert
-        self.num_permuted_tokens = self.tokens_per_expert.sum()
+        if self.expert_capacity is None:
+            self.tokens_per_expert = tokens_per_expert
+            self.num_permuted_tokens = self.tokens_per_expert.sum()
 
         return dispatched_hidden
 
@@ -473,7 +540,8 @@ class _HybridEPManager(_DispatchManager):
             pad_multiple=self.pad_multiple,
         )
         self.handle = None
-        self.num_permuted_tokens = None
+        if self.expert_capacity is None:
+            self.num_permuted_tokens = None
         return hidden_states
 
     def get_dispatched_metadata(self) -> torch.Tensor:
@@ -653,6 +721,13 @@ class MoEFlexTokenDispatcher:
             raise ValueError(
                 f"Invalid backend: {backend}. Please set moe_flex_dispatcher_backend='deepep', 'hybridep', or 'uccl_ep'"
             )
+
+    def set_cuda_graph_expert_capacity(self, expert_capacity: int) -> None:
+        """Configure fixed-capacity HybridEP metadata and communication shapes."""
+        if not isinstance(self._comm_manager, _HybridEPManager) or self.hybridep_metadata_processor is None:
+            raise RuntimeError("Full MoE CUDA graphs with EP>1 require the HybridEP dispatcher")
+        self.hybridep_metadata_processor.set_expert_capacity(expert_capacity)
+        self._comm_manager.set_expert_capacity(expert_capacity)
 
     def _initialize_metadata(self, num_local_tokens: int, probs: torch.Tensor) -> torch.Tensor:
         """

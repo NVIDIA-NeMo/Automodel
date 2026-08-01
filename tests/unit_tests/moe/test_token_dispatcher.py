@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -109,3 +109,89 @@ class TestIndicesToMultihot:
         assert routing_map.shape == (1, 8)
         assert routing_map.sum() == 2
         assert routing_map[0, 0] and routing_map[0, 7]
+
+
+class TestHybridEPFixedCapacity:
+    def test_metadata_drops_and_pads_every_expert_to_capacity(self):
+        processor = _HybridEPMetadataProcessor(num_experts=3, permute_fusion=False)
+        processor.set_expert_capacity(2)
+        indices = torch.tensor([[0, 1], [0, 2], [0, 2], [1, 2]])
+        probs = torch.tensor(
+            [[0.9, 0.1], [0.8, 0.2], [0.3, 0.7], [0.6, 0.4]],
+            requires_grad=True,
+        )
+
+        routing_map, routing_probs = processor(indices, probs)
+
+        torch.testing.assert_close(routing_map.sum(dim=0), torch.full((3,), 2))
+        assert routing_map[:, 0].tolist() == [True, True, False, False]
+        assert routing_map[:, 1].tolist() == [True, False, False, True]
+        assert routing_map[:, 2].tolist() == [False, False, True, True]
+        torch.testing.assert_close(routing_probs.sum(dim=0), torch.tensor([1.7, 0.7, 1.1]))
+
+        routing_probs.sum().backward()
+        torch.testing.assert_close(
+            probs.grad,
+            torch.tensor([[1.0, 1.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]),
+        )
+
+    def test_metadata_capacity_change_fails_closed(self):
+        processor = _HybridEPMetadataProcessor(num_experts=3, permute_fusion=False)
+        processor.set_expert_capacity(2)
+
+        with pytest.raises(RuntimeError, match="fail-closed"):
+            processor.set_expert_capacity(3)
+
+    def test_manager_keeps_static_receive_shape_through_dispatch_and_combine(self):
+        group = Mock()
+        group.size.return_value = 2
+        dispatch_calls = []
+        combine_calls = []
+
+        def fake_dispatch(**kwargs):
+            dispatch_calls.append(kwargs)
+            rows = kwargs["num_permuted_tokens"]
+            hidden = kwargs["x"].new_zeros((rows, kwargs["x"].shape[-1]))
+            probs = kwargs["probs"].new_zeros((rows,))
+            return hidden, probs, None, torch.tensor([3, 5]), ("handle",)
+
+        def fake_combine(**kwargs):
+            combine_calls.append(kwargs)
+            return kwargs["x"]
+
+        with (
+            patch("nemo_automodel.components.moe.megatron.token_dispatcher.hybrid_ep_dispatch", fake_dispatch),
+            patch("nemo_automodel.components.moe.megatron.token_dispatcher.hybrid_ep_combine", fake_combine),
+        ):
+            manager = _HybridEPManager(
+                group=group,
+                num_local_experts=2,
+                num_experts=4,
+                router_topk=2,
+            )
+            manager.set_expert_capacity(2)
+            manager.routing_map = torch.ones(4, 4, dtype=torch.bool)
+            manager.token_probs = torch.ones(4, 4)
+            dispatched = manager.dispatch(torch.ones(4, 8))
+            manager.combine(dispatched)
+
+        assert dispatch_calls[0]["num_permuted_tokens"] == 8
+        assert combine_calls[0]["num_permuted_tokens"] == 8
+        assert manager.num_permuted_tokens == 8
+        torch.testing.assert_close(manager.tokens_per_expert, torch.tensor([4, 4]))
+
+    def test_manager_capacity_change_fails_closed(self):
+        group = Mock()
+        group.size.return_value = 2
+
+        with patch("nemo_automodel.components.moe.megatron.token_dispatcher.hybrid_ep_dispatch", lambda *a, **kw: None):
+            manager = _HybridEPManager(
+                group=group,
+                num_local_experts=2,
+                num_experts=4,
+                router_topk=2,
+            )
+            manager.set_expert_capacity(2)
+
+        with pytest.raises(RuntimeError, match="fail-closed"):
+            manager.set_expert_capacity(3)

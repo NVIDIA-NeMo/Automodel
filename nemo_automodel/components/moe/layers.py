@@ -218,7 +218,19 @@ class _GateRoutingCore(nn.Module):
     """
 
     def forward(self, scores: torch.Tensor, gate: "Gate") -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-        """Select experts and compute routing probabilities from projected scores."""
+        """Select experts and compute routing probabilities from projected scores.
+
+        Args:
+            scores: Tensor of shape [tokens, num_experts] containing projected router logits.
+            gate: Owning gate whose routing policy is applied to ``scores``.
+
+        Returns:
+            Tuple containing:
+                - weights: Tensor of shape [tokens, top_k] containing selected-expert routing weights.
+                - indices: Tensor of shape [tokens, top_k] containing selected expert ids.
+                - original_scores: Tensor of shape [tokens, num_experts] containing the full expert scores used
+                  for load-balancing statistics.
+        """
         return gate._route_scores(scores)
 
 
@@ -309,7 +321,18 @@ class Gate(nn.Module):
         self.use_routing_core = False
 
     def _route_scores(self, scores: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-        """Apply fixed-shape expert selection and probability math to router logits."""
+        """Apply fixed-shape expert selection and probability math to router logits.
+
+        Args:
+            scores: Tensor of shape [tokens, num_experts] containing projected router logits.
+
+        Returns:
+            Tuple containing:
+                - weights: Tensor of shape [tokens, top_k] containing selected-expert routing weights.
+                - indices: Tensor of shape [tokens, top_k] containing selected expert ids.
+                - original_scores: Tensor of shape [tokens, num_experts] containing the full expert scores used
+                  for load-balancing statistics.
+        """
         num_tokens = scores.size(0)
 
         if self.score_func == "softmax":
@@ -668,7 +691,24 @@ class MoE(nn.Module):
         else:
             self.gate = Gate(config, gate_precision=backend.gate_precision)
             self.gate.use_routing_core = "moe_router" in backend.cuda_graph.modules
-        if backend.dispatcher in ("deepep", "hybridep", "uccl_ep") and get_world_size_safe() == 1:
+        world_size = get_world_size_safe()
+        local_fixed_te_moe = (
+            backend.experts == "te"
+            and "moe" in backend.cuda_graph.modules
+            and (backend.dispatcher == "torch" or (backend.dispatcher == "hybridep" and world_size == 1))
+        )
+        if local_fixed_te_moe:
+            # EP=1 fixed-capacity execution uses local TE experts even when the
+            # surrounding transformer block is sharded over a data-parallel FSDP2 mesh.
+            self.experts = GroupedExpertsTE(
+                config,
+                backend=backend,
+                dispatcher_backend=backend.dispatcher,
+                dispatcher_num_sms=backend.dispatcher_num_sms,
+                dispatcher_share_token_dispatcher=backend.dispatcher_share_token_dispatcher,
+                dispatcher_async_dispatch=backend.dispatcher_async_dispatch,
+            )
+        elif backend.dispatcher in ("deepep", "hybridep", "uccl_ep") and world_size == 1:
             warnings.warn(
                 f"'{backend.dispatcher}' dispatcher is enabled in config, but world size is 1. "
                 "Expert parallelism requires multiple GPUs. Falling back to standard GroupedExperts.",
