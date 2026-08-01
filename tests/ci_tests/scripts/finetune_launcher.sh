@@ -16,7 +16,7 @@
 #
 # Env required: CONFIG_PATH, PIPELINE_DIR, TEST_NAME, TEST_LEVEL, TEST_SCRIPT_PATH,
 #   TEST_NODE_COUNT, NPROC_PER_NODE, MASTER_ADDR, MASTER_PORT, SLURM_JOB_ID, SLURM_NODEID, HAS_ROBUSTNESS
-# Env optional: EXEC_CMD, RDZV_TIMEOUT, MAX_STEPS, LOCAL_BATCH_SIZE,
+# Env optional: EXEC_CMD, RDZV_TIMEOUT, SKIP_FINETUNE, MAX_STEPS, LOCAL_BATCH_SIZE,
 #   CONFIG_NPROC_PER_NODE, FINETUNE_ARGS, NEMO_CI_PATH, WANDB_AUTOMODEL_API_KEY, TIME
 
 cd /opt/Automodel
@@ -59,10 +59,17 @@ echo "[finetune] Running finetune..."
 echo "============================================"
 FINETUNE_START=$SECONDS
 
-eval $RUN_CMD
-FINETUNE_EXIT_CODE=$?
+if [[ "${SKIP_FINETUNE:-false}" == "true" ]]; then
+  echo "[finetune] Skipped by SKIP_FINETUNE=true"
+  FINETUNE_EXIT_CODE=0
+else
+  eval $RUN_CMD
+  FINETUNE_EXIT_CODE=$?
+fi
 
-if [[ "$FINETUNE_EXIT_CODE" -eq 0 && "${REQUIRE_FINITE_METRICS:-false}" == "true" ]]; then
+if [[ "${SKIP_FINETUNE:-false}" != "true" \
+  && "$FINETUNE_EXIT_CODE" -eq 0 \
+  && "${REQUIRE_FINITE_METRICS:-false}" == "true" ]]; then
   python3 /opt/Automodel/tests/ci_tests/scripts/assert_finite_train_metrics.py \
     --log "$PIPELINE_DIR/${TEST_NAME}_slurm_${SLURM_JOB_ID}.out" \
     || FINETUNE_EXIT_CODE=$?
@@ -104,7 +111,7 @@ if [[ "$HAS_ROBUSTNESS" == "true" ]]; then
   esac
 
   ROBUSTNESS_LAUNCH_CMD="$CMD"
-  if [[ "$CMD" == torchrun* ]]; then
+  if [[ "$CMD" == torchrun* && "${SKIP_FINETUNE:-false}" != "true" ]]; then
     # The elastic c10d rendezvous cannot be restarted reliably in the same Slurm step.
     # Slurm already assigns a stable node rank, so use a fresh static endpoint instead.
     ROBUSTNESS_MASTER_PORT=$((MASTER_PORT + 1))
