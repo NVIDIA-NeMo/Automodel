@@ -389,8 +389,13 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                     logger.debug("Optimizer step")
 
             # Match the training-loop lifecycle: record one complete eager
-            # optimizer step, then capture outside the measured iteration.
+            # optimizer step, then capture outside the measured iteration. The
+            # training recipe has already cleared gradients at this point; do
+            # the same here so graph staging does not overlap a complete model
+            # gradient set with its long-lived static input surfaces.
             if self.partial_cuda_graph_manager is not None and self._partial_cuda_graph_capture_pending:
+                for opt in self.optimizer:
+                    opt.zero_grad(set_to_none=True)
                 stash_manager = None
                 if self._partial_cuda_graph_paged_stash_enabled:
                     from nemo_automodel.components.moe.paged_stash import get_paged_stash_manager
@@ -400,7 +405,22 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                     logger.info("Partial MoE paged stash prepared: %s", stash_manager.diagnostics())
                 self.partial_cuda_graph_manager.capture()
                 if stash_manager is not None:
-                    overflow_ranks = self._paged_stash_overflow_rank_count(stash_manager)
+                    overflow_ranks, host_spill_ranks, imbalance_ranks = self._paged_stash_rank_counts(stash_manager)
+                    if host_spill_ranks:
+                        logger.info(
+                            "MoE paged stash used pinned-host pages during capture on %d ranks",
+                            host_spill_ranks,
+                        )
+                    if imbalance_ranks:
+                        self.partial_cuda_graph_manager.close()
+                        self.partial_cuda_graph_manager = None
+                        stash_manager.close()
+                        self._partial_cuda_graph_paged_stash_enabled = False
+                        self._partial_cuda_graph_capture_pending = False
+                        raise RuntimeError(
+                            "MoE paged stash did not recover every page during CUDA graph capture on "
+                            f"{imbalance_ranks} ranks; partial CUDA graphs were disabled"
+                        )
                     if overflow_ranks:
                         self.partial_cuda_graph_manager.close()
                         self.partial_cuda_graph_manager = None

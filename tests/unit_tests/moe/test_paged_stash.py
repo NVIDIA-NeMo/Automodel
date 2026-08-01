@@ -146,35 +146,94 @@ def test_recording_rejects_invalid_live_mask(live_mask):
 
 def test_configuration_is_idempotent_and_can_restart_recording():
     manager = paged_stash.PagedStashManager()
-    manager.configure(enabled=True, page_size=32, buffer_size_factor=1.25)
-    manager.configure(enabled=True, page_size=32, buffer_size_factor=1.25)
+    manager.configure(enabled=True, page_size=32, buffer_size_factor=0.25, host_buffer_size_factor=0.8)
+    manager.configure(enabled=True, page_size=32, buffer_size_factor=0.25, host_buffer_size_factor=0.8)
     with pytest.raises(RuntimeError, match="same page_size"):
-        manager.configure(enabled=True, page_size=64, buffer_size_factor=1.25)
+        manager.configure(enabled=True, page_size=64, buffer_size_factor=0.25, host_buffer_size_factor=0.8)
 
     manager.restart_recording()
     diagnostics = manager.diagnostics()
     assert diagnostics["state"] == "recording"
     assert diagnostics["page_size"] == 32
-    assert diagnostics["buffer_size_factor"] == 1.25
+    assert diagnostics["buffer_size_factor"] == 0.25
+    assert diagnostics["host_buffer_size_factor"] == 0.8
     manager.close()
 
 
-@pytest.mark.parametrize("invalid_factor", [0, 0.5, float("nan"), float("inf")])
-def test_configuration_rejects_buffer_factors_that_cannot_hold_warmup(invalid_factor):
+@pytest.mark.parametrize("invalid_factor", [0, float("nan"), float("inf")])
+def test_configuration_rejects_invalid_cuda_buffer_factors(invalid_factor):
     manager = paged_stash.PagedStashManager()
 
-    with pytest.raises(ValueError, match="finite and at least 1.0"):
+    with pytest.raises(ValueError, match="positive and finite"):
         manager.configure(enabled=True, buffer_size_factor=invalid_factor)
+
+
+@pytest.mark.parametrize("invalid_factor", [-0.1, float("nan"), float("inf")])
+def test_configuration_rejects_invalid_host_buffer_factors(invalid_factor):
+    manager = paged_stash.PagedStashManager()
+
+    with pytest.raises(ValueError, match="non-negative and finite"):
+        manager.configure(enabled=True, host_buffer_size_factor=invalid_factor)
+
+
+def test_configuration_requires_combined_capacity_for_warmup():
+    manager = paged_stash.PagedStashManager()
+
+    with pytest.raises(ValueError, match="at least 1.0x total capacity"):
+        manager.configure(enabled=True, buffer_size_factor=0.5, host_buffer_size_factor=0.4)
 
 
 def test_device_overflow_api_does_not_require_host_read():
     manager = paged_stash.PagedStashManager()
     assert manager.check_overflow() is None
+    assert manager.check_host_spill() is None
+    assert manager.check_allocator_imbalance() is None
     manager._overflow = torch.ones(1, dtype=torch.int64)
+    manager._host_spill = torch.ones(1, dtype=torch.int64)
     assert manager.check_overflow() is manager._overflow
+    assert manager.check_host_spill() is manager._host_spill
+    manager.clear_host_spill()
+    assert manager._host_spill.item() == 0
     with pytest.raises(paged_stash.PagedStashOverflowError):
         manager.finish_iteration()
     manager._overflow = None
+    manager._host_spill = None
+
+
+def test_allocator_balance_uses_ring_availability_not_equal_cursors():
+    manager = paged_stash.PagedStashManager()
+    manager._overflow = torch.zeros(1, dtype=torch.int64)
+    manager._buffers = {
+        (torch.float32, 4): SimpleNamespace(
+            head=torch.tensor([2, 3]),
+            tail=torch.tensor([7, 9]),
+            capacity=torch.tensor([5, 6]),
+        )
+    }
+
+    assert manager.check_allocator_imbalance().item() == 0
+    manager.finish_iteration()
+
+    manager._buffers[(torch.float32, 4)].tail[1] -= 1
+    assert manager.check_allocator_imbalance().item() == 1
+    with pytest.raises(RuntimeError, match="did not recover every CUDA/host page"):
+        manager.finish_iteration()
+
+
+def test_recorded_placement_accounts_for_whole_tensor_tiers():
+    manager = paged_stash.PagedStashManager()
+    key = (torch.float32, 4)
+    manager._recorded_events[key] = [
+        ("allocate", 0, 4),
+        ("allocate", 1, 6),
+        ("release", 1, 6),
+        ("release", 0, 4),
+    ]
+
+    with pytest.raises(RuntimeError, match="free pages are not fungible"):
+        manager._validate_recorded_placement(key, cuda_capacity=6, host_capacity=4)
+
+    manager._validate_recorded_placement(key, cuda_capacity=4, host_capacity=6)
 
 
 def test_reload_rejects_non_lifo_backward_order():

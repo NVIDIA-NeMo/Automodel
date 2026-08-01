@@ -174,7 +174,11 @@ class CudaGraphConfig:
             scope and expert inputs that participate in autograd.
         moe_paged_stash_page_size: Number of token rows per paged-stash page.
         moe_paged_stash_buffer_size_factor: Multiplicative page-buffer headroom
-            over the iteration-0 observed peak. Must be finite and at least one.
+            over the iteration-0 observed peak allocated in CUDA memory. It may
+            be below one when host spill supplies the remaining capacity.
+        moe_paged_stash_buffer_size_factor_cpu: Fraction of the iteration-0
+            observed peak allocated in pinned host memory. Zero disables host
+            spill; CUDA and host factors must sum to at least one.
     """
 
     modules: list[Literal["attn", "te_dpa", "moe", "moe_router", "moe_preprocess"]] = field(default_factory=list)
@@ -182,6 +186,7 @@ class CudaGraphConfig:
     moe_paged_stash: bool = False
     moe_paged_stash_page_size: int = 64
     moe_paged_stash_buffer_size_factor: float = 1.1
+    moe_paged_stash_buffer_size_factor_cpu: float = 0.0
 
     def __post_init__(self) -> None:
         """Validate the declarative CUDA-graph configuration."""
@@ -226,9 +231,19 @@ class CudaGraphConfig:
                 isinstance(factor, bool)
                 or not isinstance(factor, (int, float))
                 or not math.isfinite(float(factor))
-                or factor < 1.0
+                or factor <= 0.0
             ):
-                raise ValueError("cuda_graph.moe_paged_stash_buffer_size_factor must be finite and at least 1.0")
+                raise ValueError("cuda_graph.moe_paged_stash_buffer_size_factor must be positive and finite")
+            host_factor = self.moe_paged_stash_buffer_size_factor_cpu
+            if (
+                isinstance(host_factor, bool)
+                or not isinstance(host_factor, (int, float))
+                or not math.isfinite(float(host_factor))
+                or host_factor < 0.0
+            ):
+                raise ValueError("cuda_graph.moe_paged_stash_buffer_size_factor_cpu must be non-negative and finite")
+            if factor + host_factor < 1.0:
+                raise ValueError("CUDA and host paged-stash buffer factors must provide at least 1.0x total capacity")
 
 
 @dataclass(kw_only=True)

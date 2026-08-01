@@ -425,8 +425,11 @@ class TestBenchmarkingRecipeRunBenchmark:
             assert mock_recipe._forward_backward_step.call_count == 30 * expected_ga_steps
 
     def test_run_benchmark_zero_grads_per_iteration(self, mock_recipe):
-        """Test that gradients are zeroed at the start of each iteration."""
+        """Test that capture also clears the completed eager step's gradients."""
         mock_recipe._get_dp_group_size = MagicMock(return_value=8)
+        graph_manager = MagicMock()
+        mock_recipe.partial_cuda_graph_manager = graph_manager
+        mock_recipe._partial_cuda_graph_capture_pending = True
 
         # Mock _forward_backward_step to append loss to loss_buffer
         def mock_forward_backward_step(ga_step_idx, batch, loss_buffer=None, **kwargs):
@@ -463,8 +466,11 @@ class TestBenchmarkingRecipeRunBenchmark:
         with patch("torch.distributed.barrier"):
             mock_recipe.run_benchmark()
 
-            # Should be called 30 times (once per iteration)
-            assert mock_recipe.optimizer[0].zero_grad.call_count == 30
+            # Thirty iteration-start clears plus one post-step clear immediately
+            # before the first partial CUDA graph capture.
+            assert mock_recipe.optimizer[0].zero_grad.call_count == 31
+            assert mock_recipe.optimizer[0].zero_grad.call_args_list[1].kwargs == {"set_to_none": True}
+            graph_manager.capture.assert_called_once_with()
 
     def test_run_benchmark_optimizer_step_per_iteration(self, mock_recipe):
         """Test that optimizer step is called once per iteration."""
@@ -476,6 +482,8 @@ class TestBenchmarkingRecipeRunBenchmark:
         stash_manager = MagicMock()
         stash_manager.is_active = False
         stash_manager.check_overflow.return_value = torch.zeros(1, dtype=torch.int64)
+        stash_manager.check_host_spill.return_value = torch.zeros(1, dtype=torch.int64)
+        stash_manager.check_allocator_imbalance.return_value = torch.zeros(1, dtype=torch.int64)
 
         # Mock _forward_backward_step to append loss to loss_buffer
         def mock_forward_backward_step(ga_step_idx, batch, loss_buffer=None, **kwargs):

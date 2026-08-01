@@ -37,6 +37,7 @@ def _bare_recipe() -> TrainFinetuneRecipeForNextTokenPrediction:
     recipe.partial_cuda_graph_manager = None
     recipe._partial_cuda_graph_capture_pending = False
     recipe._partial_cuda_graph_paged_stash_enabled = False
+    recipe._partial_cuda_graph_logged_host_spill = False
     return recipe
 
 
@@ -90,6 +91,8 @@ def test_builder_forwards_runtime_safety_context(monkeypatch):
     discover.assert_called_once_with(
         model_parts,
         activation_checkpointing=True,
+        activation_checkpointing_modules=None,
+        activation_checkpointing_scope=("all",),
         pipeline_parallel=False,
     )
     assert result is manager
@@ -109,11 +112,39 @@ def test_builder_does_not_use_manager_when_no_scope_is_enabled(monkeypatch):
     discover.assert_not_called()
 
 
+def test_builder_forwards_attention_checkpoint_boundary(monkeypatch):
+    model_parts = [nn.Linear(2, 2)]
+    model_parts[0].backend = SimpleNamespace(cuda_graph=SimpleNamespace(modules=["moe"]))
+    manager = SimpleNamespace(capture=MagicMock())
+    discover = MagicMock(return_value=manager)
+    monkeypatch.setattr(partial_graphs.PartialCudaGraphManager, "from_model_parts", discover)
+
+    result = _build_partial_cuda_graph_manager(
+        model_parts,
+        activation_checkpointing=True,
+        activation_checkpointing_modules=("attn",),
+        activation_checkpointing_scope=("language",),
+        pipeline_parallel=False,
+    )
+
+    discover.assert_called_once_with(
+        model_parts,
+        activation_checkpointing=True,
+        activation_checkpointing_modules=("attn",),
+        activation_checkpointing_scope=("language",),
+        pipeline_parallel=False,
+    )
+    assert result is manager
+
+
 def test_paged_stash_is_prepared_before_partial_capture(monkeypatch):
     events = []
     stash = SimpleNamespace(
         prepare=lambda: events.append("prepare"),
         check_overflow=lambda: torch.zeros(1, dtype=torch.int64),
+        check_host_spill=lambda: torch.zeros(1, dtype=torch.int64),
+        check_allocator_imbalance=lambda: torch.zeros(1, dtype=torch.int64),
+        clear_host_spill=lambda: None,
         finish_iteration=lambda: events.append("finish"),
         diagnostics=lambda: {},
         close=lambda: events.append("stash-close"),
@@ -138,15 +169,18 @@ def test_capture_overflow_is_reduced_before_all_ranks_close_graphs(monkeypatch):
     stash = SimpleNamespace(
         prepare=lambda: events.append("prepare"),
         check_overflow=lambda: torch.zeros(1, dtype=torch.int64),
+        check_host_spill=lambda: torch.zeros(1, dtype=torch.int64),
+        check_allocator_imbalance=lambda: torch.zeros(1, dtype=torch.int64),
+        clear_host_spill=lambda: None,
         finish_iteration=lambda: events.append("finish"),
         diagnostics=lambda: {},
         close=lambda: events.append("stash-close"),
     )
 
-    def all_reduce(overflow_ranks, *, op):
+    def all_reduce(rank_flags, *, op):
         assert op is torch.distributed.ReduceOp.SUM
         events.append("all-reduce")
-        overflow_ranks.fill_(2)
+        rank_flags.copy_(torch.tensor([2, 0, 0], dtype=torch.int32))
 
     monkeypatch.setattr(paged_stash, "get_paged_stash_manager", lambda: stash)
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
@@ -168,11 +202,73 @@ def test_capture_overflow_is_reduced_before_all_ranks_close_graphs(monkeypatch):
     assert recipe._partial_cuda_graph_paged_stash_enabled is False
 
 
+def test_paged_stash_host_spill_is_consumed_without_disabling_graphs(monkeypatch):
+    clear_host_spill = MagicMock()
+    finish_iteration = MagicMock()
+    stash = SimpleNamespace(
+        is_active=True,
+        check_overflow=lambda: torch.zeros(1, dtype=torch.int64),
+        check_host_spill=lambda: torch.ones(1, dtype=torch.int64),
+        check_allocator_imbalance=lambda: torch.zeros(1, dtype=torch.int64),
+        clear_host_spill=clear_host_spill,
+        finish_iteration=finish_iteration,
+    )
+    monkeypatch.setattr(paged_stash, "get_paged_stash_manager", lambda: stash)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+    recipe = _bare_recipe()
+    recipe._partial_cuda_graph_paged_stash_enabled = True
+
+    loss_buffer = [torch.tensor(1.0)]
+    result = recipe._rerun_after_paged_stash_overflow(
+        ["same-batch"],
+        num_label_tokens=7,
+        loss_buffer=loss_buffer,
+        rng_state=None,
+    )
+
+    assert result is loss_buffer
+    assert recipe._partial_cuda_graph_logged_host_spill is True
+    clear_host_spill.assert_called_once_with()
+    finish_iteration.assert_called_once_with()
+
+
+def test_paged_stash_allocator_imbalance_disables_graphs(monkeypatch):
+    events = []
+    stash = SimpleNamespace(
+        is_active=True,
+        check_overflow=lambda: torch.zeros(1, dtype=torch.int64),
+        check_host_spill=lambda: torch.zeros(1, dtype=torch.int64),
+        check_allocator_imbalance=lambda: torch.ones(1, dtype=torch.int64),
+        clear_host_spill=lambda: events.append("clear-host-spill"),
+        close=lambda: events.append("stash-close"),
+    )
+    monkeypatch.setattr(paged_stash, "get_paged_stash_manager", lambda: stash)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+    recipe = _bare_recipe()
+    recipe.partial_cuda_graph_manager = SimpleNamespace(close=lambda: events.append("graph-close"))
+    recipe._partial_cuda_graph_capture_pending = False
+    recipe._partial_cuda_graph_paged_stash_enabled = True
+
+    with pytest.raises(RuntimeError, match="did not recover every CUDA/host page"):
+        recipe._rerun_after_paged_stash_overflow(
+            ["same-batch"],
+            num_label_tokens=7,
+            loss_buffer=[torch.tensor(1.0)],
+            rng_state=None,
+        )
+
+    assert events == ["clear-host-spill", "graph-close", "stash-close"]
+    assert recipe.partial_cuda_graph_manager is None
+
+
 def test_paged_stash_overflow_closes_graph_discards_gradients_and_reruns(monkeypatch):
     events = []
     stash = SimpleNamespace(
         is_active=True,
         check_overflow=lambda: torch.ones(1, dtype=torch.int64),
+        check_host_spill=lambda: torch.zeros(1, dtype=torch.int64),
+        check_allocator_imbalance=lambda: torch.zeros(1, dtype=torch.int64),
+        clear_host_spill=lambda: None,
         close=lambda: events.append("stash-close"),
     )
     monkeypatch.setattr(paged_stash, "get_paged_stash_manager", lambda: stash)
@@ -224,6 +320,9 @@ def test_overflow_retry_reproduces_python_numpy_and_torch_rng(monkeypatch):
     stash = SimpleNamespace(
         is_active=True,
         check_overflow=lambda: torch.ones(1, dtype=torch.int64),
+        check_host_spill=lambda: torch.zeros(1, dtype=torch.int64),
+        check_allocator_imbalance=lambda: torch.zeros(1, dtype=torch.int64),
+        clear_host_spill=lambda: None,
         close=lambda: None,
     )
     monkeypatch.setattr(paged_stash, "get_paged_stash_manager", lambda: stash)
