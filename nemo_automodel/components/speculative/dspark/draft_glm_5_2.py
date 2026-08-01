@@ -40,9 +40,9 @@ from nemo_automodel.components.models.common import initialize_rms_norm_module
 from nemo_automodel.components.models.deepseek_v3.rope_utils import (
     apply_rotary_emb,
     freqs_cis_from_position_ids,
-    mla_softmax_scale,
     precompute_freqs_cis,
 )
+from nemo_automodel.components.models.glm_moe_dsa.rope_utils import mla_softmax_scale
 from nemo_automodel.components.speculative.dspark._sampling import sample_tokens
 from nemo_automodel.components.speculative.dspark.common import (
     AcceptRatePredictor,

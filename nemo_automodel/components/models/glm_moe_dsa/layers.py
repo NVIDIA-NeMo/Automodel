@@ -69,10 +69,7 @@ from nemo_automodel.components.models.common import (
     initialize_linear_module,
     initialize_rms_norm_module,
 )
-from nemo_automodel.components.models.deepseek_v3.rope_utils import (
-    apply_rotary_emb,
-    mla_softmax_scale,
-)
+from nemo_automodel.components.models.deepseek_v3.rope_utils import apply_rotary_emb
 from nemo_automodel.components.models.glm_moe_dsa.cp import glm_dsa_cp_all_gather, glm_dsa_cp_enabled
 from nemo_automodel.components.models.glm_moe_dsa.optimized_kernels import (
     is_dsa_kernel_available,
@@ -80,6 +77,7 @@ from nemo_automodel.components.models.glm_moe_dsa.optimized_kernels import (
     tilelang_indexer_topk,
     tilelang_sparse_attention,
 )
+from nemo_automodel.components.models.glm_moe_dsa.rope_utils import mla_softmax_scale
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
