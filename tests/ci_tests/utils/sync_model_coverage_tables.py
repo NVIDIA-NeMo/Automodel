@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Literal, cast
 from urllib.parse import urlparse
 
-HOMEPAGE_ROW_COUNT = 9
+TABLE_ROW_COUNT = 9
 HOMEPAGE_START_MARKER = "{/* BEGIN GENERATED LATEST MODEL SUPPORT */}"
 HOMEPAGE_END_MARKER = "{/* END GENERATED LATEST MODEL SUPPORT */}"
 RELEASE_LOG_START_MARKER = "{/* BEGIN GENERATED MODEL RELEASE LOG */}"
@@ -48,7 +48,7 @@ class _ModelRelease:
     hf_model_id: str
     docs_page: str
     modality: str
-    recipe: str | None
+    recipe: str
     brev_status: _BrevStatus
     brev_url: str | None
 
@@ -135,24 +135,19 @@ def _load_model_releases(catalog_path: Path, repo_root: Path) -> list[_ModelRele
         seen_models.add(model)
         seen_hf_model_ids.add(hf_model_id)
 
-        recipe_value = raw_entry.get("recipe")
-        if recipe_value is not None and not isinstance(recipe_value, str):
-            raise ValueError(f"Model release {index} recipe must be a string or null")
-        recipe = recipe_value
-        if recipe is not None:
-            recipe_path = Path(recipe)
-            if (
-                MARKDOWN_UNSAFE_PATTERN.search(recipe)
-                or recipe_path.is_absolute()
-                or not RECIPE_PATH_PATTERN.fullmatch(recipe)
-                or not recipe_path.parts
-                or recipe_path.parts[0] != "examples"
-                or ".." in recipe_path.parts
-                or recipe_path.suffix != ".yaml"
-            ):
-                raise ValueError(f"Model release {index} has invalid recipe path {recipe!r}")
-            if not (repo_root / recipe_path).is_file():
-                raise ValueError(f"Recipe for {model} does not exist in this checkout: {recipe}")
+        recipe = _require_catalog_text(raw_entry, "recipe", index)
+        recipe_path = Path(recipe)
+        if (
+            recipe_path.is_absolute()
+            or not RECIPE_PATH_PATTERN.fullmatch(recipe)
+            or not recipe_path.parts
+            or recipe_path.parts[0] != "examples"
+            or ".." in recipe_path.parts
+            or recipe_path.suffix != ".yaml"
+        ):
+            raise ValueError(f"Model release {index} has invalid recipe path {recipe!r}")
+        if not (repo_root / recipe_path).is_file():
+            raise ValueError(f"Recipe for {model} does not exist in this checkout: {recipe}")
 
         brev_status_value = raw_entry.get("brev_status")
         if brev_status_value not in {"available", "planned", "unavailable"}:
@@ -190,8 +185,6 @@ def _load_model_releases(catalog_path: Path, repo_root: Path) -> list[_ModelRele
 
 
 def _render_recipe_link(release: _ModelRelease) -> str:
-    if release.recipe is None:
-        return "Documentation only"
     return f"[{Path(release.recipe).name}]({REPOSITORY_URL}/{release.recipe})"
 
 
@@ -216,8 +209,20 @@ def _render_release_table(releases: list[_ModelRelease]) -> str:
     )
 
 
-def _render_release_log_table(releases: list[_ModelRelease]) -> str:
-    preferred_modalities = ("LLM", "VLM", "Omni", "dLLM", "Multimodal", "Diffusion", "Encoder-Decoder")
+def _render_release_tabs(releases: list[_ModelRelease]) -> str:
+    if len(releases) < TABLE_ROW_COUNT:
+        raise ValueError(f"Model release catalog contains only {len(releases)} releases")
+
+    preferred_modalities = (
+        "LLM",
+        "VLM",
+        "Omni",
+        "dLLM",
+        "Multimodal",
+        "Diffusion",
+        "Encoder-Decoder",
+        "Retriever",
+    )
     preferred_modality_order = {modality: index for index, modality in enumerate(preferred_modalities)}
     modalities = sorted(
         {release.modality for release in releases},
@@ -230,31 +235,18 @@ def _render_release_log_table(releases: list[_ModelRelease]) -> str:
         (modality, [release for release in releases if release.modality == modality]) for modality in modalities
     ]
     tab_blocks = [
-        "\n".join([f'<Tab title="{title}">', "", _render_release_table(tab_releases), "", "</Tab>"])
+        "\n".join([f'<Tab title="{title}">', "", _render_release_table(tab_releases[:TABLE_ROW_COUNT]), "", "</Tab>"])
         for title, tab_releases in tabs
     ]
-    return "\n\n".join([RELEASE_LOG_START_MARKER, "<Tabs>", *tab_blocks, "</Tabs>", RELEASE_LOG_END_MARKER])
+    return "\n\n".join(["<Tabs>", *tab_blocks, "</Tabs>"])
+
+
+def _render_release_log_table(releases: list[_ModelRelease]) -> str:
+    return "\n\n".join([RELEASE_LOG_START_MARKER, _render_release_tabs(releases), RELEASE_LOG_END_MARKER])
 
 
 def _render_homepage_table(releases: list[_ModelRelease]) -> str:
-    runnable_releases = [release for release in releases if release.recipe is not None]
-    if len(runnable_releases) < HOMEPAGE_ROW_COUNT:
-        raise ValueError(f"Model release catalog contains only {len(runnable_releases)} runnable recipes")
-
-    table_rows = [
-        f"| {release.release_date} | {release.modality} | {_render_model_with_recipe(release)} |"
-        for release in runnable_releases[:HOMEPAGE_ROW_COUNT]
-    ]
-
-    return "\n".join(
-        [
-            HOMEPAGE_START_MARKER,
-            "| Date | Modality | Model |",
-            "|------|----------|-------|",
-            *table_rows,
-            HOMEPAGE_END_MARKER,
-        ]
-    )
+    return "\n\n".join([HOMEPAGE_START_MARKER, _render_release_tabs(releases), HOMEPAGE_END_MARKER])
 
 
 def _parse_registry_entries(source: str) -> list[tuple[str, str, str]]:

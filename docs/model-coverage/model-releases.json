@@ -63,6 +63,15 @@
     "brev_status": "planned"
   },
   {
+    "date": "2026-06-27",
+    "model": "Llama Nemotron Embed VL 1B v2",
+    "hf_model_id": "nvidia/llama-nemotron-embed-vl-1b-v2",
+    "docs_page": "/model-coverage/embedding-models/llama-bidirectional",
+    "modality": "Retriever",
+    "recipe": "examples/retrieval/bi_encoder/nemotron_vl_1b/nemotron_vl_1b_example.yaml",
+    "brev_status": "planned"
+  },
+  {
     "date": "2026-06-21",
     "model": "GLM-5.2",
     "hf_model_id": "zai-org/GLM-5.2",
@@ -167,7 +176,7 @@
     "hf_model_id": "stepfun-ai/Step-3.7-Flash",
     "docs_page": "/model-coverage/vision-language-models/step-3-7-flash",
     "modality": "VLM",
-    "recipe": null,
+    "recipe": "examples/vlm_finetune/stepfun/step3p7_medpix_200b_ep32pp4.yaml",
     "brev_status": "planned"
   },
   {

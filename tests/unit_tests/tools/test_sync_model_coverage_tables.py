@@ -51,6 +51,11 @@ def _collect_fern_routes(items: list[dict[str, object]], parents: tuple[str, ...
     return routes
 
 
+def _tab_table_rows(document: str, title: str) -> list[str]:
+    tab_content = document.split(f'<Tab title="{title}">', 1)[1].split("</Tab>", 1)[0]
+    return [line for line in tab_content.splitlines() if re.match(r"\| \d{4}-\d{2}-\d{2} \|", line)]
+
+
 def test_registry_table_is_generated_from_mapping_entries():
     source = """
 from collections import OrderedDict
@@ -105,6 +110,8 @@ def test_sync_tables_writes_release_log_homepage_and_registry(tmp_path):
     (tmp_path / "docs" / "model-coverage").mkdir(parents=True)
     (tmp_path / "nemo_automodel" / "_transformers").mkdir(parents=True)
     (tmp_path / "examples").mkdir()
+    shared_recipe = "examples/shared.yaml"
+    (tmp_path / shared_recipe).write_text("model: test\n", encoding="utf-8")
 
     releases = [
         {
@@ -113,12 +120,12 @@ def test_sync_tables_writes_release_log_homepage_and_registry(tmp_path):
             "hf_model_id": "org/documentation-model",
             "docs_page": "/model-coverage/vision-language-models/documentation-model",
             "modality": "VLM",
-            "recipe": None,
+            "recipe": shared_recipe,
             "brev_status": "available",
             "brev_url": "https://brev.nvidia.com/launchable/deploy/now?launchableID=test",
         }
     ]
-    for modality in ("Omni", "dLLM", "Multimodal", "Diffusion", "Encoder-Decoder"):
+    for modality in ("Omni", "dLLM", "Multimodal", "Diffusion", "Encoder-Decoder", "Retriever"):
         modality_slug = modality.lower().replace(" ", "-")
         releases.append(
             {
@@ -127,11 +134,11 @@ def test_sync_tables_writes_release_log_homepage_and_registry(tmp_path):
                 "hf_model_id": f"org/{modality_slug}-model",
                 "docs_page": f"/model-coverage/{modality_slug}/model",
                 "modality": modality,
-                "recipe": None,
+                "recipe": shared_recipe,
                 "brev_status": "planned",
             }
         )
-    for index in range(9):
+    for index in range(10):
         recipe_path = f"examples/model_{index}.yaml"
         (tmp_path / recipe_path).write_text("model: test\n", encoding="utf-8")
         releases.append(
@@ -170,9 +177,9 @@ def test_sync_tables_writes_release_log_homepage_and_registry(tmp_path):
     assert (
         "| 2026-07-31 | VLM | "
         "[Documentation-model](/model-coverage/vision-language-models/documentation-model) "
-        "(Documentation only) |"
+        "([shared.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/shared.yaml)) |"
     ) in release_log
-    assert re.findall(r'<Tab title="([^"]+)">', release_log) == [
+    expected_tabs = [
         "All",
         "LLM",
         "VLM",
@@ -181,7 +188,17 @@ def test_sync_tables_writes_release_log_homepage_and_registry(tmp_path):
         "Multimodal",
         "Diffusion",
         "Encoder-Decoder",
+        "Retriever",
     ]
+    assert re.findall(r'<Tab title="([^"]+)">', release_log) == expected_tabs
+    homepage = (tmp_path / "docs" / "index.mdx").read_text(encoding="utf-8")
+    assert re.findall(r'<Tab title="([^"]+)">', homepage) == expected_tabs
+    for document in (release_log, homepage):
+        for tab in expected_tabs:
+            assert len(_tab_table_rows(document, tab)) <= 9
+        assert "Documentation only" not in document
+    assert len(_tab_table_rows(release_log, "All")) == 9
+    assert len(_tab_table_rows(release_log, "LLM")) == 9
     llm_tab = release_log.split('<Tab title="LLM">', 1)[1].split("</Tab>", 1)[0]
     vlm_tab = release_log.split('<Tab title="VLM">', 1)[1].split("</Tab>", 1)[0]
     assert "[Model-0](/model-coverage/large-language-models/model-0)" in llm_tab
@@ -191,10 +208,8 @@ def test_sync_tables_writes_release_log_homepage_and_registry(tmp_path):
     assert "Documentation Model" not in release_log
     assert "Try on Brev" not in release_log
     assert "brev.nvidia.com" not in release_log
-    assert "[Model-0](/model-coverage/large-language-models/model-0)" in (tmp_path / "docs" / "index.mdx").read_text(
-        encoding="utf-8"
-    )
-    assert "Documentation Model" not in (tmp_path / "docs" / "index.mdx").read_text(encoding="utf-8")
+    assert "[Model-0](/model-coverage/large-language-models/model-0)" in homepage
+    assert "Documentation Model" not in homepage
     assert "| `NewModel` | `models.new.NewModel` |" in (
         tmp_path / "docs" / "model-coverage" / "overview.mdx"
     ).read_text(encoding="utf-8")
@@ -202,6 +217,9 @@ def test_sync_tables_writes_release_log_homepage_and_registry(tmp_path):
 
 
 def test_model_release_catalog_rejects_non_chronological_entries(tmp_path):
+    (tmp_path / "examples").mkdir()
+    recipe_path = "examples/model.yaml"
+    (tmp_path / recipe_path).write_text("model: test\n", encoding="utf-8")
     catalog = [
         {
             "date": "2026-07-29",
@@ -209,7 +227,7 @@ def test_model_release_catalog_rejects_non_chronological_entries(tmp_path):
             "hf_model_id": "org/older-model",
             "docs_page": "/model-coverage/large-language-models/older-model",
             "modality": "LLM",
-            "recipe": None,
+            "recipe": recipe_path,
             "brev_status": "unavailable",
         },
         {
@@ -218,7 +236,7 @@ def test_model_release_catalog_rejects_non_chronological_entries(tmp_path):
             "hf_model_id": "org/newer-model",
             "docs_page": "/model-coverage/large-language-models/newer-model",
             "modality": "LLM",
-            "recipe": None,
+            "recipe": recipe_path,
             "brev_status": "planned",
         },
     ]
@@ -264,6 +282,25 @@ def test_model_release_catalog_requires_version_agnostic_docs_page(tmp_path):
     catalog_path.write_text(json.dumps(catalog), encoding="utf-8")
 
     with pytest.raises(ValueError, match="version-agnostic docs page"):
+        _load_model_releases(catalog_path, tmp_path)
+
+
+def test_model_release_catalog_requires_recipe(tmp_path):
+    catalog = [
+        {
+            "date": "2026-07-30",
+            "model": "Model",
+            "hf_model_id": "org/model",
+            "docs_page": "/model-coverage/large-language-models/model",
+            "modality": "LLM",
+            "recipe": None,
+            "brev_status": "planned",
+        }
+    ]
+    catalog_path = tmp_path / "model-releases.json"
+    catalog_path.write_text(json.dumps(catalog), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="field 'recipe' must be a non-empty Markdown-safe string"):
         _load_model_releases(catalog_path, tmp_path)
 
 
