@@ -27,6 +27,7 @@ from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm
     _compare_local_state_samples,
     _compare_source_load_parity,
     _dequantize_hf_fp8_weights_in_place,
+    _evenly_spaced_sample_indices,
     _extract_custom_args,
     _finish_hf_reload_sync,
     _get_input_ids,
@@ -587,3 +588,14 @@ def test_local_state_samples_name_changed_expert_weights():
     assert comparison["expert_mismatches"] == 1
     assert comparison["nonexpert_mismatches"] == 0
     assert comparison["largest"][0]["name"] == "part0.parameter.experts.weight"
+
+
+def test_state_sample_indices_remain_in_bounds_beyond_float32_integer_precision():
+    numel = 16_777_220
+
+    indices = _evenly_spaced_sample_indices(numel, sample_count=64, device=torch.device("cpu"))
+
+    assert indices.dtype == torch.int64
+    assert indices[0].item() == 0
+    assert indices[-1].item() == numel - 1
+    assert torch.all(indices[1:] > indices[:-1])

@@ -384,6 +384,19 @@ def _report_gate_bias_diagnostic(label: str, trainer) -> None:
     print(f"[{label}] (global rank, PP, EP, tensors, max abs vs EP0, local abs max): {metrics}")
 
 
+def _evenly_spaced_sample_indices(numel: int, sample_count: int, device: torch.device) -> torch.Tensor:
+    """Return exact integer sample indices, including both tensor endpoints."""
+    if numel <= 0:
+        raise ValueError(f"numel must be positive, got {numel}")
+    if sample_count <= 0:
+        raise ValueError(f"sample_count must be positive, got {sample_count}")
+    if sample_count == 1:
+        return torch.zeros(1, dtype=torch.int64, device=device)
+
+    positions = torch.arange(sample_count, dtype=torch.int64, device=device)
+    return torch.div(positions * (numel - 1), sample_count - 1, rounding_mode="floor")
+
+
 def _sample_local_tensor(tensor: torch.Tensor, sample_count: int = 64) -> dict[str, object]:
     """Capture deterministic local samples without gathering a full distributed tensor."""
     local = tensor.to_local() if isinstance(tensor, DTensor) else tensor
@@ -394,7 +407,7 @@ def _sample_local_tensor(tensor: torch.Tensor, sample_count: int = 64) -> dict[s
     elif flat_local.numel() <= sample_count:
         samples = flat_local.float().cpu().clone()
     else:
-        indices = torch.linspace(0, flat_local.numel() - 1, steps=sample_count, device=flat_local.device).long()
+        indices = _evenly_spaced_sample_indices(flat_local.numel(), sample_count, flat_local.device)
         samples = flat_local.index_select(0, indices).float().cpu()
     return {
         "global_shape": tuple(tensor.shape),
