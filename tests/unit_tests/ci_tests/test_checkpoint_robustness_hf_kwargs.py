@@ -184,9 +184,51 @@ def test_peft_adapter_fingerprints_match_saved_safetensors(tmp_path):
     with patch(
         "peft.get_peft_model_state_dict", return_value={key: value.clone() for key, value in saved_state.items()}
     ):
-        matched = _assert_peft_adapter_matches_checkpoint(Mock(), adapter_path)
+        matched, ignored = _assert_peft_adapter_matches_checkpoint(Mock(), adapter_path)
 
     assert matched == 2
+    assert ignored == 0
+
+
+def test_peft_adapter_fingerprints_allow_configured_hf_unsupported_prefix(tmp_path):
+    from safetensors.torch import save_file
+
+    adapter_path = tmp_path / "adapter_model.safetensors"
+    loaded_key = "base_model.model.layer.lora_A.weight"
+    ignored_key = "base_model.model.mtp.layers.0.eh_proj.lora_A.weight"
+    saved_state = {
+        loaded_key: torch.tensor([[1.0, 2.0]], dtype=torch.bfloat16),
+        ignored_key: torch.tensor([[3.0, 4.0]], dtype=torch.bfloat16),
+    }
+    save_file(saved_state, adapter_path)
+
+    with patch("peft.get_peft_model_state_dict", return_value={loaded_key: saved_state[loaded_key].clone()}):
+        matched, ignored = _assert_peft_adapter_matches_checkpoint(
+            Mock(),
+            adapter_path,
+            ignored_key_prefix="base_model.model.mtp.",
+        )
+
+    assert matched == 1
+    assert ignored == 1
+
+
+def test_peft_adapter_fingerprints_reject_missing_key_outside_configured_prefix(tmp_path):
+    from safetensors.torch import save_file
+
+    adapter_path = tmp_path / "adapter_model.safetensors"
+    key = "base_model.model.layer.lora_A.weight"
+    save_file({key: torch.tensor([[1.0, 2.0]], dtype=torch.bfloat16)}, adapter_path)
+
+    with (
+        patch("peft.get_peft_model_state_dict", return_value={}),
+        pytest.raises(AssertionError, match="adapter key mismatch"),
+    ):
+        _assert_peft_adapter_matches_checkpoint(
+            Mock(),
+            adapter_path,
+            ignored_key_prefix="base_model.model.mtp.",
+        )
 
 
 def test_peft_adapter_fingerprints_report_tensor_mismatch(tmp_path):
@@ -524,6 +566,15 @@ def test_extract_custom_args_accepts_skip_hf_logit_parity():
     custom, remaining = _extract_custom_args(["--skip_hf_logit_parity", "--other-arg"])
 
     assert custom["skip_hf_logit_parity"] is True
+    assert remaining == ["--other-arg"]
+
+
+def test_extract_custom_args_accepts_hf_adapter_ignored_key_prefix():
+    custom, remaining = _extract_custom_args(
+        ["--hf_adapter_ignored_key_prefix", "base_model.model.mtp.", "--other-arg"]
+    )
+
+    assert custom["hf_adapter_ignored_key_prefix"] == "base_model.model.mtp."
     assert remaining == ["--other-arg"]
 
 

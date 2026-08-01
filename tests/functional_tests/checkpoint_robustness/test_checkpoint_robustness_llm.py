@@ -21,7 +21,7 @@ Launch: torchrun --nproc-per-node=<N> -m <this_module> --config <config.yaml>
     [--tokenizer_name <str>]
     [--source_load_kl_threshold <float>] [--source_load_mean_kl_threshold <float>]
     [--check_source_load_parity] [--check_fused_qkv_keys] [--check_phantom_keys] [--check_resume]
-    [--skip_hf_logit_parity]
+    [--skip_hf_logit_parity] [--hf_adapter_ignored_key_prefix <str>]
     [--hf_source_post_load_dequantize]
     [--max_vram_gb <float>] [--max_cpu_gb <float>]
 """
@@ -76,6 +76,7 @@ def _extract_custom_args(argv):
         "--cross_tp_size",
         "--cross_tp_kl_threshold",
         "--experts_implementation",
+        "--hf_adapter_ignored_key_prefix",
         "--hf_device_map_max_memory_gib",
         "--tokenizer_name",
         "--max_vram_gb",
@@ -378,8 +379,12 @@ def _trainable_parameter_digests(model_parts: list[torch.nn.Module]) -> dict[str
     return digests
 
 
-def _assert_peft_adapter_matches_checkpoint(peft_model: torch.nn.Module, adapter_path: Path) -> int:
-    """Verify that vanilla PEFT loaded every saved adapter tensor exactly."""
+def _assert_peft_adapter_matches_checkpoint(
+    peft_model: torch.nn.Module,
+    adapter_path: Path,
+    ignored_key_prefix: str | None = None,
+) -> tuple[int, int]:
+    """Verify that vanilla PEFT loaded every HF-supported adapter tensor exactly."""
     from peft import get_peft_model_state_dict
     from safetensors import safe_open
 
@@ -389,13 +394,18 @@ def _assert_peft_adapter_matches_checkpoint(peft_model: torch.nn.Module, adapter
         expected_keys = set(saved_adapter.keys())
         loaded_keys = set(loaded_adapter)
         missing = sorted(expected_keys - loaded_keys)
+        ignored_missing = [key for key in missing if ignored_key_prefix and key.startswith(ignored_key_prefix)]
+        required_missing = sorted(set(missing) - set(ignored_missing))
         unexpected = sorted(loaded_keys - expected_keys)
-        assert not missing and not unexpected, (
-            f"Vanilla PEFT adapter key mismatch: missing={missing[:10]}, unexpected={unexpected[:10]}"
+        assert not required_missing and not unexpected, (
+            "Vanilla PEFT adapter key mismatch: "
+            f"missing={required_missing[:10]}, unexpected={unexpected[:10]}, "
+            f"ignored_missing={ignored_missing[:10]}"
         )
 
         mismatches = []
-        for key in sorted(expected_keys):
+        matched_keys = expected_keys - set(ignored_missing)
+        for key in sorted(matched_keys):
             expected_digest = _tensor_digest(saved_adapter.get_tensor(key))
             loaded_digest = _tensor_digest(loaded_adapter[key])
             if expected_digest != loaded_digest:
@@ -404,7 +414,7 @@ def _assert_peft_adapter_matches_checkpoint(peft_model: torch.nn.Module, adapter
                     break
 
     assert not mismatches, "Vanilla PEFT adapter tensor mismatch:\n" + "\n".join(mismatches)
-    return len(expected_keys)
+    return len(matched_keys), len(ignored_missing)
 
 
 def _materialize_config_value(value):
@@ -1432,6 +1442,7 @@ def _run_vanilla_hf_reload(
         hf_device_map_auto = bool(custom_args.get("hf_device_map_auto", False))
         check_fused_qkv_keys = bool(custom_args.get("check_fused_qkv_keys", False))
         skip_hf_logit_parity = bool(custom_args.get("skip_hf_logit_parity", False))
+        hf_adapter_ignored_key_prefix = custom_args.get("hf_adapter_ignored_key_prefix")
         hf_kl_threshold = float(custom_args.get("hf_kl_threshold", "5e-3"))
         device = torch.device("cuda", torch.cuda.current_device())
         config_path = original_pretrained_path if is_peft else consolidated_dir
@@ -1523,8 +1534,17 @@ def _run_vanilla_hf_reload(
                 **_peft_adapter_dispatch_kwargs(hf_kwargs),
             )
             adapter_path = ckpt_step_dir / "model" / "adapter_model.safetensors"
-            matched_adapter_tensors = _assert_peft_adapter_matches_checkpoint(peft_model, adapter_path)
+            matched_adapter_tensors, ignored_adapter_tensors = _assert_peft_adapter_matches_checkpoint(
+                peft_model,
+                adapter_path,
+                ignored_key_prefix=hf_adapter_ignored_key_prefix,
+            )
             print(f"[HF reload] Exact saved-adapter fingerprints matched ({matched_adapter_tensors} tensors)")
+            if ignored_adapter_tensors:
+                print(
+                    "[HF reload] Saved adapter tensors absent from vanilla HF were allowed by the configured prefix "
+                    f"{hf_adapter_ignored_key_prefix!r} ({ignored_adapter_tensors} tensors)"
+                )
             hf_logits = _get_logits(peft_model, input_ids, device)
 
             if check_fused_qkv_keys:

@@ -171,4 +171,7 @@ ci:
     # Keep overflow in RAM and leave GPU headroom for PEFT's adapter re-dispatch.
     hf_device_map_max_memory_gib: 55
     hf_device_map_cpu_max_memory_gib: 128
+    # The published HF model intentionally omits training-only MTP layers 45-47. Exact-match every
+    # adapter tensor HF can instantiate, while allowing only the saved MTP adapter namespace.
+    hf_adapter_ignored_key_prefix: "base_model.model.mtp."
     tokenizer_name: stepfun-ai/Step-3.7-Flash

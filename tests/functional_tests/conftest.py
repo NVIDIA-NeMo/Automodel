@@ -125,6 +125,7 @@ _BOOLEAN_OVERRIDES = [
     "vllm_smoke_test",
     "kl_threshold",
     "hf_kl_threshold",
+    "hf_adapter_ignored_key_prefix",
     "cross_tp_size",
     "cross_tp_kl_threshold",
     "tokenizer",
