@@ -108,6 +108,41 @@ def test_model_release_docs_pages_exist_in_nightly_navigation():
     assert not missing_pages, f"Model release docs pages missing from nightly navigation: {missing_pages}"
 
 
+def test_model_coverage_navigation_includes_org_slugs():
+    repo_root = Path(__file__).parents[3]
+    navigation = yaml.safe_load((repo_root / "docs" / "fern" / "versions" / "nightly.yml").read_text())["navigation"]
+    offenders: list[tuple[str, str, str]] = []
+
+    def visit(items: list[dict[str, object]], parent_slugs: tuple[str, ...] = ()) -> None:
+        for item in items:
+            if "section" in item:
+                section_slug = str(item.get("slug", _fern_slug(str(item["section"]))))
+                visit(item.get("contents", []), (*parent_slugs, section_slug))
+                continue
+
+            path = item.get("path")
+            if not isinstance(path, str):
+                continue
+            parts = Path(path).parts
+            if "model-coverage" not in parts:
+                continue
+            relative_parts = parts[parts.index("model-coverage") + 1 :]
+            if len(relative_parts) != 3:
+                continue
+
+            expected_org = relative_parts[1]
+            actual_parent = parent_slugs[-1] if parent_slugs else "<none>"
+            if actual_parent != expected_org:
+                offenders.append((path, expected_org, actual_parent))
+
+    visit(navigation)
+
+    assert not offenders, "Model coverage pages must be nested under their organization slug:\n" + "\n".join(
+        f"  - {path}: expected {expected_org!r}, got {actual_parent!r}"
+        for path, expected_org, actual_parent in offenders
+    )
+
+
 def test_embedding_and_reranking_catalog_lists_documented_models():
     repo_root = Path(__file__).parents[3]
     releases = json.loads((repo_root / "docs" / "model-coverage" / "model-releases.json").read_text(encoding="utf-8"))
@@ -229,6 +264,8 @@ def test_sync_tables_writes_release_log_homepage_and_registry(tmp_path):
     for document in (release_log, homepage):
         assert document.count('<div className="compact-model-tables">') == 1
         assert document.count(".compact-model-tables .fern-table-root") == 1
+        assert "width: 100% !important;" in document
+        assert ".compact-model-tables .fern-table td:last-child" in document
         assert document.count("|:-----|:-----|:-----|") == len(expected_tabs)
         assert "Documentation only" not in document
     assert len(_tab_table_rows(homepage, "All")) == 9

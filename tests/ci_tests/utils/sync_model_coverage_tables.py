@@ -41,14 +41,12 @@ MARKDOWN_UNSAFE_PATTERN = re.compile(r"[\[\]|<>`\r\n]")
 REPOSITORY_URL = "https://github.com/NVIDIA-NeMo/Automodel/blob/main"
 COMPACT_TABLE_STYLE = """<style>{`
   .compact-model-tables .fern-table-root {
-    width: fit-content !important;
-    max-width: 100%;
+    width: 100% !important;
   }
 
   .compact-model-tables .fern-table {
-    width: max-content !important;
+    width: 100% !important;
     min-width: 0 !important;
-    max-width: 100%;
     table-layout: auto !important;
   }
 
@@ -61,6 +59,11 @@ COMPACT_TABLE_STYLE = """<style>{`
   .compact-model-tables .fern-table td:nth-child(-n + 2) {
     width: 1%;
     white-space: nowrap;
+  }
+
+  .compact-model-tables .fern-table th:last-child,
+  .compact-model-tables .fern-table td:last-child {
+    width: 100%;
   }
 `}</style>"""
 _BrevStatus = Literal["available", "planned", "unavailable"]
