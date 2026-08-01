@@ -184,28 +184,18 @@ def _render_recipe_link(release: _ModelRelease) -> str:
 
 
 def _render_release_log_table(releases: list[_ModelRelease]) -> str:
-    table_rows = []
-    for release in releases:
-        hf_model = f"[`{release.hf_model_id}`](https://huggingface.co/{release.hf_model_id})"
-        if release.brev_status == "available":
-            brev = (
-                f'<a href="{release.brev_url}"><img src="https://brev-assets.s3.us-west-1.amazonaws.com/'
-                'nv-lb-dark.svg" alt="Launch on Brev" height="23" /></a>'
-            )
-        elif release.brev_status == "planned":
-            brev = "🚧"
-        else:
-            brev = ""
-        table_rows.append(
-            f"| {release.release_date} | {release.model} | {hf_model} | {release.modality} | "
-            f"{_render_recipe_link(release)} | {brev} |"
-        )
+    table_rows = [
+        f"| {release.release_date} | {release.modality} | "
+        f"[`{release.hf_model_id}`](https://huggingface.co/{release.hf_model_id}) | "
+        f"{_render_recipe_link(release)} |"
+        for release in releases
+    ]
 
     return "\n".join(
         [
             RELEASE_LOG_START_MARKER,
-            "| Date | Model | HF Model ID | Modality | Recipe | Try on Brev |",
-            "|------|-------|-------------|----------|--------|------|",
+            "| Date | Modality | Model | Recipe |",
+            "|------|----------|-------|--------|",
             *table_rows,
             RELEASE_LOG_END_MARKER,
         ]

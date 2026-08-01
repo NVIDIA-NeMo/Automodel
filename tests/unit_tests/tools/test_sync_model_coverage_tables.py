@@ -120,9 +120,13 @@ def test_sync_tables_writes_release_log_homepage_and_registry(tmp_path):
         tmp_path / "docs" / "model-coverage" / "overview.mdx",
     ]
     release_log = (tmp_path / "docs" / "model-coverage" / "latest-models.mdx").read_text(encoding="utf-8")
-    assert "[`org/documentation-model`](https://huggingface.co/org/documentation-model)" in release_log
-    assert "Documentation only" in release_log
-    assert "https://brev.nvidia.com/launchable/deploy/now?launchableID=test" in release_log
+    assert (
+        "| 2026-07-31 | VLM | [`org/documentation-model`](https://huggingface.co/org/documentation-model) | "
+        "Documentation only |"
+    ) in release_log
+    assert "Documentation Model" not in release_log
+    assert "Try on Brev" not in release_log
+    assert "brev.nvidia.com" not in release_log
     assert "[Model 0](https://huggingface.co/org/model-0)" in (tmp_path / "docs" / "index.mdx").read_text(
         encoding="utf-8"
     )
