@@ -51,7 +51,6 @@ from nemo_automodel.components.checkpoint.checkpointing import (
     _is_custom_model,
     _load_hf_bin_checkpoint,
     _maybe_adapt_state_dict_to_hf,
-    _maybe_rename_gemma4_unified_keys,
     _model_has_dtensors,
     _new_gloo_process_group,
     _normalize_dtype_mapping_to_state_dict_keys,
@@ -71,6 +70,7 @@ from nemo_automodel.components.checkpoint.utils import (
     has_local_tied_lm_head,
     materialize_missing_tied_lm_head,
 )
+from nemo_automodel.components.models.gemma4_unified.hf_key_renames import maybe_rename_gemma4_unified_keys
 from nemo_automodel.components.training.rng import RNGState, StatefulRNG, init_all_rng
 
 CLOUD_PATH_MODEL = "msc://bucket/step-100/model"
@@ -78,59 +78,7 @@ CLOUD_PATH_OPTIM = "msc://bucket/step-100/optim"
 LOCAL_PATH_MODEL = "/ckpts/step-100/model"
 
 
-GEMMA4_UNIFIED_KEY_PAIRS = [
-    ("embed_vision.patch_ln1.weight", "vision_embedder.patch_ln1.weight"),
-    ("embed_vision.patch_dense.bias", "vision_embedder.patch_dense.bias"),
-    ("embed_vision.patch_ln2.weight", "vision_embedder.patch_ln2.weight"),
-    ("embed_vision.pos_embedding", "vision_embedder.pos_embedding"),
-    ("embed_vision.pos_norm.bias", "vision_embedder.pos_norm.bias"),
-    (
-        "embed_vision.multimodal_embedder.embedding_projection.weight",
-        "embed_vision.embedding_projection.weight",
-    ),
-    (
-        "model.embed_vision.multimodal_embedder.embedding_projection.weight",
-        "model.embed_vision.embedding_projection.weight",
-    ),
-]
-
-
 class TestGemma4UnifiedHFExportKeys:
-    @pytest.mark.parametrize(("model_key", "hf_key"), GEMMA4_UNIFIED_KEY_PAIRS)
-    def test_restores_hf_checkpoint_key(self, model_key, hf_key):
-        model = SimpleNamespace(config=SimpleNamespace(model_type="gemma4_unified"))
-        tensor = torch.ones(1)
-
-        result = _maybe_rename_gemma4_unified_keys(model, {model_key: tensor}, to_hf=True)
-
-        assert result == {hf_key: tensor}
-
-    @pytest.mark.parametrize(("model_key", "hf_key"), GEMMA4_UNIFIED_KEY_PAIRS)
-    def test_round_trips_back_to_model_keys(self, model_key, hf_key):
-        """A DCP resume renames to HF FQNs on load and must land back on the model FQNs."""
-        model = SimpleNamespace(config=SimpleNamespace(model_type="gemma4_unified"))
-        tensor = torch.ones(1)
-
-        exported = _maybe_rename_gemma4_unified_keys(model, {model_key: tensor}, to_hf=True)
-        restored = _maybe_rename_gemma4_unified_keys(model, exported, to_hf=False)
-
-        assert exported == {hf_key: tensor}
-        assert restored == {model_key: tensor}
-
-    def test_leaves_unrelated_keys_untouched(self):
-        model = SimpleNamespace(config=SimpleNamespace(model_type="gemma4_unified"))
-        state_dict = {"model.layers.0.self_attn.q_proj.weight": torch.ones(1), "lm_head.weight": torch.zeros(1)}
-
-        assert _maybe_rename_gemma4_unified_keys(model, state_dict, to_hf=True) == state_dict
-        assert _maybe_rename_gemma4_unified_keys(model, state_dict, to_hf=False) == state_dict
-
-    @pytest.mark.parametrize("to_hf", [True, False])
-    def test_preserves_internal_keys_for_other_model_types(self, to_hf):
-        model = SimpleNamespace(config=SimpleNamespace(model_type="gemma4"))
-        state_dict = {"embed_vision.multimodal_embedder.embedding_projection.weight": torch.ones(1)}
-
-        assert _maybe_rename_gemma4_unified_keys(model, state_dict, to_hf=to_hf) is state_dict
-
     def test_state_dict_adapter_no_longer_triggers_the_rename(self):
         """The rename is applied at the call sites, not inside the adapter helper."""
         tensor = torch.ones(1)
@@ -148,19 +96,9 @@ class TestGemma4UnifiedHFExportKeys:
         adapted = _maybe_adapt_state_dict_to_hf(model, {"projection": tensor})
 
         assert adapted == {"embed_vision.multimodal_embedder.embedding_projection.weight": tensor}
-        assert _maybe_rename_gemma4_unified_keys(model, adapted, to_hf=True) == {
+        assert maybe_rename_gemma4_unified_keys(model, adapted, to_hf=True) == {
             "embed_vision.embedding_projection.weight": tensor
         }
-
-    def test_rejects_export_key_collision(self):
-        model = SimpleNamespace(config=SimpleNamespace(model_type="gemma4_unified"))
-        state_dict = {
-            "embed_vision.embedding_projection.weight": torch.ones(1),
-            "embed_vision.multimodal_embedder.embedding_projection.weight": torch.zeros(1),
-        }
-
-        with pytest.raises(ValueError, match="HF export key collision"):
-            _maybe_rename_gemma4_unified_keys(model, state_dict, to_hf=True)
 
 
 def test_load_on_dp_ranks_requires_opt_in_for_legacy_rng_state(tmp_path):

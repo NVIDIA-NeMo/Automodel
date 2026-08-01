@@ -87,18 +87,10 @@ if TYPE_CHECKING:
 
 
 from nemo_automodel.components.checkpoint.config import CheckpointingConfig, SaveConsolidatedMode, _is_geq_torch_2_9
+from nemo_automodel.components.models.gemma4_unified.hf_key_renames import maybe_rename_gemma4_unified_keys
 
 _CONSOLIDATED_SIZE_WARNING_THRESHOLD_BYTES = 50 * 1024**3
 _DEFAULT_HF_CONSOLIDATED_SHARD_SIZE_BYTES = 5 * 1024**3
-
-_GEMMA4_UNIFIED_HF_EXPORT_KEY_RENAMES = {
-    "embed_vision.patch_ln1": "vision_embedder.patch_ln1",
-    "embed_vision.patch_dense": "vision_embedder.patch_dense",
-    "embed_vision.patch_ln2": "vision_embedder.patch_ln2",
-    "embed_vision.pos_embedding": "vision_embedder.pos_embedding",
-    "embed_vision.pos_norm": "vision_embedder.pos_norm",
-    "embed_vision.multimodal_embedder.embedding_projection": "embed_vision.embedding_projection",
-}
 
 logger = logging.getLogger(__name__)
 
@@ -626,7 +618,7 @@ class Checkpointer:
             device_mesh=self.moe_mesh,
             v4_compatible=self.config.v4_compatible,
         )
-        state_dict = _maybe_rename_gemma4_unified_keys(model_state.model[0], state_dict, to_hf=True)
+        state_dict = maybe_rename_gemma4_unified_keys(_unwrap_ddp_model(model_state.model[0]), state_dict, to_hf=True)
         # MoE adapters return non-contiguous views; safetensors.save rejects those.
         _materialize_to_hf_views_for_save(state_dict)
         # Build the consolidated model.safetensors.index.json if needed
@@ -931,7 +923,9 @@ class Checkpointer:
         # destinations must too. Base-model init instead relies on the storage reader's
         # key_mapping, which already translates the checkpoint keys.
         if not is_init_step:
-            state_dict = _maybe_rename_gemma4_unified_keys(model_state.model[0], state_dict, to_hf=True)
+            state_dict = maybe_rename_gemma4_unified_keys(
+                _unwrap_ddp_model(model_state.model[0]), state_dict, to_hf=True
+            )
 
         compat_tied_lm_head_source_key: str | None = None
         lm_head_param_name = getattr(model_state, "lm_head_param_name", None)
@@ -1028,7 +1022,9 @@ class Checkpointer:
             state_dict[lm_head_param_name] = state_dict.pop(compat_tied_lm_head_source_key)
 
         if not is_init_step:
-            state_dict = _maybe_rename_gemma4_unified_keys(model_state.model[0], state_dict, to_hf=False)
+            state_dict = maybe_rename_gemma4_unified_keys(
+                _unwrap_ddp_model(model_state.model[0]), state_dict, to_hf=False
+            )
         state_dict = _maybe_adapt_state_dict_from_hf(model_state.model[0], state_dict, moe_mesh=self.moe_mesh)
         expected_keys_for_diff = {k for k in expected_keys if not k.endswith("_extra_state")}
         loaded_keys_for_diff = {k for k in state_dict if not k.endswith("_extra_state")}
@@ -2400,66 +2396,10 @@ def _maybe_adapt_state_dict_to_hf(
     """
     Custom models use state dict adapters to convert the state dict to the Hugging Face format.
     """
-    model_part = _unwrap_ddp_model(model_part)
-    adapter = getattr(model_part, "state_dict_adapter", None)
+    adapter = getattr(_unwrap_ddp_model(model_part), "state_dict_adapter", None)
     if adapter:
-        state_dict = adapter.to_hf(
-            state_dict,
-            exclude_key_regex=r".*_extra_state.*",
-            quantization=quantization,
-            **kwargs,
-        )
+        return adapter.to_hf(state_dict, exclude_key_regex=r".*_extra_state.*", quantization=quantization, **kwargs)
     return state_dict
-
-
-def _maybe_rename_gemma4_unified_keys(
-    model_part: nn.Module, state_dict: dict[str, torch.Tensor], to_hf: bool
-) -> dict[str, torch.Tensor]:
-    """Translate Gemma4 Unified keys between model FQNs and the HF checkpoint layout.
-
-    Transformers renames six Gemma4 Unified vision keys while loading a checkpoint, so the
-    in-memory FQNs differ from the names the original HF checkpoint uses. ``gemma4_unified`` is
-    HF-native and has no ``state_dict_adapter``, so nothing else reverses those renames: without
-    this, saved checkpoints (both the DCP shards and the consolidated safetensors merged from
-    them) carry internal names such as
-    ``embed_vision.multimodal_embedder.embedding_projection.weight``.
-
-    This is only applied on the save and DCP-resume paths, which read and write checkpoints
-    Automodel itself produced. Loading a base HF checkpoint goes through the storage reader's
-    ``key_mapping`` (built from the model's ``_checkpoint_conversion_mapping``), which already
-    performs the HF-to-model translation; renaming there too would double-transform the keys.
-
-    Args:
-        model_part: Model part whose ``config.model_type`` selects the renaming.
-        state_dict: State dict to translate.
-        to_hf: If True, rename model FQNs to HF FQNs; otherwise apply the inverse.
-
-    Returns:
-        The translated state dict, or ``state_dict`` unchanged for other model types.
-
-    Raises:
-        ValueError: If two source keys collide on the same renamed key.
-    """
-    if getattr(getattr(_unwrap_ddp_model(model_part), "config", None), "model_type", None) != "gemma4_unified":
-        return state_dict
-    if to_hf:
-        renames = _GEMMA4_UNIFIED_HF_EXPORT_KEY_RENAMES
-    else:
-        renames = {hf_key: model_key for model_key, hf_key in _GEMMA4_UNIFIED_HF_EXPORT_KEY_RENAMES.items()}
-
-    renamed_state_dict: dict[str, torch.Tensor] = {}
-    for key, tensor in state_dict.items():
-        prefix = "model." if key.startswith("model.") else ""
-        unprefixed_key = key[len(prefix) :]
-        for source_key, target_key in renames.items():
-            if unprefixed_key == source_key or unprefixed_key.startswith(f"{source_key}."):
-                unprefixed_key = f"{target_key}{unprefixed_key[len(source_key) :]}"
-                break
-        renamed_key = f"{prefix}{unprefixed_key}"
-        if renamed_key in renamed_state_dict:
-            raise ValueError(f"Gemma4 Unified HF export key collision for {renamed_key!r}")
-        renamed_state_dict[renamed_key] = tensor
-    return renamed_state_dict
 
 
 def _materialize_to_hf_views_for_save(state_dict: dict[str, torch.Tensor]) -> None:
