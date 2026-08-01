@@ -32,6 +32,7 @@ import gc
 import hashlib
 import inspect
 import json
+import math
 import os
 import sys
 import time
@@ -1465,6 +1466,18 @@ def _materialize_hf_quantization_config(cfg):
     return raw_quantization_config
 
 
+def _hf_reload_kl_error(max_kl_hf: float, hf_kl_threshold: float) -> str | None:
+    """Return an actionable HF reload parity error, including non-finite results."""
+    if not math.isfinite(max_kl_hf):
+        return f"HF-loaded model produced non-finite KL divergence: {max_kl_hf}"
+    if max_kl_hf > hf_kl_threshold:
+        return (
+            "KL divergence between original and HF-loaded model too large: "
+            f"max per-token KL = {max_kl_hf:.6e} > threshold {hf_kl_threshold:.6e}"
+        )
+    return None
+
+
 def _run_vanilla_hf_reload(
     cfg,
     input_ids: list[int],
@@ -1642,11 +1655,7 @@ def _run_vanilla_hf_reload(
         else:
             max_kl_hf = _kl_divergence_from_logits(reference_logits, hf_logits).max().item()
             print(f"[HF reload] HF-loaded max KL: {max_kl_hf:.6e} (threshold: {hf_kl_threshold:.6e})")
-            if max_kl_hf > hf_kl_threshold:
-                hf_reload_error = (
-                    "KL divergence between original and HF-loaded model too large: "
-                    f"max per-token KL = {max_kl_hf:.6e} > threshold {hf_kl_threshold:.6e}"
-                )
+            hf_reload_error = _hf_reload_kl_error(max_kl_hf, hf_kl_threshold)
         del hf_logits
         _release_model_memory()
         return hf_reload_error
@@ -1735,6 +1744,8 @@ def _run_process_isolated_checkpoint_phase(
         raise ValueError(f"Unsupported isolated checkpoint phase {phase!r}; expected one of {sorted(supported_phases)}")
     if int(custom_args.get("cross_tp_size", "0")) > 0:
         raise ValueError("Process-isolated checkpoint mode does not yet support cross_tp_size")
+    if custom_args.get("no_check_resume", False) and phase in {"resume_baseline", "resume"}:
+        raise ValueError(f"Process-isolated phase {phase!r} conflicts with no_check_resume=true")
 
     _disable_distributed_atexit_teardown()
     cfg = parse_args_and_load_config()

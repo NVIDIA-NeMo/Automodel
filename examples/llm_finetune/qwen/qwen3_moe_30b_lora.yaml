@@ -105,9 +105,18 @@ ci:
   time: "00:30:00"
   nodes: 1
   env_vars:
+    # Keep each source/reload comparison independent of prior accelerator state.
+    CHECKPOINT_ROBUSTNESS_PHASES: >-
+      source_load_reference source_load_parity train_and_save automodel_reload hf_reload
     PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
   checkpoint_robustness:
+    check_source_load_parity: true
     hf_kl_threshold: 7e-2
+    process_isolation: true
+    # Exact-image BF16 source parity measured max/mean KL 0.0161/0.00407 and cosine 0.99764.
+    source_load_kl_threshold: 3e-2
+    source_load_mean_kl_threshold: 6e-3
+    source_load_cosine_threshold: 0.997
     tokenizer_name: Qwen/Qwen3-30B-A3B
     trust_remote_code: true
     hf_device_map_auto: true
