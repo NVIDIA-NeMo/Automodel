@@ -34,7 +34,7 @@ navigation:
       - page: "Release Notes"
         path: ../../release-notes.mdx
         slug: release-notes
-      - page: "Model Release Log"
+      - page: "Model Support Log"
         path: ../../model-coverage/latest-models.mdx
         slug: model-release-log
   - section: "Performance"
@@ -48,7 +48,7 @@ navigation:
       - page: "Overview"
         path: ../../model-coverage/overview.mdx
         slug: overview
-      - page: "Release Log"
+      - page: "Model Support Log"
         path: ../../model-coverage/latest-models.mdx
         slug: release-log
       - section: "Large Language Models"

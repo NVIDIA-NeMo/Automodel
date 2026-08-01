@@ -26,8 +26,8 @@ from tests.ci_tests.utils.sync_model_coverage_tables import (
     HOMEPAGE_START_MARKER,
     REGISTRY_END_MARKER,
     REGISTRY_START_MARKER,
-    RELEASE_LOG_END_MARKER,
-    RELEASE_LOG_START_MARKER,
+    SUPPORT_LOG_END_MARKER,
+    SUPPORT_LOG_START_MARKER,
     TABLE_ROW_COUNT,
     _load_model_releases,
     _parse_registry_entries,
@@ -221,7 +221,7 @@ def test_embedding_and_reranking_catalog_lists_documented_models():
     }
 
 
-def test_sync_tables_writes_release_log_homepage_and_registry(tmp_path):
+def test_sync_tables_writes_support_log_homepage_and_registry(tmp_path):
     (tmp_path / "docs" / "model-coverage").mkdir(parents=True)
     (tmp_path / "nemo_automodel" / "_transformers").mkdir(parents=True)
     (tmp_path / "examples").mkdir()
@@ -269,7 +269,7 @@ def test_sync_tables_writes_release_log_homepage_and_registry(tmp_path):
         )
     (tmp_path / "docs" / "model-coverage" / "model-releases.json").write_text(json.dumps(releases), encoding="utf-8")
     (tmp_path / "docs" / "model-coverage" / "latest-models.mdx").write_text(
-        f"before\n{RELEASE_LOG_START_MARKER}\nstale\n{RELEASE_LOG_END_MARKER}\nafter\n", encoding="utf-8"
+        f"before\n{SUPPORT_LOG_START_MARKER}\nstale\n{SUPPORT_LOG_END_MARKER}\nafter\n", encoding="utf-8"
     )
     (tmp_path / "docs" / "index.mdx").write_text(
         f"before\n{HOMEPAGE_START_MARKER}\nstale\n{HOMEPAGE_END_MARKER}\nafter\n", encoding="utf-8"
@@ -288,12 +288,12 @@ def test_sync_tables_writes_release_log_homepage_and_registry(tmp_path):
         tmp_path / "docs" / "index.mdx",
         tmp_path / "docs" / "model-coverage" / "overview.mdx",
     ]
-    release_log = (tmp_path / "docs" / "model-coverage" / "latest-models.mdx").read_text(encoding="utf-8")
+    support_log = (tmp_path / "docs" / "model-coverage" / "latest-models.mdx").read_text(encoding="utf-8")
     assert (
         "| 2026-07-31 | VLM | "
         "[Documentation-model](/model-coverage/vision-language-models/documentation-model) "
         "([shared.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/shared.yaml)) |"
-    ) in release_log
+    ) in support_log
     expected_tabs = [
         "All",
         "LLM",
@@ -306,14 +306,14 @@ def test_sync_tables_writes_release_log_homepage_and_registry(tmp_path):
         "Embedding",
         "Reranking",
     ]
-    assert re.findall(r'<Tab title="([^"]+)">', release_log) == expected_tabs
+    assert re.findall(r'<Tab title="([^"]+)">', support_log) == expected_tabs
     homepage = (tmp_path / "docs" / "index.mdx").read_text(encoding="utf-8")
     assert re.findall(r'<Tab title="([^"]+)">', homepage) == expected_tabs
-    assert len(_tab_table_rows(release_log, "All")) == len(releases)
-    assert len(_tab_table_rows(release_log, "LLM")) == 10
+    assert len(_tab_table_rows(support_log, "All")) == len(releases)
+    assert len(_tab_table_rows(support_log, "LLM")) == 10
     for tab in expected_tabs:
         assert len(_tab_table_rows(homepage, tab)) <= TABLE_ROW_COUNT
-    for document in (release_log, homepage):
+    for document in (support_log, homepage):
         assert document.count('<div className="compact-model-tables">') == 1
         assert document.count(".compact-model-tables .fern-table-root") == 1
         assert "width: 100% !important;" in document
@@ -322,15 +322,15 @@ def test_sync_tables_writes_release_log_homepage_and_registry(tmp_path):
         assert "Documentation only" not in document
     assert len(_tab_table_rows(homepage, "All")) == TABLE_ROW_COUNT
     assert len(_tab_table_rows(homepage, "LLM")) == TABLE_ROW_COUNT
-    llm_tab = release_log.split('<Tab title="LLM">', 1)[1].split("</Tab>", 1)[0]
-    vlm_tab = release_log.split('<Tab title="VLM">', 1)[1].split("</Tab>", 1)[0]
+    llm_tab = support_log.split('<Tab title="LLM">', 1)[1].split("</Tab>", 1)[0]
+    vlm_tab = support_log.split('<Tab title="VLM">', 1)[1].split("</Tab>", 1)[0]
     assert "[Model-0](/model-coverage/large-language-models/model-0)" in llm_tab
     assert "[Documentation-model]" not in llm_tab
     assert "[Documentation-model](/model-coverage/vision-language-models/documentation-model)" in vlm_tab
     assert "[Model-0]" not in vlm_tab
-    assert "Documentation Model" not in release_log
-    assert "Try on Brev" not in release_log
-    assert "brev.nvidia.com" not in release_log
+    assert "Documentation Model" not in support_log
+    assert "Try on Brev" not in support_log
+    assert "brev.nvidia.com" not in support_log
     assert "[Model-0](/model-coverage/large-language-models/model-0)" in homepage
     assert "Documentation Model" not in homepage
     assert "| `NewModel` | `models.new.NewModel` |" in (
@@ -522,7 +522,7 @@ def test_model_release_catalog_allows_same_hf_model_for_different_types(tmp_path
     assert [release.model_type for release in releases] == ["LLM", "Embedding", "Reranking"]
 
 
-def test_sync_tables_check_rejects_stale_generated_release_log(tmp_path):
+def test_sync_tables_check_rejects_stale_generated_support_log(tmp_path):
     (tmp_path / "docs" / "model-coverage").mkdir(parents=True)
     (tmp_path / "nemo_automodel" / "_transformers").mkdir(parents=True)
     (tmp_path / "examples").mkdir()
@@ -543,7 +543,7 @@ def test_sync_tables_check_rejects_stale_generated_release_log(tmp_path):
         )
     (tmp_path / "docs" / "model-coverage" / "model-releases.json").write_text(json.dumps(releases), encoding="utf-8")
     (tmp_path / "docs" / "model-coverage" / "latest-models.mdx").write_text(
-        f"{RELEASE_LOG_START_MARKER}\nstale\n{RELEASE_LOG_END_MARKER}\n", encoding="utf-8"
+        f"{SUPPORT_LOG_START_MARKER}\nstale\n{SUPPORT_LOG_END_MARKER}\n", encoding="utf-8"
     )
     (tmp_path / "docs" / "index.mdx").write_text(
         f"{HOMEPAGE_START_MARKER}\nstale\n{HOMEPAGE_END_MARKER}\n", encoding="utf-8"

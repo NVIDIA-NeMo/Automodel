@@ -28,8 +28,8 @@ from urllib.parse import urlparse
 TABLE_ROW_COUNT = 10
 HOMEPAGE_START_MARKER = "{/* BEGIN GENERATED LATEST MODEL SUPPORT */}"
 HOMEPAGE_END_MARKER = "{/* END GENERATED LATEST MODEL SUPPORT */}"
-RELEASE_LOG_START_MARKER = "{/* BEGIN GENERATED MODEL RELEASE LOG */}"
-RELEASE_LOG_END_MARKER = "{/* END GENERATED MODEL RELEASE LOG */}"
+SUPPORT_LOG_START_MARKER = "{/* BEGIN GENERATED MODEL SUPPORT LOG */}"
+SUPPORT_LOG_END_MARKER = "{/* END GENERATED MODEL SUPPORT LOG */}"
 REGISTRY_START_MARKER = "{/* BEGIN GENERATED MODEL ARCHITECTURES */}"
 REGISTRY_END_MARKER = "{/* END GENERATED MODEL ARCHITECTURES */}"
 HF_MODEL_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
@@ -380,8 +380,8 @@ def _render_release_tabs(releases: list[_ModelRelease], *, row_limit: int | None
     )
 
 
-def _render_release_log_table(releases: list[_ModelRelease]) -> str:
-    return "\n\n".join([RELEASE_LOG_START_MARKER, _render_release_tabs(releases), RELEASE_LOG_END_MARKER])
+def _render_support_log_table(releases: list[_ModelRelease]) -> str:
+    return "\n\n".join([SUPPORT_LOG_START_MARKER, _render_release_tabs(releases), SUPPORT_LOG_END_MARKER])
 
 
 def _render_homepage_table(releases: list[_ModelRelease]) -> str:
@@ -436,23 +436,23 @@ def _render_registry_table(entries: list[tuple[str, str, str]]) -> str:
 
 def _generate_tables(repo_root: Path) -> dict[Path, str]:
     release_catalog_path = repo_root / "docs" / "model-coverage" / "model-releases.json"
-    release_log_path = repo_root / "docs" / "model-coverage" / "latest-models.mdx"
+    support_log_path = repo_root / "docs" / "model-coverage" / "latest-models.mdx"
     homepage_path = repo_root / "docs" / "index.mdx"
     overview_path = repo_root / "docs" / "model-coverage" / "overview.mdx"
     registry_path = repo_root / "nemo_automodel" / "_transformers" / "registry.py"
 
-    release_log = release_log_path.read_text(encoding="utf-8")
+    support_log = support_log_path.read_text(encoding="utf-8")
     homepage = homepage_path.read_text(encoding="utf-8")
     overview = overview_path.read_text(encoding="utf-8")
     registry_source = registry_path.read_text(encoding="utf-8")
 
     releases = _load_model_releases(release_catalog_path, repo_root)
-    generated_release_log = _render_release_log_table(releases)
+    generated_support_log = _render_support_log_table(releases)
     generated_homepage = _render_homepage_table(releases)
     generated_registry = _render_registry_table(_parse_registry_entries(registry_source))
     return {
-        release_log_path: _replace_generated_block(
-            release_log, RELEASE_LOG_START_MARKER, RELEASE_LOG_END_MARKER, generated_release_log
+        support_log_path: _replace_generated_block(
+            support_log, SUPPORT_LOG_START_MARKER, SUPPORT_LOG_END_MARKER, generated_support_log
         ),
         homepage_path: _replace_generated_block(
             homepage, HOMEPAGE_START_MARKER, HOMEPAGE_END_MARKER, generated_homepage
