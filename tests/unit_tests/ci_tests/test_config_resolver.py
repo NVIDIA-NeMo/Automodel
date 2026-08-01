@@ -374,6 +374,7 @@ def test_vlm_checkpoint_robustness_recipes_resolve(tmp_path, recipe_path):
         assert robustness["hf_device_map_auto"] is True
     if "/mistral4/" in recipe_path:
         assert robustness["hf_source_post_load_dequantize"] is True
+        assert robustness["kl_threshold"] == 5e-2
         assert robustness["source_load_kl_threshold"] == 1e-2
         assert robustness["source_load_mean_kl_threshold"] == 2e-3
         assert robustness["source_load_cosine_threshold"] == 0.999

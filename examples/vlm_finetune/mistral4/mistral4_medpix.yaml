@@ -125,8 +125,10 @@ ci:
     # PP=4 with pp_microbatch_size=1 requires at least four pipeline microbatches.
     step_scheduler.local_batch_size: 4
     check_source_load_parity: true
-    # Native TE/SDPA and vanilla HF follow different BF16 execution paths.
-    # Keep checkpoint reload parity exact while bounding the stable implementation delta.
+    # Fresh PP4/EP8 DCP and consolidated reloads are bit-identical to each other,
+    # but both differ from the still-warm in-memory runtime. Bound that distributed
+    # BF16 execution delta separately from the native-vs-HF implementation delta.
+    kl_threshold: 5e-2
     source_load_kl_threshold: 1e-2
     source_load_mean_kl_threshold: 2e-3
     source_load_cosine_threshold: 0.999
