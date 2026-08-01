@@ -122,7 +122,12 @@ if [[ "$HAS_ROBUSTNESS" == "true" ]]; then
       --master_port=${ROBUSTNESS_MASTER_PORT}"
   fi
 
-  ROBUSTNESS_CMD="${ROBUSTNESS_LAUNCH_CMD} --tee 3 --log-dir $TEST_DIR/robustness_logs \
+  ROBUSTNESS_LOG_ARGS="--tee 3 --log-dir $TEST_DIR/robustness_logs"
+  if [[ "${SKIP_FINETUNE:-false}" == "true" ]]; then
+    ROBUSTNESS_LOG_ARGS=""
+  fi
+
+  ROBUSTNESS_CMD="${ROBUSTNESS_LAUNCH_CMD} ${ROBUSTNESS_LOG_ARGS} \
     -m pytest --tb=short ${ROBUSTNESS_TEST_SCRIPT} \
     --config ${RESOLVED_ROBUSTNESS_CONFIG}"
 
