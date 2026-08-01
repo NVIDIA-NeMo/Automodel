@@ -28,6 +28,7 @@ from tests.ci_tests.utils.sync_model_coverage_tables import (
     REGISTRY_START_MARKER,
     RELEASE_LOG_END_MARKER,
     RELEASE_LOG_START_MARKER,
+    TABLE_ROW_COUNT,
     _load_model_releases,
     _parse_registry_entries,
     _render_registry_table,
@@ -260,7 +261,7 @@ def test_sync_tables_writes_release_log_homepage_and_registry(tmp_path):
     assert len(_tab_table_rows(release_log, "All")) == len(releases)
     assert len(_tab_table_rows(release_log, "LLM")) == 10
     for tab in expected_tabs:
-        assert len(_tab_table_rows(homepage, tab)) <= 9
+        assert len(_tab_table_rows(homepage, tab)) <= TABLE_ROW_COUNT
     for document in (release_log, homepage):
         assert document.count('<div className="compact-model-tables">') == 1
         assert document.count(".compact-model-tables .fern-table-root") == 1
@@ -268,8 +269,8 @@ def test_sync_tables_writes_release_log_homepage_and_registry(tmp_path):
         assert ".compact-model-tables .fern-table td:last-child" in document
         assert document.count("|:-----|:-----|:-----|") == len(expected_tabs)
         assert "Documentation only" not in document
-    assert len(_tab_table_rows(homepage, "All")) == 9
-    assert len(_tab_table_rows(homepage, "LLM")) == 9
+    assert len(_tab_table_rows(homepage, "All")) == TABLE_ROW_COUNT
+    assert len(_tab_table_rows(homepage, "LLM")) == TABLE_ROW_COUNT
     llm_tab = release_log.split('<Tab title="LLM">', 1)[1].split("</Tab>", 1)[0]
     vlm_tab = release_log.split('<Tab title="VLM">', 1)[1].split("</Tab>", 1)[0]
     assert "[Model-0](/model-coverage/large-language-models/model-0)" in llm_tab
@@ -475,7 +476,7 @@ def test_sync_tables_check_rejects_stale_generated_release_log(tmp_path):
     (tmp_path / "nemo_automodel" / "_transformers").mkdir(parents=True)
     (tmp_path / "examples").mkdir()
     releases = []
-    for index in range(9):
+    for index in range(TABLE_ROW_COUNT):
         recipe_path = f"examples/model_{index}.yaml"
         (tmp_path / recipe_path).write_text("model: test\n", encoding="utf-8")
         releases.append(
