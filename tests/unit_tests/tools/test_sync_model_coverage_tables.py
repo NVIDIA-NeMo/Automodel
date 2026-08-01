@@ -118,6 +118,19 @@ def test_sync_tables_writes_release_log_homepage_and_registry(tmp_path):
             "brev_url": "https://brev.nvidia.com/launchable/deploy/now?launchableID=test",
         }
     ]
+    for modality in ("Omni", "dLLM", "Multimodal", "Diffusion", "Encoder-Decoder"):
+        modality_slug = modality.lower().replace(" ", "-")
+        releases.append(
+            {
+                "date": "2026-07-31",
+                "model": f"{modality} Model",
+                "hf_model_id": f"org/{modality_slug}-model",
+                "docs_page": f"/model-coverage/{modality_slug}/model",
+                "modality": modality,
+                "recipe": None,
+                "brev_status": "planned",
+            }
+        )
     for index in range(9):
         recipe_path = f"examples/model_{index}.yaml"
         (tmp_path / recipe_path).write_text("model: test\n", encoding="utf-8")
@@ -159,7 +172,16 @@ def test_sync_tables_writes_release_log_homepage_and_registry(tmp_path):
         "[Documentation-model](/model-coverage/vision-language-models/documentation-model) "
         "(Documentation only) |"
     ) in release_log
-    assert re.findall(r'<Tab title="([^"]+)">', release_log) == ["All", "LLM", "VLM"]
+    assert re.findall(r'<Tab title="([^"]+)">', release_log) == [
+        "All",
+        "LLM",
+        "VLM",
+        "Omni",
+        "dLLM",
+        "Multimodal",
+        "Diffusion",
+        "Encoder-Decoder",
+    ]
     llm_tab = release_log.split('<Tab title="LLM">', 1)[1].split("</Tab>", 1)[0]
     vlm_tab = release_log.split('<Tab title="VLM">', 1)[1].split("</Tab>", 1)[0]
     assert "[Model-0](/model-coverage/large-language-models/model-0)" in llm_tab

@@ -217,7 +217,8 @@ def _render_release_table(releases: list[_ModelRelease]) -> str:
 
 
 def _render_release_log_table(releases: list[_ModelRelease]) -> str:
-    preferred_modality_order = {"LLM": 0, "VLM": 1}
+    preferred_modalities = ("LLM", "VLM", "Omni", "dLLM", "Multimodal", "Diffusion", "Encoder-Decoder")
+    preferred_modality_order = {modality: index for index, modality in enumerate(preferred_modalities)}
     modalities = sorted(
         {release.modality for release in releases},
         key=lambda modality: (
