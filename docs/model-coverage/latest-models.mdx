@@ -4,15 +4,38 @@ description: ""
 position: 2
 ---
 
-import { CompactModelTables } from "@/components/CompactModelTables";
-
 A reverse-chronological log of every model added to NeMo AutoModel.
 
 See the [LLM](/model-coverage/large-language-models/overview) / [VLM](/model-coverage/vision-language-models/overview) / [Multimodal](/model-coverage/multimodal/overview) / [Omni](/model-coverage/omni/overview) / [dLLM](/model-coverage/dllm/overview) / [Diffusion](/model-coverage/diffusion/overview) / [Embedding](/model-coverage/embedding-models/overview) / [Reranker](/model-coverage/reranking-models/overview) pages for the full architecture listings.
 
 {/* BEGIN GENERATED MODEL RELEASE LOG */}
 
-<CompactModelTables>
+<div className="compact-model-tables">
+
+<style>{`
+  .compact-model-tables .fern-table-root {
+    width: fit-content !important;
+    max-width: 100%;
+  }
+
+  .compact-model-tables .fern-table {
+    width: max-content !important;
+    min-width: 0 !important;
+    max-width: 100%;
+    table-layout: auto !important;
+  }
+
+  .compact-model-tables .fern-table th,
+  .compact-model-tables .fern-table td {
+    text-align: left !important;
+  }
+
+  .compact-model-tables .fern-table th:nth-child(-n + 2),
+  .compact-model-tables .fern-table td:nth-child(-n + 2) {
+    width: 1%;
+    white-space: nowrap;
+  }
+`}</style>
 
 <Tabs>
 
@@ -270,6 +293,6 @@ See the [LLM](/model-coverage/large-language-models/overview) / [VLM](/model-cov
 
 </Tabs>
 
-</CompactModelTables>
+</div>
 
 {/* END GENERATED MODEL RELEASE LOG */}

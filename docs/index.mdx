@@ -3,8 +3,6 @@ title: "NeMo AutoModel Documentation"
 description: "NeMo AutoModel is a PyTorch DTensor-native SPMD open-source training library for scalable LLM and VLM training and fine-tuning with day-0 Hugging Face model support"
 ---
 
-import { CompactModelTables } from "@/components/CompactModelTables";
-
 PyTorch-native training that scales from 1 GPU to thousands with a single config change. Load any Hugging Face model, point at your data, and start training; no checkpoint conversion and no boilerplate.
 
 ## Quick Links
@@ -58,7 +56,32 @@ New models are added regularly. Pick a model below to start fine-tuning, or see 
 
 {/* BEGIN GENERATED LATEST MODEL SUPPORT */}
 
-<CompactModelTables>
+<div className="compact-model-tables">
+
+<style>{`
+  .compact-model-tables .fern-table-root {
+    width: fit-content !important;
+    max-width: 100%;
+  }
+
+  .compact-model-tables .fern-table {
+    width: max-content !important;
+    min-width: 0 !important;
+    max-width: 100%;
+    table-layout: auto !important;
+  }
+
+  .compact-model-tables .fern-table th,
+  .compact-model-tables .fern-table td {
+    text-align: left !important;
+  }
+
+  .compact-model-tables .fern-table th:nth-child(-n + 2),
+  .compact-model-tables .fern-table td:nth-child(-n + 2) {
+    width: 1%;
+    white-space: nowrap;
+  }
+`}</style>
 
 <Tabs>
 
@@ -184,7 +207,7 @@ New models are added regularly. Pick a model below to start fine-tuning, or see 
 
 </Tabs>
 
-</CompactModelTables>
+</div>
 
 {/* END GENERATED LATEST MODEL SUPPORT */}
 

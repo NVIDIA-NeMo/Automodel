@@ -39,6 +39,30 @@ DOCS_PAGE_PATTERN = re.compile(r"^/[a-z0-9][a-z0-9/-]*$")
 MODEL_TYPE_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9 -]*$")
 MARKDOWN_UNSAFE_PATTERN = re.compile(r"[\[\]|<>`\r\n]")
 REPOSITORY_URL = "https://github.com/NVIDIA-NeMo/Automodel/blob/main"
+COMPACT_TABLE_STYLE = """<style>{`
+  .compact-model-tables .fern-table-root {
+    width: fit-content !important;
+    max-width: 100%;
+  }
+
+  .compact-model-tables .fern-table {
+    width: max-content !important;
+    min-width: 0 !important;
+    max-width: 100%;
+    table-layout: auto !important;
+  }
+
+  .compact-model-tables .fern-table th,
+  .compact-model-tables .fern-table td {
+    text-align: left !important;
+  }
+
+  .compact-model-tables .fern-table th:nth-child(-n + 2),
+  .compact-model-tables .fern-table td:nth-child(-n + 2) {
+    width: 1%;
+    white-space: nowrap;
+  }
+`}</style>"""
 _BrevStatus = Literal["available", "planned", "unavailable"]
 
 
@@ -341,7 +365,16 @@ def _render_release_tabs(releases: list[_ModelRelease], *, row_limit: int | None
         )
         for title, tab_releases in tabs
     ]
-    return "\n\n".join(["<CompactModelTables>", "<Tabs>", *tab_blocks, "</Tabs>", "</CompactModelTables>"])
+    return "\n\n".join(
+        [
+            '<div className="compact-model-tables">',
+            COMPACT_TABLE_STYLE,
+            "<Tabs>",
+            *tab_blocks,
+            "</Tabs>",
+            "</div>",
+        ]
+    )
 
 
 def _render_release_log_table(releases: list[_ModelRelease]) -> str:
