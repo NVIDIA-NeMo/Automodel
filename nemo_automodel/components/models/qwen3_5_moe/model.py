@@ -870,7 +870,7 @@ class Qwen3_5MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
 
     def forward(
         self,
-        input_ids: torch.LongTensor | None = None,
+        input_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
         past_key_values: Any | None = None,
@@ -883,6 +883,43 @@ class Qwen3_5MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         padding_mask: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> Qwen3_5MoeCausalLMOutputWithPast:
+        """Run the text-only causal LM forward pass.
+
+        Args:
+            input_ids: Token ids of shape ``[batch, sequence]``. On a non-first
+                pipeline stage where ``embed_tokens`` is absent, this argument
+                instead carries hidden states of shape
+                ``[batch, sequence, hidden]`` and is routed as ``inputs_embeds``.
+            attention_mask: Optional mask of shape ``[batch, sequence]`` or
+                ``[batch, 1, sequence, sequence]``.
+            position_ids: Optional M-RoPE positions of shape
+                ``[axes, batch, sequence]`` or ``[batch, sequence]``.
+            past_key_values: Optional KV-cache state; caching is not supported
+                by this backend and a non-``None`` value raises.
+            inputs_embeds: Optional hidden inputs of shape
+                ``[batch, sequence, hidden]``.
+            labels: Optional labels of shape ``[batch, sequence]``. Accepted for
+                Hugging Face compatibility; loss is computed outside this model.
+            use_cache: Whether to use a KV cache; ``True`` is unsupported.
+            logits_to_keep: ``0`` to project every position, a positive integer
+                to keep the last positions, or indices of shape
+                ``[kept_sequence]``.
+            output_hidden_states: Whether to include final decoder states in the
+                output for the fused loss path.
+            cache_position: Optional token positions of shape ``[sequence]``.
+            padding_mask: Optional padding mask of shape ``[batch, sequence]``
+                where ``True`` marks padding.
+            **kwargs: Additional attention and packed-sequence metadata forwarded
+                to the decoder and optional MTP layers.
+
+        Returns:
+            A causal-LM output whose logits have shape
+            ``[batch, kept_sequence, vocab]`` (or
+            ``[batch, sequence, hidden]`` on a non-final pipeline stage), whose
+            requested hidden states have shape ``[batch, sequence, hidden]``,
+            and whose optional per-depth MTP tensors each have shape
+            ``[batch, sequence, hidden]``.
+        """
         del labels
         if inputs_embeds is None and self.model.embed_tokens is None and input_ids is not None:
             inputs_embeds = input_ids
