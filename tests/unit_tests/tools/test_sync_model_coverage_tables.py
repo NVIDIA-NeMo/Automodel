@@ -13,8 +13,11 @@
 # limitations under the License.
 
 import json
+import re
+from pathlib import Path
 
 import pytest
+import yaml
 
 from tests.ci_tests.utils.sync_model_coverage_tables import (
     HOMEPAGE_END_MARKER,
@@ -29,6 +32,23 @@ from tests.ci_tests.utils.sync_model_coverage_tables import (
     _replace_generated_block,
     _sync_tables,
 )
+
+
+def _fern_slug(value: str) -> str:
+    value = value.lower().replace("&", "and")
+    return re.sub(r"[^a-z0-9]+", "-", value).strip("-")
+
+
+def _collect_fern_routes(items: list[dict[str, object]], parents: tuple[str, ...] = ()) -> set[str]:
+    routes = set()
+    for item in items:
+        if "section" in item:
+            slug = str(item.get("slug", _fern_slug(str(item["section"]))))
+            routes.update(_collect_fern_routes(item.get("contents", []), (*parents, slug)))
+        elif "page" in item:
+            slug = str(item.get("slug", _fern_slug(str(item["page"]))))
+            routes.add("/" + "/".join((*parents, slug)))
+    return routes
 
 
 def test_registry_table_is_generated_from_mapping_entries():
@@ -69,6 +89,18 @@ def test_generated_registry_table_replaces_the_marked_block():
     assert updated.endswith("\nafter\n")
 
 
+def test_model_release_docs_pages_exist_in_nightly_navigation():
+    repo_root = Path(__file__).parents[3]
+    releases = json.loads((repo_root / "docs" / "model-coverage" / "model-releases.json").read_text(encoding="utf-8"))
+    navigation = yaml.safe_load((repo_root / "docs" / "fern" / "versions" / "nightly.yml").read_text(encoding="utf-8"))[
+        "navigation"
+    ]
+
+    missing_pages = sorted({release["docs_page"] for release in releases} - _collect_fern_routes(navigation))
+
+    assert not missing_pages, f"Model release docs pages missing from nightly navigation: {missing_pages}"
+
+
 def test_sync_tables_writes_release_log_homepage_and_registry(tmp_path):
     (tmp_path / "docs" / "model-coverage").mkdir(parents=True)
     (tmp_path / "nemo_automodel" / "_transformers").mkdir(parents=True)
@@ -79,6 +111,7 @@ def test_sync_tables_writes_release_log_homepage_and_registry(tmp_path):
             "date": "2026-07-31",
             "model": "Documentation Model",
             "hf_model_id": "org/documentation-model",
+            "docs_page": "/model-coverage/vision-language-models/documentation-model",
             "modality": "VLM",
             "recipe": None,
             "brev_status": "available",
@@ -93,6 +126,7 @@ def test_sync_tables_writes_release_log_homepage_and_registry(tmp_path):
                 "date": f"2026-07-{30 - index:02d}",
                 "model": f"Model {index}",
                 "hf_model_id": f"org/model-{index}",
+                "docs_page": f"/model-coverage/large-language-models/model-{index}",
                 "modality": "LLM",
                 "recipe": recipe_path,
                 "brev_status": "planned",
@@ -121,13 +155,23 @@ def test_sync_tables_writes_release_log_homepage_and_registry(tmp_path):
     ]
     release_log = (tmp_path / "docs" / "model-coverage" / "latest-models.mdx").read_text(encoding="utf-8")
     assert (
-        "| 2026-07-31 | VLM | [`org/documentation-model`](https://huggingface.co/org/documentation-model) | "
-        "Documentation only |"
+        "| 2026-07-31 | VLM | "
+        "[Documentation-model](/model-coverage/vision-language-models/documentation-model) "
+        "(Documentation only) |"
     ) in release_log
+    assert '<Tab title="All">' in release_log
+    assert '<Tab title="LLM">' in release_log
+    assert '<Tab title="VLM">' in release_log
+    llm_tab = release_log.split('<Tab title="LLM">', 1)[1].split("</Tab>", 1)[0]
+    vlm_tab = release_log.split('<Tab title="VLM">', 1)[1].split("</Tab>", 1)[0]
+    assert "[Model-0](/model-coverage/large-language-models/model-0)" in llm_tab
+    assert "[Documentation-model]" not in llm_tab
+    assert "[Documentation-model](/model-coverage/vision-language-models/documentation-model)" in vlm_tab
+    assert "[Model-0]" not in vlm_tab
     assert "Documentation Model" not in release_log
     assert "Try on Brev" not in release_log
     assert "brev.nvidia.com" not in release_log
-    assert "[Model 0](https://huggingface.co/org/model-0)" in (tmp_path / "docs" / "index.mdx").read_text(
+    assert "[Model-0](/model-coverage/large-language-models/model-0)" in (tmp_path / "docs" / "index.mdx").read_text(
         encoding="utf-8"
     )
     assert "Documentation Model" not in (tmp_path / "docs" / "index.mdx").read_text(encoding="utf-8")
@@ -143,6 +187,7 @@ def test_model_release_catalog_rejects_non_chronological_entries(tmp_path):
             "date": "2026-07-29",
             "model": "Older Model",
             "hf_model_id": "org/older-model",
+            "docs_page": "/model-coverage/large-language-models/older-model",
             "modality": "LLM",
             "recipe": None,
             "brev_status": "unavailable",
@@ -151,6 +196,7 @@ def test_model_release_catalog_rejects_non_chronological_entries(tmp_path):
             "date": "2026-07-30",
             "model": "Newer Model",
             "hf_model_id": "org/newer-model",
+            "docs_page": "/model-coverage/large-language-models/newer-model",
             "modality": "LLM",
             "recipe": None,
             "brev_status": "planned",
@@ -169,6 +215,7 @@ def test_model_release_catalog_requires_iso_date_format(tmp_path):
             "date": "20260730",
             "model": "Model",
             "hf_model_id": "org/model",
+            "docs_page": "/model-coverage/large-language-models/model",
             "modality": "LLM",
             "recipe": None,
             "brev_status": "planned",
@@ -178,6 +225,25 @@ def test_model_release_catalog_requires_iso_date_format(tmp_path):
     catalog_path.write_text(json.dumps(catalog), encoding="utf-8")
 
     with pytest.raises(ValueError, match="YYYY-MM-DD"):
+        _load_model_releases(catalog_path, tmp_path)
+
+
+def test_model_release_catalog_requires_version_agnostic_docs_page(tmp_path):
+    catalog = [
+        {
+            "date": "2026-07-30",
+            "model": "Model",
+            "hf_model_id": "org/model",
+            "docs_page": "https://docs.nvidia.com/nemo/automodel/nightly/model",
+            "modality": "LLM",
+            "recipe": None,
+            "brev_status": "planned",
+        }
+    ]
+    catalog_path = tmp_path / "model-releases.json"
+    catalog_path.write_text(json.dumps(catalog), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="version-agnostic docs page"):
         _load_model_releases(catalog_path, tmp_path)
 
 
@@ -194,6 +260,7 @@ def test_sync_tables_check_rejects_stale_generated_release_log(tmp_path):
                 "date": f"2026-07-{30 - index:02d}",
                 "model": f"Model {index}",
                 "hf_model_id": f"org/model-{index}",
+                "docs_page": f"/model-coverage/large-language-models/model-{index}",
                 "modality": "LLM",
                 "recipe": recipe_path,
                 "brev_status": "planned",

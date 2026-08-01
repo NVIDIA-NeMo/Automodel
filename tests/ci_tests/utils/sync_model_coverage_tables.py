@@ -34,6 +34,8 @@ REGISTRY_END_MARKER = "{/* END GENERATED MODEL ARCHITECTURES */}"
 HF_MODEL_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 RELEASE_DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 RECIPE_PATH_PATTERN = re.compile(r"^examples/[A-Za-z0-9_./-]+\.yaml$")
+DOCS_PAGE_PATTERN = re.compile(r"^/[a-z0-9][a-z0-9/-]*$")
+MODALITY_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9 -]*$")
 MARKDOWN_UNSAFE_PATTERN = re.compile(r"[\[\]|<>`\r\n]")
 REPOSITORY_URL = "https://github.com/NVIDIA-NeMo/Automodel/blob/main"
 _BrevStatus = Literal["available", "planned", "unavailable"]
@@ -44,6 +46,7 @@ class _ModelRelease:
     release_date: str
     model: str
     hf_model_id: str
+    docs_page: str
     modality: str
     recipe: str | None
     brev_status: _BrevStatus
@@ -88,6 +91,7 @@ def _load_model_releases(catalog_path: Path, repo_root: Path) -> list[_ModelRele
             "date",
             "model",
             "hf_model_id",
+            "docs_page",
             "modality",
             "recipe",
             "brev_status",
@@ -95,7 +99,9 @@ def _load_model_releases(catalog_path: Path, repo_root: Path) -> list[_ModelRele
         }
         if unknown_fields:
             raise ValueError(f"Model release {index} has unknown fields: {', '.join(sorted(unknown_fields))}")
-        missing_fields = {"date", "model", "hf_model_id", "modality", "recipe", "brev_status"} - set(raw_entry)
+        missing_fields = {"date", "model", "hf_model_id", "docs_page", "modality", "recipe", "brev_status"} - set(
+            raw_entry
+        )
         if missing_fields:
             raise ValueError(f"Model release {index} is missing fields: {', '.join(sorted(missing_fields))}")
 
@@ -114,9 +120,14 @@ def _load_model_releases(catalog_path: Path, repo_root: Path) -> list[_ModelRele
 
         model = _require_catalog_text(raw_entry, "model", index)
         hf_model_id = _require_catalog_text(raw_entry, "hf_model_id", index)
+        docs_page = _require_catalog_text(raw_entry, "docs_page", index)
         modality = _require_catalog_text(raw_entry, "modality", index)
         if not HF_MODEL_ID_PATTERN.fullmatch(hf_model_id):
             raise ValueError(f"Model release {index} has invalid Hugging Face model ID {hf_model_id!r}")
+        if not DOCS_PAGE_PATTERN.fullmatch(docs_page) or "//" in docs_page or ".." in docs_page:
+            raise ValueError(f"Model release {index} has invalid version-agnostic docs page {docs_page!r}")
+        if not MODALITY_PATTERN.fullmatch(modality):
+            raise ValueError(f"Model release {index} has invalid modality {modality!r}")
         if model in seen_models:
             raise ValueError(f"Model release catalog contains duplicate model {model!r}")
         if hf_model_id in seen_hf_model_ids:
@@ -168,6 +179,7 @@ def _load_model_releases(catalog_path: Path, repo_root: Path) -> list[_ModelRele
                 release_date=release_date,
                 model=model,
                 hf_model_id=hf_model_id,
+                docs_page=docs_page,
                 modality=modality,
                 recipe=recipe,
                 brev_status=brev_status,
@@ -183,23 +195,39 @@ def _render_recipe_link(release: _ModelRelease) -> str:
     return f"[{Path(release.recipe).name}]({REPOSITORY_URL}/{release.recipe})"
 
 
-def _render_release_log_table(releases: list[_ModelRelease]) -> str:
+def _render_model_with_recipe(release: _ModelRelease) -> str:
+    model_name = release.hf_model_id.split("/", 1)[1]
+    model_name = model_name[:1].upper() + model_name[1:]
+    return f"[{model_name}]({release.docs_page}) ({_render_recipe_link(release)})"
+
+
+def _render_release_table(releases: list[_ModelRelease]) -> str:
     table_rows = [
-        f"| {release.release_date} | {release.modality} | "
-        f"[`{release.hf_model_id}`](https://huggingface.co/{release.hf_model_id}) | "
-        f"{_render_recipe_link(release)} |"
+        f"| {release.release_date} | {release.modality} | {_render_model_with_recipe(release)} |"
         for release in releases
     ]
 
     return "\n".join(
         [
-            RELEASE_LOG_START_MARKER,
-            "| Date | Modality | Model | Recipe |",
-            "|------|----------|-------|--------|",
+            "| Date | Modality | Model |",
+            "|------|----------|-------|",
             *table_rows,
-            RELEASE_LOG_END_MARKER,
         ]
     )
+
+
+def _render_release_log_table(releases: list[_ModelRelease]) -> str:
+    modalities = sorted(
+        {release.modality for release in releases}, key=lambda modality: (modality != "LLM", modality.casefold())
+    )
+    tabs = [("All", releases)] + [
+        (modality, [release for release in releases if release.modality == modality]) for modality in modalities
+    ]
+    tab_blocks = [
+        "\n".join([f'<Tab title="{title}">', "", _render_release_table(tab_releases), "", "</Tab>"])
+        for title, tab_releases in tabs
+    ]
+    return "\n\n".join([RELEASE_LOG_START_MARKER, "<Tabs>", *tab_blocks, "</Tabs>", RELEASE_LOG_END_MARKER])
 
 
 def _render_homepage_table(releases: list[_ModelRelease]) -> str:
@@ -208,8 +236,7 @@ def _render_homepage_table(releases: list[_ModelRelease]) -> str:
         raise ValueError(f"Model release catalog contains only {len(runnable_releases)} runnable recipes")
 
     table_rows = [
-        f"| {release.release_date} | {release.modality} | "
-        f"[{release.model}](https://huggingface.co/{release.hf_model_id}) ({_render_recipe_link(release)}) |"
+        f"| {release.release_date} | {release.modality} | {_render_model_with_recipe(release)} |"
         for release in runnable_releases[:HOMEPAGE_ROW_COUNT]
     ]
 

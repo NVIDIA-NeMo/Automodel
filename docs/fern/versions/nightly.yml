@@ -189,6 +189,9 @@ navigation:
           - page: "Ling 2.0"
             path: ../../model-coverage/llm/inclusionai/ling-2.mdx
             slug: ling-2-0
+          - page: "Laguna"
+            path: ../../model-coverage/llm/poolside/laguna.mdx
+            slug: laguna
       - section: "Vision Language Models"
         slug: vision-language-models
         contents:
