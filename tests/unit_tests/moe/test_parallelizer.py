@@ -316,7 +316,11 @@ def _install_torch_and_layers_stubs(monkeypatch):
     class MoE:
         pass
 
+    class Gate:
+        pass
+
     layers_stub.GroupedExpertsDeepEP = GroupedExpertsDeepEP
+    layers_stub.Gate = Gate
     layers_stub.MoE = MoE
     monkeypatch.setitem(sys.modules, "nemo_automodel.components.moe.layers", layers_stub)
 
@@ -771,6 +775,8 @@ def test_apply_fsdp_calls_with_ignored_params_and_shard_for_experts(monkeypatch)
     monkeypatch.setattr(P, "Shard", fake_shard)
 
     block = DummyBlock(mlp=DummyMoE())
+    block.mlp.gate = P.Gate()
+    block.mlp.gate._set_expert_load_mesh = MagicMock()
     embed = object()
     embed_norm = object()
     lm = object()
@@ -788,6 +794,8 @@ def test_apply_fsdp_calls_with_ignored_params_and_shard_for_experts(monkeypatch)
         ep_shard_mesh=ep_shard_mesh,
         offload_policy=offload_policy,
     )
+
+    block.mlp.gate._set_expert_load_mesh.assert_called_once_with(fsdp_mesh)
 
     # Experts should have a dedicated shard call
     experts = block.mlp.experts

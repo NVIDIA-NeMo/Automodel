@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import importlib.util
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -1026,6 +1026,36 @@ class TestGate:
         assert not torch.equal(gate.e_score_correction_bias, original_bias)
         # Cumulative load should be reset
         assert gate._cumulative_expert_load is None
+
+    def test_gate_update_bias_aggregates_plain_buffer_load(self, moe_config, device):
+        """Plain FSDP buffers aggregate rank-local load before updating routing bias."""
+        moe_config.gate_bias_update_factor = 0.1
+        gate = Gate(moe_config).to(device)
+        gate.train()
+
+        local_load = torch.tensor([8, 0, 0, 0, 0, 0, 0, 0], device=device)
+        remote_load = torch.tensor([0, 8, 0, 0, 0, 0, 0, 0], device=device)
+        gate._cumulative_expert_load = local_load.clone()
+
+        process_group = object()
+        mesh = MagicMock()
+        mesh.size.return_value = 2
+        mesh.mesh_dim_names = ("dp_shard_cp",)
+        mesh.get_group.return_value = process_group
+        gate._set_expert_load_mesh(mesh)
+
+        def _sum_remote_load(expert_load, *, op, group):
+            assert op == torch.distributed.ReduceOp.SUM
+            assert group is process_group
+            expert_load.add_(remote_load)
+
+        with patch("torch.distributed.all_reduce", side_effect=_sum_remote_load) as all_reduce:
+            gate.update_bias()
+
+        all_reduce.assert_called_once()
+        mesh.get_group.assert_called_once_with("dp_shard_cp")
+        expected = torch.tensor([-0.1, -0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1], device=device)
+        torch.testing.assert_close(gate.e_score_correction_bias, expected)
 
     def test_gate_init_weights(self, moe_config, device):
         """Test Gate weight initialization."""

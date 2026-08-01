@@ -16,6 +16,7 @@ from functools import partial
 from typing import Optional
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributed.device_mesh import DeviceMesh
@@ -290,6 +291,12 @@ class Gate(nn.Module):
 
         self.e_score_correction_bias_master = None
 
+        # Runtime-only mesh used to aggregate token counts before updating the
+        # replicated score-correction bias. FSDP2 shards parameters but leaves
+        # buffers as ordinary tensors, so the bias cannot infer its reduction
+        # group from DTensor metadata in the common distributed path.
+        self._expert_load_mesh: Optional[DeviceMesh] = None
+
         # Cumulative expert load is a tensor representing the number of tokens
         # routed to each expert on the current rank, accumulated across gradient
         # accumulation steps.
@@ -307,6 +314,10 @@ class Gate(nn.Module):
         )
         self.routing_core = _GateRoutingCore()
         self.use_routing_core = False
+
+    def _set_expert_load_mesh(self, mesh: Optional[DeviceMesh]) -> None:
+        """Set the runtime mesh used to aggregate expert load before bias updates."""
+        self._expert_load_mesh = mesh
 
     def _route_scores(self, scores: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """Apply fixed-shape expert selection and probability math to router logits."""
@@ -522,6 +533,13 @@ class Gate(nn.Module):
                 placements=[Partial()] * self.e_score_correction_bias.device_mesh.ndim,
             )
             expert_load = expert_load.full_tensor()
+        elif self._expert_load_mesh is not None and self._expert_load_mesh.size() > 1:
+            for mesh_dim in self._expert_load_mesh.mesh_dim_names:
+                dist.all_reduce(
+                    expert_load,
+                    op=dist.ReduceOp.SUM,
+                    group=self._expert_load_mesh.get_group(mesh_dim),
+                )
 
         # 2) Compute the bias update by comparing the expert load to the average expert load.
         expert_load = expert_load.float()
