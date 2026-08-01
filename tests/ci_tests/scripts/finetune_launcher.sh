@@ -15,7 +15,7 @@
 # Finetune launcher. Config resolution happens in config_resolver.py.
 #
 # Env required: CONFIG_PATH, PIPELINE_DIR, TEST_NAME, TEST_LEVEL, TEST_SCRIPT_PATH,
-#   TEST_NODE_COUNT, NPROC_PER_NODE, MASTER_ADDR, MASTER_PORT, SLURM_JOB_ID, HAS_ROBUSTNESS
+#   TEST_NODE_COUNT, NPROC_PER_NODE, MASTER_ADDR, MASTER_PORT, SLURM_JOB_ID, SLURM_NODEID, HAS_ROBUSTNESS
 # Env optional: EXEC_CMD, RDZV_TIMEOUT, MAX_STEPS, LOCAL_BATCH_SIZE,
 #   CONFIG_NPROC_PER_NODE, FINETUNE_ARGS, NEMO_CI_PATH, WANDB_AUTOMODEL_API_KEY, TIME
 
@@ -105,14 +105,14 @@ if [[ "$HAS_ROBUSTNESS" == "true" ]]; then
 
   ROBUSTNESS_LAUNCH_CMD="$CMD"
   if [[ "$CMD" == torchrun* ]]; then
-    # A completed rendezvous endpoint cannot be reused reliably by the second torchrun.
+    # The elastic c10d rendezvous cannot be restarted reliably in the same Slurm step.
+    # Slurm already assigns a stable node rank, so use a fresh static endpoint instead.
     ROBUSTNESS_MASTER_PORT=$((MASTER_PORT + 1))
-    FINETUNE_RDZV_ENDPOINT="--rdzv_endpoint=${MASTER_ADDR}:${MASTER_PORT}"
-    ROBUSTNESS_RDZV_ENDPOINT="--rdzv_endpoint=${MASTER_ADDR}:${ROBUSTNESS_MASTER_PORT}"
-    ROBUSTNESS_LAUNCH_CMD="${ROBUSTNESS_LAUNCH_CMD/${FINETUNE_RDZV_ENDPOINT}/${ROBUSTNESS_RDZV_ENDPOINT}}"
-    FINETUNE_RDZV_ID="--rdzv_id=${SLURM_JOB_ID}"
-    ROBUSTNESS_RDZV_ID="--rdzv_id=${SLURM_JOB_ID}-robustness"
-    ROBUSTNESS_LAUNCH_CMD="${ROBUSTNESS_LAUNCH_CMD/${FINETUNE_RDZV_ID}/${ROBUSTNESS_RDZV_ID}}"
+    ROBUSTNESS_LAUNCH_CMD="torchrun --nproc-per-node=${NPROC_PER_NODE} \
+      --nnodes=${TEST_NODE_COUNT} \
+      --node_rank=${SLURM_NODEID} \
+      --master_addr=${MASTER_ADDR} \
+      --master_port=${ROBUSTNESS_MASTER_PORT}"
   fi
 
   ROBUSTNESS_CMD="${ROBUSTNESS_LAUNCH_CMD} --tee 3 --log-dir $TEST_DIR/robustness_logs \
