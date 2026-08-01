@@ -28,6 +28,7 @@ from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm
     _extract_custom_args,
     _finish_hf_reload_sync,
     _get_input_ids,
+    _hf_device_map_max_memory,
     _hf_fp32_module_names,
     _hf_model_load_context,
     _hf_source_load_kwargs,
@@ -36,11 +37,35 @@ from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm
     _load_input_ids_once,
     _post_load_dequant_max_memory,
     _record_deferred_failure,
+    _resolve_hf_model_class,
+    _run_process_isolated_checkpoint_phase,
     _trainable_parameter_digests,
     _wait_for_hf_reload_rank0,
 )
 from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_vlm import _get_vlm_input_ids
 from tests.functional_tests.checkpoint_robustness.test_checkpoint_vllm_deploy import _tokenize_for_generation
+
+
+def test_resolve_hf_model_class_uses_advertised_causal_lm_for_vlm_checkpoint():
+    from transformers import AutoModelForCausalLM, AutoModelForImageTextToText
+
+    config_dict = {
+        "auto_map": {
+            "AutoConfig": "configuration_step3p7.Step3p7Config",
+            "AutoModelForCausalLM": "modeling_step3p7.Step3p7ForConditionalGeneration",
+        }
+    }
+    with patch("transformers.PretrainedConfig.get_config_dict", return_value=(config_dict, {})):
+        resolved_cls = _resolve_hf_model_class("model-path", AutoModelForImageTextToText)
+
+    assert resolved_cls is AutoModelForCausalLM
+
+
+def test_hf_device_map_max_memory_caps_each_visible_gpu():
+    with patch("torch.cuda.device_count", return_value=8):
+        max_memory = _hf_device_map_max_memory("55")
+
+    assert max_memory == {index: "55GiB" for index in range(8)}
 
 
 @pytest.mark.parametrize(
@@ -244,6 +269,71 @@ def test_extract_custom_args_accepts_isolated_phase():
 
     assert custom["isolated_phase"] == "train_and_save"
     assert remaining == ["--other-arg"]
+
+
+def test_process_isolated_hf_reload_runs_rank0_hf_loader(tmp_path):
+    artifact_dir = tmp_path / ".checkpoint_robustness"
+    artifact_dir.mkdir()
+    (artifact_dir / "reference_logits.pt").write_bytes(b"reference")
+    cfg = SimpleNamespace(
+        checkpoint=SimpleNamespace(checkpoint_dir=tmp_path),
+        get=lambda key, default=None: default,
+    )
+    reference_logits = torch.randn(1, 2, 3)
+    recipe_cls = Mock()
+    hf_model_cls = Mock()
+
+    with (
+        patch(
+            "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm.parse_args_and_load_config",
+            return_value=cfg,
+        ),
+        patch(
+            "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm."
+            "_disable_distributed_atexit_teardown"
+        ),
+        patch(
+            "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm._load_input_ids_once",
+            return_value=[11, 12],
+        ),
+        patch("torch.distributed.init_process_group") as init_process_group,
+        patch(
+            "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm._prepare_hf_reload_sync",
+            return_value=None,
+        ),
+        patch(
+            "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm._finish_hf_reload_sync",
+            side_effect=lambda paths, error: error,
+        ),
+        patch(
+            "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm._raise_distributed_failure"
+        ) as raise_distributed_failure,
+        patch(
+            "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm._run_vanilla_hf_reload",
+            return_value=None,
+        ) as run_hf_reload,
+        patch("torch.load", return_value=reference_logits),
+    ):
+        _run_process_isolated_checkpoint_phase(
+            "hf_reload",
+            custom_args={"hf_device_map_auto": True, "trust_remote_code": True},
+            recipe_cls=recipe_cls,
+            hf_model_cls=hf_model_cls,
+            input_ids_loader=Mock(),
+        )
+
+    init_process_group.assert_called_once()
+    assert init_process_group.call_args.kwargs["backend"] == "gloo"
+    assert init_process_group.call_args.kwargs["timeout"].total_seconds() == 60
+    run_hf_reload.assert_called_once_with(
+        cfg,
+        [11, 12],
+        reference_logits,
+        hf_model_cls=hf_model_cls,
+        custom_args={"hf_device_map_auto": True, "trust_remote_code": True},
+    )
+    raise_distributed_failure.assert_called_once_with(None)
+    recipe_cls.assert_not_called()
 
 
 def test_trainable_parameter_digests_hash_only_trainable_parameters():
