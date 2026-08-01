@@ -625,17 +625,22 @@ def _input_ids_sync_paths(cfg) -> tuple[Path, Path, Path, Path]:
     return sync_dir, sync_dir / "input_ids.json", sync_dir / "done", sync_dir / "fail"
 
 
-def _wait_for_input_ids_rank0(done_path: Path, fail_path: Path) -> None:
-    """Wait for rank 0 to tokenize the checkpoint-robustness prompt."""
+def _wait_for_input_ids_rank0(payload_path: Path, done_path: Path, fail_path: Path) -> list[int]:
+    """Wait for rank 0 to publish the checkpoint-robustness prompt IDs."""
     timeout_s = int(os.environ.get("CHECKPOINT_INPUT_IDS_TIMEOUT_SECONDS", "1800"))
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
-        if done_path.exists():
-            return
         if fail_path.exists():
             raise RuntimeError(f"Rank 0 input-ID loading failed:\n{fail_path.read_text()}")
+        if done_path.exists():
+            try:
+                payload = payload_path.read_text()
+            except FileNotFoundError:
+                pass
+            else:
+                return [int(token_id) for token_id in json.loads(payload)]
         time.sleep(5)
-    raise TimeoutError(f"Timed out waiting {timeout_s}s for rank 0 input-ID loading")
+    raise TimeoutError(f"Timed out waiting {timeout_s}s for rank 0 input-ID publication")
 
 
 def _load_input_ids_once(
@@ -654,10 +659,12 @@ def _load_input_ids_once(
 
     sync_dir, payload_path, done_path, fail_path = _input_ids_sync_paths(cfg)
     if _preinit_global_rank() != 0:
-        _wait_for_input_ids_rank0(done_path, fail_path)
-        return [int(token_id) for token_id in json.loads(payload_path.read_text())]
+        return _wait_for_input_ids_rank0(payload_path, done_path, fail_path)
 
     sync_dir.mkdir(parents=True, exist_ok=True)
+    if done_path.exists():
+        return _wait_for_input_ids_rank0(payload_path, done_path, fail_path)
+
     payload_path.unlink(missing_ok=True)
     done_path.unlink(missing_ok=True)
     fail_path.unlink(missing_ok=True)
@@ -1476,6 +1483,19 @@ def _source_load_artifact_paths(cfg) -> tuple[Path, Path]:
     return artifact_dir / "source_load_reference_logits.pt", artifact_dir / "source_load_reference_metadata.json"
 
 
+def _wait_for_source_load_artifacts(reference_path: Path, metadata_path: Path, fail_path: Path) -> None:
+    """Wait for rank 0 to publish the isolated Phase 0 reference artifacts."""
+    timeout_s = int(os.environ.get("SOURCE_LOAD_PARITY_TIMEOUT_SECONDS", "1800"))
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if fail_path.exists():
+            raise RuntimeError(f"Rank 0 source-load artifact publication failed:\n{fail_path.read_text()}")
+        if reference_path.exists() and metadata_path.exists():
+            return
+        time.sleep(5)
+    raise TimeoutError(f"Timed out waiting {timeout_s}s for rank 0 source-load artifact publication")
+
+
 def _disable_distributed_atexit_teardown() -> None:
     """Let process exit reclaim distributed resources after an isolated phase."""
     import atexit
@@ -1543,6 +1563,17 @@ def _run_process_isolated_checkpoint_phase(
         if not custom_args.get("check_source_load_parity", False):
             raise ValueError("Isolated source_load_reference requires check_source_load_parity=true")
 
+        reference_path, metadata_path = _source_load_artifact_paths(cfg)
+        source_load_fail_path = _source_load_sync_paths(cfg)[2] if _preinit_world_size() > 1 else None
+        if _preinit_global_rank() == 0:
+            for path in (
+                reference_path,
+                reference_path.with_suffix(".tmp"),
+                metadata_path,
+                metadata_path.with_suffix(".tmp"),
+            ):
+                path.unlink(missing_ok=True)
+
         _report_phase("Isolated Phase 0a source load: loading prompt input IDs")
         input_ids = _load_input_ids_once(cfg, input_ids_loader, tokenizer_name)
         _report_phase("Isolated Phase 0a source load: starting vanilla-HF reference load")
@@ -1558,18 +1589,29 @@ def _run_process_isolated_checkpoint_phase(
         if _preinit_global_rank() == 0:
             assert source_load_reference is not None, "rank 0 source-load reference was not captured"
             reference_logits, hf_aliased, explicit_tie_word_embeddings = source_load_reference
-            reference_path, metadata_path = _source_load_artifact_paths(cfg)
             reference_path.parent.mkdir(parents=True, exist_ok=True)
-            torch.save(reference_logits, reference_path)
-            metadata_path.write_text(
-                json.dumps(
-                    {
-                        "explicit_tie_word_embeddings": explicit_tie_word_embeddings,
-                        "hf_aliased": hf_aliased,
-                    },
-                    sort_keys=True,
+            temporary_reference_path = reference_path.with_suffix(".tmp")
+            temporary_metadata_path = metadata_path.with_suffix(".tmp")
+            try:
+                torch.save(reference_logits, temporary_reference_path)
+                temporary_reference_path.replace(reference_path)
+                temporary_metadata_path.write_text(
+                    json.dumps(
+                        {
+                            "explicit_tie_word_embeddings": explicit_tie_word_embeddings,
+                            "hf_aliased": hf_aliased,
+                        },
+                        sort_keys=True,
+                    )
                 )
-            )
+                temporary_metadata_path.replace(metadata_path)
+            except Exception:
+                if source_load_fail_path is not None:
+                    source_load_fail_path.write_text(traceback.format_exc())
+                raise
+        else:
+            assert source_load_fail_path is not None
+            _wait_for_source_load_artifacts(reference_path, metadata_path, source_load_fail_path)
         _report_phase("Isolated Phase 0a source load: reference persisted; exiting phase")
         return
 
