@@ -19,27 +19,27 @@ from .encoding import build_chat_segments, is_batched_conversation
 
 logger = getLogger(__name__)
 VOCAB_FILES_NAMES = {"vocab_file": "tiktoken.model"}
-# Fern autodoc emits literal ampersands as invalid MDX.
-_REGEX_SET_INTERSECTION = chr(38) * 2
-_NON_HAN_UPPER_OR_MARK = r"""[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}""" + _REGEX_SET_INTERSECTION + r"""[^\p{Han}]]"""
-_NON_HAN_LOWER_OR_MARK = r"""[\p{Ll}\p{Lm}\p{Lo}\p{M}""" + _REGEX_SET_INTERSECTION + r"""[^\p{Han}]]"""
 
 
 def _build_kimi_k3_pat_str() -> str:
     """Build the Kimi K3 tiktoken regex without exposing raw set intersections to autodoc."""
 
+    regex_set_intersection = chr(38) * 2
+    non_han_upper_or_mark = r"""[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}""" + regex_set_intersection + r"""[^\p{Han}]]"""
+    non_han_lower_or_mark = r"""[\p{Ll}\p{Lm}\p{Lo}\p{M}""" + regex_set_intersection + r"""[^\p{Han}]]"""
+
     return "|".join(
         [
             r"""[\p{Han}]+""",
             r"""[^\r\n\p{L}\p{N}]?"""
-            + _NON_HAN_UPPER_OR_MARK
+            + non_han_upper_or_mark
             + r"""*"""
-            + _NON_HAN_LOWER_OR_MARK
+            + non_han_lower_or_mark
             + r"""+(?i:'s|'t|'re|'ve|'m|'ll|'d)?""",
             r"""[^\r\n\p{L}\p{N}]?"""
-            + _NON_HAN_UPPER_OR_MARK
+            + non_han_upper_or_mark
             + r"""+"""
-            + _NON_HAN_LOWER_OR_MARK
+            + non_han_lower_or_mark
             + r"""*(?i:'s|'t|'re|'ve|'m|'ll|'d)?""",
             r"""\p{N}{1,3}""",
             r""" ?[^\s\p{L}\p{N}]+[\r\n]*""",
