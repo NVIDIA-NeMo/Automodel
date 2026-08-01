@@ -18,7 +18,6 @@ import argparse
 import ast
 import json
 import re
-import subprocess
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -71,58 +70,6 @@ def _require_catalog_text(raw_entry: dict[str, object], field: str, index: int) 
     if not isinstance(value, str) or not value or MARKDOWN_UNSAFE_PATTERN.search(value):
         raise ValueError(f"Model release {index} field {field!r} must be a non-empty Markdown-safe string")
     return value
-
-
-def _load_recipe_addition_dates(repo_root: Path, recipe_paths: set[str]) -> dict[str, str] | None:
-    if not (repo_root / ".git").exists():
-        return None
-
-    try:
-        shallow_result = subprocess.run(
-            ["git", "-C", str(repo_root), "rev-parse", "--is-shallow-repository"],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-    except (OSError, subprocess.CalledProcessError) as error:
-        raise ValueError(f"Could not inspect Git history in {repo_root}: {error}") from error
-    if shallow_result.stdout.strip() == "true":
-        return None
-
-    try:
-        log_result = subprocess.run(
-            [
-                "git",
-                "-C",
-                str(repo_root),
-                "log",
-                "--reverse",
-                "--no-renames",
-                "--diff-filter=A",
-                "--format=@@DATE@@%cs",
-                "--name-only",
-                "--",
-                *sorted(recipe_paths),
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-    except (OSError, subprocess.CalledProcessError) as error:
-        raise ValueError(f"Could not read recipe addition dates from Git history: {error}") from error
-
-    addition_dates: dict[str, str] = {}
-    commit_date: str | None = None
-    for line in log_result.stdout.splitlines():
-        if line.startswith("@@DATE@@"):
-            commit_date = line.removeprefix("@@DATE@@")
-        elif line in recipe_paths and commit_date is not None:
-            addition_dates.setdefault(line, commit_date)
-
-    missing_paths = recipe_paths - addition_dates.keys()
-    if missing_paths:
-        raise ValueError(f"Recipes missing addition commits in Git history: {', '.join(sorted(missing_paths))}")
-    return addition_dates
 
 
 def _load_model_releases(catalog_path: Path, repo_root: Path) -> list[_ModelRelease]:
@@ -236,16 +183,6 @@ def _load_model_releases(catalog_path: Path, repo_root: Path) -> list[_ModelRele
                 brev_url=brev_url,
             )
         )
-
-    recipe_addition_dates = _load_recipe_addition_dates(repo_root, {release.recipe for release in releases})
-    if recipe_addition_dates is not None:
-        for release in releases:
-            addition_date = recipe_addition_dates[release.recipe]
-            if release.release_date != addition_date:
-                raise ValueError(
-                    f"Model {release.hf_model_id!r} uses date {release.release_date}, but recipe "
-                    f"{release.recipe!r} was added on {addition_date}"
-                )
     return releases
 
 

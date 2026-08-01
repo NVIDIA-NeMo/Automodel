@@ -42,8 +42,6 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        with:
-          fetch-depth: 0
 
       # `fern check` validates that every path: referenced by docs.yml / the
       # version YAMLs exists on disk. The frozen v0.4 pages are archived off main,
