@@ -105,8 +105,14 @@ if [[ "$HAS_ROBUSTNESS" == "true" ]]; then
 
   ROBUSTNESS_LAUNCH_CMD="$CMD"
   if [[ "$CMD" == torchrun* ]]; then
-    # A completed rendezvous cannot be reused reliably by the second torchrun.
-    ROBUSTNESS_LAUNCH_CMD="${CMD/--rdzv_id=${SLURM_JOB_ID}/--rdzv_id=${SLURM_JOB_ID}-robustness}"
+    # A completed rendezvous endpoint cannot be reused reliably by the second torchrun.
+    ROBUSTNESS_MASTER_PORT=$((MASTER_PORT + 1))
+    FINETUNE_RDZV_ENDPOINT="--rdzv_endpoint=${MASTER_ADDR}:${MASTER_PORT}"
+    ROBUSTNESS_RDZV_ENDPOINT="--rdzv_endpoint=${MASTER_ADDR}:${ROBUSTNESS_MASTER_PORT}"
+    ROBUSTNESS_LAUNCH_CMD="${ROBUSTNESS_LAUNCH_CMD/${FINETUNE_RDZV_ENDPOINT}/${ROBUSTNESS_RDZV_ENDPOINT}}"
+    FINETUNE_RDZV_ID="--rdzv_id=${SLURM_JOB_ID}"
+    ROBUSTNESS_RDZV_ID="--rdzv_id=${SLURM_JOB_ID}-robustness"
+    ROBUSTNESS_LAUNCH_CMD="${ROBUSTNESS_LAUNCH_CMD/${FINETUNE_RDZV_ID}/${ROBUSTNESS_RDZV_ID}}"
   fi
 
   ROBUSTNESS_CMD="${ROBUSTNESS_LAUNCH_CMD} --tee 3 --log-dir $TEST_DIR/robustness_logs \
