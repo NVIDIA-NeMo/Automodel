@@ -304,6 +304,63 @@ def test_deepep_lora_applies_router_weight_after_down(moe_config):
     torch.testing.assert_close(out, expected)
 
 
+def test_deepep_lora_stepfun_fp32_expert_probe_matches_reference(moe_config, monkeypatch):
+    """The probe keeps dispatch BF16 but evaluates each local expert in FP32."""
+    torch.manual_seed(1234)
+    moe_config.dtype = torch.bfloat16
+    moe_config.apply_router_weight_after_down = True
+    moe_config.swiglu_limit = 0.5
+    moe_config.swiglu_clamp_after_activation = True
+    orig_experts = GroupedExpertsDeepEP(moe_config).to(torch.bfloat16)
+    orig_experts.n_routed_experts = 4
+    orig_experts.ep_size = 1
+    with torch.no_grad():
+        orig_experts.gate_and_up_projs.normal_(0, 0.1)
+        orig_experts.down_projs.normal_(0, 0.1)
+
+    lora_module = GroupedExpertsDeepEPLoRA(orig_experts, lora_dim=4, alpha=8).to(torch.bfloat16)
+    with torch.no_grad():
+        lora_module.lora_gate_and_up_B.normal_(0, 0.1)
+        lora_module.lora_down_B.normal_(0, 0.1)
+
+    token_counts = torch.tensor([1, 1, 0, 0], dtype=torch.long)
+    permuted_x = torch.randn(2, 16, dtype=torch.bfloat16)
+    permuted_probs = torch.tensor([0.25, 0.75], dtype=torch.bfloat16)
+    dispatcher = MockDeepEPDispatcher()
+    dispatcher.token_permutation2 = MagicMock(return_value=(permuted_x, token_counts, permuted_probs))
+    lora_module.token_dispatcher = dispatcher
+    monkeypatch.setenv("NEMO_STEP3P7_FP32_EXPERT_PROBE", "1")
+
+    with torch.no_grad():
+        actual = lora_module(
+            torch.randn(2, 16, dtype=torch.bfloat16),
+            torch.ones(2, dtype=torch.bool),
+            permuted_probs.unsqueeze(-1),
+            torch.tensor([[0], [1]], dtype=torch.long),
+        )
+
+        expected_parts = []
+        for expert_idx, expert_input in enumerate(permuted_x):
+            expert_input = expert_input.unsqueeze(0).float()
+            gate_and_up = expert_input @ lora_module.gate_and_up_projs[expert_idx].float()
+            gate_and_up = gate_and_up + (
+                expert_input
+                @ lora_module.lora_gate_and_up_A[expert_idx].float()
+                @ lora_module.lora_gate_and_up_B[expert_idx].float()
+            ) * lora_module.scale
+            gate, up = torch.chunk(gate_and_up, 2, dim=-1)
+            activated = torch.nn.functional.silu(gate).clamp(max=0.5) * up.clamp(min=-0.5, max=0.5)
+            expert_output = activated @ lora_module.down_projs[expert_idx].float()
+            expert_output = expert_output + (
+                activated
+                @ lora_module.lora_down_A[expert_idx].float()
+                @ lora_module.lora_down_B[expert_idx].float()
+            ) * lora_module.scale
+            expected_parts.append((expert_output * permuted_probs[expert_idx].float()).to(torch.bfloat16))
+
+    torch.testing.assert_close(actual, torch.cat(expected_parts))
+
+
 @pytest.mark.skipif(grouped_gemm is None or not torch.cuda.is_available(), reason="Requires grouped_gemm and CUDA")
 def test_grouped_experts_deepep_lora_forward_mocked(moe_config, device):
     """

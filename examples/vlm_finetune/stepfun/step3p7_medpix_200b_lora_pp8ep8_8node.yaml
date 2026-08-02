@@ -151,6 +151,7 @@ ci:
   time: "01:00:00"
   env_vars:
     CHECKPOINT_ROBUSTNESS_PHASES: "source_load_reference source_load_parity"
+    NEMO_STEP3P7_FP32_EXPERT_PROBE: "1"
   checkpoint_robustness:
     # PP=8 with pp_microbatch_size=1 requires at least eight pipeline microbatches.
     step_scheduler.global_batch_size: 64

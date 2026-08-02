@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import math
+import os
 
 import torch
 import torch.nn as nn
@@ -480,6 +481,77 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
         nn.init.zeros_(self.lora_gate_and_up_B)
         nn.init.zeros_(self.lora_down_B)
 
+    def _forward_stepfun_fp32_local_experts(
+        self,
+        hidden_states: torch.Tensor,
+        tokens_per_expert: torch.Tensor,
+        routing_probs: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run exact StepFun expert math after BF16 DeepEP dispatch.
+
+        This diagnostic path intentionally uses an eager per-expert loop because
+        the installed grouped-GEMM kernel only accepts BF16 operands. It keeps
+        DeepEP communication and its output in BF16 while matching the published
+        StepFun FP32 local linear operations.
+        """
+        if torch.is_grad_enabled():
+            raise RuntimeError("The StepFun FP32 expert probe only supports no-grad parity evaluation")
+        if self.config.expert_activation != "swiglu" or not self.config.swiglu_clamp_after_activation:
+            raise RuntimeError("The StepFun FP32 expert probe requires StepFun SwiGLU semantics")
+        if not self.config.apply_router_weight_after_down:
+            raise RuntimeError("The StepFun FP32 expert probe requires routing after the down projection")
+
+        gate_and_up_projs = _to_local(self.gate_and_up_projs)
+        down_projs = _to_local(self.down_projs)
+        lora_gate_and_up_A = _to_local(self.lora_gate_and_up_A)
+        lora_gate_and_up_B = _to_local(self.lora_gate_and_up_B)
+        lora_down_A = _to_local(self.lora_down_A)
+        lora_down_B = _to_local(self.lora_down_B)
+        token_counts = tokens_per_expert.tolist()
+        if len(token_counts) != gate_and_up_projs.size(0):
+            raise RuntimeError(
+                f"DeepEP returned {len(token_counts)} local expert counts for {gate_and_up_projs.size(0)} weights"
+            )
+
+        output = torch.empty_like(hidden_states)
+        token_offset = 0
+        limit = self.config.swiglu_limit
+        for expert_idx, token_count in enumerate(token_counts):
+            next_offset = token_offset + token_count
+            if token_count == 0:
+                continue
+
+            expert_input = hidden_states[token_offset:next_offset].float()
+            gate_and_up = expert_input @ gate_and_up_projs[expert_idx].float()
+            gate_and_up = gate_and_up + (
+                expert_input @ lora_gate_and_up_A[expert_idx].float() @ lora_gate_and_up_B[expert_idx].float()
+            ) * self.scale
+            if self.expert_bias:
+                gate_and_up = gate_and_up + _to_local(self.gate_up_proj_bias)[expert_idx].float()
+
+            gate, up = torch.chunk(gate_and_up, 2, dim=-1)
+            gate = F.silu(gate)
+            if limit > 0.0:
+                gate = gate.clamp(max=limit)
+                up = up.clamp(min=-limit, max=limit)
+            activated = gate * up
+
+            expert_output = activated @ down_projs[expert_idx].float()
+            expert_output = expert_output + (
+                activated @ lora_down_A[expert_idx].float() @ lora_down_B[expert_idx].float()
+            ) * self.scale
+            if self.expert_bias:
+                expert_output = expert_output + _to_local(self.down_proj_bias)[expert_idx].float()
+            expert_output = expert_output * routing_probs[token_offset:next_offset].float()
+            output[token_offset:next_offset] = expert_output.to(output.dtype)
+            token_offset = next_offset
+
+        if token_offset != hidden_states.size(0):
+            raise RuntimeError(
+                f"DeepEP expert counts cover {token_offset} tokens, but dispatch returned {hidden_states.size(0)}"
+            )
+        return output
+
     def forward(
         self,
         x: torch.Tensor,
@@ -507,6 +579,14 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
         activation_probs = (
             torch.ones_like(permuted_probs) if self.config.apply_router_weight_after_down else permuted_probs
         )
+
+        if os.getenv("NEMO_STEP3P7_FP32_EXPERT_PROBE") == "1" and torch.count_nonzero(tokens_per_expert) > 0:
+            output2 = self._forward_stepfun_fp32_local_experts(
+                permuted_local_hidden_states,
+                tokens_per_expert,
+                permuted_probs,
+            )
+            return self.token_dispatcher.token_unpermutation(output2)
 
         compute_dtype = x.dtype
         gate_and_up_projs = _to_grouped_mm_operand(self.gate_and_up_projs, compute_dtype)
