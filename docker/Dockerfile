@@ -228,7 +228,7 @@ RUN --mount=type=cache,target=/opt/uv_cache,sharing=locked \
         MAX_JOBS=8 \
         UV_CONCURRENT_INSTALLS=8 \
         uv sync --extra $AUTOMODEL_INSTALL --all-groups $UV_SYNC_ARGS $DEEPEP_SYNC_ARGS && \
-    python -c "import deep_ep, importlib.metadata as m, magi_attention; print('deep-ep', m.version('deep-ep')); print('magi-attention', m.version('magi-attention'))"
+    python -c "import importlib.metadata as m, magi_attention; print('deep-ep', m.version('deep-ep')); print('magi-attention', m.version('magi-attention'))"
 
 # Persistent disk cache for FA4's CuTe-DSL JIT (amortizes kernel compiles across restarts)
 ENV FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1
