@@ -735,6 +735,60 @@ class TestIsQuantizedExpertKeyExtended:
         assert not adapter._is_quantized_expert_key(key)
 
 
+class TestLoRAKeysNotQuantized:
+    """LoRA adapter keys must not be treated as INT4-quantized expert weights.
+
+    Expert LoRA tensors live under the same ``mlp.experts.<i>.<proj>`` paths as the
+    quantized expert weights. Quantizing them rewrites the adapter into
+    ``weight_packed``/``weight_scale``/``weight_shape``, which PEFT cannot load, and
+    ``quantize_to_int4`` asserts on a LoRA rank that is not divisible by 8.
+    """
+
+    @pytest.fixture
+    def adapter(self):
+        """Create adapter for testing."""
+        config = KimiK25VLConfig()
+        moe_config = create_mock_moe_config()
+        backend = BackendConfig(linear="torch", rms_norm="torch", attn="sdpa")
+        return KimiK25VLStateDictAdapter(config, moe_config, backend, dtype=torch.bfloat16)
+
+    def test_lora_keys_not_identified(self, adapter):
+        """LoRA adapter weights under an expert path are not quantizable."""
+        base = "language_model.model.layers.5.mlp.experts.0.gate_proj"
+        for suffix in ("lora_A.weight", "lora_B.weight", "lora_A.default.weight"):
+            key = f"{base}.{suffix}"
+            assert not adapter._is_quantized_expert_key(key), f"{key} should not be quantized"
+
+    def test_plain_expert_weight_still_identified(self, adapter):
+        """The real expert weight is still quantized (guards against over-correcting)."""
+        key = "language_model.model.layers.5.mlp.experts.0.gate_proj.weight"
+        assert adapter._is_quantized_expert_key(key)
+
+    def test_already_quantized_keys_not_reidentified(self, adapter):
+        """Emitted triplet keys must not match again and be expanded a second time."""
+        base = "language_model.model.layers.5.mlp.experts.0.gate_proj"
+        for suffix in ("weight_packed", "weight_scale", "weight_shape"):
+            assert not adapter._is_quantized_expert_key(f"{base}.{suffix}")
+
+    def test_expand_quantized_keys_leaves_lora_untouched(self, adapter):
+        """_expand_quantized_keys passes LoRA tensors through unchanged."""
+        base = "language_model.model.layers.5.mlp.experts.0.gate_proj"
+        lora_a = torch.randn(16, 64)
+        state_dict = {
+            f"{base}.lora_A.weight": lora_a,
+            f"{base}.weight": torch.randn(32, 64),
+        }
+
+        result = adapter._expand_quantized_keys(state_dict)
+
+        # LoRA key survives as-is, with its tensor intact
+        assert f"{base}.lora_A.weight" in result
+        torch.testing.assert_close(result[f"{base}.lora_A.weight"], lora_a)
+        assert not any(".lora_A.weight_packed" in k for k in result)
+        # the real expert weight is still expanded
+        assert f"{base}.weight_packed" in result
+
+
 # =============================================================================
 # Expand Quantized Keys Extended Tests
 # =============================================================================
