@@ -84,13 +84,19 @@ dataloader:
   num_workers: 0
 
 optimizer:
-  _target_: torch.optim.Adam
+  # Transformer Engine FusedAdam avoids the slow native Adam path for
+  # FSDP2-sharded (DTensor) bf16 parameters in torch>=2.12. The native
+  # optimizer accounts for a significant part of the 26.06 performance
+  # regression in this recipe. Keep bf16 optimizer-state semantics to match
+  # the previous torch.optim.Adam configuration.
+  _target_: nemo_automodel.components.optim.optimizer.FusedAdamConfig
   betas:
   - 0.9
   - 0.999
   eps: 1e-8
   lr: 0.0001
   weight_decay: 0
+  master_weights: false
 
 ci:
   time: "00:15:00"
