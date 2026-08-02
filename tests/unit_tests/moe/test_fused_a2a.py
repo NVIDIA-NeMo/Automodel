@@ -106,6 +106,7 @@ def test_hybridep_compact_routing_preserves_dense_probs_gradients(monkeypatch):
     assert buffer.dispatch_kwargs["routing_map"] is None
     assert buffer.dispatch_kwargs["probs"] is dense_probs
     assert buffer.dispatch_kwargs["num_of_experts"] == 4
+    assert "dense_routing" not in buffer.dispatch_kwargs
     torch.testing.assert_close(hidden.grad, torch.full_like(hidden, 2))
     torch.testing.assert_close(dense_probs.grad, torch.full_like(dense_probs, 3))
 

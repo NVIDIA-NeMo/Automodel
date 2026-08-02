@@ -78,11 +78,11 @@ RUN if [ "$INSTALL_TE" = "True" ]; then \
 # Install HybridEP / DeepEP. Build with apt rdma-core v60 (so build==runtime libibverbs)
 # and RDMA_CORE_HOME symlinked to the system install; create the libnvshmem_host.so->.so.3
 # symlink required for DeepEP fabric handle ops; use the nvshmem wheel 3.6.5 and pin
-# DEEPEP_COMMIT to the narrowly scoped HybridEP backport at a6acb7e. It retains
-# the #638 combine-kernel padding fix, compact int16 top-k metadata, reusable
-# NCCL preprocessing storage, and fused permute/unpermute support.
+# DEEPEP_COMMIT to HybridEP PR 673 plus reusable NCCL preprocessing storage. It retains
+# the #638 combine-kernel padding fix, compact int16 top-k metadata, sparse-probability
+# fixes, and fused permute/unpermute support.
 COPY docker/common/deepep.patch /opt/deepep.patch
-ARG DEEPEP_COMMIT=a6acb7e8ecb136a008530b85fb6a6bc661608e52
+ARG DEEPEP_COMMIT=0e715718b41836e2754e5329b014b243bb8c91b3
 ENV HYBRID_EP_MULTINODE=1
 ENV RDMA_CORE_HOME=/opt/rdma-core/build
 ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64/:$LD_LIBRARY_PATH

@@ -463,7 +463,6 @@ class HybridEPDispatch(torch.autograd.Function):
             pad_multiple=pad_multiple,
             num_permuted_tokens=num_permuted_tokens,
             non_blocking=non_blocking,
-            dense_routing=topk_idx is not None and routing_map is None,
             fuse_permute_dispatch=fuse_permute,
         )
 
