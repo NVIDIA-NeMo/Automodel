@@ -253,6 +253,7 @@ class InklingForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
         """
         language_model = self.model.language_model
         pipeline_mode = isinstance(language_model.layers, nn.ModuleDict)
+        effective_use_cache = False if use_cache is None and self.training else use_cache
         if inputs_embeds is None and input_ids is not None and input_ids.dtype.is_floating_point:
             inputs_embeds = input_ids
             input_ids = None
@@ -274,7 +275,7 @@ class InklingForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
             position_ids=position_ids,
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
-            use_cache=use_cache,
+            use_cache=effective_use_cache,
             **kwargs,
         )
         hidden_states = outputs.last_hidden_state
@@ -286,7 +287,7 @@ class InklingForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
         logits = self.lm_head(hidden_states[:, slice_indices, :])
         unpadded_vocab_size = self.config.text_config.unpadded_vocab_size
         if unpadded_vocab_size is not None and unpadded_vocab_size < logits.shape[-1]:
-            logits = logits[..., :unpadded_vocab_size]
+            logits = logits[..., :unpadded_vocab_size].contiguous()
         if pipeline_mode:
             return logits
 

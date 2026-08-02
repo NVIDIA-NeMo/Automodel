@@ -109,6 +109,26 @@ def test_pipeline_metadata_uses_unpadded_vocabulary_size():
     assert outputs_meta[0].shape == (2, 16, cfg.text_config.unpadded_vocab_size)
 
 
+def test_unpadded_logits_match_pipeline_metadata_stride():
+    cfg = build_tiny_config()
+    cfg.text_config.unpadded_vocab_size = cfg.text_config.vocab_size - 8
+    backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch", experts="torch", dispatcher="torch")
+    model = InklingForConditionalGeneration.from_config(cfg, backend=backend).eval()
+    model.initialize_weights(buffer_device=torch.device("cpu"))
+    input_ids = torch.randint(0, cfg.text_config.unpadded_vocab_size, (1, 8))
+
+    logits = model(input_ids=input_ids, attention_mask=torch.ones_like(input_ids), use_cache=False).logits
+    _, outputs_meta = model.get_pipeline_stage_metas(
+        is_first=False,
+        microbatch_size=1,
+        seq_len=input_ids.shape[1],
+        dtype=torch.float32,
+    )
+
+    assert logits.shape == outputs_meta[0].shape
+    assert logits.stride() == outputs_meta[0].stride()
+
+
 def test_requested_dtype_preserves_strict_fp32_modules():
     cfg = build_tiny_config()
     cfg.torch_dtype = torch.bfloat16
@@ -176,6 +196,26 @@ def test_native_cached_decode_matches_full_sequence():
             cached_logits.append(outputs.logits)
 
     torch.testing.assert_close(torch.cat(cached_logits, dim=1), full_logits, rtol=1e-4, atol=1e-5)
+
+
+def test_training_disables_implicit_cache_but_preserves_explicit_request(monkeypatch):
+    _, model = _build_native_model()
+    model.train()
+    captured_use_cache = []
+    original_forward = model.model.forward
+
+    def capture_use_cache(*args, **kwargs):
+        captured_use_cache.append(kwargs.get("use_cache"))
+        return original_forward(*args, **kwargs)
+
+    monkeypatch.setattr(model.model, "forward", capture_use_cache)
+    input_ids = torch.randint(0, model.config.text_config.vocab_size, (1, 8))
+    attention_mask = torch.ones_like(input_ids)
+
+    model(input_ids=input_ids, attention_mask=attention_mask)
+    model(input_ids=input_ids, attention_mask=attention_mask, use_cache=True)
+
+    assert captured_use_cache == [False, True]
 
 
 def test_sdpa_matches_eager_for_batched_inputs():
