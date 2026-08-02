@@ -1206,7 +1206,12 @@ def _get_logits_pp(trainer, input_ids, device) -> torch.Tensor:
 
     # Replicate the prompt to pp_batch_size so the schedule's batch split is valid.
     ids = torch.tensor([input_ids] * pp_batch_size, device=device, dtype=torch.long)
-    attention_mask = torch.ones_like(ids)
+    # The PP schedule requires the static stage sequence length, but the parity
+    # prompt is usually much shorter. Keep synthetic tail tokens out of both
+    # attention and MoE dispatch so this forward represents the same prompt as
+    # the unpadded HF reference.
+    attention_mask = torch.zeros_like(ids)
+    attention_mask[:, :orig_seq_len] = 1
     targets = torch.zeros_like(ids) if trainer.pp.info.has_last_stage else None
 
     captured = [None]

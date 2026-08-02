@@ -148,9 +148,9 @@ wandb:
 ci:
   # pp_size(8) * ep_size(8) = 64 GPUs => 8 nodes (8 H100/node).
   nodes: 8
-  time: "00:35:00"
+  time: "01:00:00"
   env_vars:
-    CHECKPOINT_ROBUSTNESS_PHASES: "train_and_save automodel_reload hf_reload"
+    CHECKPOINT_ROBUSTNESS_PHASES: "source_load_reference source_load_parity train_and_save automodel_reload hf_reload"
   checkpoint_robustness:
     # PP=8 with pp_microbatch_size=1 requires at least eight pipeline microbatches.
     step_scheduler.global_batch_size: 64
@@ -160,13 +160,10 @@ ci:
     step_scheduler.ckpt_every_steps: 1
     # Match a real restart and let each large trainer exit before the next one starts.
     process_isolation: true
-    # Exact trainable-parameter fingerprints guard checkpoint integrity. Fresh PP+EP processes can
-    # choose different experts despite identical weights, so keep cross-process KL informational.
+    # Validate the published HF source before training as well as both checkpoint reload paths.
+    check_source_load_parity: true
     kl_threshold: 4e-2
-    skip_automodel_logit_parity: true
-    # HF and AutoModel already choose different experts before checkpointing; validate the HF
-    # reload by exact saved-adapter fingerprints plus a forward smoke instead of cross-backend KL.
-    skip_hf_logit_parity: true
+    hf_kl_threshold: 4e-2
     # Vanilla HF needs remote model code and shards the 403 GB base over rank 0's local GPU node.
     trust_remote_code: true
     hf_device_map_auto: true

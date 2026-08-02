@@ -317,6 +317,7 @@ def test_get_logits_pp_pads_prompt_to_static_stage_sequence_length(metadata_api)
 
     assert schedule.ids.tolist() == [[11, 12, 13] + [0] * 13]
     assert schedule.attention_mask.shape == (1, 16)
+    assert schedule.attention_mask.tolist() == [[1, 1, 1] + [0] * 13]
     assert logits.shape == (1, 3, 7)
 
 
