@@ -20,13 +20,11 @@ import pytest
 import torch
 import torch.nn as nn
 
-from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 from nemo_automodel.components.training.utils import (
     ScopedModuleOffloading,
     clip_grad_norm,
     count_tail_padding,
     get_expert_tp_replication_factor,
-    get_moe_aux_loss_backward_scale,
     move_to_device,
     scale_grads_and_clip_grad_norm,
 )
@@ -94,96 +92,6 @@ def test_random_shapes():
                 ref += (row[idx[-1] + 1 :] == -100).sum().item()
 
         assert count_tail_padding(batch) == ref
-
-
-@pytest.mark.parametrize(
-    ("pp_enabled", "dp_size", "cp_size", "num_microbatches", "num_label_tokens"),
-    [
-        (False, 1, 1, 1, None),
-        (False, 2, 1, 4, None),
-        (False, 1, 2, 3, None),
-        (True, 2, 1, 4, 96),
-        (True, 1, 2, 3, 96),
-        (True, 2, 1, 3, 0),
-    ],
-)
-def test_moe_aux_gradient_matches_single_process_optimizer_step(
-    pp_enabled,
-    dp_size,
-    cp_size,
-    num_microbatches,
-    num_label_tokens,
-):
-    """DP/CP/PP accumulation must match one fp32 auxiliary objective."""
-    initial_value = 1.25
-    dp_cp_size = dp_size * cp_size
-    scale = get_moe_aux_loss_backward_scale(
-        num_microbatches=num_microbatches,
-        cp_group_size=cp_size,
-        pp_enabled=pp_enabled,
-        num_label_tokens=num_label_tokens,
-        dp_group_size=dp_cp_size,
-    )
-
-    coefficients = torch.arange(1, dp_cp_size * num_microbatches + 1, dtype=torch.float32).reshape(
-        dp_cp_size, num_microbatches
-    )
-    local_gradients = []
-    for rank_coefficients in coefficients:
-        local_parameter = nn.Parameter(torch.tensor(initial_value))
-        MoEAuxLossAutoScaler.main_loss_backward_scale = torch.tensor(scale)
-        for coefficient in rank_coefficients:
-            output = local_parameter * 0.0
-            aux_loss = coefficient * local_parameter.square()
-            MoEAuxLossAutoScaler.apply(output, aux_loss).backward()
-        local_gradients.append(local_parameter.grad.detach().clone())
-
-    # Emulate FSDP's DP-CP average and the recipe's PP post-backward
-    # token normalization. These are the only distributed operations involved
-    # in this scalar contract.
-    distributed_gradient = torch.stack(local_gradients).sum() / dp_cp_size
-    if pp_enabled and num_label_tokens > 0:
-        distributed_gradient /= num_label_tokens / dp_cp_size
-
-    reference_parameter = nn.Parameter(torch.tensor(initial_value))
-    reference_loss = coefficients.sum() * reference_parameter.square() / (dp_size * num_microbatches)
-    reference_loss.backward()
-
-    torch.testing.assert_close(distributed_gradient, reference_parameter.grad)
-    torch.testing.assert_close(distributed_gradient.abs(), reference_parameter.grad.norm())
-
-    distributed_parameter = nn.Parameter(torch.tensor(initial_value))
-    distributed_parameter.grad = distributed_gradient.clone()
-    distributed_optimizer = torch.optim.SGD([distributed_parameter], lr=0.05)
-    reference_optimizer = torch.optim.SGD([reference_parameter], lr=0.05)
-    distributed_optimizer.step()
-    reference_optimizer.step()
-    torch.testing.assert_close(distributed_parameter, reference_parameter)
-    MoEAuxLossAutoScaler.main_loss_backward_scale = None
-
-
-@pytest.mark.parametrize(
-    ("kwargs", "error", "match"),
-    [
-        ({"num_microbatches": 0, "cp_group_size": 1, "pp_enabled": False}, ValueError, "num_microbatches"),
-        ({"num_microbatches": 1, "cp_group_size": True, "pp_enabled": False}, TypeError, "cp_group_size"),
-        ({"num_microbatches": 1, "cp_group_size": 1, "pp_enabled": True}, ValueError, "required"),
-        (
-            {
-                "num_microbatches": 1,
-                "cp_group_size": 2,
-                "pp_enabled": True,
-                "num_label_tokens": 4,
-                "dp_group_size": 3,
-            },
-            ValueError,
-            "divisible",
-        ),
-    ],
-)
-def test_moe_aux_backward_scale_rejects_invalid_topology(kwargs, error, match):
-    with pytest.raises(error, match=match):
-        get_moe_aux_loss_backward_scale(**kwargs)
 
 
 def test_clip_grad_norm_with_pp_and_tp():

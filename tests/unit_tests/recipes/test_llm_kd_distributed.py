@@ -194,7 +194,7 @@ def test_llm_kd_pp_step_undoes_expert_tp_replication(single_rank_gloo):
 
     recipe = _make_recipe(model, device_mesh, expert_mesh)
     recipe.pp_enabled = True
-    recipe.pp = SimpleNamespace(pp_batch_size=2, pp_microbatch_size=1)
+    recipe.pp = SimpleNamespace(info=SimpleNamespace(schedule=SimpleNamespace(n_microbatches=2)))
     recipe.dist_env = SimpleNamespace(device=torch.device("cpu"), rank=0, is_main=True)
     recipe._forward_backward_step_pp = Mock(
         side_effect=lambda i, batch, loss_buffer, num_label_tokens, num_batches: loss_buffer.append(torch.tensor(1.0))

@@ -2075,15 +2075,17 @@ class TestRunTrainOptimStepSetsMoEScale:
         object.__setattr__(recipe, "step_scheduler", SimpleNamespace(step=1, epoch=0))
 
         if pp_enabled:
-            pp_info = SimpleNamespace(has_first_stage=True, has_last_stage=True)
+            pp_info = SimpleNamespace(
+                has_first_stage=True,
+                has_last_stage=True,
+                schedule=SimpleNamespace(n_microbatches=pp_microbatches),
+            )
             object.__setattr__(
                 recipe,
                 "pp",
                 SimpleNamespace(
                     info=pp_info,
                     update_seq_len=lambda seq_len: None,
-                    pp_batch_size=pp_microbatches,
-                    pp_microbatch_size=1,
                 ),
             )
             # Stub the PP last-stage broadcast helper (post-d96f1b20 the recipe
