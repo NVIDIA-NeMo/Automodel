@@ -86,7 +86,7 @@ overrides = [
 
 [[manifest.dependency-metadata]]
 name = "deep-ep"
-version = "1.2.1+0e71571"
+version = "1.2.1+ad3d996"
 requires-dist = ["torch", "packaging", "ninja"]
 
 [[manifest.dependency-metadata]]
@@ -1605,8 +1605,8 @@ wheels = [
 
 [[package]]
 name = "deep-ep"
-version = "1.2.1+0e71571"
-source = { git = "https://github.com/akoumpa/DeepEP.git?rev=0e715718b41836e2754e5329b014b243bb8c91b3#0e715718b41836e2754e5329b014b243bb8c91b3" }
+version = "1.2.1+ad3d996"
+source = { git = "https://github.com/akoumpa/DeepEP.git?rev=automodel_r0.6.0#ad3d996dd1073d27cc642ff39af1abde3da74195" }
 dependencies = [
     { name = "ninja" },
     { name = "packaging" },
@@ -4137,7 +4137,7 @@ requires-dist = [
     { name = "databricks-sql-connector", marker = "extra == 'delta-databricks'", specifier = ">=3.0.0" },
     { name = "datasets", specifier = ">=4.0.0" },
     { name = "decord", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin' and extra == 'vlm-media'" },
-    { name = "deep-ep", marker = "extra == 'moe'", git = "https://github.com/akoumpa/DeepEP.git?rev=0e715718b41836e2754e5329b014b243bb8c91b3" },
+    { name = "deep-ep", marker = "extra == 'moe'", git = "https://github.com/akoumpa/DeepEP.git?rev=automodel_r0.6.0" },
     { name = "deltalake", marker = "extra == 'delta-databricks'", specifier = ">=1.0.0" },
     { name = "diffusers", marker = "extra == 'diffusion'", specifier = ">=0.39.0" },
     { name = "ffpa-attn", marker = "extra == 'ffpa'", specifier = ">=0.2.2" },
