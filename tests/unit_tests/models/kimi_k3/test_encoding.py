@@ -14,6 +14,7 @@
 
 import pytest
 
+from nemo_automodel.components.models.kimi_k3 import tokenization as kimi_k3_tokenization
 from nemo_automodel.components.models.kimi_k3.encoding import build_chat_segments
 from nemo_automodel.components.models.kimi_k3.tokenization import TikTokenTokenizer, _build_kimi_k3_pat_str
 
@@ -34,6 +35,9 @@ def test_kimi_k3_tokenizer_pattern_matches_reference_regex():
 
     assert _build_kimi_k3_pat_str() == reference_pattern
     assert "pat_str" not in TikTokenTokenizer.__dict__
+    assert {
+        name: value for name, value in vars(kimi_k3_tokenization).items() if isinstance(value, str) and "&&" in value
+    } == {}
 
 
 def test_medium_thinking_effort_is_rendered():
