@@ -129,6 +129,9 @@ CI_KEY_TO_VAR = {
     "cluster_tag": "RESERVED_CLUSTER_TAG",
 }
 
+# AMINT-8 measured eight threads as the checkpoint-load saturation point.
+DEFAULT_CPU_THREADS_PER_PROCESS = "8"
+
 
 def _compute_base_stage(test_folder: str, config: Path, has_robustness: bool) -> str:
     """Pick the GitLab CI stage for a base recipe job."""
@@ -192,6 +195,10 @@ def _enrich_base_job(job: Dict[str, Any], ci_config: Dict[str, Any], scope: str)
             job["variables"][ci_var] = f"/{value}/"
         else:
             job["variables"][ci_var] = value
+
+    if ci_config.get("checkpoint_robustness") or ci_config.get("nproc_per_node") == 1:
+        job["variables"]["OMP_NUM_THREADS"] = DEFAULT_CPU_THREADS_PER_PROCESS
+        job["variables"]["MKL_NUM_THREADS"] = DEFAULT_CPU_THREADS_PER_PROCESS
 
     for key, value in ci_config.get("env_vars", {}).items():
         job["variables"][key] = str(value)

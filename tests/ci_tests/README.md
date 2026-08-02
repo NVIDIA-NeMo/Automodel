@@ -69,6 +69,13 @@ ci:
     # See checkpoint robustness section for all options
 ```
 
+Checkpoint-robustness jobs and base jobs with `nproc_per_node: 1` default
+`OMP_NUM_THREADS` and `MKL_NUM_THREADS` to 8 per worker. JoC continues to
+allocate the full node through `--exclusive`; these variables bound PyTorch's
+CPU parallelism without restricting the Slurm CPU affinity. Set either
+variable under `ci.env_vars` when a recipe needs a different measured thread
+budget. Other jobs retain their existing thread settings.
+
 ## Checkpoint Robustness
 
 When `checkpoint_robustness` is present, the robustness test runs after the finetune under the same SLURM allocation. It trains for 5 steps, saves a checkpoint, then validates through:

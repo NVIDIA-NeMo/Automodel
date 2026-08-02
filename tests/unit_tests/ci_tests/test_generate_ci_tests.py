@@ -52,3 +52,53 @@ ci:
 
     assert jobs[""]["variables"]["TIME"] == "00:25:00"
     assert jobs["_vllm_deploy"]["variables"]["TIME"] == "00:30:00"
+
+
+def test_generate_base_job_defaults_cpu_threads_without_limiting_slurm_allocation(tmp_path):
+    config = Path("model.yaml")
+    (tmp_path / config).write_text(
+        """
+ci:
+  checkpoint_robustness:
+    hf_kl_threshold: 1e-3
+""",
+        encoding="utf-8",
+    )
+
+    jobs = dict(generate_job(config, {}, "nightly", "llm_finetune", str(tmp_path)))
+    variables = jobs[""]["variables"]
+
+    assert variables["OMP_NUM_THREADS"] == "8"
+    assert variables["MKL_NUM_THREADS"] == "8"
+    assert "CPUS_PER_TASK" not in variables
+
+
+def test_generate_base_job_allows_cpu_thread_overrides(tmp_path):
+    config = Path("model.yaml")
+    (tmp_path / config).write_text(
+        """
+ci:
+  nproc_per_node: 1
+  env_vars:
+    OMP_NUM_THREADS: 4
+    MKL_NUM_THREADS: 4
+""",
+        encoding="utf-8",
+    )
+
+    jobs = dict(generate_job(config, {}, "nightly", "llm_finetune", str(tmp_path)))
+    variables = jobs[""]["variables"]
+
+    assert variables["OMP_NUM_THREADS"] == "4"
+    assert variables["MKL_NUM_THREADS"] == "4"
+
+
+def test_generate_regular_multi_worker_job_does_not_override_cpu_threads(tmp_path):
+    config = Path("model.yaml")
+    (tmp_path / config).write_text("ci: {}\n", encoding="utf-8")
+
+    jobs = dict(generate_job(config, {}, "nightly", "llm_finetune", str(tmp_path)))
+    variables = jobs[""]["variables"]
+
+    assert "OMP_NUM_THREADS" not in variables
+    assert "MKL_NUM_THREADS" not in variables
