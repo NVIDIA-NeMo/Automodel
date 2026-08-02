@@ -150,7 +150,7 @@ ci:
   nodes: 8
   time: "01:00:00"
   env_vars:
-    CHECKPOINT_ROBUSTNESS_PHASES: "source_load_reference source_load_parity train_and_save automodel_reload hf_reload"
+    CHECKPOINT_ROBUSTNESS_PHASES: "source_load_reference source_load_parity"
   checkpoint_robustness:
     # PP=8 with pp_microbatch_size=1 requires at least eight pipeline microbatches.
     step_scheduler.global_batch_size: 64

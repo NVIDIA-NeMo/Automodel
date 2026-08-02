@@ -183,6 +183,15 @@ class TestBlock:
         assert block.is_moe_layer is True
         assert block.moe is not None
 
+    def test_routed_expert_uses_layer_swiglu_limit(self, config, moe_config, sdpa_backend):
+        config.moe_layers_enum = "1"
+        config.swiglu_limits[1] = 7.0
+
+        block = Block(layer_idx=1, config=config, moe_config=moe_config, backend=sdpa_backend)
+
+        assert block.moe.experts.config.swiglu_limit == 7.0
+        assert block.moe.experts.config.activation_limit == moe_config.activation_limit
+
     def test_shared_expert_uses_share_expert_dims(self, config, moe_config, sdpa_backend):
         """Test that HF's share_expert_dims config is used for shared expert."""
         config.moe_layers_enum = "1"
