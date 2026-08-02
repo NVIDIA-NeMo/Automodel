@@ -194,6 +194,11 @@ def _nccl_backend_override(
     return override
 
 
+def _can_reuse_default_group(group_size: int) -> bool:
+    """Return whether a derived mesh dimension spans the default process group."""
+    return dist.is_initialized() and group_size == dist.get_world_size()
+
+
 def _validate_mesh_spec(spec: _MeshSpec) -> None:
     for shape, axis in zip(spec.shape, spec.axes):
         assert isinstance(shape, int), f"Expected {axis} to be an int, but got {type(shape)}"
@@ -216,9 +221,15 @@ def _register_flattened_axes(
         timeout_minutes=timeout_minutes,
     )
     for flattened_axis, source_axes in flattened_axes.items():
-        flattened_mesh = device_mesh[source_axes]._flatten(
+        source_mesh = device_mesh[source_axes]
+        backend_override = backend_overrides.get(flattened_axis) if backend_overrides else None
+        # The default process group already has the configured timeout. Supplying
+        # an override for the same world-sized ranks would allocate another NCCL communicator.
+        if backend_override is not None and _can_reuse_default_group(source_mesh.size()):
+            backend_override = None
+        flattened_mesh = source_mesh._flatten(
             mesh_dim_name=flattened_axis,
-            backend_override=backend_overrides.get(flattened_axis) if backend_overrides else None,
+            backend_override=backend_override,
         )
         device_mesh._flatten_mapping.setdefault(flattened_axis, flattened_mesh)
 
@@ -423,19 +434,30 @@ def _unflatten_compat(
     *,
     timeout_minutes: int | None = None,
 ) -> DeviceMesh:
-    """Unflatten a mesh with its NCCL timeout, including the PyTorch 2.9 fallback."""
+    """Unflatten a mesh with its NCCL timeout, including the PyTorch 2.9 fallback.
+
+    PyTorch reuses the default process group for a world-sized dimension only
+    when no backend override is supplied. The default group already has the
+    configured distributed timeout, so omitting that redundant override avoids
+    allocating another NCCL communicator.
+    """
     if hasattr(flat_mesh, "_unflatten"):
         if timeout_minutes is not None and flat_mesh.device_type == "cuda":
-            return flat_mesh._unflatten(
-                axis,
-                sizes,
+            backend_override = _nccl_backend_override(
                 names,
-                backend_override=_nccl_backend_override(
-                    names,
-                    device_type=flat_mesh.device_type,
-                    timeout_minutes=timeout_minutes,
-                ),
+                device_type=flat_mesh.device_type,
+                timeout_minutes=timeout_minutes,
             )
+            backend_override = {
+                name: backend_override[name] for name, size in zip(names, sizes) if not _can_reuse_default_group(size)
+            }
+            if backend_override:
+                return flat_mesh._unflatten(
+                    axis,
+                    sizes,
+                    names,
+                    backend_override=backend_override,
+                )
         return flat_mesh._unflatten(axis, sizes, names)
     new_mesh_tensor = flat_mesh.mesh.reshape(sizes)
     from torch.distributed.device_mesh import DeviceMesh as _DeviceMesh
