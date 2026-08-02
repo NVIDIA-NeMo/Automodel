@@ -79,10 +79,9 @@ RUN if [ "$INSTALL_TE" = "True" ]; then \
 # and RDMA_CORE_HOME symlinked to the system install; create the libnvshmem_host.so->.so.3
 # symlink required for DeepEP fabric handle ops; use the nvshmem wheel 3.6.5 and pin
 # DEEPEP_COMMIT to the automodel_r0.6.0 HybridEP release branch tip: PR 673 plus reusable
-# NCCL preprocessing storage. It retains
-# the #638 combine-kernel padding fix, compact int16 top-k metadata, sparse-probability
-# fixes, and fused permute/unpermute support.
-ARG DEEPEP_COMMIT=0488f8cc38a944999c850214898935a79a26aef7
+# NCCL preprocessing storage. It retains the #638 combine-kernel padding fix, compact int16
+# top-k metadata, and fused permute/unpermute support while preserving dense-probability numerics.
+ARG DEEPEP_COMMIT=7e880e13c9a2ba80bc9bf89ca811f083987867eb
 ENV HYBRID_EP_MULTINODE=1
 ENV RDMA_CORE_HOME=/opt/rdma-core/build
 ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64/:$LD_LIBRARY_PATH

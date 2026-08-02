@@ -348,7 +348,7 @@ nv_grouped_gemm = ["setuptools"]
 [[tool.uv.dependency-metadata]]
 name = "deep_ep"
 # This version has to match the version in the commit/rev/tag used
-version = "v1.2.1+0488f8c"
+version = "v1.2.1+7e880e1"
 requires-dist = ["torch", "packaging", "ninja"]
 
 [[tool.uv.dependency-metadata]]
