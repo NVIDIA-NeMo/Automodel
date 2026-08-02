@@ -550,20 +550,23 @@ class InklingDecoderLayer(nn.Module):
             Tensor of shape ``[batch, sequence, hidden]``.
         """
         residual = hidden_states
+        normalized_hidden_states = self.input_layernorm(hidden_states).to(dtype=residual.dtype)
         hidden_states, _ = self.self_attn(
-            self.input_layernorm(hidden_states),
+            normalized_hidden_states,
             attention_mask=attention_mask,
             conv_mask=conv_mask,
             past_key_values=past_key_values,
             **kwargs,
         )
         hidden_states = self.attn_sconv(hidden_states, past_key_values=past_key_values, conv_mask=conv_mask, **kwargs)
+        hidden_states = hidden_states.to(dtype=residual.dtype)
         hidden_states = residual + hidden_states
 
         residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.post_attention_layernorm(hidden_states).to(dtype=residual.dtype)
         hidden_states = self.mlp(hidden_states)
         hidden_states = self.mlp_sconv(hidden_states, past_key_values=past_key_values, conv_mask=conv_mask, **kwargs)
+        hidden_states = hidden_states.to(dtype=residual.dtype)
         return residual + hidden_states
 
     @torch.no_grad()

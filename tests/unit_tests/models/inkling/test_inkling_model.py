@@ -220,6 +220,31 @@ def test_sdpa_casts_fp32_short_convolution_outputs_to_query_dtype(monkeypatch):
     assert probabilities is None
 
 
+def test_decoder_layer_restores_model_dtype_around_fp32_modules(monkeypatch):
+    cfg = build_tiny_config()
+    cfg.torch_dtype = torch.bfloat16
+    cfg.text_config.torch_dtype = torch.bfloat16
+    cfg.text_config._attn_implementation = "sdpa"
+    backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch_fp32", experts="torch", dispatcher="torch")
+    model = InklingForConditionalGeneration.from_config(cfg, backend=backend)
+    model.initialize_weights(buffer_device=torch.device("cpu"))
+    layer = model.model.language_model.layers[0].eval()
+
+    for short_convolution in (layer.attn_sconv, layer.mlp_sconv):
+        original_forward = short_convolution.forward
+
+        def return_fp32(*args, _forward=original_forward, **kwargs):
+            return _forward(*args, **kwargs).float()
+
+        monkeypatch.setattr(short_convolution, "forward", return_fp32)
+
+    hidden_states = torch.randn(1, 8, cfg.text_config.hidden_size, dtype=torch.bfloat16)
+    attention_mask = torch.zeros(1, 1, 8, 8, dtype=torch.bfloat16)
+    output = layer(hidden_states, attention_mask)
+
+    assert output.dtype == torch.bfloat16
+
+
 def test_native_state_dict_roundtrip_is_exact():
     _, model = _build_native_model()
     model.initialize_weights(buffer_device=torch.device("cpu"))
