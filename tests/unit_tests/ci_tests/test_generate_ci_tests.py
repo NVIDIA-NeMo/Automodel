@@ -54,13 +54,12 @@ ci:
     assert jobs["_vllm_deploy"]["variables"]["TIME"] == "00:30:00"
 
 
-def test_generate_base_job_defaults_cpu_threads_without_limiting_slurm_allocation(tmp_path):
+def test_generate_single_worker_base_job_defaults_cpu_threads_without_limiting_slurm_allocation(tmp_path):
     config = Path("model.yaml")
     (tmp_path / config).write_text(
         """
 ci:
-  checkpoint_robustness:
-    hf_kl_threshold: 1e-3
+  nproc_per_node: 1
 """,
         encoding="utf-8",
     )
@@ -93,9 +92,17 @@ ci:
     assert variables["MKL_NUM_THREADS"] == "4"
 
 
-def test_generate_regular_multi_worker_job_does_not_override_cpu_threads(tmp_path):
+def test_generate_checkpoint_robustness_multi_worker_job_does_not_override_cpu_threads(tmp_path):
     config = Path("model.yaml")
-    (tmp_path / config).write_text("ci: {}\n", encoding="utf-8")
+    (tmp_path / config).write_text(
+        """
+ci:
+  nproc_per_node: 8
+  checkpoint_robustness:
+    hf_kl_threshold: 1e-3
+""",
+        encoding="utf-8",
+    )
 
     jobs = dict(generate_job(config, {}, "nightly", "llm_finetune", str(tmp_path)))
     variables = jobs[""]["variables"]
