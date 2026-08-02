@@ -359,6 +359,14 @@ class _AsyncSaveContext:
     staging_active: bool = False
 
 
+class _ModelSavePlanner(dcp.DefaultSavePlanner):
+    """Keep cached model save plans separate from optimizer save plans."""
+
+
+class _OptimizerSavePlanner(dcp.DefaultSavePlanner):
+    """Keep cached optimizer save plans separate from model save plans."""
+
+
 def _new_gloo_process_group(
     process_group: torch.distributed.ProcessGroup | None,
     timeout: timedelta | None = None,
@@ -1470,7 +1478,8 @@ class Checkpointer:
             return
 
         ret = None
-        planner = dcp.DefaultSavePlanner(enable_plan_caching=True)
+        planner_cls = _ModelSavePlanner if is_model else _OptimizerSavePlanner
+        planner = planner_cls(enable_plan_caching=True)
 
         # Routes to MSC storage write for cloud paths
         storage_writer = _maybe_msc_writer(path, storage_writer)
@@ -1918,11 +1927,13 @@ def _ensure_dirs(*dirs: Optional[str], process_group: torch.distributed.ProcessG
         *dirs: One or more directory paths that should exist.
         process_group: Ranks that must observe the directories before continuing.
     """
-    for d in dirs:
-        if d:
-            if not is_cloud_path(d):
+    is_dist_initialized = torch.distributed.is_initialized()
+    is_group_rank_0 = not is_dist_initialized or torch.distributed.get_rank(group=process_group) == 0
+    if is_group_rank_0:
+        for d in dirs:
+            if d and not is_cloud_path(d):
                 os.makedirs(d, exist_ok=True)
-    if torch.distributed.is_initialized():
+    if is_dist_initialized:
         torch.distributed.barrier(group=process_group)
 
 

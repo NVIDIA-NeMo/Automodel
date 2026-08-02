@@ -2982,10 +2982,39 @@ class TestEnsureDirs:
         group = object()
         with (
             patch("torch.distributed.is_initialized", return_value=True),
+            patch("torch.distributed.get_rank", return_value=0) as get_rank,
             patch("torch.distributed.barrier") as barrier,
         ):
             _ensure_dirs(str(tmp_path), process_group=group)
+        get_rank.assert_called_once_with(group=group)
         barrier.assert_called_once_with(group=group)
+
+    def test_only_group_rank_zero_creates_distributed_directories(self, tmp_path):
+        """Nonzero group ranks wait for rank zero without issuing shared-filesystem metadata operations."""
+        group = object()
+        target = str(tmp_path / "new")
+        with (
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch("torch.distributed.get_rank", return_value=1),
+            patch("os.makedirs") as makedirs,
+            patch("torch.distributed.barrier") as barrier,
+        ):
+            _ensure_dirs(target, process_group=group)
+        makedirs.assert_not_called()
+        barrier.assert_called_once_with(group=group)
+
+
+def test_model_and_optimizer_saves_use_separate_plan_caches():
+    """Alternating model and optimizer saves must not evict each other's cached DCP plans."""
+    ckptr = _make_ckptr(is_peft=False, is_async=False)
+    with patch("nemo_automodel.components.checkpoint.checkpointing.dcp.save") as save:
+        Checkpointer._do_save(ckptr, {"weight": torch.ones(1)}, "/tmp/checkpoint/model")
+        Checkpointer._do_save(ckptr, {"state": torch.ones(1)}, "/tmp/checkpoint/optim")
+
+    model_planner = save.call_args_list[0].kwargs["planner"]
+    optimizer_planner = save.call_args_list[1].kwargs["planner"]
+    assert type(model_planner) is not type(optimizer_planner)
+    assert model_planner._cached_plans_key != optimizer_planner._cached_plans_key
 
 
 class TestSaveConfig:
