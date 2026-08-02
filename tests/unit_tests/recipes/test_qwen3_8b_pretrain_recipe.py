@@ -20,6 +20,7 @@ from transformers import Qwen3Config, Qwen3ForCausalLM
 
 REPO_ROOT = Path(__file__).parents[3]
 RECIPE_PATH = REPO_ROOT / "examples/llm_pretrain/qwen3_8b_pretrain.yaml"
+FINEWEB_RECIPE_PATH = REPO_ROOT / "examples/llm_pretrain/qwen3_8b_fineweb_edu_pretrain.yaml"
 
 
 def test_qwen3_8b_pretrain_recipe_uses_full_official_architecture() -> None:
@@ -84,3 +85,30 @@ def test_qwen3_8b_pretrain_recipe_has_reproducible_eight_gpu_smoke_shape() -> No
     assert recipe["distributed"]["activation_checkpointing"] is True
     assert recipe["ci"]["nodes"] == 1
     assert recipe["ci"]["nproc_per_node"] == 8
+
+
+def test_qwen3_8b_fineweb_recipe_uses_real_qwen_tokenized_pretraining_data() -> None:
+    recipe = yaml.safe_load(FINEWEB_RECIPE_PATH.read_text(encoding="utf-8"))
+    smoke_recipe = yaml.safe_load(RECIPE_PATH.read_text(encoding="utf-8"))
+
+    assert recipe["model"]["config"] == smoke_recipe["model"]["config"]
+    assert recipe["step_scheduler"]["max_steps"] == 100000
+    assert recipe["step_scheduler"]["num_epochs"] is None
+    assert recipe["step_scheduler"]["val_every_steps"] == 1000
+    assert recipe["step_scheduler"]["ckpt_every_steps"] == 10000
+    assert recipe["dataset"]["_target_"].endswith("MegatronPretrainingConfig")
+    assert recipe["validation_dataset"]["_target_"].endswith("MegatronPretrainingConfig")
+    assert "mock" not in recipe["dataset"]["_target_"].lower()
+    assert recipe["dataset"]["tokenizer"]["pretrained_model_name_or_path"] == "Qwen/Qwen3-8B"
+    assert recipe["dataset"]["seq_length"] == 2048
+    assert recipe["dataset"]["splits_to_build"] == "train"
+    assert recipe["validation_dataset"]["splits_to_build"] == "validation"
+    assert recipe["dataloader"]["dataloader_type"] == "cyclic"
+    assert recipe["dataloader"]["num_workers"] == 0
+    assert recipe["validation_dataloader"]["num_workers"] == 0
+    assert recipe["checkpoint"]["restore_from"] == "LATEST"
+    assert recipe["checkpoint"]["is_async"] is True
+    assert recipe["optimizer"]["master_weights"] is True
+    assert recipe["optimizer"]["store_param_remainders"] is True
+    assert recipe["optimizer"]["exp_avg_dtype"] == "torch.float32"
+    assert recipe["optimizer"]["exp_avg_sq_dtype"] == "torch.float32"
