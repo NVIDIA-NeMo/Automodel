@@ -83,7 +83,7 @@ RUN if [ "$INSTALL_TE" = "True" ]; then \
 # the #638 combine-kernel padding fix, compact int16 top-k metadata, sparse-probability
 # fixes, and fused permute/unpermute support.
 COPY docker/common/deepep.patch /opt/deepep.patch
-ARG DEEPEP_COMMIT=14979787a5184b916b8debe8c2a4e03dd4a8bc25
+ARG DEEPEP_COMMIT=cf23c1058f264a108ad76d63c9031cb5bfee5e27
 ENV HYBRID_EP_MULTINODE=1
 ENV RDMA_CORE_HOME=/opt/rdma-core/build
 ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64/:$LD_LIBRARY_PATH

@@ -86,7 +86,7 @@ overrides = [
 
 [[manifest.dependency-metadata]]
 name = "deep-ep"
-version = "1.2.1+1497978"
+version = "1.2.1+cf23c10"
 requires-dist = ["torch", "packaging", "ninja"]
 
 [[manifest.dependency-metadata]]
@@ -1605,8 +1605,8 @@ wheels = [
 
 [[package]]
 name = "deep-ep"
-version = "1.2.1+1497978"
-source = { git = "https://github.com/akoumpa/DeepEP.git?rev=automodel_r0.6.0#14979787a5184b916b8debe8c2a4e03dd4a8bc25" }
+version = "1.2.1+cf23c10"
+source = { git = "https://github.com/akoumpa/DeepEP.git?rev=automodel_r0.6.0#cf23c1058f264a108ad76d63c9031cb5bfee5e27" }
 dependencies = [
     { name = "ninja" },
     { name = "packaging" },
