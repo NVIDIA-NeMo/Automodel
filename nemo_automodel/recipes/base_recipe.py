@@ -58,10 +58,12 @@ from nemo_automodel.components.checkpoint.utils import (
 )
 from nemo_automodel.components.config.loader import ConfigNode, config_to_yaml_str
 from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
+from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.training.garbage_collection import GarbageCollection
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
+from nemo_automodel.components.training.utils import get_moe_aux_loss_backward_scale
 from nemo_automodel.recipes._typed_config import RecipeConfig
 
 logger = logging.getLogger(__name__)
@@ -960,6 +962,28 @@ class BaseRecipe:
         if not device_mesh or device_mesh["cp"].size() == 1:
             return 1
         return device_mesh["cp"].size()
+
+    def _set_moe_aux_loss_backward_scale(self, *, num_batches: int, num_label_tokens: int) -> None:
+        """Set the MoE auxiliary-loss scale for one optimizer step.
+
+        Args:
+            num_batches: Number of outer gradient-accumulation batches in the
+                optimizer step.
+            num_label_tokens: Global number of supervised tokens in the
+                optimizer step.
+        """
+        num_model_microbatches = num_batches
+        if self.pp_enabled:
+            num_model_microbatches *= self.pp.pp_batch_size // self.pp.pp_microbatch_size
+        MoEAuxLossAutoScaler.main_loss_backward_scale = torch.tensor(
+            get_moe_aux_loss_backward_scale(
+                num_microbatches=num_model_microbatches,
+                cp_group_size=self._get_cp_group_size(),
+                pp_enabled=self.pp_enabled,
+                num_label_tokens=num_label_tokens,
+                dp_group_size=self._get_dp_group_size(include_cp=True),
+            )
+        )
 
     def _get_dp_rank(self, include_cp: bool = False):
         device_mesh = getattr(self, "device_mesh", None)
