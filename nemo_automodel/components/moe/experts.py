@@ -667,12 +667,29 @@ def swiglu_clamped_deepep(x, permuted_probs, limit: float):
     return (inter * permuted_probs).to(x.dtype)
 
 
+@torch.compile(fullgraph=True, options={"max_autotune": True})
+def swiglu_clamped_after_activation_deepep(x, permuted_probs, limit: float):
+    """StepFun-style clamped SwiGLU for grouped experts.
+
+    StepFun applies SiLU to the gate before clamping it, then clamps the up
+    projection symmetrically. Both operations use FP32 before the routed
+    activation is cast back to the projection dtype.
+    """
+    gate, up = torch.chunk(x, 2, dim=-1)
+    gate = F.silu(gate.float()).clamp(max=limit)
+    up = up.float().clamp(min=-limit, max=limit)
+    inter = gate * up
+    return (inter * permuted_probs).to(x.dtype)
+
+
 def get_expert_activation_for_deepep(config: MoEConfig):
     """Return the DeepEP expert activation function selected by the MoE config."""
 
     if config.expert_activation == "swiglu":
         # DeepSeek V4 uses a clamped FP32 variant when swiglu_limit > 0.
         if getattr(config, "swiglu_limit", 0.0) > 0.0:
+            if config.swiglu_clamp_after_activation:
+                return partial(swiglu_clamped_after_activation_deepep, limit=config.swiglu_limit)
             return partial(swiglu_clamped_deepep, limit=config.swiglu_limit)
         return weighted_bias_swiglu_impl
     elif config.expert_activation == "swigluoai":

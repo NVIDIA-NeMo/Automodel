@@ -52,6 +52,9 @@ class MoEConfig:
     # DeepSeek V4's official ``Expert.forward`` with ``swiglu_limit``.
     # Default 0.0 preserves the existing ``weighted_bias_swiglu_impl`` path.
     swiglu_limit: float = 0.0
+    # StepFun applies the gate clamp after SiLU, unlike the default DeepSeek-style
+    # clamp before SiLU. This flag selects the StepFun ordering when a limit is set.
+    swiglu_clamp_after_activation: bool = False
     softmax_before_topk: bool = False
     dtype: str | torch.dtype = torch.bfloat16
     shared_expert_gate: bool = False

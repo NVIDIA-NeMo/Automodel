@@ -504,6 +504,9 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
             token_indices=indices,
         )
         permuted_probs = permuted_probs.unsqueeze(-1)
+        activation_probs = (
+            torch.ones_like(permuted_probs) if self.config.apply_router_weight_after_down else permuted_probs
+        )
 
         compute_dtype = x.dtype
         gate_and_up_projs = _to_grouped_mm_operand(self.gate_and_up_projs, compute_dtype)
@@ -534,7 +537,7 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
                     gate_up_proj_bias = _to_local(self.gate_up_proj_bias)
                     output1 = _apply_bias(output1, gate_up_proj_bias, tokens_per_expert)
 
-                output1 = self.expert_activation(output1, permuted_probs)
+                output1 = self.expert_activation(output1, activation_probs)
 
                 # Down projection + LoRA
                 output2 = torch._grouped_mm(output1, down_projs, offs=offs)
@@ -544,7 +547,12 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
 
                 if self.expert_bias:
                     down_bias = _to_local(self.down_proj_bias)
-                    output2 = _apply_bias(output2, down_bias, tokens_per_expert, permuted_probs)
+                    output2 = _apply_bias(
+                        output2,
+                        down_bias,
+                        tokens_per_expert,
+                        None if self.config.apply_router_weight_after_down else permuted_probs,
+                    )
             else:
                 # Gate+Up projection + LoRA
                 output1 = ops.gmm(
@@ -566,7 +574,7 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
                     gate_up_proj_bias = _to_local(self.gate_up_proj_bias)
                     output1 = _apply_bias(output1, gate_up_proj_bias, tokens_per_expert)
 
-                output1 = self.expert_activation(output1, permuted_probs)
+                output1 = self.expert_activation(output1, activation_probs)
 
                 # Down projection + LoRA
                 output2 = ops.gmm(output1, down_projs, tokens_per_expert, trans_b=False)
@@ -576,7 +584,12 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
 
                 if self.expert_bias:
                     down_bias = _to_local(self.down_proj_bias)
-                    output2 = _apply_bias(output2, down_bias, tokens_per_expert, permuted_probs)
+                    output2 = _apply_bias(
+                        output2,
+                        down_bias,
+                        tokens_per_expert,
+                        None if self.config.apply_router_weight_after_down else permuted_probs,
+                    )
         else:
             # Dummy computation for gradient flow
             output1 = torch.matmul(x[0] * 0, gate_and_up_projs[0])
@@ -584,9 +597,12 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
                 output1
                 + torch.matmul(torch.matmul(x[0] * 0, lora_gate_and_up_A[0]), lora_gate_and_up_B[0]) * self.scale
             )
-            output1_ = self.expert_activation(output1, permuted_probs)
+            output1_ = self.expert_activation(output1, activation_probs)
             output2 = torch.matmul(output1_, down_projs[0])
             output2 = output2 + torch.matmul(torch.matmul(output1_ * 0, lora_down_A[0]), lora_down_B[0]) * self.scale
+
+        if self.config.apply_router_weight_after_down:
+            output2 = (output2.float() * permuted_probs.float()).to(compute_dtype)
 
         y = self.token_dispatcher.token_unpermutation(output2)
         return y

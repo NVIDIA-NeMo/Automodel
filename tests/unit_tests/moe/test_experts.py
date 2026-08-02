@@ -32,6 +32,7 @@ from nemo_automodel.components.moe.experts import (
     _torch_mm_experts_fwd,
     get_expert_activation_for_deepep,
     is_gated_activation,
+    swiglu_clamped_after_activation_deepep,
     swiglu_clamped_deepep,
 )
 
@@ -109,6 +110,29 @@ class TestActivationFunctions:
 
         with patch("nemo_automodel.components.moe.experts.weighted_bias_swiglu_impl") as mock_swiglu:
             assert get_expert_activation_for_deepep(moe_config) is mock_swiglu
+
+    def test_get_expert_activation_for_deepep_stepfun_clamps_after_silu(self, moe_config):
+        """StepFun selects its post-SiLU clamp while preserving the generic default."""
+        from functools import partial
+
+        moe_config.swiglu_limit = 7.0
+        moe_config.swiglu_clamp_after_activation = True
+
+        activation_fn = get_expert_activation_for_deepep(moe_config)
+
+        assert isinstance(activation_fn, partial)
+        assert activation_fn.func is swiglu_clamped_after_activation_deepep
+        assert activation_fn.keywords == {"limit": 7.0}
+
+    def test_stepfun_clamp_order_matches_published_math(self):
+        gate = torch.tensor([[10.0, -10.0]], dtype=torch.float32)
+        up = torch.tensor([[20.0, -20.0]], dtype=torch.float32)
+        probs = torch.tensor([[0.25]], dtype=torch.float32)
+
+        actual = swiglu_clamped_after_activation_deepep(torch.cat([gate, up], dim=-1), probs, limit=7.0)
+        expected = torch.nn.functional.silu(gate).clamp(max=7.0) * up.clamp(min=-7.0, max=7.0) * probs
+
+        torch.testing.assert_close(actual, expected)
 
 
 class TestSwigluClampedDeepEP:

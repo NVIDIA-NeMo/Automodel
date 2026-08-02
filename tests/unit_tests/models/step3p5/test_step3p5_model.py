@@ -190,6 +190,8 @@ class TestBlock:
         block = Block(layer_idx=1, config=config, moe_config=moe_config, backend=sdpa_backend)
 
         assert block.moe.experts.config.swiglu_limit == 7.0
+        assert block.moe.experts.config.swiglu_clamp_after_activation is True
+        assert block.moe.experts.config.apply_router_weight_after_down is False
         assert block.moe.experts.config.activation_limit == moe_config.activation_limit
 
     def test_shared_expert_uses_share_expert_dims(self, config, moe_config, sdpa_backend):

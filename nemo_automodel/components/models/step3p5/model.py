@@ -142,8 +142,10 @@ class Block(nn.Module):
                 router_bias=moe_config.router_bias,
                 expert_bias=moe_config.expert_bias,
                 expert_activation=moe_config.expert_activation,
+                apply_router_weight_after_down=moe_config.apply_router_weight_after_down,
                 activation_limit=moe_config.activation_limit,
                 swiglu_limit=swiglu_limit if swiglu_limit is not None else moe_config.swiglu_limit,
+                swiglu_clamp_after_activation=True,
                 dtype=moe_config.dtype,
                 softmax_before_topk=moe_config.softmax_before_topk,
                 force_e_score_correction_bias=moe_config.force_e_score_correction_bias,
@@ -273,6 +275,7 @@ class Step3p5Model(nn.Module):
             router_bias=False,
             expert_bias=False,
             expert_activation="swiglu",
+            apply_router_weight_after_down=True,
             dtype=get_dtype(getattr(config, "torch_dtype", "bfloat16"), torch.bfloat16),
             force_e_score_correction_bias=use_router_bias,
         )

@@ -267,6 +267,43 @@ class MockDeepEPDispatcher:
         return hidden_states
 
 
+def test_deepep_lora_applies_router_weight_after_down(moe_config):
+    """The LoRA DeepEP path must honor the base expert routing order."""
+    moe_config.apply_router_weight_after_down = True
+    orig_experts = GroupedExpertsDeepEP(moe_config)
+    orig_experts.n_routed_experts = 4
+    orig_experts.ep_size = 1
+
+    lora_module = GroupedExpertsDeepEPLoRA(orig_experts, lora_dim=4)
+    num_tokens = 2
+    tokens_per_expert = torch.tensor([num_tokens, 0, 0, 0], dtype=torch.long)
+    permuted_x = torch.randn(num_tokens, 16)
+    permuted_probs = torch.tensor([0.25, 0.5])
+    dispatcher = MockDeepEPDispatcher()
+    dispatcher.token_permutation2 = MagicMock(return_value=(permuted_x, tokens_per_expert, permuted_probs))
+    lora_module.token_dispatcher = dispatcher
+
+    fake_ops = MagicMock()
+    fake_ops.gmm.side_effect = [
+        torch.ones(num_tokens, 64),
+        torch.zeros(num_tokens, 4),
+        torch.zeros(num_tokens, 64),
+        torch.ones(num_tokens, 16),
+        torch.zeros(num_tokens, 4),
+        torch.zeros(num_tokens, 16),
+    ]
+    with patch("nemo_automodel.components._peft.lora_experts.ops", fake_ops), torch.no_grad():
+        out = lora_module(
+            torch.randn(num_tokens, 16),
+            torch.ones(num_tokens, dtype=torch.bool),
+            permuted_probs.unsqueeze(-1),
+            torch.zeros(num_tokens, 1, dtype=torch.long),
+        )
+
+    expected = permuted_probs.unsqueeze(-1).expand_as(out)
+    torch.testing.assert_close(out, expected)
+
+
 @pytest.mark.skipif(grouped_gemm is None or not torch.cuda.is_available(), reason="Requires grouped_gemm and CUDA")
 def test_grouped_experts_deepep_lora_forward_mocked(moe_config, device):
     """
