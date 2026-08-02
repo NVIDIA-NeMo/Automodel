@@ -46,6 +46,7 @@ from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm
     _record_deferred_failure,
     _resolve_hf_model_class,
     _run_process_isolated_checkpoint_phase,
+    _set_router_weight_after_down,
     _trainable_parameter_digests,
     _wait_for_hf_reload_rank0,
     _wait_for_source_load_artifacts,
@@ -426,6 +427,56 @@ def test_lm_head_alias_check_skips_wrapper_around_input_dependent_accessor():
             return self.model.get_input_embeddings()
 
     assert _lm_head_embedding_aliased(WrapperModel()) is None
+
+
+def test_lm_head_alias_check_falls_back_to_named_embedding_parameter():
+    class TextModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed_tokens = torch.nn.Embedding(2, 2)
+
+    class InnerModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.language_model = TextModel()
+
+        def get_input_embeddings(self, input_ids):
+            raise AssertionError("input-dependent accessor must not be called")
+
+    class WrapperModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = InnerModel()
+            self.lm_head = torch.nn.Linear(2, 2, bias=False)
+
+        def get_input_embeddings(self):
+            return self.model.get_input_embeddings()
+
+    model = WrapperModel()
+
+    assert _lm_head_embedding_aliased(model) is False
+
+    model.lm_head.weight = model.model.language_model.embed_tokens.weight
+
+    assert _lm_head_embedding_aliased(model) is True
+
+
+def test_set_router_weight_after_down_updates_unique_expert_configs():
+    shared_config = SimpleNamespace(apply_router_weight_after_down=False)
+    second_config = SimpleNamespace(apply_router_weight_after_down=False)
+    model_part = torch.nn.Module()
+    model_part.first_expert = torch.nn.Module()
+    model_part.first_expert.config = shared_config
+    model_part.second_expert = torch.nn.Module()
+    model_part.second_expert.config = shared_config
+    model_part.third_expert = torch.nn.Module()
+    model_part.third_expert.config = second_config
+
+    updated = _set_router_weight_after_down([model_part], True)
+
+    assert updated == 2
+    assert shared_config.apply_router_weight_after_down is True
+    assert second_config.apply_router_weight_after_down is True
 
 
 def test_peft_no_split_modules_are_normalized_for_accelerate():
@@ -851,6 +902,74 @@ def test_process_isolated_source_load_parity_compares_persisted_reference(tmp_pa
         "source_load_cosine_threshold": 0.9985,
     }
     cleanup_source_load.assert_called_once_with(cfg)
+    raise_distributed_failure.assert_called_once_with(None)
+
+
+def test_process_isolated_source_load_parity_compares_both_router_orders(tmp_path, monkeypatch):
+    monkeypatch.setenv("CHECKPOINT_ROBUSTNESS_ROUTER_ORDER_AB", "true")
+    artifact_dir = tmp_path / ".checkpoint_robustness"
+    artifact_dir.mkdir()
+    reference_logits = torch.randn(1, 2, 3)
+    torch.save(reference_logits, artifact_dir / "source_load_reference_logits.pt")
+    (artifact_dir / "source_load_reference_metadata.json").write_text(
+        '{"explicit_tie_word_embeddings": false, "hf_aliased": false}'
+    )
+    cfg = SimpleNamespace(checkpoint=SimpleNamespace(checkpoint_dir=tmp_path))
+    after_down_logits = torch.randn(1, 2, 3)
+    before_down_logits = torch.randn(1, 2, 3)
+    model_part = torch.nn.Linear(2, 2, bias=False)
+    model_part.config = SimpleNamespace(apply_router_weight_after_down=False)
+    source_trainer = SimpleNamespace(model_parts=[model_part], setup=Mock())
+
+    with (
+        patch(
+            "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm.parse_args_and_load_config",
+            return_value=cfg,
+        ),
+        patch(
+            "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm."
+            "_disable_distributed_atexit_teardown"
+        ),
+        patch(
+            "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm._load_input_ids_once",
+            return_value=[11, 12],
+        ),
+        patch(
+            "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm._get_logits",
+            side_effect=[after_down_logits, before_down_logits],
+        ) as get_logits,
+        patch(
+            "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm._lm_head_embedding_aliased",
+            return_value=False,
+        ),
+        patch(
+            "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm._compare_source_load_parity",
+            return_value=None,
+        ) as compare_source_load,
+        patch("tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm._cleanup_source_load_sync"),
+        patch("tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm._barrier"),
+        patch(
+            "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm._raise_distributed_failure"
+        ) as raise_distributed_failure,
+    ):
+        _run_process_isolated_checkpoint_phase(
+            "source_load_parity",
+            custom_args={"check_source_load_parity": True},
+            recipe_cls=Mock(return_value=source_trainer),
+            hf_model_cls=Mock(),
+            input_ids_loader=Mock(),
+        )
+
+    assert get_logits.call_count == 2
+    assert compare_source_load.call_count == 2
+    torch.testing.assert_close(compare_source_load.call_args_list[0].args[1], after_down_logits)
+    torch.testing.assert_close(compare_source_load.call_args_list[1].args[1], before_down_logits)
+    assert compare_source_load.call_args_list[0].kwargs == {
+        "source_load_kl_threshold": float("inf"),
+        "source_load_mean_kl_threshold": float("inf"),
+        "source_load_cosine_threshold": -1.0,
+    }
+    assert model_part.config.apply_router_weight_after_down is True
     raise_distributed_failure.assert_called_once_with(None)
 
 

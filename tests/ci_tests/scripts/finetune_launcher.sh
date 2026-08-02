@@ -17,7 +17,8 @@
 # Env required: CONFIG_PATH, PIPELINE_DIR, TEST_NAME, TEST_LEVEL, TEST_SCRIPT_PATH,
 #   TEST_NODE_COUNT, NPROC_PER_NODE, MASTER_ADDR, MASTER_PORT, SLURM_JOB_ID, HAS_ROBUSTNESS
 # Env optional: EXEC_CMD, RDZV_TIMEOUT, MAX_STEPS, LOCAL_BATCH_SIZE,
-#   CONFIG_NPROC_PER_NODE, FINETUNE_ARGS, NEMO_CI_PATH, WANDB_AUTOMODEL_API_KEY, TIME
+#   CONFIG_NPROC_PER_NODE, FINETUNE_ARGS, NEMO_CI_PATH, WANDB_AUTOMODEL_API_KEY, TIME,
+#   CHECKPOINT_ROBUSTNESS_SKIP_FINETUNE
 
 cd /opt/Automodel
 
@@ -58,11 +59,18 @@ echo "============================================"
 echo "[finetune] Running finetune..."
 echo "============================================"
 FINETUNE_START=$SECONDS
+FINETUNE_SKIPPED=false
 
-eval $RUN_CMD
-FINETUNE_EXIT_CODE=$?
+if [[ "${CHECKPOINT_ROBUSTNESS_SKIP_FINETUNE:-false}" == "true" ]]; then
+  echo "[finetune] Skipped for source-parity-only diagnostic"
+  FINETUNE_SKIPPED=true
+  FINETUNE_EXIT_CODE=0
+else
+  eval $RUN_CMD
+  FINETUNE_EXIT_CODE=$?
+fi
 
-if [[ "$FINETUNE_EXIT_CODE" -eq 0 && "${REQUIRE_FINITE_METRICS:-false}" == "true" ]]; then
+if [[ "$FINETUNE_EXIT_CODE" -eq 0 && "$FINETUNE_SKIPPED" == "false" && "${REQUIRE_FINITE_METRICS:-false}" == "true" ]]; then
   python3 /opt/Automodel/tests/ci_tests/scripts/assert_finite_train_metrics.py \
     --log "$PIPELINE_DIR/${TEST_NAME}_slurm_${SLURM_JOB_ID}.out" \
     || FINETUNE_EXIT_CODE=$?

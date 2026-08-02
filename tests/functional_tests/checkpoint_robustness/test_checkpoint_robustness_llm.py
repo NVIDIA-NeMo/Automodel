@@ -621,30 +621,15 @@ def _lm_head_embedding_aliased(model) -> bool | None:
     # parameters, so only use this as a real storage check before sharding.
     if dist.is_initialized() and dist.get_world_size() > 1:
         return None
-    lm_head = getattr(model, "lm_head", None)
-    get_input_embeddings = getattr(model, "get_input_embeddings", None)
-    if lm_head is None or get_input_embeddings is None:
+    from nemo_automodel.shared.tied_weights import (
+        get_input_embeddings_weight_and_name,
+        get_lm_head_weight_and_name,
+    )
+
+    lm_head_weight, _ = get_lm_head_weight_and_name(model)
+    embedding_weight, _ = get_input_embeddings_weight_and_name(model)
+    if lm_head_weight is None or embedding_weight is None:
         return None
-    try:
-        inspect.signature(get_input_embeddings).bind()
-    except TypeError:
-        # Some remote-code VLMs require input IDs to select an embedding path.
-        # That accessor cannot provide the storage-only alias check used here.
-        return None
-    except ValueError:
-        # Some extension callables do not expose an inspectable signature. Let
-        # the normal zero-argument accessor path handle those implementations.
-        pass
-    try:
-        embeddings = get_input_embeddings()
-    except TypeError:
-        # Some wrappers expose a zero-argument accessor but delegate to an
-        # input-dependent inner model, so storage aliasing is not observable.
-        return None
-    if embeddings is None or not hasattr(lm_head, "weight") or not hasattr(embeddings, "weight"):
-        return None
-    lm_head_weight = lm_head.weight
-    embedding_weight = embeddings.weight
     if isinstance(lm_head_weight, DTensor) or isinstance(embedding_weight, DTensor):
         return None
     try:
@@ -655,6 +640,30 @@ def _lm_head_embedding_aliased(model) -> bool | None:
     if lm_head_ptr == 0 or embedding_ptr == 0:
         return None
     return lm_head_ptr == embedding_ptr
+
+
+def _set_router_weight_after_down(model_parts: list[torch.nn.Module], enabled: bool) -> int:
+    """Set the routed-expert weight order on every unique model-part config.
+
+    Args:
+        model_parts: Pipeline model partitions whose module configs should be updated.
+        enabled: Whether routing weights are applied after the expert down projection.
+
+    Returns:
+        Number of unique expert configs updated.
+    """
+    updated_config_ids: set[int] = set()
+    for model_part in model_parts:
+        for module in model_part.modules():
+            config = getattr(module, "config", None)
+            if config is None or not hasattr(config, "apply_router_weight_after_down"):
+                continue
+            config_id = id(config)
+            if config_id in updated_config_ids:
+                continue
+            config.apply_router_weight_after_down = enabled
+            updated_config_ids.add(config_id)
+    return len(updated_config_ids)
 
 
 def _normalize_peft_no_split_modules(model) -> None:
@@ -1818,12 +1827,36 @@ def _run_process_isolated_checkpoint_phase(
             _barrier()
 
         device = next(source_trainer.model_parts[0].parameters()).device
+        router_order_ab = os.environ.get("CHECKPOINT_ROBUSTNESS_ROUTER_ORDER_AB", "false") == "true"
+        if router_order_ab:
+            updated_configs = _set_router_weight_after_down(source_trainer.model_parts, True)
+            assert updated_configs > 0, "Router-order A/B found no expert configs to update"
+            if _rank0():
+                print(
+                    f"[Router-order A/B] mode=after_down updated_configs={updated_configs}",
+                    flush=True,
+                )
         trainer_source_logits = _get_logits(
             source_trainer.model_parts[0],
             input_ids,
             device,
             trainer=source_trainer,
         )
+        trainer_source_logits_before_down = None
+        if router_order_ab:
+            updated_configs = _set_router_weight_after_down(source_trainer.model_parts, False)
+            if _rank0():
+                print(
+                    f"[Router-order A/B] mode=before_down updated_configs={updated_configs}",
+                    flush=True,
+                )
+            trainer_source_logits_before_down = _get_logits(
+                source_trainer.model_parts[0],
+                input_ids,
+                device,
+                trainer=source_trainer,
+            )
+            _set_router_weight_after_down(source_trainer.model_parts, True)
         source_load_reference = None
         if _rank0():
             metadata = json.loads(metadata_path.read_text())
@@ -1832,14 +1865,36 @@ def _run_process_isolated_checkpoint_phase(
                 metadata["hf_aliased"],
                 metadata["explicit_tie_word_embeddings"],
             )
-        source_load_failure = _compare_source_load_parity(
-            source_load_reference,
-            trainer_source_logits,
-            _lm_head_embedding_aliased(source_trainer.model_parts[0]),
-            source_load_kl_threshold=float(custom_args.get("source_load_kl_threshold", "5e-3")),
-            source_load_mean_kl_threshold=float(custom_args.get("source_load_mean_kl_threshold", "1e-3")),
-            source_load_cosine_threshold=float(custom_args.get("source_load_cosine_threshold", "0.9999")),
-        )
+        candidate_aliased = _lm_head_embedding_aliased(source_trainer.model_parts[0])
+        if router_order_ab:
+            assert trainer_source_logits_before_down is not None
+            source_load_failures = []
+            for label, candidate_logits in (
+                ("after_down", trainer_source_logits),
+                ("before_down", trainer_source_logits_before_down),
+            ):
+                if _rank0():
+                    print(f"[Router-order A/B] comparing mode={label}", flush=True)
+                failure = _compare_source_load_parity(
+                    source_load_reference,
+                    candidate_logits,
+                    candidate_aliased,
+                    source_load_kl_threshold=float("inf"),
+                    source_load_mean_kl_threshold=float("inf"),
+                    source_load_cosine_threshold=-1.0,
+                )
+                if failure is not None:
+                    source_load_failures.append(f"{label}:\n{failure}")
+            source_load_failure = "\n".join(source_load_failures) or None
+        else:
+            source_load_failure = _compare_source_load_parity(
+                source_load_reference,
+                trainer_source_logits,
+                candidate_aliased,
+                source_load_kl_threshold=float(custom_args.get("source_load_kl_threshold", "5e-3")),
+                source_load_mean_kl_threshold=float(custom_args.get("source_load_mean_kl_threshold", "1e-3")),
+                source_load_cosine_threshold=float(custom_args.get("source_load_cosine_threshold", "0.9999")),
+            )
         _barrier()
         if _rank0():
             _cleanup_source_load_sync(cfg)
