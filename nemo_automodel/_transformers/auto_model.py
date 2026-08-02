@@ -55,7 +55,6 @@ from transformers.utils import ContextManagers  # noqa: E402
 from nemo_automodel.components.distributed.config import DistributedSetup  # noqa: E402
 from nemo_automodel.components.distributed.ddp import DDPManager  # noqa: E402
 from nemo_automodel.components.distributed.init_utils import get_world_size_safe  # noqa: E402
-from nemo_automodel.components.distributed.megatron_fsdp import MegatronFSDPManager  # noqa: E402
 from nemo_automodel.components.distributed.pipelining.autopipeline import AutoPipeline  # noqa: E402, F401
 from nemo_automodel.components.quantization.qat import QATConfig  # noqa: E402
 from nemo_automodel.components.utils.model_utils import (  # noqa: E402
@@ -507,13 +506,14 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 kwargs["config"] = _hf_config
 
         # Use meta device initialization when:
-        # - Not using MegatronFSDPManager or DDPManager (they handle their own initialization)
+        # - Not using DDPManager. MFSDP v2 deliberately constructs on meta so
+        #   large checkpoints can be materialized and loaded on CPU before sharding.
         # - AND either multi-GPU (world_size > 1) or single-GPU custom model (not HF)
         # - AND not using quantization (we let HF handle BitsAndBytes/FP8; don't init meta device)
         #   For non-HF models, native quant config is ignored.
         is_meta_device = all(
             [
-                not isinstance(model_wrapper, (MegatronFSDPManager, DDPManager)),
+                not isinstance(model_wrapper, DDPManager),
                 get_world_size_safe() > 1 or not is_hf_model,
                 quantization_config is None and (_hf_native_quant_cfg is None or not is_hf_model),
             ]

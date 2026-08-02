@@ -21,8 +21,10 @@ import pytest
 import torch
 
 import nemo_automodel.components.distributed.mesh_utils as mesh_utils
+from nemo_automodel.components.distributed.config import MegatronFSDPConfig
 from nemo_automodel.components.distributed.mesh import MeshAxisName, ParallelismSizes
 from nemo_automodel.components.distributed.mesh_utils import (
+    _create_device_meshes,
     _create_fsdp2_device_mesh,
     _create_moe_mesh,
     _init_named_mesh,
@@ -33,6 +35,20 @@ from nemo_automodel.components.distributed.mesh_utils import (
     get_fsdp_dp_mesh,
     get_submesh,
 )
+
+
+@pytest.mark.parametrize(
+    ("sizes", "feature"),
+    [
+        (ParallelismSizes(dp_size=2, tp_size=2), "tensor parallelism"),
+        (ParallelismSizes(dp_size=2, cp_size=2), "context parallelism"),
+        (ParallelismSizes(dp_size=2, pp_size=2), "pipeline parallelism"),
+        (ParallelismSizes(dp_size=2, ep_size=2), "expert parallelism"),
+    ],
+)
+def test_megatron_fsdp_rejects_non_dp_topologies(sizes, feature):
+    with pytest.raises(ValueError, match=feature):
+        _create_device_meshes(MegatronFSDPConfig(), sizes, world_size=4)
 
 
 def test_mesh_utils_reexports_mesh_creation_helpers():

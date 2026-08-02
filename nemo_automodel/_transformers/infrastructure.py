@@ -53,11 +53,7 @@ from nemo_automodel.components.distributed.config import (
 from nemo_automodel.components.distributed.ddp import DDPManager
 from nemo_automodel.components.distributed.fsdp2 import FSDP2Manager
 from nemo_automodel.components.distributed.init_utils import get_world_size_safe
-from nemo_automodel.components.distributed.megatron_fsdp import (
-    MegatronFSDPManager,
-    restore_distributed_param_attrs,
-    snapshot_distributed_param_attrs,
-)
+from nemo_automodel.components.distributed.megatron_fsdp import MegatronFSDPManager
 from nemo_automodel.components.distributed.mesh import MeshContext
 from nemo_automodel.components.distributed.pipelining.autopipeline import AutoPipeline
 from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
@@ -573,10 +569,11 @@ def apply_model_infrastructure(
     # the checkpoint; then apply FSDP. With TP>1 we must shard first and load after so all ranks
     # stay in sync (load-before-shard can cause NCCL collective mismatch). With PP we shard first
     # (each stage has different layers).
-    # Skip load-before-shard for PEFT: base load into unwrapped PEFT then later adapter load
-    # after shard can leave base/adapter out of sync (e.g. key/device mismatch). Use the
-    # post-shard load path so base and adapter load in the same way as multi-GPU.
+    # Skip load-before-shard for PEFT: base load into unwrapped PEFT then later
+    # adapter load after shard can leave base/adapter out of sync (e.g. key/device
+    # mismatch).
     need_checkpoint_load = bool(pretrained_model_name_or_path and load_base_model)
+    is_megatron_fsdp = isinstance(model_wrapper, MegatronFSDPManager)
     load_before_shard = _should_load_before_shard(
         autopipeline=autopipeline,
         tp_size=mesh.tp_size,
@@ -627,6 +624,15 @@ def apply_model_infrastructure(
     freeze_deepseek_v4_indexer_params(model)
     freeze_minimax_m3_indexer_params(model)
 
+    # MFSDP v2 allocates persistent gradient buffers while sharding. Freeze the
+    # PEFT base weights first so those buffers are created only for adapters.
+    # Other strategies retain the post-shard pass below because parallelization
+    # can create parameters (for example GroupedExpertsTE).
+    if is_megatron_fsdp and peft_config is not None:
+        for name, param in model.named_parameters():
+            if "lora_" not in name and param.requires_grad:
+                param.requires_grad_(False)
+
     # NemotronOmni RADIO: opt into the fused SDPA path on ViT attention blocks.
     enable_radio_vit_fused_attn(model)
 
@@ -636,19 +642,14 @@ def apply_model_infrastructure(
 
     # Apply pipeline parallelism if configured. This is the outermost parallelization.
     # Note: AutoPipeline takes care of applying PP + EP + FSDP. _shard_ep_fsdp will take care of applying EP + FSDP if no PP.
-    mfsdp_param_attrs = None
     if autopipeline is not None:
         model = _shard_pp(autopipeline, model, loss_fn, parallelize_fn)
         for part in model.parts:
             setattr(part, "_pre_shard_hf_state_dict_keys", pre_shard_hf_state_dict_keys)
     else:
         model = _shard_ep_fsdp(model, model_wrapper, parallelize_fn, mesh)
-        # Megatron-FSDP stamps load-bearing per-parameter state (owning-model back-ref,
-        # tied-weight ``_is_shared`` marker, ``orig_param`` and friends) during wrapping.
-        # The lm-head re-tie and post-wrap checkpoint reload below rebuild Parameter
-        # objects and drop that state; snapshot it now and re-apply it afterwards.
-        mfsdp_param_attrs = snapshot_distributed_param_attrs(model)
-        _ensure_tied_lm_heads(model)
+        if not is_megatron_fsdp:
+            _ensure_tied_lm_heads(model)
         if compile_config is not None and not isinstance(model_wrapper, FSDP2Manager):
             model = compile_model(model, compile_config)
         if isinstance(model_wrapper, FSDP2Manager):
@@ -713,6 +714,9 @@ def apply_model_infrastructure(
                 load_base_model=load_base_model,
             )
 
+    if is_megatron_fsdp and (need_materialize or should_load_checkpoint):
+        model_wrapper.sync_model_weights(model)
+
     _verify_safe_moe_tp_weights_loaded(
         model,
         checkpoint_loaded=bool(checkpoint_already_loaded or weights_already_loaded or should_load_checkpoint),
@@ -745,7 +749,7 @@ def apply_model_infrastructure(
         has_sharded_params = any(isinstance(p, DTensor) for p in model.parameters())
         # Skip model.to(device) when CPU offload is on — FSDP2 expects params on
         # CPU and moves them to GPU during forward/backward itself.
-        if not _has_cpu_offload and not (should_load_checkpoint and has_sharded_params):
+        if not _has_cpu_offload and not is_megatron_fsdp and not (should_load_checkpoint and has_sharded_params):
             try:
                 model.to(device, non_blocking=True)
             except NotImplementedError as e:
@@ -809,11 +813,6 @@ def apply_model_infrastructure(
     if compute_dtype is not None:
         for mp in model.parts if hasattr(model, "parts") else [model]:
             cast_frozen_modules_to_compute_dtype(mp, compute_dtype)
-
-    # Re-apply the Megatron-FSDP per-parameter state dropped by the lm-head re-tie and
-    # post-wrap checkpoint reload, so the deferred optimizer registration and first
-    # backward see the same distributed-parameter attributes the combined entry point does.
-    restore_distributed_param_attrs(model, mfsdp_param_attrs)
 
     model = _apply_runtime_compatibility_fixes(model)
     return model

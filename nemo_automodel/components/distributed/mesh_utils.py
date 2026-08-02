@@ -83,7 +83,9 @@ def _create_device_meshes(
             ranks=ranks,
         )
     elif isinstance(strategy_config, MegatronFSDPConfig):
+        _require_size_one("megatron_fsdp", parallelism.tp_size, "tensor parallelism")
         _require_size_one("megatron_fsdp", parallelism.pp_size, "pipeline parallelism")
+        _require_size_one("megatron_fsdp", parallelism.cp_size, "context parallelism")
         _require_size_one("megatron_fsdp", parallelism.ep_size, "expert parallelism")
         mesh = _create_megatron_fsdp_device_mesh(
             parallelism,
