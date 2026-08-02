@@ -84,3 +84,7 @@ optimizer:
 ci:
   time: "00:20:00"
   nproc_per_node: 1
+  env_vars:
+    # AMINT-8 measured 8 threads as the model-load saturation point.
+    OMP_NUM_THREADS: 8
+    MKL_NUM_THREADS: 8
