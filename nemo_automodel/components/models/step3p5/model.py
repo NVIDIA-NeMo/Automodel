@@ -275,7 +275,6 @@ class Step3p5Model(nn.Module):
             router_bias=False,
             expert_bias=False,
             expert_activation="swiglu",
-            apply_router_weight_after_down=True,
             dtype=get_dtype(getattr(config, "torch_dtype", "bfloat16"), torch.bfloat16),
             force_e_score_correction_bias=use_router_bias,
         )

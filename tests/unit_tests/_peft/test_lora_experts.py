@@ -269,7 +269,7 @@ class MockDeepEPDispatcher:
 
 def test_deepep_lora_applies_router_weight_after_down(moe_config):
     """The LoRA DeepEP path must honor the base expert routing order."""
-    moe_config.apply_router_weight_after_down = True
+    moe_config.apply_router_weight_after_down = False
     orig_experts = GroupedExpertsDeepEP(moe_config)
     orig_experts.n_routed_experts = 4
     orig_experts.ep_size = 1
@@ -356,7 +356,7 @@ def test_deepep_lora_stepfun_fp32_expert_probe_matches_reference(moe_config, mon
                 @ lora_module.lora_down_A[expert_idx].float()
                 @ lora_module.lora_down_B[expert_idx].float()
             ) * lora_module.scale
-            expected_parts.append((expert_output * permuted_probs[expert_idx].float()).to(torch.bfloat16))
+            expected_parts.append(expert_output.to(torch.bfloat16))
 
     torch.testing.assert_close(actual, torch.cat(expected_parts))
 

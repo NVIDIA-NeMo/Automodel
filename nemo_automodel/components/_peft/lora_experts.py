@@ -498,9 +498,6 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
             raise RuntimeError("The StepFun FP32 expert probe only supports no-grad parity evaluation")
         if self.config.expert_activation != "swiglu" or not self.config.swiglu_clamp_after_activation:
             raise RuntimeError("The StepFun FP32 expert probe requires StepFun SwiGLU semantics")
-        if not self.config.apply_router_weight_after_down:
-            raise RuntimeError("The StepFun FP32 expert probe requires routing after the down projection")
-
         gate_and_up_projs = _to_local(self.gate_and_up_projs)
         down_projs = _to_local(self.down_projs)
         lora_gate_and_up_A = _to_local(self.lora_gate_and_up_A)
@@ -535,6 +532,8 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
                 gate = gate.clamp(max=limit)
                 up = up.clamp(min=-limit, max=limit)
             activated = gate * up
+            if not self.config.apply_router_weight_after_down:
+                activated = activated * routing_probs[token_offset:next_offset].float()
 
             expert_output = activated @ down_projs[expert_idx].float()
             expert_output = expert_output + (
@@ -542,7 +541,8 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
             ) * self.scale
             if self.expert_bias:
                 expert_output = expert_output + _to_local(self.down_proj_bias)[expert_idx].float()
-            expert_output = expert_output * routing_probs[token_offset:next_offset].float()
+            if self.config.apply_router_weight_after_down:
+                expert_output = expert_output * routing_probs[token_offset:next_offset].float()
             output[token_offset:next_offset] = expert_output.to(output.dtype)
             token_offset = next_offset
 

@@ -166,4 +166,4 @@ def test_step3p5_model_router_bias_config_uses_sigmoid_with_bias_and_force_flag(
     assert model.moe_config.score_func == "sigmoid_with_bias"
     assert model.moe_config.router_bias is False
     assert model.moe_config.force_e_score_correction_bias is True
-    assert model.moe_config.apply_router_weight_after_down is True
+    assert model.moe_config.apply_router_weight_after_down is False
