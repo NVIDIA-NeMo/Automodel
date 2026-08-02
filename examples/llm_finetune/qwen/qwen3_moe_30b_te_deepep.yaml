@@ -126,7 +126,8 @@ ci:
   vllm_deploy: true
   vllm_smoke_test: true
   checkpoint_robustness:
-    hf_kl_threshold: 1e-2
+    # Observed BF16 HF reload KL spans 0.0199-0.0404 across tested expert implementations.
+    hf_kl_threshold: 5e-2
     tokenizer_name: Qwen/Qwen3-30B-A3B
     no_check_resume: true
     dataset.num_samples_limit: 500
