@@ -30,6 +30,7 @@ from nemo_automodel.components.models.inkling.configuration import InklingConfig
 from nemo_automodel.components.models.inkling.layers import InklingDenseMLP, InklingMoE
 from nemo_automodel.components.models.inkling.model import InklingForConditionalGeneration
 from nemo_automodel.components.models.inkling.state_dict_adapter import _interleave
+from nemo_automodel.components.models.inkling.text import InklingAttention
 
 from .parity_check_inkling import build_tiny_config
 
@@ -194,6 +195,29 @@ def test_sdpa_matches_eager_for_batched_inputs():
 
     assert sdpa_model.model.language_model.layers[0].self_attn.attention_backend == "sdpa"
     torch.testing.assert_close(sdpa_logits, eager_logits, rtol=1e-4, atol=1e-5)
+
+
+def test_sdpa_casts_fp32_short_convolution_outputs_to_query_dtype(monkeypatch):
+    cfg = build_tiny_config().text_config
+    cfg.torch_dtype = torch.bfloat16
+    cfg._attn_implementation = "sdpa"
+    backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch", experts="torch", dispatcher="torch")
+    attention = InklingAttention(cfg, layer_idx=0, backend=backend).eval()
+
+    for short_convolution in (attention.k_sconv, attention.v_sconv):
+        original_forward = short_convolution.forward
+
+        def return_fp32(*args, _forward=original_forward, **kwargs):
+            return _forward(*args, **kwargs).float()
+
+        monkeypatch.setattr(short_convolution, "forward", return_fp32)
+
+    hidden_states = torch.randn(1, 8, cfg.hidden_size, dtype=torch.bfloat16)
+    attention_mask = torch.zeros(1, 1, 8, 8, dtype=torch.bfloat16)
+    output, probabilities = attention(hidden_states, attention_mask)
+
+    assert output.dtype == torch.bfloat16
+    assert probabilities is None
 
 
 def test_native_state_dict_roundtrip_is_exact():

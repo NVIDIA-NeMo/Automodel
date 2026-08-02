@@ -436,6 +436,15 @@ class InklingAttention(nn.Module):
         key_states = self.k_norm(key_states.view(key_value_shape)).transpose(1, 2)
         value_states = value_states.view(key_value_shape).transpose(1, 2)
 
+        # The short-convolution parameters intentionally remain fp32 under FSDP.
+        # Some FSDP policies therefore return their activations in fp32 even
+        # though the attention projections run in bf16.  SDPA requires q/k/v to
+        # share a dtype, so restore the projection compute dtype before caching
+        # or dispatching to either attention backend.
+        attention_dtype = query_states.dtype
+        key_states = key_states.to(dtype=attention_dtype)
+        value_states = value_states.to(dtype=attention_dtype)
+
         query_length = query_states.shape[2]
         if past_key_values is None:
             key_length = key_states.shape[2]
