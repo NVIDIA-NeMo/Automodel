@@ -60,6 +60,9 @@ distributed:
 
   moe:
     reshard_after_forward: false
+    # fake_balanced_gate routes deterministically, so recomputing the router under
+    # activation checkpointing is safe and avoids the slower saved-router path.
+    ignore_router_for_ac: false
 
 dist_env:
   backend: nccl
@@ -79,6 +82,11 @@ model:
     rope_fusion: true
     experts: gmm
     dispatcher: hybridep
+    dispatcher_num_sms: 20
+    dispatcher_hybridep_permute_fusion: false
+    dispatcher_hybridep_num_sms_preprocessing: 132
+    dispatcher_hybridep_num_blocks_permute: 112
+    dispatcher_hybridep_num_blocks_unpermute: 112
     fake_balanced_gate: true
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true

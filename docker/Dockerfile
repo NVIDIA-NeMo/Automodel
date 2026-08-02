@@ -75,10 +75,14 @@ RUN if [ "$INSTALL_TE" = "True" ]; then \
     cd ../ && rm -rf TransformerEngine; \
     fi
 
-# Install HybridEP / DeepEP: apt rdma-core v60 (build==runtime libibverbs), nvshmem wheel 3.6.5.
-# DEEPEP_COMMIT = 17cfb817 + DeepEP #638, padding max_num_of_tokens_per_rank to the combine-kernel chunk size.
+# Install HybridEP / DeepEP. Build with apt rdma-core v60 (so build==runtime libibverbs)
+# and RDMA_CORE_HOME symlinked to the system install; create the libnvshmem_host.so->.so.3
+# symlink required for DeepEP fabric handle ops; use the nvshmem wheel 3.6.5 and pin
+# DEEPEP_COMMIT to the narrowly scoped HybridEP backport at a6acb7e. It retains
+# the #638 combine-kernel padding fix, compact int16 top-k metadata, reusable
+# NCCL preprocessing storage, and fused permute/unpermute support.
 COPY docker/common/deepep.patch /opt/deepep.patch
-ARG DEEPEP_COMMIT=42144303752422ade37f24bca9e2dde12df70e09
+ARG DEEPEP_COMMIT=a6acb7e8ecb136a008530b85fb6a6bc661608e52
 ENV HYBRID_EP_MULTINODE=1
 ENV RDMA_CORE_HOME=/opt/rdma-core/build
 ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64/:$LD_LIBRARY_PATH
@@ -91,7 +95,7 @@ RUN apt-get update && apt-get install -y --allow-change-held-packages \
     mkdir -p ${RDMA_CORE_HOME} && \
     ln -sfn /usr/include ${RDMA_CORE_HOME}/include && \
     ln -sfn /usr/lib/${ARCH_LIB} ${RDMA_CORE_HOME}/lib && \
-    git clone https://github.com/deepseek-ai/DeepEP.git && \
+    git clone https://github.com/akoumpa/DeepEP.git && \
     cd DeepEP && \
     git fetch origin $DEEPEP_COMMIT && \
     git checkout FETCH_HEAD && \

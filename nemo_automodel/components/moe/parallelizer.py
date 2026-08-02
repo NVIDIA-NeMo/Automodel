@@ -571,11 +571,9 @@ def apply_ac(
                 context_fn=_preserve_gate_load_during_recompute(block, selective_checkpointing_context_fn),
             )
         else:
-            block = ptd_checkpoint_wrapper(
-                block,
-                preserve_rng_state=True,
-                context_fn=_preserve_gate_load_during_recompute(block),
-            )
+            context_fn = _preserve_gate_load_during_recompute(block)
+            checkpoint_kwargs = {"context_fn": context_fn} if context_fn is not None else {}
+            block = ptd_checkpoint_wrapper(block, preserve_rng_state=True, **checkpoint_kwargs)
 
         parent_layers.register_module(layer_id, block)
 

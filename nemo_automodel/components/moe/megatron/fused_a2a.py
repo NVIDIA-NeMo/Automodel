@@ -359,6 +359,9 @@ def init_hybrid_ep_buffer(
     num_sms_dispatch_api: int,
     num_sms_combine_api: int,
     fp8_dispatch: bool,
+    num_sms_preprocessing_api: int | None = None,
+    num_blocks_permute: int | None = None,
+    num_blocks_unpermute: int | None = None,
 ) -> None:
     """Initialize the HybridEP buffer, including buffer allocation and metadata initialization.
 
@@ -374,6 +377,9 @@ def init_hybrid_ep_buffer(
         num_sms_dispatch_api: Number of SMs used by the dispatch API.
         num_sms_combine_api: Number of SMs used by the combine API.
         fp8_dispatch: Whether to use FP8 communication during the dispatch phase.
+        num_sms_preprocessing_api: Optional SM count for routing-metadata preprocessing.
+        num_blocks_permute: Optional dispatch permutation block count.
+        num_blocks_unpermute: Optional combine unpermutation block count.
     """
     assert not fp8_dispatch, "HybridEP dispatcher does not support fp8 dispatch now"
     global _hybrid_ep_buffer
@@ -385,6 +391,9 @@ def init_hybrid_ep_buffer(
         use_fp8=fp8_dispatch,
         num_sms_dispatch_api=num_sms_dispatch_api,
         num_sms_combine_api=num_sms_combine_api,
+        num_sms_preprocessing_api=num_sms_preprocessing_api,
+        num_blocks_permute=num_blocks_permute,
+        num_blocks_unpermute=num_blocks_unpermute,
     )
 
 
@@ -409,8 +418,18 @@ class HybridEPDispatch(torch.autograd.Function):
         num_sms_combine_api=24,
         num_permuted_tokens=None,
         pad_multiple=None,
+        topk_idx=None,
+        num_experts=None,
+        fuse_permute=False,
+        num_sms_preprocessing_api=None,
+        num_blocks_permute=None,
+        num_blocks_unpermute=None,
     ):
-        """Forward pass of fused dispatch of the HybridEP backend."""
+        """Dispatch ``x[T, H]`` using compact ``topk_idx[T, K]`` or ``routing_map[T, E]``.
+
+        ``probs[T, E]`` remains dense so its gradient layout is unchanged.  When both routing
+        representations are provided, HybridEP gives ``routing_map`` precedence.
+        """
         if _hybrid_ep_buffer is None:
             seq_len, hidden_dim = x.shape[-2:]
             fp8_dispatch = False
@@ -422,6 +441,9 @@ class HybridEPDispatch(torch.autograd.Function):
                 num_sms_dispatch_api,
                 num_sms_combine_api,
                 fp8_dispatch,
+                num_sms_preprocessing_api,
+                num_blocks_permute,
+                num_blocks_unpermute,
             )
         non_blocking = num_permuted_tokens is not None
         (
@@ -432,17 +454,22 @@ class HybridEPDispatch(torch.autograd.Function):
             handle,
         ) = _hybrid_ep_buffer.dispatch_with_permute(
             hidden=x,
+            topk_idx=topk_idx,
             routing_map=routing_map,
             probs=probs,
+            num_of_experts=num_experts,
             scaling_factor=None,
             num_of_experts_per_rank=num_local_experts,
             pad_multiple=pad_multiple,
             num_permuted_tokens=num_permuted_tokens,
             non_blocking=non_blocking,
+            dense_routing=topk_idx is not None and routing_map is None,
+            fuse_permute_dispatch=fuse_permute,
         )
 
         ctx.handle = handle
         ctx.pad_multiple = pad_multiple
+        ctx.fuse_permute = fuse_permute
         return (
             dispatched_hidden,
             dispatched_probs,
@@ -453,26 +480,50 @@ class HybridEPDispatch(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_x, grad_probs, grad_scaling_factor, grad_tokens_per_expert, grad_handle):
-        """Backward pass of fused dispatch of the HybridEP backend."""
+        """Combine ``grad_x`` and return the dense ``grad_probs[T, E]`` unchanged in layout."""
         handle = ctx.handle
         combined_hidden, combined_probs = _hybrid_ep_buffer.combine_with_unpermute(
-            hidden=grad_x, probs=grad_probs, handle=handle, pad_multiple=ctx.pad_multiple
+            hidden=grad_x,
+            probs=grad_probs,
+            handle=handle,
+            pad_multiple=ctx.pad_multiple,
+            fuse_unpermute_combine=ctx.fuse_permute,
         )
-        return combined_hidden, None, combined_probs, None, None, None, None, None, None
+        return (
+            combined_hidden,
+            None,
+            combined_probs,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
 
 
 class HybridEPCombine(torch.autograd.Function):
     """Fused combine operation for permute + combine a2a + permute using the HybridEP backend."""
 
     @staticmethod
-    def forward(ctx, x, handle, num_permuted_tokens=None, pad_multiple=None):
+    def forward(ctx, x, handle, num_permuted_tokens=None, pad_multiple=None, fuse_permute=False):
         """Forward pass of fused combine of the HybridEP backend."""
         combined_hidden, _ = _hybrid_ep_buffer.combine_with_unpermute(
-            hidden=x, handle=handle, pad_multiple=pad_multiple
+            hidden=x,
+            handle=handle,
+            pad_multiple=pad_multiple,
+            fuse_unpermute_combine=fuse_permute,
         )
         ctx.handle = handle
         ctx.pad_multiple = pad_multiple
         ctx.num_permuted_tokens = num_permuted_tokens
+        ctx.fuse_permute = fuse_permute
         return combined_hidden
 
     @staticmethod
@@ -485,8 +536,9 @@ class HybridEPCombine(torch.autograd.Function):
             handle=handle,
             pad_multiple=ctx.pad_multiple,
             num_permuted_tokens=ctx.num_permuted_tokens,
+            fuse_permute_dispatch=ctx.fuse_permute,
         )
-        return dispatched_hidden, None, None, None
+        return dispatched_hidden, None, None, None, None
 
 
 if HAVE_HYBRIDEP:
@@ -501,8 +553,37 @@ if HAVE_HYBRIDEP:
         num_sms_combine_api=24,
         num_permuted_tokens=None,
         pad_multiple=None,
+        *,
+        topk_idx=None,
+        num_experts=None,
+        fuse_permute: bool = False,
+        num_sms_preprocessing_api: int | None = None,
+        num_blocks_permute: int | None = None,
+        num_blocks_unpermute: int | None = None,
     ):
-        """Perform fused dispatch for permute + dispatch a2a + permute using the HybridEP backend."""
+        """Dispatch tokens through HybridEP while retaining dense probability layout.
+
+        Args:
+            x: Hidden states with shape ``[T, H]``.
+            routing_map: Optional dense routing map with shape ``[T, E]``.
+            probs: Dense routing probabilities with shape ``[T, E]``.
+            group: Expert-parallel process group.
+            num_local_experts: Number of experts owned by each rank.
+            num_sms_dispatch_api: SMs reserved for HybridEP dispatch.
+            num_sms_combine_api: SMs reserved for HybridEP combine.
+            num_permuted_tokens: Static output capacity for non-blocking dispatch.
+            pad_multiple: Optional token padding multiple.
+            topk_idx: Optional compact expert indices with shape ``[T, K]``.
+            num_experts: Global expert count required with compact indices.
+            fuse_permute: Fuse token permutation into the dispatch kernel.
+            num_sms_preprocessing_api: Optional SM count for routing-metadata preprocessing.
+            num_blocks_permute: Optional dispatch permutation block count.
+            num_blocks_unpermute: Optional combine unpermutation block count.
+
+        Returns:
+            Dispatched hidden states and probabilities, optional scaling metadata,
+            tokens per expert, and the opaque HybridEP combine handle.
+        """
         return HybridEPDispatch.apply(
             x,
             routing_map,
@@ -513,11 +594,28 @@ if HAVE_HYBRIDEP:
             num_sms_combine_api,
             num_permuted_tokens,
             pad_multiple,
+            topk_idx,
+            num_experts,
+            fuse_permute,
+            num_sms_preprocessing_api,
+            num_blocks_permute,
+            num_blocks_unpermute,
         )
 
-    def hybrid_ep_combine(x, handle, num_permuted_tokens=None, pad_multiple=None):
-        """Perform fused combine for unpermute + combine a2a + unpermute using the HybridEP backend."""
-        return HybridEPCombine.apply(x, handle, num_permuted_tokens, pad_multiple)
+    def hybrid_ep_combine(x, handle, num_permuted_tokens=None, pad_multiple=None, *, fuse_permute: bool = False):
+        """Combine expert outputs through HybridEP.
+
+        Args:
+            x: Permuted expert outputs with shape ``[T_local, H]``.
+            handle: Opaque handle returned by :func:`hybrid_ep_dispatch`.
+            num_permuted_tokens: Static token capacity used by non-blocking dispatch.
+            pad_multiple: Optional token padding multiple.
+            fuse_permute: Fuse output unpermutation into the combine kernel.
+
+        Returns:
+            Combined hidden states in the original token order with shape ``[T, H]``.
+        """
+        return HybridEPCombine.apply(x, handle, num_permuted_tokens, pad_multiple, fuse_permute)
 
 else:
     hybrid_ep_dispatch = None
