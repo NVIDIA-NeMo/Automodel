@@ -1190,9 +1190,13 @@ def _get_logits_pp(trainer, input_ids, device) -> torch.Tensor:
         if pp_seq_len:
             return pp_seq_len
         for stage in getattr(trainer.pp.info, "stages", None) or ():
-            for meta in getattr(stage, "inputs_meta", None) or ():
-                if meta.ndim >= 2 and meta.shape[1] > 0:
-                    return meta.shape[1]
+            inputs_meta = getattr(stage, "inputs_meta", None)
+            if not inputs_meta:
+                inputs_meta = getattr(getattr(stage, "_user_meta", None), "inputs", None)
+            for meta in inputs_meta or ():
+                shape = getattr(meta, "shape", ())
+                if len(shape) >= 2 and shape[1] > 0:
+                    return shape[1]
         ds_seq_length = trainer.cfg.get("dataset.seq_length", None)
         return ds_seq_length or orig_seq_len
 
