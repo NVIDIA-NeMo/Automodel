@@ -24,6 +24,8 @@ Tests cover:
 - Kwarg filtering against the model forward signature
 """
 
+from types import MethodType
+
 import pytest
 import torch
 import torch.nn as nn
@@ -265,6 +267,50 @@ class TestForwardAndAuxLoss:
         NoSigmaModel.forward = replacement_forward
         filtered = adapter._filter_model_kwargs(NoSigmaModel(), inputs)
         assert set(filtered) == {"hidden_states", "sigma"}
+
+    def test_kwargs_filter_does_not_cache_callable_instances(self):
+        class ForwardCallable:
+            def __call__(self, hidden_states, audio_hidden_states):
+                return hidden_states, audio_hidden_states
+
+        class Model(nn.Module):
+            forward = ForwardCallable()
+
+        adapter = LTX2Adapter()
+        inputs = {"hidden_states": torch.ones(1), "audio_hidden_states": torch.ones(1), "sigma": torch.ones(1)}
+        ltx2_module._get_forward_parameters.cache_clear()
+
+        filtered = adapter._filter_model_kwargs(Model(), inputs)
+
+        assert set(filtered) == {"hidden_states", "audio_hidden_states"}
+        assert ltx2_module._get_forward_parameters.cache_info().currsize == 0
+
+    def test_kwargs_filter_strips_receiver_and_does_not_cache_instance_method(self):
+        class Model(nn.Module):
+            def forward(module, hidden_states, audio_hidden_states):
+                return hidden_states, audio_hidden_states
+
+        adapter = LTX2Adapter()
+        inputs = {
+            "module": torch.ones(1),
+            "hidden_states": torch.ones(1),
+            "audio_hidden_states": torch.ones(1),
+            "sigma": torch.ones(1),
+        }
+        model = Model()
+        assert set(adapter._filter_model_kwargs(model, inputs)) == {"hidden_states", "audio_hidden_states"}
+
+        def replacement_forward(owning_model, hidden_states, sigma):
+            assert owning_model is model
+            return hidden_states, sigma
+
+        model.forward = MethodType(replacement_forward, model)
+        ltx2_module._get_forward_parameters.cache_clear()
+
+        filtered = adapter._filter_model_kwargs(model, inputs)
+
+        assert set(filtered) == {"hidden_states", "sigma"}
+        assert ltx2_module._get_forward_parameters.cache_info().currsize == 0
 
 
 class TestPipelineIntegration:

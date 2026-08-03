@@ -53,7 +53,7 @@ _MISSING_KEY_HINT = (
 )
 
 
-@lru_cache(maxsize=None)
+@lru_cache(maxsize=256)
 def _get_forward_parameters(forward_callable: Callable[..., Any]) -> Mapping[str, inspect.Parameter] | None:
     """Cache parameters by the underlying ``forward`` callable."""
     try:
@@ -263,10 +263,14 @@ class LTX2Adapter(ModelAdapter):
         forward = getattr(unwrapped, "forward", None)
         if not callable(forward):
             return model_kwargs
-        forward_callable = getattr(forward, "__func__", forward)
-        try:
-            parameters = _get_forward_parameters(forward_callable)
-        except TypeError:
+        class_forward = inspect.getattr_static(type(unwrapped), "forward", None)
+        if inspect.ismethod(forward) and getattr(forward, "__func__", None) is class_forward:
+            parameters = _get_forward_parameters(forward.__func__)
+            if parameters:
+                parameters = dict(tuple(parameters.items())[1:])
+        else:
+            # Avoid retaining partials and callable instances, which can own the
+            # module and its parameters. These uncommon forms stay uncached.
             try:
                 parameters = inspect.signature(forward).parameters
             except (TypeError, ValueError):

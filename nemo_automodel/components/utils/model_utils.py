@@ -32,18 +32,13 @@ import torch.nn as nn
 logger = logging.getLogger(__name__)
 
 
-@lru_cache(maxsize=None)
+@lru_cache(maxsize=256)
 def _get_cached_forward_signature(forward_callable: Callable[..., Any]) -> inspect.Signature | None:
     """Best-effort retrieval cached by the underlying ``forward`` callable."""
     try:
-        signature = inspect.signature(forward_callable)
+        return inspect.signature(forward_callable)
     except (ValueError, TypeError):
         return None
-
-    parameters = tuple(signature.parameters.values())
-    if parameters and parameters[0].name == "self":
-        signature = signature.replace(parameters=parameters[1:])
-    return signature
 
 
 def _get_forward_signature(model: nn.Module) -> inspect.Signature | None:
@@ -51,16 +46,21 @@ def _get_forward_signature(model: nn.Module) -> inspect.Signature | None:
     forward = getattr(model, "forward", None)
     if not callable(forward):
         return None
-    forward_callable = getattr(forward, "__func__", forward)
-    try:
-        return _get_cached_forward_signature(forward_callable)
-    except TypeError:
-        # Callable instances can opt out of hashing; inspect those without
-        # retaining the owning module in the cache.
-        try:
-            return inspect.signature(forward)
-        except (ValueError, TypeError):
+    # Cache only ordinary bound methods. Caching callable instances or partials
+    # can retain their owning module (and GPU parameters), while partialmethod
+    # may create a fresh callable on every attribute access.
+    class_forward = inspect.getattr_static(type(model), "forward", None)
+    if inspect.ismethod(forward) and getattr(forward, "__func__", None) is class_forward:
+        signature = _get_cached_forward_signature(forward.__func__)
+        if signature is None:
             return None
+        parameters = tuple(signature.parameters.values())
+        return signature.replace(parameters=parameters[1:]) if parameters else signature
+
+    try:
+        return inspect.signature(forward)
+    except (ValueError, TypeError):
+        return None
 
 
 def _supports_logits_to_keep(model: nn.Module) -> bool:
