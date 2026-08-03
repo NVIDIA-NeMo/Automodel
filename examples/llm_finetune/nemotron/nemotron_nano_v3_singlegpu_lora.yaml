@@ -5,9 +5,8 @@
 #   * distributed.activation_checkpointing: true  -> recompute block activations
 #   * peft.use_memory_efficient_lora: true        -> don't save the LoRA-A activation
 #
-# Run (single GPU). Model loading merges split MoE expert tensors on CPU; AMINT-8
-# measured eight threads as the saturation point on an EOS H100 node, so tune this
-# value for your host:
+# Run (single GPU). Model loading merges split MoE expert tensors on CPU. Eight
+# threads performed well in testing, but tune this value for your host:
 #   OMP_NUM_THREADS=8 MKL_NUM_THREADS=8 automodel \
 #     examples/llm_finetune/nemotron/nemotron_nano_v3_singlegpu_lora.yaml --nproc-per-node 1
 
@@ -85,9 +84,9 @@ optimizer:
   weight_decay: 0
 
 ci:
-  time: "00:20:00"
+  time: "00:15:00"
   nproc_per_node: 1
   env_vars:
-    # AMINT-8 measured 8 threads as the model-load saturation point.
+    # Limit checkpoint conversion parallelism to avoid excessive CPU overhead.
     OMP_NUM_THREADS: 8
     MKL_NUM_THREADS: 8
