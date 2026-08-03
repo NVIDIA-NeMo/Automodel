@@ -42,7 +42,6 @@ from contextlib import AbstractContextManager, contextmanager, nullcontext
 from datetime import timedelta
 from functools import wraps
 from pathlib import Path
-from types import MethodType
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -376,141 +375,6 @@ def _tensor_digest(tensor: torch.Tensor) -> dict[str, object]:
     }
 
 
-def _verbose_diagnostics_enabled() -> bool:
-    """Return whether expensive checkpoint diagnostics are enabled for this run."""
-    return os.environ.get("CHECKPOINT_ROBUSTNESS_VERBOSE_DIAGNOSTICS", "0") == "1"
-
-
-def _qwen3_moe_rope_ablation_enabled() -> bool:
-    """Return whether the temporary HF Qwen3-MoE RoPE A/B diagnostic is enabled."""
-    return os.environ.get("CHECKPOINT_ROBUSTNESS_QWEN3_MOE_ROPE_ABLATION", "0") == "1"
-
-
-def _diagnostic_sample_indices(numel: int, sample_size: int, device: torch.device) -> torch.Tensor:
-    """Return evenly spaced indices without float rounding for large tensors."""
-    if sample_size == 1:
-        return torch.zeros(1, dtype=torch.int64, device=device)
-    ordinal = torch.arange(sample_size, dtype=torch.int64, device=device)
-    return ordinal * (numel - 1) // (sample_size - 1)
-
-
-def _diagnostic_tensor_summary(tensor: torch.Tensor) -> dict[str, object]:
-    """Return bounded value diagnostics without copying an entire large parameter."""
-    local_tensor = tensor.detach()
-    if isinstance(local_tensor, DTensor):
-        local_tensor = local_tensor.to_local()
-    if local_tensor.is_meta:
-        return {"device": "meta", "dtype": str(local_tensor.dtype), "shape": list(local_tensor.shape)}
-
-    flat = local_tensor.reshape(-1)
-    sample_size = min(flat.numel(), 64)
-    if sample_size:
-        indices = _diagnostic_sample_indices(flat.numel(), sample_size, flat.device)
-        sample = flat[indices].float().cpu().contiguous()
-        sample_bytes = sample.view(torch.uint8).numpy()
-        sample_summary = {
-            "sample_finite": bool(torch.isfinite(sample).all()),
-            "sample_max": sample.max().item(),
-            "sample_mean": sample.mean().item(),
-            "sample_min": sample.min().item(),
-            "sample_sha256": hashlib.sha256(sample_bytes).hexdigest(),
-        }
-    else:
-        sample_summary = {"sample_finite": True, "sample_sha256": hashlib.sha256(b"").hexdigest()}
-    return {
-        "device": str(local_tensor.device),
-        "dtype": str(local_tensor.dtype),
-        "shape": list(local_tensor.shape),
-        **sample_summary,
-    }
-
-
-def _diagnostic_output_tensors(value) -> list[torch.Tensor]:
-    """Flatten tensor outputs from rotary modules for diagnostic summaries."""
-    if isinstance(value, torch.Tensor):
-        return [value]
-    if isinstance(value, (tuple, list)):
-        return [tensor for item in value for tensor in _diagnostic_output_tensors(item)]
-    if isinstance(value, dict):
-        return [tensor for item in value.values() for tensor in _diagnostic_output_tensors(item)]
-    return []
-
-
-def _diagnostic_phase() -> str:
-    """Return the isolated phase named on the current command line."""
-    try:
-        return sys.argv[sys.argv.index("--isolated_phase") + 1]
-    except (ValueError, IndexError):
-        return "monolithic"
-
-
-def _print_hf_cache_diagnostics(repo_id: str | Path, revision: str | None) -> None:
-    """Print the resolved HF snapshot and content-addressed weight manifest."""
-    if not _verbose_diagnostics_enabled():
-        return
-
-    report: dict[str, object] = {
-        "hf_home": os.environ.get("HF_HOME"),
-        "hf_hub_cache": os.environ.get("HF_HUB_CACHE"),
-        "hf_hub_offline": os.environ.get("HF_HUB_OFFLINE"),
-        "repo_id": str(repo_id),
-        "requested_revision": revision or "main",
-    }
-    try:
-        from huggingface_hub import try_to_load_from_cache
-
-        cached_files: dict[str, dict[str, object]] = {}
-        snapshot_id = None
-        for filename in ("config.json", "model.safetensors.index.json"):
-            cached = try_to_load_from_cache(str(repo_id), filename, revision=revision or "main")
-            if not isinstance(cached, str):
-                cached_files[filename] = {"cached": False}
-                continue
-            cached_path = Path(cached)
-            path_parts = cached_path.parts
-            if "snapshots" in path_parts:
-                snapshot_index = path_parts.index("snapshots")
-                snapshot_id = path_parts[snapshot_index + 1]
-            payload = cached_path.read_bytes()
-            cached_files[filename] = {
-                "cached": True,
-                "path": str(cached_path),
-                "resolved_blob": cached_path.resolve().name,
-                "sha256": hashlib.sha256(payload).hexdigest(),
-                "size": len(payload),
-            }
-
-        index_entry = cached_files.get("model.safetensors.index.json", {})
-        weight_manifest = []
-        if index_entry.get("cached"):
-            index_path = Path(str(index_entry["path"]))
-            index = json.loads(index_path.read_text())
-            for filename in sorted(set(index.get("weight_map", {}).values())):
-                cached = try_to_load_from_cache(str(repo_id), filename, revision=revision or "main")
-                if not isinstance(cached, str):
-                    weight_manifest.append({"cached": False, "filename": filename})
-                    continue
-                cached_path = Path(cached)
-                weight_manifest.append(
-                    {
-                        "cached": True,
-                        "filename": filename,
-                        "resolved_blob": cached_path.resolve().name,
-                        "size": cached_path.stat().st_size,
-                    }
-                )
-        report.update(
-            {
-                "cached_files": cached_files,
-                "resolved_snapshot": snapshot_id,
-                "weight_manifest": weight_manifest,
-            }
-        )
-    except Exception:
-        report["diagnostic_error"] = traceback.format_exc()
-    print(f"[checkpoint-diagnostic][hf-cache] {json.dumps(report, sort_keys=True)}", flush=True)
-
-
 def _trainable_parameter_digests(model_parts: list[torch.nn.Module]) -> dict[str, dict[str, object]]:
     """Hash every rank-local trainable parameter for exact PEFT save/reload comparison."""
     digests: dict[str, dict[str, object]] = {}
@@ -584,9 +448,7 @@ def _assert_peft_adapter_matches_checkpoint(
         # get_peft_model_state_dict even though it is not adapter state and was
         # therefore not written to adapter_model.safetensors. Keep unexpected
         # adapter tensors strict while excluding this base-model-only value.
-        ignored_unexpected = [
-            key for key in unexpected if ".base_layer." in key and ".lora_" not in key and "lora_magnitude" not in key
-        ]
+        ignored_unexpected = [key for key in unexpected if ".lm_head.base_layer." in key]
         required_unexpected = sorted(set(unexpected) - set(ignored_unexpected))
         assert not required_missing and not required_unexpected, (
             "Vanilla PEFT adapter key mismatch: "
@@ -1206,7 +1068,6 @@ def _prepare_source_load_reference_rank0(
         has_device_map="device_map" in hf_kwargs,
     )
 
-    _print_hf_cache_diagnostics(original_pretrained_path, hf_kwargs.get("revision"))
     print(f"\n[Phase 0] Source-load reference: vanilla HF for {original_pretrained_path}")
     with model_load_context, _keep_hf_modules_in_fp32(hf_config):
         if "device_map" in hf_kwargs:
@@ -1225,7 +1086,7 @@ def _prepare_source_load_reference_rank0(
         if should_fix_rotary_embeddings([hf_model]):
             fix_rotary_embeddings([hf_model])
 
-    hf_logits = _get_logits_with_diagnostics(hf_model, input_ids, device)
+    hf_logits = _get_logits(hf_model, input_ids, device)
     hf_aliased = _lm_head_embedding_aliased(hf_model)
     explicit_tie_word_embeddings = _explicit_tie_word_embeddings(hf_model.config)
     del hf_model
@@ -1428,226 +1289,6 @@ def _get_logits(model, input_ids, device, trainer=None) -> torch.Tensor:
         if isinstance(logits, DTensor):
             logits = logits.full_tensor()
         return logits.float().cpu()
-
-
-def _logit_pair_diagnostics(first: torch.Tensor, second: torch.Tensor) -> dict[str, object]:
-    """Return exact hashes and numerical deltas for two logit tensors."""
-    delta = (first - second).abs()
-    self_kl = _kl_divergence_from_logits(first, second)
-    return {
-        "first": _tensor_digest(first),
-        "max_abs_diff": delta.max().item(),
-        "max_kl": self_kl.max().item(),
-        "mean_abs_diff": delta.mean().item(),
-        "mean_kl": self_kl.mean().item(),
-        "second": _tensor_digest(second),
-    }
-
-
-def _run_qwen3_moe_hf_rope_ablation(
-    model,
-    input_ids: list[int],
-    device: torch.device,
-    official_first: torch.Tensor,
-    official_second: torch.Tensor,
-) -> torch.Tensor | None:
-    """Compare official, instrumented-matmul, and elementwise HF Qwen3-MoE RoPE on one model."""
-    if not _qwen3_moe_rope_ablation_enabled():
-        return None
-
-    rotary_modules = [
-        (name, module)
-        for name, module in model.named_modules()
-        if module.__class__.__name__ == "Qwen3MoeRotaryEmbedding"
-    ]
-    if not rotary_modules:
-        return None
-    assert len(rotary_modules) == 1, f"Expected one HF Qwen3-MoE rotary module, found {len(rotary_modules)}"
-    rotary_name, rotary_module = rotary_modules[0]
-    rope_type = getattr(rotary_module, "rope_type", "default")
-    assert not str(rope_type).startswith("dynamic"), (
-        f"Qwen3-MoE RoPE A/B bypasses the dynamic frequency update and cannot diagnose rope_type={rope_type!r}"
-    )
-    # Accelerate wraps ``forward`` to place inputs on the module-owned device.
-    # Patch its saved implementation so the placement hook remains active.
-    forward_attribute = "_old_forward" if hasattr(rotary_module, "_hf_hook") else "forward"
-    original_forward = getattr(rotary_module, forward_attribute)
-    rope_records: dict[str, list[dict[str, object]]] = {"stock": [], "outer": []}
-
-    def diagnostic_forward(self, x: torch.Tensor, position_ids: torch.Tensor, *, mode: str):
-        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
-        position_ids_expanded = position_ids[:, None, :].float()
-        device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
-        with torch.autocast(device_type=device_type, enabled=False):
-            if mode == "stock":
-                freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
-            else:
-                freqs = (inv_freq_expanded.float() * position_ids_expanded.float()).transpose(1, 2)
-            emb = torch.cat((freqs, freqs), dim=-1)
-            cos = emb.cos() * self.attention_scaling
-            sin = emb.sin() * self.attention_scaling
-
-        cpu_reference = (
-            self.inv_freq.detach().cpu().double()[None, :, None] * position_ids.detach().cpu().double()[:, None, :]
-        ).transpose(1, 2)
-        cpu_emb = torch.cat((cpu_reference, cpu_reference), dim=-1)
-        attention_scaling = self.attention_scaling
-        if isinstance(attention_scaling, torch.Tensor):
-            attention_scaling = attention_scaling.detach().cpu().double()
-        cpu_cos = (cpu_emb.cos() * attention_scaling).to(dtype=x.dtype)
-        cpu_sin = (cpu_emb.sin() * attention_scaling).to(dtype=x.dtype)
-        output_cos = cos.to(dtype=x.dtype)
-        output_sin = sin.to(dtype=x.dtype)
-        rope_records[mode].append(
-            {
-                "cos": _tensor_digest(output_cos),
-                "cos_max_abs_vs_cpu_fp64": (output_cos.float().cpu() - cpu_cos.float()).abs().max().item(),
-                "freqs": _tensor_digest(freqs),
-                "freqs_max_abs_vs_cpu_fp64": (freqs.double().cpu() - cpu_reference).abs().max().item(),
-                "inv_freq": _tensor_digest(self.inv_freq),
-                "position_ids": _tensor_digest(position_ids),
-                "sin": _tensor_digest(output_sin),
-                "sin_max_abs_vs_cpu_fp64": (output_sin.float().cpu() - cpu_sin.float()).abs().max().item(),
-            }
-        )
-        return output_cos, output_sin
-
-    logits: dict[str, list[torch.Tensor]] = {"stock": [], "outer": []}
-    try:
-        for mode in ("stock", "outer"):
-            setattr(
-                rotary_module,
-                forward_attribute,
-                MethodType(
-                    lambda self, x, position_ids, *, _mode=mode: diagnostic_forward(self, x, position_ids, mode=_mode),
-                    rotary_module,
-                ),
-            )
-            logits[mode].append(_get_logits(model, input_ids, device))
-            logits[mode].append(_get_logits(model, input_ids, device))
-    finally:
-        setattr(rotary_module, forward_attribute, original_forward)
-
-    official_stock_kl = _kl_divergence_from_logits(official_first, logits["stock"][0])
-    stock_outer_kl = _kl_divergence_from_logits(logits["stock"][0], logits["outer"][0])
-    report = {
-        "model_class": model.__class__.__name__,
-        "official": _logit_pair_diagnostics(official_first, official_second),
-        "official_first_max_kl_vs_stock_first": official_stock_kl.max().item(),
-        "outer": _logit_pair_diagnostics(logits["outer"][0], logits["outer"][1]),
-        "outer_first_max_kl_vs_stock_first": stock_outer_kl.max().item(),
-        "patched_forward_attribute": forward_attribute,
-        "rope_type": rope_type,
-        "rotary_module": rotary_name,
-        "rope_records": rope_records,
-        "selected_reference": "outer_first",
-        "stock": _logit_pair_diagnostics(logits["stock"][0], logits["stock"][1]),
-    }
-    print(f"[checkpoint-diagnostic][qwen3-moe-rope-ablation] {json.dumps(report, sort_keys=True)}", flush=True)
-    return logits["outer"][0]
-
-
-def _get_logits_with_diagnostics(model, input_ids, device, trainer=None) -> torch.Tensor:
-    """Run the parity forward twice and report model, logit, and RoPE identity when requested."""
-    if not _verbose_diagnostics_enabled():
-        return _get_logits(model, input_ids, device, trainer=trainer)
-
-    active_forward = "first"
-    rotary_outputs: dict[str, list[dict[str, object]]] = {"first": [], "second": []}
-    rotary_modules = []
-    handles = []
-    for name, module in model.named_modules():
-        class_name = module.__class__.__name__
-        if "rotary" not in name.lower() and "rotary" not in class_name.lower():
-            continue
-        module_summary: dict[str, object] = {"class": class_name, "name": name}
-        inv_freq = getattr(module, "inv_freq", None)
-        if isinstance(inv_freq, torch.Tensor):
-            module_summary["inv_freq"] = _diagnostic_tensor_summary(inv_freq)
-        rotary_modules.append(module_summary)
-
-        def hook(_module, _inputs, output, *, module_name=name, module_class=class_name):
-            for index, tensor in enumerate(_diagnostic_output_tensors(output)):
-                rotary_outputs[active_forward].append(
-                    {
-                        "key": f"{module_name}:{module_class}:output_{index}",
-                        **_diagnostic_tensor_summary(tensor),
-                    }
-                )
-
-        handles.append(module.register_forward_hook(hook))
-
-    try:
-        active_forward = "first"
-        first_logits = _get_logits(model, input_ids, device, trainer=trainer)
-        active_forward = "second"
-        second_logits = _get_logits(model, input_ids, device, trainer=trainer)
-    finally:
-        for handle in handles:
-            handle.remove()
-
-    selected_logits = _run_qwen3_moe_hf_rope_ablation(
-        model,
-        input_ids,
-        device,
-        first_logits,
-        second_logits,
-    )
-
-    parameter_samples = []
-    named_parameters = list(model.named_parameters())
-    selected_indices = sorted({0, 1, len(named_parameters) // 2, len(named_parameters) - 2, len(named_parameters) - 1})
-    for index in selected_indices:
-        if 0 <= index < len(named_parameters):
-            name, parameter = named_parameters[index]
-            parameter_samples.append({"name": name, **_diagnostic_tensor_summary(parameter)})
-
-    cached_rotary = []
-    for name, module in model.named_modules():
-        compute_cos_sin = getattr(module, "_compute_cos_sin", None)
-        if not callable(compute_cos_sin):
-            continue
-        try:
-            values = compute_cos_sin(len(input_ids))
-            cached_rotary.append(
-                {
-                    "name": name,
-                    "outputs": [_diagnostic_tensor_summary(tensor) for tensor in _diagnostic_output_tensors(values)],
-                }
-            )
-        except Exception:
-            cached_rotary.append({"error": traceback.format_exc(), "name": name})
-
-    delta = (first_logits - second_logits).abs()
-    self_kl = _kl_divergence_from_logits(first_logits, second_logits)
-    model_config = getattr(model, "config", None)
-    raw_device_map = getattr(model, "hf_device_map", None)
-    hf_device_map = (
-        {str(name): str(placement) for name, placement in raw_device_map.items()}
-        if isinstance(raw_device_map, dict)
-        else raw_device_map
-    )
-    report = {
-        "cached_rotary": cached_rotary,
-        "config_commit_hash": getattr(model_config, "_commit_hash", None),
-        "config_model_type": getattr(model_config, "model_type", None),
-        "first_logits": _tensor_digest(first_logits),
-        "hf_device_map": hf_device_map,
-        "input_ids": list(input_ids),
-        "max_abs_diff": delta.max().item(),
-        "max_self_kl": self_kl.max().item(),
-        "mean_abs_diff": delta.mean().item(),
-        "mean_self_kl": self_kl.mean().item(),
-        "model_class": model.__class__.__name__,
-        "parameter_samples": parameter_samples,
-        "phase": _diagnostic_phase(),
-        "rank": dist.get_rank() if dist.is_initialized() else 0,
-        "rotary_modules": rotary_modules,
-        "rotary_outputs": rotary_outputs,
-        "second_logits": _tensor_digest(second_logits),
-    }
-    print(f"[checkpoint-diagnostic][repeat-forward] {json.dumps(report, sort_keys=True)}", flush=True)
-    return first_logits if selected_logits is None else selected_logits
 
 
 def _reinit_rotary_per_module(model, default_device):
@@ -1945,7 +1586,6 @@ def _run_vanilla_hf_reload(
         if is_peft:
             from peft import PeftModel
 
-            _print_hf_cache_diagnostics(original_pretrained_path, model_kwargs.get("revision"))
             with model_load_context, _keep_hf_modules_in_fp32(hf_config):
                 if "device_map" in hf_kwargs:
                     base_model = hf_model_cls.from_pretrained(original_pretrained_path, **hf_kwargs)
@@ -1986,7 +1626,7 @@ def _run_vanilla_hf_reload(
                     "[HF reload] Saved adapter tensors absent from vanilla HF were allowed by the configured prefix "
                     f"{hf_adapter_ignored_key_prefix!r} ({ignored_adapter_tensors} tensors)"
                 )
-            hf_logits = _get_logits_with_diagnostics(peft_model, input_ids, device)
+            hf_logits = _get_logits(peft_model, input_ids, device)
 
             if check_fused_qkv_keys:
                 from safetensors import safe_open
@@ -2019,7 +1659,7 @@ def _run_vanilla_hf_reload(
 
                 if should_fix_rotary_embeddings([hf_model]):
                     fix_rotary_embeddings([hf_model])
-            hf_logits = _get_logits_with_diagnostics(hf_model, input_ids, device)
+            hf_logits = _get_logits(hf_model, input_ids, device)
             del hf_model
 
         hf_reload_error = None
@@ -2200,7 +1840,7 @@ def _run_process_isolated_checkpoint_phase(
             _barrier()
 
         device = next(source_trainer.model_parts[0].parameters()).device
-        trainer_source_logits = _get_logits_with_diagnostics(
+        trainer_source_logits = _get_logits(
             source_trainer.model_parts[0],
             input_ids,
             device,
@@ -2313,7 +1953,7 @@ def _run_process_isolated_checkpoint_phase(
 
         _report_phase("Isolated train/save: capturing reference logits")
         device = next(trainer.model_parts[0].parameters()).device
-        reference_logits = _get_logits_with_diagnostics(trainer.model_parts[0], input_ids, device, trainer=trainer)
+        reference_logits = _get_logits(trainer.model_parts[0], input_ids, device, trainer=trainer)
         _checkpoint_paths(cfg)
         artifact_dir = _robustness_artifact_dir(cfg)
         if _rank0():
@@ -2373,7 +2013,7 @@ def _run_process_isolated_checkpoint_phase(
             _barrier()
 
         device = next(restored_trainer.model_parts[0].parameters()).device
-        restored_logits = _get_logits_with_diagnostics(
+        restored_logits = _get_logits(
             restored_trainer.model_parts[0],
             input_ids,
             device,
@@ -2632,7 +2272,7 @@ def run_checkpoint_robustness(
     if check_source_load_parity:
         _report_phase("Phase 0: starting constructed-trainer parity forward")
         device = next(trainer.model_parts[0].parameters()).device
-        trainer_source_logits = _get_logits_with_diagnostics(trainer.model_parts[0], input_ids, device, trainer=trainer)
+        trainer_source_logits = _get_logits(trainer.model_parts[0], input_ids, device, trainer=trainer)
         source_load_failure = _compare_source_load_parity(
             source_load_reference,
             trainer_source_logits,
@@ -2681,7 +2321,7 @@ def run_checkpoint_robustness(
     # Phase 2: Capture reference logits before teardown
     _report_phase("Phase 2: starting reference-logits capture")
     device = next(trainer.model_parts[0].parameters()).device
-    reference_logits = _get_logits_with_diagnostics(trainer.model_parts[0], input_ids, device, trainer=trainer)
+    reference_logits = _get_logits(trainer.model_parts[0], input_ids, device, trainer=trainer)
     _report_phase("Phase 2: reference-logits capture complete")
 
     # Locate the Phase 1 checkpoint used by the reload and resume checks.
@@ -2739,9 +2379,7 @@ def run_checkpoint_robustness(
     _report_phase("Phase 3: AutoModel reload setup complete")
 
     _report_phase("Phase 3: starting restored-logits capture")
-    restored_logits = _get_logits_with_diagnostics(
-        restored_trainer.model_parts[0], input_ids, device, trainer=restored_trainer
-    )
+    restored_logits = _get_logits(restored_trainer.model_parts[0], input_ids, device, trainer=restored_trainer)
     _report_phase("Phase 3: restored-logits capture complete")
 
     kl_restored = _kl_divergence_from_logits(reference_logits, restored_logits)
@@ -2791,9 +2429,7 @@ def run_checkpoint_robustness(
         cross_tp_trainer = recipe_cls(cfg)
         cross_tp_trainer.setup()
 
-        cross_tp_logits = _get_logits_with_diagnostics(
-            cross_tp_trainer.model_parts[0], input_ids, device, trainer=cross_tp_trainer
-        )
+        cross_tp_logits = _get_logits(cross_tp_trainer.model_parts[0], input_ids, device, trainer=cross_tp_trainer)
 
         kl_cross_tp = _kl_divergence_from_logits(reference_logits, cross_tp_logits)
         max_kl_cross_tp = kl_cross_tp.max().item()

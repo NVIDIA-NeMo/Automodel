@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import json
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -27,12 +26,10 @@ from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm
     _assert_peft_adapter_matches_checkpoint,
     _compare_source_load_parity,
     _dequantize_hf_fp8_weights_in_place,
-    _diagnostic_sample_indices,
     _extract_custom_args,
     _finish_hf_reload_sync,
     _get_input_ids,
     _get_logits_pp,
-    _get_logits_with_diagnostics,
     _hf_device_map_max_memory,
     _hf_fp32_module_names,
     _hf_model_load_context,
@@ -225,104 +222,6 @@ def test_peft_adapter_fingerprints_report_tensor_mismatch(tmp_path):
         pytest.raises(AssertionError, match="adapter tensor mismatch"),
     ):
         _assert_peft_adapter_matches_checkpoint(Mock(), adapter_path)
-
-
-def test_get_logits_verbose_diagnostics_repeats_forward(monkeypatch, capsys):
-    class RepeatModel(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.calls = 0
-            self.config = SimpleNamespace(_commit_hash="test-revision", model_type="test")
-
-        def forward(self, input_ids, attention_mask, use_cache):
-            del attention_mask, use_cache
-            self.calls += 1
-            return SimpleNamespace(logits=torch.zeros((*input_ids.shape, 4), device=input_ids.device))
-
-    monkeypatch.setenv("CHECKPOINT_ROBUSTNESS_VERBOSE_DIAGNOSTICS", "1")
-    model = RepeatModel()
-
-    logits = _get_logits_with_diagnostics(model, [1, 2], torch.device("cpu"))
-
-    assert model.calls == 2
-    assert logits.shape == (1, 2, 4)
-    output = capsys.readouterr().out
-    assert "[checkpoint-diagnostic][repeat-forward]" in output
-    assert '"max_abs_diff": 0.0' in output
-    assert '"max_self_kl": 0.0' in output
-
-
-def test_diagnostic_sample_indices_are_exact_for_large_tensors():
-    numel = 100_000_003
-
-    indices = _diagnostic_sample_indices(numel, 64, torch.device("cpu"))
-
-    assert indices.dtype == torch.int64
-    assert indices[0].item() == 0
-    assert indices[-1].item() == numel - 1
-    assert torch.all(indices[1:] > indices[:-1])
-
-
-def test_qwen3_moe_rope_ablation_selects_stable_outer_reference(monkeypatch, capsys):
-    class Qwen3MoeRotaryEmbedding(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.register_buffer("inv_freq", torch.tensor([1.0, 0.5], dtype=torch.float32))
-            self.attention_scaling = 1.0
-            self.rope_type = "default"
-
-        def forward(self, x, position_ids):
-            inv_freq = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
-            positions = position_ids[:, None, :].float()
-            freqs = (inv_freq @ positions).transpose(1, 2)
-            emb = torch.cat((freqs, freqs), dim=-1)
-            return emb.cos().to(x.dtype), emb.sin().to(x.dtype)
-
-    class AblationModel(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.calls = 0
-            self.scale = torch.nn.Parameter(torch.tensor(1.0))
-            self.rotary_emb = Qwen3MoeRotaryEmbedding()
-            self.config = SimpleNamespace(_commit_hash="test-revision", model_type="qwen3_moe")
-
-        def forward(self, input_ids, attention_mask, use_cache):
-            del attention_mask, use_cache
-            self.calls += 1
-            x = torch.zeros((*input_ids.shape, 1), dtype=torch.float32, device=input_ids.device)
-            position_ids = torch.arange(input_ids.shape[1], device=input_ids.device).unsqueeze(0)
-            cos, sin = self.rotary_emb(x, position_ids)
-            logits = torch.stack((cos[..., 0], sin[..., 0], cos[..., 1], sin[..., 1]), dim=-1)
-            return SimpleNamespace(logits=logits * self.scale)
-
-    monkeypatch.setenv("CHECKPOINT_ROBUSTNESS_VERBOSE_DIAGNOSTICS", "1")
-    monkeypatch.setenv("CHECKPOINT_ROBUSTNESS_QWEN3_MOE_ROPE_ABLATION", "1")
-    model = AblationModel()
-    model.rotary_emb._old_forward = model.rotary_emb.forward
-    model.rotary_emb._hf_hook = object()
-
-    def placement_hook(x, position_ids):
-        return model.rotary_emb._old_forward(x, position_ids)
-
-    model.rotary_emb.forward = placement_hook
-
-    logits = _get_logits_with_diagnostics(model, [1, 2], torch.device("cpu"))
-
-    assert model.calls == 6
-    assert logits.shape == (1, 2, 4)
-    output = capsys.readouterr().out
-    marker = "[checkpoint-diagnostic][qwen3-moe-rope-ablation] "
-    report_line = next(line for line in output.splitlines() if marker in line)
-    report = json.loads(report_line.split(marker, 1)[1])
-    assert report["selected_reference"] == "outer_first"
-    assert report["patched_forward_attribute"] == "_old_forward"
-    assert report["rope_type"] == "default"
-    assert report["official"]["max_kl"] == 0.0
-    assert report["stock"]["max_kl"] == 0.0
-    assert report["outer"]["max_kl"] == 0.0
-    assert report["rope_records"]["stock"][0]["position_ids"] == report["rope_records"]["outer"][0]["position_ids"]
-    assert report["rope_records"]["stock"][0]["inv_freq"] == report["rope_records"]["outer"][0]["inv_freq"]
-    assert report["rope_records"]["outer"][0]["freqs_max_abs_vs_cpu_fp64"] == 0.0
 
 
 def test_remote_masking_api_compatibility_drops_removed_cache_position(monkeypatch):
