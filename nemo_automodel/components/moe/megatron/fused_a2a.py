@@ -485,6 +485,7 @@ class HybridEPCombine(torch.autograd.Function):
             handle=handle,
             pad_multiple=ctx.pad_multiple,
             num_permuted_tokens=ctx.num_permuted_tokens,
+            non_blocking=ctx.num_permuted_tokens is not None,
         )
         return dispatched_hidden, None, None, None
 

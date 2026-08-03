@@ -12,11 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
 
+from nemo_automodel.components.moe.megatron.fused_a2a import HybridEPCombine
 from nemo_automodel.components.moe.megatron.token_dispatcher import _HybridEPManager, _HybridEPMetadataProcessor
 
 
@@ -109,3 +111,93 @@ class TestIndicesToMultihot:
         assert routing_map.shape == (1, 8)
         assert routing_map.sum() == 2
         assert routing_map[0, 0] and routing_map[0, 7]
+
+
+class TestHybridEPFixedCapacity:
+    """Tests for the nonblocking fixed-capacity HybridEP manager path."""
+
+    def test_dispatch_uses_static_python_capacity_and_device_counts(self):
+        hidden = torch.randn(4, 8)
+        routing_map = torch.zeros(4, 8, dtype=torch.bool)
+        token_probs = torch.zeros(4, 8)
+        tokens_per_expert = torch.tensor([3, 2])
+        overflow_flag = torch.zeros(1, dtype=torch.int32)
+        dispatched_hidden = torch.empty(10, 8)
+        dispatched_probs = torch.empty(10)
+        dispatch = Mock(
+            return_value=(
+                dispatched_hidden,
+                dispatched_probs,
+                None,
+                tokens_per_expert,
+                (overflow_flag,),
+            )
+        )
+
+        with patch(
+            "nemo_automodel.components.moe.megatron.token_dispatcher.hybrid_ep_dispatch",
+            dispatch,
+        ):
+            manager = _HybridEPManager(
+                group=Mock(),
+                num_local_experts=2,
+                num_experts=8,
+                router_topk=2,
+                capacity_factor=1.25,
+            )
+            manager.routing_map = routing_map
+            manager.token_probs = token_probs
+            actual = manager.dispatch(hidden)
+
+        assert actual is dispatched_hidden
+        assert dispatch.call_args.kwargs["num_permuted_tokens"] == 10
+        assert manager.num_permuted_tokens == 10
+        assert isinstance(manager.num_permuted_tokens, int)
+        assert manager.tokens_per_expert is tokens_per_expert
+        assert manager.overflow_flag is overflow_flag
+
+    def test_blocking_dispatch_preserves_exact_output_size_as_python_int(self):
+        hidden = torch.randn(4, 8)
+        tokens_per_expert = torch.tensor([3, 2])
+        dispatch = Mock(
+            return_value=(
+                torch.empty(5, 8),
+                torch.empty(5),
+                None,
+                tokens_per_expert,
+                (torch.zeros(1, dtype=torch.int32),),
+            )
+        )
+
+        with patch(
+            "nemo_automodel.components.moe.megatron.token_dispatcher.hybrid_ep_dispatch",
+            dispatch,
+        ):
+            manager = _HybridEPManager(
+                group=Mock(),
+                num_local_experts=2,
+                num_experts=8,
+                router_topk=2,
+            )
+            manager.routing_map = torch.zeros(4, 8, dtype=torch.bool)
+            manager.token_probs = torch.zeros(4, 8)
+            manager.dispatch(hidden)
+
+        assert dispatch.call_args.kwargs["num_permuted_tokens"] is None
+        assert manager.num_permuted_tokens == 5
+        assert isinstance(manager.num_permuted_tokens, int)
+
+    def test_combine_backward_reuses_nonblocking_capacity(self):
+        """The combine gradient dispatch retains the host-known capacity contract."""
+        grad = torch.randn(10, 8)
+        dispatched_grad = torch.empty_like(grad)
+        buffer = Mock()
+        buffer.dispatch_with_permute.return_value = (dispatched_grad, None, None, None, None)
+        ctx = SimpleNamespace(handle=(object(),), pad_multiple=None, num_permuted_tokens=10)
+
+        with patch("nemo_automodel.components.moe.megatron.fused_a2a._hybrid_ep_buffer", buffer):
+            result = HybridEPCombine.backward(ctx, grad)
+
+        assert result == (dispatched_grad, None, None, None)
+        assert buffer.dispatch_with_permute.call_args.kwargs["num_permuted_tokens"] == 10
+        assert buffer.dispatch_with_permute.call_args.kwargs["non_blocking"] is True

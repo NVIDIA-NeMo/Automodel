@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import List, Literal, Optional, Tuple
@@ -375,6 +376,7 @@ class _HybridEPManager(_DispatchManager):
         router_topk: int,
         permute_fusion: bool = False,
         moe_hybridep_num_sms: int = 24,
+        capacity_factor: Optional[float] = None,
     ):
         self.group = group
         self.num_local_experts = num_local_experts
@@ -382,7 +384,9 @@ class _HybridEPManager(_DispatchManager):
         self.router_topk = router_topk
         self.permute_fusion = permute_fusion
         self.moe_hybridep_num_sms = moe_hybridep_num_sms
+        self.capacity_factor = capacity_factor
         self.num_permuted_tokens = None
+        self.overflow_flag: Optional[torch.Tensor] = None
 
         # Metadata
         self.token_probs: Optional[torch.Tensor] = None
@@ -438,9 +442,27 @@ class _HybridEPManager(_DispatchManager):
         async_finish: bool = True,  # noqa: ARG002 - not supported by HybridEP backend
         allocate_on_comm_stream: bool = True,  # noqa: ARG002 - not supported by HybridEP backend
     ) -> torch.Tensor:
-        # Reset num_permuted_tokens to None to avoid reusing cached state from a prior dispatch.
-        # This can happen in non-reentrant activation checkpointing mode.
-        self.num_permuted_tokens = None
+        """Dispatch tokens through HybridEP.
+
+        Args:
+            hidden_states: Per-rank token activations of shape [tokens, hidden].
+            async_finish: Ignored compatibility argument.
+            allocate_on_comm_stream: Ignored compatibility argument.
+
+        Returns:
+            Capacity-shaped expert input tensor of shape [permuted_tokens, hidden].
+            With a capacity factor, unused trailing rows are not valid and
+            ``tokens_per_expert`` identifies the valid prefix.
+        """
+        if self.capacity_factor is None:
+            self.num_permuted_tokens = None
+        else:
+            average_tokens_per_rank = hidden_states.size(0) * self.router_topk
+            self.num_permuted_tokens = math.ceil(average_tokens_per_rank * self.capacity_factor)
+            if self.pad_multiple is not None and self.pad_multiple > 1:
+                self.num_permuted_tokens = (
+                    (self.num_permuted_tokens + self.pad_multiple - 1) // self.pad_multiple * self.pad_multiple
+                )
         if self.token_probs.dtype != torch.float32:
             self.token_probs = self.token_probs.float()
         dispatched_hidden, self.dispatched_probs, _, tokens_per_expert, self.handle = hybrid_ep_dispatch(
@@ -456,7 +478,8 @@ class _HybridEPManager(_DispatchManager):
         )
 
         self.tokens_per_expert = tokens_per_expert
-        self.num_permuted_tokens = self.tokens_per_expert.sum()
+        self.num_permuted_tokens = dispatched_hidden.size(0)
+        self.overflow_flag = self.handle[-1]
 
         return dispatched_hidden
 
@@ -500,8 +523,9 @@ class TokenDispatcherConfig:
     """Fuse token rearrangement ops during token dispatching."""
 
     moe_expert_capacity_factor: Optional[float] = None
-    """moe_expert_capacity_factor (float): The capacity factor for each expert, None means no token
-    will be dropped. The default is None."""
+    """Token capacity factor. DeepEP applies it per expert. HybridEP applies it
+    to average per-rank receive load and enables nonblocking fixed-capacity
+    dispatch; overflowed tokens are dropped. None preserves exact-size dispatch."""
 
     moe_router_topk: int = 2
     """Number of experts to route to for each token."""
@@ -634,6 +658,7 @@ class MoEFlexTokenDispatcher:
                         router_topk=self.tp_size * self.config.moe_router_topk,
                         permute_fusion=self.config.moe_permute_fusion,
                         moe_hybridep_num_sms=self.config.moe_hybridep_num_sms,
+                        capacity_factor=self.config.moe_expert_capacity_factor,
                     )
                 self._comm_manager = MoEFlexTokenDispatcher.shared_hybridep_manager
             else:
@@ -644,6 +669,7 @@ class MoEFlexTokenDispatcher:
                     router_topk=self.tp_size * self.config.moe_router_topk,
                     permute_fusion=self.config.moe_permute_fusion,
                     moe_hybridep_num_sms=self.config.moe_hybridep_num_sms,
+                    capacity_factor=self.config.moe_expert_capacity_factor,
                 )
             self.hybridep_metadata_processor = _HybridEPMetadataProcessor(
                 num_experts=self.tp_size * self.config.num_moe_experts,

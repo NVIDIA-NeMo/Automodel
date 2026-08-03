@@ -186,6 +186,33 @@ class TestBackendConfigHybridEP:
         config = BackendConfig(dispatcher="hybridep", dispatcher_num_sms=24)
         assert config.dispatcher_num_sms == 24
 
+    def test_hybridep_capacity_factor_enables_sync_free_contract(self):
+        """Test that fixed-capacity HybridEP requires the device-offset expert backend."""
+        config = BackendConfig(
+            dispatcher="hybridep",
+            experts="torch_mm",
+            dispatcher_capacity_factor=1.25,
+        )
+        assert config.dispatcher_capacity_factor == 1.25
+
+    @pytest.mark.parametrize(
+        ("dispatcher", "experts", "capacity_factor"),
+        [
+            ("deepep", "torch_mm", 1.25),
+            ("hybridep", "gmm", 1.25),
+            ("hybridep", "torch_mm", 0.99),
+            ("hybridep", "torch_mm", float("inf")),
+        ],
+    )
+    def test_hybridep_capacity_factor_rejects_unsupported_contract(self, dispatcher, experts, capacity_factor):
+        """Test that sync-free mode rejects host-count backends and invalid capacities."""
+        with pytest.raises(ValueError):
+            BackendConfig(
+                dispatcher=dispatcher,
+                experts=experts,
+                dispatcher_capacity_factor=capacity_factor,
+            )
+
     def test_dispatcher_share_token_dispatcher_default(self):
         """Test that dispatcher_share_token_dispatcher defaults to enabled."""
         config = BackendConfig(dispatcher="deepep")

@@ -14,6 +14,7 @@
 
 import importlib.util
 import logging
+import math
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -214,6 +215,9 @@ class BackendConfig:
             manager instance across MoE layers.
         dispatcher_async_dispatch: Whether DeepEP/UCCL-EP dispatch should return asynchronously
             and allocate dispatched tensors on the communication stream.
+        dispatcher_capacity_factor: Fixed HybridEP receive capacity relative to the
+            average tokens received per rank. Setting this enables nonblocking,
+            synchronization-free HybridEP dispatch. Overflowed tokens are dropped.
         enable_deepep: Removed and ignored. Logs a warning if set; configure "dispatcher"
             and "experts" explicitly instead.
         fake_balanced_gate: If True, replace the learned Gate with FakeBalancedGate
@@ -251,6 +255,7 @@ class BackendConfig:
     dispatcher_num_sms: int = 20
     dispatcher_share_token_dispatcher: bool = True
     dispatcher_async_dispatch: bool = False
+    dispatcher_capacity_factor: float | None = None
     enable_deepep: bool | None = None  # Removed: ignored with a warning; set dispatcher/experts explicitly
     fake_balanced_gate: bool = False
     # Approximate max/mean load ratios (64 experts, top-8, 4096 tokens):
@@ -310,6 +315,12 @@ class BackendConfig:
                     "and enable_deepep=False to dispatcher=torch."
                 )
             self.enable_deepep = None
+
+        if self.dispatcher_capacity_factor is not None:
+            if not math.isfinite(self.dispatcher_capacity_factor) or self.dispatcher_capacity_factor < 1.0:
+                raise ValueError("dispatcher_capacity_factor must be finite and at least 1.0")
+            if self.dispatcher != "hybridep" or self.experts != "torch_mm":
+                raise ValueError("dispatcher_capacity_factor requires dispatcher='hybridep' and experts='torch_mm'")
 
         # Backward compatibility
         if self.experts in ("te", "gmm") and self.dispatcher not in ("deepep", "hybridep", "uccl_ep"):

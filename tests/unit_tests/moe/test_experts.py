@@ -803,10 +803,27 @@ class TestGroupedExpertsDeepEP:
 
         assert result.shape == value.shape
 
+    def test_grouped_experts_deepep_apply_bias_zeros_fixed_capacity_tail(self, moe_config):
+        """Bias application keeps device counts and never reads unused capacity rows."""
+        _ = GroupedExpertsDeepEP(moe_config)
+        value = torch.zeros(4, 2)
+        bias = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+        tokens_per_expert = torch.tensor([1, 1])
+
+        result = _apply_bias(value, bias=bias, tokens_per_expert=tokens_per_expert)
+
+        expected = torch.tensor([[1.0, 2.0], [3.0, 4.0], [0.0, 0.0], [0.0, 0.0]])
+        torch.testing.assert_close(result, expected)
+
     def test_grouped_experts_deepep_init_with_hybridep_backend(self, moe_config):
         """Test GroupedExpertsDeepEP initialization with hybridep backend."""
         experts = GroupedExpertsDeepEP(
             moe_config,
+            backend=BackendConfig(
+                experts="torch_mm",
+                dispatcher="hybridep",
+                dispatcher_capacity_factor=1.25,
+            ),
             dispatcher_backend="hybridep",
             dispatcher_num_sms=24,
             dispatcher_share_token_dispatcher=False,
@@ -817,12 +834,18 @@ class TestGroupedExpertsDeepEP:
         assert experts.dispatcher_num_sms == 24
         assert experts.dispatcher_share_token_dispatcher is False
         assert experts.dispatcher_async_dispatch is True
+        assert experts.dispatcher_capacity_factor == 1.25
         assert experts.config == moe_config
 
     def test_grouped_experts_deepep_token_dispatcher_init_hybridep(self, moe_config):
         """Test init_token_dispatcher passes hybridep config to TokenDispatcherConfig."""
         experts = GroupedExpertsDeepEP(
             moe_config,
+            backend=BackendConfig(
+                experts="torch_mm",
+                dispatcher="hybridep",
+                dispatcher_capacity_factor=1.25,
+            ),
             dispatcher_backend="hybridep",
             dispatcher_num_sms=24,
             dispatcher_share_token_dispatcher=False,
@@ -849,6 +872,7 @@ class TestGroupedExpertsDeepEP:
             assert config_arg.moe_deepep_num_sms == 24
             assert config_arg.moe_share_token_dispatcher is False
             assert config_arg.moe_deepep_async_dispatch is True
+            assert config_arg.moe_expert_capacity_factor == 1.25
 
 
 class TestNonGatedActivations:
@@ -2227,6 +2251,41 @@ class TestTorchMMExpertsFwd:
 
         assert output.shape == (total_tokens, dim)
         assert not torch.isnan(output).any()
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for torch._grouped_mm")
+    def test_fixed_capacity_matches_compact_valid_output(self, device):
+        """Fixed-capacity expert compute preserves all rows selected by device offsets."""
+        from nemo_automodel.components.moe.megatron.moe_utils import weighted_bias_swiglu_impl
+
+        n_experts = 2
+        dim = 32
+        inter_dim = 64
+        valid_tokens = 5
+        capacity = 8
+        hidden = torch.randn(capacity, dim, dtype=torch.bfloat16, device=device)
+        gate_up = torch.randn(n_experts, dim, inter_dim * 2, dtype=torch.bfloat16, device=device) * 0.02
+        down = torch.randn(n_experts, inter_dim, dim, dtype=torch.bfloat16, device=device) * 0.02
+        tokens_per_expert = torch.tensor([2, 3], device=device)
+        probs = torch.rand(capacity, 1, dtype=torch.float32, device=device)
+
+        fixed = _torch_mm_experts_fwd(
+            hidden,
+            gate_up,
+            down,
+            tokens_per_expert,
+            probs,
+            weighted_bias_swiglu_impl,
+        )
+        compact = _torch_mm_experts_fwd(
+            hidden[:valid_tokens],
+            gate_up,
+            down,
+            tokens_per_expert,
+            probs[:valid_tokens],
+            weighted_bias_swiglu_impl,
+        )
+
+        torch.testing.assert_close(fixed[:valid_tokens], compact)
 
 
 class TestGroupedExpertsConvergenceFixes:
