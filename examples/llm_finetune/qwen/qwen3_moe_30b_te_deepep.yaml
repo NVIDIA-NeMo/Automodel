@@ -126,10 +126,16 @@ ci:
   vllm_deploy: true
   vllm_smoke_test: true
   env_vars:
-    # Keep reload comparisons independent of accelerator state retained by training.
+    # Keep source/reload comparisons independent of accelerator state retained by prior phases.
     CHECKPOINT_ROBUSTNESS_PHASES: >-
-      train_and_save automodel_reload hf_reload
+      source_load_reference source_load_parity train_and_save automodel_reload hf_reload
   checkpoint_robustness:
+    check_source_load_parity: true
+    # This recipe uses the same optimized BF16 Qwen MoE backend as the measured
+    # HellaSwag source-parity case (max/mean KL 0.0790/0.0113, cosine 0.9957).
+    source_load_kl_threshold: 1e-1
+    source_load_mean_kl_threshold: 1.5e-2
+    source_load_cosine_threshold: 0.995
     # Same-process CI reached KL 0.2667, while controlled fresh-process reloads were stable at 0.0199.
     hf_kl_threshold: 5e-2
     process_isolation: true
