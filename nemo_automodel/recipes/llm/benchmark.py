@@ -15,6 +15,7 @@
 import json
 import logging
 import pathlib
+from contextlib import nullcontext
 
 import torch
 
@@ -120,6 +121,9 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
         self._bench_nsys_start = bench_cfg.nsys_start
         self._bench_nsys_end = bench_cfg.nsys_end
         self._bench_nsys_ranks = bench_cfg.nsys_ranks
+        self._bench_torch_profile_iteration = getattr(bench_cfg, "torch_profile_iteration", -1)
+        self._bench_torch_profile_ranks = set(getattr(bench_cfg, "torch_profile_ranks", []))
+        self._bench_torch_profile_output_path = getattr(bench_cfg, "torch_profile_output_path", None)
         self._bench_json_output_path = getattr(bench_cfg, "json_output_path", None)
         self._wandb_enabled = cfg.get("wandb", None) is not None
 
@@ -319,6 +323,13 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
 
         # Create dataloader iterator
         dataloader_iter = iter(self.dataloader)
+        completed_profile = None
+        if (
+            self._bench_torch_profile_iteration >= 0
+            and self._bench_torch_profile_ranks
+            and self._bench_torch_profile_output_path is None
+        ):
+            raise ValueError("benchmark.torch_profile_output_path is required when torch profiling is enabled")
 
         # Main benchmarking loop
         for i in range(steps):
@@ -338,9 +349,29 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
             for opt in self.optimizer:
                 opt.zero_grad()
 
-            # Time the iteration
+            # Time the iteration. torch.profiler is opt-in because it materially
+            # perturbs the profiled step and can produce large trace files.
             iter_timer = "iteration_warmup" if i < warmup_steps else "iteration"
-            with self.timers(iter_timer, log_level=1):
+            profile_this_iteration = (
+                i == self._bench_torch_profile_iteration and rank in self._bench_torch_profile_ranks
+            )
+            profile_ctx = (
+                torch.profiler.profile(
+                    activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+                    record_shapes=False,
+                    profile_memory=False,
+                    with_stack=False,
+                )
+                if profile_this_iteration
+                else nullcontext()
+            )
+            if profile_this_iteration:
+                logger.info("Rank %d | Starting torch.profiler at iteration %d", rank, i)
+
+            iteration_profile_ctx = (
+                torch.profiler.record_function(f"benchmark_iteration_{i}") if profile_this_iteration else nullcontext()
+            )
+            with profile_ctx as prof, iteration_profile_ctx, self.timers(iter_timer, log_level=1):
                 # Gradient accumulation loop
                 num_label_tokens = 0
                 loss_buffer = []
@@ -357,7 +388,12 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                     # Accumulate label tokens locally
                     num_label_tokens += (batch["labels"] != -100).sum().item()
 
-                    with self.timers(f"forward_backward_{ga_step_idx}", log_level=2):
+                    forward_backward_profile_ctx = (
+                        torch.profiler.record_function(f"forward_backward_{ga_step_idx}")
+                        if profile_this_iteration
+                        else nullcontext()
+                    )
+                    with forward_backward_profile_ctx, self.timers(f"forward_backward_{ga_step_idx}", log_level=2):
                         self._forward_backward_step(
                             ga_step_idx,
                             batch,
@@ -373,10 +409,16 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                         prepare_after_first_microbatch()
 
                 # Optimizer step
-                with self.timers("optimizer", log_level=2):
+                optimizer_profile_ctx = (
+                    torch.profiler.record_function("optimizer") if profile_this_iteration else nullcontext()
+                )
+                with optimizer_profile_ctx, self.timers("optimizer", log_level=2):
                     for opt in self.optimizer:
                         opt.step()
                     logger.debug("Optimizer step")
+
+            if profile_this_iteration:
+                completed_profile = (prof, i)
 
             # Match the training-loop lifecycle: record one complete eager
             # optimizer step, then capture outside the measured iteration.
@@ -433,6 +475,16 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
 
         # Final summary
         self._log_benchmark_summary(steps, warmup_steps, peak_tflops, rank)
+
+        # Trace serialization can be expensive. Keep it after every distributed
+        # operation so unprofiled ranks cannot time out while selected ranks write.
+        if completed_profile is not None:
+            prof, profiled_iteration = completed_profile
+            output_dir = pathlib.Path(self._bench_torch_profile_output_path)
+            output_dir.mkdir(parents=True, exist_ok=True)
+            trace_path = output_dir / f"rank{rank}_iteration{profiled_iteration}.json"
+            prof.export_chrome_trace(str(trace_path))
+            logger.info("Rank %d | torch.profiler trace: %s", rank, trace_path)
 
     def _log_iteration_metrics(self, iter_timer, ga_steps, peak_tflops, rank, iteration):
         max_iter_time = self.timers._get_global_min_max_time([iter_timer], reset=False, barrier=False, normalizer=1.0)[

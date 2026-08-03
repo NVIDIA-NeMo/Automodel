@@ -29,6 +29,9 @@ benchmark:
   nsys_start: -1
   nsys_end: -1
   nsys_ranks: []
+  torch_profile_iteration: 10
+  torch_profile_ranks: [0, 8, 16, 24, 32, 40, 48, 56]
+  torch_profile_output_path: /lustre/fsw/coreai_dlalgo_ci/automodel_ci/profiles/akoumparouli/amint183/current
   num_nodes: 8
 
 step_scheduler:
@@ -38,7 +41,7 @@ step_scheduler:
   ckpt_every_steps: 1000
   val_every_steps: 1000
   num_epochs: 1
-  max_steps: 30
+  max_steps: 11
 
 distributed:
   strategy: fsdp2
