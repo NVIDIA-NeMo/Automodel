@@ -36,6 +36,7 @@ from nemo_automodel.components.moe.experts import (
     is_gated_activation,
     swiglu_clamped_deepep,
 )
+from nemo_automodel.components.moe.megatron.ragged_activation import _zero_ragged_tail
 
 
 @pytest.fixture
@@ -2408,6 +2409,7 @@ class TestTorchMMExpertsFwd:
                 activation_fn,
             )
             assert output is not None
+            output = _zero_ragged_tail(output, tokens_per_expert)
             output[:valid_tokens].float().square().mean().backward()
 
         for workload in workloads:
@@ -2450,6 +2452,23 @@ class TestTorchMMExpertsFwd:
             }
         )
         assert not offenders, f"host synchronization found in dynamic activation trace: {offenders}"
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA and Triton required")
+    def test_zero_ragged_tail_matches_mask_forward_and_backward(self, device):
+        """The vectorized tail kernel preserves the logical prefix and masks its gradient."""
+        valid_tokens = 5
+        capacity = 16
+        base = torch.randn(capacity, 32, dtype=torch.bfloat16, device=device, requires_grad=True)
+        input = base * 1.0
+        tokens_per_expert = torch.tensor([2, 3], dtype=torch.int32, device=device)
+
+        output = _zero_ragged_tail(input, tokens_per_expert)
+
+        torch.testing.assert_close(output[:valid_tokens], base[:valid_tokens])
+        assert torch.count_nonzero(output[valid_tokens:]) == 0
+        output.float().sum().backward()
+        torch.testing.assert_close(base.grad[:valid_tokens], torch.ones_like(base.grad[:valid_tokens]))
+        assert torch.count_nonzero(base.grad[valid_tokens:]) == 0
 
 
 class TestGroupedExpertsConvergenceFixes:

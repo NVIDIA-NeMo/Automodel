@@ -38,6 +38,7 @@ from .moe_utils import (
     permute,
     unpermute,
 )
+from .ragged_activation import _zero_ragged_tail
 
 """ We use the following notation throughout this file:
      H: hidden size
@@ -358,9 +359,7 @@ class _DeepepManager(_DispatchManager):
         Restore the hidden states to their original ordering before expert processing
         """
         if self.capacity_factor is not None:
-            logical_tokens = self.tokens_per_expert.sum()
-            valid = torch.arange(hidden_states.size(0), device=hidden_states.device) < logical_tokens
-            hidden_states = hidden_states.masked_fill(~valid.unsqueeze(-1), 0)
+            hidden_states = _zero_ragged_tail(hidden_states, self.tokens_per_expert)
         hidden_states = unpermute(
             hidden_states,
             self.reversed_mapping_for_combine,

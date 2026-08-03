@@ -23,6 +23,7 @@ _HAS_TRITON = _HAS_TRITON and _HAS_TRITON_LANGUAGE
 _BLOCK_SIZE = 256
 _NUM_PROGRAMS = 256
 _MAX_INTERMEDIATE_SIZE = 16384
+_ZERO_TAIL_BLOCK_SIZE = 4096
 
 RAGGED_SWIGLU = 0
 RAGGED_GEGLU = 1
@@ -44,6 +45,22 @@ if _HAS_TRITON:
     _TRITON_RAGGED_GEGLU = tl.constexpr(RAGGED_GEGLU)
     _TRITON_RAGGED_QUICK_GEGLU = tl.constexpr(RAGGED_QUICK_GEGLU)
     _TRITON_RAGGED_RELU2 = tl.constexpr(RAGGED_RELU2)
+
+    @triton.jit
+    def _zero_ragged_tail_kernel(
+        input_ptr,
+        tokens_per_expert_ptr,
+        num_elements: tl.constexpr,
+        row_size: tl.constexpr,
+        num_experts: tl.constexpr,
+        block_size: tl.constexpr,
+    ):
+        """Zero only the storage after the GPU-resident logical row count."""
+        valid_rows = tl.zeros((), tl.int64)
+        for expert in range(num_experts):
+            valid_rows += tl.load(tokens_per_expert_ptr + expert).to(tl.int64)
+        offsets = valid_rows * row_size + tl.program_id(0) * block_size + tl.arange(0, block_size)
+        tl.store(input_ptr + offsets, 0.0, mask=offsets < num_elements)
 
     @triton.jit
     def _ragged_weighted_activation_forward_kernel(
@@ -301,6 +318,43 @@ class _RaggedWeightedActivation(torch.autograd.Function):
         return grad_input, grad_weights, None, None, None, None, None
 
 
+class _ZeroRaggedTail(torch.autograd.Function):
+    """In-place capacity-tail clearing without scalarizing the logical row count."""
+
+    @staticmethod
+    def _launch(input: torch.Tensor, tokens_per_expert: torch.Tensor) -> None:
+        grid = (triton.cdiv(input.numel(), _ZERO_TAIL_BLOCK_SIZE),)
+        _zero_ragged_tail_kernel[grid](
+            input,
+            tokens_per_expert,
+            num_elements=input.numel(),
+            row_size=input.size(1),
+            num_experts=tokens_per_expert.numel(),
+            block_size=_ZERO_TAIL_BLOCK_SIZE,
+            num_warps=8,
+        )
+
+    @staticmethod
+    def forward(
+        ctx,
+        input: torch.Tensor,
+        tokens_per_expert: torch.Tensor,
+    ) -> torch.Tensor:
+        """Clear unused rows while preserving maximum-capacity tensor shapes."""
+        ctx.mark_dirty(input)
+        ctx.save_for_backward(tokens_per_expert)
+        _ZeroRaggedTail._launch(input, tokens_per_expert)
+        return input
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, None]:
+        """Prevent unused physical rows from contributing gradients."""
+        (tokens_per_expert,) = ctx.saved_tensors
+        grad_output = grad_output.contiguous()
+        _ZeroRaggedTail._launch(grad_output, tokens_per_expert)
+        return grad_output, None
+
+
 def _can_use_ragged_weighted_activation(
     input: torch.Tensor,
     weights: torch.Tensor,
@@ -377,3 +431,27 @@ def _ragged_weighted_activation(
         limit,
         linear_offset,
     )
+
+
+def _zero_ragged_tail(input: torch.Tensor, tokens_per_expert: torch.Tensor) -> torch.Tensor:
+    """Zero the unused capacity tail using a device-resident logical row count.
+
+    The Triton path writes zeros without first loading the tail and repeats the
+    operation on the incoming gradient. The fallback retains the tensor-only
+    implementation for unsupported devices and layouts.
+    """
+    if (
+        _HAS_TRITON
+        and input.is_cuda
+        and input.ndim == 2
+        and input.is_contiguous()
+        and tokens_per_expert.is_cuda
+        and tokens_per_expert.ndim == 1
+        and tokens_per_expert.numel() > 0
+        and tokens_per_expert.is_contiguous()
+    ):
+        return _ZeroRaggedTail.apply(input, tokens_per_expert)
+
+    logical_rows = tokens_per_expert.sum()
+    valid = torch.arange(input.size(0), device=input.device) < logical_rows
+    return input.masked_fill(~valid.unsqueeze(-1), 0)
