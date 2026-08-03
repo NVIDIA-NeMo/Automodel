@@ -36,6 +36,10 @@ from nemo_automodel.components.moe.megatron.moe_utils import (
     weighted_bias_geglu_impl,
     weighted_bias_swiglu_impl,
 )
+from nemo_automodel.components.moe.megatron.ragged_activation import (
+    _can_use_ragged_weighted_swiglu,
+    _ragged_weighted_swiglu,
+)
 from nemo_automodel.components.moe.megatron.token_dispatcher import MoEFlexTokenDispatcher, TokenDispatcherConfig
 from nemo_automodel.components.moe.mxfp8 import select_grouped_mm
 
@@ -808,6 +812,32 @@ class GroupedExpertsDeepEP(nn.Module):
         dtype_size = max(torch.empty((), dtype=self.config.dtype).element_size(), 2)
         get_buffer(ep_group, self.config.expert_dim * dtype_size)
 
+    def _apply_expert_activation(
+        self,
+        value: torch.Tensor,
+        probabilities: torch.Tensor,
+        expert_offsets: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply the configured activation over valid dispatched rows.
+
+        Args:
+            value: Tensor of shape [capacity, projection].
+            probabilities: Tensor of shape [capacity, 1].
+            expert_offsets: Device tensor of shape [experts] whose final element
+                is the logical row count.
+
+        Returns:
+            Tensor of shape [capacity, intermediate]. Rows after the final device
+            offset are unspecified and ignored by grouped GEMM.
+        """
+        if (
+            self.dispatcher_capacity_factor == "dynamic"
+            and self.expert_activation is weighted_bias_swiglu_impl
+            and _can_use_ragged_weighted_swiglu(value, probabilities, expert_offsets)
+        ):
+            return _ragged_weighted_swiglu(value, probabilities, expert_offsets)
+        return self.expert_activation(value, probabilities)
+
     def forward(
         self,
         x: torch.Tensor,
@@ -880,7 +910,7 @@ class GroupedExpertsDeepEP(nn.Module):
                     gate_up_proj_bias,
                     tokens_per_expert_gpu,
                 )
-                output1 = self.expert_activation(output1, activation_probs)
+                output1 = self._apply_expert_activation(output1, activation_probs, offs)
                 output2 = grouped_mm(output1, down_projs, offs)
                 down_bias = self.down_proj_bias.to_local()
                 output2 = _apply_bias(
@@ -898,6 +928,7 @@ class GroupedExpertsDeepEP(nn.Module):
                     activation_probs,
                     self.expert_activation,
                     use_mxfp8=self.use_mxfp8,
+                    use_ragged_activation=self.dispatcher_capacity_factor == "dynamic",
                 )
         else:
             activation_probs = (
@@ -952,6 +983,7 @@ def _torch_mm_experts_fwd(
     permuted_probs: torch.Tensor,
     activation_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
     use_mxfp8: bool = False,
+    use_ragged_activation: bool = False,
 ) -> torch.Tensor:
     """Run fixed-capacity grouped expert projections without host metadata.
 
@@ -964,6 +996,9 @@ def _torch_mm_experts_fwd(
         permuted_probs: Routing probabilities of shape [capacity, 1].
         activation_fn: Token-wise expert activation.
         use_mxfp8: Whether to use the torchao MXFP8 grouped GEMM implementation.
+        use_ragged_activation: Whether the physical input capacity exceeds its
+            device-resident logical row count and eligible activations should skip
+            unused rows.
 
     Returns:
         Expert output tensor of shape [capacity, hidden]. Rows after the final
@@ -976,7 +1011,14 @@ def _torch_mm_experts_fwd(
     offs = tokens_per_expert.cumsum(dim=0).to(torch.int32)
     grouped_mm = select_grouped_mm(use_mxfp8)
     output1 = grouped_mm(hidden_states, gate_and_up_projs, offs)
-    output1 = activation_fn(output1, permuted_probs)
+    if (
+        use_ragged_activation
+        and activation_fn is weighted_bias_swiglu_impl
+        and _can_use_ragged_weighted_swiglu(output1, permuted_probs, offs)
+    ):
+        output1 = _ragged_weighted_swiglu(output1, permuted_probs, offs)
+    else:
+        output1 = activation_fn(output1, permuted_probs)
     output2 = grouped_mm(output1, down_projs, offs)
     return output2
 

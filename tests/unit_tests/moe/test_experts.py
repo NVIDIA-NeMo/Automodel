@@ -2287,6 +2287,64 @@ class TestTorchMMExpertsFwd:
 
         torch.testing.assert_close(fixed[:valid_tokens], compact)
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for torch._grouped_mm and Triton")
+    def test_ragged_activation_matches_compact_forward_and_backward(self, device):
+        """Device-offset SwiGLU preserves valid outputs and gradients while skipping the capacity tail."""
+        from nemo_automodel.components.moe.megatron.moe_utils import weighted_bias_swiglu_impl
+
+        n_experts = 2
+        dim = 32
+        inter_dim = 64
+        valid_tokens = 5
+        capacity = 16
+        hidden = torch.randn(capacity, dim, dtype=torch.bfloat16, device=device).requires_grad_()
+        gate_up = (
+            torch.randn(n_experts, dim, inter_dim * 2, dtype=torch.bfloat16, device=device) * 0.02
+        ).requires_grad_()
+        down = (torch.randn(n_experts, inter_dim, dim, dtype=torch.bfloat16, device=device) * 0.02).requires_grad_()
+        probs = torch.rand(capacity, 1, dtype=torch.float32, device=device).requires_grad_()
+        tokens_per_expert = torch.tensor([2, 3], device=device)
+        grad = torch.randn(valid_tokens, dim, dtype=torch.bfloat16, device=device)
+
+        ragged = _torch_mm_experts_fwd(
+            hidden,
+            gate_up,
+            down,
+            tokens_per_expert,
+            probs,
+            weighted_bias_swiglu_impl,
+            use_ragged_activation=True,
+        )
+        ragged[:valid_tokens].backward(grad)
+        ragged_grads = (
+            hidden.grad[:valid_tokens].clone(),
+            gate_up.grad.clone(),
+            down.grad.clone(),
+            probs.grad[:valid_tokens].clone(),
+        )
+        assert torch.count_nonzero(probs.grad[valid_tokens:]) == 0
+
+        compact_hidden = hidden.detach()[:valid_tokens].clone().requires_grad_()
+        compact_gate_up = gate_up.detach().clone().requires_grad_()
+        compact_down = down.detach().clone().requires_grad_()
+        compact_probs = probs.detach()[:valid_tokens].clone().requires_grad_()
+        compact = _torch_mm_experts_fwd(
+            compact_hidden,
+            compact_gate_up,
+            compact_down,
+            tokens_per_expert,
+            compact_probs,
+            weighted_bias_swiglu_impl,
+        )
+        compact.backward(grad)
+
+        torch.testing.assert_close(ragged[:valid_tokens], compact, rtol=2e-2, atol=2e-2)
+        for actual, expected in zip(
+            ragged_grads,
+            (compact_hidden.grad, compact_gate_up.grad, compact_down.grad, compact_probs.grad),
+        ):
+            torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
 
 class TestGroupedExpertsConvergenceFixes:
     """Test fixes for GroupedExperts convergence with expert parallelism.

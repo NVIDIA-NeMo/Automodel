@@ -545,7 +545,7 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
                     tokens_per_expert_gpu,
                 )
 
-            output1 = self.expert_activation(output1, permuted_probs)
+            output1 = self._apply_expert_activation(output1, permuted_probs, offs)
 
             # Down projection + LoRA
             output2 = torch._grouped_mm(output1, down_projs, offs=offs)
