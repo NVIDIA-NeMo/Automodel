@@ -47,6 +47,7 @@ from nemo_automodel.components.checkpoint.checkpointing import (
     SaveConsolidatedMode,
     _divide_keys_by_size,
     _ensure_dirs,
+    _ensure_shared_dirs,
     _equally_divide_layers,
     _is_custom_model,
     _load_hf_bin_checkpoint,
@@ -2982,15 +2983,13 @@ class TestEnsureDirs:
         group = object()
         with (
             patch("torch.distributed.is_initialized", return_value=True),
-            patch("torch.distributed.get_rank", return_value=0) as get_rank,
             patch("torch.distributed.barrier") as barrier,
         ):
             _ensure_dirs(str(tmp_path), process_group=group)
-        get_rank.assert_called_once_with(group=group)
         barrier.assert_called_once_with(group=group)
 
-    def test_only_group_rank_zero_creates_distributed_directories(self, tmp_path):
-        """Nonzero group ranks wait for rank zero without issuing shared-filesystem metadata operations."""
+    def test_each_rank_creates_node_local_directories(self, tmp_path):
+        """Every rank creates directories that may live on node-local filesystems."""
         group = object()
         target = str(tmp_path / "new")
         with (
@@ -3000,16 +2999,52 @@ class TestEnsureDirs:
             patch("torch.distributed.barrier") as barrier,
         ):
             _ensure_dirs(target, process_group=group)
+        makedirs.assert_called_once_with(target, exist_ok=True)
+        barrier.assert_called_once_with(group=group)
+
+    def test_only_group_rank_zero_creates_shared_directories(self, tmp_path):
+        """Nonzero group ranks avoid redundant metadata operations on shared filesystems."""
+        group = object()
+        target = str(tmp_path / "new")
+        with (
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch("torch.distributed.get_rank", return_value=1),
+            patch("os.makedirs") as makedirs,
+            patch("torch.distributed.barrier") as barrier,
+        ):
+            _ensure_shared_dirs(target, process_group=group)
         makedirs.assert_not_called()
         barrier.assert_called_once_with(group=group)
+
+
+def test_save_on_dp_ranks_creates_node_local_directory_on_each_writer_rank():
+    """A nonzero distributed rank must create its local directory before writing auxiliary state."""
+    checkpointer = Checkpointer.__new__(Checkpointer)
+    checkpointer.process_group = object()
+    checkpointer.tp_rank = 0
+    checkpointer.pp_rank = 0
+    checkpointer.dp_rank = 1
+    state = SimpleNamespace(state_dict=lambda: {"state": torch.ones(1)})
+
+    with (
+        patch("torch.distributed.is_initialized", return_value=True),
+        patch("os.makedirs") as makedirs,
+        patch("torch.distributed.barrier") as barrier,
+        patch("torch.save") as save,
+    ):
+        checkpointer.save_on_dp_ranks(state, "rng", "/tmp/checkpoint")
+
+    makedirs.assert_called_once_with("/tmp/checkpoint/rng", exist_ok=True)
+    barrier.assert_called_once_with(group=checkpointer.process_group)
+    save.assert_called_once_with({"state": torch.ones(1)}, "/tmp/checkpoint/rng/rng_dp_rank_1.pt")
 
 
 def test_model_and_optimizer_saves_use_separate_plan_caches():
     """Alternating model and optimizer saves must not evict each other's cached DCP plans."""
     ckptr = _make_ckptr(is_peft=False, is_async=False)
     with patch("nemo_automodel.components.checkpoint.checkpointing.dcp.save") as save:
-        Checkpointer._do_save(ckptr, {"weight": torch.ones(1)}, "/tmp/checkpoint/model")
-        Checkpointer._do_save(ckptr, {"state": torch.ones(1)}, "/tmp/checkpoint/optim")
+        Checkpointer._do_save(ckptr, {"weight": torch.ones(1)}, "/opt/models/qwen/step_100/model")
+        Checkpointer._do_save(ckptr, {"state": torch.ones(1)}, "/opt/models/qwen/step_100/optim")
 
     model_planner = save.call_args_list[0].kwargs["planner"]
     optimizer_planner = save.call_args_list[1].kwargs["planner"]
