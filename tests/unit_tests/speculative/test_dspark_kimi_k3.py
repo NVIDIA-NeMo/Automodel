@@ -75,8 +75,8 @@ def _draft_config(wrapped: bool = False):
     )
 
 
-def _model():
-    model = KimiK3DSparkModel(_draft_config()).eval()
+def _model(config=None):
+    model = KimiK3DSparkModel(config if config is not None else _draft_config()).eval()
     model.initialize_embeddings_and_head(
         embed_tokens=torch.nn.Embedding(VOCAB, HIDDEN),
         lm_head=torch.nn.Linear(HIDDEN, VOCAB, bias=False),
@@ -123,6 +123,34 @@ def test_forward_loss_and_gradients():
     assert model.embed_tokens.weight.grad is None
     assert model.lm_head.weight.grad is None
     assert torch.isfinite(model.layers[0].self_attn.q_a_proj.weight.grad).all()
+
+
+def test_attention_rejects_rope_only_mla():
+    config = _draft_config()
+    config.mla_use_nope = False
+    with pytest.raises(ValueError, match="mla_use_nope"):
+        KimiK3DSparkModel(config)
+
+
+def test_forward_without_q_lora_rank():
+    config = _draft_config()
+    config.q_lora_rank = None
+    model = _model(config)
+    attention = model.layers[0].self_attn
+    assert not hasattr(attention, "q_a_proj")
+    assert attention.q_proj.out_features == config.num_attention_heads * (
+        config.qk_nope_head_dim + config.qk_rope_head_dim
+    )
+
+    generator = torch.Generator().manual_seed(13)
+    output = model(
+        input_ids=torch.randint(0, VOCAB, (2, 12), generator=generator),
+        loss_mask=torch.ones(2, 12, dtype=torch.uint8),
+        target_hidden_states=torch.randn(2, 12, len(TARGET_LAYERS) * HIDDEN, generator=generator),
+        target_last_hidden_states=torch.randn(2, 12, HIDDEN, generator=generator),
+    )
+    assert output.draft_logits.shape == (2, 4, 3, VOCAB)
+    assert torch.isfinite(output.draft_logits).all()
 
 
 @pytest.mark.parametrize("architecture", ["KimiK3ForCausalLM", "KimiK3ForConditionalGeneration"])
