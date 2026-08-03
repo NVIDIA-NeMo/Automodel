@@ -42,6 +42,47 @@ We fine-tune on the [llamafactory/glaive_toolcall_en](https://huggingface.co/dat
 | **Step 5** | Evaluate the fine-tuned model |
 | **Step 6** | Compare results |
 
+## Generate coding-agent traces on NeMo repositories
+
+The [`julien-c/synthtraces`](https://github.com/julien-c/synthtraces) generator pairs a Pi coding agent with a local user model. The coding agent inspects a checked-out repository with `read` and `bash`, while the user model asks follow-up questions. Pi writes each completed session as a trace under `dataset/sessions`.
+
+To generate NeMo-specific traces, fork that generator and configure its repository matrix for these repositories:
+
+```text
+https://github.com/NVIDIA-NeMo/Automodel.git
+https://github.com/NVIDIA/NeMo.git
+```
+
+The upstream generator currently defines repository names in `src/constants.ts` and constructs clone URLs in `src/pull.ts`. Update both locations in the fork so each matrix entry stores a complete owner and repository pair. Keep the generated Pi session files unchanged. Hugging Face converts those trace files into the OpenAI-format `messages` rows consumed by `make_agent_chat_dataset`.
+
+After configuring the matrix, install and prepare the generator:
+
+```bash
+npm install
+```
+
+```bash
+npm run pull
+```
+
+Start the OpenAI-compatible llama.cpp server used by the user model, then generate a small validation batch before scaling up:
+
+```bash
+BATCH_SIZE=8 CONCURRENCY=2 node src/generate.ts
+```
+
+Upload the generated dataset with the current Hugging Face CLI:
+
+```bash
+hf upload <owner>/<dataset> dataset . --repo-type dataset --exclude '.git/*'
+```
+
+Point the SynthTraces recipe at that dataset by overriding `dataset.dataset_name` and `validation_dataset.dataset_name`. The dataset must expose parsed OpenAI-format rows through its normal dataset revision or through `refs/convert/parquet`.
+
+<Note>
+Trace generation is intentionally maintained by the SynthTraces project. NeMo AutoModel consumes the generated traces and does not vendor the Pi runtime, llama.cpp server, or remote inference provider.
+</Note>
+
 ## Hardware Requirements
 
 - **Full-parameter SFT**: the example below shards across 8 GPUs with FSDP2. Qwen2.5-3B is small enough to also train on a single 80 GB GPU, which runs unsharded (FSDP2 only applies across multiple GPUs).
