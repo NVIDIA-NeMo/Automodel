@@ -149,6 +149,8 @@ class FusedDispatch(torch.autograd.Function):
         group,
         async_finish=False,
         allocate_on_comm_stream=False,
+        num_worst_tokens=0,
+        expert_alignment=1,
     ):
         """Forward pass of fused dispatch."""
         previous_event = None
@@ -170,6 +172,22 @@ class FusedDispatch(torch.autograd.Function):
             allocate_on_comm_stream=allocate_on_comm_stream,
         )
 
+        dispatch_kwargs = {
+            "topk_idx": token_indices,
+            "topk_weights": token_probs,
+            "num_tokens_per_rank": num_tokens_per_rank,
+            "num_tokens_per_rdma_rank": num_tokens_per_rdma_rank,
+            "is_token_in_rank": is_token_in_rank,
+            "num_tokens_per_expert": num_tokens_per_expert,
+            "expert_alignment": expert_alignment,
+            "num_worst_tokens": num_worst_tokens,
+            "previous_event": event,
+            "async_finish": async_finish,
+            "allocate_on_comm_stream": allocate_on_comm_stream,
+        }
+        if num_worst_tokens > 0:
+            dispatch_kwargs["return_recv_tokens_per_expert_tensor"] = True
+
         # Do MoE dispatch
         # NOTES: the CPU will wait for GPU's signal to arrive,
         # so this is not compatible with CUDA graph
@@ -182,15 +200,7 @@ class FusedDispatch(torch.autograd.Function):
             after_event_overlap,
         ) = buffer.dispatch(
             x,
-            topk_idx=token_indices,
-            topk_weights=token_probs,  # DeepEP only supports float32 probs
-            num_tokens_per_rank=num_tokens_per_rank,
-            num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
-            is_token_in_rank=is_token_in_rank,
-            num_tokens_per_expert=num_tokens_per_expert,
-            previous_event=event,  # wait in deepep::intra/inter_dispatch
-            async_finish=async_finish,
-            allocate_on_comm_stream=allocate_on_comm_stream,
+            **dispatch_kwargs,
         )
 
         # Make sure current stream is synchronized
@@ -202,7 +212,11 @@ class FusedDispatch(torch.autograd.Function):
         ctx.handle = handle
         ctx.async_finish = async_finish
         ctx.allocate_on_comm_stream = allocate_on_comm_stream
-        tokens_per_expert = torch.tensor(num_recv_tokens_per_expert_list)
+        tokens_per_expert = (
+            num_recv_tokens_per_expert_list
+            if isinstance(num_recv_tokens_per_expert_list, torch.Tensor)
+            else torch.tensor(num_recv_tokens_per_expert_list)
+        )
 
         return (recv_x, recv_token_indices, recv_token_probs, tokens_per_expert, handle)
 
@@ -232,7 +246,7 @@ class FusedDispatch(torch.autograd.Function):
         # Make sure current stream is synchronized
         if ctx.async_finish:
             after_event.current_stream_wait()
-        return grad_x, None, grad_token_probs, None, None, None, None
+        return grad_x, None, grad_token_probs, None, None, None, None, None, None
 
 
 class FusedCombine(torch.autograd.Function):
@@ -292,6 +306,8 @@ if HAVE_DEEP_EP:
         group,
         async_finish=False,
         allocate_on_comm_stream=False,
+        num_worst_tokens=0,
+        expert_alignment=1,
     ):
         """Perform fused dispatch operation if deep_ep is available.
 
@@ -314,6 +330,8 @@ if HAVE_DEEP_EP:
             group,
             async_finish,
             allocate_on_comm_stream,
+            num_worst_tokens,
+            expert_alignment,
         )
 
     def fused_combine(x, group, handle, async_finish=False, allocate_on_comm_stream=False):

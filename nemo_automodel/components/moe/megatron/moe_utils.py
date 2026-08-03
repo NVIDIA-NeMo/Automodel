@@ -99,13 +99,25 @@ def permute(
     else:
         # mask [num_tokens, num_experts] -> [num_experts, num_tokens]
         routing_map = routing_map.bool().T.contiguous()
+        if num_out_tokens is None:
+            # Create a dense expert-to-token mapping from the sparse token-to-expert mapping.
+            token_indices = torch.arange(num_tokens, device=routing_map.device).unsqueeze(0).expand(num_experts, -1)
+            sorted_indices = token_indices.masked_select(routing_map)
 
-        # Create a dense expert-to-token mapping from the sparse token-to-expert mapping
-        token_indices = torch.arange(num_tokens, device=routing_map.device).unsqueeze(0).expand(num_experts, -1)
-        sorted_indices = token_indices.masked_select(routing_map)
-
-        if probs is not None:
-            permuted_probs = probs.T.contiguous().masked_select(routing_map)
+            if probs is not None:
+                permuted_probs = probs.T.contiguous().masked_select(routing_map)
+        else:
+            # Stable expert-major ordering with a caller-provided physical output size.
+            # Valid routes sort before unused capacity rows, so expert offsets remain
+            # compact while allocation does not depend on a GPU scalar.
+            flat_routing_map = routing_map.view(-1)
+            flat_order = flat_routing_map.to(torch.int8).argsort(descending=True, stable=True)
+            flat_order = flat_order[:num_out_tokens]
+            sorted_indices = flat_order.remainder(num_tokens)
+            valid = flat_routing_map.index_select(0, flat_order)
+            if probs is not None:
+                permuted_probs = probs.T.contiguous().view(-1).index_select(0, flat_order)
+                permuted_probs = permuted_probs.masked_fill(~valid, 0)
 
     # use the mapping to permute the tokens
     permuted_input = tokens.index_select(0, sorted_indices)

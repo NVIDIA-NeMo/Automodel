@@ -19,7 +19,12 @@ import pytest
 import torch
 
 from nemo_automodel.components.moe.megatron.fused_a2a import HybridEPCombine
-from nemo_automodel.components.moe.megatron.token_dispatcher import _HybridEPManager, _HybridEPMetadataProcessor
+from nemo_automodel.components.moe.megatron.moe_utils import permute, unpermute
+from nemo_automodel.components.moe.megatron.token_dispatcher import (
+    _DeepepManager,
+    _HybridEPManager,
+    _HybridEPMetadataProcessor,
+)
 
 
 @pytest.fixture
@@ -239,3 +244,122 @@ class TestHybridEPFixedCapacity:
         assert result == (dispatched_grad, None, None, None)
         assert buffer.dispatch_with_permute.call_args.kwargs["num_permuted_tokens"] == 10
         assert buffer.dispatch_with_permute.call_args.kwargs["non_blocking"] is True
+
+
+class TestDeepEPDynamicCapacity:
+    """Tests for capacity-shaped DeepEP dispatch with GPU-resident counts."""
+
+    @pytest.mark.parametrize(("pad_multiple", "expert_capacity"), [(None, 32), (4, 32)])
+    def test_dispatch_uses_receive_bound_and_device_counts(self, pad_multiple, expert_capacity):
+        hidden = torch.randn(4, 8)
+        recv_capacity = 16
+        recv_hidden = torch.empty(recv_capacity, 8)
+        recv_indices = torch.full((recv_capacity, 2), -1, dtype=torch.int64)
+        recv_probs = torch.zeros(recv_capacity, 2)
+        tokens_per_expert = torch.tensor([3, 2])
+        dispatch = Mock(return_value=(recv_hidden, recv_indices, recv_probs, tokens_per_expert, (object(),)))
+
+        manager = _DeepepManager(
+            group=Mock(),
+            router_topk=2,
+            permute_fusion=False,
+            capacity_factor="dynamic",
+            num_experts=8,
+            num_local_experts=2,
+            moe_router_expert_pad_multiple=pad_multiple,
+            _dispatch_fn=dispatch,
+            _combine_fn=Mock(),
+        )
+        manager.token_indices = torch.zeros(4, 2, dtype=torch.int64)
+        manager.token_probs = torch.ones(4, 2)
+
+        actual = manager.dispatch(hidden)
+
+        assert actual is recv_hidden
+        assert dispatch.call_args.kwargs["num_worst_tokens"] == recv_capacity
+        assert dispatch.call_args.kwargs["expert_alignment"] == (pad_multiple or 1)
+        assert manager.num_permuted_tokens == expert_capacity
+        assert manager.tokens_per_expert is tokens_per_expert
+
+    def test_static_multihot_conversion_handles_invalid_slots(self):
+        manager = _DeepepManager(
+            group=Mock(),
+            router_topk=2,
+            num_experts=8,
+            num_local_experts=2,
+            _dispatch_fn=Mock(),
+            _combine_fn=Mock(),
+        )
+        indices = torch.tensor([[0, -1], [1, 0], [-1, -1]])
+        probs = torch.tensor([[0.7, 0.0], [0.6, 0.4], [0.0, 0.0]])
+
+        routing_map, multihot_probs = manager._indices_to_multihot(indices, probs)
+
+        torch.testing.assert_close(
+            routing_map,
+            torch.tensor([[True, False], [True, True], [False, False]]),
+        )
+        torch.testing.assert_close(multihot_probs, torch.tensor([[0.7, 0.0], [0.4, 0.6], [0.0, 0.0]]))
+
+    @pytest.mark.parametrize(
+        ("pad_multiple", "recv_capacity", "expert_capacity"),
+        [(None, 10, 10), (4, 16, 16)],
+    )
+    def test_numeric_capacity_uses_aligned_expert_bound(self, pad_multiple, recv_capacity, expert_capacity):
+        hidden = torch.randn(4, 8)
+        dispatch = Mock(
+            return_value=(
+                torch.empty(recv_capacity, 8),
+                torch.full((recv_capacity, 2), -1, dtype=torch.int64),
+                torch.zeros(recv_capacity, 2),
+                torch.tensor([3, 2]),
+                (object(),),
+            )
+        )
+        manager = _DeepepManager(
+            group=Mock(),
+            router_topk=2,
+            permute_fusion=False,
+            capacity_factor=1.25,
+            num_experts=8,
+            num_local_experts=2,
+            moe_router_expert_pad_multiple=pad_multiple,
+            _dispatch_fn=dispatch,
+            _combine_fn=Mock(),
+        )
+        manager.token_indices = torch.zeros(4, 2, dtype=torch.int64)
+        manager.token_probs = torch.ones(4, 2)
+
+        manager.dispatch(hidden)
+
+        assert dispatch.call_args.kwargs["num_worst_tokens"] == recv_capacity
+        assert dispatch.call_args.kwargs["expert_alignment"] == (pad_multiple or 1)
+        assert manager.num_permuted_tokens == expert_capacity
+
+
+def test_unfused_permute_honors_capacity_without_dynamic_selection():
+    tokens = torch.tensor([[1.0], [2.0], [3.0], [4.0]])
+    routing_map = torch.tensor(
+        [[True, False], [False, True], [True, False], [False, False]],
+    )
+    probs = routing_map.float()
+
+    permuted, permuted_probs, reverse = permute(
+        tokens,
+        routing_map,
+        probs=probs,
+        num_out_tokens=5,
+        fused=False,
+    )
+
+    assert permuted.shape == (5, 1)
+    torch.testing.assert_close(permuted[:3], torch.tensor([[1.0], [3.0], [2.0]]))
+    torch.testing.assert_close(permuted_probs, torch.tensor([1.0, 1.0, 1.0, 0.0, 0.0]))
+
+    restored = unpermute(
+        permuted.masked_fill((torch.arange(5) >= 3).unsqueeze(-1), 0),
+        reverse,
+        restore_shape=tokens.shape,
+        fused=False,
+    )
+    torch.testing.assert_close(restored, torch.tensor([[1.0], [2.0], [3.0], [0.0]]))

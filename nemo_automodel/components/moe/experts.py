@@ -983,7 +983,7 @@ class GroupedExpertsDeepEP(nn.Module):
                     activation_probs,
                     self.expert_activation,
                     use_mxfp8=self.use_mxfp8,
-                    use_ragged_activation=self.dispatcher_capacity_factor == "dynamic",
+                    use_ragged_activation=self.dispatcher_capacity_factor is not None,
                 )
         else:
             activation_probs = (

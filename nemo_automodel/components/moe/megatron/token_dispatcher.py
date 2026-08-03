@@ -120,7 +120,7 @@ class _DeepepManager(_DispatchManager):
         group: torch.distributed.ProcessGroup,
         router_topk: int,
         permute_fusion: bool = False,
-        capacity_factor: Optional[float] = None,
+        capacity_factor: float | Literal["dynamic"] | None = None,
         num_experts: Optional[int] = None,
         num_local_experts: Optional[int] = None,
         router_dtype: Optional[str] = None,
@@ -136,6 +136,8 @@ class _DeepepManager(_DispatchManager):
         self.num_local_experts = num_local_experts
         self.router_dtype = router_dtype
         self.moe_router_expert_pad_multiple = moe_router_expert_pad_multiple
+        self.num_recv_tokens: Optional[int] = None
+        self.num_permuted_tokens: Optional[int] = None
 
         # Metadata
         self.token_indices: Optional[torch.Tensor] = None
@@ -181,6 +183,45 @@ class _DeepepManager(_DispatchManager):
                 # TODO: remove this
                 pass
             self.token_probs = self.token_probs.float()  # downcast or upcast
+        num_worst_tokens = 0
+        expert_alignment = 1
+        if self.capacity_factor == "dynamic":
+            ep_size = self.num_experts // self.num_local_experts
+            # DeepEP sends a source token at most once to each rank, even when more
+            # than one local expert selected it. Reserve that topology-derived receive
+            # bound while the kernel reports the per-expert logical lengths on device.
+            num_worst_tokens = hidden_states.size(0) * ep_size
+            expert_alignment = self.moe_router_expert_pad_multiple or 1
+            max_local_routes = min(self.num_local_experts, self.router_topk)
+            self.num_permuted_tokens = num_worst_tokens * max_local_routes
+            if expert_alignment > 1:
+                self.num_permuted_tokens = min(
+                    num_worst_tokens * self.num_local_experts,
+                    self.num_permuted_tokens + self.num_local_experts * (expert_alignment - 1),
+                )
+        elif self.capacity_factor is not None:
+            ep_size = self.num_experts // self.num_local_experts
+            expert_alignment = self.moe_router_expert_pad_multiple or 1
+            average_tokens_per_expert = hidden_states.size(0) * ep_size * self.router_topk / self.num_experts
+            capacity_per_expert = math.ceil(average_tokens_per_expert * self.capacity_factor)
+            capacity_per_expert = (capacity_per_expert + expert_alignment - 1) // expert_alignment * expert_alignment
+            max_recv_tokens = hidden_states.size(0) * ep_size
+            self.num_permuted_tokens = min(
+                capacity_per_expert * self.num_local_experts,
+                max_recv_tokens * self.num_local_experts,
+            )
+            # Every received token contributes at least one local expert route, so
+            # the expert-route bound is also a safe receive-token allocation bound.
+            num_worst_tokens = min(max_recv_tokens, self.num_permuted_tokens)
+        dispatch_kwargs = {
+            "async_finish": async_finish,
+            "allocate_on_comm_stream": allocate_on_comm_stream,
+        }
+        if self.capacity_factor is not None:
+            dispatch_kwargs.update(
+                num_worst_tokens=num_worst_tokens,
+                expert_alignment=expert_alignment,
+            )
         (
             hidden_states,
             dispatched_indices,
@@ -193,13 +234,13 @@ class _DeepepManager(_DispatchManager):
             self.token_probs,
             self.num_experts,
             self.group,
-            async_finish=async_finish,
-            allocate_on_comm_stream=allocate_on_comm_stream,
+            **dispatch_kwargs,
         )
         self.handle = handle
         self.tokens_per_expert = num_tokens_per_expert
         self.dispatched_indices = dispatched_indices
         self.dispatched_probs = dispatched_probs
+        self.num_recv_tokens = hidden_states.size(0) if self.capacity_factor is not None else None
 
         return hidden_states
 
@@ -230,10 +271,9 @@ class _DeepepManager(_DispatchManager):
         )
 
         mask = indices != -1
-        valid_indices = indices[mask]
-        row_indices = torch.arange(batch_size, device=indices.device).repeat_interleave(mask.sum(dim=1))
-        multihot_routing_map[row_indices, valid_indices] = 1
-        multihot_probs[row_indices, valid_indices] = probs[mask]
+        safe_indices = indices.clamp_min(0)
+        multihot_routing_map.scatter_add_(1, safe_indices, mask.to(multihot_routing_map.dtype))
+        multihot_probs.scatter_add_(1, safe_indices, probs * mask)
         return multihot_routing_map.bool(), multihot_probs
 
     def get_dispatched_metadata(self) -> torch.Tensor:
@@ -296,11 +336,17 @@ class _DeepepManager(_DispatchManager):
 
         self.hidden_shape_before_permute = hidden_states.shape
         assert self.dispatched_probs.dtype == torch.float32, "DeepEP only supports float32 probs"
+        if self.capacity_factor is not None:
+            num_out_tokens = self.num_permuted_tokens
+        elif self.permute_fusion:
+            num_out_tokens = self.tokens_per_expert.sum().item()
+        else:
+            num_out_tokens = None
         hidden_states, permuted_probs, self.reversed_mapping_for_combine = permute(
             hidden_states,
             self.dispatched_routing_map,
             probs=self.dispatched_probs,
-            num_out_tokens=self.tokens_per_expert.sum().item(),
+            num_out_tokens=num_out_tokens,
             fused=self.permute_fusion,
         )
         if self.router_dtype == "fp64":
@@ -311,6 +357,10 @@ class _DeepepManager(_DispatchManager):
         """
         Restore the hidden states to their original ordering before expert processing
         """
+        if self.capacity_factor is not None:
+            logical_tokens = self.tokens_per_expert.sum()
+            valid = torch.arange(hidden_states.size(0), device=hidden_states.device) < logical_tokens
+            hidden_states = hidden_states.masked_fill(~valid.unsqueeze(-1), 0)
         hidden_states = unpermute(
             hidden_states,
             self.reversed_mapping_for_combine,
@@ -318,6 +368,8 @@ class _DeepepManager(_DispatchManager):
             routing_map=self.dispatched_routing_map,
             fused=self.permute_fusion,
         )
+        self.num_recv_tokens = None
+        self.num_permuted_tokens = None
         return hidden_states
 
 
@@ -534,10 +586,10 @@ class TokenDispatcherConfig:
     """Fuse token rearrangement ops during token dispatching."""
 
     moe_expert_capacity_factor: float | Literal["dynamic"] | None = None
-    """Token capacity policy. DeepEP accepts a numeric per-expert factor. HybridEP
-    accepts either a numeric average-rank factor, which can drop overflow, or
-    ``"dynamic"``, which uses GPU logical-length metadata and a no-drop storage
-    bound. None preserves blocking exact-shaped dispatch."""
+    """Token capacity policy. ``"dynamic"`` uses GPU logical-length metadata and a
+    topology-derived no-drop storage bound for DeepEP and HybridEP. Numeric factors
+    use aligned expert-capacity storage with GPU logical lengths. None preserves
+    blocking exact-shaped dispatch."""
 
     moe_router_topk: int = 2
     """Number of experts to route to for each token."""
