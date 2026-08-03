@@ -766,6 +766,10 @@ class BaseRecipe:
         """Log metadata and config on main rank using YAML markers."""
         if not getattr(self, "dist_env", None) or not getattr(self.dist_env, "is_main", False):
             return
+        try:
+            cpu_affinity_count = len(os.sched_getaffinity(0))
+        except (AttributeError, OSError):
+            cpu_affinity_count = None
         details = {
             "Timestamp": datetime.now().isoformat(timespec="seconds"),
             "User": getpass.getuser(),
@@ -775,6 +779,15 @@ class BaseRecipe:
             "Recipe": self.__class__.__name__,
             "Model name": getattr(getattr(self, "cfg", None), "model", None)
             and getattr(self.cfg.model, "pretrained_model_name_or_path", None),
+            "CPU threading": {
+                "os.cpu_count()": os.cpu_count(),
+                "CPU affinity count": cpu_affinity_count,
+                "torch.get_num_threads()": torch.get_num_threads(),
+                "torch.get_num_interop_threads()": torch.get_num_interop_threads(),
+                "OMP_NUM_THREADS": os.environ.get("OMP_NUM_THREADS"),
+                "MKL_NUM_THREADS": os.environ.get("MKL_NUM_THREADS"),
+                "OPENBLAS_NUM_THREADS": os.environ.get("OPENBLAS_NUM_THREADS"),
+            },
         }
         try:
             details_yaml = yaml.safe_dump(details, sort_keys=False, default_flow_style=False).strip()

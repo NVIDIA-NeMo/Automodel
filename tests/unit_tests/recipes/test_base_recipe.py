@@ -229,6 +229,31 @@ class _ToyRecipe(BaseRecipe):
         self.cfg = ConfigNode(cfg_dict)
 
 
+def test_log_experiment_details_includes_cpu_threading(tmp_path, monkeypatch, caplog):
+    """Experiment metadata exposes the effective CPU affinity and thread pools."""
+    recipe_inst = _ToyRecipe(tmp_path)
+    recipe_inst.dist_env = SimpleNamespace(is_main=True, world_size=1)
+    monkeypatch.setattr(os, "cpu_count", lambda: 224)
+    monkeypatch.setattr(os, "sched_getaffinity", lambda _pid: set(range(224)), raising=False)
+    monkeypatch.setattr(torch, "get_num_threads", lambda: 8)
+    monkeypatch.setattr(torch, "get_num_interop_threads", lambda: 1)
+    monkeypatch.setenv("OMP_NUM_THREADS", "8")
+    monkeypatch.setenv("MKL_NUM_THREADS", "8")
+    monkeypatch.setenv("OPENBLAS_NUM_THREADS", "1")
+    caplog.set_level(logging.INFO)
+
+    recipe_inst._log_experiment_details()
+
+    assert "CPU threading:" in caplog.text
+    assert "os.cpu_count(): 224" in caplog.text
+    assert "CPU affinity count: 224" in caplog.text
+    assert "torch.get_num_threads(): 8" in caplog.text
+    assert "torch.get_num_interop_threads(): 1" in caplog.text
+    assert "OMP_NUM_THREADS: '8'" in caplog.text
+    assert "MKL_NUM_THREADS: '8'" in caplog.text
+    assert "OPENBLAS_NUM_THREADS: '1'" in caplog.text
+
+
 def test_dp_allreduce_uses_world_group_without_device_mesh(tmp_path, monkeypatch):
     """
     DDP does not create a device mesh, so DP reductions should use the default
