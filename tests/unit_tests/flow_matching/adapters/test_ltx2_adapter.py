@@ -28,6 +28,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+import nemo_automodel.components.flow_matching.adapters.ltx2 as ltx2_module
 from nemo_automodel.components.flow_matching.adapters import (
     FlowMatchingContext,
     LTX2Adapter,
@@ -232,6 +233,31 @@ class TestForwardAndAuxLoss:
         # Must not raise despite the model rejecting sigma/fps/etc. kwargs.
         video_pred = adapter.forward(NoSigmaModel(), inputs)
         assert video_pred.shape == (B, C_VID, F, H, W)
+
+    def test_kwargs_filter_caches_signature_by_model_type(self, monkeypatch):
+        class NoSigmaModel(nn.Module):
+            def forward(self, hidden_states, audio_hidden_states):
+                return hidden_states, audio_hidden_states
+
+        adapter = LTX2Adapter()
+        inputs = {"hidden_states": torch.ones(1), "audio_hidden_states": torch.ones(1), "sigma": torch.ones(1)}
+        ltx2_module._get_forward_parameters.cache_clear()
+        signature = ltx2_module.inspect.signature
+        calls = 0
+
+        def counting_signature(callable_object):
+            nonlocal calls
+            calls += 1
+            return signature(callable_object)
+
+        monkeypatch.setattr(ltx2_module.inspect, "signature", counting_signature)
+        try:
+            adapter._filter_model_kwargs(NoSigmaModel(), inputs)
+            adapter._filter_model_kwargs(NoSigmaModel(), inputs)
+        finally:
+            ltx2_module._get_forward_parameters.cache_clear()
+
+        assert calls == 1
 
 
 class TestPipelineIntegration:

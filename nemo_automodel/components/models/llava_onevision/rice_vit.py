@@ -46,6 +46,41 @@ def apply_rotary_pos_emb_vision(
     return q_embed.to(orig_q_dtype), k_embed.to(orig_k_dtype)
 
 
+def _block_diagonal_attention_mask(
+    cu_seqlens: torch.Tensor,
+    sequence_length: int,
+    dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
+    """Build a block-diagonal mask without host-side segment iteration.
+
+    Args:
+        cu_seqlens: Packed segment offsets with shape [num_segments + 1].
+        sequence_length: Total number of packed tokens.
+        dtype: When omitted, return a boolean visibility mask. Otherwise return
+            an additive mask in this dtype with zero for visible positions.
+
+    Returns:
+        Attention mask with shape [1, sequence_length, sequence_length]. Inputs
+        are not mutated.
+    """
+    segment_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+    segment_ids = torch.repeat_interleave(
+        torch.arange(segment_lengths.numel(), device=cu_seqlens.device),
+        segment_lengths,
+        output_size=sequence_length,
+    )
+    visible = segment_ids[:, None] == segment_ids[None, :]
+    if dtype is None:
+        return visible.unsqueeze(0)
+    additive_mask = torch.full(
+        (sequence_length, sequence_length),
+        torch.finfo(dtype).min,
+        device=cu_seqlens.device,
+        dtype=dtype,
+    )
+    return additive_mask.masked_fill(visible, 0).unsqueeze(0)
+
+
 class RiceRotaryEmbedding(nn.Module):
     def __init__(self, dim: int, theta: float = 10000.0) -> None:
         super().__init__()
@@ -136,14 +171,7 @@ class RiceAttention(nn.Module):
         cos, sin = position_embeddings
         q, k = apply_rotary_pos_emb_vision(q, k, cos, sin)
 
-        attention_mask = torch.full(
-            [1, seq_length, seq_length],
-            torch.finfo(q.dtype).min,
-            device=q.device,
-            dtype=q.dtype,
-        )
-        for i in range(1, len(cu_seqlens)):
-            attention_mask[..., cu_seqlens[i - 1] : cu_seqlens[i], cu_seqlens[i - 1] : cu_seqlens[i]] = 0
+        attention_mask = _block_diagonal_attention_mask(cu_seqlens, seq_length, q.dtype)
 
         q = q.transpose(0, 1)
         k = k.transpose(0, 1)
@@ -206,9 +234,7 @@ class RiceSdpaAttention(nn.Module):
         cos, sin = position_embeddings
         q, k = apply_rotary_pos_emb_vision(q, k, cos, sin)
 
-        attention_mask = torch.zeros([1, seq_length, seq_length], device=q.device, dtype=torch.bool)
-        for i in range(1, len(cu_seqlens)):
-            attention_mask[..., cu_seqlens[i - 1] : cu_seqlens[i], cu_seqlens[i - 1] : cu_seqlens[i]] = True
+        attention_mask = _block_diagonal_attention_mask(cu_seqlens, seq_length)
 
         q = q.transpose(0, 1).unsqueeze(0)
         k = k.transpose(0, 1).unsqueeze(0)
@@ -335,32 +361,35 @@ class RiceTransformer(nn.Module):
             dim=0, dtype=grid_thw.dtype if torch.jit.is_tracing() else torch.int32
         )
         cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
-        cu = cu_seqlens.to(torch.long)
+        cu = cu_seqlens.to(device=hidden_states.device, dtype=torch.long)
         num_segments = cu.numel() - 1
 
         cls_token = self.class_embedding.to(hidden_states.dtype).unsqueeze(0)
-        total_patches = cu[-1].item()
-        new_total = total_patches + num_segments
+        new_total = img_feats + num_segments
         D = hidden_states.size(-1)
 
         new_hidden = hidden_states.new_empty((new_total, D))
         new_rotary_pos_emb = rotary_pos_emb.new_empty((new_total, rotary_pos_emb.shape[-1]))
 
-        write_ptr = 0
-        new_cu = [0]
-        for i in range(1, num_segments + 1):
-            seg_start = cu[i - 1].item()
-            seg_end = cu[i].item()
-            seg_len = seg_end - seg_start
-            new_hidden[write_ptr] = cls_token
-            new_rotary_pos_emb[write_ptr] = self.class_pos_emb
-            new_hidden[write_ptr + 1 : write_ptr + 1 + seg_len] = hidden_states[seg_start:seg_end]
-            new_rotary_pos_emb[write_ptr + 1 : write_ptr + 1 + seg_len] = rotary_pos_emb[seg_start:seg_end]
-            write_ptr += 1 + seg_len
-            new_cu.append(write_ptr)
+        segment_lengths = cu[1:] - cu[:-1]
+        segment_ids = torch.repeat_interleave(
+            torch.arange(num_segments, device=hidden_states.device),
+            segment_lengths,
+            output_size=img_feats,
+        )
+        patch_positions = torch.arange(img_feats, device=hidden_states.device) + segment_ids + 1
+        cls_positions = cu[:-1] + torch.arange(num_segments, device=hidden_states.device)
+        new_hidden.index_copy_(0, patch_positions, hidden_states)
+        new_hidden.index_copy_(0, cls_positions, cls_token.expand(num_segments, -1))
+        new_rotary_pos_emb.index_copy_(0, patch_positions, rotary_pos_emb)
+        new_rotary_pos_emb.index_copy_(
+            0,
+            cls_positions,
+            self.class_pos_emb.to(new_rotary_pos_emb).expand(num_segments, -1),
+        )
 
         hidden_states = new_hidden
-        cu_seqlens = torch.tensor(new_cu, device=hidden_states.device, dtype=torch.int32)
+        cu_seqlens = (cu + torch.arange(num_segments + 1, device=hidden_states.device)).to(torch.int32)
         rotary_pos_emb = new_rotary_pos_emb
 
         hidden_states = self.pre_layernorm(hidden_states)
@@ -370,17 +399,8 @@ class RiceTransformer(nn.Module):
         for blk in self.blocks:
             hidden_states = blk(hidden_states, cu_seqlens=cu_seqlens, position_embeddings=position_embeddings)
 
-        # Strip the per-segment CLS tokens before merging. ``hidden_states`` is
-        # laid out as [CLS, p_0, p_1, ..., p_{k-1}] per segment in the post-CLS
-        # packed sequence, so source indices must come from ``cu_seqlens`` (which
-        # includes the +1 per segment). Using ``cu`` as the source would land on
-        # the next segment's CLS for any image after the first.
-        stripped = hidden_states.new_empty((img_feats, D))
-        for i in range(1, num_segments + 1):
-            orig_start = cu[i - 1].item()
-            orig_end = cu[i].item()
-            new_start = cu_seqlens[i - 1].item()
-            new_end = cu_seqlens[i].item()
-            stripped[orig_start:orig_end] = hidden_states[new_start + 1 : new_end]
+        # ``patch_positions`` points at every non-CLS token in original patch
+        # order, so one indexed read strips all per-segment CLS tokens.
+        stripped = hidden_states[patch_positions]
 
         return self.merger(stripped)

@@ -33,7 +33,8 @@ Expected batch keys (produced by ``tools/diffusion/processors/ltx2.py``):
 
 import inspect
 import logging
-from typing import Any, Dict
+from functools import lru_cache
+from typing import Any, Dict, Mapping
 
 import torch
 import torch.nn as nn
@@ -50,6 +51,15 @@ _MISSING_KEY_HINT = (
     "'ltx2' processor (tools/diffusion/preprocessing_multiprocess.py --processor ltx2), "
     "which caches audio latents and per-stream text embeddings."
 )
+
+
+@lru_cache(maxsize=None)
+def _get_forward_parameters(model_type: type[nn.Module]) -> Mapping[str, inspect.Parameter] | None:
+    """Cache the parameter mapping for a model type's ``forward`` method."""
+    try:
+        return inspect.signature(model_type.forward).parameters
+    except (TypeError, ValueError):
+        return None
 
 
 def _pack_video_latents(latents: torch.Tensor) -> torch.Tensor:
@@ -250,9 +260,14 @@ class LTX2Adapter(ModelAdapter):
         """
         model_kwargs = {k: v for k, v in inputs.items() if not k.startswith("_")}
         unwrapped = getattr(model, "module", model)
-        try:
-            parameters = inspect.signature(unwrapped.forward).parameters
-        except (TypeError, ValueError):
+        if "forward" in vars(unwrapped):
+            try:
+                parameters = inspect.signature(unwrapped.forward).parameters
+            except (TypeError, ValueError):
+                return model_kwargs
+        else:
+            parameters = _get_forward_parameters(type(unwrapped))
+        if parameters is None:
             return model_kwargs
         if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values()):
             return model_kwargs

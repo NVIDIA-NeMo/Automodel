@@ -467,6 +467,29 @@ class TestFilterForwardKwargs:
 
         assert filtered == batch
 
+    def test_caches_signature_by_model_type(self, monkeypatch):
+        class Model(nn.Module):
+            def forward(self, input_ids):
+                return input_ids
+
+        model_utils._get_type_forward_signature.cache_clear()
+        signature = model_utils.inspect.signature
+        calls = 0
+
+        def counting_signature(callable_object):
+            nonlocal calls
+            calls += 1
+            return signature(callable_object)
+
+        monkeypatch.setattr(model_utils.inspect, "signature", counting_signature)
+        try:
+            model_utils.filter_forward_kwargs(Model(), {"input_ids": torch.ones(1)})
+            model_utils.filter_forward_kwargs(Model(), {"input_ids": torch.ones(1)})
+        finally:
+            model_utils._get_type_forward_signature.cache_clear()
+
+        assert calls == 1
+
 
 class TestSqueezeInputForThd:
     """``squeeze_input_for_thd`` strips the placeholder batch dim (``[1, T, ...] -> [T, ...]``)

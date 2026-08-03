@@ -16,6 +16,7 @@ import inspect
 import logging
 import os
 from contextlib import contextmanager
+from functools import lru_cache
 
 from nemo_automodel.shared.import_utils import safe_import
 
@@ -30,10 +31,26 @@ import torch.nn as nn
 logger = logging.getLogger(__name__)
 
 
+@lru_cache(maxsize=None)
+def _get_type_forward_signature(model_type: type[nn.Module]) -> inspect.Signature | None:
+    """Best-effort retrieval of a module type's unbound ``forward`` signature."""
+    try:
+        signature = inspect.signature(model_type.forward)
+    except (ValueError, TypeError):
+        return None
+
+    parameters = tuple(signature.parameters.values())
+    if parameters and parameters[0].name == "self":
+        signature = signature.replace(parameters=parameters[1:])
+    return signature
+
+
 def _get_forward_signature(model: nn.Module) -> inspect.Signature | None:
-    """Best-effort retrieval of ``model.forward`` signature."""
+    """Retrieve ``model.forward`` once per type, preserving instance overrides."""
     if not callable(getattr(model, "forward", None)):
         return None
+    if "forward" not in vars(model):
+        return _get_type_forward_signature(type(model))
     try:
         return inspect.signature(model.forward)
     except (ValueError, TypeError):

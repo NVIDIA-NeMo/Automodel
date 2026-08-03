@@ -163,47 +163,24 @@ def _apply_bias(value, bias, tokens_per_expert, permuted_probs=None):
     Args:
         value: Output from grouped GEMM, shape [total_tokens, features].
         bias: Per-expert bias, shape [num_experts, features].
-        tokens_per_expert: Token counts per expert.
-        permuted_probs: If provided, bias is weighted by routing probs (for down projection).
+        tokens_per_expert: Token counts, shape [num_experts].
+        permuted_probs: Optional routing probabilities broadcastable to
+            [total_tokens, features], typically [total_tokens, 1].
+
+    Returns:
+        Grouped GEMM output with per-expert bias applied, shape
+        [total_tokens, features]. The inputs are not mutated.
     """
     if bias is None:
         return value
-    shape = value.shape
+    if not isinstance(bias, torch.Tensor):
+        bias = torch.stack(tuple(bias))
+
+    token_counts = torch.as_tensor(tokens_per_expert, device=bias.device, dtype=torch.long)
+    expanded_bias = torch.repeat_interleave(bias, token_counts, dim=0, output_size=value.shape[0])
     if permuted_probs is not None:
-        output = (
-            torch.cat(
-                [
-                    t + b * p
-                    for t, b, p in zip(
-                        torch.split(value.view(-1, shape[-1]), tokens_per_expert.tolist()),
-                        bias,
-                        torch.split(permuted_probs, tokens_per_expert.tolist()),
-                    )
-                ]
-            )
-            .view(shape)
-            .to(value.dtype)
-        )
-    else:
-        output = (
-            torch.cat(
-                [
-                    t + b
-                    for t, b in zip(
-                        torch.split(
-                            value.view(-1, shape[-1]),
-                            tokens_per_expert.tolist()
-                            if isinstance(tokens_per_expert, torch.Tensor)
-                            else tokens_per_expert,
-                        ),
-                        bias,
-                    )
-                ]
-            )
-            .view(shape)
-            .to(value.dtype)
-        )
-    return output
+        expanded_bias = expanded_bias * permuted_probs
+    return (value + expanded_bias).to(value.dtype)
 
 
 class GroupedExperts(nn.Module):
@@ -526,7 +503,7 @@ class GroupedExperts(nn.Module):
         )
         y = torch.zeros(output_shape, dtype=torch.float32, device=x.device)
 
-        if tokens_per_expert.sum() > 0:
+        if sorted_token_ids.numel() > 0:
             permuted_x = x[sorted_token_ids]
             permuted_probs = sorted_weights.unsqueeze(-1)
             activation_probs = (
