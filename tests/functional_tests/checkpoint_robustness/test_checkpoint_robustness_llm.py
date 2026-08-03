@@ -42,6 +42,7 @@ from contextlib import AbstractContextManager, contextmanager, nullcontext
 from datetime import timedelta
 from functools import wraps
 from pathlib import Path
+from types import MethodType
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -378,6 +379,11 @@ def _tensor_digest(tensor: torch.Tensor) -> dict[str, object]:
 def _verbose_diagnostics_enabled() -> bool:
     """Return whether expensive checkpoint diagnostics are enabled for this run."""
     return os.environ.get("CHECKPOINT_ROBUSTNESS_VERBOSE_DIAGNOSTICS", "0") == "1"
+
+
+def _qwen3_moe_rope_ablation_enabled() -> bool:
+    """Return whether the temporary HF Qwen3-MoE RoPE A/B diagnostic is enabled."""
+    return os.environ.get("CHECKPOINT_ROBUSTNESS_QWEN3_MOE_ROPE_ABLATION", "0") == "1"
 
 
 def _diagnostic_sample_indices(numel: int, sample_size: int, device: torch.device) -> torch.Tensor:
@@ -1424,6 +1430,123 @@ def _get_logits(model, input_ids, device, trainer=None) -> torch.Tensor:
         return logits.float().cpu()
 
 
+def _logit_pair_diagnostics(first: torch.Tensor, second: torch.Tensor) -> dict[str, object]:
+    """Return exact hashes and numerical deltas for two logit tensors."""
+    delta = (first - second).abs()
+    self_kl = _kl_divergence_from_logits(first, second)
+    return {
+        "first": _tensor_digest(first),
+        "max_abs_diff": delta.max().item(),
+        "max_kl": self_kl.max().item(),
+        "mean_abs_diff": delta.mean().item(),
+        "mean_kl": self_kl.mean().item(),
+        "second": _tensor_digest(second),
+    }
+
+
+def _run_qwen3_moe_hf_rope_ablation(
+    model,
+    input_ids: list[int],
+    device: torch.device,
+    official_first: torch.Tensor,
+    official_second: torch.Tensor,
+) -> torch.Tensor | None:
+    """Compare official, instrumented-matmul, and elementwise HF Qwen3-MoE RoPE on one model."""
+    if not _qwen3_moe_rope_ablation_enabled():
+        return None
+
+    rotary_modules = [
+        (name, module)
+        for name, module in model.named_modules()
+        if module.__class__.__name__ == "Qwen3MoeRotaryEmbedding"
+    ]
+    if not rotary_modules:
+        return None
+    assert len(rotary_modules) == 1, f"Expected one HF Qwen3-MoE rotary module, found {len(rotary_modules)}"
+    rotary_name, rotary_module = rotary_modules[0]
+    rope_type = getattr(rotary_module, "rope_type", "default")
+    assert not str(rope_type).startswith("dynamic"), (
+        f"Qwen3-MoE RoPE A/B bypasses the dynamic frequency update and cannot diagnose rope_type={rope_type!r}"
+    )
+    # Accelerate wraps ``forward`` to place inputs on the module-owned device.
+    # Patch its saved implementation so the placement hook remains active.
+    forward_attribute = "_old_forward" if hasattr(rotary_module, "_hf_hook") else "forward"
+    original_forward = getattr(rotary_module, forward_attribute)
+    rope_records: dict[str, list[dict[str, object]]] = {"stock": [], "outer": []}
+
+    def diagnostic_forward(self, x: torch.Tensor, position_ids: torch.Tensor, *, mode: str):
+        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
+        position_ids_expanded = position_ids[:, None, :].float()
+        device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
+        with torch.autocast(device_type=device_type, enabled=False):
+            if mode == "stock":
+                freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
+            else:
+                freqs = (inv_freq_expanded.float() * position_ids_expanded.float()).transpose(1, 2)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            cos = emb.cos() * self.attention_scaling
+            sin = emb.sin() * self.attention_scaling
+
+        cpu_reference = (
+            self.inv_freq.detach().cpu().double()[None, :, None] * position_ids.detach().cpu().double()[:, None, :]
+        ).transpose(1, 2)
+        cpu_emb = torch.cat((cpu_reference, cpu_reference), dim=-1)
+        attention_scaling = self.attention_scaling
+        if isinstance(attention_scaling, torch.Tensor):
+            attention_scaling = attention_scaling.detach().cpu().double()
+        cpu_cos = (cpu_emb.cos() * attention_scaling).to(dtype=x.dtype)
+        cpu_sin = (cpu_emb.sin() * attention_scaling).to(dtype=x.dtype)
+        output_cos = cos.to(dtype=x.dtype)
+        output_sin = sin.to(dtype=x.dtype)
+        rope_records[mode].append(
+            {
+                "cos": _tensor_digest(output_cos),
+                "cos_max_abs_vs_cpu_fp64": (output_cos.float().cpu() - cpu_cos.float()).abs().max().item(),
+                "freqs": _tensor_digest(freqs),
+                "freqs_max_abs_vs_cpu_fp64": (freqs.double().cpu() - cpu_reference).abs().max().item(),
+                "inv_freq": _tensor_digest(self.inv_freq),
+                "position_ids": _tensor_digest(position_ids),
+                "sin": _tensor_digest(output_sin),
+                "sin_max_abs_vs_cpu_fp64": (output_sin.float().cpu() - cpu_sin.float()).abs().max().item(),
+            }
+        )
+        return output_cos, output_sin
+
+    logits: dict[str, list[torch.Tensor]] = {"stock": [], "outer": []}
+    try:
+        for mode in ("stock", "outer"):
+            setattr(
+                rotary_module,
+                forward_attribute,
+                MethodType(
+                    lambda self, x, position_ids, *, _mode=mode: diagnostic_forward(self, x, position_ids, mode=_mode),
+                    rotary_module,
+                ),
+            )
+            logits[mode].append(_get_logits(model, input_ids, device))
+            logits[mode].append(_get_logits(model, input_ids, device))
+    finally:
+        setattr(rotary_module, forward_attribute, original_forward)
+
+    official_stock_kl = _kl_divergence_from_logits(official_first, logits["stock"][0])
+    stock_outer_kl = _kl_divergence_from_logits(logits["stock"][0], logits["outer"][0])
+    report = {
+        "model_class": model.__class__.__name__,
+        "official": _logit_pair_diagnostics(official_first, official_second),
+        "official_first_max_kl_vs_stock_first": official_stock_kl.max().item(),
+        "outer": _logit_pair_diagnostics(logits["outer"][0], logits["outer"][1]),
+        "outer_first_max_kl_vs_stock_first": stock_outer_kl.max().item(),
+        "patched_forward_attribute": forward_attribute,
+        "rope_type": rope_type,
+        "rotary_module": rotary_name,
+        "rope_records": rope_records,
+        "selected_reference": "outer_first",
+        "stock": _logit_pair_diagnostics(logits["stock"][0], logits["stock"][1]),
+    }
+    print(f"[checkpoint-diagnostic][qwen3-moe-rope-ablation] {json.dumps(report, sort_keys=True)}", flush=True)
+    return logits["outer"][0]
+
+
 def _get_logits_with_diagnostics(model, input_ids, device, trainer=None) -> torch.Tensor:
     """Run the parity forward twice and report model, logit, and RoPE identity when requested."""
     if not _verbose_diagnostics_enabled():
@@ -1462,6 +1585,14 @@ def _get_logits_with_diagnostics(model, input_ids, device, trainer=None) -> torc
     finally:
         for handle in handles:
             handle.remove()
+
+    selected_logits = _run_qwen3_moe_hf_rope_ablation(
+        model,
+        input_ids,
+        device,
+        first_logits,
+        second_logits,
+    )
 
     parameter_samples = []
     named_parameters = list(model.named_parameters())
@@ -1516,7 +1647,7 @@ def _get_logits_with_diagnostics(model, input_ids, device, trainer=None) -> torc
         "second_logits": _tensor_digest(second_logits),
     }
     print(f"[checkpoint-diagnostic][repeat-forward] {json.dumps(report, sort_keys=True)}", flush=True)
-    return first_logits
+    return first_logits if selected_logits is None else selected_logits
 
 
 def _reinit_rotary_per_module(model, default_device):

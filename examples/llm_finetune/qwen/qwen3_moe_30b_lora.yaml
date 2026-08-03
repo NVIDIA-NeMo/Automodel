@@ -110,6 +110,8 @@ ci:
       source_load_reference source_load_parity train_and_save automodel_reload hf_reload
     # Temporary AMINT-216 diagnostics: snapshot identity, repeated logits, and RoPE summaries.
     CHECKPOINT_ROBUSTNESS_VERBOSE_DIAGNOSTICS: "1"
+    # Compare HF's skinny matmul with an exact elementwise/CPU-reference RoPE path.
+    CHECKPOINT_ROBUSTNESS_QWEN3_MOE_ROPE_ABLATION: "1"
     PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
   checkpoint_robustness:
     check_source_load_parity: true

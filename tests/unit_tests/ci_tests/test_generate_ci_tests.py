@@ -147,6 +147,7 @@ def test_generate_qwen3_moe_lora_uses_isolated_reload_phases():
         "source_load_reference source_load_parity train_and_save automodel_reload hf_reload"
     )
     assert variables["CHECKPOINT_ROBUSTNESS_VERBOSE_DIAGNOSTICS"] == "1"
+    assert variables["CHECKPOINT_ROBUSTNESS_QWEN3_MOE_ROPE_ABLATION"] == "1"
     assert robustness["check_source_load_parity"] is True
     assert robustness["source_load_kl_threshold"] == 3e-2
     assert robustness["source_load_mean_kl_threshold"] == 6e-3
