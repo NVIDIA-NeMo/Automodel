@@ -1735,8 +1735,6 @@ def _run_process_isolated_checkpoint_phase(
         raise ValueError(f"Unsupported isolated checkpoint phase {phase!r}; expected one of {sorted(supported_phases)}")
     if int(custom_args.get("cross_tp_size", "0")) > 0:
         raise ValueError("Process-isolated checkpoint mode does not yet support cross_tp_size")
-    if custom_args.get("no_check_resume", False):
-        raise ValueError("Process-isolated checkpoint mode requires the resume phases")
 
     _disable_distributed_atexit_teardown()
     cfg = parse_args_and_load_config()

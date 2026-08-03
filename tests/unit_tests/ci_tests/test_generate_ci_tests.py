@@ -54,16 +54,15 @@ ci:
     assert jobs["_vllm_deploy"]["variables"]["TIME"] == "00:30:00"
 
 
-def test_generate_checkpoint_robustness_process_isolation(tmp_path):
+def test_generate_checkpoint_robustness_process_isolation_derives_phases(tmp_path):
     config = Path("large_lora.yaml")
     (tmp_path / config).write_text(
         """
 ci:
-  env_vars:
-    CHECKPOINT_ROBUSTNESS_PHASES: "source_load_reference source_load_parity train_and_save automodel_reload hf_reload"
   checkpoint_robustness:
     process_isolation: true
     check_source_load_parity: true
+    no_check_resume: true
     trust_remote_code: true
     hf_device_map_auto: true
     hf_device_map_max_memory_gib: 55
@@ -78,3 +77,57 @@ ci:
     assert jobs[""]["variables"]["CHECKPOINT_ROBUSTNESS_PHASES"] == (
         "source_load_reference source_load_parity train_and_save automodel_reload hf_reload"
     )
+
+
+def test_generate_checkpoint_robustness_process_isolation_preserves_full_default(tmp_path):
+    config = Path("full_robustness.yaml")
+    (tmp_path / config).write_text(
+        """
+ci:
+  checkpoint_robustness:
+    process_isolation: true
+""",
+        encoding="utf-8",
+    )
+
+    jobs = dict(generate_job(config, {}, "release", "llm_finetune", str(tmp_path)))
+
+    assert jobs[""]["variables"]["CHECKPOINT_ROBUSTNESS_PHASES"] == (
+        "train_and_save automodel_reload hf_reload resume_baseline resume"
+    )
+
+
+def test_generate_checkpoint_robustness_process_isolation_honors_skips(tmp_path):
+    config = Path("reload_only.yaml")
+    (tmp_path / config).write_text(
+        """
+ci:
+  checkpoint_robustness:
+    process_isolation: true
+    skip_hf_reload: true
+    no_check_resume: true
+""",
+        encoding="utf-8",
+    )
+
+    jobs = dict(generate_job(config, {}, "release", "llm_finetune", str(tmp_path)))
+
+    assert jobs[""]["variables"]["CHECKPOINT_ROBUSTNESS_PHASES"] == "train_and_save automodel_reload"
+
+
+def test_generate_checkpoint_robustness_process_isolation_allows_phase_override(tmp_path):
+    config = Path("custom_phases.yaml")
+    (tmp_path / config).write_text(
+        """
+ci:
+  env_vars:
+    CHECKPOINT_ROBUSTNESS_PHASES: "train_and_save automodel_reload"
+  checkpoint_robustness:
+    process_isolation: true
+""",
+        encoding="utf-8",
+    )
+
+    jobs = dict(generate_job(config, {}, "release", "llm_finetune", str(tmp_path)))
+
+    assert jobs[""]["variables"]["CHECKPOINT_ROBUSTNESS_PHASES"] == "train_and_save automodel_reload"

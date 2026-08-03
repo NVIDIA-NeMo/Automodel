@@ -641,6 +641,7 @@ def test_process_isolated_hf_reload_runs_rank0_hf_loader(tmp_path):
     reference_logits = torch.randn(1, 2, 3)
     recipe_cls = Mock()
     hf_model_cls = Mock()
+    custom_args = {"hf_device_map_auto": True, "no_check_resume": True, "trust_remote_code": True}
 
     with (
         patch(
@@ -675,7 +676,7 @@ def test_process_isolated_hf_reload_runs_rank0_hf_loader(tmp_path):
     ):
         _run_process_isolated_checkpoint_phase(
             "hf_reload",
-            custom_args={"hf_device_map_auto": True, "trust_remote_code": True},
+            custom_args=custom_args,
             recipe_cls=recipe_cls,
             hf_model_cls=hf_model_cls,
             input_ids_loader=Mock(),
@@ -689,7 +690,7 @@ def test_process_isolated_hf_reload_runs_rank0_hf_loader(tmp_path):
         [11, 12],
         reference_logits,
         hf_model_cls=hf_model_cls,
-        custom_args={"hf_device_map_auto": True, "trust_remote_code": True},
+        custom_args=custom_args,
     )
     raise_distributed_failure.assert_called_once_with(None)
     recipe_cls.assert_not_called()
