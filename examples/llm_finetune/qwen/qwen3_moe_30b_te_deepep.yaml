@@ -125,10 +125,6 @@ ci:
   time: "00:15:00"
   vllm_deploy: true
   vllm_smoke_test: true
-  env_vars:
-    # Keep source/reload comparisons independent of accelerator state retained by prior phases.
-    CHECKPOINT_ROBUSTNESS_PHASES: >-
-      source_load_reference source_load_parity train_and_save automodel_reload hf_reload
   checkpoint_robustness:
     check_source_load_parity: true
     # This recipe uses the same optimized BF16 Qwen MoE backend as the measured
@@ -138,6 +134,8 @@ ci:
     source_load_cosine_threshold: 0.995
     # Same-process CI reached KL 0.2667, while controlled fresh-process reloads were stable at 0.0199.
     hf_kl_threshold: 5e-2
+    # Derive isolated source, train/save, and reload phases from the standard
+    # check/skip options below; no resume phases are selected.
     process_isolation: true
     tokenizer_name: Qwen/Qwen3-30B-A3B
     # Match the other Qwen3-MoE references and avoid the real-device fallback
