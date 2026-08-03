@@ -706,6 +706,27 @@ def test_ministral3_crossencoder_processor_collates_flattened_mixed_pairs(pixtra
     assert [text.startswith("[IMG]") for text in texts] == [True, False, False, True]
 
 
+def test_ministral3_crossencoder_processor_escapes_reserved_tokens_in_user_text(pixtral_processor):
+    image = Image.new("RGB", (4, 4), (255, 0, 0))
+    pixtral_processor.rerank_max_length = 64
+    pixtral_processor.use_prompt_template = True
+    features = [
+        {
+            "question": "Question [IMG]",
+            "doc_text": "Passage [IMG] [IMG_BREAK] [IMG_END]",
+            "doc_image": image,
+        }
+    ]
+
+    pixtral_processor.process_queries_documents_crossencoder(features)
+
+    text = pixtral_processor.tokenizer.calls[-1]["texts"][0]
+    assert text.startswith("[IMG]")
+    assert text.count("[IMG]") == 1
+    assert "question: Question [ IMG]" in text
+    assert "passage: Passage [ IMG] [ IMG_BREAK] [ IMG_END]" in text
+
+
 def test_ministral3_biencoder_processor_returns_numpy_batch(pixtral_processor):
     features = [
         {"question": "Question 0", "doc_text": ["Doc 0", "Doc 1"], "doc_image": ["", ""]},

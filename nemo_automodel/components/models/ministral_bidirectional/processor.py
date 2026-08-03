@@ -378,6 +378,12 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
         """
         return f"question: {question}\n\npassage: {text}"
 
+    def _escape_reserved_mm_tokens(self, text: str) -> str:
+        """Prevent user text from being interpreted as Pixtral control tokens."""
+        for token in (self.image_token, self.image_break_token, self.image_end_token):
+            text = text.replace(token, f"{token[:1]} {token[1:]}")
+        return text
+
     def process_queries_documents_crossencoder(
         self,
         features: list[dict[str, Any]],
@@ -410,11 +416,14 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
         contents = []
         processor_images = []
         for feature in features:
-            document_text = "" if feature["doc_text"] is None else str(feature["doc_text"])
+            question = self._escape_reserved_mm_tokens(str(feature["question"]))
+            document_text = (
+                "" if feature["doc_text"] is None else self._escape_reserved_mm_tokens(str(feature["doc_text"]))
+            )
             if self.use_prompt_template:
-                content = self.prompt_template_question_passage(str(feature["question"]), document_text)
+                content = self.prompt_template_question_passage(question, document_text)
             else:
-                content = f"{feature['question']}\n{document_text}"
+                content = f"{question}\n{document_text}"
 
             image = feature["doc_image"]
             if image is not None and image != "":
