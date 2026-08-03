@@ -380,6 +380,14 @@ def _verbose_diagnostics_enabled() -> bool:
     return os.environ.get("CHECKPOINT_ROBUSTNESS_VERBOSE_DIAGNOSTICS", "0") == "1"
 
 
+def _diagnostic_sample_indices(numel: int, sample_size: int, device: torch.device) -> torch.Tensor:
+    """Return evenly spaced indices without float rounding for large tensors."""
+    if sample_size == 1:
+        return torch.zeros(1, dtype=torch.int64, device=device)
+    ordinal = torch.arange(sample_size, dtype=torch.int64, device=device)
+    return ordinal * (numel - 1) // (sample_size - 1)
+
+
 def _diagnostic_tensor_summary(tensor: torch.Tensor) -> dict[str, object]:
     """Return bounded value diagnostics without copying an entire large parameter."""
     local_tensor = tensor.detach()
@@ -391,7 +399,7 @@ def _diagnostic_tensor_summary(tensor: torch.Tensor) -> dict[str, object]:
     flat = local_tensor.reshape(-1)
     sample_size = min(flat.numel(), 64)
     if sample_size:
-        indices = torch.linspace(0, flat.numel() - 1, steps=sample_size, device=flat.device).long()
+        indices = _diagnostic_sample_indices(flat.numel(), sample_size, flat.device)
         sample = flat[indices].float().cpu().contiguous()
         sample_bytes = sample.view(torch.uint8).numpy()
         sample_summary = {

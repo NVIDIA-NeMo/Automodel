@@ -26,6 +26,7 @@ from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm
     _assert_peft_adapter_matches_checkpoint,
     _compare_source_load_parity,
     _dequantize_hf_fp8_weights_in_place,
+    _diagnostic_sample_indices,
     _extract_custom_args,
     _finish_hf_reload_sync,
     _get_input_ids,
@@ -248,6 +249,17 @@ def test_get_logits_verbose_diagnostics_repeats_forward(monkeypatch, capsys):
     assert "[checkpoint-diagnostic][repeat-forward]" in output
     assert '"max_abs_diff": 0.0' in output
     assert '"max_self_kl": 0.0' in output
+
+
+def test_diagnostic_sample_indices_are_exact_for_large_tensors():
+    numel = 100_000_003
+
+    indices = _diagnostic_sample_indices(numel, 64, torch.device("cpu"))
+
+    assert indices.dtype == torch.int64
+    assert indices[0].item() == 0
+    assert indices[-1].item() == numel - 1
+    assert torch.all(indices[1:] > indices[:-1])
 
 
 def test_remote_masking_api_compatibility_drops_removed_cache_position(monkeypatch):
