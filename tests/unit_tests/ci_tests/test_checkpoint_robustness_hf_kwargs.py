@@ -24,7 +24,9 @@ from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_bie
 )
 from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm import (
     _assert_peft_adapter_matches_checkpoint,
+    _capture_decoder_layer_probes,
     _compare_source_load_parity,
+    _decoder_layer_index,
     _dequantize_hf_fp8_weights_in_place,
     _extract_custom_args,
     _finish_hf_reload_sync,
@@ -44,6 +46,7 @@ from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm
     _post_load_dequant_max_memory,
     _raise_distributed_failure,
     _record_deferred_failure,
+    _report_decoder_layer_parity,
     _resolve_hf_model_class,
     _run_process_isolated_checkpoint_phase,
     _set_router_weight_after_down,
@@ -53,6 +56,54 @@ from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm
 )
 from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_vlm import _get_vlm_input_ids
 from tests.functional_tests.checkpoint_robustness.test_checkpoint_vllm_deploy import _tokenize_for_generation
+
+
+def test_decoder_layer_index_matches_language_layers_only():
+    assert _decoder_layer_index("model.layers.3") == 3
+    assert _decoder_layer_index("model.language_model.layers.4") == 4
+    assert _decoder_layer_index("_fsdp_wrapped_module.model.language_model.layers.5") == 5
+    assert _decoder_layer_index("model.vision_model.layers.6") is None
+    assert _decoder_layer_index("model.language_model.layers.7.self_attn") is None
+
+
+def test_capture_decoder_layer_probes_records_real_prompt_tokens():
+    class Decoder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = torch.nn.ModuleList([torch.nn.Linear(3, 3), torch.nn.Linear(3, 3)])
+
+        def forward(self, hidden_states):
+            for layer in self.layers:
+                hidden_states = layer(hidden_states)
+            return hidden_states
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = Decoder()
+
+        def forward(self, hidden_states):
+            return self.model(hidden_states)
+
+    model = Model()
+    with _capture_decoder_layer_probes([model], prompt_length=2) as probes:
+        model(torch.randn(1, 4, 3))
+
+    assert sorted(probes) == [0, 1]
+    assert probes[0].shape == (2, 3)
+    assert probes[1].shape == (2, 3)
+
+
+def test_report_decoder_layer_parity_identifies_first_large_mismatch(capsys):
+    reference = {0: torch.ones(2, 3), 1: torch.ones(2, 3)}
+    candidate = {0: torch.ones(2, 3), 1: torch.full((2, 3), 2.0)}
+
+    _report_decoder_layer_parity(reference, candidate)
+
+    output = capsys.readouterr().out
+    assert "layer=0" in output
+    assert "layer=1" in output
+    assert "first_divergent_layer=1" in output
 
 
 def test_resolve_hf_model_class_uses_advertised_causal_lm_for_vlm_checkpoint():
@@ -793,6 +844,7 @@ def test_process_isolated_source_load_reference_persists_hf_artifacts(tmp_path):
         experts_implementation=None,
         hf_device_map_auto=True,
         hf_source_post_load_dequantize=False,
+        layer_probes=None,
     )
     persisted_logits = torch.load(
         tmp_path / ".checkpoint_robustness" / "source_load_reference_logits.pt",
@@ -804,6 +856,53 @@ def test_process_isolated_source_load_reference_persists_hf_artifacts(tmp_path):
         tmp_path / ".checkpoint_robustness" / "source_load_reference_metadata.json"
     ).read_text() == '{"explicit_tie_word_embeddings": false, "hf_aliased": false}'
     recipe_cls.assert_not_called()
+
+
+def test_process_isolated_source_load_reference_persists_layer_probes(tmp_path, monkeypatch):
+    monkeypatch.setenv("CHECKPOINT_ROBUSTNESS_LAYER_PARITY", "true")
+    cfg = SimpleNamespace(checkpoint=SimpleNamespace(checkpoint_dir=tmp_path))
+    reference_logits = torch.randn(1, 2, 3)
+    reference_layers = {0: torch.randn(2, 4), 1: torch.randn(2, 4)}
+
+    def prepare_reference(_cfg, _input_ids, **kwargs):
+        kwargs["layer_probes"].update(reference_layers)
+        return reference_logits, False, False
+
+    with (
+        patch(
+            "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm.parse_args_and_load_config",
+            return_value=cfg,
+        ),
+        patch(
+            "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm."
+            "_disable_distributed_atexit_teardown"
+        ),
+        patch(
+            "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm._load_input_ids_once",
+            return_value=[11, 12],
+        ),
+        patch(
+            "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm."
+            "_prepare_source_load_reference",
+            side_effect=prepare_reference,
+        ),
+    ):
+        _run_process_isolated_checkpoint_phase(
+            "source_load_reference",
+            custom_args={"check_source_load_parity": True},
+            recipe_cls=Mock(),
+            hf_model_cls=Mock(),
+            input_ids_loader=Mock(),
+        )
+
+    persisted_layers = torch.load(
+        tmp_path / ".checkpoint_robustness" / "source_load_reference_layers.pt",
+        map_location="cpu",
+        weights_only=True,
+    )
+    assert sorted(persisted_layers) == [0, 1]
+    torch.testing.assert_close(persisted_layers[0], reference_layers[0])
+    torch.testing.assert_close(persisted_layers[1], reference_layers[1])
 
 
 def test_wait_for_source_load_artifacts_waits_for_both_files(tmp_path):

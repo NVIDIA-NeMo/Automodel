@@ -957,6 +957,7 @@ def _prepare_source_load_reference(
     experts_implementation: str | None,
     hf_device_map_auto: bool,
     hf_source_post_load_dequantize: bool,
+    layer_probes: dict[int, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, bool | None, bool | None] | None:
     """Compute vanilla HF source-load reference logits before trainer construction."""
     if _preinit_world_size() > 1:
@@ -983,6 +984,7 @@ def _prepare_source_load_reference(
             experts_implementation=experts_implementation,
             hf_device_map_auto=hf_device_map_auto,
             hf_source_post_load_dequantize=hf_source_post_load_dequantize,
+            layer_probes=layer_probes,
         )
     except Exception:
         if fail_path is not None:
@@ -1003,6 +1005,7 @@ def _prepare_source_load_reference_rank0(
     experts_implementation: str | None,
     hf_device_map_auto: bool,
     hf_source_post_load_dequantize: bool,
+    layer_probes: dict[int, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, bool | None, bool | None]:
     """Rank-0 implementation of vanilla HF source-load reference capture."""
     from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
@@ -1086,7 +1089,12 @@ def _prepare_source_load_reference_rank0(
         if should_fix_rotary_embeddings([hf_model]):
             fix_rotary_embeddings([hf_model])
 
-    hf_logits = _get_logits(hf_model, input_ids, device)
+    if layer_probes is None:
+        hf_logits = _get_logits(hf_model, input_ids, device)
+    else:
+        with _capture_decoder_layer_probes([hf_model], len(input_ids)) as captured_layer_probes:
+            hf_logits = _get_logits(hf_model, input_ids, device)
+        layer_probes.update(captured_layer_probes)
     hf_aliased = _lm_head_embedding_aliased(hf_model)
     explicit_tie_word_embeddings = _explicit_tie_word_embeddings(hf_model.config)
     del hf_model
@@ -1175,6 +1183,124 @@ def _compare_source_load_parity(
         dist.broadcast_object_list(payload, src=0)
         failure_message = payload[0]
     return failure_message
+
+
+def _decoder_layer_index(module_name: str) -> int | None:
+    """Return the language-decoder layer index for a HF or native module name."""
+    parts = module_name.split(".")
+    if len(parts) < 3 or parts[-2] != "layers" or not parts[-1].isdigit():
+        return None
+    if parts[-3] not in {"language_model", "model"}:
+        return None
+    return int(parts[-1])
+
+
+def _first_tensor(output) -> torch.Tensor:
+    """Return the hidden-state tensor from a decoder-layer output."""
+    if isinstance(output, torch.Tensor):
+        return output
+    if isinstance(output, (tuple, list)):
+        for value in output:
+            if isinstance(value, torch.Tensor):
+                return value
+    raise TypeError(f"Decoder layer returned unsupported output type {type(output).__name__}")
+
+
+@contextmanager
+def _capture_decoder_layer_probes(model_parts, prompt_length: int):
+    """Capture the first microbatch's real-token output after each language decoder layer."""
+    probes: dict[int, torch.Tensor] = {}
+    handles = []
+
+    def _capture(layer_index: int):
+        def _hook(_module, _inputs, output):
+            if layer_index in probes:
+                return
+            hidden_states = _first_tensor(output)
+            probes[layer_index] = hidden_states.detach()[0, :prompt_length].float().cpu()
+
+        return _hook
+
+    for model_part in model_parts:
+        for module_name, module in model_part.named_modules():
+            layer_index = _decoder_layer_index(module_name)
+            if layer_index is not None:
+                handles.append(module.register_forward_hook(_capture(layer_index)))
+
+    if not handles:
+        raise AssertionError("Layer-parity probe found no language decoder layers")
+    try:
+        yield probes
+    finally:
+        for handle in handles:
+            handle.remove()
+
+
+def _gather_pp_layer_probes(trainer, local_probes: dict[int, torch.Tensor]) -> dict[int, torch.Tensor]:
+    """Gather decoder outputs from every pipeline stage in this rank's PP group."""
+    if not dist.is_initialized() or not getattr(trainer, "pp_enabled", False):
+        return local_probes
+
+    pp_group = trainer.device_mesh["pp"].get_group()
+    gathered_probes: list[dict[int, torch.Tensor] | None] = [None] * dist.get_world_size(pp_group)
+    dist.all_gather_object(gathered_probes, local_probes, group=pp_group)
+
+    merged_probes: dict[int, torch.Tensor] = {}
+    for stage_probes in gathered_probes:
+        assert stage_probes is not None
+        for layer_index, hidden_states in stage_probes.items():
+            if layer_index in merged_probes:
+                torch.testing.assert_close(merged_probes[layer_index], hidden_states)
+            else:
+                merged_probes[layer_index] = hidden_states
+    return merged_probes
+
+
+def _report_decoder_layer_parity(
+    reference_probes: dict[int, torch.Tensor],
+    candidate_probes: dict[int, torch.Tensor],
+) -> None:
+    """Print per-layer HF-versus-native activation differences for source-load diagnosis."""
+    reference_layers = sorted(reference_probes)
+    candidate_layers = sorted(candidate_probes)
+    assert candidate_layers == reference_layers, (
+        f"Layer-parity probe layer mismatch: HF={reference_layers}, AutoModel={candidate_layers}"
+    )
+
+    first_divergent_layer = None
+    largest_relative_l2_jump = (float("-inf"), None)
+    previous_relative_l2 = 0.0
+    for layer_index in reference_layers:
+        reference = reference_probes[layer_index].float()
+        candidate = candidate_probes[layer_index].float()
+        assert candidate.shape == reference.shape, (
+            f"Layer {layer_index} probe shape mismatch: HF={tuple(reference.shape)}, AutoModel={tuple(candidate.shape)}"
+        )
+        difference = candidate - reference
+        max_abs = difference.abs().max().item()
+        mean_abs = difference.abs().mean().item()
+        relative_l2 = (difference.norm() / reference.norm().clamp_min(torch.finfo(torch.float32).eps)).item()
+        cosine = F.cosine_similarity(reference.flatten(), candidate.flatten(), dim=0).item()
+        relative_l2_jump = relative_l2 - previous_relative_l2
+        if relative_l2_jump > largest_relative_l2_jump[0]:
+            largest_relative_l2_jump = (relative_l2_jump, layer_index)
+        if first_divergent_layer is None and (relative_l2 > 1e-2 or cosine < 0.999):
+            first_divergent_layer = layer_index
+        previous_relative_l2 = relative_l2
+        print(
+            "[Layer parity] "
+            f"layer={layer_index} max_abs={max_abs:.6e} mean_abs={mean_abs:.6e} "
+            f"relative_l2={relative_l2:.6e} cosine={cosine:.8f}",
+            flush=True,
+        )
+
+    print(
+        "[Layer parity] summary "
+        f"first_divergent_layer={first_divergent_layer} "
+        f"largest_relative_l2_jump_layer={largest_relative_l2_jump[1]} "
+        f"largest_relative_l2_jump={largest_relative_l2_jump[0]:.6e}",
+        flush=True,
+    )
 
 
 def _get_logits_pp(trainer, input_ids, device) -> torch.Tensor:
@@ -1675,14 +1801,28 @@ def _source_load_artifact_paths(cfg) -> tuple[Path, Path]:
     return artifact_dir / "source_load_reference_logits.pt", artifact_dir / "source_load_reference_metadata.json"
 
 
-def _wait_for_source_load_artifacts(reference_path: Path, metadata_path: Path, fail_path: Path) -> None:
+def _source_load_layer_probe_path(cfg) -> Path:
+    """Return the persisted vanilla-HF decoder-layer probe path."""
+    return _robustness_artifact_dir(cfg) / "source_load_reference_layers.pt"
+
+
+def _wait_for_source_load_artifacts(
+    reference_path: Path,
+    metadata_path: Path,
+    fail_path: Path,
+    layer_probe_path: Path | None = None,
+) -> None:
     """Wait for rank 0 to publish the isolated Phase 0 reference artifacts."""
     timeout_s = int(os.environ.get("SOURCE_LOAD_PARITY_TIMEOUT_SECONDS", "1800"))
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         if fail_path.exists():
             raise RuntimeError(f"Rank 0 source-load artifact publication failed:\n{fail_path.read_text()}")
-        if reference_path.exists() and metadata_path.exists():
+        if (
+            reference_path.exists()
+            and metadata_path.exists()
+            and (layer_probe_path is None or layer_probe_path.exists())
+        ):
             return
         time.sleep(5)
     raise TimeoutError(f"Timed out waiting {timeout_s}s for rank 0 source-load artifact publication")
@@ -1756,6 +1896,8 @@ def _run_process_isolated_checkpoint_phase(
             raise ValueError("Isolated source_load_reference requires check_source_load_parity=true")
 
         reference_path, metadata_path = _source_load_artifact_paths(cfg)
+        layer_parity = os.environ.get("CHECKPOINT_ROBUSTNESS_LAYER_PARITY", "false") == "true"
+        layer_probe_path = _source_load_layer_probe_path(cfg) if layer_parity else None
         source_load_fail_path = _source_load_sync_paths(cfg)[2] if _preinit_world_size() > 1 else None
         if _preinit_global_rank() == 0:
             for path in (
@@ -1763,12 +1905,16 @@ def _run_process_isolated_checkpoint_phase(
                 reference_path.with_suffix(".tmp"),
                 metadata_path,
                 metadata_path.with_suffix(".tmp"),
+                layer_probe_path,
+                layer_probe_path.with_suffix(".tmp") if layer_probe_path is not None else None,
             ):
-                path.unlink(missing_ok=True)
+                if path is not None:
+                    path.unlink(missing_ok=True)
 
         _report_phase("Isolated Phase 0a source load: loading prompt input IDs")
         input_ids = _load_input_ids_once(cfg, input_ids_loader, tokenizer_name)
         _report_phase("Isolated Phase 0a source load: starting vanilla-HF reference load")
+        reference_layer_probes: dict[int, torch.Tensor] | None = {} if layer_parity else None
         source_load_reference = _prepare_source_load_reference(
             cfg,
             input_ids,
@@ -1777,6 +1923,7 @@ def _run_process_isolated_checkpoint_phase(
             experts_implementation=custom_args.get("experts_implementation", None),
             hf_device_map_auto=bool(custom_args.get("hf_device_map_auto", False)),
             hf_source_post_load_dequantize=bool(custom_args.get("hf_source_post_load_dequantize", False)),
+            layer_probes=reference_layer_probes,
         )
         if _preinit_global_rank() == 0:
             assert source_load_reference is not None, "rank 0 source-load reference was not captured"
@@ -1797,13 +1944,23 @@ def _run_process_isolated_checkpoint_phase(
                     )
                 )
                 temporary_metadata_path.replace(metadata_path)
+                if layer_probe_path is not None:
+                    assert reference_layer_probes, "vanilla-HF layer probe captured no decoder outputs"
+                    temporary_layer_probe_path = layer_probe_path.with_suffix(".tmp")
+                    torch.save(reference_layer_probes, temporary_layer_probe_path)
+                    temporary_layer_probe_path.replace(layer_probe_path)
             except Exception:
                 if source_load_fail_path is not None:
                     source_load_fail_path.write_text(traceback.format_exc())
                 raise
         else:
             assert source_load_fail_path is not None
-            _wait_for_source_load_artifacts(reference_path, metadata_path, source_load_fail_path)
+            _wait_for_source_load_artifacts(
+                reference_path,
+                metadata_path,
+                source_load_fail_path,
+                layer_probe_path,
+            )
         _report_phase("Isolated Phase 0a source load: reference persisted; exiting phase")
         return
 
@@ -1814,8 +1971,12 @@ def _run_process_isolated_checkpoint_phase(
         _report_phase("Isolated Phase 0b source parity: loading prompt input IDs")
         input_ids = _load_input_ids_once(cfg, input_ids_loader, tokenizer_name)
         reference_path, metadata_path = _source_load_artifact_paths(cfg)
+        layer_parity = os.environ.get("CHECKPOINT_ROBUSTNESS_LAYER_PARITY", "false") == "true"
+        layer_probe_path = _source_load_layer_probe_path(cfg) if layer_parity else None
         assert reference_path.exists(), f"Source-load reference logits not found at {reference_path}"
         assert metadata_path.exists(), f"Source-load reference metadata not found at {metadata_path}"
+        if layer_probe_path is not None:
+            assert layer_probe_path.exists(), f"Source-load reference layer probes not found at {layer_probe_path}"
 
         source_trainer = recipe_cls(cfg)
         source_trainer.setup()
@@ -1836,12 +1997,23 @@ def _run_process_isolated_checkpoint_phase(
                     f"[Router-order A/B] mode=after_down updated_configs={updated_configs}",
                     flush=True,
                 )
-        trainer_source_logits = _get_logits(
-            source_trainer.model_parts[0],
-            input_ids,
-            device,
-            trainer=source_trainer,
-        )
+        candidate_layer_probes = None
+        if layer_parity:
+            with _capture_decoder_layer_probes(source_trainer.model_parts, len(input_ids)) as local_layer_probes:
+                trainer_source_logits = _get_logits(
+                    source_trainer.model_parts[0],
+                    input_ids,
+                    device,
+                    trainer=source_trainer,
+                )
+            candidate_layer_probes = _gather_pp_layer_probes(source_trainer, local_layer_probes)
+        else:
+            trainer_source_logits = _get_logits(
+                source_trainer.model_parts[0],
+                input_ids,
+                device,
+                trainer=source_trainer,
+            )
         trainer_source_logits_before_down = None
         if router_order_ab:
             updated_configs = _set_router_weight_after_down(source_trainer.model_parts, False)
@@ -1865,6 +2037,10 @@ def _run_process_isolated_checkpoint_phase(
                 metadata["hf_aliased"],
                 metadata["explicit_tie_word_embeddings"],
             )
+            if layer_probe_path is not None:
+                assert candidate_layer_probes is not None
+                reference_layer_probes = torch.load(layer_probe_path, map_location="cpu", weights_only=True)
+                _report_decoder_layer_parity(reference_layer_probes, candidate_layer_probes)
         candidate_aliased = _lm_head_embedding_aliased(source_trainer.model_parts[0])
         if router_order_ab:
             assert trainer_source_logits_before_down is not None
@@ -1886,6 +2062,15 @@ def _run_process_isolated_checkpoint_phase(
                 if failure is not None:
                     source_load_failures.append(f"{label}:\n{failure}")
             source_load_failure = "\n".join(source_load_failures) or None
+        elif layer_parity:
+            source_load_failure = _compare_source_load_parity(
+                source_load_reference,
+                trainer_source_logits,
+                candidate_aliased,
+                source_load_kl_threshold=float("inf"),
+                source_load_mean_kl_threshold=float("inf"),
+                source_load_cosine_threshold=-1.0,
+            )
         else:
             source_load_failure = _compare_source_load_parity(
                 source_load_reference,
