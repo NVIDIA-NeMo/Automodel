@@ -16,14 +16,14 @@ Under the hood, NeMo AutoModel uses [flow matching](https://arxiv.org/abs/2210.0
 │ 1. Install   │--->│ 2. Prepare   │--->│ 3. Configure │--->│  4. Train    │--->│ 5. Generate  │
 │              │    │    Data      │    │              │    │              │    │              │
 │ uv sync      │    │ Encode to    │    │ YAML recipe  │    │ torchrun     │    │ Run inference│
-│ or Docker    │    │ .meta files  │    │              │    │              │    │ with ckpt    │
+│ or Docker    │    │ cache files  │    │              │    │              │    │ with ckpt    │
 └──────────────┘    └──────────────┘    └──────────────┘    └──────────────┘    └──────────────┘
 ```
 
 | Step | Section | What You Do |
 |------|---------|-------------|
 | **1. Install** | [Install NeMo AutoModel](#install-nemo-automodel) | Install the package with uv or Docker |
-| **2. Prepare Data** | [Prepare Your Dataset](#prepare-your-dataset) | Encode raw images/videos into `.meta` latent files |
+| **2. Prepare Data** | [Prepare Your Dataset](#prepare-your-dataset) | Encode raw images/videos into latent cache files |
 | **3. Configure** | [Configure Your Training Recipe](#configure-your-training-recipe) | Write a YAML config specifying model, data, and training settings |
 | **4. Train** | [Fine-Tune the Model](#fine-tune-the-model) | Launch training with `torchrun` on a single node |
 | **4b. Multi-Node** | [Multi-Node Training](#multi-node-training) | Scale training across multiple nodes |
@@ -39,6 +39,7 @@ For model-specific configuration (FLUX.1-dev, HunyuanVideo), see [Model-Specific
 | Wan 2.2 T2V-A14B (two-stage) | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | Text-to-Video | 14B + 14B | [wan2_2_t2v_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/wan2_2_t2v_flow.yaml) |
 | FLUX.1-dev | `black-forest-labs/FLUX.1-dev` | Text-to-Image | 12B | [flux_t2i_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/flux_t2i_flow.yaml) |
 | HunyuanVideo 1.5 | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v` | Text-to-Video | — | [hunyuan_t2v_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/hunyuan_t2v_flow.yaml) |
+| LTX-2.3 | `diffusers/LTX-2.3-Diffusers` | Text-to-Video with Audio | — | [ltx2_3_t2v_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/ltx2_3_t2v_flow.yaml) |
 
 All models use FSDP2 for distributed training and flow matching for loss computation.
 
@@ -78,13 +79,13 @@ For the full set of installation methods, see the [installation guide](/get-star
 ## Prepare Your Dataset
 
 Diffusion models operate in latent space — a compressed representation of visual data — rather than directly on raw images or videos. To avoid re-encoding data on every training step, the preprocessing
-  pipeline encodes all inputs ahead of time and saves them as .meta files.
+  pipeline encodes all inputs ahead of time and saves them as `.meta` or `.pt` cache files.
 
- Each .meta file contains:
+ Each cache file contains:
  - Latent representations produced by a VAE (Variational Autoencoder) from the raw visual data
  - Text embeddings produced by a text encoder from the associated captions/prompts
 
-Fine-tuning then operates entirely on these pre-encoded .meta files, which is significantly faster than encoding on the fly.
+Fine-tuning then operates entirely on these pre-encoded cache files, which is significantly faster than encoding on the fly.
 
 Preprocess your data using the built-in tool at [`tools/diffusion/preprocessing_multiprocess.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/tools/diffusion/preprocessing_multiprocess.py). The script provides `image` and `video` subcommands:
 
@@ -115,6 +116,20 @@ python -m tools.diffusion.preprocessing_multiprocess video \
     --target_frames 121 \
     --caption_format meta_json
 ```
+
+**Video and audio preprocessing (LTX-2.3):**
+```bash
+python -m tools.diffusion.preprocessing_multiprocess video \
+    --video_dir /data/videos \
+    --output_dir /cache \
+    --processor ltx2 \
+    --num_frames 121 \
+    --output_format pt \
+    --resolution_preset 512p \
+    --caption_format sidecar
+```
+
+LTX-2.3 requires an explicit `8n+1` frame count and uses each source video's audio track. If a clip has no audio stream, preprocessing stores silence of the matching duration.
 
 For the full set of arguments and input format details, see the [Diffusion Dataset Preparation](/datasets/diffusion-dataset) guide.
 
@@ -222,9 +237,9 @@ checkpoint:
 |---------|-----------|----------------|
 | `model` | Yes | Set `pretrained_model_name_or_path` to the Hugging Face model ID. Set `mode: finetune`. |
 | `step_scheduler` | Yes | `global_batch_size` is the effective batch size across all GPUs. `ckpt_every_steps` controls checkpoint frequency. |
-| `data` | Yes | Set `cache_dir` to the path containing your preprocessed `.meta` files. Change `model_type` and `_target_` for different models (see [Model-Specific Notes](#model-specific-notes)). |
+| `data` | Yes | Set `cache_dir` to the path containing your preprocessed cache files. Change `model_type` and `_target_` for different models (see [Model-Specific Notes](#model-specific-notes)). |
 | `optimizer` | Yes | `_target_` selects the optimizer class; `lr: 5e-6` is a good default for fine-tuning. |
-| `flow_matching` | Yes | `adapter_type` must match the model (`simple` for Wan, `flux` for FLUX, `hunyuan` for HunyuanVideo). |
+| `flow_matching` | Yes | `adapter_type` must match the model (`simple` for Wan, `flux` for FLUX, `hunyuan` for HunyuanVideo, or `ltx2` for LTX-2.3). |
 | `fsdp` | Yes | Set `dp_size` to the number of GPUs on your node. |
 | `checkpoint` | Recommended | Set `checkpoint_dir` to a persistent path, especially in Docker. |
 | `wandb` | Optional | Configure to enable Weights & Biases logging. |
@@ -290,6 +305,7 @@ Use the table below to pick the right model for your use case:
 | **Video generation on limited hardware** | [Wan 2.1 T2V 1.3B](#wan-21-t2v-13b) | Smallest model (1.3B params) — fast iteration, fits on a single A100 40GB |
 | **High-quality image generation** | [FLUX.1-dev](#flux1-dev-text-to-image) | State-of-the-art text-to-image with 12B params and guidance-based control |
 | **High-quality video generation** | [HunyuanVideo 1.5](#hunyuanvideo-15) | Larger video model with condition-latent support for richer motion and detail |
+| **Synchronized video and audio generation** | [LTX-2.3](#ltx-23) | Jointly denoises video and audio latents with a dual-stream transformer |
 
 ### Wan 2.1 T2V 1.3B
 
@@ -338,6 +354,14 @@ Use the table below to pick the right model for your use case:
   - Uses `logit_normal` timestep sampling
 - **Config**: [hunyuan_t2v_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/hunyuan_t2v_flow.yaml)
 
+### LTX-2.3
+
+- **Adapter type**: `ltx2`
+- **Dataloader**: `build_video_multiresolution_dataloader` with `model_type: ltx2`
+- **Preprocessing**: use `--processor ltx2`, an explicit `8n+1` frame count, and `--output_format pt`
+- **Loss**: applies a shared noise level to synchronized video and audio latents and adds the weighted audio loss
+- **Configs**: [full fine-tuning](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/ltx2_3_t2v_flow.yaml) and [LoRA](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/ltx2_3_t2v_flow_lora.yaml)
+
 ## Generation / Inference
 
 Once training is complete, you can use the model to generate images or videos from text prompts. This step is called inference — as opposed to training, where the model learns from data, inference is where it produces new outputs.
@@ -384,6 +408,12 @@ python examples/diffusion/generate/generate.py \
   -c examples/diffusion/generate/configs/generate_hunyuan.yaml
 ```
 
+**LTX-2.3 video with audio:**
+```bash
+python examples/diffusion/generate/generate.py \
+  -c examples/diffusion/generate/configs/generate_ltx2.yaml
+```
+
 ### Available Generation Configs
 
 | Config | Model | Output | GPUs |
@@ -391,6 +421,7 @@ python examples/diffusion/generate/generate.py \
 | [`generate_wan.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/generate/configs/generate_wan.yaml) | Wan 2.1 1.3B | Video | 1 |
 | [`generate_flux.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/generate/configs/generate_flux.yaml) | FLUX.1-dev | Image | 1 |
 | [`generate_hunyuan.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/generate/configs/generate_hunyuan.yaml) | HunyuanVideo | Video | 1 |
+| [`generate_ltx2.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/generate/configs/generate_ltx2.yaml) | LTX-2.3 | Video with audio | 1 |
 
 <Note>
 You can use `--model.checkpoint ./checkpoints/LATEST` to automatically load the most recent checkpoint.
