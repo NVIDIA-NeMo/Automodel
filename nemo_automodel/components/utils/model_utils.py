@@ -17,6 +17,7 @@ import logging
 import os
 from contextlib import contextmanager
 from functools import lru_cache
+from typing import Any, Callable
 
 from nemo_automodel.shared.import_utils import safe_import
 
@@ -32,10 +33,10 @@ logger = logging.getLogger(__name__)
 
 
 @lru_cache(maxsize=None)
-def _get_type_forward_signature(model_type: type[nn.Module]) -> inspect.Signature | None:
-    """Best-effort retrieval of a module type's unbound ``forward`` signature."""
+def _get_cached_forward_signature(forward_callable: Callable[..., Any]) -> inspect.Signature | None:
+    """Best-effort retrieval cached by the underlying ``forward`` callable."""
     try:
-        signature = inspect.signature(model_type.forward)
+        signature = inspect.signature(forward_callable)
     except (ValueError, TypeError):
         return None
 
@@ -46,15 +47,20 @@ def _get_type_forward_signature(model_type: type[nn.Module]) -> inspect.Signatur
 
 
 def _get_forward_signature(model: nn.Module) -> inspect.Signature | None:
-    """Retrieve ``model.forward`` once per type, preserving instance overrides."""
-    if not callable(getattr(model, "forward", None)):
+    """Retrieve ``model.forward`` once per callable, preserving live patches."""
+    forward = getattr(model, "forward", None)
+    if not callable(forward):
         return None
-    if "forward" not in vars(model):
-        return _get_type_forward_signature(type(model))
+    forward_callable = getattr(forward, "__func__", forward)
     try:
-        return inspect.signature(model.forward)
-    except (ValueError, TypeError):
-        return None
+        return _get_cached_forward_signature(forward_callable)
+    except TypeError:
+        # Callable instances can opt out of hashing; inspect those without
+        # retaining the owning module in the cache.
+        try:
+            return inspect.signature(forward)
+        except (ValueError, TypeError):
+            return None
 
 
 def _supports_logits_to_keep(model: nn.Module) -> bool:

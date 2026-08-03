@@ -176,11 +176,13 @@ def _apply_bias(value, bias, tokens_per_expert, permuted_probs=None):
     if not isinstance(bias, torch.Tensor):
         bias = torch.stack(tuple(bias))
 
+    shape = value.shape
+    flat_value = value.reshape(-1, shape[-1])
     token_counts = torch.as_tensor(tokens_per_expert, device=bias.device, dtype=torch.long)
-    expanded_bias = torch.repeat_interleave(bias, token_counts, dim=0, output_size=value.shape[0])
+    expanded_bias = torch.repeat_interleave(bias, token_counts, dim=0, output_size=flat_value.shape[0])
     if permuted_probs is not None:
         expanded_bias = expanded_bias * permuted_probs
-    return (value + expanded_bias).to(value.dtype)
+    return (flat_value + expanded_bias).view(shape).to(value.dtype)
 
 
 class GroupedExperts(nn.Module):

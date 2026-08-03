@@ -34,7 +34,7 @@ Expected batch keys (produced by ``tools/diffusion/processors/ltx2.py``):
 import inspect
 import logging
 from functools import lru_cache
-from typing import Any, Dict, Mapping
+from typing import Any, Callable, Dict, Mapping
 
 import torch
 import torch.nn as nn
@@ -54,10 +54,10 @@ _MISSING_KEY_HINT = (
 
 
 @lru_cache(maxsize=None)
-def _get_forward_parameters(model_type: type[nn.Module]) -> Mapping[str, inspect.Parameter] | None:
-    """Cache the parameter mapping for a model type's ``forward`` method."""
+def _get_forward_parameters(forward_callable: Callable[..., Any]) -> Mapping[str, inspect.Parameter] | None:
+    """Cache parameters by the underlying ``forward`` callable."""
     try:
-        return inspect.signature(model_type.forward).parameters
+        return inspect.signature(forward_callable).parameters
     except (TypeError, ValueError):
         return None
 
@@ -260,13 +260,17 @@ class LTX2Adapter(ModelAdapter):
         """
         model_kwargs = {k: v for k, v in inputs.items() if not k.startswith("_")}
         unwrapped = getattr(model, "module", model)
-        if "forward" in vars(unwrapped):
+        forward = getattr(unwrapped, "forward", None)
+        if not callable(forward):
+            return model_kwargs
+        forward_callable = getattr(forward, "__func__", forward)
+        try:
+            parameters = _get_forward_parameters(forward_callable)
+        except TypeError:
             try:
-                parameters = inspect.signature(unwrapped.forward).parameters
+                parameters = inspect.signature(forward).parameters
             except (TypeError, ValueError):
                 return model_kwargs
-        else:
-            parameters = _get_forward_parameters(type(unwrapped))
         if parameters is None:
             return model_kwargs
         if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values()):

@@ -234,7 +234,7 @@ class TestForwardAndAuxLoss:
         video_pred = adapter.forward(NoSigmaModel(), inputs)
         assert video_pred.shape == (B, C_VID, F, H, W)
 
-    def test_kwargs_filter_caches_signature_by_model_type(self, monkeypatch):
+    def test_kwargs_filter_caches_signature_by_forward_callable(self, monkeypatch):
         class NoSigmaModel(nn.Module):
             def forward(self, hidden_states, audio_hidden_states):
                 return hidden_states, audio_hidden_states
@@ -258,6 +258,13 @@ class TestForwardAndAuxLoss:
             ltx2_module._get_forward_parameters.cache_clear()
 
         assert calls == 1
+
+        def replacement_forward(self, hidden_states, sigma):
+            return hidden_states, sigma
+
+        NoSigmaModel.forward = replacement_forward
+        filtered = adapter._filter_model_kwargs(NoSigmaModel(), inputs)
+        assert set(filtered) == {"hidden_states", "sigma"}
 
 
 class TestPipelineIntegration:

@@ -811,15 +811,16 @@ class TestGroupedExpertsDeepEP:
         assert permuted_probs.grad is not None
 
     def test_grouped_experts_deepep_apply_bias_with_empty_experts(self, moe_config):
-        """Zero-token experts must preserve the grouped token order."""
+        """Zero-token experts and higher-rank outputs preserve grouped order."""
         _ = GroupedExpertsDeepEP(moe_config)
 
-        value = torch.randn(4, 8)
+        value = torch.randn(2, 2, 8)
         bias = torch.randn(4, 8)
         tokens_per_expert = torch.tensor([2, 0, 2, 0])
 
         result = _apply_bias(value, bias=bias, tokens_per_expert=tokens_per_expert)
-        expected = torch.cat([value[:2] + bias[0], value[2:] + bias[2]])
+        flat_value = value.view(-1, value.shape[-1])
+        expected = torch.cat([flat_value[:2] + bias[0], flat_value[2:] + bias[2]]).view_as(value)
 
         torch.testing.assert_close(result, expected)
 

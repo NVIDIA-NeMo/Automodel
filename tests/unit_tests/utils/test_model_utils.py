@@ -467,12 +467,12 @@ class TestFilterForwardKwargs:
 
         assert filtered == batch
 
-    def test_caches_signature_by_model_type(self, monkeypatch):
+    def test_caches_signature_by_forward_callable(self, monkeypatch):
         class Model(nn.Module):
             def forward(self, input_ids):
                 return input_ids
 
-        model_utils._get_type_forward_signature.cache_clear()
+        model_utils._get_cached_forward_signature.cache_clear()
         signature = model_utils.inspect.signature
         calls = 0
 
@@ -486,9 +486,23 @@ class TestFilterForwardKwargs:
             model_utils.filter_forward_kwargs(Model(), {"input_ids": torch.ones(1)})
             model_utils.filter_forward_kwargs(Model(), {"input_ids": torch.ones(1)})
         finally:
-            model_utils._get_type_forward_signature.cache_clear()
+            model_utils._get_cached_forward_signature.cache_clear()
 
         assert calls == 1
+
+    def test_class_forward_patch_invalidates_cached_signature(self):
+        class Model(nn.Module):
+            def forward(self, input_ids):
+                return input_ids
+
+        model = Model()
+        assert set(model_utils.filter_forward_kwargs(model, {"input_ids": 1, "pixel_values": 2})) == {"input_ids"}
+
+        def replacement_forward(self, pixel_values):
+            return pixel_values
+
+        Model.forward = replacement_forward
+        assert set(model_utils.filter_forward_kwargs(model, {"input_ids": 1, "pixel_values": 2})) == {"pixel_values"}
 
 
 class TestSqueezeInputForThd:
