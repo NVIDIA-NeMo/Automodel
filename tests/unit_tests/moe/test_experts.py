@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import importlib.util
+import json
 from unittest.mock import Mock, patch
 
 import pytest
@@ -30,6 +31,7 @@ from nemo_automodel.components.moe.experts import (
     _apply_bias,
     _permute_tokens_for_grouped_mm,
     _torch_mm_experts_fwd,
+    _try_apply_ragged_activation,
     get_expert_activation_for_deepep,
     is_gated_activation,
     swiglu_clamped_deepep,
@@ -2366,6 +2368,88 @@ class TestTorchMMExpertsFwd:
             (compact_hidden.grad, compact_gate_up.grad, compact_down.grad, compact_probs.grad),
         ):
             torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA and Kineto required")
+    def test_ragged_activations_trace_has_no_host_sync(self, device, moe_config, tmp_path):
+        """Dynamic activations must not scalarize device offsets or synchronize the host."""
+        activation_cases = (
+            ("swiglu", 0.0, 7.0),
+            ("swiglu", 0.5, 7.0),
+            ("swigluoai", 0.0, 0.5),
+            ("quick_geglu", 0.0, 0.5),
+            ("geglu", 0.0, 7.0),
+            ("relu2", 0.0, 7.0),
+        )
+        inter_dim = 64
+        valid_tokens = 5
+        capacity = 16
+        tokens_per_expert = torch.tensor([2, 3], device=device)
+        workloads = []
+
+        for activation_name, swiglu_limit, activation_limit in activation_cases:
+            moe_config.expert_activation = activation_name
+            moe_config.swiglu_limit = swiglu_limit
+            moe_config.activation_limit = activation_limit
+            activation_fn = get_expert_activation_for_deepep(moe_config)
+            projection_dim = inter_dim * 2 if is_gated_activation(activation_name) else inter_dim
+            value = torch.randn(capacity, projection_dim, dtype=torch.bfloat16, device=device).requires_grad_()
+            probs = torch.rand(capacity, 1, dtype=torch.float32, device=device).requires_grad_()
+            workloads.append((value, probs, activation_fn))
+
+        def run_workload(workload):
+            value, probs, activation_fn = workload
+            value.grad = None
+            probs.grad = None
+            expert_offsets = tokens_per_expert.cumsum(dim=0).to(torch.int32)
+            output = _try_apply_ragged_activation(
+                value,
+                probs,
+                expert_offsets,
+                activation_fn,
+            )
+            assert output is not None
+            output[:valid_tokens].float().square().mean().backward()
+
+        for workload in workloads:
+            run_workload(workload)
+        torch.cuda.synchronize()
+
+        region_name = "dynamic_ragged_expert_activations"
+        with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
+        ) as profile:
+            with torch.profiler.record_function(region_name):
+                for workload in workloads:
+                    run_workload(workload)
+
+        trace_path = tmp_path / "dynamic_ragged_expert_activations.json"
+        profile.export_chrome_trace(str(trace_path))
+        events = json.loads(trace_path.read_text())["traceEvents"]
+        regions = [
+            event
+            for event in events
+            if event.get("name") == region_name and event.get("ph") == "X" and event.get("cat") == "user_annotation"
+        ]
+        assert len(regions) == 1
+        region_start = regions[0]["ts"]
+        region_end = region_start + regions[0]["dur"]
+        forbidden_markers = (
+            "aten::item",
+            "aten::_local_scalar_dense",
+            "cudaStreamSynchronize",
+            "cudaDeviceSynchronize",
+            "cudaEventSynchronize",
+            "cudaCtxSynchronize",
+        )
+        offenders = sorted(
+            {
+                event["name"]
+                for event in events
+                if region_start <= event.get("ts", -1) < region_end
+                and any(marker in event.get("name", "") for marker in forbidden_markers)
+            }
+        )
+        assert not offenders, f"host synchronization found in dynamic activation trace: {offenders}"
 
 
 class TestGroupedExpertsConvergenceFixes:

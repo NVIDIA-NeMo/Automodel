@@ -736,6 +736,28 @@ def _get_ragged_activation_options(activation_fn: Callable) -> tuple[int, dict[s
     return None
 
 
+def _try_apply_ragged_activation(
+    value: torch.Tensor,
+    probabilities: torch.Tensor,
+    expert_offsets: torch.Tensor,
+    activation_fn: Callable,
+) -> torch.Tensor | None:
+    """Apply a supported device-offset activation, or return None for the generic fallback."""
+    ragged_options = _get_ragged_activation_options(activation_fn)
+    if ragged_options is None:
+        return None
+    activation_kind, activation_kwargs = ragged_options
+    if not _can_use_ragged_weighted_activation(value, probabilities, expert_offsets, activation_kind):
+        return None
+    return _ragged_weighted_activation(
+        value,
+        probabilities,
+        expert_offsets,
+        activation_kind,
+        **activation_kwargs,
+    )
+
+
 class GroupedExpertsDeepEP(nn.Module):
     """
     Sparse MoE implementation using grouped GEMM with DeepEP token dispatch.
@@ -865,17 +887,10 @@ class GroupedExpertsDeepEP(nn.Module):
             Tensor of shape [capacity, intermediate]. Rows after the final device
             offset are unspecified and ignored by grouped GEMM.
         """
-        ragged_options = _get_ragged_activation_options(self.expert_activation)
-        if self.dispatcher_capacity_factor == "dynamic" and ragged_options is not None:
-            activation_kind, activation_kwargs = ragged_options
-            if _can_use_ragged_weighted_activation(value, probabilities, expert_offsets, activation_kind):
-                return _ragged_weighted_activation(
-                    value,
-                    probabilities,
-                    expert_offsets,
-                    activation_kind,
-                    **activation_kwargs,
-                )
+        if self.dispatcher_capacity_factor == "dynamic":
+            output = _try_apply_ragged_activation(value, probabilities, expert_offsets, self.expert_activation)
+            if output is not None:
+                return output
         return self.expert_activation(value, probabilities)
 
     def forward(
@@ -1051,21 +1066,13 @@ def _torch_mm_experts_fwd(
     offs = tokens_per_expert.cumsum(dim=0).to(torch.int32)
     grouped_mm = select_grouped_mm(use_mxfp8)
     output1 = grouped_mm(hidden_states, gate_and_up_projs, offs)
-    ragged_options = _get_ragged_activation_options(activation_fn) if use_ragged_activation else None
-    if ragged_options is not None:
-        activation_kind, activation_kwargs = ragged_options
-        if _can_use_ragged_weighted_activation(output1, permuted_probs, offs, activation_kind):
-            output1 = _ragged_weighted_activation(
-                output1,
-                permuted_probs,
-                offs,
-                activation_kind,
-                **activation_kwargs,
-            )
-        else:
-            output1 = activation_fn(output1, permuted_probs)
-    else:
+    ragged_output = (
+        _try_apply_ragged_activation(output1, permuted_probs, offs, activation_fn) if use_ragged_activation else None
+    )
+    if ragged_output is None:
         output1 = activation_fn(output1, permuted_probs)
+    else:
+        output1 = ragged_output
     output2 = grouped_mm(output1, down_projs, offs)
     return output2
 
