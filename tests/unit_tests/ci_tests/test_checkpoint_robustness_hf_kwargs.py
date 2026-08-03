@@ -46,6 +46,7 @@ from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm
     _post_load_dequant_max_memory,
     _raise_distributed_failure,
     _record_deferred_failure,
+    _report_decoder_component_parity,
     _report_decoder_layer_parity,
     _resolve_hf_model_class,
     _run_process_isolated_checkpoint_phase,
@@ -86,12 +87,18 @@ def test_capture_decoder_layer_probes_records_real_prompt_tokens():
             return self.model(hidden_states)
 
     model = Model()
-    with _capture_decoder_layer_probes([model], prompt_length=2) as probes:
+    component_probes = {}
+    with _capture_decoder_layer_probes(
+        [model],
+        prompt_length=2,
+        layer_component_probes=component_probes,
+    ) as probes:
         model(torch.randn(1, 4, 3))
 
     assert sorted(probes) == [0, 1]
     assert probes[0].shape == (2, 3)
     assert probes[1].shape == (2, 3)
+    assert component_probes == {}
 
 
 def test_report_decoder_layer_parity_identifies_first_large_mismatch(capsys):
@@ -104,6 +111,56 @@ def test_report_decoder_layer_parity_identifies_first_large_mismatch(capsys):
     assert "layer=0" in output
     assert "layer=1" in output
     assert "first_divergent_layer=1" in output
+    assert "hf_max_abs=1.000000e+00" in output
+    assert "automodel_max_abs=2.000000e+00" in output
+
+
+def test_capture_and_report_decoder_layer_2_components(capsys):
+    class Layer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.input_layernorm = torch.nn.Identity()
+            self.self_attn = torch.nn.Linear(3, 3, bias=False)
+            self.post_attention_layernorm = torch.nn.Identity()
+            self.mlp = torch.nn.Linear(3, 3, bias=False)
+
+        def forward(self, hidden_states):
+            hidden_states = hidden_states + self.self_attn(self.input_layernorm(hidden_states))
+            return hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
+
+    class Decoder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = torch.nn.ModuleDict({"2": Layer()})
+
+        def forward(self, hidden_states):
+            return self.layers["2"](hidden_states)
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = Decoder()
+
+        def forward(self, hidden_states):
+            return self.model(hidden_states)
+
+    model = Model()
+    component_probes = {}
+    with _capture_decoder_layer_probes(
+        [model],
+        prompt_length=2,
+        layer_component_probes=component_probes,
+    ):
+        model(torch.randn(1, 4, 3))
+
+    assert set(component_probes) == {"input_layernorm", "self_attn", "post_attention_layernorm", "mlp"}
+    assert all(probe.shape == (2, 3) for probe in component_probes.values())
+    _report_decoder_component_parity(component_probes, component_probes)
+    output = capsys.readouterr().out
+    assert "component=input_layernorm" in output
+    assert "component=self_attn" in output
+    assert "component=post_attention_layernorm" in output
+    assert "component=mlp" in output
 
 
 def test_resolve_hf_model_class_uses_advertised_causal_lm_for_vlm_checkpoint():
@@ -845,6 +902,7 @@ def test_process_isolated_source_load_reference_persists_hf_artifacts(tmp_path):
         hf_device_map_auto=True,
         hf_source_post_load_dequantize=False,
         layer_probes=None,
+        layer_component_probes=None,
     )
     persisted_logits = torch.load(
         tmp_path / ".checkpoint_robustness" / "source_load_reference_logits.pt",
@@ -863,9 +921,16 @@ def test_process_isolated_source_load_reference_persists_layer_probes(tmp_path, 
     cfg = SimpleNamespace(checkpoint=SimpleNamespace(checkpoint_dir=tmp_path))
     reference_logits = torch.randn(1, 2, 3)
     reference_layers = {0: torch.randn(2, 4), 1: torch.randn(2, 4)}
+    reference_components = {
+        "input_layernorm": torch.randn(2, 4),
+        "self_attn": torch.randn(2, 4),
+        "post_attention_layernorm": torch.randn(2, 4),
+        "mlp": torch.randn(2, 4),
+    }
 
     def prepare_reference(_cfg, _input_ids, **kwargs):
         kwargs["layer_probes"].update(reference_layers)
+        kwargs["layer_component_probes"].update(reference_components)
         return reference_logits, False, False
 
     with (
@@ -903,6 +968,14 @@ def test_process_isolated_source_load_reference_persists_layer_probes(tmp_path, 
     assert sorted(persisted_layers) == [0, 1]
     torch.testing.assert_close(persisted_layers[0], reference_layers[0])
     torch.testing.assert_close(persisted_layers[1], reference_layers[1])
+    persisted_components = torch.load(
+        tmp_path / ".checkpoint_robustness" / "source_load_reference_layer_2_components.pt",
+        map_location="cpu",
+        weights_only=True,
+    )
+    assert set(persisted_components) == set(reference_components)
+    for component_name in reference_components:
+        torch.testing.assert_close(persisted_components[component_name], reference_components[component_name])
 
 
 def test_wait_for_source_load_artifacts_waits_for_both_files(tmp_path):
