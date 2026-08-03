@@ -971,7 +971,7 @@ class BaseRecipe:
         """
         num_model_microbatches = num_batches
         if self.pp_enabled:
-            num_model_microbatches *= self.pp.info.schedule.n_microbatches
+            num_model_microbatches *= self.pp.pp_batch_size // self.pp.pp_microbatch_size
 
         scale = self._get_cp_group_size() / num_model_microbatches
         if self.pp_enabled and num_label_tokens > 0:

@@ -1267,7 +1267,11 @@ def test_moe_aux_gradient_matches_single_process_optimizer_step(
     num_microbatches = num_batches * pp_microbatches
     recipe = SimpleNamespace(
         pp_enabled=pp_enabled,
-        pp=SimpleNamespace(info=SimpleNamespace(schedule=SimpleNamespace(n_microbatches=pp_microbatches))),
+        pp=SimpleNamespace(
+            pp_batch_size=pp_microbatches,
+            pp_microbatch_size=1,
+            info=SimpleNamespace(schedule=SimpleNamespace(_n_microbatches=pp_microbatches)),
+        ),
         _get_cp_group_size=lambda: cp_size,
         _get_dp_group_size=lambda include_cp=False: dp_cp_size,
     )

@@ -2078,13 +2078,15 @@ class TestRunTrainOptimStepSetsMoEScale:
             pp_info = SimpleNamespace(
                 has_first_stage=True,
                 has_last_stage=True,
-                schedule=SimpleNamespace(n_microbatches=pp_microbatches),
+                schedule=SimpleNamespace(_n_microbatches=pp_microbatches),
             )
             object.__setattr__(
                 recipe,
                 "pp",
                 SimpleNamespace(
                     info=pp_info,
+                    pp_batch_size=pp_microbatches,
+                    pp_microbatch_size=1,
                     update_seq_len=lambda seq_len: None,
                 ),
             )
@@ -2117,7 +2119,7 @@ class TestRunTrainOptimStepSetsMoEScale:
         object.__setattr__(recipe, "timestamp", 0.0)
         return recipe
 
-    def test_pp_scale_includes_schedule_microbatches_and_token_normalization(self, monkeypatch):
+    def test_pp_scale_includes_pipeline_microbatches_and_token_normalization(self, monkeypatch):
         from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 
         recipe = self._make_recipe(

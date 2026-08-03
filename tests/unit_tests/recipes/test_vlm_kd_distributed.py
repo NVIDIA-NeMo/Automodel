@@ -108,9 +108,7 @@ def test_vlm_kd_train_step_uses_distributed_step_helpers(monkeypatch, pp_enabled
     optimizer = _Optimizer()
     recipe.model_parts = [model]
     recipe.pp_enabled = pp_enabled
-    recipe.pp = (
-        SimpleNamespace(info=SimpleNamespace(schedule=SimpleNamespace(n_microbatches=1))) if pp_enabled else None
-    )
+    recipe.pp = SimpleNamespace(pp_batch_size=1, pp_microbatch_size=1) if pp_enabled else None
     recipe.device_mesh = None
     recipe.moe_mesh = SimpleNamespace(mesh_dim_names=("ep",))
     recipe.optimizer = [optimizer]

@@ -542,7 +542,7 @@ def _build_pp_recipe_for_optim_step(num_label_tokens_in_batch: int):
     recipe.loss_fn = object()
     recipe.model_parts = [_TensorModel()]
     recipe.pp_enabled = True
-    recipe.pp = SimpleNamespace(info=SimpleNamespace(schedule=SimpleNamespace(n_microbatches=2)))
+    recipe.pp = SimpleNamespace(pp_batch_size=2, pp_microbatch_size=1)
     recipe.optimizer = [_DummyOptimizer()]
     recipe.step_scheduler = SimpleNamespace(step=0, epoch=0, is_remote_logging_step=False)
     recipe.checkpointer = SimpleNamespace(maybe_wait_for_staging=lambda: None)
