@@ -14,9 +14,12 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from nemo_automodel.components.models.llava_onevision.rice_vit import (
+    RiceAttention,
+    RiceSdpaAttention,
     RiceTransformer,
     _block_diagonal_attention_mask,
 )
@@ -70,3 +73,19 @@ def test_cls_insertion_and_removal_preserves_patch_order():
     torch.testing.assert_close(output, expected)
     output.sum().backward()
     assert pixel_values.grad is not None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for cross-device coverage")
+@pytest.mark.parametrize("attention_type", [RiceAttention, RiceSdpaAttention])
+def test_attention_accepts_cpu_offsets_with_cuda_inputs(attention_type):
+    attention = attention_type(dim=8, num_heads=2).cuda()
+    hidden_states = torch.randn(5, 8, device="cuda")
+    cu_seqlens = torch.tensor([0, 3, 5], dtype=torch.int32)
+    position_embeddings = (
+        torch.ones(5, 4, device="cuda"),
+        torch.zeros(5, 4, device="cuda"),
+    )
+
+    output = attention(hidden_states, cu_seqlens, position_embeddings)
+
+    assert output.shape == hidden_states.shape

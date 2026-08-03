@@ -50,6 +50,7 @@ def _block_diagonal_attention_mask(
     cu_seqlens: torch.Tensor,
     sequence_length: int,
     dtype: Optional[torch.dtype] = None,
+    device: Optional[torch.device] = None,
 ) -> torch.Tensor:
     """Build a block-diagonal mask without host-side segment iteration.
 
@@ -58,14 +59,17 @@ def _block_diagonal_attention_mask(
         sequence_length: Total number of packed tokens.
         dtype: When omitted, return a boolean visibility mask. Otherwise return
             an additive mask in this dtype with zero for visible positions.
+        device: Device on which to construct the mask. Defaults to the offsets'
+            device.
 
     Returns:
         Attention mask with shape [1, sequence_length, sequence_length]. Inputs
         are not mutated.
     """
-    segment_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+    mask_device = device if device is not None else cu_seqlens.device
+    segment_lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).to(mask_device)
     segment_ids = torch.repeat_interleave(
-        torch.arange(segment_lengths.numel(), device=cu_seqlens.device),
+        torch.arange(segment_lengths.numel(), device=mask_device),
         segment_lengths,
         output_size=sequence_length,
     )
@@ -75,7 +79,7 @@ def _block_diagonal_attention_mask(
     additive_mask = torch.full(
         (sequence_length, sequence_length),
         torch.finfo(dtype).min,
-        device=cu_seqlens.device,
+        device=mask_device,
         dtype=dtype,
     )
     return additive_mask.masked_fill(visible, 0).unsqueeze(0)
@@ -171,7 +175,7 @@ class RiceAttention(nn.Module):
         cos, sin = position_embeddings
         q, k = apply_rotary_pos_emb_vision(q, k, cos, sin)
 
-        attention_mask = _block_diagonal_attention_mask(cu_seqlens, seq_length, q.dtype)
+        attention_mask = _block_diagonal_attention_mask(cu_seqlens, seq_length, q.dtype, q.device)
 
         q = q.transpose(0, 1)
         k = k.transpose(0, 1)
@@ -234,7 +238,7 @@ class RiceSdpaAttention(nn.Module):
         cos, sin = position_embeddings
         q, k = apply_rotary_pos_emb_vision(q, k, cos, sin)
 
-        attention_mask = _block_diagonal_attention_mask(cu_seqlens, seq_length)
+        attention_mask = _block_diagonal_attention_mask(cu_seqlens, seq_length, device=q.device)
 
         q = q.transpose(0, 1).unsqueeze(0)
         k = k.transpose(0, 1).unsqueeze(0)
