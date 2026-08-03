@@ -37,8 +37,14 @@ from nemo_automodel.components.moe.megatron.moe_utils import (
     weighted_bias_swiglu_impl,
 )
 from nemo_automodel.components.moe.megatron.ragged_activation import (
-    _can_use_ragged_weighted_swiglu,
-    _ragged_weighted_swiglu,
+    RAGGED_GEGLU,
+    RAGGED_QUICK_GEGLU,
+    RAGGED_RELU2,
+    RAGGED_SWIGLU,
+    RAGGED_SWIGLU_CLAMPED,
+    RAGGED_SWIGLU_OAI,
+    _can_use_ragged_weighted_activation,
+    _ragged_weighted_activation,
 )
 from nemo_automodel.components.moe.megatron.token_dispatcher import MoEFlexTokenDispatcher, TokenDispatcherConfig
 from nemo_automodel.components.moe.mxfp8 import select_grouped_mm
@@ -701,6 +707,35 @@ def get_expert_activation_for_deepep(config: MoEConfig):
         raise ValueError(f"Invalid expert activation: {config.expert_activation}")
 
 
+def _get_ragged_activation_options(activation_fn: Callable) -> tuple[int, dict[str, float]] | None:
+    """Translate a configured expert activation into ragged-kernel arguments."""
+    if activation_fn is weighted_bias_swiglu_impl:
+        return RAGGED_SWIGLU, {}
+    if activation_fn is weighted_bias_geglu_impl:
+        return RAGGED_GEGLU, {}
+    if activation_fn is relu2_deepep:
+        return RAGGED_RELU2, {}
+    if not isinstance(activation_fn, partial):
+        return None
+
+    keywords = activation_fn.keywords or {}
+    if activation_fn.func is quick_geglu_deepep:
+        return RAGGED_QUICK_GEGLU, {
+            "alpha": keywords.get("alpha", 1.702),
+            "limit": keywords.get("limit", 7.0),
+            "linear_offset": keywords.get("linear_offset", 1.0),
+        }
+    if activation_fn.func is swiglu_oai_deepep:
+        return RAGGED_SWIGLU_OAI, {
+            "alpha": keywords.get("alpha", 1.702),
+            "limit": keywords.get("limit", 7.0),
+            "linear_offset": 1.0,
+        }
+    if activation_fn.func is swiglu_clamped_deepep:
+        return RAGGED_SWIGLU_CLAMPED, {"limit": keywords["limit"]}
+    return None
+
+
 class GroupedExpertsDeepEP(nn.Module):
     """
     Sparse MoE implementation using grouped GEMM with DeepEP token dispatch.
@@ -830,12 +865,17 @@ class GroupedExpertsDeepEP(nn.Module):
             Tensor of shape [capacity, intermediate]. Rows after the final device
             offset are unspecified and ignored by grouped GEMM.
         """
-        if (
-            self.dispatcher_capacity_factor == "dynamic"
-            and self.expert_activation is weighted_bias_swiglu_impl
-            and _can_use_ragged_weighted_swiglu(value, probabilities, expert_offsets)
-        ):
-            return _ragged_weighted_swiglu(value, probabilities, expert_offsets)
+        ragged_options = _get_ragged_activation_options(self.expert_activation)
+        if self.dispatcher_capacity_factor == "dynamic" and ragged_options is not None:
+            activation_kind, activation_kwargs = ragged_options
+            if _can_use_ragged_weighted_activation(value, probabilities, expert_offsets, activation_kind):
+                return _ragged_weighted_activation(
+                    value,
+                    probabilities,
+                    expert_offsets,
+                    activation_kind,
+                    **activation_kwargs,
+                )
         return self.expert_activation(value, probabilities)
 
     def forward(
@@ -1011,12 +1051,19 @@ def _torch_mm_experts_fwd(
     offs = tokens_per_expert.cumsum(dim=0).to(torch.int32)
     grouped_mm = select_grouped_mm(use_mxfp8)
     output1 = grouped_mm(hidden_states, gate_and_up_projs, offs)
-    if (
-        use_ragged_activation
-        and activation_fn is weighted_bias_swiglu_impl
-        and _can_use_ragged_weighted_swiglu(output1, permuted_probs, offs)
-    ):
-        output1 = _ragged_weighted_swiglu(output1, permuted_probs, offs)
+    ragged_options = _get_ragged_activation_options(activation_fn) if use_ragged_activation else None
+    if ragged_options is not None:
+        activation_kind, activation_kwargs = ragged_options
+        if _can_use_ragged_weighted_activation(output1, permuted_probs, offs, activation_kind):
+            output1 = _ragged_weighted_activation(
+                output1,
+                permuted_probs,
+                offs,
+                activation_kind,
+                **activation_kwargs,
+            )
+        else:
+            output1 = activation_fn(output1, permuted_probs)
     else:
         output1 = activation_fn(output1, permuted_probs)
     output2 = grouped_mm(output1, down_projs, offs)

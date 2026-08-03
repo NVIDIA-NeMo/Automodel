@@ -2287,19 +2287,41 @@ class TestTorchMMExpertsFwd:
 
         torch.testing.assert_close(fixed[:valid_tokens], compact)
 
+    @pytest.mark.parametrize(
+        ("activation_name", "swiglu_limit", "activation_limit"),
+        (
+            ("swiglu", 0.0, 7.0),
+            ("swiglu", 0.5, 7.0),
+            ("swigluoai", 0.0, 0.5),
+            ("quick_geglu", 0.0, 0.5),
+            ("geglu", 0.0, 7.0),
+            ("relu2", 0.0, 7.0),
+        ),
+        ids=("swiglu", "swiglu_clamped", "swigluoai", "quick_geglu", "geglu", "relu2"),
+    )
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for torch._grouped_mm and Triton")
-    def test_ragged_activation_matches_compact_forward_and_backward(self, device):
-        """Device-offset SwiGLU preserves valid outputs and gradients while skipping the capacity tail."""
-        from nemo_automodel.components.moe.megatron.moe_utils import weighted_bias_swiglu_impl
-
+    def test_ragged_activation_matches_compact_forward_and_backward(
+        self,
+        device,
+        moe_config,
+        activation_name,
+        swiglu_limit,
+        activation_limit,
+    ):
+        """Every supported activation preserves valid outputs and gradients while skipping the capacity tail."""
         n_experts = 2
         dim = 32
         inter_dim = 64
         valid_tokens = 5
         capacity = 16
+        moe_config.expert_activation = activation_name
+        moe_config.swiglu_limit = swiglu_limit
+        moe_config.activation_limit = activation_limit
+        activation_fn = get_expert_activation_for_deepep(moe_config)
+        projection_dim = inter_dim * 2 if is_gated_activation(activation_name) else inter_dim
         hidden = torch.randn(capacity, dim, dtype=torch.bfloat16, device=device).requires_grad_()
         gate_up = (
-            torch.randn(n_experts, dim, inter_dim * 2, dtype=torch.bfloat16, device=device) * 0.02
+            torch.randn(n_experts, dim, projection_dim, dtype=torch.bfloat16, device=device) * 0.2
         ).requires_grad_()
         down = (torch.randn(n_experts, inter_dim, dim, dtype=torch.bfloat16, device=device) * 0.02).requires_grad_()
         probs = torch.rand(capacity, 1, dtype=torch.float32, device=device).requires_grad_()
@@ -2312,7 +2334,7 @@ class TestTorchMMExpertsFwd:
             down,
             tokens_per_expert,
             probs,
-            weighted_bias_swiglu_impl,
+            activation_fn,
             use_ragged_activation=True,
         )
         ragged[:valid_tokens].backward(grad)
@@ -2334,7 +2356,7 @@ class TestTorchMMExpertsFwd:
             compact_down,
             tokens_per_expert,
             compact_probs,
-            weighted_bias_swiglu_impl,
+            activation_fn,
         )
         compact.backward(grad)
 
