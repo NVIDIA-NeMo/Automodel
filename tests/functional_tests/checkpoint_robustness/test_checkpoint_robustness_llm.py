@@ -1236,9 +1236,10 @@ def _capture_decoder_layer_probes(
 
     def _capture(probe_mapping, probe_key):
         def _hook(_module, _inputs, output):
-            if probe_key in probe_mapping:
-                return
             hidden_states = _first_tensor(output)
+            # Interleaved PP invokes each virtual stage repeatedly. Overwrite
+            # warmup captures so this snapshot matches the last microbatch used
+            # by the final-logit capture in _get_logits_pp.
             probe_mapping[probe_key] = hidden_states.detach()[0, :prompt_length].float().cpu().clone()
 
         return _hook

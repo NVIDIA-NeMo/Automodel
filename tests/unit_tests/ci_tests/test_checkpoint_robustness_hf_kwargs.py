@@ -71,7 +71,7 @@ def test_capture_decoder_layer_probes_records_real_prompt_tokens():
     class Decoder(torch.nn.Module):
         def __init__(self):
             super().__init__()
-            self.layers = torch.nn.ModuleList([torch.nn.Linear(3, 3), torch.nn.Linear(3, 3)])
+            self.layers = torch.nn.ModuleList([torch.nn.Identity(), torch.nn.Identity()])
 
         def forward(self, hidden_states):
             for layer in self.layers:
@@ -93,11 +93,14 @@ def test_capture_decoder_layer_probes_records_real_prompt_tokens():
         prompt_length=2,
         layer_component_probes=component_probes,
     ) as probes:
-        model(torch.randn(1, 4, 3))
+        model(torch.zeros(1, 4, 3))
+        model(torch.full((1, 4, 3), 2.0))
 
     assert sorted(probes) == [0, 1]
     assert probes[0].shape == (2, 3)
     assert probes[1].shape == (2, 3)
+    torch.testing.assert_close(probes[0], torch.full((2, 3), 2.0))
+    torch.testing.assert_close(probes[1], torch.full((2, 3), 2.0))
     assert component_probes == {}
 
 
