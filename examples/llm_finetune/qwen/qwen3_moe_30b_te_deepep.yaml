@@ -140,5 +140,9 @@ ci:
     hf_kl_threshold: 5e-2
     process_isolation: true
     tokenizer_name: Qwen/Qwen3-30B-A3B
+    # Match the other Qwen3-MoE references and avoid the real-device fallback
+    # selected by trust_remote_code when no HF device map is provided.
+    trust_remote_code: true
+    hf_device_map_auto: true
     no_check_resume: true
     dataset.num_samples_limit: 500

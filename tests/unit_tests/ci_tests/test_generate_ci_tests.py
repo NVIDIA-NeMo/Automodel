@@ -168,3 +168,5 @@ def test_generate_qwen3_moe_te_deepep_uses_isolated_source_and_reload_phases():
     assert robustness["source_load_kl_threshold"] == 1e-1
     assert robustness["source_load_mean_kl_threshold"] == 1.5e-2
     assert robustness["source_load_cosine_threshold"] == 0.995
+    assert robustness["trust_remote_code"] is True
+    assert robustness["hf_device_map_auto"] is True
