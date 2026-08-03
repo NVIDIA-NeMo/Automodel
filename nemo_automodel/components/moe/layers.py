@@ -16,7 +16,6 @@ from functools import partial
 from typing import Optional
 
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributed.device_mesh import DeviceMesh
@@ -291,12 +290,6 @@ class Gate(nn.Module):
 
         self.e_score_correction_bias_master = None
 
-        # Runtime-only mesh used to aggregate token counts before updating the
-        # replicated score-correction bias. FSDP2 shards parameters but leaves
-        # buffers as ordinary tensors, so the bias cannot infer its reduction
-        # group from DTensor metadata in the common distributed path.
-        self._expert_load_mesh: Optional[DeviceMesh] = None
-
         # Cumulative expert load is a tensor representing the number of tokens
         # routed to each expert on the current rank, accumulated across gradient
         # accumulation steps.
@@ -315,13 +308,31 @@ class Gate(nn.Module):
         self.routing_core = _GateRoutingCore()
         self.use_routing_core = False
 
-    def _set_expert_load_mesh(self, mesh: Optional[DeviceMesh]) -> None:
-        """Set the runtime mesh used to aggregate expert load before bias updates."""
-        self._expert_load_mesh = mesh
+    def _local_score_correction_bias(self) -> torch.Tensor | None:
+        """Return the local tensor used to adjust this rank's routing scores.
+
+        Returns:
+            Tensor of shape [experts] replicated across the gate's DP/CP mesh, or
+            ``None`` when score correction is disabled. The returned tensor aliases
+            the registered correction-bias buffer.
+        """
+        if isinstance(self.e_score_correction_bias, DTensor):
+            return self.e_score_correction_bias.to_local()
+        return self.e_score_correction_bias
 
     def _route_scores(self, scores: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-        """Apply fixed-shape expert selection and probability math to router logits."""
+        """Apply fixed-shape expert selection and probability math to router logits.
+
+        Args:
+            scores: Tensor of shape [tokens, experts] containing local router logits.
+
+        Returns:
+            Tuple containing routing weights of shape [tokens, activated_experts],
+            expert indices of shape [tokens, activated_experts], and optional
+            original routing scores of shape [tokens, experts].
+        """
         num_tokens = scores.size(0)
+        correction_bias = self._local_score_correction_bias()
 
         if self.score_func == "softmax":
             if self.softmax_before_topk:
@@ -349,8 +360,8 @@ class Gate(nn.Module):
             original_scores = scores
 
             # Add correction bias for expert SELECTION only
-            if self.e_score_correction_bias is not None:
-                scores_for_choice = scores + self.e_score_correction_bias
+            if correction_bias is not None:
+                scores_for_choice = scores + correction_bias
             else:
                 scores_for_choice = scores
 
@@ -371,8 +382,8 @@ class Gate(nn.Module):
             scores = torch.sqrt(F.softplus(scores.float()))
             original_scores = scores
 
-            if self.e_score_correction_bias is not None:
-                scores = scores + self.e_score_correction_bias
+            if correction_bias is not None:
+                scores = scores + correction_bias
 
             indices = torch.topk(scores, self.topk, dim=-1)[1]
             indices = replay_selection(self.router_replay, indices)
@@ -382,8 +393,8 @@ class Gate(nn.Module):
             original_scores = scores
             scores_for_choice = scores
 
-            if self.e_score_correction_bias is not None:
-                scores_for_choice = scores_for_choice + self.e_score_correction_bias
+            if correction_bias is not None:
+                scores_for_choice = scores_for_choice + correction_bias
 
             if self.n_groups > 1:
                 scores_for_choice = scores_for_choice.view(num_tokens, self.n_groups, -1)
@@ -403,12 +414,12 @@ class Gate(nn.Module):
             original_scores = scores
 
             # Add correction bias to balance tokens across gates.
-            if self.e_score_correction_bias is not None:
-                scores = scores + self.e_score_correction_bias
+            if correction_bias is not None:
+                scores = scores + correction_bias
 
             if self.n_groups > 1:
                 scores = scores.view(num_tokens, self.n_groups, -1)
-                if self.e_score_correction_bias is None:
+                if correction_bias is None:
                     group_scores = scores.amax(dim=-1)
                 else:
                     group_scores = scores.topk(2, dim=-1)[0].sum(dim=-1)
@@ -533,14 +544,6 @@ class Gate(nn.Module):
                 placements=[Partial()] * self.e_score_correction_bias.device_mesh.ndim,
             )
             expert_load = expert_load.full_tensor()
-        elif self._expert_load_mesh is not None and self._expert_load_mesh.size() > 1:
-            for mesh_dim in self._expert_load_mesh.mesh_dim_names:
-                dist.all_reduce(
-                    expert_load,
-                    op=dist.ReduceOp.SUM,
-                    group=self._expert_load_mesh.get_group(mesh_dim),
-                )
-
         # 2) Compute the bias update by comparing the expert load to the average expert load.
         expert_load = expert_load.float()
         average_expert_load = expert_load.mean()

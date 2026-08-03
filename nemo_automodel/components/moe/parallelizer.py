@@ -28,7 +28,7 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import fully_shard
 from torch.distributed.fsdp._fully_shard import MixedPrecisionPolicy, OffloadPolicy
-from torch.distributed.tensor import Shard, distribute_module, distribute_tensor
+from torch.distributed.tensor import Replicate, Shard, distribute_module, distribute_tensor
 from torch.distributed.tensor.parallel import ParallelStyle, parallelize_module
 from torch.utils.checkpoint import CheckpointPolicy, create_selective_checkpoint_contexts
 
@@ -684,11 +684,15 @@ def apply_fsdp(
     for block in _iter_moe_blocks(model, _model):
         moe_module = _get_moe_module(block)
         gate = getattr(moe_module, "gate", None)
-        if isinstance(gate, Gate):
-            # FSDP2 does not convert buffers to DTensors. Give the learned
-            # load-balancing bias the same DP/CP mesh used for dense state so
-            # every replica applies one globally consistent routing update.
-            gate._set_expert_load_mesh(fsdp_mesh)
+        if isinstance(gate, Gate) and gate.e_score_correction_bias is not None:
+            # FSDP2 does not convert buffers to DTensors. Replicate the routing
+            # bias over the full DP/CP mesh so its existing Partial-to-Replicate
+            # update path aggregates every rank's expert load.
+            gate.e_score_correction_bias = distribute_tensor(
+                gate.e_score_correction_bias,
+                device_mesh=fsdp_mesh,
+                placements=[Replicate()] * fsdp_mesh.ndim,
+            )
         experts_reshard_after_forward = False if id(block) in mtp_block_ids else reshard_after_forward
         if isinstance(moe_module, MoE) and ep_shard_enabled:
             # Apply FSDP on dim=1 for grouped experts since we may have more
