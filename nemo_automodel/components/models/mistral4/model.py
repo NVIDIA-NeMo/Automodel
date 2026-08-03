@@ -31,6 +31,7 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
 )
+from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.deepseek_v3.layers import MLA
 from nemo_automodel.components.models.deepseek_v3.model import Block
 from nemo_automodel.components.models.deepseek_v3.rope_utils import (
@@ -335,6 +336,7 @@ class Mistral4Model(nn.Module):
 
 class Mistral4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
+    _keep_in_fp32_modules_strict = ["e_score_correction_bias"]
 
     @dataclass(frozen=True)
     class ModelCapabilities:
@@ -472,7 +474,7 @@ class Mistral4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                     b=cutoff_factor * final_out_std,
                 )
 
-        self.to(dtype)
+        cast_model_to_dtype(self, dtype)
         with buffer_device:
             rope_theta, rope_scaling, _ = get_rope_config(self.config)
             self.model.freqs_cis = precompute_freqs_cis(
@@ -709,6 +711,7 @@ if _HF_MISTRAL3_AVAILABLE:
         # Head lives in the Mistral4 text backbone (separate lm_head, no tie
         # mechanism); the controlling flag is on the nested text_config.
         tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
+        _keep_in_fp32_modules_strict = ["e_score_correction_bias"]
 
         @dataclass(frozen=True)
         class ModelCapabilities:
@@ -914,7 +917,7 @@ if _HF_MISTRAL3_AVAILABLE:
                         b=cutoff_factor * final_out_std,
                     )
 
-            self.to(dtype)
+            cast_model_to_dtype(self, dtype)
 
 
 ModelClass = Mistral4ForCausalLM
