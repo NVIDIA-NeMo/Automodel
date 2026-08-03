@@ -2,13 +2,13 @@
 title: "Kimi Linear"
 description: ""
 ---
-[Kimi Linear](https://huggingface.co/moonshotai/Kimi-Linear-48B-A3B-Instruct) is a hybrid-attention Mixture-of-Experts language model from Moonshot AI. Most layers use Kimi Delta Attention (KDA), a gated linear-attention variant with a recurrent state, and the remaining layers use full Multi-Head Latent Attention (MLA). NeMo AutoModel ships a native `KimiLinearForCausalLM` implementation with expert parallelism, packed sequences, and context parallelism.
+[Kimi Linear](https://huggingface.co/moonshotai/Kimi-Linear-48B-A3B-Instruct) is a hybrid-attention Mixture-of-Experts language model from Moonshot AI. Most layers use Kimi Delta Attention (KDA), a gated linear-attention variant with a recurrent state, and the remaining layers use full Multi-Head Latent Attention (MLA). NeMo AutoModel ships a native `KimiLinear48BForCausalLM` implementation with expert parallelism, packed sequences, and context parallelism.
 
 <Info>
 | | |
 |---|---|
 | **Task** | Text Generation (hybrid linear attention, MoE) |
-| **Architecture** | `KimiLinearForCausalLM` |
+| **Architecture** | `KimiLinear48BForCausalLM` |
 | **Parameters** | 48B total / 3B active |
 | **HF Org** | [moonshotai](https://huggingface.co/moonshotai) |
 
@@ -20,9 +20,17 @@ description: ""
 
 ## Architecture
 
-- `KimiLinearForCausalLM` (`model_type: kimi_linear`)
+- `KimiLinear48BForCausalLM` (`model_type: kimi_linear_48b_a3b`)
 - Hybrid attention stack: KDA linear-attention layers interleaved with MLA layers
 - MoE feed-forward blocks with sigmoid routing and grouped top-k selection
+
+Moonshot publishes this model and the Kimi K3 text backbone under the same
+`model_type: kimi_linear` and the same `architectures: ["KimiLinearForCausalLM"]`, so
+neither field identifies the model on its own. NeMo AutoModel gives this implementation a
+distinct identity, `kimi_linear_48b_a3b` / `KimiLinear48BForCausalLM`, and leaves
+`kimi_linear` to the K3 text config. The example recipes name `KimiLinear48BConfig`
+explicitly, which is what a published Moonshot checkpoint needs; checkpoints saved by
+NeMo AutoModel already carry the distinct identity and load without that override.
 
 ## Supported Parallelism
 

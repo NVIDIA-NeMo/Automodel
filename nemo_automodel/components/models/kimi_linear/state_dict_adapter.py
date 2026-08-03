@@ -80,7 +80,7 @@ def _native_moe_key_to_hf(key: str) -> str:
     return key
 
 
-class KimiLinearStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
+class KimiLinear48BStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
     """Convert Kimi Linear HF split experts to Automodel grouped experts.
 
     HF stores routed experts as per-expert Kimi names:

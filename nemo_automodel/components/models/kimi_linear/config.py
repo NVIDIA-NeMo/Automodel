@@ -21,15 +21,24 @@ from typing import Any
 from transformers.configuration_utils import PretrainedConfig
 
 
-class KimiLinearConfig(PretrainedConfig):
-    """HF-compatible configuration for Kimi Linear causal LM checkpoints."""
+class KimiLinear48BConfig(PretrainedConfig):
+    """HF-compatible configuration for Kimi Linear 48B A3B causal LM checkpoints.
 
-    model_type = "kimi_linear"
+    Moonshot publishes both this model and the Kimi K3 text backbone under
+    ``model_type: "kimi_linear"`` with ``architectures: ["KimiLinearForCausalLM"]``,
+    so neither field tells the two families apart. Automodel gives this one a
+    distinct identity (``kimi_linear_48b_a3b`` / ``KimiLinear48BForCausalLM``) and
+    leaves ``kimi_linear`` to the K3 text config. A published Moonshot checkpoint
+    therefore has to name this class explicitly, as the example recipes do; a
+    checkpoint saved by Automodel already carries the distinct identity.
+    """
+
+    model_type = "kimi_linear_48b_a3b"
+    architectures = ["KimiLinear48BForCausalLM"]
     keys_to_ignore_at_inference = ["past_key_values"]
 
     def __init__(
         self,
-        model_type: str = "kimi_linear",
         vocab_size: int = 163840,
         hidden_size: int = 4096,
         head_dim: int | None = None,
@@ -73,7 +82,6 @@ class KimiLinearConfig(PretrainedConfig):
         kda_use_qk_l2norm_in_kernel: bool = True,
         **kwargs: Any,
     ) -> None:
-        self.model_type = model_type
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
         self.head_dim = head_dim if head_dim is not None else hidden_size // num_attention_heads
@@ -129,6 +137,16 @@ class KimiLinearConfig(PretrainedConfig):
             tie_word_embeddings=tie_word_embeddings,
             **kwargs,
         )
+
+        # Stock Moonshot checkpoints declare the shared ``kimi_linear`` /
+        # ``KimiLinearForCausalLM`` identity that the K3 text backbone also uses, and
+        # ``PretrainedConfig`` would carry those file values onto the instance.
+        # Building this class is an explicit request for the 48B A3B implementation,
+        # so stamp Automodel's identity: the architecture name is what
+        # ``MODEL_ARCH_MAPPING`` resolves the model class from, and both fields are
+        # written back out when the model exports an HF checkpoint.
+        self.model_type = type(self).model_type
+        self.architectures = list(type(self).architectures)
 
     @property
     def is_mla(self) -> bool:

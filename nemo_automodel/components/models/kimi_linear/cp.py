@@ -448,7 +448,7 @@ def shard_batch_for_kimi_cp(cp_mesh, tp_mesh, batch: dict, *, loss_mask=None, pa
     """Shard a batch contiguously across the context-parallel mesh for Kimi Linear.
 
     The :attr:`~nemo_automodel.components.distributed.context_parallel.sharder.ContextParallelSharder.shard_batch`
-    implementation returned by :meth:`KimiLinearForCausalLM.prepare_model_inputs_for_cp`,
+    implementation returned by :meth:`KimiLinear48BForCausalLM.prepare_model_inputs_for_cp`,
     used instead of the default load-balanced ``context_parallel`` path. Every rank
     starts from the same full batch, keeps the ``[seq_start, seq_end)`` slice of each
     sequence-aligned tensor, and gets the (unsharded) global document-id map needed

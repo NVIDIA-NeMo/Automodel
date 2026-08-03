@@ -37,15 +37,21 @@ rng:
   seed: 20260721
   ranked: true
 
+# The published checkpoint shares its model_type with the Kimi K3 text backbone, so the
+# config class is named explicitly (see docs/model-coverage/llm/moonshotai/kimi-linear.mdx).
 model:
-  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: moonshotai/Kimi-Linear-48B-A3B-Instruct
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
+  config:
+    _target_: nemo_automodel.components.models.kimi_linear.config.KimiLinear48BConfig.from_pretrained
+    pretrained_model_name_or_path: moonshotai/Kimi-Linear-48B-A3B-Instruct
+    name_or_path: moonshotai/Kimi-Linear-48B-A3B-Instruct
+    kda_mode: chunk
+    kda_unpad_inputs: false
+    kda_use_fused_gate: true
+    kda_use_qk_l2norm_in_kernel: true
   trust_remote_code: true
   torch_dtype: bfloat16
-  kda_mode: chunk
-  kda_unpad_inputs: false
-  kda_use_fused_gate: true
-  kda_use_qk_l2norm_in_kernel: true
+  load_base_model: true
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
     attn: eager

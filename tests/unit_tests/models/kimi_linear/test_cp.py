@@ -184,10 +184,10 @@ def test_shard_batch_shards_loss_mask_with_labels(cp_size):
 def test_kimi_model_reports_cp_and_packing_support():
     from nemo_automodel._transformers.capabilities import ModelSupports
     from nemo_automodel.components.models.common import BackendConfig
-    from nemo_automodel.components.models.kimi_linear.model import KimiLinearForCausalLM
+    from nemo_automodel.components.models.kimi_linear.model import KimiLinear48BForCausalLM
     from tests.unit_tests.models.kimi_linear.test_model import _tiny_kimi_config
 
-    model = KimiLinearForCausalLM(_tiny_kimi_config(), backend=BackendConfig(attn="eager"))
+    model = KimiLinear48BForCausalLM(_tiny_kimi_config(), backend=BackendConfig(attn="eager"))
     supports = ModelSupports(model, None)
 
     assert supports.supports_cp is True

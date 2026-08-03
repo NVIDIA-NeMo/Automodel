@@ -40,7 +40,7 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
     reject_unsupported_tie_word_embeddings,
 )
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype, compute_lm_head_logits
-from nemo_automodel.components.models.kimi_linear.config import KimiLinearConfig
+from nemo_automodel.components.models.kimi_linear.config import KimiLinear48BConfig
 from nemo_automodel.components.models.kimi_linear.cp import (
     KimiPackedContext,
     all_gather_sequence,
@@ -51,7 +51,7 @@ from nemo_automodel.components.models.kimi_linear.cp import (
     document_causal_flex_attention,
     shard_batch_for_kimi_cp,
 )
-from nemo_automodel.components.models.kimi_linear.state_dict_adapter import KimiLinearStateDictAdapter
+from nemo_automodel.components.models.kimi_linear.state_dict_adapter import KimiLinear48BStateDictAdapter
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.experts import GroupedExperts
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
@@ -273,7 +273,7 @@ class KimiRMSNorm(nn.Module):
 class KimiMLAAttention(nn.Module):
     """Kimi MLA full-attention layer copied from the HF reference math."""
 
-    def __init__(self, config: KimiLinearConfig, layer_idx: int) -> None:
+    def __init__(self, config: KimiLinear48BConfig, layer_idx: int) -> None:
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -520,7 +520,7 @@ class KimiDeltaAttention(nn.Module):
     A_log = _KimiKDAFp32Param("A_log")
     dt_bias = _KimiKDAFp32Param("dt_bias")
 
-    def __init__(self, config: KimiLinearConfig, layer_idx: int) -> None:
+    def __init__(self, config: KimiLinear48BConfig, layer_idx: int) -> None:
         _require_fla()
         super().__init__()
         self.config = config
@@ -751,7 +751,9 @@ class KimiDeltaAttention(nn.Module):
 class KimiDecoderLayer(nn.Module):
     """Kimi decoder block with KDA/MLA attention and dense or MoE MLP."""
 
-    def __init__(self, config: KimiLinearConfig, layer_idx: int, moe_config: MoEConfig, backend: BackendConfig) -> None:
+    def __init__(
+        self, config: KimiLinear48BConfig, layer_idx: int, moe_config: MoEConfig, backend: BackendConfig
+    ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
         self.config = config
@@ -919,7 +921,7 @@ class KimiDecoderLayer(nn.Module):
 
 
 def _build_moe_config(
-    config: KimiLinearConfig,
+    config: KimiLinear48BConfig,
     model_dtype: torch.dtype,
     moe_overrides: dict[str, Any] | None,
 ) -> MoEConfig:
@@ -957,12 +959,12 @@ def _build_moe_config(
     return MoEConfig(**moe_defaults)
 
 
-class KimiLinearModel(nn.Module):
+class KimiLinear48BModel(nn.Module):
     """Kimi Linear decoder backbone with trainable Automodel MoE layers."""
 
     def __init__(
         self,
-        config: KimiLinearConfig,
+        config: KimiLinear48BConfig,
         backend: BackendConfig,
         *,
         moe_config: MoEConfig | None = None,
@@ -1090,7 +1092,7 @@ class KimiLinearModel(nn.Module):
             layer.init_weights(buffer_device, init_std)
 
 
-class KimiLinearForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
+class KimiLinear48BForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     """Kimi Linear causal LM with native trainable MoE layers."""
 
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
@@ -1116,11 +1118,11 @@ class KimiLinearForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     @classmethod
     def from_config(
         cls,
-        config: KimiLinearConfig,
+        config: KimiLinear48BConfig,
         moe_config: MoEConfig | None = None,
         backend: BackendConfig | None = None,
         **kwargs: Any,
-    ) -> "KimiLinearForCausalLM":
+    ) -> "KimiLinear48BForCausalLM":
         return cls(config, moe_config=moe_config, backend=backend, **kwargs)
 
     @classmethod
@@ -1129,13 +1131,13 @@ class KimiLinearForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         pretrained_model_name_or_path: str,
         *model_args: Any,
         **kwargs: Any,
-    ) -> "KimiLinearForCausalLM":
-        config = KimiLinearConfig.from_pretrained(pretrained_model_name_or_path)
+    ) -> "KimiLinear48BForCausalLM":
+        config = KimiLinear48BConfig.from_pretrained(pretrained_model_name_or_path)
         return cls.from_config(config, *model_args, **kwargs)
 
     def __init__(
         self,
-        config: KimiLinearConfig,
+        config: KimiLinear48BConfig,
         moe_config: MoEConfig | None = None,
         backend: BackendConfig | None = None,
         **kwargs: Any,
@@ -1147,7 +1149,7 @@ class KimiLinearForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         if self.backend.gate_precision is None:
             self.backend.gate_precision = torch.float32
         moe_overrides = kwargs.pop("moe_overrides", None)
-        self.model = KimiLinearModel(config, self.backend, moe_config=moe_config, moe_overrides=moe_overrides)
+        self.model = KimiLinear48BModel(config, self.backend, moe_config=moe_config, moe_overrides=moe_overrides)
         model_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
         self.lm_head = initialize_linear_module(
             self.backend.linear,
@@ -1158,7 +1160,7 @@ class KimiLinearForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         )
         self.vocab_size = config.vocab_size
         if self.backend.enable_hf_state_dict_adapter:
-            self.state_dict_adapter = KimiLinearStateDictAdapter(
+            self.state_dict_adapter = KimiLinear48BStateDictAdapter(
                 self.config,
                 self.model.moe_config,
                 self.backend,
@@ -1296,4 +1298,4 @@ class KimiLinearForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         cast_model_to_dtype(self, dtype, skip_modules=("_fp32_params",))
 
 
-ModelClass = KimiLinearForCausalLM
+ModelClass = KimiLinear48BForCausalLM

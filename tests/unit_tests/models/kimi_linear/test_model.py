@@ -6,16 +6,16 @@ import pytest
 import torch
 
 from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.kimi_linear.config import KimiLinearConfig
-from nemo_automodel.components.models.kimi_linear.model import KimiLinearForCausalLM
+from nemo_automodel.components.models.kimi_linear.config import KimiLinear48BConfig
+from nemo_automodel.components.models.kimi_linear.model import KimiLinear48BForCausalLM
 from tests.unit_tests.models.kimi_linear.test_cp import _FakeCPMesh
 
 
-def _tiny_kimi_config(*, use_kda: bool = False) -> KimiLinearConfig:
+def _tiny_kimi_config(*, use_kda: bool = False) -> KimiLinear48BConfig:
     linear_attn_config = (
         {"kda_layers": [1], "full_attn_layers": [2]} if use_kda else {"kda_layers": [], "full_attn_layers": [1, 2]}
     )
-    return KimiLinearConfig(
+    return KimiLinear48BConfig(
         vocab_size=128,
         hidden_size=16,
         intermediate_size=32,
@@ -68,7 +68,7 @@ def _assert_floating_state_finite(model: torch.nn.Module) -> None:
 
 
 def test_update_moe_gate_bias_no_op_when_factor_zero():
-    model = KimiLinearForCausalLM(_tiny_kimi_config(), backend=_backend_config())
+    model = KimiLinear48BForCausalLM(_tiny_kimi_config(), backend=_backend_config())
     moe_layer = model.model.layers["1"].mlp
 
     assert moe_layer.gate.bias_update_factor == 0.0
@@ -81,7 +81,7 @@ def test_update_moe_gate_bias_no_op_when_factor_zero():
 def test_tiny_kimi_with_kda_initializes_fp32_params_when_fla_available():
     _require_fla()
 
-    model = KimiLinearForCausalLM(_tiny_kimi_config(use_kda=True), backend=_backend_config())
+    model = KimiLinear48BForCausalLM(_tiny_kimi_config(use_kda=True), backend=_backend_config())
     model.initialize_weights(buffer_device=torch.device("cpu"), dtype=torch.float32)
     kda_attn = model.model.layers["0"].self_attn
 
@@ -94,7 +94,7 @@ def test_tiny_kimi_with_kda_initializes_fp32_params_when_fla_available():
 
 
 def test_kimi_moe_uses_hf_routing_numerics():
-    model = KimiLinearForCausalLM(_tiny_kimi_config(), backend=_backend_config())
+    model = KimiLinear48BForCausalLM(_tiny_kimi_config(), backend=_backend_config())
     moe_layer = model.model.layers["1"].mlp
 
     assert not moe_layer.gate.router_topk_sorted
@@ -106,7 +106,7 @@ def test_kimi_moe_uses_hf_routing_numerics():
 def test_kimi_defaults_gate_precision_without_mutating_backend_config():
     backend = _backend_config()
 
-    model = KimiLinearForCausalLM(_tiny_kimi_config(), backend=backend)
+    model = KimiLinear48BForCausalLM(_tiny_kimi_config(), backend=backend)
 
     assert backend.gate_precision is None
     assert model.backend is not backend
@@ -114,7 +114,7 @@ def test_kimi_defaults_gate_precision_without_mutating_backend_config():
 
 
 def test_initialize_weights_respects_explicit_buffer_device_on_cpu():
-    model = KimiLinearForCausalLM(_tiny_kimi_config(), backend=_backend_config())
+    model = KimiLinear48BForCausalLM(_tiny_kimi_config(), backend=_backend_config())
     explicit_device = torch.device("meta")
 
     with (
@@ -128,7 +128,7 @@ def test_initialize_weights_respects_explicit_buffer_device_on_cpu():
 
 
 def test_checkpoint_free_initialize_and_eval_forward_runs_hf_order_moe():
-    model = KimiLinearForCausalLM(_tiny_kimi_config(), backend=_backend_config())
+    model = KimiLinear48BForCausalLM(_tiny_kimi_config(), backend=_backend_config())
     model.initialize_weights(buffer_device=torch.device("cpu"), dtype=torch.float32)
     model.eval()
 
@@ -149,7 +149,7 @@ def test_checkpoint_free_initialize_and_eval_forward_runs_hf_order_moe():
 
 def test_hf_order_eval_moe_matches_standard_grouped_experts_path():
     torch.manual_seed(0)
-    model = KimiLinearForCausalLM(_tiny_kimi_config(), backend=_backend_config())
+    model = KimiLinear48BForCausalLM(_tiny_kimi_config(), backend=_backend_config())
     model.initialize_weights(buffer_device=torch.device("cpu"), dtype=torch.float32)
     model.eval()
     moe_layer = model.model.layers["1"]
@@ -165,7 +165,7 @@ def test_hf_order_eval_moe_matches_standard_grouped_experts_path():
 
 def test_packed_mask_blocks_attention_across_documents():
     torch.manual_seed(0)
-    model = KimiLinearForCausalLM(_tiny_kimi_config(), backend=_backend_config())
+    model = KimiLinear48BForCausalLM(_tiny_kimi_config(), backend=_backend_config())
     model.initialize_weights(buffer_device=torch.device("cpu"), dtype=torch.float32)
     model.eval()
 
@@ -185,7 +185,7 @@ def test_packed_mask_blocks_attention_across_documents():
 
 def test_padding_only_query_rows_stay_finite():
     torch.manual_seed(0)
-    model = KimiLinearForCausalLM(_tiny_kimi_config(), backend=_backend_config())
+    model = KimiLinear48BForCausalLM(_tiny_kimi_config(), backend=_backend_config())
     model.initialize_weights(buffer_device=torch.device("cpu"), dtype=torch.float32)
     model.eval()
 
@@ -202,7 +202,7 @@ def test_prepare_model_inputs_for_cp_returns_contiguous_cp_sharder():
     from nemo_automodel.components.distributed.context_parallel.sharder import contiguous_local_indices
     from nemo_automodel.components.models.kimi_linear.cp import shard_batch_for_kimi_cp
 
-    model = KimiLinearForCausalLM(_tiny_kimi_config(), backend=_backend_config())
+    model = KimiLinear48BForCausalLM(_tiny_kimi_config(), backend=_backend_config())
 
     updates = model.prepare_model_inputs_for_cp({"input_ids": torch.zeros(1, 4, dtype=torch.long)})
 
@@ -233,7 +233,7 @@ def test_cp_dispatch_shards_kimi_batch_contiguously_not_load_balanced():
     """
     from nemo_automodel.components.distributed.context_parallel.sharder import ContextParallelSharder
 
-    model = KimiLinearForCausalLM(_tiny_kimi_config(), backend=_backend_config())
+    model = KimiLinear48BForCausalLM(_tiny_kimi_config(), backend=_backend_config())
     input_ids = torch.arange(8, dtype=torch.long).unsqueeze(0)
     batch = {"input_ids": input_ids, "labels": input_ids.clone()}
 
@@ -248,7 +248,7 @@ def test_cp_dispatch_shards_kimi_batch_contiguously_not_load_balanced():
 
 def test_setup_cp_attention_records_mesh_on_every_attention_block():
     _require_fla()
-    model = KimiLinearForCausalLM(_tiny_kimi_config(use_kda=True), backend=_backend_config())
+    model = KimiLinear48BForCausalLM(_tiny_kimi_config(use_kda=True), backend=_backend_config())
     sentinel = object()
 
     for block in model.model.layers.values():
@@ -260,7 +260,7 @@ def test_setup_cp_attention_records_mesh_on_every_attention_block():
 def test_thd_packed_inputs_run_through_the_batched_layers():
     """THD packing squeezes the batch axis off; the model must restore it."""
     torch.manual_seed(0)
-    model = KimiLinearForCausalLM(_tiny_kimi_config(), backend=_backend_config())
+    model = KimiLinear48BForCausalLM(_tiny_kimi_config(), backend=_backend_config())
     model.initialize_weights(buffer_device=torch.device("cpu"), dtype=torch.float32)
     model.eval()
 

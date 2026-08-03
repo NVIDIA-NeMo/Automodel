@@ -7,13 +7,13 @@ import torch
 from torch.distributed._tensor.placement_types import Replicate, Shard
 
 from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.kimi_linear.state_dict_adapter import KimiLinearStateDictAdapter
+from nemo_automodel.components.models.kimi_linear.state_dict_adapter import KimiLinear48BStateDictAdapter
 from nemo_automodel.components.moe import state_dict_utils
 from nemo_automodel.components.moe.config import MoEConfig
 
 
 @dataclass
-class MockKimiLinearConfig:
+class MockKimiLinear48BConfig:
     hidden_size: int = 6
     intermediate_size: int = 12
     moe_intermediate_size: int = 4
@@ -23,7 +23,7 @@ class MockKimiLinearConfig:
 
 @pytest.fixture
 def config():
-    return MockKimiLinearConfig()
+    return MockKimiLinear48BConfig()
 
 
 @pytest.fixture
@@ -65,7 +65,7 @@ def backend():
 
 @pytest.fixture
 def adapter(config, moe_config, backend):
-    return KimiLinearStateDictAdapter(config, moe_config, backend, dtype=torch.bfloat16)
+    return KimiLinear48BStateDictAdapter(config, moe_config, backend, dtype=torch.bfloat16)
 
 
 class _FakeMesh:
