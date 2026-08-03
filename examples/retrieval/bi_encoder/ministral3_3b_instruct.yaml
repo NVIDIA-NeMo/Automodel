@@ -52,7 +52,7 @@ tokenizer:
   pretrained_model_name_or_path: mistralai/Ministral-3-3B-Instruct-2512
   add_eos_token: false
   padding_side: left
-  force_hf: true
+  tokenizer_backend: transformers_auto
 
 dataset:
   _target_: nemo_automodel.components.datasets.llm.retrieval_dataset.RetrievalDatasetConfig

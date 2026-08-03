@@ -23,19 +23,34 @@ from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
+from transformers import TokenizersBackend
 
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
+from nemo_automodel._transformers.tokenization.nemo_auto_tokenizer import NeMoAutoTokenizerWithBosEosEnforced
 from nemo_automodel._transformers.tokenization.tokenization_mistral_common import MistralCommonBackend
 
 _TEST_DATA_DIR = os.environ.get("TEST_DATA_DIR", "/home/TestData/automodel")
 _TOKENIZER_BASE = Path(_TEST_DATA_DIR) / "tokenizers"
 MISTRAL_7B_INSTRUCT_PATH = _TOKENIZER_BASE / "Mistral-7B-Instruct-v0.1"
+MINISTRAL3_3B_INSTRUCT_PATH = Path(
+    os.environ.get(
+        "MINISTRAL3_TOKENIZER_PATH",
+        _TOKENIZER_BASE / "Ministral-3-3B-Instruct-2512",
+    )
+)
 
 
 @pytest.fixture
 def mistral_tokenizer_path():
     assert MISTRAL_7B_INSTRUCT_PATH.exists(), "path not exists"
     return str(MISTRAL_7B_INSTRUCT_PATH)
+
+
+@pytest.fixture
+def ministral3_tokenizer_path():
+    if not MINISTRAL3_3B_INSTRUCT_PATH.exists():
+        pytest.skip("Ministral-3-3B-Instruct-2512 tokenizer fixture is unavailable")
+    return str(MINISTRAL3_3B_INSTRUCT_PATH)
 
 
 @pytest.fixture
@@ -64,6 +79,27 @@ class TestMistralTokenizerDispatch:
     def test_force_hf_returns_raw_hf_tokenizer(self, mistral_tokenizer_path):
         tokenizer = NeMoAutoTokenizer.from_pretrained(mistral_tokenizer_path, force_hf=True)
         assert not isinstance(tokenizer, MistralCommonBackend)
+
+    def test_tokenizers_backend_preserves_source_assets(self, ministral3_tokenizer_path, tmp_path):
+        tokenizer = NeMoAutoTokenizer.from_pretrained(
+            ministral3_tokenizer_path,
+            tokenizer_backend="tokenizers",
+            add_bos_token=False,
+            add_eos_token=False,
+            padding_side="left",
+        )
+
+        assert isinstance(tokenizer, NeMoAutoTokenizerWithBosEosEnforced)
+        assert isinstance(tokenizer, TokenizersBackend)
+        tokenizer.save_pretrained(tmp_path)
+
+        source = Path(ministral3_tokenizer_path)
+        for filename in ("tokenizer.json", "tokenizer_config.json"):
+            assert (tmp_path / filename).read_bytes() == (source / filename).read_bytes()
+
+        expected = TokenizersBackend.from_pretrained(source, padding_side="left")
+        texts = ["query: example", "literal <s> token"]
+        assert tokenizer(texts, add_special_tokens=False) == expected(texts, add_special_tokens=False)
 
 
 class TestMistralCommonBackendTokenization:
