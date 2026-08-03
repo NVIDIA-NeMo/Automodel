@@ -375,6 +375,128 @@ def _tensor_digest(tensor: torch.Tensor) -> dict[str, object]:
     }
 
 
+def _verbose_diagnostics_enabled() -> bool:
+    """Return whether expensive checkpoint diagnostics are enabled for this run."""
+    return os.environ.get("CHECKPOINT_ROBUSTNESS_VERBOSE_DIAGNOSTICS", "0") == "1"
+
+
+def _diagnostic_tensor_summary(tensor: torch.Tensor) -> dict[str, object]:
+    """Return bounded value diagnostics without copying an entire large parameter."""
+    local_tensor = tensor.detach()
+    if isinstance(local_tensor, DTensor):
+        local_tensor = local_tensor.to_local()
+    if local_tensor.is_meta:
+        return {"device": "meta", "dtype": str(local_tensor.dtype), "shape": list(local_tensor.shape)}
+
+    flat = local_tensor.reshape(-1)
+    sample_size = min(flat.numel(), 64)
+    if sample_size:
+        indices = torch.linspace(0, flat.numel() - 1, steps=sample_size, device=flat.device).long()
+        sample = flat[indices].float().cpu().contiguous()
+        sample_bytes = sample.view(torch.uint8).numpy()
+        sample_summary = {
+            "sample_finite": bool(torch.isfinite(sample).all()),
+            "sample_max": sample.max().item(),
+            "sample_mean": sample.mean().item(),
+            "sample_min": sample.min().item(),
+            "sample_sha256": hashlib.sha256(sample_bytes).hexdigest(),
+        }
+    else:
+        sample_summary = {"sample_finite": True, "sample_sha256": hashlib.sha256(b"").hexdigest()}
+    return {
+        "device": str(local_tensor.device),
+        "dtype": str(local_tensor.dtype),
+        "shape": list(local_tensor.shape),
+        **sample_summary,
+    }
+
+
+def _diagnostic_output_tensors(value) -> list[torch.Tensor]:
+    """Flatten tensor outputs from rotary modules for diagnostic summaries."""
+    if isinstance(value, torch.Tensor):
+        return [value]
+    if isinstance(value, (tuple, list)):
+        return [tensor for item in value for tensor in _diagnostic_output_tensors(item)]
+    if isinstance(value, dict):
+        return [tensor for item in value.values() for tensor in _diagnostic_output_tensors(item)]
+    return []
+
+
+def _diagnostic_phase() -> str:
+    """Return the isolated phase named on the current command line."""
+    try:
+        return sys.argv[sys.argv.index("--isolated_phase") + 1]
+    except (ValueError, IndexError):
+        return "monolithic"
+
+
+def _print_hf_cache_diagnostics(repo_id: str | Path, revision: str | None) -> None:
+    """Print the resolved HF snapshot and content-addressed weight manifest."""
+    if not _verbose_diagnostics_enabled():
+        return
+
+    report: dict[str, object] = {
+        "hf_home": os.environ.get("HF_HOME"),
+        "hf_hub_cache": os.environ.get("HF_HUB_CACHE"),
+        "hf_hub_offline": os.environ.get("HF_HUB_OFFLINE"),
+        "repo_id": str(repo_id),
+        "requested_revision": revision or "main",
+    }
+    try:
+        from huggingface_hub import try_to_load_from_cache
+
+        cached_files: dict[str, dict[str, object]] = {}
+        snapshot_id = None
+        for filename in ("config.json", "model.safetensors.index.json"):
+            cached = try_to_load_from_cache(str(repo_id), filename, revision=revision or "main")
+            if not isinstance(cached, str):
+                cached_files[filename] = {"cached": False}
+                continue
+            cached_path = Path(cached)
+            path_parts = cached_path.parts
+            if "snapshots" in path_parts:
+                snapshot_index = path_parts.index("snapshots")
+                snapshot_id = path_parts[snapshot_index + 1]
+            payload = cached_path.read_bytes()
+            cached_files[filename] = {
+                "cached": True,
+                "path": str(cached_path),
+                "resolved_blob": cached_path.resolve().name,
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "size": len(payload),
+            }
+
+        index_entry = cached_files.get("model.safetensors.index.json", {})
+        weight_manifest = []
+        if index_entry.get("cached"):
+            index_path = Path(str(index_entry["path"]))
+            index = json.loads(index_path.read_text())
+            for filename in sorted(set(index.get("weight_map", {}).values())):
+                cached = try_to_load_from_cache(str(repo_id), filename, revision=revision or "main")
+                if not isinstance(cached, str):
+                    weight_manifest.append({"cached": False, "filename": filename})
+                    continue
+                cached_path = Path(cached)
+                weight_manifest.append(
+                    {
+                        "cached": True,
+                        "filename": filename,
+                        "resolved_blob": cached_path.resolve().name,
+                        "size": cached_path.stat().st_size,
+                    }
+                )
+        report.update(
+            {
+                "cached_files": cached_files,
+                "resolved_snapshot": snapshot_id,
+                "weight_manifest": weight_manifest,
+            }
+        )
+    except Exception:
+        report["diagnostic_error"] = traceback.format_exc()
+    print(f"[checkpoint-diagnostic][hf-cache] {json.dumps(report, sort_keys=True)}", flush=True)
+
+
 def _trainable_parameter_digests(model_parts: list[torch.nn.Module]) -> dict[str, dict[str, object]]:
     """Hash every rank-local trainable parameter for exact PEFT save/reload comparison."""
     digests: dict[str, dict[str, object]] = {}
@@ -444,11 +566,21 @@ def _assert_peft_adapter_matches_checkpoint(
         ignored_missing = [key for key in missing if ignored_key_prefix and key.startswith(ignored_key_prefix)]
         required_missing = sorted(set(missing) - set(ignored_missing))
         unexpected = sorted(loaded_keys - expected_keys)
-        assert not required_missing and not unexpected, (
+        # PEFT can expose the wrapped output head's base-layer tensor from
+        # get_peft_model_state_dict even though it is not adapter state and was
+        # therefore not written to adapter_model.safetensors. Keep unexpected
+        # adapter tensors strict while excluding this base-model-only value.
+        ignored_unexpected = [
+            key for key in unexpected if ".base_layer." in key and ".lora_" not in key and "lora_magnitude" not in key
+        ]
+        required_unexpected = sorted(set(unexpected) - set(ignored_unexpected))
+        assert not required_missing and not required_unexpected, (
             "Vanilla PEFT adapter key mismatch: "
-            f"missing={required_missing[:10]}, unexpected={unexpected[:10]}, "
-            f"ignored_missing={ignored_missing[:10]}"
+            f"missing={required_missing[:10]}, unexpected={required_unexpected[:10]}, "
+            f"ignored_missing={ignored_missing[:10]}, ignored_non_adapter={ignored_unexpected[:10]}"
         )
+        if ignored_unexpected:
+            print(f"[HF reload] Ignored PEFT-reported non-adapter base-layer tensors: {ignored_unexpected}")
 
         mismatches = []
         matched_keys = expected_keys - set(ignored_missing)
@@ -1060,6 +1192,7 @@ def _prepare_source_load_reference_rank0(
         has_device_map="device_map" in hf_kwargs,
     )
 
+    _print_hf_cache_diagnostics(original_pretrained_path, hf_kwargs.get("revision"))
     print(f"\n[Phase 0] Source-load reference: vanilla HF for {original_pretrained_path}")
     with model_load_context, _keep_hf_modules_in_fp32(hf_config):
         if "device_map" in hf_kwargs:
@@ -1078,7 +1211,7 @@ def _prepare_source_load_reference_rank0(
         if should_fix_rotary_embeddings([hf_model]):
             fix_rotary_embeddings([hf_model])
 
-    hf_logits = _get_logits(hf_model, input_ids, device)
+    hf_logits = _get_logits_with_diagnostics(hf_model, input_ids, device)
     hf_aliased = _lm_head_embedding_aliased(hf_model)
     explicit_tie_word_embeddings = _explicit_tie_word_embeddings(hf_model.config)
     del hf_model
@@ -1281,6 +1414,101 @@ def _get_logits(model, input_ids, device, trainer=None) -> torch.Tensor:
         if isinstance(logits, DTensor):
             logits = logits.full_tensor()
         return logits.float().cpu()
+
+
+def _get_logits_with_diagnostics(model, input_ids, device, trainer=None) -> torch.Tensor:
+    """Run the parity forward twice and report model, logit, and RoPE identity when requested."""
+    if not _verbose_diagnostics_enabled():
+        return _get_logits(model, input_ids, device, trainer=trainer)
+
+    active_forward = "first"
+    rotary_outputs: dict[str, list[dict[str, object]]] = {"first": [], "second": []}
+    rotary_modules = []
+    handles = []
+    for name, module in model.named_modules():
+        class_name = module.__class__.__name__
+        if "rotary" not in name.lower() and "rotary" not in class_name.lower():
+            continue
+        module_summary: dict[str, object] = {"class": class_name, "name": name}
+        inv_freq = getattr(module, "inv_freq", None)
+        if isinstance(inv_freq, torch.Tensor):
+            module_summary["inv_freq"] = _diagnostic_tensor_summary(inv_freq)
+        rotary_modules.append(module_summary)
+
+        def hook(_module, _inputs, output, *, module_name=name, module_class=class_name):
+            for index, tensor in enumerate(_diagnostic_output_tensors(output)):
+                rotary_outputs[active_forward].append(
+                    {
+                        "key": f"{module_name}:{module_class}:output_{index}",
+                        **_diagnostic_tensor_summary(tensor),
+                    }
+                )
+
+        handles.append(module.register_forward_hook(hook))
+
+    try:
+        active_forward = "first"
+        first_logits = _get_logits(model, input_ids, device, trainer=trainer)
+        active_forward = "second"
+        second_logits = _get_logits(model, input_ids, device, trainer=trainer)
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    parameter_samples = []
+    named_parameters = list(model.named_parameters())
+    selected_indices = sorted({0, 1, len(named_parameters) // 2, len(named_parameters) - 2, len(named_parameters) - 1})
+    for index in selected_indices:
+        if 0 <= index < len(named_parameters):
+            name, parameter = named_parameters[index]
+            parameter_samples.append({"name": name, **_diagnostic_tensor_summary(parameter)})
+
+    cached_rotary = []
+    for name, module in model.named_modules():
+        compute_cos_sin = getattr(module, "_compute_cos_sin", None)
+        if not callable(compute_cos_sin):
+            continue
+        try:
+            values = compute_cos_sin(len(input_ids))
+            cached_rotary.append(
+                {
+                    "name": name,
+                    "outputs": [_diagnostic_tensor_summary(tensor) for tensor in _diagnostic_output_tensors(values)],
+                }
+            )
+        except Exception:
+            cached_rotary.append({"error": traceback.format_exc(), "name": name})
+
+    delta = (first_logits - second_logits).abs()
+    self_kl = _kl_divergence_from_logits(first_logits, second_logits)
+    model_config = getattr(model, "config", None)
+    raw_device_map = getattr(model, "hf_device_map", None)
+    hf_device_map = (
+        {str(name): str(placement) for name, placement in raw_device_map.items()}
+        if isinstance(raw_device_map, dict)
+        else raw_device_map
+    )
+    report = {
+        "cached_rotary": cached_rotary,
+        "config_commit_hash": getattr(model_config, "_commit_hash", None),
+        "config_model_type": getattr(model_config, "model_type", None),
+        "first_logits": _tensor_digest(first_logits),
+        "hf_device_map": hf_device_map,
+        "input_ids": list(input_ids),
+        "max_abs_diff": delta.max().item(),
+        "max_self_kl": self_kl.max().item(),
+        "mean_abs_diff": delta.mean().item(),
+        "mean_self_kl": self_kl.mean().item(),
+        "model_class": model.__class__.__name__,
+        "parameter_samples": parameter_samples,
+        "phase": _diagnostic_phase(),
+        "rank": dist.get_rank() if dist.is_initialized() else 0,
+        "rotary_modules": rotary_modules,
+        "rotary_outputs": rotary_outputs,
+        "second_logits": _tensor_digest(second_logits),
+    }
+    print(f"[checkpoint-diagnostic][repeat-forward] {json.dumps(report, sort_keys=True)}", flush=True)
+    return first_logits
 
 
 def _reinit_rotary_per_module(model, default_device):
@@ -1526,6 +1754,9 @@ def _run_vanilla_hf_reload(
             trust_remote_code=trust_remote_code,
             local_files_only=os.environ.get("HF_HUB_OFFLINE", "0") == "1",
         )
+        for key in ("revision", "token"):
+            if model_kwargs.get(key) is not None:
+                hf_kwargs[key] = model_kwargs[key]
         # Remote-code models can ship attention names that transformers 5.x
         # rejects. Select a supported implementation while keeping Nemotron-H
         # off HF's incompatible FlashAttention varlen path.
@@ -1557,6 +1788,8 @@ def _run_vanilla_hf_reload(
             hf_config = _load_hf_config(
                 config_path,
                 trust_remote_code=trust_remote_code,
+                revision=model_kwargs.get("revision"),
+                token=model_kwargs.get("token"),
             )
         # Load the reference model straight onto the target GPU. Materialising a
         # 14B checkpoint on CPU and then ``.to(device)`` costs ~50-225s, and that
@@ -1573,6 +1806,7 @@ def _run_vanilla_hf_reload(
         if is_peft:
             from peft import PeftModel
 
+            _print_hf_cache_diagnostics(original_pretrained_path, model_kwargs.get("revision"))
             with model_load_context, _keep_hf_modules_in_fp32(hf_config):
                 if "device_map" in hf_kwargs:
                     base_model = hf_model_cls.from_pretrained(original_pretrained_path, **hf_kwargs)
@@ -1613,7 +1847,7 @@ def _run_vanilla_hf_reload(
                     "[HF reload] Saved adapter tensors absent from vanilla HF were allowed by the configured prefix "
                     f"{hf_adapter_ignored_key_prefix!r} ({ignored_adapter_tensors} tensors)"
                 )
-            hf_logits = _get_logits(peft_model, input_ids, device)
+            hf_logits = _get_logits_with_diagnostics(peft_model, input_ids, device)
 
             if check_fused_qkv_keys:
                 from safetensors import safe_open
@@ -1646,7 +1880,7 @@ def _run_vanilla_hf_reload(
 
                 if should_fix_rotary_embeddings([hf_model]):
                     fix_rotary_embeddings([hf_model])
-            hf_logits = _get_logits(hf_model, input_ids, device)
+            hf_logits = _get_logits_with_diagnostics(hf_model, input_ids, device)
             del hf_model
 
         hf_reload_error = None
@@ -1827,7 +2061,7 @@ def _run_process_isolated_checkpoint_phase(
             _barrier()
 
         device = next(source_trainer.model_parts[0].parameters()).device
-        trainer_source_logits = _get_logits(
+        trainer_source_logits = _get_logits_with_diagnostics(
             source_trainer.model_parts[0],
             input_ids,
             device,
@@ -1940,7 +2174,7 @@ def _run_process_isolated_checkpoint_phase(
 
         _report_phase("Isolated train/save: capturing reference logits")
         device = next(trainer.model_parts[0].parameters()).device
-        reference_logits = _get_logits(trainer.model_parts[0], input_ids, device, trainer=trainer)
+        reference_logits = _get_logits_with_diagnostics(trainer.model_parts[0], input_ids, device, trainer=trainer)
         _checkpoint_paths(cfg)
         artifact_dir = _robustness_artifact_dir(cfg)
         if _rank0():
@@ -1999,7 +2233,18 @@ def _run_process_isolated_checkpoint_phase(
                 _cleanup_input_ids_sync(cfg)
             _barrier()
 
+        device = next(restored_trainer.model_parts[0].parameters()).device
+        restored_logits = _get_logits_with_diagnostics(
+            restored_trainer.model_parts[0],
+            input_ids,
+            device,
+            trainer=restored_trainer,
+        )
         if is_peft:
+            # Capture both sides after a forward. FSDP may change a parameter's
+            # rank-local view during its first unshard/reshard lifecycle, so
+            # hashing the restored model immediately after setup is not
+            # comparable to the post-forward training reference.
             artifact_dir = _robustness_artifact_dir(cfg)
             rank = dist.get_rank() if dist.is_initialized() else 0
             expected_digests_path = artifact_dir / f"trainable_parameter_digests_rank_{rank}.json"
@@ -2042,13 +2287,6 @@ def _run_process_isolated_checkpoint_phase(
                     )
             _raise_distributed_failure(failure_message)
 
-        device = next(restored_trainer.model_parts[0].parameters()).device
-        restored_logits = _get_logits(
-            restored_trainer.model_parts[0],
-            input_ids,
-            device,
-            trainer=restored_trainer,
-        )
         failure_message = None
         if _rank0():
             reference_logits = torch.load(reference_path, map_location="cpu", weights_only=True)
@@ -2255,7 +2493,7 @@ def run_checkpoint_robustness(
     if check_source_load_parity:
         _report_phase("Phase 0: starting constructed-trainer parity forward")
         device = next(trainer.model_parts[0].parameters()).device
-        trainer_source_logits = _get_logits(trainer.model_parts[0], input_ids, device, trainer=trainer)
+        trainer_source_logits = _get_logits_with_diagnostics(trainer.model_parts[0], input_ids, device, trainer=trainer)
         source_load_failure = _compare_source_load_parity(
             source_load_reference,
             trainer_source_logits,
@@ -2304,7 +2542,7 @@ def run_checkpoint_robustness(
     # Phase 2: Capture reference logits before teardown
     _report_phase("Phase 2: starting reference-logits capture")
     device = next(trainer.model_parts[0].parameters()).device
-    reference_logits = _get_logits(trainer.model_parts[0], input_ids, device, trainer=trainer)
+    reference_logits = _get_logits_with_diagnostics(trainer.model_parts[0], input_ids, device, trainer=trainer)
     _report_phase("Phase 2: reference-logits capture complete")
 
     # Locate the Phase 1 checkpoint used by the reload and resume checks.
@@ -2362,7 +2600,9 @@ def run_checkpoint_robustness(
     _report_phase("Phase 3: AutoModel reload setup complete")
 
     _report_phase("Phase 3: starting restored-logits capture")
-    restored_logits = _get_logits(restored_trainer.model_parts[0], input_ids, device, trainer=restored_trainer)
+    restored_logits = _get_logits_with_diagnostics(
+        restored_trainer.model_parts[0], input_ids, device, trainer=restored_trainer
+    )
     _report_phase("Phase 3: restored-logits capture complete")
 
     kl_restored = _kl_divergence_from_logits(reference_logits, restored_logits)
@@ -2412,7 +2652,9 @@ def run_checkpoint_robustness(
         cross_tp_trainer = recipe_cls(cfg)
         cross_tp_trainer.setup()
 
-        cross_tp_logits = _get_logits(cross_tp_trainer.model_parts[0], input_ids, device, trainer=cross_tp_trainer)
+        cross_tp_logits = _get_logits_with_diagnostics(
+            cross_tp_trainer.model_parts[0], input_ids, device, trainer=cross_tp_trainer
+        )
 
         kl_cross_tp = _kl_divergence_from_logits(reference_logits, cross_tp_logits)
         max_kl_cross_tp = kl_cross_tp.max().item()

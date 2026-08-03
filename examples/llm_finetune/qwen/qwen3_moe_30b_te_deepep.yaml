@@ -125,9 +125,14 @@ ci:
   time: "00:15:00"
   vllm_deploy: true
   vllm_smoke_test: true
+  env_vars:
+    # Keep reload comparisons independent of accelerator state retained by training.
+    CHECKPOINT_ROBUSTNESS_PHASES: >-
+      train_and_save automodel_reload hf_reload
   checkpoint_robustness:
-    # Controlled current-stack isolation observed KL 0.0199; historical backend/lifecycle paths reached 0.0404.
+    # Same-process CI reached KL 0.2667, while controlled fresh-process reloads were stable at 0.0199.
     hf_kl_threshold: 5e-2
+    process_isolation: true
     tokenizer_name: Qwen/Qwen3-30B-A3B
     no_check_resume: true
     dataset.num_samples_limit: 500

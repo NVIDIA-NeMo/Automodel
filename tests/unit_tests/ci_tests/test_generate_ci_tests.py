@@ -146,7 +146,18 @@ def test_generate_qwen3_moe_lora_uses_isolated_reload_phases():
     assert variables["CHECKPOINT_ROBUSTNESS_PHASES"] == (
         "source_load_reference source_load_parity train_and_save automodel_reload hf_reload"
     )
+    assert variables["CHECKPOINT_ROBUSTNESS_VERBOSE_DIAGNOSTICS"] == "1"
     assert robustness["check_source_load_parity"] is True
     assert robustness["source_load_kl_threshold"] == 3e-2
     assert robustness["source_load_mean_kl_threshold"] == 6e-3
     assert robustness["source_load_cosine_threshold"] == 0.997
+
+
+def test_generate_qwen3_moe_te_deepep_uses_isolated_reload_phases():
+    config = Path("examples/llm_finetune/qwen/qwen3_moe_30b_te_deepep.yaml")
+
+    jobs = dict(generate_job(config, {}, "release", "llm_finetune", "."))
+
+    variables = jobs[""]["variables"]
+    assert variables["CHECKPOINT_ROBUSTNESS_PROCESS_ISOLATION"] == "true"
+    assert variables["CHECKPOINT_ROBUSTNESS_PHASES"] == "train_and_save automodel_reload hf_reload"

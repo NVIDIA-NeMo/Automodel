@@ -30,6 +30,7 @@ from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm
     _finish_hf_reload_sync,
     _get_input_ids,
     _get_logits_pp,
+    _get_logits_with_diagnostics,
     _hf_device_map_max_memory,
     _hf_fp32_module_names,
     _hf_model_load_context,
@@ -122,6 +123,25 @@ def test_peft_adapter_fingerprints_match_saved_safetensors(tmp_path):
     assert ignored == 0
 
 
+def test_peft_adapter_fingerprints_ignore_reported_base_layer_tensor(tmp_path):
+    from safetensors.torch import save_file
+
+    adapter_path = tmp_path / "adapter_model.safetensors"
+    adapter_key = "base_model.model.lm_head.lora_A.weight"
+    saved_state = {adapter_key: torch.tensor([[1.0, 2.0]], dtype=torch.bfloat16)}
+    loaded_state = {
+        adapter_key: saved_state[adapter_key].clone(),
+        "base_model.model.lm_head.base_layer.weight": torch.tensor([[3.0, 4.0]], dtype=torch.bfloat16),
+    }
+    save_file(saved_state, adapter_path)
+
+    with patch("peft.get_peft_model_state_dict", return_value=loaded_state):
+        matched, ignored = _assert_peft_adapter_matches_checkpoint(Mock(), adapter_path)
+
+    assert matched == 1
+    assert ignored == 0
+
+
 def test_peft_adapter_fingerprints_allow_configured_hf_unsupported_prefix(tmp_path):
     from safetensors.torch import save_file
 
@@ -203,6 +223,31 @@ def test_peft_adapter_fingerprints_report_tensor_mismatch(tmp_path):
         pytest.raises(AssertionError, match="adapter tensor mismatch"),
     ):
         _assert_peft_adapter_matches_checkpoint(Mock(), adapter_path)
+
+
+def test_get_logits_verbose_diagnostics_repeats_forward(monkeypatch, capsys):
+    class RepeatModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+            self.config = SimpleNamespace(_commit_hash="test-revision", model_type="test")
+
+        def forward(self, input_ids, attention_mask, use_cache):
+            del attention_mask, use_cache
+            self.calls += 1
+            return SimpleNamespace(logits=torch.zeros((*input_ids.shape, 4), device=input_ids.device))
+
+    monkeypatch.setenv("CHECKPOINT_ROBUSTNESS_VERBOSE_DIAGNOSTICS", "1")
+    model = RepeatModel()
+
+    logits = _get_logits_with_diagnostics(model, [1, 2], torch.device("cpu"))
+
+    assert model.calls == 2
+    assert logits.shape == (1, 2, 4)
+    output = capsys.readouterr().out
+    assert "[checkpoint-diagnostic][repeat-forward]" in output
+    assert '"max_abs_diff": 0.0' in output
+    assert '"max_self_kl": 0.0' in output
 
 
 def test_remote_masking_api_compatibility_drops_removed_cache_position(monkeypatch):
