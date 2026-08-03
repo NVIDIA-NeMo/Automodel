@@ -195,6 +195,15 @@ class TestBackendConfigHybridEP:
         )
         assert config.dispatcher_capacity_factor == 1.25
 
+    def test_hybridep_dynamic_capacity_enables_no_drop_sync_free_contract(self):
+        """Test that dynamic HybridEP capacity is accepted with device-offset experts."""
+        config = BackendConfig(
+            dispatcher="hybridep",
+            experts="torch_mm",
+            dispatcher_capacity_factor="dynamic",
+        )
+        assert config.dispatcher_capacity_factor == "dynamic"
+
     @pytest.mark.parametrize(
         ("dispatcher", "experts", "capacity_factor"),
         [
@@ -202,6 +211,7 @@ class TestBackendConfigHybridEP:
             ("hybridep", "gmm", 1.25),
             ("hybridep", "torch_mm", 0.99),
             ("hybridep", "torch_mm", float("inf")),
+            ("hybridep", "torch_mm", "invalid"),
         ],
     )
     def test_hybridep_capacity_factor_rejects_unsupported_contract(self, dispatcher, experts, capacity_factor):

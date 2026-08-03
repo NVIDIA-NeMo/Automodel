@@ -187,6 +187,44 @@ class TestHybridEPFixedCapacity:
         assert manager.num_permuted_tokens == 5
         assert isinstance(manager.num_permuted_tokens, int)
 
+    @pytest.mark.parametrize(("pad_multiple", "capacity"), [(None, 32), (4, 40)])
+    def test_dynamic_dispatch_uses_no_drop_storage_bound_and_device_counts(self, pad_multiple, capacity):
+        """Dynamic logical length uses device metadata with a topology-derived storage bound."""
+        hidden = torch.randn(4, 8)
+        tokens_per_expert = torch.tensor([7, 5])
+        overflow_flag = torch.zeros(1, dtype=torch.int32)
+        dispatched_hidden = torch.empty(capacity, 8)
+        dispatch = Mock(
+            return_value=(
+                dispatched_hidden,
+                torch.empty(capacity),
+                None,
+                tokens_per_expert,
+                (overflow_flag,),
+            )
+        )
+
+        with patch(
+            "nemo_automodel.components.moe.megatron.token_dispatcher.hybrid_ep_dispatch",
+            dispatch,
+        ):
+            manager = _HybridEPManager(
+                group=Mock(),
+                num_local_experts=2,
+                num_experts=8,
+                router_topk=2,
+                capacity_factor="dynamic",
+            )
+            manager.pad_multiple = pad_multiple
+            manager.routing_map = torch.zeros(4, 8, dtype=torch.bool)
+            manager.token_probs = torch.zeros(4, 8)
+            actual = manager.dispatch(hidden)
+
+        assert actual is dispatched_hidden
+        assert dispatch.call_args.kwargs["num_permuted_tokens"] == capacity
+        assert manager.tokens_per_expert is tokens_per_expert
+        assert manager.overflow_flag is overflow_flag
+
     def test_combine_backward_reuses_nonblocking_capacity(self):
         """The combine gradient dispatch retains the host-known capacity contract."""
         grad = torch.randn(10, 8)

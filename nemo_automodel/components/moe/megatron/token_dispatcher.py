@@ -376,7 +376,7 @@ class _HybridEPManager(_DispatchManager):
         router_topk: int,
         permute_fusion: bool = False,
         moe_hybridep_num_sms: int = 24,
-        capacity_factor: Optional[float] = None,
+        capacity_factor: float | Literal["dynamic"] | None = None,
     ):
         self.group = group
         self.num_local_experts = num_local_experts
@@ -451,14 +451,25 @@ class _HybridEPManager(_DispatchManager):
 
         Returns:
             Capacity-shaped expert input tensor of shape [permuted_tokens, hidden].
-            With a capacity factor, unused trailing rows are not valid and
+            With a sync-free capacity policy, unused trailing rows are not valid and
             ``tokens_per_expert`` identifies the valid prefix.
         """
         if self.capacity_factor is None:
             self.num_permuted_tokens = None
+        elif self.capacity_factor == "dynamic":
+            # Tensor shapes and allocations are host metadata, so an exact GPU-computed
+            # row count cannot size a Tensor without synchronization. Reserve the
+            # topology-derived maximum while tokens_per_expert remains the device-side
+            # logical shape consumed by grouped GEMM and HybridEP combine.
+            ep_size = self.num_experts // self.num_local_experts
+            max_local_routes_per_source_token = min(self.num_local_experts, self.router_topk)
+            self.num_permuted_tokens = hidden_states.size(0) * ep_size * max_local_routes_per_source_token
+            if self.pad_multiple is not None and self.pad_multiple > 1:
+                self.num_permuted_tokens += self.num_local_experts * (self.pad_multiple - 1)
         else:
             average_tokens_per_rank = hidden_states.size(0) * self.router_topk
             self.num_permuted_tokens = math.ceil(average_tokens_per_rank * self.capacity_factor)
+        if self.num_permuted_tokens is not None:
             if self.pad_multiple is not None and self.pad_multiple > 1:
                 self.num_permuted_tokens = (
                     (self.num_permuted_tokens + self.pad_multiple - 1) // self.pad_multiple * self.pad_multiple
@@ -522,10 +533,11 @@ class TokenDispatcherConfig:
     moe_permute_fusion: bool = False
     """Fuse token rearrangement ops during token dispatching."""
 
-    moe_expert_capacity_factor: Optional[float] = None
-    """Token capacity factor. DeepEP applies it per expert. HybridEP applies it
-    to average per-rank receive load and enables nonblocking fixed-capacity
-    dispatch; overflowed tokens are dropped. None preserves exact-size dispatch."""
+    moe_expert_capacity_factor: float | Literal["dynamic"] | None = None
+    """Token capacity policy. DeepEP accepts a numeric per-expert factor. HybridEP
+    accepts either a numeric average-rank factor, which can drop overflow, or
+    ``"dynamic"``, which uses GPU logical-length metadata and a no-drop storage
+    bound. None preserves blocking exact-shaped dispatch."""
 
     moe_router_topk: int = 2
     """Number of experts to route to for each token."""
