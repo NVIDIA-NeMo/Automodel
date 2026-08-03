@@ -12,12 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
 
-from nemo_automodel.components.moe.megatron.token_dispatcher import _HybridEPManager, _HybridEPMetadataProcessor
+from nemo_automodel.components.moe.megatron.token_dispatcher import (
+    MoEFlexTokenDispatcher,
+    _HybridEPManager,
+    _HybridEPMetadataProcessor,
+)
 
 
 @pytest.fixture
@@ -56,16 +60,114 @@ class TestIndicesToMultihot:
         assert multihot_probs[1, 1] == pytest.approx(0.7)
         assert multihot_probs[1, 5] == pytest.approx(0.3)
 
-    def test_scoped_processor_matches_existing_conversion(self, hybrid_ep_manager):
+    def test_scoped_processor_matches_existing_probabilities(self, hybrid_ep_manager):
         indices = torch.tensor([[0, 3], [1, -1]])
         probs = torch.tensor([[0.6, 0.4], [0.7, 0.0]])
         processor = _HybridEPMetadataProcessor(num_experts=8, permute_fusion=False)
 
-        expected = hybrid_ep_manager._indices_to_multihot(indices, probs)
+        _, expected = hybrid_ep_manager._indices_to_multihot(indices, probs)
         actual = processor(indices, probs)
 
-        torch.testing.assert_close(actual[0], expected[0])
-        torch.testing.assert_close(actual[1], expected[1])
+        torch.testing.assert_close(actual, expected)
+
+    def test_scoped_processor_preserves_dense_probability_gradients(self):
+        indices = torch.tensor([[0, 3], [1, 5]])
+        probs = torch.tensor([[0.6, 0.4], [0.7, 0.3]], requires_grad=True)
+        processor = _HybridEPMetadataProcessor(num_experts=8, permute_fusion=False)
+
+        dense_probs = processor(indices, probs)
+        dense_weights = torch.arange(16, dtype=dense_probs.dtype).reshape(2, 8)
+        (dense_probs * dense_weights).sum().backward()
+
+        expected_grad = dense_weights.gather(1, indices)
+        torch.testing.assert_close(probs.grad, expected_grad)
+
+    def test_fused_configuration_preserves_dense_probability_gradients(self):
+        indices = torch.tensor([[0, 3], [1, -1]])
+        probs = torch.tensor([[0.6, 0.4], [0.7, 0.3]], requires_grad=True)
+        processor = _HybridEPMetadataProcessor(num_experts=8, permute_fusion=True)
+
+        dense_probs = processor(indices, probs)
+        dense_weights = torch.arange(16, dtype=dense_probs.dtype).reshape(2, 8)
+        (dense_probs * dense_weights).sum().backward()
+
+        assert dense_probs.shape == (2, 8)
+        torch.testing.assert_close(probs.grad, torch.tensor([[0.0, 3.0], [9.0, 0.0]]))
+
+    def test_dispatch_passes_compact_indices_and_dense_probs(self, hybrid_ep_manager):
+        token_indices = torch.tensor([[0, 3], [1, 5]])
+        dense_probs = torch.zeros(2, 8)
+        hidden = torch.randn(2, 4)
+        hybrid_ep_manager.token_indices = token_indices
+        hybrid_ep_manager.routing_map = None
+        hybrid_ep_manager.token_probs = dense_probs
+        dispatch = Mock(return_value=(hidden, dense_probs, None, torch.tensor([1, 1]), object()))
+
+        with patch("nemo_automodel.components.moe.megatron.token_dispatcher.hybrid_ep_dispatch", dispatch):
+            actual = hybrid_ep_manager.dispatch(hidden)
+
+        assert actual is hidden
+        dispatch.assert_called_once()
+        kwargs = dispatch.call_args.kwargs
+        assert kwargs["topk_idx"] is token_indices
+        assert kwargs["routing_map"] is None
+        assert kwargs["probs"] is dense_probs
+        assert kwargs["num_experts"] == 8
+
+    def test_permute_fusion_is_forwarded_to_dispatch_and_combine(self, hybrid_ep_manager):
+        manager = hybrid_ep_manager
+        manager.moe_hybridep_permute_fusion = True
+        hidden = torch.randn(2, 4)
+        dense_probs = torch.zeros(2, 8)
+        manager.token_indices = torch.tensor([[0, 3], [1, 5]])
+        manager.routing_map = None
+        manager.token_probs = dense_probs
+        handle = object()
+        dispatch = Mock(return_value=(hidden, dense_probs, None, torch.tensor([1, 1]), handle))
+        combine = Mock(return_value=hidden)
+
+        with (
+            patch("nemo_automodel.components.moe.megatron.token_dispatcher.hybrid_ep_dispatch", dispatch),
+            patch("nemo_automodel.components.moe.megatron.token_dispatcher.hybrid_ep_combine", combine),
+        ):
+            manager.dispatch(hidden)
+            manager.combine(hidden)
+
+        assert dispatch.call_args.kwargs["fuse_permute"] is True
+        assert combine.call_args.kwargs["fuse_permute"] is True
+
+    def test_hybridep_constructor_tuning_is_forwarded(self, hybrid_ep_manager):
+        manager = hybrid_ep_manager
+        manager.moe_hybridep_num_sms_preprocessing = 132
+        manager.moe_hybridep_num_blocks_permute = 112
+        manager.moe_hybridep_num_blocks_unpermute = 111
+        manager.token_indices = torch.tensor([[0, 3], [1, 5]])
+        manager.routing_map = None
+        manager.token_probs = torch.zeros(2, 8)
+        dispatch = Mock(return_value=(torch.randn(2, 4), None, None, torch.tensor([1, 1]), object()))
+
+        with patch("nemo_automodel.components.moe.megatron.token_dispatcher.hybrid_ep_dispatch", dispatch):
+            manager.dispatch(torch.randn(2, 4))
+
+        kwargs = dispatch.call_args.kwargs
+        assert kwargs["num_sms_preprocessing_api"] == 132
+        assert kwargs["num_blocks_permute"] == 112
+        assert kwargs["num_blocks_unpermute"] == 111
+
+    def test_dispatch_preprocess_retains_compact_indices(self, hybrid_ep_manager):
+        dispatcher = object.__new__(MoEFlexTokenDispatcher)
+        dispatcher._comm_manager = hybrid_ep_manager
+        dispatcher.hybridep_metadata_processor = _HybridEPMetadataProcessor(num_experts=8, permute_fusion=False)
+        hidden = torch.randn(2, 4)
+        token_indices = torch.tensor([[0, 3], [1, 5]])
+        token_probs = torch.tensor([[0.6, 0.4], [0.7, 0.3]])
+
+        actual_hidden, actual_probs = dispatcher.dispatch_preprocess2(hidden, 2, token_probs, token_indices)
+
+        assert actual_hidden.data_ptr() == hidden.data_ptr()
+        assert hybrid_ep_manager.token_indices is token_indices
+        assert hybrid_ep_manager.routing_map is None
+        assert actual_probs.shape == (2, 8)
 
     def test_topk_1(self, hybrid_ep_manager):
         """Each token routed to exactly one expert."""

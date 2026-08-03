@@ -75,10 +75,13 @@ RUN if [ "$INSTALL_TE" = "True" ]; then \
     cd ../ && rm -rf TransformerEngine; \
     fi
 
-# Install HybridEP / DeepEP: apt rdma-core v60 (build==runtime libibverbs), nvshmem wheel 3.6.5.
-# DEEPEP_COMMIT = 17cfb817 + DeepEP #638, padding max_num_of_tokens_per_rank to the combine-kernel chunk size.
-COPY docker/common/deepep.patch /opt/deepep.patch
-ARG DEEPEP_COMMIT=42144303752422ade37f24bca9e2dde12df70e09
+# Install HybridEP / DeepEP. Build with apt rdma-core v60 (so build==runtime libibverbs)
+# and RDMA_CORE_HOME symlinked to the system install; create the libnvshmem_host.so->.so.3
+# symlink required for DeepEP fabric handle ops; use the nvshmem wheel 3.6.5 and pin
+# DEEPEP_COMMIT to the automodel_r0.6.0 HybridEP release branch tip: PR 673 plus reusable
+# NCCL preprocessing storage. It retains the #638 combine-kernel padding fix, compact int16
+# top-k metadata, and fused permute/unpermute support while preserving dense-probability numerics.
+ARG DEEPEP_COMMIT=7e880e13c9a2ba80bc9bf89ca811f083987867eb
 ENV HYBRID_EP_MULTINODE=1
 ENV RDMA_CORE_HOME=/opt/rdma-core/build
 ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64/:$LD_LIBRARY_PATH
@@ -91,18 +94,17 @@ RUN apt-get update && apt-get install -y --allow-change-held-packages \
     mkdir -p ${RDMA_CORE_HOME} && \
     ln -sfn /usr/include ${RDMA_CORE_HOME}/include && \
     ln -sfn /usr/lib/${ARCH_LIB} ${RDMA_CORE_HOME}/lib && \
-    git clone https://github.com/deepseek-ai/DeepEP.git && \
+    git clone https://github.com/akoumpa/DeepEP.git && \
     cd DeepEP && \
     git fetch origin $DEEPEP_COMMIT && \
     git checkout FETCH_HEAD && \
-    patch -p1 < /opt/deepep.patch && \
     pip install --no-cache-dir nvidia-nvshmem-cu13==3.6.5 && \
     NVSHMEM_LIB_PATH=$(pip show nvidia-nvshmem-cu13 | grep "Location:" | cut -d' ' -f2)/nvidia/nvshmem/lib && \
     ln -sf ${NVSHMEM_LIB_PATH}/libnvshmem_host.so.3 ${NVSHMEM_LIB_PATH}/libnvshmem_host.so && \
     apt-get update && apt-get install -y --no-install-recommends libnvidia-ml-dev && \
     TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" pip install --no-cache-dir --no-build-isolation -v . && \
     apt-get purge -y libnvidia-ml-dev && apt-get autoremove -y && \
-    rm -rf /var/lib/apt/lists/* /opt/deepep.patch && \
+    rm -rf /var/lib/apt/lists/* && \
     cd / && rm -rf DeepEP
 
 # Install Bitsandbytes
@@ -211,16 +213,21 @@ ARG AUTOMODEL_INSTALL=all
 ARG UV_SYNC_ARGS="--locked"
 # Preserve locally built wheels for source-only CUDA packages such as flash-attn,
 # causal-conv1d, mamba-ssm, and nv-grouped-gemm across BuildKit builds.
+# DeepEP is already compiled above against the PyTorch image's Torch. The final
+# PyTorch sync must not rebuild it after the lock intentionally removes runtime Torch.
 RUN --mount=type=cache,target=/opt/uv_cache,sharing=locked \
     if [ "$BASE_IMAGE" = "pytorch" ]; then \
-        bash docker/common/update_pyproject_pytorch.sh /opt/Automodel; \
+        bash docker/common/update_pyproject_pytorch.sh /opt/Automodel && \
+        DEEPEP_SYNC_ARGS="--no-install-package deep-ep"; \
+    else \
+        DEEPEP_SYNC_ARGS=""; \
     fi && \
     MAGI_ATTENTION_BUILD_COMPUTE_CAPABILITY="90,100" \
         MAGI_ATTENTION_PREBUILD_FFA=0 \
         MAX_JOBS=8 \
         UV_CONCURRENT_INSTALLS=8 \
-        uv sync --extra $AUTOMODEL_INSTALL --all-groups $UV_SYNC_ARGS && \
-    python -c "import importlib.metadata as m; import magi_attention; print('magi-attention', m.version('magi-attention'))"
+        uv sync --extra $AUTOMODEL_INSTALL --all-groups $UV_SYNC_ARGS $DEEPEP_SYNC_ARGS && \
+    python -c "import importlib.metadata as m, magi_attention; print('deep-ep', m.version('deep-ep')); print('magi-attention', m.version('magi-attention'))"
 
 # Persistent disk cache for FA4's CuTe-DSL JIT (amortizes kernel compiles across restarts)
 ENV FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1

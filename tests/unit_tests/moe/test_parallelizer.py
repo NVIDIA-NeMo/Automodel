@@ -653,9 +653,10 @@ def test_apply_ac_wraps_blocks_with_and_without_context(monkeypatch):
     model.layers.registered.clear()
 
     P.apply_ac(model, ignore_router=False, hidden_size=7168, num_experts=256)
-    # context_fn should not be passed (3rd arg remains default None)
+    # Passing context_fn=None is not equivalent to omitting it: newer torch
+    # checkpoint implementations call any explicitly supplied context_fn.
     for _, kwargs in wrapper_mock.call_args_list:
-        assert "context_fn" not in kwargs or kwargs["context_fn"] is None
+        assert "context_fn" not in kwargs
     assert len(model.layers.registered) == 2
 
 

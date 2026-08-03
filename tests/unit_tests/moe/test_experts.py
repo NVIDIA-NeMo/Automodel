@@ -821,8 +821,15 @@ class TestGroupedExpertsDeepEP:
 
     def test_grouped_experts_deepep_token_dispatcher_init_hybridep(self, moe_config):
         """Test init_token_dispatcher passes hybridep config to TokenDispatcherConfig."""
+        backend = BackendConfig(
+            dispatcher_hybridep_permute_fusion=True,
+            dispatcher_hybridep_num_sms_preprocessing=132,
+            dispatcher_hybridep_num_blocks_permute=112,
+            dispatcher_hybridep_num_blocks_unpermute=112,
+        )
         experts = GroupedExpertsDeepEP(
             moe_config,
+            backend=backend,
             dispatcher_backend="hybridep",
             dispatcher_num_sms=24,
             dispatcher_share_token_dispatcher=False,
@@ -849,6 +856,10 @@ class TestGroupedExpertsDeepEP:
             assert config_arg.moe_deepep_num_sms == 24
             assert config_arg.moe_share_token_dispatcher is False
             assert config_arg.moe_deepep_async_dispatch is True
+            assert config_arg.moe_hybridep_permute_fusion is True
+            assert config_arg.moe_hybridep_num_sms_preprocessing == 132
+            assert config_arg.moe_hybridep_num_blocks_permute == 112
+            assert config_arg.moe_hybridep_num_blocks_unpermute == 112
 
 
 class TestNonGatedActivations:
