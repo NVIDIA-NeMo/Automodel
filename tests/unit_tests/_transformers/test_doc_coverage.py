@@ -75,6 +75,7 @@ _DOC_ARCH_ALIASES = {
     # arch name; the registry wires their MoE backbones under these keys.
     "Qwen3OmniMoeForConditionalGeneration": "Qwen3OmniForConditionalGeneration",
     "Qwen3VLMoeForConditionalGeneration": "Qwen3VLForConditionalGeneration",
+    "Qwen3_5MoeForCausalLM": "Qwen3_5MoeVLForConditionalGeneration",
     "Qwen3_5MoeForConditionalGeneration": "Qwen3_5MoeVLForConditionalGeneration",
     # Dense Qwen3.5 text/VL backbone; grouped with the VL variants on the
     # Qwen3.5-VL page.

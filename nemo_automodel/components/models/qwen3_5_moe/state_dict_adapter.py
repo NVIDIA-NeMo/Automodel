@@ -162,6 +162,7 @@ class Qwen3_5MoeStateDictAdapter(StateDictAdapter):
         dtype: torch.dtype = torch.float32,
         pretrained_model_name_or_path: str | None = None,
         mtp_expert_hf_layout: str | None = None,
+        text_only: bool = False,
     ):
         self.config = config
         self.moe_config = moe_config
@@ -169,6 +170,7 @@ class Qwen3_5MoeStateDictAdapter(StateDictAdapter):
         self.dtype = dtype
         self.pretrained_model_name_or_path = pretrained_model_name_or_path
         self.mtp_expert_hf_layout = mtp_expert_hf_layout
+        self.text_only = text_only
         self._inferred_mtp_expert_hf_layout: str | None = None
         self._local_checkpoint_layout_checked = False
         self._uses_model_prefix = True
@@ -312,7 +314,7 @@ class Qwen3_5MoeStateDictAdapter(StateDictAdapter):
                 continue
 
             match = re.match(
-                r"(?:model\.)?language_model\.layers\.(\d+)\.mlp\.experts\.(gate_up_proj|down_proj)$",
+                r"(?:model\.)?(?:language_model\.)?layers\.(\d+)\.mlp\.experts\.(gate_up_proj|down_proj)$",
                 key,
             )
             mtp_match = re.match(r"mtp\.layers\.(\d+)\.mlp\.experts\.(gate_up_proj|down_proj)$", key)
@@ -323,7 +325,8 @@ class Qwen3_5MoeStateDictAdapter(StateDictAdapter):
                 if mtp_match:
                     native_key = f"mtp.layers.{layer_num}.mlp.experts."
                 else:
-                    native_key = f"{model_prefix}language_model.layers.{layer_num}.mlp.experts."
+                    language_model_prefix = "" if self.text_only else "language_model."
+                    native_key = f"{model_prefix}{language_model_prefix}layers.{layer_num}.mlp.experts."
                 native_key += "gate_and_up_projs" if which == "gate_up_proj" else "down_projs"
 
                 if state_dict_utils.is_dtensor(value):
