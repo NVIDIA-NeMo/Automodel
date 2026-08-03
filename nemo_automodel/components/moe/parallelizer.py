@@ -858,11 +858,14 @@ def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p
     for _parent, _layer_id, block in iter_transformer_and_mtp_blocks(model):
         layer_type = getattr(block, "layer_type", getattr(block, "attention_type", "full_attention"))
 
-        if layer_type in ("full_attention", "sliding_attention"):
+        # Inkling names its global and sliding decoder layers "hybrid" / "hybrid_sliding";
+        # both are ordinary softmax attention as far as CP setup is concerned.
+        if layer_type in ("full_attention", "sliding_attention", "hybrid", "hybrid_sliding"):
+            is_sliding = layer_type in ("sliding_attention", "hybrid_sliding")
             self_attn = block.self_attn
             attn_module = getattr(self_attn, "attn_module", None)
             if isinstance(attn_module, DotProductAttention):
-                attn_cp_comm_type = "all_gather" if layer_type == "sliding_attention" else cp_comm_type
+                attn_cp_comm_type = "all_gather" if is_sliding else cp_comm_type
                 attn_module.set_context_parallel_group(
                     cp_mesh.get_group(),
                     torch.distributed.get_process_group_ranks(cp_mesh.get_group()),

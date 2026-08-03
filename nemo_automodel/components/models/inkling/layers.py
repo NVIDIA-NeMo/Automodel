@@ -118,6 +118,31 @@ class InklingShortConvolution(nn.Module):
     def __init__(self, source: nn.Module) -> None:
         super().__init__()
         self._fp32_params = _InklingShortConvolutionFP32(source)
+        self._cp_shard: tuple[int, int] | None = None
+
+    def set_cp_shard(self, cp_rank: int, cp_size: int) -> None:
+        """Declare that this convolution sees only one contiguous sequence shard.
+
+        Under context parallelism ``conv_mask`` stays full length, because the
+        convolutions inside attention run after the all-to-all and need the whole
+        sequence. The residual-stream convolutions do not: they still see ``S / cp``
+        tokens, so they must slice the mask down to their own window.
+        """
+        self._cp_shard = None if cp_size <= 1 else (cp_rank, cp_size)
+
+    def _local_conv_mask(self, conv_mask: torch.Tensor | None, seq_len: int) -> torch.Tensor | None:
+        if conv_mask is None or self._cp_shard is None or conv_mask.ndim != 2:
+            return conv_mask
+        if conv_mask.shape[1] == seq_len:
+            return conv_mask
+        cp_rank, cp_size = self._cp_shard
+        if conv_mask.shape[1] != seq_len * cp_size:
+            raise ValueError(
+                f"conv_mask has {conv_mask.shape[1]} positions, expected either {seq_len} (local) "
+                f"or {seq_len * cp_size} (full) for cp_size={cp_size}"
+            )
+        start = cp_rank * seq_len
+        return conv_mask[:, start : start + seq_len]
 
     def forward(
         self,
@@ -131,7 +156,8 @@ class InklingShortConvolution(nn.Module):
         Args:
             hidden_states: Tensor of shape ``[batch, sequence, hidden]``.
             past_key_values: Optional cache holding the per-layer conv state.
-            conv_mask: Optional boolean padding mask of shape ``[batch, sequence]``.
+            conv_mask: Optional boolean padding mask of shape ``[batch, sequence]``, or
+                of full-sequence length when context parallelism is active.
 
         Returns:
             torch.Tensor: Tensor of shape ``[batch, sequence, hidden]`` in the input
@@ -141,7 +167,7 @@ class InklingShortConvolution(nn.Module):
         output = self._fp32_params(
             hidden_states.float(),
             past_key_values=past_key_values,
-            conv_mask=conv_mask,
+            conv_mask=self._local_conv_mask(conv_mask, hidden_states.shape[1]),
             **kwargs,
         )
         return output.to(dtype=input_dtype)

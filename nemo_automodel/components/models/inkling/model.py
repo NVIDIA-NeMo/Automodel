@@ -88,12 +88,23 @@ from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 from .state_dict_adapter import InklingStateDictAdapter
 
 if _INKLING_HF_AVAILABLE:
+    from .cp_attention import attach_inkling_upipe_attention
     from .layers import InklingDenseMLP, InklingMoE, InklingShortConvolution, build_inkling_moe_config
 else:
+    attach_inkling_upipe_attention = _make_missing("attach_inkling_upipe_attention")
     InklingDenseMLP = _make_missing("InklingDenseMLP")
     InklingMoE = _make_missing("InklingMoE")
     InklingShortConvolution = _make_missing("InklingShortConvolution")
     build_inkling_moe_config = _make_missing("build_inkling_moe_config")
+
+
+def _full_padding_mask(attention_mask: Any) -> torch.Tensor | None:
+    """Reduce an incoming attention mask to the 2D keep-map the convolutions consume."""
+    if isinstance(attention_mask, dict):
+        attention_mask = attention_mask.get("linear_attention")
+    if not isinstance(attention_mask, torch.Tensor) or attention_mask.ndim != 2:
+        return None
+    return attention_mask.bool()
 
 
 class InklingTextModel(HFInklingTextModel):
@@ -131,7 +142,17 @@ class InklingTextModel(HFInklingTextModel):
             position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen_tokens
             position_ids = position_ids.unsqueeze(0)
 
-        if not isinstance(causal_mask_mapping := attention_mask, dict):
+        if getattr(self, "_cp_enabled", False):
+            # Under CP the attention masks are rebuilt inside the UPipe attention from
+            # global token indices, so only the padding map has to travel. It stays at
+            # full length: the K/V convolutions run after the all-to-all and need padding
+            # information for positions this rank does not own.
+            causal_mask_mapping = {
+                "full_attention": None,
+                "sliding_attention": None,
+                "linear_attention": _full_padding_mask(attention_mask),
+            }
+        elif not isinstance(causal_mask_mapping := attention_mask, dict):
             mask_kwargs = {
                 "config": self.config,
                 "inputs_embeds": inputs_embeds,
@@ -189,12 +210,21 @@ class InklingForConditionalGeneration(HFCheckpointingMixin, HFInklingForConditio
     # Short convolutions and router correction bias use callable fp32 holders.
     _keep_in_fp32_modules_strict = ["_fp32_params"]
 
+    # Attention is model-owned under CP (head-chunked UPipe over FlexAttention), so the
+    # runtime's SDPA-backend gate is the right one to pass.
+    _supports_cp_sdpa: bool = True
+
+    # CP submesh, installed by the parallelizer when context parallelism is active.
+    cp_mesh = None
+
     @dataclass(frozen=True)
     class ModelCapabilities:
         """Declared parallelism capabilities for this model class."""
 
         supports_tp: bool = False
-        supports_cp: bool = False
+        # CP is supported through the head-chunked UPipe attention in cp_attention.py;
+        # the batch is sharded contiguously (see prepare_model_inputs_for_cp).
+        supports_cp: bool = True
         supports_pp: bool = True
         supports_ep: bool = True
 
@@ -261,6 +291,8 @@ class InklingForConditionalGeneration(HFCheckpointingMixin, HFInklingForConditio
             layer.self_attn.v_sconv = InklingShortConvolution(layer.self_attn.v_sconv)
             layer.attn_sconv = InklingShortConvolution(layer.attn_sconv)
             layer.mlp_sconv = InklingShortConvolution(layer.mlp_sconv)
+            # Inert until the parallelizer hands over a CP mesh.
+            attach_inkling_upipe_attention(layer.self_attn)
             if isinstance(layer.mlp, HFInklingMoE):
                 layer.mlp = InklingMoE(text_config, backend, moe_config=self.moe_config)
             elif isinstance(layer.mlp, HFInklingMLP):
@@ -291,6 +323,47 @@ class InklingForConditionalGeneration(HFCheckpointingMixin, HFInklingForConditio
         del text_model
         module_names_per_stage[0].append(f"{layers_prefix}embed_norm")
         return module_names_per_stage
+
+    def prepare_model_inputs_for_cp(
+        self,
+        batch: dict[str, Any],
+        *,
+        num_chunks: int = 1,
+    ) -> dict[str, Any]:
+        """Hand the recipe Inkling's own context-parallel batch sharding.
+
+        Sharding is contiguous rather than load-balanced round-robin: the UPipe
+        all-to-all reassembles the sequence in rank order, and the residual-stream
+        convolutions need contiguous neighbors. ``attention_mask`` is left full length so
+        the post-all-to-all convolutions can see padding outside this rank's shard.
+
+        Args:
+            batch: Full-sequence batch; left untouched until the returned sharder runs.
+            num_chunks: Accepted for CP hook signature parity; Inkling uses one
+                contiguous shard per rank.
+
+        Returns:
+            dict: Batch updates carrying the model-owned context-parallel sharder.
+        """
+        from nemo_automodel.components.distributed.context_parallel.sharder import (  # noqa: PLC0415
+            ContextParallelSharder,
+            contiguous_local_indices,
+        )
+
+        from .cp import setup_inkling_cp, shard_batch_for_inkling_cp  # noqa: PLC0415
+
+        cp_mesh = getattr(self, "cp_mesh", None)
+        if cp_mesh is None:
+            raise RuntimeError("Inkling context-parallel input preparation requires a CP mesh.")
+        setup_inkling_cp(self, cp_mesh)
+
+        del batch, num_chunks
+        return {
+            "cp_sharder": ContextParallelSharder(
+                shard_batch=shard_batch_for_inkling_cp,
+                local_token_global_indices=contiguous_local_indices,
+            )
+        }
 
     def get_pipeline_stage_metas(
         self,
