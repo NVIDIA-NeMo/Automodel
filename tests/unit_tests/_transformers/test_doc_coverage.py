@@ -29,8 +29,9 @@ import pathlib
 # page). New entries should include a short inline comment explaining the
 # mismatch.
 #
-# Shared by ``test_doc_coverage.py`` (registry archs) and
-# ``test_recipe_doc_coverage.py`` (arches resolved from example YAMLs).
+# Shared by ``test_doc_coverage.py`` (registry archs), the generated
+# ready-to-run architecture table, and ``test_recipe_doc_coverage.py`` (arches
+# resolved from example YAMLs).
 _DOC_ARCH_ALIASES = {
     # HF ships the class as ``BaiChuanForCausalLM`` (CamelCase) — registry
     # uses ``BaichuanForCausalLM``. Documented on the Baichuan page.

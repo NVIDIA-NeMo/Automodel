@@ -74,6 +74,7 @@ class _ModelRelease:
     release_date: str
     model: str
     hf_model_id: str
+    architectures: tuple[str, ...]
     docs_page: str
     model_type: str
     recipe: str
@@ -203,6 +204,7 @@ def _load_model_releases(catalog_path: Path, repo_root: Path) -> list[_ModelRele
             "date",
             "model",
             "hf_model_id",
+            "architectures",
             "docs_page",
             "type",
             "recipe",
@@ -211,7 +213,16 @@ def _load_model_releases(catalog_path: Path, repo_root: Path) -> list[_ModelRele
         }
         if unknown_fields:
             raise ValueError(f"Model release {index} has unknown fields: {', '.join(sorted(unknown_fields))}")
-        missing_fields = {"date", "model", "hf_model_id", "docs_page", "type", "recipe", "brev_status"} - set(raw_entry)
+        missing_fields = {
+            "date",
+            "model",
+            "hf_model_id",
+            "architectures",
+            "docs_page",
+            "type",
+            "recipe",
+            "brev_status",
+        } - set(raw_entry)
         if missing_fields:
             raise ValueError(f"Model release {index} is missing fields: {', '.join(sorted(missing_fields))}")
 
@@ -230,6 +241,13 @@ def _load_model_releases(catalog_path: Path, repo_root: Path) -> list[_ModelRele
 
         model = _require_catalog_text(raw_entry, "model", index)
         hf_model_id = _require_catalog_text(raw_entry, "hf_model_id", index)
+        architectures_value = raw_entry.get("architectures")
+        if not isinstance(architectures_value, list) or any(
+            not isinstance(architecture, str) or not architecture or MARKDOWN_UNSAFE_PATTERN.search(architecture)
+            for architecture in architectures_value
+        ):
+            raise ValueError(f"Model release {index} architectures must be a list of Markdown-safe strings")
+        architectures = tuple(architectures_value)
         docs_page = _require_catalog_text(raw_entry, "docs_page", index)
         model_type = _require_catalog_text(raw_entry, "type", index)
         if not HF_MODEL_ID_PATTERN.fullmatch(hf_model_id):
@@ -288,6 +306,7 @@ def _load_model_releases(catalog_path: Path, repo_root: Path) -> list[_ModelRele
                 release_date=release_date,
                 model=model,
                 hf_model_id=hf_model_id,
+                architectures=architectures,
                 docs_page=docs_page,
                 model_type=model_type,
                 recipe=recipe,
@@ -419,16 +438,50 @@ def _parse_registry_entries(source: str) -> list[tuple[str, str, str]]:
     return sorted(entries, key=lambda entry: entry[0].casefold())
 
 
-def _render_registry_table(entries: list[tuple[str, str, str]]) -> str:
-    table_rows = [
-        f"| `{architecture}` | `{module_path}.{class_name}` |" for architecture, module_path, class_name in entries
+def _parse_doc_arch_aliases(source: str) -> dict[str, str]:
+    tree = ast.parse(source)
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(isinstance(target, ast.Name) and target.id == "_DOC_ARCH_ALIASES" for target in node.targets):
+            continue
+        aliases = ast.literal_eval(node.value)
+        if not isinstance(aliases, dict) or any(
+            not isinstance(architecture, str) or not isinstance(documented_name, str)
+            for architecture, documented_name in aliases.items()
+        ):
+            raise ValueError("_DOC_ARCH_ALIASES must be a string-to-string dictionary")
+        return aliases
+    raise ValueError("Could not find _DOC_ARCH_ALIASES")
+
+
+def _render_architecture_name(architecture: str, aliases: dict[str, str]) -> str:
+    documented_name = aliases.get(architecture, architecture)
+    if documented_name == architecture:
+        return f"`{architecture}`"
+    return f"`{documented_name}` (`{architecture}`)"
+
+
+def _render_registry_table(
+    entries: list[tuple[str, str, str]], recipe_architectures: set[str], aliases: dict[str, str]
+) -> str:
+    native_architectures = {architecture for architecture, _, _ in entries}
+    native_rows = [
+        f"| {_render_architecture_name(architecture, aliases)} | NeMo native | `{module_path}.{class_name}` |"
+        for architecture, module_path, class_name in entries
+        if architecture in recipe_architectures
+    ]
+    hf_rows = [
+        f"| {_render_architecture_name(architecture, aliases)} | Hugging Face | `transformers` |"
+        for architecture in sorted(recipe_architectures - native_architectures, key=str.casefold)
     ]
     return "\n".join(
         [
             REGISTRY_START_MARKER,
-            "| Checkpoint Architecture | NeMo Implementation |",
-            "|---|---|",
-            *table_rows,
+            "| Architecture | Source | Implementation |",
+            "|---|---|---|",
+            *native_rows,
+            *hf_rows,
             REGISTRY_END_MARKER,
         ]
     )
@@ -440,16 +493,23 @@ def _generate_tables(repo_root: Path) -> dict[Path, str]:
     homepage_path = repo_root / "docs" / "index.mdx"
     overview_path = repo_root / "docs" / "model-coverage" / "overview.mdx"
     registry_path = repo_root / "nemo_automodel" / "_transformers" / "registry.py"
+    aliases_path = repo_root / "tests" / "unit_tests" / "_transformers" / "test_doc_coverage.py"
 
     support_log = support_log_path.read_text(encoding="utf-8")
     homepage = homepage_path.read_text(encoding="utf-8")
     overview = overview_path.read_text(encoding="utf-8")
     registry_source = registry_path.read_text(encoding="utf-8")
+    aliases_source = aliases_path.read_text(encoding="utf-8")
 
     releases = _load_model_releases(release_catalog_path, repo_root)
     generated_support_log = _render_support_log_table(releases)
     generated_homepage = _render_homepage_table(releases)
-    generated_registry = _render_registry_table(_parse_registry_entries(registry_source))
+    recipe_architectures = {architecture for release in releases for architecture in release.architectures}
+    generated_registry = _render_registry_table(
+        _parse_registry_entries(registry_source),
+        recipe_architectures,
+        _parse_doc_arch_aliases(aliases_source),
+    )
     return {
         support_log_path: _replace_generated_block(
             support_log, SUPPORT_LOG_START_MARKER, SUPPORT_LOG_END_MARKER, generated_support_log

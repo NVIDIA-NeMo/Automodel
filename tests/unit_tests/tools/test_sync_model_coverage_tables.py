@@ -30,6 +30,7 @@ from tests.ci_tests.utils.sync_model_coverage_tables import (
     SUPPORT_LOG_START_MARKER,
     TABLE_ROW_COUNT,
     _load_model_releases,
+    _parse_doc_arch_aliases,
     _parse_registry_entries,
     _render_registry_table,
     _replace_generated_block,
@@ -98,24 +99,54 @@ MODEL_ARCH_MAPPING = OrderedDict(
 """
 
     entries = _parse_registry_entries(source)
-    generated = _render_registry_table(entries)
+    generated = _render_registry_table(entries, {"AlphaModel", "ExternalModel", "ZuluForCausalLM"}, {})
 
     assert entries == [
         ("AlphaModel", "nemo_automodel.components.models.alpha.model", "AlphaModel"),
         ("ZuluForCausalLM", "nemo_automodel.components.models.zulu.model", "ZuluForCausalLM"),
     ]
-    assert "| `AlphaModel` | `nemo_automodel.components.models.alpha.model.AlphaModel` |" in generated
-    assert "| `ZuluForCausalLM` | `nemo_automodel.components.models.zulu.model.ZuluForCausalLM` |" in generated
+    assert "| `AlphaModel` | NeMo native | `nemo_automodel.components.models.alpha.model.AlphaModel` |" in generated
+    assert (
+        "| `ZuluForCausalLM` | NeMo native | `nemo_automodel.components.models.zulu.model.ZuluForCausalLM` |"
+        in generated
+    )
+    assert "| `ExternalModel` | Hugging Face | `transformers` |" in generated
+    assert generated.count("`ZuluForCausalLM`") == 1
+
+
+def test_registry_table_uses_documentation_aliases_for_native_models():
+    generated = _render_registry_table(
+        [
+            (
+                "NativeArchitecture",
+                "nemo_automodel.components.models.native.model",
+                "NativeArchitecture",
+            )
+        ],
+        {"NativeArchitecture"},
+        {"NativeArchitecture": "DocumentedArchitecture"},
+    )
+
+    assert (
+        "| `DocumentedArchitecture` (`NativeArchitecture`) | NeMo native | "
+        "`nemo_automodel.components.models.native.model.NativeArchitecture` |"
+    ) in generated
+
+
+def test_doc_arch_aliases_are_parsed_from_the_coverage_test():
+    source = '_DOC_ARCH_ALIASES = {"NativeArchitecture": "DocumentedArchitecture"}\n'
+
+    assert _parse_doc_arch_aliases(source) == {"NativeArchitecture": "DocumentedArchitecture"}
 
 
 def test_generated_registry_table_replaces_the_marked_block():
     document = f"before\n{REGISTRY_START_MARKER}\nstale\n{REGISTRY_END_MARKER}\nafter\n"
-    generated = _render_registry_table([("NewModel", "models.new", "NewModel")])
+    generated = _render_registry_table([("NewModel", "models.new", "NewModel")], {"NewModel"}, {})
 
     updated = _replace_generated_block(document, REGISTRY_START_MARKER, REGISTRY_END_MARKER, generated)
 
     assert "stale" not in updated
-    assert "| `NewModel` | `models.new.NewModel` |" in updated
+    assert "| `NewModel` | NeMo native | `models.new.NewModel` |" in updated
     assert updated.startswith("before\n")
     assert updated.endswith("\nafter\n")
 
@@ -131,6 +162,37 @@ def test_model_release_docs_pages_exist_in_nightly_navigation():
     )
 
     assert not missing_pages, f"Model release docs pages missing from nightly navigation: {missing_pages}"
+
+
+def test_model_release_architectures_match_cached_hf_configs():
+    """Validate checked-in architecture metadata without accessing the Hub."""
+    from transformers import PretrainedConfig
+
+    repo_root = Path(__file__).parents[3]
+    releases = json.loads((repo_root / "docs" / "model-coverage" / "model-releases.json").read_text())
+    expected_by_model: dict[str, set[str]] = {}
+    for release in releases:
+        expected_by_model.setdefault(release["hf_model_id"], set()).update(release["architectures"])
+
+    checked = 0
+    mismatches: list[tuple[str, set[str], set[str]]] = []
+    for model_id, expected in sorted(expected_by_model.items()):
+        try:
+            config_dict, _ = PretrainedConfig.get_config_dict(model_id, local_files_only=True)
+        except (OSError, ValueError):
+            continue
+        checked += 1
+        actual = set(config_dict.get("architectures") or [])
+        if actual != expected:
+            mismatches.append((model_id, expected, actual))
+
+    if not checked:
+        pytest.skip("No Hugging Face configs are available in the local offline cache")
+
+    assert not mismatches, "Cached Hugging Face architectures differ from model-releases.json:\n" + "\n".join(
+        f"  - {model_id}: catalog={sorted(expected)}, cached={sorted(actual)}"
+        for model_id, expected, actual in mismatches
+    )
 
 
 def test_model_coverage_pages_use_org_slugs_without_nesting_sidebar():
@@ -224,6 +286,7 @@ def test_embedding_and_reranking_catalog_lists_documented_models():
 def test_sync_tables_writes_support_log_homepage_and_registry(tmp_path):
     (tmp_path / "docs" / "model-coverage").mkdir(parents=True)
     (tmp_path / "nemo_automodel" / "_transformers").mkdir(parents=True)
+    (tmp_path / "tests" / "unit_tests" / "_transformers").mkdir(parents=True)
     (tmp_path / "examples").mkdir()
     shared_recipe = "examples/shared.yaml"
     (tmp_path / shared_recipe).write_text("model: test\n", encoding="utf-8")
@@ -233,6 +296,7 @@ def test_sync_tables_writes_support_log_homepage_and_registry(tmp_path):
             "date": "2026-07-31",
             "model": "Documentation Model",
             "hf_model_id": "org/documentation-model",
+            "architectures": ["DocumentationForConditionalGeneration", "NewModel"],
             "docs_page": "/model-coverage/vision-language-models/documentation-model",
             "type": "VLM",
             "recipe": shared_recipe,
@@ -247,6 +311,7 @@ def test_sync_tables_writes_support_log_homepage_and_registry(tmp_path):
                 "date": "2026-07-31",
                 "model": f"{model_type} Model",
                 "hf_model_id": f"org/{type_slug}-model",
+                "architectures": [f"{type_slug.title().replace('-', '')}Model"],
                 "docs_page": f"/model-coverage/{type_slug}/model",
                 "type": model_type,
                 "recipe": shared_recipe,
@@ -261,6 +326,7 @@ def test_sync_tables_writes_support_log_homepage_and_registry(tmp_path):
                 "date": f"2026-07-{30 - index:02d}",
                 "model": f"Model {index}",
                 "hf_model_id": f"org/model-{index}",
+                "architectures": [f"Model{index}ForCausalLM"],
                 "docs_page": f"/model-coverage/large-language-models/model-{index}",
                 "type": "LLM",
                 "recipe": recipe_path,
@@ -279,6 +345,9 @@ def test_sync_tables_writes_support_log_homepage_and_registry(tmp_path):
     )
     (tmp_path / "nemo_automodel" / "_transformers" / "registry.py").write_text(
         'MODEL_ARCH_MAPPING = OrderedDict([("NewModel", ("models.new", "NewModel"))])\n', encoding="utf-8"
+    )
+    (tmp_path / "tests" / "unit_tests" / "_transformers" / "test_doc_coverage.py").write_text(
+        "_DOC_ARCH_ALIASES = {}\n", encoding="utf-8"
     )
 
     changed_paths = _sync_tables(tmp_path, check=False)
@@ -333,9 +402,11 @@ def test_sync_tables_writes_support_log_homepage_and_registry(tmp_path):
     assert "brev.nvidia.com" not in support_log
     assert "[Model-0](/model-coverage/large-language-models/model-0)" in homepage
     assert "Documentation Model" not in homepage
-    assert "| `NewModel` | `models.new.NewModel` |" in (
+    assert "| `NewModel` | NeMo native | `models.new.NewModel` |" in (
         tmp_path / "docs" / "model-coverage" / "overview.mdx"
     ).read_text(encoding="utf-8")
+    overview = (tmp_path / "docs" / "model-coverage" / "overview.mdx").read_text(encoding="utf-8")
+    assert "| `DocumentationForConditionalGeneration` | Hugging Face | `transformers` |" in overview
     assert _sync_tables(tmp_path, check=True) == []
 
 
@@ -348,6 +419,7 @@ def test_model_release_catalog_rejects_non_chronological_entries(tmp_path):
             "date": "2026-07-29",
             "model": "Older Model",
             "hf_model_id": "org/older-model",
+            "architectures": ["OlderModel"],
             "docs_page": "/model-coverage/large-language-models/older-model",
             "type": "LLM",
             "recipe": recipe_path,
@@ -357,6 +429,7 @@ def test_model_release_catalog_rejects_non_chronological_entries(tmp_path):
             "date": "2026-07-30",
             "model": "Newer Model",
             "hf_model_id": "org/newer-model",
+            "architectures": ["NewerModel"],
             "docs_page": "/model-coverage/large-language-models/newer-model",
             "type": "LLM",
             "recipe": recipe_path,
@@ -376,6 +449,7 @@ def test_model_release_catalog_requires_iso_date_format(tmp_path):
             "date": "20260730",
             "model": "Model",
             "hf_model_id": "org/model",
+            "architectures": ["ModelForCausalLM"],
             "docs_page": "/model-coverage/large-language-models/model",
             "type": "LLM",
             "recipe": None,
@@ -395,6 +469,7 @@ def test_model_release_catalog_requires_version_agnostic_docs_page(tmp_path):
             "date": "2026-07-30",
             "model": "Model",
             "hf_model_id": "org/model",
+            "architectures": ["ModelForCausalLM"],
             "docs_page": "https://docs.nvidia.com/nemo/automodel/nightly/model",
             "type": "LLM",
             "recipe": None,
@@ -414,6 +489,7 @@ def test_model_release_catalog_requires_recipe(tmp_path):
             "date": "2026-07-30",
             "model": "Model",
             "hf_model_id": "org/model",
+            "architectures": ["ModelForCausalLM"],
             "docs_page": "/model-coverage/large-language-models/model",
             "type": "LLM",
             "recipe": None,
@@ -485,6 +561,7 @@ def test_model_release_catalog_uses_first_yaml_for_model_id(tmp_path):
             "date": "2026-07-30",
             "model": "Model",
             "hf_model_id": "org/model",
+            "architectures": ["ModelForCausalLM"],
             "docs_page": "/model-coverage/model",
             "type": "LLM",
             "recipe": selected_recipe_path,
@@ -507,6 +584,7 @@ def test_model_release_catalog_allows_same_hf_model_for_different_types(tmp_path
             "date": "2026-07-30",
             "model": f"Model {model_type}",
             "hf_model_id": "org/model",
+            "architectures": ["ModelForCausalLM"],
             "docs_page": "/model-coverage/model",
             "type": model_type,
             "recipe": recipe_path,
@@ -525,6 +603,7 @@ def test_model_release_catalog_allows_same_hf_model_for_different_types(tmp_path
 def test_sync_tables_check_rejects_stale_generated_support_log(tmp_path):
     (tmp_path / "docs" / "model-coverage").mkdir(parents=True)
     (tmp_path / "nemo_automodel" / "_transformers").mkdir(parents=True)
+    (tmp_path / "tests" / "unit_tests" / "_transformers").mkdir(parents=True)
     (tmp_path / "examples").mkdir()
     releases = []
     for index in range(TABLE_ROW_COUNT):
@@ -535,6 +614,7 @@ def test_sync_tables_check_rejects_stale_generated_support_log(tmp_path):
                 "date": f"2026-07-{30 - index:02d}",
                 "model": f"Model {index}",
                 "hf_model_id": f"org/model-{index}",
+                "architectures": [f"Model{index}ForCausalLM"],
                 "docs_page": f"/model-coverage/large-language-models/model-{index}",
                 "type": "LLM",
                 "recipe": recipe_path,
@@ -553,6 +633,9 @@ def test_sync_tables_check_rejects_stale_generated_support_log(tmp_path):
     )
     (tmp_path / "nemo_automodel" / "_transformers" / "registry.py").write_text(
         'MODEL_ARCH_MAPPING = OrderedDict([("NewModel", ("models.new", "NewModel"))])\n', encoding="utf-8"
+    )
+    (tmp_path / "tests" / "unit_tests" / "_transformers" / "test_doc_coverage.py").write_text(
+        "_DOC_ARCH_ALIASES = {}\n", encoding="utf-8"
     )
 
     with pytest.raises(ValueError, match="latest-models.mdx"):

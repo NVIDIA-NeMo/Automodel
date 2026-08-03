@@ -3,6 +3,9 @@
     "date": "2026-07-30",
     "model": "Inkling / Inkling-Small",
     "hf_model_id": "thinkingmachines/Inkling-Small",
+    "architectures": [
+      "InklingForConditionalGeneration"
+    ],
     "docs_page": "/model-coverage/vision-language-models/thinkingmachines/inkling",
     "type": "VLM",
     "recipe": "examples/vlm_finetune/inkling/Inkling_small_medpix_ep64.yaml",
@@ -12,6 +15,9 @@
     "date": "2026-07-30",
     "model": "T5",
     "hf_model_id": "google-t5/t5-small",
+    "architectures": [
+      "T5ForConditionalGeneration"
+    ],
     "docs_page": "/model-coverage/overview",
     "type": "Encoder-Decoder",
     "recipe": "examples/llm_finetune/t5/t5_small_squad.yaml",
@@ -21,6 +27,7 @@
     "date": "2026-07-28",
     "model": "LTX-2.3",
     "hf_model_id": "diffusers/LTX-2.3-Diffusers",
+    "architectures": [],
     "docs_page": "/model-coverage/diffusion/diffusers/ltx-2-3",
     "type": "Diffusion",
     "recipe": "examples/diffusion/finetune/ltx2_3_t2v_flow.yaml",
@@ -30,6 +37,9 @@
     "date": "2026-07-27",
     "model": "Kimi K3",
     "hf_model_id": "moonshotai/Kimi-K3",
+    "architectures": [
+      "KimiK3ForConditionalGeneration"
+    ],
     "docs_page": "/model-coverage/large-language-models/moonshotai/kimi-k3",
     "type": "LLM",
     "recipe": "examples/llm_finetune/kimi/k3_hellaswag.yaml",
@@ -39,6 +49,7 @@
     "date": "2026-07-27",
     "model": "Qwen-Image-Edit-2511",
     "hf_model_id": "Qwen/Qwen-Image-Edit-2511",
+    "architectures": [],
     "docs_page": "/model-coverage/diffusion/qwen/qwen-image",
     "type": "Diffusion",
     "recipe": "examples/diffusion/finetune/qwen_image_edit_2511_flow.yaml",
@@ -48,6 +59,9 @@
     "date": "2026-07-22",
     "model": "Laguna-S-2.1",
     "hf_model_id": "poolside/Laguna-S-2.1",
+    "architectures": [
+      "LagunaForCausalLM"
+    ],
     "docs_page": "/model-coverage/large-language-models/poolside/laguna",
     "type": "LLM",
     "recipe": "examples/llm_finetune/laguna/laguna_s_2p1_hellaswag_ep16.yaml",
@@ -57,6 +71,9 @@
     "date": "2026-06-27",
     "model": "Llama Nemotron Embed VL 1B v2",
     "hf_model_id": "nvidia/llama-nemotron-embed-vl-1b-v2",
+    "architectures": [
+      "LlamaNemotronVLModel"
+    ],
     "docs_page": "/model-coverage/embedding-models/overview",
     "type": "Embedding",
     "recipe": "examples/retrieval/bi_encoder/nemotron_vl_1b/nemotron_vl_1b_example.yaml",
@@ -66,6 +83,9 @@
     "date": "2026-06-21",
     "model": "GLM-5.2",
     "hf_model_id": "zai-org/GLM-5.2",
+    "architectures": [
+      "GlmMoeDsaForCausalLM"
+    ],
     "docs_page": "/model-coverage/large-language-models/thudm/glm-5-moe-dsa",
     "type": "LLM",
     "recipe": "examples/llm_finetune/glm/glm_5.2_tulu3_32k_tilelang_cp8.yaml",
@@ -75,6 +95,9 @@
     "date": "2026-06-12",
     "model": "MiniMax-M3",
     "hf_model_id": "MiniMaxAI/MiniMax-M3",
+    "architectures": [
+      "MiniMaxM3SparseForConditionalGeneration"
+    ],
     "docs_page": "/model-coverage/vision-language-models/minimax/minimax-m3",
     "type": "VLM",
     "recipe": "examples/vlm_finetune/minimax_m3/minimax_m3_vl_sft_ep32pp4.yaml",
@@ -84,6 +107,9 @@
     "date": "2026-06-10",
     "model": "DiffusionGemma 26B-A4B",
     "hf_model_id": "google/diffusiongemma-26B-A4B-it",
+    "architectures": [
+      "DiffusionGemmaForBlockDiffusion"
+    ],
     "docs_page": "/model-coverage/dllm/google/diffusiongemma",
     "type": "dLLM",
     "recipe": "examples/dllm_sft/diffusion_gemma_sft.yaml",
@@ -93,6 +119,7 @@
     "date": "2026-06-09",
     "model": "FLUX.2-dev",
     "hf_model_id": "black-forest-labs/FLUX.2-dev",
+    "architectures": [],
     "docs_page": "/model-coverage/diffusion/black-forest-labs/flux-2-dev",
     "type": "Diffusion",
     "recipe": "examples/diffusion/finetune/flux2_t2i_flow.yaml",
@@ -102,6 +129,9 @@
     "date": "2026-06-08",
     "model": "BAGEL",
     "hf_model_id": "ByteDance-Seed/BAGEL-7B-MoT",
+    "architectures": [
+      "BagelForConditionalGeneration"
+    ],
     "docs_page": "/model-coverage/multimodal/bytedance-seed/bagel",
     "type": "Multimodal",
     "recipe": "examples/multimodal_finetune/bagel/bagel_sft.yaml",
@@ -111,6 +141,9 @@
     "date": "2026-06-08",
     "model": "Falcon H1",
     "hf_model_id": "tiiuae/Falcon-H1-7B-Instruct",
+    "architectures": [
+      "FalconH1ForCausalLM"
+    ],
     "docs_page": "/model-coverage/large-language-models/overview",
     "type": "LLM",
     "recipe": "examples/llm_finetune/falcon/falcon_h1_7b_instruct_squad.yaml",
@@ -120,6 +153,9 @@
     "date": "2026-06-04",
     "model": "Nemotron-3 Ultra-550B-A55B",
     "hf_model_id": "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16",
+    "architectures": [
+      "NemotronHForCausalLM"
+    ],
     "docs_page": "/recipes-e2e-examples/nemotron-3-ultra",
     "type": "LLM",
     "recipe": "examples/llm_finetune/nemotron/nemotron_ultra_v3_hellaswag_peft.yaml",
@@ -129,6 +165,9 @@
     "date": "2026-06-03",
     "model": "Gemma 4 12B",
     "hf_model_id": "google/gemma-4-12B",
+    "architectures": [
+      "Gemma4UnifiedForConditionalGeneration"
+    ],
     "docs_page": "/model-coverage/vision-language-models/google/gemma-4",
     "type": "VLM",
     "recipe": "examples/llm_finetune/gemma/gemma_4_12b_hellaswag.yaml",
@@ -138,6 +177,9 @@
     "date": "2026-06-02",
     "model": "MiniCPM5-1B",
     "hf_model_id": "openbmb/MiniCPM5-1B",
+    "architectures": [
+      "LlamaForCausalLM"
+    ],
     "docs_page": "/model-coverage/large-language-models/openbmb/minicpm",
     "type": "LLM",
     "recipe": "examples/llm_finetune/minicpm/minicpm5_1b_squad.yaml",
@@ -147,6 +189,9 @@
     "date": "2026-05-29",
     "model": "Qwen2.5-Omni",
     "hf_model_id": "Qwen/Qwen2.5-Omni-3B",
+    "architectures": [
+      "Qwen2_5OmniModel"
+    ],
     "docs_page": "/model-coverage/omni/qwen/qwen2-5-omni",
     "type": "Omni",
     "recipe": "examples/audio_finetune/qwen2_5_omni_asr/ami_sft_3b.yaml",
@@ -156,6 +201,9 @@
     "date": "2026-05-28",
     "model": "Hy-MT2-30B-A3B",
     "hf_model_id": "tencent/Hy-MT2-30B-A3B",
+    "architectures": [
+      "HYV3ForCausalLM"
+    ],
     "docs_page": "/model-coverage/large-language-models/tencent/hy-mt2",
     "type": "LLM",
     "recipe": "examples/llm_finetune/hy_mt2/hy_mt2_30b_a3b_sft.yaml",
@@ -165,6 +213,9 @@
     "date": "2026-05-27",
     "model": "Step-3.7-Flash",
     "hf_model_id": "stepfun-ai/Step-3.7-Flash",
+    "architectures": [
+      "Step3p7ForConditionalGeneration"
+    ],
     "docs_page": "/model-coverage/vision-language-models/stepfun-ai/step-3-7-flash",
     "type": "VLM",
     "recipe": "examples/vlm_finetune/stepfun/step3p7_medpix_200b_ep32pp4.yaml",
@@ -174,6 +225,7 @@
     "date": "2026-05-21",
     "model": "Wan 2.2 T2V-A14B (two-stage)",
     "hf_model_id": "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+    "architectures": [],
     "docs_page": "/model-coverage/diffusion/wan-ai/wan-2-2-t2v-a14b",
     "type": "Diffusion",
     "recipe": "examples/diffusion/finetune/wan2_2_t2v_flow.yaml",
@@ -183,6 +235,9 @@
     "date": "2026-05-21",
     "model": "Llama Nemotron Embed 1B v2",
     "hf_model_id": "nvidia/llama-nemotron-embed-1b-v2",
+    "architectures": [
+      "LlamaBidirectionalModel"
+    ],
     "docs_page": "/model-coverage/embedding-models/nvidia/llama-bidirectional",
     "type": "Embedding",
     "recipe": "examples/retrieval/bi_encoder/llama3_2_1b.yaml",
@@ -192,6 +247,9 @@
     "date": "2026-05-19",
     "model": "Ling 2.0",
     "hf_model_id": "inclusionAI/Ling-mini-2.0",
+    "architectures": [
+      "BailingMoeV2ForCausalLM"
+    ],
     "docs_page": "/model-coverage/large-language-models/inclusionai/ling-2-0",
     "type": "LLM",
     "recipe": "examples/llm_finetune/ling/ling_mini_2_0_squad.yaml",
@@ -201,6 +259,9 @@
     "date": "2026-05-17",
     "model": "ERNIE 4.5",
     "hf_model_id": "baidu/ERNIE-4.5-21B-A3B-PT",
+    "architectures": [
+      "Ernie4_5_MoeForCausalLM"
+    ],
     "docs_page": "/model-coverage/large-language-models/baidu/ernie-4-5",
     "type": "LLM",
     "recipe": "examples/llm_finetune/ernie4_5/ernie4_5_21b_a3b_hellaswag.yaml",
@@ -210,6 +271,9 @@
     "date": "2026-05-17",
     "model": "MiMo-V2-Flash",
     "hf_model_id": "XiaomiMiMo/MiMo-V2-Flash",
+    "architectures": [
+      "MiMoV2FlashForCausalLM"
+    ],
     "docs_page": "/model-coverage/large-language-models/xiaomimimo/mimo-v2-flash",
     "type": "LLM",
     "recipe": "examples/llm_finetune/mimo_v2_flash/mimo_v2_flash_hellaswag.yaml",
@@ -219,6 +283,9 @@
     "date": "2026-04-29",
     "model": "Mistral Medium 3.5",
     "hf_model_id": "mistralai/Mistral-Medium-3.5-128B",
+    "architectures": [
+      "Mistral3ForConditionalGeneration"
+    ],
     "docs_page": "/model-coverage/vision-language-models/mistralai/mistral-medium-3-5",
     "type": "VLM",
     "recipe": "examples/vlm_finetune/mistral3p5/mistral3p5_128b_medpix.yaml",
@@ -228,6 +295,9 @@
     "date": "2026-04-28",
     "model": "Hy3-preview",
     "hf_model_id": "tencent/Hy3-preview",
+    "architectures": [
+      "HYV3ForCausalLM"
+    ],
     "docs_page": "/model-coverage/large-language-models/tencent/hy3-preview",
     "type": "LLM",
     "recipe": "examples/llm_finetune/hy_v3/hy3_preview_deepep.yaml",
@@ -237,6 +307,9 @@
     "date": "2026-04-28",
     "model": "Ministral 3 3B Base Embedding",
     "hf_model_id": "mistralai/Ministral-3-3B-Base-2512",
+    "architectures": [
+      "Mistral3ForConditionalGeneration"
+    ],
     "docs_page": "/model-coverage/embedding-models/mistralai/ministral3-bidirectional",
     "type": "Embedding",
     "recipe": "examples/retrieval/bi_encoder/ministral3_3b_instruct.yaml",
@@ -246,6 +319,9 @@
     "date": "2026-04-28",
     "model": "Ministral 3 3B Instruct Embedding",
     "hf_model_id": "mistralai/Ministral-3-3B-Instruct-2512",
+    "architectures": [
+      "Mistral3ForConditionalGeneration"
+    ],
     "docs_page": "/model-coverage/embedding-models/mistralai/ministral3-bidirectional",
     "type": "Embedding",
     "recipe": "examples/retrieval/bi_encoder/ministral3_3b_instruct.yaml",
@@ -255,6 +331,9 @@
     "date": "2026-04-25",
     "model": "DeepSeek-V4 Flash",
     "hf_model_id": "deepseek-ai/DeepSeek-V4-Flash",
+    "architectures": [
+      "DeepseekV4ForCausalLM"
+    ],
     "docs_page": "/model-coverage/large-language-models/deepseek-ai/deepseek-v4-flash",
     "type": "LLM",
     "recipe": "examples/llm_finetune/deepseek_v4/deepseek_v4_flash_hellaswag.yaml",
@@ -264,6 +343,9 @@
     "date": "2026-04-22",
     "model": "Qwen3.6-27B",
     "hf_model_id": "Qwen/Qwen3.6-27B",
+    "architectures": [
+      "Qwen3_5ForConditionalGeneration"
+    ],
     "docs_page": "/model-coverage/vision-language-models/qwen/qwen3-6-vl",
     "type": "VLM",
     "recipe": "examples/vlm_finetune/qwen3_5/qwen3_6_27b.yaml",
@@ -273,6 +355,9 @@
     "date": "2026-04-16",
     "model": "LLaVA-OneVision-1.5 (4B / 8B)",
     "hf_model_id": "lmms-lab/LLaVA-OneVision-1.5-4B-Instruct",
+    "architectures": [
+      "LLaVAOneVision1_5_ForConditionalGeneration"
+    ],
     "docs_page": "/model-coverage/vision-language-models/lmms-lab/llava-onevision",
     "type": "VLM",
     "recipe": "examples/vlm_finetune/llava_onevision/llava_ov_1_5_4b_finetune.yaml",
@@ -282,6 +367,9 @@
     "date": "2026-04-16",
     "model": "Qwen3.6 MoE",
     "hf_model_id": "Qwen/Qwen3.6-35B-A3B",
+    "architectures": [
+      "Qwen3_5MoeForConditionalGeneration"
+    ],
     "docs_page": "/model-coverage/vision-language-models/qwen/qwen3-6-vl",
     "type": "VLM",
     "recipe": "examples/vlm_finetune/qwen3_5_moe/qwen3_6_35b.yaml",
@@ -291,6 +379,9 @@
     "date": "2026-04-12",
     "model": "MiniMax-M2.7",
     "hf_model_id": "MiniMaxAI/MiniMax-M2.7",
+    "architectures": [
+      "MiniMaxM2ForCausalLM"
+    ],
     "docs_page": "/model-coverage/large-language-models/minimax/minimax-m2",
     "type": "LLM",
     "recipe": "examples/llm_finetune/minimax_m2/minimax_m2.7_hellaswag_pp.yaml",
@@ -300,6 +391,9 @@
     "date": "2026-04-07",
     "model": "GLM-5.1",
     "hf_model_id": "zai-org/GLM-5.1",
+    "architectures": [
+      "GlmMoeDsaForCausalLM"
+    ],
     "docs_page": "/model-coverage/large-language-models/thudm/glm-5-moe-dsa",
     "type": "LLM",
     "recipe": "examples/llm_finetune/glm/glm_5.1_hellaswag_pp.yaml",
@@ -309,6 +403,9 @@
     "date": "2026-04-02",
     "model": "Gemma 4",
     "hf_model_id": "google/gemma-4-E4B-it",
+    "architectures": [
+      "Gemma4ForConditionalGeneration"
+    ],
     "docs_page": "/model-coverage/vision-language-models/google/gemma-4",
     "type": "VLM",
     "recipe": "examples/vlm_finetune/gemma4/gemma4_4b.yaml",
@@ -318,6 +415,9 @@
     "date": "2026-03-30",
     "model": "Llama Nemotron Rerank 1B v2",
     "hf_model_id": "nvidia/llama-nemotron-rerank-1b-v2",
+    "architectures": [
+      "LlamaBidirectionalForSequenceClassification"
+    ],
     "docs_page": "/model-coverage/reranking-models/nvidia/llama-bidirectional",
     "type": "Reranking",
     "recipe": "examples/retrieval/cross_encoder/llama3_2_1b.yaml",
@@ -327,6 +427,9 @@
     "date": "2026-03-30",
     "model": "Llama 3.2 1B Reranking",
     "hf_model_id": "meta-llama/Llama-3.2-1B",
+    "architectures": [
+      "LlamaForCausalLM"
+    ],
     "docs_page": "/model-coverage/reranking-models/nvidia/llama-bidirectional",
     "type": "Reranking",
     "recipe": "examples/retrieval/cross_encoder/llama3_2_1b.yaml",
@@ -336,6 +439,9 @@
     "date": "2026-03-30",
     "model": "Llama 3.1 8B Reranking",
     "hf_model_id": "meta-llama/Llama-3.1-8B",
+    "architectures": [
+      "LlamaForCausalLM"
+    ],
     "docs_page": "/model-coverage/reranking-models/nvidia/llama-bidirectional",
     "type": "Reranking",
     "recipe": "examples/retrieval/cross_encoder/llama3_2_1b.yaml",
@@ -345,6 +451,9 @@
     "date": "2026-03-30",
     "model": "Nemotron-3 Nano 4B",
     "hf_model_id": "nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16",
+    "architectures": [
+      "NemotronHForCausalLM"
+    ],
     "docs_page": "/model-coverage/large-language-models/nvidia/nemotron-h",
     "type": "LLM",
     "recipe": "examples/llm_finetune/nemotron/nemotron_nano_4b_squad_peft.yaml",
@@ -354,6 +463,9 @@
     "date": "2026-03-16",
     "model": "Mistral Small 4",
     "hf_model_id": "mistralai/Mistral-Small-4-119B-2603",
+    "architectures": [
+      "Mistral3ForConditionalGeneration"
+    ],
     "docs_page": "/model-coverage/vision-language-models/mistralai/mistral-small-4",
     "type": "VLM",
     "recipe": "examples/vlm_finetune/mistral4/mistral4_medpix.yaml",
@@ -363,6 +475,9 @@
     "date": "2026-03-11",
     "model": "Nemotron Super v3",
     "hf_model_id": "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16",
+    "architectures": [
+      "NemotronHForCausalLM"
+    ],
     "docs_page": "/model-coverage/large-language-models/nvidia/nemotron-h",
     "type": "LLM",
     "recipe": "examples/llm_finetune/nemotron/nemotron_super_v3_hellaswag.yaml",
@@ -372,6 +487,9 @@
     "date": "2026-03-11",
     "model": "GLM-5",
     "hf_model_id": "zai-org/GLM-5",
+    "architectures": [
+      "GlmMoeDsaForCausalLM"
+    ],
     "docs_page": "/model-coverage/large-language-models/thudm/glm-5-moe-dsa",
     "type": "LLM",
     "recipe": "examples/llm_finetune/glm/glm_5_hellaswag_pp.yaml",
@@ -381,6 +499,7 @@
     "date": "2026-03-03",
     "model": "FLUX.1-dev",
     "hf_model_id": "black-forest-labs/FLUX.1-dev",
+    "architectures": [],
     "docs_page": "/model-coverage/diffusion/black-forest-labs/flux-1-dev",
     "type": "Diffusion",
     "recipe": "examples/diffusion/finetune/flux_t2i_flow.yaml",
@@ -390,6 +509,7 @@
     "date": "2026-03-03",
     "model": "Wan 2.1 T2V",
     "hf_model_id": "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+    "architectures": [],
     "docs_page": "/model-coverage/diffusion/wan-ai/wan-2-1-t2v",
     "type": "Diffusion",
     "recipe": "examples/diffusion/finetune/wan2_1_t2v_flow.yaml",
@@ -399,6 +519,7 @@
     "date": "2026-03-03",
     "model": "HunyuanVideo 1.5",
     "hf_model_id": "hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v",
+    "architectures": [],
     "docs_page": "/model-coverage/diffusion/hunyuanvideo-community/hunyuanvideo-1-5",
     "type": "Diffusion",
     "recipe": "examples/diffusion/finetune/hunyuan_t2v_flow.yaml",
@@ -408,6 +529,9 @@
     "date": "2026-03-02",
     "model": "Qwen3.5 (0.8B \u2013 9B)",
     "hf_model_id": "Qwen/Qwen3.5-9B",
+    "architectures": [
+      "Qwen3_5ForConditionalGeneration"
+    ],
     "docs_page": "/model-coverage/vision-language-models/qwen/qwen3-5-vl",
     "type": "VLM",
     "recipe": "examples/vlm_finetune/qwen3_5/qwen3_5_9b.yaml",
@@ -417,6 +541,9 @@
     "date": "2026-02-16",
     "model": "Qwen3.5 MoE",
     "hf_model_id": "Qwen/Qwen3.5-397B-A17B",
+    "architectures": [
+      "Qwen3_5MoeForConditionalGeneration"
+    ],
     "docs_page": "/model-coverage/vision-language-models/qwen/qwen3-5-vl",
     "type": "VLM",
     "recipe": "examples/vlm_finetune/qwen3_5_moe/qwen3_5_moe_medpix.yaml",
@@ -426,6 +553,9 @@
     "date": "2026-02-13",
     "model": "MiniMax-M2.5",
     "hf_model_id": "MiniMaxAI/MiniMax-M2.5",
+    "architectures": [
+      "MiniMaxM2ForCausalLM"
+    ],
     "docs_page": "/model-coverage/large-language-models/minimax/minimax-m2",
     "type": "LLM",
     "recipe": "examples/llm_finetune/minimax_m2/minimax_m2.5_hellaswag_pp.yaml",
@@ -435,6 +565,9 @@
     "date": "2026-02-11",
     "model": "GLM-4.7-Flash",
     "hf_model_id": "zai-org/GLM-4.7-Flash",
+    "architectures": [
+      "Glm4MoeLiteForCausalLM"
+    ],
     "docs_page": "/model-coverage/large-language-models/thudm/glm-4-moe-glm-4-5-glm-4-7",
     "type": "LLM",
     "recipe": "examples/llm_finetune/glm/glm_4.7_flash_te_packed_sequence.yaml",
@@ -444,6 +577,9 @@
     "date": "2026-02-09",
     "model": "MiniMax-M2.1",
     "hf_model_id": "MiniMaxAI/MiniMax-M2",
+    "architectures": [
+      "MiniMaxM2ForCausalLM"
+    ],
     "docs_page": "/model-coverage/large-language-models/minimax/minimax-m2",
     "type": "LLM",
     "recipe": "examples/llm_finetune/minimax_m2/minimax_m2.1_hellaswag_pp.yaml",
@@ -453,6 +589,9 @@
     "date": "2026-02-06",
     "model": "Qwen3-VL-235B",
     "hf_model_id": "Qwen/Qwen3-VL-235B-A22B-Instruct",
+    "architectures": [
+      "Qwen3VLMoeForConditionalGeneration"
+    ],
     "docs_page": "/model-coverage/vision-language-models/qwen/qwen3-vl-qwen3-vl-moe",
     "type": "VLM",
     "recipe": "examples/vlm_finetune/qwen3/qwen3_vl_moe_235b.yaml",
@@ -462,6 +601,9 @@
     "date": "2026-02-06",
     "model": "GLM-4.7",
     "hf_model_id": "zai-org/GLM-4.7",
+    "architectures": [
+      "Glm4MoeForCausalLM"
+    ],
     "docs_page": "/model-coverage/large-language-models/thudm/glm-4-moe-glm-4-5-glm-4-7",
     "type": "LLM",
     "recipe": "examples/llm_finetune/glm/glm_4.7_te_deepep.yaml",
@@ -471,6 +613,9 @@
     "date": "2026-02-06",
     "model": "Step-3.5-Flash",
     "hf_model_id": "stepfun-ai/Step-3.5-Flash",
+    "architectures": [
+      "Step3p5ForCausalLM"
+    ],
     "docs_page": "/model-coverage/large-language-models/stepfun-ai/step-3-5",
     "type": "LLM",
     "recipe": "examples/llm_finetune/stepfun/step_3.5_flash_hellaswag_pp.yaml",
@@ -480,6 +625,9 @@
     "date": "2026-02-05",
     "model": "DeepSeek-V3.2",
     "hf_model_id": "deepseek-ai/DeepSeek-V3.2",
+    "architectures": [
+      "DeepseekV32ForCausalLM"
+    ],
     "docs_page": "/model-coverage/large-language-models/deepseek-ai/deepseek-v3",
     "type": "LLM",
     "recipe": "examples/llm_finetune/deepseek_v32/deepseek_v32_hellaswag_pp.yaml",
@@ -489,6 +637,9 @@
     "date": "2026-02-04",
     "model": "Kimi-K2.5 VL",
     "hf_model_id": "moonshotai/Kimi-K2.5",
+    "architectures": [
+      "KimiK25ForConditionalGeneration"
+    ],
     "docs_page": "/model-coverage/vision-language-models/moonshotai/kimi-vl",
     "type": "VLM",
     "recipe": "examples/vlm_finetune/kimi/kimi25vl_medpix.yaml",
@@ -498,6 +649,9 @@
     "date": "2026-01-30",
     "model": "Kimi-VL",
     "hf_model_id": "moonshotai/Kimi-VL-A3B-Instruct",
+    "architectures": [
+      "KimiVLForConditionalGeneration"
+    ],
     "docs_page": "/model-coverage/vision-language-models/moonshotai/kimi-vl",
     "type": "VLM",
     "recipe": "examples/vlm_finetune/kimi/kimi2vl_cordv2.yaml",
@@ -507,6 +661,9 @@
     "date": "2026-01-12",
     "model": "Nemotron Flash 1B",
     "hf_model_id": "nvidia/Nemotron-Flash-1B",
+    "architectures": [
+      "NemotronFlashForCausalLM"
+    ],
     "docs_page": "/model-coverage/large-language-models/nvidia/nemotron-flash",
     "type": "LLM",
     "recipe": "examples/llm_finetune/nemotron_flash/nemotron_flash_1b_squad.yaml",
@@ -516,6 +673,9 @@
     "date": "2026-01-12",
     "model": "Nemotron Parse v1.1",
     "hf_model_id": "nvidia/NVIDIA-Nemotron-Parse-v1.1",
+    "architectures": [
+      "NemotronParseForConditionalGeneration"
+    ],
     "docs_page": "/model-coverage/vision-language-models/nvidia/nemotron-parse",
     "type": "VLM",
     "recipe": "examples/vlm_finetune/nemotron/nemotron_parse_v1_1.yaml",
@@ -526,6 +686,9 @@
     "date": "2026-01-07",
     "model": "Devstral-Small-2512",
     "hf_model_id": "mistralai/Devstral-Small-2-24B-Instruct-2512",
+    "architectures": [
+      "Mistral3ForConditionalGeneration"
+    ],
     "docs_page": "/model-coverage/large-language-models/mistralai/ministral3-devstral",
     "type": "LLM",
     "recipe": "examples/llm_finetune/devstral/devstral2_small_2512_squad.yaml",
@@ -535,6 +698,9 @@
     "date": "2025-12-16",
     "model": "Llama Embed Nemotron 8B",
     "hf_model_id": "nvidia/llama-embed-nemotron-8b",
+    "architectures": [
+      "LlamaBidirectionalModel"
+    ],
     "docs_page": "/model-coverage/embedding-models/nvidia/llama-bidirectional",
     "type": "Embedding",
     "recipe": "examples/retrieval/bi_encoder/llama_embed_nemotron_8b/llama_embed_nemotron_8b.yaml",
@@ -544,6 +710,9 @@
     "date": "2025-12-15",
     "model": "Nemotron-3-Nano-30B-A3B",
     "hf_model_id": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8",
+    "architectures": [
+      "NemotronHForCausalLM"
+    ],
     "docs_page": "/model-coverage/large-language-models/nvidia/nemotron-h",
     "type": "LLM",
     "recipe": "examples/llm_finetune/nemotron/nemotron_nano_v3_hellaswag.yaml",
@@ -553,6 +722,9 @@
     "date": "2025-12-05",
     "model": "Ministral 3 (3B / 8B / 14B)",
     "hf_model_id": "mistralai/Ministral-8B-Instruct-2410",
+    "architectures": [
+      "MistralForCausalLM"
+    ],
     "docs_page": "/model-coverage/vision-language-models/mistralai/ministral3-vl",
     "type": "VLM",
     "recipe": "examples/vlm_finetune/mistral/ministral3_8b_medpix.yaml",
@@ -562,6 +734,9 @@
     "date": "2025-11-24",
     "model": "GLM-4.5-Air",
     "hf_model_id": "zai-org/GLM-4.5-Air",
+    "architectures": [
+      "Glm4MoeForCausalLM"
+    ],
     "docs_page": "/model-coverage/large-language-models/thudm/glm-4-moe-glm-4-5-glm-4-7",
     "type": "LLM",
     "recipe": "examples/llm_finetune/glm/glm_4.5_air_te_deepep.yaml",
@@ -571,6 +746,9 @@
     "date": "2025-11-19",
     "model": "InternVL 3.5",
     "hf_model_id": "OpenGVLab/InternVL3_5-4B",
+    "architectures": [
+      "InternVLChatModel"
+    ],
     "docs_page": "/model-coverage/vision-language-models/internlm/internvl",
     "type": "VLM",
     "recipe": "examples/vlm_finetune/internvl/internvl_3_5_4b.yaml",
@@ -580,6 +758,9 @@
     "date": "2025-11-18",
     "model": "Llama 3.2 1B Embedding",
     "hf_model_id": "meta-llama/Llama-3.2-1B",
+    "architectures": [
+      "LlamaForCausalLM"
+    ],
     "docs_page": "/model-coverage/embedding-models/nvidia/llama-bidirectional",
     "type": "Embedding",
     "recipe": "examples/retrieval/bi_encoder/llama3_2_1b.yaml",
@@ -589,6 +770,9 @@
     "date": "2025-11-18",
     "model": "Llama 3.1 8B Embedding",
     "hf_model_id": "meta-llama/Llama-3.1-8B",
+    "architectures": [
+      "LlamaForCausalLM"
+    ],
     "docs_page": "/model-coverage/embedding-models/nvidia/llama-bidirectional",
     "type": "Embedding",
     "recipe": "examples/retrieval/bi_encoder/llama_embed_nemotron_8b/llama_embed_nemotron_8b.yaml",
@@ -598,6 +782,9 @@
     "date": "2025-11-10",
     "model": "Qwen3-Omni",
     "hf_model_id": "Qwen/Qwen3-30B-A3B",
+    "architectures": [
+      "Qwen3MoeForCausalLM"
+    ],
     "docs_page": "/model-coverage/omni/qwen/qwen3-omni",
     "type": "Omni",
     "recipe": "examples/vlm_finetune/qwen3/qwen3_omni_moe_30b_te_deepep.yaml",
@@ -607,6 +794,9 @@
     "date": "2025-10-24",
     "model": "Qwen3-Next",
     "hf_model_id": "Qwen/Qwen3-235B-A22B",
+    "architectures": [
+      "Qwen3MoeForCausalLM"
+    ],
     "docs_page": "/model-coverage/large-language-models/qwen/qwen3-next",
     "type": "LLM",
     "recipe": "examples/llm_finetune/qwen/qwen3_next_te_deepep.yaml",
@@ -616,6 +806,9 @@
     "date": "2025-10-23",
     "model": "Qwen3-VL (4B / 8B)",
     "hf_model_id": "Qwen/Qwen3-VL-8B-Instruct",
+    "architectures": [
+      "Qwen3VLForConditionalGeneration"
+    ],
     "docs_page": "/model-coverage/vision-language-models/qwen/qwen3-vl-qwen3-vl-moe",
     "type": "VLM",
     "recipe": "examples/vlm_finetune/qwen3/qwen3_vl_4b_instruct_rdr.yaml",
@@ -625,6 +818,9 @@
     "date": "2025-10-05",
     "model": "Mixtral 8x7B",
     "hf_model_id": "mistralai/Mixtral-8x7B-Instruct-v0.1",
+    "architectures": [
+      "MixtralForCausalLM"
+    ],
     "docs_page": "/model-coverage/large-language-models/mistralai/mixtral",
     "type": "LLM",
     "recipe": "examples/llm_finetune/mistral/mixtral-8x7b-v0-1_squad.yaml",
@@ -634,6 +830,9 @@
     "date": "2025-09-29",
     "model": "DeepSeek-V3",
     "hf_model_id": "deepseek-ai/DeepSeek-V3",
+    "architectures": [
+      "DeepseekV3ForCausalLM"
+    ],
     "docs_page": "/model-coverage/large-language-models/deepseek-ai/deepseek-v3",
     "type": "LLM",
     "recipe": "examples/llm_pretrain/deepseekv3_pretrain.yaml",
@@ -643,6 +842,9 @@
     "date": "2025-09-23",
     "model": "GPT-OSS 20B / 120B",
     "hf_model_id": "openai/gpt-oss-20b",
+    "architectures": [
+      "GptOssForCausalLM"
+    ],
     "docs_page": "/model-coverage/large-language-models/openai/gpt-oss",
     "type": "LLM",
     "recipe": "examples/llm_finetune/gpt_oss/gpt_oss_20b.yaml",
@@ -652,6 +854,9 @@
     "date": "2025-09-08",
     "model": "Moonlight 16B",
     "hf_model_id": "moonshotai/Moonlight-16B-A3B",
+    "architectures": [
+      "DeepseekV3ForCausalLM"
+    ],
     "docs_page": "/model-coverage/large-language-models/moonshotai/moonlight",
     "type": "LLM",
     "recipe": "examples/llm_finetune/moonlight/moonlight_16b_te.yaml",
@@ -661,6 +866,9 @@
     "date": "2025-08-27",
     "model": "Mistral / Mistral-Nemo",
     "hf_model_id": "mistralai/Mistral-7B-v0.1",
+    "architectures": [
+      "MistralForCausalLM"
+    ],
     "docs_page": "/model-coverage/large-language-models/mistralai/mistral",
     "type": "LLM",
     "recipe": "examples/llm_finetune/mistral/mistral_7b_squad.yaml",
@@ -670,6 +878,9 @@
     "date": "2025-08-27",
     "model": "Qwen2 / Qwen2.5",
     "hf_model_id": "Qwen/Qwen2.5-7B",
+    "architectures": [
+      "Qwen2ForCausalLM"
+    ],
     "docs_page": "/model-coverage/large-language-models/qwen/qwen2",
     "type": "LLM",
     "recipe": "examples/llm_finetune/qwen/qwen2_5_7b_squad.yaml",
@@ -679,6 +890,9 @@
     "date": "2025-08-27",
     "model": "Gemma 2 9B IT",
     "hf_model_id": "google/gemma-2-9b-it",
+    "architectures": [
+      "Gemma2ForCausalLM"
+    ],
     "docs_page": "/model-coverage/large-language-models/google/gemma-2",
     "type": "LLM",
     "recipe": "examples/llm_finetune/gemma/gemma_2_9b_it_squad.yaml",
@@ -688,6 +902,9 @@
     "date": "2025-08-27",
     "model": "Phi 2 / 3 / 4",
     "hf_model_id": "microsoft/phi-4",
+    "architectures": [
+      "Phi3ForCausalLM"
+    ],
     "docs_page": "/model-coverage/large-language-models/microsoft/phi-3-phi-4",
     "type": "LLM",
     "recipe": "examples/llm_finetune/phi/phi_4_squad.yaml",
@@ -697,6 +914,9 @@
     "date": "2025-08-27",
     "model": "Granite 3.x",
     "hf_model_id": "ibm-granite/granite-3.3-2b-instruct",
+    "architectures": [
+      "GraniteForCausalLM"
+    ],
     "docs_page": "/model-coverage/large-language-models/ibm/granite",
     "type": "LLM",
     "recipe": "examples/llm_finetune/granite/granite_3_3_2b_instruct_squad.yaml",
@@ -706,6 +926,9 @@
     "date": "2025-08-27",
     "model": "OLMo 2",
     "hf_model_id": "allenai/OLMo-2-0425-1B-Instruct",
+    "architectures": [
+      "Olmo2ForCausalLM"
+    ],
     "docs_page": "/model-coverage/large-language-models/allenai/olmo2",
     "type": "LLM",
     "recipe": "examples/llm_finetune/olmo/olmo_2_0425_1b_instruct_squad.yaml",
@@ -715,6 +938,9 @@
     "date": "2025-08-27",
     "model": "Seed-Coder / Seed-OSS",
     "hf_model_id": "ByteDance-Seed/Seed-Coder-8B-Instruct",
+    "architectures": [
+      "LlamaForCausalLM"
+    ],
     "docs_page": "/model-coverage/large-language-models/bytedance-seed/seed-bytedance",
     "type": "LLM",
     "recipe": "examples/llm_finetune/seed/seed_coder_8b_instruct_squad.yaml",
@@ -724,6 +950,9 @@
     "date": "2025-08-27",
     "model": "Baichuan 2",
     "hf_model_id": "baichuan-inc/Baichuan2-7B-Chat",
+    "architectures": [
+      "BaichuanForCausalLM"
+    ],
     "docs_page": "/model-coverage/large-language-models/baichuan-inc/baichuan-baichuan2",
     "type": "LLM",
     "recipe": "examples/llm_finetune/baichuan/baichuan_2_7b_squad.yaml",
@@ -733,6 +962,9 @@
     "date": "2025-08-27",
     "model": "Cohere Command-R",
     "hf_model_id": "CohereForAI/c4ai-command-r-v01",
+    "architectures": [
+      "CohereForCausalLM"
+    ],
     "docs_page": "/model-coverage/large-language-models/cohere/command-r",
     "type": "LLM",
     "recipe": "examples/llm_finetune/cohere/cohere_command_r_7b_squad.yaml",
@@ -742,6 +974,9 @@
     "date": "2025-08-27",
     "model": "StarCoder 2",
     "hf_model_id": "bigcode/starcoder2-3b",
+    "architectures": [
+      "Starcoder2ForCausalLM"
+    ],
     "docs_page": "/model-coverage/large-language-models/bigcode/starcoder2",
     "type": "LLM",
     "recipe": "examples/llm_finetune/starcoder/starcoder_2_7b_squad.yaml",
@@ -751,6 +986,9 @@
     "date": "2025-08-27",
     "model": "Falcon 3",
     "hf_model_id": "tiiuae/Falcon3-7B-Instruct",
+    "architectures": [
+      "LlamaForCausalLM"
+    ],
     "docs_page": "/model-coverage/large-language-models/tiiuae/falcon",
     "type": "LLM",
     "recipe": "examples/llm_finetune/falcon/falcon3_7b_instruct_squad.yaml",
@@ -760,6 +998,9 @@
     "date": "2025-08-27",
     "model": "GLM-4 / GLM-4-MoE",
     "hf_model_id": "zai-org/glm-4-9b-chat-hf",
+    "architectures": [
+      "GlmForCausalLM"
+    ],
     "docs_page": "/model-coverage/large-language-models/thudm/glm-4",
     "type": "LLM",
     "recipe": "examples/llm_finetune/glm/glm_4_9b_chat_hf_squad.yaml",
@@ -769,6 +1010,9 @@
     "date": "2025-08-27",
     "model": "Qwen3 / Qwen3-MoE",
     "hf_model_id": "Qwen/Qwen3-0.6B",
+    "architectures": [
+      "Qwen3ForCausalLM"
+    ],
     "docs_page": "/model-coverage/large-language-models/qwen/qwen3",
     "type": "LLM",
     "recipe": "examples/llm_finetune/qwen/qwen3_0p6b_hellaswag.yaml",
@@ -778,6 +1022,9 @@
     "date": "2025-08-23",
     "model": "Gemma 3 VL",
     "hf_model_id": "google/gemma-3-4b-it",
+    "architectures": [
+      "Gemma3ForConditionalGeneration"
+    ],
     "docs_page": "/model-coverage/vision-language-models/google/gemma-3-vl-gemma-3n",
     "type": "VLM",
     "recipe": "examples/vlm_finetune/gemma3/gemma3_vl_4b_cord_v2.yaml",
@@ -787,6 +1034,9 @@
     "date": "2025-08-23",
     "model": "Gemma 3n",
     "hf_model_id": "google/gemma-3n-e4b-it",
+    "architectures": [
+      "Gemma3nForConditionalGeneration"
+    ],
     "docs_page": "/model-coverage/vision-language-models/google/gemma-3-vl-gemma-3n",
     "type": "VLM",
     "recipe": "examples/vlm_finetune/gemma3n/gemma3n_vl_4b_medpix.yaml",
@@ -796,6 +1046,9 @@
     "date": "2025-08-23",
     "model": "Llama 3.x",
     "hf_model_id": "meta-llama/Llama-3.2-1B",
+    "architectures": [
+      "LlamaForCausalLM"
+    ],
     "docs_page": "/model-coverage/large-language-models/meta/llama",
     "type": "LLM",
     "recipe": "examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml",
@@ -805,6 +1058,9 @@
     "date": "2025-08-23",
     "model": "Qwen2.5-VL",
     "hf_model_id": "Qwen/Qwen2.5-VL-7B-Instruct",
+    "architectures": [
+      "Qwen2_5_VLForConditionalGeneration"
+    ],
     "docs_page": "/model-coverage/vision-language-models/qwen/qwen2-5-vl",
     "type": "VLM",
     "recipe": "examples/vlm_finetune/qwen2_5/qwen2_5_vl_3b_rdr.yaml",
@@ -814,6 +1070,9 @@
     "date": "2025-08-23",
     "model": "Phi-4-multimodal",
     "hf_model_id": "microsoft/Phi-4-multimodal-instruct",
+    "architectures": [
+      "Phi4MMForCausalLM"
+    ],
     "docs_page": "/model-coverage/omni/microsoft/phi-4-multimodal",
     "type": "Omni",
     "recipe": "examples/vlm_finetune/phi4/phi4_mm_cv17.yaml",

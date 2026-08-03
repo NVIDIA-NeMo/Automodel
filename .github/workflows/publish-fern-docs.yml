@@ -31,6 +31,7 @@ on:
       - 'docs/**'
       - 'nemo_automodel/_transformers/registry.py'
       - 'tests/ci_tests/utils/sync_model_coverage_tables.py'
+      - 'tests/unit_tests/_transformers/test_doc_coverage.py'
     tags:
       - 'docs/v*'
   workflow_dispatch: {}

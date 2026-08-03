@@ -44,69 +44,73 @@ NeMo AutoModel includes a custom model registry that allows teams to:
 - Add custom implementations to extend support to models not yet covered upstream.
 - Provide optimized or faster implementations for specific models while retaining the same AutoModel interface.
 
-### Registered Architectures
+### Ready-to-Run Architectures
 
-The following table is generated directly from `MODEL_ARCH_MAPPING` during every documentation build. It lists checkpoint architecture names handled by NeMo implementations; Hugging Face-native architectures that require no NeMo override are not included.
+The following table lists architectures represented by the ready-to-run YAML recipes in this repository. It includes both NeMo-native implementations and models that use the standard Hugging Face implementation path.
+
+This is a practical starting set rather than an exhaustive compatibility list. NeMo AutoModel can also work with additional models supported by the installed version of the Hugging Face `transformers` library, although models without a checked-in recipe may require some configuration for a particular training setup.
 
 {/* BEGIN GENERATED MODEL ARCHITECTURES */}
-| Checkpoint Architecture | NeMo Implementation |
-|---|---|
-| `BagelForConditionalGeneration` | `nemo_automodel.components.models.bagel.model.BagelForUnifiedMultimodal` |
-| `BagelForUnifiedMultimodal` | `nemo_automodel.components.models.bagel.model.BagelForUnifiedMultimodal` |
-| `BaichuanForCausalLM` | `nemo_automodel.components.models.baichuan.model.BaichuanForCausalLM` |
-| `BailingMoeV2ForCausalLM` | `nemo_automodel.components.models.ling_v2.model.BailingMoeV2ForCausalLM` |
-| `DeepseekV32ForCausalLM` | `nemo_automodel.components.models.deepseek_v32.model.DeepseekV32ForCausalLM` |
-| `DeepseekV3ForCausalLM` | `nemo_automodel.components.models.deepseek_v3.model.DeepseekV3ForCausalLM` |
-| `DeepseekV4ForCausalLM` | `nemo_automodel.components.models.deepseek_v4.model.DeepseekV4ForCausalLM` |
-| `DiffusionGemmaForBlockDiffusion` | `nemo_automodel.components.models.diffusion_gemma.model.DiffusionGemmaForBlockDiffusion` |
-| `Ernie4_5_MoeForCausalLM` | `nemo_automodel.components.models.ernie4_5.model.Ernie4_5_MoeForCausalLM` |
-| `Gemma4AssistantForCausalLM` | `nemo_automodel.components.models.gemma4_drafter.model.Gemma4DrafterForCausalLM` |
-| `Gemma4ForConditionalGeneration` | `nemo_automodel.components.models.gemma4_moe.model.Gemma4ForConditionalGeneration` |
-| `Glm4MoeForCausalLM` | `nemo_automodel.components.models.glm4_moe.model.Glm4MoeForCausalLM` |
-| `Glm4MoeLiteForCausalLM` | `nemo_automodel.components.models.glm4_moe_lite.model.Glm4MoeLiteForCausalLM` |
-| `GlmMoeDsaForCausalLM` | `nemo_automodel.components.models.glm_moe_dsa.model.GlmMoeDsaForCausalLM` |
-| `GptOssForCausalLM` | `nemo_automodel.components.models.gpt_oss.model.GptOssForCausalLM` |
-| `HyMT2ForCausalLM` | `nemo_automodel.components.models.hy_mt2.model.HyMT2ForCausalLM` |
-| `HYV3ForCausalLM` | `nemo_automodel.components.models.hy_v3.model.HYV3ForCausalLM` |
-| `InklingForConditionalGeneration` | `nemo_automodel.components.models.inkling.model.InklingForConditionalGeneration` |
-| `KimiK25ForConditionalGeneration` | `nemo_automodel.components.models.kimi_k25_vl.model.KimiK25VLForConditionalGeneration` |
-| `KimiK25VLForConditionalGeneration` | `nemo_automodel.components.models.kimi_k25_vl.model.KimiK25VLForConditionalGeneration` |
-| `KimiK3ForCausalLM` | `nemo_automodel.components.models.kimi_k3.model.KimiK3ForCausalLM` |
-| `KimiK3ForConditionalGeneration` | `nemo_automodel.components.models.kimi_k3.multimodal.KimiK3ForConditionalGeneration` |
-| `KimiVLForConditionalGeneration` | `nemo_automodel.components.models.kimivl.model.KimiVLForConditionalGeneration` |
-| `LagunaForCausalLM` | `nemo_automodel.components.models.laguna.model.LagunaForCausalLM` |
-| `LlamaBidirectionalForSequenceClassification` | `nemo_automodel.components.models.llama_bidirectional.model.LlamaBidirectionalForSequenceClassification` |
-| `LlamaBidirectionalModel` | `nemo_automodel.components.models.llama_bidirectional.model.LlamaBidirectionalModel` |
-| `LlamaForCausalLM` | `nemo_automodel.components.models.llama.model.LlamaForCausalLM` |
-| `LlamaNemotronVLModel` | `nemo_automodel.components.models.llama_nemotron_vl.model.LlamaNemotronVLModel` |
-| `LLaVAOneVision1_5_ForConditionalGeneration` | `nemo_automodel.components.models.llava_onevision.model.LLaVAOneVision1_5_ForConditionalGeneration` |
-| `MiMoV2FlashForCausalLM` | `nemo_automodel.components.models.mimo_v2_flash.model.MiMoV2FlashForCausalLM` |
-| `MiniMaxM2ForCausalLM` | `nemo_automodel.components.models.minimax_m2.model.MiniMaxM2ForCausalLM` |
-| `MiniMaxM3SparseForConditionalGeneration` | `nemo_automodel.components.models.minimax_m3_vl.model.MiniMaxM3SparseForConditionalGeneration` |
-| `Ministral3BidirectionalModel` | `nemo_automodel.components.models.ministral_bidirectional.model.Ministral3BidirectionalModel` |
-| `Ministral3ForCausalLM` | `nemo_automodel.components.models.mistral3.model.Ministral3ForCausalLM` |
-| `Mistral3ForConditionalGeneration` | `nemo_automodel.components.models.mistral4.model.Mistral3ForConditionalGeneration` |
-| `Mistral3FP8VLMForConditionalGeneration` | `nemo_automodel.components.models.mistral3_vlm.model.Mistral3FP8VLMForConditionalGeneration` |
-| `Mistral4ForCausalLM` | `nemo_automodel.components.models.mistral4.model.Mistral4ForCausalLM` |
-| `NemotronH_Nano_Omni_Reasoning_V3` | `nemo_automodel.components.models.nemotron_omni.model.NemotronOmniForConditionalGeneration` |
-| `NemotronHForCausalLM` | `nemo_automodel.components.models.nemotron_v3.model.NemotronHForCausalLM` |
-| `NemotronParseForConditionalGeneration` | `nemo_automodel.components.models.nemotron_parse.model.NemotronParseForConditionalGeneration` |
-| `Qwen2_5OmniForConditionalGeneration` | `nemo_automodel.components.models.qwen2_5_omni.model.Qwen2_5OmniThinkerForConditionalGeneration` |
-| `Qwen2_5OmniModel` | `nemo_automodel.components.models.qwen2_5_omni.model.Qwen2_5OmniThinkerForConditionalGeneration` |
-| `Qwen2_5OmniThinkerForConditionalGeneration` | `nemo_automodel.components.models.qwen2_5_omni.model.Qwen2_5OmniThinkerForConditionalGeneration` |
-| `Qwen2ForCausalLM` | `nemo_automodel.components.models.qwen2.model.Qwen2ForCausalLM` |
-| `Qwen3_5ForCausalLM` | `nemo_automodel.components.models.qwen3_5.model.Qwen3_5ForCausalLM` |
-| `Qwen3_5ForConditionalGeneration` | `nemo_automodel.components.models.qwen3_5.model.Qwen3_5ForConditionalGeneration` |
-| `Qwen3_5MoeForConditionalGeneration` | `nemo_automodel.components.models.qwen3_5_moe.model.Qwen3_5MoeForConditionalGeneration` |
-| `Qwen3ForCausalLM` | `nemo_automodel.components.models.qwen3.model.Qwen3ForCausalLM` |
-| `Qwen3MoeForCausalLM` | `nemo_automodel.components.models.qwen3_moe.model.Qwen3MoeForCausalLM` |
-| `Qwen3NextForCausalLM` | `nemo_automodel.components.models.qwen3_next.model.Qwen3NextForCausalLM` |
-| `Qwen3OmniMoeForConditionalGeneration` | `nemo_automodel.components.models.qwen3_omni_moe.model.Qwen3OmniMoeThinkerForConditionalGeneration` |
-| `Qwen3VLForConditionalGeneration` | `nemo_automodel.components.models.qwen3_vl.model.Qwen3VLForConditionalGeneration` |
-| `Qwen3VLMoeForConditionalGeneration` | `nemo_automodel.components.models.qwen3_vl_moe.model.Qwen3VLMoeForConditionalGeneration` |
-| `Step3p5ForCausalLM` | `nemo_automodel.components.models.step3p5.model.Step3p5ForCausalLM` |
-| `Step3p6ForConditionalGeneration` | `nemo_automodel.components.models.step3p7.model.Step3p7ForConditionalGeneration` |
-| `Step3p7ForConditionalGeneration` | `nemo_automodel.components.models.step3p7.model.Step3p7ForConditionalGeneration` |
+| Architecture | Source | Implementation |
+|---|---|---|
+| `BagelForConditionalGeneration` | NeMo native | `nemo_automodel.components.models.bagel.model.BagelForUnifiedMultimodal` |
+| `BaiChuanForCausalLM` (`BaichuanForCausalLM`) | NeMo native | `nemo_automodel.components.models.baichuan.model.BaichuanForCausalLM` |
+| `BailingMoeV2ForCausalLM` | NeMo native | `nemo_automodel.components.models.ling_v2.model.BailingMoeV2ForCausalLM` |
+| `DeepseekV32ForCausalLM` | NeMo native | `nemo_automodel.components.models.deepseek_v32.model.DeepseekV32ForCausalLM` |
+| `DeepseekV3ForCausalLM` | NeMo native | `nemo_automodel.components.models.deepseek_v3.model.DeepseekV3ForCausalLM` |
+| `DeepseekV4ForCausalLM` | NeMo native | `nemo_automodel.components.models.deepseek_v4.model.DeepseekV4ForCausalLM` |
+| `DiffusionGemmaForBlockDiffusion` | NeMo native | `nemo_automodel.components.models.diffusion_gemma.model.DiffusionGemmaForBlockDiffusion` |
+| `Ernie4_5_MoeForCausalLM` | NeMo native | `nemo_automodel.components.models.ernie4_5.model.Ernie4_5_MoeForCausalLM` |
+| `Gemma4ForConditionalGeneration` | NeMo native | `nemo_automodel.components.models.gemma4_moe.model.Gemma4ForConditionalGeneration` |
+| `Glm4MoeForCausalLM` | NeMo native | `nemo_automodel.components.models.glm4_moe.model.Glm4MoeForCausalLM` |
+| `Glm4MoeLiteForCausalLM` | NeMo native | `nemo_automodel.components.models.glm4_moe_lite.model.Glm4MoeLiteForCausalLM` |
+| `GlmMoeDsaForCausalLM` | NeMo native | `nemo_automodel.components.models.glm_moe_dsa.model.GlmMoeDsaForCausalLM` |
+| `GptOssForCausalLM` | NeMo native | `nemo_automodel.components.models.gpt_oss.model.GptOssForCausalLM` |
+| `HYV3ForCausalLM` | NeMo native | `nemo_automodel.components.models.hy_v3.model.HYV3ForCausalLM` |
+| `InklingForConditionalGeneration` | NeMo native | `nemo_automodel.components.models.inkling.model.InklingForConditionalGeneration` |
+| `Kimi-K25-VL` (`KimiK25ForConditionalGeneration`) | NeMo native | `nemo_automodel.components.models.kimi_k25_vl.model.KimiK25VLForConditionalGeneration` |
+| `KimiK3ForConditionalGeneration` | NeMo native | `nemo_automodel.components.models.kimi_k3.multimodal.KimiK3ForConditionalGeneration` |
+| `KimiVLForConditionalGeneration` | NeMo native | `nemo_automodel.components.models.kimivl.model.KimiVLForConditionalGeneration` |
+| `LagunaForCausalLM` | NeMo native | `nemo_automodel.components.models.laguna.model.LagunaForCausalLM` |
+| `GritLM` (`LlamaBidirectionalForSequenceClassification`) | NeMo native | `nemo_automodel.components.models.llama_bidirectional.model.LlamaBidirectionalForSequenceClassification` |
+| `GritLM` (`LlamaBidirectionalModel`) | NeMo native | `nemo_automodel.components.models.llama_bidirectional.model.LlamaBidirectionalModel` |
+| `LlamaForCausalLM` | NeMo native | `nemo_automodel.components.models.llama.model.LlamaForCausalLM` |
+| `llama-nemotron-embed-1b-v2` (`LlamaNemotronVLModel`) | NeMo native | `nemo_automodel.components.models.llama_nemotron_vl.model.LlamaNemotronVLModel` |
+| `LlavaOneVisionForConditionalGeneration` (`LLaVAOneVision1_5_ForConditionalGeneration`) | NeMo native | `nemo_automodel.components.models.llava_onevision.model.LLaVAOneVision1_5_ForConditionalGeneration` |
+| `MiMoV2FlashForCausalLM` | NeMo native | `nemo_automodel.components.models.mimo_v2_flash.model.MiMoV2FlashForCausalLM` |
+| `MiniMaxM2ForCausalLM` | NeMo native | `nemo_automodel.components.models.minimax_m2.model.MiniMaxM2ForCausalLM` |
+| `MiniMaxM3SparseForConditionalGeneration` | NeMo native | `nemo_automodel.components.models.minimax_m3_vl.model.MiniMaxM3SparseForConditionalGeneration` |
+| `Mistral3ForConditionalGeneration` | NeMo native | `nemo_automodel.components.models.mistral4.model.Mistral3ForConditionalGeneration` |
+| `NemotronHForCausalLM` | NeMo native | `nemo_automodel.components.models.nemotron_v3.model.NemotronHForCausalLM` |
+| `NemotronParseForConditionalGeneration` | NeMo native | `nemo_automodel.components.models.nemotron_parse.model.NemotronParseForConditionalGeneration` |
+| `Qwen2_5OmniModel` | NeMo native | `nemo_automodel.components.models.qwen2_5_omni.model.Qwen2_5OmniThinkerForConditionalGeneration` |
+| `Qwen2ForCausalLM` | NeMo native | `nemo_automodel.components.models.qwen2.model.Qwen2ForCausalLM` |
+| `Qwen3.5` (`Qwen3_5ForConditionalGeneration`) | NeMo native | `nemo_automodel.components.models.qwen3_5.model.Qwen3_5ForConditionalGeneration` |
+| `Qwen3_5MoeForConditionalGeneration` | NeMo native | `nemo_automodel.components.models.qwen3_5_moe.model.Qwen3_5MoeForConditionalGeneration` |
+| `Qwen3ForCausalLM` | NeMo native | `nemo_automodel.components.models.qwen3.model.Qwen3ForCausalLM` |
+| `Qwen3MoeForCausalLM` | NeMo native | `nemo_automodel.components.models.qwen3_moe.model.Qwen3MoeForCausalLM` |
+| `Qwen3VLForConditionalGeneration` | NeMo native | `nemo_automodel.components.models.qwen3_vl.model.Qwen3VLForConditionalGeneration` |
+| `Qwen3VLForConditionalGeneration` (`Qwen3VLMoeForConditionalGeneration`) | NeMo native | `nemo_automodel.components.models.qwen3_vl_moe.model.Qwen3VLMoeForConditionalGeneration` |
+| `Step3p5ForCausalLM` | NeMo native | `nemo_automodel.components.models.step3p5.model.Step3p5ForCausalLM` |
+| `Step3p7ForConditionalGeneration` | NeMo native | `nemo_automodel.components.models.step3p7.model.Step3p7ForConditionalGeneration` |
+| `CohereForCausalLM` | Hugging Face | `transformers` |
+| `FalconH1ForCausalLM` | Hugging Face | `transformers` |
+| `Gemma2ForCausalLM` | Hugging Face | `transformers` |
+| `Gemma3ForConditionalGeneration` | Hugging Face | `transformers` |
+| `Gemma 3n` (`Gemma3nForConditionalGeneration`) | Hugging Face | `transformers` |
+| `Gemma4UnifiedForConditionalGeneration` | Hugging Face | `transformers` |
+| `GlmForCausalLM` | Hugging Face | `transformers` |
+| `GraniteForCausalLM` | Hugging Face | `transformers` |
+| `InternVLChatModel` | Hugging Face | `transformers` |
+| `MistralForCausalLM` | Hugging Face | `transformers` |
+| `MixtralForCausalLM` | Hugging Face | `transformers` |
+| `NemotronFlashForCausalLM` | Hugging Face | `transformers` |
+| `OLMo2ForCausalLM` (`Olmo2ForCausalLM`) | Hugging Face | `transformers` |
+| `Phi3ForCausalLM` | Hugging Face | `transformers` |
+| `Phi4MMForCausalLM` | Hugging Face | `transformers` |
+| `Qwen2_5VLForConditionalGeneration` (`Qwen2_5_VLForConditionalGeneration`) | Hugging Face | `transformers` |
+| `Starcoder2ForCausalLM` | Hugging Face | `transformers` |
+| `T5ForConditionalGeneration` | Hugging Face | `transformers` |
 {/* END GENERATED MODEL ARCHITECTURES */}
 
 ## Having Issues?
