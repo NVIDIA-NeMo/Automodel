@@ -828,6 +828,9 @@ class KimiDecoderLayer(nn.Module):
         if not isinstance(moe, MoE):
             raise TypeError(f"Expected Kimi MoE layer, got {type(moe).__name__}.")
         experts = unwrap_checkpoint_wrapper(moe.experts)
+        # Eval-only shortcut to the HF expert ordering. Padding, expert parallelism
+        # (DTensor experts) and every training step stay on the canonical path below,
+        # which is the only one that owns gradients.
         if (
             not self.training
             and padding_mask is None
@@ -848,6 +851,11 @@ class KimiDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         """Run Kimi inference MoE in the same expert-ordered loop as the HF reference.
+
+        Transcribed from upstream ``KimiLinearMoE.moe_infer`` so eval-time output
+        matches HF's expert ordering and accumulation; :meth:`_moe` above decides when
+        it applies. Parity with the canonical ``MoE``/``GroupedExperts`` path is pinned
+        by ``test_hf_order_eval_moe_matches_standard_grouped_experts_path``.
 
         Args:
             moe: MoE module containing the router and optional shared experts.

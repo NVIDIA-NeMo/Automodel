@@ -148,6 +148,12 @@ def test_checkpoint_free_initialize_and_eval_forward_runs_hf_order_moe():
 
 
 def test_hf_order_eval_moe_matches_standard_grouped_experts_path():
+    """Pin the eval-only HF-ordered expert loop to the canonical MoE path.
+
+    ``KimiDecoderLayer._moe_infer_hf_order`` exists to reproduce HF's expert
+    ordering at inference; this is what catches either path drifting from the
+    other, so it must keep passing before the two are merged or one is dropped.
+    """
     torch.manual_seed(0)
     model = KimiLinear48BForCausalLM(_tiny_kimi_config(), backend=_backend_config())
     model.initialize_weights(buffer_device=torch.device("cpu"), dtype=torch.float32)
