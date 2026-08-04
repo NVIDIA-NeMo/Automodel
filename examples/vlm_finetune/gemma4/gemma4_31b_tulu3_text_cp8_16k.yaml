@@ -108,3 +108,8 @@ wandb:
   entity: <your_wandb_entity>
   name: <your_wandb_name>
   dir: <your_wandb_save_dir>
+
+ci:
+  # max_steps 50 at ~46 s/step measured 47.8 min end-to-end on 8xH100; the
+  # .vlm_finetune_test default of 00:10:00 cannot fit it.
+  time: "01:00:00"
