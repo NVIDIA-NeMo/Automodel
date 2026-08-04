@@ -16,8 +16,6 @@
 
 import types
 
-import pytest
-
 from nemo_automodel.components.kernels import hub as hub_kernels
 from nemo_automodel.components.kernels.config import HubKernelConfig
 
@@ -48,6 +46,10 @@ class TestResolveAttnImplementation:
 
     def test_passthrough_for_standard_impl(self):
         assert hub_kernels.resolve_attn_implementation("sdpa") == "sdpa"
+
+    def test_hub_kernels_without_attn_repo_does_not_override(self):
+        cfg = HubKernelConfig(kernelize_layers=True)
+        assert hub_kernels.resolve_attn_implementation("sdpa", hub_kernels=cfg) == "sdpa"
 
 
 class TestExtractHubKernelsConfig:

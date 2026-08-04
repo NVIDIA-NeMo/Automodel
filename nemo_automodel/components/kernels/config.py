@@ -18,21 +18,20 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from nemo_automodel.components.kernels.hub import HUB_FLASH_ATTN2
-
 
 @dataclass(kw_only=True)
 class HubKernelConfig:
     """Hub kernel settings for native ``BackendConfig.attn="hub"``.
 
     Attributes:
-        attn_repo: Hub repo id for flash attention (default
-            ``kernels-community/flash-attn2``).
+        attn_repo: Optional Hub repo id for flash attention. When set, overrides
+            a top-level ``attn_implementation``. When ``None``, ``attn="hub"``
+            resolves to ``kernels-community/flash-attn2``.
         attn_version: Kernel major version passed to ``kernels.get_kernel``.
         kernelize_layers: When ``True`` and ``use_kernels=True`` on a custom
             model, apply Transformers ``kernelize`` after construction.
     """
 
-    attn_repo: str | None = HUB_FLASH_ATTN2
+    attn_repo: str | None = None
     attn_version: int = 1
     kernelize_layers: bool = True
