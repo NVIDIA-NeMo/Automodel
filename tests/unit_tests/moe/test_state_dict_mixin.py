@@ -91,6 +91,23 @@ def _run_ep_free_dtensor_split(rank: int, world_size: int, init_file: str) -> No
             up_key = f"model.layers.0.mlp.experts.{expert_id}.up_proj.weight"
             torch.testing.assert_close(converted[gate_key], full_weight[expert_id, :, :2].T)
             torch.testing.assert_close(converted[up_key], full_weight[expert_id, :, 2:].T)
+
+        full_down_weight = torch.arange(4 * 2 * 6, dtype=torch.float32).reshape(4, 2, 6)
+        down_weight = distribute_tensor(full_down_weight, mesh, [Shard(0)])
+        converted.update(
+            mixin._convert_single_merged_expert_to_hf_split_experts(
+                "model.layers.0.mlp.experts.down_projs",
+                down_weight,
+            )
+        )
+
+        restored = mixin._from_hf_w_merged_experts(converted)
+        assert restored == {}
+        assert mixin.view_loaded_native_keys == {
+            "model.layers.0.mlp.experts.gate_and_up_projs",
+            "model.layers.0.mlp.experts.down_projs",
+        }
+        assert mixin._inplace_loaded_native_keys == set()
     finally:
         dist.destroy_process_group()
 
@@ -126,6 +143,36 @@ class TestValidateExpertAvailability:
                     hf_state_dict[key] = torch.randn(512, 1024)
 
         with pytest.raises(RuntimeError, match="Expert weights missing from checkpoint"):
+            mixin._validate_expert_availability(hf_state_dict, 8)
+
+    def test_inplace_loaded_experts_are_not_reported_missing(self):
+        mixin = MockMoEStateDictMixin()
+        hf_state_dict = {}
+
+        for expert in [0, 1]:
+            for proj in ["gate_proj", "up_proj", "down_proj"]:
+                key = f"model.layers.0.mlp.experts.{expert}.{proj}.weight"
+                hf_state_dict[key] = torch.randn(512, 1024)
+
+        mixin._inplace_loaded_native_keys = {
+            "model.layers.0.mlp.experts.gate_and_up_projs",
+            "model.layers.0.mlp.experts.down_projs",
+        }
+        mixin._last_expert_ids = [0, 1]
+
+        mixin._validate_expert_availability(hf_state_dict, 8)
+
+    def test_inplace_loaded_gate_up_still_validates_down_projection(self):
+        mixin = MockMoEStateDictMixin()
+        hf_state_dict = {
+            "model.layers.0.mlp.experts.0.gate_proj.weight": torch.randn(512, 1024),
+            "model.layers.0.mlp.experts.0.up_proj.weight": torch.randn(512, 1024),
+            "model.layers.0.mlp.experts.0.down_proj.weight": torch.randn(512, 1024),
+        }
+        mixin._inplace_loaded_native_keys = {"model.layers.0.mlp.experts.gate_and_up_projs"}
+        mixin._last_expert_ids = [0]
+
+        with pytest.raises(RuntimeError, match=r"model\.layers\.0\.mlp\.experts\.1\.down_proj\.weight"):
             mixin._validate_expert_availability(hf_state_dict, 8)
 
     def test_without_model_prefix(self):
