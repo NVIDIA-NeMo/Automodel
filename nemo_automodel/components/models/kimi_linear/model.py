@@ -951,7 +951,6 @@ def _build_moe_config(
         router_bias=False,
         expert_bias=False,
         expert_activation="swiglu",
-        router_topk_sorted=False,
         router_weights_fp32=True,
         router_weight_uses_score_correction_bias=True,
         # The reference implementation rounds each BF16 expert output before applying

@@ -97,7 +97,6 @@ def test_kimi_moe_uses_hf_routing_numerics():
     model = KimiLinear48BForCausalLM(_tiny_kimi_config(), backend=_backend_config())
     moe_layer = model.model.layers["1"].mlp
 
-    assert not moe_layer.gate.router_topk_sorted
     assert moe_layer.gate.router_weights_fp32
     assert moe_layer.gate.router_weight_uses_score_correction_bias
     assert moe_layer.experts.config.apply_router_weight_after_down
