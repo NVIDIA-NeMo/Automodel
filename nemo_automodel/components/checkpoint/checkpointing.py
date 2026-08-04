@@ -19,6 +19,7 @@ import os
 import pickle
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
@@ -360,11 +361,19 @@ class _AsyncSaveContext:
 
 
 class _ModelSavePlanner(dcp.DefaultSavePlanner):
-    """Keep cached model save plans separate from optimizer save plans."""
+    """Keep model save plans in one checkpointer-scoped cache namespace."""
+
+    def __init__(self, cache_namespace: str) -> None:
+        super().__init__(enable_plan_caching=True)
+        self._cached_plans_key = f"{cache_namespace}:model"
 
 
 class _OptimizerSavePlanner(dcp.DefaultSavePlanner):
-    """Keep cached optimizer save plans separate from model save plans."""
+    """Keep optimizer save plans in one checkpointer-scoped cache namespace."""
+
+    def __init__(self, cache_namespace: str) -> None:
+        super().__init__(enable_plan_caching=True)
+        self._cached_plans_key = f"{cache_namespace}:optimizer"
 
 
 def _new_gloo_process_group(
@@ -528,6 +537,7 @@ class Checkpointer:
         self.tp_rank = tp_rank
         self.pp_rank = pp_rank
         self.process_group = process_group
+        self._planner_cache_namespace = uuid.uuid4().hex
 
         # async specific variables
         self._model_ctx = _AsyncSaveContext(stager=None, process_group=None, future=None, staging_active=False)
@@ -1479,7 +1489,7 @@ class Checkpointer:
 
         ret = None
         planner_cls = _ModelSavePlanner if is_model else _OptimizerSavePlanner
-        planner = planner_cls(enable_plan_caching=True)
+        planner = planner_cls(self._planner_cache_namespace)
 
         # Routes to MSC storage write for cloud paths
         storage_writer = _maybe_msc_writer(path, storage_writer)
