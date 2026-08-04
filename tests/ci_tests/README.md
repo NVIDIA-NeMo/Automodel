@@ -94,7 +94,9 @@ CI also reuses the normal finetune that already precedes checkpoint robustness a
 reproducibility metric; it does not launch another baseline. Normal finetune and checkpoint Phase 1 record per-rank
 batch digests, loss, and LR. They are compared only when component fingerprints match for model initialization and
 seed, dataset/dataloader ordering, batch sizes and topology, optimizer, LR scheduler, loss, and backend configuration.
-Otherwise the log reports `not_comparable` and names the mismatched components.
+Otherwise the log reports `not_comparable` and names the mismatched components. Loss differences use the separately
+calibrated `training_reproducibility_loss_threshold` (default `5e-2`). Exceeding that envelope remains non-blocking but
+emits a prominent `ALERT` and saves a machine-readable `report.json` in the reproducibility artifact directory.
 
 Use source-load parity for recipes where the initial HF checkpoint load is itself part of the contract, especially
 remote-code, force-HF, custom model, or tied/untied `lm_head` paths. The raw HF reference model is loaded only long

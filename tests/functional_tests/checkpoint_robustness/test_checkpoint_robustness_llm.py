@@ -1989,7 +1989,7 @@ def _run_process_isolated_checkpoint_phase(
             _report_training_reproducibility(
                 artifact_dir,
                 reproducibility_recorder,
-                loss_threshold=float(custom_args.get("training_reproducibility_loss_threshold", "5e-3")),
+                loss_threshold=float(custom_args.get("training_reproducibility_loss_threshold", "5e-2")),
             )
 
         peak_vram_gb = torch.cuda.max_memory_allocated() / 1024**3
@@ -2226,7 +2226,7 @@ def run_checkpoint_robustness(
     check_resume = bool(custom_args.get("check_resume", False))
     resume_first_loss_threshold = float(custom_args.get("resume_first_loss_threshold", "1e-6"))
     resume_loss_threshold = float(custom_args.get("resume_loss_threshold", "5e-3"))
-    training_reproducibility_loss_threshold = float(custom_args.get("training_reproducibility_loss_threshold", "5e-3"))
+    training_reproducibility_loss_threshold = float(custom_args.get("training_reproducibility_loss_threshold", "5e-2"))
     hf_device_map_auto = bool(custom_args.get("hf_device_map_auto", False))
     hf_source_post_load_dequantize = bool(custom_args.get("hf_source_post_load_dequantize", False))
     skip_hf_reload = bool(custom_args.get("skip_hf_reload", False))

@@ -397,6 +397,7 @@ def test_vlm_checkpoint_robustness_recipes_resolve(tmp_path, recipe_path):
     if Path(recipe_path).stem == "qwen3_vl_moe_30b_te_deepep":
         assert robustness["hf_kl_threshold"] == 2.5e-2
         assert "resume_loss_threshold" not in robustness
+        assert robustness["training_reproducibility_loss_threshold"] == 2e-2
         assert robustness["source_load_kl_threshold"] == 2e-2
         assert robustness["source_load_mean_kl_threshold"] == 5e-3
     if Path(recipe_path).stem == "qwen3_5_35b":

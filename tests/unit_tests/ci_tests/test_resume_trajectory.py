@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 from types import SimpleNamespace
 
 from tests.functional_tests.checkpoint_robustness.resume_trajectory import (
@@ -20,6 +21,7 @@ from tests.functional_tests.checkpoint_robustness.resume_trajectory import (
     _configure_resumed_run,
     _configure_uninterrupted_run,
     _restored_state_mismatch,
+    _report_training_reproducibility,
     _resume_plan_from_config,
     _trajectory_mismatch,
 )
@@ -163,6 +165,20 @@ def test_training_reproducibility_reports_nonblocking_loss_envelope():
     assert report["overlapping_steps"] == [0, 1]
     assert report["max_difference_step"] == 1
     assert abs(report["max_loss_difference"] - 1e-2) < 1e-12
+
+
+def test_training_reproducibility_persists_prominent_nonblocking_alert(tmp_path, capsys):
+    (tmp_path / "normal_rank_0.json").write_text(json.dumps(_training_run()))
+    checkpoint_recorder = SimpleNamespace(to_dict=lambda: _training_run(second_loss=0.96))
+
+    _report_training_reproducibility(tmp_path, checkpoint_recorder, loss_threshold=5e-2)
+
+    output = capsys.readouterr().out
+    assert "[Training reproducibility][non-blocking][ALERT]" in output
+    report = json.loads((tmp_path / "report.json").read_text())
+    assert report["blocking"] is False
+    assert report["status"] == "alert"
+    assert report["reports"][0]["status"] == "outside_tolerance"
 
 
 def test_training_reproducibility_detects_independent_batch_order_divergence():

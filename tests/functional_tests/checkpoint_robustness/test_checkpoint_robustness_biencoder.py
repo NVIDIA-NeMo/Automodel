@@ -168,7 +168,7 @@ def test_checkpoint_robustness_biencoder():
     hf_cosine_threshold = float(custom_args.get("hf_cosine_threshold", "0.999"))
     check_hf_reload = bool(custom_args.get("check_hf_reload", False))
     check_resume = bool(custom_args.get("check_resume", False))
-    training_reproducibility_loss_threshold = float(custom_args.get("training_reproducibility_loss_threshold", "5e-3"))
+    training_reproducibility_loss_threshold = float(custom_args.get("training_reproducibility_loss_threshold", "5e-2"))
     resume_first_loss_threshold = float(custom_args.get("resume_first_loss_threshold", "1e-6"))
     resume_loss_threshold = float(custom_args.get("resume_loss_threshold", "5e-3"))
 

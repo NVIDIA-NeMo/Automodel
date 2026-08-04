@@ -123,6 +123,8 @@ ci:
     # Current-stack BF16 CI observed source max/mean KL 0.0165/0.0043 and HF reload KL 0.0201.
     hf_kl_threshold: 2.5e-2
     hf_device_map_auto: true
+    # Independently calibrated normal-run envelope; it does not relax resume correctness.
+    training_reproducibility_loss_threshold: 2e-2
     source_load_kl_threshold: 2e-2
     source_load_mean_kl_threshold: 5e-3
     source_load_cosine_threshold: 0.9985

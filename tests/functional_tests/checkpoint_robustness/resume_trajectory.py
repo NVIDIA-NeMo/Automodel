@@ -445,7 +445,7 @@ def _report_training_reproducibility(
     *,
     loss_threshold: float,
 ) -> None:
-    """Print a gathered, explicitly non-blocking independent-run comparison."""
+    """Persist and print a gathered, explicitly non-blocking independent-run comparison."""
     try:
         normal_run = _load_training_reproducibility(artifact_dir, lifecycle="normal")
         local_report = _compare_training_reproducibility(
@@ -462,8 +462,43 @@ def _report_training_reproducibility(
         dist.all_gather_object(reports, local_report)
     if _rank() != 0:
         return
+
+    alert_statuses = {"diverged", "outside_tolerance"}
+    statuses = [report["status"] for report in reports]
+    summary_status = "alert" if any(status in alert_statuses for status in statuses) else "reported"
+    report_path = artifact_dir / "report.json"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = report_path.with_suffix(".tmp")
+    temporary_path.write_text(
+        json.dumps(
+            {
+                "blocking": False,
+                "status": summary_status,
+                "reports": reports,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
+    temporary_path.replace(report_path)
+
     for rank, report in enumerate(reports):
         print(f"[Training reproducibility][non-blocking] rank={rank} {json.dumps(report, sort_keys=True)}")
+    if summary_status == "alert":
+        print(
+            "[Training reproducibility][non-blocking][ALERT] Independent-run reproducibility exceeded its "
+            f"configured envelope; inspect {report_path}"
+        )
+    elif "not_comparable" in statuses:
+        print(
+            "[Training reproducibility][non-blocking][NOTICE] At least one rank was not comparable; "
+            f"inspect {report_path}"
+        )
+    else:
+        print(
+            "[Training reproducibility][non-blocking][SUMMARY] All ranks stayed within the configured envelope; "
+            f"report={report_path}"
+        )
 
 
 def _optimizer_step_summary(optimizers: object) -> list[dict[str, int]]:

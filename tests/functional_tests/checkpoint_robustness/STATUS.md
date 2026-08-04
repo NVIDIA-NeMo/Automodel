@@ -13,7 +13,9 @@ with the uninterrupted continuation of the same checkpoint-producing training
 trajectory. The check requires exact optimizer/scheduler position, LR and
 weight-decay state, RNG state, stateful-dataloader state, and per-rank batch
 identity. The first post-resume loss uses a separate strict threshold; the
-existing `resume_loss_threshold` applies only to later BF16 optimizer steps.
+existing `resume_loss_threshold` applies only to later BF16 optimizer steps. Independently calibrated historical
+envelopes are retained as the non-blocking `training_reproducibility_loss_threshold` metric instead of weakening the
+shared-trajectory resume oracle.
 
 Independent-run reproducibility is not a checkpoint-restore oracle. CI reuses
 the normal finetune and checkpoint Phase 1 to report it separately and

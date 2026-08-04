@@ -117,6 +117,10 @@ ci:
     source_load_cosine_threshold: 0.9995
     tokenizer_name: nvidia/Nemotron-Flash-1B
     trust_remote_code: true
+    # Preserve the independently calibrated hybrid-attention/Mamba/DeltaNet
+    # reproducibility envelope. This metric is observational and does not
+    # relax the exact-state shared-trajectory resume checks.
+    training_reproducibility_loss_threshold: 1.5e-2
     dataset.limit_dataset_samples: 500
     validation_dataset.limit_dataset_samples: 500
 
