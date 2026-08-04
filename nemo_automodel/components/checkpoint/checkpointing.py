@@ -866,7 +866,20 @@ class Checkpointer:
                 or single_device_custom_safetensors
             )
         ):
+            import resource  # PROBE
+
             t0 = time.monotonic()
+            _ru0 = resource.getrusage(resource.RUSAGE_SELF)  # PROBE
+            if os.environ.get("AM_CKPT_PREFETCH", "1") == "1":  # PROBE
+                _shards = _ckpt_shard_files(model_path)
+                _t_pf0 = time.monotonic()
+                _pf_bytes = _warm_page_cache(_shards)
+                _t_pf1 = time.monotonic()
+                _pf_gb = _pf_bytes / (1 << 30)
+                logging.info(
+                    f"ckpt_probe: prefetch {_pf_gb:.2f} GB from {len(_shards)} shard(s) in "
+                    f"{_t_pf1 - _t_pf0:.2f}s ({_pf_gb / max(_t_pf1 - _t_pf0, 1e-9):.2f} GB/s)"
+                )
             state_dict_from_disk = _load_hf_checkpoint_preserving_dtype(model_path)
             t_disk = time.monotonic()
             if state_dict_from_disk is not None:
@@ -875,6 +888,7 @@ class Checkpointer:
                 )
             else:
                 state_dict_from_disk = {}
+            t_adapt = time.monotonic()  # PROBE
 
             # Apply key_mapping (e.g. _checkpoint_conversion_mapping) so that
             # HF checkpoint keys are renamed to match the model's parameter FQNs.
@@ -910,6 +924,15 @@ class Checkpointer:
                 f"load_model: {gb:.2f} GB loaded in {total_s:.2f}s "
                 f"({gb / total_s:.2f} GB/s overall | "
                 f"disk read {disk_s:.2f}s, distribute {dist_s:.2f}s)"
+            )
+            _ru1 = resource.getrusage(resource.RUSAGE_SELF)  # PROBE
+            logging.info(  # PROBE
+                f"ckpt_probe: torch_threads={torch.get_num_threads()} "
+                f"open={disk_s:.2f}s from_hf_merge={t_adapt - t_disk:.2f}s "
+                f"into_model={t_end - t_adapt:.2f}s "
+                f"majflt={_ru1.ru_majflt - _ru0.ru_majflt} "
+                f"minflt={_ru1.ru_minflt - _ru0.ru_minflt} "
+                f"inblock={_ru1.ru_inblock - _ru0.ru_inblock}"
             )
             del state_dict_from_disk
             gc.collect()
@@ -2544,6 +2567,45 @@ def _load_hf_checkpoint_preserving_dtype(model_path: str) -> Optional[dict[str, 
     elif _is_safetensors_checkpoint(model_path):
         return _load_hf_safetensors_checkpoint(model_path)
     return None
+
+
+def _ckpt_shard_files(model_path: str) -> list[str]:  # PROBE
+    """Return the on-disk shard files backing a HF checkpoint path."""
+    if os.path.isfile(model_path):
+        return [model_path]
+    files = sorted(glob.glob(os.path.join(model_path, "*.safetensors")))
+    if not files:
+        files = sorted(glob.glob(os.path.join(model_path, "*.bin")))
+    return files
+
+
+def _warm_page_cache(paths: list[str], chunk_bytes: int = 64 << 20, max_workers: int = 8) -> int:  # PROBE
+    """Populate the OS page cache with large sequential reads.
+
+    safetensors ``get_tensor`` hands back mmap-backed views, so the real I/O happens
+    later as page faults while tensors are merged/copied.  Faulting 4 KiB pages from a
+    parallel network filesystem defeats readahead; a bounded set of large sequential
+    reads pulls the same bytes in at streaming speed and leaves them in (reclaimable)
+    page cache for the fault path to hit.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _read_one(path: str) -> int:
+        total = 0
+        buf = bytearray(chunk_bytes)
+        view = memoryview(buf)
+        with open(path, "rb", buffering=0) as fh:
+            while True:
+                n = fh.readinto(view)
+                if not n:
+                    break
+                total += n
+        return total
+
+    if not paths:
+        return 0
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(paths))) as pool:
+        return sum(pool.map(_read_one, paths))
 
 
 def _load_hf_safetensors_checkpoint(model_path: str) -> Optional[dict[str, torch.Tensor]]:
