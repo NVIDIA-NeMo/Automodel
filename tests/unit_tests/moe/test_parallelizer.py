@@ -677,7 +677,7 @@ def test_apply_ac_warns_when_router_is_recomputed(monkeypatch):
     assert logger_mock.warning.call_count == 1
     assert "ignore_router_for_ac" in logger_mock.warning.call_args[0][0]
 
-    # ignore_router=False (the default) saves the router projection and top-k outputs -> no warning.
+    # ignore_router=False saves the router projection and top-k outputs -> no warning.
     logger_mock.reset_mock()
     P.apply_ac(DummyModel([DummyBlock()]), ignore_router=False, hidden_size=7168, num_experts=256)
     logger_mock.warning.assert_not_called()
@@ -732,7 +732,7 @@ def test_apply_ac_custom_policy_saves_router_projection_and_topk(monkeypatch):
     num_experts = 31
     model = DummyModel([DummyBlock(), DummyBlock()])
 
-    P.apply_ac(model, hidden_size=hidden_size, num_experts=num_experts)
+    P.apply_ac(model, ignore_router=False, hidden_size=hidden_size, num_experts=num_experts)
 
     assert captured_policy is not None
 
@@ -1312,7 +1312,7 @@ def test_parallelize_model_calls_subsystems_and_validates(monkeypatch):
     apply_ep_mock.assert_called_once()
     # AC enabled
     apply_ac_mock.assert_called_once_with(
-        model, ignore_router=False, selective=False, activation_checkpointing_scope="all"
+        model, ignore_router=True, selective=False, activation_checkpointing_scope="all"
     )
     # FSDP called with combined flags and derived meshes
     args, kwargs = apply_fsdp_mock.call_args
@@ -2400,8 +2400,8 @@ def test_parallelize_model_passes_ignore_router_for_ac_to_apply_ac(monkeypatch):
     assert kwargs.get("ignore_router") is True
 
 
-def test_parallelize_model_ignore_router_for_ac_defaults_to_false(monkeypatch):
-    """Test that parallelize_model defaults ignore_router_for_ac to False."""
+def test_parallelize_model_ignore_router_for_ac_defaults_to_true(monkeypatch):
+    """Test that parallelize_model defaults ignore_router_for_ac to True."""
     P = _import_parallelizer_with_stubs(monkeypatch)
     apply_ac_mock = MagicMock()
     monkeypatch.setattr(P, "apply_ac", apply_ac_mock)
@@ -2429,10 +2429,10 @@ def test_parallelize_model_ignore_router_for_ac_defaults_to_false(monkeypatch):
         activation_checkpointing=True,
     )
 
-    # Verify apply_ac was called with ignore_router=False (default)
+    # Verify apply_ac was called with ignore_router=True (default)
     apply_ac_mock.assert_called_once()
     args, kwargs = apply_ac_mock.call_args
-    assert kwargs.get("ignore_router") is False
+    assert kwargs.get("ignore_router") is True
     # Full (True) AC is not selective.
     assert kwargs.get("selective") is False
 
@@ -2468,7 +2468,7 @@ def test_parallelize_model_passes_selective_to_apply_ac(monkeypatch):
     apply_ac_mock.assert_called_once()
     _, kwargs = apply_ac_mock.call_args
     assert kwargs.get("selective") is True
-    assert kwargs.get("ignore_router") is False
+    assert kwargs.get("ignore_router") is True
 
 
 def test_apply_ac_selective_wraps_blocks_with_shared_policy(monkeypatch):

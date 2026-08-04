@@ -170,11 +170,10 @@ class DistributedSetup:
 class MoEParallelizerConfig:
     """Configuration for MoE model parallelization (EP + FSDP settings)."""
 
-    # Default False: include the MoE router projection and top-k outputs in the values
-    # saved for the backward pass. Ignoring them recomputes tied top-k selections, which
-    # can route a different number of tokens per expert than the forward pass and make
-    # torch.utils.checkpoint raise a CheckpointError on the backward recompute.
-    ignore_router_for_ac: bool = False
+    # Default True: ignore the MoE router projection and top-k outputs from the values
+    # saved for backward, so activation checkpointing recomputes them with the block.
+    # Set this to False to preserve the forward routing decision during recompute.
+    ignore_router_for_ac: bool = True
     reshard_after_forward: bool = False
     lm_head_precision: Optional[Union[str, torch.dtype]] = None
     wrap_outer_model: bool = True
