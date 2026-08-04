@@ -375,6 +375,10 @@ class _HybridEPManager(_DispatchManager):
         router_topk: int,
         permute_fusion: bool = False,
         moe_hybridep_num_sms: int = 24,
+        moe_hybridep_permute_fusion: bool = False,
+        moe_hybridep_num_sms_preprocessing: int | None = None,
+        moe_hybridep_num_blocks_permute: int | None = None,
+        moe_hybridep_num_blocks_unpermute: int | None = None,
     ):
         self.group = group
         self.num_local_experts = num_local_experts
@@ -382,6 +386,10 @@ class _HybridEPManager(_DispatchManager):
         self.router_topk = router_topk
         self.permute_fusion = permute_fusion
         self.moe_hybridep_num_sms = moe_hybridep_num_sms
+        self.moe_hybridep_permute_fusion = moe_hybridep_permute_fusion
+        self.moe_hybridep_num_sms_preprocessing = moe_hybridep_num_sms_preprocessing
+        self.moe_hybridep_num_blocks_permute = moe_hybridep_num_blocks_permute
+        self.moe_hybridep_num_blocks_unpermute = moe_hybridep_num_blocks_unpermute
         self.num_permuted_tokens = None
 
         # Metadata
@@ -438,6 +446,7 @@ class _HybridEPManager(_DispatchManager):
         async_finish: bool = True,  # noqa: ARG002 - not supported by HybridEP backend
         allocate_on_comm_stream: bool = True,  # noqa: ARG002 - not supported by HybridEP backend
     ) -> torch.Tensor:
+        """Dispatch ``hidden_states[T, H]`` using the dense HybridEP routing map."""
         # Reset num_permuted_tokens to None to avoid reusing cached state from a prior dispatch.
         # This can happen in non-reentrant activation checkpointing mode.
         self.num_permuted_tokens = None
@@ -453,6 +462,10 @@ class _HybridEPManager(_DispatchManager):
             num_sms_combine_api=self.moe_hybridep_num_sms,
             num_permuted_tokens=self.num_permuted_tokens,
             pad_multiple=self.pad_multiple,
+            fuse_permute=self.moe_hybridep_permute_fusion,
+            num_sms_preprocessing_api=self.moe_hybridep_num_sms_preprocessing,
+            num_blocks_permute=self.moe_hybridep_num_blocks_permute,
+            num_blocks_unpermute=self.moe_hybridep_num_blocks_unpermute,
         )
 
         self.tokens_per_expert = tokens_per_expert
@@ -471,6 +484,7 @@ class _HybridEPManager(_DispatchManager):
             handle=self.handle,
             num_permuted_tokens=self.num_permuted_tokens,
             pad_multiple=self.pad_multiple,
+            fuse_permute=self.moe_hybridep_permute_fusion,
         )
         self.handle = None
         self.num_permuted_tokens = None
@@ -526,6 +540,18 @@ class TokenDispatcherConfig:
 
     moe_hybridep_num_sms: int = 24
     """Number of SMs to use for HybridEP dispatch and combine APIs."""
+
+    moe_hybridep_permute_fusion: bool = False
+    """Fuse HybridEP permutation with dispatch and unpermutation with combine."""
+
+    moe_hybridep_num_sms_preprocessing: int | None = None
+    """Optional number of SMs used by HybridEP routing-metadata preprocessing."""
+
+    moe_hybridep_num_blocks_permute: int | None = None
+    """Optional number of HybridEP dispatch permutation blocks."""
+
+    moe_hybridep_num_blocks_unpermute: int | None = None
+    """Optional number of HybridEP combine unpermutation blocks."""
 
     moe_share_token_dispatcher: bool = True
     """Share one communication manager instance across MoE layers for the configured backend."""
@@ -634,6 +660,10 @@ class MoEFlexTokenDispatcher:
                         router_topk=self.tp_size * self.config.moe_router_topk,
                         permute_fusion=self.config.moe_permute_fusion,
                         moe_hybridep_num_sms=self.config.moe_hybridep_num_sms,
+                        moe_hybridep_permute_fusion=self.config.moe_hybridep_permute_fusion,
+                        moe_hybridep_num_sms_preprocessing=self.config.moe_hybridep_num_sms_preprocessing,
+                        moe_hybridep_num_blocks_permute=self.config.moe_hybridep_num_blocks_permute,
+                        moe_hybridep_num_blocks_unpermute=self.config.moe_hybridep_num_blocks_unpermute,
                     )
                 self._comm_manager = MoEFlexTokenDispatcher.shared_hybridep_manager
             else:
@@ -644,6 +674,10 @@ class MoEFlexTokenDispatcher:
                     router_topk=self.tp_size * self.config.moe_router_topk,
                     permute_fusion=self.config.moe_permute_fusion,
                     moe_hybridep_num_sms=self.config.moe_hybridep_num_sms,
+                    moe_hybridep_permute_fusion=self.config.moe_hybridep_permute_fusion,
+                    moe_hybridep_num_sms_preprocessing=self.config.moe_hybridep_num_sms_preprocessing,
+                    moe_hybridep_num_blocks_permute=self.config.moe_hybridep_num_blocks_permute,
+                    moe_hybridep_num_blocks_unpermute=self.config.moe_hybridep_num_blocks_unpermute,
                 )
             self.hybridep_metadata_processor = _HybridEPMetadataProcessor(
                 num_experts=self.tp_size * self.config.num_moe_experts,
@@ -675,11 +709,10 @@ class MoEFlexTokenDispatcher:
         token_probs: torch.Tensor,
         token_indices: torch.Tensor,
     ):
-        """
-        Preprocesses the hidden states and routing information before dispatching tokens to experts.
+        """Prepare ``hidden_states[..., H]`` and routing metadata for dispatch.
 
-        For DeepEP backend: uses token_indices and token_probs directly.
-        For HybridEP backend: converts token_indices to routing_map (multihot format).
+        DeepEP consumes ``token_indices[T, K]`` and ``token_probs[T, K]`` directly. HybridEP
+        expands both into its established multihot ``[T, E]`` representation.
         """
         self.hidden_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, self.hidden_shape[-1])

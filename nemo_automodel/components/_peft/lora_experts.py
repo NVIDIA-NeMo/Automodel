@@ -398,6 +398,10 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
             dispatcher_share_token_dispatcher=orig_module.dispatcher_share_token_dispatcher,
             dispatcher_async_dispatch=orig_module.dispatcher_async_dispatch,
         )
+        self.dispatcher_hybridep_permute_fusion = orig_module.dispatcher_hybridep_permute_fusion
+        self.dispatcher_hybridep_num_sms_preprocessing = orig_module.dispatcher_hybridep_num_sms_preprocessing
+        self.dispatcher_hybridep_num_blocks_permute = orig_module.dispatcher_hybridep_num_blocks_permute
+        self.dispatcher_hybridep_num_blocks_unpermute = orig_module.dispatcher_hybridep_num_blocks_unpermute
 
         self.gate_and_up_projs.data.copy_(orig_module.gate_and_up_projs.data)
         self.down_projs.data.copy_(orig_module.down_projs.data)
