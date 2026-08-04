@@ -30,7 +30,7 @@ storage reader's ``key_mapping`` is disabled so the keys are translated exactly 
 """
 
 import re
-from typing import Any, Optional
+from typing import Any
 
 GEMMA4_UNIFIED_MODEL_TYPE = "gemma4_unified"
 
@@ -81,7 +81,7 @@ class Gemma4UnifiedStateDictAdapter:
     def to_hf(
         self,
         state_dict: dict[str, Any],
-        exclude_key_regex: Optional[str] = None,
+        exclude_key_regex: str | None = None,
         **kwargs,
     ) -> dict[str, Any]:
         """Rename model FQNs to the HF checkpoint FQNs.
