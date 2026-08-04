@@ -15,15 +15,17 @@
 import importlib.util
 import logging
 from contextlib import contextmanager, nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal
 
 import torch
 from torch import nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
-logger = logging.getLogger(__name__)
+from nemo_automodel.shared.import_utils import safe_import_from
 from nemo_automodel.shared.utils import dtype_from_str
+
+logger = logging.getLogger(__name__)
 
 HAVE_TE = importlib.util.find_spec("transformer_engine") is not None
 HAVE_DEEP_EP = importlib.util.find_spec("deep_ep") is not None
@@ -152,6 +154,41 @@ class TEFp8Config:
 
 
 @dataclass(kw_only=True)
+class CudaGraphConfig:
+    """Configuration for scoped partial CUDA graphs.
+
+    Attributes:
+        modules: Per-layer modules to capture with Transformer Engine, following
+            Megatron Core's module names. AutoModel supports whole ``attn``,
+            ``moe_router``, and ``moe_preprocess`` scopes, plus the
+            AutoModel-specific narrow ``te_dpa`` scope. An empty list disables
+            CUDA graphs.
+    """
+
+    modules: list[Literal["attn", "te_dpa", "moe_router", "moe_preprocess"]] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        """Validate the declarative CUDA-graph configuration."""
+        if not isinstance(self.modules, list):
+            raise TypeError("cuda_graph.modules must be a list")
+        if not all(isinstance(module, str) for module in self.modules):
+            raise TypeError("cuda_graph.modules entries must be strings")
+        supported_modules = {"attn", "te_dpa", "moe_router", "moe_preprocess"}
+        unknown_modules = set(self.modules) - supported_modules
+        if unknown_modules:
+            raise ValueError(
+                f"Unsupported cuda_graph.modules: {sorted(unknown_modules)}; "
+                f"supported modules are {sorted(supported_modules)}"
+            )
+        if len(self.modules) != len(set(self.modules)):
+            raise ValueError("cuda_graph.modules must not contain duplicates")
+        if {"attn", "te_dpa"}.issubset(self.modules):
+            raise ValueError("cuda_graph.modules cannot contain both 'attn' and 'te_dpa'")
+        if "moe_preprocess" in self.modules and "moe_router" not in self.modules:
+            raise ValueError("'moe_preprocess' in cuda_graph.modules requires 'moe_router'")
+
+
+@dataclass(kw_only=True)
 class BackendConfig:
     """Backend configuration for model components.
 
@@ -159,8 +196,10 @@ class BackendConfig:
         attn: Attention backend ("te", "sdpa", "flex", "eager", or "tilelang").
             For DeepSeek V4, "tilelang" enables the TileLang sparse attention,
             indexer, and Sinkhorn kernels together.
-        linear: Linear layer backend ("torch" or "te").
-        rms_norm: RMSNorm backend ("torch", "torch_fp32", or "te").
+        linear: Linear layer backend ("torch", "te", or "quack").
+        rms_norm: RMSNorm backend ("torch", "torch_fp32", "te", or "quack").
+        rope: Rotary embedding backend ("torch" or "quack"). QuACK is currently
+            integrated for Llama-family rotary embeddings.
         rope_fusion: Whether to use fused RoPE (requires TE).
         experts: MoE expert GEMM backend. "torch" uses per-expert loop,
             "te" uses TE GroupedLinear, "gmm" uses grouped_gemm.ops.gmm,
@@ -191,11 +230,13 @@ class BackendConfig:
         compile_attn: torch.compile(fullgraph) the attention module's forward — both the
             DeepSeek-V3 MLA and standard GQA attention (e.g. Qwen3-MoE) honor it. Requires
             attn="sdpa", linear="torch", rms_norm="torch", rope_fusion=False.
+        cuda_graph: Scoped partial CUDA-graph configuration.
     """
 
     attn: Literal["te", "sdpa", "flex", "eager", "tilelang"] = "te" if HAVE_TE and torch.cuda.is_available() else "sdpa"
-    linear: Literal["torch", "te"] = "te" if HAVE_TE and torch.cuda.is_available() else "torch"
-    rms_norm: Literal["torch", "torch_fp32", "te"] = "torch_fp32"
+    linear: Literal["torch", "te", "quack"] = "te" if HAVE_TE and torch.cuda.is_available() else "torch"
+    rms_norm: Literal["torch", "torch_fp32", "te", "quack"] = "torch_fp32"
+    rope: Literal["torch", "quack"] = "torch"
     rope_fusion: bool = HAVE_TE and torch.cuda.is_available()
     experts: Literal["torch", "te", "gmm", "torch_mm", "torch_mm_mxfp8"] = (
         "torch_mm" if torch.cuda.is_available() else "torch"
@@ -226,11 +267,33 @@ class BackendConfig:
     # fullgraph can't trace), so it requires attn="sdpa", linear="torch", rms_norm="torch",
     # rope_fusion=False. Default False.
     compile_attn: bool = False
+    cuda_graph: CudaGraphConfig = field(default_factory=CudaGraphConfig)
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
+        # QuACK consumes position-gathered cosine/sine tables. TE's fused RoPE path
+        # instead assumes contiguous [0, seq_len) positions, so combining the two
+        # silently produces incorrect phases for packed, offset, or per-example
+        # position IDs.
+        if self.rope == "quack" and self.rope_fusion:
+            logger.warning("rope='quack' is incompatible with rope_fusion=True; disabling rope_fusion.")
+            self.rope_fusion = False
+
+        # TEMPORARY: force TE fused RoPE off globally. The fused kernel computes cos/sin
+        # in fp32 in-kernel while HF/vLLM rotate with bf16 tables, breaking logprob parity
+        # in some models. See #3027. This is the one chokepoint every BackendConfig passes
+        # through, so it also overrides an explicit rope_fusion=True from a recipe/config.
+        if self.rope_fusion:
+            logger.warning("rope_fusion is temporarily force-disabled globally (see #3027).")
+        self.rope_fusion = False
+
         # Normalize te_fp8: dict -> TEFp8Config, None stays None
         if isinstance(self.te_fp8, dict):
             self.te_fp8 = TEFp8Config(**self.te_fp8)
+
+        if isinstance(self.cuda_graph, dict):
+            self.cuda_graph = CudaGraphConfig(**self.cuda_graph)
+        elif not isinstance(self.cuda_graph, CudaGraphConfig):
+            raise TypeError("cuda_graph must be a CudaGraphConfig or mapping")
 
         if isinstance(self.gate_precision, str):
             self.gate_precision = dtype_from_str(self.gate_precision, default=None)
@@ -261,6 +324,27 @@ class BackendConfig:
             self.dispatcher = "torch"
             self.experts = "torch_mm"
 
+        graph_modules = self.cuda_graph.modules
+        attention_graph_modules = {"attn", "te_dpa"}.intersection(graph_modules)
+        if attention_graph_modules and self.attn != "te":
+            raise ValueError(f"{sorted(attention_graph_modules)} in cuda_graph.modules requires attn='te'")
+        if "attn" in graph_modules and self.linear != "torch":
+            raise ValueError("'attn' in cuda_graph.modules currently requires linear='torch'")
+        if "attn" in graph_modules and self.rms_norm != "torch":
+            raise ValueError("'attn' in cuda_graph.modules currently requires rms_norm='torch'")
+        if "attn" in graph_modules and self.rope_fusion:
+            raise ValueError("'attn' in cuda_graph.modules currently requires rope_fusion=False")
+        if attention_graph_modules and self.te_fp8 is not None:
+            recipe_fp8_dpa = getattr(self.te_fp8.recipe, "fp8_dpa", False)
+            if recipe_fp8_dpa:
+                raise ValueError(
+                    f"{sorted(attention_graph_modules)} in cuda_graph.modules requires BF16 dot-product attention "
+                    "(fp8_dpa=False)"
+                )
+        if "moe_router" in graph_modules and self.fake_balanced_gate:
+            raise ValueError("'moe_router' in cuda_graph.modules requires the learned Gate (fake_balanced_gate=False)")
+        if "moe_preprocess" in graph_modules and self.dispatcher != "hybridep":
+            raise ValueError("'moe_preprocess' in cuda_graph.modules requires dispatcher='hybridep'")
         # FP8 requires at least one TE backend (applies to all TE modules: Linear, GroupedLinear, RMSNorm)
         if self.te_fp8 is not None and self.linear != "te" and self.experts != "te":
             raise ValueError(
@@ -269,7 +353,7 @@ class BackendConfig:
             )
 
 
-@torch.compile(fullgraph=True, dynamic=True)
+@torch.compile(dynamic=True)
 def _float32_rms_norm_fwd(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     """Compiled fp32 RMSNorm forward — standalone function to minimize dynamo guards."""
     input_dtype = x.dtype
@@ -311,10 +395,11 @@ def initialize_rms_norm_module(
     Call reset_parameters() to materialize weights if created on meta device.
 
     Args:
-        rms_norm_impl: Backend implementation ("te", "torch", or "torch_fp32")
+        rms_norm_impl: Backend implementation ("te", "torch", "torch_fp32", or "quack")
             - "te": Transformer Engine fused RMSNorm kernel
             - "torch": PyTorch native nn.RMSNorm (computes in input dtype)
             - "torch_fp32": torch.compiled fp32 RMSNorm for training stability
+            - "quack": QuACK CuTe DSL RMSNorm kernel
         dim: Normalized dimension
         eps: Epsilon for numerical stability
         device: Device to create module on (None uses PyTorch default, typically CPU)
@@ -332,6 +417,15 @@ def initialize_rms_norm_module(
         return nn.RMSNorm(dim, eps=eps, device=device, dtype=dtype)
     elif rms_norm_impl == "torch_fp32":
         return Float32RMSNorm(dim, eps=eps, device=device, dtype=dtype)
+    elif rms_norm_impl == "quack":
+        available, quack_rms_norm = safe_import_from(
+            "quack.rmsnorm",
+            "QuackRMSNorm",
+            msg="rms_norm='quack' requires the 'quack-kernels' package. Install nemo-automodel[cuda].",
+        )
+        if not available:
+            raise ImportError("rms_norm='quack' requires the 'quack-kernels' package. Install nemo-automodel[cuda].")
+        return quack_rms_norm(dim, eps=eps, device=device, dtype=dtype)
     else:
         raise ValueError(f"Unsupported RMSNorm implementation: {rms_norm_impl}")
 
@@ -350,7 +444,7 @@ def initialize_linear_module(
     Call reset_parameters() to materialize weights if created on meta device.
 
     Args:
-        linear_impl: Backend implementation ("te" or "torch")
+        linear_impl: Backend implementation ("te", "torch", or "quack")
         in_features: Input features
         out_features: Output features
         bias: Whether to use bias
@@ -370,6 +464,15 @@ def initialize_linear_module(
         return TransformerEngineLinear(
             in_features=in_features, out_features=out_features, bias=bias, device=device, params_dtype=dtype
         )
+    elif linear_impl == "quack":
+        available, quack_linear = safe_import_from(
+            "quack.linear",
+            "Linear",
+            msg="linear='quack' requires the 'quack-kernels' package. Install nemo-automodel[cuda].",
+        )
+        if not available:
+            raise ImportError("linear='quack' requires the 'quack-kernels' package. Install nemo-automodel[cuda].")
+        return quack_linear(in_features, out_features, bias=bias, device=device, dtype=dtype)
     else:
         raise ValueError(f"Unsupported Linear implementation: {linear_impl}")
 
@@ -671,11 +774,24 @@ def _restore_fp32_tensor_snapshots(
         param.data = snapshot.to(dtype=torch.float32)
 
     for name, snapshot in buffer_snapshots.items():
-        module_name, _, buffer_name = name.rpartition(".")
-        module = model.get_submodule(module_name) if module_name else model
-        if buffer_name not in module._buffers:
-            continue
-        module._buffers[buffer_name] = snapshot.to(dtype=torch.float32)
+        # ActivationWrapper forwards __getattr__ / __setattr__ to the wrapped
+        # module. Try the literal FQN first for buffers registered on the wrapped
+        # leaf, then strip the wrapper alias as a fallback for forwarded names.
+        candidate_names = [name]
+        stripped_name = name.replace("._checkpoint_wrapped_module", "")
+        if stripped_name != name:
+            candidate_names.append(stripped_name)
+
+        for candidate_name in candidate_names:
+            module_name, _, buffer_name = candidate_name.rpartition(".")
+            try:
+                module = model.get_submodule(module_name) if module_name else model
+            except AttributeError:
+                continue
+            if buffer_name not in module._buffers:
+                continue
+            module._buffers[buffer_name] = snapshot.to(dtype=torch.float32)
+            break
 
 
 def _restore_fp32_modules(model: nn.Module, fp32_keywords: list[str]) -> None:

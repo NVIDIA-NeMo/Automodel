@@ -78,7 +78,7 @@ distributed:
     dtype: bf16
 
 freeze_config:
-  freeze_vision_tower: false
+  freeze_vision_tower: true
   freeze_audio_tower: true
   freeze_language_model: false
 

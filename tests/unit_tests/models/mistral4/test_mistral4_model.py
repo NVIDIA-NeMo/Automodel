@@ -658,6 +658,18 @@ class TestMistral3Model:
 
 @_skip_no_hf_mistral3
 class TestMistral3ForConditionalGeneration:
+    def test_checkpoint_tie_policy_ignores_outer_wrapper_default(self, multimodal_config, backend):
+        from nemo_automodel.components.checkpoint.utils import is_tied_word_embeddings
+        from nemo_automodel.components.models.mistral4.model import (
+            Mistral3ForConditionalGeneration as OurMistral3ForCG,
+        )
+
+        model = OurMistral3ForCG(multimodal_config, backend=backend)
+
+        assert multimodal_config.tie_word_embeddings is True
+        assert multimodal_config.text_config.tie_word_embeddings is False
+        assert is_tied_word_embeddings(model) is False
+
     def test_init(self, multimodal_config, backend):
         from nemo_automodel.components.models.mistral4.model import (
             Mistral3ForConditionalGeneration as OurMistral3ForCG,

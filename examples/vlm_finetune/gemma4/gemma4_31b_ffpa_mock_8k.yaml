@@ -83,6 +83,10 @@ dataset:
   image_size: [896, 896]
   max_length: 8192
   seed: 42
+  # This non-packed recipe feeds raw conversations to gemma4_prefix_collate_fn
+  # (seqlen controlled via collate_fn.max_length), so do NOT pre-tokenize --
+  # PreTokenizedDatasetWrapper would drop the "conversation" key the collate needs.
+  pretokenize: false
 
 validation_dataset:
   _target_: nemo_automodel.components.datasets.vlm.mock.build_mock_vlm_dataset
@@ -91,6 +95,7 @@ validation_dataset:
   image_size: [896, 896]
   max_length: 8192
   seed: 43
+  pretokenize: false
 
 # Gemma4 FFPA without CP does not support sequence packing, so seqlen is controlled
 # exclusively via collate_fn.max_length (forwarded to the HF processor with
@@ -129,3 +134,10 @@ ci:
   recipe_owner: Butterfingrz
   env_vars:
     MAX_STEPS: 10
+    # Backward needs two large contiguous buffers on an 80 GiB card: the 8.00 GiB fp32
+    # grad of the [1, 8192, 262144] logits (vocab_size 262144 at seqlen 8192), and a
+    # 10.50 GiB FSDP root reduce-scatter. Peak demand is ~66 GiB so they do fit, but the
+    # default allocator strands enough memory in reserved-but-unallocated blocks that one
+    # of the two fails -- CI OOM'd on the 8.00 GiB request with 7.65 GiB free and 10.56 GiB
+    # stranded. Measured on 8xH100-80GB: 10/10 steps at 65.67 GiB peak with this set.
+    PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"

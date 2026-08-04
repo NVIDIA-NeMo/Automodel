@@ -20,14 +20,57 @@ attributes each helper reads are populated -- mirroring the EAGLE recipe tests.
 
 from __future__ import annotations
 
+import logging
 from types import SimpleNamespace
 
 import pytest
 import torch
+from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
-from nemo_automodel.components.speculative.dflash.core import NoValidAnchorsError
+from nemo_automodel.components.checkpoint.config import CheckpointingConfig
+from nemo_automodel.components.checkpoint.lifecycle import CheckpointLifecycle
+from nemo_automodel.components.speculative.dflash.core import DFlashTrainerModule, NoValidAnchorsError
+from nemo_automodel.components.speculative.dflash.draft_qwen3 import Qwen3DFlashDraftModel
 from nemo_automodel.recipes.llm import train_dflash
 from nemo_automodel.recipes.llm.train_dflash import TrainDFlashRecipe
+
+_VOCAB = 64
+_HIDDEN = 32
+_MASK_ID = _VOCAB - 1
+_TARGET_LAYER_IDS = [1, 3, 5]
+
+
+def _dflash_draft():
+    cfg = Qwen3Config(
+        vocab_size=_VOCAB,
+        hidden_size=_HIDDEN,
+        intermediate_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=8,
+        max_position_embeddings=64,
+        attention_bias=False,
+        attention_dropout=0.0,
+        tie_word_embeddings=False,
+    )
+    cfg.num_target_layers = 8
+    cfg.block_size = 4
+    cfg.dflash_config = {"mask_token_id": _MASK_ID, "target_layer_ids": _TARGET_LAYER_IDS}
+    cfg._attn_implementation = "sdpa"
+    return Qwen3DFlashDraftModel(cfg)
+
+
+def _bare_dflash_recipe():
+    recipe = TrainDFlashRecipe.__new__(TrainDFlashRecipe)
+    recipe.draft_model = _dflash_draft()
+    recipe.mask_token_id = _MASK_ID
+    recipe.block_size = 4
+    recipe.target_model = SimpleNamespace(
+        get_output_embeddings=lambda: torch.nn.Linear(_HIDDEN, _VOCAB, bias=False),
+        get_input_embeddings=lambda: torch.nn.Embedding(_VOCAB, _HIDDEN),
+    )
+    return recipe
 
 
 def _ckpt_self(ckpt_every_steps, save_every_epoch, global_step, total_optim_steps=None):
@@ -81,6 +124,132 @@ def test_maybe_save_final_checkpoint(every, save_epoch, gs, should_fire):
     assert len(calls) == (1 if should_fire else 0)
     if should_fire:
         assert calls[0]["is_final_checkpoint"] is True
+
+
+def test_save_checkpoint_applies_retention_after_sync_save(tmp_path, monkeypatch):
+    events = []
+    obj = TrainDFlashRecipe.__new__(TrainDFlashRecipe)
+    obj.checkpoint_config = SimpleNamespace(checkpoint_dir=str(tmp_path))
+    config = CheckpointingConfig(checkpoint_dir=str(tmp_path), save_consolidated=False)
+    lifecycle = CheckpointLifecycle(config=config)
+    obj.checkpointer = SimpleNamespace(
+        config=config,
+        lifecycle=lifecycle,
+        async_wait=lambda: events.append("wait"),
+        save_model=lambda *args, **kwargs: events.append("save_model"),
+        save_optimizer=lambda *args, **kwargs: events.append("save_optimizer"),
+        save_on_dp_ranks=lambda *args, **kwargs: events.append("save_rng"),
+    )
+    obj._module = lambda: SimpleNamespace(draft_model=SimpleNamespace())
+    obj.tokenizer = None
+    obj.optimizer = SimpleNamespace()
+    obj.lr_scheduler = SimpleNamespace()
+    obj.rng = SimpleNamespace()
+    obj.runtime = SimpleNamespace(global_step=1)
+    obj.cfg = SimpleNamespace(raw_config={})
+    obj.block_size = 4
+    obj.mask_token_id = 99
+    obj.target_wrapper = SimpleNamespace(target_layer_ids=[0, 1])
+    monkeypatch.setattr(
+        lifecycle,
+        "_update_best_checkpoint",
+        lambda path, val, metric_key=None: events.append(("best", path, val, metric_key)),
+    )
+    monkeypatch.setattr(lifecycle, "_prune_old_checkpoints", lambda: events.append("prune"))
+
+    TrainDFlashRecipe.save_checkpoint(obj, epoch=0, step=1, val_loss={"val_loss": 0.25})
+
+    assert events[0] == "wait"
+    assert any(event[0] == "best" and event[3] == "val_loss" for event in events if isinstance(event, tuple))
+    assert "prune" in events
+
+
+def test_save_checkpoint_records_async_best_pending_info_without_metric(tmp_path):
+    events = []
+    obj = TrainDFlashRecipe.__new__(TrainDFlashRecipe)
+    obj.checkpoint_config = SimpleNamespace(checkpoint_dir=str(tmp_path))
+    config = CheckpointingConfig(checkpoint_dir=str(tmp_path), save_consolidated=False)
+    config.is_async = True
+    lifecycle = CheckpointLifecycle(config=config)
+    obj.checkpointer = SimpleNamespace(
+        config=config,
+        lifecycle=lifecycle,
+        async_wait=lambda: events.append("wait"),
+        save_model=lambda *args, **kwargs: events.append("save_model"),
+        save_optimizer=lambda *args, **kwargs: events.append("save_optimizer"),
+        save_on_dp_ranks=lambda *args, **kwargs: events.append("save_rng"),
+    )
+    obj._module = lambda: SimpleNamespace(draft_model=SimpleNamespace())
+    obj.tokenizer = None
+    obj.optimizer = SimpleNamespace()
+    obj.lr_scheduler = SimpleNamespace()
+    obj.rng = SimpleNamespace()
+    obj.runtime = SimpleNamespace(global_step=1)
+    obj.cfg = SimpleNamespace(raw_config={})
+    obj.block_size = 4
+    obj.mask_token_id = 99
+    obj.target_wrapper = SimpleNamespace(target_layer_ids=[0, 1])
+
+    TrainDFlashRecipe.save_checkpoint(obj, epoch=0, step=1, best_metric_key="val_loss")
+
+    expected_path = str(tmp_path / "epoch_0_step_1")
+    assert events[0] == "wait"
+    assert lifecycle._pending_checkpoint_dir == expected_path
+    assert lifecycle._pending_best_checkpoint is not None
+    assert lifecycle._pending_best_checkpoint.path == expected_path
+    assert lifecycle._pending_best_checkpoint.value is None
+    assert lifecycle._pending_best_checkpoint.metric_key == "val_loss"
+
+
+def test_build_checkpointer_logs_retention_policy(tmp_path, monkeypatch, caplog):
+    built = []
+
+    class FakeCheckpointer:
+        def __init__(self, config, **kwargs):
+            self.config = config
+            built.append((config, kwargs))
+
+    monkeypatch.setattr(train_dflash, "Checkpointer", FakeCheckpointer)
+    obj = TrainDFlashRecipe.__new__(TrainDFlashRecipe)
+    obj.cfg = SimpleNamespace(
+        get=lambda key, default=None: (
+            {"checkpoint_dir": str(tmp_path), "max_recent_checkpoints": 1} if key == "checkpoint" else default
+        )
+    )
+    obj.output_dir = tmp_path
+    obj.draft_model = SimpleNamespace(state_dict=lambda: {"weight": torch.zeros(1)})
+    obj.dp_mesh = None
+
+    with caplog.at_level(logging.INFO):
+        TrainDFlashRecipe._build_checkpointer(obj, "target/repo")
+
+    assert built
+    assert "Checkpoint retention: keeping the most recent 1 checkpoint directory" in caplog.text
+
+
+def test_run_train_validation_loop_finalizes_before_close():
+    events = []
+
+    class FakePbar:
+        def close(self):
+            events.append("pbar_close")
+
+    obj = TrainDFlashRecipe.__new__(TrainDFlashRecipe)
+    obj.trainer_module = SimpleNamespace(train=lambda: None)
+    obj.num_epochs = 1
+    obj._resume_epoch = 0
+    obj.dist_env = SimpleNamespace(is_main=False)
+    obj.total_optim_steps = 1
+    obj.runtime = SimpleNamespace(global_step=1)
+    obj.train_dataloader = []
+    obj._make_progress_bar = lambda **kwargs: FakePbar()
+    obj._run_eval = lambda: None
+    obj._maybe_save_final_checkpoint = lambda completed_epochs: events.append(("final", completed_epochs)) or True
+    obj.checkpointer = SimpleNamespace(finalize=lambda: events.append("finalize"))
+
+    TrainDFlashRecipe.run_train_validation_loop(obj)
+
+    assert events == [("final", 1), "finalize", "pbar_close"]
 
 
 def test_resolve_mask_token_id_prefers_explicit():
@@ -141,6 +310,9 @@ def _eval_self(trainer, num_batches):
                 input_ids=kw["input_ids"],
                 hidden_states=kw["input_ids"],
                 loss_mask=kw["loss_mask"],
+                position_ids=None,
+                seq_lens=None,
+                doc_remaining=None,
             )
         ),
     )
@@ -148,6 +320,8 @@ def _eval_self(trainer, num_batches):
     # training (so subclasses inject their extra inputs); bind the base seam, which
     # forwards (input_ids, hidden_states, loss_mask) to the trainer module.
     obj._run_trainer_step = TrainDFlashRecipe._run_trainer_step.__get__(obj)
+    obj._extra_eval_metric_sums = TrainDFlashRecipe._extra_eval_metric_sums.__get__(obj)
+    obj._empty_extra_eval_metric_sums = TrainDFlashRecipe._empty_extra_eval_metric_sums.__get__(obj)
     return obj
 
 
@@ -159,17 +333,38 @@ def test_run_eval_returns_none_without_val_dataloader():
 def test_run_eval_skips_short_micro_batches():
     trainer = _StubTrainerModule(
         [
-            SimpleNamespace(loss=torch.tensor(1.0), accuracy=torch.tensor(0.5)),
+            SimpleNamespace(
+                loss=torch.tensor(1.0),
+                loss_weight=torch.tensor(2.0),
+                accuracy=torch.tensor(0.5),
+                valid_tokens=torch.tensor(2.0),
+                correct_tokens=torch.tensor(1.0),
+                accept_len_sum=torch.tensor(4.0),
+                valid_blocks=torch.tensor(2.0),
+            ),
             NoValidAnchorsError("all samples too short"),
-            SimpleNamespace(loss=torch.tensor(3.0), accuracy=torch.tensor(1.0)),
+            SimpleNamespace(
+                loss=torch.tensor(3.0),
+                loss_weight=torch.tensor(6.0),
+                accuracy=torch.tensor(1.0),
+                valid_tokens=torch.tensor(6.0),
+                correct_tokens=torch.tensor(6.0),
+                accept_len_sum=torch.tensor(3.0),
+                valid_blocks=torch.tensor(1.0),
+            ),
         ]
     )
     obj = _eval_self(trainer, num_batches=3)
 
     metrics = TrainDFlashRecipe._run_eval(obj)
 
-    # The short batch is skipped without counting: averages are over 2 batches.
-    assert metrics == {"val_loss": 2.0, "val_accuracy": 0.75}
+    # The short batch is skipped. The two valid batches are weighted by their
+    # token/block counts instead of receiving equal batch weight.
+    assert metrics == {
+        "val_loss": 2.5,
+        "val_accuracy": 0.875,
+        "val_accept_len": pytest.approx(7.0 / 3.0),
+    }
     assert trainer.mode_calls == ["eval", "train"]
 
 
@@ -179,7 +374,7 @@ def test_run_eval_all_batches_short_returns_zero_metrics():
 
     metrics = TrainDFlashRecipe._run_eval(obj)
 
-    assert metrics == {"val_loss": 0.0, "val_accuracy": 0.0}
+    assert metrics == {"val_loss": 0.0, "val_accuracy": 0.0, "val_accept_len": 0.0}
     assert trainer.mode_calls == ["eval", "train"]
 
 
@@ -203,11 +398,34 @@ def test_all_ranks_have_valid_ddp_min_reduces_across_ranks(monkeypatch):
     assert train_dflash._all_ranks_have_valid(1, is_ddp=True, device="cpu") is True
 
 
+def test_all_reduce_sum_uses_additive_distributed_statistics(monkeypatch):
+    monkeypatch.setattr(train_dflash.dist, "is_available", lambda: True)
+    monkeypatch.setattr(train_dflash.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(train_dflash.dist, "all_reduce", lambda value, op=None: value.add_(2.0))
+
+    value = torch.tensor(3.0)
+    assert train_dflash._all_reduce_sum(value).item() == 5.0
+
+
+def test_wandb_log_forwards_metrics_when_run_exists():
+    calls = []
+    obj = SimpleNamespace(wandb_run=SimpleNamespace(log=lambda data, step: calls.append((data, step))))
+
+    TrainDFlashRecipe._wandb_log(obj, {"val/accuracy": 0.75}, step=9)
+
+    assert calls == [({"val/accuracy": 0.75}, 9)]
+
+
+def test_wandb_log_is_noop_without_run():
+    TrainDFlashRecipe._wandb_log(SimpleNamespace(), {"val/accuracy": 0.75}, step=9)
+
+
 def _load_extra_state_self(mask_token_id=7):
     return SimpleNamespace(
         runtime=SimpleNamespace(global_step=0),
         _resume_epoch=0,
         mask_token_id=mask_token_id,
+        checkpoint_config=SimpleNamespace(allow_legacy_pickle_restore=False),
     )
 
 
@@ -249,3 +467,82 @@ def test_load_extra_state_noop_when_meta_missing(tmp_path):
     TrainDFlashRecipe._load_extra_state(obj, str(tmp_path))
     assert obj.runtime.global_step == 0
     assert obj._resume_epoch == 0
+
+
+def test_build_trainer_module_defaults_loss_decay_gamma_to_paper_value():
+    """Regression: an unset ``loss_decay_gamma`` used to fall back to ``None``
+    (uniform weighting, decay silently disabled) instead of the paper default
+    (Appendix A.1, matching ``DFlashDecayLoss``'s own default of 7.0)."""
+    recipe = _bare_dflash_recipe()
+    module = recipe._build_trainer_module("sdpa", {})
+    assert isinstance(module, DFlashTrainerModule)
+    assert module.loss_decay_gamma == 7.0
+
+
+def test_build_trainer_module_respects_explicit_loss_decay_gamma():
+    recipe = _bare_dflash_recipe()
+    module = recipe._build_trainer_module("sdpa", {"loss_decay_gamma": None})
+    assert module.loss_decay_gamma is None
+
+    recipe = _bare_dflash_recipe()
+    module = recipe._build_trainer_module("sdpa", {"loss_decay_gamma": 4.0})
+    assert module.loss_decay_gamma == 4.0
+
+
+def test_build_trainer_module_wires_loss_type_and_prefix_weight_base():
+    recipe = _bare_dflash_recipe()
+    module = recipe._build_trainer_module("sdpa", {})
+    assert module.loss_type == "dflash"
+    assert module.prefix_weight_base == 0.9
+
+    recipe = _bare_dflash_recipe()
+    module = recipe._build_trainer_module("sdpa", {"loss_type": "variable_prefix", "prefix_weight_base": 0.8})
+    assert module.loss_type == "variable_prefix"
+    assert module.prefix_weight_base == 0.8
+
+
+def test_build_trainer_module_loss_type_null_falls_back_to_default():
+    """An explicit ``loss_type: null`` in YAML must select the default objective
+    (mirroring loss_decay_gamma's documented null convention), not crash on the
+    string "None"."""
+    recipe = _bare_dflash_recipe()
+    module = recipe._build_trainer_module("sdpa", {"loss_type": None})
+    assert module.loss_type == "dflash"
+
+
+def test_train_metric_sums_are_additive_not_per_micro_batch():
+    """``train/accept_len`` must be reported over the same window as ``train/loss``.
+
+    Returning ``metrics.accept_len`` (the per-micro-batch mean) reported a single
+    micro-batch out of ``log_every_steps * grad_accumulation_steps``, so the
+    curve was a far noisier sample than the loss curve drawn beside it.
+    """
+    recipe = _bare_dflash_recipe()
+    window = [
+        SimpleNamespace(accept_len_sum=torch.tensor(6.0), valid_blocks=torch.tensor(4.0)),
+        SimpleNamespace(accept_len_sum=torch.tensor(1.0), valid_blocks=torch.tensor(1.0)),
+    ]
+
+    totals = [0.0, 0.0]
+    for metrics in window:
+        numerator, denominator = recipe._extra_train_metric_sums(metrics)["train/accept_len"]
+        totals[0] += numerator
+        totals[1] += denominator
+
+    # Block-weighted over the window (7/5), not the last micro-batch's 1.0.
+    assert totals[0] / totals[1] == pytest.approx(7.0 / 5.0)
+    assert recipe._extra_train_metric_sums(window[-1])["train/accept_len"] == (
+        pytest.approx(1.0),
+        pytest.approx(1.0),
+    )
+
+
+def test_train_metric_sums_denominator_can_be_zero():
+    """A micro-batch with no evaluated blocks must not be averaged into the window.
+
+    The log point divides only when the accumulated denominator is positive, so a
+    zero here has to survive as a zero rather than raising or silently counting.
+    """
+    recipe = _bare_dflash_recipe()
+    metrics = SimpleNamespace(accept_len_sum=torch.tensor(0.0), valid_blocks=torch.tensor(0.0))
+    assert recipe._extra_train_metric_sums(metrics)["train/accept_len"] == (0.0, 0.0)

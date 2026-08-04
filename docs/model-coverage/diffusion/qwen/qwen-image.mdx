@@ -1,100 +1,174 @@
 ---
 title: "Qwen-Image"
-description: ""
+description: "Train Qwen-Image text-to-image and Qwen-Image-Edit-2511 image-editing models."
+slug: model-coverage/diffusion/qwen/qwen-image
 ---
-[Qwen-Image](https://huggingface.co/Qwen/Qwen-Image) is Alibaba Cloud's text-to-image diffusion transformer. NeMo AutoModel supports Qwen-Image training via its flow-matching pipeline with a dedicated `qwen_image` adapter, enabling FSDP2 parallelization, multiresolution bucketed dataloading and LoRA-style fine-tuning.
+
+[Qwen-Image](https://huggingface.co/Qwen/Qwen-Image) is Alibaba Cloud's flow-matching image model. NeMo AutoModel supports Qwen-Image text-to-image training and cached, full-parameter training of [Qwen-Image-Edit-2511](https://huggingface.co/Qwen/Qwen-Image-Edit-2511).
 
 <Info>
 
 | | |
 |---|---|
-| **Task** | Text-to-Image |
-| **Architecture** | DiT (Flow Matching) |
+| **Tasks** | Text-to-Image, instruction-based image editing |
+| **Architecture** | Diffusion Transformer (Flow Matching) |
 | **HF Org** | [Qwen](https://huggingface.co/Qwen) |
 
 </Info>
 
 ## Available Models
 
-- **Qwen-Image**
+| Model | HF ID | Training scope |
+|---|---|---|
+| Qwen-Image | [`Qwen/Qwen-Image`](https://huggingface.co/Qwen/Qwen-Image) | Text-to-image training and fine-tuning |
+| Qwen-Image-Edit-2511 | [`Qwen/Qwen-Image-Edit-2511`](https://huggingface.co/Qwen/Qwen-Image-Edit-2511) | Cached, full-parameter, single-node training |
 
-## Task
+Qwen-Image-Edit-2511 training is intentionally limited to cached target/context latents and cached Qwen2.5-VL prompt conditioning. Raw-image online encoding, LoRA, older Qwen image-edit checkpoints, and multinode tuning are not supported by the training recipe. Image-edit inference is supported by the generic generation script.
 
-- Text-to-Image (T2I)
-
-## Example HF Models
-
-| Model | HF ID |
-|---|---|
-| Qwen-Image | [`Qwen/Qwen-Image`](https://huggingface.co/Qwen/Qwen-Image) |
-
-## Example Recipes
+## Recipes
 
 | Recipe | Description |
 |---|---|
-| [qwen_image_t2i_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/qwen_image_t2i_flow.yaml) | Fine-tune — Qwen-Image with flow matching |
-| [qwen_image_t2i_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/pretrain/qwen_image_t2i_flow.yaml) | Pretrain — Qwen-Image with flow matching |
+| [qwen_image_edit_2511_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/qwen_image_edit_2511_flow.yaml) | Eight-GPU BF16 FSDP2 baseline for full-parameter Qwen-Image-Edit-2511 training |
+| [qwen_image_t2i_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/qwen_image_t2i_flow.yaml) | Fine-tune Qwen-Image with flow matching |
+| [qwen_image_t2i_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/pretrain/qwen_image_t2i_flow.yaml) | Pretrain Qwen-Image with flow matching |
 
-## Try with NeMo AutoModel
+## Prepare MagicBrush
 
-**1. Install** ([full instructions](/get-started/installation)):
+The validation protocol uses [`osunlp/MagicBrush`](https://huggingface.co/datasets/osunlp/MagicBrush), an instruction-based editing dataset released under CC-BY-4.0. It contains 8,807 training examples and 528 development examples.
+
+The generic exporter maps dataset columns to ordered editing roles. Mapping `source_img` to both `context` and `condition` writes the image only once while retaining both role entries. The dataset's mask is retained in source-manifest metadata for future masked-edit adapters.
+
+Create the 64-example correctness cache with aspect-ratio-preserving processing limited to approximately 1024² total pixels:
 
 ```bash
-pip install "nemo-automodel[diffusion,diffusion-media]"
+uv run python -m tools.diffusion.preprocessing_multiprocess image-edit \
+  --dataset_name osunlp/MagicBrush \
+  --dataset_split dev \
+  --dataset_streaming \
+  --dataset_media_mapping target=target_img \
+  --dataset_media_mapping context=source_img \
+  --dataset_media_mapping condition=source_img \
+  --dataset_caption_column instruction \
+  --max_items 64 \
+  --max_pixels 1048576 \
+  --max_sequence_length 512 \
+  --processor qwen_image_edit \
+  --model_name Qwen/Qwen-Image-Edit-2511 \
+  --num_gpus 8 \
+  --verify \
+  --output_dir /cache/magicbrush-qwen-edit-correctness
 ```
 
-**2. Clone the repo** to get the example recipes:
+Create the 1,024-example fixed-square performance cache by replacing the split, limit, resolution, and output arguments:
 
 ```bash
-git clone https://github.com/NVIDIA-NeMo/Automodel.git
-cd Automodel
+uv run python -m tools.diffusion.preprocessing_multiprocess image-edit \
+  --dataset_name osunlp/MagicBrush \
+  --dataset_split train \
+  --dataset_streaming \
+  --dataset_media_mapping target=target_img \
+  --dataset_media_mapping context=source_img \
+  --dataset_media_mapping condition=source_img \
+  --dataset_caption_column instruction \
+  --max_items 1024 \
+  --resolution_preset 1024p \
+  --max_sequence_length 512 \
+  --processor qwen_image_edit \
+  --model_name Qwen/Qwen-Image-Edit-2511 \
+  --num_gpus 8 \
+  --verify \
+  --output_dir /cache/magicbrush-qwen-edit-performance
 ```
 
-**3. Run the recipe** from inside the repo:
+The performance preset resizes both source and target to 1024×1024. If that shape cannot complete without an out-of-memory error, use the 768p preset for every compared run and record the fallback.
+
+## Cache Contract
+
+Each versioned cache sample contains:
+
+- `target_latent`: `[channels, height, width]`
+- `context_latents`: an ordered list of `[channels, context_height, context_width]` tensors
+- `prompt_embeddings`: `[sequence, hidden]`
+- `prompt_attention_mask`: `[sequence]`
+- `conditioning_tensors`: optional explicitly named tensors
+- `metadata`: original IDs, tensor shapes, token lengths, and the compound target/context bucket signature
+
+The top-level `metadata.json` records the source dataset ID, dataset config when provided, split, row limit, and preprocessing settings. Batches contain only compatible target and ordered-context shapes, and their CPU metadata includes target, context, text, and total token counts.
+
+## Train
+
+Set `data.dataloader.cache_dir` and `checkpoint.checkpoint_dir` in the recipe, then launch one FSDP2 rank per H100:
 
 ```bash
-torchrun --nproc-per-node=8 \
+uv run torchrun --nproc-per-node=8 \
   examples/diffusion/finetune/finetune.py \
-  -c examples/diffusion/finetune/qwen_image_t2i_flow.yaml
+  -c examples/diffusion/finetune/qwen_image_edit_2511_flow.yaml
 ```
 
-<Accordion title="Run with Docker">
-**1. Pull the container** and mount a checkpoint directory:
+The baseline uses BF16 parameters and compute, whole Qwen transformer-block activation checkpointing, beta timestep sampling, and the distributed checkpoint manager. Consolidated model checkpoints are written in the Diffusers-compatible safetensors format (`checkpoint.diffusers_compatible: true`), matching the other diffusion recipes. Set `checkpoint.restore_from: LATEST` to resume the optimizer, scheduler, dataloader, sampler, and step state.
+
+### Checkpoint-resume smoke test
+
+Use the 64-example correctness cache and a new checkpoint path. The first launch saves after 10 completed optimizer steps:
 
 ```bash
-docker run --gpus all -it --rm \
-  --shm-size=8g \
-  -v $(pwd)/checkpoints:/opt/Automodel/checkpoints \
-  nvcr.io/nvidia/nemo-automodel:26.06.00
-```
+export QWEN_EDIT_CACHE=/cache/magicbrush-qwen-edit-correctness
+export QWEN_EDIT_CKPT=/checkpoints/qwen-edit-resume-smoke
+test ! -e "${QWEN_EDIT_CKPT}" || { echo "Choose a new QWEN_EDIT_CKPT path"; exit 1; }
 
-**2.** Navigate to the AutoModel directory (where the recipes are):
-
-```bash
-cd /opt/Automodel
-```
-
-**3. Install media dependencies** (not installed in the container by default):
-
-```bash
-uv pip install ".[diffusion-media]"
-```
-
-**4. Run the recipe**:
-
-```bash
-torchrun --nproc-per-node=8 \
+uv run torchrun --nproc-per-node=8 \
   examples/diffusion/finetune/finetune.py \
-  -c examples/diffusion/finetune/qwen_image_t2i_flow.yaml
+  -c examples/diffusion/finetune/qwen_image_edit_2511_flow.yaml \
+  --data.dataloader.cache_dir "${QWEN_EDIT_CACHE}" \
+  --checkpoint.checkpoint_dir "${QWEN_EDIT_CKPT}" \
+  --checkpoint.save_consolidated false \
+  --step_scheduler.max_steps 10 \
+  --step_scheduler.ckpt_every_steps 10 \
+  --step_scheduler.log_remote_every_steps 1 \
+  --performance.check_loss true
 ```
-</Accordion>
+
+Resume the same run and continue to 20 completed optimizer steps:
+
+```bash
+uv run torchrun --nproc-per-node=8 \
+  examples/diffusion/finetune/finetune.py \
+  -c examples/diffusion/finetune/qwen_image_edit_2511_flow.yaml \
+  --data.dataloader.cache_dir "${QWEN_EDIT_CACHE}" \
+  --checkpoint.checkpoint_dir "${QWEN_EDIT_CKPT}" \
+  --checkpoint.restore_from LATEST \
+  --checkpoint.save_consolidated false \
+  --step_scheduler.max_steps 20 \
+  --step_scheduler.ckpt_every_steps 10 \
+  --step_scheduler.log_remote_every_steps 1 \
+  --performance.check_loss true
+```
+
+The smoke test passes when the first launch writes the step-10 checkpoint, the second launch restores it and reaches step 20, and every reported loss and gradient norm is finite.
+
+## Generate
+
+Use [generate_qwen_image_edit.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/generate/configs/generate_qwen_image_edit.yaml) to edit an image with the base model or a consolidated training checkpoint. Each entry in `inference.input_images` is paired with the prompt at the same position, so both lists must have the same length.
+
+Pass the epoch checkpoint directory, source image, and edit instruction to the generic generation script:
+
+```bash
+uv run python examples/diffusion/generate/generate.py \
+  -c examples/diffusion/generate/configs/generate_qwen_image_edit.yaml \
+  --model.checkpoint /checkpoints/qwen-edit/epoch_12_step_99 \
+  --inference.input_images '["/data/source.png"]' \
+  --inference.prompts '["Add mountains in the background"]'
+```
+
+The checkpoint directory must contain the consolidated Diffusers-compatible safetensors written by training with `checkpoint.save_consolidated: final`. Omit `--model.checkpoint` to run with the base `Qwen/Qwen-Image-Edit-2511` weights.
+
+## Install
+
+From a source checkout, install the diffusion media dependencies:
+
+```bash
+uv sync --locked --all-groups --extra all --extra diffusion-media
+```
 
 See the [Installation Guide](/get-started/installation) and [Diffusion Training and Fine-Tuning Guide](/recipes-e2e-examples/diffusion-fine-tuning).
-
-## Fine-Tuning
-
-See the [Diffusion Training and Fine-Tuning Guide](/recipes-e2e-examples/diffusion-fine-tuning).
-
-## Hugging Face Model Cards
-
-- [Qwen/Qwen-Image](https://huggingface.co/Qwen/Qwen-Image)

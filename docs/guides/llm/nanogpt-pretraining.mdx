@@ -14,7 +14,7 @@ In this guide, we will use an interactive environment to install NeMo AutoModel 
 cd /path/to/workspace/ # specify to your path as needed.
 git clone https://github.com/NVIDIA-NeMo/Automodel.git
 cd Automodel/
-pip install -e ".[all]"    # installs NeMo AutoModel + optional extras
+uv sync --locked --all-groups --extra all
 ```
 
 <Note>
@@ -80,7 +80,7 @@ Consider the following options:
 
 NeMo AutoModel follows a simple but powerful flow for training:
 
-1. A Python recipe script (for example, [`examples/llm_pretrain/pretrain.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_pretrain/pretrain.py)) serves as the entry point that wires up all training components based on a YAML configuration file. Any configuration option can be overridden using CLI arguments (e.g., `--model.name abc`).
+1. The installed `automodel` CLI (`nemo_automodel.cli.app`) is the entry point. It reads the recipe selected by the YAML configuration and wires up the training components. Any configuration option can be overridden using CLI arguments (e.g., `--model.n_layer 6`).
 2. The YAML file describes each component of the training job (such as `model`, `dataset`, `optimizer`, `distributed`, `checkpoint`, and optional `wandb`).
 3. Each component is constructed from its `_target_`, which points to a Python callable (function or class constructor) to instantiate. The remaining keys in that YAML block become keyword arguments for that callable.
 
@@ -227,7 +227,10 @@ class GPT2LMHeadModel(nn.Module):
         # Initialize parameters following GPT-2 scheme
         self._init_weights()
 
-    def forward(self, input_ids: torch.LongTensor) -> torch.Tensor:  # (B, T) → (B, T, V)
+    def initialize_weights(self):
+        self._init_weights()
+
+    def forward(self, input_ids: torch.LongTensor, **kwargs) -> torch.Tensor:  # (B, T) → (B, T, V)
         batch_size, seq_len = input_ids.shape
 
         if seq_len > self.wpe.num_embeddings:
@@ -351,7 +354,7 @@ Alternatively, target a specific architecture:
 
 ```yaml
 model:
-  _target_: transformers.GPT2LMHeadModel.from_config
+  _target_: transformers.GPT2LMHeadModel
   config:
     _target_: transformers.GPT2Config
     n_layer: 12
@@ -362,7 +365,7 @@ model:
 
 <Note>
 - The `model._target_` may reference an import path or a local Python file using the `path.py:object` form.
-- Any nested mapping that includes `_target_` (e.g., `config:`) is instantiated first and its result is passed upward. This is how the Hugging Face `from_config` pattern works.
+- Any nested mapping that includes `_target_` (e.g., `config:`) is instantiated first and its result is passed upward. This supports both Hugging Face `from_config` callables and direct architecture constructors.
 - You can keep using the same training recipe (optimizer, data, distributed settings); only the `model:` block changes.
 
 </Note>
@@ -412,21 +415,11 @@ Scale **width/depth**, `batch_size`, or `seq_len` as needed - the recipe is mode
 ## Launch Training
 
 ```bash
-# Single-GPU run (good for local testing)
-python examples/llm_pretrain/pretrain.py \
-  --config examples/llm_pretrain/nanogpt_pretrain.yaml
+# Single GPU
+uv run automodel examples/llm_pretrain/nanogpt_pretrain.yaml
 
-# Multi-GPU (e.g., 8x H100)
-torchrun --standalone --nproc-per-node 8 \
-  examples/llm_pretrain/pretrain.py \
-  --config examples/llm_pretrain/nanogpt_pretrain.yaml
-
-# Using the automodel CLI:
-# single-GPU
-automodel examples/llm_pretrain/nanogpt_pretrain.yaml
-
-# multi-GPU (8 GPUs)
-automodel --nproc-per-node 8 examples/llm_pretrain/nanogpt_pretrain.yaml
+# Multi-GPU (8 GPUs)
+uv run automodel examples/llm_pretrain/nanogpt_pretrain.yaml --nproc-per-node 8
 ```
 <Tip>
 Adjust the `distributed` section in the YAML config to change between DDP, FSDP2, etc.

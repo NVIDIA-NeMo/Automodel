@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -80,7 +81,18 @@ class _WithKwargs(nn.Module):
         return input_ids
 
 
+@dataclass(frozen=True)
+class _THDCapabilities:
+    supports_tp: bool = False
+    supports_cp: bool = True
+    supports_pp: bool = True
+    supports_ep: bool = True
+    supports_thd: bool = True
+
+
 class _DeepseekV4Like(nn.Module):
+    ModelCapabilities = _THDCapabilities
+
     def __init__(self, backend_attn="tilelang"):
         super().__init__()
         self.config = SimpleNamespace(model_type="deepseek_v4")
@@ -91,6 +103,8 @@ class _DeepseekV4Like(nn.Module):
 
 
 class _GlmMoeDsaLike(nn.Module):
+    ModelCapabilities = _THDCapabilities
+
     def __init__(self, backend_attn="tilelang"):
         super().__init__()
         self.config = SimpleNamespace(model_type="glm_moe_dsa")
@@ -98,6 +112,20 @@ class _GlmMoeDsaLike(nn.Module):
 
     def forward(self, input_ids, seq_lens=None, **kwargs):
         return input_ids
+
+
+@dataclass(frozen=True)
+class _VisionShardingCapabilities:
+    supports_tp: bool = False
+    supports_cp: bool = True
+    supports_pp: bool = False
+    supports_ep: bool = False
+    supports_thd: bool = False
+    supports_cp_vision_frame_sharding: bool = True
+
+
+class _VisionShardingModel(nn.Module):
+    ModelCapabilities = _VisionShardingCapabilities
 
 
 def _mesh(tp=1, pp=1, cp=1, ep=1):
@@ -200,6 +228,36 @@ class TestModelSupportsTP:
         _attach(model)
         with patch(_PARALLELIZE_PATH, {}):
             assert model.supports.supports_tp is False
+
+
+class TestModelSupportsTHD:
+    def test_native_thd_capability_is_exposed(self):
+        model = _DeepseekV4Like()
+        _attach(model)
+        assert model.supports.supports_thd is True
+        assert model.supports_thd is True
+
+    def test_native_thd_defaults_false(self):
+        model = _Bare()
+        _attach(model)
+        assert model.supports.supports_thd is False
+        assert model.supports_thd is False
+
+
+class TestModelSupportsCpVisionFrameSharding:
+    def test_verified_model_capability_is_exposed(self):
+        model = _VisionShardingModel()
+        _attach(model)
+
+        assert model.supports.supports_cp_vision_frame_sharding is True
+        assert model.supports_cp_vision_frame_sharding is True
+
+    def test_undeclared_capability_defaults_false(self):
+        model = _Bare()
+        _attach(model)
+
+        assert model.supports.supports_cp_vision_frame_sharding is False
+        assert model.supports_cp_vision_frame_sharding is False
 
 
 class TestModelSupportsPP:
@@ -400,8 +458,14 @@ class TestModelSupportsCPWithSequencePacking:
         model._mesh = _mesh(cp=2)
         assert model.supports.supports_cp_with_sequence_packing is False
 
-    def test_deepseek_v4_cp_gt1_sequence_packing_unsupported(self):
+    def test_deepseek_v4_cp_gt1_sequence_packing_supported_with_tilelang(self):
         model = _DeepseekV4Like()
+        _attach(model)
+        model._mesh = _mesh(cp=2)
+        assert model.supports.supports_cp_with_sequence_packing is True
+
+    def test_deepseek_v4_cp_gt1_sequence_packing_rejects_sdpa(self):
+        model = _DeepseekV4Like(backend_attn="sdpa")
         _attach(model)
         model._mesh = _mesh(cp=2)
         assert model.supports.supports_cp_with_sequence_packing is False

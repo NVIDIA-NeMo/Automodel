@@ -21,9 +21,22 @@
 
 cd /opt/Automodel
 
-# VLM recipes need qwen-vl-utils/opencv from the opt-in vlm-media extra, kept out of the image.
+# VLM recipes need the opt-in vlm-media packages kept out of the image. Install
+# those packages directly instead of resolving the local project again, which
+# can refetch unrelated Git dependencies already present in the image.
 case "$CONFIG_PATH" in
-    *vlm_finetune*) uv pip install ".[vlm-media]" ;;
+    *vlm_finetune*)
+        VLM_MEDIA_PACKAGES=(
+            albumentations
+            "opencv-python-headless==4.10.0.84"
+            qwen-omni-utils
+            qwen-vl-utils
+        )
+        if [[ "$(uname -m)" == "x86_64" ]]; then
+            VLM_MEDIA_PACKAGES+=(decord)
+        fi
+        uv pip install "${VLM_MEDIA_PACKAGES[@]}"
+        ;;
 esac
 
 CONFIG_RESOLVER="python3 /opt/Automodel/tests/ci_tests/scripts/config_resolver.py"
@@ -62,6 +75,12 @@ FINETUNE_START=$SECONDS
 eval $RUN_CMD
 FINETUNE_EXIT_CODE=$?
 
+if [[ "$FINETUNE_EXIT_CODE" -eq 0 && "${REQUIRE_FINITE_METRICS:-false}" == "true" ]]; then
+  python3 /opt/Automodel/tests/ci_tests/scripts/assert_finite_train_metrics.py \
+    --log "$PIPELINE_DIR/${TEST_NAME}_slurm_${SLURM_JOB_ID}.out" \
+    || FINETUNE_EXIT_CODE=$?
+fi
+
 FINETUNE_ELAPSED=$((SECONDS - FINETUNE_START))
 echo "{\"test\":\"${TEST_NAME}\",\"phase\":\"finetune\",\"seconds\":${FINETUNE_ELAPSED}}" >> $TEST_DIR/timing.jsonl
 echo "[timing] Finetune completed in ${FINETUNE_ELAPSED}s"
@@ -87,17 +106,129 @@ if [[ "$HAS_ROBUSTNESS" == "true" ]]; then
     --phase checkpoint_robustness \
     --output "$TEST_DIR/robustness_config.yaml")
 
-  ROBUSTNESS_CMD="${CMD} --tee 3 --log-dir $TEST_DIR/robustness_logs \
-    -m pytest --tb=short tests/functional_tests/checkpoint_robustness/test_checkpoint_robustness_llm.py \
-    --config ${RESOLVED_ROBUSTNESS_CONFIG}"
+  ROBUSTNESS_TEST_MODULE="tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm"
+  case "$CONFIG_PATH" in
+    *retrieval/bi_encoder/*)
+      ROBUSTNESS_TEST_MODULE="tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_biencoder"
+      ;;
+    *vlm_finetune*)
+      ROBUSTNESS_TEST_MODULE="tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_vlm"
+      ;;
+  esac
+
+  ROBUSTNESS_LAUNCH_CMD="$CMD"
+  if [[ "$CMD" == torchrun* ]]; then
+    # A completed rendezvous cannot be reused reliably by the second torchrun.
+    ROBUSTNESS_LAUNCH_CMD="${CMD/--rdzv_id=${SLURM_JOB_ID}/--rdzv_id=${SLURM_JOB_ID}-robustness}"
+  fi
 
   echo "============================================"
   echo "[checkpoint_robustness] Running robustness test..."
   echo "============================================"
   ROBUSTNESS_START=$SECONDS
 
-  eval $ROBUSTNESS_CMD
-  ROBUSTNESS_EXIT_CODE=$?
+  # Repeated model teardown/reload phases can fragment the CUDA allocator
+  # before the resume-training check. Preserve any caller-provided setting.
+  export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+  ROBUSTNESS_EXIT_CODE=0
+
+  if [[ "${CHECKPOINT_ROBUSTNESS_PROCESS_ISOLATION:-false}" == "true" ]]; then
+    # A real checkpoint restart crosses a process boundary. Large distributed
+    # recipes also retain enough CUDA, PP, scheduler, and dataloader ownership
+    # that rebuilding several trainers in one interpreter is not reliable.
+    read -r -a ROBUSTNESS_PHASES <<< \
+      "${CHECKPOINT_ROBUSTNESS_PHASES:-train_and_save automodel_reload resume_baseline resume}"
+    # Preserve the old harness's deferred-comparison behavior: record a failed
+    # parity phase, continue independent phases, and return the first failure
+    # only after every reachable phase has reported a result.
+    ROBUSTNESS_PHASE_RESULTS=()
+    ROBUSTNESS_FAILED_PHASES=""
+    SOURCE_LOAD_REFERENCE_FAILED=false
+    TRAIN_AND_SAVE_FAILED=false
+    RESUME_BASELINE_FAILED=false
+    for ROBUSTNESS_PHASE in "${ROBUSTNESS_PHASES[@]}"; do
+      if [[ "$ROBUSTNESS_PHASE" == "source_load_parity" && "$SOURCE_LOAD_REFERENCE_FAILED" == "true" ]]; then
+        ROBUSTNESS_PHASE_RESULTS+=("${ROBUSTNESS_PHASE}|SKIP|-|0|source_load_reference_failed")
+        continue
+      fi
+      if [[ "$TRAIN_AND_SAVE_FAILED" == "true" ]]; then
+        ROBUSTNESS_PHASE_RESULTS+=("${ROBUSTNESS_PHASE}|SKIP|-|0|train_and_save_failed")
+        continue
+      fi
+      if [[ "$ROBUSTNESS_PHASE" == "resume" && "$RESUME_BASELINE_FAILED" == "true" ]]; then
+        ROBUSTNESS_PHASE_RESULTS+=("${ROBUSTNESS_PHASE}|SKIP|-|0|resume_baseline_failed")
+        continue
+      fi
+
+      PHASE_LAUNCH_CMD="$ROBUSTNESS_LAUNCH_CMD"
+      if [[ "$PHASE_LAUNCH_CMD" == torchrun* ]]; then
+        PHASE_LAUNCH_CMD="${PHASE_LAUNCH_CMD/--rdzv_id=${SLURM_JOB_ID}-robustness/--rdzv_id=${SLURM_JOB_ID}-robustness-${ROBUSTNESS_PHASE}}"
+        PHASE_LAUNCH_ARGS="--tee 3 --log-dir $TEST_DIR/robustness_logs/${ROBUSTNESS_PHASE}"
+      else
+        PHASE_LAUNCH_ARGS=""
+      fi
+      ROBUSTNESS_CMD="${PHASE_LAUNCH_CMD} ${PHASE_LAUNCH_ARGS} \
+        -m ${ROBUSTNESS_TEST_MODULE} \
+        --isolated_phase ${ROBUSTNESS_PHASE} \
+        --config ${RESOLVED_ROBUSTNESS_CONFIG}"
+      echo "[checkpoint_robustness] Starting isolated phase: ${ROBUSTNESS_PHASE}"
+      ROBUSTNESS_PHASE_START=$SECONDS
+      eval $ROBUSTNESS_CMD
+      ROBUSTNESS_PHASE_EXIT_CODE=$?
+      ROBUSTNESS_PHASE_ELAPSED=$((SECONDS - ROBUSTNESS_PHASE_START))
+      if [[ "$ROBUSTNESS_PHASE_EXIT_CODE" -eq 0 ]]; then
+        ROBUSTNESS_PHASE_RESULTS+=("${ROBUSTNESS_PHASE}|PASS|0|${ROBUSTNESS_PHASE_ELAPSED}|-")
+        continue
+      fi
+
+      ROBUSTNESS_PHASE_RESULTS+=(
+        "${ROBUSTNESS_PHASE}|FAIL|${ROBUSTNESS_PHASE_EXIT_CODE}|${ROBUSTNESS_PHASE_ELAPSED}|phase_process_failed"
+      )
+      if [[ "$ROBUSTNESS_EXIT_CODE" -eq 0 ]]; then
+        ROBUSTNESS_EXIT_CODE=$ROBUSTNESS_PHASE_EXIT_CODE
+      fi
+      if [[ -z "$ROBUSTNESS_FAILED_PHASES" ]]; then
+        ROBUSTNESS_FAILED_PHASES="$ROBUSTNESS_PHASE"
+      else
+        ROBUSTNESS_FAILED_PHASES="${ROBUSTNESS_FAILED_PHASES},${ROBUSTNESS_PHASE}"
+      fi
+      if [[ "$ROBUSTNESS_PHASE" == "source_load_reference" ]]; then
+        SOURCE_LOAD_REFERENCE_FAILED=true
+      elif [[ "$ROBUSTNESS_PHASE" == "train_and_save" ]]; then
+        TRAIN_AND_SAVE_FAILED=true
+      elif [[ "$ROBUSTNESS_PHASE" == "resume_baseline" ]]; then
+        RESUME_BASELINE_FAILED=true
+      fi
+      if [[ "${SLURM_PROCID:-0}" == "0" ]]; then
+        echo "[checkpoint_robustness][phase-failure] phase=${ROBUSTNESS_PHASE} exit_code=${ROBUSTNESS_PHASE_EXIT_CODE}"
+      fi
+    done
+
+    if [[ "${SLURM_PROCID:-0}" == "0" ]]; then
+      echo "[checkpoint_robustness] Isolated phase result summary:"
+      for ROBUSTNESS_PHASE_RESULT in "${ROBUSTNESS_PHASE_RESULTS[@]}"; do
+        IFS="|" read -r RESULT_PHASE RESULT_STATUS RESULT_EXIT_CODE RESULT_SECONDS RESULT_REASON <<< \
+          "$ROBUSTNESS_PHASE_RESULT"
+        echo "[checkpoint_robustness][phase-result] phase=${RESULT_PHASE} status=${RESULT_STATUS} exit_code=${RESULT_EXIT_CODE} seconds=${RESULT_SECONDS} reason=${RESULT_REASON}"
+      done
+      if [[ "$ROBUSTNESS_EXIT_CODE" -eq 0 ]]; then
+        echo "[checkpoint_robustness][result] status=PASS"
+      else
+        echo "[checkpoint_robustness][result] status=FAIL failed_phases=${ROBUSTNESS_FAILED_PHASES}"
+      fi
+    fi
+  else
+    if [[ "$ROBUSTNESS_LAUNCH_CMD" == torchrun* ]]; then
+      ROBUSTNESS_LAUNCH_ARGS="--tee 3 --log-dir $TEST_DIR/robustness_logs"
+    else
+      ROBUSTNESS_LAUNCH_ARGS=""
+    fi
+    ROBUSTNESS_CMD="${ROBUSTNESS_LAUNCH_CMD} ${ROBUSTNESS_LAUNCH_ARGS} \
+      -m ${ROBUSTNESS_TEST_MODULE} \
+      --config ${RESOLVED_ROBUSTNESS_CONFIG}"
+    eval $ROBUSTNESS_CMD
+    ROBUSTNESS_EXIT_CODE=$?
+  fi
 
   ROBUSTNESS_ELAPSED=$((SECONDS - ROBUSTNESS_START))
   echo "{\"test\":\"${TEST_NAME}\",\"phase\":\"robustness\",\"seconds\":${ROBUSTNESS_ELAPSED}}" >> $TEST_DIR/timing.jsonl

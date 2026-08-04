@@ -92,7 +92,6 @@ def _build_or_reuse_pp_causal_mask(module, inputs_embeds, attention_mask, cache_
         "config": module.config,
         "inputs_embeds": inputs_embeds,
         "attention_mask": attention_mask,
-        "cache_position": cache_position,
         "past_key_values": None,  # Training-only: no KV cache
         "position_ids": position_ids,
     }
@@ -234,6 +233,17 @@ def create_pipeline_forward_causal_lm() -> Callable:
         logits_to_keep: Union[int, torch.Tensor] = 0,
         **kwargs,
     ) -> Union[torch.Tensor, BaseModelOutputWithPast]:
+        """Pipeline-stage forward for a causal-LM wrapper.
+
+        B=microbatch, S=seq, H=hidden, V=vocab. Non-first stages take input
+        hidden states ``[B, S, H]`` via ``inputs_embeds`` (or ``input_ids`` when
+        already floating-point).
+
+        Returns hidden states ``[B, S, H]`` when ``self._pp_return_hidden_states``
+        is set (lm_head deferred to FusedLinearCrossEntropy); else logits
+        ``[B, S', V]`` when this stage owns ``lm_head`` (``S'`` = ``S`` sliced by
+        ``logits_to_keep``); else hidden states ``[B, S, H]`` for the next stage.
+        """
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -265,6 +275,9 @@ def create_pipeline_forward_causal_lm() -> Callable:
             else:
                 raise ValueError("Expected hidden states as input for pipeline stage without inner model")
             outputs = None
+
+        if getattr(self, "_pp_return_hidden_states", False) is True:
+            return hidden_states
 
         if hasattr(self, "lm_head") and self.lm_head is not None:
             slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
@@ -321,9 +334,8 @@ def create_pipeline_forward_gemma4_text() -> Callable:
 
         mask_kwargs = {
             "config": self.config,
-            "input_embeds": inputs_embeds,
+            "inputs_embeds": inputs_embeds,
             "attention_mask": attention_mask,
-            "cache_position": cache_position,
             "past_key_values": None,
             "position_ids": position_ids,
         }
@@ -676,6 +688,7 @@ def patch_hf_model_for_pp(model, patch_inner_model: bool = True, patch_causal_lm
             inner_model.forward = types.MethodType(create_pipeline_forward_inner("PipelineStage"), inner_model)
         if patch_causal_lm_model:
             model.forward = types.MethodType(create_pipeline_forward_causal_lm(), model)
+            model._pp_return_hidden_states_supported = True
     else:
         if patch_inner_model:
             model.forward = types.MethodType(create_pipeline_forward_inner("PipelineStage"), model)
@@ -739,7 +752,9 @@ def validate_hf_model_for_pipeline_support(model: torch.nn.Module) -> None:
             )
             if weights_tied:
                 issues.append(
-                    "tie_word_embeddings=True is not supported for pipelining. Use separate input/output embeddings."
+                    "Pipeline parallelism does not support tie_word_embeddings=True, and overriding "
+                    "it to tie_word_embeddings=False is not supported either. Train this model with "
+                    "another supported parallelism strategy (e.g., FSDP2) instead."
                 )
         if getattr(config, "is_encoder_decoder", False):
             issues.append("Encoder-Decoder models with cross-attention are not supported yet for pipeline parallelism.")

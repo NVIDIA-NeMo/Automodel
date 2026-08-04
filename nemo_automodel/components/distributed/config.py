@@ -38,10 +38,13 @@ Usage:
 from __future__ import annotations
 
 from dataclasses import dataclass, field, fields
-from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple, Union
 
 import torch
 from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy
+
+from nemo_automodel.components.distributed.cp_vision_frame_shard import CpVisionFrameShardingConfig
+from nemo_automodel.shared.multimodal_fsdp import FrozenMultimodalSharding, normalize_frozen_multimodal_sharding
 
 if TYPE_CHECKING:
     from nemo_automodel.components.distributed.mesh import MeshContext, ParallelismSizes
@@ -49,9 +52,47 @@ if TYPE_CHECKING:
 
 # Type aliases for API signatures.
 ActivationCheckpointingMode = Union[bool, Literal["full", "selective"]]
+ActivationCheckpointingScope = Union[str, List[str], Tuple[str, ...]]
 DistributedStrategyConfig = Union["FSDP2Config", "MegatronFSDPConfig", "DDPConfig"]
 # Backwards-compatible alias for external / type-checking references.
 DistributedConfig = DistributedStrategyConfig
+
+_VALID_ACTIVATION_CHECKPOINTING_SCOPES = {"all", "language", "vision", "audio", "multimodal"}
+
+
+def normalize_activation_checkpointing_scope(value: Any) -> Tuple[str, ...]:
+    """Validate and normalize activation-checkpointing scope values."""
+    if value is None:
+        return ("all",)
+    if isinstance(value, str):
+        raw_parts = value.lower().replace("-", "_").replace("+", ",").split(",")
+    elif isinstance(value, (list, tuple, set)):
+        raw_parts = []
+        for item in value:
+            if not isinstance(item, str):
+                raise ValueError("activation_checkpointing_scope entries must be strings.")
+            raw_parts.extend(item.lower().replace("-", "_").replace("+", ",").split(","))
+    else:
+        raise ValueError("activation_checkpointing_scope must be a string or list of strings.")
+
+    scopes: list[str] = []
+    for part in raw_parts:
+        scope = part.strip()
+        if not scope:
+            continue
+        if scope in {"default", "auto"}:
+            scope = "all"
+        if scope not in _VALID_ACTIVATION_CHECKPOINTING_SCOPES:
+            valid = ", ".join(sorted(_VALID_ACTIVATION_CHECKPOINTING_SCOPES))
+            raise ValueError(f"activation_checkpointing_scope must use only: {valid}. Got {part!r}.")
+        if scope not in scopes:
+            scopes.append(scope)
+
+    if not scopes:
+        return ("all",)
+    if "all" in scopes and len(scopes) > 1:
+        raise ValueError("activation_checkpointing_scope='all' cannot be combined with other scopes.")
+    return tuple(scopes)
 
 
 @dataclass(frozen=True)
@@ -74,6 +115,7 @@ class DistributedSetup:
         activation_checkpointing: ActivationCheckpointingMode = False,
         world_size: int | None = None,
         timeout_minutes: int | None = None,
+        ranks: list[int] | tuple[int, ...] | None = None,
     ) -> "DistributedSetup":
         """Create a resolved distributed setup from sizes and policy configs.
 
@@ -112,6 +154,7 @@ class DistributedSetup:
             parallelism_sizes=parallelism_sizes,
             world_size=world_size,
             timeout_minutes=timeout_minutes,
+            ranks=ranks,
         )
 
         return cls(
@@ -127,10 +170,10 @@ class DistributedSetup:
 class MoEParallelizerConfig:
     """Configuration for MoE model parallelization (EP + FSDP settings)."""
 
-    # Default True: under activation checkpointing the MoE router output must be saved
-    # rather than recomputed. Recomputing the router can route a different number of tokens
-    # per expert than the forward pass, which makes torch.utils.checkpoint raise a
-    # CheckpointError on the backward recompute.
+    # Default True: under activation checkpointing the MoE router projection and top-k outputs
+    # must be saved rather than recomputed. Recomputing tied top-k selections can route a
+    # different number of tokens per expert than the forward pass, which makes
+    # torch.utils.checkpoint raise a CheckpointError on the backward recompute.
     ignore_router_for_ac: bool = True
     reshard_after_forward: bool = False
     lm_head_precision: Optional[Union[str, torch.dtype]] = None
@@ -139,6 +182,49 @@ class MoEParallelizerConfig:
 
     def to_dict(self) -> Dict[str, Any]:
         return {f.name: getattr(self, f.name) for f in fields(self)}
+
+
+@dataclass
+class MultimodalVisionConfig:
+    """Distributed policies for resolved vision modules.
+
+    Attributes:
+        frame_sharding: Controls frame-level encoder compute sharding over the
+            selected text-model mesh dimensions.
+    """
+
+    frame_sharding: CpVisionFrameShardingConfig = field(default_factory=CpVisionFrameShardingConfig)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.frame_sharding, CpVisionFrameShardingConfig):
+            raise TypeError("MultimodalVisionConfig.frame_sharding must be a CpVisionFrameShardingConfig instance.")
+
+
+@dataclass
+class MultimodalDistributedConfig:
+    """Distributed policies for resolved multimodal modules.
+
+    Attributes:
+        frozen_sharding: Controls fully frozen multimodal modules such as
+            vision/audio towers and projectors. ``"root"`` (default) keeps
+            their parameters in an always-run outer FSDP root, which is safe
+            when modality execution differs across ranks. ``"per_layer"``
+            uses normal layer/container FSDP units and requires every rank in
+            the FSDP group to execute or skip the module identically on every
+            microbatch. ``"replicate"`` excludes the frozen parameters from
+            FSDP roots so each rank keeps a full copy. Modules with any
+            trainable parameters use normal layer/container sharding
+            regardless of this setting.
+        vision: Policies that apply specifically to resolved vision modules.
+    """
+
+    frozen_sharding: FrozenMultimodalSharding = "root"
+    vision: MultimodalVisionConfig = field(default_factory=MultimodalVisionConfig)
+
+    def __post_init__(self) -> None:
+        self.frozen_sharding = normalize_frozen_multimodal_sharding(self.frozen_sharding)
+        if not isinstance(self.vision, MultimodalVisionConfig):
+            raise TypeError("MultimodalDistributedConfig.vision must be a MultimodalVisionConfig instance.")
 
 
 @dataclass
@@ -181,6 +267,11 @@ class FSDP2Config:
         activation_checkpointing (bool | "full" | "selective"): Enable activation checkpointing. ``True`` or
             ``"full"`` keeps the existing full activation checkpointing behavior. ``"selective"`` wraps transformer
             blocks with PyTorch selective activation checkpointing.
+        activation_checkpointing_scope (str | list[str]): Which extracted
+            layer groups activation checkpointing should wrap. ``"all"``
+            selects every extracted group. Scoped values such as
+            ``"language"``, ``"vision"``, and ``"multimodal"`` are filtered
+            to trainable layers before generic wrapping.
         defer_fsdp_grad_sync (bool): Defer FSDP gradient sync to final micro-batch.
         reshard_after_forward (Optional[bool]): Override layer-level FSDP2 resharding.
             ``None`` preserves AutoModel's heuristic: pipeline-parallel layers do
@@ -205,6 +296,8 @@ class FSDP2Config:
             memory at a small throughput cost.  Default ``2``.
         fsdp2_forward_prefetch_depth (int): Number of FSDP units to prefetch during
             forward pass.  Default ``1``.
+        multimodal: Policies for resolved multimodal modules that use the text
+            model's distributed axes.
     """
 
     sequence_parallel: bool = False
@@ -221,6 +314,7 @@ class FSDP2Config:
     offload_policy: Optional[CPUOffloadPolicy] = None
     autocast_dtype: Optional[torch.dtype] = None
     activation_checkpointing: ActivationCheckpointingMode = False
+    activation_checkpointing_scope: ActivationCheckpointingScope = "all"
     defer_fsdp_grad_sync: bool = True
     reshard_after_forward: Optional[bool] = None
     enable_async_tensor_parallel: bool = False
@@ -228,8 +322,9 @@ class FSDP2Config:
     enable_fsdp2_prefetch: bool = False
     fsdp2_backward_prefetch_depth: int = 2
     fsdp2_forward_prefetch_depth: int = 1
+    multimodal: MultimodalDistributedConfig = field(default_factory=MultimodalDistributedConfig)
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if self.mp_policy is None:
             # FSDP2 default: bf16 compute and fp32 gradient reduction. Pair with
             # ``model.torch_dtype: float32`` for fp32 optimizer state. See
@@ -240,6 +335,11 @@ class FSDP2Config:
                 output_dtype=torch.bfloat16,
                 cast_forward_inputs=True,
             )
+        self.activation_checkpointing_scope = normalize_activation_checkpointing_scope(
+            self.activation_checkpointing_scope
+        )
+        if not isinstance(self.multimodal, MultimodalDistributedConfig):
+            raise TypeError("FSDP2Config.multimodal must be a MultimodalDistributedConfig instance.")
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert config to dictionary (shallow, preserves policy objects)."""
@@ -256,15 +356,28 @@ class MegatronFSDPConfig:
     support pp_size, dp_replicate_size, or ep_size.
 
     Attributes:
-        megatron_fsdp_unit_modules (Optional[List[str]]): List of unit modules to be
-            wrapped with MegatronFSDP.
+        megatron_fsdp_unit_modules (list[str] | None): Class paths of the submodules to wrap
+            as individual MegatronFSDP units. When ``None`` (the default), the wrap classes
+            are auto-derived from the model's ``_no_split_modules`` so the real instantiated
+            block classes are used regardless of backend (HF or NeMo-custom).
         zero_dp_strategy (int): Data parallel sharding strategy.
         init_fsdp_with_meta_device (bool): Initialize MegatronFSDP with meta device if True.
         grad_reduce_in_fp32 (bool): Reduce gradients in fp32 if True.
         preserve_fp32_weights (bool): Preserve fp32 weights if True.
         overlap_grad_reduce (bool): Overlap gradient reduction if True.
         overlap_param_gather (bool): Overlap parameter gathering if True.
-        check_for_nan_in_grad (bool): Check for NaN in gradients if True.
+        check_for_nan_in_grad (bool): Legacy buffer-level gradient NaN check.
+            BREAKING CHANGE on megatron-fsdp 0.5.0: this flag is a no-op,
+            preserved only for config compatibility. 0.5.0 removed the
+            buffer-level NaN check entirely, so gradient NaN checking is now OFF
+            regardless of this value; a truthy value is dropped with a one-time
+            warning. The default is kept True for config compatibility, but has
+            no effect. To restore gradient NaN checking, enable
+            report_nan_in_param_grad instead.
+        report_nan_in_param_grad (bool): Enable megatron-fsdp 0.5.0's precise
+            per-parameter gradient NaN check. This is the replacement for the
+            removed check_for_nan_in_grad and is OFF by default; enabling it can
+            significantly reduce training throughput.
         average_in_collective (bool): Average in collective if True.
         disable_bucketing (bool): Disable bucketing if True.
         calculate_per_token_loss (bool): Calculate per token loss if True.
@@ -275,9 +388,7 @@ class MegatronFSDPConfig:
             MLP layers to save memory.
     """
 
-    megatron_fsdp_unit_modules: List[str] = field(
-        default_factory=lambda: ["transformers.models.llama.modeling_llama.LlamaDecoderLayer"]
-    )
+    megatron_fsdp_unit_modules: list[str] | None = None
     zero_dp_strategy: int = 3
     init_fsdp_with_meta_device: bool = False
     grad_reduce_in_fp32: bool = False
@@ -285,6 +396,7 @@ class MegatronFSDPConfig:
     overlap_grad_reduce: bool = True
     overlap_param_gather: bool = True
     check_for_nan_in_grad: bool = True
+    report_nan_in_param_grad: bool = False
     average_in_collective: bool = False
     disable_bucketing: bool = False
     calculate_per_token_loss: bool = False
@@ -310,6 +422,11 @@ class DDPConfig:
         activation_checkpointing (bool | "full" | "selective"): Enable activation checkpointing. ``True`` or
             ``"full"`` keeps the existing full activation checkpointing behavior. ``"selective"`` wraps transformer
             blocks with PyTorch selective activation checkpointing.
+        activation_checkpointing_scope (str | list[str]): Which extracted
+            layer groups activation checkpointing should wrap. ``"all"``
+            selects every extracted group. Scoped values such as
+            ``"language"``, ``"vision"``, and ``"multimodal"`` are filtered
+            to trainable layers before generic wrapping.
         broadcast_buffers (bool): Synchronize module buffers before each forward.
         find_unused_parameters (bool): Forwarded to PyTorch DDP for models with
             conditionally unused trainable parameters.
@@ -322,12 +439,18 @@ class DDPConfig:
     """
 
     activation_checkpointing: ActivationCheckpointingMode = False
+    activation_checkpointing_scope: ActivationCheckpointingScope = "all"
     broadcast_buffers: bool = False
     find_unused_parameters: bool = False
     static_graph: bool = False
     bucket_cap_mb: Optional[float] = None
     gradient_as_bucket_view: bool = False
     autocast_dtype: Optional[torch.dtype] = None
+
+    def __post_init__(self):
+        self.activation_checkpointing_scope = normalize_activation_checkpointing_scope(
+            self.activation_checkpointing_scope
+        )
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert config to dictionary."""
@@ -376,4 +499,5 @@ __all__ = [
     "FSDP2Config",
     "MegatronFSDPConfig",
     "MoEParallelizerConfig",
+    "normalize_activation_checkpointing_scope",
 ]

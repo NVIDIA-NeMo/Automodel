@@ -1,6 +1,7 @@
 ---
 title: "Llama"
 description: ""
+slug: model-coverage/large-language-models/meta/llama
 ---
 [Meta's Llama](https://www.llama.com/) is a family of open-weight autoregressive language models built on the transformer decoder architecture. Key design choices include pre-normalization with RMSNorm, SwiGLU activations, and Rotary Positional Embeddings (RoPE). Llama 3+ models add Grouped Query Attention (GQA) for memory-efficient inference at larger scales.
 
@@ -51,23 +52,18 @@ description: ""
 
 ## Try with NeMo AutoModel
 
-**1. Install** ([full instructions](/get-started/installation)):
-
-```bash
-pip install nemo-automodel
-```
-
-**2. Clone the repo** to get the example recipes:
+**1. Clone and install from source** ([full instructions](/get-started/installation)):
 
 ```bash
 git clone https://github.com/NVIDIA-NeMo/Automodel.git
 cd Automodel
+uv sync --locked --all-groups --all-extras
 ```
 
-**3. Run the recipe** from inside the repo:
+**2. Run the recipe** from inside the repo:
 
 ```bash
-automodel --nproc-per-node=8 examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
+uv run automodel --nproc-per-node=8 examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
 ```
 
 <Accordion title="Run with Docker">

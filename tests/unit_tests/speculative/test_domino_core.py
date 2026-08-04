@@ -20,10 +20,10 @@ import pytest
 import torch
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
+from nemo_automodel.components.speculative.dflash.core import compute_accept_len
 from nemo_automodel.components.speculative.dflash.domino_core import (
     DominoStepMetrics,
     DominoTrainerModule,
-    compute_accept_len,
     get_lambda_base,
 )
 from nemo_automodel.components.speculative.dflash.draft_qwen3 import Qwen3DFlashDraftModel
@@ -151,10 +151,14 @@ def test_forward_returns_metrics_and_grads_flow_to_head(shift_label):
     assert 0.0 <= out.accuracy.item() <= 1.0
     assert 0.0 <= out.base_accuracy.item() <= 1.0
     assert out.valid_tokens.item() > 0
+    assert out.loss_weight.item() > 0
+    torch.testing.assert_close(out.accuracy, out.correct_tokens / out.valid_tokens)
+    torch.testing.assert_close(out.base_accuracy, out.base_correct_tokens / out.valid_tokens)
+    torch.testing.assert_close(out.accept_len, out.accept_len_sum / out.valid_blocks)
+    torch.testing.assert_close(out.base_accept_len, out.base_accept_len_sum / out.valid_blocks)
     assert torch.isfinite(out.final_loss) and torch.isfinite(out.base_loss)
-    # Accept length is at least the always-accepted anchor (>= ~1.0; the 1e-6
-    # denominator term keeps it a hair under 1.0 for an all-miss untrained model).
-    assert out.accept_len.item() > 0.99 and out.base_accept_len.item() > 0.99
+    # Accept length includes the always-accepted anchor.
+    assert out.accept_len.item() >= 1.0 and out.base_accept_len.item() >= 1.0
     assert out.lambda_base.item() == pytest.approx(0.3)
 
     out.loss.backward()

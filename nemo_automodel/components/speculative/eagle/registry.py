@@ -41,9 +41,11 @@ from dataclasses import dataclass
 from transformers import PreTrainedModel
 
 from nemo_automodel.components.speculative.eagle.draft_deepseek import DeepseekV3Eagle3DraftModel
+from nemo_automodel.components.speculative.eagle.draft_gemma import Gemma4Eagle3DraftModel
 from nemo_automodel.components.speculative.eagle.draft_gpt_oss import GptOssEagle3DraftModel
 from nemo_automodel.components.speculative.eagle.draft_llama import LlamaEagle3DraftModel
 from nemo_automodel.components.speculative.eagle.draft_llama_v12 import LlamaEagleDraftModel
+from nemo_automodel.components.speculative.eagle.vispec_draft import VispecDraftModel
 
 
 @dataclass(frozen=True)
@@ -84,9 +86,41 @@ EAGLE3_DRAFT_REGISTRY["GptOssForCausalLM"] = DraftSpec(draft_cls=GptOssEagle3Dra
 # dedicated MLA draft -- see ``draft_deepseek.py``. Only EAGLE-3 is wired up.
 EAGLE3_DRAFT_REGISTRY["DeepseekV3ForCausalLM"] = DraftSpec(draft_cls=DeepseekV3Eagle3DraftModel)
 
+# Gemma4 multimodal target (``Gemma4ForConditionalGeneration``). The draft is
+# Llama-style dense (it consumes only post-block hidden states from the frozen
+# target's text backbone), but the Gemma4 *text* config needs two quirks
+# reconciled before the shared draft can build -- the ``hidden_activation`` key
+# and the nested per-attention-type ``rope_parameters`` -- so it gets a thin
+# dedicated draft class. See ``draft_gemma.py`` for the rationale. The target's
+# decoder config is nested under ``config.text_config`` (the draft is built from
+# it via ``config.get_text_config()`` in the recipe) and its decoder layers live
+# under ``model.language_model.layers`` (handled by the target wrapper's
+# ``_get_transformer_layers``). Only EAGLE-3 is wired up.
+EAGLE3_DRAFT_REGISTRY["Gemma4ForConditionalGeneration"] = DraftSpec(draft_cls=Gemma4Eagle3DraftModel)
+
 
 EAGLE1_DRAFT_REGISTRY: dict[str, DraftSpec] = {
     arch: DraftSpec(draft_cls=LlamaEagleDraftModel) for arch in _DENSE_ARCHITECTURES
+}
+
+
+# ViSpec targets are vision-language models. The draft itself is the Llama-style
+# EAGLE-1/2 dense draft plus ViSpec's image adaptor, and it consumes the target's
+# *text* config (hidden size, head count, RoPE), so any VLM whose language tower
+# fits that shape is a one-line append here.
+VISPEC_DRAFT_REGISTRY: dict[str, DraftSpec] = {
+    "Qwen2_5_VLForConditionalGeneration": DraftSpec(draft_cls=VispecDraftModel),
+    "Qwen3VLForConditionalGeneration": DraftSpec(draft_cls=VispecDraftModel),
+    "Qwen3VLMoeForConditionalGeneration": DraftSpec(draft_cls=VispecDraftModel),
+}
+
+# ViSpec stage 1 uses the same VLM as a frozen text-only teacher, but its draft
+# has no image modules yet. Stage 2 loads this checkpoint into ``VispecDraftModel``
+# with ``strict=False`` and initializes the added vision parameters separately.
+VISPEC_STAGE1_DRAFT_REGISTRY: dict[str, DraftSpec] = {
+    "Qwen2_5_VLForConditionalGeneration": DraftSpec(draft_cls=LlamaEagleDraftModel),
+    "Qwen3VLForConditionalGeneration": DraftSpec(draft_cls=LlamaEagleDraftModel),
+    "Qwen3VLMoeForConditionalGeneration": DraftSpec(draft_cls=LlamaEagleDraftModel),
 }
 
 
@@ -110,3 +144,13 @@ def resolve_eagle3_draft_spec(architectures: list[str]) -> DraftSpec:
 def resolve_eagle1_draft_spec(architectures: list[str]) -> DraftSpec:
     """Resolve the EAGLE-1 / EAGLE-2 draft spec for a target's ``config.architectures`` field."""
     return _resolve(architectures, EAGLE1_DRAFT_REGISTRY, "TrainEagle1Recipe")
+
+
+def resolve_vispec_draft_spec(architectures: list[str]) -> DraftSpec:
+    """Resolve the ViSpec draft spec for a VLM target's ``config.architectures`` field."""
+    return _resolve(architectures, VISPEC_DRAFT_REGISTRY, "TrainVispecRecipe")
+
+
+def resolve_vispec_stage1_draft_spec(architectures: list[str]) -> DraftSpec:
+    """Resolve the text-only EAGLE draft spec for ViSpec stage 1."""
+    return _resolve(architectures, VISPEC_STAGE1_DRAFT_REGISTRY, "TrainVispecStage1Recipe")

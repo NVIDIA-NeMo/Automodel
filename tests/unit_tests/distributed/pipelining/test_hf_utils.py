@@ -191,6 +191,26 @@ class TestCreatePipelineForwardCausalLM:
         called_hidden = mock_lm_head.call_args[0][0]
         assert called_hidden.shape[1] == 5  # Only last 5 positions
 
+    def test_forward_returns_hidden_states_when_flagged(self):
+        """Fused-CE path: with _pp_return_hidden_states=True the last stage skips
+        lm_head and returns the hidden states unprojected."""
+        mock_model = Mock()
+        mock_model.config = Mock(output_attentions=False, output_hidden_states=False)
+        mock_model.model = None
+        mock_lm_head = Mock()
+        mock_model.lm_head = mock_lm_head
+        # Flag set by train_ft._configure_pipeline_loss_fn for FusedLinearCrossEntropy.
+        mock_model._pp_return_hidden_states = True
+
+        forward_fn = create_pipeline_forward_causal_lm()
+
+        hidden_states = torch.randn(1, 10, 768)
+        output = forward_fn(mock_model, inputs_embeds=hidden_states, logits_to_keep=1)
+
+        # lm_head must NOT be applied; hidden states are returned as-is.
+        mock_lm_head.assert_not_called()
+        assert torch.equal(output, hidden_states)
+
     def test_forward_with_non_basemodel_output(self):
         """Test handling when inner model returns non-BaseModelOutputWithPast."""
         mock_model = Mock()
@@ -534,7 +554,7 @@ class TestValidateHfModelForPipelineSupport:
 
         model = MockModel()
 
-        with pytest.raises(ValueError, match="tie_word_embeddings=True is not supported"):
+        with pytest.raises(ValueError, match="Pipeline parallelism does not support tie_word_embeddings=True"):
             validate_hf_model_for_pipeline_support(model)
 
     def test_validate_encoder_decoder_model(self):

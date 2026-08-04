@@ -13,7 +13,8 @@
 # limitations under the License.
 
 import hashlib
-from typing import TYPE_CHECKING, Any, Dict, List, Union
+import warnings
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Union, cast
 
 import torch
 from transformers import DataCollatorWithPadding, PreTrainedTokenizerBase, ProcessorMixin
@@ -204,10 +205,10 @@ class BiEncoderCollator:
         # Per-passage corpus doc ids (positive + negatives, flattened in d_input_ids
         # order) for distributed in-batch same-doc negative masking. Top-level key
         # so it bypasses the q_/d_ unpacking in the trainer.
-        if batch and batch[0].get("doc_id") is not None:
-            doc_id_flat: List[str] = []
-            for x in batch:
-                doc_id_flat.extend(x["doc_id"])
+        doc_id_groups = [x.get("doc_id") for x in batch]
+        # Inline records may not provide IDs; incomplete IDs are unsafe for same-doc masking.
+        if doc_id_groups and all(doc_ids and all(doc_ids) for doc_ids in doc_id_groups):
+            doc_id_flat = [doc_id for doc_ids in doc_id_groups for doc_id in doc_ids]
             merged_batch_dict["passage_doc_ids"] = torch.tensor(
                 [_doc_id_str_to_int64(s) for s in doc_id_flat],
                 dtype=torch.long,
@@ -304,15 +305,50 @@ class CrossEncoderCollator(DataCollatorWithPadding):
         return batch_dict
 
 
-def make_vision_collator_from_processor_method(tokenizer: ProcessorMixin, collator_fn_name: str):
+class ProcessorMethodCollator:
+    """Expose one method of a multimodal processor as a dataloader collator."""
+
+    def __init__(self, tokenizer: ProcessorMixin, collator_fn_name: str) -> None:
+        """Resolve the processor method once during dataloader construction.
+
+        Args:
+            tokenizer: Runtime multimodal processor.
+            collator_fn_name: Processor method used to collate each batch.
+        """
+        self.collate_fn = cast(
+            Callable[[list[dict[str, object]]], dict[str, object]],
+            getattr(tokenizer, collator_fn_name),
+        )
+
+    def __call__(self, batch: list[dict[str, object]]) -> dict[str, object]:
+        """Collate retrieval examples with the resolved processor method.
+
+        Args:
+            batch: Retrieval examples for one local batch.
+
+        Returns:
+            Processor-produced tensor batch.
+        """
+        return self.collate_fn(batch)
+
+
+def make_vision_collator_from_processor_method(
+    tokenizer: ProcessorMixin,
+    collator_fn_name: str,
+) -> Callable[[list[dict[str, object]]], dict[str, object]]:
     """
     Turns a method of a processor into a collator function.
 
     Args:
         tokenizer: The processor instance.
-        collator_fn_name: The name of the proceessor method to turn into a collator function.
+        collator_fn_name: The name of the processor method to turn into a collator function.
 
     Returns:
         A collator for vision/multimodal retrieval datasets.
     """
-    return getattr(tokenizer, collator_fn_name)
+    warnings.warn(
+        "make_vision_collator_from_processor_method is deprecated; use ProcessorMethodCollator instead",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return cast(Callable[[list[dict[str, object]]], dict[str, object]], getattr(tokenizer, collator_fn_name))

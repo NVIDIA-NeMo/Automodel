@@ -43,6 +43,11 @@ class IndexerFunction(torch.autograd.Function):
         _, head_num, _ = index_q.shape
         logits = indexer_fwd_interface(index_q, index_k, weights, cu_seqlen_ks, cu_seqlen_ke, clean_logits=True)
         if topk_indices is None:
+            # Pad logits with -inf when seq_len_kv < topk so torch.topk keeps a fixed k=topk
+            # (static shape); the padded columns become the same -1 sentinel as causal masking.
+            pad = topk - logits.shape[-1]
+            if pad > 0:
+                logits = torch.nn.functional.pad(logits, (0, pad), value=float("-inf"))
             index_score, topk_indices = torch.topk(logits, topk, dim=-1)
             topk_indices = topk_indices.to(torch.int32)
             topk_indices = topk_indices.masked_fill(index_score == -torch.inf, -1)

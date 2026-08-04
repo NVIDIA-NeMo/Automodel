@@ -119,4 +119,23 @@ wandb:
 ci:
   recipe_owner: akoumpa
   nodes: 4
-  time: "00:30:00"
+  # Checkpoint robustness reaches resume close to 30 minutes on EOS.
+  time: "01:00:00"
+  checkpoint_robustness:
+    # PP=4 with pp_microbatch_size=1 requires at least four pipeline microbatches.
+    step_scheduler.local_batch_size: 4
+    check_source_load_parity: true
+    # Fresh PP4/EP8 DCP and consolidated reloads are bit-identical to each other,
+    # but both differ from the still-warm in-memory runtime. Bound that distributed
+    # BF16 execution delta separately from the native-vs-HF implementation delta.
+    kl_threshold: 5e-2
+    source_load_kl_threshold: 1e-2
+    source_load_mean_kl_threshold: 2e-3
+    source_load_cosine_threshold: 0.999
+    hf_kl_threshold: 5e-2
+    hf_device_map_auto: true
+    # Transformers' load-time dequantization leaves Mistral4 expert weights in
+    # FP8, while native forward requires an optional kernel absent from CI.
+    # Preserve the native layout while loading, then dequantize before forward.
+    hf_source_post_load_dequantize: true
+    tokenizer_name: mistralai/Mistral-Small-4-119B-2603

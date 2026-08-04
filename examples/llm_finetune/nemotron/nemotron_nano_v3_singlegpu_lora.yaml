@@ -5,8 +5,10 @@
 #   * distributed.activation_checkpointing: true  -> recompute block activations
 #   * peft.use_memory_efficient_lora: true        -> don't save the LoRA-A activation
 #
-# Run (single GPU):
-#   automodel examples/llm_finetune/nemotron/nemotron_nano_v3_singlegpu_lora.yaml --nproc-per-node 1
+# Run (single GPU). Model loading merges split MoE expert tensors on CPU. Eight
+# threads performed well in testing, but tune this value for your host:
+#   OMP_NUM_THREADS=8 MKL_NUM_THREADS=8 automodel \
+#     examples/llm_finetune/nemotron/nemotron_nano_v3_singlegpu_lora.yaml --nproc-per-node 1
 
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
@@ -80,3 +82,11 @@ optimizer:
   eps: 1e-8
   lr: 1.0e-5
   weight_decay: 0
+
+ci:
+  time: "00:15:00"
+  nproc_per_node: 1
+  env_vars:
+    # Limit checkpoint conversion parallelism to avoid excessive CPU overhead.
+    OMP_NUM_THREADS: 8
+    MKL_NUM_THREADS: 8

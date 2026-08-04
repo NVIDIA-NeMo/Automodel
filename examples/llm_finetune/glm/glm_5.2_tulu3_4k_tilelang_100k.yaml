@@ -54,15 +54,13 @@ dist_env:
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: zai-org/GLM-5.2
-  config:
-    head_dim: 64
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
     attn: tilelang
     linear: torch
     rms_norm: torch_fp32
     rope_fusion: false
-    enable_deepep: true
+    dispatcher: hybridep
     gate_precision: float32
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
@@ -108,3 +106,9 @@ optimizer:
 #   project: <your_wandb_project>
 #   entity: <your_wandb_entity>
 #   name: <your_wandb_exp_name>
+
+ci:
+  # pp4 with ep64 requires 256 ranks.
+  recipe_owner: huiyingl
+  nodes: 32
+  time: "01:00:00"
