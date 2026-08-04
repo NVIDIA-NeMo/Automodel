@@ -21,9 +21,22 @@
 
 cd /opt/Automodel
 
-# VLM recipes need qwen-vl-utils/opencv from the opt-in vlm-media extra, kept out of the image.
+# VLM recipes need the opt-in vlm-media packages kept out of the image. Install
+# those packages directly instead of resolving the local project again, which
+# can refetch unrelated Git dependencies already present in the image.
 case "$CONFIG_PATH" in
-    *vlm_finetune*) uv pip install ".[vlm-media]" ;;
+    *vlm_finetune*)
+        VLM_MEDIA_PACKAGES=(
+            albumentations
+            "opencv-python-headless==4.10.0.84"
+            qwen-omni-utils
+            qwen-vl-utils
+        )
+        if [[ "$(uname -m)" == "x86_64" ]]; then
+            VLM_MEDIA_PACKAGES+=(decord)
+        fi
+        uv pip install "${VLM_MEDIA_PACKAGES[@]}"
+        ;;
 esac
 
 CONFIG_RESOLVER="python3 /opt/Automodel/tests/ci_tests/scripts/config_resolver.py"
