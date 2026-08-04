@@ -418,12 +418,18 @@ class HybridEPDispatch(torch.autograd.Function):
         num_sms_combine_api=24,
         num_permuted_tokens=None,
         pad_multiple=None,
+        topk_idx=None,
+        num_experts=None,
         fuse_permute=False,
         num_sms_preprocessing_api=None,
         num_blocks_permute=None,
         num_blocks_unpermute=None,
     ):
-        """Dispatch ``x[T, H]`` using ``routing_map[T, E]`` and dense probabilities."""
+        """Dispatch ``x[T, H]`` using compact ``topk_idx[T, K]`` or ``routing_map[T, E]``.
+
+        ``probs[T, E]`` remains dense so its gradient layout is unchanged.  When both routing
+        representations are provided, HybridEP gives ``routing_map`` precedence.
+        """
         if _hybrid_ep_buffer is None:
             seq_len, hidden_dim = x.shape[-2:]
             fp8_dispatch = False
@@ -448,8 +454,10 @@ class HybridEPDispatch(torch.autograd.Function):
             handle,
         ) = _hybrid_ep_buffer.dispatch_with_permute(
             hidden=x,
+            topk_idx=topk_idx,
             routing_map=routing_map,
             probs=probs,
+            num_of_experts=num_experts,
             scaling_factor=None,
             num_of_experts_per_rank=num_local_experts,
             pad_multiple=pad_multiple,
@@ -484,6 +492,8 @@ class HybridEPDispatch(torch.autograd.Function):
             combined_hidden,
             None,
             combined_probs,
+            None,
+            None,
             None,
             None,
             None,
@@ -543,6 +553,8 @@ if HAVE_HYBRIDEP:
         num_permuted_tokens=None,
         pad_multiple=None,
         *,
+        topk_idx=None,
+        num_experts=None,
         fuse_permute: bool = False,
         num_sms_preprocessing_api: int | None = None,
         num_blocks_permute: int | None = None,
@@ -560,6 +572,8 @@ if HAVE_HYBRIDEP:
             num_sms_combine_api: SMs reserved for HybridEP combine.
             num_permuted_tokens: Static output capacity for non-blocking dispatch.
             pad_multiple: Optional token padding multiple.
+            topk_idx: Optional compact expert indices with shape ``[T, K]``.
+            num_experts: Global expert count required with compact indices.
             fuse_permute: Fuse token permutation into the dispatch kernel.
             num_sms_preprocessing_api: Optional SM count for routing-metadata preprocessing.
             num_blocks_permute: Optional dispatch permutation block count.
@@ -579,6 +593,8 @@ if HAVE_HYBRIDEP:
             num_sms_combine_api,
             num_permuted_tokens,
             pad_multiple,
+            topk_idx,
+            num_experts,
             fuse_permute,
             num_sms_preprocessing_api,
             num_blocks_permute,
