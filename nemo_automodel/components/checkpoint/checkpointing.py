@@ -870,6 +870,7 @@ class Checkpointer:
 
             t0 = time.monotonic()
             _ru0 = resource.getrusage(resource.RUSAGE_SELF)  # PROBE
+            _log_mem("start")  # PROBE
             if os.environ.get("AM_CKPT_PREFETCH", "1") == "1":  # PROBE
                 _shards = _ckpt_shard_files(model_path)
                 _t_pf0 = time.monotonic()
@@ -880,8 +881,10 @@ class Checkpointer:
                     f"ckpt_probe: prefetch {_pf_gb:.2f} GB from {len(_shards)} shard(s) in "
                     f"{_t_pf1 - _t_pf0:.2f}s ({_pf_gb / max(_t_pf1 - _t_pf0, 1e-9):.2f} GB/s)"
                 )
+                _log_mem("after_prefetch")  # PROBE
             state_dict_from_disk = _load_hf_checkpoint_preserving_dtype(model_path)
             t_disk = time.monotonic()
+            _log_mem("after_open")  # PROBE
             if state_dict_from_disk is not None:
                 state_dict_from_disk = _maybe_adapt_state_dict_from_hf(
                     model_state.model[0], state_dict_from_disk, moe_mesh=self.moe_mesh
@@ -889,6 +892,7 @@ class Checkpointer:
             else:
                 state_dict_from_disk = {}
             t_adapt = time.monotonic()  # PROBE
+            _log_mem("after_from_hf_merge")  # PROBE
 
             # Apply key_mapping (e.g. _checkpoint_conversion_mapping) so that
             # HF checkpoint keys are renamed to match the model's parameter FQNs.
@@ -934,8 +938,10 @@ class Checkpointer:
                 f"minflt={_ru1.ru_minflt - _ru0.ru_minflt} "
                 f"inblock={_ru1.ru_inblock - _ru0.ru_inblock}"
             )
+            _log_mem("after_into_model")  # PROBE
             del state_dict_from_disk
             gc.collect()
+            _log_mem("after_free")  # PROBE
             return
 
         # Standard loading path (DCP copies into model's existing tensors; dtypes follow the model)
@@ -2567,6 +2573,33 @@ def _load_hf_checkpoint_preserving_dtype(model_path: str) -> Optional[dict[str, 
     elif _is_safetensors_checkpoint(model_path):
         return _load_hf_safetensors_checkpoint(model_path)
     return None
+
+
+def _mem_snapshot() -> dict:  # PROBE
+    """Process RSS/peak-RSS and host-wide page-cache numbers, in GiB."""
+    out: dict[str, float] = {}
+    for path, keys in (
+        ("/proc/self/status", ("VmRSS:", "VmHWM:")),
+        ("/proc/meminfo", ("MemFree:", "MemAvailable:", "Cached:")),
+    ):
+        try:
+            with open(path) as fh:
+                for line in fh:
+                    if line.startswith(keys):
+                        name, val = line.split(":", 1)
+                        out[name] = int(val.split()[0]) / (1 << 20)
+        except OSError:
+            pass
+    return out
+
+
+def _log_mem(tag: str) -> None:  # PROBE
+    m = _mem_snapshot()
+    logging.info(
+        f"ckpt_probe_mem[{tag}]: rss={m.get('VmRSS', 0):.2f} GiB peak_rss={m.get('VmHWM', 0):.2f} GiB | "
+        f"host cached={m.get('Cached', 0):.2f} GiB avail={m.get('MemAvailable', 0):.2f} GiB "
+        f"free={m.get('MemFree', 0):.2f} GiB"
+    )
 
 
 def _ckpt_shard_files(model_path: str) -> list[str]:  # PROBE
