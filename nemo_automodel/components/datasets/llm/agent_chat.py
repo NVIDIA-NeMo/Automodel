@@ -795,7 +795,10 @@ def make_agent_chat_dataset(
                 truncate_history=truncate_history,
                 trim_incomplete_last_turn=trim_incomplete_last_turn,
             )
-            return len(tokenized["input_ids"]) < seq_length
+            # Rendered with a ``seq_length + 1`` budget above, so an over-long
+            # trace comes back at ``seq_length + 1`` tokens. A trace that lands
+            # on exactly ``seq_length`` fits the real budget and is kept.
+            return len(tokenized["input_ids"]) <= seq_length
 
         dataset = dataset.filter(fits_sequence_length)
 

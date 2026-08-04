@@ -437,6 +437,7 @@ def test_make_agent_chat_dataset_filters_overlong_examples(monkeypatch):
     rows = [
         {"id": 0, "messages": [{"role": "assistant", "content": "short"}], "tools": []},
         {"id": 1, "messages": [{"role": "assistant", "content": "long"}], "tools": []},
+        {"id": 2, "messages": [{"role": "assistant", "content": "exact"}], "tools": []},
     ]
 
     class DummyDataset:
@@ -455,10 +456,10 @@ def test_make_agent_chat_dataset_filters_overlong_examples(monkeypatch):
     monkeypatch.setattr(agent_chat, "load_dataset", lambda *args, **kwargs: DummyDataset(rows))
     monkeypatch.setattr(agent_chat, "_add_pad_token", lambda tokenizer: 0)
 
-    def fake_format(example, *args, truncation=False, **kwargs):
-        length = 2 if example["id"] == 0 else 6
-        if truncation:
-            length = min(length, 4)
+    def fake_format(example, *args, seq_length=None, truncation=False, **kwargs):
+        length = {0: 2, 1: 6, 2: 4}[example["id"]]
+        if truncation and seq_length is not None:
+            length = min(length, seq_length)
         return {"input_ids": list(range(length)), "labels": list(range(length))}
 
     monkeypatch.setattr(agent_chat, "_format_example", fake_format)
@@ -471,8 +472,11 @@ def test_make_agent_chat_dataset_filters_overlong_examples(monkeypatch):
         filter_overlong=True,
     )
 
-    assert len(ds) == 1
+    # id=1 renders to seq_length + 1 tokens under the probe budget and is dropped;
+    # id=2 lands on exactly seq_length, which fits, so it is kept.
+    assert len(ds) == 2
     assert ds[0]["input_ids"] == [0, 1]
+    assert ds[1]["input_ids"] == [0, 1, 2, 3]
 
 
 def test_make_agent_chat_dataset_filter_overlong_requires_seq_length():
