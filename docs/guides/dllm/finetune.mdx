@@ -75,7 +75,7 @@ The following components drive dLLM fine-tuning:
 1. A **recipe script** ([`train_ft.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/dllm/train_ft.py)) orchestrates the training loop with dLLM-specific corruption, loss, and batch handling.
 2. A **YAML configuration file** specifies the model, data, optimizer, dLLM-specific settings, and distributed training strategy.
 
-The recipe uses a **strategy pattern** to handle differences between model families. The `dllm.mode` field in the YAML configuration selects the strategy:
+The recipe uses a **strategy pattern** to handle differences between model families. The `dllm.mode` field in the YAML configuration selects the strategy.
 
 | Mode | Strategy | Description |
 |------|----------|-------------|
