@@ -871,15 +871,27 @@ class Checkpointer:
             t0 = time.monotonic()
             _ru0 = resource.getrusage(resource.RUSAGE_SELF)  # PROBE
             _log_mem("start")  # PROBE
-            if os.environ.get("AM_CKPT_PREFETCH", "1") == "1":  # PROBE
+            _log_readahead_tunables()  # PROBE
+            _mode = os.environ.get("AM_CKPT_PREFETCH", "1")  # PROBE
+            if _mode not in ("0", "off"):
                 _shards = _ckpt_shard_files(model_path)
+                _shard_gib = sum(os.path.getsize(p) for p in _shards) / (1 << 30)
                 _t_pf0 = time.monotonic()
-                _pf_bytes = _warm_page_cache(_shards)
-                _t_pf1 = time.monotonic()
-                _pf_gb = _pf_bytes / (1 << 30)
+                if _mode in ("1", "read"):
+                    _pf_gb = _warm_page_cache(_shards) / (1 << 30)
+                    _t_pf1 = time.monotonic()
+                    _resident = _resident_gib(_shards)
+                    _wait_s = 0.0
+                else:  # "fadvise" | "madvise": ask the kernel, copy nothing
+                    _advise_willneed(_shards, _mode)
+                    _t_pf1 = time.monotonic()
+                    _resident, _wait_s = _wait_resident(_shards, _shard_gib)
+                    _pf_gb = _resident
                 logging.info(
-                    f"ckpt_probe: prefetch {_pf_gb:.2f} GB from {len(_shards)} shard(s) in "
-                    f"{_t_pf1 - _t_pf0:.2f}s ({_pf_gb / max(_t_pf1 - _t_pf0, 1e-9):.2f} GB/s)"
+                    f"ckpt_probe: prefetch[{_mode}] {_pf_gb:.2f} GiB of {_shard_gib:.2f} GiB "
+                    f"from {len(_shards)} shard(s); call={_t_pf1 - _t_pf0:.2f}s wait={_wait_s:.2f}s "
+                    f"resident_after={_resident:.2f} GiB "
+                    f"({_shard_gib / max(_t_pf1 - _t_pf0 + _wait_s, 1e-9):.2f} GiB/s effective)"
                 )
                 _log_mem("after_prefetch")  # PROBE
             state_dict_from_disk = _load_hf_checkpoint_preserving_dtype(model_path)
@@ -2593,6 +2605,25 @@ def _mem_snapshot() -> dict:  # PROBE
     return out
 
 
+def _log_readahead_tunables() -> None:  # PROBE
+    """Lustre caps per-file readahead, which bounds what WILLNEED can do."""
+    hits = []
+    for pattern in (
+        "/proc/fs/lustre/llite/*/max_read_ahead_mb",
+        "/proc/fs/lustre/llite/*/max_read_ahead_per_file_mb",
+        "/proc/fs/lustre/llite/*/max_read_ahead_whole_mb",
+        "/sys/fs/lustre/llite/*/max_read_ahead_mb",
+        "/sys/fs/lustre/llite/*/max_read_ahead_per_file_mb",
+    ):
+        for path in glob.glob(pattern):
+            try:
+                with open(path) as fh:
+                    hits.append(f"{os.path.basename(path)}={fh.read().strip()}")
+            except OSError:
+                pass
+    logging.info("ckpt_probe: readahead tunables: %s", ", ".join(hits) if hits else "none visible")
+
+
 def _log_mem(tag: str) -> None:  # PROBE
     m = _mem_snapshot()
     logging.info(
@@ -2639,6 +2670,75 @@ def _warm_page_cache(paths: list[str], chunk_bytes: int = 64 << 20, max_workers:
         return 0
     with ThreadPoolExecutor(max_workers=min(max_workers, len(paths))) as pool:
         return sum(pool.map(_read_one, paths))
+
+
+def _resident_gib(paths: list[str]) -> float:  # PROBE
+    """GiB of these files currently resident in the page cache, via mincore(2)."""
+    import ctypes
+    import mmap as _mmap
+
+    import numpy as np
+
+    libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    total_pages = 0
+    for path in paths:
+        size = os.path.getsize(path)
+        if size == 0:
+            continue
+        with open(path, "rb") as fh:
+            mm = _mmap.mmap(fh.fileno(), size, access=_mmap.ACCESS_COPY)
+            try:
+                addr = ctypes.addressof(ctypes.c_char.from_buffer(mm))
+                npages = (size + 4095) // 4096
+                vec = (ctypes.c_ubyte * npages)()
+                if libc.mincore(ctypes.c_void_p(addr), ctypes.c_size_t(size), vec) == 0:
+                    total_pages += int((np.frombuffer(vec, dtype=np.uint8) & 1).sum())
+                del addr
+            finally:
+                mm.close()
+    return total_pages * 4096 / (1 << 30)
+
+
+def _advise_willneed(paths: list[str], how: str) -> None:  # PROBE
+    """Ask the kernel to read these files ahead, without copying them to userspace."""
+    import mmap as _mmap
+
+    for path in paths:
+        if how == "fadvise":
+            fd = os.open(path, os.O_RDONLY)
+            try:
+                os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_WILLNEED)
+            finally:
+                os.close(fd)
+        else:  # madvise
+            size = os.path.getsize(path)
+            if size == 0:
+                continue
+            with open(path, "rb") as fh:
+                mm = _mmap.mmap(fh.fileno(), size, access=_mmap.ACCESS_READ)
+                try:
+                    mm.madvise(_mmap.MADV_WILLNEED)
+                finally:
+                    mm.close()
+
+
+def _wait_resident(paths: list[str], target_gib: float, timeout_s: float = 180.0) -> tuple[float, float]:  # PROBE
+    """Poll until readahead stops making progress; readahead calls are asynchronous."""
+    t0 = time.monotonic()
+    last = -1.0
+    stalls = 0
+    while time.monotonic() - t0 < timeout_s:
+        cur = _resident_gib(paths)
+        if cur >= 0.99 * target_gib:
+            return cur, time.monotonic() - t0
+        if cur <= last + 0.05:
+            stalls += 1
+            if stalls >= 3:
+                break
+        else:
+            stalls = 0
+        last = cur
+    return _resident_gib(paths), time.monotonic() - t0
 
 
 def _load_hf_safetensors_checkpoint(model_path: str) -> Optional[dict[str, torch.Tensor]]:
