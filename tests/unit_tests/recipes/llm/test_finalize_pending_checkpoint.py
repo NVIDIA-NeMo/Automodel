@@ -77,7 +77,7 @@ def test_finalize_uses_recipe_process_group(monkeypatch):
 
     r._finalize_pending_checkpoint()
 
-    assert barriers == [process_group, process_group]
+    assert barriers == [process_group]
 
 
 def test_finalize_is_noop_when_checkpointing_disabled():

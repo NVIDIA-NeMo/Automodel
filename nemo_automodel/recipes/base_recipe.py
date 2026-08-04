@@ -447,8 +447,6 @@ class BaseRecipe:
             if is_rank_0:
                 self._update_latest_symlink(prev_pending)
             setattr(self, "_last_pending_checkpoint_dir", None)
-            if is_dist_initialized:
-                _dist_barrier(process_group)
 
         if prev_best_pending is not None:
             if is_rank_0 and prev_best_pending.get("val") is not None:
@@ -458,8 +456,6 @@ class BaseRecipe:
                     prev_best_pending.get("metric_key"),
                 )
             setattr(self, "_last_pending_best_checkpoint_info", None)
-            if is_dist_initialized:
-                _dist_barrier(process_group)
 
         if is_rank_0:
             self._prune_old_checkpoints()
