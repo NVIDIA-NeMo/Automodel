@@ -871,7 +871,7 @@ class Checkpointer:
             t0 = time.monotonic()
             _ru0 = resource.getrusage(resource.RUSAGE_SELF)  # PROBE
             _log_mem("start")  # PROBE
-            if os.environ.get("AM_CKPT_PREFETCH", "1") == "1":  # PROBE
+            if os.environ.get("AM_CKPT_PREFETCH", "0") == "1":  # PROBE
                 _shards = _ckpt_shard_files(model_path)
                 _t_pf0 = time.monotonic()
                 _pf_bytes = _warm_page_cache(_shards)
