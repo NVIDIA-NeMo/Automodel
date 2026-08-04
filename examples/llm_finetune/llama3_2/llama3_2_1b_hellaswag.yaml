@@ -98,6 +98,13 @@ ci:
     source_load_kl_threshold: 5e-3
     source_load_cosine_threshold: 0.9995
     model.pretrained_model_name_or_path: meta-llama/Llama-3.2-3B-Instruct
+    # Exercise HF-native non-reentrant activation checkpointing together with
+    # explicit FSDP2 prefetch during train, save/load, and resume validation.
+    model.force_hf: true
+    distributed.activation_checkpointing: true
+    distributed.enable_fsdp2_prefetch: true
+    distributed.fsdp2_forward_prefetch_depth: 1
+    distributed.fsdp2_backward_prefetch_depth: 2
     tokenizer_name: meta-llama/Llama-3.2-3B-Instruct
     cross_tp_size: 2
     cross_tp_kl_threshold: 5e-3
