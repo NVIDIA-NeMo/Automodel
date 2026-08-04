@@ -211,34 +211,39 @@ def _route_kv_grads_to_owners(
     cp_rank: int,
     cp_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Sum each KV owner's dK/dV from every rank whose queries attended it.
+    """Sum each KV owner's dK/dV across every rank that attended it; return the local shard.
 
-    In the ring forward, rank ``r``'s queries attend the chunks owned by ranks
-    ``r, r-1, ..., 0``, so backward produces a dK/dV contribution for each of those
-    owners on rank ``r``. This sends each owner's contribution back to that owner
-    (p2p) and sums them, returning the local rank's accumulated ``(grad_key,
-    grad_value)``. Shared by the Flex and FFPA-varlen ring backward passes.
+    Summing per owner and giving owner ``i`` its slice is a reduce-scatter. It must not be
+    hand-rolled from p2p: that sends to ``cp_rank - distance`` for ``distance 1..cp_size-1``,
+    and NCCL connections are directional, so every peer/direction it uses is one the forward
+    ring (send ``cp_rank + 1``, recv ``cp_rank - 1``) never opened -- including distance 1,
+    which reverses the ring. NCCL allocates those connection buffers lazily on first use,
+    ~0.4 GiB each, outside the caching allocator and at the backward memory peak, and dies
+    with ``Cuda failure 2 'out of memory'``.
+
+    Args:
+        grad_key_by_owner: Per-owner dK of shape ``[batch, kv_heads, seq_local, head_dim]``,
+            keyed by CP rank; must cover every owner in ``range(cp_size)``.
+        grad_value_by_owner: Per-owner dV, same shapes and keys as ``grad_key_by_owner``.
+        cp_group: Context-parallel process group.
+        cp_rank: This rank's index within ``cp_group``.
+        cp_size: Size of ``cp_group``.
+
+    Returns:
+        ``(grad_key, grad_value)`` for the local KV shard, each of shape
+        ``[batch, kv_heads, seq_local, head_dim]``, summed across all CP ranks.
     """
-    grad_key = grad_key_by_owner[cp_rank].contiguous()
-    grad_value = grad_value_by_owner[cp_rank].contiguous()
-    for distance in range(1, cp_size):
-        send_owner = (cp_rank - distance) % cp_size
-        recv_query_rank = (cp_rank + distance) % cp_size
-        recv_grad_key = torch.empty_like(grad_key)
-        recv_grad_value = torch.empty_like(grad_value)
-        _direct_exchange(
-            [
-                (grad_key_by_owner[send_owner], recv_grad_key),
-                (grad_value_by_owner[send_owner], recv_grad_value),
-            ],
-            cp_group=cp_group,
-            cp_rank=cp_rank,
-            send_cp_rank=send_owner,
-            recv_cp_rank=recv_query_rank,
-        )
-        grad_key = grad_key + recv_grad_key
-        grad_value = grad_value + recv_grad_value
-    return grad_key, grad_value
+
+    def _reduce_scatter(grad_by_owner: dict[int, torch.Tensor]) -> torch.Tensor:
+        # cat (not stack) on dim 0: the collective splits dim 0 and requires
+        # output.shape[0] * cp_size == input.shape[0], which [cp_size, batch, ...] would
+        # satisfy only when batch == 1.
+        owner_major = torch.cat([grad_by_owner[owner] for owner in range(cp_size)], dim=0).contiguous()
+        out = torch.empty_like(grad_by_owner[cp_rank])
+        torch.distributed.reduce_scatter_tensor(out, owner_major, group=cp_group)
+        return out
+
+    return _reduce_scatter(grad_key_by_owner), _reduce_scatter(grad_value_by_owner)
 
 
 def _merge_flex_chunk(
