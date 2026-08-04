@@ -3,19 +3,21 @@ title: "Hub Kernels (Hugging Face kernels)"
 description: "Use Hugging Face Hub kernels for flash attention and layer replacements without compiling flash-attn"
 position: 5
 ---
-NeMo AutoModel can load optimized kernels from the Hugging Face Hub through the
-[`kernels`](https://huggingface.co/docs/kernels) package and
-[`kernels-community`](https://huggingface.co/kernels-community) repos. This avoids
-compiling `flash-attn` from source for many Hugging Face model paths.
-
-Two independent knobs control Hub usage:
+NeMo AutoModel forwards Hugging Face Transformers' Hub kernel APIs through
+`NeMoAutoModel*.from_pretrained` / `from_config`. The same knobs work as in
+Transformers ([Loading kernels](https://huggingface.co/docs/transformers/en/kernel_doc/loading_kernels)):
 
 | Setting | What it changes |
 |---------|-----------------|
 | `attn_implementation: kernels-community/flash-attn2` | Attention only |
 | `use_kernels: true` | Non-attention layers (RMSNorm, MLP, Linear, activations, RoPE, fused CE, …) |
+| `kernel_config` | Optional per-op Hub mapping (enables `use_kernels`) |
+| `allow_all_kernels: true` | Allow Hub repos outside the trusted `kernels-community` org |
 
 You do **not** need `use_kernels` when you only want Hub flash attention.
+
+Requires the [`kernels`](https://huggingface.co/docs/kernels) package
+(`kernels>=0.11.0`, matching Transformers).
 
 ## Install
 
@@ -25,8 +27,8 @@ uv sync --extra hub_kernels
 uv pip install "nemo-automodel[hub_kernels]"
 ```
 
-See [Install NeMo AutoModel](/get-started/installation) for the full extras table.
-The `hub_kernels` extra installs `kernels>=0.11.0`. It is not part of `[all]`.
+See [Install NeMo AutoModel](/get-started/installation). The `hub_kernels` extra
+is not part of `[all]`.
 
 ## Attention only
 
@@ -37,29 +39,53 @@ model:
   attn_implementation: kernels-community/flash-attn2
 ```
 
-Equivalents:
+Also supported (same as Transformers):
 
-- `attn_implementation: flash_attention_2` — uses pip `flash-attn` when installed,
-  otherwise falls back to Hub FA2 when `kernels` is available.
-- `attn_implementation: kernels-community/flash-attn3` — Hopper FA3 Hub build.
+- `flash_attention_2` / `flash_attention_3` / `flash_attention_4` — pip `flash-attn`
+  when installed, otherwise Hub FA2/3/4 when `kernels` is available.
+- Version pins: `kernels-community/flash-attn2@v2.1.0` or
+  `kernels-community/flash-attn2@>=2.0,<3.0`.
+- Non-`kernels-community` attention repos need `allow_all_kernels: true`.
 
 Example recipe: [`examples/llm_finetune/qwen/qwen2_5_7b_squad_hub_kernels.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen2_5_7b_squad_hub_kernels.yaml).
 
-## Attention plus Hub layer kernels
+## Layer kernels (`use_kernels`)
 
 ```yaml
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: Qwen/Qwen2.5-7B
-  attn_implementation: kernels-community/flash-attn2
   use_kernels: true
-  # optional; AutoModel disables pip Liger automatically when use_kernels is true
+  # AutoModel skips pip Liger when use_kernels is true
   use_liger_kernel: false
 ```
 
-`use_kernels: true` forwards to Transformers' Hub `kernelize` path (for example
-`kernels-community/liger-kernels`). Pip `liger_kernel` patching is skipped so the
-two do not fight.
+Defaults come from Transformers' device-aware Hub map (CUDA uses
+`kernels-community/liger-kernels` for RMSNorm / MLP / Linear / loss, plus
+activation and rotary repos). Override with `kernel_config`:
+
+```yaml
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: Qwen/Qwen2.5-7B
+  use_kernels: true
+  use_liger_kernel: false
+  kernel_config:
+    _target_: transformers.KernelConfig
+    kernel_mapping:
+      RMSNorm: kernels-community/rmsnorm
+```
+
+Combine with Hub attention when you want both:
+
+```yaml
+  attn_implementation: kernels-community/flash-attn2
+  use_kernels: true
+  use_liger_kernel: false
+```
+
+Hub kernels follow `model.train()` / `model.eval()` (training vs inference
+variants). AutoModel training recipes keep the model in train mode.
 
 Benchmark configs:
 
@@ -75,7 +101,6 @@ paths, set:
 model:
   backend:
     attn: hub
-    # optional repo override; default is kernels-community/flash-attn2 when attn is hub
     hub_kernels:
       attn_repo: kernels-community/flash-attn2
 ```
@@ -87,7 +112,8 @@ Layer replacements for custom models still use top-level `use_kernels: true`.
 | Goal | Recommended settings |
 |------|----------------------|
 | Avoid compiling `flash-attn` | `hub_kernels` extra + Hub `attn_implementation` |
-| Match Transformers Hub layer kernels | `use_kernels: true` |
+| Match Transformers default Hub layers | `use_kernels: true` |
+| Pin or remap individual ops | `kernel_config` + `use_kernels: true` |
 | TE / DeepEP / TileLang / QuACK | Keep existing `backend:` fields; do not mix TE attention with Hub FA |
 | EAGLE ring attention / some VLMs | Still need pip `flash-attn` (direct imports) |
 
@@ -99,4 +125,5 @@ Layer replacements for custom models still use top-level `use_kernels: true`.
 - Scoped CUDA graphs (`backend.cuda_graph`) require `attn: te`, not `hub`.
 
 For offline or reproducible deploys, pin kernels with `kernels lock` and
-`kernels download` as described in the [Hugging Face kernels docs](https://huggingface.co/docs/kernels).
+`kernels download` as described in the [Hugging Face kernels docs](https://huggingface.co/docs/kernels)
+and [Transformers loading guide](https://huggingface.co/docs/transformers/en/kernel_doc/loading_kernels).

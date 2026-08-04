@@ -201,6 +201,7 @@ model:
 
 `attn_implementation` and `use_kernels` are independent. A Hub repo id selects
 attention only; `use_kernels` replaces norms / MLP / linear via Transformers
-`kernelize`. Install with `uv sync --extra hub_kernels`. Full details:
-[Hub Kernels](/development/hub-kernels).
+`kernelize`. Non-`kernels-community` attention repos also need
+`allow_all_kernels: true`. Install with `uv sync --extra hub_kernels`. Full
+details: [Hub Kernels](/development/hub-kernels).
 

@@ -429,6 +429,13 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
 
         hub_kernels_cfg = extract_hub_kernels_config(kwargs)
         attn_implementation = resolve_attn_implementation(attn_implementation, hub_kernels=hub_kernels_cfg)
+        # Transformers uses allow_all_kernels for non-kernels-community attn repos as well as
+        # use_kernels layer maps — forward independently of use_kernels.
+        if allow_all_kernels:
+            kwargs["allow_all_kernels"] = True
+        if kernel_config is not None:
+            kwargs["kernel_config"] = kernel_config
+            use_kernels = True
         if use_kernels:
             if use_liger_kernel:
                 logger.info(
@@ -437,10 +444,6 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 )
             use_liger_kernel = False
             kwargs["use_kernels"] = True
-            if allow_all_kernels:
-                kwargs["allow_all_kernels"] = True
-            if kernel_config is not None:
-                kwargs["kernel_config"] = kernel_config
         if is_hub_attn_implementation(attn_implementation):
             logger.info("Using Hub attention implementation %r", attn_implementation)
 
@@ -721,9 +724,11 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 ``kernelize`` to non-attention layers (RMSNorm, MLP, Linear, etc.).
                 Independent of ``attn_implementation``. Requires the ``hub_kernels``
                 extra. Set ``use_liger_kernel=False`` when enabled.
-            allow_all_kernels (bool, default=False): If `True`, allow any Hub
-                kernel repo when ``use_kernels=True``.
-            kernel_config: Optional Transformers ``KernelConfig`` for
+            allow_all_kernels (bool, default=False): If `True`, allow Hub kernel
+                repos outside ``kernels-community`` (Transformers
+                ``allow_all_kernels``). Required for non-trusted attention repos
+                and optional for custom ``kernel_config`` mappings.
+            kernel_config: Optional Transformers ``KernelConfig`` (or mapping) for
                 ``use_kernels=True``. Enables ``use_kernels`` when set.
             use_sdpa_patching (bool, default=True): If `True`, patch the
                 model with SDPA-based attention optimizations.
@@ -1169,8 +1174,9 @@ class _NeMoAutoModelForRetrievalBase:
                 Ignored when ``use_kernels=True``.
             use_kernels: If ``True``, apply Transformers Hub ``kernelize`` to
                 non-attention layers. Independent of ``attn_implementation``.
-            allow_all_kernels: If ``True``, allow any Hub kernel repo when
-                ``use_kernels=True``.
+            allow_all_kernels: If ``True``, allow Hub kernel repos outside
+                ``kernels-community`` (needed for non-trusted attention repos;
+                also applies to custom ``kernel_config`` mappings).
             kernel_config: Optional Transformers ``KernelConfig`` for
                 ``use_kernels=True``. Enables ``use_kernels`` when set.
             use_sdpa_patching: Whether to apply SDPA patching.
