@@ -131,8 +131,13 @@ These call `flash_attn` APIs directly and would **not** benefit from transformer
 |---|---|
 | `components/distributed/blockdiag_cp/kernels.py` | `get_flash_attn_varlen_func()` (Hub-aware) |
 | `components/speculative/eagle/ring_attention.py` | Private `_flash_attn_forward/_backward` (pinned to FA 2.8.x ABI) |
+| `components/speculative/eagle/draft_llama.py` | `flash_attn_func` / `flash_attn_varlen_func` |
 | `components/models/kimivl/model.py` | `flash_attn_varlen_func` |
+| `components/models/kimi_k25_vl/model.py` | `flash_attn_varlen_func` |
+| `components/models/kimi_k3/vision.py` | `flash_attn_varlen_func` (new in upstream) |
 | `components/models/bagel/modeling_qwen2_packed.py` | `flash_attn_varlen_func` for packed inference |
+| `components/models/bagel/modeling_siglip_navit.py` | `flash_attn_varlen_func` |
+| `components/models/llava_onevision/rice_vit.py` | `flash_attn_varlen_func` |
 
 ### 4. Dependencies (`pyproject.toml`)
 
@@ -173,9 +178,12 @@ Implemented on this branch: Hub-aware `kernel_patches`; `use_kernels` passthroug
 
 Remaining gaps:
 
-1. KimiVL / BAGEL / EAGLE ring attention still import pip `flash_attn` directly.
+1. Several models still import pip `flash_attn` directly (KimiVL, Kimi K2.5/K3 vision,
+   BAGEL, LLaVA-OneVision Rice ViT, EAGLE draft/ring attention).
 2. Native models need `backend.attn: hub`; HF `attn_implementation` does not apply there.
 3. TE and Hub FA remain mutually exclusive (TE pins compiled `flash-attn`).
+4. Scoped partial CUDA graphs (`backend.cuda_graph`) require `attn="te"`; incompatible
+   with `attn="hub"`.
 
 ---
 
@@ -370,9 +378,11 @@ kernels download
 
 | File | Change |
 |---|---|
-| `blockdiag_cp/kernels.py` | Load `flash_attn_varlen_func` via `hub.py` |
-| `kimivl/model.py`, `bagel/modeling_qwen2_packed.py` | Same |
-| `ring_attention.py` | **High risk** — evaluate Hub FA2 private API compatibility; may keep pip pin for EAGLE |
+| `blockdiag_cp/kernels.py` | Done — `get_flash_attn_varlen_func()` |
+| `kimivl/model.py`, `kimi_k25_vl/model.py`, `kimi_k3/vision.py` | Same helper |
+| `bagel/modeling_qwen2_packed.py`, `bagel/modeling_siglip_navit.py` | Same helper |
+| `llava_onevision/rice_vit.py` | Same helper |
+| `eagle/draft_llama.py`, `eagle/ring_attention.py` | **High risk** — private FA ABI; may keep pip pin |
 
 ### Phase 3 — Liger consolidation (medium PR)
 
