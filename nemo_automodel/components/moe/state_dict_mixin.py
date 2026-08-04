@@ -183,16 +183,15 @@ class MoESplitExpertsStateDictMixin:
         """Split grouped expert weights into per-expert tensors.
 
         Args:
-            weight: Tensor of shape [experts, ...], with arbitrary trailing dimensions. An EP DTensor must shard
-                the experts axis over an ``ep`` mesh dimension. A non-EP DTensor may use any FSDP placement on a
-                mesh without an ``ep`` dimension.
+            weight: Tensor of shape [experts, ...], with arbitrary trailing dimensions. An EP DTensor uses an
+                ``ep`` mesh dimension. A non-EP DTensor may use any FSDP placement on a mesh without ``ep``.
             n_experts: Global number of experts in ``weight``.
 
         Returns:
-            List of ``n_experts`` tensors of shape [...], except on an EP rank where the list contains only that
-            rank's local experts. Non-EP DTensor outputs preserve the input mesh and adjusted placements.
+            Per-expert tensors of shape [...]. A DTensor sharded on the expert axis returns only the experts local
+            to this rank; other DTensors return every expert and preserve adjusted placements.
         """
-        if is_dtensor(weight) and "ep" in weight.device_mesh.mesh_dim_names:
+        if is_dtensor(weight):
             split_weights, expert_ids = split_experts_weights_dtensor_aware(weight, n_experts)
             self._last_expert_ids = expert_ids
             return split_weights

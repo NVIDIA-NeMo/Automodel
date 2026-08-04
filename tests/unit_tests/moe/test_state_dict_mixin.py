@@ -53,36 +53,44 @@ class MockMoEStateDictMixin(MoESplitExpertsStateDictMixin):
 
 
 def _run_ep_free_dtensor_split(rank: int, world_size: int, init_file: str) -> None:
-    """Verify non-EP DTensors retain every global expert under FSDP-style sharding."""
+    """Verify non-EP DTensors split without collecting full expert weights."""
     dist.init_process_group("gloo", init_method=f"file://{init_file}", rank=rank, world_size=world_size)
     try:
         mesh = DeviceMesh("cpu", torch.arange(world_size), mesh_dim_names=("dp_shard_cp",))
         full_weight = torch.arange(4 * 6 * 4, dtype=torch.float32).reshape(4, 6, 4)
         mixin = MockMoEStateDictMixin(n_experts=4, inter_dim=2)
 
-        for shard_dim in (0, 1):
-            weight = distribute_tensor(full_weight, mesh, [Shard(shard_dim)])
+        expert_sharded_weight = distribute_tensor(full_weight, mesh, [Shard(0)])
+        splits = mixin._split_experts_weights(expert_sharded_weight, 4)
 
-            splits = mixin._split_experts_weights(weight, 4)
+        local_expert_ids = [rank * 2, rank * 2 + 1]
+        assert mixin._last_expert_ids == local_expert_ids
+        assert len(splits) == 2
+        for expert_id, expert_weight in zip(local_expert_ids, splits):
+            assert not hasattr(expert_weight, "placements")
+            torch.testing.assert_close(expert_weight, full_weight[expert_id])
 
-            assert mixin._last_expert_ids == [0, 1, 2, 3]
-            assert len(splits) == 4
-            for expert_id, expert_weight in enumerate(splits):
-                torch.testing.assert_close(expert_weight.full_tensor(), full_weight[expert_id])
+        inner_sharded_weight = distribute_tensor(full_weight, mesh, [Shard(1)])
+        splits = mixin._split_experts_weights(inner_sharded_weight, 4)
 
-        weight = distribute_tensor(full_weight, mesh, [Shard(0)])
+        assert mixin._last_expert_ids == [0, 1, 2, 3]
+        assert len(splits) == 4
+        for expert_id, expert_weight in enumerate(splits):
+            assert expert_weight.placements == (Shard(0),)
+            torch.testing.assert_close(expert_weight.full_tensor(), full_weight[expert_id])
+
         converted = dict(
             mixin._convert_single_merged_expert_to_hf_split_experts(
                 "model.layers.0.mlp.experts.gate_and_up_projs",
-                weight,
+                expert_sharded_weight,
             )
         )
-        assert len(converted) == 8
-        for expert_id in range(4):
+        assert len(converted) == 4
+        for expert_id in local_expert_ids:
             gate_key = f"model.layers.0.mlp.experts.{expert_id}.gate_proj.weight"
             up_key = f"model.layers.0.mlp.experts.{expert_id}.up_proj.weight"
-            torch.testing.assert_close(converted[gate_key].full_tensor(), full_weight[expert_id, :, :2].T)
-            torch.testing.assert_close(converted[up_key].full_tensor(), full_weight[expert_id, :, 2:].T)
+            torch.testing.assert_close(converted[gate_key], full_weight[expert_id, :, :2].T)
+            torch.testing.assert_close(converted[up_key], full_weight[expert_id, :, 2:].T)
     finally:
         dist.destroy_process_group()
 
@@ -231,7 +239,7 @@ class TestSplitExpertsWeights:
         assert mixin._last_expert_ids == [2, 3]
         mock_split_dtensor.assert_called_once_with(mock_weight, 8)
 
-    def test_dtensor_without_ep_mesh_splits_all_experts(self, tmp_path):
+    def test_dtensor_without_ep_mesh_avoids_collecting_experts(self, tmp_path):
         torch.multiprocessing.spawn(
             _run_ep_free_dtensor_split,
             args=(2, str(tmp_path / "ep_free_dtensor_split")),
