@@ -49,7 +49,7 @@ distributed:
     layers_per_stage: 2
 
   moe:
-    ignore_router_for_ac: false
+    ignore_router_for_ac: true
     reshard_after_forward: false
     wrap_outer_model: false
 
