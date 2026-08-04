@@ -116,7 +116,7 @@ overrides = [
 
 [[manifest.dependency-metadata]]
 name = "deep-ep"
-version = "1.2.1+d45b7f7"
+version = "1.2.1+1714cb2"
 requires-dist = ["torch", "packaging", "ninja"]
 
 [[manifest.dependency-metadata]]
@@ -1661,8 +1661,8 @@ wheels = [
 
 [[package]]
 name = "deep-ep"
-version = "1.2.1+d45b7f7"
-source = { git = "https://github.com/akoumpa/DeepEP.git?rev=automodel_r0.6.0#d45b7f7a06024c2340ca56693acd2700de2072ce" }
+version = "1.2.1+1714cb2"
+source = { git = "https://github.com/akoumpa/DeepEP.git?rev=automodel_r0.6.0-pr673-upstream#1714cb2f1d47a599fd002a466dc9dabe4be1b066" }
 dependencies = [
     { name = "ninja" },
     { name = "packaging" },
@@ -4367,7 +4367,7 @@ linting = [
     { name = "ty", specifier = ">=0.0.20" },
 ]
 magi = [{ name = "magi-attention", git = "https://github.com/SandAI-org/MagiAttention.git?rev=d7ea8afd44c790b65fab68a04a6a0fdd5adbf182" }]
-moe-hybridep = [{ name = "deep-ep", git = "https://github.com/akoumpa/DeepEP.git?rev=automodel_r0.6.0" }]
+moe-hybridep = [{ name = "deep-ep", git = "https://github.com/akoumpa/DeepEP.git?rev=automodel_r0.6.0-pr673-upstream" }]
 test = [
     { name = "coverage" },
     { name = "onnxruntime-gpu", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'", index = "https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-13/pypi/simple/" },

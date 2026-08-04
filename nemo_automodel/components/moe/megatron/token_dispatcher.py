@@ -321,35 +321,23 @@ class _DeepepManager(_DispatchManager):
 
 
 class _HybridEPMetadataProcessor(nn.Module):
-    """Fixed-shape conversion from top-k metadata to HybridEP metadata."""
+    """Graphable expansion of top-k probabilities for HybridEP dispatch."""
 
     def __init__(self, *, num_experts: int, permute_fusion: bool):
         super().__init__()
         self.num_experts = num_experts
         self.permute_fusion = permute_fusion
 
-    def forward(self, token_indices: torch.Tensor, token_probs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Convert compact top-k indices and probabilities to multihot tensors."""
-        if self.permute_fusion:
-            return fused_indices_to_multihot(token_indices, token_probs, self.num_experts)
-
-        batch_size = token_indices.shape[0]
-        routing_map = torch.zeros(
-            (batch_size, self.num_experts),
-            dtype=torch.bool,
-            device=token_indices.device,
-        )
-        multihot_probs = torch.zeros(
-            (batch_size, self.num_experts),
+    def forward(self, token_indices: torch.Tensor, token_probs: torch.Tensor) -> torch.Tensor:
+        """Expand top-k probabilities without materializing a dense routing map."""
+        valid = token_indices != -1
+        safe_indices = token_indices.masked_fill(~valid, 0).long()
+        safe_probs = torch.where(valid, token_probs, torch.zeros_like(token_probs)).float()
+        return torch.zeros(
+            (token_indices.shape[0], self.num_experts),
             dtype=torch.float,
             device=token_indices.device,
-        )
-        mask = token_indices != -1
-        valid_indices = token_indices[mask]
-        row_indices = torch.arange(batch_size, device=token_indices.device).repeat_interleave(mask.sum(dim=1))
-        routing_map[row_indices, valid_indices] = True
-        multihot_probs[row_indices, valid_indices] = token_probs[mask]
-        return routing_map, multihot_probs
+        ).scatter_add(1, safe_indices, safe_probs)
 
 
 class _HybridEPManager(_DispatchManager):
@@ -394,6 +382,7 @@ class _HybridEPManager(_DispatchManager):
 
         # Metadata
         self.token_probs: torch.Tensor | None = None
+        self.token_indices: torch.Tensor | None = None
         self.routing_map: torch.Tensor | None = None
         # Handle used for combine operation
         self.handle = None
@@ -408,6 +397,7 @@ class _HybridEPManager(_DispatchManager):
     def setup_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor):
         """Process routing map and probabilities to prepare dispatch metadata."""
         num_tokens = routing_map.shape[0]
+        self.token_indices = None
         self.routing_map = routing_map.reshape(num_tokens, self.num_experts)
         self.token_probs = probs.reshape(num_tokens, self.num_experts)
 
@@ -435,6 +425,7 @@ class _HybridEPManager(_DispatchManager):
 
     def setup_metadata_from_indices(self, token_indices: torch.Tensor, token_probs: torch.Tensor):
         """Convert from topk indices format to multihot routing_map format."""
+        self.token_indices = None
         if self.permute_fusion:
             self.routing_map, self.token_probs = fused_indices_to_multihot(token_indices, token_probs, self.num_experts)
         else:
@@ -446,7 +437,7 @@ class _HybridEPManager(_DispatchManager):
         async_finish: bool = True,  # noqa: ARG002 - not supported by HybridEP backend
         allocate_on_comm_stream: bool = True,  # noqa: ARG002 - not supported by HybridEP backend
     ) -> torch.Tensor:
-        """Dispatch ``hidden_states[T, H]`` using the dense HybridEP routing map."""
+        """Dispatch ``hidden_states[T, H]`` using compact top-k metadata when available."""
         # Reset num_permuted_tokens to None to avoid reusing cached state from a prior dispatch.
         # This can happen in non-reentrant activation checkpointing mode.
         self.num_permuted_tokens = None
@@ -454,8 +445,10 @@ class _HybridEPManager(_DispatchManager):
             self.token_probs = self.token_probs.float()
         dispatched_hidden, self.dispatched_probs, _, tokens_per_expert, self.handle = hybrid_ep_dispatch(
             x=hidden_states,
+            topk_idx=self.token_indices,
             routing_map=self.routing_map,
             probs=self.token_probs,
+            num_experts=self.num_experts,
             group=self.group,
             num_local_experts=self.num_local_experts,
             num_sms_dispatch_api=self.moe_hybridep_num_sms,
@@ -709,18 +702,20 @@ class MoEFlexTokenDispatcher:
         token_probs: torch.Tensor,
         token_indices: torch.Tensor,
     ):
-        """Prepare ``hidden_states[..., H]`` and routing metadata for dispatch.
+        """Prepare ``hidden_states[..., H]`` and compact routing metadata for dispatch.
 
         DeepEP consumes ``token_indices[T, K]`` and ``token_probs[T, K]`` directly. HybridEP
-        expands both into its established multihot ``[T, E]`` representation.
+        keeps compact indices for metadata communication and expands probabilities to ``[T, E]``
+        so the existing dense router-gradient layout is preserved.
         """
         self.hidden_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, self.hidden_shape[-1])
 
         if isinstance(self._comm_manager, _HybridEPManager):
             assert self.hybridep_metadata_processor is not None
-            routing_map, multihot_probs = self.hybridep_metadata_processor(token_indices, token_probs)
-            self._comm_manager.routing_map = routing_map
+            multihot_probs = self.hybridep_metadata_processor(token_indices, token_probs)
+            self._comm_manager.token_indices = token_indices
+            self._comm_manager.routing_map = None
             self._comm_manager.token_probs = multihot_probs
         else:
             self._comm_manager.token_probs = token_probs
