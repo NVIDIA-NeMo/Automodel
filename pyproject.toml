@@ -209,7 +209,7 @@ am = "nemo_automodel.cli.app:main"
 build = ["setuptools", "torch<=2.10.0", "packaging", "psutil"]
 moe-hybridep = [
     # Plain pip: python -m pip install -e ".[moe]" --group moe-hybridep
-    "deep_ep @ git+https://github.com/akoumpa/DeepEP.git@automodel_r0.6.0",
+    "deep_ep @ git+https://github.com/akoumpa/DeepEP.git@automodel_r0.6.0-pr673",
 ]
 docs = [
     "sphinx",
@@ -363,7 +363,7 @@ nv_grouped_gemm = ["setuptools"]
 [[tool.uv.dependency-metadata]]
 name = "deep_ep"
 # This version has to match the version in the commit/rev/tag used
-version = "v1.2.1+d45b7f7"
+version = "v1.2.1+7e880e1"
 requires-dist = ["torch", "packaging", "ninja"]
 
 [[tool.uv.dependency-metadata]]
