@@ -180,11 +180,19 @@ class MoESplitExpertsStateDictMixin:
             )
 
     def _split_experts_weights(self, weight: torch.Tensor, n_experts: int) -> list[torch.Tensor]:
-        """Split grouped expert weights into individual expert weights.
-        For grouped expert weights with shape [n_experts, ...], split into n_experts tensors each with shape [...].
-        Supports both regular tensors and DTensors.
+        """Split grouped expert weights into per-expert tensors.
+
+        Args:
+            weight: Tensor of shape [experts, ...], with arbitrary trailing dimensions. An EP DTensor must shard
+                the experts axis over an ``ep`` mesh dimension. A non-EP DTensor may use any FSDP placement on a
+                mesh without an ``ep`` dimension.
+            n_experts: Global number of experts in ``weight``.
+
+        Returns:
+            List of ``n_experts`` tensors of shape [...], except on an EP rank where the list contains only that
+            rank's local experts. Non-EP DTensor outputs preserve the input mesh and adjusted placements.
         """
-        if is_dtensor(weight):
+        if is_dtensor(weight) and "ep" in weight.device_mesh.mesh_dim_names:
             split_weights, expert_ids = split_experts_weights_dtensor_aware(weight, n_experts)
             self._last_expert_ids = expert_ids
             return split_weights

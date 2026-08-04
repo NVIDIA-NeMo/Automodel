@@ -16,6 +16,9 @@ from unittest.mock import Mock, patch
 
 import pytest
 import torch
+import torch.distributed as dist
+from torch.distributed._tensor import Shard, distribute_tensor
+from torch.distributed.device_mesh import DeviceMesh
 
 skip_if_no_gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for GPU operations")
 
@@ -47,6 +50,41 @@ class MockMoEStateDictMixin(MoESplitExpertsStateDictMixin):
         self.dtype = dtype
         self._uses_model_prefix = uses_model_prefix
         self._last_expert_ids = []
+
+
+def _run_ep_free_dtensor_split(rank: int, world_size: int, init_file: str) -> None:
+    """Verify non-EP DTensors retain every global expert under FSDP-style sharding."""
+    dist.init_process_group("gloo", init_method=f"file://{init_file}", rank=rank, world_size=world_size)
+    try:
+        mesh = DeviceMesh("cpu", torch.arange(world_size), mesh_dim_names=("dp_shard_cp",))
+        full_weight = torch.arange(4 * 6 * 4, dtype=torch.float32).reshape(4, 6, 4)
+        mixin = MockMoEStateDictMixin(n_experts=4, inter_dim=2)
+
+        for shard_dim in (0, 1):
+            weight = distribute_tensor(full_weight, mesh, [Shard(shard_dim)])
+
+            splits = mixin._split_experts_weights(weight, 4)
+
+            assert mixin._last_expert_ids == [0, 1, 2, 3]
+            assert len(splits) == 4
+            for expert_id, expert_weight in enumerate(splits):
+                torch.testing.assert_close(expert_weight.full_tensor(), full_weight[expert_id])
+
+        weight = distribute_tensor(full_weight, mesh, [Shard(0)])
+        converted = dict(
+            mixin._convert_single_merged_expert_to_hf_split_experts(
+                "model.layers.0.mlp.experts.gate_and_up_projs",
+                weight,
+            )
+        )
+        assert len(converted) == 8
+        for expert_id in range(4):
+            gate_key = f"model.layers.0.mlp.experts.{expert_id}.gate_proj.weight"
+            up_key = f"model.layers.0.mlp.experts.{expert_id}.up_proj.weight"
+            torch.testing.assert_close(converted[gate_key].full_tensor(), full_weight[expert_id, :, :2].T)
+            torch.testing.assert_close(converted[up_key].full_tensor(), full_weight[expert_id, :, 2:].T)
+    finally:
+        dist.destroy_process_group()
 
 
 class TestValidateExpertAvailability:
@@ -185,12 +223,21 @@ class TestSplitExpertsWeights:
 
         mixin = MockMoEStateDictMixin()
         mock_weight = Mock()
+        mock_weight.device_mesh.mesh_dim_names = ("ep",)
 
         result = mixin._split_experts_weights(mock_weight, 8)
 
         assert len(result) == 2
         assert mixin._last_expert_ids == [2, 3]
         mock_split_dtensor.assert_called_once_with(mock_weight, 8)
+
+    def test_dtensor_without_ep_mesh_splits_all_experts(self, tmp_path):
+        torch.multiprocessing.spawn(
+            _run_ep_free_dtensor_split,
+            args=(2, str(tmp_path / "ep_free_dtensor_split")),
+            nprocs=2,
+            join=True,
+        )
 
 
 class TestConcatenateExpertWeights:
