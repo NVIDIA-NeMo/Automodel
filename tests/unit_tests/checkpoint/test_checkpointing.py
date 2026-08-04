@@ -16,6 +16,7 @@ import io
 import json
 import logging
 import os
+import pickle
 import random
 from contextlib import ExitStack
 from datetime import timedelta
@@ -47,6 +48,7 @@ from nemo_automodel.components.checkpoint.checkpointing import (
     SaveConsolidatedMode,
     _divide_keys_by_size,
     _ensure_dirs,
+    _ensure_shared_dirs,
     _equally_divide_layers,
     _is_custom_model,
     _load_hf_bin_checkpoint,
@@ -1258,6 +1260,103 @@ def test_load_model_uses_state_dict_adapter_from_ddp_module(tmp_path):
     checkpointer.load_model(ddp_model, model_path=str(model_path))
 
     torch.testing.assert_close(encoder.model.weight, checkpoint_weight)
+
+
+@pytest.mark.parametrize(("is_init_step", "expected_quantization"), [(True, True), (False, False)])
+def test_load_model_only_requests_quantized_adapter_keys_for_base_checkpoint(
+    tmp_path, is_init_step, expected_quantization
+):
+    """FP8 source metadata is requested for base initialization, not training resume."""
+    model = torch.nn.Linear(2, 2, bias=False)
+    adapter = MagicMock()
+    model_state_dict = model.state_dict()
+    adapter.to_hf.return_value = model_state_dict
+    adapter.from_hf.return_value = model_state_dict
+    model.state_dict_adapter = adapter
+
+    config = CheckpointingConfig(
+        checkpoint_dir=str(tmp_path),
+        model_cache_dir=str(tmp_path / "cache"),
+        model_repo_id="test/model",
+        save_consolidated=False,
+        dequantize_base_checkpoint=True,
+    )
+    with patch("torch.distributed.is_initialized", return_value=False):
+        checkpointer = Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0)
+
+    with (
+        patch("os.path.exists", return_value=True),
+        patch("nemo_automodel.components.checkpoint.checkpointing._is_safetensors_checkpoint", return_value=False),
+        patch("nemo_automodel.components.checkpoint.checkpointing._is_bin_checkpoint", return_value=False),
+        patch.object(checkpointer, "_get_storage_reader", return_value=None),
+        patch.object(checkpointer, "_do_load", return_value=model_state_dict),
+    ):
+        checkpointer.load_model(model, model_path=str(tmp_path / "model"), is_init_step=is_init_step)
+
+    assert adapter.to_hf.call_args.kwargs["quantization"] is expected_quantization
+
+
+def test_training_checkpoint_resume_ignores_base_fp8_metadata(tmp_path):
+    """A dequantized training checkpoint resumes without source-only FP8 scale keys."""
+
+    class QuantizedSourceAdapter:
+        def to_hf(self, state_dict: dict[str, torch.Tensor], **kwargs: object) -> dict[str, torch.Tensor]:
+            """Convert model state while optionally requesting source FP8 metadata.
+
+            Args:
+                state_dict: Mapping whose tensor values have arbitrary model-defined shapes.
+                **kwargs: Adapter options, including whether source quantization metadata is required.
+
+            Returns:
+                Mapping whose tensor values preserve the input tensors' model-defined shapes,
+                plus a scalar source-only activation scale when quantization is requested.
+            """
+            converted = dict(state_dict)
+            if kwargs.get("quantization", False):
+                converted["weight_activation_scale"] = torch.ones(())
+            return converted
+
+        def from_hf(
+            self,
+            state_dict: dict[str, torch.Tensor],
+            device_mesh: object | None = None,
+        ) -> dict[str, torch.Tensor]:
+            """Convert loaded state back to the native model mapping.
+
+            Args:
+                state_dict: Mapping whose tensor values have arbitrary model-defined shapes.
+                device_mesh: Optional mesh describing the tensors' distributed placements.
+
+            Returns:
+                Mapping whose tensor values preserve the input tensors' model-defined shapes.
+            """
+            return {key: value for key, value in state_dict.items() if key != "weight_activation_scale"}
+
+    model = torch.nn.Linear(2, 2, bias=False)
+    model.state_dict_adapter = QuantizedSourceAdapter()
+    expected_weight = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    with torch.no_grad():
+        model.weight.copy_(expected_weight)
+
+    config = CheckpointingConfig(
+        checkpoint_dir=str(tmp_path),
+        model_save_format="torch_save",
+        model_cache_dir=str(tmp_path / "cache"),
+        model_repo_id="test/model",
+        save_consolidated=False,
+        dequantize_base_checkpoint=True,
+    )
+    with patch("torch.distributed.is_initialized", return_value=False):
+        checkpointer = Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0)
+
+    checkpoint_path = tmp_path / "step_1"
+    checkpointer.save_model(model, str(checkpoint_path))
+    with torch.no_grad():
+        model.weight.zero_()
+
+    checkpointer.load_model(model, str(checkpoint_path / "model"))
+
+    torch.testing.assert_close(model.weight, expected_weight)
 
 
 # =============================================================================
@@ -2835,6 +2934,7 @@ def _make_ckptr(is_peft=False, is_async=False):
     ckptr._model_ctx = MagicMock(staging_active=False)
     ckptr._optim_ctx = MagicMock(staging_active=False)
     ckptr.process_group = None
+    ckptr._planner_cache_namespace = "test"
     return ckptr
 
 
@@ -2889,6 +2989,98 @@ class TestEnsureDirs:
         ):
             _ensure_dirs(str(tmp_path), process_group=group)
         barrier.assert_called_once_with(group=group)
+
+    def test_each_rank_creates_node_local_directories(self, tmp_path):
+        """Every rank creates directories that may live on node-local filesystems."""
+        group = object()
+        target = str(tmp_path / "new")
+        with (
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch("torch.distributed.get_rank", return_value=1),
+            patch("os.makedirs") as makedirs,
+            patch("torch.distributed.barrier") as barrier,
+        ):
+            _ensure_dirs(target, process_group=group)
+        makedirs.assert_called_once_with(target, exist_ok=True)
+        barrier.assert_called_once_with(group=group)
+
+    def test_only_group_rank_zero_creates_shared_directories(self, tmp_path):
+        """Nonzero group ranks avoid redundant metadata operations on shared filesystems."""
+        group = object()
+        target = str(tmp_path / "new")
+        with (
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch("torch.distributed.get_rank", return_value=1),
+            patch("os.makedirs") as makedirs,
+            patch("torch.distributed.barrier") as barrier,
+        ):
+            _ensure_shared_dirs(target, process_group=group)
+        makedirs.assert_not_called()
+        barrier.assert_called_once_with(group=group)
+
+
+def test_save_on_dp_ranks_creates_node_local_directory_on_each_writer_rank():
+    """A nonzero distributed rank must create its local directory before writing auxiliary state."""
+    checkpointer = Checkpointer.__new__(Checkpointer)
+    checkpointer.process_group = object()
+    checkpointer.tp_rank = 0
+    checkpointer.pp_rank = 0
+    checkpointer.dp_rank = 1
+    state = SimpleNamespace(state_dict=lambda: {"state": torch.ones(1)})
+
+    with (
+        patch("torch.distributed.is_initialized", return_value=True),
+        patch("os.makedirs") as makedirs,
+        patch("torch.distributed.barrier") as barrier,
+        patch("torch.save") as save,
+    ):
+        checkpointer.save_on_dp_ranks(state, "rng", "/tmp/checkpoint")
+
+    makedirs.assert_called_once_with("/tmp/checkpoint/rng", exist_ok=True)
+    barrier.assert_called_once_with(group=checkpointer.process_group)
+    save.assert_called_once_with({"state": torch.ones(1)}, "/tmp/checkpoint/rng/rng_dp_rank_1.pt")
+
+
+def test_model_and_optimizer_saves_use_separate_plan_caches():
+    """Alternating model and optimizer saves must not evict each other's cached DCP plans."""
+    ckptr = _make_ckptr(is_peft=False, is_async=False)
+    with patch("nemo_automodel.components.checkpoint.checkpointing.dcp.save") as save:
+        Checkpointer._do_save(ckptr, {"weight": torch.ones(1)}, "/opt/models/qwen/step_100/model")
+        Checkpointer._do_save(ckptr, {"state": torch.ones(1)}, "/opt/models/qwen/step_100/optim")
+        Checkpointer._do_save(ckptr, {"weight": torch.ones(1)}, "/opt/models/qwen/step_200/model")
+
+    model_planner = save.call_args_list[0].kwargs["planner"]
+    optimizer_planner = save.call_args_list[1].kwargs["planner"]
+    next_model_planner = save.call_args_list[2].kwargs["planner"]
+    assert type(model_planner) is not type(optimizer_planner)
+    assert model_planner._cached_plans_key != optimizer_planner._cached_plans_key
+    assert model_planner._cached_plans_key == next_model_planner._cached_plans_key
+    assert model_planner._cached_plans_key.encode() in pickle.dumps(model_planner)
+
+
+def test_cross_checkpointer_torch_plan_is_not_reused_for_safetensors(tmp_path):
+    """A torch-save plan from one checkpointer must not leak into a safetensors save from another."""
+    torch_ckpt = CheckpointingConfig(
+        checkpoint_dir=tmp_path / "run_a",
+        model_save_format="torch_save",
+        save_consolidated=False,
+    ).build(0, 0, 0)
+    safe_ckpt = CheckpointingConfig(
+        checkpoint_dir=tmp_path / "run_b",
+        model_save_format="safetensors",
+        save_consolidated=False,
+    ).build(0, 0, 0)
+    model_state = {"weight": torch.ones(4)}
+    torch_model_path = tmp_path / "run_a" / "step_100" / "model"
+    torch_optim_path = tmp_path / "run_a" / "step_100" / "optim"
+    safe_model_path = tmp_path / "run_b" / "step_100" / "model"
+
+    torch_ckpt._do_save(model_state, str(torch_model_path))
+    torch_ckpt._do_save({"state": torch.ones(2)}, str(torch_optim_path))
+    writer = safe_ckpt._get_storage_writer(None, None, None, str(safe_model_path))
+    safe_ckpt._do_save(model_state, str(safe_model_path), writer)
+
+    assert list(safe_model_path.glob("*.safetensors"))
 
 
 class TestSaveConfig:
@@ -3006,6 +3198,7 @@ class TestDoLoad:
         config.is_async = False
         ckptr = MagicMock(spec=Checkpointer)
         ckptr.config = config
+        ckptr._planner_cache_namespace = "test"
         state_dict = {"weight": torch.ones(4)}
         path = "msc://bucket/step-300"
 
@@ -3580,6 +3773,7 @@ class TestSyncAsyncSave:
         ckptr._model_ctx = MagicMock(staging_active=False)
         ckptr._optim_ctx = MagicMock(staging_active=False)
         ckptr.process_group = None
+        ckptr._planner_cache_namespace = "test"
         return ckptr
 
     def test_dcp_cloud_sync_calls_dcp_save(self):

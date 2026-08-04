@@ -2920,8 +2920,8 @@ def test_vlm_setup_applies_prewarm_config(monkeypatch):
     _patch_vlm_setup_minimals(monkeypatch, cp_size=1)
     calls = []
 
-    def _record_apply(self, *, model_parts, device, pp_mesh=None):
-        calls.append((self, model_parts, device, pp_mesh))
+    def _record_apply(self, *, model_parts, device, batch_size, pp_mesh=None):
+        calls.append((self, model_parts, device, batch_size, pp_mesh))
 
     monkeypatch.setattr("nemo_automodel.components.training.prewarm.PrewarmConfig.apply", _record_apply)
 
@@ -2929,10 +2929,11 @@ def test_vlm_setup_applies_prewarm_config(monkeypatch):
     trainer.setup()
 
     assert len(calls) == 1
-    prewarm, model_parts, device, pp_mesh = calls[0]
+    prewarm, model_parts, device, batch_size, pp_mesh = calls[0]
     assert prewarm.comm_groups is True
     assert model_parts == trainer.model_parts
     assert device == torch.device("cpu")
+    assert batch_size == 1
     assert pp_mesh is None
 
 
@@ -3298,6 +3299,37 @@ class TestChunkVlmMedia:
         with stage_vlm_media_for_pp(pp, [model], batch):
             assert torch.equal(model(), first_chunk)
             assert model._vlm_chunk_idx == 1
+
+    @pytest.mark.parametrize("schedule_flag", ["_stage_forward_initialized", "_stages_forward_initialized"])
+    def test_stage_media_does_not_replay_with_static_user_metadata(self, schedule_flag):
+        class MediaConsumer(nn.Module):
+            def forward(self):
+                chunk = self._vlm_pixel_values_chunks[self._vlm_chunk_idx]
+                self._vlm_chunk_idx += 1
+                return chunk
+
+        model = MediaConsumer()
+        schedule = SimpleNamespace(**{schedule_flag: False})
+        stage = SimpleNamespace(
+            is_first=True,
+            _user_meta=SimpleNamespace(inputs=(object(),), outputs=(object(),)),
+        )
+        pp = SimpleNamespace(
+            info=SimpleNamespace(has_first_stage=True, schedule=schedule, stages=[stage]),
+        )
+        first_chunk = torch.tensor([1.0])
+        second_chunk = torch.tensor([2.0, 3.0])
+        batch = {
+            VLM_PP_MEDIA_KEY: {
+                "pixel_values": [first_chunk, second_chunk],
+                "image_grid_hws": [torch.ones(1), torch.ones(2)],
+            }
+        }
+
+        with stage_vlm_media_for_pp(pp, [model], batch):
+            assert torch.equal(model(), first_chunk)
+            assert torch.equal(model(), second_chunk)
+            assert model._vlm_chunk_idx == 2
 
     def test_prepare_flat_patches_without_image_grid(self):
         pixel_values = torch.arange(5 * 2 * 2 * 2 * 3).reshape(5, 2, 2, 2, 3)

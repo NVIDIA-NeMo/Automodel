@@ -20,6 +20,7 @@ import os
 import pickle
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
@@ -357,6 +358,22 @@ class _AsyncSaveContext:
     staging_active: bool = False
 
 
+class _ModelSavePlanner(dcp.DefaultSavePlanner):
+    """Keep model save plans in one checkpointer-scoped cache namespace."""
+
+    def __init__(self, cache_namespace: str) -> None:
+        super().__init__(enable_plan_caching=True)
+        self._cached_plans_key = f"{cache_namespace}:model"
+
+
+class _OptimizerSavePlanner(dcp.DefaultSavePlanner):
+    """Keep optimizer save plans in one checkpointer-scoped cache namespace."""
+
+    def __init__(self, cache_namespace: str) -> None:
+        super().__init__(enable_plan_caching=True)
+        self._cached_plans_key = f"{cache_namespace}:optimizer"
+
+
 def _new_gloo_process_group(
     process_group: torch.distributed.ProcessGroup | None,
     timeout: timedelta | None = None,
@@ -519,6 +536,7 @@ class Checkpointer:
         self.pp_rank = pp_rank
         self.process_group = process_group
         self.lifecycle = CheckpointLifecycle(config=config, process_group=process_group)
+        self._planner_cache_namespace = uuid.uuid4().hex
 
         # async specific variables
         self._model_ctx = _AsyncSaveContext(stager=None, process_group=None, future=None, staging_active=False)
@@ -582,7 +600,7 @@ class Checkpointer:
         should_write_consolidated = _should_write_consolidated_safetensors(self.config, is_final_checkpoint)
         consolidated_dir = os.path.join(model_dir, "consolidated") if should_write_consolidated else None
         hf_metadata_dir = os.path.join(model_dir, ".hf_metadata") if _should_write_hf_metadata(self.config) else None
-        _ensure_dirs(model_dir, consolidated_dir, hf_metadata_dir, process_group=self.process_group)
+        _ensure_shared_dirs(model_dir, consolidated_dir, hf_metadata_dir, process_group=self.process_group)
 
         # Because this call lies outside of the dcp save call, we need to consolidate on all ranks on the main process
         # of all ranks, which lies on the critical path. Therefore, we can only do this outside of async mode.
@@ -710,7 +728,7 @@ class Checkpointer:
                 per-model-part optimizers.
         """
         optimizer_path = os.path.join(weights_path, "optim")
-        _ensure_dirs(optimizer_path, process_group=self.process_group)
+        _ensure_shared_dirs(optimizer_path, process_group=self.process_group)
         optimizer_state = OptimizerState(
             model,
             optimizer,
@@ -913,7 +931,9 @@ class Checkpointer:
         state_dict = _maybe_adapt_state_dict_to_hf(
             model_state.model[0],
             state_dict,
-            quantization=self.config.dequantize_base_checkpoint,
+            # Training checkpoints are saved from the dequantized native model.
+            # Only base-checkpoint initialization needs FP8 scale destinations.
+            quantization=bool(is_init_step and self.config.dequantize_base_checkpoint),
             device_mesh=self.moe_mesh,
         )
 
@@ -1372,7 +1392,7 @@ class Checkpointer:
         DTensor metadata and writes all shards correctly.
         """
         state_dir = os.path.join(path, state_name)
-        _ensure_dirs(state_dir, process_group=self.process_group)
+        _ensure_shared_dirs(state_dir, process_group=self.process_group)
         state_dict = state.state_dict()
         planner = dcp.DefaultSavePlanner(enable_plan_caching=True)
         process_group = getattr(self, "process_group", None)
@@ -1436,8 +1456,8 @@ class Checkpointer:
         Returns:
             The populated state dictionary (may be replaced for PEFT).
         """
-        # Both model and optimizer saving is done in this function
-        is_model = True if "/model" in path else False
+        # Both model and optimizer loading is done in this function.
+        is_model = _is_model_checkpoint_path(path)
         # PEFT loading is broadcasted from rank0 so it is a special case
         if self.config.is_peft and is_model and (not is_init_step):
             state_dict = _load_safetensors(_adapter_path(path))
@@ -1465,8 +1485,8 @@ class Checkpointer:
         Returns:
             Optional Future object if async mode is enabled.
         """
-        # Both model and optimizer saving is done in this function
-        is_model = True if "/model" in path else False
+        # Both model and optimizer saving is done in this function.
+        is_model = _is_model_checkpoint_path(path)
         # PEFT saving is done on rank0 so it is a special case
         if self.config.is_peft and is_model:
             if not torch.distributed.is_initialized() or torch.distributed.get_rank(group=self.process_group) == 0:
@@ -1476,7 +1496,8 @@ class Checkpointer:
             return
 
         ret = None
-        planner = dcp.DefaultSavePlanner(enable_plan_caching=True)
+        planner_cls = _ModelSavePlanner if is_model else _OptimizerSavePlanner
+        planner = planner_cls(self._planner_cache_namespace)
 
         # Routes to MSC storage write for cloud paths
         storage_writer = _maybe_msc_writer(path, storage_writer)
@@ -1941,6 +1962,13 @@ def save_losses(losses: dict[str, Any], weights_path: str) -> None:
         logger.warning("Failed to write checkpoint loss metadata to %s", losses_path, exc_info=True)
 
 
+def _create_dirs(*dirs: Optional[str]) -> None:
+    """Create local directory paths and ignore cloud paths."""
+    for directory in dirs:
+        if directory and not is_cloud_path(directory):
+            os.makedirs(directory, exist_ok=True)
+
+
 def _ensure_dirs(*dirs: Optional[str], process_group: torch.distributed.ProcessGroup | None = None) -> None:
     """
     Create directories on all ranks and synchronize across ranks.
@@ -1949,12 +1977,31 @@ def _ensure_dirs(*dirs: Optional[str], process_group: torch.distributed.ProcessG
         *dirs: One or more directory paths that should exist.
         process_group: Ranks that must observe the directories before continuing.
     """
-    for d in dirs:
-        if d:
-            if not is_cloud_path(d):
-                os.makedirs(d, exist_ok=True)
+    _create_dirs(*dirs)
     if torch.distributed.is_initialized():
         torch.distributed.barrier(group=process_group)
+
+
+def _ensure_shared_dirs(*dirs: Optional[str], process_group: torch.distributed.ProcessGroup | None = None) -> None:
+    """Create shared DCP directories on group rank zero and synchronize the group.
+
+    Unlike auxiliary per-rank state, DCP checkpoint directories must be visible
+    to every rank through the same filesystem.
+
+    Args:
+        *dirs: One or more shared directory paths that should exist.
+        process_group: Ranks that must observe the directories before continuing.
+    """
+    is_dist_initialized = torch.distributed.is_initialized()
+    if not is_dist_initialized or torch.distributed.get_rank(group=process_group) == 0:
+        _create_dirs(*dirs)
+    if is_dist_initialized:
+        torch.distributed.barrier(group=process_group)
+
+
+def _is_model_checkpoint_path(path: str) -> bool:
+    """Return whether a checkpoint path names the model directory."""
+    return Path(path.rstrip("/")).name == "model"
 
 
 def _init_peft_adapters(model: nn.Module, peft_init_method: str) -> None:

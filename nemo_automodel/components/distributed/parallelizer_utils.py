@@ -217,32 +217,21 @@ def _make_compute_dtype_fn(
          dtype recorded at load time (see ``_restore_loaded_model_dtype``). This makes
          any checkpoint-loaded model keep its intrinsically-fp32 params in fp32 compute
          automatically, even after storage was upcast for fp32 master weights.
-      3. Fallback -- when the tensor carries no compute hint, the result depends on
-         whether the module's floating-point *storage* is uniform:
-           * uniform storage -- ``mp_policy.param_dtype`` (the requested mixed-precision
-             compute dtype, typically bf16). This is the fp32-master-weights case: the
-             uniform-fp32 storage is artificially widened and should compute in the
-             policy dtype. Falls back to the storage dtype when no policy is given.
-           * mixed storage -- the tensor's own storage dtype. A param whose storage
-             differs from its peers is intrinsically that dtype (not a master weight),
-             so it must compute in it. Applying the policy here would force differently
-             stored params into one compute dtype and re-introduce the mixed *original*
-             dtype that stock FSDP2 rejects (``_init_mp_dtypes``).
+      3. Fallback -- when the tensor carries no compute hint, an fp32 storage under a
+         lower-precision policy is an fp32 master weight and computes in
+         ``mp_policy.param_dtype`` (the requested compute dtype, typically bf16); any
+         other storage keeps its own dtype (and so does the fp32 case when no policy is
+         given). Resolved per-param -- a single genuinely lower-precision sibling (e.g.
+         Qwen3.5-MoE's bf16 ``shared_expert_gate``) no longer forces the layer's fp32
+         master weights into fp32 compute. Intrinsic fp32 is already covered by #1/#2;
+         the ``(storage, compute)`` grouping still keeps each FSDP unit storage-uniform.
+         See NVIDIA-NeMo/Automodel#3327.
 
     Non-floating tensors always keep their storage dtype.
     """
     policy_dtype = getattr(mp_policy, "param_dtype", None)
 
-    # The policy fallback only represents "fp32 master weights -> compute in policy
-    # dtype" when the module's floating storage is uniform. If storage is already
-    # mixed, unhinted params keep their storage dtype instead (see precedence above).
     ignored_param_ids = {id(param) for param in ignored_params or ()}
-    floating_storage_dtypes = {
-        tensor.dtype
-        for tensor in (*module.parameters(), *module.buffers())
-        if id(tensor) not in ignored_param_ids and tensor.dtype.is_floating_point
-    }
-    storage_is_uniform = len(floating_storage_dtypes) <= 1
 
     pinned_ids: Set[int] = set()
     if fp32_compute_module_names:
@@ -258,7 +247,9 @@ def _make_compute_dtype_fn(
         recorded = getattr(t, "_hf_compute_dtype", None)
         if recorded is not None and recorded.is_floating_point:
             return recorded
-        if policy_dtype is not None and storage_is_uniform:
+        # Unhinted fp32 storage under a lower-precision policy is an fp32 master
+        # weight -> compute in the policy dtype (intrinsic fp32 handled by #1/#2).
+        if policy_dtype is not None and t.dtype == torch.float32 and policy_dtype != torch.float32:
             return policy_dtype
         return t.dtype
 

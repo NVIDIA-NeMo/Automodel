@@ -711,7 +711,9 @@ class MoE(nn.Module):
                 swiglu_limit=config.swiglu_limit,
             )
             if config.shared_expert_gate:
-                self.shared_expert_gate = initialize_linear_module(backend.linear, config.dim, 1, False)
+                self.shared_expert_gate = initialize_linear_module(
+                    backend.linear, config.dim, 1, False, dtype=config.dtype
+                )
             else:
                 self.shared_expert_gate = None
         else:
