@@ -337,7 +337,7 @@ Before using full-size models, verify with a tiny config (1-2 layers, small hidd
 
 ## Phase 4: Tests
 
-Create `tests/unit_tests/models/<name>/` and cover the checks below before
+Create `tests/unit_tests/components/models/<name>/` and cover the checks below before
 loading full checkpoints:
 
 - Forward-shape smoke test with a tiny config.

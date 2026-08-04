@@ -29,7 +29,7 @@ from torch.distributed.tensor import Shard, distribute_tensor
 
 from nemo_automodel.components.checkpoint.stateful_wrappers import OptimizerState
 from nemo_automodel.components.optim.optimizer import FusedAdamConfig, _drop_empty_local_shards
-from tests.unit_tests.optim.test_fused_adam_empty_local_shards import (
+from tests.unit_tests.components.optim.test_fused_adam_empty_local_shards import (
     _RecordingFusedAdam,
     _te_stub_modules,
 )

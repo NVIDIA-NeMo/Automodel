@@ -29,7 +29,7 @@ BASE_YAML="examples/speculative/dspark/glm_5.2_dspark.yaml"
 mkdir -p "$WORK"
 
 echo "### 1/4  CPU unit tests (draft / config / registry / freqs pin)"
-python -m pytest tests/unit_tests/speculative/test_dspark_glm_5_2.py -q
+python -m pytest tests/unit_tests/components/speculative/dspark/test_dspark_glm_5_2.py -q
 
 echo "### 2/4  build 64 tiny smoke rows (OpenAI 'messages' jsonl, same schema as the real data)"
 python - "$WORK/train.jsonl" <<'PY'

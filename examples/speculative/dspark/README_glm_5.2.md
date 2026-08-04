@@ -109,7 +109,8 @@ kernels **if** your TileLang build JIT-compiles them.
 ## Validation status
 
 - **Verified**: CPU unit tests for the draft / config builder / registry and the RoPE
-  `freqs` fp32 pin across a bf16 cast (`tests/unit_tests/speculative/test_dspark_glm_5_2.py`).
+  `freqs` fp32 pin across a bf16 cast
+  (`tests/unit_tests/components/speculative/dspark/test_dspark_glm_5_2.py`).
 - **Smoke-validated on 8x H100 80GB**: the reduced 6-layer EP8 path (SDPA attention,
   `torch_mm` experts, activation checkpointing) loads the FP8 checkpoint, captures
   hidden states across the shards, and trains end to end with a finite three-term

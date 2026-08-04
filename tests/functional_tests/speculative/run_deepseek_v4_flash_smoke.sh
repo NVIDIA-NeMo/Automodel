@@ -28,7 +28,7 @@ SMOKE_YAML="examples/speculative/dspark/deepseek_v4_flash_smoke.yaml"
 mkdir -p "$WORK"
 
 echo "### 1/4  CPU unit tests (draft / config / registry / inv_freq pin)"
-python -m pytest tests/unit_tests/speculative/test_dspark_draft_deepseek_v4.py -q
+python -m pytest tests/unit_tests/components/speculative/dspark/test_dspark_draft_deepseek_v4.py -q
 
 echo "### 2/4  build 64 tiny smoke rows (OpenAI 'messages' jsonl, same schema as the real data)"
 python - "$WORK/train.jsonl" <<'PY'

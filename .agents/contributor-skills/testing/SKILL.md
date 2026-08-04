@@ -10,7 +10,13 @@ when_to_use: Adding, running, or disabling tests; debugging a test failure; choo
 
 ```
 tests/
-  unit_tests/          # fast, isolated, no GPU required
+  unit_tests/          # fast, isolated, no GPU required; mirrors nemo_automodel/
+    _diffusers/
+    _transformers/
+    cli/
+    components/
+    recipes/
+    shared/
   functional_tests/    # GPU-required integration tests
   ci_tests/            # executed in CI pipeline only
 ```
@@ -58,7 +64,9 @@ or:
 
 ## Adding a Unit Test
 
-1. Place the file under `tests/unit_tests/<domain>/test_<name>.py`.
+1. Mirror the source package path under `tests/unit_tests/`. For example,
+   `nemo_automodel/components/models/llama/model.py` is tested under
+   `tests/unit_tests/components/models/llama/`.
 2. Keep configs tiny: small hidden dims, 1-2 layers, short sequences.
 3. Run locally: `pytest tests/unit_tests/<your_test>.py -v`
 

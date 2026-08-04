@@ -14,7 +14,7 @@
 
 """Tests for the **recipe-layer** YAML / dict parsing (``_dist_utils``).
 
-Typed validation tests live in ``tests/unit_tests/distributed/test_mesh.py``.
+Typed validation tests live in ``tests/unit_tests/components/distributed/test_mesh.py``.
 """
 
 import pytest
