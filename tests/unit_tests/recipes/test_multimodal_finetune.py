@@ -55,12 +55,11 @@ def test_bagel_finalizes_pending_checkpoint_before_closing_checkpointer():
     recipe.step_scheduler = SimpleNamespace(epochs=[])
     recipe.metric_logger_train = SimpleNamespace(close=lambda: events.append("train_logger_close"))
     recipe.metric_logger_valid = SimpleNamespace(close=lambda: events.append("valid_logger_close"))
-    recipe.checkpointer = SimpleNamespace(close=lambda: events.append("checkpointer_close"))
-    recipe._finalize_pending_checkpoint = lambda: events.append("finalize")
+    recipe.checkpointer = SimpleNamespace(finalize=lambda: events.append("checkpointer_finalize"))
 
     FinetuneRecipeForMultimodal.run_train_validation_loop(recipe)
 
-    assert events == ["train", "train_logger_close", "valid_logger_close", "finalize", "checkpointer_close"]
+    assert events == ["train", "train_logger_close", "valid_logger_close", "checkpointer_finalize"]
 
 
 def test_bagel_dataloader_resolved_through_recipeconfig():

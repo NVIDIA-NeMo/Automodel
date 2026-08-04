@@ -24,65 +24,69 @@ NeMo AutoModel supports the [AutoModelForCausalLM](https://huggingface.co/transf
 
 | Owner | Model Family | Architectures |
 |---|---|---|
-| Meta | [Llama](/model-coverage/large-language-models/llama) | `LlamaForCausalLM` |
-| Google | [Gemma](/model-coverage/large-language-models/gemma) | `GemmaForCausalLM`, `Gemma2ForCausalLM`, `Gemma3ForCausalLM` |
-| Qwen / Alibaba Cloud | [Qwen2](/model-coverage/large-language-models/qwen2) | `Qwen2ForCausalLM` |
-| Qwen / Alibaba Cloud | [Qwen2 MoE](/model-coverage/large-language-models/qwen2-moe) | `Qwen2MoeForCausalLM` |
-| Qwen / Alibaba Cloud | [Qwen3](/model-coverage/large-language-models/qwen3) | `Qwen3ForCausalLM` |
-| Qwen / Alibaba Cloud | [Qwen3 MoE](/model-coverage/large-language-models/qwen3-moe) | `Qwen3MoeForCausalLM` |
-| Qwen / Alibaba Cloud | [Qwen3-Next](/model-coverage/large-language-models/qwen3-next) | `Qwen3NextForCausalLM` |
-| Baidu | [ERNIE 4.5](/model-coverage/large-language-models/ernie-4-5) | `Ernie4_5ForCausalLM`, `Ernie4_5_MoeForCausalLM` |
-| DeepSeek | [DeepSeek](/model-coverage/large-language-models/deepseek) | `DeepseekForCausalLM` |
-| DeepSeek | [DeepSeek-V3](/model-coverage/large-language-models/deepseek-v3) | `DeepseekV3ForCausalLM`, `DeepseekV32ForCausalLM` |
-| DeepSeek | [DeepSeek V4 Flash](/model-coverage/large-language-models/deepseek-v4-flash) | `DeepseekV4ForCausalLM` |
-| Mistral AI | [Mistral](/model-coverage/large-language-models/mistral) | `MistralForCausalLM` |
-| Mistral AI | [Mixtral](/model-coverage/large-language-models/mixtral) | `MixtralForCausalLM` |
-| Mistral AI | [Ministral3 / Devstral](/model-coverage/large-language-models/ministral3-devstral) | `Mistral3ForConditionalGeneration` |
-| Microsoft | [Phi](/model-coverage/large-language-models/phi) | `PhiForCausalLM` |
-| Microsoft | [Phi-3 / Phi-4](/model-coverage/large-language-models/phi-3-phi-4) | `Phi3ForCausalLM` |
-| Microsoft | [Phi-3-Small](/model-coverage/large-language-models/phi-3-small) | `Phi3SmallForCausalLM` |
-| NVIDIA | [Nemotron / Minitron](/model-coverage/large-language-models/nemotron-minitron) | `NemotronForCausalLM` |
-| NVIDIA | [Nemotron-H](/model-coverage/large-language-models/nemotron-h) | `NemotronHForCausalLM` |
-| NVIDIA | [Nemotron-Flash](/model-coverage/large-language-models/nemotron-flash) | `NemotronFlashForCausalLM` |
-| NVIDIA | [Nemotron-Super](/model-coverage/large-language-models/nemotron-super-llama-3-3-nemotron-super-49b) | `DeciLMForCausalLM` |
-| ZAI / Zhipu AI | [ChatGLM](/model-coverage/large-language-models/chatglm) | `ChatGLMModel` |
-| ZAI / Zhipu AI | [GLM-4](/model-coverage/large-language-models/glm-4) | `GlmForCausalLM`, `Glm4ForCausalLM` |
-| ZAI / Zhipu AI | [GLM-4 MoE](/model-coverage/large-language-models/glm-4-moe-glm-4-5-glm-4-7) | `Glm4MoeForCausalLM`, `Glm4MoeLiteForCausalLM` |
-| ZAI / Zhipu AI | [GLM-5 / GLM-5.1 / GLM-5.2](/model-coverage/large-language-models/glm-5-moe-dsa) | `GlmMoeDsaForCausalLM` |
-| IBM | [Granite](/model-coverage/large-language-models/granite) | `GraniteForCausalLM` |
-| IBM | [Granite MoE](/model-coverage/large-language-models/granite-moe) | `GraniteMoeForCausalLM`, `GraniteMoeSharedForCausalLM` |
-| IBM | [Bamba](/model-coverage/large-language-models/bamba) | `BambaForCausalLM` |
-| Allen AI | [OLMo](/model-coverage/large-language-models/olmo) | `OLMoForCausalLM` |
-| Allen AI | [OLMo2](/model-coverage/large-language-models/olmo2) | `OLMo2ForCausalLM` |
-| Allen AI | [OLMoE](/model-coverage/large-language-models/olmoe) | `OLMoEForCausalLM` |
-| OpenAI | [GPT-OSS](/model-coverage/large-language-models/gpt-oss) | `GptOssForCausalLM` |
-| OpenAI | [GPT-2](/model-coverage/large-language-models/gpt-2) | `GPT2LMHeadModel` |
-| EleutherAI | [GPT-J](/model-coverage/large-language-models/gpt-j) | `GPTJForCausalLM` |
-| EleutherAI | [GPT-NeoX / Pythia](/model-coverage/large-language-models/gpt-neox-pythia) | `GPTNeoXForCausalLM` |
-| BigCode | [StarCoder](/model-coverage/large-language-models/starcoder) | `GPTBigCodeForCausalLM` |
-| BigCode | [StarCoder2](/model-coverage/large-language-models/starcoder2) | `Starcoder2ForCausalLM` |
-| BAAI | [Aquila / Aquila2](/model-coverage/large-language-models/aquila-aquila2) | `AquilaForCausalLM` |
-| Baichuan Inc | [Baichuan / Baichuan2](/model-coverage/large-language-models/baichuan-baichuan2) | `BaiChuanForCausalLM` |
-| Cohere | [Command-R](/model-coverage/large-language-models/command-r) | `CohereForCausalLM`, `Cohere2ForCausalLM` |
-| TII | [Falcon](/model-coverage/large-language-models/falcon) | `FalconForCausalLM` |
-| LG AI Research | [EXAONE](/model-coverage/large-language-models/exaone) | `ExaoneForCausalLM` |
-| InternLM | [InternLM](/model-coverage/large-language-models/internlm) | `InternLMForCausalLM`, `InternLM2ForCausalLM`, `InternLM3ForCausalLM` |
-| Inception AI | [Jais](/model-coverage/large-language-models/jais) | `JAISLMHeadModel` |
-| MiniMax | [MiniMax-M2](/model-coverage/large-language-models/minimax-m2) | `MiniMaxM2ForCausalLM` |
-| OpenBMB | [MiniCPM](/model-coverage/large-language-models/minicpm) | `MiniCPMForCausalLM`, `MiniCPM3ForCausalLM`, `MiniCPM5ForCausalLM` |
-| Moonshot AI | [Kimi K3](/model-coverage/large-language-models/kimi-k3) | `KimiK3ForCausalLM` |
-| Moonshot AI | [Moonlight](/model-coverage/large-language-models/moonlight) | `DeepseekV3ForCausalLM` |
-| ByteDance Seed | [Seed (ByteDance)](/model-coverage/large-language-models/seed-bytedance) | `Qwen2ForCausalLM` |
-| Upstage | [Solar Pro](/model-coverage/large-language-models/solar-pro) | `SolarForCausalLM` |
-| OrionStar | [Orion](/model-coverage/large-language-models/orion) | `OrionForCausalLM` |
-| Stability AI | [StableLM](/model-coverage/large-language-models/stablelm) | `StableLmForCausalLM` |
-| Stepfun AI | [Step-3.5](/model-coverage/large-language-models/step-3-5) | `Step3p5ForCausalLM` |
-| Parasail AI | [GritLM](/model-coverage/large-language-models/gritlm) | `GritLM` |
-| Tencent | [Hy3-preview](/model-coverage/large-language-models/hy3-preview) | `HYV3ForCausalLM` |
-| Tencent | [Hy-MT2](/model-coverage/large-language-models/hy-mt2) | `HyMT2ForCausalLM` |
-| Xiaomi MiMo | [MiMo-V2-Flash](/model-coverage/large-language-models/mimo-v2-flash) | `MiMoV2FlashForCausalLM` |
-| Poolside | [Laguna](/model-coverage/large-language-models/laguna) | `LagunaForCausalLM` |
-| inclusionAI | [Ling 2.0](/model-coverage/large-language-models/ling-2-0) | `BailingMoeV2ForCausalLM` |
+| Meta | [Llama](/model-coverage/large-language-models/meta/llama) | `LlamaForCausalLM` |
+| Google | [Gemma 1](/model-coverage/large-language-models/google/gemma-1) | `GemmaForCausalLM` |
+| Google | [Gemma 2](/model-coverage/large-language-models/google/gemma-2) | `Gemma2ForCausalLM` |
+| Google | [FunctionGemma](/model-coverage/large-language-models/google/functiongemma) | `Gemma3ForCausalLM` |
+| Qwen / Alibaba Cloud | [Qwen2](/model-coverage/large-language-models/qwen/qwen2) | `Qwen2ForCausalLM` |
+| Qwen / Alibaba Cloud | [Qwen2 MoE](/model-coverage/large-language-models/qwen/qwen2-moe) | `Qwen2MoeForCausalLM` |
+| Qwen / Alibaba Cloud | [Qwen3](/model-coverage/large-language-models/qwen/qwen3) | `Qwen3ForCausalLM` |
+| Qwen / Alibaba Cloud | [Qwen3 MoE](/model-coverage/large-language-models/qwen/qwen3-moe) | `Qwen3MoeForCausalLM` |
+| Qwen / Alibaba Cloud | [Qwen3-Next](/model-coverage/large-language-models/qwen/qwen3-next) | `Qwen3NextForCausalLM` |
+| Baidu | [ERNIE 4.5](/model-coverage/large-language-models/baidu/ernie-4-5) | `Ernie4_5ForCausalLM`, `Ernie4_5_MoeForCausalLM` |
+| DeepSeek | [DeepSeek](/model-coverage/large-language-models/deepseek-ai/deepseek) | `DeepseekForCausalLM` |
+| DeepSeek | [DeepSeek-V3](/model-coverage/large-language-models/deepseek-ai/deepseek-v3) | `DeepseekV3ForCausalLM`, `DeepseekV32ForCausalLM` |
+| DeepSeek | [DeepSeek-V4 Flash](/model-coverage/large-language-models/deepseek-ai/deepseek-v4-flash) | `DeepseekV4ForCausalLM` |
+| DeepSeek | [DeepSeek-V4 Pro](/model-coverage/large-language-models/deepseek-ai/deepseek-v4-pro) | `DeepseekV4ForCausalLM` |
+| Mistral AI | [Mistral](/model-coverage/large-language-models/mistralai/mistral) | `MistralForCausalLM` |
+| Mistral AI | [Mixtral](/model-coverage/large-language-models/mistralai/mixtral) | `MixtralForCausalLM` |
+| Mistral AI | [Ministral3 / Devstral](/model-coverage/large-language-models/mistralai/ministral3-devstral) | `Ministral3ForCausalLM`, `Mistral3ForConditionalGeneration` |
+| Microsoft | [Phi](/model-coverage/large-language-models/microsoft/phi) | `PhiForCausalLM` |
+| Microsoft | [Phi-3 / Phi-4](/model-coverage/large-language-models/microsoft/phi-3-phi-4) | `Phi3ForCausalLM` |
+| Microsoft | [Phi-3-Small](/model-coverage/large-language-models/microsoft/phi-3-small) | `Phi3SmallForCausalLM` |
+| NVIDIA | [Nemotron / Minitron](/model-coverage/large-language-models/nvidia/nemotron-minitron) | `NemotronForCausalLM` |
+| NVIDIA | [Nemotron-H](/model-coverage/large-language-models/nvidia/nemotron-h) | `NemotronHForCausalLM` |
+| NVIDIA | [Nemotron-Flash](/model-coverage/large-language-models/nvidia/nemotron-flash) | `NemotronFlashForCausalLM` |
+| NVIDIA | [Nemotron-Super](/model-coverage/large-language-models/nvidia/nemotron-super-llama-3-3-nemotron-super-49b) | `DeciLMForCausalLM` |
+| ZAI / Zhipu AI | [ChatGLM](/model-coverage/large-language-models/thudm/chatglm) | `ChatGLMModel` |
+| ZAI / Zhipu AI | [GLM-4](/model-coverage/large-language-models/thudm/glm-4) | `GlmForCausalLM`, `Glm4ForCausalLM` |
+| ZAI / Zhipu AI | [GLM-4 MoE](/model-coverage/large-language-models/thudm/glm-4-moe-glm-4-5-glm-4-7) | `Glm4MoeForCausalLM`, `Glm4MoeLiteForCausalLM` |
+| ZAI / Zhipu AI | [GLM-5 / GLM-5.1 / GLM-5.2](/model-coverage/large-language-models/thudm/glm-5-moe-dsa) | `GlmMoeDsaForCausalLM` |
+| IBM | [Granite](/model-coverage/large-language-models/ibm/granite) | `GraniteForCausalLM` |
+| IBM | [Granite MoE](/model-coverage/large-language-models/ibm/granite-moe) | `GraniteMoeForCausalLM`, `GraniteMoeSharedForCausalLM` |
+| IBM | [Bamba](/model-coverage/large-language-models/ibm/bamba) | `BambaForCausalLM` |
+| Allen AI | [OLMo](/model-coverage/large-language-models/allenai/olmo) | `OLMoForCausalLM` |
+| Allen AI | [OLMo2](/model-coverage/large-language-models/allenai/olmo2) | `OLMo2ForCausalLM` |
+| Allen AI | [OLMoE](/model-coverage/large-language-models/allenai/olmoe) | `OLMoEForCausalLM` |
+| OpenAI | [GPT-OSS](/model-coverage/large-language-models/openai/gpt-oss) | `GptOssForCausalLM` |
+| OpenAI | [GPT-2](/model-coverage/large-language-models/openai/gpt-2) | `GPT2LMHeadModel` |
+| EleutherAI | [GPT-J](/model-coverage/large-language-models/eleutherai/gpt-j) | `GPTJForCausalLM` |
+| EleutherAI | [GPT-NeoX / Pythia](/model-coverage/large-language-models/eleutherai/gpt-neox-pythia) | `GPTNeoXForCausalLM` |
+| BigCode | [StarCoder](/model-coverage/large-language-models/bigcode/starcoder) | `GPTBigCodeForCausalLM` |
+| BigCode | [StarCoder2](/model-coverage/large-language-models/bigcode/starcoder2) | `Starcoder2ForCausalLM` |
+| BAAI | [Aquila / Aquila2](/model-coverage/large-language-models/baai/aquila-aquila2) | `AquilaForCausalLM` |
+| Baichuan Inc | [Baichuan / Baichuan2](/model-coverage/large-language-models/baichuan-inc/baichuan-baichuan2) | `BaichuanForCausalLM`, `BaiChuanForCausalLM` |
+| Cohere | [Command-R](/model-coverage/large-language-models/cohere/command-r) | `CohereForCausalLM`, `Cohere2ForCausalLM` |
+| TII | [Falcon](/model-coverage/large-language-models/tiiuae/falcon) | `FalconForCausalLM` |
+| LG AI Research | [EXAONE](/model-coverage/large-language-models/lgai-exaone/exaone) | `ExaoneForCausalLM` |
+| InternLM | [InternLM](/model-coverage/large-language-models/internlm/internlm) | `InternLMForCausalLM`, `InternLM2ForCausalLM`, `InternLM3ForCausalLM` |
+| Inception AI | [Jais](/model-coverage/large-language-models/inceptionai/jais) | `JAISLMHeadModel` |
+| MiniMax | [MiniMax-M2](/model-coverage/large-language-models/minimax/minimax-m2) | `MiniMaxM2ForCausalLM` |
+| OpenBMB | [MiniCPM](/model-coverage/large-language-models/openbmb/minicpm) | `MiniCPMForCausalLM`, `MiniCPM3ForCausalLM`, `MiniCPM5ForCausalLM` |
+| Moonshot AI | [Kimi K3](/model-coverage/large-language-models/moonshotai/kimi-k3) | `KimiK3ForCausalLM` |
+| Moonshot AI | [Moonlight](/model-coverage/large-language-models/moonshotai/moonlight) | `DeepseekV3ForCausalLM` |
+| ByteDance Seed | [Seed (ByteDance)](/model-coverage/large-language-models/bytedance-seed/seed-bytedance) | `Qwen2ForCausalLM` |
+| Upstage | [Solar Pro](/model-coverage/large-language-models/upstage/solar-pro) | `SolarForCausalLM` |
+| OrionStar | [Orion](/model-coverage/large-language-models/orionstar/orion) | `OrionForCausalLM` |
+| Stability AI | [StableLM](/model-coverage/large-language-models/stabilityai/stablelm) | `StableLmForCausalLM` |
+| Google | [T5](/model-coverage/large-language-models/google-t5/t5) | `T5ForConditionalGeneration` |
+| Stepfun AI | [Step-3.5](/model-coverage/large-language-models/stepfun-ai/step-3-5) | `Step3p5ForCausalLM` |
+| Parasail AI | [GritLM](/model-coverage/large-language-models/parasail-ai/gritlm) | `GritLM` |
+| Tencent | [Hy3-preview](/model-coverage/large-language-models/tencent/hy3-preview) | `HYV3ForCausalLM` |
+| Tencent | [Hy-MT2](/model-coverage/large-language-models/tencent/hy-mt2) | `HyMT2ForCausalLM` |
+| Xiaomi MiMo | [MiMo-V2-Flash](/model-coverage/large-language-models/xiaomimimo/mimo-v2-flash) | `MiMoV2FlashForCausalLM` |
+| Poolside | [Laguna](/model-coverage/large-language-models/poolside/laguna) | `LagunaForCausalLM` |
+| inclusionAI | [Ling 2.0](/model-coverage/large-language-models/inclusionai/ling-2-0) | `BailingMoeV2ForCausalLM` |
 
 ## Fine-Tuning LLMs with NeMo AutoModel
 

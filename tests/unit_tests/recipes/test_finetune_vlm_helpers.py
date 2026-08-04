@@ -1574,7 +1574,6 @@ def _create_pp_recipe(model=None):
     recipe = object.__new__(FinetuneRecipeForVLM)
     # Initialize __dict__ directly to bypass BaseRecipe.__setattr__ tracking
     recipe.__dict__["__state_tracked"] = set()
-    recipe.__dict__["_best_val_loss"] = float("inf")
     recipe.__dict__["dist_env"] = SimpleNamespace(device="cpu")
     recipe.__dict__["device_mesh"] = None
     recipe.__dict__["moe_mesh"] = None
@@ -2253,7 +2252,6 @@ def _create_non_pp_recipe(model, device="cpu"):
     recipe = object.__new__(FinetuneRecipeForVLM)
     # Initialize __dict__ directly to bypass BaseRecipe.__setattr__ tracking
     recipe.__dict__["__state_tracked"] = set()
-    recipe.__dict__["_best_val_loss"] = float("inf")
     recipe.__dict__["dist_env"] = SimpleNamespace(device=device)
     recipe.__dict__["device_mesh"] = None
     recipe.__dict__["moe_mesh"] = None
@@ -2937,6 +2935,35 @@ def test_vlm_setup_applies_prewarm_config(monkeypatch):
     assert device == torch.device("cpu")
     assert batch_size == 1
     assert pp_mesh is None
+
+
+def test_vlm_setup_threads_pp_group_to_checkpointer(monkeypatch):
+    cfg = _minimal_vlm_cfg(cp_size=1, rope_fusion=False)
+    _patch_vlm_setup_minimals(monkeypatch, cp_size=1)
+    pp_group = object()
+    build_kwargs = {}
+    checkpoint_config = SimpleNamespace(checkpoint_dir="ckpts", model_state_dict_keys=None)
+
+    def _build_checkpointer(**kwargs):
+        build_kwargs.update(kwargs)
+        return SimpleNamespace(
+            config=checkpoint_config,
+            load_base_model=lambda *args, **kwargs: None,
+            maybe_wait_for_staging=lambda: None,
+            close=lambda: None,
+        )
+
+    checkpoint_config.build = _build_checkpointer
+    monkeypatch.setattr(
+        "nemo_automodel.recipes._typed_config.RecipeConfig.checkpoint",
+        property(lambda self: checkpoint_config),
+    )
+    monkeypatch.setattr(FinetuneRecipeForVLM, "_get_pp_group", lambda self: pp_group)
+
+    trainer = FinetuneRecipeForVLM(cfg)
+    trainer.setup()
+
+    assert build_kwargs["pp_group"] is pp_group
 
 
 def test_vlm_rope_fusion_disabled_when_cp_gt_1(monkeypatch):
