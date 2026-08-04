@@ -122,16 +122,15 @@ optimizer:
 ci:
   recipe_owner: hemildesai
   node_multiplier: true
-  time: "00:15:00"
+  time: "00:20:00"
   vllm_deploy: true
   vllm_smoke_test: true
   checkpoint_robustness:
     check_source_load_parity: true
-    # This recipe uses the same optimized BF16 Qwen MoE backend as the measured
-    # HellaSwag source-parity case (max/mean KL 0.0790/0.0113, cosine 0.9957).
-    source_load_kl_threshold: 1e-1
-    source_load_mean_kl_threshold: 1.5e-2
-    source_load_cosine_threshold: 0.995
+    # Exact-stack runs measured max/mean KL up to 0.0167/0.00437 and cosine down to 0.99750.
+    source_load_kl_threshold: 3e-2
+    source_load_mean_kl_threshold: 6e-3
+    source_load_cosine_threshold: 0.997
     # Same-process CI reached KL 0.2667, while controlled fresh-process reloads were stable at 0.0199.
     hf_kl_threshold: 5e-2
     # Derive isolated source, train/save, and reload phases from the standard

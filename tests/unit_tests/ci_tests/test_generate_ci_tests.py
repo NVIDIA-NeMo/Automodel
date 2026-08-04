@@ -144,6 +144,7 @@ def test_generate_qwen3_moe_lora_uses_isolated_reload_phases():
 
     variables = jobs[""]["variables"]
     assert "CHECKPOINT_ROBUSTNESS_PHASES" not in ci_config.get("env_vars", {})
+    assert variables["PYTORCH_CUDA_ALLOC_CONF"] == "expandable_segments:True"
     assert variables["CHECKPOINT_ROBUSTNESS_PROCESS_ISOLATION"] == "true"
     assert variables["CHECKPOINT_ROBUSTNESS_PHASES"] == (
         "source_load_reference source_load_parity train_and_save automodel_reload hf_reload"
@@ -164,13 +165,14 @@ def test_generate_qwen3_moe_te_deepep_uses_isolated_source_and_reload_phases():
 
     variables = jobs[""]["variables"]
     assert "CHECKPOINT_ROBUSTNESS_PHASES" not in ci_config.get("env_vars", {})
+    assert variables["TIME"] == "00:20:00"
     assert variables["CHECKPOINT_ROBUSTNESS_PROCESS_ISOLATION"] == "true"
     assert variables["CHECKPOINT_ROBUSTNESS_PHASES"] == (
         "source_load_reference source_load_parity train_and_save automodel_reload hf_reload"
     )
     assert robustness["check_source_load_parity"] is True
-    assert robustness["source_load_kl_threshold"] == 1e-1
-    assert robustness["source_load_mean_kl_threshold"] == 1.5e-2
-    assert robustness["source_load_cosine_threshold"] == 0.995
+    assert robustness["source_load_kl_threshold"] == 3e-2
+    assert robustness["source_load_mean_kl_threshold"] == 6e-3
+    assert robustness["source_load_cosine_threshold"] == 0.997
     assert robustness["trust_remote_code"] is True
     assert robustness["hf_device_map_auto"] is True

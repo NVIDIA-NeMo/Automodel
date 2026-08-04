@@ -104,6 +104,8 @@ ci:
   recipe_owner: adil-a
   time: "00:30:00"
   nodes: 1
+  env_vars:
+    PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
   checkpoint_robustness:
     check_source_load_parity: true
     # HF+PEFT reload remains gated by exact adapter fingerprints and a successful
