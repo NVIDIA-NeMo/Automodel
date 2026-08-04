@@ -32,6 +32,7 @@ import gc
 import hashlib
 import inspect
 import json
+import math
 import os
 import sys
 import time
@@ -443,11 +444,19 @@ def _assert_peft_adapter_matches_checkpoint(
         ignored_missing = [key for key in missing if ignored_key_prefix and key.startswith(ignored_key_prefix)]
         required_missing = sorted(set(missing) - set(ignored_missing))
         unexpected = sorted(loaded_keys - expected_keys)
-        assert not required_missing and not unexpected, (
+        # PEFT can expose the wrapped output head's base-layer tensor from
+        # get_peft_model_state_dict even though it is not adapter state and was
+        # therefore not written to adapter_model.safetensors. Keep unexpected
+        # adapter tensors strict while excluding this base-model-only value.
+        ignored_unexpected = [key for key in unexpected if ".lm_head.base_layer." in key]
+        required_unexpected = sorted(set(unexpected) - set(ignored_unexpected))
+        assert not required_missing and not required_unexpected, (
             "Vanilla PEFT adapter key mismatch: "
-            f"missing={required_missing[:10]}, unexpected={unexpected[:10]}, "
-            f"ignored_missing={ignored_missing[:10]}"
+            f"missing={required_missing[:10]}, unexpected={required_unexpected[:10]}, "
+            f"ignored_missing={ignored_missing[:10]}, ignored_non_adapter={ignored_unexpected[:10]}"
         )
+        if ignored_unexpected:
+            print(f"[HF reload] Ignored PEFT-reported non-adapter base-layer tensors: {ignored_unexpected}")
 
         mismatches = []
         matched_keys = expected_keys - set(ignored_missing)
@@ -1465,6 +1474,18 @@ def _materialize_hf_quantization_config(cfg):
     return raw_quantization_config
 
 
+def _hf_reload_kl_error(max_kl_hf: float, hf_kl_threshold: float) -> str | None:
+    """Return an actionable HF reload parity error, including non-finite results."""
+    if not math.isfinite(max_kl_hf):
+        return f"HF-loaded model produced non-finite KL divergence: {max_kl_hf}"
+    if max_kl_hf > hf_kl_threshold:
+        return (
+            "KL divergence between original and HF-loaded model too large: "
+            f"max per-token KL = {max_kl_hf:.6e} > threshold {hf_kl_threshold:.6e}"
+        )
+    return None
+
+
 def _run_vanilla_hf_reload(
     cfg,
     input_ids: list[int],
@@ -1513,6 +1534,9 @@ def _run_vanilla_hf_reload(
             trust_remote_code=trust_remote_code,
             local_files_only=os.environ.get("HF_HUB_OFFLINE", "0") == "1",
         )
+        for key in ("revision", "token"):
+            if model_kwargs.get(key) is not None:
+                hf_kwargs[key] = model_kwargs[key]
         # Remote-code models can ship attention names that transformers 5.x
         # rejects. Select a supported implementation while keeping Nemotron-H
         # off HF's incompatible FlashAttention varlen path.
@@ -1544,6 +1568,8 @@ def _run_vanilla_hf_reload(
             hf_config = _load_hf_config(
                 config_path,
                 trust_remote_code=trust_remote_code,
+                revision=model_kwargs.get("revision"),
+                token=model_kwargs.get("token"),
             )
         # Load the reference model straight onto the target GPU. Materialising a
         # 14B checkpoint on CPU and then ``.to(device)`` costs ~50-225s, and that
@@ -1642,11 +1668,7 @@ def _run_vanilla_hf_reload(
         else:
             max_kl_hf = _kl_divergence_from_logits(reference_logits, hf_logits).max().item()
             print(f"[HF reload] HF-loaded max KL: {max_kl_hf:.6e} (threshold: {hf_kl_threshold:.6e})")
-            if max_kl_hf > hf_kl_threshold:
-                hf_reload_error = (
-                    "KL divergence between original and HF-loaded model too large: "
-                    f"max per-token KL = {max_kl_hf:.6e} > threshold {hf_kl_threshold:.6e}"
-                )
+            hf_reload_error = _hf_reload_kl_error(max_kl_hf, hf_kl_threshold)
         del hf_logits
         _release_model_memory()
         return hf_reload_error
@@ -1735,6 +1757,8 @@ def _run_process_isolated_checkpoint_phase(
         raise ValueError(f"Unsupported isolated checkpoint phase {phase!r}; expected one of {sorted(supported_phases)}")
     if int(custom_args.get("cross_tp_size", "0")) > 0:
         raise ValueError("Process-isolated checkpoint mode does not yet support cross_tp_size")
+    if custom_args.get("no_check_resume", False) and phase in {"resume_baseline", "resume"}:
+        raise ValueError(f"Process-isolated phase {phase!r} conflicts with no_check_resume=true")
 
     _disable_distributed_atexit_teardown()
     cfg = parse_args_and_load_config()
@@ -1988,7 +2012,18 @@ def _run_process_isolated_checkpoint_phase(
                 _cleanup_input_ids_sync(cfg)
             _barrier()
 
+        device = next(restored_trainer.model_parts[0].parameters()).device
+        restored_logits = _get_logits(
+            restored_trainer.model_parts[0],
+            input_ids,
+            device,
+            trainer=restored_trainer,
+        )
         if is_peft:
+            # Capture both sides after a forward. FSDP may change a parameter's
+            # rank-local view during its first unshard/reshard lifecycle, so
+            # hashing the restored model immediately after setup is not
+            # comparable to the post-forward training reference.
             artifact_dir = _robustness_artifact_dir(cfg)
             rank = dist.get_rank() if dist.is_initialized() else 0
             expected_digests_path = artifact_dir / f"trainable_parameter_digests_rank_{rank}.json"
@@ -2031,13 +2066,6 @@ def _run_process_isolated_checkpoint_phase(
                     )
             _raise_distributed_failure(failure_message)
 
-        device = next(restored_trainer.model_parts[0].parameters()).device
-        restored_logits = _get_logits(
-            restored_trainer.model_parts[0],
-            input_ids,
-            device,
-            trainer=restored_trainer,
-        )
         failure_message = None
         if _rank0():
             reference_logits = torch.load(reference_path, map_location="cpu", weights_only=True)
