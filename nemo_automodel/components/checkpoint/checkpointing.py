@@ -872,7 +872,7 @@ class Checkpointer:
             _ru0 = resource.getrusage(resource.RUSAGE_SELF)  # PROBE
             _log_mem("start")  # PROBE
             _log_readahead_tunables()  # PROBE
-            _mode = os.environ.get("AM_CKPT_PREFETCH", "1")  # PROBE
+            _mode = os.environ.get("AM_CKPT_PREFETCH", "madvise")  # PROBE
             if _mode not in ("0", "off"):
                 _shards = _ckpt_shard_files(model_path)
                 _shard_gib = sum(os.path.getsize(p) for p in _shards) / (1 << 30)
