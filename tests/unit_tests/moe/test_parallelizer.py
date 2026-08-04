@@ -634,7 +634,7 @@ def test_apply_ac_wraps_blocks_with_and_without_context(monkeypatch):
 
     def fake_wrapper(block, preserve_rng_state, context_fn=None):
         assert preserve_rng_state is True
-        # if ignore_router=True, context_fn should be provided
+        # If ignore_router=False, the router-saving context should be provided.
         return wrapper_returns.pop(0)
 
     wrapper_mock = MagicMock(side_effect=fake_wrapper)
@@ -645,19 +645,19 @@ def test_apply_ac_wraps_blocks_with_and_without_context(monkeypatch):
     blocks = [DummyBlock(), DummyBlock()]
     model = DummyModel(blocks)
 
-    # ignore_router=True path - provide explicit hidden_size and num_experts
-    P.apply_ac(model, ignore_router=True, hidden_size=7168, num_experts=256)
+    # ignore_router=False path - provide explicit hidden_size and num_experts
+    P.apply_ac(model, ignore_router=False, hidden_size=7168, num_experts=256)
     assert wrapper_mock.call_count == 2
     # registration should replace both blocks
     assert len(model.layers.registered) == 2
 
-    # reset for ignore_router=False path
+    # Reset for ignore_router=True path.
     wrapper_returns.extend([object(), object()])
     model = DummyModel([DummyBlock(), DummyBlock()])
     wrapper_mock.reset_mock()
     model.layers.registered.clear()
 
-    P.apply_ac(model, ignore_router=False, hidden_size=7168, num_experts=256)
+    P.apply_ac(model, ignore_router=True, hidden_size=7168, num_experts=256)
     # Router replay does not need a selective policy, but TE attention still
     # receives a context that preserves its forward-time backend cache.
     for _, kwargs in wrapper_mock.call_args_list:
@@ -672,14 +672,14 @@ def test_apply_ac_warns_when_router_is_recomputed(monkeypatch):
     logger_mock = MagicMock()
     monkeypatch.setattr(P, "logger", logger_mock)
 
-    # ignore_router=False under (non-selective) AC recomputes the router -> warn.
-    P.apply_ac(DummyModel([DummyBlock()]), ignore_router=False, hidden_size=7168, num_experts=256)
+    # ignore_router=True under (non-selective) AC recomputes the router -> warn.
+    P.apply_ac(DummyModel([DummyBlock()]), ignore_router=True, hidden_size=7168, num_experts=256)
     assert logger_mock.warning.call_count == 1
     assert "ignore_router_for_ac" in logger_mock.warning.call_args[0][0]
 
-    # ignore_router=True (the default) saves the router projection and top-k outputs -> no warning.
+    # ignore_router=False (the default) saves the router projection and top-k outputs -> no warning.
     logger_mock.reset_mock()
-    P.apply_ac(DummyModel([DummyBlock()]), ignore_router=True, hidden_size=7168, num_experts=256)
+    P.apply_ac(DummyModel([DummyBlock()]), ignore_router=False, hidden_size=7168, num_experts=256)
     logger_mock.warning.assert_not_called()
 
 
@@ -700,7 +700,7 @@ def test_apply_ac_uses_generic_wrapper_even_when_block_local_checkpointing_is_av
     wrapper_mock = MagicMock(return_value=wrapped)
     monkeypatch.setattr(P, "ptd_checkpoint_wrapper", wrapper_mock)
 
-    P.apply_ac(model, ignore_router=True, hidden_size=7168, num_experts=256)
+    P.apply_ac(model, ignore_router=False, hidden_size=7168, num_experts=256)
 
     wrapper_mock.assert_called_once()
     assert wrapper_mock.call_args.kwargs["preserve_rng_state"] is True
@@ -732,7 +732,7 @@ def test_apply_ac_custom_policy_saves_router_projection_and_topk(monkeypatch):
     num_experts = 31
     model = DummyModel([DummyBlock(), DummyBlock()])
 
-    P.apply_ac(model, ignore_router=True, hidden_size=hidden_size, num_experts=num_experts)
+    P.apply_ac(model, hidden_size=hidden_size, num_experts=num_experts)
 
     assert captured_policy is not None
 
@@ -1312,7 +1312,7 @@ def test_parallelize_model_calls_subsystems_and_validates(monkeypatch):
     apply_ep_mock.assert_called_once()
     # AC enabled
     apply_ac_mock.assert_called_once_with(
-        model, ignore_router=True, selective=False, activation_checkpointing_scope="all"
+        model, ignore_router=False, selective=False, activation_checkpointing_scope="all"
     )
     # FSDP called with combined flags and derived meshes
     args, kwargs = apply_fsdp_mock.call_args
@@ -2058,7 +2058,7 @@ def test_apply_ac_derives_hidden_size_and_num_experts_from_config(monkeypatch):
 
     model = ModelWithConfig()
 
-    P.apply_ac(model, ignore_router=True)
+    P.apply_ac(model, ignore_router=False)
 
     assert captured_hidden_size == 256
     assert captured_num_experts == 16
@@ -2133,7 +2133,7 @@ def test_apply_ac_derives_num_experts_from_num_local_experts(monkeypatch):
 
     model = ModelWithNumLocalExperts()
 
-    P.apply_ac(model, ignore_router=True)
+    P.apply_ac(model, ignore_router=False)
 
     assert captured_num_experts == 32
 
@@ -2171,7 +2171,7 @@ def test_apply_ac_accepts_explicit_hidden_size_and_num_experts(monkeypatch):
 
     model = ModelWithoutConfig()
 
-    P.apply_ac(model, ignore_router=True, hidden_size=512, num_experts=32)
+    P.apply_ac(model, ignore_router=False, hidden_size=512, num_experts=32)
 
     assert captured_hidden_size == 512
     assert captured_num_experts == 32
@@ -2216,7 +2216,7 @@ def test_apply_ac_explicit_params_override_config(monkeypatch):
     model = ModelWithConfig()
 
     # Explicit params should override config
-    P.apply_ac(model, ignore_router=True, hidden_size=1024, num_experts=64)
+    P.apply_ac(model, ignore_router=False, hidden_size=1024, num_experts=64)
 
     assert captured_hidden_size == 1024
     assert captured_num_experts == 64
@@ -2264,7 +2264,7 @@ def test_apply_ac_derives_from_llm_config(monkeypatch):
             self.config = Config()
             self.layers = LayerContainer([DummyBlock()])
 
-    P.apply_ac(ModelWithLLMConfig(), ignore_router=True)
+    P.apply_ac(ModelWithLLMConfig(), ignore_router=False)
 
     assert captured_hidden_size == 512
     assert captured_num_experts == 32
@@ -2315,7 +2315,7 @@ def test_apply_ac_text_config_takes_priority_over_llm_config(monkeypatch):
             self.config = Config()
             self.layers = LayerContainer([DummyBlock()])
 
-    P.apply_ac(ModelBoth(), ignore_router=True)
+    P.apply_ac(ModelBoth(), ignore_router=False)
 
     assert captured_hidden_size == 256
     assert captured_num_experts == 16
@@ -2355,7 +2355,7 @@ def test_apply_ac_routes_through_get_text_module(monkeypatch):
     vit_blocks = [DummyBlock(), DummyBlock(), DummyBlock(), DummyBlock()]
     model = VLMOuter(lm_blocks, vit_blocks)
 
-    P.apply_ac(model, ignore_router=True)
+    P.apply_ac(model, ignore_router=False)
 
     # LM layers should be re-registered (wrapped); vision_tower and inner.layers untouched.
     assert set(model.model.language_model.layers.registered.keys()) == {"0", "1"}
@@ -2400,8 +2400,8 @@ def test_parallelize_model_passes_ignore_router_for_ac_to_apply_ac(monkeypatch):
     assert kwargs.get("ignore_router") is True
 
 
-def test_parallelize_model_ignore_router_for_ac_defaults_to_true(monkeypatch):
-    """Test that parallelize_model defaults ignore_router_for_ac to True."""
+def test_parallelize_model_ignore_router_for_ac_defaults_to_false(monkeypatch):
+    """Test that parallelize_model defaults ignore_router_for_ac to False."""
     P = _import_parallelizer_with_stubs(monkeypatch)
     apply_ac_mock = MagicMock()
     monkeypatch.setattr(P, "apply_ac", apply_ac_mock)
@@ -2429,10 +2429,10 @@ def test_parallelize_model_ignore_router_for_ac_defaults_to_true(monkeypatch):
         activation_checkpointing=True,
     )
 
-    # Verify apply_ac was called with ignore_router=True (default)
+    # Verify apply_ac was called with ignore_router=False (default)
     apply_ac_mock.assert_called_once()
     args, kwargs = apply_ac_mock.call_args
-    assert kwargs.get("ignore_router") is True
+    assert kwargs.get("ignore_router") is False
     # Full (True) AC is not selective.
     assert kwargs.get("selective") is False
 
@@ -2468,7 +2468,7 @@ def test_parallelize_model_passes_selective_to_apply_ac(monkeypatch):
     apply_ac_mock.assert_called_once()
     _, kwargs = apply_ac_mock.call_args
     assert kwargs.get("selective") is True
-    assert kwargs.get("ignore_router") is True
+    assert kwargs.get("ignore_router") is False
 
 
 def test_apply_ac_selective_wraps_blocks_with_shared_policy(monkeypatch):
@@ -2632,7 +2632,7 @@ def test_apply_ac_derives_num_experts_from_moe_num_experts(monkeypatch):
 
     model = ModelWithMoeNumExperts()
 
-    P.apply_ac(model, ignore_router=True)
+    P.apply_ac(model, ignore_router=False)
 
     # Should find moe_num_experts
     assert captured_num_experts == 32
@@ -2676,7 +2676,7 @@ def test_apply_ac_prefers_num_experts_over_moe_num_experts(monkeypatch):
 
     model = ModelWithBothExperts()
 
-    P.apply_ac(model, ignore_router=True)
+    P.apply_ac(model, ignore_router=False)
 
     # Should find num_experts first
     assert captured_num_experts == 16
@@ -2725,7 +2725,7 @@ def test_apply_ac_derives_num_experts_from_moe_config(monkeypatch):
 
     model = Outer()
 
-    P.apply_ac(model, ignore_router=True)
+    P.apply_ac(model, ignore_router=False)
 
     assert captured_num_experts == 32
 
@@ -2774,7 +2774,7 @@ def test_apply_ac_prefers_moe_config_over_config_attrs(monkeypatch):
 
     model = Outer()
 
-    P.apply_ac(model, ignore_router=True)
+    P.apply_ac(model, ignore_router=False)
 
     # moe_config should take priority over config.num_experts
     assert captured_num_experts == 32
@@ -2970,7 +2970,7 @@ def test_apply_ac_derives_hidden_size_and_num_experts_from_text_config(monkeypat
             self.layers = LayerContainer([DummyBlock()])
 
     model = VLMModel()
-    P.apply_ac(model, ignore_router=True)
+    P.apply_ac(model, ignore_router=False)
 
     assert captured_hidden_size == 2048
     assert captured_num_experts == 128

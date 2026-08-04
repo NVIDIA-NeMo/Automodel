@@ -408,19 +408,20 @@ def _apply_multimodal_tower_ac(model: nn.Module, scopes: tuple[str, ...]) -> Non
 
 def apply_ac(
     model: nn.Module,
-    ignore_router: bool = True,
+    ignore_router: bool = False,
     hidden_size: int | None = None,
     num_experts: int | None = None,
     selective: bool = False,
     activation_checkpointing_scope: str | list[str] | tuple[str, ...] = "all",
-):
+) -> None:
     """Apply activation checkpointing to the model.
 
     Args:
         model: The model to apply activation checkpointing to.
-        ignore_router: If True (the default), saves the MoE router projection and top-k
-            outputs so recompute preserves expert assignments (avoids a CheckpointError from
-            non-deterministic re-routing changing dispatch shapes). If False, a warning is emitted.
+        ignore_router: If False (the default), includes the MoE router projection and top-k
+            outputs in the values saved for backward so recompute preserves expert assignments
+            (avoids a CheckpointError from non-deterministic re-routing changing dispatch shapes).
+            If True, ignores those outputs and emits a warning because the router is recomputed.
         hidden_size: Hidden dimension size. If None, derived from model.config.hidden_size.
         num_experts: Number of routed experts. If None, derived from moe_config.n_routed_experts
             first, then falls back to model.config attributes.
@@ -448,14 +449,15 @@ def apply_ac(
 
     scopes = normalize_activation_checkpointing_scope(activation_checkpointing_scope)
     checkpoint_decoder = "all" in scopes or "language" in scopes
-    if checkpoint_decoder and not selective and not ignore_router:
+    if checkpoint_decoder and not selective and ignore_router:
         logger.warning(
-            "Activation checkpointing is enabled with ignore_router_for_ac=False. The MoE "
+            "Activation checkpointing is enabled with ignore_router_for_ac=True. The MoE "
             "router/dispatch will be recomputed in the backward pass, which can route a "
             "different number of tokens per expert than the forward pass and crash with "
             "torch.utils.checkpoint.CheckpointError ('Recomputed values ... have different "
-            "metadata'). Set ignore_router_for_ac=True (the default) to save the router "
-            "projection and top-k outputs and keep routing consistent across recompute."
+            "metadata'). Set ignore_router_for_ac=False (the default) to include the router "
+            "projection and top-k outputs in the values saved for backward and keep routing "
+            "consistent across recompute."
         )
 
     if selective:
@@ -577,7 +579,7 @@ def apply_ac(
     for parent_layers, layer_id, block in iter_transformer_and_mtp_blocks(model):
         if mtp_repeated and id(block) in mtp_block_ids:
             continue
-        if ignore_router:
+        if not ignore_router:
             block = ptd_checkpoint_wrapper(
                 block,
                 preserve_rng_state=True,
@@ -935,7 +937,7 @@ def parallelize_model(
     ep_axis_name: str | None = None,
     ep_shard_axis_names: tuple[str, ...] | None = None,
     activation_checkpointing: bool | str = False,
-    ignore_router_for_ac: bool = True,
+    ignore_router_for_ac: bool = False,
     activation_checkpointing_scope: str | list[str] | tuple[str, ...] = "all",
     reshard_after_forward: bool = False,
     lm_head_precision: str | torch.dtype | None = None,

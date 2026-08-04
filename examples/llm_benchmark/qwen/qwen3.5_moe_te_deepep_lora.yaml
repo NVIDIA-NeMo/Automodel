@@ -55,7 +55,7 @@ distributed:
     reshard_after_forward: false
     # fake_balanced_gate makes routing deterministic, so recompute it directly instead of
     # using the selective router cache around Qwen3.5's nested fp32 FSDP holder.
-    ignore_router_for_ac: false
+    ignore_router_for_ac: true
 
 dist_env:
   backend: nccl
