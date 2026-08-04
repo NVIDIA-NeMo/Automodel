@@ -84,6 +84,20 @@ class KimiK3DSparkAttention(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
+        """Attend from the noise block to the frozen target context plus itself.
+
+        Args:
+            hidden_states: Tensor of shape ``[batch, query_length, hidden]``; the
+                noise block that supplies the queries.
+            target_hidden_states: Tensor of shape ``[batch, context_length, hidden]``;
+                the frozen target context, concatenated before ``hidden_states`` to
+                form the keys and values.
+            attention_mask: Optional additive mask of shape
+                ``[batch, 1, query_length, context_length + query_length]``.
+
+        Returns:
+            Tensor of shape ``[batch, query_length, hidden]``.
+        """
         del kwargs
         batch_size, query_length = hidden_states.shape[:-1]
         key_value_states = torch.cat([target_hidden_states, hidden_states], dim=1)
@@ -154,6 +168,19 @@ class KimiK3DSparkDecoderLayer(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
+        """Run one draft layer over the noise block against the target context.
+
+        Args:
+            target_hidden_states: Tensor of shape ``[batch, context_length, hidden]``;
+                the frozen target context supplying the extra keys and values.
+            hidden_states: Tensor of shape ``[batch, query_length, hidden]``; the
+                noise block, also the residual stream.
+            attention_mask: Optional additive mask of shape
+                ``[batch, 1, query_length, context_length + query_length]``.
+
+        Returns:
+            Tensor of shape ``[batch, query_length, hidden]``.
+        """
         del kwargs
         residual = hidden_states
         hidden_states = self.self_attn(
@@ -206,6 +233,22 @@ class KimiK3DSparkModel(DeepseekV4DSparkModel):
         target_hidden_states: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
+        """Project the target context once, then run the draft layers over the noise block.
+
+        Args:
+            position_ids: Tensor of shape ``[batch, sequence]``; unused (NoPE MLA).
+            attention_mask: Optional additive mask of shape
+                ``[batch, 1, query_length, context_length + query_length]``.
+            noise_embedding: Tensor of shape ``[batch, query_length, hidden]``; the
+                noise block that becomes the queries.
+            target_hidden_states: Tensor of shape
+                ``[batch, context_length, len(target_layer_ids) * hidden]``; the
+                concatenated target hidden states, projected by ``fc`` and normed
+                to ``[batch, context_length, hidden]``.
+
+        Returns:
+            Tensor of shape ``[batch, query_length, hidden]``.
+        """
         del position_ids, kwargs
         hidden_states = noise_embedding
         target_hidden_states = self.hidden_norm(self.fc(target_hidden_states))
