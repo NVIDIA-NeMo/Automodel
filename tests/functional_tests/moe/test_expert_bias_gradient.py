@@ -51,3 +51,49 @@ def test_apply_bias_has_deterministic_bf16_bias_gradient():
 
         assert bias.grad is not None
         torch.testing.assert_close(bias.grad, expected_grad, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_apply_bias_preserves_fp32_probability_weighting_in_bias_gradient():
+    """FP32 probability weighting remains FP32 until the BF16 bias gradient is reduced."""
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
+    n_experts = 64
+    n_tokens = 4096
+    hidden = 512
+
+    torch.manual_seed(1234)
+    value = torch.randn(n_tokens, hidden, dtype=torch.bfloat16, device=device)
+    bias_data = torch.randn(n_experts, hidden, dtype=torch.bfloat16, device=device)
+    permuted_probs = torch.rand(n_tokens, 1, dtype=torch.float32, device=device)
+    tokens_per_expert = torch.zeros(n_experts, dtype=torch.long, device=device)
+    tokens_per_expert[0] = n_tokens
+    upstream_grad = torch.randn_like(value)
+
+    reference_bias = bias_data.clone().requires_grad_()
+    reference = torch.cat(
+        [
+            expert_value + expert_bias * expert_probs
+            for expert_value, expert_bias, expert_probs in zip(
+                torch.split(value, tokens_per_expert.tolist()),
+                reference_bias,
+                torch.split(permuted_probs, tokens_per_expert.tolist()),
+            )
+        ]
+    ).to(value.dtype)
+    reference.backward(upstream_grad)
+    expected_grad = reference_bias.grad
+    assert expected_grad is not None
+
+    bias = bias_data.clone().requires_grad_()
+    result = _apply_bias(
+        value,
+        bias=bias,
+        tokens_per_expert=tokens_per_expert,
+        permuted_probs=permuted_probs,
+    )
+    result.backward(upstream_grad)
+
+    assert result.dtype == torch.bfloat16
+    assert bias.grad is not None
+    assert bias.grad.dtype == torch.bfloat16
+    torch.testing.assert_close(bias.grad, expected_grad, rtol=0, atol=0)

@@ -224,7 +224,10 @@ def _apply_bias(value, bias, tokens_per_expert, permuted_probs=None):
     flat_value = value.reshape(-1, shape[-1])
     token_counts = torch.as_tensor(tokens_per_expert, device=bias.device, dtype=torch.long)
     if torch.is_grad_enabled() and bias.requires_grad:
-        expanded_bias = _DeterministicBiasRepeatInterleave.apply(bias, token_counts, flat_value.shape[0])
+        bias_to_expand = bias
+        if permuted_probs is not None:
+            bias_to_expand = bias.to(torch.promote_types(bias.dtype, permuted_probs.dtype))
+        expanded_bias = _DeterministicBiasRepeatInterleave.apply(bias_to_expand, token_counts, flat_value.shape[0])
     else:
         expanded_bias = torch.repeat_interleave(bias, token_counts, dim=0, output_size=flat_value.shape[0])
     if permuted_probs is not None:
