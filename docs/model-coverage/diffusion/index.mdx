@@ -7,7 +7,7 @@ position: 6
 
 Diffusion models are a class of generative models that learn to produce images or videos by iteratively denoising samples from a noise distribution. NeMo AutoModel supports training diffusion models using **flow matching**, a framework that regresses velocity fields along straight interpolation paths between noise and data.
 
-NeMo AutoModel integrates with [Hugging Face Diffusers](https://huggingface.co/docs/diffusers) for model loading and generation, while providing its own distributed training infrastructure via the `TrainDiffusionRecipe`. This recipe handles FSDP2 parallelization, flow matching loss computation, multiresolution bucketed dataloading, and checkpoint management.
+NeMo AutoModel integrates with [Hugging Face Diffusers](https://huggingface.co/docs/diffusers) for model loading and generation while providing its own distributed training infrastructure using `TrainDiffusionRecipe`. This recipe handles FSDP2 parallelization, flow matching loss computation, multiresolution bucketed data loading, and checkpoint management.
 
 ## Supported Models
 
@@ -16,6 +16,7 @@ NeMo AutoModel integrates with [Hugging Face Diffusers](https://huggingface.co/d
 | Wan AI | [Wan 2.1 T2V](/model-coverage/diffusion/wan-2-1-t2v) | Text-to-Video | DiT (Flow Matching) |
 | Black Forest Labs | [FLUX.1-dev](/model-coverage/diffusion/flux-1-dev) | Text-to-Image | DiT (Flow Matching) |
 | Hunyuan Community | [HunyuanVideo 1.5](/model-coverage/diffusion/hunyuanvideo-1-5) | Text-to-Video | DiT (Flow Matching) |
+| Lightricks | [LTX-2.3](/model-coverage/diffusion/ltx-2-3) | Text-to-Video with Audio | Dual-stream DiT (Flow Matching) |
 | Qwen / Alibaba Cloud | [Qwen-Image and Qwen-Image-Edit-2511](/model-coverage/diffusion/qwen-image) | Text-to-Image, Image Editing | DiT (Flow Matching) |
 
 ## Supported Workflows
