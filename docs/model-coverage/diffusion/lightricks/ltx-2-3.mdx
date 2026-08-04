@@ -16,7 +16,7 @@ description: "Fine-tune and generate synchronized video and audio with LTX-2.3"
 
 ## Available Models
 
-- **LTX-2.3**: full-parameter and LoRA fine-tuning with synchronized video and audio
+LTX-2.3 supports full-parameter and LoRA fine-tuning with synchronized video and audio.
 
 ## Example Recipes
 
@@ -42,7 +42,7 @@ uv run python -m tools.diffusion.preprocessing_multiprocess video \
   --caption_format sidecar
 ```
 
-LTX-2.3 requires an explicit frame count of the form `8n+1`, such as 9, 89, or 121. Clips without an audio stream use silence while preserving the video/audio alignment contract.
+LTX-2.3 requires an explicit frame count of the form `8n+1`, such as 9, 89, or 121. Clips without an audio stream use silence while preserving the video and audio alignment contract.
 
 ## Fine-Tune LTX-2.3
 

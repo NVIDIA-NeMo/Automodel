@@ -5,9 +5,9 @@ position: 16
 ---
 ## Introduction
 
-Diffusion models generate images and videos by learning to reverse a noise process — starting from random noise and iteratively refining it into coherent visual output guided by a text prompt. Pretrained diffusion models (like [FLUX.1-dev](https://huggingface.co/black-forest-labs/FLUX.1-dev) for images or [Wan 2.1](https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B-Diffusers) for video) produce impressive general-purpose results, but they know nothing about your particular visual domain, style, or subject matter. Fine-tuning bridges that gap — you adapt the model on your own data so it produces outputs that match your requirements, without the cost of training from scratch.
+Diffusion models generate images and videos by learning to reverse a noise process, starting from random noise and iteratively refining it into coherent visual output guided by a text prompt. Pretrained diffusion models, such as [FLUX.1-dev](https://huggingface.co/black-forest-labs/FLUX.1-dev) for images or [Wan 2.1](https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B-Diffusers) for video, produce impressive general-purpose results, but they know nothing about your particular visual domain, style, or subject matter. Fine-tuning bridges that gap: you adapt the model on your own data so it produces outputs that match your requirements, without the cost of training from scratch.
 
-Under the hood, NeMo AutoModel uses [flow matching](https://arxiv.org/abs/2210.02747), a modern generative framework that learns to transform noise into data by regressing a velocity field along straight interpolation paths. It integrates with [Hugging Face Diffusers](https://huggingface.co/docs/diffusers) to provide distributed fine-tuning for text-to-image and text-to-video models. This guide walks you through the process end-to-end — from installation through training and inference — using [Wan 2.1 T2V 1.3B](https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B-Diffusers) as a running example.
+Under the hood, NeMo AutoModel uses [flow matching](https://arxiv.org/abs/2210.02747), a modern generative framework that learns to transform noise into data by regressing a velocity field along straight interpolation paths. It integrates with [Hugging Face Diffusers](https://huggingface.co/docs/diffusers) to provide distributed fine-tuning for text-to-image and text-to-video models. This guide walks you through the process end to end, from installation through training and inference, using [Wan 2.1 T2V 1.3B](https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B-Diffusers) as a running example.
 
 ### Workflow Overview
 
@@ -22,12 +22,12 @@ Under the hood, NeMo AutoModel uses [flow matching](https://arxiv.org/abs/2210.0
 
 | Step | Section | What You Do |
 |------|---------|-------------|
-| **1. Install** | [Install NeMo AutoModel](#install-nemo-automodel) | Install the package with uv or Docker |
+| **1. Install** | [Install NeMo AutoModel](#install-nemo-automodel) | Install the package with `uv` or Docker |
 | **2. Prepare Data** | [Prepare Your Dataset](#prepare-your-dataset) | Encode raw images/videos into latent cache files |
 | **3. Configure** | [Configure Your Training Recipe](#configure-your-training-recipe) | Write a YAML config specifying model, data, and training settings |
 | **4. Train** | [Fine-Tune the Model](#fine-tune-the-model) | Launch training with `torchrun` on a single node |
 | **4b. Multi-Node** | [Multi-Node Training](#multi-node-training) | Scale training across multiple nodes |
-| **5. Generate** | [Generation / Inference](#generation--inference) | Run inference using the fine-tuned checkpoint |
+| **5. Generate** | [Generation and Inference](#generation-and-inference) | Run inference using the fine-tuned checkpoint |
 
 For model-specific configuration (FLUX.1-dev, HunyuanVideo), see [Model-Specific Notes](#model-specific-notes).
 
@@ -46,7 +46,7 @@ All models use FSDP2 for distributed training and flow matching for loss computa
 ## Install NeMo AutoModel
 
 Diffusion fine-tuning needs the `diffusion` extra plus `diffusion-media` (OpenCV
-for image/video preprocessing and imageio-ffmpeg for T2V export):
+Diffusion fine-tuning requires the `diffusion` and `diffusion-media` extras. The `diffusion-media` extra provides OpenCV for image and video preprocessing and imageio-ffmpeg for T2V export:
 
 ```bash
 uv venv
@@ -54,7 +54,7 @@ source .venv/bin/activate
 uv pip install "nemo-automodel[diffusion,diffusion-media]"
 ```
 
-Alternatively, if you run into dependency or driver issues, use the pre-built Docker container:
+Alternatively, if you run into dependency or driver issues, use the prebuilt Docker container:
 
 ```bash
 docker pull nvcr.io/nvidia/nemo-automodel:26.06.00
@@ -67,6 +67,7 @@ Media dependencies are not installed in the Docker container by default. Add the
 ```bash
 cd /opt/Automodel && uv pip install ".[diffusion-media]"
 ```
+
 </Note>
 
 <Info>
@@ -81,13 +82,14 @@ For the full set of installation methods, see the [installation guide](/get-star
 Diffusion models operate in latent space — a compressed representation of visual data — rather than directly on raw images or videos. To avoid re-encoding data on every training step, the preprocessing
   pipeline encodes all inputs ahead of time and saves them as `.meta` or `.pt` cache files.
 
- Each cache file contains:
- - Latent representations produced by a VAE (Variational Autoencoder) from the raw visual data
- - Text embeddings produced by a text encoder from the associated captions/prompts
+Each cache file contains:
+
+- Latent representations produced by a variational autoencoder (VAE) from the raw visual data
+- Text embeddings produced by a text encoder from the associated captions or prompts
 
 Fine-tuning then operates entirely on these pre-encoded cache files, which is significantly faster than encoding on the fly.
 
-Preprocess your data using the built-in tool at [`tools/diffusion/preprocessing_multiprocess.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/tools/diffusion/preprocessing_multiprocess.py). The script provides `image` and `video` subcommands:
+Preprocess your data using the built-in tool at [`tools/diffusion/preprocessing_multiprocess.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/tools/diffusion/preprocessing_multiprocess.py). The script provides `image` and `video` subcommands.
 
 **Video preprocessing (using Wan 2.1 as a running example):**
 ```bash
@@ -139,9 +141,10 @@ Fine-tuning is driven by two components:
 
 1. A recipe script (e.g., [`train.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/diffusion/train.py)) — the Python entry point that orchestrates the training loop: loading the model, building the dataloader, running forward/backward passes, computing the flow matching loss, checkpointing, and logging.
 2. A YAML configuration file — a text file in YAML format that specifies all settings the recipe uses: which model to fine-tune, where the data lives, optimizer hyperparameters, parallelism strategy, etc.
-  You customize training by editing this file rather than modifying code, allowing you to scale from 1 to 100s of GPUs seamlessly.
+1. A recipe script, for example [`train.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/diffusion/train.py), is the Python entry point that orchestrates the training loop: loading the model, building the data loader, running forward and backward passes, computing the flow matching loss, checkpointing, and logging.
+2. A YAML configuration file is a text file in YAML format that specifies all settings the recipe uses: which model to fine-tune, where the data lives, optimizer hyperparameters, parallelism strategy, and other settings. You customize training by editing this file rather than modifying code, allowing you to scale seamlessly from 1 to hundreds of GPUs.
 
-Below is the annotated [wan2_1_t2v_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/wan2_1_t2v_flow.yaml), with each section explained:
+The following annotated [`wan2_1_t2v_flow.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/wan2_1_t2v_flow.yaml) config explains each section:
 
 ```yaml
 seed: 42
@@ -258,7 +261,7 @@ Adjust `--nproc-per-node` to match the number of GPUs on your node, and ensure `
 
 ## Multi-Node Training
 
-When a single node doesn't provide enough GPUs or memory for your workload, you can scale training across multiple nodes. NeMo AutoModel handles multi-node distributed training through `torchrun` rendezvous and FSDP2 — the same recipe script works on one node or many.
+When a single node does not provide enough GPUs or memory for your workload, you can scale training across multiple nodes. NeMo AutoModel handles multi-node distributed training through `torchrun` rendezvous and FSDP2. The same recipe script works on one node or many.
 
 ### YAML Configuration Changes
 
@@ -298,7 +301,7 @@ torchrun \
 
 ## Model-Specific Notes
 
-Use the table below to pick the right model for your use case:
+Use the following table to select a model for your use case:
 
 | Use Case | Model | Why Choose It |
 |----------|-------|---------------|
@@ -362,9 +365,9 @@ Use the table below to pick the right model for your use case:
 - **Loss**: applies a shared noise level to synchronized video and audio latents and adds the weighted audio loss
 - **Configs**: [full fine-tuning](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/ltx2_3_t2v_flow.yaml) and [LoRA](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/ltx2_3_t2v_flow_lora.yaml)
 
-## Generation / Inference
+## Generation and Inference
 
-Once training is complete, you can use the model to generate images or videos from text prompts. This step is called inference — as opposed to training, where the model learns from data, inference is where it produces new outputs.
+After training is complete, you can use the model to generate images or videos from text prompts. This step is called inference. Unlike training, where the model learns from data, inference is where it produces new outputs.
 
 In diffusion models, generation works by starting from random noise and iteratively denoising it, guided by your text prompt, until a clean image or video emerges.
 
@@ -378,7 +381,7 @@ python examples/diffusion/generate/generate.py \
 
 **Multi-GPU (Wan 2.1 1.3B):**
 
-Wan 2.1 supports tensor parallelism for inference, which shards the transformer across GPUs to reduce per-GPU memory. Pass the `distributed` config via CLI overrides:
+Wan 2.1 supports tensor parallelism for inference, which shards the transformer across GPUs to reduce per-GPU memory. Pass the `distributed` config using CLI overrides:
 
 ```bash
 torchrun --nproc-per-node=8 \
@@ -432,7 +435,7 @@ You can use `--model.checkpoint ./checkpoints/LATEST` to automatically load the 
 
 | Component | Minimum | Recommended |
 |-----------|---------|-------------|
-| GPU | A100 40GB | A100 80GB / H100 |
+| GPU | A100 40 GB | A100 80 GB / H100 |
 | GPUs | 4 | 8 |
 | RAM | 128 GB | 256 GB+ |
 | Storage | 500 GB SSD | 2 TB NVMe |
