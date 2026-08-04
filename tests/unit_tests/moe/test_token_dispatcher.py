@@ -65,29 +65,41 @@ class TestIndicesToMultihot:
         probs = torch.tensor([[0.6, 0.4], [0.7, 0.0]])
         processor = _HybridEPMetadataProcessor(num_experts=8, permute_fusion=False)
 
-        expected_routing, expected_probs = hybrid_ep_manager._indices_to_multihot(indices, probs)
-        actual_routing, actual_probs = processor(indices, probs)
+        _, expected = hybrid_ep_manager._indices_to_multihot(indices, probs)
+        actual = processor(indices, probs)
 
-        torch.testing.assert_close(actual_routing, expected_routing)
-        torch.testing.assert_close(actual_probs, expected_probs)
+        torch.testing.assert_close(actual, expected)
 
     def test_scoped_processor_preserves_dense_probability_gradients(self):
         indices = torch.tensor([[0, 3], [1, 5]])
         probs = torch.tensor([[0.6, 0.4], [0.7, 0.3]], requires_grad=True)
         processor = _HybridEPMetadataProcessor(num_experts=8, permute_fusion=False)
 
-        _, dense_probs = processor(indices, probs)
+        dense_probs = processor(indices, probs)
         dense_weights = torch.arange(16, dtype=dense_probs.dtype).reshape(2, 8)
         (dense_probs * dense_weights).sum().backward()
 
         expected_grad = dense_weights.gather(1, indices)
         torch.testing.assert_close(probs.grad, expected_grad)
 
-    def test_dispatch_passes_dense_routing_and_probs(self, hybrid_ep_manager):
-        routing_map = torch.tensor([[True, False], [False, True]])
+    def test_fused_configuration_preserves_dense_probability_gradients(self):
+        indices = torch.tensor([[0, 3], [1, -1]])
+        probs = torch.tensor([[0.6, 0.4], [0.7, 0.3]], requires_grad=True)
+        processor = _HybridEPMetadataProcessor(num_experts=8, permute_fusion=True)
+
+        dense_probs = processor(indices, probs)
+        dense_weights = torch.arange(16, dtype=dense_probs.dtype).reshape(2, 8)
+        (dense_probs * dense_weights).sum().backward()
+
+        assert dense_probs.shape == (2, 8)
+        torch.testing.assert_close(probs.grad, torch.tensor([[0.0, 3.0], [9.0, 0.0]]))
+
+    def test_dispatch_passes_compact_indices_and_dense_probs(self, hybrid_ep_manager):
+        token_indices = torch.tensor([[0, 3], [1, 5]])
         dense_probs = torch.zeros(2, 8)
         hidden = torch.randn(2, 4)
-        hybrid_ep_manager.routing_map = routing_map
+        hybrid_ep_manager.token_indices = token_indices
+        hybrid_ep_manager.routing_map = None
         hybrid_ep_manager.token_probs = dense_probs
         dispatch = Mock(return_value=(hidden, dense_probs, None, torch.tensor([1, 1]), object()))
 
@@ -97,17 +109,18 @@ class TestIndicesToMultihot:
         assert actual is hidden
         dispatch.assert_called_once()
         kwargs = dispatch.call_args.kwargs
-        assert kwargs["routing_map"] is routing_map
+        assert kwargs["topk_idx"] is token_indices
+        assert kwargs["routing_map"] is None
         assert kwargs["probs"] is dense_probs
-        assert "topk_idx" not in kwargs
-        assert "num_experts" not in kwargs
+        assert kwargs["num_experts"] == 8
 
     def test_permute_fusion_is_forwarded_to_dispatch_and_combine(self, hybrid_ep_manager):
         manager = hybrid_ep_manager
         manager.moe_hybridep_permute_fusion = True
         hidden = torch.randn(2, 4)
         dense_probs = torch.zeros(2, 8)
-        manager.routing_map = torch.tensor([[True, False], [False, True]])
+        manager.token_indices = torch.tensor([[0, 3], [1, 5]])
+        manager.routing_map = None
         manager.token_probs = dense_probs
         handle = object()
         dispatch = Mock(return_value=(hidden, dense_probs, None, torch.tensor([1, 1]), handle))
@@ -128,7 +141,8 @@ class TestIndicesToMultihot:
         manager.moe_hybridep_num_sms_preprocessing = 132
         manager.moe_hybridep_num_blocks_permute = 112
         manager.moe_hybridep_num_blocks_unpermute = 111
-        manager.routing_map = torch.tensor([[True, False], [False, True]])
+        manager.token_indices = torch.tensor([[0, 3], [1, 5]])
+        manager.routing_map = None
         manager.token_probs = torch.zeros(2, 8)
         dispatch = Mock(return_value=(torch.randn(2, 4), None, None, torch.tensor([1, 1]), object()))
 
@@ -140,7 +154,7 @@ class TestIndicesToMultihot:
         assert kwargs["num_blocks_permute"] == 112
         assert kwargs["num_blocks_unpermute"] == 111
 
-    def test_dispatch_preprocess_expands_dense_routing(self, hybrid_ep_manager):
+    def test_dispatch_preprocess_retains_compact_indices(self, hybrid_ep_manager):
         dispatcher = object.__new__(MoEFlexTokenDispatcher)
         dispatcher._comm_manager = hybrid_ep_manager
         dispatcher.hybridep_metadata_processor = _HybridEPMetadataProcessor(num_experts=8, permute_fusion=False)
@@ -151,8 +165,8 @@ class TestIndicesToMultihot:
         actual_hidden, actual_probs = dispatcher.dispatch_preprocess2(hidden, 2, token_probs, token_indices)
 
         assert actual_hidden.data_ptr() == hidden.data_ptr()
-        assert hybrid_ep_manager.routing_map.shape == (2, 8)
-        assert hybrid_ep_manager.routing_map.sum() == 4
+        assert hybrid_ep_manager.token_indices is token_indices
+        assert hybrid_ep_manager.routing_map is None
         assert actual_probs.shape == (2, 8)
 
     def test_topk_1(self, hybrid_ep_manager):
