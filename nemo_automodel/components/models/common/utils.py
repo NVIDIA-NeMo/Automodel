@@ -15,7 +15,7 @@
 import importlib.util
 import logging
 from contextlib import contextmanager, nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal
 
 import torch
@@ -155,6 +155,41 @@ class TEFp8Config:
 
 
 @dataclass(kw_only=True)
+class CudaGraphConfig:
+    """Configuration for scoped partial CUDA graphs.
+
+    Attributes:
+        modules: Per-layer modules to capture with Transformer Engine, following
+            Megatron Core's module names. AutoModel supports whole ``attn``,
+            ``moe_router``, and ``moe_preprocess`` scopes, plus the
+            AutoModel-specific narrow ``te_dpa`` scope. An empty list disables
+            CUDA graphs.
+    """
+
+    modules: list[Literal["attn", "te_dpa", "moe_router", "moe_preprocess"]] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        """Validate the declarative CUDA-graph configuration."""
+        if not isinstance(self.modules, list):
+            raise TypeError("cuda_graph.modules must be a list")
+        if not all(isinstance(module, str) for module in self.modules):
+            raise TypeError("cuda_graph.modules entries must be strings")
+        supported_modules = {"attn", "te_dpa", "moe_router", "moe_preprocess"}
+        unknown_modules = set(self.modules) - supported_modules
+        if unknown_modules:
+            raise ValueError(
+                f"Unsupported cuda_graph.modules: {sorted(unknown_modules)}; "
+                f"supported modules are {sorted(supported_modules)}"
+            )
+        if len(self.modules) != len(set(self.modules)):
+            raise ValueError("cuda_graph.modules must not contain duplicates")
+        if {"attn", "te_dpa"}.issubset(self.modules):
+            raise ValueError("cuda_graph.modules cannot contain both 'attn' and 'te_dpa'")
+        if "moe_preprocess" in self.modules and "moe_router" not in self.modules:
+            raise ValueError("'moe_preprocess' in cuda_graph.modules requires 'moe_router'")
+
+
+@dataclass(kw_only=True)
 class BackendConfig:
     """Backend configuration for model components.
 
@@ -200,6 +235,7 @@ class BackendConfig:
         hub_kernels: Optional Hub kernel repo settings for native ``attn="hub"``.
             HF models should set ``attn_implementation`` and ``use_kernels`` on
             ``NeMoAutoModel`` instead.
+        cuda_graph: Scoped partial CUDA-graph configuration.
     """
 
     attn: Literal["te", "sdpa", "flex", "eager", "hub", "tilelang"] = (
@@ -239,8 +275,9 @@ class BackendConfig:
     # rope_fusion=False. Default False.
     compile_attn: bool = False
     hub_kernels: HubKernelConfig | None = None
+    cuda_graph: CudaGraphConfig = field(default_factory=CudaGraphConfig)
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         # QuACK consumes position-gathered cosine/sine tables. TE's fused RoPE path
         # instead assumes contiguous [0, seq_len) positions, so combining the two
         # silently produces incorrect phases for packed, offset, or per-example
@@ -263,6 +300,11 @@ class BackendConfig:
 
         if isinstance(self.hub_kernels, dict):
             self.hub_kernels = HubKernelConfig(**self.hub_kernels)
+
+        if isinstance(self.cuda_graph, dict):
+            self.cuda_graph = CudaGraphConfig(**self.cuda_graph)
+        elif not isinstance(self.cuda_graph, CudaGraphConfig):
+            raise TypeError("cuda_graph must be a CudaGraphConfig or mapping")
 
         if isinstance(self.gate_precision, str):
             self.gate_precision = dtype_from_str(self.gate_precision, default=None)
@@ -293,6 +335,27 @@ class BackendConfig:
             self.dispatcher = "torch"
             self.experts = "torch_mm"
 
+        graph_modules = self.cuda_graph.modules
+        attention_graph_modules = {"attn", "te_dpa"}.intersection(graph_modules)
+        if attention_graph_modules and self.attn != "te":
+            raise ValueError(f"{sorted(attention_graph_modules)} in cuda_graph.modules requires attn='te'")
+        if "attn" in graph_modules and self.linear != "torch":
+            raise ValueError("'attn' in cuda_graph.modules currently requires linear='torch'")
+        if "attn" in graph_modules and self.rms_norm != "torch":
+            raise ValueError("'attn' in cuda_graph.modules currently requires rms_norm='torch'")
+        if "attn" in graph_modules and self.rope_fusion:
+            raise ValueError("'attn' in cuda_graph.modules currently requires rope_fusion=False")
+        if attention_graph_modules and self.te_fp8 is not None:
+            recipe_fp8_dpa = getattr(self.te_fp8.recipe, "fp8_dpa", False)
+            if recipe_fp8_dpa:
+                raise ValueError(
+                    f"{sorted(attention_graph_modules)} in cuda_graph.modules requires BF16 dot-product attention "
+                    "(fp8_dpa=False)"
+                )
+        if "moe_router" in graph_modules and self.fake_balanced_gate:
+            raise ValueError("'moe_router' in cuda_graph.modules requires the learned Gate (fake_balanced_gate=False)")
+        if "moe_preprocess" in graph_modules and self.dispatcher != "hybridep":
+            raise ValueError("'moe_preprocess' in cuda_graph.modules requires dispatcher='hybridep'")
         # FP8 requires at least one TE backend (applies to all TE modules: Linear, GroupedLinear, RMSNorm)
         if self.te_fp8 is not None and self.linear != "te" and self.experts != "te":
             raise ValueError(

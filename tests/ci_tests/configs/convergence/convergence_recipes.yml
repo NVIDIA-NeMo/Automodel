@@ -1,0 +1,25 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Weekly Tulu-3 convergence recipes. Each is trained to completion (1000 steps)
+# then gated on downstream IFEval vs a recorded baseline (see each recipe's
+# ci.downstream_eval block) by convergence_tests_launcher.sh.
+#
+# One recipe per model -- the single config we validated end to end.
+
+examples_dir: convergence
+configs:
+  - tulu3/models/moonlight-16b/moonlight_16b_ep8_te_fusedadam.yaml
+  - tulu3/models/qwen3-moe-30b/qwen3_moe_30b_ep8_te_fusedadam.yaml
+  - tulu3/models/gemma4-31b/gemma4_31b_tulu3_packed2k_cp1_gbs32_4node.yaml

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib
 import logging
 from typing import Callable, Optional, Type, Union
 
@@ -30,6 +31,9 @@ def _get_model_type(pretrained_model_name_or_path: str, trust_remote_code: bool 
         The model_type string, or None if it cannot be determined
     """
     try:
+        # Ensure AutoModel's local custom configs are registered before asking
+        # AutoConfig to inspect a checkpoint that advertises remote code.
+        importlib.import_module("nemo_automodel._transformers.registry")
         from transformers import AutoConfig
 
         config = AutoConfig.from_pretrained(pretrained_model_name_or_path, trust_remote_code=trust_remote_code)
@@ -56,14 +60,17 @@ class NeMoAutoTokenizer:
 
     The dispatch logic is:
     1. If a custom tokenizer is registered for the model type, use it
-    2. Otherwise, fall back to NeMoAutoTokenizerWithBosEosEnforced
+    2. Otherwise, fall back to the wrapped HuggingFace tokenizer
 
     Example:
         >>> # Will use MistralCommonBackend if available for Mistral models
         >>> tokenizer = NeMoAutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1")
 
-        >>> # Force using HF AutoTokenizer with BOS/EOS enforcement
+        >>> # Force using the wrapped HF AutoTokenizer instead of a registered tokenizer
         >>> tokenizer = NeMoAutoTokenizer.from_pretrained("gpt2", force_default=True)
+
+        >>> # Explicitly opt in to BOS/EOS insertion
+        >>> tokenizer = NeMoAutoTokenizer.from_pretrained("gpt2", add_bos_token=True, add_eos_token=True)
     """
 
     # Make registry accessible at class level
@@ -95,7 +102,7 @@ class NeMoAutoTokenizer:
 
         Args:
             pretrained_model_name_or_path: Model identifier or path
-            force_default: If True, always use NeMoAutoTokenizerWithBosEosEnforced
+            force_default: If True, always use the wrapped HuggingFace tokenizer.
             force_hf: If True, return the raw HF AutoTokenizer without any wrapping
             trust_remote_code: Whether to trust remote code when loading config
             **kwargs: Additional arguments passed to the tokenizer's from_pretrained
@@ -126,7 +133,8 @@ class NeMoAutoTokenizer:
                 _ensure_pad_token_id(tokenizer, pretrained_model_name_or_path)
                 return tokenizer
 
-        # Fall back to default BOS/EOS enforced tokenizer
+        # Fall back to the default wrapped HuggingFace tokenizer. BOS/EOS insertion
+        # is enabled only when callers opt in via add_bos_token/add_eos_token.
         from nemo_automodel._transformers.tokenization.nemo_auto_tokenizer import NeMoAutoTokenizerWithBosEosEnforced
 
         return NeMoAutoTokenizerWithBosEosEnforced.from_pretrained(

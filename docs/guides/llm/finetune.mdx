@@ -741,7 +741,8 @@ distributed:
 prewarm:
   cublas_backward: false   # initialize cuBLAS backward workspaces during setup
   fla_gdn_autotune: false  # autotune FLA gated-delta-net Triton kernels during setup
-  comm_groups: false      # initialize grad-norm communication groups during setup
+  mamba_ssd_autotune: false # autotune Mamba SSD Triton kernels during setup
+  comm_groups: false       # initialize grad-norm communication groups during setup
 
 # Random Number Generator
 # The recipe constructs its checkpointable, rank-aware StatefulRNG from this seed.

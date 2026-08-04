@@ -32,7 +32,7 @@ import sys
 import time
 import traceback
 from collections.abc import Callable
-from contextlib import AbstractContextManager, nullcontext
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from pathlib import Path
 
 import datasets
@@ -143,14 +143,14 @@ def _get_input_ids(tokenizer_name: str | None) -> list[int]:
     return tokenizer.encode(_DEFAULT_PROMPT, add_special_tokens=False)
 
 
-def _load_hf_fp8_dequantized_config(
+def _load_hf_config(
     pretrained_model_name_or_path: str | Path,
     *,
     trust_remote_code: bool,
     revision: str | None = None,
     token: str | bool | None = None,
 ):
-    """Return an HF config that dequantizes a fine-grained FP8 checkpoint, if applicable."""
+    """Load the HF config used by a vanilla-reference model."""
     from transformers import AutoConfig
 
     config_kwargs: dict[str, str | bool] = {
@@ -161,7 +161,23 @@ def _load_hf_fp8_dequantized_config(
         config_kwargs["revision"] = revision
     if token is not None:
         config_kwargs["token"] = token
-    config = AutoConfig.from_pretrained(pretrained_model_name_or_path, **config_kwargs)
+    return AutoConfig.from_pretrained(pretrained_model_name_or_path, **config_kwargs)
+
+
+def _load_hf_fp8_dequantized_config(
+    pretrained_model_name_or_path: str | Path,
+    *,
+    trust_remote_code: bool,
+    revision: str | None = None,
+    token: str | bool | None = None,
+):
+    """Return an HF config that dequantizes a fine-grained FP8 checkpoint, if applicable."""
+    config = _load_hf_config(
+        pretrained_model_name_or_path,
+        trust_remote_code=trust_remote_code,
+        revision=revision,
+        token=token,
+    )
     quantization_config = getattr(config, "quantization_config", None)
     if isinstance(quantization_config, dict):
         quant_method = quantization_config.get("quant_method")
@@ -425,6 +441,41 @@ def _release_model_memory() -> None:
         torch.cuda.empty_cache()
 
 
+def _hf_fp32_module_names(hf_config: object) -> tuple[str, ...]:
+    """Infer vanilla-HF fp32 names from AutoModel's model-owned checkpoint contract."""
+    from nemo_automodel._transformers.model_init import _resolve_custom_model_cls_for_config
+    from nemo_automodel.components.models.common.gated_delta_net_fp32 import (
+        FP32_GDN_PARAM_NAMES,
+        has_gated_delta_net_fp32_checkpoint_contract,
+    )
+
+    module_names = list(FP32_GDN_PARAM_NAMES) if has_gated_delta_net_fp32_checkpoint_contract(hf_config) else []
+    model_cls = _resolve_custom_model_cls_for_config(hf_config)
+    for name in getattr(model_cls, "_keep_in_fp32_modules_strict", None) or ():
+        if name not in module_names:
+            module_names.append(name)
+    return tuple(module_names)
+
+
+@contextmanager
+def _keep_hf_modules_in_fp32(hf_config: object):
+    """Apply AutoModel's fp32 checkpoint contract while loading a vanilla HF model."""
+    module_names = _hf_fp32_module_names(hf_config)
+    if not module_names:
+        yield
+        return
+
+    from transformers import PreTrainedModel
+
+    attr = "_keep_in_fp32_modules_strict"
+    previous = getattr(PreTrainedModel, attr, None)
+    setattr(PreTrainedModel, attr, set(previous or ()) | set(module_names))
+    try:
+        yield
+    finally:
+        setattr(PreTrainedModel, attr, previous)
+
+
 def _preinit_global_rank() -> int:
     """Return the torchrun global rank before torch.distributed is initialized."""
     if dist.is_initialized():
@@ -669,13 +720,22 @@ def _prepare_source_load_reference_rank0(
         if fp8_config is not None:
             hf_kwargs["config"] = fp8_config
 
+    hf_config = hf_kwargs.get("config")
+    if hf_config is None:
+        hf_config = _load_hf_config(
+            original_pretrained_path,
+            trust_remote_code=hf_kwargs["trust_remote_code"],
+            revision=hf_kwargs.get("revision"),
+            token=hf_kwargs.get("token"),
+        )
+
     model_load_context = _hf_model_load_context(
         trust_remote_code=trust_remote_code,
         has_device_map="device_map" in hf_kwargs,
     )
 
     print(f"\n[Phase 0] Source-load reference: vanilla HF for {original_pretrained_path}")
-    with model_load_context:
+    with model_load_context, _keep_hf_modules_in_fp32(hf_config):
         if "device_map" in hf_kwargs:
             hf_model = hf_model_cls.from_pretrained(original_pretrained_path, **hf_kwargs)
         else:
@@ -703,7 +763,7 @@ def _prepare_source_load_reference_rank0(
 def _compare_source_load_parity(
     source_reference: tuple[torch.Tensor, bool | None, bool | None] | None,
     candidate_logits: torch.Tensor,
-    candidate_model,
+    candidate_aliased: bool | None,
     *,
     source_load_kl_threshold: float,
     source_load_mean_kl_threshold: float,
@@ -715,7 +775,7 @@ def _compare_source_load_parity(
         source_reference: Rank-0 tuple containing logits of shape [batch, sequence, vocab], the HF input/output
             embedding alias state, and the explicit tie-word-embeddings setting. Other ranks pass ``None``.
         candidate_logits: Constructed trainer logits of shape [batch, sequence, vocab].
-        candidate_model: Constructed trainer model used to inspect input/output embedding aliasing.
+        candidate_aliased: Constructed trainer input/output embedding alias state.
         source_load_kl_threshold: Maximum allowed per-token KL divergence.
         source_load_mean_kl_threshold: Maximum allowed mean per-token KL divergence.
         source_load_cosine_threshold: Minimum allowed cosine similarity over flattened logits.
@@ -724,7 +784,6 @@ def _compare_source_load_parity(
         Synchronized failure traceback when source-load parity fails, otherwise ``None``. The caller may defer this
         failure until independent checkpoint reload and resume phases have completed.
     """
-    candidate_aliased = _lm_head_embedding_aliased(candidate_model)
     failure_message = None
     if _rank0():
         try:
@@ -806,9 +865,13 @@ def _get_logits_pp(trainer, input_ids, device) -> torch.Tensor:
         if pp_seq_len:
             return pp_seq_len
         for stage in getattr(trainer.pp.info, "stages", None) or ():
-            for meta in getattr(stage, "inputs_meta", None) or ():
-                if meta.ndim >= 2 and meta.shape[1] > 0:
-                    return meta.shape[1]
+            inputs_meta = getattr(stage, "inputs_meta", None)
+            if not inputs_meta:
+                inputs_meta = getattr(getattr(stage, "_user_meta", None), "inputs", None)
+            for meta in inputs_meta or ():
+                shape = getattr(meta, "shape", ())
+                if len(shape) >= 2 and shape[1] > 0:
+                    return shape[1]
         ds_seq_length = trainer.cfg.get("dataset.seq_length", None)
         return ds_seq_length or orig_seq_len
 
@@ -1107,7 +1170,7 @@ def run_checkpoint_robustness(
         source_load_failure = _compare_source_load_parity(
             source_load_reference,
             trainer_source_logits,
-            trainer.model_parts[0],
+            _lm_head_embedding_aliased(trainer.model_parts[0]),
             source_load_kl_threshold=source_load_kl_threshold,
             source_load_mean_kl_threshold=source_load_mean_kl_threshold,
             source_load_cosine_threshold=source_load_cosine_threshold,
@@ -1148,7 +1211,7 @@ def run_checkpoint_robustness(
     device = next(trainer.model_parts[0].parameters()).device
     reference_logits = _get_logits(trainer.model_parts[0], input_ids, device, trainer=trainer)
 
-    # Phase 3: Reload automodel from consolidated checkpoint
+    # Locate the Phase 1 checkpoint used by the reload and resume checks.
     checkpoint_dir = Path(cfg.checkpoint.checkpoint_dir)
     ckpt_step_dirs = sorted(checkpoint_dir.glob("epoch_*_step_*"))
     assert len(ckpt_step_dirs) > 0, f"No checkpoint subdirectories found under {checkpoint_dir}"
@@ -1172,6 +1235,7 @@ def run_checkpoint_robustness(
     _release_recipe_memory(trainer)
     del trainer
 
+    # Phase 3: Reload AutoModel from the consolidated checkpoint.
     # Phantom key check: scan consolidated safetensors for leaked quantization keys
     if check_phantom_keys and _rank0():
         from safetensors import safe_open
@@ -1225,9 +1289,10 @@ def run_checkpoint_robustness(
         )
     _record_deferred_failure(deferred_failures, "Phase 3 AutoModel reload parity", automodel_reload_error)
 
-    # Phase 4: Load into vanilla HF (rank 0 only)
     _release_recipe_memory(restored_trainer)
     del restored_trainer
+
+    # Phase 4: Load into vanilla HF (rank 0 only)
     hf_reload_sync_paths = _prepare_hf_reload_sync(cfg)
 
     hf_reload_error = None
@@ -1235,6 +1300,7 @@ def run_checkpoint_robustness(
         if _rank0():
             print("[Phase 4] Skipped (ci.checkpoint_robustness.skip_hf_reload=true).")
     elif _rank0():
+        config_path = original_pretrained_path if is_peft else consolidated_dir
         hf_kwargs = dict(
             torch_dtype=torch.bfloat16,
             trust_remote_code=trust_remote_code,
@@ -1244,7 +1310,6 @@ def run_checkpoint_robustness(
         # rejects. Select a supported implementation while keeping Nemotron-H
         # off HF's incompatible FlashAttention varlen path.
         if trust_remote_code and "attn_implementation" not in hf_kwargs:
-            config_path = original_pretrained_path if is_peft else consolidated_dir
             hf_kwargs["attn_implementation"] = _get_trust_remote_code_attn_implementation(config_path)
         if experts_implementation and not trust_remote_code:
             hf_kwargs["experts_implementation"] = experts_implementation
@@ -1254,13 +1319,18 @@ def run_checkpoint_robustness(
         if original_quantization_config is not None:
             hf_kwargs["quantization_config"] = original_quantization_config
         else:
-            config_path = original_pretrained_path if is_peft else consolidated_dir
             fp8_config = _load_hf_fp8_dequantized_config(
                 config_path,
                 trust_remote_code=trust_remote_code,
             )
             if fp8_config is not None:
                 hf_kwargs["config"] = fp8_config
+        hf_config = hf_kwargs.get("config")
+        if hf_config is None:
+            hf_config = _load_hf_config(
+                config_path,
+                trust_remote_code=trust_remote_code,
+            )
         # Load the reference model straight onto the target GPU. Materialising a
         # 14B checkpoint on CPU and then ``.to(device)`` costs ~50-225s, and that
         # rank-0-only stall trips the NCCL watchdog while the other ranks idle at
@@ -1279,7 +1349,7 @@ def run_checkpoint_robustness(
         if is_peft:
             from peft import PeftModel
 
-            with model_load_context:
+            with model_load_context, _keep_hf_modules_in_fp32(hf_config):
                 if "device_map" in hf_kwargs:
                     base_model = hf_model_cls.from_pretrained(original_pretrained_path, **hf_kwargs)
                 else:
@@ -1326,7 +1396,7 @@ def run_checkpoint_robustness(
             del peft_model, base_model
         else:
             _prepopulate_hf_dynamic_modules_cache(consolidated_dir)
-            with model_load_context:
+            with model_load_context, _keep_hf_modules_in_fp32(hf_config):
                 if "device_map" in hf_kwargs:
                     hf_model = hf_model_cls.from_pretrained(str(consolidated_dir), **hf_kwargs)
                 else:
@@ -1357,6 +1427,8 @@ def run_checkpoint_robustness(
                 "KL divergence between original and HF-loaded model too large: "
                 f"max per-token KL = {max_kl_hf:.6e} > threshold {hf_kl_threshold:.6e}"
             )
+        del hf_logits
+        _release_model_memory()
 
     hf_reload_error = _finish_hf_reload_sync(hf_reload_sync_paths, hf_reload_error)
     _record_deferred_failure(deferred_failures, "Phase 4 HF reload parity", hf_reload_error)

@@ -164,6 +164,9 @@ navigation:
             path: ../../model-coverage/llm/openbmb/minicpm.mdx
           - page: "Moonlight"
             path: ../../model-coverage/llm/moonshotai/moonlight.mdx
+          - page: "Kimi K3"
+            path: ../../model-coverage/llm/moonshotai/kimi-k3.mdx
+            slug: kimi-k3
           - page: "Seed (ByteDance)"
             path: ../../model-coverage/llm/bytedance-seed/seed.mdx
           - page: "Solar Pro"
@@ -194,6 +197,8 @@ navigation:
             slug: overview
           - page: "Kimi-VL"
             path: ../../model-coverage/vlm/moonshotai/kimi-vl.mdx
+          - page: "Kimi-K3"
+            path: ../../model-coverage/vlm/moonshotai/kimi-k3.mdx
           - page: "Inkling"
             path: ../../model-coverage/vlm/thinkingmachines/inkling.mdx
           - page: "Gemma 3 VL / Gemma 3n"
@@ -284,6 +289,9 @@ navigation:
           - page: "HunyuanVideo 1.5"
             path: ../../model-coverage/diffusion/hunyuanvideo-community/hunyuanvideo.mdx
             slug: hunyuanvideo-1-5
+          - page: "LTX-2.3"
+            path: ../../model-coverage/diffusion/lightricks/ltx-2-3.mdx
+            slug: ltx-2-3
           - page: "Qwen-Image"
             path: ../../model-coverage/diffusion/qwen/qwen-image.mdx
       - section: "Embedding Models"
@@ -454,6 +462,9 @@ navigation:
       - page: "Pipeline Parallelism"
         path: ../../guides/pipelining.mdx
         slug: pipeline-parallelism
+      - page: "Context-Parallel Vision Frame Sharding"
+        path: ../../guides/cp-vision-frame-sharding.mdx
+        slug: cp-vision-frame-sharding
       - page: "FP8 Training"
         path: ../../guides/fp8-training.mdx
         slug: fp8-training

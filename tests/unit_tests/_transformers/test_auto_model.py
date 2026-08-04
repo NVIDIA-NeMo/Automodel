@@ -33,7 +33,7 @@ from nemo_automodel._transformers.auto_model import (
     _patch_remote_code_compat,
     _resolve_distributed_setup,
 )
-from nemo_automodel._transformers.infrastructure import _apply_peft_and_lower_precision
+from nemo_automodel._transformers.infrastructure import _apply_peft_and_lower_precision, instantiate_infrastructure
 from nemo_automodel._transformers.model_init import (
     _filter_kwargs_for_init,
     _filter_meta_device_from_init_context,
@@ -43,7 +43,12 @@ from nemo_automodel._transformers.model_init import (
     no_hf_meta_device,
 )
 from nemo_automodel.components.checkpoint.utils import _get_checkpoint_tensor_dtypes
-from nemo_automodel.components.distributed.config import DistributedSetup, FSDP2Config, MoEParallelizerConfig
+from nemo_automodel.components.distributed.config import (
+    DistributedSetup,
+    FSDP2Config,
+    MoEParallelizerConfig,
+    MultimodalDistributedConfig,
+)
 from nemo_automodel.components.distributed.mesh import MeshAxisName, MeshContext
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 
@@ -120,6 +125,21 @@ class TestResolveMeshContext:
         assert isinstance(setup.mesh_context, MeshContext)
         assert setup.strategy_config is None
         assert setup.activation_checkpointing is False
+
+    def test_infrastructure_forwards_frozen_multimodal_sharding_to_moe_parallelizer(self):
+        device_mesh = _FakeMesh({MeshAxisName.DP_SHARD: 2, MeshAxisName.CP: 1, MeshAxisName.TP: 1})
+        moe_mesh = _FakeMesh({MeshAxisName.EP: 2, MeshAxisName.EP_SHARD: 2})
+        mesh = MeshContext.from_meshes(device_mesh, moe_mesh)
+
+        _, _, parallelize_fn, _ = instantiate_infrastructure(
+            distributed_config=FSDP2Config(multimodal=MultimodalDistributedConfig(frozen_sharding="replicate")),
+            moe_parallel_config=MoEParallelizerConfig(),
+            activation_checkpointing=False,
+            mesh=mesh,
+        )
+
+        assert parallelize_fn is not None
+        assert parallelize_fn.keywords["frozen_multimodal_sharding"] == "replicate"
 
 
 class TestFromPretrainedDeviceMesh:
@@ -1745,6 +1765,53 @@ class TestNeMoAutoModelForMultimodalLM:
         import nemo_automodel._transformers as pkg
 
         assert "NeMoAutoModelForMultimodalLM" in pkg.__all__
+
+
+class TestNeMoAutoModelForSeq2SeqLM:
+    """Tests for the NeMoAutoModelForSeq2SeqLM class and its exports (issue #630)."""
+
+    def test_class_exists_and_inherits_correctly(self):
+        from transformers import AutoModelForSeq2SeqLM
+
+        from nemo_automodel._transformers.auto_model import NeMoAutoModelForSeq2SeqLM, _BaseNeMoAutoModelClass
+
+        assert issubclass(NeMoAutoModelForSeq2SeqLM, _BaseNeMoAutoModelClass)
+        assert issubclass(NeMoAutoModelForSeq2SeqLM, AutoModelForSeq2SeqLM)
+
+    def test_has_from_pretrained_and_from_config(self):
+        from nemo_automodel._transformers.auto_model import NeMoAutoModelForSeq2SeqLM
+
+        assert callable(NeMoAutoModelForSeq2SeqLM.from_pretrained)
+        assert callable(NeMoAutoModelForSeq2SeqLM.from_config)
+
+    def test_lazy_export_from_transformers_subpackage(self):
+        from nemo_automodel._transformers import NeMoAutoModelForSeq2SeqLM
+
+        assert NeMoAutoModelForSeq2SeqLM is not None
+
+    def test_lazy_export_from_top_level_package(self):
+        from nemo_automodel import NeMoAutoModelForSeq2SeqLM
+
+        assert NeMoAutoModelForSeq2SeqLM is not None
+
+    def test_top_level_dir_includes_seq2seq(self):
+        import nemo_automodel
+
+        assert "NeMoAutoModelForSeq2SeqLM" in dir(nemo_automodel)
+
+    def test_transformers_subpackage_all_includes_seq2seq(self):
+        import nemo_automodel._transformers as pkg
+
+        assert "NeMoAutoModelForSeq2SeqLM" in pkg.__all__
+
+    def test_model_mapping_resolves_t5_and_bart(self):
+        from transformers import BartConfig, T5Config
+
+        from nemo_automodel._transformers.auto_model import NeMoAutoModelForSeq2SeqLM
+
+        mapping = NeMoAutoModelForSeq2SeqLM._model_mapping
+        assert mapping[T5Config].__name__ == "T5ForConditionalGeneration"
+        assert mapping[BartConfig].__name__ == "BartForConditionalGeneration"
 
 
 class TestFilterMetaDeviceFromInitContext:
