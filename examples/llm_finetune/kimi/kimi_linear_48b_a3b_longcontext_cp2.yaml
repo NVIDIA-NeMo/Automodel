@@ -144,6 +144,6 @@ wandb:
   dir: result/wandb
 
 ci:
-  recipe_owner: khazic
+  recipe_owner: huiyingl
   nodes: 1
   time: "01:00:00"
