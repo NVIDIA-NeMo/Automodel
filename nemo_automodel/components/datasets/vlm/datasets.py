@@ -522,6 +522,97 @@ def make_unimm_chat_dataset(path_or_dataset="Yirany/UniMM-Chat", split="train", 
     return [format(example) for example in dataset]
 
 
+SHOPIFY_PRODUCT_CATALOGUE_PROMPT = "What product category does this item belong to?"
+
+
+@dataclass
+class ShopifyProductCatalogueDatasetConfig:
+    """Construction-time configuration for the Shopify product-catalogue dataset."""
+
+    path_or_dataset: str = "Shopify/product-catalogue"
+    """HuggingFace dataset id or local path for the Shopify product catalogue."""
+    split: str = "train"
+    """Dataset split to load (e.g. ``"train"``, ``"test"``)."""
+    limit_dataset_samples: int | None = None
+    """Optional maximum number of samples to load."""
+
+    def build(self):
+        """Build the Shopify product-catalogue dataset from this config."""
+        return make_shopify_product_catalogue_dataset(
+            path_or_dataset=self.path_or_dataset,
+            split=self.split,
+            limit_dataset_samples=self.limit_dataset_samples,
+        )
+
+
+def make_shopify_product_catalogue_dataset(
+    path_or_dataset="Shopify/product-catalogue",
+    split="train",
+    limit_dataset_samples: int | None = None,
+    **kwargs,
+):
+    """Load the Shopify product-catalogue dataset for image-to-text fine-tuning.
+
+    The task is product image -> taxonomy category, supervised on the dataset's
+    ``ground_truth_category`` field.
+
+    Formatting is deferred to ``__getitem__`` via ``with_transform`` so the
+    dataset stays Arrow-backed, as in :func:`make_medpix_dataset`. The train
+    split holds 38,631 product photos; materialising formatted rows measured
+    ~8.1 GB per 1,500 rows (~209 GB for the full split) because each retained
+    row pins its decoded image. Images are loaded undecoded
+    (``Image(decode=False)``) and wrapped as lazy ``PIL`` handles, so the pixel
+    decode happens in the DataLoader workers.
+
+    Note:
+        Product photos are full resolution (up to 2084x2084). Bound the visual
+        token count through the processor (e.g. Qwen2.5-VL's ``max_pixels``) or
+        via ``max_length`` on the collate function.
+
+    Args:
+        path_or_dataset: HuggingFace dataset id or local path.
+        split: Dataset split to load.
+        limit_dataset_samples: Optional maximum number of samples to load.
+        **kwargs: Unused; accepted for parity with the other dataset builders.
+
+    Returns:
+        Dataset: Arrow-backed dataset yielding ``{"conversation": [...]}`` rows.
+    """
+    dataset = load_dataset(path_or_dataset, split=split)
+    if limit_dataset_samples is not None:
+        dataset = dataset.select(range(min(limit_dataset_samples, len(dataset))))
+    if "product_image" in getattr(dataset, "features", {}):
+        dataset = dataset.cast_column("product_image", HfImage(decode=False))
+
+    def lazy_image(value):
+        # ``Image(decode=False)`` yields a ``{"bytes": ..., "path": ...}`` dict.
+        if isinstance(value, dict):
+            if value.get("bytes") is not None:
+                return Image.open(io.BytesIO(value["bytes"]))
+            if value.get("path"):
+                return value["path"]
+        return value
+
+    def transform(batch):
+        return {
+            "conversation": [
+                [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image", "image": lazy_image(image)},
+                            {"type": "text", "text": SHOPIFY_PRODUCT_CATALOGUE_PROMPT},
+                        ],
+                    },
+                    {"role": "assistant", "content": [{"type": "text", "text": category}]},
+                ]
+                for image, category in zip(batch["product_image"], batch["ground_truth_category"])
+            ]
+        }
+
+    return dataset.with_transform(transform)
+
+
 def convert_sharegpt_to_conversation(
     example,
     columns=None,

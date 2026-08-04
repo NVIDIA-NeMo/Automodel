@@ -13,6 +13,7 @@
 # limitations under the License.
 from __future__ import annotations
 
+import io
 import json
 from types import SimpleNamespace
 from typing import Dict, List
@@ -2007,3 +2008,87 @@ class TestPreTokenizedDatasetWrapperInjectFakeImages:
         )
 
         assert wrapper.inject_fake_images is False
+
+
+def _shopify_hf_dataset(n=3):
+    """A real in-memory HF dataset so ``with_transform`` is actually exercised."""
+    import datasets as hfds
+
+    images = []
+    for i in range(n):
+        buf = io.BytesIO()
+        Image.new("RGB", (8 + i, 8), (i, i, i)).save(buf, format="PNG")
+        images.append({"bytes": buf.getvalue(), "path": None})
+
+    return hfds.Dataset.from_dict(
+        {
+            "product_image": images,
+            "ground_truth_category": [f"Root > Mid > Leaf {i}" for i in range(n)],
+        }
+    ).cast_column("product_image", hfds.Image())
+
+
+def test_make_shopify_product_catalogue_dataset(monkeypatch):
+    """Rows are emitted in the Automodel conversation schema."""
+    monkeypatch.setattr(ds, "load_dataset", lambda *a, **k: _shopify_hf_dataset(3))
+
+    result = ds.make_shopify_product_catalogue_dataset()
+
+    assert len(result) == 3
+    conversation = result[1]["conversation"]
+    user_turn, assistant_turn = conversation
+
+    assert user_turn["role"] == "user"
+    assert user_turn["content"][1] == {
+        "type": "text",
+        "text": ds.SHOPIFY_PRODUCT_CATALOGUE_PROMPT,
+    }
+    assert assistant_turn["role"] == "assistant"
+    assert assistant_turn["content"] == [{"type": "text", "text": "Root > Mid > Leaf 1"}]
+
+
+def test_make_shopify_product_catalogue_dataset_images_stay_undecoded(monkeypatch):
+    """Images arrive as lazy PIL handles, not eagerly decoded rasters.
+
+    The train split is 38,631 product photos, so eager decoding would pin every
+    image in memory.
+    """
+    monkeypatch.setattr(ds, "load_dataset", lambda *a, **k: _shopify_hf_dataset(2))
+
+    result = ds.make_shopify_product_catalogue_dataset()
+    image = result[0]["conversation"][0]["content"][0]["image"]
+
+    assert isinstance(image, Image.Image)
+    # PIL populates .size from the header but defers the pixel decode; a pending
+    # decode shows up as a non-empty tile list, which load() then clears.
+    assert image.size == (8, 8)
+    assert image.tile
+    image.load()
+    assert not image.tile
+
+
+def test_make_shopify_product_catalogue_dataset_limit(monkeypatch):
+    """``limit_dataset_samples`` truncates, and never over-selects a short split."""
+    monkeypatch.setattr(ds, "load_dataset", lambda *a, **k: _shopify_hf_dataset(5))
+    assert len(ds.make_shopify_product_catalogue_dataset(limit_dataset_samples=2)) == 2
+
+    monkeypatch.setattr(ds, "load_dataset", lambda *a, **k: _shopify_hf_dataset(3))
+    assert len(ds.make_shopify_product_catalogue_dataset(limit_dataset_samples=99)) == 3
+
+
+def test_shopify_product_catalogue_dataset_config_build(monkeypatch):
+    """The config dataclass forwards its fields to the builder."""
+    captured = {}
+
+    def _fake_load_dataset(path_or_dataset, split=None, **kwargs):
+        captured["path_or_dataset"] = path_or_dataset
+        captured["split"] = split
+        return _shopify_hf_dataset(4)
+
+    monkeypatch.setattr(ds, "load_dataset", _fake_load_dataset)
+
+    cfg = ds.ShopifyProductCatalogueDatasetConfig(split="test", limit_dataset_samples=2)
+    dataset = cfg.build()
+
+    assert captured == {"path_or_dataset": "Shopify/product-catalogue", "split": "test"}
+    assert len(dataset) == 2
