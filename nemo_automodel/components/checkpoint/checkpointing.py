@@ -2538,12 +2538,62 @@ def _load_hf_checkpoint_preserving_dtype(model_path: str) -> Optional[dict[str, 
     Args:
         model_path: Path to checkpoint file or directory.
     """
+    _prefetch_checkpoint(_checkpoint_shard_files(model_path))
 
     if _is_bin_checkpoint(model_path):
         return _load_hf_bin_checkpoint(model_path)
     elif _is_safetensors_checkpoint(model_path):
         return _load_hf_safetensors_checkpoint(model_path)
     return None
+
+
+def _checkpoint_shard_files(model_path: str) -> list[str]:
+    """On-disk shard files backing a HF checkpoint path."""
+    if os.path.isfile(model_path):
+        return [model_path]
+    files = sorted(glob.glob(os.path.join(model_path, "*.safetensors")))
+    if not files:
+        files = sorted(glob.glob(os.path.join(model_path, "*.bin")))
+    return files
+
+
+def _prefetch_checkpoint(paths: list[str], chunk_bytes: int = 64 << 20, max_workers: int = 8) -> int:
+    """Pull the checkpoint into the page cache with large sequential reads.
+
+    ``safe_open(...).get_tensor()`` returns mmap-backed views, so the bulk of the I/O is
+    not done by the loader -- it happens later, as page faults, while tensors are merged
+    and copied into the model.  Servicing that as 4 KiB faults against a parallel
+    filesystem is orders of magnitude slower than streaming the same bytes, and readahead
+    hints do not help because they are advisory and clamped to one readahead window.
+
+    Reading each shard into a small reusable buffer leaves the bytes in (reclaimable) page
+    cache for the fault path to hit.  Peak RSS is unaffected: the fault path populates the
+    same cache pages either way, and the scratch buffers are freed before the merge.
+
+    Returns the number of bytes read.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    def read_one(path: str) -> int:
+        total = 0
+        buf = bytearray(chunk_bytes)
+        view = memoryview(buf)
+        with open(path, "rb", buffering=0) as fh:
+            while True:
+                n = fh.readinto(view)
+                if not n:
+                    break
+                total += n
+        return total
+
+    if not paths:
+        return 0
+    try:
+        with ThreadPoolExecutor(max_workers=min(max_workers, len(paths))) as pool:
+            return sum(pool.map(read_one, paths))
+    except OSError as err:  # best-effort warm-up; never fail a load over it
+        logging.warning("Checkpoint prefetch failed (%s); falling back to on-demand paging.", err)
+        return 0
 
 
 def _load_hf_safetensors_checkpoint(model_path: str) -> Optional[dict[str, torch.Tensor]]:

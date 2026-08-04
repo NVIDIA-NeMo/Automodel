@@ -13,7 +13,9 @@
 # limitations under the License.
 
 import gc
+import os
 import re
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Optional
 
 import torch
@@ -27,6 +29,77 @@ from nemo_automodel.components.moe.state_dict_utils import (
     should_load_expert_for_rank,
     split_experts_weights_dtensor_aware,
 )
+
+# Experts are merged by copying each one into its own row of a preallocated grouped
+# tensor, one expert per worker.  Parallelising across experts (rather than inside each
+# copy, which is what a single large `torch.stack` does) keeps every copy single-threaded,
+# so the cost does not depend on how the intra-op pool happens to be sized.
+_MERGE_WORKERS = int(os.environ.get("NEMO_AUTOMODEL_MERGE_WORKERS", "16"))
+
+
+def _local_tensor(t: torch.Tensor) -> torch.Tensor:
+    """Local shard of a DTensor, or the tensor itself."""
+    return t.to_local() if is_dtensor(t) else t
+
+
+def _fill_experts(fill, n_experts: int) -> None:
+    """Apply ``fill(i)`` for each expert across a bounded pool of single-threaded workers."""
+    workers = max(1, min(_MERGE_WORKERS, n_experts))
+    prev_threads = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        if workers == 1:
+            for i in range(n_experts):
+                fill(i)
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                list(pool.map(fill, range(n_experts)))
+    finally:
+        torch.set_num_threads(prev_threads)
+
+
+def _merge_gate_up_experts(entries: dict, expert_ids: list, dtype, is_gated: bool) -> torch.Tensor:
+    """Build ``[n_experts, dim, 2*inter]`` (gated) or ``[n_experts, dim, inter]`` directly.
+
+    Each expert makes a single transposing copy into its own row, instead of
+    transpose -> cat -> stack -> dtype-cast, which walks the data two to three times.
+    Fewer passes in checkpoint order also keeps the read sequential, which matters when
+    the source tensors are mmap-backed views over a network filesystem.
+    """
+    if is_gated:
+        # Localize once per tensor: DTensor.shape is the global shape, so the local tensor
+        # is needed both to size the destination and to copy from.
+        pairs = [(_local_tensor(entries[e]["gate_proj"]), _local_tensor(entries[e]["up_proj"])) for e in expert_ids]
+        inter_dim, dim = pairs[0][0].shape
+        merged = torch.empty((len(expert_ids), dim, 2 * inter_dim), dtype=dtype)
+
+        def fill(i: int) -> None:
+            gate, up = pairs[i]
+            merged[i, :, :inter_dim].copy_(gate.transpose(0, 1))
+            merged[i, :, inter_dim:].copy_(up.transpose(0, 1))
+    else:
+        ups = [_local_tensor(entries[e]) for e in expert_ids]
+        inter_dim, dim = ups[0].shape
+        merged = torch.empty((len(expert_ids), dim, inter_dim), dtype=dtype)
+
+        def fill(i: int) -> None:
+            merged[i].copy_(ups[i].transpose(0, 1))
+
+    _fill_experts(fill, len(expert_ids))
+    return merged
+
+
+def _merge_down_experts(entries: dict, expert_ids: list, dtype) -> torch.Tensor:
+    """Build ``[n_experts, inter, dim]`` directly from per-expert ``[dim, inter]`` weights."""
+    downs = [_local_tensor(entries[e]) for e in expert_ids]
+    dim, inter_dim = downs[0].shape
+    merged = torch.empty((len(expert_ids), inter_dim, dim), dtype=dtype)
+
+    def fill(i: int) -> None:
+        merged[i].copy_(downs[i].transpose(0, 1))
+
+    _fill_experts(fill, len(expert_ids))
+    return merged
 
 
 class MoESplitExpertsStateDictMixin:
@@ -507,37 +580,19 @@ class MoESplitExpertsStateDictMixin:
 
                     if all_complete:
                         expert_ids = sorted(expert_weights_by_layer[layer_num][native_key].keys())
-                        tensors = []
-                        for expert_id in expert_ids:
-                            expert_data = expert_weights_by_layer[layer_num][native_key][expert_id]
-
-                            if is_gated:
-                                gate_weight = expert_data["gate_proj"]
-                                up_weight = expert_data["up_proj"]
-                                if is_dtensor(gate_weight):
-                                    gate_weight = gate_weight.to_local()
-                                if is_dtensor(up_weight):
-                                    up_weight = up_weight.to_local()
-                                gate_t = gate_weight.transpose(0, 1)
-                                up_t = up_weight.transpose(0, 1)
-                                tensors.append(torch.cat([gate_t, up_t], dim=-1))
-                            else:
-                                up_weight = expert_data
-                                if is_dtensor(up_weight):
-                                    up_weight = up_weight.to_local()
-                                tensors.append(up_weight.transpose(0, 1))
-
-                        stacked = torch.stack(tensors, dim=0).to(self.dtype)
+                        stacked = _merge_gate_up_experts(
+                            expert_weights_by_layer[layer_num][native_key], expert_ids, self.dtype, is_gated
+                        )
                         state_dict[native_key] = create_dtensor_from_local(stacked, device_mesh, rank)
 
                         # Aggressively release intermediates so the per-layer
                         # transient does not pile on top of the model's
                         # already-materialized GPU DTensors. Without this,
-                        # ``tensors``/``stacked`` and the per-expert dict
-                        # entries hang around until Python's refcount GC
-                        # eventually runs — too late under tight GPU budgets
-                        # (e.g. a large MoE on 2 nodes / 8 GPUs).
-                        del tensors, stacked
+                        # ``stacked`` and the per-expert dict entries hang
+                        # around until Python's refcount GC eventually runs —
+                        # too late under tight GPU budgets (e.g. a large MoE
+                        # on 2 nodes / 8 GPUs).
+                        del stacked
                         del expert_weights_by_layer[layer_num][native_key]
                         if not expert_weights_by_layer[layer_num]:
                             del expert_weights_by_layer[layer_num]
@@ -551,24 +606,14 @@ class MoESplitExpertsStateDictMixin:
                     if len(expert_weights_by_layer[layer_num][native_key]) == expected_experts_per_rank:
                         expert_ids = sorted(expert_weights_by_layer[layer_num][native_key].keys())
 
-                        ordered = []
-                        for expert_id in expert_ids:
-                            down_weight = expert_weights_by_layer[layer_num][native_key][expert_id]  # [dim, inter_dim]
-
-                            # Extract local tensor if input is already a DTensor
-                            if is_dtensor(down_weight):
-                                down_weight = down_weight.to_local()
-
-                            down_t = down_weight.transpose(0, 1)  # [inter_dim, dim]
-                            ordered.append(down_t)
-
-                        stacked = torch.stack(ordered, dim=0)
-                        stacked = stacked.to(self.dtype)
+                        stacked = _merge_down_experts(
+                            expert_weights_by_layer[layer_num][native_key], expert_ids, self.dtype
+                        )
 
                         state_dict[native_key] = create_dtensor_from_local(stacked, device_mesh, rank)
 
                         # See gate/up branch above for the cleanup rationale.
-                        del ordered, stacked
+                        del stacked
                         del expert_weights_by_layer[layer_num][native_key]
                         if not expert_weights_by_layer[layer_num]:
                             del expert_weights_by_layer[layer_num]
