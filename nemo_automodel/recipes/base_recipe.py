@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import errno
 import getpass
 import json
 import logging
@@ -65,6 +66,7 @@ from nemo_automodel.components.training.step_scheduler import StepScheduler
 from nemo_automodel.recipes._typed_config import RecipeConfig
 
 logger = logging.getLogger(__name__)
+_CHECKPOINT_POINTER_CAPACITY_ERRNOS = {errno.EDQUOT, errno.ENOSPC}
 
 
 def has_load_restore_state(object):
@@ -507,7 +509,9 @@ class BaseRecipe:
         try:
             try:
                 os.symlink(relative_target, temp_path)
-            except OSError:
+            except OSError as error:
+                if error.errno in _CHECKPOINT_POINTER_CAPACITY_ERRNOS:
+                    raise
                 if os.path.lexists(temp_path):
                     os.remove(temp_path)
                 # Fallback: publish a text pointer when symbolic links are not supported.
@@ -524,6 +528,22 @@ class BaseRecipe:
                 temp_path = ""
                 if os.path.exists(txt_path):
                     os.remove(txt_path)
+        except OSError as error:
+            if error.errno not in _CHECKPOINT_POINTER_CAPACITY_ERRNOS:
+                raise
+
+            if link_name == "LATEST":
+                self._remove_checkpoint_pointer(link_name)
+                logger.warning(
+                    "Checkpoint storage is full; removed stale %s pointer. "
+                    "Resume will discover the highest-step checkpoint directory instead.",
+                    link_name,
+                )
+            else:
+                logger.warning(
+                    "Checkpoint storage is full; preserving the existing %s pointer instead of updating it.",
+                    link_name,
+                )
         finally:
             if temp_path and os.path.lexists(temp_path):
                 os.remove(temp_path)

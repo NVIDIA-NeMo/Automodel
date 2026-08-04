@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import errno
 import logging
 import os
 from types import SimpleNamespace
@@ -1095,6 +1096,68 @@ def test_checkpoint_pointer_replace_failure_preserves_existing_target(tmp_path, 
 
     assert read_checkpoint_pointer(tmp_path, "LATEST") == old_checkpoint
     assert not list(tmp_path.glob(".LATEST.*.tmp"))
+
+
+def test_latest_pointer_quota_failure_falls_back_to_highest_checkpoint(tmp_path, monkeypatch, caplog):
+    """A quota failure removes stale LATEST so resume restores the completed newer checkpoint."""
+    recipe_inst = _ToyRecipe(tmp_path)
+    x = torch.randn(4, 2)
+    loss = recipe_inst.model(x).sum()
+    loss.backward()
+    recipe_inst.optimizer.step()
+    recipe_inst.save_checkpoint(epoch=0, step=100, train_loss=float(loss.item()))
+
+    recipe_inst.checkpointer.config.is_async = True
+    x = torch.randn(4, 2)
+    loss = recipe_inst.model(x).sum()
+    loss.backward()
+    recipe_inst.optimizer.step()
+    expected_weight = recipe_inst.model.weight.clone()
+    recipe_inst.save_checkpoint(epoch=0, step=200, train_loss=float(loss.item()))
+
+    real_symlink = os.symlink
+
+    def fail_temporary_symlink(source, destination):
+        if os.path.basename(destination).startswith(".LATEST."):
+            raise OSError(errno.EDQUOT, "quota exceeded")
+        return real_symlink(source, destination)
+
+    monkeypatch.setattr(os, "symlink", fail_temporary_symlink)
+
+    with caplog.at_level(logging.WARNING):
+        recipe_inst._finalize_pending_checkpoint()
+
+    assert read_checkpoint_pointer(tmp_path, "LATEST") is None
+    assert find_latest_checkpoint(tmp_path) == tmp_path / "epoch_0_step_200"
+    assert "removed stale LATEST pointer" in caplog.text
+    assert not list(tmp_path.glob(".LATEST.*.tmp"))
+
+    with torch.no_grad():
+        recipe_inst.model.weight.add_(42.0)
+    recipe_inst.load_checkpoint(restore_from="LATEST")
+    assert torch.allclose(recipe_inst.model.weight, expected_weight)
+
+
+def test_non_latest_pointer_quota_failure_preserves_existing_target(tmp_path, monkeypatch, caplog):
+    """Quota failures keep the last published best-checkpoint pointer intact."""
+    recipe_inst = _ToyRecipe(tmp_path)
+    old_checkpoint = tmp_path / "epoch_0_step_100"
+    new_checkpoint = tmp_path / "epoch_0_step_200"
+    old_checkpoint.mkdir()
+    new_checkpoint.mkdir()
+    recipe_inst._update_checkpoint_symlink("LOWEST_VAL", str(old_checkpoint))
+
+    def fail_temporary_symlink(_source, _destination):
+        raise OSError(errno.ENOSPC, "filesystem full")
+
+    monkeypatch.setattr(os, "symlink", fail_temporary_symlink)
+
+    with caplog.at_level(logging.WARNING):
+        recipe_inst._update_checkpoint_symlink("LOWEST_VAL", str(new_checkpoint))
+
+    assert read_checkpoint_pointer(tmp_path, "LOWEST_VAL") == old_checkpoint
+    assert "preserving the existing LOWEST_VAL pointer" in caplog.text
+    assert not list(tmp_path.glob(".LOWEST_VAL.*.tmp"))
 
 
 def test_checkpoint_retention_preserves_lowest_val_after_resume(tmp_path):
