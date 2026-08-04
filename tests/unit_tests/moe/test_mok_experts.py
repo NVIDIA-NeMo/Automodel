@@ -1,0 +1,189 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import pytest
+import torch
+
+from nemo_automodel.components.models.common import BackendConfig, MoKBackendConfig
+from nemo_automodel.components.moe.config import MoEConfig
+from nemo_automodel.components.moe.mok_experts import GroupedExpertsMoK
+
+
+def _valid_moe_config(**overrides: object) -> MoEConfig:
+    values = {
+        "n_routed_experts": 4,
+        "n_shared_experts": 1,
+        "n_activated_experts": 2,
+        "n_expert_groups": 1,
+        "n_limited_groups": 1,
+        "train_gate": True,
+        "gate_bias_update_factor": 0.0,
+        "aux_loss_coeff": 0.0,
+        "score_func": "softmax",
+        "route_scale": 1.0,
+        "dim": 256,
+        "inter_dim": 512,
+        "moe_inter_dim": 256,
+        "norm_topk_prob": True,
+        "dtype": torch.bfloat16,
+    }
+    values.update(overrides)
+    return MoEConfig(**values)
+
+
+def test_mok_backend_config_build_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeFunctional:
+        class MoKConfig:
+            def __init__(self, **kwargs: object) -> None:
+                captured.update(kwargs)
+
+    monkeypatch.setattr(
+        "nemo_automodel.components.models.common.utils.safe_import",
+        lambda *args, **kwargs: (True, FakeFunctional),
+    )
+    config = MoKBackendConfig(
+        fwd_num_comm_sms=24,
+        bwd_num_comm_sms=20,
+        minibatch_size=2048,
+        macrobatch_size=8192,
+        schedule_capacity_multiplier=0.75,
+        all_gather_top_experts_chunk_bytes=1024,
+    )
+
+    config.build()
+
+    assert captured == {
+        "fwd_num_comm_sms": 24,
+        "bwd_num_comm_sms": 20,
+        "minibatch_size": 2048,
+        "macrobatch_size": 8192,
+        "schedule_capacity_multiplier": 0.75,
+        "all_gather_top_experts_chunk_bytes": 1024,
+    }
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"n_shared_experts": 0}, "n_shared_experts=0"),
+        ({"dim": 384}, "dim=384"),
+        ({"moe_inter_dim": 384}, "moe_inter_dim=384"),
+        ({"expert_bias": True}, "expert_bias=True"),
+        ({"shared_expert_gate": True}, "shared_expert_gate=True"),
+        ({"moe_latent_size": 128}, "moe_latent_size=128"),
+        ({"expert_activation": "relu2"}, "activations must both be swiglu"),
+    ],
+)
+def test_mok_rejects_unsupported_moe_contract(overrides: dict[str, object], message: str) -> None:
+    with pytest.raises(ValueError, match=message):
+        GroupedExpertsMoK(_valid_moe_config(**overrides), BackendConfig(dispatcher="mok"))
+
+
+def test_mok_state_dict_preserves_combined_expert_layout() -> None:
+    config = _valid_moe_config()
+    source = GroupedExpertsMoK(config, BackendConfig(dispatcher="mok"))
+    with torch.no_grad():
+        source.routed_gate_weights.copy_(
+            torch.arange(source.routed_gate_weights.numel(), dtype=torch.float32)
+            .reshape_as(source.routed_gate_weights)
+            .to(torch.bfloat16)
+        )
+        source.routed_up_weights.copy_(source.routed_gate_weights + 1)
+        source.routed_down_weights.copy_(
+            torch.arange(source.routed_down_weights.numel(), dtype=torch.float32)
+            .reshape_as(source.routed_down_weights)
+            .to(torch.bfloat16)
+        )
+
+    state = source.state_dict()
+
+    assert set(state) == {"gate_and_up_projs", "down_projs"}
+    assert state["gate_and_up_projs"].shape == (4, 256, 512)
+    assert state["down_projs"].shape == (4, 256, 256)
+    torch.testing.assert_close(state["gate_and_up_projs"][..., :256], source.routed_gate_weights.transpose(-1, -2))
+    torch.testing.assert_close(state["gate_and_up_projs"][..., 256:], source.routed_up_weights.transpose(-1, -2))
+    torch.testing.assert_close(state["down_projs"], source.routed_down_weights.transpose(-1, -2))
+
+    restored = GroupedExpertsMoK(config, BackendConfig(dispatcher="mok"))
+    restored.load_state_dict(state)
+    torch.testing.assert_close(restored.routed_gate_weights, source.routed_gate_weights)
+    torch.testing.assert_close(restored.routed_up_weights, source.routed_up_weights)
+    torch.testing.assert_close(restored.routed_down_weights, source.routed_down_weights)
+
+
+def test_mok_manual_backward_maps_gradients_to_autograd_inputs() -> None:
+    class FakeRuntime:
+        def forward(self, x: torch.Tensor, *args: torch.Tensor) -> tuple[torch.Tensor, object, object]:
+            del args
+            return x.clone(), object(), object()
+
+        def backward(
+            self,
+            schedule: object,
+            forward_context: object,
+            grad_output: torch.Tensor,
+            x: torch.Tensor,
+            router_weights: torch.Tensor,
+            shared_gate_weights: torch.Tensor,
+            shared_up_weights: torch.Tensor,
+            shared_down_weights: torch.Tensor,
+            routed_gate_weights: torch.Tensor,
+            routed_up_weights: torch.Tensor,
+            routed_down_weights: torch.Tensor,
+        ) -> tuple[torch.Tensor, ...]:
+            del schedule, forward_context, grad_output
+            return (
+                torch.full_like(x, 1),
+                torch.full_like(router_weights, 2),
+                torch.full_like(routed_gate_weights, 3),
+                torch.full_like(routed_up_weights, 4),
+                torch.full_like(routed_down_weights, 5),
+                torch.full_like(shared_gate_weights, 6),
+                torch.full_like(shared_up_weights, 7),
+                torch.full_like(shared_down_weights, 8),
+            )
+
+    experts = GroupedExpertsMoK(_valid_moe_config(), BackendConfig(dispatcher="mok"))
+    experts.runtime = FakeRuntime()
+    x = torch.randn(4, 256, dtype=torch.bfloat16, requires_grad=True)
+    router_weights = torch.randn(4, 2, dtype=torch.bfloat16, requires_grad=True)
+    top_experts = torch.tensor([[0, 1], [1, 2], [2, 3], [3, 0]])
+    shared_gate = torch.randn(256, 256, dtype=torch.bfloat16, requires_grad=True)
+    shared_up = torch.randn(256, 256, dtype=torch.bfloat16, requires_grad=True)
+    shared_down = torch.randn(256, 256, dtype=torch.bfloat16, requires_grad=True)
+
+    output = experts(
+        x,
+        torch.ones(4, dtype=torch.bool),
+        router_weights,
+        top_experts,
+        shared_gate,
+        shared_up,
+        shared_down,
+    )
+    output.backward(torch.ones_like(output))
+
+    for actual, expected in (
+        (x.grad, 1),
+        (router_weights.grad, 2),
+        (experts.routed_gate_weights.grad, 3),
+        (experts.routed_up_weights.grad, 4),
+        (experts.routed_down_weights.grad, 5),
+        (shared_gate.grad, 6),
+        (shared_up.grad, 7),
+        (shared_down.grad, 8),
+    ):
+        torch.testing.assert_close(actual, torch.full_like(actual, expected))

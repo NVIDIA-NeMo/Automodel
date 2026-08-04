@@ -36,6 +36,7 @@ from nemo_automodel.components.moe.experts import (
 from nemo_automodel.components.moe.megatron.moe_utils import (
     MoEAuxLossAutoScaler,
 )
+from nemo_automodel.components.moe.mok_experts import GroupedExpertsMoK
 from nemo_automodel.components.moe.router_replay import RouterReplay, replay_selection
 
 
@@ -756,7 +757,11 @@ class MoE(nn.Module):
         else:
             self.gate = Gate(config, gate_precision=backend.gate_precision)
             self.gate.use_routing_core = "moe_router" in backend.cuda_graph.modules
-        if backend.dispatcher in ("deepep", "hybridep", "uccl_ep") and get_world_size_safe() == 1:
+        if backend.dispatcher == "mok":
+            if get_world_size_safe() == 1:
+                raise ValueError("dispatcher='mok' requires expert parallelism with at least 4 GPUs")
+            self.experts = GroupedExpertsMoK(config, backend)
+        elif backend.dispatcher in ("deepep", "hybridep", "uccl_ep") and get_world_size_safe() == 1:
             warnings.warn(
                 f"'{backend.dispatcher}' dispatcher is enabled in config, but world size is 1. "
                 "Expert parallelism requires multiple GPUs. Falling back to standard GroupedExperts.",
@@ -828,17 +833,17 @@ class MoE(nn.Module):
         x: torch.Tensor,
         padding_mask: Optional[torch.Tensor] = None,
         cp_mesh: Optional[DeviceMesh] = None,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """
-        Forward pass for the MoE module.
+    ) -> torch.Tensor:
+        """Route tokens through shared and routed experts.
 
         Args:
-            x (torch.Tensor): Input tensor.
-            padding_mask (Optional[torch.Tensor]): Boolean mask indicating padding positions.
+            x: Input tensor of shape ``[..., hidden]``.
+            padding_mask: Boolean tensor matching ``x.shape[:-1]`` where true
+                entries are padding. MoK currently requires this to be absent.
+            cp_mesh: Optional context-parallel mesh used by the router.
 
         Returns:
-            torch.Tensor: Output tensor after expert routing and computation.
-            Optional[torch.Tensor]: Auxiliary loss for load balancing (if applicable).
+            Tensor with the same shape and dtype as ``x``.
         """
         if cp_mesh is None:
             cp_mesh = self.cp_mesh
@@ -859,15 +864,33 @@ class MoE(nn.Module):
 
         weights, indices, aux_loss = self.gate(x, token_mask, cp_mesh)
 
-        # Shared-expert output (optionally gated), computed inline on the main stream.
-        z = None
-        if self.shared_experts is not None:
-            z = self.shared_experts(x)
-            if self.shared_expert_gate is not None:
-                z = torch.nn.functional.sigmoid(self.shared_expert_gate(x)) * z
+        if isinstance(self.experts, GroupedExpertsMoK):
+            if padding_mask is not None:
+                raise ValueError("dispatcher='mok' requires unpadded, equal token counts on every EP rank")
+            if not isinstance(self.shared_experts, MLP):
+                raise RuntimeError("dispatcher='mok' requires exactly one shared MLP expert")
+            if self.shared_experts.gate_proj is None:
+                raise RuntimeError("dispatcher='mok' requires a gated shared SwiGLU expert")
+            y = self.experts(
+                x_latent,
+                token_mask,
+                weights,
+                indices,
+                self.shared_experts.gate_proj.weight,
+                self.shared_experts.up_proj.weight,
+                self.shared_experts.down_proj.weight,
+            )
+            z = None
+        else:
+            # Shared-expert output (optionally gated), computed inline on the main stream.
+            z = None
+            if self.shared_experts is not None:
+                z = self.shared_experts(x)
+                if self.shared_expert_gate is not None:
+                    z = torch.nn.functional.sigmoid(self.shared_expert_gate(x)) * z
 
-        # Routed experts on the main stream.
-        y = self.experts(x_latent, token_mask, weights, indices)
+            # Routed experts on the main stream.
+            y = self.experts(x_latent, token_mask, weights, indices)
 
         if self.fc2_latent_proj is not None:
             y = self.fc2_latent_proj(y)
@@ -897,6 +920,8 @@ def _init_weights(module, buffer_device: torch.device, init_std: float = 0.02):
         elif isinstance(module, (GroupedExperts, GroupedExpertsDeepEP, GroupedExpertsTE)):
             # Delegate expert initialization to experts.py
             _init_expert_weights(module, buffer_device, init_std)
+        elif isinstance(module, GroupedExpertsMoK):
+            module.init_weights(buffer_device, init_std)
         elif isinstance(module, MLP):
             to_local(module.down_proj.weight).normal_(mean=0.0, std=init_std)
             to_local(module.up_proj.weight).normal_(mean=0.0, std=init_std)
