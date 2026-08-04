@@ -1,8 +1,29 @@
 # Checkpoint Robustness Test Status
 
-Last updated: 2026-04-02 UTC
+Resume policy last updated: 2026-08-04 UTC
+
+Historical model matrix last measured: 2026-04-02 UTC
 
 > **Note:** vLLM deployment tests moved to separate PR.
+
+## Resume oracle policy
+
+Enabled LLM, VLM, and retrieval resume coverage now compares a restored trainer
+with the uninterrupted continuation of the same checkpoint-producing training
+trajectory. The check requires exact optimizer/scheduler position, LR and
+weight-decay state, RNG state, stateful-dataloader state, and per-rank batch
+identity. The first post-resume loss uses a separate strict threshold; the
+existing `resume_loss_threshold` applies only to later BF16 optimizer steps.
+
+Independent-run reproducibility is not a checkpoint-restore oracle and is
+reported separately in logs. Recipe-specific threshold relaxations calibrated
+against the former independent baseline have been removed.
+
+Recipes with `no_check_resume: true` remain explicitly exempt rather than being
+treated as passing. Those exemptions cover model/topology-specific restore
+blockers already documented in the recipe or this file (for example DeepEP/MoE
+state, hybrid Mamba state, or strict optimizer-state loading for unused/frozen
+parameters); they require focused fixes before resume coverage is enabled.
 
 ## Passing Models (8/15)
 

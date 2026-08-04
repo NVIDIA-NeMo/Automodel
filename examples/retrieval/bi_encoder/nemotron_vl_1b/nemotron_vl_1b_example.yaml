@@ -133,6 +133,3 @@ ci:
     hf_cosine_threshold: 0.999
     check_hf_reload: true
     check_resume: true
-    # The current robustness check uses an independently initialized BF16
-    # baseline, so allow small distributed-kernel drift in the loss comparison.
-    resume_loss_threshold: 5e-2

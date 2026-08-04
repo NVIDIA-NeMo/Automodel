@@ -112,6 +112,5 @@ ci:
     tokenizer_name: Qwen/Qwen2.5-7B
     cross_tp_size: 2
     cross_tp_kl_threshold: 9e-3
-    resume_loss_threshold: 5e-2
     dataset.limit_dataset_samples: 500
     validation_dataset.limit_dataset_samples: 500

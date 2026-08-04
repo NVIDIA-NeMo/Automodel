@@ -132,6 +132,10 @@ fixture_keys:
     - hf_source_post_load_dequantize
     - no_check_resume
     - process_isolation
+    # The first threshold gates the exact first loss after restoring state and
+    # batch identity. The existing resume_loss_threshold is only the numerical
+    # envelope for later optimizer steps on the same shared trajectory.
+    - resume_first_loss_threshold
     - resume_loss_threshold
     - skip_hf_reload
     - skip_automodel_logit_parity
