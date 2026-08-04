@@ -789,6 +789,91 @@ class TestLoRAKeysNotQuantized:
         assert f"{base}.weight_packed" in result
 
 
+class TestPeftExpertLoraPrefixRoundTrip:
+    """PEFT saves must keep expert LoRA keys under the ``base_model.model.`` prefix.
+
+    ``ModelState.state_dict()`` emits grouped expert LoRA params with the PEFT outer
+    prefix already applied. The expert to_hf conversion preserves that prefix, so
+    re-wrapping the results with ``language_model.`` corrupts the keys (nothing
+    matches them on resume) — while full-fine-tune expert weights, whose keys the
+    mixin resets to the bare ``model.`` prefix, still need the wrap.
+    """
+
+    @pytest.fixture
+    def moe_config(self):
+        return create_mock_moe_config()
+
+    @pytest.fixture
+    def adapter(self, moe_config):
+        backend = BackendConfig(linear="torch", rms_norm="torch", attn="sdpa")
+        return KimiK25VLStateDictAdapter(KimiK25VLConfig(), moe_config, backend, dtype=torch.bfloat16)
+
+    def _peft_state_dict(self, moe_config, rank=8):
+        n_e = moe_config.n_routed_experts
+        dim, inter = moe_config.dim, moe_config.moe_inter_dim
+        base = "base_model.model.model.language_model.model.layers.5.mlp.experts"
+        attn = "base_model.model.model.language_model.model.layers.5.self_attn.q_proj"
+        return {
+            f"{base}.lora_gate_and_up_A": torch.randn(n_e, rank, dim, dtype=torch.bfloat16),
+            f"{base}.lora_gate_and_up_B": torch.randn(n_e, 2 * inter, rank, dtype=torch.bfloat16),
+            f"{base}.lora_down_A": torch.randn(n_e, rank, inter, dtype=torch.bfloat16),
+            f"{base}.lora_down_B": torch.randn(n_e, dim, rank, dtype=torch.bfloat16),
+            f"{attn}.lora_A.weight": torch.randn(rank, dim, dtype=torch.bfloat16),
+        }
+
+    def test_peft_save_keeps_base_model_prefix(self, adapter, moe_config):
+        """All saved keys stay under base_model.model., like the attention LoRA keys."""
+        sd = self._peft_state_dict(moe_config)
+        out = adapter.to_hf(dict(sd), exclude_key_regex=r".*_extra_state.*", quantization=False)
+
+        assert len(out) > 0
+        bad = [k for k in out if not k.startswith("base_model.model.")]
+        assert bad == [], f"malformed adapter keys: {bad[:4]}"
+        # the expert conversion actually ran (grouped params were split per expert)
+        assert any(".mlp.experts.0.gate_proj.lora_A.weight" in k for k in out)
+
+    def test_peft_save_round_trips_for_resume(self, adapter, moe_config):
+        """from_hf rebuilds the exact grouped keys ModelState expects on resume."""
+        sd = self._peft_state_dict(moe_config)
+        out = adapter.to_hf({k: v.clone() for k, v in sd.items()}, quantization=False)
+        back = adapter.from_hf(dict(out))
+
+        assert set(back) == set(sd)
+        for key in sd:
+            torch.testing.assert_close(back[key], sd[key])
+
+    def test_fft_expert_weights_still_get_language_model_prefix(self):
+        """Full-fine-tune expert weights keep the language_model. wrap (regression guard)."""
+        # tiny dims: the real-sized mock config would allocate GBs for full expert weights
+        moe = MoEConfig(
+            n_routed_experts=4,
+            n_shared_experts=1,
+            n_activated_experts=2,
+            n_expert_groups=1,
+            n_limited_groups=1,
+            train_gate=False,
+            gate_bias_update_factor=0.0,
+            aux_loss_coeff=0.0,
+            score_func="softmax",
+            route_scale=1.0,
+            dim=64,
+            inter_dim=128,
+            moe_inter_dim=16,
+            norm_topk_prob=True,
+        )
+        backend = BackendConfig(linear="torch", rms_norm="torch", attn="sdpa")
+        adapter = KimiK25VLStateDictAdapter(KimiK25VLConfig(), moe, backend, dtype=torch.bfloat16)
+        sd = {
+            "model.language_model.model.layers.5.mlp.experts.gate_and_up_projs": torch.randn(
+                4, 64, 32, dtype=torch.bfloat16
+            ),
+        }
+        out = adapter.to_hf(dict(sd), quantization=False)
+
+        assert len(out) > 0
+        assert all(k.startswith("language_model.model.") for k in out)
+
+
 # =============================================================================
 # Expand Quantized Keys Extended Tests
 # =============================================================================
