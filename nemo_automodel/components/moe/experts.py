@@ -152,6 +152,50 @@ def _permute_tokens_for_grouped_mm(
     return sorted_token_ids, sorted_weights, tokens_per_expert, offs
 
 
+class _DeterministicBiasRepeatInterleave(Function):
+    """Expand expert biases while reducing their gradients deterministically."""
+
+    @staticmethod
+    def forward(ctx, bias, token_counts, output_size):
+        """Expand each expert bias over its contiguous token group.
+
+        Args:
+            ctx: Autograd context used to retain the token counts for backward.
+            bias: Tensor of shape [experts, hidden].
+            token_counts: Tensor of shape [experts] containing nonnegative token counts.
+            output_size: Total number of grouped tokens.
+
+        Returns:
+            Tensor of shape [tokens, hidden], with each expert row repeated for its tokens.
+        """
+        ctx.save_for_backward(token_counts)
+        return torch.repeat_interleave(bias, token_counts, dim=0, output_size=output_size)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """Reduce expanded bias gradients with one deterministic segmented reduction.
+
+        Args:
+            ctx: Autograd context containing the forward token counts.
+            grad_output: Tensor of shape [tokens, hidden].
+
+        Returns:
+            Tuple containing the bias gradient of shape [experts, hidden] and no gradients for token counts or size.
+        """
+        (token_counts,) = ctx.saved_tensors
+        accumulation_dtype = (
+            torch.float32 if grad_output.dtype in (torch.float16, torch.bfloat16) else grad_output.dtype
+        )
+        grad_bias = torch.segment_reduce(
+            grad_output.to(accumulation_dtype),
+            "sum",
+            lengths=token_counts,
+            axis=0,
+            unsafe=True,
+        ).to(grad_output.dtype)
+        return grad_bias, None, None
+
+
 def _apply_bias(value, bias, tokens_per_expert, permuted_probs=None):
     """Apply per-expert bias to grouped GEMM output.
 
@@ -163,47 +207,29 @@ def _apply_bias(value, bias, tokens_per_expert, permuted_probs=None):
     Args:
         value: Output from grouped GEMM, shape [total_tokens, features].
         bias: Per-expert bias, shape [num_experts, features].
-        tokens_per_expert: Token counts per expert.
-        permuted_probs: If provided, bias is weighted by routing probs (for down projection).
+        tokens_per_expert: Token counts, shape [num_experts].
+        permuted_probs: Optional routing probabilities broadcastable to
+            [total_tokens, features], typically [total_tokens, 1].
+
+    Returns:
+        Grouped GEMM output with per-expert bias applied, shape
+        [total_tokens, features]. The inputs are not mutated.
     """
     if bias is None:
         return value
+    if not isinstance(bias, torch.Tensor):
+        bias = torch.stack(tuple(bias))
+
     shape = value.shape
-    if permuted_probs is not None:
-        output = (
-            torch.cat(
-                [
-                    t + b * p
-                    for t, b, p in zip(
-                        torch.split(value.view(-1, shape[-1]), tokens_per_expert.tolist()),
-                        bias,
-                        torch.split(permuted_probs, tokens_per_expert.tolist()),
-                    )
-                ]
-            )
-            .view(shape)
-            .to(value.dtype)
-        )
+    flat_value = value.reshape(-1, shape[-1])
+    token_counts = torch.as_tensor(tokens_per_expert, device=bias.device, dtype=torch.long)
+    if torch.is_grad_enabled() and bias.requires_grad:
+        expanded_bias = _DeterministicBiasRepeatInterleave.apply(bias, token_counts, flat_value.shape[0])
     else:
-        output = (
-            torch.cat(
-                [
-                    t + b
-                    for t, b in zip(
-                        torch.split(
-                            value.view(-1, shape[-1]),
-                            tokens_per_expert.tolist()
-                            if isinstance(tokens_per_expert, torch.Tensor)
-                            else tokens_per_expert,
-                        ),
-                        bias,
-                    )
-                ]
-            )
-            .view(shape)
-            .to(value.dtype)
-        )
-    return output
+        expanded_bias = torch.repeat_interleave(bias, token_counts, dim=0, output_size=flat_value.shape[0])
+    if permuted_probs is not None:
+        expanded_bias = expanded_bias * permuted_probs
+    return (flat_value + expanded_bias).view(shape).to(value.dtype)
 
 
 class GroupedExperts(nn.Module):
