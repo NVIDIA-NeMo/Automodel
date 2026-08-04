@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
@@ -41,6 +42,7 @@ def calculate_mtp_loss(
     cu_seqlens: Optional[torch.Tensor] = None,
     seq_idx: Optional[torch.Tensor] = None,
     lm_weight: Optional[torch.Tensor] = None,
+    grad_reduce_group: dist.ProcessGroup | None = None,
 ) -> torch.Tensor:
     """Compute the DeepSeek-V3 Multi-Token Prediction auxiliary loss.
 
@@ -72,6 +74,8 @@ def calculate_mtp_loss(
         lm_weight: Optional caller-materialized LM-head weight. Supplying this
             lets the main loss and all MTP depths share one DTensor
             ``full_tensor()`` gather on the FusedLinearCrossEntropy path.
+        grad_reduce_group: Group that contributes independent loss shards when
+            the shared LM-head weight is a DTensor.
 
     Returns:
         Scalar MTP loss with autograd graph.
@@ -101,7 +105,10 @@ def calculate_mtp_loss(
     # numerically identical (same weight); grads from every depth accumulate into
     # it and collapse to a single reduce-scatter on the sharded parameter.
     if isinstance(loss_fn, FusedLinearCrossEntropy) and lm_weight is None:
-        lm_weight = _get_lm_head_weight(model)
+        lm_weight = loss_fn.materialize_lm_weight(
+            _get_lm_head_weight(model),
+            grad_reduce_group=grad_reduce_group,
+        )
 
     if seq_idx is None and cu_seqlens is not None:
         cs = cu_seqlens
@@ -163,6 +170,7 @@ def calculate_mtp_loss(
                 model=model,
                 lm_weight=lm_weight,
                 num_label_tokens=num_label_tokens,
+                grad_reduce_group=grad_reduce_group,
             )
         else:
             lm_head = _get_lm_head_module(model)
@@ -197,12 +205,14 @@ class PipelineCausalLMLoss(nn.Module):
         model: nn.Module,
         scaling_factor: float | None = None,
         ignore_index: int = -100,
+        grad_reduce_group: dist.ProcessGroup | None = None,
     ):
         super().__init__()
         self.loss_fn = loss_fn
         self.model = model
         self.scaling_factor = scaling_factor
         self.ignore_index = ignore_index
+        self.grad_reduce_group = grad_reduce_group
         # Legacy THD-pack fallback used when the model has no seq_idx tail.
         self.cu_seqlens: Optional[torch.Tensor] = None
 
@@ -264,7 +274,12 @@ class PipelineCausalLMLoss(nn.Module):
         # Gather the LM head at most once and thread it through the main loss and
         # every MTP depth (avoids redundant per-call full_tensor() gathers).
         shared_lm_weight = (
-            _get_lm_head_weight(self.model) if isinstance(self.loss_fn, FusedLinearCrossEntropy) else None
+            self.loss_fn.materialize_lm_weight(
+                _get_lm_head_weight(self.model),
+                grad_reduce_group=self.grad_reduce_group,
+            )
+            if isinstance(self.loss_fn, FusedLinearCrossEntropy)
+            else None
         )
         loss = calculate_loss(
             self.loss_fn,
@@ -273,6 +288,7 @@ class PipelineCausalLMLoss(nn.Module):
             model=self.model,
             hidden_states=hidden_states,
             lm_weight=shared_lm_weight,
+            grad_reduce_group=self.grad_reduce_group,
         )
         if (mtp_per_depth_h is not None or mtp_per_depth_logits is not None) and self.model.training:
             scaling_factor = self.scaling_factor if self.scaling_factor is not None else model_scaling_factor
@@ -287,6 +303,7 @@ class PipelineCausalLMLoss(nn.Module):
                 cu_seqlens=self.cu_seqlens,
                 seq_idx=seq_idx_mb,
                 lm_weight=shared_lm_weight,
+                grad_reduce_group=self.grad_reduce_group,
             )
         return loss
 
@@ -304,6 +321,18 @@ class MTPLossConfig:
     scaling_factor: float | None = None
     ignore_index: int = -100
 
-    def build(self, loss_fn: nn.Module, model: nn.Module) -> PipelineCausalLMLoss:
+    def build(
+        self,
+        loss_fn: nn.Module,
+        model: nn.Module,
+        *,
+        grad_reduce_group: dist.ProcessGroup | None = None,
+    ) -> PipelineCausalLMLoss:
         """Build the pipeline-schedule, MTP-aware loss for ``loss_fn``/``model``."""
-        return PipelineCausalLMLoss(loss_fn, model, scaling_factor=self.scaling_factor, ignore_index=self.ignore_index)
+        return PipelineCausalLMLoss(
+            loss_fn,
+            model,
+            scaling_factor=self.scaling_factor,
+            ignore_index=self.ignore_index,
+            grad_reduce_group=grad_reduce_group,
+        )

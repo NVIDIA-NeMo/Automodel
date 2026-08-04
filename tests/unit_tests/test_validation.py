@@ -81,6 +81,18 @@ class _WithKwargs(nn.Module):
         return input_ids
 
 
+class _ModelOwnedPackedCP(nn.Module):
+    _packed_cp_attn_backends = ("sdpa",)
+    _supports_sdpa = True
+
+    def __init__(self, backend_attn):
+        super().__init__()
+        self.backend = SimpleNamespace(attn=backend_attn)
+
+    def forward(self, input_ids, **kwargs):
+        return input_ids
+
+
 @dataclass(frozen=True)
 class _THDCapabilities:
     supports_tp: bool = False
@@ -419,6 +431,21 @@ class TestModelSupportsGradientCheckpointing:
 
 
 class TestModelSupportsCPWithSequencePacking:
+    @pytest.mark.parametrize(("backend", "expected"), [("sdpa", True), ("te", False)])
+    def test_model_owned_packed_cp_backend_contract(self, backend, expected):
+        model = _ModelOwnedPackedCP(backend)
+        _attach(model)
+        model._mesh = _mesh(cp=2)
+
+        assert model.supports.supports_cp_with_sequence_packing is expected
+
+    def test_model_owned_backend_contract_does_not_restrict_cp1_packing(self):
+        model = _ModelOwnedPackedCP("te")
+        _attach(model)
+        model._mesh = _mesh(cp=1)
+
+        assert model.supports.supports_cp_with_sequence_packing is True
+
     def test_cp1_seq_packing_supported(self):
         """When cp_size=1, just checks seq_lens support."""
         model = _WithSeqLens()

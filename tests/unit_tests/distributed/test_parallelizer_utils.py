@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from typing import List, Tuple
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -25,9 +26,44 @@ from nemo_automodel.components.distributed.parallelizer_utils import (
     _group_params_by_dtype,
     _make_compute_dtype_fn,
     _mp_policy_with_param_dtype,
+    configure_fsdp_unused_param_reduction,
     fully_shard_by_dtype,
     iter_maximal_uniform_dtype_subtrees,
 )
+
+
+def test_configure_fsdp_unused_param_reduction_uses_public_fsdp_api(monkeypatch):
+    from nemo_automodel.components.distributed import parallelizer_utils
+
+    class FakeFSDPModule(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.calls = []
+
+        def set_reduce_scatter_unused_params(self, enabled, *, recurse):
+            self.calls.append((enabled, recurse))
+
+    monkeypatch.setattr(parallelizer_utils, "FSDPModule", FakeFSDPModule)
+    model = nn.Sequential(FakeFSDPModule(), nn.Sequential(FakeFSDPModule()))
+
+    assert configure_fsdp_unused_param_reduction(model) == 2
+    assert model[0].calls == [(True, False)]
+    assert model[1][0].calls == [(True, False)]
+
+
+def test_configure_fsdp_unused_param_reduction_uses_legacy_fallback(monkeypatch):
+    from nemo_automodel.components.distributed import parallelizer_utils
+
+    class LegacyFSDPModule(nn.Module):
+        pass
+
+    install_fallback = Mock()
+    monkeypatch.setattr(parallelizer_utils, "FSDPModule", LegacyFSDPModule)
+    monkeypatch.setattr(parallelizer_utils, "_install_legacy_fsdp_unused_param_reduction", install_fallback)
+    model = nn.Sequential(LegacyFSDPModule(), nn.Sequential(LegacyFSDPModule()))
+
+    assert configure_fsdp_unused_param_reduction(model) == 2
+    install_fallback.assert_called_once_with()
 
 
 def _tag_hf_compute_dtype(model: nn.Module) -> None:

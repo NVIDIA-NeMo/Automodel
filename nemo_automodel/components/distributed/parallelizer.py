@@ -457,6 +457,14 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
             root_kwargs["ignored_params"] = root_ignored_params
         model = fully_shard_fn(model, **root_kwargs)
 
+        cp_enabled = "cp" in device_mesh.mesh_dim_names and device_mesh["cp"].size() > 1
+        if cp_enabled:
+            configured_units = parallelizer_utils.configure_fsdp_unused_param_reduction(model)
+            logger.info(
+                "Enabled unused-parameter reduce-scatter on %d FSDP units for context parallelism",
+                configured_units,
+            )
+
         return model
 
 

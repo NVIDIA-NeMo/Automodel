@@ -90,8 +90,13 @@ def _pixels(grid, in_dim=8, seed=0):
     return torch.randn(total_patches, in_dim, generator=g)
 
 
-def _policy(*, enabled=True, min_tokens=0, cost_alpha="auto"):
-    return vs.CpVisionFrameShardingConfig(enabled=enabled, min_tokens=min_tokens, cost_alpha=cost_alpha)
+def _policy(*, enabled=True, min_tokens=0, min_frames=32, cost_alpha="auto"):
+    return vs.CpVisionFrameShardingConfig(
+        enabled=enabled,
+        min_tokens=min_tokens,
+        min_frames=min_frames,
+        cost_alpha=cost_alpha,
+    )
 
 
 # entries with varied sizes; every patch count (t*h*w) is a multiple of sms_sq=4.
@@ -224,6 +229,10 @@ def test_cost_alpha_override_and_unknown_model_fallback():
     qwen_visual = SimpleNamespace(config=SimpleNamespace(hidden_size=1152))
 
     assert vs.CpVisionFrameShardingConfig().cost_alpha == "auto"
+    assert vs.CpVisionFrameShardingConfig().min_frames == 32
+
+    with pytest.raises(ValueError, match="min_frames must be a non-negative integer"):
+        vs.CpVisionFrameShardingConfig(min_frames=-1)
     assert vs._vision_cost_alpha(qwen_visual, _policy(cost_alpha="auto")) == 3456
     assert vs._vision_cost_alpha(qwen_visual, _policy(cost_alpha=None)) == 3456
     assert vs._vision_cost_alpha(qwen_visual, _policy(cost_alpha=777)) == 777
@@ -432,7 +441,18 @@ def test_all_gather_var_tokens_forward_backward(monkeypatch, world):
 # ======================================================================================
 # D. maybe_distribute_visual end-to-end (simulated ranks) + fallbacks + deepstack
 # ======================================================================================
-def _simulate_maybe_distribute(visual, pixel, grid, world, rank, monkeypatch, *, grad=False, spans_only_cp=True):
+def _simulate_maybe_distribute(
+    visual,
+    pixel,
+    grid,
+    world,
+    rank,
+    monkeypatch,
+    *,
+    grad=False,
+    spans_only_cp=True,
+    policy=None,
+):
     """Drive the real maybe_distribute_visual on `rank` with all ranks' data supplied to a
     mocked all-gather, returning its output object.
 
@@ -510,7 +530,7 @@ def _simulate_maybe_distribute(visual, pixel, grid, world, rank, monkeypatch, *,
 
     tok = vs.set_cp_vision_group(
         object(),
-        config=_policy(),
+        config=policy or _policy(),
         spans_only_cp=spans_only_cp,
     )  # any non-None group activates the path
     try:
@@ -699,13 +719,32 @@ def test_maybe_distribute_falls_back_below_min_tokens(monkeypatch):
     grid = _grid([(1, 2, 2)])
     pixel = _pixels(grid)
     visual = _StubVisual()
-    tok = vs.set_cp_vision_group(object(), config=_policy(min_tokens=999))
+    tok = vs.set_cp_vision_group(object(), config=_policy(min_tokens=999, min_frames=999))
     try:
         out = vs.maybe_distribute_visual(visual, pixel, grid)
     finally:
         vs.reset_cp_vision_group(tok)
 
     assert torch.allclose(out.pooler_output, visual(pixel, grid).pooler_output, atol=1e-6)
+
+
+def test_frame_threshold_shards_long_video_below_token_cutoff(monkeypatch):
+    grid = _grid([(32, 2, 2)])
+    pixel = _pixels(grid, seed=17)
+    visual = _StubVisual()
+    expected = visual(pixel, grid).pooler_output
+    out = _simulate_maybe_distribute(
+        visual,
+        pixel,
+        grid,
+        world=8,
+        rank=0,
+        monkeypatch=monkeypatch,
+        policy=_policy(min_tokens=999, min_frames=32),
+    )
+
+    assert out.pooler_output.shape == expected.shape
+    assert torch.allclose(out.pooler_output, expected, atol=1e-6)
 
 
 @pytest.mark.parametrize(

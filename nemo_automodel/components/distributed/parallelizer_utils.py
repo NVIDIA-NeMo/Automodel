@@ -19,12 +19,73 @@ import torch
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import (
+    FSDPModule,
     MixedPrecisionPolicy,
     OffloadPolicy,
     fully_shard,
 )
 
 UniformSubtreeItem = Union[Tuple[nn.Module, torch.dtype], Tuple[str, nn.Module, torch.dtype]]
+
+
+def _install_legacy_fsdp_unused_param_reduction() -> None:
+    """Backport unused-parameter reduction for PyTorch without the public API."""
+    try:
+        from torch.distributed.fsdp._fully_shard._fsdp_common import TrainingState
+        from torch.distributed.fsdp._fully_shard._fsdp_param_group import FSDPParamGroup
+    except ImportError as error:
+        raise RuntimeError(
+            "Context parallelism requires FSDP unused-parameter reduction, but this PyTorch "
+            "version provides neither the public API nor the compatible FSDP2 implementation."
+        ) from error
+
+    original_post_backward = FSDPParamGroup.post_backward
+    if getattr(original_post_backward, "_automodel_reduce_scatter_unused_params", False):
+        return
+
+    def _post_backward_with_unused_param_reduction(self, *args):
+        if self.reduce_grads and self._training_state == TrainingState.PRE_BACKWARD:
+            for fsdp_param in self.fsdp_params:
+                if not hasattr(fsdp_param, "_unsharded_param"):
+                    continue
+                if fsdp_param.unsharded_accumulated_grad is not None:
+                    continue
+                param = fsdp_param.unsharded_param
+                if param.requires_grad and param.grad is None:
+                    param.grad = torch.zeros_like(param, memory_format=torch.preserve_format)
+        return original_post_backward(self, *args)
+
+    _post_backward_with_unused_param_reduction._automodel_reduce_scatter_unused_params = True
+    FSDPParamGroup.post_backward = _post_backward_with_unused_param_reduction
+
+
+def configure_fsdp_unused_param_reduction(module: nn.Module) -> int:
+    """Reduce zero gradients for FSDP parameters unused on a local CP rank.
+
+    Packed or modality-dependent context-parallel batches may execute a module
+    on only a subset of ranks. FSDP must still issue the same reduce-scatter
+    sequence everywhere; otherwise a rank with ``grad is None`` can omit a
+    collective and discard peer contributions. PyTorch's public API fills the
+    missing local contribution with zero, analogous to DDP unused-parameter
+    handling. AutoModel keeps a compatibility fallback for supported PyTorch
+    versions that predate that public API.
+
+    Args:
+        module: Root module containing the FSDP units to configure.
+
+    Returns:
+        Number of FSDP units configured.
+    """
+    fsdp_modules = [candidate for candidate in module.modules() if isinstance(candidate, FSDPModule)]
+    if not fsdp_modules:
+        return 0
+
+    if hasattr(fsdp_modules[0], "set_reduce_scatter_unused_params"):
+        for fsdp_module in fsdp_modules:
+            fsdp_module.set_reduce_scatter_unused_params(True, recurse=False)
+    else:
+        _install_legacy_fsdp_unused_param_reduction()
+    return len(fsdp_modules)
 
 
 def iter_maximal_uniform_dtype_subtrees(

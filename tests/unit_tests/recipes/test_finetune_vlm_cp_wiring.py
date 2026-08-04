@@ -118,6 +118,14 @@ class _SupportedVisionModel:
     supports_cp_vision_frame_sharding = True
 
 
+class _PackedCPModel:
+    _packed_cp_attn_backends = ("sdpa",)
+
+    def __init__(self, *, supported, backend="sdpa"):
+        self.supports_cp_with_sequence_packing = supported
+        self.backend = SimpleNamespace(attn=backend)
+
+
 def test_cp_vision_frame_sharding_rejects_model_without_capability():
     policy = CpVisionFrameShardingConfig(enabled=True)
 
@@ -138,6 +146,32 @@ def test_disabled_cp_vision_frame_sharding_accepts_model_without_capability():
     policy = CpVisionFrameShardingConfig(enabled=False)
 
     vlm_finetune._validate_cp_vision_frame_sharding_support(_UnsupportedVisionModel(), policy)
+
+
+def test_packed_cp_rejects_unsupported_qwen_backend_before_dataloader_build():
+    with pytest.raises(ValueError, match="backend.attn='te'.*sdpa"):
+        vlm_finetune._validate_cp_packing_support(
+            _PackedCPModel(supported=False, backend="te"),
+            packing_enabled=True,
+            cp_size=8,
+        )
+
+
+@pytest.mark.parametrize(("packing_enabled", "cp_size"), [(False, 8), (True, 1)])
+def test_packed_cp_validation_is_inactive_without_composed_path(packing_enabled, cp_size):
+    vlm_finetune._validate_cp_packing_support(
+        _PackedCPModel(supported=False, backend="te"),
+        packing_enabled=packing_enabled,
+        cp_size=cp_size,
+    )
+
+
+def test_packed_cp_accepts_model_owned_backend():
+    vlm_finetune._validate_cp_packing_support(
+        _PackedCPModel(supported=True),
+        packing_enabled=True,
+        cp_size=8,
+    )
 
 
 def test_cp_vision_frame_sharding_context_resets_published_group_after_failure(monkeypatch):

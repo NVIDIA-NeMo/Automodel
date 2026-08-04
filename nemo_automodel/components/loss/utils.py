@@ -38,14 +38,13 @@ def _get_lm_head_module(model: nn.Module) -> Optional[nn.Module]:
 
 
 def _get_lm_head_weight(model: nn.Module) -> torch.Tensor:
-    """Return the model's LM-head weight, materializing DTensor weights when needed."""
+    """Return the model's LM-head weight without changing its distributed layout."""
     lm_head = _get_lm_head_module(model)
     if lm_head is not None:
-        weight = lm_head.weight
-        return weight.full_tensor() if hasattr(weight, "full_tensor") else weight
+        return lm_head.weight
     for name, param in model.named_parameters(remove_duplicate=False):
         if "lm_head" in name and name.endswith(".weight"):
-            return param.full_tensor() if hasattr(param, "full_tensor") else param
+            return param
     raise ValueError("lm_head.weight not found in model")
 
 
@@ -98,10 +97,12 @@ def calculate_loss(loss_fn, **kwargs) -> torch.Tensor:
                 "hidden_states": kwargs.pop("hidden_states"),
                 "labels": labels,
                 "lm_weight": lm_head,
+                "grad_reduce_group": kwargs.pop("grad_reduce_group", None),
             }
         )
     else:
         kwargs.pop("lm_weight", None)  # logit-based losses do not need the LM head
+        kwargs.pop("grad_reduce_group", None)
         loss_fn_kwargs.update(
             {
                 "logits": kwargs.pop("logits"),

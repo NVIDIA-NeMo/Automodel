@@ -66,6 +66,7 @@ from importlib.metadata import version as metadata_version
 from typing import Optional
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from packaging.version import Version
 
@@ -144,12 +145,74 @@ class FusedLinearCrossEntropy(nn.Module):
         self.logit_softcapping = logit_softcapping
         self.reduction = reduction
 
+    @staticmethod
+    def materialize_lm_weight(
+        lm_weight: torch.Tensor,
+        *,
+        grad_reduce_group: dist.ProcessGroup | None = None,
+    ) -> torch.Tensor:
+        """Materialize an LM-head DTensor with gradient-correct reduction semantics.
+
+        Fused linear CE consumes the LM-head weight outside the owning FSDP
+        module's forward. Each data/context-parallel rank therefore computes a
+        rank-local full-weight gradient. A plain ``DTensor.full_tensor()`` marks
+        that gradient as replicated, so backward only slices the local result
+        into the owned shard instead of combining peer contributions.
+
+        Args:
+            lm_weight: LM-head weight tensor. A regular tensor is returned
+                unchanged; a DTensor is gathered to a regular full tensor.
+            grad_reduce_group: Process group whose ranks contribute independent
+                token losses. Its size must match the LM-head DTensor mesh.
+
+        Returns:
+            A full LM-head tensor whose backward reduce-scatters the averaged
+            peer gradients into the original DTensor shard.
+
+        Raises:
+            ValueError: If a trainable sharded weight has no matching reduction
+                group. This fails closed instead of producing rank-local shards.
+        """
+        if not hasattr(lm_weight, "full_tensor"):
+            return lm_weight
+
+        # Evaluation has no weight gradient to combine, so preserve the ordinary
+        # gather path and do not require a process group from inference callers.
+        if not torch.is_grad_enabled() or not lm_weight.requires_grad:
+            return lm_weight.full_tensor()
+
+        mesh = lm_weight.device_mesh
+        mesh_world_size = mesh.size()
+        reduce_world_size = dist.get_world_size(grad_reduce_group) if grad_reduce_group is not None else 1
+        if mesh_world_size != reduce_world_size:
+            raise ValueError(
+                "FusedLinearCrossEntropy requires grad_reduce_group to match the LM-head "
+                f"DTensor mesh: mesh size={mesh_world_size}, reduction group size={reduce_world_size}. "
+                "Tensor-parallel or hierarchical layouts need an explicit compatible loss path."
+            )
+        if mesh_world_size == 1:
+            return lm_weight.full_tensor()
+
+        from torch.distributed.tensor import Partial
+
+        # ``Partial`` tells DTensor autograd to reduce-scatter the full gradient
+        # directly into the parameter's original FSDP shard. Training recipes
+        # scale the local loss by the reduction world size before backward to
+        # cancel FSDP's averaged-gradient convention, so restore that average
+        # before the reduce-scatter sum.
+        full_weight = lm_weight.full_tensor(
+            grad_placements=tuple(Partial() for _ in range(mesh.ndim)),
+        )
+        full_weight.register_hook(lambda grad: grad.div_(reduce_world_size))
+        return full_weight
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         labels: torch.Tensor,
         lm_weight: torch.Tensor,
         num_label_tokens: Optional[int] = None,
+        grad_reduce_group: dist.ProcessGroup | None = None,
     ) -> torch.Tensor:
         """
         Compute fused linear cross entropy loss that matches PyTorch's cross_entropy behavior.
@@ -159,9 +222,16 @@ class FusedLinearCrossEntropy(nn.Module):
             labels: Target labels
             lm_weight: Weight matrix for linear transformation
             num_label_tokens: Number of non-padding tokens.
+            grad_reduce_group: Group that contributes independent loss shards
+                when ``lm_weight`` is a sharded DTensor.
         """
         if not HAVE_CUT_CROSS_ENTROPY:
             raise ImportError(MISSING_CUT_CROSS_ENTROPY_MSG)
+
+        lm_weight = self.materialize_lm_weight(
+            lm_weight,
+            grad_reduce_group=grad_reduce_group,
+        )
 
         # First compute loss with sum reduction to handle normalization ourselves
         if self.logit_softcapping == 0:
