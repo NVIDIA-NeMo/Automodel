@@ -1216,7 +1216,7 @@ def test_run_train_validation_loop_calls_gc_hook_once_per_step():
     trainer.val_dataloaders = {}
     trainer.metric_logger_train = SimpleNamespace(close=MagicMock())
     trainer.metric_logger_valid = {}
-    trainer.checkpointer = SimpleNamespace(close=MagicMock())
+    trainer.checkpointer = SimpleNamespace(finalize=MagicMock())
     trainer.best_metric_key = "default"
 
     trainer.run_train_validation_loop()

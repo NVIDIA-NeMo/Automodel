@@ -1,0 +1,82 @@
+---
+title: "LTX-2.3"
+description: "Fine-tune and generate synchronized video and audio with LTX-2.3"
+---
+[LTX-2.3](https://huggingface.co/Lightricks/LTX-2.3) is a text-to-video diffusion model from Lightricks. Its dual-stream transformer denoises video and audio latents together so generated clips can include synchronized sound.
+
+<Info>
+
+| | |
+|---|---|
+| **Task** | Text-to-Video with Audio |
+| **Architecture** | Dual-stream DiT (Flow Matching) |
+| **HF Org** | [Lightricks](https://huggingface.co/Lightricks) |
+
+</Info>
+
+## Available Models
+
+LTX-2.3 supports full-parameter and LoRA fine-tuning with synchronized video and audio.
+
+## Example Recipes
+
+| Recipe | Description |
+|---|---|
+| [ltx2_3_t2v_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/ltx2_3_t2v_flow.yaml) | Full fine-tuning with flow matching |
+| [ltx2_3_t2v_flow_lora.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/ltx2_3_t2v_flow_lora.yaml) | Parameter-efficient LoRA fine-tuning |
+| [generate_ltx2.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/generate/configs/generate_ltx2.yaml) | Generate video and mux the model's audio into the output |
+
+## Prepare Video and Audio Data
+
+Install the diffusion and media dependencies, then preprocess clips with a fixed frame count. LTX-2.3 samples video at 24 FPS and trims or pads each audio track to the matching duration.
+
+```bash
+uv sync --extra diffusion --extra diffusion-media
+uv run python -m tools.diffusion.preprocessing_multiprocess video \
+  --video_dir /path/to/videos \
+  --output_dir /path/to/ltx2-cache \
+  --processor ltx2 \
+  --num_frames 121 \
+  --output_format pt \
+  --resolution_preset 512p \
+  --caption_format sidecar
+```
+
+LTX-2.3 requires an explicit frame count of the form `8n+1`, such as 9, 89, or 121. Clips without an audio stream use silence while preserving the video and audio alignment contract.
+
+## Fine-Tune LTX-2.3
+
+Set `data.dataloader.cache_dir` and `checkpoint.checkpoint_dir` in the selected recipe, then launch one process per GPU.
+
+```bash
+uv run torchrun --nproc-per-node=8 \
+  examples/diffusion/finetune/finetune.py \
+  -c examples/diffusion/finetune/ltx2_3_t2v_flow.yaml
+```
+
+For LoRA, use the LoRA recipe instead:
+
+```bash
+uv run torchrun --nproc-per-node=8 \
+  examples/diffusion/finetune/finetune.py \
+  -c examples/diffusion/finetune/ltx2_3_t2v_flow_lora.yaml
+```
+
+Both recipes use `flow_matching.adapter_type: ltx2`. The adapter applies the same sampled noise level to the video and audio streams and combines their flow-matching losses.
+
+## Generate Video with Audio
+
+Point `model.checkpoint` at a consolidated full-fine-tuning checkpoint, or set `model.lora_weights` for a LoRA checkpoint.
+
+```bash
+uv run python examples/diffusion/generate/generate.py \
+  -c examples/diffusion/generate/configs/generate_ltx2.yaml \
+  --model.checkpoint /path/to/checkpoint
+```
+
+The generation command writes an MP4 and muxes the generated waveform into it. See the [Diffusion Fine-Tuning Guide](/recipes-e2e-examples/diffusion-fine-tuning) and [Diffusion Dataset Preparation](/datasets/diffusion-dataset) guide for shared training and dataset options.
+
+## Hugging Face Model Cards
+
+- [Lightricks/LTX-2.3](https://huggingface.co/Lightricks/LTX-2.3)
+- [diffusers/LTX-2.3-Diffusers](https://huggingface.co/diffusers/LTX-2.3-Diffusers)

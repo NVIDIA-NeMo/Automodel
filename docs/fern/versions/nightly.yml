@@ -316,6 +316,9 @@ navigation:
           - page: "HunyuanVideo 1.5"
             path: ../../model-coverage/diffusion/hunyuanvideo-community/hunyuanvideo.mdx
             slug: hunyuanvideo-1-5
+          - page: "LTX-2.3"
+            path: ../../model-coverage/diffusion/lightricks/ltx-2-3.mdx
+            slug: ltx-2-3
           - page: "Qwen-Image"
             path: ../../model-coverage/diffusion/qwen/qwen-image.mdx
           - page: "LTX-2.3"

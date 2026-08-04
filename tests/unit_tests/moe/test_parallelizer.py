@@ -14,6 +14,7 @@
 
 import sys
 import types
+from contextlib import nullcontext
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -190,8 +191,13 @@ def _install_torch_and_layers_stubs(monkeypatch):
         def __init__(self, *args, **kwargs):
             pass
 
+    class Replicate:
+        def __init__(self, *args, **kwargs):
+            pass
+
     tensor_stub.distribute_module = distribute_module
     tensor_stub.distribute_tensor = distribute_tensor
+    tensor_stub.Replicate = Replicate
     tensor_stub.Shard = Shard
 
     # tensor.parallel
@@ -316,7 +322,11 @@ def _install_torch_and_layers_stubs(monkeypatch):
     class MoE:
         pass
 
+    class Gate:
+        pass
+
     layers_stub.GroupedExpertsDeepEP = GroupedExpertsDeepEP
+    layers_stub.Gate = Gate
     layers_stub.MoE = MoE
     monkeypatch.setitem(sys.modules, "nemo_automodel.components.moe.layers", layers_stub)
 
@@ -430,7 +440,11 @@ def _import_parallelizer_with_stubs(monkeypatch):
     monkeypatch.setitem(sys.modules, "nemo_automodel.shared.tied_weights", tied_weights_stub)
 
     activation_checkpointing_stub = types.ModuleType("nemo_automodel.components.distributed.activation_checkpointing")
+    activation_checkpointing_stub.ensure_fsdp_ops_sac_ignored = lambda: None
     activation_checkpointing_stub.ensure_profiler_ops_sac_ignored = lambda: None
+    activation_checkpointing_stub.transformer_engine_attention_backend_snapshot_context_fn = (
+        lambda context_fn=None: context_fn() if context_fn is not None else (nullcontext(), nullcontext())
+    )
     monkeypatch.setitem(
         sys.modules,
         "nemo_automodel.components.distributed.activation_checkpointing",
@@ -653,9 +667,10 @@ def test_apply_ac_wraps_blocks_with_and_without_context(monkeypatch):
     model.layers.registered.clear()
 
     P.apply_ac(model, ignore_router=False, hidden_size=7168, num_experts=256)
-    # context_fn should not be passed (3rd arg remains default None)
+    # Router replay does not need a selective policy, but TE attention still
+    # receives a context that preserves its forward-time backend cache.
     for _, kwargs in wrapper_mock.call_args_list:
-        assert "context_fn" not in kwargs or kwargs["context_fn"] is None
+        assert callable(kwargs["context_fn"])
     assert len(model.layers.registered) == 2
 
 
@@ -761,6 +776,9 @@ def test_apply_fsdp_calls_with_ignored_params_and_shard_for_experts(monkeypatch)
     fully_shard_mock = MagicMock()
     mp_policy_mock = MagicMock(return_value="MP_POLICY")
     shard_sentinel = object()
+    replicate_sentinel = object()
+    correction_bias = object()
+    distributed_correction_bias = object()
 
     def fake_shard(dim):
         assert dim == 1
@@ -768,15 +786,20 @@ def test_apply_fsdp_calls_with_ignored_params_and_shard_for_experts(monkeypatch)
 
     monkeypatch.setattr(P, "fully_shard", fully_shard_mock)
     monkeypatch.setattr(P, "MixedPrecisionPolicy", mp_policy_mock)
+    monkeypatch.setattr(P, "Replicate", MagicMock(return_value=replicate_sentinel))
     monkeypatch.setattr(P, "Shard", fake_shard)
+    distribute_tensor_mock = MagicMock(return_value=distributed_correction_bias)
+    monkeypatch.setattr(P, "distribute_tensor", distribute_tensor_mock)
 
     block = DummyBlock(mlp=DummyMoE())
+    block.mlp.gate = P.Gate()
+    block.mlp.gate.e_score_correction_bias = correction_bias
     embed = object()
     embed_norm = object()
     lm = object()
     model = DummyModel([block], embed_tokens=embed, embed_norm=embed_norm, lm_head=lm)
 
-    fsdp_mesh = type("Mesh", (), {"size": lambda self: 2})()
+    fsdp_mesh = type("Mesh", (), {"ndim": 1, "size": lambda self: 2})()
     ep_shard_mesh = type("Mesh", (), {"size": lambda self: 2})()
     offload_policy = object()
 
@@ -788,6 +811,13 @@ def test_apply_fsdp_calls_with_ignored_params_and_shard_for_experts(monkeypatch)
         ep_shard_mesh=ep_shard_mesh,
         offload_policy=offload_policy,
     )
+
+    distribute_tensor_mock.assert_called_once_with(
+        correction_bias,
+        device_mesh=fsdp_mesh,
+        placements=[replicate_sentinel],
+    )
+    assert block.mlp.gate.e_score_correction_bias is distributed_correction_bias
 
     # Experts should have a dedicated shard call
     experts = block.mlp.experts
@@ -2476,6 +2506,7 @@ def test_apply_ac_selective_wraps_blocks_with_shared_policy(monkeypatch):
     dense_stub = types.ModuleType("nemo_automodel.components.distributed.activation_checkpointing")
     dense_stub.make_selective_checkpoint_context_fn = MagicMock(return_value=sentinel_ctx)
     dense_stub.SELECTIVE_AC_WRAPPER_FLAG = sentinel_flag
+    dense_stub.transformer_engine_attention_backend_snapshot_context_fn = lambda context_fn=None: context_fn
     monkeypatch.setitem(sys.modules, "nemo_automodel.components.distributed.activation_checkpointing", dense_stub)
 
     wrapped = []
@@ -2486,7 +2517,8 @@ def test_apply_ac_selective_wraps_blocks_with_shared_policy(monkeypatch):
 
     def fake_wrapper(block, preserve_rng_state, context_fn=None):
         assert preserve_rng_state is True
-        assert context_fn is sentinel_ctx
+        assert callable(context_fn)
+        assert context_fn() is sentinel_ctx
         w = _Wrapper(block)
         wrapped.append(w)
         return w

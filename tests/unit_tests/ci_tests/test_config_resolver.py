@@ -374,6 +374,11 @@ def test_vlm_checkpoint_robustness_recipes_resolve(tmp_path, recipe_path):
         assert robustness["hf_device_map_auto"] is True
     if "/mistral4/" in recipe_path:
         assert robustness["hf_source_post_load_dequantize"] is True
+        assert robustness["kl_threshold"] == 5e-2
+        assert robustness["source_load_kl_threshold"] == 1e-2
+        assert robustness["source_load_mean_kl_threshold"] == 2e-3
+        assert robustness["source_load_cosine_threshold"] == 0.999
+        assert robustness["hf_kl_threshold"] == 5e-2
     if Path(recipe_path).stem == "qwen3_vl_moe_30b_te_deepep":
         assert robustness["resume_loss_threshold"] == 1e-2
     if Path(recipe_path).stem == "qwen3_5_35b":
@@ -387,9 +392,7 @@ def test_vlm_checkpoint_robustness_recipes_resolve(tmp_path, recipe_path):
         assert robustness["source_load_cosine_threshold"] == 0.9985
         assert robustness["source_load_kl_threshold"] == 1e-1
         assert robustness["source_load_mean_kl_threshold"] == 1e-2
-        assert resolved["loss_fn"]["_target_"] == (
-            "nemo_automodel.components.loss.chunked_ce.ChunkedCrossEntropy"
-        )
+        assert resolved["loss_fn"]["_target_"] == ("nemo_automodel.components.loss.chunked_ce.ChunkedCrossEntropy")
         assert resolved["model"]["backend"]["experts"] == "torch_mm"
         assert resolved["step_scheduler"]["global_batch_size"] == 16
         assert resolved["step_scheduler"]["local_batch_size"] == 1

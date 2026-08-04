@@ -7,7 +7,7 @@ position: 6
 
 Diffusion models are a class of generative models that learn to produce images or videos by iteratively denoising samples from a noise distribution. NeMo AutoModel supports training diffusion models using **flow matching**, a framework that regresses velocity fields along straight interpolation paths between noise and data.
 
-NeMo AutoModel integrates with [Hugging Face Diffusers](https://huggingface.co/docs/diffusers) for model loading and generation, while providing its own distributed training infrastructure via the `TrainDiffusionRecipe`. This recipe handles FSDP2 parallelization, flow matching loss computation, multiresolution bucketed dataloading, and checkpoint management.
+NeMo AutoModel integrates with [Hugging Face Diffusers](https://huggingface.co/docs/diffusers) for model loading and generation while providing its own distributed training infrastructure using `TrainDiffusionRecipe`. This recipe handles FSDP2 parallelization, flow matching loss computation, multiresolution bucketed data loading, and checkpoint management.
 
 ## Supported Models
 
