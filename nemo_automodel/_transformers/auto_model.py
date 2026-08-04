@@ -101,6 +101,7 @@ from nemo_automodel._transformers.model_init import (
 from nemo_automodel.components.kernels.hub import (
     apply_hub_kernels_to_model,
     extract_hub_kernels_config,
+    is_hub_attn_implementation,
     resolve_attn_implementation,
 )
 from nemo_automodel.components.models.common.tie_word_embeddings import reject_tie_word_embeddings_flip
@@ -429,12 +430,19 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         hub_kernels_cfg = extract_hub_kernels_config(kwargs)
         attn_implementation = resolve_attn_implementation(attn_implementation, hub_kernels=hub_kernels_cfg)
         if use_kernels:
+            if use_liger_kernel:
+                logger.info(
+                    "use_kernels=True: skipping pip Liger patching (Transformers Hub kernelize owns layer replacements). "
+                    "Install with: uv sync --extra hub_kernels"
+                )
             use_liger_kernel = False
             kwargs["use_kernels"] = True
             if allow_all_kernels:
                 kwargs["allow_all_kernels"] = True
             if kernel_config is not None:
                 kwargs["kernel_config"] = kernel_config
+        if is_hub_attn_implementation(attn_implementation):
+            logger.info("Using Hub attention implementation %r", attn_implementation)
 
         def _retry(**override):
             """Re-enter ``_build_model`` with overridden parameters."""

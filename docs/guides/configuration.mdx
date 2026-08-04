@@ -185,3 +185,22 @@ sbatch my_cluster.sub
 ```
 
 All cluster-specific configuration, including SBATCH directives, the container image, mounts, secrets, and environment variables, resides in your `sbatch` script. See [Run on a Cluster](/job-launchers/slurm-cluster) for complete examples.
+
+## Model Attention and Hub Kernels
+
+`model:` entries passed to `NeMoAutoModel*.from_pretrained` / `from_config` accept:
+
+```yaml
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: Qwen/Qwen2.5-7B
+  attn_implementation: kernels-community/flash-attn2  # Hub flash attention
+  use_kernels: true                                   # optional Hub layer kernels
+  use_liger_kernel: false                             # auto-disabled when use_kernels is true
+```
+
+`attn_implementation` and `use_kernels` are independent. A Hub repo id selects
+attention only; `use_kernels` replaces norms / MLP / linear via Transformers
+`kernelize`. Install with `uv sync --extra hub_kernels`. Full details:
+[Hub Kernels](/development/hub-kernels).
+

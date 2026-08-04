@@ -1,0 +1,102 @@
+---
+title: "Hub Kernels (Hugging Face kernels)"
+description: "Use Hugging Face Hub kernels for flash attention and layer replacements without compiling flash-attn"
+position: 5
+---
+NeMo AutoModel can load optimized kernels from the Hugging Face Hub through the
+[`kernels`](https://huggingface.co/docs/kernels) package and
+[`kernels-community`](https://huggingface.co/kernels-community) repos. This avoids
+compiling `flash-attn` from source for many Hugging Face model paths.
+
+Two independent knobs control Hub usage:
+
+| Setting | What it changes |
+|---------|-----------------|
+| `attn_implementation: kernels-community/flash-attn2` | Attention only |
+| `use_kernels: true` | Non-attention layers (RMSNorm, MLP, Linear, activations, RoPE, fused CE, …) |
+
+You do **not** need `use_kernels` when you only want Hub flash attention.
+
+## Install
+
+```bash
+uv sync --extra hub_kernels
+# or
+uv pip install "nemo-automodel[hub_kernels]"
+```
+
+See [Install NeMo AutoModel](/get-started/installation) for the full extras table.
+The `hub_kernels` extra installs `kernels>=0.11.0`. It is not part of `[all]`.
+
+## Attention only
+
+```yaml
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: Qwen/Qwen2.5-7B
+  attn_implementation: kernels-community/flash-attn2
+```
+
+Equivalents:
+
+- `attn_implementation: flash_attention_2` — uses pip `flash-attn` when installed,
+  otherwise falls back to Hub FA2 when `kernels` is available.
+- `attn_implementation: kernels-community/flash-attn3` — Hopper FA3 Hub build.
+
+Example recipe: [`examples/llm_finetune/qwen/qwen2_5_7b_squad_hub_kernels.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen2_5_7b_squad_hub_kernels.yaml).
+
+## Attention plus Hub layer kernels
+
+```yaml
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: Qwen/Qwen2.5-7B
+  attn_implementation: kernels-community/flash-attn2
+  use_kernels: true
+  # optional; AutoModel disables pip Liger automatically when use_kernels is true
+  use_liger_kernel: false
+```
+
+`use_kernels: true` forwards to Transformers' Hub `kernelize` path (for example
+`kernels-community/liger-kernels`). Pip `liger_kernel` patching is skipped so the
+two do not fight.
+
+Benchmark configs:
+
+- [`qwen2_5_7b_hub_kernels.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/qwen/qwen2_5_7b_hub_kernels.yaml) — attention only
+- [`qwen2_5_7b_hub_kernels_layers.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/qwen/qwen2_5_7b_hub_kernels_layers.yaml) — attention + layers
+
+## Native models (`BackendConfig`)
+
+Custom NeMo model factories do not use Hugging Face attention dispatch. For those
+paths, set:
+
+```yaml
+model:
+  backend:
+    attn: hub
+    # optional repo override; default is kernels-community/flash-attn2 when attn is hub
+    hub_kernels:
+      attn_repo: kernels-community/flash-attn2
+```
+
+Layer replacements for custom models still use top-level `use_kernels: true`.
+
+## What to prefer when
+
+| Goal | Recommended settings |
+|------|----------------------|
+| Avoid compiling `flash-attn` | `hub_kernels` extra + Hub `attn_implementation` |
+| Match Transformers Hub layer kernels | `use_kernels: true` |
+| TE / DeepEP / TileLang / QuACK | Keep existing `backend:` fields; do not mix TE attention with Hub FA |
+| EAGLE ring attention / some VLMs | Still need pip `flash-attn` (direct imports) |
+
+## Limitations
+
+- Transformer Engine attention and Hub flash attention are mutually exclusive.
+- Some vision and speculative paths still import pip `flash-attn` directly
+  (Kimi VL, BAGEL packed inference, LLaVA-OneVision Rice ViT, EAGLE).
+- Scoped CUDA graphs (`backend.cuda_graph`) require `attn: te`, not `hub`.
+
+For offline or reproducible deploys, pin kernels with `kernels lock` and
+`kernels download` as described in the [Hugging Face kernels docs](https://huggingface.co/docs/kernels).
