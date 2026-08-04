@@ -33,7 +33,7 @@ YAML-native types (such as `step_size: 10` without quotes) are already typed by 
 
 ## Use `_target_` for Instantiation
 
-Any mapping containing a `_target_` key can be instantiated using `ConfigNode.instantiate()`:
+Any mapping containing a `_target_` key can be instantiated using `ConfigNode.instantiate()`.
 
 ```yaml
 model:
@@ -67,7 +67,7 @@ The `distributed:` section is **not** instantiated using `_target_`. Recipes par
 
 {/* docs-review-start: mamba-ssd-prewarm */}
 
-The LLM training, LLM fine-tuning, and VLM fine-tuning recipes accept an optional `prewarm:` section:
+The LLM training, LLM fine-tuning, and VLM fine-tuning recipes accept an optional `prewarm:` section.
 
 ```yaml
 prewarm:
@@ -97,7 +97,7 @@ Triton reuses an autotuned configuration according to each kernel's explicit cac
 
 ## Repair Near-Zero Input Embeddings
 
-The LLM training and fine-tuning recipe can repair a small number of damaged input-embedding rows after loading the base checkpoint and before creating the optimizer:
+The LLM training and fine-tuning recipe can repair a small number of damaged input-embedding rows after loading the base checkpoint and before creating the optimizer.
 
 ```yaml
 embedding_row_repair:
@@ -113,7 +113,7 @@ For diagnosis, safety behavior, verification steps, and performance impact, see 
 
 ### Frozen Multimodal FSDP Policy
 
-FSDP2 uses the correctness-first `root` policy for fully frozen vision/audio towers and multimodal projectors:
+FSDP2 uses the correctness-first `root` policy for fully frozen vision/audio towers and multimodal projectors.
 
 ```yaml
 distributed:
@@ -128,7 +128,7 @@ The supported policies are:
 - `per_layer`: layers inside the frozen multimodal module get their normal FSDP units. This can reduce peak unshard memory, but it is an expert option: every rank in the FSDP group must execute or skip those units the same number of times and in the same order on every microbatch.
 - `replicate`: frozen multimodal parameters are excluded from FSDP and copied on every rank. This removes their collectives at the cost of higher per-rank parameter memory.
 
-This setting does not change modules that contain any trainable parameters. For nested MoE/VLM models, `root` requires `distributed.moe.wrap_outer_model: true` when a fully frozen multimodal module is outside the inner text-model FSDP root. Use `per_layer` or `replicate` if the outer model must remain unwrapped.
+This setting does not change modules that contain any trainable parameters. For nested MoE or VLM models, `root` requires `distributed.moe.wrap_outer_model: true` when a fully frozen multimodal module is outside the inner text-model FSDP root. Use `per_layer` or `replicate` if the outer model must remain unwrapped.
 
 ## Interpolate Environment Variables in YAML
 
@@ -155,6 +155,8 @@ NeMo AutoModel supports env var interpolation inside YAML **string values**.
 
 ### Example (Databricks Delta)
 
+The following configuration shows an example of environment variable interpolation for a Databricks Delta dataset.
+
 ```yaml
 dataset:
   _target_: nemo_automodel.components.datasets.llm.column_mapped_text_instruction_iterable_dataset.ColumnMappedTextInstructionIterableDataset
@@ -167,9 +169,9 @@ dataset:
 
 ## Prevent Secret Leakage in Logs
 
-When an env var placeholder is resolved, the config keeps the original placeholder in an internal `._orig_value` field for **safe printing**:
+When an env var placeholder is resolved, the config keeps the original placeholder in an internal `._orig_value` field for **safe printing**.
 
-- `str(cfg)` / `repr(cfg)` prints placeholders (e.g. `${DATABRICKS_TOKEN}`), not resolved secrets.
+- `str(cfg)` or `repr(cfg)` prints placeholders (for example, `${DATABRICKS_TOKEN}`), not resolved secrets.
 - `cfg.to_yaml_dict(use_orig_values=True, redact_sensitive=True)` is the recommended way to produce a loggable YAML dict.
 
 <Info>
