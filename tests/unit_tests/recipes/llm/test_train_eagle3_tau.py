@@ -17,7 +17,7 @@ recipe: ``_all_reduce_sum`` / ``_window_tau_sim``, the training-window
 accumulation and progress-bar/log wiring, and the ``_run_eval`` tau column.
 
 The trainer-side math (per-step counts, :func:`simulated_accept_length`) is
-covered in ``tests/unit_tests/speculative/test_eagle3.py``; here the trainer
+covered in ``tests/unit_tests/components/speculative/eagle/test_eagle3.py``; here the trainer
 module is faked and only the recipe plumbing is exercised.
 """
 

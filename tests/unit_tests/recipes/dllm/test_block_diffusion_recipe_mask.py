@@ -15,7 +15,7 @@
 """Non-degeneracy tests for the diffusion_gemma recipe's ACTUAL response-window mask.
 
 The mask leakage/structure unit tests in
-``tests/unit_tests/models/diffusion_gemma/test_diffusion_gemma_mask.py`` build
+``tests/unit_tests/components/models/diffusion_gemma/test_diffusion_gemma_mask.py`` build
 hand-crafted masks. This file instead drives the recipe's own
 ``_build_response_window`` (the code that runs in ``_forward_backward_step``)
 using the ``seq_length`` / ``block_size`` from the *shipped* example configs, and

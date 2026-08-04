@@ -17,7 +17,7 @@
 import pytest
 import torch
 
-from tests.unit_tests.moe.test_gate_activation_checkpointing import _assert_gate_load_and_gradient_parity
+from tests.unit_tests.components.moe.test_gate_activation_checkpointing import _assert_gate_load_and_gradient_parity
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA GPU")

@@ -105,7 +105,7 @@ sparse/indexer/Sinkhorn kernels. Some versions fail with
 
 - **Verified**: CPU unit tests for the draft / config / registry / RoPE `inv_freq`
   fp32 pin, and the new chat-template / target-layer-reduction recipe knobs
-  (`tests/unit_tests/speculative/`).
+  (`tests/unit_tests/components/speculative/dspark/`).
 - **Smoke-validated on 8x H100 80GB** (community): the reduced 4-layer EP path with
   `target_attn_backend: eager` trains end to end (loss decreases, ~16 GiB/rank).
   The full 43-layer target OOMs on a single 8x80GB node, which is why full training

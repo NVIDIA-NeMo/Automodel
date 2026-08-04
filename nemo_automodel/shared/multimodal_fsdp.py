@@ -127,7 +127,7 @@ def iter_multimodal_modules(model: nn.Module) -> Iterator[tuple[str, nn.Module]]
     tower/projector maximal (e.g. ``vision_tower`` rather than the
     ``vision_tower.vision_model`` nested inside it).
 
-    The attribute-scan fallback only serves ``tests/unit_tests/moe`` model
+    The attribute-scan fallback only serves ``tests/unit_tests/components/moe`` model
     doubles, which are plain classes rather than ``nn.Module`` subclasses. It
     uses different (non-maximal, top-two-levels-only) selection than the real
     path, so tests that exercise it are not testing production behavior.
