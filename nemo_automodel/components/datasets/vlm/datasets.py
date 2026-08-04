@@ -29,8 +29,8 @@ from typing import TYPE_CHECKING, ClassVar
 
 import torch
 import torch.utils.data
+from datasets import Dataset, load_dataset
 from datasets import Image as HfImage
-from datasets import load_dataset
 from PIL import Image
 
 if TYPE_CHECKING:
@@ -536,7 +536,7 @@ class ShopifyProductCatalogueDatasetConfig:
     limit_dataset_samples: int | None = None
     """Optional maximum number of samples to load."""
 
-    def build(self):
+    def build(self) -> Dataset:
         """Build the Shopify product-catalogue dataset from this config."""
         return make_shopify_product_catalogue_dataset(
             path_or_dataset=self.path_or_dataset,
@@ -550,7 +550,7 @@ def make_shopify_product_catalogue_dataset(
     split="train",
     limit_dataset_samples: int | None = None,
     **kwargs,
-):
+) -> Dataset:
     """Load the Shopify product-catalogue dataset for image-to-text fine-tuning.
 
     The task is product image -> taxonomy category, supervised on the dataset's
