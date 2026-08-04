@@ -146,7 +146,7 @@ The schedule values above are taken from the config shipped with the authors' re
 so that is the first knob to sweep.
 
 Decode SCDD checkpoints with `--sampler scdd`, passing the same `uniform_ratio`, `schedule_shape`,
-and `schedule_peak` used during training — the sampler rebuilds the reverse posterior from that
+and `schedule_peak` used during training. The sampler rebuilds the reverse posterior from that
 schedule, so a mismatch degrades generation.
 
 Unlike the absorbing losses, the SCDD objective needs the model's probability for every
