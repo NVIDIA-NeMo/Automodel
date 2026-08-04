@@ -123,6 +123,20 @@ class KimiK3Eagle3MLAAttention(Eagle3DeepseekMLAAttention):
         position_ids: torch.Tensor,
         cache_hidden: list[list[torch.Tensor]],
     ) -> torch.Tensor:
+        """Run one NoPE MLA step over the fused EAGLE-3 input.
+
+        Args:
+            combined_states: Tensor of shape ``[batch, sequence, 2 * hidden]``, the
+                fused ``[normed embed, normed hidden]`` EAGLE-3 first-layer input.
+            attention_mask: Additive mask of shape ``[batch, 1, sequence, sequence]``.
+            position_ids: Tensor of shape ``[batch, sequence]``; unused (NoPE MLA).
+            cache_hidden: TTT cache ``[K_list, V_list]``; each list holds one entry
+                per TTT step, shaped ``[batch, heads, sequence, qk_head_dim]`` for
+                keys and ``[batch, heads, sequence, v_head_dim]`` for values.
+
+        Returns:
+            Tensor of shape ``[batch, sequence, hidden]``.
+        """
         # ``position_ids`` is unused: K3's MLA is NoPE, so the TTT step index only
         # extends the key axis (via cache_hidden) and never shifts a rotary phase.
         del position_ids
@@ -175,6 +189,20 @@ class KimiK3Eagle3DecoderLayer(nn.Module):
         position_ids: torch.Tensor,
         cache_hidden: list[list[torch.Tensor]],
     ) -> torch.Tensor:
+        """Fuse the embedding and hidden streams, then run attention and the MLP.
+
+        Args:
+            input_embeds: Tensor of shape ``[batch, sequence, hidden]``, the draft
+                token embeddings.
+            hidden_states: Tensor of shape ``[batch, sequence, hidden]``, the
+                projected target hidden states; also the residual stream.
+            attention_mask: Additive mask of shape ``[batch, 1, sequence, sequence]``.
+            position_ids: Tensor of shape ``[batch, sequence]``; unused (NoPE MLA).
+            cache_hidden: TTT cache ``[K_list, V_list]`` forwarded to the attention.
+
+        Returns:
+            Tensor of shape ``[batch, sequence, hidden]``.
+        """
         residual = hidden_states
         combined_states = torch.cat((self.input_layernorm(input_embeds), self.hidden_norm(hidden_states)), dim=-1)
         hidden_states = residual + self.self_attn(combined_states, attention_mask, position_ids, cache_hidden)
