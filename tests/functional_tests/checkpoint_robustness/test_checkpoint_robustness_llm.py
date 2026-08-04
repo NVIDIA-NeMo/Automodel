@@ -61,7 +61,6 @@ from nemo_automodel.components.config._arg_parser import parse_args_and_load_con
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.shared.utils import dtype_from_str
 from tests.functional_tests.checkpoint_robustness.resume_trajectory import (
-    _TrajectoryRecorder,
     _checkpoint_for_completed_steps,
     _checkpoint_state_snapshot,
     _configure_resumed_run,
@@ -69,9 +68,13 @@ from tests.functional_tests.checkpoint_robustness.resume_trajectory import (
     _gather_rank_failures,
     _load_reference_trajectory,
     _persist_reference_trajectory,
+    _persist_training_reproducibility,
+    _report_training_reproducibility,
     _restored_state_mismatch,
     _resume_plan_from_config,
+    _TrainingReproducibilityRecorder,
     _trajectory_mismatch,
+    _TrajectoryRecorder,
 )
 
 datasets.disable_caching()
@@ -95,6 +98,7 @@ def _extract_custom_args(argv):
         "--tokenizer_name",
         "--max_vram_gb",
         "--max_cpu_gb",
+        "--training_reproducibility_loss_threshold",
         "--resume_first_loss_threshold",
         "--resume_loss_threshold",
         "--source_load_cosine_threshold",
@@ -1953,6 +1957,11 @@ def _run_process_isolated_checkpoint_phase(
         if resume_plan is not None:
             resume_recorder = _TrajectoryRecorder(resume_plan, capture_boundary_state=True)
             resume_recorder.attach(trainer)
+        reproducibility_recorder = None
+        reproducibility_dir = os.environ.get("AUTOMODEL_REPRODUCIBILITY_DIR")
+        if reproducibility_dir is not None:
+            reproducibility_recorder = _TrainingReproducibilityRecorder(trainer)
+            reproducibility_recorder.attach()
         _report_phase("Isolated train/save: trainer setup complete")
         if tokenizer_name is not None and dist.is_initialized() and dist.get_world_size() > 1:
             _barrier()
@@ -1968,13 +1977,20 @@ def _run_process_isolated_checkpoint_phase(
             _persist_reference_trajectory(resume_recorder)
             _barrier()
             if _rank0():
-                print(
-                    "[Resume correctness] Persisted the uninterrupted post-checkpoint trajectory"
-                )
-                print(
-                    "[Training reproducibility] Not evaluated in the resume phase; independent runs are not "
-                    "a checkpoint-restore oracle"
-                )
+                print("[Resume correctness] Persisted the uninterrupted post-checkpoint trajectory")
+        if reproducibility_recorder is not None:
+            artifact_dir = Path(reproducibility_dir)
+            _persist_training_reproducibility(
+                reproducibility_recorder,
+                artifact_dir,
+                lifecycle="checkpoint",
+            )
+            _barrier()
+            _report_training_reproducibility(
+                artifact_dir,
+                reproducibility_recorder,
+                loss_threshold=float(custom_args.get("training_reproducibility_loss_threshold", "5e-3")),
+            )
 
         peak_vram_gb = torch.cuda.max_memory_allocated() / 1024**3
         peak_cpu_gb = _rss_gb()
@@ -2210,6 +2226,7 @@ def run_checkpoint_robustness(
     check_resume = bool(custom_args.get("check_resume", False))
     resume_first_loss_threshold = float(custom_args.get("resume_first_loss_threshold", "1e-6"))
     resume_loss_threshold = float(custom_args.get("resume_loss_threshold", "5e-3"))
+    training_reproducibility_loss_threshold = float(custom_args.get("training_reproducibility_loss_threshold", "5e-3"))
     hf_device_map_auto = bool(custom_args.get("hf_device_map_auto", False))
     hf_source_post_load_dequantize = bool(custom_args.get("hf_source_post_load_dequantize", False))
     skip_hf_reload = bool(custom_args.get("skip_hf_reload", False))
@@ -2294,6 +2311,11 @@ def run_checkpoint_robustness(
     if resume_plan is not None:
         resume_recorder = _TrajectoryRecorder(resume_plan, capture_boundary_state=True)
         resume_recorder.attach(trainer)
+    reproducibility_recorder = None
+    reproducibility_dir = os.environ.get("AUTOMODEL_REPRODUCIBILITY_DIR")
+    if reproducibility_dir is not None:
+        reproducibility_recorder = _TrainingReproducibilityRecorder(trainer)
+        reproducibility_recorder.attach()
     _report_phase("Phase 1: starting train and checkpoint")
     trainer.run_train_validation_loop()
     _report_phase("Phase 1: train and checkpoint complete")
@@ -2305,10 +2327,19 @@ def run_checkpoint_robustness(
                 "[Resume correctness] Phase 1 continued through the comparison steps from the exact "
                 "checkpoint-producing trajectory"
             )
-            print(
-                "[Training reproducibility] Not evaluated in Phase 6; independent runs are not a "
-                "checkpoint-restore oracle"
-            )
+    if reproducibility_recorder is not None:
+        artifact_dir = Path(reproducibility_dir)
+        _persist_training_reproducibility(
+            reproducibility_recorder,
+            artifact_dir,
+            lifecycle="checkpoint",
+        )
+        _barrier()
+        _report_training_reproducibility(
+            artifact_dir,
+            reproducibility_recorder,
+            loss_threshold=training_reproducibility_loss_threshold,
+        )
 
     # Memory tracking after training
     peak_vram_gb = torch.cuda.max_memory_allocated() / 1024**3
@@ -2327,7 +2358,6 @@ def run_checkpoint_robustness(
     _report_phase("Phase 2: reference-logits capture complete")
 
     # Locate the Phase 1 checkpoint used by the reload and resume checks.
-    checkpoint_dir = Path(cfg.checkpoint.checkpoint_dir)
     if resume_plan is not None:
         ckpt_step_dir = _checkpoint_for_completed_steps(resume_plan, resume_plan.final_max_steps)
     else:

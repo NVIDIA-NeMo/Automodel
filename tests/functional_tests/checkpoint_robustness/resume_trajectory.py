@@ -79,7 +79,14 @@ class _TrajectoryRecorder:
         @wraps(original_train_step)
         def recorded_train_step(batches, *args, **kwargs):
             step = int(trainer.step_scheduler.step)
-            batch_digest = _state_digest(batches) if step in self.plan.comparison_steps else None
+            shared_batch_digest = getattr(trainer, "_training_reproducibility_batch_digest", None)
+            batch_digest = None
+            if step in self.plan.comparison_steps:
+                batch_digest = (
+                    shared_batch_digest[1]
+                    if shared_batch_digest is not None and shared_batch_digest[0] == step
+                    else _state_digest(batches)
+                )
             log_data = original_train_step(batches, *args, **kwargs)
             if batch_digest is not None:
                 self.steps[step] = {
@@ -117,6 +124,44 @@ class _TrajectoryRecorder:
             "boundary_step": self.plan.boundary_step,
             "continuation_steps": self.plan.continuation_steps,
             "boundary_state": self.boundary_state,
+            "steps": {str(step): values for step, values in sorted(self.steps.items())},
+        }
+
+
+class _TrainingReproducibilityRecorder:
+    """Record one independent training lifecycle for a non-blocking CI comparison."""
+
+    def __init__(self, trainer: object) -> None:
+        self.trainer = trainer
+        self.fingerprint_components = _training_fingerprint_components(trainer)
+        self.steps: dict[int, dict[str, object]] = {}
+
+    def attach(self) -> None:
+        """Attach a batch-and-metric recorder to the configured trainer."""
+        original_train_step = self.trainer._run_train_optim_step
+
+        @wraps(original_train_step)
+        def recorded_train_step(batches, *args, **kwargs):
+            step = int(self.trainer.step_scheduler.step)
+            batch_digest = _state_digest(batches)
+            self.trainer._training_reproducibility_batch_digest = (step, batch_digest)
+            try:
+                log_data = original_train_step(batches, *args, **kwargs)
+            finally:
+                del self.trainer._training_reproducibility_batch_digest
+            self.steps[step] = {
+                "batch_digest": batch_digest,
+                "loss": float(log_data.metrics["loss"]),
+                "lr": float(log_data.metrics["lr"]),
+            }
+            return log_data
+
+        self.trainer._run_train_optim_step = recorded_train_step
+
+    def to_dict(self) -> dict[str, object]:
+        """Return the recorded lifecycle as a JSON-serializable mapping."""
+        return {
+            "fingerprint_components": self.fingerprint_components,
             "steps": {str(step): values for step, values in sorted(self.steps.items())},
         }
 
@@ -239,6 +284,186 @@ def _state_digest(value: object) -> str:
 
     update(value)
     return digest.hexdigest()
+
+
+def _config_section(config: dict[str, object], key: str) -> object:
+    """Return one serializable config section or ``None`` when it is absent."""
+    return config.get(key)
+
+
+def _training_fingerprint_components(trainer: object) -> dict[str, str]:
+    """Fingerprint independent-run inputs that must match before comparing metrics."""
+    config = trainer.cfg.to_dict()
+    step_scheduler = trainer.step_scheduler
+    lr_schedulers = trainer.lr_scheduler
+    if lr_schedulers is not None and not isinstance(lr_schedulers, (list, tuple)):
+        lr_schedulers = [lr_schedulers]
+    lr_scheduler_state = [] if lr_schedulers is None else [scheduler.state_dict() for scheduler in lr_schedulers]
+
+    components = {
+        "model_and_initialization": {
+            "model": _config_section(config, "model"),
+            "teacher_model": _config_section(config, "teacher_model"),
+            "peft": _config_section(config, "peft"),
+            "freeze_config": _config_section(config, "freeze_config"),
+        },
+        "seed": {
+            "seed": _config_section(config, "seed"),
+            "rng": _config_section(config, "rng"),
+        },
+        "dataset_and_ordering": {
+            "dataset": _config_section(config, "dataset"),
+            "dataloader": _config_section(config, "dataloader"),
+            "validation_dataset": _config_section(config, "validation_dataset"),
+            "validation_dataloader": _config_section(config, "validation_dataloader"),
+            "packed_sequence": _config_section(config, "packed_sequence"),
+            "tokenizer": _config_section(config, "tokenizer"),
+        },
+        "batch_and_topology": {
+            "global_batch_size": int(step_scheduler.global_batch_size),
+            "local_batch_size": int(step_scheduler.local_batch_size),
+            "grad_acc_steps": int(step_scheduler.grad_acc_steps),
+            "world_size": dist.get_world_size() if dist.is_initialized() else 1,
+            "distributed": _config_section(config, "distributed"),
+        },
+        "optimizer": _config_section(config, "optimizer"),
+        "lr_scheduler": {
+            "config": _config_section(config, "lr_scheduler"),
+            "initial_state": lr_scheduler_state,
+            "initial_step": int(step_scheduler.step),
+            "initial_epoch": int(step_scheduler.epoch),
+            "num_epochs": int(step_scheduler.num_epochs),
+            "val_every_steps": step_scheduler.val_every_steps,
+        },
+        "loss_and_backend": {
+            "loss_fn": _config_section(config, "loss_fn"),
+            "backend": _config_section(config, "backend"),
+        },
+    }
+    return {name: _state_digest(value) for name, value in components.items()}
+
+
+def _training_reproducibility_path(artifact_dir: Path, lifecycle: str) -> Path:
+    """Return one rank-local lifecycle artifact path."""
+    return artifact_dir / f"{lifecycle}_rank_{_rank()}.json"
+
+
+def _persist_training_reproducibility(
+    recorder: _TrainingReproducibilityRecorder,
+    artifact_dir: Path,
+    *,
+    lifecycle: str,
+) -> None:
+    """Atomically persist one rank's independent training lifecycle."""
+    path = _training_reproducibility_path(artifact_dir, lifecycle)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = path.with_suffix(".tmp")
+    temporary_path.write_text(json.dumps(recorder.to_dict(), sort_keys=True))
+    temporary_path.replace(path)
+
+
+def _load_training_reproducibility(artifact_dir: Path, *, lifecycle: str) -> dict[str, object]:
+    """Load one rank's recorded independent training lifecycle."""
+    path = _training_reproducibility_path(artifact_dir, lifecycle)
+    if not path.exists():
+        raise FileNotFoundError(f"training reproducibility artifact not found: {path}")
+    return json.loads(path.read_text())
+
+
+def _compare_training_reproducibility(
+    normal_run: dict[str, object],
+    checkpoint_run: dict[str, object],
+    *,
+    loss_threshold: float,
+) -> dict[str, object]:
+    """Compare independent lifecycles without making the result a resume gate."""
+    if loss_threshold < 0:
+        return {"status": "not_comparable", "reason": "loss threshold must be non-negative"}
+
+    normal_fingerprint = normal_run.get("fingerprint_components", {})
+    checkpoint_fingerprint = checkpoint_run.get("fingerprint_components", {})
+    fingerprint_keys = set(normal_fingerprint) | set(checkpoint_fingerprint)
+    mismatched_components = sorted(
+        key for key in fingerprint_keys if normal_fingerprint.get(key) != checkpoint_fingerprint.get(key)
+    )
+    if mismatched_components:
+        return {
+            "status": "not_comparable",
+            "reason": "configuration fingerprint mismatch",
+            "mismatched_components": mismatched_components,
+        }
+
+    normal_steps = {int(step): values for step, values in normal_run.get("steps", {}).items()}
+    checkpoint_steps = {int(step): values for step, values in checkpoint_run.get("steps", {}).items()}
+    overlapping_steps = sorted(set(normal_steps) & set(checkpoint_steps))
+    if not overlapping_steps:
+        return {"status": "not_comparable", "reason": "no overlapping recorded steps"}
+
+    for step in overlapping_steps:
+        normal = normal_steps[step]
+        checkpoint = checkpoint_steps[step]
+        if normal["batch_digest"] != checkpoint["batch_digest"]:
+            return {
+                "status": "diverged",
+                "reason": "batch identity mismatch",
+                "step": step,
+                "overlapping_steps": overlapping_steps,
+            }
+        if normal["lr"] != checkpoint["lr"]:
+            return {
+                "status": "diverged",
+                "reason": "learning-rate mismatch",
+                "step": step,
+                "normal_lr": normal["lr"],
+                "checkpoint_lr": checkpoint["lr"],
+                "overlapping_steps": overlapping_steps,
+            }
+
+    loss_differences = {
+        step: abs(float(normal_steps[step]["loss"]) - float(checkpoint_steps[step]["loss"]))
+        for step in overlapping_steps
+    }
+    max_step = max(loss_differences, key=loss_differences.get)
+    max_difference = loss_differences[max_step]
+    status = (
+        "within_tolerance"
+        if math.isfinite(max_difference) and max_difference <= loss_threshold
+        else "outside_tolerance"
+    )
+    return {
+        "status": status,
+        "overlapping_steps": overlapping_steps,
+        "max_loss_difference": max_difference,
+        "max_difference_step": max_step,
+        "loss_threshold": loss_threshold,
+    }
+
+
+def _report_training_reproducibility(
+    artifact_dir: Path,
+    checkpoint_recorder: _TrainingReproducibilityRecorder,
+    *,
+    loss_threshold: float,
+) -> None:
+    """Print a gathered, explicitly non-blocking independent-run comparison."""
+    try:
+        normal_run = _load_training_reproducibility(artifact_dir, lifecycle="normal")
+        local_report = _compare_training_reproducibility(
+            normal_run,
+            checkpoint_recorder.to_dict(),
+            loss_threshold=loss_threshold,
+        )
+    except (FileNotFoundError, json.JSONDecodeError) as error:
+        local_report = {"status": "not_comparable", "reason": str(error)}
+
+    reports = [local_report]
+    if dist.is_initialized():
+        reports = [None] * dist.get_world_size()
+        dist.all_gather_object(reports, local_report)
+    if _rank() != 0:
+        return
+    for rank, report in enumerate(reports):
+        print(f"[Training reproducibility][non-blocking] rank={rank} {json.dumps(report, sort_keys=True)}")
 
 
 def _optimizer_step_summary(optimizers: object) -> list[dict[str, int]]:

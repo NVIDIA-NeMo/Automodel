@@ -132,6 +132,9 @@ fixture_keys:
     - hf_source_post_load_dequantize
     - no_check_resume
     - process_isolation
+    # Independent normal-finetune versus checkpoint-Phase-1 metric. This is
+    # reported separately and never gates checkpoint resume correctness.
+    - training_reproducibility_loss_threshold
     # The first threshold gates the exact first loss after restoring state and
     # batch identity. The existing resume_loss_threshold is only the numerical
     # envelope for later optimizer steps on the same shared trajectory.

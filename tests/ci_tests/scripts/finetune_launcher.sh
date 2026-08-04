@@ -66,7 +66,17 @@ if [ "$EXEC_CMD" = "python" ]; then CMD="python"; fi
 if [ "$EXEC_CMD" = "uv_python" ]; then CMD="uv run python"; fi
 
 # --- Finetune ---
-RUN_CMD="${CMD} ${TEST_SCRIPT_PATH} --config ${RESOLVED_FINETUNE_CONFIG} ${FINETUNE_ARGS:-}"
+FINETUNE_ENTRYPOINT="${TEST_SCRIPT_PATH}"
+if [[ "$HAS_ROBUSTNESS" == "true" ]]; then
+  export AUTOMODEL_REPRODUCIBILITY_DIR="$TEST_DIR/training_reproducibility"
+  case "$CONFIG_PATH" in
+    *retrieval/bi_encoder/*) export AUTOMODEL_REPRODUCIBILITY_DOMAIN="retrieval" ;;
+    *vlm_finetune*) export AUTOMODEL_REPRODUCIBILITY_DOMAIN="vlm" ;;
+    *) export AUTOMODEL_REPRODUCIBILITY_DOMAIN="llm" ;;
+  esac
+  FINETUNE_ENTRYPOINT="-m tests.ci_tests.scripts.recorded_finetune"
+fi
+RUN_CMD="${CMD} ${FINETUNE_ENTRYPOINT} --config ${RESOLVED_FINETUNE_CONFIG} ${FINETUNE_ARGS:-}"
 echo "============================================"
 echo "[finetune] Running finetune..."
 echo "============================================"

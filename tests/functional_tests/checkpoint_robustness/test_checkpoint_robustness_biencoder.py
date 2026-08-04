@@ -36,13 +36,7 @@ from PIL import Image
 
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.recipes.retrieval.train_bi_encoder import TrainBiEncoderRecipe
-from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm import (
-    _finish_hf_reload_sync,
-    _prepare_hf_reload_sync,
-    _raise_distributed_failure,
-)
 from tests.functional_tests.checkpoint_robustness.resume_trajectory import (
-    _TrajectoryRecorder,
     _checkpoint_for_completed_steps,
     _checkpoint_state_snapshot,
     _configure_resumed_run,
@@ -50,9 +44,18 @@ from tests.functional_tests.checkpoint_robustness.resume_trajectory import (
     _gather_rank_failures,
     _load_reference_trajectory,
     _persist_reference_trajectory,
+    _persist_training_reproducibility,
+    _report_training_reproducibility,
     _restored_state_mismatch,
     _resume_plan_from_config,
+    _TrainingReproducibilityRecorder,
     _trajectory_mismatch,
+    _TrajectoryRecorder,
+)
+from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm import (
+    _finish_hf_reload_sync,
+    _prepare_hf_reload_sync,
+    _raise_distributed_failure,
 )
 
 # Default test sentence for embedding extraction
@@ -64,6 +67,7 @@ def _extract_custom_args(argv: list[str]) -> tuple[dict[str, str | bool], list[s
     custom_keys = {
         "--cosine_threshold",
         "--hf_cosine_threshold",
+        "--training_reproducibility_loss_threshold",
         "--resume_first_loss_threshold",
         "--resume_loss_threshold",
     }
@@ -164,6 +168,7 @@ def test_checkpoint_robustness_biencoder():
     hf_cosine_threshold = float(custom_args.get("hf_cosine_threshold", "0.999"))
     check_hf_reload = bool(custom_args.get("check_hf_reload", False))
     check_resume = bool(custom_args.get("check_resume", False))
+    training_reproducibility_loss_threshold = float(custom_args.get("training_reproducibility_loss_threshold", "5e-3"))
     resume_first_loss_threshold = float(custom_args.get("resume_first_loss_threshold", "1e-6"))
     resume_loss_threshold = float(custom_args.get("resume_loss_threshold", "5e-3"))
 
@@ -181,18 +186,30 @@ def test_checkpoint_robustness_biencoder():
     if resume_plan is not None:
         resume_recorder = _TrajectoryRecorder(resume_plan, capture_boundary_state=True)
         resume_recorder.attach(trainer)
+    reproducibility_recorder = None
+    reproducibility_dir = os.environ.get("AUTOMODEL_REPRODUCIBILITY_DIR")
+    if reproducibility_dir is not None:
+        reproducibility_recorder = _TrainingReproducibilityRecorder(trainer)
+        reproducibility_recorder.attach()
     trainer.run_train_validation_loop()
     if resume_recorder is not None:
         _persist_reference_trajectory(resume_recorder)
         _barrier()
         if _rank0():
-            print(
-                "[Resume correctness] Retrieval Phase 1 persisted the exact uninterrupted continuation"
-            )
-            print(
-                "[Training reproducibility] Not evaluated in the retrieval resume phase; independent runs are "
-                "not a checkpoint-restore oracle"
-            )
+            print("[Resume correctness] Retrieval Phase 1 persisted the exact uninterrupted continuation")
+    if reproducibility_recorder is not None:
+        artifact_dir = Path(reproducibility_dir)
+        _persist_training_reproducibility(
+            reproducibility_recorder,
+            artifact_dir,
+            lifecycle="checkpoint",
+        )
+        _barrier()
+        _report_training_reproducibility(
+            artifact_dir,
+            reproducibility_recorder,
+            loss_threshold=training_reproducibility_loss_threshold,
+        )
 
     peak_vram_gb = torch.cuda.max_memory_allocated() / 1024**3
     peak_cpu_gb = _rss_gb()

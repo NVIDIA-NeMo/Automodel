@@ -15,9 +15,13 @@ weight-decay state, RNG state, stateful-dataloader state, and per-rank batch
 identity. The first post-resume loss uses a separate strict threshold; the
 existing `resume_loss_threshold` applies only to later BF16 optimizer steps.
 
-Independent-run reproducibility is not a checkpoint-restore oracle and is
-reported separately in logs. Recipe-specific threshold relaxations calibrated
-against the former independent baseline have been removed.
+Independent-run reproducibility is not a checkpoint-restore oracle. CI reuses
+the normal finetune and checkpoint Phase 1 to report it separately and
+non-blockingly, without another training run. The comparison runs only when
+their model/seed, data, batch/topology, optimizer, scheduler, loss, and backend
+fingerprints match; exact per-rank batch digests are then checked before loss
+differences are reported. Recipe-specific resume threshold relaxations
+calibrated against the former independent baseline have been removed.
 
 Recipes with `no_check_resume: true` remain explicitly exempt rather than being
 treated as passing. Those exemptions cover model/topology-specific restore
