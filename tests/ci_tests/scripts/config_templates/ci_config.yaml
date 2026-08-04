@@ -122,14 +122,20 @@ fixture_keys:
     - cross_tp_size
     - cosine_threshold
     - experts_implementation
+    - hf_adapter_ignored_key_prefix
     - hf_device_map_auto
+    - hf_device_map_cpu_max_memory_gib
+    - hf_device_map_max_memory_gib
     - hf_cosine_threshold
     - hf_kl_threshold
     - kl_threshold
     - hf_source_post_load_dequantize
     - no_check_resume
+    - process_isolation
     - resume_loss_threshold
     - skip_hf_reload
+    - skip_automodel_logit_parity
+    - skip_hf_logit_parity
     - source_load_cosine_threshold
     - source_load_kl_threshold
     - source_load_mean_kl_threshold

@@ -18,7 +18,7 @@ Biencoder models (e.g. nvidia/llama-nemotron-embed-1b-v2) output embeddings rath
 next-token logits, so we compare checkpoint fidelity using cosine similarity instead of
 KL divergence.
 
-Launch: torchrun --nproc-per-node=<N> -m pytest <this_file> -c <config.yaml>
+Launch: torchrun --nproc-per-node=<N> -m <this_module> --config <config.yaml>
     [--cosine_threshold <float>] [--hf_cosine_threshold <float>]
     [--check_hf_reload] [--check_resume]
 """
@@ -338,3 +338,7 @@ def test_checkpoint_robustness_biencoder():
         del resume_trainer
         torch.cuda.empty_cache()
         _barrier()
+
+
+if __name__ == "__main__":
+    test_checkpoint_robustness_biencoder()
