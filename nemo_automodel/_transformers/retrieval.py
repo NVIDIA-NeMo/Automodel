@@ -45,13 +45,6 @@ logger = logging.get_logger(__name__)
 
 _BI_ENCODER_DEFAULT_POOLING = "avg"
 _BI_ENCODER_DEFAULT_L2_NORMALIZE = True
-_EXPORT_ONLY_BI_ENCODER_KWARGS = {
-    "query_prompt",
-    "document_prompt",
-    "sentence_transformer_max_seq_length",
-    "similarity_fn_name",
-    "do_lower_case",
-}
 
 
 def _resolve_bi_encoder_options(
@@ -474,13 +467,6 @@ class BiEncoderModel(nn.Module):
         effective_task = cls._TASK if cls._TASK is not None else task
         if effective_task is None:
             raise ValueError("task must be specified when calling build()")
-        export_only_kwargs = _EXPORT_ONLY_BI_ENCODER_KWARGS.intersection(hf_kwargs)
-        if export_only_kwargs:
-            names = ", ".join(sorted(export_only_kwargs))
-            raise TypeError(
-                f"Sentence Transformers export metadata is derived from effective NeMo settings; remove: {names}."
-            )
-
         logger.info(f"Building BiEncoderModel from {model_name_or_path}")
 
         config = AutoConfig.from_pretrained(

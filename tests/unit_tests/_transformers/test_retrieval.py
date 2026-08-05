@@ -180,10 +180,6 @@ def test_bi_encoder_public_api_excludes_export_format_overrides():
         assert export_only_parameters.isdisjoint(parameters)
         assert {"pooling", "l2_normalize"} <= parameters.keys()
 
-    for parameter in export_only_parameters:
-        with pytest.raises(TypeError, match="derived from effective NeMo settings"):
-            retrieval.BiEncoderModel.build("unused", **{parameter: None})
-
 
 def test_effective_pipeline_prompts_replace_restored_export_defaults():
     from nemo_automodel._transformers import retrieval

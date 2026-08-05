@@ -38,7 +38,6 @@ _HF_HUB_METADATA_KWARGS = {
     "token",
 }
 _SOURCE_LEGAL_ASSET_PATTERNS = (
-    ".gitattributes",
     "LICENSE*",
     "license*",
     "NOTICE*",
@@ -304,11 +303,7 @@ def _copy_source_legal_assets(
     for source_root in source_roots:
         for item in os.scandir(source_root):
             normalized_name = item.name.lower()
-            is_legal_asset = (
-                normalized_name == ".gitattributes"
-                or normalized_name.startswith(_SOURCE_LEGAL_ASSET_PREFIXES)
-                or "notice" in normalized_name
-            )
+            is_legal_asset = normalized_name.startswith(_SOURCE_LEGAL_ASSET_PREFIXES) or "notice" in normalized_name
             if item.is_file() and is_legal_asset:
                 shutil.copy2(item.path, os.path.join(hf_metadata_dir, item.name))
 

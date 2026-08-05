@@ -1666,19 +1666,6 @@ fi
                 excluded_keys.update(keys_to_remove)
                 for key in keys_to_remove:
                     fqn_to_file_index_mapping.pop(key, None)
-                if not fqn_to_file_index_mapping:
-                    fallback_keys = pre_shard_hf_state_dict_keys or list(state_dict.keys())
-                    fqn_to_file_index_mapping = _divide_keys_by_size(
-                        fallback_keys,
-                        state_dict,
-                        _DEFAULT_HF_CONSOLIDATED_SHARD_SIZE_BYTES,
-                    )
-                    if is_rank_0():
-                        logger.info(
-                            "Original HF shard mapping for %s contained no exported model keys; using size-based "
-                            "consolidated shard mapping instead.",
-                            self.config.model_repo_id,
-                        )
         else:
             pre_shard_hf_state_dict_keys = getattr(model, "_pre_shard_hf_state_dict_keys", None)
             if pre_shard_hf_state_dict_keys is None:
@@ -1703,7 +1690,7 @@ fi
         # These will go to the same file as the last file (or file 1 for single-file models).
         # The global keys keep mappings complete under PP, while the current keys preserve
         # parameters registered after parallelization, such as test- or application-owned weights.
-        # Use a default of 1 only when the exported state dict itself has no mapped tensor keys.
+        # Use default of 1 when mapping is empty (e.g., encoder models with different key prefixes)
         default_index = max(fqn_to_file_index_mapping.values()) if fqn_to_file_index_mapping else 1
 
         # add any additional keys that are not in the base checkpoint
