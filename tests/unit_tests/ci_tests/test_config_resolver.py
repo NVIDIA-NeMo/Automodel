@@ -309,6 +309,9 @@ def test_end_to_end_fixture_keys_not_applied_as_overrides(tmp_path):
         "ci:\n"
         "  checkpoint_robustness:\n"
         "    check_source_load_parity: true             # fixture arg, must NOT become top-level\n"
+        "    skip_automodel_logit_parity: true          # fixture arg, must NOT become top-level\n"
+        "    skip_hf_logit_parity: true                 # fixture arg, must NOT become top-level\n"
+        "    hf_adapter_ignored_key_prefix: base_model.model.mtp.  # fixture arg, must NOT become top-level\n"
         "    hf_kl_threshold: 5e-3                       # fixture arg, must NOT become top-level\n"
         "    source_load_kl_threshold: 1e-2              # fixture arg, must NOT become top-level\n"
         "    source_load_mean_kl_threshold: 1e-3         # fixture arg, must NOT become top-level\n"
@@ -327,12 +330,18 @@ def test_end_to_end_fixture_keys_not_applied_as_overrides(tmp_path):
     # and do NOT pollute the top level.
     assert "hf_kl_threshold" not in resolved
     assert "check_source_load_parity" not in resolved
+    assert "skip_automodel_logit_parity" not in resolved
+    assert "skip_hf_logit_parity" not in resolved
+    assert "hf_adapter_ignored_key_prefix" not in resolved
     assert "source_load_kl_threshold" not in resolved
     assert "source_load_mean_kl_threshold" not in resolved
     assert "source_load_cosine_threshold" not in resolved
     assert "tokenizer_name" not in resolved
     assert resolved["ci"]["checkpoint_robustness"]["hf_kl_threshold"] == 5e-3
     assert resolved["ci"]["checkpoint_robustness"]["check_source_load_parity"] is True
+    assert resolved["ci"]["checkpoint_robustness"]["skip_automodel_logit_parity"] is True
+    assert resolved["ci"]["checkpoint_robustness"]["skip_hf_logit_parity"] is True
+    assert resolved["ci"]["checkpoint_robustness"]["hf_adapter_ignored_key_prefix"] == "base_model.model.mtp."
     assert resolved["ci"]["checkpoint_robustness"]["source_load_kl_threshold"] == 1e-2
     assert resolved["ci"]["checkpoint_robustness"]["source_load_mean_kl_threshold"] == 1e-3
     assert resolved["ci"]["checkpoint_robustness"]["source_load_cosine_threshold"] == 0.999
@@ -380,7 +389,10 @@ def test_vlm_checkpoint_robustness_recipes_resolve(tmp_path, recipe_path):
         assert robustness["source_load_cosine_threshold"] == 0.999
         assert robustness["hf_kl_threshold"] == 5e-2
     if Path(recipe_path).stem == "qwen3_vl_moe_30b_te_deepep":
-        assert robustness["resume_loss_threshold"] == 1e-2
+        assert robustness["hf_kl_threshold"] == 2.5e-2
+        assert robustness["resume_loss_threshold"] == 2e-2
+        assert robustness["source_load_kl_threshold"] == 2e-2
+        assert robustness["source_load_mean_kl_threshold"] == 5e-3
     if Path(recipe_path).stem == "qwen3_5_35b":
         assert robustness["experts_implementation"] == "grouped_mm"
         for key in (
