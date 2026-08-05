@@ -113,10 +113,6 @@ def _build_backbone_from_extracted_submodel(
     if model_type.lower() == "ministral3" and task == "embedding":
         config = text_config.__class__.from_dict(text_config.to_dict())
         config.is_causal = False
-        if pooling is not None:
-            config.pooling = pooling
-        if temperature is not None:
-            config.temperature = temperature
         try:
             backbone_class = MODEL_MAPPING[type(config)]
         except KeyError as exc:
@@ -287,10 +283,6 @@ def build_encoder_backbone(
             **hf_kwargs,
         )
         backbone.config.is_causal = False
-        if pooling is not None:
-            backbone.config.pooling = pooling
-        if temperature is not None:
-            backbone.config.temperature = temperature
         return backbone
 
     BidirectionalModelClass = _get_supported_backbone_class(model_type, task)

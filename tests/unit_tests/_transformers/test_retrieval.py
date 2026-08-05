@@ -275,12 +275,14 @@ def test_ministral_embedding_uses_stock_bidirectional_model(tmp_path):
         model_name_or_path=str(model_dir),
         task="embedding",
         pooling="avg",
+        temperature=0.5,
     )
 
     assert type(backbone) is Ministral3Model
     assert backbone.config.model_type == "ministral3"
     assert backbone.config.is_causal is False
-    assert backbone.config.pooling == "avg"
+    assert not hasattr(backbone.config, "pooling")
+    assert not hasattr(backbone.config, "temperature")
     assert backbone.config.sliding_window == 4
     assert backbone.config._attn_implementation == "sdpa"
     _assert_state_dict_equal(source_state_dict, backbone.state_dict())
@@ -349,12 +351,14 @@ def test_extract_submodel_ministral_embedding_from_local_vlm_converts_to_support
         task="embedding",
         extract_submodel="language_model",
         pooling="avg",
+        temperature=0.5,
     )
 
     assert type(backbone) is Ministral3Model
     assert backbone.config.model_type == "ministral3"
     assert backbone.config.is_causal is False
-    assert backbone.config.pooling == "avg"
+    assert not hasattr(backbone.config, "pooling")
+    assert not hasattr(backbone.config, "temperature")
     _assert_state_dict_equal(language_state_dict, backbone.state_dict())
 
     input_ids = torch.randint(0, backbone.config.vocab_size, (2, 8))
