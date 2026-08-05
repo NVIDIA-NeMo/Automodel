@@ -264,6 +264,8 @@ redirects:
     destination: "/nemo/automodel/latest/job-launchers/slurm-cluster"
   - source: "/nemo/automodel/nightly/performance-summary"
     destination: "/nemo/automodel/nightly/performance/performance-summary"
+  - source: "/nemo/automodel/nightly/model-coverage/diffusion/ltx-2-3"
+    destination: "/nemo/automodel/nightly/model-coverage/diffusion/lightricks/ltx-2-3"
   - source: "/nemo/automodel/latest/guides/configuration"
     destination: "/nemo/automodel/latest/get-started/configuration"
   # Version-root index.html / index — explicit because :path* does not match
