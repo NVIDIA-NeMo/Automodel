@@ -14,6 +14,7 @@
 
 # Full-parameter, 93-layer Kimi K3 text SFT run on 256 GPUs:
 #   64 nodes x 4 GPUs, EP32 x PP8, DP32, 100 steps, lr=1e-5.
+# Passing GB200 validation: https://wandb.ai/Nemo-automodel/huiyingl_workspace/runs/olnfgmh1
 # PP stages own the complete attention-residual blocks:
 #   [0,12), [12,24), [24,36), [36,48), [48,60), [60,72), [72,84), [84,93).
 
@@ -139,5 +140,6 @@ clip_grad_norm:
 
 ci:
   recipe_owner: huiyingl
-  nodes: 32
+  nodes: 64
+  cluster_tag: gb200
   time: "01:30:00"
