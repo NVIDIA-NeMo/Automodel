@@ -351,63 +351,26 @@ def _render_release_table(releases: list[_ModelRelease]) -> str:
     )
 
 
-def _render_release_tabs(releases: list[_ModelRelease], *, row_limit: int | None = None) -> str:
-    preferred_types = (
-        "LLM",
-        "VLM",
-        "Omni",
-        "dLLM",
-        "Multimodal",
-        "Diffusion",
-        "Encoder-Decoder",
-        "Embedding",
-        "Reranking",
-    )
-    preferred_type_order = {model_type: index for index, model_type in enumerate(preferred_types)}
-    model_types = sorted(
-        {release.model_type for release in releases},
-        key=lambda model_type: (
-            preferred_type_order.get(model_type, len(preferred_type_order)),
-            model_type.casefold(),
-        ),
-    )
-    tabs = [("All", releases)] + [
-        (model_type, [release for release in releases if release.model_type == model_type])
-        for model_type in model_types
-    ]
-    tab_blocks = [
-        "\n".join(
-            [
-                f'<Tab title="{title}">',
-                "",
-                _render_release_table(tab_releases if row_limit is None else tab_releases[:row_limit]),
-                "",
-                "</Tab>",
-            ]
-        )
-        for title, tab_releases in tabs
-    ]
+def _render_compact_release_table(releases: list[_ModelRelease]) -> str:
     return "\n\n".join(
         [
             '<div className="compact-model-tables">',
             COMPACT_TABLE_STYLE,
-            "<Tabs>",
-            *tab_blocks,
-            "</Tabs>",
+            _render_release_table(releases),
             "</div>",
         ]
     )
 
 
 def _render_support_log_table(releases: list[_ModelRelease]) -> str:
-    return "\n\n".join([SUPPORT_LOG_START_MARKER, _render_release_tabs(releases), SUPPORT_LOG_END_MARKER])
+    return "\n\n".join([SUPPORT_LOG_START_MARKER, _render_compact_release_table(releases), SUPPORT_LOG_END_MARKER])
 
 
 def _render_homepage_table(releases: list[_ModelRelease]) -> str:
     if len(releases) < TABLE_ROW_COUNT:
         raise ValueError(f"Model release catalog contains only {len(releases)} releases")
     return "\n\n".join(
-        [HOMEPAGE_START_MARKER, _render_release_tabs(releases, row_limit=TABLE_ROW_COUNT), HOMEPAGE_END_MARKER]
+        [HOMEPAGE_START_MARKER, _render_compact_release_table(releases[:TABLE_ROW_COUNT]), HOMEPAGE_END_MARKER]
     )
 
 

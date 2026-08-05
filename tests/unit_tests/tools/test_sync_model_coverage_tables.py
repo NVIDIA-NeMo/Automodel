@@ -78,11 +78,6 @@ def _collect_fern_routes(
     return routes
 
 
-def _tab_table_rows(document: str, title: str) -> list[str]:
-    tab_content = document.split(f'<Tab title="{title}">', 1)[1].split("</Tab>", 1)[0]
-    return [line for line in tab_content.splitlines() if re.match(r"\| \d{4}-\d{2}-\d{2} \|", line)]
-
-
 def test_registry_table_is_generated_from_mapping_entries():
     source = """
 from collections import OrderedDict
@@ -249,6 +244,10 @@ def test_internal_model_coverage_links_resolve_to_nightly_routes():
             continue
         document = page.read_text(encoding="utf-8")
         for link in re.findall(r"\]\((/model-coverage/[^)#?]+)", document):
+            # Fern serves a generated llms.txt index at every navigation level;
+            # it is a virtual endpoint rather than an entry in nightly.yml.
+            if link == "/model-coverage/llms.txt":
+                continue
             if link.rstrip("/") not in routes:
                 broken_links.append((page.relative_to(repo_root), link))
 
@@ -363,40 +362,22 @@ def test_sync_tables_writes_support_log_homepage_and_registry(tmp_path):
         "[Documentation-model](/model-coverage/vision-language-models/documentation-model) "
         "([shared.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/shared.yaml)) |"
     ) in support_log
-    expected_tabs = [
-        "All",
-        "LLM",
-        "VLM",
-        "Omni",
-        "dLLM",
-        "Multimodal",
-        "Diffusion",
-        "Encoder-Decoder",
-        "Embedding",
-        "Reranking",
-    ]
-    assert re.findall(r'<Tab title="([^"]+)">', support_log) == expected_tabs
     homepage = (tmp_path / "docs" / "index.mdx").read_text(encoding="utf-8")
-    assert re.findall(r'<Tab title="([^"]+)">', homepage) == expected_tabs
-    assert len(_tab_table_rows(support_log, "All")) == len(releases)
-    assert len(_tab_table_rows(support_log, "LLM")) == 10
-    for tab in expected_tabs:
-        assert len(_tab_table_rows(homepage, tab)) <= TABLE_ROW_COUNT
     for document in (support_log, homepage):
         assert document.count('<div className="compact-model-tables">') == 1
         assert document.count(".compact-model-tables .fern-table-root") == 1
         assert "width: 100% !important;" in document
         assert ".compact-model-tables .fern-table td:last-child" in document
-        assert document.count("|:-----|:-----|:-----|") == len(expected_tabs)
+        assert document.count("|:-----|:-----|:-----|") == 1
+        assert "<Tabs>" not in document
+        assert "<Tab " not in document
         assert "Documentation only" not in document
-    assert len(_tab_table_rows(homepage, "All")) == TABLE_ROW_COUNT
-    assert len(_tab_table_rows(homepage, "LLM")) == TABLE_ROW_COUNT
-    llm_tab = support_log.split('<Tab title="LLM">', 1)[1].split("</Tab>", 1)[0]
-    vlm_tab = support_log.split('<Tab title="VLM">', 1)[1].split("</Tab>", 1)[0]
-    assert "[Model-0](/model-coverage/large-language-models/model-0)" in llm_tab
-    assert "[Documentation-model]" not in llm_tab
-    assert "[Documentation-model](/model-coverage/vision-language-models/documentation-model)" in vlm_tab
-    assert "[Model-0]" not in vlm_tab
+    assert len([line for line in support_log.splitlines() if re.match(r"\| \d{4}-\d{2}-\d{2} \|", line)]) == len(
+        releases
+    )
+    assert (
+        len([line for line in homepage.splitlines() if re.match(r"\| \d{4}-\d{2}-\d{2} \|", line)]) == TABLE_ROW_COUNT
+    )
     assert "Documentation Model" not in support_log
     assert "Try on Brev" not in support_log
     assert "brev.nvidia.com" not in support_log
