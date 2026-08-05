@@ -937,6 +937,58 @@ def consolidate_safetensors_files(
     logger.info("Done consolidating. Took %.2f secs.", time.time() - start_time)
 
 
+def _raise_if_any_rank_failed(
+    local_exception: Exception | None,
+    local_failure: str | None,
+    distributed: bool,
+    rank: int,
+    world_size: int,
+    process_group: Optional[dist.ProcessGroup],
+) -> None:
+    """
+    Share per-rank consolidation failures across ranks and raise if any rank failed.
+
+    In a multi-rank run this also acts as a barrier, so callers can rely on every rank having
+    finished the preceding step once this returns.
+
+    Args:
+        local_exception: Exception raised on this rank, if any.
+        local_failure: Human-readable description of this rank's failure, if any.
+        distributed: Whether a distributed environment is initialized.
+        rank: Rank of the current process within ``process_group``.
+        world_size: Number of ranks in ``process_group``.
+        process_group: Process group the synchronization collective runs on.
+
+    Raises:
+        RuntimeError: If any rank reported a failure, or if the failures could not be
+            synchronized across ranks.
+    """
+    if distributed and world_size > 1:
+        failures: list[str | None] = [None] * world_size
+        try:
+            dist.all_gather_object(failures, local_failure, group=process_group)
+        except Exception as exc:
+            if local_exception is not None:
+                raise RuntimeError(
+                    f"Safetensors consolidation failed on {local_failure}, and rank {rank} could not synchronize "
+                    f"the failure across ranks: {type(exc).__name__}: {exc}"
+                ) from local_exception
+            raise RuntimeError(
+                "Failed to synchronize safetensors consolidation status across ranks. A peer may have exited before "
+                "reporting its original exception; inspect the first failing rank's traceback. "
+                f"Synchronization error: {type(exc).__name__}: {exc}"
+            ) from exc
+
+        reported_failures = [failure for failure in failures if failure is not None]
+        if reported_failures:
+            message = "Safetensors consolidation failed before final synchronization: " + " | ".join(reported_failures)
+            if local_exception is not None:
+                raise RuntimeError(message) from local_exception
+            raise RuntimeError(message)
+    elif local_exception is not None:
+        raise local_exception
+
+
 def consolidate_safetensors_files_on_every_rank(
     input_dir: str,
     output_dir: str,
@@ -971,11 +1023,17 @@ def consolidate_safetensors_files_on_every_rank(
         cast_dtype: Optional dtype used to cast floating-point tensors during consolidation.
         fqn_to_dtype_mapping: Optional mapping from tensor FQN to target safetensors dtype string. This can combine
             original HF dtype metadata with model-owned export overrides.
+
+    Raises:
+        RuntimeError: If consolidation fails on any rank of a multi-rank
+            distributed run. The error identifies the originating rank,
+            operation, and exception.
     """
 
     start_time = time.time()
     # Derive rank and world_size from process_group or default distributed environment
-    if dist.is_available() and dist.is_initialized():
+    distributed = dist.is_available() and dist.is_initialized()
+    if distributed:
         rank = dist.get_rank(group=process_group)
         world_size = dist.get_world_size(group=process_group)
     else:
@@ -993,56 +1051,75 @@ def consolidate_safetensors_files_on_every_rank(
                 cast_dtype,
             )
 
-    # Find all unique indices in the mapping
-    unique_indices = set(fqn_to_index_mapping.values())
+    indices_for_this_rank: list[int] = []
+    operation = "preparing assigned output shards"
+    local_exception: Exception | None = None
+    local_failure: str | None = None
+    try:
+        # Find all unique indices in the mapping
+        unique_indices = set(fqn_to_index_mapping.values())
 
-    # Distribute indices across ranks
-    indices_for_this_rank = []
-    for idx in unique_indices:
-        # Output shard indices are 1-based. Assign shard 1 to rank 0.
-        if (idx - 1) % world_size == rank:
-            indices_for_this_rank.append(idx)
+        # Distribute indices across ranks
+        for idx in unique_indices:
+            # Output shard indices are 1-based. Assign shard 1 to rank 0.
+            if (idx - 1) % world_size == rank:
+                indices_for_this_rank.append(idx)
 
-    # Filter the fqn_to_index_mapping to only include tensors for this rank
-    filtered_mapping = {fqn: idx for fqn, idx in fqn_to_index_mapping.items() if idx in indices_for_this_rank}
-    logger.debug(
-        "Rank %d/%d: assigned %d of %d output file(s) (%d tensor(s)).",
-        rank,
-        world_size,
-        len(indices_for_this_rank),
-        len(unique_indices),
-        len(filtered_mapping),
-    )
-
-    if filtered_mapping:
-        # Convert index mapping to filename mapping
-        max_index = max(unique_indices)
-        filtered_filename_mapping = {}
-        for fqn, idx in filtered_mapping.items():
-            filename = _gen_file_name(idx, max_index)
-            filtered_filename_mapping[fqn] = filename
-
-        # Call the existing consolidation function with the filtered mapping
-        _consolidate_safetensors_files(
-            input_dir=input_dir,
-            output_dir=output_dir,
-            fqn_to_file_mapping=filtered_filename_mapping,
-            num_threads=num_threads,
-            use_staging=use_staging,
-            staging_dir=staging_dir,
-            cast_dtype=cast_dtype,
-            fqn_to_dtype_mapping=fqn_to_dtype_mapping,
+        # Filter the fqn_to_index_mapping to only include tensors for this rank
+        filtered_mapping = {fqn: idx for fqn, idx in fqn_to_index_mapping.items() if idx in indices_for_this_rank}
+        logger.debug(
+            "Rank %d/%d: assigned %d of %d output file(s) (%d tensor(s)).",
+            rank,
+            world_size,
+            len(indices_for_this_rank),
+            len(unique_indices),
+            len(filtered_mapping),
         )
+
+        if filtered_mapping:
+            operation = "consolidating assigned output shards"
+            # Convert index mapping to filename mapping
+            max_index = max(unique_indices)
+            filtered_filename_mapping = {}
+            for fqn, idx in filtered_mapping.items():
+                filename = _gen_file_name(idx, max_index)
+                filtered_filename_mapping[fqn] = filename
+
+            # Call the existing consolidation function with the filtered mapping
+            _consolidate_safetensors_files(
+                input_dir=input_dir,
+                output_dir=output_dir,
+                fqn_to_file_mapping=filtered_filename_mapping,
+                num_threads=num_threads,
+                use_staging=use_staging,
+                staging_dir=staging_dir,
+                cast_dtype=cast_dtype,
+                fqn_to_dtype_mapping=fqn_to_dtype_mapping,
+            )
+    except Exception as exc:
+        local_exception = exc
+        local_failure = f"rank {rank} while {operation}: {type(exc).__name__}: {exc}"
+
+    # Doubles as a barrier: the index must not be published before every rank has written
+    # its assigned shards.
+    _raise_if_any_rank_failed(local_exception, local_failure, distributed, rank, world_size, process_group)
 
     # Write overall model.index.safetensors.json file with weight map (rank 0 only)
+    local_exception = None
+    local_failure = None
     if rank == 0:
-        _write_overall_metadata_file_from_shards(
-            input_dir,
-            output_dir,
-            fqn_to_index_mapping,
-            cast_dtype,
-            fqn_to_dtype_mapping,
-        )
+        try:
+            _write_overall_metadata_file_from_shards(
+                input_dir,
+                output_dir,
+                fqn_to_index_mapping,
+                cast_dtype,
+                fqn_to_dtype_mapping,
+            )
+        except Exception as exc:
+            local_exception = exc
+            local_failure = f"rank {rank} while writing the consolidated safetensors index: {type(exc).__name__}: {exc}"
+    _raise_if_any_rank_failed(local_exception, local_failure, distributed, rank, world_size, process_group)
 
     logger.debug(
         "Rank %d: Done consolidating. Processed %d unique indices in %.2f secs.",
@@ -1050,11 +1127,5 @@ def consolidate_safetensors_files_on_every_rank(
         len(indices_for_this_rank),
         time.time() - start_time,
     )
-
-    # Wait for all ranks to complete
-    if dist.is_available() and dist.is_initialized():
-        logger.debug("Rank %d: Waiting for all ranks to complete...", rank)
-        dist.barrier(group=process_group)
-        logger.debug("Rank %d: All ranks have completed.", rank)
-        if rank == 0:
-            logger.debug("Total time taken: %.2f secs.", time.time() - start_time)
+    if distributed and rank == 0:
+        logger.debug("Total time taken: %.2f secs.", time.time() - start_time)

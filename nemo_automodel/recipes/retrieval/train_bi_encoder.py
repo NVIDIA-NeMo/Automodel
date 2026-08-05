@@ -23,7 +23,6 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
-import wandb
 from transformers import ProcessorMixin
 
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
@@ -44,7 +43,10 @@ from nemo_automodel.recipes._dist_utils import (
 )
 from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.base_recipe import BaseRecipe
+from nemo_automodel.shared.import_utils import safe_import
 from nemo_automodel.shared.te_patches import apply_te_patches
+
+_, wandb = safe_import("wandb")
 
 logger = logging.getLogger(__name__)
 

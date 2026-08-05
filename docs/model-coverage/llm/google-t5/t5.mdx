@@ -1,0 +1,31 @@
+---
+title: "T5"
+description: "Supported T5 checkpoints and NeMo AutoModel recipes."
+slug: model-coverage/large-language-models/google-t5/t5
+---
+
+[T5](https://huggingface.co/google-t5/t5-small) is Google's encoder-decoder text-to-text transformer family.
+
+<Info>
+
+| | |
+|---|---|
+| **Task** | Text-to-Text Generation |
+| **Architecture** | `T5ForConditionalGeneration` |
+| **HF Org** | [google-t5](https://huggingface.co/google-t5) |
+
+</Info>
+
+## Example Model and Recipe
+
+| Model | Recipe |
+|---|---|
+| [`google-t5/t5-small`](https://huggingface.co/google-t5/t5-small) | [SQuAD fine-tuning](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/t5/t5_small_squad.yaml) |
+
+## Run the Recipe
+
+```bash
+uv run automodel --nproc-per-node=8 examples/llm_finetune/t5/t5_small_squad.yaml
+```
+
+See the [Installation Guide](/get-started/installation) and [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft).

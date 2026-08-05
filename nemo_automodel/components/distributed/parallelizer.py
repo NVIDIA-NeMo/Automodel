@@ -900,6 +900,18 @@ class HunyuanParallelizationStrategy(ParallelizationStrategy):
         )
 
 
+class LTX2ParallelizationStrategy(HunyuanParallelizationStrategy):
+    """Parallelization strategy for the LTX-2 video+audio transformer.
+
+    ``LTX2VideoTransformer3DModel`` exposes its layers as ``transformer_blocks``
+    but names the attention/FFN submodules ``attn1``/``attn2``/``ff``, which the
+    Default strategy's submodule-level activation checkpointing does not
+    recognize — leaving attention and MLP activations un-checkpointed and OOM-ing
+    on the long combined video+audio token sequence. Wrapping each whole block
+    (as the HunyuanVideo strategy does) restores the expected memory profile.
+    """
+
+
 def _unwrap_qwen_checkpointed_block(block: nn.Module) -> nn.Module:
     """Return the Qwen transformer block held by a checkpoint wrapper."""
     if isinstance(block, CheckpointWrapper):
@@ -1000,6 +1012,7 @@ PARALLELIZATION_STRATEGIES: Dict[str, ParallelizationStrategy] = {
     "Qwen3_5ForCausalLM": Qwen3_5ParallelizationStrategy(),
     "WanTransformer3DModel": WanParallelizationStrategy(),
     "HunyuanVideo15Transformer3DModel": HunyuanParallelizationStrategy(),
+    "LTX2VideoTransformer3DModel": LTX2ParallelizationStrategy(),
     "QwenImageTransformer2DModel": QwenImageEditParallelizationStrategy(),
 }
 
@@ -2264,14 +2277,22 @@ def _get_parallel_plan(
             logger.info("Using default base TP plan. Compatible with huggingface llama3-style models.")
 
     # Nemotron-Flash's forward computes `logits / self.lm_head.weight.norm(p=2, dim=1)`.
-    # Under TP, sharding lm_head turns the weight into a DTensor while `logits` is a
-    # plain tensor (output_layouts=Replicate), and the mixed-operand division raises
-    # "aten.div.Tensor got mixed torch.Tensor and DTensor". Drop lm_head from the plan
-    # so its weight stays replicated and the division stays in plain-tensor space.
+    # The logits and weight norm must therefore either both be plain tensors or both
+    # use the same vocab-sharded DTensor layout.  A replicated-output ColwiseParallel
+    # plan mixes a plain logits tensor with a sharded weight norm, so retain the
+    # historical fallback of dropping that plan.  A vocab-sharded output keeps both
+    # operands aligned and is required under FSDP+TP: leaving lm_head unplanned makes
+    # FSDP expose its weight as a DTensor while the input activation remains local.
     if _is_nemotron_flash_config(getattr(model, "config", None)):
         for k in ("lm_head", "language_model.lm_head"):
-            if model_parallel_plan.pop(k, None) is not None:
-                logger.info("Nemotron-Flash: excluding %s from TP plan to keep lm_head.weight replicated.", k)
+            style = model_parallel_plan.get(k)
+            output_layouts = getattr(style, "output_layouts", ())
+            if not isinstance(output_layouts, (tuple, list)):
+                output_layouts = (output_layouts,)
+            if any(isinstance(layout, Shard) for layout in output_layouts):
+                logger.info("Nemotron-Flash: retaining vocab-sharded %s TP plan.", k)
+            elif model_parallel_plan.pop(k, None) is not None:
+                logger.info("Nemotron-Flash: excluding replicated-output %s from TP plan.", k)
 
     # EP=1 uses this generic FSDP2 path rather than the dedicated MoE
     # parallelizer. Apply the same routed-expert ownership validation here so
