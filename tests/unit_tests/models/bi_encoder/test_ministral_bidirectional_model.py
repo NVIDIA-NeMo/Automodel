@@ -26,6 +26,7 @@ import torch
 import torch.nn as nn
 from PIL import Image
 from transformers import PixtralImageProcessor
+from transformers.tokenization_utils_tokenizers import TokenizersBackend
 from transformers.models.mistral3.modeling_mistral3 import Mistral3Model
 from transformers.processing_utils import ProcessorMixin
 
@@ -66,6 +67,7 @@ class FakePixtralTokenizer:
         self.padding_side = "right"
         self.init_kwargs = {}
         self.calls = []
+        self.all_special_tokens = ["[INST]", "[IMG]", "[IMG_BREAK]", "[IMG_END]"]
 
     def convert_tokens_to_ids(self, token):
         return {"[IMG]": 10, "[IMG_BREAK]": 11, "[IMG_END]": 12}.get(token, 1)
@@ -148,6 +150,48 @@ def test_ministral3_bidirectional_config_fields():
     assert cfg.model_type == "ministral3_bidirec"
 
 
+def test_ministral3_biencoder_processor_loads_tokenizers_backend_directly(monkeypatch):
+    expected = object()
+    calls = []
+
+    def fake_load_tokenizers_backend(model_id, *args, **kwargs):
+        calls.append((model_id, args, kwargs))
+        return expected
+
+    monkeypatch.setattr(TokenizersBackend, "from_pretrained", fake_load_tokenizers_backend)
+
+    actual = Mistral3BiEncoderProcessor._load_tokenizer_from_pretrained(
+        "tokenizer",
+        "mistralai/Ministral-3-3B-Instruct-2512",
+        subfolder="tokenizer-assets",
+        cache_dir="cache",
+    )
+
+    assert actual is expected
+    assert calls == [
+        (
+            "mistralai/Ministral-3-3B-Instruct-2512",
+            (),
+            {
+                "subfolder": "tokenizer-assets",
+                "cache_dir": "cache",
+                "fix_mistral_regex": True,
+                "split_special_tokens": False,
+            },
+        )
+    ]
+
+
+@pytest.mark.parametrize(("keyword", "value"), [("backend", "mistral-common"), ("split_special_tokens", True)])
+def test_ministral3_biencoder_processor_rejects_conflicting_tokenizer_policy(keyword, value):
+    with pytest.raises(ValueError, match=keyword):
+        Mistral3BiEncoderProcessor._load_tokenizer_from_pretrained(
+            "tokenizer",
+            "unused",
+            **{keyword: value},
+        )
+
+
 def test_ministral3_biencoder_processor_processes_queries(pixtral_processor):
     output = pixtral_processor.process_queries(["What is shown?"])
 
@@ -188,6 +232,20 @@ def test_ministral3_biencoder_processor_processes_mixed_image_text_documents(pix
     assert call["texts"][0].startswith("passage: [IMG]")
     assert call["texts"][0].endswith("[IMG_END] Image doc")
     assert call["texts"][1] == "passage: Text doc"
+
+
+def test_ministral3_biencoder_processor_escapes_user_control_tokens_but_preserves_image_markers(pixtral_processor):
+    image = Image.new("RGB", (4, 4), (255, 0, 0))
+
+    pixtral_processor.process_queries(["literal [INST] and [IMG]"])
+    query_text = pixtral_processor.tokenizer.calls[-1]["texts"][0]
+    pixtral_processor.process_documents({"images": [image], "texts": ["literal [IMG_END]"]})
+    document_text = pixtral_processor.tokenizer.calls[-1]["texts"][0]
+
+    assert "[INST]" not in query_text
+    assert "[IMG]" not in query_text
+    assert "[IMG]" in document_text
+    assert document_text.count("[IMG_END]") == 1
 
 
 def test_ministral3_biencoder_processor_rejects_remote_image_urls():

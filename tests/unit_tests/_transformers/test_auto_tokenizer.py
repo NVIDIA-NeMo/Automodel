@@ -79,26 +79,33 @@ class _StubConfig:
 
 
 class TestNeMoAutoTokenizerFromPretrained:
-    def test_default_preserves_tokenizer_special_token_behavior(self):
+    @pytest.mark.parametrize("tokenizer_backend", [None, "nemo_auto"])
+    def test_default_preserves_tokenizer_special_token_behavior(self, tokenizer_backend):
         stub = _StubHFTokenizer()
         with (
             patch("transformers.AutoTokenizer.from_pretrained", return_value=stub),
             patch("transformers.AutoConfig.from_pretrained", return_value=_StubConfig()),
         ):
-            tok = NeMoAutoTokenizer.from_pretrained("dummy/model")
+            tok = NeMoAutoTokenizer.from_pretrained("dummy/model", tokenizer_backend=tokenizer_backend)
 
         assert tok.add_bos_token is False
         assert tok.add_eos_token is False
         assert tok(["x"])["input_ids"] == [[5, 6]]
         assert tok.encode("x") == [5, 6]
 
-    def test_opt_in_adds_bos_eos(self):
+    @pytest.mark.parametrize("tokenizer_backend", [None, "nemo_auto"])
+    def test_opt_in_adds_bos_eos(self, tokenizer_backend):
         stub = _StubHFTokenizer()
         with (
             patch("transformers.AutoTokenizer.from_pretrained", return_value=stub),
             patch("transformers.AutoConfig.from_pretrained", return_value=_StubConfig()),
         ):
-            tok = NeMoAutoTokenizer.from_pretrained("dummy/model", add_bos_token=True, add_eos_token=True)
+            tok = NeMoAutoTokenizer.from_pretrained(
+                "dummy/model",
+                tokenizer_backend=tokenizer_backend,
+                add_bos_token=True,
+                add_eos_token=True,
+            )
             out = tok(["x"])
             assert isinstance(out, BatchEncoding)
             assert out["input_ids"] == [[stub.bos_token_id, 5, 6, stub.eos_token_id]]
@@ -256,6 +263,45 @@ class TestNeMoAutoTokenizerFromPretrained:
             with pytest.raises(ValueError, match="backend tokenizer"):
                 NeMoAutoTokenizer.from_pretrained("dummy/model", trust_remote_code=True)
             mock_resolve.assert_not_called()
+
+    def test_transformers_auto_backend_matches_force_hf_route(self):
+        stub = _StubHFTokenizer()
+        with patch("transformers.AutoTokenizer.from_pretrained", return_value=stub) as load_transformers:
+            tokenizer = NeMoAutoTokenizer.from_pretrained(
+                "dummy/model",
+                tokenizer_backend="transformers_auto",
+                padding_side="left",
+            )
+
+        assert tokenizer is stub
+        load_transformers.assert_called_once_with("dummy/model", trust_remote_code=False, padding_side="left")
+
+    def test_force_hf_accepts_equivalent_explicit_backend(self):
+        stub = _StubHFTokenizer()
+        with patch("transformers.AutoTokenizer.from_pretrained", return_value=stub):
+            tokenizer = NeMoAutoTokenizer.from_pretrained(
+                "dummy/model",
+                force_hf=True,
+                tokenizer_backend="transformers_auto",
+            )
+
+        assert tokenizer is stub
+
+    def test_force_hf_rejects_conflicting_backend(self):
+        with pytest.raises(ValueError, match="cannot be combined"):
+            NeMoAutoTokenizer.from_pretrained(
+                "dummy/model",
+                force_hf=True,
+                tokenizer_backend="tokenizers",
+            )
+
+    def test_force_default_rejects_conflicting_backend(self):
+        with pytest.raises(ValueError, match="force_default=True"):
+            NeMoAutoTokenizer.from_pretrained(
+                "dummy/model",
+                force_default=True,
+                tokenizer_backend="tokenizers",
+            )
 
     def test_force_hf_passthrough(self):
         stub = _StubHFTokenizer()

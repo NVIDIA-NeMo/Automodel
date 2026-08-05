@@ -25,6 +25,9 @@ import numpy as np
 import torch
 from PIL import Image
 from transformers import BatchEncoding, PixtralProcessor
+from transformers.tokenization_utils_tokenizers import TokenizersBackend
+
+_CONTROL_TOKEN_ESCAPE = "\u200c"
 
 
 def load_image(image: Any) -> Image.Image:
@@ -47,6 +50,34 @@ def load_image(image: Any) -> Image.Image:
 
 class Mistral3BiEncoderProcessor(PixtralProcessor):
     """Pixtral processor with retrieval-specific query/document batching helpers."""
+
+    @classmethod
+    def _load_tokenizer_from_pretrained(
+        cls,
+        sub_processor_type: str,
+        pretrained_model_name_or_path: str,
+        subfolder: str = "",
+        **kwargs: Any,
+    ) -> TokenizersBackend:
+        """Load the processor tokenizer directly, bypassing automatic backend selection."""
+        tokenizer_subfolder = (
+            subfolder if sub_processor_type == "tokenizer" else os.path.join(subfolder, sub_processor_type)
+        )
+        if "backend" in kwargs and kwargs["backend"] != "tokenizers":
+            raise ValueError(
+                f"backend must be 'tokenizers' for Mistral retrieval processors, got {kwargs['backend']!r}."
+            )
+        if "split_special_tokens" in kwargs and kwargs["split_special_tokens"] is not False:
+            raise ValueError("split_special_tokens must be False for Mistral retrieval processors.")
+        kwargs.pop("backend", None)
+        kwargs.pop("split_special_tokens", None)
+        return TokenizersBackend.from_pretrained(
+            pretrained_model_name_or_path,
+            subfolder=tokenizer_subfolder,
+            fix_mistral_regex=True,
+            split_special_tokens=False,
+            **kwargs,
+        )
 
     def __init__(
         self,
@@ -110,7 +141,12 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
         if return_tensors not in ("pt", "np"):
             raise ValueError(f"Invalid return_tensors: {return_tensors!r}. Must be 'pt' or 'np'.")
 
-        query_prompts = [f"{self.query_prefix} {query}" if self.query_prefix else query for query in queries]
+        query_prompts = [
+            f"{self.query_prefix} {self._escape_user_control_tokens(query)}"
+            if self.query_prefix
+            else self._escape_user_control_tokens(query)
+            for query in queries
+        ]
         return self._process_text(
             query_prompts,
             max_length=self.q_max_length,
@@ -149,7 +185,7 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
         contents = []
         processor_images = []
         for image, text in zip(images, texts):
-            content = "" if text is None else str(text)
+            content = "" if text is None else self._escape_user_control_tokens(str(text))
             if image is not None and image != "":
                 processor_images.append(load_image(image).convert("RGB"))
                 content = f"{self.image_token} {content}".strip()
@@ -268,6 +304,14 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
         if isinstance(documents, list):
             return [pair["image"] for pair in documents], [pair["text"] for pair in documents]
         raise ValueError("The documents need to be a dict or list of dicts.")
+
+    def _escape_user_control_tokens(self, text: str) -> str:
+        """Break literal user control tokens without changing processor-owned markers."""
+        special_tokens = getattr(self.tokenizer, "all_special_tokens", ())
+        for token in sorted((token for token in special_tokens if len(token) > 1), key=len, reverse=True):
+            escaped = f"{token[0]}{_CONTROL_TOKEN_ESCAPE}{token[1:]}"
+            text = text.replace(token, escaped)
+        return text
 
 
 def _register_with_hf_auto_classes() -> None:

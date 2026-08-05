@@ -14,7 +14,7 @@
 
 import importlib
 import logging
-from typing import Callable, Optional, Type, Union
+from typing import Callable, Literal, Optional, Type, Union
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +94,7 @@ class NeMoAutoTokenizer:
         *args,
         force_default: bool = False,
         force_hf: bool = False,
+        tokenizer_backend: Literal["nemo_auto", "transformers_auto", "tokenizers"] | None = None,
         trust_remote_code: bool = False,
         **kwargs,
     ):
@@ -103,20 +104,43 @@ class NeMoAutoTokenizer:
         Args:
             pretrained_model_name_or_path: Model identifier or path
             force_default: If True, always use the wrapped HuggingFace tokenizer.
-            force_hf: If True, return the raw HF AutoTokenizer without any wrapping
+            force_hf: Backward-compatible alias for tokenizer_backend="transformers_auto".
+            tokenizer_backend: Tokenizer loading route. "nemo_auto" preserves the default NeMo dispatch,
+                "transformers_auto" uses Transformers AutoTokenizer, and "tokenizers" loads tokenizer.json
+                directly through Transformers TokenizersBackend.
             trust_remote_code: Whether to trust remote code when loading config
             **kwargs: Additional arguments passed to the tokenizer's from_pretrained
 
         Returns:
             A tokenizer instance appropriate for the model type
         """
-        # If force_hf, just use the base HF AutoTokenizer
-        if force_hf:
+        valid_backends = {"nemo_auto", "transformers_auto", "tokenizers"}
+        if tokenizer_backend is not None and tokenizer_backend not in valid_backends:
+            raise ValueError(f"tokenizer_backend must be one of {sorted(valid_backends)}, got {tokenizer_backend!r}")
+        if force_default and tokenizer_backend not in (None, "nemo_auto"):
+            raise ValueError(
+                "force_default=True uses the nemo_auto route and cannot be combined "
+                f"with tokenizer_backend={tokenizer_backend!r}."
+            )
+        if force_hf and tokenizer_backend not in (None, "transformers_auto"):
+            raise ValueError(
+                "force_hf=True is equivalent to tokenizer_backend='transformers_auto' and cannot be combined "
+                f"with tokenizer_backend={tokenizer_backend!r}."
+            )
+
+        resolved_backend = "transformers_auto" if force_hf else (tokenizer_backend or "nemo_auto")
+
+        if resolved_backend == "transformers_auto":
             from transformers import AutoTokenizer
 
             return AutoTokenizer.from_pretrained(
                 pretrained_model_name_or_path, *args, trust_remote_code=trust_remote_code, **kwargs
             )
+
+        if resolved_backend == "tokenizers":
+            from transformers.tokenization_utils_tokenizers import TokenizersBackend
+
+            return TokenizersBackend.from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
 
         # Try to determine model type from config
         model_type = _get_model_type(pretrained_model_name_or_path, trust_remote_code=trust_remote_code)
