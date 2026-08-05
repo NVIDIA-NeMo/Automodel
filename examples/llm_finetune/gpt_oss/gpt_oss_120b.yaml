@@ -19,7 +19,7 @@
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 step_scheduler:
-  global_batch_size: 256
+  global_batch_size: 512
   local_batch_size: 32
   ckpt_every_steps: 500
   val_every_steps: 100  # will run every x number of gradient steps
@@ -55,7 +55,7 @@ distributed:
   tp_size: 1
   cp_size: 1
   pp_size: 1
-  ep_size: 32
+  ep_size: 64
 
   sequence_parallel: false
 
@@ -114,7 +114,5 @@ optimizer:
 ci:
   recipe_owner: hemildesai
   local_batch_size: 8
-  nodes: 4
+  nodes: 8
   time: "01:00:00"
-  env_vars:
-    PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
