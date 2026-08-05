@@ -301,6 +301,45 @@ class TestCheckFp8DequantizeWillFit:
         with pytest.raises(RuntimeError):
             _check_fp8_dequantize_will_fit(cfg, quant, "any/model")
 
+    def test_fallback_wording_does_not_blame_force_hf(self, monkeypatch):
+        """With force_hf=False the diagnostic must not suggest dropping force_hf.
+
+        The fallback path never had force_hf on, so that advice would be a no-op
+        and point at the wrong cause.
+        """
+        monkeypatch.setattr("torch.cuda.is_available", lambda: True)
+        monkeypatch.setattr("torch.cuda.mem_get_info", lambda *a, **k: (_MEM_8GB, _MEM_8GB))
+        cfg = _make_hf_config(layers=88, hidden=12288)
+
+        with pytest.raises(RuntimeError) as excinfo:
+            _check_fp8_dequantize_will_fit(cfg, _fp8_dequant_cfg(), "any/model", force_hf=False)
+        msg = str(excinfo.value)
+        assert "force_hf" not in msg
+        assert "no streaming-aware custom implementation" in msg
+        assert "mistral3_vlm" in msg
+
+    def test_force_hf_wording_keeps_the_drop_force_hf_hint(self, monkeypatch):
+        """Default force_hf=True wording still tells the user they can drop force_hf."""
+        monkeypatch.setattr("torch.cuda.is_available", lambda: True)
+        monkeypatch.setattr("torch.cuda.mem_get_info", lambda *a, **k: (_MEM_8GB, _MEM_8GB))
+        cfg = _make_hf_config(layers=88, hidden=12288)
+
+        with pytest.raises(RuntimeError) as excinfo:
+            _check_fp8_dequantize_will_fit(cfg, _fp8_dequant_cfg(), "any/model")
+        assert "drop force_hf=True" in str(excinfo.value)
+
+    def test_diagnostic_reports_gib(self, monkeypatch):
+        """Sizes are computed with 1024**3, so the label has to be GiB, not GB."""
+        monkeypatch.setattr("torch.cuda.is_available", lambda: True)
+        monkeypatch.setattr("torch.cuda.mem_get_info", lambda *a, **k: (_MEM_8GB, _MEM_8GB))
+        cfg = _make_hf_config(layers=88, hidden=12288)
+
+        with pytest.raises(RuntimeError) as excinfo:
+            _check_fp8_dequantize_will_fit(cfg, _fp8_dequant_cfg(), "any/model")
+        msg = str(excinfo.value)
+        assert "GiB" in msg
+        assert " GB " not in msg
+
 
 # ---------------------------------------------------------------------------
 # Wiring: the force_hf branch must invoke the pre-flight before HF's loader.
@@ -390,6 +429,90 @@ class TestForceHfBranchWiring:
                 None,  # quantization_config
                 False,  # force_hf -> exercise the fallback branch
             )
+
+
+class TestConfigOnlyInitSkipsPreflight:
+    """from_config builds never touch the checkpoint, so the guard must not run.
+
+    Before this gate, a config that merely carried fp8 dequantize metadata made
+    from_config raise even though nothing was going to be materialized.
+    """
+
+    class _Sentinel(Exception):
+        pass
+
+    @pytest.fixture(autouse=True)
+    def _sentinel_preflight(self, monkeypatch):
+        def _raise_sentinel(*a, **k):
+            raise self._Sentinel()
+
+        monkeypatch.setattr(model_init, "_check_fp8_dequantize_will_fit", _raise_sentinel)
+        monkeypatch.setattr(model_init, "_propagate_torch_dtype_to_subconfigs", lambda *a, **k: None)
+        monkeypatch.setattr(model_init, "_streaming_bnb_supported", lambda *a, **k: False)
+
+    @staticmethod
+    def _fp8_config_object():
+        # a config object (not a repo path) carrying fp8 dequantize metadata
+        return SimpleNamespace(
+            architectures=["Dummy"],
+            quantization_config={"quant_method": "fp8", "dequantize": True},
+            name_or_path="fake/config-only",
+        )
+
+    class _DummyModel:
+        pass
+
+    def test_force_hf_config_only_does_not_preflight(self, monkeypatch):
+        outer = self
+
+        class _DummyCls:
+            _model_mapping = {}
+
+            @classmethod
+            def _from_pretrained_parent_class(cls, *a, **k):
+                raise AssertionError("from_config path must not hit the pretrained loader")
+
+            @classmethod
+            def _from_config_parent_class(cls, *a, **k):
+                return outer._DummyModel()
+
+        _, model = model_init._init_model(
+            _DummyCls,
+            self._fp8_config_object(),
+            "sdpa",
+            "bfloat16",
+            None,  # quantization_config
+            True,  # force_hf
+        )
+        assert model is not None
+
+    def test_fallback_config_only_does_not_preflight(self, monkeypatch):
+        monkeypatch.setattr(model_init, "_resolve_custom_model_cls_for_config", lambda *a, **k: None)
+        monkeypatch.setattr(model_init, "_prepopulate_remote_code_cache", lambda *a, **k: None)
+        monkeypatch.setattr(model_init, "_try_get_remote_code_model_cls", lambda *a, **k: None)
+        outer = self
+
+        class _DummyCls:
+            __name__ = "NeMoDummy"
+            _model_mapping = {}
+
+            @classmethod
+            def _from_pretrained_parent_class(cls, *a, **k):
+                raise AssertionError("from_config path must not hit the pretrained loader")
+
+            @classmethod
+            def _from_config_parent_class(cls, *a, **k):
+                return outer._DummyModel()
+
+        _, model = model_init._init_model(
+            _DummyCls,
+            self._fp8_config_object(),
+            "sdpa",
+            "bfloat16",
+            None,  # quantization_config
+            False,  # force_hf -> exercise the fallback branch
+        )
+        assert model is not None
 
 
 class TestParamCountFromLocalSafetensors:

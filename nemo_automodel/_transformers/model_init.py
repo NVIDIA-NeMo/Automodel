@@ -642,7 +642,9 @@ def _get_hf_param_count_estimate(hf_config, pretrained_model_name_or_path=None) 
     return total if total > 0 else None
 
 
-def _check_fp8_dequantize_will_fit(hf_config, quantization_config, pretrained_model_name_or_path) -> None:
+def _check_fp8_dequantize_will_fit(
+    hf_config, quantization_config, pretrained_model_name_or_path, force_hf: bool = True
+) -> None:
     """Refuse FP8-dequantize loads that won't fit in CUDA HBM.
 
     When ``force_hf=True`` meets an FP8 quant config with ``dequantize=True``,
@@ -664,6 +666,11 @@ def _check_fp8_dequantize_will_fit(hf_config, quantization_config, pretrained_mo
     No-ops when CUDA isn't available, the config isn't an FP8 full-materialize
     config, the param count can't be estimated, or
     ``NEMO_AUTOMODEL_DISABLE_FP8_PREFLIGHT=1`` is set.
+
+    The guard runs from two load paths: the explicit ``force_hf=True`` branch
+    and the no-custom-class HF fallback. ``force_hf`` only picks the wording of
+    the diagnostic, since "drop force_hf" is not a useful suggestion on the
+    fallback path.
 
     Raises:
         RuntimeError: if the estimated BF16 footprint exceeds the safe budget.
@@ -698,21 +705,35 @@ def _check_fp8_dequantize_will_fit(hf_config, quantization_config, pretrained_mo
     if bf16_bytes <= budget_bytes:
         return None
 
+    if force_hf:
+        cause_and_workaround = (
+            "  With force_hf=True and quant_method='fp8' + dequantize=True, transformers "
+            "materializes the full BF16 model on every rank inside _from_pretrained_parent_class "
+            "BEFORE Automodel sharding runs, so tensor parallelism cannot prevent the OOM for any "
+            "model larger than one device's HBM.\n"
+            "  Workaround: provide a streaming-aware custom model class (see the mistral3_vlm "
+            "adapter in nemo_automodel/components/models/ for the pattern), or drop force_hf=True "
+            "so the custom path can shard the FP8 checkpoint directly.\n"
+        )
+    else:
+        cause_and_workaround = (
+            "  This model has no streaming-aware custom implementation, so the load falls back to "
+            "the plain HF loader, which materializes the full BF16 model on every rank BEFORE "
+            "Automodel sharding runs; tensor parallelism cannot prevent the OOM for any model "
+            "larger than one device's HBM.\n"
+            "  Workaround: provide a streaming-aware custom model class (see the mistral3_vlm "
+            "adapter in nemo_automodel/components/models/ for the pattern).\n"
+        )
+
     gib = 1024**3
     raise RuntimeError(
         f"FP8 dequantize pre-flight failed for {pretrained_model_name_or_path!r}.\n"
-        f"  Estimated BF16 footprint: {bf16_bytes / gib:.1f} GB "
+        f"  Estimated BF16 footprint: {bf16_bytes / gib:.1f} GiB "
         f"(~{n_params / 1e9:.1f}B parameters x 2 bytes).\n"
-        f"  Total CUDA memory: {total_bytes / gib:.1f} GB "
-        f"(safe budget at {int(_FP8_PREFLIGHT_FOOTPRINT_THRESHOLD * 100)}%: {budget_bytes / gib:.1f} GB; "
-        f"free right now: {free_bytes / gib:.1f} GB).\n"
-        f"  With force_hf=True and quant_method='fp8' + dequantize=True, transformers "
-        f"materializes the full BF16 model on every rank inside _from_pretrained_parent_class "
-        f"BEFORE Automodel sharding runs, so tensor parallelism cannot prevent the OOM for any "
-        f"model larger than one device's HBM.\n"
-        f"  Workaround: provide a streaming-aware custom model class (see the mistral3_vlm "
-        f"adapter in nemo_automodel/components/models/ for the pattern), or drop force_hf=True "
-        f"so the custom path can shard the FP8 checkpoint directly.\n"
+        f"  Total CUDA memory: {total_bytes / gib:.1f} GiB "
+        f"(safe budget at {int(_FP8_PREFLIGHT_FOOTPRINT_THRESHOLD * 100)}%: {budget_bytes / gib:.1f} GiB; "
+        f"free right now: {free_bytes / gib:.1f} GiB).\n"
+        f"{cause_and_workaround}"
         f"  Tracking issue: https://github.com/NVIDIA-NeMo/Automodel/issues/2114\n"
         f"  Bypass (use only if you're sure the estimate is wrong): "
         f"export {_FP8_PREFLIGHT_DISABLE_ENV}=1."
@@ -1151,10 +1172,13 @@ def __init_model(
         # full BF16 model that won't fit in HBM (issue #2114). Both the
         # user-supplied quant config and the one baked into the HF config
         # (e.g. set by _maybe_dequantize_fp8_for_peft) can trigger this path.
-        _check_fp8_dequantize_will_fit(hf_config, quantization_config, pretrained_model_name_or_path)
-        _check_fp8_dequantize_will_fit(
-            hf_config, getattr(hf_config, "quantization_config", None), pretrained_model_name_or_path
-        )
+        # Only checked for from_pretrained: a from_config build never touches
+        # the checkpoint, so there's nothing to dequantize.
+        if is_pretrained_init:
+            _check_fp8_dequantize_will_fit(hf_config, quantization_config, pretrained_model_name_or_path)
+            _check_fp8_dequantize_will_fit(
+                hf_config, getattr(hf_config, "quantization_config", None), pretrained_model_name_or_path
+            )
         if quantization_config is not None:
             kwargs["quantization_config"] = quantization_config
             _setup_bnb_loading_kwargs(kwargs)
@@ -1236,10 +1260,12 @@ def __init_model(
     # fp8 checkpoint with dequantize=True but no custom streaming model class
     # also reaches HF's full-materialize loader below (e.g. when PEFT set
     # dequantize=True on the native config). Tensor parallelism can't save it.
-    _check_fp8_dequantize_will_fit(hf_config, quantization_config, pretrained_model_name_or_path)
-    _check_fp8_dequantize_will_fit(
-        hf_config, getattr(hf_config, "quantization_config", None), pretrained_model_name_or_path
-    )
+    # Skipped for from_config builds, which never materialize a checkpoint.
+    if is_pretrained_init:
+        _check_fp8_dequantize_will_fit(hf_config, quantization_config, pretrained_model_name_or_path, force_hf=False)
+        _check_fp8_dequantize_will_fit(
+            hf_config, getattr(hf_config, "quantization_config", None), pretrained_model_name_or_path, force_hf=False
+        )
     # Serialize HF custom-code cache population across ranks to avoid a partial-copy race.
     _prepopulate_remote_code_cache(hf_config, pretrained_model_name_or_path, kwargs, process_group=process_group)
     if quantization_config is not None:
