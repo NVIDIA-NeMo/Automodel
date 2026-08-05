@@ -139,5 +139,6 @@ clip_grad_norm:
 
 ci:
   recipe_owner: huiyingl
-  nodes: 32
+  nodes: 64
+  cluster_tag: gb200
   time: "01:30:00"
