@@ -88,6 +88,7 @@ validation_dataloader:
     max_length: 4096
 
 wandb:
+  enable: false
   entity: Nemo-automodel
   project: huiyingl_workspace
   name: nomni_v3_medpix_ep8cp2_te

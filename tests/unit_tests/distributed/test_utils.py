@@ -14,8 +14,6 @@
 
 from __future__ import annotations
 
-import os
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -80,7 +78,6 @@ def patch_dist(monkeypatch):
     yield fake
 
 
-
 def test_first_rank_per_node_single_gpu(monkeypatch, patch_dist):
     """
     In the absence of a distributed init the context manager should behave like
@@ -93,6 +90,34 @@ def test_first_rank_per_node_single_gpu(monkeypatch, patch_dist):
     with du.FirstRankPerNode() as is_first:
         assert is_first is True
 
+
+def test_first_rank_per_node_uses_explicit_process_group(monkeypatch, patch_dist):
+    group = object()
+    seen_groups = []
+    monkeypatch.setattr(du.dist, "get_world_size", lambda group=None: 2, raising=False)
+
+    def get_rank(group=None):
+        seen_groups.append(group)
+        return 0
+
+    monkeypatch.setattr(du.dist, "get_rank", get_rank, raising=False)
+    monkeypatch.setattr(du, "_barrier_with_timeout", lambda timeout, group=None: seen_groups.append(group) or True)
+
+    with du.FirstRankPerNode(group=group) as is_first:
+        assert is_first is True
+
+    assert seen_groups == [group, group]
+
+
+def test_barrier_with_timeout_reuses_explicit_process_group(monkeypatch, patch_dist):
+    group = object()
+    seen_groups = []
+    monkeypatch.setattr(du.dist, "get_world_size", lambda group=None: 2, raising=False)
+    monkeypatch.setattr(du.dist, "barrier", lambda group=None: seen_groups.append(group), raising=False)
+    monkeypatch.setattr(du, "_create_gloo_group", lambda: pytest.fail("unexpected Gloo group"))
+
+    assert du._barrier_with_timeout(timeout=du.timedelta(seconds=1), group=group)
+    assert seen_groups == [group]
 
 
 def test_reduce_loss_no_dp(monkeypatch):

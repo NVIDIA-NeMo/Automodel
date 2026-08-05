@@ -118,3 +118,18 @@ optimizer:
 
 ci:
   recipe_owner: HuiyingLi
+  time: "00:25:00"
+  checkpoint_robustness:
+    check_source_load_parity: true
+    hf_kl_threshold: 1e-2
+    # FP8 here is training-time quantization of a bf16 checkpoint (see the fp8
+    # section above), so Phase 0 bounds the FP8-prepared trainer model against
+    # the raw bf16 HF reference. This is an FP8-only exception; keep the
+    # non-quantized Phase 0 configs at the default strict mean KL threshold.
+    source_load_kl_threshold: 1e-2
+    source_load_mean_kl_threshold: 3e-3
+    source_load_cosine_threshold: 0.999
+    tokenizer_name: mistralai/Mistral-7B-v0.1
+    no_check_resume: true
+    dataset.num_samples_limit: 500
+    validation_dataset.num_samples_limit: 500

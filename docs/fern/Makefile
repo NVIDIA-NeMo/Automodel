@@ -23,7 +23,7 @@ REPO_ROOT := $(shell git rev-parse --show-toplevel)
 
 .DEFAULT_GOAL := help
 
-.PHONY: help docs docs-login docs-check docs-preview docs-publish docs-generate-library docs-stitch
+.PHONY: help docs docs-login docs-check docs-preview docs-publish docs-generate-library docs-stitch docs-mdx-check docs-model-tables
 
 help:
 	@echo ""
@@ -36,7 +36,9 @@ help:
 	@echo "  make docs-login             FIRST-TIME SETUP — provision Fern account + CLI auth"
 	@echo "  make docs                   Generate library reference and start Fern dev server"
 	@echo "  make docs-stitch            Restore frozen backward-version pages from the $(ARCHIVE_REF) branch"
-	@echo "  make docs-check             Run 'fern check' (config + MDX validation)"
+	@echo "  make docs-check             Run MDX syntax validation + 'fern check'"
+	@echo "  make docs-mdx-check         Run MDX syntax validation"
+	@echo "  make docs-model-tables      Generate release-log and model-registry tables"
 	@echo "  make docs-preview           Build a shared preview URL on *.docs.buildwithfern.com (needs DOCS_FERN_TOKEN)"
 	@echo "  make docs-publish           Trigger the 'Publish Fern Docs' workflow on origin/main"
 	@echo "  make docs-generate-library  Regenerate the autodoc library reference under product-docs/"
@@ -94,11 +96,21 @@ docs-login:
 # `fern docs dev` then serves the site on localhost:3002. Re-run `make docs` only
 # when the library source changes — for prose-only iteration, `fern docs dev`
 # alone is enough after the first generate.
-docs: docs-stitch docs-generate-library
+docs: docs-model-tables docs-stitch docs-generate-library
 	fern docs dev
 
-docs-check: docs-stitch
+docs-check: docs-mdx-check
 	fern check
+
+docs-model-tables:
+	python3 "$(REPO_ROOT)/tests/ci_tests/utils/sync_model_coverage_tables.py"
+
+docs-mdx-check: docs-model-tables docs-stitch
+	@tmp_dir="$$(mktemp -d)"; \
+	trap 'rm -rf "$$tmp_dir"' EXIT; \
+	printf '%s\n' '{"private":true,"type":"module"}' > "$$tmp_dir/package.json"; \
+	npm --prefix "$$tmp_dir" install --silent @mdx-js/mdx@3 remark-frontmatter@5 remark-math@6 >/dev/null; \
+	MDX_LINT_PREFIX="$$tmp_dir" MDX_LINT_REPO_ROOT="$(REPO_ROOT)" node "$(REPO_ROOT)/tools/validate_mdx_syntax.mjs" "$(REPO_ROOT)/docs"
 
 # Restore the frozen backward-version page trees into the working copy. They
 # live on the `$(ARCHIVE_REF)` branch (not on main), so a fresh clone has only
@@ -107,7 +119,8 @@ docs-check: docs-stitch
 docs-stitch:
 	@git -C "$(REPO_ROOT)" fetch --depth=1 origin $(ARCHIVE_REF) --quiet
 	@git -C "$(REPO_ROOT)" restore --source=FETCH_HEAD --worktree --no-overlay -- docs/fern/versions/v0.4/pages
-	@echo "Stitched frozen v0.4 pages from $(ARCHIVE_REF)."
+	@git -C "$(REPO_ROOT)" restore --source=FETCH_HEAD --worktree --no-overlay -- docs/fern/versions/v0.5/pages
+	@echo "Stitched frozen v0.4, v0.5 pages from $(ARCHIVE_REF)."
 
 # Wraps the autodoc generate step. If it fails (the most common cause is
 # the HTTP 403 from missing dashboard provisioning), print the recovery
@@ -132,7 +145,7 @@ docs-generate-library:
 # Shared preview hosted at <repo-slug>.docs.buildwithfern.com — useful for sharing a
 # work-in-progress link before merge. Requires DOCS_FERN_TOKEN in the environment
 # (org secret of the same name is wired into CI).
-docs-preview: docs-stitch docs-generate-library
+docs-preview: docs-model-tables docs-stitch docs-generate-library
 	fern generate --docs --preview
 
 # Trigger the Publish Fern Docs workflow on origin/main via workflow_dispatch.

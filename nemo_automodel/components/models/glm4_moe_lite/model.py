@@ -20,6 +20,10 @@ import torch.nn as nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.tie_word_embeddings import (
+    TieSupport,
+    reject_unsupported_tie_word_embeddings,
+)
 from nemo_automodel.components.models.common.utils import (
     BackendConfig,
     cast_model_to_dtype,
@@ -231,6 +235,7 @@ class Glm4MoeLiteModel(nn.Module):
 
 
 class Glm4MoeLiteForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
+    tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
     _keep_in_fp32_modules_strict = ["e_score_correction_bias"]
 
     @dataclass(frozen=True)
@@ -274,6 +279,7 @@ class Glm4MoeLiteForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     ):
         super().__init__()
         self.config = config
+        reject_unsupported_tie_word_embeddings(type(self), config)
         self.backend = backend or BackendConfig()
         moe_overrides = kwargs.pop("moe_overrides", None)
         self.model = Glm4MoeLiteModel(

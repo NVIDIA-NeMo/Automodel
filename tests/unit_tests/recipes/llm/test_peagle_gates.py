@@ -43,3 +43,10 @@ def test_peagle_gate_rejects_cached_target():
 def test_peagle_gate_rejects_sequence_packing():
     with pytest.raises(NotImplementedError, match="sequence packing"):
         _validate_peagle_gates(backend="colocated", cached_target_path=None, packed_sequence_size=4096)
+
+
+def test_peagle_gate_rejects_lk_loss():
+    with pytest.raises(NotImplementedError, match="lk_loss_type"):
+        _validate_peagle_gates(
+            backend="colocated", cached_target_path=None, packed_sequence_size=0, lk_loss_type="alpha"
+        )

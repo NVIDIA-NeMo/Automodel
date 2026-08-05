@@ -12,64 +12,173 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""``BaseRecipe._finalize_pending_checkpoint`` flushes the last async checkpoint.
-
-The async ``save_checkpoint`` path defers the latest/best symlink update to the
-next save's preamble; the final checkpoint has no next save, so the training loop
-calls this once at the end to wait the write and flush the deferred symlinks.
-"""
+"""Final async checkpoint publication is owned by the checkpoint component."""
 
 from types import SimpleNamespace
 
+import pytest
+import torch
+
+from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
+from nemo_automodel.components.checkpoint.config import CheckpointingConfig
+from nemo_automodel.components.checkpoint.lifecycle import CheckpointLifecycle
 from nemo_automodel.recipes.llm.train_dflash import TrainDFlashRecipe
 
 
-def _recipe(enabled=True, pending=None, best_pending=None):
-    # Any BaseRecipe subclass exercises the shared helper; TrainDFlashRecipe is one.
-    r = TrainDFlashRecipe.__new__(TrainDFlashRecipe)
-    r._waited = []
-    r.checkpointer = SimpleNamespace(
-        config=SimpleNamespace(enabled=enabled),
-        async_wait=lambda: r._waited.append(1),
+@pytest.fixture(autouse=True)
+def _single_process(monkeypatch):
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+
+
+def _lifecycle(checkpoint_dir="/ckpt", process_group=None):
+    config = CheckpointingConfig(
+        checkpoint_dir=checkpoint_dir,
+        save_consolidated=False,
     )
-    r._last_pending_checkpoint_dir = pending
-    r._last_pending_best_checkpoint_info = best_pending
-    r._latest = []
-    r._best = []
-    r._update_latest_symlink = lambda d: r._latest.append(d)
-    r._update_best_symlink = lambda d, v: r._best.append((d, v))
-    return r
+    return CheckpointLifecycle(config=config, process_group=process_group)
 
 
-def test_finalize_waits_and_flushes_pending_latest_and_best():
-    r = _recipe(pending="/ckpt/epoch_1_step_10", best_pending={"path": "/ckpt/epoch_1_step_10", "val": 0.5})
-    r._finalize_pending_checkpoint()
-    assert r._waited == [1]
-    assert r._latest == ["/ckpt/epoch_1_step_10"]
-    assert r._best == [("/ckpt/epoch_1_step_10", 0.5)]
-    # pending cleared so a second finalize is a no-op
-    assert r._last_pending_checkpoint_dir is None
-    assert r._last_pending_best_checkpoint_info is None
+def test_complete_pending_publishes_latest_best_and_retention(monkeypatch):
+    lifecycle = _lifecycle()
+    events = []
+    lifecycle.defer_publication(
+        "/ckpt/epoch_1_step_10",
+        best_val_metric=0.5,
+        metric_key="val_loss",
+    )
+    monkeypatch.setattr(lifecycle, "_publish_checkpoint", lambda path: events.append(("latest", path)))
+    monkeypatch.setattr(
+        lifecycle,
+        "_update_best_checkpoint",
+        lambda path, value, metric_key: events.append(("best", path, value, metric_key)),
+    )
+    monkeypatch.setattr(lifecycle, "_prune_old_checkpoints", lambda: events.append(("prune",)))
+
+    lifecycle.complete_pending()
+
+    assert events == [
+        ("latest", "/ckpt/epoch_1_step_10"),
+        ("best", "/ckpt/epoch_1_step_10", 0.5, "val_loss"),
+        ("prune",),
+    ]
+    assert lifecycle._pending_checkpoint_dir is None
+    assert lifecycle._pending_best_checkpoint is None
+
+    lifecycle.complete_pending()
+    assert len(events) == 3
 
 
-def test_finalize_with_no_pending_only_waits():
-    r = _recipe(pending=None, best_pending=None)
-    r._finalize_pending_checkpoint()
-    assert r._waited == [1]
-    assert r._latest == []
-    assert r._best == []
+def test_complete_pending_uses_lifecycle_process_group(monkeypatch):
+    process_group = object()
+    lifecycle = _lifecycle(process_group=process_group)
+    lifecycle.defer_publication(
+        "/ckpt/epoch_1_step_10",
+        best_val_metric=None,
+        metric_key=None,
+    )
+    barriers = []
+    rank_groups = []
+    reduce_groups = []
+
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        torch.distributed,
+        "get_rank",
+        lambda group=None: rank_groups.append(group) or 0,
+    )
+    monkeypatch.setattr(torch.distributed, "barrier", lambda group=None: barriers.append(group))
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_reduce",
+        lambda tensor, op=None, group=None: reduce_groups.append(group),
+    )
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(lifecycle, "_publish_checkpoint", lambda path: None)
+    monkeypatch.setattr(lifecycle, "_prune_old_checkpoints", lambda: None)
+
+    lifecycle.complete_pending()
+
+    assert rank_groups == [process_group, process_group, process_group]
+    assert barriers == [process_group, process_group, process_group]
+    assert reduce_groups == [process_group, process_group, process_group]
 
 
-def test_finalize_is_noop_when_checkpointing_disabled():
-    r = _recipe(enabled=False, pending="/ckpt/epoch_1_step_10")
-    r._finalize_pending_checkpoint()
-    # disabled -> no async_wait, no symlink flush
-    assert r._waited == []
-    assert r._latest == []
-    assert r._last_pending_checkpoint_dir == "/ckpt/epoch_1_step_10"
+def test_checkpointer_owns_lifecycle_with_the_same_process_group():
+    process_group = object()
+    config = CheckpointingConfig(
+        enabled=False,
+        checkpoint_dir="/ckpt",
+        save_consolidated=False,
+    )
+
+    checkpointer = Checkpointer(
+        config=config,
+        dp_rank=0,
+        tp_rank=0,
+        pp_rank=0,
+        process_group=process_group,
+    )
+
+    assert checkpointer.lifecycle.config is config
+    assert checkpointer.lifecycle.process_group is process_group
 
 
-def test_finalize_is_noop_without_checkpointer():
-    r = TrainDFlashRecipe.__new__(TrainDFlashRecipe)
-    # No checkpointer attribute at all (e.g. checkpointing never set up).
-    r._finalize_pending_checkpoint()  # must not raise
+def test_checkpointer_finalize_waits_publishes_and_closes():
+    events = []
+    checkpointer = Checkpointer.__new__(Checkpointer)
+    checkpointer.config = SimpleNamespace(enabled=True)
+    checkpointer.lifecycle = SimpleNamespace(complete_pending=lambda: events.append("publish"))
+    checkpointer.async_wait = lambda: events.append("wait")
+    checkpointer.close = lambda: events.append("close")
+
+    checkpointer.finalize()
+
+    assert events == ["wait", "publish", "close"]
+
+
+def test_checkpointer_finalize_closes_when_publication_fails():
+    events = []
+    checkpointer = Checkpointer.__new__(Checkpointer)
+    checkpointer.config = SimpleNamespace(enabled=True)
+
+    def fail_publication():
+        events.append("publish")
+        raise RuntimeError("publication failed")
+
+    checkpointer.lifecycle = SimpleNamespace(complete_pending=fail_publication)
+    checkpointer.async_wait = lambda: events.append("wait")
+    checkpointer.close = lambda: events.append("close")
+
+    with pytest.raises(RuntimeError, match="publication failed"):
+        checkpointer.finalize()
+
+    assert events == ["wait", "publish", "close"]
+
+
+def test_checkpointer_finalize_only_closes_when_checkpointing_is_disabled():
+    events = []
+    checkpointer = Checkpointer.__new__(Checkpointer)
+    checkpointer.config = SimpleNamespace(enabled=False)
+    checkpointer.lifecycle = SimpleNamespace(complete_pending=lambda: events.append("publish"))
+    checkpointer.async_wait = lambda: events.append("wait")
+    checkpointer.close = lambda: events.append("close")
+
+    checkpointer.finalize()
+
+    assert events == ["close"]
+
+
+def test_base_recipe_cleanup_delegates_to_checkpointer_finalize():
+    events = []
+    recipe = TrainDFlashRecipe.__new__(TrainDFlashRecipe)
+    recipe.checkpointer = SimpleNamespace(finalize=lambda: events.append("finalize"))
+
+    recipe._finalize_and_close_checkpointer()
+
+    assert events == ["finalize"]
+
+
+def test_base_recipe_cleanup_without_checkpointer_is_a_noop():
+    recipe = TrainDFlashRecipe.__new__(TrainDFlashRecipe)
+
+    recipe._finalize_and_close_checkpointer()

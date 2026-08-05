@@ -25,7 +25,7 @@
 # timesteps; reseeding here keeps the packed-data stream reproducible even if
 # model construction consumed RNG before the DataLoader starts iterating.
 
-"""PackedDataset + DataConfig — packed-sequence iterable for BAGEL training."""
+"""Packed-sequence iterable for BAGEL training."""
 
 from __future__ import annotations
 
@@ -33,10 +33,13 @@ import copy
 import json
 import logging
 import random
+from collections.abc import Mapping
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
 
+from .datasets import BagelDatasetConfig
 from .transforms import ImageTransform
 from .utils import (
     get_flattened_position_ids_extrapolate,
@@ -49,29 +52,12 @@ from .video import FrameSampler
 
 logger = logging.getLogger(__name__)
 
+if TYPE_CHECKING:
+    from transformers import PreTrainedTokenizerBase
 
-class DataConfig:
-    """Container for the packing-level knobs + grouped-dataset YAML dict."""
-
-    def __init__(
-        self,
-        grouped_datasets,
-        text_cond_dropout_prob=0.1,
-        vit_cond_dropout_prob=0.4,
-        vae_cond_dropout_prob=0.1,
-        vae_image_downsample=16,
-        max_latent_size=32,
-        vit_patch_size=14,
-        max_num_patch_per_side=70,
-    ):
-        self.grouped_datasets = grouped_datasets
-        self.text_cond_dropout_prob = text_cond_dropout_prob
-        self.vit_cond_dropout_prob = vit_cond_dropout_prob
-        self.vit_patch_size = vit_patch_size
-        self.max_num_patch_per_side = max_num_patch_per_side
-        self.vae_cond_dropout_prob = vae_cond_dropout_prob
-        self.vae_image_downsample = vae_image_downsample
-        self.max_latent_size = max_latent_size
+# Compatibility alias for the former packing-only config. The canonical
+# config now owns complete packed-dataset construction.
+DataConfig = BagelDatasetConfig
 
 
 class PackedDataset(torch.utils.data.IterableDataset):
@@ -84,22 +70,43 @@ class PackedDataset(torch.utils.data.IterableDataset):
 
     def __init__(
         self,
-        data_config,
-        tokenizer,
-        special_tokens,
-        local_rank,
-        world_size,
-        num_workers,
-        expected_num_tokens=32768,
-        max_num_tokens_per_sample=16384,
-        max_num_tokens=36864,
-        prefer_buffer_before=16384,
-        max_buffer_size=50,
-        interpolate_pos=False,
-        use_flex=False,
-        data_status=None,
-        dataset_info=None,
-    ):
+        data_config: "BagelDatasetConfig",
+        tokenizer: "PreTrainedTokenizerBase",
+        special_tokens: Mapping[str, object],
+        local_rank: int,
+        world_size: int,
+        num_workers: int,
+        expected_num_tokens: int = 32768,
+        max_num_tokens_per_sample: int = 16384,
+        max_num_tokens: int = 36864,
+        prefer_buffer_before: int = 16384,
+        max_buffer_size: int = 50,
+        interpolate_pos: bool = False,
+        use_flex: bool = False,
+        data_status: object | None = None,
+        dataset_info: Mapping[str, object] | None = None,
+        global_seed: int | None = None,
+    ) -> None:
+        """Initialize the packed BAGEL data stream.
+
+        Args:
+            data_config: Declarative grouped-dataset configuration.
+            tokenizer: Tokenizer used to encode text samples.
+            special_tokens: BAGEL special tokens exposed to dataset transforms.
+            local_rank: Rank used to shard source datasets.
+            world_size: Number of ranks consuming the dataset.
+            num_workers: Number of dataloader workers per rank.
+            expected_num_tokens: Preferred packed token count.
+            max_num_tokens_per_sample: Maximum tokens accepted from one sample.
+            max_num_tokens: Hard token limit for one packed result.
+            prefer_buffer_before: Token threshold at which buffered samples are preferred.
+            max_buffer_size: Maximum number of samples retained for greedy packing.
+            interpolate_pos: Whether to interpolate image position identifiers.
+            use_flex: Whether to emit metadata for flex attention.
+            data_status: Optional checkpointed source-dataset status.
+            dataset_info: Resolved dataset metadata keyed by source name.
+            global_seed: Optional seed used to reset the iterator deterministically.
+        """
         super().__init__()
         self.expected_num_tokens = expected_num_tokens
         self.max_num_tokens_per_sample = max_num_tokens_per_sample
@@ -111,6 +118,7 @@ class PackedDataset(torch.utils.data.IterableDataset):
         self.world_size = world_size
         self.num_workers = num_workers
         self.use_flex = use_flex
+        self._global_seed = global_seed
         for k, v in special_tokens.items():
             setattr(self, k, v)
 

@@ -44,6 +44,7 @@ from nemo_automodel.components.distributed.optimized_tp_plans import (
     _parallelize_llama,
     _parallelize_qwen,
 )
+from nemo_automodel.components.models.qwen3.model import Qwen3ForCausalLM as CustomQwen3ForCausalLM
 
 
 class MockModel:
@@ -55,6 +56,7 @@ class MockModel:
             "llama": LlamaForCausalLM,
             "qwen2": Qwen2ForCausalLM,
             "qwen3": Qwen3ForCausalLM,
+            "custom_qwen3": CustomQwen3ForCausalLM,
             "qwen3_seq_cls": Qwen3ForSequenceClassification,
             "gemma3_causal": Gemma3ForCausalLM,
             "gemma3_conditional": Gemma3ForConditionalGeneration,
@@ -389,6 +391,7 @@ class TestParallelizeFunctionsMapping:
         expected_types = [
             Qwen2ForCausalLM,
             Qwen3ForCausalLM,
+            CustomQwen3ForCausalLM,
             Qwen3ForSequenceClassification,
             LlamaForCausalLM,
             Gemma3ForCausalLM,
@@ -408,6 +411,7 @@ class TestParallelizeFunctionsMapping:
         all_model_types = [
             Qwen2ForCausalLM,
             Qwen3ForCausalLM,
+            CustomQwen3ForCausalLM,
             Qwen3ForSequenceClassification,
             LlamaForCausalLM,
             Gemma3ForCausalLM,
@@ -429,8 +433,10 @@ class TestParallelizeFunctionsMapping:
         """Test that Qwen2 and Qwen3 models use the same parallelization function."""
         qwen2_func = PARALLELIZE_FUNCTIONS[_get_class_qualname(Qwen2ForCausalLM)]
         qwen3_func = PARALLELIZE_FUNCTIONS[_get_class_qualname(Qwen3ForCausalLM)]
+        custom_qwen3_func = PARALLELIZE_FUNCTIONS[_get_class_qualname(CustomQwen3ForCausalLM)]
 
         assert qwen2_func is qwen3_func
+        assert qwen3_func is custom_qwen3_func
         assert qwen2_func is _parallelize_qwen
 
     def test_gemma3_models_use_same_function(self):

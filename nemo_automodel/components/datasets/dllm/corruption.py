@@ -18,6 +18,7 @@ Provides masking strategies for dLLM SFT:
 - ``corrupt_uniform``: uniform per-sequence corruption
 - ``corrupt_blockwise``: per-block weighted corruption with exponential position bias
 - ``corrupt_uniform_random``: per-block random-token (D3PM-uniform) corruption
+- ``corrupt_all_masked``: deterministic all-masked corruption (I-DLM)
 """
 
 from __future__ import annotations
@@ -39,7 +40,9 @@ def gumbel_topk(log_w: torch.Tensor, k: int) -> torch.Tensor:
     return mask
 
 
-def _batched_gumbel_topk(log_w: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
+def _batched_gumbel_topk(
+    log_w: torch.Tensor, k: torch.Tensor, generator: torch.Generator | None = None
+) -> torch.Tensor:
     """Batched variable-*k* Gumbel top-k selection.
 
     Vectorised replacement for calling :func:`gumbel_topk` in a Python loop.
@@ -56,11 +59,14 @@ def _batched_gumbel_topk(log_w: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
             be selected must be set to ``-inf``.
         k: Number of positions to select per row, shape ``[N]``.
             Rows with ``k=0`` produce an all-False mask.
+        generator: Optional ``torch.Generator`` used for the Gumbel draws;
+            ``None`` falls back to the global RNG.
 
     Returns:
         Boolean mask of shape ``[N, D]``.
     """
-    g = -torch.log(-torch.log(torch.rand_like(log_w) + 1e-9) + 1e-9)
+    u = torch.rand(log_w.shape, device=log_w.device, dtype=log_w.dtype, generator=generator)
+    g = -torch.log(-torch.log(u + 1e-9) + 1e-9)
     _, sorted_indices = torch.sort(log_w + g, dim=1, descending=True)
     # positions[i, j] = j  →  "is this the j-th largest in row i?"
     positions = torch.arange(log_w.shape[1], device=log_w.device).expand_as(log_w)
@@ -75,6 +81,7 @@ def corrupt_uniform(
     loss_mask: torch.Tensor,
     mask_token_id: int,
     eps: float = 1e-3,
+    generator: torch.Generator | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Per-sequence uniform corruption for MDLM training.
 
@@ -88,6 +95,11 @@ def corrupt_uniform(
         loss_mask: Binary mask indicating supervised positions, shape ``[B, L]``.
         mask_token_id: The token ID used for masking.
         eps: Minimum corruption ratio.
+        generator: Optional ``torch.Generator`` (on ``input_ids.device``) used for
+            ALL random draws. Pass a step-seeded generator so corruption is a
+            deterministic function of the training step (resume-reproducible) and
+            identical across ranks that share a batch (TP peers); ``None`` falls
+            back to the global RNG (not resume-safe, rank-divergent).
 
     Returns:
         Tuple of ``(noisy_input_ids, noise_mask, p_mask)`` each of shape ``[B, L]``.
@@ -99,17 +111,44 @@ def corrupt_uniform(
     device = input_ids.device
 
     # t ~ U[0, 1] per sequence
-    t = torch.rand((B,), device=device)
+    t = torch.rand((B,), device=device, generator=generator)
     p_mask = (1 - eps) * t + eps
     p_mask = p_mask[:, None].expand(B, L)  # (B, L)
 
     # Sample noise mask: each position independently masked with probability p
-    noise_mask = torch.rand((B, L), device=device) < p_mask
+    noise_mask = torch.rand((B, L), device=device, generator=generator) < p_mask
     noise_mask = noise_mask & loss_mask.bool()
 
     noisy_input_ids = torch.where(noise_mask, mask_token_id, input_ids)
 
     return noisy_input_ids, noise_mask, p_mask.float()
+
+
+def corrupt_all_masked(
+    input_ids: torch.Tensor,
+    loss_mask: torch.Tensor,
+    mask_token_id: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """All-masked corruption for I-DLM training (Yu et al., 2026).
+
+    Every supervised position (``loss_mask == 1``) is replaced with
+    ``mask_token_id`` deterministically — the all-masked objective that gives
+    dense supervision in a single forward pass. Non-supervised positions (the
+    prompt) are left clean to serve as the introspective verify signal.
+
+    Args:
+        input_ids: Token IDs, shape ``[B, L]``.
+        loss_mask: Binary mask indicating supervised positions, shape ``[B, L]``.
+        mask_token_id: The token ID used for masking.
+
+    Returns:
+        Tuple of ``(noisy_input_ids, noise_mask, p_mask)`` each of shape ``[B, L]``.
+        ``p_mask`` is all-ones (every supervised token is masked with probability 1).
+    """
+    noise_mask = loss_mask.bool()
+    noisy_input_ids = torch.where(noise_mask, mask_token_id, input_ids)
+    p_mask = torch.ones_like(input_ids, dtype=torch.float32)
+    return noisy_input_ids, noise_mask, p_mask
 
 
 def corrupt_blockwise(
@@ -119,6 +158,7 @@ def corrupt_blockwise(
     block_size: int | None = None,
     eps: float = 1e-3,
     half_life_ratio: float = 0.25,
+    generator: torch.Generator | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Two-stage corruption with optional per-block sampling.
 
@@ -152,6 +192,10 @@ def corrupt_blockwise(
         block_size: If not None, operate block-wise with per-block *m* sampling.
         eps: Minimum corruption ratio.
         half_life_ratio: Controls steepness of positional bias when ``m → 0``.
+        generator: Optional ``torch.Generator`` used for ALL random draws (the
+            ``m`` levels and the Gumbel top-k selection). Pass a step-seeded
+            generator for resume-reproducible, TP-consistent corruption; ``None``
+            falls back to the global RNG.
 
     Returns:
         Tuple of ``(noisy_input_ids, noise_mask, p_mask)`` each of shape ``[B, L]``.
@@ -164,7 +208,7 @@ def corrupt_blockwise(
         # --- Vectorised per-sequence path ---
         lam_base = math.log(2.0) / (half_life_ratio * L)
 
-        m = eps + (1.0 - eps) * torch.rand(B, device=device)  # [B]
+        m = eps + (1.0 - eps) * torch.rand(B, device=device, generator=generator)  # [B]
         k = torch.round(m * L).long().clamp(1, L)  # [B]
 
         p_mask = m.unsqueeze(1).expand(B, L)  # [B, L]
@@ -173,7 +217,7 @@ def corrupt_blockwise(
         pos = torch.arange(L, device=device, dtype=dtype)  # [L]
         log_w = lam_base * slope.unsqueeze(1) * pos.unsqueeze(0)  # [B, L]
 
-        masked_indices = _batched_gumbel_topk(log_w, k)
+        masked_indices = _batched_gumbel_topk(log_w, k, generator=generator)
     else:
         # --- Vectorised per-block path ---
         num_blocks = math.ceil(L / block_size)
@@ -189,7 +233,7 @@ def corrupt_blockwise(
             last_indices = torch.arange(num_blocks - 1, N, num_blocks, device=device)
             block_lens[last_indices] = last_len
 
-        m = eps + (1.0 - eps) * torch.rand(N, device=device)  # [N]
+        m = eps + (1.0 - eps) * torch.rand(N, device=device, generator=generator)  # [N]
         k = torch.round(m * block_lens.float()).long()  # [N]
         k = torch.min(k.clamp(min=0), block_lens)  # [N]
 
@@ -202,7 +246,7 @@ def corrupt_blockwise(
         valid = pos.unsqueeze(0).expand(N, block_size) < block_lens.unsqueeze(1)
         log_w[~valid] = -float("inf")
 
-        block_masked = _batched_gumbel_topk(log_w, k)
+        block_masked = _batched_gumbel_topk(log_w, k, generator=generator)
 
         # Reshape [N, block_size] → [B, padded_L] and trim to [B, L]
         masked_indices = block_masked.view(B, padded_L)[:, :L]

@@ -108,9 +108,16 @@ lr_scheduler:
   lr_decay_style: constant
 
 wandb:
+  enable: false
   project: huiyingl_workspace
   entity: Nemo-automodel
   name: qwen3_6_27b_medpix_cp1_2k_2node_100steps
   group: qwen3_6_27b_medpix_dense_cp_parity_2k_2node_100steps
   tags: [qwen3.6-27b, medpix, dense, cp1, 2k, 2node, parity]
   dir: logs/qwen3_6_27b_medpix_cp1_2k_2node_100steps/wandb
+
+ci:
+  recipe_owner: HuiyingLi
+  nodes: 2
+  time: "00:30:00"
+  max_steps: 10

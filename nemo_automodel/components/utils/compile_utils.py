@@ -168,6 +168,56 @@ def apply_flash_attention_compile_fix():
     return success
 
 
+def _resolve_compile_kwargs(config: CompileConfig) -> Dict[str, Any]:
+    """Translate a CompileConfig into torch.compile keyword arguments.
+
+    ``torch.compile`` is keyword-only, rejects unknown kwargs, and treats
+    ``mode`` and ``options`` as mutually exclusive -- inductor options must go
+    through the ``options`` dict, not be flattened into the call. A non-empty
+    ``CompileConfig.options`` therefore replaces ``mode``, and combining
+    options with a non-default mode is an explicit error.
+    """
+    options_dict = config.options.to_dict() if hasattr(config.options, "to_dict") else dict(config.options)
+    compile_kwargs: Dict[str, Any] = {
+        "fullgraph": config.fullgraph,
+        "dynamic": config.dynamic,
+    }
+    if options_dict:
+        if config.mode and config.mode != "default":
+            raise ValueError(
+                "CompileConfig.mode and CompileConfig.options are mutually exclusive in torch.compile; set only one."
+            )
+        compile_kwargs["options"] = options_dict
+    else:
+        compile_kwargs["mode"] = config.mode
+    if config.backend is not None:
+        compile_kwargs["backend"] = config.backend
+    return compile_kwargs
+
+
+def compile_module_inplace(module: nn.Module, config: CompileConfig) -> None:
+    """In-place variant of ``compile_model`` using ``nn.Module.compile()``.
+
+    Keeps the module object identity and state-dict keys unchanged (no
+    ``OptimizedModule`` wrapper, no ``_orig_mod.`` key prefix), for callers
+    that track the module by reference or save its state dict directly.
+    Compilation is lazy: errors surface at the first forward, as with
+    ``torch.compile``.
+    """
+    if not config.enabled:
+        logger.info("torch.compile is disabled")
+        return
+
+    configure_torch_dynamo(cache_size_limit=config.dynamo_cache_size_limit)
+    apply_flash_attention_compile_fix()
+
+    compile_kwargs = _resolve_compile_kwargs(config)
+    logger.info(
+        f"Compiling module in place with backend={config.backend}, mode={config.mode}, dynamic={config.dynamic}"
+    )
+    module.compile(**compile_kwargs)
+
+
 def compile_model(model: nn.Module, config: CompileConfig) -> nn.Module:
     """Compile the model with Flash Attention compatibility.
 
@@ -188,16 +238,7 @@ def compile_model(model: nn.Module, config: CompileConfig) -> nn.Module:
     # Apply Flash Attention compatibility fix
     apply_flash_attention_compile_fix()
 
-    # Prepare torch.compile arguments
-    options_dict = config.options.to_dict() if hasattr(config.options, "to_dict") else dict(config.options)
-    compile_kwargs = {
-        "mode": config.mode,
-        "fullgraph": config.fullgraph,
-        "dynamic": config.dynamic,
-    }
-    if config.backend is not None:
-        compile_kwargs["backend"] = config.backend
-    compile_kwargs.update(options_dict)
+    compile_kwargs = _resolve_compile_kwargs(config)
 
     logger.info(f"Compiling model with backend={config.backend}, mode={config.mode}, dynamic={config.dynamic}")
 

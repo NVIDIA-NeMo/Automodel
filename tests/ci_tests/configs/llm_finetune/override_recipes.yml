@@ -12,12 +12,64 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Models deprecated for 26.10 removal — skipped in release (auto-discover) scope.
 exempt_models:
+  - agent
+  - baichuan
+  - cohere
+  - gemma
+  - granite
+  - olmo
+  - phi
+  - seed
+  - starcoder
 
 exempt_configs:
-  llama3_2_1b_hellaswag_megatron_fsdp:
-    reason: "Known issue megatron fsdp support,PIC: @akoumparouli, 3680"
-  llama3_2_1b_squad_megatron_fsdp:
-    reason: "Known issue megatron fsdp support,PIC: @akoumparouli, 3680"
+  falcon3_7b_instruct_hellaswag_fp8:
+    reason: "Deprecated for 26.10 (Falcon 3)"
+  falcon3_7b_instruct_squad:
+    reason: "Deprecated for 26.10 (Falcon 3)"
+  falcon3_7b_instruct_squad_peft:
+    reason: "Deprecated for 26.10 (Falcon 3)"
+  glm_4.5_air_te_deepep:
+    reason: "Deprecated for 26.10 (GLM-4.5 MoE)"
+  glm_4_9b_chat_hf_hellaswag_fp8:
+    reason: "Deprecated for 26.10 (GLM-4)"
+  glm_4_9b_chat_hf_squad:
+    reason: "Deprecated for 26.10 (GLM-4)"
+  mistral_7b_hellaswag_fp8:
+    reason: "Deprecated for 26.10 (Mistral 7B)"
+  mistral_7b_squad:
+    reason: "Deprecated for 26.10 (Mistral 7B)"
+  mistral_7b_squad_peft:
+    reason: "Deprecated for 26.10 (Mistral 7B)"
+  mistral_nemo_2407_hellaswag_fp8:
+    reason: "Deprecated for 26.10 (Mistral NeMo)"
+  mistral_nemo_2407_squad:
+    reason: "Deprecated for 26.10 (Mistral NeMo)"
+  mistral_nemo_2407_squad_peft:
+    reason: "Deprecated for 26.10 (Mistral NeMo)"
+  mixtral-8x7b-v0-1_squad:
+    reason: "Deprecated for 26.10 (Mixtral)"
+  mixtral-8x7b-v0-1_squad_peft:
+    reason: "Deprecated for 26.10 (Mixtral)"
+  mixtral_8x7b_instruct_squad_peft:
+    reason: "Deprecated for 26.10 (Mixtral)"
+  qwen2_5_0p5b_instruct_fineproofs_chat:
+    reason: "Deprecated for 26.10 (Qwen2.5)"
+  qwen2_5_32b_peft_benchmark:
+    reason: "Deprecated for 26.10 (Qwen2.5)"
+  qwen2_5_7b_hellaswag_fp8:
+    reason: "Deprecated for 26.10 (Qwen2.5)"
+  qwen2_5_7b_instruct_chat:
+    reason: "Deprecated for 26.10 (Qwen2.5)"
+  qwen2_5_7b_squad:
+    reason: "Deprecated for 26.10 (Qwen2.5)"
+  qwen2_5_7b_squad_muon:
+    reason: "Deprecated for 26.10 (Qwen2.5)"
+  qwen2_5_7b_squad_peft:
+    reason: "Deprecated for 26.10 (Qwen2.5)"
+  qwen25_magi_prefix_tree_rollouts:
+    reason: "Deprecated for 26.10 (Qwen2.5)"
 
 known_issue:

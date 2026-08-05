@@ -12,47 +12,38 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Numerical parity: native diffusion_gemma vs the transformers 5.8 fork.
+"""Numerical parity: native DiffusionGemma vs the Transformers reference.
 
-Builds a TINY random-config model both ways, loads the fork's weights into the
+Builds a tiny random-config model both ways, loads the reference weights into the
 native model via the state-dict adapter, and asserts that:
 
 1. ``from_hf`` -> ``to_hf`` round-trips the checkpoint keys/values exactly.
 2. The native shared stack (causal encoder pass + bidirectional canvas decode)
-   reproduces the fork's ``DiffusionGemmaForBlockDiffusion.forward`` logits
+   reproduces the reference ``DiffusionGemmaForBlockDiffusion.forward`` logits
    within fp32 tolerance.
 
 The native *training* forward uses a block-causal mask; here we drive the
-native ``encode``/``decode`` building blocks with the fork's **inference** mask
+native ``encode``/``decode`` building blocks with the reference **inference** mask
 (fully bidirectional canvas, causal encoder) so the comparison is apples to
 apples. The block-causal training mask is covered by
 ``test_diffusion_gemma_mask.py``.
 
-Requires the fork (``transformers.models.diffusion_gemma``), which lives only
-in the pinned 5.8-dev wheel; the whole module is skipped otherwise so it does
-not break collection on a stock-transformers environment.
+``diffusion_gemma`` is multimodal; the reference is built with a tiny throwaway
+vision tower (see ``_tiny_vision_config_dict``) and compared on the text path
+only.
 """
 
-import importlib.util
 import re
 
-import pytest
 import torch
-
-_FORK_AVAILABLE = importlib.util.find_spec("transformers.models.diffusion_gemma") is not None
-
-pytestmark = pytest.mark.skipif(
-    not _FORK_AVAILABLE,
-    reason="transformers.models.diffusion_gemma (5.8-dev fork) not available",
-)
 
 
 def _tiny_text_config_dict() -> dict:
-    """Tiny text-config shared by the fork and native configs.
+    """Tiny text config shared by the reference and native models.
 
     2 layers (one sliding, one full), hidden 64, 4 experts, canvas 8. The
     sliding window is larger than any sequence here so sliding == full
-    attention, matching the fork's eager no-padding inference path (which does
+    attention, matching the reference's eager no-padding inference path (which does
     not truncate by window in eager mode).
     """
     return dict(
@@ -80,13 +71,37 @@ def _tiny_text_config_dict() -> dict:
     )
 
 
-def _build_fork_model(text_cfg: dict):
+def _tiny_vision_config_dict() -> dict:
+    """Tiny ``gemma4_vision`` config so the multimodal reference can be built.
+
+    ``diffusion_gemma`` is a multimodal architecture, and the supported
+    Transformers implementation unconditionally constructs its vision tower.
+    Hand it a *tiny* tower: it is built but never exercised -- both models are
+    compared on the text path only (no ``pixel_values``), the native model ignores
+    ``vision_config`` entirely, and the adapter drops all ``model.encoder.*``
+    (vision) weights -- so it cannot perturb the comparison.
+    """
+    return dict(
+        model_type="gemma4_vision",
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        head_dim=16,
+        patch_size=16,
+        position_embedding_size=64,
+        pooling_kernel_size=1,
+    )
+
+
+def _build_hf_model(text_cfg: dict):
     from transformers.models.diffusion_gemma.configuration_diffusion_gemma import DiffusionGemmaConfig
     from transformers.models.diffusion_gemma.modeling_diffusion_gemma import (
         DiffusionGemmaForBlockDiffusion,
     )
 
-    config = DiffusionGemmaConfig(text_config=dict(text_cfg), vision_config=None, canvas_length=8)
+    config = DiffusionGemmaConfig(text_config=dict(text_cfg), vision_config=_tiny_vision_config_dict(), canvas_length=8)
     config._attn_implementation = "eager"
     model = DiffusionGemmaForBlockDiffusion(config).to(torch.float32).eval()
     return model, config
@@ -98,9 +113,9 @@ def _build_native_model(text_cfg: dict):
     from nemo_automodel.components.models.common import BackendConfig
     from nemo_automodel.components.models.diffusion_gemma.model import DiffusionGemmaForBlockDiffusion
 
-    # The native model now reuses the fork's config; self_conditioning/freeze_router are
+    # The native model reuses the HF config; self_conditioning/freeze_router are
     # model-construction flags (not strict config fields), so pass them to the model.
-    config = DiffusionGemmaConfig(text_config=dict(text_cfg), vision_config=None, canvas_length=8)
+    config = DiffusionGemmaConfig(text_config=dict(text_cfg), vision_config=_tiny_vision_config_dict(), canvas_length=8)
     backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch_fp32", enable_hf_state_dict_adapter=True)
     model = (
         DiffusionGemmaForBlockDiffusion(config, backend=backend, self_conditioning=True, freeze_router=False)
@@ -111,12 +126,12 @@ def _build_native_model(text_cfg: dict):
 
 
 def test_state_dict_adapter_round_trip():
-    """``from_hf`` -> ``to_hf`` preserves the fork checkpoint keys and values."""
+    """``from_hf`` -> ``to_hf`` preserves the HF checkpoint keys and values."""
     text_cfg = _tiny_text_config_dict()
-    fork_model, _ = _build_fork_model(text_cfg)
+    hf_model, _ = _build_hf_model(text_cfg)
     native_model, _ = _build_native_model(text_cfg)
 
-    hf_sd = {k: v.clone() for k, v in fork_model.state_dict().items()}
+    hf_sd = {k: v.clone() for k, v in hf_model.state_dict().items()}
     adapter = native_model.state_dict_adapter
     # The adapter casts converted weights to its dtype (the ckpt's bf16 in real
     # use, which is correct). Here the reference models are fp32, so run the
@@ -127,7 +142,7 @@ def test_state_dict_adapter_round_trip():
     native_sd = adapter.from_hf(hf_sd)
     roundtrip = adapter.to_hf(native_sd)
 
-    # The fork ships encoder layer_scalar duplicates (tied) and a tied lm_head;
+    # The HF model ships encoder layer_scalar duplicates (tied) and a tied lm_head;
     # those are reconstructed/dropped, so compare on the decoder weights that
     # carry the actual parameters.
     hf_keys = {k for k in hf_sd if k.startswith("model.decoder.")}
@@ -155,17 +170,17 @@ def test_state_dict_adapter_round_trip():
             assert max_diff < 1e-5, f"round-trip mismatch for {key}: max_diff={max_diff}"
 
 
-def test_forward_parity_with_fork():
-    """Native encode+decode logits match the fork's forward within fp32 tol."""
+def test_forward_parity_with_hf():
+    """Native encode+decode logits match the HF forward within fp32 tolerance."""
     torch.manual_seed(0)
     text_cfg = _tiny_text_config_dict()
-    fork_model, fork_config = _build_fork_model(text_cfg)
+    hf_model, _ = _build_hf_model(text_cfg)
     native_model, _ = _build_native_model(text_cfg)
 
-    # Load fork weights into the native model. Run the adapter in fp32 so loaded
+    # Load HF weights into the native model. Run the adapter in fp32 so loaded
     # weights aren't bf16-rounded (the reference + native models are both fp32).
     native_model.state_dict_adapter.dtype = torch.float32
-    native_sd = native_model.state_dict_adapter.from_hf({k: v.clone() for k, v in fork_model.state_dict().items()})
+    native_sd = native_model.state_dict_adapter.from_hf({k: v.clone() for k, v in hf_model.state_dict().items()})
     missing, unexpected = native_model.load_state_dict(native_sd, strict=False)
     # Only non-persistent buffers (embed_scale, rope inv_freq, root_size) may be
     # "missing"; no parameter should be missing or unexpected.
@@ -179,10 +194,14 @@ def test_forward_parity_with_fork():
     canvas_ids = torch.randint(0, vocab, (batch_size, canvas_len))
 
     with torch.no_grad():
-        fork_out = fork_model(input_ids=input_ids, canvas_ids=canvas_ids, self_conditioning_logits=None)
-        fork_logits = fork_out.logits
+        hf_out = hf_model(
+            input_ids=input_ids,
+            decoder_input_ids=canvas_ids,
+            self_conditioning_logits=None,
+        )
+        hf_logits = hf_out.logits
 
-        # Native: drive the building blocks with the fork's inference mask
+        # Native: drive the building blocks with the reference inference mask
         # (causal encoder built inside ``encode``; fully-bidirectional canvas
         # = all-zero additive mask). Canvas positions continue after the prompt.
         encoder_position_ids = torch.arange(prompt_len).unsqueeze(0).expand(batch_size, -1)
@@ -200,10 +219,10 @@ def test_forward_parity_with_fork():
         )
         native_logits = native_model._softcap_logits(hidden)
 
-    assert native_logits.shape == fork_logits.shape
-    max_diff = (native_logits - fork_logits).abs().max().item()
+    assert native_logits.shape == hf_logits.shape
+    max_diff = (native_logits - hf_logits).abs().max().item()
     cos = torch.nn.functional.cosine_similarity(
-        native_logits.flatten().float(), fork_logits.flatten().float(), dim=0
+        native_logits.flatten().float(), hf_logits.flatten().float(), dim=0
     ).item()
     # Cosine similarity is the robust structural-parity gate (a real architectural
     # bug tanks it); keep it strict. The max-abs on softcapped logits (|.|<=30) is

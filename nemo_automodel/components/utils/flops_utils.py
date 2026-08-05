@@ -837,7 +837,9 @@ def gpt_oss_flops(config, gbs=1, seq_len=None):
         config.moe_ffn_hidden_size if hasattr(config, "moe_ffn_hidden_size") else config.intermediate_size
     )
     moe_router_topk = config.num_experts_per_tok
-    kv_channels = config.kv_channels if hasattr(config, "kv_channels") else (hidden_size // num_attention_heads)
+    kv_channels = getattr(config, "head_dim", None)
+    if kv_channels is None:
+        kv_channels = getattr(config, "kv_channels", hidden_size // num_attention_heads)
     swa_window_size = config.window_size[0] if hasattr(config, "window_size") and config.window_size else 128
     window_attn_skip_freq = config.window_attn_skip_freq if hasattr(config, "window_attn_skip_freq") else 2
 

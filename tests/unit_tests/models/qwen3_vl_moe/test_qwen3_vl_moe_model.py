@@ -132,21 +132,35 @@ def vl_config(text_config):
 class TestFp32SafeRotaryEmbeddings:
     def test_text_rotary_inv_freq_remains_fp32(self, text_config):
         rotary = Fp32SafeQwen3VLMoeTextRotaryEmbedding(config=text_config)
-        original = rotary.inv_freq.clone()
+        originals = {
+            name: buf.detach().clone()
+            for name, buf in rotary.named_buffers(recurse=False)
+            if name in ("inv_freq", "original_inv_freq")
+        }
 
         rotary = rotary.to(torch.float16)
 
-        assert rotary.inv_freq.dtype == torch.float32
-        torch.testing.assert_close(rotary.inv_freq.float(), original.float())
+        assert originals
+        for name, original in originals.items():
+            buf = getattr(rotary, name)
+            assert buf.dtype == torch.float32
+            torch.testing.assert_close(buf.float(), original.float())
 
     def test_vision_rotary_inv_freq_remains_fp32(self):
         rotary = Fp32SafeQwen3VLMoeVisionRotaryEmbedding(dim=16)
-        original = rotary.inv_freq.clone()
+        originals = {
+            name: buf.detach().clone()
+            for name, buf in rotary.named_buffers(recurse=False)
+            if name in ("inv_freq", "original_inv_freq")
+        }
 
         rotary = rotary.to(torch.float16)
 
-        assert rotary.inv_freq.dtype == torch.float32
-        torch.testing.assert_close(rotary.inv_freq.float(), original.float())
+        assert originals
+        for name, original in originals.items():
+            buf = getattr(rotary, name)
+            assert buf.dtype == torch.float32
+            torch.testing.assert_close(buf.float(), original.float())
 
 
 @_requires_cuda
@@ -861,16 +875,15 @@ class TestQwen3VLMoeForConditionalGenerationPPGuard:
 
 @_requires_cuda
 class TestQwen3VLMoeFromPretrainedAndModelClass:
-    def test_from_pretrained_classmethod(self):
-        cfg = Qwen3VLMoeConfig()
-        cfg.text_config.rope_parameters = {
-            "rope_theta": 10000.0,
-            "rope_type": "default",
-            "mrope_section": [1, 1, 1],
-            "partial_rotary_factor": 1.0,
-        }
-        # Add pad_token_id required by transformers v5
-        cfg.text_config.pad_token_id = 0
+    def test_from_pretrained_classmethod(self, vl_config):
+        # Use the tiny `vl_config` fixture instead of the default ``Qwen3VLMoeConfig()``,
+        # which describes the full model (24 layers, 60 experts, 151K vocab) and takes
+        # ~100s to materialize on GPU. The classmethod's delegation behaviour is
+        # independent of model size.
+        # `vl_config` already carries a valid tiny rope/pad setup (it is the same
+        # config every other test in this module builds and runs forward with), so no
+        # extra rope_parameters/pad_token_id massaging is required here.
+        cfg = vl_config
 
         with (
             patch(

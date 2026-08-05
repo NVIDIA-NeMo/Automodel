@@ -18,23 +18,9 @@
 ``{type}_inv_freq`` fp32 buffers. ``initialize_weights(dtype=torch.bfloat16)`` casts
 the model to bf16 via ``cast_model_to_dtype``; the model lists ``"rotary_emb"`` in
 ``_keep_in_fp32_modules`` so those buffers are restored to fp32. Runs on CPU.
-
-Skipped unless the ``transformers.models.diffusion_gemma`` fork is importable (it
-ships in the NGC container, not on PyPI), matching the other diffusion_gemma tests.
 """
 
-import importlib.util
-
-import pytest
 import torch
-
-_FORK_AVAILABLE = importlib.util.find_spec("transformers.models.diffusion_gemma") is not None
-_GEMMA4_AVAILABLE = importlib.util.find_spec("transformers.models.gemma4") is not None
-
-pytestmark = pytest.mark.skipif(
-    not (_FORK_AVAILABLE and _GEMMA4_AVAILABLE),
-    reason="requires the transformers diffusion_gemma fork (NGC container only)",
-)
 
 
 def _tiny_text_config_dict():

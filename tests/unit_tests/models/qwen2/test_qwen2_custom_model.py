@@ -13,6 +13,8 @@
 # limitations under the License.
 
 
+from unittest.mock import patch
+
 import numpy as np
 import pytest
 import torch
@@ -20,6 +22,7 @@ from transformers import AutoModelForCausalLM, Qwen2Config, set_seed
 
 from nemo_automodel import NeMoAutoModelForCausalLM
 from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.qwen2.model import Qwen2Attention
 from nemo_automodel.components.models.qwen2.state_dict_adapter import Qwen2StateDictAdapter
 
 set_seed(42)
@@ -38,6 +41,18 @@ TINY_DEFAULT_QWEN2_CONFIG = dict(
     rms_norm_eps=1e-5,
     tie_word_embeddings=True,
 )
+
+
+def test_quack_rope_reports_missing_dependency():
+    config = Qwen2Config(**TINY_DEFAULT_QWEN2_CONFIG)
+    with (
+        patch(
+            "nemo_automodel.components.models.qwen2.model.safe_import_from",
+            return_value=(False, None),
+        ),
+        pytest.raises(ImportError, match="quack-kernels"),
+    ):
+        Qwen2Attention(config, layer_idx=0, backend=BackendConfig(rope="quack"))
 
 
 def _create_checkpoint(config_kwargs, tmpdir):

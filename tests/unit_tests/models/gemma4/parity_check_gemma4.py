@@ -164,8 +164,10 @@ def main() -> None:
     print(f"  NeMo forward qualname : {nemo_fwd.__qualname__}")
     print(f"  NeMo forward module   : {getattr(nemo_fwd, '__module__', 'unknown')}")
     # Check top-level model and language_model forward
-    for name, submod in [("language_model", getattr(nemo_model, "language_model", None)),
-                          ("model",          getattr(nemo_model, "model", None))]:
+    for name, submod in [
+        ("language_model", getattr(nemo_model, "language_model", None)),
+        ("model", getattr(nemo_model, "model", None)),
+    ]:
         if submod is None:
             continue
         sf = getattr(submod.forward, "__func__", submod.forward)
@@ -182,14 +184,16 @@ def main() -> None:
     nemo_logits = _run_forward(nemo_model, input_ids)
 
     # Diagnose: which language model backend does NeMo use?
-    hf_lm  = getattr(getattr(hf_model,   "model", None), "language_model", None)
+    hf_lm = getattr(getattr(hf_model, "model", None), "language_model", None)
     nemo_lm = getattr(getattr(nemo_model, "model", None), "language_model", None)
     if hf_lm is not None and nemo_lm is not None:
-        hf_lm_fwd   = getattr(hf_lm.forward,   "__func__", hf_lm.forward)
-        nemo_lm_fwd = getattr(nemo_lm.forward,  "__func__", nemo_lm.forward)
+        hf_lm_fwd = getattr(hf_lm.forward, "__func__", hf_lm.forward)
+        nemo_lm_fwd = getattr(nemo_lm.forward, "__func__", nemo_lm.forward)
         print(f"  HF   language_model class : {type(hf_lm).__name__}")
-        print(f"  NeMo language_model class : {type(nemo_lm).__name__}  "
-              f"(module={getattr(nemo_lm_fwd, '__module__', '?')})")
+        print(
+            f"  NeMo language_model class : {type(nemo_lm).__name__}  "
+            f"(module={getattr(nemo_lm_fwd, '__module__', '?')})"
+        )
         print(f"  Same language_model code  : {hf_lm_fwd.__code__ is nemo_lm_fwd.__code__}")
 
         # Level-2 parity: compare text backbone outputs directly. Gemma4 needs

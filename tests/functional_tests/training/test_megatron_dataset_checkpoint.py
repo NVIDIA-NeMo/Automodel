@@ -22,7 +22,8 @@ from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, Che
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config
-from nemo_automodel.recipes.llm.train_ft import build_dataloader
+from nemo_automodel.recipes._typed_config import RecipeConfig
+from nemo_automodel.recipes.llm.train_ft import _build_tokenizer
 
 """
 This test is to make sure that JSONL dataset can be checkpointed and loaded correctly.
@@ -61,20 +62,23 @@ def test_megatron_dataset_checkpointing():
         pp_rank=pp_rank,
     )
 
-    dataset = build_dataloader(
-        cfg_ds=cfg.dataset,
-        cfg_dl=cfg.dataloader,
-        cfg_model=cfg.model,
-        cfg_ps={},
-        seed=42,
-        local_batch_size=2,
-        global_batch_size=4,
-        max_steps=None,
-        val_check_interval=10,
-        dp_rank=dp_rank,
-        dp_world_size=dp_world_size,
-        pp_enabled=False,
-    )[0]
+    # Override the example config's batch sizes / schedule with the small values this test needs.
+    schedule_overrides = {
+        "local_batch_size": 2,
+        "global_batch_size": 4,
+        "max_steps": None,
+        "val_every_steps": 10,
+    }
+    for key, value in schedule_overrides.items():
+        if not hasattr(cfg.step_scheduler, key):
+            raise ValueError(f"step_scheduler config has no field {key!r}")
+        setattr(cfg.step_scheduler, key, value)
+    # Megatron datasets require a tokenizer; the recipe supplies it via runtime (build(tokenizer=...)),
+    # so build it here the same way (from the dataset/model config) instead of relying on the default.
+    _, tokenizer = _build_tokenizer(cfg.model, cfg.dataset)
+    dataset = RecipeConfig(cfg).dataloader.build(
+        dp_rank=dp_rank, dp_world_size=dp_world_size, pp_enabled=False, tokenizer=tokenizer
+    )
 
     # fast-forward. not necessary, but we want to make sure the dataset is not at the beginning.
     for i, batch in enumerate(dataset):
@@ -101,20 +105,9 @@ def test_megatron_dataset_checkpointing():
         assert os.access(path, os.R_OK), f"Expected {path} to be readable"
         assert path.stat().st_size > 0, f"Expected {path} to be non-empty"
 
-    dataset = build_dataloader(
-        cfg_ds=cfg.dataset,
-        cfg_dl=cfg.dataloader,
-        cfg_model=cfg.model,
-        cfg_ps={},
-        seed=42,
-        local_batch_size=2,
-        global_batch_size=4,
-        max_steps=None,
-        val_check_interval=10,
-        dp_rank=dp_rank,
-        dp_world_size=dp_world_size,
-        pp_enabled=False,
-    )[0]
+    dataset = RecipeConfig(cfg).dataloader.build(
+        dp_rank=dp_rank, dp_world_size=dp_world_size, pp_enabled=False, tokenizer=tokenizer
+    )
 
     initial_batch = next(iter(dataset))
     for k in ["input_ids", "labels"]:

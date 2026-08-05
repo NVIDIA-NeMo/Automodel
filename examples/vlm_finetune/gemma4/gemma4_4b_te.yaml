@@ -111,4 +111,5 @@ freeze_config:
 #   name: <your-run-name>
 
 ci:
+  time: "00:15:00"
   recipe_owner: khazic

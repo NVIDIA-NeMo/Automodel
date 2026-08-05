@@ -72,9 +72,24 @@ def _infer_vocab_size(model_cfg):
         model_config = config_cls.from_pretrained(config_section.pretrained_model_name_or_path)
 
     if model_config is None:
-        model_config = AutoConfig.from_pretrained(
-            config_section.pretrained_model_name_or_path, trust_remote_code=trust_remote_code
-        )
+        try:
+            model_config = AutoConfig.from_pretrained(
+                config_section.pretrained_model_name_or_path, trust_remote_code=trust_remote_code
+            )
+        except Exception as exc:
+            # Step-3.5 publishes MTP layer metadata in ``layer_types`` in addition
+            # to its transformer-layer count.  Newer Transformers validates those
+            # lengths while loading a config even though benchmark setup only needs
+            # ``vocab_size``.  Reuse the tokenizer compatibility patch, then retry.
+            message = str(exc)
+            if "num_hidden_layers" not in message or "layer_types" not in message:
+                raise
+            from nemo_automodel._transformers.v4_patches.layer_types import relax_layer_types_validator
+
+            relax_layer_types_validator()
+            model_config = AutoConfig.from_pretrained(
+                config_section.pretrained_model_name_or_path, trust_remote_code=trust_remote_code
+            )
 
     if hasattr(model_config, "vocab_size"):
         return model_config.vocab_size
@@ -240,14 +255,24 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
             if mtp_cfg is None or not getattr(mtp_cfg, "enabled", False) or layers is None:
                 continue
             block_types = [getattr(s, "block_type", "moe") for s in layers]
-            flops = _nemotronh_mtp_flops(
-                mp.config,
-                global_batch_size,
-                seq_len,
-                mtp_cfg.num_layers,
-                block_types,
-                mtp_cfg.use_repeated_layer,
-            )
+            try:
+                flops = _nemotronh_mtp_flops(
+                    mp.config,
+                    global_batch_size,
+                    seq_len,
+                    mtp_cfg.num_layers,
+                    block_types,
+                    mtp_cfg.use_repeated_layer,
+                )
+            except AttributeError as exc:
+                if self.dist_env.is_main:
+                    logger.warning(
+                        "Skipping MTP head FLOPs for %s because the Nemotron-H FLOPs formula "
+                        "does not support this config: %s",
+                        type(mp.config).__name__,
+                        exc,
+                    )
+                continue
             if self.dist_env.is_main:
                 logger.info(
                     f"MTP head FLOPs: N={mtp_cfg.num_layers} repeated={mtp_cfg.use_repeated_layer} "
@@ -302,7 +327,9 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
             if i == nsys_start and rank in nsys_ranks:
                 logger.info(f"Rank {rank} | Starting nsys profiling")
                 torch.cuda.cudart().cudaProfilerStart()
-                torch.autograd.profiler.emit_nvtx(record_shapes=True).__enter__()
+                # Per-microbatch NVTX ranges below already delimit the work.
+                # Entering emit_nvtx() without closing it leaks RecordFunction
+                # callbacks into later DTensor/FSDP operations.
 
             if rank == 0:
                 logger.info(f"Rank {rank} | Iteration {i}")
@@ -351,6 +378,12 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                         opt.step()
                     logger.debug("Optimizer step")
 
+            # Match the training-loop lifecycle: record one complete eager
+            # optimizer step, then capture outside the measured iteration.
+            if self.partial_cuda_graph_manager is not None and self._partial_cuda_graph_capture_pending:
+                self.partial_cuda_graph_manager.capture()
+                self._partial_cuda_graph_capture_pending = False
+
             # Synchronize num_label_tokens across DP ranks
             num_label_tokens_tensor = torch.tensor(num_label_tokens, dtype=torch.long, device=device)
             num_label_tokens_tensor = self._dp_allreduce(num_label_tokens_tensor)
@@ -394,6 +427,9 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                 torch.cuda.cudart().cudaProfilerStop()
 
             self._maybe_collect_garbage()
+
+        if self.partial_cuda_graph_manager is not None:
+            self.partial_cuda_graph_manager.log_stats("benchmark")
 
         # Final summary
         self._log_benchmark_summary(steps, warmup_steps, peak_tflops, rank)
@@ -566,8 +602,13 @@ def main(config_path=None):
 
     cfg = parse_args_and_load_config(config_path)
     recipe = BenchmarkingRecipeForNextTokenPrediction(cfg)
-    recipe.setup()
-    recipe.run_benchmark()
+    try:
+        recipe.setup()
+        recipe.run_benchmark()
+    finally:
+        if recipe.partial_cuda_graph_manager is not None:
+            recipe.partial_cuda_graph_manager.close()
+            recipe.partial_cuda_graph_manager = None
 
 
 if __name__ == "__main__":

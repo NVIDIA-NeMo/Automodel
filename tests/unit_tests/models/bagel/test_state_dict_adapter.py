@@ -49,3 +49,17 @@ def test_bagel_adapter_unroots_am_keys_when_saving():
 
     assert set(converted) == {"language_model.model.embed_tokens.weight"}
     assert converted["language_model.model.embed_tokens.weight"] is weight
+
+
+def test_bagel_adapter_drops_te_extra_state():
+    adapter = BagelStateDictAdapter(stage="stage1")
+
+    converted = adapter.from_hf(
+        {
+            "language_model.model.embed_tokens.weight": torch.ones(2, 2),
+            "language_model.model.layers.0.self_attn.q_proj._extra_state": torch.zeros(1),
+        }
+    )
+
+    assert set(converted) == {"model.language_model.model.embed_tokens.weight"}
+    assert adapter.convert_single_tensor_to_hf("model.layer._extra_state", torch.zeros(1)) == []

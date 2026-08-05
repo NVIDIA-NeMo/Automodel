@@ -213,12 +213,12 @@ For cross-repo references (yaml configs, Python source), use absolute GitHub URL
 ## Validate
 
 ```bash
-make docs-check          # `fern check` — config + MDX validation
+make docs-check          # MDX syntax validation + `fern check`
 ```
 
 Run from `docs/fern/` (`cd docs/fern && make docs-check`) or anywhere with `make -C docs/fern docs-check`.
 
-`fern check` must pass before commit. The dev server's broken-link warnings for version-prefixed routes (e.g. `/latest/get-started/installation` from MDX that uses `/get-started/installation`) are **false positives** — Fern's strict validator doesn't resolve version-agnostic links. The published site renders them correctly. The URLMap-based `validate_fern_internal_links.py` (under the convert-to-fern toolkit) is authoritative.
+`make docs-check` must pass before commit. It runs a no-secret MDX parser before `fern check`, so raw HTML must be valid JSX (for example, use `<img ... />`, not `<img ...>`). The dev server's broken-link warnings for version-prefixed routes (e.g. `/latest/get-started/installation` from MDX that uses `/get-started/installation`) are **false positives** — Fern's strict validator doesn't resolve version-agnostic links. The published site renders them correctly. The URLMap-based `validate_fern_internal_links.py` (under the convert-to-fern toolkit) is authoritative.
 
 To regenerate the autodoc library reference (gitignored under `docs/fern/product-docs/`):
 
@@ -244,7 +244,7 @@ backward-version pages (the `docs-archive` branch) into the working copy — the
 trees are not on `main`.
 
 ```
-                    ┌─ fern-docs-ci.yml                  → stitch → fern check (push to pull-request/<n>)
+                    ┌─ fern-docs-ci.yml                  → stitch → MDX syntax → fern check (push to pull-request/<n>)
 PR (touches docs/) ─┼─ fern-docs-preview-build.yml       → stitch → upload docs/ artifact (no secrets)
                     └─ fern-docs-preview-comment.yml     → 🌿 preview URL comment (consumes artifact)
 

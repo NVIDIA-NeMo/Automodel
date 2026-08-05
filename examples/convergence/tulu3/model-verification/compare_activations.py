@@ -123,7 +123,7 @@ def run_hf_extraction(model_path: str, prompts: list[str], prompts_file: str | N
             logger.error("HF extraction exited with code %d", result.returncode)
             sys.exit(1)
 
-        return torch.load(output_file, map_location="cpu", weights_only=False)
+        return torch.load(output_file, map_location="cpu", weights_only=True)
 
 
 def run_nemo_extraction(
@@ -180,7 +180,7 @@ def run_nemo_extraction(
             logger.error("NeMo torchrun exited with code %d", result.returncode)
             sys.exit(1)
 
-        return torch.load(output_file, map_location="cpu", weights_only=False)
+        return torch.load(output_file, map_location="cpu", weights_only=True)
 
 
 def compare_and_report(

@@ -18,6 +18,9 @@ set -euo pipefail
 #   CONFIG_PATH, TEST_LEVEL, NPROC_PER_NODE, TEST_NODE_COUNT,
 #   MASTER_ADDR, MASTER_PORT, SLURM_JOB_ID, PIPELINE_DIR, TEST_NAME
 
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+source "$SCRIPT_DIR/diffusion_finetune_recipe_config.sh"
+
 DATA_DIR="$PIPELINE_DIR/$TEST_NAME/data"
 CKPT_DIR="$PIPELINE_DIR/$TEST_NAME/checkpoint"
 INFER_DIR="$PIPELINE_DIR/$TEST_NAME/inference_output"
@@ -28,42 +31,7 @@ cd /opt/Automodel
 # Derive model-specific settings from config
 # ============================================
 RECIPE_NAME=$(basename "$CONFIG_PATH" .yaml)
-case "$RECIPE_NAME" in
-    wan2_1_t2v_flow*)
-        MEDIA_TYPE="video"
-        PROCESSOR="wan"
-        GENERATE_CONFIG="examples/diffusion/generate/configs/generate_wan.yaml"
-        MODEL_NAME="Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
-        INFER_NUM_FRAMES=9
-        PREPROCESS_EXTRA_ARGS=""
-        ;;
-    hunyuan_t2v_flow*)
-        MEDIA_TYPE="video"
-        PROCESSOR="hunyuan"
-        GENERATE_CONFIG="examples/diffusion/generate/configs/generate_hunyuan.yaml"
-        MODEL_NAME="hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v"
-        INFER_NUM_FRAMES=5
-        PREPROCESS_EXTRA_ARGS="--target_frames 13"
-        ;;
-    flux_t2i_flow*)
-        MEDIA_TYPE="image"
-        PROCESSOR="flux"
-        GENERATE_CONFIG="examples/diffusion/generate/configs/generate_flux.yaml"
-        MODEL_NAME="black-forest-labs/FLUX.1-dev"
-        PREPROCESS_EXTRA_ARGS=""
-        ;;
-    qwen_image_t2i_flow*)
-        MEDIA_TYPE="image"
-        PROCESSOR="qwen_image"
-        GENERATE_CONFIG="examples/diffusion/generate/configs/generate_qwen_image.yaml"
-        MODEL_NAME="Qwen/Qwen-Image"
-        PREPROCESS_EXTRA_ARGS=""
-        ;;
-    *)
-        echo "ERROR: Unknown recipe '$RECIPE_NAME'. Add a case to diffusion_finetune_launcher.sh."
-        exit 1
-        ;;
-esac
+configure_diffusion_finetune_recipe "$RECIPE_NAME"
 
 # LoRA recipes are named *_lora.yaml — they save PEFT adapter artifacts
 # (adapter_model.safetensors + adapter_config.json) that generate.py loads via
@@ -73,6 +41,9 @@ if [[ "$RECIPE_NAME" == *_lora ]]; then
     IS_LORA=true
 fi
 echo "[config] Recipe=$RECIPE_NAME  MediaType=$MEDIA_TYPE  Processor=$PROCESSOR  Model=$MODEL_NAME  LoRA=$IS_LORA"
+
+# Video decodes via imageio-ffmpeg (opt-in diffusion-media extra, kept out of the image).
+DIFFUSION_EXTRAS="--extra diffusion --extra diffusion-media"
 
 # ============================================
 # Stage 1: Download dataset
@@ -86,7 +57,7 @@ echo "[data] Resolving dataset..."
 echo "============================================"
 if [ "$MEDIA_TYPE" = "image" ]; then
     RAW_DATA_DIR="$DATA_DIR/raw"
-    uv run --extra diffusion python -c "
+    uv run $DIFFUSION_EXTRAS python -c "
 from datasets import load_dataset
 from pathlib import Path
 import json
@@ -109,7 +80,7 @@ with open(jsonl_path, 'w') as jf:
 print(f'Extracted {len(ds)} images to {out_dir}')
 "
 else
-    RAW_DATA_DIR=$(uv run --extra diffusion python -c "
+    RAW_DATA_DIR=$(uv run $DIFFUSION_EXTRAS python -c "
 from huggingface_hub import snapshot_download
 print(snapshot_download('modal-labs/dissolve', repo_type='dataset'))
 " | tail -n 1)
@@ -123,13 +94,13 @@ echo "============================================"
 echo "[preprocess] Converting ${MEDIA_TYPE}s to latents..."
 echo "============================================"
 if [ "$MEDIA_TYPE" = "image" ]; then
-    uv run --extra diffusion python -m tools.diffusion.preprocessing_multiprocess image \
+    uv run $DIFFUSION_EXTRAS python -m tools.diffusion.preprocessing_multiprocess image \
         --image_dir "$RAW_DATA_DIR" \
         --output_dir "$DATA_DIR/cache" \
         --processor "$PROCESSOR" \
         $PREPROCESS_EXTRA_ARGS
 else
-    uv run --extra diffusion python -m tools.diffusion.preprocessing_multiprocess video \
+    uv run $DIFFUSION_EXTRAS python -m tools.diffusion.preprocessing_multiprocess video \
         --video_dir "$RAW_DATA_DIR" \
         --output_dir "$DATA_DIR/cache" \
         --processor "$PROCESSOR" \
@@ -153,6 +124,7 @@ if grep -qE '^ddp:' "/opt/Automodel/${CONFIG_PATH}"; then
 fi
 
 CONFIG="--config /opt/Automodel/${CONFIG_PATH} \
+    --model.pretrained_model_name_or_path $MODEL_NAME \
     --data.dataloader.cache_dir $DATA_DIR/cache \
     --checkpoint.checkpoint_dir $CKPT_DIR \
     --step_scheduler.max_steps ${MAX_STEPS:-100} \
@@ -161,7 +133,7 @@ CONFIG="--config /opt/Automodel/${CONFIG_PATH} \
     ${DIST_OVERRIDE} \
     --wandb.mode disabled"
 
-CMD="uv run --extra diffusion torchrun --nproc-per-node=${NPROC_PER_NODE} \
+CMD="uv run $DIFFUSION_EXTRAS torchrun --nproc-per-node=${NPROC_PER_NODE} \
               --nnodes=${TEST_NODE_COUNT} \
               --rdzv_backend=c10d \
               --rdzv_endpoint=${MASTER_ADDR}:${MASTER_PORT} \
@@ -190,7 +162,7 @@ else
 fi
 
 if [ "$MEDIA_TYPE" = "image" ]; then
-    uv run --extra diffusion python examples/diffusion/generate/generate.py \
+    uv run $DIFFUSION_EXTRAS python examples/diffusion/generate/generate.py \
         --config "$GENERATE_CONFIG" \
         --model.pretrained_model_name_or_path "$MODEL_NAME" \
         $CKPT_FLAG "$CKPT_STEP_DIR" \
@@ -206,7 +178,7 @@ if [ "$MEDIA_TYPE" = "image" ]; then
         exit 1
     fi
 else
-    uv run --extra diffusion python examples/diffusion/generate/generate.py \
+    uv run $DIFFUSION_EXTRAS python examples/diffusion/generate/generate.py \
         --config "$GENERATE_CONFIG" \
         --model.pretrained_model_name_or_path "$MODEL_NAME" \
         $CKPT_FLAG "$CKPT_STEP_DIR" \

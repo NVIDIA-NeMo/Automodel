@@ -26,6 +26,7 @@ To check without modifying files:
 ```bash
 ruff format --check .   # exits non-zero if any file would change
 ruff check .            # exits non-zero on lint violations
+bandit -r app.py nemo_automodel examples scripts tools tutorials -t B614
 ```
 
 To lint a single file or directory:
@@ -35,7 +36,7 @@ ruff format nemo_automodel/components/models/llama/model.py
 ruff check --fix nemo_automodel/components/models/llama/
 ```
 
-### What ruff enforces (from `pyproject.toml`)
+### What linting enforces (from `pyproject.toml`)
 
 | Rule | ID | Description |
 |---|---|---|
@@ -48,10 +49,11 @@ ruff check --fix nemo_automodel/components/models/llama/
 | Import sorting | I | isort-compatible ordering, auto-fixed |
 | Docstring convention | D101/D103 | Google style (currently ignored — selected then suppressed) |
 | No pickle | S301/S403 | Security: forbids `pickle.load` |
+| Restricted PyTorch load | B614 | Requires explicit `weights_only=True` for `torch.load` |
 | Ambiguous variable names | E741 | Error (e.g., `l`, `O`, `I`) |
 
-Tests (`tests/`) are excluded from lint checks. Docstring rules (`D`) are
-also relaxed in test files.
+Tests (`tests/`) are excluded from Ruff and Bandit checks. Docstring rules
+(`D`) are also relaxed in test files.
 
 ## Type Hints
 
@@ -120,3 +122,10 @@ modify it. Use the current year (2026).
 6. **No commented-out code** without explanation
 7. **Optional imports** guarded with `safe_import()`
 8. **No cross-component imports** between `components/` subdirectories
+
+## Automated Review
+
+The review-only maintainability heuristics and thresholds live in
+`.github/workflows/claude-review.yml`. Keep repository-wide coding rules here
+and automated-review prompt policy there so the detailed checklist has one
+source of truth.

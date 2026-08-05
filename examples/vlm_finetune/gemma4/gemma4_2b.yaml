@@ -104,3 +104,10 @@ freeze_config:
 
 ci:
   recipe_owner: athitten
+  nodes: 1
+  time: "00:20:00"
+  checkpoint_robustness:
+    check_source_load_parity: true
+    hf_kl_threshold: 2e-2
+    source_load_cosine_threshold: 0.9995
+    tokenizer_name: google/gemma-4-E2B-it

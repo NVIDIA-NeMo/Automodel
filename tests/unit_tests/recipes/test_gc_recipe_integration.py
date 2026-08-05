@@ -53,7 +53,7 @@ def test_seq_cls_loop_calls_gc_hook():
     recipe.val_dataloader = None
     recipe.metric_logger_train = SimpleNamespace(close=MagicMock())
     recipe.metric_logger_valid = SimpleNamespace(close=MagicMock())
-    recipe.checkpointer = SimpleNamespace(close=MagicMock())
+    recipe.checkpointer = SimpleNamespace(finalize=MagicMock())
     recipe.best_metric_key = "default"
 
     recipe.run_train_validation_loop()
@@ -75,7 +75,7 @@ def test_encoder_loop_calls_gc_hook():
     recipe.val_dataloader = None
     recipe.metric_logger_train = SimpleNamespace(close=MagicMock())
     recipe.metric_logger_valid = SimpleNamespace(close=MagicMock())
-    recipe.checkpointer = SimpleNamespace(close=MagicMock())
+    recipe.checkpointer = SimpleNamespace(finalize=MagicMock())
 
     recipe.run_train_validation_loop()
 
@@ -97,7 +97,7 @@ def test_encoder_loop_sets_dataset_epoch():
     recipe.val_dataloader = None
     recipe.metric_logger_train = SimpleNamespace(close=MagicMock())
     recipe.metric_logger_valid = SimpleNamespace(close=MagicMock())
-    recipe.checkpointer = SimpleNamespace(close=MagicMock())
+    recipe.checkpointer = SimpleNamespace(finalize=MagicMock())
 
     recipe.run_train_validation_loop()
 
@@ -117,7 +117,7 @@ def test_vlm_loop_calls_gc_hook():
     recipe.val_dataloader = None
     recipe.metric_logger_train = SimpleNamespace(close=MagicMock())
     recipe.metric_logger_valid = SimpleNamespace(close=MagicMock())
-    recipe.checkpointer = SimpleNamespace(close=MagicMock())
+    recipe.checkpointer = SimpleNamespace(finalize=MagicMock())
     recipe.best_metric_key = "default"
     recipe.pp_enabled = False
 

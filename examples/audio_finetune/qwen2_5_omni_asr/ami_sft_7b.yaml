@@ -47,7 +47,7 @@ checkpoint:
   enabled: true
   checkpoint_dir: result/checkpoints/qwen2_5_omni_asr_ami_7b
   model_save_format: safetensors
-  save_consolidated: true
+  save_consolidated: final
 
 distributed:
   strategy: fsdp2
@@ -104,6 +104,7 @@ optimizer:
   weight_decay: 0.0
 
 wandb:
+  enable: false
   project: ${oc.env:WANDB_PROJECT,qwen2_5-omni-asr-ami}
   name: ${oc.env:WANDB_NAME,qwen2_5_omni_7b_asr_ami_fullft}
   dir: ${oc.env:WANDB_DIR,result/wandb}

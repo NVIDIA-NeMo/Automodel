@@ -23,7 +23,7 @@ recipe: BenchmarkingRecipeForNextTokenPrediction
 seed: 1234
 
 benchmark:
-  warmup_steps: 10
+  warmup_steps: 2
   peak_tflops: 989  # H100 peak TFLOPs
   nsys_start: -1
   nsys_end: -1
@@ -32,12 +32,12 @@ benchmark:
 
 step_scheduler:
   gc_every_steps: 10
-  global_batch_size: 512
-  local_batch_size: 8
+  global_batch_size: 256
+  local_batch_size: 4
   ckpt_every_steps: 1000
   val_every_steps: 1000
   num_epochs: 1
-  max_steps: 30
+  max_steps: 12
 
 distributed:
   strategy: fsdp2
@@ -78,8 +78,8 @@ model:
     linear: te
     rms_norm: te
     rope_fusion: true
-    experts: gmm
-    dispatcher: deepep
+    experts: torch_mm
+    dispatcher: hybridep
     fake_balanced_gate: true
     enable_hf_state_dict_adapter: false
     enable_fsdp_optimizations: true

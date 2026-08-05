@@ -49,7 +49,8 @@ model:
     linear: te
     rms_norm: torch_fp32
     rope_fusion: false
-    enable_deepep: true
+    experts: gmm
+    dispatcher: hybridep
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true
@@ -99,4 +100,5 @@ optimizer:
   weight_decay: 0
 
 ci:
+  time: "00:30:00"
   nodes: 32

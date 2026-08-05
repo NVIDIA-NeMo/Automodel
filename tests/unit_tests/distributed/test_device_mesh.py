@@ -22,6 +22,7 @@ from nemo_automodel.components.distributed.config import (
     FSDP2Config,
     MegatronFSDPConfig,
     MoEParallelizerConfig,
+    normalize_activation_checkpointing_scope,
 )
 from nemo_automodel.components.distributed.mesh import MeshAxisName, MeshContext, ParallelismSizes
 from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
@@ -108,9 +109,37 @@ def test_mesh_context_build_passes_parallelism_to_raw_mesh_builder(captured_raw_
     assert parallelism.ep_size == 1
 
 
+def test_mesh_context_build_passes_timeout_to_raw_mesh_builder(captured_raw_mesh_call):
+    MeshContext.build(FSDP2Config(), world_size=4, timeout_minutes=30)
+
+    assert captured_raw_mesh_call["timeout_minutes"] == 30
+
+
 def test_mesh_context_build_requires_strategy_config():
     with pytest.raises(ValueError, match="Unknown distributed strategy config type"):
         MeshContext.build("ddp", world_size=1)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (None, ("all",)),
+        ("language+vision", ("language", "vision")),
+        ("vision,audio", ("vision", "audio")),
+        (["language", "vision"], ("language", "vision")),
+        ("auto", ("all",)),
+    ],
+)
+def test_activation_checkpointing_scope_normalization(value, expected):
+    assert normalize_activation_checkpointing_scope(value) == expected
+    assert FSDP2Config(activation_checkpointing_scope=value).activation_checkpointing_scope == expected
+    assert DDPConfig(activation_checkpointing_scope=value).activation_checkpointing_scope == expected
+
+
+@pytest.mark.parametrize("value", ["all+vision", "encoder", "trainable", [1]])
+def test_activation_checkpointing_scope_normalization_rejects_invalid_values(value):
+    with pytest.raises(ValueError, match="activation_checkpointing_scope"):
+        normalize_activation_checkpointing_scope(value)
 
 
 def test_distributed_setup_config_rejects_unknown_strategy():

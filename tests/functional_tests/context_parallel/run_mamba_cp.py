@@ -179,7 +179,7 @@ def run_bshd_te(rank, world_size, device, config):
     """Config 1: 3D BSHD input with TE p2p CP and DualChunkSwap."""
     from torch.distributed.device_mesh import init_device_mesh
 
-    from nemo_automodel.components.distributed.mamba_cp import MambaContextParallel
+    from nemo_automodel.components.distributed.context_parallel.mamba import MambaContextParallel
 
     mixer_baseline, mixer_cp = _create_mixer_pair(config, device)
 
@@ -263,7 +263,7 @@ def run_thd_te(rank, world_size, device, config):
     """Config 2: 2D THD input with TE p2p CP and DualChunkSwap."""
     from torch.distributed.device_mesh import init_device_mesh
 
-    from nemo_automodel.components.distributed.mamba_cp import MambaContextParallel
+    from nemo_automodel.components.distributed.context_parallel.mamba import MambaContextParallel
 
     mixer_baseline, mixer_cp = _create_mixer_pair(config, device)
 
@@ -348,7 +348,7 @@ def run_thd_te_packed(rank, world_size, device, config):
     """Config 3: 2D THD input with TE p2p CP, multi-sequence packing, and seq_idx."""
     from torch.distributed.device_mesh import init_device_mesh
 
-    from nemo_automodel.components.distributed.mamba_cp import MambaContextParallel
+    from nemo_automodel.components.distributed.context_parallel.mamba import MambaContextParallel
 
     mixer_baseline, mixer_cp = _create_mixer_pair(config, device)
 
@@ -445,7 +445,7 @@ def run_bshd_sdpa(rank, world_size, device, config):
     """Config 4: 3D BSHD input with DualChunkSwap split (matches context_parallel allgather)."""
     from torch.distributed.device_mesh import init_device_mesh
 
-    from nemo_automodel.components.distributed.mamba_cp import (
+    from nemo_automodel.components.distributed.context_parallel.mamba import (
         MambaContextParallel,
         _redo_attention_load_balancing,
         _undo_attention_load_balancing,

@@ -24,6 +24,67 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable
+from typing import Any
+
+import torch.nn as nn
+
+from nemo_automodel.components.quantization.fp8 import apply_fp8_to_model, build_fp8_config
+from nemo_automodel.components.utils.compile_utils import build_compile_config, compile_module_inplace
+
+
+def apply_draft_fp8(draft_model: nn.Module, cfg_fp8: Any) -> None:
+    """Optionally convert the draft's ``nn.Linear`` layers to torchao ``Float8Linear``, in place.
+
+    ``cfg_fp8`` is the recipe's top-level ``fp8:`` YAML block (dict-like, same
+    surface as the SFT recipe's -- see ``FP8Config``). No-op when the block is
+    absent or ``enabled`` is false. Modifies the draft in place (never
+    reassign ``self.draft_model`` -- ``BaseRecipe.__setattr__`` rejects
+    re-tracking an ``nn.Module`` attribute). Must be called before the draft is
+    wrapped (DDP / ``fully_shard``) so the swapped modules are what gets
+    replicated or sharded.
+    """
+    if cfg_fp8 is None:
+        return
+    apply_fp8_to_model(draft_model, config=build_fp8_config(cfg_fp8))
+
+
+def apply_draft_compile(draft_model: nn.Module, cfg_compile: Any) -> None:
+    """Optionally ``torch.compile`` the draft in place (top-level ``compile:`` block).
+
+    Same YAML surface as the SFT recipes (``CompileConfig``); no-op when the
+    block is absent or ``enabled`` is false. Uses ``nn.Module.compile()`` so
+    the draft object and its state-dict keys are unchanged (the recipes track
+    the module by reference and checkpoint it directly). Must run after
+    ``apply_draft_fp8`` so inductor traces the swapped ``Float8Linear``
+    modules: fp8's cast/scale ops only pay off once fused into the GEMM
+    prologue, and in eager mode fp8 is typically slower than bf16.
+    """
+    if cfg_compile is None:
+        return
+    compile_module_inplace(draft_model, build_compile_config(cfg_compile))
+
+
+def raise_if_peft_configured(cfg: Any, recipe_name: str) -> None:
+    """Fail fast on EAGLE-3-only draft knobs set on a recipe that does not support them.
+
+    ``peft:``: the DFlash-family and DSpark drafts register trainable non-LoRA
+    modules on the draft itself (Domino's ``prefix_gru``/``embed_proj``, DSpark's
+    Markov and confidence heads); LoRA's freeze-everything-but-adapters contract
+    would silently freeze them, so reject the config instead of ignoring it.
+    ``recipe_args.draft_weights_path``: only the EAGLE-3 recipe implements the
+    warm-start load; a silently ignored knob would train from random init while
+    the user believes the draft was warm-started.
+    """
+    if cfg.get("peft", None) is not None:
+        raise ValueError(
+            f"peft is not supported by {recipe_name}; LoRA draft training is only available in the EAGLE-3 recipe."
+        )
+    recipe_args = cfg.get("recipe_args", None)
+    if recipe_args is not None and recipe_args.get("draft_weights_path", None):
+        raise ValueError(
+            f"recipe_args.draft_weights_path is not supported by {recipe_name}; the draft warm start is only "
+            "available in the EAGLE-3 recipe."
+        )
 
 
 def optim_steps_per_epoch(num_batches_per_epoch: int, grad_accumulation_steps: int) -> int:
@@ -89,3 +150,58 @@ def make_warmup_cosine_schedule(
         return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
 
     return _lr_lambda
+
+
+def raise_if_target_not_materialized(model: nn.Module, target_path: str) -> None:
+    """Fail loudly when a frozen target's weights were never loaded from disk.
+
+    ``NeMoAutoModel*.from_pretrained`` initializes on the meta device whenever
+    ``world_size > 1`` and no sharding infrastructure was requested, on the
+    assumption that a later FSDP2 / MegatronFSDP wrap materializes the weights.
+    A draft recipe that keeps one full frozen replica per rank never performs
+    that step, so ``.to(device)`` turns the meta tensors into uninitialized
+    memory and the target silently becomes a randomly initialized teacher: the
+    draft then trains against noise, loss stalls at ``ln(vocab)``, and nothing
+    raises.
+
+    This check is cheap (one norm per checked tensor) and runs once at setup.
+    It compares against the theoretical norm of HuggingFace's default
+    ``N(0, 0.02)`` initialization, which is what uninitialized-then-copied
+    memory ends up resembling.
+
+    Args:
+        model: The frozen target model, already moved to its device.
+        target_path: Model id or path, echoed in the error message.
+
+    Raises:
+        RuntimeError: If a parameter is still on the meta device, or if the
+            input embedding matches an untrained initialization.
+    """
+    meta = [name for name, param in model.named_parameters() if param.is_meta]
+    if meta:
+        raise RuntimeError(
+            f"The frozen target {target_path} still has {len(meta)} parameter(s) on the meta device "
+            f"(e.g. {meta[0]}). It was initialized on meta and never materialized, so training would "
+            "distill the draft against random weights. Load the target without meta-device init."
+        )
+
+    embedding = model.get_input_embeddings()
+    weight = getattr(embedding, "weight", None)
+    if weight is None or weight.numel() == 0:
+        return
+    observed = weight.detach().float().norm().item()
+    # HF initializes embeddings from N(0, initializer_range); the norm of such a
+    # matrix concentrates tightly around std * sqrt(numel).
+    # A diagnostic must never be the thing that breaks a run, so every lookup
+    # it makes degrades to the HuggingFace default rather than raising.
+    config = getattr(model, "config", None)
+    std = float(getattr(config, "initializer_range", 0.02) or 0.02)
+    untrained = std * math.sqrt(weight.numel())
+    if untrained > 0 and abs(observed - untrained) / untrained < 0.02:
+        raise RuntimeError(
+            f"The frozen target {target_path} has an input embedding whose norm ({observed:.2f}) matches an "
+            f"untrained N(0, {std}) initialization ({untrained:.2f}), so its weights were never loaded from "
+            "the checkpoint. This happens when the model is initialized on the meta device for a "
+            "world_size > 1 run and nothing materializes it. Training would distill the draft against a "
+            "random teacher without raising."
+        )

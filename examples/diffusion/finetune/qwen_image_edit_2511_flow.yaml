@@ -1,0 +1,104 @@
+model:
+  pretrained_model_name_or_path: "Qwen/Qwen-Image-Edit-2511"
+  mode: "finetune"
+  model_type: "qwen_image_edit"
+  cache_dir: null
+  torch_dtype: bfloat16
+  compute_dtype: bfloat16
+  attention_backend: "native"
+  transformer_engine_linear: false
+  transformer_engine_fp8: false
+  fuse_qkv_projections: false
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 2e-6
+  weight_decay: 0.05
+  betas: [0.9, 0.999]
+  foreach: false
+  fused: true
+
+clip_grad_norm:
+  max_norm: 1.0
+
+# Single-node baseline: one FSDP2 data-parallel rank per H100.
+fsdp:
+  dp_size: 8
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  activation_checkpointing: true
+  defer_fsdp_grad_sync: true
+  cpu_offload: false
+  reduce_dtype: bfloat16
+  enable_compile: false
+  enable_fsdp2_prefetch: true
+  fsdp2_backward_prefetch_depth: 2
+  fsdp2_forward_prefetch_depth: 1
+
+flow_matching:
+  adapter_type: "qwen_image_edit"
+  timestep_sampling: "beta"
+  beta_alpha: 2.5
+  beta_beta: 1.5
+  sigma_min: 0.0
+  sigma_max: 1.0
+  num_train_timesteps: 1000
+  i2v_prob: 0.0
+  cfg_dropout_prob: 0.0
+  use_loss_weighting: false
+  log_interval: 100
+  summary_log_interval: 10
+
+step_scheduler:
+  num_epochs: 10
+  local_batch_size: 1
+  global_batch_size: 8
+  ckpt_every_steps: 250
+  save_checkpoint_every_epoch: false
+  log_remote_every_steps: 100
+  max_steps: null
+
+data:
+  dataloader:
+    _target_: nemo_automodel.components.datasets.diffusion.image_edit_dataset.ImageEditDataloaderConfig
+    cache_dir: PATH_TO_YOUR_QWEN_IMAGE_EDIT_CACHE
+    quantization: 64
+    base_resolution: [1024, 1024]
+    dynamic_batch_size: false
+    num_workers: 8
+    prefetch_factor: 2
+    pin_memory: true
+    shuffle: true
+    drop_last: true
+    seed: 42
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: PATH_TO_YOUR_CKPT_DIR
+  model_save_format: safetensors
+  save_consolidated: final
+  diffusers_compatible: true
+  restore_from: null
+
+performance:
+  check_loss: false
+  grad_clip_foreach: true
+
+wandb:
+  enable: false
+  project: qwen-image-edit-2511-training
+  mode: online
+  name: qwen_image_edit_2511_8xh100_bf16
+
+dist_env:
+  backend: "nccl"
+  init_method: "env://"
+  timeout_minutes: 120
+
+seed: 42
+
+ci:
+  recipe_owner: pthombre
+  time: "04:00:00"
+  nodes: 1

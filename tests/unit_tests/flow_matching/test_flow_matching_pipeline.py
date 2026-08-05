@@ -271,6 +271,50 @@ class TestTimestepSampling:
         assert sigma.shape == (batch_size,)
         assert (sigma >= 0).all() and (sigma <= 1).all()
 
+    def test_beta_sampling_is_deterministic_with_seed(self, simple_adapter):
+        """Beta sampling is reproducible under a fixed global seed."""
+        pipeline = FlowMatchingPipeline(
+            model_adapter=simple_adapter,
+            timestep_sampling="beta",
+            beta_alpha=2.5,
+            beta_beta=1.5,
+        )
+
+        torch.manual_seed(1234)
+        sigma_a, timesteps_a, method = pipeline.sample_timesteps(128, torch.device("cpu"))
+        torch.manual_seed(1234)
+        sigma_b, timesteps_b, _ = pipeline.sample_timesteps(128, torch.device("cpu"))
+
+        assert method == "beta"
+        assert torch.equal(sigma_a, sigma_b)
+        assert torch.equal(timesteps_a, timesteps_b)
+        assert (sigma_a >= 0).all() and (sigma_a <= 1).all()
+
+    def test_beta_sampling_matches_configured_distribution_moments(self, simple_adapter):
+        """A large sample matches the configured Beta mean and variance."""
+        alpha = 2.5
+        beta = 1.5
+        pipeline = FlowMatchingPipeline(
+            model_adapter=simple_adapter,
+            timestep_sampling="beta",
+            beta_alpha=alpha,
+            beta_beta=beta,
+        )
+
+        torch.manual_seed(2026)
+        sigma, _, method = pipeline.sample_timesteps(100_000, torch.device("cpu"))
+
+        expected_mean = alpha / (alpha + beta)
+        expected_variance = alpha * beta / ((alpha + beta) ** 2 * (alpha + beta + 1.0))
+        assert method == "beta"
+        assert sigma.mean().item() == pytest.approx(expected_mean, abs=0.004)
+        assert sigma.var(unbiased=True).item() == pytest.approx(expected_variance, abs=0.002)
+
+    def test_beta_sampling_rejects_non_positive_shape_parameters(self, simple_adapter):
+        """Invalid beta shape parameters fail at construction time."""
+        with pytest.raises(ValueError, match="must both be positive"):
+            FlowMatchingPipeline(model_adapter=simple_adapter, timestep_sampling="beta", beta_alpha=0.0)
+
     def test_mix_sampling_strategy(self, simple_adapter):
         """Test mixed uniform sampling ratio."""
         pipeline = FlowMatchingPipeline(

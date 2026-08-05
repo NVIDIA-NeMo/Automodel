@@ -29,6 +29,11 @@ class DummyConfig:
     def set_by_dotted(self, dotted, value):
         self._calls.append((dotted, value))
 
+    def get(self, key, default=None):
+        # Mirror ConfigNode.get: missing keys (e.g. the optional `wandb`
+        # section resolved by parse_args_and_load_config) return the default.
+        return default
+
     # allow direct attribute access in case caller relies on it later
     def __getattr__(self, item):
         raise AttributeError(item)

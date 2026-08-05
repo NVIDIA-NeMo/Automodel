@@ -127,6 +127,11 @@ optimizer:
   lr: 1.0e-4
   weight_decay: 0.01
 
+ci:
+  time: "00:15:00"
+  env_vars:
+    MAX_STEPS: 10
+
 # wandb:
 #   project: <your_wandb_project>
 #   entity: <your_wandb_entity>

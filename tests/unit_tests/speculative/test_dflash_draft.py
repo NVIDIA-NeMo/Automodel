@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import torch
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
@@ -44,6 +46,56 @@ def test_extract_context_feature_uses_offset_one():
     # first 3 features come from hidden_states[2], next 3 from hidden_states[4]
     assert torch.allclose(out[..., :3], torch.full((1, 2, 3), 2.0))
     assert torch.allclose(out[..., 3:], torch.full((1, 2, 3), 4.0))
+
+
+def _draft_cfg(bs=4):
+    cfg = Qwen3Config(
+        vocab_size=64,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=8,
+        max_position_embeddings=64,
+        rope_theta=1000000,
+        tie_word_embeddings=False,
+    )
+    cfg.num_target_layers = 8
+    cfg.block_size = bs
+    cfg.dflash_config = {"mask_token_id": 63, "target_layer_ids": [1, 3, 5]}
+    cfg._attn_implementation = "sdpa"
+    return cfg
+
+
+def _rope_relerr(inv_freq):
+    # Reference fp32 default-rope frequencies for head_dim=8, theta=1e6.
+    ref = 1.0 / (1000000 ** (torch.arange(0, 8, 2).float() / 8))
+    return ((inv_freq.float() - ref).abs() / ref).max().item()
+
+
+def test_rope_inv_freq_stays_fp32_after_bf16_cast():
+    """``model.to(bf16)`` must not round the RoPE frequencies.
+
+    The serving runtime keeps an fp32 RoPE cache; if the draft trained with a
+    bf16-rounded ``inv_freq`` the train/inference RoPE would diverge (worse with
+    longer context) and erode acceptance. The draft pins ``inv_freq`` to fp32.
+    """
+    draft = Qwen3DFlashDraftModel(_draft_cfg()).to(torch.bfloat16)
+    inv_freq = draft.rotary_emb.inv_freq
+    assert inv_freq.dtype == torch.float32
+    # Recomputed fresh, so the values are exact fp32 (not a bf16 round-trip).
+    assert _rope_relerr(inv_freq) < 1e-6
+    # original_inv_freq (used by dynamic-rope resets) is pinned too.
+    assert draft.rotary_emb.original_inv_freq.dtype == torch.float32
+    # The rest of the model is still bf16 (the pin is rope-only).
+    assert next(draft.layers[0].parameters()).dtype == torch.bfloat16
+
+
+def test_rope_inv_freq_fp32_survives_chained_casts():
+    draft = Qwen3DFlashDraftModel(_draft_cfg()).to(torch.float16).to(torch.bfloat16)
+    assert draft.rotary_emb.inv_freq.dtype == torch.float32
+    assert _rope_relerr(draft.rotary_emb.inv_freq) < 1e-6
 
 
 def test_draft_forward_output_shape():
@@ -75,3 +127,59 @@ def test_draft_forward_output_shape():
     out = draft(position_ids=position_ids, attention_mask=None, noise_embedding=noise, target_hidden=target_hidden)
     assert out.shape == (B, Q, H)
     assert torch.isfinite(out).all()
+
+
+class _ConstantTarget(torch.nn.Module):
+    """Minimal stand-in for the verifier: always samples ``forced_token_id``.
+
+    Only the surface ``spec_generate`` touches is implemented (``model.embed_tokens``,
+    ``lm_head``, and a forward returning logits + per-layer hidden states).
+    """
+
+    def __init__(self, cfg: Qwen3Config, forced_token_id: int):
+        super().__init__()
+        self.model = torch.nn.Module()
+        self.model.embed_tokens = torch.nn.Embedding(cfg.vocab_size, cfg.hidden_size)
+        self.lm_head = torch.nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
+        self.num_layers = cfg.num_target_layers
+        self.vocab_size = cfg.vocab_size
+        self.forced_token_id = forced_token_id
+        self.device = torch.device("cpu")
+
+    def forward(
+        self,
+        input_ids,
+        position_ids=None,
+        past_key_values=None,
+        use_cache=True,
+        logits_to_keep=None,
+        output_hidden_states=False,
+    ):
+        hidden = self.model.embed_tokens(input_ids)
+        keep = input_ids.shape[1] if logits_to_keep is None else logits_to_keep
+        logits = torch.zeros(input_ids.shape[0], keep, self.vocab_size)
+        logits[..., self.forced_token_id] = 1.0
+        return SimpleNamespace(logits=logits, hidden_states=[hidden] * (self.num_layers + 1))
+
+
+def test_spec_generate_keeps_generated_tokens_equal_to_the_mask_id():
+    """A generated token that happens to equal ``mask_token_id`` must survive.
+
+    The output buffer is pre-filled with ``mask_token_id`` as padding, so filtering
+    the padding out by value also deleted real tokens of that id and shifted the
+    rest of the sequence left. The generated span is tracked by the commit counter
+    instead.
+    """
+    torch.manual_seed(0)
+    cfg = _draft_cfg(bs=4)
+    draft = Qwen3DFlashDraftModel(cfg)
+    target = _ConstantTarget(cfg, forced_token_id=cfg.dflash_config["mask_token_id"])
+
+    prompt = torch.tensor([[1, 2, 3]])
+    max_new_tokens = 5
+    out = draft.spec_generate(target, prompt, max_new_tokens, stop_token_ids=None, temperature=0.0)
+
+    assert out.shape == (1, prompt.shape[1] + max_new_tokens)
+    torch.testing.assert_close(out[:, : prompt.shape[1]], prompt)
+    generated = out[0, prompt.shape[1] :]
+    assert torch.all(generated == cfg.dflash_config["mask_token_id"])

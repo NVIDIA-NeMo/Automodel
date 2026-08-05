@@ -20,11 +20,11 @@
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 step_scheduler:
-  global_batch_size: 256
-  local_batch_size: 32
+  global_batch_size: 64
+  local_batch_size: 8
   ckpt_every_steps: 50
   val_every_steps: 1000
-  max_steps: 100
+  max_steps: 5
 
 dist_env:
   backend: nccl
@@ -58,7 +58,7 @@ distributed:
 
   pipeline:
     pp_schedule: interleaved1f1b
-    pp_microbatch_size: 4
+    pp_microbatch_size: 1
     scale_grads_in_schedule: false
 
 loss_fn:
@@ -71,12 +71,14 @@ dataset:
   split: train
 
 packed_sequence:
+  # Set packed_sequence_size > 0 to run with packed sequences
   packed_sequence_size: 1024
+  packing_strategy: thd
 
-# StatefulDataLoader with default collate
+# StatefulDataLoader with packed-sequence collate
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
   shuffle: true
 
 validation_dataset:
@@ -86,7 +88,7 @@ validation_dataset:
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
 
 optimizer:
   _target_: torch.optim.Adam
@@ -102,5 +104,18 @@ lr_scheduler:
 
 ci:
   recipe_owner: HuiyingLi
-  time: "00:20:00"
+  time: "00:40:00"
   nodes: 2
+  checkpoint_robustness:
+    check_source_load_parity: true
+    hf_kl_threshold: 1e-2
+    source_load_kl_threshold: 1e-2
+    source_load_cosine_threshold: 0.9995
+    tokenizer_name: mistralai/Mixtral-8x7B-v0.1
+    trust_remote_code: true
+    hf_device_map_auto: true
+    no_check_resume: true
+    dataset.limit_dataset_samples: 500
+    validation_dataset.limit_dataset_samples: 500
+  release:
+    step_scheduler.max_steps: 5

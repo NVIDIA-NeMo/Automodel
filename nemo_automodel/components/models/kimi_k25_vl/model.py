@@ -146,6 +146,10 @@ class KimiK25VLConfig(PretrainedConfig):
 
 
 from nemo_automodel.components.models.common import BackendConfig, compute_lm_head_logits, initialize_linear_module
+from nemo_automodel.components.models.common.tie_word_embeddings import (
+    TieSupport,
+    reject_unsupported_tie_word_embeddings,
+)
 from nemo_automodel.components.models.deepseek_v3.model import DeepseekV3Model
 from nemo_automodel.components.models.deepseek_v3.rope_utils import freqs_cis_from_position_ids
 from nemo_automodel.components.models.kimi_k25_vl.state_dict_adapter import KimiK25VLStateDictAdapter
@@ -882,6 +886,8 @@ class KimiK25VLModel(nn.Module):
 class KimiK25VLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     """KimiK25VL model with backend-aware DeepseekV3 language model."""
 
+    tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
+
     # RoPE freqs/inv_freq must stay fp32: from_pretrained casts the model to bf16 and
     # nn.Module.to rounds floating buffers; routing through cast_model_to_dtype restores
     # these keep-fp32 buffers afterwards (see llama/rope_utils.py).
@@ -951,6 +957,7 @@ class KimiK25VLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDP
     def __init__(self, config, moe_config: MoEConfig | None = None, backend: BackendConfig | None = None, **kwargs):
         super().__init__()
         self.config = config
+        reject_unsupported_tie_word_embeddings(type(self), config)
         self.backend = backend or BackendConfig()
 
         self.model = KimiK25VLModel(config, moe_config=moe_config, backend=self.backend)

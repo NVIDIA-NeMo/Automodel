@@ -1,0 +1,143 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Full-parameter, 93-layer Kimi K3 text SFT run on 256 GPUs:
+#   64 nodes x 4 GPUs, EP32 x PP8, DP32, 100 steps, lr=1e-5.
+# PP stages own the complete attention-residual blocks:
+#   [0,12), [12,24), [24,36), [36,48), [48,60), [60,72), [72,84), [84,93).
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
+step_scheduler:
+  global_batch_size: 256
+  local_batch_size: 8
+  ckpt_every_steps: 100
+  val_every_steps: 100
+  max_steps: 100
+  num_epochs: 1
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 120
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 1234
+  ranked: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: moonshotai/Kimi-K3
+  torch_dtype: bfloat16
+  trust_remote_code: false
+  config:
+    architectures: [KimiK3ForCausalLM]
+  kda_mode: chunk
+  use_liger_kernel: false
+  use_sdpa_patching: false
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: eager
+    linear: torch
+    rms_norm: torch_fp32
+    experts: torch_mm
+    dispatcher: torch
+    rope_fusion: false
+    fake_balanced_gate: false
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
+
+checkpoint:
+  enabled: false
+  checkpoint_dir: checkpoints/kimi_k3_hellaswag
+  model_save_format: safetensors
+  save_consolidated: false
+  dequantize_base_checkpoint: true
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 1
+  pp_size: 8
+  ep_size: 32
+  sequence_parallel: false
+  activation_checkpointing: true
+  pipeline:
+    pp_schedule: 1f1b
+    pp_microbatch_size: 1
+    scale_grads_in_schedule: false
+    patch_inner_model: false
+    patch_causal_lm_model: false
+  moe:
+    reshard_after_forward: false
+    wrap_outer_model: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  path_or_dataset: Rowan/hellaswag
+  split: train
+  num_samples_limit: 25600
+  pad_to_max_length: false
+  tokenizer:
+    _target_: nemo_automodel.NeMoAutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: moonshotai/Kimi-K3
+    trust_remote_code: false
+
+packed_sequence:
+  packed_sequence_size: 0
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  shuffle: true
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  path_or_dataset: Rowan/hellaswag
+  split: validation
+  num_samples_limit: 256
+  pad_to_max_length: false
+  tokenizer:
+    _target_: nemo_automodel.NeMoAutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: moonshotai/Kimi-K3
+    trust_remote_code: false
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  batch_size: 8
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1.0e-5
+  weight_decay: 0.0
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+
+wandb:
+  enable: false
+  project: kimi-k3-sft
+  name: kimi_k3_hellaswag_ep32_pp8
+  dir: wandb
+
+clip_grad_norm:
+  max_norm: 1.0
+
+ci:
+  recipe_owner: huiyingl
+  nodes: 32
+  time: "01:30:00"

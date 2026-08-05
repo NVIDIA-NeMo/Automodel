@@ -91,9 +91,14 @@ class DeepseekV4Config(PretrainedConfig):
         pretraining_tp: int = 1,
         tie_word_embeddings: bool = False,
         initializer_range: float = 0.02,
-        torch_dtype: str = "bfloat16",
+        torch_dtype: str | None = None,
         **kwargs,
     ):
+        dtype = kwargs.pop("dtype", None)
+        resolved_dtype = dtype if dtype is not None else torch_dtype
+        if resolved_dtype is None:
+            resolved_dtype = "bfloat16"
+
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
         self.moe_intermediate_size = moe_intermediate_size
@@ -133,7 +138,6 @@ class DeepseekV4Config(PretrainedConfig):
         self.attention_dropout = attention_dropout
         self.pretraining_tp = pretraining_tp
         self.initializer_range = initializer_range
-        self.torch_dtype = torch_dtype
 
         super().__init__(
             pad_token_id=pad_token_id,
@@ -141,5 +145,6 @@ class DeepseekV4Config(PretrainedConfig):
             eos_token_id=eos_token_id,
             tie_word_embeddings=tie_word_embeddings,
             use_cache=use_cache,
+            dtype=resolved_dtype,
             **kwargs,
         )

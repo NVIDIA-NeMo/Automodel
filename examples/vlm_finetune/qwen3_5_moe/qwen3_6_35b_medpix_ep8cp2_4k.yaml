@@ -113,9 +113,13 @@ lr_scheduler:
   lr_decay_style: constant
 
 wandb:
+  enable: false
   project: huiyingl_workspace
   entity: Nemo-automodel
   name: qwen3_6_35b_medpix_ep8cp2_4k_100steps
   group: qwen3_6_35b_medpix_ep8cp_parity_4k_100steps
   tags: [qwen3.6-35b, medpix, ep8, cp2, 4k, parity]
   dir: logs/qwen3_6_35b_medpix_ep8cp2_4k_100steps/wandb  # pragma: allowlist secret
+
+ci:
+  time: "00:15:00"

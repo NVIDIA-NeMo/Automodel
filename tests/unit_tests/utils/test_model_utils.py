@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+from types import MethodType
 from typing import Dict
 
 import pytest
@@ -466,6 +467,84 @@ class TestFilterForwardKwargs:
         filtered = model_utils.filter_forward_kwargs(model, batch)
 
         assert filtered == batch
+
+    def test_caches_signature_by_forward_callable(self, monkeypatch):
+        class Model(nn.Module):
+            def forward(self, input_ids):
+                return input_ids
+
+        model_utils._get_cached_forward_signature.cache_clear()
+        signature = model_utils.inspect.signature
+        calls = 0
+
+        def counting_signature(callable_object):
+            nonlocal calls
+            calls += 1
+            return signature(callable_object)
+
+        monkeypatch.setattr(model_utils.inspect, "signature", counting_signature)
+        try:
+            model_utils.filter_forward_kwargs(Model(), {"input_ids": torch.ones(1)})
+            model_utils.filter_forward_kwargs(Model(), {"input_ids": torch.ones(1)})
+        finally:
+            model_utils._get_cached_forward_signature.cache_clear()
+
+        assert calls == 1
+
+    def test_class_forward_patch_invalidates_cached_signature(self):
+        class Model(nn.Module):
+            def forward(self, input_ids):
+                return input_ids
+
+        model = Model()
+        assert set(model_utils.filter_forward_kwargs(model, {"input_ids": 1, "pixel_values": 2})) == {"input_ids"}
+
+        def replacement_forward(self, pixel_values):
+            return pixel_values
+
+        Model.forward = replacement_forward
+        assert set(model_utils.filter_forward_kwargs(model, {"input_ids": 1, "pixel_values": 2})) == {"pixel_values"}
+
+    def test_bound_forward_receiver_name_is_not_treated_as_kwarg(self):
+        class Model(nn.Module):
+            def forward(module, input_ids):
+                return input_ids
+
+        filtered = model_utils.filter_forward_kwargs(Model(), {"module": 1, "input_ids": 2})
+
+        assert filtered == {"input_ids": 2}
+
+    def test_instance_callable_forward_is_not_retained_in_cache(self):
+        class ForwardCallable:
+            def __call__(self, input_ids):
+                return input_ids
+
+        class Model(nn.Module):
+            forward = ForwardCallable()
+
+        model_utils._get_cached_forward_signature.cache_clear()
+        model_utils.filter_forward_kwargs(Model(), {"input_ids": 1})
+
+        assert model_utils._get_cached_forward_signature.cache_info().currsize == 0
+
+    def test_instance_bound_forward_is_not_retained_in_cache(self):
+        class Model(nn.Module):
+            def forward(self, input_ids):
+                return input_ids
+
+        model = Model()
+
+        def replacement_forward(owning_model, pixel_values):
+            assert owning_model is model
+            return pixel_values
+
+        model.forward = MethodType(replacement_forward, model)
+        model_utils._get_cached_forward_signature.cache_clear()
+
+        filtered = model_utils.filter_forward_kwargs(model, {"input_ids": 1, "pixel_values": 2})
+
+        assert filtered == {"pixel_values": 2}
+        assert model_utils._get_cached_forward_signature.cache_info().currsize == 0
 
 
 class TestSqueezeInputForThd:

@@ -266,10 +266,18 @@ class KimiK25VLStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
         return result
 
     def _is_quantized_expert_key(self, key: str) -> bool:
-        if "mlp.experts." in key and ".weight" in key:
+        # ``endswith`` rather than ``in``: a substring test also matches keys that
+        # merely contain ".weight", such as the ".weight_packed"/".weight_scale"
+        # triplet this function's callers emit.
+        if "mlp.experts." in key and key.endswith(".weight"):
             if "shared_experts" in key:
                 return False
             if ".layers.0." in key:
+                return False
+            # LoRA adapter tensors sit under the same expert paths but are not part
+            # of the INT4-quantized checkpoint. PEFT expects plain lora_A/lora_B
+            # weights, and quantizing them makes the saved adapter unloadable.
+            if ".lora_" in key:
                 return False
             return True
         return False

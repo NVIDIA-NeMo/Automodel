@@ -15,8 +15,10 @@
 
 """Standalone test script for Qwen3.5 MoE linear attention context parallelism.
 
-Validates that CPAwareGatedDeltaNet produces identical forward outputs and
-gradients when running with CP=2 vs the baseline HF forward with CP=1.
+Validates that CPAwareGatedDeltaNet produces equivalent forward outputs and
+gradients when running with CP=2 vs the baseline HF forward with CP=1. Covers
+both the load-balanced single-document layout and the contiguous block-diagonal
+layout with packed document resets.
 
 The linear attention CP path is fundamentally different from TE attention CP:
   - Works in BSHD format (not THD packed sequences)
@@ -42,6 +44,83 @@ def init_distributed():
         if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
             dist.init_process_group(backend="nccl")
             torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+
+
+def _run_packed_contiguous_case(config, cp_mesh, device):
+    """Check packed GDN CP against the same layer's non-CP packed kernel."""
+    from nemo_automodel.components.distributed.blockdiag_cp import make_cp_blockdiag_batch_and_ctx
+    from nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn import CPAwareGatedDeltaNet
+
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    batch_size = 1
+    seq_len = 32
+    local_len = seq_len // world_size
+    hidden_size = config.hidden_size
+    offset = rank * local_len
+
+    torch.manual_seed(314)
+    reference = CPAwareGatedDeltaNet(config, layer_idx=1).to(device).to(torch.bfloat16)
+    distributed = CPAwareGatedDeltaNet(config, layer_idx=1).to(device).to(torch.bfloat16)
+    distributed.load_state_dict(reference.state_dict())
+    for ref_param, cp_param in zip(reference.parameters(), distributed.parameters()):
+        dist.broadcast(ref_param.data, src=0)
+        dist.broadcast(cp_param.data, src=0)
+    if reference.causal_conv1d_fn is None:
+        raise RuntimeError("packed GDN parity requires causal_conv1d with seq_idx support")
+    cp_submesh = cp_mesh["cp"]
+    distributed._cp_mesh = cp_submesh
+
+    torch.manual_seed(2718)
+    x_data = torch.randn(batch_size, seq_len, hidden_size, device=device, dtype=torch.bfloat16)
+    torch.manual_seed(1618)
+    upstream_grad = torch.randn_like(x_data)
+    doc_ids = torch.tensor(
+        [[1] * 7 + [2] * 11 + [3] * 14],
+        dtype=torch.long,
+        device=device,
+    )
+    cu_seqlens = torch.tensor([0, 7, 18, 32], dtype=torch.long, device=device)
+    indices = torch.arange(seq_len, dtype=torch.long, device=device)
+
+    x_ref = x_data.clone().requires_grad_(True)
+    out_ref = reference._forward_no_cp(
+        x_ref,
+        attention_mask=doc_ids,
+        cu_seqlens=cu_seqlens,
+        indices=indices,
+    )
+    (out_ref * upstream_grad).sum().backward()
+    ref_x_grad = x_ref.grad.detach().clone()
+    ref_param_grads = {name: param.grad.detach().float().clone() for name, param in reference.named_parameters()}
+
+    x_cp = x_data.clone().requires_grad_(True)
+    ctx, sharded, _ = make_cp_blockdiag_batch_and_ctx(
+        cp_submesh,
+        None,
+        {"inputs_embeds": x_cp, "_packed_seq_ids": doc_ids.clone()},
+    )
+    with ctx():
+        out_local = distributed(sharded["inputs_embeds"])
+        (out_local * upstream_grad[:, offset : offset + local_len]).sum().backward()
+
+    output_parts = [torch.empty_like(out_local) for _ in range(world_size)]
+    grad_parts = [torch.empty_like(x_cp.grad[:, offset : offset + local_len]) for _ in range(world_size)]
+    dist.all_gather(output_parts, out_local.detach())
+    dist.all_gather(grad_parts, x_cp.grad[:, offset : offset + local_len].detach())
+    out_cp = torch.cat(output_parts, dim=1)
+    grad_cp = torch.cat(grad_parts, dim=1)
+
+    torch.testing.assert_close(out_cp, out_ref.detach(), rtol=5e-2, atol=5e-2)
+    torch.testing.assert_close(grad_cp, ref_x_grad, rtol=8e-2, atol=8e-2)
+    for name, param in distributed.named_parameters():
+        cp_grad = param.grad.detach().float().clone()
+        dist.all_reduce(cp_grad, op=dist.ReduceOp.SUM)
+        torch.testing.assert_close(cp_grad, ref_param_grads[name], rtol=8e-2, atol=8e-2)
+
+    output_diff = (out_cp.float() - out_ref.detach().float()).abs().max().item()
+    grad_diff = (grad_cp.float() - ref_x_grad.float()).abs().max().item()
+    return output_diff, grad_diff
 
 
 def run_test():
@@ -243,8 +322,13 @@ def run_test():
             msg=f"[Rank {rank}] Gradients differ between CP=1 and CP=2",
         )
 
+        packed_output_diff, packed_grad_diff = _run_packed_contiguous_case(config, cp_mesh, device)
+
         if rank == 0:
-            print("PASSED: Forward outputs and gradients match between CP=1 and CP=2")
+            print(
+                f"Packed contiguous diff - output max: {packed_output_diff:.6f}, input-grad max: {packed_grad_diff:.6f}"
+            )
+            print("PASSED: load-balanced and packed-contiguous GDN CP match their CP=1 references")
             print(f"{'=' * 70}\n")
         return 0
 

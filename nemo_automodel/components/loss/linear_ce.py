@@ -61,10 +61,13 @@
 # -------------------------------------------------------------------------------
 
 
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as metadata_version
 from typing import Optional
 
 import torch
 import torch.nn as nn
+from packaging.version import Version
 
 from nemo_automodel.shared.import_utils import MISSING_CUT_CROSS_ENTROPY_MSG
 
@@ -77,35 +80,43 @@ except ImportError:  # pragma: no cover
     HAVE_CUT_CROSS_ENTROPY = False  # pragma: no cover
 
 
+def _get_triton_version():
+    for package_name in ("pytorch-triton", "triton"):
+        try:
+            return metadata_version(package_name), package_name
+        except PackageNotFoundError:
+            continue
+
+    return None, None
+
+
 def new_is_triton_greater_or_equal(version_str):
     """
-    Check if pytorch-triton version is greater than or equal to the specified version.
+    Check if pytorch-triton/triton version is greater than or equal to the specified version.
 
     Args:
         version_str: Version string to check
 
     Returns:
-        bool: True if pytorch-triton version >= specified version
+        bool: True if pytorch-triton/triton version >= specified version
     """
-    import pkg_resources
-
-    try:
-        pytorch_triton_version = pkg_resources.get_distribution("pytorch-triton").version
-        current = pkg_resources.parse_version(pytorch_triton_version)
-        required = pkg_resources.parse_version(version_str)
-        print(f"Current pytorch-triton version: {pytorch_triton_version}, Required triton version: {version_str}")
-        return current >= required
-    except pkg_resources.DistributionNotFound:
-        print("pytorch-triton not found")
+    triton_version, package_name = _get_triton_version()
+    if triton_version is None:
+        print("pytorch-triton/triton not found")
         return False
+
+    current = Version(triton_version)
+    required = Version(version_str)
+    print(f"Current {package_name} version: {triton_version}, Required triton version: {version_str}")
+    return current >= required
 
 
 def new_is_triton_greater_or_equal_3_2_0():
     """
-    Check if pytorch-triton version is greater than or equal to 3.1.0.
+    Check if pytorch-triton/triton version is greater than or equal to 3.1.0.
 
     Returns:
-        bool: True if pytorch-triton version >= 3.1.0
+        bool: True if pytorch-triton/triton version >= 3.1.0
     """
     return new_is_triton_greater_or_equal("3.1.0")
 

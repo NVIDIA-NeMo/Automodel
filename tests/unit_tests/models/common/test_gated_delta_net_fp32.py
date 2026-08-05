@@ -9,6 +9,7 @@ import torch
 
 from nemo_automodel.components.models.common.gated_delta_net_fp32 import (
     FP32_GDN_PARAM_NAMES,
+    forced_gated_delta_net_fp32_dtype_mapping,
     has_gated_delta_net_fp32_checkpoint_contract,
     is_gated_delta_net_fp32_param_key,
     route_fp32_holder_key,
@@ -82,3 +83,19 @@ def test_upcast_gated_delta_net_fp32_state_tensor_handles_bare_key():
     tensor = torch.ones(4, dtype=torch.bfloat16)
     out = upcast_gated_delta_net_fp32_state_tensor("model.layers.0.linear_attn.A_log", tensor)
     assert out.dtype == torch.float32
+
+
+def test_forced_gated_delta_net_fp32_dtype_mapping():
+    state_dict = {
+        "model.layers.0.linear_attn.A_log": torch.ones(4, dtype=torch.float32),
+        "model.layers.0.linear_attn.dt_bias": torch.ones(4, dtype=torch.float32),
+        "model.layers.0.linear_attn.conv1d.weight": torch.ones(4, dtype=torch.float32),
+        "model.layers.0.self_attn.A_log": torch.ones(4, dtype=torch.float32),
+        "model.layers.0.linear_attn.A_log_extra": torch.ones(4, dtype=torch.float32),
+        "model.layers.0.linear_attn.dt_bias_nonfloating": torch.ones(4, dtype=torch.int64),
+    }
+
+    assert forced_gated_delta_net_fp32_dtype_mapping(state_dict) == {
+        "model.layers.0.linear_attn.A_log": "F32",
+        "model.layers.0.linear_attn.dt_bias": "F32",
+    }

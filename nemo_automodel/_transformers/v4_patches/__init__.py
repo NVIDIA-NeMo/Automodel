@@ -14,6 +14,10 @@
 
 """Compatibility patches for legacy v4-style transformer models."""
 
+from nemo_automodel._transformers.v4_patches.kv_sharing import (
+    install_kv_sharing_holder,
+    should_install_kv_sharing_holder,
+)
 from nemo_automodel._transformers.v4_patches.layer_types import (
     install_layer_types_patch_hook,
     patch_allowed_layer_types,
@@ -25,7 +29,9 @@ from nemo_automodel._transformers.v4_patches.rotary import (
 
 __all__ = [
     "fix_rotary_embeddings",
+    "install_kv_sharing_holder",
     "install_layer_types_patch_hook",
     "patch_allowed_layer_types",
     "should_fix_rotary_embeddings",
+    "should_install_kv_sharing_holder",
 ]

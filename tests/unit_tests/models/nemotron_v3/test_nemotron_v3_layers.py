@@ -216,7 +216,7 @@ class TestNemotronV3Block:
             linear="torch",
             attn="sdpa",
             rms_norm="torch",
-            enable_deepep=False,
+            dispatcher="torch",
             fake_balanced_gate=False,
             enable_hf_state_dict_adapter=False,
         )
@@ -434,6 +434,56 @@ class TestNemotronV3MambaRMSNormGated:
 class TestNemotronV3Mamba2Mixer:
     """Test NemotronV3Mamba2Mixer module initialization."""
 
+    def test_full_tensor_if_dtensor_clones_gathered_value(self, monkeypatch):
+        """Gathered fp32 holder outputs must not alias storage FSDP may reshard."""
+        from nemo_automodel.components.models.nemotron_v3 import layers as layers_mod
+
+        full = torch.arange(4, dtype=torch.float32, requires_grad=True)
+
+        class FakeDTensor:
+            def full_tensor(self):
+                return full
+
+        monkeypatch.setattr(layers_mod, "DTensor", FakeDTensor)
+
+        gathered = layers_mod._full_tensor_if_dtensor(FakeDTensor())
+
+        assert torch.equal(gathered, full)
+        assert gathered.data_ptr() != full.data_ptr()
+        gathered.sum().backward()
+        assert torch.equal(full.grad, torch.ones_like(full))
+
+    def test_full_tensor_if_dtensor_clones_regular_tensor(self):
+        """FSDP can reshard a regular-looking tensor returned from an fp32 holder."""
+        from nemo_automodel.components.models.nemotron_v3 import layers as layers_mod
+
+        tensor = torch.arange(4, dtype=torch.float32, requires_grad=True)
+
+        gathered = layers_mod._full_tensor_if_dtensor(tensor)
+
+        assert torch.equal(gathered, tensor)
+        assert gathered.data_ptr() != tensor.data_ptr()
+        gathered.sum().backward()
+        assert torch.equal(tensor.grad, torch.ones_like(tensor))
+
+    def test_get_fp32_ssm_params_passes_reference(self, config):
+        """FSDP2 root pre-forward expects a non-empty args tuple for the holder."""
+        from nemo_automodel.components.models.nemotron_v3.layers import NemotronV3Mamba2Mixer
+
+        mixer = NemotronV3Mamba2Mixer(config, layer_idx=0)
+        reference = torch.randn(1, 2, mixer.in_proj.out_features)
+        seen = {}
+
+        def fake_forward(ref=None):
+            seen["reference"] = ref
+            return mixer.A_log, mixer.dt_bias, mixer.D
+
+        mixer._fp32_params.forward = fake_forward
+
+        mixer._get_fp32_ssm_params(reference)
+
+        assert seen["reference"] is reference
+
     @pytest.fixture
     def config(self):
         return MockNemotronV3Config()
@@ -488,6 +538,14 @@ class TestNemotronV3Mamba2Mixer:
         assert mixer.A_log.shape == (config.mamba_num_heads,)
         assert mixer.D.shape == (config.mamba_num_heads,)
 
+        params = dict(mixer.named_parameters())
+        assert "_fp32_params.A_log" in params
+        assert "_fp32_params.dt_bias" in params
+        assert "_fp32_params.D" in params
+        assert "A_log" not in mixer._parameters
+        assert "dt_bias" not in mixer._parameters
+        assert "D" not in mixer._parameters
+
         # Check no_weight_decay attributes
         assert getattr(mixer.A_log, "_no_weight_decay", False)
         assert getattr(mixer.D, "_no_weight_decay", False)
@@ -517,7 +575,7 @@ class TestBackwardCompatibility:
             linear="torch",
             attn="sdpa",
             rms_norm="torch",
-            enable_deepep=False,
+            dispatcher="torch",
             fake_balanced_gate=False,
             enable_hf_state_dict_adapter=False,
         )

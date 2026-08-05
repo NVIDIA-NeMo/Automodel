@@ -18,6 +18,25 @@ from transformers import AutoProcessor
 from transformers.processing_utils import ProcessorMixin
 
 
+def _resolve_chat_template_path(pretrained_model_name_or_path: str, **kwargs) -> str | None:
+    """Return a local filesystem path to ``chat_template.jinja`` if available."""
+    local_path = os.path.join(pretrained_model_name_or_path, "chat_template.jinja")
+    if os.path.isfile(local_path):
+        return local_path
+
+    try:
+        from huggingface_hub import hf_hub_download
+
+        hub_kwargs = {k: kwargs[k] for k in ("cache_dir", "revision", "token") if k in kwargs}
+        return hf_hub_download(
+            repo_id=str(pretrained_model_name_or_path),
+            filename="chat_template.jinja",
+            **hub_kwargs,
+        )
+    except Exception:
+        return None
+
+
 def build_minimax_m3_vl_processor(pretrained_model_name_or_path: str, **kwargs) -> ProcessorMixin:
     """Load the MiniMax M3 VL processor with its chat template attached.
 
@@ -40,8 +59,8 @@ def build_minimax_m3_vl_processor(pretrained_model_name_or_path: str, **kwargs) 
     """
     processor = AutoProcessor.from_pretrained(pretrained_model_name_or_path, **kwargs)
     if getattr(processor, "chat_template", None) is None:
-        template_path = os.path.join(pretrained_model_name_or_path, "chat_template.jinja")
-        if os.path.isfile(template_path):
+        template_path = _resolve_chat_template_path(pretrained_model_name_or_path, **kwargs)
+        if template_path is not None:
             with open(template_path, encoding="utf-8") as f:
                 processor.chat_template = f.read()
     return processor

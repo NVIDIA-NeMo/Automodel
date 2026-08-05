@@ -14,6 +14,7 @@
 
 import abc
 import logging
+from dataclasses import dataclass
 from itertools import chain
 from typing import Literal, Optional
 
@@ -349,5 +350,38 @@ def create_megatron_sampler(
             drop_last=drop_last,
         )
     else:
-        raise Exception(f"{dataloader_type} dataloader type is not supported.")
+        raise ValueError(f"Unsupported Megatron dataloader_type {dataloader_type!r}; expected 'single' or 'cyclic'")
     return batch_sampler
+
+
+@dataclass(frozen=True)
+class MegatronSamplerConfig:
+    """Declarative configuration for a Megatron micro-batch sampler."""
+
+    micro_batch_size: int
+    global_batch_size: int
+    dataloader_type: Literal["single", "cyclic"] = "single"
+    drop_last: bool = True
+    pad_samples_to_global_batch_size: bool = False
+
+    def build(self, *, dataset_len: int, rank: int, world_size: int) -> BaseMegatronSampler:
+        """Build a Megatron sampler for one data-parallel rank.
+
+        Args:
+            dataset_len: Number of samples in the materialized dataset.
+            rank: Rank within the data-parallel group.
+            world_size: Size of the data-parallel group.
+
+        Returns:
+            Sampler yielding one local micro-batch of dataset indices at a time.
+        """
+        return create_megatron_sampler(
+            dataset_len=dataset_len,
+            micro_batch_size=self.micro_batch_size,
+            global_batch_size=self.global_batch_size,
+            dataloader_type=self.dataloader_type,
+            drop_last=self.drop_last,
+            pad_samples_to_global_batch_size=self.pad_samples_to_global_batch_size,
+            rank=rank,
+            world_size=world_size,
+        )

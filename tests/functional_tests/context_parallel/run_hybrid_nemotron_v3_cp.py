@@ -140,7 +140,7 @@ def _wire_te_cp(model, cp_group, config):
     """Wire TE-based CP on each hybrid layer (p2p for attention, hidden-parallel for mamba)."""
     from transformer_engine.pytorch.attention import DotProductAttention
 
-    from nemo_automodel.components.distributed.mamba_cp import MambaContextParallel
+    from nemo_automodel.components.distributed.context_parallel.mamba import MambaContextParallel
 
     for layer in model.layers.values():
         if layer.block_type == "mamba":
@@ -171,7 +171,7 @@ def _wire_sdpa_cp(model, cp_group):
     kernel, matching the reordering applied by both TE CP and PyTorch's
     context_parallel(allgather).
     """
-    from nemo_automodel.components.distributed.mamba_cp import MambaContextParallel
+    from nemo_automodel.components.distributed.context_parallel.mamba import MambaContextParallel
 
     for layer in model.layers.values():
         if layer.block_type == "mamba":

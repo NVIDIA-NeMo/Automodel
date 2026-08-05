@@ -45,6 +45,11 @@ model:
     dispatcher: deepep
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
+    # WAR for https://github.com/NVIDIA-NeMo/Automodel/issues/2674:
+    # fused TE RoPE emits NaN/Inf on the MLA single-head k_pe in THD (packed-sequence)
+    # mode, NaN-ing step-0 loss/grad and collapsing MoE routing -> OOM.
+    # Non-fused RoPE (fp32 unit-magnitude complex multiply) is bounded.
+    rope_fusion: false
 
 autopipeline:
   _target_: nemo_automodel.components.distributed.pipelining.config.PipelineConfig

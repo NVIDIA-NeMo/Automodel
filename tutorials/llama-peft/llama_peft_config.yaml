@@ -79,5 +79,6 @@ packed_sequence:
   packed_sequence_size: 1024
 
 wandb:
+  enable: false
   project: peft-llama
   name: bs8-lr1e-4-warmup207-clip0.8

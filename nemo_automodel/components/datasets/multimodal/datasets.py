@@ -37,7 +37,13 @@ import json
 import logging
 import os
 import random
+from collections.abc import Mapping
+from copy import deepcopy
+from dataclasses import dataclass, replace
+from pathlib import Path
+from typing import TYPE_CHECKING
 
+import yaml
 from PIL import Image, ImageFile, PngImagePlugin
 
 from .distributed_iterable import DistributedIterableDataset
@@ -46,6 +52,11 @@ from .parquet_utils import get_parquet_data_paths, init_arrow_pf_fs
 from .utils import pil_img2rgb
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from transformers import PreTrainedTokenizerBase
+
+    from .packing import PackedDataset
 
 Image.MAX_IMAGE_PIXELS = 200000000
 ImageFile.LOAD_TRUNCATED_IMAGES = True
@@ -411,6 +422,110 @@ DATASET_REGISTRY = {
 DEFAULT_DATASET_INFO = {}
 
 
+@dataclass
+class BagelDatasetConfig:
+    """Declarative configuration for the packed BAGEL multimodal dataset."""
+
+    grouped_datasets: Mapping[str, object] | None = None
+    grouped_datasets_path: str | None = None
+    dataset_info: Mapping[str, object] | None = None
+    dataset_info_path: str | None = None
+    expected_num_tokens: int = 32768
+    max_num_tokens_per_sample: int = 16384
+    max_num_tokens: int = 36864
+    prefer_buffer_before: int = 16384
+    max_buffer_size: int = 50
+    interpolate_pos: bool = False
+    use_flex: bool = False
+    data_seed: int = 42
+    text_cond_dropout_prob: float = 0.1
+    vit_cond_dropout_prob: float = 0.4
+    vae_cond_dropout_prob: float = 0.1
+    vae_image_downsample: int = 16
+    max_latent_size: int = 32
+    vit_patch_size: int = 14
+    max_num_patch_per_side: int = 70
+
+    @staticmethod
+    def _resolve_mapping(
+        *,
+        inline: Mapping[str, object] | None,
+        path: str | None,
+        name: str,
+    ) -> dict[str, object]:
+        """Resolve one inline or YAML/JSON mapping without mutating config state."""
+        if path is not None:
+            config_path = Path(path)
+            with config_path.open("r") as file:
+                value = yaml.safe_load(file) if config_path.suffix in (".yaml", ".yml") else json.load(file)
+        elif inline is not None:
+            value = dict(inline)
+        else:
+            raise ValueError(f"BAGEL dataset config requires {name} or {name}_path")
+        if not isinstance(value, Mapping):
+            raise TypeError(f"BAGEL {name} must resolve to a mapping, got {type(value).__name__}")
+        return deepcopy(dict(value))
+
+    def build(
+        self,
+        *,
+        tokenizer: "PreTrainedTokenizerBase",
+        special_tokens: Mapping[str, object],
+        rank: int,
+        world_size: int,
+        num_workers: int,
+        global_seed: int,
+        data_status: object | None = None,
+    ) -> "PackedDataset":
+        """Build and initialize the packed BAGEL dataset.
+
+        Args:
+            tokenizer: Runtime tokenizer used by the packed dataset.
+            special_tokens: Runtime BAGEL special-token mapping.
+            rank: Global distributed rank used for source-data sharding.
+            world_size: Global distributed world size.
+            num_workers: Dataloader worker count used to shard source files.
+            global_seed: Ranked-training base seed used by worker-start reseeding.
+            data_status: Optional dataset resume state.
+
+        Returns:
+            Initialized packed BAGEL iterable dataset.
+        """
+        from .packing import PackedDataset
+
+        grouped_datasets = self._resolve_mapping(
+            inline=self.grouped_datasets,
+            path=self.grouped_datasets_path,
+            name="grouped_datasets",
+        )
+        dataset_info = self._resolve_mapping(
+            inline=self.dataset_info,
+            path=self.dataset_info_path,
+            name="dataset_info",
+        )
+        runtime_config = replace(self, grouped_datasets=grouped_datasets, dataset_info=dataset_info)
+        dataset = PackedDataset(
+            data_config=runtime_config,
+            tokenizer=tokenizer,
+            special_tokens=special_tokens,
+            local_rank=rank,
+            world_size=world_size,
+            num_workers=num_workers,
+            expected_num_tokens=self.expected_num_tokens,
+            max_num_tokens_per_sample=self.max_num_tokens_per_sample,
+            max_num_tokens=self.max_num_tokens,
+            prefer_buffer_before=self.prefer_buffer_before,
+            max_buffer_size=self.max_buffer_size,
+            interpolate_pos=self.interpolate_pos,
+            use_flex=self.use_flex,
+            data_status=data_status,
+            dataset_info=dataset_info,
+            global_seed=global_seed,
+        )
+        dataset.set_epoch(self.data_seed)
+        return dataset
+
+
 def make_bagel_multimodal_dataset(
     *,
     tokenizer,
@@ -448,29 +563,9 @@ def make_bagel_multimodal_dataset(
     DataLoader iteration (and for the pre-iter RNG reseed — see
     :meth:`PackedDataset.set_epoch` docstring).
     """
-    # Lazy import to avoid a circular: packing imports DATASET_REGISTRY from
-    # here, so we defer the packing import until factory call time.
-    from .packing import DataConfig, PackedDataset
-
-    data_config = DataConfig(
+    return BagelDatasetConfig(
         grouped_datasets=grouped_datasets,
-        text_cond_dropout_prob=text_cond_dropout_prob,
-        vit_cond_dropout_prob=vit_cond_dropout_prob,
-        vae_cond_dropout_prob=vae_cond_dropout_prob,
-        vae_image_downsample=vae_image_downsample,
-        max_latent_size=max_latent_size,
-        vit_patch_size=vit_patch_size,
-        max_num_patch_per_side=max_num_patch_per_side,
-    )
-    data_config.data_seed = data_seed
-
-    return PackedDataset(
-        data_config=data_config,
-        tokenizer=tokenizer,
-        special_tokens=special_tokens,
-        local_rank=local_rank,
-        world_size=world_size,
-        num_workers=num_workers,
+        dataset_info=dataset_info,
         expected_num_tokens=expected_num_tokens,
         max_num_tokens_per_sample=max_num_tokens_per_sample,
         max_num_tokens=max_num_tokens,
@@ -478,6 +573,20 @@ def make_bagel_multimodal_dataset(
         max_buffer_size=max_buffer_size,
         interpolate_pos=interpolate_pos,
         use_flex=use_flex,
+        data_seed=data_seed,
+        text_cond_dropout_prob=text_cond_dropout_prob,
+        vit_cond_dropout_prob=vit_cond_dropout_prob,
+        vae_cond_dropout_prob=vae_cond_dropout_prob,
+        vae_image_downsample=vae_image_downsample,
+        max_latent_size=max_latent_size,
+        vit_patch_size=vit_patch_size,
+        max_num_patch_per_side=max_num_patch_per_side,
+    ).build(
+        tokenizer=tokenizer,
+        special_tokens=special_tokens,
+        rank=local_rank,
+        world_size=world_size,
+        num_workers=num_workers,
+        global_seed=data_seed,
         data_status=data_status,
-        dataset_info=dataset_info,
     )

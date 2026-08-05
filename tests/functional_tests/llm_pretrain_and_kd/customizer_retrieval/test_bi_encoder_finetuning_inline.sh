@@ -24,7 +24,7 @@ python3 -m coverage run ${COVERAGE_ARGS} \
     tests/functional_tests/llm_pretrain_and_kd/customizer_retrieval/recipe.yaml \
     --model.pretrained_model_name_or_path $TEST_DATA_DIR/llama-nemotron-embed-1b-v2/ \
     --tokenizer.pretrained_model_name_or_path $TEST_DATA_DIR/llama-nemotron-embed-1b-v2/ \
-    --dataloader.dataset.data_dir_list $TEST_DATA_DIR/embedding_testdata/training.jsonl \
+    --dataset.data_dir_list $TEST_DATA_DIR/embedding_testdata/training.jsonl \
 
 # Compare baseline vs finetuned bi-encoder checkpoint (pos-neg separation should not degrade).
 python3 -m coverage run --append ${COVERAGE_ARGS} \

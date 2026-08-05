@@ -63,6 +63,7 @@ dataset:
   _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
   dataset_name: rajpurkar/squad
   split: train
+  chat_template: examples/llm_finetune/olmo/chat_template.jinja
 
 packed_sequence:
   packed_sequence_size: 0
@@ -77,6 +78,7 @@ validation_dataset:
   dataset_name: rajpurkar/squad
   split: validation
   limit_dataset_samples: 64
+  chat_template: examples/llm_finetune/olmo/chat_template.jinja
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader

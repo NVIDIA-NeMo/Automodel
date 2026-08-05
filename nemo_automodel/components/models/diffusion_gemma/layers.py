@@ -41,54 +41,31 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from transformers.models.diffusion_gemma.configuration_diffusion_gemma import DiffusionGemmaTextConfig
+from transformers.models.diffusion_gemma.modeling_diffusion_gemma import (
+    DiffusionGemmaRMSNorm,
+    apply_rotary_pos_emb,
+    repeat_kv,
+)
+from transformers.models.diffusion_gemma.modeling_diffusion_gemma import (
+    DiffusionGemmaSelfConditioning as DiffusionGemmaSelfConditioning,
+)
+from transformers.models.diffusion_gemma.modeling_diffusion_gemma import (
+    DiffusionGemmaText4MLP as DiffusionGemmaMLP,
+)
+from transformers.models.diffusion_gemma.modeling_diffusion_gemma import (
+    DiffusionGemmaTextRotaryEmbedding as DiffusionGemmaTextRotaryEmbedding,
+)
 
-from nemo_automodel.shared.import_utils import UnavailableMeta
-
-
-def _make_missing(name: str):
-    return UnavailableMeta(name, (), {"_msg": "transformers diffusion_gemma implementation is not available."})
-
+from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.gemma4_moe.model import Gemma4MoE
+from nemo_automodel.components.moe.layers import MoEConfig
 
 # Leaf layers are reused directly from the released transformers diffusion_gemma
 # implementation so the model tracks Google's release. ``DiffusionGemmaMLP`` is
 # the reference's ``DiffusionGemmaText4MLP``. ``DiffusionGemmaRMSNorm`` /
 # ``DiffusionGemmaTextRotaryEmbedding`` / ``DiffusionGemmaSelfConditioning`` are
 # re-exported here because ``model.py`` and the backbone compose them.
-try:
-    from transformers.models.diffusion_gemma.configuration_diffusion_gemma import (
-        DiffusionGemmaTextConfig as DiffusionGemmaTextConfig,
-    )
-    from transformers.models.diffusion_gemma.modeling_diffusion_gemma import (
-        DiffusionGemmaRMSNorm as DiffusionGemmaRMSNorm,
-    )
-    from transformers.models.diffusion_gemma.modeling_diffusion_gemma import (
-        DiffusionGemmaSelfConditioning as DiffusionGemmaSelfConditioning,
-    )
-    from transformers.models.diffusion_gemma.modeling_diffusion_gemma import (
-        DiffusionGemmaText4MLP as DiffusionGemmaMLP,
-    )
-    from transformers.models.diffusion_gemma.modeling_diffusion_gemma import (
-        DiffusionGemmaTextRotaryEmbedding as DiffusionGemmaTextRotaryEmbedding,
-    )
-    from transformers.models.diffusion_gemma.modeling_diffusion_gemma import (
-        apply_rotary_pos_emb,
-        repeat_kv,
-    )
-
-    _FORK_AVAILABLE = True
-except (ModuleNotFoundError, ImportError):
-    _FORK_AVAILABLE = False
-    DiffusionGemmaTextConfig = _make_missing("DiffusionGemmaTextConfig")
-    DiffusionGemmaMLP = _make_missing("DiffusionGemmaMLP")
-    DiffusionGemmaRMSNorm = _make_missing("DiffusionGemmaRMSNorm")
-    DiffusionGemmaSelfConditioning = _make_missing("DiffusionGemmaSelfConditioning")
-    DiffusionGemmaTextRotaryEmbedding = _make_missing("DiffusionGemmaTextRotaryEmbedding")
-    apply_rotary_pos_emb = _make_missing("apply_rotary_pos_emb")
-    repeat_kv = _make_missing("repeat_kv")
-
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.gemma4_moe.model import Gemma4MoE
-from nemo_automodel.components.moe.layers import MoEConfig
 
 
 def eager_attention_forward(
