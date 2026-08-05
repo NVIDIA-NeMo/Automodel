@@ -196,7 +196,20 @@ def _enrich_base_job(job: Dict[str, Any], ci_config: Dict[str, Any], scope: str)
     for key, value in ci_config.get("env_vars", {}).items():
         job["variables"][key] = str(value)
 
-    job["variables"]["HAS_ROBUSTNESS"] = str(bool(ci_config.get("checkpoint_robustness"))).lower()
+    robustness_config = ci_config.get("checkpoint_robustness") or {}
+    job["variables"]["HAS_ROBUSTNESS"] = str(bool(robustness_config)).lower()
+    if robustness_config.get("process_isolation"):
+        job["variables"]["CHECKPOINT_ROBUSTNESS_PROCESS_ISOLATION"] = "true"
+        if "CHECKPOINT_ROBUSTNESS_PHASES" not in job["variables"]:
+            robustness_phases = []
+            if robustness_config.get("check_source_load_parity"):
+                robustness_phases.extend(("source_load_reference", "source_load_parity"))
+            robustness_phases.extend(("train_and_save", "automodel_reload"))
+            if not robustness_config.get("skip_hf_reload"):
+                robustness_phases.append("hf_reload")
+            if not robustness_config.get("no_check_resume"):
+                robustness_phases.extend(("resume_baseline", "resume"))
+            job["variables"]["CHECKPOINT_ROBUSTNESS_PHASES"] = " ".join(robustness_phases)
 
     # Convergence tests run for 2 epochs; double the slurm time allocation.
     if scope == "convergence":
