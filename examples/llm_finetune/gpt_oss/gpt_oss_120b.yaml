@@ -116,3 +116,5 @@ ci:
   local_batch_size: 4
   nodes: 4
   time: "01:00:00"
+  env_vars:
+    PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
