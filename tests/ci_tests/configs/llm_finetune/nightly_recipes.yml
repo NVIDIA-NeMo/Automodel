@@ -38,6 +38,7 @@ configs:
   - nemotron/nemotron_nano_8b_v1_squad.yaml
   - nemotron/nemotron_nano_9b_squad.yaml
   - nemotron/nemotron_nano_v3_hellaswag.yaml
+  - nemotron/nemotron_nano_v3_singlegpu_lora.yaml
   - nemotron/nemotron_super_v3_hellaswag.yaml
   - nemotron/llama3_3_nemotron_super_49B_squad.yaml
   - nemotron_flash/nemotron_flash_1b_squad.yaml
