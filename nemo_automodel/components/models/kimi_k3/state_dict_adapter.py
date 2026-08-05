@@ -177,27 +177,34 @@ class KimiK3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
     def _expert_path_segment(self) -> str:
         return "mlp.experts"
 
+    # The prefix is deliberately open-ended: besides the bare native ``model.``
+    # root, PEFT saves carry keys under the ``base_model.model.`` outer prefix,
+    # and those expert LoRA keys (``...gate_proj.lora_A.weight``) need the same
+    # w1/w2/w3 renames as the plain expert weights or the saved adapter ends up
+    # with key names that don't exist in the checkpoint layout.
     def _map_hf_expert_key_to_generic(self, key: str) -> str:
         match = re.match(
-            r"(?P<prefix>(?:model\.)?layers\.\d+)\.block_sparse_moe\.experts\.(?P<expert>\d+)\."
-            r"(?P<proj>w1|w2|w3)\.weight$",
+            r"(?P<prefix>.*?layers\.\d+)\.block_sparse_moe\.experts\.(?P<expert>\d+)\."
+            r"(?P<proj>w1|w2|w3)(?P<lora>\.lora_[AB])?\.weight$",
             key,
         )
         if match is None:
             return key
         projection = _HF_TO_GENERIC_EXPERT_PROJ[match.group("proj")]
-        return f"{match.group('prefix')}.mlp.experts.{match.group('expert')}.{projection}.weight"
+        lora = match.group("lora") or ""
+        return f"{match.group('prefix')}.mlp.experts.{match.group('expert')}.{projection}{lora}.weight"
 
     def _map_generic_expert_key_to_hf(self, key: str) -> str:
         match = re.match(
-            r"(?P<prefix>(?:model\.)?layers\.\d+)\.mlp\.experts\.(?P<expert>\d+)\."
-            r"(?P<proj>gate_proj|up_proj|down_proj)\.weight$",
+            r"(?P<prefix>.*?layers\.\d+)\.mlp\.experts\.(?P<expert>\d+)\."
+            r"(?P<proj>gate_proj|up_proj|down_proj)(?P<lora>\.lora_[AB])?\.weight$",
             key,
         )
         if match is None:
             return key
         projection = _GENERIC_TO_HF_EXPERT_PROJ[match.group("proj")]
-        return f"{match.group('prefix')}.block_sparse_moe.experts.{match.group('expert')}.{projection}.weight"
+        lora = match.group("lora") or ""
+        return f"{match.group('prefix')}.block_sparse_moe.experts.{match.group('expert')}.{projection}{lora}.weight"
 
     def to_hf(
         self,
@@ -300,14 +307,23 @@ class KimiK3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
 
     @staticmethod
     def _add_hf_text_prefix(key: str) -> str:
-        """Prefix native text keys while leaving vision/projector keys unchanged."""
+        """Prefix native text keys while leaving vision/projector keys unchanged.
+
+        PEFT adapter keys keep their ``base_model.model.`` outer prefix, so for
+        those the ``language_model.`` namespace goes inside it — matching how
+        PEFT names modules on the actual HF model.
+        """
         if key.startswith(("model.", "lm_head.")):
             return f"language_model.{key}"
+        if key.startswith(("base_model.model.model.", "base_model.model.lm_head.")):
+            return "base_model.model.language_model." + key.removeprefix("base_model.model.")
         return key
 
     @staticmethod
     def _strip_hf_text_prefix(key: str) -> str:
         """Remove the K3 checkpoint's ``language_model.`` namespace."""
+        if key.startswith("base_model.model.language_model."):
+            return "base_model.model." + key.removeprefix("base_model.model.language_model.")
         return key.removeprefix("language_model.")
 
     def _normalize_checkpoint_tensor(self, key: str, value: Any) -> Any:
