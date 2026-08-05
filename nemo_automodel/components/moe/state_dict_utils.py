@@ -30,22 +30,49 @@ def get_submesh(device_mesh: DeviceMesh, dims: tuple[str, ...]) -> DeviceMesh:
     return device_mesh[dims]
 
 
+def _get_expert_mesh_dim_index(dtensor: DTensor) -> int | None:
+    """Find the device-mesh dimension that partitions a grouped expert tensor.
+
+    Args:
+        dtensor: DTensor with global shape [experts, ...] and arbitrary trailing dimensions. A named ``ep`` mesh
+            dimension owns the expert partition when present; otherwise a ``Shard(0)`` placement identifies an
+            EP-free FSDP partition of the experts axis.
+
+    Returns:
+        Index of the expert-partitioning mesh dimension, or ``None`` when every rank retains all experts.
+    """
+    mesh_dim_names = tuple(dtensor.device_mesh.mesh_dim_names)
+    if "ep" in mesh_dim_names:
+        return mesh_dim_names.index("ep")
+
+    return next(
+        (
+            dim_idx
+            for dim_idx, placement in enumerate(dtensor.placements)
+            if isinstance(placement, Shard) and placement.dim == 0
+        ),
+        None,
+    )
+
+
 def get_expert_slice_for_rank(experts_tensor: torch.Tensor, n_experts: int) -> tuple[torch.Tensor, int, int]:
     """
     Get the slice of experts present on the current rank for a DTensor.
 
     For non-DTensors, returns the full tensor with start_expert=0, end_expert=n_experts.
-    For DTensors sharded along the expert dimension (dim=0), returns only the local experts.
+    For DTensors sharded along the expert dimension (dim=0), returns only the local experts. The mesh dimension
+    may be the explicit ``ep`` dimension or an EP-free FSDP dimension such as ``dp_shard_cp``.
 
     Args:
-        experts_tensor: Input tensor containing expert weights [n_experts, ...]
-        n_experts: Total number of experts across all ranks
+        experts_tensor: Tensor with global shape [experts, ...] and arbitrary trailing dimensions. For a DTensor,
+            the per-rank local shape is [local_experts, ...] when a mesh dimension uses ``Shard(0)``; other
+            placements retain ``experts`` on the first local axis.
+        n_experts: Total number of experts across all ranks.
 
     Returns:
-        tuple of (local_tensor, start_expert_id, end_expert_id)
-        - local_tensor: The local portion of the tensor
-        - start_expert_id: Global ID of the first expert on this rank
-        - end_expert_id: Global ID after the last expert on this rank (exclusive)
+        Tuple containing the local tensor of shape [local_experts, ...], the inclusive global ID of its first
+        expert, and the exclusive global ID after its last expert. The local tensor aliases the input's local
+        storage.
     """
     if not is_dtensor(experts_tensor):
         return experts_tensor, 0, n_experts
@@ -54,14 +81,17 @@ def get_expert_slice_for_rank(experts_tensor: torch.Tensor, n_experts: int) -> t
     local_tensor = dtensor.to_local()
 
     device_mesh = dtensor.device_mesh
-    assert "ep" in device_mesh.mesh_dim_names, "ep mesh dimension not found"
-    ep_mesh = get_submesh(device_mesh, ("ep",))
-    current_rank = ep_mesh.get_local_rank()
+    expert_mesh_dim_idx = _get_expert_mesh_dim_index(dtensor)
+    if expert_mesh_dim_idx is None:
+        return local_tensor, 0, n_experts
 
-    placement = dtensor.placements[-1]  # Assume single device mesh for now
+    expert_mesh_dim_name = device_mesh.mesh_dim_names[expert_mesh_dim_idx]
+    expert_mesh = get_submesh(device_mesh, (expert_mesh_dim_name,))
+    placement = dtensor.placements[expert_mesh_dim_idx]
     if isinstance(placement, Shard) and placement.dim == 0:
         # Tensor is sharded along expert dimension
-        world_size = ep_mesh.size()
+        current_rank = expert_mesh.get_local_rank()
+        world_size = expert_mesh.size()
 
         # Calculate expert range for this rank
         experts_per_rank = n_experts // world_size
@@ -81,26 +111,26 @@ def get_expert_slice_for_rank(experts_tensor: torch.Tensor, n_experts: int) -> t
     elif isinstance(placement, Replicate):
         # Tensor is replicated - all ranks have full data
         return local_tensor, 0, n_experts
-    else:
-        # Other sharding patterns - assume full range for now
-        # Could be extended to handle sharding along other dimensions
-        return local_tensor, 0, n_experts
+    # Other sharding patterns retain every expert on the rank.
+    return local_tensor, 0, n_experts
 
 
 def split_experts_weights_dtensor_aware(weight: torch.Tensor, n_experts: int) -> tuple[list[torch.Tensor], list[int]]:
     """
     Split expert weights, handling both regular tensors and DTensors.
 
-    For DTensors, only splits the experts present on the current rank.
+    For DTensors sharded on the expert axis, only splits the experts present on the current rank. Other DTensor
+    placements retain all experts and are adjusted after removing the expert tensor dimension.
 
     Args:
-        weight: Expert weights tensor [n_experts, ...] (regular tensor or DTensor)
-        n_experts: Total number of experts across all ranks
+        weight: Tensor with global shape [experts, ...] and arbitrary trailing dimensions. A ``Shard(0)`` DTensor
+            has local shape [local_experts, ...]; inner-axis shards retain shape [experts, ...] locally.
+        n_experts: Total number of experts across all ranks.
 
     Returns:
-        tuple of (split_weights, expert_ids)
-        - split_weights: List of individual expert weight tensors
-        - expert_ids: List of global expert IDs corresponding to split_weights
+        Tuple containing per-expert tensors of shape [...] and their global expert IDs. Each output aliases the
+        corresponding local input slice. Any retained DTensor ``Shard(d)`` placement becomes ``Shard(d - 1)``
+        after the experts axis is removed.
     """
     local_tensor, start_expert, end_expert = get_expert_slice_for_rank(weight, n_experts)
     local_n_experts = end_expert - start_expert
@@ -120,19 +150,23 @@ def split_experts_weights_dtensor_aware(weight: torch.Tensor, n_experts: int) ->
         original_placements = weight.placements
         mesh_dim_names = list(weight.device_mesh.mesh_dim_names)
 
-        # 'ep' is guaranteed to be present; remove it
-        ep_dim_idx = mesh_dim_names.index("ep")
-        remaining_mesh_dims = mesh_dim_names[:ep_dim_idx] + mesh_dim_names[ep_dim_idx + 1 :]
+        # Remove the mesh dimension that partitions experts. With EP disabled, this may be an FSDP dimension.
+        expert_mesh_dim_idx = _get_expert_mesh_dim_index(weight)
+        if expert_mesh_dim_idx is None:
+            remaining_mesh_dims = mesh_dim_names
+            new_placements_template = original_placements
+        else:
+            remaining_mesh_dims = mesh_dim_names[:expert_mesh_dim_idx] + mesh_dim_names[expert_mesh_dim_idx + 1 :]
+            new_placements_template = (
+                original_placements[:expert_mesh_dim_idx] + original_placements[expert_mesh_dim_idx + 1 :]
+            )
 
-        # Build device mesh without 'ep'
+        # Build a device mesh without the dimension that partitioned experts.
         if remaining_mesh_dims and any(map(lambda x: get_submesh(device_mesh, (x,)).size() > 1, remaining_mesh_dims)):
             new_device_mesh = get_submesh(device_mesh, tuple(remaining_mesh_dims))
         else:
             new_device_mesh = None
             is_weight_dtensor = False
-
-        # Placements without the 'ep' dimension
-        new_placements_template = original_placements[:ep_dim_idx] + original_placements[ep_dim_idx + 1 :]
 
     for i in range(local_n_experts):
         expert_weight = local_tensor[i]  # Shape: [...] (expert dimension removed)
