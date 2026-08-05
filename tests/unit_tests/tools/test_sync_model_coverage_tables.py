@@ -22,6 +22,9 @@ import pytest
 import yaml
 
 from tests.ci_tests.utils.sync_model_coverage_tables import (
+    DATED_SUPPORT_TABLE_HEADER,
+    DIFFUSION_MODELS_END_MARKER,
+    DIFFUSION_MODELS_START_MARKER,
     HOMEPAGE_END_MARKER,
     HOMEPAGE_START_MARKER,
     MODEL_TYPE_OVERVIEW_PATHS,
@@ -36,19 +39,43 @@ from tests.ci_tests.utils.sync_model_coverage_tables import (
     _render_registry_table,
     _replace_generated_block,
     _sync_tables,
+    _validate_dated_support_tables_are_generated,
 )
 
 
 def _write_typed_overview_templates(repo_root: Path) -> list[Path]:
     paths = []
-    for _, relative_path in MODEL_TYPE_OVERVIEW_PATHS:
+    for model_type, relative_path in MODEL_TYPE_OVERVIEW_PATHS:
         path = repo_root / "docs" / "model-coverage" / relative_path
         path.parent.mkdir(parents=True, exist_ok=True)
+        diffusion_models_block = ""
+        if model_type == "Diffusion":
+            diffusion_models_block = f"{DIFFUSION_MODELS_START_MARKER}\nstale\n{DIFFUSION_MODELS_END_MARKER}\n"
         path.write_text(
-            f"before\n{SUPPORT_LOG_START_MARKER}\nstale\n{SUPPORT_LOG_END_MARKER}\nafter\n",
+            f"before\n{diffusion_models_block}{SUPPORT_LOG_START_MARKER}\nstale\n{SUPPORT_LOG_END_MARKER}\nafter\n",
             encoding="utf-8",
         )
         paths.append(path)
+    diffusion_model_path = repo_root / "docs" / "model-coverage" / "diffusion" / "test" / "model.mdx"
+    diffusion_model_path.parent.mkdir(parents=True)
+    diffusion_model_path.write_text(
+        """---
+title: "Test Diffusion Model"
+slug: model-coverage/diffusion/test/model
+---
+
+<Info>
+
+| | |
+|---|---|
+| **Task** | Text-to-Image |
+| **Architecture** | DiT (Flow Matching) |
+| **HF Org** | [Test-Owner](https://huggingface.co/Test-Owner) |
+
+</Info>
+""",
+        encoding="utf-8",
+    )
     return paths
 
 
@@ -384,6 +411,11 @@ def test_sync_tables_writes_support_log_homepage_and_registry(tmp_path):
         assert len(typed_rows) == len([release for release in releases if release["type"] == model_type])
         assert all(f"| {model_type} |" in row for row in typed_rows)
         assert "<Tabs>" not in typed_overview
+        if model_type == "Diffusion":
+            assert (
+                "| Test Owner | [Test Diffusion Model](/model-coverage/diffusion/test/model) | "
+                "Text-to-Image | DiT (Flow Matching) |"
+            ) in typed_overview
     homepage = (tmp_path / "docs" / "index.mdx").read_text(encoding="utf-8")
     for document in (support_log, homepage):
         assert document.count('<div className="compact-model-tables">') == 1
@@ -644,3 +676,20 @@ def test_sync_tables_check_rejects_stale_generated_support_log(tmp_path):
 
     with pytest.raises(ValueError, match="latest-models.mdx"):
         _sync_tables(tmp_path, check=True)
+
+
+def test_dated_support_tables_must_be_generated(tmp_path):
+    docs_dir = tmp_path / "docs" / "model-coverage"
+    docs_dir.mkdir(parents=True)
+    generated_path = docs_dir / "generated.mdx"
+    generated_path.write_text(
+        f"{SUPPORT_LOG_START_MARKER}\n{DATED_SUPPORT_TABLE_HEADER}\n{SUPPORT_LOG_END_MARKER}\n",
+        encoding="utf-8",
+    )
+
+    _validate_dated_support_tables_are_generated(tmp_path)
+
+    manual_path = docs_dir / "manual.mdx"
+    manual_path.write_text(f"{DATED_SUPPORT_TABLE_HEADER}\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="manual.mdx"):
+        _validate_dated_support_tables_are_generated(tmp_path)

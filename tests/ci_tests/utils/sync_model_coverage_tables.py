@@ -30,6 +30,8 @@ HOMEPAGE_START_MARKER = "{/* BEGIN GENERATED LATEST MODEL SUPPORT */}"
 HOMEPAGE_END_MARKER = "{/* END GENERATED LATEST MODEL SUPPORT */}"
 SUPPORT_LOG_START_MARKER = "{/* BEGIN GENERATED MODEL SUPPORT LOG */}"
 SUPPORT_LOG_END_MARKER = "{/* END GENERATED MODEL SUPPORT LOG */}"
+DIFFUSION_MODELS_START_MARKER = "{/* BEGIN GENERATED DIFFUSION MODELS */}"
+DIFFUSION_MODELS_END_MARKER = "{/* END GENERATED DIFFUSION MODELS */}"
 REGISTRY_START_MARKER = "{/* BEGIN GENERATED MODEL ARCHITECTURES */}"
 REGISTRY_END_MARKER = "{/* END GENERATED MODEL ARCHITECTURES */}"
 HF_MODEL_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
@@ -39,6 +41,7 @@ DOCS_PAGE_PATTERN = re.compile(r"^/[a-z0-9][a-z0-9/-]*$")
 MODEL_TYPE_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9 -]*$")
 MARKDOWN_UNSAFE_PATTERN = re.compile(r"[\[\]|<>`\r\n]")
 REPOSITORY_URL = "https://github.com/NVIDIA-NeMo/Automodel/blob/main"
+DATED_SUPPORT_TABLE_HEADER = "| Date | Type | Model |"
 MODEL_TYPE_OVERVIEW_PATHS = (
     ("LLM", "llm/index.mdx"),
     ("VLM", "vlm/index.mdx"),
@@ -92,6 +95,15 @@ class _ModelRelease:
     brev_url: str | None
 
 
+@dataclass(frozen=True)
+class _DiffusionModel:
+    owner: str
+    model: str
+    docs_page: str
+    task: str
+    architecture: str
+
+
 def _replace_generated_block(document: str, start_marker: str, end_marker: str, generated_block: str) -> str:
     start = document.find(start_marker)
     end = document.find(end_marker)
@@ -102,6 +114,28 @@ def _replace_generated_block(document: str, start_marker: str, end_marker: str, 
     if document.find(end_marker, end + len(end_marker)) != -1:
         raise ValueError(f"Found multiple end markers: {end_marker}")
     return document[:start] + generated_block + document[end + len(end_marker) :]
+
+
+def _validate_dated_support_tables_are_generated(repo_root: Path) -> None:
+    generated_marker_pairs = (
+        (HOMEPAGE_START_MARKER, HOMEPAGE_END_MARKER),
+        (SUPPORT_LOG_START_MARKER, SUPPORT_LOG_END_MARKER),
+    )
+    docs_root = repo_root / "docs"
+    for path in docs_root.rglob("*.mdx"):
+        if "fern" in path.relative_to(docs_root).parts:
+            continue
+        document = path.read_text(encoding="utf-8")
+        ungenerated = document
+        for start_marker, end_marker in generated_marker_pairs:
+            start = ungenerated.find(start_marker)
+            end = ungenerated.find(end_marker)
+            if start != -1 and end != -1 and start < end:
+                ungenerated = ungenerated[:start] + ungenerated[end + len(end_marker) :]
+        if DATED_SUPPORT_TABLE_HEADER in ungenerated:
+            raise ValueError(
+                f"Dated model-support tables must be inside Python-generated markers: {path.relative_to(repo_root)}"
+            )
 
 
 def _require_catalog_text(raw_entry: dict[str, object], field: str, index: int) -> str:
@@ -384,6 +418,79 @@ def _render_homepage_table(releases: list[_ModelRelease]) -> str:
     )
 
 
+def _require_diffusion_page_field(document: str, pattern: str, path: Path, field: str) -> str:
+    match = re.search(pattern, document, flags=re.MULTILINE)
+    if match is None:
+        raise ValueError(f"Diffusion model page {path} is missing generated-table field {field!r}")
+    value = match.group(1).strip()
+    if not value or MARKDOWN_UNSAFE_PATTERN.search(value):
+        raise ValueError(f"Diffusion model page {path} has invalid generated-table field {field!r}")
+    return value
+
+
+def _format_hugging_face_org(owner: str) -> str:
+    words = owner.replace("-", " ").split()
+    return " ".join(word.upper() if word.casefold() == "ai" else word.capitalize() for word in words)
+
+
+def _render_diffusion_models_table(diffusion_docs_dir: Path) -> str:
+    models = []
+    for path in sorted(diffusion_docs_dir.glob("*/*.mdx")):
+        document = path.read_text(encoding="utf-8")
+        title = _require_diffusion_page_field(document, r'^title: "([^"]+)"$', path, "title")
+        slug = _require_diffusion_page_field(
+            document,
+            r"^slug: (model-coverage/diffusion/[a-z0-9][a-z0-9/-]+)$",
+            path,
+            "slug",
+        )
+        owner = _require_diffusion_page_field(
+            document,
+            r"^\| \*\*HF Org\*\* \| \[([^\]]+)\]\(https://huggingface\.co/[^)]+\) \|$",
+            path,
+            "HF Org",
+        )
+        task = _require_diffusion_page_field(
+            document,
+            r"^\| \*\*Tasks?\*\* \| ([^|]+) \|$",
+            path,
+            "Task",
+        )
+        architecture = _require_diffusion_page_field(
+            document,
+            r"^\| \*\*Architecture\*\* \| ([^|]+) \|$",
+            path,
+            "Architecture",
+        )
+        models.append(
+            _DiffusionModel(
+                owner=_format_hugging_face_org(owner),
+                model=title,
+                docs_page=f"/{slug}",
+                task=task,
+                architecture=architecture,
+            )
+        )
+
+    if not models:
+        raise ValueError(f"No diffusion model pages found under {diffusion_docs_dir}")
+
+    rows = [
+        f"| {model.owner} | [{model.model}]({model.docs_page}) | {model.task} | {model.architecture} |"
+        for model in sorted(models, key=lambda model: (model.owner.casefold(), model.model.casefold()))
+    ]
+
+    return "\n".join(
+        [
+            DIFFUSION_MODELS_START_MARKER,
+            "| Owner | Model | Task | Architecture |",
+            "|---|---|---|---|",
+            *rows,
+            DIFFUSION_MODELS_END_MARKER,
+        ]
+    )
+
+
 def _parse_registry_entries(source: str) -> list[tuple[str, str, str]]:
     tree = ast.parse(source)
     mapping_value: ast.AST | None = None
@@ -461,7 +568,9 @@ def _render_registry_table(
 
 
 def _generate_tables(repo_root: Path) -> dict[Path, str]:
+    _validate_dated_support_tables_are_generated(repo_root)
     release_catalog_path = repo_root / "docs" / "model-coverage" / "model-releases.json"
+    diffusion_docs_dir = repo_root / "docs" / "model-coverage" / "diffusion"
     support_log_path = repo_root / "docs" / "model-coverage" / "latest-models.mdx"
     homepage_path = repo_root / "docs" / "index.mdx"
     overview_path = repo_root / "docs" / "model-coverage" / "overview.mdx"
@@ -482,6 +591,13 @@ def _generate_tables(repo_root: Path) -> dict[Path, str]:
     aliases_source = aliases_path.read_text(encoding="utf-8")
 
     releases = _load_model_releases(release_catalog_path, repo_root)
+    generated_diffusion_models = _render_diffusion_models_table(diffusion_docs_dir)
+    typed_overviews["Diffusion"] = _replace_generated_block(
+        typed_overviews["Diffusion"],
+        DIFFUSION_MODELS_START_MARKER,
+        DIFFUSION_MODELS_END_MARKER,
+        generated_diffusion_models,
+    )
     generated_support_log = _render_support_log_table(releases)
     generated_homepage = _render_homepage_table(releases)
     recipe_architectures = {architecture for release in releases for architecture in release.architectures}
