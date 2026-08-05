@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import gc
 import glob
 import logging
@@ -869,12 +870,14 @@ class Checkpointer:
             t0 = time.monotonic()
             state_dict_from_disk = _load_hf_checkpoint_preserving_dtype(model_path)
             t_disk = time.monotonic()
-            if state_dict_from_disk is not None:
-                state_dict_from_disk = _maybe_adapt_state_dict_from_hf(
-                    model_state.model[0], state_dict_from_disk, moe_mesh=self.moe_mesh
-                )
-            else:
-                state_dict_from_disk = {}
+            with _phase_profile("from_hf_merge"):  # PROBE
+                if state_dict_from_disk is not None:
+                    state_dict_from_disk = _maybe_adapt_state_dict_from_hf(
+                        model_state.model[0], state_dict_from_disk, moe_mesh=self.moe_mesh
+                    )
+                else:
+                    state_dict_from_disk = {}
+            t_adapt = time.monotonic()  # PROBE
 
             # Apply key_mapping (e.g. _checkpoint_conversion_mapping) so that
             # HF checkpoint keys are renamed to match the model's parameter FQNs.
@@ -899,7 +902,8 @@ class Checkpointer:
             total_bytes = sum(
                 t.nelement() * t.element_size() for t in state_dict_from_disk.values() if isinstance(t, torch.Tensor)
             )
-            _load_full_state_dict_into_model(model_state.model, state_dict_from_disk)
+            with _phase_profile("into_model"):  # PROBE
+                _load_full_state_dict_into_model(model_state.model, state_dict_from_disk)
             t_end = time.monotonic()
 
             disk_s = t_disk - t0
@@ -910,6 +914,9 @@ class Checkpointer:
                 f"load_model: {gb:.2f} GB loaded in {total_s:.2f}s "
                 f"({gb / total_s:.2f} GB/s overall | "
                 f"disk read {disk_s:.2f}s, distribute {dist_s:.2f}s)"
+            )
+            logging.info(  # PROBE
+                f"phase_split: from_hf_merge={t_adapt - t_disk:.2f}s into_model={t_end - t_adapt:.2f}s"
             )
             del state_dict_from_disk
             gc.collect()
@@ -2545,6 +2552,57 @@ def _load_hf_checkpoint_preserving_dtype(model_path: str) -> Optional[dict[str, 
     elif _is_safetensors_checkpoint(model_path):
         return _load_hf_safetensors_checkpoint(model_path)
     return None
+
+
+@contextlib.contextmanager  # PROBE
+def _phase_profile(tag: str):
+    """torch op-level + Python-level + page-fault accounting for one load phase."""
+    if os.environ.get("AM_PROFILE_LOAD", "1") != "1":
+        yield
+        return
+
+    import cProfile
+    import io
+    import pstats
+    import resource
+
+    from torch.profiler import ProfilerActivity, profile
+
+    from nemo_automodel.components.moe import state_dict_mixin as _sdm
+
+    _sdm._WORKER_PROFILES = []  # collected by the merge worker pool
+    ru0 = resource.getrusage(resource.RUSAGE_SELF)
+    t0 = time.monotonic()
+    pr = cProfile.Profile()
+    torch_prof = profile(activities=[ProfilerActivity.CPU], record_shapes=False, with_stack=False)
+    torch_prof.__enter__()
+    pr.enable()
+    try:
+        yield
+    finally:
+        pr.disable()
+        torch_prof.__exit__(None, None, None)
+        elapsed = time.monotonic() - t0
+        ru1 = resource.getrusage(resource.RUSAGE_SELF)
+        logging.info(
+            f"profile[{tag}]: {elapsed:.2f}s wall | "
+            f"utime={ru1.ru_utime - ru0.ru_utime:.2f}s stime={ru1.ru_stime - ru0.ru_stime:.2f}s "
+            f"majflt={ru1.ru_majflt - ru0.ru_majflt} minflt={ru1.ru_minflt - ru0.ru_minflt}"
+        )
+        logging.info(
+            "profile[%s] torch ops:\n%s",
+            tag,
+            torch_prof.key_averages().table(sort_by="self_cpu_time_total", row_limit=20),
+        )
+        buf = io.StringIO()
+        stats = pstats.Stats(pr, stream=buf)
+        for wp in getattr(_sdm, "_WORKER_PROFILES", []) or []:
+            stats.add(wp)
+        stats.sort_stats("tottime").print_stats(20)
+        logging.info(
+            "profile[%s] python (main + %d workers):\n%s", tag, len(_sdm._WORKER_PROFILES or []), buf.getvalue()
+        )
+        _sdm._WORKER_PROFILES = None
 
 
 def _checkpoint_shard_files(model_path: str) -> list[str]:

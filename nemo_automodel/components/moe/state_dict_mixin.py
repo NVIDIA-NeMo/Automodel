@@ -42,9 +42,35 @@ def _local_tensor(t: torch.Tensor) -> torch.Tensor:
     return t.to_local() if is_dtensor(t) else t
 
 
+_WORKER_PROFILES = None  # PROBE: set to a list by the load profiler to collect worker stats
+
+
+def _profiled(fill):  # PROBE
+    """Wrap ``fill`` so each pool worker records its own cProfile (cProfile is per-thread)."""
+    import cProfile
+    import threading
+
+    local = threading.local()
+
+    def wrapped(i: int) -> None:
+        pr = getattr(local, "pr", None)
+        if pr is None:
+            pr = local.pr = cProfile.Profile()
+            _WORKER_PROFILES.append(pr)
+        pr.enable()
+        try:
+            fill(i)
+        finally:
+            pr.disable()
+
+    return wrapped
+
+
 def _fill_experts(fill, n_experts: int) -> None:
     """Apply ``fill(i)`` for each expert across a bounded pool of single-threaded workers."""
     workers = max(1, min(_MERGE_WORKERS, n_experts))
+    if _WORKER_PROFILES is not None:  # PROBE
+        fill = _profiled(fill)
     prev_threads = torch.get_num_threads()
     torch.set_num_threads(1)
     try:
