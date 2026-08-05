@@ -117,6 +117,8 @@ def _build_backbone_from_extracted_submodel(
         except KeyError as exc:
             raise ValueError(f"No HuggingFace sequence-classification model found for '{model_type}'.") from exc
     elif not has_supported_target:
+        if task == "embedding":
+            extracted_model.config.is_causal = False
         return extracted_model
     else:
         backbone_class = _get_supported_backbone_class(model_type, task)
@@ -223,15 +225,14 @@ def build_encoder_backbone(
     When ``extract_submodel`` is set, loads the parent model with HuggingFace
     Auto classes and extracts the dotted path. For supported extracted text
     backbones, it then builds the registered retrieval class for the requested
-    task (bidirectional base model for ``"embedding"``, sequence-classification
-    wrapper for ``"score"``). For unsupported extracted text backbones, it
-    returns the extracted model for ``"embedding"`` and wraps it with
+    task. For unsupported extracted text backbones, it returns the extracted model
+    with ``is_causal=False`` for ``"embedding"`` and wraps it with
     ``AutoModelForSequenceClassification`` for ``"score"``.
 
-    Without ``extract_submodel``, model types listed in
-    :data:`SUPPORTED_BACKBONES` resolve to custom bidirectional classes from
-    :class:`ModelRegistry`; all other model types fall back to HuggingFace Auto
-    classes.
+    Without ``extract_submodel``, model types listed in :data:`SUPPORTED_BACKBONES`
+    resolve to custom bidirectional classes from :class:`ModelRegistry`; all other
+    model types fall back to HuggingFace Auto classes, with embedding backbones
+    configured with ``is_causal=False``.
 
     Args:
         model_name_or_path: Path or HuggingFace Hub identifier.
@@ -253,7 +254,7 @@ def build_encoder_backbone(
         ValueError: If the task is unsupported for a known model type, or the
             architecture class is missing from :class:`ModelRegistry`.
     """
-    config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code)
+    config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code, **hf_kwargs)
     model_type = getattr(config, "model_type", "")
 
     if extract_submodel is not None:
@@ -288,7 +289,10 @@ def build_encoder_backbone(
         return AutoModelForSequenceClassification.from_pretrained(
             model_name_or_path, trust_remote_code=trust_remote_code, **hf_kwargs
         )
-    return AutoModel.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code, **hf_kwargs)
+    backbone = AutoModel.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code, **hf_kwargs)
+    if task == "embedding":
+        backbone.config.is_causal = False
+    return backbone
 
 
 def save_encoder_pretrained(model: nn.Module, save_directory: str, **kwargs) -> None:
@@ -328,7 +332,7 @@ def save_encoder_pretrained(model: nn.Module, save_directory: str, **kwargs) -> 
     model.model.save_pretrained(save_directory)
 
 
-# HuggingFace model_type -> task -> bidirectional architecture class name in ModelRegistry
+# Model types that require a registered custom retrieval backbone for each task.
 _LLAMA_TASKS = {
     "embedding": "LlamaBidirectionalModel",
     "score": "LlamaBidirectionalForSequenceClassification",
@@ -342,7 +346,6 @@ _LLAMA_NEMOTRON_VL_TASKS = {
 SUPPORTED_BACKBONES = {
     "llama": _LLAMA_TASKS,
     "llama_bidirec": _LLAMA_TASKS,
-    "ministral3": _MINISTRAL3_BIDIREC_TASKS,
     "ministral3_bidirec": _MINISTRAL3_BIDIREC_TASKS,
     "llama_nemotron_vl": _LLAMA_NEMOTRON_VL_TASKS,
 }
