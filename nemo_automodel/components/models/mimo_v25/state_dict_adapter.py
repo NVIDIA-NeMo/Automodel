@@ -20,6 +20,8 @@ from typing import Any
 
 import torch
 from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.tensor import DTensor
+from torch.distributed.tensor._utils import compute_local_shape_and_global_offset
 
 from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
 from nemo_automodel.components.models.common import BackendConfig
@@ -58,8 +60,9 @@ class MiMoV2StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
     into ``gate_and_up_projs`` and ``down_projs`` so EP can shard experts
     without materialising every expert on every rank.
 
-    MiMo-V2.5-Pro uses fused QKV (``self_attn.qkv_proj.weight``), so attention
-    projection keys require no renaming — they pass through unchanged.
+    MiMo-V2.5-Pro stores fused QKV projections as TP-interleaved shards. The
+    adapter dequantizes each checkpoint shard independently, then restores the
+    canonical ``[Q, K, V]`` row layout expected by the model.
     """
 
     def __init__(
@@ -144,12 +147,16 @@ class MiMoV2StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
             scale_key = key + "_scale_inv"
             if scale_key not in state_dict:
                 continue
-            state_dict[key] = dequantize_from_fp8(
-                state_dict[key],
-                state_dict[scale_key],
-                dtype=self.dtype,
-                name=key,
-            )
+            scale_inv = state_dict[scale_key]
+            if key.endswith(".self_attn.qkv_proj.weight"):
+                state_dict[key] = self._dequantize_interleaved_qkv(state_dict[key], scale_inv, key)
+            else:
+                state_dict[key] = dequantize_from_fp8(
+                    state_dict[key],
+                    scale_inv,
+                    dtype=self.dtype,
+                    name=key,
+                )
             scale_inv_keys.append(scale_key)
             dequantized_count += 1
 
@@ -158,3 +165,116 @@ class MiMoV2StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
 
         logger.debug("[MiMo V2.5-Pro FP8 Dequant] Dequantized %s weights", dequantized_count)
         return state_dict
+
+    def _dequantize_interleaved_qkv(
+        self,
+        weight: torch.Tensor,
+        scale_inv: torch.Tensor,
+        key: str,
+    ) -> torch.Tensor:
+        """Dequantize and canonicalize a TP-interleaved fused QKV projection.
+
+        Args:
+            weight: Tensor of shape [interleaved_qkv, hidden]. Axis 0 stores
+                checkpoint TP shards, each laid out as [Q_shard, K_shard,
+                V_shard]. A DTensor may shard either axis; its placements and
+                global shape are preserved in the returned tensor.
+            scale_inv: Tensor of shape [tp * scale_rows_per_shard,
+                scale_columns]. Each checkpoint TP shard owns an independent
+                128x128 FP8 scale grid.
+            key: Fully qualified weight name containing the decoder layer index.
+
+        Returns:
+            Tensor of shape [q_rows + k_rows + v_rows, hidden] in canonical
+            [Q, K, V] row order. DTensor inputs retain their original mesh and
+            placements.
+        """
+
+        match = re.search(r"layers\.(\d+)\.", key)
+        if match is None:
+            raise ValueError(f"Cannot determine MiMo layer index from {key}")
+        layer_idx = int(match.group(1))
+        is_swa = bool(self.config.hybrid_layer_pattern[layer_idx])
+
+        ckpt_tp = int(self.config.num_key_value_heads)
+        if is_swa:
+            num_heads = int(self.config.swa_num_attention_heads)
+            num_kv_heads = int(self.config.swa_num_key_value_heads)
+            head_dim = int(self.config.swa_head_dim)
+            v_head_dim = int(self.config.swa_v_head_dim)
+        else:
+            num_heads = int(self.config.num_attention_heads)
+            num_kv_heads = int(self.config.num_key_value_heads)
+            head_dim = int(self.config.head_dim)
+            v_head_dim = int(self.config.v_head_dim)
+
+        q_per_shard = (num_heads // ckpt_tp) * head_dim
+        k_per_shard = max(1, num_kv_heads // ckpt_tp) * head_dim
+        v_per_shard = max(1, num_kv_heads // ckpt_tp) * v_head_dim
+        rows_per_shard = q_per_shard + k_per_shard + v_per_shard
+        scale_rows_per_shard = (rows_per_shard + 127) // 128
+
+        if weight.shape[0] != ckpt_tp * rows_per_shard:
+            raise ValueError(
+                f"{key} has {weight.shape[0]} rows, expected {ckpt_tp * rows_per_shard} "
+                f"for {ckpt_tp} interleaved checkpoint shards"
+            )
+
+        distributed = isinstance(weight, DTensor)
+        local_weight = weight.to_local() if distributed else weight
+        full_scale = scale_inv.full_tensor() if isinstance(scale_inv, DTensor) else scale_inv
+        full_scale = full_scale.to(device=local_weight.device)
+        expected_scale_shape = (ckpt_tp * scale_rows_per_shard, (weight.shape[1] + 127) // 128)
+        if full_scale.shape != expected_scale_shape:
+            raise ValueError(f"{key} scale_inv has shape {full_scale.shape}, expected {expected_scale_shape}")
+
+        if distributed:
+            _, global_offset = compute_local_shape_and_global_offset(
+                weight.shape,
+                weight.device_mesh,
+                weight.placements,
+            )
+            row_offset, col_offset = global_offset
+        else:
+            row_offset, col_offset = 0, 0
+
+        global_rows = torch.arange(local_weight.shape[0], device=local_weight.device) + row_offset
+        scale_rows = (global_rows // rows_per_shard) * scale_rows_per_shard
+        scale_rows = scale_rows + (global_rows % rows_per_shard) // 128
+        scale_cols = (torch.arange(local_weight.shape[1], device=local_weight.device) + col_offset) // 128
+        scales = full_scale[scale_rows[:, None], scale_cols[None, :]]
+        local_dequant = (local_weight.float() * scales).to(self.dtype)
+
+        if distributed:
+            raw_dequant = DTensor.from_local(
+                local_dequant,
+                weight.device_mesh,
+                weight.placements,
+                shape=weight.shape,
+                stride=weight.stride(),
+            ).full_tensor()
+        else:
+            raw_dequant = local_dequant
+
+        shards = raw_dequant.chunk(ckpt_tp, dim=0)
+        canonical = torch.cat(
+            [shard[:q_per_shard] for shard in shards]
+            + [shard[q_per_shard : q_per_shard + k_per_shard] for shard in shards]
+            + [shard[q_per_shard + k_per_shard :] for shard in shards],
+            dim=0,
+        )
+
+        if not distributed:
+            return canonical
+        local_shape = local_weight.shape
+        canonical_local = canonical[
+            row_offset : row_offset + local_shape[0],
+            col_offset : col_offset + local_shape[1],
+        ].contiguous()
+        return DTensor.from_local(
+            canonical_local,
+            weight.device_mesh,
+            weight.placements,
+            shape=weight.shape,
+            stride=weight.stride(),
+        )
