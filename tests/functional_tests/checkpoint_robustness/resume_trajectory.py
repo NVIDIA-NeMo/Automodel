@@ -295,6 +295,9 @@ def _training_fingerprint_components(trainer: object) -> dict[str, str]:
     """Fingerprint independent-run inputs that must match before comparing metrics."""
     config = trainer.cfg.to_dict()
     step_scheduler = trainer.step_scheduler
+    step_scheduler_config = config.get("step_scheduler", {})
+    if not isinstance(step_scheduler_config, dict):
+        raise TypeError("step_scheduler config must serialize to a mapping for reproducibility comparison")
     lr_schedulers = trainer.lr_scheduler
     if lr_schedulers is not None and not isinstance(lr_schedulers, (list, tuple)):
         lr_schedulers = [lr_schedulers]
@@ -320,8 +323,8 @@ def _training_fingerprint_components(trainer: object) -> dict[str, str]:
             "tokenizer": _config_section(config, "tokenizer"),
         },
         "batch_and_topology": {
-            "global_batch_size": int(step_scheduler.global_batch_size),
-            "local_batch_size": int(step_scheduler.local_batch_size),
+            "global_batch_size": int(step_scheduler_config.get("global_batch_size", 32)),
+            "local_batch_size": int(step_scheduler_config.get("local_batch_size", 1)),
             "grad_acc_steps": int(step_scheduler.grad_acc_steps),
             "world_size": dist.get_world_size() if dist.is_initialized() else 1,
             "distributed": _config_section(config, "distributed"),

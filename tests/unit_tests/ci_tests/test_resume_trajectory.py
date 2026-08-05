@@ -15,6 +15,7 @@
 import json
 from types import SimpleNamespace
 
+from nemo_automodel.components.training.step_scheduler import StepScheduler
 from tests.functional_tests.checkpoint_robustness.resume_trajectory import (
     _TrainingReproducibilityRecorder,
     _compare_training_reproducibility,
@@ -193,6 +194,16 @@ def test_training_reproducibility_detects_independent_batch_order_divergence():
 
 
 def test_training_reproducibility_recorder_captures_runtime_batch_and_metrics():
+    step_scheduler = StepScheduler(
+        global_batch_size=2,
+        local_batch_size=1,
+        dp_size=1,
+        dataloader=[0, 1],
+        max_steps=2,
+        preemption_signal=None,
+    )
+    assert not hasattr(step_scheduler, "global_batch_size")
+    assert not hasattr(step_scheduler, "local_batch_size")
     trainer = SimpleNamespace(
         cfg=SimpleNamespace(
             to_dict=lambda: {
@@ -204,17 +215,10 @@ def test_training_reproducibility_recorder_captures_runtime_batch_and_metrics():
                 "optimizer": {"lr": 1e-4},
                 "lr_scheduler": {"lr_decay_steps": 2},
                 "loss_fn": {"name": "loss"},
+                "step_scheduler": {"global_batch_size": 2, "local_batch_size": 1},
             }
         ),
-        step_scheduler=SimpleNamespace(
-            step=0,
-            global_batch_size=2,
-            local_batch_size=1,
-            grad_acc_steps=2,
-            epoch=0,
-            num_epochs=1,
-            val_every_steps=2,
-        ),
+        step_scheduler=step_scheduler,
         lr_scheduler=SimpleNamespace(state_dict=lambda: {"last_epoch": 0}),
     )
     trainer._run_train_optim_step = lambda batches: SimpleNamespace(metrics={"loss": 0.75, "lr": 1e-4})
