@@ -156,6 +156,8 @@ MODEL_ARCH_MAPPING = OrderedDict(
         (
             "MiMoV2ForCausalLM",
             ("nemo_automodel.components.models.mimo_v25.model", "MiMoV2ForCausalLM"),
+        ),
+        (
             "LagunaForCausalLM",
             ("nemo_automodel.components.models.laguna.model", "LagunaForCausalLM"),
         ),
