@@ -51,6 +51,36 @@ navigation:
       - page: "Model Support Log"
         path: ../../model-coverage/latest-models.mdx
         slug: release-log
+      - section: "Model Support Logs by Type"
+        slug: release-logs
+        contents:
+          - page: "Large Language Models"
+            path: ../../model-coverage/release-logs/large-language-models.mdx
+            slug: large-language-models
+          - page: "Vision Language Models"
+            path: ../../model-coverage/release-logs/vision-language-models.mdx
+            slug: vision-language-models
+          - page: "Omni Models"
+            path: ../../model-coverage/release-logs/omni-models.mdx
+            slug: omni-models
+          - page: "Diffusion Language Models"
+            path: ../../model-coverage/release-logs/diffusion-language-models.mdx
+            slug: diffusion-language-models
+          - page: "Multimodal Models"
+            path: ../../model-coverage/release-logs/multimodal-models.mdx
+            slug: multimodal-models
+          - page: "Diffusion Models"
+            path: ../../model-coverage/release-logs/diffusion-models.mdx
+            slug: diffusion-models
+          - page: "Encoder-Decoder Models"
+            path: ../../model-coverage/release-logs/encoder-decoder-models.mdx
+            slug: encoder-decoder-models
+          - page: "Embedding Models"
+            path: ../../model-coverage/release-logs/embedding-models.mdx
+            slug: embedding-models
+          - page: "Reranking Models"
+            path: ../../model-coverage/release-logs/reranking-models.mdx
+            slug: reranking-models
       - section: "Large Language Models"
         slug: large-language-models
         contents:

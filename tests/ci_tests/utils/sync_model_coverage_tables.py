@@ -39,6 +39,17 @@ DOCS_PAGE_PATTERN = re.compile(r"^/[a-z0-9][a-z0-9/-]*$")
 MODEL_TYPE_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9 -]*$")
 MARKDOWN_UNSAFE_PATTERN = re.compile(r"[\[\]|<>`\r\n]")
 REPOSITORY_URL = "https://github.com/NVIDIA-NeMo/Automodel/blob/main"
+MODEL_TYPE_RELEASE_LOGS = (
+    ("LLM", "large-language-models"),
+    ("VLM", "vision-language-models"),
+    ("Omni", "omni-models"),
+    ("dLLM", "diffusion-language-models"),
+    ("Multimodal", "multimodal-models"),
+    ("Diffusion", "diffusion-models"),
+    ("Encoder-Decoder", "encoder-decoder-models"),
+    ("Embedding", "embedding-models"),
+    ("Reranking", "reranking-models"),
+)
 COMPACT_TABLE_STYLE = """<style>{`
   .compact-model-tables .fern-table-root {
     width: 100% !important;
@@ -459,12 +470,25 @@ def _generate_tables(repo_root: Path) -> dict[Path, str]:
     aliases_path = repo_root / "tests" / "unit_tests" / "_transformers" / "test_doc_coverage.py"
 
     support_log = support_log_path.read_text(encoding="utf-8")
+    typed_support_log_paths = {
+        model_type: repo_root / "docs" / "model-coverage" / "release-logs" / f"{slug}.mdx"
+        for model_type, slug in MODEL_TYPE_RELEASE_LOGS
+    }
+    typed_support_logs = {
+        model_type: path.read_text(encoding="utf-8") for model_type, path in typed_support_log_paths.items()
+    }
     homepage = homepage_path.read_text(encoding="utf-8")
     overview = overview_path.read_text(encoding="utf-8")
     registry_source = registry_path.read_text(encoding="utf-8")
     aliases_source = aliases_path.read_text(encoding="utf-8")
 
     releases = _load_model_releases(release_catalog_path, repo_root)
+    configured_model_types = {model_type for model_type, _ in MODEL_TYPE_RELEASE_LOGS}
+    unconfigured_model_types = {release.model_type for release in releases} - configured_model_types
+    if unconfigured_model_types:
+        raise ValueError(
+            "Model release types are missing typed support-log pages: " + ", ".join(sorted(unconfigured_model_types))
+        )
     generated_support_log = _render_support_log_table(releases)
     generated_homepage = _render_homepage_table(releases)
     recipe_architectures = {architecture for release in releases for architecture in release.architectures}
@@ -473,10 +497,19 @@ def _generate_tables(repo_root: Path) -> dict[Path, str]:
         recipe_architectures,
         _parse_doc_arch_aliases(aliases_source),
     )
-    return {
+    generated_documents = {
         support_log_path: _replace_generated_block(
             support_log, SUPPORT_LOG_START_MARKER, SUPPORT_LOG_END_MARKER, generated_support_log
         ),
+        **{
+            typed_support_log_paths[model_type]: _replace_generated_block(
+                typed_support_logs[model_type],
+                SUPPORT_LOG_START_MARKER,
+                SUPPORT_LOG_END_MARKER,
+                _render_support_log_table([release for release in releases if release.model_type == model_type]),
+            )
+            for model_type, _ in MODEL_TYPE_RELEASE_LOGS
+        },
         homepage_path: _replace_generated_block(
             homepage, HOMEPAGE_START_MARKER, HOMEPAGE_END_MARKER, generated_homepage
         ),
@@ -484,6 +517,7 @@ def _generate_tables(repo_root: Path) -> dict[Path, str]:
             overview, REGISTRY_START_MARKER, REGISTRY_END_MARKER, generated_registry
         ),
     }
+    return generated_documents
 
 
 def _sync_tables(repo_root: Path, *, check: bool) -> list[Path]:

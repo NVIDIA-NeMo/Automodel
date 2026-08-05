@@ -24,6 +24,7 @@ import yaml
 from tests.ci_tests.utils.sync_model_coverage_tables import (
     HOMEPAGE_END_MARKER,
     HOMEPAGE_START_MARKER,
+    MODEL_TYPE_RELEASE_LOGS,
     REGISTRY_END_MARKER,
     REGISTRY_START_MARKER,
     SUPPORT_LOG_END_MARKER,
@@ -36,6 +37,20 @@ from tests.ci_tests.utils.sync_model_coverage_tables import (
     _replace_generated_block,
     _sync_tables,
 )
+
+
+def _write_typed_support_log_templates(repo_root: Path) -> list[Path]:
+    release_log_dir = repo_root / "docs" / "model-coverage" / "release-logs"
+    release_log_dir.mkdir(parents=True)
+    paths = []
+    for _, slug in MODEL_TYPE_RELEASE_LOGS:
+        path = release_log_dir / f"{slug}.mdx"
+        path.write_text(
+            f"before\n{SUPPORT_LOG_START_MARKER}\nstale\n{SUPPORT_LOG_END_MARKER}\nafter\n",
+            encoding="utf-8",
+        )
+        paths.append(path)
+    return paths
 
 
 def _fern_slug(value: str) -> str:
@@ -336,6 +351,7 @@ def test_sync_tables_writes_support_log_homepage_and_registry(tmp_path):
     (tmp_path / "docs" / "model-coverage" / "latest-models.mdx").write_text(
         f"before\n{SUPPORT_LOG_START_MARKER}\nstale\n{SUPPORT_LOG_END_MARKER}\nafter\n", encoding="utf-8"
     )
+    typed_support_log_paths = _write_typed_support_log_templates(tmp_path)
     (tmp_path / "docs" / "index.mdx").write_text(
         f"before\n{HOMEPAGE_START_MARKER}\nstale\n{HOMEPAGE_END_MARKER}\nafter\n", encoding="utf-8"
     )
@@ -353,6 +369,7 @@ def test_sync_tables_writes_support_log_homepage_and_registry(tmp_path):
 
     assert changed_paths == [
         tmp_path / "docs" / "model-coverage" / "latest-models.mdx",
+        *typed_support_log_paths,
         tmp_path / "docs" / "index.mdx",
         tmp_path / "docs" / "model-coverage" / "overview.mdx",
     ]
@@ -362,6 +379,12 @@ def test_sync_tables_writes_support_log_homepage_and_registry(tmp_path):
         "[Documentation-model](/model-coverage/vision-language-models/documentation-model) "
         "([shared.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/shared.yaml)) |"
     ) in support_log
+    for (model_type, _), typed_support_log_path in zip(MODEL_TYPE_RELEASE_LOGS, typed_support_log_paths):
+        typed_support_log = typed_support_log_path.read_text(encoding="utf-8")
+        typed_rows = [line for line in typed_support_log.splitlines() if re.match(r"\| \d{4}-\d{2}-\d{2} \|", line)]
+        assert len(typed_rows) == len([release for release in releases if release["type"] == model_type])
+        assert all(f"| {model_type} |" in row for row in typed_rows)
+        assert "<Tabs>" not in typed_support_log
     homepage = (tmp_path / "docs" / "index.mdx").read_text(encoding="utf-8")
     for document in (support_log, homepage):
         assert document.count('<div className="compact-model-tables">') == 1
@@ -606,6 +629,7 @@ def test_sync_tables_check_rejects_stale_generated_support_log(tmp_path):
     (tmp_path / "docs" / "model-coverage" / "latest-models.mdx").write_text(
         f"{SUPPORT_LOG_START_MARKER}\nstale\n{SUPPORT_LOG_END_MARKER}\n", encoding="utf-8"
     )
+    _write_typed_support_log_templates(tmp_path)
     (tmp_path / "docs" / "index.mdx").write_text(
         f"{HOMEPAGE_START_MARKER}\nstale\n{HOMEPAGE_END_MARKER}\n", encoding="utf-8"
     )
@@ -621,3 +645,43 @@ def test_sync_tables_check_rejects_stale_generated_support_log(tmp_path):
 
     with pytest.raises(ValueError, match="latest-models.mdx"):
         _sync_tables(tmp_path, check=True)
+
+
+def test_sync_tables_rejects_model_type_without_release_log_page(tmp_path):
+    (tmp_path / "docs" / "model-coverage").mkdir(parents=True)
+    (tmp_path / "nemo_automodel" / "_transformers").mkdir(parents=True)
+    (tmp_path / "tests" / "unit_tests" / "_transformers").mkdir(parents=True)
+    (tmp_path / "examples").mkdir()
+    recipe_path = "examples/model.yaml"
+    (tmp_path / recipe_path).write_text("model: test\n", encoding="utf-8")
+    releases = [
+        {
+            "date": "2026-07-30",
+            "model": "Audio Model",
+            "hf_model_id": "org/audio-model",
+            "architectures": ["AudioModel"],
+            "docs_page": "/model-coverage/audio/model",
+            "type": "Audio",
+            "recipe": recipe_path,
+            "brev_status": "planned",
+        }
+    ]
+    (tmp_path / "docs" / "model-coverage" / "model-releases.json").write_text(json.dumps(releases), encoding="utf-8")
+    (tmp_path / "docs" / "model-coverage" / "latest-models.mdx").write_text(
+        f"{SUPPORT_LOG_START_MARKER}\n{SUPPORT_LOG_END_MARKER}\n", encoding="utf-8"
+    )
+    _write_typed_support_log_templates(tmp_path)
+    (tmp_path / "docs" / "index.mdx").write_text(f"{HOMEPAGE_START_MARKER}\n{HOMEPAGE_END_MARKER}\n", encoding="utf-8")
+    (tmp_path / "docs" / "model-coverage" / "overview.mdx").write_text(
+        f"{REGISTRY_START_MARKER}\n{REGISTRY_END_MARKER}\n", encoding="utf-8"
+    )
+    (tmp_path / "nemo_automodel" / "_transformers" / "registry.py").write_text(
+        'MODEL_ARCH_MAPPING = OrderedDict([("AudioModel", ("models.audio", "AudioModel"))])\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "tests" / "unit_tests" / "_transformers" / "test_doc_coverage.py").write_text(
+        "_DOC_ARCH_ALIASES = {}\n", encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="missing typed support-log pages: Audio"):
+        _sync_tables(tmp_path, check=False)
