@@ -68,7 +68,7 @@ from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_mes
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.components.loss.mtp import calculate_mtp_loss
-from nemo_automodel.components.loss.utils import _get_lm_head_weight
+from nemo_automodel.components.loss.utils import _get_lm_head_weight, calculate_loss
 from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
 from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
@@ -152,16 +152,10 @@ def _validate_cp_packing_support(
     if cp_size <= 1 or not packing_enabled or model.supports_cp_with_sequence_packing:
         return
 
-    backend = getattr(getattr(model, "backend", None), "attn", None)
-    supported_backends = getattr(model, "_packed_cp_attn_backends", ())
-    backend_hint = (
-        f" Supported backends for this model are: {', '.join(supported_backends)}."
-        if supported_backends
-        else ""
-    )
     raise ValueError(
         f"Context parallelism (cp_size={cp_size}) with VLM sequence packing is not supported "
-        f"for {type(model).__name__} with backend.attn={backend!r}.{backend_hint}"
+        f"for {type(model).__name__} with its active attention backend. Disable sequence "
+        "packing, use cp_size=1, or select a model-supported packed-CP backend."
     )
 
 
@@ -394,45 +388,6 @@ def build_dataloader(
             cp_size=cp_size,
         )
     return result.dataloader, result.processor
-
-
-def calculate_loss(loss_fn, **kwargs) -> torch.Tensor:
-    """Calculate the loss.
-
-    Args:
-        loss_fn: Loss function.
-        **kwargs: Keyword arguments for the loss function.
-
-    Returns:
-        The loss.
-    """
-    loss_fn_kwargs = {"num_label_tokens": kwargs.pop("num_label_tokens", None)}
-    if isinstance(loss_fn, FusedLinearCrossEntropy):
-        model = kwargs.pop("model")
-        labels = kwargs.pop("labels")
-
-        lm_head = kwargs.pop("lm_weight", None)
-        if lm_head is None:
-            lm_head = _get_lm_head_weight(model)
-        loss_fn_kwargs.update(
-            {
-                "hidden_states": kwargs.pop("hidden_states"),
-                "labels": labels,
-                "lm_weight": lm_head,
-                "grad_reduce_group": kwargs.pop("grad_reduce_group", None),
-            }
-        )
-    else:
-        kwargs.pop("lm_weight", None)
-        kwargs.pop("grad_reduce_group", None)
-        loss_fn_kwargs.update(
-            {
-                "logits": kwargs.pop("logits"),
-                "labels": kwargs.pop("labels"),
-            }
-        )
-
-    return loss_fn(**loss_fn_kwargs)
 
 
 # ---------------------------------------------------------------------------

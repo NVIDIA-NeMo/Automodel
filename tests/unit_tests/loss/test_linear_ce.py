@@ -47,6 +47,13 @@ def test_flce_materialized_weight_reduces_partial_gradient_into_shard(monkeypatc
 
     monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 2)
     weight = _FakeDTensor()
+    raw_grads = []
+
+    def capture_raw_grad(grad):
+        raw_grads.append(grad)
+        return grad
+
+    weight.full.register_hook(capture_raw_grad)
 
     full = FusedLinearCrossEntropy.materialize_lm_weight(
         weight,
@@ -56,6 +63,9 @@ def test_flce_materialized_weight_reduces_partial_gradient_into_shard(monkeypatc
 
     assert len(weight.grad_placements) == 1
     assert isinstance(weight.grad_placements[0], Partial)
+    # The normalization hook must return a new tensor instead of modifying the
+    # gradient object received by earlier hooks.
+    assert torch.equal(raw_grads[0], torch.full_like(weight.full, 2.0))
     # Raw grad is 2; divide by the two-rank reduction world size restores 1.
     assert torch.equal(weight.full.grad, torch.ones_like(weight.full))
 

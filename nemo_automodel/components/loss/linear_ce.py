@@ -160,14 +160,19 @@ class FusedLinearCrossEntropy(nn.Module):
         into the owned shard instead of combining peer contributions.
 
         Args:
-            lm_weight: LM-head weight tensor. A regular tensor is returned
-                unchanged; a DTensor is gathered to a regular full tensor.
+            lm_weight: LM-head weight with global shape ``[vocab, hidden]``. A
+                regular tensor is returned unchanged. A DTensor may have any
+                FSDP sharding placement over its device mesh and is gathered to
+                a rank-local regular tensor with the global shape, device, and
+                dtype.
             grad_reduce_group: Process group whose ranks contribute independent
                 token losses. Its size must match the LM-head DTensor mesh.
 
         Returns:
-            A full LM-head tensor whose backward reduce-scatters the averaged
-            peer gradients into the original DTensor shard.
+            Regular tensor with shape ``[vocab, hidden]``. For a DTensor input,
+            backward reduce-scatters the averaged peer gradients into the
+            original local shard. The gathered result does not alias the local
+            DTensor shard; a regular-tensor input is returned by identity.
 
         Raises:
             ValueError: If a trainable sharded weight has no matching reduction
@@ -203,7 +208,7 @@ class FusedLinearCrossEntropy(nn.Module):
         full_weight = lm_weight.full_tensor(
             grad_placements=tuple(Partial() for _ in range(mesh.ndim)),
         )
-        full_weight.register_hook(lambda grad: grad.div_(reduce_world_size))
+        full_weight.register_hook(lambda grad: grad / reduce_world_size)
         return full_weight
 
     def forward(
@@ -214,16 +219,22 @@ class FusedLinearCrossEntropy(nn.Module):
         num_label_tokens: Optional[int] = None,
         grad_reduce_group: dist.ProcessGroup | None = None,
     ) -> torch.Tensor:
-        """
-        Compute fused linear cross entropy loss that matches PyTorch's cross_entropy behavior.
+        """Compute fused linear cross entropy matching PyTorch behavior.
 
         Args:
-            hidden_states: Input hidden states
-            labels: Target labels
-            lm_weight: Weight matrix for linear transformation
-            num_label_tokens: Number of non-padding tokens.
+            hidden_states: Rank-local hidden states with shape
+                ``[batch, sequence, hidden]``.
+            labels: Rank-local target token IDs with shape ``[batch, sequence]``.
+            lm_weight: LM-head weight with global shape ``[vocab, hidden]``.
+                It may be a regular tensor or an FSDP-sharded DTensor.
+            num_label_tokens: Global number of non-padding target tokens used
+                to normalize a sum-reduced loss.
             grad_reduce_group: Group that contributes independent loss shards
                 when ``lm_weight`` is a sharded DTensor.
+
+        Returns:
+            Scalar loss tensor on the same device as ``hidden_states``. The
+            inputs are not mutated and the result does not alias an input.
         """
         if not HAVE_CUT_CROSS_ENTROPY:
             raise ImportError(MISSING_CUT_CROSS_ENTROPY_MSG)

@@ -70,15 +70,21 @@ def _get_final_hidden_states(model_output: Any) -> Optional[Any]:
     return hidden_states
 
 
-def calculate_loss(loss_fn, **kwargs) -> torch.Tensor:
-    """Calculate the loss.
+def calculate_loss(loss_fn: nn.Module, **kwargs: Any) -> torch.Tensor:
+    """Calculate a logit-based or fused linear cross-entropy loss.
 
     Args:
-        loss_fn: Loss function.
-        **kwargs: Keyword arguments for the loss function.
+        loss_fn: Loss module. ``FusedLinearCrossEntropy`` consumes
+            ``hidden_states`` with shape ``[batch, sequence, hidden]``, labels
+            with shape ``[batch, sequence]``, and an LM-head weight with global
+            shape ``[vocab, hidden]``. Other loss modules consume logits with
+            shape ``[batch, sequence, vocab]`` and labels.
+        **kwargs: Loss inputs. Rank-local tensors keep their existing layout;
+            ``grad_reduce_group`` describes the ranks contributing independent
+            fused-loss shards. The caller's mapping and tensors are not mutated.
 
     Returns:
-        The loss.
+        Scalar loss tensor that does not alias an input.
     """
     loss_fn_kwargs = {"num_label_tokens": kwargs.pop("num_label_tokens", None)}
     if isinstance(loss_fn, FusedLinearCrossEntropy):
