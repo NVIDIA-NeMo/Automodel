@@ -11,11 +11,13 @@ Historical model matrix last measured: 2026-04-02 UTC
 Enabled LLM, VLM, and retrieval resume coverage now compares a restored trainer
 with the uninterrupted continuation of the same checkpoint-producing training
 trajectory. The check requires exact optimizer/scheduler position, LR and
-weight-decay state, RNG state, stateful-dataloader state, and per-rank batch
-identity. The first post-resume loss uses a separate strict threshold; the
-existing `resume_loss_threshold` applies only to later BF16 optimizer steps. Independently calibrated historical
-envelopes are retained as the non-blocking `training_reproducibility_loss_threshold` metric instead of weakening the
-shared-trajectory resume oracle.
+weight-decay state, and RNG state. Stateful-dataloader position is verified by
+exact per-rank post-resume batch identity because a loader may normalize its
+equivalent serialized state during restore. The first post-resume loss uses a
+separate strict threshold; the existing `resume_loss_threshold` applies only to
+later BF16 optimizer steps. Independently calibrated historical envelopes are
+retained as the non-blocking `training_reproducibility_loss_threshold` metric
+instead of weakening the shared-trajectory resume oracle.
 
 Independent-run reproducibility is not a checkpoint-restore oracle. CI reuses
 the normal finetune and checkpoint Phase 1 to report it separately and

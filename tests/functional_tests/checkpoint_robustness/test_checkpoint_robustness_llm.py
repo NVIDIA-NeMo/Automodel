@@ -2160,7 +2160,7 @@ def _run_process_isolated_checkpoint_phase(
     if _rank0():
         print(
             "[Resume correctness] Model-adjacent checkpoint state matched exactly: optimizer, "
-            "LR/weight-decay schedulers, RNG, and stateful dataloader"
+            "LR/weight-decay schedulers, and RNG; dataloader position is verified by exact resumed batch identity"
         )
 
     resume_recorder = _TrajectoryRecorder(resume_plan, capture_boundary_state=False)
@@ -2500,8 +2500,8 @@ def run_checkpoint_robustness(
         _raise_distributed_failure(failure_message)
         if _rank0():
             print(
-                "[Resume correctness] Restored optimizer, LR/weight-decay schedulers, RNG, and "
-                "stateful dataloader exactly at the Phase 1 boundary"
+                "[Resume correctness] Restored optimizer, LR/weight-decay schedulers, and RNG exactly at the "
+                "Phase 1 boundary; dataloader position is verified by exact resumed batch identity"
             )
 
         resumed_recorder = _TrajectoryRecorder(resume_plan, capture_boundary_state=False)

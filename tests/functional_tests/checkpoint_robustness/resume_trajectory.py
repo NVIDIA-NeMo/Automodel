@@ -557,7 +557,6 @@ def _checkpoint_state_snapshot(trainer: object, *, state_is_being_saved: bool) -
         "optimizer_groups": _optimizer_group_state(trainer.optimizer),
         "lr_scheduler_digest": _state_digest(lr_scheduler_state),
         "rng_digest": _state_digest(trainer.rng.state_dict()),
-        "dataloader_digest": _state_digest(trainer.dataloader.state_dict()),
     }
 
 
@@ -569,7 +568,6 @@ def _restored_state_mismatch(reference: dict[str, object], restored: dict[str, o
         "optimizer_groups": "learning-rate/weight-decay state",
         "lr_scheduler_digest": "LR scheduler state",
         "rng_digest": "RNG state",
-        "dataloader_digest": "stateful dataloader position",
     }
     for key, label in component_labels.items():
         if key not in reference:

@@ -13,18 +13,29 @@
 # limitations under the License.
 
 import json
+from copy import deepcopy
 from types import SimpleNamespace
 
+import torch
+from torch.utils.data import TensorDataset
+from torchdata.stateful_dataloader import StatefulDataLoader
+from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
+
+from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
 from tests.functional_tests.checkpoint_robustness.resume_trajectory import (
-    _TrainingReproducibilityRecorder,
+    _checkpoint_state_snapshot,
     _compare_training_reproducibility,
     _configure_resumed_run,
     _configure_uninterrupted_run,
-    _restored_state_mismatch,
     _report_training_reproducibility,
+    _restored_state_mismatch,
     _resume_plan_from_config,
+    _ResumePlan,
+    _state_digest,
+    _TrainingReproducibilityRecorder,
     _trajectory_mismatch,
+    _TrajectoryRecorder,
 )
 
 
@@ -89,20 +100,167 @@ def test_shared_resume_plan_extends_phase_one_from_the_checkpoint_boundary(tmp_p
     assert cfg.checkpoint.save_consolidated is False
 
 
-def test_resume_state_check_detects_omitted_dataloader_state():
+def test_resume_state_check_detects_omitted_rng_state():
     reference = {
         "step_scheduler": {"step": 5, "epoch": 0},
         "optimizer_steps": [{"5.0": 2}],
         "optimizer_groups": [[{"lr": 1e-4, "weight_decay": 0.01}]],
         "lr_scheduler_digest": "lr",
         "rng_digest": "rng",
-        "dataloader_digest": "batch-position-5",
     }
-    restored = {key: value for key, value in reference.items() if key != "dataloader_digest"}
+    restored = {key: value for key, value in reference.items() if key != "rng_digest"}
 
     mismatch = _restored_state_mismatch(reference, restored)
 
-    assert mismatch == "restored snapshot omitted required stateful dataloader position (dataloader_digest)"
+    assert mismatch == "restored snapshot omitted required RNG state (rng_digest)"
+
+
+def test_stateful_sampler_restore_uses_next_batch_instead_of_raw_state_digest():
+    dataset = TensorDataset(torch.arange(8))
+
+    def make_dataloader() -> StatefulDataLoader:
+        sampler = StatefulDistributedSampler(
+            dataset,
+            seed=42,
+            drop_last=True,
+            num_replicas=1,
+            rank=0,
+            shuffle=True,
+        )
+        return StatefulDataLoader(dataset, batch_size=2, sampler=sampler, num_workers=0)
+
+    uninterrupted = make_dataloader()
+    uninterrupted_iterator = iter(uninterrupted)
+    next(uninterrupted_iterator)
+    checkpoint_state = uninterrupted.state_dict()
+    checkpoint_digest = _state_digest(checkpoint_state)
+
+    resumed = make_dataloader()
+    resumed.load_state_dict(checkpoint_state)
+
+    assert _state_digest(resumed.state_dict()) != checkpoint_digest
+    expected_batch = next(uninterrupted_iterator)
+    resumed_batch = next(iter(resumed))
+    assert torch.equal(resumed_batch[0], expected_batch[0])
+
+
+def test_shared_trajectory_harness_runs_checkpoint_and_resume_locally(tmp_path):
+    plan = _ResumePlan(checkpoint_dir=tmp_path, boundary_step=2, continuation_steps=2)
+    checkpoints: dict[int, dict[str, object]] = {}
+
+    def make_trainer() -> SimpleNamespace:
+        dataset = TensorDataset(torch.arange(16, dtype=torch.float32))
+        sampler = StatefulDistributedSampler(
+            dataset,
+            seed=42,
+            drop_last=True,
+            num_replicas=1,
+            rank=0,
+            shuffle=True,
+        )
+        dataloader = StatefulDataLoader(dataset, batch_size=2, sampler=sampler, num_workers=0)
+        parameter = torch.nn.Parameter(torch.tensor(1.0))
+        optimizer = torch.optim.Adam([parameter], lr=1e-3)
+        lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
+        trainer = SimpleNamespace(
+            dataloader=dataloader,
+            parameter=parameter,
+            optimizer=optimizer,
+            lr_scheduler=lr_scheduler,
+            rng=StatefulRNG(seed=123),
+            step_scheduler=StepScheduler(
+                global_batch_size=2,
+                local_batch_size=2,
+                dp_size=1,
+                dataloader=dataloader,
+                ckpt_every_steps=plan.boundary_step,
+                save_checkpoint_every_epoch=False,
+                max_steps=plan.final_max_steps,
+                preemption_signal=None,
+            ),
+        )
+
+        def train_step(batches: list[tuple[torch.Tensor]]) -> SimpleNamespace:
+            """Run one deterministic optimizer step over scalar sample tensors.
+
+            Args:
+                batches: List of microbatches, each containing a tensor of shape [batch].
+
+            Returns:
+                Namespace containing scalar loss and learning-rate metrics.
+            """
+            optimizer.zero_grad()
+            target = batches[0][0].mean()
+            loss = (parameter - target).square()
+            loss.backward()
+            optimizer.step()
+            lr_scheduler.step()
+            return SimpleNamespace(metrics={"loss": float(loss.detach()), "lr": optimizer.param_groups[0]["lr"]})
+
+        def save_checkpoint(
+            epoch: int,
+            step: int,
+            train_loss: float,
+            val_loss: dict[str, float] | None = None,
+            best_metric_key: str = "default",
+        ) -> None:
+            del epoch, train_loss, val_loss, best_metric_key
+            checkpoints[int(step)] = {
+                "model": parameter.detach().clone(),
+                "optimizer": deepcopy(optimizer.state_dict()),
+                "lr_scheduler": deepcopy(lr_scheduler.state_dict()),
+                "rng": deepcopy(trainer.rng.state_dict()),
+                "dataloader": deepcopy(dataloader.state_dict()),
+                "step_scheduler": deepcopy(trainer.step_scheduler.state_dict()),
+            }
+
+        trainer._run_train_optim_step = train_step
+        trainer.save_checkpoint = save_checkpoint
+        return trainer
+
+    def run(trainer: SimpleNamespace) -> None:
+        for epoch in trainer.step_scheduler.epochs:
+            trainer.step_scheduler.set_epoch(epoch)
+            for batches in trainer.step_scheduler:
+                log_data = trainer._run_train_optim_step(batches)
+                if trainer.step_scheduler.is_ckpt_step:
+                    trainer.save_checkpoint(
+                        epoch,
+                        trainer.step_scheduler.step,
+                        log_data.metrics["loss"],
+                    )
+
+    uninterrupted = make_trainer()
+    reference_recorder = _TrajectoryRecorder(plan, capture_boundary_state=True)
+    reference_recorder.attach(uninterrupted)
+    run(uninterrupted)
+    reference = reference_recorder.to_dict()
+
+    resumed = make_trainer()
+    checkpoint = checkpoints[plan.boundary_step - 1]
+    with torch.no_grad():
+        resumed.parameter.copy_(checkpoint["model"])
+    resumed.optimizer.load_state_dict(checkpoint["optimizer"])
+    resumed.lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
+    resumed.rng.load_state_dict(checkpoint["rng"])
+    resumed.dataloader.load_state_dict(checkpoint["dataloader"])
+    resumed.step_scheduler.load_state_dict(checkpoint["step_scheduler"])
+
+    restored_state = _checkpoint_state_snapshot(resumed, state_is_being_saved=False)
+    assert _restored_state_mismatch(reference["boundary_state"], restored_state) is None
+
+    resumed_recorder = _TrajectoryRecorder(plan, capture_boundary_state=False)
+    resumed_recorder.attach(resumed)
+    run(resumed)
+    assert (
+        _trajectory_mismatch(
+            reference,
+            resumed_recorder.to_dict(),
+            first_loss_threshold=0.0,
+            later_loss_threshold=0.0,
+        )
+        is None
+    )
 
 
 def test_shared_trajectory_detects_shifted_dataloader_position():
