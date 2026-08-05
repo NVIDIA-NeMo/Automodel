@@ -85,7 +85,6 @@ model:
     dispatcher: hybridep
     dispatcher_num_sms: 20
     dispatcher_hybridep_permute_fusion: false
-    dispatcher_hybridep_num_sms_preprocessing: 132
     dispatcher_hybridep_num_blocks_permute: 112
     dispatcher_hybridep_num_blocks_unpermute: 112
     fake_balanced_gate: true
