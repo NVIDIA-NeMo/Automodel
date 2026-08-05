@@ -16,14 +16,12 @@
 
 import argparse
 import ast
-import json
 import re
 import subprocess
 from dataclasses import dataclass
-from datetime import date
 from pathlib import Path
-from typing import Literal, cast
-from urllib.parse import urlparse
+
+import yaml
 
 TABLE_ROW_COUNT = 10
 HOMEPAGE_START_MARKER = "{/* BEGIN GENERATED LATEST MODEL SUPPORT */}"
@@ -35,10 +33,7 @@ DIFFUSION_MODELS_END_MARKER = "{/* END GENERATED DIFFUSION MODELS */}"
 REGISTRY_START_MARKER = "{/* BEGIN GENERATED MODEL ARCHITECTURES */}"
 REGISTRY_END_MARKER = "{/* END GENERATED MODEL ARCHITECTURES */}"
 HF_MODEL_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
-RELEASE_DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-RECIPE_PATH_PATTERN = re.compile(r"^examples/[A-Za-z0-9_./-]+\.yaml$")
 DOCS_PAGE_PATTERN = re.compile(r"^/[a-z0-9][a-z0-9/-]*$")
-MODEL_TYPE_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9 -]*$")
 MARKDOWN_UNSAFE_PATTERN = re.compile(r"[\[\]|<>`\r\n]")
 REPOSITORY_URL = "https://github.com/NVIDIA-NeMo/Automodel/blob/main"
 DATED_SUPPORT_TABLE_HEADER = "| Date | Type | Model |"
@@ -79,20 +74,22 @@ COMPACT_TABLE_STYLE = """<style>{`
     width: 100%;
   }
 `}</style>"""
-_BrevStatus = Literal["available", "planned", "unavailable"]
 
 
 @dataclass(frozen=True)
 class _ModelRelease:
     release_date: str
-    model: str
     hf_model_id: str
-    architectures: tuple[str, ...]
     docs_page: str
     model_type: str
     recipe: str
-    brev_status: _BrevStatus
-    brev_url: str | None
+
+
+@dataclass(frozen=True)
+class _ModelDoc:
+    model_type: str
+    docs_page: str
+    architectures: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -138,235 +135,191 @@ def _validate_dated_support_tables_are_generated(repo_root: Path) -> None:
             )
 
 
-def _require_catalog_text(raw_entry: dict[str, object], field: str, index: int) -> str:
-    value = raw_entry.get(field)
-    if not isinstance(value, str) or not value or MARKDOWN_UNSAFE_PATTERN.search(value):
-        raise ValueError(f"Model release {index} field {field!r} must be a non-empty Markdown-safe string")
-    return value
-
-
-def _load_new_model_creation_dates(repo_root: Path, hf_model_ids: set[str]) -> dict[str, str]:
-    """Return first-YAML dates for model IDs introduced by the current branch.
-
-    Squash merges discard the originating branch's file history, so dates for
-    existing models remain stored in the catalog. For model IDs introduced by
-    the current branch, full Git history still contains their first YAML
-    occurrence and lets CI validate the catalog before that provenance is lost.
-    """
-    if not (repo_root / ".git").exists():
-        return {}
-
-    def run_git(arguments: list[str], *, allow_no_match: bool = False) -> subprocess.CompletedProcess[str]:
-        try:
-            result = subprocess.run(
-                ["git", "-C", str(repo_root), *arguments],
-                capture_output=True,
-                text=True,
-            )
-        except OSError as error:
-            raise ValueError(f"Could not inspect recipe creation history: {error}") from error
-        if result.returncode != 0 and not (allow_no_match and result.returncode == 1):
-            raise ValueError(f"Could not inspect recipe creation history: {result.stderr.strip()}")
-        return result
-
-    if run_git(["rev-parse", "--is-shallow-repository"]).stdout.strip() == "true":
-        return {}
-
-    base_ref = next(
-        (
-            candidate
-            for candidate in ("origin/main", "main")
-            if subprocess.run(
-                ["git", "-C", str(repo_root), "rev-parse", "--verify", "--quiet", candidate],
-                capture_output=True,
-            ).returncode
-            == 0
-        ),
-        None,
-    )
-    if base_ref is None:
-        return {}
-
-    merge_base = run_git(["merge-base", "HEAD", base_ref]).stdout.strip()
-
-    grep_patterns = [argument for hf_model_id in sorted(hf_model_ids) for argument in ("-e", hf_model_id)]
-
-    def find_model_ids(revision: str) -> set[str]:
-        result = run_git(["grep", "-F", *grep_patterns, revision, "--", "*.yaml"], allow_no_match=True)
-        return {
-            hf_model_id
-            for hf_model_id in hf_model_ids
-            if re.search(
-                rf"(?<![A-Za-z0-9_.-]){re.escape(hf_model_id)}(?![A-Za-z0-9_.-])",
-                result.stdout,
-            )
-        }
-
-    new_model_ids = find_model_ids("HEAD") - find_model_ids(merge_base)
-    if not new_model_ids:
-        return {}
-
-    creation_dates: dict[str, str] = {}
-    for hf_model_id in new_model_ids:
-        log_result = run_git(
-            [
-                "log",
-                "--reverse",
-                "--no-renames",
-                f"-S{hf_model_id}",
-                "--format=%as",
-                f"{merge_base}..HEAD",
-                "--",
-                "*.yaml",
-            ]
-        )
-        first_date = next(
-            (line for line in log_result.stdout.splitlines() if RELEASE_DATE_PATTERN.fullmatch(line)), None
-        )
-        if first_date is None:
-            raise ValueError(f"Model {hf_model_id!r} is missing a first YAML commit")
-        creation_dates[hf_model_id] = first_date
-    return creation_dates
-
-
-def _load_model_releases(catalog_path: Path, repo_root: Path) -> list[_ModelRelease]:
+def _run_git(repo_root: Path, arguments: list[str]) -> str:
     try:
-        raw_entries = json.loads(catalog_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
-        raise ValueError(f"Could not read model release catalog {catalog_path}: {error}") from error
-    if not isinstance(raw_entries, list) or not raw_entries:
-        raise ValueError("Model release catalog must contain a non-empty JSON list")
-
-    releases = []
-    seen_models = set()
-    seen_hf_model_types = set()
-    previous_date: str | None = None
-    for index, raw_entry in enumerate(raw_entries, start=1):
-        if not isinstance(raw_entry, dict):
-            raise ValueError(f"Model release {index} must be a JSON object")
-        unknown_fields = set(raw_entry) - {
-            "date",
-            "model",
-            "hf_model_id",
-            "architectures",
-            "docs_page",
-            "type",
-            "recipe",
-            "brev_status",
-            "brev_url",
-        }
-        if unknown_fields:
-            raise ValueError(f"Model release {index} has unknown fields: {', '.join(sorted(unknown_fields))}")
-        missing_fields = {
-            "date",
-            "model",
-            "hf_model_id",
-            "architectures",
-            "docs_page",
-            "type",
-            "recipe",
-            "brev_status",
-        } - set(raw_entry)
-        if missing_fields:
-            raise ValueError(f"Model release {index} is missing fields: {', '.join(sorted(missing_fields))}")
-
-        release_date = _require_catalog_text(raw_entry, "date", index)
-        if not RELEASE_DATE_PATTERN.fullmatch(release_date):
-            raise ValueError(f"Model release {index} date must use YYYY-MM-DD: {release_date!r}")
-        try:
-            date.fromisoformat(release_date)
-        except ValueError as error:
-            raise ValueError(f"Model release {index} has invalid date {release_date!r}") from error
-        if previous_date is not None and previous_date < release_date:
-            raise ValueError(
-                f"Model release catalog is not reverse chronological at {previous_date} then {release_date}"
-            )
-        previous_date = release_date
-
-        model = _require_catalog_text(raw_entry, "model", index)
-        hf_model_id = _require_catalog_text(raw_entry, "hf_model_id", index)
-        architectures_value = raw_entry.get("architectures")
-        if not isinstance(architectures_value, list) or any(
-            not isinstance(architecture, str) or not architecture or MARKDOWN_UNSAFE_PATTERN.search(architecture)
-            for architecture in architectures_value
-        ):
-            raise ValueError(f"Model release {index} architectures must be a list of Markdown-safe strings")
-        architectures = tuple(architectures_value)
-        docs_page = _require_catalog_text(raw_entry, "docs_page", index)
-        model_type = _require_catalog_text(raw_entry, "type", index)
-        if not HF_MODEL_ID_PATTERN.fullmatch(hf_model_id):
-            raise ValueError(f"Model release {index} has invalid Hugging Face model ID {hf_model_id!r}")
-        if not DOCS_PAGE_PATTERN.fullmatch(docs_page) or "//" in docs_page or ".." in docs_page:
-            raise ValueError(f"Model release {index} has invalid version-agnostic docs page {docs_page!r}")
-        if not MODEL_TYPE_PATTERN.fullmatch(model_type):
-            raise ValueError(f"Model release {index} has invalid type {model_type!r}")
-        if model in seen_models:
-            raise ValueError(f"Model release catalog contains duplicate model {model!r}")
-        hf_model_type = (hf_model_id, model_type)
-        if hf_model_type in seen_hf_model_types:
-            raise ValueError(
-                f"Model release catalog contains duplicate Hugging Face model ID {hf_model_id!r} "
-                f"for type {model_type!r}"
-            )
-        seen_models.add(model)
-        seen_hf_model_types.add(hf_model_type)
-
-        recipe = _require_catalog_text(raw_entry, "recipe", index)
-        recipe_path = Path(recipe)
-        if (
-            recipe_path.is_absolute()
-            or not RECIPE_PATH_PATTERN.fullmatch(recipe)
-            or not recipe_path.parts
-            or recipe_path.parts[0] != "examples"
-            or ".." in recipe_path.parts
-            or recipe_path.suffix != ".yaml"
-        ):
-            raise ValueError(f"Model release {index} has invalid recipe path {recipe!r}")
-        if not (repo_root / recipe_path).is_file():
-            raise ValueError(f"Recipe for {model} does not exist in this checkout: {recipe}")
-
-        brev_status_value = raw_entry.get("brev_status")
-        if brev_status_value not in {"available", "planned", "unavailable"}:
-            raise ValueError(f"Model release {index} has invalid Brev status {brev_status_value!r}")
-        brev_status = cast(_BrevStatus, brev_status_value)
-        brev_url_value = raw_entry.get("brev_url")
-        if brev_url_value is not None and not isinstance(brev_url_value, str):
-            raise ValueError(f"Model release {index} Brev URL must be a string or absent")
-        brev_url = brev_url_value
-        if brev_status == "available":
-            parsed_brev_url = urlparse(brev_url or "")
-            if (
-                parsed_brev_url.scheme != "https"
-                or parsed_brev_url.netloc != "brev.nvidia.com"
-                or MARKDOWN_UNSAFE_PATTERN.search(brev_url or "")
-                or any(character in (brev_url or "") for character in {'"', "<", ">"})
-            ):
-                raise ValueError(f"Model release {index} requires an https://brev.nvidia.com URL")
-        elif brev_url is not None:
-            raise ValueError(f"Model release {index} has a Brev URL but status is {brev_status!r}")
-
-        releases.append(
-            _ModelRelease(
-                release_date=release_date,
-                model=model,
-                hf_model_id=hf_model_id,
-                architectures=architectures,
-                docs_page=docs_page,
-                model_type=model_type,
-                recipe=recipe,
-                brev_status=brev_status,
-                brev_url=brev_url,
-            )
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), *arguments],
+            check=True,
+            capture_output=True,
+            text=True,
         )
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise ValueError(f"Could not inspect Git history: {error}") from error
+    return result.stdout
 
-    model_creation_dates = _load_new_model_creation_dates(repo_root, {release.hf_model_id for release in releases})
-    for release in releases:
-        creation_date = model_creation_dates.get(release.hf_model_id)
-        if creation_date is not None and release.release_date != creation_date:
-            raise ValueError(
-                f"Model {release.hf_model_id!r} uses date {release.release_date}, but its first YAML "
-                f"was created on {creation_date}"
+
+def _load_recipe_addition_dates(repo_root: Path) -> dict[str, str]:
+    if not (repo_root / ".git").exists():
+        raise ValueError("Model support generation requires a Git checkout")
+
+    shallow_commits = set()
+    if _run_git(repo_root, ["rev-parse", "--is-shallow-repository"]).strip() == "true":
+        shallow_path = Path(_run_git(repo_root, ["rev-parse", "--git-path", "shallow"]).strip())
+        if not shallow_path.is_absolute():
+            shallow_path = repo_root / shallow_path
+        shallow_commits = set(shallow_path.read_text(encoding="utf-8").splitlines())
+
+    history = _run_git(
+        repo_root,
+        [
+            "log",
+            "--reverse",
+            "--no-renames",
+            "--diff-filter=A",
+            "--format=@@COMMIT@@%H %as",
+            "--name-only",
+            "--",
+            "examples",
+        ],
+    )
+    additions = {}
+    commit = None
+    commit_date: str | None = None
+    for line in history.splitlines():
+        if line.startswith("@@COMMIT@@"):
+            commit, commit_date = line.removeprefix("@@COMMIT@@").split(" ", 1)
+        elif line.endswith(".yaml") and commit_date is not None:
+            additions.setdefault(line, (commit_date, commit))
+    current_recipes = {str(path.relative_to(repo_root)) for path in (repo_root / "examples").rglob("*.yaml")}
+    missing_recipes = current_recipes - additions.keys()
+    if missing_recipes:
+        raise ValueError(
+            "Git history is incomplete for model support generation; use fetch-depth: 0. "
+            f"Missing recipe additions: {', '.join(sorted(missing_recipes))}"
+        )
+    boundary_recipes = sorted(recipe for recipe in current_recipes if additions[recipe][1] in shallow_commits)
+    if boundary_recipes:
+        raise ValueError(
+            "Git history is incomplete for model support generation; use fetch-depth: 0. "
+            f"Recipe additions fall on a shallow boundary: {', '.join(boundary_recipes)}"
+        )
+    return {recipe: addition[0] for recipe, addition in additions.items()}
+
+
+def _iter_pretrained_model_ids(value: object) -> set[str]:
+    model_ids = set()
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key == "pretrained_model_name_or_path" and isinstance(child, str):
+                if HF_MODEL_ID_PATTERN.fullmatch(child) and not child.startswith("checkpoints/"):
+                    model_ids.add(child)
+            model_ids.update(_iter_pretrained_model_ids(child))
+    elif isinstance(value, list):
+        for child in value:
+            model_ids.update(_iter_pretrained_model_ids(child))
+    return model_ids
+
+
+def _model_type_for_recipe(recipe: Path, hf_model_id: str) -> str | None:
+    top_level = recipe.parts[1]
+    if top_level.startswith("audio_"):
+        return "Omni"
+    if top_level.startswith("diffusion"):
+        return "Diffusion"
+    if top_level.startswith("dllm_"):
+        return "dLLM"
+    if top_level.startswith("multimodal_"):
+        return "Multimodal"
+    if top_level == "retrieval":
+        if "bi_encoder" in recipe.parts:
+            return "Embedding"
+        if "cross_encoder" in recipe.parts:
+            return "Reranking"
+        return None
+    if top_level.startswith("vlm_"):
+        return "VLM"
+    if top_level.startswith("llm_") or top_level in {"convergence", "long_context_validation"}:
+        if hf_model_id.startswith("google-t5/"):
+            return "Encoder-Decoder"
+        return "LLM"
+    return None
+
+
+def _load_model_docs(docs_root: Path) -> tuple[dict[str, list[_ModelDoc]], set[str]]:
+    directory_types = {
+        "llm": "LLM",
+        "vlm": "VLM",
+        "multimodal": "Multimodal",
+        "omni": "Omni",
+        "dllm": "dLLM",
+        "diffusion": "Diffusion",
+        "embedding": "Embedding",
+        "reranker": "Reranking",
+    }
+    model_docs: dict[str, list[_ModelDoc]] = {}
+    architectures = set()
+    model_coverage_root = docs_root / "model-coverage"
+    for directory, model_type in directory_types.items():
+        for path in sorted((model_coverage_root / directory).glob("*/*.mdx")):
+            document = path.read_text(encoding="utf-8")
+            slug_match = re.search(r'^slug: "?([^"\r\n]+)"?$', document, flags=re.MULTILINE)
+            if slug_match is None:
+                raise ValueError(f"Model coverage page is missing a slug: {path}")
+            docs_page = f"/{slug_match.group(1)}"
+            if not DOCS_PAGE_PATTERN.fullmatch(docs_page):
+                raise ValueError(f"Model coverage page has an invalid slug: {path}")
+            architecture_match = re.search(r"^\| \*\*Architecture\*\* \| ([^|]+) \|$", document, flags=re.MULTILINE)
+            page_architectures = (
+                tuple(re.findall(r"`([A-Za-z_][A-Za-z0-9_]*)`", architecture_match.group(1)))
+                if architecture_match
+                else ()
             )
+            page_architectures = tuple(
+                architecture for architecture in page_architectures if architecture != "trust_remote_code"
+            )
+            architectures.update(page_architectures)
+            page_model_type = (
+                "Encoder-Decoder" if directory == "llm" and path.parent.name == "google-t5" else model_type
+            )
+            model_doc = _ModelDoc(page_model_type, docs_page, page_architectures)
+            for hf_model_id in re.findall(r"https://huggingface\.co/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)", document):
+                docs = model_docs.setdefault(hf_model_id, [])
+                if model_doc not in docs:
+                    docs.append(model_doc)
+    return model_docs, architectures
+
+
+def _load_model_releases(repo_root: Path, model_docs: dict[str, list[_ModelDoc]]) -> list[_ModelRelease]:
+    recipe_dates = _load_recipe_addition_dates(repo_root)
+    releases_by_model_type: dict[tuple[str, str], _ModelRelease] = {}
+    for path in sorted((repo_root / "examples").rglob("*.yaml")):
+        recipe = path.relative_to(repo_root)
+        recipe_text = path.read_text(encoding="utf-8")
+        try:
+            recipe_config = yaml.safe_load(recipe_text)
+        except yaml.YAMLError as error:
+            raise ValueError(f"Could not parse recipe {recipe}: {error}") from error
+        model_config = recipe_config.get("model") if isinstance(recipe_config, dict) else None
+        for hf_model_id in _iter_pretrained_model_ids(model_config):
+            inferred_type = _model_type_for_recipe(recipe, hf_model_id)
+            if inferred_type is None:
+                continue
+            matching_docs = model_docs.get(hf_model_id, [])
+            documented_types = {model_doc.model_type for model_doc in matching_docs}
+            model_type = inferred_type
+            if inferred_type == "VLM" and len(documented_types) == 1:
+                documented_type = next(iter(documented_types))
+                if documented_type in {"Omni", "Multimodal"}:
+                    model_type = documented_type
+            docs_page = next(
+                (model_doc.docs_page for model_doc in matching_docs if model_doc.model_type == model_type),
+                f"https://huggingface.co/{hf_model_id}",
+            )
+            recipe_string = str(recipe)
+            release_date = recipe_dates.get(recipe_string)
+            if release_date is None:
+                raise ValueError(f"Recipe is missing from Git addition history: {recipe_string}")
+            release = _ModelRelease(release_date, hf_model_id, docs_page, model_type, recipe_string)
+            key = (hf_model_id, model_type)
+            previous = releases_by_model_type.get(key)
+            if previous is None or (release.release_date, release.recipe) < (previous.release_date, previous.recipe):
+                releases_by_model_type[key] = release
+
+    releases = sorted(
+        releases_by_model_type.values(),
+        key=lambda release: (release.model_type.casefold(), release.hf_model_id.casefold()),
+    )
+    releases.sort(key=lambda release: release.release_date, reverse=True)
     return releases
 
 
@@ -412,7 +365,7 @@ def _render_support_log_table(releases: list[_ModelRelease]) -> str:
 
 def _render_homepage_table(releases: list[_ModelRelease]) -> str:
     if len(releases) < TABLE_ROW_COUNT:
-        raise ValueError(f"Model release catalog contains only {len(releases)} releases")
+        raise ValueError(f"Git history produced only {len(releases)} model releases")
     return "\n\n".join(
         [HOMEPAGE_START_MARKER, _render_compact_release_table(releases[:TABLE_ROW_COUNT]), HOMEPAGE_END_MARKER]
     )
@@ -543,17 +496,17 @@ def _render_architecture_name(architecture: str, aliases: dict[str, str]) -> str
 
 
 def _render_registry_table(
-    entries: list[tuple[str, str, str]], recipe_architectures: set[str], aliases: dict[str, str]
+    entries: list[tuple[str, str, str]], documented_architectures: set[str], aliases: dict[str, str]
 ) -> str:
     native_architectures = {architecture for architecture, _, _ in entries}
     native_rows = [
         f"| {_render_architecture_name(architecture, aliases)} | NeMo native | `{module_path}.{class_name}` |"
         for architecture, module_path, class_name in entries
-        if architecture in recipe_architectures
+        if architecture in documented_architectures
     ]
     hf_rows = [
         f"| {_render_architecture_name(architecture, aliases)} | Hugging Face | `transformers` |"
-        for architecture in sorted(recipe_architectures - native_architectures, key=str.casefold)
+        for architecture in sorted(documented_architectures - native_architectures, key=str.casefold)
     ]
     return "\n".join(
         [
@@ -569,7 +522,7 @@ def _render_registry_table(
 
 def _generate_tables(repo_root: Path) -> dict[Path, str]:
     _validate_dated_support_tables_are_generated(repo_root)
-    release_catalog_path = repo_root / "docs" / "model-coverage" / "model-releases.json"
+    docs_root = repo_root / "docs"
     diffusion_docs_dir = repo_root / "docs" / "model-coverage" / "diffusion"
     support_log_path = repo_root / "docs" / "model-coverage" / "latest-models.mdx"
     homepage_path = repo_root / "docs" / "index.mdx"
@@ -590,7 +543,8 @@ def _generate_tables(repo_root: Path) -> dict[Path, str]:
     registry_source = registry_path.read_text(encoding="utf-8")
     aliases_source = aliases_path.read_text(encoding="utf-8")
 
-    releases = _load_model_releases(release_catalog_path, repo_root)
+    model_docs, documented_architectures = _load_model_docs(docs_root)
+    releases = _load_model_releases(repo_root, model_docs)
     generated_diffusion_models = _render_diffusion_models_table(diffusion_docs_dir)
     typed_overviews["Diffusion"] = _replace_generated_block(
         typed_overviews["Diffusion"],
@@ -600,10 +554,9 @@ def _generate_tables(repo_root: Path) -> dict[Path, str]:
     )
     generated_support_log = _render_support_log_table(releases)
     generated_homepage = _render_homepage_table(releases)
-    recipe_architectures = {architecture for release in releases for architecture in release.architectures}
     generated_registry = _render_registry_table(
         _parse_registry_entries(registry_source),
-        recipe_architectures,
+        documented_architectures,
         _parse_doc_arch_aliases(aliases_source),
     )
     generated_documents = {
