@@ -19,7 +19,7 @@
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 step_scheduler:
-  global_batch_size: 512
+  global_batch_size: 480
   local_batch_size: 32
   ckpt_every_steps: 500
   val_every_steps: 100  # will run every x number of gradient steps
@@ -113,7 +113,7 @@ optimizer:
 
 ci:
   recipe_owner: hemildesai
-  local_batch_size: 16
+  local_batch_size: 15
   nodes: 4
   time: "01:00:00"
   env_vars:
