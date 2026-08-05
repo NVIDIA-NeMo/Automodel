@@ -103,3 +103,17 @@ def upcast_gated_delta_net_fp32_state_tensor(
     if callable(is_floating_point) and is_floating_point():
         return tensor.to(dtype=torch.float32)
     return tensor
+
+
+def forced_gated_delta_net_fp32_dtype_mapping(
+    state_dict: dict[str, object], param_names: tuple[str, ...] = FP32_GDN_PARAM_NAMES
+) -> dict[str, str]:
+    """Return HF export dtype overrides for intrinsically-fp32 GDN tensors."""
+    forced: dict[str, str] = {}
+    for key, tensor in state_dict.items():
+        if not is_gated_delta_net_fp32_param_key(key, param_names):
+            continue
+        is_floating_point = getattr(tensor, "is_floating_point", None)
+        if callable(is_floating_point) and is_floating_point():
+            forced[key] = "F32"
+    return forced

@@ -54,9 +54,9 @@ The Slurm script below is the one used to fine-tune Nemotron-3-Ultra on 4 × GB2
 set -uo pipefail
 
 # --- Credentials ---
-export HF_TOKEN=<your-hf-token>
+export HF_TOKEN="<your-hf-token>"
 export HF_HOME=/your/shared/hf_cache
-export WANDB_API_KEY=<your-wandb-key>
+export WANDB_API_KEY="<your-wandb-key>"
 
 export CONT=nvcr.io/nvidia/nemo-automodel:26.04.00
 export CONT_NAME=nemo-automodel-2604

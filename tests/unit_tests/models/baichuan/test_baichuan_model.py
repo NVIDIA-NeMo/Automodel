@@ -520,3 +520,12 @@ class TestReorderCache:
         for layer_past in reordered:
             assert layer_past[0].shape == (3, 2, 4, 8)
         assert torch.allclose(reordered[0][0][0], past[0][0][2])
+
+
+class TestBaichuanTieWordEmbeddings:
+    """Baichuan is UNTIED_ONLY: its NormHead lm_head cannot be meaningfully tied."""
+
+    def test_rejects_tied_word_embeddings(self):
+        # Guard raises at the top of __init__ (before NormHead construction).
+        with pytest.raises(NotImplementedError, match="does not support tie_word_embeddings=True"):
+            BaichuanForCausalLM(_tiny_config(tie_word_embeddings=True))

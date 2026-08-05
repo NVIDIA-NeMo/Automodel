@@ -37,6 +37,7 @@ from nemo_automodel.components.models.qwen3_5_moe.model import (
     Fp32SafeQwen3_5MoeVisionRotaryEmbedding,
     ModelClass,
     Qwen3_5MoeBlock,
+    Qwen3_5MoeForCausalLM,
     Qwen3_5MoeForConditionalGeneration,
     Qwen3_5MoeModel,
     Qwen3_5MoeTextModelBackend,
@@ -129,7 +130,7 @@ def backend_config():
         linear="torch",
         attn="sdpa",
         rms_norm="torch",
-        enable_deepep=False,
+        dispatcher="torch",
         fake_balanced_gate=False,
         enable_hf_state_dict_adapter=False,
     )
@@ -630,6 +631,7 @@ class TestQwen3_5MoeForConditionalGeneration:
         assert squeeze_args[1] is position_ids
         assert squeeze_args[2] is padding_mask
         assert squeeze_args[3]["qkv_format"] == "thd"
+        assert mock_model_forward.call_args.kwargs["padding_mask"] is squeezed_padding_mask
 
     def test_initialize_weights_invokes_language_model(self, vl_config, backend_config, moe_config):
         model = Qwen3_5MoeForConditionalGeneration(vl_config, backend=backend_config, moe_config=moe_config)
@@ -656,8 +658,12 @@ class TestQwen3_5MoeForConditionalGeneration:
 # from_pretrained / ModelClass export tests
 # ---------------------------------------------------------------------------
 class TestQwen3_5MoeFromPretrainedAndModelClass:
-    def test_from_pretrained_classmethod(self):
-        cfg = Qwen3_5MoeConfig()
+    def test_from_pretrained_classmethod(self, vl_config):
+        # Use the tiny `vl_config` fixture instead of the default ``Qwen3_5MoeConfig()``,
+        # which describes the full ~30B model (40 layers, 256 experts, 248K vocab) and
+        # takes minutes to materialize on GPU. The classmethod's delegation behaviour is
+        # identical regardless of model size.
+        cfg = vl_config
         cfg.text_config.pad_token_id = 0
 
         with (
@@ -703,7 +709,10 @@ class TestQwen3_5MoeModelVLPath:
             batch, seq_len, vl_config.text_config.hidden_size, device=device, dtype=model_dtype
         )
 
-        with patch.object(HFQwen3_5MoeModel, "forward", return_value=mock_output) as mock_hf_forward:
+        with (
+            patch.object(HFQwen3_5MoeModel, "forward", return_value=mock_output) as mock_hf_forward,
+            patch.object(core.language_model, "forward") as mock_language_forward,
+        ):
             result = core.forward(
                 input_ids=input_ids,
                 pixel_values=pixel_values,
@@ -711,6 +720,7 @@ class TestQwen3_5MoeModelVLPath:
             )
 
         mock_hf_forward.assert_called_once()
+        mock_language_forward.assert_not_called()
         kw = mock_hf_forward.call_args.kwargs
         assert kw["pixel_values"] is pixel_values
         assert kw["input_ids"] is None
@@ -880,6 +890,71 @@ class TestTextModelBackendInputsEmbedsPath:
 
         assert isinstance(output, Qwen3_5MoeModelOutputWithPast)
         assert output.last_hidden_state.shape == (batch, seq_len, text_config.hidden_size)
+
+    def test_forward_requires_inputs_embeds_when_embed_tokens_absent(
+        self, text_config, backend_config, moe_config, device
+    ):
+        """The shared backend stays strict; wrappers route PP hidden states explicitly."""
+        model = Qwen3_5MoeTextModelBackend(text_config, backend=backend_config, moe_config=moe_config).to(device)
+        model.embed_tokens = None
+
+        batch, seq_len = 2, 3
+        hidden_states = torch.randn(batch, seq_len, text_config.hidden_size, device=device)
+
+        with pytest.raises(ValueError, match="inputs_embeds must be provided"):
+            model(input_ids=hidden_states)
+
+    def test_forward_does_not_reinterpret_float_input_ids_when_embed_tokens_present(
+        self, text_config, backend_config, moe_config, device
+    ):
+        """Full/first stages still pass input_ids through embed_tokens regardless of dtype."""
+        model = Qwen3_5MoeTextModelBackend(text_config, backend=backend_config, moe_config=moe_config).to(device)
+
+        class RecordingEmbedding(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.seen_input = None
+
+            def forward(self, input_ids):
+                self.seen_input = input_ids
+                raise RuntimeError("embed_tokens called")
+
+        embed_tokens = RecordingEmbedding()
+        model.embed_tokens = embed_tokens
+        float_input = torch.randn(2, 3, text_config.hidden_size, device=device)
+
+        with pytest.raises(RuntimeError, match="embed_tokens called"):
+            model(input_ids=float_input)
+
+        assert embed_tokens.seen_input is float_input
+
+
+class TestQwen3_5MoeForCausalLMPipelineRouting:
+    def test_forward_routes_positional_hidden_states_when_embed_tokens_absent(
+        self, text_config, backend_config, moe_config, device
+    ):
+        """Text-only CausalLM handles non-first PP stage routing before the shared backend."""
+        model = Qwen3_5MoeForCausalLM(text_config, backend=backend_config, moe_config=moe_config).to(device)
+        model.eval()
+        model.model.embed_tokens = None
+
+        batch, seq_len = 2, 3
+        hidden_states = torch.randn(
+            batch, seq_len, text_config.hidden_size, device=device, dtype=model.lm_head.weight.dtype
+        )
+
+        with patch.object(model.model, "forward") as mock_model_forward:
+            mock_model_forward.return_value = Qwen3_5MoeModelOutputWithPast(
+                last_hidden_state=hidden_states,
+                past_key_values=None,
+                rope_deltas=None,
+            )
+
+            model(input_ids=hidden_states)
+
+        call_kwargs = mock_model_forward.call_args.kwargs
+        assert call_kwargs["input_ids"] is None
+        assert call_kwargs["inputs_embeds"] is hidden_states
 
 
 # ---------------------------------------------------------------------------

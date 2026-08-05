@@ -27,7 +27,7 @@ from nemo_automodel.components.distributed.config import DDPConfig
 logger = logging.getLogger(__name__)
 
 
-def _create_gloo_group():
+def _create_gloo_group() -> dist.ProcessGroup | None:
     """
     Create a Gloo process group for barrier operations.
 
@@ -41,7 +41,6 @@ def _create_gloo_group():
         return None
 
     try:
-        # Create a Gloo group for barrier operations
         gloo_group = dist.new_group(backend="gloo")
         logger.debug("Created Gloo group for barrier operations")
         return gloo_group
@@ -50,12 +49,13 @@ def _create_gloo_group():
         return None
 
 
-def _barrier_with_timeout(timeout: timedelta, group=None):
+def _barrier_with_timeout(timeout: timedelta, group: dist.ProcessGroup | None = None) -> bool:
     """
-    A timeout wrapper for torch.distributed.barrier() using Gloo backend.
+    Run a barrier using the timeout configured on its process group.
 
-    This approach creates a separate Gloo process group for barrier operations
-    while keeping the main NCCL backend for training operations.
+    Explicit model-local groups are reused directly so subset ranks do not need
+    to create another process group in a globally coordinated order. The default
+    group path uses a temporary Gloo group and ``monitored_barrier``.
 
     Args:
         timeout: Maximum time to wait for the barrier
@@ -64,7 +64,11 @@ def _barrier_with_timeout(timeout: timedelta, group=None):
     Returns:
         bool: True if barrier completed successfully, False if timeout occurred
     """
-    if not dist.is_initialized() or dist.get_world_size() == 1:
+    if not dist.is_initialized() or dist.get_world_size(group=group) == 1:
+        return True
+
+    if group is not None:
+        dist.barrier(group=group)
         return True
 
     # Use Gloo group for barrier operations
@@ -102,7 +106,15 @@ class FirstRankPerNode(ContextDecorator):
       - Works on a single GPU (no env flags, no distributed initialisation).
 
     Note: it is assumed the scoped code is not torch.distributed heavy.
+
+    Args:
+        group: Optional model-local process group. When provided, only members
+            of that group participate in serialization and temporary Gloo
+            barrier creation.
     """
+
+    def __init__(self, group: dist.ProcessGroup | None = None) -> None:
+        self.group = group
 
     def __enter__(self, timeout=timedelta(hours=10)):
         """
@@ -116,18 +128,18 @@ class FirstRankPerNode(ContextDecorator):
         self._node0_group = None
         self._first = True  # default for single-GPU / no-dist case
         self._timeout = timeout
-        if not dist.is_initialized() or dist.get_world_size() == 1:
+        if not dist.is_initialized() or dist.get_world_size(group=self.group) == 1:
             # pure single GPU
             return True
 
         # Figure out rank
-        self._first = dist.get_rank() == 0
+        self._first = dist.get_rank(group=self.group) == 0
 
         # Synchronisation logic
         if not self._first:
             # Non-rank-0 processes wait for their node-rank-0
             # Use Gloo group for monitored_barrier to avoid NCCL timeout issues
-            success = _barrier_with_timeout(timeout=self._timeout)
+            success = _barrier_with_timeout(timeout=self._timeout, group=self.group)
             if not success:
                 logger.warning("Barrier timed out, continuing anyway")
 
@@ -157,7 +169,7 @@ class FirstRankPerNode(ContextDecorator):
             if self._first and dist.is_initialized():
                 # Re-sync the whole world so that non-rank-0s can proceed
                 # Use Gloo group for monitored_barrier to avoid NCCL timeout issues
-                success = _barrier_with_timeout(timeout=self._timeout)
+                success = _barrier_with_timeout(timeout=self._timeout, group=self.group)
                 if not success:
                     logger.warning("Barrier timed out during exit, continuing anyway")
                 if exc_type is not None:

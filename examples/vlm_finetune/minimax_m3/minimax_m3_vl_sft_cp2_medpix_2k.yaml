@@ -1,0 +1,144 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Recipe for cp_size=2, UNPACKED MedPix @ max_length=2048.
+# Identical to minimax_m3_vl_sft_ep32pp4.yaml in every respect EXCEPT cp_size (1 -> 2),
+# so the loss curve should track that recipe's step-for-step (only bf16 / ring-reduction
+# drift). A matching curve validates that CP shards the sequence without changing the math.
+#
+# world = pp4 * dp16 * cp2 * tp1 = 128 (16 nodes x 8);  ep32 | dp*cp = 16 * 2 = 32.
+# global_batch_size=512 / local_batch_size=8 -> grad_accum = 512/(8*16) = 4 (cp1 uses 2).
+# Unpacked short MedPix @2048 mostly shards padding under cp2 -- fine here, the goal is a
+# matched-regime CP-vs-no-CP loss check, not throughput. 2048 is divisible by 2*cp=4.
+
+recipe: FinetuneRecipeForVLM
+
+seed: 1234
+
+step_scheduler:
+  global_batch_size: 512
+  local_batch_size: 8
+  ckpt_every_steps: 100
+  val_every_steps: 25
+  log_remote_every_steps: 1
+  gc_every_steps: 10
+  max_steps: 100
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 60
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 1234
+  ranked: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
+  pretrained_model_name_or_path: MiniMaxAI/MiniMax-M3
+  trust_remote_code: false
+  torch_dtype: bfloat16
+  text_config:
+    # The bf16 checkpoint ships no MTP weights, so this must stay 0.
+    num_mtp_modules: 0
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: sdpa
+    linear: te
+    rms_norm: torch_fp32
+    rope_fusion: false
+    experts: gmm
+    dispatcher: hybridep
+    fake_balanced_gate: false
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
+
+processor:
+  _target_: nemo_automodel.components.models.minimax_m3_vl.processing.build_minimax_m3_vl_processor
+  pretrained_model_name_or_path: MiniMaxAI/MiniMax-M3
+  trust_remote_code: true
+
+checkpoint:
+  enabled: false               # comparison run: don't persist a 400B checkpoint
+  checkpoint_dir: vlm_checkpoints/minimax_m3_vl_sft_cp2_medpix_2k/
+  model_save_format: safetensors
+  save_consolidated: false
+  dequantize_base_checkpoint: false
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 2
+  pp_size: 4
+  ep_size: 32
+  sequence_parallel: false
+  activation_checkpointing: true
+  pipeline:
+    pp_schedule: interleaved1f1b
+    pp_microbatch_size: 1
+    layers_per_stage: 2
+    round_virtual_stages_to_pp_multiple: down
+    scale_grads_in_schedule: false
+    patch_inner_model: false
+    patch_causal_lm_model: false
+  moe:
+    reshard_after_forward: false
+    wrap_outer_model: true
+
+freeze_config:
+  freeze_embeddings: true
+  freeze_vision_tower: true
+  freeze_audio_tower: true
+  freeze_language_model: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+  fp32_upcast: false
+
+dataset:
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset
+  path_or_dataset: mmoukouba/MedPix-VQA
+  split: train
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 2
+  persistent_workers: true
+  pin_memory: true
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.vlm.collate_fns.default_collate_fn
+    max_length: 2048
+  drop_last: true
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset
+  path_or_dataset: mmoukouba/MedPix-VQA
+  split: validation[:256]
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 1
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.vlm.collate_fns.default_collate_fn
+    max_length: 2048
+
+optimizer:
+  _target_: torch.optim.AdamW
+  betas: [0.9, 0.95]
+  eps: 1e-8
+  lr: 1.0e-5
+  weight_decay: 0.1
+
+lr_scheduler:
+  lr_decay_style: cosine
+  min_lr: 1.0e-6
+
+wandb:
+  enable: false
+  project: <your_wandb_project>
+  entity: <your_wandb_entity>
+  name: <your_wandb_name>
+  dir: <your_wandb_save_dir>
+
+ci:
+  recipe_owner: athitten
+  nodes: 16

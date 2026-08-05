@@ -71,26 +71,39 @@ uv sync --locked --all-groups                          # base + dev groups
 uv sync --locked --all-groups --extra cuda             # CUDA support
 uv sync --locked --all-groups --extra fa               # flash-attention
 uv sync --locked --all-groups --extra moe              # mixture-of-experts
-uv sync --locked --all-groups --extra vlm              # vision-language models
+uv sync --locked --all-groups --extra vlm              # vision-language models (core)
+uv sync --locked --all-groups --extra vlm-media        # + video/Qwen/Mistral decode (opencv, decord, qwen-utils; FFmpeg-bearing)
 uv sync --locked --all-groups --extra diffusion        # diffusion models
+uv sync --locked --all-groups --extra diffusion-media  # + diffusion preprocessing/export (imageio-ffmpeg, opencv)
+uv sync --locked --all-groups --extra media            # vlm-media + diffusion-media (union)
 uv sync --locked --all-groups --extra delta-databricks # Delta Lake / Databricks
-uv sync --locked --all-groups --extra all              # everything
+uv sync --locked --all-groups --extra all              # all standard extras (EXCLUDES media — FFmpeg kept opt-in)
 ```
 
-### Option 3: pip
+The media extras (`vlm-media`, `diffusion-media`, `media`) bundle FFmpeg and are
+deliberately **excluded from `all`** and from the container image — add them
+explicitly for video/image decode.
+
+### Option 3: uv pip
 
 Full install (matches `uv sync --extra all`):
 
 ```bash
-pip install -e ".[all]"
+uv venv
+source .venv/bin/activate
+uv pip install -e ".[all]"
 ```
 
-Login-node / submitter-only install — lightweight package for SLURM, k8s, or
-NeMo-Run job submission without local CUDA deps:
+To add NeMo Run submission support to the base package:
 
 ```bash
-pip install nemo-automodel[cli]
+uv venv
+source .venv/bin/activate
+uv pip install "nemo-automodel[cli]"
 ```
+
+The `cli` extra is additive: it adds `nemo-run` but does not remove the base
+package's core training dependencies, including PyTorch.
 
 ## Package Management
 
@@ -113,31 +126,20 @@ export HF_HOME="/path/to/hf_cache" # Hugging Face cache directory
 
 ## CLI Usage
 
-The entry point is `automodel` (defined at `nemo_automodel._cli.app:main`).
+The entry point is `automodel` (defined at `nemo_automodel.cli.app:main`).
 
-Pattern: `automodel <command> <domain> -c <config.yaml>`
+Pattern: `uv run automodel <config.yaml> [--nproc-per-node N] [--key.subkey value ...]`
 
 ```bash
-# LLM
-automodel finetune llm -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
-automodel pretrain llm -c config.yaml
-automodel kd llm -c config.yaml
-automodel benchmark llm -c config.yaml
-
-# VLM
-automodel finetune vlm -c config.yaml
-
-# Diffusion
-automodel finetune diffusion -c config.yaml
-
-# Retrieval
-automodel finetune retrieval -c config.yaml
+# The YAML's recipe field selects LLM, VLM, diffusion, or retrieval behavior.
+uv run automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml --nproc-per-node 8
 ```
 
 Override any config value from the CLI:
 
 ```bash
-automodel finetune llm -c config.yaml --model.name_or_path meta-llama/Llama-3.2-1B
+uv run automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
+    --model.pretrained_model_name_or_path meta-llama/Llama-3.2-1B
 ```
 
 ## Common Pitfalls
@@ -146,4 +148,5 @@ automodel finetune llm -c config.yaml --model.name_or_path meta-llama/Llama-3.2-
 |---|---|---|
 | Stale `.venv` after switching branches | Cached environment out of sync | Delete `.venv` and re-run `uv sync --locked` |
 | Import errors for optional features (TE, flash-attn, MoE) | Missing extras | Install the matching `uv` extra (`--extra fa`, `--extra moe`, etc.) |
+| Import errors for media (`cv2`, `decord`, `qwen_vl_utils`, `imageio_ffmpeg`) | Media extras are opt-in (not in `all`) | Install `--extra vlm-media` (VLM/Qwen/Mistral) or `--extra diffusion-media` (diffusion) |
 | TransformerEngine version mismatch | The TE installed by `uv sync` takes precedence over the version baked into the container | Set the desired TE version in `pyproject.toml` / `uv.lock` and re-run `uv sync` — the venv's TE wins, not the container's |

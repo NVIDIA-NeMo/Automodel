@@ -263,12 +263,15 @@ def test_transform_func_image_conversion():
         "c": DummyCorpus({"p": {"text": "t", "image": img, "nr_ocr": ""}}),
     }
     examples = {"question": ["Q"], "corpus_id": ["c"], "pos_doc": [[{"id": "p"}]], "neg_doc": [[{"id": "p"}]]}
-    out = rd._transform_func(examples, num_neg_docs=1, corpus_dict=corpus_dict)
+    out = rd._transform_func(examples, num_neg_docs=1, corpus_dict=corpus_dict, use_text_in_document=True)
     # conversion called
     assert isinstance(out["doc_image"][0][0], DummyImage)
     assert img.convert_called_with == "RGB"
     # text is preserved (trim logic without leading spaces result)
     assert out["doc_text"][0][0] == "t"
+
+    out_without_text = rd._transform_func(examples, num_neg_docs=1, corpus_dict=corpus_dict)
+    assert out_without_text["doc_text"][0][0] == ""
 
 
 def _make_train_file(tmp_path, corpus_dir, data_len=1, corpus_id="corpusA"):
@@ -311,13 +314,13 @@ def test_make_retrieval_dataset_train_and_eval(tmp_path, monkeypatch):
     train_file = _make_train_file(tmp_path, corpus_dir, data_len=2)
 
     # Train mode: set_transform uses n_passages - 1 negatives
-    ds_train = rd.make_retrieval_dataset(
+    ds_train = rd.RetrievalDatasetConfig(
         data_dir_list=str(train_file),
         data_type="train",
         n_passages=3,
         max_train_samples=1,
         cycle_positive_docs=True,
-    )
+    ).build()
     assert len(ds_train) == 1
     assert hasattr(ds_train, "set_epoch")
     ex = ds_train[0]
@@ -351,6 +354,102 @@ def test_textqa_get_all_ids(tmp_path, monkeypatch):
     )
     _, corpus = rd.load_corpus(str(corpus_dir))
     assert corpus.get_all_ids() == ["1", "2"]
+
+
+def test_colpali_dataset_uses_image_filename_ids(monkeypatch):
+    """ColPaliDataset should expose image documents keyed by image_filename."""
+    monkeypatch.setattr(
+        rd,
+        "load_dataset",
+        _mock_hf_load_dataset_returning(
+            [
+                {
+                    "image_filename": "z-page.png",
+                    "image": "image-z",
+                    "nr_ocr": "ocr-z",
+                    "complex_ocr": "complex-z",
+                },
+                {
+                    "image_filename": "a-page.png",
+                    "image": "image-a",
+                    "nr_ocr": "ocr-a",
+                    "complex_ocr": "complex-a",
+                },
+            ]
+        ),
+    )
+
+    corpus = rd.ColPaliDataset("colpali-path")
+
+    assert corpus.path == "colpali-path"
+    assert corpus.get_all_ids() == ["a-page.png", "z-page.png"]
+    assert corpus.get_document_by_id("z-page.png") == {
+        "text": "",
+        "image": "image-z",
+        "nr_ocr": "ocr-z",
+        "complex_ocr": "complex-z",
+    }
+
+
+def test_wikissnq_dataset_uses_docid_ids(monkeypatch):
+    """WikiSSNQDataset should expose image documents keyed by docid."""
+    monkeypatch.setattr(
+        rd,
+        "load_dataset",
+        _mock_hf_load_dataset_returning(
+            [
+                {
+                    "docid": "doc-b",
+                    "text": "text-b",
+                    "image": "image-b",
+                    "nr_ocr": "ocr-b",
+                    "complex_ocr": "complex-b",
+                },
+                {
+                    "docid": "doc-a",
+                    "text": "text-a",
+                    "image": "image-a",
+                    "nr_ocr": "ocr-a",
+                    "complex_ocr": "complex-a",
+                },
+            ]
+        ),
+    )
+
+    corpus = rd.WikiSSNQDataset("wikissnq-path")
+
+    assert corpus.path == "wikissnq-path"
+    assert corpus.get_all_ids() == ["doc-a", "doc-b"]
+    assert corpus.get_document_by_id("doc-a") == {
+        "text": "text-a",
+        "image": "image-a",
+        "nr_ocr": "ocr-a",
+        "complex_ocr": "complex-a",
+    }
+
+
+def test_docmatix_dataset_loads_images_config_and_row_image_ids(monkeypatch):
+    """DocMatixDataset should read the images config and resolve row_image IDs."""
+    calls = []
+    backing_dataset = Dataset.from_list(
+        [
+            {"images": ["image-0-0", "image-0-1"]},
+            {"images": ["image-1-0"]},
+        ]
+    )
+
+    def fake_load_dataset(path, config):
+        calls.append((path, config))
+        return {"train": backing_dataset}
+
+    monkeypatch.setattr(rd, "load_dataset", fake_load_dataset)
+
+    corpus = rd.DocMatixDataset("docmatix-path")
+
+    assert calls == [("docmatix-path", "images")]
+    assert corpus.path == "docmatix-path"
+    assert corpus.get_all_ids() == ["0_0", "1_0"]
+    assert corpus.get_document_by_id("0_1") == {"text": "", "image": "image-0-1", "nr_ocr": ""}
 
 
 def test_load_corpus_metadata_missing_file(tmp_path):
@@ -893,6 +992,62 @@ def test_make_retrieval_dataset_inline_end_to_end(tmp_path):
     assert ex["question"] == "Explain transformers"
     assert ex["doc_text"] == ["Transformers are a type of neural network...", "RNNs are...", "CNNs are..."]
     assert ex["doc_image"] == ["", "", ""]
+
+
+def test_retrieval_dataset_config_builds_inline_jsonl_for_both_model_types(tmp_path):
+    """The public retrieval config should route inline JSONL without corpus metadata."""
+    f = tmp_path / "inline.jsonl"
+    f.write_text(
+        json.dumps(
+            {
+                "query": "Q",
+                "pos_doc": ["P1", "P2"],
+                "neg_doc": ["N"],
+            }
+        )
+    )
+
+    dataset = rd.RetrievalDatasetConfig(
+        data_dir_list=str(f),
+        data_type="train",
+        n_passages=2,
+        cycle_positive_docs=True,
+    ).build()
+
+    assert hasattr(dataset, "set_epoch")
+    assert dataset[0]["doc_text"] == ["P1", "N"]
+    dataset.set_epoch(1)
+    assert dataset[0]["doc_text"] == ["P2", "N"]
+
+    cross_dataset = rd.RetrievalDatasetConfig(
+        data_dir_list=str(f),
+        model_type="cross_encoder",
+        data_type="train",
+        n_passages=2,
+    ).build()
+    cross_batch = cross_dataset[[0]]
+    assert cross_batch["question"] == ["Q", "Q"]
+    assert cross_batch["doc_text"] == ["P1", "N"]
+    assert cross_batch["num_labels"] == [1, 1]
+
+
+def test_retrieval_dataset_config_rejects_instructions_without_corpus_metadata(tmp_path):
+    """Pure inline records cannot resolve dataset instructions without corpus metadata."""
+    f = tmp_path / "inline.jsonl"
+    f.write_text(json.dumps({"query": "Q", "pos_doc": "P", "neg_doc": ["N"]}))
+
+    dataset = rd.RetrievalDatasetConfig(
+        data_dir_list=str(f),
+        data_type="train",
+        n_passages=2,
+        use_dataset_instruction=True,
+    ).build()
+
+    with pytest.raises(
+        ValueError,
+        match=r"use_dataset_instruction=True requires corpus metadata.*Set use_dataset_instruction=False",
+    ):
+        dataset[0]
 
 
 def test__load_json_or_jsonl_json_and_jsonl_error_paths(tmp_path):

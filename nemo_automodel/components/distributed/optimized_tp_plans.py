@@ -48,6 +48,7 @@ from nemo_automodel.components.models.llama.model import LlamaForCausalLM as Cus
 from nemo_automodel.components.models.mistral3.model import Ministral3ForCausalLM
 from nemo_automodel.components.models.mistral3_vlm.model import Mistral3FP8VLMForConditionalGeneration
 from nemo_automodel.components.models.qwen2.model import Qwen2ForCausalLM as CustomQwen2ForCausalLM
+from nemo_automodel.components.models.qwen3.model import Qwen3ForCausalLM as CustomQwen3ForCausalLM
 
 
 class SequenceParallelAllGatherActivation(SequenceParallel):
@@ -305,6 +306,15 @@ def get_decilm_nemotron_tp_plan(
         base_model_tp_plan.update(cast(dict[str, ParallelStyle], base_model_sp_plan))
 
     return cast(dict[str, ParallelStyle], base_model_tp_plan)
+
+
+def _parallelize_decilm_nemotron(
+    model,
+    sequence_parallel: bool = False,
+) -> dict[str, ParallelStyle]:
+    if getattr(getattr(model, "config", None), "model_type", None) != "nemotron-nas":
+        raise ValueError("DeciLM TP plan is only registered for Nemotron-NAS checkpoints")
+    return get_decilm_nemotron_tp_plan(sequence_parallel=sequence_parallel)
 
 
 def _parallelize_baichuan(
@@ -745,7 +755,10 @@ PARALLELIZE_FUNCTIONS: Dict[str, Callable[..., Dict[str, ParallelStyle]]] = {
     _get_class_qualname(Phi3ForCausalLM): _parallelize_phi3,
     _get_class_qualname(CustomLlamaForCausalLM): _parallelize_llama,
     _get_class_qualname(CustomQwen2ForCausalLM): _parallelize_qwen,
+    _get_class_qualname(CustomQwen3ForCausalLM): _parallelize_qwen,
     # trust_remote_code models — matched by bare class __name__ in parallelizer
     # because their qualname includes a snapshot-hash-bearing module path.
+    "NemotronFlashForCausalLM": _parallelize_llama,
+    "DeciLMForCausalLM": _parallelize_decilm_nemotron,
     "NemotronLabsDiffusionModel": _parallelize_nemotron_labs_diffusion,
 }

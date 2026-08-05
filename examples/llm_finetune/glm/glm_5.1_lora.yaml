@@ -28,7 +28,7 @@ model:
     linear: torch
     rms_norm: torch_fp32
     rope_fusion: false
-    dispatcher: deepep
+    dispatcher: hybridep
     experts: gmm
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
@@ -110,3 +110,4 @@ ci:
   # pp_size(4) * ep_size(32) = 128 GPUs => 16 nodes (8 H100/node).
   recipe_owner: hemildesai
   nodes: 16
+  time: "00:20:00"

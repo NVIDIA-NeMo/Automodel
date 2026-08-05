@@ -20,16 +20,28 @@ CPU=false
 TEST_DIR="tests/"
 TEST_NAME=""
 ADDITIONAL_ARGS=""
+SHARD_ID=""
+NUM_SHARDS=""
 
 for i in "$@"; do
     case $i in
         --UNIT_TEST=?*) UNIT_TEST="${i#*=}";;
         --CPU=?*) CPU="${i#*=}";;
         --TEST_NAME=?*) TEST_NAME="${i#*=}";;
+        --SHARD_ID=?*) SHARD_ID="${i#*=}";;
+        --NUM_SHARDS=?*) NUM_SHARDS="${i#*=}";;
         *) ;;
     esac
     shift
 done
+
+# Optionally split the collected tests into shards via pytest-shard so a single
+# suite can be spread across several parallel CI runners. Only takes effect when
+# both a shard index and a shard count (>1) are provided.
+SHARD_ARGS=""
+if [[ -n "$NUM_SHARDS" && "$NUM_SHARDS" -gt 1 && -n "$SHARD_ID" ]]; then
+    SHARD_ARGS="--shard-id=$SHARD_ID --num-shards=$NUM_SHARDS"
+fi
 
 if [[ "$CPU" == "false" ]]; then
     export CUDA_VISIBLE_DEVICES="0,1"
@@ -43,6 +55,15 @@ else
     export TEST_DIR="tests/functional_tests/$TEST_NAME"
 fi
 
+# Install opt-in media extras (kept out of the default media-free image) per folder.
+case "$TEST_NAME" in
+    hf_transformer_vlm) MEDIA_EXTRA="vlm-media" ;;
+    *) MEDIA_EXTRA="" ;;
+esac
+if [[ -n "$MEDIA_EXTRA" ]]; then
+    uv pip install ".[$MEDIA_EXTRA]"
+fi
+
 coverage run \
     -m pytest \
     --durations 32 \
@@ -51,5 +72,6 @@ coverage run \
     -o log_cli=true \
     -o log_cli_level=INFO \
     -vs -m "not pleasefixme" --tb=short -rA \
+    $SHARD_ARGS \
     $ADDITIONAL_ARGS
 coverage combine -q

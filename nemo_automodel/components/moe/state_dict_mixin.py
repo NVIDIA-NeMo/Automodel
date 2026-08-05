@@ -104,14 +104,18 @@ class MoESplitExpertsStateDictMixin:
     ) -> None:
         """Validate that all required experts are available in the HF state dict before loading.
         Only validates experts needed for the current rank and layers present in the state dict.
+        Expert groups already loaded through registered in-place views validate the rank-local IDs recorded by
+        ``_split_experts_weights``, including when EP is disabled and no MoE mesh is passed to this method.
 
         Args:
-            hf_state_dict: HuggingFace format state dict
-            n_experts: Total number of experts
-            device_mesh: Optional device mesh for expert parallelism
+            hf_state_dict: HuggingFace state mapping. Expert gate/up values are tensors of shape
+                [expert_hidden, hidden], and down values have shape [hidden, expert_hidden]. This method validates
+                their keys only.
+            n_experts: Total number of experts.
+            device_mesh: Optional device mesh whose ``ep`` dimension partitions the experts axis.
 
         Raises:
-            RuntimeError: If required expert weights are missing from the checkpoint
+            RuntimeError: If required expert weights are missing from the checkpoint.
         """
         if device_mesh is not None:
             start_expert, end_expert = get_expert_range_for_rank_from_mesh(device_mesh, n_experts)
@@ -159,18 +163,24 @@ class MoESplitExpertsStateDictMixin:
 
         missing_weights = []
         projection_types = ["gate_proj", "up_proj", "down_proj"] if self._is_gated_moe else ["up_proj", "down_proj"]
+        inplace_loaded_keys: set[str] = getattr(self, "_inplace_loaded_native_keys", None) or set()
+        inplace_expert_ids = getattr(self, "_last_expert_ids", None) or required_experts
+        total_required = 0
 
         for layer_num, prefixes in layers_with_experts.items():
             for prefix in prefixes:
-                for expert_id in required_experts:
-                    for proj_type in projection_types:
+                for proj_type in projection_types:
+                    native_projection = "down_projs" if proj_type == "down_proj" else "gate_and_up_projs"
+                    native_key = f"{prefix}layers.{layer_num}.{expert_segment}.{native_projection}"
+                    experts_to_validate = inplace_expert_ids if native_key in inplace_loaded_keys else required_experts
+                    total_required += len(experts_to_validate)
+                    for expert_id in experts_to_validate:
                         expected_key = f"{prefix}layers.{layer_num}.{expert_segment}.{expert_id}.{proj_type}.weight"
                         if expected_key not in hf_state_dict:
                             missing_weights.append(expected_key)
 
         if missing_weights:
             missing_count = len(missing_weights)
-            total_required = len(required_experts) * len(layers_with_experts) * len(projection_types)
             raise RuntimeError(
                 f"Expert weights missing from checkpoint{rank_info}: {missing_count}/{total_required} required weights not found. "
                 f"Cannot load experts - checkpoint may be incomplete or corrupted. "
@@ -180,9 +190,16 @@ class MoESplitExpertsStateDictMixin:
             )
 
     def _split_experts_weights(self, weight: torch.Tensor, n_experts: int) -> list[torch.Tensor]:
-        """Split grouped expert weights into individual expert weights.
-        For grouped expert weights with shape [n_experts, ...], split into n_experts tensors each with shape [...].
-        Supports both regular tensors and DTensors.
+        """Split grouped expert weights into per-expert tensors.
+
+        Args:
+            weight: Tensor of shape [experts, ...], with arbitrary trailing dimensions. An EP DTensor uses an
+                ``ep`` mesh dimension. A non-EP DTensor may use any FSDP placement on a mesh without ``ep``.
+            n_experts: Global number of experts in ``weight``.
+
+        Returns:
+            Per-expert tensors of shape [...]. A DTensor sharded on the expert axis returns only the experts local
+            to this rank; other DTensors return every expert and preserve adjusted placements.
         """
         if is_dtensor(weight):
             split_weights, expert_ids = split_experts_weights_dtensor_aware(weight, n_experts)
@@ -637,6 +654,19 @@ class MoESplitExpertsStateDictMixin:
         inter_dim = self.moe_config.moe_inter_dim
         prefix = prefix_override if prefix_override is not None else self._hf_prefix
         expert_segment = self._expert_path_segment
+        # When quantizing, the adapter casts each split with ``value.to(float8_e4m3fn)``,
+        # which ALLOCATES a new tensor that no longer aliases the model's grouped storage.
+        # An in-place DCP ``copy_`` into that throwaway buffer would silently never reach the
+        # model (experts stay at random init -> garbage loss). So fp8 loads must take the
+        # rebuild path: never mark these keys in-place-loaded when ``quantization`` is set.
+        quantization = kwargs.get("quantization", False)
+
+        # GroupedExpertsTE (backend.experts == "te") exposes gate_and_up_projs/down_projs as a
+        # torch.stack COPY of TE's per-expert weight{i} params; it does not alias the model's
+        # grouped storage, so an in-place copy_ would write that throwaway buffer and leave the TE
+        # experts at their initial values. Force the rebuild path for it. Other expert backends
+        # keep a real aliasing stacked Parameter and are unaffected.
+        experts_alias_grouped_storage = getattr(getattr(self, "backend", None), "experts", None) != "te"
 
         from nemo_automodel.components.moe.state_dict_utils import (
             is_dtensor,
@@ -651,8 +681,13 @@ class MoESplitExpertsStateDictMixin:
 
             splits = self._split_experts_weights(tensor, n_experts)
 
-            # In-place views only engage when splits are plain (ep_shard==1).
-            inplace_ok = is_dtensor(tensor) and len(splits) > 0 and not is_dtensor(splits[0])
+            inplace_ok = (
+                (is_dtensor(tensor) or (isinstance(tensor, torch.Tensor) and tensor.is_cuda and not tensor.is_meta))
+                and len(splits) > 0
+                and not is_dtensor(splits[0])
+                and not quantization
+                and experts_alias_grouped_storage
+            )
             if inplace_ok:
                 self._register_inplace_loaded_key(fqn, prefix_override)
 
@@ -694,7 +729,13 @@ class MoESplitExpertsStateDictMixin:
                 validate_dtensor_expert_sharding(tensor, n_experts, f"down_projs (DeepEP) layer {layer_num}")
 
             splits = self._split_experts_weights(tensor, n_experts)
-            inplace_ok = is_dtensor(tensor) and len(splits) > 0 and not is_dtensor(splits[0])
+            inplace_ok = (
+                (is_dtensor(tensor) or (isinstance(tensor, torch.Tensor) and tensor.is_cuda and not tensor.is_meta))
+                and len(splits) > 0
+                and not is_dtensor(splits[0])
+                and not quantization
+                and experts_alias_grouped_storage
+            )
             if inplace_ok:
                 self._register_inplace_loaded_key(fqn, prefix_override)
 

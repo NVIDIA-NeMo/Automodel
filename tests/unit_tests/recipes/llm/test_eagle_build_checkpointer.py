@@ -121,6 +121,39 @@ def test_eagle3_build_checkpointer_user_none_override_falls_back(mock_checkpoint
 
 
 # ---------------------------------------------------------------------------
+# EAGLE-3: _build_checkpointer flips to adapter-only checkpoints under LoRA
+# ---------------------------------------------------------------------------
+
+
+@patch("nemo_automodel.components.checkpoint.checkpointing.Checkpointer")
+def test_eagle3_build_checkpointer_defaults_without_peft(mock_checkpointer, tmp_path):
+    """Without a peft config the draft saves full consolidated checkpoints."""
+    from nemo_automodel.components.checkpoint.config import SaveConsolidatedMode
+
+    recipe = _bare_recipe_for_checkpointer(TrainEagle3Recipe, tmp_path)
+
+    recipe._build_checkpointer(target_path="/fake/target")
+
+    assert recipe.checkpoint_config.is_peft is False
+    assert recipe.checkpoint_config.save_consolidated == SaveConsolidatedMode.EVERY
+
+
+@patch("nemo_automodel.components.checkpoint.checkpointing.Checkpointer")
+def test_eagle3_build_checkpointer_adapter_only_with_peft(mock_checkpointer, tmp_path):
+    """With a peft config the checkpointer saves adapters only (no consolidated export)."""
+    from nemo_automodel.components._peft.lora import PeftConfig
+    from nemo_automodel.components.checkpoint.config import SaveConsolidatedMode
+
+    recipe = _bare_recipe_for_checkpointer(TrainEagle3Recipe, tmp_path)
+    recipe.peft_config = PeftConfig(target_modules=["q_proj"])
+
+    recipe._build_checkpointer(target_path="/fake/target")
+
+    assert recipe.checkpoint_config.is_peft is True
+    assert recipe.checkpoint_config.save_consolidated == SaveConsolidatedMode.FALSE
+
+
+# ---------------------------------------------------------------------------
 # EAGLE-3: main(None) no longer raises ValueError
 # ---------------------------------------------------------------------------
 

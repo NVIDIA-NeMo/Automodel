@@ -99,8 +99,11 @@ def test_parse_args_explicit():
 )
 def test_main_wires_server(monkeypatch, argv, expected_nccl_port):
     fake_model = mock.MagicMock()
+    # ``NeMoAutoModelForCausalLM`` is imported lazily inside ``_build_hf_target``
+    # (so the sglang engine needs no HF stack), so patch it at its source module.
     monkeypatch.setattr(
-        serve_target.NeMoAutoModelForCausalLM, "from_pretrained", mock.MagicMock(return_value=fake_model)
+        "nemo_automodel._transformers.auto_model.NeMoAutoModelForCausalLM.from_pretrained",
+        mock.MagicMock(return_value=fake_model),
     )
     monkeypatch.setattr(serve_target, "HFEagle3TargetModel", mock.MagicMock(return_value="wrapper"))
     captured = {}
@@ -142,6 +145,22 @@ def test_nccl_port_nondigit_falls_back(monkeypatch):
     monkeypatch.delenv("NEMO_EAGLE_NCCL_PORT", raising=False)
     client = _ServerClient("http://hostname-no-port", timeout=1, max_retries=0)
     assert client._nccl_port() == 8100  # 8000 default + 100
+
+
+def test_init_nccl_skips_server_when_locally_unavailable(monkeypatch):
+    """No local NCCL support (e.g. an sglang-free client) must not ask the server
+    to init NCCL -- otherwise the server blocks on a rendezvous the client can
+    never complete. The client falls back to wire immediately instead."""
+    from nemo_automodel.components.speculative.eagle.remote import client as client_mod
+
+    monkeypatch.setattr(client_mod, "nccl_transport_available", lambda: False)
+    client = _ServerClient("http://h:8001", timeout=1, max_retries=0)
+    sent = []
+    monkeypatch.setattr(client, "request", lambda endpoint, *_a, **_k: sent.append(endpoint) or b"{}")
+
+    assert client._init_nccl() is False
+    assert protocol.EP_INIT_NCCL not in sent  # server was never contacted
+    assert client._nccl is None
 
 
 # ── _ServerClient.request: retry / failure ───────────────────────────────

@@ -19,10 +19,14 @@ from __future__ import annotations
 import gc
 import json
 import logging
+import math
 import pathlib
-from typing import Any, Dict
+from typing import TYPE_CHECKING, Any, Dict
 
 import torch
+
+if TYPE_CHECKING:
+    from nemo_automodel.components.models.bagel.configuration import BagelBackendConfig
 
 logger = logging.getLogger(__name__)
 
@@ -150,23 +154,19 @@ def _load_siglip_backbone_into_bagel(model, vit_path: str) -> None:
     gc.collect()
 
 
-def initialize_bagel_non_backbone_weights(model: torch.nn.Module) -> None:
-    """Initialize BAGEL-owned modules not loaded from Qwen/SigLIP checkpoints."""
+def initialize_bagel_non_backbone_weights(model: torch.nn.Module, *, seed: int) -> None:
+    """Initialize BAGEL-owned modules from one logical, topology-independent RNG stream."""
     from nemo_automodel.components.models.bagel.embeddings import _get_2d_sincos_pos_embed
 
     bagel = model.model
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(seed)
 
-    def _reset_linear(module: torch.nn.Module) -> None:
-        if isinstance(module, torch.nn.Linear):
-            module.reset_parameters()
+    def _copy_full_tensor(parameter: torch.nn.Parameter, value: torch.Tensor) -> None:
+        from torch.distributed.tensor import DTensor, distribute_tensor
 
-    def _init_position_embedding(module: torch.nn.Module) -> None:
-        pos_embed = _get_2d_sincos_pos_embed(module.hidden_size, module.max_num_patch_per_side)
-        value = torch.from_numpy(pos_embed).to(dtype=module.pos_embed.dtype)
-        param_data = module.pos_embed.data
-        if type(param_data).__name__ == "DTensor":
-            from torch.distributed.tensor import distribute_tensor
-
+        param_data = parameter.data
+        if isinstance(param_data, DTensor):
             value = distribute_tensor(
                 value,
                 device_mesh=param_data.device_mesh,
@@ -176,11 +176,30 @@ def initialize_bagel_non_backbone_weights(model: torch.nn.Module) -> None:
             value = value.to(device=param_data.device)
         param_data.copy_(value)
 
+    def _reset_linear(module: torch.nn.Module) -> None:
+        if not isinstance(module, torch.nn.Linear):
+            return
+
+        weight = torch.empty(tuple(module.weight.shape), dtype=module.weight.dtype, device="cpu")
+        torch.nn.init.kaiming_uniform_(weight, a=math.sqrt(5), generator=generator)
+        _copy_full_tensor(module.weight, weight)
+        if module.bias is not None:
+            fan_in, _ = torch.nn.init._calculate_fan_in_and_fan_out(weight)
+            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+            bias = torch.empty(tuple(module.bias.shape), dtype=module.bias.dtype, device="cpu")
+            torch.nn.init.uniform_(bias, -bound, bound, generator=generator)
+            _copy_full_tensor(module.bias, bias)
+
+    def _init_position_embedding(module: torch.nn.Module) -> None:
+        pos_embed = _get_2d_sincos_pos_embed(module.hidden_size, module.max_num_patch_per_side)
+        value = torch.from_numpy(pos_embed).to(dtype=module.pos_embed.dtype)
+        _copy_full_tensor(module.pos_embed, value)
+
     with torch.no_grad():
         if getattr(model.config, "visual_gen", False):
             bagel.time_embedder.apply(_reset_linear)
-            bagel.vae2llm.reset_parameters()
-            bagel.llm2vae.reset_parameters()
+            bagel.vae2llm.apply(_reset_linear)
+            bagel.llm2vae.apply(_reset_linear)
             _init_position_embedding(bagel.latent_pos_embed)
 
         if getattr(model.config, "visual_und", False):
@@ -215,6 +234,7 @@ def build_bagel_from_hf_backbones(
     vae_config: Dict[str, int] | None,
     meta_init: bool = False,
     load_backbone_weights: bool = True,
+    backend: BagelBackendConfig | None = None,
 ) -> torch.nn.Module:
     """Build BAGEL from upstream Qwen/SigLIP backbone configs."""
     from transformers import Qwen2Config
@@ -276,9 +296,9 @@ def build_bagel_from_hf_backbones(
             from nemo_automodel.components.utils.model_utils import init_empty_weights
 
             with no_init_weights(), init_empty_weights():
-                model = BagelForUnifiedMultimodal(bagel_config)
+                model = BagelForUnifiedMultimodal(bagel_config, backend=backend)
         else:
-            model = BagelForUnifiedMultimodal(bagel_config)
+            model = BagelForUnifiedMultimodal(bagel_config, backend=backend)
     finally:
         torch.set_default_dtype(original_dtype)
 

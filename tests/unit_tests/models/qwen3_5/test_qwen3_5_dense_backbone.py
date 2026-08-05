@@ -55,7 +55,7 @@ def _backend():
         # Qwen3.5 recipe sets rope_fusion=false. Pin it here so the test exercises
         # the supported (non-fused) path deterministically on both CPU and GPU.
         rope_fusion=False,
-        enable_deepep=False,
+        dispatcher="torch",
         fake_balanced_gate=False,
         enable_hf_state_dict_adapter=True,
     )

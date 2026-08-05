@@ -32,6 +32,10 @@ from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
 
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module, initialize_rms_norm_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.tie_word_embeddings import (
+    TieSupport,
+    reject_unsupported_tie_word_embeddings,
+)
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype, compute_lm_head_logits
 from nemo_automodel.components.models.qwen3_moe.model import Block
 from nemo_automodel.components.moe.config import MoEConfig
@@ -46,15 +50,15 @@ class Fp32SafeQwen3VLMoeTextRotaryEmbedding(Qwen3VLMoeTextRotaryEmbedding):
     """Ensure inv_freq stays in float32"""
 
     def _apply(self, fn: Any, recurse: bool = True):
-        # Keep an fp32 copy before super mutates the registered buffer
-        inv_freq_fp32 = self.inv_freq.detach().clone().to(torch.float32)
+        fp32_buffers = {
+            name: buf.detach().clone().to(torch.float32)
+            for name, buf in self.named_buffers(recurse=False)
+            if name in ("inv_freq", "original_inv_freq")
+        }
         result = super()._apply(fn, recurse=recurse)
-        # Restore dtype while honoring the new device placement
-        self.register_buffer(
-            "inv_freq",
-            inv_freq_fp32.to(device=self.inv_freq.device),
-            persistent=False,
-        )
+        for name, fp32_buffer in fp32_buffers.items():
+            current = getattr(self, name)
+            self.register_buffer(name, fp32_buffer.to(device=current.device), persistent=False)
         return result
 
 
@@ -62,13 +66,15 @@ class Fp32SafeQwen3VLMoeVisionRotaryEmbedding(Qwen3VLMoeVisionRotaryEmbedding):
     """Ensure the vision rotary inv_freq buffer remains float32."""
 
     def _apply(self, fn: Any, recurse: bool = True):
-        inv_freq_fp32 = self.inv_freq.detach().clone().to(torch.float32)
+        fp32_buffers = {
+            name: buf.detach().clone().to(torch.float32)
+            for name, buf in self.named_buffers(recurse=False)
+            if name in ("inv_freq", "original_inv_freq")
+        }
         result = super()._apply(fn, recurse=recurse)
-        self.register_buffer(
-            "inv_freq",
-            inv_freq_fp32.to(device=self.inv_freq.device),
-            persistent=False,
-        )
+        for name, fp32_buffer in fp32_buffers.items():
+            current = getattr(self, name)
+            self.register_buffer(name, fp32_buffer.to(device=current.device), persistent=False)
         return result
 
 
@@ -375,6 +381,14 @@ class Qwen3VLMoeTextModelBackend(nn.Module):
         cos, sin = self.rotary_emb(hidden_states, position_ids)
         head_dim = cos.shape[-1] // 2
         freqs_cis = torch.cat((cos[..., :head_dim], sin[..., :head_dim]), dim=-1)
+        if attn_kwargs.get("qkv_format") == "thd":
+            # THD q/k/v are token-major [total, heads, dim] with no batch axis, and
+            # the non-fused rope apply broadcasts freqs after an unsqueeze(-2). The
+            # HF-style rotary above emits [1, total, head_dim]; keeping that batch
+            # axis broadcasts q/k up to 4D while v stays 3D, tripping TE attention
+            # ("Keys and values must have the same batch size..."). Drop it so the
+            # per-token mRoPE freqs match the native THD freqs_cis layout.
+            freqs_cis = freqs_cis.squeeze(0)
 
         for layer_id_str, decoder_layer in self.layers.items():
             layer_idx = int(layer_id_str)
@@ -442,6 +456,8 @@ class Qwen3VLMoeTextModelBackend(nn.Module):
 class Qwen3VLMoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLMoeForConditionalGeneration, MoEFSDPSyncMixin):
     """Qwen3-VL conditional generation model using the Qwen3-MoE backend components."""
 
+    tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
+
     # forward() pulls per-microbatch pixel_values from _vlm_pixel_values_chunks;
     # patch_hf_model_for_pp must not replace it under PP.
     _pp_keep_self_forward: bool = True
@@ -454,6 +470,7 @@ class Qwen3VLMoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLMoeForCo
         supports_cp: bool = False
         supports_pp: bool = True
         supports_ep: bool = True
+        supports_thd: bool = True
 
     @classmethod
     def from_config(
@@ -497,6 +514,7 @@ class Qwen3VLMoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLMoeForCo
                 if sub_cfg is not config and hasattr(sub_cfg, "torch_dtype"):
                     sub_cfg.torch_dtype = top_dtype
 
+        reject_unsupported_tie_word_embeddings(type(self), config)
         super().__init__(config)
 
         self.backend = backend

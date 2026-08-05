@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.minimax_m2.model import Block, MiniMaxM2ForCausalLM, MiniMaxM2Model
 from nemo_automodel.components.moe.layers import MoE, MoEConfig
 
@@ -49,7 +50,7 @@ def backend():
         attn="sdpa",
         rms_norm="torch",
         rope_fusion=False,
-        enable_deepep=False,
+        dispatcher="torch",
         fake_balanced_gate=False,
         enable_hf_state_dict_adapter=False,
     )
@@ -243,6 +244,25 @@ class TestMiniMaxM2ForCausalLM:
             )
         assert out.logits.shape == (batch, seq, config.vocab_size)
         assert out.hidden_states.shape == (batch, seq, config.hidden_size)
+
+    def test_router_correction_bias_stays_fp32_after_bf16_cast(self, config, backend):
+        model = MiniMaxM2ForCausalLM(config, backend=backend)
+        expected = {}
+        for name, buf in model.named_buffers():
+            if name.endswith("e_score_correction_bias"):
+                values = torch.linspace(0.00123, 0.00456, buf.numel(), dtype=torch.float32).reshape_as(buf)
+                buf.copy_(values)
+                expected[name] = values
+
+        assert expected, "MiniMax M2 should create router correction-bias buffers"
+
+        cast_model_to_dtype(model, torch.bfloat16)
+
+        buffers = dict(model.named_buffers())
+        for name, values in expected.items():
+            assert buffers[name].dtype == torch.float32
+            torch.testing.assert_close(buffers[name], values)
+        assert model.lm_head.weight.dtype == torch.bfloat16
 
 
 class TestMoeOverrides:

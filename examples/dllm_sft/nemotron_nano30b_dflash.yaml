@@ -46,7 +46,7 @@ dist_env:
 seed: 42
 
 wandb:
-  entity: joc
+  enable: false
   project: dflash-sft
   name: dflash-nemotron-nano-30b-run
 
