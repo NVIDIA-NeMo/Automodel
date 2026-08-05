@@ -148,3 +148,31 @@ wandb:
 ci:
   # pp_size(8) * ep_size(8) = 64 GPUs => 8 nodes (8 H100/node).
   nodes: 8
+  time: "01:00:00"
+  checkpoint_robustness:
+    # PP=8 with pp_microbatch_size=1 requires at least eight pipeline microbatches.
+    step_scheduler.global_batch_size: 64
+    step_scheduler.local_batch_size: 8
+    # One optimizer step materializes Adam state; AutoModel setup then restores it from DCP.
+    step_scheduler.max_steps: 1
+    step_scheduler.ckpt_every_steps: 1
+    # Match a real restart and let each large trainer exit before the next one starts.
+    process_isolation: true
+    # AutoModel reload restores model and optimizer state; skip the separate resume/loss-continuity check.
+    no_check_resume: true
+    # Keep native save/reload logits bounded in addition to exact per-rank LoRA fingerprints.
+    kl_threshold: 4e-2
+    # HF reload still exact-matches every supported adapter tensor and runs a forward smoke.
+    # Cross-implementation KL is not a checkpoint-integrity gate: Step-3.7's top-k MoE routing
+    # amplifies normal BF16 implementation-order differences into different expert choices.
+    skip_hf_logit_parity: true
+    # Vanilla HF needs remote model code and shards the 403 GB base over rank 0's local GPU node.
+    trust_remote_code: true
+    hf_device_map_auto: true
+    # Keep overflow in RAM and leave GPU headroom for PEFT's adapter re-dispatch.
+    hf_device_map_max_memory_gib: 55
+    hf_device_map_cpu_max_memory_gib: 128
+    # The published HF model intentionally omits training-only MTP layers 45-47. Exact-match every
+    # adapter tensor HF can instantiate, while allowing only the saved MTP adapter namespace.
+    hf_adapter_ignored_key_prefix: "base_model.model.mtp."
+    tokenizer_name: stepfun-ai/Step-3.7-Flash

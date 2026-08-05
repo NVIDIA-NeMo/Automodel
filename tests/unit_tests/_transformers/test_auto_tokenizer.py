@@ -31,11 +31,13 @@ from nemo_automodel._transformers.tokenization.nemo_auto_tokenizer import (
 
 
 class _StubHFTokenizer:
-    def __init__(self, bos_id=101, eos_id=102):
+    def __init__(self, bos_id=101, eos_id=102, add_bos_token=False, add_eos_token=False):
         self.bos_token_id = bos_id
         self.eos_token_id = eos_id
-        self.add_bos_token = True
-        self.add_eos_token = True
+        self.bos_token = "<s>" if bos_id is not None else None
+        self.eos_token = "</s>" if eos_id is not None else None
+        self.add_bos_token = add_bos_token
+        self.add_eos_token = add_eos_token
 
     def __call__(self, *args, **kwargs):
         return BatchEncoding(
@@ -77,13 +79,26 @@ class _StubConfig:
 
 
 class TestNeMoAutoTokenizerFromPretrained:
-    def test_patched_adds_bos_eos(self):
+    def test_default_preserves_tokenizer_special_token_behavior(self):
         stub = _StubHFTokenizer()
         with (
             patch("transformers.AutoTokenizer.from_pretrained", return_value=stub),
             patch("transformers.AutoConfig.from_pretrained", return_value=_StubConfig()),
         ):
             tok = NeMoAutoTokenizer.from_pretrained("dummy/model")
+
+        assert tok.add_bos_token is False
+        assert tok.add_eos_token is False
+        assert tok(["x"])["input_ids"] == [[5, 6]]
+        assert tok.encode("x") == [5, 6]
+
+    def test_opt_in_adds_bos_eos(self):
+        stub = _StubHFTokenizer()
+        with (
+            patch("transformers.AutoTokenizer.from_pretrained", return_value=stub),
+            patch("transformers.AutoConfig.from_pretrained", return_value=_StubConfig()),
+        ):
+            tok = NeMoAutoTokenizer.from_pretrained("dummy/model", add_bos_token=True, add_eos_token=True)
             out = tok(["x"])
             assert isinstance(out, BatchEncoding)
             assert out["input_ids"] == [[stub.bos_token_id, 5, 6, stub.eos_token_id]]
@@ -281,7 +296,7 @@ class TestNeMoAutoTokenizerFromPretrained:
             patch("transformers.AutoTokenizer.from_pretrained", return_value=stub),
             patch("transformers.AutoConfig.from_pretrained", return_value=_StubConfig()),
         ):
-            tok = NeMoAutoTokenizer.from_pretrained("dummy/model")
+            tok = NeMoAutoTokenizer.from_pretrained("dummy/model", add_bos_token=True)
             assert tok._add_bos_token is True
 
     def test_add_eos_token_falls_back_on_value_error(self):
@@ -313,7 +328,7 @@ class TestNeMoAutoTokenizerFromPretrained:
             patch("transformers.AutoTokenizer.from_pretrained", return_value=stub),
             patch("transformers.AutoConfig.from_pretrained", return_value=_StubConfig()),
         ):
-            tok = NeMoAutoTokenizer.from_pretrained("dummy/model")
+            tok = NeMoAutoTokenizer.from_pretrained("dummy/model", add_eos_token=True)
             assert tok._add_eos_token is True
 
 
@@ -878,7 +893,7 @@ class TestTikTokenLikeTokenizerGuards:
             patch("transformers.AutoTokenizer.from_pretrained", return_value=stub),
             patch("transformers.AutoConfig.from_pretrained", return_value=_StubConfig()),
         ):
-            tok = NeMoAutoTokenizer.from_pretrained("dummy/model")
+            tok = NeMoAutoTokenizer.from_pretrained("dummy/model", add_bos_token=True, add_eos_token=True)
             assert tok.add_bos_token is True
             assert tok.add_eos_token is True
 

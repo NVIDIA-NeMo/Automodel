@@ -14,12 +14,16 @@
 
 from contextlib import nullcontext
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
 from torch import nn
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from nemo_automodel.components.config.loader import ConfigNode
+from nemo_automodel.components.loss.kd_loss import KDLoss
+from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.recipes.llm import kd as llm_kd
 from nemo_automodel.recipes.vlm import kd as vlm_kd
 
@@ -37,6 +41,31 @@ class _Teacher(nn.Module):
         return SimpleNamespace(logits=torch.nn.functional.one_hot(input_ids, num_classes=4).float())
 
 
+class _TensorHiddenStateStudent(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.scale = nn.Parameter(torch.tensor(1.0))
+        self.register_buffer("hidden_states", torch.arange(24, dtype=torch.float32).reshape(2, 3, 4))
+        self.logits_to_keep = None
+
+    def forward(self, input_ids: torch.Tensor, logits_to_keep: int | None = None) -> CausalLMOutputWithPast:
+        """Return logits and a tensor-valued final hidden state.
+
+        Args:
+            input_ids: Tensor of shape [batch, sequence].
+            logits_to_keep: Number of trailing logits requested by the fused-loss path.
+
+        Returns:
+            Model output with logits of shape [batch, sequence, vocab] and
+            tensor-valued hidden states of shape [batch, sequence, hidden].
+        """
+        self.logits_to_keep = logits_to_keep
+        logits = torch.ones(*input_ids.shape, 4, dtype=torch.float32) * self.scale
+        if logits_to_keep is not None:
+            logits = logits[:, -logits_to_keep:]
+        return CausalLMOutputWithPast(logits=logits, hidden_states=self.hidden_states)
+
+
 _RECIPE_CASES = (
     pytest.param(
         llm_kd,
@@ -51,6 +80,72 @@ _RECIPE_CASES = (
         id="vlm",
     ),
 )
+
+
+@pytest.mark.parametrize("recipe_module,recipe_cls,_", _RECIPE_CASES)
+def test_kd_fused_loss_preserves_tensor_valued_hidden_states(monkeypatch, recipe_module, recipe_cls, _):
+    def no_op_sharder(model, mesh, batch, **kwargs):
+        """Return a context-parallel sharder that preserves the input batch.
+
+        Args:
+            model: Student model under test.
+            mesh: Unused device mesh.
+            batch: Mapping containing tensors of shape [batch, sequence].
+            **kwargs: Unused context-parallel options.
+
+        Returns:
+            Object whose shard operation returns the unchanged batch.
+        """
+        del model, mesh, kwargs
+        return SimpleNamespace(shard=lambda actual_batch: (nullcontext, actual_batch))
+
+    calculate_loss = Mock(return_value=torch.tensor(2.0))
+    monkeypatch.setattr(recipe_module, "ContextParallelSharder", no_op_sharder)
+    monkeypatch.setattr(recipe_module, "calculate_loss", calculate_loss)
+
+    student = _TensorHiddenStateStudent()
+    recipe = object.__new__(recipe_cls)
+    recipe.dist_env = SimpleNamespace(device="cpu")
+    recipe.device_mesh = None
+    recipe.pp_enabled = False
+    recipe.distributed_config = SimpleNamespace(defer_fsdp_grad_sync=True)
+    recipe.model_parts = [student]
+    recipe.teacher_model = _Teacher()
+    recipe.loss_fn = FusedLinearCrossEntropy()
+    recipe.kd_loss_fn = KDLoss()
+    recipe.kd_ratio = 0.5
+    recipe._offload_teacher_model = False
+    recipe.separate_meshes = False
+    recipe._get_dp_group_size = lambda include_cp=True: 1
+
+    batch = {
+        "input_ids": torch.tensor([[0, 1, 2], [1, 2, 3]]),
+        "labels": torch.tensor([[0, 1, 2], [1, 2, -100]]),
+    }
+    if recipe_module is vlm_kd:
+        recipe._ce_loss_buffer = []
+        recipe._kd_loss_buffer = []
+        recipe._forward_backward_step(
+            0,
+            batch,
+            loss_buffer=[],
+            num_label_tokens=5,
+            num_batches=1,
+            is_train=False,
+        )
+    else:
+        recipe._forward_backward_step(
+            0,
+            batch,
+            num_label_tokens=5,
+            num_batches=1,
+            is_train=False,
+        )
+
+    received_hidden_states = calculate_loss.call_args.kwargs["hidden_states"]
+    assert student.logits_to_keep is None
+    assert received_hidden_states is student.hidden_states
+    assert received_hidden_states.shape[:-1] == batch["labels"].shape
 
 
 @pytest.mark.parametrize("recipe_module,recipe_cls,parent_cls", _RECIPE_CASES)

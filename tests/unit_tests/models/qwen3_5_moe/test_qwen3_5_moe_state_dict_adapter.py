@@ -313,6 +313,36 @@ class TestToHF:
         for key in hf_state:
             torch.testing.assert_close(roundtrip[key], hf_state[key])
 
+    def test_text_only_expert_round_trip_preserves_keys_and_values(self, config, moe_config, backend_config):
+        """The causal-LM adapter keeps model.layers keys free of a language_model prefix."""
+        adapter = Qwen3_5MoeStateDictAdapter(
+            config=config,
+            moe_config=moe_config,
+            backend=backend_config,
+            dtype=torch.float32,
+            text_only=True,
+        )
+        gate_up_hf = torch.randn(4, 128, 64)
+        down_hf = torch.randn(4, 64, 64)
+        hf_state = {
+            "model.layers.0.mlp.experts.gate_up_proj": gate_up_hf,
+            "model.layers.0.mlp.experts.down_proj": down_hf,
+        }
+
+        native = adapter.from_hf(hf_state)
+
+        gate_up_native_key = "model.layers.0.mlp.experts.gate_and_up_projs"
+        down_native_key = "model.layers.0.mlp.experts.down_projs"
+        assert set(native) == {gate_up_native_key, down_native_key}
+        torch.testing.assert_close(native[gate_up_native_key], gate_up_hf.transpose(1, 2))
+        torch.testing.assert_close(native[down_native_key], down_hf.transpose(1, 2))
+
+        roundtrip = adapter.to_hf(native)
+
+        assert set(roundtrip) == set(hf_state)
+        for key, value in hf_state.items():
+            torch.testing.assert_close(roundtrip[key], value)
+
     @pytest.mark.parametrize(
         ("checkpoint_layout", "misleading_checkpoint_name", "use_index"),
         [
