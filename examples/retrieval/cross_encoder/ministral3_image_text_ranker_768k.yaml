@@ -13,8 +13,9 @@
 # limitations under the License.
 
 # Joint image + text cross-encoder fine-tuning for Ministral3 1B (single stage).
-# To run:
-#   sbatch -J ministral3_1B_reranker_image_text_joint_new_lr2e6_gbs256_t002_le1284_2ep_768k_0802 nemotron_vl_multinode_reranker.sh examples/retrieval/cross_encoder/ministral3_image_text_ranker_new.yaml
+# To run (from the repo root):
+#   sbatch -J ministral3_1B_reranker_image_text_768k_lr5e6_gbs256_t002_le1284 \
+#     examples/retrieval/cross_encoder/nemotron_vl_multinode_reranker.sh examples/retrieval/cross_encoder/ministral3_image_text_ranker_768k.yaml
 
 recipe: TrainCrossEncoderRecipe
 

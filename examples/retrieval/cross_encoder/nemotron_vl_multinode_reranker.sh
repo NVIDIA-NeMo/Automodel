@@ -27,6 +27,10 @@ if [[ -z "${1:-}" ]]; then
   exit 2
 fi
 CONFIG_YAML="$1"
+if [[ ! -f "${CONFIG_YAML}" ]]; then
+  echo "Config YAML not found: ${CONFIG_YAML}" >&2
+  exit 2
+fi
 echo "Config YAML: ${CONFIG_YAML}"
 
 CONT=/lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/03_sqsh/nvidia-nemo-automodel-26.04.00.sqsh
@@ -97,11 +101,11 @@ srun \
         --container-entrypoint \
         --no-container-mount-home \
         --export=ALL \
-        bash -c "set -euo pipefail
+        bash -c 'set -euo pipefail
             cd /opt/Automodel/
             torchrun \
             --nproc_per_node=${SLURM_GPUS_PER_NODE:-8} \
             --nnodes=${SLURM_NNODES:-1} \
             --rdzv_backend=c10d \
             --rdzv_endpoint=${MASTER_ADDR}:${MASTER_PORT} \
-            examples/retrieval/cross_encoder/finetune.py --config ${CONFIG_YAML}"
+            examples/retrieval/cross_encoder/finetune.py --config "$1"' _ "${CONFIG_YAML}"
