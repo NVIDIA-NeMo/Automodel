@@ -4,11 +4,23 @@ description: "NeMo AutoModel is a PyTorch DTensor-native SPMD open-source traini
 hide-nav-links: true
 ---
 
-import { AccessibilityEnhancements } from "@/components/AccessibilityEnhancements";
-
-<AccessibilityEnhancements />
-
 PyTorch-native training that scales from 1 GPU to thousands with a single config change. Load any Hugging Face model, point at your data, and start training; no checkpoint conversion and no boilerplate.
+
+<style>{`
+  .fern-header-navbar-links button[aria-haspopup="menu"]::after {
+    content: "Select color theme";
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+  }
+
+  #fern-toc .toc-root a[class*="text-(color:--accent-a9)"] {
+    color: var(--accent-11) !important;
+  }
+`}</style>
 
 <llms-only>
 
