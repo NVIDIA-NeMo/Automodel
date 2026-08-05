@@ -726,6 +726,15 @@ def test_sentence_transformers_and_nemo_round_trip_generated_ministral_checkpoin
     sentence_transformer = SentenceTransformer(str(save_dir), device="cpu")
     actual_query = sentence_transformer.encode_query(raw_texts, convert_to_tensor=True)
     actual_document = sentence_transformer.encode_document(raw_texts, convert_to_tensor=True)
+    actual_similarity = sentence_transformer.similarity(actual_query, actual_document)
+    if l2_normalize:
+        expected_similarity = torch.nn.functional.cosine_similarity(
+            expected_query[:, None, :], expected_document[None, :, :], dim=-1
+        )
+        expected_similarity_fn = "cosine"
+    else:
+        expected_similarity = expected_query @ expected_document.T
+        expected_similarity_fn = "dot"
 
     setup = SimpleNamespace(
         mesh_context=None,
@@ -754,7 +763,104 @@ def test_sentence_transformers_and_nemo_round_trip_generated_ministral_checkpoin
 
     assert nemo_reloaded.pooling == pooling
     assert nemo_reloaded.l2_normalize is l2_normalize
+    assert sentence_transformer.similarity_fn_name == expected_similarity_fn
+    assert sentence_transformer.max_seq_length == 32
     assert actual_query.shape == actual_document.shape == nemo_query.shape == nemo_document.shape == (2, 16)
+    torch.testing.assert_close(actual_query, expected_query)
+    torch.testing.assert_close(actual_document, expected_document)
+    torch.testing.assert_close(actual_similarity, expected_similarity)
+    torch.testing.assert_close(nemo_query, expected_query)
+    torch.testing.assert_close(nemo_document, expected_document)
+
+
+def test_consolidated_checkpointer_round_trip_through_sentence_transformers_and_nemo(tmp_path, monkeypatch):
+    from sentence_transformers import SentenceTransformer
+
+    from nemo_automodel._transformers import auto_model as auto_model_module
+    from nemo_automodel._transformers import retrieval
+    from nemo_automodel.components.checkpoint.config import CheckpointingConfig
+
+    model_dir, _ = _save_tiny_ministral_text_model(tmp_path)
+    encoder = retrieval.BiEncoderModel.build(
+        str(model_dir),
+        pooling="last",
+        l2_normalize=False,
+        attn_implementation="eager",
+    )
+    encoder.configure_sentence_transformer_prompts(query_prompt="query: ", document_prompt="passage: ")
+    tokenizer = _tiny_tokenizer()
+    raw_texts = ["hello", "hello world"]
+    query_texts = [f"query: {text}" for text in raw_texts]
+    document_texts = [f"passage: {text}" for text in raw_texts]
+    encoder.eval()
+    with torch.no_grad():
+        expected_query = encoder(tokenizer(query_texts, padding=True, return_tensors="pt"))
+        expected_document = encoder(tokenizer(document_texts, padding=True, return_tensors="pt"))
+
+    checkpoint_config = CheckpointingConfig(
+        enabled=True,
+        checkpoint_dir=str(tmp_path / "checkpoints"),
+        model_save_format="safetensors",
+        model_cache_dir=str(tmp_path),
+        model_repo_id=str(model_dir),
+        save_consolidated="final",
+        is_peft=False,
+    )
+    checkpointer = checkpoint_config.build(dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
+    step_dir = tmp_path / "checkpoints" / "step_1"
+    try:
+        encoder.save_pretrained(
+            str(step_dir),
+            checkpointer=checkpointer,
+            tokenizer=tokenizer,
+            is_final_checkpoint=True,
+        )
+    finally:
+        checkpointer.close()
+
+    consolidated_dir = step_dir / "model" / "consolidated"
+    for asset in (
+        "config.json",
+        "modules.json",
+        "config_sentence_transformers.json",
+        "sentence_bert_config.json",
+        "1_Pooling/config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "model.safetensors.index.json",
+    ):
+        assert (consolidated_dir / asset).is_file(), asset
+    assert list(consolidated_dir.glob("*.safetensors"))
+    assert not (consolidated_dir / "2_Normalize").exists()
+
+    sentence_transformer = SentenceTransformer(str(consolidated_dir), device="cpu")
+    actual_query = sentence_transformer.encode_query(raw_texts, convert_to_tensor=True)
+    actual_document = sentence_transformer.encode_document(raw_texts, convert_to_tensor=True)
+
+    setup = SimpleNamespace(
+        mesh_context=None,
+        strategy_config=None,
+        moe_parallel_config=None,
+        activation_checkpointing=None,
+    )
+    monkeypatch.setattr(auto_model_module, "_resolve_distributed_setup", lambda **_: setup)
+    monkeypatch.setattr(auto_model_module, "instantiate_infrastructure", lambda **_: (None, None, None, None))
+    monkeypatch.setattr(auto_model_module.torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(auto_model_module, "apply_model_infrastructure", lambda model, **_: model)
+    nemo_reloaded = auto_model_module.NeMoAutoModelBiEncoder.from_pretrained(
+        str(consolidated_dir),
+        attn_implementation="eager",
+        use_liger_kernel=False,
+        use_sdpa_patching=False,
+    )
+    nemo_reloaded.eval()
+    with torch.no_grad():
+        nemo_query = nemo_reloaded(tokenizer(query_texts, padding=True, return_tensors="pt"))
+        nemo_document = nemo_reloaded(tokenizer(document_texts, padding=True, return_tensors="pt"))
+
+    assert sentence_transformer.similarity_fn_name == "dot"
+    assert nemo_reloaded.pooling == "last"
+    assert nemo_reloaded.l2_normalize is False
     torch.testing.assert_close(actual_query, expected_query)
     torch.testing.assert_close(actual_document, expected_document)
     torch.testing.assert_close(nemo_query, expected_query)
