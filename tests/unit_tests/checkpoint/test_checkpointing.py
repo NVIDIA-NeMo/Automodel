@@ -45,7 +45,6 @@ from nemo_automodel.components.checkpoint.checkpointing import (
     Checkpointer,
     CheckpointingConfig,
     SaveConsolidatedMode,
-    _checkpoint_predates_state_dict_adapter,
     _divide_keys_by_size,
     _ensure_dirs,
     _equally_divide_layers,
@@ -75,36 +74,6 @@ from nemo_automodel.components.training.rng import RNGState, StatefulRNG, init_a
 CLOUD_PATH_MODEL = "msc://bucket/step-100/model"
 CLOUD_PATH_OPTIM = "msc://bucket/step-100/optim"
 LOCAL_PATH_MODEL = "/ckpts/step-100/model"
-
-
-class TestCheckpointPredatesStateDictAdapter:
-    """A model that gains an adapter must still resume from checkpoints written without it."""
-
-    NATIVE = {"embed_vision.multimodal_embedder.embedding_projection.weight": torch.ones(1)}
-    ADAPTED = {"embed_vision.embedding_projection.weight": torch.ones(1)}
-
-    def test_detects_pre_adapter_checkpoint(self):
-        assert _checkpoint_predates_state_dict_adapter(self.NATIVE, self.ADAPTED, set(self.NATIVE))
-
-    def test_ignores_checkpoint_written_with_adapter_keys(self):
-        assert not _checkpoint_predates_state_dict_adapter(self.NATIVE, self.ADAPTED, set(self.ADAPTED))
-
-    def test_ignores_checkpoint_carrying_both_layouts(self):
-        """Ambiguous checkpoints keep the adapter keys rather than silently reverting."""
-        both = set(self.NATIVE) | set(self.ADAPTED)
-        assert not _checkpoint_predates_state_dict_adapter(self.NATIVE, self.ADAPTED, both)
-
-    def test_ignores_adapter_that_renames_nothing(self):
-        passthrough = {"lm_head.weight": torch.ones(1)}
-        assert not _checkpoint_predates_state_dict_adapter(passthrough, passthrough, set(passthrough))
-
-    def test_requires_every_renamed_key_to_be_present(self):
-        native = dict(self.NATIVE)
-        native["embed_vision.pos_norm.weight"] = torch.ones(1)
-        adapted = dict(self.ADAPTED)
-        adapted["vision_embedder.pos_norm.weight"] = torch.ones(1)
-
-        assert not _checkpoint_predates_state_dict_adapter(native, adapted, set(self.NATIVE))
 
 
 def test_load_on_dp_ranks_requires_opt_in_for_legacy_rng_state(tmp_path):
@@ -2337,6 +2306,7 @@ class TestOfflineHFConsolidationTool:
             num_threads=5,
             cast_dtype=None,
             fqn_to_dtype_mapping={"w": "BF16"},
+            export_key_renames=None,
         )
         mock_rename.assert_called_once_with(str(output_dir))
         assert metadata_dir.exists()
@@ -2427,6 +2397,7 @@ class TestOfflineHFConsolidationTool:
             num_threads=5,
             cast_dtype=torch.bfloat16,
             fqn_to_dtype_mapping=None,
+            export_key_renames=None,
         )
         with open(output_dir / "config.json", "r") as f:
             assert json.load(f)["torch_dtype"] == "bfloat16"
@@ -3800,3 +3771,93 @@ class TestSyncAsyncSave:
 
         mock_dcp.async_save.assert_called_once()
         mock_dcp.save.assert_not_called()
+
+
+class TestExportKeyRenames:
+    """The consolidated export must publish the names the reference checkpoint uses."""
+
+    @staticmethod
+    def _checkpointer(tmp_path, reference_dir):
+        config = CheckpointingConfig(
+            enabled=True,
+            checkpoint_dir=str(tmp_path),
+            model_save_format="safetensors",
+            model_cache_dir=str(reference_dir),
+            model_repo_id="some/model",
+            save_consolidated=True,
+            is_peft=False,
+        )
+        with patch("torch.distributed.is_initialized", return_value=False):
+            return Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
+
+    @staticmethod
+    def _reference_index(tmp_path, weight_map):
+        reference_dir = tmp_path / "reference"
+        reference_dir.mkdir()
+        (reference_dir / "model.safetensors.index.json").write_text(json.dumps({"weight_map": weight_map}))
+        return reference_dir
+
+    @staticmethod
+    def _model_state(model_type, **attrs):
+        model = SimpleNamespace(config=SimpleNamespace(model_type=model_type), **attrs)
+        return SimpleNamespace(model=[model])
+
+    def test_renames_are_derived_from_the_reference_checkpoint(self, tmp_path):
+        reference_dir = self._reference_index(
+            tmp_path, {"vision_embedder.patch_ln1.weight": "model-00001-of-00001.safetensors"}
+        )
+        checkpointer = self._checkpointer(tmp_path, reference_dir)
+
+        with patch(
+            "nemo_automodel.components.checkpoint.checkpointing._get_hf_safetensors_reference_path",
+            return_value=str(reference_dir),
+        ):
+            renames = checkpointer._maybe_build_export_key_renames(self._model_state("gemma4_unified"))
+
+        assert renames == {"embed_vision.patch_ln1.weight": "vision_embedder.patch_ln1.weight"}
+
+    def test_no_renames_for_a_model_held_under_its_published_names(self, tmp_path):
+        reference_dir = self._reference_index(tmp_path, {"lm_head.weight": "model-00001-of-00001.safetensors"})
+        checkpointer = self._checkpointer(tmp_path, reference_dir)
+
+        with patch(
+            "nemo_automodel.components.checkpoint.checkpointing._get_hf_safetensors_reference_path",
+            return_value=str(reference_dir),
+        ):
+            assert checkpointer._maybe_build_export_key_renames(self._model_state("llama")) is None
+
+    def test_no_renames_when_transformers_merged_the_experts(self, tmp_path):
+        """Merged-expert models are saved in the converted layout, so renaming would contradict it.
+
+        Mixtral's conversion table pairs its expert merges with a
+        ``block_sparse_moe. -> mlp.`` rename; applying that rename on export would publish
+        names that do not match the merged tensors actually written.
+        """
+        reference_dir = self._reference_index(
+            tmp_path,
+            {"model.layers.0.block_sparse_moe.gate.weight": "model-00001-of-00001.safetensors"},
+        )
+        checkpointer = self._checkpointer(tmp_path, reference_dir)
+
+        with patch(
+            "nemo_automodel.components.checkpoint.checkpointing._get_hf_safetensors_reference_path",
+            return_value=str(reference_dir),
+        ):
+            assert checkpointer._maybe_build_export_key_renames(self._model_state("mixtral")) is None
+
+    def test_no_renames_for_nemotron_h_remote_code(self, tmp_path):
+        """The load path skips conversion for backbone.* remote code, so the export must too."""
+        reference_dir = self._reference_index(
+            tmp_path, {"backbone.embeddings.weight": "model-00001-of-00001.safetensors"}
+        )
+        checkpointer = self._checkpointer(tmp_path, reference_dir)
+
+        with patch(
+            "nemo_automodel.components.checkpoint.checkpointing._get_hf_safetensors_reference_path",
+            return_value=str(reference_dir),
+        ):
+            renames = checkpointer._maybe_build_export_key_renames(
+                self._model_state("nemotron_h", backbone=SimpleNamespace())
+            )
+
+        assert renames is None

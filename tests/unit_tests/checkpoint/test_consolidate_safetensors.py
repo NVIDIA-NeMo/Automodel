@@ -767,3 +767,120 @@ class TestStorageWriterFinishDiffusersCompatible:
 
         assert captured_kwargs["use_staging"] is False
         assert captured_kwargs["staging_dir"] is None
+
+
+def _write_dcp_shard(path: Path, tensors: dict[str, torch.Tensor]) -> None:
+    """Write a single-shard DCP-style safetensors file.
+
+    Args:
+        path: Destination ``.safetensors`` file.
+        tensors: Tensors to store, keyed by model FQN. Each is written whole, so its
+            saved offsets are all zero.
+    """
+    dcp_metadata = {fqn: {"saved_offsets": [0] * tensor.dim()} for fqn, tensor in tensors.items()}
+    save_file(tensors, path, metadata={CUSTOM_METADATA_KEY: json.dumps(dcp_metadata)})
+
+
+@pytest.mark.run_only_on("CPU")
+def test_consolidate_publishes_renamed_keys(tmp_path):
+    """Model FQNs are exported under the names the original HF checkpoint publishes.
+
+    The input shards stay keyed by the model's own FQNs; only the safetensors header
+    and the weight index carry the published names, and tensor data is untouched.
+    """
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "output"
+    input_dir.mkdir()
+    output_dir.mkdir()
+
+    tensors = {
+        "embed_vision.patch_ln1.weight": torch.arange(4, dtype=torch.float32).reshape(2, 2),
+        "model.layers.0.self_attn.q_proj.weight": torch.arange(6, dtype=torch.float32).reshape(2, 3),
+    }
+    _write_dcp_shard(input_dir / "model-00001-of-00001.safetensors", tensors)
+
+    consolidate_safetensors_files(
+        input_dir=str(input_dir),
+        output_dir=str(output_dir),
+        fqn_to_index_mapping={fqn: 1 for fqn in tensors},
+        export_key_renames={"embed_vision.patch_ln1.weight": "vision_embedder.patch_ln1.weight"},
+    )
+
+    output_tensors = load_file(output_dir / "model-00001-of-00001.safetensors")
+    assert set(output_tensors) == {
+        "vision_embedder.patch_ln1.weight",
+        "model.layers.0.self_attn.q_proj.weight",
+    }
+    torch.testing.assert_close(
+        output_tensors["vision_embedder.patch_ln1.weight"], tensors["embed_vision.patch_ln1.weight"]
+    )
+    torch.testing.assert_close(
+        output_tensors["model.layers.0.self_attn.q_proj.weight"],
+        tensors["model.layers.0.self_attn.q_proj.weight"],
+    )
+
+    index = json.loads((output_dir / "model.safetensors.index.json").read_text())
+    assert set(index["weight_map"]) == {
+        "vision_embedder.patch_ln1.weight",
+        "model.layers.0.self_attn.q_proj.weight",
+    }
+
+
+@pytest.mark.run_only_on("CPU")
+def test_consolidate_without_renames_keeps_model_keys(tmp_path):
+    """Models held under their published names are unaffected by the rename plumbing."""
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "output"
+    input_dir.mkdir()
+    output_dir.mkdir()
+
+    tensors = {"lm_head.weight": torch.arange(4, dtype=torch.float32).reshape(2, 2)}
+    _write_dcp_shard(input_dir / "model-00001-of-00001.safetensors", tensors)
+
+    consolidate_safetensors_files(
+        input_dir=str(input_dir),
+        output_dir=str(output_dir),
+        fqn_to_index_mapping={"lm_head.weight": 1},
+        export_key_renames=None,
+    )
+
+    assert set(load_file(output_dir / "model-00001-of-00001.safetensors")) == {"lm_head.weight"}
+    index = json.loads((output_dir / "model.safetensors.index.json").read_text())
+    assert set(index["weight_map"]) == {"lm_head.weight"}
+
+
+@pytest.mark.run_only_on("CPU")
+def test_consolidate_on_every_rank_publishes_renamed_keys(tmp_path):
+    """The distributed path renames both the shard headers and the index it writes separately."""
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "output"
+    input_dir.mkdir()
+    output_dir.mkdir()
+
+    tensors = {
+        "embed_vision.multimodal_embedder.embedding_projection.weight": torch.arange(4, dtype=torch.float32).reshape(
+            2, 2
+        ),
+        "lm_head.weight": torch.arange(6, dtype=torch.float32).reshape(2, 3),
+    }
+    _write_dcp_shard(input_dir / "model-00001-of-00001.safetensors", tensors)
+
+    renames = {
+        "embed_vision.multimodal_embedder.embedding_projection.weight": ("embed_vision.embedding_projection.weight")
+    }
+    consolidate_safetensors_files_on_every_rank(
+        input_dir=str(input_dir),
+        output_dir=str(output_dir),
+        fqn_to_index_mapping={fqn: 1 for fqn in tensors},
+        export_key_renames=renames,
+    )
+
+    output_tensors = load_file(output_dir / "model-00001-of-00001.safetensors")
+    assert set(output_tensors) == {"embed_vision.embedding_projection.weight", "lm_head.weight"}
+    torch.testing.assert_close(
+        output_tensors["embed_vision.embedding_projection.weight"],
+        tensors["embed_vision.multimodal_embedder.embedding_projection.weight"],
+    )
+
+    index = json.loads((output_dir / "model.safetensors.index.json").read_text())
+    assert set(index["weight_map"]) == {"embed_vision.embedding_projection.weight", "lm_head.weight"}
