@@ -98,14 +98,22 @@ def _load_sentence_transformer_json(
                 subfolder=subfolder,
                 **download_kwargs,
             )
+        except LocalEntryNotFoundError as exc:
+            logger.warning(
+                "Unable to discover optional Sentence Transformers metadata %s; using wrapper defaults: %s",
+                filename,
+                exc,
+            )
+            return None
         except EntryNotFoundError:
             return None
-        except LocalEntryNotFoundError as exc:
-            raise RuntimeError(
-                f"Could not establish whether Sentence Transformers metadata {filename} exists locally."
-            ) from exc
         except Exception as exc:
-            raise RuntimeError(f"Unable to load Sentence Transformers metadata {filename}.") from exc
+            logger.warning(
+                "Unable to discover optional Sentence Transformers metadata %s; using wrapper defaults: %s",
+                filename,
+                exc,
+            )
+            return None
 
     with open(asset_path) as f:
         return json.load(f)

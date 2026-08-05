@@ -82,7 +82,14 @@ def _configure_sentence_transformer_export(model, collate_fn) -> None:
         return
     else:
         if not hasattr(collate_fn, "query_prefix") or not hasattr(collate_fn, "passage_prefix"):
-            raise TypeError("Bi-encoder collator must expose query_prefix and passage_prefix for checkpoint export.")
+            disable_export = getattr(model, "disable_sentence_transformer_export", None)
+            if disable_export is not None:
+                disable_export()
+                logger.warning(
+                    "Standard Sentence Transformers export is disabled because the configured collator "
+                    "does not expose static query_prefix and passage_prefix metadata."
+                )
+            return
         query_prompt = f"{collate_fn.query_prefix} " if collate_fn.query_prefix else ""
         document_prompt = f"{collate_fn.passage_prefix} " if collate_fn.passage_prefix else ""
 

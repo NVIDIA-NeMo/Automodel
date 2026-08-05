@@ -123,6 +123,30 @@ def test_configure_sentence_transformer_export_disables_export_for_dataset_instr
     assert "per-example dataset instructions" in caplog.text
 
 
+def test_configure_sentence_transformer_export_disables_export_for_custom_collator(caplog):
+    class _Model:
+        sentence_transformer_export_config = object()
+
+        def configure_sentence_transformer_prompts(self, **kwargs):
+            raise AssertionError(f"unknown custom preprocessing must not configure prompts: {kwargs}")
+
+        def disable_sentence_transformer_export(self):
+            self.sentence_transformer_export_config = None
+
+    class _CustomCollator:
+        def __call__(self, examples):
+            return examples
+
+    model = _Model()
+    collator = _CustomCollator()
+    assert callable(collator)
+
+    _configure_sentence_transformer_export(model, collator)
+
+    assert model.sentence_transformer_export_config is None
+    assert "does not expose static query_prefix and passage_prefix metadata" in caplog.text
+
+
 def test_retrieval_autocast_ctx_disabled_by_default(monkeypatch):
     def _unexpected_autocast(*args, **kwargs):
         raise AssertionError("autocast should be disabled when autocast_dtype is unset")

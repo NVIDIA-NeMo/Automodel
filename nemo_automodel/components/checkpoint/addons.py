@@ -164,7 +164,12 @@ class ConsolidatedHFAddon:
         export_model = _unwrap_ddp_model(model_part)
         get_metadata_exporter = getattr(export_model, "_get_consolidated_hf_metadata_exporter", None)
         metadata_exporter: _ConsolidatedHFMetadataExporter | None = (
-            get_metadata_exporter() if callable(get_metadata_exporter) else None
+            get_metadata_exporter(
+                tokenizer=tokenizer,
+                original_model_path=original_model_path,
+            )
+            if callable(get_metadata_exporter)
+            else None
         )
         if metadata_exporter is not None:
             metadata_exporter.validate(

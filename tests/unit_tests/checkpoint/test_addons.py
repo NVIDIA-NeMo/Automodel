@@ -109,7 +109,7 @@ def test_consolidated_hf_addon_delegates_to_model_metadata_exporter(tmp_path, us
     metadata_dir.mkdir()
     exporter = SimpleNamespace(validate=MagicMock(), save=MagicMock())
     model = nn.Module()
-    model._get_consolidated_hf_metadata_exporter = lambda: exporter
+    model._get_consolidated_hf_metadata_exporter = lambda *, tokenizer, original_model_path: exporter
     wrapped_model = object.__new__(DistributedDataParallel)
     nn.Module.__init__(wrapped_model)
     wrapped_model.module = model
@@ -139,7 +139,7 @@ def test_consolidated_hf_addon_validates_model_exporter_on_nonzero_rank(tmp_path
         save=MagicMock(),
     )
     model = nn.Module()
-    model._get_consolidated_hf_metadata_exporter = lambda: exporter
+    model._get_consolidated_hf_metadata_exporter = lambda *, tokenizer, original_model_path: exporter
 
     with (
         patch("torch.distributed.is_initialized", return_value=True),
@@ -159,6 +159,28 @@ def test_consolidated_hf_addon_validates_model_exporter_on_nonzero_rank(tmp_path
 
     exporter.save.assert_not_called()
     barrier.assert_not_called()
+
+
+def test_consolidated_hf_addon_uses_standard_metadata_when_exporter_declines_without_tokenizer(tmp_path):
+    metadata_dir = tmp_path / "metadata"
+    metadata_dir.mkdir()
+    model = nn.Module()
+    model.config = {"model_type": "dummy"}
+    get_metadata_exporter = MagicMock(return_value=None)
+    model._get_consolidated_hf_metadata_exporter = get_metadata_exporter
+
+    ConsolidatedHFAddon().pre_save(
+        model_state=SimpleNamespace(model=[model]),
+        hf_metadata_dir=str(metadata_dir),
+        tokenizer=None,
+        fqn_to_file_index_mapping={"w": 1},
+        fqn_to_dtype_mapping=None,
+        original_model_path=None,
+        v4_compatible=False,
+    )
+
+    get_metadata_exporter.assert_called_once_with(tokenizer=None, original_model_path=None)
+    assert (metadata_dir / "config.json").is_file()
 
 
 def test_model_state_keeps_lm_head_when_storage_not_shared():

@@ -372,8 +372,12 @@ def save_encoder_pretrained(model: nn.Module, save_directory: str, **kwargs) -> 
     export_config = getattr(model, "sentence_transformer_export_config", None)
     tokenizer = kwargs.get("tokenizer", None)
     if export_config is not None and tokenizer is None:
-        raise ValueError("A tokenizer is required to export a loadable Sentence Transformers checkpoint.")
-    deploy_config = model.get_hf_export_config() if export_config is not None else None
+        logger.warning(
+            "Sentence Transformers metadata export is disabled because no tokenizer was provided; "
+            "saving the standard encoder checkpoint instead."
+        )
+        export_config = None
+    deploy_config = None
     original_model_path = getattr(model, "source_model_path", None)
     if original_model_path is None:
         model_reference = getattr(model.model, "name_or_path", None) or getattr(
@@ -386,8 +390,16 @@ def save_encoder_pretrained(model: nn.Module, save_directory: str, **kwargs) -> 
             _validate_sentence_transformer_export,
         )
 
-        _validate_sentence_transformer_export(model, tokenizer, original_model_path)
-
+        try:
+            _validate_sentence_transformer_export(model, tokenizer, original_model_path)
+            deploy_config = model.get_hf_export_config()
+        except (TypeError, ValueError) as exc:
+            logger.warning(
+                "Sentence Transformers metadata export is disabled because this checkpoint cannot be "
+                "represented faithfully; saving the standard encoder checkpoint instead: %s",
+                exc,
+            )
+            export_config = None
     model.model.save_pretrained(save_directory)
     if export_config is None:
         return
@@ -534,12 +546,34 @@ class BiEncoderModel(nn.Module):
         """Disable standard export when runtime behavior cannot be represented faithfully."""
         self.sentence_transformer_export_config = None
 
-    def _get_consolidated_hf_metadata_exporter(self) -> _SentenceTransformerMetadataExporter | None:
+    def _get_consolidated_hf_metadata_exporter(
+        self,
+        *,
+        tokenizer=None,
+        original_model_path: str | None = None,
+    ) -> _SentenceTransformerMetadataExporter | None:
         """Return the retrieval-owned exporter for consolidated Hugging Face metadata."""
         export_config = self.sentence_transformer_export_config
         if export_config is None:
             return None
-        return _SentenceTransformerMetadataExporter(self, export_config)
+        if tokenizer is None:
+            logger.warning(
+                "Sentence Transformers metadata export is disabled because no tokenizer was provided; "
+                "saving the standard Hugging Face checkpoint metadata instead."
+            )
+            return None
+        exporter = _SentenceTransformerMetadataExporter(self, export_config)
+        try:
+            exporter.validate(tokenizer=tokenizer, original_model_path=original_model_path)
+            self.get_hf_export_config()
+        except (TypeError, ValueError) as exc:
+            logger.warning(
+                "Sentence Transformers metadata export is disabled because this checkpoint cannot be "
+                "represented faithfully; saving the standard Hugging Face checkpoint metadata instead: %s",
+                exc,
+            )
+            return None
+        return exporter
 
     def get_hf_export_config(self) -> PretrainedConfig:
         """Return a deployable Hugging Face config describing the effective bi-encoder."""

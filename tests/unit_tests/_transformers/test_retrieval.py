@@ -201,7 +201,7 @@ def test_effective_pipeline_prompts_replace_restored_export_defaults():
     assert encoder.sentence_transformer_export_config.document_prompt == "current document: "
 
 
-def test_direct_standard_export_without_tokenizer_rejects_before_writing(tmp_path):
+def test_direct_save_without_tokenizer_omits_sentence_transformer_metadata(tmp_path, caplog):
     from nemo_automodel._transformers import retrieval
 
     backbone = LlamaBidirectionalModel(
@@ -217,10 +217,43 @@ def test_direct_standard_export_without_tokenizer_rejects_before_writing(tmp_pat
     encoder = retrieval.BiEncoderModel(backbone, pooling="avg", l2_normalize=False)
     save_dir = tmp_path / "missing_tokenizer"
 
-    with pytest.raises(ValueError, match="tokenizer is required"):
-        encoder.save_pretrained(save_dir)
+    encoder.save_pretrained(save_dir)
 
-    assert not save_dir.exists()
+    assert (save_dir / "config.json").is_file()
+    assert (save_dir / "model.safetensors").is_file()
+    assert not (save_dir / "modules.json").exists()
+    assert "no tokenizer was provided" in caplog.text
+
+
+def test_direct_save_omits_unrepresentable_sentence_transformer_metadata(tmp_path, caplog):
+    from nemo_automodel._transformers import retrieval
+
+    backbone = LlamaBidirectionalModel(
+        LlamaBidirectionalConfig(
+            vocab_size=32,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            max_position_embeddings=64,
+        )
+    )
+    encoder = retrieval.BiEncoderModel(backbone, pooling="avg", l2_normalize=True)
+    backbone.config.max_position_embeddings = 1_000_000_000
+    tokenizer = _tiny_tokenizer()
+    tokenizer.model_max_length = int(1e30)
+    save_dir = tmp_path / "unrepresentable_export"
+
+    assert (
+        encoder._get_consolidated_hf_metadata_exporter(tokenizer=tokenizer, original_model_path=None) is None
+    )
+    encoder.save_pretrained(save_dir, tokenizer=tokenizer)
+
+    assert (save_dir / "config.json").is_file()
+    assert (save_dir / "model.safetensors").is_file()
+    assert not (save_dir / "modules.json").exists()
+    assert "cannot be represented faithfully" in caplog.text
 
 
 def test_direct_standard_export_uses_general_sequence_capabilities(tmp_path):

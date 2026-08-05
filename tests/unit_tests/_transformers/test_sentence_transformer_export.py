@@ -370,8 +370,14 @@ def test_sentence_transformer_source_lowercasing_is_rejected(tmp_path):
         sentence_transformer_export._load_sentence_transformer_wrapper_options(str(tmp_path), {})
 
 
-def test_sentence_transformer_metadata_load_fails_closed_on_unexpected_hub_error(monkeypatch):
-    monkeypatch.setattr(sentence_transformer_export, "hf_hub_download", MagicMock(side_effect=OSError("offline")))
+@pytest.mark.parametrize(
+    "error",
+    [OSError("offline"), sentence_transformer_export.LocalEntryNotFoundError("not cached")],
+)
+def test_sentence_transformer_metadata_discovery_error_falls_back_to_defaults(monkeypatch, caplog, error):
+    monkeypatch.setattr(sentence_transformer_export, "hf_hub_download", MagicMock(side_effect=error))
 
-    with pytest.raises(RuntimeError, match="Unable to load Sentence Transformers metadata modules.json"):
-        sentence_transformer_export._load_sentence_transformer_json("org/model", "modules.json", {})
+    result = sentence_transformer_export._load_sentence_transformer_json("org/model", "modules.json", {})
+
+    assert result is None
+    assert "Unable to discover optional Sentence Transformers metadata modules.json" in caplog.text
