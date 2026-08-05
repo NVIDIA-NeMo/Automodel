@@ -28,6 +28,7 @@ from nemo_automodel.components.moe.experts import (
     GroupedExperts,
     GroupedExpertsDeepEP,
     _apply_bias,
+    _DeterministicBiasRepeatInterleave,
     _permute_tokens_for_grouped_mm,
     _torch_mm_experts_fwd,
     get_expert_activation_for_deepep,
@@ -869,6 +870,45 @@ class TestGroupedExpertsDeepEP:
         expected = torch.cat([flat_value[:2] + bias[0], flat_value[2:] + bias[2]]).view_as(value)
 
         torch.testing.assert_close(result, expected)
+
+    def test_grouped_experts_deepep_apply_bias_cpu_fallback_matches_fp64_cancellation(self, moe_config):
+        """The CPU fallback retains small residuals after large cancellation."""
+        _ = GroupedExpertsDeepEP(moe_config)
+        n_tokens = 4096
+        hidden = 8
+        value = torch.zeros(n_tokens, hidden, dtype=torch.float32)
+        bias = torch.zeros(2, hidden, dtype=torch.float32, requires_grad=True)
+        tokens_per_expert = torch.tensor([n_tokens, 0])
+        permuted_probs = torch.ones(n_tokens, 1, dtype=torch.float32)
+        permuted_probs[n_tokens // 2 :] = 0.9999
+        upstream_grad = torch.ones(n_tokens, hidden, dtype=torch.float32)
+        upstream_grad[n_tokens // 2 :] = -1
+
+        _apply_bias(value, bias, tokens_per_expert, permuted_probs).backward(upstream_grad)
+
+        expected_grad = torch.zeros_like(bias)
+        expected_grad[0] = (upstream_grad * permuted_probs).double().sum(dim=0).float()
+        assert bias.grad is not None
+        torch.testing.assert_close(bias.grad, expected_grad, rtol=0, atol=0)
+
+    def test_deterministic_bias_repeat_interleave_supports_higher_order_gradients(self):
+        """The differentiable fallback preserves the custom function's double backward."""
+        bias = torch.randn(3, 2, dtype=torch.float64, requires_grad=True)
+        token_counts = torch.tensor([0, 2, 1], dtype=torch.long)
+
+        def expand(candidate_bias: torch.Tensor) -> torch.Tensor:
+            """Expand an expert bias for numerical differentiation.
+
+            Args:
+                candidate_bias: Tensor of shape [experts, hidden].
+
+            Returns:
+                Tensor of shape [tokens, hidden].
+            """
+            return _DeterministicBiasRepeatInterleave.apply(candidate_bias, token_counts, 3)
+
+        assert torch.autograd.gradcheck(expand, (bias,))
+        assert torch.autograd.gradgradcheck(expand, (bias,))
 
     @pytest.mark.parametrize("use_probs", [False, True], ids=["unweighted", "fp32-weighted"])
     def test_grouped_experts_deepep_apply_bias_backward_is_fullgraph_compatible(self, moe_config, use_probs):
