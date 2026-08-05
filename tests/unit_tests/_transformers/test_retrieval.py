@@ -128,8 +128,8 @@ def test_save_encoder_pretrained_forwards_is_final_checkpoint(tmp_path, kwargs, 
     )
 
 
-def test_extract_submodel_unsupported_embedding_from_local_vlm(tmp_path):
-    """Unsupported extracted text backbones are returned directly for bi-encoder use."""
+def test_extract_submodel_embedding_fallback_is_bidirectional(tmp_path):
+    """Extracted HuggingFace embedding fallbacks use bidirectional attention."""
     from nemo_automodel._transformers import retrieval
 
     model_dir, language_state_dict = _save_tiny_vlm(tmp_path, "mistral")
@@ -142,13 +142,25 @@ def test_extract_submodel_unsupported_embedding_from_local_vlm(tmp_path):
 
     assert backbone.__class__.__name__ == "MistralModel"
     assert backbone.config.model_type == "mistral"
+    assert backbone.config.is_causal is False
     _assert_no_language_model_prefix(backbone)
     _assert_state_dict_equal(language_state_dict, backbone.state_dict())
+
+    input_ids = torch.randint(0, backbone.config.vocab_size, (1, 4))
+    attention_mask = torch.ones_like(input_ids)
+    modified_input_ids = input_ids.clone()
+    modified_input_ids[0, -1] = (modified_input_ids[0, -1] + 1) % backbone.config.vocab_size
+    backbone.eval()
+    with torch.no_grad():
+        original_output = backbone(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+        modified_output = backbone(input_ids=modified_input_ids, attention_mask=attention_mask).last_hidden_state
+    assert not torch.allclose(original_output[0, 0], modified_output[0, 0])
 
     save_dir = tmp_path / "mistral_text_backbone"
     backbone.save_pretrained(save_dir)
     saved_config = json.loads((save_dir / "config.json").read_text())
     assert saved_config["model_type"] == "mistral"
+    assert saved_config["is_causal"] is False
 
 
 def test_extract_submodel_llama_embedding_from_local_vlm_converts_to_supported_backbone(tmp_path):
@@ -178,12 +190,12 @@ def test_extract_submodel_llama_embedding_from_local_vlm_converts_to_supported_b
     assert outputs.last_hidden_state.shape == (2, 8, backbone.config.hidden_size)
 
 
-def test_ministral_embedding_forwards_supported_hf_kwargs_to_config_and_model(monkeypatch):
-    """Ministral config and weights receive the same supported native loader options."""
+def test_embedding_fallback_forwards_hf_kwargs_and_disables_causal_attention(monkeypatch):
+    """Embedding fallbacks preserve loader options and disable causal attention."""
     from nemo_automodel._transformers import retrieval
 
     config = MagicMock()
-    config.model_type = "ministral3"
+    config.model_type = "mistral"
     backbone = MagicMock()
     auto_config_from_pretrained = MagicMock(return_value=config)
     auto_model_from_pretrained = MagicMock(return_value=backbone)
@@ -203,6 +215,7 @@ def test_ministral_embedding_forwards_supported_hf_kwargs_to_config_and_model(mo
     )
 
     assert result is backbone
+    assert backbone.config.is_causal is False
     auto_config_from_pretrained.assert_called_once_with(
         "org/model",
         trust_remote_code=True,

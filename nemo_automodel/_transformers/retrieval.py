@@ -23,7 +23,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoConfig, AutoModel, AutoModelForSequenceClassification, PreTrainedModel
-from transformers.models.auto.modeling_auto import MODEL_FOR_SEQUENCE_CLASSIFICATION_MAPPING, MODEL_MAPPING
+from transformers.models.auto.modeling_auto import MODEL_FOR_SEQUENCE_CLASSIFICATION_MAPPING
 from transformers.utils import logging
 
 from nemo_automodel._transformers.registry import ModelRegistry
@@ -110,20 +110,15 @@ def _build_backbone_from_extracted_submodel(
             f"Unsupported task '{task}' for model type '{model_type}'. Available tasks: {', '.join(task_map)}."
         )
 
-    if model_type.lower() == "ministral3" and task == "embedding":
-        config = text_config.__class__.from_dict(text_config.to_dict())
-        config.is_causal = False
-        try:
-            backbone_class = MODEL_MAPPING[type(config)]
-        except KeyError as exc:
-            raise ValueError(f"No HuggingFace base model found for '{model_type}'.") from exc
-    elif task == "score" and not has_supported_target:
+    if task == "score" and not has_supported_target:
         config = text_config.__class__.from_dict(text_config.to_dict())
         try:
             backbone_class = MODEL_FOR_SEQUENCE_CLASSIFICATION_MAPPING[type(config)]
         except KeyError as exc:
             raise ValueError(f"No HuggingFace sequence-classification model found for '{model_type}'.") from exc
     elif not has_supported_target:
+        if task == "embedding":
+            extracted_model.config.is_causal = False
         return extracted_model
     else:
         backbone_class = _get_supported_backbone_class(model_type, task)
@@ -230,16 +225,14 @@ def build_encoder_backbone(
     When ``extract_submodel`` is set, loads the parent model with HuggingFace
     Auto classes and extracts the dotted path. For supported extracted text
     backbones, it then builds the registered retrieval class for the requested
-    task. Extracted Ministral embedding backbones use the stock HuggingFace model
-    with ``is_causal=False``. For unsupported extracted text backbones, it returns
-    the extracted model for ``"embedding"`` and wraps it with
+    task. For unsupported extracted text backbones, it returns the extracted model
+    with ``is_causal=False`` for ``"embedding"`` and wraps it with
     ``AutoModelForSequenceClassification`` for ``"score"``.
 
-    Without ``extract_submodel``, standard Ministral embedding checkpoints use
-    the stock HuggingFace model with ``is_causal=False``. Model types listed in
-    :data:`SUPPORTED_BACKBONES` resolve to custom bidirectional classes from
-    :class:`ModelRegistry`; all other model types fall back to HuggingFace Auto
-    classes.
+    Without ``extract_submodel``, model types listed in :data:`SUPPORTED_BACKBONES`
+    resolve to custom bidirectional classes from :class:`ModelRegistry`; all other
+    model types fall back to HuggingFace Auto classes, with embedding backbones
+    configured with ``is_causal=False``.
 
     Args:
         model_name_or_path: Path or HuggingFace Hub identifier.
@@ -276,15 +269,6 @@ def build_encoder_backbone(
             temperature=temperature,
         )
 
-    if model_type.lower() == "ministral3" and task == "embedding":
-        backbone = AutoModel.from_pretrained(
-            model_name_or_path,
-            trust_remote_code=trust_remote_code,
-            **hf_kwargs,
-        )
-        backbone.config.is_causal = False
-        return backbone
-
     BidirectionalModelClass = _get_supported_backbone_class(model_type, task)
     if BidirectionalModelClass is not None:
         if pooling is not None:
@@ -305,7 +289,10 @@ def build_encoder_backbone(
         return AutoModelForSequenceClassification.from_pretrained(
             model_name_or_path, trust_remote_code=trust_remote_code, **hf_kwargs
         )
-    return AutoModel.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code, **hf_kwargs)
+    backbone = AutoModel.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code, **hf_kwargs)
+    if task == "embedding":
+        backbone.config.is_causal = False
+    return backbone
 
 
 def save_encoder_pretrained(model: nn.Module, save_directory: str, **kwargs) -> None:
