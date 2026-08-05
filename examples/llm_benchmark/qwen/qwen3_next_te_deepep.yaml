@@ -61,9 +61,8 @@ distributed:
 
   moe:
     reshard_after_forward: false
-    # fake_balanced_gate routes deterministically, so recomputing the router under
-    # activation checkpointing is safe and avoids the slower saved-router path.
-    ignore_router_for_ac: false
+    # Ablation: preserve router projection and top-k outputs during checkpoint recompute.
+    ignore_router_for_ac: true
 
 dist_env:
   backend: nccl
