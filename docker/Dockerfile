@@ -78,9 +78,8 @@ RUN if [ "$INSTALL_TE" = "True" ]; then \
 # Install HybridEP / DeepEP. Build with apt rdma-core v60 (so build==runtime libibverbs)
 # and RDMA_CORE_HOME symlinked to the system install; create the libnvshmem_host.so->.so.3
 # symlink required for DeepEP fabric handle ops; use the nvshmem wheel 3.6.5 and pin
-# DEEPEP_COMMIT to the automodel_r0.6.0 branch: upstream HybridEP through #638
-# plus the routing all-gather buffer-reuse patch. DeepEP PR 673 is intentionally separate.
-ARG DEEPEP_COMMIT=d45b7f7a06024c2340ca56693acd2700de2072ce
+# Ablation: identical pre-PR-673 HybridEP packaging with routing buffer reuse disabled.
+ARG DEEPEP_COMMIT=f109f953f9067025682b1dfc01e0cc7ce3a82b42
 ENV HYBRID_EP_MULTINODE=1
 ENV RDMA_CORE_HOME=/opt/rdma-core/build
 ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64/:$LD_LIBRARY_PATH
@@ -226,7 +225,7 @@ RUN --mount=type=cache,target=/opt/uv_cache,sharing=locked \
         MAX_JOBS=8 \
         UV_CONCURRENT_INSTALLS=8 \
         uv sync --extra $AUTOMODEL_INSTALL --all-groups $UV_SYNC_ARGS $DEEPEP_SYNC_ARGS && \
-    python -c "import importlib.metadata as m; import magi_attention; print('magi-attention', m.version('magi-attention')); assert m.version('deep-ep') == '1.2.1+d45b7f7'"
+    python -c "import importlib.metadata as m; import magi_attention; print('magi-attention', m.version('magi-attention')); assert m.version('deep-ep') == '1.2.1+f109f95'"
 
 # Persistent disk cache for FA4's CuTe-DSL JIT (amortizes kernel compiles across restarts)
 ENV FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1
