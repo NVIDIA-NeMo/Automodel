@@ -84,3 +84,5 @@ optimizer:
 ci:
   time: "00:20:00"
   nproc_per_node: 1
+  env_vars:
+    NEMO_AUTOMODEL_MERGE_WORKERS: 64
