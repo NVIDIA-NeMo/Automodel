@@ -3,8 +3,8 @@
 This example runs DMD2 through AutoModel's standard diffusion fine-tuning
 trainer. AutoModel continues to own data loading, FSDP2, optimizers, gradient
 accumulation, logging, and checkpoint cadence. The top-level `dmd2` block in
-the YAML contains only DMD2 parameters; the integration explicitly calls
-Model Optimizer's Qwen-Image pipeline.
+the YAML contains the DMD2 parameters and selects Model Optimizer's Qwen-Image
+pipeline, discriminator, and feature-capture callback.
 
 Install the DMD2 dependency:
 

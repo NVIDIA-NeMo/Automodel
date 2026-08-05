@@ -3,26 +3,32 @@ model:
   mode: finetune
 
 dmd2:
-  modelopt_config:
-    pred_type: flow
-    guidance_scale: 4.0
-    student_sample_steps: 4
-    student_update_freq: 5
-    fake_score_pred_type: x0
-    gan_loss_weight_gen: 0.03
-    gan_use_same_t_noise: true
-    gan_r1_reg_weight: 0.0
-    sample_t_cfg:
-      time_dist_type: uniform
-      # Four LightX2V shift-3 student steps plus the terminal point.
-      t_list: [1.0, 0.9, 0.75, 0.5, 0.0]
-    # The validated run disabled EMA. Set an EMAConfig here to enable it.
-    ema: null
+  pred_type: flow
+  guidance_scale: 4.0
+  student_sample_steps: 4
+  student_update_freq: 5
+  fake_score_pred_type: x0
+  gan_loss_weight_gen: 0.03
+  gan_use_same_t_noise: true
+  gan_r1_reg_weight: 0.0
+  sample_t_cfg:
+    time_dist_type: uniform
+    # Four LightX2V shift-3 student steps plus the terminal point.
+    t_list: [1.0, 0.9, 0.75, 0.5, 0.0]
+  # The validated run disabled EMA. Set an EMAConfig here to enable it.
+  ema: null
+
+  pipeline:
+    _target_: modelopt.torch.fastgen.plugins.qwen_image.QwenImageDMDPipeline
 
   discriminator:
+    _target_: modelopt.torch.fastgen.discriminators.Discriminator_ImageDiT
     feature_indices: [30]
     num_blocks: 60
     inner_dim: 3072
+
+  feature_capture:
+    _target_: modelopt.torch.fastgen.plugins.qwen_image.attach_feature_capture
 
   # Generate this once with the same Qwen text encoder used for the data cache.
   negative_prompt_embedding_path: PATH_TO_NEGATIVE_PROMPT_EMBEDDING

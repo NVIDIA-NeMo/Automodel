@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Model Optimizer Qwen-Image DMD2 objective for the native diffusion trainer."""
+"""Model Optimizer DMD2 step distillation for the native diffusion trainer."""
 
 from __future__ import annotations
 
@@ -39,14 +39,12 @@ if TYPE_CHECKING:
     from nemo_automodel.recipes.diffusion.train import TrainDiffusionRecipe
 
 
-def _require_qwen_fastgen() -> tuple[Any, Any, Any]:
-    """Import ModelOpt only when Qwen-Image DMD2 is configured."""
+def _require_fastgen() -> Any:
+    """Import ModelOpt only when DMD2 is configured."""
     has_fastgen, fastgen = safe_import("modelopt.torch.fastgen")
-    has_discriminator, fastgen_discriminators = safe_import("modelopt.torch.fastgen.discriminators")
-    has_qwen, qwen_fastgen = safe_import("modelopt.torch.fastgen.plugins.qwen_image")
-    if not (has_fastgen and has_discriminator and has_qwen):
-        raise ImportError("Qwen-Image DMD2 requires ModelOpt FastGen; install with `uv sync --extra dmd2`.")
-    return fastgen, fastgen_discriminators, qwen_fastgen
+    if not has_fastgen:
+        raise ImportError("DMD2 requires ModelOpt FastGen; install with `uv sync --extra dmd2`.")
+    return fastgen
 
 
 def _load_negative_prompt_embedding(path: str) -> torch.Tensor:
@@ -62,7 +60,7 @@ def _load_negative_prompt_embedding(path: str) -> torch.Tensor:
     return embedding.contiguous()
 
 
-class _QwenImageDMD2Objective:
+class _DMD2Objective:
     """Add full Model Optimizer DMD2 updates to ``TrainDiffusionRecipe``.
 
     Model Optimizer owns CFG, VSD/DSM, multi-step simulation, GAN/R1, and EMA.
@@ -74,12 +72,15 @@ class _QwenImageDMD2Objective:
 
     def __init__(self, cfg: ConfigNode) -> None:
         self.cfg = cfg
-        fastgen, _, _ = _require_qwen_fastgen()
-        self.modelopt_config = fastgen.DMDConfig(**cfg.modelopt_config.to_dict())
-        if self.modelopt_config.student_update_freq < 1:
-            raise ValueError("dmd2.modelopt_config.student_update_freq must be at least 1.")
+        fastgen = _require_fastgen()
+        config = cfg.to_dict()
+        for key in ("discriminator", "feature_capture", "negative_prompt_embedding_path", "pipeline"):
+            config.pop(key, None)
+        self.dmd_config = fastgen.DMDConfig(**config)
+        if self.dmd_config.student_update_freq < 1:
+            raise ValueError("dmd2.student_update_freq must be at least 1.")
 
-        self.modelopt_pipeline: Any | None = None
+        self.dmd_pipeline: Any | None = None
         self.teacher: nn.Module | None = None
         self.fake_score: nn.Module | None = None
         self.student_optimizer: torch.optim.Optimizer | None = None
@@ -118,17 +119,17 @@ class _QwenImageDMD2Objective:
         if bool(recipe.cfg.get("model.transformer_engine_fp8", False)):
             raise ValueError("DMD2 does not yet support Transformer Engine FP8 state.")
         if recipe.cfg.get("model.attention_backend", None) == "flash":
-            raise ValueError("Qwen-Image DMD2 requires text masks, which the flash-attn 2 backend does not support.")
+            raise ValueError("DMD2 requires text masks, which the flash-attn 2 backend does not support.")
         if recipe.cfg.optimizer is None:
             raise ValueError("DMD2 requires the native top-level `optimizer` configuration.")
 
-        ema = self.modelopt_config.ema
+        ema = self.dmd_config.ema
         if ema is not None and (not ema.fsdp2 or ema.mode != "full_tensor"):
             raise ValueError("DMD2 checkpoint resume requires EMA with fsdp2=true and mode=full_tensor.")
 
     def primary_optimizer_steps(self, outer_steps: int) -> int:
         """Return the number of student updates in ``outer_steps``."""
-        return ceil(outer_steps / int(self.modelopt_config.student_update_freq))
+        return ceil(outer_steps / int(self.dmd_config.student_update_freq))
 
     def build_lr_scheduler(self, recipe: TrainDiffusionRecipe) -> list[Any] | None:
         """Build the native student scheduler against the student-update budget."""
@@ -151,10 +152,8 @@ class _QwenImageDMD2Objective:
 
     def setup(self, recipe: TrainDiffusionRecipe) -> None:
         """Create DMD2 auxiliaries before the native checkpoint restore."""
-        _, fastgen_discriminators, qwen_fastgen = _require_qwen_fastgen()
-
         negative_path = self.cfg.get("negative_prompt_embedding_path", None)
-        if self.modelopt_config.guidance_scale is not None:
+        if self.dmd_config.guidance_scale is not None:
             if not negative_path:
                 raise ValueError("DMD2 CFG requires dmd2.negative_prompt_embedding_path.")
             self.negative_prompt_embedding = _load_negative_prompt_embedding(str(negative_path)).to(
@@ -167,11 +166,13 @@ class _QwenImageDMD2Objective:
         self.fake_score = self._build_auxiliary_transformer(recipe, trainable=True)
         self.fake_score_optimizer = self._build_auxiliary_optimizer(recipe, self.fake_score, "fake-score")
 
-        if self.modelopt_config.gan_loss_weight_gen > 0:
+        if self.dmd_config.gan_loss_weight_gen > 0:
             discriminator_cfg = self.cfg.get("discriminator", None)
             if discriminator_cfg is None:
                 raise ValueError("DMD2 GAN requires dmd2.discriminator arguments.")
-            self.discriminator = fastgen_discriminators.Discriminator_ImageDiT(**discriminator_cfg.to_dict()).to(
+            if self.cfg.get("feature_capture", None) is None:
+                raise ValueError("DMD2 GAN requires dmd2.feature_capture.")
+            self.discriminator = discriminator_cfg.instantiate().to(
                 device=recipe.device,
                 dtype=recipe.compute_dtype,
             )
@@ -182,11 +183,14 @@ class _QwenImageDMD2Objective:
                 "discriminator",
             )
 
-        self.modelopt_pipeline = qwen_fastgen.QwenImageDMDPipeline(
+        pipeline_cfg = self.cfg.get("pipeline", None)
+        if pipeline_cfg is None:
+            raise ValueError("DMD2 requires dmd2.pipeline.")
+        self.dmd_pipeline = pipeline_cfg.instantiate(
             student=recipe.model,
             teacher=self.teacher,
             fake_score=self.fake_score,
-            config=self.modelopt_config,
+            config=self.dmd_config,
             discriminator=self.discriminator,
         )
 
@@ -209,7 +213,7 @@ class _QwenImageDMD2Objective:
         if recipe.lr_scheduler is None:
             return
         completed_steps = int(recipe.step_scheduler.step)
-        expected_student_steps = ceil(completed_steps / int(self.modelopt_config.student_update_freq))
+        expected_student_steps = ceil(completed_steps / int(self.dmd_config.student_update_freq))
         restored_student_steps = int(recipe.lr_scheduler[0].num_steps)
         if restored_student_steps != expected_student_steps:
             raise ValueError(
@@ -230,12 +234,19 @@ class _QwenImageDMD2Objective:
             state["discriminator"] = self._discriminator_state.state_dict()
         if self._discriminator_optimizer_state is not None:
             state["discriminator_optimizer"] = self._discriminator_optimizer_state.state_dict()
-        if self.modelopt_pipeline.ema is not None:
-            state["ema"] = self.modelopt_pipeline.ema.state_dict()
+        if self.dmd_pipeline.ema is not None:
+            state["ema"] = self.dmd_pipeline.ema.state_dict()
         return state
 
     def load_state_dict(self, state: dict[str, Any]) -> None:
-        """Restore DMD2 auxiliary state populated by DCP."""
+        """Restore the DCP-populated DMD2 auxiliary state.
+
+        Args:
+            state: Mapping returned by :meth:`state_dict`. Fake-score and
+                discriminator tensors use their logical parameter shapes,
+                optimizer tensors preserve those axes, and EMA tensors match
+                the student parameters they shadow.
+        """
         self._require_ready()
         assert self._fake_score_state is not None
         assert self._fake_score_optimizer_state is not None
@@ -245,8 +256,8 @@ class _QwenImageDMD2Objective:
             self._discriminator_state.load_state_dict(state["discriminator"])
         if self._discriminator_optimizer_state is not None:
             self._discriminator_optimizer_state.load_state_dict(state["discriminator_optimizer"])
-        if self.modelopt_pipeline.ema is not None:
-            self.modelopt_pipeline.ema.load_state_dict(state["ema"])
+        if self.dmd_pipeline.ema is not None:
+            self.dmd_pipeline.ema.load_state_dict(state["ema"])
 
     def train_batch_group(
         self,
@@ -254,7 +265,17 @@ class _QwenImageDMD2Objective:
         batch_group: list[dict[str, Any]],
         global_step: int,
     ) -> tuple[float, float]:
-        """Run one student or fake-score/discriminator optimizer phase."""
+        """Run one student or fake-score/discriminator phase.
+
+        Args:
+            recipe: Active recipe owning the student and distributed state.
+            batch_group: Microbatches containing image latents ``[B,C,H,W]``,
+                text embeddings ``[B,S,D]``, and masks ``[B,S]``.
+            global_step: Outer step selecting the active DMD2 phase.
+
+        Returns:
+            Mean loss and active-model gradient norm scalars.
+        """
         self._require_ready()
         assert self.fake_score is not None
         assert self.student_optimizer is not None
@@ -263,7 +284,7 @@ class _QwenImageDMD2Objective:
         if not batch_group:
             raise RuntimeError("DMD2 received an empty gradient-accumulation group.")
 
-        student_phase = global_step % int(self.modelopt_config.student_update_freq) == 0
+        student_phase = global_step % int(self.dmd_config.student_update_freq) == 0
         phase = "student" if student_phase else "fake_score"
         active_model = recipe.model if student_phase else self.fake_score
         active_optimizer = self.student_optimizer if student_phase else self.fake_score_optimizer
@@ -296,7 +317,7 @@ class _QwenImageDMD2Objective:
                 "encoder_hidden_states_mask": text_mask,
             }
             if student_phase:
-                losses = self.modelopt_pipeline.compute_student_loss(
+                losses = self.dmd_pipeline.compute_student_loss(
                     latents,
                     noise,
                     negative_encoder_hidden_states=negative_embeddings,
@@ -304,7 +325,7 @@ class _QwenImageDMD2Objective:
                     **kwargs,
                 )
             else:
-                losses = self.modelopt_pipeline.compute_fake_score_loss(latents, noise, **kwargs)
+                losses = self.dmd_pipeline.compute_fake_score_loss(latents, noise, **kwargs)
 
             total = losses["total"]
             if recipe.check_loss and not torch.isfinite(total).all():
@@ -313,7 +334,7 @@ class _QwenImageDMD2Objective:
             reported_total = total.detach()
 
             if not student_phase and self.discriminator_optimizer is not None:
-                discriminator_losses = self.modelopt_pipeline.compute_discriminator_loss(latents, noise, **kwargs)
+                discriminator_losses = self.dmd_pipeline.compute_discriminator_loss(latents, noise, **kwargs)
                 discriminator_total = discriminator_losses["total"]
                 if recipe.check_loss and not torch.isfinite(discriminator_total).all():
                     raise FloatingPointError(f"Non-finite DMD2 discriminator loss at step {global_step}.")
@@ -329,7 +350,7 @@ class _QwenImageDMD2Objective:
             [active_model],
             foreach=recipe.grad_clip_foreach,
         )
-        grad_norm = float(grad_norm) if torch.is_tensor(grad_norm) else float(grad_norm)
+        grad_norm = float(grad_norm)
 
         if not student_phase and self.discriminator_optimizer is not None:
             self._synchronize_discriminator_gradients(recipe)
@@ -346,9 +367,7 @@ class _QwenImageDMD2Objective:
         if student_phase:
             if recipe.lr_scheduler is not None:
                 recipe.lr_scheduler[0].step(1)
-            self.modelopt_pipeline.update_ema(
-                iteration=global_step // int(self.modelopt_config.student_update_freq) + 1
-            )
+            self.dmd_pipeline.update_ema(iteration=global_step // int(self.dmd_config.student_update_freq) + 1)
 
         active_optimizer.zero_grad(set_to_none=True)
         if not student_phase and self.discriminator_optimizer is not None:
@@ -393,7 +412,7 @@ class _QwenImageDMD2Objective:
         if isinstance(optimizers, torch.optim.Optimizer):
             return optimizers
         if len(optimizers) != 1:
-            raise ValueError(f"Qwen-Image DMD2 requires one {component} optimizer, got {len(optimizers)}.")
+            raise ValueError(f"DMD2 requires one {component} optimizer, got {len(optimizers)}.")
         return optimizers[0]
 
     def _build_auxiliary_optimizer(
@@ -419,13 +438,17 @@ class _QwenImageDMD2Objective:
         torch.Tensor | None,
         torch.Tensor | None,
     ]:
-        """Move and validate one cached Qwen-Image batch.
+        """Move and validate one cached image batch.
+
+        Args:
+            recipe: Active recipe providing the target device and dtype.
+            batch: Mapping with image latents ``[B,C,H,W]``, text embeddings
+                ``[B,S,D]`` or ``[S,D]``, and masks ``[B,S]`` or ``[S]``.
 
         Returns:
-            Image latents ``[B, C, H, W]``, sampled noise with the same shape,
-            positive text embeddings ``[B, S, D]`` and their ``[B, S]`` mask,
-            plus optional negative text embeddings ``[B, S_negative, D]`` and
-            their ``[B, S_negative]`` mask.
+            Image latents ``[B,C,H,W]``, same-shaped noise, positive embeddings
+            ``[B,S,D]`` and mask ``[B,S]``, plus optional negative embeddings
+            ``[B,S_negative,D]`` and mask ``[B,S_negative]``.
         """
         latents = batch["image_latents"].to(recipe.device, dtype=recipe.compute_dtype, non_blocking=True)
         text_embeddings = batch["text_embeddings"].to(
@@ -454,10 +477,8 @@ class _QwenImageDMD2Objective:
 
         feature_shape = (latents.shape[-2], latents.shape[-1])
         if self.discriminator is not None and self._feature_capture_shape != feature_shape:
-            _, _, qwen_fastgen = _require_qwen_fastgen()
-
-            qwen_fastgen.attach_feature_capture(
-                self.teacher,
+            self.cfg.feature_capture.instantiate(
+                teacher=self.teacher,
                 feature_indices=sorted(self.discriminator.feature_indices),
                 h_lat=feature_shape[0],
                 w_lat=feature_shape[1],
@@ -504,7 +525,7 @@ class _QwenImageDMD2Objective:
 
     def _require_ready(self) -> None:
         if (
-            self.modelopt_pipeline is None
+            self.dmd_pipeline is None
             or self.fake_score is None
             or self.student_optimizer is None
             or self.fake_score_optimizer is None

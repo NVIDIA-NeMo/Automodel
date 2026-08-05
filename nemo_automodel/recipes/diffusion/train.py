@@ -588,9 +588,9 @@ class TrainDiffusionRecipe(BaseRecipe):
         self.defer_fsdp_grad_sync = fsdp_cfg.get("defer_fsdp_grad_sync", True) if fsdp_cfg else True
         self._dmd2 = None
         if self.cfg.get("dmd2", None) is not None:
-            from nemo_automodel.recipes.diffusion.dmd2 import _QwenImageDMD2Objective
+            from nemo_automodel.recipes.diffusion.step_distillation import _DMD2Objective
 
-            self._dmd2 = _QwenImageDMD2Objective(self.cfg.dmd2)
+            self._dmd2 = _DMD2Objective(self.cfg.dmd2)
             self._dmd2.configure(self)
 
         # Flow matching configuration
@@ -655,7 +655,7 @@ class TrainDiffusionRecipe(BaseRecipe):
             if self.stage is not None:
                 logging.info(f"[INFO]   - Two-stage finetune: stage={self.stage}, active={self.active_transformer}")
         else:
-            logging.info("[INFO] Model Optimizer Qwen-Image DMD2 objective")
+            logging.info("[INFO] Model Optimizer DMD2 objective")
 
         # Get pipeline_spec for pretraining mode (required when mode != "finetune")
         pipeline_spec_cfg = self.cfg.get("model.pipeline_spec", None)
@@ -901,7 +901,17 @@ class TrainDiffusionRecipe(BaseRecipe):
         batch_group: list[Dict[str, Any]],
         global_step: int,
     ) -> tuple[float, float]:
-        """Run one accumulated outer step through the configured objective."""
+        """Run one accumulated outer step through the configured objective.
+
+        Args:
+            batch_group: Microbatches with image latents ``[B,C,H,W]`` or video
+                latents ``[B,C,F,H,W]``, plus text embeddings ``[B,S,D]`` and
+                objective-specific conditioning tensors such as masks ``[B,S]``.
+            global_step: Zero-based outer optimizer-step index.
+
+        Returns:
+            Mean loss and active-model gradient norm scalars.
+        """
         if self._dmd2 is not None:
             # StepScheduler increments only after the yielded group resumes, so
             # its live counter is the exact DMD2 phase, including after restore.
@@ -981,7 +991,7 @@ class TrainDiffusionRecipe(BaseRecipe):
         return float(torch.stack(micro_losses).mean().item()), grad_norm
 
     def run_train_validation_loop(self):
-        objective_name = "Qwen-Image DMD2" if self._dmd2 is not None else "T2V training with Flow Matching"
+        objective_name = "DMD2" if self._dmd2 is not None else "T2V training with Flow Matching"
         logging.info("[INFO] Starting %s", objective_name)
         logging.info(f"[INFO] Global Batch size: {self.global_batch_size}; Local Batch size: {self.local_batch_size}")
         logging.info(f"[INFO] Num nodes: {self.num_nodes}; DP size: {self.dp_size}")

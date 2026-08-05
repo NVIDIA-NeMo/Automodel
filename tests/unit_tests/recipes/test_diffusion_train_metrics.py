@@ -787,11 +787,17 @@ def _train_batch_group_recipe(model: nn.Module, flow_step) -> TrainDiffusionReci
 def test_train_batch_group_logs_batch_shapes_and_reraises_on_step_failure(caplog):
     model = nn.Linear(1, 1, bias=False)
 
-    def _failing_step(**_kwargs):
+    def _failing_step(**_kwargs: object) -> None:
+        """Fail after accepting one flow-matching microbatch.
+
+        Args:
+            **_kwargs: Step arguments containing a batch with video latents
+                ``[B,C,F,H,W]`` and text embeddings ``[B,S,D]``.
+        """
         raise RuntimeError("simulated flow-matching failure")
 
     recipe = _train_batch_group_recipe(model, _failing_step)
-    micro_batch = {"video_latents": torch.zeros(2, 1, 4, 4), "text_embeddings": torch.zeros(2, 3, 8)}
+    micro_batch = {"video_latents": torch.zeros(2, 1, 1, 4, 4), "text_embeddings": torch.zeros(2, 3, 8)}
 
     with caplog.at_level("INFO"):
         with pytest.raises(RuntimeError, match="simulated flow-matching failure"):
@@ -810,7 +816,15 @@ def test_train_batch_group_reports_lora_gradient_diagnostic_on_first_step(caplog
 
     model = _LoraModel()
 
-    def _step(**_kwargs):
+    def _step(**_kwargs: object) -> tuple[None, torch.Tensor, None, None]:
+        """Return a scalar LoRA loss.
+
+        Args:
+            **_kwargs: Step arguments containing the diffusion batch tensors.
+
+        Returns:
+            Tuple whose second field is a scalar loss tensor.
+        """
         loss = model.lora_B.weight.square().sum()
         return None, loss, None, None
 
@@ -818,7 +832,10 @@ def test_train_batch_group_reports_lora_gradient_diagnostic_on_first_step(caplog
     recipe.peft_cfg = object()
 
     with caplog.at_level("INFO"):
-        loss, grad_norm = recipe._train_batch_group([{}], global_step=1)
+        loss, grad_norm = recipe._train_batch_group(
+            [{"video_latents": torch.zeros(1, 1, 1, 1, 1), "text_embeddings": torch.zeros(1, 1, 1)}],
+            global_step=1,
+        )
 
     assert "[GRAD CHECK] lora_B.weight" in caplog.text
     assert model.lora_B.weight.grad is not None

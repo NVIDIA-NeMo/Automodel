@@ -65,7 +65,20 @@ def _stack_or_pad_text_tensors(tensors: List[torch.Tensor], sequence_length_mult
 
 
 def collate_fn_production(batch: List[Dict]) -> Dict:
-    """Production collate function with verification."""
+    """Collate cached diffusion samples and pad variable-length text tensors.
+
+    Args:
+        batch: Samples with ``latent[C,H,W]``; resolution and offset tensors
+            ``[2]``; optional ``clip_hidden`` or ``prompt_embeds`` tensors
+            ``[S,D]``; ``pooled_prompt_embeds[D]``; and optional
+            ``clip_tokens`` or ``t5_tokens`` tensors ``[S]``.
+
+    Returns:
+        Mapping with ``latent[B,C,H,W]``, resolution and offset tensors
+        ``[B,2]``, and optional text tensors with a batch axis and padded
+        sequence axis. ``prompt_embeds`` and ``prompt_embeds_mask`` have shapes
+        ``[B,S_padded,D]`` and ``[B,S_padded]``.
+    """
     # Verify all samples have same resolution
     resolutions = [tuple(item["crop_resolution"].tolist()) for item in batch]
     assert len(set(resolutions)) == 1, f"Mixed resolutions in batch: {set(resolutions)}"
@@ -112,15 +125,16 @@ def collate_fn_production(batch: List[Dict]) -> Dict:
 
 
 def collate_fn_text_to_image(batch: List[Dict]) -> Dict:
-    """
-    Text-to-image collate function that transforms multiresolution batch output
-    to match FlowMatchingPipeline expected format.
+    """Adapt cached samples to the flow-matching image contract.
 
     Args:
-        batch: List of samples from TextToImageDataset
+        batch: Samples following :func:`collate_fn_production`'s input contract.
 
     Returns:
-        Dict compatible with FlowMatchingPipeline.step()
+        Mapping with ``image_latents[B,C,H,W]``, padded text embeddings
+        ``[B,S,D]`` and mask ``[B,S]``, optional pooled embeddings ``[B,D]``
+        and ``clip_hidden[B,S_clip,D]``. Nested crop, original-resolution, and
+        offset metadata tensors have shape ``[B,2]``.
     """
     # First, use the production collate to stack tensors
     production_batch = collate_fn_production(batch)
