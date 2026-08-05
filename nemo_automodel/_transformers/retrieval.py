@@ -129,16 +129,16 @@ def _build_backbone_from_extracted_submodel(
         config_dict = text_config.to_dict()
         config_dict.pop("model_type", None)
         config = config_class(**config_dict)
-        if pooling is not None:
-            config.pooling = pooling
-        if temperature is not None:
-            config.temperature = temperature
 
     attn_implementation = getattr(text_config, "_attn_implementation", None)
     if attn_implementation is not None:
         config._attn_implementation = attn_implementation
+    if has_supported_target and pooling is not None:
+        config.pooling = pooling
     if num_labels is not None:
         config.num_labels = num_labels
+    if has_supported_target and temperature is not None:
+        config.temperature = temperature
 
     return _load_from_extracted_state(backbone_class, config, extracted_model)
 
