@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH -A nemotron_retriever_dev    #account
-#SBATCH -p batch_block1,batch_block2,batch_block3,batch_block4
+#SBATCH -p batch_block1,batch_block3,batch_block4
 #SBATCH -t 04:00:00    #wall time limit, hr:min:sec
 #SBATCH -N 8             # node count — change per job (always multi-node)
 #SBATCH --gres=gpu:8
