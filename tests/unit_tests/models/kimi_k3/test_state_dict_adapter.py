@@ -48,15 +48,17 @@ def _tiny_adapter():
 
 
 def _peft_lora_state_dict(rank=8, n_experts=4, dim=64, inter=16):
-    # grouped expert LoRA params exactly as ModelState.state_dict() emits them
-    # on a PEFT save, plus one attention LoRA key for contrast
+    # grouped expert LoRA params exactly as ModelState.state_dict() emits them on a
+    # PEFT save, shapes matching GroupedExpertsLoRA (lora_experts.py): A is
+    # [experts, in_features, rank], B is [experts, rank, out_features]. Plus one
+    # attention LoRA key for contrast.
     base = "base_model.model.model.layers.5.mlp.experts"
     attn = "base_model.model.model.layers.5.self_attn.q_proj"
     return {
-        f"{base}.lora_gate_and_up_A": torch.randn(n_experts, rank, dim),
-        f"{base}.lora_gate_and_up_B": torch.randn(n_experts, 2 * inter, rank),
-        f"{base}.lora_down_A": torch.randn(n_experts, rank, inter),
-        f"{base}.lora_down_B": torch.randn(n_experts, dim, rank),
+        f"{base}.lora_gate_and_up_A": torch.randn(n_experts, dim, rank),
+        f"{base}.lora_gate_and_up_B": torch.randn(n_experts, rank, 2 * inter),
+        f"{base}.lora_down_A": torch.randn(n_experts, inter, rank),
+        f"{base}.lora_down_B": torch.randn(n_experts, rank, dim),
         f"{attn}.lora_A.weight": torch.randn(rank, dim),
     }
 
