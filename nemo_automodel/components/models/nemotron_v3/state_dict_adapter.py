@@ -221,9 +221,16 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
                 stripped[stripped_key] = _upcast_mamba_fp32_state_tensor(stripped_key, value)
             # reset_view_loaded_keys=False: this is the second merge of a single from_hf (after the
             # backbone merge above), so accumulate MTP view-loaded keys onto the backbone's record.
+            prior_view_keys = set(self.view_loaded_native_keys)
             merged_mtp = self._from_hf_w_merged_experts(stripped, device_mesh, reset_view_loaded_keys=False)
             for key, value in merged_mtp.items():
                 merged[f"mtp.{key}"] = value
+            # The merge loop records view-loaded keys in mtp.-stripped form (it only ever sees
+            # stripped keys); re-prefix them so the checkpoint loader's key-diff matches them
+            # against the model's real mtp.* parameter names instead of flagging them as
+            # missing/unexpected.
+            new_view_keys = self._view_loaded_native_keys - prior_view_keys
+            self._view_loaded_native_keys = prior_view_keys | {f"mtp.{key}" for key in new_view_keys}
 
         return merged
 
