@@ -135,6 +135,11 @@ ci:
     thinking: true
     extra_model_args: "think_end_token=</think>,max_model_len=8192"
     metric: prompt_level_strict_acc
-    baseline: 0.5767
+    # Re-baselined 2026-08-04 on main @ cb5c1734d: 0.5989 over all 541 IFEval prompts.
+    # The previous 0.5767 was measured 2026-07-14, before #3028 disabled TE fused RoPE
+    # globally. Re-enabling rope_fusion on current main reproduces the old 1000-step
+    # loss curve exactly, so the change is attributable to the RoPE path alone -- see
+    # AM-795 for the bisect.
+    baseline: 0.5989
     stderr: 0.0213
     k: 2

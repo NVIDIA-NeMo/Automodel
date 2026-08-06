@@ -38,6 +38,74 @@ from nemo_automodel.components.moe.megatron.moe_utils import (
 )
 from nemo_automodel.components.moe.megatron.token_dispatcher import MoEFlexTokenDispatcher, TokenDispatcherConfig
 from nemo_automodel.components.moe.mxfp8 import select_grouped_mm
+from nemo_automodel.shared.import_utils import safe_import
+
+_HAVE_TRITON, triton = safe_import("triton")
+_HAVE_TRITON_LANGUAGE, tl = safe_import("triton.language")
+_BIAS_GRAD_TRITON_AVAILABLE = _HAVE_TRITON and _HAVE_TRITON_LANGUAGE and hasattr(tl, "make_tensor_descriptor")
+
+
+def _allocate_triton_workspace(size: int, alignment: int, stream: int | None) -> torch.Tensor:
+    """Allocate device workspace required by Triton tensor descriptors.
+
+    Args:
+        size: Workspace size in bytes.
+        alignment: Required byte alignment. CUDA allocations already provide at least 256-byte alignment.
+        stream: CUDA stream pointer requesting the allocation, or ``None`` outside a stream.
+
+    Returns:
+        One-dimensional CUDA byte tensor with ``size`` elements.
+    """
+    del alignment, stream
+    return torch.empty(size, dtype=torch.int8, device=torch.device("cuda", torch.cuda.current_device()))
+
+
+if _BIAS_GRAD_TRITON_AVAILABLE:
+
+    @triton.jit
+    def _deterministic_bias_grad_kernel(
+        grad_output_ptr,
+        token_offsets_ptr,
+        grad_bias_ptr,
+        n_tokens,
+        hidden: tl.constexpr,
+        BLOCK_TOKENS: tl.constexpr,
+        BLOCK_HIDDEN: tl.constexpr,
+    ):
+        """Reduce one expert's contiguous token gradients without atomic writes.
+
+        ``grad_output_ptr`` is a contiguous row-major ``[tokens, hidden]`` allocation. The caller ensures its row
+        stride is descriptor-aligned and its token offsets fit in int32. Each program exclusively owns one
+        ``[expert, hidden block]`` output tile, so the reduction order is deterministic.
+        """
+        expert_idx = tl.program_id(0)
+        hidden_block_start = tl.program_id(1) * BLOCK_HIDDEN
+        hidden_offsets = hidden_block_start + tl.arange(0, BLOCK_HIDDEN)
+        token_start = tl.load(token_offsets_ptr + expert_idx).to(tl.int32)
+        token_end = tl.load(token_offsets_ptr + expert_idx + 1).to(tl.int32)
+        grad_output = tl.make_tensor_descriptor(
+            grad_output_ptr,
+            shape=[n_tokens, hidden],
+            strides=[hidden, 1],
+            block_shape=[BLOCK_TOKENS, BLOCK_HIDDEN],
+        )
+
+        total = tl.zeros((BLOCK_HIDDEN,), dtype=tl.float32)
+        compensation = tl.zeros((BLOCK_HIDDEN,), dtype=tl.float32)
+        for token_block_start in range(token_start, token_end, BLOCK_TOKENS):
+            token_offsets = token_block_start + tl.arange(0, BLOCK_TOKENS)
+            values = grad_output.load([token_block_start, hidden_block_start]).to(tl.float32)
+            values = tl.where(token_offsets[:, None] < token_end, values, 0.0)
+            block_sum = tl.sum(values, axis=0)
+
+            # Kahan compensation protects the serial accumulation of the balanced
+            # per-block reductions when positive and negative gradients cancel.
+            corrected = block_sum - compensation
+            updated = total + corrected
+            compensation = (updated - total) - corrected
+            total = updated
+
+        tl.store(grad_bias_ptr + expert_idx * hidden + hidden_offsets, total, mask=hidden_offsets < hidden)
 
 # ── EP variable-length collective helpers ──
 
@@ -152,6 +220,114 @@ def _permute_tokens_for_grouped_mm(
     return sorted_token_ids, sorted_weights, tokens_per_expert, offs
 
 
+def _reduce_bias_grad_fallback(grad_output: torch.Tensor, token_counts: torch.Tensor) -> torch.Tensor:
+    """Reduce grouped token gradients without requiring Triton.
+
+    Args:
+        grad_output: Tensor of shape [tokens, hidden], grouped contiguously by expert.
+        token_counts: Tensor of shape [experts] containing each contiguous segment length.
+
+    Returns:
+        Tensor of shape [experts, hidden] with one gradient sum per expert.
+    """
+    accumulation_dtype = (
+        torch.float64 if not grad_output.is_cuda and grad_output.dtype != torch.float64 else torch.float32
+    )
+    if grad_output.dtype == torch.float64:
+        accumulation_dtype = torch.float64
+    accumulation_input = grad_output.to(accumulation_dtype)
+    hidden = accumulation_input.shape[1]
+    flattened_by_hidden = accumulation_input.transpose(0, 1).contiguous().view(-1)
+    repeated_counts = token_counts.repeat(hidden)
+    grad_bias = torch.segment_reduce(
+        flattened_by_hidden,
+        "sum",
+        lengths=repeated_counts,
+        axis=0,
+        unsafe=True,
+    )
+    return grad_bias.view(hidden, token_counts.numel()).transpose(0, 1).contiguous().to(grad_output.dtype)
+
+
+def _reduce_bias_grad_triton(grad_output: torch.Tensor, token_counts: torch.Tensor) -> torch.Tensor:
+    """Reduce grouped CUDA token gradients with deterministic compensated FP32 sums.
+
+    Args:
+        grad_output: Contiguous CUDA tensor of shape [tokens, hidden], grouped by expert. Supported dtypes are
+            FP16, BF16, and FP32.
+        token_counts: Contiguous CUDA tensor of shape [experts] containing each segment length.
+
+    Returns:
+        CUDA tensor of shape [experts, hidden] and the same dtype as ``grad_output``.
+    """
+    grad_output = grad_output.contiguous()
+    hidden = grad_output.shape[1]
+    token_offsets = torch.cat((token_counts.new_zeros(1), token_counts.cumsum(dim=0)))
+    grad_bias = torch.empty((token_counts.numel(), hidden), dtype=torch.float32, device=grad_output.device)
+    block_hidden = 16
+    grid = (token_counts.numel(), triton.cdiv(hidden, block_hidden))
+    if not torch.compiler.is_compiling():
+        triton.set_allocator(_allocate_triton_workspace)
+    _deterministic_bias_grad_kernel[grid](
+        grad_output,
+        token_offsets,
+        grad_bias,
+        grad_output.shape[0],
+        hidden,
+        BLOCK_TOKENS=128,
+        BLOCK_HIDDEN=block_hidden,
+        num_warps=4,
+    )
+    return grad_bias.to(grad_output.dtype)
+
+
+class _DeterministicBiasRepeatInterleave(Function):
+    """Expand expert biases while reducing their gradients deterministically."""
+
+    @staticmethod
+    def forward(ctx, bias, token_counts, output_size):
+        """Expand each expert bias over its contiguous token group.
+
+        Args:
+            ctx: Autograd context used to retain the token counts for backward.
+            bias: Tensor of shape [experts, hidden].
+            token_counts: Tensor of shape [experts] containing nonnegative token counts.
+            output_size: Total number of grouped tokens.
+
+        Returns:
+            Tensor of shape [tokens, hidden], with each expert row repeated for its tokens.
+        """
+        ctx.save_for_backward(token_counts)
+        return torch.repeat_interleave(bias, token_counts, dim=0, output_size=output_size)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """Reduce expanded bias gradients with one deterministic segmented reduction.
+
+        Args:
+            ctx: Autograd context containing the forward token counts.
+            grad_output: Tensor of shape [tokens, hidden].
+
+        Returns:
+            Tuple containing the bias gradient of shape [experts, hidden] and no gradients for token counts or size.
+        """
+        (token_counts,) = ctx.saved_tensors
+        use_triton = (
+            _BIAS_GRAD_TRITON_AVAILABLE
+            and grad_output.is_cuda
+            and grad_output.dtype in (torch.float16, torch.bfloat16, torch.float32)
+            and grad_output.shape[0] < 2**31
+            and grad_output.shape[1] * grad_output.element_size() % 16 == 0
+            and not torch.is_grad_enabled()
+        )
+        grad_bias = (
+            _reduce_bias_grad_triton(grad_output, token_counts)
+            if use_triton
+            else _reduce_bias_grad_fallback(grad_output, token_counts)
+        )
+        return grad_bias, None, None
+
+
 def _apply_bias(value, bias, tokens_per_expert, permuted_probs=None):
     """Apply per-expert bias to grouped GEMM output.
 
@@ -163,47 +339,32 @@ def _apply_bias(value, bias, tokens_per_expert, permuted_probs=None):
     Args:
         value: Output from grouped GEMM, shape [total_tokens, features].
         bias: Per-expert bias, shape [num_experts, features].
-        tokens_per_expert: Token counts per expert.
-        permuted_probs: If provided, bias is weighted by routing probs (for down projection).
+        tokens_per_expert: Token counts, shape [num_experts].
+        permuted_probs: Optional routing probabilities broadcastable to
+            [total_tokens, features], typically [total_tokens, 1].
+
+    Returns:
+        Grouped GEMM output with per-expert bias applied, shape
+        [total_tokens, features]. The inputs are not mutated.
     """
     if bias is None:
         return value
+    if not isinstance(bias, torch.Tensor):
+        bias = torch.stack(tuple(bias))
+
     shape = value.shape
-    if permuted_probs is not None:
-        output = (
-            torch.cat(
-                [
-                    t + b * p
-                    for t, b, p in zip(
-                        torch.split(value.view(-1, shape[-1]), tokens_per_expert.tolist()),
-                        bias,
-                        torch.split(permuted_probs, tokens_per_expert.tolist()),
-                    )
-                ]
-            )
-            .view(shape)
-            .to(value.dtype)
-        )
+    flat_value = value.reshape(-1, shape[-1])
+    token_counts = torch.as_tensor(tokens_per_expert, device=bias.device, dtype=torch.long)
+    if torch.is_grad_enabled() and bias.requires_grad:
+        bias_to_expand = bias
+        if permuted_probs is not None:
+            bias_to_expand = bias.to(torch.promote_types(bias.dtype, permuted_probs.dtype))
+        expanded_bias = _DeterministicBiasRepeatInterleave.apply(bias_to_expand, token_counts, flat_value.shape[0])
     else:
-        output = (
-            torch.cat(
-                [
-                    t + b
-                    for t, b in zip(
-                        torch.split(
-                            value.view(-1, shape[-1]),
-                            tokens_per_expert.tolist()
-                            if isinstance(tokens_per_expert, torch.Tensor)
-                            else tokens_per_expert,
-                        ),
-                        bias,
-                    )
-                ]
-            )
-            .view(shape)
-            .to(value.dtype)
-        )
-    return output
+        expanded_bias = torch.repeat_interleave(bias, token_counts, dim=0, output_size=flat_value.shape[0])
+    if permuted_probs is not None:
+        expanded_bias = expanded_bias * permuted_probs
+    return (flat_value + expanded_bias).view(shape).to(value.dtype)
 
 
 class GroupedExperts(nn.Module):
