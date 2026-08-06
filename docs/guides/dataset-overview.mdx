@@ -30,7 +30,8 @@ dataset:
 
 ### SQuAD-Style Question Answering (QA) (Instruction SFT)
 - Factory: `nemo_automodel.components.datasets.llm.squad.make_squad_dataset`
-- Use case: instruction/QA tuning with either prompt-and-answer formatting or chat-template formatting
+- Use case: instruction or QA tuning with either prompt-and-answer formatting or chat-template formatting
+
 <Note>
 - If the tokenizer has a usable chat template, `make_squad_dataset` uses it automatically and masks non-answer tokens. Otherwise it uses prompt-and-answer formatting.
 - Optional `seq_length` can be used for padding/truncation.
