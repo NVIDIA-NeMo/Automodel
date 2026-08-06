@@ -382,6 +382,56 @@ def test_freeze_audio_tower_false_keeps_sound_trainable(sound_model):
     assert _all_requires_grad(sound_model.sound_projection)
 
 
+def test_freeze_towers_can_leave_projectors_trainable():
+    """Tower and projector freezing can be configured independently."""
+
+    class MultimodalModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.vision_model = nn.Linear(4, 4)
+            self.vision_projector = nn.Linear(4, 4)
+            self.sound_encoder = nn.Linear(4, 4)
+            self.sound_projection = nn.Linear(4, 4)
+
+    model = MultimodalModel()
+    model_utils.apply_parameter_freezing(
+        model,
+        {
+            "freeze_vision_tower": True,
+            "freeze_vision_projector": False,
+            "freeze_audio_tower": True,
+            "freeze_audio_projector": False,
+        },
+    )
+
+    assert not _any_requires_grad(model.vision_model)
+    assert _all_requires_grad(model.vision_projector)
+    assert not _any_requires_grad(model.sound_encoder)
+    assert _all_requires_grad(model.sound_projection)
+
+
+def test_freeze_towers_preserves_legacy_projector_behavior_without_override():
+    """Omitting projector overrides preserves the existing tower-wide freeze."""
+
+    class MultimodalModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.vision_projector = nn.Linear(4, 4)
+            self.sound_projection = nn.Linear(4, 4)
+
+    model = MultimodalModel()
+    model_utils.apply_parameter_freezing(
+        model,
+        {
+            "freeze_vision_tower": True,
+            "freeze_audio_tower": True,
+        },
+    )
+
+    assert not _any_requires_grad(model.vision_projector)
+    assert not _any_requires_grad(model.sound_projection)
+
+
 # =============================================================================
 # Tests for cast_mixed_dtype_params_to_bf16
 # =============================================================================
