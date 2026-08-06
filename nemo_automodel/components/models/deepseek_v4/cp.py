@@ -91,6 +91,69 @@ def dsv4_cp_all_gather(tensor: torch.Tensor, *, dim: int, cp_group) -> torch.Ten
     return torch.cat(tuple(parts), dim=dim)
 
 
+class _Dsv4Fp8CpAnchor(torch.autograd.Function):
+    """Create a value-free global KV anchor with reduce-scatter backward."""
+
+    @staticmethod
+    def forward(ctx, local_anchor: torch.Tensor, dim: int, cp_group) -> torch.Tensor:
+        world_size = dist.get_world_size(group=cp_group)
+        shape = list(local_anchor.shape)
+        shape[dim] *= world_size
+        ctx.dim = dim
+        ctx.cp_group = cp_group
+        ctx.local_size = local_anchor.shape[dim]
+        # Values are intentionally uninitialized: the FP8 attention kernel only
+        # uses this tensor as the autograd edge for its straight-through dKV.
+        return local_anchor.new_empty(shape)
+
+    @staticmethod
+    def backward(ctx, grad_global: torch.Tensor):
+        dim = ctx.dim
+        if dim != 0:
+            order = [dim, *[axis for axis in range(grad_global.ndim) if axis != dim]]
+            inverse = [order.index(axis) for axis in range(grad_global.ndim)]
+            reduce_input = grad_global.permute(order).contiguous()
+        else:
+            inverse = None
+            reduce_input = grad_global.contiguous()
+        local_shape = list(reduce_input.shape)
+        local_shape[0] = ctx.local_size
+        local = torch.empty(local_shape, dtype=grad_global.dtype, device=grad_global.device)
+        dist.reduce_scatter_tensor(local, reduce_input, op=dist.ReduceOp.SUM, group=ctx.cp_group)
+        if inverse is not None:
+            local = local.permute(inverse).contiguous()
+        return local, None, None
+
+
+def dsv4_cp_all_gather_fp8(kv, *, dim: int, cp_group):
+    """Gather DSV4 FP8 payloads while preserving a BF16 straight-through gradient.
+
+    No BF16 KV values are communicated.  Forward gathers 448 E4M3 bytes,
+    64 BF16 RoPE values, and eight UE8M0 bytes per token.  Backward
+    reduce-scatters the full BF16 dKV produced by sparse attention.
+    """
+    if not dsv4_cp_enabled(cp_group):
+        return kv
+
+    from nemo_automodel.components.models.deepseek_v4.fp8 import Dsv4Fp8KV
+
+    world_size = dist.get_world_size(group=cp_group)
+
+    def gather(tensor: torch.Tensor, *, as_bytes: bool = False) -> torch.Tensor:
+        source = tensor.contiguous().view(torch.uint8) if as_bytes else tensor.contiguous()
+        parts = [torch.empty_like(source) for _ in range(world_size)]
+        dist.all_gather(parts, source, group=cp_group)
+        gathered = torch.cat(parts, dim=dim)
+        return gathered.view(torch.float8_e4m3fn) if as_bytes else gathered
+
+    return Dsv4Fp8KV(
+        anchor=_Dsv4Fp8CpAnchor.apply(kv.anchor, dim, cp_group),
+        nope=gather(kv.nope, as_bytes=True),
+        rope=gather(kv.rope),
+        scales=gather(kv.scales),
+    )
+
+
 def dsv4_cp_all_gather_metadata(tensor: torch.Tensor | None, *, dim: int, cp_group) -> torch.Tensor | None:
     """All-gather non-differentiable metadata such as padding masks."""
     if tensor is None or not dsv4_cp_enabled(cp_group):

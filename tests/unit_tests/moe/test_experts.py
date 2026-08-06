@@ -31,9 +31,11 @@ from nemo_automodel.components.moe.experts import (
     _DeterministicBiasRepeatInterleave,
     _permute_tokens_for_grouped_mm,
     _torch_mm_experts_fwd,
+    apply_vllm_moe_routing_weights,
     get_expert_activation_for_deepep,
     is_gated_activation,
     swiglu_clamped_deepep,
+    swiglu_clamped_vllm_fp8,
 )
 
 
@@ -207,6 +209,40 @@ class TestSwigluClampedDeepEP:
 
         assert out.dtype == torch.bfloat16
         assert out.shape == (2, 4)
+
+
+class TestSwigluClampedVllmFp8:
+    """Tests for vLLM's BF16 boundaries around the fused FP8 SwiGLU input."""
+
+    @staticmethod
+    def _reference(x, limit):
+        gate, up = torch.chunk(x, 2, dim=-1)
+        gate = gate.float().clamp(max=limit).to(x.dtype)
+        up = up.float().clamp(min=-limit, max=limit).to(x.dtype)
+        silu = torch.nn.functional.silu(gate.float()).to(x.dtype)
+        return (silu * up).to(x.dtype)
+
+    def test_matches_vllm_rounding_oracle(self):
+        torch.manual_seed(91)
+        x = (torch.randn(17, 64, dtype=torch.bfloat16) * 3.0).requires_grad_(True)
+
+        actual = swiglu_clamped_vllm_fp8(x, limit=7.0)
+        expected = self._reference(x, limit=7.0)
+
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        actual.float().sum().backward()
+        assert x.grad is not None
+        assert torch.isfinite(x.grad).all()
+
+    def test_routing_weight_is_post_down_fp32_multiply(self):
+        torch.manual_seed(92)
+        down_output = torch.randn(19, 32, dtype=torch.bfloat16)
+        probs = torch.rand(19, 1, dtype=torch.float32)
+
+        actual = apply_vllm_moe_routing_weights(down_output, probs)
+        expected = (down_output.float() * probs).to(torch.bfloat16)
+
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
 class TestGroupedExpertsZeroActiveExperts:
@@ -1218,29 +1254,16 @@ class TestGroupedExpertsTE:
             dtype=torch.bfloat16,
         )
 
-    def _materialize_weights(self, experts, device):
+    def _materialize_weights(self, experts, device, params_dtype=None):
         """Materialize meta device weights to actual device."""
-        from transformer_engine.pytorch import GroupedLinear
-
         config = experts.config
-        gate_up_out_features = config.moe_inter_dim * 2 if experts.is_gated else config.moe_inter_dim
-        # Re-create on actual device
-        experts.gate_up_linear = GroupedLinear(
-            num_gemms=experts.num_local_experts,
-            in_features=config.dim,
-            out_features=gate_up_out_features,
-            bias=experts.expert_bias,
-            params_dtype=config.dtype,
-            device=device,
-        )
-        experts.down_linear = GroupedLinear(
-            num_gemms=experts.num_local_experts,
-            in_features=config.moe_inter_dim,
-            out_features=config.dim,
-            bias=experts.expert_bias,
-            params_dtype=config.dtype,
-            device=device,
-        )
+        params_dtype = params_dtype or config.dtype
+        original_dtype = config.dtype
+        config.dtype = params_dtype
+        try:
+            experts._make_grouped_linears(experts.num_local_experts, device=device)
+        finally:
+            config.dtype = original_dtype
 
     def test_grouped_experts_te_init(self, te_moe_config):
         """Test GroupedExpertsTE initialization."""
@@ -1320,6 +1343,147 @@ class TestGroupedExpertsTE:
         # Verify shapes match
         assert experts.gate_and_up_projs.shape == new_gate_up.shape
         assert experts.down_projs.shape == new_down.shape
+
+    def test_grouped_experts_te_virtual_tp_weight_roundtrip(self, te_moe_config):
+        """Virtual TP packs local w13/w2 shards without changing checkpoint layout."""
+        from nemo_automodel.components.moe.experts import GroupedExpertsTE
+
+        te_moe_config.fp8_row_parallel_size = 2
+        te_moe_config.__post_init__()
+        device = torch.device(f"cuda:{torch.cuda.current_device()}")
+        experts = GroupedExpertsTE(te_moe_config)
+        self._materialize_weights(experts, device)
+
+        gate_up = torch.randn(
+            te_moe_config.n_routed_experts,
+            te_moe_config.dim,
+            te_moe_config.moe_inter_dim * 2,
+            dtype=te_moe_config.dtype,
+            device=device,
+        )
+        down = torch.randn(
+            te_moe_config.n_routed_experts,
+            te_moe_config.moe_inter_dim,
+            te_moe_config.dim,
+            dtype=te_moe_config.dtype,
+            device=device,
+        )
+        experts.gate_and_up_projs = gate_up
+        experts.down_projs = down
+
+        assert experts.gate_up_linear.num_gemms == te_moe_config.n_routed_experts * 2
+        assert experts.gate_up_linear.weight0.shape == (
+            te_moe_config.moe_inter_dim,
+            te_moe_config.dim,
+        )
+        assert experts.down_linear.weight0.shape == (
+            te_moe_config.dim,
+            te_moe_config.moe_inter_dim // 2,
+        )
+        torch.testing.assert_close(experts.gate_and_up_projs, gate_up, rtol=0, atol=0)
+        torch.testing.assert_close(experts.down_projs, down, rtol=0, atol=0)
+
+        # DCP reaches this module through ``_load_from_state_dict`` rather than
+        # the logical property setters.  Exercise that exact path so full
+        # checkpoint loading also packs the logical expert weights into the
+        # virtual-TP GroupedLinear parameters.
+        reloaded = GroupedExpertsTE(te_moe_config)
+        self._materialize_weights(reloaded, device)
+        missing_keys = []
+        reloaded._load_from_state_dict(
+            {"gate_and_up_projs": gate_up, "down_projs": down},
+            "",
+            None,
+            True,
+            missing_keys,
+            [],
+            [],
+        )
+        assert missing_keys == []
+        torch.testing.assert_close(reloaded.gate_and_up_projs, gate_up, rtol=0, atol=0)
+        torch.testing.assert_close(reloaded.down_projs, down, rtol=0, atol=0)
+
+        dispatcher = Mock()
+        dispatcher.token_unpermutation.side_effect = lambda value: value
+        experts.token_dispatcher = dispatcher
+        partials = torch.randn(
+            3,
+            experts.fp8_row_parallel_size,
+            te_moe_config.dim,
+            dtype=te_moe_config.dtype,
+            device=device,
+        )
+        unpermuted = experts._unpermute_virtual_tp_partials(partials)
+        dispatcher.token_unpermutation.assert_called_once()
+        assert dispatcher.token_unpermutation.call_args.args[0].shape == (
+            3,
+            experts.fp8_row_parallel_size * te_moe_config.dim,
+        )
+        torch.testing.assert_close(unpermuted, partials, rtol=0, atol=0)
+
+        experts.dispatcher_backend = "hybridep"
+        dispatcher.reset_mock()
+        dispatcher.token_unpermutation_partitions.side_effect = lambda value: value
+        unpermuted = experts._unpermute_virtual_tp_partials(partials)
+        dispatcher.token_unpermutation.assert_not_called()
+        grouped_partials = dispatcher.token_unpermutation_partitions.call_args.args[0]
+        assert grouped_partials.shape == (
+            3,
+            experts.fp8_row_parallel_size // 2,
+            2 * te_moe_config.dim,
+        )
+        dispatcher.token_unpermutation_partitions.assert_called_once()
+        torch.testing.assert_close(unpermuted, partials, rtol=0, atol=0)
+
+        dispatcher.reset_mock()
+        route_to_token = torch.tensor([0, 0, 1, 1], device=device)
+
+        def combine_topk_partitions(value):
+            combined = torch.zeros(
+                2,
+                *value.shape[1:],
+                dtype=torch.float32,
+                device=value.device,
+            )
+            return combined.index_add(0, route_to_token, value.float()).to(value.dtype)
+
+        dispatcher.token_unpermutation_partitions.side_effect = combine_topk_partitions
+        topk_partials = torch.randn(
+            4,
+            experts.fp8_row_parallel_size,
+            te_moe_config.dim,
+            dtype=te_moe_config.dtype,
+            device=device,
+            requires_grad=True,
+        )
+        route_slots = torch.tensor([0, 1, 0, 1], device=device)
+        routing_weights = torch.tensor(
+            [[0.25, 0.75], [0.4, 0.6]],
+            dtype=torch.float32,
+            device=device,
+            requires_grad=True,
+        )
+        weighted = experts._unpermute_vllm_weighted_partials(
+            topk_partials,
+            route_slots,
+            routing_weights,
+        )
+        expected = torch.stack(
+            (
+                topk_partials[0].float() * routing_weights[0, 0] + topk_partials[1].float() * routing_weights[0, 1],
+                topk_partials[2].float() * routing_weights[1, 0] + topk_partials[3].float() * routing_weights[1, 1],
+            )
+        ).to(te_moe_config.dtype)
+        torch.testing.assert_close(weighted, expected, rtol=0, atol=0)
+        grouped_topk = dispatcher.token_unpermutation_partitions.call_args.args[0]
+        assert grouped_topk.shape == (
+            4,
+            te_moe_config.n_activated_experts * experts.fp8_row_parallel_size // 2,
+            2 * te_moe_config.dim,
+        )
+        weighted.float().sum().backward()
+        assert topk_partials.grad is not None
+        assert routing_weights.grad is not None
 
     def test_grouped_experts_te_bias_properties(self, te_moe_config_with_bias):
         """Test bias property getters and setters."""
@@ -1935,7 +2099,8 @@ class TestGroupedExpertsTE:
             assert experts.gate_up_linear.out_features == config.moe_inter_dim
             assert experts.gate_up_linear.num_gemms == config.n_routed_experts // 2
 
-    def test_grouped_experts_te_zero_routed_tokens_grads_all_local_experts(self, te_moe_config):
+    @pytest.mark.parametrize("params_dtype", [torch.bfloat16, torch.float32])
+    def test_grouped_experts_te_zero_routed_tokens_grads_all_local_experts(self, te_moe_config, params_dtype):
         """All local expert params must get (zero) grads when no tokens are routed locally.
 
         Grouped GEMM produces explicit zero gradients for every local expert.
@@ -1948,7 +2113,7 @@ class TestGroupedExpertsTE:
 
         device = torch.device(f"cuda:{torch.cuda.current_device()}")
         experts = GroupedExpertsTE(te_moe_config)
-        self._materialize_weights(experts, device)
+        self._materialize_weights(experts, device, params_dtype=params_dtype)
 
         num_tokens = 4
         x = torch.randn(num_tokens, te_moe_config.dim, dtype=te_moe_config.dtype, device=device)
@@ -1967,6 +2132,8 @@ class TestGroupedExpertsTE:
         experts.ep_size = 1
 
         y = experts(x, token_mask, weights, indices)
+        assert y.shape == empty_hidden.shape
+        assert y.dtype == te_moe_config.dtype
         y.sum().backward()
 
         params = list(experts.gate_up_linear.parameters()) + list(experts.down_linear.parameters())

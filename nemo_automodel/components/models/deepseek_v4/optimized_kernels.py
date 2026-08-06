@@ -39,6 +39,7 @@ from typing import Literal
 
 import torch
 
+from nemo_automodel.components.models.deepseek_v4.fp8 import Dsv4Fp8Indexer
 from nemo_automodel.components.models.deepseek_v4.kernels._tilelang import HAS_TILELANG
 from nemo_automodel.shared.import_utils import safe_import_from
 
@@ -72,10 +73,20 @@ _HAS_MILES_SPARSE_ATTN_CHUNKED, _miles_sparse_attn_tilelang_head_chunked = safe_
     msg="Vendored Miles DeepSeek V4 chunked sparse attention is unavailable. Install tilelang to use "
     "backend.attn='tilelang'.",
 )
+_HAS_DSV4_FP8_SPARSE_ATTN, _dsv4_fp8_sparse_attn_tilelang = safe_import_from(
+    "nemo_automodel.components.models.deepseek_v4.kernels.sparse_attention",
+    "sparse_attn_fp8_tilelang",
+    msg="DeepSeek V4 FP8 KV sparse attention is unavailable. Install TileLang to use kv_cache_dtype='fp8_ds_mla'.",
+)
 _HAS_MILES_INDEXER, _miles_batched_indexer_fwd = safe_import_from(
     "nemo_automodel.components.models.deepseek_v4.kernels.tilelang_indexer_fwd",
     "batched_indexer_fwd",
     msg="Vendored Miles DeepSeek V4 indexer is unavailable. Install tilelang to use backend.attn='tilelang'.",
+)
+_HAS_DSV4_FP8_INDEXER, _dsv4_batched_fp8_indexer_fwd = safe_import_from(
+    "nemo_automodel.components.models.deepseek_v4.kernels.tilelang_fp8_indexer_fwd",
+    "batched_indexer_fp8_fwd",
+    msg="DeepSeek V4 true-FP8 indexer is unavailable. Install tilelang to use the vLLM 0.21 Q/K boundary.",
 )
 _HAS_MILES_CU_SEQLENS, _miles_make_causal_cu_seqlens = safe_import_from(
     "nemo_automodel.components.models.deepseek_v4.kernels.tilelang_indexer_fwd",
@@ -365,6 +376,49 @@ def dsv4_sparse_attention(
     return sparse_attention_torch(q, kv, sinks, topk_idxs.long(), sm_scale)
 
 
+def dsv4_fp8_sparse_attention(
+    q: torch.Tensor,
+    kv,
+    sinks: torch.Tensor,
+    topk_idxs: torch.Tensor,
+    sm_scale: float,
+) -> torch.Tensor:
+    """Run sparse attention directly from a :class:`Dsv4Fp8KV` payload."""
+    if not (HAS_TILELANG and _HAS_DSV4_FP8_SPARSE_ATTN):
+        raise RuntimeError("DSV4 FP8 KV sparse attention requires TileLang")
+    if not q.is_cuda or q.dtype != torch.bfloat16:
+        raise RuntimeError("DSV4 FP8 KV sparse attention requires CUDA BF16 queries")
+    q = q.contiguous()
+    sinks = sinks.float().contiguous()
+    topk_idxs = topk_idxs.to(torch.int32).contiguous()
+    if kv.shape[1] == 0:
+        # A short sequence can produce no pooled KV tokens in a high
+        # compress-ratio layer. The attention distribution then contains only
+        # the learned sink, whose value is zero, so the exact output and all
+        # input gradients are zero. Avoid launching TileLang with empty KV
+        # storage (and keep all differentiable inputs connected to autograd).
+        zero = kv.anchor.sum().to(q.dtype) * 0 + sinks.sum().to(q.dtype) * 0
+        return q * 0 + zero
+    original_heads = q.shape[2]
+    if original_heads < 16:
+        head_pad = 16 - original_heads
+        q = torch.cat([q, q.new_zeros(*q.shape[:2], head_pad, q.shape[3])], dim=2).contiguous()
+        sinks = torch.cat([sinks, sinks.new_zeros(head_pad)], dim=0).contiguous()
+    max_heads_per_kernel = 16
+    output = _dsv4_fp8_sparse_attn_tilelang(
+        q,
+        kv.anchor,
+        kv.nope.contiguous(),
+        kv.rope.contiguous(),
+        kv.scales.contiguous(),
+        sinks,
+        topk_idxs,
+        max_heads_per_kernel,
+        sm_scale,
+    )
+    return output[:, :, :original_heads, :]
+
+
 def indexer_scores_torch(
     q: torch.Tensor,
     pooled_kv: torch.Tensor,
@@ -386,8 +440,8 @@ def extract_indexer_topk_scores_torch(logits: torch.Tensor, topk_indices: torch.
 
 
 def dsv4_indexer_scores(
-    q: torch.Tensor,
-    pooled_kv: torch.Tensor,
+    q: torch.Tensor | Dsv4Fp8Indexer,
+    pooled_kv: torch.Tensor | Dsv4Fp8Indexer,
     weights: torch.Tensor,
     *,
     compress_ratio: int,
@@ -397,6 +451,42 @@ def dsv4_indexer_scores(
     query_total_len: int | None = None,
 ) -> torch.Tensor:
     """Run DSV4 C4 indexer scores through Miles TileLang kernels or torch fallback."""
+    if isinstance(q, Dsv4Fp8Indexer) or isinstance(pooled_kv, Dsv4Fp8Indexer):
+        if not isinstance(q, Dsv4Fp8Indexer) or not isinstance(pooled_kv, Dsv4Fp8Indexer):
+            raise TypeError("DSV4 indexer Q and K must use the same precision boundary")
+        if backend != "tilelang" or not (
+            _HAS_DSV4_FP8_INDEXER and q.device.type == "cuda" and pooled_kv.device.type == "cuda"
+        ):
+            if backend == "tilelang":
+                raise RuntimeError("DSV4 true-FP8 indexer TileLang kernel is unavailable")
+            return indexer_scores_torch(q.dequantize(), pooled_kv.dequantize(), weights, softmax_scale)
+
+        seq_len = q.shape[1]
+        seq_len_kv = pooled_kv.shape[1]
+        query_total_len = seq_len if query_total_len is None else query_total_len
+        cu_ks, cu_ke = _miles_make_causal_cu_seqlens(
+            query_total_len,
+            seq_len_kv,
+            compress_ratio,
+            q.device,
+        )
+        if query_start or query_total_len != seq_len:
+            cu_ks = cu_ks[query_start : query_start + seq_len]
+            cu_ke = cu_ke[query_start : query_start + seq_len]
+        return _dsv4_batched_fp8_indexer_fwd(
+            (
+                q.values.transpose(0, 1).contiguous(),
+                q.scales.transpose(0, 1).contiguous(),
+            ),
+            (
+                pooled_kv.values.transpose(0, 1).contiguous(),
+                pooled_kv.scales.transpose(0, 1).contiguous(),
+            ),
+            (weights * softmax_scale).transpose(0, 1).contiguous(),
+            cu_ks,
+            cu_ke,
+        )
+
     if _should_use_tilelang(
         backend,
         available=_HAS_MILES_INDEXER and _HAS_MILES_CU_SEQLENS,

@@ -98,6 +98,64 @@ def is_tensor_unallocated(tensor: torch.Tensor) -> bool:
         return True
 
 
+def _te_module_autocast(module: nn.Module, inp: torch.Tensor):
+    """Locally enable native AMP when TE sees fp32 masters and bf16 activations.
+
+    FSDP2 may expose an original fp32 parameter object to Transformer Engine
+    while using bf16 for forward compute. TE requires native AMP in that case;
+    applying it around the whole model would also downcast reference-sensitive
+    fp32 modules such as MoE routers. Keep the context on the TE GEMM only.
+    """
+    if not inp.is_cuda or torch.is_autocast_enabled() or inp.dtype not in (torch.float16, torch.bfloat16):
+        return nullcontext()
+
+    has_mismatched_param = any(
+        param is not None and torch.is_floating_point(param) and param.dtype != inp.dtype
+        for param in module.parameters()
+    )
+    if not has_mismatched_param:
+        return nullcontext()
+    return torch.autocast(device_type="cuda", dtype=inp.dtype)
+
+
+def _pad_te_fp8_linear_input(inp: torch.Tensor, *, fp8_enabled: bool | None = None):
+    """Pad TE Linear's flattened M dimension to the block-FP8 alignment."""
+    if fp8_enabled is None:
+        from transformer_engine.pytorch.quantization import FP8GlobalStateManager
+
+        fp8_enabled = FP8GlobalStateManager.is_fp8_enabled()
+    if not fp8_enabled or inp.ndim < 2:
+        return inp, None
+
+    rows = inp.numel() // inp.shape[-1]
+    # NVTE block-scaling wgrad GEMMs require the flattened token dimension
+    # (which becomes a leading dimension for the transposed operand) to be a
+    # multiple of 16. Forward can accept some 8-aligned shapes, so padding to
+    # only 8 may pass inference and fail later in ``Linear.backward``.
+    pad_rows = -rows % 16
+    if pad_rows == 0:
+        return inp, None
+
+    flat = inp.reshape(rows, inp.shape[-1])
+    padded = torch.cat((flat, flat.new_zeros((pad_rows, flat.shape[-1]))), dim=0)
+    return padded, (inp.shape[:-1], rows)
+
+
+def _restore_te_fp8_linear_output(output, pad_state):
+    """Remove rows added by :func:`_pad_te_fp8_linear_input`."""
+    if pad_state is None:
+        return output
+
+    leading_shape, rows = pad_state
+
+    def restore_tensor(tensor):
+        return tensor[:rows].reshape(*leading_shape, tensor.shape[-1])
+
+    if isinstance(output, tuple):
+        return (restore_tensor(output[0]), *output[1:])
+    return restore_tensor(output)
+
+
 @dataclass(kw_only=True)
 class TEFp8Config:
     """Configuration for Transformer Engine FP8 quantization.
@@ -522,12 +580,16 @@ def _make_lazy_te_patcher():
                 return torch.empty(out_shape, dtype=x.dtype, device=x.device)
             if is_first_microbatch is None:
                 is_first_microbatch = get_is_first_microbatch()
-            return _original_linear_forward(self, x, is_first_microbatch=is_first_microbatch, **kwargs)
+            x, fp8_pad_state = _pad_te_fp8_linear_input(x)
+            with _te_module_autocast(self, x):
+                output = _original_linear_forward(self, x, is_first_microbatch=is_first_microbatch, **kwargs)
+            return _restore_te_fp8_linear_output(output, fp8_pad_state)
 
         def _patched_grouped_linear_forward(self, inp, m_splits, is_first_microbatch=None):
             if is_first_microbatch is None:
                 is_first_microbatch = get_is_first_microbatch()
-            return _original_grouped_linear_forward(self, inp, m_splits, is_first_microbatch=is_first_microbatch)
+            with _te_module_autocast(self, inp):
+                return _original_grouped_linear_forward(self, inp, m_splits, is_first_microbatch=is_first_microbatch)
 
         TERMSNorm.forward = _patched_rmsnorm_forward
         TELinear.forward = _patched_linear_forward
