@@ -129,6 +129,20 @@ def _install_torch_and_layers_stubs(monkeypatch):
     torch_stub.nn = nn_stub
     torch_stub.Tensor = Tensor
 
+    nn_attention_stub = types.ModuleType("torch.nn.attention")
+
+    class SDPBackend:
+        FLASH_ATTENTION = object()
+        EFFICIENT_ATTENTION = object()
+        CUDNN_ATTENTION = object()
+        MATH = object()
+
+    def sdpa_kernel(*args, **kwargs):
+        return nullcontext()
+
+    nn_attention_stub.SDPBackend = SDPBackend
+    nn_attention_stub.sdpa_kernel = sdpa_kernel
+
     # cuda submodule
     cuda_stub = types.ModuleType("torch.cuda")
 
@@ -270,6 +284,15 @@ def _install_torch_and_layers_stubs(monkeypatch):
     )
     torch_stub.ops = types.SimpleNamespace(aten=aten)
 
+    torch_stub.backends = types.SimpleNamespace(
+        cuda=types.SimpleNamespace(
+            flash_sdp_enabled=lambda: True,
+            mem_efficient_sdp_enabled=lambda: False,
+            cudnn_sdp_enabled=lambda: False,
+            math_sdp_enabled=lambda: True,
+        )
+    )
+
     # dtype and device classes for type annotations
     class dtype:
         pass
@@ -291,6 +314,7 @@ def _install_torch_and_layers_stubs(monkeypatch):
     # register into sys.modules via monkeypatch
     monkeypatch.setitem(sys.modules, "torch", torch_stub)
     monkeypatch.setitem(sys.modules, "torch.nn", nn_stub)
+    monkeypatch.setitem(sys.modules, "torch.nn.attention", nn_attention_stub)
     monkeypatch.setitem(sys.modules, "torch.cuda", cuda_stub)
     monkeypatch.setitem(sys.modules, "torch.distributed", dist_stub)
     monkeypatch.setitem(sys.modules, "torch.distributed.device_mesh", device_mesh_stub)

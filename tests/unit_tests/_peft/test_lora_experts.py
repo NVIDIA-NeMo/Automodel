@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -34,7 +35,9 @@ from nemo_automodel.components._peft.lora import PeftConfig, apply_lora_to_linea
 from nemo_automodel.components._peft.lora_experts import (
     GroupedExpertsDeepEPLoRA,
     GroupedExpertsLoRA,
+    _needs_lora_rank_padding_for_grouped_mm,
     _pad_lora_rank_for_grouped_mm,
+    _use_grouped_gemm_for_lora,
 )
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.layers import GroupedExperts, GroupedExpertsDeepEP, GroupedExpertsTE
@@ -194,6 +197,46 @@ def test_grouped_experts_deepep_lora_preserves_dispatcher_settings(moe_config):
     assert lora_experts.use_mxfp8 is True
 
 
+def test_deepep_lora_nonempty_branch_uses_permuted_token_shape(moe_config):
+    """DeepEP LoRA should not branch on token-count reductions before grouped GEMMs."""
+    orig_experts = GroupedExpertsDeepEP(moe_config)
+    with torch.no_grad():
+        orig_experts.init_weights(torch.device("cpu"))
+    orig_experts.n_routed_experts = 4
+    orig_experts.ep_size = 1
+    orig_experts.use_torch_mm = False
+
+    lora_module = GroupedExpertsDeepEPLoRA(orig_experts, lora_dim=4)
+
+    num_tokens = 3
+    permuted_x = torch.randn(num_tokens, 16)
+    permuted_probs = torch.ones(num_tokens)
+    tokens_per_expert = torch.zeros(4, dtype=torch.long)
+
+    mock_dispatcher = MockDeepEPDispatcher()
+    mock_dispatcher.token_permutation2 = MagicMock(return_value=(permuted_x, tokens_per_expert, permuted_probs))
+    mock_dispatcher.token_unpermutation = MagicMock(side_effect=lambda hidden_states: hidden_states)
+    lora_module.token_dispatcher = mock_dispatcher
+
+    fake_gmm = MagicMock(side_effect=lambda a, b, *_args, **_kwargs: torch.zeros(a.shape[0], b.shape[-1]))
+    x = torch.randn(num_tokens, 16)
+    weights = torch.ones(num_tokens, 1)
+    indices = torch.zeros(num_tokens, 1, dtype=torch.long)
+    token_mask = torch.ones(num_tokens, dtype=torch.bool)
+
+    with (
+        patch("nemo_automodel.components._peft.lora_experts.ops", SimpleNamespace(gmm=fake_gmm)),
+        patch(
+            "nemo_automodel.components._peft.lora_experts.torch.count_nonzero",
+            side_effect=AssertionError("count_nonzero should not decide whether routed tokens are present"),
+        ),
+    ):
+        out = lora_module(x, token_mask, weights, indices)
+
+    assert out.shape == (num_tokens, 16)
+    assert fake_gmm.call_count == 6
+
+
 def test_pad_lora_rank_for_grouped_mm_aligns_bf16_rank():
     """Test rank padding for torch._grouped_mm stride alignment."""
     lora_A = torch.randn(2, 16, 4, dtype=torch.bfloat16)
@@ -207,6 +250,150 @@ def test_pad_lora_rank_for_grouped_mm_aligns_bf16_rank():
     assert torch.equal(padded_B[:, :4], lora_B)
     assert torch.count_nonzero(padded_A[..., 4:]) == 0
     assert torch.count_nonzero(padded_B[:, 4:]) == 0
+
+
+def test_deepep_lora_torch_mm_uses_grouped_gemm_for_unaligned_bf16_lora_rank(moe_config):
+    """DeepEP LoRA should avoid per-forward padding when only the LoRA rank is unaligned."""
+    moe_config.dtype = torch.bfloat16
+    orig_experts = GroupedExpertsDeepEP(moe_config)
+    with torch.no_grad():
+        orig_experts.init_weights(torch.device("cpu"))
+    orig_experts.n_routed_experts = 4
+    orig_experts.ep_size = 1
+    orig_experts.use_torch_mm = True
+
+    lora_module = GroupedExpertsDeepEPLoRA(orig_experts, lora_dim=4).to(torch.bfloat16)
+
+    num_tokens = 3
+    permuted_x = torch.randn(num_tokens, 16, dtype=torch.bfloat16)
+    permuted_probs = torch.ones(num_tokens, dtype=torch.bfloat16)
+    tokens_per_expert = torch.tensor([num_tokens, 0, 0, 0], dtype=torch.long)
+
+    mock_dispatcher = MockDeepEPDispatcher()
+    mock_dispatcher.token_permutation2 = MagicMock(return_value=(permuted_x, tokens_per_expert, permuted_probs))
+    mock_dispatcher.token_unpermutation = MagicMock(side_effect=lambda hidden_states: hidden_states)
+    lora_module.token_dispatcher = mock_dispatcher
+
+    fake_torch_grouped_mm = MagicMock(
+        side_effect=lambda a, b, *_args, **_kwargs: torch.zeros(a.shape[0], b.shape[-1], dtype=a.dtype)
+    )
+    fake_gmm = MagicMock(
+        side_effect=lambda a, b, *_args, **_kwargs: torch.zeros(a.shape[0], b.shape[-1], dtype=a.dtype)
+    )
+    fake_grouped_mm_operand = MagicMock(side_effect=lambda proj, dtype: proj.to(dtype).contiguous())
+
+    x = torch.randn(num_tokens, 16, dtype=torch.bfloat16)
+    weights = torch.ones(num_tokens, 1, dtype=torch.bfloat16)
+    indices = torch.zeros(num_tokens, 1, dtype=torch.long)
+    token_mask = torch.ones(num_tokens, dtype=torch.bool)
+
+    with (
+        patch("nemo_automodel.components._peft.lora_experts.ops", SimpleNamespace(gmm=fake_gmm)),
+        patch("nemo_automodel.components._peft.lora_experts.torch._grouped_mm", fake_torch_grouped_mm, create=True),
+        patch("nemo_automodel.components._peft.lora_experts._to_grouped_mm_operand", fake_grouped_mm_operand),
+        patch(
+            "nemo_automodel.components._peft.lora_experts._pad_lora_rank_for_grouped_mm",
+            side_effect=AssertionError("unaligned LoRA rank should use grouped_gemm without padding"),
+        ),
+    ):
+        out = lora_module(x, token_mask, weights, indices)
+
+    assert out.shape == (num_tokens, 16)
+    assert fake_grouped_mm_operand.call_count == 2
+    assert fake_torch_grouped_mm.call_count == 2
+    assert fake_gmm.call_count == 4
+
+
+def test_deepep_lora_torch_mm_pads_aligned_lora_rank_without_grouped_gemm(moe_config):
+    """Aligned DeepEP LoRA ranks should stay entirely on torch._grouped_mm."""
+    moe_config.dtype = torch.bfloat16
+    orig_experts = GroupedExpertsDeepEP(moe_config)
+    with torch.no_grad():
+        orig_experts.init_weights(torch.device("cpu"))
+    orig_experts.n_routed_experts = 4
+    orig_experts.ep_size = 1
+    orig_experts.use_torch_mm = True
+
+    lora_module = GroupedExpertsDeepEPLoRA(orig_experts, lora_dim=8).to(torch.bfloat16)
+
+    num_tokens = 3
+    permuted_x = torch.randn(num_tokens, 16, dtype=torch.bfloat16)
+    permuted_probs = torch.ones(num_tokens, dtype=torch.bfloat16)
+    tokens_per_expert = torch.tensor([num_tokens, 0, 0, 0], dtype=torch.long)
+
+    mock_dispatcher = MockDeepEPDispatcher()
+    mock_dispatcher.token_permutation2 = MagicMock(return_value=(permuted_x, tokens_per_expert, permuted_probs))
+    mock_dispatcher.token_unpermutation = MagicMock(side_effect=lambda hidden_states: hidden_states)
+    lora_module.token_dispatcher = mock_dispatcher
+
+    fake_torch_grouped_mm = MagicMock(
+        side_effect=lambda a, b, *_args, **_kwargs: torch.zeros(a.shape[0], b.shape[-1], dtype=a.dtype)
+    )
+    fake_gmm = MagicMock(side_effect=AssertionError("aligned LoRA rank should stay on torch._grouped_mm"))
+
+    x = torch.randn(num_tokens, 16, dtype=torch.bfloat16)
+    weights = torch.ones(num_tokens, 1, dtype=torch.bfloat16)
+    indices = torch.zeros(num_tokens, 1, dtype=torch.long)
+    token_mask = torch.ones(num_tokens, dtype=torch.bool)
+
+    with (
+        patch("nemo_automodel.components._peft.lora_experts.ops", SimpleNamespace(gmm=fake_gmm)),
+        patch("nemo_automodel.components._peft.lora_experts.torch._grouped_mm", fake_torch_grouped_mm, create=True),
+    ):
+        out = lora_module(x, token_mask, weights, indices)
+
+    assert out.shape == (num_tokens, 16)
+    assert fake_torch_grouped_mm.call_count == 6
+
+
+def test_deepep_lora_grouped_gemm_path_skips_grouped_mm_operand_conversion(moe_config):
+    """DeepEP LoRA grouped_gemm path should not force grouped-mm layout conversion."""
+    orig_experts = GroupedExpertsDeepEP(moe_config)
+    with torch.no_grad():
+        orig_experts.init_weights(torch.device("cpu"))
+    orig_experts.n_routed_experts = 4
+    orig_experts.ep_size = 1
+    orig_experts.use_torch_mm = False
+
+    lora_module = GroupedExpertsDeepEPLoRA(orig_experts, lora_dim=4)
+
+    num_tokens = 3
+    permuted_x = torch.randn(num_tokens, 16)
+    permuted_probs = torch.ones(num_tokens)
+    tokens_per_expert = torch.tensor([num_tokens, 0, 0, 0], dtype=torch.long)
+
+    mock_dispatcher = MockDeepEPDispatcher()
+    mock_dispatcher.token_permutation2 = MagicMock(return_value=(permuted_x, tokens_per_expert, permuted_probs))
+    mock_dispatcher.token_unpermutation = MagicMock(side_effect=lambda hidden_states: hidden_states)
+    lora_module.token_dispatcher = mock_dispatcher
+
+    fake_gmm = MagicMock(side_effect=lambda a, b, *_args, **_kwargs: torch.zeros(a.shape[0], b.shape[-1]))
+    x = torch.randn(num_tokens, 16)
+    weights = torch.ones(num_tokens, 1)
+    indices = torch.zeros(num_tokens, 1, dtype=torch.long)
+    token_mask = torch.ones(num_tokens, dtype=torch.bool)
+
+    with (
+        patch("nemo_automodel.components._peft.lora_experts.ops", SimpleNamespace(gmm=fake_gmm)),
+        patch(
+            "nemo_automodel.components._peft.lora_experts._to_grouped_mm_operand",
+            side_effect=AssertionError("grouped_gemm path should not request grouped-mm operands"),
+        ),
+    ):
+        out = lora_module(x, token_mask, weights, indices)
+
+    assert out.shape == (num_tokens, 16)
+    assert fake_gmm.call_count == 6
+
+
+def test_unaligned_lora_rank_detection_uses_grouped_gemm_when_available():
+    """Rank 4 bf16 LoRA tensors need padding for torch._grouped_mm but not grouped_gemm."""
+    lora_A = torch.randn(2, 16, 4, dtype=torch.bfloat16)
+
+    assert _needs_lora_rank_padding_for_grouped_mm(lora_A)
+
+    with patch("nemo_automodel.components._peft.lora_experts.ops", SimpleNamespace(gmm=object())):
+        assert _use_grouped_gemm_for_lora(lora_A)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
