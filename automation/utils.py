@@ -130,19 +130,21 @@ def validate_args(args, add_args):
             raise ValueError('Additional CLI args can be used to provide the training args, but cannot be used in conjunction with --more_train_args is set.')
     # ToDo: How to check that train_scripts and eval_scripts are executable (chmod -R 777) 
 
-def draco(
+def cluster_executor(
     account: str = "nemotron_retriever_dev",
-    container_image: str = "/lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/03_sqsh/nvidia-nemo-automodel-26.04.00.sqsh",
+    container_image: str = "/lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/03_sqsh/nvidia-nemo-automodel-26.06.sqsh",
     partition: str = None,
     nodes: int=1,
     gpus_per_node: int = 8,
     time: str = "03:57:00",
     username: str = os.getenv("USER"),
+    job_dir: str = f"/lustre/fsw/portfolios/nemotron/projects/nemotron_retriever_dev/users/{os.getenv('USER')}/jobs",
+    ssh_host: str = "draco-oci-dc-02.draco-oci-iad.nvidia.com",
     dependency_type: str = "afterok",
     job_name_prefix: str = "",
     master_port: int = 29500,
     comment: str | None = None,
-) -> run.Config[run.Executor]:
+) -> run.SlurmExecutor:
     """
     Create a Slurm executor configuration for the DRACO cluster.
 
@@ -156,7 +158,7 @@ def draco(
         master_port (str): The port for torchrun rendezvous endpoint.
 
     Returns:
-        run.Config[run.SlurmExecutor]: The Slurm executor configuration for the DRACO cluster.
+        Slurm executor configuration for the DRACO cluster.
     """
     env_vars = {}
     env_vars['N_NODES'] = str(nodes)
@@ -165,10 +167,9 @@ def draco(
     env_vars['N_PROCESSES'] = str(nodes * gpus_per_node)
     env_vars["MASTER_ADDR"] = "$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n 1)"
     env_vars["MASTER_PORT"] = str(master_port)
-    
-    job_dir = f"/lustre/fsw/portfolios/nemotron/projects/nemotron_retriever_dev/users/{username}/jobs"
+        
     ssh_tunnel = run.SSHTunnel(
-        host="draco-oci-login-02.draco-oci-iad.nvidia.com",
+        host=ssh_host,
         user=username,
         job_dir=job_dir,
     )

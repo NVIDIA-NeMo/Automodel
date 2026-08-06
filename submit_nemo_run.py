@@ -20,7 +20,7 @@ from datetime import datetime
 
 import nemo_run as run
 
-from automation.utils import eval_datasets, draco, get_script, validate_args
+from automation.utils import cluster_executor, eval_datasets, get_script, validate_args
 from torchx.specs.api import AppState
 import csv
 import wandb
@@ -59,7 +59,13 @@ def get_args():
         '--container_image',
         type=str,
         help='Container used for training and evaluation',
-        default='/home/bschifferer/llm2/team_folder/03_sqsh/inform-python3.10-vidore-beir-flashattn-nemorun-ncclupdate.sqsh'
+        default='/lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/03_sqsh/nvidia-nemo-automodel-26.06.sqsh'
+    )
+    parser.add_argument(
+        '--job_dir',
+        type=str,
+        help='Directory for the job files to be rsynced to',
+        default=f"/lustre/fsw/portfolios/nemotron/projects/nemotron_retriever_dev/users/{os.getenv('USER')}/jobs",
     )
     parser.add_argument(
         '-ckpd', '--checkpoint_directory',
@@ -68,16 +74,23 @@ def get_args():
         default=None
     )
     parser.add_argument(
+        "--cluster",
+        type=str,
+        choices=("draco", "nrt"),
+        default=None,
+        help="Cluster used for Slurm execution",
+    )
+    parser.add_argument(
+        "--partition",
+        type=str,
+        default=None,
+        help="Slurm partition override",
+    )
+    parser.add_argument(
         '--account',
         type=str,
         help='Slurm account to use for the job',
         default='nemotron_retriever_dev',
-    )
-    parser.add_argument(
-        '--partition',
-        type=str,
-        help='Partition - e.g. interactive',
-        default="batch_block1,batch_block3,batch_block4"
     )
     parser.add_argument(
         '--num_nodes',
@@ -128,13 +141,11 @@ def get_args():
         help='Datasets to evaluate (can specify multiple datasets)',
         default=None
     )
-
     parser.add_argument(
         '--run_local',
         help='Run locally',
         action='store_true',
     )
-
     parser.add_argument(
         '-nt', '--no_append_timestamp',
         action='store_true',
@@ -248,7 +259,6 @@ def main():
     logger.info('User: ' + str(username))
     logger.info("########################## " + "args" + " #######################")
     logger.info(args)
-      
 
     if args.experiment_name is None:
         experiment_id = "train_model_experiment"
@@ -267,25 +277,42 @@ def main():
         train_executor = run.LocalExecutor()
         eval_executor = run.LocalExecutor()
     else:
-        train_executor = draco(
+        if args.cluster == "draco":
+            run_kwargs = {
+                "partition": "batch_block1,batch_block3,batch_block4",
+                "ssh_host": "draco-oci-dc-02.draco-oci-iad.nvidia.com",
+            }
+        elif args.cluster == "nrt":
+            run_kwargs = {
+                "partition": "batch_block1",
+                "ssh_host": "oci-nrt-cs-001-dc-02.nvidia.com",
+            }
+        else:
+            raise ValueError(f"Invalid cluster: {args.cluster}. Available clusters: draco, nrt. Please use --cluster to specify the cluster.")
+
+        if args.partition is not None:
+            run_kwargs["partition"] = args.partition
+
+        train_executor = cluster_executor(
             account=args.account,
-            container_image = args.container_image,
-            partition = args.partition,
-            nodes = int(args.num_nodes),        
+            container_image=args.container_image,
+            job_dir=args.job_dir,
+            nodes = int(args.num_nodes),
             dependency_type="afterany",
             job_name_prefix=experiment_id,
             gpus_per_node=0 if args.partition == "cpu" else 8,
             # comment=IDLE_REAPER_COMMENT,
+            **run_kwargs,
         )
-        eval_executor = draco(
+        eval_executor = cluster_executor(
             account=args.account,
-            container_image = args.container_image,
-            partition = args.partition,
-            nodes = 1,
+            container_image=args.container_image,
+            job_dir=args.job_dir,
+            nodes=1,
             job_name_prefix='e_' + experiment_id,
             # comment=IDLE_REAPER_COMMENT,
+            **run_kwargs,
         )
-    
     
     if args.checkpoint_directory is None:
         if isinstance(train_executor, run.SlurmExecutor):
