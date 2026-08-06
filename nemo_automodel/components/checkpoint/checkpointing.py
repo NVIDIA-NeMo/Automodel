@@ -14,10 +14,13 @@
 
 import gc
 import glob
+import json
 import logging
 import os
 import pickle
+import threading
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
@@ -66,6 +69,7 @@ from nemo_automodel.components.checkpoint.conversion_mapping import (
     get_combined_key_mapping,
     requires_tensor_merging,
 )
+from nemo_automodel.components.checkpoint.lifecycle import CheckpointLifecycle
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, OptimizerState
 from nemo_automodel.components.checkpoint.utils import (
     ensure_tied_lm_head,
@@ -76,6 +80,7 @@ from nemo_automodel.components.checkpoint.utils import (
     get_safetensors_index_total_size,
     get_tied_lm_head_source_names,
     get_world_size_safe,
+    is_cloud_path,
     is_rank_0,
     materialize_missing_tied_lm_head,
 )
@@ -225,11 +230,6 @@ def _apply_adapter_forced_dtype_mapping(
     return normalized
 
 
-def is_cloud_path(path: str) -> bool:
-    """Check if path is a cloud storage path (MSC)."""
-    return path.startswith("msc://")
-
-
 def _ensure_msc_available() -> None:
     """Raise an error if MSC is not installed but a cloud path is used."""
     if not MSC_AVAILABLE:
@@ -356,6 +356,22 @@ class _AsyncSaveContext:
     process_group: Any | None  # torch.distributed.ProcessGroup
     future: Any | None  # AsyncSaveResponse
     staging_active: bool = False
+
+
+class _ModelSavePlanner(dcp.DefaultSavePlanner):
+    """Keep model save plans in one checkpointer-scoped cache namespace."""
+
+    def __init__(self, cache_namespace: str) -> None:
+        super().__init__(enable_plan_caching=True)
+        self._cached_plans_key = f"{cache_namespace}:model"
+
+
+class _OptimizerSavePlanner(dcp.DefaultSavePlanner):
+    """Keep optimizer save plans in one checkpointer-scoped cache namespace."""
+
+    def __init__(self, cache_namespace: str) -> None:
+        super().__init__(enable_plan_caching=True)
+        self._cached_plans_key = f"{cache_namespace}:optimizer"
 
 
 def _new_gloo_process_group(
@@ -519,6 +535,8 @@ class Checkpointer:
         self.tp_rank = tp_rank
         self.pp_rank = pp_rank
         self.process_group = process_group
+        self.lifecycle = CheckpointLifecycle(config=config, process_group=process_group)
+        self._planner_cache_namespace = uuid.uuid4().hex
 
         # async specific variables
         self._model_ctx = _AsyncSaveContext(stager=None, process_group=None, future=None, staging_active=False)
@@ -529,7 +547,7 @@ class Checkpointer:
             self._optim_ctx.stager = DefaultStager()
             self._model_ctx.process_group = _new_gloo_process_group(process_group)
             self._optim_ctx.process_group = _new_gloo_process_group(process_group)
-        elif (
+        if (
             torch.distributed.is_initialized()
             and torch.distributed.get_world_size(group=process_group) > 1
             and _should_write_hf_metadata(self.config)
@@ -542,6 +560,8 @@ class Checkpointer:
                 process_group,
                 timeout=timedelta(minutes=self.config.consolidation_timeout_minutes),
             )
+        self._consolidation_thread: threading.Thread | None = None
+        self._consolidation_error: BaseException | None = None
 
         self._addons = []
         if _should_write_hf_metadata(self.config):
@@ -580,14 +600,19 @@ class Checkpointer:
         should_write_consolidated = _should_write_consolidated_safetensors(self.config, is_final_checkpoint)
         consolidated_dir = os.path.join(model_dir, "consolidated") if should_write_consolidated else None
         hf_metadata_dir = os.path.join(model_dir, ".hf_metadata") if _should_write_hf_metadata(self.config) else None
-        _ensure_dirs(model_dir, consolidated_dir, hf_metadata_dir, process_group=self.process_group)
+        _ensure_shared_dirs(model_dir, consolidated_dir, hf_metadata_dir, process_group=self.process_group)
 
         # Because this call lies outside of the dcp save call, we need to consolidate on all ranks on the main process
         # of all ranks, which lies on the critical path. Therefore, we can only do this outside of async mode.
+        # In async mode the same distributed consolidation is deferred to a background thread on every rank that
+        # waits for the async upload to finish, instead of the storage writer's single-rank finish() consolidation.
         # If single_rank_consolidation is set, we skip distributed consolidation and let rank 0 handle it
         # via the storage writer's finish() method - useful for Unity Catalog Volumes.
         consolidate_on_all_ranks = (
             should_write_consolidated and not self.config.is_async and not self.config.single_rank_consolidation
+        )
+        defer_consolidation = (
+            should_write_consolidated and self.config.is_async and not self.config.single_rank_consolidation
         )
         consolidation_process_group = (
             self._consolidation_process_group if self._consolidation_process_group is not None else self.process_group
@@ -639,7 +664,11 @@ class Checkpointer:
         self._maybe_write_offline_consolidation_script(model_dir)
 
         storage_writer = self._get_storage_writer(
-            consolidated_dir, fqn_to_file_index_mapping, fqn_to_dtype_mapping, model_dir, consolidate_on_all_ranks
+            consolidated_dir,
+            fqn_to_file_index_mapping,
+            fqn_to_dtype_mapping,
+            model_dir,
+            consolidate_on_all_ranks or defer_consolidation,
         )
         self._model_ctx.future = self._do_save(state_dict, model_dir, storage_writer)
 
@@ -666,6 +695,15 @@ class Checkpointer:
                     _maybe_rename_index_for_diffusers(consolidated_dir)
             if is_rank_0():
                 logger.info("Successfully exported consolidated HF safetensors to %s.", consolidated_dir)
+        elif defer_consolidation:
+            self._schedule_deferred_consolidation(
+                self._model_ctx.future,
+                model_dir,
+                consolidated_dir,
+                fqn_to_file_index_mapping,
+                fqn_to_dtype_mapping,
+                consolidation_process_group,
+            )
         self._maybe_log_final_offline_consolidation_hint(model_dir, is_final_checkpoint)
 
     @torch.no_grad()
@@ -690,7 +728,7 @@ class Checkpointer:
                 per-model-part optimizers.
         """
         optimizer_path = os.path.join(weights_path, "optim")
-        _ensure_dirs(optimizer_path, process_group=self.process_group)
+        _ensure_shared_dirs(optimizer_path, process_group=self.process_group)
         optimizer_state = OptimizerState(
             model,
             optimizer,
@@ -773,6 +811,7 @@ class Checkpointer:
             is_init_step=is_init_step,
             skip_task_head_prefixes=getattr(self.config, "skip_task_head_prefixes_for_base_model", None),
             cpu_offload=self.config.cpu_offload,
+            has_expert_parallelism=self.moe_mesh is not None,
         )
 
         # Check if this model requires tensor merging (e.g., Mixtral with grouped experts)
@@ -893,7 +932,9 @@ class Checkpointer:
         state_dict = _maybe_adapt_state_dict_to_hf(
             model_state.model[0],
             state_dict,
-            quantization=self.config.dequantize_base_checkpoint,
+            # Training checkpoints are saved from the dequantized native model.
+            # Only base-checkpoint initialization needs FP8 scale destinations.
+            quantization=bool(is_init_step and self.config.dequantize_base_checkpoint),
             device_mesh=self.moe_mesh,
         )
 
@@ -1082,16 +1123,22 @@ class Checkpointer:
         #   init.zeros_(module.weight[module.padding_idx]) on the embedding layer, which
         #   triggers DTensor redistribute and fails with sharded (TP) embeddings.
         # - NemotronHForCausalLM: the HF remote code's _init_weights uses dt_bias.copy_()
-        #   which fails with DTensors. This applies to:
-        #   - v2 (non-MoE, no n_routed_experts): always uses HF remote code.
-        #   - v3 (MoE, has n_routed_experts) with force_hf=True: also uses HF remote code
-        #     (detected via model.backbone attribute). When force_hf=False, v3 uses our custom
-        #     implementation (model.model with ModuleDict layers) which handles this correctly.
+        #   which fails with DTensors. This applies to the HF-remote-code path only
+        #   (detected via the model.backbone attribute), for both:
+        #   - dense/v2 (no n_routed_experts) under force_hf=True, and
+        #   - v3 (MoE, has n_routed_experts) under force_hf=True.
+        #   With force_hf=False, both dense and v3 use our custom implementation
+        #   (model.model with ModuleDict layers), which runs its own initialize_weights
+        #   correctly, so the skip must NOT apply there.
         try:
             model_class = model.config.architectures[0]
         except Exception:
             model_class = ""
-        is_nemotron_v2 = model_class == "NemotronHForCausalLM" and not getattr(model.config, "n_routed_experts", None)
+        is_nemotron_v2 = (
+            model_class == "NemotronHForCausalLM"
+            and not getattr(model.config, "n_routed_experts", None)
+            and hasattr(model, "backbone")  # HF remote-code path only; custom dense runs its own init
+        )
         is_nemotron_v3_hf = (
             model_class == "NemotronHForCausalLM"
             and getattr(model.config, "n_routed_experts", None)  # is Nemotron V3
@@ -1218,14 +1265,89 @@ class Checkpointer:
 
     def async_wait(self) -> None:
         """
-        Wait for the async save to finish.
+        Wait for the async save (and any deferred consolidation) to finish.
         """
         if self._model_ctx.future is not None:
             self._model_ctx.future.upload_completion.result()
             self._model_ctx.future = None
+            self._release_async_stager(self._model_ctx)
         if self._optim_ctx.future is not None:
             self._optim_ctx.future.upload_completion.result()
             self._optim_ctx.future = None
+            self._release_async_stager(self._optim_ctx)
+        self._join_deferred_consolidation()
+
+    @staticmethod
+    def _release_async_stager(context: _AsyncSaveContext) -> None:
+        """Close a completed async stager so the next save uses a fresh instance."""
+        if context.stager is not None:
+            context.stager.close()
+            context.stager = None
+
+    def _schedule_deferred_consolidation(
+        self,
+        future: "AsyncSaveResponse | None",
+        model_dir: str,
+        consolidated_dir: str,
+        fqn_to_index_mapping: dict[str, int] | None,
+        fqn_to_dtype_mapping: dict[str, str] | None,
+        process_group: "torch.distributed.ProcessGroup | None",
+    ) -> None:
+        """
+        Consolidate HF safetensors on a background thread once the async upload completes.
+
+        Every rank schedules the same distributed consolidation used in sync mode, so the
+        shards written by the async save are merged in parallel across ranks without
+        blocking the training loop. Collectives inside the consolidation run on the
+        dedicated Gloo group created at init.
+
+        Args:
+            future: Async save response whose ``upload_completion`` gates the consolidation.
+            model_dir: Directory holding the sharded safetensors written by the async save.
+            consolidated_dir: Output directory for the consolidated HF safetensors.
+            fqn_to_index_mapping: Mapping from tensor FQN to consolidated output file index.
+            fqn_to_dtype_mapping: Optional mapping from tensor FQN to original HF dtype string.
+            process_group: Group the consolidation collectives run on; the same one the
+                synchronous path and the save addons use.
+        """
+        self._join_deferred_consolidation()
+
+        def _consolidate() -> None:
+            try:
+                if future is not None:
+                    future.upload_completion.result()
+                consolidate_safetensors_files_on_every_rank(
+                    input_dir=model_dir,
+                    output_dir=consolidated_dir,
+                    fqn_to_index_mapping=fqn_to_index_mapping,
+                    num_threads=5,
+                    use_staging=self.config.staging_dir is not None,
+                    staging_dir=self.config.staging_dir,
+                    fqn_to_dtype_mapping=fqn_to_dtype_mapping,
+                    process_group=process_group,
+                )
+                if self.config.diffusers_compatible and is_rank_0():
+                    _maybe_rename_index_for_diffusers(consolidated_dir)
+                if is_rank_0():
+                    logger.info("Successfully exported consolidated HF safetensors to %s.", consolidated_dir)
+            except BaseException as e:  # noqa: B036 - re-raised on the main thread in async_wait
+                self._consolidation_error = e
+
+        self._consolidation_thread = threading.Thread(
+            target=_consolidate, name="hf-safetensors-consolidation", daemon=True
+        )
+        self._consolidation_thread.start()
+
+    def _join_deferred_consolidation(self) -> None:
+        """Wait for a pending background consolidation and surface its error, if any."""
+        thread = self._consolidation_thread
+        if thread is not None:
+            thread.join()
+            self._consolidation_thread = None
+        if self._consolidation_error is not None:
+            error = self._consolidation_error
+            self._consolidation_error = None
+            raise error
 
     def save_on_dp_ranks(self, state: Any, state_name: str, path: str) -> None:
         """
@@ -1271,7 +1393,7 @@ class Checkpointer:
         DTensor metadata and writes all shards correctly.
         """
         state_dir = os.path.join(path, state_name)
-        _ensure_dirs(state_dir, process_group=self.process_group)
+        _ensure_shared_dirs(state_dir, process_group=self.process_group)
         state_dict = state.state_dict()
         planner = dcp.DefaultSavePlanner(enable_plan_caching=True)
         process_group = getattr(self, "process_group", None)
@@ -1307,6 +1429,15 @@ class Checkpointer:
             if consolidation_process_group is not None:
                 torch.distributed.destroy_process_group(consolidation_process_group)
 
+    def finalize(self) -> None:
+        """Publish any final async checkpoint and close owned resources."""
+        try:
+            if self.config.enabled:
+                self.async_wait()
+                self.lifecycle.complete_pending()
+        finally:
+            self.close()
+
     def _do_load(
         self,
         state_dict: dict[str, torch.Tensor],
@@ -1326,8 +1457,8 @@ class Checkpointer:
         Returns:
             The populated state dictionary (may be replaced for PEFT).
         """
-        # Both model and optimizer saving is done in this function
-        is_model = True if "/model" in path else False
+        # Both model and optimizer loading is done in this function.
+        is_model = _is_model_checkpoint_path(path)
         # PEFT loading is broadcasted from rank0 so it is a special case
         if self.config.is_peft and is_model and (not is_init_step):
             state_dict = _load_safetensors(_adapter_path(path))
@@ -1355,8 +1486,8 @@ class Checkpointer:
         Returns:
             Optional Future object if async mode is enabled.
         """
-        # Both model and optimizer saving is done in this function
-        is_model = True if "/model" in path else False
+        # Both model and optimizer saving is done in this function.
+        is_model = _is_model_checkpoint_path(path)
         # PEFT saving is done on rank0 so it is a special case
         if self.config.is_peft and is_model:
             if not torch.distributed.is_initialized() or torch.distributed.get_rank(group=self.process_group) == 0:
@@ -1366,13 +1497,16 @@ class Checkpointer:
             return
 
         ret = None
-        planner = dcp.DefaultSavePlanner(enable_plan_caching=True)
+        planner_cls = _ModelSavePlanner if is_model else _OptimizerSavePlanner
+        planner = planner_cls(self._planner_cache_namespace)
 
         # Routes to MSC storage write for cloud paths
         storage_writer = _maybe_msc_writer(path, storage_writer)
 
         if self.config.is_async:
             ctx = self._model_ctx if is_model else self._optim_ctx
+            if ctx.stager is None:
+                ctx.stager = DefaultStager()
             ret = dcp.async_save(
                 state_dict,
                 checkpoint_id=path,
@@ -1602,7 +1736,7 @@ fi
         fqn_to_index_mapping: Optional[dict[str, int]],
         fqn_to_dtype_mapping: Optional[dict[str, str]],
         model_path: str,
-        consolidate_on_all_ranks: bool = False,
+        consolidation_handled_externally: bool = False,
     ) -> StorageWriter | None:
         """
         Construct a Hugging Face storage writer for sharded safetensors.
@@ -1612,7 +1746,9 @@ fi
             fqn_to_index_mapping: Optional mapping from FQN to shard index.
             fqn_to_dtype_mapping: Optional mapping from FQN to original HF safetensors dtype string.
             model_path: Path where the model checkpoint is saved.
-            consolidate_on_all_ranks: If True, consolidate on all ranks on the main process.
+            consolidation_handled_externally: If True, consolidation happens outside the writer
+                (inline on all ranks in sync mode, or on a background thread in async mode), so
+                the writer's own finish() consolidation is disabled.
 
         Returns:
             Configured storage writer or None for non-safetensors.
@@ -1621,7 +1757,7 @@ fi
             return _HuggingFaceStorageWriter(
                 path=model_path,
                 save_sharded=True,
-                consolidated_output_path=consolidated_output_path if not consolidate_on_all_ranks else None,
+                consolidated_output_path=consolidated_output_path if not consolidation_handled_externally else None,
                 fqn_to_index_mapping=fqn_to_index_mapping,
                 fqn_to_dtype_mapping=fqn_to_dtype_mapping,
                 staging_dir=self.config.staging_dir,
@@ -1802,6 +1938,38 @@ def save_config(config: dict[str, Any], weights_path: str) -> None:
             yaml.dump(config, f, sort_keys=False, default_flow_style=False)
 
 
+def save_losses(losses: dict[str, Any], weights_path: str) -> None:
+    """Write checkpoint loss metadata to ``weights_path/losses.json``.
+
+    Mirrors :func:`save_config` so the file lands in the checkpoint directory for
+    both local and ``msc://`` roots. Every failure is logged rather than raised,
+    including a missing ``multistorageclient``: this is metadata written on rank 0
+    only, so raising would strand the other ranks in the next collective.
+
+    Args:
+        losses: Loss values to record. Values must be JSON-serializable.
+        weights_path: Checkpoint directory.
+    """
+    losses_path = os.path.join(weights_path, "losses.json")
+    try:
+        if is_cloud_path(weights_path):
+            _ensure_msc_available()
+            with msc.open(losses_path, "w") as f:
+                json.dump(losses, f)
+        else:
+            with open(losses_path, "w") as f:
+                json.dump(losses, f)
+    except (TypeError, ValueError, OSError, ImportError):
+        logger.warning("Failed to write checkpoint loss metadata to %s", losses_path, exc_info=True)
+
+
+def _create_dirs(*dirs: Optional[str]) -> None:
+    """Create local directory paths and ignore cloud paths."""
+    for directory in dirs:
+        if directory and not is_cloud_path(directory):
+            os.makedirs(directory, exist_ok=True)
+
+
 def _ensure_dirs(*dirs: Optional[str], process_group: torch.distributed.ProcessGroup | None = None) -> None:
     """
     Create directories on all ranks and synchronize across ranks.
@@ -1810,12 +1978,31 @@ def _ensure_dirs(*dirs: Optional[str], process_group: torch.distributed.ProcessG
         *dirs: One or more directory paths that should exist.
         process_group: Ranks that must observe the directories before continuing.
     """
-    for d in dirs:
-        if d:
-            if not is_cloud_path(d):
-                os.makedirs(d, exist_ok=True)
+    _create_dirs(*dirs)
     if torch.distributed.is_initialized():
         torch.distributed.barrier(group=process_group)
+
+
+def _ensure_shared_dirs(*dirs: Optional[str], process_group: torch.distributed.ProcessGroup | None = None) -> None:
+    """Create shared DCP directories on group rank zero and synchronize the group.
+
+    Unlike auxiliary per-rank state, DCP checkpoint directories must be visible
+    to every rank through the same filesystem.
+
+    Args:
+        *dirs: One or more shared directory paths that should exist.
+        process_group: Ranks that must observe the directories before continuing.
+    """
+    is_dist_initialized = torch.distributed.is_initialized()
+    if not is_dist_initialized or torch.distributed.get_rank(group=process_group) == 0:
+        _create_dirs(*dirs)
+    if is_dist_initialized:
+        torch.distributed.barrier(group=process_group)
+
+
+def _is_model_checkpoint_path(path: str) -> bool:
+    """Return whether a checkpoint path names the model directory."""
+    return Path(path.rstrip("/")).name == "model"
 
 
 def _init_peft_adapters(model: nn.Module, peft_init_method: str) -> None:

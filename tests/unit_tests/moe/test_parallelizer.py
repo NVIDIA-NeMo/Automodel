@@ -14,6 +14,7 @@
 
 import sys
 import types
+from contextlib import nullcontext
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -190,8 +191,13 @@ def _install_torch_and_layers_stubs(monkeypatch):
         def __init__(self, *args, **kwargs):
             pass
 
+    class Replicate:
+        def __init__(self, *args, **kwargs):
+            pass
+
     tensor_stub.distribute_module = distribute_module
     tensor_stub.distribute_tensor = distribute_tensor
+    tensor_stub.Replicate = Replicate
     tensor_stub.Shard = Shard
 
     # tensor.parallel
@@ -316,7 +322,11 @@ def _install_torch_and_layers_stubs(monkeypatch):
     class MoE:
         pass
 
+    class Gate:
+        pass
+
     layers_stub.GroupedExpertsDeepEP = GroupedExpertsDeepEP
+    layers_stub.Gate = Gate
     layers_stub.MoE = MoE
     monkeypatch.setitem(sys.modules, "nemo_automodel.components.moe.layers", layers_stub)
 
@@ -343,6 +353,7 @@ def _import_parallelizer_with_stubs(monkeypatch):
         "nemo_automodel.components.distributed.pipelining.config",
         "nemo_automodel.components.distributed.pipelining.hf_utils",
         "nemo_automodel.components.distributed.mesh_utils",
+        "nemo_automodel.components.distributed.parallelizer_utils",
     ]:
         if mod in sys.modules:
             sys.modules.pop(mod)
@@ -353,7 +364,9 @@ def _import_parallelizer_with_stubs(monkeypatch):
     distributed_stub = types.ModuleType("nemo_automodel.components.distributed")
     distributed_stub.__path__ = []
     config_stub = types.ModuleType("nemo_automodel.components.distributed.config")
-    config_stub.normalize_activation_checkpointing_scope = lambda scope: (scope,) if isinstance(scope, str) else tuple(scope)
+    config_stub.normalize_activation_checkpointing_scope = lambda scope: (
+        (scope,) if isinstance(scope, str) else tuple(scope)
+    )
     pipelining_stub = types.ModuleType("nemo_automodel.components.distributed.pipelining")
     pipelining_stub.__path__ = []
     pipelining_config_stub = types.ModuleType("nemo_automodel.components.distributed.pipelining.config")
@@ -384,10 +397,69 @@ def _import_parallelizer_with_stubs(monkeypatch):
     mesh_utils_stub.get_fsdp_dp_mesh = lambda mesh, *_axis_names: mesh[("dp_replicate", "dp_shard_cp")]
     monkeypatch.setitem(sys.modules, "nemo_automodel.components.distributed.mesh_utils", mesh_utils_stub)
 
+    parallelizer_utils_stub = types.ModuleType("nemo_automodel.components.distributed.parallelizer_utils")
+
+    def fully_shard_by_dtype(
+        module,
+        *,
+        mesh,
+        mp_policy,
+        offload_policy,
+        fp32_compute_module_names=(),
+        reshard_after_forward=None,
+        ignored_params=None,
+        fully_shard_fn=None,
+    ):
+        kwargs = {
+            "mesh": mesh,
+            "mp_policy": mp_policy,
+            "offload_policy": offload_policy,
+        }
+        if reshard_after_forward is not None:
+            kwargs["reshard_after_forward"] = reshard_after_forward
+        if ignored_params:
+            kwargs["ignored_params"] = ignored_params
+        fully_shard_fn(module, **kwargs)
+
+    parallelizer_utils_stub.fully_shard_by_dtype = fully_shard_by_dtype
+    monkeypatch.setitem(
+        sys.modules,
+        "nemo_automodel.components.distributed.parallelizer_utils",
+        parallelizer_utils_stub,
+    )
+    distributed_package = importlib.import_module("nemo_automodel.components.distributed")
+    monkeypatch.setattr(distributed_package, "parallelizer_utils", parallelizer_utils_stub, raising=False)
+
     # Stub dtype_from_str utility
     shared_utils_stub = types.ModuleType("nemo_automodel.shared.utils")
     shared_utils_stub.dtype_from_str = lambda val, default=None: default
     monkeypatch.setitem(sys.modules, "nemo_automodel.shared.utils", shared_utils_stub)
+
+    tied_weights_stub = types.ModuleType("nemo_automodel.shared.tied_weights")
+    tied_weights_stub.ensure_tied_lm_head = lambda model: None
+    monkeypatch.setitem(sys.modules, "nemo_automodel.shared.tied_weights", tied_weights_stub)
+
+    activation_checkpointing_stub = types.ModuleType("nemo_automodel.components.distributed.activation_checkpointing")
+    activation_checkpointing_stub.ensure_fsdp_ops_sac_ignored = lambda: None
+    activation_checkpointing_stub.ensure_profiler_ops_sac_ignored = lambda: None
+    activation_checkpointing_stub.transformer_engine_attention_backend_snapshot_context_fn = (
+        lambda context_fn=None: context_fn() if context_fn is not None else (nullcontext(), nullcontext())
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "nemo_automodel.components.distributed.activation_checkpointing",
+        activation_checkpointing_stub,
+    )
+
+    distributed_config_stub = types.ModuleType("nemo_automodel.components.distributed.config")
+    distributed_config_stub.normalize_activation_checkpointing_scope = lambda value: (
+        (value,) if isinstance(value, str) else tuple(value or ("all",))
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "nemo_automodel.components.distributed.config",
+        distributed_config_stub,
+    )
 
     parallel_styles_stub = types.ModuleType("nemo_automodel.components.distributed.parallel_styles")
     parallel_styles_stub.translate_to_lora = lambda style: style
@@ -595,9 +667,10 @@ def test_apply_ac_wraps_blocks_with_and_without_context(monkeypatch):
     model.layers.registered.clear()
 
     P.apply_ac(model, ignore_router=False, hidden_size=7168, num_experts=256)
-    # context_fn should not be passed (3rd arg remains default None)
+    # Router replay does not need a selective policy, but TE attention still
+    # receives a context that preserves its forward-time backend cache.
     for _, kwargs in wrapper_mock.call_args_list:
-        assert "context_fn" not in kwargs or kwargs["context_fn"] is None
+        assert callable(kwargs["context_fn"])
     assert len(model.layers.registered) == 2
 
 
@@ -703,6 +776,9 @@ def test_apply_fsdp_calls_with_ignored_params_and_shard_for_experts(monkeypatch)
     fully_shard_mock = MagicMock()
     mp_policy_mock = MagicMock(return_value="MP_POLICY")
     shard_sentinel = object()
+    replicate_sentinel = object()
+    correction_bias = object()
+    distributed_correction_bias = object()
 
     def fake_shard(dim):
         assert dim == 1
@@ -710,15 +786,20 @@ def test_apply_fsdp_calls_with_ignored_params_and_shard_for_experts(monkeypatch)
 
     monkeypatch.setattr(P, "fully_shard", fully_shard_mock)
     monkeypatch.setattr(P, "MixedPrecisionPolicy", mp_policy_mock)
+    monkeypatch.setattr(P, "Replicate", MagicMock(return_value=replicate_sentinel))
     monkeypatch.setattr(P, "Shard", fake_shard)
+    distribute_tensor_mock = MagicMock(return_value=distributed_correction_bias)
+    monkeypatch.setattr(P, "distribute_tensor", distribute_tensor_mock)
 
     block = DummyBlock(mlp=DummyMoE())
+    block.mlp.gate = P.Gate()
+    block.mlp.gate.e_score_correction_bias = correction_bias
     embed = object()
     embed_norm = object()
     lm = object()
     model = DummyModel([block], embed_tokens=embed, embed_norm=embed_norm, lm_head=lm)
 
-    fsdp_mesh = type("Mesh", (), {"size": lambda self: 2})()
+    fsdp_mesh = type("Mesh", (), {"ndim": 1, "size": lambda self: 2})()
     ep_shard_mesh = type("Mesh", (), {"size": lambda self: 2})()
     offload_policy = object()
 
@@ -730,6 +811,13 @@ def test_apply_fsdp_calls_with_ignored_params_and_shard_for_experts(monkeypatch)
         ep_shard_mesh=ep_shard_mesh,
         offload_policy=offload_policy,
     )
+
+    distribute_tensor_mock.assert_called_once_with(
+        correction_bias,
+        device_mesh=fsdp_mesh,
+        placements=[replicate_sentinel],
+    )
+    assert block.mlp.gate.e_score_correction_bias is distributed_correction_bias
 
     # Experts should have a dedicated shard call
     experts = block.mlp.experts
@@ -783,84 +871,45 @@ def test_apply_fsdp_installs_accumulated_grad_guard(monkeypatch):
     guard_mock.assert_called_once_with()
 
 
-def test_shard_fp32_param_holders_shards_each_holder(monkeypatch):
-    """``_shard_fp32_param_holders`` fully_shards each model-owned fp32 holder."""
-    P = _import_parallelizer_with_stubs(monkeypatch)
-
-    fully_shard_mock = MagicMock()
-    monkeypatch.setattr(P, "fully_shard", fully_shard_mock)
-
-    holder_param = object()
-
-    class Holder:
-        def parameters(self, recurse=False):
-            return iter([holder_param])
-
-    holder = Holder()
-    block = type(
-        "Block",
-        (),
-        {"named_modules": lambda self: iter([("", self), ("linear_attn._fp32_params", holder)])},
-    )()
-
-    mesh = object()
-    ignored = P._shard_fp32_param_holders(block, mesh, reshard_after_forward=False, offload_policy=None)
-
-    assert ignored == {holder_param}
-    holder_call = _find_call_by_first_arg(fully_shard_mock, holder)
-    assert holder_call is not None
-    _, kwargs = holder_call
-    assert kwargs["mesh"] is mesh
-    assert kwargs["reshard_after_forward"] is False
-
-
-def test_apply_fsdp_shards_model_owned_fp32_holders(monkeypatch):
-    """apply_fsdp shards each model-owned ``_fp32_params`` holder per block."""
+def test_apply_fsdp_routes_strict_fp32_contract_and_expert_exclusions_to_shared_sharder(monkeypatch):
+    """MoE uses the dense dtype-aware sharder with the model and EP contracts."""
     P = _import_parallelizer_with_stubs(monkeypatch)
     monkeypatch.setattr(P, "MoE", DummyMoE)
     fully_shard_mock = MagicMock()
     monkeypatch.setattr(P, "fully_shard", fully_shard_mock)
-    monkeypatch.setattr(P, "MixedPrecisionPolicy", MagicMock(return_value="FP32_MP"))
+    shared_sharder_mock = MagicMock()
+    monkeypatch.setattr(P.parallelizer_utils, "fully_shard_by_dtype", shared_sharder_mock)
 
-    holder_param = object()
-
-    class Holder:
-        def parameters(self, recurse=False):
-            return iter([holder_param])
-
-    holder = Holder()
-
-    class BlockWithHolder:
-        def __init__(self):
-            self.mlp = DummyMoE()
-
-        def named_modules(self):
-            return iter([("", self), ("linear_attn._fp32_params", holder)])
-
-    block = BlockWithHolder()
+    block = DummyBlock(mlp=DummyMoE())
     model = DummyModel([block])
+    model._keep_in_fp32_modules_strict = ["mlp.gate.weight", "mlp.gate.e_score_correction_bias"]
     fsdp_mesh = object()
     mp_policy = MagicMock()
+    offload_policy = object()
 
     P.apply_fsdp(
         model=model,
         fsdp_mesh=fsdp_mesh,
-        ep_enabled=False,
+        ep_enabled=True,
         ep_shard_enabled=False,
-        ep_shard_mesh=None,
         mp_policy=mp_policy,
+        offload_policy=offload_policy,
+        reshard_after_forward=True,
     )
 
-    # The holder is sharded as its own fp32 unit before the block-level shard.
-    holder_call = _find_call_by_first_arg(fully_shard_mock, holder)
-    assert holder_call is not None
-    _, holder_kwargs = holder_call
-    assert holder_kwargs["mesh"] is fsdp_mesh
-    assert holder_kwargs["mp_policy"] == "FP32_MP"
-
-    block_call = _find_call_by_first_arg(fully_shard_mock, block)
-    assert block_call is not None
-    assert holder_param in block_call[1]["ignored_params"]
+    shared_sharder_mock.assert_called_once_with(
+        block,
+        mesh=fsdp_mesh,
+        mp_policy=mp_policy,
+        offload_policy=offload_policy,
+        fp32_compute_module_names=(
+            "mlp.gate.weight",
+            "mlp.gate.e_score_correction_bias",
+        ),
+        reshard_after_forward=True,
+        ignored_params=set(block.mlp.experts.parameters()),
+        fully_shard_fn=fully_shard_mock,
+    )
 
 
 def test_apply_fsdp_skips_separate_wrapping_for_tied_embeddings(monkeypatch):
@@ -2457,6 +2506,7 @@ def test_apply_ac_selective_wraps_blocks_with_shared_policy(monkeypatch):
     dense_stub = types.ModuleType("nemo_automodel.components.distributed.activation_checkpointing")
     dense_stub.make_selective_checkpoint_context_fn = MagicMock(return_value=sentinel_ctx)
     dense_stub.SELECTIVE_AC_WRAPPER_FLAG = sentinel_flag
+    dense_stub.transformer_engine_attention_backend_snapshot_context_fn = lambda context_fn=None: context_fn
     monkeypatch.setitem(sys.modules, "nemo_automodel.components.distributed.activation_checkpointing", dense_stub)
 
     wrapped = []
@@ -2467,7 +2517,8 @@ def test_apply_ac_selective_wraps_blocks_with_shared_policy(monkeypatch):
 
     def fake_wrapper(block, preserve_rng_state, context_fn=None):
         assert preserve_rng_state is True
-        assert context_fn is sentinel_ctx
+        assert callable(context_fn)
+        assert context_fn() is sentinel_ctx
         w = _Wrapper(block)
         wrapped.append(w)
         return w

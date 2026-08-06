@@ -107,14 +107,18 @@ class MoESplitExpertsStateDictMixin:
     ) -> None:
         """Validate that all required experts are available in the HF state dict before loading.
         Only validates experts needed for the current rank and layers present in the state dict.
+        Expert groups already loaded through registered in-place views validate the rank-local IDs recorded by
+        ``_split_experts_weights``, including when EP is disabled and no MoE mesh is passed to this method.
 
         Args:
-            hf_state_dict: HuggingFace format state dict
-            n_experts: Total number of experts
-            device_mesh: Optional device mesh for expert parallelism
+            hf_state_dict: HuggingFace state mapping. Expert gate/up values are tensors of shape
+                [expert_hidden, hidden], and down values have shape [hidden, expert_hidden]. This method validates
+                their keys only.
+            n_experts: Total number of experts.
+            device_mesh: Optional device mesh whose ``ep`` dimension partitions the experts axis.
 
         Raises:
-            RuntimeError: If required expert weights are missing from the checkpoint
+            RuntimeError: If required expert weights are missing from the checkpoint.
         """
         if device_mesh is not None:
             start_expert, end_expert = get_expert_range_for_rank_from_mesh(device_mesh, n_experts)
@@ -162,18 +166,24 @@ class MoESplitExpertsStateDictMixin:
 
         missing_weights = []
         projection_types = ["gate_proj", "up_proj", "down_proj"] if self._is_gated_moe else ["up_proj", "down_proj"]
+        inplace_loaded_keys: set[str] = getattr(self, "_inplace_loaded_native_keys", None) or set()
+        inplace_expert_ids = getattr(self, "_last_expert_ids", None) or required_experts
+        total_required = 0
 
         for layer_num, prefixes in layers_with_experts.items():
             for prefix in prefixes:
-                for expert_id in required_experts:
-                    for proj_type in projection_types:
+                for proj_type in projection_types:
+                    native_projection = "down_projs" if proj_type == "down_proj" else "gate_and_up_projs"
+                    native_key = f"{prefix}layers.{layer_num}.{expert_segment}.{native_projection}"
+                    experts_to_validate = inplace_expert_ids if native_key in inplace_loaded_keys else required_experts
+                    total_required += len(experts_to_validate)
+                    for expert_id in experts_to_validate:
                         expected_key = f"{prefix}layers.{layer_num}.{expert_segment}.{expert_id}.{proj_type}.weight"
                         if expected_key not in hf_state_dict:
                             missing_weights.append(expected_key)
 
         if missing_weights:
             missing_count = len(missing_weights)
-            total_required = len(required_experts) * len(layers_with_experts) * len(projection_types)
             raise RuntimeError(
                 f"Expert weights missing from checkpoint{rank_info}: {missing_count}/{total_required} required weights not found. "
                 f"Cannot load experts - checkpoint may be incomplete or corrupted. "
@@ -183,9 +193,16 @@ class MoESplitExpertsStateDictMixin:
             )
 
     def _split_experts_weights(self, weight: torch.Tensor, n_experts: int) -> list[torch.Tensor]:
-        """Split grouped expert weights into individual expert weights.
-        For grouped expert weights with shape [n_experts, ...], split into n_experts tensors each with shape [...].
-        Supports both regular tensors and DTensors.
+        """Split grouped expert weights into per-expert tensors.
+
+        Args:
+            weight: Tensor of shape [experts, ...], with arbitrary trailing dimensions. An EP DTensor uses an
+                ``ep`` mesh dimension. A non-EP DTensor may use any FSDP placement on a mesh without ``ep``.
+            n_experts: Global number of experts in ``weight``.
+
+        Returns:
+            Per-expert tensors of shape [...]. A DTensor sharded on the expert axis returns only the experts local
+            to this rank; other DTensors return every expert and preserve adjusted placements.
         """
         if is_dtensor(weight):
             split_weights, expert_ids = split_experts_weights_dtensor_aware(weight, n_experts)

@@ -18,6 +18,9 @@ set -euo pipefail
 #   CONFIG_PATH, TEST_LEVEL, NPROC_PER_NODE, TEST_NODE_COUNT,
 #   MASTER_ADDR, MASTER_PORT, SLURM_JOB_ID, PIPELINE_DIR, TEST_NAME
 
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+source "$SCRIPT_DIR/diffusion_finetune_recipe_config.sh"
+
 DATA_DIR="$PIPELINE_DIR/$TEST_NAME/data"
 CKPT_DIR="$PIPELINE_DIR/$TEST_NAME/checkpoint"
 INFER_DIR="$PIPELINE_DIR/$TEST_NAME/inference_output"
@@ -28,42 +31,7 @@ cd /opt/Automodel
 # Derive model-specific settings from config
 # ============================================
 RECIPE_NAME=$(basename "$CONFIG_PATH" .yaml)
-case "$RECIPE_NAME" in
-    wan2_1_t2v_flow*)
-        MEDIA_TYPE="video"
-        PROCESSOR="wan"
-        GENERATE_CONFIG="examples/diffusion/generate/configs/generate_wan.yaml"
-        MODEL_NAME="Wan-AI/Wan2.1-T2V-14B-Diffusers"
-        INFER_NUM_FRAMES=9
-        PREPROCESS_EXTRA_ARGS=""
-        ;;
-    hunyuan_t2v_flow*)
-        MEDIA_TYPE="video"
-        PROCESSOR="hunyuan"
-        GENERATE_CONFIG="examples/diffusion/generate/configs/generate_hunyuan.yaml"
-        MODEL_NAME="hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v"
-        INFER_NUM_FRAMES=5
-        PREPROCESS_EXTRA_ARGS="--target_frames 13"
-        ;;
-    flux_t2i_flow*)
-        MEDIA_TYPE="image"
-        PROCESSOR="flux"
-        GENERATE_CONFIG="examples/diffusion/generate/configs/generate_flux.yaml"
-        MODEL_NAME="black-forest-labs/FLUX.1-dev"
-        PREPROCESS_EXTRA_ARGS=""
-        ;;
-    qwen_image_t2i_flow*)
-        MEDIA_TYPE="image"
-        PROCESSOR="qwen_image"
-        GENERATE_CONFIG="examples/diffusion/generate/configs/generate_qwen_image.yaml"
-        MODEL_NAME="Qwen/Qwen-Image"
-        PREPROCESS_EXTRA_ARGS=""
-        ;;
-    *)
-        echo "ERROR: Unknown recipe '$RECIPE_NAME'. Add a case to diffusion_finetune_launcher.sh."
-        exit 1
-        ;;
-esac
+configure_diffusion_finetune_recipe "$RECIPE_NAME"
 
 # LoRA recipes are named *_lora.yaml — they save PEFT adapter artifacts
 # (adapter_model.safetensors + adapter_config.json) that generate.py loads via
