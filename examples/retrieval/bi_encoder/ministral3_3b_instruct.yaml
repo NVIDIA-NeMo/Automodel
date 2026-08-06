@@ -149,4 +149,17 @@ distributed:
 #   project: <your_wandb_project>
 #   entity: <your_wandb_entity>
 #   name: <your_wandb_exp_name>
-#   save_dir: <your_wandb_save_dir> 
+#   save_dir: <your_wandb_save_dir>
+
+ci:
+  recipe_owner: yuhez
+  time: "00:30:00"
+  nodes: 1
+  nproc_per_node: 2
+  nightly:
+    step_scheduler.max_steps: 10
+    step_scheduler.global_batch_size: 8
+    step_scheduler.local_batch_size: 1
+    step_scheduler.val_every_steps: 100
+    lr_scheduler.lr_warmup_steps: 2
+    checkpoint.enabled: false
