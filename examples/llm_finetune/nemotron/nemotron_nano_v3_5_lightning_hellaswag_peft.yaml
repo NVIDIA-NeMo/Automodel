@@ -14,11 +14,11 @@
 
 
 
-# LoRA finetuning for a Nemotron hybrid mamba-attention MoE checkpoint with
-# multi-token prediction (MTP).
+# LoRA finetuning for Nemotron Nano v3.5 Lightning (hybrid mamba-attention MoE
+# with multi-token prediction).
 #
-# To run this recipe (set pretrained_model_name_or_path to your checkpoint first):
-#   automodel examples/llm_finetune/nemotron/nemotron_mtp_hellaswag_peft.yaml --nproc-per-node 8
+# To run this recipe:
+#   automodel examples/llm_finetune/nemotron/nemotron_nano_v3_5_lightning_hellaswag_peft.yaml --nproc-per-node 8
 # Adjust --nproc-per-node to the number of GPUs available on your machine.
 
 recipe: TrainFinetuneRecipeForNextTokenPrediction
@@ -41,13 +41,14 @@ rng:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: /path/to/checkpoint
+  pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16
   # MTP is auto-enabled from the checkpoint config's num_nextn_predict_layers
-  # and MTP block-pattern fields. The overrides below configure 2 weight-tied
-  # MTP iterations (predicting t+2 and t+3) that reuse the checkpoint's single
-  # physical MTP layer, mirroring Megatron's --mtp-use-repeated-layer; the HF
-  # export only retains the physical depth count, so the iteration count must
-  # be set explicitly.
+  # and mtp_layers_block_type fields (one MTP depth = attention sublayer then
+  # MoE sublayer). The overrides below configure 2 weight-tied MTP iterations
+  # (predicting t+2 and t+3) that reuse the checkpoint's single physical MTP
+  # layer, mirroring Megatron's --mtp-use-repeated-layer; the HF export only
+  # retains the physical depth count, so the iteration count must be set
+  # explicitly.
   num_nextn_predict_layers: 2
   mtp_use_repeated_layer: true
   mtp_loss_scaling_factor: 0.1
