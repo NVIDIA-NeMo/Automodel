@@ -25,10 +25,11 @@ import pytest
 import torch
 import torch.nn as nn
 from PIL import Image
+from tokenizers import Tokenizer
+from tokenizers.models import WordLevel
 from transformers import PixtralImageProcessor
-from transformers.tokenization_utils_tokenizers import TokenizersBackend
 from transformers.models.mistral3.modeling_mistral3 import Mistral3Model
-from transformers.processing_utils import ProcessorMixin
+from transformers.tokenization_utils_tokenizers import TokenizersBackend
 
 pytest.importorskip("transformers.models.ministral3", reason="Ministral3 not available in this transformers version")
 
@@ -130,7 +131,7 @@ class FakePixtralImageProcessor:
 
 @pytest.fixture
 def pixtral_processor(monkeypatch):
-    monkeypatch.setattr(ProcessorMixin, "check_argument_for_proper_class", lambda *args, **kwargs: None)
+    monkeypatch.setattr(Mistral3BiEncoderProcessor, "check_argument_for_proper_class", lambda *args, **kwargs: None)
     return Mistral3BiEncoderProcessor(
         image_processor=FakePixtralImageProcessor(),
         tokenizer=FakePixtralTokenizer(),
@@ -180,6 +181,34 @@ def test_ministral3_biencoder_processor_loads_tokenizers_backend_directly(monkey
             },
         )
     ]
+
+
+def test_ministral3_biencoder_processor_validates_backend_without_importing_mistral_common(monkeypatch):
+    backend = Tokenizer(WordLevel({"<unk>": 0, "[IMG]": 1}, unk_token="<unk>"))
+    tokenizer = TokenizersBackend(tokenizer_object=backend, unk_token="<unk>", additional_special_tokens=["[IMG]"])
+    original_resolver = Mistral3BiEncoderProcessor.get_possibly_dynamic_module
+
+    def guarded_resolver(class_name):
+        if class_name == "MistralCommonBackend":
+            raise AssertionError("MistralCommonBackend must not be resolved")
+        return original_resolver(class_name)
+
+    monkeypatch.setattr(Mistral3BiEncoderProcessor, "get_possibly_dynamic_module", staticmethod(guarded_resolver))
+
+    processor = Mistral3BiEncoderProcessor(
+        image_processor=PixtralImageProcessor(size={"longest_edge": 56}),
+        tokenizer=tokenizer,
+        patch_size=14,
+    )
+
+    assert processor.tokenizer is tokenizer
+
+
+def test_ministral3_biencoder_processor_rejects_injected_non_tokenizers_backend():
+    processor = object.__new__(Mistral3BiEncoderProcessor)
+
+    with pytest.raises(TypeError, match=r"from_pretrained\(\.\.\.\).+automatically"):
+        processor.check_argument_for_proper_class("tokenizer", FakePixtralTokenizer())
 
 
 @pytest.mark.parametrize(("keyword", "value"), [("backend", "mistral-common"), ("split_special_tokens", True)])
@@ -254,7 +283,7 @@ def test_ministral3_biencoder_processor_rejects_remote_image_urls():
 
 
 def test_ministral3_biencoder_processor_canonicalizes_image_longest_edge(monkeypatch):
-    monkeypatch.setattr(ProcessorMixin, "check_argument_for_proper_class", lambda *args, **kwargs: None)
+    monkeypatch.setattr(Mistral3BiEncoderProcessor, "check_argument_for_proper_class", lambda *args, **kwargs: None)
     image_processor = FakePixtralImageProcessor()
     processor = Mistral3BiEncoderProcessor(
         image_processor=image_processor,
@@ -273,7 +302,7 @@ def test_ministral3_biencoder_processor_canonicalizes_image_longest_edge(monkeyp
 
 
 def test_ministral3_biencoder_processor_preserves_nested_longest_edge(monkeypatch):
-    monkeypatch.setattr(ProcessorMixin, "check_argument_for_proper_class", lambda *args, **kwargs: None)
+    monkeypatch.setattr(Mistral3BiEncoderProcessor, "check_argument_for_proper_class", lambda *args, **kwargs: None)
     image_processor = FakePixtralImageProcessor(size={"longest_edge": 1540})
 
     processor = Mistral3BiEncoderProcessor(
@@ -287,7 +316,7 @@ def test_ministral3_biencoder_processor_preserves_nested_longest_edge(monkeypatc
 
 
 def test_ministral3_biencoder_processor_attribute_and_call_overrides(monkeypatch):
-    monkeypatch.setattr(ProcessorMixin, "check_argument_for_proper_class", lambda *args, **kwargs: None)
+    monkeypatch.setattr(Mistral3BiEncoderProcessor, "check_argument_for_proper_class", lambda *args, **kwargs: None)
     image_processor = FakePixtralImageProcessor()
     processor = Mistral3BiEncoderProcessor(
         image_processor=image_processor,
@@ -319,7 +348,7 @@ def test_ministral3_biencoder_processor_serializes_only_nested_longest_edge(
     processor_config,
     expected_longest_edge,
 ):
-    monkeypatch.setattr(ProcessorMixin, "check_argument_for_proper_class", lambda *args, **kwargs: None)
+    monkeypatch.setattr(Mistral3BiEncoderProcessor, "check_argument_for_proper_class", lambda *args, **kwargs: None)
     image_processor = PixtralImageProcessor(size={"longest_edge": 1540})
     processor = Mistral3BiEncoderProcessor.from_args_and_dict(
         [image_processor, FakePixtralTokenizer()],

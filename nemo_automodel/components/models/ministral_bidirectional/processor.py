@@ -51,6 +51,39 @@ def load_image(image: Any) -> Image.Image:
 class Mistral3BiEncoderProcessor(PixtralProcessor):
     """Pixtral processor with retrieval-specific query/document batching helpers."""
 
+    def check_argument_for_proper_class(
+        self,
+        argument_name: str,
+        argument: Any,
+    ) -> type | tuple[type, ...]:
+        """Validate the retrieval tokenizer without importing MistralCommonBackend.
+
+        Transformers validates processor tokenizers against every generally supported
+        tokenizer class, which imports ``mistral-common`` even when the selected tokenizer
+        is already a ``TokenizersBackend``. This processor supports only the latter so its
+        image markers and escaped user text retain the retrieval-specific semantics.
+
+        Args:
+            argument_name: Processor attribute being validated.
+            argument: Runtime processor component.
+
+        Returns:
+            The accepted component class, or the superclass validation result.
+
+        Raises:
+            TypeError: If a non-TokenizersBackend tokenizer is supplied.
+        """
+        if argument_name == "tokenizer":
+            if not isinstance(argument, TokenizersBackend):
+                raise TypeError(
+                    "Mistral3BiEncoderProcessor requires a Transformers TokenizersBackend tokenizer; "
+                    f"got {type(argument).__name__}. Load it with "
+                    "Mistral3BiEncoderProcessor.from_pretrained(...), which selects the required backend "
+                    "automatically."
+                )
+            return TokenizersBackend
+        return super().check_argument_for_proper_class(argument_name, argument)
+
     @classmethod
     def _load_tokenizer_from_pretrained(
         cls,
