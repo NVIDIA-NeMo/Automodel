@@ -176,3 +176,34 @@ def test_generate_qwen3_moe_te_deepep_uses_isolated_source_and_reload_phases():
     assert robustness["source_load_cosine_threshold"] == 0.997
     assert robustness["trust_remote_code"] is True
     assert robustness["hf_device_map_auto"] is True
+
+
+def test_generate_qwen3_moe_hellaswag_uses_isolated_source_and_reload_phases():
+    config = Path("examples/llm_finetune/qwen/qwen3_moe_30b_hellaswag.yaml")
+
+    jobs = dict(generate_job(config, {}, "release", "llm_finetune", "."))
+    robustness = YAML(typ="safe").load(config)["ci"]["checkpoint_robustness"]
+
+    variables = jobs[""]["variables"]
+    assert variables["CHECKPOINT_ROBUSTNESS_PROCESS_ISOLATION"] == "true"
+    assert variables["CHECKPOINT_ROBUSTNESS_PHASES"] == (
+        "source_load_reference source_load_parity train_and_save automodel_reload hf_reload"
+    )
+    assert robustness["check_source_load_parity"] is True
+    assert robustness["source_load_kl_threshold"] == 1e-1
+    assert robustness["source_load_mean_kl_threshold"] == 1.5e-2
+    assert robustness["source_load_cosine_threshold"] == 0.995
+
+
+def test_generate_step3p7_uses_fingerprints_as_automodel_reload_gate():
+    config = Path("examples/vlm_finetune/stepfun/step3p7_medpix_200b_lora_pp8ep8_8node.yaml")
+
+    jobs = dict(generate_job(config, {}, "release", "vlm_finetune", "."))
+    robustness = YAML(typ="safe").load(config)["ci"]["checkpoint_robustness"]
+
+    variables = jobs[""]["variables"]
+    assert variables["CHECKPOINT_ROBUSTNESS_PROCESS_ISOLATION"] == "true"
+    assert variables["CHECKPOINT_ROBUSTNESS_PHASES"] == "train_and_save automodel_reload hf_reload"
+    assert robustness["skip_automodel_logit_parity"] is True
+    assert robustness["skip_hf_logit_parity"] is True
+    assert "kl_threshold" not in robustness
