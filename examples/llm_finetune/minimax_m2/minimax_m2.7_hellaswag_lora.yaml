@@ -116,6 +116,9 @@ ci:
   time: "00:30:00"
   nodes: 4
   checkpoint_robustness:
+    # The robustness default local batch is 2; with 32 ranks the global batch
+    # must be at least 64 and divisible by 2 * 32.
+    step_scheduler.global_batch_size: 64
     # Keep each large-model load in a fresh process so the HF reload has all
     # local GPU memory available after the distributed train/save phase.
     process_isolation: true

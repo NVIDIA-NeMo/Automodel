@@ -121,6 +121,9 @@ ci:
     trust_remote_code: true
     tokenizer_name: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16
     hf_device_map_auto: true
+    # Vanilla Transformers intentionally omits the training-only MTP modules.
+    # Exact-match every adapter tensor it can instantiate and allow only MTP keys.
+    hf_adapter_ignored_key_prefix: "base_model.model.mtp."
     no_check_resume: true
     dataset.num_samples_limit: 500
     validation_dataset.num_samples_limit: 500
