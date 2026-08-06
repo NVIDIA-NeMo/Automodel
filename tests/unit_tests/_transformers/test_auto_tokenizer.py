@@ -303,6 +303,14 @@ class TestNeMoAutoTokenizerFromPretrained:
                 tokenizer_backend="tokenizers",
             )
 
+    def test_force_flags_are_mutually_exclusive(self):
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            NeMoAutoTokenizer.from_pretrained(
+                "dummy/model",
+                force_default=True,
+                force_hf=True,
+            )
+
     def test_force_hf_passthrough(self):
         stub = _StubHFTokenizer()
         with patch("transformers.AutoTokenizer.from_pretrained", return_value=stub):

@@ -117,6 +117,8 @@ class NeMoAutoTokenizer:
         valid_backends = {"nemo_auto", "transformers_auto", "tokenizers"}
         if tokenizer_backend is not None and tokenizer_backend not in valid_backends:
             raise ValueError(f"tokenizer_backend must be one of {sorted(valid_backends)}, got {tokenizer_backend!r}")
+        if force_default and force_hf:
+            raise ValueError("force_default=True and force_hf=True are mutually exclusive.")
         if force_default and tokenizer_backend not in (None, "nemo_auto"):
             raise ValueError(
                 "force_default=True uses the nemo_auto route and cannot be combined "
