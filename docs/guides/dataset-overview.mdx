@@ -274,7 +274,7 @@ workflow, refer to [Retrieval fine-tuning](/recipes-e2e-examples/retrieval-finet
 - Class: `nemo_automodel.components.datasets.llm.nanogpt_dataset.NanogptDataset`
 - Use case: token-level LM pretraining over `.bin` shards produced by NanoGPT-style preprocessors (supports legacy and current formats)
 <Note>
-- Streams contiguous `seq_len` slices, supports optional BOS alignment and `.bos.idx` sidecar files
+- Streams contiguous `seq_len` slices and supports optional BOS alignment and `.bos.idx` sidecar files
 - Related tool: `tools/nanogpt_data_processor.py`
 
 </Note>
