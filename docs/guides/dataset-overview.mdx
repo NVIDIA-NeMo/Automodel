@@ -20,6 +20,7 @@ NeMo AutoModel supports several common patterns for language modeling and instru
 - Use case: single-turn completion-style SFT where a prompt (ctx) is followed by a gold continuation (ending)
 - Key args: `path_or_dataset`, `split`, `num_samples_limit`
 - Example YAML:
+
 ```yaml
 dataset:
   _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
