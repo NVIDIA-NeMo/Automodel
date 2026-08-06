@@ -14,7 +14,8 @@ NeMo AutoModel provides two retrieval fine-tuning recipes:
   produced a shortlist and you want stronger ranking quality.
 
 Both recipes use retrieval examples where the first passage is positive and the remaining passages are negatives. A
-common workflow is to train a bi-encoder, use it to mine harder negatives, then train either a stronger bi-encoder or a
+Both recipes use retrieval examples in which the first passage is positive and the remaining passages are negatives. A
+common workflow is to train a bi-encoder, use it to mine harder negatives, and then train either a stronger bi-encoder or a
 cross-encoder reranker.
 
 ## Workflow Overview
@@ -104,7 +105,10 @@ Choose the recipe that matches your retrieval stage:
 | Search across a large corpus | Bi-encoder | Encodes queries and passages independently, so passage embeddings can be indexed once. |
 | RAG candidate generation | Bi-encoder | Produces dense vectors for approximate nearest-neighbor retrieval. |
 | Better ranking for a small shortlist | Cross-encoder | Scores each query-passage pair jointly, which is slower but usually more accurate. |
-| Better negatives for the next training run | Hard-negative mining | Uses a trained bi-encoder to find confusing passages for each query. |
+| Search across a large corpus | Bi-encoder | Encodes queries and passages independently, so passage embeddings can be indexed a single time |
+| RAG candidate generation | Bi-encoder | Produces dense vectors for approximate nearest-neighbor retrieval |
+| Better ranking for a small shortlist | Cross-encoder | Scores each query-passage pair jointly, which is slower but usually more accurate |
+| Better negatives for the next training run | Hard-negative mining | Uses a trained bi-encoder to find confusing passages for each query |
 
 The following table compares the recipe components:
 
@@ -149,7 +153,9 @@ matches the workflow you need:
 |-----------|----------|-------|
 | `hf://` AutoModel retrieval schema | You want a tutorial run or shared public dataset | Requires an AutoModel-style HF subset with a companion corpus split. |
 | Inline JSONL | You want a small custom run without hard-negative mining | Documents are embedded directly in each record. Pure inline records do not provide document IDs for same-document masking. |
-| Corpus ID-based JSON | You need hard-negative mining, reusable corpora, or same-document masking | Records reference document IDs in a local corpus that can be loaded by Hugging Face `datasets`. |
+| `hf://` AutoModel retrieval schema | You want a tutorial run or shared public dataset | Requires an AutoModel-style Hugging Face subset with a companion corpus split |
+| Inline JSONL | You want a small custom run without hard-negative mining | Documents are embedded directly in each record. No document IDs are available for same-document masking |
+| Corpus ID-based JSON | You need hard-negative mining, reusable corpora, or same-document masking | Records reference document IDs in a local corpus that can be loaded by Hugging Face `datasets` |
 | Normalized Arrow | You are training on a full-scale or image-heavy VL retrieval dataset | Prepare local corpus ID-based JSON sources on CPU, then train from portable Arrow shards with `NormalizedRetrievalDatasetConfig`. |
 
 For typical text-only retrieval, load the source directly with `RetrievalDatasetConfig`. For full-scale or image-heavy
@@ -179,7 +185,9 @@ The key field requirements differ by source:
 The standard bi-encoder and cross-encoder recipes need at least one negative candidate for meaningful contrastive or
 reranking supervision, unless you add a custom strategy such as qrels-aware in-batch negatives.
 
+
 </Warning>
+
 
 For quick custom experiments, inline JSONL is the simplest format. `RetrievalDatasetConfig` selects the inline loading
 path from the `.jsonl` extension. Switch to corpus ID-based JSON before hard-negative mining or full-corpus evaluation:
@@ -375,7 +383,7 @@ The following settings control bi-encoder behavior:
   or masking prevents sibling positives from becoming negatives.
 
 The complete example is
-[examples/retrieval/bi_encoder/llama3_2_1b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/bi_encoder/llama3_2_1b.yaml).
+For the complete example, see [examples/retrieval/bi_encoder/llama3_2_1b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/bi_encoder/llama3_2_1b.yaml).
 
 ## Configure a Cross-Encoder
 
@@ -427,7 +435,7 @@ The following settings control cross-encoder behavior:
   to index `0`.
 
 The complete example is
-[examples/retrieval/cross_encoder/llama3_2_1b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/cross_encoder/llama3_2_1b.yaml).
+For the complete example, see [examples/retrieval/cross_encoder/llama3_2_1b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/cross_encoder/llama3_2_1b.yaml).
 
 ## Distributed Launch and Batch Size
 
@@ -872,9 +880,20 @@ Use the following checks to diagnose common retrieval training problems:
 | Batch-size assertion fails | Set `global_batch_size` to a multiple of `local_batch_size * data_parallel_size`. |
 | `training.jsonl` does not update during a basic verification test | Use standard output and error for live monitoring. JSONL metrics are buffered before flush. |
 | Run resumes unexpectedly | Use a new or empty `checkpoint_dir`. AutoModel auto-detects compatible checkpoints when `restore_from` is omitted. |
-| Different mining and training behavior | Match tokenizer settings, max lengths, and prefix text including trailing spaces across training and mining. |
+| Training fails with empty negatives | Ensure every record has `neg_doc` when `n_passages > 1` |
+| Dataset records fail to load | Check the supported schemas in [Retrieval Dataset](/datasets/retrieval-dataset) |
+| Loss does not move | Verify the positive passage is first and negatives are not duplicates of the positive |
+| Poor retrieval quality | Mine harder negatives and align training and inference prefixes |
+| Out of memory at startup or first batch | Lower `local_batch_size`, `q_max_len`, `p_max_len`, or `rerank_max_length`. Use LoRA for larger backbones |
+| Distributed launch times out | Increase `dist_env.timeout_minutes`, especially for first model downloads, slow filesystems, or multi-node runs |
+| Batch-size assertion fails | Set `global_batch_size` to a multiple of `local_batch_size * data_parallel_size` |
+| `training.jsonl` does not update during a smoke test | Use stdout and stderr for live monitoring. JSONL metrics are buffered before flush |
+| Run resumes unexpectedly | Use a new or empty `checkpoint_dir`. AutoModel auto-detects compatible checkpoints when `restore_from` is omitted |
+| Different mining and training behavior | Match tokenizer settings, max lengths, and prefix text, including trailing spaces, across training and mining |
 
 ## Related Files
+
+The following files provide related examples and implementation details:
 
 Refer to the following files for implementation and configuration details:
 
