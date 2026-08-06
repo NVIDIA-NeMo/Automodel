@@ -14,8 +14,7 @@ NeMo AutoModel provides two retrieval fine-tuning recipes:
   produced a shortlist and you want stronger ranking quality.
 
 Both recipes use retrieval examples where the first passage is positive and the remaining passages are negatives. A
-Both recipes use retrieval examples in which the first passage is positive and the remaining passages are negatives. A
-common workflow is to train a bi-encoder, use it to mine harder negatives, and then train either a stronger bi-encoder or a
+common workflow is to train a bi-encoder, use it to mine harder negatives, then train either a stronger bi-encoder or a
 cross-encoder reranker.
 
 ## Workflow Overview
@@ -105,10 +104,7 @@ Choose the recipe that matches your retrieval stage:
 | Search across a large corpus | Bi-encoder | Encodes queries and passages independently, so passage embeddings can be indexed once. |
 | RAG candidate generation | Bi-encoder | Produces dense vectors for approximate nearest-neighbor retrieval. |
 | Better ranking for a small shortlist | Cross-encoder | Scores each query-passage pair jointly, which is slower but usually more accurate. |
-| Search across a large corpus | Bi-encoder | Encodes queries and passages independently, so passage embeddings can be indexed a single time |
-| RAG candidate generation | Bi-encoder | Produces dense vectors for approximate nearest-neighbor retrieval |
-| Better ranking for a small shortlist | Cross-encoder | Scores each query-passage pair jointly, which is slower but usually more accurate |
-| Better negatives for the next training run | Hard-negative mining | Uses a trained bi-encoder to find confusing passages for each query |
+| Better negatives for the next training run | Hard-negative mining | Uses a trained bi-encoder to find confusing passages for each query. |
 
 The following table compares the recipe components:
 
@@ -153,9 +149,7 @@ matches the workflow you need:
 |-----------|----------|-------|
 | `hf://` AutoModel retrieval schema | You want a tutorial run or shared public dataset | Requires an AutoModel-style HF subset with a companion corpus split. |
 | Inline JSONL | You want a small custom run without hard-negative mining | Documents are embedded directly in each record. Pure inline records do not provide document IDs for same-document masking. |
-| `hf://` AutoModel retrieval schema | You want a tutorial run or shared public dataset | Requires an AutoModel-style Hugging Face subset with a companion corpus split |
-| Inline JSONL | You want a small custom run without hard-negative mining | Documents are embedded directly in each record. No document IDs are available for same-document masking |
-| Corpus ID-based JSON | You need hard-negative mining, reusable corpora, or same-document masking | Records reference document IDs in a local corpus that can be loaded by Hugging Face `datasets` |
+| Corpus ID-based JSON | You need hard-negative mining, reusable corpora, or same-document masking | Records reference document IDs in a local corpus that can be loaded by Hugging Face `datasets`. |
 | Normalized Arrow | You are training on a full-scale or image-heavy VL retrieval dataset | Prepare local corpus ID-based JSON sources on CPU, then train from portable Arrow shards with `NormalizedRetrievalDatasetConfig`. |
 
 For typical text-only retrieval, load the source directly with `RetrievalDatasetConfig`. For full-scale or image-heavy
@@ -185,9 +179,7 @@ The key field requirements differ by source:
 The standard bi-encoder and cross-encoder recipes need at least one negative candidate for meaningful contrastive or
 reranking supervision, unless you add a custom strategy such as qrels-aware in-batch negatives.
 
-
 </Warning>
-
 
 For quick custom experiments, inline JSONL is the simplest format. `RetrievalDatasetConfig` selects the inline loading
 path from the `.jsonl` extension. Switch to corpus ID-based JSON before hard-negative mining or full-corpus evaluation:
@@ -362,14 +354,13 @@ dataloader:
 The following settings control bi-encoder behavior:
 
 - `pooling`: controls how token hidden states become one embedding. Common single-vector choices are `avg`, `cls`,
-  `last`, and `weighted_avg`. `mean` is a compatibility alias for `avg`. AutoModel canonicalizes it to `avg` before
-  saving or exporting. The shipped hard-negative miner does not expose a pooling override. When the checkpoint
-  contains supported Sentence Transformers metadata, the miner restores the saved pooling mode. Otherwise, loading
-  falls back to the backbone configuration or `avg`. Do not use the miner with `colbert` pooling, which returns
-  token-level embeddings.
+  `last`, and `weighted_avg`. The shipped hard-negative miner does not expose a pooling override. When a checkpoint
+  contains supported Sentence Transformers metadata, the miner restores the saved pooling mode. Otherwise, the loader
+  uses the backbone configuration or `avg`. Do not use the miner with `colbert` pooling, which returns token-level
+  embeddings.
 - `l2_normalize`: normalizes embeddings before scoring. When enabled, the recipe divides scores by `temperature`. The
-  shipped miner does not expose a normalization override. It restores saved Sentence Transformers normalization
-  metadata when available and otherwise defaults to `true`.
+  shipped miner does not expose a normalization override. When a checkpoint contains supported Sentence Transformers
+  metadata, the miner restores the saved normalization setting. Otherwise, the loader enables L2 normalization.
 - `q_max_len` and `p_max_len`: set separate truncation lengths for queries and passages.
 - `query_prefix` and `passage_prefix`: add task-specific text before tokenization. Keep these aligned between training,
   hard-negative mining, and inference.
@@ -384,7 +375,7 @@ The following settings control bi-encoder behavior:
   or masking prevents sibling positives from becoming negatives.
 
 The complete example is
-For the complete example, see [examples/retrieval/bi_encoder/llama3_2_1b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/bi_encoder/llama3_2_1b.yaml).
+[examples/retrieval/bi_encoder/llama3_2_1b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/bi_encoder/llama3_2_1b.yaml).
 
 ## Configure a Cross-Encoder
 
@@ -436,7 +427,7 @@ The following settings control cross-encoder behavior:
   to index `0`.
 
 The complete example is
-For the complete example, see [examples/retrieval/cross_encoder/llama3_2_1b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/cross_encoder/llama3_2_1b.yaml).
+[examples/retrieval/cross_encoder/llama3_2_1b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/cross_encoder/llama3_2_1b.yaml).
 
 ## Distributed Launch and Batch Size
 
@@ -689,12 +680,11 @@ Match these mining settings to training:
 - Set `use_negatives_from_file` when you want to keep existing negatives before appending mined negatives. Deduplicate
   and audit the combined list.
 
-`pooling` and `l2_normalize` are not `mining.*` config fields. Unknown mining keys are ignored rather than applied, so do
-not pass `--mining.pooling` or `--mining.l2_normalize`. The current miner calls
+The miner does not accept `pooling` or `l2_normalize` settings. It calls
 `NeMoAutoModelBiEncoder.from_pretrained` without those arguments. The loader restores pooling and normalization from
-supported Sentence Transformers checkpoint metadata when available. For checkpoints without that metadata, pooling
-falls back to the backbone configuration or `avg`, and normalization defaults to `true`. Confirm that these fallbacks
-match training before mining from a legacy or external checkpoint.
+supported Sentence Transformers checkpoint metadata. If the metadata is unavailable, pooling uses the backbone
+configuration or `avg`, and L2 normalization is enabled. Confirm that these fallback settings match training before
+mining from a legacy or external checkpoint.
 
 Use a new, empty `cache_embeddings_dir` for every model, input, prefix, sequence length, `corpus_chunk_size`, and world
 size. The miner reuses expected shard files even when `load_embeddings_from_cache` is `false`, and it does not record
@@ -881,20 +871,9 @@ Use the following checks to diagnose common retrieval training problems:
 | Batch-size assertion fails | Set `global_batch_size` to a multiple of `local_batch_size * data_parallel_size`. |
 | `training.jsonl` does not update during a basic verification test | Use standard output and error for live monitoring. JSONL metrics are buffered before flush. |
 | Run resumes unexpectedly | Use a new or empty `checkpoint_dir`. AutoModel auto-detects compatible checkpoints when `restore_from` is omitted. |
-| Training fails with empty negatives | Ensure every record has `neg_doc` when `n_passages > 1` |
-| Dataset records fail to load | Check the supported schemas in [Retrieval Dataset](/datasets/retrieval-dataset) |
-| Loss does not move | Verify the positive passage is first and negatives are not duplicates of the positive |
-| Poor retrieval quality | Mine harder negatives and align training and inference prefixes |
-| Out of memory at startup or first batch | Lower `local_batch_size`, `q_max_len`, `p_max_len`, or `rerank_max_length`. Use LoRA for larger backbones |
-| Distributed launch times out | Increase `dist_env.timeout_minutes`, especially for first model downloads, slow filesystems, or multi-node runs |
-| Batch-size assertion fails | Set `global_batch_size` to a multiple of `local_batch_size * data_parallel_size` |
-| `training.jsonl` does not update during a smoke test | Use stdout and stderr for live monitoring. JSONL metrics are buffered before flush |
-| Run resumes unexpectedly | Use a new or empty `checkpoint_dir`. AutoModel auto-detects compatible checkpoints when `restore_from` is omitted |
-| Different mining and training behavior | Match tokenizer settings, max lengths, and prefix text, including trailing spaces, across training and mining |
+| Different mining and training behavior | Match tokenizer settings, max lengths, and prefix text including trailing spaces across training and mining. |
 
 ## Related Files
-
-The following files provide related examples and implementation details:
 
 Refer to the following files for implementation and configuration details:
 
