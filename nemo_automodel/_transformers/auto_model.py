@@ -43,6 +43,7 @@ from transformers import (  # noqa: E402
     AutoModelForCausalLM,
     AutoModelForImageTextToText,
     AutoModelForMultimodalLM,
+    AutoModelForSeq2SeqLM,
     AutoModelForSequenceClassification,
     AutoModelForTextToWaveform,
     AutoModelForTokenClassification,
@@ -683,8 +684,8 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 Accepts both SDPBackend enum values and string names (e.g.
                 ``["flash_attention", "efficient_attention"]``). When ``None``,
                 auto-selects based on CP and activation checkpointing.
-            torch_dtype (str | torch.dtype | Literal["auto"], default="auto"):
-                Data type passed to the underlying `from_pretrained` call.
+            torch_dtype (str | torch.dtype):
+                Data type passed to the underlying `from_pretrained` call. Defaults to `auto`.
             attn_implementation (str, optional):
                 Specifies which attention implementation to use (e.g.,
                 ``"flash_attention_2"``, ``"eager"``). Only applied when the
@@ -812,8 +813,8 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 The configuration object used to build the model.
                 If config is passed as a string (e.g., model-id / local checkpoint),
                 it will create a config internally using AutoConfig.
-            torch_dtype (str | torch.dtype, default="auto"):
-                Data type for model parameters. If "auto", defaults to ``torch.bfloat16``.
+            torch_dtype (str | torch.dtype):
+                Data type for model parameters. Defaults to `auto`, which selects ``torch.bfloat16``.
         """
         _reject_separate_distributed_kwargs(kwargs)
         setup = _resolve_distributed_setup(
@@ -1003,6 +1004,21 @@ class NeMoAutoModelForTokenClassification(_BaseNeMoAutoModelClass, AutoModelForT
     >>> model = NeMoAutoModelForTokenClassification.from_pretrained("dbmdz/bert-large-cased-finetuned-conll03-english") # try Liger
     >>> model = NeMoAutoModelForTokenClassification.from_pretrained(
     ...     "dbmdz/bert-large-cased-finetuned-conll03-english", use_liger_kernel=False)   # skip Liger
+    """
+
+    pass
+
+
+class NeMoAutoModelForSeq2SeqLM(_BaseNeMoAutoModelClass, AutoModelForSeq2SeqLM):
+    """Drop-in replacement for ``transformers.AutoModelForSeq2SeqLM`` with custom-kernels.
+
+    Resolves encoder-decoder (sequence-to-sequence) architectures such as T5,
+    mT5, BART, and Pegasus to their HF ``*ForConditionalGeneration`` classes via
+    the inherited ``AutoModelForSeq2SeqLM`` mapping. Like the other wrappers it
+    only overrides ``from_pretrained`` / ``from_config`` to add the optional
+    ``use_liger_kernel`` flag; the Liger patch only applies to decoder-only
+    architectures, so for encoder-decoder models it silently falls back and the
+    model is unchanged.
     """
 
     pass

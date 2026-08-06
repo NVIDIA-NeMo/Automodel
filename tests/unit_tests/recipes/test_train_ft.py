@@ -1204,6 +1204,8 @@ def test_run_train_validation_loop_calls_gc_hook_once_per_step():
     trainer.model_parts = [MagicMock()]
     trainer.step_scheduler = _OneStepScheduler()
     trainer.max_grad_norm = 1.0
+    trainer.partial_cuda_graph_manager = None
+    trainer._partial_cuda_graph_capture_pending = False
     trainer._enable_qat_if_delayed = MagicMock()
     trainer._run_train_optim_step = MagicMock(return_value=SimpleNamespace(metrics={"loss": 1.0}))
     trainer._maybe_collect_garbage = MagicMock()
@@ -1214,7 +1216,7 @@ def test_run_train_validation_loop_calls_gc_hook_once_per_step():
     trainer.val_dataloaders = {}
     trainer.metric_logger_train = SimpleNamespace(close=MagicMock())
     trainer.metric_logger_valid = {}
-    trainer.checkpointer = SimpleNamespace(close=MagicMock())
+    trainer.checkpointer = SimpleNamespace(finalize=MagicMock())
     trainer.best_metric_key = "default"
 
     trainer.run_train_validation_loop()
