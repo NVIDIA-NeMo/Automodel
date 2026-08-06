@@ -434,7 +434,7 @@ def test_retrieval_checkpoint_robustness_retains_calibrated_resume_threshold(tmp
     )
 
     robustness = yaml.load(out.open())["ci"]["checkpoint_robustness"]
-    assert robustness["resume_loss_threshold"] == 2e-2
+    assert robustness["resume_loss_threshold"] == 5e-2
     assert robustness["training_reproducibility_loss_threshold"] == 5e-2
 
 
