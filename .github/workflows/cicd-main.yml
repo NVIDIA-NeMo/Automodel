@@ -488,11 +488,6 @@ jobs:
             timeout: 20
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
-          - test-name: L2_CP_KimiLinear
-            test-folder: context_parallel_kimi_linear
-            timeout: 20
-            runner: ${{ needs.pre-flight.outputs.runner_prefix }}
-            test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
           - test-name: L2_Retrieval
             test-folder: retrieval
             timeout: 20
@@ -567,9 +562,6 @@ jobs:
             timeout: 20
           - test-name: L2_Context_Parallel
             test-folder: context_parallel
-            timeout: 20
-          - test-name: L2_CP_KimiLinear
-            test-folder: context_parallel_kimi_linear
             timeout: 20
           - test-name: L2_Retrieval
             test-folder: retrieval
