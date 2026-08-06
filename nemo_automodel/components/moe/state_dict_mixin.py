@@ -99,6 +99,17 @@ class MoESplitExpertsStateDictMixin:
         """Path segment for experts (e.g., 'mlp.experts' or 'mixer.experts'). Override in subclass."""
         return "mlp.experts"
 
+    @property
+    def _v5_peft_target_parameters(self) -> tuple[str, ...]:
+        """Fused expert parameters validated for PEFT v5 ParamWrapper export.
+
+        Adapters opt in by overriding this property. Keeping the default empty
+        preserves the legacy per-expert export for model families whose HF
+        naming, activation layout, or checkpoint post-processing has not been
+        validated against ParamWrapper yet.
+        """
+        return ()
+
     def _validate_expert_availability(
         self,
         hf_state_dict: dict[str, Any],
@@ -895,13 +906,14 @@ class MoESplitExpertsStateDictMixin:
 
         # MoE expert LoRA keys: convert to HF-PEFT-compatible format.
         # When v4_compatible=True: per-expert split keys (v4 format).
-        # When v4_compatible=False (default): fused ParamWrapper format (v5).
+        # When v4_compatible=False and the adapter explicitly opts in: fused
+        # ParamWrapper format (v5). Unvalidated adapters retain the legacy
+        # per-expert format even when v4_compatible is not requested.
         v4_compatible = kwargs.get("v4_compatible", False)
         for suffix in _LORA_EXPERT_SUFFIXES:
             if f".{expert_segment}.{suffix}" in fqn and fqn.endswith(f".{suffix}"):
-                if v4_compatible:
-                    return self._convert_lora_expert_to_hf(fqn, tensor, n_experts, inter_dim, expert_segment)
-                else:
+                if not v4_compatible and self._v5_peft_target_parameters:
                     return self._convert_lora_to_paramwrapper(fqn, tensor)
+                return self._convert_lora_expert_to_hf(fqn, tensor, n_experts, inter_dim, expert_segment)
 
         return None

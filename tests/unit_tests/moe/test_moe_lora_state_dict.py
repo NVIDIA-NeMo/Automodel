@@ -63,6 +63,18 @@ class _Adapter(MoESplitExpertsStateDictMixin):
         self._uses_model_prefix = uses_model_prefix
         self._last_expert_ids = []
 
+    @property
+    def _v5_peft_target_parameters(self):
+        return ("mlp.experts.gate_up_proj", "mlp.experts.down_proj")
+
+
+class _LegacyAdapter(_Adapter):
+    """Representative unvalidated adapter that must retain v4-style export."""
+
+    @property
+    def _v5_peft_target_parameters(self):
+        return ()
+
 
 def _make_moe_config():
     return MoEConfig(
@@ -481,6 +493,28 @@ class TestExtractTargetsV5Defaults:
         model = _make_tiny_moe_model()
 
         assert _extract_target_parameters([model]) == _extract_target_parameters(model)
+
+    def test_unvalidated_adapter_keeps_legacy_targets_by_default(self):
+        model = _make_tiny_moe_model()
+        model.state_dict_adapter = _LegacyAdapter()
+
+        assert _extract_target_parameters(model) == []
+        targets = _extract_target_modules(model)
+        assert "layers.0.mlp.experts.0.gate_proj" in targets
+        assert "layers.0.mlp.experts.0.up_proj" in targets
+        assert "layers.0.mlp.experts.0.down_proj" in targets
+
+    def test_unvalidated_adapter_keeps_legacy_state_dict_format_by_default(self):
+        adapter = _LegacyAdapter()
+        tensor = torch.randn(N_EXPERTS, DIM, LORA_DIM)
+
+        converted = adapter._convert_single_merged_expert_to_hf_split_experts(
+            "model.layers.0.mlp.experts.lora_gate_and_up_A", tensor
+        )
+
+        keys = {key for key, _ in converted}
+        assert "model.layers.0.mlp.experts.0.gate_proj.lora_A.weight" in keys
+        assert not any("base_layer.lora_A.weight" in key for key in keys)
 
 
 # ---------------------------------------------------------------------------

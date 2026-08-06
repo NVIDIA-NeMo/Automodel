@@ -306,9 +306,8 @@ def _get_automodel_peft_metadata(peft_config: "PeftConfig") -> dict:
 def _extract_target_parameters(model: "nn.Module | list[nn.Module]", v4_compatible: bool = False) -> list[str]:
     """Extract ``target_parameters`` for PEFT v0.18+ ParamWrapper format.
 
-    Returns fused expert parameter paths for MoE models using
-    ``MoESplitExpertsStateDictMixin`` when not in legacy mode, or an empty list
-    otherwise.
+    Returns fused expert parameter paths for adapters that explicitly opt in
+    to PEFT v5 ParamWrapper export, or an empty list otherwise.
 
     ``model`` may be a single module or a list of PP parts; the check is a
     per-model-class property, so the first part is representative.
@@ -318,8 +317,7 @@ def _extract_target_parameters(model: "nn.Module | list[nn.Module]", v4_compatib
         return []
     adapter = getattr(model_part, "state_dict_adapter", None)
     if adapter is not None and isinstance(adapter, MoESplitExpertsStateDictMixin):
-        expert_segment = adapter._expert_path_segment
-        return [f"{expert_segment}.gate_up_proj", f"{expert_segment}.down_proj"]
+        return list(adapter._v5_peft_target_parameters)
     return []
 
 
@@ -381,14 +379,14 @@ def _extract_target_modules(
 
     # MoE expert LoRA: adapter weights are nn.Parameter (not nn.Module) so
     # they don't appear in named_modules(). Expand to per-expert HF names,
-    # unless we are in v5 mode (v4_compatible=False) where fused
-    # target_parameters are used instead. The mixin check is a
-    # per-model-class property (identical across all PP parts), so check the
-    # first part.
-    _has_split_expert_mixin = hasattr(model_parts[0], "state_dict_adapter") and isinstance(
-        model_parts[0].state_dict_adapter, MoESplitExpertsStateDictMixin
+    # unless the adapter explicitly opts into v5 fused target_parameters.
+    # Unvalidated MoE adapters keep the legacy expansion as their default.
+    adapter = getattr(model_parts[0], "state_dict_adapter", None)
+    _has_split_expert_mixin = isinstance(adapter, MoESplitExpertsStateDictMixin)
+    _uses_v5_target_parameters = bool(
+        _has_split_expert_mixin and not v4_compatible and adapter._v5_peft_target_parameters
     )
-    if _has_split_expert_mixin and v4_compatible:
+    if _has_split_expert_mixin and not _uses_v5_target_parameters:
         seen_expert_groups: set[tuple[str, str]] = set()
         for _mp in model_parts:
             for name, param in _mp.named_parameters():

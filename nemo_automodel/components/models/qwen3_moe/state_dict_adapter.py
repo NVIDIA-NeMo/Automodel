@@ -56,6 +56,11 @@ class Qwen3MoeStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
         self.dtype = dtype
         self._uses_model_prefix = True
 
+    @property
+    def _v5_peft_target_parameters(self) -> tuple[str, ...]:
+        """Qwen3 MoE is validated for fused PEFT v5 ParamWrapper export."""
+        return ("mlp.experts.gate_up_proj", "mlp.experts.down_proj")
+
     def to_hf(
         self, state_dict: dict[str, Any], exclude_key_regex: Optional[str] = None, quantization: bool = False, **kwargs
     ) -> dict[str, Any]:
