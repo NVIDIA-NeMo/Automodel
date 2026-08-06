@@ -14,23 +14,8 @@
 
 """Tests for Hub kernel config and attn resolution helpers."""
 
-import types
-
 from nemo_automodel.components.kernels import hub as hub_kernels
 from nemo_automodel.components.kernels.config import HubKernelConfig
-
-
-class TestHasFlashAttnAvailable:
-    def test_compiled_package_short_circuits(self, monkeypatch):
-        monkeypatch.setattr(hub_kernels, "HAS_COMPILED_FA", True)
-        monkeypatch.setattr(hub_kernels, "_hub_flash_attn_module", lambda *args, **kwargs: None)
-        assert hub_kernels.has_flash_attn_available() is True
-
-    def test_hub_fallback_when_no_pip_package(self, monkeypatch):
-        monkeypatch.setattr(hub_kernels, "HAS_COMPILED_FA", False)
-        fake_mod = types.ModuleType("fake_fa")
-        monkeypatch.setattr(hub_kernels, "_hub_flash_attn_module", lambda *args, **kwargs: fake_mod)
-        assert hub_kernels.has_flash_attn_available() is True
 
 
 class TestResolveAttnImplementation:

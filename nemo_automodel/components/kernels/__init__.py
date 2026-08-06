@@ -16,17 +16,7 @@
 
 from nemo_automodel.components.kernels.config import HubKernelConfig
 from nemo_automodel.components.kernels.hub import (
-    HUB_ACTIVATION,
-    HUB_CAUSAL_CONV1D,
-    HUB_FLA,
     HUB_FLASH_ATTN2,
-    HUB_FLASH_ATTN3,
-    HUB_FLASH_ATTN4,
-    HUB_LIGER_KERNELS,
-    HUB_MAMBA_SSM,
-    HUB_MEGABLOCKS,
-    HUB_ROTARY,
-    RECOMMENDED_LOCK_REPOS,
     apply_hub_kernels_to_model,
     extract_hub_kernels_config,
     get_flash_attn_func,
@@ -39,18 +29,8 @@ from nemo_automodel.components.kernels.hub import (
 )
 
 __all__ = [
-    "HUB_ACTIVATION",
-    "HUB_CAUSAL_CONV1D",
-    "HUB_FLA",
     "HUB_FLASH_ATTN2",
-    "HUB_FLASH_ATTN3",
-    "HUB_FLASH_ATTN4",
-    "HUB_LIGER_KERNELS",
-    "HUB_MAMBA_SSM",
-    "HUB_MEGABLOCKS",
-    "HUB_ROTARY",
     "HubKernelConfig",
-    "RECOMMENDED_LOCK_REPOS",
     "apply_hub_kernels_to_model",
     "extract_hub_kernels_config",
     "get_flash_attn_func",

@@ -129,7 +129,7 @@ def initialize_attn_module_and_func(
                 "Install the optional hub_kernels extra: uv sync --extra hub_kernels"
             )
 
-        supported_flash_kwargs = {"dropout_p", "softmax_scale", "causal", "window_size", "deterministic", "is_causal"}
+        supported_flash_kwargs = {"dropout_p", "softmax_scale", "causal", "deterministic", "is_causal"}
         unexpected_kwargs = kwargs.keys() - supported_flash_kwargs
         if unexpected_kwargs:
             raise TypeError(f"Unsupported Hub flash attention kwargs: {sorted(unexpected_kwargs)}")
@@ -138,8 +138,18 @@ def initialize_attn_module_and_func(
         default_softmax_scale = cast(float | None, kwargs.get("softmax_scale", softmax_scale))
         default_is_causal = cast(bool, kwargs.get("is_causal", attn_mask_type == "causal"))
         default_deterministic = cast(bool, kwargs.get("deterministic", False))
+        supported_call_kwargs = {"dropout_p", "softmax_scale", "causal", "is_causal", "deterministic"}
 
         def attn_func(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, **call_kwargs: Any) -> torch.Tensor:
+            if call_kwargs.get("attn_mask") is not None:
+                raise ValueError(
+                    "backend.attn='hub' does not support dense attention masks. "
+                    "Use attn='sdpa' or attn='te' for padded or windowed batches."
+                )
+            unexpected_call_kwargs = call_kwargs.keys() - supported_call_kwargs
+            if unexpected_call_kwargs:
+                raise TypeError(f"Unsupported Hub flash attention kwargs: {sorted(unexpected_call_kwargs)}")
+
             dropout_p = cast(float, call_kwargs.get("dropout_p", default_dropout_p))
             scale = call_kwargs.get("softmax_scale", default_softmax_scale)
             is_causal = cast(bool, call_kwargs.get("is_causal", default_is_causal))
@@ -240,6 +250,29 @@ def preprocess_args_and_kwargs_for_attn(
         q = q.transpose(1, 2).contiguous()
         k = k.transpose(1, 2).contiguous()
         v = v.transpose(1, 2).contiguous()
+    elif attn_impl == "hub":
+        attn_kwargs = {}
+        q = q.transpose(1, 2).contiguous()
+        k = k.transpose(1, 2).contiguous()
+        v = v.transpose(1, 2).contiguous()
+        window_size = kwargs.get("window_size", (-1, 0))
+        left_window, right_window = window_size if isinstance(window_size, tuple) else (window_size, 0)
+        has_local_window = (left_window is not None and left_window >= 0) or (
+            right_window is not None and right_window > 0
+        )
+        if has_local_window:
+            raise ValueError(
+                "backend.attn='hub' does not support sliding-window attention. Use attn='sdpa' or attn='te'."
+            )
+        if attention_mask is not None:
+            if attention_mask.dim() > 2:
+                raise ValueError(
+                    "backend.attn='hub' does not support explicit dense attention masks. Use attn='sdpa' or attn='te'."
+                )
+            key_mask = attention_mask.to(device=q.device, dtype=torch.bool)
+            if not bool(key_mask.all().item()):
+                raise ValueError("backend.attn='hub' does not support padded batches. Use attn='sdpa' or attn='te'.")
+        attn_kwargs["is_causal"] = True
     elif attn_impl == "magi":  # pragma: no cover - requires magi_attention
         # magi's attn_func consumes the native [b, s, nh, hd] / [t, nh, hd] layout
         # directly (no transpose). Forward the genuine mask metadata so the FFA key
@@ -251,9 +284,9 @@ def preprocess_args_and_kwargs_for_attn(
         for _k in ("magi_attn_spec", "cu_seqlens", "cu_seqlens_q", "window_size"):
             if kwargs.get(_k) is not None:
                 attn_kwargs[_k] = kwargs[_k]
-    else:  # sdpa, hub
+    else:  # sdpa
         attn_kwargs = {}
-        # Transpose for SDPA / Hub flash (BHSD layout expected by attn_func)
+        # Transpose for SDPA (BHSD layout expected by attn_func)
         q = q.transpose(1, 2).contiguous()
         k = k.transpose(1, 2).contiguous()
         v = v.transpose(1, 2).contiguous()
