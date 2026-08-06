@@ -17,7 +17,12 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+from tokenizers import Tokenizer
+from tokenizers.models import WordLevel
+from tokenizers.pre_tokenizers import Whitespace
+from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
+from nemo_automodel import NeMoAutoTokenizer
 from nemo_automodel._transformers import sentence_transformer_export
 from nemo_automodel._transformers.sentence_transformer_export import (
     _resolve_sentence_transformer_max_seq_length,
@@ -141,6 +146,44 @@ def test_generated_sentence_transformer_assets_remove_training_tokenizer_state(t
     assert "processor_class" not in tokenizer_config
     assert not (metadata_dir / "processor_config.json").exists()
     assert not (metadata_dir / "preprocessor_config.json").exists()
+
+
+def test_generated_sentence_transformer_assets_preserve_effective_pad_token(tmp_path):
+    source_dir = tmp_path / "source"
+    metadata_dir = tmp_path / "metadata"
+    source_dir.mkdir()
+    metadata_dir.mkdir()
+    tokenizer_backend = Tokenizer(WordLevel({"[UNK]": 0, "hello": 1, "world": 2}, unk_token="[UNK]"))
+    tokenizer_backend.pre_tokenizer = Whitespace()
+    source_tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=tokenizer_backend,
+        unk_token="[UNK]",
+        model_max_length=32,
+    )
+    source_tokenizer.save_pretrained(source_dir)
+
+    tokenizer = NeMoAutoTokenizer.from_pretrained(source_dir)
+    assert tokenizer.pad_token == "[UNK]"
+    tokenizer.save_pretrained(metadata_dir)
+
+    model = SimpleNamespace(
+        pooling="avg",
+        l2_normalize=True,
+        config=SimpleNamespace(hidden_size=8, max_position_embeddings=32),
+    )
+    export_config = SimpleNamespace(query_prompt="query: ", document_prompt="passage: ")
+    _save_generated_sentence_transformer_assets(
+        model,
+        export_config,
+        str(source_dir),
+        str(metadata_dir),
+        tokenizer,
+    )
+
+    reloaded = AutoTokenizer.from_pretrained(metadata_dir)
+    assert reloaded.pad_token == tokenizer.pad_token
+    assert reloaded.pad_token_id == tokenizer.pad_token_id
+    assert reloaded(["hello", "hello world"], padding=True)["attention_mask"] == [[1, 0], [1, 1]]
 
 
 def test_generated_sentence_transformer_assets_preserve_repository_and_model_root_legal_assets(tmp_path):

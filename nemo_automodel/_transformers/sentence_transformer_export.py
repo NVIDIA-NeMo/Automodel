@@ -327,8 +327,10 @@ def _remove_stale_text_processor_assets(hf_metadata_dir: str) -> None:
 def _restore_source_tokenizer_serialization_state(
     original_model_path: str | None,
     hf_metadata_dir: str,
+    tokenizer,
 ) -> None:
     """Remove training-time tokenizer state while retaining tokenizer edits."""
+    pad_token = getattr(tokenizer, "pad_token", None)
     tokenizer_json_path = os.path.join(hf_metadata_dir, "tokenizer.json")
     source_tokenizer_json_path = (
         os.path.join(original_model_path, "tokenizer.json") if original_model_path is not None else None
@@ -360,7 +362,16 @@ def _restore_source_tokenizer_serialization_state(
         else:
             tokenizer_config.pop("local_files_only", None)
         tokenizer_config.pop("processor_class", None)
+        if pad_token is not None:
+            tokenizer_config["pad_token"] = pad_token
         _write_json(tokenizer_config_path, tokenizer_config)
+
+    special_tokens_map_path = os.path.join(hf_metadata_dir, "special_tokens_map.json")
+    if pad_token is not None and os.path.isfile(special_tokens_map_path):
+        with open(special_tokens_map_path) as f:
+            special_tokens_map = json.load(f)
+        special_tokens_map["pad_token"] = pad_token
+        _write_json(special_tokens_map_path, special_tokens_map)
 
 
 def _read_source_sentence_transformer_max_seq_length(original_model_path: str | None) -> int | None:
@@ -505,7 +516,7 @@ def _save_generated_sentence_transformer_assets(
         {"max_seq_length": max_seq_length, "do_lower_case": False},
     )
     _write_json(os.path.join(hf_metadata_dir, "1_Pooling", "config.json"), pooling_config)
-    _restore_source_tokenizer_serialization_state(original_model_path, hf_metadata_dir)
+    _restore_source_tokenizer_serialization_state(original_model_path, hf_metadata_dir, tokenizer)
     _remove_stale_text_processor_assets(hf_metadata_dir)
     _copy_source_legal_assets(
         original_model_path,
