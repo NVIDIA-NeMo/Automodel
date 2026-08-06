@@ -36,7 +36,7 @@ covers the pieces a single-process test cannot reach:
   * collective ordering across the two layer types within one forward/backward
 
 Usage:
-    torchrun --nproc_per_node=2 tests/functional_tests/context_parallel/run_kimi_linear_cp.py
+    torchrun --nproc_per_node=2 tests/functional_tests/context_parallel_kimi_linear/run_kimi_linear_cp.py
 """
 
 import os

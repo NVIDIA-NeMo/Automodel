@@ -20,4 +20,4 @@ export CUDA_VISIBLE_DEVICES="0,1"
 
 # Run the Kimi Linear hybrid (KDA + MLA) CP test with 2 GPUs
 python -m torch.distributed.run --nproc_per_node=2 --nnodes=1 -m coverage run \
-    tests/functional_tests/context_parallel/run_kimi_linear_cp.py
+    tests/functional_tests/context_parallel_kimi_linear/run_kimi_linear_cp.py
