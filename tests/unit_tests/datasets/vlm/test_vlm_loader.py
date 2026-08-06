@@ -18,6 +18,7 @@ import pytest
 from transformers import ProcessorMixin
 
 from nemo_automodel.components.config.loader import ConfigNode
+from nemo_automodel.components.datasets.llm.chat_dataset import ChatDatasetConfig
 from nemo_automodel.components.datasets.vlm.collate_fns import (
     neat_packed_vlm_collater,
     packed_sequence_thd_vlm_collater,
@@ -329,6 +330,35 @@ def test_build_source_forwards_processor_tokenizer_to_text_dataset():
     assert ds_cfg.received_tokenizer is inner_tokenizer  # tokenizer, not the processor
     assert returned_processor is processor  # processor still returned for pretokenization/collation
     assert dataset == ["sample"]
+
+
+def test_vlm_dataloader_drops_dataset_tokenizer_block():
+    # A `dataset.tokenizer` block is valid on the LLM path (the tokenizer is a runtime
+    # build arg, popped before building the dataset config). The VLM path must drop it
+    # too; otherwise it reaches ChatDatasetConfig, which rejects unknown fields.
+    config = RecipeConfig(
+        ConfigNode(
+            {
+                "dataset": {
+                    "_target_": "nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset",
+                    "path_or_dataset_id": "unused.jsonl",
+                    "seq_length": 512,
+                    "tokenizer": {
+                        "_target_": "transformers.AutoTokenizer.from_pretrained",
+                        "pretrained_model_name_or_path": "unused-model",
+                    },
+                },
+                "dataloader": {
+                    "_target_": "torchdata.stateful_dataloader.StatefulDataLoader",
+                    "num_workers": 0,
+                },
+            }
+        )
+    ).vlm_dataloader
+
+    assert isinstance(config.dataset_config, ChatDatasetConfig)
+    assert config.dataset_config.path_or_dataset_id == "unused.jsonl"
+    assert config.dataset_config.seq_length == 512
 
 
 def test_build_source_forwards_bare_tokenizer_unchanged():
