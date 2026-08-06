@@ -189,13 +189,15 @@ def test_extract_submodel_dequantizes_native_fp8_for_training(monkeypatch):
     )
 
     assert backbone is language_model
-    assert config.quantization_config["dequantize"] is True
-    auto_model_from_pretrained.assert_called_once_with(
-        "org/fp8-vlm",
-        trust_remote_code=True,
-        torch_dtype=torch.bfloat16,
-        config=config,
-    )
+    assert config.quantization_config["dequantize"] is False
+    auto_model_from_pretrained.assert_called_once()
+    (model_name_or_path,) = auto_model_from_pretrained.call_args.args
+    model_load_kwargs = auto_model_from_pretrained.call_args.kwargs
+    assert model_name_or_path == "org/fp8-vlm"
+    assert model_load_kwargs["trust_remote_code"] is True
+    assert model_load_kwargs["torch_dtype"] is torch.bfloat16
+    assert isinstance(model_load_kwargs["quantization_config"], retrieval.FineGrainedFP8Config)
+    assert model_load_kwargs["quantization_config"].dequantize is True
 
 
 def test_extract_submodel_llama_embedding_from_local_vlm_converts_to_supported_backbone(tmp_path):

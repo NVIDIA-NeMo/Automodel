@@ -22,6 +22,7 @@ from nemo_automodel.components.config.loader import ConfigNode
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 CONFIG_PATH = REPO_ROOT / "examples" / "retrieval" / "bi_encoder" / "ministral3_3b_instruct.yaml"
+EXPECTED_CHECKPOINT = "mistralai/Ministral-3-3B-Instruct-2512-BF16"
 
 
 class _Mistral3Config:
@@ -33,9 +34,17 @@ class _FakeMistralTokenizer:
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path: str, *, padding_side: str):
-        assert pretrained_model_name_or_path == "mistralai/Ministral-3-3B-Instruct-2512"
+        assert pretrained_model_name_or_path == EXPECTED_CHECKPOINT
         assert padding_side == "left"
         return cls()
+
+
+def test_ministral3_recipe_uses_bf16_checkpoint() -> None:
+    """The shipped training recipe must use the unquantized checkpoint."""
+    raw_config = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
+
+    assert raw_config["model"]["pretrained_model_name_or_path"] == EXPECTED_CHECKPOINT
+    assert raw_config["tokenizer"]["pretrained_model_name_or_path"] == EXPECTED_CHECKPOINT
 
 
 def test_ministral3_tokenizer_config_uses_registered_backend() -> None:
