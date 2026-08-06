@@ -44,6 +44,8 @@ NON_QUANTIZED_KEY_PATTERNS = [
 def should_quantize_key(key: str) -> bool:
     if not key.endswith(".weight"):
         return False
+    if ".lora_" in key:
+        return False
     return not any(pattern in key for pattern in NON_QUANTIZED_KEY_PATTERNS)
 
 
@@ -66,6 +68,11 @@ class MiniMaxM2StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
     @property
     def _expert_path_segment(self) -> str:
         return "mlp.experts"
+
+    @property
+    def _v5_peft_target_parameters(self) -> tuple[str, ...]:
+        """MiniMax M2 exposes fused expert parameters under block_sparse_moe in Transformers v5."""
+        return ("block_sparse_moe.experts.gate_up_proj", "block_sparse_moe.experts.down_proj")
 
     def _dequantize(self, state_dict: dict[str, Any]) -> dict[str, Any]:
         scale_inv_keys = []
