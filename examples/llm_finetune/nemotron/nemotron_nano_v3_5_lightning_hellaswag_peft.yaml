@@ -46,9 +46,8 @@ model:
   # and mtp_layers_block_type fields (one MTP depth = attention sublayer then
   # MoE sublayer). The overrides below configure 2 weight-tied MTP iterations
   # (predicting t+2 and t+3) that reuse the checkpoint's single physical MTP
-  # layer, mirroring Megatron's --mtp-use-repeated-layer; the HF export only
-  # retains the physical depth count, so the iteration count must be set
-  # explicitly.
+  # layer; the HF export only retains the physical depth count, so the
+  # iteration count must be set explicitly.
   num_nextn_predict_layers: 2
   mtp_use_repeated_layer: true
   mtp_loss_scaling_factor: 0.1
