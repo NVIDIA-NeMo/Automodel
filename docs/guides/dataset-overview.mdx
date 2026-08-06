@@ -626,7 +626,7 @@ class MyCompletionDataset:
 Then reference your class with `_target_` in YAML.
 
 ### Important Considerations
-- **Chat templates**: SQuAD uses a tokenizer chat template automatically when available. Column-mapped datasets opt in with `use_hf_chat_template: true`; `ChatDataset` derives assistant masking from the tokenizer's chat template. VLM collators derive assistant labels from the processor template and do not accept `start_of_response_token`.
+- **Chat templates**: SQuAD uses a tokenizer chat template automatically when available. Column-mapped datasets opt in with `use_hf_chat_template: true`. `ChatDataset` derives assistant masking from the tokenizer's chat template. VLM collators derive assistant labels from the processor template and do not accept `start_of_response_token`.
 - **Padding for FP8**: If training with FP8, set `pad_seq_len_divisible: 16` in your collate function to align sequence lengths.
 - **Packed sequences**: Prefer packed sequences for throughput when fine-tuning LLMs on variable-length corpora.
 - **Validation**: You can define a separate `validation_dataset` and `validation_dataloader` block mirroring your training config.
