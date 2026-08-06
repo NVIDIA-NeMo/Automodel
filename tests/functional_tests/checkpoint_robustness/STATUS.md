@@ -25,7 +25,10 @@ non-blockingly, without another training run. The comparison runs only when
 their model/seed, data, batch/topology, optimizer, scheduler, loss, and backend
 fingerprints match; exact per-rank batch digests are then checked before loss
 differences are reported. Recipe-specific resume threshold relaxations
-calibrated against the former independent baseline have been removed.
+calibrated against the former independent baseline have been removed. This
+independent-run report is opportunistic rather than guaranteed coverage when
+phase-specific overrides make the existing runs incomparable; the blocking
+reproducibility oracle is the shared-trajectory resume comparison.
 
 Recipes with `no_check_resume: true` remain explicitly exempt rather than being
 treated as passing. Those exemptions cover model/topology-specific restore

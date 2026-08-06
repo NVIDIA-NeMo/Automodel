@@ -96,7 +96,9 @@ batch digests, loss, and LR. They are compared only when component fingerprints 
 seed, dataset/dataloader ordering, batch sizes and topology, optimizer, LR scheduler, loss, and backend configuration.
 Otherwise the log reports `not_comparable` and names the mismatched components. Loss differences use the separately
 calibrated `training_reproducibility_loss_threshold` (default `5e-2`). Exceeding that envelope remains non-blocking but
-emits a prominent `ALERT` and saves a machine-readable `report.json` in the reproducibility artifact directory.
+emits a prominent `ALERT` and saves a machine-readable `report.json` in the reproducibility artifact directory. This is
+an opportunistic diagnostic rather than required coverage: phase-specific overrides may make the two existing runs
+incomparable, while the shared-trajectory resume check remains the blocking reproducibility oracle.
 
 Use source-load parity for recipes where the initial HF checkpoint load is itself part of the contract, especially
 remote-code, force-HF, custom model, or tied/untied `lm_head` paths. The raw HF reference model is loaded only long

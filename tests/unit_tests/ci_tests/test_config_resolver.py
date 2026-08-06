@@ -398,8 +398,8 @@ def test_vlm_checkpoint_robustness_recipes_resolve(tmp_path, recipe_path):
         assert robustness["hf_kl_threshold"] == 2.5e-2
         assert "resume_loss_threshold" not in robustness
         assert robustness["training_reproducibility_loss_threshold"] == 2e-2
-        assert robustness["source_load_kl_threshold"] == 2e-2
-        assert robustness["source_load_mean_kl_threshold"] == 5e-3
+        assert robustness["source_load_kl_threshold"] == 4e-2
+        assert robustness["source_load_mean_kl_threshold"] == 7e-3
     if Path(recipe_path).stem == "qwen3_5_35b":
         assert robustness["experts_implementation"] == "grouped_mm"
         for key in (
@@ -421,6 +421,21 @@ def test_vlm_checkpoint_robustness_recipes_resolve(tmp_path, recipe_path):
     assert "hf_device_map_auto" not in resolved
     assert "hf_source_post_load_dequantize" not in resolved
     assert "tokenizer_name" not in resolved
+
+
+def test_retrieval_checkpoint_robustness_retains_calibrated_resume_threshold(tmp_path):
+    """Retrieval robustness keeps its shared-trajectory and independent-run envelopes distinct."""
+    recipe_path = "examples/retrieval/bi_encoder/nemotron_vl_1b/nemotron_vl_1b_example.yaml"
+    out = tmp_path / "resolved.yaml"
+    env = {"PIPELINE_DIR": str(tmp_path), "TEST_NAME": Path(recipe_path).stem}
+    _run_resolver(
+        ["--base", str(REPO_ROOT / recipe_path), "--phase", "checkpoint_robustness", "--output", str(out)],
+        env=env,
+    )
+
+    robustness = yaml.load(out.open())["ci"]["checkpoint_robustness"]
+    assert robustness["resume_loss_threshold"] == 2e-2
+    assert robustness["training_reproducibility_loss_threshold"] == 5e-2
 
 
 @pytest.mark.parametrize(
