@@ -720,6 +720,8 @@ def test_ministral_embedding_uses_bidirectional_flash_attention(tmp_path, monkey
     [
         ("avg", True),
         ("avg", False),
+        ("mean", True),
+        ("mean", False),
         ("cls", True),
         ("cls", False),
         ("last", True),
@@ -794,7 +796,8 @@ def test_sentence_transformers_and_nemo_round_trip_generated_ministral_checkpoin
         nemo_query = nemo_reloaded(tokenizer(query_texts, padding=True, return_tensors="pt"))
         nemo_document = nemo_reloaded(tokenizer(document_texts, padding=True, return_tensors="pt"))
 
-    assert nemo_reloaded.pooling == pooling
+    assert encoder.pooling == ("avg" if pooling == "mean" else pooling)
+    assert nemo_reloaded.pooling == ("avg" if pooling == "mean" else pooling)
     assert nemo_reloaded.l2_normalize is l2_normalize
     assert sentence_transformer.similarity_fn_name == expected_similarity_fn
     assert sentence_transformer.max_seq_length == 32
@@ -948,12 +951,42 @@ def test_nemo_bi_encoder_saved_prompts_round_trip_through_reexport(tmp_path):
     assert metadata["prompts"] == {"query": "query: ", "document": "passage: "}
 
 
+def test_mean_pooling_alias_matches_avg():
+    from nemo_automodel._transformers import retrieval
+
+    hidden_states = torch.tensor([[[1.0, 2.0], [3.0, 4.0], [100.0, 100.0]]])
+    attention_mask = torch.tensor([[1, 1, 0]])
+
+    torch.testing.assert_close(
+        retrieval.pool(hidden_states, attention_mask, "mean"),
+        retrieval.pool(hidden_states, attention_mask, "avg"),
+    )
+
+
 def test_nemo_bi_encoder_uses_defaults_without_sentence_transformer_metadata():
     from nemo_automodel._transformers import retrieval
 
     config = PretrainedConfig()
 
     assert retrieval._resolve_bi_encoder_options(config, None, None, None) == ("avg", True)
+
+    assert retrieval._resolve_bi_encoder_options(PretrainedConfig(pooling="mean"), None, None, None) == ("avg", True)
+
+
+def test_nemo_bi_encoder_build_canonicalizes_mean_pooling(tmp_path):
+    from nemo_automodel._transformers import retrieval
+
+    model_dir, _ = _save_tiny_ministral_text_model(tmp_path)
+
+    encoder = retrieval.BiEncoderModel.build(
+        str(model_dir),
+        pooling="mean",
+        attn_implementation="eager",
+    )
+
+    assert encoder.pooling == "avg"
+    assert not hasattr(encoder.model.config, "pooling")
+    assert encoder.sentence_transformer_export_config is not None
 
 
 def test_extract_submodel_ministral_embedding_from_local_vlm_converts_to_supported_backbone(tmp_path):

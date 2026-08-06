@@ -362,7 +362,8 @@ dataloader:
 The following settings control bi-encoder behavior:
 
 - `pooling`: controls how token hidden states become one embedding. Common single-vector choices are `avg`, `cls`,
-  `last`, and `weighted_avg`. The shipped hard-negative miner does not expose a pooling override. When the checkpoint
+  `last`, and `weighted_avg`. `mean` is a compatibility alias for `avg`. AutoModel canonicalizes it to `avg` before
+  saving or exporting. The shipped hard-negative miner does not expose a pooling override. When the checkpoint
   contains supported Sentence Transformers metadata, the miner restores the saved pooling mode. Otherwise, loading
   falls back to the backbone configuration or `avg`. Do not use the miner with `colbert` pooling, which returns
   token-level embeddings.

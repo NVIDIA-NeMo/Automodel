@@ -47,6 +47,11 @@ _BI_ENCODER_DEFAULT_POOLING = "avg"
 _BI_ENCODER_DEFAULT_L2_NORMALIZE = True
 
 
+def _canonicalize_bi_encoder_pooling(pooling: str) -> str:
+    """Return the canonical AutoModel name for a bi-encoder pooling alias."""
+    return _BI_ENCODER_DEFAULT_POOLING if pooling == "mean" else pooling
+
+
 def _resolve_bi_encoder_options(
     config: PretrainedConfig,
     saved_options: SentenceTransformerWrapperOptions | None,
@@ -61,6 +66,7 @@ def _resolve_bi_encoder_options(
             pooling = getattr(config, "pooling", None) or _BI_ENCODER_DEFAULT_POOLING
     if l2_normalize is None:
         l2_normalize = saved_options.l2_normalize if saved_options is not None else _BI_ENCODER_DEFAULT_L2_NORMALIZE
+    pooling = _canonicalize_bi_encoder_pooling(pooling)
     return pooling, l2_normalize
 
 
@@ -187,8 +193,7 @@ def pool(last_hidden_states: torch.Tensor, attention_mask: torch.Tensor, pool_ty
         Pooled embeddings [batch_size, hidden_size]
     """
     last_hidden = last_hidden_states.masked_fill(~attention_mask[..., None].bool(), 0.0)
-    if pool_type == "mean":
-        pool_type = "avg"
+    pool_type = _canonicalize_bi_encoder_pooling(pool_type)
 
     if pool_type == "avg":
         emb = last_hidden.sum(dim=1) / attention_mask.sum(dim=1)[..., None]
@@ -454,6 +459,7 @@ class BiEncoderModel(nn.Module):
         detach_distributed_inbatch_negatives: bool = True,
     ):
         super().__init__()
+        pooling = _canonicalize_bi_encoder_pooling(pooling)
         _init_encoder_common(self, model)
         self.pooling = pooling
         self.l2_normalize = l2_normalize
