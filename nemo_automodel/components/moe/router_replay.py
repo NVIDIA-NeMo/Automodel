@@ -57,7 +57,7 @@ from typing import Iterator, List, Optional
 
 import torch
 
-__all__ = ["RouterReplayMode", "RouterReplay", "replay_selection"]
+__all__ = ["RouterReplayMode", "RouterReplay", "RecomputeReplayDriver", "replay_selection"]
 
 
 class RouterReplayMode(Enum):
@@ -218,6 +218,59 @@ class RouterReplay:
             cls.set_mode(None)
             for inst in cls._registry:
                 inst.target_indices = None
+
+    @classmethod
+    @contextmanager
+    def drive_recompute(cls) -> Iterator["RecomputeReplayDriver"]:
+        """Replay the forward's routing during an activation-checkpointing/pipeline recompute.
+
+        This is the single-step analog of the RL ``record``/``replay`` pair above: instead of a
+        rollout forward and a later training forward, the two passes are the forward and its
+        activation-checkpoint (or pipeline) recompute *within one training step*. Under activation
+        checkpointing the MoE router is re-run during ``backward``; on tie-heavy routing (e.g.
+        mask-dense diffusion data) a near-tie can flip on the recompute, changing a per-rank dispatch
+        buffer's token count by one and raising ``torch.utils.checkpoint.CheckpointError``. Replaying
+        the recorded selection makes the recompute's routing identical to the forward's.
+
+        Gates RECORD their selection during the forward; :meth:`RecomputeReplayDriver.backward` sets
+        each gate's recorded selection as its replay target and runs ``backward`` in REPLAY mode.
+        Drives every gate built with ``enable_routing_replay=True`` (a no-op otherwise). Correct for
+        gradient accumulation because the replay target is refreshed from the freshly recorded
+        selection at each ``backward``. Usage::
+
+            with RouterReplay.drive_recompute() as driver:
+                loss = model(batch)      # forward: RECORD each gate's top-k selection
+                driver.backward(loss)    # backward: REPLAY it during the checkpoint recompute
+        """
+        cls.set_mode(RouterReplayMode.RECORD)
+        try:
+            yield RecomputeReplayDriver()
+        finally:
+            cls.set_mode(None)
+            cls.clear_indices()
+
+
+class RecomputeReplayDriver:
+    """Runs ``backward`` with each gate's recorded selection replayed during recompute.
+
+    Created by :meth:`RouterReplay.drive_recompute`; not instantiated directly.
+    """
+
+    def backward(self, tensor: torch.Tensor, *args, **kwargs) -> None:
+        """Replay the recorded selection during recompute, then run ``tensor.backward(...)``.
+
+        Args:
+            tensor: The scalar loss to call ``backward`` on.
+            *args: Positional args forwarded to ``tensor.backward``.
+            **kwargs: Keyword args forwarded to ``tensor.backward``.
+        """
+        for inst in RouterReplay.instances():
+            inst.target_indices = inst.recorded_indices
+        RouterReplay.set_mode(RouterReplayMode.REPLAY)
+        try:
+            tensor.backward(*args, **kwargs)
+        finally:
+            RouterReplay.set_mode(RouterReplayMode.RECORD)
 
 
 def replay_selection(router_replay: Optional[RouterReplay], indices: torch.Tensor) -> torch.Tensor:
