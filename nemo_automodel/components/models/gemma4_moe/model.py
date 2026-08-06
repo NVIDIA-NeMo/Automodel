@@ -97,6 +97,7 @@ from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 from .cp_attention import attach_gemma4_cp_ring_attention, gemma4_vision_group_ids
 from .cp_batch import make_contiguous_aux_only_shard_cp_batch_and_ctx
+from .sdpa_fp32 import enable_gemma4_sdpa_fp32
 
 
 class _Gemma4KVShareHolder:
@@ -978,6 +979,10 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
         if not _GEMMA4_HF_AVAILABLE:
             raise UnavailableError("transformers.models.gemma4 is not available.")
         config = Gemma4Config.from_pretrained(pretrained_model_name_or_path)
+        # #2208: fused bf16 SDPA NaNs on Hopper; run SDPA in fp32 instead.
+        attn_impl = kwargs.get("attn_implementation") or getattr(config, "_attn_implementation", None)
+        if attn_impl == "sdpa":
+            enable_gemma4_sdpa_fp32()
         return cls.from_config(config, *model_args, **kwargs)
 
     def setup_cp_attention(self, cp_mesh) -> None:

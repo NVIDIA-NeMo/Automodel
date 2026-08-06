@@ -28,8 +28,8 @@ except ImportError:
 import logging
 import pathlib
 import time
-from contextlib import nullcontext
-from typing import TYPE_CHECKING, Any, Optional
+from contextlib import contextmanager, nullcontext
+from typing import TYPE_CHECKING, Any, Optional, Protocol
 
 import mlflow
 import torch
@@ -47,9 +47,14 @@ from nemo_automodel._transformers import (
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches, resolve_get_rope_index
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.vlm.pp_media import stage_vlm_media_for_pp
-from nemo_automodel.components.distributed.config import DistributedSetup, MegatronFSDPConfig
+from nemo_automodel.components.distributed.config import DistributedSetup, FSDP2Config, MegatronFSDPConfig
 from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
 from nemo_automodel.components.distributed.context_parallel.magi import MagiState, setup_magi
+from nemo_automodel.components.distributed.cp_vision_frame_shard import (
+    CpVisionFrameShardingConfig,
+    reset_cp_vision_group,
+    set_cp_vision_group,
+)
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
@@ -98,6 +103,33 @@ except (ImportError, FileNotFoundError, OSError):
 # ---------------------------
 #  Stateless helper functions
 # ---------------------------
+
+
+class _CpVisionFrameShardingCapability(Protocol):
+    """Model capability required by the VLM vision frame-sharding recipe policy."""
+
+    @property
+    def supports_cp_vision_frame_sharding(self) -> bool:
+        """Whether the model owns a verified CP vision frame-sharding integration."""
+        ...
+
+
+def _validate_cp_vision_frame_sharding_support(
+    model: _CpVisionFrameShardingCapability,
+    config: CpVisionFrameShardingConfig,
+) -> None:
+    """Reject enabled vision frame sharding when the model has no production integration."""
+    if not config.enabled or model.supports_cp_vision_frame_sharding:
+        return
+
+    model_name = type(model).__name__
+    raise ValueError(
+        "distributed.multimodal.vision.frame_sharding.enabled=true requires a model-owned integration "
+        f"for sharding vision frames over CP ranks, but {model_name} declares "
+        "supports_cp_vision_frame_sharding=False. "
+        "Disable the policy with distributed.multimodal.vision.frame_sharding.enabled=false "
+        "or use a supported model."
+    )
 
 
 def _get_model_name(cfg_model):
@@ -326,6 +358,7 @@ def build_dataloader(
             get_rope_index=get_rope_index,
             packing_attn_implementation=packing_attn_implementation,
             pp_n_microbatches=pp_n_microbatches,
+            cp_size=cp_size,
         )
     return result.dataloader, result.processor
 
@@ -438,6 +471,11 @@ class FinetuneRecipeForVLM(BaseRecipe):
             self.moe_parallel_config,
             self.activation_checkpointing,
         ) = self._distributed_setup_attributes(self._create_distributed_setup())
+        self.cp_vision_frame_sharding = (
+            self.distributed_config.multimodal.vision.frame_sharding
+            if isinstance(self.distributed_config, FSDP2Config)
+            else CpVisionFrameShardingConfig()
+        )
 
         if not self._should_setup_training_components():
             return
@@ -507,6 +545,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             pp_rank=self._get_pp_rank(),
             moe_mesh=self.moe_mesh,
             process_group=getattr(self.mesh_context, "process_group", None),
+            pp_group=self._get_pp_group(),
         )
 
         # Disable fused RoPE when context parallelism is enabled (cp > 1)
@@ -524,6 +563,8 @@ class FinetuneRecipeForVLM(BaseRecipe):
             distributed_setup=self.distributed_setup,
             cfg_quantization=self.cfg.get("quantization", None),
         )
+        capability_model = model.parts[0] if isinstance(model, AutoPipeline) else model
+        _validate_cp_vision_frame_sharding_support(capability_model, self.cp_vision_frame_sharding)
         apply_te_patches()
         optimizer = self.cfg.optimizer.build(model, device_mesh=self.device_mesh, is_peft=self.peft_config is not None)
         allow_megatron_fsdp_sharding = getattr(self.cfg.optimizer, "supports_megatron_fsdp_sharding", True)
@@ -551,6 +592,11 @@ class FinetuneRecipeForVLM(BaseRecipe):
             self.cfg.prewarm.apply(
                 model_parts=self.model_parts,
                 device=self.dist_env.device,
+                batch_size=(
+                    self.pp.pp_microbatch_size
+                    if self.pp is not None
+                    else self.cfg.get("step_scheduler.local_batch_size", 1)
+                ),
                 pp_mesh=(self.device_mesh["pp"] if self.pp_enabled and self.device_mesh is not None else None),
             )
 
@@ -573,7 +619,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         from nemo_automodel.components.models.common.packing import configure_packing, get_attn_implementation
 
         packing_attn_implementation = dataloader_config.resolve_packing_attn_implementation(
-            model_attn_implementation=get_attn_implementation(self.cfg.model),
+            model_attn_implementation=get_attn_implementation(self.cfg.model, model=self.model_parts[0]),
             cp_size=self.mesh_context.cp_size,
         )
         if dataloader_config.packing is not None and dataloader_config.packing.packing_format != "thd":
@@ -590,6 +636,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 get_rope_index=get_rope_index,
                 packing_attn_implementation=packing_attn_implementation,
                 pp_n_microbatches=pp_n_microbatches,
+                cp_size=self.mesh_context.cp_size,
             )
         self.dataloader = dataloader_build.dataloader
         self.processor = dataloader_build.processor
@@ -607,6 +654,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
                     dataset_build_context=validation_build_context,
                     get_rope_index=get_rope_index,
+                    cp_size=self.mesh_context.cp_size,
                 )
             self.val_dataloader = validation_build.dataloader
 
@@ -772,6 +820,28 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     ),
                 )
 
+    @contextmanager
+    def _cp_vision_frame_sharding_context(self):
+        """Publish the CP-only group while a VLM forward may run its vision tower."""
+        if self.device_mesh is None:
+            yield
+            return
+
+        mesh_dim = self.cp_vision_frame_sharding.mesh_dims[0]
+        cp_active = mesh_dim in self.device_mesh.mesh_dim_names and self.device_mesh[mesh_dim].size() > 1
+        if not cp_active:
+            yield
+            return
+
+        token = set_cp_vision_group(
+            self.device_mesh[mesh_dim].get_group(),
+            config=self.cp_vision_frame_sharding,
+        )
+        try:
+            yield
+        finally:
+            reset_cp_vision_group(token)
+
     def _forward_backward_step(
         self,
         idx,
@@ -829,7 +899,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 logging.info("Skipping forward pass for validation because pipeline parallelism is enabled")
                 return
 
-            with train_ctx():
+            with self._cp_vision_frame_sharding_context(), train_ctx():
                 losses = [] if self.pp.info.has_last_stage else None
                 if self.pp.info.has_last_stage:
                     masked_labels = labels.clone()
@@ -843,10 +913,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 self._maybe_set_pp_first_stage_embed_input_meta(model_input)
 
                 with stage_vlm_media_for_pp(self.pp, self.model_parts, batch):
-                    if self.pp.info.has_first_stage:
-                        self.pp.info.schedule.step(model_input, target=targets, losses=losses, **batch)
-                    else:
-                        self.pp.info.schedule.step(target=targets, losses=losses, **batch)
+                    self.pp.step(model_input, target=targets, losses=losses, **batch)
 
             if self.pp.info.has_last_stage:
                 local_loss = torch.sum(torch.stack(losses))
@@ -865,7 +932,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 if is_train
                 else nullcontext()
             )
-            with sync_ctx, train_ctx():
+            with sync_ctx, self._cp_vision_frame_sharding_context(), train_ctx():
                 batch = filter_forward_kwargs(model, batch)
                 if isinstance(self.loss_fn, FusedLinearCrossEntropy):
                     # use num_logits_to_keep to avoid full logits matrix in memory
@@ -1116,7 +1183,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 )
                 train_ctx, batch = cp_sharder.shard(batch)
                 labels = batch.pop("labels")
-                with train_ctx():
+                with self._cp_vision_frame_sharding_context(), train_ctx():
                     batch = filter_forward_kwargs(self.model_parts[0], batch)
                     if isinstance(self.loss_fn, FusedLinearCrossEntropy):
                         out = self.model_parts[0](logits_to_keep=1, **batch)
@@ -1127,9 +1194,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                         logits=getattr(out, "logits", out),
                         labels=labels,
                         model=self.model_parts[0],
-                        hidden_states=out.hidden_states[-1]
-                        if getattr(out, "hidden_states", None) is not None
-                        else None,
+                        hidden_states=get_final_hidden_states(out),
                         num_label_tokens=num_label_tokens,
                     )
                     # Mirror training: include the drafter term so validation

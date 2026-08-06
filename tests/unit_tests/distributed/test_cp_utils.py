@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import contextlib
 from functools import partial
+from unittest import mock
 
 import pytest
 import torch
@@ -447,6 +448,73 @@ def test_attach_context_parallel_hooks_skips_non_self_attn():
         assert len(layer._forward_pre_hooks) == 0
 
 
+def test_attach_te_context_parallel_configures_full_and_sliding_attention(monkeypatch):
+    """TE setup must configure TP independently and choose the CP communication mode."""
+
+    class _FakeDotProductAttention:
+        def __init__(self):
+            self.calls = []
+            self.tp_calls = []
+            self.num_attention_heads = 8
+            self.num_gqa_groups = 4
+            self.tp_size = 1
+            self.num_gqa_groups_per_partition = 4
+
+        def set_context_parallel_group(self, group, ranks, stream, *, cp_comm_type):
+            self.calls.append((group, ranks, stream, cp_comm_type))
+
+        def set_tensor_parallel_group(self, group):
+            self.tp_calls.append(group)
+
+    class _Attention(torch.nn.Module):
+        def __init__(self, sliding_window):
+            super().__init__()
+            self.attn_module = _FakeDotProductAttention()
+            self.sliding_window = sliding_window
+
+    class _Block(torch.nn.Module):
+        def __init__(self, sliding_window):
+            super().__init__()
+            self.self_attn = _Attention(sliding_window)
+
+    model = torch.nn.ModuleList([_Block(None), _Block(128)])
+    group = object()
+    stream = object()
+    cp_mesh = mock.MagicMock()
+    cp_mesh.size.return_value = 2
+    cp_mesh.get_group.return_value = group
+    tp_group = object()
+    tp_mesh = mock.MagicMock()
+    tp_mesh.size.return_value = 2
+    tp_mesh.get_group.return_value = tp_group
+
+    monkeypatch.setattr(
+        "nemo_automodel.shared.import_utils.safe_import_from",
+        lambda *_args: (True, _FakeDotProductAttention),
+    )
+    monkeypatch.setattr(torch.distributed, "get_process_group_ranks", lambda _group: [0, 1])
+    monkeypatch.setattr(torch.cuda, "Stream", lambda: stream)
+
+    configured = _cu.attach_te_context_parallel(model, cp_mesh, tp_mesh)
+
+    assert configured == 2
+    assert model[0].self_attn.attn_module.calls == [(group, [0, 1], stream, "p2p")]
+    assert model[1].self_attn.attn_module.calls == [(group, [0, 1], stream, "all_gather")]
+    for block in model:
+        assert block.self_attn.attn_module.tp_calls == [tp_group]
+        assert block.self_attn.attn_module.tp_size == 2
+        assert block.self_attn.attn_module.num_gqa_groups_per_partition == 2
+
+    tp_only_model = torch.nn.ModuleList([_Block(None)])
+    configured = _cu.attach_te_context_parallel(tp_only_model, tp_mesh=tp_mesh)
+
+    assert configured == 1
+    assert tp_only_model[0].self_attn.attn_module.calls == []
+    assert tp_only_model[0].self_attn.attn_module.tp_calls == [tp_group]
+    assert tp_only_model[0].self_attn.attn_module.tp_size == 2
+    assert tp_only_model[0].self_attn.attn_module.num_gqa_groups_per_partition == 2
+
+
 # ============================================================================
 # Tests for make_cp_batch_for_te
 # ============================================================================
@@ -512,6 +580,38 @@ def test_make_cp_batch_for_te_basic(monkeypatch):
 
     # Verify cu_seqlens are properly formatted
     assert result["cu_seqlens"].dtype == torch.int32
+
+
+def test_make_cp_batch_for_te_multi_chunk(monkeypatch):
+    """The num_chunks > 1 path shards and stacks every pipeline chunk.
+
+    Covers the per-chunk shard call, which the single-chunk test does not reach.
+    """
+    cp_mesh = _DummySubMesh(size=2)
+
+    batch = {
+        "input_ids": torch.tensor([[1, 2, 3, 4], [5, 6, 7, 8]]),
+        "labels": torch.tensor([[10, 20, 30, 40], [50, 60, 70, 80]]),
+        "position_ids": torch.tensor([[0, 1, 2, 3], [0, 1, 2, 3]]),
+        "seq_lens": torch.tensor([[4], [4]]),
+        "seq_lens_padded": torch.tensor([[4], [4]]),
+    }
+
+    class MockTex:
+        @staticmethod
+        def thd_get_partitioned_indices(cu_seqlens_padded, total_tokens, cp_size, cp_rank):
+            return torch.arange(total_tokens)
+
+    import sys
+
+    sys.modules["transformer_engine_torch"] = MockTex
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: 0)
+
+    result = _cu.make_cp_batch_for_te(cp_mesh=cp_mesh, batch=batch, num_chunks=2)
+
+    assert result["qkv_format"] == "thd"
+    assert result["input_ids"].shape[0] == 2
+    assert result["padding_mask"].shape == result["input_ids"].shape
 
 
 def test_shard_thd_chunk_skips_missing_padding_mask(monkeypatch):

@@ -138,6 +138,10 @@ def _compute_base_stage(test_folder: str, config: Path, has_robustness: bool) ->
         return "pretrain"
     if "benchmark" in config.stem:
         return "benchmark"
+    if test_folder == "convergence":
+        # Weekly train-then-eval flow; the .convergence_test template runs
+        # convergence_tests_launcher.sh (train -> IFEval -> threshold gate).
+        return "convergence"
     if test_folder.startswith("diffusion"):
         return "diffusion_peft" if ("lora" in config.stem or "peft" in config.stem) else "diffusion_sft"
     if test_folder.startswith("retrieval"):
@@ -192,7 +196,20 @@ def _enrich_base_job(job: Dict[str, Any], ci_config: Dict[str, Any], scope: str)
     for key, value in ci_config.get("env_vars", {}).items():
         job["variables"][key] = str(value)
 
-    job["variables"]["HAS_ROBUSTNESS"] = str(bool(ci_config.get("checkpoint_robustness"))).lower()
+    robustness_config = ci_config.get("checkpoint_robustness") or {}
+    job["variables"]["HAS_ROBUSTNESS"] = str(bool(robustness_config)).lower()
+    if robustness_config.get("process_isolation"):
+        job["variables"]["CHECKPOINT_ROBUSTNESS_PROCESS_ISOLATION"] = "true"
+        if "CHECKPOINT_ROBUSTNESS_PHASES" not in job["variables"]:
+            robustness_phases = []
+            if robustness_config.get("check_source_load_parity"):
+                robustness_phases.extend(("source_load_reference", "source_load_parity"))
+            robustness_phases.extend(("train_and_save", "automodel_reload"))
+            if not robustness_config.get("skip_hf_reload"):
+                robustness_phases.append("hf_reload")
+            if not robustness_config.get("no_check_resume"):
+                robustness_phases.extend(("resume_baseline", "resume"))
+            job["variables"]["CHECKPOINT_ROBUSTNESS_PHASES"] = " ".join(robustness_phases)
 
     # Convergence tests run for 2 epochs; double the slurm time allocation.
     if scope == "convergence":
@@ -248,6 +265,9 @@ def generate_job(
     # vLLM deploy variant. `ci.vllm_deploy_known_issue_id` suppresses just this
     # variant (base job still runs) -- use for bugs that only manifest in vllm deploy.
     if ci_config.get("vllm_deploy") and not ci_config.get("vllm_deploy_known_issue_id"):
+        vllm_deploy_vars = {}
+        if "vllm_deploy_time" in ci_config:
+            vllm_deploy_vars["TIME"] = DQ(str(ci_config["vllm_deploy_time"]))
         variants.append(
             (
                 "_vllm_deploy",
@@ -256,6 +276,7 @@ def generate_job(
                     scope,
                     extends=".vllm_deploy_test",
                     stage="peft_vllm_deploy" if "peft" in config.stem else "sft_vllm_deploy",
+                    extra_vars=vllm_deploy_vars,
                     allow_failure=recipe_allow_failure,
                     known_issue_id=known_issue_id,
                 ),

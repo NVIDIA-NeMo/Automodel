@@ -600,8 +600,8 @@ def test_qwen25_collate_shapes(collate_mod, monkeypatch):
     assert torch.all(batch["labels"][:, -1] == -100)
 
 
-def test_default_collate_shapes(collate_mod, fake_qwen_utils, monkeypatch):
-    monkeypatch.setattr(collate_mod, "HAVE_QWEN_VL_UTILS", True, raising=True)
+def test_default_collate_shapes_without_qwen_vl_utils(collate_mod, monkeypatch):
+    monkeypatch.setattr(collate_mod, "HAVE_QWEN_VL_UTILS", False, raising=True)
 
     processor = DummyDefaultProcessor()
     batch = collate_mod.default_collate_fn([{"conversation": CONVERSATION} for _ in range(2)], processor)
@@ -666,14 +666,11 @@ def test_nemotron_parse_collate_shifts_and_casts(collate_mod, monkeypatch):
     assert torch.equal(batch["decoder_attention_mask"], torch.tensor([[1, 1, 1]]))
 
 
-@pytest.mark.parametrize("fn_name", ["default_collate_fn", "qwen3_omni_collate_fn"])
-def test_import_error_when_qwen_utils_missing(collate_mod, fn_name, monkeypatch):
-    monkeypatch.setattr(collate_mod, "HAVE_QWEN_VL_UTILS", False, raising=True)
+def test_import_error_when_qwen_omni_utils_missing(collate_mod, monkeypatch):
     monkeypatch.setattr(collate_mod, "HAVE_QWEN_OMNI_UTILS", False, raising=True)
-    func = getattr(collate_mod, fn_name)
 
     with pytest.raises(ImportError):
-        func([], None)
+        collate_mod.qwen3_omni_collate_fn([], None)
 
 
 def test_default_collate_fn_with_max_length(collate_mod, fake_qwen_utils, monkeypatch):
@@ -3087,6 +3084,21 @@ class TestNeatPackedVlmCollaterAttnImpl:
         result = neat_packed_vlm_collater(batch, attn_implementation="sdpa")
         # SDPA produces 4D block-causal mask
         assert result["attention_mask"].ndim == 4
+
+    def test_sdpa_cp_keeps_compact_document_ids(self):
+        from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
+
+        batch = [self._make_packed_sample(16, 0)]
+        result = neat_packed_vlm_collater(
+            batch,
+            max_length=32,
+            attn_implementation="sdpa",
+            materialize_4d_mask=False,
+        )
+
+        assert result["attention_mask"].shape == (1, 32)
+        assert torch.equal(result["_packed_seq_ids"], result["attention_mask"])
+        assert result["_packed_seq_ids"][0, 16:].eq(0).all()
 
     def test_single_sequence_omits_packed_seq_ids(self):
         """A single (unpacked) sequence carries no ``_packed_seq_ids``; the all-gather

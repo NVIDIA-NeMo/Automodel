@@ -117,6 +117,46 @@ def test_collator_end_to_end_no_prefix():
     assert out["d_input_ids"].shape == out["d_attention_mask"].shape
 
 
+def test_collator_emits_passage_doc_ids_for_complete_nonempty_ids():
+    collator = rc.BiEncoderCollator(tokenizer=FakeTokenizer(), q_max_len=16, p_max_len=16, padding=True)
+    batch = _make_batch(num_examples=2, docs_per_example=2)
+    batch[0]["doc_id"] = ["positive-0", "negative-0"]
+    batch[1]["doc_id"] = ["positive-1", "negative-1"]
+
+    out = collator(batch)
+
+    expected = torch.tensor(
+        [
+            rc._doc_id_str_to_int64("positive-0"),
+            rc._doc_id_str_to_int64("negative-0"),
+            rc._doc_id_str_to_int64("positive-1"),
+            rc._doc_id_str_to_int64("negative-1"),
+        ],
+        dtype=torch.long,
+    )
+    torch.testing.assert_close(out["passage_doc_ids"], expected)
+
+
+@pytest.mark.parametrize(
+    "doc_id_groups",
+    [
+        [["", ""], ["", ""]],
+        [["positive-0", ""], ["positive-1", "negative-1"]],
+        [["positive-0", "negative-0"], None],
+    ],
+)
+def test_collator_omits_passage_doc_ids_when_any_id_is_missing(doc_id_groups):
+    collator = rc.BiEncoderCollator(tokenizer=FakeTokenizer(), q_max_len=16, p_max_len=16, padding=True)
+    batch = _make_batch(num_examples=2, docs_per_example=2)
+    for example, doc_ids in zip(batch, doc_id_groups):
+        if doc_ids is not None:
+            example["doc_id"] = doc_ids
+
+    out = collator(batch)
+
+    assert "passage_doc_ids" not in out
+
+
 def test_collator_with_prefix_and_pad_multiple():
     tok = FakeTokenizer()
     collator = rc.BiEncoderCollator(

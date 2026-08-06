@@ -41,6 +41,8 @@ import pytest
 import torch
 import torch.nn as nn
 
+from nemo_automodel.components.checkpoint.lifecycle import CheckpointLifecycle
+from nemo_automodel.components.checkpoint.utils import is_checkpoint_incomplete, mark_checkpoint_incomplete
 from nemo_automodel.recipes.llm.train_eagle1 import TrainEagle1Recipe
 from nemo_automodel.recipes.llm.train_eagle3 import TrainEagle3Recipe
 
@@ -49,6 +51,9 @@ from nemo_automodel.recipes.llm.train_eagle3 import TrainEagle3Recipe
 class _StubCheckpointConfig:
     enabled: bool
     checkpoint_dir: str
+    allow_legacy_pickle_restore: bool = False
+    is_async: bool = False
+    max_recent_checkpoints: int | None = None
 
 
 def _build_stub_checkpointer(tmp_path) -> MagicMock:
@@ -58,6 +63,7 @@ def _build_stub_checkpointer(tmp_path) -> MagicMock:
     os.makedirs(ckpt_dir, exist_ok=True)
     mock = MagicMock()
     mock.config = _StubCheckpointConfig(enabled=True, checkpoint_dir=ckpt_dir)
+    mock.lifecycle = CheckpointLifecycle(config=mock.config)
     return mock
 
 
@@ -318,7 +324,6 @@ def test_eagle1_save_checkpoint_train_loss_only(tmp_path):
 def test_eagle1_save_checkpoint_multi_key_val_loss(tmp_path):
     """Multi-key val_loss dict uses best_metric_key to pick the tracked metric."""
     recipe = _bare_eagle1_recipe(tmp_path)
-    recipe._best_val_loss = float("inf")
     recipe.runtime.global_step = 5
 
     recipe.save_checkpoint(
@@ -344,7 +349,6 @@ def test_eagle1_save_checkpoint_multi_key_val_loss(tmp_path):
 def test_eagle1_save_checkpoint_single_key_val_loss(tmp_path):
     """Single-key val_loss dict auto-selects the only key for best_val_metric."""
     recipe = _bare_eagle1_recipe(tmp_path)
-    recipe._best_val_loss = float("inf")
     recipe.runtime.global_step = 2
 
     recipe.save_checkpoint(epoch=1, step=2, val_loss={"val_loss": 0.3})
@@ -366,8 +370,9 @@ def test_eagle1_save_checkpoint_async_defers_symlink(tmp_path):
 
     recipe.save_checkpoint(epoch=2, step=10, train_loss=0.5)
 
-    assert recipe._last_pending_checkpoint_dir is not None
-    assert "epoch_2_step_10" in recipe._last_pending_checkpoint_dir
+    pending_checkpoint_dir = recipe.checkpointer.lifecycle._pending_checkpoint_dir
+    assert pending_checkpoint_dir is not None
+    assert "epoch_2_step_10" in pending_checkpoint_dir
     latest = os.path.join(recipe.checkpoint_config.checkpoint_dir, "LATEST")
     assert not os.path.islink(latest) and not os.path.isfile(latest + ".txt")
 
@@ -384,11 +389,15 @@ def test_eagle1_save_checkpoint_flushes_prev_pending(tmp_path):
 
     prev_path = os.path.join(recipe.checkpoint_config.checkpoint_dir, "epoch_1_step_5")
     os.makedirs(prev_path, exist_ok=True)
-    recipe._last_pending_checkpoint_dir = prev_path
+    recipe.checkpointer.lifecycle.defer_publication(
+        prev_path,
+        best_val_metric=None,
+        metric_key=None,
+    )
 
     recipe.save_checkpoint(epoch=2, step=10, train_loss=0.3)
 
-    assert recipe._last_pending_checkpoint_dir is None
+    assert recipe.checkpointer.lifecycle._pending_checkpoint_dir is None
     latest = os.path.join(recipe.checkpoint_config.checkpoint_dir, "LATEST")
     assert os.path.islink(latest) or os.path.isfile(latest + ".txt")
 
@@ -401,16 +410,19 @@ def test_eagle1_save_checkpoint_flushes_prev_pending(tmp_path):
 def test_eagle1_save_checkpoint_flushes_prev_best_pending(tmp_path):
     """When a prev_best_pending exists, the next save flushes the best symlink."""
     recipe = _bare_eagle1_recipe(tmp_path)
-    recipe._best_val_loss = float("inf")
     recipe.runtime.global_step = 5
 
     prev_path = os.path.join(recipe.checkpoint_config.checkpoint_dir, "epoch_1_step_5")
     os.makedirs(prev_path, exist_ok=True)
-    recipe._last_pending_best_checkpoint_info = {"path": prev_path, "val": 0.3}
+    recipe.checkpointer.lifecycle.defer_publication(
+        prev_path,
+        best_val_metric=0.3,
+        metric_key="val_loss",
+    )
 
     recipe.save_checkpoint(epoch=2, step=10, train_loss=0.3)
 
-    assert recipe._last_pending_best_checkpoint_info is None
+    assert recipe.checkpointer.lifecycle._pending_best_checkpoint is None
 
 
 # ---------------------------------------------------------------------------
@@ -426,9 +438,10 @@ def test_eagle1_save_checkpoint_async_stores_best_pending(tmp_path):
 
     recipe.save_checkpoint(epoch=2, step=10, val_loss={"val_loss": 0.25})
 
-    assert recipe._last_pending_checkpoint_dir is not None
-    assert recipe._last_pending_best_checkpoint_info is not None
-    assert recipe._last_pending_best_checkpoint_info["val"] == 0.25
+    assert recipe.checkpointer.lifecycle._pending_checkpoint_dir is not None
+    pending_best = recipe.checkpointer.lifecycle._pending_best_checkpoint
+    assert pending_best is not None
+    assert pending_best.value == 0.25
 
 
 @pytest.mark.parametrize("recipe_factory", [_bare_eagle1_recipe, _bare_eagle3_recipe])
@@ -448,7 +461,7 @@ def test_eagle_async_checkpoint_retention_prunes_completed_window(tmp_path, reci
 
 
 # ---------------------------------------------------------------------------
-# save_checkpoint: FileExistsError when checkpoint dir already exists
+# save_checkpoint: leftover checkpoint dir from an interrupted save
 # ---------------------------------------------------------------------------
 
 
@@ -467,24 +480,46 @@ def test_eagle1_final_checkpoint_saved_before_close(tmp_path):
     events = []
 
     recipe._maybe_save_final_checkpoint = lambda completed_epochs: events.append(("final", completed_epochs)) or True
-    recipe._finalize_pending_checkpoint = lambda: events.append(("finalize", None))
-    recipe.checkpointer.close = lambda: events.append(("close", None))
+    recipe.checkpointer.finalize = lambda: events.append(("finalize", None))
     recipe._run_eval = lambda: None
 
     recipe.run_train_validation_loop()
 
-    assert events == [("final", 1), ("finalize", None), ("close", None)]
+    assert events == [("final", 1), ("finalize", None)]
 
 
-def test_eagle1_save_checkpoint_raises_on_existing_dir(tmp_path):
-    """save_checkpoint raises FileExistsError if the target checkpoint dir already exists."""
+def test_eagle1_save_checkpoint_replaces_interrupted_dir(tmp_path):
+    """A leftover directory from an interrupted save is replaced instead of aborting the re-save.
+
+    A resumed run recomputes the interrupted step and targets the same directory
+    name, so failing here would stall the job at that step for every subsequent
+    resume window.
+    """
     recipe = _bare_eagle1_recipe(tmp_path)
     recipe.runtime.global_step = 5
-    ckpt_path = os.path.join(recipe.checkpoint_config.checkpoint_dir, "epoch_1_step_5")
-    os.makedirs(ckpt_path, exist_ok=True)
+    ckpt_path = Path(recipe.checkpoint_config.checkpoint_dir) / "epoch_1_step_5"
+    ckpt_path.mkdir(parents=True, exist_ok=True)
+    (ckpt_path / "stale.txt").write_text("left behind by the interrupted save")
+    mark_checkpoint_incomplete(ckpt_path)
 
-    with pytest.raises(FileExistsError):
+    recipe.save_checkpoint(epoch=1, step=5)
+
+    assert not (ckpt_path / "stale.txt").exists()
+    assert not is_checkpoint_incomplete(ckpt_path)
+
+
+def test_eagle1_save_checkpoint_refuses_to_overwrite_published_dir(tmp_path):
+    """A directory without the marker holds a published checkpoint and is not reclaimed."""
+    recipe = _bare_eagle1_recipe(tmp_path)
+    recipe.runtime.global_step = 5
+    ckpt_path = Path(recipe.checkpoint_config.checkpoint_dir) / "epoch_1_step_5"
+    ckpt_path.mkdir(parents=True, exist_ok=True)
+    (ckpt_path / "published.txt").write_text("a complete checkpoint")
+
+    with pytest.raises(FileExistsError, match="already holds a published checkpoint"):
         recipe.save_checkpoint(epoch=1, step=5)
+
+    assert (ckpt_path / "published.txt").exists()
 
 
 # ---------------------------------------------------------------------------

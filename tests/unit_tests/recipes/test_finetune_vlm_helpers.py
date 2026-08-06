@@ -29,6 +29,7 @@ from nemo_automodel.components.datasets.vlm.pp_media import (
     prepare_vlm_media_for_pp,
     stage_vlm_media_for_pp,
 )
+from nemo_automodel.components.distributed.cp_vision_frame_shard import CpVisionFrameShardingConfig
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
 from nemo_automodel.components.optim.optimizer import LRSchedulerConfig, build_optimizer_config
 from nemo_automodel.components.training.step_scheduler import StepSchedulerConfig
@@ -1539,11 +1540,31 @@ class _MockAutoPipeline:
     def __init__(self, has_first_stage=True, has_last_stage=True, n_microbatches=2, add_losses=True):
         self._info = _MockPPInfo(has_first_stage, has_last_stage, n_microbatches, add_losses)
         self.info = self._info
+        self.step_batches = []
 
     def update_seq_len(self, seq_len: int) -> None:
         # Dynamic seq-len hook is a no-op in tests; AutoPipeline exposes this for
         # variable-length VLM batches.
         return None
+
+    def step(self, model_input, *, target=None, losses=None, **kwargs):
+        """Record and forward an AutoPipeline step.
+
+        Args:
+            model_input: Tensor of shape [batch, ...] containing the first
+                pipeline stage's input.
+            target: Optional tensor of shape [batch, sequence] containing loss
+                targets.
+            losses: Optional mutable list populated with scalar loss tensors.
+            **kwargs: Keyword schedule inputs. Tensor values have arbitrary
+                model-defined layouts.
+
+        Returns:
+            The value returned by the schedule mock.
+        """
+        self.step_batches.append(dict(kwargs))
+        schedule_args = (model_input,) if self.info.has_first_stage else ()
+        return self.info.schedule.step(*schedule_args, target=target, losses=losses, **kwargs)
 
 
 def _create_pp_recipe(model=None):
@@ -1553,13 +1574,13 @@ def _create_pp_recipe(model=None):
     recipe = object.__new__(FinetuneRecipeForVLM)
     # Initialize __dict__ directly to bypass BaseRecipe.__setattr__ tracking
     recipe.__dict__["__state_tracked"] = set()
-    recipe.__dict__["_best_val_loss"] = float("inf")
     recipe.__dict__["dist_env"] = SimpleNamespace(device="cpu")
     recipe.__dict__["device_mesh"] = None
     recipe.__dict__["moe_mesh"] = None
     recipe.__dict__["pp_enabled"] = True
     recipe.__dict__["loss_fn"] = MagicMock()
     recipe.__dict__["distributed_config"] = None
+    recipe.__dict__["cp_vision_frame_sharding"] = CpVisionFrameShardingConfig(enabled=True)
     recipe.__dict__["model_parts"] = [model]
     recipe.__dict__["_get_dp_group_size"] = lambda include_cp=True: 1
     return recipe
@@ -1666,9 +1687,39 @@ class TestForwardBackwardStepPP:
 
         # Verify schedule.step was called
         pp_recipe.pp.info.schedule.step.assert_called_once()
+        assert pp_recipe.pp.step_batches == [{}]
 
         # Verify loss was computed
         assert len(loss_buffer) == 1
+
+    def test_pp_step_receives_remaining_kwargs(self, pp_recipe, monkeypatch):
+        """The recipe passes remaining model kwargs through AutoPipeline.step."""
+        pp_recipe.pp = _MockAutoPipeline(has_first_stage=True, has_last_stage=True, n_microbatches=2)
+
+        monkeypatch.setattr(
+            "nemo_automodel.components.distributed.context_parallel.utils._make_cp_batch_and_ctx",
+            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch, None),
+        )
+
+        position_ids = torch.zeros(3, 2, 8, dtype=torch.long)
+        batch = {
+            "labels": torch.ones(2, 8, dtype=torch.long),
+            "input_ids": torch.ones(2, 8, dtype=torch.long),
+            "position_ids": position_ids,
+        }
+
+        pp_recipe._forward_backward_step(
+            idx=0,
+            batch=batch,
+            loss_buffer=[],
+            num_label_tokens=16,
+            num_batches=1,
+            is_train=True,
+        )
+
+        assert len(pp_recipe.pp.step_batches) == 1
+        assert pp_recipe.pp.step_batches[0].keys() == {"position_ids"}
+        assert torch.equal(pp_recipe.pp.step_batches[0]["position_ids"], position_ids)
 
     def test_pp_vlm_chunking_videos_uses_video_grid_and_counts(self, pp_recipe, monkeypatch):
         """Video tensors are chunked by per-sample video counts before schedule.step."""
@@ -2201,12 +2252,12 @@ def _create_non_pp_recipe(model, device="cpu"):
     recipe = object.__new__(FinetuneRecipeForVLM)
     # Initialize __dict__ directly to bypass BaseRecipe.__setattr__ tracking
     recipe.__dict__["__state_tracked"] = set()
-    recipe.__dict__["_best_val_loss"] = float("inf")
     recipe.__dict__["dist_env"] = SimpleNamespace(device=device)
     recipe.__dict__["device_mesh"] = None
     recipe.__dict__["moe_mesh"] = None
     recipe.__dict__["pp_enabled"] = False
     recipe.__dict__["distributed_config"] = None
+    recipe.__dict__["cp_vision_frame_sharding"] = CpVisionFrameShardingConfig(enabled=True)
     recipe.__dict__["model_parts"] = [model]
     recipe.__dict__["_get_dp_group_size"] = lambda include_cp=True: 1
     # ``is_remote_logging_step`` is read by ``_forward_backward_step`` to
@@ -2219,9 +2270,13 @@ def _create_non_pp_recipe(model, device="cpu"):
 class _DummyCPSubMesh:
     def __init__(self, size: int):
         self._size = size
+        self._group = object()
 
     def size(self) -> int:
         return self._size
+
+    def get_group(self):
+        return self._group
 
 
 class _DummyCPDeviceMesh(dict):
@@ -2865,8 +2920,8 @@ def test_vlm_setup_applies_prewarm_config(monkeypatch):
     _patch_vlm_setup_minimals(monkeypatch, cp_size=1)
     calls = []
 
-    def _record_apply(self, *, model_parts, device, pp_mesh=None):
-        calls.append((self, model_parts, device, pp_mesh))
+    def _record_apply(self, *, model_parts, device, batch_size, pp_mesh=None):
+        calls.append((self, model_parts, device, batch_size, pp_mesh))
 
     monkeypatch.setattr("nemo_automodel.components.training.prewarm.PrewarmConfig.apply", _record_apply)
 
@@ -2874,11 +2929,41 @@ def test_vlm_setup_applies_prewarm_config(monkeypatch):
     trainer.setup()
 
     assert len(calls) == 1
-    prewarm, model_parts, device, pp_mesh = calls[0]
+    prewarm, model_parts, device, batch_size, pp_mesh = calls[0]
     assert prewarm.comm_groups is True
     assert model_parts == trainer.model_parts
     assert device == torch.device("cpu")
+    assert batch_size == 1
     assert pp_mesh is None
+
+
+def test_vlm_setup_threads_pp_group_to_checkpointer(monkeypatch):
+    cfg = _minimal_vlm_cfg(cp_size=1, rope_fusion=False)
+    _patch_vlm_setup_minimals(monkeypatch, cp_size=1)
+    pp_group = object()
+    build_kwargs = {}
+    checkpoint_config = SimpleNamespace(checkpoint_dir="ckpts", model_state_dict_keys=None)
+
+    def _build_checkpointer(**kwargs):
+        build_kwargs.update(kwargs)
+        return SimpleNamespace(
+            config=checkpoint_config,
+            load_base_model=lambda *args, **kwargs: None,
+            maybe_wait_for_staging=lambda: None,
+            close=lambda: None,
+        )
+
+    checkpoint_config.build = _build_checkpointer
+    monkeypatch.setattr(
+        "nemo_automodel.recipes._typed_config.RecipeConfig.checkpoint",
+        property(lambda self: checkpoint_config),
+    )
+    monkeypatch.setattr(FinetuneRecipeForVLM, "_get_pp_group", lambda self: pp_group)
+
+    trainer = FinetuneRecipeForVLM(cfg)
+    trainer.setup()
+
+    assert build_kwargs["pp_group"] is pp_group
 
 
 def test_vlm_rope_fusion_disabled_when_cp_gt_1(monkeypatch):
@@ -3243,6 +3328,37 @@ class TestChunkVlmMedia:
         with stage_vlm_media_for_pp(pp, [model], batch):
             assert torch.equal(model(), first_chunk)
             assert model._vlm_chunk_idx == 1
+
+    @pytest.mark.parametrize("schedule_flag", ["_stage_forward_initialized", "_stages_forward_initialized"])
+    def test_stage_media_does_not_replay_with_static_user_metadata(self, schedule_flag):
+        class MediaConsumer(nn.Module):
+            def forward(self):
+                chunk = self._vlm_pixel_values_chunks[self._vlm_chunk_idx]
+                self._vlm_chunk_idx += 1
+                return chunk
+
+        model = MediaConsumer()
+        schedule = SimpleNamespace(**{schedule_flag: False})
+        stage = SimpleNamespace(
+            is_first=True,
+            _user_meta=SimpleNamespace(inputs=(object(),), outputs=(object(),)),
+        )
+        pp = SimpleNamespace(
+            info=SimpleNamespace(has_first_stage=True, schedule=schedule, stages=[stage]),
+        )
+        first_chunk = torch.tensor([1.0])
+        second_chunk = torch.tensor([2.0, 3.0])
+        batch = {
+            VLM_PP_MEDIA_KEY: {
+                "pixel_values": [first_chunk, second_chunk],
+                "image_grid_hws": [torch.ones(1), torch.ones(2)],
+            }
+        }
+
+        with stage_vlm_media_for_pp(pp, [model], batch):
+            assert torch.equal(model(), first_chunk)
+            assert torch.equal(model(), second_chunk)
+            assert model._vlm_chunk_idx == 2
 
     def test_prepare_flat_patches_without_image_grid(self):
         pixel_values = torch.arange(5 * 2 * 2 * 2 * 3).reshape(5, 2, 2, 2, 3)
