@@ -130,13 +130,9 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
     def _native_key_to_hf(key: str) -> str:
         """Normalize a native Nemotron V3 key to its public HF namespace."""
         key = _strip_mamba_fp32_holder_key(key)
-        key = re.sub(
-            r"^(?P<outer>base_model\.model\.)?model\.",
-            lambda match: f"{match.group('outer') or ''}backbone.",
-            key,
-        )
-        key = re.sub(r"^((?:base_model\.model\.)?backbone)\.norm\.weight$", r"\1.norm_f.weight", key)
-        key = re.sub(r"^((?:base_model\.model\.)?backbone)\.embed_tokens\.weight$", r"\1.embeddings.weight", key)
+        key = re.sub(r"^model\.", "backbone.", key)
+        key = re.sub(r"^backbone\.norm\.weight$", "backbone.norm_f.weight", key)
+        key = re.sub(r"^backbone\.embed_tokens\.weight$", "backbone.embeddings.weight", key)
         return key
 
     @staticmethod

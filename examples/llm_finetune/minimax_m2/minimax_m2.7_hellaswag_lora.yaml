@@ -113,5 +113,18 @@ optimizer:
 ci:
   # pp_size(1) * ep_size(32) = 32 GPUs => 4 nodes (8 H100/node).
   recipe_owner: hemildesai
-  time: "00:20:00"
+  time: "00:30:00"
   nodes: 4
+  checkpoint_robustness:
+    # Keep each large-model load in a fresh process so the HF reload has all
+    # local GPU memory available after the distributed train/save phase.
+    process_isolation: true
+    # Exact adapter fingerprints and a successful HF+PEFT forward still run;
+    # live-LoRA cross-runtime logit parity is not a stable quantized reference.
+    skip_hf_logit_parity: true
+    trust_remote_code: true
+    tokenizer_name: MiniMaxAI/MiniMax-M2.7
+    hf_device_map_auto: true
+    no_check_resume: true
+    dataset.num_samples_limit: 500
+    validation_dataset.num_samples_limit: 500

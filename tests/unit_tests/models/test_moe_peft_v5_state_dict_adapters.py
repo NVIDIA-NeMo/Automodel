@@ -24,58 +24,46 @@ from nemo_automodel.components.models.nemotron_v3.state_dict_adapter import Nemo
 from nemo_automodel.components.moe.config import MoEConfig
 
 
-def _make_transformers_experts(family: str, num_experts: int, dim: int, inter_dim: int) -> nn.Module:
-    """Instantiate the actual fused expert class shipped by Transformers v5."""
+def _make_transformers_model(family: str, num_experts: int, dim: int, inter_dim: int) -> nn.Module:
+    """Instantiate a tiny causal LM using the actual Transformers v5 module hierarchy."""
     if family == "nemotron_v3":
-        from transformers.models.nemotron_h.modeling_nemotron_h import NemotronHExperts
+        from transformers.models.nemotron_h.configuration_nemotron_h import NemotronHConfig
+        from transformers.models.nemotron_h.modeling_nemotron_h import NemotronHForCausalLM
 
-        config = SimpleNamespace(
+        config = NemotronHConfig(
+            vocab_size=32,
+            layers_block_type=["moe"],
             n_routed_experts=num_experts,
             hidden_size=dim,
             moe_intermediate_size=inter_dim,
+            moe_shared_expert_intermediate_size=inter_dim,
             moe_latent_size=None,
             mlp_hidden_act="relu2",
-            _experts_implementation="eager",
+            num_experts_per_tok=1,
+            n_group=1,
+            topk_group=1,
+            use_mamba_kernels=False,
         )
-        experts = NemotronHExperts(config)
+        return NemotronHForCausalLM(config)
     else:
-        from transformers.models.minimax_m2.modeling_minimax_m2 import MiniMaxM2Experts
+        from transformers.models.minimax_m2.configuration_minimax_m2 import MiniMaxM2Config
+        from transformers.models.minimax_m2.modeling_minimax_m2 import MiniMaxM2ForCausalLM
 
-        config = SimpleNamespace(
+        config = MiniMaxM2Config(
+            vocab_size=32,
             num_local_experts=num_experts,
             hidden_size=dim,
             intermediate_size=inter_dim,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=dim // 2,
+            max_position_embeddings=32,
+            num_experts_per_tok=1,
             hidden_act="silu",
-            _experts_implementation="eager",
+            use_cache=False,
         )
-        experts = MiniMaxM2Experts(config)
-
-    for parameter in experts.parameters():
-        nn.init.normal_(parameter)
-    return experts
-
-
-class _TinyFusedPeftModel(nn.Module):
-    """Minimal module trees matching the two Transformers v5 implementations."""
-
-    def __init__(self, family: str, num_experts: int, dim: int, inter_dim: int) -> None:
-        super().__init__()
-        if family == "nemotron_v3":
-            self.backbone = nn.Module()
-            self.backbone.layers = nn.ModuleList([nn.Module()])
-            self.backbone.layers[0].mixer = nn.Module()
-            self.backbone.layers[0].mixer.experts = _make_transformers_experts(family, num_experts, dim, inter_dim)
-        else:
-            self.model = nn.Module()
-            self.model.layers = nn.ModuleList([nn.Module()])
-            self.model.layers[0].block_sparse_moe = nn.Module()
-            self.model.layers[0].block_sparse_moe.experts = _make_transformers_experts(
-                family, num_experts, dim, inter_dim
-            )
-
-    def prepare_inputs_for_generation(self, *args, **kwargs):
-        """Provide the compatibility hook required by PEFT's causal-LM wrapper."""
-        raise NotImplementedError("stub for PEFT compatibility")
+        return MiniMaxM2ForCausalLM(config)
 
 
 def _make_moe_config(*, gated: bool) -> MoEConfig:
@@ -124,6 +112,17 @@ def _make_adapter_and_state(family: str, rank: int):
 
 
 def _paramwrapper_delta(lora_a: torch.Tensor, lora_b: torch.Tensor, num_experts: int, scale: float):
+    """Compute the grouped expert delta represented by PEFT ParamWrapper tensors.
+
+    Args:
+        lora_a: Tensor of shape [rank * experts, input].
+        lora_b: Tensor of shape [output, rank * experts].
+        num_experts: Number of experts folded into the rank axes.
+        scale: LoRA scaling factor.
+
+    Returns:
+        Tensor of shape [experts, input, output].
+    """
     lora_a = lora_a.reshape(num_experts, -1, lora_a.shape[-1])
     lora_b = lora_b.reshape(lora_b.shape[0], -1, num_experts)
     return torch.einsum("ore,eri->eio", lora_b, lora_a) * scale
@@ -142,13 +141,13 @@ def test_peft_v5_load_merge_and_adapter_round_trip(family, tmp_path):
     hf_state_dict = adapter.to_hf(dict(native_state_dict), quantization=family == "minimax_m2")
 
     if family == "nemotron_v3":
-        hf_parent = "base_model.model.backbone.layers.0.mixer.experts"
-        model_parent = "backbone.layers.0.mixer.experts"
+        expert_path = "mixer.experts"
         input_projection = "up_proj"
     else:
-        hf_parent = "base_model.model.model.layers.0.block_sparse_moe.experts"
-        model_parent = "model.layers.0.block_sparse_moe.experts"
+        expert_path = "mlp.experts"
         input_projection = "gate_up_proj"
+    hf_parent = f"base_model.model.model.layers.0.{expert_path}"
+    model_parent = f"model.layers.0.{expert_path}"
 
     assert set(hf_state_dict) == {
         f"{hf_parent}.base_layer.lora_A.weight",
@@ -168,7 +167,7 @@ def test_peft_v5_load_merge_and_adapter_round_trip(family, tmp_path):
     ).save_pretrained(tmp_path)
     save_file(hf_state_dict, str(tmp_path / "adapter_model.safetensors"))
 
-    hf_model = _TinyFusedPeftModel(family, moe_config.n_routed_experts, moe_config.dim, moe_config.moe_inter_dim)
+    hf_model = _make_transformers_model(family, moe_config.n_routed_experts, moe_config.dim, moe_config.moe_inter_dim)
     base_weights = {
         name: parameter.detach().clone()
         for name, parameter in hf_model.named_parameters()
