@@ -36,7 +36,7 @@ from nemo_automodel.components.datasets.loader import (
 )
 from nemo_automodel.components.distributed.utils import dp_eval_sample_shard
 from nemo_automodel.components.eval.tool_call_evaluator import ToolCallAccuracyEvaluator
-from nemo_automodel.components.loss.mtp import PipelineCausalLMLoss
+from nemo_automodel.components.loss.mtp import PipelineCausalLMLoss, calculate_mtp_loss
 from nemo_automodel.components.models.deepseek_v4.cp import dsv4_cp_local_seq_multiple
 from nemo_automodel.components.optim.optimizer import build_optimizer_config
 from nemo_automodel.recipes._typed_config import RecipeConfig, _as_dict, _callable_and_kwargs
@@ -44,6 +44,7 @@ from nemo_automodel.recipes.llm.train_ft import (
     TrainFinetuneRecipeForNextTokenPrediction,
     _build_pp_collate_wrapper,
     _should_pack_validation,
+    _validate_domain_sampling_weights,
     build_model,
     compute_trust_remote_code_from_model,
 )
@@ -229,6 +230,28 @@ def test_mtp_loss_config_defaults_and_override():
     torch.testing.assert_close(got_default, base + 0.2 * aux)
 
 
+def test_mtp_loss_applies_domain_weights_to_shifted_targets():
+    from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+
+    loss_fn = MaskedCrossEntropy(fp32_upcast=False)
+    logits = torch.randn(2, 4, 6)
+    labels = torch.tensor([[0, 1, 2, 3], [1, 2, 3, 4]])
+    loss_weights = torch.tensor([[0.5] * 4, [1.5] * 4])
+
+    got = calculate_mtp_loss(
+        loss_fn,
+        mtp_per_depth_logits=[logits],
+        labels=labels,
+        model=nn.Module(),
+        scaling_factor=1.0,
+        loss_weights=loss_weights,
+    )
+    shifted_labels = torch.tensor([[1, 2, 3, -100], [2, 3, 4, -100]])
+    expected = loss_fn(logits, shifted_labels, loss_weights=loss_weights)
+
+    torch.testing.assert_close(got, expected)
+
+
 def test_validation_dataloaders_pp_enabled(caplog):
     cfg = ConfigNode(
         {
@@ -269,6 +292,45 @@ def test_validation_dataloaders_collects_and_names_properly():
     assert set(result.keys()) == {"default", "val", "test"}
     assert all(isinstance(v, DataloaderConfig) for v in result.values())
     assert all(v.batch_size == 8 for v in result.values())
+
+
+def test_recipe_config_resolves_typed_domain_mixture():
+    cfg = RecipeConfig(
+        ConfigNode(
+            {
+                "domain_mixture": {
+                    "domains": [
+                        {"name": "web", "sampling_weight": 0.75, "objective_weight": 0.5},
+                        {"name": "code", "sampling_weight": 0.25, "objective_weight": 0.5},
+                    ]
+                }
+            }
+        )
+    )
+
+    mixture = cfg.domain_mixture.build()
+
+    assert mixture.names == ("web", "code")
+    assert mixture.loss_multipliers == pytest.approx((2.0 / 3.0, 2.0))
+
+
+def test_domain_mixture_sampling_weights_match_megatron_blend():
+    from nemo_automodel.components.datasets.llm.megatron_dataset import MegatronPretrainingConfig
+    from nemo_automodel.components.training.domain_mixture import DomainMixtureConfig, DomainWeightConfig
+
+    mixture = DomainMixtureConfig(
+        domains=(
+            DomainWeightConfig(name="web", sampling_weight=0.75, objective_weight=0.5),
+            DomainWeightConfig(name="code", sampling_weight=0.25, objective_weight=0.5),
+        )
+    ).build()
+    dataloader = DataloaderConfig(dataset_config=MegatronPretrainingConfig(paths=["3", "/data/web", "1", "/data/code"]))
+
+    _validate_domain_sampling_weights(mixture, dataloader)
+
+    mismatched = DataloaderConfig(dataset_config=MegatronPretrainingConfig(paths=["1", "/data/web", "1", "/data/code"]))
+    with pytest.raises(ValueError, match="sampling weights must match"):
+        _validate_domain_sampling_weights(mixture, mismatched)
 
 
 def test_validation_dataloaders_no_validation_keys():
@@ -1222,6 +1284,61 @@ def test_run_train_validation_loop_calls_gc_hook_once_per_step():
     trainer.run_train_validation_loop()
 
     trainer._maybe_collect_garbage.assert_called_once()
+
+
+def test_run_train_validation_loop_reports_weighted_domain_validation():
+    from nemo_automodel.components.training.domain_mixture import DomainMixtureConfig, DomainWeightConfig
+
+    class _OneValidationStep:
+        step = 1
+        epoch = 0
+        epochs = [0]
+        is_val_step = True
+        is_ckpt_step = True
+        sigterm_flag = False
+
+        def set_epoch(self, epoch):
+            self.epoch = epoch
+
+        def __iter__(self):
+            yield ["dummy-batch"]
+
+    trainer = TrainFinetuneRecipeForNextTokenPrediction.__new__(TrainFinetuneRecipeForNextTokenPrediction)
+    trainer.model_parts = [MagicMock()]
+    trainer.step_scheduler = _OneValidationStep()
+    trainer.max_grad_norm = 1.0
+    trainer._enable_qat_if_delayed = MagicMock()
+    trainer._run_train_optim_step = MagicMock(return_value=SimpleNamespace(metrics={"loss": 1.0}))
+    trainer.optimizer = [SimpleNamespace(param_groups=[{"lr": 1.0e-4}])]
+    trainer._collect_moe_load_balance = MagicMock()
+    trainer._maybe_collect_garbage = MagicMock()
+    trainer.log_train_metrics = MagicMock()
+    trainer.log_val_metrics = MagicMock()
+    trainer.save_checkpoint = MagicMock()
+    trainer.val_dataloaders = {"web": object(), "code": object()}
+    trainer._run_validation_epoch = MagicMock(
+        side_effect=[
+            SimpleNamespace(metrics={"val_loss": 2.0, "num_label_tokens": 10}),
+            SimpleNamespace(metrics={"val_loss": 4.0, "num_label_tokens": 20}),
+        ]
+    )
+    trainer.domain_mixture = DomainMixtureConfig(
+        domains=(
+            DomainWeightConfig(name="web", sampling_weight=0.5, objective_weight=0.25),
+            DomainWeightConfig(name="code", sampling_weight=0.5, objective_weight=0.75),
+        )
+    ).build()
+    trainer.metric_logger_train = SimpleNamespace(close=MagicMock())
+    trainer.metric_logger_valid = {name: SimpleNamespace(close=MagicMock()) for name in ("web", "code", "weighted")}
+    trainer.checkpointer = SimpleNamespace(close=MagicMock())
+    trainer.best_metric_key = "weighted"
+
+    trainer.run_train_validation_loop()
+
+    weighted_call = next(call for call in trainer.log_val_metrics.call_args_list if call.args[0] == "weighted")
+    assert weighted_call.args[1].metrics["val_loss"] == pytest.approx(3.5)
+    saved_val_losses = trainer.save_checkpoint.call_args.args[3]
+    assert saved_val_losses == {"web": 2.0, "code": 4.0, "weighted": pytest.approx(3.5)}
 
 
 def test_compute_trust_remote_code_prefers_cfg_flag():

@@ -21,8 +21,8 @@ recipe body only ever sees typed component configs and calls
 
 Known sections are exposed as cached, typed attributes that own a ``build()`` or
 ``apply()``: ``wandb``/``mlflow``/``step_scheduler``/``lr_scheduler``/``prewarm``/
-``embedding_row_repair`` map to component config dataclasses; the ``optimizer``
-and ``loss_fn`` blocks resolve to a component
+``embedding_row_repair``/``domain_mixture`` map to component config dataclasses;
+the ``optimizer`` and ``loss_fn`` blocks resolve to a component
 :class:`~nemo_automodel.components.optim.optimizer.OptimizerConfig` /
 :class:`~nemo_automodel.components.loss.loss.LossConfig` via
 ``build_optimizer_config`` / ``build_loss_config`` (which own a ``build()``),
@@ -60,6 +60,7 @@ if TYPE_CHECKING:
     from nemo_automodel.components.loss.loss import LossConfig
     from nemo_automodel.components.loss.mtp import MTPLossConfig
     from nemo_automodel.components.optim.optimizer import OptimizerConfig
+    from nemo_automodel.components.training.domain_mixture import DomainMixtureConfig
     from nemo_automodel.components.training.embedding_row_repair import EmbeddingRowRepairConfig
     from nemo_automodel.components.training.prewarm import PrewarmConfig
 
@@ -131,7 +132,7 @@ class RecipeConfig:
     """Typed view over the YAML config consumed by recipes.
 
     ``wandb``, ``mlflow``, ``step_scheduler``, ``lr_scheduler``, ``optimizer``,
-    ``loss_fn`` and ``checkpoint`` are exposed as typed objects (``optimizer`` is an
+    ``loss_fn``, ``domain_mixture`` and ``checkpoint`` are exposed as typed objects (``optimizer`` is an
     :class:`~nemo_automodel.components.optim.optimizer.OptimizerConfig`,
     ``checkpoint`` a
     :class:`~nemo_automodel.components.checkpoint.config.CheckpointingConfig`);
@@ -621,6 +622,23 @@ class RecipeConfig:
 
         node = self._raw.get("embedding_row_repair", None)
         return EmbeddingRowRepairConfig(**_section_kwargs(node)) if node else None
+
+    @cached_property
+    def domain_mixture(self) -> "DomainMixtureConfig | None":
+        """Resolve the optional named-domain objective configuration."""
+        from nemo_automodel.components.training.domain_mixture import DomainMixtureConfig, DomainWeightConfig
+
+        node = self._raw.get("domain_mixture", None)
+        if node is None:
+            return None
+        kwargs = _section_kwargs(node)
+        domains = kwargs.pop("domains", None)
+        if domains is None:
+            raise ValueError("domain_mixture.domains is required")
+        return DomainMixtureConfig(
+            domains=tuple(DomainWeightConfig(**_as_dict(domain)) for domain in domains),
+            **kwargs,
+        )
 
     @cached_property
     def checkpoint(self) -> "CheckpointingConfig":

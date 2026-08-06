@@ -36,6 +36,7 @@ class _ChunkedCrossEntropySum(torch.autograd.Function):
         ctx,
         logits: torch.Tensor,
         labels: torch.Tensor,
+        loss_weights: torch.Tensor,
         ignore_index: int,
         chunk_len: int,
     ) -> torch.Tensor:
@@ -47,6 +48,8 @@ class _ChunkedCrossEntropySum(torch.autograd.Function):
                 in its original floating-point dtype and is not mutated.
             labels: Target class indices of shape [tokens]. Positions equal to
                 ``ignore_index`` contribute zero loss and gradient.
+            loss_weights: Per-token multipliers of shape [tokens], or an empty
+                tensor when no weighting is requested.
             ignore_index: Target value excluded from the loss.
             chunk_len: Maximum number of token rows upcast to fp32 at once.
 
@@ -59,6 +62,11 @@ class _ChunkedCrossEntropySum(torch.autograd.Function):
                 "_ChunkedCrossEntropySum requires logits shaped [tokens, vocab] and labels shaped [tokens]; "
                 f"got logits.shape={tuple(logits.shape)} and labels.shape={tuple(labels.shape)}."
             )
+        has_loss_weights = loss_weights.numel() > 0
+        if has_loss_weights and loss_weights.shape != labels.shape:
+            raise ValueError(
+                f"loss_weights.shape must match labels.shape, got {tuple(loss_weights.shape)} and {tuple(labels.shape)}"
+            )
 
         valid = labels != ignore_index
         safe_labels = torch.where(valid, labels, torch.zeros_like(labels))
@@ -68,15 +76,17 @@ class _ChunkedCrossEntropySum(torch.autograd.Function):
             logits_chunk = logits[start:end].float()
             log_normalizer = torch.logsumexp(logits_chunk, dim=-1)
             target_logits = logits_chunk.gather(1, safe_labels[start:end].unsqueeze(1)).squeeze(1)
-            total = total + ((log_normalizer - target_logits) * valid[start:end]).sum()
+            token_weights = loss_weights[start:end] if has_loss_weights else 1.0
+            total = total + ((log_normalizer - target_logits) * valid[start:end] * token_weights).sum()
 
-        ctx.save_for_backward(logits, safe_labels, valid)
+        ctx.save_for_backward(logits, safe_labels, valid, loss_weights)
         ctx.chunk_len = chunk_len
+        ctx.has_loss_weights = has_loss_weights
         return total
 
     @staticmethod
     @torch.autograd.function.once_differentiable
-    def backward(ctx, grad_out: torch.Tensor) -> tuple[torch.Tensor, None, None, None]:
+    def backward(ctx, grad_out: torch.Tensor) -> tuple[torch.Tensor, None, None, None, None]:
         """Recompute the fp32 softmax chunks and return the logits gradient.
 
         Args:
@@ -89,7 +99,7 @@ class _ChunkedCrossEntropySum(torch.autograd.Function):
             vocab] in the logits' original dtype. The remaining entries are
             ``None`` for non-differentiable inputs.
         """
-        logits, safe_labels, valid = ctx.saved_tensors
+        logits, safe_labels, valid, loss_weights = ctx.saved_tensors
         grad = torch.empty_like(logits)
         for start in range(0, logits.shape[0], ctx.chunk_len):
             end = min(start + ctx.chunk_len, logits.shape[0])
@@ -100,9 +110,10 @@ class _ChunkedCrossEntropySum(torch.autograd.Function):
                 safe_labels[start:end].unsqueeze(1),
                 torch.full((end - start, 1), -1.0, dtype=torch.float32, device=logits.device),
             )
-            grad_chunk = grad_chunk * (valid[start:end].unsqueeze(1) * grad_out)
+            token_weights = loss_weights[start:end].unsqueeze(1) if ctx.has_loss_weights else 1.0
+            grad_chunk = grad_chunk * (valid[start:end].unsqueeze(1) * token_weights * grad_out)
             grad[start:end] = grad_chunk.to(grad.dtype)
-        return grad, None, None, None
+        return grad, None, None, None, None
 
 
 def compute_cross_entropy(
@@ -167,6 +178,7 @@ class ChunkedCrossEntropy(nn.Module):
         labels: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
         num_label_tokens: Optional[int] = None,
+        loss_weights: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Computes cross-entropy loss in chunks to handle long sequences more efficiently.
 
@@ -180,6 +192,8 @@ class ChunkedCrossEntropy(nn.Module):
                 positions contribute to the loss and zero positions are ignored.
             num_label_tokens: Optional global count used to normalize the
                 sum-reduced scalar loss.
+            loss_weights: Optional per-token multipliers matching
+                ``labels.shape``. Only supported with ``reduction="sum"``.
 
         Returns:
             Scalar tensor containing the reduced cross-entropy loss.
@@ -188,6 +202,19 @@ class ChunkedCrossEntropy(nn.Module):
         # this may happen with CPUOffloadPolicy
         if labels.device != logits.device:
             labels = labels.to(logits.device)  # pragma: no cover
+        labels_shape = labels.shape
+        if loss_weights is not None:
+            if self.reduction != "sum":
+                raise ValueError("loss_weights is only supported when reduction is 'sum'")
+            if loss_weights.shape != labels_shape:
+                raise ValueError(
+                    f"loss_weights.shape must match labels.shape, got {tuple(loss_weights.shape)} "
+                    f"and {tuple(labels_shape)}"
+                )
+            loss_weights = loss_weights.reshape(-1).to(device=logits.device, dtype=torch.float32)
+        else:
+            loss_weights = torch.empty(0, device=logits.device, dtype=logits.dtype)
+
         # reshape to (N, C) and (N,) respectively
         logits = logits.view(-1, logits.size(-1))
         labels = labels.view(-1)
@@ -201,7 +228,13 @@ class ChunkedCrossEntropy(nn.Module):
         if self.reduction == "sum":
             # Save only original-dtype logits and recompute each fp32 softmax
             # chunk in backward.
-            loss = _ChunkedCrossEntropySum.apply(logits, labels, self.ignore_index, self.chunk_len)
+            loss = _ChunkedCrossEntropySum.apply(
+                logits,
+                labels,
+                loss_weights,
+                self.ignore_index,
+                self.chunk_len,
+            )
         else:
             compute_loss = compute_cross_entropy
             if self.compile:
@@ -216,6 +249,7 @@ class ChunkedCrossEntropy(nn.Module):
             for logits_chunk, targets_chunk in zip(logits.chunk(num_chunks, dim=0), labels.chunk(num_chunks, dim=0)):
                 loss += compute_loss(logits_chunk, targets_chunk, self.ignore_index, self.reduction)
         if num_label_tokens is not None:
-            assert self.reduction == "sum", "num_label_tokens is only supported when reduction is 'sum'"
-            loss = loss / num_label_tokens  # pragma: no cover
+            if self.reduction != "sum":
+                raise ValueError("num_label_tokens is only supported when reduction is 'sum'")
+            loss = loss * 0.0 if num_label_tokens == 0 else loss / num_label_tokens  # pragma: no cover
         return loss

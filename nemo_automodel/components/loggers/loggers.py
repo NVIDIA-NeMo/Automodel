@@ -23,7 +23,7 @@ there is no free builder function — ``config.build(...)`` is the entry point.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import dataclass, field, fields
 from typing import Any
 
 
@@ -87,7 +87,13 @@ class WandbConfig:
         import wandb
         from wandb import Settings
 
-        named = {k: v for k, v in asdict(self).items() if k != "extra" and v is not None}
+        named = {}
+        for config_field in fields(self):
+            if config_field.name == "extra":
+                continue
+            value = getattr(self, config_field.name)
+            if value is not None:
+                named[config_field.name] = value
         # ``extra`` (e.g. mode/dir) is forwarded verbatim; named fields win on collision.
         kwargs = {**self.extra, **named}
         if kwargs.get("name", "") == "" and model_name:
