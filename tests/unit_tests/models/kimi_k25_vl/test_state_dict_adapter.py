@@ -809,15 +809,17 @@ class TestPeftExpertLoraPrefixRoundTrip:
         return KimiK25VLStateDictAdapter(KimiK25VLConfig(), moe_config, backend, dtype=torch.bfloat16)
 
     def _peft_state_dict(self, moe_config, rank=8):
+        # shapes match GroupedExpertsLoRA (lora_experts.py): A is
+        # [experts, in_features, rank], B is [experts, rank, out_features]
         n_e = moe_config.n_routed_experts
         dim, inter = moe_config.dim, moe_config.moe_inter_dim
         base = "base_model.model.model.language_model.model.layers.5.mlp.experts"
         attn = "base_model.model.model.language_model.model.layers.5.self_attn.q_proj"
         return {
-            f"{base}.lora_gate_and_up_A": torch.randn(n_e, rank, dim, dtype=torch.bfloat16),
-            f"{base}.lora_gate_and_up_B": torch.randn(n_e, 2 * inter, rank, dtype=torch.bfloat16),
-            f"{base}.lora_down_A": torch.randn(n_e, rank, inter, dtype=torch.bfloat16),
-            f"{base}.lora_down_B": torch.randn(n_e, dim, rank, dtype=torch.bfloat16),
+            f"{base}.lora_gate_and_up_A": torch.randn(n_e, dim, rank, dtype=torch.bfloat16),
+            f"{base}.lora_gate_and_up_B": torch.randn(n_e, rank, 2 * inter, dtype=torch.bfloat16),
+            f"{base}.lora_down_A": torch.randn(n_e, inter, rank, dtype=torch.bfloat16),
+            f"{base}.lora_down_B": torch.randn(n_e, rank, dim, dtype=torch.bfloat16),
             f"{attn}.lora_A.weight": torch.randn(rank, dim, dtype=torch.bfloat16),
         }
 
