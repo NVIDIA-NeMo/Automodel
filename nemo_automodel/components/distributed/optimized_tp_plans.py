@@ -718,6 +718,24 @@ def _parallelize_falcon_h1(
     )
 
 
+def _parallelize_kimi_linear(
+    model,
+    sequence_parallel: bool = False,
+) -> Dict[str, ParallelStyle]:
+    """Parallelize Kimi Linear (hybrid KDA linear attention + MLA full attention).
+
+    Unlike Qwen3.5 and Falcon-H1, whose linear-attention branches stay
+    replicated, Kimi Linear shards KDA over its heads as well: the delta rule
+    treats heads independently, so the projections, depthwise convolutions and
+    per-head decay parameters all follow the head axis. Routed experts remain
+    owned by expert parallelism. See
+    ``nemo_automodel.components.models.kimi_linear.tp`` for the plan itself.
+    """
+    from nemo_automodel.components.models.kimi_linear.tp import parallelize_kimi_linear
+
+    return parallelize_kimi_linear(model, sequence_parallel=sequence_parallel)
+
+
 # Keyed by qualified class name — see _get_class_qualname for why.
 PARALLELIZE_FUNCTIONS: Dict[str, Callable[..., Dict[str, ParallelStyle]]] = {
     _get_class_qualname(BaichuanForCausalLM): _parallelize_baichuan,
@@ -756,6 +774,10 @@ PARALLELIZE_FUNCTIONS: Dict[str, Callable[..., Dict[str, ParallelStyle]]] = {
     _get_class_qualname(CustomQwen2ForCausalLM): _parallelize_qwen,
     # trust_remote_code models — matched by bare class __name__ in parallelizer
     # because their qualname includes a snapshot-hash-bearing module path.
+    # Custom MoE with hybrid attention; the only custom-MoE architecture with a
+    # tensor-parallel plan, so routed-expert ownership stays with EP.
+    "nemo_automodel.components.models.kimi_linear.model.KimiLinearForCausalLM": _parallelize_kimi_linear,
+    "KimiLinearForCausalLM": _parallelize_kimi_linear,
     "DeciLMForCausalLM": _parallelize_decilm_nemotron,
     "NemotronLabsDiffusionModel": _parallelize_nemotron_labs_diffusion,
 }

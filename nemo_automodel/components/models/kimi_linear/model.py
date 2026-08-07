@@ -30,12 +30,23 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 from nemo_automodel.components.distributed.activation_checkpointing import unwrap_checkpoint_wrapper
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.packing import get_unpad_data, is_indexed_packed_mask
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
 )
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype, compute_lm_head_logits
 from nemo_automodel.components.models.kimi_linear.config import KimiLinearConfig
+from nemo_automodel.components.models.kimi_linear.cp import (
+    KimiPackedContext,
+    all_gather_sequence,
+    build_document_causal_mask,
+    build_fla_cp_context,
+    doc_ids_from_attention_mask,
+    doc_ids_from_cu_seqlens,
+    document_causal_flex_attention,
+    shard_batch_for_kimi_cp,
+)
 from nemo_automodel.components.models.kimi_linear.state_dict_adapter import KimiLinearStateDictAdapter
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.experts import GroupedExperts
@@ -172,29 +183,60 @@ def _pad_input(hidden_states: torch.Tensor, indices: torch.Tensor, batch_size: i
 
 def _make_causal_mask(
     inputs_embeds: torch.Tensor,
-    attention_mask: torch.Tensor | None,
+    packed_context: "KimiPackedContext | None",
     *,
     dtype: torch.dtype,
 ) -> torch.Tensor | None:
-    """Create the additive causal attention mask for padded full attention.
+    """Create the additive causal attention mask for full-attention layers.
 
     Args:
         inputs_embeds: Tensor of shape [batch, sequence, hidden].
-        attention_mask: Optional binary mask tensor of shape [batch, sequence] where 1 marks valid tokens.
+        packed_context: Optional document layout of the batch. When it marks more
+            than one document per row, the mask is block-diagonal so tokens never
+            attend across packed documents.
         dtype: Floating-point dtype used for the additive mask values.
 
     Returns:
-        Additive causal mask tensor of shape [batch, 1, sequence, sequence], or None.
+        Additive causal mask tensor of shape [batch, 1, sequence, sequence].
     """
     batch_size, seq_len = inputs_embeds.shape[:2]
+    if packed_context is not None:
+        return build_document_causal_mask(
+            packed_context.doc_ids,
+            packed_context.doc_ids,
+            q_global_start=0,
+            dtype=dtype,
+        )
     min_value = torch.finfo(dtype).min
     mask = torch.full((seq_len, seq_len), min_value, device=inputs_embeds.device, dtype=dtype)
     mask = torch.triu(mask, diagonal=1)
-    mask = mask[None, None, :, :].expand(batch_size, 1, -1, -1)
+    return mask[None, None, :, :].expand(batch_size, 1, -1, -1)
+
+
+def _packed_context_from_inputs(
+    inputs_embeds: torch.Tensor,
+    *,
+    attention_mask: torch.Tensor | None,
+    cu_seqlens: torch.Tensor | None,
+) -> KimiPackedContext | None:
+    """Derive the document layout of a batch that was not sharded for context parallelism.
+
+    Args:
+        inputs_embeds: Tensor of shape [batch, sequence, hidden].
+        attention_mask: Optional binary or indexed packing mask of shape [batch, sequence].
+        cu_seqlens: Optional cumulative document lengths of shape [documents + 1] from
+            the THD packed path.
+
+    Returns:
+        The document layout, or None when the batch is a single unpadded document per
+        row and needs no document bookkeeping.
+    """
     if attention_mask is not None and attention_mask.ndim == 2:
-        padding = attention_mask[:, None, None, :].to(torch.bool)
-        mask = mask.masked_fill(~padding, min_value)
-    return mask
+        return KimiPackedContext(doc_ids=doc_ids_from_attention_mask(attention_mask))
+    if cu_seqlens is not None and isinstance(cu_seqlens, torch.Tensor):
+        boundaries = cu_seqlens.squeeze(0) if cu_seqlens.ndim == 2 else cu_seqlens
+        return KimiPackedContext(doc_ids=doc_ids_from_cu_seqlens(boundaries, inputs_embeds.shape[1]))
+    return None
 
 
 class KimiRMSNorm(nn.Module):
@@ -264,25 +306,47 @@ class KimiMLAAttention(nn.Module):
             dtype=dtype,
         )
         self.o_proj = nn.Linear(self.num_heads * self.v_head_dim, self.hidden_size, bias=False, dtype=dtype)
+        self._cp_mesh = None
+
+    def setup_cp_attention(self, cp_mesh) -> None:
+        """Attach the context-parallel mesh used to gather full-sequence keys and values.
+
+        Called by the MoE parallelizer's ``apply_cp`` for every attention block.
+
+        Args:
+            cp_mesh: One-dimensional context-parallel device mesh.
+        """
+        self._cp_mesh = cp_mesh
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
+        packed_context: "KimiPackedContext | None" = None,
         **kwargs: Any,
     ) -> torch.Tensor:
         """Run MLA full attention.
 
         Args:
-            hidden_states: Tensor of shape [batch, sequence, hidden].
+            hidden_states: Tensor of shape [batch, sequence, hidden]; the sequence axis
+                holds this rank's contiguous shard under context parallelism.
             attention_mask: Optional additive attention mask of shape [batch, 1, sequence, sequence].
+            packed_context: Optional document layout of the batch, required under
+                context parallelism.
             **kwargs: Extra attention options accepted for HF compatibility.
 
         Returns:
             Tensor of shape [batch, sequence, hidden].
         """
         del kwargs
+        if packed_context is not None and packed_context.cp_enabled:
+            return self._forward_with_cp(hidden_states, packed_context)
         batch_size, seq_length = hidden_states.shape[:-1]
+        if attention_mask is None:
+            # Built here rather than in the backbone because sequence parallelism
+            # hands the backbone a sequence shard while this layer runs on the
+            # all-gathered sequence.
+            attention_mask = _make_causal_mask(hidden_states, packed_context, dtype=hidden_states.dtype)
         query_shape = (batch_size, seq_length, -1, self.q_head_dim)
         key_shape = (batch_size, seq_length, -1, self.qk_nope_head_dim + self.v_head_dim)
 
@@ -301,23 +365,7 @@ class KimiMLAAttention(nn.Module):
         query_states = torch.cat((q_pass, q_rot), dim=-1)
         key_states = torch.cat((k_pass, k_rot), dim=-1)
 
-        if self.num_key_value_groups != 1:
-            key_states = key_states[:, :, None, :, :].expand(
-                batch_size,
-                self.num_key_value_heads,
-                self.num_key_value_groups,
-                seq_length,
-                self.q_head_dim,
-            )
-            value_states = value_states[:, :, None, :, :].expand(
-                batch_size,
-                self.num_key_value_heads,
-                self.num_key_value_groups,
-                seq_length,
-                self.v_head_dim,
-            )
-            key_states = key_states.reshape(batch_size, self.num_heads, seq_length, self.q_head_dim)
-            value_states = value_states.reshape(batch_size, self.num_heads, seq_length, self.v_head_dim)
+        key_states, value_states = self._expand_key_value_groups(key_states, value_states, seq_length)
 
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) * self.scaling
         if attention_mask is not None:
@@ -326,6 +374,90 @@ class KimiMLAAttention(nn.Module):
         attn_weights = F.dropout(attn_weights, p=self.attention_dropout, training=self.training)
         attn_output = torch.matmul(attn_weights, value_states)
         attn_output = attn_output.transpose(1, 2).contiguous().reshape(batch_size, seq_length, -1)
+        return self.o_proj(attn_output)
+
+    def _expand_key_value_groups(
+        self,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        seq_length: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Repeat key/value heads to match the query heads.
+
+        Args:
+            key_states: Tensor of shape [batch, key_value_heads, sequence, qk_head_dim].
+            value_states: Tensor of shape [batch, key_value_heads, sequence, v_head_dim].
+            seq_length: Sequence length of the key/value tensors.
+
+        Returns:
+            Key and value tensors expanded to [batch, heads, sequence, head_dim].
+        """
+        if self.num_key_value_groups == 1:
+            return key_states, value_states
+        batch_size = key_states.shape[0]
+        key_states = key_states[:, :, None, :, :].expand(
+            batch_size, self.num_key_value_heads, self.num_key_value_groups, seq_length, self.q_head_dim
+        )
+        value_states = value_states[:, :, None, :, :].expand(
+            batch_size, self.num_key_value_heads, self.num_key_value_groups, seq_length, self.v_head_dim
+        )
+        return (
+            key_states.reshape(batch_size, self.num_heads, seq_length, self.q_head_dim),
+            value_states.reshape(batch_size, self.num_heads, seq_length, self.v_head_dim),
+        )
+
+    def _forward_with_cp(self, hidden_states: torch.Tensor, packed_context: KimiPackedContext) -> torch.Tensor:
+        """Run MLA attention over a contiguous context-parallel shard.
+
+        Queries stay local while the compressed KV latent -- ``kv_lora_rank +
+        qk_rope_head_dim`` values per token, far smaller than the expanded per-head
+        keys and values -- is all-gathered across the context-parallel group and
+        expanded locally. Attention then runs as FlexAttention with a causal,
+        per-document block mask over the full sequence.
+
+        Args:
+            hidden_states: Tensor of shape [batch, local_sequence, hidden].
+            packed_context: Document layout of the batch.
+
+        Returns:
+            Tensor of shape [batch, local_sequence, hidden].
+        """
+        if self._cp_mesh is None:
+            raise RuntimeError(
+                "Kimi MLA attention received a context-parallel batch but no CP mesh; "
+                "apply_cp must run before the forward pass."
+            )
+        cp_group = self._cp_mesh.get_group()
+        batch_size, local_seq_length = hidden_states.shape[:-1]
+
+        q_states = self.q_proj(hidden_states).view(batch_size, local_seq_length, -1, self.q_head_dim).transpose(1, 2)
+        q_pass, q_rot = torch.split(q_states, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+
+        compressed_kv = all_gather_sequence(self.kv_a_proj_with_mqa(hidden_states), cp_group, dim=1)
+        full_seq_length = compressed_kv.shape[1]
+        k_pass, k_rot = torch.split(compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+
+        key_shape = (batch_size, full_seq_length, -1, self.qk_nope_head_dim + self.v_head_dim)
+        k_pass = self.kv_b_proj(self.kv_a_layernorm(k_pass)).view(key_shape).transpose(1, 2)
+        k_pass, value_states = torch.split(k_pass, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+
+        k_rot = k_rot.view(batch_size, 1, full_seq_length, self.qk_rope_head_dim)
+        k_rot = k_rot.expand(*k_pass.shape[:-1], -1)
+
+        query_states = torch.cat((q_pass, q_rot), dim=-1)
+        key_states = torch.cat((k_pass, k_rot), dim=-1)
+        key_states, value_states = self._expand_key_value_groups(key_states, value_states, full_seq_length)
+
+        attn_output = document_causal_flex_attention(
+            query_states,
+            key_states,
+            value_states,
+            q_doc_ids=packed_context.local_doc_ids,
+            kv_doc_ids=packed_context.doc_ids,
+            q_global_start=packed_context.seq_start,
+            scale=self.scaling,
+        )
+        attn_output = attn_output.transpose(1, 2).contiguous().reshape(batch_size, local_seq_length, -1)
         return self.o_proj(attn_output)
 
     @torch.no_grad()
@@ -438,23 +570,42 @@ class KimiDeltaAttention(nn.Module):
         self.g_b_proj = nn.Linear(self.head_dim, projection_size, bias=False, dtype=dtype)
         self.o_norm = FusedRMSNormGated(self.head_dim, eps=config.rms_norm_eps, activation="sigmoid", dtype=dtype)
         self.o_proj = nn.Linear(projection_size, self.hidden_size, bias=False, dtype=dtype)
+        self._cp_mesh = None
+
+    def setup_cp_attention(self, cp_mesh) -> None:
+        """Attach the context-parallel mesh used to build FLA's CP context.
+
+        Called by the MoE parallelizer's ``apply_cp`` for every attention block.
+
+        Args:
+            cp_mesh: One-dimensional context-parallel device mesh.
+        """
+        self._cp_mesh = cp_mesh
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
+        packed_context: "KimiPackedContext | None" = None,
         **kwargs: Any,
     ) -> torch.Tensor:
         """Run KDA linear attention.
 
         Args:
-            hidden_states: Tensor of shape [batch, sequence, hidden].
+            hidden_states: Tensor of shape [batch, sequence, hidden]; the sequence axis
+                holds this rank's contiguous shard under context parallelism.
             attention_mask: Optional binary padding mask of shape [batch, sequence] where 1 marks valid tokens.
+            packed_context: Optional document layout of the batch, required under
+                context parallelism and used to reset the recurrent state at every
+                packed-document boundary.
             **kwargs: Optional KDA kwargs, including ``cu_seqlens`` for packed sequences.
 
         Returns:
             Tensor of shape [batch, sequence, hidden].
         """
+        if packed_context is not None and packed_context.cp_enabled:
+            return self._forward_with_cp(hidden_states, packed_context)
+
         if attention_mask is not None:
             if attention_mask.dim() != 2:
                 attention_mask = kwargs.get("padding_mask")
@@ -465,15 +616,76 @@ class KimiDeltaAttention(nn.Module):
 
         cu_seqlens = kwargs.get("cu_seqlens")
         indices = None
-        if attention_mask is not None and getattr(self.config, "kda_unpad_inputs", True):
+        if is_indexed_packed_mask(attention_mask):
+            # Packed rows: unpad to a single flat sequence and reset the recurrent
+            # state per document instead of per row.
+            indices, cu_seqlens, _ = get_unpad_data(attention_mask[:, -q_len:])
+            hidden_states = _index_first_axis(hidden_states.reshape(batch_size * q_len, -1), indices).unsqueeze(0)
+        elif attention_mask is not None and getattr(self.config, "kda_unpad_inputs", True):
             indices, cu_seqlens, _ = _get_unpad_data(attention_mask[:, -q_len:])
             hidden_states = _index_first_axis(hidden_states.reshape(batch_size * q_len, -1), indices).unsqueeze(0)
-        effective_q_len = hidden_states.shape[1]
-        mode = "fused_recurrent" if effective_q_len <= 64 else self.mode
 
-        q, _ = self.q_conv1d(x=self.q_proj(hidden_states), cache=None, output_final_state=False, cu_seqlens=cu_seqlens)
-        k, _ = self.k_conv1d(x=self.k_proj(hidden_states), cache=None, output_final_state=False, cu_seqlens=cu_seqlens)
-        v, _ = self.v_conv1d(x=self.v_proj(hidden_states), cache=None, output_final_state=False, cu_seqlens=cu_seqlens)
+        o = self._kda_core(hidden_states, cu_seqlens=cu_seqlens)
+        if indices is not None:
+            o = _pad_input(o.squeeze(0), indices, batch_size, q_len)
+        return o
+
+    def _forward_with_cp(self, hidden_states: torch.Tensor, packed_context: KimiPackedContext) -> torch.Tensor:
+        """Run KDA over a contiguous context-parallel shard.
+
+        FLA's context-parallel kernels take the *global* ``cu_seqlens`` and derive
+        each rank's local segments, passing the recurrent state (and the short
+        convolution's boundary tokens) rank to rank. Batch rows are processed one
+        at a time because FLA's variable-length path expects a single flattened
+        sequence per call.
+
+        Args:
+            hidden_states: Tensor of shape [batch, local_sequence, hidden].
+            packed_context: Document layout of the batch.
+
+        Returns:
+            Tensor of shape [batch, local_sequence, hidden].
+        """
+        if self._cp_mesh is None:
+            raise RuntimeError(
+                "Kimi KDA attention received a context-parallel batch but no CP mesh; "
+                "apply_cp must run before the forward pass."
+            )
+        cp_group = self._cp_mesh.get_group()
+        outputs = [
+            self._kda_core(
+                hidden_states[row : row + 1],
+                cp_context=build_fla_cp_context(packed_context, row, cp_group, self.conv_size),
+            )
+            for row in range(hidden_states.shape[0])
+        ]
+        return torch.cat(outputs, dim=0)
+
+    def _kda_core(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        cu_seqlens: torch.Tensor | None = None,
+        cp_context: Any = None,
+    ) -> torch.Tensor:
+        """Run the KDA projections, convolutions and delta-rule kernel.
+
+        Args:
+            hidden_states: Tensor of shape [batch, sequence, hidden]; the batch must be
+                one whenever ``cu_seqlens`` or ``cp_context`` is given.
+            cu_seqlens: Optional cumulative document lengths of shape [documents + 1].
+            cp_context: Optional FLA context-parallel context, which supersedes
+                ``cu_seqlens`` with its per-rank local segments.
+
+        Returns:
+            Tensor of shape [batch, sequence, hidden].
+        """
+        kernel_kwargs: dict[str, Any] = {} if cp_context is None else {"cp_context": cp_context}
+        conv_kwargs = dict(cache=None, output_final_state=False, cu_seqlens=cu_seqlens, **kernel_kwargs)
+
+        q, _ = self.q_conv1d(x=self.q_proj(hidden_states), **conv_kwargs)
+        k, _ = self.k_conv1d(x=self.k_proj(hidden_states), **conv_kwargs)
+        v, _ = self.v_conv1d(x=self.v_proj(hidden_states), **conv_kwargs)
         g = self.f_b_proj(self.f_a_proj(hidden_states)).contiguous()
         beta = self.b_proj(hidden_states).float().sigmoid()
 
@@ -487,38 +699,32 @@ class KimiDeltaAttention(nn.Module):
             q = F.normalize(q.float(), p=2, dim=-1, eps=1e-6).to(q.dtype)
             k = F.normalize(k.float(), p=2, dim=-1, eps=1e-6).to(k.dtype)
 
-        if mode == "chunk":
-            o, _ = chunk_kda(
-                q=q,
-                k=k,
-                v=v,
-                g=g,
-                beta=beta,
-                initial_state=None,
-                output_final_state=True,
-                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-                cu_seqlens=cu_seqlens,
-            )
-        else:
-            o, _ = fused_recurrent_kda(
-                q=q,
-                k=k,
-                v=v,
-                g=g,
-                beta=beta,
-                initial_state=None,
-                output_final_state=True,
-                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-                cu_seqlens=cu_seqlens,
-            )
+        # The recurrent kernel cannot pass state across ranks, so context parallelism
+        # always runs the chunked kernel.
+        mode = "chunk" if cp_context is not None else self._resolve_mode(hidden_states.shape[1])
+        kernel = chunk_kda if mode == "chunk" else fused_recurrent_kda
+        o, _ = kernel(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            initial_state=None,
+            # Under CP the final state is owned by FLA's rank-to-rank handoff.
+            output_final_state=cp_context is None,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            cu_seqlens=cu_seqlens,
+            **kernel_kwargs,
+        )
 
         gate = self.g_b_proj(self.g_a_proj(hidden_states)).reshape(*hidden_states.shape[:-1], self.num_heads, -1)
         o = self.o_norm(o, gate)
         o = o.reshape(o.shape[0], o.shape[1], -1).contiguous()
-        o = self.o_proj(o)
-        if indices is not None:
-            o = _pad_input(o.squeeze(0), indices, batch_size, q_len)
-        return o
+        return self.o_proj(o)
+
+    def _resolve_mode(self, seq_len: int) -> str:
+        """Return the KDA kernel to use for a sequence of ``seq_len`` tokens."""
+        return "fused_recurrent" if seq_len <= 64 else self.mode
 
     @torch.no_grad()
     def init_weights(self, buffer_device: torch.device, init_std: float) -> None:
@@ -562,8 +768,11 @@ class KimiDecoderLayer(nn.Module):
         )
 
         dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+        # Both branches are named ``mlp``: the custom-MoE parallelizer discovers MoE
+        # layers by that attribute (as MiniMax does), and the checkpoint's
+        # ``block_sparse_moe`` naming is handled by the state-dict adapter.
         if self.is_moe_layer:
-            self.block_sparse_moe = MoE(moe_config, backend)
+            self.mlp = MoE(moe_config, backend)
         else:
             self.mlp = MLP(config.hidden_size, config.intermediate_size, backend.linear, dtype=dtype)
         self.input_layernorm = KimiRMSNorm(config.hidden_size, eps=config.rms_norm_eps, dtype=dtype)
@@ -614,7 +823,7 @@ class KimiDecoderLayer(nn.Module):
         Returns:
             Tensor of shape [batch, sequence, hidden].
         """
-        moe = unwrap_checkpoint_wrapper(self.block_sparse_moe)
+        moe = unwrap_checkpoint_wrapper(self.mlp)
         if not isinstance(moe, MoE):
             raise TypeError(f"Expected Kimi MoE layer, got {type(moe).__name__}.")
         experts = unwrap_checkpoint_wrapper(moe.experts)
@@ -625,7 +834,7 @@ class KimiDecoderLayer(nn.Module):
             and not self._has_dtensor_expert_params(experts)
         ):
             return self._moe_infer_hf_order(moe, experts, hidden_states)
-        return self.block_sparse_moe(hidden_states, padding_mask)
+        return self.mlp(hidden_states, padding_mask)
 
     @staticmethod
     def _has_dtensor_expert_params(experts: GroupedExperts) -> bool:
@@ -708,7 +917,7 @@ class KimiDecoderLayer(nn.Module):
         self.post_attention_layernorm.reset_parameters()
         self.self_attn.init_weights(buffer_device, init_std)
         if self.is_moe_layer:
-            self.block_sparse_moe.init_weights(buffer_device, init_std)
+            self.mlp.init_weights(buffer_device, init_std)
         else:
             self.mlp.init_weights(buffer_device, init_std)
 
@@ -806,6 +1015,7 @@ class KimiLinearModel(nn.Module):
         position_ids: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
         cache_position: torch.Tensor | None = None,
+        kimi_packed_context: KimiPackedContext | None = None,
         **attn_kwargs: Any,
     ) -> torch.Tensor:
         """Run the Kimi Linear decoder.
@@ -813,10 +1023,13 @@ class KimiLinearModel(nn.Module):
         Args:
             input_ids: Optional token ids of shape [batch, sequence].
             inputs_embeds: Optional embeddings of shape [batch, sequence, hidden].
-            attention_mask: Optional binary padding mask of shape [batch, sequence].
+            attention_mask: Optional binary or indexed packing mask of shape [batch, sequence].
             position_ids: Optional positions of shape [batch, sequence]; accepted for HF compatibility.
             padding_mask: Optional boolean tensor of shape [batch, sequence], where true marks padding tokens.
             cache_position: Optional position vector of shape [sequence].
+            kimi_packed_context: Optional document layout attached by
+                :func:`~nemo_automodel.components.models.kimi_linear.cp.shard_batch_for_kimi_cp`;
+                required under context parallelism and otherwise derived here.
             **attn_kwargs: Additional attention kwargs used by packed or THD execution.
 
         Returns:
@@ -830,12 +1043,18 @@ class KimiLinearModel(nn.Module):
         if cache_position is None:
             cache_position = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device)
 
+        packed_context = kimi_packed_context or _packed_context_from_inputs(
+            inputs_embeds,
+            attention_mask=attention_mask,
+            cu_seqlens=attn_kwargs.get("cu_seqlens"),
+        )
         linear_attn_mask = self._update_linear_attn_mask(attention_mask, cache_position)
-        causal_mask = _make_causal_mask(inputs_embeds, attention_mask, dtype=inputs_embeds.dtype)
         hidden_states = inputs_embeds
 
         for decoder_layer in self.layers.values():
-            layer_mask = linear_attn_mask if decoder_layer.is_linear_attn else causal_mask
+            # Full-attention layers build their own additive mask; see
+            # ``KimiMLAAttention.forward``.
+            layer_mask = linear_attn_mask if decoder_layer.is_linear_attn else None
             layer_padding_mask = padding_mask
             if decoder_layer.is_linear_attn and layer_mask is not None:
                 layer_padding_mask = layer_mask.bool().logical_not()
@@ -843,6 +1062,7 @@ class KimiLinearModel(nn.Module):
                 hidden_states,
                 attention_mask=layer_mask,
                 padding_mask=layer_padding_mask,
+                packed_context=packed_context,
                 **attn_kwargs,
             )
 
@@ -851,8 +1071,8 @@ class KimiLinearModel(nn.Module):
     def update_moe_gate_bias(self) -> None:
         with torch.no_grad():
             for block in self.layers.values():
-                if block.is_moe_layer and block.block_sparse_moe.gate.bias_update_factor > 0:
-                    block.block_sparse_moe.gate.update_bias()
+                if block.is_moe_layer and block.mlp.gate.bias_update_factor > 0:
+                    block.mlp.gate.update_bias()
 
     @torch.no_grad()
     def init_weights(self, buffer_device: torch.device | None = None) -> None:
@@ -875,13 +1095,24 @@ class KimiLinearForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
     _keep_in_fp32_modules = ["_fp32_params", "e_score_correction_bias"]
     _keep_in_fp32_modules_strict = ["_fp32_params", "e_score_correction_bias"]
+    # Kimi Linear owns context parallelism end to end: it shards the batch itself
+    # (contiguous slices, as FLA's CP kernels require) and each layer type carries
+    # its own transport, so CP does not depend on the attention backend.
+    _owns_cp_attention = True
+    # Packed documents are masked by the model itself: MLA gets a document-blocked
+    # causal mask and KDA resets its recurrent state on per-document ``cu_seqlens``.
+    _owns_packed_attention = True
+    # The tensor-parallel plan shards the block boundaries (norms, output
+    # projections and the MoE output) along the sequence, so the custom-MoE path
+    # may enable sequence parallelism for this architecture.
+    _supports_sequence_parallel = True
 
     @dataclass(frozen=True)
     class ModelCapabilities:
         """Declared parallelism capabilities for Kimi Linear."""
 
-        supports_tp: bool = False
-        supports_cp: bool = False
+        supports_tp: bool = True
+        supports_cp: bool = True
         supports_pp: bool = False
         supports_ep: bool = True
 
@@ -990,6 +1221,16 @@ class KimiLinearForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                 attn_kwargs,
             )
             attention_mask = None
+            # THD packing drops the placeholder batch axis, but every Kimi layer
+            # works in [batch, sequence, ...]. Restore it and let ``cu_seqlens``
+            # carry the document boundaries; ``compute_lm_head_logits`` leaves the
+            # already-batched [1, tokens, hidden] result untouched.
+            if input_ids is not None and input_ids.dim() == 1:
+                input_ids = input_ids.unsqueeze(0)
+            if inputs_embeds is not None and inputs_embeds.dim() == 2:
+                inputs_embeds = inputs_embeds.unsqueeze(0)
+            if padding_mask is not None and padding_mask.dim() == 1:
+                padding_mask = padding_mask.unsqueeze(0)
 
         hidden_states = self.model(
             input_ids=input_ids,
@@ -1006,6 +1247,24 @@ class KimiLinearForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             is_thd=is_thd,
             output_hidden_states=output_hidden_states,
         )
+
+    def prepare_model_inputs_for_cp(self, input_ids: torch.Tensor | None = None, **kwargs: Any) -> dict[str, Any]:
+        """Hand the recipe Kimi Linear's own context-parallel batch sharding.
+
+        KDA's recurrent state (and FLA's CP kernels) require every rank to own one
+        contiguous slice of the sequence, so Kimi Linear replaces the default
+        load-balanced ``context_parallel`` sharding with
+        :func:`~nemo_automodel.components.models.kimi_linear.cp.shard_batch_for_kimi_cp`.
+
+        Args:
+            input_ids: Token ids of the unsharded batch; accepted for interface parity.
+            **kwargs: Additional recipe arguments; accepted for interface parity.
+
+        Returns:
+            Batch updates carrying the model-owned sharding callable.
+        """
+        del input_ids, kwargs
+        return {"_cp_make_batch_fn": shard_batch_for_kimi_cp}
 
     def update_moe_gate_bias(self) -> None:
         self.model.update_moe_gate_bias()

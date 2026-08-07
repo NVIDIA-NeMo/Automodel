@@ -148,10 +148,11 @@ def _resolve_moe_tp_plan(
     MoE path only accepts an explicit plan or an architecture registration and
     always validates routed-expert ownership before applying it.
     """
-    if sequence_parallel:
+    if sequence_parallel and not getattr(model, "_supports_sequence_parallel", False):
         raise ValueError(
-            "sequence_parallel=True is not supported by the custom MoE TP path yet; "
-            "use sequence_parallel=False so replicated router/attention activations remain correct."
+            f"sequence_parallel=True is not supported by '{type(model).__name__}' on the custom MoE TP path; "
+            "use sequence_parallel=False so replicated router/attention activations remain correct, or declare "
+            "_supports_sequence_parallel on a model whose plan shards the block boundaries."
         )
     if tp_size <= 1:
         return {}
@@ -163,7 +164,7 @@ def _resolve_moe_tp_plan(
 
         plan = _get_parallel_plan(
             model,
-            sequence_parallel=False,
+            sequence_parallel=sequence_parallel,
             tp_shard_plan=tp_shard_plan,
             tp_size=tp_size,
         )
@@ -184,7 +185,7 @@ def _resolve_moe_tp_plan(
                 "PARALLELIZE_FUNCTIONS or pass tp_shard_plan explicitly; routed experts must remain EP-owned."
             )
         try:
-            plan = plan_factory(model, False)
+            plan = plan_factory(model, sequence_parallel)
         except Exception as exc:
             raise ValueError(
                 f"The registered tensor-parallel plan for custom MoE model '{model_cls.__name__}' failed: {exc}"

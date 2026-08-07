@@ -59,6 +59,27 @@ def _route_kda_fp32_holder(key: str) -> str:
     return f"{head}.self_attn._fp32_params.{tail}"
 
 
+# The decoder block calls its feed-forward ``mlp`` for both the dense and the MoE
+# case, so only the MoE-owned children are renamed. Dense layers keep
+# ``mlp.{gate,up,down}_proj`` on both sides and must not be touched, which is why
+# these are exact path segments rather than a blanket ``mlp`` rewrite.
+_MOE_CHILD_SEGMENTS = ("gate.", "shared_experts.")
+
+
+def _hf_moe_key_to_native(key: str) -> str:
+    """Rewrite a checkpoint MoE key onto the decoder block's ``mlp`` submodule."""
+    for segment in _MOE_CHILD_SEGMENTS:
+        key = key.replace(f".block_sparse_moe.{segment}", f".mlp.{segment}")
+    return key
+
+
+def _native_moe_key_to_hf(key: str) -> str:
+    """Inverse of :func:`_hf_moe_key_to_native`."""
+    for segment in _MOE_CHILD_SEGMENTS:
+        key = key.replace(f".mlp.{segment}", f".block_sparse_moe.{segment}")
+    return key
+
+
 class KimiLinearStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
     """Convert Kimi Linear HF split experts to Automodel grouped experts.
 
@@ -70,8 +91,12 @@ class KimiLinearStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
 
     Automodel stores grouped experts as:
 
-    * ``block_sparse_moe.experts.gate_and_up_projs`` with shape [experts, hidden, 2 * inter].
-    * ``block_sparse_moe.experts.down_projs`` with shape [experts, inter, hidden].
+    * ``mlp.experts.gate_and_up_projs`` with shape [experts, hidden, 2 * inter].
+    * ``mlp.experts.down_projs`` with shape [experts, inter, hidden].
+
+    The decoder block names both its dense and its MoE feed-forward ``mlp`` (the
+    naming the custom-MoE parallelizer looks for), so the checkpoint's
+    ``block_sparse_moe`` path segment is translated here in both directions.
     """
 
     def __init__(
@@ -89,27 +114,29 @@ class KimiLinearStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
 
     @property
     def _expert_path_segment(self) -> str:
-        return "block_sparse_moe.experts"
+        return "mlp.experts"
 
     def _map_hf_expert_key_to_generic(self, key: str) -> str:
         match = re.match(
-            r"(?P<prefix>(?:model\.)?layers\.\d+\.block_sparse_moe\.experts\.\d+)\."
+            r"(?P<prefix>(?:model\.)?layers\.\d+)\.block_sparse_moe\.experts\.(?P<expert>\d+)\."
             r"(?P<proj>w1|w2|w3)\.weight$",
             key,
         )
         if match is None:
             return key
-        return f"{match.group('prefix')}.{_HF_TO_GENERIC_EXPERT_PROJ[match.group('proj')]}.weight"
+        projection = _HF_TO_GENERIC_EXPERT_PROJ[match.group("proj")]
+        return f"{match.group('prefix')}.mlp.experts.{match.group('expert')}.{projection}.weight"
 
     def _map_generic_expert_key_to_hf(self, key: str) -> str:
         match = re.match(
-            r"(?P<prefix>(?:model\.)?layers\.\d+\.block_sparse_moe\.experts\.\d+)\."
+            r"(?P<prefix>(?:model\.)?layers\.\d+)\.mlp\.experts\.(?P<expert>\d+)\."
             r"(?P<proj>gate_proj|up_proj|down_proj)\.weight$",
             key,
         )
         if match is None:
             return key
-        return f"{match.group('prefix')}.{_GENERIC_TO_HF_EXPERT_PROJ[match.group('proj')]}.weight"
+        projection = _GENERIC_TO_HF_EXPERT_PROJ[match.group("proj")]
+        return f"{match.group('prefix')}.block_sparse_moe.experts.{match.group('expert')}.{projection}.weight"
 
     def to_hf(
         self,
@@ -154,6 +181,7 @@ class KimiLinearStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
         result = expert_result if expert_result is not None else [(fqn, tensor)]
         result = [(_strip_kda_fp32_holder(key), value) for key, value in result]
         result = [(self._map_generic_expert_key_to_hf(key), value) for key, value in result]
+        result = [(_native_moe_key_to_hf(key), value) for key, value in result]
         if exclude_key_regex:
             result = [(key, value) for key, value in result if not re.match(exclude_key_regex, key)]
         return result
@@ -176,7 +204,9 @@ class KimiLinearStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
         """
         self._uses_model_prefix = any(key.startswith("model.") for key in hf_state_dict)
         generic_state_dict = {
-            _route_kda_fp32_holder(self._map_hf_expert_key_to_generic(key)): _upcast_fp32_state_tensor(key, value)
+            _route_kda_fp32_holder(_hf_moe_key_to_native(self._map_hf_expert_key_to_generic(key))): (
+                _upcast_fp32_state_tensor(key, value)
+            )
             for key, value in hf_state_dict.items()
         }
         return self._from_hf_w_merged_experts(generic_state_dict, device_mesh)

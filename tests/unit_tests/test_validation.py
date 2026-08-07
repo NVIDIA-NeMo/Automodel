@@ -143,6 +143,24 @@ def _make_moe_cls():
     return _MoE
 
 
+def _make_owns_cp_cls(backend_attn="eager"):
+    """MoE model that ships its own CP transport (Kimi Linear style)."""
+    from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
+
+    class _OwnsCP(MoEFSDPSyncMixin, nn.Module):
+        _owns_cp_attention = True
+        _owns_packed_attention = True
+
+        def __init__(self):
+            super().__init__()
+            self.backend = SimpleNamespace(attn=backend_attn)
+
+        def forward(self, input_ids, seq_lens=None):
+            return input_ids
+
+    return _OwnsCP
+
+
 def _make_moe_te_cls():
     """MoE model whose backend.attn == 'te'."""
     from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
@@ -306,6 +324,12 @@ class TestModelSupportsCP:
         _attach(model)
         assert model.supports.supports_cp is False
 
+    def test_custom_true_when_model_owns_cp(self):
+        """A model owning its CP transport needs no TE/Magi attention backend."""
+        model = _make_owns_cp_cls()()
+        _attach(model)
+        assert model.supports.supports_cp is True
+
     def test_deepseek_v4_true_with_tilelang(self):
         model = _DeepseekV4Like(backend_attn="tilelang")
         _attach(model)
@@ -427,6 +451,13 @@ class TestModelSupportsCPWithSequencePacking:
         _attach(model)
         model._mesh = _mesh(cp=2)
         assert model.supports.supports_cp_with_sequence_packing is False
+
+    def test_cp_gt1_sequence_packing_supported_when_model_owns_cp(self):
+        model = _make_owns_cp_cls()()
+        _attach(model)
+        model._mesh = _mesh(cp=2)
+        assert model.supports.supports_sequence_packing is True
+        assert model.supports.supports_cp_with_sequence_packing is True
 
     def test_deepseek_v4_cp_gt1_sequence_packing_supported_with_tilelang(self):
         model = _DeepseekV4Like()

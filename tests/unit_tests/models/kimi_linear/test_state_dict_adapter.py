@@ -127,8 +127,8 @@ def test_from_hf_groups_kimi_w1_w2_w3_experts(adapter, moe_config):
 
     native = adapter.from_hf(hf_state)
 
-    gate_up_key = "model.layers.1.block_sparse_moe.experts.gate_and_up_projs"
-    down_key = "model.layers.1.block_sparse_moe.experts.down_projs"
+    gate_up_key = "model.layers.1.mlp.experts.gate_and_up_projs"
+    down_key = "model.layers.1.mlp.experts.down_projs"
     assert gate_up_key in native
     assert down_key in native
 
@@ -156,7 +156,7 @@ def test_from_hf_upcasts_kda_and_router_fp32_keys(adapter):
 
     assert native["model.layers.0.self_attn._fp32_params.A_log"].dtype is torch.float32
     assert native["model.layers.0.self_attn._fp32_params.dt_bias"].dtype is torch.float32
-    assert native["model.layers.1.block_sparse_moe.gate.e_score_correction_bias"].dtype is torch.float32
+    assert native["model.layers.1.mlp.gate.e_score_correction_bias"].dtype is torch.float32
 
 
 def test_to_hf_strips_kda_fp32_holder(adapter):
@@ -175,12 +175,12 @@ def test_to_hf_strips_kda_fp32_holder(adapter):
 
 def test_to_hf_splits_grouped_experts_back_to_kimi_names(adapter, moe_config):
     native = {
-        "model.layers.1.block_sparse_moe.experts.gate_and_up_projs": torch.randn(
+        "model.layers.1.mlp.experts.gate_and_up_projs": torch.randn(
             moe_config.n_routed_experts,
             moe_config.dim,
             2 * moe_config.moe_inter_dim,
         ),
-        "model.layers.1.block_sparse_moe.experts.down_projs": torch.randn(
+        "model.layers.1.mlp.experts.down_projs": torch.randn(
             moe_config.n_routed_experts,
             moe_config.moe_inter_dim,
             moe_config.dim,
@@ -298,3 +298,23 @@ def test_split_experts_weights_dtensor_shard_validates_local_expert_count(adapte
 
     with pytest.raises(ValueError, match="Expected local Kimi expert tensor first dimension to be 3"):
         adapter._split_experts_weights(weight, n_experts=5)
+
+
+def test_moe_children_map_between_block_sparse_moe_and_mlp(adapter):
+    """The block names its feed-forward ``mlp``; the checkpoint says ``block_sparse_moe``."""
+    hf_state = {
+        "model.layers.1.block_sparse_moe.gate.weight": torch.ones(3, 4),
+        "model.layers.1.block_sparse_moe.shared_experts.down_proj.weight": torch.ones(4, 3),
+        # A dense layer keeps ``mlp`` on both sides and must survive untouched.
+        "model.layers.0.mlp.down_proj.weight": torch.ones(4, 3),
+    }
+
+    native = adapter.from_hf(hf_state)
+
+    assert "model.layers.1.mlp.gate.weight" in native
+    assert "model.layers.1.mlp.shared_experts.down_proj.weight" in native
+    assert "model.layers.0.mlp.down_proj.weight" in native
+
+    round_tripped = adapter.to_hf(native)
+
+    assert set(round_tripped) == set(hf_state)
