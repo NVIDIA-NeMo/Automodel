@@ -937,3 +937,43 @@ class TestInplaceLoadViews:
         assert not hasattr(mixin, "_inplace_loaded_native_keys") or (
             "model.layers.3.mlp.experts.down_projs" not in (mixin._inplace_loaded_native_keys or set())
         )
+
+    def test_inplace_load_skips_mok_gate_up_copy_but_keeps_down_view(self):
+        # GroupedExpertsMoK stores gate and up in separate contiguous Parameters;
+        # its virtual gate_and_up_projs is a torch.cat copy and cannot be a DCP
+        # write-through target. Its virtual down_projs remains a transpose view.
+        mixin = MockMoEStateDictMixin(n_experts=2, inter_dim=512)
+        mixin.backend.experts = "gmm"
+        mixin.backend.dispatcher = "mok"
+
+        gate_up_storage = torch.randn(2, 1024, 1024)
+        gate_up_dtensor = Mock()
+        gate_up_result = self._run_inplace_conversion(
+            mixin,
+            "model.layers.0.mlp.experts.gate_and_up_projs",
+            gate_up_dtensor,
+            [gate_up_storage[i] for i in range(2)],
+        )
+
+        assert gate_up_result is not None
+        assert all(value.is_contiguous() for _, value in gate_up_result)
+        assert not hasattr(mixin, "_inplace_loaded_native_keys") or (
+            "model.layers.0.mlp.experts.gate_and_up_projs" not in (mixin._inplace_loaded_native_keys or set())
+        )
+
+        down_storage = torch.randn(2, 512, 1024)
+        down_dtensor = Mock(spec=["ndim", "shape", "is_meta"])
+        down_dtensor.ndim = 3
+        down_dtensor.shape = (2, 512, 1024)
+        down_dtensor.is_meta = False
+        down_result = self._run_inplace_conversion(
+            mixin,
+            "model.layers.3.mlp.experts.down_projs",
+            down_dtensor,
+            [down_storage[i] for i in range(2)],
+        )
+
+        assert down_result is not None
+        down_ptr = down_storage.untyped_storage().data_ptr()
+        assert all(value.untyped_storage().data_ptr() == down_ptr for _, value in down_result)
+        assert "model.layers.3.mlp.experts.down_projs" in mixin._inplace_loaded_native_keys

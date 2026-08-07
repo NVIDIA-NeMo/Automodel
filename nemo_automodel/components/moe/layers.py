@@ -839,7 +839,8 @@ class MoE(nn.Module):
         Args:
             x: Input tensor of shape ``[..., hidden]``.
             padding_mask: Boolean tensor matching ``x.shape[:-1]`` where true
-                entries are padding. MoK currently requires this to be absent.
+                entries are padding. MoK compacts valid tokens before dispatch
+                and restores the original token layout afterward.
             cp_mesh: Optional context-parallel mesh used by the router.
 
         Returns:
@@ -862,26 +863,69 @@ class MoE(nn.Module):
         else:
             x_latent = x
 
-        weights, indices, aux_loss = self.gate(x, token_mask, cp_mesh)
-
         if isinstance(self.experts, GroupedExpertsMoK):
-            if padding_mask is not None:
-                raise ValueError("dispatcher='mok' requires unpadded, equal token counts on every EP rank")
             if not isinstance(self.shared_experts, MLP):
                 raise RuntimeError("dispatcher='mok' requires exactly one shared MLP expert")
             if self.shared_experts.gate_proj is None:
                 raise RuntimeError("dispatcher='mok' requires a gated shared SwiGLU expert")
-            y = self.experts(
-                x_latent,
-                token_mask,
-                weights,
-                indices,
-                self.shared_experts.gate_proj.weight,
-                self.shared_experts.up_proj.weight,
-                self.shared_experts.down_proj.weight,
-            )
+
+            # MoK's fused schedule requires the same number of dense token rows
+            # on every EP rank, with at least 512 rows aligned to 256. Packed THD
+            # batches still have an equal padded extent on all ranks, but padding
+            # must not be routed or counted by the correction-bias/load metrics.
+            # Compact valid rows before the gate, zero-pad only the MoK dispatch
+            # inputs, then discard the dummy outputs and scatter valid rows back
+            # into the original layout. Dummy router weights are zero, so the
+            # alignment rows contribute neither activations nor gradients. The
+            # common padded sequence extent preserves MoK's equal-token contract
+            # even when EP ranks consume different packed examples.
+            if padding_mask is not None:
+                valid_positions = token_mask.nonzero(as_tuple=False).flatten()
+                gate_x = x.index_select(0, valid_positions)
+                expert_x = x_latent.index_select(0, valid_positions)
+                compact_mask = torch.ones(valid_positions.numel(), dtype=torch.bool, device=x.device)
+                weights, indices, aux_loss = self.gate(gate_x, compact_mask, cp_mesh)
+                num_valid_tokens = valid_positions.numel()
+                # EP ranks consume different packed examples, so their valid
+                # counts need not match. The padded input extent does match;
+                # use its aligned size as the common dispatch shape instead
+                # of deriving a different shape from each rank's valid count.
+                num_dispatch_tokens = max(512, ((x.size(0) + 255) // 256) * 256)
+                num_dummy_tokens = num_dispatch_tokens - num_valid_tokens
+                if num_dummy_tokens:
+                    expert_x = torch.cat((expert_x, expert_x.new_zeros((num_dummy_tokens, expert_x.size(1)))), dim=0)
+                    weights = torch.cat((weights, weights.new_zeros((num_dummy_tokens, weights.size(1)))), dim=0)
+                    dummy_indices = torch.arange(
+                        num_dummy_tokens * indices.size(1), device=indices.device, dtype=indices.dtype
+                    ).view(num_dummy_tokens, indices.size(1))
+                    dummy_indices = dummy_indices.remainder(self.n_routed_experts)
+                    indices = torch.cat((indices, dummy_indices), dim=0)
+                dispatch_mask = torch.ones(num_dispatch_tokens, dtype=torch.bool, device=x.device)
+                dispatch_y = self.experts(
+                    expert_x,
+                    dispatch_mask,
+                    weights,
+                    indices,
+                    self.shared_experts.gate_proj.weight,
+                    self.shared_experts.up_proj.weight,
+                    self.shared_experts.down_proj.weight,
+                )
+                valid_y = dispatch_y[:num_valid_tokens]
+                y = x.new_zeros((x.size(0), self.dim)).index_copy(0, valid_positions, valid_y)
+            else:
+                weights, indices, aux_loss = self.gate(x, token_mask, cp_mesh)
+                y = self.experts(
+                    x_latent,
+                    token_mask,
+                    weights,
+                    indices,
+                    self.shared_experts.gate_proj.weight,
+                    self.shared_experts.up_proj.weight,
+                    self.shared_experts.down_proj.weight,
+                )
             z = None
         else:
+            weights, indices, aux_loss = self.gate(x, token_mask, cp_mesh)
             # Shared-expert output (optionally gated), computed inline on the main stream.
             z = None
             if self.shared_experts is not None:

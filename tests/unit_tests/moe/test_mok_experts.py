@@ -23,6 +23,7 @@ from torch.utils.checkpoint import checkpoint
 from nemo_automodel.components.models.common import BackendConfig, MoKBackendConfig
 from nemo_automodel.components.moe import mok_experts
 from nemo_automodel.components.moe.config import MoEConfig
+from nemo_automodel.components.moe.layers import MoE
 from nemo_automodel.components.moe.mok_experts import GroupedExpertsMoK
 
 
@@ -146,6 +147,110 @@ def test_mok_state_dict_preserves_combined_expert_layout() -> None:
     torch.testing.assert_close(restored.routed_gate_weights, source.routed_gate_weights)
     torch.testing.assert_close(restored.routed_up_weights, source.routed_up_weights)
     torch.testing.assert_close(restored.routed_down_weights, source.routed_down_weights)
+
+
+def test_mok_state_dict_loads_virtual_expert_keys_independently() -> None:
+    config = _valid_moe_config()
+    source = GroupedExpertsMoK(config, BackendConfig(dispatcher="mok"))
+    target = GroupedExpertsMoK(config, BackendConfig(dispatcher="mok"))
+    with torch.no_grad():
+        source.routed_gate_weights.fill_(1)
+        source.routed_up_weights.fill_(2)
+        source.routed_down_weights.fill_(3)
+        target.routed_gate_weights.zero_()
+        target.routed_up_weights.zero_()
+        target.routed_down_weights.zero_()
+
+    source_state = source.state_dict()
+    target.load_state_dict({"gate_and_up_projs": source_state["gate_and_up_projs"]}, strict=False)
+
+    torch.testing.assert_close(target.routed_gate_weights, source.routed_gate_weights)
+    torch.testing.assert_close(target.routed_up_weights, source.routed_up_weights)
+    torch.testing.assert_close(target.routed_down_weights, torch.zeros_like(target.routed_down_weights))
+
+    target.load_state_dict({"down_projs": source_state["down_projs"]}, strict=False)
+
+    torch.testing.assert_close(target.routed_down_weights, source.routed_down_weights)
+
+
+def test_mok_compacts_padding_and_restores_token_layout(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = _valid_moe_config()
+    monkeypatch.setattr("nemo_automodel.components.moe.layers.get_world_size_safe", lambda: 4)
+    moe = MoE(config, BackendConfig(dispatcher="mok", linear="torch"))
+    captured: dict[str, torch.Tensor] = {}
+
+    def fake_experts(
+        x: torch.Tensor,
+        token_mask: torch.Tensor,
+        weights: torch.Tensor,
+        indices: torch.Tensor,
+        *shared_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        del shared_weights
+        captured["x"] = x
+        captured["token_mask"] = token_mask
+        captured["weights"] = weights
+        captured["indices"] = indices
+        return x + 1
+
+    monkeypatch.setattr(moe.experts, "forward", fake_experts)
+    x = torch.randn(1, 4, 256, dtype=torch.bfloat16, requires_grad=True)
+    padding_mask = torch.tensor([[False, True, False, True]])
+
+    output = moe(x, padding_mask=padding_mask)
+
+    assert output.shape == x.shape
+    assert captured["x"].shape == (512, 256)
+    torch.testing.assert_close(captured["x"][:2], x.detach().view(-1, 256)[[0, 2]])
+    torch.testing.assert_close(captured["x"][2:], torch.zeros_like(captured["x"][2:]))
+    assert captured["token_mask"].all()
+    assert captured["token_mask"].numel() == 512
+    torch.testing.assert_close(captured["weights"][2:], torch.zeros_like(captured["weights"][2:]))
+    dummy_load = torch.bincount(captured["indices"][2:].flatten(), minlength=config.n_routed_experts)
+    torch.testing.assert_close(dummy_load, torch.full_like(dummy_load, dummy_load[0]))
+    torch.testing.assert_close(output[0, 0], x[0, 0] + 1)
+    torch.testing.assert_close(output[0, 2], x[0, 2] + 1)
+    torch.testing.assert_close(output[0, 1], torch.zeros_like(output[0, 1]))
+    torch.testing.assert_close(output[0, 3], torch.zeros_like(output[0, 3]))
+
+    output.sum().backward()
+    torch.testing.assert_close(x.grad[0, 0], torch.ones_like(x.grad[0, 0]))
+    torch.testing.assert_close(x.grad[0, 2], torch.ones_like(x.grad[0, 2]))
+    torch.testing.assert_close(x.grad[0, 1], torch.zeros_like(x.grad[0, 1]))
+    torch.testing.assert_close(x.grad[0, 3], torch.zeros_like(x.grad[0, 3]))
+
+
+def test_mok_all_padding_still_enters_collective_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = _valid_moe_config()
+    monkeypatch.setattr("nemo_automodel.components.moe.layers.get_world_size_safe", lambda: 4)
+    moe = MoE(config, BackendConfig(dispatcher="mok", linear="torch"))
+    calls: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+
+    def fake_experts(
+        x: torch.Tensor,
+        token_mask: torch.Tensor,
+        weights: torch.Tensor,
+        indices: torch.Tensor,
+        *shared_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        del shared_weights
+        calls.append((x, weights, indices))
+        assert token_mask.all()
+        return torch.zeros_like(x)
+
+    monkeypatch.setattr(moe.experts, "forward", fake_experts)
+    x = torch.randn(1, 4, 256, dtype=torch.bfloat16)
+
+    output = moe(x, padding_mask=torch.ones(1, 4, dtype=torch.bool))
+
+    assert len(calls) == 1
+    expert_x, weights, indices = calls[0]
+    assert expert_x.shape == (512, 256)
+    torch.testing.assert_close(expert_x, torch.zeros_like(expert_x))
+    torch.testing.assert_close(weights, torch.zeros_like(weights))
+    dummy_load = torch.bincount(indices.flatten(), minlength=config.n_routed_experts)
+    torch.testing.assert_close(dummy_load, torch.full_like(dummy_load, dummy_load[0]))
+    torch.testing.assert_close(output, torch.zeros_like(output))
 
 
 def test_mok_manual_backward_maps_gradients_to_autograd_inputs() -> None:

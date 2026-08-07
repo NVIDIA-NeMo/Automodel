@@ -602,22 +602,27 @@ class GroupedExpertsMoK(nn.Module):
             missing_keys.append(gate_up_key)
         if down is None:
             missing_keys.append(down_key)
-        if gate_up is None or down is None:
-            return
-        gate_up = _local_tensor(gate_up)
-        down = _local_tensor(down)
         inter_dim = self.config.moe_inter_dim
         expected_gate_up_shape = (*_local_tensor(self.routed_gate_weights).shape[:1], self.config.dim, 2 * inter_dim)
         expected_down_shape = (*_local_tensor(self.routed_down_weights).shape[:1], inter_dim, self.config.dim)
-        if tuple(gate_up.shape) != expected_gate_up_shape:
-            raise RuntimeError(
-                f"Cannot load {gate_up_key}: expected local shape {expected_gate_up_shape}, got {tuple(gate_up.shape)}"
-            )
-        if tuple(down.shape) != expected_down_shape:
-            raise RuntimeError(
-                f"Cannot load {down_key}: expected local shape {expected_down_shape}, got {tuple(down.shape)}"
-            )
         with torch.no_grad():
-            _local_tensor(self.routed_gate_weights).copy_(gate_up[..., :inter_dim].transpose(-1, -2))
-            _local_tensor(self.routed_up_weights).copy_(gate_up[..., inter_dim:].transpose(-1, -2))
-            _local_tensor(self.routed_down_weights).copy_(down.transpose(-1, -2))
+            # DCP may already have written one virtual tensor through an aliasing
+            # state-dict view while the other takes the rebuild path. Load the two
+            # keys independently so the absence of an in-place-loaded key does not
+            # suppress copying the rebuilt key.
+            if gate_up is not None:
+                gate_up = _local_tensor(gate_up)
+                if tuple(gate_up.shape) != expected_gate_up_shape:
+                    raise RuntimeError(
+                        f"Cannot load {gate_up_key}: expected local shape {expected_gate_up_shape}, "
+                        f"got {tuple(gate_up.shape)}"
+                    )
+                _local_tensor(self.routed_gate_weights).copy_(gate_up[..., :inter_dim].transpose(-1, -2))
+                _local_tensor(self.routed_up_weights).copy_(gate_up[..., inter_dim:].transpose(-1, -2))
+            if down is not None:
+                down = _local_tensor(down)
+                if tuple(down.shape) != expected_down_shape:
+                    raise RuntimeError(
+                        f"Cannot load {down_key}: expected local shape {expected_down_shape}, got {tuple(down.shape)}"
+                    )
+                _local_tensor(self.routed_down_weights).copy_(down.transpose(-1, -2))
