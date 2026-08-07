@@ -411,7 +411,9 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
                     ac_scopes,
                     enable_compile=enable_compile,
                 ):
-                    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": True})
+                    # Reentrant HF checkpointing reruns FSDP2 forward hooks during backward and can retrigger
+                    # explicit forward-prefetch chains, issuing duplicate parameter all-gathers.
+                    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
                 else:
                     apply_submodule_checkpointing(ac_layers, _has_kv_sharing)
 
