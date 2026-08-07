@@ -24,10 +24,10 @@ from typing import Any, Literal
 import numpy as np
 import torch
 from PIL import Image
+from tokenizers import Encoding
 from transformers import BatchEncoding, PixtralProcessor
+from transformers.models.pixtral.processing_pixtral import PixtralProcessorKwargs
 from transformers.tokenization_utils_tokenizers import TokenizersBackend
-
-_CONTROL_TOKEN_ESCAPE = "\u200c"
 
 
 def load_image(image: Any) -> Image.Image:
@@ -61,7 +61,7 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
         Transformers validates processor tokenizers against every generally supported
         tokenizer class, which imports ``mistral-common`` even when the selected tokenizer
         is already a ``TokenizersBackend``. This processor supports only the latter so its
-        image markers and escaped user text retain the retrieval-specific semantics.
+        processor-owned image IDs and user text retain distinct retrieval semantics.
 
         Args:
             argument_name: Processor attribute being validated.
@@ -100,15 +100,15 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
             raise ValueError(
                 f"backend must be 'tokenizers' for Mistral retrieval processors, got {kwargs['backend']!r}."
             )
-        if "split_special_tokens" in kwargs and kwargs["split_special_tokens"] is not False:
-            raise ValueError("split_special_tokens must be False for Mistral retrieval processors.")
+        if "split_special_tokens" in kwargs and kwargs["split_special_tokens"] is not True:
+            raise ValueError("split_special_tokens must be True for Mistral retrieval processors.")
         kwargs.pop("backend", None)
         kwargs.pop("split_special_tokens", None)
         return TokenizersBackend.from_pretrained(
             pretrained_model_name_or_path,
             subfolder=tokenizer_subfolder,
             fix_mistral_regex=True,
-            split_special_tokens=False,
+            split_special_tokens=True,
             **kwargs,
         )
 
@@ -174,12 +174,7 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
         if return_tensors not in ("pt", "np"):
             raise ValueError(f"Invalid return_tensors: {return_tensors!r}. Must be 'pt' or 'np'.")
 
-        query_prompts = [
-            f"{self.query_prefix} {self._escape_user_control_tokens(query)}"
-            if self.query_prefix
-            else self._escape_user_control_tokens(query)
-            for query in queries
-        ]
+        query_prompts = [f"{self.query_prefix} {query}" if self.query_prefix else query for query in queries]
         return self._process_text(
             query_prompts,
             max_length=self.q_max_length,
@@ -215,26 +210,35 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
             raise ValueError(f"Invalid return_tensors: {return_tensors!r}. Must be 'pt' or 'np'.")
 
         images, texts = self._extract_document_fields(documents)
-        contents = []
-        processor_images = []
-        for image, text in zip(images, texts):
-            content = "" if text is None else self._escape_user_control_tokens(str(text))
-            if image is not None and image != "":
-                processor_images.append(load_image(image).convert("RGB"))
-                content = f"{self.image_token} {content}".strip()
-            if self.passage_prefix:
-                content = f"{self.passage_prefix} {content}".strip()
-            contents.append(content)
+        contents = ["" if text is None else str(text) for text in texts]
+        image_flags = [image is not None and image != "" for image in images]
+        processor_images = [
+            load_image(image).convert("RGB") for image, has_image in zip(images, image_flags) if has_image
+        ]
 
-        batch = self._process_text(
-            contents,
-            images=processor_images or None,
-            max_length=self.p_max_length,
-            return_tensors=return_tensors,
-            padding=padding,
-            truncation=truncation,
-            **kwargs,
-        )
+        if processor_images:
+            batch = self._process_structured_documents(
+                contents,
+                image_flags=image_flags,
+                images=processor_images,
+                max_length=self.p_max_length,
+                return_tensors=return_tensors,
+                padding=padding,
+                truncation=truncation,
+                **kwargs,
+            )
+        else:
+            prompts = [
+                f"{self.passage_prefix} {content}".strip() if self.passage_prefix else content for content in contents
+            ]
+            batch = self._process_text(
+                prompts,
+                max_length=self.p_max_length,
+                return_tensors=return_tensors,
+                padding=padding,
+                truncation=truncation,
+                **kwargs,
+            )
         if "pixel_values" not in batch:
             batch["pixel_values"] = None
         if "image_sizes" not in batch:
@@ -300,6 +304,124 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
             raise ValueError(f"Invalid return_tensors: {return_tensors!r}. Must be 'pt' or 'np'.")
         return merged_batch_dict
 
+    def _process_structured_documents(
+        self,
+        contents: list[str],
+        *,
+        image_flags: list[bool],
+        images: list[Image.Image],
+        max_length: int | None,
+        return_tensors: Literal["pt", "np"],
+        padding: bool | str | None,
+        truncation: bool,
+        **kwargs: Any,
+    ) -> BatchEncoding:
+        """Tokenize user text separately from processor-owned image markers."""
+        if padding is None:
+            padding = self.padding
+        if truncation and max_length is None:
+            max_length = getattr(self.tokenizer, "model_max_length", None)
+
+        output_kwargs = self._merge_kwargs(
+            PixtralProcessorKwargs,
+            tokenizer_init_kwargs=getattr(self.tokenizer, "init_kwargs", {}),
+            return_tensors=return_tensors,
+            padding=padding,
+            truncation=truncation,
+            max_length=max_length,
+            pad_to_multiple_of=self.pad_to_multiple_of,
+            **kwargs,
+        )
+        patch_size = self.patch_size * self.spatial_merge_size
+        output_kwargs["images_kwargs"]["patch_size"] = patch_size
+        image_inputs = self.image_processor(images, **output_kwargs["images_kwargs"])
+
+        image_marker_texts = [self._build_image_marker_text(size, patch_size) for size in image_inputs["image_sizes"]]
+        text_segments: list[str] = []
+        document_layouts: list[list[tuple[str, int]]] = []
+        image_index = 0
+        for content, has_image in zip(contents, image_flags):
+            if has_image:
+                prefix = f"{self.passage_prefix} " if self.passage_prefix else ""
+                suffix = f" {content}" if content else ""
+                prefix_index = len(text_segments)
+                text_segments.append(prefix)
+                suffix_index = len(text_segments)
+                text_segments.append(suffix)
+                document_layouts.append([("text", prefix_index), ("image", image_index), ("text", suffix_index)])
+                image_index += 1
+            else:
+                prompt = f"{self.passage_prefix} {content}".strip() if self.passage_prefix else content
+                text_index = len(text_segments)
+                text_segments.append(prompt)
+                document_layouts.append([("text", text_index)])
+
+        text_encodings = self.tokenizer(
+            text_segments,
+            add_special_tokens=False,
+            padding=False,
+            truncation=False,
+            split_special_tokens=True,
+            return_tensors=None,
+        ).encodings
+        image_encodings = self.tokenizer(
+            image_marker_texts,
+            add_special_tokens=False,
+            padding=False,
+            truncation=False,
+            split_special_tokens=False,
+            return_tensors=None,
+        ).encodings
+
+        special_tokens = self.tokenizer.num_special_tokens_to_add(pair=False)
+        encoded_documents = []
+        for document_index, layout in enumerate(document_layouts):
+            parts = [text_encodings[index] if owner == "text" else image_encodings[index] for owner, index in layout]
+            merged = Encoding.merge(parts, growing_offsets=True)
+            if truncation and max_length is not None:
+                available_length = max_length - special_tokens
+                if available_length < 0:
+                    raise ValueError(f"max_length={max_length} cannot accommodate required tokenizer special tokens.")
+                if image_flags[document_index]:
+                    protected_length = len(parts[0].ids) + len(parts[1].ids)
+                    if protected_length > available_length:
+                        raise ValueError(
+                            "A complete image token structure plus the passage prefix cannot fit within "
+                            f"p_max_length={max_length}; increase p_max_length or reduce the processed image size."
+                        )
+                    if len(merged.ids) > available_length and self.tokenizer.truncation_side != "right":
+                        raise ValueError(
+                            "Structured Mistral image documents require right-side truncation so image tokens remain intact."
+                        )
+                merged.truncate(available_length, direction=self.tokenizer.truncation_side)
+            encoded_documents.append(self.tokenizer.backend_tokenizer.post_process(merged, add_special_tokens=True).ids)
+
+        text_kwargs = output_kwargs["text_kwargs"]
+        text_inputs = self.tokenizer.pad(
+            {"input_ids": encoded_documents},
+            padding=text_kwargs.get("padding", False),
+            max_length=text_kwargs.get("max_length"),
+            pad_to_multiple_of=text_kwargs.get("pad_to_multiple_of"),
+            padding_side=text_kwargs.get("padding_side"),
+            return_attention_mask=True,
+            return_tensors=return_tensors,
+        )
+        return BatchEncoding(data={**text_inputs, **image_inputs}, tensor_type=return_tensors)
+
+    def _build_image_marker_text(self, image_size: Any, patch_size: int) -> str:
+        """Build the processor-owned Pixtral image marker sequence."""
+        height, width = (int(dimension) for dimension in image_size)
+        num_height_tokens = height // patch_size
+        num_width_tokens = width // patch_size
+        if num_height_tokens < 1 or num_width_tokens < 1:
+            raise ValueError(
+                f"Processed image size {(height, width)} is smaller than the effective patch size {patch_size}."
+            )
+        markers = [[self.image_token] * num_width_tokens + [self.image_break_token]] * num_height_tokens
+        flattened_markers = [marker for row in markers for marker in row]
+        flattened_markers[-1] = self.image_end_token
+        return "".join(flattened_markers)
+
     def _process_text(
         self,
         text: list[str],
@@ -307,7 +429,6 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
         return_tensors: Literal["pt", "np"],
         padding: bool | str | None,
         truncation: bool,
-        images: list[Image.Image] | None = None,
         **kwargs: Any,
     ) -> BatchEncoding:
         if padding is None:
@@ -315,14 +436,18 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
         if truncation and max_length is None:
             max_length = getattr(self.tokenizer, "model_max_length", None)
 
-        return self(
-            images=images,
-            text=text,
+        if "split_special_tokens" in kwargs and kwargs["split_special_tokens"] is not True:
+            raise ValueError("split_special_tokens must be True for Mistral retrieval user text.")
+        kwargs.pop("split_special_tokens", None)
+        return self.tokenizer(
+            text,
             return_tensors=return_tensors,
             padding=padding,
             truncation=truncation,
             max_length=max_length,
             pad_to_multiple_of=self.pad_to_multiple_of,
+            split_special_tokens=True,
+            padding_side="right",
             **kwargs,
         )
 
@@ -337,14 +462,6 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
         if isinstance(documents, list):
             return [pair["image"] for pair in documents], [pair["text"] for pair in documents]
         raise ValueError("The documents need to be a dict or list of dicts.")
-
-    def _escape_user_control_tokens(self, text: str) -> str:
-        """Break literal user control tokens without changing processor-owned markers."""
-        special_tokens = getattr(self.tokenizer, "all_special_tokens", ())
-        for token in sorted((token for token in special_tokens if len(token) > 1), key=len, reverse=True):
-            escaped = f"{token[0]}{_CONTROL_TOKEN_ESCAPE}{token[1:]}"
-            text = text.replace(token, escaped)
-        return text
 
 
 def _register_with_hf_auto_classes() -> None:
