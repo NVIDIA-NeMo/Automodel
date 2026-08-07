@@ -94,9 +94,7 @@ ci:
 
     jobs = dict(generate_job(config, {}, "release", "llm_finetune", str(tmp_path)))
 
-    assert jobs[""]["variables"]["CHECKPOINT_ROBUSTNESS_PHASES"] == (
-        "train_and_save automodel_reload hf_reload resume_baseline resume"
-    )
+    assert jobs[""]["variables"]["CHECKPOINT_ROBUSTNESS_PHASES"] == ("train_and_save automodel_reload hf_reload resume")
 
 
 def test_generate_checkpoint_robustness_process_isolation_honors_skips(tmp_path):
