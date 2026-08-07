@@ -61,9 +61,7 @@ model:
 
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
-  # Match grouped experts as well as ordinary linear modules so the exported
-  # PEFT v5 target_parameters are backed by trained and saved adapter tensors.
-  target_modules: ["*"]
+  match_all_linear: True
   dim: 8
   alpha: 32
   use_triton: True

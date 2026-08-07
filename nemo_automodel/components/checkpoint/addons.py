@@ -33,6 +33,9 @@ if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
 
 
+_MOE_LORA_PARAMETER_SUFFIXES = ("lora_gate_and_up_A", "lora_gate_and_up_B", "lora_down_A", "lora_down_B")
+
+
 def _is_group_rank_0(process_group: "ProcessGroup | None") -> bool:
     return not torch.distributed.is_initialized() or torch.distributed.get_rank(group=process_group) == 0
 
@@ -246,7 +249,7 @@ def _get_hf_peft_config(peft_config: "PeftConfig", model_state: ModelState, v4_c
     model_part = model_parts[0]
     pp_group = getattr(model_state, "pp_group", None)
     target_modules = _extract_target_modules(model_parts, v4_compatible=v4_compatible, pp_group=pp_group)
-    target_parameters = _extract_target_parameters(model_parts, v4_compatible=v4_compatible)
+    target_parameters = _extract_target_parameters(model_parts, v4_compatible=v4_compatible, pp_group=pp_group)
     try:
         arch_name = model_part.config.architectures[0]
         # "LlamaForCausalLM".split("For") → ["Llama", "CausalLM"]
@@ -303,20 +306,53 @@ def _get_automodel_peft_metadata(peft_config: "PeftConfig") -> dict:
     return result
 
 
-def _extract_target_parameters(model: "nn.Module | list[nn.Module]", v4_compatible: bool = False) -> list[str]:
+def _has_trainable_moe_lora_parameters(
+    model: "nn.Module | list[nn.Module]",
+    pp_group: "torch.distributed.ProcessGroup | None" = None,
+) -> bool:
+    """Return whether any pipeline stage owns trainable grouped-expert LoRA parameters."""
+    model_parts = model if isinstance(model, (list, tuple)) else [model]
+    parameter_endings = tuple(f".{suffix}" for suffix in _MOE_LORA_PARAMETER_SUFFIXES)
+    local_has_moe_lora = any(
+        param.requires_grad and name.endswith(parameter_endings)
+        for model_part in model_parts
+        for name, param in model_part.named_parameters()
+    )
+
+    if pp_group is not None and torch.distributed.get_world_size(group=pp_group) > 1:
+        world = torch.distributed.get_world_size(group=pp_group)
+        gathered = [False] * world
+        torch.distributed.all_gather_object(gathered, local_has_moe_lora, group=pp_group)
+        return any(gathered)
+
+    return local_has_moe_lora
+
+
+def _extract_target_parameters(
+    model: "nn.Module | list[nn.Module]",
+    v4_compatible: bool = False,
+    pp_group: "torch.distributed.ProcessGroup | None" = None,
+) -> list[str]:
     """Extract ``target_parameters`` for PEFT v0.18+ ParamWrapper format.
 
     Returns fused expert parameter paths for adapters that explicitly opt in
-    to PEFT v5 ParamWrapper export, or an empty list otherwise.
+    to PEFT v5 ParamWrapper export and have trainable grouped-expert LoRA
+    parameters, or an empty list otherwise.
 
-    ``model`` may be a single module or a list of PP parts; the check is a
-    per-model-class property, so the first part is representative.
+    ``model`` may be a single module or a list of local PP parts. When a PP
+    group is provided, expert-LoRA presence is unioned across its ranks so all
+    stages emit identical metadata.
     """
     model_part = model[0] if isinstance(model, (list, tuple)) else model
     if v4_compatible:
         return []
     adapter = getattr(model_part, "state_dict_adapter", None)
-    if adapter is not None and isinstance(adapter, MoESplitExpertsStateDictMixin):
+    if (
+        adapter is not None
+        and isinstance(adapter, MoESplitExpertsStateDictMixin)
+        and adapter._v5_peft_target_parameters
+        and _has_trainable_moe_lora_parameters(model, pp_group=pp_group)
+    ):
         return list(adapter._v5_peft_target_parameters)
     return []
 
@@ -356,8 +392,6 @@ def _extract_target_modules(
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
 
-    _MOE_LORA_SUFFIXES = ("lora_gate_and_up_A", "lora_gate_and_up_B", "lora_down_A", "lora_down_B")
-
     final_target_modules = set()
     for _mp in model_parts:
         for name, _ in _mp.named_modules():
@@ -384,7 +418,10 @@ def _extract_target_modules(
     adapter = getattr(model_parts[0], "state_dict_adapter", None)
     _has_split_expert_mixin = isinstance(adapter, MoESplitExpertsStateDictMixin)
     _uses_v5_target_parameters = bool(
-        _has_split_expert_mixin and not v4_compatible and adapter._v5_peft_target_parameters
+        _has_split_expert_mixin
+        and not v4_compatible
+        and adapter._v5_peft_target_parameters
+        and _has_trainable_moe_lora_parameters(model_parts)
     )
     if _has_split_expert_mixin and not _uses_v5_target_parameters:
         seen_expert_groups: set[tuple[str, str]] = set()
@@ -392,7 +429,7 @@ def _extract_target_modules(
             for name, param in _mp.named_parameters():
                 if not param.requires_grad:
                     continue
-                for lora_suffix in _MOE_LORA_SUFFIXES:
+                for lora_suffix in _MOE_LORA_PARAMETER_SUFFIXES:
                     if name.endswith(f".{lora_suffix}"):
                         expert_path = name[: -len(f".{lora_suffix}")]
                         if expert_path.startswith("_orig_mod."):

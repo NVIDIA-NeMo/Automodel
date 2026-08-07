@@ -22,6 +22,7 @@ from torch import nn
 
 from nemo_automodel.components._peft.lora import PeftConfig, apply_lora_to_linear_modules
 from nemo_automodel.components._peft.lora_experts import GroupedExpertsLoRA
+from nemo_automodel.components.checkpoint.addons import _get_hf_peft_config
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.minimax_m2.model import MiniMaxM2ForCausalLM as NeMoMiniMaxM2ForCausalLM
@@ -236,8 +237,8 @@ def test_peft_v5_load_merge_and_adapter_round_trip(family, tmp_path):
         torch.testing.assert_close(restored_state_dict[key], expected)
 
 
-def test_minimax_recipe_injects_and_exports_expert_adapters():
-    """The shipped MiniMax recipe must save every expert adapter advertised to PEFT v5."""
+def test_minimax_recipe_does_not_advertise_untrained_expert_adapters():
+    """The dense-only MiniMax recipe must not advertise PEFT v5 expert parameters."""
     from transformers.models.minimax_m2.configuration_minimax_m2 import MiniMaxM2Config
 
     with _MINIMAX_RECIPE.open(encoding="utf-8") as recipe_file:
@@ -246,8 +247,8 @@ def test_minimax_recipe_injects_and_exports_expert_adapters():
     peft_values["use_triton"] = False
     peft_config = PeftConfig(**peft_values)
 
-    assert peft_config.target_modules == ["*"]
-    assert peft_config.match_all_linear is False
+    assert peft_config.target_modules == []
+    assert peft_config.match_all_linear is True
 
     config = MiniMaxM2Config(
         vocab_size=32,
@@ -275,14 +276,14 @@ def test_minimax_recipe_injects_and_exports_expert_adapters():
     model = NeMoMiniMaxM2ForCausalLM(config, backend=backend)
     apply_lora_to_linear_modules(model, peft_config)
 
-    assert isinstance(model.model.layers["0"].mlp.experts, GroupedExpertsLoRA)
+    assert not isinstance(model.model.layers["0"].mlp.experts, GroupedExpertsLoRA)
     model_state = ModelState(model, is_peft=True)
     native_adapter_state = model_state.state_dict()
     hf_adapter_state = model.state_dict_adapter.to_hf(native_adapter_state, v4_compatible=False)
     expert_prefix = "base_model.model.model.layers.0.mlp.experts"
-    assert {key for key in hf_adapter_state if key.startswith(expert_prefix)} == {
-        f"{expert_prefix}.base_layer.lora_A.weight",
-        f"{expert_prefix}.base_layer.lora_B.weight",
-        f"{expert_prefix}.lora_A.weight",
-        f"{expert_prefix}.lora_B.weight",
-    }
+    assert any("lora_" in key for key in hf_adapter_state)
+    assert not [key for key in hf_adapter_state if key.startswith(expert_prefix)]
+
+    hf_peft_config = _get_hf_peft_config(peft_config, model_state)
+    assert hf_peft_config["target_modules"]
+    assert "target_parameters" not in hf_peft_config
