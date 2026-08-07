@@ -127,6 +127,9 @@ ci:
     # envelope; 1 matches the recipe's validated per-rank image batch.
     step_scheduler.local_batch_size: 1
     check_source_load_parity: true
+    # Keep source-reference, training, and reload forwards independent; same-process
+    # CI retains accelerator state and inflates source KL (see AMINT-238).
+    process_isolation: true
     check_resume: true
     hf_device_map_auto: true
     tokenizer_name: google/gemma-4-26B-A4B-it
