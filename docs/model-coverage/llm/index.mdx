@@ -8,7 +8,7 @@ Large Language Models (LLMs) power a variety of tasks such as dialogue systems, 
 NeMo AutoModel provides a simple interface for loading and fine-tuning LLMs hosted on the Hugging Face Hub.
 
 ## Run LLMs with NeMo AutoModel
-To run LLMs with NeMo AutoModel, make sure you're using NeMo container version [`26.06.00`](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel?version=26.06.00) or later. If the model you intend to fine-tune requires newer source than the container provides, use a current checkout so the package and its example recipes stay on one revision:
+To run LLMs with NeMo AutoModel, make sure you use NeMo container version [`26.06.00`](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel?version=26.06.00) or later. If the model you intend to fine-tune requires a newer source than the container provides, use a current checkout so the package and its example recipes stay on one revision:
 
 ```bash
 git clone https://github.com/NVIDIA-NeMo/Automodel.git
@@ -16,7 +16,7 @@ cd Automodel
 uv sync --locked --all-groups --all-extras
 ```
 
-For other installation options (e.g., uv), see the [NeMo AutoModel Installation Guide](/get-started/installation).
+For other installation options (such as uv), refer to the [NeMo AutoModel Installation Guide](/get-started/installation).
 
 ## Supported Models
 
@@ -75,6 +75,7 @@ NeMo AutoModel supports the [AutoModelForCausalLM](https://huggingface.co/transf
 | OpenBMB | [MiniCPM](/model-coverage/large-language-models/openbmb/minicpm) | `MiniCPMForCausalLM`, `MiniCPM3ForCausalLM`, `MiniCPM5ForCausalLM` |
 | Moonshot AI | [Kimi K3](/model-coverage/large-language-models/moonshotai/kimi-k3) | `KimiK3ForCausalLM` |
 | Moonshot AI | [Moonlight](/model-coverage/large-language-models/moonshotai/moonlight) | `DeepseekV3ForCausalLM` |
+| Moonshot AI | [Kimi Linear](/model-coverage/large-language-models/moonshotai/kimi-linear) | `KimiLinear48BForCausalLM` |
 | ByteDance Seed | [Seed (ByteDance)](/model-coverage/large-language-models/bytedance-seed/seed-bytedance) | `Qwen2ForCausalLM` |
 | Upstage | [Solar Pro](/model-coverage/large-language-models/upstage/solar-pro) | `SolarForCausalLM` |
 | OrionStar | [Orion](/model-coverage/large-language-models/orionstar/orion) | `OrionForCausalLM` |
@@ -92,12 +93,12 @@ NeMo AutoModel supports the [AutoModelForCausalLM](https://huggingface.co/transf
 
 The models listed above can be fine-tuned using NeMo AutoModel. NeMo AutoModel supports two primary fine-tuning approaches:
 
-1. **Parameter-Efficient Fine-Tuning (PEFT)**: Updates only a small subset of parameters (typically &lt;1%) using techniques like Low-Rank Adaptation (LoRA).
+1. **Parameter-Efficient Fine-Tuning (PEFT)**: Updates only a small subset of parameters (typically less than 1%) using techniques such as Low-Rank Adaptation (LoRA).
 2. **Supervised Fine-Tuning (SFT)**: Updates all or most model parameters for deeper adaptation.
 
 See the [Fine-Tuning Guide](/recipes-e2e-examples/sft-peft) to learn how to apply both methods to your data.
 
 <Tip>
-In these guides, we use the `SQuAD v1.1` dataset for demonstration purposes, but you can use your own data. Update the recipe YAML `dataset` / `validation_dataset` sections accordingly. See [LLM datasets](/datasets/text-dataset) and [dataset overview](/datasets/overview).
+In these guides, the `SQuAD v1.1` dataset is used for demonstration purposes, but you can use custom data. Update the recipe YAML `dataset` and `validation_dataset` sections accordingly. Refer to [LLM Datasets](/datasets/text-dataset) and [Dataset Overview](/datasets/overview).
 
 </Tip>

@@ -133,6 +133,10 @@ ci:
     hf_cosine_threshold: 0.999
     check_hf_reload: true
     check_resume: true
-    # The current robustness check uses an independently initialized BF16
-    # baseline, so allow small distributed-kernel drift in the loss comparison.
+    # Shared-trajectory CI observed later-step loss deltas of 0.0137 and 0.0215.
+    # Keep the exact first resumed step strict, but allow BF16 distributed
+    # contrastive-loss drift to accumulate across the following optimizer steps.
     resume_loss_threshold: 5e-2
+    # Independently calibrated normal-run comparison; non-blocking and
+    # separate from shared-trajectory resume correctness.
+    training_reproducibility_loss_threshold: 5e-2
