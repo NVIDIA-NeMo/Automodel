@@ -121,6 +121,18 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
         """NemotronV3 uses 'mixer.experts' instead of 'mlp.experts'."""
         return "mixer.experts"
 
+    @staticmethod
+    def _native_key_to_hf(key: str) -> str:
+        """Normalize a native Nemotron V3 key to its public HF namespace."""
+        key = _strip_mamba_fp32_holder_key(key)
+        if key.startswith("model."):
+            key = "backbone." + key[len("model.") :]
+        if key == "backbone.norm.weight":
+            key = "backbone.norm_f.weight"
+        if key == "backbone.embed_tokens.weight":
+            key = "backbone.embeddings.weight"
+        return key
+
     def to_hf(self, state_dict: dict[str, Any], exclude_key_regex: Optional[str] = None, **kwargs) -> dict[str, Any]:
         """Convert from internal model state dict to HuggingFace format.
 
@@ -269,23 +281,12 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
             else self._convert_single_merged_expert_to_hf_split_experts(fqn, tensor, **kwargs)
         )
         if expert_result is not None:
-            result = expert_result
+            # The shared expert converter preserves the native input prefix for
+            # LoRA keys. Route every result through Nemotron's adapter-specific
+            # model -> backbone normalization just like ordinary tensors.
+            result = [(self._native_key_to_hf(key), value) for key, value in expert_result]
         else:
-            # Standard conversion: just rename keys
-            new_fqn = _strip_mamba_fp32_holder_key(fqn)
-
-            # Rename model → backbone
-            if new_fqn.startswith("model."):
-                new_fqn = "backbone." + new_fqn[len("model.") :]
-
-            # Rename norm → norm_f
-            if new_fqn == "backbone.norm.weight":
-                new_fqn = "backbone.norm_f.weight"
-
-            # Internal uses 'embed_tokens' but HF uses 'embeddings'
-            if new_fqn == "backbone.embed_tokens.weight":
-                new_fqn = "backbone.embeddings.weight"
-
+            new_fqn = self._native_key_to_hf(fqn)
             result = [(new_fqn, _upcast_mamba_fp32_state_tensor(new_fqn, tensor))]
 
         if exclude_key_regex:

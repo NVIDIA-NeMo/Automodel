@@ -36,6 +36,7 @@ from nemo_automodel.components.checkpoint.utils import (
 )
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.recipes.base_recipe import BaseRecipe, is_distributed_stateful
 
@@ -1890,7 +1891,7 @@ def test_load_checkpoint_path_with_separator_treated_as_full_path(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Tests for _make_progress_bar and _update_progress_bar
+# Progress-bar test helpers
 # ---------------------------------------------------------------------------
 
 
@@ -1905,6 +1906,89 @@ def _make_fake_recipe(max_steps=10, step=0):
     r = _FakeRecipe()
     r.step_scheduler = SimpleNamespace(max_steps=max_steps, step=step)
     return r
+
+
+# ---------------------------------------------------------------------------
+# Tests for MoE auxiliary-loss scaling
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("pp_enabled", "dp_size", "cp_size", "num_batches", "pp_microbatches", "num_label_tokens"),
+    [
+        (False, 1, 1, 1, 1, 0),
+        (False, 2, 1, 4, 1, 0),
+        (False, 1, 2, 3, 1, 0),
+        (True, 2, 1, 2, 2, 96),
+        (True, 1, 2, 3, 1, 96),
+        (True, 2, 1, 3, 1, 0),
+    ],
+)
+def test_moe_aux_gradient_matches_single_process_optimizer_step(
+    monkeypatch,
+    pp_enabled,
+    dp_size,
+    cp_size,
+    num_batches,
+    pp_microbatches,
+    num_label_tokens,
+):
+    """DP/CP/PP accumulation must match one fp32 auxiliary objective."""
+    monkeypatch.setattr(MoEAuxLossAutoScaler, "main_loss_backward_scale", None)
+    dp_cp_size = dp_size * cp_size
+    num_microbatches = num_batches * pp_microbatches
+    recipe = SimpleNamespace(
+        pp_enabled=pp_enabled,
+        pp=SimpleNamespace(
+            pp_batch_size=pp_microbatches,
+            pp_microbatch_size=1,
+            info=SimpleNamespace(schedule=SimpleNamespace(_n_microbatches=pp_microbatches)),
+        ),
+        _get_cp_group_size=lambda: cp_size,
+        _get_dp_group_size=lambda include_cp=False: dp_cp_size,
+    )
+    BaseRecipe._set_moe_aux_loss_backward_scale(
+        recipe,
+        num_batches=num_batches,
+        num_label_tokens=num_label_tokens,
+    )
+
+    initial_value = 1.25
+    coefficients = torch.arange(1, dp_cp_size * num_microbatches + 1, dtype=torch.float32).reshape(
+        dp_cp_size, num_microbatches
+    )
+    local_gradients = []
+    for rank_coefficients in coefficients:
+        local_parameter = nn.Parameter(torch.tensor(initial_value))
+        for coefficient in rank_coefficients:
+            output = local_parameter * 0.0
+            aux_loss = coefficient * local_parameter.square()
+            MoEAuxLossAutoScaler.apply(output, aux_loss).backward()
+        local_gradients.append(local_parameter.grad.detach().clone())
+
+    distributed_gradient = torch.stack(local_gradients).sum() / dp_cp_size
+    if pp_enabled and num_label_tokens > 0:
+        distributed_gradient /= num_label_tokens / dp_cp_size
+
+    reference_parameter = nn.Parameter(torch.tensor(initial_value))
+    reference_loss = coefficients.sum() * reference_parameter.square() / (dp_size * num_microbatches)
+    reference_loss.backward()
+
+    torch.testing.assert_close(distributed_gradient, reference_parameter.grad)
+    torch.testing.assert_close(distributed_gradient.abs(), reference_parameter.grad.norm())
+
+    distributed_parameter = nn.Parameter(torch.tensor(initial_value))
+    distributed_parameter.grad = distributed_gradient.clone()
+    distributed_optimizer = torch.optim.SGD([distributed_parameter], lr=0.05)
+    reference_optimizer = torch.optim.SGD([reference_parameter], lr=0.05)
+    distributed_optimizer.step()
+    reference_optimizer.step()
+    torch.testing.assert_close(distributed_parameter, reference_parameter)
+
+
+# ---------------------------------------------------------------------------
+# Tests for _make_progress_bar and _update_progress_bar
+# ---------------------------------------------------------------------------
 
 
 class TestMakeProgressBar:
