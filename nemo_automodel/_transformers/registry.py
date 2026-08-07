@@ -119,6 +119,10 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ("nemo_automodel.components.models.kimivl.model", "KimiVLForConditionalGeneration"),
         ),
         (
+            "KimiLinear48BForCausalLM",
+            ("nemo_automodel.components.models.kimi_linear.model", "KimiLinear48BForCausalLM"),
+        ),
+        (
             "LlamaBidirectionalForSequenceClassification",
             (
                 "nemo_automodel.components.models.llama_bidirectional.model",
@@ -317,6 +321,7 @@ _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
     "kimi_k25": ("nemo_automodel.components.models.kimi_k25_vl.model", "KimiK25VLConfig"),
     "kimi_k3": ("nemo_automodel.components.models.kimi_k3.config", "KimiK3Config"),
     "kimi_linear": ("nemo_automodel.components.models.kimi_k3.config", "KimiK3TextConfig"),
+    "kimi_linear_48b_a3b": ("nemo_automodel.components.models.kimi_linear.config", "KimiLinear48BConfig"),
     "kimi_vl": ("nemo_automodel.components.models.kimivl.model", "KimiVLConfig"),
     "laguna": ("nemo_automodel.components.models.laguna.config", "LagunaConfig"),
     "llavaonevision1_5": ("nemo_automodel.components.models.llava_onevision.model", "Llavaonevision1_5Config"),
