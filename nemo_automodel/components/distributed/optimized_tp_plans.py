@@ -18,7 +18,7 @@ This module contains optimized tensor parallel plans for different model archite
 including LLaMA, Qwen, Gemma3, and Ministral3 models.
 """
 
-from typing import Callable, Dict, Union, cast
+from typing import TYPE_CHECKING, Callable, Dict, Union, cast
 
 import torch
 from torch.distributed.tensor import DTensor
@@ -45,10 +45,12 @@ from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM, Qwen3ForS
 from nemo_automodel.components.models.baichuan.model import BaichuanForCausalLM
 from nemo_automodel.components.models.gemma4_moe.model import Gemma4ForConditionalGeneration
 from nemo_automodel.components.models.llama.model import LlamaForCausalLM as CustomLlamaForCausalLM
-from nemo_automodel.components.models.mistral3.model import Ministral3ForCausalLM
 from nemo_automodel.components.models.mistral3_vlm.model import Mistral3FP8VLMForConditionalGeneration
 from nemo_automodel.components.models.qwen2.model import Qwen2ForCausalLM as CustomQwen2ForCausalLM
 from nemo_automodel.components.models.qwen3.model import Qwen3ForCausalLM as CustomQwen3ForCausalLM
+
+if TYPE_CHECKING:
+    from nemo_automodel.components.models.mistral3.model import Ministral3ForCausalLM
 
 
 class SequenceParallelAllGatherActivation(SequenceParallel):
@@ -379,7 +381,7 @@ def _parallelize_llama(
 
 
 def _parallelize_ministral3(
-    model: Ministral3ForCausalLM,
+    model: "Ministral3ForCausalLM",
     sequence_parallel: bool = False,
 ) -> dict[str, ParallelStyle]:
     """Parallelizes a Ministral3ForCausalLM model across data and tensor parallel dimensions."""
@@ -741,7 +743,7 @@ PARALLELIZE_FUNCTIONS: Dict[str, Callable[..., Dict[str, ParallelStyle]]] = {
     "transformers.models.falcon_h1.modeling_falcon_h1.FalconH1ForCausalLM": _parallelize_falcon_h1,
     "FalconH1ForCausalLM": _parallelize_falcon_h1,
     _get_class_qualname(LlamaForCausalLM): _parallelize_llama,
-    _get_class_qualname(Ministral3ForCausalLM): _parallelize_ministral3,
+    "nemo_automodel.components.models.mistral3.model.Ministral3ForCausalLM": _parallelize_ministral3,
     # Mistral3 VLM (Pixtral + Ministral3) — native HF class plus the Automodel
     # FP8-VLM subclass that owns FP8 dequant.
     _get_class_qualname(Mistral3ForConditionalGeneration): _parallelize_mistral3_vlm,
