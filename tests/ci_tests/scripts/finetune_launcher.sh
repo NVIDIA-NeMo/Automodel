@@ -66,7 +66,17 @@ if [ "$EXEC_CMD" = "python" ]; then CMD="python"; fi
 if [ "$EXEC_CMD" = "uv_python" ]; then CMD="uv run python"; fi
 
 # --- Finetune ---
-RUN_CMD="${CMD} ${TEST_SCRIPT_PATH} --config ${RESOLVED_FINETUNE_CONFIG} ${FINETUNE_ARGS:-}"
+FINETUNE_ENTRYPOINT="${TEST_SCRIPT_PATH}"
+if [[ "$HAS_ROBUSTNESS" == "true" ]]; then
+  export AUTOMODEL_REPRODUCIBILITY_DIR="$TEST_DIR/training_reproducibility"
+  case "$CONFIG_PATH" in
+    *retrieval/bi_encoder/*) export AUTOMODEL_REPRODUCIBILITY_DOMAIN="retrieval" ;;
+    *vlm_finetune*) export AUTOMODEL_REPRODUCIBILITY_DOMAIN="vlm" ;;
+    *) export AUTOMODEL_REPRODUCIBILITY_DOMAIN="llm" ;;
+  esac
+  FINETUNE_ENTRYPOINT="-m tests.ci_tests.scripts.recorded_finetune"
+fi
+RUN_CMD="${CMD} ${FINETUNE_ENTRYPOINT} --config ${RESOLVED_FINETUNE_CONFIG} ${FINETUNE_ARGS:-}"
 echo "============================================"
 echo "[finetune] Running finetune..."
 echo "============================================"
@@ -137,7 +147,7 @@ if [[ "$HAS_ROBUSTNESS" == "true" ]]; then
     # recipes also retain enough CUDA, PP, scheduler, and dataloader ownership
     # that rebuilding several trainers in one interpreter is not reliable.
     read -r -a ROBUSTNESS_PHASES <<< \
-      "${CHECKPOINT_ROBUSTNESS_PHASES:-train_and_save automodel_reload resume_baseline resume}"
+      "${CHECKPOINT_ROBUSTNESS_PHASES:-train_and_save automodel_reload resume}"
     # Preserve the old harness's deferred-comparison behavior: record a failed
     # parity phase, continue independent phases, and return the first failure
     # only after every reachable phase has reported a result.
@@ -145,7 +155,6 @@ if [[ "$HAS_ROBUSTNESS" == "true" ]]; then
     ROBUSTNESS_FAILED_PHASES=""
     SOURCE_LOAD_REFERENCE_FAILED=false
     TRAIN_AND_SAVE_FAILED=false
-    RESUME_BASELINE_FAILED=false
     for ROBUSTNESS_PHASE in "${ROBUSTNESS_PHASES[@]}"; do
       if [[ "$ROBUSTNESS_PHASE" == "source_load_parity" && "$SOURCE_LOAD_REFERENCE_FAILED" == "true" ]]; then
         ROBUSTNESS_PHASE_RESULTS+=("${ROBUSTNESS_PHASE}|SKIP|-|0|source_load_reference_failed")
@@ -155,11 +164,6 @@ if [[ "$HAS_ROBUSTNESS" == "true" ]]; then
         ROBUSTNESS_PHASE_RESULTS+=("${ROBUSTNESS_PHASE}|SKIP|-|0|train_and_save_failed")
         continue
       fi
-      if [[ "$ROBUSTNESS_PHASE" == "resume" && "$RESUME_BASELINE_FAILED" == "true" ]]; then
-        ROBUSTNESS_PHASE_RESULTS+=("${ROBUSTNESS_PHASE}|SKIP|-|0|resume_baseline_failed")
-        continue
-      fi
-
       PHASE_LAUNCH_CMD="$ROBUSTNESS_LAUNCH_CMD"
       if [[ "$PHASE_LAUNCH_CMD" == torchrun* ]]; then
         PHASE_LAUNCH_CMD="${PHASE_LAUNCH_CMD/--rdzv_id=${SLURM_JOB_ID}-robustness/--rdzv_id=${SLURM_JOB_ID}-robustness-${ROBUSTNESS_PHASE}}"
@@ -196,8 +200,6 @@ if [[ "$HAS_ROBUSTNESS" == "true" ]]; then
         SOURCE_LOAD_REFERENCE_FAILED=true
       elif [[ "$ROBUSTNESS_PHASE" == "train_and_save" ]]; then
         TRAIN_AND_SAVE_FAILED=true
-      elif [[ "$ROBUSTNESS_PHASE" == "resume_baseline" ]]; then
-        RESUME_BASELINE_FAILED=true
       fi
       if [[ "${SLURM_PROCID:-0}" == "0" ]]; then
         echo "[checkpoint_robustness][phase-failure] phase=${ROBUSTNESS_PHASE} exit_code=${ROBUSTNESS_PHASE_EXIT_CODE}"
