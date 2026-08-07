@@ -12,16 +12,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
+import yaml
 from torch import nn
 
+from nemo_automodel.components._peft.lora import PeftConfig, apply_lora_to_linear_modules
+from nemo_automodel.components._peft.lora_experts import GroupedExpertsLoRA
+from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState
 from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.minimax_m2.model import MiniMaxM2ForCausalLM as NeMoMiniMaxM2ForCausalLM
 from nemo_automodel.components.models.minimax_m2.state_dict_adapter import MiniMaxM2StateDictAdapter
 from nemo_automodel.components.models.nemotron_v3.state_dict_adapter import NemotronV3StateDictAdapter
 from nemo_automodel.components.moe.config import MoEConfig
+
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+_MINIMAX_RECIPE = _REPO_ROOT / "examples/llm_finetune/minimax_m2/minimax_m2.7_hellaswag_lora.yaml"
 
 
 def _make_transformers_model(family: str, num_experts: int, dim: int, inter_dim: int) -> nn.Module:
@@ -225,3 +234,55 @@ def test_peft_v5_load_merge_and_adapter_round_trip(family, tmp_path):
     assert set(restored_state_dict) == set(native_state_dict)
     for key, expected in native_state_dict.items():
         torch.testing.assert_close(restored_state_dict[key], expected)
+
+
+def test_minimax_recipe_injects_and_exports_expert_adapters():
+    """The shipped MiniMax recipe must save every expert adapter advertised to PEFT v5."""
+    from transformers.models.minimax_m2.configuration_minimax_m2 import MiniMaxM2Config
+
+    with _MINIMAX_RECIPE.open(encoding="utf-8") as recipe_file:
+        recipe_peft = yaml.safe_load(recipe_file)["peft"]
+    peft_values = {key: value for key, value in recipe_peft.items() if key != "_target_"}
+    peft_values["use_triton"] = False
+    peft_config = PeftConfig(**peft_values)
+
+    assert peft_config.target_modules == ["*"]
+    assert peft_config.match_all_linear is False
+
+    config = MiniMaxM2Config(
+        vocab_size=32,
+        num_local_experts=2,
+        hidden_size=16,
+        intermediate_size=8,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=8,
+        max_position_embeddings=32,
+        num_experts_per_tok=1,
+        hidden_act="silu",
+        use_cache=False,
+        torch_dtype="float32",
+    )
+    backend = BackendConfig(
+        linear="torch",
+        attn="sdpa",
+        rms_norm="torch",
+        dispatcher="torch",
+        rope_fusion=False,
+        enable_hf_state_dict_adapter=True,
+    )
+    model = NeMoMiniMaxM2ForCausalLM(config, backend=backend)
+    apply_lora_to_linear_modules(model, peft_config)
+
+    assert isinstance(model.model.layers["0"].mlp.experts, GroupedExpertsLoRA)
+    model_state = ModelState(model, is_peft=True)
+    native_adapter_state = model_state.state_dict()
+    hf_adapter_state = model.state_dict_adapter.to_hf(native_adapter_state, v4_compatible=False)
+    expert_prefix = "base_model.model.model.layers.0.mlp.experts"
+    assert {key for key in hf_adapter_state if key.startswith(expert_prefix)} == {
+        f"{expert_prefix}.base_layer.lora_A.weight",
+        f"{expert_prefix}.base_layer.lora_B.weight",
+        f"{expert_prefix}.lora_A.weight",
+        f"{expert_prefix}.lora_B.weight",
+    }
