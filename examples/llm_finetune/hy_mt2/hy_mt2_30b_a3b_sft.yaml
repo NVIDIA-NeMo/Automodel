@@ -150,3 +150,6 @@ optimizer:
 # wandb:
 #   project: hy_mt2-30b-a3b-sft
 #   name: hy_mt2_30b_a3b_sft
+
+ci:
+  time: "00:30:00"

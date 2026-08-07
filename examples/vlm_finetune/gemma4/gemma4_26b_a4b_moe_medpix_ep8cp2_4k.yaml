@@ -100,3 +100,6 @@ freeze_config:
   freeze_vision_tower: true
   freeze_audio_tower: true
   freeze_language_model: false
+
+ci:
+  time: "00:30:00"
