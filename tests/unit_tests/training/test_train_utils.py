@@ -102,7 +102,9 @@ def test_clip_grad_norm_with_pp_and_tp():
 
     device_mesh = Mock()
     device_mesh.mesh_dim_names = ["pp", "tp"]
-    device_mesh.__getitem__ = Mock(side_effect=lambda key: Mock(size=Mock(return_value=2)))
+    # device_type must be a real string: a DeviceMesh always exposes one, and the norm
+    # reduction compares it against the accumulator's device to pick the comm device.
+    device_mesh.__getitem__ = Mock(side_effect=lambda key: Mock(size=Mock(return_value=2), device_type="cpu"))
 
     grad_norm = clip_grad_norm(
         max_grad_norm=1.0,
