@@ -15,6 +15,7 @@
 """Functional tests for retrieval backbone extraction."""
 
 import json
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -161,6 +162,42 @@ def test_extract_submodel_embedding_fallback_is_bidirectional(tmp_path):
     saved_config = json.loads((save_dir / "config.json").read_text())
     assert saved_config["model_type"] == "mistral"
     assert saved_config["is_causal"] is False
+
+
+def test_extract_submodel_dequantizes_native_fp8_for_training(monkeypatch):
+    """FP8 parent checkpoints are materialized without scalar scale parameters."""
+    from nemo_automodel._transformers import retrieval
+
+    config = SimpleNamespace(
+        model_type="mistral3",
+        quantization_config={"quant_method": "fp8", "dequantize": False},
+    )
+    language_model = MagicMock()
+    language_model.config = SimpleNamespace(model_type="unregistered")
+    parent_model = SimpleNamespace(language_model=language_model)
+    auto_config_from_pretrained = MagicMock(return_value=config)
+    auto_model_from_pretrained = MagicMock(return_value=parent_model)
+    monkeypatch.setattr(retrieval.AutoConfig, "from_pretrained", auto_config_from_pretrained)
+    monkeypatch.setattr(retrieval.AutoModel, "from_pretrained", auto_model_from_pretrained)
+
+    backbone = retrieval.build_encoder_backbone(
+        model_name_or_path="org/fp8-vlm",
+        task="embedding",
+        extract_submodel="language_model",
+        trust_remote_code=True,
+        torch_dtype=torch.bfloat16,
+    )
+
+    assert backbone is language_model
+    assert config.quantization_config["dequantize"] is False
+    auto_model_from_pretrained.assert_called_once()
+    (model_name_or_path,) = auto_model_from_pretrained.call_args.args
+    model_load_kwargs = auto_model_from_pretrained.call_args.kwargs
+    assert model_name_or_path == "org/fp8-vlm"
+    assert model_load_kwargs["trust_remote_code"] is True
+    assert model_load_kwargs["torch_dtype"] is torch.bfloat16
+    assert isinstance(model_load_kwargs["quantization_config"], retrieval.FineGrainedFP8Config)
+    assert model_load_kwargs["quantization_config"].dequantize is True
 
 
 def test_extract_submodel_llama_embedding_from_local_vlm_converts_to_supported_backbone(tmp_path):
