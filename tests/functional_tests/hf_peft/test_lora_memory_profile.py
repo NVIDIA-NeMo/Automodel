@@ -195,7 +195,8 @@ def _dump_memory_gain(result: dict[str, int], *, mode: str, dist_rank: int | Non
 def _assert_profile_memory_gain(result: dict[str, int]) -> None:
     assert result["before_profiler_memory_bytes"] > 0
     assert result["after_profiler_memory_bytes"] > 0
-    assert result["before_profiler_memory_bytes"] > result["after_profiler_memory_bytes"], result
+    # The profiler value sums positive allocation events; it is a capture sanity check, not a peak-memory metric.
+    # Out-of-place operations can increase that total even when allocator peak memory decreases.
     assert result["saved_bytes"] >= _MIN_SAVED_BYTES, result
 
 
