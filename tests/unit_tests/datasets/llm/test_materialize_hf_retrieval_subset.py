@@ -1,0 +1,204 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import json
+import sys
+
+import pytest
+
+from examples.retrieval.data_utils import materialize_hf_retrieval_subset
+
+
+class _FakeCorpusInfo:
+    metadata = {"corpus_id": "demo", "query_instruction": "query:"}
+    corpus_id = "demo"
+
+    def get_all_ids(self):
+        return ["d0"]
+
+    def get_document_by_id(self, doc_id):
+        return {"text": f"document {doc_id}"}
+
+
+def test_materialize_hf_retrieval_subset_writes_local_corpus_json(tmp_path, monkeypatch):
+    data_list = [
+        {
+            "question_id": "q0",
+            "original_question_id": "q0",
+            "question": "What is the document?",
+            "corpus_id": "demo",
+            "pos_doc": [{"id": "d0"}],
+            "neg_doc": [{"id": "d1"}],
+        }
+    ]
+    monkeypatch.setattr(
+        materialize_hf_retrieval_subset,
+        "_load_hf_subset",
+        lambda repo_id, subset: (data_list, _FakeCorpusInfo()),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "materialize_hf_retrieval_subset.py",
+            "nvidia/embed-nemotron-dataset-v1",
+            "FEVER",
+            str(tmp_path),
+        ],
+    )
+
+    assert materialize_hf_retrieval_subset.main() == 0
+
+    train_json = json.loads((tmp_path / "train.json").read_text())
+    metadata = json.loads((tmp_path / "FEVER_corpus" / "merlin_metadata.json").read_text())
+
+    assert train_json["corpus"] == [{"path": "./FEVER_corpus"}]
+    assert train_json["data"] == data_list
+    assert metadata["class"] == "TextQADataset"
+    assert metadata["corpus_id"] == "demo"
+    assert (tmp_path / "FEVER_corpus" / "train.parquet").exists()
+
+
+def test_materialize_hf_retrieval_subset_rejects_non_empty_output_dir(tmp_path, monkeypatch):
+    (tmp_path / "existing.txt").write_text("keep me")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "materialize_hf_retrieval_subset.py",
+            "nvidia/embed-nemotron-dataset-v1",
+            "FEVER",
+            str(tmp_path),
+        ],
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        materialize_hf_retrieval_subset.main()
+
+    assert exc_info.value.code == 2
+
+
+def test_materialize_hf_retrieval_subset_overwrites_when_requested(tmp_path, monkeypatch):
+    (tmp_path / "existing.txt").write_text("replace allowed")
+    stale_corpus = tmp_path / "FEVER_corpus"
+    stale_corpus.mkdir()
+    (stale_corpus / "train-00000-of-00001.parquet").write_text("stale")
+    data_list = [
+        {
+            "question_id": "q0",
+            "question": "What is the document?",
+            "corpus_id": "demo",
+            "pos_doc": [{"id": "d0"}],
+            "neg_doc": [],
+        }
+    ]
+    monkeypatch.setattr(
+        materialize_hf_retrieval_subset,
+        "_load_hf_subset",
+        lambda repo_id, subset: (data_list, _FakeCorpusInfo()),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "materialize_hf_retrieval_subset.py",
+            "nvidia/embed-nemotron-dataset-v1",
+            "FEVER",
+            str(tmp_path),
+            "--overwrite",
+        ],
+    )
+
+    assert materialize_hf_retrieval_subset.main() == 0
+    assert (tmp_path / "train.json").exists()
+    assert not (tmp_path / "FEVER_corpus" / "train-00000-of-00001.parquet").exists()
+    assert (tmp_path / "FEVER_corpus" / "train.parquet").exists()
+
+
+def test_materialize_hf_retrieval_subset_overwrite_keeps_existing_output_when_load_fails(tmp_path, monkeypatch):
+    existing_train_json = tmp_path / "train.json"
+    existing_train_json.write_text('{"corpus": [{"path": "./FEVER_corpus"}], "data": []}')
+    stale_corpus = tmp_path / "FEVER_corpus"
+    stale_corpus.mkdir()
+    (stale_corpus / "train.parquet").write_text("still valid")
+
+    def raise_load_error(repo_id, subset):
+        raise RuntimeError("temporary load failure")
+
+    monkeypatch.setattr(materialize_hf_retrieval_subset, "_load_hf_subset", raise_load_error)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "materialize_hf_retrieval_subset.py",
+            "nvidia/embed-nemotron-dataset-v1",
+            "FEVER",
+            str(tmp_path),
+            "--overwrite",
+        ],
+    )
+
+    with pytest.raises(RuntimeError, match="temporary load failure"):
+        materialize_hf_retrieval_subset.main()
+
+    assert existing_train_json.read_text() == '{"corpus": [{"path": "./FEVER_corpus"}], "data": []}'
+    assert (stale_corpus / "train.parquet").read_text() == "still valid"
+
+
+def test_materialize_hf_retrieval_subset_overwrite_restores_existing_corpus_on_interruption(tmp_path, monkeypatch):
+    existing_train_json = tmp_path / "train.json"
+    existing_train_json.write_text('{"corpus": [{"path": "./FEVER_corpus"}], "data": []}')
+    stale_corpus = tmp_path / "FEVER_corpus"
+    stale_corpus.mkdir()
+    (stale_corpus / "train.parquet").write_text("still valid")
+    data_list = [
+        {
+            "question_id": "q0",
+            "question": "What is the document?",
+            "corpus_id": "demo",
+            "pos_doc": [{"id": "d0"}],
+            "neg_doc": [],
+        }
+    ]
+    monkeypatch.setattr(
+        materialize_hf_retrieval_subset,
+        "_load_hf_subset",
+        lambda repo_id, subset: (data_list, _FakeCorpusInfo()),
+    )
+    original_replace = materialize_hf_retrieval_subset.Path.replace
+
+    def interrupt_train_replace(self, target):
+        if self.name.startswith(".train."):
+            raise KeyboardInterrupt("stop during commit")
+        return original_replace(self, target)
+
+    monkeypatch.setattr(materialize_hf_retrieval_subset.Path, "replace", interrupt_train_replace)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "materialize_hf_retrieval_subset.py",
+            "nvidia/embed-nemotron-dataset-v1",
+            "FEVER",
+            str(tmp_path),
+            "--overwrite",
+        ],
+    )
+
+    with pytest.raises(KeyboardInterrupt, match="stop during commit"):
+        materialize_hf_retrieval_subset.main()
+
+    assert existing_train_json.read_text() == '{"corpus": [{"path": "./FEVER_corpus"}], "data": []}'
+    assert (stale_corpus / "train.parquet").read_text() == "still valid"
+    assert not list(tmp_path.glob(".FEVER_corpus.backup.*"))
