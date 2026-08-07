@@ -303,7 +303,7 @@ navigation:
           - page: "Llama (Bidirectional)"
             path: ../../model-coverage/embedding/nvidia/llama-bidirectional.mdx
             slug: llama-bidirectional
-          - page: "Ministral3 (Bidirectional)"
+          - page: "Ministral3"
             path: ../../model-coverage/embedding/mistralai/ministral3-bidirectional.mdx
             slug: ministral3-bidirectional
       - section: "Reranking Models"
