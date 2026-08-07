@@ -11,10 +11,3 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-examples_dir: retrieval
-
-configs:
-  - bi_encoder/llama3_2_1b.yaml
-  - bi_encoder/ministral3_3b_instruct.yaml
-  - bi_encoder/nemotron_vl_1b/nemotron_vl_1b_example.yaml

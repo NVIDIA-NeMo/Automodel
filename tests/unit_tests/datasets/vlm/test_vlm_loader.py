@@ -15,8 +15,10 @@
 from dataclasses import dataclass
 
 import pytest
+from transformers import ProcessorMixin
 
 from nemo_automodel.components.config.loader import ConfigNode
+from nemo_automodel.components.datasets.llm.chat_dataset import ChatDatasetConfig
 from nemo_automodel.components.datasets.vlm.collate_fns import (
     neat_packed_vlm_collater,
     packed_sequence_thd_vlm_collater,
@@ -286,3 +288,89 @@ def test_vlm_dataloader_skips_dense_neat_packing_mask_under_cp(monkeypatch):
     assert result.dataloader.collate_fn.func is neat_packed_vlm_collater
     assert result.dataloader.collate_fn.keywords["attn_implementation"] == "sdpa"
     assert result.dataloader.collate_fn.keywords["materialize_4d_mask"] is False
+
+
+class _NoEosProcessor(ProcessorMixin):
+    """Processor stub whose tokenizer lives at ``.tokenizer`` and that does not proxy
+    tokenizer attributes (no ``eos_token_id``), matching a real LlavaProcessor."""
+
+    attributes = []
+
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
+
+
+@dataclass
+class _RecordingTokenizerDatasetConfig:
+    """TokenizerDatasetConfig stub (a text dataset) that records the arg it is built with."""
+
+    accepts_tokenizer: bool = True
+    received_tokenizer: object = None
+
+    def build(self, *, tokenizer):
+        self.received_tokenizer = tokenizer
+        return ["sample"]
+
+
+def test_build_source_forwards_processor_tokenizer_to_text_dataset():
+    # A genuine processor does not expose tokenizer attributes (e.g. eos_token_id);
+    # text datasets must receive processor.tokenizer, not the processor itself.
+    inner_tokenizer = object()
+    processor = _NoEosProcessor(inner_tokenizer)
+    ds_cfg = _RecordingTokenizerDatasetConfig()
+    config = VlmDataloaderConfig(
+        dataset_config=ds_cfg,
+        processor_config=VlmProcessorConfig(factory=lambda: processor),
+    )
+
+    dataset, returned_processor = config._build_source(
+        pretrained_model_name_or_path="unused", dp_rank=0, dp_world_size=1, dataset_build_context=None
+    )
+
+    assert ds_cfg.received_tokenizer is inner_tokenizer  # tokenizer, not the processor
+    assert returned_processor is processor  # processor still returned for pretokenization/collation
+    assert dataset == ["sample"]
+
+
+def test_vlm_dataloader_drops_dataset_tokenizer_block():
+    # A `dataset.tokenizer` block is valid on the LLM path (the tokenizer is a runtime
+    # build arg, popped before building the dataset config). The VLM path must drop it
+    # too; otherwise it reaches ChatDatasetConfig, which rejects unknown fields.
+    config = RecipeConfig(
+        ConfigNode(
+            {
+                "dataset": {
+                    "_target_": "nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset",
+                    "path_or_dataset_id": "unused.jsonl",
+                    "seq_length": 512,
+                    "tokenizer": {
+                        "_target_": "transformers.AutoTokenizer.from_pretrained",
+                        "pretrained_model_name_or_path": "unused-model",
+                    },
+                },
+                "dataloader": {
+                    "_target_": "torchdata.stateful_dataloader.StatefulDataLoader",
+                    "num_workers": 0,
+                },
+            }
+        )
+    ).vlm_dataloader
+
+    assert isinstance(config.dataset_config, ChatDatasetConfig)
+    assert config.dataset_config.path_or_dataset_id == "unused.jsonl"
+    assert config.dataset_config.seq_length == 512
+
+
+def test_build_source_forwards_bare_tokenizer_unchanged():
+    # When the processor slot holds a bare tokenizer (not a ProcessorMixin), it is
+    # forwarded unchanged so tokenizer-only recipes keep working.
+    bare_tokenizer = object()
+    ds_cfg = _RecordingTokenizerDatasetConfig()
+    config = VlmDataloaderConfig(
+        dataset_config=ds_cfg,
+        processor_config=VlmProcessorConfig(factory=lambda: bare_tokenizer),
+    )
+
+    config._build_source(pretrained_model_name_or_path="unused", dp_rank=0, dp_world_size=1, dataset_build_context=None)
+
+    assert ds_cfg.received_tokenizer is bare_tokenizer

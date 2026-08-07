@@ -789,6 +789,208 @@ class TestLoRAKeysNotQuantized:
         assert f"{base}.weight_packed" in result
 
 
+class _TinyKimiExpert(torch.nn.Module):
+    """Minimal HF-style Kimi expert with separately addressable projections."""
+
+    def __init__(self, dim: int, inter_dim: int) -> None:
+        super().__init__()
+        self.gate_proj = torch.nn.Linear(dim, inter_dim, bias=False)
+        self.up_proj = torch.nn.Linear(dim, inter_dim, bias=False)
+        self.down_proj = torch.nn.Linear(inter_dim, dim, bias=False)
+
+
+class _TinyKimiPeftModel(torch.nn.Module):
+    """Minimal module tree matching Kimi K2.5's saved expert paths."""
+
+    def __init__(self, dim: int, inter_dim: int, n_experts: int, layer_index: int) -> None:
+        super().__init__()
+        self.model = torch.nn.Module()
+        self.model.language_model = torch.nn.Module()
+        self.model.language_model.model = torch.nn.Module()
+        self.model.language_model.model.layers = torch.nn.ModuleList(
+            [torch.nn.Module() for _ in range(layer_index + 1)]
+        )
+
+        layer = self.model.language_model.model.layers[layer_index]
+        layer.mlp = torch.nn.Module()
+        layer.mlp.experts = torch.nn.ModuleList([_TinyKimiExpert(dim, inter_dim) for _ in range(n_experts)])
+
+    def prepare_inputs_for_generation(self, *args, **kwargs):
+        """Provide the compatibility hook required by PEFT's causal-LM wrapper."""
+        raise NotImplementedError("stub for PEFT compatibility")
+
+
+class TestPeftExpertLoraPrefixRoundTrip:
+    """PEFT saves must keep expert LoRA keys under the ``base_model.model.`` prefix.
+
+    ``ModelState.state_dict()`` emits grouped expert LoRA params with the PEFT outer
+    prefix already applied. The expert to_hf conversion preserves that prefix, so
+    re-wrapping the results with ``language_model.`` corrupts the keys (nothing
+    matches them on resume) — while full-fine-tune expert weights, whose keys the
+    mixin resets to the bare ``model.`` prefix, still need the wrap.
+    """
+
+    @pytest.fixture
+    def moe_config(self):
+        return create_mock_moe_config()
+
+    @pytest.fixture
+    def adapter(self, moe_config):
+        backend = BackendConfig(linear="torch", rms_norm="torch", attn="sdpa")
+        return KimiK25VLStateDictAdapter(KimiK25VLConfig(), moe_config, backend, dtype=torch.bfloat16)
+
+    def _peft_state_dict(self, moe_config, rank=8):
+        # shapes match GroupedExpertsLoRA (lora_experts.py): A is
+        # [experts, in_features, rank], B is [experts, rank, out_features]
+        n_e = moe_config.n_routed_experts
+        dim, inter = moe_config.dim, moe_config.moe_inter_dim
+        base = "base_model.model.model.language_model.model.layers.5.mlp.experts"
+        attn = "base_model.model.model.language_model.model.layers.5.self_attn.q_proj"
+        return {
+            f"{base}.lora_gate_and_up_A": torch.randn(n_e, dim, rank, dtype=torch.bfloat16),
+            f"{base}.lora_gate_and_up_B": torch.randn(n_e, rank, 2 * inter, dtype=torch.bfloat16),
+            f"{base}.lora_down_A": torch.randn(n_e, inter, rank, dtype=torch.bfloat16),
+            f"{base}.lora_down_B": torch.randn(n_e, rank, dim, dtype=torch.bfloat16),
+            f"{attn}.lora_A.weight": torch.randn(rank, dim, dtype=torch.bfloat16),
+        }
+
+    def test_peft_save_keeps_base_model_prefix(self, adapter, moe_config):
+        """All saved keys stay under base_model.model., like the attention LoRA keys."""
+        sd = self._peft_state_dict(moe_config)
+        out = adapter.to_hf(dict(sd), exclude_key_regex=r".*_extra_state.*", quantization=False)
+
+        assert len(out) > 0
+        bad = [k for k in out if not k.startswith("base_model.model.")]
+        assert bad == [], f"malformed adapter keys: {bad[:4]}"
+        # the expert conversion actually ran (grouped params were split per expert)
+        assert any(".mlp.experts.0.gate_proj.lora_A.weight" in k for k in out)
+
+    def test_peft_save_round_trips_for_resume(self, adapter, moe_config):
+        """from_hf rebuilds the exact grouped keys ModelState expects on resume."""
+        sd = self._peft_state_dict(moe_config)
+        out = adapter.to_hf({k: v.clone() for k, v in sd.items()}, quantization=False)
+        back = adapter.from_hf(dict(out))
+
+        assert set(back) == set(sd)
+        for key in sd:
+            torch.testing.assert_close(back[key], sd[key])
+
+    def test_peft_v5_load_and_merge_applies_all_expert_adapters(self, tmp_path):
+        """PEFT on Transformers v5 loads and numerically applies every expert adapter."""
+        from peft import LoraConfig, PeftModel, TaskType
+        from safetensors.torch import save_file
+
+        torch.manual_seed(42)
+        layer_index = 1
+        rank = 4
+        alpha = 8
+        moe_config = MoEConfig(
+            n_routed_experts=2,
+            n_shared_experts=1,
+            n_activated_experts=1,
+            n_expert_groups=1,
+            n_limited_groups=1,
+            train_gate=False,
+            gate_bias_update_factor=0.0,
+            aux_loss_coeff=0.0,
+            score_func="softmax",
+            route_scale=1.0,
+            dim=16,
+            inter_dim=32,
+            moe_inter_dim=8,
+            norm_topk_prob=True,
+        )
+        backend = BackendConfig(linear="torch", rms_norm="torch", attn="sdpa")
+        adapter = KimiK25VLStateDictAdapter(KimiK25VLConfig(), moe_config, backend, dtype=torch.float32)
+
+        base = f"base_model.model.model.language_model.model.layers.{layer_index}.mlp.experts"
+        native_state_dict = {
+            f"{base}.lora_gate_and_up_A": torch.randn(moe_config.n_routed_experts, moe_config.dim, rank),
+            f"{base}.lora_gate_and_up_B": torch.randn(moe_config.n_routed_experts, rank, 2 * moe_config.moe_inter_dim),
+            f"{base}.lora_down_A": torch.randn(moe_config.n_routed_experts, moe_config.moe_inter_dim, rank),
+            f"{base}.lora_down_B": torch.randn(moe_config.n_routed_experts, rank, moe_config.dim),
+        }
+        hf_state_dict = adapter.to_hf(dict(native_state_dict), quantization=False)
+
+        target_modules = [
+            f"model.language_model.model.layers.{layer_index}.mlp.experts.{expert_id}.{projection}"
+            for expert_id in range(moe_config.n_routed_experts)
+            for projection in ("gate_proj", "up_proj", "down_proj")
+        ]
+        LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            r=rank,
+            lora_alpha=alpha,
+            lora_dropout=0.0,
+            target_modules=target_modules,
+            bias="none",
+        ).save_pretrained(tmp_path)
+        save_file(hf_state_dict, str(tmp_path / "adapter_model.safetensors"))
+
+        hf_model = _TinyKimiPeftModel(
+            moe_config.dim,
+            moe_config.moe_inter_dim,
+            moe_config.n_routed_experts,
+            layer_index,
+        )
+        base_weights = {
+            name: parameter.detach().clone() for name, parameter in hf_model.named_parameters() if ".experts." in name
+        }
+
+        peft_model = PeftModel.from_pretrained(hf_model, str(tmp_path))
+        loaded_parameters = dict(peft_model.named_parameters())
+        for key, expected in hf_state_dict.items():
+            loaded_key = key.replace(".lora_A.weight", ".lora_A.default.weight").replace(
+                ".lora_B.weight", ".lora_B.default.weight"
+            )
+            assert loaded_key in loaded_parameters, f"PEFT silently dropped {key}"
+            torch.testing.assert_close(loaded_parameters[loaded_key], expected)
+
+        merged = peft_model.merge_and_unload()
+        merged_parameters = dict(merged.named_parameters())
+        scale = alpha / rank
+        for name, base_weight in base_weights.items():
+            adapter_prefix = f"base_model.model.{name.removesuffix('.weight')}"
+            lora_a = hf_state_dict[f"{adapter_prefix}.lora_A.weight"]
+            lora_b = hf_state_dict[f"{adapter_prefix}.lora_B.weight"]
+            expected = base_weight + (lora_b @ lora_a) * scale
+            torch.testing.assert_close(merged_parameters[name], expected)
+
+        assert len(base_weights) == moe_config.n_routed_experts * 3
+        assert not any("lora_" in name for name in merged_parameters)
+
+    def test_fft_expert_weights_still_get_language_model_prefix(self):
+        """Full-fine-tune expert weights keep the language_model. wrap (regression guard)."""
+        # tiny dims: the real-sized mock config would allocate GBs for full expert weights
+        moe = MoEConfig(
+            n_routed_experts=4,
+            n_shared_experts=1,
+            n_activated_experts=2,
+            n_expert_groups=1,
+            n_limited_groups=1,
+            train_gate=False,
+            gate_bias_update_factor=0.0,
+            aux_loss_coeff=0.0,
+            score_func="softmax",
+            route_scale=1.0,
+            dim=64,
+            inter_dim=128,
+            moe_inter_dim=16,
+            norm_topk_prob=True,
+        )
+        backend = BackendConfig(linear="torch", rms_norm="torch", attn="sdpa")
+        adapter = KimiK25VLStateDictAdapter(KimiK25VLConfig(), moe, backend, dtype=torch.bfloat16)
+        sd = {
+            "model.language_model.model.layers.5.mlp.experts.gate_and_up_projs": torch.randn(
+                4, 64, 32, dtype=torch.bfloat16
+            ),
+        }
+        out = adapter.to_hf(dict(sd), quantization=False)
+
+        assert len(out) > 0
+        assert all(k.startswith("language_model.model.") for k in out)
+
+
 # =============================================================================
 # Expand Quantized Keys Extended Tests
 # =============================================================================
