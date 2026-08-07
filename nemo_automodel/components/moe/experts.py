@@ -1154,6 +1154,16 @@ class GroupedExpertsTE(nn.Module):
             dispatcher_share_token_dispatcher: Whether to share a flex dispatcher communication manager across layers.
             dispatcher_async_dispatch: Whether DeepEP/UCCL-EP dispatch should run asynchronously.
         """
+        if config.apply_router_weight_after_down:
+            # GroupedExperts and GroupedExpertsDeepEP fold the router weight in after the
+            # down projection; this backend applies it inside the activation instead, which
+            # silently changes the numerics the flag exists to preserve. Fail loudly rather
+            # than train a model on the wrong reduction order.
+            raise ValueError(
+                "apply_router_weight_after_down is not supported by GroupedExpertsTE. "
+                "Use BackendConfig(experts='torch_mm') or the DeepEP expert backend."
+            )
+
         from transformer_engine.pytorch import GroupedLinear
 
         from nemo_automodel.components.models.common.utils import _patch_te_modules
