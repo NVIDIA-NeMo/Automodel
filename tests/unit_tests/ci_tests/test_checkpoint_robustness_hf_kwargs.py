@@ -33,6 +33,7 @@ from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm
     _hf_device_map_max_memory,
     _hf_fp32_module_names,
     _hf_model_load_context,
+    _hf_reload_kl_error,
     _hf_source_load_kwargs,
     _keep_hf_modules_in_fp32,
     _lm_head_embedding_aliased,
@@ -118,6 +119,25 @@ def test_peft_adapter_fingerprints_match_saved_safetensors(tmp_path):
         matched, ignored = _assert_peft_adapter_matches_checkpoint(Mock(), adapter_path)
 
     assert matched == 2
+    assert ignored == 0
+
+
+def test_peft_adapter_fingerprints_ignore_reported_base_layer_tensor(tmp_path):
+    from safetensors.torch import save_file
+
+    adapter_path = tmp_path / "adapter_model.safetensors"
+    adapter_key = "base_model.model.lm_head.lora_A.weight"
+    saved_state = {adapter_key: torch.tensor([[1.0, 2.0]], dtype=torch.bfloat16)}
+    loaded_state = {
+        adapter_key: saved_state[adapter_key].clone(),
+        "base_model.model.lm_head.base_layer.weight": torch.tensor([[3.0, 4.0]], dtype=torch.bfloat16),
+    }
+    save_file(saved_state, adapter_path)
+
+    with patch("peft.get_peft_model_state_dict", return_value=loaded_state):
+        matched, ignored = _assert_peft_adapter_matches_checkpoint(Mock(), adapter_path)
+
+    assert matched == 1
     assert ignored == 0
 
 
@@ -694,6 +714,22 @@ def test_process_isolated_hf_reload_runs_rank0_hf_loader(tmp_path):
     )
     raise_distributed_failure.assert_called_once_with(None)
     recipe_cls.assert_not_called()
+
+
+def test_process_isolated_resume_rejects_no_check_resume():
+    with pytest.raises(ValueError, match="conflicts with no_check_resume=true"):
+        _run_process_isolated_checkpoint_phase(
+            "resume",
+            custom_args={"no_check_resume": True},
+            recipe_cls=Mock(),
+            hf_model_cls=Mock(),
+            input_ids_loader=Mock(),
+        )
+
+
+@pytest.mark.parametrize("non_finite_kl", [float("nan"), float("inf"), float("-inf")])
+def test_hf_reload_rejects_non_finite_kl(non_finite_kl):
+    assert "non-finite KL divergence" in _hf_reload_kl_error(non_finite_kl, 7e-2)
 
 
 def test_process_isolated_source_load_reference_persists_hf_artifacts(tmp_path):
