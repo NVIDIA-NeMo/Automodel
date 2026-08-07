@@ -873,18 +873,21 @@ class MoE(nn.Module):
             # on every EP rank, with at least 512 rows aligned to 256. Packed THD
             # batches still have an equal padded extent on all ranks, but padding
             # must not be routed or counted by the correction-bias/load metrics.
-            # Compact valid rows before the gate, zero-pad only the MoK dispatch
-            # inputs, then discard the dummy outputs and scatter valid rows back
-            # into the original layout. Dummy router weights are zero, so the
-            # alignment rows contribute neither activations nor gradients. The
-            # common padded sequence extent preserves MoK's equal-token contract
-            # even when EP ranks consume different packed examples.
+            # Run the gate on the original dense extent, matching the reference
+            # dispatcher exactly, then compact valid rows before MoK dispatch.
+            # Running the router on a variable compacted extent can select a
+            # different GEMM algorithm and perturb close group-top-k decisions.
+            # Zero-pad only the MoK dispatch inputs, discard dummy outputs, and
+            # scatter valid rows back into the original layout. Dummy router
+            # weights are zero, so alignment rows contribute neither activations
+            # nor gradients. The common padded sequence extent preserves MoK's
+            # equal-token contract when EP ranks consume different examples.
             if padding_mask is not None:
                 valid_positions = token_mask.nonzero(as_tuple=False).flatten()
-                gate_x = x.index_select(0, valid_positions)
                 expert_x = x_latent.index_select(0, valid_positions)
-                compact_mask = torch.ones(valid_positions.numel(), dtype=torch.bool, device=x.device)
-                weights, indices, aux_loss = self.gate(gate_x, compact_mask, cp_mesh)
+                weights, indices, aux_loss = self.gate(x, token_mask, cp_mesh)
+                weights = weights.index_select(0, valid_positions)
+                indices = indices.index_select(0, valid_positions)
                 num_valid_tokens = valid_positions.numel()
                 # EP ranks consume different packed examples, so their valid
                 # counts need not match. The padded input extent does match;
