@@ -12,10 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import gc
+import weakref
+from dataclasses import dataclass
+
 import pytest
 import torch
+from torch.utils.checkpoint import checkpoint
 
 from nemo_automodel.components.models.common import BackendConfig, MoKBackendConfig
+from nemo_automodel.components.moe import mok_experts
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.mok_experts import GroupedExpertsMoK
 
@@ -40,6 +46,24 @@ def _valid_moe_config(**overrides: object) -> MoEConfig:
     }
     values.update(overrides)
     return MoEConfig(**values)
+
+
+def test_mok_functional_import_is_lazy_and_cached(monkeypatch: pytest.MonkeyPatch) -> None:
+    functional = object()
+    imports: list[str] = []
+
+    def fake_safe_import(path: str, **kwargs: object) -> tuple[bool, object]:
+        del kwargs
+        imports.append(path)
+        return True, functional
+
+    monkeypatch.setattr(mok_experts, "_mok_functional", None)
+    monkeypatch.setattr(mok_experts, "safe_import", fake_safe_import)
+
+    assert mok_experts._mok_functional is None
+    assert mok_experts._load_mok_functional() is functional
+    assert mok_experts._load_mok_functional() is functional
+    assert imports == ["mok.functional"]
 
 
 def test_mok_backend_config_build_settings(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -125,10 +149,18 @@ def test_mok_state_dict_preserves_combined_expert_layout() -> None:
 
 
 def test_mok_manual_backward_maps_gradients_to_autograd_inputs() -> None:
+    @dataclass(frozen=True)
+    class FakeSchedule:
+        peer_rank: torch.Tensor
+
+    @dataclass(frozen=True)
+    class FakeForwardContext:
+        hidden: torch.Tensor
+
     class FakeRuntime:
         def forward(self, x: torch.Tensor, *args: torch.Tensor) -> tuple[torch.Tensor, object, object]:
             del args
-            return x.clone(), object(), object()
+            return x.clone(), FakeSchedule(torch.zeros(1, dtype=torch.int32)), FakeForwardContext(x.clone())
 
         def backward(
             self,
@@ -187,3 +219,83 @@ def test_mok_manual_backward_maps_gradients_to_autograd_inputs() -> None:
         (shared_down.grad, 8),
     ):
         torch.testing.assert_close(actual, torch.full_like(actual, expected))
+
+
+def test_mok_context_uses_checkpoint_saved_tensor_hooks() -> None:
+    @dataclass(frozen=True)
+    class FakeSchedule:
+        peer_rank: torch.Tensor
+        counts: tuple[torch.Tensor, torch.Tensor]
+
+    @dataclass(frozen=True)
+    class FakeForwardContext:
+        x_routed: torch.Tensor
+        hidden_routed: tuple[torch.Tensor, torch.Tensor]
+
+    class FakeRuntime:
+        def __init__(self) -> None:
+            self.forward_calls = 0
+            self.first_context_refs: list[weakref.ReferenceType[torch.Tensor]] = []
+            self.backward_state: tuple[object, object] | None = None
+
+        def forward(self, x: torch.Tensor, *args: torch.Tensor) -> tuple[torch.Tensor, object, object]:
+            del args
+            self.forward_calls += 1
+            schedule = FakeSchedule(
+                peer_rank=torch.zeros(2, dtype=torch.int32),
+                counts=(torch.ones(1, dtype=torch.int32), torch.ones(2, dtype=torch.int32)),
+            )
+            forward_context = FakeForwardContext(
+                x_routed=torch.ones(128, 128),
+                hidden_routed=(torch.ones(64, 64), torch.ones(32, 32)),
+            )
+            if self.forward_calls == 1:
+                self.first_context_refs = [
+                    weakref.ref(forward_context.x_routed),
+                    *(weakref.ref(item) for item in forward_context.hidden_routed),
+                ]
+            return x.clone(), schedule, forward_context
+
+        def backward(
+            self,
+            schedule: object,
+            forward_context: object,
+            grad_output: torch.Tensor,
+            *inputs: torch.Tensor,
+        ) -> tuple[torch.Tensor, ...]:
+            self.backward_state = (schedule, forward_context)
+            return tuple(torch.ones_like(tensor) for tensor in (inputs[0], inputs[1], *inputs[5:], *inputs[2:5]))
+
+    runtime = FakeRuntime()
+    tensors = [torch.randn(2, 2, requires_grad=True) for _ in range(8)]
+    top_experts = torch.zeros(2, 2, dtype=torch.int64)
+
+    def run(x: torch.Tensor) -> torch.Tensor:
+        return mok_experts._MoKAutogradFunction.apply(
+            runtime,
+            x,
+            tensors[1],
+            top_experts,
+            tensors[2],
+            tensors[3],
+            tensors[4],
+            tensors[5],
+            tensors[6],
+            tensors[7],
+        )
+
+    output = checkpoint(run, tensors[0], use_reentrant=False)
+    gc.collect()
+
+    assert runtime.forward_calls == 1
+    assert runtime.first_context_refs
+    assert all(ref() is None for ref in runtime.first_context_refs)
+
+    output.sum().backward()
+
+    assert runtime.forward_calls == 2
+    assert runtime.backward_state is not None
+    schedule, forward_context = runtime.backward_state
+    assert isinstance(schedule, FakeSchedule)
+    assert isinstance(forward_context, FakeForwardContext)
+    assert all(tensor.grad is not None for tensor in tensors)

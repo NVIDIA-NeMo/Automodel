@@ -15,6 +15,8 @@
 """Mixture-of-Kittens expert backend for AutoModel's shared MoE component."""
 
 from collections import OrderedDict
+from dataclasses import fields, is_dataclass
+from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -30,7 +32,25 @@ from nemo_automodel.shared.import_utils import safe_import
 _MOK_IMPORT_MESSAGE = (
     "dispatcher='mok' requires a built Mixture-of-Kittens installation or an importable mixture-of-kittens checkout."
 )
-_MOK_AVAILABLE, _mok_functional = safe_import("mok.functional", msg=_MOK_IMPORT_MESSAGE)
+_mok_functional = None
+
+
+def _load_mok_functional():
+    """Import MoK after distributed setup has selected this process's GPU.
+
+    Importing MoK loads its CUDA extension.  Doing that at module-import time is
+    too early for torchrun workers: every local worker still has CUDA device 0
+    selected, leaving one stray CUDA context per worker on the first GPU.  MoK
+    is only needed when expert parallelism is initialized, which happens after
+    ``initialize_distributed`` calls ``torch.cuda.set_device``.
+    """
+    global _mok_functional
+    if _mok_functional is None:
+        available, functional = safe_import("mok.functional", msg=_MOK_IMPORT_MESSAGE)
+        if not available:
+            raise ImportError(_MOK_IMPORT_MESSAGE)
+        _mok_functional = functional
+    return _mok_functional
 
 
 def _local_tensor(tensor: torch.Tensor) -> torch.Tensor:
@@ -45,6 +65,65 @@ def _local_tensor(tensor: torch.Tensor) -> torch.Tensor:
         The returned tensor aliases the input's local storage.
     """
     return tensor.to_local() if isinstance(tensor, DTensor) else tensor
+
+
+def _flatten_mok_tensor_dataclass(
+    value: object,
+) -> tuple[tuple[torch.Tensor, ...], tuple[type, tuple[tuple[str, int], ...]]]:
+    """Flatten a MoK schedule/context without retaining tensor references in metadata.
+
+    MoK's dataclasses contain either tensors or tuples of tensors (the latter for
+    MXFP8 values).  Saving the flattened tensors with ``ctx.save_for_backward``
+    makes them visible to activation-checkpoint saved-tensor hooks.  Storing the
+    original dataclass directly on ``ctx`` would keep every layer's macro-sized
+    context alive until backward.
+
+    Args:
+        value: MoK schedule or forward-context dataclass.
+
+    Returns:
+        Flat tensors and tensor-free reconstruction metadata.
+    """
+    if not is_dataclass(value) or isinstance(value, type):
+        raise TypeError(f"Expected a MoK tensor dataclass, got {type(value).__name__}")
+
+    tensors: list[torch.Tensor] = []
+    field_layout: list[tuple[str, int]] = []
+    for field in fields(value):
+        field_value = getattr(value, field.name)
+        if isinstance(field_value, torch.Tensor):
+            field_tensors = (field_value,)
+        elif (
+            isinstance(field_value, tuple)
+            and field_value
+            and all(isinstance(item, torch.Tensor) for item in field_value)
+        ):
+            field_tensors = field_value
+        else:
+            raise TypeError(
+                f"MoK field {type(value).__name__}.{field.name} must be a tensor or nonempty tuple of tensors"
+            )
+        field_layout.append((field.name, len(field_tensors)))
+        tensors.extend(field_tensors)
+    return tuple(tensors), (type(value), tuple(field_layout))
+
+
+def _unflatten_mok_tensor_dataclass(
+    spec: tuple[type, tuple[tuple[str, int], ...]],
+    tensors: tuple[torch.Tensor, ...],
+    offset: int,
+) -> tuple[object, int]:
+    """Reconstruct a MoK dataclass from checkpoint-managed saved tensors."""
+    dataclass_type, field_layout = spec
+    values: dict[str, Any] = {}
+    for name, count in field_layout:
+        end = offset + count
+        if end > len(tensors):
+            raise RuntimeError("MoK saved-tensor metadata exceeds the available tensors")
+        field_tensors = tensors[offset:end]
+        values[name] = field_tensors[0] if count == 1 else field_tensors
+        offset = end
+    return dataclass_type(**values), offset
 
 
 class _MoKRuntime:
@@ -65,8 +144,6 @@ class _MoKRuntime:
         """
         if ep_mesh.ndim != 1 or ep_mesh.mesh_dim_names != ("ep",):
             raise ValueError(f"MoK requires a one-dimensional 'ep' mesh, got {ep_mesh.mesh_dim_names}")
-        if not _MOK_AVAILABLE:
-            raise ImportError(_MOK_IMPORT_MESSAGE)
         ep_size = ep_mesh.size()
         if ep_size not in (4, 8, 16, 32, 64):
             raise ValueError(f"MoK EP size must be one of 4, 8, 16, 32, 64; got {ep_size}")
@@ -74,6 +151,9 @@ class _MoKRuntime:
             raise ValueError(
                 f"MoK requires n_routed_experts ({n_routed_experts}) to be divisible by ep_size ({ep_size})"
             )
+        # Load the CUDA extension only after torchrun has bound this worker to
+        # its local device.  This avoids all workers creating a context on GPU 0.
+        _load_mok_functional()
         self.config = self.backend.mok.build()
         self.ep_group = ep_mesh.get_group()
 
@@ -252,9 +332,10 @@ class _MoKAutogradFunction(torch.autograd.Function):
             routed_up_weights,
             routed_down_weights,
         )
+        schedule_tensors, schedule_spec = _flatten_mok_tensor_dataclass(schedule)
+        forward_context_tensors, forward_context_spec = _flatten_mok_tensor_dataclass(forward_context)
         ctx.runtime = runtime
-        ctx.schedule = schedule
-        ctx.forward_context = forward_context
+        ctx.mok_tensor_specs = (schedule_spec, forward_context_spec)
         ctx.save_for_backward(
             x,
             router_weights,
@@ -264,6 +345,8 @@ class _MoKAutogradFunction(torch.autograd.Function):
             routed_gate_weights,
             routed_up_weights,
             routed_down_weights,
+            *schedule_tensors,
+            *forward_context_tensors,
         )
         return output
 
@@ -279,6 +362,7 @@ class _MoKAutogradFunction(torch.autograd.Function):
             Gradients matching every :meth:`forward` input. The runtime and integer
             expert-index inputs have ``None`` gradients.
         """
+        saved_tensors = ctx.saved_tensors
         (
             x,
             router_weights,
@@ -288,7 +372,11 @@ class _MoKAutogradFunction(torch.autograd.Function):
             routed_gate_weights,
             routed_up_weights,
             routed_down_weights,
-        ) = ctx.saved_tensors
+        ) = saved_tensors[:8]
+        schedule, offset = _unflatten_mok_tensor_dataclass(ctx.mok_tensor_specs[0], saved_tensors, 8)
+        forward_context, offset = _unflatten_mok_tensor_dataclass(ctx.mok_tensor_specs[1], saved_tensors, offset)
+        if offset != len(saved_tensors):
+            raise RuntimeError(f"MoK saved-tensor metadata consumed {offset} of {len(saved_tensors)} tensors")
         (
             grad_x,
             grad_router_weights,
@@ -299,8 +387,8 @@ class _MoKAutogradFunction(torch.autograd.Function):
             grad_shared_up,
             grad_shared_down,
         ) = ctx.runtime.backward(
-            ctx.schedule,
-            ctx.forward_context,
+            schedule,
+            forward_context,
             grad_output,
             x,
             router_weights,
