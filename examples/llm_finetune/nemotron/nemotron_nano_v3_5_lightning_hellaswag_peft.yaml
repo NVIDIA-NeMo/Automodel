@@ -119,6 +119,12 @@ lr_scheduler:
   lr_warmup_steps: 10
   min_lr: 1.0e-5
 
+ci:
+  # ep_size(8) = 8 GPUs => 1 node (8 H100/node).
+  recipe_owner: adil-a
+  time: "00:30:00"
+  nodes: 1
+
 # wandb:
 #   project: <your_wandb_project>
 #   entity: <your_wandb_entity>
