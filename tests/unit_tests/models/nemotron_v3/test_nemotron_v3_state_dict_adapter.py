@@ -554,6 +554,17 @@ class TestNemotronV3AdapterMixerExperts:
 
         assert adapter._expert_path_segment == "mixer.experts"
 
+    def test_default_lora_export_stays_legacy_for_non_gated_experts(self, config, moe_config, backend):
+        """Nemotron V3 must emit its real up_proj path until v5 is validated."""
+        adapter = NemotronV3StateDictAdapter(config, moe_config, backend)
+        tensor = torch.randn(moe_config.n_routed_experts, moe_config.dim, 8)
+
+        result = adapter.convert_single_tensor_to_hf("model.layers.0.mixer.experts.lora_gate_and_up_A", tensor)
+
+        keys = {key for key, _ in result}
+        assert "backbone.layers.0.mixer.experts.0.up_proj.lora_A.weight" in keys
+        assert not any("gate_up_proj" in key or "base_layer.lora_A.weight" in key for key in keys)
+
     def test_from_hf_uses_mixer_experts_path(self, config, moe_config, backend):
         """Test that from_hf correctly parses mixer.experts paths."""
         adapter = NemotronV3StateDictAdapter(config, moe_config, backend)
