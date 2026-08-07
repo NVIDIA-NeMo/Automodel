@@ -12,18 +12,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# To run this script, use the following command:
-# torchrun --nproc_per_node=8 --master_port=29500 ./examples/retrieval/data_utils/mine_hard_negatives.py \
+# Single-node usage:
+# uv run torchrun --standalone --nproc_per_node=8 ./examples/retrieval/data_utils/mine_hard_negatives.py \
 #     --config examples/retrieval/data_utils/mining_config.yaml \
-#     --mining.model_name_or_path /path/to/encoder/checkpoint \
+#     --mining.model_name_or_path ./output/llama3_2_1b_encoder/checkpoints/epoch_0_step_499/model/consolidated \
 #     --mining.train_qa_file_path /path/to/input.json \
 #     --mining.train_file_output_path /path/to/output.json \
-#     --mining.cache_embeddings_dir /path/to/cache \
-#     --mining.hard_neg_margin 0.95
+#     --mining.cache_embeddings_dir /shared/path/to/cache/<run-specific-name> \
+#     --mining.query_prefix "query: " \
+#     --mining.passage_prefix "passage: " \
+#     --mining.query_max_length 512 \
+#     --mining.passage_max_length 512 \
+#     --mining.add_eos_token false
 #
-# The model is loaded directly from the checkpoint path (--mining.model_name_or_path),
-# so no model architecture config is needed. This allows mining with any saved
-# encoder checkpoint without requiring the original training config.
+# For multi-node torchrun, use explicit rendezvous flags as shown in the
+# retrieval fine-tuning guide.
+#
+# The model is loaded directly from --mining.model_name_or_path. Use a HF-loadable
+# encoder export such as checkpoints/epoch_0_step_499/model/consolidated from a
+# full fine-tuning run.
+# Match tokenizer, prefix, and max-length settings to the training config.
 #
 # The mining_config.yaml contains only mining parameters and dist_env settings,
 # not the model architecture. All mining parameters can also be overridden via
