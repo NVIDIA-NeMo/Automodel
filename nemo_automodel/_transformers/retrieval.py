@@ -22,7 +22,13 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import AutoConfig, AutoModel, AutoModelForSequenceClassification, PreTrainedModel
+from transformers import (
+    AutoConfig,
+    AutoModel,
+    AutoModelForSequenceClassification,
+    FineGrainedFP8Config,
+    PreTrainedModel,
+)
 from transformers.models.auto.modeling_auto import MODEL_FOR_SEQUENCE_CLASSIFICATION_MAPPING
 from transformers.utils import logging
 
@@ -31,6 +37,33 @@ from nemo_automodel.components.loss.intermediate_distill import LayerCapture
 from nemo_automodel.components.models.common.bidirectional import EncoderStateDictAdapter
 
 logger = logging.get_logger(__name__)
+
+
+def _get_fp8_dequantization_config(config) -> FineGrainedFP8Config | None:
+    """Build the Transformers config for loading trainable dense FP8 weights.
+
+    HuggingFace fine-grained FP8 linear modules register scalar scale
+    parameters, which FSDP2 cannot shard. Retrieval recipes train the extracted
+    backbone, so materialize the checkpoint weights in the requested dense
+    dtype instead of keeping the inference-only FP8 modules.
+
+    Args:
+        config: HuggingFace model config that may contain a native
+            ``quantization_config``.
+
+    Returns:
+        A dequantizing Transformers FP8 config for native FP8 checkpoints,
+        otherwise ``None``.
+    """
+    quantization_config = getattr(config, "quantization_config", None)
+    if isinstance(quantization_config, dict):
+        if quantization_config.get("quant_method") != "fp8":
+            return None
+        return FineGrainedFP8Config(dequantize=True)
+
+    if getattr(quantization_config, "quant_method", None) != "fp8":
+        return None
+    return FineGrainedFP8Config(dequantize=True)
 
 
 def _extract_submodel(model: nn.Module, extract_submodel: str) -> PreTrainedModel:
@@ -258,7 +291,16 @@ def build_encoder_backbone(
 
     if extract_submodel is not None:
         logger.info(f"Loading {model_name_or_path} with HuggingFace Auto classes to extract {extract_submodel}")
-        model = AutoModel.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code, **hf_kwargs)
+        model_load_kwargs = hf_kwargs
+        fp8_dequantization_config = _get_fp8_dequantization_config(config)
+        if fp8_dequantization_config is not None:
+            logger.info("Dequantizing the native FP8 checkpoint for retrieval training")
+            model_load_kwargs = {**hf_kwargs, "quantization_config": fp8_dequantization_config}
+        model = AutoModel.from_pretrained(
+            model_name_or_path,
+            trust_remote_code=trust_remote_code,
+            **model_load_kwargs,
+        )
         extracted_model = _extract_submodel(model, extract_submodel)
         return _build_backbone_from_extracted_submodel(
             extracted_model,
