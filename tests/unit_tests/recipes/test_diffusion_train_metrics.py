@@ -763,3 +763,81 @@ def test_run_train_validation_loop_uses_hot_path_and_logs_perf_metrics(monkeypat
         "s/s": "2.5",
         "s/s/gpu": "2.50",
     }
+
+
+def _train_batch_group_recipe(model: nn.Module, flow_step) -> TrainDiffusionRecipe:
+    """Build a minimal CPU recipe whose ``flow_matching_pipeline.step`` is ``flow_step``."""
+    recipe = object.__new__(TrainDiffusionRecipe)
+    recipe.model = model
+    recipe.optimizer = [torch.optim.SGD(model.parameters(), lr=0.1)]
+    recipe.lr_scheduler = None
+    recipe.flow_matching_pipeline = SimpleNamespace(step=flow_step)
+    recipe.device = torch.device("cpu")
+    recipe.compute_dtype = torch.float32
+    recipe.check_loss = False
+    recipe.defer_fsdp_grad_sync = True
+    recipe.cp_size = 1
+    recipe.clip_grad_max_norm = 1.0
+    recipe.grad_clip_foreach = False
+    recipe.peft_cfg = None
+    recipe.transformer_engine_fp8 = False
+    return recipe
+
+
+def test_train_batch_group_logs_batch_shapes_and_reraises_on_step_failure(caplog):
+    model = nn.Linear(1, 1, bias=False)
+
+    def _failing_step(**_kwargs: object) -> None:
+        """Fail after accepting one flow-matching microbatch.
+
+        Args:
+            **_kwargs: Step arguments containing a batch with video latents
+                ``[B,C,F,H,W]`` and text embeddings ``[B,S,D]``.
+        """
+        raise RuntimeError("simulated flow-matching failure")
+
+    recipe = _train_batch_group_recipe(model, _failing_step)
+    micro_batch = {"video_latents": torch.zeros(2, 1, 1, 4, 4), "text_embeddings": torch.zeros(2, 3, 8)}
+
+    with caplog.at_level("INFO"):
+        with pytest.raises(RuntimeError, match="simulated flow-matching failure"):
+            recipe._train_batch_group([micro_batch], global_step=3)
+
+    assert "Training step failed at step 3" in caplog.text
+    assert f"video: {micro_batch['video_latents'].shape}" in caplog.text
+
+
+def test_train_batch_group_reports_lora_gradient_diagnostic_on_first_step(caplog):
+    class _LoraModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.base = nn.Linear(1, 1, bias=False)
+            self.lora_B = nn.Linear(1, 1, bias=False)
+
+    model = _LoraModel()
+
+    def _step(**_kwargs: object) -> tuple[None, torch.Tensor, None, None]:
+        """Return a scalar LoRA loss.
+
+        Args:
+            **_kwargs: Step arguments containing the diffusion batch tensors.
+
+        Returns:
+            Tuple whose second field is a scalar loss tensor.
+        """
+        loss = model.lora_B.weight.square().sum()
+        return None, loss, None, None
+
+    recipe = _train_batch_group_recipe(model, _step)
+    recipe.peft_cfg = object()
+
+    with caplog.at_level("INFO"):
+        loss, grad_norm = recipe._train_batch_group(
+            [{"video_latents": torch.zeros(1, 1, 1, 1, 1), "text_embeddings": torch.zeros(1, 1, 1)}],
+            global_step=1,
+        )
+
+    assert "[GRAD CHECK] lora_B.weight" in caplog.text
+    assert model.lora_B.weight.grad is not None
+    assert loss > 0.0
+    assert grad_norm >= 0.0

@@ -441,6 +441,69 @@ class TestLRSchedulerConfig:
         scheds = LRSchedulerConfig(lr_warmup_steps=1).build(opt, ss)
         assert scheds[0].lr_decay_steps == 20  # min(num_epochs*epoch_len=1000, max_steps=20)
 
+    def test_build_accepts_explicit_total_steps(self):
+        opt = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=0.01)
+        ss = self._step_scheduler(epoch_len=100, num_epochs=10, max_steps=20)
+        scheds = LRSchedulerConfig(lr_warmup_steps=1).build(opt, ss, total_steps=7)
+        assert scheds[0].lr_decay_steps == 7
+
+    def test_build_explicit_total_steps_skips_derivation(self):
+        # With an explicit total_steps, the iterable-without-max_steps case must
+        # not raise: the derivation branch is skipped entirely.
+        opt = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=0.01)
+        ss = self._step_scheduler(epoch_len=None, num_epochs=10, max_steps=None)
+        scheds = LRSchedulerConfig(lr_warmup_steps=1).build(opt, ss, total_steps=7)
+        assert scheds[0].lr_decay_steps == 7
+
+    @pytest.mark.parametrize("warmup", [0.1, 0.5, 0.999])
+    def test_build_fractional_warmup_raises(self, warmup):
+        # The removed diffusion-only builder treated (0, 1) floats as a fraction of
+        # total steps; here they would silently disable warmup, so build() rejects them.
+        opt = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=0.01)
+        ss = self._step_scheduler(epoch_len=10, num_epochs=4, max_steps=None)
+        with pytest.raises(ValueError, match="Fractional warmup is not supported"):
+            LRSchedulerConfig(lr_warmup_steps=warmup).build(opt, ss)
+
+    @pytest.mark.parametrize("total_steps", [0, -5])
+    def test_build_explicit_nonpositive_total_steps_raises(self, total_steps):
+        opt = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=0.01)
+        ss = self._step_scheduler(epoch_len=10, num_epochs=4, max_steps=None)
+        with pytest.raises(ValueError, match="total_steps must be greater than 0"):
+            LRSchedulerConfig(lr_warmup_steps=1).build(opt, ss, total_steps=total_steps)
+
+    def test_build_derived_zero_total_steps_raises(self):
+        # epoch_len == 0 (empty dataloader) derives total_steps == 0, which must be
+        # rejected by the same guard as an explicit non-positive value.
+        opt = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=0.01)
+        ss = self._step_scheduler(epoch_len=0, num_epochs=4, max_steps=None)
+        with pytest.raises(ValueError, match="total_steps must be greater than 0"):
+            LRSchedulerConfig(lr_warmup_steps=1).build(opt, ss)
+
+    @pytest.mark.parametrize(
+        ("total_steps", "expected_warmup"),
+        [(50, 5), (100000, 1000)],  # min(1000, total_steps // 10)
+    )
+    def test_build_default_warmup_rule(self, total_steps, expected_warmup):
+        opt = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=0.01)
+        ss = self._step_scheduler(epoch_len=10, num_epochs=4, max_steps=None)
+        scheds = LRSchedulerConfig().build(opt, ss, total_steps=total_steps)
+        assert scheds[0].lr_warmup_steps == expected_warmup
+
+    def test_build_one_scheduler_per_optimizer_with_own_base_lr(self):
+        # A list of optimizers gets one scheduler each, seeded from that
+        # optimizer's own base LR (max_lr default) and weight decay.
+        opt_a = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=0.01, weight_decay=0.1)
+        opt_b = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=0.002, weight_decay=0.0)
+        ss = self._step_scheduler(epoch_len=10, num_epochs=4, max_steps=None)
+        scheds = LRSchedulerConfig(lr_warmup_steps=1).build([opt_a, opt_b], ss)
+        assert len(scheds) == 2
+        assert scheds[0].max_lr == pytest.approx(0.01)
+        assert scheds[1].max_lr == pytest.approx(0.002)
+        assert scheds[0].min_lr == pytest.approx(0.01 * 0.01)
+        assert scheds[1].min_lr == pytest.approx(0.002 * 0.01)
+        assert scheds[0].start_wd == pytest.approx(0.1)
+        assert scheds[1].start_wd == pytest.approx(0.0)
+
 
 # ---------------------------------------------------------------------------
 # Per-parameter-group LR overrides (issue #2961)
