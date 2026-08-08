@@ -119,6 +119,7 @@ _OVERRIDES = [
     "config_path",
     "deploy_mode",
     "max_new_tokens",
+    "hf_adapter_ignored_key_prefix",
 ]
 
 _BOOLEAN_OVERRIDES = [
@@ -132,6 +133,8 @@ _BOOLEAN_OVERRIDES = [
     "tokenizer_name",
     "max_vram_gb",
     "max_cpu_gb",
+    "training_reproducibility_loss_threshold",
+    "resume_first_loss_threshold",
     "resume_loss_threshold",
     "source_load_cosine_threshold",
     "source_load_kl_threshold",
@@ -149,6 +152,8 @@ _BOOLEAN_OVERRIDES = [
     "check_resume",
     "hf_device_map_auto",
     "hf_source_post_load_dequantize",
+    "skip_automodel_logit_parity",
+    "skip_hf_logit_parity",
 ]
 
 

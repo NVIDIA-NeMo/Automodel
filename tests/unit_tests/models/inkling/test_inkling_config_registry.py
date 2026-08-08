@@ -12,12 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import pytest
 from transformers import AutoConfig
 from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 
 from nemo_automodel._transformers.registry import ModelRegistry
+from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.inkling.configuration import InklingConfig
+from nemo_automodel.components.models.inkling.model import InklingForConditionalGeneration
+
+from .parity_check_inkling import build_tiny_config
 
 
 def test_inkling_config_registered_with_auto_config():
@@ -30,13 +33,29 @@ def test_inkling_config_registered_with_auto_config():
     assert cfg.text_config.model_type == "inkling_text"
 
 
-def test_inkling_architecture_stays_registered_when_hf_inkling_is_unavailable():
-    from nemo_automodel.components.models.inkling.model import _INKLING_HF_AVAILABLE, InklingForConditionalGeneration
-    from nemo_automodel.shared.import_utils import UnavailableError
+def test_inkling_checkpoint_aliases_and_placeholder_defaults():
+    cfg = InklingConfig.from_dict(
+        {
+            "model_type": "inkling_mm_model",
+            "image_token_id": None,
+            "audio_token_id": None,
+            "text_config": {"hidden_size": 64, "num_hidden_layers": 2},
+            "vision_config": {"n_layers": 4, "n_channels": 5, "decoder_dmodel": 64},
+            "audio_config": {"n_mel_bins": 8, "mel_vocab_size": 16, "decoder_dmodel": 64},
+        }
+    )
 
+    assert cfg.image_token_id == 200054
+    assert cfg.audio_token_id == 200053
+    assert cfg.vision_config.num_hidden_layers == 4
+    assert cfg.vision_config.num_channels == 5
+    assert cfg.vision_config.text_hidden_size == 64
+    assert cfg.audio_config.text_hidden_size == 64
+
+
+def test_inkling_architecture_instantiates_from_local_config():
     assert ModelRegistry.has_custom_model("InklingForConditionalGeneration")
-    if _INKLING_HF_AVAILABLE:
-        pytest.skip("This host's transformers build ships Inkling.")
-
-    with pytest.raises(UnavailableError, match="transformers >= 5.14"):
-        InklingForConditionalGeneration.from_config(InklingConfig())
+    backend = BackendConfig(linear="torch", rms_norm="torch", experts="torch", dispatcher="torch")
+    model = InklingForConditionalGeneration.from_config(build_tiny_config(), backend=backend)
+    assert isinstance(model, InklingForConditionalGeneration)
+    assert model.config.model_type == "inkling_mm_model"

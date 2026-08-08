@@ -167,6 +167,30 @@ def enforce_torch_memory_limit(request):
         )
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _fail_on_leaked_process_group():
+    """Fail the session when a test leaves a torch.distributed process group running.
+
+    A leaked group is invisible in the test that created it and silently corrupts
+    later ones: helpers such as ``get_world_size_safe`` stop reading ``WORLD_SIZE``
+    from the environment and report the live group's size instead, and tests that
+    skip when a group already exists stop running at all. Whether it bites depends
+    on collection order, so it can pass in CI and fail locally.
+
+    Tests that need a real group must tear it down, for example by initializing it
+    inside a fixture that destroys it in a ``finally`` block.
+    """
+    yield
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.destroy_process_group()
+        pytest.fail(
+            "a test left a torch.distributed process group initialized; "
+            "re-run with -p no:randomly and bisect by file to find the fixture that "
+            "calls init_process_group without a matching destroy_process_group",
+            pytrace=False,
+        )
+
+
 def pytest_configure(config):
     """Initial configuration of conftest.
     The function checks if test_data.tar.gz is present in tests/.data.

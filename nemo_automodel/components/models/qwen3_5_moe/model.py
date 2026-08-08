@@ -653,6 +653,10 @@ class Qwen3_5MoeTextModelBackend(nn.Module):
             raise NotImplementedError("KV cache is not supported for the Qwen3.5-MoE backend implementation.")
 
         if inputs_embeds is None:
+            if input_ids is None:
+                raise ValueError("Either input_ids or inputs_embeds must be provided")
+            if self.embed_tokens is None:
+                raise ValueError("inputs_embeds must be provided for pipeline stages without embed_tokens")
             inputs_embeds = self.embed_tokens(input_ids)
 
         if cache_position is None:
@@ -739,6 +743,264 @@ class Qwen3_5MoeTextModelBackend(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Top-level text-only causal language model
+# ---------------------------------------------------------------------------
+class Qwen3_5MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
+    """Text-only Qwen3.5-MoE causal language model."""
+
+    tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
+    _pp_keep_self_forward: bool = True
+
+    @dataclass(frozen=True)
+    class ModelCapabilities:
+        """Declared parallelism capabilities for this model class."""
+
+        supports_tp: bool = False
+        supports_cp: bool = True
+        supports_pp: bool = True
+        supports_ep: bool = True
+
+    @classmethod
+    def from_config(
+        cls,
+        config: Qwen3_5MoeTextConfig,
+        moe_config: MoEConfig | None = None,
+        backend: BackendConfig | None = None,
+        **kwargs: Any,
+    ):
+        return cls(config, moe_config=moe_config, backend=backend, **kwargs)
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path: str,
+        *model_args: Any,
+        **kwargs: Any,
+    ):
+        if not _QWEN3_5_MOE_HF_AVAILABLE:
+            raise UnavailableError("transformers.models.qwen3_5_moe is not available.")
+        config = Qwen3_5MoeTextConfig.from_pretrained(pretrained_model_name_or_path)
+        return cls.from_config(config, *model_args, **kwargs)
+
+    def __init__(
+        self,
+        config: Qwen3_5MoeTextConfig,
+        moe_config: MoEConfig | None = None,
+        backend: BackendConfig | None = None,
+        mtp_loss_scaling_factor: float = 0.1,
+        num_nextn_predict_layers: int | None = None,
+        **kwargs: Any,
+    ) -> None:
+        if not _QWEN3_5_MOE_HF_AVAILABLE:
+            raise UnavailableError("transformers.models.qwen3_5_moe is not available.")
+        reject_unsupported_tie_word_embeddings(type(self), config)
+        super().__init__()
+        moe_overrides = kwargs.pop("moe_overrides", None)
+        if kwargs:
+            raise TypeError(f"Unexpected keyword arguments: {sorted(kwargs)}")
+
+        self.config = config
+        self.backend = _qwen3_5_moe_backend(backend)
+        self.model = Qwen3_5MoeTextModelBackend(
+            config,
+            backend=self.backend,
+            moe_config=moe_config,
+            moe_overrides=moe_overrides,
+        )
+
+        dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+        self.lm_head = initialize_linear_module(
+            self.backend.linear,
+            config.hidden_size,
+            config.vocab_size,
+            bias=False,
+            dtype=dtype,
+        )
+        self.vocab_size = config.vocab_size
+        self.pad_token_id = config.pad_token_id if config.pad_token_id is not None else -1
+
+        self.mtp_config = build_mtp_config_from_hf(
+            config,
+            loss_scaling_factor=mtp_loss_scaling_factor,
+            num_nextn_predict_layers=num_nextn_predict_layers,
+        )
+        self.mtp = (
+            build_qwen3_5_moe_mtp(config, self.mtp_config, self.backend, self.model.moe_config, dtype=dtype)
+            if self.mtp_config.enabled
+            else None
+        )
+        self.moe_config = self.model.moe_config
+
+        keep_fp32 = list(getattr(self, "_keep_in_fp32_modules", None) or [])
+        if "_fp32_params" not in keep_fp32:
+            keep_fp32.append("_fp32_params")
+        self._keep_in_fp32_modules = keep_fp32
+
+        if self.backend.enable_hf_state_dict_adapter:
+            self.state_dict_adapter = Qwen3_5MoeStateDictAdapter(
+                config,
+                self.model.moe_config,
+                self.backend,
+                dtype=dtype,
+                pretrained_model_name_or_path=getattr(config, "_name_or_path", None)
+                or getattr(config, "name_or_path", None),
+                text_only=True,
+            )
+
+    def get_input_embeddings(self) -> nn.Module:
+        return self.model.embed_tokens
+
+    def set_input_embeddings(self, value: nn.Module) -> None:
+        self.model.embed_tokens = value
+
+    def get_output_embeddings(self) -> nn.Module:
+        return self.lm_head
+
+    def set_output_embeddings(self, new_embeddings: nn.Module) -> None:
+        self.lm_head = new_embeddings
+
+    def forward(
+        self,
+        input_ids: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Any | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        labels: torch.LongTensor | None = None,
+        use_cache: bool | None = None,
+        logits_to_keep: int | torch.Tensor = 0,
+        output_hidden_states: bool | None = None,
+        cache_position: torch.Tensor | None = None,
+        padding_mask: torch.Tensor | None = None,
+        **kwargs: Any,
+    ) -> Qwen3_5MoeCausalLMOutputWithPast:
+        """Run the text-only causal LM forward pass.
+
+        Args:
+            input_ids: Token ids of shape ``[batch, sequence]``. On a non-first
+                pipeline stage where ``embed_tokens`` is absent, this argument
+                instead carries hidden states of shape
+                ``[batch, sequence, hidden]`` and is routed as ``inputs_embeds``.
+            attention_mask: Optional mask of shape ``[batch, sequence]`` or
+                ``[batch, 1, sequence, sequence]``.
+            position_ids: Optional M-RoPE positions of shape
+                ``[axes, batch, sequence]`` or ``[batch, sequence]``.
+            past_key_values: Optional KV-cache state; caching is not supported
+                by this backend and a non-``None`` value raises.
+            inputs_embeds: Optional hidden inputs of shape
+                ``[batch, sequence, hidden]``.
+            labels: Optional labels of shape ``[batch, sequence]``. Accepted for
+                Hugging Face compatibility; loss is computed outside this model.
+            use_cache: Whether to use a KV cache; ``True`` is unsupported.
+            logits_to_keep: ``0`` to project every position, a positive integer
+                to keep the last positions, or indices of shape
+                ``[kept_sequence]``.
+            output_hidden_states: Whether to include final decoder states in the
+                output for the fused loss path.
+            cache_position: Optional token positions of shape ``[sequence]``.
+            padding_mask: Optional padding mask of shape ``[batch, sequence]``
+                where ``True`` marks padding.
+            **kwargs: Additional attention and packed-sequence metadata forwarded
+                to the decoder and optional MTP layers.
+
+        Returns:
+            A causal-LM output whose logits have shape
+            ``[batch, kept_sequence, vocab]`` (or
+            ``[batch, sequence, hidden]`` on a non-final pipeline stage), whose
+            requested hidden states have shape ``[batch, sequence, hidden]``,
+            and whose optional per-depth MTP tensors each have shape
+            ``[batch, sequence, hidden]``.
+        """
+        del labels
+        if inputs_embeds is None and self.model.embed_tokens is None and input_ids is not None:
+            inputs_embeds = input_ids
+            input_ids = None
+
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=False if use_cache is None else use_cache,
+            cache_position=cache_position,
+            padding_mask=padding_mask,
+            **kwargs,
+        )
+        hidden_states = outputs.last_hidden_state
+        lm_output = compute_lm_head_logits(
+            self.lm_head,
+            hidden_states,
+            logits_to_keep,
+            output_hidden_states=output_hidden_states,
+        )
+
+        mtp_per_depth_h: list[torch.Tensor] | None = None
+        if self.mtp is not None and self.training:
+            source_embeds = inputs_embeds if inputs_embeds is not None else self.model.embed_tokens(input_ids)
+            mtp_position_ids = _split_qwen3_5_moe_position_ids(
+                position_ids,
+                batch_size=source_embeds.shape[0],
+                seq_len=source_embeds.shape[1],
+                device=source_embeds.device,
+                cache_position=cache_position,
+            )
+            if input_ids is None:
+                mtp_per_depth_h = self.mtp(
+                    hidden_states,
+                    embed_inputs=_rolled_embed_inputs(source_embeds, self.mtp.num_depths),
+                    position_ids=mtp_position_ids,
+                    attention_mask=attention_mask,
+                    padding_mask=padding_mask,
+                    rotary_emb=self.model.rotary_emb,
+                    **kwargs,
+                )
+            else:
+                mtp_per_depth_h = self.mtp(
+                    hidden_states,
+                    input_ids=input_ids,
+                    embed_fn=self.model.embed_tokens,
+                    position_ids=mtp_position_ids,
+                    attention_mask=attention_mask,
+                    padding_mask=padding_mask,
+                    rotary_emb=self.model.rotary_emb,
+                    **kwargs,
+                )
+
+        return Qwen3_5MoeCausalLMOutputWithPast(
+            logits=lm_output.logits,
+            hidden_states=lm_output.hidden_states,
+            mtp_per_depth_h=mtp_per_depth_h,
+            mtp_loss_scaling_factor=(self.mtp_config.loss_scaling_factor if mtp_per_depth_h is not None else None),
+        )
+
+    @torch.no_grad()
+    def initialize_weights(
+        self,
+        buffer_device: torch.device | None = None,
+        dtype: torch.dtype = torch.bfloat16,
+    ) -> None:
+        buffer_device = buffer_device or _default_init_device()
+        self.model.init_weights(buffer_device=buffer_device)
+        final_out_std = self.config.hidden_size**-0.5
+        cutoff_factor = 3
+        with buffer_device:
+            if self.lm_head is not None:
+                nn.init.trunc_normal_(
+                    self.lm_head.weight,
+                    mean=0.0,
+                    std=final_out_std,
+                    a=-cutoff_factor * final_out_std,
+                    b=cutoff_factor * final_out_std,
+                )
+            if self.mtp is not None:
+                for sublayer in self.mtp.layers:
+                    sublayer.init_weights(buffer_device=buffer_device)
+            self.model.rotary_emb.device = buffer_device
+        cast_model_to_dtype(self, dtype, skip_modules=("_fp32_params",))
+
+
+# ---------------------------------------------------------------------------
 # Top-level conditional generation model
 # ---------------------------------------------------------------------------
 class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForConditionalGeneration, MoEFSDPSyncMixin):
@@ -755,6 +1017,8 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
     """
 
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
+
+    _keep_in_fp32_modules_strict = ["_fp32_params"]
 
     # forward() pulls per-microbatch pixel_values from _vlm_pixel_values_chunks;
     # patch_hf_model_for_pp must not replace it under PP.

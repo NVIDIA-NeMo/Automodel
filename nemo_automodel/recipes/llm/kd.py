@@ -58,11 +58,13 @@ from nemo_automodel.components.loggers.metric_logger import MetricsSample
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.loss.utils import calculate_loss
 from nemo_automodel.components.optim.precision_warnings import resolve_storage_dtype
+from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
 from nemo_automodel.components.training.rng import ScopedRNG
 from nemo_automodel.components.training.signal_handler import DistributedSignalHandler
 from nemo_automodel.components.training.utils import (
     ScopedModuleOffloading,
     count_tail_padding,
+    get_expert_tp_replication_factor,
     prepare_after_first_microbatch,
     prepare_for_final_backward,
     prepare_for_grad_accumulation,
@@ -640,11 +642,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
 
             # Student forward.
             student_batch = filter_forward_kwargs(model, batch)
-            student_keep_last = isinstance(self.loss_fn, FusedLinearCrossEntropy)
-            if student_keep_last:
-                student_out = model(logits_to_keep=1, **student_batch)
-            else:
-                student_out = model(**student_batch)
+            student_out = model(**student_batch)
 
             student_logits = getattr(student_out, "logits", student_out)  # shape (B, S, V)
             if separate_teacher_logits is not None:
@@ -659,7 +657,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                     logits=student_logits,
                     labels=labels,
                     model=model,
-                    hidden_states=student_out.hidden_states[-1] if "hidden_states" in student_out else None,
+                    hidden_states=get_final_hidden_states(student_out),
                     num_label_tokens=num_label_tokens,
                 )
 
@@ -797,6 +795,8 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         )
         num_label_tokens = self._dp_allreduce(num_label_tokens).item()
         loss_buffer = []
+        num_batches = len(batches)
+        self._set_moe_aux_loss_backward_scale(num_batches=num_batches, num_label_tokens=num_label_tokens)
 
         # number of tokens in the batch, excluding any tail padding.
         num_tokens_in_batch = torch.tensor(
@@ -804,7 +804,6 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             dtype=torch.long,
         )
         num_tokens_in_batch = self._dp_allreduce(num_tokens_in_batch).item()
-        num_batches = len(batches)
         for i, batch in enumerate(batches):
             local_loss, kd_loss, ce_loss = self._forward_backward_step(
                 i, batch, num_label_tokens=num_label_tokens, num_batches=num_batches
@@ -813,19 +812,20 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             self._ce_loss_buffer.append(ce_loss)
             self._kd_loss_buffer.append(kd_loss)
 
-        grad_norm = 0
-        # Clip gradients **after** any rescaling.
-        # TODO(@boxiangw): Fix TP gradient clipping
-        if max_grad_norm is not None:
-            if not self.device_mesh or self.device_mesh["tp"].size() == 1:
-                grad_norm = torch.nn.utils.clip_grad_norm_(
-                    [p for p in self.model_parts[0].parameters() if p.requires_grad], max_grad_norm
-                )
-                if hasattr(grad_norm, "full_tensor"):
-                    grad_norm = grad_norm.full_tensor()  # collect the summed grad norm across ranks
-
-            if isinstance(grad_norm, torch.Tensor):
-                grad_norm = grad_norm.item()
+        grad_norm = scale_grads_and_clip_grad_norm(
+            max_grad_norm,
+            self.model_parts,
+            norm_type=2.0,
+            pp_enabled=False,
+            device_mesh=self.device_mesh,
+            moe_mesh=self.moe_mesh,
+            ep_axis_name="ep" if self.moe_mesh is not None and "ep" in self.moe_mesh.mesh_dim_names else None,
+            pp_axis_name=None,
+            foreach=True,
+            num_label_tokens=num_label_tokens,
+            dp_group_size=self._get_dp_group_size(include_cp=True),
+            expert_tp_replication_factor=get_expert_tp_replication_factor(self.model_parts, self.device_mesh),
+        )
 
         self.checkpointer.maybe_wait_for_staging()
         for opt in self.optimizer:
@@ -893,6 +893,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         )
         num_tokens_in_batch = self._dp_allreduce(num_tokens_in_batch).item()
         num_batches = len(batches)
+        self._set_moe_aux_loss_backward_scale(num_batches=num_batches, num_label_tokens=num_label_tokens)
 
         prepare_for_grad_accumulation(self.model_parts, pp_enabled=True)
 
@@ -921,6 +922,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             foreach=True,
             num_label_tokens=num_label_tokens,
             dp_group_size=self._get_dp_group_size(include_cp=True),
+            expert_tp_replication_factor=get_expert_tp_replication_factor(self.model_parts, self.device_mesh),
         )
 
         self.checkpointer.maybe_wait_for_staging()
