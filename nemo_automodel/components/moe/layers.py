@@ -839,8 +839,8 @@ class MoE(nn.Module):
         Args:
             x: Input tensor of shape ``[..., hidden]``.
             padding_mask: Boolean tensor matching ``x.shape[:-1]`` where true
-                entries are padding. MoK compacts valid tokens before dispatch
-                and restores the original token layout afterward.
+                entries are padding. A two-dimensional ``x`` is a packed THD
+                tensor whose padding, when present, must be one contiguous tail.
             cp_mesh: Optional context-parallel mesh used by the router.
 
         Returns:
@@ -851,6 +851,7 @@ class MoE(nn.Module):
 
         # Reshape the inputs to 2-D since we are just distributing tokens.
         shape = x.size()
+        is_packed_thd = x.dim() == 2
         x = x.view(-1, self.dim)
         if padding_mask is not None:
             token_mask = (~padding_mask).flatten()
@@ -870,39 +871,68 @@ class MoE(nn.Module):
                 raise RuntimeError("dispatcher='mok' requires a gated shared SwiGLU expert")
 
             # MoK's fused schedule requires the same number of dense token rows
-            # on every EP rank, with at least 512 rows aligned to 256. Packed THD
-            # batches still have an equal padded extent on all ranks, but padding
-            # must not be routed or counted by the correction-bias/load metrics.
-            # Run the gate on the original dense extent, matching the reference
-            # dispatcher exactly, then compact valid rows before MoK dispatch.
-            # Running the router on a variable compacted extent can select a
-            # different GEMM algorithm and perturb close group-top-k decisions.
-            # Zero-pad only the MoK dispatch inputs, discard dummy outputs, and
-            # scatter valid rows back into the original layout. Dummy router
-            # weights are zero, so alignment rows contribute neither activations
-            # nor gradients. The common padded sequence extent preserves MoK's
-            # equal-token contract when EP ranks consume different examples.
+            # on every EP rank, with at least 512 rows aligned to 256. Run the
+            # gate on the original dense extent so close group-top-k decisions
+            # match the reference dispatcher, then replace semantic padding with
+            # MoK structural dummy rows whose activations and router weights are
+            # zero. The common padded extent preserves MoK's equal-token contract
+            # when EP ranks consume different examples.
             if padding_mask is not None:
-                valid_positions = token_mask.nonzero(as_tuple=False).flatten()
-                expert_x = x_latent.index_select(0, valid_positions)
+                if is_packed_thd:
+                    # Packed THD rows are [all real tokens][tail padding]. The
+                    # asynchronous device assertion avoids a host sync in every
+                    # MoE layer while rejecting padding between sequences.
+                    packed_padding_mask = padding_mask.flatten()
+                    if packed_padding_mask.numel() > 1:
+                        has_interior_padding = (packed_padding_mask[:-1] & ~packed_padding_mask[1:]).any()
+                        torch._assert_async(
+                            ~has_interior_padding,
+                            "MoK packed THD inputs require all padding to form one contiguous tail",
+                        )
+
                 weights, indices, aux_loss = self.gate(x, token_mask, cp_mesh)
-                weights = weights.index_select(0, valid_positions)
-                indices = indices.index_select(0, valid_positions)
-                num_valid_tokens = valid_positions.numel()
-                # EP ranks consume different packed examples, so their valid
-                # counts need not match. The padded input extent does match;
-                # use its aligned size as the common dispatch shape instead
-                # of deriving a different shape from each rank's valid count.
                 num_dispatch_tokens = max(512, ((x.size(0) + 255) // 256) * 256)
-                num_dummy_tokens = num_dispatch_tokens - num_valid_tokens
-                if num_dummy_tokens:
-                    expert_x = torch.cat((expert_x, expert_x.new_zeros((num_dummy_tokens, expert_x.size(1)))), dim=0)
-                    weights = torch.cat((weights, weights.new_zeros((num_dummy_tokens, weights.size(1)))), dim=0)
+                if is_packed_thd:
+                    # Keep the already-contiguous real prefix in place and
+                    # rewrite semantic padding as MoK structural dummies.
+                    padding_rows = packed_padding_mask.unsqueeze(-1)
+                    expert_x = x_latent.masked_fill(padding_rows, 0)
+                    weights = weights.masked_fill(padding_rows, 0)
+                    num_alignment_tokens = num_dispatch_tokens - x.size(0)
+                    if num_alignment_tokens:
+                        expert_x = F.pad(expert_x, (0, 0, 0, num_alignment_tokens))
+                        weights = F.pad(weights, (0, 0, 0, num_alignment_tokens))
+                        indices = F.pad(indices, (0, 0, 0, num_alignment_tokens))
+                        dispatch_padding_mask = F.pad(packed_padding_mask, (0, num_alignment_tokens), value=True)
+                    else:
+                        dispatch_padding_mask = packed_padding_mask
+                    # Dense-row ordinals give structural dummies legal, evenly
+                    # distributed expert IDs without counting valid rows.
                     dummy_indices = torch.arange(
-                        num_dummy_tokens * indices.size(1), device=indices.device, dtype=indices.dtype
-                    ).view(num_dummy_tokens, indices.size(1))
+                        num_dispatch_tokens * indices.size(1), device=indices.device, dtype=indices.dtype
+                    ).view(num_dispatch_tokens, indices.size(1))
                     dummy_indices = dummy_indices.remainder(self.n_routed_experts)
-                    indices = torch.cat((indices, dummy_indices), dim=0)
+                    indices = torch.where(dispatch_padding_mask.unsqueeze(-1), dummy_indices, indices)
+                else:
+                    # Unpacked batches can contain one padding tail per batch row,
+                    # which becomes non-contiguous after flattening. Preserve the
+                    # general gather/scatter path for that layout.
+                    valid_positions = token_mask.nonzero(as_tuple=False).flatten()
+                    expert_x = x_latent.index_select(0, valid_positions)
+                    weights = weights.index_select(0, valid_positions)
+                    indices = indices.index_select(0, valid_positions)
+                    num_valid_tokens = valid_positions.numel()
+                    num_dummy_tokens = num_dispatch_tokens - num_valid_tokens
+                    if num_dummy_tokens:
+                        expert_x = torch.cat(
+                            (expert_x, expert_x.new_zeros((num_dummy_tokens, expert_x.size(1)))), dim=0
+                        )
+                        weights = torch.cat((weights, weights.new_zeros((num_dummy_tokens, weights.size(1)))), dim=0)
+                        dummy_indices = torch.arange(
+                            num_dummy_tokens * indices.size(1), device=indices.device, dtype=indices.dtype
+                        ).view(num_dummy_tokens, indices.size(1))
+                        dummy_indices = dummy_indices.remainder(self.n_routed_experts)
+                        indices = torch.cat((indices, dummy_indices), dim=0)
                 dispatch_mask = torch.ones(num_dispatch_tokens, dtype=torch.bool, device=x.device)
                 dispatch_y = self.experts(
                     expert_x,
@@ -913,8 +943,11 @@ class MoE(nn.Module):
                     self.shared_experts.up_proj.weight,
                     self.shared_experts.down_proj.weight,
                 )
-                valid_y = dispatch_y[:num_valid_tokens]
-                y = x.new_zeros((x.size(0), self.dim)).index_copy(0, valid_positions, valid_y)
+                if is_packed_thd:
+                    y = dispatch_y[: x.size(0)].masked_fill(padding_rows, 0)
+                else:
+                    valid_y = dispatch_y[:num_valid_tokens]
+                    y = x.new_zeros((x.size(0), self.dim)).index_copy(0, valid_positions, valid_y)
             else:
                 weights, indices, aux_loss = self.gate(x, token_mask, cp_mesh)
                 y = self.experts(
