@@ -555,16 +555,37 @@ class GroupedExpertsMoK(nn.Module):
         )
 
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
-        """Initialize MoK-native expert weights.
+        """Initialize MoK-native weights from the canonical expert layout.
+
+        Draw random values in the same tensor shapes and order as
+        :class:`GroupedExperts` before transposing them into MoK's native
+        layouts.  Otherwise switching only the dispatcher changes a
+        random-initialized model even when every process uses the same seed.
 
         Args:
             buffer_device: Device on which initialization kernels execute.
             init_std: Standard deviation of the normal weight initialization.
         """
         with torch.device(buffer_device):
-            _local_tensor(self.routed_gate_weights).normal_(mean=0.0, std=init_std)
-            _local_tensor(self.routed_up_weights).normal_(mean=0.0, std=init_std)
-            _local_tensor(self.routed_down_weights).normal_(mean=0.0, std=init_std)
+            routed_gate = _local_tensor(self.routed_gate_weights)
+            routed_up = _local_tensor(self.routed_up_weights)
+            routed_down = _local_tensor(self.routed_down_weights)
+            inter_dim = self.config.moe_inter_dim
+
+            # GroupedExperts draws one contiguous [gate | up] tensor.  Preserve
+            # that RNG stream and semantic layout, then copy into the two
+            # contiguous tensors consumed by MoK.
+            canonical_gate_up = routed_gate.new_empty((routed_gate.size(0), self.config.dim, 2 * inter_dim))
+            canonical_gate_up.normal_(mean=0.0, std=init_std)
+            routed_gate.copy_(canonical_gate_up[..., :inter_dim].transpose(-1, -2))
+            routed_up.copy_(canonical_gate_up[..., inter_dim:].transpose(-1, -2))
+            del canonical_gate_up
+
+            # GroupedExperts draws down projection weights immediately after
+            # the combined tensor, in [expert, intermediate, hidden] order.
+            canonical_down = routed_down.new_empty((routed_down.size(0), inter_dim, self.config.dim))
+            canonical_down.normal_(mean=0.0, std=init_std)
+            routed_down.copy_(canonical_down.transpose(-1, -2))
 
     def _save_to_state_dict(
         self,

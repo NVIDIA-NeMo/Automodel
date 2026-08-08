@@ -23,6 +23,7 @@ from torch.utils.checkpoint import checkpoint
 from nemo_automodel.components.models.common import BackendConfig, MoKBackendConfig
 from nemo_automodel.components.moe import mok_experts
 from nemo_automodel.components.moe.config import MoEConfig
+from nemo_automodel.components.moe.experts import GroupedExperts
 from nemo_automodel.components.moe.layers import MoE
 from nemo_automodel.components.moe.mok_experts import GroupedExpertsMoK
 
@@ -147,6 +148,25 @@ def test_mok_state_dict_preserves_combined_expert_layout() -> None:
     torch.testing.assert_close(restored.routed_gate_weights, source.routed_gate_weights)
     torch.testing.assert_close(restored.routed_up_weights, source.routed_up_weights)
     torch.testing.assert_close(restored.routed_down_weights, source.routed_down_weights)
+
+
+def test_mok_random_init_matches_canonical_grouped_expert_layout() -> None:
+    """A dispatcher switch must not change random-init model weights."""
+    config = _valid_moe_config()
+
+    torch.manual_seed(1234)
+    reference = GroupedExperts(config)
+    with torch.no_grad():
+        reference.init_weights(torch.device("cpu"))
+
+    torch.manual_seed(1234)
+    mok = GroupedExpertsMoK(config, BackendConfig(dispatcher="mok"))
+    with torch.no_grad():
+        mok.init_weights(torch.device("cpu"))
+
+    mok_state = mok.state_dict()
+    torch.testing.assert_close(mok_state["gate_and_up_projs"], reference.gate_and_up_projs, rtol=0, atol=0)
+    torch.testing.assert_close(mok_state["down_projs"], reference.down_projs, rtol=0, atol=0)
 
 
 def test_mok_state_dict_loads_virtual_expert_keys_independently() -> None:
