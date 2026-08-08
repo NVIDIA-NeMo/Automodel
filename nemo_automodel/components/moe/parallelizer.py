@@ -28,16 +28,19 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import fully_shard
 from torch.distributed.fsdp._fully_shard import MixedPrecisionPolicy, OffloadPolicy
-from torch.distributed.tensor import Shard, distribute_module, distribute_tensor
+from torch.distributed.tensor import Replicate, Shard, distribute_module, distribute_tensor
 from torch.distributed.tensor.parallel import ParallelStyle, parallelize_module
 from torch.utils.checkpoint import CheckpointPolicy, create_selective_checkpoint_contexts
 
+from nemo_automodel.components.distributed import parallelizer_utils
 from nemo_automodel.components.distributed.pipelining.hf_utils import get_text_module
 from nemo_automodel.components.moe.experts import GroupedExpertsDeepEP, GroupedExpertsTE
 from nemo_automodel.components.moe.layers import (
+    Gate,
     MoE,
 )
 from nemo_automodel.components.moe.tp_plan_validation import _validate_moe_tp_plan
+from nemo_automodel.shared.model_utils import iter_transformer_and_mtp_blocks
 from nemo_automodel.shared.multimodal_fsdp import (
     MULTIMODAL_TOWER_NAMES,
     FrozenMultimodalSharding,
@@ -97,22 +100,6 @@ def _get_cp_stream() -> torch.cuda.Stream:
     if _CP_STREAM is None:
         _CP_STREAM = torch.cuda.Stream()
     return _CP_STREAM
-
-
-def _iter_transformer_and_mtp_blocks(model: nn.Module):
-    inner = model.model if hasattr(model, "model") and model.model is not None else model
-    text_model = get_text_module(inner)
-
-    layers = getattr(text_model, "layers", None)
-    if layers is not None:
-        for layer_id, block in layers.named_children():
-            yield layers, layer_id, block
-
-    mtp = getattr(model, "mtp", None)
-    mtp_layers = getattr(mtp, "layers", None)
-    if mtp_layers is not None:
-        for layer_id, block in mtp_layers.named_children():
-            yield mtp_layers, layer_id, block
 
 
 def _get_moe_module(block: nn.Module) -> MoE | None:
@@ -361,7 +348,7 @@ def _apply_multimodal_tower_ac(model: nn.Module, scopes: tuple[str, ...]) -> Non
     """Checkpoint trainable multimodal (vision/audio) tower blocks on the expert-parallel path.
 
     ``apply_ac`` iterates only the text/MTP decoder stack
-    (``_iter_transformer_and_mtp_blocks``), and the generic FSDP2 scope
+    (``iter_transformer_and_mtp_blocks``), and the generic FSDP2 scope
     handling does not run for expert-parallel configs, so a trainable vision
     tower would otherwise keep every activation. Reuses the per-model
     layer-group mapping from the dense parallelizer and applies the same
@@ -479,14 +466,19 @@ def apply_ac(
             from nemo_automodel.components.distributed.activation_checkpointing import (
                 SELECTIVE_AC_WRAPPER_FLAG,
                 make_selective_checkpoint_context_fn,
+                transformer_engine_attention_backend_snapshot_context_fn,
             )
 
             selective_context_fn = make_selective_checkpoint_context_fn()
-            for parent_layers, layer_id, block in _iter_transformer_and_mtp_blocks(model):
+            attention_context_fn = functools.partial(
+                transformer_engine_attention_backend_snapshot_context_fn,
+                selective_context_fn,
+            )
+            for parent_layers, layer_id, block in iter_transformer_and_mtp_blocks(model):
                 block = ptd_checkpoint_wrapper(
                     block,
                     preserve_rng_state=True,
-                    context_fn=_preserve_gate_load_during_recompute(block, selective_context_fn),
+                    context_fn=_preserve_gate_load_during_recompute(block, attention_context_fn),
                 )
                 # Tag so _apply_per_layer_compile compiles the wrapper OUTER (keeping the
                 # selective policy visible to the partitioner) instead of unwrapping and
@@ -553,9 +545,17 @@ def apply_ac(
     def selective_checkpointing_context_fn():
         return create_selective_checkpoint_contexts(_custom_policy)
 
-    from nemo_automodel.components.distributed.activation_checkpointing import ensure_profiler_ops_sac_ignored
+    from nemo_automodel.components.distributed.activation_checkpointing import (
+        ensure_fsdp_ops_sac_ignored,
+        ensure_profiler_ops_sac_ignored,
+        transformer_engine_attention_backend_snapshot_context_fn,
+    )
 
     ensure_profiler_ops_sac_ignored()
+    ensure_fsdp_ops_sac_ignored()
+
+    def _with_attention_backend_snapshot(context_fn=None):
+        return functools.partial(transformer_engine_attention_backend_snapshot_context_fn, context_fn)
 
     # Weight-tied (use_repeated_layer) MTP head blocks must NOT be activation
     # checkpointed: the single physical block is recomputed once per MTP depth in
@@ -575,63 +575,28 @@ def apply_ac(
     if mtp_repeated and mtp_block_ids:
         logger.info("Skipping activation checkpointing on %d weight-tied MTP head block(s)", len(mtp_block_ids))
 
-    for parent_layers, layer_id, block in _iter_transformer_and_mtp_blocks(model):
+    for parent_layers, layer_id, block in iter_transformer_and_mtp_blocks(model):
         if mtp_repeated and id(block) in mtp_block_ids:
             continue
         if ignore_router:
             block = ptd_checkpoint_wrapper(
                 block,
                 preserve_rng_state=True,
-                context_fn=_preserve_gate_load_during_recompute(block, selective_checkpointing_context_fn),
+                context_fn=_preserve_gate_load_during_recompute(
+                    block,
+                    _with_attention_backend_snapshot(selective_checkpointing_context_fn),
+                ),
             )
         else:
             block = ptd_checkpoint_wrapper(
                 block,
                 preserve_rng_state=True,
-                context_fn=_preserve_gate_load_during_recompute(block),
+                context_fn=_preserve_gate_load_during_recompute(block, _with_attention_backend_snapshot()),
             )
 
         parent_layers.register_module(layer_id, block)
 
     _apply_multimodal_tower_ac(model, scopes)
-
-
-def _shard_fp32_param_holders(block, fsdp_mesh, reshard_after_forward, offload_policy):
-    """Shard each ``_fp32_params`` holder in ``block`` as its own fp32 FSDP unit.
-
-    Model implementations own the architecture-specific decision to create these
-    holders (for example Qwen3.5/Qwen3-Next GatedDeltaNet ``A_log``/``dt_bias``).
-    FSDP only treats the holder as a dtype-uniform fp32 unit and excludes its params
-    from the block's bf16 FSDP unit.
-
-    Returns the set of holder parameters to exclude from the block's FSDP wrap.
-    Blocks that do not expose ``named_modules`` (e.g. non-``nn.Module`` test
-    stubs) cannot hold fp32 holders, so an empty set is returned.
-    """
-    if not hasattr(block, "named_modules"):
-        return set()
-    fp32_mp_policy = MixedPrecisionPolicy(
-        param_dtype=torch.float32,
-        reduce_dtype=torch.float32,
-        output_dtype=torch.float32,
-        cast_forward_inputs=False,
-    )
-    ignored: set = set()
-    for name, sub in block.named_modules():
-        if not name.endswith("_fp32_params"):
-            continue
-        holder_params = list(sub.parameters(recurse=False))
-        if not holder_params:
-            continue
-        fully_shard(
-            sub,
-            mesh=fsdp_mesh,
-            reshard_after_forward=reshard_after_forward,
-            mp_policy=fp32_mp_policy,
-            offload_policy=offload_policy,
-        )
-        ignored.update(holder_params)
-    return ignored
 
 
 def apply_fsdp(
@@ -664,6 +629,7 @@ def apply_fsdp(
             output_dtype=torch.bfloat16,
             cast_forward_inputs=True,
         )
+    fp32_compute_module_names = tuple(getattr(model, "_keep_in_fp32_modules_strict", None) or ())
 
     fully_shard_impl = fully_shard
     if _is_deepseek_v4_model(model):
@@ -733,6 +699,16 @@ def apply_fsdp(
 
     for block in _iter_moe_blocks(model, _model):
         moe_module = _get_moe_module(block)
+        gate = getattr(moe_module, "gate", None)
+        if isinstance(gate, Gate) and gate.e_score_correction_bias is not None:
+            # FSDP2 does not convert buffers to DTensors. Replicate the routing
+            # bias over the full DP/CP mesh so its existing Partial-to-Replicate
+            # update path aggregates every rank's expert load.
+            gate.e_score_correction_bias = distribute_tensor(
+                gate.e_score_correction_bias,
+                device_mesh=fsdp_mesh,
+                placements=[Replicate()] * fsdp_mesh.ndim,
+            )
         experts_reshard_after_forward = False if id(block) in mtp_block_ids else reshard_after_forward
         if isinstance(moe_module, MoE) and ep_shard_enabled:
             # Apply FSDP on dim=1 for grouped experts since we may have more
@@ -759,12 +735,18 @@ def apply_fsdp(
         if isinstance(moe_module, MoE) and ep_enabled:
             ignored_params = set(moe_module.experts.parameters())
 
-        # Shard model-owned fp32 holders on their own and exclude their params from
-        # the block's FSDP unit to keep the block dtype-uniform.
-        fp32_ignored = _shard_fp32_param_holders(block, fsdp_mesh, reshard_after_forward, offload_policy)
-        if fp32_ignored:
-            ignored_params = (ignored_params or set()) | fp32_ignored
-        fully_shard_default(block, ignored_params=ignored_params)
+        # Reuse the dense dtype-aware path for model-owned fp32 contracts while
+        # leaving EP-owned experts out of the block's dtype and FSDP ownership.
+        parallelizer_utils.fully_shard_by_dtype(
+            block,
+            mesh=fsdp_mesh,
+            mp_policy=mp_policy,
+            offload_policy=offload_policy,
+            fp32_compute_module_names=fp32_compute_module_names,
+            reshard_after_forward=reshard_after_forward,
+            ignored_params=ignored_params,
+            fully_shard_fn=fully_shard_impl,
+        )
 
     # Re-establish weight tying before detecting it: a device/dtype move during
     # from_pretrained (HF replaces param tensors) can silently break a tie set in
@@ -785,6 +767,7 @@ def apply_fsdp(
             _out.weight = _inp.weight
 
     embed_tokens = getattr(_model, "embed_tokens", None)
+    embed_norm = getattr(_model, "embed_norm", None)
     inner_lm_head = getattr(_model, "lm_head", None)
     outer_lm_head = getattr(model, "lm_head", None) if model is not _model else None
     lm_head = inner_lm_head or outer_lm_head
@@ -793,6 +776,10 @@ def apply_fsdp(
 
     if embed_tokens is not None and not tied_input_output_embeddings:
         fully_shard_default(embed_tokens)
+
+    # The outer VLM forward calls embed_norm before the text FSDP root.
+    if embed_norm is not None:
+        fully_shard_default(embed_norm)
 
     if lm_head is not None and not tied_input_output_embeddings:
         # Use custom mixed precision policy for lm_head if lm_head_precision is specified
@@ -895,7 +882,7 @@ def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p
     #     M3's block-sparse DSA) -> installs its own CP attention + mask handling
     #     (model-owned, like TE/DSV4).
     # Any other (non-TE, non-model-owned) attention is not supported under CP here.
-    for _parent, _layer_id, block in _iter_transformer_and_mtp_blocks(model):
+    for _parent, _layer_id, block in iter_transformer_and_mtp_blocks(model):
         layer_type = getattr(block, "layer_type", getattr(block, "attention_type", "full_attention"))
 
         if layer_type in ("full_attention", "sliding_attention"):

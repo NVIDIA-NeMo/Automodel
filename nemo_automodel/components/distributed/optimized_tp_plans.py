@@ -758,6 +758,7 @@ PARALLELIZE_FUNCTIONS: Dict[str, Callable[..., Dict[str, ParallelStyle]]] = {
     _get_class_qualname(CustomQwen3ForCausalLM): _parallelize_qwen,
     # trust_remote_code models — matched by bare class __name__ in parallelizer
     # because their qualname includes a snapshot-hash-bearing module path.
+    "NemotronFlashForCausalLM": _parallelize_llama,
     "DeciLMForCausalLM": _parallelize_decilm_nemotron,
     "NemotronLabsDiffusionModel": _parallelize_nemotron_labs_diffusion,
 }

@@ -45,6 +45,8 @@ tokenizer:
   _target_: nemo_automodel.NeMoAutoTokenizer.from_pretrained
   pretrained_model_name_or_path: baichuan-inc/Baichuan2-7B-Chat
   trust_remote_code: true
+  add_bos_token: true
+  add_eos_token: true
 
 checkpoint:
   enabled: true
@@ -117,7 +119,7 @@ ci:
     distributed.tp_size: 2
     cross_tp_size: 2
     cross_tp_kl_threshold: 1e-2
-    resume_loss_threshold: 5e-2
+    training_reproducibility_loss_threshold: 5e-2
     tokenizer_name: baichuan-inc/Baichuan2-7B-Chat
     dataset.limit_dataset_samples: 500
     validation_dataset.limit_dataset_samples: 500

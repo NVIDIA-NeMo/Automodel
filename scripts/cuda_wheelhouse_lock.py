@@ -47,6 +47,7 @@ class LockedInputs(TypedDict):
     build_tools: list[str]
     constraints: list[str]
     torch: str
+    torchvision: str
     wheels: list[str]
 
 
@@ -116,6 +117,7 @@ def load_locked_inputs(
         "sys_platform": sys_platform,
     }
     torch_package = _select_package(packages, "torch", registry=torch_index, **selection_args)
+    torchvision_package = _select_package(packages, "torchvision", registry=torch_index, **selection_args)
 
     wheel_packages = {name: _select_package(packages, name, **selection_args) for name in _WHEEL_REQUIREMENTS}
     wheels = [
@@ -137,12 +139,14 @@ def load_locked_inputs(
     }
     constraints = list(build_tools)
     constraints.append(_locked_requirement(torch_package))
+    constraints.append(_locked_requirement(torchvision_package))
     constraints.extend(_locked_requirement(runtime_packages[name]) for name in sorted(runtime_packages))
 
     return {
         "build_tools": sorted(build_tools),
         "constraints": sorted(constraints),
         "torch": _locked_requirement(torch_package),
+        "torchvision": _locked_requirement(torchvision_package),
         "wheels": wheels,
     }
 
@@ -183,7 +187,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--output",
-        choices=("build-tools", "constraints", "fingerprint", "manifest", "torch", "wheels"),
+        choices=("build-tools", "constraints", "fingerprint", "manifest", "torch", "torchvision", "wheels"),
         required=True,
     )
     parser.add_argument("--lock", type=Path, default=Path("uv.lock"))
@@ -213,6 +217,8 @@ def main() -> None:
         print(json.dumps(locked_inputs, sort_keys=True, separators=(",", ":")))
     elif args.output == "torch":
         print(locked_inputs["torch"])
+    elif args.output == "torchvision":
+        print(locked_inputs["torchvision"])
     elif args.output == "wheels":
         _print_lines(locked_inputs["wheels"])
     elif args.output == "build-tools":
