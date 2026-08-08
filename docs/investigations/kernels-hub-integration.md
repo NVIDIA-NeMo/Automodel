@@ -431,10 +431,10 @@ RUN uv pip install "kernels>=0.11.0" \
 
 ## Recommended Next Steps
 
-1. **Phase 0 spike** — run one L0 finetune on branch with `kernels` installed, no `flash-attn` pip, `attn_implementation=kernels-community/flash-attn2`.
-2. **Phase 1 PR** — hub-aware availability checks + kwargs passthrough (minimal, backward compatible).
-3. **Decision point** — after EAGLE ring-attn parity test, decide whether speculative stays on compiled FA permanently.
-4. **Container experiment** — build image without `flash-attn` source compile, Hub-only FA2; measure build time and runtime parity.
+1. **Phase 0 spike:** run one L0 finetune on branch with `kernels` installed, no `flash-attn` pip, `attn_implementation=kernels-community/flash-attn2`.
+2. **Phase 1 PR:** hub-aware availability checks and kwargs passthrough (minimal, backward compatible).
+3. **Decision point:** after EAGLE ring-attn parity test, decide whether speculative stays on compiled FA permanently.
+4. **Container experiment:** build image without `flash-attn` source compile, Hub-only FA2; measure build time and runtime parity.
 
 ---
 
