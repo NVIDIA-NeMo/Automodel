@@ -339,6 +339,15 @@ class HybridDiffusionLLMLoss(nn.Module):
         return DLLMLossOutput(total_loss=total_loss, dllm_loss=(self.alpha * dllm_loss).detach())
 
 
+_DFLASH_LOSS_TYPES = {
+    "dflash",
+    "dpace",
+    "dpace-cumulative-confidence-only",
+    "dpace-continuation-value-only",
+}
+_DPACE_LOSS_TYPES = _DFLASH_LOSS_TYPES - {"dflash"}
+
+
 class DFlashDecayLoss(nn.Module):
     """Position-decay cross-entropy loss for DFlash draft model training.
 
@@ -379,13 +388,17 @@ class DFlashDecayLoss(nn.Module):
             The chunked path is plain autograd, so FSDP2 handles it correctly.
         chunk_size: Number of predicted positions per chunk in the chunked
             linear-CE path. Smaller = lower peak memory, more recompute.
-        normalize: Loss denominator. ``"tokens"`` (default) divides the
-            decay-weighted sum by ``num_tokens``, a global all-reduced count
-            that keeps the loss consistent across DP replicas and grad-accum.
-            ``"mean"`` divides by the effective weight sum
-            ``(w_k * block_mask).sum()`` for a per-call decay-weighted mean.
-        loss_gamma: Decay parameter γ. ``None`` disables decay (all predicted
-            positions weighted equally).
+        normalize: Loss denominator. ``"tokens"`` (default) divides the weighted
+            sum by ``num_tokens``, a global all-reduced count that keeps the loss
+            consistent across DP replicas and grad-accum. ``"mean"`` divides by
+            the effective weight sum ``(w_k * block_mask).sum()`` for dflash, and
+            by the batch size for D-PACE -- whose weights carry the objective's
+            signal, so a weight-sum denominator would cancel it (and, being
+            per-rank, would bias the DP gradient average).
+        loss_type: Loss variant. ``"dflash"`` keeps the original decay-weighted
+            cross entropy. The ``"dpace*"`` variants use detached Dynamic
+            Position-Aware Cross-Entropy weights (D-PACE, arXiv:2605.18810).
+        dpace_alpha: Smoothing alpha for D-PACE confidence products.
     """
 
     def __init__(
@@ -394,14 +407,22 @@ class DFlashDecayLoss(nn.Module):
         use_fused_linear_ce: bool = False,
         chunk_size: int = 1024,
         normalize: str = "tokens",
+        loss_type: str = "dflash",
+        dpace_alpha: float = 0.5,
     ):
         super().__init__()
         if normalize not in ("tokens", "mean"):
             raise ValueError(f"normalize must be 'tokens' or 'mean', got {normalize!r}")
+        if loss_type not in _DFLASH_LOSS_TYPES:
+            raise ValueError(f"loss_type must be one of {sorted(_DFLASH_LOSS_TYPES)}, got {loss_type!r}")
+        if not 0.0 <= dpace_alpha <= 1.0:
+            raise ValueError(f"dpace_alpha must be in [0, 1], got {dpace_alpha}")
         self.loss_gamma = None if loss_gamma is None else float(loss_gamma)
         self.use_fused_linear_ce = bool(use_fused_linear_ce)
         self.chunk_size = int(chunk_size)
         self.normalize = normalize
+        self.loss_type = loss_type
+        self.dpace_alpha = float(dpace_alpha)
 
     def _decay_weights(self, T: int, block_size: Optional[int], device, dtype) -> torch.Tensor:
         """Eq. 4 weights for ``T`` predicted positions, resetting per block.
@@ -417,6 +438,31 @@ class DFlashDecayLoss(nn.Module):
             return w_single.repeat(n_blocks)
         return torch.exp(-torch.arange(T, device=device, dtype=dtype) / self.loss_gamma)
 
+    def _dpace_weight(
+        self,
+        prob: torch.Tensor,
+        binary_mask: torch.Tensor,
+        binary_mask_bool: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute detached D-PACE position weights."""
+        smooth = (1.0 - self.dpace_alpha) * prob + self.dpace_alpha
+        smooth = torch.where(binary_mask_bool, smooth, torch.ones_like(smooth))
+        prefix = torch.cumprod(smooth, dim=-1)
+
+        if self.loss_type == "dpace-cumulative-confidence-only":
+            return prefix
+
+        suffix = torch.flip(
+            torch.cumsum(torch.flip(prefix * binary_mask, dims=[-1]), dim=-1),
+            dims=[-1],
+        )
+
+        if self.loss_type == "dpace":
+            return suffix
+        if self.loss_type == "dpace-continuation-value-only":
+            return suffix / prefix.clamp_min(torch.finfo(prefix.dtype).tiny)
+        raise ValueError(f"unknown D-PACE loss_type {self.loss_type!r}")
+
     def _reduce(
         self,
         token_nll: torch.Tensor,
@@ -426,13 +472,55 @@ class DFlashDecayLoss(nn.Module):
         draft_correct_per_pos: Optional[torch.Tensor] = None,
         draft_count_per_pos: Optional[torch.Tensor] = None,
     ) -> DLLMLossOutput:
-        """Apply decay weights + block mask, sum, and normalise."""
+        """Build per-position weights, then sum and normalise.
+
+        ``loss_type`` selects the weights (decay for ``"dflash"``, detached D-PACE
+        confidence for the ``"dpace*"`` variants). ``normalize`` / ``num_tokens``
+        select the denominator, which is always data-independent for D-PACE (the
+        global ``num_tokens``, or the batch size) so the DP gradient average stays
+        exact and the objective's weight magnitudes are preserved.
+        """
         _, T = token_nll.shape
-        w = self._decay_weights(T, block_size, token_nll.device, token_nll.dtype)
-        weights = w.unsqueeze(0) * block_mask.to(token_nll.dtype)  # [B, T]
+        block_mask = block_mask.to(token_nll.dtype)
+        if self.loss_type == "dflash":
+            w = self._decay_weights(T, block_size, token_nll.device, token_nll.dtype)
+            weights = w.unsqueeze(0) * block_mask  # [B, T]
+        elif self.loss_type in _DPACE_LOSS_TYPES:
+            dpace_nll = token_nll
+            dpace_mask = block_mask
+            if block_size is not None and block_size > 1:
+                t_per = block_size - 1
+                # The confidence product must reset per block; a non-partitioning T
+                # would cumprod across the whole sequence and underflow to ~0
+                # (meaningless weights), so fail loud instead of mis-weighting silently.
+                if T % t_per != 0:
+                    raise ValueError(
+                        f"D-PACE requires predicted length T={T} to be a multiple of "
+                        f"block_size-1={t_per} (per-block confidence reset); got a remainder."
+                    )
+                n_blocks = T // t_per
+                dpace_nll = token_nll.view(token_nll.shape[0], n_blocks, t_per)
+                dpace_mask = block_mask.view(block_mask.shape[0], n_blocks, t_per)
+            with torch.no_grad():
+                prob = torch.exp(-dpace_nll.detach())
+                dpace_weights = self._dpace_weight(prob, dpace_mask, dpace_mask > 0)
+            weights = (dpace_mask * dpace_weights).reshape_as(token_nll)
+        else:
+            raise ValueError(f"unknown loss_type {self.loss_type!r}")
+
         loss = (token_nll * weights).sum()
         if self.normalize == "mean":
-            loss = loss / (weights.sum() + 1e-6)
+            if self.loss_type in _DPACE_LOSS_TYPES:
+                # D-PACE is a weighted *sum*: the weight magnitude is the signal
+                # (the expected accepted-prefix length), so dividing by the weight
+                # sum would cancel exactly the variation the objective encodes.
+                # It would also desync the DP gradient average -- that stays exact
+                # only when every rank divides by the same constant, and the D-PACE
+                # weights are data-dependent. Normalize per sequence instead, which
+                # is what the reference implementation does.
+                loss = loss / max(float(token_nll.shape[0]), 1.0)
+            else:
+                loss = loss / (weights.sum() + 1e-6)
         elif num_tokens is not None:
             loss = loss / max(float(num_tokens), 1.0)
         return DLLMLossOutput(
