@@ -443,8 +443,8 @@ RUN uv pip install "kernels>=0.11.0" \
 - [huggingface/kernels repo](https://github.com/huggingface/kernels) — loader source, CLI, lockfiles
 - [Upstream integration guide](https://github.com/huggingface/kernels/blob/main/kernel-builder/skills/cuda-kernels/references/huggingface-kernels-integration.md)
 - [Upstream example script](https://github.com/huggingface/kernels/blob/main/kernel-builder/skills/cuda-kernels/scripts/huggingface_kernels_example.py)
-- [Kernels docs — Quickstart](https://huggingface.co/docs/kernels/en/basic-usage)
-- [Transformers — Loading kernels](https://huggingface.co/docs/transformers/main/kernel_doc/loading_kernels)
+- [Kernels Quickstart](https://huggingface.co/docs/kernels/en/basic-usage)
+- [Transformers Loading Kernels](https://huggingface.co/docs/transformers/main/kernel_doc/loading_kernels)
 - [Transformers `hub_kernels.py`](https://github.com/huggingface/transformers/blob/main/src/transformers/integrations/hub_kernels.py)
 - [kernels-community catalog (54 kernels)](https://huggingface.co/kernels-community/kernels)
 - [kernels-community source repo](https://github.com/huggingface/kernels-community)
