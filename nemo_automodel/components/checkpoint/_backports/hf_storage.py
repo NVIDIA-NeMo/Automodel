@@ -102,6 +102,7 @@ class _HuggingFaceStorageWriter(FsspecWriter):
         staging_dir: Optional[str] = None,
         diffusers_compatible: bool = False,
         fqn_to_dtype_mapping: Optional[dict[str, str]] = None,
+        export_key_renames: Optional[dict[str, str]] = None,
     ) -> None:
         """
         Initialize the huggingface writer pointing to path.
@@ -125,6 +126,8 @@ class _HuggingFaceStorageWriter(FsspecWriter):
             diffusers_compatible: If True, rename the index file to diffusion_pytorch_model.safetensors.index.json
                         so checkpoints are loadable via diffusers from_pretrained().
             fqn_to_dtype_mapping: Optional mapping from tensor FQN to original HF safetensors dtype string.
+            export_key_renames: Optional mapping from model FQN to the name the tensor is published under,
+                applied to the consolidated safetensors headers and weight index.
         """
         if token is not None:
             super().__init__(
@@ -143,6 +146,7 @@ class _HuggingFaceStorageWriter(FsspecWriter):
         self._staging_dir = staging_dir
         self._diffusers_compatible = diffusers_compatible
         self._fqn_to_dtype_mapping = fqn_to_dtype_mapping
+        self._export_key_renames = export_key_renames
 
         if num_threads_consolidation:
             self._num_threads_consolidation = num_threads_consolidation
@@ -208,6 +212,7 @@ class _HuggingFaceStorageWriter(FsspecWriter):
                 use_staging=self._staging_dir is not None,
                 staging_dir=self._staging_dir,
                 fqn_to_dtype_mapping=self._fqn_to_dtype_mapping,
+                export_key_renames=self._export_key_renames,
             )
             if self._diffusers_compatible:
                 _maybe_rename_index_for_diffusers(self._consolidated_output_path)

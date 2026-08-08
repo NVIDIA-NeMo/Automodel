@@ -25,7 +25,7 @@ import shutil
 import struct
 import tempfile
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Optional
 
 import torch
@@ -198,6 +198,8 @@ class _FqnData:
         dtype_str: String representation of the tensor's data type
         source_dtype_size: Size of the source tensor's data type in bytes
         source_dtype_str: String representation of the source tensor's data type
+        export_name: Name the tensor is published under, when it differs from the
+            model FQN the input shards are keyed by. Empty means the two are the same.
     """
 
     offset_in_file: int = 0
@@ -206,6 +208,7 @@ class _FqnData:
     dtype_str: str = ""
     source_dtype_size: int = 0
     source_dtype_str: str = ""
+    export_name: str = ""
 
 
 @dataclass
@@ -332,7 +335,10 @@ def _parse_input_metadata(
                     fqn_to_dtype_mapping,
                     quantized_dtype_mismatches,
                 )
-                output_data.fqn_data[fqn] = _FqnData(
+                # Replaced rather than rebuilt so fields assigned when the output files were
+                # laid out survive; the shard metadata read here is keyed by model FQNs only.
+                output_data.fqn_data[fqn] = replace(
+                    output_data.fqn_data[fqn],
                     shape_in_file=tensor_size,
                     dtype_size=_get_dtype_size(output_dtype),
                     dtype_str=output_dtype_str,
@@ -350,7 +356,7 @@ def _compute_safetensors_metadata_and_offsets(output_data: _OutputFileData) -> d
 
     for fqn, fqn_data in output_data.fqn_data.items():
         end_offset = curr_offset + math.prod(fqn_data.shape_in_file) * fqn_data.dtype_size
-        metadata[fqn] = {
+        metadata[fqn_data.export_name or fqn] = {
             SHAPE_KEY: fqn_data.shape_in_file,
             DTYPE_KEY: fqn_data.dtype_str,
             DATA_OFFSETS_KEY: [curr_offset, end_offset],
@@ -698,7 +704,7 @@ def _write_overall_metadata_file(
     for output_path, value in output_files_data.items():
         for fqn, fqn_data in value.fqn_data.items():
             total_size += math.prod(fqn_data.shape_in_file) * fqn_data.dtype_size
-            weight_map[fqn] = os.path.basename(output_path)
+            weight_map[fqn_data.export_name or fqn] = os.path.basename(output_path)
 
     metadata_to_write: dict[str, Any] = {}
     metadata_to_write["metadata"] = {"total_size": total_size}
@@ -715,6 +721,7 @@ def _write_overall_metadata_file_from_shards(
     fqn_to_index_mapping: dict[str, int],
     cast_dtype: torch.dtype | None = None,
     fqn_to_dtype_mapping: dict[str, str] | None = None,
+    export_key_renames: dict[str, str] | None = None,
 ) -> None:
     """
     Write the overall metadata file by reading metadata from input shard files.
@@ -728,6 +735,10 @@ def _write_overall_metadata_file_from_shards(
         input_dir: Directory containing the input shard safetensors files
         output_dir: Directory where the metadata file will be written
         fqn_to_index_mapping: Mapping from tensor names to output file indices
+        cast_dtype: Optional dtype used to cast floating-point tensors during consolidation.
+        fqn_to_dtype_mapping: Optional mapping from tensor FQN to target safetensors dtype string.
+        export_key_renames: Optional mapping from model FQN to the name the tensor is published
+            under. Only the weight map is renamed; the input shards stay keyed by model FQNs.
     """
     # Find all safetensors files in the input directory
     safetensors_files = glob.glob(os.path.join(input_dir, f"*{SUFFIX}"))
@@ -771,6 +782,7 @@ def _write_overall_metadata_file_from_shards(
     max_index = max(fqn_to_index_mapping.values())
     total_size = 0
     weight_map = {}
+    renames = export_key_renames or {}
 
     for fqn, (tensor_shape, dtype_str) in fqn_to_size_mapping.items():
         output_dtype, _ = _resolve_output_dtype(
@@ -784,7 +796,7 @@ def _write_overall_metadata_file_from_shards(
         total_size += math.prod(tensor_shape) * dtype_size
 
         idx = fqn_to_index_mapping[fqn]
-        weight_map[fqn] = _gen_file_name(idx, max_index)
+        weight_map[renames.get(fqn, fqn)] = _gen_file_name(idx, max_index)
 
     # Write the metadata file
     metadata_to_write: dict[str, Any] = {}
@@ -805,16 +817,16 @@ def _consolidate_safetensors_files(
     staging_dir: Optional[str] = None,
     cast_dtype: torch.dtype | None = None,
     fqn_to_dtype_mapping: dict[str, str] | None = None,
+    export_key_renames: dict[str, str] | None = None,
 ) -> dict[str, _OutputFileData]:
     # Build output paths
     output_files_data: dict[str, _OutputFileData] = {}
+    renames = export_key_renames or {}
     for fqn, filename in fqn_to_file_mapping.items():
         output_path = os.path.join(output_dir, filename)
-
-        if output_path not in output_files_data:
-            output_files_data[output_path] = _OutputFileData(fqn_data={fqn: _FqnData()})
-        else:
-            output_files_data[output_path].fqn_data[fqn] = _FqnData()
+        output_files_data.setdefault(output_path, _OutputFileData()).fqn_data[fqn] = _FqnData(
+            export_name=renames.get(fqn, "")
+        )
 
     # Find all safetensors files in the input directory
     safetensors_files = glob.glob(os.path.join(input_dir, f"*{SUFFIX}"))
@@ -881,6 +893,7 @@ def consolidate_safetensors_files(
     staging_dir: Optional[str] = None,
     cast_dtype: torch.dtype | None = None,
     fqn_to_dtype_mapping: dict[str, str] | None = None,
+    export_key_renames: dict[str, str] | None = None,
 ) -> None:
     """
     Main function to consolidate sharded safetensors files into one or more output files.
@@ -906,6 +919,8 @@ def consolidate_safetensors_files(
         cast_dtype: Optional dtype used to cast floating-point tensors during consolidation.
         fqn_to_dtype_mapping: Optional mapping from tensor FQN to target safetensors dtype string. This can combine
             original HF dtype metadata with model-owned export overrides.
+        export_key_renames: Optional mapping from model FQN to the name the tensor is published under. Applied
+            only to the safetensors headers and the weight index; tensor data and the input shards are untouched.
     """
     start_time = time.time()
     logger.info("Consolidating safetensors files from %s to %s.", input_dir, output_dir)
@@ -929,6 +944,7 @@ def consolidate_safetensors_files(
         staging_dir=staging_dir,
         cast_dtype=cast_dtype,
         fqn_to_dtype_mapping=fqn_to_dtype_mapping,
+        export_key_renames=export_key_renames,
     )
 
     # Step 4: Write overall model.index.safetensors.json file with weight map
@@ -999,6 +1015,7 @@ def consolidate_safetensors_files_on_every_rank(
     staging_dir: Optional[str] = None,
     cast_dtype: torch.dtype | None = None,
     fqn_to_dtype_mapping: dict[str, str] | None = None,
+    export_key_renames: dict[str, str] | None = None,
 ) -> None:
     """
     Consolidate sharded safetensors files across multiple ranks, with each rank handling a subset of output files.
@@ -1023,6 +1040,8 @@ def consolidate_safetensors_files_on_every_rank(
         cast_dtype: Optional dtype used to cast floating-point tensors during consolidation.
         fqn_to_dtype_mapping: Optional mapping from tensor FQN to target safetensors dtype string. This can combine
             original HF dtype metadata with model-owned export overrides.
+        export_key_renames: Optional mapping from model FQN to the name the tensor is published under. Applied
+            only to the safetensors headers and the weight index; tensor data and the input shards are untouched.
 
     Raises:
         RuntimeError: If consolidation fails on any rank of a multi-rank
@@ -1095,6 +1114,7 @@ def consolidate_safetensors_files_on_every_rank(
                 staging_dir=staging_dir,
                 cast_dtype=cast_dtype,
                 fqn_to_dtype_mapping=fqn_to_dtype_mapping,
+                export_key_renames=export_key_renames,
             )
     except Exception as exc:
         local_exception = exc
@@ -1113,8 +1133,9 @@ def consolidate_safetensors_files_on_every_rank(
                 input_dir,
                 output_dir,
                 fqn_to_index_mapping,
-                cast_dtype,
-                fqn_to_dtype_mapping,
+                cast_dtype=cast_dtype,
+                fqn_to_dtype_mapping=fqn_to_dtype_mapping,
+                export_key_renames=export_key_renames,
             )
         except Exception as exc:
             local_exception = exc
