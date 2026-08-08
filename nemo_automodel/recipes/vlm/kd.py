@@ -394,6 +394,7 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
                     model=model,
                     hidden_states=hidden_states,
                     num_label_tokens=num_label_tokens,
+                    grad_reduce_group=self._get_dp_group(include_cp=True) if is_train else None,
                 )
             del hidden_states
 
