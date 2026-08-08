@@ -873,10 +873,10 @@ class MoE(nn.Module):
             # MoK's fused schedule requires the same number of dense token rows
             # on every EP rank, with at least 512 rows aligned to 256. Run the
             # gate on the original dense extent so close group-top-k decisions
-            # match the reference dispatcher, then replace semantic padding with
-            # MoK structural dummy rows whose activations and router weights are
-            # zero. The common padded extent preserves MoK's equal-token contract
-            # when EP ranks consume different examples.
+            # match the reference dispatcher. The common padded extent preserves
+            # MoK's equal-token contract when EP ranks consume different examples;
+            # semantic padding remains present as inactive routes with zero router
+            # weights and is removed from the returned output below.
             if padding_mask is not None:
                 if is_packed_thd:
                     # Packed THD rows are [all real tokens][tail padding]. The
@@ -893,10 +893,13 @@ class MoE(nn.Module):
                 weights, indices, aux_loss = self.gate(x, token_mask, cp_mesh)
                 num_dispatch_tokens = max(512, ((x.size(0) + 255) // 256) * 256)
                 if is_packed_thd:
-                    # Keep the already-contiguous real prefix in place and
-                    # rewrite semantic padding as MoK structural dummies.
+                    # Packed padding is one contiguous tail, so the dense input is
+                    # already in MoK's equal-row layout. Keep it in place instead
+                    # of copying the full activation just to zero the tail. MoK's
+                    # per-token shared/routed MLPs cannot mix those rows into valid
+                    # outputs, and the output mask below gives them zero gradient.
                     padding_rows = packed_padding_mask.unsqueeze(-1)
-                    expert_x = x_latent.masked_fill(padding_rows, 0)
+                    expert_x = x_latent
                     weights = weights.masked_fill(padding_rows, 0)
                     num_alignment_tokens = num_dispatch_tokens - x.size(0)
                     if num_alignment_tokens:
@@ -906,8 +909,9 @@ class MoE(nn.Module):
                         dispatch_padding_mask = F.pad(packed_padding_mask, (0, num_alignment_tokens), value=True)
                     else:
                         dispatch_padding_mask = packed_padding_mask
-                    # Dense-row ordinals give structural dummies legal, evenly
-                    # distributed expert IDs without counting valid rows.
+                    # MoK's forward and backward schedules require every physical
+                    # row to carry a legal route. Give inactive rows balanced expert
+                    # IDs while zero router weights keep them out of the result.
                     dummy_indices = torch.arange(
                         num_dispatch_tokens * indices.size(1), device=indices.device, dtype=indices.dtype
                     ).view(num_dispatch_tokens, indices.size(1))
@@ -933,10 +937,8 @@ class MoE(nn.Module):
                         ).view(num_dummy_tokens, indices.size(1))
                         dummy_indices = dummy_indices.remainder(self.n_routed_experts)
                         indices = torch.cat((indices, dummy_indices), dim=0)
-                dispatch_mask = torch.ones(num_dispatch_tokens, dtype=torch.bool, device=x.device)
                 dispatch_y = self.experts(
                     expert_x,
-                    dispatch_mask,
                     weights,
                     indices,
                     self.shared_experts.gate_proj.weight,
@@ -952,7 +954,6 @@ class MoE(nn.Module):
                 weights, indices, aux_loss = self.gate(x, token_mask, cp_mesh)
                 y = self.experts(
                     x_latent,
-                    token_mask,
                     weights,
                     indices,
                     self.shared_experts.gate_proj.weight,

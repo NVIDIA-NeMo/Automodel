@@ -519,7 +519,6 @@ class GroupedExpertsMoK(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        token_mask: torch.Tensor,
         weights: torch.Tensor,
         indices: torch.Tensor,
         shared_gate_weights: torch.Tensor,
@@ -530,8 +529,6 @@ class GroupedExpertsMoK(nn.Module):
 
         Args:
             x: BF16 tensor of shape [tokens, hidden].
-            token_mask: Boolean tensor of shape [tokens]. All entries must be true;
-                padding is rejected by the owning :class:`MoE` before this call.
             weights: Tensor of shape [tokens, activated_experts].
             indices: Int64 tensor of shape [tokens, activated_experts].
             shared_gate_weights: BF16 tensor of shape [expert_intermediate, hidden].
@@ -542,7 +539,6 @@ class GroupedExpertsMoK(nn.Module):
             BF16 tensor of shape [tokens, hidden] containing the fused shared and
             router-weighted routed expert output.
         """
-        del token_mask
         if isinstance(x, DTensor):
             raise ValueError("MoK expects rank-local activations, not a DTensor")
         return _MoKAutogradFunction.apply(

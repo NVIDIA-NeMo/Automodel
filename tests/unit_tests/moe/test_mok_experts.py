@@ -189,14 +189,12 @@ def test_mok_unpacked_compacts_padding_and_restores_token_layout(monkeypatch: py
 
     def fake_experts(
         x: torch.Tensor,
-        token_mask: torch.Tensor,
         weights: torch.Tensor,
         indices: torch.Tensor,
         *shared_weights: torch.Tensor,
     ) -> torch.Tensor:
         del shared_weights
         captured["x"] = x
-        captured["token_mask"] = token_mask
         captured["weights"] = weights
         captured["indices"] = indices
         return x + 1
@@ -214,8 +212,6 @@ def test_mok_unpacked_compacts_padding_and_restores_token_layout(monkeypatch: py
     assert captured["x"].shape == (512, 256)
     torch.testing.assert_close(captured["x"][:2], x.detach().view(-1, 256)[[0, 2]])
     torch.testing.assert_close(captured["x"][2:], torch.zeros_like(captured["x"][2:]))
-    assert captured["token_mask"].all()
-    assert captured["token_mask"].numel() == 512
     torch.testing.assert_close(captured["weights"][2:], torch.zeros_like(captured["weights"][2:]))
     dummy_load = torch.bincount(captured["indices"][2:].flatten(), minlength=config.n_routed_experts)
     torch.testing.assert_close(dummy_load, torch.full_like(dummy_load, dummy_load[0]))
@@ -231,7 +227,7 @@ def test_mok_unpacked_compacts_padding_and_restores_token_layout(monkeypatch: py
     torch.testing.assert_close(x.grad[0, 3], torch.zeros_like(x.grad[0, 3]))
 
 
-def test_mok_packed_thd_replaces_tail_padding_with_dummy_rows(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_mok_packed_thd_reuses_tail_rows_as_balanced_dummies(monkeypatch: pytest.MonkeyPatch) -> None:
     config = _valid_moe_config()
     monkeypatch.setattr("nemo_automodel.components.moe.layers.get_world_size_safe", lambda: 4)
     moe = MoE(config, BackendConfig(dispatcher="mok", linear="torch"))
@@ -247,14 +243,12 @@ def test_mok_packed_thd_replaces_tail_padding_with_dummy_rows(monkeypatch: pytes
 
     def fake_experts(
         x: torch.Tensor,
-        token_mask: torch.Tensor,
         weights: torch.Tensor,
         indices: torch.Tensor,
         *shared_weights: torch.Tensor,
     ) -> torch.Tensor:
         del shared_weights
         captured["x"] = x
-        captured["token_mask"] = token_mask
         captured["weights"] = weights
         captured["indices"] = indices
         return x + 1
@@ -270,9 +264,8 @@ def test_mok_packed_thd_replaces_tail_padding_with_dummy_rows(monkeypatch: pytes
     torch.testing.assert_close(captured["gate_x"], x.detach())
     torch.testing.assert_close(captured["gate_token_mask"], ~padding_mask)
     assert captured["x"].shape == (512, 256)
-    torch.testing.assert_close(captured["x"][:2], x.detach()[:2])
-    torch.testing.assert_close(captured["x"][2:], torch.zeros_like(captured["x"][2:]))
-    assert captured["token_mask"].all()
+    torch.testing.assert_close(captured["x"][:4], x.detach())
+    torch.testing.assert_close(captured["x"][4:], torch.zeros_like(captured["x"][4:]))
     torch.testing.assert_close(captured["weights"][2:], torch.zeros_like(captured["weights"][2:]))
     dummy_load = torch.bincount(captured["indices"][2:].flatten(), minlength=config.n_routed_experts)
     torch.testing.assert_close(dummy_load, torch.full_like(dummy_load, dummy_load[0]))
@@ -311,14 +304,12 @@ def test_mok_all_padding_still_enters_collective_dispatch(monkeypatch: pytest.Mo
 
     def fake_experts(
         x: torch.Tensor,
-        token_mask: torch.Tensor,
         weights: torch.Tensor,
         indices: torch.Tensor,
         *shared_weights: torch.Tensor,
     ) -> torch.Tensor:
         del shared_weights
         calls.append((x, weights, indices))
-        assert token_mask.all()
         return torch.zeros_like(x)
 
     monkeypatch.setattr(moe.gate, "forward", capture_gate)
@@ -334,7 +325,8 @@ def test_mok_all_padding_still_enters_collective_dispatch(monkeypatch: pytest.Mo
     assert len(calls) == 1
     expert_x, weights, indices = calls[0]
     assert expert_x.shape == (512, 256)
-    torch.testing.assert_close(expert_x, torch.zeros_like(expert_x))
+    torch.testing.assert_close(expert_x[:4], x)
+    torch.testing.assert_close(expert_x[4:], torch.zeros_like(expert_x[4:]))
     torch.testing.assert_close(weights, torch.zeros_like(weights))
     dummy_load = torch.bincount(indices.flatten(), minlength=config.n_routed_experts)
     torch.testing.assert_close(dummy_load, torch.full_like(dummy_load, dummy_load[0]))
@@ -392,7 +384,6 @@ def test_mok_manual_backward_maps_gradients_to_autograd_inputs() -> None:
 
     output = experts(
         x,
-        torch.ones(4, dtype=torch.bool),
         router_weights,
         top_experts,
         shared_gate,
