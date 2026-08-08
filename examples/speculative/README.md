@@ -63,7 +63,14 @@ The shipped example configs only cover a subset.
   `config.get_text_config()` and the draft consumes post-block hidden states, so
   images do not participate in drafting. Configs: `eagle3/gemma4_e2b_eagle3.yaml`,
   `gemma4_e4b_eagle3.yaml`, `gemma4_31b_eagle3.yaml`, `gemma4_26b_a4b_eagle3.yaml`.
-- **DFlash / Domino / JetSpec**: `Qwen3ForCausalLM`, `Qwen3MoeForCausalLM`.
+- **DFlash / Domino / JetSpec**: `Qwen3ForCausalLM`, `Qwen3MoeForCausalLM`. All
+  DFlash-family recipes reject `distributed.pp_size > 1`: online hidden-state
+  capture hooks one complete, non-pipelined target forward.
+- **DFlash on Kimi K3** (`KimiK3ForCausalLM`, `KimiK3ForConditionalGeneration`):
+  using a dedicated dense MLA draft class. Plain DFlash only (Domino's projector
+  head is Qwen3-only), and it requires `attention_backend: sdpa`. Sequence
+  packing and context parallelism are rejected, because K3 owns both itself.
+  See `dflash/README_kimi_k3.md`.
 - **DSpark**: `Qwen3ForCausalLM`, `Qwen3MoeForCausalLM`,
   `DeepseekV4ForCausalLM`, GLM-5.2 (`GlmMoeDsaForCausalLM`), Gemma4
   (`Gemma4ForConditionalGeneration`, `Gemma4UnifiedForConditionalGeneration`),
