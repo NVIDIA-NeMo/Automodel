@@ -47,6 +47,39 @@ def _combine_norms(norms: list[torch.Tensor], norm_type: float, target_device: t
     return max_norm * norm_stack.div(max_norm).pow(norm_type).sum().pow(1.0 / norm_type)
 
 
+def _all_reduce_scalar(
+    scalar: torch.Tensor,
+    op: torch.distributed.ReduceOp,
+    mesh: DeviceMesh,
+    mesh_dim: int | None = None,
+) -> torch.Tensor:
+    """All-reduce a 0-dim norm accumulator over ``mesh``, communicating on the mesh device.
+
+    The norm math stays on the gradients' own device, which under FSDP2
+    ``CPUOffloadPolicy`` is CPU while the mesh's process group is NCCL and has no CPU
+    backend. Only the scalar hops to ``mesh.device_type`` for the collective and comes
+    straight back, so a genuinely-CPU (gloo) mesh is never forced onto an accelerator.
+
+    Args:
+        scalar: 0-dim tensor to reduce, on the gradients' device.
+        op: Reduction operation.
+        mesh: Device mesh whose process group performs the collective.
+        mesh_dim: Mesh dimension to reduce over, or None for the whole mesh.
+
+    Returns:
+        The reduced scalar on ``scalar``'s original device. Callers must use the return
+        value: when the devices differ the reduction is out-of-place.
+    """
+    group = mesh.get_group(mesh_dim=mesh_dim)
+    if scalar.device.type == mesh.device_type:
+        torch.distributed.all_reduce(scalar, op=op, group=group)
+        return scalar
+
+    comm_scalar = scalar.to(device=mesh.device_type)
+    torch.distributed.all_reduce(comm_scalar, op=op, group=group)
+    return comm_scalar.to(device=scalar.device)
+
+
 @torch.no_grad()
 def count_tail_padding(labels, ignore_label=-100):
     """Counts the total number of padding token in the tail of labels
@@ -157,9 +190,7 @@ def _clip_grad_norm_impl(
             for dim_idx, pl in enumerate(first.placements):
                 if isinstance(pl, Replicate):
                     continue
-                torch.distributed.all_reduce(
-                    local_max, op=torch.distributed.ReduceOp.MAX, group=mesh.get_group(mesh_dim=dim_idx)
-                )
+                local_max = _all_reduce_scalar(local_max, torch.distributed.ReduceOp.MAX, mesh, dim_idx)
 
         if is_inf or local_max == 0 or not torch.isfinite(local_max):
             group_norms.append(local_max)
@@ -183,9 +214,7 @@ def _clip_grad_norm_impl(
             for dim_idx, pl in enumerate(first.placements):
                 if isinstance(pl, Replicate):
                     continue
-                torch.distributed.all_reduce(
-                    local_val, op=torch.distributed.ReduceOp.SUM, group=mesh.get_group(mesh_dim=dim_idx)
-                )
+                local_val = _all_reduce_scalar(local_val, torch.distributed.ReduceOp.SUM, mesh, dim_idx)
 
         group_norms.append(local_max * local_val.pow(1.0 / norm_type))
 
@@ -195,15 +224,15 @@ def _clip_grad_norm_impl(
     # Reduce across pipeline parallel mesh if provided
     if pp_mesh is not None:
         if math.isinf(norm_type):
-            torch.distributed.all_reduce(total_norm, op=torch.distributed.ReduceOp.MAX, group=pp_mesh.get_group())
+            total_norm = _all_reduce_scalar(total_norm, torch.distributed.ReduceOp.MAX, pp_mesh)
         else:
             pp_max_norm = total_norm.abs().clone()
-            torch.distributed.all_reduce(pp_max_norm, op=torch.distributed.ReduceOp.MAX, group=pp_mesh.get_group())
+            pp_max_norm = _all_reduce_scalar(pp_max_norm, torch.distributed.ReduceOp.MAX, pp_mesh)
             if pp_max_norm == 0 or not torch.isfinite(pp_max_norm):
                 total_norm = pp_max_norm
             else:
                 total_norm = total_norm.div(pp_max_norm).pow(norm_type)
-                torch.distributed.all_reduce(total_norm, op=torch.distributed.ReduceOp.SUM, group=pp_mesh.get_group())
+                total_norm = _all_reduce_scalar(total_norm, torch.distributed.ReduceOp.SUM, pp_mesh)
                 total_norm = pp_max_norm * total_norm.pow(1.0 / norm_type)
 
     if error_if_nonfinite and torch.logical_or(total_norm.isnan(), total_norm.isinf()):
