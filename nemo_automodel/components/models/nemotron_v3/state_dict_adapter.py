@@ -121,6 +121,18 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
         """NemotronV3 uses 'mixer.experts' instead of 'mlp.experts'."""
         return "mixer.experts"
 
+    @staticmethod
+    def _native_key_to_hf(key: str) -> str:
+        """Normalize a native Nemotron V3 key to its public HF namespace."""
+        key = _strip_mamba_fp32_holder_key(key)
+        if key.startswith("model."):
+            key = "backbone." + key[len("model.") :]
+        if key == "backbone.norm.weight":
+            key = "backbone.norm_f.weight"
+        if key == "backbone.embed_tokens.weight":
+            key = "backbone.embeddings.weight"
+        return key
+
     def to_hf(self, state_dict: dict[str, Any], exclude_key_regex: Optional[str] = None, **kwargs) -> dict[str, Any]:
         """Convert from internal model state dict to HuggingFace format.
 
@@ -230,9 +242,16 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
                 stripped[stripped_key] = _upcast_mamba_fp32_state_tensor(stripped_key, value)
             # reset_view_loaded_keys=False: this is the second merge of a single from_hf (after the
             # backbone merge above), so accumulate MTP view-loaded keys onto the backbone's record.
+            prior_view_keys = set(self.view_loaded_native_keys)
             merged_mtp = self._from_hf_w_merged_experts(stripped, device_mesh, reset_view_loaded_keys=False)
             for key, value in merged_mtp.items():
                 merged[f"mtp.{key}"] = value
+            # The merge loop records view-loaded keys in mtp.-stripped form (it only ever sees
+            # stripped keys); re-prefix them so the checkpoint loader's key-diff matches them
+            # against the model's real mtp.* parameter names instead of flagging them as
+            # missing/unexpected.
+            new_view_keys = self._view_loaded_native_keys - prior_view_keys
+            self._view_loaded_native_keys = prior_view_keys | {f"mtp.{key}" for key in new_view_keys}
 
         return merged
 
@@ -269,23 +288,12 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
             else self._convert_single_merged_expert_to_hf_split_experts(fqn, tensor, **kwargs)
         )
         if expert_result is not None:
-            result = expert_result
+            # The shared expert converter preserves the native input prefix for
+            # LoRA keys. Route every result through Nemotron's adapter-specific
+            # model -> backbone normalization just like ordinary tensors.
+            result = [(self._native_key_to_hf(key), value) for key, value in expert_result]
         else:
-            # Standard conversion: just rename keys
-            new_fqn = _strip_mamba_fp32_holder_key(fqn)
-
-            # Rename model → backbone
-            if new_fqn.startswith("model."):
-                new_fqn = "backbone." + new_fqn[len("model.") :]
-
-            # Rename norm → norm_f
-            if new_fqn == "backbone.norm.weight":
-                new_fqn = "backbone.norm_f.weight"
-
-            # Internal uses 'embed_tokens' but HF uses 'embeddings'
-            if new_fqn == "backbone.embed_tokens.weight":
-                new_fqn = "backbone.embeddings.weight"
-
+            new_fqn = self._native_key_to_hf(fqn)
             result = [(new_fqn, _upcast_mamba_fp32_state_tensor(new_fqn, tensor))]
 
         if exclude_key_regex:

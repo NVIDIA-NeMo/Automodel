@@ -122,14 +122,27 @@ fixture_keys:
     - cross_tp_size
     - cosine_threshold
     - experts_implementation
+    - hf_adapter_ignored_key_prefix
     - hf_device_map_auto
+    - hf_device_map_cpu_max_memory_gib
+    - hf_device_map_max_memory_gib
     - hf_cosine_threshold
     - hf_kl_threshold
     - kl_threshold
     - hf_source_post_load_dequantize
     - no_check_resume
+    - process_isolation
+    # Independent normal-finetune versus checkpoint-Phase-1 metric. This is
+    # reported separately and never gates checkpoint resume correctness.
+    - training_reproducibility_loss_threshold
+    # The first threshold gates the exact first loss after restoring state and
+    # batch identity. The existing resume_loss_threshold is only the numerical
+    # envelope for later optimizer steps on the same shared trajectory.
+    - resume_first_loss_threshold
     - resume_loss_threshold
     - skip_hf_reload
+    - skip_automodel_logit_parity
+    - skip_hf_logit_parity
     - source_load_cosine_threshold
     - source_load_kl_threshold
     - source_load_mean_kl_threshold

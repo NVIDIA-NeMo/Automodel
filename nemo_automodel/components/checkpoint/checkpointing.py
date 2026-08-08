@@ -14,6 +14,7 @@
 
 import gc
 import glob
+import json
 import logging
 import os
 import pickle
@@ -68,6 +69,7 @@ from nemo_automodel.components.checkpoint.conversion_mapping import (
     get_combined_key_mapping,
     requires_tensor_merging,
 )
+from nemo_automodel.components.checkpoint.lifecycle import CheckpointLifecycle
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, OptimizerState
 from nemo_automodel.components.checkpoint.utils import (
     ensure_tied_lm_head,
@@ -78,6 +80,7 @@ from nemo_automodel.components.checkpoint.utils import (
     get_safetensors_index_total_size,
     get_tied_lm_head_source_names,
     get_world_size_safe,
+    is_cloud_path,
     is_rank_0,
     materialize_missing_tied_lm_head,
 )
@@ -225,11 +228,6 @@ def _apply_adapter_forced_dtype_mapping(
         if fqn in state_dict_key_set:
             normalized[fqn] = dtype_str
     return normalized
-
-
-def is_cloud_path(path: str) -> bool:
-    """Check if path is a cloud storage path (MSC)."""
-    return path.startswith("msc://")
 
 
 def _ensure_msc_available() -> None:
@@ -537,6 +535,7 @@ class Checkpointer:
         self.tp_rank = tp_rank
         self.pp_rank = pp_rank
         self.process_group = process_group
+        self.lifecycle = CheckpointLifecycle(config=config, process_group=process_group)
         self._planner_cache_namespace = uuid.uuid4().hex
 
         # async specific variables
@@ -812,6 +811,7 @@ class Checkpointer:
             is_init_step=is_init_step,
             skip_task_head_prefixes=getattr(self.config, "skip_task_head_prefixes_for_base_model", None),
             cpu_offload=self.config.cpu_offload,
+            has_expert_parallelism=self.moe_mesh is not None,
         )
 
         # Check if this model requires tensor merging (e.g., Mixtral with grouped experts)
@@ -1429,6 +1429,15 @@ class Checkpointer:
             if consolidation_process_group is not None:
                 torch.distributed.destroy_process_group(consolidation_process_group)
 
+    def finalize(self) -> None:
+        """Publish any final async checkpoint and close owned resources."""
+        try:
+            if self.config.enabled:
+                self.async_wait()
+                self.lifecycle.complete_pending()
+        finally:
+            self.close()
+
     def _do_load(
         self,
         state_dict: dict[str, torch.Tensor],
@@ -1927,6 +1936,31 @@ def save_config(config: dict[str, Any], weights_path: str) -> None:
     else:
         with open(config_path, "w") as f:
             yaml.dump(config, f, sort_keys=False, default_flow_style=False)
+
+
+def save_losses(losses: dict[str, Any], weights_path: str) -> None:
+    """Write checkpoint loss metadata to ``weights_path/losses.json``.
+
+    Mirrors :func:`save_config` so the file lands in the checkpoint directory for
+    both local and ``msc://`` roots. Every failure is logged rather than raised,
+    including a missing ``multistorageclient``: this is metadata written on rank 0
+    only, so raising would strand the other ranks in the next collective.
+
+    Args:
+        losses: Loss values to record. Values must be JSON-serializable.
+        weights_path: Checkpoint directory.
+    """
+    losses_path = os.path.join(weights_path, "losses.json")
+    try:
+        if is_cloud_path(weights_path):
+            _ensure_msc_available()
+            with msc.open(losses_path, "w") as f:
+                json.dump(losses, f)
+        else:
+            with open(losses_path, "w") as f:
+                json.dump(losses, f)
+    except (TypeError, ValueError, OSError, ImportError):
+        logger.warning("Failed to write checkpoint loss metadata to %s", losses_path, exc_info=True)
 
 
 def _create_dirs(*dirs: Optional[str]) -> None:

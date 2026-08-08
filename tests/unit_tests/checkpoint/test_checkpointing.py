@@ -879,6 +879,60 @@ def test_model_state_passes_cpu_offload_to_dcp(cpu_offload):
         assert options is None
 
 
+def test_peft_ep_model_load_checks_every_local_pipeline_part():
+    dense_part = torch.nn.Linear(2, 2)
+    expert_part = torch.nn.Module()
+    expert_part.ep_size = 8
+    model_state = ModelState([dense_part, expert_part], is_peft=True)
+
+    with (
+        patch("nemo_automodel.components.checkpoint.stateful_wrappers._set_peft_state_dict") as set_peft_state,
+        patch("nemo_automodel.components.checkpoint.stateful_wrappers.set_model_state_dict") as set_model_state,
+    ):
+        model_state.load_state_dict({})
+
+    assert set_peft_state.call_args_list == [call(dense_part, {}), call(expert_part, {})]
+    set_model_state.assert_not_called()
+
+
+def test_peft_ep_model_load_uses_global_topology_when_local_stage_has_no_experts():
+    model_part = torch.nn.Linear(2, 2)
+    model_state = ModelState(model_part, is_peft=True, has_expert_parallelism=True)
+
+    with (
+        patch("nemo_automodel.components.checkpoint.stateful_wrappers._set_peft_state_dict") as set_peft_state,
+        patch("nemo_automodel.components.checkpoint.stateful_wrappers.set_model_state_dict") as set_model_state,
+    ):
+        model_state.load_state_dict({})
+
+    set_peft_state.assert_called_once_with(model_part, {})
+    set_model_state.assert_not_called()
+
+
+def test_checkpointer_passes_ep_topology_to_model_state(tmp_path):
+    config = CheckpointingConfig(
+        checkpoint_dir=tmp_path,
+        model_save_format="safetensors",
+        save_consolidated=False,
+        is_peft=True,
+    )
+    with patch("torch.distributed.is_initialized", return_value=False):
+        checkpointer = Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=object())
+
+    model = torch.nn.Linear(2, 2)
+    with (
+        patch("os.path.exists", return_value=True),
+        patch(
+            "nemo_automodel.components.checkpoint.checkpointing.ModelState",
+            side_effect=RuntimeError("stop after constructor"),
+        ) as model_state,
+        pytest.raises(RuntimeError, match="stop after constructor"),
+    ):
+        checkpointer.load_model(model, model_path="/fake/path")
+
+    assert model_state.call_args.kwargs["has_expert_parallelism"] is True
+
+
 @pytest.mark.parametrize("cpu_offload", [False, True])
 def test_optimizer_state_passes_cpu_offload_to_dcp(cpu_offload):
     model = torch.nn.Linear(2, 2)

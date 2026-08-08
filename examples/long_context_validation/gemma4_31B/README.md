@@ -17,6 +17,8 @@ data/
   prefilter.sh           Runner with CoderForge + Gemma4 defaults
   validate_data.py       Token-level correctness assertions on the ChatDataset output
   check_masking.py       Eyeball the assistant-only label mask on real training samples
+gemma4_coderforge_chat_template.jinja
+                         Gemma4 template with {% generation %} blocks for direct assistant masking
 ```
 
 ### Why prefilter (don't truncate)
@@ -59,11 +61,18 @@ higher-length pass is a cheap re-filter (no re-tokenization) that emits a new
   + `tokenizer.json`). Point `--model` at it. The base `google/gemma-4-31B` ships
   **no `chat_template.jinja`** — copy it from `google/gemma-4-31B-it` into the base
   checkpoint dir before running data prep or training (the tokenizer is identical).
-- The Gemma4 template has **no real `{% generation %}` block**, so
-  `return_assistant_tokens_mask` is all-zeros. `ChatDataset` detects this and
-  falls back to `_build_multiturn_assistant_mask`, which supervises every
-  assistant turn (including tool-call turns). Correct, but O(turns) re-tokenization
-  per sample — pre-tokenization is a future optimization for large runs.
+- **Assistant masking uses `gemma4_coderforge_chat_template.jinja`** (in this
+  directory), a copy of the stock Gemma4 template with every assistant turn's body
+  wrapped in `{% generation %}...{% endgeneration %}`. The recipe, `validate_data.py`,
+  and `check_masking.py` point `chat_template` at it, so
+  `apply_chat_template(return_assistant_tokens_mask=True)` returns the assistant
+  mask directly (one `apply_chat_template` call per sample). The rendered token
+  stream is byte-identical to the stock template.
+  The stock Gemma4 template has **no `{% generation %}` block**, so `ChatDataset`
+  would fall back to `_build_multiturn_assistant_mask` — an O(turns) per-sample
+  re-tokenization that #3024's prefix-consistency guard rejects for multi-turn
+  conversations whose rendered prefixes are not exact token prefixes of the full
+  render. The generation-block template is the supported path.
 - The stop token the model must learn is **`<turn|>` (id 106)**, listed in
   `generation_config.eos_token_id=[1,106,50]` — **not** the tokenizer
   `eos_token_id` (1 = `<eos>`). `validate_data.py` checks 106.
