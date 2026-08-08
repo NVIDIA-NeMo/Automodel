@@ -1094,9 +1094,12 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
             # ring chunks through the FFPA CuTeDSL kernel (eligibility re-checked per
             # call in _ring_use_ffpa_varlen); default "flex" preserves prior behavior.
             use_ffpa_cp = str(getattr(text_config, "cp_full_attn_backend", "flex")).lower() == "ffpa"
+            # ``cp_sliding_attn_backend``: "flex" (default) | "fa" — kernel for the
+            # sliding-window CP layers (see cp_local_ring). fa gets off compiled flex.
+            sliding_cp_backend = str(getattr(text_config, "cp_sliding_attn_backend", "flex")).lower()
             for module in self.modules():
                 if isinstance(module, Gemma4Attention):
-                    attach_gemma4_cp_ring_attention(module, use_ffpa=use_ffpa_cp)
+                    attach_gemma4_cp_ring_attention(module, use_ffpa=use_ffpa_cp, sliding_backend=sliding_cp_backend)
             return
 
         # --- MoE path: replace the text model ---
