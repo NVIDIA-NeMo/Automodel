@@ -36,6 +36,7 @@ from nemo_automodel.components.moe.experts import (
 from nemo_automodel.components.moe.megatron.moe_utils import (
     MoEAuxLossAutoScaler,
 )
+from nemo_automodel.components.moe.mok_experts import GroupedExpertsMoK
 from nemo_automodel.components.moe.router_replay import RouterReplay, replay_selection
 
 
@@ -762,7 +763,11 @@ class MoE(nn.Module):
         else:
             self.gate = Gate(config, gate_precision=backend.gate_precision)
             self.gate.use_routing_core = "moe_router" in backend.cuda_graph.modules
-        if backend.dispatcher in ("deepep", "hybridep", "uccl_ep") and get_world_size_safe() == 1:
+        if backend.dispatcher == "mok":
+            if get_world_size_safe() == 1:
+                raise ValueError("dispatcher='mok' requires expert parallelism with at least 4 GPUs")
+            self.experts = GroupedExpertsMoK(config, backend)
+        elif backend.dispatcher in ("deepep", "hybridep", "uccl_ep") and get_world_size_safe() == 1:
             warnings.warn(
                 f"'{backend.dispatcher}' dispatcher is enabled in config, but world size is 1. "
                 "Expert parallelism requires multiple GPUs. Falling back to standard GroupedExperts.",
@@ -834,23 +839,25 @@ class MoE(nn.Module):
         x: torch.Tensor,
         padding_mask: Optional[torch.Tensor] = None,
         cp_mesh: Optional[DeviceMesh] = None,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """
-        Forward pass for the MoE module.
+    ) -> torch.Tensor:
+        """Route tokens through shared and routed experts.
 
         Args:
-            x (torch.Tensor): Input tensor.
-            padding_mask (Optional[torch.Tensor]): Boolean mask indicating padding positions.
+            x: Input tensor of shape ``[..., hidden]``.
+            padding_mask: Boolean tensor matching ``x.shape[:-1]`` where true
+                entries are padding. A two-dimensional ``x`` is a packed THD
+                tensor whose padding, when present, must be one contiguous tail.
+            cp_mesh: Optional context-parallel mesh used by the router.
 
         Returns:
-            torch.Tensor: Output tensor after expert routing and computation.
-            Optional[torch.Tensor]: Auxiliary loss for load balancing (if applicable).
+            Tensor with the same shape and dtype as ``x``.
         """
         if cp_mesh is None:
             cp_mesh = self.cp_mesh
 
         # Reshape the inputs to 2-D since we are just distributing tokens.
         shape = x.size()
+        is_packed_thd = x.dim() == 2
         x = x.view(-1, self.dim)
         if padding_mask is not None:
             token_mask = (~padding_mask).flatten()
@@ -863,17 +870,114 @@ class MoE(nn.Module):
         else:
             x_latent = x
 
-        weights, indices, aux_loss = self.gate(x, token_mask, cp_mesh)
+        if isinstance(self.experts, GroupedExpertsMoK):
+            if not isinstance(self.shared_experts, MLP):
+                raise RuntimeError("dispatcher='mok' requires exactly one shared MLP expert")
+            if self.shared_experts.gate_proj is None:
+                raise RuntimeError("dispatcher='mok' requires a gated shared SwiGLU expert")
 
-        # Shared-expert output (optionally gated), computed inline on the main stream.
-        z = None
-        if self.shared_experts is not None:
-            z = self.shared_experts(x)
-            if self.shared_expert_gate is not None:
-                z = torch.nn.functional.sigmoid(self.shared_expert_gate(x)) * z
+            # MoK's fused schedule requires the same number of dense token rows
+            # on every EP rank, with at least 512 rows aligned to 256. Run the
+            # gate on the original dense extent so close group-top-k decisions
+            # match the reference dispatcher. The common padded extent preserves
+            # MoK's equal-token contract when EP ranks consume different examples;
+            # semantic padding remains present as inactive routes with zero router
+            # weights and is removed from the returned output below.
+            if padding_mask is not None:
+                if is_packed_thd:
+                    # Packed THD rows are [all real tokens][tail padding]. The
+                    # asynchronous device assertion avoids a host sync in every
+                    # MoE layer while rejecting padding between sequences.
+                    packed_padding_mask = padding_mask.flatten()
+                    if packed_padding_mask.numel() > 1:
+                        has_interior_padding = (packed_padding_mask[:-1] & ~packed_padding_mask[1:]).any()
+                        torch._assert_async(
+                            ~has_interior_padding,
+                            "MoK packed THD inputs require all padding to form one contiguous tail",
+                        )
 
-        # Routed experts on the main stream.
-        y = self.experts(x_latent, token_mask, weights, indices)
+                weights, indices, aux_loss = self.gate(x, token_mask, cp_mesh)
+                num_dispatch_tokens = max(512, ((x.size(0) + 255) // 256) * 256)
+                if is_packed_thd:
+                    # Packed padding is one contiguous tail, so the dense input is
+                    # already in MoK's equal-row layout. Keep it in place instead
+                    # of copying the full activation just to zero the tail. MoK's
+                    # per-token shared/routed MLPs cannot mix those rows into valid
+                    # outputs, and the output mask below gives them zero gradient.
+                    padding_rows = packed_padding_mask.unsqueeze(-1)
+                    expert_x = x_latent
+                    weights = weights.masked_fill(padding_rows, 0)
+                    num_alignment_tokens = num_dispatch_tokens - x.size(0)
+                    if num_alignment_tokens:
+                        expert_x = F.pad(expert_x, (0, 0, 0, num_alignment_tokens))
+                        weights = F.pad(weights, (0, 0, 0, num_alignment_tokens))
+                        indices = F.pad(indices, (0, 0, 0, num_alignment_tokens))
+                        dispatch_padding_mask = F.pad(packed_padding_mask, (0, num_alignment_tokens), value=True)
+                    else:
+                        dispatch_padding_mask = packed_padding_mask
+                    # MoK's forward and backward schedules require every physical
+                    # row to carry a legal route. Give inactive rows balanced expert
+                    # IDs while zero router weights keep them out of the result.
+                    dummy_indices = torch.arange(
+                        num_dispatch_tokens * indices.size(1), device=indices.device, dtype=indices.dtype
+                    ).view(num_dispatch_tokens, indices.size(1))
+                    dummy_indices = dummy_indices.remainder(self.n_routed_experts)
+                    indices = torch.where(dispatch_padding_mask.unsqueeze(-1), dummy_indices, indices)
+                else:
+                    # Unpacked batches can contain one padding tail per batch row,
+                    # which becomes non-contiguous after flattening. Preserve the
+                    # general gather/scatter path for that layout.
+                    valid_positions = token_mask.nonzero(as_tuple=False).flatten()
+                    expert_x = x_latent.index_select(0, valid_positions)
+                    weights = weights.index_select(0, valid_positions)
+                    indices = indices.index_select(0, valid_positions)
+                    num_valid_tokens = valid_positions.numel()
+                    num_dummy_tokens = num_dispatch_tokens - num_valid_tokens
+                    if num_dummy_tokens:
+                        expert_x = torch.cat(
+                            (expert_x, expert_x.new_zeros((num_dummy_tokens, expert_x.size(1)))), dim=0
+                        )
+                        weights = torch.cat((weights, weights.new_zeros((num_dummy_tokens, weights.size(1)))), dim=0)
+                        dummy_indices = torch.arange(
+                            num_dummy_tokens * indices.size(1), device=indices.device, dtype=indices.dtype
+                        ).view(num_dummy_tokens, indices.size(1))
+                        dummy_indices = dummy_indices.remainder(self.n_routed_experts)
+                        indices = torch.cat((indices, dummy_indices), dim=0)
+                dispatch_y = self.experts(
+                    expert_x,
+                    weights,
+                    indices,
+                    self.shared_experts.gate_proj.weight,
+                    self.shared_experts.up_proj.weight,
+                    self.shared_experts.down_proj.weight,
+                )
+                if is_packed_thd:
+                    y = dispatch_y[: x.size(0)].masked_fill(padding_rows, 0)
+                else:
+                    valid_y = dispatch_y[:num_valid_tokens]
+                    y = x.new_zeros((x.size(0), self.dim)).index_copy(0, valid_positions, valid_y)
+            else:
+                weights, indices, aux_loss = self.gate(x, token_mask, cp_mesh)
+                y = self.experts(
+                    x_latent,
+                    weights,
+                    indices,
+                    self.shared_experts.gate_proj.weight,
+                    self.shared_experts.up_proj.weight,
+                    self.shared_experts.down_proj.weight,
+                )
+            z = None
+        else:
+            weights, indices, aux_loss = self.gate(x, token_mask, cp_mesh)
+            # Shared-expert output (optionally gated), computed inline on the main stream.
+            z = None
+            if self.shared_experts is not None:
+                z = self.shared_experts(x)
+                if self.shared_expert_gate is not None:
+                    z = torch.nn.functional.sigmoid(self.shared_expert_gate(x)) * z
+
+            # Routed experts on the main stream.
+            y = self.experts(x_latent, token_mask, weights, indices)
 
         if self.fc2_latent_proj is not None:
             y = self.fc2_latent_proj(y)
@@ -903,6 +1007,8 @@ def _init_weights(module, buffer_device: torch.device, init_std: float = 0.02):
         elif isinstance(module, (GroupedExperts, GroupedExpertsDeepEP, GroupedExpertsTE)):
             # Delegate expert initialization to experts.py
             _init_expert_weights(module, buffer_device, init_std)
+        elif isinstance(module, GroupedExpertsMoK):
+            module.init_weights(buffer_device, init_std)
         elif isinstance(module, MLP):
             to_local(module.down_proj.weight).normal_(mean=0.0, std=init_std)
             to_local(module.up_proj.weight).normal_(mean=0.0, std=init_std)

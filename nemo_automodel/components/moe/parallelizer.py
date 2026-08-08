@@ -39,6 +39,7 @@ from nemo_automodel.components.moe.layers import (
     Gate,
     MoE,
 )
+from nemo_automodel.components.moe.mok_experts import GroupedExpertsMoK
 from nemo_automodel.components.moe.tp_plan_validation import _validate_moe_tp_plan
 from nemo_automodel.shared.model_utils import iter_transformer_and_mtp_blocks
 from nemo_automodel.shared.multimodal_fsdp import (
@@ -255,7 +256,7 @@ class ExpertParallel(ParallelStyle):
             dist_param.requires_grad = param.requires_grad
             module.register_parameter(name, dist_param)
 
-        if isinstance(module, GroupedExpertsDeepEP):
+        if isinstance(module, (GroupedExpertsDeepEP, GroupedExpertsMoK)):
             module.init_token_dispatcher(ep_mesh=device_mesh)
 
     def _apply(self, module: nn.Module, device_mesh: DeviceMesh) -> nn.Module:

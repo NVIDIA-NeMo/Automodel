@@ -152,6 +152,9 @@ class Glm4MoeLiteModel(nn.Module):
             expert_bias=False,
             router_bias=False,
             expert_activation="swiglu",
+            # Match the HF GLM reference: round each BF16 expert output before
+            # applying its FP32 routing weight and reducing top-k outputs.
+            apply_router_weight_after_down=True,
             softmax_before_topk=False,  # GLM4 uses sigmoid, not softmax
             dtype=model_dtype,
         )

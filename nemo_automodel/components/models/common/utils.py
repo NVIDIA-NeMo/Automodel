@@ -14,15 +14,16 @@
 
 import importlib.util
 import logging
+import math
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 
 import torch
 from torch import nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
-from nemo_automodel.shared.import_utils import safe_import_from
+from nemo_automodel.shared.import_utils import safe_import, safe_import_from
 from nemo_automodel.shared.utils import dtype_from_str
 
 logger = logging.getLogger(__name__)
@@ -188,6 +189,93 @@ class CudaGraphConfig:
             raise ValueError("'moe_preprocess' in cuda_graph.modules requires 'moe_router'")
 
 
+class _MoKFunctionalConfig(Protocol):
+    """Structural type for the optional ``mok.functional.MoKConfig``."""
+
+    fwd_num_comm_sms: int
+    bwd_num_comm_sms: int
+    minibatch_size: int
+    macrobatch_size: int
+    schedule_capacity_multiplier: float
+    all_gather_top_experts_chunk_bytes: int
+
+
+@dataclass(kw_only=True, frozen=True)
+class MoKBackendConfig:
+    """Configuration for the optional Mixture-of-Kittens MoE backend.
+
+    Attributes:
+        fwd_num_comm_sms: Communication SMs reserved during the forward megakernel.
+        bwd_num_comm_sms: Communication SMs reserved during the backward megakernel.
+        minibatch_size: Routed-token overlap granularity, divisible by 256.
+        macrobatch_size: Routed-token ring-buffer capacity and a multiple of
+            ``minibatch_size``.
+        schedule_capacity_multiplier: Worst-case fraction of routes sent to one EP rank.
+        all_gather_top_experts_chunk_bytes: Routing all-gather chunk size in bytes.
+    """
+
+    fwd_num_comm_sms: int = 40
+    bwd_num_comm_sms: int = 28
+    minibatch_size: int = 4096
+    macrobatch_size: int = 131072
+    schedule_capacity_multiplier: float = 0.5
+    all_gather_top_experts_chunk_bytes: int = 2048
+
+    def __post_init__(self) -> None:
+        """Validate settings that do not depend on a CUDA device or EP group."""
+        for name, value in (
+            ("fwd_num_comm_sms", self.fwd_num_comm_sms),
+            ("bwd_num_comm_sms", self.bwd_num_comm_sms),
+        ):
+            if type(value) is not int or value <= 0 or value % 2 != 0:
+                raise ValueError(f"mok.{name} must be a positive even integer")
+        if type(self.minibatch_size) is not int or self.minibatch_size <= 0 or self.minibatch_size % 256 != 0:
+            raise ValueError("mok.minibatch_size must be a positive multiple of 256")
+        if (
+            type(self.macrobatch_size) is not int
+            or self.macrobatch_size <= 0
+            or self.macrobatch_size % self.minibatch_size != 0
+        ):
+            raise ValueError("mok.macrobatch_size must be a positive multiple of mok.minibatch_size")
+        if (
+            type(self.schedule_capacity_multiplier) not in (int, float)
+            or not math.isfinite(self.schedule_capacity_multiplier)
+            or self.schedule_capacity_multiplier <= 0
+        ):
+            raise ValueError("mok.schedule_capacity_multiplier must be a positive finite number")
+        if (
+            type(self.all_gather_top_experts_chunk_bytes) is not int
+            or self.all_gather_top_experts_chunk_bytes <= 0
+            or self.all_gather_top_experts_chunk_bytes % 16 != 0
+        ):
+            raise ValueError("mok.all_gather_top_experts_chunk_bytes must be a positive multiple of 16")
+
+    def build(self) -> _MoKFunctionalConfig:
+        """Build the optional MoK runtime configuration.
+
+        Returns:
+            A ``mok.functional.MoKConfig`` with these declarative settings.
+
+        Raises:
+            UnavailableError: If Mixture-of-Kittens is not installed.
+        """
+        _, mok_functional = safe_import(
+            "mok.functional",
+            msg=(
+                "dispatcher='mok' requires a built Mixture-of-Kittens installation or an importable "
+                "mixture-of-kittens checkout."
+            ),
+        )
+        return mok_functional.MoKConfig(
+            fwd_num_comm_sms=self.fwd_num_comm_sms,
+            bwd_num_comm_sms=self.bwd_num_comm_sms,
+            minibatch_size=self.minibatch_size,
+            macrobatch_size=self.macrobatch_size,
+            schedule_capacity_multiplier=self.schedule_capacity_multiplier,
+            all_gather_top_experts_chunk_bytes=self.all_gather_top_experts_chunk_bytes,
+        )
+
+
 @dataclass(kw_only=True)
 class BackendConfig:
     """Backend configuration for model components.
@@ -208,8 +296,9 @@ class BackendConfig:
             scaled grouped GEMM (training-only; GB200/sm_100+ with torchao installed,
             else falls back to torch._grouped_mm at runtime).
         dispatcher: MoE token dispatcher. "torch" uses DTensor all-gather/reduce-scatter,
-            "deepep" uses DeepEP for token dispatch,
-            "uccl_ep" uses UCCL-EP for token dispatch across heterogeneous GPUs and NICs.
+            "deepep" uses DeepEP, "hybridep" uses HybridEP, "uccl_ep" uses UCCL-EP,
+            and "mok" uses Mixture-of-Kittens' fused communication and SwiGLU megakernel.
+        mok: Mixture-of-Kittens tuning settings used when ``dispatcher="mok"``.
         dispatcher_share_token_dispatcher: Whether flex token dispatchers share a communication
             manager instance across MoE layers.
         dispatcher_async_dispatch: Whether DeepEP/UCCL-EP dispatch should return asynchronously
@@ -241,7 +330,7 @@ class BackendConfig:
     experts: Literal["torch", "te", "gmm", "torch_mm", "torch_mm_mxfp8"] = (
         "torch_mm" if torch.cuda.is_available() else "torch"
     )
-    dispatcher: Literal["torch", "deepep", "hybridep", "uccl_ep"] = (
+    dispatcher: Literal["torch", "deepep", "hybridep", "uccl_ep", "mok"] = (
         "deepep"
         if HAVE_DEEP_EP and torch.cuda.is_available()
         else "uccl_ep"
@@ -251,6 +340,7 @@ class BackendConfig:
     dispatcher_num_sms: int = 20
     dispatcher_share_token_dispatcher: bool = True
     dispatcher_async_dispatch: bool = False
+    mok: MoKBackendConfig = field(default_factory=MoKBackendConfig)
     enable_deepep: bool | None = None  # Removed: ignored with a warning; set dispatcher/experts explicitly
     fake_balanced_gate: bool = False
     # Approximate max/mean load ratios (64 experts, top-8, 4096 tokens):
@@ -295,6 +385,11 @@ class BackendConfig:
         elif not isinstance(self.cuda_graph, CudaGraphConfig):
             raise TypeError("cuda_graph must be a CudaGraphConfig or mapping")
 
+        if isinstance(self.mok, dict):
+            self.mok = MoKBackendConfig(**self.mok)
+        elif not isinstance(self.mok, MoKBackendConfig):
+            raise TypeError("mok must be a MoKBackendConfig or mapping")
+
         if isinstance(self.gate_precision, str):
             self.gate_precision = dtype_from_str(self.gate_precision, default=None)
 
@@ -312,7 +407,7 @@ class BackendConfig:
             self.enable_deepep = None
 
         # Backward compatibility
-        if self.experts in ("te", "gmm") and self.dispatcher not in ("deepep", "hybridep", "uccl_ep"):
+        if self.experts in ("te", "gmm") and self.dispatcher not in ("deepep", "hybridep", "uccl_ep", "mok"):
             if (
                 torch.distributed.is_initialized() and torch.distributed.get_rank() == 0
             ) or not torch.distributed.is_initialized():
