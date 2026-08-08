@@ -1216,8 +1216,8 @@ class NeMoAutoModelBiEncoder(_NeMoAutoModelForRetrievalBase):
     def from_pretrained(
         cls,
         pretrained_model_name_or_path: str,
-        pooling: str = "avg",
-        l2_normalize: bool = True,
+        pooling: str | None = None,
+        l2_normalize: bool | None = None,
         do_distributed_inbatch_negative: bool = False,
         detach_distributed_inbatch_negatives: bool = True,
         **kwargs,
@@ -1225,12 +1225,15 @@ class NeMoAutoModelBiEncoder(_NeMoAutoModelForRetrievalBase):
         """Load a bi-encoder model with infrastructure.
 
         Accepts all arguments from ``_NeMoAutoModelForRetrievalBase.from_pretrained``
-        plus the bi-encoder-specific parameters below.
+        plus the bi-encoder-specific parameters below. Sentence Transformers export
+        metadata is derived from effective model, tokenizer, and collator settings.
 
         Args:
             pretrained_model_name_or_path: Path to pretrained model or model identifier.
-            pooling: Pooling strategy (``'avg'``, ``'cls'``, ``'last'``, etc.).
-            l2_normalize: Whether to L2-normalize embeddings.
+            pooling: Pooling strategy (``'avg'``, ``'cls'``, ``'last'``, etc.). When omitted, standard
+                Sentence Transformers metadata is restored when available, otherwise defaults to ``'avg'``.
+            l2_normalize: Whether to L2-normalize embeddings. When omitted, the standard Sentence Transformers
+                module stack is restored when available, otherwise defaults to ``True``.
             do_distributed_inbatch_negative: Whether to gather passages across ranks for distributed in-batch
                 negatives during training.
             detach_distributed_inbatch_negatives: Whether to detach remote passage embeddings in distributed
