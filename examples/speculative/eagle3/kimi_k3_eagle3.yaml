@@ -1,0 +1,74 @@
+# EAGLE-3 draft training against a frozen Kimi K3 target.
+#
+# The 896 target experts are sharded with expert parallelism; the trainable draft
+# is one fused K3 MLA layer that keeps Q-LoRA, the compressed KV latent, NoPE, the
+# output gate, K3 RMSNorm and the SiTU MLP, and drops KDA, MoE and the
+# attention-residual mixer. See README_kimi_k3.md.
+
+recipe: TrainEagle3Recipe
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 120
+
+wandb:
+  enable: false
+  project: kimi-k3-eagle3
+  group: perfectblend
+  tags: [eagle3, kimi-k3, mla]
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  ep_size: 64
+  activation_checkpointing: false
+  moe:
+    reshard_after_forward: false
+    wrap_outer_model: false
+
+recipe_args:
+  target_model_name_or_path: moonshotai/Kimi-K3
+  # Or a local checkout of the same checkpoint:
+  # target_model_name_or_path: /path/to/Kimi-K3
+  train_data_path: /path/to/open-perfectblend-direct-clean   # <-- messages-format SFT data
+  val_data_path: null
+  output_dir: ./outputs/eagle3_kimi_k3_perfectblend
+  seq_length: 4096
+  micro_batch_size: 1
+  grad_accumulation_steps: 8
+  num_workers: 2
+  num_epochs: 1
+  ttt_steps: 7
+  # K3's vocabulary is 163840 wide; compress the draft head to the most frequent
+  # 32k target ids (the d2t/t2d remap tables ride along in the checkpoint).
+  draft_vocab_size: 32000
+  # The draft copies K3's 163840 x 7168 embedding table; keeping it frozen removes
+  # ~1.2B parameters worth of optimizer state.
+  freeze_embeddings: true
+
+  # Frozen-target backend knobs, shown with their defaults. Uncomment to retune the
+  # target's expert dispatch per cluster.
+  # target_attn_backend: eager
+  # target_dispatcher: torch      # deepep / hybridep when that build is available
+  # target_experts: torch_mm
+  # target_enable_fsdp_optimizations: true
+
+  trust_remote_code: false
+  shuffle_seed: 42
+  log_every_steps: 10
+  max_grad_norm: 1.0
+  packed_sequence_size: 0
+
+optimizer:
+  lr: 1.0e-4
+  betas: [0.9, 0.95]
+  weight_decay: 0.0
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: ./outputs/eagle3_kimi_k3_perfectblend/checkpoints
+  model_save_format: safetensors
+  save_consolidated: true
+  dequantize_base_checkpoint: true
