@@ -502,6 +502,9 @@ navigation:
       - page: "FP8 Training"
         path: ../../guides/fp8-training.mdx
         slug: fp8-training
+      - page: "Hub Kernels"
+        path: ../../guides/hub-kernels.mdx
+        slug: hub-kernels
       - page: "Mixed-Precision Training"
         path: ../../guides/mixed-precision-training.mdx
         slug: mixed-precision-training

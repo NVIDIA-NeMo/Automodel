@@ -108,6 +108,50 @@ class TestInitializeAttnModuleAndFunc:
                 softmax_scale=0.125,
             )
 
+    def test_hub_attention_calls_flash_attn_func(self, monkeypatch):
+        """Hub backend wraps get_flash_attn_func with BHSD layout."""
+
+        def fake_flash(q, k, v, **kwargs):
+            assert q.shape[1] == 4  # seq dim in BSHD after transpose
+            return torch.ones_like(q)
+
+        monkeypatch.setattr(
+            "nemo_automodel.components.kernels.hub.get_flash_attn_func",
+            lambda **kwargs: fake_flash,
+        )
+        _, attn_func = initialize_attn_module_and_func(
+            attn_impl="hub",
+            num_attention_heads=8,
+            num_qk_channels=64,
+            num_v_channels=64,
+            softmax_scale=0.125,
+        )
+        q = torch.randn(1, 8, 4, 64)
+        k = torch.randn(1, 8, 4, 64)
+        v = torch.randn(1, 8, 4, 64)
+        out = attn_func(q, k, v)
+        assert out.shape == q.shape
+        assert torch.all(out == 1)
+
+    def test_hub_attention_rejects_dense_mask_in_call_kwargs(self, monkeypatch):
+        """Hub flash_attn_func has no dense-mask argument; reject rather than silently drop."""
+        monkeypatch.setattr(
+            "nemo_automodel.components.kernels.hub.get_flash_attn_func",
+            lambda **kwargs: lambda *args, **kwargs: torch.ones_like(args[0]),
+        )
+        _, attn_func = initialize_attn_module_and_func(
+            attn_impl="hub",
+            num_attention_heads=8,
+            num_qk_channels=64,
+            num_v_channels=64,
+            softmax_scale=0.125,
+        )
+        q = torch.randn(1, 8, 4, 64)
+        k = torch.randn(1, 8, 4, 64)
+        v = torch.randn(1, 8, 4, 64)
+        with pytest.raises(ValueError, match="does not support dense attention masks"):
+            attn_func(q, k, v, attn_mask=torch.ones(1, 1, 4, 4, dtype=torch.bool))
+
     def test_sdpa_late_binding_picks_up_monkey_patch(self):
         """Test that SDPA attn_func uses late-bound lookup of F.scaled_dot_product_attention.
 
@@ -288,6 +332,32 @@ class TestPreprocessArgsAndKwargsForAttn:
         assert k_out.shape == expected_shape
         assert v_out.shape == expected_shape
         assert attn_kwargs["is_causal"] is True
+
+    def test_hub_preprocessing_causal_only(self):
+        """Hub preprocessing transposes and keeps causal-only flash attention."""
+        q_out, k_out, v_out, attn_kwargs = preprocess_args_and_kwargs_for_attn(
+            self.q, self.k, self.v, attention_mask=None, attn_impl="hub"
+        )
+
+        expected_shape = (self.batch_size, self.seq_len, self.num_heads, self.head_dim)
+        assert q_out.shape == expected_shape
+        assert "attn_mask" not in attn_kwargs
+        assert attn_kwargs["is_causal"] is True
+
+    def test_hub_preprocessing_rejects_padding_mask(self):
+        """Hub backend cannot consume SDPA-style dense padding masks."""
+        attention_mask = torch.ones(self.batch_size, self.seq_len, dtype=torch.bool)
+        attention_mask[:, self.seq_len // 2 :] = False
+
+        with pytest.raises(ValueError, match="does not support padded batches"):
+            preprocess_args_and_kwargs_for_attn(self.q, self.k, self.v, attention_mask=attention_mask, attn_impl="hub")
+
+    def test_hub_preprocessing_rejects_sliding_window(self):
+        """Hub flash_attn_func does not accept window_size; fail early in preprocess."""
+        with pytest.raises(ValueError, match="does not support sliding-window"):
+            preprocess_args_and_kwargs_for_attn(
+                self.q, self.k, self.v, attention_mask=None, attn_impl="hub", window_size=(128, 0)
+            )
 
     def test_sdpa_preprocessing_with_mask(self):
         """Test SDPA preprocessing skips explicit mask when attention mask has no padding."""

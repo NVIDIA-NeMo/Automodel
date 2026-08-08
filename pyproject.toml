@@ -105,6 +105,9 @@ diffusion_kernels = [
     "nemo_automodel[diffusion]",
     "kernels",
 ]
+hub_kernels = [
+    "kernels>=0.11.0",
+]
 # nvidia-cudnn-cu12 pin: This is required for GPTOSS TE support + faster cudnn attention (only on Linux where CUDA is available)
 # "nvidia-cudnn-cu12>=9.18.0.0; sys_platform == 'linux'",
 # Flash-attn version should be selected to satisfy TE requirements

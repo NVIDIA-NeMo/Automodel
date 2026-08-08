@@ -28,6 +28,7 @@ import types
 import torch
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
+from nemo_automodel.components.kernels.hub import has_flash_attn_available, is_hub_attn_implementation
 from nemo_automodel.shared.import_utils import safe_import
 
 # Check availability without fully importing (avoids CUDA init at import time).
@@ -68,7 +69,13 @@ def _device_supports_fa3() -> bool:
 if HAS_FA3 and torch.cuda.is_available() and not _device_supports_fa3():
     HAS_FA3 = False
 FLASH_ATTN_IMPLEMENTATIONS = ("flash_attention_2", "flash_attention_3", "flash_attention_4")
-DEFAULT_ATTN_IMPLEMENTATION = "flash_attention_2" if HAS_FA else "sdpa"
+DEFAULT_ATTN_IMPLEMENTATION = "flash_attention_2" if has_flash_attn_available() else "sdpa"
+
+
+def _is_flash_attn_implementation(attn_implementation: str) -> bool:
+    """Return True for pip flash-attn strings and Hub flash-attn repo ids."""
+    return attn_implementation in FLASH_ATTN_IMPLEMENTATIONS or is_hub_attn_implementation(attn_implementation)
+
 
 logger = logging.getLogger(__name__)
 
@@ -289,6 +296,8 @@ def _get_next_fallback_attn(attn_implementation: str) -> str:
         "flash_attention_3",
         "flash_attention_4",
     ]
+    if is_hub_attn_implementation(attn_implementation):
+        return "sdpa"
     if attn_implementation in priorities:
         pos = priorities.index(attn_implementation)
         return priorities[max(0, pos - 1)]
@@ -315,13 +324,20 @@ def _apply_preload_overrides(tp_size, cp_size, has_packed_sequence, attn_impleme
 
     if has_packed_sequence:
         if cp_size == 1:
-            # FA2/FA3/FA4 all support varlen packing via transformers'
-            # flash-attention wrapper; keep an explicitly requested version.
-            if attn_implementation not in FLASH_ATTN_IMPLEMENTATIONS:
-                assert HAS_FA or HAS_FA3 or HAS_FA4, "Flash Attention is not available"
-                attn_implementation = (
-                    DEFAULT_ATTN_IMPLEMENTATION if HAS_FA else ("flash_attention_3" if HAS_FA3 else "flash_attention_4")
+            # FA2/FA3/FA4 and Hub flash-attn repos support varlen packing via
+            # transformers' flash-attention wrapper; keep an explicitly requested version.
+            if not _is_flash_attn_implementation(attn_implementation):
+                assert has_flash_attn_available(attn_implementation=attn_implementation), (
+                    "Flash Attention is not available"
                 )
+                if HAS_FA:
+                    attn_implementation = DEFAULT_ATTN_IMPLEMENTATION
+                elif HAS_FA3:
+                    attn_implementation = "flash_attention_3"
+                elif HAS_FA4:
+                    attn_implementation = "flash_attention_4"
+                else:
+                    attn_implementation = DEFAULT_ATTN_IMPLEMENTATION
                 logger.warning(
                     "Packed sequence is supported only with Flash Attention. Setting model's attn_implementation to %s",
                     attn_implementation,
