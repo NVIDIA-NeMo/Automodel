@@ -659,6 +659,56 @@ def test_run_validation_epoch_does_not_sum_tokens_over_cp(monkeypatch):
     assert result.metrics["val_loss"] == pytest.approx(2.0)
 
 
+def test_run_validation_epoch_preserves_tensor_hidden_state_batch_dimension(monkeypatch):
+    """Validation must support models that return final hidden states as a tensor."""
+    from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
+
+    monkeypatch.setattr(vlm_finetune, "ScopedRNG", lambda *a, **k: nullcontext())
+    monkeypatch.setattr(vlm_finetune.ContextParallelSharder, "shard", _identity_cp_shard)
+    monkeypatch.setattr(vlm_finetune, "filter_forward_kwargs", lambda model, batch: batch)
+
+    captured = {}
+
+    def _capture_loss(*args, hidden_states, labels, **kwargs):
+        captured["hidden_states"] = hidden_states
+        captured["labels"] = labels
+        return torch.tensor(2.0)
+
+    monkeypatch.setattr(vlm_finetune, "calculate_loss", _capture_loss)
+
+    class _Model(torch.nn.Module):
+        def eval(self):
+            return self
+
+        def forward(self, logits_to_keep=None, **batch):
+            assert logits_to_keep == 1
+            return SimpleNamespace(
+                logits=torch.zeros(1, 1, 8),
+                hidden_states=torch.zeros(1, 4, 8),
+            )
+
+    recipe = FinetuneRecipeForVLM.__new__(FinetuneRecipeForVLM)
+    recipe.model_parts = [_Model()]
+    recipe.loss_fn = FusedLinearCrossEntropy()
+    recipe.device_mesh = None
+    recipe.pp_enabled = False
+    recipe.dist_env = SimpleNamespace(device=torch.device("cpu"))
+    recipe.step_scheduler = SimpleNamespace(step=3, epoch=1)
+    recipe.optimizer = [SimpleNamespace(param_groups=[{"lr": 0.001}])]
+    recipe._maybe_add_drafter_loss = lambda *, out, base_loss, labels, model, num_label_tokens: base_loss
+    recipe._dp_allreduce = lambda tensor, include_cp=False: tensor
+
+    batch = {
+        "input_ids": torch.tensor([[1, 2, 3, 4]]),
+        "labels": torch.tensor([[1, 2, -100, 4]]),
+    }
+
+    recipe._run_validation_epoch([batch])
+
+    assert captured["hidden_states"].shape == (1, 4, 8)
+    assert captured["hidden_states"].shape[:-1] == captured["labels"].shape
+
+
 def test_run_validation_epoch_cp_active_runs_pre_embed(monkeypatch):
     """With CP active and a model exposing prepare_model_inputs_for_cp, the
     validation loop must invoke the model's sharder-only CP hook before sharding.
