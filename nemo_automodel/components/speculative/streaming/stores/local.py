@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import uuid
 from typing import Mapping
 
 import torch
@@ -90,6 +91,10 @@ class LocalFeatureStore(FeatureStore):
         self._low_watermark = low_watermark_bytes if low_watermark_bytes is not None else 0
         # The lock that guards every public method.
         self._lock = threading.Lock()
+        # Per-instance identity for store_uri. id(self) is unstable: CPython
+        # reuses addresses, so a GC'd store and a freshly allocated one could
+        # share a URI and the queue would lease a dead store's ref.
+        self._uri_id = uuid.uuid4().hex
         self._storage: dict[str, dict[str, torch.Tensor]] = {}
         self._handle_refs: dict[int, str] = {}  # handle_id -> sample_id (one entry per live get() handle)
         self._resident_bytes = 0
@@ -142,7 +147,7 @@ class LocalFeatureStore(FeatureStore):
         # SharedDirFeatureStore will return a different scheme ("file://"),
         # so the queue can refuse to lease a ref whose URI does not match
         # its bound store.
-        return f"mem://local-{id(self):x}"
+        return f"mem://local-{self._uri_id}"
 
     # --- public API ---------------------------------------------------------
 

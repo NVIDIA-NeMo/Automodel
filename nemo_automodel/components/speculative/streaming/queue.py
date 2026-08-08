@@ -512,7 +512,14 @@ class SampleRefQueue:
             return len(self._outstanding)
 
     def close(self) -> None:
-        """Drain the queue; subsequent :meth:`acquire` calls return ``None``.
+        """Mark the queue closed; :meth:`acquire` drains what remains, then returns ``None``.
+
+        Closing does not discard already-enqueued refs: :meth:`acquire` keeps
+        handing out pending refs until they are all leased, and only returns
+        ``None`` once the queue is closed *and* both pending and outstanding are
+        empty. :attr:`is_closed` therefore reports the closed flag, not that the
+        queue is already drained; :class:`FeatureDataLoader` polls it to know
+        when a ``None`` from :meth:`acquire` is terminal.
 
         Outstanding leases are left intact: their consumer still owns the
         tensors, and a leaked :meth:`FeatureStore.release` would push the
