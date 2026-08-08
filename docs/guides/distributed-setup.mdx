@@ -63,6 +63,10 @@ configurations accept either a dataclass or a plain dictionary.
 YAML `distributed:` sections also forward strategy-specific fields to FSDP2 or
 DDP.
 
+`megatron_fsdp` uses Megatron Core MFSDP v2 and initially supports DP-only
+ZeRO-3. Keep `zero_dp_strategy: 3` and leave TP, CP, PP, EP, and DP replication
+at size one; use `fsdp2` for those topologies.
+
 `ParallelismSizes` is durable user intent (what you requested). The resolved
 runtime topology lives on `DistributedSetup.mesh_context`
 (`MeshContext`), which derives its sizes from the live `DeviceMesh` after build.

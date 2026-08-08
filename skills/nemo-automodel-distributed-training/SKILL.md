@@ -67,9 +67,9 @@ distributed:
 
 ### MegatronFSDP limitations
 
-Say no for pipeline parallelism, expert parallelism, and `sequence_parallel`.
-Recommend `fsdp2` for PP, EP, or `sequence_parallel`; mention that DDP is only
-simple data parallelism.
+Say MFSDP v2 is DP-only: no tensor, context, pipeline, or expert parallelism,
+and no `sequence_parallel`. Recommend `fsdp2` for TP, CP, PP, EP, or
+`sequence_parallel`; mention that DDP is only simple data parallelism.
 
 ## Strategy Selection
 
@@ -78,7 +78,7 @@ Three strategies are available, selected via the `distributed.strategy` YAML key
 | Strategy | YAML value | Best for |
 |---|---|---|
 | FSDP2 | `fsdp2` | General use, recommended default. Supports TP, PP, CP, EP, HSDP. |
-| MegatronFSDP | `megatron_fsdp` | NVIDIA Megatron-style FSDP. No PP, no EP, no sequence_parallel. |
+| MegatronFSDP | `megatron_fsdp` | Megatron Core MFSDP v2, initially DP-only ZeRO-3. |
 | DDP | `ddp` | Simple data parallelism only. No TP, PP, CP, or EP. |
 
 Decision tree:
@@ -410,9 +410,9 @@ distributed:
 
 ### MegatronFSDP limitations
 
-Despite its name, `megatron_fsdp` does **not** support expert parallelism
-(`ep_size > 1`), pipeline parallelism (`pp_size > 1`), or
-`sequence_parallel`. Use `fsdp2` for these features.
+`megatron_fsdp` initially supports only DP ZeRO-3. It does **not** support
+tensor, context, pipeline, or expert parallelism, or `sequence_parallel`.
+Use `fsdp2` for these features.
 
 ## Parallelism Sizing Guidelines
 
@@ -584,8 +584,8 @@ components/moe/config.py
 6. **MoE EP size must evenly divide `dp_size * cp_size`.** The device mesh
    creation asserts `dp_cp_size % ep_size == 0`.
 
-7. **MegatronFSDP is more limited than FSDP2.** It does not support PP
-   (`pp_size > 1`), EP (`ep_size > 1`), or `sequence_parallel`. The
+7. **MegatronFSDP is more limited than FSDP2.** It initially supports only DP
+   ZeRO-3 and does not support TP, CP, PP, EP, or `sequence_parallel`. The
    `MeshContext` validation raises on these combinations.
 
 8. **DDP supports nothing beyond data parallelism.** No TP, PP, CP, EP, or

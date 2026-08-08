@@ -302,20 +302,56 @@ class TestApplyModelInfrastructurePostShardInit:
 
         mock_ckpt.initialize_model_weights.assert_not_called()
 
-    def test_megatron_fsdp_skips_post_shard_init(self):
-        """MegatronFSDPManager wrapper should skip post-shard initialize_model_weights."""
-        mock_wrapper = MagicMock(spec=["parallelize", "moe_mesh"])
-        mock_wrapper.moe_mesh = None
-        # Make isinstance check work for MegatronFSDPManager
+    def test_megatron_fsdp_shards_meta_then_initializes_and_loads(self):
+        """MFSDP v2 shards meta parameters before initializing and loading."""
+        from nemo_automodel._transformers.infrastructure import apply_model_infrastructure
         from nemo_automodel.components.distributed.megatron_fsdp import MegatronFSDPManager
 
+        model = _DummyModel()
+        model.register_parameter("lora_adapter", torch.nn.Parameter(torch.ones(1)))
+        peft_config = SimpleNamespace(lora_A_init="xavier", use_triton=False)
+        mock_wrapper = MagicMock(spec=["parallelize", "moe_mesh", "sync_model_weights"])
+        mock_wrapper.moe_mesh = None
         mock_wrapper.__class__ = MegatronFSDPManager
+        events = MagicMock()
 
-        _, mock_ckpt = _run_apply_model_infrastructure(
-            is_meta_device=True, load_base_model=False, model_wrapper=mock_wrapper
-        )
+        def shard_after_freeze(*args):
+            assert not model.linear.weight.requires_grad
+            assert model.lora_adapter.requires_grad
+            events.shard()
+            return model
 
-        mock_ckpt.initialize_model_weights.assert_not_called()
+        with (
+            patch(f"{_INFRA_MODULE}.get_world_size_safe", return_value=2),
+            patch(f"{_INFRA_MODULE}._supports_logits_to_keep", return_value=True),
+            patch(f"{_INFRA_MODULE}.print_trainable_parameters"),
+            patch(f"{_INFRA_MODULE}._apply_peft_and_lower_precision", return_value=model),
+            patch(f"{_INFRA_MODULE}._should_load_before_shard", return_value=False),
+            patch(f"{_INFRA_MODULE}.Checkpointer") as MockCheckpointer,
+            patch(f"{_INFRA_MODULE}._shard_ep_fsdp", side_effect=shard_after_freeze),
+        ):
+            mock_ckpt = MockCheckpointer.return_value
+            mock_ckpt.config = MagicMock()
+            mock_ckpt.config.dequantize_base_checkpoint = False
+            mock_ckpt.initialize_model_weights.side_effect = lambda *args, **kwargs: events.materialize()
+            mock_ckpt.load_base_model.side_effect = lambda *args, **kwargs: events.load()
+            mock_wrapper.sync_model_weights.side_effect = lambda *args, **kwargs: events.sync()
+
+            result = apply_model_infrastructure(
+                model=model,
+                is_meta_device=True,
+                device=torch.device("cuda"),
+                load_base_model=True,
+                model_wrapper=mock_wrapper,
+                peft_config=peft_config,
+                pretrained_model_name_or_path="test/model",
+            )
+
+        assert result is model
+        assert events.mock_calls == [call.shard(), call.materialize(), call.load(), call.sync()]
+        assert mock_ckpt.initialize_model_weights.call_args.args[1] == torch.device("cuda")
+        assert mock_ckpt.load_base_model.call_args.args[1] == torch.device("cuda")
+        mock_wrapper.sync_model_weights.assert_called_once_with(model)
 
     def test_calls_model_to_device_when_checkpoint_loaded_without_dtensor(self):
         """Unsharded post-shard checkpoint loads should still move buffers with model.to(device)."""

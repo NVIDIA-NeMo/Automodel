@@ -210,13 +210,11 @@ class TestIntegration:
         setup = DistributedSetup(
             mesh_context=MeshContext(),
             strategy_config=MegatronFSDPConfig(
-                zero_dp_strategy=2,
-                overlap_grad_reduce=False,
+                zero_dp_strategy=3,
                 activation_checkpointing=True,
             ),
         )
-        assert setup.strategy_config.zero_dp_strategy == 2
-        assert setup.strategy_config.overlap_grad_reduce is False
+        assert setup.strategy_config.zero_dp_strategy == 3
 
     def test_fsdp2_validates_on_distributed_setup(self):
         """DistributedSetup validates strategy policy against mesh topology."""

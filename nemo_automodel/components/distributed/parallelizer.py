@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import importlib
-import inspect
 import logging
 import warnings
 from abc import ABC, abstractmethod
@@ -118,6 +117,8 @@ from transformers.models.qwen2_vl.modeling_qwen2_vl import (
 )
 from transformers.models.smolvlm.modeling_smolvlm import SmolVLMForConditionalGeneration
 
+# Import as module so tests can patch nemo_automodel.components.distributed.parallelizer_utils.fully_shard_by_dtype
+import nemo_automodel.components.distributed.parallelizer_utils as parallelizer_utils
 from nemo_automodel._transformers.v4_patches.rotary import _is_nemotron_flash_config
 from nemo_automodel.components.distributed.optimized_tp_plans import (
     LLAMA_NEMOTRON_SUPER_TP_PLAN_NAME,
@@ -128,44 +129,9 @@ from nemo_automodel.components.distributed.optimized_tp_plans import (
     get_llama_nemotron_super_tp_plan,
 )
 from nemo_automodel.components.distributed.parallel_styles import translate_to_lora
-from nemo_automodel.shared.import_utils import UnavailableMeta, safe_import_from
-
-_MEGATRON_FSDP_050_REQUIRED_MSG = (
-    "megatron_fsdp.MixedPrecisionPolicy could not be imported: NeMo Automodel requires megatron-fsdp==0.5.0"
-)
-
-HAVE_MEGATRON_FSDP = False
-logging.getLogger("megatron_fsdp").setLevel(logging.WARNING)
-try:
-    from megatron_fsdp import fully_shard as megatron_fsdp_fully_shard
-    from megatron_fsdp import fully_shard_model as megatron_fsdp_fully_shard_model
-
-    # megatron-fsdp==0.5.0, the only supported release, always exports
-    # MixedPrecisionPolicy. safe_import_from keeps module import safe on any
-    # other install; constructing the returned placeholder then raises
-    # _MEGATRON_FSDP_050_REQUIRED_MSG instead of silently degrading.
-    _, MegatronFSDPMixedPrecisionPolicy = safe_import_from(
-        "megatron_fsdp", "MixedPrecisionPolicy", msg=_MEGATRON_FSDP_050_REQUIRED_MSG
-    )
-
-    HAVE_MEGATRON_FSDP = True
-except (ImportError, FileNotFoundError, OSError):
-    # megatron_fsdp itself is unavailable; every use is already guarded by
-    # HAVE_MEGATRON_FSDP, and this placeholder fails loudly like the one above.
-    MegatronFSDPMixedPrecisionPolicy = UnavailableMeta(
-        "MixedPrecisionPolicy", (), {"_msg": _MEGATRON_FSDP_050_REQUIRED_MSG}
-    )
-
-# Import as module so tests can patch nemo_automodel.components.distributed.parallelizer_utils.fully_shard_by_dtype
-import nemo_automodel.components.distributed.parallelizer_utils as parallelizer_utils
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
-
-# One-time flag: megatron-fsdp 0.5.0 removed the legacy buffer-level NaN check,
-# so a truthy check_for_nan_in_grad is dropped by _megatron_fsdp_compat_kwargs
-# and only warned about once per process.
-_megatron_fsdp_nan_check_noop_warned = False
 
 
 def apply_selective_activation_checkpointing(
@@ -2397,57 +2363,6 @@ def fsdp2_strategy_parallelize(
     )
 
 
-def _megatron_fsdp_compat_kwargs(
-    shard_fn,
-    *,
-    grad_reduce_in_fp32: bool,
-    preserve_fp32_weights: bool,
-    check_for_nan_in_grad: bool,
-    report_nan_in_param_grad: bool,
-) -> Dict[str, Any]:
-    """Translate the config precision controls to the Megatron-FSDP 0.5.0 API.
-
-    megatron-fsdp==0.5.0, the only supported release, expresses precision
-    through a ``MixedPrecisionPolicy`` plus a more expensive per-parameter NaN
-    reporter. The reporter stays a separate opt-in rather than being silently
-    enabled from the legacy buffer-check setting; because 0.5.0 has no
-    buffer-level NaN check at all, a truthy ``check_for_nan_in_grad`` is
-    dropped with a one-time warning that points at ``report_nan_in_param_grad``
-    as the opt-in replacement. Any other ``fully_shard`` signature — older or
-    newer releases alike — fails loudly instead of guessing a translation.
-    """
-    try:
-        parameters = inspect.signature(shard_fn).parameters
-    except (TypeError, ValueError) as exc:
-        raise RuntimeError("cannot determine the installed Megatron-FSDP fully_shard API") from exc
-
-    required_names = {"mixed_precision_policy", "report_nan_in_param_grad"}
-    if not required_names.issubset(parameters):
-        raise RuntimeError(
-            "unsupported Megatron-FSDP fully_shard API: NeMo Automodel requires megatron-fsdp==0.5.0, "
-            f"whose signature has the arguments {sorted(required_names)!r}; got {sorted(parameters)!r}"
-        )
-
-    global _megatron_fsdp_nan_check_noop_warned
-    if check_for_nan_in_grad and not _megatron_fsdp_nan_check_noop_warned:
-        _megatron_fsdp_nan_check_noop_warned = True
-        logger.warning(
-            "check_for_nan_in_grad=True is a no-op with megatron-fsdp==0.5.0, which removed the "
-            "legacy buffer-level NaN check: gradient NaN checking is now DISABLED. Set "
-            "report_nan_in_param_grad=True to restore per-parameter gradient NaN checking."
-        )
-    return {
-        "mixed_precision_policy": MegatronFSDPMixedPrecisionPolicy(
-            main_params_dtype=torch.float32 if preserve_fp32_weights else None,
-            main_grads_dtype=torch.float32 if grad_reduce_in_fp32 else None,
-            # In megatron-fsdp 0.5.0, None makes communication use the main
-            # gradient dtype, matching the legacy grad_reduce_in_fp32 flag.
-            grad_comm_dtype=None,
-        ),
-        "report_nan_in_param_grad": report_nan_in_param_grad,
-    }
-
-
 def _derive_megatron_fsdp_unit_modules(model: nn.Module) -> list[type[nn.Module]]:
     """Derive the MegatronFSDP wrap classes from a model's ``_no_split_modules``.
 
@@ -2500,189 +2415,6 @@ def _derive_megatron_fsdp_unit_modules(model: nn.Module) -> list[type[nn.Module]
         [cls.__name__ for cls in derived],
     )
     return derived
-
-
-def megatron_fsdp_strategy_parallelize(
-    model,
-    device_mesh: DeviceMesh,
-    optimizer=None,
-    megatron_fsdp_unit_modules: Optional[List[str]] = None,
-    tp_shard_plan: Optional[Dict[str, Union[RowwiseParallel, ColwiseParallel, SequenceParallel]]] = None,
-    zero_dp_strategy: int = 3,
-    init_fsdp_with_meta_device: bool = False,
-    grad_reduce_in_fp32: bool = False,
-    preserve_fp32_weights: bool = False,
-    overlap_grad_reduce: bool = True,
-    overlap_param_gather: bool = True,
-    check_for_nan_in_grad: bool = True,
-    report_nan_in_param_grad: bool = False,
-    average_in_collective: bool = False,
-    disable_bucketing: bool = False,
-    calculate_per_token_loss: bool = False,
-    keep_fp8_transpose_cache: bool = False,
-    nccl_ub: bool = False,
-    fsdp_double_buffer: bool = False,
-    dp_shard_dim: str = "dp",
-    tp_dim: str = "tp",
-):
-    """
-    Apply tensor/data parallelism (MegatronFSDP) and optional activation-checkpointing to the model.
-
-    Args:
-        model: The model to be parallelized.
-        device_mesh (DeviceMesh): The device mesh describing the physical devices
-            used for distributed training.
-        megatron_fsdp_unit_modules (Optional[List[str]]): Class paths of the sub-modules that
-            should become individual MegatronFSDP units. When None or empty, the wrap classes
-            are auto-derived from the model's ``_no_split_modules`` (see
-            :func:`_derive_megatron_fsdp_unit_modules`).
-        tp_shard_plan (Optional[Dict[str, Union[RowwiseParallel, ColwiseParallel, SequenceParallel]]]):
-            A tensor-parallel sharding plan.
-            Keys are module names; values specify the parallel style to apply
-            (e.g., RowwiseParallel, ColwiseParallel, SequenceParallel).
-        zero_dp_strategy (int): The zero-DP strategy to use.
-        init_fsdp_with_meta_device (bool): If True, construct the model on a
-            meta device first and materialize weights lazily to reduce memory
-            fragmentation.
-        grad_reduce_in_fp32 (bool): Reduce gradients in FP32 irrespective of the
-            parameter precision to improve numerical stability.
-        preserve_fp32_weights (bool): Keep a master FP32 copy of weights when
-            training in reduced precision (e.g., FP16/BF16).
-        overlap_grad_reduce (bool): If True, overlap gradient reduction with
-            backward computation.
-        overlap_param_gather (bool): If True, overlap parameter gathering with
-            forward computation.
-        check_for_nan_in_grad (bool): Legacy buffer-level gradient NaN check.
-            BREAKING CHANGE on megatron-fsdp 0.5.0: this flag is a no-op,
-            preserved only for config compatibility. 0.5.0 removed the
-            buffer-level NaN check entirely, so gradient NaN checking is now OFF
-            regardless of this value; a truthy value is dropped with a one-time
-            warning per process. Enable ``report_nan_in_param_grad`` to restore
-            gradient NaN checking.
-        report_nan_in_param_grad (bool): Whether Megatron-FSDP should perform
-            its precise per-parameter gradient NaN check. This is the 0.5.0
-            replacement for ``check_for_nan_in_grad`` and is disabled by default
-            because it can significantly reduce training throughput.
-        average_in_collective (bool): Perform gradient averaging inside the
-            collective operation instead of dividing afterward.
-        disable_bucketing (bool): Disable gradient bucketing; gradients are
-            reduced immediately as they are produced.
-        calculate_per_token_loss (bool): Compute loss normalized by the number of
-            tokens instead of the number of sequences.
-        keep_fp8_transpose_cache (bool): Retain the FP8
-            transpose cache when using a custom MegatronFSDP wrapper.
-        nccl_ub (bool): Enable NCCL user-buffer API (experimental) for reduced
-            latency on some networks.
-        fsdp_double_buffer (bool): Enable double buffering of parameters to
-            overlap communication and computation in MegatronFSDP.
-        dp_shard_dim (str): Key name for the data parallel mesh in device_mesh.
-            Defaults to "dp".
-        tp_dim (str): Key name for the tensor parallel mesh in device_mesh.
-            Defaults to "tp".
-
-    NOTE: The passed-in model should preferably reside on the meta device.
-    Otherwise, ensure the model fits into available GPU or CPU memory.
-
-    NOTE: The user must ensure that the provided tp_shard_plan is compatible
-    with the model architecture.
-    """
-    assert HAVE_MEGATRON_FSDP, (
-        "MegatronFSDP is not installed, please visit \
-        https://github.com/NVIDIA/Megatron-LM/tree/main/megatron/core/distributed/fsdp/src for \
-        more information"
-    )
-
-    # DP_CP ranks are sharded by FSDP.
-    dp_mesh = device_mesh[dp_shard_dim]
-    tp_mesh = device_mesh[tp_dim]
-
-    if dp_mesh.size() > 1:
-        # TODO(boxiangw): remove this once HSDP is supported.
-        assert dp_mesh.ndim == 1, "Hybrid-sharding not supported"
-
-    # TP sharding.
-    if tp_mesh.size() > 1:
-        parallelize_module(model, tp_mesh, tp_shard_plan)
-
-    # MegatronFSDP requires a sharded DP dimension to create its param/grad buffers.
-    # In practice, configurations like world_size=2,tp=2 -> dp=1 frequently hit
-    # DTensor metadata assertions inside megatron_fsdp. In that case, we still
-    # support training by applying TP-only and skipping the MegatronFSDP wrapper.
-    if dp_mesh.size() == 1:
-        logger.warning(
-            "MegatronFSDP DP shard group size is 1; skipping MegatronFSDP wrapping and returning the "
-            "TP-parallelized model. To enable MegatronFSDP sharding, use dp_size>1 (e.g., tp_size=1 "
-            "for world_size=2)."
-        )
-        # `parallelize_module` only moves/shards modules covered by the TP plan.
-        # Ensure the remaining (non-sharded) parameters/buffers are on the local device.
-        if getattr(device_mesh, "device_type", None) == "cuda" and torch.cuda.is_available():
-            try:
-                model = model.to(torch.device("cuda", torch.cuda.current_device()))
-            except Exception:
-                # Best-effort fallback (e.g., if current_device isn't set).
-                model = model.to("cuda")
-        return model, optimizer
-
-    # Resolve the MegatronFSDP unit (wrap) modules (only needed on the wrapping path).
-    # When the config specifies them, import the class paths as-is. Otherwise derive
-    # them from the model's `_no_split_modules` so the real instantiated block classes
-    # are wrapped regardless of backend (HF or NeMo-custom); a mismatched hard-coded
-    # class path would otherwise wrap zero modules and MegatronFSDP would raise a
-    # ZeroDivisionError (total_fsdp_module=0).
-    if megatron_fsdp_unit_modules:
-        megatron_fsdp_unit_modules = import_classes_from_paths(megatron_fsdp_unit_modules)
-    else:
-        megatron_fsdp_unit_modules = _derive_megatron_fsdp_unit_modules(model)
-
-    # Wrap model with MegatronFSDP.
-    # When an optimizer is provided, use the combined fully_shard which handles
-    # both model wrapping and optimizer sharding in one step.
-    # When optimizer is None (e.g., during model creation before optimizer
-    # instantiation), use fully_shard_model to wrap only the model and prepare
-    # distributed parameters so the optimizer can be sharded later via
-    # fully_shard_optimizer.
-    fsdp_kwargs = dict(
-        fsdp_unit_modules=megatron_fsdp_unit_modules,
-        device_mesh=device_mesh,
-        dp_shard_dim=dp_shard_dim,
-        tp_dim=tp_dim,
-        zero_dp_strategy=zero_dp_strategy,
-        init_model_with_meta_device=init_fsdp_with_meta_device,
-        overlap_grad_reduce=overlap_grad_reduce,
-        overlap_param_gather=overlap_param_gather,
-        average_in_collective=average_in_collective,
-        disable_bucketing=disable_bucketing,
-        calculate_per_token_loss=calculate_per_token_loss,
-        keep_fp8_transpose_cache=keep_fp8_transpose_cache,
-        nccl_ub=nccl_ub,
-        fsdp_double_buffer=fsdp_double_buffer,
-    )
-    if optimizer is not None:
-        fsdp_kwargs.update(
-            _megatron_fsdp_compat_kwargs(
-                megatron_fsdp_fully_shard,
-                grad_reduce_in_fp32=grad_reduce_in_fp32,
-                preserve_fp32_weights=preserve_fp32_weights,
-                check_for_nan_in_grad=check_for_nan_in_grad,
-                report_nan_in_param_grad=report_nan_in_param_grad,
-            )
-        )
-        model, optimizer = megatron_fsdp_fully_shard(module=model, optimizer=optimizer, **fsdp_kwargs)
-    else:
-        fsdp_kwargs.update(
-            _megatron_fsdp_compat_kwargs(
-                megatron_fsdp_fully_shard_model,
-                grad_reduce_in_fp32=grad_reduce_in_fp32,
-                preserve_fp32_weights=preserve_fp32_weights,
-                check_for_nan_in_grad=check_for_nan_in_grad,
-                report_nan_in_param_grad=report_nan_in_param_grad,
-            )
-        )
-        model = megatron_fsdp_fully_shard_model(module=model, **fsdp_kwargs)
-        model._replace_param_with_distributed_if_needed()
-
-    return model, optimizer
 
 
 @contextmanager

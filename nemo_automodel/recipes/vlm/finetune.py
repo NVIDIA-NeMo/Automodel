@@ -92,13 +92,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-try:
-    from megatron_fsdp import MegatronFSDP
-    from megatron_fsdp.fully_shard import fully_shard_optimizer
-except (ImportError, FileNotFoundError, OSError):
-    MegatronFSDP = None
-    fully_shard_optimizer = None
-
 # ---------------------------
 #  Stateless helper functions
 # ---------------------------
