@@ -165,7 +165,7 @@ dataset:
 
 When an env var placeholder is resolved, the config keeps the original placeholder in an internal `._orig_value` field for **safe printing**:
 
-- `str(cfg)` / `repr(cfg)` prints placeholders (e.g. `${DATABRICKS_TOKEN}`), not resolved secrets.
+- `str(cfg)` / `repr(cfg)` prints placeholders (for example, `${DATABRICKS_TOKEN}`), not resolved secrets.
 - `cfg.to_yaml_dict(use_orig_values=True, redact_sensitive=True)` is the recommended way to produce a loggable YAML dict.
 
 <Info>
