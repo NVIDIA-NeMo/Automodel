@@ -33,7 +33,8 @@ Expected batch keys (produced by ``tools/diffusion/processors/ltx2.py``):
 
 import inspect
 import logging
-from typing import Any, Dict
+from functools import lru_cache
+from typing import Any, Callable, Dict, Mapping
 
 import torch
 import torch.nn as nn
@@ -50,6 +51,15 @@ _MISSING_KEY_HINT = (
     "'ltx2' processor (tools/diffusion/preprocessing_multiprocess.py --processor ltx2), "
     "which caches audio latents and per-stream text embeddings."
 )
+
+
+@lru_cache(maxsize=256)
+def _get_forward_parameters(forward_callable: Callable[..., Any]) -> Mapping[str, inspect.Parameter] | None:
+    """Cache parameters by the underlying ``forward`` callable."""
+    try:
+        return inspect.signature(forward_callable).parameters
+    except (TypeError, ValueError):
+        return None
 
 
 def _pack_video_latents(latents: torch.Tensor) -> torch.Tensor:
@@ -250,9 +260,22 @@ class LTX2Adapter(ModelAdapter):
         """
         model_kwargs = {k: v for k, v in inputs.items() if not k.startswith("_")}
         unwrapped = getattr(model, "module", model)
-        try:
-            parameters = inspect.signature(unwrapped.forward).parameters
-        except (TypeError, ValueError):
+        forward = getattr(unwrapped, "forward", None)
+        if not callable(forward):
+            return model_kwargs
+        class_forward = inspect.getattr_static(type(unwrapped), "forward", None)
+        if inspect.ismethod(forward) and getattr(forward, "__func__", None) is class_forward:
+            parameters = _get_forward_parameters(forward.__func__)
+            if parameters:
+                parameters = dict(tuple(parameters.items())[1:])
+        else:
+            # Avoid retaining partials and callable instances, which can own the
+            # module and its parameters. These uncommon forms stay uncached.
+            try:
+                parameters = inspect.signature(forward).parameters
+            except (TypeError, ValueError):
+                return model_kwargs
+        if parameters is None:
             return model_kwargs
         if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values()):
             return model_kwargs

@@ -122,5 +122,6 @@ freeze_config:
 
 ci:
   recipe_owner: Butterfingrz
+  time: "00:20:00"
   env_vars:
     MAX_STEPS: 10

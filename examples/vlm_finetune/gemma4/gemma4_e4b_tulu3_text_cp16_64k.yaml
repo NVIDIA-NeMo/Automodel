@@ -133,4 +133,7 @@ wandb:
   dir: <your_wandb_save_dir>
 ci:
   nodes: 2
-  time: "00:15:00"
+  time: "01:00:00"
+  env_vars:
+    # CP backward fragments the allocator; the FSDP gradient bucket then cannot fit, leads to OOM.
+    PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
