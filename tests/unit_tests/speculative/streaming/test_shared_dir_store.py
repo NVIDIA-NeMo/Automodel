@@ -296,14 +296,31 @@ def test_shared_dir_store_cross_process_get_and_release(tmp_path) -> None:
     assert not (tmp_path / "store" / "s1.safetensors").exists()
 
 
-def test_shared_dir_store_health_scans_directory(tmp_path) -> None:
+def test_shared_dir_store_health_is_scoped_to_owned_files(tmp_path) -> None:
+    # health() is served from in-memory counters scoped to the files this
+    # instance put, not a directory scan: the producer sees its own sample; a
+    # second instance that put nothing sees an empty store even though the file
+    # is on the shared directory. This keeps the queue's health() polling off
+    # the filesystem and gives each rank its full configured budget.
     directory = str(tmp_path / "store")
     producer = SharedDirFeatureStore(directory, max_samples=4, max_bytes=4 * 1024 * 1024)
     consumer = SharedDirFeatureStore(directory, max_samples=4, max_bytes=4 * 1024 * 1024)
     _put(producer, "s1", n_floats=128)
-    health = consumer.health()
-    assert health.sample_count == 1
-    assert health.resident_bytes > 0
+    assert producer.health().sample_count == 1
+    assert producer.health().resident_bytes > 0
+    assert consumer.health().sample_count == 0
+    assert consumer.health().resident_bytes == 0
+
+
+def test_shared_dir_store_close_with_outstanding_handles_does_not_raise(store, tmp_path) -> None:
+    # close() clears state unconditionally, mirroring LocalFeatureStore: the
+    # FeatureStore ABC only promises idempotency, so a generic caller must get
+    # the same shutdown semantics from either backend rather than a RuntimeError
+    # from this one alone.
+    ref = _put(store, "s1", n_floats=64)
+    _out, _handle = store.get(ref)  # leave a handle outstanding
+    store.close()
+    assert not (tmp_path / "store" / "s1.safetensors").exists()
 
 
 def test_shared_dir_store_atomic_write_leaves_no_partial_files(tmp_path) -> None:

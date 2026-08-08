@@ -144,14 +144,25 @@ class AsyncFeaturePipeline:
     def start(self) -> None:
         """Spawn the background producer thread.
 
-        Idempotent: a second call while the thread is alive is a
-        no-op. The thread is named ``streaming-async-producer`` so
-        test failures and runtime traces show which thread is hung.
+        Idempotent while the thread is alive: a second call is a no-op. The
+        thread is named ``streaming-async-producer`` so test failures and
+        runtime traces show which thread is hung.
+
+        The pipeline is single-use. When the producer thread exits -- prompt
+        source exhausted, :meth:`stop`, or an error -- the bound queue is
+        closed in ``_run``'s ``finally`` so the consumer drains and stops. A
+        closed queue cannot reopen, so restarting is not supported; construct
+        a fresh pipeline (and queue) to stream again. Restart is rejected here
+        rather than failing later with an opaque "queue is closed" from a
+        blocking put.
         """
         if self._thread is not None and self._thread.is_alive():
             return
-        self._stop_event.clear()
-        self._joined_event.clear()
+        if self._queue.is_closed:
+            raise RuntimeError(
+                "AsyncFeaturePipeline is single-use: its queue is already closed. "
+                "Construct a new pipeline and queue to stream again."
+            )
         self._thread = threading.Thread(
             target=self._run,
             name="streaming-async-producer",
@@ -229,6 +240,11 @@ class AsyncFeaturePipeline:
                         abort_when=self._stop_event.is_set,
                     )
                 except RuntimeError as e:
+                    # The ref was produced (its sample is resident in the store)
+                    # but never entered the queue, so no consumer can release it.
+                    # Discard it or it orphans -- an on-disk .safetensors file for
+                    # SharedDirFeatureStore -- until this instance's close().
+                    self._producer.discard(ref)
                     if self._stop_event.is_set() and (
                         "aborted during shutdown" in str(e) or "closed while put was waiting" in str(e)
                     ):

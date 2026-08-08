@@ -155,9 +155,13 @@ def test_async_pipeline_producer_runs_ahead_of_loader(producer, queue) -> None:
 
 
 def test_async_pipeline_start_is_idempotent(producer, queue) -> None:
-    pipe = AsyncFeaturePipeline(producer, queue, _prompts(0))
+    # stop_on_exhausted=False keeps the producer thread alive (polling an empty
+    # source) so the second start() exercises the no-op-while-alive path rather
+    # than racing thread exit, which would close the queue and trip the
+    # single-use guard.
+    pipe = AsyncFeaturePipeline(producer, queue, _prompts(0), stop_on_exhausted=False, poll_interval=0.05)
     pipe.start()
-    pipe.start()  # no-op the second time
+    pipe.start()  # no-op the second time (thread still alive)
     pipe.stop()
 
 
@@ -179,6 +183,18 @@ def test_async_pipeline_context_manager_drains_on_exit(producer, queue) -> None:
     with AsyncFeaturePipeline(producer, queue, _prompts(2)) as pipe:
         pipe.join(timeout=2.0)
     assert queue.is_closed
+
+
+def test_async_pipeline_rejects_restart_after_stop(producer, queue) -> None:
+    # Single-use: once the producer thread exits, the bound queue is closed and
+    # cannot reopen. A restart must raise a clear error here rather than failing
+    # later with an opaque "queue is closed" from a blocking put.
+    pipe = AsyncFeaturePipeline(producer, queue, _prompts(1))
+    pipe.start()
+    pipe.stop(join_timeout=2.0)
+    assert queue.is_closed
+    with pytest.raises(RuntimeError, match="single-use"):
+        pipe.start()
 
 
 # --- 3. prompt-source variants ----------------------------------------------
@@ -280,7 +296,12 @@ def test_async_pipeline_propagates_producer_error(target, store, queue) -> None:
 
 
 def test_async_pipeline_stop_unblocks_backpressured_producer(producer, queue) -> None:
-    """``stop`` closes the queue so a blocked ``put_blocks_until_below`` exits."""
+    """``stop`` closes the queue so a blocked ``put_blocks_until_below`` exits.
+
+    Also covers orphan cleanup: the sample the producer wrote before blocking on
+    the put never entered the queue, so ``stop`` must discard it rather than
+    leak it -- the store's sample count returns to its pre-pipeline level.
+    """
     small_store = LocalFeatureStore(
         max_samples=8,
         max_bytes=256 * 1024,
@@ -295,14 +316,17 @@ def test_async_pipeline_stop_unblocks_backpressured_producer(producer, queue) ->
             attention_mask=torch.ones(2, 8, dtype=torch.long),
             loss_mask=torch.ones(2, 8, dtype=torch.long),
         )
+    resident_before = small_store.health().sample_count
     assert small_store.health().high_watermark_hit
 
     pipe = AsyncFeaturePipeline(small_producer, small_queue, _prompts(1), poll_interval=0.01)
     pipe.start()
-    time.sleep(0.1)
+    time.sleep(0.1)  # let the thread produce one sample and block on the put
     assert pipe._thread is not None and pipe._thread.is_alive()
     pipe.stop(join_timeout=2.0)
     assert small_queue.is_closed
+    # The orphaned sample (produced but never enqueued) was discarded.
+    assert small_store.health().sample_count == resident_before
 
 
 def test_async_pipeline_with_shared_dir_store(tmp_path) -> None:

@@ -36,6 +36,13 @@ The store is the rendezvous for a multi-process run:
 
 Backpressure is identical to :class:`LocalFeatureStore`: sample and
 byte caps with the high / low-watermark hysteresis the queue reads.
+Residency (:meth:`health` and the ``max_samples`` / ``max_bytes`` caps)
+is scoped to the files *this* instance put, tracked in in-memory
+counters. That keeps :meth:`health` off the filesystem hot path (the
+queue polls it every ``poll_interval`` while a producer is paused) and
+gives each rank its full configured budget instead of 1/N of a
+directory-global measurement. Files other ranks wrote are not counted
+here; disk-global capacity is the deployment's responsibility.
 """
 
 from __future__ import annotations
@@ -145,26 +152,6 @@ class SharedDirFeatureStore(FeatureStore):
             )
         return os.path.join(self._directory, f"{sample_id}.safetensors")
 
-    def _directory_residency(self) -> tuple[int, int]:
-        """Return ``(sample_count, resident_bytes)`` from on-disk sample files."""
-        sample_count = 0
-        resident_bytes = 0
-        try:
-            names = os.listdir(self._directory)
-        except OSError:
-            return 0, 0
-        for name in names:
-            if not name.endswith(".safetensors") or name.startswith(".tmp."):
-                continue
-            path = os.path.join(self._directory, name)
-            try:
-                if os.path.isfile(path):
-                    resident_bytes += os.path.getsize(path)
-                    sample_count += 1
-            except OSError:
-                continue
-        return sample_count, resident_bytes
-
     def _atomic_write(self, path: str, tensors: Mapping[str, torch.Tensor]) -> int:
         # Atomic write: serialize to a tmp file in the same directory,
         # then os.replace. A concurrent reader either sees the old file
@@ -214,7 +201,8 @@ class SharedDirFeatureStore(FeatureStore):
                 raise RuntimeError("SharedDirFeatureStore is closed; no further puts accepted")
             if sample_id in self._owned_files or os.path.isfile(path):
                 raise ValueError(f"sample_id already present in store: {sample_id}")
-            sample_count, resident_bytes = self._directory_residency()
+            sample_count = len(self._owned_files)
+            resident_bytes = sum(self._owned_files.values())
             if self._max_samples is not None and sample_count >= self._max_samples:
                 raise MemoryError(
                     f"SharedDirFeatureStore at sample-count cap ({sample_count}/{self._max_samples}); "
@@ -348,7 +336,7 @@ class SharedDirFeatureStore(FeatureStore):
                     pass
                 except OSError:
                     logger.exception("SharedDirFeatureStore unlink failed for %s; ignoring", path)
-            _, resident_bytes = self._directory_residency()
+            resident_bytes = sum(self._owned_files.values())
             logger.debug(
                 "SharedDirFeatureStore release sample_id=%s handle_id=%s remaining_siblings=%d resident=%d",
                 sample_id,
@@ -363,11 +351,18 @@ class SharedDirFeatureStore(FeatureStore):
         return 0
 
     def health(self) -> StoreHealth:
-        sample_count, resident_bytes = self._directory_residency()
+        # Served from in-memory counters (this instance's owned files), never a
+        # directory scan: the queue polls health() every poll_interval while a
+        # producer is backpressure-paused, and an os.listdir + per-file getsize
+        # on each poll is a metadata storm on the shared mount. The ABC requires
+        # health() to serve from cached counters for exactly this reason.
         with self._lock:
             if self._closed:
                 sample_count = 0
                 resident_bytes = 0
+            else:
+                sample_count = len(self._owned_files)
+                resident_bytes = sum(self._owned_files.values())
             capacity = self._max_bytes if self._max_bytes is not None else 0
             return StoreHealth(
                 resident_bytes=resident_bytes,
@@ -381,12 +376,13 @@ class SharedDirFeatureStore(FeatureStore):
         with self._lock:
             if self._closed:
                 return
-            outstanding = len(self._handle_refs)
-            if outstanding:
-                raise RuntimeError(
-                    f"SharedDirFeatureStore.close() called with {outstanding} outstanding handle(s); "
-                    f"release all StoreHandles before closing"
-                )
+            # Clear state unconditionally, mirroring LocalFeatureStore.close():
+            # the FeatureStore ABC only promises close() is idempotent and says
+            # nothing about rejecting outstanding handles, so a caller closing a
+            # store generically must get the same shutdown semantics from either
+            # backend rather than a RuntimeError from this one alone.
+            if self._handle_refs:
+                logger.debug("SharedDirFeatureStore.close() dropping %d outstanding handle(s)", len(self._handle_refs))
             self._closed = True
             # Delete every file this store instance still owns. A
             # crashed process leaks its files into the directory;
