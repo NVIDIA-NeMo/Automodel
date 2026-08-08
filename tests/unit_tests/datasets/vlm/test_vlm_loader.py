@@ -15,14 +15,20 @@
 from dataclasses import dataclass
 
 import pytest
+from transformers import ProcessorMixin
 
 from nemo_automodel.components.config.loader import ConfigNode
-from nemo_automodel.components.datasets.vlm.collate_fns import packed_sequence_thd_vlm_collater
+from nemo_automodel.components.datasets.llm.chat_dataset import ChatDatasetConfig
+from nemo_automodel.components.datasets.vlm.collate_fns import (
+    neat_packed_vlm_collater,
+    packed_sequence_thd_vlm_collater,
+)
 from nemo_automodel.components.datasets.vlm.datasets import CordV2DatasetConfig, PreTokenizedDatasetWrapperConfig
 from nemo_automodel.components.datasets.vlm.loader import (
     VlmCollatorConfig,
     VlmDataloaderConfig,
     VlmProcessorConfig,
+    VlmVideoProcessorConfig,
 )
 from nemo_automodel.components.datasets.vlm.mock import MockVlmDatasetConfig
 from nemo_automodel.components.datasets.vlm.neat_packing_vlm import NeatPackConfig
@@ -158,6 +164,83 @@ def test_vlm_dataloader_builds_processor_and_dataset_inside_context_then_iterate
     assert batch_processor is processor
 
 
+def test_vlm_processor_builds_independently_configured_video_processor():
+    video_processor = object()
+    calls = []
+
+    def build_video_processor(*, pretrained_model_name_or_path, size, fps, max_frames):
+        calls.append(("video", pretrained_model_name_or_path, size, fps, max_frames))
+        return video_processor
+
+    def build_processor(*, model_id, video_processor):
+        calls.append(("processor", model_id, video_processor))
+        return DummyProcessor()
+
+    config = VlmProcessorConfig(
+        factory=build_processor,
+        kwargs={"model_id": "outer-model"},
+        video_processor=VlmVideoProcessorConfig(
+            factory=build_video_processor,
+            kwargs={
+                "size": {"shortest_edge": 1024, "longest_edge": 524288},
+                "fps": 2,
+                "max_frames": 8,
+            },
+        ),
+    )
+
+    result = config.build(pretrained_model_name_or_path="runtime-model")
+
+    assert isinstance(result, DummyProcessor)
+    assert calls == [
+        ("video", "runtime-model", {"shortest_edge": 1024, "longest_edge": 524288}, 2, 8),
+        ("processor", "outer-model", video_processor),
+    ]
+
+
+def test_recipe_config_resolves_nested_vlm_video_processor():
+    def build_video_processor(**kwargs):
+        return kwargs
+
+    def build_processor(**kwargs):
+        return kwargs
+
+    config = RecipeConfig(
+        ConfigNode(
+            {
+                "processor": {
+                    "_target_": build_processor,
+                    "pretrained_model_name_or_path": "outer-model",
+                    "video_processor": {
+                        "_target_": build_video_processor,
+                        "size": {"shortest_edge": 1024, "longest_edge": 524288},
+                        "fps": 2,
+                        "max_frames": 8,
+                    },
+                },
+                "dataset": {
+                    "_target_": "nemo_automodel.components.datasets.vlm.mock.build_mock_vlm_dataset",
+                    "num_samples": 1,
+                },
+                "dataloader": {
+                    "_target_": "torchdata.stateful_dataloader.StatefulDataLoader",
+                    "num_workers": 0,
+                },
+            }
+        )
+    ).vlm_dataloader.processor_config
+
+    assert config.factory is build_processor
+    assert config.kwargs == {"pretrained_model_name_or_path": "outer-model"}
+    assert config.video_processor is not None
+    assert config.video_processor.factory is build_video_processor
+    assert config.video_processor.kwargs == {
+        "size": {"shortest_edge": 1024, "longest_edge": 524288},
+        "fps": 2,
+        "max_frames": 8,
+    }
+
+
 def test_vlm_dataloader_selects_thd_collater(monkeypatch):
     processor = DummyProcessor()
     monkeypatch.setattr(PreTokenizedDatasetWrapperConfig, "build", lambda self, dataset, processor: dataset)
@@ -179,3 +262,115 @@ def test_vlm_dataloader_selects_thd_collater(monkeypatch):
 
     assert result.dataloader.collate_fn.func is packed_sequence_thd_vlm_collater
     assert result.dataloader.collate_fn.keywords == {"padding_idx": 0, "max_length": None}
+
+
+def test_vlm_dataloader_skips_dense_neat_packing_mask_under_cp(monkeypatch):
+    processor = DummyProcessor()
+    monkeypatch.setattr(PreTokenizedDatasetWrapperConfig, "build", lambda self, dataset, processor: dataset)
+    monkeypatch.setattr(NeatPackConfig, "build", lambda self, dataset, **kwargs: dataset)
+    config = VlmDataloaderConfig(
+        dataset_config=StaticDatasetConfig([]),
+        processor_config=VlmProcessorConfig(factory=lambda: processor),
+        pretokenization=PreTokenizedDatasetWrapperConfig(),
+        packing=NeatPackConfig(),
+        shuffle=False,
+    )
+
+    result = config.build(
+        pretrained_model_name_or_path="unused",
+        dp_rank=0,
+        dp_world_size=1,
+        batch_size=2,
+        packing_attn_implementation="sdpa",
+        cp_size=32,
+    )
+
+    assert result.dataloader.collate_fn.func is neat_packed_vlm_collater
+    assert result.dataloader.collate_fn.keywords["attn_implementation"] == "sdpa"
+    assert result.dataloader.collate_fn.keywords["materialize_4d_mask"] is False
+
+
+class _NoEosProcessor(ProcessorMixin):
+    """Processor stub whose tokenizer lives at ``.tokenizer`` and that does not proxy
+    tokenizer attributes (no ``eos_token_id``), matching a real LlavaProcessor."""
+
+    attributes = []
+
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
+
+
+@dataclass
+class _RecordingTokenizerDatasetConfig:
+    """TokenizerDatasetConfig stub (a text dataset) that records the arg it is built with."""
+
+    accepts_tokenizer: bool = True
+    received_tokenizer: object = None
+
+    def build(self, *, tokenizer):
+        self.received_tokenizer = tokenizer
+        return ["sample"]
+
+
+def test_build_source_forwards_processor_tokenizer_to_text_dataset():
+    # A genuine processor does not expose tokenizer attributes (e.g. eos_token_id);
+    # text datasets must receive processor.tokenizer, not the processor itself.
+    inner_tokenizer = object()
+    processor = _NoEosProcessor(inner_tokenizer)
+    ds_cfg = _RecordingTokenizerDatasetConfig()
+    config = VlmDataloaderConfig(
+        dataset_config=ds_cfg,
+        processor_config=VlmProcessorConfig(factory=lambda: processor),
+    )
+
+    dataset, returned_processor = config._build_source(
+        pretrained_model_name_or_path="unused", dp_rank=0, dp_world_size=1, dataset_build_context=None
+    )
+
+    assert ds_cfg.received_tokenizer is inner_tokenizer  # tokenizer, not the processor
+    assert returned_processor is processor  # processor still returned for pretokenization/collation
+    assert dataset == ["sample"]
+
+
+def test_vlm_dataloader_drops_dataset_tokenizer_block():
+    # A `dataset.tokenizer` block is valid on the LLM path (the tokenizer is a runtime
+    # build arg, popped before building the dataset config). The VLM path must drop it
+    # too; otherwise it reaches ChatDatasetConfig, which rejects unknown fields.
+    config = RecipeConfig(
+        ConfigNode(
+            {
+                "dataset": {
+                    "_target_": "nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset",
+                    "path_or_dataset_id": "unused.jsonl",
+                    "seq_length": 512,
+                    "tokenizer": {
+                        "_target_": "transformers.AutoTokenizer.from_pretrained",
+                        "pretrained_model_name_or_path": "unused-model",
+                    },
+                },
+                "dataloader": {
+                    "_target_": "torchdata.stateful_dataloader.StatefulDataLoader",
+                    "num_workers": 0,
+                },
+            }
+        )
+    ).vlm_dataloader
+
+    assert isinstance(config.dataset_config, ChatDatasetConfig)
+    assert config.dataset_config.path_or_dataset_id == "unused.jsonl"
+    assert config.dataset_config.seq_length == 512
+
+
+def test_build_source_forwards_bare_tokenizer_unchanged():
+    # When the processor slot holds a bare tokenizer (not a ProcessorMixin), it is
+    # forwarded unchanged so tokenizer-only recipes keep working.
+    bare_tokenizer = object()
+    ds_cfg = _RecordingTokenizerDatasetConfig()
+    config = VlmDataloaderConfig(
+        dataset_config=ds_cfg,
+        processor_config=VlmProcessorConfig(factory=lambda: bare_tokenizer),
+    )
+
+    config._build_source(pretrained_model_name_or_path="unused", dp_rank=0, dp_world_size=1, dataset_build_context=None)
+
+    assert ds_cfg.received_tokenizer is bare_tokenizer

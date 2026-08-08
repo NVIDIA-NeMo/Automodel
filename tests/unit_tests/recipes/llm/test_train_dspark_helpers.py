@@ -33,6 +33,9 @@ Covers the recipe-level glue added for the DeepSeek-V4-Flash target:
   documentation-only ``enable`` flag is stripped before forwarding to
   ``wandb.init`` and gates whether to log at all; ``_init_dspark_wandb`` also
   gates on rank (``is_main``) and block presence.
+- ``_DSparkMetricWindow``: the log window packs into one all-reduce and unpacks
+  back to the logged metrics, dividing the acceptance diagnostics once so they
+  stay the exact global ratio across DP ranks.
 
 (target_layer_ids range/-1/ordering validation is covered by the shared
 ``common.validate_target_layer_ids``, which HFDSparkTargetModel already calls.)
@@ -47,21 +50,28 @@ import pytest
 import torch
 from transformers import Qwen3Config
 
+from nemo_automodel.components.checkpoint.config import CheckpointingConfig
+from nemo_automodel.components.checkpoint.lifecycle import CheckpointLifecycle
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.datasets.llm.dspark_cache import write_manifest, write_shard, write_target_weights
+from nemo_automodel.components.speculative.dspark.core import DSparkStepMetrics
 from nemo_automodel.recipes.llm import train_dspark
 from nemo_automodel.recipes.llm._dspark_target_build import (
     build_deepseek_v4_backend,
     gather_full_weight_module,
     repair_glm_5_2_qk_rope_head_dim,
     resolve_reduced_target_layers,
+    unsupported_parallel_axes,
+    validate_dspark_parallelism_axes,
 )
 from nemo_automodel.recipes.llm.train_dspark import (
+    _DSPARK_WINDOW_SCALARS,
     TrainDSparkRecipe,
     _add_accept_rate_per_position,
     _apply_draft_activation_checkpointing,
     _apply_target_chat_template,
     _build_dspark_optimizer,
+    _DSparkMetricWindow,
     _extract_mm_kwargs,
     _init_dspark_wandb,
     _resolve_dspark_optimizer_spec,
@@ -126,12 +136,15 @@ def test_draft_activation_checkpointing_false_is_noop():
     assert draft.layers[0].self_attn is original_attention
 
 
-def test_save_checkpoint_applies_retention_after_sync_save(tmp_path):
+def test_save_checkpoint_applies_retention_after_sync_save(tmp_path, monkeypatch):
     events = []
     obj = TrainDSparkRecipe.__new__(TrainDSparkRecipe)
     obj.checkpoint_config = SimpleNamespace(checkpoint_dir=str(tmp_path))
+    config = CheckpointingConfig(checkpoint_dir=str(tmp_path), save_consolidated=False)
+    lifecycle = CheckpointLifecycle(config=config)
     obj.checkpointer = SimpleNamespace(
-        config=SimpleNamespace(enabled=True, is_async=False),
+        config=config,
+        lifecycle=lifecycle,
         async_wait=lambda: events.append("wait"),
         save_model=lambda *args, **kwargs: events.append("save_model"),
         save_optimizer=lambda *args, **kwargs: events.append("save_optimizer"),
@@ -149,14 +162,16 @@ def test_save_checkpoint_applies_retention_after_sync_save(tmp_path):
     obj.mask_token_id = 99
     obj.target_layer_ids = [0, 1]
     obj.target_wrapper = SimpleNamespace(target_layer_ids=[0, 1])
-    obj._complete_pending_checkpoint = lambda: events.append("complete_pending")
-    obj._update_latest_symlink = lambda path: events.append(("latest", path))
-    obj._update_best_symlink = lambda path, val, metric_key=None: events.append(("best", path, val, metric_key))
-    obj._prune_old_checkpoints = lambda: events.append("prune")
+    monkeypatch.setattr(
+        lifecycle,
+        "_update_best_checkpoint",
+        lambda path, val, metric_key=None: events.append(("best", path, val, metric_key)),
+    )
+    monkeypatch.setattr(lifecycle, "_prune_old_checkpoints", lambda: events.append("prune"))
 
     TrainDSparkRecipe.save_checkpoint(obj, epoch=0, step=1, val_loss={"val_loss": 0.25})
 
-    assert events[0:2] == ["wait", "complete_pending"]
+    assert events[0] == "wait"
     assert any(event[0] == "best" and event[3] == "val_loss" for event in events if isinstance(event, tuple))
     assert "prune" in events
 
@@ -165,8 +180,12 @@ def test_save_checkpoint_records_async_best_pending_info_without_metric(tmp_path
     events = []
     obj = TrainDSparkRecipe.__new__(TrainDSparkRecipe)
     obj.checkpoint_config = SimpleNamespace(checkpoint_dir=str(tmp_path))
+    config = CheckpointingConfig(checkpoint_dir=str(tmp_path), save_consolidated=False)
+    config.is_async = True
+    lifecycle = CheckpointLifecycle(config=config)
     obj.checkpointer = SimpleNamespace(
-        config=SimpleNamespace(enabled=True, is_async=True),
+        config=config,
+        lifecycle=lifecycle,
         async_wait=lambda: events.append("wait"),
         save_model=lambda *args, **kwargs: events.append("save_model"),
         save_optimizer=lambda *args, **kwargs: events.append("save_optimizer"),
@@ -184,18 +203,16 @@ def test_save_checkpoint_records_async_best_pending_info_without_metric(tmp_path
     obj.mask_token_id = 99
     obj.target_layer_ids = [0, 1]
     obj.target_wrapper = SimpleNamespace(target_layer_ids=[0, 1])
-    obj._complete_pending_checkpoint = lambda: events.append("complete_pending")
 
     TrainDSparkRecipe.save_checkpoint(obj, epoch=0, step=1, best_metric_key="val_loss")
 
     expected_path = str(tmp_path / "epoch_0_step_1")
-    assert events[0:2] == ["wait", "complete_pending"]
-    assert obj._last_pending_checkpoint_dir == expected_path
-    assert obj._last_pending_best_checkpoint_info == {
-        "path": expected_path,
-        "val": None,
-        "metric_key": "val_loss",
-    }
+    assert events[0] == "wait"
+    assert lifecycle._pending_checkpoint_dir == expected_path
+    assert lifecycle._pending_best_checkpoint is not None
+    assert lifecycle._pending_best_checkpoint.path == expected_path
+    assert lifecycle._pending_best_checkpoint.value is None
+    assert lifecycle._pending_best_checkpoint.metric_key == "val_loss"
 
 
 def test_build_checkpointer_logs_retention_policy(tmp_path, monkeypatch, caplog):
@@ -209,9 +226,9 @@ def test_build_checkpointer_logs_retention_policy(tmp_path, monkeypatch, caplog)
     monkeypatch.setattr(train_dspark, "Checkpointer", FakeCheckpointer)
     obj = TrainDSparkRecipe.__new__(TrainDSparkRecipe)
     obj.cfg = SimpleNamespace(
-        get=lambda key, default=None: {"checkpoint_dir": str(tmp_path), "max_recent_checkpoints": 1}
-        if key == "checkpoint"
-        else default
+        get=lambda key, default=None: (
+            {"checkpoint_dir": str(tmp_path), "max_recent_checkpoints": 1} if key == "checkpoint" else default
+        )
     )
     obj.output_dir = tmp_path
     obj.draft_model = SimpleNamespace(state_dict=lambda: {"weight": torch.zeros(1)})
@@ -243,14 +260,13 @@ def test_run_train_validation_loop_finalizes_before_close():
     obj._make_progress_bar = lambda **kwargs: FakePbar()
     obj._run_eval = lambda: None
     obj._maybe_save_final_checkpoint = lambda completed_epochs: events.append(("final", completed_epochs)) or True
-    obj._finalize_pending_checkpoint = lambda: events.append("finalize")
-    obj.checkpointer = SimpleNamespace(close=lambda: events.append("close"))
+    obj.checkpointer = SimpleNamespace(finalize=lambda: events.append("finalize"))
     obj.metric_logger = None
     obj._finish_wandb = lambda: events.append("wandb_finish")
 
     TrainDSparkRecipe.run_train_validation_loop(obj)
 
-    assert events == [("final", 1), "finalize", "close", "pbar_close", "wandb_finish"]
+    assert events == [("final", 1), "finalize", "pbar_close", "wandb_finish"]
 
 
 # ---------------------------------------------------------------------------
@@ -998,11 +1014,11 @@ def test_should_shard_dense_target_ignored_on_ddp():
     assert recipe._should_shard_dense_target({"shard_dense_target": True}) is False
 
 
-@pytest.mark.parametrize("axis", ["tp_size", "pp_size", "cp_size", "ep_size", "dp_replicate_size"])
+@pytest.mark.parametrize("axis", ["cp_size", "ep_size", "dp_replicate_size"])
 def test_should_shard_dense_target_rejects_non_pure_dp_axes(axis):
-    # Only a pure FSDP2 data-parallel topology is supported: pp_size>1 builds an
-    # AutoPipeline the target wrapper cannot run, tp/cp/ep are untested here, and
-    # HSDP replication (dp_replicate_size>1) re-replicates the target.
+    # Only a pure FSDP2 data-parallel topology is supported: cp/ep are untested here and
+    # HSDP replication (dp_replicate_size>1) re-replicates the target. tp_size / pp_size
+    # are rejected earlier for every run by validate_dspark_parallelism_axes.
     recipe = _make_shard_recipe(cfg={"distributed": {"strategy": "fsdp2", axis: 2}})
     with pytest.raises(ValueError, match=axis):
         recipe._should_shard_dense_target({"shard_dense_target": True})
@@ -1014,6 +1030,144 @@ def test_should_shard_dense_target_allows_explicit_unit_or_null_axes():
         cfg={"distributed": {"strategy": "fsdp2", "tp_size": 1, "pp_size": None, "cp_size": 1, "ep_size": None}}
     )
     assert recipe._should_shard_dense_target({"shard_dense_target": True}) is True
+
+
+# ---------------------------------------------------------------------------
+# _DSparkMetricWindow
+# ---------------------------------------------------------------------------
+
+
+def _step_metrics(*, accept_num, accept_den, **scalars):
+    """One micro-batch of DSparkStepMetrics; unnamed scalars default to zero."""
+    values = {name: 0.0 for name in _DSPARK_WINDOW_SCALARS if name != "num_micro_batches"}
+    values.update(scalars)
+    return DSparkStepMetrics(
+        accept_rate_per_pos_num=torch.tensor(accept_num, dtype=torch.float32),
+        accept_rate_per_pos_den=torch.tensor(accept_den, dtype=torch.float32),
+        **{name: torch.tensor(value, dtype=torch.float32) for name, value in values.items()},
+    )
+
+
+def test_metric_window_pack_layout():
+    window = _DSparkMetricWindow(block_size=3)
+    window.add(_step_metrics(accept_num=[1.0, 2.0, 3.0], accept_den=[4.0, 5.0, 6.0], loss=7.0))
+    packed = window.pack()
+
+    n = len(_DSPARK_WINDOW_SCALARS)
+    assert packed.numel() == n + 2 * 3
+    assert packed[_DSPARK_WINDOW_SCALARS.index("loss")].item() == 7.0
+    assert packed[_DSPARK_WINDOW_SCALARS.index("num_micro_batches")].item() == 1.0
+    assert packed[n : n + 3].tolist() == [1.0, 2.0, 3.0]
+    assert packed[n + 3 :].tolist() == [4.0, 5.0, 6.0]
+
+
+def test_metric_window_unpack_averages_losses_and_divides_diagnostics_once():
+    window = _DSparkMetricWindow(block_size=2)
+    window.add(
+        _step_metrics(
+            accept_num=[2.0, 1.0],
+            accept_den=[4.0, 4.0],
+            loss=1.0,
+            ce_loss=0.5,
+            l1_loss=0.25,
+            confidence_loss=0.125,
+            tau_num=3.0,
+            tau_den=2.0,
+            confidence_abs_error_num=0.4,
+            confidence_bias_num=-0.2,
+            confidence_cumprod_bias_num=0.1,
+            confidence_diag_den=2.0,
+        )
+    )
+    window.add(
+        _step_metrics(
+            accept_num=[3.0, 0.0],
+            accept_den=[4.0, 4.0],
+            loss=3.0,
+            ce_loss=1.5,
+            l1_loss=0.75,
+            confidence_loss=0.375,
+            tau_num=1.0,
+            tau_den=2.0,
+            confidence_abs_error_num=0.2,
+            confidence_bias_num=0.4,
+            confidence_cumprod_bias_num=0.3,
+            confidence_diag_den=2.0,
+        )
+    )
+
+    avg = window.unpack(window.pack())
+
+    assert avg["loss"] == pytest.approx(2.0)
+    assert avg["ce_loss"] == pytest.approx(1.0)
+    assert avg["l1_loss"] == pytest.approx(0.5)
+    assert avg["confidence_loss"] == pytest.approx(0.25)
+    assert avg["accept_rate"] == pytest.approx(6.0 / 16.0)
+    assert avg["accept_rate@0"] == pytest.approx(5.0 / 8.0)
+    assert avg["accept_rate@1"] == pytest.approx(1.0 / 8.0)
+    assert avg["tau"] == pytest.approx(1.0)
+    assert avg["confidence_abs_error"] == pytest.approx(0.15)
+    assert avg["confidence_bias"] == pytest.approx(0.05)
+    assert avg["confidence_cumprod_bias"] == pytest.approx(0.1)
+
+
+def test_metric_window_reduces_as_ratio_of_sums_across_ranks():
+    rank0 = _DSparkMetricWindow(block_size=1)
+    rank0.add(_step_metrics(accept_num=[3.0], accept_den=[3.0], loss=1.0, tau_num=4.0, tau_den=2.0))
+    rank0.add(_step_metrics(accept_num=[0.0], accept_den=[0.0], loss=1.0))
+    rank1 = _DSparkMetricWindow(block_size=1)
+    rank1.add(_step_metrics(accept_num=[0.0], accept_den=[1.0], loss=3.0, tau_num=1.0, tau_den=1.0))
+
+    avg = rank0.unpack(rank0.pack() + rank1.pack())
+
+    assert avg["accept_rate"] == pytest.approx(3.0 / 4.0)
+    assert avg["tau"] == pytest.approx(5.0 / 3.0)
+    assert avg["loss"] == pytest.approx(5.0 / 3.0)
+
+
+def test_metric_window_omits_unmeasured_diagnostics():
+    window = _DSparkMetricWindow(block_size=2)
+    window.add(_step_metrics(accept_num=[0.0, 0.0], accept_den=[0.0, 0.0], loss=2.0))
+
+    avg = window.unpack(window.pack())
+
+    assert avg["loss"] == pytest.approx(2.0)
+    for key in ("accept_rate", "accept_rate@0", "tau", "confidence_abs_error", "confidence_bias"):
+        assert key not in avg
+
+
+def test_metric_window_omits_only_the_unmeasured_positions():
+    window = _DSparkMetricWindow(block_size=3)
+    window.add(_step_metrics(accept_num=[3.0, 1.0, 0.0], accept_den=[4.0, 4.0, 0.0], loss=1.0))
+
+    avg = window.unpack(window.pack())
+
+    assert avg["accept_rate@0"] == pytest.approx(0.75)
+    assert avg["accept_rate@1"] == pytest.approx(0.25)
+    assert "accept_rate@2" not in avg
+
+
+def test_metric_window_reset_clears_the_window():
+    window = _DSparkMetricWindow(block_size=2)
+    window.add(_step_metrics(accept_num=[1.0, 1.0], accept_den=[2.0, 2.0], loss=4.0, tau_num=1.0, tau_den=1.0))
+    window.reset()
+
+    avg = window.unpack(window.pack())
+
+    assert avg["loss"] == 0.0
+    assert "accept_rate" not in avg
+    assert "tau" not in avg
+
+
+def test_metric_window_unpack_rejects_mismatched_length():
+    window = _DSparkMetricWindow(block_size=4)
+    with pytest.raises(ValueError, match="expected"):
+        window.unpack(window.pack()[:-1])
+
+
+# ---------------------------------------------------------------------------
+# _load_extra_state (resume guard)
+# ---------------------------------------------------------------------------
 
 
 def _dspark_resume_self(mask_token_id=7):
@@ -1060,3 +1214,52 @@ def test_dspark_load_extra_state_accepts_legacy_meta_without_mask_token_id(tmp_p
     TrainDSparkRecipe._load_extra_state(obj, str(tmp_path))
     assert obj.runtime.global_step == 3
     assert obj._resume_epoch == 1
+
+
+def test_parallelism_axes_allow_data_and_expert_parallel_topologies():
+    """The supported DSpark topologies (pure DP, EP-sharded target, CP) pass the gate."""
+    for section in (
+        {},
+        {"ep_size": 8},
+        {"tp_size": 1, "pp_size": 1, "cp_size": 2, "ep_size": 1},
+        # explicit YAML nulls (``tp_size:``) must read as the default 1
+        {"tp_size": None, "pp_size": None},
+    ):
+        validate_dspark_parallelism_axes(ConfigNode({"distributed": section}))
+
+
+def test_parallelism_axes_allow_missing_distributed_block():
+    validate_dspark_parallelism_axes(ConfigNode({}))
+
+
+@pytest.mark.parametrize(
+    "section",
+    [
+        {"tp_size": 2},
+        {"pp_size": 2},
+        {"tp_size": 2, "pp_size": 4},
+    ],
+)
+def test_parallelism_axes_reject_tensor_and_pipeline_parallelism(section):
+    """tp_size/pp_size > 1 corrupt the supervision silently, so they must fail loudly.
+
+    A TP group's ranks each get a different micro-batch from the rank-sharded
+    sampler, and a pipelined target is an AutoPipeline the hidden-state capture
+    hooks cannot run.
+    """
+    with pytest.raises(NotImplementedError, match="DSpark does not support"):
+        validate_dspark_parallelism_axes(ConfigNode({"distributed": section}))
+
+
+def test_parallelism_axes_error_names_the_offending_axes():
+    with pytest.raises(NotImplementedError) as excinfo:
+        validate_dspark_parallelism_axes(ConfigNode({"distributed": {"tp_size": 4, "ep_size": 8}}))
+    message = str(excinfo.value)
+    assert "{'tp_size': 4}" in message
+
+
+def test_unsupported_parallel_axes_reads_absent_and_null_sizes_as_one():
+    """Shared by the up-front gate and the shard_dense_target gate, so both agree."""
+    assert unsupported_parallel_axes({}, ("tp_size", "pp_size")) == {}
+    assert unsupported_parallel_axes({"tp_size": None}, ("tp_size",)) == {}
+    assert unsupported_parallel_axes({"cp_size": 2, "ep_size": 1}, ("cp_size", "ep_size")) == {"cp_size": 2}

@@ -43,8 +43,15 @@ Usage:
 """
 
 import argparse
+import os
 import sys
 from typing import Dict, List, Tuple
+
+# The generation-block template lives one directory up from this script (data/../).
+# Resolve it absolutely so the default works regardless of the caller's CWD.
+_DEFAULT_CHAT_TEMPLATE = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "gemma4_coderforge_chat_template.jinja"
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -60,6 +67,13 @@ def parse_args() -> argparse.Namespace:
         help="Padding strategy. Training uses do_not_pad (the collator pads the batch).",
     )
     parser.add_argument("--split", type=str, default="train", help="Dataset split")
+    parser.add_argument(
+        "--chat_template",
+        type=str,
+        default=_DEFAULT_CHAT_TEMPLATE,
+        help="Chat template (Jinja file or string) with {% generation %} blocks for direct assistant "
+        "masking. Empty string uses the tokenizer's own template (the prefix-arithmetic fallback).",
+    )
     parser.add_argument("--stop_token_id", type=int, default=106, help="Gemma4 turn terminator <turn|> (id 106).")
     parser.add_argument(
         "--terminator_window",
@@ -149,6 +163,7 @@ def main() -> None:
         split=args.split,
         seq_length=args.seq_length,
         padding=args.padding,
+        chat_template=args.chat_template or None,
     )
     print(f"Dataset size: {len(dataset)}")
     print(

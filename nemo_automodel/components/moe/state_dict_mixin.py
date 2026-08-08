@@ -28,6 +28,9 @@ from nemo_automodel.components.moe.state_dict_utils import (
     split_experts_weights_dtensor_aware,
 )
 
+# Native LoRA suffixes for grouped MoE expert tensors
+_LORA_EXPERT_SUFFIXES = ("lora_gate_and_up_A", "lora_gate_and_up_B", "lora_down_A", "lora_down_B")
+
 
 class MoESplitExpertsStateDictMixin:
     """Mixin class providing MoE state dict conversion utilities.
@@ -96,6 +99,17 @@ class MoESplitExpertsStateDictMixin:
         """Path segment for experts (e.g., 'mlp.experts' or 'mixer.experts'). Override in subclass."""
         return "mlp.experts"
 
+    @property
+    def _v5_peft_target_parameters(self) -> tuple[str, ...]:
+        """Fused expert parameters validated for PEFT v5 ParamWrapper export.
+
+        Adapters opt in by overriding this property. Keeping the default empty
+        preserves the legacy per-expert export for model families whose HF
+        naming, activation layout, or checkpoint post-processing has not been
+        validated against ParamWrapper yet.
+        """
+        return ()
+
     def _validate_expert_availability(
         self,
         hf_state_dict: dict[str, Any],
@@ -104,14 +118,18 @@ class MoESplitExpertsStateDictMixin:
     ) -> None:
         """Validate that all required experts are available in the HF state dict before loading.
         Only validates experts needed for the current rank and layers present in the state dict.
+        Expert groups already loaded through registered in-place views validate the rank-local IDs recorded by
+        ``_split_experts_weights``, including when EP is disabled and no MoE mesh is passed to this method.
 
         Args:
-            hf_state_dict: HuggingFace format state dict
-            n_experts: Total number of experts
-            device_mesh: Optional device mesh for expert parallelism
+            hf_state_dict: HuggingFace state mapping. Expert gate/up values are tensors of shape
+                [expert_hidden, hidden], and down values have shape [hidden, expert_hidden]. This method validates
+                their keys only.
+            n_experts: Total number of experts.
+            device_mesh: Optional device mesh whose ``ep`` dimension partitions the experts axis.
 
         Raises:
-            RuntimeError: If required expert weights are missing from the checkpoint
+            RuntimeError: If required expert weights are missing from the checkpoint.
         """
         if device_mesh is not None:
             start_expert, end_expert = get_expert_range_for_rank_from_mesh(device_mesh, n_experts)
@@ -159,18 +177,24 @@ class MoESplitExpertsStateDictMixin:
 
         missing_weights = []
         projection_types = ["gate_proj", "up_proj", "down_proj"] if self._is_gated_moe else ["up_proj", "down_proj"]
+        inplace_loaded_keys: set[str] = getattr(self, "_inplace_loaded_native_keys", None) or set()
+        inplace_expert_ids = getattr(self, "_last_expert_ids", None) or required_experts
+        total_required = 0
 
         for layer_num, prefixes in layers_with_experts.items():
             for prefix in prefixes:
-                for expert_id in required_experts:
-                    for proj_type in projection_types:
+                for proj_type in projection_types:
+                    native_projection = "down_projs" if proj_type == "down_proj" else "gate_and_up_projs"
+                    native_key = f"{prefix}layers.{layer_num}.{expert_segment}.{native_projection}"
+                    experts_to_validate = inplace_expert_ids if native_key in inplace_loaded_keys else required_experts
+                    total_required += len(experts_to_validate)
+                    for expert_id in experts_to_validate:
                         expected_key = f"{prefix}layers.{layer_num}.{expert_segment}.{expert_id}.{proj_type}.weight"
                         if expected_key not in hf_state_dict:
                             missing_weights.append(expected_key)
 
         if missing_weights:
             missing_count = len(missing_weights)
-            total_required = len(required_experts) * len(layers_with_experts) * len(projection_types)
             raise RuntimeError(
                 f"Expert weights missing from checkpoint{rank_info}: {missing_count}/{total_required} required weights not found. "
                 f"Cannot load experts - checkpoint may be incomplete or corrupted. "
@@ -180,9 +204,16 @@ class MoESplitExpertsStateDictMixin:
             )
 
     def _split_experts_weights(self, weight: torch.Tensor, n_experts: int) -> list[torch.Tensor]:
-        """Split grouped expert weights into individual expert weights.
-        For grouped expert weights with shape [n_experts, ...], split into n_experts tensors each with shape [...].
-        Supports both regular tensors and DTensors.
+        """Split grouped expert weights into per-expert tensors.
+
+        Args:
+            weight: Tensor of shape [experts, ...], with arbitrary trailing dimensions. An EP DTensor uses an
+                ``ep`` mesh dimension. A non-EP DTensor may use any FSDP placement on a mesh without ``ep``.
+            n_experts: Global number of experts in ``weight``.
+
+        Returns:
+            Per-expert tensors of shape [...]. A DTensor sharded on the expert axis returns only the experts local
+            to this rank; other DTensors return every expert and preserve adjusted placements.
         """
         if is_dtensor(weight):
             split_weights, expert_ids = split_experts_weights_dtensor_aware(weight, n_experts)
@@ -228,6 +259,134 @@ class MoESplitExpertsStateDictMixin:
                     return stacked_tensor
 
         return None
+
+    def _convert_lora_to_paramwrapper(self, fqn: str, tensor: torch.Tensor) -> list[tuple[str, torch.Tensor]]:
+        """Convert a single grouped MoE LoRA tensor to PEFT ParamWrapper format.
+
+        ParamWrapper format stores fused 3-D expert LoRA parameters as 2-D
+        tensors with the expert dimension folded into the rank dimension.
+
+        Shape mapping (automodel native -> ParamWrapper):
+
+        down_proj (outer wrapper, NO ``base_layer`` prefix — processed first alphabetically):
+          - ``lora_down_B``  (E, r, H) -> ``lora_A.weight``  (r*E, H)  reshape
+          - ``lora_down_A``  (E, I, r) -> ``lora_B.weight``  (I, r*E)  permute+reshape
+
+        gate_up_proj (inner wrapper, HAS ``base_layer.`` prefix):
+          - ``lora_gate_and_up_B``  (E, r, 2*I) -> ``base_layer.lora_A.weight``  (r*E, 2*I)  reshape
+          - ``lora_gate_and_up_A``  (E, H, r)   -> ``base_layer.lora_B.weight``  (H, r*E)    permute+reshape
+
+        Returns:
+            List containing one ``(fqn, tensor)`` tuple in ParamWrapper format.
+        """
+        match = re.search(r"(.*)layers\.(\d+)\.", fqn)
+        if not match:
+            return [(fqn, tensor)]
+
+        prefix = match.group(1)
+        layer_num = match.group(2)
+        expert_segment = self._expert_path_segment
+        suffix = fqn.rsplit(".", 1)[-1]
+
+        # PEFT ParamWrapper nesting: target_parameters are sorted alphabetically
+        # and wrapped in order. The FIRST wrapped becomes the OUTER ParamWrapper.
+        # "down_proj" < "gate_up_proj", so down_proj is outer (no base_layer prefix)
+        # and gate_up_proj is inner (has base_layer prefix).
+        if suffix == "lora_gate_and_up_B":
+            # (E, r, 2*I) -> (r*E, 2*I)
+            out = tensor.reshape(-1, tensor.shape[2]).contiguous()
+            pw_suffix = "base_layer.lora_A.weight"
+        elif suffix == "lora_gate_and_up_A":
+            # (E, H, r) -> permute(1,2,0) -> (H, r, E) -> (H, r*E)
+            out = tensor.permute(1, 2, 0).contiguous().reshape(tensor.shape[1], -1)
+            pw_suffix = "base_layer.lora_B.weight"
+        elif suffix == "lora_down_B":
+            # (E, r, H) -> (r*E, H)
+            out = tensor.reshape(-1, tensor.shape[2]).contiguous()
+            pw_suffix = "lora_A.weight"
+        elif suffix == "lora_down_A":
+            # (E, I, r) -> permute(1,2,0) -> (I, r, E) -> (I, r*E)
+            out = tensor.permute(1, 2, 0).contiguous().reshape(tensor.shape[1], -1)
+            pw_suffix = "lora_B.weight"
+        else:
+            return [(fqn, tensor)]
+
+        out_fqn = f"{prefix}layers.{layer_num}.{expert_segment}.{pw_suffix}"
+        return [(out_fqn, out)]
+
+    def _convert_paramwrapper_to_native(self, state_dict: dict[str, Any]) -> dict[str, Any]:
+        """Convert PEFT ParamWrapper LoRA keys to native grouped MoE LoRA format.
+
+        This is the reverse of ``_convert_lora_to_paramwrapper``.  It detects
+        ParamWrapper-format keys and converts them back to the 3-D grouped
+        tensors expected by GroupedExpertsLoRA.
+
+        Reverse transforms (down_proj is outer, gate_up_proj is inner):
+          - ``experts.lora_A.weight``            (r*E, H)   -> (E, r, H)    = lora_down_B
+          - ``experts.lora_B.weight``            (I, r*E)   -> (E, I, r)    = lora_down_A
+          - ``experts.base_layer.lora_A.weight`` (r*E, 2*I) -> (E, r, 2*I)  = lora_gate_and_up_B
+          - ``experts.base_layer.lora_B.weight`` (H, r*E)   -> (E, H, r)    = lora_gate_and_up_A
+        """
+        expert_segment = re.escape(self._expert_path_segment)
+        n_experts = self.moe_config.n_routed_experts
+
+        # Detect ParamWrapper keys
+        pw_pattern = re.compile(
+            rf"(?P<prefix>.*)layers\.(?P<layer>\d+)\.{expert_segment}\."
+            rf"(?P<pw_suffix>(?:base_layer\.)?lora_[AB]\.weight)$"
+        )
+
+        consumed_keys: set[str] = set()
+        new_entries: dict[str, torch.Tensor] = {}
+
+        for key, tensor in state_dict.items():
+            m = pw_pattern.match(key)
+            if m is None:
+                continue
+
+            pw_suffix = m.group("pw_suffix")
+            # Preserve the full prefix from the input key (e.g. "base_model.model.model.")
+            # so downstream prefix stripping (_drop_outer_prefix) works correctly.
+            prefix = m.group("prefix")
+            layer_num = m.group("layer")
+            base_key = f"{prefix}layers.{layer_num}.{self._expert_path_segment}"
+
+            # down_proj is outer (no base_layer), gate_up_proj is inner (base_layer)
+            if pw_suffix == "lora_A.weight":
+                # (r*E, H) -> (E, r, H) = lora_down_B
+                r = tensor.shape[0] // n_experts
+                out = tensor.reshape(n_experts, r, tensor.shape[1]).contiguous()
+                new_entries[f"{base_key}.lora_down_B"] = out
+
+            elif pw_suffix == "lora_B.weight":
+                # (I, r*E) -> reshape (I, r, E) -> permute(2,0,1) -> (E, I, r) = lora_down_A
+                r = tensor.shape[1] // n_experts
+                out = tensor.reshape(tensor.shape[0], r, n_experts).permute(2, 0, 1).contiguous()
+                new_entries[f"{base_key}.lora_down_A"] = out
+
+            elif pw_suffix == "base_layer.lora_A.weight":
+                # (r*E, 2*I) -> (E, r, 2*I) = lora_gate_and_up_B
+                r = tensor.shape[0] // n_experts
+                out = tensor.reshape(n_experts, r, tensor.shape[1]).contiguous()
+                new_entries[f"{base_key}.lora_gate_and_up_B"] = out
+
+            elif pw_suffix == "base_layer.lora_B.weight":
+                # (H, r*E) -> reshape (H, r, E) -> permute(2,0,1) -> (E, H, r) = lora_gate_and_up_A
+                r = tensor.shape[1] // n_experts
+                out = tensor.reshape(tensor.shape[0], r, n_experts).permute(2, 0, 1).contiguous()
+                new_entries[f"{base_key}.lora_gate_and_up_A"] = out
+
+            else:
+                continue
+
+            consumed_keys.add(key)
+
+        if not consumed_keys:
+            return state_dict
+
+        result = {k: v for k, v in state_dict.items() if k not in consumed_keys}
+        result.update(new_entries)
+        return result
 
     def _convert_lora_expert_to_hf(
         self,
@@ -594,6 +753,9 @@ class MoESplitExpertsStateDictMixin:
         # Recombine any per-expert HF LoRA keys back to grouped format
         state_dict = self._recombine_lora_expert_keys(state_dict)
 
+        # Convert any ParamWrapper-format LoRA keys to native grouped format
+        state_dict = self._convert_paramwrapper_to_native(state_dict)
+
         return state_dict
 
     def _convert_single_merged_expert_to_hf_split_experts(
@@ -742,11 +904,16 @@ class MoESplitExpertsStateDictMixin:
                 torch.cuda.empty_cache()
             return result
 
-        # MoE expert LoRA keys: split grouped 3-D adapter tensors into per-expert
-        # HF-PEFT-compatible keys so that AutoPeftModelForCausalLM can load & merge.
-        _LORA_EXPERT_SUFFIXES = ("lora_gate_and_up_A", "lora_gate_and_up_B", "lora_down_A", "lora_down_B")
+        # MoE expert LoRA keys: convert to HF-PEFT-compatible format.
+        # When v4_compatible=True: per-expert split keys (v4 format).
+        # When v4_compatible=False and the adapter explicitly opts in: fused
+        # ParamWrapper format (v5). Unvalidated adapters retain the legacy
+        # per-expert format even when v4_compatible is not requested.
+        v4_compatible = kwargs.get("v4_compatible", False)
         for suffix in _LORA_EXPERT_SUFFIXES:
             if f".{expert_segment}.{suffix}" in fqn and fqn.endswith(f".{suffix}"):
+                if not v4_compatible and self._v5_peft_target_parameters:
+                    return self._convert_lora_to_paramwrapper(fqn, tensor)
                 return self._convert_lora_expert_to_hf(fqn, tensor, n_experts, inter_dim, expert_segment)
 
         return None

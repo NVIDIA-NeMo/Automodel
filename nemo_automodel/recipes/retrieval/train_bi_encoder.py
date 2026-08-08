@@ -23,7 +23,6 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
-import wandb
 from transformers import ProcessorMixin
 
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
@@ -44,7 +43,10 @@ from nemo_automodel.recipes._dist_utils import (
 )
 from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.base_recipe import BaseRecipe
+from nemo_automodel.shared.import_utils import safe_import
 from nemo_automodel.shared.te_patches import apply_te_patches
+
+_, wandb = safe_import("wandb")
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +60,40 @@ def _uses_multi_vector_scoring(model) -> bool:
 def _unwrap_model_for_attrs(model):
     """Return the underlying model object for configuration-style attribute reads."""
     return getattr(model, "module", model)
+
+
+def _configure_sentence_transformer_export(model, collate_fn) -> None:
+    """Bind the training collator's exact static prompts to bi-encoder export metadata."""
+    model = _unwrap_model_for_attrs(model)
+    configure_prompts = getattr(model, "configure_sentence_transformer_prompts", None)
+    if configure_prompts is None:
+        return
+    if hasattr(model, "sentence_transformer_export_config") and model.sentence_transformer_export_config is None:
+        return
+
+    if getattr(collate_fn, "use_dataset_instruction", False):
+        disable_export = getattr(model, "disable_sentence_transformer_export", None)
+        if disable_export is not None:
+            disable_export()
+            logger.warning(
+                "Standard Sentence Transformers export is disabled because per-example dataset instructions "
+                "cannot be represented by static checkpoint prompts."
+            )
+        return
+    else:
+        if not hasattr(collate_fn, "query_prefix") or not hasattr(collate_fn, "passage_prefix"):
+            disable_export = getattr(model, "disable_sentence_transformer_export", None)
+            if disable_export is not None:
+                disable_export()
+                logger.warning(
+                    "Standard Sentence Transformers export is disabled because the configured collator "
+                    "does not expose static query_prefix and passage_prefix metadata."
+                )
+            return
+        query_prompt = f"{collate_fn.query_prefix} " if collate_fn.query_prefix else ""
+        document_prompt = f"{collate_fn.passage_prefix} " if collate_fn.passage_prefix else ""
+
+    configure_prompts(query_prompt=query_prompt, document_prompt=document_prompt)
 
 
 def _get_autocast_ctx(distributed_config):
@@ -324,6 +360,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
                 )
 
         self.dataloader = materialize_loader(dataloader_config)
+        _configure_sentence_transformer_export(self.model_parts[0], self.dataloader.collate_fn)
         self.train_n_passages = getattr(dataloader_config.dataset_config, "n_passages", 1)
 
         self.val_dataloader = None

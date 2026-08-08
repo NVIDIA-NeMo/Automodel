@@ -41,7 +41,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
 
       # `fern check` validates that every path: referenced by docs.yml / the
       # version YAMLs exists on disk. The frozen v0.4 pages are archived off main,
@@ -54,9 +56,12 @@ jobs:
             v0.5=docs-archive
 
       - name: Setup Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: '20'
+
+      - name: Generate model coverage tables
+        run: python3 tests/ci_tests/utils/sync_model_coverage_tables.py
 
       - name: Validate MDX syntax
         run: |

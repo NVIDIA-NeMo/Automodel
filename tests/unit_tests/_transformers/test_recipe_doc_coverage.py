@@ -231,6 +231,7 @@ def test_yaml_recipe_scan_finds_model_ids(recipe_model_ids: set[str]):
 # pages, etc.).
 _HF_ORG_TO_DOC_SLUG = {
     "CohereForAI": "cohere",
+    "diffusers": "lightricks",  # LTX-2.3 conversion shares the Lightricks family page
     "ibm-granite": "ibm",
     "meta-llama": "meta",
     "MiniMaxAI": "minimax",

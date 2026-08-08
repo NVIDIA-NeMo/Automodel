@@ -81,10 +81,12 @@ def _to_full_tensor(tensor: torch.Tensor) -> torch.Tensor:
 class NoValidAnchorsError(ValueError):
     """Raised when a batch has no sample long enough to form a DFlash block.
 
-    A DFlash anchor needs at least ``block_size + 1`` supervised tokens (the
-    anchor plus its block). Datasets always contain some short conversations;
-    the training loop catches this and skips the offending micro-batch rather
-    than aborting the run.
+    A DFlash anchor is a supervised position (``loss_mask=1``) that still has a
+    full block ahead of it, i.e. one in ``[0, seq_len - block_size]`` (and, when
+    packing, with at least ``block_size - 1`` further real tokens in its own
+    document). Datasets always contain some short conversations; the training
+    loop catches this and skips the offending micro-batch rather than aborting
+    the run.
     """
 
 
@@ -254,9 +256,11 @@ class DFlashTrainerModule(nn.Module):
         # richest sample has exactly one valid anchor and always drop one otherwise.
         max_n = min(self.num_anchors, int(valid_counts.max().item()))
         if max_n <= 0:
+            doc_note = " with block_size-1 further real tokens in its document" if doc_remaining is not None else ""
             raise NoValidAnchorsError(
-                "No valid anchor positions in this batch; every sample has fewer than "
-                f"block_size+1 ({bs + 1}) supervised tokens."
+                f"No valid anchor positions in this batch: no sample has a supervised token "
+                f"(loss_mask=1) in [0, seq_len - block_size] = [0, {max_anchor}]{doc_note} "
+                f"(seq_len={seq_len}, block_size={bs})."
             )
 
         indices = torch.arange(max_anchor + 1, device=device).unsqueeze(0).expand(bsz, -1)
