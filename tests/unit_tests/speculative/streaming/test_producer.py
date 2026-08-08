@@ -134,6 +134,31 @@ def test_producer_ref_feature_specs_match_measured_tensors(target, store) -> Non
     assert ref.feature_specs["logits"].shape[1] == input_ids.shape[1]
 
 
+def test_producer_evicts_sample_on_spec_mismatch(target, store, monkeypatch) -> None:
+    # The feature_specs self-check runs after store.put has committed the
+    # sample. When it trips, the ref is discarded on the raise, so no consumer
+    # could ever get/release the sample -- the producer must evict it instead
+    # of leaking its bytes into the store for the process lifetime. Force the
+    # mismatch by storing loss_mask under a different dtype than the producer
+    # measured; the ref stays internally consistent with the stored tensor, so
+    # the eviction path's get() still succeeds.
+    real_put = store.put
+
+    def _tampered_put(sample_id, tensors, **kwargs):
+        tampered = dict(tensors)
+        tampered["loss_mask"] = tensors["loss_mask"].to(torch.int32)
+        return real_put(sample_id, tampered, **kwargs)
+
+    monkeypatch.setattr(store, "put", _tampered_put)
+    producer = FeatureProducer(target, store, run_id="r1")
+    input_ids, attn, loss = _inputs()
+    with pytest.raises(RuntimeError, match="feature_specs does not match"):
+        producer.produce(input_ids=input_ids, attention_mask=attn, loss_mask=loss)
+    health = store.health()
+    assert health.sample_count == 0
+    assert health.resident_bytes == 0
+
+
 def test_producer_assigns_unique_sample_ids(target, store) -> None:
     producer = FeatureProducer(target, store, run_id="r1")
     ids = set()

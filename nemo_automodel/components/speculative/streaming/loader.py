@@ -121,7 +121,14 @@ class FeatureDataLoader:
             try:
                 validate_eagle3_ref(ref)
             except ValueError:
-                self._queue.fail(lease)
+                # A schema-invalid ref is deterministically bad for every
+                # consumer. Re-enqueueing it (fail) would poison the stream:
+                # the next acquire re-leases it, fails the same validation, and
+                # re-enqueues it forever, since there is no retry budget. Drop
+                # it instead -- ack frees the queue slot without touching the
+                # store -- and surface the error.
+                logger.warning("FeatureDataLoader dropping schema-invalid ref sample_id=%s", ref.sample_id)
+                self._queue.ack(lease)
                 raise
         try:
             tensors, handle = self._store.get(ref)

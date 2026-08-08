@@ -235,11 +235,34 @@ class FeatureProducer:
             num_tokens=num_tokens,
         )
         if ref.feature_specs != feature_specs:
+            # The put already committed the sample. Since we discard the ref on
+            # the raise below, no consumer could ever get/release it, so evict
+            # it here instead of leaking its bytes into the store.
+            self.discard(ref)
             raise RuntimeError(
                 f"SampleRef.feature_specs does not match what the producer just measured "
                 f"(sample_id={sample_id}): ref={ref.feature_specs} measured={feature_specs}"
             )
         return ref
+
+    def discard(self, ref: SampleRef) -> None:
+        """Evict a produced sample whose ref will not be enqueued.
+
+        Used when a produced ref is dropped before it reaches the queue: a
+        spec-mismatch abort in :meth:`produce`, or the async pipeline shutting
+        down while a blocking put is in flight. ``get`` + ``release`` drops the
+        last handle so the store frees the sample; without it the sample's bytes
+        (or its shared-dir file) stay resident with no consumer able to release
+        them.
+
+        Args:
+            ref: The reference whose backing sample should be evicted.
+        """
+        try:
+            _, handle = self._store.get(ref)
+            self._store.release(handle)
+        except Exception:
+            logger.exception("failed to discard sample_id=%s from store", ref.sample_id)
 
     def close(self) -> None:
         """Release any backend resources; the producer itself holds none."""

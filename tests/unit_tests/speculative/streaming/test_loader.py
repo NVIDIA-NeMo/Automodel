@@ -32,6 +32,8 @@ The loader's contract under test:
 
 from __future__ import annotations
 
+import dataclasses
+
 import pytest
 import torch
 import torch.nn as nn
@@ -43,6 +45,7 @@ from nemo_automodel.components.speculative.streaming import (
     LocalFeatureStore,
     SampleRefQueue,
 )
+from nemo_automodel.components.speculative.streaming.eagle3 import EAGLE3_SCHEMA_VERSION
 from nemo_automodel.components.speculative.streaming.loader import FeatureDataLoader
 from nemo_automodel.components.speculative.streaming.refs import SampleRef
 from nemo_automodel.components.speculative.streaming.stores.local import LocalFeatureStore as _Store
@@ -329,3 +332,19 @@ def test_loader_fails_lease_on_algorithm_mismatch(queue, store) -> None:
     # queue pending count covers it for redelivery.
     assert queue.outstanding_count() == 0
     assert queue.pending_count() == 1
+
+
+def test_loader_drops_schema_invalid_ref_instead_of_poisoning(queue, store, backend) -> None:
+    # A schema-invalid ref (here a mismatched schema_version) fails
+    # validate_eagle3_ref deterministically for every consumer. If the loader
+    # re-enqueued it (fail), the next acquire would lease it, fail identically,
+    # and re-enqueue it forever -- poisoning the stream. It must drop it (ack).
+    ref = _produce_one(backend, store, sample_id="schema-bad")
+    bad_ref = dataclasses.replace(ref, schema_version=EAGLE3_SCHEMA_VERSION + 1)
+    queue.put(bad_ref)
+    loader = FeatureDataLoader(queue, store)
+    with pytest.raises(ValueError):
+        next(iter(loader))
+    # Dropped, not re-enqueued: nothing pending and nothing outstanding.
+    assert queue.outstanding_count() == 0
+    assert queue.pending_count() == 0
