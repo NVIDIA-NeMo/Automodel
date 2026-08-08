@@ -24,10 +24,10 @@ plumbing -- and trains the draft with the three-term DSpark objective.
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import pathlib
+from dataclasses import dataclass, field
 from types import SimpleNamespace
 
 import torch
@@ -45,6 +45,7 @@ from nemo_automodel.components.checkpoint.checkpointing import (
     CheckpointingConfig,
     load_torch_ckpt,
     save_config,
+    save_losses,
 )
 from nemo_automodel.components.checkpoint.utils import find_latest_checkpoint, resolve_restore_from_to_checkpoint_dir
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
@@ -79,7 +80,7 @@ from nemo_automodel.components.speculative.dspark.config import (
     build_glm_5_2_draft_config,
     build_minimax_m3_draft_config,
 )
-from nemo_automodel.components.speculative.dspark.core import DSparkTrainerModule
+from nemo_automodel.components.speculative.dspark.core import DSparkStepMetrics, DSparkTrainerModule
 from nemo_automodel.components.speculative.dspark.registry import (
     build_target_layer_ids,
     resolve_dspark_draft_spec,
@@ -113,9 +114,12 @@ from nemo_automodel.recipes.base_recipe import (
 from nemo_automodel.recipes.llm._dspark_target_build import (
     build_deepseek_v4_target,
     build_glm_5_2_target,
+    distributed_section_dict,
     gather_full_weight_module,
     repair_glm_5_2_qk_rope_head_dim,
     resolve_reduced_target_layers,
+    unsupported_parallel_axes,
+    validate_dspark_parallelism_axes,
 )
 from nemo_automodel.recipes.llm._spec_train_utils import (
     apply_draft_compile,
@@ -369,19 +373,6 @@ def _validate_cached_dspark_manifest(
         )
 
 
-def _distributed_section_dict(cfg) -> dict:
-    """Return the ``distributed:`` section of a top-level recipe config as a plain dict.
-
-    A missing block yields ``{}``, i.e. the default FSDP2 configuration; this keeps the
-    fail-loud missing-block contract of ``create_distributed_setup_from_config`` intact
-    for callers that require an explicit block.
-    """
-    section = cfg.get("distributed", None)
-    if section is None:
-        return {}
-    return section.to_dict() if hasattr(section, "to_dict") else dict(section)
-
-
 def _add_accept_rate_per_position(
     metrics: dict[str, float],
     accept_num: torch.Tensor,
@@ -391,6 +382,117 @@ def _add_accept_rate_per_position(
     for position, (num, den) in enumerate(zip(accept_num.tolist(), accept_den.tolist())):
         if den > 0:
             metrics[f"accept_rate@{position}"] = num / den
+
+
+# Order of the scalar sums inside the packed window tensor. ``pack`` and ``unpack``
+# both walk this tuple, so inserting a metric cannot misalign the two.
+_DSPARK_WINDOW_SCALARS = (
+    "loss",
+    "ce_loss",
+    "l1_loss",
+    "confidence_loss",
+    "tau_num",
+    "tau_den",
+    "confidence_abs_error_num",
+    "confidence_bias_num",
+    "confidence_cumprod_bias_num",
+    "confidence_diag_den",
+    "num_micro_batches",
+)
+
+
+@dataclass
+class _DSparkMetricWindow:
+    """Metric sums accumulated between two log points, reduced in one collective.
+
+    The scalar sums and the two ``[block_size]`` per-position accept vectors are
+    concatenated into a single tensor by :meth:`pack` so one all-reduce covers the
+    whole window, and :meth:`unpack` turns the reduced tensor into the metrics to log.
+
+    The losses are window means of already normalized per-micro-batch values, so they
+    divide by the micro-batch count. The acceptance diagnostics accumulate as
+    ``(num, den)`` sums and divide once after the reduction, which gives the exact
+    global ratio regardless of per-rank token imbalance. A diagnostic whose denominator
+    is zero was not measured this window (e.g. an ablation without the confidence head)
+    and is omitted, so it shows no curve rather than a flat zero that reads like
+    collapsed acceptance.
+    """
+
+    block_size: int
+    device: torch.device | None = None
+    loss: float = 0.0
+    ce_loss: float = 0.0
+    l1_loss: float = 0.0
+    confidence_loss: float = 0.0
+    tau_num: float = 0.0
+    tau_den: float = 0.0
+    confidence_abs_error_num: float = 0.0
+    confidence_bias_num: float = 0.0
+    confidence_cumprod_bias_num: float = 0.0
+    confidence_diag_den: float = 0.0
+    num_micro_batches: float = 0.0
+    accept_num: torch.Tensor = field(init=False)
+    accept_den: torch.Tensor = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        """Zero every sum, starting a new window."""
+        for name in _DSPARK_WINDOW_SCALARS:
+            setattr(self, name, 0.0)
+        self.accept_num = torch.zeros(self.block_size, device=self.device)
+        self.accept_den = torch.zeros(self.block_size, device=self.device)
+
+    def add(self, metrics: DSparkStepMetrics) -> None:
+        """Accumulate one micro-batch's outputs."""
+        self.loss += metrics.loss.detach().item()
+        self.ce_loss += metrics.ce_loss.detach().item()
+        self.l1_loss += metrics.l1_loss.detach().item()
+        self.confidence_loss += metrics.confidence_loss.detach().item()
+        self.tau_num += metrics.tau_num.detach().item()
+        self.tau_den += metrics.tau_den.detach().item()
+        self.confidence_abs_error_num += metrics.confidence_abs_error_num.detach().item()
+        self.confidence_bias_num += metrics.confidence_bias_num.detach().item()
+        self.confidence_cumprod_bias_num += metrics.confidence_cumprod_bias_num.detach().item()
+        self.confidence_diag_den += metrics.confidence_diag_den.detach().item()
+        self.accept_num += metrics.accept_rate_per_pos_num.detach()
+        self.accept_den += metrics.accept_rate_per_pos_den.detach()
+        self.num_micro_batches += 1.0
+
+    def pack(self) -> torch.Tensor:
+        """Flatten the window into the 1-D tensor handed to the DP all-reduce."""
+        scalars = torch.tensor(
+            [getattr(self, name) for name in _DSPARK_WINDOW_SCALARS],
+            device=self.device,
+            dtype=torch.float32,
+        )
+        return torch.cat([scalars, self.accept_num.to(scalars.dtype), self.accept_den.to(scalars.dtype)])
+
+    def unpack(self, reduced: torch.Tensor) -> dict[str, float]:
+        """Turn the DP-reduced :meth:`pack` tensor into the metrics to log."""
+        n = len(_DSPARK_WINDOW_SCALARS)
+        expected = n + 2 * self.block_size
+        if reduced.numel() != expected:
+            raise ValueError(f"reduced window has {reduced.numel()} entries, expected {expected}")
+        sums = dict(zip(_DSPARK_WINDOW_SCALARS, reduced[:n].tolist()))
+        accept_num = reduced[n : n + self.block_size]
+        accept_den = reduced[n + self.block_size :]
+
+        count = max(1.0, sums["num_micro_batches"])
+        avg = {name: sums[name] / count for name in ("loss", "ce_loss", "l1_loss", "confidence_loss")}
+        total_accept_den = accept_den.sum().item()
+        if total_accept_den > 0:
+            avg["accept_rate"] = accept_num.sum().item() / total_accept_den
+            _add_accept_rate_per_position(avg, accept_num, accept_den)
+        if sums["tau_den"] > 0:
+            avg["tau"] = sums["tau_num"] / sums["tau_den"]
+        if sums["confidence_diag_den"] > 0:
+            den = sums["confidence_diag_den"]
+            avg["confidence_abs_error"] = sums["confidence_abs_error_num"] / den
+            avg["confidence_bias"] = sums["confidence_bias_num"] / den
+            avg["confidence_cumprod_bias"] = sums["confidence_cumprod_bias_num"] / den
+        return avg
 
 
 class TrainDSparkRecipe(BaseRecipe):
@@ -429,7 +531,7 @@ class TrainDSparkRecipe(BaseRecipe):
         # Reuse the canonical distributed-section parser (strategy case-folding, YAML-null
         # axis defaulting) instead of re-reading the raw block, so the gate cannot drift
         # from what create_distributed_setup_from_config later builds.
-        parsed = parse_distributed_section(_distributed_section_dict(self.cfg))
+        parsed = parse_distributed_section(distributed_section_dict(self.cfg))
         if self.dist_env.world_size <= 1 or not isinstance(parsed["strategy_config"], FSDP2Config):
             if self.dist_env.is_main:
                 logger.warning(
@@ -440,17 +542,13 @@ class TrainDSparkRecipe(BaseRecipe):
                     self.dist_env.world_size,
                 )
             return False
-        unsupported = {
-            axis: parsed[axis]
-            for axis in ("tp_size", "pp_size", "cp_size", "ep_size", "dp_replicate_size")
-            if (parsed[axis] or 1) != 1
-        }
+        # tp_size / pp_size are rejected for every DSpark run by
+        # validate_dspark_parallelism_axes, so only the remaining axes are checked here.
+        unsupported = unsupported_parallel_axes(parsed, ("cp_size", "ep_size", "dp_replicate_size"))
         if unsupported:
             raise ValueError(
                 f"recipe_args.shard_dense_target=true only supports a pure FSDP2 data-parallel "
-                f"topology (tp_size=pp_size=cp_size=ep_size=dp_replicate_size=1), got {unsupported}. "
-                f"DSpark's hidden-state capture needs one non-pipelined model call per rank "
-                f"(pp_size>1 builds an AutoPipeline the target wrapper cannot run), the remaining "
+                f"topology (cp_size=ep_size=dp_replicate_size=1), got {unsupported}. Those "
                 f"model-parallel axes are unsupported for the frozen dense target, and HSDP "
                 f"replication re-replicates the target, defeating the sharding."
             )
@@ -502,6 +600,8 @@ class TrainDSparkRecipe(BaseRecipe):
                 "Sequence packing (packed_sequence_size>0) is only supported on the online text-only "
                 "DSpark path; the VLM and cached-target paths do not carry the packing metadata."
             )
+
+        validate_dspark_parallelism_axes(self.cfg)
 
         # Context parallelism (long-context memory relief): shard only the frozen
         # target forward along the sequence and gather the captured hidden states
@@ -1115,6 +1215,7 @@ class TrainDSparkRecipe(BaseRecipe):
         if checkpointer is None or not checkpointer.config.enabled:
             return
         self.checkpointer.async_wait()
+        self.checkpointer.lifecycle.complete_pending()
 
         ckpt_root = self.checkpoint_config.checkpoint_dir
         path = os.path.join(str(ckpt_root), f"epoch_{epoch}_step_{step}")
@@ -1123,12 +1224,9 @@ class TrainDSparkRecipe(BaseRecipe):
         best_metric_name = next(iter(val_loss.keys())) if val_loss and len(val_loss) == 1 else best_metric_key
         best_val_metric = val_loss.get(best_metric_name) if val_loss else None
 
-        self._complete_pending_checkpoint()
+        self.checkpointer.lifecycle.reserve(path)
 
         if is_rank_0:
-            if os.path.exists(path):
-                raise FileExistsError(f"Checkpoint directory {path} already exists")
-            os.makedirs(path, exist_ok=True)
             loss_dict: dict[str, float] = {}
             if train_loss is not None:
                 loss_dict["train_loss"] = float(train_loss)
@@ -1136,8 +1234,7 @@ class TrainDSparkRecipe(BaseRecipe):
                 for k, v in val_loss.items():
                     loss_dict[k] = float(v)
             if loss_dict:
-                with open(os.path.join(path, "losses.json"), "w") as f:
-                    json.dump(loss_dict, f)
+                save_losses(loss_dict, path)
         if is_dist_initialized:
             dist.barrier()
 
@@ -1157,34 +1254,34 @@ class TrainDSparkRecipe(BaseRecipe):
         if cp_mesh is None or cp_mesh.get_local_rank() == 0:
             self.checkpointer.save_on_dp_ranks(self.rng, "rng", path)
 
-        if is_rank_0:
+        # Rank-0 writes followed by collectives, so they go through the same guard:
+        # a failure here must abort every rank rather than only this one.
+        def write_recipe_metadata() -> None:
             self._save_extra_state(path, epoch=epoch)
             try:
                 save_config(self.cfg.raw_config, path)
             except (AttributeError, OSError) as e:
                 logger.warning("Failed to save config snapshot: %s", e)
+
+        self.checkpointer.lifecycle.run_coordinator_step(
+            write_recipe_metadata,
+            description=f"write recipe metadata to {path}",
+        )
         if is_dist_initialized:
             dist.barrier()
 
         if getattr(self.checkpointer.config, "is_async", False):
-            setattr(self, "_last_pending_checkpoint_dir", path)
-            setattr(
-                self,
-                "_last_pending_best_checkpoint_info",
-                {
-                    "path": path,
-                    "val": float(best_val_metric) if best_val_metric is not None else None,
-                    "metric_key": best_metric_name,
-                },
+            self.checkpointer.lifecycle.defer_publication(
+                path,
+                best_val_metric=float(best_val_metric) if best_val_metric is not None else None,
+                metric_key=best_metric_name,
             )
         else:
-            if is_rank_0:
-                self._update_latest_symlink(path)
-                if best_val_metric is not None:
-                    self._update_best_symlink(path, float(best_val_metric), best_metric_name)
-                self._prune_old_checkpoints()
-            if is_dist_initialized:
-                dist.barrier()
+            self.checkpointer.lifecycle.publish(
+                path,
+                best_val_metric=float(best_val_metric) if best_val_metric is not None else None,
+                metric_key=best_metric_name,
+            )
 
     def _save_extra_state(self, path: str, epoch: int) -> None:
         """Persist DSpark meta: global_step, epoch, block_size, mask, and target layers."""
@@ -1387,23 +1484,7 @@ class TrainDSparkRecipe(BaseRecipe):
                 if hasattr(self.train_dataloader, "sampler") and hasattr(self.train_dataloader.sampler, "set_epoch"):
                     self.train_dataloader.sampler.set_epoch(epoch_idx)
 
-                running_loss = 0.0
-                running_ce = 0.0
-                running_l1 = 0.0
-                running_conf = 0.0
-                # Acceptance diagnostics accumulate as (num, den) sums, not per-step
-                # ratios: reducing the sums and dividing once gives the exact global
-                # ratio regardless of per-micro-batch token imbalance, and keeps tau at
-                # its >= 1 floor even when a micro-batch contributes no valid blocks.
-                running_tau_num = 0.0
-                running_tau_den = 0.0
-                running_conf_abs_err_num = 0.0
-                running_conf_bias_num = 0.0
-                running_conf_cumprod_bias_num = 0.0
-                running_conf_diag_den = 0.0
-                running_accept_pos_num = torch.zeros(self.block_size, device=self.device)
-                running_accept_pos_den = torch.zeros(self.block_size, device=self.device)
-                running_micro = 0
+                window = _DSparkMetricWindow(block_size=self.block_size, device=self.device)
                 epoch_loss = 0.0
                 micro_step = 0
                 pending_micro_batches = 0
@@ -1421,19 +1502,7 @@ class TrainDSparkRecipe(BaseRecipe):
                         loss = metrics.loss / self.grad_accumulation_steps
                         loss.backward()
 
-                    running_loss += metrics.loss.detach().item()
-                    running_ce += metrics.ce_loss.detach().item()
-                    running_l1 += metrics.l1_loss.detach().item()
-                    running_conf += metrics.confidence_loss.detach().item()
-                    running_tau_num += metrics.tau_num.detach().item()
-                    running_tau_den += metrics.tau_den.detach().item()
-                    running_conf_abs_err_num += metrics.confidence_abs_error_num.detach().item()
-                    running_conf_bias_num += metrics.confidence_bias_num.detach().item()
-                    running_conf_cumprod_bias_num += metrics.confidence_cumprod_bias_num.detach().item()
-                    running_conf_diag_den += metrics.confidence_diag_den.detach().item()
-                    running_accept_pos_num += metrics.accept_rate_per_pos_num.detach()
-                    running_accept_pos_den += metrics.accept_rate_per_pos_den.detach()
-                    running_micro += 1
+                    window.add(metrics)
                     epoch_loss += metrics.loss.detach().item()
                     micro_step += 1
                     pending_micro_batches += 1
@@ -1452,64 +1521,10 @@ class TrainDSparkRecipe(BaseRecipe):
                         self._maybe_save_step_checkpoint(epoch_idx)
 
                         if self.runtime.global_step % self.log_every_steps == 0:
-                            # One collective: the loss window sums and micro-batch count,
-                            # the acceptance-diagnostic (num, den) sums, and the per-position
-                            # accept sums, concatenated so a single all-reduce covers them.
-                            # Losses divide by the micro-batch count (window mean of already
-                            # normalized values); the diagnostics divide num by den for the
-                            # exact global ratio.
-                            scalars = torch.tensor(
-                                [
-                                    running_loss,
-                                    running_ce,
-                                    running_l1,
-                                    running_conf,
-                                    running_tau_num,
-                                    running_tau_den,
-                                    running_conf_abs_err_num,
-                                    running_conf_bias_num,
-                                    running_conf_cumprod_bias_num,
-                                    running_conf_diag_den,
-                                    float(running_micro),
-                                ],
-                                device=self.device,
-                                dtype=torch.float32,
-                            )
-                            reduced = self._dp_allreduce(
-                                torch.cat([scalars, running_accept_pos_num, running_accept_pos_den])
-                            )
-                            n_scalars = scalars.numel()
-                            w = reduced[:n_scalars].tolist()
-                            pos_num = reduced[n_scalars : n_scalars + self.block_size]
-                            pos_den = reduced[n_scalars + self.block_size :]
-                            count = max(1.0, w[10])
-                            avg = {
-                                "loss": w[0] / count,
-                                "ce_loss": w[1] / count,
-                                "l1_loss": w[2] / count,
-                                "confidence_loss": w[3] / count,
-                            }
-                            # Log a diagnostic only when it was measured this window (its
-                            # denominator is positive), so an ablation without the TV signal
-                            # or the confidence head shows no curve rather than a flat zero
-                            # that reads like collapsed acceptance.
-                            accept_den = pos_den.sum().item()
-                            if accept_den > 0:
-                                avg["accept_rate"] = pos_num.sum().item() / accept_den
-                                _add_accept_rate_per_position(avg, pos_num, pos_den)
-                            if w[5] > 0:
-                                avg["tau"] = w[4] / w[5]
-                            if w[9] > 0:
-                                avg["confidence_abs_error"] = w[6] / w[9]
-                                avg["confidence_bias"] = w[7] / w[9]
-                                avg["confidence_cumprod_bias"] = w[8] / w[9]
-                            running_loss = running_ce = running_l1 = running_conf = 0.0
-                            running_tau_num = running_tau_den = 0.0
-                            running_conf_abs_err_num = running_conf_bias_num = 0.0
-                            running_conf_cumprod_bias_num = running_conf_diag_den = 0.0
-                            running_accept_pos_num = torch.zeros(self.block_size, device=self.device)
-                            running_accept_pos_den = torch.zeros(self.block_size, device=self.device)
-                            running_micro = 0
+                            # Every rank enters the window's single collective, so it cannot
+                            # sit inside the rank-0 logging guard below.
+                            avg = window.unpack(self._dp_allreduce(window.pack()))
+                            window.reset()
                             if self.dist_env.is_main:
                                 current_lr = self.lr_scheduler.get_last_lr()[0]
                                 mem = torch.cuda.max_memory_allocated() / 1024**3 if torch.cuda.is_available() else 0.0
