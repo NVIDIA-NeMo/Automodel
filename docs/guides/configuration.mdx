@@ -188,7 +188,7 @@ All cluster-specific configuration, including SBATCH directives, the container i
 
 ## Model Attention and Hub Kernels
 
-`model:` entries passed to `NeMoAutoModel*.from_pretrained` / `from_config` accept:
+`model:` entries passed to `NeMoAutoModel*.from_pretrained` or `from_config` accept:
 
 ```yaml
 model:
@@ -200,7 +200,7 @@ model:
 ```
 
 `attn_implementation` and `use_kernels` are independent. A Hub repo id selects
-attention only; `use_kernels` replaces norms / MLP / linear via Transformers
+attention only. `use_kernels` replaces norms, MLP, and linear layers through Transformers
 `kernelize`. Non-`kernels-community` attention repos also need
 `allow_all_kernels: true`. Install with `uv sync --extra hub_kernels`. Full
 details: [Hub Kernels](/development/hub-kernels).

@@ -4,19 +4,19 @@ description: "Use Hugging Face Hub kernels for flash attention and layer replace
 position: 5
 ---
 NeMo AutoModel forwards Hugging Face Transformers' Hub kernel APIs through
-`NeMoAutoModel*.from_pretrained` / `from_config`. The same knobs work as in
-Transformers ([Loading kernels](https://huggingface.co/docs/transformers/en/kernel_doc/loading_kernels)):
+`NeMoAutoModel*.from_pretrained` and `from_config`. The same knobs work as in
+Transformers ([Loading kernels](https://huggingface.co/docs/transformers/en/kernel_doc/loading_kernels)).
 
-| Setting | What it changes |
+| Setting | What It Changes |
 |---------|-----------------|
 | `attn_implementation: kernels-community/flash-attn2` | Attention only |
-| `use_kernels: true` | Non-attention layers (RMSNorm, MLP, Linear, activations, RoPE, fused CE, …) |
+| `use_kernels: true` | Non-attention layers (RMSNorm, MLP, Linear, activations, RoPE, fused CE, and so on) |
 | `kernel_config` | Optional per-op Hub mapping (enables `use_kernels`) |
 | `allow_all_kernels: true` | Allow Hub repos outside the trusted `kernels-community` org |
 
 You do **not** need `use_kernels` when you only want Hub flash attention.
 
-Requires the [`kernels`](https://huggingface.co/docs/kernels) package
+This feature requires the [`kernels`](https://huggingface.co/docs/kernels) package
 (`kernels>=0.11.0`, matching Transformers).
 
 ## Install
@@ -30,7 +30,7 @@ uv pip install "nemo-automodel[hub_kernels]"
 See [Install NeMo AutoModel](/get-started/installation). The `hub_kernels` extra
 is not part of `[all]`.
 
-## Attention only
+## Attention Only
 
 ```yaml
 model:
@@ -41,7 +41,7 @@ model:
 
 Also supported (same as Transformers):
 
-- `flash_attention_2` / `flash_attention_3` / `flash_attention_4` — pip `flash-attn`
+- `flash_attention_2`, `flash_attention_3`, or `flash_attention_4`: pip `flash-attn`
   when installed, otherwise Hub FA2/3/4 when `kernels` is available.
 - Version pins: `kernels-community/flash-attn2@v2.1.0` or
   `kernels-community/flash-attn2@>=2.0,<3.0`.
@@ -49,7 +49,7 @@ Also supported (same as Transformers):
 
 Example recipe: [`examples/llm_finetune/qwen/qwen2_5_7b_squad_hub_kernels.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen2_5_7b_squad_hub_kernels.yaml).
 
-## Layer kernels (`use_kernels`)
+## Layer Kernels (`use_kernels`)
 
 ```yaml
 model:
@@ -61,7 +61,7 @@ model:
 ```
 
 Defaults come from Transformers' device-aware Hub map (CUDA uses
-`kernels-community/liger-kernels` for RMSNorm / MLP / Linear / loss, plus
+`kernels-community/liger-kernels` for RMSNorm, MLP, Linear, and loss, plus
 activation and rotary repos). Override with `kernel_config`:
 
 ```yaml
@@ -84,15 +84,15 @@ Combine with Hub attention when you want both:
   use_liger_kernel: false
 ```
 
-Hub kernels follow `model.train()` / `model.eval()` (training vs inference
+Hub kernels follow `model.train()` and `model.eval()` (training and inference
 variants). AutoModel training recipes keep the model in train mode.
 
-Benchmark configs:
+The following benchmark configs are available:
 
-- [`qwen2_5_7b_hub_kernels.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/qwen/qwen2_5_7b_hub_kernels.yaml) — attention only
-- [`qwen2_5_7b_hub_kernels_layers.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/qwen/qwen2_5_7b_hub_kernels_layers.yaml) — attention + layers
+- [`qwen2_5_7b_hub_kernels.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/qwen/qwen2_5_7b_hub_kernels.yaml): attention only
+- [`qwen2_5_7b_hub_kernels_layers.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/qwen/qwen2_5_7b_hub_kernels_layers.yaml): attention and layers
 
-## Native models (`BackendConfig`)
+## Native Models (`BackendConfig`)
 
 Custom NeMo model factories do not use Hugging Face attention dispatch. For those
 paths, set:
@@ -107,23 +107,23 @@ model:
 
 Layer replacements for custom models still use top-level `use_kernels: true`.
 
-## What to prefer when
+## Recommended Settings by Goal
 
-| Goal | Recommended settings |
+| Goal | Recommended Settings |
 |------|----------------------|
-| Avoid compiling `flash-attn` | `hub_kernels` extra + Hub `attn_implementation` |
+| Avoid compiling `flash-attn` | `hub_kernels` extra and Hub `attn_implementation` |
 | Match Transformers default Hub layers | `use_kernels: true` |
-| Pin or remap individual ops | `kernel_config` + `use_kernels: true` |
-| TE / DeepEP / TileLang / QuACK | Keep existing `backend:` fields; do not mix TE attention with Hub FA |
-| EAGLE ring attention / some VLMs | Still need pip `flash-attn` (direct imports) |
+| Pin or remap individual ops | `kernel_config` and `use_kernels: true` |
+| TE, DeepEP, TileLang, or QuACK | Keep existing `backend:` fields. Do not mix TE attention with Hub FA |
+| EAGLE ring attention or some VLMs | Still need pip `flash-attn` (direct imports) |
 
 ## Limitations
 
 - Transformer Engine attention and Hub flash attention are mutually exclusive.
 - Some vision and speculative paths still import pip `flash-attn` directly
-  (Kimi VL, BAGEL packed inference, LLaVA-OneVision Rice ViT, EAGLE).
+  (Kimi VL, BAGEL packed inference, LLaVA-OneVision Rice ViT, and EAGLE).
 - Scoped CUDA graphs (`backend.cuda_graph`) require `attn: te`, not `hub`.
 
 For offline or reproducible deploys, pin kernels with `kernels lock` and
 `kernels download` as described in the [Hugging Face kernels docs](https://huggingface.co/docs/kernels)
-and [Transformers loading guide](https://huggingface.co/docs/transformers/en/kernel_doc/loading_kernels).
+and the [Transformers loading guide](https://huggingface.co/docs/transformers/en/kernel_doc/loading_kernels).
