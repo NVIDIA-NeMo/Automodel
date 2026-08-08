@@ -424,8 +424,8 @@ RUN uv pip install "kernels>=0.11.0" \
 | FSDP2 + Hub kernel autograd | **Medium** | Parity tests on 1-GPU and multi-GPU finetune |
 | Hub download at training start (latency) | **Low** | `kernels lock` + pre-download in container |
 | `USE_HUB_KERNELS=0` env disables all Hub loading | **Low** | Document; default YES in transformers |
-| Packed sequence + CP override forces SDPA | **Medium** | Existing limitation; Hub FA varlen may enable CP+packing later |
-| tilelang / FA4 / apache-tvm-ffi conflict | **High** | Unrelated to Hub; existing pyproject constraint remains |
+| Packed sequence with CP override forces SDPA | **Medium** | Existing limitation; Hub FA varlen might enable CP and packing later |
+| tilelang, FA4, and apache-tvm-ffi conflict | **High** | Unrelated to Hub; existing pyproject constraint remains |
 
 ---
 
