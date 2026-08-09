@@ -89,7 +89,7 @@ def test_mok_backend_config_build_settings(monkeypatch: pytest.MonkeyPatch) -> N
         all_gather_top_experts_chunk_bytes=1024,
     )
 
-    config.build()
+    config.build(swiglu_limit=10.0)
 
     assert captured == {
         "fwd_num_comm_sms": 24,
@@ -98,7 +98,17 @@ def test_mok_backend_config_build_settings(monkeypatch: pytest.MonkeyPatch) -> N
         "macrobatch_size": 8192,
         "schedule_capacity_multiplier": 0.75,
         "all_gather_top_experts_chunk_bytes": 1024,
+        "swiglu_limit": 10.0,
     }
+
+
+def test_mok_accepts_dsv4_clamped_swiglu() -> None:
+    experts = GroupedExpertsMoK(
+        _valid_moe_config(swiglu_limit=10.0),
+        BackendConfig(dispatcher="mok"),
+    )
+
+    assert experts.runtime.swiglu_limit == 10.0
 
 
 @pytest.mark.parametrize(
@@ -111,6 +121,8 @@ def test_mok_backend_config_build_settings(monkeypatch: pytest.MonkeyPatch) -> N
         ({"shared_expert_gate": True}, "shared_expert_gate=True"),
         ({"moe_latent_size": 128}, "moe_latent_size=128"),
         ({"expert_activation": "relu2"}, "activations must both be swiglu"),
+        ({"swiglu_limit": -1.0}, "swiglu_limit=-1.0"),
+        ({"swiglu_limit": float("nan")}, "swiglu_limit=nan"),
     ],
 )
 def test_mok_rejects_unsupported_moe_contract(overrides: dict[str, object], message: str) -> None:

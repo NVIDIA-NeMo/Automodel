@@ -14,6 +14,7 @@
 
 """Mixture-of-Kittens expert backend for AutoModel's shared MoE component."""
 
+import math
 from collections import OrderedDict
 from dataclasses import fields, is_dataclass
 from typing import Any
@@ -129,8 +130,9 @@ def _unflatten_mok_tensor_dataclass(
 class _MoKRuntime:
     """Own one layer's MoK configuration and expert-parallel process group."""
 
-    def __init__(self, backend: BackendConfig) -> None:
+    def __init__(self, backend: BackendConfig, *, swiglu_limit: float) -> None:
         self.backend = backend
+        self.swiglu_limit = swiglu_limit
         self.config: object | None = None
         self.ep_group: dist.ProcessGroup | None = None
 
@@ -154,7 +156,7 @@ class _MoKRuntime:
         # Load the CUDA extension only after torchrun has bound this worker to
         # its local device.  This avoids all workers creating a context on GPU 0.
         _load_mok_functional()
-        self.config = self.backend.mok.build()
+        self.config = self.backend.mok.build(swiglu_limit=self.swiglu_limit)
         self.ep_group = ep_mesh.get_group()
 
     def forward(
@@ -441,7 +443,7 @@ class GroupedExpertsMoK(nn.Module):
         self.routed_down_weights = nn.Parameter(
             torch.empty(config.n_routed_experts, config.dim, config.moe_inter_dim, dtype=config.dtype)
         )
-        self.runtime = _MoKRuntime(backend)
+        self.runtime = _MoKRuntime(backend, swiglu_limit=config.swiglu_limit)
         self.ep_mesh: DeviceMesh | None = None
         self.ep_rank = 0
 
@@ -467,8 +469,12 @@ class GroupedExpertsMoK(nn.Module):
             unsupported.append("shared_expert_gate=True")
         if config.moe_latent_size is not None:
             unsupported.append(f"moe_latent_size={config.moe_latent_size}")
-        if config.swiglu_limit != 0.0:
-            unsupported.append(f"swiglu_limit={config.swiglu_limit}")
+        if (
+            type(config.swiglu_limit) not in (int, float)
+            or not math.isfinite(config.swiglu_limit)
+            or config.swiglu_limit < 0
+        ):
+            unsupported.append(f"swiglu_limit={config.swiglu_limit} (must be non-negative and finite)")
         if unsupported:
             raise ValueError("dispatcher='mok' does not support this MoE config: " + "; ".join(unsupported))
 
