@@ -457,7 +457,7 @@ class DFlashStrategy(DLLMStrategy):
         """Load and freeze the target LM; resolve block_size, layer_ids, decay loss."""
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
-        from nemo_automodel.components.loss.dllm_loss import DFlashDecayLoss
+        from nemo_automodel.components.loss.loss import DFlashDecayLossConfig
 
         dflash_cfg = recipe.cfg.get("dflash", None) or {}
 
@@ -541,13 +541,13 @@ class DFlashStrategy(DLLMStrategy):
         # ce_chunk_size trades peak memory (smaller = lower) against recompute.
         self.use_fused_linear_ce = bool(dflash_cfg.get("use_fused_linear_ce", True))
         ce_chunk_size = int(dflash_cfg.get("ce_chunk_size", 1024))
-        self.dflash_loss_fn = DFlashDecayLoss(
+        self.dflash_loss_fn = DFlashDecayLossConfig(
             loss_gamma=loss_gamma,
             use_fused_linear_ce=self.use_fused_linear_ce,
             chunk_size=ce_chunk_size,
             loss_type=str(dflash_cfg.get("loss_type", "dflash")),
             dpace_alpha=float(dflash_cfg.get("dpace_alpha", 0.5)),
-        )
+        ).build()
 
         # --- Multi-block ---
         self.num_blocks_per_sample = int(dflash_cfg.get("num_blocks_per_sample", 1))
@@ -872,24 +872,24 @@ class DFlashStrategy(DLLMStrategy):
             if not torch.is_tensor(draft_hidden):
                 draft_hidden = getattr(draft_hidden, "last_hidden_state", draft_hidden[0])
 
-            # Extract predicted positions (skip the anchor token at index 0 of
-            # each block). draft_hidden: [B, N*block_size, dim] → [B, N*(block_size-1), dim].
-            pred = draft_hidden.view(B, N, self.block_size, -1)[:, :, 1:, :].reshape(B, N * (self.block_size - 1), -1)
-            # D-PACE's confidence product must reset per block, so it always needs an
-            # explicit block_size; dflash tolerates None for the single-block (N==1)
-            # case (its decay curve is identical either way there).
-            loss_block_size = self.block_size if (N > 1 or self.dflash_loss_fn.loss_type != "dflash") else None
+            # Extract predicted positions (skip the anchor token at index 0 of each
+            # block). draft_hidden: [B, N*block_size, dim] → [B, N, block_size-1, dim].
+            # The [B, N, k] block layout is kept (not flattened) so the loss's
+            # per-block confidence reset is structural.
+            k = self.block_size - 1
+            pred = draft_hidden.view(B, N, self.block_size, -1)[:, :, 1:, :]  # [B, N, k, dim]
+            block_targets = block_targets.view(B, N, k)
+            block_mask = block_mask.view(B, N, k)
             if self.use_fused_linear_ce:
                 # Fuse the LM-head projection into the CE — avoids materialising
-                # the [B, N*(block_size-1), vocab] logits tensor (the main OOM
-                # source at large N on a full-vocab target).
+                # the [B, N, k, vocab] logits tensor (the main OOM source at large
+                # N on a full-vocab target).
                 loss_result = self.dflash_loss_fn.forward_fused(
                     hidden=pred,
                     lm_head_weight=self.target_head.weight,
                     target_ids=block_targets,
                     block_mask=block_mask,
                     num_tokens=num_diffusion_tokens,
-                    block_size=loss_block_size,
                     lm_head_bias=getattr(self.target_head, "bias", None),
                 )
             else:
@@ -899,7 +899,6 @@ class DFlashStrategy(DLLMStrategy):
                     target_ids=block_targets,
                     block_mask=block_mask,
                     num_tokens=num_diffusion_tokens,
-                    block_size=loss_block_size,
                 )
             microbatch_loss = loss_result.total_loss
             loss_buffer.append(microbatch_loss.detach().clone())

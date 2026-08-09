@@ -93,12 +93,18 @@ class DLLMLossOutput(NamedTuple):
             DP/CP replicas and dividing post-reduction yields per-position
             global accuracy; summing across positions before dividing gives
             the overall draft top-1 accuracy.
+        loss_denominator: Scalar tensor -- the exact denominator ``total_loss``
+            was divided by. Consumers that token-weight across microbatches /
+            DP ranks (``sum(loss * denom) / sum(denom)``) read this so the
+            aggregate can never drift from the denominator the loss used.
+            ``None`` for losses that do not report it.
     """
 
     total_loss: torch.Tensor
     dllm_loss: torch.Tensor
     draft_correct_per_pos: Optional[torch.Tensor] = None
     draft_count_per_pos: Optional[torch.Tensor] = None
+    loss_denominator: Optional[torch.Tensor] = None
 
 
 class MDLMCrossEntropyLoss(nn.Module):
@@ -424,19 +430,21 @@ class DFlashDecayLoss(nn.Module):
         self.loss_type = loss_type
         self.dpace_alpha = float(dpace_alpha)
 
-    def _decay_weights(self, T: int, block_size: Optional[int], device, dtype) -> torch.Tensor:
-        """Eq. 4 weights for ``T`` predicted positions, resetting per block.
+    def _decay_weights(self, k: int, device, dtype) -> torch.Tensor:
+        """Eq. 4 decay weights for the ``k`` predicted positions of one block.
 
-        Returns all-ones (uniform) when ``loss_gamma is None`` (decay disabled).
+        Args:
+            k: Predicted positions per block (``block_size - 1``).
+            device: Device for the returned tensor.
+            dtype: Dtype for the returned tensor.
+
+        Returns:
+            Tensor of shape ``[k]``; all-ones (uniform) when ``loss_gamma is None``
+            (decay disabled).
         """
         if self.loss_gamma is None:
-            return torch.ones(T, device=device, dtype=dtype)
-        if block_size is not None:
-            T_per = block_size - 1
-            n_blocks = T // T_per if T_per > 0 else 1
-            w_single = torch.exp(-torch.arange(T_per, device=device, dtype=dtype) / self.loss_gamma)
-            return w_single.repeat(n_blocks)
-        return torch.exp(-torch.arange(T, device=device, dtype=dtype) / self.loss_gamma)
+            return torch.ones(k, device=device, dtype=dtype)
+        return torch.exp(-torch.arange(k, device=device, dtype=dtype) / self.loss_gamma)
 
     def _dpace_weight(
         self,
@@ -444,7 +452,18 @@ class DFlashDecayLoss(nn.Module):
         binary_mask: torch.Tensor,
         binary_mask_bool: torch.Tensor,
     ) -> torch.Tensor:
-        """Compute detached D-PACE position weights."""
+        """Compute detached D-PACE position weights.
+
+        Args:
+            prob: Draft confidence ``exp(-nll)``, shape ``[batch, blocks, k]``.
+            binary_mask: Float valid-position mask, same shape.
+            binary_mask_bool: Boolean valid-position mask, same shape.
+
+        Returns:
+            Detached weights of shape ``[batch, blocks, k]``. The ``cumprod`` /
+            reverse-``cumsum`` run over the last (``k``) axis, so the confidence
+            product resets at every block boundary by construction.
+        """
         smooth = (1.0 - self.dpace_alpha) * prob + self.dpace_alpha
         smooth = torch.where(binary_mask_bool, smooth, torch.ones_like(smooth))
         prefix = torch.cumprod(smooth, dim=-1)
@@ -468,53 +487,46 @@ class DFlashDecayLoss(nn.Module):
         token_nll: torch.Tensor,
         block_mask: torch.Tensor,
         num_tokens: Optional[int],
-        block_size: Optional[int],
-        draft_correct_per_pos: Optional[torch.Tensor] = None,
-        draft_count_per_pos: Optional[torch.Tensor] = None,
+        draft_correct_per_pos: torch.Tensor,
+        draft_count_per_pos: torch.Tensor,
     ) -> DLLMLossOutput:
         """Build per-position weights, then sum and normalise.
 
+        Args:
+            token_nll: Per-token NLL, shape ``[batch, blocks, k]`` (``k =
+                block_size - 1`` predicted positions per block).
+            block_mask: Valid-position mask, same shape ``[batch, blocks, k]``;
+                zero entries (padding) are excluded from the loss.
+            num_tokens: Optional global, DP-all-reduced token count used as the
+                denominator when ``normalize != "mean"``.
+            draft_correct_per_pos: Per-offset argmax-correct counts, shape ``[k]``.
+            draft_count_per_pos: Per-offset valid-position counts, shape ``[k]``.
+
+        Returns:
+            :class:`DLLMLossOutput` whose ``loss_denominator`` is the exact scalar
+            the weighted sum was divided by, so callers never recompute it.
+
         ``loss_type`` selects the weights (decay for ``"dflash"``, detached D-PACE
-        confidence for the ``"dpace*"`` variants). ``normalize`` / ``num_tokens``
-        select the denominator, which is always data-independent for D-PACE (the
-        global ``num_tokens``, or the batch size) so the DP gradient average stays
-        exact and the objective's weight magnitudes are preserved.
+        confidence for the ``"dpace*"`` variants -- the ``cumprod`` runs over the
+        last (``k``) axis, so it resets per block by construction). The denominator
+        is data-independent for D-PACE (the global ``num_tokens`` or the batch size)
+        so the DP gradient average stays exact and the objective's weight
+        magnitudes are preserved.
         """
-        _, T = token_nll.shape
+        bsz, _, k = token_nll.shape
         block_mask = block_mask.to(token_nll.dtype)
         if self.loss_type == "dflash":
-            w = self._decay_weights(T, block_size, token_nll.device, token_nll.dtype)
-            weights = w.unsqueeze(0) * block_mask  # [B, T]
+            w = self._decay_weights(k, token_nll.device, token_nll.dtype)
+            weights = w.view(1, 1, k) * block_mask  # [batch, blocks, k]
         elif self.loss_type in _DPACE_LOSS_TYPES:
-            # The confidence product (cumprod) must reset at every block boundary;
-            # run across blocks it underflows to ~0 and the weights become
-            # meaningless. The block layout is only knowable from block_size, so
-            # require it -- never infer "single block" from a None sentinel, or a
-            # future multi-block caller passing None would silently span blocks.
-            if block_size is None or block_size <= 1:
-                raise ValueError(
-                    f"D-PACE loss_type={self.loss_type!r} requires block_size > 1 so the "
-                    f"confidence product resets per block; got block_size={block_size!r}."
-                )
-            t_per = block_size - 1
-            # A non-partitioning T would cumprod across the whole sequence, so fail
-            # loud instead of mis-weighting silently.
-            if T % t_per != 0:
-                raise ValueError(
-                    f"D-PACE requires predicted length T={T} to be a multiple of "
-                    f"block_size-1={t_per} (per-block confidence reset); got a remainder."
-                )
-            n_blocks = T // t_per
-            dpace_nll = token_nll.view(token_nll.shape[0], n_blocks, t_per)
-            dpace_mask = block_mask.view(block_mask.shape[0], n_blocks, t_per)
             with torch.no_grad():
-                prob = torch.exp(-dpace_nll.detach())
-                dpace_weights = self._dpace_weight(prob, dpace_mask, dpace_mask > 0)
-            weights = (dpace_mask * dpace_weights).reshape_as(token_nll)
+                prob = torch.exp(-token_nll.detach())
+                dpace_weights = self._dpace_weight(prob, block_mask, block_mask > 0)
+            weights = block_mask * dpace_weights
         else:
             raise ValueError(f"unknown loss_type {self.loss_type!r}")
 
-        loss = (token_nll * weights).sum()
+        weighted_sum = (token_nll * weights).sum()
         if self.normalize == "mean":
             if self.loss_type in _DPACE_LOSS_TYPES:
                 # D-PACE is a weighted *sum* normalized per sequence: the weight
@@ -524,44 +536,43 @@ class DFlashDecayLoss(nn.Module):
                 # DP gradient average (exact only when every rank divides by the same
                 # constant). Divide by the batch size, as the reference implementation
                 # does -- independent of the sampled anchor count.
-                loss = loss / max(float(token_nll.shape[0]), 1.0)
+                denom = weighted_sum.new_tensor(max(float(bsz), 1.0))
             else:
-                loss = loss / (weights.sum() + 1e-6)
+                denom = weights.sum() + 1e-6
         elif num_tokens is not None:
-            loss = loss / max(float(num_tokens), 1.0)
+            denom = weighted_sum.new_tensor(max(float(num_tokens), 1.0))
+        else:
+            denom = weighted_sum.new_tensor(1.0)
+        loss = weighted_sum / denom
         return DLLMLossOutput(
             total_loss=loss,
             dllm_loss=loss.detach().clone(),
             draft_correct_per_pos=draft_correct_per_pos,
             draft_count_per_pos=draft_count_per_pos,
+            loss_denominator=denom.detach(),
         )
 
     @staticmethod
     def _draft_acc_per_pos(
         correct: torch.Tensor,
         block_mask: torch.Tensor,
-        block_size: Optional[int],
-    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """Per-rank (correct, count) sums per block offset k=1..block_size-1.
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Per-rank (correct, count) sums per block offset.
 
-        ``correct`` is a ``[B, T]`` bool/float tensor of argmax matches and
-        ``block_mask`` excludes padding (T = N * (block_size - 1) when
-        ``block_size`` is provided). Reshape to ``[B, N, block_size-1]`` and
-        sum over ``(B, N)`` to get per-offset counts of shape
-        ``[block_size-1]``. Returns ``(None, None)`` when ``block_size`` is
-        unknown (single-block / legacy path).
+        Args:
+            correct: Bool/float argmax-match tensor, shape ``[batch, blocks, k]``.
+            block_mask: Valid-position mask, shape ``[batch, blocks, k]``.
+
+        Returns:
+            ``(correct_per_pos, count_per_pos)``, each shape ``[k]`` -- summed over
+            ``(batch, blocks)``. SUM-allreducing both across DP/CP replicas and
+            dividing post-reduction yields per-offset global accuracy; summing
+            across offsets before dividing gives the overall draft top-1 accuracy.
         """
-        if block_size is None or block_size <= 1:
-            return None, None
-        T_per = block_size - 1
-        B, T = correct.shape
-        if T % T_per != 0:
-            return None, None
-        N = T // T_per
-        c = correct.to(block_mask.dtype).view(B, N, T_per)
-        m = block_mask.view(B, N, T_per)
-        correct_per_pos = (c * m).sum(dim=(0, 1))  # [block_size-1]
-        count_per_pos = m.sum(dim=(0, 1))  # [block_size-1]
+        c = correct.to(block_mask.dtype)
+        m = block_mask.to(c.dtype)
+        correct_per_pos = (c * m).sum(dim=(0, 1))  # [k]
+        count_per_pos = m.sum(dim=(0, 1))  # [k]
         return correct_per_pos, count_per_pos
 
     def forward(
@@ -570,33 +581,31 @@ class DFlashDecayLoss(nn.Module):
         target_ids: torch.Tensor,
         block_mask: torch.Tensor,
         num_tokens: Optional[int] = None,
-        block_size: Optional[int] = None,
     ) -> DLLMLossOutput:
         """Compute the DFlash decay-weighted loss from pre-computed logits.
 
         Args:
-            logits: Draft model logits for the predicted block positions,
-                shape ``[B, T, V]`` where ``T = N * (block_size - 1)``.
-            target_ids: Ground-truth token IDs, shape ``[B, T]``.
-            block_mask: Float/bool valid-position mask, shape ``[B, T]``.
-                Zero entries (padding) are excluded from the loss.
+            logits: Draft logits for the predicted block positions, shape
+                ``[batch, blocks, k, vocab]`` (``k = block_size - 1``; the clean
+                anchor at within-block position 0 is dropped by the caller). The
+                block dimension carries the layout, so the per-block confidence
+                reset is structural.
+            target_ids: Ground-truth token IDs, shape ``[batch, blocks, k]``.
+            block_mask: Float/bool valid-position mask, shape ``[batch, blocks, k]``;
+                zero entries (padding) are excluded from the loss.
             num_tokens: Optional global token count for loss normalisation.
-            block_size: When provided, the decay weights reset at each block
-                boundary so that every block's first predicted position has
-                weight 1.  Required for multi-block training (N > 1).
 
         Returns:
             :class:`DLLMLossOutput`.
         """
-        token_nll = _compute_per_token_nll(logits, target_ids)  # [B, T]
-        correct = logits.argmax(dim=-1) == target_ids  # [B, T]
+        token_nll = _compute_per_token_nll(logits, target_ids)  # [batch, blocks, k]
+        correct = logits.argmax(dim=-1) == target_ids  # [batch, blocks, k]
         del logits
-        c_per_pos, n_per_pos = self._draft_acc_per_pos(correct, block_mask, block_size)
+        c_per_pos, n_per_pos = self._draft_acc_per_pos(correct, block_mask)
         return self._reduce(
             token_nll,
             block_mask,
             num_tokens,
-            block_size,
             draft_correct_per_pos=c_per_pos,
             draft_count_per_pos=n_per_pos,
         )
@@ -626,7 +635,6 @@ class DFlashDecayLoss(nn.Module):
         target_ids: torch.Tensor,
         block_mask: torch.Tensor,
         num_tokens: Optional[int] = None,
-        block_size: Optional[int] = None,
         lm_head_bias: Optional[torch.Tensor] = None,
     ) -> DLLMLossOutput:
         """Chunked linear-CE: never materialises the full logits tensor.
@@ -634,25 +642,26 @@ class DFlashDecayLoss(nn.Module):
         Projects the LM head + cross-entropy in chunks of ``chunk_size``
         predicted positions, each wrapped in :func:`torch.utils.checkpoint` so
         the ``[chunk, vocab]`` logits are recomputed in backward instead of
-        held — peak logit memory is one chunk, not ``[B*T, vocab]``. Pure
-        autograd, so the gradient flows correctly through FSDP2 (unlike a
+        held — peak logit memory is one chunk, not ``[batch*blocks*k, vocab]``.
+        Pure autograd, so the gradient flows correctly through FSDP2 (unlike a
         standalone liger fused-CE Function).
 
         Args:
-            hidden: Draft hidden states for the predicted positions,
-                shape ``[B, T, D]`` (``D`` = model dim, NOT vocab).
-            lm_head_weight: LM-head projection weight, shape ``[V, D]``.
-            target_ids: Ground-truth token IDs, shape ``[B, T]``.
-            block_mask: Valid-position mask, shape ``[B, T]``.
-            num_tokens / block_size: as in :meth:`forward`.
-            lm_head_bias: Optional LM-head bias, shape ``[V]``.
+            hidden: Draft hidden states for the predicted positions, shape
+                ``[batch, blocks, k, hidden]`` (``k = block_size - 1``; ``hidden``
+                is the model dim, NOT vocab).
+            lm_head_weight: LM-head projection weight, shape ``[vocab, hidden]``.
+            target_ids: Ground-truth token IDs, shape ``[batch, blocks, k]``.
+            block_mask: Valid-position mask, shape ``[batch, blocks, k]``.
+            num_tokens: as in :meth:`forward`.
+            lm_head_bias: Optional LM-head bias, shape ``[vocab]``.
 
         Returns:
             :class:`DLLMLossOutput`.
         """
-        B, T, D = hidden.shape
-        flat_hidden = hidden.reshape(-1, D)  # [B*T, D]
-        flat_target = target_ids.reshape(-1)  # [B*T]
+        B, n, k, D = hidden.shape
+        flat_hidden = hidden.reshape(-1, D)  # [batch*blocks*k, D]
+        flat_target = target_ids.reshape(-1)  # [batch*blocks*k]
 
         nll_parts = []
         correct_parts = []
@@ -668,14 +677,13 @@ class DFlashDecayLoss(nn.Module):
             )
             nll_parts.append(nll_chunk)
             correct_parts.append(correct_chunk)
-        token_nll = torch.cat(nll_parts).reshape(B, T)
-        correct = torch.cat(correct_parts).reshape(B, T)
-        c_per_pos, n_per_pos = self._draft_acc_per_pos(correct, block_mask, block_size)
+        token_nll = torch.cat(nll_parts).reshape(B, n, k)
+        correct = torch.cat(correct_parts).reshape(B, n, k)
+        c_per_pos, n_per_pos = self._draft_acc_per_pos(correct, block_mask)
         return self._reduce(
             token_nll,
             block_mask,
             num_tokens,
-            block_size,
             draft_correct_per_pos=c_per_pos,
             draft_count_per_pos=n_per_pos,
         )

@@ -56,7 +56,7 @@ from nemo_automodel.components.attention.dflash_mask import (
     create_dflash_sdpa_mask,
 )
 from nemo_automodel.components.loss.dllm_loss import _DFLASH_LOSS_TYPES as _DECAY_LOSS_TYPES
-from nemo_automodel.components.loss.dllm_loss import _DPACE_LOSS_TYPES, DFlashDecayLoss
+from nemo_automodel.components.loss.loss import DFlashDecayLossConfig
 from nemo_automodel.components.speculative.dflash.draft_qwen3 import Qwen3DFlashDraftModel
 
 
@@ -232,12 +232,12 @@ class DFlashTrainerModule(nn.Module):
         self.loss_fn = (
             None
             if loss_type == "variable_prefix"
-            else DFlashDecayLoss(
+            else DFlashDecayLossConfig(
                 loss_gamma=loss_decay_gamma,
                 normalize="mean",
                 loss_type=loss_type,
                 dpace_alpha=dpace_alpha,
-            )
+            ).build()
         )
 
         # Per-block offset constant (block_size,) for label gathering / position ids.
@@ -578,40 +578,30 @@ class DFlashTrainerModule(nn.Module):
             return self._variable_prefix_loss(logits.view(bsz, n, bs, -1), target_ids, block_mask, prefix_lengths)
 
         # Drop block position 0 (the clean anchor token, never a target); the
-        # remaining bs-1 predicted positions are what the loss supervises.
-        pred_logits = logits.view(bsz, n, bs, -1)[:, :, 1:, :].reshape(bsz, n * (bs - 1), -1)
-        pred_targets = target_ids[:, :, 1:].reshape(bsz, n * (bs - 1))
-        pred_mask = block_mask[:, :, 1:].reshape(bsz, n * (bs - 1))
+        # remaining bs-1 predicted positions are what the loss supervises. The
+        # [bsz, n, bs-1, ...] block layout is kept (not flattened) so the loss's
+        # per-block confidence reset is structural.
+        pred_logits = logits.view(bsz, n, bs, -1)[:, :, 1:, :]  # [bsz, n, bs-1, V]
+        pred_targets = target_ids[:, :, 1:]  # [bsz, n, bs-1]
+        pred_mask = block_mask[:, :, 1:]  # [bsz, n, bs-1]
 
         loss_fn = self.loss_fn
         assert loss_fn is not None, "loss_fn is constructed for every loss_type except 'variable_prefix'"
-        loss_out = loss_fn(pred_logits, pred_targets, pred_mask, num_tokens=None, block_size=bs)
+        loss_out = loss_fn(pred_logits, pred_targets, pred_mask, num_tokens=None)
 
-        if self.loss_type in _DPACE_LOSS_TYPES:
-            # D-PACE normalizes its weighted sum by the batch size (see
-            # DFlashDecayLoss._reduce), so report that same denominator here. The
-            # recipe's token-weighted validation average -- sum(loss * loss_weight)
-            # / sum(loss_weight) -- is only correct when loss_weight is the exact
-            # denominator the loss used; the decay-weight sum below describes the
-            # dflash denominator, not D-PACE's.
-            loss_weight = pred_mask.new_tensor(float(bsz))
-        else:
-            loss_weights = pred_mask.view(bsz, n, bs - 1)
-            if self.loss_decay_gamma is not None:
-                depth_weights = torch.exp(
-                    -torch.arange(bs - 1, device=pred_mask.device, dtype=pred_mask.dtype) / self.loss_decay_gamma
-                )
-                loss_weights = loss_weights * depth_weights
-            loss_weight = loss_weights.sum()
+        # The loss reports the exact denominator it divided by (per-sequence batch
+        # size for D-PACE, the effective decay-weight sum for dflash), so read it
+        # directly -- the metric can never drift from the loss's own normalization.
+        loss_weight = loss_out.loss_denominator
 
         count_per_pos = loss_out.draft_count_per_pos
         valid_tokens = count_per_pos.sum()
         correct_tokens = loss_out.draft_correct_per_pos.sum()
         accuracy = correct_tokens / valid_tokens.clamp_min(1)
         accept_len, accept_len_sum, valid_blocks = compute_acceptance_stats(
-            pred_logits.argmax(dim=-1).view(bsz, n, bs - 1),
-            pred_targets.view(bsz, n, bs - 1),
-            pred_mask.view(bsz, n, bs - 1).bool(),
+            pred_logits.argmax(dim=-1),  # [bsz, n, bs-1]
+            pred_targets,
+            pred_mask.bool(),
         )
 
         return DFlashStepMetrics(
