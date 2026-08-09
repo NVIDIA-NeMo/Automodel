@@ -1297,7 +1297,7 @@ def test_shipped_scdd_recipe_builds_its_strategy_and_loss():
     assert isinstance(strategy, SCDDStrategy)
     loss_fn = strategy.create_loss_fn(dllm_cfg)
     assert isinstance(loss_fn, SCDDLoss)
-    # Schedule values are the authors' released scdd_pu_0.1 checkpoint config.
+    # Schedule values match the authors' released checkpoint config.
     assert (loss_fn.num_timesteps, loss_fn.max_ratio) == (1000, 0.1)
     assert (loss_fn.gamma_shape, loss_fn.t_peak) == (1.0, 0.5)
     assert loss_fn.max_ratio > 0, "uniform_ratio 0 would silently degenerate SCDD to MDLM"

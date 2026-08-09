@@ -141,9 +141,9 @@ dataset:
   unshifted: true
 ```
 
-The schedule values above are taken from the config shipped with the authors' released
-`scdd_pu_0.1` checkpoint. Their only other released setting differs solely in `uniform_ratio: 0.2`,
-so that is the first knob to sweep.
+The schedule values above match the config shipped with the authors' released checkpoint. Their
+only other released setting differs solely in `uniform_ratio: 0.2`, so that is the first knob to
+sweep.
 
 Decode SCDD checkpoints with `--sampler scdd`, passing the same `uniform_ratio`, `schedule_shape`,
 and `schedule_peak` used during training. The sampler rebuilds the reverse posterior from that
