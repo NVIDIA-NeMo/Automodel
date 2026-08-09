@@ -78,8 +78,8 @@ CLOUD_PATH_OPTIM = "msc://bucket/step-100/optim"
 LOCAL_PATH_MODEL = "/ckpts/step-100/model"
 
 
-def test_load_on_dp_ranks_requires_opt_in_for_legacy_rng_state(tmp_path):
-    """Legacy RNG checkpoints restore only with the trusted-pickle opt-in."""
+def test_load_on_global_ranks_falls_back_to_legacy_rng_state(tmp_path, caplog):
+    """Global-rank restore warns and requires the trusted-pickle opt-in for legacy RNG state."""
     init_all_rng(123)
     legacy_state = RNGState(
         random_rng_state=random.getstate(),
@@ -94,15 +94,20 @@ def test_load_on_dp_ranks_requires_opt_in_for_legacy_rng_state(tmp_path):
 
     rng = StatefulRNG(999)
     restricted = CheckpointingConfig(checkpoint_dir=tmp_path, save_consolidated=False).build(0, 0, 0)
-    with pytest.raises(RuntimeError, match="Refusing to load torch artifact"):
-        restricted.load_on_dp_ranks(rng, "rng", str(tmp_path))
+    with (
+        caplog.at_level(logging.WARNING),
+        pytest.raises(RuntimeError, match="Refusing to load torch artifact"),
+    ):
+        restricted.load_on_global_ranks(rng, "rng", str(tmp_path))
+
+    assert "Loading legacy per-DP rng state" in caplog.text
 
     legacy = CheckpointingConfig(
         checkpoint_dir=tmp_path,
         save_consolidated=False,
         allow_legacy_pickle_restore=True,
     ).build(0, 0, 0)
-    legacy.load_on_dp_ranks(rng, "rng", str(tmp_path))
+    legacy.load_on_global_ranks(rng, "rng", str(tmp_path))
 
     assert (random.random(), np.random.rand(), torch.rand(1).item()) == expected
 
@@ -3056,7 +3061,7 @@ class TestEnsureDirs:
 
 
 def test_save_on_dp_ranks_creates_node_local_directory_on_each_writer_rank():
-    """A nonzero distributed rank must create its local directory before writing auxiliary state."""
+    """A nonzero DP writer rank must create its local directory before writing dataloader state."""
     checkpointer = Checkpointer.__new__(Checkpointer)
     checkpointer.process_group = object()
     checkpointer.tp_rank = 0
@@ -3070,11 +3075,32 @@ def test_save_on_dp_ranks_creates_node_local_directory_on_each_writer_rank():
         patch("torch.distributed.barrier") as barrier,
         patch("torch.save") as save,
     ):
-        checkpointer.save_on_dp_ranks(state, "rng", "/tmp/checkpoint")
+        checkpointer.save_on_dp_ranks(state, "dataloader", "/tmp/checkpoint")
+
+    makedirs.assert_called_once_with("/tmp/checkpoint/dataloader", exist_ok=True)
+    barrier.assert_called_once_with(group=checkpointer.process_group)
+    save.assert_called_once_with({"state": torch.ones(1)}, "/tmp/checkpoint/dataloader/dataloader_dp_rank_1.pt")
+
+
+def test_save_on_global_ranks_writes_one_file_per_process_rank():
+    """Rank-local state uses the global process rank even when DP rank is shared."""
+    checkpointer = Checkpointer.__new__(Checkpointer)
+    checkpointer.process_group = object()
+    checkpointer.dp_rank = 0
+    state = SimpleNamespace(state_dict=lambda: {"state": torch.ones(1)})
+
+    with (
+        patch("torch.distributed.is_initialized", return_value=True),
+        patch("torch.distributed.get_rank", return_value=3),
+        patch("os.makedirs") as makedirs,
+        patch("torch.distributed.barrier") as barrier,
+        patch("torch.save") as save,
+    ):
+        checkpointer.save_on_global_ranks(state, "rng", "/tmp/checkpoint")
 
     makedirs.assert_called_once_with("/tmp/checkpoint/rng", exist_ok=True)
     barrier.assert_called_once_with(group=checkpointer.process_group)
-    save.assert_called_once_with({"state": torch.ones(1)}, "/tmp/checkpoint/rng/rng_dp_rank_1.pt")
+    save.assert_called_once_with({"state": torch.ones(1)}, "/tmp/checkpoint/rng/rng_global_rank_3.pt")
 
 
 def test_model_and_optimizer_saves_use_separate_plan_caches():
