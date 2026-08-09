@@ -1019,6 +1019,10 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
 
     _keep_in_fp32_modules_strict = ["_fp32_params"]
+    # Packed CP uses the model-owned block-diagonal SDPA dispatch. Generic
+    # hybrid CP also supports TE for unpacked sequences, but TE has no route
+    # through this packed attention contract.
+    _packed_cp_attn_backends = ("sdpa",)
 
     # forward() pulls per-microbatch pixel_values from _vlm_pixel_values_chunks;
     # patch_hf_model_for_pp must not replace it under PP.
