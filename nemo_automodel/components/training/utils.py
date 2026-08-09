@@ -41,10 +41,8 @@ def _combine_norms(norms: list[torch.Tensor], norm_type: float, target_device: t
         return norm_stack.max()
 
     max_norm = norm_stack.abs().max()
-    if max_norm == 0 or not torch.isfinite(max_norm):
-        return max_norm
-
-    return max_norm * norm_stack.div(max_norm).pow(norm_type).sum().pow(1.0 / norm_type)
+    scale = torch.where(torch.isfinite(max_norm) & max_norm.ne(0), max_norm, torch.ones_like(max_norm))
+    return max_norm * norm_stack.div(scale).pow(norm_type).sum().pow(1.0 / norm_type)
 
 
 def _all_reduce_scalar(
@@ -192,10 +190,11 @@ def _clip_grad_norm_impl(
                     continue
                 local_max = _all_reduce_scalar(local_max, torch.distributed.ReduceOp.MAX, mesh, dim_idx)
 
-        if is_inf or local_max == 0 or not torch.isfinite(local_max):
+        if is_inf:
             group_norms.append(local_max)
             continue
 
+        scale = torch.where(torch.isfinite(local_max) & local_max.ne(0), local_max, torch.ones_like(local_max))
         local_val = torch.zeros((), dtype=torch.float64, device=target_device)
         for p in group_params:
             g = p.grad
@@ -203,7 +202,7 @@ def _clip_grad_norm_impl(
                 g = g.full_tensor() if has_partial else g.to_local()
             if g.numel() == 0:
                 continue
-            g = g.detach().abs().div(local_max)
+            g = g.detach().abs().div(scale)
             if norm_type == 2.0:
                 local_val = local_val + g.square().sum(dtype=torch.float64)
             else:
@@ -228,12 +227,12 @@ def _clip_grad_norm_impl(
         else:
             pp_max_norm = total_norm.abs().clone()
             pp_max_norm = _all_reduce_scalar(pp_max_norm, torch.distributed.ReduceOp.MAX, pp_mesh)
-            if pp_max_norm == 0 or not torch.isfinite(pp_max_norm):
-                total_norm = pp_max_norm
-            else:
-                total_norm = total_norm.div(pp_max_norm).pow(norm_type)
-                total_norm = _all_reduce_scalar(total_norm, torch.distributed.ReduceOp.SUM, pp_mesh)
-                total_norm = pp_max_norm * total_norm.pow(1.0 / norm_type)
+            scale = torch.where(
+                torch.isfinite(pp_max_norm) & pp_max_norm.ne(0), pp_max_norm, torch.ones_like(pp_max_norm)
+            )
+            total_norm = total_norm.div(scale).pow(norm_type)
+            total_norm = _all_reduce_scalar(total_norm, torch.distributed.ReduceOp.SUM, pp_mesh)
+            total_norm = pp_max_norm * total_norm.pow(1.0 / norm_type)
 
     if error_if_nonfinite and torch.logical_or(total_norm.isnan(), total_norm.isinf()):
         raise RuntimeError(
@@ -260,11 +259,11 @@ def clip_grad_norm(
     pp_axis_name: str | None = None,
     foreach: bool = True,
     use_torch_clip_grad_norm: bool = False,
-):
+) -> torch.Tensor | float:
     """Common gradient clipping helper.
 
     Handles all parallelism strategies (TP, PP, EP/MoE) with automatic sharding-aware grouping.
-    Returns the gradient norm as a float, or 0.0 if clipping is skipped.
+    Returns the gradient norm as a scalar tensor on the gradients' device, or 0.0 if clipping is skipped.
 
     This function automatically:
     - Groups parameters by sharding pattern (device mesh + placements)
@@ -278,14 +277,13 @@ def clip_grad_norm(
         norm_type: Type of norm to use (default: 2.0 for L2).
         pp_enabled: Whether pipeline parallelism is enabled.
         device_mesh: Device mesh for parallelism.
-        moe_mesh: MoE-specific device mesh (unused, kept for API compatibility).
-        ep_axis_name: Expert parallel axis name (unused, kept for API compatibility).
         pp_axis_name: Pipeline parallel axis name.
         foreach: Whether to use foreach implementation for clipping.
         use_torch_clip_grad_norm: Use PyTorch's optimized regular-tensor clipping path when possible.
 
     Returns:
-        Total gradient norm as a float.
+        Scalar tensor containing the total gradient norm without synchronizing it to the host,
+        or 0.0 when clipping is disabled.
     """
     if max_grad_norm is None:
         return 0.0
@@ -324,12 +322,6 @@ def clip_grad_norm(
             foreach=foreach,
             pp_mesh=pp_mesh,
         )
-
-    # Convert to float for API compatibility
-    if isinstance(grad_norm, torch.Tensor):
-        grad_norm = grad_norm.item() if grad_norm.numel() == 1 else grad_norm
-        if hasattr(grad_norm, "full_tensor"):
-            grad_norm = grad_norm.full_tensor()
 
     return grad_norm
 
@@ -420,13 +412,17 @@ def scale_grads_and_clip_grad_norm(
     dp_group_size: int | None = None,
     expert_tp_replication_factor: int = 1,
     use_torch_clip_grad_norm: bool = False,
-):
+) -> torch.Tensor | float:
     """Scale gradients for PP/EP in a single pass, then clip.
 
     - PP scaling: divide all local grads by (num_label_tokens / dp_group_size).
     - EP scaling: for parameters on the expert axis, divide grads by
       ``(dp_group_size / ep_shard_size) * expert_tp_replication_factor``.
     - Finally, perform grad clipping with PP/EP-aware reductions.
+
+    Returns:
+        Scalar tensor containing the total gradient norm without synchronizing it to the host,
+        or 0.0 when clipping is disabled.
     """
 
     # Precompute scale factors

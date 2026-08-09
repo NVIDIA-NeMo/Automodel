@@ -128,7 +128,30 @@ def test_clip_grad_norm_works_without_pp():
         pp_enabled=False,
     )
 
+    assert isinstance(grad_norm, torch.Tensor)
     assert grad_norm > 0
+
+
+@pytest.mark.parametrize(
+    ("gradient", "expected"),
+    [
+        (0.0, 0.0),
+        (float("inf"), float("inf")),
+        (float("nan"), float("nan")),
+    ],
+)
+def test_clip_grad_norm_preserves_zero_and_nonfinite_results(gradient: float, expected: float):
+    """Branch-free scaling preserves the prior zero and non-finite norm behavior."""
+    model = torch.nn.Linear(1, 1, bias=False)
+    model.weight.grad = torch.full_like(model.weight, gradient)
+
+    grad_norm = clip_grad_norm(max_grad_norm=1.0, model_parts=[model])
+
+    assert isinstance(grad_norm, torch.Tensor)
+    if math.isnan(expected):
+        assert torch.isnan(grad_norm)
+    else:
+        torch.testing.assert_close(grad_norm, torch.tensor(expected, dtype=grad_norm.dtype))
 
 
 def test_clip_grad_norm_uses_torch_fast_path_when_requested(monkeypatch):
