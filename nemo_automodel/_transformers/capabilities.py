@@ -347,12 +347,18 @@ class ModelSupports:
         MagiAttention dispatches the packed sequence across the CP group with its
         own load-balancing solver and a per-document varlen mask, so it supports
         CP + packing (see ``context_parallel.magi.magi_prepare_packed_cp``). Models
-        with native THD support own their packed CP path in TileLang attention."""
+        with native THD support own their packed CP path in TileLang attention.
+        Models can restrict a model-owned packed CP path to specific attention
+        backends with ``_packed_cp_attn_backends``."""
         model = self._model
         if not self.supports_sequence_packing:
             return False
         if self.cp_size <= 1:
             return True
+        model_owned_backends = getattr(model, "_packed_cp_attn_backends", None)
+        if model_owned_backends is not None:
+            backend_attn = getattr(getattr(model, "backend", None), "attn", None)
+            return _supports_seq_lens(model) and backend_attn in model_owned_backends
         if self.supports_thd:
             backend_attn = getattr(getattr(model, "backend", None), "attn", None)
             return backend_attn == "tilelang"

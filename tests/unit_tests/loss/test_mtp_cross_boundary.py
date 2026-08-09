@@ -258,6 +258,7 @@ def test_thd_flat_labels_squeeze_3d_hidden_states():
             mtp_per_depth_h=mtp_per_depth_h,
             labels=labels,
             model=mock.MagicMock(),
+            lm_weight=torch.zeros((1, H), requires_grad=True),
             scaling_factor=1.0,
             ignore_index=IGNORE,
         )
@@ -292,6 +293,7 @@ def test_2d_labels_and_3d_hidden_states_unchanged():
             mtp_per_depth_h=mtp_per_depth_h,
             labels=labels,
             model=mock.MagicMock(),
+            lm_weight=torch.zeros((1, H), requires_grad=True),
             scaling_factor=1.0,
             ignore_index=IGNORE,
         )

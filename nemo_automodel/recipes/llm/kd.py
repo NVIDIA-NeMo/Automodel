@@ -659,6 +659,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                     model=model,
                     hidden_states=get_final_hidden_states(student_out),
                     num_label_tokens=num_label_tokens,
+                    grad_reduce_group=self._get_dp_group(include_cp=True) if is_train else None,
                 )
 
             # Reminder: kd_loss is normalized by num_label_tokens, which is typically

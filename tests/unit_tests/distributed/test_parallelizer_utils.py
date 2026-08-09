@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from types import SimpleNamespace
 from typing import List, Tuple
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -25,9 +27,80 @@ from nemo_automodel.components.distributed.parallelizer_utils import (
     _group_params_by_dtype,
     _make_compute_dtype_fn,
     _mp_policy_with_param_dtype,
+    configure_fsdp_unused_param_reduction,
     fully_shard_by_dtype,
     iter_maximal_uniform_dtype_subtrees,
 )
+from nemo_automodel.shared.torch_patches import patch_fsdp_unused_param_reduction
+
+
+def test_configure_fsdp_unused_param_reduction_uses_public_fsdp_api(monkeypatch):
+    from nemo_automodel.components.distributed import parallelizer_utils
+
+    class FakeFSDPModule(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.calls = []
+
+        def set_reduce_scatter_unused_params(self, enabled, *, recurse):
+            self.calls.append((enabled, recurse))
+
+    monkeypatch.setattr(parallelizer_utils, "FSDPModule", FakeFSDPModule)
+    model = nn.Sequential(FakeFSDPModule(), nn.Sequential(FakeFSDPModule()))
+
+    assert configure_fsdp_unused_param_reduction(model) == 2
+    assert model[0].calls == [(True, False)]
+    assert model[1][0].calls == [(True, False)]
+
+
+def test_configure_fsdp_unused_param_reduction_uses_legacy_fallback(monkeypatch):
+    from nemo_automodel.components.distributed import parallelizer_utils
+
+    class LegacyFSDPModule(nn.Module):
+        pass
+
+    install_fallback = Mock()
+    monkeypatch.setattr(parallelizer_utils, "FSDPModule", LegacyFSDPModule)
+    monkeypatch.setattr(parallelizer_utils, "_patch_fsdp_unused_param_reduction", install_fallback)
+    model = nn.Sequential(LegacyFSDPModule(), nn.Sequential(LegacyFSDPModule()))
+
+    assert configure_fsdp_unused_param_reduction(model) == 2
+    install_fallback.assert_called_once_with()
+
+
+def test_legacy_fsdp_unused_param_reduction_fills_missing_local_grad(monkeypatch):
+    from torch.distributed.fsdp._fully_shard._fsdp_common import TrainingState
+    from torch.distributed.fsdp._fully_shard._fsdp_param_group import FSDPParamGroup
+
+    calls = []
+
+    def original_post_backward(self, *args, **kwargs):
+        calls.append((self, args, kwargs))
+        return "post-backward-result"
+
+    monkeypatch.setattr(FSDPParamGroup, "post_backward", original_post_backward)
+    patch_fsdp_unused_param_reduction()
+    patched_post_backward = FSDPParamGroup.post_backward
+
+    param = torch.nn.Parameter(torch.ones(2))
+    fsdp_param = SimpleNamespace(
+        _unsharded_param=param,
+        unsharded_accumulated_grad=None,
+        unsharded_param=param,
+    )
+    param_group = SimpleNamespace(
+        reduce_grads=True,
+        _training_state=TrainingState.PRE_BACKWARD,
+        fsdp_params=[fsdp_param, SimpleNamespace()],
+    )
+
+    result = patched_post_backward(param_group, "arg", flag=True)
+    patch_fsdp_unused_param_reduction()
+
+    assert result == "post-backward-result"
+    assert torch.equal(param.grad, torch.zeros_like(param))
+    assert calls == [(param_group, ("arg",), {"flag": True})]
+    assert FSDPParamGroup.post_backward is patched_post_backward
 
 
 def _tag_hf_compute_dtype(model: nn.Module) -> None:

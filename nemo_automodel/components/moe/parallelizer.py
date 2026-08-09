@@ -1052,3 +1052,9 @@ def parallelize_model(
             wrap_outer_model=wrap_outer_model,
             frozen_multimodal_sharding=frozen_multimodal_sharding,
         )
+        if cp_enabled:
+            configured_units = parallelizer_utils.configure_fsdp_unused_param_reduction(model)
+            logger.info(
+                "Enabled unused-parameter reduce-scatter on %d MoE FSDP units for context parallelism",
+                configured_units,
+            )
