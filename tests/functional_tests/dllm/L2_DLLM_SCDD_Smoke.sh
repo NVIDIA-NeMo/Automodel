@@ -1,3 +1,4 @@
+#!/bin/bash
 # Copyright (c) 2026, NVIDIA CORPORATION.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-#!/bin/bash
 set -xeuo pipefail # Exit immediately if a command exits with a non-zero status
 
 export PYTHONPATH=${PYTHONPATH:-}:$(pwd)
@@ -31,6 +31,7 @@ fi
 SCDD_SMOKE_MODEL=${SCDD_SMOKE_MODEL:-hf-internal-testing/tiny-random-LlamaForCausalLM}
 
 python \
+-m coverage run \
 -m pytest $PYTEST_S_FLAG tests/functional_tests/training/test_scdd_smoke.py \
     --config tests/functional_tests/dllm/scdd_smoke.yaml \
     --model.pretrained_model_name_or_path "$SCDD_SMOKE_MODEL" \
