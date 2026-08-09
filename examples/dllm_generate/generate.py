@@ -561,15 +561,15 @@ class SCDDSampler(DLLMSampler):
     Where the absorbing samplers commit tokens irreversibly — each step unmasks
     a few positions and never revisits them — SCDD resamples *every* generated
     position from the exact reverse posterior at each step. A token the model
-    now believes is wrong can be replaced by a better one, or sent back to
-    ``[MASK]``; that self-correction is what keeps quality up when many
-    positions are decoded per step.
+    now believes is wrong can be replaced by a better one; that self-correction
+    is what keeps quality up when many positions are decoded per step.
 
     Two cases make up the posterior, both derived from the mixed forward
     schedule (:func:`~nemo_automodel.components.loss.dllm_loss.scdd_schedule`):
 
-    * a visible token can stay, be replaced by another token, or (only through
-      the schedule's own transition mass) move on,
+    * a visible token can stay or be rewritten to another visible token. It is
+      never sent back to ``[MASK]``: ``[MASK]`` is absorbing in the forward
+      process, so the reverse posterior puts no mass on it,
     * a ``[MASK]`` position un-absorbs into the denoiser's distribution or stays
       masked.
 
