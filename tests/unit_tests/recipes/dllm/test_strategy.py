@@ -1047,6 +1047,35 @@ def test_scdd_create_loss_fn_builds_scdd_loss_from_config():
     assert (loss_fn.gamma_shape, loss_fn.t_peak) == (2.0, 0.4)
 
 
+def test_scdd_apply_corruption_keeps_t_on_the_discrete_grid():
+    """t must land on {1/T, ..., (T-1)/T}.
+
+    SCDDLoss reads t back out of p_mask and forms s = t - 1/T, so an off-grid t
+    (the old 1 - 1e-4 clamp) puts s off-grid too. The top point t = 1 stays
+    excluded because the schedule is fully absorbed there.
+    """
+    num_timesteps = 8
+    strategy = _scdd_strategy(num_timesteps=num_timesteps)
+    input_ids = torch.randint(0, SCDD_VOCAB - 1, (256, 4))
+    loss_mask = torch.ones(256, 4, dtype=torch.long)
+
+    _, _, p_mask = strategy.apply_corruption(
+        input_ids,
+        loss_mask,
+        SCDD_MASK_ID,
+        eps=1e-3,
+        block_size=None,
+        half_life_ratio=None,
+        generator=torch.Generator().manual_seed(0),
+    )
+
+    t = p_mask[:, 0]
+    steps = t * num_timesteps
+    assert torch.allclose(steps, steps.round())
+    assert int(steps.min()) >= 1
+    assert int(steps.max()) == num_timesteps - 1
+
+
 def test_scdd_create_loss_fn_requires_vocab_size():
     with pytest.raises(ValueError, match="dllm.vocab_size"):
         SCDDStrategy().create_loss_fn({"mask_token_id": SCDD_MASK_ID})

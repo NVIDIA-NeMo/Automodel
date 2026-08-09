@@ -448,3 +448,56 @@ class TestCorruptMix:
                 mask_prob=torch.zeros(B),
                 uniform_prob=torch.zeros(B),
             )
+
+    def test_rejects_channel_probabilities_beyond_one(self, inputs):
+        """The two channels split one [0, 1) variate, so their sum cannot exceed 1.
+
+        Without the check the uniform channel is silently truncated and the
+        realised noise stops matching the schedule the ELBO weights assume.
+        """
+        input_ids, loss_mask = inputs
+        with pytest.raises(ValueError, match="mask_prob \\+ uniform_prob <= 1"):
+            corrupt_mix(
+                input_ids,
+                loss_mask,
+                MASK_TOKEN_ID,
+                vocab_size=1000,
+                mask_prob=torch.full((B,), 0.7),
+                uniform_prob=torch.full((B,), 0.4),
+            )
+
+    def test_probabilities_summing_to_exactly_one_are_accepted(self, inputs):
+        """A schedule whose masses sum to 1 must not trip the tolerance."""
+        input_ids, loss_mask = inputs
+        noisy, _ = corrupt_mix(
+            input_ids,
+            loss_mask,
+            MASK_TOKEN_ID,
+            vocab_size=1000,
+            mask_prob=torch.full((B,), 0.3),
+            uniform_prob=torch.full((B,), 0.7),
+        )
+        assert noisy.shape == input_ids.shape
+
+    def test_ids_stay_in_range_when_every_clean_token_is_mask(self):
+        """Clean ``[MASK]`` tokens make the two exclusion shifts collide.
+
+        ``lo == hi`` there, so an unclamped draw could reach ``vocab_size``.
+        Those positions are never routed to the uniform channel, so they must
+        come back unchanged and every id must stay addressable.
+        """
+        vocab_size, mask_id = 16, 5
+        input_ids = torch.full((B, L), mask_id, dtype=torch.long)
+        loss_mask = torch.ones(B, L, dtype=torch.long)
+        noisy, noise_mask = corrupt_mix(
+            input_ids,
+            loss_mask,
+            mask_id,
+            vocab_size=vocab_size,
+            mask_prob=torch.zeros(B),
+            uniform_prob=torch.ones(B),
+            generator=torch.Generator().manual_seed(0),
+        )
+        assert torch.equal(noisy, input_ids)
+        assert not noise_mask.any()
+        assert int(noisy.max()) < vocab_size

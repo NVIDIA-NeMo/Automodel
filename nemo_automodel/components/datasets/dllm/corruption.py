@@ -214,6 +214,10 @@ def corrupt_mix(
         the loss weight for a mixed kernel, so the caller supplies whatever
         per-position quantity its loss needs.
 
+    Raises:
+        ValueError: If ``vocab_size < 3``, or if any ``mask_prob + uniform_prob``
+            exceeds 1.
+
     Note:
         Supervised positions whose clean token already **is** ``mask_token_id``
         are never routed to the uniform channel (there would be no well-defined
@@ -228,12 +232,21 @@ def corrupt_mix(
 
     mask_prob = mask_prob.reshape(B, 1).to(torch.float32)
     uniform_prob = uniform_prob.reshape(B, 1).to(torch.float32)
+    # The two channels are carved out of a single [0, 1) variate, so anything
+    # past 1 is unrepresentable: the uniform channel would be silently truncated
+    # and the realised noise would no longer match the schedule the loss weights
+    # assume. Costs one host sync per call, which is worth an explicit error.
+    channel_split = mask_prob + uniform_prob
+    if bool((channel_split > 1.0 + 1e-5).any()):
+        raise ValueError(
+            f"corrupt_mix requires mask_prob + uniform_prob <= 1 (got up to {channel_split.max().item():.6f})"
+        )
 
     # One variate per position splits the two channels without double-drawing.
     u = torch.rand((B, L), device=device, generator=generator)
     supervised = loss_mask.bool()
     absorbed = (u < mask_prob) & supervised
-    transitioned = (u >= mask_prob) & (u < mask_prob + uniform_prob) & supervised
+    transitioned = (u >= mask_prob) & (u < channel_split) & supervised
     transitioned &= input_ids != mask_token_id
 
     # Uniform over the vocabulary minus {mask_token_id, input_ids}: draw over
@@ -244,6 +257,11 @@ def corrupt_mix(
     hi = torch.maximum(input_ids, mask_id_t)
     draw = draw + (draw >= lo).to(draw.dtype)
     draw = draw + (draw >= hi).to(draw.dtype)
+    # A clean token that already is [MASK] gives lo == hi, so both shifts fire on
+    # the same draw and the result can reach vocab_size. Those positions are
+    # excluded from `transitioned` above and are never selected below, but clamp
+    # so the tensor cannot carry an out-of-range id regardless.
+    draw = draw.clamp_(max=vocab_size - 1)
 
     noisy_input_ids = torch.where(absorbed, mask_id_t, input_ids)
     noisy_input_ids = torch.where(transitioned, draw, noisy_input_ids)

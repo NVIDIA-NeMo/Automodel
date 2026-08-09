@@ -322,7 +322,8 @@ class SCDDLoss(nn.Module):
         Args:
             mask_token_id: Token ID of the absorbing ``[MASK]`` state.
             num_timesteps: Number of discrete diffusion steps ``T``; the loss is
-                the ``T``-step NELBO and the reverse step is ``1/T``.
+                the ``T``-step NELBO and the reverse step is ``1/T``. At least 2,
+                so the grid holds a usable point below the fully absorbed ``t = 1``.
             max_ratio: Peak uniform-to-retained mass ratio of the forward
                 process (``0`` degenerates to MDLM).
             gamma_shape: Shape mass of the uniform-noise bump.
@@ -335,8 +336,8 @@ class SCDDLoss(nn.Module):
                 two fp32 ``[batch * sequence, vocab]`` tensors at once.
         """
         super().__init__()
-        if num_timesteps < 1:
-            raise ValueError(f"SCDDLoss requires num_timesteps >= 1 (got {num_timesteps})")
+        if num_timesteps < 2:
+            raise ValueError(f"SCDDLoss requires num_timesteps >= 2 (got {num_timesteps})")
         self.mask_token_id = int(mask_token_id)
         self.num_timesteps = int(num_timesteps)
         self.max_ratio = float(max_ratio)

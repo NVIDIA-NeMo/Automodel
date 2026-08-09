@@ -311,7 +311,10 @@ class SCDDStrategy(DLLMStrategy):
         u = torch.rand((batch,), device=input_ids.device, generator=generator)
         u = (1.0 - eps) * u + eps
         t = ((u * self._num_timesteps).to(torch.int64).float() + 1.0) / self._num_timesteps
-        t = t.clamp(0.0, 1.0 - 1e-4)
+        # Drop the top point t = 1, where the schedule is fully absorbed and rho
+        # is degenerate. Clamping to the previous grid point rather than to
+        # 1 - 1e-4 keeps both t and s = t - 1/T on the grid.
+        t = t.clamp(max=1.0 - 1.0 / self._num_timesteps)
 
         sched = scdd_schedule(t, max_ratio=self._max_ratio, gamma_shape=self._gamma_shape, t_peak=self._t_peak)
         # A uniform draw that lands back on the clean token leaves the position

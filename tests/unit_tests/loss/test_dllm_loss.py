@@ -864,6 +864,12 @@ def _scdd_batch(seed=0, t=0.5):
 
 
 class TestSCDDLoss:
+    @pytest.mark.parametrize("num_timesteps", [0, 1])
+    def test_rejects_grids_without_a_usable_point(self, num_timesteps):
+        """T = 1 leaves only t = 1, where the forward process is fully absorbed."""
+        with pytest.raises(ValueError, match="num_timesteps >= 2"):
+            SCDDLoss(mask_token_id=SCDD_MASK_ID, num_timesteps=num_timesteps)
+
     def test_reduces_to_mdlm_when_the_uniform_channel_is_off(self):
         """With max_ratio=0 the NELBO collapses to -log p(x0)/t at masked
         positions and exactly zero elsewhere — the MDLM objective."""
