@@ -338,6 +338,17 @@ class TestDFlashDecayLoss:
         with pytest.raises(ValueError, match="multiple of"):
             loss_fn(logits, target_ids, block_mask, block_size=4)
 
+    def test_dpace_requires_block_size(self):
+        """D-PACE must reject block_size=None -- without it the block layout is
+        unknown and the cumprod could silently span blocks (a caller passing None
+        with multiple blocks would underflow to meaningless weights)."""
+        loss_fn = DFlashDecayLoss(loss_type="dpace", dpace_alpha=0.5)
+        logits = torch.randn(1, 6, 9)
+        target_ids = torch.randint(0, 9, (1, 6))
+        block_mask = torch.ones(1, 6)
+        with pytest.raises(ValueError, match="requires block_size"):
+            loss_fn(logits, target_ids, block_mask, block_size=None)
+
     @pytest.mark.parametrize(
         "loss_type",
         ["dpace", "dpace-cumulative-confidence-only", "dpace-continuation-value-only"],
@@ -367,9 +378,10 @@ class TestDFlashDecayLoss:
             ref_weight = suffix / prefix.clamp_min(torch.finfo(prefix.dtype).tiny)
         else:
             ref_weight = suffix
-        # normalize="mean" => the reference's per-sequence normalization. Dividing by
-        # the D-PACE weight sum instead would cancel the weight magnitudes the
-        # objective encodes (and bias the DP gradient average).
+        # normalize="mean" => the reference's per-sequence normalization (divide by
+        # the batch size, independent of the sampled anchor count). Dividing by the
+        # D-PACE weight sum instead would cancel the weight magnitudes the objective
+        # encodes (and bias the DP gradient average).
         expected = (token_nll * mask * ref_weight).sum() / float(bsz)
 
         got = DFlashDecayLoss(loss_type=loss_type, dpace_alpha=alpha, normalize="mean")(
@@ -384,10 +396,11 @@ class TestDFlashDecayLoss:
     def test_dpace_mean_divides_by_batch_size_not_weight_sum(self):
         """``normalize="mean"`` normalizes D-PACE per sequence, as the reference does.
 
-        The D-PACE weights carry the objective's signal, so a weight-sum denominator
-        would cancel it. It is also data-dependent, hence different on every DP rank,
-        which would bias the gradient average (that stays exact only when every rank
-        divides by the same constant).
+        The reference divides the D-PACE weighted sum by the batch size, independent
+        of the sampled anchor count. The D-PACE weights carry the objective's signal,
+        so a weight-sum denominator would cancel it; it is also data-dependent, hence
+        different on every DP rank, which would bias the gradient average (that stays
+        exact only when every rank divides by the same constant).
         """
         torch.manual_seed(21)
         bsz, n, bs, vocab = 2, 3, 5, 17

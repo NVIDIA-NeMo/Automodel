@@ -486,21 +486,27 @@ class DFlashDecayLoss(nn.Module):
             w = self._decay_weights(T, block_size, token_nll.device, token_nll.dtype)
             weights = w.unsqueeze(0) * block_mask  # [B, T]
         elif self.loss_type in _DPACE_LOSS_TYPES:
-            dpace_nll = token_nll
-            dpace_mask = block_mask
-            if block_size is not None and block_size > 1:
-                t_per = block_size - 1
-                # The confidence product must reset per block; a non-partitioning T
-                # would cumprod across the whole sequence and underflow to ~0
-                # (meaningless weights), so fail loud instead of mis-weighting silently.
-                if T % t_per != 0:
-                    raise ValueError(
-                        f"D-PACE requires predicted length T={T} to be a multiple of "
-                        f"block_size-1={t_per} (per-block confidence reset); got a remainder."
-                    )
-                n_blocks = T // t_per
-                dpace_nll = token_nll.view(token_nll.shape[0], n_blocks, t_per)
-                dpace_mask = block_mask.view(block_mask.shape[0], n_blocks, t_per)
+            # The confidence product (cumprod) must reset at every block boundary;
+            # run across blocks it underflows to ~0 and the weights become
+            # meaningless. The block layout is only knowable from block_size, so
+            # require it -- never infer "single block" from a None sentinel, or a
+            # future multi-block caller passing None would silently span blocks.
+            if block_size is None or block_size <= 1:
+                raise ValueError(
+                    f"D-PACE loss_type={self.loss_type!r} requires block_size > 1 so the "
+                    f"confidence product resets per block; got block_size={block_size!r}."
+                )
+            t_per = block_size - 1
+            # A non-partitioning T would cumprod across the whole sequence, so fail
+            # loud instead of mis-weighting silently.
+            if T % t_per != 0:
+                raise ValueError(
+                    f"D-PACE requires predicted length T={T} to be a multiple of "
+                    f"block_size-1={t_per} (per-block confidence reset); got a remainder."
+                )
+            n_blocks = T // t_per
+            dpace_nll = token_nll.view(token_nll.shape[0], n_blocks, t_per)
+            dpace_mask = block_mask.view(block_mask.shape[0], n_blocks, t_per)
             with torch.no_grad():
                 prob = torch.exp(-dpace_nll.detach())
                 dpace_weights = self._dpace_weight(prob, dpace_mask, dpace_mask > 0)
@@ -511,13 +517,13 @@ class DFlashDecayLoss(nn.Module):
         loss = (token_nll * weights).sum()
         if self.normalize == "mean":
             if self.loss_type in _DPACE_LOSS_TYPES:
-                # D-PACE is a weighted *sum*: the weight magnitude is the signal
-                # (the expected accepted-prefix length), so dividing by the weight
-                # sum would cancel exactly the variation the objective encodes.
-                # It would also desync the DP gradient average -- that stays exact
-                # only when every rank divides by the same constant, and the D-PACE
-                # weights are data-dependent. Normalize per sequence instead, which
-                # is what the reference implementation does.
+                # D-PACE is a weighted *sum* normalized per sequence: the weight
+                # magnitude is the signal (the expected accepted-prefix length), so a
+                # weight-sum denominator would cancel exactly the variation the
+                # objective encodes, and a data-dependent denominator would desync the
+                # DP gradient average (exact only when every rank divides by the same
+                # constant). Divide by the batch size, as the reference implementation
+                # does -- independent of the sampled anchor count.
                 loss = loss / max(float(token_nll.shape[0]), 1.0)
             else:
                 loss = loss / (weights.sum() + 1e-6)

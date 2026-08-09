@@ -56,7 +56,7 @@ from nemo_automodel.components.attention.dflash_mask import (
     create_dflash_sdpa_mask,
 )
 from nemo_automodel.components.loss.dllm_loss import _DFLASH_LOSS_TYPES as _DECAY_LOSS_TYPES
-from nemo_automodel.components.loss.dllm_loss import DFlashDecayLoss
+from nemo_automodel.components.loss.dllm_loss import _DPACE_LOSS_TYPES, DFlashDecayLoss
 from nemo_automodel.components.speculative.dflash.draft_qwen3 import Qwen3DFlashDraftModel
 
 
@@ -587,13 +587,22 @@ class DFlashTrainerModule(nn.Module):
         assert loss_fn is not None, "loss_fn is constructed for every loss_type except 'variable_prefix'"
         loss_out = loss_fn(pred_logits, pred_targets, pred_mask, num_tokens=None, block_size=bs)
 
-        loss_weights = pred_mask.view(bsz, n, bs - 1)
-        if self.loss_decay_gamma is not None:
-            depth_weights = torch.exp(
-                -torch.arange(bs - 1, device=pred_mask.device, dtype=pred_mask.dtype) / self.loss_decay_gamma
-            )
-            loss_weights = loss_weights * depth_weights
-        loss_weight = loss_weights.sum()
+        if self.loss_type in _DPACE_LOSS_TYPES:
+            # D-PACE normalizes its weighted sum by the batch size (see
+            # DFlashDecayLoss._reduce), so report that same denominator here. The
+            # recipe's token-weighted validation average -- sum(loss * loss_weight)
+            # / sum(loss_weight) -- is only correct when loss_weight is the exact
+            # denominator the loss used; the decay-weight sum below describes the
+            # dflash denominator, not D-PACE's.
+            loss_weight = pred_mask.new_tensor(float(bsz))
+        else:
+            loss_weights = pred_mask.view(bsz, n, bs - 1)
+            if self.loss_decay_gamma is not None:
+                depth_weights = torch.exp(
+                    -torch.arange(bs - 1, device=pred_mask.device, dtype=pred_mask.dtype) / self.loss_decay_gamma
+                )
+                loss_weights = loss_weights * depth_weights
+            loss_weight = loss_weights.sum()
 
         count_per_pos = loss_out.draft_count_per_pos
         valid_tokens = count_per_pos.sum()
