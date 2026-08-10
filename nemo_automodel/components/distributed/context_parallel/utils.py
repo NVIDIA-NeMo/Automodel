@@ -554,12 +554,6 @@ def _resolve_cp_sharder(
                 seq_lens_padding_value=seq_lens_padding_value,
                 return_local_indices=True,
             )
-            if local_indices is not None:
-                # Models that splice non-text features after the framework THD
-                # partition need the exact global-token map used for Q/K/V.
-                # Keeping it in the prepared batch avoids recomputing TE's
-                # document-aware load-balanced partition in model code.
-                prepped["_thd_local_indices"] = local_indices
             layout = None
             if local_indices is not None:
                 layout = ShardLayout(

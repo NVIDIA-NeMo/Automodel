@@ -514,6 +514,7 @@ def test_attach_te_context_parallel_configures_full_and_sliding_attention(monkey
     assert tp_only_model[0].self_attn.attn_module.tp_size == 2
     assert tp_only_model[0].self_attn.attn_module.num_gqa_groups_per_partition == 2
 
+
 # ============================================================================
 # Tests for make_cp_batch_for_te
 # ============================================================================
@@ -807,8 +808,7 @@ def test_sharder_constructor_derives_te_from_model_and_thd_from_batch(monkeypatc
     assert not seen
     ctx, batch = sharder.shard(batch)
     assert ctx is contextlib.nullcontext
-    assert batch["thd"] is True
-    assert batch["_thd_local_indices"] is local_indices
+    assert batch == {"thd": True}
     assert seen["cp_mesh"] is device_mesh["cp"]
     assert (seen["pad"], seen["fmt"], seen["chunks"], seen["sent"]) == (7, "thd", 3, -1000)
 
