@@ -1370,9 +1370,7 @@ def _merge_media_values(values: list[Any]) -> torch.Tensor | list[Any]:
         return torch.cat(values, dim=0).to(torch.bfloat16)
     if all(isinstance(value, (list, tuple)) for value in values):
         return [
-            item.to(torch.bfloat16) if isinstance(item, torch.Tensor) else item
-            for value in values
-            for item in value
+            item.to(torch.bfloat16) if isinstance(item, torch.Tensor) else item for value in values for item in value
         ]
     raise TypeError(
         "VLM media values must be consistently tensors or variable-resolution lists, "
@@ -1696,8 +1694,7 @@ def packed_sequence_thd_vlm_collater(
         attention_mask = torch.as_tensor(item["attention_mask"]).to(torch.long)
         if attention_mask.ndim != 1:
             raise ValueError(
-                "Packed VLM THD attention_mask must be one-dimensional, "
-                f"got shape {tuple(attention_mask.shape)}."
+                f"Packed VLM THD attention_mask must be one-dimensional, got shape {tuple(attention_mask.shape)}."
             )
         if attention_mask.numel() == 0:
             return [0]
@@ -1705,8 +1702,7 @@ def packed_sequence_thd_vlm_collater(
         expected = torch.arange(1, document_ids.numel() + 1, dtype=document_ids.dtype)
         if not torch.equal(document_ids.cpu(), expected):
             raise ValueError(
-                "Packed VLM THD attention_mask must contain contiguous document IDs "
-                f"1..N, got {document_ids.tolist()}."
+                f"Packed VLM THD attention_mask must contain contiguous document IDs 1..N, got {document_ids.tolist()}."
             )
         return [(attention_mask == document_id).sum().item() for document_id in document_ids]
 
@@ -1753,8 +1749,7 @@ def packed_sequence_thd_vlm_collater(
 
     seq_lens_list = [_document_lengths(item) for item in batch]
     padded_items_and_lengths = [
-        _pad_documents_for_cp(item, document_lengths)
-        for item, document_lengths in zip(batch, seq_lens_list)
+        _pad_documents_for_cp(item, document_lengths) for item, document_lengths in zip(batch, seq_lens_list)
     ]
     batch = [item for item, _ in padded_items_and_lengths]
     seq_lens_padded_list = [lengths for _, lengths in padded_items_and_lengths]
@@ -1771,8 +1766,7 @@ def packed_sequence_thd_vlm_collater(
         max_len = batch_max
     if cp_size > 1 and max_len % (2 * cp_size) != 0:
         raise ValueError(
-            "Packed VLM THD max_length must be divisible by 2 * cp_size, "
-            f"got max_length={max_len}, cp_size={cp_size}."
+            f"Packed VLM THD max_length must be divisible by 2 * cp_size, got max_length={max_len}, cp_size={cp_size}."
         )
     if batch_max > max_len:
         raise ValueError(

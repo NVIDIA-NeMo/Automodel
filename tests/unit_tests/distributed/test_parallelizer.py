@@ -1840,6 +1840,7 @@ class TestUpdateAttentionHeadCountsForTP:
         model.config = SimpleNamespace(num_attention_heads=8, hidden_size=64)
         _update_attention_head_counts_for_tp(model, tp_size=2)
 
+
 class TestAttentionIsHeadSharded:
     """Tests for _attention_is_head_sharded."""
 
