@@ -22,7 +22,7 @@ For other installation options (such as uv), refer to the [NeMo AutoModel Instal
 
 NeMo AutoModel supports the [AutoModelForCausalLM](https://huggingface.co/transformers/v3.5.1/model_doc/auto.html#automodelforcausallm) in the [Text Generation](https://huggingface.co/models?pipeline_tag=text-generation&sort=trending) category. During preprocessing, it uses `transformers.AutoTokenizer`, which is sufficient for most LLM cases. If your model requires custom text handling, override the tokenizer in your recipe YAML or provide a custom dataset `_target_`. Refer to [LLM datasets](/datasets/text-dataset) and [dataset overview](/datasets/overview).
 
-This table lists LLM support in reverse chronological order by the date its first recipe was added. See the [combined model support log](/model-coverage/release-log) for every model type.
+This table combines recipe-backed checkpoints with documented model families. Dates show when the current checkpoint first appeared in a recipe, or when a documentation-only family page was added. See the [combined model support log](/model-coverage/release-log) for recipe-backed checkpoints of every model type.
 
 {/* BEGIN GENERATED MODEL SUPPORT LOG */}
 {/* END GENERATED MODEL SUPPORT LOG */}

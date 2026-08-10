@@ -35,7 +35,7 @@ DOCS_PAGE_PATTERN = re.compile(r"^/[a-z0-9][a-z0-9/-]*$")
 MARKDOWN_UNSAFE_PATTERN = re.compile(r"[\[\]|<>`\r\n]")
 REPOSITORY_URL = "https://github.com/NVIDIA-NeMo/Automodel/blob/main"
 DATED_SUPPORT_TABLE_HEADER = "| Date | Type | Model |"
-DATED_MODEL_TABLE_HEADER = "| Date | Model |"
+DATED_MODEL_TABLE_HEADER = "| Date | Model | Architectures |"
 MODEL_TYPE_OVERVIEW_PATHS = (
     ("LLM", "llm/index.mdx"),
     ("VLM", "vlm/index.mdx"),
@@ -94,6 +94,9 @@ class _ModelDoc:
     model_type: str
     docs_page: str
     architectures: tuple[str, ...]
+    title: str = ""
+    source_path: str = ""
+    architecture_display: str = ""
 
 
 def _replace_generated_block(document: str, start_marker: str, end_marker: str, generated_block: str) -> str:
@@ -225,6 +228,46 @@ def _load_recipe_addition_dates(repo_root: Path) -> dict[str, str]:
     return {recipe: addition[0] for recipe, addition in additions.items()}
 
 
+def _load_model_introduction_dates(repo_root: Path) -> dict[tuple[str, str], str]:
+    history = _run_git(
+        repo_root,
+        ["log", "--reverse", "--format=@@COMMIT@@%as", "-p", "--unified=0", "--", "examples"],
+    )
+    introductions = {}
+    commit_date = None
+    recipe = None
+    rename_from = None
+    model_id_pattern = re.compile(r"pretrained_model_name_or_path:\s*[\"']?([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)")
+    for line in history.splitlines():
+        if line.startswith("@@COMMIT@@"):
+            commit_date = line.removeprefix("@@COMMIT@@")
+        elif line.startswith("diff --git "):
+            recipe = None
+            rename_from = None
+        elif line.startswith("rename from "):
+            rename_from = line.removeprefix("rename from ")
+        elif line.startswith("rename to ") and rename_from is not None:
+            renamed_recipe = line.removeprefix("rename to ")
+            for (historical_recipe, hf_model_id), introduction_date in list(introductions.items()):
+                if historical_recipe == rename_from:
+                    introductions.setdefault((renamed_recipe, hf_model_id), introduction_date)
+        elif line.startswith("+++ b/"):
+            recipe = line.removeprefix("+++ b/")
+        elif line.startswith("+") and not line.startswith("+++") and commit_date is not None and recipe is not None:
+            for hf_model_id in model_id_pattern.findall(line):
+                introductions.setdefault((recipe, hf_model_id), commit_date)
+    return introductions
+
+
+def _load_file_addition_date(repo_root: Path, relative_path: str) -> str | None:
+    history = _run_git(
+        repo_root,
+        ["log", "--follow", "--diff-filter=A", "--format=%as", "--", relative_path],
+    )
+    dates = [line for line in history.splitlines() if line]
+    return dates[-1] if dates else None
+
+
 def _iter_pretrained_model_ids(value: object) -> set[str]:
     model_ids = set()
     if isinstance(value, dict):
@@ -264,7 +307,9 @@ def _model_type_for_recipe(recipe: Path, hf_model_id: str) -> str | None:
     return None
 
 
-def _load_model_docs(docs_root: Path) -> tuple[dict[str, list[_ModelDoc]], set[str]]:
+def _load_model_doc_catalog(
+    docs_root: Path,
+) -> tuple[dict[str, list[_ModelDoc]], set[str], list[_ModelDoc]]:
     directory_types = {
         "llm": "LLM",
         "vlm": "VLM",
@@ -277,6 +322,7 @@ def _load_model_docs(docs_root: Path) -> tuple[dict[str, list[_ModelDoc]], set[s
     }
     model_docs: dict[str, list[_ModelDoc]] = {}
     architectures = set()
+    documented_models = []
     model_coverage_root = docs_root / "model-coverage"
     for directory, model_type in directory_types.items():
         for path in sorted((model_coverage_root / directory).glob("*/*.mdx")):
@@ -288,6 +334,7 @@ def _load_model_docs(docs_root: Path) -> tuple[dict[str, list[_ModelDoc]], set[s
             if not DOCS_PAGE_PATTERN.fullmatch(docs_page):
                 raise ValueError(f"Model coverage page has an invalid slug: {path}")
             architecture_match = re.search(r"^\| \*\*Architecture\*\* \| ([^|]+) \|$", document, flags=re.MULTILINE)
+            architecture_display = architecture_match.group(1).strip() if architecture_match else ""
             page_architectures = (
                 tuple(re.findall(r"`([A-Za-z_][A-Za-z0-9_]*)`", architecture_match.group(1)))
                 if architecture_match
@@ -300,16 +347,35 @@ def _load_model_docs(docs_root: Path) -> tuple[dict[str, list[_ModelDoc]], set[s
             page_model_type = (
                 "Encoder-Decoder" if directory == "llm" and path.parent.name == "google-t5" else model_type
             )
-            model_doc = _ModelDoc(page_model_type, docs_page, page_architectures)
+            title_match = re.search(r'^title: "?([^"\r\n]+)"?$', document, flags=re.MULTILINE)
+            if title_match is None:
+                raise ValueError(f"Model coverage page is missing a title: {path}")
+            model_doc = _ModelDoc(
+                page_model_type,
+                docs_page,
+                page_architectures,
+                title_match.group(1),
+                str(path.relative_to(docs_root.parent)),
+                architecture_display,
+            )
+            documented_models.append(model_doc)
             for hf_model_id in re.findall(r"https://huggingface\.co/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)", document):
                 docs = model_docs.setdefault(hf_model_id, [])
                 if model_doc not in docs:
                     docs.append(model_doc)
+    return model_docs, architectures, documented_models
+
+
+def _load_model_docs(docs_root: Path) -> tuple[dict[str, list[_ModelDoc]], set[str]]:
+    model_docs, architectures, _ = _load_model_doc_catalog(docs_root)
     return model_docs, architectures
 
 
 def _load_model_releases(repo_root: Path, model_docs: dict[str, list[_ModelDoc]]) -> list[_ModelRelease]:
-    recipe_dates = _load_recipe_addition_dates(repo_root)
+    # This both validates that the checkout contains complete recipe history and
+    # gives a clearer error than a missing pickaxe result in a shallow clone.
+    _load_recipe_addition_dates(repo_root)
+    introduction_dates = _load_model_introduction_dates(repo_root)
     releases_by_model_type: dict[tuple[str, str], _ModelRelease] = {}
     for path in sorted((repo_root / "examples").rglob("*.yaml")):
         recipe = path.relative_to(repo_root)
@@ -335,9 +401,9 @@ def _load_model_releases(repo_root: Path, model_docs: dict[str, list[_ModelDoc]]
                 f"https://huggingface.co/{hf_model_id}",
             )
             recipe_string = str(recipe)
-            release_date = recipe_dates.get(recipe_string)
+            release_date = introduction_dates.get((recipe_string, hf_model_id))
             if release_date is None:
-                raise ValueError(f"Recipe is missing from Git addition history: {recipe_string}")
+                raise ValueError(f"Could not find when {hf_model_id} was introduced in {recipe_string}")
             release = _ModelRelease(release_date, hf_model_id, docs_page, model_type, recipe_string)
             key = (hf_model_id, model_type)
             previous = releases_by_model_type.get(key)
@@ -370,10 +436,64 @@ def _render_release_table(releases: list[_ModelRelease], *, include_type: bool =
             for release in releases
         ]
     else:
-        header = [DATED_MODEL_TABLE_HEADER, "|:-----|:-----|"]
-        table_rows = [f"| {release.release_date} | {_render_model_with_recipe(release)} |" for release in releases]
+        header = [DATED_MODEL_TABLE_HEADER, "|:-----|:-----|:-----|"]
+        table_rows = [f"| {release.release_date} | {_render_model_with_recipe(release)} | |" for release in releases]
 
     return "\n".join([*header, *table_rows])
+
+
+def _render_typed_support_table(
+    repo_root: Path,
+    releases: list[_ModelRelease],
+    documented_models: list[_ModelDoc],
+) -> str:
+    docs_by_page = {model.docs_page: model for model in documented_models}
+    rows = []
+    represented_pages = set()
+    for release in releases:
+        model_doc = docs_by_page.get(release.docs_page)
+        if model_doc is not None:
+            represented_pages.add(model_doc.docs_page)
+        architectures = model_doc.architecture_display if model_doc is not None else ""
+        rows.append((release.release_date, _render_model_with_recipe(release), architectures))
+
+    for model_doc in documented_models:
+        if model_doc.docs_page in represented_pages:
+            continue
+        addition_date = _load_file_addition_date(repo_root, model_doc.source_path)
+        if addition_date is None:
+            continue
+        rows.append(
+            (
+                addition_date,
+                f"[{model_doc.title}]({model_doc.docs_page}) (documentation)",
+                model_doc.architecture_display,
+            )
+        )
+
+    rows.sort(key=lambda row: (row[0], row[1].casefold()), reverse=True)
+    table = "\n".join(
+        [
+            DATED_MODEL_TABLE_HEADER,
+            "|:-----|:-----|:-----|",
+            *(f"| {date} | {model} | {architectures} |" for date, model, architectures in rows),
+        ]
+    )
+    table_style = COMPACT_TABLE_STYLE.replace("nth-child(-n + 2)", "nth-child(-n + 1)")
+    return "\n\n".join(
+        [
+            SUPPORT_LOG_START_MARKER,
+            '<div className="compact-model-tables">',
+            table_style,
+            table,
+            "</div>",
+            SUPPORT_LOG_END_MARKER,
+        ]
+    )
+
+
+def _belongs_to_overview(model_type: str, overview_type: str) -> bool:
+    return model_type == overview_type or (overview_type == "LLM" and model_type == "Encoder-Decoder")
 
 
 def _render_compact_release_table(releases: list[_ModelRelease], *, include_type: bool = True) -> str:
@@ -506,7 +626,7 @@ def _generate_tables(repo_root: Path) -> dict[Path, str]:
     registry_source = registry_path.read_text(encoding="utf-8")
     aliases_source = aliases_path.read_text(encoding="utf-8")
 
-    model_docs, documented_architectures = _load_model_docs(docs_root)
+    model_docs, documented_architectures, documented_models = _load_model_doc_catalog(docs_root)
     releases = _load_model_releases(repo_root, model_docs)
     generated_support_log = _render_support_log_table(releases)
     generated_homepage = _render_homepage_table(releases)
@@ -524,8 +644,10 @@ def _generate_tables(repo_root: Path) -> dict[Path, str]:
                 typed_overviews[model_type],
                 SUPPORT_LOG_START_MARKER,
                 SUPPORT_LOG_END_MARKER,
-                _render_support_log_table(
-                    [release for release in releases if release.model_type == model_type], include_type=False
+                _render_typed_support_table(
+                    repo_root,
+                    [release for release in releases if _belongs_to_overview(release.model_type, model_type)],
+                    [model for model in documented_models if _belongs_to_overview(model.model_type, model_type)],
                 ),
             )
             for model_type, _ in MODEL_TYPE_OVERVIEW_PATHS

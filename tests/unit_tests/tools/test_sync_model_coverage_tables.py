@@ -31,6 +31,8 @@ from tests.ci_tests.utils.sync_model_coverage_tables import (
     SUPPORT_LOG_END_MARKER,
     SUPPORT_LOG_START_MARKER,
     TABLE_ROW_COUNT,
+    _generate_tables,
+    _load_model_doc_catalog,
     _load_model_docs,
     _load_model_releases,
     _parse_doc_arch_aliases,
@@ -488,6 +490,62 @@ def test_model_release_uses_first_recipe_addition_date(tmp_path):
     assert len(releases) == 1
     assert releases[0].release_date == "2026-07-29"
     assert releases[0].recipe == first_recipe_path
+
+
+def test_model_release_uses_model_introduction_date_when_recipe_changes(tmp_path):
+    subprocess.run(["git", "init", "-q", "-b", "main", str(tmp_path)], check=True)
+    recipe_path = tmp_path / "examples" / "llm_finetune" / "model.yaml"
+    recipe_path.parent.mkdir(parents=True)
+
+    def commit(model_id: str, message: str, timestamp: str) -> None:
+        recipe_path.write_text(f"model:\n  pretrained_model_name_or_path: {model_id}\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(tmp_path), "add", str(recipe_path.relative_to(tmp_path))], check=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(tmp_path),
+                "-c",
+                "user.name=Test User",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-q",
+                "-m",
+                message,
+                f"--date={timestamp}",
+            ],
+            check=True,
+            env={**os.environ, "GIT_COMMITTER_DATE": timestamp},
+        )
+
+    commit("org/old-model", "add recipe", "2026-07-29T12:00:00Z")
+    commit("org/current-model", "update checkpoint", "2026-08-07T12:00:00Z")
+
+    releases = _load_model_releases(tmp_path, {})
+
+    assert len(releases) == 1
+    assert releases[0].hf_model_id == "org/current-model"
+    assert releases[0].release_date == "2026-08-07"
+
+
+def test_typed_support_tables_include_every_documented_model_family():
+    repo_root = Path(__file__).parents[3]
+    _, _, documented_models = _load_model_doc_catalog(repo_root / "docs")
+    generated = _generate_tables(repo_root)
+    overview_paths = {
+        model_type: repo_root / "docs" / "model-coverage" / relative_path
+        for model_type, relative_path in MODEL_TYPE_OVERVIEW_PATHS
+    }
+    overview_paths["Encoder-Decoder"] = overview_paths["LLM"]
+
+    missing = [
+        (model.model_type, model.docs_page)
+        for model in documented_models
+        if model.docs_page not in generated[overview_paths[model.model_type]]
+    ]
+
+    assert not missing, f"Documented model families missing from generated support tables: {missing}"
 
 
 def test_model_release_ignores_tokenizer_and_teacher_checkpoints(tmp_path):
