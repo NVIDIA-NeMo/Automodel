@@ -34,8 +34,8 @@ HF_MODEL_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 DOCS_PAGE_PATTERN = re.compile(r"^/[a-z0-9][a-z0-9/-]*$")
 MARKDOWN_UNSAFE_PATTERN = re.compile(r"[\[\]|<>`\r\n]")
 REPOSITORY_URL = "https://github.com/NVIDIA-NeMo/Automodel/blob/main"
-DATED_SUPPORT_TABLE_HEADER = "| Date | Type | Model |"
-DATED_MODEL_TABLE_HEADER = "| Date | Model | Architectures |"
+DATED_SUPPORT_TABLE_HEADER = "| Date | Type | Model | Recipe |"
+DATED_MODEL_TABLE_HEADER = "| Date | Model | Architectures | Recipe |"
 MODEL_TYPE_OVERVIEW_PATHS = (
     ("LLM", "llm/index.mdx"),
     ("VLM", "vlm/index.mdx"),
@@ -67,14 +67,16 @@ COMPACT_TABLE_STYLE = """<style>{`
     text-align: left !important;
   }
 
-  .compact-model-tables .fern-table th:nth-child(-n + 2),
-  .compact-model-tables .fern-table td:nth-child(-n + 2) {
+  .compact-model-tables .fern-table th:first-child,
+  .compact-model-tables .fern-table td:first-child,
+  .compact-model-tables .fern-table th:last-child,
+  .compact-model-tables .fern-table td:last-child {
     width: 1%;
     white-space: nowrap;
   }
 
-  .compact-model-tables .fern-table th:last-child,
-  .compact-model-tables .fern-table td:last-child {
+  .compact-model-tables .fern-table th:nth-last-child(2),
+  .compact-model-tables .fern-table td:nth-last-child(2) {
     width: 100%;
   }
 `}</style>"""
@@ -422,22 +424,26 @@ def _render_recipe_link(release: _ModelRelease) -> str:
     return f"[recipe]({REPOSITORY_URL}/{release.recipe})"
 
 
-def _render_model_with_recipe(release: _ModelRelease) -> str:
+def _render_model_link(release: _ModelRelease) -> str:
     model_name = release.hf_model_id.split("/", 1)[1]
     model_name = model_name[:1].upper() + model_name[1:]
-    return f"[{model_name}]({release.docs_page}) ({_render_recipe_link(release)})"
+    return f"[{model_name}]({release.docs_page})"
 
 
 def _render_release_table(releases: list[_ModelRelease], *, include_type: bool = True) -> str:
     if include_type:
-        header = [DATED_SUPPORT_TABLE_HEADER, "|:-----|:-----|:-----|"]
+        header = [DATED_SUPPORT_TABLE_HEADER, "|:-----|:-----|:-----|:-----|"]
         table_rows = [
-            f"| {release.release_date} | {release.model_type} | {_render_model_with_recipe(release)} |"
+            f"| {release.release_date} | {release.model_type} | {_render_model_link(release)} | "
+            f"{_render_recipe_link(release)} |"
             for release in releases
         ]
     else:
-        header = [DATED_MODEL_TABLE_HEADER, "|:-----|:-----|:-----|"]
-        table_rows = [f"| {release.release_date} | {_render_model_with_recipe(release)} | |" for release in releases]
+        header = [DATED_MODEL_TABLE_HEADER, "|:-----|:-----|:-----|:-----|"]
+        table_rows = [
+            f"| {release.release_date} | {_render_model_link(release)} | | {_render_recipe_link(release)} |"
+            for release in releases
+        ]
 
     return "\n".join([*header, *table_rows])
 
@@ -455,7 +461,7 @@ def _render_typed_support_table(
         if model_doc is not None:
             represented_pages.add(model_doc.docs_page)
         architectures = model_doc.architecture_display if model_doc is not None else ""
-        rows.append((release.release_date, _render_model_with_recipe(release), architectures))
+        rows.append((release.release_date, _render_model_link(release), architectures, _render_recipe_link(release)))
 
     for model_doc in documented_models:
         if model_doc.docs_page in represented_pages:
@@ -468,6 +474,7 @@ def _render_typed_support_table(
                 addition_date,
                 f"[{model_doc.title}]({model_doc.docs_page}) (documentation)",
                 model_doc.architecture_display,
+                "",
             )
         )
 
@@ -475,16 +482,15 @@ def _render_typed_support_table(
     table = "\n".join(
         [
             DATED_MODEL_TABLE_HEADER,
-            "|:-----|:-----|:-----|",
-            *(f"| {date} | {model} | {architectures} |" for date, model, architectures in rows),
+            "|:-----|:-----|:-----|:-----|",
+            *(f"| {date} | {model} | {architectures} | {recipe} |" for date, model, architectures, recipe in rows),
         ]
     )
-    table_style = COMPACT_TABLE_STYLE.replace("nth-child(-n + 2)", "nth-child(-n + 1)")
     return "\n\n".join(
         [
             SUPPORT_LOG_START_MARKER,
             '<div className="compact-model-tables">',
-            table_style,
+            COMPACT_TABLE_STYLE,
             table,
             "</div>",
             SUPPORT_LOG_END_MARKER,
@@ -497,13 +503,10 @@ def _belongs_to_overview(model_type: str, overview_type: str) -> bool:
 
 
 def _render_compact_release_table(releases: list[_ModelRelease], *, include_type: bool = True) -> str:
-    table_style = COMPACT_TABLE_STYLE
-    if not include_type:
-        table_style = table_style.replace("nth-child(-n + 2)", "nth-child(-n + 1)")
     return "\n\n".join(
         [
             '<div className="compact-model-tables">',
-            table_style,
+            COMPACT_TABLE_STYLE,
             _render_release_table(releases, include_type=include_type),
             "</div>",
         ]

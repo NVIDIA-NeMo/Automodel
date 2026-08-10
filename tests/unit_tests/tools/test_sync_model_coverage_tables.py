@@ -415,8 +415,8 @@ def test_sync_tables_writes_support_log_homepage_and_registry(tmp_path):
     support_log = (tmp_path / "docs" / "model-coverage" / "latest-models.mdx").read_text(encoding="utf-8")
     assert (
         "| 2026-07-30 | VLM | "
-        "[Vlm-model](https://huggingface.co/org/vlm-model) "
-        "([recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/model.yaml)) |"
+        "[Vlm-model](https://huggingface.co/org/vlm-model) | "
+        "[recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/model.yaml) |"
     ) in support_log
     for (model_type, _), typed_overview_path in zip(MODEL_TYPE_OVERVIEW_PATHS, typed_overview_paths):
         typed_overview = typed_overview_path.read_text(encoding="utf-8")
@@ -424,8 +424,8 @@ def test_sync_tables_writes_support_log_homepage_and_registry(tmp_path):
         assert len(typed_rows) == len([release for release in releases if release.model_type == model_type])
         assert DATED_MODEL_TABLE_HEADER in typed_overview
         assert all(f"| {model_type} |" not in row for row in typed_rows)
-        assert "nth-child(-n + 1)" in typed_overview
-        assert "nth-child(-n + 2)" not in typed_overview
+        assert ".compact-model-tables .fern-table th:first-child" in typed_overview
+        assert ".compact-model-tables .fern-table th:nth-last-child(2)" in typed_overview
         assert "<Tabs>" not in typed_overview
     homepage = (tmp_path / "docs" / "index.mdx").read_text(encoding="utf-8")
     for document in (support_log, homepage):
@@ -433,7 +433,7 @@ def test_sync_tables_writes_support_log_homepage_and_registry(tmp_path):
         assert document.count(".compact-model-tables .fern-table-root") == 1
         assert "width: 100% !important;" in document
         assert ".compact-model-tables .fern-table td:last-child" in document
-        assert document.count("|:-----|:-----|:-----|") == 1
+        assert document.count("|:-----|:-----|:-----|:-----|") == 1
         assert "<Tabs>" not in document
         assert "<Tab " not in document
         assert "Documentation only" not in document
