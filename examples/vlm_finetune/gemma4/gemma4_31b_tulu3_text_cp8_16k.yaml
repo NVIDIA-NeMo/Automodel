@@ -108,3 +108,9 @@ wandb:
   entity: <your_wandb_entity>
   name: <your_wandb_name>
   dir: <your_wandb_save_dir>
+
+ci:
+  time: "01:00:00"
+  env_vars:
+    # CP backward fragments the allocator; NCCL then cannot get its connection buffers, leads to OOM.
+    PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"

@@ -19,7 +19,7 @@ env:
 
 jobs:
   pre-flight:
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@d211550f7cfe04e657ed568ce28bef620457b94f # v0.64.2
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@c1a0837f362a1a696e647238ab1cf916b2a7cf4a # v1.8.6
 
   setup-install-image:
     runs-on: ubuntu-latest
@@ -373,7 +373,8 @@ jobs:
 
           export PATH="${UV_PROJECT_ENVIRONMENT}/bin/:$PATH"
 
-          uv venv ${UV_PROJECT_ENVIRONMENT} --system-site-packages
+          # Keep runner packages isolated, but seed pip for the check-imports action.
+          uv venv ${UV_PROJECT_ENVIRONMENT} --seed
 
           uv sync --link-mode copy --locked --only-group build
 

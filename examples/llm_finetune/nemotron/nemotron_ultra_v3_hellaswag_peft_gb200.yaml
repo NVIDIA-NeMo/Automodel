@@ -40,6 +40,10 @@ dist_env:
   backend: nccl
   timeout_minutes: 120
 
+prewarm:
+  # Autotune Mamba SSD backward kernels before the real batch's activations are live.
+  mamba_ssd_autotune: true
+
 rng:
   _target_: nemo_automodel.components.training.rng.StatefulRNG
   seed: 1111
