@@ -3276,6 +3276,30 @@ def test_thd_vlm_collater_fixed_max_length_pads():
     assert out["seq_lens_padded"].tolist() == [[8]]
 
 
+def test_thd_vlm_collater_preserves_materialized_cp_document_padding():
+    from nemo_automodel.components.datasets.vlm.collate_fns import packed_sequence_thd_vlm_collater
+    from nemo_automodel.components.distributed.thd_utils import process_input_for_thd
+
+    first = _thd_vlm_make_sample([8])
+    first["seq_lens"] = [3, 2]
+    first["seq_lens_padded"] = [4, 4]
+    first["position_ids"] = torch.arange(8)
+    second = _thd_vlm_make_sample([4])
+    second["seq_lens"] = [4]
+    second["seq_lens_padded"] = [4]
+    second["position_ids"] = torch.arange(4)
+
+    out = packed_sequence_thd_vlm_collater([first, second], padding_idx=0)
+
+    assert out["seq_lens"].tolist() == [[3, 2], [4, -1000]]
+    assert out["seq_lens_padded"].tolist() == [[4, 4], [8, -1000]]
+    thd = process_input_for_thd(
+        {key: out[key] for key in ("input_ids", "labels", "position_ids", "seq_lens", "seq_lens_padded")}
+    )
+    assert thd["cu_seqlens"].tolist() == [0, 3, 5, 9]
+    assert thd["cu_seqlens_padded"].tolist() == [0, 4, 8, 16]
+
+
 def test_thd_vlm_collater_empty_batch():
     from nemo_automodel.components.datasets.vlm.collate_fns import packed_sequence_thd_vlm_collater
 
