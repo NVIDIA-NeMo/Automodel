@@ -60,10 +60,12 @@ Built on `transformers` for day-0 model support and OOTB compatibility.
 
 ## Get Started
 
-<pre aria-label="Quick start commands"><code>{`git clone https://github.com/NVIDIA-NeMo/Automodel.git
+```bash
+git clone https://github.com/NVIDIA-NeMo/Automodel.git
 cd Automodel
 uv sync --locked --all-groups --extra all
-uv run automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml --nproc-per-node 2`}</code></pre>
+uv run automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml --nproc-per-node 2
+```
 
 See the [installation guide](/get-started/installation) for Docker, source builds, and multi-node setup.
 See the [configuration guide](/get-started/configuration) for YAML recipes and CLI overrides.
