@@ -89,7 +89,7 @@ def test_mok_backend_config_build_settings(monkeypatch: pytest.MonkeyPatch) -> N
         all_gather_top_experts_chunk_bytes=1024,
     )
 
-    config.build(swiglu_limit=10.0)
+    config.build()
 
     assert captured == {
         "fwd_num_comm_sms": 24,
@@ -98,7 +98,6 @@ def test_mok_backend_config_build_settings(monkeypatch: pytest.MonkeyPatch) -> N
         "macrobatch_size": 8192,
         "schedule_capacity_multiplier": 0.75,
         "all_gather_top_experts_chunk_bytes": 1024,
-        "swiglu_limit": 10.0,
     }
 
 
@@ -109,6 +108,77 @@ def test_mok_accepts_dsv4_clamped_swiglu() -> None:
     )
 
     assert experts.runtime.swiglu_limit == 10.0
+
+
+@pytest.mark.parametrize(("configured_limit", "functional_limit"), [(0.0, None), (10.0, 10.0)])
+def test_mok_passes_swiglu_limit_to_functional_forward_and_backward(
+    monkeypatch: pytest.MonkeyPatch,
+    configured_limit: float,
+    functional_limit: float | None,
+) -> None:
+    calls: dict[str, object] = {}
+
+    class FakeFunctional:
+        @staticmethod
+        def get_workspace(*args: object, **kwargs: object) -> object:
+            del args, kwargs
+            return object()
+
+        @staticmethod
+        def build_schedule(*args: object, **kwargs: object) -> object:
+            del args, kwargs
+            return object()
+
+        @staticmethod
+        def forward(*args: object) -> tuple[torch.Tensor, object]:
+            calls["forward_limit"] = args[-1]
+            return args[3], object()
+
+        @staticmethod
+        def backward(*args: object) -> tuple[object, ...]:
+            calls["backward_limit"] = args[-1]
+            return ()
+
+    monkeypatch.setattr(mok_experts, "_mok_functional", FakeFunctional)
+    runtime = mok_experts._MoKRuntime(BackendConfig(dispatcher="mok"), swiglu_limit=configured_limit)
+    runtime.config = object()
+    runtime.ep_group = object()
+    x = torch.empty(4, 256, dtype=torch.bfloat16)
+    router_weights = torch.empty(4, 2, dtype=torch.float32)
+    top_experts = torch.empty(4, 2, dtype=torch.int64)
+    shared_gate = torch.empty(256, 256, dtype=torch.bfloat16)
+    shared_up = torch.empty(256, 256, dtype=torch.bfloat16)
+    shared_down = torch.empty(256, 256, dtype=torch.bfloat16)
+    routed_gate = torch.empty(1, 256, 256, dtype=torch.bfloat16)
+    routed_up = torch.empty(1, 256, 256, dtype=torch.bfloat16)
+    routed_down = torch.empty(1, 256, 256, dtype=torch.bfloat16)
+
+    _, schedule, forward_context = runtime.forward(
+        x,
+        router_weights,
+        top_experts,
+        shared_gate,
+        shared_up,
+        shared_down,
+        routed_gate,
+        routed_up,
+        routed_down,
+    )
+    runtime.backward(
+        schedule,
+        forward_context,
+        x,
+        x,
+        router_weights,
+        shared_gate,
+        shared_up,
+        shared_down,
+        routed_gate,
+        routed_up,
+        routed_down,
+    )
+
+    assert calls == {"forward_limit": functional_limit, "backward_limit": functional_limit}
 
 
 @pytest.mark.parametrize(

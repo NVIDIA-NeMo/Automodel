@@ -198,7 +198,6 @@ class _MoKFunctionalConfig(Protocol):
     macrobatch_size: int
     schedule_capacity_multiplier: float
     all_gather_top_experts_chunk_bytes: int
-    swiglu_limit: float
 
 
 @dataclass(kw_only=True, frozen=True)
@@ -251,12 +250,8 @@ class MoKBackendConfig:
         ):
             raise ValueError("mok.all_gather_top_experts_chunk_bytes must be a positive multiple of 16")
 
-    def build(self, *, swiglu_limit: float = 0.0) -> _MoKFunctionalConfig:
+    def build(self) -> _MoKFunctionalConfig:
         """Build the optional MoK runtime configuration.
-
-        Args:
-            swiglu_limit: Optional model-level clamp used by routed and shared
-                SwiGLU experts. Zero selects ordinary SwiGLU.
 
         Returns:
             A ``mok.functional.MoKConfig`` with these declarative settings.
@@ -278,7 +273,6 @@ class MoKBackendConfig:
             macrobatch_size=self.macrobatch_size,
             schedule_capacity_multiplier=self.schedule_capacity_multiplier,
             all_gather_top_experts_chunk_bytes=self.all_gather_top_experts_chunk_bytes,
-            swiglu_limit=swiglu_limit,
         )
 
 

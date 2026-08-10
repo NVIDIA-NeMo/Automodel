@@ -132,7 +132,7 @@ class _MoKRuntime:
 
     def __init__(self, backend: BackendConfig, *, swiglu_limit: float) -> None:
         self.backend = backend
-        self.swiglu_limit = swiglu_limit
+        self.swiglu_limit = None if swiglu_limit == 0.0 else float(swiglu_limit)
         self.config: object | None = None
         self.ep_group: dist.ProcessGroup | None = None
 
@@ -156,7 +156,7 @@ class _MoKRuntime:
         # Load the CUDA extension only after torchrun has bound this worker to
         # its local device.  This avoids all workers creating a context on GPU 0.
         _load_mok_functional()
-        self.config = self.backend.mok.build(swiglu_limit=self.swiglu_limit)
+        self.config = self.backend.mok.build()
         self.ep_group = ep_mesh.get_group()
 
     def forward(
@@ -219,6 +219,7 @@ class _MoKRuntime:
             routed_gate_weights,
             routed_up_weights,
             routed_down_weights,
+            self.swiglu_limit,
         )
         return output, schedule, forward_context
 
@@ -282,6 +283,7 @@ class _MoKRuntime:
             routed_gate_weights,
             routed_up_weights,
             routed_down_weights,
+            self.swiglu_limit,
         )
 
 
