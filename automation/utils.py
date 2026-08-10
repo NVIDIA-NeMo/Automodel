@@ -24,17 +24,17 @@ eval_datasets['debug_text'] = [
     ('techqa_beir', ''),
 ]
 
-"""eval_datasets['vision_split'] = [
+"""eval_datasets['20250405'] = [
     ('bo767_fullpage', ''),
     ('earnings', ''),
     ('vidore_infovqa_test_subsampled vidore_arxivqa_test_subsampled vidore_docvqa_test_subsampled vidore_shiftproject_test vidore_syntheticDocQA_artificial_intelligence_test vidore_syntheticDocQA_energy_test vidore_syntheticDocQA_government_reports_test vidore_syntheticDocQA_healthcare_industry_test vidore_tabfquad_test_subsampled vidore_tatdqa_test', ''),
 ]"""
-eval_datasets['vision_split'] = [
-    ('earnings_v2', ''),
-    ('dc10k', ''),
-    ('earnings', ''),
-    ('bo767_fullpage', ''),
-    ('vidore_all', ''),
+eval_datasets['20250405'] = [
+    ('earnings_v2', ' --eval_type beir_embedding_eval '),
+    ('dc10k', ' --eval_type beir_embedding_eval '),
+    ('earnings', ' --eval_type beir_embedding_eval '),
+    ('bo767_fullpage', ' --eval_type beir_embedding_eval '),
+    ('vidore_all', ' --eval_type beir_embedding_eval '),
 ]
 
 eval_datasets['text_short_context'] = [
@@ -42,8 +42,8 @@ eval_datasets['text_short_context'] = [
 ]
 
 eval_datasets['small_textqa_eval_20250508'] = [
-    ('bo767_text earnings_text fiqa nq_sample35 hotpotqa_sample35 techqa_beir miracl_ar_sample miracl_de_sample miracl_en_sample miracl_es_sample miracl_fi_sample miracl_fr_sample miracl_ja_sample miracl_ko_sample miracl_ru_sample miracl_th_sample miracl_zh_sample test-context-de-question-ar test-context-ar-question-es test-context-en-question-zh test-context-hi-question-de test-context-vi-question-ar test-context-zh-question-en test-context-es-question-vi', ''),
-    ('mldr_en_sample_bge_400query mldr_it_full mldr_pt_full mldr_ja_full mldr_de_full', ' --batch_size 2 --max_length 8192 '),
+    ('bo767_text earnings_text fiqa nq_sample35 hotpotqa_sample35 techqa_beir miracl_ar_sample miracl_de_sample miracl_en_sample miracl_es_sample miracl_fi_sample miracl_fr_sample miracl_ja_sample miracl_ko_sample miracl_ru_sample miracl_th_sample miracl_zh_sample test-context-de-question-ar test-context-ar-question-es test-context-en-question-zh test-context-hi-question-de test-context-vi-question-ar test-context-zh-question-en test-context-es-question-vi', ' --eval_type beir_embedding_eval '),
+    ('mldr_en_sample_bge_400query mldr_it_full mldr_pt_full mldr_ja_full mldr_de_full', ' --batch_size 2 --max_length 8192 --eval_type beir_embedding_eval '),
 ]
 
 eval_datasets['full_text_eval'] = [
@@ -75,15 +75,14 @@ eval_datasets['MTEB_ALL_QUICK'] = [
     ('MTEB_ENG', ' --max_length 2048 --batch_size 16 '),
 ]
 
-
 eval_datasets["vidore_v3_complex_ocr"] = [
     ("vidore_v3_finance_bank_reports_en_complex_ocr vidore_v3_military_technical_reports_complex_ocr vidore_v3_education_computer_science_en_complex_ocr vidore_v3_healthcare_fda_en_complex_ocr vidore_v3_hr_european_reports_en_complex_ocr vidore_v3_energy_reports_fr_complex_ocr vidore_v3_education_physics_fr_complex_ocr vidore_v3_luxury_financial_reports_fr_complex_ocr",
-     " --eval_type text_embedding_eval"),
+     " --eval_type beir_embedding_eval "),
 ]
 
 eval_datasets["text_embedding_eval"] = [
     ("dc10k_complex_ocr earnings_v2_complex_ocr fiqa nq_sample35 hotpotqa_sample35 techqa_beir miracl_ar_sample miracl_de_sample miracl_en_sample miracl_es_sample miracl_fi_sample miracl_fr_sample miracl_ja_sample miracl_ko_sample miracl_ru_sample miracl_th_sample miracl_zh_sample mldr_en_sample_bge_400query mldr_it_full mldr_pt_full mldr_ja_full mldr_de_full test-context-de-question-ar test-context-ar-question-es test-context-en-question-zh test-context-hi-question-de test-context-vi-question-ar test-context-zh-question-en test-context-es-question-vi",
-     " --eval_type text_embedding_eval"),
+     " --eval_type beir_embedding_eval "),
 ]
 
 def get_script(
@@ -144,6 +143,7 @@ def cluster_executor(
     job_name_prefix: str = "",
     master_port: int = 29500,
     comment: str | None = None,
+    symlink_from_remote_dir: str | None = None,
 ) -> run.SlurmExecutor:
     """
     Create a Slurm executor configuration for the DRACO cluster.
@@ -156,6 +156,7 @@ def cluster_executor(
         time (str): The time to use for the job.
         username (str): The username to use for the job.
         master_port (str): The port for torchrun rendezvous endpoint.
+        symlink_from_remote_dir: Remote source directory to symlink as the job's code directory.
 
     Returns:
         Slurm executor configuration for the DRACO cluster.
@@ -196,7 +197,7 @@ def cluster_executor(
         packager = run.GitArchivePackager(
             include_untracked=True,
             include_uncommitted=True,
-            symlink_from_remote_dir=os.getenv("NEMO_RUN_REMOTE_CODE_SYMLINK"),
+            symlink_from_remote_dir=symlink_from_remote_dir,
         )
     )
     return slurm_executor

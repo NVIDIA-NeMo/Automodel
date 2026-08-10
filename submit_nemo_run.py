@@ -12,20 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Usage: python3 submit_nemo_run.py -n test_qwen  -tr scripts/mengyaox/local_qwen2_5_vl_train_script.sh -e scripts/mengyaox/local_qwen2_5_eval_script.sh --eval_datasets vision_split small_textqa_eval_20250508  --run_local -r 2
+# Usage: python3 submit_nemo_run.py -n test_qwen  -tr scripts/mengyaox/local_qwen2_5_vl_train_script.sh -e scripts/mengyaox/local_qwen2_5_eval_script.sh --eval_datasets 20250405 small_textqa_eval_20250508  --run_local -r 2
 
-import os
 import argparse
+import csv
+import logging
+import os
+import time
 from datetime import datetime
 
 import nemo_run as run
+import wandb
+from torchx.specs.api import AppState
 
 from automation.utils import cluster_executor, eval_datasets, get_script, validate_args
-from torchx.specs.api import AppState
-import csv
-import wandb
-import time
-import logging
 
 
 logging.basicConfig(level=logging.INFO)
@@ -36,6 +36,29 @@ IDLE_REAPER_COMMENT = (
     '"description":"Draco cluster is in the broken state and kills false positive IDLE jobs. '
     'These runs are critical for the release. MARSSUP-6917"}}'
 )
+
+_EVAL_DATASET_DIRS_BY_CLUSTER = {
+    "draco": (
+        "/lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/"
+        "retriever_models_research/01_datasets/01_evaluation_datasets/"
+    ),
+    "nrt": (
+        "/lustre/fsw/portfolios/nemotron/projects/nemotron_retriever_dev/"
+        "retriever_models_research/01_datasets/01_evaluation_datasets/"
+    ),
+}
+
+_CLUSTER_RUN_KWARGS = {
+    "draco": {
+        "partition": "batch_block1,batch_block3,batch_block4",
+        "ssh_host": "draco-oci-dc-02.draco-oci-iad.nvidia.com",
+    },
+    "nrt": {
+        "partition": "batch_block1",
+        "ssh_host": "oci-nrt-cs-001-dc-02.nvidia.com",
+    },
+}
+
 
 def str2bool(v):
     if isinstance(v, bool):
@@ -66,6 +89,12 @@ def get_args():
         type=str,
         help='Directory for the job files to be rsynced to',
         default=f"/lustre/fsw/portfolios/nemotron/projects/nemotron_retriever_dev/users/{os.getenv('USER')}/jobs",
+    )
+    parser.add_argument(
+        "--use_remote_code_symlink",
+        action="store_true",
+        default=False,
+        help="Use this AutoModel checkout directly for training jobs instead of packaging it",
     )
     parser.add_argument(
         '-ckpd', '--checkpoint_directory',
@@ -277,22 +306,16 @@ def main():
         train_executor = run.LocalExecutor()
         eval_executor = run.LocalExecutor()
     else:
-        if args.cluster == "draco":
-            run_kwargs = {
-                "partition": "batch_block1,batch_block3,batch_block4",
-                "ssh_host": "draco-oci-dc-02.draco-oci-iad.nvidia.com",
-            }
-        elif args.cluster == "nrt":
-            run_kwargs = {
-                "partition": "batch_block1",
-                "ssh_host": "oci-nrt-cs-001-dc-02.nvidia.com",
-            }
-        else:
-            raise ValueError(f"Invalid cluster: {args.cluster}. Available clusters: draco, nrt. Please use --cluster to specify the cluster.")
-
+        if args.cluster not in _CLUSTER_RUN_KWARGS:
+            raise ValueError(
+                f"Invalid cluster: {args.cluster}. Available clusters: "
+                f"{', '.join(_CLUSTER_RUN_KWARGS)}. Please use --cluster to specify the cluster."
+            )
+        run_kwargs = dict(_CLUSTER_RUN_KWARGS[args.cluster])
         if args.partition is not None:
             run_kwargs["partition"] = args.partition
 
+        remote_code_dir = os.path.dirname(os.path.abspath(__file__))
         train_executor = cluster_executor(
             account=args.account,
             container_image=args.container_image,
@@ -301,6 +324,7 @@ def main():
             dependency_type="afterany",
             job_name_prefix=experiment_id,
             gpus_per_node=0 if args.partition == "cpu" else 8,
+            symlink_from_remote_dir=remote_code_dir if args.use_remote_code_symlink else None,
             # comment=IDLE_REAPER_COMMENT,
             **run_kwargs,
         )
@@ -310,6 +334,7 @@ def main():
             job_dir=args.job_dir,
             nodes=1,
             job_name_prefix='e_' + experiment_id,
+            symlink_from_remote_dir=remote_code_dir,
             # comment=IDLE_REAPER_COMMENT,
             **run_kwargs,
         )
@@ -326,6 +351,12 @@ def main():
     args.more_train_args += f' --config {args.yaml_config} --checkpoint.checkpoint_dir {experiment_checkpoint_directory} --wandb.name {experiment_id} '
     if 'model_name_or_path' not in args.more_eval_args: 
         args.more_eval_args += f' --model_name_or_path {experiment_checkpoint_directory}/LATEST/model/consolidated'
+    if (
+        args.eval_datasets
+        and "--dataset_dir" not in args.more_eval_args
+        and args.cluster in _EVAL_DATASET_DIRS_BY_CLUSTER
+    ):
+        args.more_eval_args += f" --dataset_dir {_EVAL_DATASET_DIRS_BY_CLUSTER[args.cluster]}"
 
     logger.info("########################## " + "more_train_args" + " #######################")
     logger.info(args.more_train_args)
@@ -380,7 +411,7 @@ def main():
                             eval_args += f" --results_dir_name {args.results_dir_name}/{eval_dataset}"
                         if "--dataset_mapping" not in eval_args and "--dataset_mapping" not in extra_eval_args:
                             eval_args += f" --dataset_mapping {eval_dataset}"
-                            logger.info("Dataset mappings module not available, using default mapping")
+                            logger.info("Using dataset mapping version: %s", eval_dataset)
                         eval_args += " --dataset " + dataset_list + extra_eval_args
                         eval_commands.append(f"{args.eval_script} {eval_args}")
 
