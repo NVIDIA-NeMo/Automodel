@@ -43,16 +43,26 @@ RUN apt-get update && apt-get install -y --only-upgrade gnupg && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
-# Install uv; drop the base image's own /usr/local/bin copy (vulnerable rustls-webpki)
+# Install the pinned uv outside /root so arbitrary runtime UIDs can execute it.
+# Overwrite the base image's vulnerable /usr/local/bin copy.
 ENV UV_VERSION="0.11.24"
 RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh && \
-    rm -f /usr/local/bin/uv /usr/local/bin/uvx
-ENV PATH="/root/.local/bin:$PATH"
+    install -m 0755 /root/.local/bin/uv /usr/local/bin/uv && \
+    rm -f /usr/local/bin/uvx
+ENV PATH="/usr/local/bin:$PATH"
 ENV UV_PROJECT_ENVIRONMENT=/opt/venv
 ENV UV_CACHE_DIR=/opt/uv_cache
 ENV PATH="$UV_PROJECT_ENVIRONMENT/bin:$PATH"
 ENV UV_LINK_MODE=copy UV_COMPILE_BYTECODE=1
-RUN uv venv ${UV_PROJECT_ENVIRONMENT} --system-site-packages
+ARG RUNTIME_UID=65532
+ARG RUNTIME_GID=65532
+RUN groupadd --gid "${RUNTIME_GID}" nemo-runtime && \
+    useradd --no-log-init --uid "${RUNTIME_UID}" --gid "${RUNTIME_GID}" \
+        --create-home --home-dir /home/nemo-runtime --shell /bin/bash nemo-runtime && \
+    install -d -o "${RUNTIME_UID}" -g "${RUNTIME_GID}" \
+        /opt/Automodel /opt/uv_cache && \
+    uv venv ${UV_PROJECT_ENVIRONMENT} --system-site-packages && \
+    chown -R "${RUNTIME_UID}:${RUNTIME_GID}" ${UV_PROJECT_ENVIRONMENT}
 
 # Torchrun uses uv venv
 RUN if [ -f /usr/local/bin/torchrun ]; then \
@@ -164,7 +174,7 @@ RUN if [ "$TARGETARCH" = "arm64" ]; then INSTALL_FA3=false; fi && \
     fi && \
     rm -rf /tmp/fa
 
-FROM automodel_dep as automodel_final
+FROM automodel_dep AS automodel_final
 
 WORKDIR /opt/Automodel
 
@@ -200,10 +210,12 @@ RUN pip install "aiohttp>=3.14.3" \
     pip uninstall -y nvidia-dali-cuda130 wandb && \
     rm -rf /opt/pytorch/pytorch/third_party/onnx
 
-COPY pyproject.toml uv.lock /opt/Automodel/
-COPY nemo_automodel/__init__.py nemo_automodel/package_info.py /opt/Automodel/nemo_automodel/
-COPY docker/common/uv-pytorch.toml docker/common/uv-pytorch.lock /opt/Automodel/docker/common/
-COPY docker/common/update_pyproject_pytorch.sh /opt/Automodel/docker/common/
+ARG RUNTIME_UID=65532
+ARG RUNTIME_GID=65532
+COPY --chown=${RUNTIME_UID}:${RUNTIME_GID} pyproject.toml uv.lock /opt/Automodel/
+COPY --chown=${RUNTIME_UID}:${RUNTIME_GID} nemo_automodel/__init__.py nemo_automodel/package_info.py /opt/Automodel/nemo_automodel/
+COPY --chown=${RUNTIME_UID}:${RUNTIME_GID} docker/common/uv-pytorch.toml docker/common/uv-pytorch.lock /opt/Automodel/docker/common/
+COPY --chown=${RUNTIME_UID}:${RUNTIME_GID} docker/common/update_pyproject_pytorch.sh /opt/Automodel/docker/common/
 
 # Install Automodel
 ARG BASE_IMAGE=cuda
@@ -220,12 +232,13 @@ RUN --mount=type=cache,target=/opt/uv_cache,sharing=locked \
         MAX_JOBS=8 \
         UV_CONCURRENT_INSTALLS=8 \
         uv sync --extra $AUTOMODEL_INSTALL --all-groups $UV_SYNC_ARGS && \
-    python -c "import importlib.metadata as m; import magi_attention; print('magi-attention', m.version('magi-attention'))"
+    python -c "import importlib.metadata as m; import magi_attention; print('magi-attention', m.version('magi-attention'))" && \
+    chown -R "${RUNTIME_UID}:${RUNTIME_GID}" ${UV_PROJECT_ENVIRONMENT}
 
 # Persistent disk cache for FA4's CuTe-DSL JIT (amortizes kernel compiles across restarts)
 ENV FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1
 
-COPY . /opt/Automodel
+COPY --chown=${RUNTIME_UID}:${RUNTIME_GID} . /opt/Automodel
 
 # Re-apply PyTorch overrides after full COPY (which overwrites the modified pyproject.toml/uv.lock)
 RUN if [ "$BASE_IMAGE" = "pytorch" ]; then \
@@ -238,7 +251,7 @@ COPY <<EOF /opt/venv/env.sh
 export UV_PROJECT_ENVIRONMENT=/opt/venv
 export PATH="/opt/venv/bin:$PATH"
 export UV_LINK_MODE=copy
-export PATH="/root/.local/bin:$PATH"
+export PATH="/usr/local/bin:$PATH"
 EOF
 
 RUN chmod +x /opt/venv/env.sh
@@ -254,3 +267,19 @@ ARG TARGETARCH
 # NOTICES.txt file points to where the OSS source code is archived
 RUN echo "This distribution includes open source which is archived at the following URL: https://opensource.nvidia.com/oss/teams/nvidia/nemo-automodel/${RC_DATE}:linux-${TARGETARCH}/index.html" > NOTICES.txt && \
     echo "For further inquiries or assistance, contact us at oss-requests@nvidia.com" >> NOTICES.txt
+
+ENV HOME=/home/nemo-runtime \
+    XDG_CACHE_HOME=/tmp/regent-cache/xdg \
+    UV_CACHE_DIR=/tmp/regent-cache/uv
+
+USER ${RUNTIME_UID}:${RUNTIME_GID}
+
+# Validate the final user after the complete source and environment layers are
+# present. Runtime writes are limited to the source tree, test overlay venv,
+# and declared cache roots.
+RUN test "$(id -u)" = "${RUNTIME_UID}" && \
+    test -x /usr/local/bin/uv && \
+    test -x /opt/venv/bin/python && \
+    mkdir -p "${XDG_CACHE_HOME}" "${UV_CACHE_DIR}" && \
+    touch /opt/Automodel/.nonroot-write-probe /opt/venv/.nonroot-write-probe && \
+    rm /opt/Automodel/.nonroot-write-probe /opt/venv/.nonroot-write-probe

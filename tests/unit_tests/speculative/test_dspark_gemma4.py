@@ -76,17 +76,18 @@ def _build_gemma4_draft():
 
 
 def test_gemma4_draft_forward_shapes():
-    model = _build_gemma4_draft()
-    b, s, block, anchors = 2, 16, 4, 8
-    gen = torch.Generator().manual_seed(0)
-    with torch.no_grad():
+    with torch.random.fork_rng(devices=[]):
         torch.manual_seed(7)
-        out = model(
-            input_ids=torch.randint(0, VOCAB, (b, s), generator=gen),
-            target_hidden_states=torch.randn(b, s, len(TARGET_LAYER_IDS) * HIDDEN, generator=gen),
-            loss_mask=torch.ones(b, s, dtype=torch.uint8),
-            target_last_hidden_states=torch.randn(b, s, HIDDEN, generator=gen),
-        )
+        model = _build_gemma4_draft()
+        b, s, block, anchors = 2, 16, 4, 8
+        gen = torch.Generator().manual_seed(0)
+        with torch.no_grad():
+            out = model(
+                input_ids=torch.randint(0, VOCAB, (b, s), generator=gen),
+                target_hidden_states=torch.randn(b, s, len(TARGET_LAYER_IDS) * HIDDEN, generator=gen),
+                loss_mask=torch.ones(b, s, dtype=torch.uint8),
+                target_last_hidden_states=torch.randn(b, s, HIDDEN, generator=gen),
+            )
     assert out.draft_logits.shape == (b, anchors, block, VOCAB)
     assert out.confidence_pred.shape == (b, anchors, block)
     assert torch.isfinite(out.draft_logits).all()
