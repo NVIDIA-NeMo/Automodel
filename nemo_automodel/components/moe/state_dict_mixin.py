@@ -110,6 +110,19 @@ class MoESplitExpertsStateDictMixin:
         """
         return ()
 
+    def _v5_peft_hf_expert_path_segment(self) -> str:
+        """Return the common HF module path that owns the fused expert parameters."""
+        target_parameters = self._v5_peft_target_parameters
+        if not target_parameters:
+            return self._expert_path_segment
+
+        expert_segments = {target.rsplit(".", 1)[0] for target in target_parameters}
+        if len(expert_segments) != 1:
+            raise ValueError(
+                f"PEFT v5 expert target parameters must share one parent module, got {sorted(target_parameters)}"
+            )
+        return next(iter(expert_segments))
+
     def _validate_expert_availability(
         self,
         hf_state_dict: dict[str, Any],
@@ -272,8 +285,9 @@ class MoESplitExpertsStateDictMixin:
           - ``lora_down_B``  (E, r, H) -> ``lora_A.weight``  (r*E, H)  reshape
           - ``lora_down_A``  (E, I, r) -> ``lora_B.weight``  (I, r*E)  permute+reshape
 
-        gate_up_proj (inner wrapper, HAS ``base_layer.`` prefix):
-          - ``lora_gate_and_up_B``  (E, r, 2*I) -> ``base_layer.lora_A.weight``  (r*E, 2*I)  reshape
+        input projection (``gate_up_proj`` or ``up_proj``; inner wrapper, HAS
+        ``base_layer.`` prefix):
+          - ``lora_gate_and_up_B``  (E, r, U) -> ``base_layer.lora_A.weight``  (r*E, U)  reshape
           - ``lora_gate_and_up_A``  (E, H, r)   -> ``base_layer.lora_B.weight``  (H, r*E)    permute+reshape
 
         Returns:
@@ -285,7 +299,7 @@ class MoESplitExpertsStateDictMixin:
 
         prefix = match.group(1)
         layer_num = match.group(2)
-        expert_segment = self._expert_path_segment
+        expert_segment = self._v5_peft_hf_expert_path_segment()
         suffix = fqn.rsplit(".", 1)[-1]
 
         # PEFT ParamWrapper nesting: target_parameters are sorted alphabetically
@@ -321,18 +335,18 @@ class MoESplitExpertsStateDictMixin:
         ParamWrapper-format keys and converts them back to the 3-D grouped
         tensors expected by GroupedExpertsLoRA.
 
-        Reverse transforms (down_proj is outer, gate_up_proj is inner):
+        Reverse transforms (down_proj is outer, the input projection is inner):
           - ``experts.lora_A.weight``            (r*E, H)   -> (E, r, H)    = lora_down_B
           - ``experts.lora_B.weight``            (I, r*E)   -> (E, I, r)    = lora_down_A
           - ``experts.base_layer.lora_A.weight`` (r*E, 2*I) -> (E, r, 2*I)  = lora_gate_and_up_B
           - ``experts.base_layer.lora_B.weight`` (H, r*E)   -> (E, H, r)    = lora_gate_and_up_A
         """
-        expert_segment = re.escape(self._expert_path_segment)
+        hf_expert_segment = re.escape(self._v5_peft_hf_expert_path_segment())
         n_experts = self.moe_config.n_routed_experts
 
         # Detect ParamWrapper keys
         pw_pattern = re.compile(
-            rf"(?P<prefix>.*)layers\.(?P<layer>\d+)\.{expert_segment}\."
+            rf"(?P<prefix>.*)layers\.(?P<layer>\d+)\.{hf_expert_segment}\."
             rf"(?P<pw_suffix>(?:base_layer\.)?lora_[AB]\.weight)$"
         )
 
