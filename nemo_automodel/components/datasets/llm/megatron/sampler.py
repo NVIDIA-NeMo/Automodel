@@ -364,10 +364,11 @@ class MegatronSamplerConfig:
     drop_last: bool = True
     pad_samples_to_global_batch_size: bool = False
 
-    def build(self, *, dataset_len: int, rank: int, world_size: int) -> BaseMegatronSampler:
+    def build(self, *, dataset: object, dataset_len: int, rank: int, world_size: int) -> BaseMegatronSampler:
         """Build a Megatron sampler for one data-parallel rank.
 
         Args:
+            dataset: The materialized dataset; unused, Megatron sampling is index-only.
             dataset_len: Number of samples in the materialized dataset.
             rank: Rank within the data-parallel group.
             world_size: Size of the data-parallel group.
@@ -375,6 +376,7 @@ class MegatronSamplerConfig:
         Returns:
             Sampler yielding one local micro-batch of dataset indices at a time.
         """
+        del dataset
         return create_megatron_sampler(
             dataset_len=dataset_len,
             micro_batch_size=self.micro_batch_size,

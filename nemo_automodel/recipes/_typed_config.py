@@ -269,6 +269,19 @@ class RecipeConfig:
         elif dataloader_type is not None:
             raise ValueError("dataloader_type is only supported by Megatron dataset configs")
 
+        dynamic_batching = loader_kwargs.pop("dynamic_batching", None)
+        if dynamic_batching is not None:
+            if batch_sampler_config is not None:
+                raise ValueError(
+                    "dataloader.dynamic_batching cannot be combined with a Megatron dataset, which brings "
+                    "its own micro-batch sampler"
+                )
+            if loader_kwargs.get("group_by_length", False):
+                raise ValueError(
+                    "dataloader.dynamic_batching already groups by length; set group_by_length=false"
+                )
+            batch_sampler_config = _build_dynamic_batching_config(_as_dict(dynamic_batching), seed=self._raw.get("seed", 42))
+
         config_fields = {
             "shuffle",
             "group_by_length",
@@ -661,3 +674,21 @@ class RecipeConfig:
         if hasattr(self._raw, "to_yaml_dict"):
             return self._raw.to_yaml_dict(**kwargs)
         return self.to_dict()
+
+
+def _build_dynamic_batching_config(kwargs: dict, *, seed: int) -> "DynamicTokenBatchSamplerConfig":
+    """Build the token-budget batch sampler config from the ``dataloader.dynamic_batching`` block."""
+    from nemo_automodel.components.datasets.llm.dynamic_token_batch_sampler import DynamicTokenBatchSamplerConfig
+
+    supported = {"max_tokens_per_batch", "max_batch_size", "sort_window"}
+    unknown = sorted(set(kwargs) - supported)
+    if unknown:
+        raise TypeError(f"Unexpected dynamic_batching field(s): {', '.join(unknown)}")
+    if "max_tokens_per_batch" not in kwargs:
+        raise ValueError("dataloader.dynamic_batching requires max_tokens_per_batch")
+    return DynamicTokenBatchSamplerConfig(
+        max_tokens_per_batch=int(kwargs["max_tokens_per_batch"]),
+        max_batch_size=kwargs.get("max_batch_size", None),
+        sort_window=int(kwargs.get("sort_window", 2048)),
+        seed=seed,
+    )

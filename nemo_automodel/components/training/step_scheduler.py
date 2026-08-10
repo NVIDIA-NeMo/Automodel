@@ -214,10 +214,16 @@ class StepScheduler(Stateful):
     def set_epoch(self, epoch: int):
         """
         Set the epoch for the sampler.
+
+        A dataloader built with a ``batch_sampler`` keeps its per-epoch state there:
+        ``DataLoader`` replaces ``.sampler`` with an unused default in that case, so
+        forwarding only to ``.sampler`` would silently stop reshuffling.
         """
         self.epoch = epoch
-        if hasattr(getattr(self.dataloader, "sampler", None), "set_epoch"):
-            self.dataloader.sampler.set_epoch(epoch)
+        for attribute in ("sampler", "batch_sampler"):
+            sampler = getattr(self.dataloader, attribute, None)
+            if hasattr(sampler, "set_epoch"):
+                sampler.set_epoch(epoch)
 
     @property
     def is_remote_logging_step(self):

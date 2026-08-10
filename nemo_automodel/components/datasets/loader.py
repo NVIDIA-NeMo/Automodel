@@ -98,8 +98,12 @@ class AllRanksDatasetConfig(Protocol):
 class BatchSamplerConfig(Protocol):
     """Typed construction contract for a dataset-specific batch sampler."""
 
-    def build(self, *, dataset_len: int, rank: int, world_size: int) -> Sampler[list[int]]:
-        """Build a per-rank batch sampler for a materialized dataset."""
+    def build(self, *, dataset: object, dataset_len: int, rank: int, world_size: int) -> Sampler[list[int]]:
+        """Build a per-rank batch sampler for a materialized dataset.
+
+        ``dataset`` is passed alongside its length because a length-aware sampler (see
+        ``DynamicTokenBatchSampler``) has to read the samples themselves to size its batches.
+        """
 
 
 DatasetConfig = PlainDatasetConfig | TokenizerDatasetConfig | ScheduledDatasetConfig
@@ -697,7 +701,7 @@ class DataloaderConfig:
                     f"{type(self.batch_sampler_config).__name__} requires a sized dataset, got {type(dataset).__name__}"
                 )
             batch_sampler = self.batch_sampler_config.build(
-                dataset_len=len(dataset), rank=dp_rank, world_size=dp_world_size
+                dataset=dataset, dataset_len=len(dataset), rank=dp_rank, world_size=dp_world_size
             )
 
         return ParallelAwareDataloader(
