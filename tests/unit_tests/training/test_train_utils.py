@@ -385,8 +385,43 @@ def test_all_reduce_scalar_moves_offloaded_scalar_to_mesh_device(monkeypatch):
     # The result returns to the gradients' device so the clip math stays consistent.
     assert out.device.type == "cpu"
     assert out.item() == 1.0
+def _run_partial_gradient_clip_worker(rank: int, world_size: int, init_file: str) -> None:
+    """Verify a Partial gradient is synchronized before norm and clipping."""
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.tensor import DTensor, Partial, Replicate
+
+    torch.distributed.init_process_group(
+        backend="gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=30),
+    )
+    try:
+        mesh = init_device_mesh("cpu", (world_size,))
+        model = torch.nn.Module()
+        model.weight = torch.nn.Parameter(DTensor.from_local(torch.ones(2), mesh, [Replicate()], run_check=False))
+        local_grad = torch.tensor([3.0, 0.0]) if rank == 0 else torch.tensor([0.0, 4.0])
+        model.weight.grad = DTensor.from_local(local_grad, mesh, [Partial()], run_check=False)
+
+        grad_norm = clip_grad_norm(1.0, [model], foreach=False)
+
+        assert grad_norm == pytest.approx(5.0)
+        assert model.weight.grad.placements == (Replicate(),)
+        torch.testing.assert_close(model.weight.grad.to_local(), torch.tensor([0.6, 0.8]))
+        torch.distributed.barrier()
+    finally:
+        torch.distributed.destroy_process_group()
 
 
+def test_clip_grad_norm_synchronizes_partial_gradients(tmp_path):
+    """Replicated parameters must not retain rank-local Partial gradients."""
+    torch.multiprocessing.spawn(
+        _run_partial_gradient_clip_worker,
+        args=(2, str(tmp_path / "partial_gradient_clip_pg")),
+        nprocs=2,
+        join=True,
+    )
 def test_clip_grad_norm_with_inf_norm():
     """Test clip_grad_norm with infinity norm."""
     model = torch.nn.Linear(10, 10)

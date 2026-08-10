@@ -15,9 +15,9 @@
 """Dense-vs-TP correctness checks for LoRA tensor-parallel placements.
 
 Run with ``torchrun --standalone --nproc-per-node=2``.  The test intentionally
-uses Adam because replicated LoRA parameters receive Partial gradients: output
-and gradient parity alone would not catch an optimizer that applied unreduced
-rank-local gradients to replicated parameters.
+uses the production clipping helper and Adam because replicated LoRA parameters
+receive Partial gradients: output and gradient parity alone would not catch
+rank-local clipping or optimizer updates on replicated parameters.
 """
 
 from __future__ import annotations
@@ -34,6 +34,7 @@ from torch.distributed.tensor.parallel import parallelize_module
 
 from nemo_automodel.components._peft.lora import LinearLoRA
 from nemo_automodel.components.distributed.parallel_styles import ColwiseParallelLora, RowwiseParallelLora
+from nemo_automodel.components.training.utils import clip_grad_norm
 
 
 def _full_tensor(tensor: torch.Tensor) -> torch.Tensor:
@@ -143,9 +144,20 @@ def _run_plan(plan_name: str, device: torch.device, dtype: torch.dtype) -> None:
                     f"{plan_name} step {step} {adapter_name} grad",
                 )
 
-        # On step 1, deliberately do not materialize either adapter gradient
-        # before Adam.  This ensures the optimizer, rather than the test's
-        # full_tensor() comparison, consumes and resolves the Partial gradient.
+        # On step 1, deliberately do not materialize either adapter gradient in
+        # the parity check.  The production clipping helper itself must resolve
+        # Partial gradients before computing the norm or handing them to Adam.
+
+        distributed_norm = clip_grad_norm(0.05, [module], foreach=False)
+        reference_norm = torch.nn.utils.clip_grad_norm_(reference.parameters(), 0.05, foreach=False)
+        norm_atol, norm_rtol = (5e-3, 5e-3) if dtype == torch.bfloat16 else (2e-4, 2e-3)
+        torch.testing.assert_close(
+            torch.as_tensor(distributed_norm, device=device, dtype=torch.float32),
+            reference_norm.float(),
+            atol=norm_atol,
+            rtol=norm_rtol,
+            msg=lambda msg: f"{plan_name} {dtype} step {step} clipped grad norm: {msg}",
+        )
 
         optimizer.step()
         reference_optimizer.step()
