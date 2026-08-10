@@ -47,6 +47,12 @@ MODEL_TYPE_OVERVIEW_PATHS = (
     ("Embedding", "embedding/index.mdx"),
     ("Reranking", "reranker/index.mdx"),
 )
+GENERATED_MARKER_PAIRS = (
+    (HOMEPAGE_START_MARKER, HOMEPAGE_END_MARKER),
+    (SUPPORT_LOG_START_MARKER, SUPPORT_LOG_END_MARKER),
+    (DIFFUSION_MODELS_START_MARKER, DIFFUSION_MODELS_END_MARKER),
+    (REGISTRY_START_MARKER, REGISTRY_END_MARKER),
+)
 COMPACT_TABLE_STYLE = """<style>{`
   .compact-model-tables .fern-table-root {
     width: 100% !important;
@@ -111,6 +117,40 @@ def _replace_generated_block(document: str, start_marker: str, end_marker: str, 
     if document.find(end_marker, end + len(end_marker)) != -1:
         raise ValueError(f"Found multiple end markers: {end_marker}")
     return document[:start] + generated_block + document[end + len(end_marker) :]
+
+
+def _strip_generated_tables(repo_root: Path) -> list[Path]:
+    changed_paths = []
+    for path in (repo_root / "docs").rglob("*.mdx"):
+        document = path.read_text(encoding="utf-8")
+        stripped = document
+        for start_marker, end_marker in GENERATED_MARKER_PAIRS:
+            if start_marker in stripped or end_marker in stripped:
+                stripped = _replace_generated_block(
+                    stripped,
+                    start_marker,
+                    end_marker,
+                    f"{start_marker}\n{end_marker}",
+                )
+        if stripped != document:
+            path.write_text(stripped, encoding="utf-8")
+            changed_paths.append(path)
+    return changed_paths
+
+
+def _validate_generated_tables_are_not_committed(repo_root: Path) -> None:
+    populated_paths = []
+    for path in (repo_root / "docs").rglob("*.mdx"):
+        document = path.read_text(encoding="utf-8")
+        for start_marker, end_marker in GENERATED_MARKER_PAIRS:
+            start = document.find(start_marker)
+            end = document.find(end_marker)
+            if start != -1 and end != -1 and document[start + len(start_marker) : end].strip():
+                populated_paths.append(path.relative_to(repo_root))
+                break
+    if populated_paths:
+        paths = ", ".join(str(path) for path in populated_paths)
+        raise ValueError(f"Generated model-coverage tables must not be committed: {paths}")
 
 
 def _validate_dated_support_tables_are_generated(repo_root: Path) -> None:
@@ -599,10 +639,15 @@ def _sync_tables(repo_root: Path, *, check: bool) -> list[Path]:
 def main() -> None:
     """Generate model-coverage tables in the repository checkout."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--check", action="store_true", help="fail instead of writing when generated output is stale")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--check", action="store_true", help="fail instead of writing when generated output is stale")
+    mode.add_argument("--clean", action="store_true", help="remove generated tables while preserving their markers")
     args = parser.parse_args()
     repo_root = Path(__file__).resolve().parents[3]
-    _sync_tables(repo_root, check=args.check)
+    if args.clean:
+        _strip_generated_tables(repo_root)
+    else:
+        _sync_tables(repo_root, check=args.check)
 
 
 if __name__ == "__main__":

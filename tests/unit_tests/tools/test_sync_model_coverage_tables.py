@@ -38,8 +38,10 @@ from tests.ci_tests.utils.sync_model_coverage_tables import (
     _parse_registry_entries,
     _render_registry_table,
     _replace_generated_block,
+    _strip_generated_tables,
     _sync_tables,
     _validate_dated_support_tables_are_generated,
+    _validate_generated_tables_are_not_committed,
 )
 
 
@@ -250,8 +252,40 @@ def test_embedding_and_reranking_releases_are_discovered_from_recipes():
     }
 
     assert "meta-llama/Llama-3.2-1B" in models_by_type["Embedding"]
-    assert "mistralai/Ministral-3-3B-Instruct-2512" in models_by_type["Embedding"]
+    assert "mistralai/Ministral-3-3B-Instruct-2512-BF16" in models_by_type["Embedding"]
     assert models_by_type["Reranking"] == {"meta-llama/Llama-3.2-1B"}
+
+
+def test_generated_model_coverage_tables_are_not_committed():
+    _validate_generated_tables_are_not_committed(Path(__file__).parents[3])
+
+
+def test_strip_generated_tables_preserves_empty_markers(tmp_path):
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir()
+    generated_path = docs_dir / "generated.mdx"
+    generated_path.write_text(
+        f"before\n{SUPPORT_LOG_START_MARKER}\n| generated |\n{SUPPORT_LOG_END_MARKER}\nafter\n",
+        encoding="utf-8",
+    )
+
+    assert _strip_generated_tables(tmp_path) == [generated_path]
+    assert generated_path.read_text(encoding="utf-8") == (
+        f"before\n{SUPPORT_LOG_START_MARKER}\n{SUPPORT_LOG_END_MARKER}\nafter\n"
+    )
+    _validate_generated_tables_are_not_committed(tmp_path)
+
+
+def test_committed_generated_tables_are_rejected(tmp_path):
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir()
+    (docs_dir / "generated.mdx").write_text(
+        f"{SUPPORT_LOG_START_MARKER}\n| generated |\n{SUPPORT_LOG_END_MARKER}\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="Generated model-coverage tables must not be committed"):
+        _validate_generated_tables_are_not_committed(tmp_path)
 
 
 def test_model_coverage_pages_use_org_slugs_without_nesting_sidebar():
