@@ -101,13 +101,14 @@ def _make_moe_config():
     )
 
 
-def _make_tiny_moe_model(device="cpu"):
+def _make_tiny_moe_model(device="cpu", target_modules=None):
     """Build a 2-layer toy model with GroupedExperts + LoRA on experts."""
     moe_cfg = _make_moe_config()
 
     class TinyMoE(nn.Module):
         def __init__(self):
             super().__init__()
+            self.dense = nn.Linear(DIM, DIM, bias=False)
             self.layers = nn.ModuleList()
             for _ in range(N_LAYERS):
                 layer = nn.Module()
@@ -123,7 +124,7 @@ def _make_tiny_moe_model(device="cpu"):
     model = TinyMoE().to(device)
     model.state_dict_adapter = _Adapter()
     peft_config = PeftConfig(
-        target_modules=["*experts*"],
+        target_modules=["*experts*"] if target_modules is None else target_modules,
         dim=LORA_DIM,
         alpha=LORA_ALPHA,
     )
@@ -487,6 +488,13 @@ class TestExtractTargetsV5Defaults:
     def test_target_parameters_empty_without_a_moe_adapter(self):
         """A non-MoE model must not gain fused expert paths."""
         assert _extract_target_parameters(nn.Module()) == []
+
+    def test_target_parameters_empty_when_only_dense_lora_is_injected(self):
+        """A v5-capable model must not advertise expert paths for dense-only LoRA."""
+        model = _make_tiny_moe_model(target_modules=["dense"])
+
+        assert _extract_target_parameters(model) == []
+        assert _extract_target_modules(model) == ["dense"]
 
     def test_accepts_a_list_of_pp_parts(self):
         """Under PP the caller passes this rank's stages; the first is representative."""
