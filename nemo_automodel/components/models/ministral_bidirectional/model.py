@@ -106,6 +106,7 @@ class Ministral3BidirectionalModel(Ministral3Model):
             config=self.config,
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
+            past_key_values=past_key_values,
         )
 
         hidden_states = inputs_embeds
@@ -272,10 +273,6 @@ class Mistral3BidirectionalModel(Mistral3Model):
             return_dict=return_dict,
             **kwargs,
         )
-
-    def build_collator(self, processor=None, **kwargs):
-        """Dummy method that matches the interface for evaluation, returning the processor argunment as the model collator for data loading."""
-        return processor
 
 
 # Export for ModelRegistry auto-discovery
