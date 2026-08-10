@@ -54,6 +54,7 @@ distributed:
   strategy: fsdp2
   dp_size: none
   tp_size: 4
+  tp_plan: llama_nemotron_super_tp_plan  # registered DeciLM/nemotron-nas TP plan; custom-code arch has no default plan
   cp_size: 1
   ep_size: 1
   pipeline:
