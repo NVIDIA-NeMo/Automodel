@@ -55,9 +55,6 @@ distributed:
     layers_per_stage: 2
   moe:
     reshard_after_forward: false
-    # fake_balanced_gate makes routing deterministic, so recompute it directly instead of
-    # keeping the router outside activation checkpointing through the saved-router path.
-    ignore_router_for_ac: false
     wrap_outer_model: false
 dist_env:
   backend: nccl
