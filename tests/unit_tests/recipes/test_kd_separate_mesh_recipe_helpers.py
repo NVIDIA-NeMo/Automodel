@@ -99,8 +99,10 @@ def test_kd_fused_loss_preserves_tensor_valued_hidden_states(monkeypatch, recipe
         del model, mesh, kwargs
         return SimpleNamespace(shard=lambda actual_batch: (nullcontext, actual_batch))
 
-    calculate_loss = Mock(return_value=torch.tensor(2.0))
+    grad_reduce_group = object()
+    calculate_loss = Mock(return_value=torch.tensor(2.0, requires_grad=True))
     monkeypatch.setattr(recipe_module, "ContextParallelSharder", no_op_sharder)
+    monkeypatch.setattr(recipe_module, "get_sync_ctx", lambda *args, **kwargs: nullcontext())
     monkeypatch.setattr(recipe_module, "calculate_loss", calculate_loss)
 
     student = _TensorHiddenStateStudent()
@@ -116,6 +118,7 @@ def test_kd_fused_loss_preserves_tensor_valued_hidden_states(monkeypatch, recipe
     recipe.kd_ratio = 0.5
     recipe._offload_teacher_model = False
     recipe.separate_meshes = False
+    recipe._get_dp_group = lambda include_cp=True: grad_reduce_group
     recipe._get_dp_group_size = lambda include_cp=True: 1
 
     batch = {
@@ -131,7 +134,7 @@ def test_kd_fused_loss_preserves_tensor_valued_hidden_states(monkeypatch, recipe
             loss_buffer=[],
             num_label_tokens=5,
             num_batches=1,
-            is_train=False,
+            is_train=True,
         )
     else:
         recipe._forward_backward_step(
@@ -139,13 +142,14 @@ def test_kd_fused_loss_preserves_tensor_valued_hidden_states(monkeypatch, recipe
             batch,
             num_label_tokens=5,
             num_batches=1,
-            is_train=False,
+            is_train=True,
         )
 
     received_hidden_states = calculate_loss.call_args.kwargs["hidden_states"]
     assert student.logits_to_keep is None
     assert received_hidden_states is student.hidden_states
     assert received_hidden_states.shape[:-1] == batch["labels"].shape
+    assert calculate_loss.call_args.kwargs["grad_reduce_group"] is grad_reduce_group
 
 
 @pytest.mark.parametrize("recipe_module,recipe_cls,parent_cls", _RECIPE_CASES)

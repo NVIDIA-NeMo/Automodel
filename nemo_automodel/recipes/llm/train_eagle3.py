@@ -1578,7 +1578,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             merged_dir = _export_merged_lora_draft(draft_model, path)
             logger.info("LoRA final checkpoint: merged consolidated draft exported to %s", merged_dir)
         self.checkpointer.save_optimizer(self.optimizer, draft_model, path, self.lr_scheduler)
-        self.checkpointer.save_on_dp_ranks(self.rng, "rng", path)
+        self.checkpointer.save_on_global_ranks(self.rng, "rng", path)
 
         # Rank-0 writes followed by collectives, so they go through the same guard:
         # a failure here must abort every rank rather than only this one.
@@ -1734,7 +1734,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         self.checkpointer.load_model(draft_model, os.path.join(ckpt_dir, "model"))
         self.checkpointer.load_optimizer(self.optimizer, draft_model, ckpt_dir, self.lr_scheduler)
         try:
-            self.checkpointer.load_on_dp_ranks(self.rng, "rng", ckpt_dir)
+            self.checkpointer.load_on_global_ranks(self.rng, "rng", ckpt_dir)
         except FileNotFoundError:
             logger.warning("RNG state not found in %s; continuing without restoring RNG.", ckpt_dir)
 

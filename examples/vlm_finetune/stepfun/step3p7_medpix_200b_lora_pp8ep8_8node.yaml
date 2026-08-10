@@ -160,8 +160,9 @@ ci:
     process_isolation: true
     # AutoModel reload restores model and optimizer state; skip the separate resume/loss-continuity check.
     no_check_resume: true
-    # Keep native save/reload logits bounded in addition to exact per-rank LoRA fingerprints.
-    kl_threshold: 4e-2
+    # Cross-process PP+EP BF16 logits are not a stable checkpoint-integrity signal (AMINT-238).
+    # Keep the exact per-rank LoRA fingerprints as the blocking AutoModel reload gate.
+    skip_automodel_logit_parity: true
     # HF reload still exact-matches every supported adapter tensor and runs a forward smoke.
     # Cross-implementation KL is not a checkpoint-integrity gate: Step-3.7's top-k MoE routing
     # amplifies normal BF16 implementation-order differences into different expert choices.

@@ -375,6 +375,10 @@ class RecipeConfig:
         from nemo_automodel.components.datasets.vlm.neat_packing_vlm import NeatPackConfig
 
         target, dataset_kwargs = _callable_and_kwargs(dataset_node)
+        # `tokenizer`/`processor` are runtime build args, not declarative dataset fields.
+        # Drop them here as the LLM path (`_resolve_dataloader`) does, so a `dataset.tokenizer`
+        # block (valid on the LLM path) does not reach the dataset config, which rejects unknown fields.
+        dataset_kwargs.pop("tokenizer", None)
         chat_template = dataset_kwargs.pop("chat_template", None)
         legacy_packing = dataset_kwargs.pop("packing", None)
         dataset_pretokenize = dataset_kwargs.pop("pretokenize", None)
