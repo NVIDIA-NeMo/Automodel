@@ -121,17 +121,30 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
         """NemotronV3 uses 'mixer.experts' instead of 'mlp.experts'."""
         return "mixer.experts"
 
+    @property
+    def _v5_peft_target_parameters(self) -> tuple[str, ...]:
+        """Nemotron V3 exposes fused non-gated expert parameters in Transformers v5."""
+        return ("mixer.experts.up_proj", "mixer.experts.down_proj")
+
     @staticmethod
     def _native_key_to_hf(key: str) -> str:
         """Normalize a native Nemotron V3 key to its public HF namespace."""
         key = _strip_mamba_fp32_holder_key(key)
-        if key.startswith("model."):
-            key = "backbone." + key[len("model.") :]
-        if key == "backbone.norm.weight":
-            key = "backbone.norm_f.weight"
-        if key == "backbone.embed_tokens.weight":
-            key = "backbone.embeddings.weight"
+        key = re.sub(r"^model\.", "backbone.", key)
+        key = re.sub(r"^backbone\.norm\.weight$", "backbone.norm_f.weight", key)
+        key = re.sub(r"^backbone\.embed_tokens\.weight$", "backbone.embeddings.weight", key)
         return key
+
+    @staticmethod
+    def _hf_key_to_native(key: str) -> str:
+        """Normalize a public HF Nemotron V3 key to its native namespace."""
+        key = re.sub(r"^((?:base_model\.model\.)?backbone)\.norm_f\.weight$", r"\1.norm.weight", key)
+        key = re.sub(r"^((?:base_model\.model\.)?backbone)\.embeddings\.weight$", r"\1.embed_tokens.weight", key)
+        return re.sub(
+            r"^(?P<outer>base_model\.model\.)?backbone\.",
+            lambda match: f"{match.group('outer') or ''}model.",
+            key,
+        )
 
     def to_hf(self, state_dict: dict[str, Any], exclude_key_regex: Optional[str] = None, **kwargs) -> dict[str, Any]:
         """Convert from internal model state dict to HuggingFace format.
@@ -212,14 +225,7 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
         renamed_state_dict = {}
         for key in list(backbone_state_dict.keys()):
             value = backbone_state_dict.pop(key)
-            new_key = key
-            if new_key.startswith("backbone."):
-                new_key = "model." + new_key[len("backbone.") :]
-            if new_key == "model.norm_f.weight":
-                new_key = "model.norm.weight"
-            # HF uses 'embeddings' but internal uses 'embed_tokens'
-            if new_key == "model.embeddings.weight":
-                new_key = "model.embed_tokens.weight"
+            new_key = self._hf_key_to_native(key)
 
             new_key = _route_mamba_fp32_holder_key(new_key)
             renamed_state_dict[new_key] = _upcast_mamba_fp32_state_tensor(new_key, value)
@@ -242,9 +248,16 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
                 stripped[stripped_key] = _upcast_mamba_fp32_state_tensor(stripped_key, value)
             # reset_view_loaded_keys=False: this is the second merge of a single from_hf (after the
             # backbone merge above), so accumulate MTP view-loaded keys onto the backbone's record.
+            prior_view_keys = set(self.view_loaded_native_keys)
             merged_mtp = self._from_hf_w_merged_experts(stripped, device_mesh, reset_view_loaded_keys=False)
             for key, value in merged_mtp.items():
                 merged[f"mtp.{key}"] = value
+            # The merge loop records view-loaded keys in mtp.-stripped form (it only ever sees
+            # stripped keys); re-prefix them so the checkpoint loader's key-diff matches them
+            # against the model's real mtp.* parameter names instead of flagging them as
+            # missing/unexpected.
+            new_view_keys = self._view_loaded_native_keys - prior_view_keys
+            self._view_loaded_native_keys = prior_view_keys | {f"mtp.{key}" for key in new_view_keys}
 
         return merged
 
