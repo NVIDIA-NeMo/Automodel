@@ -145,7 +145,9 @@ def test_canonical_nested_config_and_model_resolve_without_remote_code(tmp_path)
     )
 
 
-def test_nemo_auto_model_builds_native_muse_glimmer_from_config():
+def test_nemo_auto_model_builds_native_muse_glimmer_from_config(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: torch.device("cpu"))
+
     model = NeMoAutoModelForCausalLM.from_config(
         _tiny_config(),
         backend={"attn": "sdpa"},
@@ -156,7 +158,9 @@ def test_nemo_auto_model_builds_native_muse_glimmer_from_config():
     assert model.backend.attn == "sdpa"
 
 
-def test_nemo_vlm_auto_model_builds_canonical_muse_glimmer_from_config():
+def test_nemo_vlm_auto_model_builds_canonical_muse_glimmer_from_config(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: torch.device("cpu"))
+
     config = MuseGlimmerConfig(
         text_config={
             "hidden_size": 32,
