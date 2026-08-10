@@ -291,6 +291,7 @@ class VlmDataloaderConfig:
                     packed_sequence_thd_vlm_collater,
                     padding_idx=padding_idx,
                     max_length=self.packing.collate_max_length,
+                    cp_size=cp_size,
                 )
             else:
                 materialize_4d_mask = cp_size <= 1

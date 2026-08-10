@@ -17,6 +17,7 @@ import torch.nn.functional as F
 
 from nemo_automodel.components.loss.linear_ce import (
     HAVE_CUT_CROSS_ENTROPY,
+    CheckpointedLinearCrossEntropy,
     FusedLinearCrossEntropy,
 )
 
@@ -250,3 +251,35 @@ def test_fused_cross_entropy_normalizes_by_num_tokens(monkeypatch):
     # The stub returns 20, so after division by 10 we expect 2.0
     assert torch.is_tensor(out)
     assert out.item() == pytest.approx(2.0)
+
+
+def test_checkpointed_linear_cross_entropy_matches_reference_and_gradients():
+    """The dependency-free long-context loss matches native linear + soft-cap CE."""
+    torch.manual_seed(17)
+    hidden = torch.randn(2, 7, 11, requires_grad=True)
+    weight = torch.randn(19, 11, requires_grad=True)
+    labels = torch.randint(0, 19, (2, 7))
+    labels[0, 3] = -100
+    ref_hidden = hidden.detach().clone().requires_grad_()
+    ref_weight = weight.detach().clone().requires_grad_()
+    soft_cap = 3.0
+
+    actual = CheckpointedLinearCrossEntropy(
+        chunk_size=4,
+        logit_softcapping=soft_cap,
+    )(hidden, labels, weight, num_label_tokens=13)
+    ref_logits = F.linear(ref_hidden, ref_weight).float()
+    ref_logits = soft_cap * torch.tanh(ref_logits / soft_cap)
+    expected = F.cross_entropy(ref_logits.view(-1, 19), labels.view(-1), reduction="sum") / 13
+
+    torch.testing.assert_close(actual, expected)
+    actual.backward()
+    expected.backward()
+    torch.testing.assert_close(hidden.grad, ref_hidden.grad)
+    torch.testing.assert_close(weight.grad, ref_weight.grad)
+
+
+@pytest.mark.parametrize("chunk_size", [0, -1])
+def test_checkpointed_linear_cross_entropy_rejects_invalid_chunk_size(chunk_size):
+    with pytest.raises(ValueError, match="chunk_size must be greater than zero"):
+        CheckpointedLinearCrossEntropy(chunk_size=chunk_size)

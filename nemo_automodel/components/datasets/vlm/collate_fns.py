@@ -1256,15 +1256,26 @@ def default_collate_fn(
     max_length: Optional[int] = None,
     drop_overlong: bool = False,
     _post_tokenize_hook=None,
-) -> Dict[str, torch.Tensor]:
+) -> dict[str, Any]:
     """Default collate function for multimodal VLM datasets.
 
     Args:
+        examples: Conversation samples to collate.
+        processor: Multimodal processor used to apply the chat template.
+        max_length: Optional maximum token sequence length.
+        drop_overlong: Whether to remove samples estimated to exceed ``max_length``.
         _post_tokenize_hook: Optional callable ``(batch, processor) -> batch``
             invoked right after ``apply_chat_template`` and before
             ``build_labels``.  Used by model-specific collate wrappers
             (e.g. Gemma4 thinking-channel injection) to transform the
             tokenized batch and the prefix tokens without duplicating the rest of the pipeline.
+
+    Returns:
+        Batch mapping containing ``input_ids``, ``attention_mask``, and ``labels``
+        tensors of shape [batch, sequence]. Processor-specific media values are
+        either tensors with processor-defined shape and arbitrary rank or lists
+        whose tensor elements preserve their processor-defined shapes; image lists
+        commonly contain tensors of shape [channels, height, width].
     """
     conversations = _ensure_rgb([example["conversation"] for example in examples])
 
@@ -1303,9 +1314,21 @@ def default_collate_fn(
 
     # Convert pixel values to bfloat16 (images and/or videos)
     if "pixel_values" in batch:
-        batch["pixel_values"] = batch["pixel_values"].to(torch.bfloat16)
+        pixel_values = batch["pixel_values"]
+        if isinstance(pixel_values, torch.Tensor):
+            batch["pixel_values"] = pixel_values.to(torch.bfloat16)
+        elif isinstance(pixel_values, list):
+            batch["pixel_values"] = [
+                value.to(torch.bfloat16) if isinstance(value, torch.Tensor) else value for value in pixel_values
+            ]
     if "pixel_values_videos" in batch:
-        batch["pixel_values_videos"] = batch["pixel_values_videos"].to(torch.bfloat16)
+        pixel_values_videos = batch["pixel_values_videos"]
+        if isinstance(pixel_values_videos, torch.Tensor):
+            batch["pixel_values_videos"] = pixel_values_videos.to(torch.bfloat16)
+        elif isinstance(pixel_values_videos, list):
+            batch["pixel_values_videos"] = [
+                value.to(torch.bfloat16) if isinstance(value, torch.Tensor) else value for value in pixel_values_videos
+            ]
 
     labels = build_labels_from_template(
         batch["input_ids"],
@@ -1334,9 +1357,27 @@ def default_collate_fn(
 
     pixel_values = batch.get("pixel_values")
     image_token_id = getattr(processor, "image_token_id", None)
-    if image_token_id is not None and pixel_values is not None and pixel_values.dim() == 5:
+    if image_token_id is not None and isinstance(pixel_values, torch.Tensor) and pixel_values.dim() == 5:
         batch["num_patches"] = (batch["input_ids"] == image_token_id).sum(dim=-1)
     return batch
+
+
+def _merge_media_values(values: list[Any]) -> torch.Tensor | list[Any]:
+    """Merge fixed-shape patch tensors or preserve variable-resolution media lists."""
+    if not values:
+        raise ValueError("Media merge requires at least one value.")
+    if all(isinstance(value, torch.Tensor) for value in values):
+        return torch.cat(values, dim=0).to(torch.bfloat16)
+    if all(isinstance(value, (list, tuple)) for value in values):
+        return [
+            item.to(torch.bfloat16) if isinstance(item, torch.Tensor) else item
+            for value in values
+            for item in value
+        ]
+    raise TypeError(
+        "VLM media values must be consistently tensors or variable-resolution lists, "
+        f"got {[type(value).__name__ for value in values]}."
+    )
 
 
 def pad_collate_fn(
@@ -1426,7 +1467,7 @@ def pad_collate_fn(
     for key in ("pixel_values", "pixel_values_videos"):
         tensors = [ex[key] for ex in examples if key in ex and ex[key] is not None]
         if tensors:
-            batch[key] = torch.cat(tensors, dim=0).to(torch.bfloat16)
+            batch[key] = _merge_media_values(tensors)
 
     # Per-sample image counts from image_grid_thw shapes (before concat)
     image_grid_per_sample = [
@@ -1582,7 +1623,7 @@ def neat_packed_vlm_collater(
     for key in ("pixel_values", "pixel_values_videos"):
         tensors = [x[key] for x in batch if key in x and x[key] is not None]
         if tensors:
-            result[key] = torch.cat(tensors, dim=0).to(torch.bfloat16)
+            result[key] = _merge_media_values(tensors)
 
     for key in ("image_grid_thw", "image_position_ids", "video_grid_thw", "second_per_grid_ts"):
         tensors = [x[key] for x in batch if key in x and x[key] is not None]
@@ -1605,6 +1646,7 @@ def packed_sequence_thd_vlm_collater(
     padding_idx: int = 0,
     max_length: int | None = None,
     seq_lens_padding_value: int = -1000,
+    cp_size: int = 1,
 ) -> dict:
     """Collater for neat-packed VLM sequences in THD (Transformer Engine) format.
 
@@ -1614,8 +1656,11 @@ def packed_sequence_thd_vlm_collater(
     length and stacks them to ``[batch, seq]``; derives per-document real lengths
     (``seq_lens``) from the indexed ``attention_mask`` (values 1, 2, ... per
     sub-sequence, 0 = padding) and folds each sample's trailing pad into its last
-    document for ``seq_lens_padded``; keeps the mRoPE ``[3, seq]`` layout as
-    ``[3, batch, seq]``; concatenates media tensors; and emits ``qkv_format='thd'``.
+    document for ``seq_lens_padded``. With context parallelism, it first inserts
+    padding after every document so each padded document length is divisible by
+    ``2 * cp_size``, as required by TE's THD p2p partitioner. It keeps the mRoPE
+    ``[3, seq]`` layout as ``[3, batch, seq]`` for the non-CP path, concatenates
+    media tensors, and emits ``qkv_format='thd'``.
 
     Args:
         batch: List of packed sample dicts. Each holds ``input_ids``/``labels``/
@@ -1628,6 +1673,9 @@ def packed_sequence_thd_vlm_collater(
             longest pack in the batch.
         seq_lens_padding_value: Sentinel to right-pad ragged ``seq_lens`` rows
             (default -1000); filtered downstream in ``process_input_for_thd``.
+        cp_size: Runtime context-parallel size. Values greater than one insert
+            per-document padding to a ``2 * cp_size`` boundary. Multi-axis
+            mRoPE remains unsupported with THD context parallelism.
 
     Returns:
         Dict with ``input_ids``/``labels`` ``[batch, seq]``, ``position_ids``
@@ -1641,10 +1689,96 @@ def packed_sequence_thd_vlm_collater(
 
     LABEL_PAD = -100
 
+    if cp_size < 1:
+        raise ValueError(f"cp_size must be at least 1, got {cp_size}.")
+
+    def _document_lengths(item: dict) -> list[int]:
+        attention_mask = torch.as_tensor(item["attention_mask"]).to(torch.long)
+        if attention_mask.ndim != 1:
+            raise ValueError(
+                "Packed VLM THD attention_mask must be one-dimensional, "
+                f"got shape {tuple(attention_mask.shape)}."
+            )
+        if attention_mask.numel() == 0:
+            return [0]
+        document_ids = torch.unique_consecutive(attention_mask)
+        expected = torch.arange(1, document_ids.numel() + 1, dtype=document_ids.dtype)
+        if not torch.equal(document_ids.cpu(), expected):
+            raise ValueError(
+                "Packed VLM THD attention_mask must contain contiguous document IDs "
+                f"1..N, got {document_ids.tolist()}."
+            )
+        return [(attention_mask == document_id).sum().item() for document_id in document_ids]
+
+    def _pad_documents_for_cp(item: dict, document_lengths: list[int]) -> tuple[dict, list[int]]:
+        if cp_size == 1:
+            return item, list(document_lengths)
+
+        position_ids = torch.as_tensor(item["position_ids"])
+        if position_ids.ndim != 1:
+            raise NotImplementedError(
+                "Context-parallel THD packing for multi-axis mRoPE VLMs is not yet implemented; "
+                "use one-dimensional position_ids or cp_size=1."
+            )
+
+        input_ids = torch.as_tensor(item["input_ids"])
+        labels = torch.as_tensor(item["labels"])
+        real_tokens = sum(document_lengths)
+        if input_ids.numel() != real_tokens or labels.numel() != real_tokens or position_ids.numel() != real_tokens:
+            raise ValueError(
+                "Packed VLM THD token-aligned fields must match the document layout: "
+                f"documents={real_tokens}, input_ids={input_ids.numel()}, labels={labels.numel()}, "
+                f"position_ids={position_ids.numel()}."
+            )
+
+        divisor = 2 * cp_size
+        padded_lengths = [((length + divisor - 1) // divisor) * divisor for length in document_lengths]
+        padded_input_ids = []
+        padded_labels = []
+        padded_position_ids = []
+        offset = 0
+        for real_length, padded_length in zip(document_lengths, padded_lengths):
+            end = offset + real_length
+            pad = padded_length - real_length
+            padded_input_ids.append(torch.nn.functional.pad(input_ids[offset:end], (0, pad), value=padding_idx))
+            padded_labels.append(torch.nn.functional.pad(labels[offset:end], (0, pad), value=LABEL_PAD))
+            padded_position_ids.append(torch.nn.functional.pad(position_ids[offset:end], (0, pad), value=0))
+            offset = end
+
+        padded_item = dict(item)
+        padded_item["input_ids"] = torch.cat(padded_input_ids)
+        padded_item["labels"] = torch.cat(padded_labels)
+        padded_item["position_ids"] = torch.cat(padded_position_ids)
+        return padded_item, padded_lengths
+
+    seq_lens_list = [_document_lengths(item) for item in batch]
+    padded_items_and_lengths = [
+        _pad_documents_for_cp(item, document_lengths)
+        for item, document_lengths in zip(batch, seq_lens_list)
+    ]
+    batch = [item for item, _ in padded_items_and_lengths]
+    seq_lens_padded_list = [lengths for _, lengths in padded_items_and_lengths]
+
     batch_max = max(
         x["input_ids"].shape[-1] if isinstance(x["input_ids"], torch.Tensor) else len(x["input_ids"]) for x in batch
     )
-    max_len = max_length if max_length is not None else batch_max
+    if max_length is not None:
+        max_len = max_length
+    elif cp_size > 1:
+        divisor = 2 * cp_size
+        max_len = ((batch_max + divisor - 1) // divisor) * divisor
+    else:
+        max_len = batch_max
+    if cp_size > 1 and max_len % (2 * cp_size) != 0:
+        raise ValueError(
+            "Packed VLM THD max_length must be divisible by 2 * cp_size, "
+            f"got max_length={max_len}, cp_size={cp_size}."
+        )
+    if batch_max > max_len:
+        raise ValueError(
+            "Packed VLM THD CP padding exceeds max_length: "
+            f"requires {batch_max} tokens, max_length={max_len}. Reduce pack_size or increase collate_max_length."
+        )
 
     def _pad_seq(tensor, pad_value, target_len, seq_dim=-1):
         """Pad ``tensor`` along ``seq_dim`` to ``target_len`` with ``pad_value``."""
@@ -1659,18 +1793,8 @@ def packed_sequence_thd_vlm_collater(
     input_ids = torch.stack([_pad_seq(x["input_ids"], padding_idx, max_len) for x in batch])
     labels = torch.stack([_pad_seq(x["labels"], LABEL_PAD, max_len) for x in batch])
 
-    seq_lens_list: list[list[int]] = []
-    seq_lens_padded_list: list[list[int]] = []
-    for x in batch:
-        am = torch.as_tensor(x["attention_mask"]).to(torch.long)
-        real_len = int(am.shape[0])
-        doc_lens = torch.bincount(am)[1:].tolist()
-        if not doc_lens:
-            doc_lens = [real_len]
-        padded = list(doc_lens)
-        padded[-1] += max_len - real_len
-        seq_lens_list.append(doc_lens)
-        seq_lens_padded_list.append(padded)
+    for item, padded_lengths in zip(batch, seq_lens_padded_list):
+        padded_lengths[-1] += max_len - int(item["input_ids"].shape[-1])
 
     seq_lens = torch.LongTensor(pad_within_micro(seq_lens_list, seq_lens_padding_value))
     seq_lens_padded = torch.LongTensor(pad_within_micro(seq_lens_padded_list, seq_lens_padding_value))
@@ -1694,7 +1818,7 @@ def packed_sequence_thd_vlm_collater(
     for key in ("pixel_values", "pixel_values_videos"):
         tensors = [x[key] for x in batch if key in x and x[key] is not None]
         if tensors:
-            result[key] = torch.cat(tensors, dim=0).to(torch.bfloat16)
+            result[key] = _merge_media_values(tensors)
 
     for key in ("image_grid_thw", "image_position_ids", "video_grid_thw", "second_per_grid_ts"):
         tensors = [x[key] for x in batch if key in x and x[key] is not None]

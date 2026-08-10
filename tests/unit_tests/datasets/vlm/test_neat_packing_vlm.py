@@ -133,6 +133,25 @@ class TestBuildPackedVlmSample:
         assert result["n_images"] == 3
         assert result["n_videos"] == 0
 
+    def test_variable_resolution_media_lists_are_preserved(self):
+        samples = [
+            {
+                "input_ids": torch.tensor([1, 2]),
+                "labels": torch.tensor([10, 20]),
+                "pixel_values": [torch.randn(3, 8, 12)],
+            },
+            {
+                "input_ids": torch.tensor([3, 4]),
+                "labels": torch.tensor([30, 40]),
+                "pixel_values": [torch.randn(3, 16, 8)],
+            },
+        ]
+
+        result = _build_packed_vlm_sample(samples, pack_size=4, padding_idx=0)
+
+        assert isinstance(result["pixel_values"], list)
+        assert [tuple(value.shape) for value in result["pixel_values"]] == [(3, 8, 12), (3, 16, 8)]
+
     def test_mm_token_type_ids_propagated(self):
         samples = [
             {
