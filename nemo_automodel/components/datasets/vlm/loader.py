@@ -220,7 +220,12 @@ class VlmDataloaderConfig:
             if isinstance(self.dataset_config, RankedVlmDatasetConfig):
                 dataset = self.dataset_config.build(rank=dp_rank, world_size=dp_world_size)
             elif isinstance(self.dataset_config, TokenizerDatasetConfig):
-                dataset = self.dataset_config.build(tokenizer=processor)
+                # These configs are text datasets (e.g. ChatDataset) that consume a tokenizer,
+                # not the full processor: a ProcessorMixin does not proxy tokenizer attributes
+                # (eos_token_id, pad_token, ...) -- those live on processor.tokenizer. Forward the
+                # wrapped tokenizer so both a genuine processor and a bare tokenizer work.
+                source_tokenizer = processor.tokenizer if isinstance(processor, ProcessorMixin) else processor
+                dataset = self.dataset_config.build(tokenizer=source_tokenizer)
             else:
                 dataset = self.dataset_config.build()
         return dataset, processor

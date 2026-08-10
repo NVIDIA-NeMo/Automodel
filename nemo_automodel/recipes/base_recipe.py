@@ -50,6 +50,7 @@ from nemo_automodel.components.checkpoint.utils import (
 )
 from nemo_automodel.components.config.loader import ConfigNode, config_to_yaml_str
 from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
+from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.training.garbage_collection import GarbageCollection
 from nemo_automodel.components.training.rng import StatefulRNG
@@ -305,7 +306,9 @@ class BaseRecipe:
                 scheduler = getattr(self, key)
             elif is_tokenizer(getattr(self, key)):
                 tokenizer = getattr(self, key)
-            elif is_dataloader(getattr(self, key)) or isinstance(getattr(self, key), StatefulRNG):
+            elif isinstance(getattr(self, key), StatefulRNG):
+                self.checkpointer.save_on_global_ranks(getattr(self, key), key, path)
+            elif is_dataloader(getattr(self, key)):
                 self.checkpointer.save_on_dp_ranks(getattr(self, key), key, path)
             elif is_distributed_stateful(getattr(self, key)):
                 self.checkpointer.save_distributed_state(getattr(self, key), key, path)
@@ -432,7 +435,9 @@ class BaseRecipe:
                 optimizer = obj
             elif is_lr_scheduler(obj):
                 scheduler = obj
-            elif is_dataloader(obj) or isinstance(obj, StatefulRNG):
+            elif isinstance(obj, StatefulRNG):
+                self.checkpointer.load_on_global_ranks(obj, key, ckpt_dir)
+            elif is_dataloader(obj):
                 self.checkpointer.load_on_dp_ranks(obj, key, ckpt_dir)
             elif is_distributed_stateful(obj):
                 self.checkpointer.load_distributed_state(obj, key, ckpt_dir)
@@ -750,6 +755,22 @@ class BaseRecipe:
         if not device_mesh or device_mesh["cp"].size() == 1:
             return 1
         return device_mesh["cp"].size()
+
+    def _set_moe_aux_loss_backward_scale(self, *, num_batches: int, num_label_tokens: int) -> None:
+        """Set the per-microbatch MoE auxiliary-loss scale for one optimizer step.
+
+        The base scale averages accumulation microbatches and restores the CP
+        sum lost in the flattened DP-CP gradient average. PP additionally needs
+        to compensate for its post-backward token normalization.
+        """
+        num_model_microbatches = num_batches
+        if self.pp_enabled:
+            num_model_microbatches *= self.pp.pp_batch_size // self.pp.pp_microbatch_size
+
+        scale = self._get_cp_group_size() / num_model_microbatches
+        if self.pp_enabled and num_label_tokens > 0:
+            scale *= num_label_tokens / self._get_dp_group_size(include_cp=True)
+        MoEAuxLossAutoScaler.main_loss_backward_scale = torch.tensor(scale)
 
     def _get_dp_rank(self, include_cp: bool = False):
         device_mesh = getattr(self, "device_mesh", None)

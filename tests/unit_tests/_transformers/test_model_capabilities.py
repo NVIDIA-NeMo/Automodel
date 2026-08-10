@@ -136,6 +136,16 @@ def test_llama_declares_context_parallel_support():
     assert cls.ModelCapabilities().supports_cp is True
 
 
+def test_query_static_class_without_thd_defaults_to_false():
+    """Static capability declarations predating THD remain queryable."""
+    cls = ModelRegistry.get_model_cls_from_model_arch("LlamaForCausalLM")
+
+    caps = query_capabilities(cls)
+
+    assert type(caps) is ModelCapabilities
+    assert caps.supports_thd is False
+
+
 @pytest.mark.parametrize(
     "arch",
     [

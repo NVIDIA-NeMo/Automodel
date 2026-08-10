@@ -133,6 +133,8 @@ _BOOLEAN_OVERRIDES = [
     "tokenizer_name",
     "max_vram_gb",
     "max_cpu_gb",
+    "training_reproducibility_loss_threshold",
+    "resume_first_loss_threshold",
     "resume_loss_threshold",
     "source_load_cosine_threshold",
     "source_load_kl_threshold",

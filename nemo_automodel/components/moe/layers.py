@@ -255,6 +255,8 @@ class Gate(nn.Module):
         self.n_experts = config.n_routed_experts
         self.topk = config.n_activated_experts
         self.softmax_before_topk = config.softmax_before_topk
+        self.router_weights_fp32 = config.router_weights_fp32
+        self.router_weight_uses_score_correction_bias = config.router_weight_uses_score_correction_bias
         self.n_groups = config.n_expert_groups
         self.topk_groups = config.n_limited_groups
         self.score_func = config.score_func
@@ -483,6 +485,8 @@ class Gate(nn.Module):
             # Add correction bias to balance tokens across gates.
             if correction_bias is not None:
                 scores = scores + correction_bias
+                if self.router_weight_uses_score_correction_bias:
+                    original_scores = scores
 
             if self.n_groups > 1:
                 scores = scores.view(num_tokens, self.n_groups, -1)
@@ -544,7 +548,7 @@ class Gate(nn.Module):
         else:
             weights, indices, original_scores = self._route_scores(scores)
 
-        if self.gate_precision is not None:
+        if self.gate_precision is not None and not self.router_weights_fp32:
             weights = weights.to(dtype=original_dtype)
             original_scores = original_scores.to(dtype=original_dtype)
 
@@ -575,6 +579,8 @@ class Gate(nn.Module):
         if self._track_load_balance and aux_loss is not None:
             self._last_aux_loss = aux_loss.detach()
 
+        if self.router_weights_fp32:
+            return weights.float(), indices, aux_loss
         return weights.type_as(x), indices, aux_loss
 
     def update_bias(self) -> None:
