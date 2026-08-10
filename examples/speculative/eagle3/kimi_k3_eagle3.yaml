@@ -25,7 +25,7 @@ distributed:
   ep_size: 64
   activation_checkpointing: false
   moe:
-    reshard_after_forward: false
+    reshard_after_forward: true
     wrap_outer_model: false
 
 recipe_args:
