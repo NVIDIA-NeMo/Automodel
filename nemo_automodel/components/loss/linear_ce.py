@@ -68,9 +68,7 @@ from typing import Optional
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-import torch.nn.functional as F
 from packaging.version import Version
-from torch.utils.checkpoint import checkpoint
 
 from nemo_automodel.shared.import_utils import MISSING_CUT_CROSS_ENTROPY_MSG
 
@@ -81,7 +79,6 @@ try:
     HAVE_CUT_CROSS_ENTROPY = True
 except ImportError:  # pragma: no cover
     HAVE_CUT_CROSS_ENTROPY = False  # pragma: no cover
-    linear_cross_entropy = None  # type: ignore[assignment]  # pragma: no cover
 
 
 def _get_triton_version():
@@ -267,83 +264,3 @@ class FusedLinearCrossEntropy(nn.Module):
             assert self.reduction == "sum", "num_label_tokens is only supported when reduction is 'sum'"
             loss = loss / num_label_tokens
         return loss
-
-
-class CheckpointedLinearCrossEntropy(FusedLinearCrossEntropy):
-    """Memory-bounded linear projection plus cross entropy.
-
-    This is the dependency-free counterpart to :class:`FusedLinearCrossEntropy`
-    for very long sequences. It projects a bounded number of token positions at
-    a time and wraps each projection/CE chunk in non-reentrant activation
-    checkpointing. Consequently, the ``[chunk_size, vocab]`` logits are
-    recomputed one chunk at a time during backward instead of retaining a
-    ``[tokens, vocab]`` tensor.
-    """
-
-    def __init__(
-        self,
-        ignore_index: int = -100,
-        logit_softcapping: float = 0,
-        reduction: str = "sum",
-        chunk_size: int = 256,
-    ):
-        super().__init__(
-            ignore_index=ignore_index,
-            logit_softcapping=logit_softcapping,
-            reduction=reduction,
-        )
-        self.chunk_size = int(chunk_size)
-        if self.chunk_size <= 0:
-            raise ValueError(f"chunk_size must be greater than zero, got {self.chunk_size}.")
-        if self.reduction != "sum":
-            raise ValueError("CheckpointedLinearCrossEntropy currently supports only reduction='sum'.")
-
-    def _chunk_loss(
-        self,
-        hidden_states: torch.Tensor,
-        lm_weight: torch.Tensor,
-        labels: torch.Tensor,
-    ) -> torch.Tensor:
-        """Project and reduce one token chunk; checkpoint recomputes it in backward."""
-        logits = F.linear(hidden_states, lm_weight).float()
-        if self.logit_softcapping:
-            logits = self.logit_softcapping * torch.tanh(logits / self.logit_softcapping)
-        return F.cross_entropy(
-            logits,
-            labels,
-            ignore_index=self.ignore_index,
-            reduction="sum",
-        )
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        labels: torch.Tensor,
-        lm_weight: torch.Tensor,
-        num_label_tokens: Optional[int] = None,
-    ) -> torch.Tensor:
-        """Compute linear CE while bounding live logit memory to one chunk."""
-        hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
-        labels = labels.reshape(-1)
-        if hidden_states.shape[0] != labels.shape[0]:
-            raise ValueError(
-                "hidden_states and labels must contain the same number of token positions, "
-                f"got {hidden_states.shape[0]} and {labels.shape[0]}."
-            )
-
-        total = torch.zeros((), dtype=torch.float32, device=hidden_states.device)
-        for start in range(0, hidden_states.shape[0], self.chunk_size):
-            end = min(start + self.chunk_size, hidden_states.shape[0])
-            total = total + checkpoint(
-                self._chunk_loss,
-                hidden_states[start:end],
-                lm_weight,
-                labels[start:end],
-                use_reentrant=False,
-            )
-
-        if num_label_tokens is not None:
-            if num_label_tokens == 0:
-                return total * 0.0
-            total = total / num_label_tokens
-        return total
