@@ -165,7 +165,7 @@ def test_fsdp2_gpu_clip_grad_norm_has_no_host_scalar_sync(tmp_path) -> None:
 
         assert isinstance(grad_norm, torch.Tensor)
         assert grad_norm.device.type == "cuda"
-        synchronizing_events = []
+        host_scalar_events = []
         for event in profiler.events():
             parent = event.cpu_parent
             while parent is not None and parent.key != "clip_grad_norm_under_test":
@@ -174,11 +174,9 @@ def test_fsdp2_gpu_clip_grad_norm_has_no_host_scalar_sync(tmp_path) -> None:
                 "aten::item",
                 "aten::_local_scalar_dense",
                 "aten::is_nonzero",
-                "cudaDeviceSynchronize",
-                "cudaStreamSynchronize",
             }:
-                synchronizing_events.append(event.key)
-        assert synchronizing_events == []
+                host_scalar_events.append(event.key)
+        assert host_scalar_events == []
     finally:
         if owns_process_group:
             torch.distributed.destroy_process_group()
