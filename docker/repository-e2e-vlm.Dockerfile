@@ -1,4 +1,6 @@
-ARG BASE_IMAGE
+# CI overrides this with the exact primary-image digest. Keep a public,
+# functional default so direct builds and Dockerfile validation remain valid.
+ARG BASE_IMAGE=nvcr.io/nvidia/nemo-automodel:26.04
 FROM ${BASE_IMAGE}
 
 WORKDIR /opt/Automodel
