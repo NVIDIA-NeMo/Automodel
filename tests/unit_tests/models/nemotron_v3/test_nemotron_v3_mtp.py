@@ -242,6 +242,20 @@ def _make_model(backend, *, mtp_layers=0, mtp_pattern="", **cfg_overrides):
 
 
 class TestMTPDisabled:
+    def test_constructor_override_disables_native_mtp_config(self, backend):
+        """SpeechLM can skip a checkpoint-provided MTP head at load time."""
+        from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
+
+        config = MockNemotronV3Config(
+            num_nextn_predict_layers=1,
+            mtp_hybrid_override_pattern=None,
+            mtp_layers_block_type=["attention", "moe"],
+        )
+        model = NemotronHForCausalLM(config, backend=backend, num_nextn_predict_layers=0)
+
+        assert model.mtp is None
+        assert not model.mtp_config.enabled
+
     @pytest.mark.run_only_on("GPU")
     def test_no_mtp_when_config_omits_fields(self, backend):
         """When num_nextn_predict_layers is 0, self.mtp must be None and
