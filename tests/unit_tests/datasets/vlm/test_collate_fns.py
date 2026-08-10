@@ -3332,43 +3332,6 @@ def test_thd_vlm_collater_fixed_max_length_pads():
     assert out["seq_lens_padded"].tolist() == [[8]]
 
 
-def test_thd_vlm_collater_cp_pads_every_document():
-    from nemo_automodel.components.datasets.vlm.collate_fns import packed_sequence_thd_vlm_collater
-    from nemo_automodel.components.distributed.thd_utils import process_input_for_thd
-
-    sample = _thd_vlm_make_sample([3, 5])
-    sample["position_ids"] = torch.cat([torch.arange(3), torch.arange(5)])
-    out = packed_sequence_thd_vlm_collater([sample], padding_idx=0, max_length=24, cp_size=4)
-
-    assert tuple(out["input_ids"].shape) == (1, 24)
-    assert out["seq_lens"].tolist() == [[3, 5]]
-    assert out["seq_lens_padded"].tolist() == [[8, 16]]
-    assert out["input_ids"][0, :8].tolist() == [1, 2, 3, 0, 0, 0, 0, 0]
-    assert out["input_ids"][0, 8:16].tolist() == [4, 5, 6, 7, 8, 0, 0, 0]
-
-    thd_in = {k: out[k] for k in ("input_ids", "labels", "position_ids", "seq_lens", "seq_lens_padded")}
-    thd = process_input_for_thd(thd_in)
-    assert thd["cu_seqlens"].tolist() == [0, 3, 8]
-    assert thd["cu_seqlens_padded"].tolist() == [0, 8, 24]
-    assert int(thd["padding_mask"].sum().item()) == 16
-
-
-def test_thd_vlm_collater_cp_rejects_mrope():
-    from nemo_automodel.components.datasets.vlm.collate_fns import packed_sequence_thd_vlm_collater
-
-    with pytest.raises(NotImplementedError, match="multi-axis mRoPE"):
-        packed_sequence_thd_vlm_collater([_thd_vlm_make_sample([3])], max_length=8, cp_size=2)
-
-
-def test_thd_vlm_collater_cp_requires_divisible_max_length():
-    from nemo_automodel.components.datasets.vlm.collate_fns import packed_sequence_thd_vlm_collater
-
-    sample = _thd_vlm_make_sample([3])
-    sample["position_ids"] = torch.arange(3)
-    with pytest.raises(ValueError, match=r"divisible by 2 \* cp_size"):
-        packed_sequence_thd_vlm_collater([sample], max_length=10, cp_size=2)
-
-
 def test_thd_vlm_collater_empty_batch():
     from nemo_automodel.components.datasets.vlm.collate_fns import packed_sequence_thd_vlm_collater
 

@@ -859,20 +859,13 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 if k != "input_ids":
                     batch.pop(k, None)
         # THD packed VLM inputs (qkv_format='thd' from the packing collator) use TE
-        # sequence metadata even without context parallelism (#3052). Standard
-        # one-dimensional RoPE can follow the generic TE CP partition. Multi-axis
-        # mRoPE still needs axis-aware sharding before it can use this path.
+        # sequence metadata even without context parallelism (#3052); CP over THD for
+        # mRoPE VLMs is not implemented.
         _use_te_vlm = batch.get("qkv_format", None) == "thd"
-        position_ids = batch.get("position_ids")
-        if (
-            _use_te_vlm
-            and self.mesh_context.cp_size > 1
-            and isinstance(position_ids, torch.Tensor)
-            and position_ids.ndim == 3
-        ):
+        if _use_te_vlm and self.mesh_context.cp_size > 1:
             raise NotImplementedError(
-                "Context-parallel THD packing for multi-axis mRoPE VLMs is not yet implemented; "
-                "use one-dimensional position_ids or cp_size=1."
+                "THD packing (packing_format='thd') for VLM currently supports cp_size=1 only; "
+                "context-parallel THD for mRoPE VLMs is not yet implemented."
             )
         _padding_id = getattr(getattr(getattr(self, "processor", None), "tokenizer", None), "pad_token_id", 0) or 0
         cp_sharder = ContextParallelSharder(
