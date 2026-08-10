@@ -130,7 +130,11 @@ def _clip_grad_norm_impl(
     for p in parameters:
         grad = p.grad
         if isinstance(grad, DTensor) and any(isinstance(placement, Partial) for placement in grad.placements):
-            target_placements = p.placements if isinstance(p, DTensor) else tuple(Replicate() for _ in grad.placements)
+            target_placements = (
+                tuple(Replicate() if isinstance(placement, Partial) else placement for placement in p.placements)
+                if isinstance(p, DTensor)
+                else tuple(Replicate() for _ in grad.placements)
+            )
             p.grad = grad.redistribute(placements=target_placements)
 
     # Group parameters by their gradient sharding pattern.  Parameter and

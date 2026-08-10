@@ -385,6 +385,8 @@ def test_all_reduce_scalar_moves_offloaded_scalar_to_mesh_device(monkeypatch):
     # The result returns to the gradients' device so the clip math stays consistent.
     assert out.device.type == "cpu"
     assert out.item() == 1.0
+
+
 def _run_partial_gradient_clip_worker(rank: int, world_size: int, init_file: str) -> None:
     """Verify a Partial gradient is synchronized before norm and clipping."""
     from torch.distributed.device_mesh import init_device_mesh
