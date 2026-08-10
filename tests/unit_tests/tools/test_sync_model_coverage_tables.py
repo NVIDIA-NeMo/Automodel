@@ -21,9 +21,8 @@ import pytest
 import yaml
 
 from tests.ci_tests.utils.sync_model_coverage_tables import (
+    DATED_MODEL_TABLE_HEADER,
     DATED_SUPPORT_TABLE_HEADER,
-    DIFFUSION_MODELS_END_MARKER,
-    DIFFUSION_MODELS_START_MARKER,
     HOMEPAGE_END_MARKER,
     HOMEPAGE_START_MARKER,
     MODEL_TYPE_OVERVIEW_PATHS,
@@ -32,14 +31,18 @@ from tests.ci_tests.utils.sync_model_coverage_tables import (
     SUPPORT_LOG_END_MARKER,
     SUPPORT_LOG_START_MARKER,
     TABLE_ROW_COUNT,
+    _generate_tables,
+    _load_model_doc_catalog,
     _load_model_docs,
     _load_model_releases,
     _parse_doc_arch_aliases,
     _parse_registry_entries,
     _render_registry_table,
     _replace_generated_block,
+    _strip_generated_tables,
     _sync_tables,
     _validate_dated_support_tables_are_generated,
+    _validate_generated_tables_are_not_committed,
 )
 
 
@@ -71,11 +74,8 @@ def _write_typed_overview_templates(repo_root: Path) -> list[Path]:
     for model_type, relative_path in MODEL_TYPE_OVERVIEW_PATHS:
         path = repo_root / "docs" / "model-coverage" / relative_path
         path.parent.mkdir(parents=True, exist_ok=True)
-        diffusion_models_block = ""
-        if model_type == "Diffusion":
-            diffusion_models_block = f"{DIFFUSION_MODELS_START_MARKER}\nstale\n{DIFFUSION_MODELS_END_MARKER}\n"
         path.write_text(
-            f"before\n{diffusion_models_block}{SUPPORT_LOG_START_MARKER}\nstale\n{SUPPORT_LOG_END_MARKER}\nafter\n",
+            f"before\n{SUPPORT_LOG_START_MARKER}\nstale\n{SUPPORT_LOG_END_MARKER}\nafter\n",
             encoding="utf-8",
         )
         paths.append(path)
@@ -250,8 +250,50 @@ def test_embedding_and_reranking_releases_are_discovered_from_recipes():
     }
 
     assert "meta-llama/Llama-3.2-1B" in models_by_type["Embedding"]
-    assert "mistralai/Ministral-3-3B-Instruct-2512" in models_by_type["Embedding"]
+    assert "mistralai/Ministral-3-3B-Instruct-2512-BF16" in models_by_type["Embedding"]
     assert models_by_type["Reranking"] == {"meta-llama/Llama-3.2-1B"}
+
+
+def test_generated_model_coverage_tables_are_not_committed():
+    _validate_generated_tables_are_not_committed(Path(__file__).parents[3])
+
+
+def test_model_type_overviews_use_one_dated_supported_models_table():
+    repo_root = Path(__file__).parents[3]
+    for _, relative_path in MODEL_TYPE_OVERVIEW_PATHS:
+        document = (repo_root / "docs" / "model-coverage" / relative_path).read_text(encoding="utf-8")
+        assert document.count("## Supported Models") == 1
+        assert "## Model Support Log" not in document
+        assert document.count(SUPPORT_LOG_START_MARKER) == 1
+        assert document.count(SUPPORT_LOG_END_MARKER) == 1
+
+
+def test_strip_generated_tables_preserves_empty_markers(tmp_path):
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir()
+    generated_path = docs_dir / "generated.mdx"
+    generated_path.write_text(
+        f"before\n{SUPPORT_LOG_START_MARKER}\n| generated |\n{SUPPORT_LOG_END_MARKER}\nafter\n",
+        encoding="utf-8",
+    )
+
+    assert _strip_generated_tables(tmp_path) == [generated_path]
+    assert generated_path.read_text(encoding="utf-8") == (
+        f"before\n{SUPPORT_LOG_START_MARKER}\n{SUPPORT_LOG_END_MARKER}\nafter\n"
+    )
+    _validate_generated_tables_are_not_committed(tmp_path)
+
+
+def test_committed_generated_tables_are_rejected(tmp_path):
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir()
+    (docs_dir / "generated.mdx").write_text(
+        f"{SUPPORT_LOG_START_MARKER}\n| generated |\n{SUPPORT_LOG_END_MARKER}\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="Generated model-coverage tables must not be committed"):
+        _validate_generated_tables_are_not_committed(tmp_path)
 
 
 def test_model_coverage_pages_use_org_slugs_without_nesting_sidebar():
@@ -373,27 +415,25 @@ def test_sync_tables_writes_support_log_homepage_and_registry(tmp_path):
     support_log = (tmp_path / "docs" / "model-coverage" / "latest-models.mdx").read_text(encoding="utf-8")
     assert (
         "| 2026-07-30 | VLM | "
-        "[Vlm-model](https://huggingface.co/org/vlm-model) "
-        "([model.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/model.yaml)) |"
+        "[Vlm-model](https://huggingface.co/org/vlm-model) | "
+        "[recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/model.yaml) |"
     ) in support_log
     for (model_type, _), typed_overview_path in zip(MODEL_TYPE_OVERVIEW_PATHS, typed_overview_paths):
         typed_overview = typed_overview_path.read_text(encoding="utf-8")
         typed_rows = [line for line in typed_overview.splitlines() if re.match(r"\| \d{4}-\d{2}-\d{2} \|", line)]
         assert len(typed_rows) == len([release for release in releases if release.model_type == model_type])
-        assert all(f"| {model_type} |" in row for row in typed_rows)
+        assert DATED_MODEL_TABLE_HEADER in typed_overview
+        assert all(f"| {model_type} |" not in row for row in typed_rows)
+        assert ".compact-model-tables .fern-table th:first-child" in typed_overview
+        assert ".compact-model-tables .fern-table th:nth-last-child(2)" in typed_overview
         assert "<Tabs>" not in typed_overview
-        if model_type == "Diffusion":
-            assert (
-                "| Test Owner | [Test Diffusion Model](/model-coverage/diffusion/test/model) | "
-                "Text-to-Image | DiT (Flow Matching) |"
-            ) in typed_overview
     homepage = (tmp_path / "docs" / "index.mdx").read_text(encoding="utf-8")
     for document in (support_log, homepage):
         assert document.count('<div className="compact-model-tables">') == 1
         assert document.count(".compact-model-tables .fern-table-root") == 1
         assert "width: 100% !important;" in document
         assert ".compact-model-tables .fern-table td:last-child" in document
-        assert document.count("|:-----|:-----|:-----|") == 1
+        assert document.count("|:-----|:-----|:-----|:-----|") == 1
         assert "<Tabs>" not in document
         assert "<Tab " not in document
         assert "Documentation only" not in document
@@ -450,6 +490,62 @@ def test_model_release_uses_first_recipe_addition_date(tmp_path):
     assert len(releases) == 1
     assert releases[0].release_date == "2026-07-29"
     assert releases[0].recipe == first_recipe_path
+
+
+def test_model_release_uses_model_introduction_date_when_recipe_changes(tmp_path):
+    subprocess.run(["git", "init", "-q", "-b", "main", str(tmp_path)], check=True)
+    recipe_path = tmp_path / "examples" / "llm_finetune" / "model.yaml"
+    recipe_path.parent.mkdir(parents=True)
+
+    def commit(model_id: str, message: str, timestamp: str) -> None:
+        recipe_path.write_text(f"model:\n  pretrained_model_name_or_path: {model_id}\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(tmp_path), "add", str(recipe_path.relative_to(tmp_path))], check=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(tmp_path),
+                "-c",
+                "user.name=Test User",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-q",
+                "-m",
+                message,
+                f"--date={timestamp}",
+            ],
+            check=True,
+            env={**os.environ, "GIT_COMMITTER_DATE": timestamp},
+        )
+
+    commit("org/old-model", "add recipe", "2026-07-29T12:00:00Z")
+    commit("org/current-model", "update checkpoint", "2026-08-07T12:00:00Z")
+
+    releases = _load_model_releases(tmp_path, {})
+
+    assert len(releases) == 1
+    assert releases[0].hf_model_id == "org/current-model"
+    assert releases[0].release_date == "2026-08-07"
+
+
+def test_typed_support_tables_include_every_documented_model_family():
+    repo_root = Path(__file__).parents[3]
+    _, _, documented_models = _load_model_doc_catalog(repo_root / "docs")
+    generated = _generate_tables(repo_root)
+    overview_paths = {
+        model_type: repo_root / "docs" / "model-coverage" / relative_path
+        for model_type, relative_path in MODEL_TYPE_OVERVIEW_PATHS
+    }
+    overview_paths["Encoder-Decoder"] = overview_paths["LLM"]
+
+    missing = [
+        (model.model_type, model.docs_page)
+        for model in documented_models
+        if model.docs_page not in generated[overview_paths[model.model_type]]
+    ]
+
+    assert not missing, f"Documented model families missing from generated support tables: {missing}"
 
 
 def test_model_release_ignores_tokenizer_and_teacher_checkpoints(tmp_path):
@@ -541,18 +637,19 @@ def test_sync_tables_check_rejects_stale_generated_support_log(tmp_path):
         _sync_tables(tmp_path, check=True)
 
 
-def test_dated_support_tables_must_be_generated(tmp_path):
+@pytest.mark.parametrize("table_header", [DATED_SUPPORT_TABLE_HEADER, DATED_MODEL_TABLE_HEADER])
+def test_dated_support_tables_must_be_generated(tmp_path, table_header):
     docs_dir = tmp_path / "docs" / "model-coverage"
     docs_dir.mkdir(parents=True)
     generated_path = docs_dir / "generated.mdx"
     generated_path.write_text(
-        f"{SUPPORT_LOG_START_MARKER}\n{DATED_SUPPORT_TABLE_HEADER}\n{SUPPORT_LOG_END_MARKER}\n",
+        f"{SUPPORT_LOG_START_MARKER}\n{table_header}\n{SUPPORT_LOG_END_MARKER}\n",
         encoding="utf-8",
     )
 
     _validate_dated_support_tables_are_generated(tmp_path)
 
     manual_path = docs_dir / "manual.mdx"
-    manual_path.write_text(f"{DATED_SUPPORT_TABLE_HEADER}\n", encoding="utf-8")
+    manual_path.write_text(f"{table_header}\n", encoding="utf-8")
     with pytest.raises(ValueError, match="manual.mdx"):
         _validate_dated_support_tables_are_generated(tmp_path)
