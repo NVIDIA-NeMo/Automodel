@@ -27,7 +27,7 @@ temperature: 0.02
 step_scheduler:
   global_batch_size: 128
   local_batch_size: 2
-  ckpt_every_steps: 500
+  ckpt_every_steps: 1000
   val_every_steps: 500
   num_epochs: 1
   log_remote_every_steps: 10

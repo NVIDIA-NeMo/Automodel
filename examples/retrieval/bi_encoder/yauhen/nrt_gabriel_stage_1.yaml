@@ -27,7 +27,7 @@ temperature: 0.02
 step_scheduler:
   global_batch_size: 128
   local_batch_size: 2
-  ckpt_every_steps: 500
+  ckpt_every_steps: 1000
   val_every_steps: 500
   num_epochs: 1
   log_remote_every_steps: 10
@@ -38,7 +38,7 @@ dist_env:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelBiEncoder.from_pretrained
-  pretrained_model_name_or_path: /lustre/fsw/portfolios/nemotron/projects/nemotron_retriever_dev/users/ybabakhin/model_checkpoints/Ministral-3-1B-Instruct-2512-BF16_llm_replaced_nemotron_3_embed_1B
+  pretrained_model_name_or_path: /lustre/fsw/portfolios/nemotron/projects/nemotron_retriever_dev/retriever_models_research/nemotron_4_embed_vl/pixtral_nemotron_3_embed_1B
   trust_remote_code: true
   pooling: avg
   l2_normalize: true
@@ -53,7 +53,7 @@ freeze_config:
 
 tokenizer:
   _target_: nemo_automodel.components.models.ministral_bidirectional.processor.Mistral3BiEncoderProcessor.from_pretrained
-  pretrained_model_name_or_path: /lustre/fsw/portfolios/nemotron/projects/nemotron_retriever_dev/users/ybabakhin/model_checkpoints/Ministral-3-1B-Instruct-2512-BF16_llm_replaced_nemotron_3_embed_1B
+  pretrained_model_name_or_path: /lustre/fsw/portfolios/nemotron/projects/nemotron_retriever_dev/retriever_models_research/nemotron_4_embed_vl/pixtral_nemotron_3_embed_1B
   q_max_length: 512
   p_max_length: 4096
   query_prefix: "query:"
