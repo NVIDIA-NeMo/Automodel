@@ -68,7 +68,7 @@ from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_mes
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.components.loss.mtp import calculate_mtp_loss
-from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
+from nemo_automodel.components.loss.utils import _get_lm_head_weight, calculate_loss
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
 from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
@@ -114,6 +114,15 @@ class _CpVisionFrameShardingCapability(Protocol):
         ...
 
 
+class _CpPackingCapability(Protocol):
+    """Model capability required by packed VLM context parallelism."""
+
+    @property
+    def supports_cp_with_sequence_packing(self) -> bool:
+        """Whether the model's active backend owns packed CP routing."""
+        ...
+
+
 def _validate_cp_vision_frame_sharding_support(
     model: _CpVisionFrameShardingCapability,
     config: CpVisionFrameShardingConfig,
@@ -129,6 +138,23 @@ def _validate_cp_vision_frame_sharding_support(
         "supports_cp_vision_frame_sharding=False. "
         "Disable the policy with distributed.multimodal.vision.frame_sharding.enabled=false "
         "or use a supported model."
+    )
+
+
+def _validate_cp_packing_support(
+    model: _CpPackingCapability,
+    *,
+    packing_enabled: bool,
+    cp_size: int,
+) -> None:
+    """Reject packed CP before dataloader construction when routing is unsupported."""
+    if cp_size <= 1 or not packing_enabled or model.supports_cp_with_sequence_packing:
+        return
+
+    raise ValueError(
+        f"Context parallelism (cp_size={cp_size}) with VLM sequence packing is not supported "
+        f"for {type(model).__name__} with its active attention backend. Disable sequence "
+        "packing, use cp_size=1, or select a model-supported packed-CP backend."
     )
 
 
@@ -363,53 +389,6 @@ def build_dataloader(
     return result.dataloader, result.processor
 
 
-def calculate_loss(loss_fn, **kwargs) -> torch.Tensor:
-    """Calculate the loss.
-
-    Args:
-        loss_fn: Loss function.
-        **kwargs: Keyword arguments for the loss function.
-
-    Returns:
-        The loss.
-    """
-    loss_fn_kwargs = {"num_label_tokens": kwargs.pop("num_label_tokens", None)}
-    if isinstance(loss_fn, FusedLinearCrossEntropy):
-        model = kwargs.pop("model")
-        labels = kwargs.pop("labels")
-
-        # find the lm_head in the model
-        lm_head = None
-        if hasattr(model, "get_output_embeddings"):
-            lm_head = model.get_output_embeddings().weight
-        else:
-            for n, p in model.named_parameters(remove_duplicate=False):
-                if "lm_head" in n and n.endswith(".weight"):
-                    lm_head = p
-                    break
-        if lm_head is None:
-            raise ValueError("lm_head.weight not found in model")
-
-        # unshard the possibly sharded lm_head
-        lm_head = lm_head.full_tensor() if hasattr(lm_head, "full_tensor") else lm_head
-        loss_fn_kwargs.update(
-            {
-                "hidden_states": kwargs.pop("hidden_states"),
-                "labels": labels,
-                "lm_weight": lm_head,
-            }
-        )
-    else:
-        loss_fn_kwargs.update(
-            {
-                "logits": kwargs.pop("logits"),
-                "labels": kwargs.pop("labels"),
-            }
-        )
-
-    return loss_fn(**loss_fn_kwargs)
-
-
 # ---------------------------------------------------------------------------
 #  Trainer class – orchestration only
 # ---------------------------------------------------------------------------
@@ -545,6 +524,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             pp_rank=self._get_pp_rank(),
             moe_mesh=self.moe_mesh,
             process_group=getattr(self.mesh_context, "process_group", None),
+            pp_group=self._get_pp_group(),
         )
 
         # Disable fused RoPE when context parallelism is enabled (cp > 1)
@@ -591,6 +571,11 @@ class FinetuneRecipeForVLM(BaseRecipe):
             self.cfg.prewarm.apply(
                 model_parts=self.model_parts,
                 device=self.dist_env.device,
+                batch_size=(
+                    self.pp.pp_microbatch_size
+                    if self.pp is not None
+                    else self.cfg.get("step_scheduler.local_batch_size", 1)
+                ),
                 pp_mesh=(self.device_mesh["pp"] if self.pp_enabled and self.device_mesh is not None else None),
             )
 
@@ -610,6 +595,11 @@ class FinetuneRecipeForVLM(BaseRecipe):
         dataloader_config = self.cfg.vlm_dataloader
         if dataloader_config is None:
             raise ValueError("VLM training requires a dataset config")
+        _validate_cp_packing_support(
+            self.model_parts[0],
+            packing_enabled=dataloader_config.packing is not None,
+            cp_size=self.mesh_context.cp_size,
+        )
         from nemo_automodel.components.models.common.packing import configure_packing, get_attn_implementation
 
         packing_attn_implementation = dataloader_config.resolve_packing_attn_implementation(
@@ -939,12 +929,23 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 else:
                     out = model(**batch)
 
+                grad_reduce_group = self._get_dp_group(include_cp=True) if is_train else None
+                shared_lm_weight = (
+                    self.loss_fn.materialize_lm_weight(
+                        _get_lm_head_weight(model),
+                        grad_reduce_group=grad_reduce_group,
+                    )
+                    if isinstance(self.loss_fn, FusedLinearCrossEntropy)
+                    else None
+                )
                 local_loss = calculate_loss(
                     self.loss_fn,
                     logits=getattr(out, "logits", out),
                     labels=labels,
                     model=model,
                     hidden_states=get_final_hidden_states(out),
+                    lm_weight=shared_lm_weight,
+                    grad_reduce_group=grad_reduce_group,
                     num_label_tokens=num_label_tokens,
                 )
                 # DSV4-style MTP loss (from main): triggers when the model emits
@@ -965,6 +966,8 @@ class FinetuneRecipeForVLM(BaseRecipe):
                         scaling_factor=scaling_factor,
                         num_label_tokens=num_label_tokens,
                         ignore_index=mtp_cfg.ignore_index,
+                        lm_weight=shared_lm_weight,
+                        grad_reduce_group=grad_reduce_group,
                     )
 
                 # Joint base + drafter co-training (Gemma4WithDrafter and
@@ -1001,7 +1004,11 @@ class FinetuneRecipeForVLM(BaseRecipe):
         if last_stage_model is None:
             raise RuntimeError("Pipeline reports a last stage, but no last-stage model part was found")
 
-        self.pp.info.schedule._loss_fn = self.cfg.mtp.build(self.loss_fn, last_stage_model)
+        self.pp.info.schedule._loss_fn = self.cfg.mtp.build(
+            self.loss_fn,
+            last_stage_model,
+            grad_reduce_group=self._get_dp_group(include_cp=True),
+        )
 
     def _run_train_optim_step(self, batches, max_grad_norm: Optional[float] = None):
         """Execute a single training step.
@@ -1015,25 +1022,8 @@ class FinetuneRecipeForVLM(BaseRecipe):
         )
         num_label_tokens = self._dp_allreduce(num_label_tokens).item()
 
-        # MoE aux loss gradients are injected via MoEAuxLossAutoScaler, which
-        # multiplies them by main_loss_backward_scale during backward.  This
-        # counteracts the unwanted scaling that FSDP and PP post-hoc rescaling
-        # apply to *all* gradients (including aux loss):
-        #
-        #   Non-PP: FSDP allreduce divides grads by dp_group_size.
-        #           Scale = dp_group_size  →  net = 1.
-        #
-        #   PP:     FSDP divides by dp_group_size, then
-        #           scale_grads_and_clip_grad_norm divides by
-        #           (num_label_tokens / dp_group_size).  The dp_group_size
-        #           factors cancel, leaving net 1/num_label_tokens.
-        #           Scale = num_label_tokens  →  net = 1.
-        if self.pp_enabled:
-            MoEAuxLossAutoScaler.main_loss_backward_scale = torch.tensor(float(num_label_tokens))
-        else:
-            MoEAuxLossAutoScaler.main_loss_backward_scale = torch.tensor(
-                float(self._get_dp_group_size(include_cp=True))
-            )
+        num_batches = len(batches)
+        self._set_moe_aux_loss_backward_scale(num_batches=num_batches, num_label_tokens=num_label_tokens)
 
         loss_buffer = []
 
@@ -1044,7 +1034,6 @@ class FinetuneRecipeForVLM(BaseRecipe):
         )
         num_tokens_in_batch = self._dp_allreduce(num_tokens_in_batch).item()
 
-        num_batches = len(batches)
         prepare_for_grad_accumulation(self.model_parts, pp_enabled=self.pp_enabled)
 
         for i, batch in enumerate(batches):

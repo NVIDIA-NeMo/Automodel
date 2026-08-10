@@ -16,6 +16,7 @@ import io
 import json
 import logging
 import os
+import pickle
 import random
 from contextlib import ExitStack
 from datetime import timedelta
@@ -47,6 +48,7 @@ from nemo_automodel.components.checkpoint.checkpointing import (
     SaveConsolidatedMode,
     _divide_keys_by_size,
     _ensure_dirs,
+    _ensure_shared_dirs,
     _equally_divide_layers,
     _is_custom_model,
     _load_hf_bin_checkpoint,
@@ -76,8 +78,8 @@ CLOUD_PATH_OPTIM = "msc://bucket/step-100/optim"
 LOCAL_PATH_MODEL = "/ckpts/step-100/model"
 
 
-def test_load_on_dp_ranks_requires_opt_in_for_legacy_rng_state(tmp_path):
-    """Legacy RNG checkpoints restore only with the trusted-pickle opt-in."""
+def test_load_on_global_ranks_falls_back_to_legacy_rng_state(tmp_path, caplog):
+    """Global-rank restore warns and requires the trusted-pickle opt-in for legacy RNG state."""
     init_all_rng(123)
     legacy_state = RNGState(
         random_rng_state=random.getstate(),
@@ -92,15 +94,20 @@ def test_load_on_dp_ranks_requires_opt_in_for_legacy_rng_state(tmp_path):
 
     rng = StatefulRNG(999)
     restricted = CheckpointingConfig(checkpoint_dir=tmp_path, save_consolidated=False).build(0, 0, 0)
-    with pytest.raises(RuntimeError, match="Refusing to load torch artifact"):
-        restricted.load_on_dp_ranks(rng, "rng", str(tmp_path))
+    with (
+        caplog.at_level(logging.WARNING),
+        pytest.raises(RuntimeError, match="Refusing to load torch artifact"),
+    ):
+        restricted.load_on_global_ranks(rng, "rng", str(tmp_path))
+
+    assert "Loading legacy per-DP rng state" in caplog.text
 
     legacy = CheckpointingConfig(
         checkpoint_dir=tmp_path,
         save_consolidated=False,
         allow_legacy_pickle_restore=True,
     ).build(0, 0, 0)
-    legacy.load_on_dp_ranks(rng, "rng", str(tmp_path))
+    legacy.load_on_global_ranks(rng, "rng", str(tmp_path))
 
     assert (random.random(), np.random.rand(), torch.rand(1).item()) == expected
 
@@ -877,6 +884,60 @@ def test_model_state_passes_cpu_offload_to_dcp(cpu_offload):
         assert options is None
 
 
+def test_peft_ep_model_load_checks_every_local_pipeline_part():
+    dense_part = torch.nn.Linear(2, 2)
+    expert_part = torch.nn.Module()
+    expert_part.ep_size = 8
+    model_state = ModelState([dense_part, expert_part], is_peft=True)
+
+    with (
+        patch("nemo_automodel.components.checkpoint.stateful_wrappers._set_peft_state_dict") as set_peft_state,
+        patch("nemo_automodel.components.checkpoint.stateful_wrappers.set_model_state_dict") as set_model_state,
+    ):
+        model_state.load_state_dict({})
+
+    assert set_peft_state.call_args_list == [call(dense_part, {}), call(expert_part, {})]
+    set_model_state.assert_not_called()
+
+
+def test_peft_ep_model_load_uses_global_topology_when_local_stage_has_no_experts():
+    model_part = torch.nn.Linear(2, 2)
+    model_state = ModelState(model_part, is_peft=True, has_expert_parallelism=True)
+
+    with (
+        patch("nemo_automodel.components.checkpoint.stateful_wrappers._set_peft_state_dict") as set_peft_state,
+        patch("nemo_automodel.components.checkpoint.stateful_wrappers.set_model_state_dict") as set_model_state,
+    ):
+        model_state.load_state_dict({})
+
+    set_peft_state.assert_called_once_with(model_part, {})
+    set_model_state.assert_not_called()
+
+
+def test_checkpointer_passes_ep_topology_to_model_state(tmp_path):
+    config = CheckpointingConfig(
+        checkpoint_dir=tmp_path,
+        model_save_format="safetensors",
+        save_consolidated=False,
+        is_peft=True,
+    )
+    with patch("torch.distributed.is_initialized", return_value=False):
+        checkpointer = Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=object())
+
+    model = torch.nn.Linear(2, 2)
+    with (
+        patch("os.path.exists", return_value=True),
+        patch(
+            "nemo_automodel.components.checkpoint.checkpointing.ModelState",
+            side_effect=RuntimeError("stop after constructor"),
+        ) as model_state,
+        pytest.raises(RuntimeError, match="stop after constructor"),
+    ):
+        checkpointer.load_model(model, model_path="/fake/path")
+
+    assert model_state.call_args.kwargs["has_expert_parallelism"] is True
+
+
 @pytest.mark.parametrize("cpu_offload", [False, True])
 def test_optimizer_state_passes_cpu_offload_to_dcp(cpu_offload):
     model = torch.nn.Linear(2, 2)
@@ -1258,6 +1319,103 @@ def test_load_model_uses_state_dict_adapter_from_ddp_module(tmp_path):
     checkpointer.load_model(ddp_model, model_path=str(model_path))
 
     torch.testing.assert_close(encoder.model.weight, checkpoint_weight)
+
+
+@pytest.mark.parametrize(("is_init_step", "expected_quantization"), [(True, True), (False, False)])
+def test_load_model_only_requests_quantized_adapter_keys_for_base_checkpoint(
+    tmp_path, is_init_step, expected_quantization
+):
+    """FP8 source metadata is requested for base initialization, not training resume."""
+    model = torch.nn.Linear(2, 2, bias=False)
+    adapter = MagicMock()
+    model_state_dict = model.state_dict()
+    adapter.to_hf.return_value = model_state_dict
+    adapter.from_hf.return_value = model_state_dict
+    model.state_dict_adapter = adapter
+
+    config = CheckpointingConfig(
+        checkpoint_dir=str(tmp_path),
+        model_cache_dir=str(tmp_path / "cache"),
+        model_repo_id="test/model",
+        save_consolidated=False,
+        dequantize_base_checkpoint=True,
+    )
+    with patch("torch.distributed.is_initialized", return_value=False):
+        checkpointer = Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0)
+
+    with (
+        patch("os.path.exists", return_value=True),
+        patch("nemo_automodel.components.checkpoint.checkpointing._is_safetensors_checkpoint", return_value=False),
+        patch("nemo_automodel.components.checkpoint.checkpointing._is_bin_checkpoint", return_value=False),
+        patch.object(checkpointer, "_get_storage_reader", return_value=None),
+        patch.object(checkpointer, "_do_load", return_value=model_state_dict),
+    ):
+        checkpointer.load_model(model, model_path=str(tmp_path / "model"), is_init_step=is_init_step)
+
+    assert adapter.to_hf.call_args.kwargs["quantization"] is expected_quantization
+
+
+def test_training_checkpoint_resume_ignores_base_fp8_metadata(tmp_path):
+    """A dequantized training checkpoint resumes without source-only FP8 scale keys."""
+
+    class QuantizedSourceAdapter:
+        def to_hf(self, state_dict: dict[str, torch.Tensor], **kwargs: object) -> dict[str, torch.Tensor]:
+            """Convert model state while optionally requesting source FP8 metadata.
+
+            Args:
+                state_dict: Mapping whose tensor values have arbitrary model-defined shapes.
+                **kwargs: Adapter options, including whether source quantization metadata is required.
+
+            Returns:
+                Mapping whose tensor values preserve the input tensors' model-defined shapes,
+                plus a scalar source-only activation scale when quantization is requested.
+            """
+            converted = dict(state_dict)
+            if kwargs.get("quantization", False):
+                converted["weight_activation_scale"] = torch.ones(())
+            return converted
+
+        def from_hf(
+            self,
+            state_dict: dict[str, torch.Tensor],
+            device_mesh: object | None = None,
+        ) -> dict[str, torch.Tensor]:
+            """Convert loaded state back to the native model mapping.
+
+            Args:
+                state_dict: Mapping whose tensor values have arbitrary model-defined shapes.
+                device_mesh: Optional mesh describing the tensors' distributed placements.
+
+            Returns:
+                Mapping whose tensor values preserve the input tensors' model-defined shapes.
+            """
+            return {key: value for key, value in state_dict.items() if key != "weight_activation_scale"}
+
+    model = torch.nn.Linear(2, 2, bias=False)
+    model.state_dict_adapter = QuantizedSourceAdapter()
+    expected_weight = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    with torch.no_grad():
+        model.weight.copy_(expected_weight)
+
+    config = CheckpointingConfig(
+        checkpoint_dir=str(tmp_path),
+        model_save_format="torch_save",
+        model_cache_dir=str(tmp_path / "cache"),
+        model_repo_id="test/model",
+        save_consolidated=False,
+        dequantize_base_checkpoint=True,
+    )
+    with patch("torch.distributed.is_initialized", return_value=False):
+        checkpointer = Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0)
+
+    checkpoint_path = tmp_path / "step_1"
+    checkpointer.save_model(model, str(checkpoint_path))
+    with torch.no_grad():
+        model.weight.zero_()
+
+    checkpointer.load_model(model, str(checkpoint_path / "model"))
+
+    torch.testing.assert_close(model.weight, expected_weight)
 
 
 # =============================================================================
@@ -1746,10 +1904,14 @@ class TestInitializeModelWeights:
             Checkpointer.initialize_model_weights(model, torch.device("cpu"))
             mock_logging.warning.assert_called_once()
 
-    def test_skips_for_nemotron_v2(self):
-        """NemotronHForCausalLM v2 (no n_routed_experts) should skip init."""
+    def test_skips_for_nemotron_v2_hf_remote_code(self):
+        """HF remote-code dense NemotronH (has .backbone, no n_routed_experts) skips init.
+
+        Its _init_weights uses DTensor-unsafe ops, so the loaded weights are left as-is.
+        """
         model = self._make_meta_model()
         model.config = SimpleNamespace(architectures=["NemotronHForCausalLM"])
+        model.backbone = torch.nn.Module()  # marks the HF remote-code path
         model._is_hf_initialized = True
         model.initialize_weights = MagicMock()
 
@@ -1757,6 +1919,20 @@ class TestInitializeModelWeights:
 
         model.initialize_weights.assert_not_called()
         assert model._is_hf_initialized is True
+
+    def test_does_not_skip_for_custom_dense_nemotron(self):
+        """Custom dense NemotronH (no .backbone, no n_routed_experts) runs its own init.
+
+        Regression guard for #2004: the custom dense path uses model.model with its own
+        initialize_weights, so unlike the HF remote-code path it must NOT be skipped.
+        """
+        model = self._make_meta_model()
+        model.config = SimpleNamespace(architectures=["NemotronHForCausalLM"])
+        model.initialize_weights = MagicMock()
+
+        Checkpointer.initialize_model_weights(model, torch.device("cpu"))
+
+        model.initialize_weights.assert_called_once()
 
     def test_does_not_skip_for_nemotron_v3_moe(self):
         """NemotronHForCausalLM v3 (with n_routed_experts) should NOT be skipped."""
@@ -2817,6 +2993,7 @@ def _make_ckptr(is_peft=False, is_async=False):
     ckptr._model_ctx = MagicMock(staging_active=False)
     ckptr._optim_ctx = MagicMock(staging_active=False)
     ckptr.process_group = None
+    ckptr._planner_cache_namespace = "test"
     return ckptr
 
 
@@ -2871,6 +3048,119 @@ class TestEnsureDirs:
         ):
             _ensure_dirs(str(tmp_path), process_group=group)
         barrier.assert_called_once_with(group=group)
+
+    def test_each_rank_creates_node_local_directories(self, tmp_path):
+        """Every rank creates directories that may live on node-local filesystems."""
+        group = object()
+        target = str(tmp_path / "new")
+        with (
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch("torch.distributed.get_rank", return_value=1),
+            patch("os.makedirs") as makedirs,
+            patch("torch.distributed.barrier") as barrier,
+        ):
+            _ensure_dirs(target, process_group=group)
+        makedirs.assert_called_once_with(target, exist_ok=True)
+        barrier.assert_called_once_with(group=group)
+
+    def test_only_group_rank_zero_creates_shared_directories(self, tmp_path):
+        """Nonzero group ranks avoid redundant metadata operations on shared filesystems."""
+        group = object()
+        target = str(tmp_path / "new")
+        with (
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch("torch.distributed.get_rank", return_value=1),
+            patch("os.makedirs") as makedirs,
+            patch("torch.distributed.barrier") as barrier,
+        ):
+            _ensure_shared_dirs(target, process_group=group)
+        makedirs.assert_not_called()
+        barrier.assert_called_once_with(group=group)
+
+
+def test_save_on_dp_ranks_creates_node_local_directory_on_each_writer_rank():
+    """A nonzero DP writer rank must create its local directory before writing dataloader state."""
+    checkpointer = Checkpointer.__new__(Checkpointer)
+    checkpointer.process_group = object()
+    checkpointer.tp_rank = 0
+    checkpointer.pp_rank = 0
+    checkpointer.dp_rank = 1
+    state = SimpleNamespace(state_dict=lambda: {"state": torch.ones(1)})
+
+    with (
+        patch("torch.distributed.is_initialized", return_value=True),
+        patch("os.makedirs") as makedirs,
+        patch("torch.distributed.barrier") as barrier,
+        patch("torch.save") as save,
+    ):
+        checkpointer.save_on_dp_ranks(state, "dataloader", "/tmp/checkpoint")
+
+    makedirs.assert_called_once_with("/tmp/checkpoint/dataloader", exist_ok=True)
+    barrier.assert_called_once_with(group=checkpointer.process_group)
+    save.assert_called_once_with({"state": torch.ones(1)}, "/tmp/checkpoint/dataloader/dataloader_dp_rank_1.pt")
+
+
+def test_save_on_global_ranks_writes_one_file_per_process_rank():
+    """Rank-local state uses the global process rank even when DP rank is shared."""
+    checkpointer = Checkpointer.__new__(Checkpointer)
+    checkpointer.process_group = object()
+    checkpointer.dp_rank = 0
+    state = SimpleNamespace(state_dict=lambda: {"state": torch.ones(1)})
+
+    with (
+        patch("torch.distributed.is_initialized", return_value=True),
+        patch("torch.distributed.get_rank", return_value=3),
+        patch("os.makedirs") as makedirs,
+        patch("torch.distributed.barrier") as barrier,
+        patch("torch.save") as save,
+    ):
+        checkpointer.save_on_global_ranks(state, "rng", "/tmp/checkpoint")
+
+    makedirs.assert_called_once_with("/tmp/checkpoint/rng", exist_ok=True)
+    barrier.assert_called_once_with(group=checkpointer.process_group)
+    save.assert_called_once_with({"state": torch.ones(1)}, "/tmp/checkpoint/rng/rng_global_rank_3.pt")
+
+
+def test_model_and_optimizer_saves_use_separate_plan_caches():
+    """Alternating model and optimizer saves must not evict each other's cached DCP plans."""
+    ckptr = _make_ckptr(is_peft=False, is_async=False)
+    with patch("nemo_automodel.components.checkpoint.checkpointing.dcp.save") as save:
+        Checkpointer._do_save(ckptr, {"weight": torch.ones(1)}, "/opt/models/qwen/step_100/model")
+        Checkpointer._do_save(ckptr, {"state": torch.ones(1)}, "/opt/models/qwen/step_100/optim")
+        Checkpointer._do_save(ckptr, {"weight": torch.ones(1)}, "/opt/models/qwen/step_200/model")
+
+    model_planner = save.call_args_list[0].kwargs["planner"]
+    optimizer_planner = save.call_args_list[1].kwargs["planner"]
+    next_model_planner = save.call_args_list[2].kwargs["planner"]
+    assert type(model_planner) is not type(optimizer_planner)
+    assert model_planner._cached_plans_key != optimizer_planner._cached_plans_key
+    assert model_planner._cached_plans_key == next_model_planner._cached_plans_key
+    assert model_planner._cached_plans_key.encode() in pickle.dumps(model_planner)
+
+
+def test_cross_checkpointer_torch_plan_is_not_reused_for_safetensors(tmp_path):
+    """A torch-save plan from one checkpointer must not leak into a safetensors save from another."""
+    torch_ckpt = CheckpointingConfig(
+        checkpoint_dir=tmp_path / "run_a",
+        model_save_format="torch_save",
+        save_consolidated=False,
+    ).build(0, 0, 0)
+    safe_ckpt = CheckpointingConfig(
+        checkpoint_dir=tmp_path / "run_b",
+        model_save_format="safetensors",
+        save_consolidated=False,
+    ).build(0, 0, 0)
+    model_state = {"weight": torch.ones(4)}
+    torch_model_path = tmp_path / "run_a" / "step_100" / "model"
+    torch_optim_path = tmp_path / "run_a" / "step_100" / "optim"
+    safe_model_path = tmp_path / "run_b" / "step_100" / "model"
+
+    torch_ckpt._do_save(model_state, str(torch_model_path))
+    torch_ckpt._do_save({"state": torch.ones(2)}, str(torch_optim_path))
+    writer = safe_ckpt._get_storage_writer(None, None, None, str(safe_model_path))
+    safe_ckpt._do_save(model_state, str(safe_model_path), writer)
+
+    assert list(safe_model_path.glob("*.safetensors"))
 
 
 class TestSaveConfig:
@@ -2988,6 +3278,7 @@ class TestDoLoad:
         config.is_async = False
         ckptr = MagicMock(spec=Checkpointer)
         ckptr.config = config
+        ckptr._planner_cache_namespace = "test"
         state_dict = {"weight": torch.ones(4)}
         path = "msc://bucket/step-300"
 
@@ -3562,6 +3853,7 @@ class TestSyncAsyncSave:
         ckptr._model_ctx = MagicMock(staging_active=False)
         ckptr._optim_ctx = MagicMock(staging_active=False)
         ckptr.process_group = None
+        ckptr._planner_cache_namespace = "test"
         return ckptr
 
     def test_dcp_cloud_sync_calls_dcp_save(self):

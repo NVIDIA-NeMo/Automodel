@@ -1000,7 +1000,21 @@ class KimiK3Gate(Gate):
         token_mask: torch.Tensor,
         cp_mesh: Any = None,
     ) -> tuple[torch.Tensor, torch.Tensor, None]:
-        """Route ``[tokens, hidden]`` states and return fp32 top-k weights."""
+        """Route local token states and return fp32 top-k weights.
+
+        Args:
+            hidden_states: Tensor of shape [tokens, hidden] containing this rank's
+                local token states.
+            token_mask: Boolean tensor of shape [tokens]. Kimi K3 currently routes
+                every supplied token, so this mask is unused.
+            cp_mesh: Optional context-parallel mesh. Kimi K3 currently operates on
+                already-local token states, so this mesh is unused.
+
+        Returns:
+            Tuple containing fp32 routing weights of shape
+            [tokens, activated_experts], expert indices of shape
+            [tokens, activated_experts], and ``None`` for auxiliary loss.
+        """
         del token_mask, cp_mesh
         logits = F.linear(hidden_states.float(), self.weight.float(), None)
         if self.score_func == "sigmoid_with_bias":
@@ -1011,8 +1025,9 @@ class KimiK3Gate(Gate):
             raise ValueError(f"Kimi K3 requires a correction-bias router, got {self.score_func!r}.")
 
         scores_for_choice = scores
-        if self.e_score_correction_bias is not None:
-            scores_for_choice = scores_for_choice + self.e_score_correction_bias.unsqueeze(0)
+        correction_bias = self._local_score_correction_bias()
+        if correction_bias is not None:
+            scores_for_choice = scores_for_choice + correction_bias.unsqueeze(0)
         if self.n_groups > 1 and self.n_groups > self.topk_groups:
             grouped = scores_for_choice.view(hidden_states.shape[0], self.n_groups, -1)
             group_scores = grouped.topk(2, dim=-1)[0].sum(dim=-1)

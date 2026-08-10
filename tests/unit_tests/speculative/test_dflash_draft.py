@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import torch
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
@@ -125,3 +127,59 @@ def test_draft_forward_output_shape():
     out = draft(position_ids=position_ids, attention_mask=None, noise_embedding=noise, target_hidden=target_hidden)
     assert out.shape == (B, Q, H)
     assert torch.isfinite(out).all()
+
+
+class _ConstantTarget(torch.nn.Module):
+    """Minimal stand-in for the verifier: always samples ``forced_token_id``.
+
+    Only the surface ``spec_generate`` touches is implemented (``model.embed_tokens``,
+    ``lm_head``, and a forward returning logits + per-layer hidden states).
+    """
+
+    def __init__(self, cfg: Qwen3Config, forced_token_id: int):
+        super().__init__()
+        self.model = torch.nn.Module()
+        self.model.embed_tokens = torch.nn.Embedding(cfg.vocab_size, cfg.hidden_size)
+        self.lm_head = torch.nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
+        self.num_layers = cfg.num_target_layers
+        self.vocab_size = cfg.vocab_size
+        self.forced_token_id = forced_token_id
+        self.device = torch.device("cpu")
+
+    def forward(
+        self,
+        input_ids,
+        position_ids=None,
+        past_key_values=None,
+        use_cache=True,
+        logits_to_keep=None,
+        output_hidden_states=False,
+    ):
+        hidden = self.model.embed_tokens(input_ids)
+        keep = input_ids.shape[1] if logits_to_keep is None else logits_to_keep
+        logits = torch.zeros(input_ids.shape[0], keep, self.vocab_size)
+        logits[..., self.forced_token_id] = 1.0
+        return SimpleNamespace(logits=logits, hidden_states=[hidden] * (self.num_layers + 1))
+
+
+def test_spec_generate_keeps_generated_tokens_equal_to_the_mask_id():
+    """A generated token that happens to equal ``mask_token_id`` must survive.
+
+    The output buffer is pre-filled with ``mask_token_id`` as padding, so filtering
+    the padding out by value also deleted real tokens of that id and shifted the
+    rest of the sequence left. The generated span is tracked by the commit counter
+    instead.
+    """
+    torch.manual_seed(0)
+    cfg = _draft_cfg(bs=4)
+    draft = Qwen3DFlashDraftModel(cfg)
+    target = _ConstantTarget(cfg, forced_token_id=cfg.dflash_config["mask_token_id"])
+
+    prompt = torch.tensor([[1, 2, 3]])
+    max_new_tokens = 5
+    out = draft.spec_generate(target, prompt, max_new_tokens, stop_token_ids=None, temperature=0.0)
+
+    assert out.shape == (1, prompt.shape[1] + max_new_tokens)
+    torch.testing.assert_close(out[:, : prompt.shape[1]], prompt)
+    generated = out[0, prompt.shape[1] :]
+    assert torch.all(generated == cfg.dflash_config["mask_token_id"])

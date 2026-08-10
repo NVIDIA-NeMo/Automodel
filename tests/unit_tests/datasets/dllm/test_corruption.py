@@ -18,6 +18,7 @@ import pytest
 import torch
 
 from nemo_automodel.components.datasets.dllm.corruption import (
+    corrupt_all_masked,
     corrupt_blockwise,
     corrupt_uniform,
     corrupt_uniform_random,
@@ -54,6 +55,32 @@ class TestGumbelTopk:
     def test_output_is_bool(self):
         mask = gumbel_topk(torch.zeros(10), 3)
         assert mask.dtype == torch.bool
+
+
+# ---------------------------------------------------------------------------
+# corrupt_all_masked
+# ---------------------------------------------------------------------------
+
+
+class TestCorruptAllMasked:
+    def test_masks_all_supervised_positions(self, inputs):
+        input_ids, loss_mask = inputs
+        noisy, noise_mask, p_mask = corrupt_all_masked(input_ids, loss_mask, MASK_TOKEN_ID)
+        # Every supervised position is masked; no stochasticity.
+        assert torch.equal(noise_mask, loss_mask.bool())
+        assert (noisy[loss_mask.bool()] == MASK_TOKEN_ID).all()
+
+    def test_leaves_prompt_clean(self, inputs):
+        input_ids, loss_mask = inputs
+        noisy, _, _ = corrupt_all_masked(input_ids, loss_mask, MASK_TOKEN_ID)
+        clean = ~loss_mask.bool()
+        assert (noisy[clean] == input_ids[clean]).all()
+
+    def test_p_mask_is_all_ones(self, inputs):
+        input_ids, loss_mask = inputs
+        _, _, p_mask = corrupt_all_masked(input_ids, loss_mask, MASK_TOKEN_ID)
+        assert p_mask.shape == (B, L)
+        assert torch.all(p_mask == 1.0)
 
 
 # ---------------------------------------------------------------------------

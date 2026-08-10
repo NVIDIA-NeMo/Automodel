@@ -14,11 +14,13 @@
 
 import gc
 import glob
+import json
 import logging
 import os
 import pickle
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
@@ -67,6 +69,7 @@ from nemo_automodel.components.checkpoint.conversion_mapping import (
     get_combined_key_mapping,
     requires_tensor_merging,
 )
+from nemo_automodel.components.checkpoint.lifecycle import CheckpointLifecycle
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, OptimizerState
 from nemo_automodel.components.checkpoint.utils import (
     ensure_tied_lm_head,
@@ -77,6 +80,7 @@ from nemo_automodel.components.checkpoint.utils import (
     get_safetensors_index_total_size,
     get_tied_lm_head_source_names,
     get_world_size_safe,
+    is_cloud_path,
     is_rank_0,
     materialize_missing_tied_lm_head,
 )
@@ -226,11 +230,6 @@ def _apply_adapter_forced_dtype_mapping(
     return normalized
 
 
-def is_cloud_path(path: str) -> bool:
-    """Check if path is a cloud storage path (MSC)."""
-    return path.startswith("msc://")
-
-
 def _ensure_msc_available() -> None:
     """Raise an error if MSC is not installed but a cloud path is used."""
     if not MSC_AVAILABLE:
@@ -359,6 +358,22 @@ class _AsyncSaveContext:
     staging_active: bool = False
 
 
+class _ModelSavePlanner(dcp.DefaultSavePlanner):
+    """Keep model save plans in one checkpointer-scoped cache namespace."""
+
+    def __init__(self, cache_namespace: str) -> None:
+        super().__init__(enable_plan_caching=True)
+        self._cached_plans_key = f"{cache_namespace}:model"
+
+
+class _OptimizerSavePlanner(dcp.DefaultSavePlanner):
+    """Keep optimizer save plans in one checkpointer-scoped cache namespace."""
+
+    def __init__(self, cache_namespace: str) -> None:
+        super().__init__(enable_plan_caching=True)
+        self._cached_plans_key = f"{cache_namespace}:optimizer"
+
+
 def _new_gloo_process_group(
     process_group: torch.distributed.ProcessGroup | None,
     timeout: timedelta | None = None,
@@ -485,8 +500,8 @@ class Checkpointer:
     - PEFT adapter save/load handling
     - Async save for torch >= 2.9.0
 
-    Also provides DP-aware helpers for saving/loading auxiliary state and
-    utilities to initialize from a base HF checkpoint.
+    Also provides DP- and global-rank-aware helpers for saving/loading
+    auxiliary state and utilities to initialize from a base HF checkpoint.
     """
 
     def __init__(
@@ -520,6 +535,8 @@ class Checkpointer:
         self.tp_rank = tp_rank
         self.pp_rank = pp_rank
         self.process_group = process_group
+        self.lifecycle = CheckpointLifecycle(config=config, process_group=process_group)
+        self._planner_cache_namespace = uuid.uuid4().hex
 
         # async specific variables
         self._model_ctx = _AsyncSaveContext(stager=None, process_group=None, future=None, staging_active=False)
@@ -583,7 +600,7 @@ class Checkpointer:
         should_write_consolidated = _should_write_consolidated_safetensors(self.config, is_final_checkpoint)
         consolidated_dir = os.path.join(model_dir, "consolidated") if should_write_consolidated else None
         hf_metadata_dir = os.path.join(model_dir, ".hf_metadata") if _should_write_hf_metadata(self.config) else None
-        _ensure_dirs(model_dir, consolidated_dir, hf_metadata_dir, process_group=self.process_group)
+        _ensure_shared_dirs(model_dir, consolidated_dir, hf_metadata_dir, process_group=self.process_group)
 
         # Because this call lies outside of the dcp save call, we need to consolidate on all ranks on the main process
         # of all ranks, which lies on the critical path. Therefore, we can only do this outside of async mode.
@@ -711,7 +728,7 @@ class Checkpointer:
                 per-model-part optimizers.
         """
         optimizer_path = os.path.join(weights_path, "optim")
-        _ensure_dirs(optimizer_path, process_group=self.process_group)
+        _ensure_shared_dirs(optimizer_path, process_group=self.process_group)
         optimizer_state = OptimizerState(
             model,
             optimizer,
@@ -794,6 +811,7 @@ class Checkpointer:
             is_init_step=is_init_step,
             skip_task_head_prefixes=getattr(self.config, "skip_task_head_prefixes_for_base_model", None),
             cpu_offload=self.config.cpu_offload,
+            has_expert_parallelism=self.moe_mesh is not None,
         )
 
         # Check if this model requires tensor merging (e.g., Mixtral with grouped experts)
@@ -914,7 +932,9 @@ class Checkpointer:
         state_dict = _maybe_adapt_state_dict_to_hf(
             model_state.model[0],
             state_dict,
-            quantization=self.config.dequantize_base_checkpoint,
+            # Training checkpoints are saved from the dequantized native model.
+            # Only base-checkpoint initialization needs FP8 scale destinations.
+            quantization=bool(is_init_step and self.config.dequantize_base_checkpoint),
             device_mesh=self.moe_mesh,
         )
 
@@ -1103,16 +1123,22 @@ class Checkpointer:
         #   init.zeros_(module.weight[module.padding_idx]) on the embedding layer, which
         #   triggers DTensor redistribute and fails with sharded (TP) embeddings.
         # - NemotronHForCausalLM: the HF remote code's _init_weights uses dt_bias.copy_()
-        #   which fails with DTensors. This applies to:
-        #   - v2 (non-MoE, no n_routed_experts): always uses HF remote code.
-        #   - v3 (MoE, has n_routed_experts) with force_hf=True: also uses HF remote code
-        #     (detected via model.backbone attribute). When force_hf=False, v3 uses our custom
-        #     implementation (model.model with ModuleDict layers) which handles this correctly.
+        #   which fails with DTensors. This applies to the HF-remote-code path only
+        #   (detected via the model.backbone attribute), for both:
+        #   - dense/v2 (no n_routed_experts) under force_hf=True, and
+        #   - v3 (MoE, has n_routed_experts) under force_hf=True.
+        #   With force_hf=False, both dense and v3 use our custom implementation
+        #   (model.model with ModuleDict layers), which runs its own initialize_weights
+        #   correctly, so the skip must NOT apply there.
         try:
             model_class = model.config.architectures[0]
         except Exception:
             model_class = ""
-        is_nemotron_v2 = model_class == "NemotronHForCausalLM" and not getattr(model.config, "n_routed_experts", None)
+        is_nemotron_v2 = (
+            model_class == "NemotronHForCausalLM"
+            and not getattr(model.config, "n_routed_experts", None)
+            and hasattr(model, "backbone")  # HF remote-code path only; custom dense runs its own init
+        )
         is_nemotron_v3_hf = (
             model_class == "NemotronHForCausalLM"
             and getattr(model.config, "n_routed_experts", None)  # is Nemotron V3
@@ -1324,10 +1350,10 @@ class Checkpointer:
             raise error
 
     def save_on_dp_ranks(self, state: Any, state_name: str, path: str) -> None:
-        """
-        Save the stateful object.
+        """Save state shared by all tensor- and pipeline-parallel peers.
 
-        This function is a helper function currently used to save the dataloader and rng state.
+        This helper is intended for data-parallel-scoped state such as a
+        stateful dataloader. Only the TP0/PP0 peer writes each DP rank's state.
 
         Args:
             state: Stateful object to save
@@ -1340,10 +1366,10 @@ class Checkpointer:
             torch.save(state.state_dict(), os.path.join(state_dir, f"{state_name}_dp_rank_{self.dp_rank}.pt"))
 
     def load_on_dp_ranks(self, state: Any, state_name: str, path: str) -> None:
-        """
-        Load the stateful object.
+        """Load state shared by all tensor- and pipeline-parallel peers.
 
-        This function is a helper function currently used to load the dataloader and rng state.
+        This helper is intended for data-parallel-scoped state such as a
+        stateful dataloader. All TP/PP peers in a DP rank load the same state.
 
         Args:
             state: Stateful object to load
@@ -1358,6 +1384,46 @@ class Checkpointer:
             )
         )
 
+    def save_on_global_ranks(self, state: Any, state_name: str, path: str) -> None:
+        """Save state that is unique to every global process rank.
+
+        Args:
+            state: Stateful object to save.
+            state_name: Name of the stateful object.
+            path: Path to save the stateful object.
+        """
+        state_dir = os.path.join(path, state_name)
+        _ensure_dirs(state_dir, process_group=self.process_group)
+        global_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        torch.save(state.state_dict(), os.path.join(state_dir, f"{state_name}_global_rank_{global_rank}.pt"))
+
+    def load_on_global_ranks(self, state: Any, state_name: str, path: str) -> None:
+        """Load state unique to this global rank, with legacy DP fallback.
+
+        Args:
+            state: Stateful object to load.
+            state_name: Name of the stateful object.
+            path: Path containing the stateful object.
+        """
+        state_dir = os.path.join(path, state_name)
+        global_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        state_file = os.path.join(state_dir, f"{state_name}_global_rank_{global_rank}.pt")
+        if not os.path.exists(state_file):
+            state_file = os.path.join(state_dir, f"{state_name}_dp_rank_{self.dp_rank}.pt")
+            if os.path.exists(state_file) and global_rank == 0:
+                logger.warning(
+                    "Loading legacy per-DP %s state from %s. Exact rank-local restoration is not guaranteed under "
+                    "tensor or pipeline parallelism.",
+                    state_name,
+                    state_file,
+                )
+        state.load_state_dict(
+            load_torch_ckpt(
+                state_file,
+                weights_only=not self.config.allow_legacy_pickle_restore,
+            )
+        )
+
     def save_distributed_state(self, state: Any, state_name: str, path: str) -> None:
         """Save a custom stateful object through DCP on all ranks.
 
@@ -1367,7 +1433,7 @@ class Checkpointer:
         DTensor metadata and writes all shards correctly.
         """
         state_dir = os.path.join(path, state_name)
-        _ensure_dirs(state_dir, process_group=self.process_group)
+        _ensure_shared_dirs(state_dir, process_group=self.process_group)
         state_dict = state.state_dict()
         planner = dcp.DefaultSavePlanner(enable_plan_caching=True)
         process_group = getattr(self, "process_group", None)
@@ -1403,6 +1469,15 @@ class Checkpointer:
             if consolidation_process_group is not None:
                 torch.distributed.destroy_process_group(consolidation_process_group)
 
+    def finalize(self) -> None:
+        """Publish any final async checkpoint and close owned resources."""
+        try:
+            if self.config.enabled:
+                self.async_wait()
+                self.lifecycle.complete_pending()
+        finally:
+            self.close()
+
     def _do_load(
         self,
         state_dict: dict[str, torch.Tensor],
@@ -1422,8 +1497,8 @@ class Checkpointer:
         Returns:
             The populated state dictionary (may be replaced for PEFT).
         """
-        # Both model and optimizer saving is done in this function
-        is_model = True if "/model" in path else False
+        # Both model and optimizer loading is done in this function.
+        is_model = _is_model_checkpoint_path(path)
         # PEFT loading is broadcasted from rank0 so it is a special case
         if self.config.is_peft and is_model and (not is_init_step):
             state_dict = _load_safetensors(_adapter_path(path))
@@ -1451,8 +1526,8 @@ class Checkpointer:
         Returns:
             Optional Future object if async mode is enabled.
         """
-        # Both model and optimizer saving is done in this function
-        is_model = True if "/model" in path else False
+        # Both model and optimizer saving is done in this function.
+        is_model = _is_model_checkpoint_path(path)
         # PEFT saving is done on rank0 so it is a special case
         if self.config.is_peft and is_model:
             if not torch.distributed.is_initialized() or torch.distributed.get_rank(group=self.process_group) == 0:
@@ -1462,7 +1537,8 @@ class Checkpointer:
             return
 
         ret = None
-        planner = dcp.DefaultSavePlanner(enable_plan_caching=True)
+        planner_cls = _ModelSavePlanner if is_model else _OptimizerSavePlanner
+        planner = planner_cls(self._planner_cache_namespace)
 
         # Routes to MSC storage write for cloud paths
         storage_writer = _maybe_msc_writer(path, storage_writer)
@@ -1902,6 +1978,38 @@ def save_config(config: dict[str, Any], weights_path: str) -> None:
             yaml.dump(config, f, sort_keys=False, default_flow_style=False)
 
 
+def save_losses(losses: dict[str, Any], weights_path: str) -> None:
+    """Write checkpoint loss metadata to ``weights_path/losses.json``.
+
+    Mirrors :func:`save_config` so the file lands in the checkpoint directory for
+    both local and ``msc://`` roots. Every failure is logged rather than raised,
+    including a missing ``multistorageclient``: this is metadata written on rank 0
+    only, so raising would strand the other ranks in the next collective.
+
+    Args:
+        losses: Loss values to record. Values must be JSON-serializable.
+        weights_path: Checkpoint directory.
+    """
+    losses_path = os.path.join(weights_path, "losses.json")
+    try:
+        if is_cloud_path(weights_path):
+            _ensure_msc_available()
+            with msc.open(losses_path, "w") as f:
+                json.dump(losses, f)
+        else:
+            with open(losses_path, "w") as f:
+                json.dump(losses, f)
+    except (TypeError, ValueError, OSError, ImportError):
+        logger.warning("Failed to write checkpoint loss metadata to %s", losses_path, exc_info=True)
+
+
+def _create_dirs(*dirs: Optional[str]) -> None:
+    """Create local directory paths and ignore cloud paths."""
+    for directory in dirs:
+        if directory and not is_cloud_path(directory):
+            os.makedirs(directory, exist_ok=True)
+
+
 def _ensure_dirs(*dirs: Optional[str], process_group: torch.distributed.ProcessGroup | None = None) -> None:
     """
     Create directories on all ranks and synchronize across ranks.
@@ -1910,12 +2018,31 @@ def _ensure_dirs(*dirs: Optional[str], process_group: torch.distributed.ProcessG
         *dirs: One or more directory paths that should exist.
         process_group: Ranks that must observe the directories before continuing.
     """
-    for d in dirs:
-        if d:
-            if not is_cloud_path(d):
-                os.makedirs(d, exist_ok=True)
+    _create_dirs(*dirs)
     if torch.distributed.is_initialized():
         torch.distributed.barrier(group=process_group)
+
+
+def _ensure_shared_dirs(*dirs: Optional[str], process_group: torch.distributed.ProcessGroup | None = None) -> None:
+    """Create shared DCP directories on group rank zero and synchronize the group.
+
+    Unlike auxiliary per-rank state, DCP checkpoint directories must be visible
+    to every rank through the same filesystem.
+
+    Args:
+        *dirs: One or more shared directory paths that should exist.
+        process_group: Ranks that must observe the directories before continuing.
+    """
+    is_dist_initialized = torch.distributed.is_initialized()
+    if not is_dist_initialized or torch.distributed.get_rank(group=process_group) == 0:
+        _create_dirs(*dirs)
+    if is_dist_initialized:
+        torch.distributed.barrier(group=process_group)
+
+
+def _is_model_checkpoint_path(path: str) -> bool:
+    """Return whether a checkpoint path names the model directory."""
+    return Path(path.rstrip("/")).name == "model"
 
 
 def _init_peft_adapters(model: nn.Module, peft_init_method: str) -> None:

@@ -13,10 +13,81 @@
 # limitations under the License.
 
 
+import pytest
 import torch
 from transformers.models.donut.modeling_donut_swin import DonutSwinModelOutput
 
 from nemo_automodel.components.models.nemotron_parse import model as np_model
+
+
+class _DummyRadioEncoder(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.probe = torch.nn.Parameter(torch.zeros(1, dtype=torch.float32))
+        self.externalize_calls = 0
+        self.input_dtypes = []
+
+    def make_preprocessor_external(self):
+        self.externalize_calls += 1
+
+    def forward(self, pixel_values):
+        """Return deterministic RADIO features for an image batch.
+
+        Args:
+            pixel_values: Tensor of shape [batch, channels, height, width].
+
+        Returns:
+            A tuple containing summary features of shape [batch, 3840] and patch features of shape
+            [batch, height * width, 1280].
+        """
+        self.input_dtypes.append(pixel_values.dtype)
+        batch = pixel_values.shape[0]
+        height = pixel_values.shape[-2]
+        width = pixel_values.shape[-1]
+        summary = torch.zeros(batch, 3840)
+        feature = torch.zeros(batch, height * width, 1280)
+        return summary, feature
+
+
+class _DummyRadioConfig:
+    patch_size = 1
+
+    def __init__(self, image_processor_normalizes):
+        self.image_processor_normalizes = image_processor_normalizes
+
+
+@pytest.mark.parametrize("image_processor_normalizes", [False, True])
+def test_radio_with_neck_respects_processor_normalization(monkeypatch, image_processor_normalizes):
+    radio_encoder = _DummyRadioEncoder()
+    monkeypatch.setattr(np_model.AutoModel, "from_config", lambda *args, **kwargs: radio_encoder)
+    encoder = np_model.RadioWithNeck(_DummyRadioConfig(image_processor_normalizes))
+    pixel_values = torch.zeros(1, 3, 1, 4, dtype=torch.bfloat16 if image_processor_normalizes else torch.float32)
+
+    first_output = encoder(pixel_values)
+    second_output = encoder(pixel_values)
+
+    expected_externalize_calls = 1 if image_processor_normalizes else 0
+    assert radio_encoder.externalize_calls == expected_externalize_calls
+    assert radio_encoder.input_dtypes == [torch.float32, torch.float32]
+    assert first_output.last_hidden_state.shape == (1, 2, 1024)
+    assert second_output.last_hidden_state.shape == (1, 2, 1024)
+
+
+def test_radio_with_neck_requires_external_preprocessor_support(monkeypatch):
+    class RadioEncoderWithoutExternalPreprocessor(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.probe = torch.nn.Parameter(torch.zeros(1))
+
+    monkeypatch.setattr(
+        np_model.AutoModel,
+        "from_config",
+        lambda *args, **kwargs: RadioEncoderWithoutExternalPreprocessor(),
+    )
+    encoder = np_model.RadioWithNeck(_DummyRadioConfig(image_processor_normalizes=True))
+
+    with pytest.raises(ValueError, match="requires a RADIO encoder with make_preprocessor_external"):
+        encoder(torch.zeros(1, 3, 1, 4))
 
 
 def test_nemotron_parse_forward_with_stub_encoder(monkeypatch):
