@@ -21,14 +21,19 @@ For other installation options, see our [NeMo AutoModel Installation Guide](/get
 Omni models such as Qwen3-Omni need the `vlm-media` extra included in the source-sync command above for video/vision preprocessing; it is not installed in the Docker container by default. See [Media Extras](/get-started/installation#media-extras-video--image-decode).
 </Note>
 
+<Info>
+**Automatic speech recognition:** Qwen2.5-Omni and Qwen3-Omni support
+supervised ASR fine-tuning on Hugging Face audio datasets. See the
+[Qwen3-Omni ASR fine-tuning guide](/recipes-e2e-examples/qwen3-omni-asr) and
+the ASR recipes on the model cards below.
+</Info>
+
 ## Supported Models
 
-| Owner | Model | Modalities | Architecture |
-|---|---|---|---|
-| Qwen / Alibaba Cloud | [Qwen3-Omni](/model-coverage/omni/qwen3-omni) | Text · Image · Audio · Video | `Qwen3OmniForConditionalGeneration` |
-| Qwen / Alibaba Cloud | [Qwen2.5-Omni](/model-coverage/omni/qwen2-5-omni) | Text · Image · Audio · Video | `Qwen2_5OmniForConditionalGeneration` |
-| Microsoft | [Phi-4-multimodal](/model-coverage/omni/phi-4-multimodal) | Text · Image · Audio | `Phi4MultimodalForCausalLM` |
-| NVIDIA | [Nemotron-3-Nano-Omni](/model-coverage/omni/nemotron-omni) | Text · Image · Audio | `NemotronH_Nano_Omni_Reasoning_V3` |
+This table combines recipe-backed checkpoints with documented model families. Dates show when the current checkpoint first appeared in a recipe, or when a documentation-only family page was added. See the [combined model support log](/model-coverage/release-log) for recipe-backed checkpoints of every model type.
+
+{/* BEGIN GENERATED MODEL SUPPORT LOG */}
+{/* END GENERATED MODEL SUPPORT LOG */}
 
 ## Fine-Tune Omni Models
 

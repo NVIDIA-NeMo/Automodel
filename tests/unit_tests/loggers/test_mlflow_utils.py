@@ -83,7 +83,7 @@ class TestConfigureMlflow:
         monkeypatch.delenv("MLFLOW_RUN_ID", raising=False)
 
         self.tmp_path = tmp_path
-        self.tracking_uri = f"file://{tmp_path}/mlruns"
+        self.tracking_uri = f"sqlite:///{tmp_path / 'mlflow.db'}"
         mlflow.set_tracking_uri(self.tracking_uri)
         if mlflow.active_run() is not None:
             mlflow.end_run()
@@ -101,6 +101,7 @@ class TestConfigureMlflow:
             mlflow={
                 "experiment_name": "test-exp",
                 "tracking_uri": self.tracking_uri,
+                "artifact_location": (self.tmp_path / "artifacts").as_uri(),
                 **(mlflow_overrides or {}),
             },
             checkpoint_dir=str(ckpt_dir),
@@ -259,7 +260,7 @@ class TestConfigureMlflow:
 class TestEndMlflowActiveRunAsKilled:
     @pytest.fixture(autouse=True)
     def _setup(self, tmp_path):
-        mlflow.set_tracking_uri(f"file://{tmp_path}/mlruns")
+        mlflow.set_tracking_uri(f"sqlite:///{tmp_path / 'mlflow.db'}")
         if mlflow.active_run() is not None:
             mlflow.end_run()
         yield
@@ -296,7 +297,7 @@ class TestEndMlflowActiveRunAsKilled:
 class TestInstallMlflowFailureHook:
     @pytest.fixture(autouse=True)
     def _setup(self, tmp_path):
-        mlflow.set_tracking_uri(f"file://{tmp_path}/mlruns")
+        mlflow.set_tracking_uri(f"sqlite:///{tmp_path / 'mlflow.db'}")
         if mlflow.active_run() is not None:
             mlflow.end_run()
 

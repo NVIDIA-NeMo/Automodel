@@ -182,17 +182,17 @@ RUN pip install --no-cache-dir --no-deps /tmp/wheels/*.whl && \
     rm -rf /tmp/wheels
 
 # Address base image CVE
-RUN pip install "aiohttp>=3.13.3" \
+RUN pip install "aiohttp>=3.14.3" \
         "black>=26.3.1" \
         "GitPython>=3.1.50" \
         "jaraco-context>=6.1.0" \
-        "jupyter-server>=2.18.0" \
+        "jupyter-server>=2.20.0" \
         "jupyterlab>=4.5.7" \
         "mistune>=3.2.1" \
         "nbconvert>=7.17.0" \
         "notebook>=7.5.6" \
         "onnx>=1.21.0" \
-        "pillow>=12.2.0" \
+        "pillow>=12.3.0" \
         "protobuf>=6.33.5" \
         "setuptools>=80.10.2" \
         "tornado>=6.5.5" \

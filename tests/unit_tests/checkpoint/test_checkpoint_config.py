@@ -142,6 +142,33 @@ class TestCheckpointingConfig:
                 max_recent_checkpoints=1,
             )
 
+    @pytest.mark.parametrize("save_consolidated", [True, "final", "every"])
+    def test_consolidated_export_rejects_msc_checkpoint_dir(self, save_consolidated):
+        with pytest.raises(ValueError, match="not compatible with remote cloud storage"):
+            CheckpointingConfig(
+                checkpoint_dir="msc://bucket/checkpoints",
+                save_consolidated=save_consolidated,
+            )
+
+    def test_accepts_msc_dcp_checkpoint_dir(self):
+        cfg = CheckpointingConfig(
+            checkpoint_dir="msc://bucket/checkpoints",
+            save_consolidated=False,
+        )
+
+        assert cfg.checkpoint_dir == "msc://bucket/checkpoints"
+        assert cfg.save_consolidated.value == "false"
+        assert cfg.max_recent_checkpoints is None
+
+    def test_accepts_local_checkpoint_dir_with_retention(self):
+        """The rejection is scoped to remote roots; local paths keep working."""
+        cfg = CheckpointingConfig(
+            checkpoint_dir="/tmp/checkpoints",
+            save_consolidated=False,
+            max_recent_checkpoints=1,
+        )
+        assert cfg.max_recent_checkpoints == 1
+
     def test_importable_from_checkpointing(self):
         """Verify backward compat: import from checkpointing.py still works."""
         from nemo_automodel.components.checkpoint.checkpointing import CheckpointingConfig as CkptCfg

@@ -24,7 +24,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn.functional as F
-from torch.distributed.tensor import DTensor
+from torch.distributed.tensor import DTensor, Replicate
 from transformers.models.ernie4_5_moe.configuration_ernie4_5_moe import Ernie4_5_MoeConfig
 
 from nemo_automodel.components.distributed.config import FSDP2Config
@@ -128,6 +128,8 @@ def _worker(rank: int, port: int) -> None:
 
         assert moe.gate.weight.dtype == torch.float32
         assert moe.gate.e_score_correction_bias.dtype == torch.float32
+        assert isinstance(moe.gate.e_score_correction_bias, DTensor)
+        assert all(isinstance(placement, Replicate) for placement in moe.gate.e_score_correction_bias.placements)
         assert moe.experts.gate_and_up_projs.dtype == torch.bfloat16
 
         gate_observation: dict[str, torch.Tensor] = {}
@@ -174,6 +176,16 @@ def _worker(rank: int, port: int) -> None:
         assert moe.gate.weight.grad is not None
         assert moe.gate.weight.grad.dtype == torch.float32
         assert torch.isfinite(moe.gate.weight.grad.to_local()).all()
+
+        moe.gate.train_gate = True
+        moe.gate.bias_update_factor = 0.1
+        local_expert_load = torch.zeros(moe.gate.n_experts, device=rank)
+        local_expert_load[rank] = 8
+        moe.gate._cumulative_expert_load = local_expert_load
+        moe.gate.update_bias()
+
+        expected_bias = torch.tensor([-0.1, -0.1, 0.1, 0.1], device=rank)
+        torch.testing.assert_close(moe.gate.e_score_correction_bias.to_local(), expected_bias)
     finally:
         if dist.is_initialized():
             dist.destroy_process_group()

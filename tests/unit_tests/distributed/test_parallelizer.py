@@ -2457,16 +2457,18 @@ class TestActivationCheckpointingKVSharing:
         self._run_parallelize(model)
 
         assert model.config.use_cache is True
-        model.gradient_checkpointing_enable.assert_called_once()
+        model.gradient_checkpointing_enable.assert_called_once_with(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
 
-    def test_hf_native_grad_ckpt_disables_use_cache_without_kv_sharing(self, monkeypatch):
-        """HF native path + no KV sharing: use_cache is set to False."""
+    def test_hf_native_grad_ckpt_disables_use_cache_and_uses_non_reentrant(self, monkeypatch):
+        """HF native checkpointing disables cache and avoids reentrant FSDP2 forward hooks."""
         model = self._setup_hf_native_model(monkeypatch, num_kv_shared_layers=0)
         self._run_parallelize(model)
 
         assert model.config.use_cache is False
         model.gradient_checkpointing_enable.assert_called_once_with(
-            gradient_checkpointing_kwargs={"use_reentrant": True}
+            gradient_checkpointing_kwargs={"use_reentrant": False}
         )
 
     def test_hf_native_grad_ckpt_skips_frozen_layers(self, monkeypatch):

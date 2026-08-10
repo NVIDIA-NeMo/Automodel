@@ -106,8 +106,9 @@ class MLflowConfig:
     Attributes:
         experiment_name: MLflow experiment name.
         run_name: Display name for the run.
-        tracking_uri: MLflow tracking server URI.  ``None`` uses the
-            ``MLFLOW_TRACKING_URI`` env var or local ``./mlruns``.
+        tracking_uri: MLflow tracking server URI. ``None`` delegates to
+            ``MLFLOW_TRACKING_URI`` and then MLflow's local default
+            (``sqlite:///mlflow.db`` in current releases).
         artifact_location: Root artifact store URI for the experiment.
         tags: Dictionary of string tags attached to the run.
         resume: When ``True`` (default), look for a ``mlflow_run_id``
