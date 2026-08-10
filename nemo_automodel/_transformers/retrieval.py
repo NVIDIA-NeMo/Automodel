@@ -205,7 +205,6 @@ def tanh_int8_quantize(x: torch.Tensor) -> torch.Tensor:
     y = 127.0 * torch.tanh(x) + 0.5
     return _ste_floor(y)
 
-
 def _get_module_device_dtype(module: nn.Module) -> tuple[torch.device, torch.dtype]:
     """Return a real device/dtype pair from a module's parameters or buffers."""
     for parameter in module.parameters():
@@ -355,7 +354,7 @@ def build_encoder_backbone(
             num_labels=num_labels,
             temperature=temperature,
         )
-        return extracted_model
+        return extracted_model    
 
     BidirectionalModelClass = _get_supported_backbone_class(model_type, task)
     if BidirectionalModelClass is not None:
@@ -365,10 +364,6 @@ def build_encoder_backbone(
             hf_kwargs["num_labels"] = num_labels
         if temperature is not None:
             hf_kwargs["temperature"] = temperature
-        # HF Mistral3 checkpoints nest the text tower under ``language_model.model``;
-        # the retrieval VLM owns that tower directly as ``language_model``.
-        if model_type == "mistral3" and BidirectionalModelClass.__name__ == "Mistral3BidirectionalModel":
-            hf_kwargs.setdefault("key_mapping", {r"^language_model\.model\.": "language_model."})
         return BidirectionalModelClass.from_pretrained(
             model_name_or_path, trust_remote_code=trust_remote_code, **hf_kwargs
         )

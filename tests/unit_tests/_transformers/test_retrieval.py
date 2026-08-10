@@ -87,8 +87,9 @@ def _assert_no_language_model_prefix(model: nn.Module) -> None:
         assert not key.startswith("language_model."), f"VLM prefix in key: {key}"
 
 
-def test_direct_ministral_vlm_load_restores_all_towers(tmp_path):
-    """Direct retrieval loading remaps the nested source language-model keys."""
+@pytest.mark.parametrize("load_path", ["retrieval_factory", "model_class"])
+def test_ministral_vlm_load_restores_all_towers(tmp_path, load_path):
+    """Factory and model-owned loading restore every stock Mistral3 tower."""
     from nemo_automodel._transformers import retrieval
 
     source = AutoModel.from_config(_tiny_mistral3_vlm_config("ministral3"))
@@ -96,10 +97,18 @@ def test_direct_ministral_vlm_load_restores_all_towers(tmp_path):
     model_dir = tmp_path / "ministral3_vlm"
     source.save_pretrained(model_dir)
 
-    backbone = retrieval.build_encoder_backbone(
-        model_name_or_path=str(model_dir),
-        task="embedding",
-    )
+    if load_path == "retrieval_factory":
+        backbone = retrieval.build_encoder_backbone(
+            model_name_or_path=str(model_dir),
+            task="embedding",
+        )
+    else:
+        # A caller-provided mapping must be preserved without disabling the
+        # model's required stock-checkpoint conversion.
+        backbone = Mistral3BidirectionalModel.from_pretrained(
+            model_dir,
+            key_mapping={r"^unused\.": "unused."},
+        )
 
     assert isinstance(backbone, Mistral3BidirectionalModel)
     _assert_state_dict_equal(expected_state_dict, backbone.state_dict())
