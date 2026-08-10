@@ -94,29 +94,29 @@ class ColwiseParallelLora(ColwiseParallel):
         # colwise shard weight/bias to Shard(0), weight be Shard(0)
         # means Colwise as Linear is input * weight^T + bias, where
         # weight would become Shard(1)
-        def _get_module_and_name(module, name):
+        # The root call handles LoRA child weights explicitly.  Do not let the
+        # recursive child visit overwrite replicated lora_A with Shard(0).
+        if isinstance(getattr(module, "weight", None), DTensor):
+            return
+
+        def _get_module_name_and_placements(module, name):
             if name.endswith("lora_A.weight"):
                 assert hasattr(module, "lora_A"), f"lora_A not found in {module}"
-                return module.lora_A, "weight"
+                # Replicate the small rank-reducing projection.  Its output is
+                # then already replicated and can feed the column-sharded B
+                # projection without an explicit DTensor redistribute.
+                return module.lora_A, "weight", [Replicate()]
             elif name.endswith("lora_B.weight"):
                 assert hasattr(module, "lora_B"), f"lora_B not found in {module}"
-                return module.lora_B, "weight"
+                return module.lora_B, "weight", [Shard(0)]
             else:
-                return module, name
+                return module, name, [Shard(0)]
 
         for name, param in module.named_parameters():
-            _module, _name = _get_module_and_name(module, name)
-            _distribute_param(_module, _name, device_mesh, self.src_data_rank, [Shard(0)])
-
-        # Register forward hook on lora_A to all-gather its low rank output
-        def lora_a_output_hook(module, input, output):
-            if isinstance(output, DTensor):
-                if any(isinstance(p, Shard) for p in output.placements):
-                    output = output.redistribute(device_mesh=output.device_mesh, placements=[Replicate()])
-            return output
+            _module, _name, placements = _get_module_name_and_placements(module, name)
+            _distribute_param(_module, _name, device_mesh, self.src_data_rank, placements)
 
         if hasattr(module, "lora_A"):
-            module.lora_A.register_forward_hook(lora_a_output_hook)
             # lora_A/lora_B are nn.Linear sub-modules whose weights are now DTensors.
             # Convert to TPLinear so torch.compile sees matmul-based forward and
             # avoids the aten.view recursion in the backward.
@@ -156,7 +156,11 @@ class RowwiseParallelLora(RowwiseParallel):
             _distribute_param(module, "bias", device_mesh, self.src_data_rank, [Replicate()])
         if hasattr(module, "lora_A"):
             _distribute_param(module.lora_A, "weight", device_mesh, self.src_data_rank, [Shard(1)])
-            _distribute_param(module.lora_B, "weight", device_mesh, self.src_data_rank, [Shard(1)])
+            # Keep the A projection's Partial output Partial through B so it can
+            # share the row-parallel module's existing output reduction.  A
+            # replicated B maps Partial low-rank activations to Partial output
+            # activations without an intermediate redistribute.
+            _distribute_param(module.lora_B, "weight", device_mesh, self.src_data_rank, [Replicate()])
             module.lora_A.__class__ = TPLinear
             module.lora_B.__class__ = TPLinear
         # Plain nn.Linear: convert to TPLinear for compile safety.
