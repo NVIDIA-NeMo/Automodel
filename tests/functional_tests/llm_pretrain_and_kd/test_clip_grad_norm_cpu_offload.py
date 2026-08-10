@@ -34,7 +34,13 @@ def _fully_shard_tiny_model(*, cpu_offload: bool) -> torch.nn.Module:
     return model
 
 
-def _init_process_group(init_file: str, *, rank: int = 0, world_size: int = 1) -> None:
+def _init_process_group(init_file: str, *, rank: int = 0, world_size: int = 1) -> bool:
+    if torch.distributed.is_initialized():
+        assert torch.distributed.get_rank() == rank
+        assert torch.distributed.get_world_size() == world_size
+        torch.cuda.set_device(rank)
+        return False
+
     torch.distributed.init_process_group(
         backend="nccl",
         init_method=f"file://{init_file}",
@@ -43,11 +49,12 @@ def _init_process_group(init_file: str, *, rank: int = 0, world_size: int = 1) -
         timeout=timedelta(seconds=30),
     )
     torch.cuda.set_device(rank)
+    return True
 
 
 def _run_two_rank_clip_grad_norm(rank: int, world_size: int, init_file: str, cpu_offload: bool) -> None:
     """Exercise the real multi-rank NCCL collective for either gradient residency mode."""
-    _init_process_group(init_file, rank=rank, world_size=world_size)
+    owns_process_group = _init_process_group(init_file, rank=rank, world_size=world_size)
     try:
         torch.manual_seed(1234)
         device = torch.device("cuda", rank)
@@ -76,13 +83,14 @@ def _run_two_rank_clip_grad_norm(rank: int, world_size: int, init_file: str, cpu
         optimizer.step()
         torch.distributed.barrier()
     finally:
-        torch.distributed.destroy_process_group()
+        if owns_process_group:
+            torch.distributed.destroy_process_group()
 
 
 @pytest.mark.parametrize("cpu_offload", [False, True])
 def test_fsdp2_clip_grad_norm_matches_reference_with_and_without_cpu_offload(tmp_path, cpu_offload: bool) -> None:
     """FSDP2 clipping matches an unsharded reference in both gradient residency modes."""
-    _init_process_group(str(tmp_path / f"clip-grad-norm-{cpu_offload}"))
+    owns_process_group = _init_process_group(str(tmp_path / f"clip-grad-norm-{cpu_offload}"))
     try:
         torch.manual_seed(1234)
         reference = torch.nn.Sequential(torch.nn.Linear(8, 8), torch.nn.Linear(8, 4)).cuda()
@@ -123,7 +131,8 @@ def test_fsdp2_clip_grad_norm_matches_reference_with_and_without_cpu_offload(tmp
                 actual_parameter.to_local().cpu(), expected_parameter.cpu(), rtol=1e-6, atol=1e-7
             )
     finally:
-        torch.distributed.destroy_process_group()
+        if owns_process_group:
+            torch.distributed.destroy_process_group()
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two GPUs")
@@ -140,7 +149,7 @@ def test_two_rank_fsdp2_clip_grad_norm_with_and_without_cpu_offload(tmp_path, cp
 
 def test_fsdp2_gpu_clip_grad_norm_has_no_host_scalar_sync(tmp_path) -> None:
     """The standard GPU-gradient path keeps its reported norm on the device."""
-    _init_process_group(str(tmp_path / "clip-grad-norm-profiler"))
+    owns_process_group = _init_process_group(str(tmp_path / "clip-grad-norm-profiler"))
     try:
         model = _fully_shard_tiny_model(cpu_offload=False)
         model(torch.randn(3, 8, device="cuda")).sum().backward()
@@ -171,4 +180,5 @@ def test_fsdp2_gpu_clip_grad_norm_has_no_host_scalar_sync(tmp_path) -> None:
                 synchronizing_events.append(event.key)
         assert synchronizing_events == []
     finally:
-        torch.distributed.destroy_process_group()
+        if owns_process_group:
+            torch.distributed.destroy_process_group()
