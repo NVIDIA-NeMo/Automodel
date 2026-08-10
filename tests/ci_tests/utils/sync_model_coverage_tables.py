@@ -419,7 +419,7 @@ def _load_model_releases(repo_root: Path, model_docs: dict[str, list[_ModelDoc]]
 
 
 def _render_recipe_link(release: _ModelRelease) -> str:
-    return f"[{Path(release.recipe).name}]({REPOSITORY_URL}/{release.recipe})"
+    return f"[recipe]({REPOSITORY_URL}/{release.recipe})"
 
 
 def _render_model_with_recipe(release: _ModelRelease) -> str:

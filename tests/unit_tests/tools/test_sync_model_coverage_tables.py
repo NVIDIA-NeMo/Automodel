@@ -416,7 +416,7 @@ def test_sync_tables_writes_support_log_homepage_and_registry(tmp_path):
     assert (
         "| 2026-07-30 | VLM | "
         "[Vlm-model](https://huggingface.co/org/vlm-model) "
-        "([model.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/model.yaml)) |"
+        "([recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/model.yaml)) |"
     ) in support_log
     for (model_type, _), typed_overview_path in zip(MODEL_TYPE_OVERVIEW_PATHS, typed_overview_paths):
         typed_overview = typed_overview_path.read_text(encoding="utf-8")
