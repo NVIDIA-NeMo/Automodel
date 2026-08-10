@@ -24,9 +24,13 @@
 #   * the same data takes markedly fewer optimizer steps, because short-sequence
 #     batches are no longer padded out to a fixed sample count.
 #
-# `local_batch_size` is ignored while dynamic batching is on; the sampler owns the
-# micro-batch. Gradients are unaffected: the recipe normalizes by the globally
-# all-reduced label-token count, not by the batch count.
+# `local_batch_size` no longer sizes a micro-batch (the sampler does), but it is NOT
+# ignored: `StepScheduler` still derives the gradient-accumulation count from
+# `global_batch_size // (local_batch_size * dp_size)`, so the pair below decides how
+# many dynamic micro-batches are accumulated per optimizer step. `global_batch_size`
+# therefore stops bounding the samples per step: a step of short-sequence batches can
+# hold far more than 64 samples. Gradients stay correct regardless, because the recipe
+# normalizes by the globally all-reduced label-token count, not by the batch count.
 #
 # To run this recipe:
 #   automodel finetune llm -c examples/llm_finetune/qwen/qwen3_4b_chat_dynamic_batching.yaml --nproc-per-node 8

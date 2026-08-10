@@ -279,6 +279,12 @@ class RecipeConfig:
                 )
             if loader_kwargs.get("group_by_length", False):
                 raise ValueError("dataloader.dynamic_batching already groups by length; set group_by_length=false")
+            if int(self._raw.get("distributed.pp_size", 1) or 1) > 1:
+                raise ValueError(
+                    "dataloader.dynamic_batching does not support pipeline parallelism: the pipeline schedule "
+                    "is built for a fixed pp_batch_size derived from local_batch_size, while the token budget "
+                    "makes the batch dimension vary per step. Set pp_size=1."
+                )
             from nemo_automodel.components.datasets.llm.dynamic_token_batch_sampler import (
                 DynamicTokenBatchSamplerConfig,
             )

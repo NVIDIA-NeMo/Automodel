@@ -38,13 +38,16 @@ def compute_sample_lengths(dataset: Dataset) -> list[int]:
     """
     # Fast path: read the underlying list directly when the dataset just wraps one,
     # which skips per-item __getitem__ overhead on large datasets.
+    n = len(dataset)
     raw = dataset
     while hasattr(raw, "dataset"):
         raw = raw.dataset
-    if not isinstance(raw, list):
+    # Only trust the unwrapped list when it lines up one-to-one with the outer dataset:
+    # a wrapper that remaps indices (Subset, filtered or shuffled views) shares no index
+    # space with its base, and reading through it would attribute lengths to the wrong
+    # samples. That merely reordered batches before; it now sets the memory ceiling.
+    if not isinstance(raw, list) or len(raw) != n:
         raw = None
-
-    n = len(dataset)
     logger.info("Computing token lengths for %d samples...", n)
     start = time.monotonic()
     lengths = [0] * n

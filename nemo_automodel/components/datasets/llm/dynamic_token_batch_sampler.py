@@ -100,6 +100,11 @@ class DynamicTokenBatchSampler(Sampler[list[int]]):
     - No collective is needed to reach that agreement, so the sampler stays usable
       before the process group exists (and in single-process tests).
 
+    The batch count drifts slightly between epochs, because each epoch reshuffles and the
+    greedy packing lands differently. ``StepScheduler`` reads ``len(dataloader)`` once, so
+    ``epoch_len`` (and with it per-epoch checkpoint placement) follows epoch 0's count. All
+    ranks share the same value, so this shifts bookkeeping rather than desyncing anything.
+
     Indices are shuffled per epoch, then sorted by length inside a window of
     ``sort_window`` samples before batching. The window keeps each batch
     length-homogeneous (which is what makes the token budget efficient) while the
@@ -150,6 +155,12 @@ class DynamicTokenBatchSampler(Sampler[list[int]]):
         self._next_batches_yielded: int | None = None
 
         self.lengths = compute_sample_lengths(dataset)
+        if self.lengths and not any(self.lengths):
+            raise ValueError(
+                "Every sample reported zero length, so the token budget cannot bound anything and the "
+                "whole dataset would land in one batch. The samples are expected to carry `input_ids`; "
+                "check the dataset's field names."
+            )
         oversized = sum(1 for length in self.lengths if length > self.max_tokens_per_batch)
         if oversized:
             logger.warning(
@@ -222,7 +233,11 @@ class DynamicTokenBatchSampler(Sampler[list[int]]):
         """Restore ``state_dict``; the next iteration resumes mid-epoch."""
         self.epoch = int(state_dict["epoch"])
         self._plan(self.epoch)
-        self._next_batches_yielded = int(state_dict["batches_yielded"])
+        # Set both: __iter__ is a generator, so its body does not run until the first
+        # next(). A state_dict() taken between this call and the first fetched batch
+        # would otherwise report 0 and silently replay the epoch from the start.
+        self.batches_yielded = int(state_dict["batches_yielded"])
+        self._next_batches_yielded = self.batches_yielded
 
     def __iter__(self) -> Iterator[list[int]]:
         """Yield this rank's batches, resuming from a loaded state when present."""

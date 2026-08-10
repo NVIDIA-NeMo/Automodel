@@ -271,3 +271,35 @@ def test_compute_sample_lengths_reads_lists_and_tensors():
             return [{"input_ids": [1, 2, 3]}, {"input_ids": torch.zeros(5)}, {}][index]
 
     assert compute_sample_lengths(_Mixed()) == [3, 5, 0]
+
+
+def test_all_zero_lengths_raise_instead_of_making_one_giant_batch():
+    """Zero lengths make the token budget vacuous: every sample would land in one batch."""
+
+    class _NoInputIds(torch.utils.data.Dataset):
+        def __len__(self):
+            return 16
+
+        def __getitem__(self, index):
+            return {"tokens": [1, 2, 3]}
+
+    with pytest.raises(ValueError, match="zero length"):
+        DynamicTokenBatchSampler(_NoInputIds(), max_tokens_per_batch=128)
+
+
+def test_load_state_dict_reports_the_resume_point_before_iteration_starts():
+    """state_dict() taken between resume and the first batch must not rewind the epoch."""
+    dataset = _ListDataset([(i % 15) * 16 + 16 for i in range(240)])
+    resumed = DynamicTokenBatchSampler(dataset, max_tokens_per_batch=1024)
+
+    resumed.load_state_dict({"epoch": 0, "batches_yielded": 3})
+
+    assert resumed.state_dict() == {"epoch": 0, "batches_yielded": 3}
+
+
+def test_lengths_come_from_the_outer_dataset_when_a_wrapper_remaps_indices():
+    """A Subset shares no index space with its base; reading through it mislabels lengths."""
+    base = _ListDataset([8] * 50 + [4096] * 50)
+    subset = torch.utils.data.Subset(base, list(range(50, 100)))
+
+    assert compute_sample_lengths(subset) == [4096] * 50
