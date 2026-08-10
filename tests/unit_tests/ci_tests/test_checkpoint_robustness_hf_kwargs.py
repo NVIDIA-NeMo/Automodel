@@ -14,7 +14,7 @@
 
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -23,23 +23,252 @@ from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_bie
     _extract_custom_args as _extract_biencoder_custom_args,
 )
 from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm import (
+    _assert_peft_adapter_matches_checkpoint,
     _compare_source_load_parity,
     _dequantize_hf_fp8_weights_in_place,
     _extract_custom_args,
     _finish_hf_reload_sync,
     _get_input_ids,
     _get_logits_pp,
+    _hf_device_map_max_memory,
     _hf_fp32_module_names,
     _hf_model_load_context,
+    _hf_reload_kl_error,
     _hf_source_load_kwargs,
     _keep_hf_modules_in_fp32,
+    _lm_head_embedding_aliased,
     _load_hf_fp8_dequantized_config,
+    _load_input_ids_once,
+    _normalize_peft_no_split_modules,
+    _patch_remote_masking_api_compatibility,
+    _peft_adapter_load_kwargs,
     _post_load_dequant_max_memory,
+    _raise_distributed_failure,
     _record_deferred_failure,
+    _resolve_hf_model_class,
+    _run_process_isolated_checkpoint_phase,
+    _trainable_parameter_digests,
     _wait_for_hf_reload_rank0,
+    _wait_for_source_load_artifacts,
 )
 from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_vlm import _get_vlm_input_ids
 from tests.functional_tests.checkpoint_robustness.test_checkpoint_vllm_deploy import _tokenize_for_generation
+
+
+def test_resolve_hf_model_class_uses_advertised_causal_lm_for_vlm_checkpoint():
+    from transformers import AutoModelForCausalLM, AutoModelForImageTextToText
+
+    config_dict = {
+        "auto_map": {
+            "AutoConfig": "configuration_step3p7.Step3p7Config",
+            "AutoModelForCausalLM": "modeling_step3p7.Step3p7ForConditionalGeneration",
+        }
+    }
+    with patch("transformers.PretrainedConfig.get_config_dict", return_value=(config_dict, {})):
+        resolved_cls = _resolve_hf_model_class("model-path", AutoModelForImageTextToText)
+
+    assert resolved_cls is AutoModelForCausalLM
+
+
+def test_hf_device_map_max_memory_caps_each_visible_gpu():
+    with patch("torch.cuda.device_count", return_value=8):
+        max_memory = _hf_device_map_max_memory("55")
+
+    assert max_memory == {index: "55GiB" for index in range(8)}
+
+
+def test_hf_device_map_max_memory_includes_optional_cpu_overflow():
+    with patch("torch.cuda.device_count", return_value=8):
+        max_memory = _hf_device_map_max_memory("65", "64")
+
+    assert max_memory == {**{index: "65GiB" for index in range(8)}, "cpu": "64GiB"}
+
+
+def test_peft_adapter_load_reuses_base_model_placement_constraints_without_key_conversion():
+    max_memory = {0: "55GiB", "cpu": "128GiB"}
+
+    load_kwargs = _peft_adapter_load_kwargs(
+        {
+            "device_map": "auto",
+            "max_memory": max_memory,
+            "torch_dtype": torch.bfloat16,
+            "trust_remote_code": True,
+        }
+    )
+
+    assert load_kwargs == {"key_mapping": {}, "device_map": "auto", "max_memory": max_memory}
+
+
+def test_peft_adapter_load_disables_key_conversion_without_a_base_device_map():
+    assert _peft_adapter_load_kwargs({"torch_dtype": torch.bfloat16}) == {"key_mapping": {}}
+
+
+def test_peft_adapter_fingerprints_match_saved_safetensors(tmp_path):
+    from safetensors.torch import save_file
+
+    adapter_path = tmp_path / "adapter_model.safetensors"
+    saved_state = {
+        "base_model.model.layer.lora_A.weight": torch.tensor([[1.0, 2.0]], dtype=torch.bfloat16),
+        "base_model.model.layer.lora_B.weight": torch.tensor([[3.0], [4.0]], dtype=torch.bfloat16),
+    }
+    save_file(saved_state, adapter_path)
+
+    with patch(
+        "peft.get_peft_model_state_dict", return_value={key: value.clone() for key, value in saved_state.items()}
+    ):
+        matched, ignored = _assert_peft_adapter_matches_checkpoint(Mock(), adapter_path)
+
+    assert matched == 2
+    assert ignored == 0
+
+
+def test_peft_adapter_fingerprints_ignore_reported_base_layer_tensor(tmp_path):
+    from safetensors.torch import save_file
+
+    adapter_path = tmp_path / "adapter_model.safetensors"
+    adapter_key = "base_model.model.lm_head.lora_A.weight"
+    saved_state = {adapter_key: torch.tensor([[1.0, 2.0]], dtype=torch.bfloat16)}
+    loaded_state = {
+        adapter_key: saved_state[adapter_key].clone(),
+        "base_model.model.lm_head.base_layer.weight": torch.tensor([[3.0, 4.0]], dtype=torch.bfloat16),
+    }
+    save_file(saved_state, adapter_path)
+
+    with patch("peft.get_peft_model_state_dict", return_value=loaded_state):
+        matched, ignored = _assert_peft_adapter_matches_checkpoint(Mock(), adapter_path)
+
+    assert matched == 1
+    assert ignored == 0
+
+
+def test_peft_adapter_fingerprints_allow_configured_hf_unsupported_prefix(tmp_path):
+    from safetensors.torch import save_file
+
+    adapter_path = tmp_path / "adapter_model.safetensors"
+    loaded_key = "base_model.model.layer.lora_A.weight"
+    ignored_key = "base_model.model.mtp.layers.0.eh_proj.lora_A.weight"
+    saved_state = {
+        loaded_key: torch.tensor([[1.0, 2.0]], dtype=torch.bfloat16),
+        ignored_key: torch.tensor([[3.0, 4.0]], dtype=torch.bfloat16),
+    }
+    save_file(saved_state, adapter_path)
+
+    with patch("peft.get_peft_model_state_dict", return_value={loaded_key: saved_state[loaded_key].clone()}):
+        matched, ignored = _assert_peft_adapter_matches_checkpoint(
+            Mock(),
+            adapter_path,
+            ignored_key_prefix="base_model.model.mtp.",
+        )
+
+    assert matched == 1
+    assert ignored == 1
+
+
+def test_peft_adapter_fingerprints_read_accelerate_offload_backing_tensor(tmp_path):
+    from safetensors.torch import save_file
+
+    class OffloadedPeftModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layer = torch.nn.Module()
+            self.layer.lora_A = torch.nn.ModuleDict({"default": torch.nn.Linear(2, 1, bias=False, device="meta")})
+            self.layer._hf_hook = SimpleNamespace(
+                hooks=(
+                    SimpleNamespace(
+                        weights_map={"lora_A.default.weight": torch.tensor([[1.0, 2.0]], dtype=torch.bfloat16)}
+                    ),
+                )
+            )
+
+    adapter_path = tmp_path / "adapter_model.safetensors"
+    key = "layer.lora_A.weight"
+    save_file({key: torch.tensor([[1.0, 2.0]], dtype=torch.bfloat16)}, adapter_path)
+    model = OffloadedPeftModel()
+
+    with patch("peft.get_peft_model_state_dict", return_value={key: torch.empty(1, 2, device="meta")}):
+        matched, ignored = _assert_peft_adapter_matches_checkpoint(model, adapter_path)
+
+    assert matched == 1
+    assert ignored == 0
+
+
+def test_peft_adapter_fingerprints_reject_missing_key_outside_configured_prefix(tmp_path):
+    from safetensors.torch import save_file
+
+    adapter_path = tmp_path / "adapter_model.safetensors"
+    key = "base_model.model.layer.lora_A.weight"
+    save_file({key: torch.tensor([[1.0, 2.0]], dtype=torch.bfloat16)}, adapter_path)
+
+    with (
+        patch("peft.get_peft_model_state_dict", return_value={}),
+        pytest.raises(AssertionError, match="adapter key mismatch"),
+    ):
+        _assert_peft_adapter_matches_checkpoint(
+            Mock(),
+            adapter_path,
+            ignored_key_prefix="base_model.model.mtp.",
+        )
+
+
+def test_peft_adapter_fingerprints_report_tensor_mismatch(tmp_path):
+    from safetensors.torch import save_file
+
+    adapter_path = tmp_path / "adapter_model.safetensors"
+    key = "base_model.model.layer.lora_A.weight"
+    save_file({key: torch.tensor([[1.0, 2.0]], dtype=torch.bfloat16)}, adapter_path)
+
+    with (
+        patch("peft.get_peft_model_state_dict", return_value={key: torch.tensor([[1.0, 3.0]], dtype=torch.bfloat16)}),
+        pytest.raises(AssertionError, match="adapter tensor mismatch"),
+    ):
+        _assert_peft_adapter_matches_checkpoint(Mock(), adapter_path)
+
+
+def test_remote_masking_api_compatibility_drops_removed_cache_position(monkeypatch):
+    import transformers.masking_utils as masking_utils
+
+    calls = []
+
+    def create_mask(config, inputs_embeds, attention_mask, past_key_values, position_ids=None):
+        calls.append((config, inputs_embeds, attention_mask, past_key_values, position_ids))
+        return "mask"
+
+    monkeypatch.setattr(masking_utils, "create_causal_mask", create_mask)
+    monkeypatch.setattr(masking_utils, "create_sliding_window_causal_mask", create_mask)
+
+    _patch_remote_masking_api_compatibility()
+    _patch_remote_masking_api_compatibility()
+
+    for function_name in ("create_causal_mask", "create_sliding_window_causal_mask"):
+        result = getattr(masking_utils, function_name)(
+            "config",
+            "inputs",
+            "attention",
+            "cache",
+            position_ids="positions",
+            cache_position="removed-argument",
+        )
+        assert result == "mask"
+
+    assert calls == [
+        ("config", "inputs", "attention", "cache", "positions"),
+        ("config", "inputs", "attention", "cache", "positions"),
+    ]
+
+
+def test_remote_masking_api_compatibility_preserves_supported_api(monkeypatch):
+    import transformers.masking_utils as masking_utils
+
+    def create_mask(config, inputs_embeds, attention_mask, past_key_values, cache_position=None):
+        return cache_position
+
+    monkeypatch.setattr(masking_utils, "create_causal_mask", create_mask)
+    monkeypatch.setattr(masking_utils, "create_sliding_window_causal_mask", create_mask)
+
+    _patch_remote_masking_api_compatibility()
+
+    assert masking_utils.create_causal_mask is create_mask
+    assert masking_utils.create_sliding_window_causal_mask is create_mask
 
 
 @pytest.mark.parametrize("metadata_api", ["legacy", "user"])
@@ -108,12 +337,13 @@ def test_get_logits_pp_pads_prompt_to_static_stage_sequence_length(metadata_api)
 
     assert schedule.ids.tolist() == [[11, 12, 13] + [0] * 13]
     assert schedule.attention_mask.shape == (1, 16)
+    assert schedule.attention_mask.tolist() == [[1, 1, 1] + [0] * 13]
     assert logits.shape == (1, 3, 7)
 
 
 @pytest.mark.parametrize(
     ("model_type", "expected_attn_implementation"),
-    [("nemotron_h", "eager"), ("nemotron_flash", "flash_attention_2")],
+    [("nemotron_h", "eager"), ("step3p7", "eager"), ("nemotron_flash", "flash_attention_2")],
 )
 def test_remote_code_attention_implementation(model_type, expected_attn_implementation):
     with patch(
@@ -189,6 +419,43 @@ def test_hf_model_load_context_keeps_meta_for_device_map(
     assert no_hf_meta_device.call_count == expected_no_meta_calls
 
 
+def test_lm_head_alias_check_skips_nonstandard_embedding_accessor():
+    class InputDependentEmbeddingModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lm_head = torch.nn.Linear(2, 2, bias=False)
+
+        def get_input_embeddings(self, input_ids):
+            raise AssertionError("input-dependent accessor must not be called")
+
+    assert _lm_head_embedding_aliased(InputDependentEmbeddingModel()) is None
+
+
+def test_lm_head_alias_check_skips_wrapper_around_input_dependent_accessor():
+    class InputDependentEmbeddingModel(torch.nn.Module):
+        def get_input_embeddings(self, input_ids):
+            raise AssertionError("input-dependent accessor must not be called")
+
+    class WrapperModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = InputDependentEmbeddingModel()
+            self.lm_head = torch.nn.Linear(2, 2, bias=False)
+
+        def get_input_embeddings(self):
+            return self.model.get_input_embeddings()
+
+    assert _lm_head_embedding_aliased(WrapperModel()) is None
+
+
+def test_peft_no_split_modules_are_normalized_for_accelerate():
+    model = SimpleNamespace(_no_split_modules={"SecondLayer", "FirstLayer"})
+
+    _normalize_peft_no_split_modules(model)
+
+    assert model._no_split_modules == ["FirstLayer", "SecondLayer"]
+
+
 @pytest.mark.parametrize(("offline", "expected_local_files_only"), [(None, False), ("1", True)])
 def test_hf_source_load_kwargs_respects_hf_offline(monkeypatch, offline, expected_local_files_only):
     if offline is None:
@@ -248,6 +515,67 @@ def test_get_vlm_input_ids_uses_processor_tokenizer(monkeypatch, offline, expect
     )
 
 
+def test_load_input_ids_once_shares_rank0_result(tmp_path, monkeypatch):
+    cfg = SimpleNamespace(checkpoint=SimpleNamespace(checkpoint_dir=tmp_path / "checkpoints"))
+    rank0_loader = Mock(return_value=[31, 32, 33])
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    monkeypatch.setenv("SLURM_JOB_ID", "input-id-test")
+    monkeypatch.setenv("RANK", "0")
+
+    assert _load_input_ids_once(cfg, rank0_loader, "model/tokenizer") == [31, 32, 33]
+    rank0_loader.assert_called_once_with("model/tokenizer")
+
+    rank1_loader = Mock(side_effect=AssertionError("nonzero rank must not load the tokenizer"))
+    monkeypatch.setenv("RANK", "1")
+
+    assert _load_input_ids_once(cfg, rank1_loader, "model/tokenizer") == [31, 32, 33]
+    rank1_loader.assert_not_called()
+
+    rank0_reuse_loader = Mock(side_effect=AssertionError("rank 0 must reuse the published input IDs"))
+    monkeypatch.setenv("RANK", "0")
+
+    assert _load_input_ids_once(cfg, rank0_reuse_loader, "model/tokenizer") == [31, 32, 33]
+    rank0_reuse_loader.assert_not_called()
+
+
+def test_load_input_ids_once_waits_for_payload_visibility(tmp_path, monkeypatch):
+    cfg = SimpleNamespace(checkpoint=SimpleNamespace(checkpoint_dir=tmp_path / "checkpoints"))
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    monkeypatch.setenv("SLURM_JOB_ID", "input-id-visibility-test")
+    monkeypatch.delenv("SLURM_STEP_ID", raising=False)
+    monkeypatch.delenv("SLURM_RESTART_COUNT", raising=False)
+    monkeypatch.setenv("RANK", "1")
+    sync_dir = tmp_path / ".checkpoint_robustness_input_ids_slurm_input-id-visibility-test_step_0"
+    sync_dir.mkdir()
+    (sync_dir / "done").write_text("ok\n")
+
+    def publish_payload(_seconds):
+        (sync_dir / "input_ids.json").write_text("[41, 42, 43]")
+
+    loader = Mock(side_effect=AssertionError("nonzero rank must not load the tokenizer"))
+    with patch(
+        "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm.time.sleep",
+        side_effect=publish_payload,
+    ):
+        assert _load_input_ids_once(cfg, loader, "model/tokenizer") == [41, 42, 43]
+
+    loader.assert_not_called()
+
+
+def test_load_input_ids_once_propagates_rank0_failure(tmp_path, monkeypatch):
+    cfg = SimpleNamespace(checkpoint=SimpleNamespace(checkpoint_dir=tmp_path / "checkpoints"))
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    monkeypatch.setenv("SLURM_JOB_ID", "input-id-failure-test")
+    monkeypatch.setenv("RANK", "0")
+
+    with pytest.raises(ValueError, match="tokenizer failed"):
+        _load_input_ids_once(cfg, Mock(side_effect=ValueError("tokenizer failed")), "model/tokenizer")
+
+    monkeypatch.setenv("RANK", "1")
+    with pytest.raises(RuntimeError, match="Rank 0 input-ID loading failed"):
+        _load_input_ids_once(cfg, Mock(), "model/tokenizer")
+
+
 def test_vllm_deploy_tokenization_omits_token_type_ids():
     from tokenizers import Tokenizer
     from tokenizers.models import WordLevel
@@ -274,6 +602,311 @@ def test_extract_custom_args_accepts_hf_source_post_load_dequantize():
 
     assert custom["hf_source_post_load_dequantize"] is True
     assert remaining == ["--other-arg"]
+
+
+def test_extract_custom_args_accepts_isolated_phase():
+    custom, remaining = _extract_custom_args(["--isolated_phase", "train_and_save", "--other-arg"])
+
+    assert custom["isolated_phase"] == "train_and_save"
+    assert remaining == ["--other-arg"]
+
+
+def test_extract_custom_args_accepts_skip_hf_logit_parity():
+    custom, remaining = _extract_custom_args(["--skip_hf_logit_parity", "--other-arg"])
+
+    assert custom["skip_hf_logit_parity"] is True
+    assert remaining == ["--other-arg"]
+
+
+def test_extract_custom_args_accepts_skip_automodel_logit_parity():
+    custom, remaining = _extract_custom_args(["--skip_automodel_logit_parity", "--other-arg"])
+
+    assert custom["skip_automodel_logit_parity"] is True
+    assert remaining == ["--other-arg"]
+
+
+def test_extract_custom_args_accepts_hf_adapter_ignored_key_prefix():
+    custom, remaining = _extract_custom_args(
+        ["--hf_adapter_ignored_key_prefix", "base_model.model.mtp.", "--other-arg"]
+    )
+
+    assert custom["hf_adapter_ignored_key_prefix"] == "base_model.model.mtp."
+    assert remaining == ["--other-arg"]
+
+
+def test_distributed_failure_prints_stable_phase_marker(monkeypatch, capsys):
+    monkeypatch.setenv("RANK", "0")
+    failure = (
+        "CHECKPOINT_ROBUSTNESS_PHASE_FAILURE phase=automodel_reload check=logit_kl\n"
+        "max per-token KL exceeded its threshold"
+    )
+
+    with pytest.raises(AssertionError, match="max per-token KL exceeded"):
+        _raise_distributed_failure(failure)
+
+    assert capsys.readouterr().err == (
+        "[checkpoint_robustness][phase-error] "
+        "CHECKPOINT_ROBUSTNESS_PHASE_FAILURE phase=automodel_reload check=logit_kl\n"
+    )
+
+
+def test_process_isolated_hf_reload_runs_rank0_hf_loader(tmp_path):
+    artifact_dir = tmp_path / ".checkpoint_robustness"
+    artifact_dir.mkdir()
+    (artifact_dir / "reference_logits.pt").write_bytes(b"reference")
+    cfg = SimpleNamespace(
+        checkpoint=SimpleNamespace(checkpoint_dir=tmp_path),
+        get=lambda key, default=None: default,
+    )
+    reference_logits = torch.randn(1, 2, 3)
+    recipe_cls = Mock()
+    hf_model_cls = Mock()
+    custom_args = {"hf_device_map_auto": True, "no_check_resume": True, "trust_remote_code": True}
+
+    with (
+        patch(
+            "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm.parse_args_and_load_config",
+            return_value=cfg,
+        ),
+        patch(
+            "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm."
+            "_disable_distributed_atexit_teardown"
+        ),
+        patch(
+            "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm._load_input_ids_once",
+            return_value=[11, 12],
+        ),
+        patch("torch.distributed.init_process_group") as init_process_group,
+        patch(
+            "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm._prepare_hf_reload_sync",
+            return_value=None,
+        ),
+        patch(
+            "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm._finish_hf_reload_sync",
+            side_effect=lambda paths, error: error,
+        ),
+        patch(
+            "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm._raise_distributed_failure"
+        ) as raise_distributed_failure,
+        patch(
+            "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm._run_vanilla_hf_reload",
+            return_value=None,
+        ) as run_hf_reload,
+        patch("torch.load", return_value=reference_logits),
+    ):
+        _run_process_isolated_checkpoint_phase(
+            "hf_reload",
+            custom_args=custom_args,
+            recipe_cls=recipe_cls,
+            hf_model_cls=hf_model_cls,
+            input_ids_loader=Mock(),
+        )
+
+    init_process_group.assert_called_once()
+    assert init_process_group.call_args.kwargs["backend"] == "gloo"
+    assert init_process_group.call_args.kwargs["timeout"].total_seconds() == 60
+    run_hf_reload.assert_called_once_with(
+        cfg,
+        [11, 12],
+        reference_logits,
+        hf_model_cls=hf_model_cls,
+        custom_args=custom_args,
+    )
+    raise_distributed_failure.assert_called_once_with(None)
+    recipe_cls.assert_not_called()
+
+
+def test_process_isolated_resume_rejects_no_check_resume():
+    with pytest.raises(ValueError, match="conflicts with no_check_resume=true"):
+        _run_process_isolated_checkpoint_phase(
+            "resume",
+            custom_args={"no_check_resume": True},
+            recipe_cls=Mock(),
+            hf_model_cls=Mock(),
+            input_ids_loader=Mock(),
+        )
+
+
+@pytest.mark.parametrize("non_finite_kl", [float("nan"), float("inf"), float("-inf")])
+def test_hf_reload_rejects_non_finite_kl(non_finite_kl):
+    assert "non-finite KL divergence" in _hf_reload_kl_error(non_finite_kl, 7e-2)
+
+
+def test_process_isolated_source_load_reference_persists_hf_artifacts(tmp_path):
+    cfg = SimpleNamespace(checkpoint=SimpleNamespace(checkpoint_dir=tmp_path))
+    reference_logits = torch.randn(1, 2, 3)
+    source_reference = (reference_logits, False, False)
+    recipe_cls = Mock()
+    hf_model_cls = Mock()
+    custom_args = {
+        "check_source_load_parity": True,
+        "hf_device_map_auto": True,
+        "trust_remote_code": True,
+    }
+
+    with (
+        patch(
+            "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm.parse_args_and_load_config",
+            return_value=cfg,
+        ),
+        patch(
+            "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm."
+            "_disable_distributed_atexit_teardown"
+        ),
+        patch(
+            "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm._load_input_ids_once",
+            return_value=[11, 12],
+        ),
+        patch(
+            "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm."
+            "_prepare_source_load_reference",
+            return_value=source_reference,
+        ) as prepare_source_load,
+    ):
+        _run_process_isolated_checkpoint_phase(
+            "source_load_reference",
+            custom_args=custom_args,
+            recipe_cls=recipe_cls,
+            hf_model_cls=hf_model_cls,
+            input_ids_loader=Mock(),
+        )
+
+    prepare_source_load.assert_called_once_with(
+        cfg,
+        [11, 12],
+        hf_model_cls=hf_model_cls,
+        trust_remote_code=True,
+        experts_implementation=None,
+        hf_device_map_auto=True,
+        hf_source_post_load_dequantize=False,
+    )
+    persisted_logits = torch.load(
+        tmp_path / ".checkpoint_robustness" / "source_load_reference_logits.pt",
+        map_location="cpu",
+        weights_only=True,
+    )
+    torch.testing.assert_close(persisted_logits, reference_logits)
+    assert (
+        tmp_path / ".checkpoint_robustness" / "source_load_reference_metadata.json"
+    ).read_text() == '{"explicit_tie_word_embeddings": false, "hf_aliased": false}'
+    recipe_cls.assert_not_called()
+
+
+def test_wait_for_source_load_artifacts_waits_for_both_files(tmp_path):
+    reference_path = tmp_path / "reference.pt"
+    metadata_path = tmp_path / "metadata.json"
+    fail_path = tmp_path / "fail"
+    sleep_calls = 0
+
+    def publish_artifacts(_seconds):
+        nonlocal sleep_calls
+        sleep_calls += 1
+        if sleep_calls == 1:
+            reference_path.write_bytes(b"reference")
+        else:
+            metadata_path.write_text("{}")
+
+    with patch(
+        "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm.time.sleep",
+        side_effect=publish_artifacts,
+    ):
+        _wait_for_source_load_artifacts(reference_path, metadata_path, fail_path)
+
+    assert sleep_calls == 2
+
+
+def test_process_isolated_source_load_parity_compares_persisted_reference(tmp_path):
+    artifact_dir = tmp_path / ".checkpoint_robustness"
+    artifact_dir.mkdir()
+    reference_logits = torch.randn(1, 2, 3)
+    torch.save(reference_logits, artifact_dir / "source_load_reference_logits.pt")
+    (artifact_dir / "source_load_reference_metadata.json").write_text(
+        '{"explicit_tie_word_embeddings": false, "hf_aliased": false}'
+    )
+    cfg = SimpleNamespace(checkpoint=SimpleNamespace(checkpoint_dir=tmp_path))
+    candidate_logits = torch.randn(1, 2, 3)
+    model_part = torch.nn.Linear(2, 2, bias=False)
+    source_trainer = SimpleNamespace(model_parts=[model_part], setup=Mock())
+    recipe_cls = Mock(return_value=source_trainer)
+    custom_args = {
+        "check_source_load_parity": True,
+        "source_load_kl_threshold": "4e-2",
+        "source_load_mean_kl_threshold": "1e-2",
+        "source_load_cosine_threshold": "0.9985",
+    }
+
+    with (
+        patch(
+            "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm.parse_args_and_load_config",
+            return_value=cfg,
+        ),
+        patch(
+            "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm."
+            "_disable_distributed_atexit_teardown"
+        ),
+        patch(
+            "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm._load_input_ids_once",
+            return_value=[11, 12],
+        ),
+        patch(
+            "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm._get_logits",
+            return_value=candidate_logits,
+        ),
+        patch(
+            "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm._lm_head_embedding_aliased",
+            return_value=False,
+        ),
+        patch(
+            "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm._compare_source_load_parity",
+            return_value=None,
+        ) as compare_source_load,
+        patch(
+            "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm._cleanup_source_load_sync"
+        ) as cleanup_source_load,
+        patch("tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm._barrier"),
+        patch(
+            "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm._raise_distributed_failure"
+        ) as raise_distributed_failure,
+    ):
+        _run_process_isolated_checkpoint_phase(
+            "source_load_parity",
+            custom_args=custom_args,
+            recipe_cls=recipe_cls,
+            hf_model_cls=Mock(),
+            input_ids_loader=Mock(),
+        )
+
+    recipe_cls.assert_called_once_with(cfg)
+    source_trainer.setup.assert_called_once_with()
+    compare_args = compare_source_load.call_args
+    torch.testing.assert_close(compare_args.args[0][0], reference_logits)
+    assert compare_args.args[0][1:] == (False, False)
+    assert compare_args.args[1:] == (candidate_logits, False)
+    assert compare_args.kwargs == {
+        "source_load_kl_threshold": 4e-2,
+        "source_load_mean_kl_threshold": 1e-2,
+        "source_load_cosine_threshold": 0.9985,
+    }
+    cleanup_source_load.assert_called_once_with(cfg)
+    raise_distributed_failure.assert_called_once_with(None)
+
+
+def test_trainable_parameter_digests_hash_only_trainable_parameters():
+    first_part = torch.nn.Linear(2, 2, bias=False)
+    second_part = torch.nn.Linear(2, 1, bias=False)
+    second_part.weight.requires_grad_(False)
+    with torch.no_grad():
+        first_part.weight.copy_(torch.tensor([[1.0, 2.0], [3.0, 4.0]]))
+
+    before = _trainable_parameter_digests([first_part, second_part])
+    with torch.no_grad():
+        first_part.weight[0, 0] = 5.0
+    after = _trainable_parameter_digests([first_part, second_part])
+
+    assert set(before) == {"part_0:weight"}
+    assert before["part_0:weight"]["dtype"] == "torch.float32"
+    assert before["part_0:weight"]["shape"] == [2, 2]
+    assert before["part_0:weight"]["sha256"] != after["part_0:weight"]["sha256"]
 
 
 def test_keep_hf_modules_in_fp32_uses_strict_dtype_plan_and_restores_class_state(tmp_path):

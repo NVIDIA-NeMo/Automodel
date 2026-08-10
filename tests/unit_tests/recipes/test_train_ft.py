@@ -1216,7 +1216,7 @@ def test_run_train_validation_loop_calls_gc_hook_once_per_step():
     trainer.val_dataloaders = {}
     trainer.metric_logger_train = SimpleNamespace(close=MagicMock())
     trainer.metric_logger_valid = {}
-    trainer.checkpointer = SimpleNamespace(close=MagicMock())
+    trainer.checkpointer = SimpleNamespace(finalize=MagicMock())
     trainer.best_metric_key = "default"
 
     trainer.run_train_validation_loop()
@@ -2028,7 +2028,14 @@ class TestRunTrainOptimStepSetsMoEScale:
 
         MoEAuxLossAutoScaler.main_loss_backward_scale = None
 
-    def _make_recipe(self, monkeypatch, pp_enabled, dp_group_size=4):
+    def _make_recipe(
+        self,
+        monkeypatch,
+        pp_enabled,
+        dp_group_size=4,
+        cp_group_size=1,
+        pp_microbatches=1,
+    ):
         from nemo_automodel.components.config.loader import ConfigNode
 
         cfg = ConfigNode(
@@ -2068,8 +2075,21 @@ class TestRunTrainOptimStepSetsMoEScale:
         object.__setattr__(recipe, "step_scheduler", SimpleNamespace(step=1, epoch=0))
 
         if pp_enabled:
-            pp_info = SimpleNamespace(has_first_stage=True, has_last_stage=True)
-            object.__setattr__(recipe, "pp", SimpleNamespace(info=pp_info, update_seq_len=lambda seq_len: None))
+            pp_info = SimpleNamespace(
+                has_first_stage=True,
+                has_last_stage=True,
+                schedule=SimpleNamespace(_n_microbatches=pp_microbatches),
+            )
+            object.__setattr__(
+                recipe,
+                "pp",
+                SimpleNamespace(
+                    info=pp_info,
+                    pp_batch_size=pp_microbatches,
+                    pp_microbatch_size=1,
+                    update_seq_len=lambda seq_len: None,
+                ),
+            )
             # Stub the PP last-stage broadcast helper (post-d96f1b20 the recipe
             # broadcasts inside the PP group instead of using send/recv).
             monkeypatch.setattr(recipe, "_broadcast_from_last_pp_stage", lambda t: t)
@@ -2081,7 +2101,7 @@ class TestRunTrainOptimStepSetsMoEScale:
             lambda val, include_cp=False: val if isinstance(val, torch.Tensor) else torch.tensor(val),
         )
         monkeypatch.setattr(recipe, "_get_dp_group_size", lambda include_cp=False: dp_group_size)
-        monkeypatch.setattr(recipe, "_get_cp_group_size", lambda: 1)
+        monkeypatch.setattr(recipe, "_get_cp_group_size", lambda: cp_group_size)
 
         def mock_forward_backward_step(idx, batch, *, loss_buffer, num_label_tokens, num_batches, is_train=True):
             loss_buffer.append(torch.tensor(0.5))
@@ -2099,31 +2119,60 @@ class TestRunTrainOptimStepSetsMoEScale:
         object.__setattr__(recipe, "timestamp", 0.0)
         return recipe
 
-    def test_pp_enabled_sets_scale_to_num_label_tokens(self, monkeypatch):
+    def test_pp_scale_includes_pipeline_microbatches_and_token_normalization(self, monkeypatch):
         from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 
-        recipe = self._make_recipe(monkeypatch, pp_enabled=True, dp_group_size=4)
+        recipe = self._make_recipe(
+            monkeypatch,
+            pp_enabled=True,
+            dp_group_size=8,
+            cp_group_size=2,
+            pp_microbatches=4,
+        )
 
-        # 3 valid labels out of 4
-        batches = [{"input_ids": torch.tensor([[1, 2, 3, 4]]), "labels": torch.tensor([[1, 2, 3, -100]])}]
+        batches = [
+            {"input_ids": torch.tensor([[1, 2, 3, 4]]), "labels": torch.tensor([[1, 2, 3, -100]])},
+            {"input_ids": torch.tensor([[5, 6, 7, 8]]), "labels": torch.tensor([[5, 6, 7, -100]])},
+        ]
 
         recipe._run_train_optim_step(batches)
 
         assert MoEAuxLossAutoScaler.main_loss_backward_scale is not None
-        assert MoEAuxLossAutoScaler.main_loss_backward_scale.item() == pytest.approx(3.0)
+        # 2 outer batches * 4 PP microbatches = 8 model microbatches.
+        # Base CP-aware average: 2 / 8. PP post-normalization compensation: 6 / 8.
+        assert MoEAuxLossAutoScaler.main_loss_backward_scale.item() == pytest.approx(0.1875)
 
-    def test_pp_disabled_sets_scale_to_dp_group_size(self, monkeypatch):
+    @pytest.mark.parametrize("dp_size", [1, 8])
+    def test_non_pp_scale_is_independent_of_dp_size(self, monkeypatch, dp_size):
         from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 
-        dp_size = 8
         recipe = self._make_recipe(monkeypatch, pp_enabled=False, dp_group_size=dp_size)
 
-        batches = [{"input_ids": torch.tensor([[1, 2, 3, 4]]), "labels": torch.tensor([[1, 2, 3, -100]])}]
+        batches = [
+            {"input_ids": torch.tensor([[1, 2, 3, 4]]), "labels": torch.tensor([[1, 2, 3, -100]])} for _ in range(4)
+        ]
 
         recipe._run_train_optim_step(batches)
 
         assert MoEAuxLossAutoScaler.main_loss_backward_scale is not None
-        assert MoEAuxLossAutoScaler.main_loss_backward_scale.item() == pytest.approx(float(dp_size))
+        assert MoEAuxLossAutoScaler.main_loss_backward_scale.item() == pytest.approx(0.25)
+
+    def test_non_pp_scale_restores_cp_sum(self, monkeypatch):
+        from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
+
+        recipe = self._make_recipe(
+            monkeypatch,
+            pp_enabled=False,
+            dp_group_size=8,
+            cp_group_size=2,
+        )
+        batches = [
+            {"input_ids": torch.tensor([[1, 2, 3, 4]]), "labels": torch.tensor([[1, 2, 3, -100]])} for _ in range(4)
+        ]
+
+        recipe._run_train_optim_step(batches)
+
+        assert MoEAuxLossAutoScaler.main_loss_backward_scale.item() == pytest.approx(0.5)
 
 
 # -----------------------------------------------------------------------------

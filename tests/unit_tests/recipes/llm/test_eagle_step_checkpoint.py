@@ -320,7 +320,6 @@ def _saving_recipe(recipe_cls, tmp_path):
     recipe.rng = MagicMock()
     recipe._module = lambda: SimpleNamespace(draft_model=nn.Linear(2, 2))
     recipe._save_extra_state = lambda path, epoch: None
-    recipe._update_latest_symlink = lambda path: None
     recipe.cfg = SimpleNamespace()  # no raw_config -> the config snapshot is skipped
     return recipe
 

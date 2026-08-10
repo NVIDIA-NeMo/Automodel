@@ -242,6 +242,7 @@ class ModelSupports:
         +------------------+----------------+---------+
         | Model kind       | Attention      | CP?     |
         +------------------+----------------+---------+
+        | Custom (owns CP) | any            | Yes     |
         | Custom           | TE             | Yes     |
         | Custom           | Magi (FFA)     | Yes     |
         | Custom hybrid    | TE / SDPA      | Yes     |
@@ -251,6 +252,11 @@ class ModelSupports:
         | HF hybrid (Mamba)| any            | No      |
         +------------------+----------------+---------+
         """
+        if getattr(self._model, "_owns_cp_attention", False):
+            # The model ships its own CP batch sharding and per-layer transport for
+            # every layer type it has (e.g. Kimi Linear's FLA context for KDA plus
+            # gathered-KV FlexAttention for MLA), so no attention backend is required.
+            return True
         if _has_backend(self._model):
             backend_attn = getattr(getattr(self._model, "backend", None), "attn", None)
             if _is_deepseek_v4(self._model) or _is_glm_moe_dsa(self._model):
@@ -283,6 +289,10 @@ class ModelSupports:
             or _uses_te_attention(model)
             or _uses_magi_attention(model)
             or (self.supports_thd and backend_attn == "tilelang")
+            # Models that build their own per-document masks (Kimi Linear's
+            # document-blocked causal mask plus per-document KDA ``cu_seqlens``)
+            # need no packing-aware attention backend.
+            or getattr(model, "_owns_packed_attention", False)
         )
         return _supports_seq_lens(model) and sp_attn_backend
 
@@ -347,11 +357,21 @@ class ModelSupports:
         MagiAttention dispatches the packed sequence across the CP group with its
         own load-balancing solver and a per-document varlen mask, so it supports
         CP + packing (see ``context_parallel.magi.magi_prepare_packed_cp``). Models
-        with native THD support own their packed CP path in TileLang attention."""
+        with native THD support own their packed CP path in TileLang attention.
+        Models can restrict a model-owned packed CP path to specific attention
+        backends with ``_packed_cp_attn_backends``.
+        Models that own their CP end to end (``_owns_cp_attention``) shard the
+        packed batch themselves and carry document boundaries into every layer."""
         model = self._model
         if not self.supports_sequence_packing:
             return False
         if self.cp_size <= 1:
+            return True
+        model_owned_backends = getattr(model, "_packed_cp_attn_backends", None)
+        if model_owned_backends is not None:
+            backend_attn = getattr(getattr(model, "backend", None), "attn", None)
+            return _supports_seq_lens(model) and backend_attn in model_owned_backends
+        if getattr(model, "_owns_cp_attention", False):
             return True
         if self.supports_thd:
             backend_attn = getattr(getattr(model, "backend", None), "attn", None)
