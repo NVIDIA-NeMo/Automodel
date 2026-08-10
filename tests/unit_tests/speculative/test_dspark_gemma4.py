@@ -76,9 +76,18 @@ def _build_gemma4_draft():
 
 
 def test_gemma4_draft_forward_shapes():
-    with torch.random.fork_rng(devices=[]):
+    # This is a CPU-only shape check. Isolate it from any earlier test that
+    # temporarily selected CUDA as PyTorch's default device.
+    with torch.device("cpu"), torch.random.fork_rng(devices=[]):
         torch.manual_seed(7)
         model = _build_gemma4_draft()
+        # The framework defaults used by the full unit-test process can change
+        # module initialization behavior. Bound every floating-point parameter
+        # explicitly because this test exercises shapes, not initialization.
+        with torch.no_grad():
+            for parameter in model.parameters():
+                if parameter.is_floating_point():
+                    parameter.uniform_(-0.02, 0.02)
         b, s, block, anchors = 2, 16, 4, 8
         gen = torch.Generator().manual_seed(0)
         with torch.no_grad():
