@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""MuseGlimmer 29B TE context-parallel parity on deterministic real MedPix data.
+"""MuseGlimmer 30B TE context-parallel parity on deterministic real MedPix data.
 
 Run both commands on the same 8-GPU node:
 
