@@ -1,0 +1,151 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# MuseGlimmer 29B dense text-only SFT with a real 16-Ki-token THD pack.
+#
+# Each dataloader row contains 16384 tokens assembled from Tulu-3 documents.
+# cu_seqlens preserves document boundaries, so TE runs block-diagonal causal
+# attention and position_ids restart for every document. TP2 shards the full
+# MuseGlimmer attention/MLP/vocabulary stack; CP4 leaves 4096 packed tokens on each
+# rank. TP2 also exactly divides MuseGlimmer's 202048-token vocabulary. The full mesh
+# is one 8-GPU node:
+#
+#   automodel \
+#     examples/llm_finetune/muse_glimmer/muse_glimmer_29b_tulu3_te_tp2_cp4_packed_16k.yaml \
+#     --nproc-per-node 8
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+seed: 1234
+
+step_scheduler:
+  global_batch_size: 1
+  local_batch_size: 1
+  ckpt_every_steps: 1000
+  val_every_steps: 1000
+  log_remote_every_steps: 1
+  gc_every_steps: 5
+  num_epochs: 1
+  max_steps: 100
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 60
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 1234
+  ranked: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: ../muse-glimmer-final-hf
+  torch_dtype: bfloat16
+  # HF config validation remains on SDPA; native language attention is selected below.
+  attn_implementation: sdpa
+  backend:
+    attn: te
+  use_liger_kernel: false
+
+checkpoint:
+  enabled: false
+  checkpoint_dir: checkpoints/muse_glimmer_29b_tulu3_te_tp2_cp4_packed_16k/
+  model_save_format: safetensors
+  save_consolidated: false
+
+distributed:
+  strategy: fsdp2
+  dp_size: none
+  tp_size: 2
+  cp_size: 4
+  pp_size: 1
+  ep_size: 1
+  sequence_parallel: false
+  activation_checkpointing: true
+  reshard_after_forward: true
+  defer_fsdp_grad_sync: false
+
+# Checkpointed linear CE avoids materializing an [4096, 202048] local logits
+# tensor and needs no optional package. Native MuseGlimmer folds
+# output_multiplier into hidden states; the soft cap below therefore matches
+# the native HF logits exactly.
+loss_fn:
+  _target_: nemo_automodel.components.loss.linear_ce.CheckpointedLinearCrossEntropy
+  logit_softcapping: 20.0
+  reduction: sum
+  # Keep the transient fp32 vocabulary projection small enough that TE's
+  # CP4 p2p communicators still have CUDA allocation headroom in backward.
+  chunk_size: 64
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
+  path_or_dataset_id: allenai/tulu-3-sft-mixture
+  split: train[:100000]
+  shuffle_seed: 42
+  truncation: true
+  # Keep every document (plus its bounded pack-tail padding) within MuseGlimmer's 2K
+  # sliding window. TE p2p can then represent sliding layers as full-causal
+  # with exactly identical attention, while the packed row itself remains
+  # 16K and document-local positions restart at every cu_seqlens boundary.
+  seq_length: 1024
+  padding: false
+  tokenizer:
+    _target_: transformers.AutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: ../muse-glimmer-final-hf
+    trust_remote_code: false
+
+packed_sequence:
+  packing_strategy: thd
+  packed_sequence_size: 16384
+  # 100 optimizer steps plus a small safety margin without preprocessing the
+  # entire mixture on every rank.
+  max_packs: 104
+  num_proc: 1
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  batch_size: 1
+  num_workers: 0
+  drop_last: true
+  shuffle: false
+  collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
+
+# No validation pass: the requested artifact is exactly 100 real train steps.
+validation_dataset: none
+validation_dataloader: none
+
+optimizer:
+  _target_: torch.optim.AdamW
+  betas: [0.9, 0.95]
+  eps: 1e-8
+  lr: 5.0e-6
+  weight_decay: 0.1
+  foreach: false
+
+lr_scheduler:
+  lr_decay_style: constant
+
+wandb:
+  enable: true
+  project: huiyingl_workspace
+  entity: Nemo-automodel
+  name: muse_glimmer_29b_tulu3_te_tp2_cp4_packed_16k_100step_20260809
+  group: muse_glimmer_29b_tulu3_te_packed_16k
+  tags: [muse_glimmer, 29b, dense, text, tulu3, packed, thd, 16k, te, tp2, cp4, single-node]
+  dir: logs/muse_glimmer_29b_tulu3_te_tp2_cp4_packed_16k/wandb
+
+ci:
+  recipe_owner: HuiyingLi
+  nodes: 1
+  time: "02:00:00"
+  max_steps: 2

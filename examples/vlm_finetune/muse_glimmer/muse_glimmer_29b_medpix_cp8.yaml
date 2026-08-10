@@ -1,0 +1,136 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# MuseGlimmer is a dense VLM. Its native Transformer Engine attention uses
+# load-balanced context parallelism. The replicated vision tower runs before
+# the spliced text hidden states are sharded.
+#
+# Run on one 8-GPU node:
+#   automodel examples/vlm_finetune/muse_glimmer/muse_glimmer_29b_medpix_cp8.yaml --nproc-per-node 8
+
+recipe: FinetuneRecipeForVLM
+
+seed: 1234
+
+step_scheduler:
+  global_batch_size: 8
+  local_batch_size: 1
+  ckpt_every_steps: 1000
+  val_every_steps: 20
+  log_remote_every_steps: 1
+  gc_every_steps: 5
+  num_epochs: 1
+  max_steps: 100
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 1234
+  ranked: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: ../muse-glimmer-final-hf
+  torch_dtype: bfloat16
+  # HF config validation remains on SDPA; native language attention is selected below.
+  attn_implementation: sdpa
+  backend:
+    attn: te
+  use_liger_kernel: false
+
+processor:
+  _target_: transformers.AutoProcessor.from_pretrained
+  pretrained_model_name_or_path: ../muse-glimmer-final-hf
+  trust_remote_code: true
+
+checkpoint:
+  enabled: false
+  checkpoint_dir: checkpoints/muse_glimmer_29b_medpix_cp8/
+  model_save_format: safetensors
+  save_consolidated: false
+
+distributed:
+  strategy: fsdp2
+  dp_size: none
+  tp_size: 1
+  cp_size: 8
+  pp_size: 1
+  ep_size: 1
+  sequence_parallel: false
+  activation_checkpointing: true
+  # CP8 uses eight microbatches per optimizer step. Reduce-scatter gradients
+  # after every microbatch to avoid retaining full gradients across accumulation.
+  defer_fsdp_grad_sync: false
+
+freeze_config:
+  freeze_vision_tower: true
+  freeze_audio_tower: true
+  freeze_language_model: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset
+  path_or_dataset: mmoukouba/MedPix-VQA
+  split: train
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 0
+  drop_last: true
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.vlm.collate_fns.default_collate_fn
+    max_length: 4096
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset
+  path_or_dataset: mmoukouba/MedPix-VQA
+  split: validation
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 0
+  drop_last: true
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.vlm.collate_fns.default_collate_fn
+    max_length: 4096
+
+optimizer:
+  _target_: torch.optim.AdamW
+  betas: [0.9, 0.95]
+  eps: 1e-8
+  lr: 5.0e-6
+  weight_decay: 0.1
+
+lr_scheduler:
+  lr_decay_style: constant
+
+wandb:
+  enable: false
+  project: huiyingl_workspace
+  entity: Nemo-automodel
+  name: muse_glimmer_29b_medpix_te_cp8_100steps
+  group: muse_glimmer_29b_loss_curves
+  tags: [muse_glimmer, 29b, dense, vlm, medpix, fsdp2, te, cp8]
+  dir: logs/muse_glimmer_29b_medpix_te_cp8/wandb
+
+ci:
+  recipe_owner: HuiyingLi
+  nodes: 1
+  time: "02:00:00"
+  max_steps: 5
