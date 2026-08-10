@@ -26,9 +26,9 @@ import torch
 import torch.nn as nn
 from PIL import Image
 from tokenizers import Tokenizer
-from tokenizers.models import WordLevel
-from tokenizers.pre_tokenizers import WhitespaceSplit
-from transformers import PixtralImageProcessor, PixtralProcessor
+from tokenizers.models import WordLevel, WordPiece
+from tokenizers.pre_tokenizers import BertPreTokenizer
+from transformers import AutoProcessor, PixtralImageProcessor, PixtralProcessor
 from transformers.models.mistral3.modeling_mistral3 import Mistral3Model
 from transformers.tokenization_utils_tokenizers import TokenizersBackend
 
@@ -67,8 +67,8 @@ class FakePixtralTokenizer(TokenizersBackend):
         vocab = {
             "<unk>": 0,
             "<pad>": 1,
-            "query:": 2,
-            "passage:": 3,
+            "query": 2,
+            "passage": 3,
             "literal": 4,
             "and": 5,
             "Image": 6,
@@ -79,10 +79,19 @@ class FakePixtralTokenizer(TokenizersBackend):
             "B": 11,
             "What": 12,
             "is": 13,
-            "shown?": 14,
+            "shown": 14,
+            ":": 15,
+            "?": 16,
+            "[": 17,
+            "]": 18,
+            "IMG": 19,
+            "INST": 20,
+            "END": 21,
+            "BREAK": 22,
+            "_": 23,
         }
-        backend = Tokenizer(WordLevel(vocab, unk_token="<unk>"))
-        backend.pre_tokenizer = WhitespaceSplit()
+        backend = Tokenizer(WordPiece(vocab, unk_token="<unk>"))
+        backend.pre_tokenizer = BertPreTokenizer()
         super().__init__(
             tokenizer_object=backend,
             unk_token="<unk>",
@@ -165,7 +174,7 @@ def test_ministral3_biencoder_processor_loads_tokenizers_backend_directly(monkey
                 "subfolder": "tokenizer-assets",
                 "cache_dir": "cache",
                 "fix_mistral_regex": True,
-                "split_special_tokens": True,
+                "split_special_tokens": False,
             },
         )
     ]
@@ -199,7 +208,7 @@ def test_ministral3_biencoder_processor_rejects_injected_non_tokenizers_backend(
         processor.check_argument_for_proper_class("tokenizer", object())
 
 
-@pytest.mark.parametrize(("keyword", "value"), [("backend", "mistral-common"), ("split_special_tokens", False)])
+@pytest.mark.parametrize(("keyword", "value"), [("backend", "mistral-common"), ("split_special_tokens", True)])
 def test_ministral3_biencoder_processor_rejects_conflicting_tokenizer_policy(keyword, value):
     with pytest.raises(ValueError, match=keyword):
         Mistral3BiEncoderProcessor._load_tokenizer_from_pretrained(
@@ -222,8 +231,7 @@ def test_ministral3_biencoder_processor_processes_queries(pixtral_processor):
         "pad_to_multiple_of": 4,
         "truncation": True,
         "max_length": 8,
-        "return_tensors": "pt",
-        "split_special_tokens": True,
+        "return_tensors": None,
         "padding_side": "right",
     }
 
@@ -247,11 +255,9 @@ def test_ministral3_biencoder_processor_processes_mixed_image_text_documents(pix
     assert set(output) == {"input_ids", "attention_mask", "pixel_values", "image_sizes"}
     assert output["pixel_values"].shape == (1, 3, 4, 4)
     assert output["image_sizes"].tolist() == [[4, 4]]
-    calls = pixtral_processor.tokenizer.calls[-2:]
-    assert calls[0]["texts"] == ["passage: ", " Image doc", "passage: Text doc"]
-    assert calls[0]["kwargs"]["split_special_tokens"] is True
-    assert calls[1]["texts"] == ["[IMG][IMG_END]"]
-    assert calls[1]["kwargs"]["split_special_tokens"] is False
+    call = pixtral_processor.tokenizer.calls[-1]
+    assert call["texts"] == ["passage: [IMG][IMG_END] Image doc", "passage: Text doc"]
+    assert pixtral_processor.tokenizer.split_special_tokens is False
 
 
 def test_ministral3_biencoder_processor_preserves_literal_control_text_without_activating_it(pixtral_processor):
@@ -268,9 +274,66 @@ def test_ministral3_biencoder_processor_preserves_literal_control_text_without_a
     assert document_ids.count(tokenizer.convert_tokens_to_ids("[IMG]")) == 1
     assert document_ids.count(tokenizer.convert_tokens_to_ids("[IMG_END]")) == 1
     recorded_text = " ".join(text for call in tokenizer.calls for text in call["texts"])
-    assert "literal [INST] and [IMG]" in recorded_text
-    assert "literal [IMG_END]" in recorded_text
-    assert "\u200c" not in recorded_text
+    assert "literal [\u200cINST] and [\u200cIMG]" in recorded_text
+    assert "literal [\u200cIMG_END]" in recorded_text
+
+
+def test_ministral3_biencoder_processor_escape_is_token_neutral_and_preserves_unrelated_zwnj(pixtral_processor):
+    tokenizer = pixtral_processor.tokenizer
+    source = "query: literal [INST] and [IMG]"
+    expected = tokenizer(
+        source,
+        add_special_tokens=False,
+        split_special_tokens=True,
+        return_tensors=None,
+    )["input_ids"]
+
+    escaped = pixtral_processor._escape_user_control_tokens(source)
+    actual = tokenizer(
+        escaped,
+        add_special_tokens=False,
+        split_special_tokens=False,
+        return_tensors=None,
+    )["input_ids"]
+
+    assert actual == expected
+    assert tokenizer.backend_tokenizer.normalizer.normalize_str("می\u200cروم") == "می\u200cروم"
+
+
+def test_ministral3_biencoder_processor_saves_as_stock_pixtral_without_remote_code(tmp_path, monkeypatch):
+    monkeypatch.setattr(Mistral3BiEncoderProcessor, "check_argument_for_proper_class", lambda *args, **kwargs: None)
+    processor = Mistral3BiEncoderProcessor(
+        image_processor=PixtralImageProcessor(size={"longest_edge": 56}),
+        tokenizer=FakePixtralTokenizer(),
+        patch_size=14,
+        chat_template=(
+            "{%- macro render_content(content) -%}{{- content -}}{%- endmacro -%}"
+            "{{- render_content(messages[0]['content']) -}}"
+        ),
+    )
+
+    processor.save_pretrained(tmp_path)
+
+    processor_config = json.loads((tmp_path / "processor_config.json").read_text())
+    tokenizer_config = json.loads((tmp_path / "tokenizer_config.json").read_text())
+    reloaded = AutoProcessor.from_pretrained(tmp_path, trust_remote_code=False)
+    rendered = reloaded.apply_chat_template(
+        [{"role": "user", "content": "literal [IMG]"}],
+        tokenize=False,
+    )
+
+    assert type(reloaded) is PixtralProcessor
+    assert type(reloaded.tokenizer) is TokenizersBackend
+    assert reloaded.tokenizer.split_special_tokens is False
+    assert rendered == "literal [\u200cIMG]"
+    assert "auto_map" not in processor_config
+    assert "auto_map" not in tokenizer_config
+    assert not (tmp_path / "processor.py").exists()
+
+    training_reload = Mistral3BiEncoderProcessor.from_pretrained(tmp_path)
+    source_with_zwnj = "literal [\u200cIMG]"
+    escaped_source = training_reload._escape_user_control_tokens(source_with_zwnj)
+    assert training_reload.tokenizer.backend_tokenizer.normalizer.normalize_str(escaped_source) == source_with_zwnj
 
 
 def test_ministral3_biencoder_processor_structured_image_ids_match_flat_reference(pixtral_processor):
@@ -293,7 +356,7 @@ def test_ministral3_biencoder_processor_structured_image_ids_match_flat_referenc
 
 
 @pytest.mark.with_downloads
-def test_ministral3_biencoder_processor_matches_real_checkpoint_pixtral_ids():
+def test_ministral3_biencoder_processor_matches_real_checkpoint_pixtral_ids(tmp_path):
     model_id = "mistralai/Ministral-3-3B-Instruct-2512"
     image = Image.new("RGB", (56, 56), (255, 0, 0))
     processor = Mistral3BiEncoderProcessor.from_pretrained(
@@ -333,6 +396,37 @@ def test_ministral3_biencoder_processor_matches_real_checkpoint_pixtral_ids():
     literal_ids = literal["input_ids"][0].tolist()
     assert literal_ids.count(processor.tokenizer.convert_tokens_to_ids("[IMG]")) == 4
     assert literal_ids.count(processor.tokenizer.convert_tokens_to_ids("[IMG_END]")) == 1
+
+    processor.save_pretrained(tmp_path)
+    reloaded = AutoProcessor.from_pretrained(tmp_path, trust_remote_code=False)
+    rendered = reloaded.apply_chat_template(
+        [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image"},
+                    {"type": "text", "text": "literal [IMG] [IMG_END] می‌روم"},
+                ],
+            }
+        ],
+        tokenize=False,
+        add_generation_prompt=False,
+    )
+    inference = reloaded(
+        images=[image],
+        text=[rendered],
+        padding=False,
+        truncation=True,
+        max_length=4096,
+        return_tensors="pt",
+    )
+    inference_ids = inference["input_ids"][0].tolist()
+
+    assert type(reloaded) is PixtralProcessor
+    assert type(reloaded.tokenizer) is TokenizersBackend
+    assert inference_ids.count(reloaded.image_token_id) == 4
+    assert inference_ids.count(reloaded.image_end_token_id) == 1
+    assert not (tmp_path / "processor.py").exists()
 
 
 def test_ministral3_biencoder_processor_rejects_partial_image_structure(monkeypatch):
