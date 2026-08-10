@@ -21,9 +21,8 @@ import pytest
 import yaml
 
 from tests.ci_tests.utils.sync_model_coverage_tables import (
+    DATED_MODEL_TABLE_HEADER,
     DATED_SUPPORT_TABLE_HEADER,
-    DIFFUSION_MODELS_END_MARKER,
-    DIFFUSION_MODELS_START_MARKER,
     HOMEPAGE_END_MARKER,
     HOMEPAGE_START_MARKER,
     MODEL_TYPE_OVERVIEW_PATHS,
@@ -73,11 +72,8 @@ def _write_typed_overview_templates(repo_root: Path) -> list[Path]:
     for model_type, relative_path in MODEL_TYPE_OVERVIEW_PATHS:
         path = repo_root / "docs" / "model-coverage" / relative_path
         path.parent.mkdir(parents=True, exist_ok=True)
-        diffusion_models_block = ""
-        if model_type == "Diffusion":
-            diffusion_models_block = f"{DIFFUSION_MODELS_START_MARKER}\nstale\n{DIFFUSION_MODELS_END_MARKER}\n"
         path.write_text(
-            f"before\n{diffusion_models_block}{SUPPORT_LOG_START_MARKER}\nstale\n{SUPPORT_LOG_END_MARKER}\nafter\n",
+            f"before\n{SUPPORT_LOG_START_MARKER}\nstale\n{SUPPORT_LOG_END_MARKER}\nafter\n",
             encoding="utf-8",
         )
         paths.append(path)
@@ -260,6 +256,16 @@ def test_generated_model_coverage_tables_are_not_committed():
     _validate_generated_tables_are_not_committed(Path(__file__).parents[3])
 
 
+def test_model_type_overviews_use_one_dated_supported_models_table():
+    repo_root = Path(__file__).parents[3]
+    for _, relative_path in MODEL_TYPE_OVERVIEW_PATHS:
+        document = (repo_root / "docs" / "model-coverage" / relative_path).read_text(encoding="utf-8")
+        assert document.count("## Supported Models") == 1
+        assert "## Model Support Log" not in document
+        assert document.count(SUPPORT_LOG_START_MARKER) == 1
+        assert document.count(SUPPORT_LOG_END_MARKER) == 1
+
+
 def test_strip_generated_tables_preserves_empty_markers(tmp_path):
     docs_dir = tmp_path / "docs"
     docs_dir.mkdir()
@@ -414,13 +420,11 @@ def test_sync_tables_writes_support_log_homepage_and_registry(tmp_path):
         typed_overview = typed_overview_path.read_text(encoding="utf-8")
         typed_rows = [line for line in typed_overview.splitlines() if re.match(r"\| \d{4}-\d{2}-\d{2} \|", line)]
         assert len(typed_rows) == len([release for release in releases if release.model_type == model_type])
-        assert all(f"| {model_type} |" in row for row in typed_rows)
+        assert DATED_MODEL_TABLE_HEADER in typed_overview
+        assert all(f"| {model_type} |" not in row for row in typed_rows)
+        assert "nth-child(-n + 1)" in typed_overview
+        assert "nth-child(-n + 2)" not in typed_overview
         assert "<Tabs>" not in typed_overview
-        if model_type == "Diffusion":
-            assert (
-                "| Test Owner | [Test Diffusion Model](/model-coverage/diffusion/test/model) | "
-                "Text-to-Image | DiT (Flow Matching) |"
-            ) in typed_overview
     homepage = (tmp_path / "docs" / "index.mdx").read_text(encoding="utf-8")
     for document in (support_log, homepage):
         assert document.count('<div className="compact-model-tables">') == 1
@@ -575,18 +579,19 @@ def test_sync_tables_check_rejects_stale_generated_support_log(tmp_path):
         _sync_tables(tmp_path, check=True)
 
 
-def test_dated_support_tables_must_be_generated(tmp_path):
+@pytest.mark.parametrize("table_header", [DATED_SUPPORT_TABLE_HEADER, DATED_MODEL_TABLE_HEADER])
+def test_dated_support_tables_must_be_generated(tmp_path, table_header):
     docs_dir = tmp_path / "docs" / "model-coverage"
     docs_dir.mkdir(parents=True)
     generated_path = docs_dir / "generated.mdx"
     generated_path.write_text(
-        f"{SUPPORT_LOG_START_MARKER}\n{DATED_SUPPORT_TABLE_HEADER}\n{SUPPORT_LOG_END_MARKER}\n",
+        f"{SUPPORT_LOG_START_MARKER}\n{table_header}\n{SUPPORT_LOG_END_MARKER}\n",
         encoding="utf-8",
     )
 
     _validate_dated_support_tables_are_generated(tmp_path)
 
     manual_path = docs_dir / "manual.mdx"
-    manual_path.write_text(f"{DATED_SUPPORT_TABLE_HEADER}\n", encoding="utf-8")
+    manual_path.write_text(f"{table_header}\n", encoding="utf-8")
     with pytest.raises(ValueError, match="manual.mdx"):
         _validate_dated_support_tables_are_generated(tmp_path)
