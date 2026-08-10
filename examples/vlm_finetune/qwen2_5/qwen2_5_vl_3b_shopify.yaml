@@ -114,4 +114,6 @@ freeze_config:
 #   save_dir:
 
 ci:
-  recipe_owner: zeryx
+  recipe_owner: HuiyingLi
+  nodes: 1
+  time: "00:30:00"
