@@ -68,6 +68,7 @@ class InklingTextConfig(PretrainedConfig):
         logits_mup_width_multiplier: float = 24.0,
         rms_norm_eps_moe_gate: float = 1e-6,
         attention_dropout: float = 0.0,
+        use_cache: bool = True,
         initializer_range: float = 0.02,
         pad_token_id: int | None = None,
         bos_token_id: int | None = 1,
@@ -123,6 +124,7 @@ class InklingTextConfig(PretrainedConfig):
         self.logits_mup_width_multiplier = logits_mup_width_multiplier
         self.rms_norm_eps_moe_gate = rms_norm_eps_moe_gate
         self.attention_dropout = attention_dropout
+        self.use_cache = use_cache
         self.initializer_range = initializer_range
         self.num_mtp_layers = num_mtp_layers
         self.chain_hidden_post_norm = chain_hidden_post_norm
@@ -161,6 +163,7 @@ class InklingAudioConfig(PretrainedConfig):
         "num_codebooks": "n_mel_bins",
         "codebook_size": "mel_vocab_size",
         "hidden_size": "text_hidden_size",
+        "text_hidden_size": "decoder_dmodel",
     }
 
     def __init__(
@@ -185,7 +188,11 @@ class InklingVisionConfig(PretrainedConfig):
 
     model_type = "inkling_vision"
     base_config_key = "vision_config"
-    attribute_map = {"num_hidden_layers": "n_layers"}
+    attribute_map = {
+        "num_hidden_layers": "n_layers",
+        "num_channels": "n_channels",
+        "text_hidden_size": "decoder_dmodel",
+    }
 
     def __init__(
         self,
@@ -246,10 +253,10 @@ class InklingConfig(PretrainedConfig):
         self.vision_config = self._coerce_sub_config(vision_config, InklingVisionConfig)
         self.vision_config.text_hidden_size = self.text_config.hidden_size
         self.audio_config.text_hidden_size = self.text_config.hidden_size
-        self.image_token_id = image_token_id
-        self.audio_token_id = audio_token_id
-        self.image_bos_token_id = image_bos_token_id
-        self.audio_bos_token_id = audio_bos_token_id
+        self.image_token_id = 200054 if image_token_id is None else image_token_id
+        self.audio_token_id = 200053 if audio_token_id is None else audio_token_id
+        self.image_bos_token_id = 200005 if image_bos_token_id is None else image_bos_token_id
+        self.audio_bos_token_id = 200020 if audio_bos_token_id is None else audio_bos_token_id
         self.mtp_config = mtp_config
         super().__init__(**kwargs)
 

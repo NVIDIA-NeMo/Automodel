@@ -34,7 +34,7 @@ navigation:
       - page: "Release Notes"
         path: ../../release-notes.mdx
         slug: release-notes
-      - page: "Model Release Log"
+      - page: "Model Support Log"
         path: ../../model-coverage/latest-models.mdx
         slug: model-release-log
   - section: "Performance"
@@ -48,12 +48,9 @@ navigation:
       - page: "Overview"
         path: ../../model-coverage/overview.mdx
         slug: overview
-      - page: "Release Log"
+      - page: "Model Support Log"
         path: ../../model-coverage/latest-models.mdx
         slug: release-log
-      - page: "Troubleshooting Models and First Runs"
-        path: ../../model-coverage/troubleshooting.mdx
-        slug: troubleshooting
       - section: "Large Language Models"
         slug: large-language-models
         contents:
@@ -64,6 +61,13 @@ navigation:
             path: ../../model-coverage/llm/meta/llama.mdx
           - page: "Gemma"
             path: ../../model-coverage/llm/google/gemma.mdx
+            hidden: true
+          - page: "Gemma 1"
+            path: ../../model-coverage/llm/google/gemma-1.mdx
+          - page: "Gemma 2"
+            path: ../../model-coverage/llm/google/gemma-2.mdx
+          - page: "FunctionGemma"
+            path: ../../model-coverage/llm/google/functiongemma.mdx
           - page: "Qwen2"
             path: ../../model-coverage/llm/qwen/qwen2.mdx
           - page: "Qwen2 MoE"
@@ -83,6 +87,8 @@ navigation:
             path: ../../model-coverage/llm/deepseek-ai/deepseek-v3.mdx
           - page: "DeepSeek-V4 Flash"
             path: ../../model-coverage/llm/deepseek-ai/dsv4-flash.mdx
+          - page: "DeepSeek-V4 Pro"
+            path: ../../model-coverage/llm/deepseek-ai/dsv4-pro.mdx
           - page: "Mistral"
             path: ../../model-coverage/llm/mistralai/mistral.mdx
           - page: "Mixtral"
@@ -164,6 +170,8 @@ navigation:
             path: ../../model-coverage/llm/openbmb/minicpm.mdx
           - page: "Moonlight"
             path: ../../model-coverage/llm/moonshotai/moonlight.mdx
+          - page: "Kimi Linear"
+            path: ../../model-coverage/llm/moonshotai/kimi-linear.mdx
           - page: "Kimi K3"
             path: ../../model-coverage/llm/moonshotai/kimi-k3.mdx
             slug: kimi-k3
@@ -175,6 +183,8 @@ navigation:
             path: ../../model-coverage/llm/orionstar/orion.mdx
           - page: "StableLM"
             path: ../../model-coverage/llm/stabilityai/stablelm.mdx
+          - page: "T5"
+            path: ../../model-coverage/llm/google-t5/t5.mdx
           - page: "Step-3.5"
             path: ../../model-coverage/llm/stepfun-ai/step-3-5.mdx
             slug: step-3-5
@@ -189,19 +199,24 @@ navigation:
           - page: "Ling 2.0"
             path: ../../model-coverage/llm/inclusionai/ling-2.mdx
             slug: ling-2-0
+          - page: "Laguna"
+            path: ../../model-coverage/llm/poolside/laguna.mdx
+            slug: laguna
       - section: "Vision Language Models"
         slug: vision-language-models
         contents:
           - page: "Overview"
             path: ../../model-coverage/vlm/index.mdx
             slug: overview
+          - page: "MuseGlimmer"
+            path: ../../model-coverage/vlm/muse/muse_glimmer.mdx
           - page: "Kimi-VL"
             path: ../../model-coverage/vlm/moonshotai/kimi-vl.mdx
           - page: "Kimi-K3"
             path: ../../model-coverage/vlm/moonshotai/kimi-k3.mdx
           - page: "Inkling"
             path: ../../model-coverage/vlm/thinkingmachines/inkling.mdx
-          - page: "Gemma 3 VL / Gemma 3n"
+          - page: "Gemma 3 / Gemma 3n"
             path: ../../model-coverage/vlm/google/gemma3-vl.mdx
             slug: gemma-3-vl-gemma-3n
           - page: "Gemma 4"
@@ -212,9 +227,12 @@ navigation:
           - page: "Qwen3-VL / Qwen3-VL-MoE"
             path: ../../model-coverage/vlm/qwen/qwen3-vl.mdx
             slug: qwen3-vl-qwen3-vl-moe
-          - page: "Qwen3.5-VL"
+          - page: "Qwen3.5"
             path: ../../model-coverage/vlm/qwen/qwen3-5-vl.mdx
             slug: qwen3-5-vl
+          - page: "Qwen3.6"
+            path: ../../model-coverage/vlm/qwen/qwen3-6-vl.mdx
+            slug: qwen3-6-vl
           - page: "Nemotron-Parse"
             path: ../../model-coverage/vlm/nvidia/nemotron-parse.mdx
           - page: "Ministral3 VL"
@@ -271,6 +289,16 @@ navigation:
             slug: overview
           - page: "DiffusionGemma"
             path: ../../model-coverage/dllm/google/diffusiongemma.mdx
+          - page: "LLaDA"
+            path: ../../model-coverage/dllm/gsai-ml/llada.mdx
+          - page: "LLaDA 2.1"
+            path: ../../model-coverage/dllm/inclusionai/llada2.mdx
+          - page: "Nemotron-Labs-Diffusion"
+            path: ../../model-coverage/dllm/nvidia/nemotron-labs-diffusion.mdx
+          - page: "DFlash"
+            path: ../../model-coverage/dllm/z-lab/dflash.mdx
+          - page: "Qwen3 I-DLM"
+            path: ../../model-coverage/dllm/qwen/qwen3-idlm.mdx
       - section: "Diffusion"
         slug: diffusion
         contents:
@@ -286,11 +314,19 @@ navigation:
           - page: "FLUX.1-dev"
             path: ../../model-coverage/diffusion/black-forest-labs/flux.mdx
             slug: flux-1-dev
+          - page: "FLUX.2-dev"
+            path: ../../model-coverage/diffusion/black-forest-labs/flux2.mdx
+            slug: flux-2-dev
           - page: "HunyuanVideo 1.5"
             path: ../../model-coverage/diffusion/hunyuanvideo-community/hunyuanvideo.mdx
             slug: hunyuanvideo-1-5
+          - page: "LTX-2.3"
+            path: ../../model-coverage/diffusion/lightricks/ltx-2-3.mdx
+            slug: ltx-2-3
           - page: "Qwen-Image"
             path: ../../model-coverage/diffusion/qwen/qwen-image.mdx
+          - page: "LTX-2.3"
+            path: ../../model-coverage/diffusion/diffusers/ltx-2-3.mdx
       - section: "Embedding Models"
         slug: embedding-models
         contents:
@@ -300,7 +336,7 @@ navigation:
           - page: "Llama (Bidirectional)"
             path: ../../model-coverage/embedding/nvidia/llama-bidirectional.mdx
             slug: llama-bidirectional
-          - page: "Ministral3 (Bidirectional)"
+          - page: "Ministral3"
             path: ../../model-coverage/embedding/mistralai/ministral3-bidirectional.mdx
             slug: ministral3-bidirectional
       - section: "Reranking Models"
@@ -312,6 +348,9 @@ navigation:
           - page: "Llama (Bidirectional)"
             path: ../../model-coverage/reranker/nvidia/llama-bidirectional.mdx
             slug: llama-bidirectional
+      - page: "Troubleshooting"
+        path: ../../model-coverage/troubleshooting.mdx
+        slug: troubleshooting
   - section: "Recipes & E2E Examples"
     slug: recipes-e2e-examples
     contents:
@@ -333,7 +372,7 @@ navigation:
       - page: "Fine-Tune Large MoE LLMs"
         path: ../../guides/llm/large-moe-finetune.mdx
         slug: large-moe-fine-tuning
-      - page: "DeepSeek V4 Flash"
+      - page: "DeepSeek-V4 Flash"
         path: ../../guides/llm/dsv4-flash.mdx
         slug: deepseek-v4-flash
       - page: "Hy3-preview"

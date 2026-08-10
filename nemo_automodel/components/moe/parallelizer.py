@@ -28,7 +28,7 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import fully_shard
 from torch.distributed.fsdp._fully_shard import MixedPrecisionPolicy, OffloadPolicy
-from torch.distributed.tensor import Shard, distribute_module, distribute_tensor
+from torch.distributed.tensor import Replicate, Shard, distribute_module, distribute_tensor
 from torch.distributed.tensor.parallel import ParallelStyle, parallelize_module
 from torch.utils.checkpoint import CheckpointPolicy, create_selective_checkpoint_contexts
 
@@ -36,6 +36,7 @@ from nemo_automodel.components.distributed import parallelizer_utils
 from nemo_automodel.components.distributed.pipelining.hf_utils import get_text_module
 from nemo_automodel.components.moe.experts import GroupedExpertsDeepEP, GroupedExpertsTE
 from nemo_automodel.components.moe.layers import (
+    Gate,
     MoE,
 )
 from nemo_automodel.components.moe.tp_plan_validation import _validate_moe_tp_plan
@@ -465,14 +466,19 @@ def apply_ac(
             from nemo_automodel.components.distributed.activation_checkpointing import (
                 SELECTIVE_AC_WRAPPER_FLAG,
                 make_selective_checkpoint_context_fn,
+                transformer_engine_attention_backend_snapshot_context_fn,
             )
 
             selective_context_fn = make_selective_checkpoint_context_fn()
+            attention_context_fn = functools.partial(
+                transformer_engine_attention_backend_snapshot_context_fn,
+                selective_context_fn,
+            )
             for parent_layers, layer_id, block in iter_transformer_and_mtp_blocks(model):
                 block = ptd_checkpoint_wrapper(
                     block,
                     preserve_rng_state=True,
-                    context_fn=_preserve_gate_load_during_recompute(block, selective_context_fn),
+                    context_fn=_preserve_gate_load_during_recompute(block, attention_context_fn),
                 )
                 # Tag so _apply_per_layer_compile compiles the wrapper OUTER (keeping the
                 # selective policy visible to the partitioner) instead of unwrapping and
@@ -539,9 +545,17 @@ def apply_ac(
     def selective_checkpointing_context_fn():
         return create_selective_checkpoint_contexts(_custom_policy)
 
-    from nemo_automodel.components.distributed.activation_checkpointing import ensure_profiler_ops_sac_ignored
+    from nemo_automodel.components.distributed.activation_checkpointing import (
+        ensure_fsdp_ops_sac_ignored,
+        ensure_profiler_ops_sac_ignored,
+        transformer_engine_attention_backend_snapshot_context_fn,
+    )
 
     ensure_profiler_ops_sac_ignored()
+    ensure_fsdp_ops_sac_ignored()
+
+    def _with_attention_backend_snapshot(context_fn=None):
+        return functools.partial(transformer_engine_attention_backend_snapshot_context_fn, context_fn)
 
     # Weight-tied (use_repeated_layer) MTP head blocks must NOT be activation
     # checkpointed: the single physical block is recomputed once per MTP depth in
@@ -568,13 +582,16 @@ def apply_ac(
             block = ptd_checkpoint_wrapper(
                 block,
                 preserve_rng_state=True,
-                context_fn=_preserve_gate_load_during_recompute(block, selective_checkpointing_context_fn),
+                context_fn=_preserve_gate_load_during_recompute(
+                    block,
+                    _with_attention_backend_snapshot(selective_checkpointing_context_fn),
+                ),
             )
         else:
             block = ptd_checkpoint_wrapper(
                 block,
                 preserve_rng_state=True,
-                context_fn=_preserve_gate_load_during_recompute(block),
+                context_fn=_preserve_gate_load_during_recompute(block, _with_attention_backend_snapshot()),
             )
 
         parent_layers.register_module(layer_id, block)
@@ -682,6 +699,16 @@ def apply_fsdp(
 
     for block in _iter_moe_blocks(model, _model):
         moe_module = _get_moe_module(block)
+        gate = getattr(moe_module, "gate", None)
+        if isinstance(gate, Gate) and gate.e_score_correction_bias is not None:
+            # FSDP2 does not convert buffers to DTensors. Replicate the routing
+            # bias over the full DP/CP mesh so its existing Partial-to-Replicate
+            # update path aggregates every rank's expert load.
+            gate.e_score_correction_bias = distribute_tensor(
+                gate.e_score_correction_bias,
+                device_mesh=fsdp_mesh,
+                placements=[Replicate()] * fsdp_mesh.ndim,
+            )
         experts_reshard_after_forward = False if id(block) in mtp_block_ids else reshard_after_forward
         if isinstance(moe_module, MoE) and ep_shard_enabled:
             # Apply FSDP on dim=1 for grouped experts since we may have more
@@ -1025,3 +1052,9 @@ def parallelize_model(
             wrap_outer_model=wrap_outer_model,
             frozen_multimodal_sharding=frozen_multimodal_sharding,
         )
+        if cp_enabled:
+            configured_units = parallelizer_utils.configure_fsdp_unused_param_reduction(model)
+            logger.info(
+                "Enabled unused-parameter reduce-scatter on %d MoE FSDP units for context parallelism",
+                configured_units,
+            )
