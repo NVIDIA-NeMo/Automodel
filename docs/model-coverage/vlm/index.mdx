@@ -31,24 +31,104 @@ NeMo AutoModel supports [AutoModelForImageTextToText](https://huggingface.co/doc
 
 | Owner | Model | Architectures |
 |---|---|---|
-| Moonshot AI | [Kimi-VL](/model-coverage/vision-language-models/kimi-vl) | `KimiVLForConditionalGeneration` |
-| Thinking Machines Lab | [Inkling](/model-coverage/vision-language-models/inkling) | `InklingForConditionalGeneration` |
-| Google | [Gemma 3 VL / Gemma 3n](/model-coverage/vision-language-models/gemma-3-vl-gemma-3n) | `Gemma3ForConditionalGeneration` |
-| Google | [Gemma 4](/model-coverage/vision-language-models/gemma-4) | `Gemma4ForConditionalGeneration` |
-| Qwen / Alibaba Cloud | [Qwen2.5-VL](/model-coverage/vision-language-models/qwen2-5-vl) | `Qwen2VLForConditionalGeneration`, `Qwen2_5VLForConditionalGeneration` |
-| Qwen / Alibaba Cloud | [Qwen3-VL / Qwen3-VL-MoE](/model-coverage/vision-language-models/qwen3-vl-qwen3-vl-moe) | `Qwen3VLForConditionalGeneration` |
-| Qwen / Alibaba Cloud | [Qwen3.5-VL](/model-coverage/vision-language-models/qwen3-5-vl) | `Qwen3_5VLForConditionalGeneration`, `Qwen3_5MoeVLForConditionalGeneration` |
-| NVIDIA | [Nemotron-Parse](/model-coverage/vision-language-models/nemotron-parse) | `NemotronParseForConditionalGeneration` |
-| Mistral AI | [Ministral3 VL](/model-coverage/vision-language-models/ministral3-vl) | `Mistral3ForConditionalGeneration` |
-| Mistral AI | [Mistral-Small-4](/model-coverage/vision-language-models/mistral-small-4) | `MistralForConditionalGeneration` |
-| Mistral AI | [Mistral Medium 3.5](/model-coverage/vision-language-models/mistral-medium-3-5) | `Mistral3ForConditionalGeneration` (FP8) |
-| InternLM / Shanghai AI Lab | [InternVL](/model-coverage/vision-language-models/internvl) | `InternVLForConditionalGeneration` |
-| Meta | [Llama 4](/model-coverage/vision-language-models/llama-4) | `Llama4ForConditionalGeneration` |
-| HuggingFace | [SmolVLM](/model-coverage/vision-language-models/smolvlm) | `SmolVLMForConditionalGeneration` |
-| LLaVA | [LLaVA](/model-coverage/vision-language-models/l-la-va) | `LlavaForConditionalGeneration`, `LlavaNextForConditionalGeneration`, `LlavaNextVideoForConditionalGeneration`, `LlavaOnevisionForConditionalGeneration` |
-| lmms-lab | [LLaVA-OneVision 1.5](/model-coverage/vision-language-models/l-la-va-one-vision) | `LlavaOneVisionForConditionalGeneration` |
-| Stepfun AI | [Step-3.7-Flash](/model-coverage/vision-language-models/step-3-7-flash) | 198B-A13B MoE VLM |
-| MiniMaxAI | [MiniMax-M3](/model-coverage/vision-language-models/minimax-m3) | 428B-A22B MoE VLM |
+| Moonshot AI | [Kimi-VL](/model-coverage/vision-language-models/moonshotai/kimi-vl) | `KimiVLForConditionalGeneration`, `KimiK25ForConditionalGeneration`, `KimiK25VLForConditionalGeneration` |
+| Moonshot AI | [Kimi-K3](/model-coverage/vision-language-models/moonshotai/kimi-k3) | `KimiK3ForConditionalGeneration`, `KimiK3ForCausalLM` |
+| Thinking Machines Lab | [Inkling](/model-coverage/vision-language-models/thinkingmachines/inkling) | `InklingForConditionalGeneration` |
+| Google | [Gemma 3 / Gemma 3n](/model-coverage/vision-language-models/google/gemma-3-vl-gemma-3n) | `Gemma3ForCausalLM`, `Gemma3ForConditionalGeneration` |
+| Google | [Gemma 4](/model-coverage/vision-language-models/google/gemma-4) | `Gemma4UnifiedForConditionalGeneration`, `Gemma4ForConditionalGeneration`, `Gemma4AssistantForCausalLM` |
+| Qwen / Alibaba Cloud | [Qwen2.5-VL](/model-coverage/vision-language-models/qwen/qwen2-5-vl) | `Qwen2VLForConditionalGeneration`, `Qwen2_5VLForConditionalGeneration` |
+| Qwen / Alibaba Cloud | [Qwen3-VL / Qwen3-VL-MoE](/model-coverage/vision-language-models/qwen/qwen3-vl-qwen3-vl-moe) | `Qwen3VLForConditionalGeneration`, `Qwen3VLMoeForConditionalGeneration` |
+| Qwen / Alibaba Cloud | [Qwen3.5](/model-coverage/vision-language-models/qwen/qwen3-5-vl) | `Qwen3_5ForConditionalGeneration`, `Qwen3_5MoeForConditionalGeneration` |
+| Qwen / Alibaba Cloud | [Qwen3.6](/model-coverage/vision-language-models/qwen/qwen3-6-vl) | `Qwen3_5ForConditionalGeneration`, `Qwen3_5MoeForConditionalGeneration` |
+| NVIDIA | [Nemotron-Parse](/model-coverage/vision-language-models/nvidia/nemotron-parse) | `NemotronParseForConditionalGeneration` |
+| Mistral AI | [Ministral3 VL](/model-coverage/vision-language-models/mistralai/ministral3-vl) | `Mistral3ForConditionalGeneration` |
+| Mistral AI | [Mistral-Small-4](/model-coverage/vision-language-models/mistralai/mistral-small-4) | `MistralForConditionalGeneration`, `Mistral4ForCausalLM` |
+| Mistral AI | [Mistral Medium 3.5](/model-coverage/vision-language-models/mistralai/mistral-medium-3-5) | `Mistral3ForConditionalGeneration`, `Mistral3FP8VLMForConditionalGeneration` |
+| InternLM / Shanghai AI Lab | [InternVL](/model-coverage/vision-language-models/internlm/internvl) | `InternVLForConditionalGeneration` |
+| Meta | [Llama 4](/model-coverage/vision-language-models/meta/llama-4) | `Llama4ForConditionalGeneration` |
+| HuggingFace | [SmolVLM](/model-coverage/vision-language-models/huggingface/smolvlm) | `SmolVLMForConditionalGeneration` |
+| LLaVA | [LLaVA](/model-coverage/vision-language-models/llava-hf/llava) | `LlavaForConditionalGeneration`, `LlavaNextForConditionalGeneration`, `LlavaNextVideoForConditionalGeneration`, `LlavaOnevisionForConditionalGeneration` |
+| lmms-lab | [LLaVA-OneVision 1.5](/model-coverage/vision-language-models/lmms-lab/llava-onevision) | `LLaVAOneVision1_5_ForConditionalGeneration`, `LlavaOneVisionForConditionalGeneration` |
+| Stepfun AI | [Step-3.7-Flash](/model-coverage/vision-language-models/stepfun-ai/step-3-7-flash) | `Step3p6ForConditionalGeneration`, `Step3p7ForConditionalGeneration` |
+| MiniMaxAI | [MiniMax-M3](/model-coverage/vision-language-models/minimax/minimax-m3) | `MiniMaxM3SparseForConditionalGeneration` |
+
+## Model Support Log
+
+This table lists VLM support in reverse chronological order. See the [combined model support log](/model-coverage/release-log) for every model type.
+
+{/* BEGIN GENERATED MODEL SUPPORT LOG */}
+
+<div className="compact-model-tables">
+
+<style>{`
+  .compact-model-tables .fern-table-root {
+    width: 100% !important;
+  }
+
+  .compact-model-tables .fern-table {
+    width: 100% !important;
+    min-width: 0 !important;
+    table-layout: auto !important;
+  }
+
+  .compact-model-tables .fern-table th,
+  .compact-model-tables .fern-table td {
+    text-align: left !important;
+  }
+
+  .compact-model-tables .fern-table th:nth-child(-n + 2),
+  .compact-model-tables .fern-table td:nth-child(-n + 2) {
+    width: 1%;
+    white-space: nowrap;
+  }
+
+  .compact-model-tables .fern-table th:last-child,
+  .compact-model-tables .fern-table td:last-child {
+    width: 100%;
+  }
+`}</style>
+
+| Date | Type | Model |
+|:-----|:-----|:-----|
+| 2026-07-30 | VLM | [Inkling-Small](/model-coverage/vision-language-models/thinkingmachines/inkling) ([Inkling_small_medpix_ep64.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/inkling/Inkling_small_medpix_ep64.yaml)) |
+| 2026-07-29 | VLM | [Qwen3.5-122B-A10B](https://huggingface.co/Qwen/Qwen3.5-122B-A10B) ([qwen3_5_122b_128k_ep8cp32.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5_moe/qwen3_5_122b_128k_ep8cp32.yaml)) |
+| 2026-07-17 | VLM | [Inkling](/model-coverage/vision-language-models/thinkingmachines/inkling) ([inkling_medpix.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/inkling/inkling_medpix.yaml)) |
+| 2026-06-12 | VLM | [MiniMax-M3](/model-coverage/vision-language-models/minimax/minimax-m3) ([minimax_m3_vl_lora_pp4ep8_8node.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/minimax_m3/minimax_m3_vl_lora_pp4ep8_8node.yaml)) |
+| 2026-05-29 | VLM | [Step-3.7-Flash](/model-coverage/vision-language-models/stepfun-ai/step-3-7-flash) ([step3p7_medpix_200b_ep32pp4.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/stepfun/step3p7_medpix_200b_ep32pp4.yaml)) |
+| 2026-04-29 | VLM | [Mistral-Medium-3.5-128B](https://huggingface.co/mistralai/Mistral-Medium-3.5-128B) ([mistral3p5_128b_medpix.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/mistral3p5/mistral3p5_128b_medpix.yaml)) |
+| 2026-04-27 | VLM | [Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16](https://huggingface.co/nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16) ([nemotron_omni_cord_v2.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/nemotron_omni/nemotron_omni_cord_v2.yaml)) |
+| 2026-04-22 | VLM | [Qwen3.6-27B](/model-coverage/vision-language-models/qwen/qwen3-6-vl) ([qwen3_6_27b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5/qwen3_6_27b.yaml)) |
+| 2026-04-21 | VLM | [Qwen3.5-27B](https://huggingface.co/Qwen/Qwen3.5-27B) ([qwen3_5_27b_tp4pp4.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5/qwen3_5_27b_tp4pp4.yaml)) |
+| 2026-04-17 | VLM | [LLaVA-OneVision-1.5-4B-Instruct](/model-coverage/vision-language-models/lmms-lab/llava-onevision) ([llava_ov_1_5_4b_finetune.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/llava_onevision/llava_ov_1_5_4b_finetune.yaml)) |
+| 2026-04-17 | VLM | [LLaVA-OneVision-1.5-8B-Instruct](/model-coverage/vision-language-models/lmms-lab/llava-onevision) ([llava_ov_1_5_8b_lora.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/llava_onevision/llava_ov_1_5_8b_lora.yaml)) |
+| 2026-04-16 | VLM | [Qwen3.6-35B-A3B](/model-coverage/vision-language-models/qwen/qwen3-6-vl) ([qwen3_6_35b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5_moe/qwen3_6_35b.yaml)) |
+| 2026-04-02 | VLM | [Gemma-4-26B-A4B-it](/model-coverage/vision-language-models/google/gemma-4) ([gemma4_26b_a4b_moe.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_26b_a4b_moe.yaml)) |
+| 2026-04-02 | VLM | [Gemma-4-31B-it](/model-coverage/vision-language-models/google/gemma-4) ([gemma4_31b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_31b.yaml)) |
+| 2026-04-02 | VLM | [Gemma-4-E2B-it](/model-coverage/vision-language-models/google/gemma-4) ([gemma4_2b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_2b.yaml)) |
+| 2026-04-02 | VLM | [Gemma-4-E4B-it](/model-coverage/vision-language-models/google/gemma-4) ([gemma4_4b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_4b.yaml)) |
+| 2026-03-16 | VLM | [Mistral-Small-4-119B-2603](/model-coverage/vision-language-models/mistralai/mistral-small-4) ([mistral4_medpix.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/mistral4/mistral4_medpix.yaml)) |
+| 2026-03-02 | VLM | [Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B) ([qwen3_5_4b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5/qwen3_5_4b.yaml)) |
+| 2026-03-02 | VLM | [Qwen3.5-9B](https://huggingface.co/Qwen/Qwen3.5-9B) ([qwen3_5_9b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5/qwen3_5_9b.yaml)) |
+| 2026-02-24 | VLM | [Qwen3.5-35B-A3B](https://huggingface.co/Qwen/Qwen3.5-35B-A3B) ([qwen3_5_35b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5_moe/qwen3_5_35b.yaml)) |
+| 2026-02-15 | VLM | [Qwen3.5-397B-A17B](https://huggingface.co/Qwen/Qwen3.5-397B-A17B) ([qwen3_5_moe_medpix.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5_moe/qwen3_5_moe_medpix.yaml)) |
+| 2026-02-06 | VLM | [Qwen3-VL-235B-A22B-Instruct](https://huggingface.co/Qwen/Qwen3-VL-235B-A22B-Instruct) ([qwen3_vl_moe_235b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3/qwen3_vl_moe_235b.yaml)) |
+| 2026-01-31 | VLM | [Kimi-K2.5](https://huggingface.co/moonshotai/Kimi-K2.5) ([kimi25vl_medpix.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/kimi/kimi25vl_medpix.yaml)) |
+| 2026-01-30 | VLM | [Kimi-VL-A3B-Instruct](/model-coverage/vision-language-models/moonshotai/kimi-vl) ([kimi2vl_cordv2.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/kimi/kimi2vl_cordv2.yaml)) |
+| 2026-01-12 | VLM | [NVIDIA-Nemotron-Parse-v1.1](/model-coverage/vision-language-models/nvidia/nemotron-parse) ([nemotron_parse_v1_1.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/nemotron/nemotron_parse_v1_1.yaml)) |
+| 2025-12-05 | VLM | [Ministral-3-14B-Reasoning-2512](https://huggingface.co/mistralai/Ministral-3-14B-Reasoning-2512) ([ministral3_14b_medpix.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/mistral/ministral3_14b_medpix.yaml)) |
+| 2025-12-05 | VLM | [Ministral-3-3B-Reasoning-2512](https://huggingface.co/mistralai/Ministral-3-3B-Reasoning-2512) ([ministral3_3b_medpix.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/mistral/ministral3_3b_medpix.yaml)) |
+| 2025-12-05 | VLM | [Ministral-3-8B-Reasoning-2512](https://huggingface.co/mistralai/Ministral-3-8B-Reasoning-2512) ([ministral3_8b_medpix.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/mistral/ministral3_8b_medpix.yaml)) |
+| 2025-11-24 | VLM | [Qwen3-VL-30B-A3B-Instruct](https://huggingface.co/Qwen/Qwen3-VL-30B-A3B-Instruct) ([qwen3_vl_moe_30b_te_deepep.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3/qwen3_vl_moe_30b_te_deepep.yaml)) |
+| 2025-11-19 | VLM | [InternVL3_5-4B-hf](https://huggingface.co/OpenGVLab/InternVL3_5-4B-hf) ([internvl_3_5_4b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/internvl/internvl_3_5_4b.yaml)) |
+| 2025-10-23 | VLM | [Qwen3-VL-4B-Thinking](https://huggingface.co/Qwen/Qwen3-VL-4B-Thinking) ([qwen3_vl_4b_instruct_rdr.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3/qwen3_vl_4b_instruct_rdr.yaml)) |
+| 2025-10-23 | VLM | [Qwen3-VL-8B-Instruct](/model-coverage/vision-language-models/qwen/qwen3-vl-qwen3-vl-moe) ([qwen3_vl_8b_instruct_rdr.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3/qwen3_vl_8b_instruct_rdr.yaml)) |
+| 2025-08-23 | VLM | [Gemma-3-4b-it](/model-coverage/vision-language-models/google/gemma-3-vl-gemma-3n) ([gemma3_vl_4b_cord_v2.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma3/gemma3_vl_4b_cord_v2.yaml)) |
+| 2025-08-23 | VLM | [Gemma-3n-e4b-it](https://huggingface.co/google/gemma-3n-e4b-it) ([gemma3n_vl_4b_medpix.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma3n/gemma3n_vl_4b_medpix.yaml)) |
+| 2025-08-23 | VLM | [Qwen2.5-VL-3B-Instruct](/model-coverage/vision-language-models/qwen/qwen2-5-vl) ([qwen2_5_vl_3b_rdr.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen2_5/qwen2_5_vl_3b_rdr.yaml)) |
+
+</div>
+
+{/* END GENERATED MODEL SUPPORT LOG */}
 
 ## Fine-Tuning
 

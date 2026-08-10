@@ -42,6 +42,7 @@ def _bare_recipe(module, draft_model, target_wrapper):
     recipe.runtime = SimpleNamespace(global_step=0)
     recipe.draft_model = draft_model
     recipe.target_wrapper = target_wrapper
+    recipe.checkpoint_config = SimpleNamespace(enabled=False, allow_legacy_pickle_restore=False)
     return recipe
 
 

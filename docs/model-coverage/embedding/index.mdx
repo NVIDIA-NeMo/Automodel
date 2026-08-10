@@ -6,7 +6,7 @@ position: 1
 
 ## Introduction
 
-Text embedding models transform text into dense vector representations that power semantic search, dense retrieval, retrieval-augmented generation (RAG), and classification tasks. NeMo AutoModel includes a training recipe for converting Llama decoder-only models into encoder architectures with bidirectional attention, and falls back to Hugging Face AutoModel for other encoder backbones.
+Text embedding models transform text into dense vector representations that power semantic search, dense retrieval, retrieval-augmented generation (RAG), and classification tasks. NeMo AutoModel includes custom bidirectional backbones and configures supported Hugging Face `AutoModel` backbones with non-causal attention for retrieval training.
 
 For cross-encoder pairwise scoring, see [Reranking Models](/model-coverage/reranking-models/overview).
 
@@ -16,12 +16,15 @@ Embedding models use bi-encoders to produce dense representations for queries an
 
 | Owner | Model | Architecture | Auto Class | Tasks |
 |---|---|---|---|---|
-| NVIDIA | [Llama (Bidirectional)](/model-coverage/embedding-models/llama-bidirectional) | `LlamaBidirectionalModel` | [`NeMoAutoModelBiEncoder`](https://github.com/NVIDIA-NeMo/Automodel/blob/8dc00dcb4a35c2413c52c6e7eb7ac8f1c24836aa/nemo_automodel/_transformers/auto_model.py#L991) | Embedding, Dense Retrieval |
-| Mistral AI | [Ministral3 (Bidirectional)](/model-coverage/embedding-models/ministral3-bidirectional) | `Ministral3BidirectionalModel` | [`NeMoAutoModelBiEncoder`](https://github.com/NVIDIA-NeMo/Automodel/blob/8dc00dcb4a35c2413c52c6e7eb7ac8f1c24836aa/nemo_automodel/_transformers/auto_model.py#L991) | Embedding, Dense Retrieval |
+| NVIDIA | [Llama (Bidirectional)](/model-coverage/embedding-models/nvidia/llama-bidirectional) | `LlamaBidirectionalModel` | [`NeMoAutoModelBiEncoder`](https://github.com/NVIDIA-NeMo/Automodel/blob/8dc00dcb4a35c2413c52c6e7eb7ac8f1c24836aa/nemo_automodel/_transformers/auto_model.py#L991) | Embedding, Dense Retrieval |
+| NVIDIA | [Llama Nemotron VL](/model-coverage/embedding-models/nvidia/llama-bidirectional) | `LlamaNemotronVLModel` | [`NeMoAutoModelBiEncoder`](https://github.com/NVIDIA-NeMo/Automodel/blob/8dc00dcb4a35c2413c52c6e7eb7ac8f1c24836aa/nemo_automodel/_transformers/auto_model.py#L991) | Embedding, Dense Retrieval |
+| Mistral AI | [Ministral3](/model-coverage/embedding-models/mistralai/ministral3-bidirectional) | `Ministral3Model` with `is_causal: false` | [`NeMoAutoModelBiEncoder`](https://github.com/NVIDIA-NeMo/Automodel/blob/8dc00dcb4a35c2413c52c6e7eb7ac8f1c24836aa/nemo_automodel/_transformers/auto_model.py#L991) | Embedding, Dense Retrieval |
+
+The stock `ministral3` path is preferred. The `ministral3_bidirec` model type remains available for compatibility with legacy checkpoints and resolves to the custom `Ministral3BidirectionalModel`.
 
 ### Hugging Face Auto Backbones
 
-Any Hugging Face model that can be loaded with `AutoModel` can be used as an embedding backbone. This fallback path uses the model's native attention; no bidirectional conversion is applied.
+Any Hugging Face model that can be loaded with `AutoModel` can be used as an embedding backbone. The fallback path sets `config.is_causal: false`; verify that an unregistered architecture honors this flag before using it for retrieval training.
 
 ## Example Recipes
 
@@ -30,6 +33,53 @@ Any Hugging Face model that can be loaded with `AutoModel` can be used as an emb
 | [llama3_2_1b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/bi_encoder/llama3_2_1b.yaml) | Bi-encoder — Llama 3.2 1B embedding model |
 | [llama_embed_nemotron_8b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/bi_encoder/llama_embed_nemotron_8b/llama_embed_nemotron_8b.yaml) | Bi-encoder — Llama-Embed-Nemotron-8B reproduction recipe |
 | [ministral3_3b_instruct.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/bi_encoder/ministral3_3b_instruct.yaml) | Bi-encoder — Ministral3-3B recipe |
+
+## Model Support Log
+
+This table lists embedding model support in reverse chronological order. See the [combined model support log](/model-coverage/release-log) for every model type.
+
+{/* BEGIN GENERATED MODEL SUPPORT LOG */}
+
+<div className="compact-model-tables">
+
+<style>{`
+  .compact-model-tables .fern-table-root {
+    width: 100% !important;
+  }
+
+  .compact-model-tables .fern-table {
+    width: 100% !important;
+    min-width: 0 !important;
+    table-layout: auto !important;
+  }
+
+  .compact-model-tables .fern-table th,
+  .compact-model-tables .fern-table td {
+    text-align: left !important;
+  }
+
+  .compact-model-tables .fern-table th:nth-child(-n + 2),
+  .compact-model-tables .fern-table td:nth-child(-n + 2) {
+    width: 1%;
+    white-space: nowrap;
+  }
+
+  .compact-model-tables .fern-table th:last-child,
+  .compact-model-tables .fern-table td:last-child {
+    width: 100%;
+  }
+`}</style>
+
+| Date | Type | Model |
+|:-----|:-----|:-----|
+| 2026-06-27 | Embedding | [Llama-nemotron-embed-vl-1b-v2](https://huggingface.co/nvidia/llama-nemotron-embed-vl-1b-v2) ([nemotron_vl_1b_example.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/bi_encoder/nemotron_vl_1b/nemotron_vl_1b_example.yaml)) |
+| 2026-05-21 | Embedding | [Ministral-3-3B-Instruct-2512](/model-coverage/embedding-models/mistralai/ministral3-bidirectional) ([ministral3_3b_instruct.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/bi_encoder/ministral3_3b_instruct.yaml)) |
+| 2026-03-30 | Embedding | [Llama-3.1-8B](/model-coverage/embedding-models/nvidia/llama-bidirectional) ([llama_embed_nemotron_8b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/bi_encoder/llama_embed_nemotron_8b/llama_embed_nemotron_8b.yaml)) |
+| 2026-03-30 | Embedding | [Llama-3.2-1B](/model-coverage/embedding-models/nvidia/llama-bidirectional) ([llama3_2_1b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/bi_encoder/llama3_2_1b.yaml)) |
+
+</div>
+
+{/* END GENERATED MODEL SUPPORT LOG */}
 
 ## Supported Workflows
 

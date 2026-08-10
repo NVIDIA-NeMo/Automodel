@@ -313,6 +313,36 @@ class TestToHF:
         for key in hf_state:
             torch.testing.assert_close(roundtrip[key], hf_state[key])
 
+    def test_text_only_expert_round_trip_preserves_keys_and_values(self, config, moe_config, backend_config):
+        """The causal-LM adapter keeps model.layers keys free of a language_model prefix."""
+        adapter = Qwen3_5MoeStateDictAdapter(
+            config=config,
+            moe_config=moe_config,
+            backend=backend_config,
+            dtype=torch.float32,
+            text_only=True,
+        )
+        gate_up_hf = torch.randn(4, 128, 64)
+        down_hf = torch.randn(4, 64, 64)
+        hf_state = {
+            "model.layers.0.mlp.experts.gate_up_proj": gate_up_hf,
+            "model.layers.0.mlp.experts.down_proj": down_hf,
+        }
+
+        native = adapter.from_hf(hf_state)
+
+        gate_up_native_key = "model.layers.0.mlp.experts.gate_and_up_projs"
+        down_native_key = "model.layers.0.mlp.experts.down_projs"
+        assert set(native) == {gate_up_native_key, down_native_key}
+        torch.testing.assert_close(native[gate_up_native_key], gate_up_hf.transpose(1, 2))
+        torch.testing.assert_close(native[down_native_key], down_hf.transpose(1, 2))
+
+        roundtrip = adapter.to_hf(native)
+
+        assert set(roundtrip) == set(hf_state)
+        for key, value in hf_state.items():
+            torch.testing.assert_close(roundtrip[key], value)
+
     @pytest.mark.parametrize(
         ("checkpoint_layout", "misleading_checkpoint_name", "use_index"),
         [
@@ -707,6 +737,71 @@ class TestFromHF:
         assert set(roundtrip) == set(hf_state)
         for key in hf_state:
             torch.testing.assert_close(roundtrip[key], hf_state[key])
+
+    def test_converts_mtp_split_dtensors_from_dcp(self, adapter, monkeypatch):
+        """DCP split experts must unwrap their residual DTensor before rebuilding the EP DTensor."""
+
+        class FakeDTensor(torch.Tensor):
+            _is_fake_dtensor = True
+
+            @staticmethod
+            def __new__(cls, data):
+                return torch.Tensor._make_subclass(cls, data)
+
+            def to_local(self):
+                return self.as_subclass(torch.Tensor)
+
+        monkeypatch.setattr(
+            "nemo_automodel.components.moe.state_dict_utils.is_dtensor",
+            lambda tensor: getattr(tensor, "_is_fake_dtensor", False),
+        )
+        monkeypatch.setattr(
+            "nemo_automodel.components.moe.state_dict_utils.get_expert_range_for_rank_from_mesh",
+            lambda mesh, n_experts: (0, n_experts),
+        )
+        monkeypatch.setattr(
+            "nemo_automodel.components.moe.state_dict_utils.get_submesh",
+            lambda mesh, dims: Mock(get_rank=lambda: 0),
+        )
+
+        rebuilt_locals = []
+
+        def fake_create_dtensor(local_tensor, mesh, rank):
+            assert not getattr(local_tensor, "_is_fake_dtensor", False)
+            rebuilt_locals.append(local_tensor)
+            return local_tensor
+
+        monkeypatch.setattr(
+            "nemo_automodel.components.moe.state_dict_utils.create_dtensor_from_local",
+            fake_create_dtensor,
+        )
+
+        device_mesh = Mock()
+        device_mesh.mesh_dim_names = ["ep"]
+        hf_state = {}
+        expected_gate_up = []
+        expected_down = []
+        for expert_id in range(adapter.moe_config.n_routed_experts):
+            gate = torch.randn(32, 64)
+            up = torch.randn(32, 64)
+            down = torch.randn(64, 32)
+            hf_state[f"mtp.layers.0.mlp.experts.{expert_id}.gate_proj.weight"] = FakeDTensor(gate)
+            hf_state[f"mtp.layers.0.mlp.experts.{expert_id}.up_proj.weight"] = FakeDTensor(up)
+            hf_state[f"mtp.layers.0.mlp.experts.{expert_id}.down_proj.weight"] = FakeDTensor(down)
+            expected_gate_up.append(torch.cat((gate.transpose(0, 1), up.transpose(0, 1)), dim=1))
+            expected_down.append(down.transpose(0, 1))
+
+        out = adapter.from_hf(hf_state, device_mesh=device_mesh)
+
+        assert len(rebuilt_locals) == 2
+        torch.testing.assert_close(
+            out["mtp.layers.0.mlp.experts.gate_and_up_projs"],
+            torch.stack(expected_gate_up, dim=0).to(adapter.dtype),
+        )
+        torch.testing.assert_close(
+            out["mtp.layers.0.mlp.experts.down_projs"],
+            torch.stack(expected_down, dim=0).to(adapter.dtype),
+        )
 
     def test_expert_parallel_sharding(self, adapter, monkeypatch):
         """When device_mesh is provided, from_hf should slice experts by rank."""

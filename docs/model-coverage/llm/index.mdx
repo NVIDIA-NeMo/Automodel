@@ -8,7 +8,7 @@ Large Language Models (LLMs) power a variety of tasks such as dialogue systems, 
 NeMo AutoModel provides a simple interface for loading and fine-tuning LLMs hosted on the Hugging Face Hub.
 
 ## Run LLMs with NeMo AutoModel
-To run LLMs with NeMo AutoModel, make sure you're using NeMo container version [`26.06.00`](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel?version=26.06.00) or later. If the model you intend to fine-tune requires newer source than the container provides, use a current checkout so the package and its example recipes stay on one revision:
+To run LLMs with NeMo AutoModel, make sure you use NeMo container version [`26.06.00`](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel?version=26.06.00) or later. If the model you intend to fine-tune requires a newer source than the container provides, use a current checkout so the package and its example recipes stay on one revision:
 
 ```bash
 git clone https://github.com/NVIDIA-NeMo/Automodel.git
@@ -16,7 +16,7 @@ cd Automodel
 uv sync --locked --all-groups --all-extras
 ```
 
-For other installation options (e.g., uv), see the [NeMo AutoModel Installation Guide](/get-started/installation).
+For other installation options (such as uv), refer to the [NeMo AutoModel Installation Guide](/get-started/installation).
 
 ## Supported Models
 
@@ -24,75 +24,215 @@ NeMo AutoModel supports the [AutoModelForCausalLM](https://huggingface.co/transf
 
 | Owner | Model Family | Architectures |
 |---|---|---|
-| Meta | [Llama](/model-coverage/large-language-models/llama) | `LlamaForCausalLM` |
-| Google | [Gemma](/model-coverage/large-language-models/gemma) | `GemmaForCausalLM`, `Gemma2ForCausalLM`, `Gemma3ForCausalLM` |
-| Qwen / Alibaba Cloud | [Qwen2](/model-coverage/large-language-models/qwen2) | `Qwen2ForCausalLM` |
-| Qwen / Alibaba Cloud | [Qwen2 MoE](/model-coverage/large-language-models/qwen2-moe) | `Qwen2MoeForCausalLM` |
-| Qwen / Alibaba Cloud | [Qwen3](/model-coverage/large-language-models/qwen3) | `Qwen3ForCausalLM` |
-| Qwen / Alibaba Cloud | [Qwen3 MoE](/model-coverage/large-language-models/qwen3-moe) | `Qwen3MoeForCausalLM` |
-| Qwen / Alibaba Cloud | [Qwen3-Next](/model-coverage/large-language-models/qwen3-next) | `Qwen3NextForCausalLM` |
-| Baidu | [ERNIE 4.5](/model-coverage/large-language-models/ernie-4-5) | `Ernie4_5ForCausalLM`, `Ernie4_5_MoeForCausalLM` |
-| DeepSeek | [DeepSeek](/model-coverage/large-language-models/deepseek) | `DeepseekForCausalLM` |
-| DeepSeek | [DeepSeek-V3](/model-coverage/large-language-models/deepseek-v3) | `DeepseekV3ForCausalLM`, `DeepseekV32ForCausalLM` |
-| DeepSeek | [DeepSeek V4 Flash](/model-coverage/large-language-models/deepseek-v4-flash) | `DeepseekV4ForCausalLM` |
-| Mistral AI | [Mistral](/model-coverage/large-language-models/mistral) | `MistralForCausalLM` |
-| Mistral AI | [Mixtral](/model-coverage/large-language-models/mixtral) | `MixtralForCausalLM` |
-| Mistral AI | [Ministral3 / Devstral](/model-coverage/large-language-models/ministral3-devstral) | `Mistral3ForConditionalGeneration` |
-| Microsoft | [Phi](/model-coverage/large-language-models/phi) | `PhiForCausalLM` |
-| Microsoft | [Phi-3 / Phi-4](/model-coverage/large-language-models/phi-3-phi-4) | `Phi3ForCausalLM` |
-| Microsoft | [Phi-3-Small](/model-coverage/large-language-models/phi-3-small) | `Phi3SmallForCausalLM` |
-| NVIDIA | [Nemotron / Minitron](/model-coverage/large-language-models/nemotron-minitron) | `NemotronForCausalLM` |
-| NVIDIA | [Nemotron-H](/model-coverage/large-language-models/nemotron-h) | `NemotronHForCausalLM` |
-| NVIDIA | [Nemotron-Flash](/model-coverage/large-language-models/nemotron-flash) | `NemotronFlashForCausalLM` |
-| NVIDIA | [Nemotron-Super](/model-coverage/large-language-models/nemotron-super-llama-3-3-nemotron-super-49b) | `DeciLMForCausalLM` |
-| ZAI / Zhipu AI | [ChatGLM](/model-coverage/large-language-models/chatglm) | `ChatGLMModel` |
-| ZAI / Zhipu AI | [GLM-4](/model-coverage/large-language-models/glm-4) | `GlmForCausalLM`, `Glm4ForCausalLM` |
-| ZAI / Zhipu AI | [GLM-4 MoE](/model-coverage/large-language-models/glm-4-moe-glm-4-5-glm-4-7) | `Glm4MoeForCausalLM`, `Glm4MoeLiteForCausalLM` |
-| ZAI / Zhipu AI | [GLM-5 / GLM-5.1 / GLM-5.2](/model-coverage/large-language-models/glm-5-moe-dsa) | `GlmMoeDsaForCausalLM` |
-| IBM | [Granite](/model-coverage/large-language-models/granite) | `GraniteForCausalLM` |
-| IBM | [Granite MoE](/model-coverage/large-language-models/granite-moe) | `GraniteMoeForCausalLM`, `GraniteMoeSharedForCausalLM` |
-| IBM | [Bamba](/model-coverage/large-language-models/bamba) | `BambaForCausalLM` |
-| Allen AI | [OLMo](/model-coverage/large-language-models/olmo) | `OLMoForCausalLM` |
-| Allen AI | [OLMo2](/model-coverage/large-language-models/olmo2) | `OLMo2ForCausalLM` |
-| Allen AI | [OLMoE](/model-coverage/large-language-models/olmoe) | `OLMoEForCausalLM` |
-| OpenAI | [GPT-OSS](/model-coverage/large-language-models/gpt-oss) | `GptOssForCausalLM` |
-| OpenAI | [GPT-2](/model-coverage/large-language-models/gpt-2) | `GPT2LMHeadModel` |
-| EleutherAI | [GPT-J](/model-coverage/large-language-models/gpt-j) | `GPTJForCausalLM` |
-| EleutherAI | [GPT-NeoX / Pythia](/model-coverage/large-language-models/gpt-neox-pythia) | `GPTNeoXForCausalLM` |
-| BigCode | [StarCoder](/model-coverage/large-language-models/starcoder) | `GPTBigCodeForCausalLM` |
-| BigCode | [StarCoder2](/model-coverage/large-language-models/starcoder2) | `Starcoder2ForCausalLM` |
-| BAAI | [Aquila / Aquila2](/model-coverage/large-language-models/aquila-aquila2) | `AquilaForCausalLM` |
-| Baichuan Inc | [Baichuan / Baichuan2](/model-coverage/large-language-models/baichuan-baichuan2) | `BaiChuanForCausalLM` |
-| Cohere | [Command-R](/model-coverage/large-language-models/command-r) | `CohereForCausalLM`, `Cohere2ForCausalLM` |
-| TII | [Falcon](/model-coverage/large-language-models/falcon) | `FalconForCausalLM` |
-| LG AI Research | [EXAONE](/model-coverage/large-language-models/exaone) | `ExaoneForCausalLM` |
-| InternLM | [InternLM](/model-coverage/large-language-models/internlm) | `InternLMForCausalLM`, `InternLM2ForCausalLM`, `InternLM3ForCausalLM` |
-| Inception AI | [Jais](/model-coverage/large-language-models/jais) | `JAISLMHeadModel` |
-| MiniMax | [MiniMax-M2](/model-coverage/large-language-models/minimax-m2) | `MiniMaxM2ForCausalLM` |
-| OpenBMB | [MiniCPM](/model-coverage/large-language-models/minicpm) | `MiniCPMForCausalLM`, `MiniCPM3ForCausalLM`, `MiniCPM5ForCausalLM` |
-| Moonshot AI | [Moonlight](/model-coverage/large-language-models/moonlight) | `DeepseekV3ForCausalLM` |
-| ByteDance Seed | [Seed (ByteDance)](/model-coverage/large-language-models/seed-bytedance) | `Qwen2ForCausalLM` |
-| Upstage | [Solar Pro](/model-coverage/large-language-models/solar-pro) | `SolarForCausalLM` |
-| OrionStar | [Orion](/model-coverage/large-language-models/orion) | `OrionForCausalLM` |
-| Stability AI | [StableLM](/model-coverage/large-language-models/stablelm) | `StableLmForCausalLM` |
-| Stepfun AI | [Step-3.5](/model-coverage/large-language-models/step-3-5) | `Step3p5ForCausalLM` |
-| Parasail AI | [GritLM](/model-coverage/large-language-models/gritlm) | `GritLM` |
-| Tencent | [Hy3-preview](/model-coverage/large-language-models/hy3-preview) | `HYV3ForCausalLM` |
-| Tencent | [Hy-MT2](/model-coverage/large-language-models/hy-mt2) | `HyMT2ForCausalLM` |
-| Xiaomi MiMo | [MiMo-V2-Flash](/model-coverage/large-language-models/mimo-v2-flash) | `MiMoV2FlashForCausalLM` |
-| Poolside | [Laguna](/model-coverage/large-language-models/laguna) | `LagunaForCausalLM` |
-| inclusionAI | [Ling 2.0](/model-coverage/large-language-models/ling-2-0) | `BailingMoeV2ForCausalLM` |
+| Meta | [Llama](/model-coverage/large-language-models/meta/llama) | `LlamaForCausalLM` |
+| Google | [Gemma 1](/model-coverage/large-language-models/google/gemma-1) | `GemmaForCausalLM` |
+| Google | [Gemma 2](/model-coverage/large-language-models/google/gemma-2) | `Gemma2ForCausalLM` |
+| Google | [FunctionGemma](/model-coverage/large-language-models/google/functiongemma) | `Gemma3ForCausalLM` |
+| Qwen / Alibaba Cloud | [Qwen2](/model-coverage/large-language-models/qwen/qwen2) | `Qwen2ForCausalLM` |
+| Qwen / Alibaba Cloud | [Qwen2 MoE](/model-coverage/large-language-models/qwen/qwen2-moe) | `Qwen2MoeForCausalLM` |
+| Qwen / Alibaba Cloud | [Qwen3](/model-coverage/large-language-models/qwen/qwen3) | `Qwen3ForCausalLM` |
+| Qwen / Alibaba Cloud | [Qwen3 MoE](/model-coverage/large-language-models/qwen/qwen3-moe) | `Qwen3MoeForCausalLM` |
+| Qwen / Alibaba Cloud | [Qwen3-Next](/model-coverage/large-language-models/qwen/qwen3-next) | `Qwen3NextForCausalLM` |
+| Baidu | [ERNIE 4.5](/model-coverage/large-language-models/baidu/ernie-4-5) | `Ernie4_5ForCausalLM`, `Ernie4_5_MoeForCausalLM` |
+| DeepSeek | [DeepSeek](/model-coverage/large-language-models/deepseek-ai/deepseek) | `DeepseekForCausalLM` |
+| DeepSeek | [DeepSeek-V3](/model-coverage/large-language-models/deepseek-ai/deepseek-v3) | `DeepseekV3ForCausalLM`, `DeepseekV32ForCausalLM` |
+| DeepSeek | [DeepSeek-V4 Flash](/model-coverage/large-language-models/deepseek-ai/deepseek-v4-flash) | `DeepseekV4ForCausalLM` |
+| DeepSeek | [DeepSeek-V4 Pro](/model-coverage/large-language-models/deepseek-ai/deepseek-v4-pro) | `DeepseekV4ForCausalLM` |
+| Mistral AI | [Mistral](/model-coverage/large-language-models/mistralai/mistral) | `MistralForCausalLM` |
+| Mistral AI | [Mixtral](/model-coverage/large-language-models/mistralai/mixtral) | `MixtralForCausalLM` |
+| Mistral AI | [Ministral3 / Devstral](/model-coverage/large-language-models/mistralai/ministral3-devstral) | `Ministral3ForCausalLM`, `Mistral3ForConditionalGeneration` |
+| Microsoft | [Phi](/model-coverage/large-language-models/microsoft/phi) | `PhiForCausalLM` |
+| Microsoft | [Phi-3 / Phi-4](/model-coverage/large-language-models/microsoft/phi-3-phi-4) | `Phi3ForCausalLM` |
+| Microsoft | [Phi-3-Small](/model-coverage/large-language-models/microsoft/phi-3-small) | `Phi3SmallForCausalLM` |
+| NVIDIA | [Nemotron / Minitron](/model-coverage/large-language-models/nvidia/nemotron-minitron) | `NemotronForCausalLM` |
+| NVIDIA | [Nemotron-H](/model-coverage/large-language-models/nvidia/nemotron-h) | `NemotronHForCausalLM` |
+| NVIDIA | [Nemotron-Flash](/model-coverage/large-language-models/nvidia/nemotron-flash) | `NemotronFlashForCausalLM` |
+| NVIDIA | [Nemotron-Super](/model-coverage/large-language-models/nvidia/nemotron-super-llama-3-3-nemotron-super-49b) | `DeciLMForCausalLM` |
+| ZAI / Zhipu AI | [ChatGLM](/model-coverage/large-language-models/thudm/chatglm) | `ChatGLMModel` |
+| ZAI / Zhipu AI | [GLM-4](/model-coverage/large-language-models/thudm/glm-4) | `GlmForCausalLM`, `Glm4ForCausalLM` |
+| ZAI / Zhipu AI | [GLM-4 MoE](/model-coverage/large-language-models/thudm/glm-4-moe-glm-4-5-glm-4-7) | `Glm4MoeForCausalLM`, `Glm4MoeLiteForCausalLM` |
+| ZAI / Zhipu AI | [GLM-5 / GLM-5.1 / GLM-5.2](/model-coverage/large-language-models/thudm/glm-5-moe-dsa) | `GlmMoeDsaForCausalLM` |
+| IBM | [Granite](/model-coverage/large-language-models/ibm/granite) | `GraniteForCausalLM` |
+| IBM | [Granite MoE](/model-coverage/large-language-models/ibm/granite-moe) | `GraniteMoeForCausalLM`, `GraniteMoeSharedForCausalLM` |
+| IBM | [Bamba](/model-coverage/large-language-models/ibm/bamba) | `BambaForCausalLM` |
+| Allen AI | [OLMo](/model-coverage/large-language-models/allenai/olmo) | `OLMoForCausalLM` |
+| Allen AI | [OLMo2](/model-coverage/large-language-models/allenai/olmo2) | `OLMo2ForCausalLM` |
+| Allen AI | [OLMoE](/model-coverage/large-language-models/allenai/olmoe) | `OLMoEForCausalLM` |
+| OpenAI | [GPT-OSS](/model-coverage/large-language-models/openai/gpt-oss) | `GptOssForCausalLM` |
+| OpenAI | [GPT-2](/model-coverage/large-language-models/openai/gpt-2) | `GPT2LMHeadModel` |
+| EleutherAI | [GPT-J](/model-coverage/large-language-models/eleutherai/gpt-j) | `GPTJForCausalLM` |
+| EleutherAI | [GPT-NeoX / Pythia](/model-coverage/large-language-models/eleutherai/gpt-neox-pythia) | `GPTNeoXForCausalLM` |
+| BigCode | [StarCoder](/model-coverage/large-language-models/bigcode/starcoder) | `GPTBigCodeForCausalLM` |
+| BigCode | [StarCoder2](/model-coverage/large-language-models/bigcode/starcoder2) | `Starcoder2ForCausalLM` |
+| BAAI | [Aquila / Aquila2](/model-coverage/large-language-models/baai/aquila-aquila2) | `AquilaForCausalLM` |
+| Baichuan Inc | [Baichuan / Baichuan2](/model-coverage/large-language-models/baichuan-inc/baichuan-baichuan2) | `BaichuanForCausalLM`, `BaiChuanForCausalLM` |
+| Cohere | [Command-R](/model-coverage/large-language-models/cohere/command-r) | `CohereForCausalLM`, `Cohere2ForCausalLM` |
+| TII | [Falcon](/model-coverage/large-language-models/tiiuae/falcon) | `FalconForCausalLM` |
+| LG AI Research | [EXAONE](/model-coverage/large-language-models/lgai-exaone/exaone) | `ExaoneForCausalLM` |
+| InternLM | [InternLM](/model-coverage/large-language-models/internlm/internlm) | `InternLMForCausalLM`, `InternLM2ForCausalLM`, `InternLM3ForCausalLM` |
+| Inception AI | [Jais](/model-coverage/large-language-models/inceptionai/jais) | `JAISLMHeadModel` |
+| MiniMax | [MiniMax-M2](/model-coverage/large-language-models/minimax/minimax-m2) | `MiniMaxM2ForCausalLM` |
+| OpenBMB | [MiniCPM](/model-coverage/large-language-models/openbmb/minicpm) | `MiniCPMForCausalLM`, `MiniCPM3ForCausalLM`, `MiniCPM5ForCausalLM` |
+| Moonshot AI | [Kimi K3](/model-coverage/large-language-models/moonshotai/kimi-k3) | `KimiK3ForCausalLM` |
+| Moonshot AI | [Moonlight](/model-coverage/large-language-models/moonshotai/moonlight) | `DeepseekV3ForCausalLM` |
+| Moonshot AI | [Kimi Linear](/model-coverage/large-language-models/moonshotai/kimi-linear) | `KimiLinear48BForCausalLM` |
+| ByteDance Seed | [Seed (ByteDance)](/model-coverage/large-language-models/bytedance-seed/seed-bytedance) | `Qwen2ForCausalLM` |
+| Upstage | [Solar Pro](/model-coverage/large-language-models/upstage/solar-pro) | `SolarForCausalLM` |
+| OrionStar | [Orion](/model-coverage/large-language-models/orionstar/orion) | `OrionForCausalLM` |
+| Stability AI | [StableLM](/model-coverage/large-language-models/stabilityai/stablelm) | `StableLmForCausalLM` |
+| Google | [T5](/model-coverage/large-language-models/google-t5/t5) | `T5ForConditionalGeneration` |
+| Stepfun AI | [Step-3.5](/model-coverage/large-language-models/stepfun-ai/step-3-5) | `Step3p5ForCausalLM` |
+| Parasail AI | [GritLM](/model-coverage/large-language-models/parasail-ai/gritlm) | `GritLM` |
+| Tencent | [Hy3-preview](/model-coverage/large-language-models/tencent/hy3-preview) | `HYV3ForCausalLM` |
+| Tencent | [Hy-MT2](/model-coverage/large-language-models/tencent/hy-mt2) | `HyMT2ForCausalLM` |
+| Xiaomi MiMo | [MiMo-V2-Flash](/model-coverage/large-language-models/xiaomimimo/mimo-v2-flash) | `MiMoV2FlashForCausalLM` |
+| Poolside | [Laguna](/model-coverage/large-language-models/poolside/laguna) | `LagunaForCausalLM` |
+| inclusionAI | [Ling 2.0](/model-coverage/large-language-models/inclusionai/ling-2-0) | `BailingMoeV2ForCausalLM` |
+
+## Model Support Log
+
+This table lists LLM support in reverse chronological order. See the [combined model support log](/model-coverage/release-log) for every model type.
+
+{/* BEGIN GENERATED MODEL SUPPORT LOG */}
+
+<div className="compact-model-tables">
+
+<style>{`
+  .compact-model-tables .fern-table-root {
+    width: 100% !important;
+  }
+
+  .compact-model-tables .fern-table {
+    width: 100% !important;
+    min-width: 0 !important;
+    table-layout: auto !important;
+  }
+
+  .compact-model-tables .fern-table th,
+  .compact-model-tables .fern-table td {
+    text-align: left !important;
+  }
+
+  .compact-model-tables .fern-table th:nth-child(-n + 2),
+  .compact-model-tables .fern-table td:nth-child(-n + 2) {
+    width: 1%;
+    white-space: nowrap;
+  }
+
+  .compact-model-tables .fern-table th:last-child,
+  .compact-model-tables .fern-table td:last-child {
+    width: 100%;
+  }
+`}</style>
+
+| Date | Type | Model |
+|:-----|:-----|:-----|
+| 2026-07-29 | LLM | [Kimi-K3](/model-coverage/large-language-models/moonshotai/kimi-k3) ([k3_hellaswag.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/kimi/k3_hellaswag.yaml)) |
+| 2026-07-22 | LLM | [Gemma-4-31B](https://huggingface.co/google/gemma-4-31B) ([gemma4_31b_base_coderforge_cp8_64k_1e5_800steps.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/long_context_validation/gemma4_31B/gemma4_31b_base_coderforge_cp8_64k_1e5_800steps.yaml)) |
+| 2026-07-22 | LLM | [Laguna-S-2.1](/model-coverage/large-language-models/poolside/laguna) ([laguna_s_2p1_hellaswag_ep16.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/laguna/laguna_s_2p1_hellaswag_ep16.yaml)) |
+| 2026-06-21 | LLM | [GLM-5.2](/model-coverage/large-language-models/thudm/glm-5-moe-dsa) ([glm_5.2_hellaswag_pp.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.2_hellaswag_pp.yaml)) |
+| 2026-06-18 | LLM | [Qwen2.5-0.5B](https://huggingface.co/Qwen/Qwen2.5-0.5B) ([qwen25_magi_prefix_tree_rollouts.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen25_magi_prefix_tree_rollouts.yaml)) |
+| 2026-06-08 | LLM | [Falcon-H1-0.5B-Instruct](https://huggingface.co/tiiuae/Falcon-H1-0.5B-Instruct) ([falcon_h1_0p5b_instruct_squad.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/falcon/falcon_h1_0p5b_instruct_squad.yaml)) |
+| 2026-06-08 | LLM | [Falcon-H1-1.5B-Deep-Instruct](https://huggingface.co/tiiuae/Falcon-H1-1.5B-Deep-Instruct) ([falcon_h1_1p5b_instruct_squad.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/falcon/falcon_h1_1p5b_instruct_squad.yaml)) |
+| 2026-06-08 | LLM | [Falcon-H1-34B-Instruct](https://huggingface.co/tiiuae/Falcon-H1-34B-Instruct) ([falcon_h1_34b_instruct_squad_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/falcon/falcon_h1_34b_instruct_squad_peft.yaml)) |
+| 2026-06-08 | LLM | [Falcon-H1-7B-Instruct](https://huggingface.co/tiiuae/Falcon-H1-7B-Instruct) ([falcon_h1_7b_instruct_hellaswag_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/falcon/falcon_h1_7b_instruct_hellaswag_peft.yaml)) |
+| 2026-06-04 | LLM | [Gemma-4-12B](https://huggingface.co/google/gemma-4-12B) ([gemma_4_12b_hellaswag.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gemma/gemma_4_12b_hellaswag.yaml)) |
+| 2026-06-04 | LLM | [NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16) ([nemotron_ultra_v3_hellaswag_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron/nemotron_ultra_v3_hellaswag_peft.yaml)) |
+| 2026-06-02 | LLM | [MiniCPM5-1B](/model-coverage/large-language-models/openbmb/minicpm) ([minicpm5_1b_hellaswag_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/minicpm/minicpm5_1b_hellaswag_peft.yaml)) |
+| 2026-05-28 | LLM | [Qwen2.5-3B](https://huggingface.co/Qwen/Qwen2.5-3B) ([qwen2_5_3b_function_calling.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/agent/qwen2_5_3b_function_calling.yaml)) |
+| 2026-05-28 | LLM | [Hy-MT2-30B-A3B](/model-coverage/large-language-models/tencent/hy-mt2) ([hy_mt2_30b_a3b_sft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/hy_mt2/hy_mt2_30b_a3b_sft.yaml)) |
+| 2026-05-22 | LLM | [DeepSeek-V4-Pro](/model-coverage/large-language-models/deepseek-ai/deepseek-v4-pro) ([deepseek_v4_pro_hellaswag_all_tilelang_pp8_ep64_20steps.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v4/deepseek_v4_pro_hellaswag_all_tilelang_pp8_ep64_20steps.yaml)) |
+| 2026-05-20 | LLM | [Ling-1T](/model-coverage/large-language-models/inclusionai/ling-2-0) ([ling_1t_lora_pp.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/ling/ling_1t_lora_pp.yaml)) |
+| 2026-05-20 | LLM | [Ling-flash-2.0](/model-coverage/large-language-models/inclusionai/ling-2-0) ([ling_flash_2_0_lora.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/ling/ling_flash_2_0_lora.yaml)) |
+| 2026-05-20 | LLM | [Ling-mini-2.0](/model-coverage/large-language-models/inclusionai/ling-2-0) ([ling_mini_2_0_hellaswag.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/ling/ling_mini_2_0_hellaswag.yaml)) |
+| 2026-05-17 | LLM | [ERNIE-4.5-0.3B-PT](/model-coverage/large-language-models/baidu/ernie-4-5) ([ernie4_5_0p3b_hellaswag.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/ernie4_5/ernie4_5_0p3b_hellaswag.yaml)) |
+| 2026-05-17 | LLM | [ERNIE-4.5-21B-A3B-PT](/model-coverage/large-language-models/baidu/ernie-4-5) ([ernie4_5_21b_a3b_hellaswag.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/ernie4_5/ernie4_5_21b_a3b_hellaswag.yaml)) |
+| 2026-05-17 | LLM | [MiMo-V2-Flash](/model-coverage/large-language-models/xiaomimimo/mimo-v2-flash) ([mimo_v2_flash_hellaswag.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/mimo_v2_flash/mimo_v2_flash_hellaswag.yaml)) |
+| 2026-04-29 | LLM | [Hy3-preview](/model-coverage/large-language-models/tencent/hy3-preview) ([hy3_preview_deepep.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/hy_v3/hy3_preview_deepep.yaml)) |
+| 2026-04-27 | LLM | [DeepSeek-V4-Flash](/model-coverage/large-language-models/deepseek-ai/deepseek-v4-flash) ([deepseek_v4_flash_hellaswag.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v4/deepseek_v4_flash_hellaswag.yaml)) |
+| 2026-04-15 | LLM | [Llama-3.1-8B-Instruct](https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct) ([customizer_llama_3_1_8b_full_sft_tp.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_1/customizer_llama_3_1_8b_full_sft_tp.yaml)) |
+| 2026-04-15 | LLM | [Llama-3.2-1B-Instruct](https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct) ([customizer_llama_3_2_1b_full_sft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_2/customizer_llama_3_2_1b_full_sft.yaml)) |
+| 2026-04-12 | LLM | [DeepSeek-V3.2](/model-coverage/large-language-models/deepseek-ai/deepseek-v3) ([dsv32_lora.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/deepseek/dsv32_lora.yaml)) |
+| 2026-04-12 | LLM | [Mistral-Small-4-119B-2603](https://huggingface.co/mistralai/Mistral-Small-4-119B-2603) ([mistral_small_4_te_deepep.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/mistral/mistral_small_4_te_deepep.yaml)) |
+| 2026-04-12 | LLM | [Kimi-K2-Base](https://huggingface.co/moonshotai/Kimi-K2-Base) ([kimi_k2_te_deepep.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/kimi/kimi_k2_te_deepep.yaml)) |
+| 2026-04-12 | LLM | [Qwen3-235B-A22B](/model-coverage/large-language-models/qwen/qwen3-moe) ([qwen3_moe_235b_te_deepep.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/qwen/qwen3_moe_235b_te_deepep.yaml)) |
+| 2026-04-12 | LLM | [Qwen3.5-35B-A3B](https://huggingface.co/Qwen/Qwen3.5-35B-A3B) ([qwen3.5_moe_lora.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/qwen/qwen3.5_moe_lora.yaml)) |
+| 2026-04-11 | LLM | [MiniMax-M2.7](/model-coverage/large-language-models/minimax/minimax-m2) ([minimax_m2.7_hellaswag_pp.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/minimax_m2/minimax_m2.7_hellaswag_pp.yaml)) |
+| 2026-04-07 | LLM | [GLM-5.1](/model-coverage/large-language-models/thudm/glm-5-moe-dsa) ([glm_5.1_hellaswag_pp.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.1_hellaswag_pp.yaml)) |
+| 2026-04-06 | LLM | [Ministral-3-3B-Instruct-2512](/model-coverage/large-language-models/mistralai/ministral3-devstral) ([ministral3_3b_squad.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/mistral/ministral3_3b_squad.yaml)) |
+| 2026-04-06 | LLM | [Llama-3.1-Nemotron-Nano-8B-v1](https://huggingface.co/nvidia/Llama-3.1-Nemotron-Nano-8B-v1) ([nemotron_nano_8b_v1_squad.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron/nemotron_nano_8b_v1_squad.yaml)) |
+| 2026-04-03 | LLM | [Qwen2.5-0.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct) ([qwen2_5_0p5b_instruct_fineproofs_chat.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen2_5_0p5b_instruct_fineproofs_chat.yaml)) |
+| 2026-03-30 | LLM | [NVIDIA-Nemotron-3-Nano-4B-BF16](/model-coverage/large-language-models/nvidia/nemotron-h) ([nemotron_nano_4b_squad.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron/nemotron_nano_4b_squad.yaml)) |
+| 2026-03-26 | LLM | [Qwen3-30B-A3B-Base](https://huggingface.co/Qwen/Qwen3-30B-A3B-Base) ([qwen3_moe_30b_ep8_flashoptim.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/convergence/tulu3/models/qwen3-moe-30b/qwen3_moe_30b_ep8_flashoptim.yaml)) |
+| 2026-03-26 | LLM | [Qwen3-4B-Base](https://huggingface.co/Qwen/Qwen3-4B-Base) ([qwen3_4b_cp1_flashoptim.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/convergence/tulu3/models/qwen3-4b/qwen3_4b_cp1_flashoptim.yaml)) |
+| 2026-03-11 | LLM | [NVIDIA-Nemotron-3-Super-120B-A12B-BF16](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16) ([nemotron_super_v3_hellaswag.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron/nemotron_super_v3_hellaswag.yaml)) |
+| 2026-03-11 | LLM | [GLM-5](/model-coverage/large-language-models/thudm/glm-5-moe-dsa) ([glm_5_hellaswag_pp.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5_hellaswag_pp.yaml)) |
+| 2026-03-09 | LLM | [Qwen3-30B-A3B-Thinking-2507](https://huggingface.co/Qwen/Qwen3-30B-A3B-Thinking-2507) ([qwen3_moe_30b_te_chat_thd.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen3_moe_30b_te_chat_thd.yaml)) |
+| 2026-02-13 | LLM | [MiniMax-M2.5](/model-coverage/large-language-models/minimax/minimax-m2) ([minimax_m2.5_hellaswag_pp.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/minimax_m2/minimax_m2.5_hellaswag_pp.yaml)) |
+| 2026-02-11 | LLM | [GLM-4.7-Flash](/model-coverage/large-language-models/thudm/glm-4-moe-glm-4-5-glm-4-7) ([glm_4.7_flash_te_deepep.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_4.7_flash_te_deepep.yaml)) |
+| 2026-02-08 | LLM | [MiniMax-M2.1](/model-coverage/large-language-models/minimax/minimax-m2) ([minimax_m2.1_hellaswag_pp.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/minimax_m2/minimax_m2.1_hellaswag_pp.yaml)) |
+| 2026-02-04 | LLM | [Step-3.5-Flash](/model-coverage/large-language-models/stepfun-ai/step-3-5) ([step_3.5_flash_hellaswag_pp.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/stepfun/step_3.5_flash_hellaswag_pp.yaml)) |
+| 2026-01-29 | LLM | [NVIDIA-Nemotron-3-Nano-30B-A3B-BF16](/model-coverage/large-language-models/nvidia/nemotron-h) ([nemotron_nano_v3_hellaswag.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron/nemotron_nano_v3_hellaswag.yaml)) |
+| 2026-01-27 | LLM | [GLM-4.7](/model-coverage/large-language-models/thudm/glm-4-moe-glm-4-5-glm-4-7) ([glm_4.7_te_deepep.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_4.7_te_deepep.yaml)) |
+| 2026-01-12 | LLM | [Nemotron-Flash-1B](/model-coverage/large-language-models/nvidia/nemotron-flash) ([nemotron_flash_1b_squad.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron_flash/nemotron_flash_1b_squad.yaml)) |
+| 2026-01-08 | LLM | [Qwen1.5-MoE-A2.7B](/model-coverage/large-language-models/qwen/qwen2-moe) ([qwen1_5_moe_a2_7b_qlora.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen1_5_moe_a2_7b_qlora.yaml)) |
+| 2026-01-07 | LLM | [Devstral-Small-2-24B-Instruct-2512](/model-coverage/large-language-models/mistralai/ministral3-devstral) ([devstral2_small_2512_squad.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/devstral/devstral2_small_2512_squad.yaml)) |
+| 2025-12-18 | LLM | [Functiongemma-270m-it](/model-coverage/large-language-models/google/functiongemma) ([functiongemma_xlam.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gemma/functiongemma_xlam.yaml)) |
+| 2025-12-16 | LLM | [Llama-3.1-70B](https://huggingface.co/meta-llama/Llama-3.1-70B) ([llama3_70b_pretrain.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_pretrain/llama3_70b_pretrain.yaml)) |
+| 2025-11-24 | LLM | [GLM-4.5-Air](/model-coverage/large-language-models/thudm/glm-4-moe-glm-4-5-glm-4-7) ([glm_4.5_air_te_deepep.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_4.5_air_te_deepep.yaml)) |
+| 2025-11-17 | LLM | [Qwen2.5-32B-Instruct](https://huggingface.co/Qwen/Qwen2.5-32B-Instruct) ([qwen2_5_32b_peft_benchmark.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen2_5_32b_peft_benchmark.yaml)) |
+| 2025-10-24 | LLM | [Qwen3-Next-80B-A3B-Instruct](/model-coverage/large-language-models/qwen/qwen3-next) ([qwen3_next_te_deepep.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen3_next_te_deepep.yaml)) |
+| 2025-10-21 | LLM | [Qwen2.5-7B-Instruct](/model-coverage/large-language-models/qwen/qwen2) ([qwen2_5_7b_instruct_chat.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen2_5_7b_instruct_chat.yaml)) |
+| 2025-10-15 | LLM | [Qwen3-8B](/model-coverage/large-language-models/qwen/qwen3) ([qwen3_8b_squad_spark.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen3_8b_squad_spark.yaml)) |
+| 2025-10-05 | LLM | [Llama-3.3-70B-Instruct](https://huggingface.co/meta-llama/Llama-3.3-70B-Instruct) ([llama_3_3_70b_instruct_squad.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_3/llama_3_3_70b_instruct_squad.yaml)) |
+| 2025-10-05 | LLM | [Mixtral-8x7B-v0.1](/model-coverage/large-language-models/mistralai/mixtral) ([mixtral-8x7b-v0-1_squad.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/mistral/mixtral-8x7b-v0-1_squad.yaml)) |
+| 2025-10-01 | LLM | [Qwen3-30B-A3B](/model-coverage/large-language-models/qwen/qwen3-moe) ([qwen3_moe_30b_te_deepep.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen3_moe_30b_te_deepep.yaml)) |
+| 2025-09-29 | LLM | [DeepSeek-V3](/model-coverage/large-language-models/deepseek-ai/deepseek-v3) ([deepseekv3_pretrain.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_pretrain/deepseekv3_pretrain.yaml)) |
+| 2025-09-29 | LLM | [Llama-3_3-Nemotron-Super-49B-v1_5](https://huggingface.co/nvidia/Llama-3_3-Nemotron-Super-49B-v1_5) ([llama3_3_nemotron_super_49B_squad_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron/llama3_3_nemotron_super_49B_squad_peft.yaml)) |
+| 2025-09-29 | LLM | [NVIDIA-Nemotron-Nano-9B-v2](/model-coverage/large-language-models/nvidia/nemotron-h) ([nemotron_nano_9b_squad.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron/nemotron_nano_9b_squad.yaml)) |
+| 2025-09-23 | LLM | [Gpt-oss-120b](/model-coverage/large-language-models/openai/gpt-oss) ([gpt_oss_120b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gpt_oss/gpt_oss_120b.yaml)) |
+| 2025-09-23 | LLM | [Gpt-oss-20b](/model-coverage/large-language-models/openai/gpt-oss) ([gpt_oss_20b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gpt_oss/gpt_oss_20b.yaml)) |
+| 2025-09-08 | LLM | [Moonlight-16B-A3B](/model-coverage/large-language-models/deepseek-ai/deepseek-v3) ([moonlight_16b_te.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/moonlight/moonlight_16b_te.yaml)) |
+| 2025-09-03 | LLM | [Gpt2](/model-coverage/large-language-models/openai/gpt-2) ([megatron_pretrain_gpt2.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_pretrain/megatron_pretrain_gpt2.yaml)) |
+| 2025-08-27 | LLM | [OLMo-2-0425-1B-Instruct](/model-coverage/large-language-models/allenai/olmo2) ([olmo_2_0425_1b_instruct_squad.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/olmo/olmo_2_0425_1b_instruct_squad.yaml)) |
+| 2025-08-27 | LLM | [Baichuan2-7B-Chat](https://huggingface.co/baichuan-inc/Baichuan2-7B-Chat) ([baichuan_2_7b_mock_fp8.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/baichuan/baichuan_2_7b_mock_fp8.yaml)) |
+| 2025-08-27 | LLM | [Starcoder2-7b](/model-coverage/large-language-models/bigcode/starcoder2) ([starcoder_2_7b_hellaswag_fp8.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/starcoder/starcoder_2_7b_hellaswag_fp8.yaml)) |
+| 2025-08-27 | LLM | [Seed-Coder-8B-Instruct](/model-coverage/large-language-models/bytedance-seed/seed-bytedance) ([seed_coder_8b_instruct_hellaswag_fp8.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/seed/seed_coder_8b_instruct_hellaswag_fp8.yaml)) |
+| 2025-08-27 | LLM | [Seed-OSS-36B-Instruct](/model-coverage/large-language-models/bytedance-seed/seed-bytedance) ([seed_oss_36B_hellaswag.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/seed/seed_oss_36B_hellaswag.yaml)) |
+| 2025-08-27 | LLM | [C4ai-command-r7b-12-2024](/model-coverage/large-language-models/cohere/command-r) ([cohere_command_r_7b_hellaswag_fp8.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/cohere/cohere_command_r_7b_hellaswag_fp8.yaml)) |
+| 2025-08-27 | LLM | [Gemma-2-9b-it](/model-coverage/large-language-models/google/gemma-2) ([gemma_2_9b_it_hellaswag_fp8.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gemma/gemma_2_9b_it_hellaswag_fp8.yaml)) |
+| 2025-08-27 | LLM | [Gemma-3-270m](https://huggingface.co/google/gemma-3-270m) ([gemma_3_270m_squad.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gemma/gemma_3_270m_squad.yaml)) |
+| 2025-08-27 | LLM | [Gemma-7b](/model-coverage/large-language-models/google/gemma-1) ([gemma_7b_squad.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gemma/gemma_7b_squad.yaml)) |
+| 2025-08-27 | LLM | [Granite-3.3-2b-instruct](https://huggingface.co/ibm-granite/granite-3.3-2b-instruct) ([granite_3_3_2b_instruct_hellaswag_fp8.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/granite/granite_3_3_2b_instruct_hellaswag_fp8.yaml)) |
+| 2025-08-27 | LLM | [Llama-3.2-3B-Instruct](https://huggingface.co/meta-llama/Llama-3.2-3B-Instruct) ([llama_3_2_3b_instruct_squad.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_2/llama_3_2_3b_instruct_squad.yaml)) |
+| 2025-08-27 | LLM | [Phi-2](/model-coverage/large-language-models/microsoft/phi) ([phi_2_squad.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/phi/phi_2_squad.yaml)) |
+| 2025-08-27 | LLM | [Phi-3-mini-4k-instruct](/model-coverage/large-language-models/microsoft/phi-3-phi-4) ([phi_3_mini_it_squad.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/phi/phi_3_mini_it_squad.yaml)) |
+| 2025-08-27 | LLM | [Phi-4](https://huggingface.co/microsoft/phi-4) ([phi_4_hellaswag_fp8.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/phi/phi_4_hellaswag_fp8.yaml)) |
+| 2025-08-27 | LLM | [Mistral-7B-v0.1](/model-coverage/large-language-models/mistralai/mistral) ([mistral_7b_hellaswag_fp8.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/mistral/mistral_7b_hellaswag_fp8.yaml)) |
+| 2025-08-27 | LLM | [Mistral-Nemo-Base-2407](https://huggingface.co/mistralai/Mistral-Nemo-Base-2407) ([mistral_nemo_2407_hellaswag_fp8.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/mistral/mistral_nemo_2407_hellaswag_fp8.yaml)) |
+| 2025-08-27 | LLM | [Mixtral-8x7B-Instruct-v0.1](/model-coverage/large-language-models/mistralai/mixtral) ([mixtral_8x7b_instruct_squad_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/mistral/mixtral_8x7b_instruct_squad_peft.yaml)) |
+| 2025-08-27 | LLM | [Qwen2.5-7B](https://huggingface.co/Qwen/Qwen2.5-7B) ([qwen2_5_7b_hellaswag_fp8.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen2_5_7b_hellaswag_fp8.yaml)) |
+| 2025-08-27 | LLM | [Qwen3-0.6B](/model-coverage/large-language-models/qwen/qwen3) ([qwen3_0p6b_hellaswag.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen3_0p6b_hellaswag.yaml)) |
+| 2025-08-27 | LLM | [QwQ-32B](https://huggingface.co/Qwen/QwQ-32B) ([qwq_32b_squad.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwq_32b_squad.yaml)) |
+| 2025-08-27 | LLM | [Falcon3-7B-Instruct](https://huggingface.co/tiiuae/Falcon3-7B-Instruct) ([falcon3_7b_instruct_hellaswag_fp8.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/falcon/falcon3_7b_instruct_hellaswag_fp8.yaml)) |
+| 2025-08-27 | LLM | [Glm-4-9b-chat-hf](/model-coverage/large-language-models/thudm/glm-4) ([glm_4_9b_chat_hf_hellaswag_fp8.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_4_9b_chat_hf_hellaswag_fp8.yaml)) |
+| 2025-08-23 | LLM | [Llama-3.1-8B](/model-coverage/large-language-models/meta/llama) ([llama3_1_8b_hellaswag_fp8.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_1/llama3_1_8b_hellaswag_fp8.yaml)) |
+| 2025-08-23 | LLM | [Llama-3.2-1B](/model-coverage/large-language-models/meta/llama) ([llama3_2_1b_hellaswag.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_2/llama3_2_1b_hellaswag.yaml)) |
+
+</div>
+
+{/* END GENERATED MODEL SUPPORT LOG */}
 
 ## Fine-Tuning LLMs with NeMo AutoModel
 
 The models listed above can be fine-tuned using NeMo AutoModel. NeMo AutoModel supports two primary fine-tuning approaches:
 
-1. **Parameter-Efficient Fine-Tuning (PEFT)**: Updates only a small subset of parameters (typically &lt;1%) using techniques like Low-Rank Adaptation (LoRA).
+1. **Parameter-Efficient Fine-Tuning (PEFT)**: Updates only a small subset of parameters (typically less than 1%) using techniques such as Low-Rank Adaptation (LoRA).
 2. **Supervised Fine-Tuning (SFT)**: Updates all or most model parameters for deeper adaptation.
 
 See the [Fine-Tuning Guide](/recipes-e2e-examples/sft-peft) to learn how to apply both methods to your data.
 
 <Tip>
-In these guides, we use the `SQuAD v1.1` dataset for demonstration purposes, but you can use your own data. Update the recipe YAML `dataset` / `validation_dataset` sections accordingly. See [LLM datasets](/datasets/text-dataset) and [dataset overview](/datasets/overview).
+In these guides, the `SQuAD v1.1` dataset is used for demonstration purposes, but you can use custom data. Update the recipe YAML `dataset` and `validation_dataset` sections accordingly. Refer to [LLM Datasets](/datasets/text-dataset) and [Dataset Overview](/datasets/overview).
 
 </Tip>

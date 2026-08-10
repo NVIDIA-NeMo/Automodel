@@ -113,4 +113,23 @@ optimizer:
 ci:
   # pp_size(1) * ep_size(32) = 32 GPUs => 4 nodes (8 H100/node).
   recipe_owner: hemildesai
+  time: "00:30:00"
   nodes: 4
+  checkpoint_robustness:
+    # The robustness default local batch is 2; with 32 ranks the global batch
+    # must be at least 64 and divisible by 2 * 32.
+    step_scheduler.global_batch_size: 64
+    # Keep each large-model load in a fresh process so the HF reload has all
+    # local GPU memory available after the distributed train/save phase.
+    process_isolation: true
+    # Exact adapter fingerprints and a successful HF+PEFT forward still run;
+    # live-LoRA cross-runtime logit parity is not a stable quantized reference.
+    skip_hf_logit_parity: true
+    # Use Transformers' built-in MiniMax M2 implementation for the HF+PEFT
+    # reload; the checkpoint's remote code targets an older Transformers API.
+    trust_remote_code: false
+    tokenizer_name: MiniMaxAI/MiniMax-M2.7
+    hf_device_map_auto: true
+    no_check_resume: true
+    dataset.num_samples_limit: 500
+    validation_dataset.num_samples_limit: 500

@@ -50,9 +50,9 @@ import argparse
 import hashlib
 import json
 import logging
+import multiprocessing
 import os
 import traceback
-from multiprocessing import Pool
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Protocol, Tuple, runtime_checkable
 
@@ -161,10 +161,12 @@ def _init_worker(processor_name: str, model_name: str, gpu_id: int, max_pixels: 
     """Initialize worker process with models on assigned GPU."""
     global _worker_models, _worker_processor, _worker_calculator, _worker_device
 
-    # Set CUDA_VISIBLE_DEVICES to isolate this GPU for the worker process.
-    # After this, the selected GPU becomes cuda:0 (not cuda:{gpu_id}).
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-    _worker_device = "cuda:0"
+    # Select the GPU explicitly rather than via CUDA_VISIBLE_DEVICES: in a
+    # spawned worker the module re-imports can touch the CUDA driver before
+    # this function runs, after which CUDA_VISIBLE_DEVICES is ignored and
+    # every worker would land on GPU 0.
+    torch.cuda.set_device(gpu_id)
+    _worker_device = f"cuda:{gpu_id}"
 
     _worker_processor = ProcessorRegistry.get(processor_name)
     _worker_models = _worker_processor.load_models(model_name, _worker_device)
@@ -391,10 +393,12 @@ def preprocess_dataset(
     # Split images across GPUs
     chunks = [image_files[i::num_gpus] for i in range(num_gpus)]
 
-    # Process with one worker per GPU
+    # Process with one worker per GPU. Workers use CUDA, and module imports can
+    # initialize CUDA in this parent process, so fork-based workers would fail
+    # with "Cannot re-initialize CUDA in forked subprocess"; spawn is required.
     all_metadata = []
 
-    with Pool(processes=num_gpus) as pool:
+    with multiprocessing.get_context("spawn").Pool(processes=num_gpus) as pool:
         args = [
             (gpu_id, chunks[gpu_id], str(output_dir), processor_name, model_name, verify, caption_cache, max_pixels)
             for gpu_id in range(num_gpus)
@@ -438,9 +442,12 @@ def _init_video_worker(
     """Initialize video worker process with models on assigned GPU."""
     global _worker_models, _worker_processor, _worker_calculator, _worker_device, _worker_config
 
-    # Set CUDA_VISIBLE_DEVICES to isolate this GPU for the worker process.
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-    _worker_device = "cuda:0"
+    # Select the GPU explicitly rather than via CUDA_VISIBLE_DEVICES: in a
+    # spawned worker the module re-imports can touch the CUDA driver before
+    # this function runs, after which CUDA_VISIBLE_DEVICES is ignored and
+    # every worker would land on GPU 0.
+    torch.cuda.set_device(gpu_id)
+    _worker_device = f"cuda:{gpu_id}"
     _worker_config = video_config
 
     _worker_processor = ProcessorRegistry.get(processor_name)
@@ -795,8 +802,14 @@ def _process_video_video_mode(args: Tuple) -> Optional[Dict]:
         if hasattr(_worker_processor, "encode_first_frame"):
             image_embeds = _worker_processor.encode_first_frame(first_frame, _worker_models, _worker_device)
 
+        # Encode the audio track for audio-video models (if processor supports it)
+        audio_encodings = {}
+        if hasattr(_worker_processor, "encode_audio"):
+            audio_encodings = _worker_processor.encode_audio(video_path, actual_frames, _worker_models, _worker_device)
+
         # Prepare metadata
         metadata = {
+            **audio_encodings,
             "original_resolution": (orig_width, orig_height),
             "bucket_resolution": (target_width, target_height),
             "bucket_id": bucket_id,
@@ -1046,10 +1059,12 @@ def preprocess_video_dataset(
     # Split videos across GPUs
     chunks = [video_files[i::num_gpus] for i in range(num_gpus)]
 
-    # Process with one worker per GPU
+    # Process with one worker per GPU. Workers use CUDA, and module imports can
+    # initialize CUDA in this parent process, so fork-based workers would fail
+    # with "Cannot re-initialize CUDA in forked subprocess"; spawn is required.
     all_metadata = []
 
-    with Pool(processes=num_gpus) as pool:
+    with multiprocessing.get_context("spawn").Pool(processes=num_gpus) as pool:
         args = [
             (
                 gpu_id,
@@ -1355,7 +1370,7 @@ Examples:
         "--processor",
         type=str,
         required=True,
-        choices=["wan", "wan2.1", "wan2.2", "hunyuan", "hunyuanvideo", "hunyuanvideo-1.5"],
+        choices=["wan", "wan2.1", "wan2.2", "hunyuan", "hunyuanvideo", "hunyuanvideo-1.5", "ltx2"],
     )
     video_parser.add_argument("--model_name", type=str, default=None, help="Model name (uses processor default)")
     video_parser.add_argument("--mode", type=str, default="video", choices=["video", "frames"], help="Processing mode")
