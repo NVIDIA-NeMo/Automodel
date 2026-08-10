@@ -88,7 +88,6 @@ class TestDistributeParam:
         """Test basic parameter distribution."""
         module = nn.Linear(10, 20)
         original_param = module.weight.clone()
-        original_requires_grad = module.weight.requires_grad
 
         with patch("nemo_automodel.components.distributed.parallel_styles.distribute_tensor") as mock_distribute:
             # Mock distribute_tensor to return a tensor-like object
@@ -261,12 +260,12 @@ class TestRowwiseParallelLora:
             assert bias_call[0][1] == "bias"
             assert bias_call[0][4] == [Replicate()]
 
-            # A follows the input shard; replicated B preserves A's Partial
-            # output until the row-parallel module's output reduction.
+            # A follows the input shard; B consumes the redistributed low-rank
+            # activation shard, matching the numerically stable legacy plan.
             lora_a_call = mock_dist.call_args_list[2]
             assert lora_a_call[0][4] == [Shard(1)]
             lora_b_call = mock_dist.call_args_list[3]
-            assert lora_b_call[0][4] == [Replicate()]
+            assert lora_b_call[0][4] == [Shard(1)]
 
     def test_partition_linear_fn_without_lora(self, mock_linear_module, mock_device_mesh):
         """Test partitioning a linear module without LoRA adapters."""

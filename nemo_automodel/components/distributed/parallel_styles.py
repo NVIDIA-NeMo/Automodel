@@ -156,11 +156,7 @@ class RowwiseParallelLora(RowwiseParallel):
             _distribute_param(module, "bias", device_mesh, self.src_data_rank, [Replicate()])
         if hasattr(module, "lora_A"):
             _distribute_param(module.lora_A, "weight", device_mesh, self.src_data_rank, [Shard(1)])
-            # Keep the A projection's Partial output Partial through B so it can
-            # share the row-parallel module's existing output reduction.  A
-            # replicated B maps Partial low-rank activations to Partial output
-            # activations without an intermediate redistribute.
-            _distribute_param(module.lora_B, "weight", device_mesh, self.src_data_rank, [Replicate()])
+            _distribute_param(module.lora_B, "weight", device_mesh, self.src_data_rank, [Shard(1)])
             module.lora_A.__class__ = TPLinear
             module.lora_B.__class__ = TPLinear
         # Plain nn.Linear: convert to TPLinear for compile safety.

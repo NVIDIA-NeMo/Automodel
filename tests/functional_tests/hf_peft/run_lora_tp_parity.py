@@ -71,6 +71,7 @@ def _assert_optimizer_state_parity(
     reference_optimizer: torch.optim.Adam,
     module: LinearLoRA,
     reference: LinearLoRA,
+    label_prefix: str,
 ) -> None:
     for adapter_name in ("lora_A", "lora_B"):
         param = getattr(module, adapter_name).weight
@@ -82,11 +83,11 @@ def _assert_optimizer_state_parity(
             _assert_close(
                 _full_tensor(distributed_state),
                 reference_state[state_name],
-                f"{adapter_name}.{state_name}",
+                f"{label_prefix} {adapter_name}.{state_name}",
             )
             if param.placements == (Replicate(),):
                 assert isinstance(distributed_state, DTensor)
-                _assert_replicated_rank_parity(distributed_state, f"{adapter_name}.{state_name}")
+                _assert_replicated_rank_parity(distributed_state, f"{label_prefix} {adapter_name}.{state_name}")
 
 
 def _run_plan(plan_name: str, device: torch.device, dtype: torch.dtype) -> None:
@@ -101,7 +102,7 @@ def _run_plan(plan_name: str, device: torch.device, dtype: torch.dtype) -> None:
         expected_grad_placements = {"lora_A": (Partial(),), "lora_B": (Shard(0),)}
     elif plan_name == "rowwise":
         plan = RowwiseParallelLora(input_layouts=Replicate(), use_local_output=False)
-        expected_param_placements = {"lora_A": (Shard(1),), "lora_B": (Replicate(),)}
+        expected_param_placements = {"lora_A": (Shard(1),), "lora_B": (Shard(1),)}
         expected_grad_placements = {"lora_A": (Shard(1),), "lora_B": (Partial(),)}
     else:
         raise ValueError(f"unknown plan: {plan_name}")
@@ -136,12 +137,15 @@ def _run_plan(plan_name: str, device: torch.device, dtype: torch.dtype) -> None:
             param = getattr(module, adapter_name).weight
             reference_param = getattr(reference, adapter_name).weight
             assert param.placements == expected_param_placements[adapter_name]
-            assert param.grad.placements == expected_grad_placements[adapter_name]
+            assert param.grad.placements == expected_grad_placements[adapter_name], (
+                f"{plan_name} {adapter_name}: expected gradient placements "
+                f"{expected_grad_placements[adapter_name]}, got {param.grad.placements}"
+            )
             if step == 0:
                 _assert_close(
                     _full_tensor(param.grad),
                     reference_param.grad,
-                    f"{plan_name} step {step} {adapter_name} grad",
+                    f"{plan_name} {dtype} step {step} {adapter_name} grad",
                 )
 
         # On step 1, deliberately do not materialize either adapter gradient in
@@ -168,12 +172,18 @@ def _run_plan(plan_name: str, device: torch.device, dtype: torch.dtype) -> None:
             _assert_close(
                 _full_tensor(param),
                 reference_param,
-                f"{plan_name} step {step} {adapter_name} parameter",
+                f"{plan_name} {dtype} step {step} {adapter_name} parameter",
             )
             if param.placements == (Replicate(),):
-                _assert_replicated_rank_parity(param, f"{plan_name} step {step} {adapter_name}")
+                _assert_replicated_rank_parity(param, f"{plan_name} {dtype} step {step} {adapter_name}")
 
-        _assert_optimizer_state_parity(optimizer, reference_optimizer, module, reference)
+        _assert_optimizer_state_parity(
+            optimizer,
+            reference_optimizer,
+            module,
+            reference,
+            f"{plan_name} {dtype} step {step}",
+        )
 
 
 def main() -> None:

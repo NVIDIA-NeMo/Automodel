@@ -121,18 +121,17 @@ def _clip_grad_norm_impl(
     else:
         parameters = list(parameters)
 
-    # Resolve Partial gradients once after accumulation.  In particular, a
-    # replicated parameter can legitimately receive a Partial gradient (for
-    # example replicated LoRA-A in a column-parallel projection).  Computing
-    # or clipping its rank-local gradient would produce different norms and
-    # parameter updates across ranks.
+    # Resolve Partial gradients once after accumulation into the parameter's
+    # placement. In particular, a replicated parameter can legitimately receive
+    # a Partial gradient (for example replicated LoRA-A in a column-parallel
+    # projection). Computing or clipping its rank-local gradient would produce
+    # different norms and parameter updates across ranks. A sharded parameter can
+    # also receive a Partial gradient, which must reduce-scatter back to its shard.
     for p in parameters:
         grad = p.grad
         if isinstance(grad, DTensor) and any(isinstance(placement, Partial) for placement in grad.placements):
-            placements = tuple(
-                Replicate() if isinstance(placement, Partial) else placement for placement in grad.placements
-            )
-            p.grad = grad.redistribute(placements=placements)
+            target_placements = p.placements if isinstance(p, DTensor) else tuple(Replicate() for _ in grad.placements)
+            p.grad = grad.redistribute(placements=target_placements)
 
     # Group parameters by their gradient sharding pattern.  Parameter and
     # gradient placements need not match: Replicate parameters can have
