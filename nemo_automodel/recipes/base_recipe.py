@@ -306,7 +306,9 @@ class BaseRecipe:
                 scheduler = getattr(self, key)
             elif is_tokenizer(getattr(self, key)):
                 tokenizer = getattr(self, key)
-            elif is_dataloader(getattr(self, key)) or isinstance(getattr(self, key), StatefulRNG):
+            elif isinstance(getattr(self, key), StatefulRNG):
+                self.checkpointer.save_on_global_ranks(getattr(self, key), key, path)
+            elif is_dataloader(getattr(self, key)):
                 self.checkpointer.save_on_dp_ranks(getattr(self, key), key, path)
             elif is_distributed_stateful(getattr(self, key)):
                 self.checkpointer.save_distributed_state(getattr(self, key), key, path)
@@ -433,7 +435,9 @@ class BaseRecipe:
                 optimizer = obj
             elif is_lr_scheduler(obj):
                 scheduler = obj
-            elif is_dataloader(obj) or isinstance(obj, StatefulRNG):
+            elif isinstance(obj, StatefulRNG):
+                self.checkpointer.load_on_global_ranks(obj, key, ckpt_dir)
+            elif is_dataloader(obj):
                 self.checkpointer.load_on_dp_ranks(obj, key, ckpt_dir)
             elif is_distributed_stateful(obj):
                 self.checkpointer.load_distributed_state(obj, key, ckpt_dir)
