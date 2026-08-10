@@ -316,7 +316,7 @@ def test_ministral3_biencoder_processor_saves_as_stock_pixtral_without_remote_co
 
     ownership_template = processor.chat_template
     assert ownership_template is not None
-    assert "content | replace" in ownership_template
+    assert "Derived from the Mistral" in ownership_template
     normalizer = str(processor.tokenizer.backend_tokenizer.normalizer)
 
     processor.save_pretrained(tmp_path)
@@ -326,14 +326,18 @@ def test_ministral3_biencoder_processor_saves_as_stock_pixtral_without_remote_co
     tokenizer_config = json.loads((tmp_path / "tokenizer_config.json").read_text())
     reloaded = AutoProcessor.from_pretrained(tmp_path, trust_remote_code=False)
     rendered = reloaded.apply_chat_template(
-        [{"role": "user", "content": "literal [IMG]"}],
+        [
+            {"role": "system", "content": "query:"},
+            {"role": "user", "content": "literal [IMG]"},
+        ],
         tokenize=False,
     )
 
     assert type(reloaded) is PixtralProcessor
     assert type(reloaded.tokenizer) is TokenizersBackend
     assert reloaded.tokenizer.split_special_tokens is False
-    assert rendered == "literal [\u200cIMG]"
+    assert rendered == "query: literal [\u200cIMG]"
+    assert "[INST]" not in rendered
     assert "auto_map" not in processor_config
     assert "auto_map" not in tokenizer_config
     assert not (tmp_path / "processor.py").exists()
@@ -346,16 +350,54 @@ def test_ministral3_biencoder_processor_saves_as_stock_pixtral_without_remote_co
     assert training_reload.tokenizer.backend_tokenizer.normalizer.normalize_str(marked_source) == source_with_zwnj
 
 
-def test_ministral3_biencoder_processor_rejects_unsupported_chat_template(monkeypatch):
+def test_ministral3_biencoder_processor_chat_template_matches_training_helpers(monkeypatch):
     monkeypatch.setattr(Mistral3BiEncoderProcessor, "check_argument_for_proper_class", lambda *args, **kwargs: None)
+    processor = Mistral3BiEncoderProcessor(
+        image_processor=FakePixtralImageProcessor(),
+        tokenizer=FakePixtralTokenizer(),
+        patch_size=4,
+        q_max_length=64,
+        p_max_length=64,
+        padding=False,
+        chat_template='{{ bos_token }}[INST]{{ messages[0]["content"] }}[/INST]',
+    )
+    image = Image.new("RGB", (4, 4), (255, 0, 0))
 
-    with pytest.raises(ValueError, match="chat template.+user text.+supported"):
-        Mistral3BiEncoderProcessor(
-            image_processor=PixtralImageProcessor(size={"longest_edge": 56}),
-            tokenizer=FakePixtralTokenizer(),
-            patch_size=14,
-            chat_template='{{ messages[0]["content"] }}',
-        )
+    query_rendered = processor.apply_chat_template(
+        [
+            {"role": "system", "content": "query:"},
+            {"role": "user", "content": "literal [IMG]"},
+        ],
+        tokenize=False,
+    )
+    document_rendered = processor.apply_chat_template(
+        [
+            {"role": "system", "content": [{"type": "text", "text": "passage:"}]},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "literal [IMG_END]"},
+                    {"type": "image"},
+                ],
+            },
+        ],
+        tokenize=False,
+    )
+
+    assert query_rendered == "query: literal [\u200cIMG]"
+    assert document_rendered == "passage: [IMG] literal [\u200cIMG_END]"
+    assert "[INST]" not in query_rendered + document_rendered
+
+    query_inference = processor(text=[query_rendered], padding=False, return_tensors="pt")
+    document_inference = processor(images=[image], text=[document_rendered], padding=False, return_tensors="pt")
+    query_training = processor.process_queries(["literal [IMG]"], padding=False)
+    document_training = processor.process_documents(
+        {"images": [image], "texts": ["literal [IMG_END]"]},
+        padding=False,
+    )
+
+    torch.testing.assert_close(query_inference["input_ids"], query_training["input_ids"])
+    torch.testing.assert_close(document_inference["input_ids"], document_training["input_ids"])
 
 
 def test_ministral3_biencoder_processor_structured_image_ids_match_flat_reference(pixtral_processor):
@@ -412,7 +454,7 @@ def test_ministral3_biencoder_processor_matches_real_checkpoint_pixtral_ids(tmp_
     torch.testing.assert_close(actual["attention_mask"], expected["attention_mask"])
 
     literal = processor.process_documents(
-        {"images": [image], "texts": ["literal [IMG] [IMG_END]"]},
+        {"images": [image], "texts": ["literal [IMG] [IMG_END] می‌روم"]},
         padding=False,
     )
     literal_ids = literal["input_ids"][0].tolist()
@@ -423,13 +465,14 @@ def test_ministral3_biencoder_processor_matches_real_checkpoint_pixtral_ids(tmp_
     reloaded = AutoProcessor.from_pretrained(tmp_path, trust_remote_code=False)
     rendered = reloaded.apply_chat_template(
         [
+            {"role": "system", "content": "passage:"},
             {
                 "role": "user",
                 "content": [
                     {"type": "image"},
                     {"type": "text", "text": "literal [IMG] [IMG_END] می‌روم"},
                 ],
-            }
+            },
         ],
         tokenize=False,
         add_generation_prompt=False,
@@ -448,6 +491,7 @@ def test_ministral3_biencoder_processor_matches_real_checkpoint_pixtral_ids(tmp_
     assert type(reloaded.tokenizer) is TokenizersBackend
     assert inference_ids.count(reloaded.image_token_id) == 4
     assert inference_ids.count(reloaded.image_end_token_id) == 1
+    torch.testing.assert_close(inference["input_ids"], literal["input_ids"])
     assert not (tmp_path / "processor.py").exists()
 
 

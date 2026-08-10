@@ -31,41 +31,76 @@ from transformers.tokenization_utils_tokenizers import TokenizersBackend
 _CONTROL_TOKEN_ESCAPE = "\u200c"
 _CONTROL_TOKEN_ESCAPE_POLICY = "mistral_retrieval_zwnj_prefix_v1"
 _CONTROL_TOKEN_PREFIXES = ("[", "<")
-_CHAT_TEMPLATE_TEXT_EXPRESSIONS = ("content", "block['text']")
-_CHAT_TEMPLATE_OWNERSHIP_FILTER = "".join(
-    f" | replace('{prefix}', '{prefix}{_CONTROL_TOKEN_ESCAPE}')" for prefix in _CONTROL_TOKEN_PREFIXES
-)
+
+_MISTRAL_RETRIEVAL_CHAT_TEMPLATE = """
+{# nemo-mistral-retrieval-v1
+   Derived from the Mistral Ministral-3 instruct chat template render_content
+   macro and its image-before-text canonicalization. Retrieval adaptation:
+   system content is the retrieval prefix; generation wrappers and BOS/EOS are
+   deliberately omitted so message inference matches training token for token.
+#}
+{%- macro mark_user_text(text) -%}
+{{- text | replace("[", "[\u200c") | replace("<", "<\u200c") -}}
+{%- endmacro -%}
+{%- macro render_text_content(content, context_name) -%}
+{%- if content is string -%}
+    {{- mark_user_text(content) -}}
+{%- elif content is sequence -%}
+    {%- set ns = namespace(has_output=false) -%}
+    {%- for block in content -%}
+        {%- if block["type"] == "text" -%}
+            {%- if ns.has_output %}{{ "\\n\\n" }}{% endif -%}
+            {{- mark_user_text(block["text"]) -}}
+            {%- set ns.has_output = true -%}
+        {%- else -%}
+            {{- raise_exception(context_name + " may contain only text blocks") -}}
+        {%- endif -%}
+    {%- endfor -%}
+{%- else -%}
+    {{- raise_exception(context_name + " must be a string or a list of text blocks") -}}
+{%- endif -%}
+{%- endmacro -%}
+{%- macro render_user_content(content) -%}
+{%- if content is string -%}
+    {{- mark_user_text(content) -}}
+{%- elif content is sequence -%}
+    {%- set ns = namespace(has_output=false) -%}
+    {%- for block in content -%}
+        {%- if block["type"] in ["image", "image_url"] -%}
+            {%- if ns.has_output %}{{ " " }}{% endif -%}
+            {{- "[IMG]" -}}
+            {%- set ns.has_output = true -%}
+        {%- endif -%}
+    {%- endfor -%}
+    {%- for block in content -%}
+        {%- if block["type"] == "text" -%}
+            {%- if ns.has_output %}{{ " " }}{% endif -%}
+            {{- mark_user_text(block["text"]) -}}
+            {%- set ns.has_output = true -%}
+        {%- elif block["type"] not in ["image", "image_url"] -%}
+            {{- raise_exception("User content supports only text and image blocks") -}}
+        {%- endif -%}
+    {%- endfor -%}
+{%- else -%}
+    {{- raise_exception("User content must be a string or a list of text and image blocks") -}}
+{%- endif -%}
+{%- endmacro -%}
+{%- if messages | length == 1 and messages[0]["role"] == "user" -%}
+    {{- render_user_content(messages[0]["content"]) -}}
+{%- elif messages | length == 2
+    and messages[0]["role"] == "system"
+    and messages[1]["role"] == "user" -%}
+    {{- render_text_content(messages[0]["content"], "System content") -}}
+    {{- " " -}}
+    {{- render_user_content(messages[1]["content"]) -}}
+{%- else -%}
+    {{- raise_exception("Retrieval inputs require one user message with an optional leading system prefix") -}}
+{%- endif -%}
+""".strip()
 
 
-def _make_ownership_aware_chat_template(
-    chat_template: str | dict[str, str] | None,
-) -> str | dict[str, str] | None:
-    """Return a chat template that marks externally supplied text."""
-    if isinstance(chat_template, dict):
-        return {name: _make_ownership_aware_chat_template(template) for name, template in chat_template.items()}
-    if not chat_template or _CHAT_TEMPLATE_OWNERSHIP_FILTER in chat_template:
-        return chat_template
-
-    adapted_template = chat_template
-    for expression in _CHAT_TEMPLATE_TEXT_EXPRESSIONS:
-        source = "{{- " + expression + " -}}"
-        replacement = "{{- " + expression + _CHAT_TEMPLATE_OWNERSHIP_FILTER + " -}}"
-        adapted_template = adapted_template.replace(source, replacement)
-
-    if adapted_template == chat_template:
-        raise ValueError(
-            "The chat template cannot protect user text because it does not contain a supported Mistral "
-            "text-rendering expression. Use a template that renders content or block['text'] with "
-            "whitespace-control delimiters, or omit the chat template when stock chat inference is not required."
-        )
-    return adapted_template
-
-
-def _apply_mistral_retrieval_ownership_policy(
-    tokenizer: TokenizersBackend,
-    chat_template: str | dict[str, str] | None,
-) -> str | dict[str, str] | None:
-    """Configure persistent tokenizer and template ownership behavior."""
+def _apply_mistral_retrieval_ownership_policy(tokenizer: TokenizersBackend) -> str:
+    """Configure persistent tokenizer and retrieval-template ownership behavior."""
     tokenizer.split_special_tokens = False
     tokenizer.init_kwargs["split_special_tokens"] = False
     if tokenizer.init_kwargs.get("nemo_control_token_escape_policy") != _CONTROL_TOKEN_ESCAPE_POLICY:
@@ -77,7 +112,7 @@ def _apply_mistral_retrieval_ownership_policy(
             ownership_normalizers.append(existing_normalizer)
         tokenizer.backend_tokenizer.normalizer = Sequence(ownership_normalizers)
         tokenizer.init_kwargs["nemo_control_token_escape_policy"] = _CONTROL_TOKEN_ESCAPE_POLICY
-    return _make_ownership_aware_chat_template(chat_template)
+    return _MISTRAL_RETRIEVAL_CHAT_TEMPLATE
 
 
 def load_image(image: Any) -> Image.Image:
@@ -202,10 +237,7 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
             image_end_token=image_end_token,
             **kwargs,
         )
-        self.chat_template = _apply_mistral_retrieval_ownership_policy(
-            self.tokenizer,
-            self.chat_template,
-        )
+        self.chat_template = _apply_mistral_retrieval_ownership_policy(self.tokenizer)
         self.q_max_length = q_max_length if q_max_length is not None else q_max_len
         self.p_max_length = p_max_length if p_max_length is not None else p_max_len
         self.pad_to_multiple_of = pad_to_multiple_of
