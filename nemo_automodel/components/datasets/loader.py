@@ -98,11 +98,11 @@ class AllRanksDatasetConfig(Protocol):
 class BatchSamplerConfig(Protocol):
     """Typed construction contract for a dataset-specific batch sampler."""
 
-    def build(self, *, dataset: object, dataset_len: int, rank: int, world_size: int) -> Sampler[list[int]]:
+    def build(self, *, dataset: Sized, rank: int, world_size: int) -> Sampler[list[int]]:
         """Build a per-rank batch sampler for a materialized dataset.
 
-        ``dataset`` is passed alongside its length because a length-aware sampler (see
-        ``DynamicTokenBatchSampler``) has to read the samples themselves to size its batches.
+        Implementations receive the dataset itself, not just its length: a sampler may
+        inspect the samples, for example to size batches by token count.
         """
 
 
@@ -568,6 +568,18 @@ class ParallelAwareDataloader(StatefulDataLoader):
         self.dp_rank = dp_rank
         self.dp_world_size = dp_world_size
 
+    def set_epoch(self, epoch: int) -> None:
+        """Forward the epoch to whichever sampler this loader was built with.
+
+        ``DataLoader`` replaces ``.sampler`` with an unused default when a
+        ``batch_sampler`` is supplied, so a caller reaching for ``.sampler`` alone would
+        silently stop reshuffling. This loader knows which one it chose.
+        """
+        for sampler in (self.batch_sampler, self.sampler):
+            if hasattr(sampler, "set_epoch"):
+                sampler.set_epoch(epoch)
+                return
+
 
 @dataclass
 class DataloaderConfig:
@@ -700,9 +712,7 @@ class DataloaderConfig:
                 raise TypeError(
                     f"{type(self.batch_sampler_config).__name__} requires a sized dataset, got {type(dataset).__name__}"
                 )
-            batch_sampler = self.batch_sampler_config.build(
-                dataset=dataset, dataset_len=len(dataset), rank=dp_rank, world_size=dp_world_size
-            )
+            batch_sampler = self.batch_sampler_config.build(dataset=dataset, rank=dp_rank, world_size=dp_world_size)
 
         return ParallelAwareDataloader(
             dataset,

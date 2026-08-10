@@ -111,12 +111,10 @@ class DynamicTokenBatchSampler(Sampler[list[int]]):
         max_tokens_per_batch: Padded-token ceiling for one batch.
         max_batch_size: Optional cap on the sample count of a single batch.
         sort_window: Number of shuffled samples sorted together before batching.
-            ``0`` disables sorting and batches in shuffled order.
+            ``1`` leaves the shuffled order untouched.
         seed: Base seed; must match across ranks.
         num_replicas: Data-parallel world size.
         rank: This rank's data-parallel index.
-        lengths: Precomputed per-sample token counts. Computed from ``dataset`` when
-            omitted.
     """
 
     def __init__(
@@ -129,14 +127,13 @@ class DynamicTokenBatchSampler(Sampler[list[int]]):
         seed: int = 42,
         num_replicas: int = 1,
         rank: int = 0,
-        lengths: Sequence[int] | None = None,
     ) -> None:
         if max_tokens_per_batch <= 0:
             raise ValueError(f"max_tokens_per_batch must be positive, got {max_tokens_per_batch}")
         if max_batch_size is not None and max_batch_size <= 0:
             raise ValueError(f"max_batch_size must be positive when set, got {max_batch_size}")
-        if sort_window < 0:
-            raise ValueError(f"sort_window must be non-negative, got {sort_window}")
+        if sort_window < 1:
+            raise ValueError(f"sort_window must be >= 1, got {sort_window}")
         if num_replicas <= 0:
             raise ValueError(f"num_replicas must be positive, got {num_replicas}")
         if not 0 <= rank < num_replicas:
@@ -152,7 +149,7 @@ class DynamicTokenBatchSampler(Sampler[list[int]]):
         self.batches_yielded = 0
         self._next_batches_yielded: int | None = None
 
-        self.lengths = list(lengths) if lengths is not None else compute_sample_lengths(dataset)
+        self.lengths = compute_sample_lengths(dataset)
         oversized = sum(1 for length in self.lengths if length > self.max_tokens_per_batch)
         if oversized:
             logger.warning(
@@ -166,7 +163,6 @@ class DynamicTokenBatchSampler(Sampler[list[int]]):
 
         self._planned_epoch: int | None = None
         self._local_batches: list[list[int]] = []
-        self._plan(self.epoch)
 
     def _plan(self, epoch: int) -> None:
         """Compute this rank's batch list for ``epoch`` (identical inputs on every rank)."""
@@ -178,10 +174,11 @@ class DynamicTokenBatchSampler(Sampler[list[int]]):
         order = torch.randperm(len(self.lengths), generator=generator).tolist()
 
         if self.sort_window > 1:
+            length_of = self.lengths.__getitem__
             ordered: list[int] = []
             for start in range(0, len(order), self.sort_window):
                 window = order[start : start + self.sort_window]
-                window.sort(key=lambda index: self.lengths[index], reverse=True)
+                window.sort(key=length_of, reverse=True)
                 ordered.extend(window)
             order = ordered
 
@@ -204,12 +201,12 @@ class DynamicTokenBatchSampler(Sampler[list[int]]):
                 self.num_replicas,
             )
         logger.info(
-            "DynamicTokenBatchSampler: epoch=%d rank=%d %d batches (%d global, %d samples dropped at the tail)",
+            "DynamicTokenBatchSampler: epoch=%d rank=%d %d batches (%d global, %d dropped to align ranks)",
             epoch,
             self.rank,
             len(self._local_batches),
             len(global_batches),
-            sum(len(batch) for batch in global_batches[per_rank * self.num_replicas :]),
+            len(global_batches) - per_rank * self.num_replicas,
         )
 
     def set_epoch(self, epoch: int) -> None:
@@ -257,26 +254,17 @@ class DynamicTokenBatchSamplerConfig:
     sort_window: int = 2048
     seed: int = 42
 
-    def build(
-        self,
-        *,
-        dataset: Dataset,
-        dataset_len: int,
-        rank: int,
-        world_size: int,
-    ) -> DynamicTokenBatchSampler:
+    def build(self, *, dataset: Dataset, rank: int, world_size: int) -> DynamicTokenBatchSampler:
         """Build the sampler for one data-parallel rank.
 
         Args:
             dataset: The materialized dataset, read for per-sample token counts.
-            dataset_len: Number of samples; unused, the lengths come from ``dataset``.
             rank: Rank within the data-parallel group.
             world_size: Size of the data-parallel group.
 
         Returns:
             A sampler yielding one local batch of dataset indices at a time.
         """
-        del dataset_len
         return DynamicTokenBatchSampler(
             dataset,
             max_tokens_per_batch=self.max_tokens_per_batch,

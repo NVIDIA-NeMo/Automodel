@@ -309,7 +309,7 @@ def test_megatron_loader_preserves_schedule_and_sampler_config():
     assert config.dataset_build_schedule.max_steps == 50
     assert config.dataset_build_schedule.val_check_interval == 5
     assert isinstance(config.batch_sampler_config, MegatronSamplerConfig)
-    megatron_sampler = config.batch_sampler_config.build(dataset=None, dataset_len=32, rank=1, world_size=2)
+    megatron_sampler = config.batch_sampler_config.build(dataset=range(32), rank=1, world_size=2)
     assert next(iter(megatron_sampler)) == [2, 3]
 
 

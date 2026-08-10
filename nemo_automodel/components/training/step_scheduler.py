@@ -215,15 +215,16 @@ class StepScheduler(Stateful):
         """
         Set the epoch for the sampler.
 
-        A dataloader built with a ``batch_sampler`` keeps its per-epoch state there:
-        ``DataLoader`` replaces ``.sampler`` with an unused default in that case, so
-        forwarding only to ``.sampler`` would silently stop reshuffling.
+        Delegates to the dataloader when it owns the choice of sampler, which is what
+        keeps a ``batch_sampler``-based loader reshuffling per epoch.
         """
         self.epoch = epoch
-        for attribute in ("sampler", "batch_sampler"):
-            sampler = getattr(self.dataloader, attribute, None)
-            if hasattr(sampler, "set_epoch"):
-                sampler.set_epoch(epoch)
+        # ParallelAwareDataloader knows which sampler it built; fall back to .sampler for
+        # a plain DataLoader that does not expose set_epoch itself.
+        if hasattr(self.dataloader, "set_epoch"):
+            self.dataloader.set_epoch(epoch)
+        elif hasattr(getattr(self.dataloader, "sampler", None), "set_epoch"):
+            self.dataloader.sampler.set_epoch(epoch)
 
     @property
     def is_remote_logging_step(self):

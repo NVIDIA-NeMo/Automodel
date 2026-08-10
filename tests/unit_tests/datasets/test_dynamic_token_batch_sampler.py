@@ -95,11 +95,7 @@ def test_every_rank_yields_the_same_number_of_batches():
     for world_size in (1, 2, 3, 8):
         counts = {
             rank: len(
-                list(
-                    DynamicTokenBatchSampler(
-                        dataset, max_tokens_per_batch=1024, num_replicas=world_size, rank=rank
-                    )
-                )
+                list(DynamicTokenBatchSampler(dataset, max_tokens_per_batch=1024, num_replicas=world_size, rank=rank))
             )
             for rank in range(world_size)
         }
@@ -111,7 +107,10 @@ def test_ranks_partition_the_batches_without_overlap():
     world_size = 4
 
     per_rank = [
-        [tuple(batch) for batch in DynamicTokenBatchSampler(dataset, max_tokens_per_batch=512, num_replicas=world_size, rank=rank)]
+        [
+            tuple(batch)
+            for batch in DynamicTokenBatchSampler(dataset, max_tokens_per_batch=512, num_replicas=world_size, rank=rank)
+        ]
         for rank in range(world_size)
     ]
 
@@ -188,24 +187,14 @@ def test_state_dict_carries_the_epoch():
     assert restored.epoch == 4
 
 
-def test_precomputed_lengths_skip_the_dataset_scan():
-    class _Exploding(_ListDataset):
-        def __getitem__(self, index):
-            raise AssertionError("the dataset must not be read when lengths are supplied")
-
-    sampler = DynamicTokenBatchSampler(
-        _Exploding([0] * 32), max_tokens_per_batch=256, lengths=[64] * 32
-    )
-
-    assert len(list(sampler)) > 0
-
-
-def test_sort_window_zero_batches_in_shuffled_order():
+def test_sort_window_one_batches_in_shuffled_order():
     dataset = _ListDataset([(i % 5) * 64 + 64 for i in range(100)])
 
-    sampler = DynamicTokenBatchSampler(dataset, max_tokens_per_batch=1024, sort_window=0)
+    windowed = [tuple(b) for b in DynamicTokenBatchSampler(dataset, max_tokens_per_batch=1024, sort_window=32)]
+    unsorted = [tuple(b) for b in DynamicTokenBatchSampler(dataset, max_tokens_per_batch=1024, sort_window=1)]
 
-    assert sorted(i for batch in sampler for i in batch) != []
+    assert windowed != unsorted
+    assert sorted(i for batch in unsorted for i in batch) == sorted(i for batch in windowed for i in batch)
 
 
 def test_oversized_samples_warn_once(caplog):
@@ -230,7 +219,7 @@ def test_a_dataset_smaller_than_the_world_warns_and_yields_nothing():
     [
         ({"max_tokens_per_batch": 0}, "max_tokens_per_batch must be positive"),
         ({"max_tokens_per_batch": 128, "max_batch_size": 0}, "max_batch_size must be positive"),
-        ({"max_tokens_per_batch": 128, "sort_window": -1}, "sort_window must be non-negative"),
+        ({"max_tokens_per_batch": 128, "sort_window": 0}, "sort_window must be >= 1"),
         ({"max_tokens_per_batch": 128, "num_replicas": 0}, "num_replicas must be positive"),
         ({"max_tokens_per_batch": 128, "num_replicas": 2, "rank": 2}, "is out of range"),
     ],
@@ -249,7 +238,7 @@ def test_config_builds_a_sampler_for_its_rank():
     dataset = _ListDataset([(i % 7) * 32 + 32 for i in range(120)])
     config = DynamicTokenBatchSamplerConfig(max_tokens_per_batch=1024, max_batch_size=8, sort_window=64, seed=3)
 
-    sampler = config.build(dataset=dataset, dataset_len=len(dataset), rank=1, world_size=2)
+    sampler = config.build(dataset=dataset, rank=1, world_size=2)
 
     assert isinstance(sampler, DynamicTokenBatchSampler)
     assert (sampler.rank, sampler.num_replicas, sampler.seed) == (1, 2, 3)
