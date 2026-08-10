@@ -119,8 +119,8 @@ lr_scheduler:
 
 wandb:
   enable: false
-  project: huiyingl_workspace
-  entity: Nemo-automodel
+  project: automodel-muse-glimmer
+  entity: <your_wandb_entity>
   name: muse_glimmer_30b_medpix_packed4k_te_tp2_cp8_100step_parity
   group: muse_glimmer_30b_medpix_packed4k_te_tp2_cp1_cp8_100step_parity
   tags: [muse_glimmer, 30b, dense, vlm, medpix, packed4k, thd, te, tp2, cp8, parity]

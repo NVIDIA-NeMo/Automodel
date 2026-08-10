@@ -136,10 +136,10 @@ lr_scheduler:
   lr_decay_style: constant
 
 wandb:
-  enable: true
-  project: huiyingl_workspace
-  entity: Nemo-automodel
-  name: muse_glimmer_30b_tulu3_te_tp2_cp4_packed_16k_100step_20260809
+  enable: false
+  project: automodel-muse-glimmer
+  entity: <your_wandb_entity>
+  name: muse_glimmer_30b_tulu3_te_tp2_cp4_packed_16k
   group: muse_glimmer_30b_tulu3_te_packed_16k
   tags: [muse_glimmer, 30b, dense, text, tulu3, packed, thd, 16k, te, tp2, cp4, single-node]
   dir: logs/muse_glimmer_30b_tulu3_te_tp2_cp4_packed_16k/wandb

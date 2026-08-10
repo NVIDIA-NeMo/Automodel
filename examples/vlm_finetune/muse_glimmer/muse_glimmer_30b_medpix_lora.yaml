@@ -131,8 +131,8 @@ lr_scheduler:
 
 wandb:
   enable: false
-  project: huiyingl_workspace
-  entity: Nemo-automodel
+  project: automodel-muse-glimmer
+  entity: <your_wandb_entity>
   name: muse_glimmer_30b_medpix_lora_100steps
   group: muse_glimmer_30b_medpix_lora
   tags: [muse_glimmer, 30b, dense, vlm, medpix, lora, fsdp2, single-node]
