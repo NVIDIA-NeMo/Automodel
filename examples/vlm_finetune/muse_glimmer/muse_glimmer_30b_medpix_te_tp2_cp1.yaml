@@ -12,21 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Convert the native MuseGlimmer checkpoint with the bundled hf/convert_muse_glimmer_to_hf.py,
-# including --encoder_checkpoint_dir, before running this recipe.
+# One-node reference for the packed MuseGlimmer TP2 + TE CP8 parity recipe. TP2 shards
+# all language attention projections because MuseGlimmer has exactly two KV heads.
 #
 # Run on one 8-GPU node:
-#   automodel examples/vlm_finetune/muse_glimmer/muse_glimmer_29b_medpix.yaml --nproc-per-node 8
+#   automodel examples/vlm_finetune/muse_glimmer/muse_glimmer_30b_medpix_te_tp2_cp1.yaml --nproc-per-node 8
 
 recipe: FinetuneRecipeForVLM
-
 seed: 1234
 
 step_scheduler:
   global_batch_size: 8
   local_batch_size: 1
   ckpt_every_steps: 1000
-  val_every_steps: 20
+  val_every_steps: 1000
   log_remote_every_steps: 1
   gc_every_steps: 5
   num_epochs: 1
@@ -43,33 +42,35 @@ rng:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: ../muse-glimmer-final-hf
+  pretrained_model_name_or_path: meta-models/Muse-Glimmer-30B
   torch_dtype: bfloat16
+  # HF config validation remains on SDPA; native language attention is selected below.
   attn_implementation: sdpa
   backend:
-    attn: sdpa
+    attn: te
   use_liger_kernel: false
 
 processor:
   _target_: transformers.AutoProcessor.from_pretrained
-  pretrained_model_name_or_path: ../muse-glimmer-final-hf
+  pretrained_model_name_or_path: meta-models/Muse-Glimmer-30B
   trust_remote_code: true
 
 checkpoint:
   enabled: false
-  checkpoint_dir: checkpoints/muse_glimmer_29b_medpix/
+  checkpoint_dir: checkpoints/muse_glimmer_30b_medpix_te_tp2_cp1/
   model_save_format: safetensors
   save_consolidated: false
 
 distributed:
   strategy: fsdp2
   dp_size: none
-  tp_size: 1
+  tp_size: 2
   cp_size: 1
   pp_size: 1
   ep_size: 1
   sequence_parallel: false
   activation_checkpointing: true
+  defer_fsdp_grad_sync: false
 
 freeze_config:
   freeze_vision_tower: true
@@ -84,28 +85,27 @@ dataset:
   path_or_dataset: mmoukouba/MedPix-VQA
   split: train
 
+packed_sequence:
+  pretokenize: true
+  # Individual documents stay within MuseGlimmer's native sliding window. Multiple
+  # real MedPix documents are packed together into each 4096-token THD stream.
+  max_length: 2048
+  pack_size: 4096
+  collate_max_length: 4096
+  packing_ratio: 0.9
+  drop_long_samples: true
+  balance_media_tokens: true
+  packing_format: thd
+
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  # MuseGlimmer performs CUDA vision work in the model process. Forked dataloader
-  # workers would inherit initialized CUDA/NCCL state and can hang at shutdown.
   num_workers: 0
   drop_last: true
-  collate_fn:
-    _target_: nemo_automodel.components.datasets.vlm.collate_fns.default_collate_fn
-    max_length: 1024
 
-validation_dataset:
-  _target_: nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset
-  path_or_dataset: mmoukouba/MedPix-VQA
-  split: validation
-
-validation_dataloader:
-  _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  num_workers: 0
-  drop_last: true
-  collate_fn:
-    _target_: nemo_automodel.components.datasets.vlm.collate_fns.default_collate_fn
-    max_length: 1024
+# Parity measures exactly 100 optimizer steps without a trailing validation
+# epoch changing the run lifetime or W&B finalization point.
+validation_dataset: none
+validation_dataloader: none
 
 optimizer:
   _target_: torch.optim.AdamW
@@ -121,10 +121,10 @@ wandb:
   enable: false
   project: huiyingl_workspace
   entity: Nemo-automodel
-  name: muse_glimmer_29b_medpix_100steps
-  group: muse_glimmer_29b_loss_curves
-  tags: [muse_glimmer, 29b, dense, vlm, medpix, fsdp2]
-  dir: logs/muse_glimmer_29b_medpix/wandb
+  name: muse_glimmer_30b_medpix_packed4k_te_tp2_cp1_100step_parity
+  group: muse_glimmer_30b_medpix_packed4k_te_tp2_cp1_cp8_100step_parity
+  tags: [muse_glimmer, 30b, dense, vlm, medpix, packed4k, thd, te, tp2, cp1, parity]
+  dir: logs/muse_glimmer_30b_medpix_te_tp2_cp1/wandb
 
 ci:
   recipe_owner: HuiyingLi

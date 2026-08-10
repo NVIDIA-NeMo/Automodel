@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# MuseGlimmer 29B dense text-only SFT with a real 16-Ki-token THD pack.
+# MuseGlimmer 30B dense text-only SFT with a real 16-Ki-token THD pack.
 #
 # Each dataloader row contains 16384 tokens assembled from Tulu-3 documents.
 # cu_seqlens preserves document boundaries, so TE runs block-diagonal causal
@@ -22,7 +22,7 @@
 # is one 8-GPU node:
 #
 #   automodel \
-#     examples/llm_finetune/muse_glimmer/muse_glimmer_29b_tulu3_te_tp2_cp4_packed_16k.yaml \
+#     examples/llm_finetune/muse_glimmer/muse_glimmer_30b_tulu3_te_tp2_cp4_packed_16k.yaml \
 #     --nproc-per-node 8
 
 recipe: TrainFinetuneRecipeForNextTokenPrediction
@@ -49,7 +49,7 @@ rng:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: ../muse-glimmer-final-hf
+  pretrained_model_name_or_path: meta-models/Muse-Glimmer-30B
   torch_dtype: bfloat16
   # HF config validation remains on SDPA; native language attention is selected below.
   attn_implementation: sdpa
@@ -59,7 +59,7 @@ model:
 
 checkpoint:
   enabled: false
-  checkpoint_dir: checkpoints/muse_glimmer_29b_tulu3_te_tp2_cp4_packed_16k/
+  checkpoint_dir: checkpoints/muse_glimmer_30b_tulu3_te_tp2_cp4_packed_16k/
   model_save_format: safetensors
   save_consolidated: false
 
@@ -101,7 +101,7 @@ dataset:
   padding: false
   tokenizer:
     _target_: transformers.AutoTokenizer.from_pretrained
-    pretrained_model_name_or_path: ../muse-glimmer-final-hf
+    pretrained_model_name_or_path: meta-models/Muse-Glimmer-30B
     trust_remote_code: false
 
 packed_sequence:
@@ -139,10 +139,10 @@ wandb:
   enable: true
   project: huiyingl_workspace
   entity: Nemo-automodel
-  name: muse_glimmer_29b_tulu3_te_tp2_cp4_packed_16k_100step_20260809
-  group: muse_glimmer_29b_tulu3_te_packed_16k
-  tags: [muse_glimmer, 29b, dense, text, tulu3, packed, thd, 16k, te, tp2, cp4, single-node]
-  dir: logs/muse_glimmer_29b_tulu3_te_tp2_cp4_packed_16k/wandb
+  name: muse_glimmer_30b_tulu3_te_tp2_cp4_packed_16k_100step_20260809
+  group: muse_glimmer_30b_tulu3_te_packed_16k
+  tags: [muse_glimmer, 30b, dense, text, tulu3, packed, thd, 16k, te, tp2, cp4, single-node]
+  dir: logs/muse_glimmer_30b_tulu3_te_tp2_cp4_packed_16k/wandb
 
 ci:
   recipe_owner: HuiyingLi

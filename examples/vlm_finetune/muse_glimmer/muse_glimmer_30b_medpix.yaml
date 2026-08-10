@@ -12,12 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# MuseGlimmer is a dense VLM. Its native Transformer Engine attention uses
-# load-balanced context parallelism. The replicated vision tower runs before
-# the spliced text hidden states are sharded.
+# Convert the native MuseGlimmer checkpoint with the bundled hf/convert_muse_glimmer_to_hf.py,
+# including --encoder_checkpoint_dir, before running this recipe.
 #
 # Run on one 8-GPU node:
-#   automodel examples/vlm_finetune/muse_glimmer/muse_glimmer_29b_medpix_cp8.yaml --nproc-per-node 8
+#   automodel examples/vlm_finetune/muse_glimmer/muse_glimmer_30b_medpix.yaml --nproc-per-node 8
 
 recipe: FinetuneRecipeForVLM
 
@@ -44,22 +43,21 @@ rng:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: ../muse-glimmer-final-hf
+  pretrained_model_name_or_path: meta-models/Muse-Glimmer-30B
   torch_dtype: bfloat16
-  # HF config validation remains on SDPA; native language attention is selected below.
   attn_implementation: sdpa
   backend:
-    attn: te
+    attn: sdpa
   use_liger_kernel: false
 
 processor:
   _target_: transformers.AutoProcessor.from_pretrained
-  pretrained_model_name_or_path: ../muse-glimmer-final-hf
+  pretrained_model_name_or_path: meta-models/Muse-Glimmer-30B
   trust_remote_code: true
 
 checkpoint:
   enabled: false
-  checkpoint_dir: checkpoints/muse_glimmer_29b_medpix_cp8/
+  checkpoint_dir: checkpoints/muse_glimmer_30b_medpix/
   model_save_format: safetensors
   save_consolidated: false
 
@@ -67,14 +65,11 @@ distributed:
   strategy: fsdp2
   dp_size: none
   tp_size: 1
-  cp_size: 8
+  cp_size: 1
   pp_size: 1
   ep_size: 1
   sequence_parallel: false
   activation_checkpointing: true
-  # CP8 uses eight microbatches per optimizer step. Reduce-scatter gradients
-  # after every microbatch to avoid retaining full gradients across accumulation.
-  defer_fsdp_grad_sync: false
 
 freeze_config:
   freeze_vision_tower: true
@@ -91,11 +86,13 @@ dataset:
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  # MuseGlimmer performs CUDA vision work in the model process. Forked dataloader
+  # workers would inherit initialized CUDA/NCCL state and can hang at shutdown.
   num_workers: 0
   drop_last: true
   collate_fn:
     _target_: nemo_automodel.components.datasets.vlm.collate_fns.default_collate_fn
-    max_length: 4096
+    max_length: 1024
 
 validation_dataset:
   _target_: nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset
@@ -108,7 +105,7 @@ validation_dataloader:
   drop_last: true
   collate_fn:
     _target_: nemo_automodel.components.datasets.vlm.collate_fns.default_collate_fn
-    max_length: 4096
+    max_length: 1024
 
 optimizer:
   _target_: torch.optim.AdamW
@@ -124,10 +121,10 @@ wandb:
   enable: false
   project: huiyingl_workspace
   entity: Nemo-automodel
-  name: muse_glimmer_29b_medpix_te_cp8_100steps
-  group: muse_glimmer_29b_loss_curves
-  tags: [muse_glimmer, 29b, dense, vlm, medpix, fsdp2, te, cp8]
-  dir: logs/muse_glimmer_29b_medpix_te_cp8/wandb
+  name: muse_glimmer_30b_medpix_100steps
+  group: muse_glimmer_30b_loss_curves
+  tags: [muse_glimmer, 30b, dense, vlm, medpix, fsdp2]
+  dir: logs/muse_glimmer_30b_medpix/wandb
 
 ci:
   recipe_owner: HuiyingLi

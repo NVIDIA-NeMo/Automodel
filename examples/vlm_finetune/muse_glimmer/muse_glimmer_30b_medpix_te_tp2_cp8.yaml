@@ -12,11 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# One-node reference for the packed MuseGlimmer TP2 + TE CP8 parity recipe. TP2 shards
-# all language attention projections because MuseGlimmer has exactly two KV heads.
-#
-# Run on one 8-GPU node:
-#   automodel examples/vlm_finetune/muse_glimmer/muse_glimmer_29b_medpix_te_tp2_cp1.yaml --nproc-per-node 8
+# Two-node target for packed MuseGlimmer TP2 + TE CP8 parity. The required world size
+# is TP2 * CP8 = 16 GPUs. TP2 shards every language attention projection while
+# TE p2p context parallelism distributes each 4096-token THD pack.
 
 recipe: FinetuneRecipeForVLM
 seed: 1234
@@ -42,7 +40,7 @@ rng:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: ../muse-glimmer-final-hf
+  pretrained_model_name_or_path: meta-models/Muse-Glimmer-30B
   torch_dtype: bfloat16
   # HF config validation remains on SDPA; native language attention is selected below.
   attn_implementation: sdpa
@@ -52,12 +50,12 @@ model:
 
 processor:
   _target_: transformers.AutoProcessor.from_pretrained
-  pretrained_model_name_or_path: ../muse-glimmer-final-hf
+  pretrained_model_name_or_path: meta-models/Muse-Glimmer-30B
   trust_remote_code: true
 
 checkpoint:
   enabled: false
-  checkpoint_dir: checkpoints/muse_glimmer_29b_medpix_te_tp2_cp1/
+  checkpoint_dir: checkpoints/muse_glimmer_30b_medpix_te_tp2_cp8/
   model_save_format: safetensors
   save_consolidated: false
 
@@ -65,11 +63,13 @@ distributed:
   strategy: fsdp2
   dp_size: none
   tp_size: 2
-  cp_size: 1
+  cp_size: 8
   pp_size: 1
   ep_size: 1
   sequence_parallel: false
   activation_checkpointing: true
+  # CP8 accumulates eight microbatches at global batch 8. Reduce-scatter after
+  # each microbatch to avoid holding full gradients throughout accumulation.
   defer_fsdp_grad_sync: false
 
 freeze_config:
@@ -121,13 +121,13 @@ wandb:
   enable: false
   project: huiyingl_workspace
   entity: Nemo-automodel
-  name: muse_glimmer_29b_medpix_packed4k_te_tp2_cp1_100step_parity
-  group: muse_glimmer_29b_medpix_packed4k_te_tp2_cp1_cp8_100step_parity
-  tags: [muse_glimmer, 29b, dense, vlm, medpix, packed4k, thd, te, tp2, cp1, parity]
-  dir: logs/muse_glimmer_29b_medpix_te_tp2_cp1/wandb
+  name: muse_glimmer_30b_medpix_packed4k_te_tp2_cp8_100step_parity
+  group: muse_glimmer_30b_medpix_packed4k_te_tp2_cp1_cp8_100step_parity
+  tags: [muse_glimmer, 30b, dense, vlm, medpix, packed4k, thd, te, tp2, cp8, parity]
+  dir: logs/muse_glimmer_30b_medpix_te_tp2_cp8/wandb
 
 ci:
   recipe_owner: HuiyingLi
-  nodes: 1
+  nodes: 2
   time: "02:00:00"
   max_steps: 5
