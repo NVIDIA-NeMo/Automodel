@@ -88,7 +88,11 @@ class CpVisionFrameShardingConfig:
         mesh_dims: Device-mesh dimensions across which frames are distributed. Only
             ``("cp",)`` is currently supported.
         min_tokens: Minimum number of merged visual tokens required to use the sharded
-            path. Smaller workloads stay replicated to avoid collective overhead.
+            path unless ``min_frames`` is reached. Smaller workloads stay replicated
+            to avoid collective overhead.
+        min_frames: Minimum number of independent image/frame units that can select
+            sharding even below ``min_tokens``. Long videos reduce per-frame spatial
+            resolution, so merged-token count alone underestimates their ViT work.
         cost_alpha: Non-negative linear term in the partition cost
             ``p * (p + cost_alpha)``. ``"auto"`` infers ``3 * vision_hidden_size``
             and falls back to ``0`` when the width is unavailable. ``None`` remains
@@ -98,6 +102,7 @@ class CpVisionFrameShardingConfig:
     enabled: bool = False
     mesh_dims: tuple[Literal["cp"]] = ("cp",)
     min_tokens: int = 2048
+    min_frames: int = 32
     cost_alpha: int | Literal["auto"] | None = "auto"
 
     def __post_init__(self) -> None:
@@ -111,6 +116,8 @@ class CpVisionFrameShardingConfig:
             raise ValueError(f'{config_path}.mesh_dims currently supports only ["cp"]')
         if isinstance(self.min_tokens, bool) or not isinstance(self.min_tokens, int) or self.min_tokens < 0:
             raise ValueError(f"{config_path}.min_tokens must be a non-negative integer")
+        if isinstance(self.min_frames, bool) or not isinstance(self.min_frames, int) or self.min_frames < 0:
+            raise ValueError(f"{config_path}.min_frames must be a non-negative integer")
         if self.cost_alpha not in (None, "auto") and (
             isinstance(self.cost_alpha, bool) or not isinstance(self.cost_alpha, int) or self.cost_alpha < 0
         ):
@@ -649,15 +656,19 @@ def maybe_distribute_visual(
     n_units = len(f_patches)
     n_real_tokens = sum(p // sms_sq for p in f_patches)
     min_shard_tokens = scope.config.min_tokens
-    if n_real_tokens < min_shard_tokens:
+    min_shard_frames = scope.config.min_frames
+    if n_real_tokens < min_shard_tokens and n_units < min_shard_frames:
         global _LOGGED_SMALL_FALLBACK
         if not _LOGGED_SMALL_FALLBACK:
             _LOGGED_SMALL_FALLBACK = True
             logger.info(
                 "vision tower using replicated path for small visual workload "
-                "(tokens=%d < distributed.multimodal.vision.frame_sharding.min_tokens=%d)",
+                "(tokens=%d < distributed.multimodal.vision.frame_sharding.min_tokens=%d and "
+                "frames=%d < distributed.multimodal.vision.frame_sharding.min_frames=%d)",
                 n_real_tokens,
                 min_shard_tokens,
+                n_units,
+                min_shard_frames,
             )
         return visual(
             pixel_values,

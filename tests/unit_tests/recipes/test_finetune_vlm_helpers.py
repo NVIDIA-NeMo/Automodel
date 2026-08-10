@@ -1462,12 +1462,13 @@ class TestCalculateLoss:
         hidden_states = torch.randn(2, 5, 32, device="cuda")
         labels = torch.randint(0, 50, (2, 5), device="cuda")
 
-        # Use a plain object that has lm_head but no get_output_embeddings
+        # Use a module that has lm_head parameters but no get_output_embeddings
         # This tests the fallback path in calculate_loss
-        class ModelWithLmHeadOnly:
-            """Non-nn.Module model without get_output_embeddings."""
+        class ModelWithLmHeadOnly(torch.nn.Module):
+            """nn.Module model without get_output_embeddings."""
 
             def __init__(self):
+                super().__init__()
                 self._lm_head = torch.nn.Linear(32, 50).cuda()
 
             def named_parameters(self, remove_duplicate=False):
