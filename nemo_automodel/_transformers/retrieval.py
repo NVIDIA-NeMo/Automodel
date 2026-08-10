@@ -15,7 +15,6 @@
 """Encoder models for bi-encoder and cross-encoder tasks."""
 
 import inspect
-import os
 from collections.abc import Iterable, Sequence
 from typing import Optional
 
@@ -453,6 +452,10 @@ def build_encoder_backbone(
             hf_kwargs["num_labels"] = num_labels
         if temperature is not None:
             hf_kwargs["temperature"] = temperature
+        # HF Mistral3 checkpoints nest the text tower under ``language_model.model``;
+        # the retrieval VLM owns that tower directly as ``language_model``.
+        if model_type == "mistral3" and BidirectionalModelClass.__name__ == "Mistral3BidirectionalModel":
+            hf_kwargs.setdefault("key_mapping", {r"^language_model\.model\.": "language_model."})
         return BidirectionalModelClass.from_pretrained(
             model_name_or_path, trust_remote_code=trust_remote_code, **hf_kwargs
         )
@@ -575,7 +578,7 @@ def _init_encoder_common(encoder: nn.Module, model: PreTrainedModel) -> None:
     encoder.model = model
     encoder.config = model.config
     if ModelRegistry.has_retrieval_model(model.__class__.__name__):
-        encoder.name_or_path = os.path.dirname(inspect.getfile(type(model)))
+        encoder.name_or_path = inspect.getfile(type(model))
     else:
         encoder.name_or_path = getattr(model.config, "name_or_path", "")
     encoder.state_dict_adapter = EncoderStateDictAdapter()

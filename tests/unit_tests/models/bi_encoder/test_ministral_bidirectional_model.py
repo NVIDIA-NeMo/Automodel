@@ -36,6 +36,7 @@ pytest.importorskip("transformers.models.ministral3", reason="Ministral3 not ava
 
 from nemo_automodel._transformers.registry import ModelRegistry
 from nemo_automodel._transformers.retrieval import BiEncoderModel, _init_encoder_common, configure_encoder_metadata
+from nemo_automodel.components.checkpoint.addons import _maybe_save_custom_model_code
 from nemo_automodel.components.models.ministral_bidirectional.model import (
     Ministral3BidirectionalConfig,
     Ministral3BidirectionalModel,
@@ -784,11 +785,11 @@ def test_configure_encoder_metadata_sets_auto_map_for_ministral_retrieval():
     assert "AutoModel" in fake.config.auto_map
 
 
-def test_init_encoder_common_name_or_path_ministral_retrieval():
-    """Retrieval architectures set name_or_path from dirname(inspect.getfile(model class)).
+def test_init_encoder_common_name_or_path_ministral_retrieval(tmp_path):
+    """Retrieval architectures advertise only the model source file for checkpoint export.
 
     Must use the real ``Ministral3BidirectionalModel`` class: a class defined in this test
-    file would resolve to ``.../bi_encoder/``, not ``.../ministral_bidirectional/``.
+    file would resolve to this test file, not ``.../ministral_bidirectional/model.py``.
     """
     cfg = tiny_bidirectional_config()
     backbone = Ministral3BidirectionalModel(cfg)
@@ -796,7 +797,12 @@ def test_init_encoder_common_name_or_path_ministral_retrieval():
     encoder = nn.Module()
     _init_encoder_common(encoder, backbone)
 
-    assert "ministral_bidirectional" in encoder.name_or_path
+    assert encoder.name_or_path.endswith("ministral_bidirectional/model.py")
+
+    _maybe_save_custom_model_code(encoder.name_or_path, str(tmp_path))
+
+    assert (tmp_path / "model.py").is_file()
+    assert not (tmp_path / "processor.py").exists()
 
 
 def test_mistral3_vlm_liger_patch_targets_text_tower():
