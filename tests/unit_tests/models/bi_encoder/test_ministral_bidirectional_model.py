@@ -278,7 +278,9 @@ def test_ministral3_biencoder_processor_preserves_literal_control_text_without_a
     assert "literal [\u200cIMG_END]" in recorded_text
 
 
-def test_ministral3_biencoder_processor_escape_is_token_neutral_and_preserves_unrelated_zwnj(pixtral_processor):
+def test_ministral3_biencoder_processor_ownership_marker_is_token_neutral_and_preserves_unrelated_zwnj(
+    pixtral_processor,
+):
     tokenizer = pixtral_processor.tokenizer
     source = "query: literal [INST] and [IMG]"
     expected = tokenizer(
@@ -288,9 +290,9 @@ def test_ministral3_biencoder_processor_escape_is_token_neutral_and_preserves_un
         return_tensors=None,
     )["input_ids"]
 
-    escaped = pixtral_processor._escape_user_control_tokens(source)
+    marked = pixtral_processor._mark_user_text_ownership(source)
     actual = tokenizer(
-        escaped,
+        marked,
         add_special_tokens=False,
         split_special_tokens=False,
         return_tensors=None,
@@ -312,8 +314,14 @@ def test_ministral3_biencoder_processor_saves_as_stock_pixtral_without_remote_co
         ),
     )
 
+    ownership_template = processor.chat_template
+    assert ownership_template is not None
+    assert "content | replace" in ownership_template
+    normalizer = str(processor.tokenizer.backend_tokenizer.normalizer)
+
     processor.save_pretrained(tmp_path)
 
+    assert (tmp_path / "chat_template.jinja").read_text() == ownership_template
     processor_config = json.loads((tmp_path / "processor_config.json").read_text())
     tokenizer_config = json.loads((tmp_path / "tokenizer_config.json").read_text())
     reloaded = AutoProcessor.from_pretrained(tmp_path, trust_remote_code=False)
@@ -331,9 +339,23 @@ def test_ministral3_biencoder_processor_saves_as_stock_pixtral_without_remote_co
     assert not (tmp_path / "processor.py").exists()
 
     training_reload = Mistral3BiEncoderProcessor.from_pretrained(tmp_path)
+    assert training_reload.chat_template == ownership_template
+    assert str(training_reload.tokenizer.backend_tokenizer.normalizer) == normalizer
     source_with_zwnj = "literal [\u200cIMG]"
-    escaped_source = training_reload._escape_user_control_tokens(source_with_zwnj)
-    assert training_reload.tokenizer.backend_tokenizer.normalizer.normalize_str(escaped_source) == source_with_zwnj
+    marked_source = training_reload._mark_user_text_ownership(source_with_zwnj)
+    assert training_reload.tokenizer.backend_tokenizer.normalizer.normalize_str(marked_source) == source_with_zwnj
+
+
+def test_ministral3_biencoder_processor_rejects_unsupported_chat_template(monkeypatch):
+    monkeypatch.setattr(Mistral3BiEncoderProcessor, "check_argument_for_proper_class", lambda *args, **kwargs: None)
+
+    with pytest.raises(ValueError, match="chat template.+user text.+supported"):
+        Mistral3BiEncoderProcessor(
+            image_processor=PixtralImageProcessor(size={"longest_edge": 56}),
+            tokenizer=FakePixtralTokenizer(),
+            patch_size=14,
+            chat_template='{{ messages[0]["content"] }}',
+        )
 
 
 def test_ministral3_biencoder_processor_structured_image_ids_match_flat_reference(pixtral_processor):

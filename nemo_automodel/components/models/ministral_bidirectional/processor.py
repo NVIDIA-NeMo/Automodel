@@ -31,10 +31,53 @@ from transformers.tokenization_utils_tokenizers import TokenizersBackend
 _CONTROL_TOKEN_ESCAPE = "\u200c"
 _CONTROL_TOKEN_ESCAPE_POLICY = "mistral_retrieval_zwnj_prefix_v1"
 _CONTROL_TOKEN_PREFIXES = ("[", "<")
-_CHAT_TEMPLATE_TEXT_REPLACEMENTS = {
-    "{{- content -}}": "{{- content | replace('[', '[\u200c') | replace('<', '<\u200c') -}}",
-    "{{- block['text'] -}}": "{{- block['text'] | replace('[', '[\u200c') | replace('<', '<\u200c') -}}",
-}
+_CHAT_TEMPLATE_TEXT_EXPRESSIONS = ("content", "block['text']")
+_CHAT_TEMPLATE_OWNERSHIP_FILTER = "".join(
+    f" | replace('{prefix}', '{prefix}{_CONTROL_TOKEN_ESCAPE}')" for prefix in _CONTROL_TOKEN_PREFIXES
+)
+
+
+def _make_ownership_aware_chat_template(
+    chat_template: str | dict[str, str] | None,
+) -> str | dict[str, str] | None:
+    """Return a chat template that marks externally supplied text."""
+    if isinstance(chat_template, dict):
+        return {name: _make_ownership_aware_chat_template(template) for name, template in chat_template.items()}
+    if not chat_template or _CHAT_TEMPLATE_OWNERSHIP_FILTER in chat_template:
+        return chat_template
+
+    adapted_template = chat_template
+    for expression in _CHAT_TEMPLATE_TEXT_EXPRESSIONS:
+        source = "{{- " + expression + " -}}"
+        replacement = "{{- " + expression + _CHAT_TEMPLATE_OWNERSHIP_FILTER + " -}}"
+        adapted_template = adapted_template.replace(source, replacement)
+
+    if adapted_template == chat_template:
+        raise ValueError(
+            "The chat template cannot protect user text because it does not contain a supported Mistral "
+            "text-rendering expression. Use a template that renders content or block['text'] with "
+            "whitespace-control delimiters, or omit the chat template when stock chat inference is not required."
+        )
+    return adapted_template
+
+
+def _apply_mistral_retrieval_ownership_policy(
+    tokenizer: TokenizersBackend,
+    chat_template: str | dict[str, str] | None,
+) -> str | dict[str, str] | None:
+    """Configure persistent tokenizer and template ownership behavior."""
+    tokenizer.split_special_tokens = False
+    tokenizer.init_kwargs["split_special_tokens"] = False
+    if tokenizer.init_kwargs.get("nemo_control_token_escape_policy") != _CONTROL_TOKEN_ESCAPE_POLICY:
+        existing_normalizer = tokenizer.backend_tokenizer.normalizer
+        ownership_normalizers = [
+            Replace(f"{prefix}{_CONTROL_TOKEN_ESCAPE}", prefix) for prefix in _CONTROL_TOKEN_PREFIXES
+        ]
+        if existing_normalizer is not None:
+            ownership_normalizers.append(existing_normalizer)
+        tokenizer.backend_tokenizer.normalizer = Sequence(ownership_normalizers)
+        tokenizer.init_kwargs["nemo_control_token_escape_policy"] = _CONTROL_TOKEN_ESCAPE_POLICY
+    return _make_ownership_aware_chat_template(chat_template)
 
 
 def load_image(image: Any) -> Image.Image:
@@ -56,7 +99,15 @@ def load_image(image: Any) -> Image.Image:
 
 
 class Mistral3BiEncoderProcessor(PixtralProcessor):
-    """Pixtral processor with retrieval-specific query/document batching helpers."""
+    """Pixtral processor with retrieval-specific query/document batching helpers.
+
+    The persistent ownership policy is applied when the processor is constructed:
+    its tokenizer treats raw control markers as processor-owned, while its chat
+    template marks externally supplied text for ordinary tokenization. Direct
+    retrieval query/document helpers apply the same text marker because they do
+    not render the chat template. Saving changes only the processor class to the
+    stock Pixtral implementation; it does not change the configured behavior.
+    """
 
     def check_argument_for_proper_class(
         self,
@@ -151,7 +202,10 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
             image_end_token=image_end_token,
             **kwargs,
         )
-        self._configure_control_token_escape_normalizer()
+        self.chat_template = _apply_mistral_retrieval_ownership_policy(
+            self.tokenizer,
+            self.chat_template,
+        )
         self.q_max_length = q_max_length if q_max_length is not None else q_max_len
         self.p_max_length = p_max_length if p_max_length is not None else p_max_len
         self.pad_to_multiple_of = pad_to_multiple_of
@@ -183,9 +237,9 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
             raise ValueError(f"Invalid return_tensors: {return_tensors!r}. Must be 'pt' or 'np'.")
 
         query_prompts = [
-            f"{self.query_prefix} {self._escape_user_control_tokens(query)}"
+            f"{self.query_prefix} {self._mark_user_text_ownership(query)}"
             if self.query_prefix
-            else self._escape_user_control_tokens(query)
+            else self._mark_user_text_ownership(query)
             for query in queries
         ]
         return self._process_text(
@@ -226,7 +280,7 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
         contents = []
         processor_images = []
         for image, text in zip(images, texts):
-            content = "" if text is None else self._escape_user_control_tokens(str(text))
+            content = "" if text is None else self._mark_user_text_ownership(str(text))
             if image is not None and image != "":
                 processor_images.append(load_image(image).convert("RGB"))
                 content = f"{self.image_token} {content}".strip()
@@ -363,28 +417,12 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
             tokenizer=self.tokenizer,
             patch_size=self.patch_size,
             spatial_merge_size=self.spatial_merge_size,
-            chat_template=self._escape_chat_template(self.chat_template),
+            chat_template=self.chat_template,
             image_token=self.image_token,
             image_break_token=self.image_break_token,
             image_end_token=self.image_end_token,
         )
         return standard_processor.save_pretrained(save_directory, push_to_hub=push_to_hub, **kwargs)
-
-    @staticmethod
-    def _escape_chat_template(
-        chat_template: str | dict[str, str] | None,
-    ) -> str | dict[str, str] | None:
-        """Escape externally supplied text in supported Mistral chat templates."""
-        if isinstance(chat_template, dict):
-            return {
-                name: Mistral3BiEncoderProcessor._escape_chat_template(template)
-                for name, template in chat_template.items()
-            }
-        if not isinstance(chat_template, str):
-            return chat_template
-        for source, replacement in _CHAT_TEMPLATE_TEXT_REPLACEMENTS.items():
-            chat_template = chat_template.replace(source, replacement)
-        return chat_template
 
     @staticmethod
     def _extract_document_fields(documents: dict[str, list[Any]] | list[dict[str, Any]]) -> tuple[list[Any], list[Any]]:
@@ -398,24 +436,12 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
             return [pair["image"] for pair in documents], [pair["text"] for pair in documents]
         raise ValueError("The documents need to be a dict or list of dicts.")
 
-    def _escape_user_control_tokens(self, text: str) -> str:
+    @staticmethod
+    def _mark_user_text_ownership(text: str) -> str:
         """Mark user-owned control-token prefixes for ordinary tokenization."""
         for prefix in _CONTROL_TOKEN_PREFIXES:
             text = text.replace(prefix, f"{prefix}{_CONTROL_TOKEN_ESCAPE}")
         return text
-
-    def _configure_control_token_escape_normalizer(self) -> None:
-        """Remove transient ownership escapes after special-token matching."""
-        self.tokenizer.split_special_tokens = False
-        self.tokenizer.init_kwargs["split_special_tokens"] = False
-        if self.tokenizer.init_kwargs.get("nemo_control_token_escape_policy") == _CONTROL_TOKEN_ESCAPE_POLICY:
-            return
-        existing_normalizer = self.tokenizer.backend_tokenizer.normalizer
-        escape_normalizers = [Replace(f"{prefix}{_CONTROL_TOKEN_ESCAPE}", prefix) for prefix in _CONTROL_TOKEN_PREFIXES]
-        if existing_normalizer is not None:
-            escape_normalizers.append(existing_normalizer)
-        self.tokenizer.backend_tokenizer.normalizer = Sequence(escape_normalizers)
-        self.tokenizer.init_kwargs["nemo_control_token_escape_policy"] = _CONTROL_TOKEN_ESCAPE_POLICY
 
 
 def _register_with_hf_auto_classes() -> None:
