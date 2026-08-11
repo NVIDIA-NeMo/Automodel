@@ -1272,8 +1272,12 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
                     **kwargs,
                 )
                 hidden_states = text_outputs.last_hidden_state
-                slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-                logits = self.lm_head(hidden_states[:, slice_indices, :])
+                logits = compute_lm_head_logits(
+                    self.lm_head,
+                    hidden_states,
+                    logits_to_keep,
+                    match_lm_head_dtype=True,
+                ).logits
                 if (final_logit_softcapping := getattr(text_config, "final_logit_softcapping", None)) is not None:
                     logits = logits / final_logit_softcapping
                     logits = torch.tanh(logits)
@@ -1394,7 +1398,12 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
 
         hidden_states = outputs.last_hidden_state
 
-        logits = compute_lm_head_logits(self.lm_head, hidden_states, logits_to_keep).logits
+        logits = compute_lm_head_logits(
+            self.lm_head,
+            hidden_states,
+            logits_to_keep,
+            match_lm_head_dtype=True,
+        ).logits
 
         if (final_logit_softcapping := getattr(text_config, "final_logit_softcapping", None)) is not None:
             logits = logits / final_logit_softcapping

@@ -352,6 +352,17 @@ class TestComputeLmHeadLogits:
         out = compute_lm_head_logits(None, hidden, fp32_lm_head=True)
         assert out.logits is hidden
 
+    def test_match_lm_head_dtype_casts_after_slicing(self):
+        lm_head = self._lm_head().to(torch.bfloat16)
+        hidden = torch.randn(2, 5, self.HIDDEN, dtype=torch.float32)
+
+        out = compute_lm_head_logits(lm_head, hidden, logits_to_keep=2, match_lm_head_dtype=True)
+
+        expected = lm_head(hidden[:, -2:, :].to(torch.bfloat16))
+        assert out.logits.shape == (2, 2, self.VOCAB)
+        assert out.logits.dtype == torch.bfloat16
+        torch.testing.assert_close(out.logits, expected)
+
     def test_output_hidden_states_attaches_hidden(self):
         """output_hidden_states attaches the final hidden states; default leaves them None."""
         lm_head = self._lm_head()

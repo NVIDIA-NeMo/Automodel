@@ -848,6 +848,8 @@ def compute_lm_head_logits(
     is_thd: bool = False,
     fp32_lm_head: bool = False,
     output_hidden_states: bool = False,
+    *,
+    match_lm_head_dtype: bool = False,
 ) -> CausalLMOutputWithPast:
     """Project hidden states through ``lm_head`` and wrap the result.
 
@@ -878,6 +880,7 @@ def compute_lm_head_logits(
       to fp32 (e.g. via the MoE ``lm_head_precision`` setting). The matmul goes
       through ``lm_head`` (``nn.Linear``, DTensor-aware under FSDP2) rather than
       ``F.linear`` so DTensor redistribution is preserved.
+    - ``match_lm_head_dtype``: cast the sliced input to the head weight dtype.
     - ``output_hidden_states``: when set, the (full-sequence, THD-restored)
       ``hidden_states`` are attached to the output so the fused cross-entropy
       path can recompute logits over every position; otherwise the field is
@@ -894,6 +897,7 @@ def compute_lm_head_logits(
         fp32_lm_head: Project in fp32 and cast the result back to the input
             dtype. Ignored when ``lm_head`` is ``None``.
         output_hidden_states: Attach the final hidden states to the output.
+        match_lm_head_dtype: Cast the sliced input to the LM-head weight dtype.
 
     Returns:
         A ``CausalLMOutputWithPast`` whose ``logits`` are the projected logits
@@ -914,6 +918,11 @@ def compute_lm_head_logits(
                 sliced = hidden_states[:, slice_indices, :]
         if fp32_lm_head:
             logits = lm_head(sliced.float()).to(hidden_states.dtype)
+        elif match_lm_head_dtype:
+            lm_head_weight = getattr(lm_head, "weight", None)
+            if lm_head_weight is None:
+                raise ValueError("match_lm_head_dtype requires lm_head to expose a weight tensor")
+            logits = lm_head(sliced.to(lm_head_weight.dtype))
         else:
             logits = lm_head(sliced)
     if is_thd and logits.dim() == 2:
