@@ -15,19 +15,22 @@
 """Functional tests for retrieval backbone extraction."""
 
 import json
-from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 import torch
 import torch.nn as nn
 from transformers import AutoModel, Mistral3Config
+from transformers.models.mistral3.modeling_mistral3 import Mistral3Model as HFMistral3Model
 
 from nemo_automodel.components.models.llama_bidirectional.model import (
     LlamaBidirectionalForSequenceClassification,
     LlamaBidirectionalModel,
 )
-from nemo_automodel.components.models.ministral_bidirectional.model import Ministral3BidirectionalModel
+from nemo_automodel.components.models.ministral_bidirectional.model import (
+    Ministral3BidirectionalModel,
+    Mistral3BidirectionalModel,
+)
 
 
 def test_llama_nemotron_vl_supported_backbone_for_embedding():
@@ -83,6 +86,63 @@ def _assert_state_dict_equal(expected: dict[str, torch.Tensor], actual: dict[str
 def _assert_no_language_model_prefix(model: nn.Module) -> None:
     for key in model.state_dict():
         assert not key.startswith("language_model."), f"VLM prefix in key: {key}"
+
+
+@pytest.mark.parametrize("load_path", ["retrieval_factory", "model_class"])
+def test_ministral_vlm_load_restores_all_towers(tmp_path, load_path):
+    """Factory and model-owned loading restore every stock Mistral3 tower."""
+    from nemo_automodel._transformers import retrieval
+
+    source = AutoModel.from_config(_tiny_mistral3_vlm_config("ministral3"))
+    expected_state_dict = {key: tensor.detach().clone() for key, tensor in source.state_dict().items()}
+    model_dir = tmp_path / "ministral3_vlm"
+    source.save_pretrained(model_dir)
+
+    if load_path == "retrieval_factory":
+        backbone = retrieval.build_encoder_backbone(
+            model_name_or_path=str(model_dir),
+            task="embedding",
+        )
+    else:
+        # An unrelated caller mapping is preserved without disabling the
+        # model's default stock-checkpoint conversion.
+        backbone = Mistral3BidirectionalModel.from_pretrained(
+            model_dir,
+            key_mapping={r"^unused\.": "unused."},
+        )
+
+    assert isinstance(backbone, Mistral3BidirectionalModel)
+    _assert_state_dict_equal(expected_state_dict, backbone.state_dict())
+
+
+@pytest.mark.parametrize(
+    ("caller_mapping", "expected_required_mapping"),
+    [
+        ({r"^unused\.": "unused."}, "language_model."),
+        ({r"^language_model\.model\.": "caller_prefix."}, "caller_prefix."),
+    ],
+)
+def test_mistral_vlm_load_preserves_caller_key_mapping(
+    monkeypatch,
+    caller_mapping,
+    expected_required_mapping,
+):
+    """Model loading adds its remap as a default without overriding callers."""
+    captured_kwargs = {}
+    sentinel = object()
+
+    def fake_from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
+        captured_kwargs.update(kwargs)
+        return sentinel
+
+    monkeypatch.setattr(HFMistral3Model, "from_pretrained", classmethod(fake_from_pretrained))
+
+    result = Mistral3BidirectionalModel.from_pretrained("checkpoint", key_mapping=caller_mapping)
+
+    assert result is sentinel
+    assert captured_kwargs["key_mapping"][r"^language_model\.model\."] == expected_required_mapping
+    for pattern, replacement in caller_mapping.items():
+        assert captured_kwargs["key_mapping"][pattern] == replacement
 
 
 @pytest.mark.parametrize(("kwargs", "expected_is_final"), [({}, False), ({"is_final_checkpoint": True}, True)])
