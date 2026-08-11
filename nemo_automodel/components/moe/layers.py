@@ -952,14 +952,27 @@ class MoE(nn.Module):
                     y = x.new_zeros((x.size(0), self.dim)).index_copy(0, valid_positions, valid_y)
             else:
                 weights, indices, aux_loss = self.gate(x, token_mask, cp_mesh)
-                y = self.experts(
-                    x_latent,
+                num_dispatch_tokens = max(512, ((x.size(0) + 255) // 256) * 256)
+                num_dummy_tokens = num_dispatch_tokens - x.size(0)
+                if num_dummy_tokens:
+                    expert_x = F.pad(x_latent, (0, 0, 0, num_dummy_tokens))
+                    weights = F.pad(weights, (0, 0, 0, num_dummy_tokens))
+                    dummy_indices = torch.arange(
+                        num_dummy_tokens * indices.size(1), device=indices.device, dtype=indices.dtype
+                    ).view(num_dummy_tokens, indices.size(1))
+                    dummy_indices = dummy_indices.remainder(self.n_routed_experts)
+                    indices = torch.cat((indices, dummy_indices), dim=0)
+                else:
+                    expert_x = x_latent
+                dispatch_y = self.experts(
+                    expert_x,
                     weights,
                     indices,
                     self.shared_experts.gate_proj.weight,
                     self.shared_experts.up_proj.weight,
                     self.shared_experts.down_proj.weight,
                 )
+                y = dispatch_y[: x.size(0)]
             z = None
         else:
             weights, indices, aux_loss = self.gate(x, token_mask, cp_mesh)

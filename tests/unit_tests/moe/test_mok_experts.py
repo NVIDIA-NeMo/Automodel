@@ -20,6 +20,7 @@ import pytest
 import torch
 from torch.utils.checkpoint import checkpoint
 
+from nemo_automodel.components._peft.lora import PeftConfig, apply_lora_to_linear_modules, patch_moe_module
 from nemo_automodel.components.models.common import BackendConfig, MoKBackendConfig
 from nemo_automodel.components.moe import mok_experts
 from nemo_automodel.components.moe.config import MoEConfig
@@ -273,6 +274,65 @@ def test_mok_state_dict_loads_virtual_expert_keys_independently() -> None:
     target.load_state_dict({"down_projs": source_state["down_projs"]}, strict=False)
 
     torch.testing.assert_close(target.routed_down_weights, source.routed_down_weights)
+
+
+def test_mok_rejects_lora_patching() -> None:
+    experts = GroupedExpertsMoK(_valid_moe_config(), BackendConfig(dispatcher="mok"))
+
+    with pytest.raises(NotImplementedError, match="LoRA is not supported for Mixture-of-Kittens"):
+        patch_moe_module(experts)
+
+    model = torch.nn.Module()
+    model.experts = experts
+    with pytest.raises(NotImplementedError, match="LoRA is not supported for Mixture-of-Kittens"):
+        apply_lora_to_linear_modules(model, PeftConfig(target_modules=["experts"]))
+
+
+def test_mok_without_padding_mask_aligns_dispatch_extent(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = _valid_moe_config()
+    monkeypatch.setattr("nemo_automodel.components.moe.layers.get_world_size_safe", lambda: 4)
+    moe = MoE(config, BackendConfig(dispatcher="mok", linear="torch"))
+    captured: dict[str, torch.Tensor] = {}
+
+    def fake_experts(
+        x: torch.Tensor,
+        weights: torch.Tensor,
+        indices: torch.Tensor,
+        *shared_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        """Capture aligned expert inputs and return an identity-like output.
+
+        Args:
+            x: BF16 tensor of shape [tokens, hidden].
+            weights: Tensor of shape [tokens, activated_experts].
+            indices: Int64 tensor of shape [tokens, activated_experts].
+            *shared_weights: Shared-expert tensors in their projection layouts.
+
+        Returns:
+            Tensor of shape [tokens, hidden].
+        """
+        del shared_weights
+        captured["x"] = x
+        captured["weights"] = weights
+        captured["indices"] = indices
+        return x + 1
+
+    monkeypatch.setattr(moe.experts, "forward", fake_experts)
+    x = torch.randn(1, 4, 256, dtype=torch.bfloat16, requires_grad=True)
+
+    output = moe(x)
+
+    assert output.shape == x.shape
+    assert captured["x"].shape == (512, 256)
+    torch.testing.assert_close(captured["x"][:4], x.detach().view(-1, 256))
+    torch.testing.assert_close(captured["x"][4:], torch.zeros_like(captured["x"][4:]))
+    torch.testing.assert_close(captured["weights"][4:], torch.zeros_like(captured["weights"][4:]))
+    dummy_load = torch.bincount(captured["indices"][4:].flatten(), minlength=config.n_routed_experts)
+    torch.testing.assert_close(dummy_load, torch.full_like(dummy_load, dummy_load[0]))
+    torch.testing.assert_close(output, x + 1)
+
+    output.sum().backward()
+    torch.testing.assert_close(x.grad, torch.ones_like(x.grad))
 
 
 def test_mok_unpacked_compacts_padding_and_restores_token_layout(monkeypatch: pytest.MonkeyPatch) -> None:
