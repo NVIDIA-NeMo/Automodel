@@ -876,22 +876,17 @@ class MoE(nn.Module):
             # padding out of router load statistics and auxiliary losses.
             if padding_mask is not None:
                 weights, indices, aux_loss = self.gate(x, token_mask, cp_mesh)
-                num_dispatch_tokens = max(512, ((x.size(0) + 255) // 256) * 256)
                 if is_packed_thd:
                     # THD attention isolates padding rows and the loss mask gives
                     # them zero gradient. Dispatch the physical rows directly,
                     # like context-parallel padding, rather than launching eager
                     # masking and dummy-route kernels in every MoE layer.
                     expert_x = x_latent
-                    num_alignment_tokens = num_dispatch_tokens - x.size(0)
-                    if num_alignment_tokens:
-                        expert_x = F.pad(expert_x, (0, 0, 0, num_alignment_tokens))
-                        weights = F.pad(weights, (0, 0, 0, num_alignment_tokens))
-                        indices = F.pad(indices, (0, 0, 0, num_alignment_tokens))
                 else:
                     # Unpacked batches can contain one padding tail per batch row,
                     # which becomes non-contiguous after flattening. Preserve the
                     # general gather/scatter path for that layout.
+                    num_dispatch_tokens = max(512, ((x.size(0) + 255) // 256) * 256)
                     valid_positions = token_mask.nonzero(as_tuple=False).flatten()
                     expert_x = x_latent.index_select(0, valid_positions)
                     weights = weights.index_select(0, valid_positions)

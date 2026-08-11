@@ -102,6 +102,17 @@ def test_mok_backend_config_build_settings(monkeypatch: pytest.MonkeyPatch) -> N
     }
 
 
+@pytest.mark.parametrize("num_tokens", [512, 768, 4096])
+def test_mok_backend_config_accepts_valid_token_extent(num_tokens: int) -> None:
+    MoKBackendConfig.validate_token_extent(num_tokens)
+
+
+@pytest.mark.parametrize("num_tokens", [0, 511, 513, 512.0])
+def test_mok_backend_config_rejects_invalid_token_extent(num_tokens: object) -> None:
+    with pytest.raises(ValueError, match="integer at least 512 and divisible by 256"):
+        MoKBackendConfig.validate_token_extent(num_tokens)  # type: ignore[arg-type]
+
+
 def test_mok_accepts_dsv4_clamped_swiglu() -> None:
     experts = GroupedExpertsMoK(
         _valid_moe_config(swiglu_limit=10.0),
@@ -420,21 +431,18 @@ def test_mok_packed_thd_dispatches_padding_as_physical_tokens(monkeypatch: pytes
 
     monkeypatch.setattr(moe.gate, "forward", capture_gate)
     monkeypatch.setattr(moe.experts, "forward", fake_experts)
-    x = torch.randn(4, 256, dtype=torch.bfloat16, requires_grad=True)
-    padding_mask = torch.tensor([False, False, True, True])
+    x = torch.randn(512, 256, dtype=torch.bfloat16, requires_grad=True)
+    padding_mask = torch.zeros(512, dtype=torch.bool)
+    padding_mask[-2:] = True
 
     output = moe(x, padding_mask=padding_mask)
 
     assert output.shape == x.shape
     torch.testing.assert_close(captured["gate_x"], x.detach())
     torch.testing.assert_close(captured["gate_token_mask"], ~padding_mask)
-    assert captured["x"].shape == (512, 256)
-    torch.testing.assert_close(captured["x"][:4], x.detach())
-    torch.testing.assert_close(captured["x"][4:], torch.zeros_like(captured["x"][4:]))
-    torch.testing.assert_close(captured["weights"][:4], captured["gate_weights"])
-    torch.testing.assert_close(captured["weights"][4:], torch.zeros_like(captured["weights"][4:]))
-    torch.testing.assert_close(captured["indices"][:4], captured["gate_indices"])
-    torch.testing.assert_close(captured["indices"][4:], torch.zeros_like(captured["indices"][4:]))
+    torch.testing.assert_close(captured["x"], x.detach())
+    torch.testing.assert_close(captured["weights"], captured["gate_weights"])
+    torch.testing.assert_close(captured["indices"], captured["gate_indices"])
     torch.testing.assert_close(output, x + 1)
 
     output.sum().backward()
@@ -465,8 +473,9 @@ def test_mok_packed_thd_accepts_padding_between_sequences(monkeypatch: pytest.Mo
 
     monkeypatch.setattr(moe.gate, "forward", capture_gate)
     monkeypatch.setattr(moe.experts, "forward", fake_experts)
-    x = torch.randn(4, 256, dtype=torch.bfloat16)
-    padding_mask = torch.tensor([False, True, False, True])
+    x = torch.randn(512, 256, dtype=torch.bfloat16)
+    padding_mask = torch.zeros(512, dtype=torch.bool)
+    padding_mask[[1, 511]] = True
 
     output = moe(x, padding_mask=padding_mask)
 
@@ -503,9 +512,9 @@ def test_mok_all_padding_still_enters_collective_dispatch(monkeypatch: pytest.Mo
 
     monkeypatch.setattr(moe.gate, "forward", capture_gate)
     monkeypatch.setattr(moe.experts, "forward", fake_experts)
-    x = torch.randn(4, 256, dtype=torch.bfloat16)
+    x = torch.randn(512, 256, dtype=torch.bfloat16)
 
-    output = moe(x, padding_mask=torch.ones(4, dtype=torch.bool))
+    output = moe(x, padding_mask=torch.ones(512, dtype=torch.bool))
 
     assert len(gate_calls) == 1
     gate_x, gate_token_mask = gate_calls[0]
@@ -513,13 +522,9 @@ def test_mok_all_padding_still_enters_collective_dispatch(monkeypatch: pytest.Mo
     assert not gate_token_mask.any()
     assert len(calls) == 1
     expert_x, weights, indices = calls[0]
-    assert expert_x.shape == (512, 256)
-    torch.testing.assert_close(expert_x[:4], x)
-    torch.testing.assert_close(expert_x[4:], torch.zeros_like(expert_x[4:]))
-    torch.testing.assert_close(weights[:4], gate_outputs[0][0])
-    torch.testing.assert_close(weights[4:], torch.zeros_like(weights[4:]))
-    torch.testing.assert_close(indices[:4], gate_outputs[0][1])
-    torch.testing.assert_close(indices[4:], torch.zeros_like(indices[4:]))
+    torch.testing.assert_close(expert_x, x)
+    torch.testing.assert_close(weights, gate_outputs[0][0])
+    torch.testing.assert_close(indices, gate_outputs[0][1])
     torch.testing.assert_close(output, torch.zeros_like(output))
 
 

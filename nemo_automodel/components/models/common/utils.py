@@ -221,6 +221,12 @@ class MoKBackendConfig:
     schedule_capacity_multiplier: float = 0.5
     all_gather_top_experts_chunk_bytes: int = 2048
 
+    @staticmethod
+    def validate_token_extent(num_tokens: int, *, name: str = "num_tokens") -> None:
+        """Validate the per-rank dense token extent required by MoK."""
+        if type(num_tokens) is not int or num_tokens < 512 or num_tokens % 256 != 0:
+            raise ValueError(f"MoK {name} must be an integer at least 512 and divisible by 256; got {num_tokens!r}")
+
     def __post_init__(self) -> None:
         """Validate settings that do not depend on a CUDA device or EP group."""
         for name, value in (
