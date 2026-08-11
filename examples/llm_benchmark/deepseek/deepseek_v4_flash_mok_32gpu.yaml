@@ -12,14 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# DeepSeek-V4-Flash full-width, four-layer random-init MoK benchmark on one
-# 4xGB200 node. Every layer retains the published 256-expert, H=4096,
-# routed-I=2048, top-6 MoE shape. This mock pretraining run does not load a
-# checkpoint.
-#
-# Build the sibling checkout once with `MOK_ARCH=SM100`, then run from AutoModel:
-#   PYTHONPATH=../mixture-of-kittens:$PYTHONPATH \
-#     automodel examples/llm_benchmark/deepseek/deepseek_v4_flash_mok_4gpu.yaml --nproc-per-node 4
+# Full 43-layer DeepSeek-V4-Flash random-init MoK benchmark on 8x4 GB200 GPUs.
+# This is an end-to-end mock pretraining run; it does not load a checkpoint.
+# Run this config through the multi-node launcher with 8 nodes and 4 ranks per
+# node, with the built mixture-of-kittens checkout on PYTHONPATH.
 
 recipe: BenchmarkingRecipeForNextTokenPrediction
 
@@ -31,12 +27,12 @@ benchmark:
   nsys_start: -1
   nsys_end: -1
   nsys_ranks: []
-  num_nodes: 1
-  json_output_path: training_logs/deepseek_v4_flash_mok_4gpu.json
+  num_nodes: 8
+  json_output_path: training_logs/deepseek_v4_flash_mok_32gpu.json
 
 step_scheduler:
   gc_every_steps: 10
-  global_batch_size: 4
+  global_batch_size: 32
   local_batch_size: 1
   ckpt_every_steps: 1000
   val_every_steps: 1000
@@ -48,7 +44,7 @@ distributed:
   tp_size: 1
   cp_size: 1
   pp_size: 1
-  ep_size: 4
+  ep_size: 32
   sequence_parallel: false
   activation_checkpointing: true
   moe:
@@ -57,14 +53,14 @@ distributed:
 
 dist_env:
   backend: nccl
-  timeout_minutes: 20
+  timeout_minutes: 30
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
   config:
     _target_: nemo_automodel.components.models.deepseek_v4.config.DeepseekV4Config
     architectures: [DeepseekV4ForCausalLM]
-    num_hidden_layers: 4
+    num_hidden_layers: 43
     num_nextn_predict_layers: 0
     use_cache: false
     rope_scaling:
@@ -73,7 +69,9 @@ model:
       factor: 16
       original_max_position_embeddings: 65536
       type: yarn
-    compress_ratios: [0, 0, 4, 128]
+    compress_ratios:
+      [0, 0, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128,
+       4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4]
   trust_remote_code: false
   load_base_model: false
   backend:
@@ -89,7 +87,7 @@ model:
     enable_hf_state_dict_adapter: false
     enable_fsdp_optimizations: true
     mok:
-      fwd_num_comm_sms: 24
+      fwd_num_comm_sms: 40
       bwd_num_comm_sms: 28
       minibatch_size: 4096
       macrobatch_size: 131072
@@ -106,7 +104,7 @@ loss_fn:
 dataset:
   _target_: nemo_automodel.components.datasets.llm.mock_iterable_dataset.MockIterableDataset
   vocab_size: 129280
-  seq_len: 4096
+  seq_len: 1024
   num_samples: 100000
 
 dataloader:
@@ -118,7 +116,7 @@ optimizer:
   _target_: torch.optim.AdamW
   betas: [0.9, 0.95]
   eps: 1.0e-5
-  lr: 1.0e-5
+  lr: 1.0e-4
   weight_decay: 0.1
   foreach: false
 
