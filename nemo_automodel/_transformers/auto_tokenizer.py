@@ -14,7 +14,10 @@
 
 import importlib
 import logging
-from typing import Callable, Literal, Optional, Type, Union
+from typing import TYPE_CHECKING, Callable, Literal, Optional, Type, Union
+
+if TYPE_CHECKING:
+    from transformers import PreTrainedTokenizerBase
 
 logger = logging.getLogger(__name__)
 
@@ -97,7 +100,7 @@ class NeMoAutoTokenizer:
         tokenizer_backend: Literal["nemo_auto", "transformers_auto", "tokenizers"] | None = None,
         trust_remote_code: bool = False,
         **kwargs,
-    ):
+    ) -> "PreTrainedTokenizerBase":
         """
         Load a tokenizer from a pretrained model.
 
