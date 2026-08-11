@@ -1317,8 +1317,12 @@ def _report_qwen_source_expert_weight_parity(model, cfg) -> None:
     from safetensors import safe_open
 
     named_parameters = dict(unwrapped.named_parameters())
-    gate_up_name = next(name for name in named_parameters if name.endswith("layers.0.mlp.experts.gate_and_up_projs"))
-    down_name = next(name for name in named_parameters if name.endswith("layers.0.mlp.experts.down_projs"))
+    gate_up_name = next(
+        name for name in named_parameters if "layers.0.mlp.experts" in name and name.endswith("gate_and_up_projs")
+    )
+    down_name = next(
+        name for name in named_parameters if "layers.0.mlp.experts" in name and name.endswith("down_projs")
+    )
     gate_up = named_parameters[gate_up_name].detach()
     down = named_parameters[down_name].detach()
     if isinstance(gate_up, DTensor):
