@@ -49,6 +49,21 @@ def test_generate_gpt_oss_120b_release_job_uses_ep64():
     assert variables["TEST_NODE_COUNT"] == 8
     assert variables["LOCAL_BATCH_SIZE"] == 8
     assert recipe["distributed"]["ep_size"] == world_size
+    assert recipe["distributed"]["activation_checkpointing"] is False
+
+
+def test_generate_gpt_oss_120b_benchmark_job_uses_ep64_without_activation_checkpointing():
+    config = Path("examples/llm_benchmark/gpt_oss/gptoss_120b_te_deepep.yaml")
+
+    jobs = dict(generate_job(config, {}, "performance", "llm_benchmark", "."))
+    recipe = YAML(typ="safe").load(config)
+
+    variables = jobs[""]["variables"]
+    world_size = variables["TEST_NODE_COUNT"] * 8
+    assert variables["TEST_NODE_COUNT"] == 8
+    assert variables["EP_SIZE"] == world_size
+    assert recipe["distributed"]["ep_size"] == world_size
+    assert recipe["distributed"]["activation_checkpointing"] is False
 
 
 def test_generate_vllm_deploy_time_override(tmp_path):
