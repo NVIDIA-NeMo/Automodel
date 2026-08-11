@@ -58,6 +58,7 @@ distributed:
   ep_size: 64
 
   sequence_parallel: false
+  activation_checkpointing: false
 
   pipeline:
     pp_schedule: interleaved1f1b
