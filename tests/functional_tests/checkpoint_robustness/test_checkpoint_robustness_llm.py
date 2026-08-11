@@ -34,6 +34,7 @@ import inspect
 import json
 import math
 import os
+import re
 import sys
 import time
 import traceback
@@ -1316,15 +1317,14 @@ def _report_qwen_source_expert_weight_parity(model, cfg) -> None:
     from huggingface_hub import try_to_load_from_cache
     from safetensors import safe_open
 
-    named_parameters = dict(unwrapped.named_parameters())
-    gate_up_name = next(
-        name for name in named_parameters if "layers.0.mlp.experts" in name and name.endswith("gate_and_up_projs")
-    )
+    native_state = unwrapped.state_dict()
+    gate_up_name = next(name for name in native_state if name.endswith("mlp.experts.gate_and_up_projs"))
+    layer_num = int(re.search(r"layers\.(\d+)\.", gate_up_name).group(1))
     down_name = next(
-        name for name in named_parameters if "layers.0.mlp.experts" in name and name.endswith("down_projs")
+        name for name in native_state if f"layers.{layer_num}." in name and name.endswith("mlp.experts.down_projs")
     )
-    gate_up = named_parameters[gate_up_name].detach()
-    down = named_parameters[down_name].detach()
+    gate_up = native_state[gate_up_name].detach()
+    down = native_state[down_name].detach()
     if isinstance(gate_up, DTensor):
         gate_up = gate_up.to_local()
     if isinstance(down, DTensor):
@@ -1336,9 +1336,9 @@ def _report_qwen_source_expert_weight_parity(model, cfg) -> None:
     assert isinstance(index_path, str), f"No cached safetensors index for {model_path}"
     weight_map = json.loads(Path(index_path).read_text())["weight_map"]
     hf_keys = {
-        "gate": "model.layers.0.mlp.experts.0.gate_proj.weight",
-        "up": "model.layers.0.mlp.experts.0.up_proj.weight",
-        "down": "model.layers.0.mlp.experts.0.down_proj.weight",
+        "gate": f"model.layers.{layer_num}.mlp.experts.0.gate_proj.weight",
+        "up": f"model.layers.{layer_num}.mlp.experts.0.up_proj.weight",
+        "down": f"model.layers.{layer_num}.mlp.experts.0.down_proj.weight",
     }
     references = {}
     for label, key in hf_keys.items():
