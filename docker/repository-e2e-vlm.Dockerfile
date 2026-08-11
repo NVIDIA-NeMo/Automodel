@@ -1,6 +1,6 @@
-# CI overrides this with the exact primary-image digest. Keep a public,
-# functional default so direct builds and Dockerfile validation remain valid.
-ARG BASE_IMAGE=nvcr.io/nvidia/nemo-automodel:26.04
+# CI overrides this with the exact primary-image digest. Keep the public,
+# functional default immutable so direct builds reproduce the reviewed base.
+ARG BASE_IMAGE=nvcr.io/nvidia/nemo-automodel:26.04@sha256:bd1287277a447edb1cc0b58219246740c22b6548f6d47b192a8604894e2bfc4b
 FROM ${BASE_IMAGE}
 
 WORKDIR /opt/Automodel
@@ -12,6 +12,6 @@ COPY --chown=65532:65532 tests/unit_tests/speculative/test_dspark_gemma4.py test
 # The native hf_transformer_vlm CI lane installs this opt-in extra at runtime.
 # Populate both the venv and uv cache while the image build has package egress so
 # the unchanged launcher can repeat the install in the offline GPU sandbox.
-RUN . /opt/venv/env.sh && uv pip install ".[vlm-media]"
+RUN . /opt/venv/env.sh && uv sync --locked --extra vlm-media
 
 ENV UV_OFFLINE=1
