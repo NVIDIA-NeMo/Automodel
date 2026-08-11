@@ -1466,6 +1466,11 @@ class TestCalculateLoss:
             def named_parameters(self, remove_duplicate=False):
                 return [("lm_head.weight", self._lm_head.weight), ("lm_head.bias", self._lm_head.bias)]
 
+            def named_modules(self):
+                # No module is named ``lm_head``, so the lookup must fall back to
+                # the parameter-name search this test exercises.
+                return []
+
         model = ModelWithLmHeadOnly()
 
         loss = calculate_loss(

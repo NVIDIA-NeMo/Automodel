@@ -519,7 +519,9 @@ def test_run_validation_epoch_does_not_sum_tokens_over_cp(monkeypatch):
     monkeypatch.setattr(vlm_finetune, "ScopedRNG", lambda *a, **k: nullcontext())
     monkeypatch.setattr(vlm_finetune.ContextParallelSharder, "shard", _identity_cp_shard)
     monkeypatch.setattr(vlm_finetune, "filter_forward_kwargs", lambda model, batch: batch)
-    monkeypatch.setattr(vlm_finetune, "calculate_loss", lambda *a, **k: torch.tensor(2.0))
+    monkeypatch.setattr(
+        "nemo_automodel.components.training.forward_backward.calculate_loss", lambda *a, **k: torch.tensor(2.0)
+    )
 
     class _Model(torch.nn.Module):
         def eval(self):  # noqa: D401
@@ -572,7 +574,9 @@ def test_run_validation_epoch_cp_active_runs_pre_embed(monkeypatch):
     monkeypatch.setattr(vlm_finetune, "ScopedRNG", lambda *a, **k: nullcontext())
     monkeypatch.setattr(vlm_finetune.ContextParallelSharder, "shard", _identity_cp_shard)
     monkeypatch.setattr(vlm_finetune, "filter_forward_kwargs", lambda model, batch: batch)
-    monkeypatch.setattr(vlm_finetune, "calculate_loss", lambda *a, **k: torch.tensor(2.0))
+    monkeypatch.setattr(
+        "nemo_automodel.components.training.forward_backward.calculate_loss", lambda *a, **k: torch.tensor(2.0)
+    )
 
     pre_embed_calls = []
 
