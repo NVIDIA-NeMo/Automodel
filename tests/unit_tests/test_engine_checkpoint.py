@@ -36,6 +36,7 @@ class ToyLM(nn.Module):
 @pytest.fixture
 def dist_gloo():
     """Single-process gloo process group so DCP has a backend."""
+    created = False
     if not dist.is_initialized():
         dist.init_process_group(
             backend="gloo",
@@ -43,8 +44,12 @@ def dist_gloo():
             rank=0,
             world_size=1,
         )
-    yield
-    # leave the PG initialized for other tests in the session
+        created = True
+    try:
+        yield
+    finally:
+        if created and dist.is_initialized():
+            dist.destroy_process_group()
 
 
 def _engine(lr=0.5):
