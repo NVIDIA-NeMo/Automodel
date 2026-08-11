@@ -140,3 +140,8 @@ optimizer:
   lr: 1.0e-4
   weight_decay: 0
   foreach: false
+
+ci:
+  recipe_owner: HuiyingLi
+  time: "00:25:00"
+  nodes: 1

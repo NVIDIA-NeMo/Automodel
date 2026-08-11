@@ -124,3 +124,8 @@ lr_scheduler:
   lr_decay_style: constant
   lr_warmup_steps: 0
   min_lr: 0.0
+
+ci:
+  recipe_owner: HuiyingLi
+  time: "00:45:00"
+  nodes: 8
