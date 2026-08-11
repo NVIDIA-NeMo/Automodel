@@ -1276,7 +1276,6 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
                     self.lm_head,
                     hidden_states,
                     logits_to_keep,
-                    match_lm_head_dtype=True,
                 ).logits
                 if (final_logit_softcapping := getattr(text_config, "final_logit_softcapping", None)) is not None:
                     logits = logits / final_logit_softcapping
@@ -1402,7 +1401,6 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
             self.lm_head,
             hidden_states,
             logits_to_keep,
-            match_lm_head_dtype=True,
         ).logits
 
         if (final_logit_softcapping := getattr(text_config, "final_logit_softcapping", None)) is not None:
