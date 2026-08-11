@@ -385,7 +385,7 @@ def _build_packed_vlm_sample(
     seq_lens: list[int] = []
     seq_lens_padded: list[int] = []
 
-    pixel_values_list: list[torch.Tensor] = []
+    pixel_values_list: list[torch.Tensor | list[torch.Tensor]] = []
     image_grid_thw_list: list[torch.Tensor] = []
     image_position_ids_list: list[torch.Tensor] = []
     pixel_values_videos_list: list[torch.Tensor] = []
@@ -455,7 +455,14 @@ def _build_packed_vlm_sample(
     else:
         packed["position_ids"] = torch.tensor(all_position_ids_1d, dtype=torch.long)
 
-    packed["pixel_values"] = torch.cat(pixel_values_list, dim=0) if pixel_values_list else None
+    if pixel_values_list and all(isinstance(value, torch.Tensor) for value in pixel_values_list):
+        packed["pixel_values"] = torch.cat(pixel_values_list, dim=0)
+    elif pixel_values_list and all(isinstance(value, (list, tuple)) for value in pixel_values_list):
+        packed["pixel_values"] = [item for value in pixel_values_list for item in value]
+    elif pixel_values_list:
+        raise TypeError("Packed VLM pixel_values must be consistently tensors or variable-resolution lists.")
+    else:
+        packed["pixel_values"] = None
     packed["image_grid_thw"] = torch.cat(image_grid_thw_list, dim=0) if image_grid_thw_list else None
     packed["image_position_ids"] = torch.cat(image_position_ids_list, dim=0) if image_position_ids_list else None
     packed["pixel_values_videos"] = torch.cat(pixel_values_videos_list, dim=0) if pixel_values_videos_list else None

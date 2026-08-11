@@ -1256,15 +1256,26 @@ def default_collate_fn(
     max_length: Optional[int] = None,
     drop_overlong: bool = False,
     _post_tokenize_hook=None,
-) -> Dict[str, torch.Tensor]:
+) -> dict[str, Any]:
     """Default collate function for multimodal VLM datasets.
 
     Args:
+        examples: Conversation samples to collate.
+        processor: Multimodal processor used to apply the chat template.
+        max_length: Optional maximum token sequence length.
+        drop_overlong: Whether to remove samples estimated to exceed ``max_length``.
         _post_tokenize_hook: Optional callable ``(batch, processor) -> batch``
             invoked right after ``apply_chat_template`` and before
             ``build_labels``.  Used by model-specific collate wrappers
             (e.g. Gemma4 thinking-channel injection) to transform the
             tokenized batch and the prefix tokens without duplicating the rest of the pipeline.
+
+    Returns:
+        Batch mapping containing ``input_ids``, ``attention_mask``, and ``labels``
+        tensors of shape [batch, sequence]. Processor-specific media values are
+        either tensors with processor-defined shape and arbitrary rank or lists
+        whose tensor elements preserve their processor-defined shapes; image lists
+        commonly contain tensors of shape [channels, height, width].
     """
     conversations = _ensure_rgb([example["conversation"] for example in examples])
 
@@ -1303,9 +1314,21 @@ def default_collate_fn(
 
     # Convert pixel values to bfloat16 (images and/or videos)
     if "pixel_values" in batch:
-        batch["pixel_values"] = batch["pixel_values"].to(torch.bfloat16)
+        pixel_values = batch["pixel_values"]
+        if isinstance(pixel_values, torch.Tensor):
+            batch["pixel_values"] = pixel_values.to(torch.bfloat16)
+        elif isinstance(pixel_values, list):
+            batch["pixel_values"] = [
+                value.to(torch.bfloat16) if isinstance(value, torch.Tensor) else value for value in pixel_values
+            ]
     if "pixel_values_videos" in batch:
-        batch["pixel_values_videos"] = batch["pixel_values_videos"].to(torch.bfloat16)
+        pixel_values_videos = batch["pixel_values_videos"]
+        if isinstance(pixel_values_videos, torch.Tensor):
+            batch["pixel_values_videos"] = pixel_values_videos.to(torch.bfloat16)
+        elif isinstance(pixel_values_videos, list):
+            batch["pixel_values_videos"] = [
+                value.to(torch.bfloat16) if isinstance(value, torch.Tensor) else value for value in pixel_values_videos
+            ]
 
     labels = build_labels_from_template(
         batch["input_ids"],
@@ -1334,9 +1357,25 @@ def default_collate_fn(
 
     pixel_values = batch.get("pixel_values")
     image_token_id = getattr(processor, "image_token_id", None)
-    if image_token_id is not None and pixel_values is not None and pixel_values.dim() == 5:
+    if image_token_id is not None and isinstance(pixel_values, torch.Tensor) and pixel_values.dim() == 5:
         batch["num_patches"] = (batch["input_ids"] == image_token_id).sum(dim=-1)
     return batch
+
+
+def _merge_media_values(values: list[Any]) -> torch.Tensor | list[Any]:
+    """Merge fixed-shape patch tensors or preserve variable-resolution media lists."""
+    if not values:
+        raise ValueError("Media merge requires at least one value.")
+    if all(isinstance(value, torch.Tensor) for value in values):
+        return torch.cat(values, dim=0).to(torch.bfloat16)
+    if all(isinstance(value, (list, tuple)) for value in values):
+        return [
+            item.to(torch.bfloat16) if isinstance(item, torch.Tensor) else item for value in values for item in value
+        ]
+    raise TypeError(
+        "VLM media values must be consistently tensors or variable-resolution lists, "
+        f"got {[type(value).__name__ for value in values]}."
+    )
 
 
 def pad_collate_fn(
@@ -1426,7 +1465,7 @@ def pad_collate_fn(
     for key in ("pixel_values", "pixel_values_videos"):
         tensors = [ex[key] for ex in examples if key in ex and ex[key] is not None]
         if tensors:
-            batch[key] = torch.cat(tensors, dim=0).to(torch.bfloat16)
+            batch[key] = _merge_media_values(tensors)
 
     # Per-sample image counts from image_grid_thw shapes (before concat)
     image_grid_per_sample = [
@@ -1582,7 +1621,7 @@ def neat_packed_vlm_collater(
     for key in ("pixel_values", "pixel_values_videos"):
         tensors = [x[key] for x in batch if key in x and x[key] is not None]
         if tensors:
-            result[key] = torch.cat(tensors, dim=0).to(torch.bfloat16)
+            result[key] = _merge_media_values(tensors)
 
     for key in ("image_grid_thw", "image_position_ids", "video_grid_thw", "second_per_grid_ts"):
         tensors = [x[key] for x in batch if key in x and x[key] is not None]
@@ -1721,7 +1760,7 @@ def packed_sequence_thd_vlm_collater(
     for key in ("pixel_values", "pixel_values_videos"):
         tensors = [x[key] for x in batch if key in x and x[key] is not None]
         if tensors:
-            result[key] = torch.cat(tensors, dim=0).to(torch.bfloat16)
+            result[key] = _merge_media_values(tensors)
 
     for key in ("image_grid_thw", "image_position_ids", "video_grid_thw", "second_per_grid_ts"):
         tensors = [x[key] for x in batch if key in x and x[key] is not None]
