@@ -19,12 +19,46 @@ import torch
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import (
+    FSDPModule,
     MixedPrecisionPolicy,
     OffloadPolicy,
     fully_shard,
 )
 
+from nemo_automodel.shared.torch_patches import (
+    patch_fsdp_unused_param_reduction as _patch_fsdp_unused_param_reduction,
+)
+
 UniformSubtreeItem = Union[Tuple[nn.Module, torch.dtype], Tuple[str, nn.Module, torch.dtype]]
+
+
+def configure_fsdp_unused_param_reduction(module: nn.Module) -> int:
+    """Reduce zero gradients for FSDP parameters unused on a local CP rank.
+
+    Packed or modality-dependent context-parallel batches may execute a module
+    on only a subset of ranks. FSDP must still issue the same reduce-scatter
+    sequence everywhere; otherwise a rank with ``grad is None`` can omit a
+    collective and discard peer contributions. PyTorch's public API fills the
+    missing local contribution with zero, analogous to DDP unused-parameter
+    handling. AutoModel keeps a compatibility fallback for supported PyTorch
+    versions that predate that public API.
+
+    Args:
+        module: Root module containing the FSDP units to configure.
+
+    Returns:
+        Number of FSDP units configured.
+    """
+    fsdp_modules = [candidate for candidate in module.modules() if isinstance(candidate, FSDPModule)]
+    if not fsdp_modules:
+        return 0
+
+    if hasattr(fsdp_modules[0], "set_reduce_scatter_unused_params"):
+        for fsdp_module in fsdp_modules:
+            fsdp_module.set_reduce_scatter_unused_params(True, recurse=False)
+    else:
+        _patch_fsdp_unused_param_reduction()
+    return len(fsdp_modules)
 
 
 def iter_maximal_uniform_dtype_subtrees(

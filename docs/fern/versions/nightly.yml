@@ -208,6 +208,8 @@ navigation:
           - page: "Overview"
             path: ../../model-coverage/vlm/index.mdx
             slug: overview
+          - page: "MuseGlimmer"
+            path: ../../model-coverage/vlm/muse/muse_glimmer.mdx
           - page: "Kimi-VL"
             path: ../../model-coverage/vlm/moonshotai/kimi-vl.mdx
           - page: "Kimi-K3"
