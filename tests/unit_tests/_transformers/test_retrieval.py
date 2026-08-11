@@ -21,6 +21,7 @@ import pytest
 import torch
 import torch.nn as nn
 from transformers import AutoModel, Mistral3Config
+from transformers.models.mistral3.modeling_mistral3 import Mistral3Model as HFMistral3Model
 
 from nemo_automodel.components.models.llama_bidirectional.model import (
     LlamaBidirectionalForSequenceClassification,
@@ -103,18 +104,45 @@ def test_ministral_vlm_load_restores_all_towers(tmp_path, load_path):
             task="embedding",
         )
     else:
-        # Unrelated caller mappings are preserved, but a conflicting mapping
-        # cannot disable the model's required stock-checkpoint conversion.
+        # An unrelated caller mapping is preserved without disabling the
+        # model's default stock-checkpoint conversion.
         backbone = Mistral3BidirectionalModel.from_pretrained(
             model_dir,
-            key_mapping={
-                r"^unused\.": "unused.",
-                r"^language_model\.model\.": "wrong_prefix.",
-            },
+            key_mapping={r"^unused\.": "unused."},
         )
 
     assert isinstance(backbone, Mistral3BidirectionalModel)
     _assert_state_dict_equal(expected_state_dict, backbone.state_dict())
+
+
+@pytest.mark.parametrize(
+    ("caller_mapping", "expected_required_mapping"),
+    [
+        ({r"^unused\.": "unused."}, "language_model."),
+        ({r"^language_model\.model\.": "caller_prefix."}, "caller_prefix."),
+    ],
+)
+def test_mistral_vlm_load_preserves_caller_key_mapping(
+    monkeypatch,
+    caller_mapping,
+    expected_required_mapping,
+):
+    """Model loading adds its remap as a default without overriding callers."""
+    captured_kwargs = {}
+    sentinel = object()
+
+    def fake_from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
+        captured_kwargs.update(kwargs)
+        return sentinel
+
+    monkeypatch.setattr(HFMistral3Model, "from_pretrained", classmethod(fake_from_pretrained))
+
+    result = Mistral3BidirectionalModel.from_pretrained("checkpoint", key_mapping=caller_mapping)
+
+    assert result is sentinel
+    assert captured_kwargs["key_mapping"][r"^language_model\.model\."] == expected_required_mapping
+    for pattern, replacement in caller_mapping.items():
+        assert captured_kwargs["key_mapping"][pattern] == replacement
 
 
 @pytest.mark.parametrize(("kwargs", "expected_is_final"), [({}, False), ({"is_final_checkpoint": True}, True)])
