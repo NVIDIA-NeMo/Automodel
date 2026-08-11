@@ -316,8 +316,8 @@ def test_nemotron_flash_peft_robustness_keeps_supported_tp_topology(tmp_path):
     assert "resume_first_loss_threshold" not in resolved["ci"]["checkpoint_robustness"]
 
 
-def test_qwen3_moe_lora_robustness_keeps_checkpoint_gates_without_source_parity(tmp_path):
-    """Qwen MoE LoRA retains checkpoint reload coverage without its unstable runtime comparison."""
+def test_qwen3_moe_lora_robustness_keeps_source_and_checkpoint_gates(tmp_path):
+    """Qwen MoE LoRA retains both source-load and checkpoint reload coverage."""
     recipe_path = REPO_ROOT / "examples/llm_finetune/qwen/qwen3_moe_30b_lora.yaml"
     out = tmp_path / "resolved.yaml"
     env = {"PIPELINE_DIR": str(tmp_path), "TEST_NAME": recipe_path.stem}
@@ -327,7 +327,7 @@ def test_qwen3_moe_lora_robustness_keeps_checkpoint_gates_without_source_parity(
     )
 
     robustness = yaml.load(out.open())["ci"]["checkpoint_robustness"]
-    assert robustness["check_source_load_parity"] is False
+    assert robustness["check_source_load_parity"] is True
     assert "skip_automodel_logit_parity" not in robustness
     assert robustness["skip_hf_logit_parity"] is True
 

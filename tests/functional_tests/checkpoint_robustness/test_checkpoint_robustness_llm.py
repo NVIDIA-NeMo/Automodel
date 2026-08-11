@@ -1868,6 +1868,24 @@ def _run_process_isolated_checkpoint_phase(
             device,
             trainer=source_trainer,
         )
+        repeated_trainer_source_logits = _get_logits(
+            source_trainer.model_parts[0],
+            input_ids,
+            device,
+            trainer=source_trainer,
+        )
+        if _rank0():
+            repeat_kl = _kl_divergence_from_logits(trainer_source_logits, repeated_trainer_source_logits)
+            repeat_cosine = _cosine_similarity_from_logits(
+                trainer_source_logits,
+                repeated_trainer_source_logits,
+            )
+            repeat_max_abs = (trainer_source_logits - repeated_trainer_source_logits).abs().max().item()
+            print(
+                "[Phase 0] Constructed-trainer repeated-forward stability: "
+                f"max KL={repeat_kl.max().item():.6e}; mean KL={repeat_kl.mean().item():.6e}; "
+                f"max abs={repeat_max_abs:.6e}; cosine={repeat_cosine:.8f}"
+            )
         source_load_reference = None
         if _rank0():
             metadata = json.loads(metadata_path.read_text())

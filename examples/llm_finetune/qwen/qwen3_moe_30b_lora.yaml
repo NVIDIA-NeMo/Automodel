@@ -107,11 +107,7 @@ ci:
   env_vars:
     PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
   checkpoint_robustness:
-    # The vanilla-HF vs optimized EP runtime comparison is not a checkpoint
-    # oracle and is unstable for this recipe (the same image has ranged from
-    # 1e-2 to O(1e1) max KL). Keep exact AutoModel reload and saved-adapter
-    # fingerprint checks as the blocking checkpoint-integrity gates.
-    check_source_load_parity: false
+    check_source_load_parity: true
     # HF+PEFT reload remains gated by exact adapter fingerprints and a successful
     # forward; its live-LoRA logits are not a stable cross-runtime reference (AMINT-216).
     skip_hf_logit_parity: true
