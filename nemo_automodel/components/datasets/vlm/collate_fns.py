@@ -1611,11 +1611,12 @@ def packed_sequence_thd_vlm_collater(
     VLM counterpart of ``packed_sequence_thd_collater`` (text-only,
     ``datasets/utils.py``). Packs arrive with variable lengths (no pre-padding)
     from ``neat_pack_dataset_vlm``. This collater pads text tensors to a common
-    length and stacks them to ``[batch, seq]``; derives per-document real lengths
-    (``seq_lens``) from the indexed ``attention_mask`` (values 1, 2, ... per
-    sub-sequence, 0 = padding) and folds each sample's trailing pad into its last
-    document for ``seq_lens_padded``; keeps the mRoPE ``[3, seq]`` layout as
-    ``[3, batch, seq]``; concatenates media tensors; and emits ``qkv_format='thd'``.
+    length and stacks them to ``[batch, seq]``. CP-aware packed samples provide
+    explicit ``seq_lens`` and ``seq_lens_padded`` metadata; older samples derive
+    real lengths from the indexed ``attention_mask`` (values 1, 2, ... per
+    sub-sequence, 0 = padding). The collater folds only batch-level trailing pad
+    into the last document, keeps the mRoPE ``[3, seq]`` layout as
+    ``[3, batch, seq]``, concatenates media tensors, and emits ``qkv_format='thd'``.
 
     Args:
         batch: List of packed sample dicts. Each holds ``input_ids``/``labels``/
@@ -1645,6 +1646,10 @@ def packed_sequence_thd_vlm_collater(
         x["input_ids"].shape[-1] if isinstance(x["input_ids"], torch.Tensor) else len(x["input_ids"]) for x in batch
     )
     max_len = max_length if max_length is not None else batch_max
+    if batch_max > max_len:
+        raise ValueError(
+            f"Packed VLM THD batch requires {batch_max} tokens, exceeding configured max_length={max_len}."
+        )
 
     def _pad_seq(tensor, pad_value, target_len, seq_dim=-1):
         """Pad ``tensor`` along ``seq_dim`` to ``target_len`` with ``pad_value``."""
@@ -1662,13 +1667,35 @@ def packed_sequence_thd_vlm_collater(
     seq_lens_list: list[list[int]] = []
     seq_lens_padded_list: list[list[int]] = []
     for x in batch:
-        am = torch.as_tensor(x["attention_mask"]).to(torch.long)
-        real_len = int(am.shape[0])
-        doc_lens = torch.bincount(am)[1:].tolist()
-        if not doc_lens:
-            doc_lens = [real_len]
-        padded = list(doc_lens)
-        padded[-1] += max_len - real_len
+        has_seq_lens = "seq_lens" in x
+        has_seq_lens_padded = "seq_lens_padded" in x
+        if has_seq_lens != has_seq_lens_padded:
+            raise ValueError("Packed VLM samples must provide both seq_lens and seq_lens_padded, or neither.")
+
+        item_len = int(torch.as_tensor(x["input_ids"]).shape[-1])
+        if has_seq_lens:
+            doc_lens = torch.as_tensor(x["seq_lens"], dtype=torch.long).reshape(-1).tolist()
+            padded = torch.as_tensor(x["seq_lens_padded"], dtype=torch.long).reshape(-1).tolist()
+            invalid_lengths = not padded or any(
+                real < 0 or slots < 0 or real > slots for real, slots in zip(doc_lens, padded)
+            )
+            if len(doc_lens) != len(padded) or invalid_lengths:
+                raise ValueError(
+                    f"Invalid packed VLM THD sequence metadata: seq_lens={doc_lens}, seq_lens_padded={padded}."
+                )
+            if sum(padded) != item_len:
+                raise ValueError(
+                    "Packed VLM THD seq_lens_padded must cover the materialized token stream, "
+                    f"got sum={sum(padded)} and tokens={item_len}."
+                )
+        else:
+            am = torch.as_tensor(x["attention_mask"]).to(torch.long)
+            doc_lens = torch.bincount(am)[1:].tolist()
+            if not doc_lens:
+                doc_lens = [item_len]
+            padded = list(doc_lens)
+
+        padded[-1] += max_len - item_len
         seq_lens_list.append(doc_lens)
         seq_lens_padded_list.append(padded)
 
