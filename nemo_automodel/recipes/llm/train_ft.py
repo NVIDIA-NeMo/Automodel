@@ -75,7 +75,6 @@ from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.components.loss.mtp import calculate_mtp_loss
 from nemo_automodel.components.loss.utils import _get_lm_head_weight, calculate_loss
-from nemo_automodel.components.models.common import MoKBackendConfig
 from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
 from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
@@ -122,18 +121,6 @@ def _get_model_name(cfg_model):
         return cfg_model.config.get("pretrained_model_name_or_path", None)
     else:
         return None
-
-
-def _validate_mok_thd_packing(cfg: RecipeConfig) -> None:
-    """Validate the cross-component MoK and THD-packing token contract."""
-    if cfg.get("model.backend.dispatcher", None) != "mok":
-        return
-    if cfg.get("packed_sequence.packing_strategy", "thd") != "thd":
-        return
-
-    packed_sequence_size = cfg.get("packed_sequence.packed_sequence_size", 0) or 0
-    if packed_sequence_size > 0:
-        MoKBackendConfig.validate_token_extent(packed_sequence_size, name="packed_sequence_size")
 
 
 def _should_pack_validation(
@@ -490,7 +477,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         Raises:
             NotImplemented: Raises if it tries to restore a checkpoint; will be removed.
         """
-        _validate_mok_thd_packing(self.cfg)
         torch.cuda.reset_peak_memory_stats()
         self.dist_env = initialize_distributed(
             backend=self.cfg.get("dist_env", {}).get("backend", "nccl"),

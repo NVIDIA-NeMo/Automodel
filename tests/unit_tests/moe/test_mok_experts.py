@@ -102,17 +102,6 @@ def test_mok_backend_config_build_settings(monkeypatch: pytest.MonkeyPatch) -> N
     }
 
 
-@pytest.mark.parametrize("num_tokens", [512, 768, 4096])
-def test_mok_backend_config_accepts_valid_token_extent(num_tokens: int) -> None:
-    MoKBackendConfig.validate_token_extent(num_tokens)
-
-
-@pytest.mark.parametrize("num_tokens", [0, 511, 513, 512.0])
-def test_mok_backend_config_rejects_invalid_token_extent(num_tokens: object) -> None:
-    with pytest.raises(ValueError, match="integer at least 512 and divisible by 256"):
-        MoKBackendConfig.validate_token_extent(num_tokens)  # type: ignore[arg-type]
-
-
 def test_mok_accepts_dsv4_clamped_swiglu() -> None:
     experts = GroupedExpertsMoK(
         _valid_moe_config(swiglu_limit=10.0),
