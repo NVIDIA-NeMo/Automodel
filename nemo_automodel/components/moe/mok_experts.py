@@ -450,7 +450,7 @@ class GroupedExpertsMoK(nn.Module):
         self.ep_rank = 0
 
     @staticmethod
-    def _validate_model_config(config: MoEConfig) -> None:
+    def ._validate_model_mok_config(config: MoEConfig) -> None:
         """Reject MoE variants outside MoK's current fused-kernel contract."""
         unsupported: list[str] = []
         if config.dtype != torch.bfloat16:
