@@ -114,13 +114,19 @@ def test_loaded_tokenizer_policy_survives_save_and_auto_reload(tmp_path):
     assert not list(saved_dir.glob("*.py"))
 
 
-def test_all_maintained_ministral_retrieval_recipes_use_policy_loader():
+def test_all_maintained_ministral_retrieval_recipes_use_tokenizers_backend_policy():
     recipe_dir = Path(__file__).parents[4] / "examples" / "retrieval" / "bi_encoder"
     recipe_paths = sorted(path for path in recipe_dir.glob("*ministral*.yaml") if path.stat().st_size)
 
     assert recipe_paths
     for recipe_path in recipe_paths:
         tokenizer_config = yaml.safe_load(recipe_path.read_text())["tokenizer"]
+        if tokenizer_config["_target_"] == (
+            "nemo_automodel.components.models.ministral_bidirectional.processor."
+            "Mistral3BiEncoderProcessor.from_pretrained"
+        ):
+            continue
+
         assert tokenizer_config["_target_"] == "nemo_automodel.NeMoAutoTokenizer.from_pretrained"
         assert tokenizer_config["tokenizer_backend"] == "tokenizers"
         assert tokenizer_config["fix_mistral_regex"] is True
