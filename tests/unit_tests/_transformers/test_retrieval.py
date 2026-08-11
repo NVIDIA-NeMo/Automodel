@@ -103,11 +103,14 @@ def test_ministral_vlm_load_restores_all_towers(tmp_path, load_path):
             task="embedding",
         )
     else:
-        # A caller-provided mapping must be preserved without disabling the
-        # model's required stock-checkpoint conversion.
+        # Unrelated caller mappings are preserved, but a conflicting mapping
+        # cannot disable the model's required stock-checkpoint conversion.
         backbone = Mistral3BidirectionalModel.from_pretrained(
             model_dir,
-            key_mapping={r"^unused\.": "unused."},
+            key_mapping={
+                r"^unused\.": "unused.",
+                r"^language_model\.model\.": "wrong_prefix.",
+            },
         )
 
     assert isinstance(backbone, Mistral3BidirectionalModel)

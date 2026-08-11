@@ -181,11 +181,16 @@ class Mistral3BidirectionalModel(Mistral3Model):
         *model_args: Any,
         **kwargs: Any,
     ) -> Any:
-        """Load stock Mistral3 weights into the bidirectional VL layout."""
+        """Load stock Mistral3 weights into the bidirectional VL layout.
+
+        Caller-provided key mappings are preserved unless they conflict with
+        the structural mapping required by this model's fixed module layout.
+        """
         key_mapping = dict(kwargs.pop("key_mapping", None) or {})
         # Stock Mistral3 wraps the text tower in an extra ``model`` module. This
         # custom base model owns the same tower directly, so mirror Transformers'
-        # native Mistral3Model checkpoint conversion during loading only.
+        # native Mistral3Model checkpoint conversion during loading only. This
+        # required mapping intentionally overrides a conflicting caller entry.
         key_mapping[r"^language_model\.model\."] = "language_model."
         return super().from_pretrained(
             pretrained_model_name_or_path,
