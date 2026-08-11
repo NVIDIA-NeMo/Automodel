@@ -11,7 +11,9 @@ COPY --chown=65532:65532 tests/unit_tests/speculative/test_dspark_gemma4.py test
 
 # The native hf_transformer_vlm CI lane installs this opt-in extra at runtime.
 # Populate both the venv and uv cache while the image build has package egress so
-# the unchanged launcher can repeat the install in the offline GPU sandbox.
-RUN . /opt/venv/env.sh && uv sync --locked --extra vlm-media
+# the unchanged launcher can repeat the install in the offline GPU sandbox. Keep
+# packages inherited from the official CI image, matching the additive native
+# `uv pip install` step while still enforcing this checkout's lockfile.
+RUN . /opt/venv/env.sh && uv sync --locked --extra vlm-media --inexact
 
 ENV UV_OFFLINE=1
