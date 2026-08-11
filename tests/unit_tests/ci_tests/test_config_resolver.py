@@ -316,6 +316,22 @@ def test_nemotron_flash_peft_robustness_keeps_supported_tp_topology(tmp_path):
     assert "resume_first_loss_threshold" not in resolved["ci"]["checkpoint_robustness"]
 
 
+def test_qwen3_moe_lora_robustness_keeps_checkpoint_gates_without_source_parity(tmp_path):
+    """Qwen MoE LoRA retains checkpoint reload coverage without its unstable runtime comparison."""
+    recipe_path = REPO_ROOT / "examples/llm_finetune/qwen/qwen3_moe_30b_lora.yaml"
+    out = tmp_path / "resolved.yaml"
+    env = {"PIPELINE_DIR": str(tmp_path), "TEST_NAME": recipe_path.stem}
+    _run_resolver(
+        ["--base", str(recipe_path), "--phase", "checkpoint_robustness", "--output", str(out)],
+        env=env,
+    )
+
+    robustness = yaml.load(out.open())["ci"]["checkpoint_robustness"]
+    assert robustness["check_source_load_parity"] is False
+    assert "skip_automodel_logit_parity" not in robustness
+    assert robustness["skip_hf_logit_parity"] is True
+
+
 def test_end_to_end_fixture_keys_not_applied_as_overrides(tmp_path):
     """Non-config fixture-arg keys in ci.checkpoint_robustness must not leak into the top-level config."""
     recipe = tmp_path / "llama_squad.yaml"
