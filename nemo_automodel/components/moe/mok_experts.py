@@ -432,7 +432,7 @@ class GroupedExpertsMoK(nn.Module):
             backend: Backend configuration whose ``mok`` field owns runtime tuning.
         """
         super().__init__()
-        self._validate_model_config(config)
+        self._validate_model_mok_config(config)
         self.config = config
         self.n_routed_experts = config.n_routed_experts
         self.expert_bias = False
