@@ -864,34 +864,21 @@ class MoE(nn.Module):
 
         if isinstance(self.experts, GroupedExpertsMoK):
             # MoK's fused schedule requires the same number of dense token rows
-            # on every EP rank, with at least 512 rows aligned to 256. Run the
-            # gate on the original dense extent so close group-top-k decisions
-            # match the reference dispatcher. The token mask keeps semantic
-            # padding out of router load statistics and auxiliary losses. Keep
-            # all physical rows in the fused token-wise experts; attention and
-            # loss masks prevent semantic padding from affecting valid tokens.
+            # on every EP rank, with at least 512 rows aligned to 256. Supported
+            # fixed-length and THD inputs provide that physical extent; the MoK
+            # runtime rejects invalid extents before building its schedule. The
+            # token mask keeps semantic padding out of router load statistics
+            # and auxiliary losses, while attention and loss masks prevent those
+            # physical rows from affecting valid tokens.
             weights, indices, aux_loss = self.gate(x, token_mask, cp_mesh)
-            num_dispatch_tokens = max(512, ((x.size(0) + 255) // 256) * 256)
-            num_dummy_tokens = num_dispatch_tokens - x.size(0)
-            if num_dummy_tokens:
-                expert_x = F.pad(x_latent, (0, 0, 0, num_dummy_tokens))
-                weights = F.pad(weights, (0, 0, 0, num_dummy_tokens))
-                dummy_indices = torch.arange(
-                    num_dummy_tokens * indices.size(1), device=indices.device, dtype=indices.dtype
-                ).view(num_dummy_tokens, indices.size(1))
-                dummy_indices = dummy_indices.remainder(self.n_routed_experts)
-                indices = torch.cat((indices, dummy_indices), dim=0)
-            else:
-                expert_x = x_latent
-            dispatch_y = self.experts(
-                expert_x,
+            y = self.experts(
+                x_latent,
                 weights,
                 indices,
                 self.shared_experts.gate_proj.weight,
                 self.shared_experts.up_proj.weight,
                 self.shared_experts.down_proj.weight,
             )
-            y = dispatch_y[: x.size(0)]
             z = None
         else:
             weights, indices, aux_loss = self.gate(x, token_mask, cp_mesh)

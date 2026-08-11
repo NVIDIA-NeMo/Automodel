@@ -288,7 +288,7 @@ def test_mok_rejects_lora_patching() -> None:
         apply_lora_to_linear_modules(model, PeftConfig(target_modules=["experts"]))
 
 
-def test_mok_without_padding_mask_aligns_dispatch_extent(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_mok_dispatches_pre_aligned_extent_directly(monkeypatch: pytest.MonkeyPatch) -> None:
     config = _valid_moe_config()
     monkeypatch.setattr("nemo_automodel.components.moe.layers.get_world_size_safe", lambda: 4)
     moe = MoE(config, BackendConfig(dispatcher="mok", linear="torch"))
@@ -300,7 +300,7 @@ def test_mok_without_padding_mask_aligns_dispatch_extent(monkeypatch: pytest.Mon
         indices: torch.Tensor,
         *shared_weights: torch.Tensor,
     ) -> torch.Tensor:
-        """Capture aligned expert inputs and return an identity-like output.
+        """Capture expert inputs and return an identity-like output.
 
         Args:
             x: BF16 tensor of shape [tokens, hidden].
@@ -318,39 +318,23 @@ def test_mok_without_padding_mask_aligns_dispatch_extent(monkeypatch: pytest.Mon
         return x + 1
 
     monkeypatch.setattr(moe.experts, "forward", fake_experts)
-    x = torch.randn(1, 4, 256, dtype=torch.bfloat16, requires_grad=True)
+    x = torch.randn(1, 512, 256, dtype=torch.bfloat16, requires_grad=True)
 
     output = moe(x)
 
     assert output.shape == x.shape
     assert captured["x"].shape == (512, 256)
-    torch.testing.assert_close(captured["x"][:4], x.detach().view(-1, 256))
-    torch.testing.assert_close(captured["x"][4:], torch.zeros_like(captured["x"][4:]))
-    torch.testing.assert_close(captured["weights"][4:], torch.zeros_like(captured["weights"][4:]))
-    dummy_load = torch.bincount(captured["indices"][4:].flatten(), minlength=config.n_routed_experts)
-    torch.testing.assert_close(dummy_load, torch.full_like(dummy_load, dummy_load[0]))
+    torch.testing.assert_close(captured["x"], x.detach().view(-1, 256))
     torch.testing.assert_close(output, x + 1)
 
     output.sum().backward()
     torch.testing.assert_close(x.grad, torch.ones_like(x.grad))
 
 
-def test_mok_unpacked_dispatches_padding_as_physical_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_mok_delegates_invalid_extent_without_padding(monkeypatch: pytest.MonkeyPatch) -> None:
     config = _valid_moe_config()
     monkeypatch.setattr("nemo_automodel.components.moe.layers.get_world_size_safe", lambda: 4)
     moe = MoE(config, BackendConfig(dispatcher="mok", linear="torch"))
-    captured: dict[str, torch.Tensor] = {}
-    original_gate_forward = moe.gate.forward
-
-    def capture_gate(
-        x: torch.Tensor, token_mask: torch.Tensor, cp_mesh: object
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-        captured["gate_x"] = x
-        captured["gate_token_mask"] = token_mask
-        weights, indices, aux_loss = original_gate_forward(x, token_mask, cp_mesh)
-        captured["gate_weights"] = weights
-        captured["gate_indices"] = indices
-        return weights, indices, aux_loss
 
     def fake_experts(
         x: torch.Tensor,
@@ -358,34 +342,16 @@ def test_mok_unpacked_dispatches_padding_as_physical_tokens(monkeypatch: pytest.
         indices: torch.Tensor,
         *shared_weights: torch.Tensor,
     ) -> torch.Tensor:
-        del shared_weights
-        captured["x"] = x
-        captured["weights"] = weights
-        captured["indices"] = indices
-        return x + 1
+        del weights, indices, shared_weights
+        if x.size(0) % 256 != 0:
+            raise ValueError("num_local_tokens must be divisible by 256")
+        return x
 
-    monkeypatch.setattr(moe.gate, "forward", capture_gate)
     monkeypatch.setattr(moe.experts, "forward", fake_experts)
-    x = torch.randn(1, 4, 256, dtype=torch.bfloat16, requires_grad=True)
-    padding_mask = torch.tensor([[False, True, False, True]])
+    x = torch.randn(1, 513, 256, dtype=torch.bfloat16)
 
-    output = moe(x, padding_mask=padding_mask)
-
-    assert output.shape == x.shape
-    torch.testing.assert_close(captured["gate_x"], x.detach().view(-1, 256))
-    torch.testing.assert_close(captured["gate_token_mask"], ~padding_mask.flatten())
-    assert captured["x"].shape == (512, 256)
-    torch.testing.assert_close(captured["x"][:4], x.detach().view(-1, 256))
-    torch.testing.assert_close(captured["x"][4:], torch.zeros_like(captured["x"][4:]))
-    torch.testing.assert_close(captured["weights"][:4], captured["gate_weights"])
-    torch.testing.assert_close(captured["weights"][4:], torch.zeros_like(captured["weights"][4:]))
-    torch.testing.assert_close(captured["indices"][:4], captured["gate_indices"])
-    dummy_load = torch.bincount(captured["indices"][4:].flatten(), minlength=config.n_routed_experts)
-    torch.testing.assert_close(dummy_load, torch.full_like(dummy_load, dummy_load[0]))
-    torch.testing.assert_close(output, x + 1)
-
-    output.sum().backward()
-    torch.testing.assert_close(x.grad, torch.ones_like(x.grad))
+    with pytest.raises(ValueError, match="num_local_tokens must be divisible by 256"):
+        moe(x)
 
 
 def test_mok_packed_thd_dispatches_padding_as_physical_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
