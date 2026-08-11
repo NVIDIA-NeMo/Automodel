@@ -122,9 +122,14 @@ def _scatter_seq_gather_heads(x: torch.Tensor, group: dist.ProcessGroup) -> torc
 
 
 def _gather_lse(lse: torch.Tensor, group: dist.ProcessGroup) -> torch.Tensor:
-    """Sequence-sharded -> head-sharded log-sum-exp: ``[B, H, S_local] -> [B, H/uly, S_full]``."""
+    """Sequence-sharded -> head-sharded log-sum-exp: ``[B, H, S_local] -> [B, H/uly, S_full]``.
+
+    The result is contiguous: the FlashAttention backward passes ``softmax_lse``
+    straight to the kernel without a ``maybe_contiguous`` (unlike q/k/v/out/dout),
+    so a transposed view would be read with the wrong strides.
+    """
     x = lse.transpose(1, 2).unsqueeze(-1)  # [B, S_local, H, 1]
-    return _gather_seq_scatter_heads(x, group).squeeze(-1).transpose(1, 2)  # [B, H/uly, S_full]
+    return _gather_seq_scatter_heads(x, group).squeeze(-1).transpose(1, 2).contiguous()  # [B, H/uly, S_full]
 
 
 def _scatter_lse(lse: torch.Tensor, group: dist.ProcessGroup) -> torch.Tensor:
