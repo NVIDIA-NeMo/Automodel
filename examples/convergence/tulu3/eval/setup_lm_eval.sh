@@ -31,7 +31,23 @@ if [ -d "$INSTALL_DIR/.git" ]; then
   echo "lm-evaluation-harness already cloned at $INSTALL_DIR, skipping."
 else
   echo "Cloning lm-evaluation-harness to $INSTALL_DIR ..."
-  git clone --depth 1 https://github.com/EleutherAI/lm-evaluation-harness "$INSTALL_DIR"
+  # CI nodes intermittently get an auth challenge instead of the repo ("could not read
+  # Username for 'https://github.com'"); retry, removing the partial checkout so the
+  # `.git` probe above cannot short-circuit it.
+  cloned=0
+  for attempt in 1 2 3; do
+    if git clone --depth 1 https://github.com/EleutherAI/lm-evaluation-harness "$INSTALL_DIR"; then
+      cloned=1
+      break
+    fi
+    echo "clone attempt ${attempt}/3 failed; retrying"
+    rm -rf "$INSTALL_DIR"
+    sleep $((attempt * 10))
+  done
+  if [ "$cloned" -ne 1 ]; then
+    echo "ERROR: could not clone lm-evaluation-harness after 3 attempts" >&2
+    exit 1
+  fi
 fi
 
 # ── Virtual-env & dependencies ───────────────────────────────────────────────
