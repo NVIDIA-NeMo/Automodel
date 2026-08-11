@@ -863,13 +863,10 @@ class MoE(nn.Module):
             x_latent = x
 
         if isinstance(self.experts, GroupedExpertsMoK):
-            # MoK's fused schedule requires the same number of dense token rows
-            # on every EP rank, with at least 512 rows aligned to 256. Supported
-            # fixed-length and THD inputs provide that physical extent; the MoK
-            # runtime rejects invalid extents before building its schedule. The
-            # token mask keeps semantic padding out of router load statistics
-            # and auxiliary losses, while attention and loss masks prevent those
-            # physical rows from affecting valid tokens.
+            # MoK requires every EP rank to dispatch the same pre-aligned physical
+            # token extent (at least 512 and divisible by 256). Its runtime validates
+            # the local extent. THD padding rows remain in dispatch, while token_mask
+            # excludes them from router load statistics and auxiliary losses.
             weights, indices, aux_loss = self.gate(x, token_mask, cp_mesh)
             y = self.experts(
                 x_latent,
