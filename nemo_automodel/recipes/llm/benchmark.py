@@ -14,6 +14,7 @@
 
 import json
 import logging
+import os
 import pathlib
 
 import torch
@@ -29,6 +30,32 @@ from nemo_automodel.components.utils.flops_utils import calculate_mfu, get_flops
 from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
 
 logger = logging.getLogger(__name__)
+
+
+def _log_torch_profile(profiler):
+    """Log rank-zero CUDA operator and raw kernel summaries from a completed profile."""
+    try:
+        operator_table = profiler.key_averages().table(sort_by="self_cuda_time_total", row_limit=100)
+    except AttributeError:
+        operator_table = profiler.key_averages().table(sort_by="self_device_time_total", row_limit=100)
+    logger.info("TORCH_PROFILER_OPERATOR_TABLE_BEGIN\n%s\nTORCH_PROFILER_OPERATOR_TABLE_END", operator_table)
+
+    kernels = {}
+    for event in profiler.events():
+        if "cuda" not in str(getattr(event, "device_type", "")).lower():
+            continue
+        duration_us = getattr(event, "self_device_time_total", None)
+        if duration_us is None:
+            duration_us = getattr(event, "self_cuda_time_total", 0.0)
+        entry = kernels.setdefault(event.name, {"calls": 0, "self_cuda_time_us": 0.0})
+        entry["calls"] += 1
+        entry["self_cuda_time_us"] += float(duration_us)
+
+    summary = [
+        {"name": name, **values}
+        for name, values in sorted(kernels.items(), key=lambda item: item[1]["self_cuda_time_us"], reverse=True)[:100]
+    ]
+    logger.info("TORCH_PROFILER_KERNEL_SUMMARY=%s", json.dumps(summary, separators=(",", ":")))
 
 
 def _infer_vocab_size(model_cfg):
@@ -251,6 +278,22 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
         # Create dataloader iterator
         dataloader_iter = iter(self.dataloader)
 
+        profiler = None
+        if os.environ.get("AUTOMODEL_TORCH_PROFILER") == "1":
+            profiler = torch.profiler.profile(
+                activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+                schedule=torch.profiler.schedule(wait=warmup_steps, warmup=1, active=3, repeat=1),
+                record_shapes=False,
+                profile_memory=False,
+                with_stack=False,
+            )
+            profiler.__enter__()
+            if rank == 0:
+                logger.info(
+                    "PyTorch profiler enabled on all ranks: wait=%d warmup=1 active=3",
+                    warmup_steps,
+                )
+
         # Main benchmarking loop
         for i in range(steps):
             self.step_scheduler.step = i
@@ -350,6 +393,14 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                 torch.cuda.cudart().cudaProfilerStop()
 
             self._maybe_collect_garbage()
+
+            if profiler is not None:
+                profiler.step()
+
+        if profiler is not None:
+            profiler.__exit__(None, None, None)
+            if rank == 0:
+                _log_torch_profile(profiler)
 
         # Final summary
         self._log_benchmark_summary(steps, warmup_steps, peak_tflops, rank)
