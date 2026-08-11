@@ -65,9 +65,9 @@ else
   # (vllm_flash_attn.cute). On older cutlass-dsl (the 4.5.x that vllm 0.25.x resolves
   # transitively) that kernel fails to compile -> GPUModuleOp / cudaErrorIllegalAddress.
   # vllm 0.26.0 + cutlass-dsl 4.6.0 compiles it cleanly (verified: gemma4 IFEval
-  # prompt_level_strict_acc=0.5360). Floor both so the nemo-ci convergence run stays on a known-good
-  # combination while still picking up newer fixes.
-  uv pip install -e ".[vllm]" "vllm>=0.26.0" "nvidia-cutlass-dsl>=4.6.0"
+  # prompt_level_strict_acc=0.5360).
+  # vllm 0.27.1 leads to a get_head_size() attribute error for gemma4, so pinning the version.
+  uv pip install -e ".[vllm]" "vllm==0.26.0" "nvidia-cutlass-dsl>=4.6.0"
 
   echo "Setup complete. Activate with:  source $VENV_DIR/bin/activate"
 fi
