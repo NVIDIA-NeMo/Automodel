@@ -26,10 +26,13 @@ from typing import Any, Dict, Optional
 
 from nemo_automodel.components.distributed.config import (
     DistributedSetup,
+    MultimodalDistributedConfig,
+    MultimodalVisionConfig,
     _resolve_moe_parallel_config,
     _resolve_pipeline_config,
     _resolve_strategy_config,
 )
+from nemo_automodel.components.distributed.cp_vision_frame_shard import CpVisionFrameShardingConfig
 from nemo_automodel.components.distributed.mesh import ParallelismSizes
 
 logger = logging.getLogger(__name__)
@@ -104,6 +107,25 @@ def parse_distributed_section(cfg_dict: dict) -> dict:
 
     # Everything still in *cfg* is forwarded to the strategy constructor.
     strategy_kwargs: Dict[str, Any] = cfg
+
+    # Coerce the serialized multimodal policy at the YAML boundary so the
+    # component layer only receives typed config objects.
+    if "multimodal" in strategy_kwargs:
+        multimodal_raw = strategy_kwargs["multimodal"]
+        if isinstance(multimodal_raw, dict):
+            multimodal_kwargs = multimodal_raw.copy()
+            vision_raw = multimodal_kwargs.get("vision")
+            if isinstance(vision_raw, dict):
+                vision_kwargs = vision_raw.copy()
+                frame_sharding_raw = vision_kwargs.get("frame_sharding")
+                if isinstance(frame_sharding_raw, dict):
+                    frame_sharding_kwargs = frame_sharding_raw.copy()
+                    mesh_dims = frame_sharding_kwargs.get("mesh_dims")
+                    if isinstance(mesh_dims, list):
+                        frame_sharding_kwargs["mesh_dims"] = tuple(mesh_dims)
+                    vision_kwargs["frame_sharding"] = CpVisionFrameShardingConfig(**frame_sharding_kwargs)
+                multimodal_kwargs["vision"] = MultimodalVisionConfig(**vision_kwargs)
+            strategy_kwargs["multimodal"] = MultimodalDistributedConfig(**multimodal_kwargs)
 
     ep_size: int = parallelism.get("ep_size") or 1
     if activation_checkpointing == "selective" and strategy_name not in {"fsdp2", "ddp"}:

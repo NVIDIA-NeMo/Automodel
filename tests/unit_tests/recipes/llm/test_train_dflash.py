@@ -27,6 +27,8 @@ import pytest
 import torch
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
+from nemo_automodel.components.checkpoint.config import CheckpointingConfig
+from nemo_automodel.components.checkpoint.lifecycle import CheckpointLifecycle
 from nemo_automodel.components.speculative.dflash.core import DFlashTrainerModule, NoValidAnchorsError
 from nemo_automodel.components.speculative.dflash.draft_qwen3 import Qwen3DFlashDraftModel
 from nemo_automodel.recipes.llm import train_dflash
@@ -124,12 +126,15 @@ def test_maybe_save_final_checkpoint(every, save_epoch, gs, should_fire):
         assert calls[0]["is_final_checkpoint"] is True
 
 
-def test_save_checkpoint_applies_retention_after_sync_save(tmp_path):
+def test_save_checkpoint_applies_retention_after_sync_save(tmp_path, monkeypatch):
     events = []
     obj = TrainDFlashRecipe.__new__(TrainDFlashRecipe)
     obj.checkpoint_config = SimpleNamespace(checkpoint_dir=str(tmp_path))
+    config = CheckpointingConfig(checkpoint_dir=str(tmp_path), save_consolidated=False)
+    lifecycle = CheckpointLifecycle(config=config)
     obj.checkpointer = SimpleNamespace(
-        config=SimpleNamespace(enabled=True, is_async=False),
+        config=config,
+        lifecycle=lifecycle,
         async_wait=lambda: events.append("wait"),
         save_model=lambda *args, **kwargs: events.append("save_model"),
         save_optimizer=lambda *args, **kwargs: events.append("save_optimizer"),
@@ -145,14 +150,16 @@ def test_save_checkpoint_applies_retention_after_sync_save(tmp_path):
     obj.block_size = 4
     obj.mask_token_id = 99
     obj.target_wrapper = SimpleNamespace(target_layer_ids=[0, 1])
-    obj._complete_pending_checkpoint = lambda: events.append("complete_pending")
-    obj._update_latest_symlink = lambda path: events.append(("latest", path))
-    obj._update_best_symlink = lambda path, val, metric_key=None: events.append(("best", path, val, metric_key))
-    obj._prune_old_checkpoints = lambda: events.append("prune")
+    monkeypatch.setattr(
+        lifecycle,
+        "_update_best_checkpoint",
+        lambda path, val, metric_key=None: events.append(("best", path, val, metric_key)),
+    )
+    monkeypatch.setattr(lifecycle, "_prune_old_checkpoints", lambda: events.append("prune"))
 
     TrainDFlashRecipe.save_checkpoint(obj, epoch=0, step=1, val_loss={"val_loss": 0.25})
 
-    assert events[0:2] == ["wait", "complete_pending"]
+    assert events[0] == "wait"
     assert any(event[0] == "best" and event[3] == "val_loss" for event in events if isinstance(event, tuple))
     assert "prune" in events
 
@@ -161,8 +168,12 @@ def test_save_checkpoint_records_async_best_pending_info_without_metric(tmp_path
     events = []
     obj = TrainDFlashRecipe.__new__(TrainDFlashRecipe)
     obj.checkpoint_config = SimpleNamespace(checkpoint_dir=str(tmp_path))
+    config = CheckpointingConfig(checkpoint_dir=str(tmp_path), save_consolidated=False)
+    config.is_async = True
+    lifecycle = CheckpointLifecycle(config=config)
     obj.checkpointer = SimpleNamespace(
-        config=SimpleNamespace(enabled=True, is_async=True),
+        config=config,
+        lifecycle=lifecycle,
         async_wait=lambda: events.append("wait"),
         save_model=lambda *args, **kwargs: events.append("save_model"),
         save_optimizer=lambda *args, **kwargs: events.append("save_optimizer"),
@@ -178,18 +189,16 @@ def test_save_checkpoint_records_async_best_pending_info_without_metric(tmp_path
     obj.block_size = 4
     obj.mask_token_id = 99
     obj.target_wrapper = SimpleNamespace(target_layer_ids=[0, 1])
-    obj._complete_pending_checkpoint = lambda: events.append("complete_pending")
 
     TrainDFlashRecipe.save_checkpoint(obj, epoch=0, step=1, best_metric_key="val_loss")
 
     expected_path = str(tmp_path / "epoch_0_step_1")
-    assert events[0:2] == ["wait", "complete_pending"]
-    assert obj._last_pending_checkpoint_dir == expected_path
-    assert obj._last_pending_best_checkpoint_info == {
-        "path": expected_path,
-        "val": None,
-        "metric_key": "val_loss",
-    }
+    assert events[0] == "wait"
+    assert lifecycle._pending_checkpoint_dir == expected_path
+    assert lifecycle._pending_best_checkpoint is not None
+    assert lifecycle._pending_best_checkpoint.path == expected_path
+    assert lifecycle._pending_best_checkpoint.value is None
+    assert lifecycle._pending_best_checkpoint.metric_key == "val_loss"
 
 
 def test_build_checkpointer_logs_retention_policy(tmp_path, monkeypatch, caplog):
@@ -203,9 +212,9 @@ def test_build_checkpointer_logs_retention_policy(tmp_path, monkeypatch, caplog)
     monkeypatch.setattr(train_dflash, "Checkpointer", FakeCheckpointer)
     obj = TrainDFlashRecipe.__new__(TrainDFlashRecipe)
     obj.cfg = SimpleNamespace(
-        get=lambda key, default=None: {"checkpoint_dir": str(tmp_path), "max_recent_checkpoints": 1}
-        if key == "checkpoint"
-        else default
+        get=lambda key, default=None: (
+            {"checkpoint_dir": str(tmp_path), "max_recent_checkpoints": 1} if key == "checkpoint" else default
+        )
     )
     obj.output_dir = tmp_path
     obj.draft_model = SimpleNamespace(state_dict=lambda: {"weight": torch.zeros(1)})
@@ -236,12 +245,11 @@ def test_run_train_validation_loop_finalizes_before_close():
     obj._make_progress_bar = lambda **kwargs: FakePbar()
     obj._run_eval = lambda: None
     obj._maybe_save_final_checkpoint = lambda completed_epochs: events.append(("final", completed_epochs)) or True
-    obj._finalize_pending_checkpoint = lambda: events.append("finalize")
-    obj.checkpointer = SimpleNamespace(close=lambda: events.append("close"))
+    obj.checkpointer = SimpleNamespace(finalize=lambda: events.append("finalize"))
 
     TrainDFlashRecipe.run_train_validation_loop(obj)
 
-    assert events == [("final", 1), "finalize", "close", "pbar_close"]
+    assert events == [("final", 1), "finalize", "pbar_close"]
 
 
 def test_resolve_mask_token_id_prefers_explicit():
@@ -417,6 +425,7 @@ def _load_extra_state_self(mask_token_id=7):
         runtime=SimpleNamespace(global_step=0),
         _resume_epoch=0,
         mask_token_id=mask_token_id,
+        checkpoint_config=SimpleNamespace(allow_legacy_pickle_restore=False),
     )
 
 
@@ -499,3 +508,41 @@ def test_build_trainer_module_loss_type_null_falls_back_to_default():
     recipe = _bare_dflash_recipe()
     module = recipe._build_trainer_module("sdpa", {"loss_type": None})
     assert module.loss_type == "dflash"
+
+
+def test_train_metric_sums_are_additive_not_per_micro_batch():
+    """``train/accept_len`` must be reported over the same window as ``train/loss``.
+
+    Returning ``metrics.accept_len`` (the per-micro-batch mean) reported a single
+    micro-batch out of ``log_every_steps * grad_accumulation_steps``, so the
+    curve was a far noisier sample than the loss curve drawn beside it.
+    """
+    recipe = _bare_dflash_recipe()
+    window = [
+        SimpleNamespace(accept_len_sum=torch.tensor(6.0), valid_blocks=torch.tensor(4.0)),
+        SimpleNamespace(accept_len_sum=torch.tensor(1.0), valid_blocks=torch.tensor(1.0)),
+    ]
+
+    totals = [0.0, 0.0]
+    for metrics in window:
+        numerator, denominator = recipe._extra_train_metric_sums(metrics)["train/accept_len"]
+        totals[0] += numerator
+        totals[1] += denominator
+
+    # Block-weighted over the window (7/5), not the last micro-batch's 1.0.
+    assert totals[0] / totals[1] == pytest.approx(7.0 / 5.0)
+    assert recipe._extra_train_metric_sums(window[-1])["train/accept_len"] == (
+        pytest.approx(1.0),
+        pytest.approx(1.0),
+    )
+
+
+def test_train_metric_sums_denominator_can_be_zero():
+    """A micro-batch with no evaluated blocks must not be averaged into the window.
+
+    The log point divides only when the accumulated denominator is positive, so a
+    zero here has to survive as a zero rather than raising or silently counting.
+    """
+    recipe = _bare_dflash_recipe()
+    metrics = SimpleNamespace(accept_len_sum=torch.tensor(0.0), valid_blocks=torch.tensor(0.0))
+    assert recipe._extra_train_metric_sums(metrics)["train/accept_len"] == (0.0, 0.0)

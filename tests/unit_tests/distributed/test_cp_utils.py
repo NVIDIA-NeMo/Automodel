@@ -538,6 +538,8 @@ def test_make_cp_batch_for_te_basic(monkeypatch):
         "position_ids": position_ids,
         "seq_lens": seq_lens,
         "seq_lens_padded": seq_lens_padded,
+        "pixel_values": torch.randn(1, 3, 8, 12),
+        "_global_vision_mask": input_ids == 7,
     }
 
     def mock_get_rank(group=None):
@@ -580,6 +582,40 @@ def test_make_cp_batch_for_te_basic(monkeypatch):
 
     # Verify cu_seqlens are properly formatted
     assert result["cu_seqlens"].dtype == torch.int32
+    assert result["pixel_values"] is batch["pixel_values"]
+    assert result["_global_vision_mask"] is batch["_global_vision_mask"]
+
+
+def test_make_cp_batch_for_te_multi_chunk(monkeypatch):
+    """The num_chunks > 1 path shards and stacks every pipeline chunk.
+
+    Covers the per-chunk shard call, which the single-chunk test does not reach.
+    """
+    cp_mesh = _DummySubMesh(size=2)
+
+    batch = {
+        "input_ids": torch.tensor([[1, 2, 3, 4], [5, 6, 7, 8]]),
+        "labels": torch.tensor([[10, 20, 30, 40], [50, 60, 70, 80]]),
+        "position_ids": torch.tensor([[0, 1, 2, 3], [0, 1, 2, 3]]),
+        "seq_lens": torch.tensor([[4], [4]]),
+        "seq_lens_padded": torch.tensor([[4], [4]]),
+    }
+
+    class MockTex:
+        @staticmethod
+        def thd_get_partitioned_indices(cu_seqlens_padded, total_tokens, cp_size, cp_rank):
+            return torch.arange(total_tokens)
+
+    import sys
+
+    sys.modules["transformer_engine_torch"] = MockTex
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: 0)
+
+    result = _cu.make_cp_batch_for_te(cp_mesh=cp_mesh, batch=batch, num_chunks=2)
+
+    assert result["qkv_format"] == "thd"
+    assert result["input_ids"].shape[0] == 2
+    assert result["padding_mask"].shape == result["input_ids"].shape
 
 
 def test_shard_thd_chunk_skips_missing_padding_mask(monkeypatch):
@@ -613,6 +649,7 @@ def test_shard_thd_chunk_skips_missing_padding_mask(monkeypatch):
 
     assert "input_ids" in result
     assert "attention_mask" not in result
+    assert "cu_seqlens_padded" not in result
     # the partition IS the local-token global index map (mock returns arange)
     assert torch.equal(local_indices, torch.arange(4))
 
@@ -746,6 +783,7 @@ def test_magi_state_is_derived_from_live_model():
 def test_sharder_constructor_derives_te_from_model_and_thd_from_batch(monkeypatch):
     """A TE model and THD batch resolve a sharder without recipe-owned flags."""
     seen = {}
+    local_indices = torch.tensor([1, 0])
 
     def fake_make_cp_batch_for_te(
         cp_mesh, batch, *, padding_token_id, qkv_format, num_chunks, seq_lens_padding_value, return_local_indices=False
@@ -753,7 +791,7 @@ def test_sharder_constructor_derives_te_from_model_and_thd_from_batch(monkeypatc
         seen.update(
             cp_mesh=cp_mesh, pad=padding_token_id, fmt=qkv_format, chunks=num_chunks, sent=seq_lens_padding_value
         )
-        return ({"thd": True}, None) if return_local_indices else {"thd": True}
+        return ({"thd": True}, local_indices) if return_local_indices else {"thd": True}
 
     monkeypatch.setattr(_cu, "make_cp_batch_for_te", fake_make_cp_batch_for_te)
 

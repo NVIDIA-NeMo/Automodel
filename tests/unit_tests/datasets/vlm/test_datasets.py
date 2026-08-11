@@ -13,7 +13,9 @@
 # limitations under the License.
 from __future__ import annotations
 
+import io
 import json
+from types import SimpleNamespace
 from typing import Dict, List
 
 import pytest
@@ -1438,6 +1440,111 @@ class TestPreloadMedia:
         with pytest.raises(FileNotFoundError):
             vlm_utils._preload_media(example)
 
+    # ---- pre-extracted frame sequence (video value is a list of image paths) ----
+
+    def _make_frame_paths(self, tmp_path, n):
+        """Create *n* tiny frame images on disk and return their paths."""
+        paths = []
+        for i in range(n):
+            frame = Image.new("RGB", (4, 4), color=(i, 0, 0))
+            path = tmp_path / f"frame_{i}.png"
+            frame.save(str(path))
+            paths.append(str(path))
+        return paths
+
+    def _make_frame_sequence_example(self, paths, **extra_item_fields):
+        """Build a conversation example whose video content is a frame path list."""
+        return {
+            "conversation": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "video", "video": paths, **extra_item_fields},
+                        {"type": "text", "text": "Describe."},
+                    ],
+                },
+            ],
+        }
+
+    def test_frame_sequence_loaded_and_padded(self, tmp_path):
+        """Odd frame count is padded to temporal_patch_size=2 by repeating the last frame."""
+        paths = self._make_frame_paths(tmp_path, 5)
+        example = self._make_frame_sequence_example(paths)
+
+        result = vlm_utils._preload_media(example)
+        loaded = result["conversation"][0]["content"][0]["video"]
+        assert isinstance(loaded, list)
+        # 5 frames -> padded to 6 (default temporal_patch_size=2)
+        assert len(loaded) == 6
+        assert all(isinstance(f, Image.Image) for f in loaded)
+        assert all(f.mode == "RGB" for f in loaded)
+        # Padding repeats the last frame
+        assert loaded[5] is loaded[4]
+
+    def test_frame_sequence_no_padding_when_aligned(self, tmp_path):
+        """Even frame count needs no padding."""
+        paths = self._make_frame_paths(tmp_path, 4)
+        example = self._make_frame_sequence_example(paths)
+
+        result = vlm_utils._preload_media(example)
+        loaded = result["conversation"][0]["content"][0]["video"]
+        assert len(loaded) == 4
+
+    def test_frame_sequence_respects_processor_temporal_patch_size(self, tmp_path):
+        """temporal_patch_size from the processor drives the padding amount."""
+        paths = self._make_frame_paths(tmp_path, 5)
+        example = self._make_frame_sequence_example(paths)
+        processor = SimpleNamespace(video_processor=SimpleNamespace(temporal_patch_size=4))
+
+        result = vlm_utils._preload_media(example, processor=processor)
+        loaded = result["conversation"][0]["content"][0]["video"]
+        # 5 frames -> padded to 8 (temporal_patch_size=4)
+        assert len(loaded) == 8
+        assert loaded[5] is loaded[4] and loaded[6] is loaded[4] and loaded[7] is loaded[4]
+
+    def test_frame_sequence_metadata_from_item_fps(self, tmp_path):
+        """preserve_video_metadata=True stores _video_fps from the item and padded _frame_indices."""
+        paths = self._make_frame_paths(tmp_path, 5)
+        example = self._make_frame_sequence_example(paths, fps=2.0)
+
+        result = vlm_utils._preload_media(example, preserve_video_metadata=True)
+        item = result["conversation"][0]["content"][0]
+        assert item["_video_fps"] == 2.0
+        # Indices padded by repeating the last index, mirroring the frames
+        assert item["_frame_indices"] == [0, 1, 2, 3, 4, 4]
+        assert len(item["video"]) == len(item["_frame_indices"])
+
+    def test_frame_sequence_metadata_fps_from_processor(self, tmp_path):
+        """fps falls back to the processor's video_processor when absent on the item."""
+        paths = self._make_frame_paths(tmp_path, 4)
+        example = self._make_frame_sequence_example(paths)
+        processor = SimpleNamespace(video_processor=SimpleNamespace(fps=1.0))
+
+        result = vlm_utils._preload_media(example, processor=processor, preserve_video_metadata=True)
+        item = result["conversation"][0]["content"][0]
+        assert item["_video_fps"] == 1.0
+        assert item["_frame_indices"] == [0, 1, 2, 3]
+
+    def test_frame_sequence_fps_missing_raises(self, tmp_path):
+        """ValueError when metadata is requested but fps cannot be resolved."""
+        paths = self._make_frame_paths(tmp_path, 4)
+        example = self._make_frame_sequence_example(paths)
+
+        with pytest.raises(ValueError, match="fps is required"):
+            vlm_utils._preload_media(example, preserve_video_metadata=True)
+
+    def test_frame_sequence_no_metadata_without_flag(self, tmp_path):
+        """Without preserve_video_metadata, no fps is needed and no metadata keys are set."""
+        paths = self._make_frame_paths(tmp_path, 3)
+        example = self._make_frame_sequence_example(paths)
+
+        result = vlm_utils._preload_media(example)
+        item = result["conversation"][0]["content"][0]
+        assert "_video_fps" not in item
+        assert "_frame_indices" not in item
+        # Frames still loaded and padded
+        assert len(item["video"]) == 4
+
 
 # ---------------------------------------------------------------------------
 # Tests for _read_video_frames
@@ -1901,3 +2008,87 @@ class TestPreTokenizedDatasetWrapperInjectFakeImages:
         )
 
         assert wrapper.inject_fake_images is False
+
+
+def _shopify_hf_dataset(n=3):
+    """A real in-memory HF dataset so ``with_transform`` is actually exercised."""
+    import datasets as hfds
+
+    images = []
+    for i in range(n):
+        buf = io.BytesIO()
+        Image.new("RGB", (8 + i, 8), (i, i, i)).save(buf, format="PNG")
+        images.append({"bytes": buf.getvalue(), "path": None})
+
+    return hfds.Dataset.from_dict(
+        {
+            "product_image": images,
+            "ground_truth_category": [f"Root > Mid > Leaf {i}" for i in range(n)],
+        }
+    ).cast_column("product_image", hfds.Image())
+
+
+def test_make_shopify_product_catalogue_dataset(monkeypatch):
+    """Rows are emitted in the Automodel conversation schema."""
+    monkeypatch.setattr(ds, "load_dataset", lambda *a, **k: _shopify_hf_dataset(3))
+
+    result = ds.make_shopify_product_catalogue_dataset()
+
+    assert len(result) == 3
+    conversation = result[1]["conversation"]
+    user_turn, assistant_turn = conversation
+
+    assert user_turn["role"] == "user"
+    assert user_turn["content"][1] == {
+        "type": "text",
+        "text": ds.SHOPIFY_PRODUCT_CATALOGUE_PROMPT,
+    }
+    assert assistant_turn["role"] == "assistant"
+    assert assistant_turn["content"] == [{"type": "text", "text": "Root > Mid > Leaf 1"}]
+
+
+def test_make_shopify_product_catalogue_dataset_images_stay_undecoded(monkeypatch):
+    """Images arrive as lazy PIL handles, not eagerly decoded rasters.
+
+    The train split is 38,631 product photos, so eager decoding would pin every
+    image in memory.
+    """
+    monkeypatch.setattr(ds, "load_dataset", lambda *a, **k: _shopify_hf_dataset(2))
+
+    result = ds.make_shopify_product_catalogue_dataset()
+    image = result[0]["conversation"][0]["content"][0]["image"]
+
+    assert isinstance(image, Image.Image)
+    # PIL populates .size from the header but defers the pixel decode; a pending
+    # decode shows up as a non-empty tile list, which load() then clears.
+    assert image.size == (8, 8)
+    assert image.tile
+    image.load()
+    assert not image.tile
+
+
+def test_make_shopify_product_catalogue_dataset_limit(monkeypatch):
+    """``limit_dataset_samples`` truncates, and never over-selects a short split."""
+    monkeypatch.setattr(ds, "load_dataset", lambda *a, **k: _shopify_hf_dataset(5))
+    assert len(ds.make_shopify_product_catalogue_dataset(limit_dataset_samples=2)) == 2
+
+    monkeypatch.setattr(ds, "load_dataset", lambda *a, **k: _shopify_hf_dataset(3))
+    assert len(ds.make_shopify_product_catalogue_dataset(limit_dataset_samples=99)) == 3
+
+
+def test_shopify_product_catalogue_dataset_config_build(monkeypatch):
+    """The config dataclass forwards its fields to the builder."""
+    captured = {}
+
+    def _fake_load_dataset(path_or_dataset, split=None, **kwargs):
+        captured["path_or_dataset"] = path_or_dataset
+        captured["split"] = split
+        return _shopify_hf_dataset(4)
+
+    monkeypatch.setattr(ds, "load_dataset", _fake_load_dataset)
+
+    cfg = ds.ShopifyProductCatalogueDatasetConfig(split="test", limit_dataset_samples=2)
+    dataset = cfg.build()
+
+    assert captured == {"path_or_dataset": "Shopify/product-catalogue", "split": "test"}
+    assert len(dataset) == 2

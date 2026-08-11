@@ -33,6 +33,7 @@ import os
 from pathlib import Path
 
 import pytest
+from transformers import AutoTokenizer
 
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel._transformers.tokenization.nemo_auto_tokenizer import (
@@ -98,13 +99,12 @@ class TestSavePretrainedV4Compat:
                 )
 
     def test_no_runtime_overrides_leak_into_saved_config(self, nemotron_nano_path, original_config, tmp_path):
-        """The wrapper forces add_bos_token=True and add_eos_token=True at
-        runtime.  These must NOT appear in the saved config unless the original
-        already had them."""
+        """The wrapper preserves native BOS/EOS behavior and saved config fields."""
+        raw_tok = AutoTokenizer.from_pretrained(nemotron_nano_path)
         tok = NeMoAutoTokenizer.from_pretrained(nemotron_nano_path)
 
-        assert tok.add_bos_token is True, "Wrapper should force add_bos_token=True at runtime"
-        assert tok.add_eos_token is True, "Wrapper should force add_eos_token=True at runtime"
+        assert tok.add_bos_token == raw_tok.add_bos_token
+        assert tok.add_eos_token == raw_tok.add_eos_token
 
         tok.save_pretrained(str(tmp_path))
 

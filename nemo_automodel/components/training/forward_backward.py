@@ -49,6 +49,7 @@ def forward_backward_step(
     num_label_tokens: Optional[int] = None,
     mtp_cfg: Any = None,
     cu_seqlens: Optional[torch.Tensor] = None,
+    grad_reduce_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> tuple[Any, torch.Tensor]:
     """Forward the model and compute the (main + optional MTP) LM loss.
 
@@ -73,6 +74,11 @@ def forward_backward_step(
             MTP loss is added.
         cu_seqlens: THD packing boundaries forwarded to the MTP loss to mask
             cross-sequence label rolls (``None`` for unpacked batches).
+        grad_reduce_group: Process group whose ranks contribute independent
+            fused-loss shards (the flattened DP-CP group during training).
+            Forwarded to ``FusedLinearCrossEntropy.materialize_lm_weight`` so
+            LM-head gradients are reduced correctly; pass ``None`` when no
+            backward follows (e.g. validation).
 
     Returns:
         ``(out, local_loss)`` -- the raw model output and the summed (main + MTP)
@@ -90,10 +96,18 @@ def forward_backward_step(
     else:
         out = model(**batch)
 
-    # Gather the LM head once and share it across the main loss and every MTP
-    # depth (fused path) to avoid redundant full_tensor() gathers that accumulate
-    # on-device and OOM for long sequences.
-    shared_lm_weight = _get_lm_head_weight(model) if use_fused else None
+    # Materialize the LM head once and share it across the main loss and every
+    # MTP depth (fused path) to avoid redundant full_tensor() gathers that
+    # accumulate on-device and OOM for long sequences. The grad-reduce group
+    # only exists on the fused path, so it is threaded as an extra kwarg to
+    # keep non-fused loss callables free of it.
+    loss_distributed_kwargs: dict[str, Any] = {}
+    shared_lm_weight = None
+    if use_fused:
+        shared_lm_weight = loss_fn.materialize_lm_weight(
+            _get_lm_head_weight(model), grad_reduce_group=grad_reduce_group
+        )
+        loss_distributed_kwargs["grad_reduce_group"] = grad_reduce_group
     local_loss = calculate_loss(
         loss_fn,
         logits=getattr(out, "logits", out),
@@ -102,6 +116,7 @@ def forward_backward_step(
         hidden_states=get_final_hidden_states(out),
         lm_weight=shared_lm_weight,
         num_label_tokens=num_label_tokens,
+        **loss_distributed_kwargs,
     )
 
     # DSV4-style multi-token-prediction: triggered when the model emits per-depth
@@ -123,6 +138,7 @@ def forward_backward_step(
             # mask cross-boundary MTP label rolls in THD packing (no-op when None)
             cu_seqlens=cu_seqlens,
             lm_weight=shared_lm_weight,
+            **loss_distributed_kwargs,
         )
 
     return out, local_loss

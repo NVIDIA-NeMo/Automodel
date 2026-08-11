@@ -55,9 +55,8 @@ from nemo_automodel.components.distributed.config import DistributedSetup
 from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
 from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
-from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
-from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 from nemo_automodel.components.optim.precision_warnings import resolve_storage_dtype
+from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
 from nemo_automodel.components.training.rng import ScopedRNG
 from nemo_automodel.components.training.signal_handler import DistributedSignalHandler
 from nemo_automodel.components.training.utils import (
@@ -375,19 +374,13 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
 
             # Student forward.
             student_batch = filter_forward_kwargs(model, batch)
-            student_keep_last = isinstance(self.loss_fn, FusedLinearCrossEntropy)
-            if student_keep_last:
-                student_out = model(logits_to_keep=1, **student_batch)
-            else:
-                student_out = model(**student_batch)
+            student_out = model(**student_batch)
             del student_batch
 
             student_logits = getattr(student_out, "logits", student_out)
             if separate_teacher_logits is not None:
                 teacher_logits = self.kd_mesh_bridge.match_student_vocab_shard(student_logits, teacher_logits)
-            hidden_states = (
-                student_out.hidden_states[-1] if getattr(student_out, "hidden_states", None) is not None else None
-            )
+            hidden_states = get_final_hidden_states(student_out)
             del student_out
 
             # CE loss (skip when kd_ratio >= 1.0).
@@ -401,6 +394,7 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
                     model=model,
                     hidden_states=hidden_states,
                     num_label_tokens=num_label_tokens,
+                    grad_reduce_group=self._get_dp_group(include_cp=True) if is_train else None,
                 )
             del hidden_states
 
@@ -426,12 +420,8 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
         )
         num_label_tokens = self._dp_allreduce(num_label_tokens).item()
 
-        if self.pp_enabled:
-            MoEAuxLossAutoScaler.main_loss_backward_scale = torch.tensor(float(num_label_tokens))
-        else:
-            MoEAuxLossAutoScaler.main_loss_backward_scale = torch.tensor(
-                float(self._get_dp_group_size(include_cp=True))
-            )
+        num_batches = len(batches)
+        self._set_moe_aux_loss_backward_scale(num_batches=num_batches, num_label_tokens=num_label_tokens)
 
         loss_buffer: list[torch.Tensor] = []
 
@@ -441,7 +431,6 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
         )
         num_tokens_in_batch = self._dp_allreduce(num_tokens_in_batch).item()
 
-        num_batches = len(batches)
         prepare_for_grad_accumulation(self.model_parts, pp_enabled=self.pp_enabled)
 
         for i, batch in enumerate(batches):

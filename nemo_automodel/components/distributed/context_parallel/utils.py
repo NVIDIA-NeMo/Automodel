@@ -27,7 +27,10 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
     shard_batch_identity,
     shard_batch_load_balanced,
 )
-from nemo_automodel.components.distributed.thd_utils import split_batch_into_thd_chunks
+from nemo_automodel.components.distributed.thd_utils import (
+    split_batch_into_thd_chunks,
+    thd_padding_mask_from_token_ids,
+)
 
 
 @contextlib.contextmanager
@@ -755,7 +758,10 @@ def make_cp_batch_for_te(
         raise ValueError(f"Currently only 'thd' format is supported, got: {qkv_format}")
 
     batch = split_batch_into_thd_chunks(
-        batch, num_chunks=num_chunks, seq_lens_padding_value=seq_lens_padding_value, padding_token_id=padding_token_id
+        batch,
+        num_chunks=num_chunks,
+        seq_lens_padding_value=seq_lens_padding_value,
+        padding_token_id=padding_token_id,
     )
 
     if cp_mesh is None or cp_mesh.size() <= 1:
@@ -835,17 +841,35 @@ def _shard_thd_chunk_for_te(
         if key in batch:
             batch[key] = batch[key].index_select(0, local_indices)
 
+    # Keep model-owned payloads (for example VLM media) by default. Only remove
+    # source metadata that is invalid after the THD CP conversion; the update
+    # below replaces every transformed field with its authoritative local value.
+    output_batch = batch.copy()
+    output_batch.pop("attention_mask", None)
+    output_batch.pop("cu_seqlens_padded", None)
+
     max_seqlen = (filtered_cu_seqlens_padded[1:] - filtered_cu_seqlens_padded[:-1]).max().item()
-    output_batch = {
-        "input_ids": batch["input_ids"].to(torch.int64).contiguous(),
-        "labels": batch["labels"].to(torch.int64).contiguous(),
-        "position_ids": batch["position_ids"].to(torch.int64).contiguous(),
-        "cu_seqlens": cu_seqlens_padded.to(torch.int32).contiguous(),
-        "max_seqlen": torch.tensor(max_seqlen).to(torch.int32).to(device=cu_seqlens_padded.device),
-        "qkv_format": qkv_format,
-        "padding_mask": (batch["input_ids"] == padding_token_id).bool().contiguous(),
-        "cp_size": cp_size,
-        "cp_rank": cp_rank,
-    }
+    output_batch.update(
+        {
+            "input_ids": batch["input_ids"].to(torch.int64).contiguous(),
+            "labels": batch["labels"].to(torch.int64).contiguous(),
+            "position_ids": batch["position_ids"].to(torch.int64).contiguous(),
+            "cu_seqlens": cu_seqlens_padded.to(torch.int32).contiguous(),
+            "max_seqlen": torch.tensor(max_seqlen).to(torch.int32).to(device=cu_seqlens_padded.device),
+            "qkv_format": qkv_format,
+            "cp_size": cp_size,
+            "cp_rank": cp_rank,
+        }
+    )
+
+    # Already partitioned above with the same local_indices as input_ids. Only
+    # fall back to the token-value comparison when the caller supplied no mask;
+    # it rejects a pad id that is also content instead of silently masking it.
+    if "padding_mask" in batch:
+        output_batch["padding_mask"] = batch["padding_mask"].bool().contiguous()
+    else:
+        output_batch["padding_mask"] = thd_padding_mask_from_token_ids(
+            output_batch["input_ids"], padding_token_id
+        ).contiguous()
 
     return output_batch, local_indices

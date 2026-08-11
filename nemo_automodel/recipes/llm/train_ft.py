@@ -42,7 +42,11 @@ from huggingface_hub import constants as hf_constants
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from transformers import AutoConfig
 
-from nemo_automodel._transformers import NeMoAutoModelForCausalLM, NeMoAutoModelForSequenceClassification
+from nemo_automodel._transformers import (
+    NeMoAutoModelForCausalLM,
+    NeMoAutoModelForSeq2SeqLM,
+    NeMoAutoModelForSequenceClassification,
+)
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel._transformers.infrastructure import (
     apply_model_infrastructure,
@@ -51,6 +55,7 @@ from nemo_automodel._transformers.infrastructure import (
 from nemo_automodel._transformers.mfu import AutoMFU
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
+from nemo_automodel.components.cuda_graphs import PartialCudaGraphManager
 from nemo_automodel.components.datasets.loader import DataloaderConfig
 from nemo_automodel.components.distributed.config import DistributedSetup, FSDP2Config, MegatronFSDPConfig
 from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
@@ -68,7 +73,6 @@ from nemo_automodel.components.loggers.mlflow_utils import (
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
-from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
 from nemo_automodel.components.training.forward_backward import forward_backward_step
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
@@ -234,6 +238,8 @@ def build_model(
         is_nemo_auto_model = cfg_model.get("_target_", None) in (
             NeMoAutoModelForCausalLM.from_config,
             NeMoAutoModelForCausalLM.from_pretrained,
+            NeMoAutoModelForSeq2SeqLM.from_config,
+            NeMoAutoModelForSeq2SeqLM.from_pretrained,
             NeMoAutoModelForSequenceClassification.from_config,
             NeMoAutoModelForSequenceClassification.from_pretrained,
         )
@@ -390,6 +396,36 @@ def _build_pp_collate_wrapper(cfg_model, pp_enabled: bool):
     return wrapper
 
 
+def _build_partial_cuda_graph_manager(
+    model_parts: list[nn.Module],
+    *,
+    activation_checkpointing: bool,
+    pipeline_parallel: bool,
+) -> PartialCudaGraphManager | None:
+    """Build partial CUDA-graph state only for explicitly enabled model backends.
+
+    Args:
+        model_parts: Fully initialized model roots or pipeline-local model parts.
+        activation_checkpointing: Whether PyTorch activation checkpointing is enabled.
+        pipeline_parallel: Whether pipeline parallelism is enabled.
+
+    Returns:
+        An armed manager when any backend selects CUDA-graph scopes, otherwise ``None``.
+    """
+    enabled = any(
+        model_part.backend.cuda_graph.modules
+        for model_part in model_parts
+        if getattr(model_part, "backend", None) is not None
+    )
+    if not enabled:
+        return None
+    return PartialCudaGraphManager.from_model_parts(
+        model_parts,
+        activation_checkpointing=activation_checkpointing,
+        pipeline_parallel=pipeline_parallel,
+    )
+
+
 # ---------------------------------------------------------------------------
 #  Trainer class – orchestration only
 # ---------------------------------------------------------------------------
@@ -415,6 +451,11 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 wrapper is idempotent.
         """
         self.cfg = cfg if isinstance(cfg, RecipeConfig) else RecipeConfig(cfg)
+        # Partial graphs are opt-in through model.backend. Discovery happens
+        # after checkpoint restore, and capture is deferred until one complete
+        # eager optimizer step has supplied representative runtime inputs.
+        self.partial_cuda_graph_manager = None
+        self._partial_cuda_graph_capture_pending = False
 
     # ------------------ build phase ------------------
     def _create_distributed_setup(self) -> DistributedSetup:
@@ -625,6 +666,11 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self.cfg.prewarm.apply(
                 model_parts=self.model_parts,
                 device=self.dist_env.device,
+                batch_size=(
+                    self.pp.pp_microbatch_size
+                    if self.pp is not None
+                    else self.cfg.get("step_scheduler.local_batch_size", 1)
+                ),
                 pp_mesh=(self.device_mesh["pp"] if self.pp_enabled and self.device_mesh is not None else None),
             )
 
@@ -654,7 +700,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         ):
             from nemo_automodel.components.models.common.packing import configure_packing, get_attn_implementation
 
-            attn_implementation = get_attn_implementation(self.cfg.model)
+            attn_implementation = get_attn_implementation(self.cfg.model, model=self.model_parts[0])
             configure_packing(attn_implementation=attn_implementation)
         collate_wrapper = _build_pp_collate_wrapper(self.cfg.model, self.pp_enabled)
 
@@ -756,6 +802,16 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         # Optionally resume
         self.load_checkpoint(restore_from)
+
+        # Match TorchTitan's pass gate: only construct CUDA-graph state when
+        # the model backend explicitly enables at least one graph scope.
+        self.partial_cuda_graph_manager = _build_partial_cuda_graph_manager(
+            self.model_parts,
+            activation_checkpointing=bool(self.activation_checkpointing),
+            pipeline_parallel=bool(self.pp_enabled),
+        )
+        if self.partial_cuda_graph_manager is not None:
+            self._partial_cuda_graph_capture_pending = True
         torch.cuda.empty_cache()
 
         # Log step scheduler details
@@ -826,7 +882,11 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         if isinstance(self.loss_fn, FusedLinearCrossEntropy):
             last_stage_model._pp_return_hidden_states = True
 
-        self.pp.info.schedule._loss_fn = self.cfg.mtp.build(self.loss_fn, last_stage_model)
+        self.pp.info.schedule._loss_fn = self.cfg.mtp.build(
+            self.loss_fn,
+            last_stage_model,
+            grad_reduce_group=self._get_dp_group(include_cp=True),
+        )
 
     def _setup_qat(self, cfg, model_parts: list[nn.Module]):
         if not cfg.get("qat.enabled", False):
@@ -892,6 +952,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     # If QAT delayed fake-quant is configured, enable after threshold
                     self._enable_qat_if_delayed(self.step_scheduler.step)
                     train_log_data = self._run_train_optim_step(batches, self.max_grad_norm)
+                    # Capture outside the microbatch loop and only after the
+                    # eager optimizer step has completed. This leaves no
+                    # pending checkpoint recomputation or GA backward work.
+                    if self.partial_cuda_graph_manager is not None and self._partial_cuda_graph_capture_pending:
+                        self.partial_cuda_graph_manager.capture()
+                        self._partial_cuda_graph_capture_pending = False
                     # Collect MoE load balance metrics (all ranks participate in all-reduce)
                     self._collect_moe_load_balance()
                     # log
@@ -931,6 +997,11 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # Mark the MLflow run KILLED if training exited via SIGTERM.
         if self.step_scheduler.sigterm_flag:
             end_mlflow_active_run_as_killed()
+
+        if self.partial_cuda_graph_manager is not None:
+            self.partial_cuda_graph_manager.close()
+            self.partial_cuda_graph_manager = None
+        self._partial_cuda_graph_capture_pending = False
 
     # ------------------ helpers ------------------
     def _forward_backward_step(
@@ -1024,6 +1095,13 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             )
             with train_ctx(), sync_ctx, fp8_ctx:
                 batch = filter_forward_kwargs(model, batch)
+                # The fused-CE LM-head grad reduces over the flattened DP-CP group
+                # during training; other losses (and validation) don't need it.
+                grad_reduce_group = (
+                    self._get_dp_group(include_cp=True)
+                    if is_train and isinstance(self.loss_fn, FusedLinearCrossEntropy)
+                    else None
+                )
                 out, local_loss = forward_backward_step(
                     model,
                     batch,
@@ -1032,6 +1110,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     num_label_tokens=num_label_tokens,
                     mtp_cfg=getattr(getattr(self, "cfg", None), "mtp", None),
                     cu_seqlens=batch.get("cu_seqlens"),
+                    grad_reduce_group=grad_reduce_group,
                 )
                 loss_buffer.append(local_loss.clone().detach())
                 if is_train:
@@ -1057,25 +1136,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         )
         num_label_tokens = self._dp_allreduce(num_label_tokens).item()
 
-        # MoE aux loss gradients are injected via MoEAuxLossAutoScaler, which
-        # multiplies them by main_loss_backward_scale during backward.  This
-        # counteracts the unwanted scaling that FSDP and PP post-hoc rescaling
-        # apply to *all* gradients (including aux loss):
-        #
-        #   Non-PP: FSDP allreduce divides grads by dp_group_size.
-        #           Scale = dp_group_size  →  net = 1.
-        #
-        #   PP:     FSDP divides by dp_group_size, then
-        #           scale_grads_and_clip_grad_norm divides by
-        #           (num_label_tokens / dp_group_size).  The dp_group_size
-        #           factors cancel, leaving net 1/num_label_tokens.
-        #           Scale = num_label_tokens  →  net = 1.
-        if self.pp_enabled:
-            MoEAuxLossAutoScaler.main_loss_backward_scale = torch.tensor(float(num_label_tokens))
-        else:
-            MoEAuxLossAutoScaler.main_loss_backward_scale = torch.tensor(
-                float(self._get_dp_group_size(include_cp=True))
-            )
+        num_batches = len(batches)
+        self._set_moe_aux_loss_backward_scale(num_batches=num_batches, num_label_tokens=num_label_tokens)
 
         loss_buffer = []
 
@@ -1086,7 +1148,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         )
         num_tokens_in_batch = self._dp_allreduce(num_tokens_in_batch).item()
 
-        num_batches = len(batches)
         prepare_for_grad_accumulation(self.model_parts, pp_enabled=self.pp_enabled)
 
         for i, batch in enumerate(batches):
