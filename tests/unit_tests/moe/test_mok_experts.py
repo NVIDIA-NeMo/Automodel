@@ -335,7 +335,7 @@ def test_mok_without_padding_mask_aligns_dispatch_extent(monkeypatch: pytest.Mon
     torch.testing.assert_close(x.grad, torch.ones_like(x.grad))
 
 
-def test_mok_unpacked_compacts_padding_and_restores_token_layout(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_mok_unpacked_dispatches_padding_as_physical_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
     config = _valid_moe_config()
     monkeypatch.setattr("nemo_automodel.components.moe.layers.get_world_size_safe", lambda: 4)
     moe = MoE(config, BackendConfig(dispatcher="mok", linear="torch"))
@@ -347,7 +347,10 @@ def test_mok_unpacked_compacts_padding_and_restores_token_layout(monkeypatch: py
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         captured["gate_x"] = x
         captured["gate_token_mask"] = token_mask
-        return original_gate_forward(x, token_mask, cp_mesh)
+        weights, indices, aux_loss = original_gate_forward(x, token_mask, cp_mesh)
+        captured["gate_weights"] = weights
+        captured["gate_indices"] = indices
+        return weights, indices, aux_loss
 
     def fake_experts(
         x: torch.Tensor,
@@ -372,21 +375,17 @@ def test_mok_unpacked_compacts_padding_and_restores_token_layout(monkeypatch: py
     torch.testing.assert_close(captured["gate_x"], x.detach().view(-1, 256))
     torch.testing.assert_close(captured["gate_token_mask"], ~padding_mask.flatten())
     assert captured["x"].shape == (512, 256)
-    torch.testing.assert_close(captured["x"][:2], x.detach().view(-1, 256)[[0, 2]])
-    torch.testing.assert_close(captured["x"][2:], torch.zeros_like(captured["x"][2:]))
-    torch.testing.assert_close(captured["weights"][2:], torch.zeros_like(captured["weights"][2:]))
-    dummy_load = torch.bincount(captured["indices"][2:].flatten(), minlength=config.n_routed_experts)
+    torch.testing.assert_close(captured["x"][:4], x.detach().view(-1, 256))
+    torch.testing.assert_close(captured["x"][4:], torch.zeros_like(captured["x"][4:]))
+    torch.testing.assert_close(captured["weights"][:4], captured["gate_weights"])
+    torch.testing.assert_close(captured["weights"][4:], torch.zeros_like(captured["weights"][4:]))
+    torch.testing.assert_close(captured["indices"][:4], captured["gate_indices"])
+    dummy_load = torch.bincount(captured["indices"][4:].flatten(), minlength=config.n_routed_experts)
     torch.testing.assert_close(dummy_load, torch.full_like(dummy_load, dummy_load[0]))
-    torch.testing.assert_close(output[0, 0], x[0, 0] + 1)
-    torch.testing.assert_close(output[0, 2], x[0, 2] + 1)
-    torch.testing.assert_close(output[0, 1], torch.zeros_like(output[0, 1]))
-    torch.testing.assert_close(output[0, 3], torch.zeros_like(output[0, 3]))
+    torch.testing.assert_close(output, x + 1)
 
     output.sum().backward()
-    torch.testing.assert_close(x.grad[0, 0], torch.ones_like(x.grad[0, 0]))
-    torch.testing.assert_close(x.grad[0, 2], torch.ones_like(x.grad[0, 2]))
-    torch.testing.assert_close(x.grad[0, 1], torch.zeros_like(x.grad[0, 1]))
-    torch.testing.assert_close(x.grad[0, 3], torch.zeros_like(x.grad[0, 3]))
+    torch.testing.assert_close(x.grad, torch.ones_like(x.grad))
 
 
 def test_mok_packed_thd_dispatches_padding_as_physical_tokens(monkeypatch: pytest.MonkeyPatch) -> None:

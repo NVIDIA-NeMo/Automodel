@@ -850,7 +850,6 @@ class MoE(nn.Module):
 
         # Reshape the inputs to 2-D since we are just distributing tokens.
         shape = x.size()
-        is_packed_thd = x.dim() == 2
         x = x.view(-1, self.dim)
         if padding_mask is not None:
             token_mask = (~padding_mask).flatten()
@@ -864,81 +863,35 @@ class MoE(nn.Module):
             x_latent = x
 
         if isinstance(self.experts, GroupedExpertsMoK):
-            if not isinstance(self.shared_experts, MLP):
-                raise RuntimeError("dispatcher='mok' requires exactly one shared MLP expert")
-            if self.shared_experts.gate_proj is None:
-                raise RuntimeError("dispatcher='mok' requires a gated shared SwiGLU expert")
-
             # MoK's fused schedule requires the same number of dense token rows
             # on every EP rank, with at least 512 rows aligned to 256. Run the
             # gate on the original dense extent so close group-top-k decisions
             # match the reference dispatcher. The token mask keeps semantic
-            # padding out of router load statistics and auxiliary losses.
-            if padding_mask is not None:
-                weights, indices, aux_loss = self.gate(x, token_mask, cp_mesh)
-                if is_packed_thd:
-                    # THD attention isolates padding rows and the loss mask gives
-                    # them zero gradient. Dispatch the physical rows directly,
-                    # like context-parallel padding, rather than launching eager
-                    # masking and dummy-route kernels in every MoE layer.
-                    expert_x = x_latent
-                else:
-                    # Unpacked batches can contain one padding tail per batch row,
-                    # which becomes non-contiguous after flattening. Preserve the
-                    # general gather/scatter path for that layout.
-                    num_dispatch_tokens = max(512, ((x.size(0) + 255) // 256) * 256)
-                    valid_positions = token_mask.nonzero(as_tuple=False).flatten()
-                    expert_x = x_latent.index_select(0, valid_positions)
-                    weights = weights.index_select(0, valid_positions)
-                    indices = indices.index_select(0, valid_positions)
-                    num_valid_tokens = valid_positions.numel()
-                    num_dummy_tokens = num_dispatch_tokens - num_valid_tokens
-                    if num_dummy_tokens:
-                        expert_x = torch.cat(
-                            (expert_x, expert_x.new_zeros((num_dummy_tokens, expert_x.size(1)))), dim=0
-                        )
-                        weights = torch.cat((weights, weights.new_zeros((num_dummy_tokens, weights.size(1)))), dim=0)
-                        dummy_indices = torch.arange(
-                            num_dummy_tokens * indices.size(1), device=indices.device, dtype=indices.dtype
-                        ).view(num_dummy_tokens, indices.size(1))
-                        dummy_indices = dummy_indices.remainder(self.n_routed_experts)
-                        indices = torch.cat((indices, dummy_indices), dim=0)
-                dispatch_y = self.experts(
-                    expert_x,
-                    weights,
-                    indices,
-                    self.shared_experts.gate_proj.weight,
-                    self.shared_experts.up_proj.weight,
-                    self.shared_experts.down_proj.weight,
-                )
-                if is_packed_thd:
-                    y = dispatch_y[: x.size(0)]
-                else:
-                    valid_y = dispatch_y[:num_valid_tokens]
-                    y = x.new_zeros((x.size(0), self.dim)).index_copy(0, valid_positions, valid_y)
+            # padding out of router load statistics and auxiliary losses. Keep
+            # all physical rows in the fused token-wise experts; attention and
+            # loss masks prevent semantic padding from affecting valid tokens.
+            weights, indices, aux_loss = self.gate(x, token_mask, cp_mesh)
+            num_dispatch_tokens = max(512, ((x.size(0) + 255) // 256) * 256)
+            num_dummy_tokens = num_dispatch_tokens - x.size(0)
+            if num_dummy_tokens:
+                expert_x = F.pad(x_latent, (0, 0, 0, num_dummy_tokens))
+                weights = F.pad(weights, (0, 0, 0, num_dummy_tokens))
+                dummy_indices = torch.arange(
+                    num_dummy_tokens * indices.size(1), device=indices.device, dtype=indices.dtype
+                ).view(num_dummy_tokens, indices.size(1))
+                dummy_indices = dummy_indices.remainder(self.n_routed_experts)
+                indices = torch.cat((indices, dummy_indices), dim=0)
             else:
-                weights, indices, aux_loss = self.gate(x, token_mask, cp_mesh)
-                num_dispatch_tokens = max(512, ((x.size(0) + 255) // 256) * 256)
-                num_dummy_tokens = num_dispatch_tokens - x.size(0)
-                if num_dummy_tokens:
-                    expert_x = F.pad(x_latent, (0, 0, 0, num_dummy_tokens))
-                    weights = F.pad(weights, (0, 0, 0, num_dummy_tokens))
-                    dummy_indices = torch.arange(
-                        num_dummy_tokens * indices.size(1), device=indices.device, dtype=indices.dtype
-                    ).view(num_dummy_tokens, indices.size(1))
-                    dummy_indices = dummy_indices.remainder(self.n_routed_experts)
-                    indices = torch.cat((indices, dummy_indices), dim=0)
-                else:
-                    expert_x = x_latent
-                dispatch_y = self.experts(
-                    expert_x,
-                    weights,
-                    indices,
-                    self.shared_experts.gate_proj.weight,
-                    self.shared_experts.up_proj.weight,
-                    self.shared_experts.down_proj.weight,
-                )
-                y = dispatch_y[: x.size(0)]
+                expert_x = x_latent
+            dispatch_y = self.experts(
+                expert_x,
+                weights,
+                indices,
+                self.shared_experts.gate_proj.weight,
+                self.shared_experts.up_proj.weight,
+                self.shared_experts.down_proj.weight,
+            )
+            y = dispatch_y[: x.size(0)]
             z = None
         else:
             weights, indices, aux_loss = self.gate(x, token_mask, cp_mesh)
