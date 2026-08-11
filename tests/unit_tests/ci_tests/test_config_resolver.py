@@ -301,6 +301,21 @@ def test_end_to_end_robustness_peft_disables_triton(tmp_path):
     assert resolved["peft"]["use_triton"] is False
 
 
+def test_nemotron_flash_peft_robustness_keeps_supported_tp_topology(tmp_path):
+    """Flash checkpoint reload must not opt into unsupported TP and numerical resume drift."""
+    recipe_path = REPO_ROOT / "examples/llm_finetune/nemotron_flash/nemotron_flash_1b_squad_peft.yaml"
+    out = tmp_path / "resolved.yaml"
+    env = {"PIPELINE_DIR": str(tmp_path), "TEST_NAME": recipe_path.stem}
+    _run_resolver(
+        ["--base", str(recipe_path), "--phase", "checkpoint_robustness", "--output", str(out)],
+        env=env,
+    )
+
+    resolved = yaml.load(out.open())
+    assert resolved["distributed"]["tp_size"] == 1
+    assert "resume_first_loss_threshold" not in resolved["ci"]["checkpoint_robustness"]
+
+
 def test_end_to_end_fixture_keys_not_applied_as_overrides(tmp_path):
     """Non-config fixture-arg keys in ci.checkpoint_robustness must not leak into the top-level config."""
     recipe = tmp_path / "llama_squad.yaml"
