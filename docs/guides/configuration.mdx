@@ -22,7 +22,7 @@ A `ConfigNode` handles values as follows:
 
 ### Typed Scalar Translation (`translate_value`)
 
-Only **strings** are translated:
+Only **strings** are translated by `translate_value()`:
 
 - `"123"` → `123`
 - `"3.14"` → `3.14`
@@ -113,7 +113,7 @@ For diagnosis, safety behavior, verification steps, and performance impact, see 
 
 ### Frozen Multimodal FSDP Policy
 
-FSDP2 uses the correctness-first `root` policy for fully frozen vision/audio towers and multimodal projectors.
+FSDP2 uses the correctness-first `root` policy for fully frozen vision and audio towers and multimodal projectors:
 
 ```yaml
 distributed:
@@ -153,7 +153,7 @@ NeMo AutoModel supports env var interpolation inside YAML **string values**.
 - If a referenced env var is **missing** and **no default** is provided, config loading raises a `KeyError`.
 - Defaults are supported only for braced forms using the first comma: `${VAR,default_value}`.
 
-### Example (Databricks Delta)
+### Example for Databricks Delta
 
 The following configuration shows an example of environment variable interpolation for a Databricks Delta dataset.
 
@@ -191,3 +191,23 @@ sbatch my_cluster.sub
 ```
 
 All cluster-specific configuration, including SBATCH directives, the container image, mounts, secrets, and environment variables, resides in your `sbatch` script. See [Run on a Cluster](/job-launchers/slurm-cluster) for complete examples.
+
+## Model Attention and Hub Kernels
+
+`model:` entries passed to `NeMoAutoModel*.from_pretrained` or `from_config` accept:
+
+```yaml
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: Qwen/Qwen2.5-7B
+  attn_implementation: kernels-community/flash-attn2  # Hub flash attention
+  use_kernels: true                                   # optional Hub layer kernels
+  use_liger_kernel: false                             # auto-disabled when use_kernels is true
+```
+
+`attn_implementation` and `use_kernels` are independent. A Hub repo id selects
+attention only. `use_kernels` replaces norms, MLP, and linear layers through Transformers
+`kernelize`. Non-`kernels-community` attention repos also need
+`allow_all_kernels: true`. Install with `uv sync --extra hub_kernels`. Full
+details: [Hub Kernels](/development/hub-kernels).
+
