@@ -349,18 +349,20 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
 
         profiler = None
         if os.environ.get("AUTOMODEL_TORCH_PROFILER") == "1":
-            profiler = torch.profiler.profile(
-                activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
-                schedule=torch.profiler.schedule(wait=warmup_steps, warmup=1, active=3, repeat=1),
-                record_shapes=False,
-                profile_memory=False,
-                with_stack=False,
-            )
-            profiler.__enter__()
+            steps = min(steps, warmup_steps + 4)
             if rank == 0:
+                profiler = torch.profiler.profile(
+                    activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+                    schedule=torch.profiler.schedule(wait=warmup_steps, warmup=1, active=3, repeat=1),
+                    record_shapes=False,
+                    profile_memory=False,
+                    with_stack=False,
+                )
+                profiler.__enter__()
                 logger.info(
-                    "PyTorch profiler enabled on all ranks: wait=%d warmup=1 active=3",
+                    "PyTorch profiler enabled on rank 0: wait=%d warmup=1 active=3 steps=%d",
                     warmup_steps,
+                    steps,
                 )
 
         # Main benchmarking loop
