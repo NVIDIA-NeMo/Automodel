@@ -106,6 +106,7 @@ ci:
   nodes: 1
   env_vars:
     PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+    CHECKPOINT_ROBUSTNESS_VERIFY_SOURCE_EXPERTS: "1"
   checkpoint_robustness:
     check_source_load_parity: true
     # HF+PEFT reload remains gated by exact adapter fingerprints and a successful

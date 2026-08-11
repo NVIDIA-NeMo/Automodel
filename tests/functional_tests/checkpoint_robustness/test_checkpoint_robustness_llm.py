@@ -1305,6 +1305,65 @@ def _get_logits(model, input_ids, device, trainer=None) -> torch.Tensor:
         return logits.float().cpu()
 
 
+def _report_qwen_source_expert_weight_parity(model, cfg) -> None:
+    """Compare one rank-0 grouped expert directly with its cached HF tensors."""
+    if os.environ.get("CHECKPOINT_ROBUSTNESS_VERIFY_SOURCE_EXPERTS", "0") != "1" or not _rank0():
+        return
+    unwrapped = getattr(model, "module", model)
+    if getattr(getattr(unwrapped, "config", None), "model_type", None) != "qwen3_moe":
+        return
+
+    from huggingface_hub import try_to_load_from_cache
+    from safetensors import safe_open
+
+    named_parameters = dict(unwrapped.named_parameters())
+    gate_up_name = next(name for name in named_parameters if name.endswith("layers.0.mlp.experts.gate_and_up_projs"))
+    down_name = next(name for name in named_parameters if name.endswith("layers.0.mlp.experts.down_projs"))
+    gate_up = named_parameters[gate_up_name].detach()
+    down = named_parameters[down_name].detach()
+    if isinstance(gate_up, DTensor):
+        gate_up = gate_up.to_local()
+    if isinstance(down, DTensor):
+        down = down.to_local()
+
+    model_path = str(cfg.model.pretrained_model_name_or_path)
+    revision = cfg.model.get("revision", None)
+    index_path = try_to_load_from_cache(model_path, "model.safetensors.index.json", revision=revision or "main")
+    assert isinstance(index_path, str), f"No cached safetensors index for {model_path}"
+    weight_map = json.loads(Path(index_path).read_text())["weight_map"]
+    hf_keys = {
+        "gate": "model.layers.0.mlp.experts.0.gate_proj.weight",
+        "up": "model.layers.0.mlp.experts.0.up_proj.weight",
+        "down": "model.layers.0.mlp.experts.0.down_proj.weight",
+    }
+    references = {}
+    for label, key in hf_keys.items():
+        shard_path = try_to_load_from_cache(model_path, weight_map[key], revision=revision or "main")
+        assert isinstance(shard_path, str), f"No cached safetensors shard for {key}"
+        with safe_open(shard_path, framework="pt") as shard:
+            references[label] = shard.get_tensor(key)
+
+    inter_dim = references["gate"].shape[0]
+    candidates = {
+        "gate": gate_up[0, :, :inter_dim].transpose(0, 1).cpu(),
+        "up": gate_up[0, :, inter_dim:].transpose(0, 1).cpu(),
+        "down": down[0].transpose(0, 1).cpu(),
+    }
+    for label in ("gate", "up", "down"):
+        reference = references[label]
+        candidate = candidates[label]
+        difference = candidate.float() - reference.float()
+        print(
+            "[Phase 0] Source expert weight parity: "
+            f"projection={label} exact={torch.equal(candidate, reference)} "
+            f"max_abs={difference.abs().max().item():.6e} "
+            f"mean_abs={difference.abs().mean().item():.6e} "
+            f"candidate_sha256={_tensor_digest(candidate)['sha256']} "
+            f"reference_sha256={_tensor_digest(reference)['sha256']}",
+            flush=True,
+        )
+
+
 def _reinit_rotary_per_module(model, default_device):
     """Recompute DeciLM / Gemma3 style non-persistent rotary buffers on each
     module's own device.
@@ -1850,6 +1909,7 @@ def _run_process_isolated_checkpoint_phase(
 
         source_trainer = recipe_cls(cfg)
         source_trainer.setup()
+        _report_qwen_source_expert_weight_parity(source_trainer.model_parts[0], cfg)
         _report_phase("Isolated Phase 0b source parity: trainer setup complete; starting parity forward")
         if tokenizer_name is not None and dist.is_initialized() and dist.get_world_size() > 1:
             _barrier()
