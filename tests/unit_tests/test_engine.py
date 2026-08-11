@@ -21,8 +21,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from nemo_automodel.components.datasets.datum import Datum
-from nemo_automodel.components.training.model_output import ModelOutput
 from nemo_automodel.components.training.engine import Engine
+from nemo_automodel.components.training.model_output import ModelOutput
 
 
 class ToyLM(nn.Module):
@@ -289,3 +289,103 @@ def test_export_weights_yields_named_tensors():
     weights = dict(engine.export_weights())
     assert "head.weight" in weights and "embed.weight" in weights
     assert isinstance(weights["head.weight"], torch.Tensor)
+
+
+# ── MoE aux-loss scale + DP grad compensation ────────────────────────────────
+
+
+class _FakeCpMesh:
+    """Minimal device-mesh stand-in exposing a ``cp`` dim of the given size."""
+
+    def __init__(self, cp_size):
+        self._cp = SimpleNamespace(size=lambda: cp_size)
+
+    def __getitem__(self, name):
+        assert name == "cp"
+        return self._cp
+
+
+def test_set_moe_scale_noop_without_moe_mesh(monkeypatch):
+    from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
+
+    sentinel = torch.tensor(-1.0)
+    monkeypatch.setattr(MoEAuxLossAutoScaler, "main_loss_backward_scale", sentinel)
+    engine, _ = _engine()
+    assert engine.moe_mesh is None
+    engine._set_moe_scale(4)
+    assert MoEAuxLossAutoScaler.main_loss_backward_scale is sentinel
+
+
+def test_set_moe_scale_averages_microbatches_and_restores_cp(monkeypatch):
+    from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
+
+    monkeypatch.setattr(MoEAuxLossAutoScaler, "main_loss_backward_scale", torch.tensor(-1.0))
+    engine, _ = _engine()
+    engine.moe_mesh = object()
+
+    engine._set_moe_scale(4)  # no device mesh -> cp=1
+    assert float(MoEAuxLossAutoScaler.main_loss_backward_scale) == pytest.approx(0.25)
+
+    engine.device_mesh = _FakeCpMesh(2)
+    engine._set_moe_scale(4)
+    assert float(MoEAuxLossAutoScaler.main_loss_backward_scale) == pytest.approx(0.5)
+
+
+def test_forward_backward_sets_moe_scale_in_every_door(monkeypatch):
+    from nemo_automodel.components.datasets.datum import PackedBatch
+    from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
+
+    engine, _ = _engine()
+    engine.moe_mesh = object()
+
+    # dict door: 2 microbatches -> cp(1)/2
+    monkeypatch.setattr(MoEAuxLossAutoScaler, "main_loss_backward_scale", torch.tensor(-1.0))
+    mbs = [{"input_ids": torch.randint(0, 16, (2, 4)), "labels": torch.randint(0, 16, (2, 4))} for _ in range(2)]
+    engine.forward_backward(mbs, loss_fn=toy_loss)
+    assert float(MoEAuxLossAutoScaler.main_loss_backward_scale) == pytest.approx(0.5)
+
+    # Datum door: 2 microbatch datum lists -> cp(1)/2
+    monkeypatch.setattr(MoEAuxLossAutoScaler, "main_loss_backward_scale", torch.tensor(-1.0))
+    engine.forward_backward([_datums(), _datums()])
+    assert float(MoEAuxLossAutoScaler.main_loss_backward_scale) == pytest.approx(0.5)
+
+    # packed door: 2 PackedBatch microbatches -> cp(1)/2
+    monkeypatch.setattr(MoEAuxLossAutoScaler, "main_loss_backward_scale", torch.tensor(-1.0))
+    flat = torch.randint(0, 16, (8,))
+    packs = [
+        PackedBatch(
+            model_inputs={"input_ids": flat.unsqueeze(0)},
+            seq_lens=[5, 3],
+            targets=torch.roll(flat, -1),
+        )
+        for _ in range(2)
+    ]
+    engine.forward_backward(packs, loss_fn=lambda mo: torch.stack([lp.sum() for lp in mo.logprobs]).sum())
+    assert float(MoEAuxLossAutoScaler.main_loss_backward_scale) == pytest.approx(0.5)
+
+
+def test_datum_backward_cancels_fsdp_grad_average(monkeypatch):
+    grads = {}
+    for dp in (1, 4):
+        monkeypatch.setattr(Engine, "dp_size", property(lambda self, _dp=dp: _dp))
+        engine, model = _engine()
+        torch.manual_seed(1)
+        engine.forward_backward([_datums()])
+        grads[dp] = model.head.weight.grad.clone()
+    assert torch.allclose(grads[4], 4 * grads[1])
+
+
+def test_dict_backward_scales_only_globally_normalized_losses(monkeypatch):
+    grads = {}
+    for dp, num_label_tokens in ((1, 16), (4, 16), (4, None)):
+        monkeypatch.setattr(Engine, "dp_size", property(lambda self, _dp=dp: _dp))
+        engine, model = _engine()
+        torch.manual_seed(1)
+        batch = {"input_ids": torch.randint(0, 16, (2, 4)), "labels": torch.randint(0, 16, (2, 4))}
+        engine.forward_backward(batch, loss_fn=toy_loss, num_label_tokens=num_label_tokens)
+        grads[(dp, num_label_tokens)] = model.head.weight.grad.clone()
+    # Global-token normalization: grads are DP-size-invariant only with the x dp_size
+    # compensation, so the pre-average grad must be 4x.
+    assert torch.allclose(grads[(4, 16)], 4 * grads[(1, 16)])
+    # Locally normalized loss (no global count): FSDP's average is already correct.
+    assert torch.allclose(grads[(4, None)], grads[(1, 16)])

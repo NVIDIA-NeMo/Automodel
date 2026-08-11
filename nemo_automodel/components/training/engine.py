@@ -427,7 +427,7 @@ class Engine:
 
         if is_train:
             prepare_for_grad_accumulation(self.model_parts, pp_enabled=False)
-            self._set_moe_scale(num_label_tokens)
+            self._set_moe_scale(n)
 
         losses: list[torch.Tensor] = []
         for i, mb in enumerate(microbatches):
@@ -459,7 +459,13 @@ class Engine:
                         num_label_tokens=num_label_tokens,
                     )
                 if is_train:
-                    local_loss.backward()
+                    # A loss normalized by the global token count needs FSDP's grad
+                    # average over the flattened DP-CP group cancelled so grads stay
+                    # DP/CP-size-invariant (recipe non-PP convention). Locally
+                    # normalized losses (model-own, or no global count) already
+                    # average correctly under FSDP.
+                    backward_scale = self.dp_size if loss_fn is not None and num_label_tokens is not None else 1
+                    (local_loss * backward_scale).backward()
             losses.append(local_loss.detach())
 
             if is_train and i == 0:
@@ -605,7 +611,7 @@ class Engine:
 
         if is_train:
             prepare_for_grad_accumulation(self.model_parts, pp_enabled=False)
-            self._set_moe_scale(int(token_denom))
+            self._set_moe_scale(n)
 
         agg_logprobs: list[torch.Tensor] = []
         agg_entropy: list[torch.Tensor] = []
@@ -626,7 +632,11 @@ class Engine:
                 per_datum_losses = loss_fn(mo, mb, **loss_kwargs)
                 loss = self._reduce_datum_losses(per_datum_losses, mb, token_denom, sample_denom)
                 if is_train:
-                    loss.backward()
+                    # The loss is normalized by the global (all-reduced) denominator,
+                    # so summing grads across ranks — not FSDP's average — yields the
+                    # exact global mean. Cancel the average over the flattened DP-CP
+                    # group (recipe non-PP convention).
+                    (loss * self.dp_size).backward()
             loss_sum = loss_sum + loss.detach()
             agg_logprobs.extend(t.detach() for t in (mo.logprobs or []))
             agg_entropy.extend(t.detach() for t in (mo.entropy or []))
@@ -712,6 +722,7 @@ class Engine:
         n = len(packs)
         if is_train:
             prepare_for_grad_accumulation(self.model_parts, pp_enabled=False)
+            self._set_moe_scale(n)
 
         agg_logprobs: list[torch.Tensor] = []
         agg_entropy: list[torch.Tensor] = []
@@ -978,13 +989,23 @@ class Engine:
 
     # ── Helpers ──────────────────────────────────────────────────────
 
-    def _set_moe_scale(self, num_label_tokens: int | None) -> None:
-        """Set the MoE aux-loss backward scale to cancel DP/PP grad scaling."""
+    def _cp_size(self) -> int:
+        if not self.device_mesh or self.device_mesh["cp"].size() == 1:
+            return 1
+        return self.device_mesh["cp"].size()
+
+    def _set_moe_scale(self, num_microbatches: int) -> None:
+        """Set the per-microbatch MoE auxiliary-loss scale for one optimizer step.
+
+        Non-PP slice of ``BaseRecipe._set_moe_aux_loss_backward_scale``: average
+        the accumulation microbatches and restore the CP sum lost in the
+        flattened DP-CP gradient average.
+        """
         if self.moe_mesh is None:
             return
         from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 
-        scale = float(num_label_tokens) if num_label_tokens is not None else float(self.dp_size)
+        scale = self._cp_size() / max(num_microbatches, 1)
         MoEAuxLossAutoScaler.main_loss_backward_scale = torch.tensor(scale)
 
     @staticmethod
