@@ -911,6 +911,21 @@ def _extract_model_signature(cfg: dict) -> dict:
     peft_cfg = cfg.get("peft", None)
     sig["_has_peft"] = peft_cfg is not None and isinstance(peft_cfg, dict)
 
+    # Model expansion adds parameters the base architecture does not have, and which
+    # layers and projections it expands decides exactly which ones. Two runs that differ
+    # there have different model *and* optimizer state dicts, so neither checkpoint loads
+    # into the other -- the model signature above cannot see the difference, because the
+    # expanded model is built from the same architecture config.
+    expansion_cfg = cfg.get("expansion", None)
+    if not isinstance(expansion_cfg, dict):
+        expansion_cfg = {}
+    sig["_has_expansion"] = bool(expansion_cfg.get("enabled", False))
+    # Only the fields that decide which parameters exist. `merge_weight` and
+    # `zero_init_modules` change numerics or initial values, not the parameter set, so
+    # tuning them on resume stays compatible.
+    sig["_expansion_layers"] = expansion_cfg.get("layers", None) if sig["_has_expansion"] else None
+    sig["_expansion_target_modules"] = expansion_cfg.get("target_modules", None) if sig["_has_expansion"] else None
+
     return sig
 
 
