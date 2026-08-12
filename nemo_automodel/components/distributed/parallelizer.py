@@ -63,6 +63,7 @@ except (ImportError, ModuleNotFoundError):
 
 from nemo_automodel.components.distributed.activation_checkpointing import (
     SELECTIVE_AC_WRAPPER_FLAG,
+    apply_full_layer_checkpointing_to_layers,
     apply_selective_checkpointing_to_layers,
     apply_submodule_checkpointing,
     detect_kv_sharing_and_maybe_disable_cache,
@@ -410,10 +411,10 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
                     layer_groups,
                     ac_scopes,
                     enable_compile=enable_compile,
-                ):
-                    # Reentrant HF checkpointing reruns FSDP2 forward hooks during backward and can retrigger
-                    # explicit forward-prefetch chains, issuing duplicate parameter all-gathers.
-                    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+                ) and not _has_kv_sharing:
+                    # Work around a PyTorch FSDP2 bug that skips mixed-precision input casts during
+                    # checkpoint recomputation. Remove when the minimum PyTorch version is 2.13.
+                    apply_full_layer_checkpointing_to_layers(model, ac_layers)
                 else:
                     apply_submodule_checkpointing(ac_layers, _has_kv_sharing)
 
