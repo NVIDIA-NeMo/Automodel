@@ -320,7 +320,12 @@ def wrap_vlm_collate_for_pp(
 
 
 def _will_run_forward_metadata_inference(pp: Any) -> bool:
-    """Return whether the next schedule step will probe stage 0 with a real forward."""
+    """Return whether the next schedule step will probe stage 0 with a real forward.
+
+    Both the legacy ``_configure_outputs_meta`` API and the newer populated
+    ``_user_meta`` API provide analytical stage metadata, so neither needs a
+    forward probe. An unpopulated ``_user_meta`` still uses dynamic inference.
+    """
     schedule = getattr(pp.info, "schedule", None)
     stages = getattr(pp.info, "stages", None)
     if schedule is None or not stages:
@@ -328,6 +333,14 @@ def _will_run_forward_metadata_inference(pp: Any) -> bool:
 
     first_stage = next((stage for stage in stages if getattr(stage, "is_first", False)), None)
     if first_stage is None or hasattr(first_stage, "_configure_outputs_meta"):
+        return False
+
+    user_meta = getattr(first_stage, "_user_meta", None)
+    if (
+        user_meta is not None
+        and getattr(user_meta, "inputs", None) is not None
+        and getattr(user_meta, "outputs", None) is not None
+    ):
         return False
 
     if hasattr(schedule, "_stage_forward_initialized"):

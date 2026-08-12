@@ -585,3 +585,104 @@ class DFlashDecayLoss(nn.Module):
             draft_correct_per_pos=c_per_pos,
             draft_count_per_pos=n_per_pos,
         )
+
+
+class IDLMLoss(nn.Module):
+    """Introspective DLM all-masked loss (Yu et al., 2026; arXiv:2604.11035).
+
+    Operates on the concatenated ``[x_t (L) | x_0 (L)]`` forward output produced
+    under the block-diffusion attention mask, where ``x_t`` is the noisy (masked)
+    copy and ``x_0`` the clean copy. With a next-token "logit shift" (the hidden
+    state at position ``i`` predicts token ``i+1``) the objective combines two
+    cross-entropy terms, both supervised on the response (answer) tokens:
+
+    .. math::
+        L = \\text{CE}_\\text{noisy} + \\alpha \\cdot \\text{CE}_\\text{clean}
+
+    - ``CE_noisy`` — decode CE on the ``x_t`` half (distribution ``q``): each
+      masked token is conditioned on the clean ground-truth prefix.
+    - ``CE_clean`` — verify CE on the ``x_0`` half (distribution ``p``): the
+      clean copy of the response under strict causal attention.
+
+    With ``auto_balance=True`` the fixed weight is replaced by the detached
+    ratio ``CE_noisy / CE_clean`` each step so the two terms stay comparable in
+    magnitude (paper Eq. 2, used for the later stride expansions). Otherwise the
+    fixed ``clean_loss_weight`` is used (the paper's ``0.2`` for early training).
+
+    Args:
+        clean_loss_weight: Fixed ``alpha`` for the clean-copy CE.
+        auto_balance: Replace ``alpha`` with ``(CE_noisy / CE_clean).detach()``.
+    """
+
+    def __init__(self, clean_loss_weight: float = 0.2, auto_balance: bool = False):
+        super().__init__()
+        self.clean_loss_weight = float(clean_loss_weight)
+        self.auto_balance = bool(auto_balance)
+
+    def forward(
+        self,
+        logits: torch.Tensor,
+        target_ids: torch.Tensor,
+        answer_mask: torch.Tensor,
+        valid_mask: torch.Tensor,
+        *,
+        seq_len: int,
+        num_diffusion_tokens: Optional[int] = None,
+    ) -> DLLMLossOutput:
+        """Compute the I-DLM block-diffusion loss.
+
+        Args:
+            logits: Concatenated forward logits, shape ``[B, 2L, V]`` ordered
+                ``[x_t | x_0]``.
+            target_ids: Clean token IDs for one copy, shape ``[B, L]``.
+            answer_mask: Bool mask of supervised (response) positions, ``[B, L]``.
+            valid_mask: Bool/long padding-validity mask, shape ``[B, L]``.
+            seq_len: Length ``L`` of one copy.
+            num_diffusion_tokens: Global, DP-all-reduced supervised-token count
+                used as the loss denominator (summed across grad-accum
+                microbatches and data-parallel ranks). Pass this so the loss is a
+                proper global token-mean — required for the recipe's
+                ``(loss * dp_group_size).backward()`` scaling to give
+                DP/grad-accum-invariant gradients. Falls back to the local
+                supervised count when ``None`` (single-process use / unit tests).
+
+        Returns:
+            :class:`DLLMLossOutput` with the combined ``total_loss`` and
+            ``dllm_loss`` set to the decode term ``CE_noisy``.
+        """
+        noisy_logits = logits[:, :seq_len, :]
+        clean_logits = logits[:, seq_len : 2 * seq_len, :]
+
+        # Logit shift: logits[:, i] predicts target[:, i+1]. Both copies supervise
+        # the response tokens. _compute_per_token_nll materialises a vocab-sharded
+        # DTensor via full_tensor() if needed.
+        #
+        # Support note (deliberate, differs from the reference by one position):
+        # gating on ``answer_mask[:, 1:]`` supervises every position whose NEXT
+        # token is a response token, so the loss covers exactly the response
+        # tokens — including the FIRST one, predicted from the last prompt
+        # position. The official repo instead keeps only masked positions
+        # (``logits_to_keep``), which never includes that clean prompt position,
+        # so it skips the first response token and scores one position past the
+        # answer. Supervising it matters here: at inference the first generated
+        # token comes from exactly that hidden state, so leaving it untrained
+        # would rely on the base AR behaviour surviving finetuning.
+        shift_target = target_ids[:, 1:]
+        supervise = answer_mask[:, 1:].bool() & valid_mask[:, 1:].bool()
+        weight = supervise.to(torch.float32)
+        # Global token count keeps the denominator constant across ranks and
+        # microbatches; the ratio in auto_balance is denominator-independent.
+        if num_diffusion_tokens is not None:
+            denom = max(int(num_diffusion_tokens), 1)
+        else:
+            denom = supervise.sum().clamp_min(1)
+
+        ce_noisy = (_compute_per_token_nll(noisy_logits[:, :-1, :], shift_target) * weight).sum() / denom
+        ce_clean = (_compute_per_token_nll(clean_logits[:, :-1, :], shift_target) * weight).sum() / denom
+
+        if self.auto_balance:
+            alpha = (ce_noisy / ce_clean.clamp_min(1e-6)).detach()
+        else:
+            alpha = self.clean_loss_weight
+        loss = ce_noisy + alpha * ce_clean
+        return DLLMLossOutput(total_loss=loss, dllm_loss=ce_noisy.detach().clone())

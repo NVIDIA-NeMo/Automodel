@@ -32,6 +32,13 @@ repos:
       args: ["check", "--select", "I", "--fix"]
     - id: ruff-format
 
+  - repo: https://github.com/PyCQA/bandit
+    rev: "1.9.4"
+    hooks:
+    - id: bandit
+      args: ["-t", "B614"]
+      exclude: "^tests/"
+
   - repo: https://github.com/astral-sh/uv-pre-commit
     # Use the latest version
     rev: 0.9.2

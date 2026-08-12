@@ -87,6 +87,98 @@ class MockOuterFSDPMoEModel(MockFSDPModule, MoEFSDPSyncMixin):
         self.model = model
 
 
+class MockMultimodalMoEModel(MoEFSDPSyncMixin):
+    """Mock VLM whose multimodal towers/projectors are their own FSDP roots.
+
+    Mirrors what ``moe/parallelizer.apply_fsdp`` produces for a trainable
+    multimodal module, e.g. Kimi-K2.5-VL LoRA (target_modules ["*"] makes
+    ``vision_tower`` trainable, ``wrap_outer_model: false``, ``pp_size: 4``).
+    """
+
+    def __init__(self, backend, model, **multimodal):
+        self.backend = backend
+        self.model = model
+        for name, module in multimodal.items():
+            setattr(self, name, module)
+
+
+def _mock_fsdp_isinstance(obj, cls):
+    if cls.__name__ == "FSDPModule":
+        return isinstance(obj, MockFSDPModule)
+    return isinstance(obj, cls)
+
+
+class TestMultimodalFSDPRootsGetSyncState:
+    """apply_fsdp() creates standalone roots for recognized multimodal modules.
+
+    A root this iterator does not find never receives set_is_last_backward /
+    set_reshard_after_backward / set_requires_gradient_sync, so it drops out of
+    the gradient-accumulation state machine and, under PP, out of
+    patched_backward_maybe_with_nosync.
+    """
+
+    @patch("nemo_automodel.components.moe.fsdp_mixin.isinstance")
+    def test_iterates_vision_tower_and_embed_audio(self, mock_isinstance):
+        mock_isinstance.side_effect = _mock_fsdp_isinstance
+
+        vision_tower = MockFSDPModule()
+        embed_audio = MockFSDPModule()
+        moe_model = MockMultimodalMoEModel(
+            MockBackend(), MockFSDPModule(), vision_tower=vision_tower, embed_audio=embed_audio
+        )
+
+        modules = list(_iter_fsdp_modules(moe_model))
+
+        assert vision_tower in modules
+        assert embed_audio in modules
+
+    @patch("nemo_automodel.components.moe.fsdp_mixin.isinstance")
+    def test_receives_accumulation_and_final_backward_transitions(self, mock_isinstance):
+        mock_isinstance.side_effect = _mock_fsdp_isinstance
+
+        vision_tower = MockFSDPModule()
+        embed_audio = MockFSDPModule()
+        moe_model = MockMultimodalMoEModel(
+            MockBackend(enable_fsdp_optimizations=True),
+            MockFSDPModule(),
+            vision_tower=vision_tower,
+            embed_audio=embed_audio,
+        )
+
+        moe_model.prepare_for_grad_accumulation()
+        for module in (vision_tower, embed_audio):
+            assert module._is_last_backward is False
+            assert module._reshard_after_backward is False
+            assert module._requires_gradient_sync is False
+
+        moe_model.prepare_for_final_backward()
+        for module in (vision_tower, embed_audio):
+            assert module._is_last_backward is True
+            assert module._reshard_after_backward is True
+            assert module._requires_gradient_sync is True
+
+    @patch("nemo_automodel.components.moe.fsdp_mixin.isinstance")
+    def test_roots_reachable_twice_are_yielded_once(self, mock_isinstance):
+        """The inner text root and a multimodal alias can be the same object."""
+        mock_isinstance.side_effect = _mock_fsdp_isinstance
+
+        shared = MockFSDPModule()
+        moe_model = MockMultimodalMoEModel(MockBackend(), shared, visual=shared)
+
+        modules = list(_iter_fsdp_modules(moe_model))
+
+        assert modules.count(shared) == 1
+
+    @patch("nemo_automodel.components.moe.fsdp_mixin.isinstance")
+    def test_no_multimodal_modules_is_unchanged(self, mock_isinstance):
+        mock_isinstance.side_effect = _mock_fsdp_isinstance
+
+        model = MockFSDPModule()
+        moe_model = MockMoEModel(MockBackend(), model)
+
+        assert list(_iter_fsdp_modules(moe_model)) == [model]
+
+
 class TestConfigureFSDPModule:
     """Test _configure_fsdp_module helper function."""
 

@@ -38,7 +38,7 @@ import torch.nn.functional as F
 from _prefix_tree_reference import build_reference_mask
 
 from nemo_automodel.components.datasets.llm.prefix_tree import fold_shared_prefix_rollouts
-from nemo_automodel.components.distributed.magi_attn_utils import (
+from nemo_automodel.components.distributed.context_parallel.magi import (
     AttnMaskSpec,
     is_magi_available,
     make_magi_attn_func,

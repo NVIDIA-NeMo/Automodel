@@ -15,6 +15,8 @@
 """Unit tests for Ministral3 bidirectional encoder (retrieval / bi-encoder path)."""
 
 import json
+import subprocess
+import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -311,6 +313,26 @@ def test_ministral3_biencoder_processor_returns_numpy_batch(pixtral_processor):
     np.testing.assert_array_equal(output["labels"], np.zeros(2, dtype=np.int64))
 
 
+def test_legacy_ministral_checkpoint_loads_in_fresh_process(tmp_path):
+    model_dir = tmp_path / "legacy_ministral"
+    Ministral3BidirectionalModel(tiny_bidirectional_config()).save_pretrained(model_dir)
+
+    code = (
+        "from nemo_automodel._transformers.retrieval import build_encoder_backbone; "
+        f"model = build_encoder_backbone(r'{model_dir}', 'embedding', pooling='avg'); "
+        "assert type(model).__name__ == 'Ministral3BidirectionalModel'; "
+        "assert model.config.model_type == 'ministral3_bidirec'"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+
+
 def test_ministral3_bidirectional_model_init_and_mask():
     cfg = tiny_bidirectional_config()
     model = Ministral3BidirectionalModel(cfg)
@@ -392,7 +414,7 @@ class FakeLM(nn.Module):
         self.saved.append(out_dir)
 
 
-def test_encoder_build_ministral3_registry_path(tmp_path, monkeypatch):
+def test_encoder_build_legacy_ministral_registry_path(tmp_path, monkeypatch):
     class FakeBidirectionalModel(FakeLM):
         @classmethod
         def from_pretrained(cls, *args, **kwargs):
@@ -406,7 +428,7 @@ def test_encoder_build_ministral3_registry_path(tmp_path, monkeypatch):
 
     model_dir = tmp_path / "model"
     model_dir.mkdir()
-    (model_dir / "config.json").write_text(json.dumps({"model_type": "ministral3"}))
+    (model_dir / "config.json").write_text(json.dumps({"model_type": "ministral3_bidirec"}))
 
     model = BiEncoderModel.build(
         model_name_or_path=str(model_dir),
@@ -420,27 +442,13 @@ def test_encoder_build_ministral3_registry_path(tmp_path, monkeypatch):
     assert any("save1" in p for p in model.model.saved)
 
 
-@pytest.mark.parametrize("top_level_model_type", ["ministral3", "ministral3_bidirec"])
-def test_encoder_build_ministral_supported_model_types(tmp_path, monkeypatch, top_level_model_type):
-    """Hub / local text configs use ministral3; saved bidirectional checkpoints use ministral3_bidirec."""
+def test_ministral_dispatch_uses_custom_class_only_for_legacy_checkpoints():
+    from nemo_automodel._transformers.retrieval import SUPPORTED_BACKBONES
 
-    class FakeBidirectionalModel(FakeLM):
-        @classmethod
-        def from_pretrained(cls, *args, **kwargs):
-            return cls(hidden=16)
-
-    monkeypatch.setattr(
-        ModelRegistry,
-        "model_arch_name_to_cls",
-        {"Ministral3BidirectionalModel": FakeBidirectionalModel},
-    )
-
-    model_dir = tmp_path / "hub" / "checkpoint"
-    model_dir.mkdir(parents=True)
-    (model_dir / "config.json").write_text(json.dumps({"model_type": top_level_model_type}))
-
-    model = BiEncoderModel.build(model_name_or_path=str(model_dir), pooling="avg", l2_normalize=True)
-    assert isinstance(model, BiEncoderModel)
+    assert "ministral3" not in SUPPORTED_BACKBONES
+    assert SUPPORTED_BACKBONES["ministral3_bidirec"]["embedding"] == "Ministral3BidirectionalModel"
+    assert SUPPORTED_BACKBONES["mistral3"]["embedding"] == "Mistral3BidirectionalModel"
+    assert SUPPORTED_BACKBONES["mistral3_bidirec"]["embedding"] == "Mistral3BidirectionalModel"
 
 
 def test_configure_encoder_metadata_sets_auto_map_for_ministral_retrieval():

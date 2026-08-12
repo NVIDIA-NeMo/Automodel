@@ -376,6 +376,8 @@ class RadioWithNeck(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
+        self.image_processor_normalizes = bool(getattr(config, "image_processor_normalizes", False))
+        self._radio_input_conditioner_externalized = False
 
         # Create RADIO encoder from config (which is now actual RADIOConfig)
         self.model_encoder = AutoModel.from_config(config, trust_remote_code=True)
@@ -391,7 +393,38 @@ class RadioWithNeck(nn.Module):
         self.sum_proj = nn.Linear(3840, last_hidden_state)
         self.layer_norm3 = nn.LayerNorm(last_hidden_state, eps=1e-06, elementwise_affine=True)
 
+    def _externalize_radio_input_conditioner(self) -> None:
+        if not self.image_processor_normalizes or self._radio_input_conditioner_externalized:
+            return
+
+        make_external = getattr(self.model_encoder, "make_preprocessor_external", None)
+        if make_external is None:
+            raise ValueError(
+                "image_processor_normalizes=True requires a RADIO encoder with make_preprocessor_external()."
+            )
+
+        make_external()
+        self._radio_input_conditioner_externalized = True
+
     def forward(self, pixel_values, output_attentions=False, output_hidden_states=False, return_dict=False, **kwargs):
+        """Encode document images into visual tokens.
+
+        Args:
+            pixel_values: Tensor of shape [batch, channels, height, width]. When the image processor normalizes
+                inputs, values must already contain that external normalization.
+            output_attentions: Accepted for model interface compatibility and currently unused.
+            output_hidden_states: Accepted for model interface compatibility and currently unused.
+            return_dict: Accepted for model interface compatibility and currently unused.
+            **kwargs: Additional model arguments accepted for interface compatibility.
+
+        Returns:
+            A DonutSwinModelOutput whose last_hidden_state has shape [batch, image_tokens, hidden].
+        """
+        self._externalize_radio_input_conditioner()
+        if self.image_processor_normalizes:
+            encoder_dtype = next(self.model_encoder.parameters()).dtype
+            pixel_values = pixel_values.to(dtype=encoder_dtype)
+
         radio_output = self.model_encoder(pixel_values)
         summary, feature = radio_output
 

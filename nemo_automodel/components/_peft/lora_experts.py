@@ -328,7 +328,7 @@ class GroupedExpertsLoRA(GroupedExperts):
 
         y = torch.zeros(x.shape, dtype=torch.float32, device=x.device)
 
-        if tokens_per_expert.sum() > 0:
+        if sorted_token_ids.numel() > 0:
             permuted_x = x[sorted_token_ids]
             permuted_probs = sorted_weights.unsqueeze(-1)
 

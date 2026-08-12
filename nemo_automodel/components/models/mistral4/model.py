@@ -31,6 +31,7 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
 )
+from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.deepseek_v3.layers import MLA
 from nemo_automodel.components.models.deepseek_v3.model import Block
 from nemo_automodel.components.models.deepseek_v3.rope_utils import (
@@ -58,12 +59,25 @@ def _get_llama_4_attn_scale(position_ids: torch.Tensor, beta: float, max_positio
 class Mistral4MLA(MLA):
     """MLA with Llama 4 attention scaling for Mistral 4.
 
-    Compared to DeepSeek V3 MLA, adds position-dependent scaling to q_pe after RoPE
+    Compared to DeepSeek V3 MLA, adds position-dependent scaling to the query after RoPE
     (llama_4_scaling_beta). RoPE itself uses the same complex-number approach as DSV3.
     """
 
     def __init__(self, config, backend: BackendConfig):
         super().__init__(config, backend)
+        # DeepSeek V3 folds YaRN's mscale into the attention softmax scale. Mistral 4
+        # instead keeps the standard qk head-dimension scale and applies its separate
+        # Llama 4 position-dependent multiplier directly to the query.
+        from nemo_automodel.components.attention.utils import initialize_attn_module_and_func
+
+        self.softmax_scale = self.qk_head_dim**-0.5
+        self.attn_module, self.attn_func = initialize_attn_module_and_func(
+            attn_impl=backend.attn,
+            num_attention_heads=self.n_heads,
+            num_qk_channels=self.qk_head_dim,
+            num_v_channels=self.v_head_dim,
+            softmax_scale=self.softmax_scale,
+        )
         rope_parameters = config.rope_parameters if hasattr(config, "rope_parameters") else config.rope_scaling
         self.llama_4_scaling_beta = rope_parameters.get("llama_4_scaling_beta") if rope_parameters else None
         self.llama_4_orig_max_pos = rope_parameters.get("original_max_position_embeddings") if rope_parameters else None
@@ -74,7 +88,20 @@ class Mistral4MLA(MLA):
         freqs_cis: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         **attn_kwargs: Any,
-    ):
+    ) -> torch.Tensor:
+        """Apply Mistral 4 multi-head latent attention.
+
+        Args:
+            x: Tensor of shape [batch, sequence, hidden] for BSHD input or [tokens, hidden] for THD input.
+            freqs_cis: Rotary frequencies of shape [batch, sequence, rope_dim / 2] for non-fused BSHD,
+                [tokens, rope_dim / 2] for non-fused THD, or [sequence, 1, 1, rope_dim] for fused RoPE.
+            attention_mask: Optional tensor of shape [batch, sequence] or an explicit mask broadcastable to
+                [batch, heads, query_sequence, key_sequence].
+            **attn_kwargs: Backend metadata such as packed-sequence offsets, position IDs, and CP rank information.
+
+        Returns:
+            Tensor of shape [batch, sequence, hidden] for BSHD input or [tokens, hidden] for THD input.
+        """
         from nemo_automodel.components.attention.utils import (
             postprocess_output_for_attn,
             preprocess_args_and_kwargs_for_attn,
@@ -119,18 +146,18 @@ class Mistral4MLA(MLA):
             cp_rank=attn_kwargs.get("cp_rank", 0),
         )
 
-        # Llama 4 attention scaling on q_pe (no-op for positions < orig_max_pos)
+        q = torch.cat([q_nope, q_pe], dim=-1)
+
+        # Llama 4 attention scaling on the full query (no-op for positions < orig_max_pos).
         if self.llama_4_scaling_beta is not None:
             position_ids = attn_kwargs.get("position_ids", None)
             if position_ids is not None:
                 attn_scale = _get_llama_4_attn_scale(
                     position_ids, self.llama_4_scaling_beta, self.llama_4_orig_max_pos
-                ).to(q_pe.dtype)
-                q_pe = q_pe * attn_scale.unsqueeze(-1)
+                ).to(q.dtype)
+                q = q * attn_scale.unsqueeze(-1)
 
         k_pe = k_pe.squeeze(head_unsqueeze_dim)
-
-        q = torch.cat([q_nope, q_pe], dim=-1)
 
         kv = self.kv_b_proj(kv)
         if qkv_format == "thd":
@@ -309,6 +336,7 @@ class Mistral4Model(nn.Module):
 
 class Mistral4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
+    _keep_in_fp32_modules_strict = ["e_score_correction_bias"]
 
     @dataclass(frozen=True)
     class ModelCapabilities:
@@ -446,7 +474,7 @@ class Mistral4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                     b=cutoff_factor * final_out_std,
                 )
 
-        self.to(dtype)
+        cast_model_to_dtype(self, dtype)
         with buffer_device:
             rope_theta, rope_scaling, _ = get_rope_config(self.config)
             self.model.freqs_cis = precompute_freqs_cis(
@@ -683,6 +711,7 @@ if _HF_MISTRAL3_AVAILABLE:
         # Head lives in the Mistral4 text backbone (separate lm_head, no tie
         # mechanism); the controlling flag is on the nested text_config.
         tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
+        _keep_in_fp32_modules_strict = ["e_score_correction_bias"]
 
         @dataclass(frozen=True)
         class ModelCapabilities:
@@ -888,7 +917,7 @@ if _HF_MISTRAL3_AVAILABLE:
                         b=cutoff_factor * final_out_std,
                     )
 
-            self.to(dtype)
+            cast_model_to_dtype(self, dtype)
 
 
 ModelClass = Mistral4ForCausalLM

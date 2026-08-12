@@ -108,7 +108,7 @@ def initialize_attn_module_and_func(
             )
         # requires magi_attention; the guards above are exercised on CPU but the
         # kernel build is not, so exclude it from coverage.
-        from nemo_automodel.components.distributed.magi_attn_utils import (  # pragma: no cover - requires magi_attention
+        from nemo_automodel.components.distributed.context_parallel.magi import (  # pragma: no cover - requires magi_attention
             make_magi_attn_func,
         )
 

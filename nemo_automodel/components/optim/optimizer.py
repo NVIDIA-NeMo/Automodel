@@ -598,6 +598,14 @@ class LRSchedulerConfig:
         Returns:
             One :class:`OptimizerParamScheduler` per optimizer.
         """
+        # The removed diffusion-only LR builder accepted a float in (0, 1) as a
+        # fraction of total steps; here it would silently disable warmup (warmup
+        # ends before step 1), so reject it explicitly.
+        if self.lr_warmup_steps is not None and 0 < self.lr_warmup_steps < 1:
+            raise ValueError(
+                f"lr_warmup_steps must be an integer step count, got {self.lr_warmup_steps!r}. "
+                "Fractional warmup is not supported; set the number of warmup steps directly."
+            )
         # ``epoch_len`` is already expressed in optimizer steps (StepScheduler computes it as
         # ``ceil(len(dataloader) / grad_acc_steps)``) and is ``None`` for iterable/streaming
         # dataloaders, where ``len()`` is undefined.  Never call ``len(dataloader)`` here.

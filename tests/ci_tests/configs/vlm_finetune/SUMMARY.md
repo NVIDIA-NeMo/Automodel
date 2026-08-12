@@ -15,7 +15,7 @@ The nightly scope uses only the recipes listed in [nightly_recipes.yml](nightly_
 | gemma4_26b_a4b_moe | 00:30:00 | 1 |
 | internvl_3_5_4b | 00:10:00 | 1 |
 | ministral3_3b_medpix | 00:10:00 | 1 |
-| mistral4_medpix | 00:30:00 | 4 |
+| mistral4_medpix | 01:00:00 | 4 |
 | nemotron_parse_v1_1 | 00:30:00 | 1 |
 | qwen3_5_4b | 00:30:00 | 1 |
 | qwen3_5_35b | 00:30:00 | 1 |

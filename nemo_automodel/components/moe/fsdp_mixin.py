@@ -21,9 +21,26 @@ from torch.distributed.pipelining._backward import stage_backward, stage_backwar
 from torch.nn.parallel import DistributedDataParallel
 
 from nemo_automodel.components.models.common.utils import get_is_optim_step
+from nemo_automodel.shared.multimodal_fsdp import iter_multimodal_modules
 
 
 def _iter_fsdp_modules(module: torch.nn.Module) -> Iterator[FSDPModule]:
+    """Yield every FSDP unit whose backward state this mixin must drive, deduplicated.
+
+    A unit that is not yielded here never receives ``set_is_last_backward`` /
+    ``set_reshard_after_backward`` / ``set_requires_gradient_sync``, so it drops
+    out of the gradient-accumulation state machine and, under pipeline
+    parallelism, out of ``patched_backward_maybe_with_nosync``.
+    """
+    seen: set[int] = set()
+    for candidate in _iter_fsdp_module_candidates(module):
+        if id(candidate) in seen:
+            continue
+        seen.add(id(candidate))
+        yield candidate
+
+
+def _iter_fsdp_module_candidates(module: torch.nn.Module) -> Iterator[FSDPModule]:
     if isinstance(module, FSDPModule):
         yield module
 
@@ -40,12 +57,20 @@ def _iter_fsdp_modules(module: torch.nn.Module) -> Iterator[FSDPModule]:
     if hasattr(module, "lm_head") and isinstance(module.lm_head, FSDPModule):
         yield module.lm_head
 
-    # TODO: properly handle all possible multimodal component names
-    if hasattr(module, "audio_tower") and isinstance(module.audio_tower, FSDPModule):
-        yield module.audio_tower
-
-    if hasattr(module, "visual") and isinstance(module.visual, FSDPModule):
-        yield module.visual
+    # Multimodal towers/projectors. ``moe/parallelizer.apply_fsdp`` gives every
+    # recognized *trainable* multimodal module its own FSDP unit, and under the
+    # ``per_layer`` frozen policy it shards their layer containers instead of the
+    # module itself -- so walk the module and its descendants rather than testing
+    # only the top-level attribute. Uses the same shared taxonomy as the
+    # parallelizer so unit creation and unit enumeration cannot drift apart:
+    # e.g. Kimi-K2.5-VL LoRA (`examples/vlm_benchmark/kimi/kimi25vl_lora.yaml`,
+    # target_modules ["*"] -> trainable vision_tower, wrap_outer_model=false, pp_size 4)
+    # previously created a vision_tower root that this function never found.
+    for _, mm_module in iter_multimodal_modules(module):
+        subs = mm_module.modules() if isinstance(mm_module, torch.nn.Module) else (mm_module,)
+        for sub in subs:
+            if isinstance(sub, FSDPModule):
+                yield sub
 
     # Check experts in each layer (Qwen-style: block.mlp.experts; Gemma4-style: block.moe.experts)
     if hasattr(_model, "layers"):

@@ -175,3 +175,59 @@ def test_compute_logits_gathers_sharded_dtensor_target_lm_head():
     finally:
         if not already_initialized:
             dist.destroy_process_group()
+
+
+class TestOptionalRankLoss:
+    """ViSpec's stage 1 is EAGLE plus a ListMLE ranking term.
+
+    The reference optimizes ``v_w * vloss + p_w * (ploss + 0.1 * rloss)`` with
+    ``v_w=1.0`` and ``p_w=0.1``, so the ranking term carries an effective weight
+    of 0.01. EAGLE-1/2 itself does not use it, so it must stay off by default.
+    """
+
+    @staticmethod
+    def _inputs(loss_mask=None):
+        torch.manual_seed(0)
+        return dict(
+            input_ids=torch.randint(0, 64, (1, 6)),
+            attention_mask=torch.ones(1, 6, dtype=torch.long),
+            loss_mask=torch.tensor([[0, 0, 1, 1, 1, 0]]) if loss_mask is None else loss_mask,
+            input_hidden_states=torch.randn(1, 6, 16),
+            target_hidden_states=torch.randn(1, 6, 16),
+            target_logits=torch.randn(1, 6, 64),
+        )
+
+    @staticmethod
+    def _trainer(**kwargs):
+        torch.manual_seed(0)
+        return EagleTrainerModule(
+            _build_tiny_draft_model(), target_lm_head=_build_tiny_target().lm_head, **kwargs
+        ).eval()
+
+    def test_off_by_default_leaves_the_objective_untouched(self):
+        trainer = self._trainer()
+        metrics = trainer(**self._inputs())
+
+        assert metrics.rank_loss is None
+        expected = trainer.hidden_loss_weight * metrics.hidden_loss + trainer.token_loss_weight * metrics.token_loss
+        torch.testing.assert_close(metrics.loss, expected)
+
+    def test_enabled_adds_the_weighted_ranking_term(self):
+        trainer = self._trainer(rank_loss_weight=0.01, rank_loss_topk=4)
+        metrics = trainer(**self._inputs())
+
+        assert metrics.rank_loss is not None
+        expected = (
+            trainer.hidden_loss_weight * metrics.hidden_loss
+            + trainer.token_loss_weight * metrics.token_loss
+            + 0.01 * metrics.rank_loss
+        )
+        torch.testing.assert_close(metrics.loss, expected)
+
+    def test_empty_loss_mask_keeps_the_ranking_term_finite(self):
+        """topk over an empty selection would otherwise produce NaN."""
+        trainer = self._trainer(rank_loss_weight=0.01)
+        metrics = trainer(**self._inputs(loss_mask=torch.zeros(1, 6, dtype=torch.long)))
+
+        assert torch.isfinite(metrics.loss)
+        assert metrics.rank_loss is not None and float(metrics.rank_loss.detach()) == 0.0

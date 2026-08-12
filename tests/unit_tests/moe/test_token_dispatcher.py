@@ -17,7 +17,7 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from nemo_automodel.components.moe.megatron.token_dispatcher import _HybridEPManager
+from nemo_automodel.components.moe.megatron.token_dispatcher import _HybridEPManager, _HybridEPMetadataProcessor
 
 
 @pytest.fixture
@@ -55,6 +55,17 @@ class TestIndicesToMultihot:
         assert multihot_probs[0, 3] == pytest.approx(0.4)
         assert multihot_probs[1, 1] == pytest.approx(0.7)
         assert multihot_probs[1, 5] == pytest.approx(0.3)
+
+    def test_scoped_processor_matches_existing_conversion(self, hybrid_ep_manager):
+        indices = torch.tensor([[0, 3], [1, -1]])
+        probs = torch.tensor([[0.6, 0.4], [0.7, 0.0]])
+        processor = _HybridEPMetadataProcessor(num_experts=8, permute_fusion=False)
+
+        expected = hybrid_ep_manager._indices_to_multihot(indices, probs)
+        actual = processor(indices, probs)
+
+        torch.testing.assert_close(actual[0], expected[0])
+        torch.testing.assert_close(actual[1], expected[1])
 
     def test_topk_1(self, hybrid_ep_manager):
         """Each token routed to exactly one expert."""

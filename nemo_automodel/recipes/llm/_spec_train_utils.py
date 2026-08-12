@@ -150,3 +150,58 @@ def make_warmup_cosine_schedule(
         return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
 
     return _lr_lambda
+
+
+def raise_if_target_not_materialized(model: nn.Module, target_path: str) -> None:
+    """Fail loudly when a frozen target's weights were never loaded from disk.
+
+    ``NeMoAutoModel*.from_pretrained`` initializes on the meta device whenever
+    ``world_size > 1`` and no sharding infrastructure was requested, on the
+    assumption that a later FSDP2 / MegatronFSDP wrap materializes the weights.
+    A draft recipe that keeps one full frozen replica per rank never performs
+    that step, so ``.to(device)`` turns the meta tensors into uninitialized
+    memory and the target silently becomes a randomly initialized teacher: the
+    draft then trains against noise, loss stalls at ``ln(vocab)``, and nothing
+    raises.
+
+    This check is cheap (one norm per checked tensor) and runs once at setup.
+    It compares against the theoretical norm of HuggingFace's default
+    ``N(0, 0.02)`` initialization, which is what uninitialized-then-copied
+    memory ends up resembling.
+
+    Args:
+        model: The frozen target model, already moved to its device.
+        target_path: Model id or path, echoed in the error message.
+
+    Raises:
+        RuntimeError: If a parameter is still on the meta device, or if the
+            input embedding matches an untrained initialization.
+    """
+    meta = [name for name, param in model.named_parameters() if param.is_meta]
+    if meta:
+        raise RuntimeError(
+            f"The frozen target {target_path} still has {len(meta)} parameter(s) on the meta device "
+            f"(e.g. {meta[0]}). It was initialized on meta and never materialized, so training would "
+            "distill the draft against random weights. Load the target without meta-device init."
+        )
+
+    embedding = model.get_input_embeddings()
+    weight = getattr(embedding, "weight", None)
+    if weight is None or weight.numel() == 0:
+        return
+    observed = weight.detach().float().norm().item()
+    # HF initializes embeddings from N(0, initializer_range); the norm of such a
+    # matrix concentrates tightly around std * sqrt(numel).
+    # A diagnostic must never be the thing that breaks a run, so every lookup
+    # it makes degrades to the HuggingFace default rather than raising.
+    config = getattr(model, "config", None)
+    std = float(getattr(config, "initializer_range", 0.02) or 0.02)
+    untrained = std * math.sqrt(weight.numel())
+    if untrained > 0 and abs(observed - untrained) / untrained < 0.02:
+        raise RuntimeError(
+            f"The frozen target {target_path} has an input embedding whose norm ({observed:.2f}) matches an "
+            f"untrained N(0, {std}) initialization ({untrained:.2f}), so its weights were never loaded from "
+            "the checkpoint. This happens when the model is initialized on the meta device for a "
+            "world_size > 1 run and nothing materializes it. Training would distill the draft against a "
+            "random teacher without raising."
+        )

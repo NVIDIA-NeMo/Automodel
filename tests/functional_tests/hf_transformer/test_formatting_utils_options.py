@@ -38,7 +38,7 @@ def test_format_prompt_completion_options(seq_length, padding, truncation):
     os.environ["HF_HUB_OFFLINE"] = "1"
     TOKENIZER_DIR = f"{os.environ['TEST_DATA_DIR']}/hf_mixtral_2l"
     assert os.path.exists(TOKENIZER_DIR), "Tokenizer directory does not exist"
-    tok = NeMoAutoTokenizer.from_pretrained(TOKENIZER_DIR)
+    tok = NeMoAutoTokenizer.from_pretrained(TOKENIZER_DIR, add_eos_token=True)
     # Only applicable when tokenizer lacks chat template
     assert getattr(tok, "chat_template", None) is None
 
@@ -87,9 +87,9 @@ def test_format_prompt_completion_options(seq_length, padding, truncation):
         assert tok.eos_token_id in labels, "EOS must appear in labels"
 
     # There should be masked (prompt) and supervised (answer) tokens
-    assert any(v== -100 for v in labels), "Must have masked prompt tokens"
+    assert any(v == -100 for v in labels), "Must have masked prompt tokens"
     if truncation is not True:
-        assert any(v!= -100 for v in labels), "Must have supervised answer tokens"
+        assert any(v != -100 for v in labels), "Must have supervised answer tokens"
 
     # Where attention_mask=0, labels must be -100
     if padding == "do_not_pad":
@@ -120,7 +120,6 @@ def test_format_prompt_completion_options(seq_length, padding, truncation):
     ],
 )
 def test_format_chat_template_options(seq_length, padding, truncation):
-
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
     os.environ["HF_HUB_OFFLINE"] = "1"
     TOKENIZER_DIR = f"{os.environ['TEST_DATA_DIR']}/qwen3_4b_instruct_2407"

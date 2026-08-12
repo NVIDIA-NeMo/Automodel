@@ -29,8 +29,9 @@ import pathlib
 # page). New entries should include a short inline comment explaining the
 # mismatch.
 #
-# Shared by ``test_doc_coverage.py`` (registry archs) and
-# ``test_recipe_doc_coverage.py`` (arches resolved from example YAMLs).
+# Shared by ``test_doc_coverage.py`` (registry archs), the generated
+# ready-to-run architecture table, and ``test_recipe_doc_coverage.py`` (arches
+# resolved from example YAMLs).
 _DOC_ARCH_ALIASES = {
     # HF ships the class as ``BaiChuanForCausalLM`` (CamelCase) — registry
     # uses ``BaichuanForCausalLM``. Documented on the Baichuan page.
@@ -71,11 +72,13 @@ _DOC_ARCH_ALIASES = {
     # (``Qwen2_5_VLForConditionalGeneration``); the Qwen2.5-VL page still uses
     # the pre-rename spelling.
     "Qwen2_5_VLForConditionalGeneration": "Qwen2_5VLForConditionalGeneration",
-    # Qwen3-Omni, Qwen3-VL and Qwen3.5-VL are documented with the VL-facing
-    # arch name; the registry wires their MoE backbones under these keys.
+    # Qwen3-Omni and Qwen3-VL are documented with the VL-facing arch name; the
+    # registry wires their MoE backbones under these keys.
     "Qwen3OmniMoeForConditionalGeneration": "Qwen3OmniForConditionalGeneration",
     "Qwen3VLMoeForConditionalGeneration": "Qwen3VLForConditionalGeneration",
-    "Qwen3_5MoeForConditionalGeneration": "Qwen3_5MoeVLForConditionalGeneration",
+    # Qwen3.5-MoE text and VL entry points share the unified Qwen3.5 page.
+    "Qwen3_5MoeForCausalLM": "Qwen3.5-MoE",
+    "Qwen3_5MoeForConditionalGeneration": "Qwen3.5-MoE",
     # Dense Qwen3.5 text/VL backbone; grouped with the VL variants on the
     # Qwen3.5-VL page.
     "Qwen3_5ForCausalLM": "Qwen3.5",
@@ -88,6 +91,16 @@ _DOC_ARCH_ALIASES = {
 
 def _repo_root() -> pathlib.Path:
     return pathlib.Path(__file__).resolve().parents[3]
+
+
+def _without_generated_registry_table(content: str) -> str:
+    start_marker = "{/* BEGIN GENERATED MODEL ARCHITECTURES */}"
+    end_marker = "{/* END GENERATED MODEL ARCHITECTURES */}"
+    start = content.find(start_marker)
+    end = content.find(end_marker)
+    if start == -1 or end == -1:
+        return content
+    return content[:start] + content[end + len(end_marker) :]
 
 
 def test_every_registered_arch_has_model_coverage_doc():
@@ -103,7 +116,7 @@ def test_every_registered_arch_has_model_coverage_doc():
     docs_dir = _repo_root() / "docs" / "model-coverage"
     assert docs_dir.is_dir(), f"docs/model-coverage/ not found at {docs_dir}"
 
-    md_contents = [p.read_text(encoding="utf-8") for p in docs_dir.rglob("*.mdx")]
+    md_contents = [_without_generated_registry_table(p.read_text(encoding="utf-8")) for p in docs_dir.rglob("*.mdx")]
     assert md_contents, "No .mdx files found under docs/model-coverage/"
 
     missing = []
@@ -136,7 +149,7 @@ def test_doc_arch_aliases_target_strings_appear_in_docs():
     undocumented and the doc-coverage check becomes a no-op for that entry.
     """
     docs_dir = _repo_root() / "docs" / "model-coverage"
-    md_contents = [p.read_text(encoding="utf-8") for p in docs_dir.rglob("*.mdx")]
+    md_contents = [_without_generated_registry_table(p.read_text(encoding="utf-8")) for p in docs_dir.rglob("*.mdx")]
 
     bad = []
     for arch, needle in _DOC_ARCH_ALIASES.items():

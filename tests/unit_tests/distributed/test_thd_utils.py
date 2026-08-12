@@ -244,7 +244,7 @@ class TestProcessInputForTHD:
         }
 
         # Process with 2 chunks (2 batch items per chunk)
-        result = split_batch_into_thd_chunks(batch, num_chunks=2)
+        result = split_batch_into_thd_chunks(batch, num_chunks=2, padding_token_id=0)
 
         # Check shapes - should be [num_chunks, tokens_per_chunk]
         assert result["input_ids"].shape == (2, 12), f"Expected shape (2, 12), got {result['input_ids'].shape}"
@@ -274,7 +274,7 @@ class TestProcessInputForTHD:
             "seq_lens_padded": torch.tensor([[4, 2], [3, 3], [4, 2], [3, 3]]),
         }
 
-        result = split_batch_into_thd_chunks(batch, num_chunks=2)
+        result = split_batch_into_thd_chunks(batch, num_chunks=2, padding_token_id=0)
 
         # Check shapes
         assert result["input_ids"].shape == (2, 12)
@@ -304,7 +304,7 @@ class TestProcessInputForTHD:
             "seq_lens_padded": torch.full((batch_size, 1), seq_len),
         }
 
-        result = split_batch_into_thd_chunks(batch, num_chunks=2)
+        result = split_batch_into_thd_chunks(batch, num_chunks=2, padding_token_id=0)
 
         # Check shapes - should be [num_chunks, tokens_per_chunk, hidden_dim]
         assert result["input_ids"].shape == (2, 12, hidden_dim)
@@ -335,7 +335,7 @@ class TestProcessInputForTHDWithChunks:
             "seq_lens_padded": torch.tensor([[4, 2, -1000], [6, -1000, -1000], [4, -1000, -1000], [3, 3, -1000]]),
         }
 
-        result = split_batch_into_thd_chunks(batch, num_chunks=2)
+        result = split_batch_into_thd_chunks(batch, num_chunks=2, padding_token_id=0)
 
         # First chunk has 2+1=3 sequences, second chunk has 1+2=3 sequences
         # cu_seqlens should be [num_chunks, max_seqs_across_chunks+1]
@@ -411,7 +411,7 @@ class TestProcessInputForTHDWithChunks:
             "metadata": {"batch_id": 123},
         }
 
-        result = split_batch_into_thd_chunks(batch, num_chunks=2)
+        result = split_batch_into_thd_chunks(batch, num_chunks=2, padding_token_id=0)
 
         # Non-tensor keys should be preserved
         assert "qkv_format" in result
@@ -446,7 +446,7 @@ class TestProcessInputForTHDWithChunks:
             "seq_lens_padded": torch.tensor([[4, 2], [6, -1000]] * 2),
         }
 
-        result = split_batch_into_thd_chunks(batch, num_chunks=2)
+        result = split_batch_into_thd_chunks(batch, num_chunks=2, padding_token_id=0)
 
         # cu_seqlens should be present
         assert "cu_seqlens" in result
@@ -483,7 +483,7 @@ class TestProcessInputForTHDWithChunks:
             "seq_lens_padded": torch.tensor([[3], [3], [3], [3]], dtype=torch.long),
         }
 
-        result = split_batch_into_thd_chunks(batch, num_chunks=2)
+        result = split_batch_into_thd_chunks(batch, num_chunks=2, padding_token_id=0)
 
         assert result["input_ids"].dtype == torch.long
         assert result["labels"].dtype == torch.long
@@ -505,10 +505,10 @@ class TestProcessInputForTHDWithChunks:
         # Check padding_mask shape
         assert result["padding_mask"].shape == (2, 6)
 
-        # Verify padding mask identifies 0s as padding
-        # First chunk: [0, 1, 2, 3, 0, 5] -> mask: [T, F, F, F, T, F]
-        expected_mask_0 = torch.tensor([True, False, False, False, True, False])
-        assert torch.equal(result["padding_mask"][0], expected_mask_0)
+        # seq_lens == seq_lens_padded, so every slot holds a real token. The 0s
+        # in input_ids are content (token id 0 is a real token in most
+        # vocabularies), and the pack layout -- not the token value -- decides.
+        assert not result["padding_mask"].any()
 
     @pytest.mark.parametrize("num_chunks", [2, 4, 8])
     def test_different_chunk_sizes(self, num_chunks):
@@ -637,7 +637,7 @@ class TestTrailingPadAbsorption:
             "seq_lens": seq_lens,
             "seq_lens_padded": seq_lens_padded,
         }
-        result = split_batch_into_thd_chunks(batch, num_chunks=2)
+        result = split_batch_into_thd_chunks(batch, num_chunks=2, padding_token_id=0)
 
         assert "cu_seqlens" in result
         # Both chunks absorbed (cu_seqlens_padded == cu_seqlens for both),

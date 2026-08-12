@@ -45,7 +45,10 @@ model:
   block_size: 32
 
 checkpoint:
-  enabled: false
+  enabled: true
+  checkpoint_dir: dllm_checkpoints/nemotron_labs_diffusion_sft/
+  model_save_format: safetensors
+  save_consolidated: final  # final step exports the consolidated HF dir generate.py loads
 
 distributed:
   strategy: fsdp2

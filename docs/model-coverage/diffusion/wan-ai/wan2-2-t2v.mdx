@@ -1,6 +1,7 @@
 ---
 title: "Wan 2.2 T2V-A14B"
 description: ""
+slug: model-coverage/diffusion/wan-ai/wan-2-2-t2v-a14b
 ---
 [Wan 2.2 T2V-A14B](https://huggingface.co/Wan-AI/Wan2.2-T2V-A14B-Diffusers) is the successor to Wan 2.1, also a text-to-video flow-matching DiT. Its defining feature is a **two-stage denoising pipeline**: a high-noise `transformer` handles the early/noisy timesteps and a low-noise `transformer_2` handles the later/cleaner timesteps, switching at `boundary_ratio * num_train_timesteps` (default `0.875`). Each transformer is ~14B parameters, for ~28B total.
 

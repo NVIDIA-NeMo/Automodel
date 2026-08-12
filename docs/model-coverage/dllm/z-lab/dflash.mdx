@@ -1,0 +1,31 @@
+---
+title: "DFlash"
+description: "Supported DFlash draft checkpoint and NeMo AutoModel recipes."
+slug: model-coverage/dllm/z-lab/dflash
+---
+
+[Qwen3-4B-DFlash-b16](https://huggingface.co/z-lab/Qwen3-4B-DFlash-b16) is a diffusion draft model trained against a frozen Qwen3 target for speculative decoding.
+
+<Info>
+
+| | |
+|---|---|
+| **Task** | Diffusion Draft-Model Training |
+| **Architecture** | `DFlashDraftModel` with Hugging Face `trust_remote_code` |
+| **Target** | `Qwen/Qwen3-4B` |
+| **HF Org** | [z-lab](https://huggingface.co/z-lab) |
+
+</Info>
+
+## Example Model and Recipe
+
+| Model | Recipe |
+|---|---|
+| [`z-lab/Qwen3-4B-DFlash-b16`](https://huggingface.co/z-lab/Qwen3-4B-DFlash-b16) | [DFlash SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/dflash_sft.yaml) |
+
+```bash
+uv run torchrun --nproc-per-node=8 nemo_automodel/recipes/dllm/train_ft.py \
+  -c examples/dllm_sft/dflash_sft.yaml
+```
+
+See the [dLLM Fine-Tuning Guide](/recipes-e2e-examples/dllm-fine-tuning).

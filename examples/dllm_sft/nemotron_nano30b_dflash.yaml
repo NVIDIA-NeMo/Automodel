@@ -47,7 +47,6 @@ seed: 42
 
 wandb:
   enable: false
-  entity: joc
   project: dflash-sft
   name: dflash-nemotron-nano-30b-run
 

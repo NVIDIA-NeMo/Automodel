@@ -77,6 +77,9 @@ checkpoint:
 
 distributed:
   strategy: fsdp2
+  multimodal:
+    # Every rank receives text-only batches, so the frozen multimodal modules are skipped uniformly.
+    frozen_sharding: per_layer
   dp_size: none
   tp_size: 1
   cp_size: 16
@@ -130,4 +133,7 @@ wandb:
   dir: <your_wandb_save_dir>
 ci:
   nodes: 2
-  time: "00:15:00"
+  time: "01:00:00"
+  env_vars:
+    # CP backward fragments the allocator; the FSDP gradient bucket then cannot fit, leads to OOM.
+    PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"

@@ -278,3 +278,42 @@ class TestMTPForwardDeterminism:
         assert out_b.mtp_per_depth_h is None
         # Main path identical (NaN-tolerant — tiny random-init model may NaN).
         torch.testing.assert_close(out_a.logits, out_b.logits, rtol=0.0, atol=0.0, equal_nan=True)
+
+
+# ---------------------------------------------------------------------------
+# Layer 3: View-loaded key bookkeeping (checkpoint loader key-diff contract)
+# ---------------------------------------------------------------------------
+
+
+def test_view_loaded_mtp_keys_are_mtp_prefixed(backend):
+    """In-place (strided-view) loaded expert keys must surface under model-native names.
+
+    The distributed loader pre-writes merged expert tensors through strided
+    views and registers them via ``_register_inplace_loaded_key`` before
+    ``from_hf`` runs. The checkpoint loader then diffs
+    ``view_loaded_native_keys`` against the model's real parameter names, so
+    MTP entries must come back ``mtp.``-prefixed — the stripped form the merge
+    loop uses internally must not leak out (it produced false
+    missing/unexpected warnings for ``mtp.layers.*.mixer.experts.*``).
+    """
+    model, _ = _build_model(backend, mtp_layers=1, mtp_pattern="*E")
+    adapter = model.state_dict_adapter
+    hf_sd = adapter.to_hf(model.state_dict())
+
+    native_backbone = "model.layers.1.mixer.experts.gate_and_up_projs"
+    native_mtp = "mtp.layers.1.mixer.experts.gate_and_up_projs"
+    # Mirror the loader's registration: backbone keys register verbatim, MTP
+    # keys register with the ``mtp.`` prefix stripped for the merge loop.
+    adapter._register_inplace_loaded_key(native_backbone, None)
+    adapter._register_inplace_loaded_key(native_mtp, "mtp.")
+
+    converted = adapter.from_hf(dict(hf_sd))
+
+    # Consumed (already view-loaded) tensors stay out of the returned dict...
+    assert native_backbone not in converted
+    assert native_mtp not in converted
+    # ...and are recorded under the model-native names the loader diffs against.
+    assert native_backbone in adapter.view_loaded_native_keys
+    assert native_mtp in adapter.view_loaded_native_keys
+    stripped_leaks = {k for k in adapter.view_loaded_native_keys if k.startswith("layers.")}
+    assert not stripped_leaks, f"mtp.-stripped keys leaked into view_loaded_native_keys: {stripped_leaks}"

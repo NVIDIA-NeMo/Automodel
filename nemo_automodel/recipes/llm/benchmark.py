@@ -327,7 +327,9 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
             if i == nsys_start and rank in nsys_ranks:
                 logger.info(f"Rank {rank} | Starting nsys profiling")
                 torch.cuda.cudart().cudaProfilerStart()
-                torch.autograd.profiler.emit_nvtx(record_shapes=True).__enter__()
+                # Per-microbatch NVTX ranges below already delimit the work.
+                # Entering emit_nvtx() without closing it leaks RecordFunction
+                # callbacks into later DTensor/FSDP operations.
 
             if rank == 0:
                 logger.info(f"Rank {rank} | Iteration {i}")
@@ -376,6 +378,12 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                         opt.step()
                     logger.debug("Optimizer step")
 
+            # Match the training-loop lifecycle: record one complete eager
+            # optimizer step, then capture outside the measured iteration.
+            if self.partial_cuda_graph_manager is not None and self._partial_cuda_graph_capture_pending:
+                self.partial_cuda_graph_manager.capture()
+                self._partial_cuda_graph_capture_pending = False
+
             # Synchronize num_label_tokens across DP ranks
             num_label_tokens_tensor = torch.tensor(num_label_tokens, dtype=torch.long, device=device)
             num_label_tokens_tensor = self._dp_allreduce(num_label_tokens_tensor)
@@ -419,6 +427,9 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                 torch.cuda.cudart().cudaProfilerStop()
 
             self._maybe_collect_garbage()
+
+        if self.partial_cuda_graph_manager is not None:
+            self.partial_cuda_graph_manager.log_stats("benchmark")
 
         # Final summary
         self._log_benchmark_summary(steps, warmup_steps, peak_tflops, rank)
@@ -591,8 +602,13 @@ def main(config_path=None):
 
     cfg = parse_args_and_load_config(config_path)
     recipe = BenchmarkingRecipeForNextTokenPrediction(cfg)
-    recipe.setup()
-    recipe.run_benchmark()
+    try:
+        recipe.setup()
+        recipe.run_benchmark()
+    finally:
+        if recipe.partial_cuda_graph_manager is not None:
+            recipe.partial_cuda_graph_manager.close()
+            recipe.partial_cuda_graph_manager = None
 
 
 if __name__ == "__main__":

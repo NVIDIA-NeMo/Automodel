@@ -84,7 +84,7 @@ def _resolve_args(custom_args):
     """Resolve final test arguments from CLI args and optional recipe config.
 
     Returns a dict with keys: model_path, adapter_path, tokenizer, max_new_tokens,
-    smoke_test, trust_remote_code.
+    smoke_test, trust_remote_code, enable_expert_parallel.
     """
     config_path = custom_args.get("config_path")
     mode = custom_args.get("deploy_mode")  # "sft", "peft", or None (legacy)
@@ -131,6 +131,7 @@ def _resolve_args(custom_args):
     )
 
     smoke_test = bool(custom_args.get("vllm_smoke_test") or ci_cfg.get("vllm_smoke_test"))
+    enable_expert_parallel = bool(ci_cfg.get("vllm_enable_expert_parallel"))
     merge_lora = bool(ckpt_robustness_cfg.get("vllm_merge_lora"))
 
     max_new_tokens = int(custom_args.get("max_new_tokens", "20"))
@@ -142,8 +143,14 @@ def _resolve_args(custom_args):
         "max_new_tokens": max_new_tokens,
         "smoke_test": smoke_test,
         "trust_remote_code": trust_remote_code,
+        "enable_expert_parallel": enable_expert_parallel,
         "merge_lora": merge_lora,
     }
+
+
+def _tokenize_for_generation(tokenizer, prompt, device):
+    """Tokenize a prompt using only inputs accepted by causal LM generation."""
+    return tokenizer(prompt, return_tensors="pt", return_token_type_ids=False).to(device)
 
 
 # Extract custom args at module level before pytest processes them.
@@ -161,6 +168,7 @@ def test_vllm_greedy_matches_hf():
     max_new_tokens = args["max_new_tokens"]
     smoke_test = args["smoke_test"]
     trust_remote_code = args["trust_remote_code"]
+    enable_expert_parallel = args["enable_expert_parallel"]
     merge_lora = args["merge_lora"]
 
     from vllm import LLM, SamplingParams
@@ -180,13 +188,19 @@ def test_vllm_greedy_matches_hf():
                 max_lora_rank=64,
                 trust_remote_code=trust_remote_code,
                 tensor_parallel_size=tp_size,
+                enable_expert_parallel=enable_expert_parallel,
             )
             lora_request = LoRARequest("adapter", 1, adapter_path)
             sampling_params = SamplingParams(temperature=0, max_tokens=max_new_tokens)
             vllm_results = llm.generate(PROMPTS, sampling_params, lora_request=lora_request)
         else:
             print(f"[vLLM smoke test] Loading model from {model_path} (tp={tp_size})")
-            llm = LLM(model=model_path, trust_remote_code=trust_remote_code, tensor_parallel_size=tp_size)
+            llm = LLM(
+                model=model_path,
+                trust_remote_code=trust_remote_code,
+                tensor_parallel_size=tp_size,
+                enable_expert_parallel=enable_expert_parallel,
+            )
             sampling_params = SamplingParams(temperature=0, max_tokens=max_new_tokens)
             vllm_results = llm.generate(PROMPTS, sampling_params)
 
@@ -221,7 +235,7 @@ def test_vllm_greedy_matches_hf():
 
     hf_outputs = []
     for idx, prompt in enumerate(PROMPTS):
-        inputs = tokenizer(prompt, return_tensors="pt").to(device)
+        inputs = _tokenize_for_generation(tokenizer, prompt, device)
         with torch.no_grad():
             output_ids = hf_model.generate(**inputs, do_sample=False, max_new_tokens=max_new_tokens)
         generated = output_ids[0, inputs["input_ids"].shape[1] :]

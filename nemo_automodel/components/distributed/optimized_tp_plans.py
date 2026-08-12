@@ -48,6 +48,7 @@ from nemo_automodel.components.models.llama.model import LlamaForCausalLM as Cus
 from nemo_automodel.components.models.mistral3.model import Ministral3ForCausalLM
 from nemo_automodel.components.models.mistral3_vlm.model import Mistral3FP8VLMForConditionalGeneration
 from nemo_automodel.components.models.qwen2.model import Qwen2ForCausalLM as CustomQwen2ForCausalLM
+from nemo_automodel.components.models.qwen3.model import Qwen3ForCausalLM as CustomQwen3ForCausalLM
 
 
 class SequenceParallelAllGatherActivation(SequenceParallel):
@@ -485,6 +486,41 @@ def _parallelize_mistral3_vlm(
     return cast(dict[str, ParallelStyle], base_model_tp_plan)
 
 
+def _parallelize_muse_glimmer(
+    model,
+    sequence_parallel: bool = False,
+) -> dict[str, ParallelStyle]:
+    """TP plan for the native MuseGlimmer dense VLM.
+
+    The vision tower stays replicated. The language backbone and vocabulary
+    matrices contain nearly all trainable parameters and are tensor-sharded.
+    MuseGlimmer has two KV heads, so the model strategy limits this complete
+    Q/K/V-sharding plan to TP1 or TP2.
+    """
+    if sequence_parallel:
+        import warnings
+
+        warnings.warn(
+            "sequence_parallel=True is not yet supported for MuseGlimmer and will be ignored.",
+            stacklevel=2,
+        )
+
+    plan: dict[str, ParallelStyle] = {
+        "model.embed_tokens": VocabParallelEmbedding(input_layouts=Replicate()),
+        "model.layers.*.self_attn.q_proj": ColwiseParallel(),
+        "model.layers.*.self_attn.k_proj": ColwiseParallel(),
+        "model.layers.*.self_attn.v_proj": ColwiseParallel(),
+        "model.layers.*.self_attn.output_gate_proj": ColwiseParallel(),
+        "model.layers.*.self_attn.o_proj": RowwiseParallel(),
+        "model.layers.*.mlp.up_proj": ColwiseParallel(),
+        "model.layers.*.mlp.gate_proj": ColwiseParallel(),
+        "model.layers.*.mlp.down_proj": RowwiseParallel(),
+        "lm_head": ColwiseParallel(output_layouts=Shard(-1), use_local_output=False),
+    }
+
+    return cast(dict[str, ParallelStyle], plan)
+
+
 def _parallelize_qwen(
     model: Union[Qwen2ForCausalLM, Qwen3ForCausalLM],
     sequence_parallel: bool = False,
@@ -754,8 +790,11 @@ PARALLELIZE_FUNCTIONS: Dict[str, Callable[..., Dict[str, ParallelStyle]]] = {
     _get_class_qualname(Phi3ForCausalLM): _parallelize_phi3,
     _get_class_qualname(CustomLlamaForCausalLM): _parallelize_llama,
     _get_class_qualname(CustomQwen2ForCausalLM): _parallelize_qwen,
+    _get_class_qualname(CustomQwen3ForCausalLM): _parallelize_qwen,
     # trust_remote_code models — matched by bare class __name__ in parallelizer
     # because their qualname includes a snapshot-hash-bearing module path.
+    "NemotronFlashForCausalLM": _parallelize_llama,
     "DeciLMForCausalLM": _parallelize_decilm_nemotron,
     "NemotronLabsDiffusionModel": _parallelize_nemotron_labs_diffusion,
+    "nemo_automodel.components.models.muse_glimmer.model.MuseGlimmerForConditionalGeneration": _parallelize_muse_glimmer,
 }

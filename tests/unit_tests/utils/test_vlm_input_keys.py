@@ -65,7 +65,7 @@ def test_vlm_input_keys_covers_gemma4_modalities():
 
 def test_vlm_input_keys_covers_qwen_kimi_mistral_grid_keys():
     """Qwen-VL/Kimi-VL/Mistral4 grid + sizes keys must be present."""
-    expected = {"image_grid_hws", "image_grid_thw", "image_sizes"}
+    expected = {"image_grid_hws", "image_grid_thw", "video_grid_thw", "image_sizes"}
     missing = expected - set(VLM_INPUT_KEYS)
     assert not missing, f"missing grid/size keys: {missing}"
 
@@ -79,7 +79,7 @@ def test_vlm_input_keys_covers_phi4mm_audio_keys():
 
 def test_vlm_input_keys_does_not_include_labels_or_position_ids():
     """labels and position_ids are NOT multimodal inputs — they are CP buffers
-    handled by ``make_cp_batch_and_ctx`` and must not be popped by the recipe."""
+    handled by ``_make_cp_batch_and_ctx`` and must not be popped by the recipe."""
     assert "labels" not in VLM_INPUT_KEYS
     assert "position_ids" not in VLM_INPUT_KEYS
     assert "attention_mask" not in VLM_INPUT_KEYS

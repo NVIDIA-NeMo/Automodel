@@ -59,6 +59,9 @@ peft:
   dim: 16
   alpha: 32
   dropout: 0.1
+  # This throughput benchmark is not activation-memory bound. Avoid the memory-efficient
+  # LoRA paths, which trade extra recomputation in backward for lower activation memory.
+  use_memory_efficient_lora: false
   use_triton: true
 
 distributed:

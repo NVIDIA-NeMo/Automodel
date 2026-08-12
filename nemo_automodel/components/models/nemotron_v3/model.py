@@ -22,6 +22,7 @@ from transformers import AutoConfig
 from transformers.generation import GenerationConfig, GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
+from nemo_automodel._transformers.model_capabilities import ModelCapabilities
 from nemo_automodel.components.models.common import (
     BackendConfig,
     HFCheckpointingMixin,
@@ -89,34 +90,50 @@ class NemotronV3Model(nn.Module):
         self.backend = backend or BackendConfig()
         if moe_config is not None and moe_overrides is not None:
             raise ValueError("Cannot pass both moe_config and moe_overrides; use one or the other.")
-        moe_defaults = dict(
-            n_routed_experts=config.n_routed_experts,
-            n_shared_experts=1,  # NemotronV3 has 1 shared expert
-            n_activated_experts=config.num_experts_per_tok,
-            n_expert_groups=config.n_group,
-            n_limited_groups=config.topk_group,
-            train_gate=True,
-            gate_bias_update_factor=0.0,
-            aux_loss_coeff=0.0,  # No aux loss for NemotronV3
-            score_func="sigmoid",  # NemotronV3 uses sigmoid scoring
-            route_scale=config.routed_scaling_factor,
-            dim=config.hidden_size,
-            inter_dim=config.intermediate_size,  # For shared expert
-            moe_inter_dim=config.moe_intermediate_size,  # For routed experts
-            norm_topk_prob=config.norm_topk_prob,
-            router_bias=False,
-            expert_bias=config.mlp_bias,
-            expert_activation="relu2",  # NemotronV3 uses ReLU² activation
-            dtype=config.torch_dtype,
-            shared_expert_gate=False,
-            shared_expert_inter_dim=config.moe_shared_expert_intermediate_size,
-            shared_expert_activation="relu2",  # Use ReLU² for shared experts
-            force_e_score_correction_bias=True,  # NemotronV3 checkpoint has this buffer
-            moe_latent_size=getattr(config, "moe_latent_size", None),
+        # Dense Nemotron-H variants (e.g. the Nano 4B / 9B / 12B BF16 models) have no MoE
+        # layers, and their HF config omits the n_routed_experts / moe_* fields, so eagerly
+        # building a MoEConfig would raise AttributeError. Only construct it when the model
+        # actually has MoE layers (or one was supplied explicitly). A dense model carries
+        # moe_config=None, which NemotronV3Block only ever dereferences in its "moe" branch
+        # (never reached for mamba/attention/mlp layers).
+        layer_block_types = getattr(config, "layers_block_type", None) or []
+        has_moe = (
+            moe_config is not None
+            or moe_overrides is not None
+            or "moe" in layer_block_types
+            or getattr(config, "n_routed_experts", None) is not None
         )
-        if moe_overrides:
-            moe_defaults.update(moe_overrides)
-        self.moe_config = moe_config or MoEConfig(**moe_defaults)
+        if not has_moe:
+            self.moe_config = None
+        else:
+            moe_defaults = dict(
+                n_routed_experts=config.n_routed_experts,
+                n_shared_experts=1,  # NemotronV3 has 1 shared expert
+                n_activated_experts=config.num_experts_per_tok,
+                n_expert_groups=config.n_group,
+                n_limited_groups=config.topk_group,
+                train_gate=True,
+                gate_bias_update_factor=0.0,
+                aux_loss_coeff=0.0,  # No aux loss for NemotronV3
+                score_func="sigmoid",  # NemotronV3 uses sigmoid scoring
+                route_scale=config.routed_scaling_factor,
+                dim=config.hidden_size,
+                inter_dim=config.intermediate_size,  # For shared expert
+                moe_inter_dim=config.moe_intermediate_size,  # For routed experts
+                norm_topk_prob=config.norm_topk_prob,
+                router_bias=False,
+                expert_bias=config.mlp_bias,
+                expert_activation="relu2",  # NemotronV3 uses ReLU² activation
+                dtype=config.torch_dtype,
+                shared_expert_gate=False,
+                shared_expert_inter_dim=config.moe_shared_expert_intermediate_size,
+                shared_expert_activation="relu2",  # Use ReLU² for shared experts
+                force_e_score_correction_bias=True,  # NemotronV3 checkpoint has this buffer
+                moe_latent_size=getattr(config, "moe_latent_size", None),
+            )
+            if moe_overrides:
+                moe_defaults.update(moe_overrides)
+            self.moe_config = moe_config or MoEConfig(**moe_defaults)
 
         # Embeddings
         dtype = get_dtype(config.torch_dtype, torch.bfloat16)
@@ -296,14 +313,19 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
     # Skip patch_hf_model_for_pp; our forward already handles PP routing.
     _pp_keep_self_forward: bool = True
 
-    @dataclass(frozen=True)
-    class ModelCapabilities:
-        """Declared parallelism capabilities for this model class."""
+    @classmethod
+    def get_capabilities(cls, config) -> ModelCapabilities:
+        """Return parallelism capabilities for a specific Nemotron-H config.
 
-        supports_tp: bool = False
-        supports_cp: bool = True
-        supports_pp: bool = True
-        supports_ep: bool = True
+        NemotronHForCausalLM serves both the MoE ("v3") and the dense Nemotron-H
+        variants. Expert parallelism only applies when the config actually has MoE
+        layers; a dense config has no experts to parallelize, so supports_ep must
+        be False for it (see #2004). The other flags are the same for both.
+        """
+        is_moe = getattr(config, "n_routed_experts", None) is not None or "moe" in (
+            getattr(config, "layers_block_type", None) or []
+        )
+        return ModelCapabilities(supports_cp=True, supports_pp=True, supports_ep=is_moe)
 
     @classmethod
     def from_config(
@@ -418,6 +440,12 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
             )
         else:
             self.mtp = None
+
+        # When True, the MTP heads also run under eval mode (``self.training``
+        # False) so validation can measure per-head token acceptance. Defaults
+        # to False so generation/decoding never pays the MTP cost; the training
+        # harness toggles it around the validation forward only.
+        self.compute_mtp_in_eval = False
 
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = NemotronV3StateDictAdapter(
@@ -786,7 +814,11 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
         # MTP head: last PP stage in training only. Other stages / eval emit
         # placeholder empties below so the tuple arity stays 1 + D.
         mtp_per_depth_h: list[torch.Tensor] | None = None
-        if self.mtp is not None and self.training:
+        # Run the MTP heads in training, or in eval when explicitly requested for
+        # validation acceptance metrics. Never on the cached generation path —
+        # decoding feeds one token at a time and must not pay the MTP cost.
+        mtp_active = self.mtp is not None and (self.training or (self.compute_mtp_in_eval and not use_cache))
+        if mtp_active:
             mtp_attention_mask = (
                 causal_mask_mapping.get("full_attention") if causal_mask_mapping is not None else attention_mask
             )

@@ -30,6 +30,27 @@ from nemo_automodel.components.speculative.eagle.core_v12 import EagleTrainerMod
 from nemo_automodel.components.speculative.eagle.draft_gpt_oss import GptOssEagle3DraftModel
 from nemo_automodel.components.speculative.eagle.draft_llama import LlamaEagle3DraftModel
 from nemo_automodel.components.speculative.eagle.draft_llama_v12 import LlamaEagleDraftModel
+from nemo_automodel.components.speculative.eagle.msd import MSDTrainerModule, MultimodalEagleDraftModel
+from nemo_automodel.components.speculative.eagle.msd_curriculum import (
+    MSDCurriculum,
+    MSDCurriculumConfig,
+    MSDCurriculumPhase,
+    MSDDataSource,
+)
+from nemo_automodel.components.speculative.eagle.msd_decode import (
+    MSDGreedyDecoder,
+    MSDTreeDraftGenerator,
+    MSDTreeLayout,
+    MSDTreeNode,
+    MSDTreeProposal,
+    MSDVerificationResult,
+    accept_or_resample,
+    build_msd_tree_layout,
+    verify_greedy_tree,
+    verify_hf_greedy_tree,
+    verify_stochastic_chain,
+)
+from nemo_automodel.components.speculative.eagle.msd_target import HFMSDTargetModel
 from nemo_automodel.components.speculative.eagle.peagle_trainer import PEagleTrainerModule
 from nemo_automodel.components.speculative.eagle.registry import (
     EAGLE1_DRAFT_REGISTRY,
@@ -50,6 +71,24 @@ __all__ = [
     "RunnerEagle3TargetModel",
     "TargetRunner",
     "HFEagleTargetModel",
+    "HFMSDTargetModel",
+    "MSDTrainerModule",
+    "MSDCurriculum",
+    "MSDCurriculumConfig",
+    "MSDCurriculumPhase",
+    "MSDDataSource",
+    "MSDGreedyDecoder",
+    "MSDTreeDraftGenerator",
+    "MSDTreeLayout",
+    "MSDTreeNode",
+    "MSDTreeProposal",
+    "MSDVerificationResult",
+    "accept_or_resample",
+    "build_msd_tree_layout",
+    "verify_greedy_tree",
+    "verify_hf_greedy_tree",
+    "verify_stochastic_chain",
+    "MultimodalEagleDraftModel",
     "HFEagle3TargetModel",
     "LlamaEagleDraftModel",
     "LlamaEagle3DraftModel",

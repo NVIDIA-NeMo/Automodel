@@ -1,0 +1,31 @@
+---
+title: "Qwen3 I-DLM"
+description: "Supported Qwen3 I-DLM conversion recipe in NeMo AutoModel."
+slug: model-coverage/dllm/qwen/qwen3-idlm
+---
+
+The I-DLM recipe converts the autoregressive [`Qwen/Qwen3-8B`](https://huggingface.co/Qwen/Qwen3-8B) checkpoint into a diffusion language model using an all-masked block-diffusion objective.
+
+<Info>
+
+| | |
+|---|---|
+| **Task** | Diffusion Language Modeling |
+| **Architecture** | `Qwen3ForCausalLM` with the I-DLM objective |
+| **Parameters** | 8B |
+| **HF Org** | [Qwen](https://huggingface.co/Qwen) |
+
+</Info>
+
+## Example Model and Recipe
+
+| Model | Recipe |
+|---|---|
+| [`Qwen/Qwen3-8B`](https://huggingface.co/Qwen/Qwen3-8B) | [I-DLM full fine-tuning](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/qwen3_8b_idlm.yaml) |
+
+```bash
+uv run torchrun --nproc-per-node=8 nemo_automodel/recipes/dllm/train_ft.py \
+  -c examples/dllm_sft/qwen3_8b_idlm.yaml
+```
+
+See the [dLLM Fine-Tuning Guide](/recipes-e2e-examples/dllm-fine-tuning).

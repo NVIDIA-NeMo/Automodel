@@ -11,13 +11,11 @@ model:
     subfolder: "transformer"
     load_full_pipeline: false
 
-optim:
-  learning_rate: 2e-5
-
-  optimizer:
-    _target_: torch.optim.AdamW
-    weight_decay: 0.01
-    betas: [0.9, 0.999]
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 2e-5
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
 
 lr_scheduler:
   lr_decay_style: cosine
@@ -56,7 +54,8 @@ step_scheduler:
   local_batch_size: 1
   global_batch_size: 8
   ckpt_every_steps: 1000
-  log_every: 1
+  log_remote_every_steps: 1
+  save_checkpoint_every_epoch: false
 
 data:
   dataloader:

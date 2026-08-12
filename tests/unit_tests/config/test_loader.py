@@ -16,6 +16,7 @@ from __future__ import annotations
 import importlib
 import sys
 import textwrap
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -402,6 +403,10 @@ def test_confignode_repr_uses_orig_value_for_oc_env(monkeypatch, tmp_path: Path)
     s = str(cfg)
     assert "${oc.env:SECRET_ENV}" in s
     assert "super_secret_value" not in s
+
+    copied_value = deepcopy(cfg.x)
+    assert copied_value == "super_secret_value"
+    assert copied_value._orig_value == "${oc.env:SECRET_ENV}"
 
 
 def test_load_module_from_file(tmp_path):

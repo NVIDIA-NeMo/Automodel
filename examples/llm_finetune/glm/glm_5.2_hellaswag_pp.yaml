@@ -103,3 +103,4 @@ optimizer:
 
 ci:
   nodes: 32
+  time: "00:30:00"
