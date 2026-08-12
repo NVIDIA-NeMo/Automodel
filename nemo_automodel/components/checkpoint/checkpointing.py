@@ -783,6 +783,7 @@ class Checkpointer:
         use_checkpoint_id: bool = True,
         key_mapping: Optional[dict[str, str]] = None,
         allow_checkpoint_key_subset: bool = False,
+        model_is_pipeline_stage: bool = False,
     ) -> None:
         """
         Load model weights from `model_path`.
@@ -799,6 +800,9 @@ class Checkpointer:
             is_init_step: If True, treat load as initialization from a base checkpoint.
             use_checkpoint_id: Pass `checkpoint_id` to DCP if True; disable when using direct HF paths.
             key_mapping: Optional key remapping when reading from HF checkpoints.
+            model_is_pipeline_stage: If True, `model` holds one pipeline stage's layers, so
+                    checkpoint keys belonging to other stages are expected rather than a sign
+                    of a wrong architecture. Only consulted with allow_checkpoint_key_subset.
             allow_checkpoint_key_subset: If True, keep the model's current initialization for
                 parameters that are absent from the checkpoint instead of requiring an exact key match.
         """
@@ -1005,8 +1009,18 @@ class Checkpointer:
             # loaded into an LLM model would drop the vision tower), so refuse rather than
             # silently export a partial model. lm_head is never a false positive here: it is
             # only popped from state_dict when it is also absent from the checkpoint.
-            unmatched_checkpoint_keys = sorted(
-                key for key in checkpoint_metadata_keys if key not in state_dict and not key.endswith("_extra_state")
+            # A pipeline stage owns only its own layers, so the checkpoint legitimately
+            # carries keys it does not have. That is the one case where the subset must
+            # hold in neither direction, and the caller has to say so: nothing here can
+            # tell a stage apart from a model built with the wrong architecture.
+            unmatched_checkpoint_keys = (
+                []
+                if model_is_pipeline_stage
+                else sorted(
+                    key
+                    for key in checkpoint_metadata_keys
+                    if key not in state_dict and not key.endswith("_extra_state")
+                )
             )
             if unmatched_checkpoint_keys:
                 raise RuntimeError(
@@ -1216,6 +1230,8 @@ class Checkpointer:
         root_dir: str,
         model_name: str | None,
         load_base_model: bool = True,
+        allow_checkpoint_key_subset: bool = False,
+        model_is_pipeline_stage: bool = False,
     ) -> None:
         """
         Load a model from the base Hugging Face checkpoint in parallel.
@@ -1226,6 +1242,12 @@ class Checkpointer:
             root_dir: Root directory of the model cache or snapshots
             model_name: Name of the model or an absolute path to a snapshot
             load_base_model: If True, restore from HF base checkpoint
+            allow_checkpoint_key_subset: Keep the model's current initialization for
+                parameters the checkpoint does not carry, instead of failing. Needed when
+                the model has parameters the pretrained checkpoint predates, such as the
+                weights added by model expansion. See :meth:`load_model`.
+            model_is_pipeline_stage: Whether `model` is one stage of a pipeline, which
+                makes the checkpoint's other-stage keys expected. See :meth:`load_model`.
         """
         model_type = getattr(getattr(model, "config", None), "model_type", None)
 
@@ -1245,6 +1267,8 @@ class Checkpointer:
                 else _get_hf_safetensors_reference_path(root_dir, model_name),
                 is_init_step=True,
                 key_mapping=key_mapping,
+                allow_checkpoint_key_subset=allow_checkpoint_key_subset,
+                model_is_pipeline_stage=model_is_pipeline_stage,
             )
 
         _reinit_non_persistent_buffers(model, device, model_type=model_type)

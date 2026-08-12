@@ -1,0 +1,126 @@
+# Growing Llama-3.2-1B-Instruct by expanding two of its decoder layers.
+#
+# Expansion adds a second, trainable weight to the projections of the named layers while
+# the pretrained weights stay frozen. At step 0 the expanded model reproduces its parent
+# exactly -- the projections that write into the residual stream start at zero -- so this
+# continues pretraining rather than restarting it. Only the expansion weights reach the
+# optimizer, which is why the learning rate here is far above a full-finetune one.
+#
+# Works with tensor, data and pipeline parallelism. Not supported with `peft:`, which
+# patches the same linear layers. Under pipeline parallelism, `expansion.layers` must name
+# at least one layer in every stage's range -- a stage is a contiguous slice of the decoder
+# stack, and one holding no expanded layer would have nothing to train.
+#
+#   uv run automodel finetune llm -c examples/llm_finetune/llama3_2/llama3_2_1b_expansion.yaml
+#
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 1111
+  ranked: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: meta-llama/Llama-3.2-1B-Instruct
+  # This is the storage dtype of the resident parameters and of Adam's EMA buffers -- not
+  # the compute dtype, which FSDP2's mp_policy owns (see `distributed:` below). float32 is
+  # the master-weights pattern from docs/guides/mixed-precision-training.mdx. Do not set
+  # this to float16: Adam's eps (1e-8) is below fp16's smallest subnormal and flushes to
+  # zero, exp_avg_sq underflows with it, and the update becomes 0/0 -> NaN.
+  torch_dtype: float32
+  attn_implementation: sdpa
+  trust_remote_code: false
+
+expansion:
+  _target_: nemo_automodel.components.expansion.ExpansionConfig
+  enabled: true
+  # Zero-based decoder-layer indices to expand. Omit to expand every layer; every layer
+  # left out still carries both hidden-state streams, at no extra compute.
+  layers: [8, 12]   # with pp_size=2 over 16 layers, use e.g. [4, 12] so both stages train
+  # lambda in h = h_a + lambda * (h_b - h_a), applied just before the final norm.
+  merge_weight: 0.5
+
+distributed:
+  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
+  # Compute dtype. Left unset, FSDP2 defaults to bf16 compute with fp32 gradient
+  # reduction, which is right for Ampere and newer. Pre-Ampere cards (V100, sm70) have
+  # fp16 tensor cores but no bf16 ones, so bf16 there is emulated; uncomment this to run
+  # the compute in fp16 while the master weights above stay fp32. Measured on 4xV100 with
+  # this config: 2.7x faster, with the loss curve and grad norms unchanged to within
+  # rounding. No loss scaling is involved -- gradients are reduced in fp32 and the
+  # optimizer state never leaves fp32, so there is nothing here for fp16 to underflow.
+  # mp_policy:
+  #   _target_: torch.distributed.fsdp.MixedPrecisionPolicy
+  #   param_dtype: float16
+  #   reduce_dtype: float32
+  #   output_dtype: float16
+  #   cast_forward_inputs: true
+  dp_size: 4
+  tp_size: 1
+  pp_size: 1
+  cp_size: 1
+  ep_size: null
+  sequence_parallel: false
+
+step_scheduler:
+  global_batch_size: 8
+  local_batch_size: 1
+  max_steps: 50
+  num_epochs: 1
+  val_every_steps: 25
+  ckpt_every_steps: 50
+
+optimizer:
+  _target_: torch.optim.Adam
+  lr: 1.0e-04
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+  eps: 1.0e-08
+
+lr_scheduler:
+  lr_decay_style: cosine
+  lr_warmup_steps: 5
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+packed_sequence:
+  packed_sequence_size: 0
+
+checkpoint:
+  enabled: true
+  model_save_format: safetensors
+  checkpoint_dir: ./checkpoints/llama3_2_1b_expansion
+  save_consolidated: false
+
+# Local OpenAI-format chat rows. The safety subset is the smallest one in the release
+# (~15 MB, 3570 rows), which keeps a smoke run's startup short; point this at any other
+# subset for a real run. Validation reuses the same file, so its loss is a sanity signal
+# rather than a held-out measurement.
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
+  path_or_dataset_id: /data/datasets/Nemotron-Cascade-2-SFT-Data/safety/safety.jsonl
+  split: train
+  seq_length: 1024
+  truncation: true
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
+  path_or_dataset_id: /data/datasets/Nemotron-Cascade-2-SFT-Data/safety/safety.jsonl
+  split: train
+  seq_length: 1024
+  truncation: true
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  shuffle: false
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater

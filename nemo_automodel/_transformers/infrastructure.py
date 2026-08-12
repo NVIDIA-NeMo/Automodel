@@ -61,6 +61,13 @@ from nemo_automodel.components.distributed.megatron_fsdp import (
 from nemo_automodel.components.distributed.mesh import MeshContext
 from nemo_automodel.components.distributed.pipelining.autopipeline import AutoPipeline
 from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
+from nemo_automodel.components.expansion import (
+    ExpansionConfig,
+    apply_expansion,
+    expanded_linears,
+    freeze_non_expansion_parameters,
+    initialize_expansion,
+)
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.components.models.common.utils import cast_frozen_modules_to_compute_dtype
 from nemo_automodel.components.quantization.fp8 import apply_fp8_to_model
@@ -483,6 +490,7 @@ def apply_model_infrastructure(
     pretrained_model_name_or_path="",
     weights_already_loaded=False,
     inject_te_attention: bool = False,
+    expansion_config: ExpansionConfig | None = None,
     **_kwargs,
 ):
     """Apply sharding, PEFT, quantization, and checkpoint loading to a model.
@@ -504,6 +512,10 @@ def apply_model_infrastructure(
         mesh: MeshContext with parallelism sizes (tp_size, cp_size, etc.) and mesh
             references. Default: None (treated as single-GPU defaults).
         peft_config: PEFT/LoRA configuration dict. Default: None
+        expansion_config: Dual-stream model expansion configuration. Default: None.
+            Expansion weights are allocated alongside PEFT, before sharding, and given
+            their values after the checkpoint load -- see
+            ``nemo_automodel.components.expansion.apply_expansion``.
         quantization_config: Quantization configuration. Default: None
         fp8_config: FP8 configuration. Default: None
         qat_quantizer: QAT quantizer instance. Default: None
@@ -556,6 +568,18 @@ def apply_model_infrastructure(
                 getattr(model, "config", None), "quantization_config"
             )
 
+    # Model expansion rejects PEFT, checked before anything is applied so the run fails on
+    # its configuration rather than partway through building the model. Pipeline
+    # parallelism needs no rejection: the two streams travel between layers concatenated
+    # on the hidden axis, so a stage boundary sends one ordinary tensor.
+    expanding = expansion_config is not None and expansion_config.enabled
+    if expanding:
+        if peft_config is not None:
+            raise NotImplementedError(
+                "Model expansion and PEFT cannot be combined: both patch the same linear "
+                "layers in place, and the combination is untested. Choose one."
+            )
+
     # Apply PEFT and lower precision if configured
     # When on meta device, wrap in init_empty_weights() so new LoRA modules are also on meta device
     # This allows copy operations between meta tensors to succeed (they're no-ops)
@@ -564,6 +588,14 @@ def apply_model_infrastructure(
         model = _apply_peft_and_lower_precision(
             model, mesh.tp_size, autopipeline, peft_config, quantization_config, fp8_config, qat_quantizer
         )
+
+        # Model expansion: allocate the second weight of every expanded projection here, in
+        # the same slot as PEFT and for the same reason -- sharding has to see the new
+        # parameters so the tensor-parallel plan and FSDP distribute them. Unlike a LoRA
+        # adapter, an expansion weight is a copy of the pretrained weight beside it, so it
+        # can only be given a value once the checkpoint has loaded, further down.
+        if expanding:
+            apply_expansion(model, expansion_config, initialize=False)
 
     # Inject TE attention into HF models when requested.
     # Done after PEFT (so projection shapes are final) and before sharding
@@ -602,6 +634,8 @@ def apply_model_infrastructure(
                 cache_dir,
                 pretrained_model_name_or_path,
                 load_base_model=load_base_model,
+                allow_checkpoint_key_subset=expanding,
+                model_is_pipeline_stage=autopipeline is not None,
             )
         else:
             # Non-meta models already have weights from from_pretrained.
@@ -715,12 +749,54 @@ def apply_model_infrastructure(
                 cache_dir,
                 pretrained_model_name_or_path,
                 load_base_model=load_base_model,
+                allow_checkpoint_key_subset=expanding,
+                model_is_pipeline_stage=autopipeline is not None,
             )
 
     _verify_safe_moe_tp_weights_loaded(
         model,
         checkpoint_loaded=bool(checkpoint_already_loaded or weights_already_loaded or should_load_checkpoint),
     )
+
+    # Model expansion: the pretrained weights are in, so the expansion weights allocated
+    # above can now be copied from them. Sharding in between is fine -- both weights are
+    # distributed the same way, so the copy is local to each rank. Freezing here rather
+    # than earlier keeps stream A out of the autograd graph for the whole run.
+    if expanding:
+        # Under pipeline parallelism the model is a list of stages and the expanded layers
+        # sit on whichever stages own them, so a stage can legitimately hold none. Both
+        # helpers refuse an unexpanded module -- correct for a whole model, wrong for a
+        # stage -- so they are applied per stage and the totals are checked globally.
+        parts = model.parts if hasattr(model, "parts") else [model]
+        trainable = frozen = 0
+        for part in parts:
+            if next(iter(expanded_linears(part)), None) is None:
+                part.requires_grad_(False)
+                frozen += sum(param.numel() for param in part.parameters())
+                continue
+            initialize_expansion(part)
+            part_trainable, part_frozen = freeze_non_expansion_parameters(part)
+            trainable += part_trainable
+            frozen += part_frozen
+        if not trainable and autopipeline is not None:
+            raise RuntimeError(
+                "model expansion is enabled but this pipeline rank holds no expanded layer, so "
+                "it has nothing to train and the optimizer would be built with no parameters. "
+                "Pipeline parallelism splits the decoder stack into contiguous stages, so "
+                "expansion.layers has to name at least one layer in each stage's range -- "
+                f"expanding only layers that land on one stage leaves the others idle. This "
+                f"rank owns {len(parts)} stage(s)."
+            )
+        if not trainable:
+            raise RuntimeError(
+                "model expansion is enabled but no expanded layer survived; "
+                "check that expansion.layers names layers this model has"
+            )
+        logger.info(
+            "Model expansion: %d trainable expansion parameters, %d frozen pretrained parameters",
+            trainable,
+            frozen,
+        )
 
     # Freeze parameters after checkpoint loading and parallelization
     # This catches params created during parallelization (e.g., GroupedExpertsTE in init_token_dispatcher)

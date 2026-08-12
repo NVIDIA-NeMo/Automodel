@@ -608,14 +608,28 @@ class TestLoadBeforeShardPath:
 
         mock_ckpt.initialize_model_weights.assert_called_once_with(model, torch.device("cpu"), peft_init_method=None)
         mock_ckpt.load_base_model.assert_called_once_with(
-            model, torch.device("cpu"), "/tmp/cache", "test/model", load_base_model=True
+            model,
+            torch.device("cpu"),
+            "/tmp/cache",
+            "test/model",
+            load_base_model=True,
+            allow_checkpoint_key_subset=False,
+            model_is_pipeline_stage=False,
         )
 
         init_idx = mock_ckpt.method_calls.index(
             call.initialize_model_weights(model, torch.device("cpu"), peft_init_method=None)
         )
         load_idx = mock_ckpt.method_calls.index(
-            call.load_base_model(model, torch.device("cpu"), "/tmp/cache", "test/model", load_base_model=True)
+            call.load_base_model(
+                model,
+                torch.device("cpu"),
+                "/tmp/cache",
+                "test/model",
+                load_base_model=True,
+                allow_checkpoint_key_subset=False,
+                model_is_pipeline_stage=False,
+            )
         )
         assert init_idx < load_idx
 

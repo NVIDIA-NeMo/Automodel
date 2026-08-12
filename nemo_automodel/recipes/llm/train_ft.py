@@ -176,6 +176,7 @@ def build_model(
     cfg_model,
     cfg_peft,
     seed,
+    cfg_expansion=None,
     has_packed_sequence=False,
     cfg_fp8=None,
     cfg_compile=None,
@@ -191,6 +192,8 @@ def build_model(
     Args:
         cfg_model: Configuration for model instantiation.
         cfg_peft: Configuration for PEFT.
+        cfg_expansion: Instantiated ``ExpansionConfig`` for dual-stream model expansion,
+            or ``None``.
         seed: Random seed.
         has_packed_sequence: Whether using packed sequences.
         cfg_fp8: Configuration for FP8.
@@ -208,6 +211,7 @@ def build_model(
         kwargs = {
             "has_packed_sequence": has_packed_sequence,
             "peft_config": cfg_peft,
+            "expansion_config": cfg_expansion,
             "sdpa_method": sdpa_method,
         }
         if distributed_setup is not None:
@@ -286,6 +290,7 @@ def build_model(
                 qat_quantizer=qat_quantizer,
                 loss_fn=loss_fn,
                 peft_config=kwargs.get("peft_config"),
+                expansion_config=kwargs.get("expansion_config"),
                 fp8_config=kwargs.get("fp8_config"),
                 compile_config=kwargs.get("compile_config"),
                 quantization_config=kwargs.get("quantization_config"),
@@ -586,6 +591,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         if self.cfg.get("peft", None) is not None:
             self.peft_config = self.cfg.peft.instantiate()
 
+        self.expansion_config = None
+        if self.cfg.get("expansion", None) is not None:
+            self.expansion_config = self.cfg.expansion.instantiate()
+
         # Checkpoint config (model-derived fields are filled in by RecipeConfig)
         checkpoint_config = self.cfg.checkpoint
 
@@ -621,6 +630,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             distributed_setup=self.distributed_setup,
             cfg_qat=self.cfg.get("qat", None),
             sdpa_method=self.cfg.get("sdpa_method", None),
+            cfg_expansion=self.expansion_config,
         )
         self.embedding_row_repair_report = None
         embedding_row_repair = self.cfg.embedding_row_repair
