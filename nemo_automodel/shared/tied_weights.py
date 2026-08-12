@@ -17,6 +17,8 @@ from enum import Enum
 import torch
 import torch.nn as nn
 
+from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
+
 
 class TieSupport(Enum):
     """Which ``tie_word_embeddings`` settings a model class supports.
@@ -84,7 +86,7 @@ def is_tied_word_embeddings(model: nn.Module) -> bool:
 
 def _normalize_param_name(name: str) -> str:
     """Strip wrapper-specific prefixes from a parameter name."""
-    return name.replace("_orig_mod.", "")
+    return canonical_parameter_fqn(name).replace("_orig_mod.", "")
 
 
 def get_lm_head_weight_and_name(model: nn.Module) -> tuple[torch.Tensor | None, str | None]:

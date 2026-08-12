@@ -84,6 +84,7 @@ from nemo_automodel.components.checkpoint.utils import (
     is_rank_0,
     materialize_missing_tied_lm_head,
 )
+from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 
 if TYPE_CHECKING:
     from peft import PeftConfig
@@ -2308,18 +2309,15 @@ def _load_full_state_dict_into_model(
     """
     # IMPORTANT: named_modules() returns paths that include wrapper prefixes
     # like _checkpoint_wrapped_module, but PyTorch's _get_fqns() strips
-    # _CHECKPOINT_PREFIX from FQNs.  We must do the same so our keys match
+    # checkpoint-wrapper components from FQNs. We must do the same so our keys match
     # what _load_model_state_dict actually looks up.
-    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
-        _CHECKPOINT_PREFIX,
-    )
     from torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
 
     for model in model_parts:
         for name, module in model.named_modules():
             if type(module).get_extra_state is not nn.Module.get_extra_state:
                 key = f"{name}._extra_state" if name else "_extra_state"
-                key = key.replace(_CHECKPOINT_PREFIX, "")
+                key = canonical_parameter_fqn(key)
                 if key not in state_dict:
                     state_dict[key] = torch.tensor([], dtype=torch.uint8)
 
