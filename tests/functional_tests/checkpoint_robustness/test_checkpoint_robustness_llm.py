@@ -1556,6 +1556,12 @@ def _run_vanilla_hf_reload(
         for key in ("revision", "token"):
             if model_kwargs.get(key) is not None:
                 hf_kwargs[key] = model_kwargs[key]
+        # Load HF with the attention backend the recipe pins, the same way the
+        # source-load phase does. Attention backends are not bit-identical in bf16,
+        # so without this the two sides can run different backends and the reload
+        # reports a logit gap that the checkpoint did not cause.
+        if model_kwargs.get("attn_implementation") is not None:
+            hf_kwargs["attn_implementation"] = model_kwargs["attn_implementation"]
         # Remote-code models can ship attention names that transformers 5.x
         # rejects. Select a supported implementation while keeping Nemotron-H
         # off HF's incompatible FlashAttention varlen path.
