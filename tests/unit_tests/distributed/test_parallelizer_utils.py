@@ -31,7 +31,10 @@ from nemo_automodel.components.distributed.parallelizer_utils import (
     fully_shard_by_dtype,
     iter_maximal_uniform_dtype_subtrees,
 )
-from nemo_automodel.shared.torch_patches import patch_fsdp_unused_param_reduction
+from nemo_automodel.shared.torch_patches import (
+    patch_fsdp_uniform_reduce_dtype,
+    patch_fsdp_unused_param_reduction,
+)
 
 
 def test_configure_fsdp_unused_param_reduction_uses_public_fsdp_api(monkeypatch):
@@ -101,6 +104,87 @@ def test_legacy_fsdp_unused_param_reduction_fills_missing_local_grad(monkeypatch
     assert torch.equal(param.grad, torch.zeros_like(param))
     assert calls == [(param_group, ("arg",), {"flag": True})]
     assert FSDPParamGroup.post_backward is patched_post_backward
+
+
+def _install_uniform_reduce_dtype(monkeypatch, recorder):
+    """Install the patch over a stub foreach_reduce that records what it receives."""
+    import torch.distributed.fsdp._fully_shard._fsdp_collectives as collectives
+    import torch.distributed.fsdp._fully_shard._fsdp_param_group as param_group
+
+    def stub(fsdp_params, unsharded_grads, *args, **kwargs):
+        recorder.append([g.dtype for g in unsharded_grads])
+        return "reduced"
+
+    monkeypatch.setattr(collectives, "foreach_reduce", stub)
+    monkeypatch.setattr(param_group, "foreach_reduce", stub)
+    patch_fsdp_uniform_reduce_dtype()
+    return collectives
+
+
+def test_uniform_reduce_dtype_widens_mixed_group(monkeypatch):
+    """A bf16 straggler is widened to match its fp32 peers before the reduce."""
+    seen = []
+    collectives = _install_uniform_reduce_dtype(monkeypatch, seen)
+
+    grads = [torch.ones(2, dtype=torch.float32), torch.full((2,), 5.0, dtype=torch.bfloat16)]
+    result = collectives.foreach_reduce(["p0", "p1"], grads)
+
+    assert result == "reduced"
+    assert seen == [[torch.float32, torch.float32]]
+    # Mutated in place so foreach_reduce's list.clear() still frees the caller's refs.
+    assert [g.dtype for g in grads] == [torch.float32, torch.float32]
+    assert torch.equal(grads[1], torch.full((2,), 5.0))
+
+
+def test_uniform_reduce_dtype_leaves_uniform_group_untouched(monkeypatch):
+    """Uniform groups pass straight through, preserving upstream's own checks."""
+    seen = []
+    collectives = _install_uniform_reduce_dtype(monkeypatch, seen)
+
+    grads = [torch.ones(2, dtype=torch.bfloat16), torch.ones(2, dtype=torch.bfloat16)]
+    original = [g for g in grads]
+    collectives.foreach_reduce(["p0", "p1"], grads)
+
+    assert seen == [[torch.bfloat16, torch.bfloat16]]
+    assert all(a is b for a, b in zip(grads, original))
+
+
+def test_uniform_reduce_dtype_ignores_non_float_mixtures(monkeypatch):
+    """Non-float gradients are left alone so the upstream assertion still fires."""
+    seen = []
+    collectives = _install_uniform_reduce_dtype(monkeypatch, seen)
+
+    grads = [torch.ones(2, dtype=torch.float32), torch.ones(2, dtype=torch.int32)]
+    collectives.foreach_reduce(["p0", "p1"], grads)
+
+    assert seen == [[torch.float32, torch.int32]]
+
+
+def test_uniform_reduce_dtype_patch_is_idempotent(monkeypatch):
+    """Re-installing must not stack a second wrapper."""
+    seen = []
+    collectives = _install_uniform_reduce_dtype(monkeypatch, seen)
+    wrapped = collectives.foreach_reduce
+
+    patch_fsdp_uniform_reduce_dtype()
+
+    assert collectives.foreach_reduce is wrapped
+
+
+def test_configure_fsdp_unused_param_reduction_installs_dtype_alignment_first(monkeypatch):
+    """The zero fill must wrap the alignment so filled zeros are aligned too."""
+    from nemo_automodel.components.distributed import parallelizer_utils
+
+    class LegacyFSDPModule(nn.Module):
+        pass
+
+    order = []
+    monkeypatch.setattr(parallelizer_utils, "FSDPModule", LegacyFSDPModule)
+    monkeypatch.setattr(parallelizer_utils, "_patch_fsdp_uniform_reduce_dtype", lambda: order.append("uniform_dtype"))
+    monkeypatch.setattr(parallelizer_utils, "_patch_fsdp_unused_param_reduction", lambda: order.append("zero_fill"))
+
+    assert configure_fsdp_unused_param_reduction(nn.Sequential(LegacyFSDPModule())) == 1
+    assert order == ["uniform_dtype", "zero_fill"]
 
 
 def _tag_hf_compute_dtype(model: nn.Module) -> None:
