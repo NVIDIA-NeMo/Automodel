@@ -227,6 +227,12 @@ class Gemma4Gate(nn.Module):
         self.proj = nn.Linear(hidden_size, num_experts, bias=False, dtype=dtype)
         self.scale = nn.Parameter(torch.ones(hidden_size, dtype=dtype))
         scalar_root_size = hidden_size**-0.5
+        # Scale by the Python float, not the buffer: casting the module to bf16
+        # rounds the buffer to 0.01879883 (2.4e-3 off), and softmax is not
+        # scale-invariant, so that rescales every logit. The buffer is unused by
+        # forward and kept only for backward compatibility with
+        # test_gemma4_model.py, which asserts it exists and holds this value.
+        self.scalar_root_size = scalar_root_size
         self.register_buffer("root_size", torch.tensor(scalar_root_size), persistent=False)
 
     def forward(self, x, token_mask=None, cp_mesh=None):
@@ -238,9 +244,11 @@ class Gemma4Gate(nn.Module):
         # back to the input dtype for the downstream expert computation.
         input_dtype = x.dtype
 
+        # Applying self.scale before the root is a cosmetic swap to match HF's
+        # ordering; in fp32 it changes nothing. The fix is scalar_root_size,
+        # which keeps the constant exact instead of bf16-rounded (see __init__).
         x_norm = self.norm(x).to(torch.float32)
-        x_norm = x_norm * self.root_size.to(torch.float32)
-        x_norm = x_norm * self.scale.to(torch.float32)
+        x_norm = x_norm * self.scale.to(torch.float32) * self.scalar_root_size
 
         expert_scores = F.linear(x_norm, self.proj.weight.to(torch.float32))
         router_probs = F.softmax(expert_scores, dim=-1)
@@ -883,6 +891,12 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
     # nn.Module.to rounds floating buffers; cast_model_to_dtype restores keep-fp32
     # modules afterwards (see llama/rope_utils.py).
     _keep_in_fp32_modules = ["rotary_emb"]
+    # Gemma4Gate already computes routing in fp32 (softmax over 128 near-tied
+    # experts is ill-conditioned in bf16), upcasting from bf16 storage, so no
+    # AutoModel param needs pinning. These are HF's spellings of the same
+    # modules: they hold the vanilla-HF reference (ckpt_robustness tests) to the
+    # same fp32 routing contract instead of letting it round the router to bf16.
+    _keep_in_fp32_modules_strict = ["router.proj", "router.scale"]
     # CP submesh, recorded by _cp_shard_batch_aux_only the first time the dispatch
     # hands the model the CP submesh; None means the forward embeds/shards nothing
     # for CP.
@@ -1258,8 +1272,11 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
                     **kwargs,
                 )
                 hidden_states = text_outputs.last_hidden_state
-                slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-                logits = self.lm_head(hidden_states[:, slice_indices, :])
+                logits = compute_lm_head_logits(
+                    self.lm_head,
+                    hidden_states,
+                    logits_to_keep,
+                ).logits
                 if (final_logit_softcapping := getattr(text_config, "final_logit_softcapping", None)) is not None:
                     logits = logits / final_logit_softcapping
                     logits = torch.tanh(logits)
@@ -1380,7 +1397,11 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
 
         hidden_states = outputs.last_hidden_state
 
-        logits = compute_lm_head_logits(self.lm_head, hidden_states, logits_to_keep).logits
+        logits = compute_lm_head_logits(
+            self.lm_head,
+            hidden_states,
+            logits_to_keep,
+        ).logits
 
         if (final_logit_softcapping := getattr(text_config, "final_logit_softcapping", None)) is not None:
             logits = logits / final_logit_softcapping

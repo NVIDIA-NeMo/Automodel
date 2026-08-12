@@ -648,6 +648,59 @@ class TestMergeLoraFunction:
 
     @patch("tools.merge_lora.gc")
     @patch("tools.merge_lora.torch")
+    def test_vlm_processor_artifacts_are_saved(self, mock_torch, mock_gc, tmp_path):
+        """The merged output contains processor artifacts if save_tokenizer is True."""
+        from tools.merge_lora import merge_lora
+
+        mock_torch.float16 = torch.float16
+
+        mock_model = self._make_mock_model()
+        mock_peft_model = MagicMock()
+        mock_peft_model.merge_and_unload.return_value = mock_model
+
+        mock_auto = MagicMock()
+        mock_auto.__name__ = "AutoModelForImageTextToText"
+        mock_auto.from_pretrained.return_value = mock_model
+        mock_peft_cls = MagicMock()
+        mock_peft_cls.from_pretrained.return_value = mock_peft_model
+
+        mock_processor = MagicMock()
+        mock_processor_cls = MagicMock()
+        mock_processor_cls.from_pretrained.return_value = mock_processor
+
+        mock_tokenizer = MagicMock()
+        mock_tokenizer_cls = MagicMock()
+        mock_tokenizer_cls.from_pretrained.return_value = mock_tokenizer
+
+        output_dir = tmp_path / "out"
+        with patch("tools.merge_lora._resolve_auto_cls", return_value=mock_auto):
+            with patch.dict(
+                "sys.modules",
+                {
+                    "peft": MagicMock(PeftModel=mock_peft_cls),
+                    "transformers": MagicMock(
+                        AutoTokenizer=mock_tokenizer_cls,
+                        AutoProcessor=mock_processor_cls,
+                    ),
+                },
+            ):
+                merge_lora(
+                    base_model="/fake/vlm",
+                    adapter_path="/fake/adapter",
+                    output_dir=str(output_dir),
+                    dtype="float16",
+                    device="cpu",
+                    save_tokenizer=True,
+                    trust_remote_code=True,
+                )
+
+        mock_processor_cls.from_pretrained.assert_called_once_with("/fake/vlm", trust_remote_code=True)
+        mock_processor.save_pretrained.assert_called_once_with(str(output_dir))
+        mock_tokenizer_cls.from_pretrained.assert_called_once()
+        mock_tokenizer.save_pretrained.assert_called_once()
+
+    @patch("tools.merge_lora.gc")
+    @patch("tools.merge_lora.torch")
     def test_vlm_processor_artifacts_are_reloadable(self, mock_torch, mock_gc, tmp_path):
         """The merged output contains processor artifacts that AutoProcessor can reload."""
         from tokenizers import Tokenizer

@@ -14,6 +14,8 @@
 
 from pathlib import Path
 
+from ruamel.yaml import YAML
+
 from tests.ci_tests.utils.generate_ci_tests import generate_job, generate_pipeline
 
 
@@ -34,6 +36,34 @@ def test_generate_deepseek_v4_pretrain_release_job():
     job = pipeline["deepseek_v4_flash_pretrain"]
     assert job["extends"] == ".llm_pretrain_test"
     assert job["variables"]["TEST_LEVEL"] == "release"
+
+
+def test_generate_gpt_oss_120b_release_job_uses_ep64():
+    config = Path("examples/llm_finetune/gpt_oss/gpt_oss_120b.yaml")
+
+    jobs = dict(generate_job(config, {}, "release", "llm_finetune", "."))
+    recipe = YAML(typ="safe").load(config)
+
+    variables = jobs[""]["variables"]
+    world_size = variables["TEST_NODE_COUNT"] * 8
+    assert variables["TEST_NODE_COUNT"] == 8
+    assert variables["LOCAL_BATCH_SIZE"] == 8
+    assert recipe["distributed"]["ep_size"] == world_size
+    assert recipe["distributed"]["activation_checkpointing"] is False
+
+
+def test_generate_gpt_oss_120b_benchmark_job_uses_ep64_without_activation_checkpointing():
+    config = Path("examples/llm_benchmark/gpt_oss/gptoss_120b_te_deepep.yaml")
+
+    jobs = dict(generate_job(config, {}, "performance", "llm_benchmark", "."))
+    recipe = YAML(typ="safe").load(config)
+
+    variables = jobs[""]["variables"]
+    world_size = variables["TEST_NODE_COUNT"] * 8
+    assert variables["TEST_NODE_COUNT"] == 8
+    assert variables["EP_SIZE"] == world_size
+    assert recipe["distributed"]["ep_size"] == world_size
+    assert recipe["distributed"]["activation_checkpointing"] is False
 
 
 def test_generate_vllm_deploy_time_override(tmp_path):
@@ -92,9 +122,7 @@ ci:
 
     jobs = dict(generate_job(config, {}, "release", "llm_finetune", str(tmp_path)))
 
-    assert jobs[""]["variables"]["CHECKPOINT_ROBUSTNESS_PHASES"] == (
-        "train_and_save automodel_reload hf_reload resume_baseline resume"
-    )
+    assert jobs[""]["variables"]["CHECKPOINT_ROBUSTNESS_PHASES"] == ("train_and_save automodel_reload hf_reload resume")
 
 
 def test_generate_checkpoint_robustness_process_isolation_honors_skips(tmp_path):
@@ -131,3 +159,46 @@ ci:
     jobs = dict(generate_job(config, {}, "release", "llm_finetune", str(tmp_path)))
 
     assert jobs[""]["variables"]["CHECKPOINT_ROBUSTNESS_PHASES"] == "train_and_save automodel_reload"
+
+
+def test_generate_qwen3_moe_lora_uses_isolated_reload_phases():
+    config = Path("examples/llm_finetune/qwen/qwen3_moe_30b_lora.yaml")
+
+    jobs = dict(generate_job(config, {}, "release", "llm_finetune", "."))
+    ci_config = YAML(typ="safe").load(config)["ci"]
+    robustness = ci_config["checkpoint_robustness"]
+
+    variables = jobs[""]["variables"]
+    assert "CHECKPOINT_ROBUSTNESS_PHASES" not in ci_config.get("env_vars", {})
+    assert variables["PYTORCH_CUDA_ALLOC_CONF"] == "expandable_segments:True"
+    assert variables["CHECKPOINT_ROBUSTNESS_PROCESS_ISOLATION"] == "true"
+    assert variables["CHECKPOINT_ROBUSTNESS_PHASES"] == (
+        "source_load_reference source_load_parity train_and_save automodel_reload hf_reload"
+    )
+    assert robustness["check_source_load_parity"] is True
+    assert robustness["skip_hf_logit_parity"] is True
+    assert robustness["source_load_kl_threshold"] == 3e-2
+    assert robustness["source_load_mean_kl_threshold"] == 6e-3
+    assert robustness["source_load_cosine_threshold"] == 0.997
+
+
+def test_generate_qwen3_moe_te_deepep_uses_isolated_source_and_reload_phases():
+    config = Path("examples/llm_finetune/qwen/qwen3_moe_30b_te_deepep.yaml")
+
+    jobs = dict(generate_job(config, {}, "release", "llm_finetune", "."))
+    ci_config = YAML(typ="safe").load(config)["ci"]
+    robustness = ci_config["checkpoint_robustness"]
+
+    variables = jobs[""]["variables"]
+    assert "CHECKPOINT_ROBUSTNESS_PHASES" not in ci_config.get("env_vars", {})
+    assert variables["TIME"] == "00:20:00"
+    assert variables["CHECKPOINT_ROBUSTNESS_PROCESS_ISOLATION"] == "true"
+    assert variables["CHECKPOINT_ROBUSTNESS_PHASES"] == (
+        "source_load_reference source_load_parity train_and_save automodel_reload hf_reload"
+    )
+    assert robustness["check_source_load_parity"] is True
+    assert robustness["source_load_kl_threshold"] == 3e-2
+    assert robustness["source_load_mean_kl_threshold"] == 6e-3
+    assert robustness["source_load_cosine_threshold"] == 0.997
+    assert robustness["trust_remote_code"] is True
+    assert robustness["hf_device_map_auto"] is True

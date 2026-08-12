@@ -568,6 +568,18 @@ class TestCastFrozenModulesToComputeDtype:
         for p in model.parameters():
             assert p.dtype == torch.float32
 
+    def test_frozen_weight_cast_with_trainable_adapter_subtree(self):
+        model = nn.Linear(4, 4)
+        model.weight.requires_grad_(False)
+        model.bias.requires_grad_(False)
+        model.adapter = nn.Linear(4, 2, bias=False)
+
+        cast_frozen_modules_to_compute_dtype(model, torch.bfloat16)
+
+        assert model.weight.dtype == torch.bfloat16
+        assert model.bias.dtype == torch.bfloat16
+        assert model.adapter.weight.dtype == torch.bfloat16
+
     def test_sharded_frozen_param_skipped_but_buffer_cast(self, monkeypatch):
         """A sharded (DTensor) frozen param is left to FSDP, but its fp32 buffers are still cast.
 

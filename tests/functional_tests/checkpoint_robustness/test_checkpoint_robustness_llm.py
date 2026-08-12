@@ -15,7 +15,7 @@
 """Train, checkpoint, and validate AutoModel and vanilla-HF reloads.
 
 Launch: torchrun --nproc-per-node=<N> -m <this_module> --config <config.yaml>
-    [--isolated_phase <source_load_reference|source_load_parity|train_and_save|automodel_reload|hf_reload|resume_baseline|resume>]
+    [--isolated_phase <source_load_reference|source_load_parity|train_and_save|automodel_reload|hf_reload|resume>]
     [--kl_threshold <float>] [--hf_kl_threshold <float>]
     [--cross_tp_size <int>] [--cross_tp_kl_threshold <float>]
     [--tokenizer_name <str>]
@@ -32,6 +32,7 @@ import gc
 import hashlib
 import inspect
 import json
+import math
 import os
 import sys
 import time
@@ -59,6 +60,22 @@ from nemo_automodel.components.checkpoint.checkpointing import (
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.shared.utils import dtype_from_str
+from tests.functional_tests.checkpoint_robustness.resume_trajectory import (
+    _checkpoint_for_completed_steps,
+    _checkpoint_state_snapshot,
+    _configure_resumed_run,
+    _configure_uninterrupted_run,
+    _gather_rank_failures,
+    _load_reference_trajectory,
+    _persist_reference_trajectory,
+    _persist_training_reproducibility,
+    _report_training_reproducibility,
+    _restored_state_mismatch,
+    _resume_plan_from_config,
+    _TrainingReproducibilityRecorder,
+    _trajectory_mismatch,
+    _TrajectoryRecorder,
+)
 
 datasets.disable_caching()
 
@@ -81,6 +98,8 @@ def _extract_custom_args(argv):
         "--tokenizer_name",
         "--max_vram_gb",
         "--max_cpu_gb",
+        "--training_reproducibility_loss_threshold",
+        "--resume_first_loss_threshold",
         "--resume_loss_threshold",
         "--source_load_cosine_threshold",
         "--source_load_kl_threshold",
@@ -427,7 +446,11 @@ def _assert_peft_adapter_matches_checkpoint(
     from safetensors import safe_open
 
     assert adapter_path.exists(), f"adapter_model.safetensors not found at {adapter_path}"
-    loaded_adapter = get_peft_model_state_dict(peft_model)
+    # This comparison is against AutoModel's adapter-only safetensors export.
+    # PEFT's default ``save_embedding_layers="auto"`` treats a targeted output
+    # head as an embedding and adds its base-layer weight, even though that
+    # tensor is not adapter state and is intentionally absent from the file.
+    loaded_adapter = get_peft_model_state_dict(peft_model, save_embedding_layers=False)
     normalized_parameter_names = {}
     if any(tensor.is_meta for tensor in loaded_adapter.values()):
         for parameter_name, _ in peft_model.named_parameters():
@@ -1448,9 +1471,14 @@ def _release_recipe_memory(recipe) -> None:
 def _checkpoint_paths(cfg) -> tuple[Path, Path, Path]:
     """Locate the latest checkpoint and its consolidated model directory."""
     checkpoint_dir = Path(cfg.checkpoint.checkpoint_dir)
-    ckpt_step_dirs = sorted(checkpoint_dir.glob("epoch_*_step_*"))
+    ckpt_step_dirs = list(checkpoint_dir.glob("epoch_*_step_*"))
     assert ckpt_step_dirs, f"No checkpoint subdirectories found under {checkpoint_dir}"
-    ckpt_step_dir = ckpt_step_dirs[-1]
+
+    def checkpoint_position(path: Path) -> tuple[int, int]:
+        name_parts = path.name.split("_")
+        return int(name_parts[1]), int(name_parts[3])
+
+    ckpt_step_dir = max(ckpt_step_dirs, key=checkpoint_position)
     return checkpoint_dir, ckpt_step_dir, ckpt_step_dir / "model" / "consolidated"
 
 
@@ -1463,6 +1491,18 @@ def _materialize_hf_quantization_config(cfg):
         except Exception:
             return None
     return raw_quantization_config
+
+
+def _hf_reload_kl_error(max_kl_hf: float, hf_kl_threshold: float) -> str | None:
+    """Return an actionable HF reload parity error, including non-finite results."""
+    if not math.isfinite(max_kl_hf):
+        return f"HF-loaded model produced non-finite KL divergence: {max_kl_hf}"
+    if max_kl_hf > hf_kl_threshold:
+        return (
+            "KL divergence between original and HF-loaded model too large: "
+            f"max per-token KL = {max_kl_hf:.6e} > threshold {hf_kl_threshold:.6e}"
+        )
+    return None
 
 
 def _run_vanilla_hf_reload(
@@ -1513,6 +1553,9 @@ def _run_vanilla_hf_reload(
             trust_remote_code=trust_remote_code,
             local_files_only=os.environ.get("HF_HUB_OFFLINE", "0") == "1",
         )
+        for key in ("revision", "token"):
+            if model_kwargs.get(key) is not None:
+                hf_kwargs[key] = model_kwargs[key]
         # Remote-code models can ship attention names that transformers 5.x
         # rejects. Select a supported implementation while keeping Nemotron-H
         # off HF's incompatible FlashAttention varlen path.
@@ -1544,6 +1587,8 @@ def _run_vanilla_hf_reload(
             hf_config = _load_hf_config(
                 config_path,
                 trust_remote_code=trust_remote_code,
+                revision=model_kwargs.get("revision"),
+                token=model_kwargs.get("token"),
             )
         # Load the reference model straight onto the target GPU. Materialising a
         # 14B checkpoint on CPU and then ``.to(device)`` costs ~50-225s, and that
@@ -1642,11 +1687,7 @@ def _run_vanilla_hf_reload(
         else:
             max_kl_hf = _kl_divergence_from_logits(reference_logits, hf_logits).max().item()
             print(f"[HF reload] HF-loaded max KL: {max_kl_hf:.6e} (threshold: {hf_kl_threshold:.6e})")
-            if max_kl_hf > hf_kl_threshold:
-                hf_reload_error = (
-                    "KL divergence between original and HF-loaded model too large: "
-                    f"max per-token KL = {max_kl_hf:.6e} > threshold {hf_kl_threshold:.6e}"
-                )
+            hf_reload_error = _hf_reload_kl_error(max_kl_hf, hf_kl_threshold)
         del hf_logits
         _release_model_memory()
         return hf_reload_error
@@ -1728,13 +1769,14 @@ def _run_process_isolated_checkpoint_phase(
         "train_and_save",
         "automodel_reload",
         "hf_reload",
-        "resume_baseline",
         "resume",
     }
     if phase not in supported_phases:
         raise ValueError(f"Unsupported isolated checkpoint phase {phase!r}; expected one of {sorted(supported_phases)}")
     if int(custom_args.get("cross_tp_size", "0")) > 0:
         raise ValueError("Process-isolated checkpoint mode does not yet support cross_tp_size")
+    if custom_args.get("no_check_resume", False) and phase == "resume":
+        raise ValueError(f"Process-isolated phase {phase!r} conflicts with no_check_resume=true")
 
     _disable_distributed_atexit_teardown()
     cfg = parse_args_and_load_config()
@@ -1898,11 +1940,24 @@ def _run_process_isolated_checkpoint_phase(
     if phase == "train_and_save":
         _report_phase("Isolated train/save: loading prompt input IDs")
         input_ids = _load_input_ids_once(cfg, input_ids_loader, tokenizer_name)
+        resume_plan = None
+        if custom_args.get("check_resume", False):
+            resume_plan = _resume_plan_from_config(cfg)
+            _configure_uninterrupted_run(cfg, resume_plan)
 
         torch.cuda.reset_peak_memory_stats()
         _report_phase("Isolated train/save: starting trainer setup")
         trainer = recipe_cls(cfg)
         trainer.setup()
+        resume_recorder = None
+        if resume_plan is not None:
+            resume_recorder = _TrajectoryRecorder(resume_plan, capture_boundary_state=True)
+            resume_recorder.attach(trainer)
+        reproducibility_recorder = None
+        reproducibility_dir = os.environ.get("AUTOMODEL_REPRODUCIBILITY_DIR")
+        if reproducibility_dir is not None:
+            reproducibility_recorder = _TrainingReproducibilityRecorder(trainer)
+            reproducibility_recorder.attach()
         _report_phase("Isolated train/save: trainer setup complete")
         if tokenizer_name is not None and dist.is_initialized() and dist.get_world_size() > 1:
             _barrier()
@@ -1913,6 +1968,25 @@ def _run_process_isolated_checkpoint_phase(
         _report_phase("Isolated train/save: starting training and checkpoint")
         trainer.run_train_validation_loop()
         _report_phase("Isolated train/save: training and checkpoint complete")
+
+        if resume_recorder is not None:
+            _persist_reference_trajectory(resume_recorder)
+            _barrier()
+            if _rank0():
+                print("[Resume correctness] Persisted the uninterrupted post-checkpoint trajectory")
+        if reproducibility_recorder is not None:
+            artifact_dir = Path(reproducibility_dir)
+            _persist_training_reproducibility(
+                reproducibility_recorder,
+                artifact_dir,
+                lifecycle="checkpoint",
+            )
+            _barrier()
+            _report_training_reproducibility(
+                artifact_dir,
+                reproducibility_recorder,
+                loss_threshold=float(custom_args.get("training_reproducibility_loss_threshold", "5e-2")),
+            )
 
         peak_vram_gb = torch.cuda.max_memory_allocated() / 1024**3
         peak_cpu_gb = _rss_gb()
@@ -1988,7 +2062,18 @@ def _run_process_isolated_checkpoint_phase(
                 _cleanup_input_ids_sync(cfg)
             _barrier()
 
+        device = next(restored_trainer.model_parts[0].parameters()).device
+        restored_logits = _get_logits(
+            restored_trainer.model_parts[0],
+            input_ids,
+            device,
+            trainer=restored_trainer,
+        )
         if is_peft:
+            # Capture both sides after a forward. FSDP may change a parameter's
+            # rank-local view during its first unshard/reshard lifecycle, so
+            # hashing the restored model immediately after setup is not
+            # comparable to the post-forward training reference.
             artifact_dir = _robustness_artifact_dir(cfg)
             rank = dist.get_rank() if dist.is_initialized() else 0
             expected_digests_path = artifact_dir / f"trainable_parameter_digests_rank_{rank}.json"
@@ -2031,13 +2116,6 @@ def _run_process_isolated_checkpoint_phase(
                     )
             _raise_distributed_failure(failure_message)
 
-        device = next(restored_trainer.model_parts[0].parameters()).device
-        restored_logits = _get_logits(
-            restored_trainer.model_parts[0],
-            input_ids,
-            device,
-            trainer=restored_trainer,
-        )
         failure_message = None
         if _rank0():
             reference_logits = torch.load(reference_path, map_location="cpu", weights_only=True)
@@ -2063,98 +2141,40 @@ def _run_process_isolated_checkpoint_phase(
         )
         return
 
-    original_max_steps = cfg.step_scheduler.max_steps
-    resume_max_steps = original_max_steps + 3
-    artifact_dir = _robustness_artifact_dir(cfg)
-    baseline_losses_path = artifact_dir / "baseline_losses.json"
-
-    if phase == "resume_baseline":
-        baseline_dir = artifact_dir / "resume_baseline"
-        cfg.step_scheduler.max_steps = resume_max_steps
-        cfg.checkpoint.checkpoint_dir = str(baseline_dir)
-        cfg.checkpoint.enabled = False
-        if hasattr(cfg, "lr_scheduler") and cfg.lr_scheduler is not None:
-            cfg.lr_scheduler.lr_decay_steps = original_max_steps
-
-        _report_phase("Isolated resume baseline: starting trainer setup")
-        baseline_trainer = recipe_cls(cfg)
-        baseline_trainer.setup()
-        _report_phase("Isolated resume baseline: setup complete; starting training")
-        baseline_trainer.run_train_validation_loop()
-        _report_phase("Isolated resume baseline: training complete")
-
-        failure_message = None
-        if _rank0():
-            baseline_losses = {}
-            baseline_jsonl = baseline_dir / "training.jsonl"
-            if baseline_jsonl.exists():
-                with baseline_jsonl.open() as f:
-                    for line in f:
-                        entry = json.loads(line)
-                        if entry["step"] >= original_max_steps:
-                            baseline_losses[entry["step"]] = entry["loss"]
-            if not baseline_losses:
-                failure_message = "Isolated resume baseline produced no post-checkpoint losses"
-            else:
-                artifact_dir.mkdir(parents=True, exist_ok=True)
-                baseline_losses_path.write_text(json.dumps(baseline_losses, sort_keys=True))
-        _raise_distributed_failure(failure_message)
-        _report_phase("Isolated resume baseline: losses persisted; exiting phase")
-        return
-
-    checkpoint_dir, ckpt_step_dir, _ = _checkpoint_paths(cfg)
-    assert baseline_losses_path.exists(), f"Baseline losses not found at {baseline_losses_path}"
-    cfg.checkpoint.restore_from = str(ckpt_step_dir)
-    cfg.step_scheduler.max_steps = resume_max_steps
+    resume_plan = _resume_plan_from_config(cfg)
+    reference_trajectory = _load_reference_trajectory(resume_plan)
+    checkpoint_path = _checkpoint_for_completed_steps(resume_plan, resume_plan.boundary_step)
+    _configure_resumed_run(cfg, resume_plan, checkpoint_path)
 
     _report_phase("Isolated resume: starting setup and optimizer checkpoint load")
     resume_trainer = recipe_cls(cfg)
     resume_trainer.setup()
-    _report_phase("Isolated resume: checkpoint load complete; starting training")
+    restored_state = _checkpoint_state_snapshot(resume_trainer, state_is_being_saved=False)
+    local_failure = _restored_state_mismatch(reference_trajectory["boundary_state"], restored_state)
+    failure_message = _gather_rank_failures(local_failure, check="restored_state")
+    _raise_distributed_failure(failure_message)
+    if _rank0():
+        print(
+            "[Resume correctness] Model-adjacent checkpoint state matched exactly: optimizer, "
+            "LR/weight-decay schedulers, and RNG; dataloader position is verified by exact resumed batch identity"
+        )
+
+    resume_recorder = _TrajectoryRecorder(resume_plan, capture_boundary_state=False)
+    resume_recorder.attach(resume_trainer)
+    _report_phase("Isolated resume: checkpoint state verified; starting shared-trajectory continuation")
     resume_trainer.run_train_validation_loop()
     _report_phase("Isolated resume: training complete")
 
-    failure_message = None
-    if _rank0():
-        baseline_losses = {int(step): loss for step, loss in json.loads(baseline_losses_path.read_text()).items()}
-        resume_jsonl = checkpoint_dir / "training.jsonl"
-        if not resume_jsonl.exists():
-            failure_message = f"Isolated resume log not found at {resume_jsonl}"
-        else:
-            resume_losses = {}
-            with resume_jsonl.open() as f:
-                for line in f:
-                    entry = json.loads(line)
-                    if entry["step"] in baseline_losses:
-                        resume_losses[entry["step"]] = entry["loss"]
-
-            matched_steps = 0
-            is_peft = hasattr(cfg, "peft")
-            resume_loss_threshold = float(custom_args.get("resume_loss_threshold", "5e-3"))
-            for step in sorted(baseline_losses):
-                if step not in resume_losses:
-                    continue
-                matched_steps += 1
-                baseline_loss = baseline_losses[step]
-                resume_loss = resume_losses[step]
-                difference = abs(baseline_loss - resume_loss)
-                print(
-                    f"[Isolated resume] Step {step}: baseline_loss={baseline_loss:.6f}, "
-                    f"resume_loss={resume_loss:.6f}, diff={difference:.6e}"
-                )
-                if not is_peft and difference >= resume_loss_threshold:
-                    failure_message = (
-                        f"SFT loss mismatch after resume at step {step}: baseline={baseline_loss:.6f}, "
-                        f"resume={resume_loss:.6f}, diff={difference:.6e}"
-                    )
-                    break
-            if failure_message is None and matched_steps == 0:
-                failure_message = (
-                    f"No overlapping steps between baseline ({sorted(baseline_losses)}) "
-                    f"and resume ({sorted(resume_losses)})"
-                )
+    resumed_trajectory = resume_recorder.to_dict()
+    local_failure = _trajectory_mismatch(
+        reference_trajectory,
+        resumed_trajectory,
+        first_loss_threshold=float(custom_args.get("resume_first_loss_threshold", "1e-6")),
+        later_loss_threshold=float(custom_args.get("resume_loss_threshold", "5e-3")),
+    )
+    failure_message = _gather_rank_failures(local_failure, check="shared_trajectory")
     _raise_distributed_failure(failure_message)
-    _report_phase("Isolated resume: optimizer save/load/resume verified; exiting phase")
+    _report_phase("Isolated resume: shared-trajectory checkpoint continuation verified; exiting phase")
 
 
 def run_checkpoint_robustness(
@@ -2200,7 +2220,9 @@ def run_checkpoint_robustness(
     max_cpu_gb = float(custom_args.get("max_cpu_gb", "0"))
     check_phantom_keys = bool(custom_args.get("check_phantom_keys", False))
     check_resume = bool(custom_args.get("check_resume", False))
+    resume_first_loss_threshold = float(custom_args.get("resume_first_loss_threshold", "1e-6"))
     resume_loss_threshold = float(custom_args.get("resume_loss_threshold", "5e-3"))
+    training_reproducibility_loss_threshold = float(custom_args.get("training_reproducibility_loss_threshold", "5e-2"))
     hf_device_map_auto = bool(custom_args.get("hf_device_map_auto", False))
     hf_source_post_load_dequantize = bool(custom_args.get("hf_source_post_load_dequantize", False))
     skip_hf_reload = bool(custom_args.get("skip_hf_reload", False))
@@ -2211,6 +2233,9 @@ def run_checkpoint_robustness(
     deferred_failures: list[str] = []
 
     cfg = parse_args_and_load_config()
+    resume_plan = _resume_plan_from_config(cfg) if check_resume else None
+    if resume_plan is not None:
+        _configure_uninterrupted_run(cfg, resume_plan)
     input_ids = _load_input_ids_once(cfg, input_ids_loader, tokenizer_name)
 
     source_load_reference = None
@@ -2271,14 +2296,46 @@ def run_checkpoint_robustness(
         del trainer
         _barrier()
         cfg = parse_args_and_load_config()
+        if resume_plan is not None:
+            _configure_uninterrupted_run(cfg, resume_plan)
         _report_phase("Phase 1: starting fresh trainer setup after source parity")
         trainer = recipe_cls(cfg)
         trainer.setup()
         _report_phase("Phase 1: fresh trainer setup complete")
 
+    resume_recorder = None
+    if resume_plan is not None:
+        resume_recorder = _TrajectoryRecorder(resume_plan, capture_boundary_state=True)
+        resume_recorder.attach(trainer)
+    reproducibility_recorder = None
+    reproducibility_dir = os.environ.get("AUTOMODEL_REPRODUCIBILITY_DIR")
+    if reproducibility_dir is not None:
+        reproducibility_recorder = _TrainingReproducibilityRecorder(trainer)
+        reproducibility_recorder.attach()
     _report_phase("Phase 1: starting train and checkpoint")
     trainer.run_train_validation_loop()
     _report_phase("Phase 1: train and checkpoint complete")
+    if resume_recorder is not None:
+        _persist_reference_trajectory(resume_recorder)
+        _barrier()
+        if _rank0():
+            print(
+                "[Resume correctness] Phase 1 continued through the comparison steps from the exact "
+                "checkpoint-producing trajectory"
+            )
+    if reproducibility_recorder is not None:
+        artifact_dir = Path(reproducibility_dir)
+        _persist_training_reproducibility(
+            reproducibility_recorder,
+            artifact_dir,
+            lifecycle="checkpoint",
+        )
+        _barrier()
+        _report_training_reproducibility(
+            artifact_dir,
+            reproducibility_recorder,
+            loss_threshold=training_reproducibility_loss_threshold,
+        )
 
     # Memory tracking after training
     peak_vram_gb = torch.cuda.max_memory_allocated() / 1024**3
@@ -2297,10 +2354,10 @@ def run_checkpoint_robustness(
     _report_phase("Phase 2: reference-logits capture complete")
 
     # Locate the Phase 1 checkpoint used by the reload and resume checks.
-    checkpoint_dir = Path(cfg.checkpoint.checkpoint_dir)
-    ckpt_step_dirs = sorted(checkpoint_dir.glob("epoch_*_step_*"))
-    assert len(ckpt_step_dirs) > 0, f"No checkpoint subdirectories found under {checkpoint_dir}"
-    ckpt_step_dir = ckpt_step_dirs[-1]
+    if resume_plan is not None:
+        ckpt_step_dir = _checkpoint_for_completed_steps(resume_plan, resume_plan.final_max_steps)
+    else:
+        _, ckpt_step_dir, _ = _checkpoint_paths(cfg)
     consolidated_dir = ckpt_step_dir / "model" / "consolidated"
 
     is_peft = hasattr(cfg, "peft")
@@ -2423,92 +2480,47 @@ def run_checkpoint_robustness(
         _barrier()
         _report_phase("Phase 5: cross-TP reload complete")
 
-    # Phase 6 (optional): Training resumption — verify loss continuity
-    # Phase 1 trained for max_steps (e.g. 5) and checkpointed. We now train a fresh baseline
-    # for max_steps+3 (no checkpoint save), then resume from the checkpoint and train to
-    # max_steps+3. For SFT, losses should match to ~4 decimal places.
+    # Phase 6 (optional): restore the exact Phase 1 boundary and replay its continuation.
     if check_resume:
-        import json
-        import shutil
-        import tempfile
-
-        # Baseline: fresh continuous run for max_steps+3, saving losses to a temp dir
-        _report_phase("Phase 6: starting continuous-baseline setup")
-        baseline_dir = tempfile.mkdtemp(prefix="resume_baseline_")
+        assert resume_plan is not None
+        reference_trajectory = _load_reference_trajectory(resume_plan)
+        checkpoint_path = _checkpoint_for_completed_steps(resume_plan, resume_plan.boundary_step)
         cfg = parse_args_and_load_config()
-        original_max_steps = cfg.step_scheduler.max_steps
-        resume_max_steps = original_max_steps + 3
-        cfg.step_scheduler.max_steps = resume_max_steps
-        cfg.checkpoint.checkpoint_dir = baseline_dir
-        cfg.checkpoint.enabled = False
-        # Phase 1 computed lr_decay_steps = min(total_epoch_steps, original_max_steps).
-        # With resume_max_steps the baseline would compute a *different* lr_decay_steps,
-        # causing the LR curve (and thus model weights) at step N to diverge from
-        # Phase 1's checkpoint.  Pin lr_decay_steps to match Phase 1.
-        if hasattr(cfg, "lr_scheduler") and cfg.lr_scheduler is not None:
-            cfg.lr_scheduler.lr_decay_steps = original_max_steps
-        baseline_trainer = recipe_cls(cfg)
-        baseline_trainer.setup()
-        _report_phase("Phase 6: continuous-baseline setup complete; starting training")
-        baseline_trainer.run_train_validation_loop()
-        _report_phase("Phase 6: continuous-baseline training complete")
-
-        baseline_losses = {}
-        baseline_jsonl = Path(baseline_dir) / "training.jsonl"
-        if _rank0() and baseline_jsonl.exists():
-            with open(baseline_jsonl) as f:
-                for line in f:
-                    entry = json.loads(line)
-                    if entry["step"] >= original_max_steps:
-                        baseline_losses[entry["step"]] = entry["loss"]
-
-        _release_recipe_memory(baseline_trainer)
-        del baseline_trainer
-        shutil.rmtree(baseline_dir, ignore_errors=True)
-
-        # Resume: reload from Phase 1 checkpoint and train to resume_max_steps.
+        _configure_resumed_run(cfg, resume_plan, checkpoint_path)
         _report_phase("Phase 6: starting resume setup and checkpoint load")
-        cfg = parse_args_and_load_config()
-        cfg.checkpoint.restore_from = str(ckpt_step_dir)
-        cfg.step_scheduler.max_steps = resume_max_steps
         resume_trainer = recipe_cls(cfg)
         resume_trainer.setup()
-        _report_phase("Phase 6: resume setup and checkpoint load complete; starting training")
+        restored_state = _checkpoint_state_snapshot(resume_trainer, state_is_being_saved=False)
+        local_failure = _restored_state_mismatch(reference_trajectory["boundary_state"], restored_state)
+        failure_message = _gather_rank_failures(local_failure, check="restored_state")
+        _raise_distributed_failure(failure_message)
+        if _rank0():
+            print(
+                "[Resume correctness] Restored optimizer, LR/weight-decay schedulers, and RNG exactly at the "
+                "Phase 1 boundary; dataloader position is verified by exact resumed batch identity"
+            )
+
+        resumed_recorder = _TrajectoryRecorder(resume_plan, capture_boundary_state=False)
+        resumed_recorder.attach(resume_trainer)
+        _report_phase("Phase 6: checkpoint state verified; starting shared-trajectory continuation")
         resume_trainer.run_train_validation_loop()
         _report_phase("Phase 6: resumed training complete")
 
-        # Compare losses at the overlapping steps
-        resume_jsonl = checkpoint_dir / "training.jsonl"
+        resumed_trajectory = resumed_recorder.to_dict()
+        local_failure = _trajectory_mismatch(
+            reference_trajectory,
+            resumed_trajectory,
+            first_loss_threshold=resume_first_loss_threshold,
+            later_loss_threshold=resume_loss_threshold,
+        )
+        failure_message = _gather_rank_failures(local_failure, check="shared_trajectory")
+        _raise_distributed_failure(failure_message)
         if _rank0():
-            assert baseline_losses, "Phase 6: baseline_losses is empty — no steps to compare"
-            assert resume_jsonl.exists(), f"Phase 6: {resume_jsonl} not found"
-
-            resume_losses = {}
-            with open(resume_jsonl) as f:
-                for line in f:
-                    entry = json.loads(line)
-                    if entry["step"] in baseline_losses:
-                        resume_losses[entry["step"]] = entry["loss"]
-
-            matched_steps = 0
-            for step in sorted(baseline_losses):
-                if step in resume_losses:
-                    matched_steps += 1
-                    bl = baseline_losses[step]
-                    rl = resume_losses[step]
-                    diff = abs(bl - rl)
-                    print(f"[Phase 6] Step {step}: baseline_loss={bl:.6f}, resume_loss={rl:.6f}, diff={diff:.6e}")
-                    if not is_peft:
-                        assert diff < resume_loss_threshold, (
-                            f"SFT loss mismatch after resume at step {step}: "
-                            f"baseline={bl:.6f}, resume={rl:.6f}, diff={diff:.6e}"
-                        )
-
-            assert matched_steps > 0, (
-                f"Phase 6: no overlapping steps found between baseline ({sorted(baseline_losses.keys())}) "
-                f"and resume ({sorted(resume_losses.keys())})"
+            print(
+                f"[Resume correctness] Shared-trajectory continuation verified for "
+                f"{resume_plan.continuation_steps} steps; first-step threshold={resume_first_loss_threshold:.3e}, "
+                f"later-step threshold={resume_loss_threshold:.3e}"
             )
-            print(f"[Phase 6] Training resumption verified ({matched_steps} steps compared) ✓")
 
         _release_recipe_memory(resume_trainer)
         del resume_trainer
