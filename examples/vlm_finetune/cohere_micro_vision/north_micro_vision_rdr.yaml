@@ -1,4 +1,4 @@
-# LoRA fine-tune of North Micro Vision Instruct (preview) on the RDR
+# LoRA fine-tune of North Micro Vision Instruct on the RDR
 # image-description dataset -- the smallest end-to-end check that the model,
 # LoRA injection, FSDP2 and checkpointing all work before committing to a real
 # run. RDR is 48 rows in a single `train` split, so at global_batch_size 8 an
@@ -34,14 +34,14 @@ rng:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
-  pretrained_model_name_or_path: CohereLabs/North-Micro-Vision-instruct-preview
+  pretrained_model_name_or_path: CohereLabs/North-Micro-Vision-Instruct
   # sdpa, not flash_attention_2: flash-attn is not installed.
   attn_implementation: sdpa
   trust_remote_code: true
 
 processor:
   _target_: transformers.AutoProcessor.from_pretrained
-  pretrained_model_name_or_path: CohereLabs/North-Micro-Vision-instruct-preview
+  pretrained_model_name_or_path: CohereLabs/North-Micro-Vision-Instruct
   trust_remote_code: true
 
 checkpoint:

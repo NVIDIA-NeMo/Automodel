@@ -1,4 +1,4 @@
-# Full-epoch LoRA fine-tune of Cohere North Micro Vision Instruct (preview) on
+# Full-epoch LoRA fine-tune of Cohere North Micro Vision Instruct on
 # the complete Shopify/product-catalogue train split (38,631 rows).
 #
 #   automodel north_micro_vision_shopify_full.yaml --nproc-per-node 2
@@ -33,13 +33,13 @@ rng:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
-  pretrained_model_name_or_path: CohereLabs/North-Micro-Vision-instruct-preview
+  pretrained_model_name_or_path: CohereLabs/North-Micro-Vision-Instruct
   attn_implementation: sdpa
   trust_remote_code: true
 
 processor:
   _target_: transformers.AutoProcessor.from_pretrained
-  pretrained_model_name_or_path: CohereLabs/North-Micro-Vision-instruct-preview
+  pretrained_model_name_or_path: CohereLabs/North-Micro-Vision-Instruct
   trust_remote_code: true
 
 checkpoint:

@@ -1,9 +1,9 @@
 ---
 title: "North Micro Vision"
-description: "LoRA fine-tune the North Micro Vision instruct preview, a native-resolution vision language model, with FSDP2 on two GPUs."
+description: "LoRA fine-tune North Micro Vision Instruct, a native-resolution vision language model, with FSDP2 on two GPUs."
 slug: model-coverage/vision-language-models/coherelabs/north-micro-vision
 ---
-[North Micro Vision](https://huggingface.co/CohereLabs/North-Micro-Vision-instruct-preview) is Cohere Labs' 2.4B-parameter vision language model with native-resolution image support. NeMo AutoModel loads it through `NeMoAutoModelForImageTextToText` with `trust_remote_code`, since the architecture is not yet registered upstream.
+[North Micro Vision](https://huggingface.co/CohereLabs/North-Micro-Vision-Instruct) is Cohere Labs' 2.4B-parameter vision language model with native-resolution image support. NeMo AutoModel loads it through `NeMoAutoModelForImageTextToText` with `trust_remote_code`, since the architecture is not yet registered upstream.
 
 
 <Warning>
@@ -54,6 +54,6 @@ Both datasets feed the generic `default_collate_fn`, since `CohereCompassProcess
 
 ## References
 
-- [North Micro Vision model card](https://huggingface.co/CohereLabs/North-Micro-Vision-instruct-preview)
+- [North Micro Vision model card](https://huggingface.co/CohereLabs/North-Micro-Vision-Instruct)
 - [Introducing North Micro Vision](https://huggingface.co/blog/CohereLabs/introducing-north-micro-vision)
 - [Shopify product-catalogue dataset](https://huggingface.co/datasets/Shopify/product-catalogue)

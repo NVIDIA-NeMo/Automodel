@@ -1,5 +1,5 @@
 # Resume variant of the Shopify LoRA fine-tune of Cohere North Micro Vision
-# Instruct (preview) -- product image -> taxonomy category. Restores from a
+# Instruct -- product image -> taxonomy category. Restores from a
 # checkpoint written by north_micro_vision_shopify_lora.yaml and continues
 # training, exercising the checkpoint restore path.
 #
@@ -31,13 +31,13 @@ rng:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
-  pretrained_model_name_or_path: CohereLabs/North-Micro-Vision-instruct-preview
+  pretrained_model_name_or_path: CohereLabs/North-Micro-Vision-Instruct
   attn_implementation: sdpa
   trust_remote_code: true
 
 processor:
   _target_: transformers.AutoProcessor.from_pretrained
-  pretrained_model_name_or_path: CohereLabs/North-Micro-Vision-instruct-preview
+  pretrained_model_name_or_path: CohereLabs/North-Micro-Vision-Instruct
   trust_remote_code: true
 
 checkpoint:

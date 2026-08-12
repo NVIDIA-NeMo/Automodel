@@ -1,4 +1,4 @@
-# LoRA fine-tune of Cohere North Micro Vision Instruct (preview) on
+# LoRA fine-tune of Cohere North Micro Vision Instruct on
 # Shopify/product-catalogue -- product image -> taxonomy category.
 #
 # 2-GPU data-parallel (FSDP2) run:
@@ -28,13 +28,13 @@ rng:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
-  pretrained_model_name_or_path: CohereLabs/North-Micro-Vision-instruct-preview
+  pretrained_model_name_or_path: CohereLabs/North-Micro-Vision-Instruct
   attn_implementation: sdpa
   trust_remote_code: true
 
 processor:
   _target_: transformers.AutoProcessor.from_pretrained
-  pretrained_model_name_or_path: CohereLabs/North-Micro-Vision-instruct-preview
+  pretrained_model_name_or_path: CohereLabs/North-Micro-Vision-Instruct
   trust_remote_code: true
 
 checkpoint:
