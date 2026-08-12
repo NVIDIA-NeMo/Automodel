@@ -29,10 +29,11 @@ from tokenizers import Tokenizer
 from tokenizers.models import WordLevel, WordPiece
 from tokenizers.pre_tokenizers import BertPreTokenizer
 from transformers import AutoModel, AutoProcessor, PixtralImageProcessor, PixtralProcessor
-from transformers.models.mistral3.modeling_mistral3 import Mistral3Model
 from transformers.tokenization_utils_tokenizers import TokenizersBackend
 
 pytest.importorskip("transformers.models.ministral3", reason="Ministral3 not available in this transformers version")
+
+from transformers.models.mistral3.modeling_mistral3 import Mistral3Model
 
 from nemo_automodel._transformers.registry import ModelRegistry
 from nemo_automodel._transformers.retrieval import BiEncoderModel, _init_encoder_common, configure_encoder_metadata
