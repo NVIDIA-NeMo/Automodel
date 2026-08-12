@@ -536,6 +536,11 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
         """Set the output embeddings (lm_head) of the language model."""
         self.language_model.set_output_embeddings(new_embeddings)
 
+    @property
+    def lm_head(self) -> nn.Module | None:
+        """Return the nested language-model output head without re-registering it."""
+        return self.language_model.lm_head
+
     # ------------------------------------------------------------------
     # Vision feature extraction
     # ------------------------------------------------------------------
