@@ -21,12 +21,12 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.models.siglip.configuration_siglip import SiglipVisionConfig
 from transformers.processing_utils import ProcessorMixin
 
-from nemo_automodel.components.models.llama_nemotron_vl.model import (
+from nemo_automodel._transformers.models.llama_nemotron_vl.model import (
     LlamaBidirectionalConfig,
     LlamaNemotronVLConfig,
     LlamaNemotronVLModel,
 )
-from nemo_automodel.components.models.llama_nemotron_vl.processor import (
+from nemo_automodel._transformers.models.llama_nemotron_vl.processor import (
     LlamaNemotronVLImageProcessor,
     LlamaNemotronVLProcessor,
     dynamic_preprocess,
@@ -134,7 +134,7 @@ def processor(monkeypatch):
 
 @pytest.fixture
 def tiny_model(monkeypatch, processor):
-    import nemo_automodel.components.models.llama_nemotron_vl.model as model_module
+    import nemo_automodel._transformers.models.llama_nemotron_vl.model as model_module
 
     monkeypatch.setattr(model_module.AutoProcessor, "from_pretrained", lambda *args, **kwargs: processor)
     config = LlamaNemotronVLConfig(

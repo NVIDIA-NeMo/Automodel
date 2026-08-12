@@ -22,8 +22,8 @@ is pragma-excluded as it only runs on the GPU benchmark.
 
 from unittest.mock import Mock, patch
 
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.qwen3_moe.layers import Qwen3MoeAttention
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.qwen3_moe.layers import Qwen3MoeAttention
 
 
 def _config():
@@ -46,9 +46,9 @@ def _config():
     return cfg
 
 
-@patch("nemo_automodel.components.models.qwen3_moe.layers.initialize_attn_module_and_func")
-@patch("nemo_automodel.components.models.qwen3_moe.layers.initialize_rms_norm_module")
-@patch("nemo_automodel.components.models.qwen3_moe.layers.initialize_linear_module")
+@patch("nemo_automodel._transformers.models.qwen3_moe.layers.initialize_attn_module_and_func")
+@patch("nemo_automodel._transformers.models.qwen3_moe.layers.initialize_rms_norm_module")
+@patch("nemo_automodel._transformers.models.qwen3_moe.layers.initialize_linear_module")
 class TestQwen3MoeCompileAttn:
     """compile_attn gating in Qwen3MoeAttention.__init__."""
 

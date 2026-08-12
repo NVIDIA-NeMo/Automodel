@@ -36,7 +36,7 @@ Everything EAGLE-3 specific is inherited from the DeepSeek MLA draft: the
 TTT recurrence with diagonal-extension attention, ``project_hidden_states`` /
 ``compute_logits`` / ``set_vocab_mapping`` and the ``d2t`` / ``t2d`` buffers. The
 SiTU MLP and the norm are imported from the onboarded K3 target
-(``components/models/kimi_k3.model``) and the MLA projection layout and the gate
+(``_transformers/models/kimi_k3.model``) and the MLA projection layout and the gate
 follow its ``KimiMLAAttention`` (widened to the fused ``[embed, hidden]`` input),
 so the draft's math matches the target's MLA.
 
@@ -54,7 +54,7 @@ import torch
 import torch.nn as nn
 from transformers import PretrainedConfig
 
-from nemo_automodel.components.models.kimi_k3.model import KimiK3MLP, KimiRMSNorm
+from nemo_automodel._transformers.models.kimi_k3.model import KimiK3MLP, KimiRMSNorm
 from nemo_automodel.components.speculative.eagle.draft_deepseek import (
     DeepseekV3Eagle3DraftModel,
     Eagle3DeepseekMLAAttention,

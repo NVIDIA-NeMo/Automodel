@@ -19,6 +19,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers.modeling_outputs import BaseModelOutputWithPast, SequenceClassifierOutputWithPast
 
+from nemo_automodel._transformers.models.llama_bidirectional.model import (
+    LlamaBidirectionalConfig,
+    LlamaBidirectionalForSequenceClassification,
+    LlamaBidirectionalModel,
+)
 from nemo_automodel._transformers.registry import ModelRegistry
 from nemo_automodel._transformers.retrieval import (
     BiEncoderModel,
@@ -26,11 +31,6 @@ from nemo_automodel._transformers.retrieval import (
     _init_encoder_common,
     configure_encoder_metadata,
     pool,
-)
-from nemo_automodel.components.models.llama_bidirectional.model import (
-    LlamaBidirectionalConfig,
-    LlamaBidirectionalForSequenceClassification,
-    LlamaBidirectionalModel,
 )
 from nemo_automodel.recipes.retrieval.train_bi_encoder import contrastive_scores_and_labels
 

@@ -48,10 +48,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--out-device", default="cuda:0")
     args = parser.parse_args(argv)
 
-    from nemo_automodel.components.models.common import BackendConfig
-    from nemo_automodel.components.models.ling_v2.config import BailingMoeV2Config
-    from nemo_automodel.components.models.ling_v2.model import BailingMoeV2ForCausalLM
-    from nemo_automodel.components.models.ling_v2.state_dict_adapter import BailingMoeV2StateDictAdapter
+    from nemo_automodel._transformers.models.common import BackendConfig
+    from nemo_automodel._transformers.models.ling_v2.config import BailingMoeV2Config
+    from nemo_automodel._transformers.models.ling_v2.model import BailingMoeV2ForCausalLM
+    from nemo_automodel._transformers.models.ling_v2.state_dict_adapter import BailingMoeV2StateDictAdapter
     from nemo_automodel.components.moe.config import MoEConfig
 
     t0 = time.time()

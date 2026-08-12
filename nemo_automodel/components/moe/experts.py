@@ -150,7 +150,7 @@ class _AllGatherConcatVarlenFn(Function):
 if TYPE_CHECKING:
     from transformer_engine.pytorch import GroupedLinear
 
-    from nemo_automodel.components.models.common.utils import BackendConfig
+    from nemo_automodel._transformers.models.common.utils import BackendConfig
 
 
 def is_gated_activation(activation: str) -> bool:
@@ -1166,7 +1166,7 @@ class GroupedExpertsTE(nn.Module):
 
         from transformer_engine.pytorch import GroupedLinear
 
-        from nemo_automodel.components.models.common.utils import _patch_te_modules
+        from nemo_automodel._transformers.models.common.utils import _patch_te_modules
 
         _patch_te_modules()
 
@@ -1447,7 +1447,7 @@ class GroupedExpertsTE(nn.Module):
         """
         from transformer_engine.pytorch import GroupedLinear
 
-        from nemo_automodel.components.models.common.utils import _patch_te_modules
+        from nemo_automodel._transformers.models.common.utils import _patch_te_modules
 
         _patch_te_modules()
 

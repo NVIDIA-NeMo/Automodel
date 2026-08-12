@@ -31,15 +31,15 @@ import torch.nn.functional as F
 from safetensors import safe_open
 from torch.distributed.tensor import DTensor
 
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.common.utils import cast_model_to_dtype
+from nemo_automodel._transformers.models.deepseek_v4.config import DeepseekV4Config
+from nemo_automodel._transformers.models.deepseek_v4.cp import make_dsv4_contiguous_shard_cp_batch_and_ctx
+from nemo_automodel._transformers.models.deepseek_v4.model import DeepseekV4ForCausalLM
 from nemo_automodel.components.distributed.config import FSDP2Config
 from nemo_automodel.components.distributed.context_parallel.utils import make_cp_batch_and_ctx
 from nemo_automodel.components.distributed.mesh import ParallelismSizes
 from nemo_automodel.components.distributed.mesh_utils import _create_device_meshes
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.common.utils import cast_model_to_dtype
-from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
-from nemo_automodel.components.models.deepseek_v4.cp import make_dsv4_contiguous_shard_cp_batch_and_ctx
-from nemo_automodel.components.models.deepseek_v4.model import DeepseekV4ForCausalLM
 from nemo_automodel.components.moe.parallelizer import apply_cp, apply_ep
 from nemo_automodel.components.moe.state_dict_utils import get_expert_range_for_rank_from_mesh
 

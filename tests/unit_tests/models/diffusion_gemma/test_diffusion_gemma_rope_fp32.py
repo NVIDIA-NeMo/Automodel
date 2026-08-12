@@ -52,8 +52,8 @@ def _tiny_text_config_dict():
 def test_initialize_weights_bf16_keeps_rope_inv_freq_fp32():
     from transformers.models.diffusion_gemma.configuration_diffusion_gemma import DiffusionGemmaConfig
 
-    from nemo_automodel.components.models.common import BackendConfig
-    from nemo_automodel.components.models.diffusion_gemma.model import DiffusionGemmaForBlockDiffusion
+    from nemo_automodel._transformers.models.common import BackendConfig
+    from nemo_automodel._transformers.models.diffusion_gemma.model import DiffusionGemmaForBlockDiffusion
 
     config = DiffusionGemmaConfig(text_config=_tiny_text_config_dict(), vision_config=None, canvas_length=8)
     backend = BackendConfig(

@@ -19,7 +19,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from nemo_automodel.components.models.mistral3_vlm.state_dict_adapter import (
+from nemo_automodel._transformers.models.mistral3_vlm.state_dict_adapter import (
     _NON_QUANTIZED_SUFFIXES,
     Mistral3FP8StateDictAdapter,
     _dequantize_from_fp8,

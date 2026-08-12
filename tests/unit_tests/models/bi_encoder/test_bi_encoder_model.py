@@ -491,7 +491,7 @@ def test_forward_backward_step_supports_distributed_multi_vector_inbatch_negativ
     detach_distributed_inbatch_negatives,
 ):
     """Exercise the trainer branch that gathers token embeddings across ranks."""
-    import nemo_automodel.components.models.common.inbatch_neg_utils as inbatch_neg_utils
+    import nemo_automodel._transformers.models.common.inbatch_neg_utils as inbatch_neg_utils
 
     recipe = TrainBiEncoderRecipe.__new__(TrainBiEncoderRecipe)
     recipe.dist_env = SimpleNamespace(device="cpu")

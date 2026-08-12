@@ -20,19 +20,19 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from nemo_automodel.components.models.kimi_k25_vl.model import (
+from nemo_automodel._transformers.models.kimi_k25_vl.model import (
     DeepSeekV3RotaryEmbeddingAdapter,
     KimiK25VLConfig,
     KimiK25VLForConditionalGeneration,
     KimiK25VLModel,
     KimiK25VLMultiModalProjector,
     Learnable2DInterpPosEmbDividedFixed,
+    MoonVision3dPatchEmbed,
     MoonViT3dConfig,
     MoonViT3dEncoder,
     MoonViT3dEncoderLayer,
     MoonViT3dMLP,
     MoonViT3dPretrainedModel,
-    MoonVision3dPatchEmbed,
     Rope2DPosEmbRepeated,
     _apply_rope_vision,
     get_1d_sincos_pos_embed,
@@ -148,7 +148,7 @@ class TestKimiK25VLModelUpdates:
 
     def test_modelclass_export_exists(self):
         """Ensure ModelClass pointer is defined and points to class."""
-        from nemo_automodel.components.models.kimi_k25_vl import model as kimi_mod
+        from nemo_automodel._transformers.models.kimi_k25_vl import model as kimi_mod
 
         assert hasattr(kimi_mod, "ModelClass")
         assert kimi_mod.ModelClass == KimiK25VLForConditionalGeneration
@@ -279,21 +279,21 @@ class TestKimiK25VLRegistration:
 
     def test_registration_function_exists(self):
         """Test _register_kimi_k25_vl_with_transformers function exists."""
-        from nemo_automodel.components.models.kimi_k25_vl import model as kimi_mod
+        from nemo_automodel._transformers.models.kimi_k25_vl import model as kimi_mod
 
         assert hasattr(kimi_mod, "_register_kimi_k25_vl_with_transformers")
         assert callable(kimi_mod._register_kimi_k25_vl_with_transformers)
 
     def test_compute_expanded_seq_length_exists(self):
         """Test compute_expanded_seq_length utility function exists."""
-        from nemo_automodel.components.models.kimi_k25_vl import model as kimi_mod
+        from nemo_automodel._transformers.models.kimi_k25_vl import model as kimi_mod
 
         assert hasattr(kimi_mod, "compute_expanded_seq_length")
         assert callable(kimi_mod.compute_expanded_seq_length)
 
     def test_compute_expanded_seq_length_basic(self):
         """Test compute_expanded_seq_length computes correct length."""
-        from nemo_automodel.components.models.kimi_k25_vl.model import compute_expanded_seq_length
+        from nemo_automodel._transformers.models.kimi_k25_vl.model import compute_expanded_seq_length
 
         # grid_thws = [[1, 28, 28]] -> (28//2) * (28//2) = 196 image tokens
         # text_seq_length=82, num_images=1
@@ -304,7 +304,7 @@ class TestKimiK25VLRegistration:
 
     def test_compute_expanded_seq_length_larger_image(self):
         """Test compute_expanded_seq_length with larger image."""
-        from nemo_automodel.components.models.kimi_k25_vl.model import compute_expanded_seq_length
+        from nemo_automodel._transformers.models.kimi_k25_vl.model import compute_expanded_seq_length
 
         # grid_thws = [[1, 56, 56]] -> (56//2) * (56//2) = 784 image tokens
         grid_thws = torch.tensor([[1, 56, 56]])
@@ -313,7 +313,7 @@ class TestKimiK25VLRegistration:
 
     def test_compute_expanded_seq_length_multiple_images(self):
         """Test compute_expanded_seq_length with multiple images."""
-        from nemo_automodel.components.models.kimi_k25_vl.model import compute_expanded_seq_length
+        from nemo_automodel._transformers.models.kimi_k25_vl.model import compute_expanded_seq_length
 
         # grid_thws = [[1, 28, 28], [1, 14, 14]]
         # Image 1: (28//2) * (28//2) = 196
@@ -1137,7 +1137,7 @@ class TestKimiK25VLModelForward:
     def test_forward_with_qkv_format_thd(self):
         """Test forward handles qkv_format='thd' kwarg."""
         # Verify squeeze_input_for_thd is called when qkv_format='thd'
-        from nemo_automodel.components.models.kimi_k25_vl.model import squeeze_input_for_thd
+        from nemo_automodel._transformers.models.kimi_k25_vl.model import squeeze_input_for_thd
 
         input_ids = torch.randint(0, 100, (2, 8))
         position_ids = torch.arange(8).unsqueeze(0).expand(2, -1)
@@ -1388,14 +1388,14 @@ class TestKimiK25VLForConditionalGenerationInit:
 
     def test_init_creates_state_dict_adapter_when_enabled(self):
         """Test __init__ creates state_dict_adapter when backend.enable_hf_state_dict_adapter is True."""
-        from nemo_automodel.components.models.kimi_k25_vl.model import BackendConfig
+        from nemo_automodel._transformers.models.kimi_k25_vl.model import BackendConfig
 
         backend = BackendConfig(enable_hf_state_dict_adapter=True)
         assert backend.enable_hf_state_dict_adapter is True
 
     def test_init_backend_default(self):
         """Test __init__ creates default BackendConfig when not provided."""
-        from nemo_automodel.components.models.kimi_k25_vl.model import BackendConfig
+        from nemo_automodel._transformers.models.kimi_k25_vl.model import BackendConfig
 
         # Simulate the default backend logic
         backend = None
@@ -1526,7 +1526,7 @@ class TestVisionAttentionFlash:
 
     def test_vision_attention_flash_exists(self):
         """Test vision_attention_flash function is importable."""
-        from nemo_automodel.components.models.kimi_k25_vl.model import vision_attention_flash
+        from nemo_automodel._transformers.models.kimi_k25_vl.model import vision_attention_flash
         assert callable(vision_attention_flash)
 
     def test_vision_attention_flash_max_seqlen_computation(self):
@@ -1552,7 +1552,8 @@ class TestVisionAttentionFlash:
     def test_vision_attention_flash_signature(self):
         """Test vision_attention_flash has expected signature."""
         import inspect
-        from nemo_automodel.components.models.kimi_k25_vl.model import vision_attention_flash
+
+        from nemo_automodel._transformers.models.kimi_k25_vl.model import vision_attention_flash
 
         sig = inspect.signature(vision_attention_flash)
         params = list(sig.parameters.keys())
@@ -1569,10 +1570,10 @@ class TestVisionAttentionFlash:
         assert sig.parameters["max_seqlen_q"].default is None
         assert sig.parameters["max_seqlen_k"].default is None
 
-    @patch("nemo_automodel.components.models.kimi_k25_vl.model.flash_attn_varlen_func")
+    @patch("nemo_automodel._transformers.models.kimi_k25_vl.model.flash_attn_varlen_func")
     def test_vision_attention_flash_calls_flash_attn(self, mock_flash_attn):
         """Test vision_attention_flash calls flash_attn_varlen_func with correct args."""
-        from nemo_automodel.components.models.kimi_k25_vl.model import vision_attention_flash
+        from nemo_automodel._transformers.models.kimi_k25_vl.model import vision_attention_flash
 
         seq_len, num_heads, head_dim = 24, 4, 32
         q = torch.randn(seq_len, num_heads, head_dim)
@@ -1593,10 +1594,10 @@ class TestVisionAttentionFlash:
         assert call_args[0][2] is v
         assert call_args[1]["causal"] is False
 
-    @patch("nemo_automodel.components.models.kimi_k25_vl.model.flash_attn_varlen_func")
+    @patch("nemo_automodel._transformers.models.kimi_k25_vl.model.flash_attn_varlen_func")
     def test_vision_attention_flash_handles_tuple_output(self, mock_flash_attn):
         """Test vision_attention_flash handles tuple output from flash_attn."""
-        from nemo_automodel.components.models.kimi_k25_vl.model import vision_attention_flash
+        from nemo_automodel._transformers.models.kimi_k25_vl.model import vision_attention_flash
 
         seq_len, num_heads, head_dim = 16, 4, 32
         q = torch.randn(seq_len, num_heads, head_dim)
@@ -1614,10 +1615,10 @@ class TestVisionAttentionFlash:
         expected_shape = (seq_len, num_heads * head_dim)
         assert result.shape == expected_shape
 
-    @patch("nemo_automodel.components.models.kimi_k25_vl.model.flash_attn_varlen_func")
+    @patch("nemo_automodel._transformers.models.kimi_k25_vl.model.flash_attn_varlen_func")
     def test_vision_attention_flash_flattens_output(self, mock_flash_attn):
         """Test vision_attention_flash flattens last two dimensions."""
-        from nemo_automodel.components.models.kimi_k25_vl.model import vision_attention_flash
+        from nemo_automodel._transformers.models.kimi_k25_vl.model import vision_attention_flash
 
         seq_len, num_heads, head_dim = 16, 4, 32
         q = torch.randn(seq_len, num_heads, head_dim)
@@ -1644,12 +1645,12 @@ class TestSqueezeInputForThd:
 
     def test_squeeze_input_for_thd_import(self):
         """Test squeeze_input_for_thd is importable."""
-        from nemo_automodel.components.models.kimi_k25_vl.model import squeeze_input_for_thd
+        from nemo_automodel._transformers.models.kimi_k25_vl.model import squeeze_input_for_thd
         assert callable(squeeze_input_for_thd)
 
     def test_squeeze_input_for_thd_basic(self):
         """Test squeeze_input_for_thd with basic inputs."""
-        from nemo_automodel.components.models.kimi_k25_vl.model import squeeze_input_for_thd
+        from nemo_automodel._transformers.models.kimi_k25_vl.model import squeeze_input_for_thd
 
         input_ids = torch.randint(0, 100, (2, 8))
         position_ids = torch.arange(8).unsqueeze(0).expand(2, -1)

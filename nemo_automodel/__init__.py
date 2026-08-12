@@ -65,57 +65,78 @@ __all__ = sorted([*_SUBMODULES, "__version__", "__package_name__", *_LAZY_ATTRS.
 
 
 # ---------------------------------------------------------------------------
-# nemo_automodel.models → nemo_automodel.components.models alias
+# Model import aliases.
 #
-# Implemented as a meta-path finder so it works regardless of whether a
-# physical nemo_automodel/models/ directory is shipped in the installation.
-# The actual import of the canonical module happens inside exec_module so
-# that _load_unlocked's pop-and-set pattern on sys.modules picks up the
-# replacement correctly.
+# Model implementations are split by the upstream HuggingFace package they are
+# written against: ``nemo_automodel._transformers.models`` (transformers) and
+# ``nemo_automodel._diffusers.models`` (diffusers). Two legacy flat paths are
+# kept working on top of that split:
+#
+#   nemo_automodel.models.*             -- supported public alias (no warning)
+#   nemo_automodel.components.models.*  -- deprecated pre-split location
+#
+# Implemented as a meta-path finder so it works regardless of whether physical
+# directories are shipped in the installation. The actual import of the
+# canonical module happens inside exec_module so that _load_unlocked's
+# pop-and-set pattern on sys.modules picks up the replacement correctly.
 # ---------------------------------------------------------------------------
 
+from ._model_locations import resolve_model_module as _resolve_model_module  # noqa: E402
+
 _MODELS_ALIAS = "nemo_automodel.models"
-_MODELS_ALIAS_DOT = _MODELS_ALIAS + "."
-_MODELS_TARGET = "nemo_automodel.components.models"
-_MODELS_TARGET_DOT = _MODELS_TARGET + "."
+_LEGACY_MODELS_ALIAS = "nemo_automodel.components.models"
 
 
 class _AliasLoader(importlib.abc.Loader):
     """Loader that replaces the placeholder module in sys.modules with the
     canonical module during exec_module."""
 
-    def __init__(self, real_name):
+    def __init__(self, real_name, deprecated_name=None):
         self._real_name = real_name
+        self._deprecated_name = deprecated_name
 
     def create_module(self, spec):
         return None
 
     def exec_module(self, module):
+        if self._deprecated_name is not None:
+            warnings.warn(
+                f"'{self._deprecated_name}' has moved to '{self._real_name}'. "
+                f"The old path still works but will be removed in a future release; "
+                f"update imports and YAML '_target_' values accordingly.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         real = importlib.import_module(self._real_name)
         sys.modules[module.__name__] = real
 
 
 class _ModelsAliasFinder(importlib.abc.MetaPathFinder):
-    """Redirect ``nemo_automodel.models`` and ``nemo_automodel.models.*``
-    to ``nemo_automodel.components.models`` and its subpackages.
+    """Redirect the legacy flat model paths to their canonical packages.
 
     Installed at the *front* of ``sys.meta_path`` so it intercepts before the
-    default ``PathFinder``.  Both import paths resolve to the exact same module
+    default ``PathFinder``.  All import paths resolve to the exact same module
     objects, avoiding duplication.
     """
 
+    _ALIASES = (
+        (_MODELS_ALIAS, False),
+        (_LEGACY_MODELS_ALIAS, True),
+    )
+
     def find_spec(self, fullname, path, target=None):
-        if fullname == _MODELS_ALIAS:
+        for alias, deprecated in self._ALIASES:
+            if fullname == alias:
+                suffix = ""
+            elif fullname.startswith(alias + "."):
+                suffix = fullname[len(alias) + 1 :]
+            else:
+                continue
+            real_name = _resolve_model_module(suffix)
             return importlib.machinery.ModuleSpec(
                 fullname,
-                _AliasLoader(_MODELS_TARGET),
-                is_package=True,
-            )
-        if fullname.startswith(_MODELS_ALIAS_DOT):
-            real_name = _MODELS_TARGET_DOT + fullname[len(_MODELS_ALIAS_DOT) :]
-            return importlib.machinery.ModuleSpec(
-                fullname,
-                _AliasLoader(real_name),
+                _AliasLoader(real_name, fullname if deprecated else None),
+                is_package=not suffix,
             )
         return None
 

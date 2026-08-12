@@ -19,8 +19,8 @@ import importlib
 import pytest
 import torch
 
+from nemo_automodel._transformers.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel._transformers.registry import MODEL_ARCH_MAPPING
-from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 
 
 def _gemma4_assistant_available() -> bool:
@@ -48,7 +48,7 @@ class TestRegistryEntry:
 
     def test_arch_points_to_drafter_module(self):
         module_path, class_name = MODEL_ARCH_MAPPING["Gemma4AssistantForCausalLM"][:2]
-        assert module_path == "nemo_automodel.components.models.gemma4_drafter.model"
+        assert module_path == "nemo_automodel._transformers.models.gemma4_drafter.model"
         assert class_name == "Gemma4DrafterForCausalLM"
 
 
@@ -60,12 +60,12 @@ class TestDrafterModuleImports:
     def test_module_imports_regardless_of_transformers_version(self):
         # Should not raise even on transformers 5.0 (where gemma4_assistant
         # is missing). The placeholder path raises only at use time.
-        from nemo_automodel.components.models.gemma4_drafter import model as drafter_module
+        from nemo_automodel._transformers.models.gemma4_drafter import model as drafter_module
 
         assert hasattr(drafter_module, "Gemma4DrafterForCausalLM")
 
     def test_init_reexports_class(self):
-        from nemo_automodel.components.models.gemma4_drafter import (
+        from nemo_automodel._transformers.models.gemma4_drafter import (
             Gemma4DrafterForCausalLM,
             Gemma4JointOutput,
             Gemma4WithDrafter,
@@ -88,7 +88,7 @@ class TestDrafterClassStructure:
             Gemma4AssistantForCausalLM,
         )
 
-        from nemo_automodel.components.models.gemma4_drafter.model import (
+        from nemo_automodel._transformers.models.gemma4_drafter.model import (
             Gemma4DrafterForCausalLM,
         )
 
@@ -101,7 +101,7 @@ class TestDrafterClassStructure:
             Gemma4AssistantConfig,
         )
 
-        from nemo_automodel.components.models.gemma4_drafter.model import (
+        from nemo_automodel._transformers.models.gemma4_drafter.model import (
             Gemma4DrafterForCausalLM,
         )
 
@@ -135,7 +135,7 @@ class TestDrafterClassStructure:
             Gemma4AssistantConfig,
         )
 
-        from nemo_automodel.components.models.gemma4_drafter.model import (
+        from nemo_automodel._transformers.models.gemma4_drafter.model import (
             Gemma4DrafterForCausalLM,
         )
 
@@ -152,7 +152,7 @@ class TestDrafterClassStructure:
             Gemma4AssistantConfig,
         )
 
-        from nemo_automodel.components.models.gemma4_drafter.model import (
+        from nemo_automodel._transformers.models.gemma4_drafter.model import (
             Gemma4DrafterForCausalLM,
         )
 
@@ -171,7 +171,7 @@ class TestDrafterClassStructure:
             Gemma4AssistantConfig,
         )
 
-        from nemo_automodel.components.models.gemma4_drafter.model import (
+        from nemo_automodel._transformers.models.gemma4_drafter.model import (
             Gemma4DrafterForCausalLM,
         )
 

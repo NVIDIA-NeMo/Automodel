@@ -5,9 +5,9 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.kimi_linear.config import KimiLinear48BConfig
-from nemo_automodel.components.models.kimi_linear.model import KimiLinear48BForCausalLM
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.kimi_linear.config import KimiLinear48BConfig
+from nemo_automodel._transformers.models.kimi_linear.model import KimiLinear48BForCausalLM
 from tests.unit_tests.models.kimi_linear.test_cp import _FakeCPMesh
 
 
@@ -204,8 +204,8 @@ def test_padding_only_query_rows_stay_finite():
 
 
 def test_prepare_model_inputs_for_cp_returns_contiguous_cp_sharder():
+    from nemo_automodel._transformers.models.kimi_linear.cp import shard_batch_for_kimi_cp
     from nemo_automodel.components.distributed.context_parallel.sharder import contiguous_local_indices
-    from nemo_automodel.components.models.kimi_linear.cp import shard_batch_for_kimi_cp
 
     model = KimiLinear48BForCausalLM(_tiny_kimi_config(), backend=_backend_config())
 

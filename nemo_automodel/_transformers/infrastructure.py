@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING, Optional, Union
 
 import torch
 
+from nemo_automodel._transformers.models.common.utils import cast_frozen_modules_to_compute_dtype
 from nemo_automodel._transformers.utils import _should_load_before_shard
 from nemo_automodel._transformers.v4_patches.kv_sharing import (
     install_kv_sharing_holder,
@@ -62,7 +63,6 @@ from nemo_automodel.components.distributed.mesh import MeshContext
 from nemo_automodel.components.distributed.pipelining.autopipeline import AutoPipeline
 from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
-from nemo_automodel.components.models.common.utils import cast_frozen_modules_to_compute_dtype
 from nemo_automodel.components.quantization.fp8 import apply_fp8_to_model
 from nemo_automodel.components.quantization.qat import QATConfig
 from nemo_automodel.components.utils.compile_utils import compile_model

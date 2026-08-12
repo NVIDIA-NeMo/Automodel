@@ -24,7 +24,7 @@ Pure torch / CPU — no GPU, no model forward.
 
 import torch
 
-from nemo_automodel.components.models.diffusion_gemma.attention_mask import (
+from nemo_automodel._transformers.models.diffusion_gemma.attention_mask import (
     build_block_diffusion_training_mask,
 )
 

@@ -15,9 +15,9 @@
 import pytest
 import torch
 
-from nemo_automodel.components.models.minimax_m3_vl.config import MiniMaxM3VLTextConfig
-from nemo_automodel.components.models.minimax_m3_vl.layers import MiniMaxM3MLP
-from nemo_automodel.components.models.minimax_m3_vl.model import MiniMaxM3SparseForCausalLM
+from nemo_automodel._transformers.models.minimax_m3_vl.config import MiniMaxM3VLTextConfig
+from nemo_automodel._transformers.models.minimax_m3_vl.layers import MiniMaxM3MLP
+from nemo_automodel._transformers.models.minimax_m3_vl.model import MiniMaxM3SparseForCausalLM
 from nemo_automodel.components.moe.layers import MoE
 
 from .conftest import TINY_CFG
@@ -51,7 +51,7 @@ def test_per_head_qk_norm_shape(model):
 
 
 def test_gemma_norm_zero_centered(text_config, backend):
-    from nemo_automodel.components.models.minimax_m3_vl.layers import MiniMaxM3RMSNorm
+    from nemo_automodel._transformers.models.minimax_m3_vl.layers import MiniMaxM3RMSNorm
 
     norm = MiniMaxM3RMSNorm(8, eps=1e-6, gemma=True)
     norm.reset_parameters()

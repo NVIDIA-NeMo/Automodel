@@ -27,7 +27,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from nemo_automodel.components.models.gemma4_moe import cp_attention as cpa
+from nemo_automodel._transformers.models.gemma4_moe import cp_attention as cpa
 
 _SCALE = 1.0 / math.sqrt(256)  # Gemma4 full-attn query_pre_attn_scalar=256
 

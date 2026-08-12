@@ -14,7 +14,7 @@
 
 from unittest.mock import Mock, patch
 
-from nemo_automodel.components.models.common.utils import get_is_optim_step, set_is_optim_step
+from nemo_automodel._transformers.models.common.utils import get_is_optim_step, set_is_optim_step
 from nemo_automodel.components.moe.fsdp_mixin import (
     MoEFSDPSyncMixin,
     _configure_fsdp_module,

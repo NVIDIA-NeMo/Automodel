@@ -16,10 +16,10 @@ from unittest.mock import patch
 
 import torch
 
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.common.utils import cast_model_to_dtype
-from nemo_automodel.components.models.hy_v3.config import HYV3Config
-from nemo_automodel.components.models.hy_v3.model import HYV3ForCausalLM
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.common.utils import cast_model_to_dtype
+from nemo_automodel._transformers.models.hy_v3.config import HYV3Config
+from nemo_automodel._transformers.models.hy_v3.model import HYV3ForCausalLM
 
 
 def _backend() -> BackendConfig:

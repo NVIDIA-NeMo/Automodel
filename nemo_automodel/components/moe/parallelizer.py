@@ -633,7 +633,7 @@ def apply_fsdp(
 
     fully_shard_impl = fully_shard
     if _is_deepseek_v4_model(model):
-        from nemo_automodel.components.models.deepseek_v4.fsdp import fully_shard_deepseek_v4
+        from nemo_automodel._transformers.models.deepseek_v4.fsdp import fully_shard_deepseek_v4
 
         fully_shard_impl = fully_shard_deepseek_v4
 

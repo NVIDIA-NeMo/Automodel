@@ -19,8 +19,8 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.qwen2_5_omni.state_dict_adapter import (
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.qwen2_5_omni.state_dict_adapter import (
     Qwen2_5OmniStateDictAdapter,
 )
 

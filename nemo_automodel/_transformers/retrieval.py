@@ -33,6 +33,7 @@ from transformers import (
 from transformers.models.auto.modeling_auto import MODEL_FOR_SEQUENCE_CLASSIFICATION_MAPPING, MODEL_MAPPING
 from transformers.utils import logging
 
+from nemo_automodel._transformers.models.common.bidirectional import EncoderStateDictAdapter
 from nemo_automodel._transformers.registry import ModelRegistry
 from nemo_automodel._transformers.sentence_transformer_export import (
     SentenceTransformerExportConfig,
@@ -45,7 +46,6 @@ from nemo_automodel._transformers.sentence_transformer_export import (
     _supports_standard_sentence_transformer_export,
 )
 from nemo_automodel.components.loss.intermediate_distill import LayerCapture
-from nemo_automodel.components.models.common.bidirectional import EncoderStateDictAdapter
 
 logger = logging.get_logger(__name__)
 

@@ -17,7 +17,7 @@ import math
 import pytest
 import torch
 
-from nemo_automodel.components.models.gpt_oss.rope_utils import (
+from nemo_automodel._transformers.models.gpt_oss.rope_utils import (
     RotaryEmbedding,
     apply_rotary_emb,
     apply_rotary_emb_qk,

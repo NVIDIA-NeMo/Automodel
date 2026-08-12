@@ -16,7 +16,7 @@ import torch.nn as nn
 
 pytest.importorskip("transformers.models.qwen3_5_moe")
 
-from nemo_automodel.components.models.qwen3_5_moe.model import Qwen3_5MoeBlock
+from nemo_automodel._transformers.models.qwen3_5_moe.model import Qwen3_5MoeBlock
 
 
 def _build_block(layer_type: str) -> tuple[Qwen3_5MoeBlock, dict]:
@@ -55,7 +55,7 @@ class TestQwen3_5MoeBlockForward:
 
     def test_full_attention_branch_delegates_to_super(self, monkeypatch):
         """layer_type=full_attention skips packing logic and calls Block.forward."""
-        from nemo_automodel.components.models.qwen3_next.model import Block
+        from nemo_automodel._transformers.models.qwen3_next.model import Block
 
         block, _ = _build_block("full_attention")
         called: dict = {}
@@ -166,7 +166,7 @@ class TestQwen3_5MoeBlockForward:
 
     def test_full_attention_strips_seq_index_before_super(self, monkeypatch):
         """Full-attention path must drop seq_index so Block.forward gets no unexpected kwarg."""
-        from nemo_automodel.components.models.qwen3_next.model import Block
+        from nemo_automodel._transformers.models.qwen3_next.model import Block
 
         block, _ = _build_block("full_attention")
         called: dict = {}

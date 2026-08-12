@@ -31,7 +31,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from nemo_automodel.components.models.kimi_linear.cp import all_gather_sequence, shard_batch_for_kimi_cp
+from nemo_automodel._transformers.models.kimi_linear.cp import all_gather_sequence, shard_batch_for_kimi_cp
 
 # Run only on the GPU job. Each test mp.spawns two gloo worker processes that
 # re-import the full package, and these cover a multi-GPU feature, so they are

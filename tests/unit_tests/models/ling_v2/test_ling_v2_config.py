@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from nemo_automodel.components.models.ling_v2.config import BailingMoeV2Config
+from nemo_automodel._transformers.models.ling_v2.config import BailingMoeV2Config
 
 
 def test_default_matches_ling_mini_2_0():

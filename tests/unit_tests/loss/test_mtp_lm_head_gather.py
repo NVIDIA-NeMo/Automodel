@@ -41,9 +41,9 @@ import torch.nn.functional as F
 import nemo_automodel.components.loss.linear_ce as _lce
 import nemo_automodel.components.loss.mtp as _mtp
 import nemo_automodel.components.loss.utils as _lutils
+from nemo_automodel._transformers.models.common.mtp import roll_tensor
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.loss.mtp import calculate_mtp_loss
-from nemo_automodel.components.models.common.mtp import roll_tensor
 
 H, V, B, S, D = 8, 32, 2, 6, 2
 IGN, SF, NLT = -100, 0.1, 20

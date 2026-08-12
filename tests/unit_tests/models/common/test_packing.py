@@ -1,7 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Tests for nemo_automodel.components.models.common.packing."""
+"""Tests for nemo_automodel._transformers.models.common.packing."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
-from nemo_automodel.components.models.common.packing import (
+from nemo_automodel._transformers.models.common.packing import (
     _passthrough_create_causal_mask,
     _patch_preprocess_mask_arguments_for_packing,
     configure_packing,
@@ -196,7 +196,7 @@ class TestConfigurePacking:
         """configure_packing should not install flash-attn shims for unsupported backends."""
         patch_preprocess = MagicMock()
         monkeypatch.setattr(
-            "nemo_automodel.components.models.common.packing._patch_preprocess_mask_arguments_for_packing",
+            "nemo_automodel._transformers.models.common.packing._patch_preprocess_mask_arguments_for_packing",
             patch_preprocess,
         )
 
@@ -408,7 +408,7 @@ class TestConfigurePackingFA3FA4:
         assert out is mask
 
     def test_llama_and_qwen3_in_patch_modules(self):
-        from nemo_automodel.components.models.common.packing import _PACKING_PATCH_MODULES
+        from nemo_automodel._transformers.models.common.packing import _PACKING_PATCH_MODULES
 
         assert "transformers.models.llama.modeling_llama" in _PACKING_PATCH_MODULES
         assert "transformers.models.qwen3.modeling_qwen3" in _PACKING_PATCH_MODULES

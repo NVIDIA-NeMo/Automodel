@@ -36,6 +36,7 @@ from transformers.models.llama.modeling_llama import LlamaForCausalLM
 from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
 from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM, Qwen3ForSequenceClassification
 
+from nemo_automodel._transformers.models.qwen3.model import Qwen3ForCausalLM as CustomQwen3ForCausalLM
 from nemo_automodel.components.distributed.optimized_tp_plans import (
     PARALLELIZE_FUNCTIONS,
     RotaryEmbedParallel,
@@ -44,7 +45,6 @@ from nemo_automodel.components.distributed.optimized_tp_plans import (
     _parallelize_llama,
     _parallelize_qwen,
 )
-from nemo_automodel.components.models.qwen3.model import Qwen3ForCausalLM as CustomQwen3ForCausalLM
 
 
 class MockModel:
@@ -569,13 +569,13 @@ class TestParallelizeMistral3Vlm:
         stay unsharded."""
         from transformers.models.mistral3.modeling_mistral3 import Mistral3ForConditionalGeneration
 
+        from nemo_automodel._transformers.models.mistral3_vlm.model import (
+            Mistral3FP8VLMForConditionalGeneration,
+        )
         from nemo_automodel.components.distributed.optimized_tp_plans import (
             PARALLELIZE_FUNCTIONS,
             _get_class_qualname,
             _parallelize_mistral3_vlm,
-        )
-        from nemo_automodel.components.models.mistral3_vlm.model import (
-            Mistral3FP8VLMForConditionalGeneration,
         )
 
         for cls in (Mistral3ForConditionalGeneration, Mistral3FP8VLMForConditionalGeneration):
@@ -695,13 +695,13 @@ class TestParallelizeMuseGlimmer:
 
     def test_native_class_qualname_is_registered(self):
         from nemo_automodel._transformers.capabilities import _has_optimized_tp_plan
+        from nemo_automodel._transformers.models.muse_glimmer.model import MuseGlimmerForConditionalGeneration
         from nemo_automodel.components.distributed.optimized_tp_plans import (
             PARALLELIZE_FUNCTIONS,
             _parallelize_muse_glimmer,
         )
-        from nemo_automodel.components.models.muse_glimmer.model import MuseGlimmerForConditionalGeneration
 
-        key = "nemo_automodel.components.models.muse_glimmer.model.MuseGlimmerForConditionalGeneration"
+        key = "nemo_automodel._transformers.models.muse_glimmer.model.MuseGlimmerForConditionalGeneration"
         assert PARALLELIZE_FUNCTIONS[key] is _parallelize_muse_glimmer
         assert _has_optimized_tp_plan(MuseGlimmerForConditionalGeneration)
 

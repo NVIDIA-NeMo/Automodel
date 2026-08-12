@@ -29,9 +29,9 @@ except ImportError:
         mock_hadamard.hadamard_transform = lambda x, scale: x
         sys.modules["fast_hadamard_transform"] = mock_hadamard
 
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.deepseek_v32.config import DeepseekV32Config
-from nemo_automodel.components.models.deepseek_v32.state_dict_adapter import DeepSeekV32StateDictAdapter
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.deepseek_v32.config import DeepseekV32Config
+from nemo_automodel._transformers.models.deepseek_v32.state_dict_adapter import DeepSeekV32StateDictAdapter
 from nemo_automodel.components.moe.config import MoEConfig
 
 
@@ -497,7 +497,7 @@ class TestDeepSeekV32StateDictAdapterInheritance:
 
     def test_inherits_from_v3_adapter(self):
         """Test that DeepSeekV32StateDictAdapter inherits from DeepSeekV3StateDictAdapter."""
-        from nemo_automodel.components.models.deepseek_v3.state_dict_adapter import DeepSeekV3StateDictAdapter
+        from nemo_automodel._transformers.models.deepseek_v3.state_dict_adapter import DeepSeekV3StateDictAdapter
 
         assert issubclass(DeepSeekV32StateDictAdapter, DeepSeekV3StateDictAdapter)
 
@@ -561,7 +561,7 @@ class TestDeepSeekV32StateDictAdapterBlockSize:
 
     def test_scale_shape_calculation(self):
         """Test that scale shape is calculated correctly."""
-        from nemo_automodel.components.models.deepseek_v3.state_dict_adapter import (
+        from nemo_automodel._transformers.models.deepseek_v3.state_dict_adapter import (
             BLOCK_SIZE,
             calculate_scale_shape,
         )

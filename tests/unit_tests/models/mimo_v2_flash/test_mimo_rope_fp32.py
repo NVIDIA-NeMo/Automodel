@@ -23,9 +23,9 @@ the rotary buffers are restored to fp32. Runs on CPU.
 
 import torch
 
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.mimo_v2_flash.config import MiMoV2FlashConfig
-from nemo_automodel.components.models.mimo_v2_flash.model import MiMoV2FlashForCausalLM
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.mimo_v2_flash.config import MiMoV2FlashConfig
+from nemo_automodel._transformers.models.mimo_v2_flash.model import MiMoV2FlashForCausalLM
 
 
 def _tiny_config(**overrides):

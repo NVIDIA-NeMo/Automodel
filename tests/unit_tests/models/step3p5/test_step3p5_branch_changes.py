@@ -20,9 +20,9 @@ import pytest
 import torch
 import torch.nn as nn
 
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.step3p5.layers import Step3p5Attention, Step3p5RotaryEmbedding
-from nemo_automodel.components.models.step3p5.model import (
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.step3p5.layers import Step3p5Attention, Step3p5RotaryEmbedding
+from nemo_automodel._transformers.models.step3p5.model import (
     Step3p5Model,
     _keep_step_router_bias_fp32,
     parse_moe_layers_enum,

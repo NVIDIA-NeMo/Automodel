@@ -14,10 +14,10 @@
 
 import torch
 
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.common.utils import cast_model_to_dtype
-from nemo_automodel.components.models.hy_mt2.config import HyMT2Config
-from nemo_automodel.components.models.hy_mt2.model import HyMT2ForCausalLM
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.common.utils import cast_model_to_dtype
+from nemo_automodel._transformers.models.hy_mt2.config import HyMT2Config
+from nemo_automodel._transformers.models.hy_mt2.model import HyMT2ForCausalLM
 
 
 def _backend() -> BackendConfig:

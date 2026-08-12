@@ -18,8 +18,8 @@ import torch
 from torch import nn
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
 
-from nemo_automodel.components.models.gpt_oss.model import Block as GptOssBlock
-from nemo_automodel.components.models.qwen3_moe.model import Block as Qwen3MoeBlock
+from nemo_automodel._transformers.models.gpt_oss.model import Block as GptOssBlock
+from nemo_automodel._transformers.models.qwen3_moe.model import Block as Qwen3MoeBlock
 from nemo_automodel.components.moe.layers import MLP, MoE
 
 

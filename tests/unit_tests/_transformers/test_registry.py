@@ -179,7 +179,7 @@ def test_llama_nemotron_vl_registry_entry_is_retrieval_model():
     from nemo_automodel._transformers.registry import MODEL_ARCH_MAPPING, ModelRegistry
 
     assert MODEL_ARCH_MAPPING["LlamaNemotronVLModel"] == (
-        "nemo_automodel.components.models.llama_nemotron_vl.model",
+        "nemo_automodel._transformers.models.llama_nemotron_vl.model",
         "LlamaNemotronVLModel",
         {"retrieval"},
     )
@@ -193,19 +193,19 @@ def test_step3p7_registry_and_custom_config_registration():
     from nemo_automodel._transformers.registry import _CUSTOM_CONFIG_REGISTRATIONS, MODEL_ARCH_MAPPING
 
     assert MODEL_ARCH_MAPPING["Step3p7ForConditionalGeneration"] == (
-        "nemo_automodel.components.models.step3p7.model",
+        "nemo_automodel._transformers.models.step3p7.model",
         "Step3p7ForConditionalGeneration",
     )
     assert MODEL_ARCH_MAPPING["Step3p6ForConditionalGeneration"] == (
-        "nemo_automodel.components.models.step3p7.model",
+        "nemo_automodel._transformers.models.step3p7.model",
         "Step3p7ForConditionalGeneration",
     )
     assert _CUSTOM_CONFIG_REGISTRATIONS["step3p5v"] == (
-        "nemo_automodel.components.models.step3p7.configuration_step3p7",
+        "nemo_automodel._transformers.models.step3p7.configuration_step3p7",
         "Step3p5VConfig",
     )
     assert _CUSTOM_CONFIG_REGISTRATIONS["step3p7"] == (
-        "nemo_automodel.components.models.step3p7.configuration_step3p7",
+        "nemo_automodel._transformers.models.step3p7.configuration_step3p7",
         "Step3p7Config",
     )
     assert CONFIG_MAPPING["step3p5v"].__name__ == "Step3p5VConfig"
@@ -397,7 +397,7 @@ def test_kimi_k2_config_loads_without_trust_remote_code(tmp_path):
     from transformers import AutoConfig
 
     import nemo_automodel._transformers.registry  # noqa: F401
-    from nemo_automodel.components.models.kimi_k2.config import KimiK2Config
+    from nemo_automodel._transformers.models.kimi_k2.config import KimiK2Config
 
     (tmp_path / "config.json").write_text(
         json.dumps(
@@ -447,7 +447,7 @@ def test_kimi_k3_configs_load_without_transformers_builtin(
     from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 
     from nemo_automodel._transformers import registry as reg
-    from nemo_automodel.components.models.kimi_k3 import config as kimi_config
+    from nemo_automodel._transformers.models.kimi_k3 import config as kimi_config
 
     expected_config = getattr(kimi_config, expected_config_name)
     monkeypatch.delitem(CONFIG_MAPPING._mapping, model_type, raising=False)
@@ -465,8 +465,8 @@ def test_kimi_linear_48b_has_its_own_model_type(monkeypatch):
     from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 
     from nemo_automodel._transformers import registry as reg
-    from nemo_automodel.components.models.kimi_k3.config import KimiK3TextConfig
-    from nemo_automodel.components.models.kimi_linear.config import KimiLinear48BConfig
+    from nemo_automodel._transformers.models.kimi_k3.config import KimiK3TextConfig
+    from nemo_automodel._transformers.models.kimi_linear.config import KimiLinear48BConfig
 
     monkeypatch.delitem(CONFIG_MAPPING._mapping, "kimi_linear", raising=False)
     monkeypatch.delitem(CONFIG_MAPPING._mapping, "kimi_linear_48b_a3b", raising=False)
@@ -480,7 +480,7 @@ def test_kimi_linear_48b_checkpoint_config_resolves_through_get_hf_config(tmp_pa
     import json
 
     from nemo_automodel._transformers.model_init import get_hf_config
-    from nemo_automodel.components.models.kimi_linear.config import KimiLinear48BConfig
+    from nemo_automodel._transformers.models.kimi_linear.config import KimiLinear48BConfig
 
     (tmp_path / "config.json").write_text(
         json.dumps(
@@ -522,7 +522,7 @@ def test_deepseek_v4_registered_in_arch_mapping():
         "in-tree model implementation."
     )
     module_path, cls_name = MODEL_ARCH_MAPPING["DeepseekV4ForCausalLM"]
-    assert module_path == "nemo_automodel.components.models.deepseek_v4.model"
+    assert module_path == "nemo_automodel._transformers.models.deepseek_v4.model"
     assert cls_name == "DeepseekV4ForCausalLM"
 
 
@@ -535,7 +535,7 @@ def test_deepseek_v4_in_custom_config_registrations():
         "can resolve DSV4 configs without trust_remote_code=True."
     )
     module_path, cls_name = _CUSTOM_CONFIG_REGISTRATIONS["deepseek_v4"]
-    assert module_path == "nemo_automodel.components.models.deepseek_v4.config"
+    assert module_path == "nemo_automodel._transformers.models.deepseek_v4.config"
     assert cls_name == "DeepseekV4Config"
 
 
@@ -543,28 +543,39 @@ def test_all_model_folders_registered_in_auto_map():
     """Every model folder with a model.py must have at least one entry in MODEL_ARCH_MAPPING.
 
     This catches the case where a developer adds a new model directory under
-    ``nemo_automodel/components/models/`` but forgets to add it to the static
-    ``MODEL_ARCH_MAPPING`` in ``registry.py``.
+    ``nemo_automodel/_transformers/models/`` or ``nemo_automodel/_diffusers/models/``
+    but forgets to add it to the static ``MODEL_ARCH_MAPPING`` in ``registry.py``.
     """
     import pathlib
 
+    from nemo_automodel._model_locations import (
+        DIFFUSERS_MODELS_PACKAGE,
+        TRANSFORMERS_MODELS_PACKAGE,
+    )
     from nemo_automodel._transformers.registry import MODEL_ARCH_MAPPING
 
-    models_root = pathlib.Path(__file__).resolve().parents[3] / "nemo_automodel" / "components" / "models"
+    repo_root = pathlib.Path(__file__).resolve().parents[3]
+    # Models are split by the upstream HF package they are built on; scan both.
+    models_roots = {
+        package: repo_root.joinpath(*package.split("."))
+        for package in (TRANSFORMERS_MODELS_PACKAGE, DIFFUSERS_MODELS_PACKAGE)
+    }
 
     # Collect the set of module paths referenced by the auto_map
     registered_module_paths = {v[0] for v in MODEL_ARCH_MAPPING.values()}
 
     missing = []
-    for model_dir in sorted(models_root.iterdir()):
-        if not model_dir.is_dir() or model_dir.name.startswith(("_", ".")):
-            continue
-        model_file = model_dir / "model.py"
-        if not model_file.exists():
-            continue
-        expected_module = f"nemo_automodel.components.models.{model_dir.name}.model"
-        if expected_module not in registered_module_paths:
-            missing.append(model_dir.name)
+    for package, models_root in sorted(models_roots.items()):
+        assert models_root.is_dir(), f"{package} does not map to a directory at {models_root}"
+        for model_dir in sorted(models_root.iterdir()):
+            if not model_dir.is_dir() or model_dir.name.startswith(("_", ".")):
+                continue
+            model_file = model_dir / "model.py"
+            if not model_file.exists():
+                continue
+            expected_module = f"{package}.{model_dir.name}.model"
+            if expected_module not in registered_module_paths:
+                missing.append(model_dir.name)
 
     assert not missing, (
         f"Model folder(s) {missing} contain a model.py but are not registered "
@@ -586,7 +597,7 @@ def test_minimax_m3_vl_config_overrides_transformers_builtin():
     """
     from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 
-    from nemo_automodel.components.models.minimax_m3_vl.config import MiniMaxM3VLConfig
+    from nemo_automodel._transformers.models.minimax_m3_vl.config import MiniMaxM3VLConfig
 
     resolved = CONFIG_MAPPING["minimax_m3_vl"]
     assert resolved is MiniMaxM3VLConfig, (

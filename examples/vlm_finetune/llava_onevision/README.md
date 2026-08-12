@@ -113,7 +113,7 @@ peft:
 
 ```
 nemo_automodel/
-├── components/models/llava_onevision/
+├── _transformers/models/llava_onevision/
 │   ├── __init__.py
 │   ├── model.py                    # Main model class
 │   ├── rice_vit.py                 # Rice ViT implementation

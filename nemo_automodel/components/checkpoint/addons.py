@@ -522,7 +522,7 @@ def _extract_target_modules(
     # is compatible with HF PEFT / merge_lora.
     adapter = getattr(model_parts[0], "state_dict_adapter", None)
     if adapter is not None:
-        from nemo_automodel.components.models.common.bidirectional import EncoderStateDictAdapter
+        from nemo_automodel._transformers.models.common.bidirectional import EncoderStateDictAdapter
 
         if isinstance(adapter, EncoderStateDictAdapter):
             final_target_modules = {

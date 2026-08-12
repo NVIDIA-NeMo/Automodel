@@ -194,7 +194,7 @@ class TestIsRecipeTarget:
         exercises the lazy-import branch of ``_accepted_targets()`` --
         the composite is added behind a try/except for the optional
         ``transformers.models.gemma4_assistant`` dep."""
-        from nemo_automodel.components.models.gemma4_drafter.composite import (
+        from nemo_automodel._transformers.models.gemma4_drafter.composite import (
             Gemma4WithDrafter,
         )
 
@@ -271,7 +271,7 @@ class TestAcceptedTargets:
         (which it is in the test environment, see the conftest fixture
         that gates the gemma4_drafter unit tests), the composite's
         ``from_pretrained`` must be in the set."""
-        from nemo_automodel.components.models.gemma4_drafter.composite import (
+        from nemo_automodel._transformers.models.gemma4_drafter.composite import (
             Gemma4WithDrafter,
         )
 

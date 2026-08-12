@@ -23,8 +23,8 @@ registration, so no GPU is required.
 
 import torch
 
-from nemo_automodel.components.models.gemma4_moe import sdpa_fp32
-from nemo_automodel.components.models.gemma4_moe.sdpa_fp32 import (
+from nemo_automodel._transformers.models.gemma4_moe import sdpa_fp32
+from nemo_automodel._transformers.models.gemma4_moe.sdpa_fp32 import (
     enable_gemma4_sdpa_fp32,
     sdpa_fp32_attention_forward,
 )
@@ -131,7 +131,7 @@ def _from_pretrained_calls(monkeypatch, attn_implementation):
     import pytest
 
     try:
-        from nemo_automodel.components.models.gemma4_moe import model as g4model
+        from nemo_automodel._transformers.models.gemma4_moe import model as g4model
     except ImportError as exc:  # e.g. older torch without FSDPModule, or no gemma4
         pytest.skip(f"gemma4_moe model unavailable: {exc}")
 

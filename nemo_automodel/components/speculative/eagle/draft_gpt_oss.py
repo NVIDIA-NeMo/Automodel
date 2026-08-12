@@ -39,7 +39,7 @@ The shared ``LlamaRotaryEmbedding`` cannot represent YaRN -- it implements only
 ``{"default", "llama3"}`` and silently falls back to the llama3 NTK schedule for
 ``rope_type="yarn"``. So this draft swaps in :class:`GptOssDraftRotaryEmbedding`,
 which reproduces gpt-oss's exact YaRN ``inv_freq`` and concentration (reusing the
-target's own ``components/models/gpt_oss/rope_utils.RotaryEmbedding``) but returns
+target's own ``_transformers/models/gpt_oss/rope_utils.RotaryEmbedding``) but returns
 ``(cos, sin)`` in the duplicated ``[..., head_dim]`` layout. gpt-oss's interleaved
 ``apply_rotary_emb`` and the draft's ``rotate_half``-based ``apply_rotary_pos_emb``
 are algebraically identical under that layout, so the draft's rotation is
@@ -58,8 +58,8 @@ import torch
 import torch.nn as nn
 from transformers import PretrainedConfig
 
-from nemo_automodel.components.models.common.utils import get_rope_config
-from nemo_automodel.components.models.gpt_oss.rope_utils import RotaryEmbedding as GptOssRotaryEmbedding
+from nemo_automodel._transformers.models.common.utils import get_rope_config
+from nemo_automodel._transformers.models.gpt_oss.rope_utils import RotaryEmbedding as GptOssRotaryEmbedding
 from nemo_automodel.components.speculative.eagle.draft_llama import LlamaEagle3DraftModel
 
 
@@ -90,7 +90,7 @@ class GptOssDraftRotaryEmbedding(nn.Module):
                 f"(partial_rotary_factor=1.0), got {partial_rotary_factor}."
             )
         # Same parameter mapping the gpt-oss target uses to build its rotary
-        # (see components/models/gpt_oss/model.py): factor -> scaling_factor,
+        # (see _transformers/models/gpt_oss/model.py): factor -> scaling_factor,
         # beta_slow -> ntk_alpha, beta_fast -> ntk_beta.
         self._rope = GptOssRotaryEmbedding(
             head_dim=head_dim,

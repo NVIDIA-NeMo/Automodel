@@ -2586,16 +2586,16 @@ def _model_has_dtensors(module: nn.Module) -> bool:
 
 
 def _is_custom_model(module: nn.Module) -> bool:
-    """True if the model has a custom implementation in nemo_automodel/components/models/.
+    """True if the model has a custom implementation in nemo_automodel/_transformers/models/.
 
     The generic HFCheckpointingMixin (in .common.hf_checkpointing_mixin) is
     injected into every model by _get_mixin_wrapped_class and does NOT count
     as a "custom model".  Only actual model implementations (e.g. llama,
-    deepseek_v3) that live under nemo_automodel.components.models qualify.
+    deepseek_v3) that live under nemo_automodel._transformers.models qualify.
     """
-    _MIXIN_MODULE = "nemo_automodel.components.models.common."
+    _MIXIN_MODULE = "nemo_automodel._transformers.models.common."
     return any(
-        (c.__module__ or "").startswith("nemo_automodel.components.models.")
+        (c.__module__ or "").startswith("nemo_automodel._transformers.models.")
         and not (c.__module__ or "").startswith(_MIXIN_MODULE)
         for c in type(module).__mro__
     )

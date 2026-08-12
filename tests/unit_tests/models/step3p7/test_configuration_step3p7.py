@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import torch
 
-from nemo_automodel.components.models.step3p7.configuration_step3p7 import (
+from nemo_automodel._transformers.models.step3p7.configuration_step3p7 import (
     Step3p5VConfig,
     Step3p7Config,
     Step3p7TextConfig,

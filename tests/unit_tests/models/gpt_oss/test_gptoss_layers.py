@@ -18,10 +18,10 @@ import pytest
 import torch
 from transformers.models.gpt_oss.configuration_gpt_oss import GptOssConfig
 
-from nemo_automodel.components.models.gpt_oss.layers import (
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.gpt_oss.layers import (
     GptOssAttention,
 )
-from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.shared.import_utils import is_te_min_version
 
 
@@ -294,7 +294,7 @@ class TestGptOssAttentionWithTE:
 
         # Mock TE version check to simulate old version
         from unittest.mock import patch
-        with patch("nemo_automodel.components.models.gpt_oss.layers.is_te_min_version", return_value=False):
+        with patch("nemo_automodel._transformers.models.gpt_oss.layers.is_te_min_version", return_value=False):
             with pytest.raises(ValueError, match="Transformer Engine DotProductAttention for GPT-OSS is only supported for TE version 2.8.0 or higher"):
                 GptOssAttention(gpt_config, te_backend)
 
@@ -305,7 +305,7 @@ class TestGptOssAttentionWithTE:
 
         # Mock version check to allow initialization
         from unittest.mock import patch
-        with patch("nemo_automodel.components.models.gpt_oss.layers.is_te_min_version", return_value=True):
+        with patch("nemo_automodel._transformers.models.gpt_oss.layers.is_te_min_version", return_value=True):
             attention = GptOssAttention(gpt_config, te_backend_config)
 
             assert attention.backend.attn == "te"
@@ -322,7 +322,7 @@ class TestGptOssAttentionWithTE:
         pytest.importorskip("transformer_engine")
 
         from unittest.mock import patch
-        with patch("nemo_automodel.components.models.gpt_oss.layers.is_te_min_version", return_value=True):
+        with patch("nemo_automodel._transformers.models.gpt_oss.layers.is_te_min_version", return_value=True):
             attention = GptOssAttention(gpt_config, te_backend_config)
 
             # Store original softmax_offset to verify it changes
@@ -339,7 +339,7 @@ class TestGptOssAttentionWithTE:
         pytest.importorskip("transformer_engine")
 
         from unittest.mock import patch
-        with patch("nemo_automodel.components.models.gpt_oss.layers.is_te_min_version", return_value=True):
+        with patch("nemo_automodel._transformers.models.gpt_oss.layers.is_te_min_version", return_value=True):
             attention = GptOssAttention(gpt_config, te_backend_config)
             attention = attention.to(device)
 
@@ -361,7 +361,7 @@ class TestGptOssAttentionWithTE:
         pytest.importorskip("transformer_engine")
 
         from unittest.mock import patch
-        with patch("nemo_automodel.components.models.gpt_oss.layers.is_te_min_version", return_value=True):
+        with patch("nemo_automodel._transformers.models.gpt_oss.layers.is_te_min_version", return_value=True):
             attention = GptOssAttention(gpt_config, te_backend_config)
             attention = attention.to(device)
 
@@ -389,7 +389,7 @@ class TestGptOssAttentionWithTE:
         gpt_config.sliding_window = 256
 
         from unittest.mock import patch
-        with patch("nemo_automodel.components.models.gpt_oss.layers.is_te_min_version", return_value=True):
+        with patch("nemo_automodel._transformers.models.gpt_oss.layers.is_te_min_version", return_value=True):
             attention = GptOssAttention(gpt_config, te_backend_config, use_sliding_attention=True)
             attention = attention.to(device)
 

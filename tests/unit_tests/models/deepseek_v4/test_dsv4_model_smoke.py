@@ -27,13 +27,13 @@ import pytest
 import torch
 from torch.distributed.fsdp import MixedPrecisionPolicy
 
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.common.mtp import MTPConfig
-from nemo_automodel.components.models.common.utils import cast_model_to_dtype
-from nemo_automodel.components.models.deepseek_v4 import fsdp as dsv4_fsdp
-from nemo_automodel.components.models.deepseek_v4 import model as dsv4_model_module
-from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
-from nemo_automodel.components.models.deepseek_v4.model import DeepseekV4ForCausalLM
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.common.mtp import MTPConfig
+from nemo_automodel._transformers.models.common.utils import cast_model_to_dtype
+from nemo_automodel._transformers.models.deepseek_v4 import fsdp as dsv4_fsdp
+from nemo_automodel._transformers.models.deepseek_v4 import model as dsv4_model_module
+from nemo_automodel._transformers.models.deepseek_v4.config import DeepseekV4Config
+from nemo_automodel._transformers.models.deepseek_v4.model import DeepseekV4ForCausalLM
 
 # ``MoE.forward`` (in ``nemo_automodel/components/moe/layers.py``)
 # unconditionally creates a ``torch.cuda.Stream()`` when the model has a

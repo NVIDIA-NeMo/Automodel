@@ -2699,7 +2699,7 @@ def test_vlm_build_model_accepts_multimodal_lm_entry_points(entry_point):
     assert model is not None
 
 
-_GEMMA4_COMPOSITE_MOD = "nemo_automodel.components.models.gemma4_drafter.composite"
+_GEMMA4_COMPOSITE_MOD = "nemo_automodel._transformers.models.gemma4_drafter.composite"
 
 
 def _target_owner_names(targets):
@@ -3429,9 +3429,9 @@ def _patches_for_packing(neat_pack_side_effect):
             side_effect=neat_pack_side_effect,
         ),
         patch("nemo_automodel.components.datasets.vlm.loader.StatefulDataLoader", return_value=MagicMock()),
-        patch("nemo_automodel.components.models.common.packing.configure_packing"),
+        patch("nemo_automodel._transformers.models.common.packing.configure_packing"),
         patch(
-            "nemo_automodel.components.models.common.packing.get_attn_implementation",
+            "nemo_automodel._transformers.models.common.packing.get_attn_implementation",
             return_value="sdpa",
         ),
     ]

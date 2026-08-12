@@ -37,8 +37,8 @@ import torch
 from transformers import AutoConfig, PretrainedConfig
 
 from nemo_automodel._transformers import NeMoAutoModelForCausalLM
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.deepseek_v4.config import DeepseekV4Config
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config
 
 logger = logging.getLogger(__name__)

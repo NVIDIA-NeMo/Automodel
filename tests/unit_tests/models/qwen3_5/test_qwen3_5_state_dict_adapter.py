@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import torch
 
-from nemo_automodel.components.models.qwen3_5.state_dict_adapter import (
+from nemo_automodel._transformers.models.qwen3_5.state_dict_adapter import (
     Qwen3_5DenseStateDictAdapter,
     _route_to_fp32_holder,
     _strip_fp32_prefix,

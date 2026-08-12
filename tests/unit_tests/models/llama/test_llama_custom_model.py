@@ -21,13 +21,13 @@ import torch
 from transformers import AutoModelForCausalLM, LlamaConfig, set_seed
 
 from nemo_automodel import NeMoAutoModelForCausalLM
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.llama.model import LlamaAttention
-from nemo_automodel.components.models.llama.rope_utils import (
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.llama.model import LlamaAttention
+from nemo_automodel._transformers.models.llama.rope_utils import (
     apply_rotary_pos_emb,
     apply_rotary_pos_emb_quack,
 )
-from nemo_automodel.components.models.llama.state_dict_adapter import LlamaStateDictAdapter
+from nemo_automodel._transformers.models.llama.state_dict_adapter import LlamaStateDictAdapter
 
 set_seed(42)
 
@@ -107,7 +107,7 @@ def test_quack_rope_reports_missing_dependency():
     config = LlamaConfig(**TINY_DEFAULT_ROPE_CONFIG)
     with (
         patch(
-            "nemo_automodel.components.models.llama.model.safe_import_from",
+            "nemo_automodel._transformers.models.llama.model.safe_import_from",
             return_value=(False, None),
         ),
         pytest.raises(ImportError, match="quack-kernels"),

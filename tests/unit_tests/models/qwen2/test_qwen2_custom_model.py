@@ -21,9 +21,9 @@ import torch
 from transformers import AutoModelForCausalLM, Qwen2Config, set_seed
 
 from nemo_automodel import NeMoAutoModelForCausalLM
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.qwen2.model import Qwen2Attention
-from nemo_automodel.components.models.qwen2.state_dict_adapter import Qwen2StateDictAdapter
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.qwen2.model import Qwen2Attention
+from nemo_automodel._transformers.models.qwen2.state_dict_adapter import Qwen2StateDictAdapter
 
 set_seed(42)
 
@@ -47,7 +47,7 @@ def test_quack_rope_reports_missing_dependency():
     config = Qwen2Config(**TINY_DEFAULT_QWEN2_CONFIG)
     with (
         patch(
-            "nemo_automodel.components.models.qwen2.model.safe_import_from",
+            "nemo_automodel._transformers.models.qwen2.model.safe_import_from",
             return_value=(False, None),
         ),
         pytest.raises(ImportError, match="quack-kernels"),

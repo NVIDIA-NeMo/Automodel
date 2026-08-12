@@ -24,7 +24,7 @@ group.
 
 import torch
 
-from nemo_automodel.components.models.minimax_m3_vl.cp_sparse_attn import cp_document_ids
+from nemo_automodel._transformers.models.minimax_m3_vl.cp_sparse_attn import cp_document_ids
 
 
 def test_single_sequence_is_all_zero_docid():

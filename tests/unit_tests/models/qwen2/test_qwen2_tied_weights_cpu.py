@@ -22,7 +22,7 @@ model from the dict-shaped ``_tied_weights_keys`` under transformers v5).
 
 from transformers import Qwen2Config
 
-from nemo_automodel.components.models.qwen2.model import Qwen2ForCausalLM
+from nemo_automodel._transformers.models.qwen2.model import Qwen2ForCausalLM
 
 
 def _tiny_qwen2_config(tie_word_embeddings: bool) -> Qwen2Config:

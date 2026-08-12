@@ -17,8 +17,8 @@
 import pytest
 import torch
 
-import nemo_automodel.components.models.common.inbatch_neg_utils as inbatch_neg_utils
-from nemo_automodel.components.models.common.inbatch_neg_utils import (
+import nemo_automodel._transformers.models.common.inbatch_neg_utils as inbatch_neg_utils
+from nemo_automodel._transformers.models.common.inbatch_neg_utils import (
     dist_gather_tensor,
     dist_gather_tensor_with_dim1_padding,
     mask_gathered_passages_same_doc_as_positive,

@@ -25,7 +25,7 @@ square selection produces for those query rows. These tests verify that against
 import pytest
 import torch
 
-from nemo_automodel.components.models.minimax_m3_vl.layers import (
+from nemo_automodel._transformers.models.minimax_m3_vl.layers import (
     build_block_sparse_attn_mask,
     select_sparse_blocks,
 )

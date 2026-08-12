@@ -24,12 +24,12 @@ import torch.nn as nn
 
 pytest.importorskip("transformers.models.ministral3", reason="Ministral3 not available in this transformers version")
 
-from nemo_automodel._transformers.registry import ModelRegistry
-from nemo_automodel._transformers.retrieval import BiEncoderModel, _init_encoder_common, configure_encoder_metadata
-from nemo_automodel.components.models.ministral_bidirectional.model import (
+from nemo_automodel._transformers.models.ministral_bidirectional.model import (
     Ministral3BidirectionalConfig,
     Ministral3BidirectionalModel,
 )
+from nemo_automodel._transformers.registry import ModelRegistry
+from nemo_automodel._transformers.retrieval import BiEncoderModel, _init_encoder_common, configure_encoder_metadata
 
 
 def tiny_bidirectional_config() -> Ministral3BidirectionalConfig:

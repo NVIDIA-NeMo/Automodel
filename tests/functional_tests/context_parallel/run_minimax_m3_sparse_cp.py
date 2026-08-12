@@ -96,13 +96,13 @@ def main():
 
     from torch.distributed.device_mesh import init_device_mesh
 
-    from nemo_automodel.components.models.common import BackendConfig
-    from nemo_automodel.components.models.minimax_m3_vl.config import MiniMaxM3VLTextConfig
-    from nemo_automodel.components.models.minimax_m3_vl.cp_sparse_attn import (
+    from nemo_automodel._transformers.models.common import BackendConfig
+    from nemo_automodel._transformers.models.minimax_m3_vl.config import MiniMaxM3VLTextConfig
+    from nemo_automodel._transformers.models.minimax_m3_vl.cp_sparse_attn import (
         MiniMaxM3CPSparseAttention,
         cp_load_balanced_global_slots,
     )
-    from nemo_automodel.components.models.minimax_m3_vl.model import MiniMaxM3SparseForCausalLM
+    from nemo_automodel._transformers.models.minimax_m3_vl.model import MiniMaxM3SparseForCausalLM
 
     backend = BackendConfig(
         linear="torch",

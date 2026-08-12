@@ -38,12 +38,12 @@ from transformers.models.ministral3.modeling_ministral3 import (
     Ministral3Model,
 )
 
-from nemo_automodel.components.models.llama_bidirectional.model import (
+from nemo_automodel._transformers.models.llama_bidirectional.model import (
     LlamaBidirectionalConfig,
     LlamaBidirectionalForSequenceClassification,
     LlamaBidirectionalModel,
 )
-from nemo_automodel.components.models.ministral_bidirectional.model import (
+from nemo_automodel._transformers.models.ministral_bidirectional.model import (
     Ministral3BidirectionalConfig,
     Ministral3BidirectionalModel,
 )

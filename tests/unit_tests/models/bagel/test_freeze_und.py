@@ -43,7 +43,7 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not 
 
 def _build_layer(freeze_und: bool):
     """Construct a tiny Qwen2MoTDecoderLayer in MoT mode."""
-    from nemo_automodel.components.models.bagel.modeling_qwen2_packed import (
+    from nemo_automodel._transformers.models.bagel.modeling_qwen2_packed import (
         Qwen2Config,
         Qwen2MoTDecoderLayer,
     )

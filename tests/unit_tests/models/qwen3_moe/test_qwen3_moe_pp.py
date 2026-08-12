@@ -13,8 +13,8 @@
 # limitations under the License.
 """CPU-only checks for Qwen3-MoE pipeline-parallel compatibility."""
 
+from nemo_automodel._transformers.models.qwen3_moe.model import Qwen3MoeForCausalLM
 from nemo_automodel.components.distributed.pipelining.hf_utils import model_keeps_self_forward
-from nemo_automodel.components.models.qwen3_moe.model import Qwen3MoeForCausalLM
 
 
 def test_pp_keep_self_forward_is_declared():

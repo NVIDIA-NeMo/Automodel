@@ -1721,10 +1721,10 @@ def test_apply_fsdp_uses_dsv4_wrapper_only_for_deepseek_v4(monkeypatch):
     fully_shard_mock = MagicMock()
     monkeypatch.setattr(P, "fully_shard", fully_shard_mock)
 
-    dsv4_fsdp_stub = types.ModuleType("nemo_automodel.components.models.deepseek_v4.fsdp")
+    dsv4_fsdp_stub = types.ModuleType("nemo_automodel._transformers.models.deepseek_v4.fsdp")
     dsv4_fully_shard_mock = MagicMock()
     dsv4_fsdp_stub.fully_shard_deepseek_v4 = dsv4_fully_shard_mock
-    monkeypatch.setitem(sys.modules, "nemo_automodel.components.models.deepseek_v4.fsdp", dsv4_fsdp_stub)
+    monkeypatch.setitem(sys.modules, "nemo_automodel._transformers.models.deepseek_v4.fsdp", dsv4_fsdp_stub)
 
     block = DummyBlock(mlp=DummyMoE())
     model = DummyModel([block])

@@ -17,8 +17,8 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.nemotron_v3.state_dict_adapter import (
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.nemotron_v3.state_dict_adapter import (
     NemotronV3StateDictAdapter,
 )
 from nemo_automodel.components.moe.config import MoEConfig

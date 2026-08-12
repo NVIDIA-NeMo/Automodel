@@ -106,7 +106,6 @@ recipes/             -- main training / eval entry points
     |
     v
 components/          -- modular building blocks
-  models/            -- 27+ model families (LLM, VLM, MoE, ...)
   datasets/          -- LLM, VLM, diffusion data pipelines
   distributed/       -- FSDP2, HSDP, DDP utilities
   checkpoint/        -- async DCP, SafeTensors
@@ -115,13 +114,15 @@ components/          -- modular building blocks
   launcher/          -- Slurm, SkyPilot job submission
     |
     v
-_transformers/       -- HuggingFace bridge
+_transformers/       -- HuggingFace transformers bridge
+  models/            -- 50+ model families built on transformers (LLM, VLM, MoE, ...)
   auto_model.py      -- NeMoAutoModelForCausalLM, NeMoAutoModelForImageTextToText, ...
   registry.py        -- MODEL_ARCH_MAPPING (model registration)
   capabilities.py    -- per-model feature detection flags
   infrastructure.py  -- device mesh setup for distributed training
 
-_diffusers/          -- diffusion pipeline wrapper
+_diffusers/          -- HuggingFace diffusers bridge
+  models/            -- model families built on diffusers
   NeMoAutoDiffusionPipeline
 ```
 
@@ -170,7 +171,18 @@ distributed training interface used by LLM/VLM recipes.
 
 ### Directory Layout
 
-Each model lives under `components/models/<name>/` and contains:
+Models are split by the upstream HuggingFace package they are written against:
+models built on `transformers` live under `_transformers/models/<name>/`, models
+built on `diffusers` under `_diffusers/models/<name>/`. When adding to the
+diffusers side, also add the name to `DIFFUSERS_MODELS` in
+`nemo_automodel/_model_locations.py` -- `tests/unit_tests/test_model_locations.py`
+fails if the table and the directories drift apart.
+
+The legacy `nemo_automodel.components.models.*` import path still resolves to
+both (with a `DeprecationWarning`) via the alias finder in
+`nemo_automodel/__init__.py`; `nemo_automodel.models.*` remains supported.
+
+Each model directory contains:
 
 | File                    | Purpose                                           |
 |-------------------------|---------------------------------------------------|
@@ -224,7 +236,7 @@ to instantiate. This is the same pattern used by Hydra/OmegaConf:
 
 ```yaml
 model:
-  _target_: nemo_automodel.components.models.llama.model.LlamaForCausalLM
+  _target_: nemo_automodel._transformers.models.llama.model.LlamaForCausalLM
   config:
     hidden_size: 4096
     num_attention_heads: 32

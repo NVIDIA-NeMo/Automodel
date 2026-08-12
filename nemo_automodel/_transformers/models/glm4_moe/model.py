@@ -1,0 +1,375 @@
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from dataclasses import dataclass
+from typing import Any, Optional, Union
+
+import torch
+import torch.nn as nn
+from transformers.modeling_outputs import CausalLMOutputWithPast
+from transformers.models.glm4_moe.configuration_glm4_moe import Glm4MoeConfig
+
+from nemo_automodel._transformers.models.common import (
+    BackendConfig,
+    get_rope_config,
+    initialize_linear_module,
+    initialize_rms_norm_module,
+)
+from nemo_automodel._transformers.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel._transformers.models.common.tie_word_embeddings import (
+    TieSupport,
+    reject_unsupported_tie_word_embeddings,
+)
+from nemo_automodel._transformers.models.common.utils import cast_model_to_dtype, compute_lm_head_logits
+from nemo_automodel._transformers.models.glm4_moe.layers import Glm4MoeAttention
+from nemo_automodel._transformers.models.glm4_moe.state_dict_adapter import Glm4MoeStateDictAdapter
+from nemo_automodel._transformers.models.gpt_oss.rope_utils import RotaryEmbedding, position_ids_to_freqs_cis
+from nemo_automodel.components.moe.config import MoEConfig
+from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
+from nemo_automodel.components.moe.layers import MLP, MoE
+from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
+from nemo_automodel.shared.utils import dtype_from_str as get_dtype
+
+
+class Block(nn.Module):
+    def __init__(self, layer_idx: int, config: Glm4MoeConfig, moe_config: MoEConfig, backend: BackendConfig):
+        super().__init__()
+        self.self_attn = Glm4MoeAttention(config, backend)
+
+        # Thread dtype from config.torch_dtype so the block's own params stay
+        # aligned with the rest of the model (fp32 under fp32 master weights).
+        dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+
+        # GLM4-MoE uses dense layers for first_k_dense_replace layers, then MoE
+        is_moe_layer = layer_idx >= config.first_k_dense_replace
+        if is_moe_layer:
+            self.mlp = MoE(moe_config, backend)
+        else:
+            self.mlp = MLP(config.hidden_size, config.intermediate_size, backend.linear, dtype=dtype)
+
+        self.input_layernorm = initialize_rms_norm_module(
+            backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, dtype=dtype
+        )
+        self.post_attention_layernorm = initialize_rms_norm_module(
+            backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, dtype=dtype
+        )
+        self.layer_idx = layer_idx
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        freqs_cis: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        padding_mask: torch.Tensor | None = None,
+        **attn_kwargs: Any,
+    ) -> torch.Tensor:
+        if attention_mask is not None and padding_mask is None:
+            padding_mask = attention_mask.bool().logical_not()
+
+        attn_out = self.self_attn(
+            x=self.input_layernorm(x),
+            freqs_cis=freqs_cis,
+            attention_mask=attention_mask,
+            **attn_kwargs,
+        )
+        x = x + attn_out
+
+        mlp_out = self._mlp(x=self.post_attention_layernorm(x), padding_mask=padding_mask)
+        x = x + mlp_out
+        return x
+
+    def _mlp(self, x: torch.Tensor, padding_mask: torch.Tensor | None) -> torch.Tensor:
+        if isinstance(self.mlp, MLP):
+            return self.mlp(x)
+        else:
+            assert isinstance(self.mlp, MoE)
+            return self.mlp(x, padding_mask)
+
+    def init_weights(self, buffer_device: torch.device):
+        for norm in (self.input_layernorm, self.post_attention_layernorm):
+            norm.reset_parameters()
+        self.self_attn.init_weights(buffer_device)
+        self.mlp.init_weights(buffer_device)
+
+
+class Glm4MoeModel(nn.Module):
+    def __init__(
+        self,
+        config: Glm4MoeConfig,
+        backend: BackendConfig,
+        *,
+        moe_config: MoEConfig | None = None,
+        moe_overrides: dict | None = None,
+    ):
+        super().__init__()
+        self.backend = backend
+        self.config = config
+        if moe_config is not None and moe_overrides is not None:
+            raise ValueError("Cannot pass both moe_config and moe_overrides; use one or the other.")
+
+        # Resolve model dtype once; thread it explicitly to every sub-module
+        # so fp32 master weights work even when construction is not wrapped in
+        # local_torch_dtype().
+        model_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+
+        # Map HF GLM4 MoE config -> our MoE wrapper
+        # GLM4 MoE config fields:
+        # - hidden_size, intermediate_size, moe_intermediate_size
+        # - n_routed_experts, n_shared_experts, num_experts_per_tok
+        # - n_group, topk_group, routed_scaling_factor, norm_topk_prob
+        moe_defaults = dict(
+            dim=config.hidden_size,
+            inter_dim=config.intermediate_size,
+            moe_inter_dim=config.moe_intermediate_size,
+            n_routed_experts=config.n_routed_experts,
+            n_shared_experts=config.n_shared_experts,
+            n_activated_experts=config.num_experts_per_tok,
+            n_expert_groups=config.n_group,
+            n_limited_groups=config.topk_group,
+            train_gate=True,
+            gate_bias_update_factor=1e-3,
+            score_func="sigmoid",  # GLM4 MoE uses sigmoid scoring with groups
+            route_scale=config.routed_scaling_factor,
+            aux_loss_coeff=0.0,  # GLM4 MoE doesn't use aux loss in the HF implementation
+            norm_topk_prob=config.norm_topk_prob,
+            expert_bias=False,
+            router_bias=False,
+            expert_activation="swiglu",
+            softmax_before_topk=False,  # GLM4 uses sigmoid, not softmax
+            dtype=model_dtype,
+        )
+        if moe_overrides:
+            moe_defaults.update(moe_overrides)
+        self.moe_config = moe_config or MoEConfig(**moe_defaults)
+
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, dtype=model_dtype)
+        self.layers = torch.nn.ModuleDict()
+        for layer_id in range(config.num_hidden_layers):
+            self.layers[str(layer_id)] = Block(layer_id, config, self.moe_config, backend)
+        self.norm = initialize_rms_norm_module(
+            backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, dtype=model_dtype
+        )
+
+        # Rotary embedding cache compatible with our rope_utils functions
+        # GLM4 MoE uses partial rotary embeddings
+        self.max_seq_len = config.max_position_embeddings
+        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+
+        base, rope_scaling, partial_rotary_factor = get_rope_config(config)
+
+        self.rotary_emb = RotaryEmbedding(
+            head_dim=self.head_dim,
+            base=base,
+            dtype=torch.float32,
+            initial_context_length=rope_scaling.get("original_max_position_embeddings", 4096),
+            scaling_factor=rope_scaling.get("factor", 1.0),
+            ntk_alpha=rope_scaling.get("beta_slow", 1.0),
+            ntk_beta=rope_scaling.get("beta_fast", 32.0),
+            device=torch.device(f"cuda:{torch.cuda.current_device()}"),
+            partial_rotary_factor=partial_rotary_factor,
+        )
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        position_ids: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        padding_mask: torch.Tensor | None = None,
+        **attn_kwargs: Any,
+    ) -> torch.Tensor:
+        if position_ids is None:
+            position_ids = (
+                torch.arange(0, input_ids.shape[1], device=input_ids.device).unsqueeze(0).expand(input_ids.shape[0], -1)
+            )
+
+        # Compute freqs_cis from RotaryEmbedding inv_freq and current position_ids; then concat [cos, sin]
+        freqs_cis = position_ids_to_freqs_cis(
+            self.rotary_emb,
+            position_ids,
+            qkv_format=attn_kwargs.get("qkv_format", "bshd"),
+            for_fused_rope=self.backend.rope_fusion,
+            cp_size=attn_kwargs.get("cp_size", 1),
+        )
+
+        h = self.embed_tokens(input_ids) if self.embed_tokens is not None else input_ids
+
+        for layer in self.layers.values():
+            h = layer(
+                x=h,
+                freqs_cis=freqs_cis,
+                attention_mask=attention_mask,
+                padding_mask=padding_mask,
+                **attn_kwargs,
+            )
+
+        h = self.norm(h) if self.norm else h
+        return h
+
+    @torch.no_grad()
+    def init_weights(self, buffer_device: torch.device | None = None) -> None:
+        buffer_device = buffer_device or torch.device(f"cuda:{torch.cuda.current_device()}")
+
+        with buffer_device:
+            if self.embed_tokens is not None:
+                nn.init.normal_(self.embed_tokens.weight)
+            if self.norm is not None:
+                self.norm.reset_parameters()
+            # Ensure rotary embedding uses correct device after dtype move
+            self.rotary_emb.device = buffer_device
+
+        for layer in self.layers.values():
+            if layer is not None:
+                layer.init_weights(buffer_device=buffer_device)
+
+
+class Glm4MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
+    tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
+    _keep_in_fp32_modules_strict = ["e_score_correction_bias"]
+
+    @dataclass(frozen=True)
+    class ModelCapabilities:
+        """Declared parallelism capabilities for this model class."""
+
+        supports_tp: bool = False
+        supports_cp: bool = False
+        supports_pp: bool = True
+        supports_ep: bool = True
+
+    @classmethod
+    def from_config(
+        cls,
+        config: Glm4MoeConfig,
+        moe_config: MoEConfig | None = None,
+        backend: BackendConfig | None = None,
+        **kwargs,
+    ):
+        return cls(config, moe_config, backend, **kwargs)
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path: str,
+        *model_args,
+        **kwargs,
+    ):
+        config = Glm4MoeConfig.from_pretrained(pretrained_model_name_or_path)
+        return cls.from_config(config, *model_args, **kwargs)
+
+    def __init__(
+        self,
+        config: Glm4MoeConfig,
+        moe_config: MoEConfig | None = None,
+        backend: BackendConfig | None = None,
+        **kwargs,
+    ):
+        super().__init__()
+        self.config = config
+        reject_unsupported_tie_word_embeddings(type(self), config)
+        self.backend = backend or BackendConfig()
+        moe_overrides = kwargs.pop("moe_overrides", None)
+        self.model = Glm4MoeModel(
+            config,
+            backend=self.backend,
+            moe_config=moe_config,
+            moe_overrides=moe_overrides,
+        )
+        model_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+        self.lm_head = initialize_linear_module(
+            self.backend.linear, config.hidden_size, config.vocab_size, bias=False, dtype=model_dtype
+        )
+        if self.backend.enable_hf_state_dict_adapter:
+            self.state_dict_adapter = Glm4MoeStateDictAdapter(
+                self.config, self.model.moe_config, self.backend, dtype=model_dtype
+            )
+
+    def get_input_embeddings(self):
+        return self.model.embed_tokens
+
+    def set_input_embeddings(self, value):
+        self.model.embed_tokens = value
+
+    def get_output_embeddings(self):
+        return self.lm_head
+
+    def set_output_embeddings(self, new_embeddings):
+        self.lm_head = new_embeddings
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        position_ids: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        padding_mask: torch.Tensor | None = None,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
+        output_hidden_states: Optional[bool] = None,
+        **attn_kwargs: Any,
+    ) -> CausalLMOutputWithPast:
+        output_hidden_states = (
+            output_hidden_states
+            if output_hidden_states is not None
+            else getattr(self.config, "output_hidden_states", False)
+        )
+
+        is_thd = attn_kwargs.get("qkv_format") == "thd"
+        if is_thd:
+            input_ids, position_ids, padding_mask, attn_kwargs = squeeze_input_for_thd(
+                input_ids, position_ids, padding_mask, attn_kwargs
+            )
+            attention_mask = None
+
+        hidden = self.model(
+            input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            padding_mask=padding_mask,
+            **attn_kwargs,
+        )
+
+        return compute_lm_head_logits(
+            self.lm_head, hidden, logits_to_keep, is_thd=is_thd, output_hidden_states=output_hidden_states
+        )
+
+    @torch.no_grad()
+    def initialize_weights(
+        self, buffer_device: torch.device | None = None, dtype: torch.dtype = torch.bfloat16
+    ) -> None:
+        buffer_device = buffer_device or torch.device(f"cuda:{torch.cuda.current_device()}")
+        with buffer_device:
+            self.model.init_weights(buffer_device=buffer_device)
+            final_out_std = self.config.hidden_size**-0.5
+            cutoff_factor = 3
+            if self.lm_head is not None:
+                nn.init.trunc_normal_(
+                    self.lm_head.weight,
+                    mean=0.0,
+                    std=final_out_std,
+                    a=-cutoff_factor * final_out_std,
+                    b=cutoff_factor * final_out_std,
+                )
+
+        cast_model_to_dtype(self, dtype)
+        for layer in self.model.layers.values():
+            if isinstance(layer.mlp, MoE):
+                layer.mlp.gate.e_score_correction_bias = torch.zeros(
+                    (self.config.n_routed_experts), dtype=torch.float32
+                ).to(buffer_device)
+        with buffer_device:
+            # Ensure rotary embedding uses correct device after dtype move
+            self.model.rotary_emb.device = buffer_device
+
+
+ModelClass = Glm4MoeForCausalLM

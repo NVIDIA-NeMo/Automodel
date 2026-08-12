@@ -335,7 +335,7 @@ def _gemma4_text_config():
 
 
 def _make_gemma4_gate(enable_routing_replay=True):
-    from nemo_automodel.components.models.gemma4_moe.model import Gemma4Gate
+    from nemo_automodel._transformers.models.gemma4_moe.model import Gemma4Gate
 
     gate = Gemma4Gate(_gemma4_text_config(), enable_routing_replay=enable_routing_replay)
     with torch.no_grad():

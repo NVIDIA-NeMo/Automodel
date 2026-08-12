@@ -18,8 +18,8 @@ import pytest
 import torch
 from transformers.models.gemma4.configuration_gemma4 import Gemma4Config, Gemma4TextConfig
 
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.gemma4_moe.model import (
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.gemma4_moe.model import (
     Gemma4ForConditionalGeneration,
     Gemma4Gate,
     Gemma4MoE,
@@ -816,7 +816,7 @@ class TestGemma4ForConditionalGenerationClassmethods:
                 assert called_cfg is cfg
 
     def test_model_class_export_exists(self):
-        from nemo_automodel.components.models.gemma4_moe import model as gemma4_mod
+        from nemo_automodel._transformers.models.gemma4_moe import model as gemma4_mod
 
         assert hasattr(gemma4_mod, "ModelClass")
         assert gemma4_mod.ModelClass is Gemma4ForConditionalGeneration

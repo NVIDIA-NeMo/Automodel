@@ -173,8 +173,8 @@ class TestBiEncoderCheckpointRestoration:
         """Train bi-encoder -> load trained model back in NeMo -> save ->
         restore with transformers -> verify state dicts match."""
 
+        from nemo_automodel._transformers.models.llama_bidirectional import LlamaBidirectionalModel
         from nemo_automodel._transformers.retrieval import BiEncoderModel
-        from nemo_automodel.components.models.llama_bidirectional import LlamaBidirectionalModel
 
         # ---- Step 1: Train ------------------------------------------------
         checkpoint_dir = _run_training(RECIPE_YAML, CHECKPOINT_DIR)
@@ -233,9 +233,9 @@ class TestBiEncoderCheckpointRestoration:
         """Train bi-encoder with LoRA -> load in NeMo -> save -> verify base
         weights restored by transformers + LoRA weights by safetensors."""
 
+        from nemo_automodel._transformers.models.llama_bidirectional import LlamaBidirectionalModel
         from nemo_automodel._transformers.retrieval import BiEncoderModel
         from nemo_automodel.components._peft.lora import PeftConfig, apply_lora_to_linear_modules
-        from nemo_automodel.components.models.llama_bidirectional import LlamaBidirectionalModel
 
         # ---- Step 1: Train with PEFT -------------------------------------
         checkpoint_dir = _run_training(PEFT_RECIPE_YAML, PEFT_CHECKPOINT_DIR)

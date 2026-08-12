@@ -57,8 +57,8 @@ def compare(a: torch.Tensor, b: torch.Tensor, name: str = "") -> tuple[float, fl
 # -------------------------------------------------------------- Level 1
 def level1_state_dict_roundtrip(hf_model_id: str) -> bool:
     print(f"\n=== Level 1: state-dict round-trip on {hf_model_id} (CPU/fp32) ===")
-    from nemo_automodel.components.models.common import BackendConfig
-    from nemo_automodel.components.models.ling_v2.config import BailingMoeV2Config
+    from nemo_automodel._transformers.models.common import BackendConfig
+    from nemo_automodel._transformers.models.ling_v2.config import BailingMoeV2Config
     from nemo_automodel.components.moe.config import MoEConfig
 
     cfg = BailingMoeV2Config.from_pretrained(hf_model_id)
@@ -98,7 +98,7 @@ def level1_state_dict_roundtrip(hf_model_id: str) -> bool:
         rope_fusion=False,
     )
 
-    from nemo_automodel.components.models.ling_v2.state_dict_adapter import BailingMoeV2StateDictAdapter
+    from nemo_automodel._transformers.models.ling_v2.state_dict_adapter import BailingMoeV2StateDictAdapter
 
     adapter = BailingMoeV2StateDictAdapter(cfg, moe_cfg, backend, dtype=torch.float32)
 
@@ -152,7 +152,7 @@ def level1_state_dict_roundtrip(hf_model_id: str) -> bool:
 def level2_component_parity() -> bool:
     """Component checks: half-RoPE equivalence vs HF reference; sigmoid+group gate sanity."""
     print("\n=== Level 2: component parity (CPU/fp32) ===")
-    from nemo_automodel.components.models.gpt_oss.rope_utils import RotaryEmbedding, apply_rotary_emb
+    from nemo_automodel._transformers.models.gpt_oss.rope_utils import RotaryEmbedding, apply_rotary_emb
 
     head_dim = 128
     rotary_dim = head_dim // 2  # partial_rotary_factor=0.5

@@ -14,7 +14,7 @@
 
 import torch
 
-from nemo_automodel.components.models.minimax_m3_vl.state_dict_adapter import dequantize_mxfp8
+from nemo_automodel._transformers.models.minimax_m3_vl.state_dict_adapter import dequantize_mxfp8
 
 
 def test_native_to_hf_key_mapping(model):

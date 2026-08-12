@@ -60,18 +60,18 @@ apply_qwen3_omni_config_patch()
 
 import nemo_automodel.components.checkpoint.utils as checkpoint_utils
 import nemo_automodel.components.distributed.utils as dist_utils
-from nemo_automodel._transformers.registry import ModelRegistry, resolve_custom_config_cls
-from nemo_automodel.components.distributed.init_utils import get_local_world_size_preinit, get_world_size_safe
-from nemo_automodel.components.models.common.gated_delta_net_fp32 import (
+from nemo_automodel._transformers.models.common.gated_delta_net_fp32 import (
     has_gated_delta_net_fp32_checkpoint_contract,
     is_gated_delta_net_fp32_param_key,
 )
-from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.common.utils import (
+from nemo_automodel._transformers.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel._transformers.models.common.utils import (
     BackendConfig,
     initialize_linear_module,
     initialize_rms_norm_module,
 )
+from nemo_automodel._transformers.registry import ModelRegistry, resolve_custom_config_cls
+from nemo_automodel.components.distributed.init_utils import get_local_world_size_preinit, get_world_size_safe
 from nemo_automodel.components.utils.model_utils import resolve_trust_remote_code, skip_random_init
 from nemo_automodel.shared.utils import dtype_from_str
 
@@ -239,10 +239,10 @@ def _resolve_custom_model_cls_for_config(config):
 
     arch_name = architectures[0]
     if arch_name == "HYV3ForCausalLM":
-        from nemo_automodel.components.models.hy_mt2.dispatch import is_hy_mt2_config
+        from nemo_automodel._transformers.models.hy_mt2.dispatch import is_hy_mt2_config
 
         if is_hy_mt2_config(config):
-            from nemo_automodel.components.models.hy_mt2.model import HyMT2ForCausalLM
+            from nemo_automodel._transformers.models.hy_mt2.model import HyMT2ForCausalLM
 
             return HyMT2ForCausalLM
 
@@ -712,7 +712,7 @@ def _check_fp8_dequantize_will_fit(
             "BEFORE Automodel sharding runs, so tensor parallelism cannot prevent the OOM for any "
             "model larger than one device's HBM.\n"
             "  Workaround: provide a streaming-aware custom model class (see the mistral3_vlm "
-            "adapter in nemo_automodel/components/models/ for the pattern), or drop force_hf=True "
+            "adapter in nemo_automodel/_transformers/models/ for the pattern), or drop force_hf=True "
             "so the custom path can shard the FP8 checkpoint directly.\n"
         )
     else:
@@ -722,7 +722,7 @@ def _check_fp8_dequantize_will_fit(
             "Automodel sharding runs; tensor parallelism cannot prevent the OOM for any model "
             "larger than one device's HBM.\n"
             "  Workaround: provide a streaming-aware custom model class (see the mistral3_vlm "
-            "adapter in nemo_automodel/components/models/ for the pattern).\n"
+            "adapter in nemo_automodel/_transformers/models/ for the pattern).\n"
         )
 
     gib = 1024**3
@@ -889,7 +889,7 @@ def _streaming_bnb_supported(cls, hf_config) -> bool:
     except (KeyError, TypeError):
         return False
     try:
-        from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+        from nemo_automodel._transformers.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 
         if issubclass(model_cls, HFCheckpointingMixin):
             return False
@@ -1248,7 +1248,7 @@ def __init_model(
                 if backend_config_resolver is not None:
                     kwargs["backend"] = backend_config_resolver(kwargs["backend"])
                 else:
-                    from nemo_automodel.components.models.common.utils import BackendConfig
+                    from nemo_automodel._transformers.models.common.utils import BackendConfig
 
                     kwargs["backend"] = BackendConfig(**kwargs["backend"])
             with local_torch_dtype(torch_dtype, model_cls.__name__):

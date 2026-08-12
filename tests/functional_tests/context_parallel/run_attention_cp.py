@@ -227,10 +227,10 @@ def get_model_config_and_attention(model_type, device):
     if model_type == "qwen3_moe":
         from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 
-        from nemo_automodel.components.models.common import BackendConfig
-        from nemo_automodel.components.models.common.utils import get_rope_config
-        from nemo_automodel.components.models.gpt_oss.rope_utils import RotaryEmbedding
-        from nemo_automodel.components.models.qwen3_moe.layers import Qwen3MoeAttention
+        from nemo_automodel._transformers.models.common import BackendConfig
+        from nemo_automodel._transformers.models.common.utils import get_rope_config
+        from nemo_automodel._transformers.models.gpt_oss.rope_utils import RotaryEmbedding
+        from nemo_automodel._transformers.models.qwen3_moe.layers import Qwen3MoeAttention
 
         config = Qwen3MoeConfig(
             vocab_size=256,
@@ -271,7 +271,7 @@ def get_model_config_and_attention(model_type, device):
         attn_no_cp = Qwen3MoeAttention(config, backend).to(device).to(torch.bfloat16)
         attn_with_cp = Qwen3MoeAttention(config, backend).to(device).to(torch.bfloat16)
 
-        from nemo_automodel.components.models.gpt_oss.rope_utils import position_ids_to_freqs_cis
+        from nemo_automodel._transformers.models.gpt_oss.rope_utils import position_ids_to_freqs_cis
 
         def get_freqs_cis(position_ids, qkv_format, cp_size=1):
             # Build freqs in the layout the (possibly globally-disabled, see #3027) fused-RoPE
@@ -283,10 +283,10 @@ def get_model_config_and_attention(model_type, device):
     elif model_type == "deepseek_v3":
         from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
 
-        from nemo_automodel.components.models.common import BackendConfig
-        from nemo_automodel.components.models.common.utils import get_rope_config
-        from nemo_automodel.components.models.deepseek_v3.layers import MLA
-        from nemo_automodel.components.models.deepseek_v3.rope_utils import (
+        from nemo_automodel._transformers.models.common import BackendConfig
+        from nemo_automodel._transformers.models.common.utils import get_rope_config
+        from nemo_automodel._transformers.models.deepseek_v3.layers import MLA
+        from nemo_automodel._transformers.models.deepseek_v3.rope_utils import (
             freqs_cis_from_position_ids,
             precompute_freqs_cis,
         )
@@ -361,7 +361,7 @@ def get_model_config_and_attention(model_type, device):
 
 def _create_nemotron_v3_attn_pair(config, backend, device):
     """Create a pair of identical NemotronV3Attention modules with synced weights."""
-    from nemo_automodel.components.models.nemotron_v3.layers import NemotronV3Attention
+    from nemo_automodel._transformers.models.nemotron_v3.layers import NemotronV3Attention
 
     attn_baseline = NemotronV3Attention(config, backend).to(device).to(torch.bfloat16)
     attn_cp = NemotronV3Attention(config, backend).to(device).to(torch.bfloat16)
@@ -389,7 +389,7 @@ def run_bshd_te(model_type, config, rank, world_size, device, attn_no_cp=None, a
     if model_type != "nemotron_v3":
         raise ValueError(f"bshd_te config is only supported for nemotron_v3, got {model_type}")
 
-    from nemo_automodel.components.models.common import BackendConfig
+    from nemo_automodel._transformers.models.common import BackendConfig
 
     backend = BackendConfig(linear="torch", attn="te")
     attn_baseline, attn_cp = _create_nemotron_v3_attn_pair(config, backend, device)
@@ -734,7 +734,7 @@ def _run_thd_te_qwen_deepseek(model_type, config, rank, world_size, device, attn
 
 def _run_thd_te_nemotron_v3(config, rank, world_size, device):
     """THD test flow for nemotron_v3 (DualChunkSwap + set_context_parallel_group)."""
-    from nemo_automodel.components.models.common import BackendConfig
+    from nemo_automodel._transformers.models.common import BackendConfig
 
     backend = BackendConfig(linear="torch", attn="te")
     attn_baseline, attn_cp = _create_nemotron_v3_attn_pair(config, backend, device)
@@ -836,7 +836,7 @@ def run_bshd_sdpa(model_type, config, rank, world_size, device, attn_no_cp=None,
     from torch.distributed.tensor.experimental._attention import context_parallel_unshard, set_rotate_method
     from torch.nn.attention import SDPBackend, sdpa_kernel
 
-    from nemo_automodel.components.models.common import BackendConfig
+    from nemo_automodel._transformers.models.common import BackendConfig
 
     backend = BackendConfig(linear="torch", attn="sdpa")
     attn_baseline, attn_cp = _create_nemotron_v3_attn_pair(config, backend, device)

@@ -25,7 +25,7 @@ import types
 import pytest
 import torch
 
-from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel._transformers.models.common import BackendConfig
 
 # Reuse the CPU-friendly Mock config from the existing MTP test module.
 from tests.unit_tests.models.nemotron_v3.test_nemotron_v3_mtp import MockNemotronV3Config
@@ -44,7 +44,7 @@ def backend():
 
 
 def _make_model(backend, *, mtp_layers=0, mtp_pattern="", mtp_layers_block_type=None, **cfg_overrides):
-    from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
+    from nemo_automodel._transformers.models.nemotron_v3.model import NemotronHForCausalLM
 
     cfg = MockNemotronV3Config(
         num_nextn_predict_layers=mtp_layers,

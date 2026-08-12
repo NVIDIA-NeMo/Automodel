@@ -26,7 +26,7 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
-from nemo_automodel.components.models.nemotron_omni.state_dict_adapter import (
+from nemo_automodel._transformers.models.nemotron_omni.state_dict_adapter import (
     _VISION_PROJ_CUSTOM_TO_HF,
     _VISION_PROJ_HF_TO_CUSTOM,
     NemotronOmniStateDictAdapter,

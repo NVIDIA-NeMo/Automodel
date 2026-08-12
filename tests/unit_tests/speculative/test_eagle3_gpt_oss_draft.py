@@ -18,9 +18,9 @@ import pytest
 import torch
 from transformers import GptOssConfig
 
-from nemo_automodel.components.models.common.utils import get_rope_config
-from nemo_automodel.components.models.gpt_oss.rope_utils import RotaryEmbedding as GptOssRotaryEmbedding
-from nemo_automodel.components.models.llama.rope_utils import apply_rotary_pos_emb as llama_apply_rotary_pos_emb
+from nemo_automodel._transformers.models.common.utils import get_rope_config
+from nemo_automodel._transformers.models.gpt_oss.rope_utils import RotaryEmbedding as GptOssRotaryEmbedding
+from nemo_automodel._transformers.models.llama.rope_utils import apply_rotary_pos_emb as llama_apply_rotary_pos_emb
 from nemo_automodel.components.speculative.eagle.draft_gpt_oss import GptOssEagle3DraftModel
 from nemo_automodel.components.speculative.eagle.registry import (
     EAGLE3_DRAFT_REGISTRY,

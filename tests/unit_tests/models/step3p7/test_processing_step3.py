@@ -20,7 +20,7 @@ import torch
 from PIL import Image
 from transformers.processing_utils import ProcessorMixin
 
-from nemo_automodel.components.models.step3p7.processing_step3 import (
+from nemo_automodel._transformers.models.step3p7.processing_step3 import (
     GPUToTensor,
     ImagePatcher,
     Step3VisionProcessor,

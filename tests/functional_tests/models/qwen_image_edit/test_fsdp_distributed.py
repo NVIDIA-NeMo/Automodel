@@ -59,12 +59,12 @@ def _two_rank_worker(
         from torch.distributed.device_mesh import init_device_mesh
         from torch.distributed.fsdp import MixedPrecisionPolicy
 
+        from nemo_automodel._diffusers.models.qwen_image_edit.adapter import QwenImageEditAdapter
         from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
         from nemo_automodel.components.checkpoint.config import CheckpointingConfig
+        from nemo_automodel.components.distributed.parallelizer import QwenImageEditParallelizationStrategy
         from nemo_automodel.components.distributed.utils import get_sync_ctx
         from nemo_automodel.components.flow_matching.adapters.base import FlowMatchingContext
-        from nemo_automodel.components.models.qwen_image_edit.adapter import QwenImageEditAdapter
-        from nemo_automodel.components.distributed.parallelizer import QwenImageEditParallelizationStrategy
         from nemo_automodel.components.training.utils import (
             prepare_after_first_microbatch,
             prepare_for_final_backward,

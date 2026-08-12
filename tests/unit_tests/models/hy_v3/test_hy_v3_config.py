@@ -16,7 +16,7 @@
 
 from transformers import PretrainedConfig
 
-from nemo_automodel.components.models.hy_v3.config import HYV3Config
+from nemo_automodel._transformers.models.hy_v3.config import HYV3Config
 
 
 class TestDefaults:

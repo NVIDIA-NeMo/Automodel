@@ -19,7 +19,7 @@ import pytest
 import torch
 from torch.nn import CrossEntropyLoss
 
-from nemo_automodel.components.models.nemotron_parse.nemotron_parse_loss import NemotronParseLoss
+from nemo_automodel._transformers.models.nemotron_parse.nemotron_parse_loss import NemotronParseLoss
 
 
 def _compute_reference_loss(logits, labels, class_token_start_idx=50000, coordinate_weight=10.0):

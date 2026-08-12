@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import torch
 
-from nemo_automodel.components.models.common.gated_delta_net_fp32 import (
+from nemo_automodel._transformers.models.common.gated_delta_net_fp32 import (
     FP32_GDN_PARAM_NAMES,
     forced_gated_delta_net_fp32_dtype_mapping,
     has_gated_delta_net_fp32_checkpoint_contract,

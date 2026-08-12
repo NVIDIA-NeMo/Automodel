@@ -18,8 +18,8 @@ import pytest
 import torch
 from transformers.models.qwen3_next.configuration_qwen3_next import Qwen3NextConfig
 
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.qwen3_next.model import Block, Qwen3NextForCausalLM, Qwen3NextModel
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.qwen3_next.model import Block, Qwen3NextForCausalLM, Qwen3NextModel
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.layers import MLP, MoE
 
@@ -47,7 +47,7 @@ class MockQwen3NextGatedDeltaNet(torch.nn.Module):
 def mock_gated_deltanet():
     """Automatically mock Qwen3NextFp32GatedDeltaNet for all tests to avoid torch.get_current_dtype() issue"""
     with patch(
-        "nemo_automodel.components.models.qwen3_next.model.Qwen3NextFp32GatedDeltaNet", MockQwen3NextGatedDeltaNet
+        "nemo_automodel._transformers.models.qwen3_next.model.Qwen3NextFp32GatedDeltaNet", MockQwen3NextGatedDeltaNet
     ):
         yield
 
@@ -334,7 +334,7 @@ class TestQwen3NextModel:
             with patch.object(
                 Block, "forward", side_effect=lambda *_, **kwargs: torch.randn(batch, seq_len, qwen_config.hidden_size)
             ):
-                with patch("nemo_automodel.components.models.qwen3_next.model.position_ids_to_freqs_cis") as mock_freqs:
+                with patch("nemo_automodel._transformers.models.qwen3_next.model.position_ids_to_freqs_cis") as mock_freqs:
                     mock_freqs.return_value = torch.randn(batch, seq_len, qwen_config.head_dim)
                     model(input_ids)
 
@@ -372,7 +372,7 @@ class TestQwen3NextModel:
             "_compute_concentration_and_inv_freq",
             return_value=(1.0, torch.ones(qwen_config.head_dim // 2)),
         ):
-            with patch("nemo_automodel.components.models.qwen3_next.model.position_ids_to_freqs_cis") as mock_freqs:
+            with patch("nemo_automodel._transformers.models.qwen3_next.model.position_ids_to_freqs_cis") as mock_freqs:
                 mock_freqs.return_value = torch.randn(batch, seq_len, qwen_config.head_dim)
                 with patch.object(Block, "forward", return_value=torch.zeros(batch, seq_len, qwen_config.hidden_size)):
                     model(input_ids)
@@ -430,7 +430,7 @@ class TestQwen3NextForCausalLM:
         input_ids = torch.randint(0, qwen_config.vocab_size, (batch, seq_len), device=device)
 
         with (
-            patch("nemo_automodel.components.models.qwen3_next.model.squeeze_input_for_thd") as mock_squeeze,
+            patch("nemo_automodel._transformers.models.qwen3_next.model.squeeze_input_for_thd") as mock_squeeze,
             patch.object(
                 model.model,
                 "forward",
@@ -527,7 +527,7 @@ class TestQwen3NextModelClassmethods:
 
     def test_modelclass_export_exists(self):
         """Ensure ModelClass pointer is defined and points to class."""
-        from nemo_automodel.components.models.qwen3_next import model as qwen_mod
+        from nemo_automodel._transformers.models.qwen3_next import model as qwen_mod
 
         assert hasattr(qwen_mod, "ModelClass")
         assert qwen_mod.ModelClass is Qwen3NextForCausalLM

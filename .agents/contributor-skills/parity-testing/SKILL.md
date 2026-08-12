@@ -356,7 +356,7 @@ These are the key source files relevant to parity testing:
 
 | Component | Path |
 |---|---|
-| State dict adapter base | `components/models/common/combined_projection/state_dict_adapter.py` |
+| State dict adapter base | `_transformers/models/common/combined_projection/state_dict_adapter.py` |
 | Model registry | `_transformers/registry.py` |
 | AutoModel entry point | `_transformers/auto_model.py` |
 | Kernel patches | `_transformers/kernel_patches.py` |

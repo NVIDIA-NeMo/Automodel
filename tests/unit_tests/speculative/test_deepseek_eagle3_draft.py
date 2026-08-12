@@ -28,7 +28,7 @@ import pytest
 import torch
 from transformers import PretrainedConfig
 
-from nemo_automodel.components.models.deepseek_v3.rope_utils import precompute_freqs_cis
+from nemo_automodel._transformers.models.deepseek_v3.rope_utils import precompute_freqs_cis
 from nemo_automodel.components.speculative.eagle.core import Eagle3TrainerModule
 from nemo_automodel.components.speculative.eagle.draft_deepseek import (
     DeepseekV3Eagle3DraftModel,

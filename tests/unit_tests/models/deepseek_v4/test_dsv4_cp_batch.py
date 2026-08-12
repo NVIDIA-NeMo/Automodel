@@ -28,15 +28,15 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from nemo_automodel.components.models.deepseek_v4 import cp as cpmod
-from nemo_automodel.components.models.deepseek_v4.cp import (
+from nemo_automodel._transformers.models.deepseek_v4 import cp as cpmod
+from nemo_automodel._transformers.models.deepseek_v4.cp import (
     dsv4_cp_enabled,
     dsv4_cp_local_seq_multiple,
     dsv4_cp_rank,
     dsv4_cp_size,
     make_dsv4_contiguous_shard_cp_batch_and_ctx,
 )
-from nemo_automodel.components.models.deepseek_v4.model import DeepseekV4ForCausalLM
+from nemo_automodel._transformers.models.deepseek_v4.model import DeepseekV4ForCausalLM
 
 
 @pytest.fixture(autouse=True)
@@ -531,7 +531,7 @@ def test_prepare_model_inputs_for_cp_binds_shard_multiple():
 
 
 def test_setup_cp_attention_stores_group():
-    from nemo_automodel.components.models.deepseek_v4.layers import DeepseekV4Attention
+    from nemo_automodel._transformers.models.deepseek_v4.layers import DeepseekV4Attention
 
     fake_attn = SimpleNamespace()
     DeepseekV4Attention.setup_cp_attention(fake_attn, _FakeMesh(2, 0, group="grp"))

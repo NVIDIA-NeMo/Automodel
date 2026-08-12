@@ -25,13 +25,13 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 
-from nemo_automodel.components.datasets.diffusion.image_edit_dataset import ImageEditDataset
-from nemo_automodel.components.models.qwen_image_edit.preprocessing import (
+from nemo_automodel._diffusers.models.qwen_image_edit.preprocessing import (
     QwenImageEditCacheEncoder,
     _resize_condition_image,
     _resize_vae_image,
     _validate_output_directory,
 )
+from nemo_automodel.components.datasets.diffusion.image_edit_dataset import ImageEditDataset
 
 
 class _FakeLatentDistribution:
@@ -191,7 +191,7 @@ def test_encoder_writes_dataset_compatible_cache(tmp_path: Path, monkeypatch: py
         "model_name": "Qwen/Qwen-Image-Edit-2511",
         "num_gpus": 1,
         "processor_target": (
-            "nemo_automodel.components.models.qwen_image_edit.preprocessing.QwenImageEditCacheEncoder"
+            "nemo_automodel._diffusers.models.qwen_image_edit.preprocessing.QwenImageEditCacheEncoder"
         ),
         "resize_mode": "aspect_preserving_max_pixels",
         "resolution_preset": None,
@@ -270,7 +270,7 @@ def test_output_validation_allows_configured_materialization_tree(tmp_path: Path
 
 def test_load_pipeline_raises_when_diffusers_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
     """The lazy diffusers import surfaces a clear error when the extra is missing."""
-    from nemo_automodel.components.models.qwen_image_edit import preprocessing as preprocessing_module
+    from nemo_automodel._diffusers.models.qwen_image_edit import preprocessing as preprocessing_module
 
     encoder = QwenImageEditCacheEncoder(model_name="stub/qwen-image-edit", torch_dtype="float32")
     monkeypatch.setattr(preprocessing_module, "safe_import", lambda name, msg=None: (False, None))

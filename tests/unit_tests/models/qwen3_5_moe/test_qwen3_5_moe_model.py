@@ -31,8 +31,8 @@ from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
     Qwen3_5MoeModelOutputWithPast,
 )
 
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.qwen3_5_moe.model import (
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.qwen3_5_moe.model import (
     Fp32SafeQwen3_5MoeTextRotaryEmbedding,
     Fp32SafeQwen3_5MoeVisionRotaryEmbedding,
     ModelClass,
@@ -608,7 +608,7 @@ class TestQwen3_5MoeForConditionalGeneration:
 
         with (
             patch(
-                "nemo_automodel.components.models.qwen3_5_moe.model.squeeze_input_for_thd",
+                "nemo_automodel._transformers.models.qwen3_5_moe.model.squeeze_input_for_thd",
                 return_value=(squeezed_ids, squeezed_position_ids, squeezed_padding_mask, squeezed_kwargs),
             ) as mock_squeeze,
             patch.object(model.model, "forward") as mock_model_forward,
@@ -1105,7 +1105,7 @@ class TestFromConfigDirect:
 class TestImportGuardUnavailabilityPaths:
     def test_from_pretrained_raises_when_hf_unavailable(self):
         """from_pretrained should raise UnavailableError when transformers lacks qwen3_5_moe."""
-        import nemo_automodel.components.models.qwen3_5_moe.model as qwen35_mod
+        import nemo_automodel._transformers.models.qwen3_5_moe.model as qwen35_mod
         from nemo_automodel.shared.import_utils import UnavailableError
 
         with patch.object(qwen35_mod, "_QWEN3_5_MOE_HF_AVAILABLE", False):
@@ -1114,7 +1114,7 @@ class TestImportGuardUnavailabilityPaths:
 
     def test_init_raises_when_hf_unavailable(self, vl_config):
         """__init__ should raise UnavailableError when transformers lacks qwen3_5_moe."""
-        import nemo_automodel.components.models.qwen3_5_moe.model as qwen35_mod
+        import nemo_automodel._transformers.models.qwen3_5_moe.model as qwen35_mod
         from nemo_automodel.shared.import_utils import UnavailableError
 
         with patch.object(qwen35_mod, "_QWEN3_5_MOE_HF_AVAILABLE", False):

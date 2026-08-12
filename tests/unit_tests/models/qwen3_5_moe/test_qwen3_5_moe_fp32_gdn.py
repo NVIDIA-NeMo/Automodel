@@ -12,8 +12,8 @@ pytest.importorskip("transformers.models.qwen3_5_moe")
 
 from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeTextConfig
 
-from nemo_automodel.components.models.common.gated_delta_net_fp32 import HOLDER_NAME
-from nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn import CPAwareGatedDeltaNet
+from nemo_automodel._transformers.models.common.gated_delta_net_fp32 import HOLDER_NAME
+from nemo_automodel._transformers.models.qwen3_5_moe.cp_linear_attn import CPAwareGatedDeltaNet
 
 
 def _text_config() -> Qwen3_5MoeTextConfig:

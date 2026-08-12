@@ -23,8 +23,8 @@ import torch
 import torch.nn as nn
 from torch.utils.checkpoint import set_checkpoint_early_stop
 
+from nemo_automodel._transformers.models.common import BackendConfig
 from nemo_automodel.components.distributed.activation_checkpointing import unwrap_checkpoint_wrapper
-from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.layers import Gate, MoE
 from nemo_automodel.components.moe.parallelizer import apply_ac

@@ -56,14 +56,14 @@ from torch.distributed.tensor.placement_types import Replicate
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM, Qwen3ForSequenceClassification
 
+from nemo_automodel._transformers.models.baichuan.configuration import BaichuanConfig
+from nemo_automodel._transformers.models.baichuan.model import BaichuanForCausalLM
+from nemo_automodel._transformers.models.common.utils import BackendConfig
+from nemo_automodel._transformers.models.llama.model import LlamaConfig, LlamaForCausalLM
+from nemo_automodel._transformers.models.mistral3.model import Ministral3Config, Ministral3ForCausalLM
+from nemo_automodel._transformers.models.qwen2.model import Qwen2Config, Qwen2ForCausalLM
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.distributed.parallelizer import _get_parallel_plan, _update_attention_head_counts_for_tp
-from nemo_automodel.components.models.baichuan.configuration import BaichuanConfig
-from nemo_automodel.components.models.baichuan.model import BaichuanForCausalLM
-from nemo_automodel.components.models.common.utils import BackendConfig
-from nemo_automodel.components.models.llama.model import LlamaConfig, LlamaForCausalLM
-from nemo_automodel.components.models.mistral3.model import Ministral3Config, Ministral3ForCausalLM
-from nemo_automodel.components.models.qwen2.model import Qwen2Config, Qwen2ForCausalLM
 
 ModelKind = Literal["qwen3", "qwen3_seq_cls", "ministral3", "llama", "qwen2", "nemotron", "baichuan"]
 SPMode = Literal["true", "false", "both"]

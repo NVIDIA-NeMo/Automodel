@@ -13,7 +13,7 @@
 # limitations under the License.
 
 """Unit tests for the standalone helpers in
-``nemo_automodel.components.models.deepseek_v4.layers``.
+``nemo_automodel._transformers.models.deepseek_v4.layers``.
 
 Pieces here are easy to construct in isolation (grouped output projection,
 the Hyper-Connections weight builder, and the partial-RoPE helper).
@@ -24,12 +24,12 @@ import pytest
 import torch
 import torch.nn as nn
 
-from nemo_automodel.components.models.deepseek_v4 import layers as dsv4_layers
-from nemo_automodel.components.models.deepseek_v4 import optimized_kernels as dsv4_optimized_kernels
-from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
-from nemo_automodel.components.models.deepseek_v4.cp import build_dsv4_cp_causal_padding_mask
-from nemo_automodel.components.models.deepseek_v4.kernels._tilelang import HAS_TILELANG
-from nemo_automodel.components.models.deepseek_v4.layers import (
+from nemo_automodel._transformers.models.deepseek_v4 import layers as dsv4_layers
+from nemo_automodel._transformers.models.deepseek_v4 import optimized_kernels as dsv4_optimized_kernels
+from nemo_automodel._transformers.models.deepseek_v4.config import DeepseekV4Config
+from nemo_automodel._transformers.models.deepseek_v4.cp import build_dsv4_cp_causal_padding_mask
+from nemo_automodel._transformers.models.deepseek_v4.kernels._tilelang import HAS_TILELANG
+from nemo_automodel._transformers.models.deepseek_v4.layers import (
     DeepseekV4Attention,
     DeepseekV4GroupedLinear,
     DeepseekV4HyperConnection,
@@ -44,7 +44,7 @@ from nemo_automodel.components.models.deepseek_v4.layers import (
     build_packed_causal_padding_mask,
     eager_attention_with_sink,
 )
-from nemo_automodel.components.models.deepseek_v4.optimized_kernels import (
+from nemo_automodel._transformers.models.deepseek_v4.optimized_kernels import (
     build_dsv4_sparse_topk_indices,
     dense_attention_topk_torch,
     dsv4_indexer_scores,
@@ -1108,8 +1108,8 @@ class TestDeepseekV4OptimizedKernels:
 
         from nemo_automodel.shared.import_utils import UnavailableError
 
-        helper_name = "nemo_automodel.components.models.deepseek_v4.kernels._tilelang"
-        module_name = "nemo_automodel.components.models.deepseek_v4.kernels.tilelang_indexer_fwd"
+        helper_name = "nemo_automodel._transformers.models.deepseek_v4.kernels._tilelang"
+        module_name = "nemo_automodel._transformers.models.deepseek_v4.kernels.tilelang_indexer_fwd"
         helper_path = dsv4_layers.__file__.rsplit("/", 1)[0] + "/kernels/_tilelang.py"
         original_import = builtins.__import__
         sys.modules.pop("tilelang", None)

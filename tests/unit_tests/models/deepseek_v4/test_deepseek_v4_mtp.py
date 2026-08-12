@@ -26,10 +26,10 @@ import types
 import pytest
 import torch
 
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
-from nemo_automodel.components.models.deepseek_v4.model import DeepseekV4ForCausalLM
-from nemo_automodel.components.models.deepseek_v4.mtp import build_mtp_config_from_hf
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.deepseek_v4.config import DeepseekV4Config
+from nemo_automodel._transformers.models.deepseek_v4.model import DeepseekV4ForCausalLM
+from nemo_automodel._transformers.models.deepseek_v4.mtp import build_mtp_config_from_hf
 
 # MoE.forward unconditionally creates a torch.cuda.Stream() for shared experts.
 # Gate the tests that actually call model.forward() on CUDA availability.

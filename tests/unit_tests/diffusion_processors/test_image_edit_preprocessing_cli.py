@@ -29,7 +29,7 @@ from tools.diffusion import preprocessing_multiprocess
 
 
 def test_qwen_image_edit_processor_is_registered():
-    from nemo_automodel.components.models.qwen_image_edit.preprocessing import QwenImageEditCacheEncoder
+    from nemo_automodel._diffusers.models.qwen_image_edit.preprocessing import QwenImageEditCacheEncoder
     from tools.diffusion.processors import ProcessorRegistry
 
     processor_cls = ProcessorRegistry.get_class("qwen_image_edit")

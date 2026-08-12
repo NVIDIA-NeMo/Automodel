@@ -419,7 +419,9 @@ NeMo-Automodel/
 │   └── vlm_generate/               # VLM generation configs
 ├── nemo_automodel/
 │   ├── _diffusers/                 # HF Diffusers integration (NeMoAutoDiffusionPipeline)
+│   │   └── models/                 # Model families built on Diffusers
 │   ├── _transformers/              # HF Transformers integration
+│   │   └── models/                 # Model families built on Transformers (LLM, VLM, MoE, ...)
 │   ├── components/                 # Core library
 │   │   ├── _peft/                  # PEFT implementations (LoRA, QLoRA)
 │   │   ├── attention/              # Attention implementations
@@ -430,7 +432,6 @@ NeMo-Automodel/
 │   │   ├── launcher/               # Launcher backends (SLURM, NeMo-Run, SkyPilot)
 │   │   ├── loggers/                # Loggers
 │   │   ├── loss/                   # Optimized loss functions
-│   │   ├── models/                 # User-defined model examples
 │   │   ├── moe/                    # Optimized kernels for MoE models
 │   │   ├── optim/                  # Optimizer/LR scheduler components (incl. Dion)
 │   │   ├── quantization/           # FP8, QAT, QLoRA

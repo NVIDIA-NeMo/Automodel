@@ -15,8 +15,8 @@
 import pytest
 import torch
 
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.minimax_m3_vl.config import MiniMaxM3VLTextConfig
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.minimax_m3_vl.config import MiniMaxM3VLTextConfig
 
 # Tiny config (~layers 0 dense, 1-2 MoE) used across the Stage-1 M3 unit tests.
 TINY_CFG = dict(
@@ -70,7 +70,7 @@ def backend():
 
 @pytest.fixture
 def model(text_config, backend):
-    from nemo_automodel.components.models.minimax_m3_vl.model import MiniMaxM3SparseForCausalLM
+    from nemo_automodel._transformers.models.minimax_m3_vl.model import MiniMaxM3SparseForCausalLM
 
     m = MiniMaxM3SparseForCausalLM(text_config, backend=backend).eval()
     m.initialize_weights(dtype=torch.float32)
@@ -102,7 +102,7 @@ def sparse_text_config():
 
 @pytest.fixture
 def sparse_model(sparse_text_config, backend):
-    from nemo_automodel.components.models.minimax_m3_vl.model import MiniMaxM3SparseForCausalLM
+    from nemo_automodel._transformers.models.minimax_m3_vl.model import MiniMaxM3SparseForCausalLM
 
     m = MiniMaxM3SparseForCausalLM(sparse_text_config, backend=backend).eval()
     m.initialize_weights(dtype=torch.float32)
@@ -129,7 +129,7 @@ VIDEO_TOKEN_INDEX = 101
 @pytest.fixture
 def mtp_model(backend):
     """Sparse text backbone with one MTP module (DeepSeek-V3 style)."""
-    from nemo_automodel.components.models.minimax_m3_vl.model import MiniMaxM3SparseForCausalLM
+    from nemo_automodel._transformers.models.minimax_m3_vl.model import MiniMaxM3SparseForCausalLM
 
     cfg = MiniMaxM3VLTextConfig(
         torch_dtype="float32",
@@ -142,8 +142,8 @@ def mtp_model(backend):
 
 @pytest.fixture
 def vlm_model(backend):
-    from nemo_automodel.components.models.minimax_m3_vl.config import MiniMaxM3VLConfig
-    from nemo_automodel.components.models.minimax_m3_vl.model import MiniMaxM3SparseForConditionalGeneration
+    from nemo_automodel._transformers.models.minimax_m3_vl.config import MiniMaxM3VLConfig
+    from nemo_automodel._transformers.models.minimax_m3_vl.model import MiniMaxM3SparseForConditionalGeneration
 
     text = {**TINY_CFG, "torch_dtype": "float32", "sparse_attention_config": dict(SPARSE_ATTENTION_CONFIG)}
     cfg = MiniMaxM3VLConfig(

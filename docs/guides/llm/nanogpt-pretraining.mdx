@@ -105,7 +105,7 @@ Below are examples for each pattern.
 
 ### NanoGPT Source and File-Path `_target_`
 
-Below is the minimal GPT‑2 [implementation](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/models/gpt2.py) used for this NanoGPT‑style pretraining flow.
+Below is the minimal GPT‑2 [implementation](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/_transformers/models/gpt2.py) used for this NanoGPT‑style pretraining flow.
 It is a pure‑PyTorch model with tied embeddings and standard transformer blocks:
 
 ```
@@ -308,7 +308,7 @@ To use this exact implementation directly from a file path, point `_target_` to 
 
 ```yaml
 model:
-  _target_: /abs/path/to/repo/nemo_automodel/components/models/gpt2.py:build_gpt2_model
+  _target_: /abs/path/to/repo/nemo_automodel/_transformers/models/gpt2.py:build_gpt2_model
   vocab_size: 50258
   n_positions: 2048
   n_embd: 768
@@ -325,7 +325,7 @@ Instead of a file path, you can reference the callable using its import path:
 ```yaml
 # examples/llm_pretrain/nanogpt_pretrain.yaml
 model:
-  _target_: nemo_automodel.components.models.gpt2.build_gpt2_model
+  _target_: nemo_automodel._transformers.models.gpt2.build_gpt2_model
   vocab_size: 50258
   n_positions: 2048
   n_embd: 768
@@ -384,7 +384,7 @@ Key configuration sections:
 ```yaml
 # Model configuration (two options available)
 model:
-  _target_: nemo_automodel.components.models.gpt2.build_gpt2_model
+  _target_: nemo_automodel._transformers.models.gpt2.build_gpt2_model
   vocab_size: 50258
   n_positions: 2048
   n_embd: 768
@@ -406,7 +406,7 @@ distributed:
   cp_size: 1
 ```
 
-**About `_target_` configuration**: The `_target_` field specifies import paths to classes and functions within the nemo_automodel package (or any Python module). For example, `nemo_automodel.components.models.gpt2.build_gpt2_model` imports and calls the GPT-2 model builder function. You can also specify paths to your own Python files (e.g., `my_custom_models.MyTransformer`) to use custom `nn.Module` implementations, allowing full flexibility in model architecture while leveraging the training infrastructure.
+**About `_target_` configuration**: The `_target_` field specifies import paths to classes and functions within the nemo_automodel package (or any Python module). For example, `nemo_automodel._transformers.models.gpt2.build_gpt2_model` imports and calls the GPT-2 model builder function. You can also specify paths to your own Python files (e.g., `my_custom_models.MyTransformer`) to use custom `nn.Module` implementations, allowing full flexibility in model architecture while leveraging the training infrastructure.
 
 Update the `file_pattern` to match your data location. For example, if using `tools/nanogpt_data_processor.py` with the default settings: `"tools/fineweb_max_tokens_500M/dataset.bin"`
 

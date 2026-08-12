@@ -26,7 +26,7 @@ class TestArchMapping:
         from nemo_automodel._transformers.registry import MODEL_ARCH_MAPPING
 
         entry = MODEL_ARCH_MAPPING["HYV3ForCausalLM"]
-        assert entry[0] == "nemo_automodel.components.models.hy_v3.model"
+        assert entry[0] == "nemo_automodel._transformers.models.hy_v3.model"
         assert entry[1] == "HYV3ForCausalLM"
 
     def test_hyv3_arch_resolves_to_class(self):

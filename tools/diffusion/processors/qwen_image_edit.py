@@ -15,13 +15,13 @@
 """Registry entry for Qwen-Image-Edit cache preprocessing.
 
 The encoding logic is owned by the model package
-(``nemo_automodel.components.models.qwen_image_edit.preprocessing``); this
+(``nemo_automodel._diffusers.models.qwen_image_edit.preprocessing``); this
 module only registers it under the ``qwen_image_edit`` processor name so the
 ``image-edit`` CLI selects it the same way the image and video CLIs select
 their processors.
 """
 
-from nemo_automodel.components.models.qwen_image_edit.preprocessing import QwenImageEditCacheEncoder
+from nemo_automodel._diffusers.models.qwen_image_edit.preprocessing import QwenImageEditCacheEncoder
 
 from .registry import ProcessorRegistry
 

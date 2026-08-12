@@ -22,7 +22,7 @@ This skill guides implementation of new model architectures in NeMo AutoModel. F
 When answering an onboarding question, keep the response in this order:
 
 1. Classify the architecture from `config.json`.
-2. Name the exact implementation files under `components/models/<name>/`.
+2. Name the exact implementation files under `_transformers/models/<name>/`.
 3. Identify registry and optional custom-config updates.
 4. State the validation tests that must be added before full checkpoint use.
 
@@ -42,7 +42,7 @@ Use these compact answer patterns for common questions:
 - Dense causal LM: classify as dense only when `architectures` contains a
   `ForCausalLM` class and expert fields such as `num_local_experts`,
   `n_routed_experts`, or `num_experts_per_tok` are absent. Create
-  `components/models/<name>/model.py`, `state_dict_adapter.py`, `__init__.py`,
+  `_transformers/models/<name>/model.py`, `state_dict_adapter.py`, `__init__.py`,
   and optional `config.py`, register `MODEL_ARCH_MAPPING` in
   `_transformers/registry.py`, add example YAML, and add tiny-config unit tests
   plus layer-equivalence tests for rewritten layers.
@@ -105,10 +105,10 @@ Download the model's `config.json` from the HuggingFace Hub (or use `AutoConfig.
 
 ### 1.3 Check for existing similar architectures
 
-Look in `components/models/` for architectures with similar attention or MLP patterns:
+Look in `_transformers/models/` for architectures with similar attention or MLP patterns:
 
 ```
-components/models/
+_transformers/models/
   llama/           # Standard GQA + SwiGLU (CombinedQKV + CombinedGateUpMLP)
   qwen2/           # Same as Llama but with attention bias + QKV bias
   baichuan/        # ALiBi attention variant
@@ -153,8 +153,15 @@ tiny_config = LlamaConfig(
 
 ### 2.1 Create directory structure
 
+Pick the parent package by the upstream HuggingFace package the model is built
+against -- `_transformers/models/` for anything written against `transformers`
+(LLM, VLM, OMNI, MoE, dLLM), `_diffusers/models/` for anything written against
+`diffusers` (text-to-image, text-to-video). When adding to the diffusers side,
+also add the name to `DIFFUSERS_MODELS` in `nemo_automodel/_model_locations.py`;
+`tests/unit_tests/test_model_locations.py` fails if the two drift apart.
+
 ```
-components/models/<name>/
+_transformers/models/<name>/     # or _diffusers/models/<name>/
   __init__.py
   model.py
   state_dict_adapter.py
@@ -269,7 +276,7 @@ MODEL_ARCH_MAPPING = OrderedDict([
     # ... existing entries ...
     (
         "NewModelForCausalLM",
-        ("nemo_automodel.components.models.new_model.model", "NewModelForCausalLM"),
+        ("nemo_automodel._transformers.models.new_model.model", "NewModelForCausalLM"),
     ),
 ])
 ```
@@ -279,7 +286,7 @@ If the model has a custom config class with `auto_map` in its `config.json`, als
 ```python
 _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
     # ... existing entries ...
-    "new_model": ("nemo_automodel.components.models.new_model.configuration", "NewModelConfig"),
+    "new_model": ("nemo_automodel._transformers.models.new_model.configuration", "NewModelConfig"),
 }
 ```
 
@@ -391,12 +398,12 @@ that only surface in a full parity comparison.
 | File | Purpose |
 |------|---------|
 | `_transformers/registry.py` | `MODEL_ARCH_MAPPING` and `_CUSTOM_CONFIG_REGISTRATIONS` |
-| `components/models/common/__init__.py` | Exports `CombinedQKVAttentionMixin`, `CombinedGateUpMLP`, `BackendConfig`, `HFCheckpointingMixin`, etc. |
-| `components/models/common/combined_projection/combined_qkv.py` | `CombinedQKVAttentionMixin` with `setup_qkv_projection()` and `compute_qkv()` |
-| `components/models/common/combined_projection/combined_mlp.py` | `CombinedGateUpMLP` with interleaved gate/up layout |
-| `components/models/common/combined_projection/state_dict_adapter.py` | `CombinedProjectionStateDictAdapter` base class |
-| `components/models/common/hf_checkpointing_mixin.py` | `HFCheckpointingMixin` for save/load |
-| `components/models/common/utils.py` | `BackendConfig`, `initialize_rms_norm_module`, `initialize_linear_module`, `get_rope_config` |
+| `_transformers/models/common/__init__.py` | Exports `CombinedQKVAttentionMixin`, `CombinedGateUpMLP`, `BackendConfig`, `HFCheckpointingMixin`, etc. |
+| `_transformers/models/common/combined_projection/combined_qkv.py` | `CombinedQKVAttentionMixin` with `setup_qkv_projection()` and `compute_qkv()` |
+| `_transformers/models/common/combined_projection/combined_mlp.py` | `CombinedGateUpMLP` with interleaved gate/up layout |
+| `_transformers/models/common/combined_projection/state_dict_adapter.py` | `CombinedProjectionStateDictAdapter` base class |
+| `_transformers/models/common/hf_checkpointing_mixin.py` | `HFCheckpointingMixin` for save/load |
+| `_transformers/models/common/utils.py` | `BackendConfig`, `initialize_rms_norm_module`, `initialize_linear_module`, `get_rope_config` |
 | `components/moe/config.py` | `MoEConfig` dataclass |
 | `components/moe/fsdp_mixin.py` | `MoEFSDPSyncMixin` for distributed expert handling |
 | `components/moe/layers.py` | `MoE` layer, `MLP` (dense) for MoE blocks |
@@ -409,7 +416,7 @@ that only surface in a full parity comparison.
 - [ ] Fetched and analyzed `config.json` from HuggingFace
 - [ ] Determined model type (dense LLM / MoE / VLM)
 - [ ] Identified custom components (attention, RoPE, normalization, MLP)
-- [ ] Created `components/models/<name>/` directory
+- [ ] Created `_transformers/models/<name>/` directory
 - [ ] Implemented config.py (if custom config needed)
 - [ ] Implemented layers.py (if custom layers needed)
 - [ ] Implemented rope_utils.py (if custom RoPE needed)

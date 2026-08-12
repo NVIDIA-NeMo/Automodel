@@ -20,7 +20,7 @@ import pytest
 import torch
 from torch import nn
 
-from nemo_automodel.components.models.common.utils import (
+from nemo_automodel._transformers.models.common.utils import (
     BackendConfig,
     TEFp8Config,
     compute_lm_head_logits,
@@ -40,7 +40,7 @@ class TestQuackBackend:
             pass
 
         with patch(
-            "nemo_automodel.components.models.common.utils.safe_import_from",
+            "nemo_automodel._transformers.models.common.utils.safe_import_from",
             return_value=(True, FakeQuackLinear),
         ):
             module = initialize_linear_module("quack", 8, 16, bias=True, device="cpu", dtype=torch.float32)
@@ -54,7 +54,7 @@ class TestQuackBackend:
             pass
 
         with patch(
-            "nemo_automodel.components.models.common.utils.safe_import_from",
+            "nemo_automodel._transformers.models.common.utils.safe_import_from",
             return_value=(True, FakeQuackRMSNorm),
         ):
             module = initialize_rms_norm_module("quack", 8, eps=1e-6, device="cpu", dtype=torch.float32)
@@ -73,7 +73,7 @@ class TestQuackBackend:
     def test_quack_backend_reports_missing_optional_dependency(self, initializer, args, match):
         with (
             patch(
-                "nemo_automodel.components.models.common.utils.safe_import_from",
+                "nemo_automodel._transformers.models.common.utils.safe_import_from",
                 return_value=(False, object()),
             ),
             pytest.raises(ImportError, match=match),
@@ -157,14 +157,14 @@ class TestTEFp8Config:
     def test_maybe_te_autocast_without_te(self):
         """Without TE installed, maybe_te_autocast returns nullcontext."""
         cfg = TEFp8Config()
-        with patch("nemo_automodel.components.models.common.utils.HAVE_TE", False):
+        with patch("nemo_automodel._transformers.models.common.utils.HAVE_TE", False):
             ctx = cfg.maybe_te_autocast()
             assert isinstance(ctx, nullcontext)
 
     def test_build_recipe_without_te(self):
         """Without TE installed, build_recipe returns None."""
         cfg = TEFp8Config()
-        with patch("nemo_automodel.components.models.common.utils.HAVE_TE", False):
+        with patch("nemo_automodel._transformers.models.common.utils.HAVE_TE", False):
             assert cfg.build_recipe() is None
 
 

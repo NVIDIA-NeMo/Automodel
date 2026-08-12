@@ -639,7 +639,7 @@ def create_adapter(adapter_type: str, **kwargs) -> ModelAdapter:
     """
     # Imported lazily: the adapter is owned by the model package, and importing
     # it here at module scope would load the Qwen model code for every recipe.
-    from nemo_automodel.components.models.qwen_image_edit.adapter import QwenImageEditAdapter
+    from nemo_automodel._diffusers.models.qwen_image_edit.adapter import QwenImageEditAdapter
 
     adapters = {
         "hunyuan": HunyuanAdapter,

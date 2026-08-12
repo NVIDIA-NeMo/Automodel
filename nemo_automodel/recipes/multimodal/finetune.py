@@ -46,16 +46,16 @@ import torch
 import torch.distributed as dist
 import wandb
 
-from nemo_automodel.components.config._arg_parser import parse_args_and_load_config  # noqa: E402
-from nemo_automodel.components.loggers.log_utils import setup_logging  # noqa: E402
-from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger  # noqa: E402
-from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages  # noqa: E402
-from nemo_automodel.components.models.bagel.configuration import resolve_bagel_backend  # noqa: E402
-from nemo_automodel.components.models.bagel.hf_backbone_loader import (  # noqa: E402
+from nemo_automodel._transformers.models.bagel.configuration import resolve_bagel_backend  # noqa: E402
+from nemo_automodel._transformers.models.bagel.hf_backbone_loader import (  # noqa: E402
     build_bagel_from_hf_backbones,
     initialize_bagel_non_backbone_weights,
     load_bagel_hf_backbone_weights,
 )
+from nemo_automodel.components.config._arg_parser import parse_args_and_load_config  # noqa: E402
+from nemo_automodel.components.loggers.log_utils import setup_logging  # noqa: E402
+from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger  # noqa: E402
+from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages  # noqa: E402
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG  # noqa: E402
 from nemo_automodel.components.training.step_scheduler import StepScheduler  # noqa: E402
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config  # noqa: E402
@@ -244,7 +244,7 @@ def _resolve_bagel_vae_path(model_path: str | None, vae_path: str | None) -> str
 def _load_bagel_vae(vae_path: str) -> tuple[Any, Any]:
     """Load BAGEL's autoencoder from AM-owned code."""
 
-    from nemo_automodel.components.models.bagel.autoencoder import load_bagel_autoencoder
+    from nemo_automodel._transformers.models.bagel.autoencoder import load_bagel_autoencoder
 
     return load_bagel_autoencoder(vae_path)
 

@@ -31,8 +31,8 @@ except ImportError:
         mock_hadamard.hadamard_transform = lambda x, scale: x
         sys.modules["fast_hadamard_transform"] = mock_hadamard
 
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.glm_moe_dsa.model import Block, GlmMoeDsaForCausalLM, GlmMoeDsaModel
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.glm_moe_dsa.model import Block, GlmMoeDsaForCausalLM, GlmMoeDsaModel
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.layers import MLP, MoE
 
@@ -262,7 +262,7 @@ class TestGlmMoeDsaModel:
         assert model.qk_rope_head_dim == config.qk_rope_head_dim
 
     def test_model_extracts_rope_theta_from_rope_parameters(self, config, backend_config):
-        with patch("nemo_automodel.components.models.glm_moe_dsa.model.precompute_freqs_cis") as mock_precompute:
+        with patch("nemo_automodel._transformers.models.glm_moe_dsa.model.precompute_freqs_cis") as mock_precompute:
             mock_precompute.return_value = torch.randn(10)
             GlmMoeDsaModel(config, backend=backend_config)
 
@@ -289,7 +289,7 @@ class TestGlmMoeDsaModel:
         batch, seq_len = 2, 4
         input_ids = torch.randint(0, config.vocab_size, (batch, seq_len))
 
-        with patch("nemo_automodel.components.models.glm_moe_dsa.model.freqs_cis_from_position_ids") as mock_freqs:
+        with patch("nemo_automodel._transformers.models.glm_moe_dsa.model.freqs_cis_from_position_ids") as mock_freqs:
             mock_freqs.return_value = torch.randn(batch, seq_len, config.qk_rope_head_dim // 2)
             with patch.object(
                 Block, "forward", side_effect=lambda *_, **__: (torch.randn(batch, seq_len, config.hidden_size), None)
@@ -352,7 +352,7 @@ class TestGlmMoeDsaForCausalLM:
         input_ids = torch.randint(0, config.vocab_size, (batch, seq_len), device=device)
 
         with (
-            patch("nemo_automodel.components.models.glm_moe_dsa.model.squeeze_input_for_thd") as mock_squeeze,
+            patch("nemo_automodel._transformers.models.glm_moe_dsa.model.squeeze_input_for_thd") as mock_squeeze,
             patch.object(
                 model.model,
                 "forward",
@@ -457,7 +457,7 @@ class TestGlmMoeDsaClassmethods:
                 assert called_cfg is config
 
     def test_modelclass_export_exists(self):
-        from nemo_automodel.components.models.glm_moe_dsa import model as dsa_mod
+        from nemo_automodel._transformers.models.glm_moe_dsa import model as dsa_mod
 
         assert hasattr(dsa_mod, "ModelClass")
         assert dsa_mod.ModelClass is GlmMoeDsaForCausalLM
@@ -483,7 +483,7 @@ class TestIndexShare:
             assert (block.self_attn.indexer is None) is skip
 
     def test_shared_mla_requires_prev_topk(self, config, backend_config, device):
-        from nemo_automodel.components.models.glm_moe_dsa.layers import GlmMoeDsaMLA
+        from nemo_automodel._transformers.models.glm_moe_dsa.layers import GlmMoeDsaMLA
 
         mla = GlmMoeDsaMLA(config, backend_config, skip_topk=True).to(device)
         assert mla.indexer is None

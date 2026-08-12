@@ -23,12 +23,12 @@ expected ``mtp.*`` keys).
 import pytest
 import torch
 
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.common.mtp import (
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.common.mtp import (
     MTPConfig,
     roll_tensor,
 )
-from nemo_automodel.components.models.nemotron_v3.mtp import (
+from nemo_automodel._transformers.models.nemotron_v3.mtp import (
     _resolve_block_types_per_sublayer,
     build_mtp_config_from_hf,
     parse_mtp_layer_pattern,
@@ -230,7 +230,7 @@ def backend():
 
 
 def _make_model(backend, *, mtp_layers=0, mtp_pattern="", **cfg_overrides):
-    from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
+    from nemo_automodel._transformers.models.nemotron_v3.model import NemotronHForCausalLM
 
     config = MockNemotronV3Config(
         num_nextn_predict_layers=mtp_layers,
@@ -244,7 +244,7 @@ def _make_model(backend, *, mtp_layers=0, mtp_pattern="", **cfg_overrides):
 class TestMTPDisabled:
     def test_constructor_override_disables_native_mtp_config(self, backend):
         """SpeechLM can skip a checkpoint-provided MTP head at load time."""
-        from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
+        from nemo_automodel._transformers.models.nemotron_v3.model import NemotronHForCausalLM
 
         config = MockNemotronV3Config(
             num_nextn_predict_layers=1,
@@ -370,7 +370,7 @@ class TestMTPComputeInEval:
         """Even with the flag on, the cached generation path (``use_cache``)
         must skip MTP — decoding feeds one token at a time and must not pay
         the MTP cost."""
-        from nemo_automodel.components.models.nemotron_v3.cache import NemotronHybridCache
+        from nemo_automodel._transformers.models.nemotron_v3.cache import NemotronHybridCache
 
         model, config = _make_model(backend, mtp_layers=1, mtp_pattern="*E")
         model.eval()
@@ -399,7 +399,7 @@ class TestMTPRepeatedLayer:
     def _build_repeated(self, backend, *, iterations, pattern):
         """Construct a model whose HF config exposes a single physical MTP depth
         but whose runtime iterates ``iterations`` times through the shared head."""
-        from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
+        from nemo_automodel._transformers.models.nemotron_v3.model import NemotronHForCausalLM
 
         # HF config records 1 physical depth (this is what the checkpoint exposes);
         # the kwargs override drives the runtime iteration count and weight tying.
@@ -551,8 +551,8 @@ class TestMTPInputEmbeds:
     def test_embed_inputs_overrides_embed_fn(self, backend):
         """When embed_inputs is passed to MTPModule, the fusion sublayer receives it
         directly instead of calling embed_fn(rolled_input_ids)."""
-        from nemo_automodel.components.models.common.mtp import MTPConfig, roll_tensor
-        from nemo_automodel.components.models.nemotron_v3.mtp import build_nemotron_v3_mtp
+        from nemo_automodel._transformers.models.common.mtp import MTPConfig, roll_tensor
+        from nemo_automodel._transformers.models.nemotron_v3.mtp import build_nemotron_v3_mtp
 
         H = 64
         B, S = 2, 10
@@ -589,8 +589,8 @@ class TestMTPInputEmbeds:
     @pytest.mark.run_only_on("GPU")
     def test_without_inputs_embeds_uses_embed_fn(self, backend):
         """Regression: when inputs_embeds is absent the original embed_fn path is unchanged."""
-        from nemo_automodel.components.models.common.mtp import MTPConfig
-        from nemo_automodel.components.models.nemotron_v3.mtp import build_nemotron_v3_mtp
+        from nemo_automodel._transformers.models.common.mtp import MTPConfig
+        from nemo_automodel._transformers.models.nemotron_v3.mtp import build_nemotron_v3_mtp
 
         H = 64
         B, S = 2, 10
