@@ -13,16 +13,27 @@
 # limitations under the License.
 """Single source of truth for where model sub-packages live.
 
-Model implementations are split by the upstream HuggingFace package they are
-written against:
+Model implementations are split by which bridge trains them:
 
-* :mod:`nemo_automodel._transformers.models` -- models built on ``transformers``
-  (the overwhelming majority: dense/MoE LLMs, VLMs, omni and dLLM backbones).
-* :mod:`nemo_automodel._diffusers.models` -- models built on ``diffusers``.
+* :mod:`nemo_automodel._transformers.models` -- models trained through the
+  HuggingFace ``transformers`` bridge: dense/MoE LLMs, VLMs, omni and dLLM
+  backbones. These subclass ``PreTrainedModel``.
+* :mod:`nemo_automodel._diffusers.models` -- models trained through the
+  flow-matching / diffusion bridge. These are ``ModelAdapter`` implementations
+  that drive an upstream ``diffusers`` pipeline; most do not import
+  ``diffusers`` themselves, because the pipeline is constructed for them by
+  :class:`NeMoAutoDiffusionPipeline`.
+
+Note this is a *domain* split, not "which upstream package does the file
+import". ``qwen_image_edit`` is the only diffusers-side package that imports
+``diffusers`` directly; the rest operate on tensors handed to them by the
+pipeline. The reliable invariant is the one asserted in
+``tests/unit_tests/test_model_locations.py``: diffusers-side packages expose a
+``ModelAdapter``, transformers-side packages do not.
 
 Three call sites need to agree on that split -- the two ``models/__init__.py``
 "unknown model" error messages and the import aliases in
-:mod:`nemo_automodel` -- so the table lives here.
+:mod:`nemo_automodel` -- so the tables live here.
 
 This module must stay import-light (stdlib only): it is imported from
 ``nemo_automodel/__init__.py`` and must not drag in ``torch`` or
@@ -34,10 +45,30 @@ from __future__ import annotations
 TRANSFORMERS_MODELS_PACKAGE = "nemo_automodel._transformers.models"
 DIFFUSERS_MODELS_PACKAGE = "nemo_automodel._diffusers.models"
 
-# Model sub-packages that live under ``_diffusers.models`` rather than the
-# ``_transformers.models`` default. Keep in sync with the directory contents;
-# ``tests/unit_tests/test_model_locations.py`` asserts they match.
-DIFFUSERS_MODELS: frozenset[str] = frozenset({"qwen_image_edit"})
+# Where each model sub-package lives today. Keep in sync with the directory
+# contents; ``tests/unit_tests/test_model_locations.py`` asserts they match.
+#
+# ``wan`` holds ``SimpleAdapter``: Wan is the only user of the generic "simple"
+# transformer interface, and ``adapter_type: "simple"`` remains its config key.
+DIFFUSERS_MODELS: frozenset[str] = frozenset(
+    {
+        "flux",
+        "flux2",
+        "hunyuan",
+        "ltx2",
+        "qwen_image",
+        "qwen_image_edit",
+        "wan",
+    }
+)
+
+# Model names that were *actually* reachable under the pre-split
+# ``nemo_automodel.components.models`` namespace and now live on the diffusers
+# side. Deliberately narrower than ``DIFFUSERS_MODELS``: the flow-matching
+# adapters (flux, wan, ...) were never under ``components.models``, so aliasing
+# them there would invent a history that never existed and would swallow the
+# "unknown model" error for those names.
+_LEGACY_DIFFUSERS_MODELS: frozenset[str] = frozenset({"qwen_image_edit"})
 
 
 def models_package_for(name: str) -> str:
@@ -52,21 +83,28 @@ def models_package_for(name: str) -> str:
     return DIFFUSERS_MODELS_PACKAGE if name in DIFFUSERS_MODELS else TRANSFORMERS_MODELS_PACKAGE
 
 
-def resolve_model_module(suffix: str) -> str:
-    """Map a legacy ``models``-relative module path to its canonical location.
+def resolve_model_module(suffix: str, *, legacy: bool = False) -> str:
+    """Map a flat ``models``-relative module path to its canonical location.
 
     Args:
-        suffix: Path relative to the old flat ``models`` package. May be empty
+        suffix: Path relative to the flat ``models`` package. May be empty
             (the package root), a bare model name (``"llama"``), or a deeper
             path (``"llama.model"``). Non-model members such as ``"gpt2"``,
             ``"common.utils"`` and ``"deprecation"`` resolve to the
             transformers-side package.
+        legacy: Resolve for the deprecated ``nemo_automodel.components.models``
+            namespace, which only ever contained ``qwen_image_edit`` on the
+            diffusers side. Names that never lived there fall through to the
+            transformers-side package so that the "unknown model" error still
+            fires instead of silently resolving.
 
     Returns:
-        The fully-qualified module path under ``_transformers`` or
-        ``_diffusers``.
+        The fully-qualified module path under the transformers- or
+        diffusers-side models package.
     """
     if not suffix:
         return TRANSFORMERS_MODELS_PACKAGE
     head = suffix.split(".", 1)[0]
-    return f"{models_package_for(head)}.{suffix}"
+    diffusers_names = _LEGACY_DIFFUSERS_MODELS if legacy else DIFFUSERS_MODELS
+    package = DIFFUSERS_MODELS_PACKAGE if head in diffusers_names else TRANSFORMERS_MODELS_PACKAGE
+    return f"{package}.{suffix}"

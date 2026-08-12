@@ -37,7 +37,7 @@ from nemo_automodel.components.flow_matching.adapters import (
     HunyuanAdapter,
 )
 from nemo_automodel.components.flow_matching.adapters import hunyuan as hunyuan_module
-from nemo_automodel.components.flow_matching.adapters.hunyuan import _is_flash_varlen_attention_backend
+from nemo_automodel._diffusers.models.hunyuan.adapter import _is_flash_varlen_attention_backend
 
 # =============================================================================
 # Mock Model

@@ -121,7 +121,7 @@ nemo_automodel/
 ├── components/datasets/vlm/
 │   ├── collate_fns.py              # Added llava_onevision_collate_fn
 │   └── datasets.py                 # Added make_llava_onevision_dataset
-├── _transformers/
+├── transformers/
 │   └── registry.py                 # Added LlavaOneVisionForConditionalGeneration
 examples/
 └── vlm_finetune/llava_onevision/

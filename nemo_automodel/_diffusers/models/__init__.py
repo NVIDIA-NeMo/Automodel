@@ -11,9 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Model implementations built on the HuggingFace ``diffusers`` package.
+"""Models trained through the flow-matching / diffusion bridge.
 
-Models written against ``transformers`` instead live in
+Each sub-package provides a ``ModelAdapter`` in ``<arch>/adapter.py``. The
+architectures themselves come from upstream ``diffusers`` pipelines, which
+:class:`NeMoAutoDiffusionPipeline` constructs -- so most adapters here never
+import ``diffusers`` directly.
+
+Models trained through the ``transformers`` bridge live in
 :mod:`nemo_automodel._transformers.models`.
 
 Kept import-light on purpose: importing this package must not pull in
@@ -46,7 +51,7 @@ def _make_upgrade_message(name: str) -> str:
         f"Module '{__name__}' has no submodule '{name}'. "
         f"Available diffusion model submodules in this installation: "
         f"{sorted(_available_model_submodules())}. "
-        f"Models built on 'transformers' live in '{TRANSFORMERS_MODELS_PACKAGE}' -- "
+        f"Models trained through the transformers bridge live in '{TRANSFORMERS_MODELS_PACKAGE}' -- "
         f"try '{TRANSFORMERS_MODELS_PACKAGE}.{name}'. "
         f"If '{name}' is a newly added model, your installed version of "
         f"nemo_automodel may be too old.  Upgrade with:\n"

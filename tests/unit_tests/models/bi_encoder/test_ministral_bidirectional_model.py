@@ -165,7 +165,6 @@ def test_encoder_build_legacy_ministral_registry_path(tmp_path, monkeypatch):
             return cls(hidden=16)
 
     ModelRegistry.model_arch_name_to_cls["Ministral3BidirectionalModel"] = FakeBidirectionalModel
-    monkeypatch.setattr(ModelRegistry, "model_arch_name_to_cls", ModelRegistry.model_arch_name_to_cls)
 
     model_dir = tmp_path / "model"
     model_dir.mkdir()

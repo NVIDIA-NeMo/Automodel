@@ -65,15 +65,16 @@ __all__ = sorted([*_SUBMODULES, "__version__", "__package_name__", *_LAZY_ATTRS.
 
 
 # ---------------------------------------------------------------------------
-# Model import aliases.
+# Import aliases for relocated packages.
 #
 # Model implementations are split by the upstream HuggingFace package they are
 # written against: ``nemo_automodel._transformers.models`` (transformers) and
-# ``nemo_automodel._diffusers.models`` (diffusers). Two legacy flat paths are
-# kept working on top of that split:
+# ``nemo_automodel._diffusers.models`` (diffusers). Several legacy paths are kept
+# working on top of that layout:
 #
 #   nemo_automodel.models.*             -- supported public alias (no warning)
 #   nemo_automodel.components.models.*  -- deprecated pre-split location
+#   ...flow_matching.adapters.<model>   -- deprecated, moved next to its model
 #
 # Implemented as a meta-path finder so it works regardless of whether physical
 # directories are shipped in the installation. The actual import of the
@@ -85,6 +86,33 @@ from ._model_locations import resolve_model_module as _resolve_model_module  # n
 
 _MODELS_ALIAS = "nemo_automodel.models"
 _LEGACY_MODELS_ALIAS = "nemo_automodel.components.models"
+
+# Individual modules that moved to a different name. The flow-matching adapters
+# moved next to the model they adapt; only ``base`` (the adapter contract) stays
+# with the pipeline, so this is a per-module map rather than a prefix rename.
+_RENAMED_MODULES = {
+    f"nemo_automodel.components.flow_matching.adapters.{old}": f"nemo_automodel._diffusers.models.{new}.adapter"
+    for old, new in (
+        ("flux", "flux"),
+        ("flux2", "flux2"),
+        ("hunyuan", "hunyuan"),
+        ("ltx2", "ltx2"),
+        ("qwen_image", "qwen_image"),
+        ("simple", "wan"),
+    )
+}
+
+
+def _alias_suffix(fullname, alias):
+    """Return the part of ``fullname`` below ``alias``, or None if unrelated.
+
+    An exact match yields ``""`` (the package root).
+    """
+    if fullname == alias:
+        return ""
+    if fullname.startswith(alias + "."):
+        return fullname[len(alias) + 1 :]
+    return None
 
 
 class _AliasLoader(importlib.abc.Loader):
@@ -99,6 +127,11 @@ class _AliasLoader(importlib.abc.Loader):
         return None
 
     def exec_module(self, module):
+        # Import first, then warn. Callers that probe a dotted path segment by
+        # segment (``_resolve_target``'s longest-prefix loop) would otherwise
+        # get a relocation warning naming a module that does not exist, e.g.
+        # for the attribute in ``...models.common.BackendConfig``.
+        real = importlib.import_module(self._real_name)
         if self._deprecated_name is not None:
             warnings.warn(
                 f"'{self._deprecated_name}' has moved to '{self._real_name}'. "
@@ -107,38 +140,50 @@ class _AliasLoader(importlib.abc.Loader):
                 DeprecationWarning,
                 stacklevel=2,
             )
-        real = importlib.import_module(self._real_name)
         sys.modules[module.__name__] = real
 
 
 class _ModelsAliasFinder(importlib.abc.MetaPathFinder):
-    """Redirect the legacy flat model paths to their canonical packages.
+    """Redirect legacy import paths to their canonical packages.
 
     Installed at the *front* of ``sys.meta_path`` so it intercepts before the
     default ``PathFinder``.  All import paths resolve to the exact same module
     objects, avoiding duplication.
     """
 
-    _ALIASES = (
+    _MODEL_ALIASES = (
         (_MODELS_ALIAS, False),
         (_LEGACY_MODELS_ALIAS, True),
     )
 
     def find_spec(self, fullname, path, target=None):
-        for alias, deprecated in self._ALIASES:
-            if fullname == alias:
-                suffix = ""
-            elif fullname.startswith(alias + "."):
-                suffix = fullname[len(alias) + 1 :]
-            else:
+        if not fullname.startswith("nemo_automodel."):
+            return None
+
+        # Flat model paths need routing across the transformers/diffusers split.
+        # The deprecated namespace routes off a narrower table -- see
+        # resolve_model_module -- so names that never lived there still error.
+        for alias, deprecated in self._MODEL_ALIASES:
+            suffix = _alias_suffix(fullname, alias)
+            if suffix is None:
                 continue
-            real_name = _resolve_model_module(suffix)
-            return importlib.machinery.ModuleSpec(
-                fullname,
-                _AliasLoader(real_name, fullname if deprecated else None),
-                is_package=not suffix,
-            )
+            real_name = _resolve_model_module(suffix, legacy=deprecated)
+            return self._spec(fullname, real_name, deprecated, suffix)
+
+        # Individually relocated modules (never packages, so never is_package).
+        renamed = _RENAMED_MODULES.get(fullname)
+        if renamed is not None:
+            return self._spec(fullname, renamed, True, suffix="relocated")
+
         return None
+
+    @staticmethod
+    def _spec(fullname, real_name, deprecated, suffix):
+        return importlib.machinery.ModuleSpec(
+            fullname,
+            _AliasLoader(real_name, fullname if deprecated else None),
+            is_package=not suffix,
+        )
 
 
 sys.meta_path.insert(0, _ModelsAliasFinder())

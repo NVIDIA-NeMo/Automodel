@@ -529,6 +529,11 @@ class _ModelRegistry:
 
 @lru_cache
 def get_registry():
+    """Return the process-wide model registry, creating it on first call.
+
+    Returns:
+        The cached :class:`_ModelRegistry` singleton.
+    """
     return _ModelRegistry()
 
 

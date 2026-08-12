@@ -14,8 +14,9 @@
 
 """Tests for the transformers/diffusers model split.
 
-Models are split by the upstream HuggingFace package they are written against.
-Covers:
+Models are split by which bridge trains them -- the ``transformers`` bridge vs
+the flow-matching/diffusion bridge -- not by which upstream package their source
+imports. Covers:
 
 1. The :mod:`nemo_automodel._model_locations` routing table matches what is
    actually on disk (drift guard).
@@ -25,6 +26,7 @@ Covers:
 
 import importlib
 import pathlib
+import re
 import subprocess
 import sys
 
@@ -39,8 +41,10 @@ from nemo_automodel._model_locations import (
 )
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
-_TRANSFORMERS_DIR = _REPO_ROOT / "nemo_automodel" / "_transformers" / "models"
-_DIFFUSERS_DIR = _REPO_ROOT / "nemo_automodel" / "_diffusers" / "models"
+# Derived from the package constants rather than spelled out as path segments,
+# so a future package rename cannot leave these pointing at a stale directory.
+_TRANSFORMERS_DIR = _REPO_ROOT.joinpath(*TRANSFORMERS_MODELS_PACKAGE.split("."))
+_DIFFUSERS_DIR = _REPO_ROOT.joinpath(*DIFFUSERS_MODELS_PACKAGE.split("."))
 
 
 def _model_dirs(root: pathlib.Path) -> set[str]:
@@ -80,20 +84,53 @@ def _collect_moved_warnings(module: str) -> list[str]:
 class TestRoutingTableMatchesDisk:
     """``DIFFUSERS_MODELS`` must stay in sync with the directory contents."""
 
+    def test_package_constants_map_to_real_directories(self):
+        """Guards the two derived paths above against a silent rename."""
+        assert _TRANSFORMERS_DIR.is_dir(), _TRANSFORMERS_DIR
+        assert _DIFFUSERS_DIR.is_dir(), _DIFFUSERS_DIR
+
     def test_diffusers_table_matches_directory(self):
         assert DIFFUSERS_MODELS == _model_dirs(_DIFFUSERS_DIR)
 
     def test_no_model_lives_in_both_packages(self):
         assert not (_model_dirs(_TRANSFORMERS_DIR) & _model_dirs(_DIFFUSERS_DIR))
 
-    def test_only_diffusers_side_models_import_diffusers(self):
-        """A model importing upstream ``diffusers`` belongs under ``_diffusers``."""
-        offenders = {
+    def test_diffusers_side_models_are_flow_matching_adapters(self):
+        """The invariant that actually separates the two sides.
+
+        "Imports upstream ``diffusers``" does *not* work as the criterion: only
+        ``qwen_image_edit`` does, because ``NeMoAutoDiffusionPipeline`` builds
+        the pipeline and hands the adapter tensors. What every diffusers-side
+        package does have is a concrete ``ModelAdapter``.
+
+        Asserted against the ABC rather than the presence of an ``adapter.py``,
+        so a stub file or a half-implemented adapter fails here.
+        """
+        from nemo_automodel.components.flow_matching.adapters.base import ModelAdapter
+
+        for name in sorted(_model_dirs(_DIFFUSERS_DIR)):
+            module = importlib.import_module(f"{DIFFUSERS_MODELS_PACKAGE}.{name}.adapter")
+            concrete = [
+                obj
+                for obj in vars(module).values()
+                if isinstance(obj, type)
+                and issubclass(obj, ModelAdapter)
+                and obj is not ModelAdapter
+                and not obj.__abstractmethods__
+            ]
+            assert concrete, f"{name} exposes no concrete ModelAdapter subclass"
+
+    def test_transformers_side_models_are_not_adapters(self):
+        """Converse direction: a ``ModelAdapter`` belongs on the diffusers side."""
+        offenders = [
             d
-            for d in _model_dirs(_TRANSFORMERS_DIR)
-            if any("diffusers" in p.read_text(encoding="utf-8") for p in (_TRANSFORMERS_DIR / d).rglob("*.py"))
-        }
-        assert offenders == set(), f"transformers-side models referencing diffusers: {sorted(offenders)}"
+            for d in sorted(_model_dirs(_TRANSFORMERS_DIR))
+            if any(
+                "ModelAdapter" in p.read_text(encoding="utf-8", errors="ignore")
+                for p in (_TRANSFORMERS_DIR / d).rglob("*.py")
+            )
+        ]
+        assert offenders == [], f"transformers-side packages defining a ModelAdapter: {offenders}"
 
 
 class TestResolveModelModule:
@@ -131,19 +168,148 @@ class TestLegacyComponentsModelsAlias:
                 "nemo_automodel.components.models.qwen_image_edit.adapter",
                 "nemo_automodel._diffusers.models.qwen_image_edit.adapter",
             ),
+            # Shared helpers, not a model -- reached by both downstream code and
+            # YAML _target_ values.
+            (
+                "nemo_automodel.components.models.common",
+                "nemo_automodel._transformers.models.common",
+            ),
+            (
+                "nemo_automodel.components.models.common.utils",
+                "nemo_automodel._transformers.models.common.utils",
+            ),
         ],
     )
     def test_legacy_path_is_same_module_object(self, legacy, canonical):
         assert importlib.import_module(legacy) is importlib.import_module(canonical)
 
+    @pytest.mark.parametrize(
+        "target",
+        [
+            # Both spellings appear in the wild: re-exported from the package,
+            # and from the module that defines it.
+            "nemo_automodel.components.models.common.BackendConfig",
+            "nemo_automodel.components.models.common.utils.BackendConfig",
+        ],
+    )
+    def test_legacy_backend_config_target_resolves(self, target):
+        """``BackendConfig`` is the most-referenced symbol under the old namespace."""
+        from nemo_automodel._transformers.models.common import BackendConfig
+        from nemo_automodel.components.config.loader import _resolve_target
+
+        assert _resolve_target(target) is BackendConfig
+
     def test_legacy_import_emits_deprecation_warning(self):
         """The warning only fires on first load, so import in a clean interpreter."""
         moved = _collect_moved_warnings("nemo_automodel.components.models.qwen2.model")
-        assert any("_transformers.models" in m for m in moved), moved
+        assert any("transformers.models" in m for m in moved), moved
+
+    def test_legacy_namespace_rejects_names_that_never_lived_there(self):
+        """flux/wan/... were never under components.models; don't invent them."""
+        for name in ("flux", "wan", "hunyuan", "ltx2", "qwen_image"):
+            assert resolve_model_module(name, legacy=True).startswith(TRANSFORMERS_MODELS_PACKAGE)
+            with pytest.raises(ModuleNotFoundError):
+                importlib.import_module(f"nemo_automodel.components.models.{name}")
+
+    def test_legacy_namespace_keeps_the_one_name_that_did(self):
+        assert resolve_model_module("qwen_image_edit.adapter", legacy=True).startswith(DIFFUSERS_MODELS_PACKAGE)
+
+    def test_public_models_alias_routes_to_both_sides(self):
+        """The live alias reflects current locations, unlike the legacy one."""
+        assert resolve_model_module("flux").startswith(DIFFUSERS_MODELS_PACKAGE)
+        assert resolve_model_module("llama").startswith(TRANSFORMERS_MODELS_PACKAGE)
 
     def test_public_models_alias_does_not_warn(self):
         """``nemo_automodel.models.*`` is supported, not deprecated."""
         assert _collect_moved_warnings("nemo_automodel.models.qwen3.model") == []
+
+
+class TestRelocatedFlowMatchingAdapters:
+    """Per-model adapters moved to ``diffusers.models.<arch>.adapter``.
+
+    Only the contract (``ModelAdapter``/``FlowMatchingContext``) stayed with the
+    flow-matching pipeline.
+    """
+
+    def test_rename_table_targets_exist(self):
+        from nemo_automodel import _RENAMED_MODULES
+
+        for old, new in _RENAMED_MODULES.items():
+            assert importlib.import_module(new).__name__ == new
+            assert not (_REPO_ROOT / pathlib.Path(*old.split("."))).with_suffix(".py").exists(), (
+                f"{old} still exists on disk; the alias would be shadowed by the real module"
+            )
+
+    def test_legacy_module_path_is_same_object(self):
+        from nemo_automodel import _RENAMED_MODULES
+
+        for old, new in _RENAMED_MODULES.items():
+            assert importlib.import_module(old) is importlib.import_module(new)
+
+    def test_legacy_package_attribute_still_resolves(self):
+        """``from ...flow_matching.adapters import FluxAdapter`` must keep working."""
+        adapters = importlib.import_module("nemo_automodel.components.flow_matching.adapters")
+        for name in (
+            "FluxAdapter",
+            "Flux2Adapter",
+            "HunyuanAdapter",
+            "LTX2Adapter",
+            "QwenImageAdapter",
+            "SimpleAdapter",
+        ):
+            assert getattr(adapters, name).__module__.startswith(DIFFUSERS_MODELS_PACKAGE)
+
+    def test_every_configured_adapter_type_is_dispatchable(self):
+        """Each ``adapter_type`` used by a shipped recipe must still build."""
+        from nemo_automodel.components.flow_matching.pipeline import create_adapter
+
+        pattern = re.compile(r"adapter_type:\s*\"?([a-z_0-9]+)")
+        configured = {
+            m.group(1)
+            for yaml in (_REPO_ROOT / "examples").rglob("*.yaml")
+            for m in pattern.finditer(yaml.read_text(encoding="utf-8", errors="ignore"))
+        }
+        assert configured, "no adapter_type found in examples/ -- the probe is broken"
+        for adapter_type in sorted(configured):
+            built = create_adapter(adapter_type)
+            assert type(built).__module__.startswith(DIFFUSERS_MODELS_PACKAGE), (
+                f"adapter_type '{adapter_type}' built {type(built).__module__}, expected a diffusers-side model"
+            )
+
+    def test_importing_adapters_package_does_not_load_models(self):
+        """The contract must stay cheap to import."""
+        code = (
+            "import importlib, sys\n"
+            "importlib.import_module('nemo_automodel.components.flow_matching.adapters')\n"
+            "loaded = [m for m in sys.modules if m.startswith('nemo_automodel._diffusers.models.')]\n"
+            "print(loaded)\n"
+        )
+        result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, cwd=_REPO_ROOT)
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "[]", f"eagerly loaded model code: {result.stdout.strip()}"
+
+
+class TestUpstreamPackagesNotShadowed:
+    """``nemo_automodel._transformers`` must not shadow the HuggingFace package.
+
+    Python 3 absolute imports make this safe, but the names now collide, so
+    pin the behaviour down.
+    """
+
+    @pytest.mark.parametrize("package", ["transformers", "diffusers"])
+    def test_bare_import_resolves_to_site_packages(self, package):
+        code = (
+            "import nemo_automodel\n"
+            f"import {package} as p\n"
+            f"assert p.__name__ == '{package}', p.__name__\n"
+            "assert 'nemo_automodel' not in (getattr(p, '__file__', '') or ''), p.__file__\n"
+            "print('ok')\n"
+        )
+        result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, cwd=_REPO_ROOT)
+        if "ModuleNotFoundError" in result.stderr:
+            pytest.skip(f"upstream {package} not installed")
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "ok"
 
 
 class TestFromImportForms:
@@ -190,7 +356,7 @@ class TestWrongPackageErrorMessages:
     """Importing a model from the wrong side points at the right package."""
 
     def test_diffusers_model_from_transformers_package(self):
-        with pytest.raises(ModuleNotFoundError, match=r"built on the 'diffusers' package"):
+        with pytest.raises(ModuleNotFoundError, match=r"trained through the diffusion bridge"):
             importlib.import_module(f"{TRANSFORMERS_MODELS_PACKAGE}.qwen_image_edit")
 
     def test_transformers_model_from_diffusers_package(self):

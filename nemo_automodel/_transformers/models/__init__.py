@@ -11,10 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Model implementations built on the HuggingFace ``transformers`` package.
+"""Models trained through the HuggingFace ``transformers`` bridge.
 
-Models written against ``diffusers`` instead live in
-:mod:`nemo_automodel._diffusers.models`.
+These subclass ``PreTrainedModel``. Models trained through the flow-matching /
+diffusion bridge live in :mod:`nemo_automodel._diffusers.models`.
 
 Also includes convenience model builders:
     • build_gpt2_model – returns a GPT-2 causal language model (Flash-Attention-2 by default).
@@ -48,7 +48,7 @@ def _available_model_submodules() -> set[str]:
 def _make_upgrade_message(name: str) -> str:
     if name in DIFFUSERS_MODELS:
         return (
-            f"Model '{name}' is built on the 'diffusers' package and lives in "
+            f"Model '{name}' is trained through the diffusion bridge and lives in "
             f"'{DIFFUSERS_MODELS_PACKAGE}', not '{__name__}'. "
             f"Import it as '{DIFFUSERS_MODELS_PACKAGE}.{name}'."
         )

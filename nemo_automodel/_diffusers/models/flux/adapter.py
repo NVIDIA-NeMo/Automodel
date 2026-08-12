@@ -26,7 +26,7 @@ from typing import Any, Dict
 import torch
 import torch.nn as nn
 
-from .base import FlowMatchingContext, ModelAdapter
+from nemo_automodel.components.flow_matching.adapters.base import FlowMatchingContext, ModelAdapter
 
 
 class FluxAdapter(ModelAdapter):

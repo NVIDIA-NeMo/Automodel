@@ -1838,9 +1838,9 @@ def _get_model_layer_group_specs() -> Dict[Any, Dict[str, List[str]]]:
                 "model.vision_tower.transformer.layers",
             ],
         },
-        # Retrieval text encoder in _transformers.models.ministral_bidirectional.model.
+        # Retrieval text encoder in transformers.models.ministral_bidirectional.model.
         "Ministral3BidirectionalModel": {"language": ["layers"]},
-        # Retrieval VLM in _transformers.models.llama_nemotron_vl.model. String-keyed
+        # Retrieval VLM in transformers.models.llama_nemotron_vl.model. String-keyed
         # to keep distributed core from importing optional model-specific deps.
         "LlamaNemotronVLModel": {
             "language": ["language_model.layers"],

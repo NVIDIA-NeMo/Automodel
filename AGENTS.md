@@ -122,9 +122,17 @@ _transformers/       -- HuggingFace transformers bridge
   infrastructure.py  -- device mesh setup for distributed training
 
 _diffusers/          -- HuggingFace diffusers bridge
-  models/            -- model families built on diffusers
+  models/            -- flux, flux2, hunyuan, ltx2, qwen_image,
+                        qwen_image_edit, wan -- each a <arch>/adapter.py
   NeMoAutoDiffusionPipeline
 ```
+
+Diffusion architectures come from upstream `diffusers` pipelines; what Automodel
+owns per family is a `ModelAdapter` in `_diffusers/models/<arch>/adapter.py`.
+The adapter *contract* (`ModelAdapter`, `FlowMatchingContext`) stays with the
+algorithm, in `components/flow_matching/adapters/base.py`. Recipes select one by
+`adapter_type` (`"simple"` maps to `wan`), never by module path -- go through
+`create_adapter()` in `components/flow_matching/pipeline.py`.
 
 ### Entry Point
 
@@ -171,16 +179,28 @@ distributed training interface used by LLM/VLM recipes.
 
 ### Directory Layout
 
-Models are split by the upstream HuggingFace package they are written against:
-models built on `transformers` live under `_transformers/models/<name>/`, models
-built on `diffusers` under `_diffusers/models/<name>/`. When adding to the
-diffusers side, also add the name to `DIFFUSERS_MODELS` in
-`nemo_automodel/_model_locations.py` -- `tests/unit_tests/test_model_locations.py`
-fails if the table and the directories drift apart.
+Models are split by **which bridge trains them**, not by which upstream package
+their source imports:
 
-The legacy `nemo_automodel.components.models.*` import path still resolves to
-both (with a `DeprecationWarning`) via the alias finder in
-`nemo_automodel/__init__.py`; `nemo_automodel.models.*` remains supported.
+- `_transformers/models/<name>/` -- trained through the HuggingFace
+  `transformers` bridge. These subclass `PreTrainedModel`.
+- `_diffusers/models/<name>/` -- trained through the flow-matching / diffusion
+  bridge. These are `ModelAdapter` implementations. Most do **not** import
+  `diffusers` themselves; `NeMoAutoDiffusionPipeline` builds the pipeline and
+  hands them tensors. Only `qwen_image_edit` imports `diffusers` directly.
+
+When adding to the diffusers side, also add the name to `DIFFUSERS_MODELS` in
+`nemo_automodel/_model_locations.py` -- `tests/unit_tests/test_model_locations.py`
+fails if the table and the directories drift apart, and asserts the invariant
+that actually holds: diffusers-side packages expose a `ModelAdapter`,
+transformers-side packages do not.
+
+The legacy `nemo_automodel.components.models.*` import path still resolves (with
+a `DeprecationWarning`) via the alias finder in `nemo_automodel/__init__.py`.
+It routes off a deliberately narrower table -- only `qwen_image_edit` was ever
+reachable there -- so `components.models.flux` still raises "unknown model"
+rather than inventing a path that never existed.
+`nemo_automodel.models.*` remains supported and routes to both sides.
 
 Each model directory contains:
 

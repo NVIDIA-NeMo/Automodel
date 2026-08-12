@@ -26,9 +26,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from nemo_automodel.components.flow_matching.adapters.base import FlowMatchingContext, ModelAdapter
 from nemo_automodel.shared.import_utils import safe_import_from
-
-from .base import FlowMatchingContext, ModelAdapter
 
 logger = logging.getLogger(__name__)
 

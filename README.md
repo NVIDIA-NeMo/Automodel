@@ -419,7 +419,7 @@ NeMo-Automodel/
 │   └── vlm_generate/               # VLM generation configs
 ├── nemo_automodel/
 │   ├── _diffusers/                 # HF Diffusers integration (NeMoAutoDiffusionPipeline)
-│   │   └── models/                 # Model families built on Diffusers
+│   │   └── models/                 # Flux, Hunyuan, LTX-2, Qwen-Image, Wan adapters
 │   ├── _transformers/              # HF Transformers integration
 │   │   └── models/                 # Model families built on Transformers (LLM, VLM, MoE, ...)
 │   ├── components/                 # Core library

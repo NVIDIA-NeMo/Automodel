@@ -19,6 +19,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers.modeling_outputs import BaseModelOutputWithPast, SequenceClassifierOutputWithPast
 
+from nemo_automodel.recipes.retrieval.train_bi_encoder import contrastive_scores_and_labels
 from nemo_automodel._transformers.models.llama_bidirectional.model import (
     LlamaBidirectionalConfig,
     LlamaBidirectionalForSequenceClassification,
@@ -32,7 +33,6 @@ from nemo_automodel._transformers.retrieval import (
     configure_encoder_metadata,
     pool,
 )
-from nemo_automodel.recipes.retrieval.train_bi_encoder import contrastive_scores_and_labels
 
 
 def test_contrastive_scores_and_labels_shapes_and_labels():
@@ -327,7 +327,6 @@ def test_encoder_build_and_save(tmp_path, monkeypatch):
 
     # Patch the registry to return our fake model
     ModelRegistry.model_arch_name_to_cls["LlamaBidirectionalModel"] = FakeBidirectionalModel
-    monkeypatch.setattr(ModelRegistry, "model_arch_name_to_cls", ModelRegistry.model_arch_name_to_cls)
 
     # Directory path with config.json to hit config-reading branch
     model_dir = tmp_path / "model"
@@ -413,7 +412,6 @@ def test_encoder_build_llama_bidirec_model_type_generic_path(tmp_path, monkeypat
 
     # Patch the registry to return our fake model
     ModelRegistry.model_arch_name_to_cls["LlamaBidirectionalModel"] = FakeBidirectionalModel
-    monkeypatch.setattr(ModelRegistry, "model_arch_name_to_cls", ModelRegistry.model_arch_name_to_cls)
 
     # Create a model directory whose path has no 'llama' substring
     model_dir = tmp_path / "scratch" / "job" / "model"
@@ -448,7 +446,6 @@ def test_encoder_build_hub_and_errors(tmp_path, monkeypatch):
 
     # Patch the registry to return our fake model
     ModelRegistry.model_arch_name_to_cls["LlamaBidirectionalModel"] = FakeBidirectionalModel
-    monkeypatch.setattr(ModelRegistry, "model_arch_name_to_cls", ModelRegistry.model_arch_name_to_cls)
 
     # Model type not in SUPPORTED_BACKBONES should fall back to AutoModel
     import nemo_automodel._transformers.retrieval as encoder_module
