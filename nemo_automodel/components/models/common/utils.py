@@ -24,6 +24,7 @@ from torch.distributed.fsdp import FSDPModule
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from nemo_automodel.shared.import_utils import safe_import_from
+from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 from nemo_automodel.shared.utils import dtype_from_str
 
 logger = logging.getLogger(__name__)
@@ -779,7 +780,7 @@ def _restore_fp32_tensor_snapshots(
         # module. Try the literal FQN first for buffers registered on the wrapped
         # leaf, then strip the wrapper alias as a fallback for forwarded names.
         candidate_names = [name]
-        stripped_name = name.replace("._checkpoint_wrapped_module", "")
+        stripped_name = canonical_parameter_fqn(name)
         if stripped_name != name:
             candidate_names.append(stripped_name)
 
