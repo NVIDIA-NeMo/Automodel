@@ -96,6 +96,9 @@ class MetricLogger:
     """
 
     def __init__(self, filepath: str, *, flush: bool = False, append: bool = True, buffer_size: int = 100) -> None:
+        # Validate before opening the file so a bad value cannot leak a descriptor.
+        if not isinstance(buffer_size, int) or buffer_size < 1:
+            raise ValueError("buffer_size must be a positive integer")
         self.filepath = os.path.abspath(filepath)
         self.flush = flush
         self.buffer_size = buffer_size
