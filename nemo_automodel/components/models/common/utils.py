@@ -20,6 +20,7 @@ from typing import Any, Literal
 
 import torch
 from torch import nn
+from torch.distributed.fsdp import FSDPModule
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from nemo_automodel.shared.import_utils import safe_import_from
@@ -878,6 +879,10 @@ def compute_lm_head_logits(
       to fp32 (e.g. via the MoE ``lm_head_precision`` setting). The matmul goes
       through ``lm_head`` (``nn.Linear``, DTensor-aware under FSDP2) rather than
       ``F.linear`` so DTensor redistribution is preserved.
+    - Otherwise, cast the sliced input to the head's effective compute dtype.
+      For a standalone FSDP2 head this comes from its mixed-precision policy,
+      since its sharded weight may still expose the master-copy dtype before the
+      forward pre-hook runs. Other heads use their materialized weight dtype.
     - ``output_hidden_states``: when set, the (full-sequence, THD-restored)
       ``hidden_states`` are attached to the output so the fused cross-entropy
       path can recompute logits over every position; otherwise the field is
@@ -915,7 +920,14 @@ def compute_lm_head_logits(
         if fp32_lm_head:
             logits = lm_head(sliced.float()).to(hidden_states.dtype)
         else:
-            logits = lm_head(sliced)
+            compute_dtype = None
+            if isinstance(lm_head, FSDPModule):
+                compute_dtype = lm_head._get_fsdp_state()._mp_policy.param_dtype
+            lm_head_weight = getattr(lm_head, "weight", None)
+            if compute_dtype is None and isinstance(lm_head_weight, torch.Tensor):
+                compute_dtype = lm_head_weight.dtype
+            projection_input = sliced.to(compute_dtype) if compute_dtype is not None else sliced
+            logits = lm_head(projection_input)
     if is_thd and logits.dim() == 2:
         logits = logits.unsqueeze(0)
 

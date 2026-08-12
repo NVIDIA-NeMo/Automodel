@@ -108,13 +108,39 @@ def test_collate_padded_uses_default_collater_schema():
     assert "padding_mask" in batch
 
 
-def test_collate_packed_uses_thd_collater_schema():
+def test_collate_packed_concatenates_into_one_thd_row():
     batch = collate_datums(_toy_datums(), packed=True)
-    # qkv_format + seq_lens come straight from packed_sequence_thd_collater.
+    # All datums share one flat [1, total_tokens] pack.
     assert batch["qkv_format"] == "thd"
-    assert batch["input_ids"].shape == (2, 3)
-    assert "seq_lens" in batch and "seq_lens_padded" in batch
-    assert batch["labels"][0].tolist() == [11, 12, CROSS_ENTROPY_IGNORE_IDX]
+    assert batch["input_ids"].shape == (1, 5)
+    assert batch["input_ids"][0].tolist() == [10, 11, 12, 20, 21]
+    assert batch["labels"][0].tolist() == [11, 12, CROSS_ENTROPY_IGNORE_IDX, 21, 22]
+    # position_ids restart at every sequence boundary (RoPE resets).
+    assert batch["position_ids"][0].tolist() == [0, 1, 2, 0, 1]
+    assert batch["seq_lens"][0].tolist() == [3, 2]
+    assert batch["seq_lens_padded"][0].tolist() == [3, 2]
+
+
+def test_collate_packed_side_inputs_ride_the_flat_axis():
+    batch = collate_datums(_toy_datums(), packed=True)
+    # Per-token floats are concatenated in datum order, aligned with input_ids.
+    assert batch["advantages"].shape == (1, 5)
+    assert batch["advantages"][0].tolist() == pytest.approx([0.5, 0.5, 0.5, 0.9, 0.9])
+    assert batch["weights"][0].tolist() == pytest.approx([1.0, 1.0, 0.0, 1.0, 1.0])
+    # seq_lens allows splitting flat outputs back per datum.
+    lens = [n for n in batch["seq_lens"][0].tolist() if n > 0]
+    split = torch.split(batch["advantages"][0], lens)
+    assert [t.tolist() for t in split] == [pytest.approx([0.5, 0.5, 0.5]), pytest.approx([0.9, 0.9])]
+
+
+def test_collate_packed_per_sample_side_input_is_one_per_datum():
+    datums = [
+        Datum(input_ids=torch.tensor([1, 2]), loss_inputs={"advantages": torch.tensor([0.5])}),
+        Datum(input_ids=torch.tensor([3, 4, 5]), loss_inputs={"advantages": torch.tensor([0.9])}),
+    ]
+    batch = collate_datums(datums, packed=True)
+    assert batch["input_ids"].shape == (1, 5)
+    assert batch["advantages"].tolist() == pytest.approx([0.5, 0.9])
 
 
 def test_collate_carries_per_token_float_side_inputs():

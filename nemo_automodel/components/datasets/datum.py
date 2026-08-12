@@ -54,7 +54,11 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-from nemo_automodel.components.datasets.utils import default_collater, packed_sequence_thd_collater
+from nemo_automodel.components.datasets.utils import (
+    default_collater,
+    pack_features_for_thd,
+    packed_sequence_thd_collater,
+)
 
 CROSS_ENTROPY_IGNORE_IDX = -100
 
@@ -167,19 +171,25 @@ def collate_datums(
     produced by the same code paths the dataset pipeline uses — no fork:
 
     * ``packed=False`` → ``default_collater`` (padded ``[B, T]``).
-    * ``packed=True``  → ``packed_sequence_thd_collater`` (THD).
+    * ``packed=True``  → :func:`pack_features_for_thd` concatenates all datums
+      into one pre-packed record, then ``packed_sequence_thd_collater`` emits
+      the flat ``[1, total_tokens]`` THD schema (``qkv_format="thd"``,
+      per-sequence ``seq_lens`` for splitting outputs back per datum).
 
     Float per-token side-inputs (every ``loss_inputs`` key shared by all datums
     except ``target_tokens``, e.g. ``weights`` / ``logprobs`` / ``advantages``)
-    are right-padded to the collated width and stacked under their own key —
-    this is the part the token collaters cannot carry (they cast to
-    ``LongTensor``). Per-sample (scalar / length-1) entries are stacked into a
-    ``[B]`` tensor without padding.
+    are batched under their own key — this is the part the token collaters
+    cannot carry (they cast to ``LongTensor``). Padded mode right-pads them to
+    the collated width and stacks to ``[B, T]``; packed mode concatenates them
+    in datum order to ``[1, total_tokens]``, aligned with ``input_ids``.
+    Per-sample (scalar / length-1) entries are stacked into a ``[num_datums]``
+    tensor without padding in both modes.
 
     Args:
         datums: examples for this microbatch. Must be non-empty. One ``Datum``
             is treated as one sequence.
-        packed: emit THD packed layout instead of padded ``[B, T]``.
+        packed: pack all datums into one flat ``[1, total_tokens]`` THD row
+            instead of the padded ``[B, T]`` layout.
         pad_seq_len_divisible: pad sequence length to a multiple of this value
             (padded mode only; TP/CP/FP8 alignment).
         ignore_index: label value for masked positions.
@@ -192,7 +202,9 @@ def collate_datums(
 
     features = [datums[i].to_features(ignore_index=ignore_index) for i in range(len(datums))]
     if packed:
-        batch = packed_sequence_thd_collater([dict(f) for f in features])
+        # Concatenate all datums into one pre-packed record and let the
+        # canonical THD collater produce the [1, total] schema.
+        batch = packed_sequence_thd_collater([pack_features_for_thd(features, ignore_index=ignore_index)])
     else:
         batch = default_collater([dict(f) for f in features], pad_seq_len_divisible)
 
@@ -203,9 +215,15 @@ def collate_datums(
     for key in sorted(shared_keys - {"target_tokens"}):
         rows = [d.loss_inputs[key].to(torch.float).flatten() for d in datums]
         if all(r.shape[0] == d.seq_len for r, d in zip(rows, datums)):
-            # Per-token field: right-pad to the collated width and stack.
-            batch[key] = torch.stack([F.pad(r, (0, width - r.shape[0])) for r in rows])
+            if packed:
+                # Per-token field, packed: concatenate in datum order so the
+                # values ride the same flat [1, total] axis as input_ids.
+                batch[key] = torch.cat(rows).unsqueeze(0)
+            else:
+                # Per-token field, padded: right-pad to the collated width and stack.
+                batch[key] = torch.stack([F.pad(r, (0, width - r.shape[0])) for r in rows])
         else:
-            # Per-sample field: one value per datum.
+            # Per-sample field: one value per datum (shape [num_datums], which in
+            # packed mode is deliberately NOT the batch dim of the [1, total] rows).
             batch[key] = torch.stack([r.reshape(-1)[0] for r in rows])
     return batch
