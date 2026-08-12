@@ -28,7 +28,7 @@ from PIL import Image
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel, WordPiece
 from tokenizers.pre_tokenizers import BertPreTokenizer
-from transformers import AutoProcessor, PixtralImageProcessor, PixtralProcessor
+from transformers import AutoModel, AutoProcessor, PixtralImageProcessor, PixtralProcessor
 from transformers.models.mistral3.modeling_mistral3 import Mistral3Model
 from transformers.tokenization_utils_tokenizers import TokenizersBackend
 
@@ -36,10 +36,12 @@ pytest.importorskip("transformers.models.ministral3", reason="Ministral3 not ava
 
 from nemo_automodel._transformers.registry import ModelRegistry
 from nemo_automodel._transformers.retrieval import BiEncoderModel, _init_encoder_common, configure_encoder_metadata
-from nemo_automodel.components.checkpoint.addons import _maybe_save_custom_model_code
+from nemo_automodel.components.checkpoint.addons import ConsolidatedHFAddon, _maybe_save_custom_model_code
+from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
 from nemo_automodel.components.models.ministral_bidirectional.model import (
     Ministral3BidirectionalConfig,
     Ministral3BidirectionalModel,
+    Mistral3BidirectionalConfig,
     Mistral3BidirectionalModel,
 )
 from nemo_automodel.components.models.ministral_bidirectional.processor import Mistral3BiEncoderProcessor, load_image
@@ -803,6 +805,123 @@ def test_init_encoder_common_name_or_path_ministral_retrieval(tmp_path):
 
     assert (tmp_path / "model.py").is_file()
     assert not (tmp_path / "processor.py").exists()
+
+
+def _tiny_mistral3_bidirectional_vlm_config() -> Mistral3BidirectionalConfig:
+    """Build a tiny VL retrieval config for stock checkpoint export tests."""
+    config = Mistral3BidirectionalConfig(
+        text_config={
+            "model_type": "ministral3",
+            "vocab_size": 32,
+            "hidden_size": 16,
+            "intermediate_size": 32,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 8,
+            "max_position_embeddings": 64,
+            "sliding_window": None,
+        },
+        vision_config={
+            "model_type": "pixtral",
+            "hidden_size": 16,
+            "intermediate_size": 32,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 2,
+            "image_size": 16,
+            "patch_size": 4,
+            "num_channels": 3,
+        },
+        spatial_merge_size=1,
+        pooling="avg",
+    )
+    config.text_config.auto_map = {"AutoModel": "legacy_model.LegacyTextModel"}
+    config.vision_config.auto_map = {"AutoModel": "legacy_model.LegacyVisionModel"}
+    config._attn_implementation = "eager"
+    config.text_config._attn_implementation = "eager"
+    return config
+
+
+def test_mistral3_vlm_saves_as_stock_bidirectional_model_without_remote_code(tmp_path):
+    config = _tiny_mistral3_bidirectional_vlm_config()
+    backbone = Mistral3BidirectionalModel(config).eval()
+    encoder = BiEncoderModel(backbone, pooling="avg", l2_normalize=True)
+    input_ids = torch.tensor([[1, 2, 3, 4]])
+    attention_mask = torch.ones_like(input_ids)
+
+    image_input_ids = torch.tensor([[config.image_token_id] * 16 + [1, 2]])
+    image_attention_mask = torch.ones_like(image_input_ids)
+    pixel_values = torch.arange(3 * 16 * 16, dtype=torch.float32).reshape(1, 3, 16, 16) / 255
+    image_sizes = torch.tensor([[16, 16]])
+
+    with torch.no_grad():
+        expected = backbone(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+        expected_multimodal = backbone(
+            input_ids=image_input_ids,
+            attention_mask=image_attention_mask,
+            pixel_values=pixel_values,
+            image_sizes=image_sizes,
+        ).last_hidden_state
+
+    legacy_source = tmp_path / "legacy_source"
+    legacy_source.mkdir()
+    (legacy_source / "model.py").write_text("class LegacyModel: pass\n")
+    (legacy_source / "processor.py").write_text("class LegacyProcessor: pass\n")
+    encoder.config.name_or_path = str(legacy_source)
+    model_state = SimpleNamespace(model=[encoder])
+    checkpointer = SimpleNamespace(config=SimpleNamespace())
+    original_model_path = Checkpointer._get_original_model_path(checkpointer, model_state)
+    assert original_model_path == str(legacy_source)
+
+    custom_code_dir = tmp_path / "custom_code"
+    custom_code_dir.mkdir()
+    ConsolidatedHFAddon().pre_save(
+        model_state=model_state,
+        hf_metadata_dir=str(custom_code_dir),
+        fqn_to_file_index_mapping={},
+        original_model_path=original_model_path,
+    )
+    assert not list(custom_code_dir.rglob("*.py"))
+    assert (custom_code_dir / "config.json").is_file()
+
+    encoder.save_pretrained(str(tmp_path))
+
+    saved_config = json.loads((tmp_path / "config.json").read_text())
+    reloaded = AutoModel.from_pretrained(tmp_path, trust_remote_code=False).eval()
+    training_reload = Mistral3BidirectionalModel.from_pretrained(tmp_path).eval()
+
+    assert type(reloaded) is Mistral3Model
+    assert saved_config["model_type"] == "mistral3"
+    assert saved_config["architectures"] == ["Mistral3Model"]
+    assert saved_config["is_causal"] is False
+    assert saved_config["pooling"] == "avg"
+    assert saved_config["text_config"]["is_causal"] is False
+    assert "auto_map" not in saved_config["text_config"]
+    assert "auto_map" not in saved_config["vision_config"]
+    assert "auto_map" not in saved_config
+    assert not list(tmp_path.glob("*.py"))
+    assert encoder.name_or_path is None
+    assert set(reloaded.state_dict()) == set(backbone.state_dict())
+    for key, tensor in backbone.state_dict().items():
+        torch.testing.assert_close(reloaded.state_dict()[key], tensor)
+        torch.testing.assert_close(training_reload.state_dict()[key], tensor)
+
+    with torch.no_grad():
+        actual = reloaded(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+        actual_multimodal = reloaded(
+            input_ids=image_input_ids,
+            attention_mask=image_attention_mask,
+            pixel_values=pixel_values,
+            image_sizes=image_sizes,
+        ).last_hidden_state
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(actual_multimodal, expected_multimodal)
+
+    changed_ids = input_ids.clone()
+    changed_ids[0, -1] = 5
+    with torch.no_grad():
+        changed = reloaded(input_ids=changed_ids, attention_mask=attention_mask).last_hidden_state
+    assert not torch.allclose(actual[0, 0], changed[0, 0], atol=1e-6)
 
 
 def test_mistral3_vlm_liger_patch_targets_text_tower():

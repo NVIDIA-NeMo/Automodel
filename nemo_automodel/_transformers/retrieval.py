@@ -341,17 +341,26 @@ def _dummy_vision_sum(model: nn.Module) -> torch.Tensor | None:
 def configure_encoder_metadata(model: PreTrainedModel, config) -> None:
     """Configure HuggingFace consolidated checkpoint metadata on a model.
 
-    Sets ``config.architectures`` unconditionally.  For custom retrieval
+    Sets ``config.architectures`` unconditionally. For custom retrieval
     architectures registered in :class:`ModelRegistry`, also writes
     ``config.auto_map`` so that the saved checkpoint can be reloaded via
-    HuggingFace Auto classes.  Standard HF models already have their own
-    auto-resolution and do not need ``auto_map`` entries.
+    HuggingFace Auto classes. Mistral 3 VL retrieval is exported as the stock
+    ``Mistral3Model`` with ``is_causal=False`` and therefore needs no custom
+    model code. Other standard HF models already have their own auto-resolution.
 
     Args:
         model: The backbone ``PreTrainedModel`` instance.
         config: The model's config object (typically ``model.config``).
     """
     encoder_class_name = model.__class__.__name__
+    if encoder_class_name == "Mistral3BidirectionalModel":
+        config.architectures = ["Mistral3Model"]
+        config.is_causal = False
+        config.text_config.is_causal = False
+        if hasattr(config, "auto_map"):
+            del config.auto_map
+        return
+
     config.architectures = [encoder_class_name]
 
     # Only set auto_map for custom retrieval architectures.
@@ -573,7 +582,11 @@ def _init_encoder_common(encoder: nn.Module, model: PreTrainedModel) -> None:
     """Shared init for BiEncoderModel and CrossEncoderModel."""
     encoder.model = model
     encoder.config = model.config
-    if ModelRegistry.has_retrieval_model(model.__class__.__name__):
+    if model.__class__.__name__ == "Mistral3BidirectionalModel":
+        encoder._export_as_stock_model = True
+        model._export_as_stock_model = True
+        encoder.name_or_path = None
+    elif ModelRegistry.has_retrieval_model(model.__class__.__name__):
         encoder.name_or_path = inspect.getfile(type(model))
     else:
         encoder.name_or_path = getattr(model.config, "name_or_path", "")

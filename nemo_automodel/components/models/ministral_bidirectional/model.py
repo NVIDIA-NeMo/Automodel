@@ -163,8 +163,21 @@ class Mistral3BidirectionalConfig(Mistral3Config):
         super().__post_init__(**kwargs)
 
     def to_dict(self):
+        """Serialize the VL retrieval model as a stock bidirectional Mistral3 config."""
         config_dict = super().to_dict()
-        config_dict.pop("_pooling", None)
+        config_dict["pooling"] = config_dict.pop("_pooling", "avg")
+        config_dict.pop("auto_map", None)
+        config_dict["model_type"] = "mistral3"
+        config_dict["architectures"] = ["Mistral3Model"]
+        config_dict["is_causal"] = False
+        text_config = config_dict.get("text_config")
+        if isinstance(text_config, dict):
+            text_config.pop("auto_map", None)
+            text_config["model_type"] = "ministral3"
+            text_config["is_causal"] = False
+        vision_config = config_dict.get("vision_config")
+        if isinstance(vision_config, dict):
+            vision_config.pop("auto_map", None)
         return config_dict
 
 
