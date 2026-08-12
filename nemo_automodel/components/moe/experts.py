@@ -857,6 +857,24 @@ def get_expert_activation_for_deepep(config: MoEConfig):
         raise ValueError(f"Invalid expert activation: {config.expert_activation}")
 
 
+def _stabilize_empty_routing_probs_dtype(
+    permuted_probs: torch.Tensor, compute_dtype: torch.dtype
+) -> torch.Tensor:
+    """Keep empty expert probabilities stable across checkpoint recomputation.
+
+    DeepEP may return an empty probability tensor in either the router dtype or
+    the activation dtype. With non-reentrant activation checkpointing, a later
+    recomputation can choose the other representation, and PyTorch checkpointing rejects
+    the resulting saved-tensor metadata change even though both tensors contain
+    zero elements. Empty probabilities have no numerical contribution, so
+    canonicalize only that case to the dispatched activation dtype. Non-empty
+    probabilities retain their original (normally FP32) router precision.
+    """
+    if permuted_probs.numel() == 0 and permuted_probs.dtype != compute_dtype:
+        return permuted_probs.to(compute_dtype)
+    return permuted_probs
+
+
 class GroupedExpertsDeepEP(nn.Module):
     """
     Sparse MoE implementation using grouped GEMM with DeepEP token dispatch.
@@ -893,7 +911,7 @@ class GroupedExpertsDeepEP(nn.Module):
             dispatcher_backend: Backend for the flex token dispatcher ("deepep" or "hybridep").
             dispatcher_num_sms: Number of SMs to use for the dispatcher backend.
             dispatcher_share_token_dispatcher: Whether to share a flex dispatcher communication manager across layers.
-            dispatcher_async_dispatch: Whether DeepEP/UCCL-EP dispatch should run asynchronously.
+            dispatcher_async_dispatch: Whether DeepEP/UCCL-EP dispatch and combine should run asynchronously.
         """
         super().__init__()
 
@@ -1002,6 +1020,7 @@ class GroupedExpertsDeepEP(nn.Module):
             token_probs=weights,
             token_indices=indices,
         )
+        permuted_probs = _stabilize_empty_routing_probs_dtype(permuted_probs, self.config.dtype)
         permuted_probs = permuted_probs.unsqueeze(-1)
         activation_probs = (
             torch.ones_like(permuted_probs) if self.config.apply_router_weight_after_down else permuted_probs

@@ -212,8 +212,8 @@ class BackendConfig:
             "uccl_ep" uses UCCL-EP for token dispatch across heterogeneous GPUs and NICs.
         dispatcher_share_token_dispatcher: Whether flex token dispatchers share a communication
             manager instance across MoE layers.
-        dispatcher_async_dispatch: Whether DeepEP/UCCL-EP dispatch should return asynchronously
-            and allocate dispatched tensors on the communication stream.
+        dispatcher_async_dispatch: Whether DeepEP/UCCL-EP dispatch and combine should return
+            asynchronously and allocate their outputs on the communication stream.
         enable_deepep: Removed and ignored. Logs a warning if set; configure "dispatcher"
             and "experts" explicitly instead.
         fake_balanced_gate: If True, replace the learned Gate with FakeBalancedGate

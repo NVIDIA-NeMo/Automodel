@@ -59,6 +59,37 @@ from nemo_automodel.shared.utils import dtype_from_str
 
 logger = logging.getLogger(__name__)
 _CP_STREAM = None
+_EMPTY_TENSOR_DETERMINISM_CHECK = "moe_empty_tensor_dtype_tolerant"
+
+
+def _moe_checkpoint_metadata_fn(tensor: torch.Tensor):
+    """Checkpoint metadata that ignores dtype only for zero-element tensors.
+
+    Mixed-precision DeepEP can expose an empty routed-token tensor as BF16 in the
+    original forward and FP32 during backward recomputation. Empty tensors have no values
+    whose precision could differ, but PyTorch's default checkpoint check still
+    rejects the dtype-only metadata change. Preserve shape/device checks for every
+    tensor and dtype checks for every non-empty tensor.
+    """
+    return {
+        "shape": tensor.shape,
+        "dtype": tensor.dtype if tensor.numel() else None,
+        "device": tensor.device,
+    }
+
+
+def _register_moe_checkpoint_determinism_check() -> str:
+    """Register the narrow empty-tensor checker with PyTorch checkpointing."""
+    import torch.utils.checkpoint as torch_checkpoint
+
+    checks = getattr(torch_checkpoint, "_allowed_determinism_checks_to_fns", None)
+    if checks is None:
+        raise RuntimeError(
+            "This PyTorch version does not expose checkpoint determinism-check registration; "
+            "cannot safely tolerate empty MoE dtype changes."
+        )
+    checks[_EMPTY_TENSOR_DETERMINISM_CHECK] = _moe_checkpoint_metadata_fn
+    return _EMPTY_TENSOR_DETERMINISM_CHECK
 
 
 def _moe_shard_placement(param):
@@ -314,8 +345,6 @@ def apply_ep(model: nn.Module, ep_mesh: DeviceMesh, moe_mesh: DeviceMesh | None 
                 device_mesh=ep_mesh,
                 parallelize_plan=ExpertParallel(),
             )
-
-
 # Alias of the shared tower taxonomy. Previously a private copy that had drifted
 # from the other multimodal name lists in the tree.
 _MULTIMODAL_TOWER_ATTRS = MULTIMODAL_TOWER_NAMES
@@ -536,9 +565,20 @@ def apply_ac(
         return False
 
     router_topk = getattr(getattr(torch.ops.aten, "topk", None), "default", None)
+    # Dispatch/combine are part of the routed-token assignment just like the
+    # router projection and top-k outputs. Replaying them during backward adds
+    # another EP communication pass and can change empty-rank tensor metadata
+    # under mixed-precision parameter lifecycles. Save their outputs instead;
+    # this is much smaller than broad selective AC because every other GEMM is
+    # still recomputed.
+    moe_comm_ops = {
+        getattr(getattr(getattr(torch.ops, "deepep", None), op_name, None), "default", None)
+        for op_name in ("dispatch", "combine")
+    }
+    moe_comm_ops.discard(None)
 
     def _custom_policy(ctx, func, *args, **kwargs):
-        if (router_topk is not None and func == router_topk) or _is_router_projection(func, args):
+        if func in moe_comm_ops or (router_topk is not None and func == router_topk) or _is_router_projection(func, args):
             return CheckpointPolicy.MUST_SAVE
         return CheckpointPolicy.PREFER_RECOMPUTE
 
@@ -582,6 +622,7 @@ def apply_ac(
             block = ptd_checkpoint_wrapper(
                 block,
                 preserve_rng_state=True,
+                determinism_check=_register_moe_checkpoint_determinism_check(),
                 context_fn=_preserve_gate_load_during_recompute(
                     block,
                     _with_attention_backend_snapshot(selective_checkpointing_context_fn),
