@@ -135,6 +135,15 @@ class Engine:
         max_grad_norm: float = 1.0
         defer_fsdp_grad_sync: bool = True
         has_packed_sequence: bool = False
+        # Pack each Datum microbatch into one flat [1, total_tokens] THD row
+        # (cross-sample packing via collate_datums(packed=True)) instead of the
+        # padded [B, T] layout. Text-only: Datum carries no media fields, and
+        # VLM packing needs model-coupled mRoPE positions (see neat_packing_vlm).
+        # Implies has_packed_sequence for config-built models so packed-aware
+        # backends (e.g. fused-RoPE disabling) are configured correctly.
+        # Not supported with context parallelism yet (loss-input co-sharding is
+        # a planned follow-up).
+        pack_datums: bool = False
         fp8: Any = None
         compile: Any = None
         quantization: Any = None
@@ -238,7 +247,9 @@ class Engine:
         model = build_model(
             self.config.model,
             self.config.peft,
-            has_packed_sequence=self.config.has_packed_sequence,
+            # pack_datums feeds the model packed sequences, so packed-aware
+            # backend choices (fused-RoPE disabling) must kick in either way.
+            has_packed_sequence=self.config.has_packed_sequence or self.config.pack_datums,
             seed=self.config.seed,
             cfg_fp8=self.config.fp8,
             cfg_compile=self.config.compile,
@@ -506,13 +517,17 @@ class Engine:
         datums = list(datums)
         model = self.model_parts[0]
         device = self.device
-        batch = self._batch_to_device(collate_datums(datums), device)
-        train_ctx, batch = self._shard_batch_for_cp(batch)
+        packed = self._packing_datums()
+        batch = self._batch_to_device(collate_datums(datums, packed=packed), device)
+        if packed:
+            train_ctx = nullcontext  # caller-visible CP is rejected; the pack is final
+        else:
+            train_ctx, batch = self._shard_batch_for_cp(batch)
         labels = batch.pop("labels", None)
         adapter_ctx = self.disable_adapter() if disable_adapters else nullcontext()
         with torch.no_grad(), adapter_ctx, train_ctx():
             out = model(**filter_forward_kwargs(model, batch))
-        return self._build_model_output(out, datums, labels, detach=True)
+        return self._build_model_output(out, datums, labels, detach=True, packed=packed)
 
     @contextmanager
     def disable_adapter(self):
@@ -536,8 +551,13 @@ class Engine:
         labels: torch.Tensor | None,
         *,
         detach: bool,
+        packed: bool = False,
     ) -> ModelOutput:
-        """Slice padded ``[B, T, ...]`` model output into per-datum fields.
+        """Slice the model output into per-datum fields.
+
+        The padded layout slices row ``i`` of ``[B, T, ...]`` to each datum's
+        length; the packed layout (``packed=True``) splits the flat
+        ``[1, total_tokens, ...]`` row by the datums' sequence lengths in order.
 
         Duck-typed on what the model *emits*, not on any role config — the
         Engine surfaces what is there, it does not know "actor"/"critic": a
@@ -547,6 +567,13 @@ class Engine:
         both. For custom extraction, subclass this method (cf. verl's
         per-head engine subclasses). With ``detach`` the graph is dropped.
         """
+        seq_lens = [d.seq_len for d in datums]
+
+        def per_datum(token_tensor: torch.Tensor) -> list[torch.Tensor]:
+            if packed:
+                return list(split_per_datum(token_tensor[0], seq_lens))
+            return [token_tensor[i, : d.seq_len] for i, d in enumerate(datums)]
+
         per_values = None
         values = getattr(out, "values", None)
         # Guard: HF model outputs subclass OrderedDict, so `.values` is its dict
@@ -556,7 +583,7 @@ class Engine:
         if values is not None:
             if values.dim() == 3 and values.shape[-1] == 1:
                 values = values.squeeze(-1)  # [B, T, 1] -> [B, T]
-            per_values = [values[i, : d.seq_len] for i, d in enumerate(datums)]
+            per_values = per_datum(values)
 
         per_logprobs: list[torch.Tensor] | None = None
         per_entropy: list[torch.Tensor] | None = None
@@ -567,10 +594,10 @@ class Engine:
             logits = out  # raw logits tensor
         if logits is not None:
             if labels is not None:
-                token_lp = selected_token_logprobs(logits, labels.clamp_min(0))  # [B, T]
-                per_logprobs = [token_lp[i, : d.seq_len] for i, d in enumerate(datums)]
-            token_ent = compute_entropy(logits)  # [B, T]
-            per_entropy = [token_ent[i, : d.seq_len] for i, d in enumerate(datums)]
+                token_lp = selected_token_logprobs(logits, labels.clamp_min(0))  # [B, T] / [1, total]
+                per_logprobs = per_datum(token_lp)
+            token_ent = compute_entropy(logits)  # [B, T] / [1, total]
+            per_entropy = per_datum(token_ent)
 
         if detach:
             per_values = [t.detach() for t in per_values] if per_values is not None else None
@@ -593,6 +620,12 @@ class Engine:
         lifecycle. Matches the recipe's non-PP loss formula (weighted sum of
         per-token losses / global token count), so DP scaling stays identical to
         the proven path.
+
+        With ``Config.pack_datums`` each microbatch is packed into one flat
+        ``[1, total_tokens]`` THD row (text-only; rejected under CP). The loss
+        contract is unaffected: ``loss_fn`` still receives per-datum
+        ``ModelOutput`` lists and reads ``loss_inputs`` from the ``Datum``
+        objects, so padded and packed layouts produce identical losses.
         """
         from nemo_automodel.components.distributed.utils import get_sync_ctx
         from nemo_automodel.components.training.utils import (
@@ -602,6 +635,7 @@ class Engine:
         )
         from nemo_automodel.components.utils.model_utils import filter_forward_kwargs
 
+        packed = self._packing_datums()  # first: fail fast on the CP limit
         all_datums = [d for mb in mb_datum_lists for d in mb]
         token_denom, sample_denom = self._global_denominator(all_datums)
         is_train = not forward_only
@@ -621,14 +655,17 @@ class Engine:
             if is_train and is_last:
                 prepare_for_final_backward(self.model_parts, pp_enabled=False)
 
-            batch = self._batch_to_device(collate_datums(mb), device)
-            train_ctx, batch = self._shard_batch_for_cp(batch)
+            batch = self._batch_to_device(collate_datums(mb, packed=packed), device)
+            if packed:
+                train_ctx = nullcontext  # CP with pack_datums is rejected upfront
+            else:
+                train_ctx, batch = self._shard_batch_for_cp(batch)
             labels = batch.pop("labels", None)
             sync_ctx = get_sync_ctx(model, is_last, self.config.defer_fsdp_grad_sync) if is_train else nullcontext()
             fwd_ctx = nullcontext() if is_train else torch.no_grad()
             with fwd_ctx, train_ctx(), sync_ctx:
                 out = model(**filter_forward_kwargs(model, batch))
-                mo = self._build_model_output(out, mb, labels, detach=False)
+                mo = self._build_model_output(out, mb, labels, detach=False, packed=packed)
                 per_datum_losses = loss_fn(mo, mb, **loss_kwargs)
                 loss = self._reduce_datum_losses(per_datum_losses, mb, token_denom, sample_denom)
                 if is_train:
@@ -993,6 +1030,19 @@ class Engine:
         if not self.device_mesh or self.device_mesh["cp"].size() == 1:
             return 1
         return self.device_mesh["cp"].size()
+
+    def _packing_datums(self) -> bool:
+        """Whether the Datum path packs microbatches, validating the CP limit."""
+        if not self.config.pack_datums:
+            return False
+        if self._cp_size() > 1:
+            raise NotImplementedError(
+                "pack_datums is not supported with context parallelism yet: the Engine "
+                "does not co-shard Datum.loss_inputs or gather per-datum logprobs across "
+                "CP ranks (planned follow-up, see Automodel issue #2861). "
+                "Use padded datums (pack_datums=False) under CP."
+            )
+        return True
 
     def _set_moe_scale(self, num_microbatches: int) -> None:
         """Set the per-microbatch MoE auxiliary-loss scale for one optimizer step.

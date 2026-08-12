@@ -389,3 +389,100 @@ def test_dict_backward_scales_only_globally_normalized_losses(monkeypatch):
     assert torch.allclose(grads[(4, 16)], 4 * grads[(1, 16)])
     # Locally normalized loss (no global count): FSDP's average is already correct.
     assert torch.allclose(grads[(4, None)], grads[(1, 16)])
+
+
+# ── pack_datums: packed Datum door (text-only, CP=1) ─────────────────────────
+
+
+def _packing_engines(lr=0.1):
+    """Two engines over identically-initialized models: padded vs packed."""
+    torch.manual_seed(0)
+    model_a = ToyLM()
+    torch.manual_seed(0)
+    model_b = ToyLM()
+    eng_a = Engine(model_parts=[model_a], optimizers=[torch.optim.SGD(model_a.parameters(), lr=lr)])
+    eng_b = Engine(model_parts=[model_b], optimizers=[torch.optim.SGD(model_b.parameters(), lr=lr)])
+    eng_b.config.pack_datums = True
+    return (eng_a, model_a), (eng_b, model_b)
+
+
+def _parity_datums():
+    torch.manual_seed(7)
+    datums = _datums()
+    # Exercise the alignment-sensitive cases: a masked position and a
+    # per-sample advantage next to per-token weights.
+    datums[0].loss_inputs["weights"][-1] = 0.0
+    datums[0].loss_inputs["advantages"] = torch.tensor([0.3])
+    datums[1].loss_inputs["advantages"] = torch.tensor([0.7])
+    return datums
+
+
+def test_pack_datums_loss_parity_with_padded():
+    (eng_a, model_a), (eng_b, model_b) = _packing_engines()
+    torch.manual_seed(7)
+    out_a = eng_a.forward_backward([_parity_datums()])
+    torch.manual_seed(7)
+    out_b = eng_b.forward_backward([_parity_datums()])
+    # Packing is a pure layout change: loss, per-datum logprobs, and the
+    # resulting gradients must be identical.
+    assert torch.allclose(out_a.loss, out_b.loss)
+    assert len(out_a.logprobs) == len(out_b.logprobs)
+    for lp_a, lp_b in zip(out_a.logprobs, out_b.logprobs):
+        assert torch.allclose(lp_a, lp_b)
+    assert torch.allclose(model_a.head.weight.grad, model_b.head.weight.grad)
+    assert torch.allclose(model_a.embed.weight.grad, model_b.embed.weight.grad)
+
+
+def test_pack_datums_multi_microbatch_parity():
+    (eng_a, model_a), (eng_b, model_b) = _packing_engines()
+    torch.manual_seed(11)
+    mbs_a = [_datums(), _datums()]
+    torch.manual_seed(11)
+    mbs_b = [_datums(), _datums()]
+    out_a = eng_a.forward_backward(mbs_a)
+    out_b = eng_b.forward_backward(mbs_b)
+    assert torch.allclose(out_a.loss, out_b.loss)
+    assert torch.allclose(model_a.head.weight.grad, model_b.head.weight.grad)
+
+
+def test_pack_datums_forward_extraction_parity():
+    (eng_a, _), (eng_b, _) = _packing_engines()
+    torch.manual_seed(13)
+    datums_a = _datums()
+    torch.manual_seed(13)
+    datums_b = _datums()
+    mo_a = eng_a.forward(datums_a)
+    mo_b = eng_b.forward(datums_b)
+    for lp_a, lp_b in zip(mo_a.logprobs, mo_b.logprobs):
+        assert torch.allclose(lp_a, lp_b)
+    for en_a, en_b in zip(mo_a.entropy, mo_b.entropy):
+        assert torch.allclose(en_a, en_b)
+
+
+def test_pack_datums_rejected_under_cp():
+    engine, _ = _engine()
+    engine.config.pack_datums = True
+    engine.device_mesh = _FakeCpMesh(2)
+    with pytest.raises(NotImplementedError, match="pack_datums"):
+        engine.forward_backward([_datums()])
+    with pytest.raises(NotImplementedError, match="pack_datums"):
+        engine.forward(_datums())
+
+
+def test_pack_datums_implies_packed_sequence_model_build(monkeypatch):
+    captured = {}
+
+    def fake_build_model(model_cfg, peft_cfg, **kwargs):
+        captured.update(kwargs)
+        return ToyLM()
+
+    # build_model is imported lazily inside the config-build path.
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.build_model", fake_build_model)
+    cfg = Engine.Config(model=object(), pack_datums=True)
+    try:
+        # Inject a stub distributed_setup so the build path never initializes
+        # torch.distributed (the session guard flags leaked process groups).
+        Engine(config=cfg, distributed_setup=SimpleNamespace())
+    except Exception:
+        pass  # later build stages may fail; we only assert the model-build wiring
+    assert captured.get("has_packed_sequence") is True
