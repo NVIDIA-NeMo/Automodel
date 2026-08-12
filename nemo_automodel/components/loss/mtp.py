@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Literal, Optional, overload
 
 import torch
 import torch.distributed as dist
@@ -41,6 +41,63 @@ class MTPLossOutput:
 
     loss: torch.Tensor
     per_depth_losses: list[torch.Tensor]
+
+
+@overload
+def calculate_mtp_loss(
+    loss_fn: nn.Module,
+    *,
+    mtp_per_depth_h: list[torch.Tensor] | None = None,
+    mtp_per_depth_logits: list[torch.Tensor] | None = None,
+    labels: torch.Tensor,
+    model: nn.Module,
+    scaling_factor: float = 0.1,
+    num_label_tokens: int | None = None,
+    ignore_index: int = -100,
+    cu_seqlens: torch.Tensor | None = None,
+    seq_idx: torch.Tensor | None = None,
+    lm_weight: torch.Tensor | None = None,
+    grad_reduce_group: dist.ProcessGroup | None = None,
+    return_per_depth: Literal[False] = False,
+) -> torch.Tensor: ...
+
+
+@overload
+def calculate_mtp_loss(
+    loss_fn: nn.Module,
+    *,
+    mtp_per_depth_h: list[torch.Tensor] | None = None,
+    mtp_per_depth_logits: list[torch.Tensor] | None = None,
+    labels: torch.Tensor,
+    model: nn.Module,
+    scaling_factor: float = 0.1,
+    num_label_tokens: int | None = None,
+    ignore_index: int = -100,
+    cu_seqlens: torch.Tensor | None = None,
+    seq_idx: torch.Tensor | None = None,
+    lm_weight: torch.Tensor | None = None,
+    grad_reduce_group: dist.ProcessGroup | None = None,
+    return_per_depth: Literal[True],
+) -> MTPLossOutput: ...
+
+
+@overload
+def calculate_mtp_loss(
+    loss_fn: nn.Module,
+    *,
+    mtp_per_depth_h: list[torch.Tensor] | None = None,
+    mtp_per_depth_logits: list[torch.Tensor] | None = None,
+    labels: torch.Tensor,
+    model: nn.Module,
+    scaling_factor: float = 0.1,
+    num_label_tokens: int | None = None,
+    ignore_index: int = -100,
+    cu_seqlens: torch.Tensor | None = None,
+    seq_idx: torch.Tensor | None = None,
+    lm_weight: torch.Tensor | None = None,
+    grad_reduce_group: dist.ProcessGroup | None = None,
+    return_per_depth: bool,
+) -> torch.Tensor | MTPLossOutput: ...
 
 
 def calculate_mtp_loss(
@@ -105,10 +162,14 @@ def calculate_mtp_loss(
         :class:`MTPLossOutput` containing the scalar aggregate and scalar
         per-depth losses. All returned tensors retain their autograd graphs.
     """
-    if (mtp_per_depth_h is None) == (mtp_per_depth_logits is None):
+    if mtp_per_depth_logits is not None:
+        if mtp_per_depth_h is not None:
+            raise ValueError("Provide exactly one of mtp_per_depth_h or mtp_per_depth_logits")
+        mtp_outputs = mtp_per_depth_logits
+    elif mtp_per_depth_h is not None:
+        mtp_outputs = mtp_per_depth_h
+    else:
         raise ValueError("Provide exactly one of mtp_per_depth_h or mtp_per_depth_logits")
-
-    mtp_outputs = mtp_per_depth_logits if mtp_per_depth_logits is not None else mtp_per_depth_h
 
     # Reconcile per-depth output and label dims for the THD-packed non-PP path:
     # the model unsqueezes outputs from ``[T, *]`` back to ``[1, T, *]`` (model.py
