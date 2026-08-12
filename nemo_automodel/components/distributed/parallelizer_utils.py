@@ -26,6 +26,9 @@ from torch.distributed.fsdp import (
 )
 
 from nemo_automodel.shared.torch_patches import (
+    patch_fsdp_uniform_reduce_dtype as _patch_fsdp_uniform_reduce_dtype,
+)
+from nemo_automodel.shared.torch_patches import (
     patch_fsdp_unused_param_reduction as _patch_fsdp_unused_param_reduction,
 )
 
@@ -53,6 +56,10 @@ def configure_fsdp_unused_param_reduction(module: nn.Module) -> int:
     if not fsdp_modules:
         return 0
 
+    # Install first so the zero fill below wraps it: the filled zero is in param
+    # dtype and must be aligned with the peers' reduce-dtype accumulations before
+    # the group reaches ``foreach_reduce``.
+    _patch_fsdp_uniform_reduce_dtype()
     if hasattr(fsdp_modules[0], "set_reduce_scatter_unused_params"):
         for fsdp_module in fsdp_modules:
             fsdp_module.set_reduce_scatter_unused_params(True, recurse=False)
