@@ -857,9 +857,7 @@ def get_expert_activation_for_deepep(config: MoEConfig):
         raise ValueError(f"Invalid expert activation: {config.expert_activation}")
 
 
-def _stabilize_empty_routing_probs_dtype(
-    permuted_probs: torch.Tensor, compute_dtype: torch.dtype
-) -> torch.Tensor:
+def _stabilize_empty_routing_probs_dtype(permuted_probs: torch.Tensor, compute_dtype: torch.dtype) -> torch.Tensor:
     """Keep empty expert probabilities stable across checkpoint recomputation.
 
     DeepEP may return an empty probability tensor in either the router dtype or

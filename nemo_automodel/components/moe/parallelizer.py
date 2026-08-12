@@ -345,6 +345,8 @@ def apply_ep(model: nn.Module, ep_mesh: DeviceMesh, moe_mesh: DeviceMesh | None 
                 device_mesh=ep_mesh,
                 parallelize_plan=ExpertParallel(),
             )
+
+
 # Alias of the shared tower taxonomy. Previously a private copy that had drifted
 # from the other multimodal name lists in the tree.
 _MULTIMODAL_TOWER_ATTRS = MULTIMODAL_TOWER_NAMES
@@ -578,7 +580,11 @@ def apply_ac(
     moe_comm_ops.discard(None)
 
     def _custom_policy(ctx, func, *args, **kwargs):
-        if func in moe_comm_ops or (router_topk is not None and func == router_topk) or _is_router_projection(func, args):
+        if (
+            func in moe_comm_ops
+            or (router_topk is not None and func == router_topk)
+            or _is_router_projection(func, args)
+        ):
             return CheckpointPolicy.MUST_SAVE
         return CheckpointPolicy.PREFER_RECOMPUTE
 
