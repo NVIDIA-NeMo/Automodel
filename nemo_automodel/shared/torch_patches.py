@@ -22,10 +22,89 @@ that already depend on torch (training / distributed / dataloading).
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterable
+from typing import Any
 
 _logger = logging.getLogger(__name__)
 
 _TORCH_PATCHES_APPLIED = False
+
+
+def _align_accumulated_grad_dtype(fsdp_params: Iterable[Any]) -> None:
+    """Move a group's fresh gradients into the accumulation dtype FSDP2 already chose.
+
+    ``FSDPParamGroup.post_backward`` builds the reduce-scatter input from two
+    sources: ``unsharded_accumulated_grad``, which
+    ``FSDPParam.to_accumulated_grad_if_needed`` upcast to ``reduce_dtype`` (e.g.
+    fp32) for parameters that received a gradient during an earlier no-sync
+    micro-batch, and the raw ``unsharded_param.grad`` in ``param_dtype`` (e.g.
+    bf16) for parameters whose gradient appeared only now. ``foreach_reduce``
+    requires one dtype for the whole group, so a group holding both raises
+    ``FSDP reduce-scatter expects uniform gradient dtype``.
+
+    Upcasting the stragglers is value-preserving: it is the same conversion FSDP2
+    would have applied had the gradient existed one micro-batch earlier. Groups
+    with no accumulation in flight are left untouched, so the upstream assertion
+    still catches genuinely inconsistent gradients, such as fp8 weights that fail
+    to produce higher-precision gradients.
+
+    Args:
+        fsdp_params: The ``FSDPParam`` entries of a single ``FSDPParamGroup``.
+            Each carries a per-rank *unsharded* gradient shaped like its
+            unsharded parameter; only the dtype and the slot holding it change,
+            never the gradient values.
+    """
+    accumulating = False
+    pending = []
+    for fsdp_param in fsdp_params:
+        # A unit that never ran forward has no lazily-created unsharded parameter
+        # and therefore no gradient to align.
+        if not hasattr(fsdp_param, "_unsharded_param"):
+            continue
+        if fsdp_param.unsharded_accumulated_grad is not None:
+            accumulating = True
+        else:
+            pending.append(fsdp_param)
+    if not accumulating:
+        return
+    for fsdp_param in pending:
+        # No-op when the gradient is absent or already in ``reduce_dtype``.
+        fsdp_param.to_accumulated_grad_if_needed()
+
+
+def patch_fsdp_uniform_reduce_dtype() -> None:
+    """Keep every FSDP2 reduce-scatter group's gradients in a single dtype.
+
+    Gradient accumulation leaves a group holding ``reduce_dtype`` accumulations
+    for the parameters used so far. Any parameter whose gradient joins later --
+    a locally unused parameter zero-filled by
+    :func:`patch_fsdp_unused_param_reduction`, or one whose gradient lands after
+    its group's post-backward already ran -- contributes ``param_dtype`` instead,
+    and ``foreach_reduce`` rejects the mixed group. Align the group before every
+    reduction, including the reductions
+    ``nemo_automodel.components.moe.fsdp_mixin`` drives by hand under pipeline
+    parallelism, where the autograd-hook path never runs.
+
+    The patch is process-global and idempotent. Install it *before*
+    :func:`patch_fsdp_unused_param_reduction` so the zero fill runs first and its
+    zeros are aligned too.
+    """
+    try:
+        from torch.distributed.fsdp._fully_shard._fsdp_param_group import FSDPParamGroup
+    except ImportError:
+        return
+
+    if getattr(FSDPParamGroup, "_automodel_uniform_reduce_dtype", False):
+        return
+    original_post_backward = FSDPParamGroup.post_backward
+
+    def _post_backward_with_uniform_reduce_dtype(self, *args, **kwargs):
+        if self.reduce_grads:
+            _align_accumulated_grad_dtype(self.fsdp_params)
+        return original_post_backward(self, *args, **kwargs)
+
+    FSDPParamGroup.post_backward = _post_backward_with_uniform_reduce_dtype
+    FSDPParamGroup._automodel_uniform_reduce_dtype = True
 
 
 def patch_fsdp_unused_param_reduction() -> None:
@@ -64,6 +143,11 @@ def patch_fsdp_unused_param_reduction() -> None:
                     continue
                 param = fsdp_param.unsharded_param
                 if param.requires_grad and param.grad is None:
+                    # ``zeros_like`` on the *unsharded* parameter is the dtype
+                    # autograd would have produced under any precision policy
+                    # (bf16 compute over fp32 storage, an fp32-pinned unit, or no
+                    # casting at all). ``_align_accumulated_grad_dtype`` then
+                    # promotes it to ``reduce_dtype`` if the group is accumulating.
                     param.grad = torch.zeros_like(param, memory_format=torch.preserve_format)
         return original_post_backward(self, *args, **kwargs)
 

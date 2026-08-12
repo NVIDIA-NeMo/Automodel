@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from functools import partial
 from types import SimpleNamespace
 from typing import List, Tuple
 from unittest.mock import Mock
@@ -31,7 +32,10 @@ from nemo_automodel.components.distributed.parallelizer_utils import (
     fully_shard_by_dtype,
     iter_maximal_uniform_dtype_subtrees,
 )
-from nemo_automodel.shared.torch_patches import patch_fsdp_unused_param_reduction
+from nemo_automodel.shared.torch_patches import (
+    patch_fsdp_uniform_reduce_dtype,
+    patch_fsdp_unused_param_reduction,
+)
 
 
 def test_configure_fsdp_unused_param_reduction_uses_public_fsdp_api(monkeypatch):
@@ -101,6 +105,134 @@ def test_legacy_fsdp_unused_param_reduction_fills_missing_local_grad(monkeypatch
     assert torch.equal(param.grad, torch.zeros_like(param))
     assert calls == [(param_group, ("arg",), {"flag": True})]
     assert FSDPParamGroup.post_backward is patched_post_backward
+
+
+def _fsdp_param_stub(param: torch.nn.Parameter, *, reduce_dtype, accumulated=None):
+    """Build an ``FSDPParam`` stand-in wired to torch's real accumulation helper.
+
+    Args:
+        param: Stand-in for the unsharded parameter. Its ``.grad``, when set, is
+            the per-rank unsharded gradient in ``param_dtype``.
+        reduce_dtype: The group's reduce dtype, or ``None`` when no upcast applies.
+        accumulated: Optional gradient already upcast to ``reduce_dtype``, shaped
+            like ``param``.
+
+    Returns:
+        A namespace exposing the ``FSDPParam`` attributes the patch touches.
+    """
+    from torch.distributed.fsdp._fully_shard._fsdp_param import FSDPParam
+
+    stub = SimpleNamespace(
+        _unsharded_param=param,
+        unsharded_param=param,
+        unsharded_accumulated_grad=accumulated,
+        reduce_dtype=reduce_dtype,
+    )
+    stub.to_accumulated_grad_if_needed = partial(FSDPParam.to_accumulated_grad_if_needed, stub)
+    return stub
+
+
+def _install_uniform_reduce_dtype(monkeypatch, original_post_backward):
+    from torch.distributed.fsdp._fully_shard._fsdp_param_group import FSDPParamGroup
+
+    monkeypatch.setattr(FSDPParamGroup, "post_backward", original_post_backward)
+    monkeypatch.setattr(FSDPParamGroup, "_automodel_uniform_reduce_dtype", False, raising=False)
+    patch_fsdp_uniform_reduce_dtype()
+    return FSDPParamGroup
+
+
+def test_uniform_reduce_dtype_upcasts_gradient_that_joined_late(monkeypatch):
+    """A late bf16 gradient joins the group's fp32 accumulation instead of splitting it."""
+    calls = []
+
+    def original_post_backward(self, *args, **kwargs):
+        calls.append(self)
+
+    param_group_cls = _install_uniform_reduce_dtype(monkeypatch, original_post_backward)
+
+    accumulated_early = torch.full((2,), 3.0, dtype=torch.float32)
+    early = _fsdp_param_stub(
+        torch.nn.Parameter(torch.ones(2, dtype=torch.bfloat16)),
+        reduce_dtype=torch.float32,
+        accumulated=accumulated_early,
+    )
+    late_param = torch.nn.Parameter(torch.ones(2, dtype=torch.bfloat16))
+    late_param.grad = torch.full((2,), 5.0, dtype=torch.bfloat16)
+    late = _fsdp_param_stub(late_param, reduce_dtype=torch.float32)
+    param_group = SimpleNamespace(reduce_grads=True, fsdp_params=[early, late, SimpleNamespace()])
+
+    param_group_cls.post_backward(param_group)
+
+    assert calls == [param_group]
+    # The straggler moved into the same slot and dtype the group is reducing in.
+    assert late.unsharded_accumulated_grad.dtype == torch.float32
+    assert torch.equal(late.unsharded_accumulated_grad, torch.full((2,), 5.0))
+    assert late_param.grad is None
+    # The already-accumulated peer is untouched.
+    assert early.unsharded_accumulated_grad is accumulated_early
+
+
+def test_uniform_reduce_dtype_leaves_group_without_accumulation_alone(monkeypatch):
+    """Without an accumulation in flight the upstream uniform-dtype check still applies."""
+    param_group_cls = _install_uniform_reduce_dtype(monkeypatch, lambda self, *args, **kwargs: None)
+
+    param = torch.nn.Parameter(torch.ones(2, dtype=torch.bfloat16))
+    param.grad = torch.full((2,), 5.0, dtype=torch.bfloat16)
+    fsdp_param = _fsdp_param_stub(param, reduce_dtype=torch.float32)
+    param_group = SimpleNamespace(reduce_grads=True, fsdp_params=[fsdp_param])
+
+    param_group_cls.post_backward(param_group)
+
+    assert fsdp_param.unsharded_accumulated_grad is None
+    assert param.grad.dtype == torch.bfloat16
+
+
+def test_uniform_reduce_dtype_skips_alignment_when_not_reducing(monkeypatch):
+    """No-sync micro-batches keep FSDP2's own accumulation path unchanged."""
+    param_group_cls = _install_uniform_reduce_dtype(monkeypatch, lambda self, *args, **kwargs: None)
+
+    param = torch.nn.Parameter(torch.ones(2, dtype=torch.bfloat16))
+    param.grad = torch.full((2,), 5.0, dtype=torch.bfloat16)
+    late = _fsdp_param_stub(param, reduce_dtype=torch.float32)
+    early = _fsdp_param_stub(
+        torch.nn.Parameter(torch.ones(2, dtype=torch.bfloat16)),
+        reduce_dtype=torch.float32,
+        accumulated=torch.zeros(2, dtype=torch.float32),
+    )
+    param_group = SimpleNamespace(reduce_grads=False, fsdp_params=[early, late])
+
+    param_group_cls.post_backward(param_group)
+
+    assert late.unsharded_accumulated_grad is None
+    assert param.grad.dtype == torch.bfloat16
+
+
+def test_uniform_reduce_dtype_patch_is_idempotent_under_later_wrapping(monkeypatch):
+    """Re-installing after the unused-param patch must not wrap post_backward twice."""
+    param_group_cls = _install_uniform_reduce_dtype(monkeypatch, lambda self, *args, **kwargs: None)
+    monkeypatch.setattr(param_group_cls.post_backward, "_automodel_reduce_scatter_unused_params", False, raising=False)
+    patch_fsdp_unused_param_reduction()
+    after_unused_param_patch = param_group_cls.post_backward
+
+    patch_fsdp_uniform_reduce_dtype()
+
+    assert param_group_cls.post_backward is after_unused_param_patch
+
+
+def test_configure_fsdp_unused_param_reduction_installs_dtype_alignment_first(monkeypatch):
+    """The zero fill must wrap the alignment so filled zeros are aligned too."""
+    from nemo_automodel.components.distributed import parallelizer_utils
+
+    class LegacyFSDPModule(nn.Module):
+        pass
+
+    order = []
+    monkeypatch.setattr(parallelizer_utils, "FSDPModule", LegacyFSDPModule)
+    monkeypatch.setattr(parallelizer_utils, "_patch_fsdp_uniform_reduce_dtype", lambda: order.append("uniform_dtype"))
+    monkeypatch.setattr(parallelizer_utils, "_patch_fsdp_unused_param_reduction", lambda: order.append("zero_fill"))
+
+    assert configure_fsdp_unused_param_reduction(nn.Sequential(LegacyFSDPModule())) == 1
+    assert order == ["uniform_dtype", "zero_fill"]
 
 
 def _tag_hf_compute_dtype(model: nn.Module) -> None:
