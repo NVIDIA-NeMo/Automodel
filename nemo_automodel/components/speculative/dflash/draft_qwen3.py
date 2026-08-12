@@ -392,8 +392,10 @@ class Qwen3DFlashDraftModel(Qwen3PreTrainedModel):
             ):
                 break
 
-        output_ids = output_ids[:, :max_length]
-        output_ids = output_ids[:, output_ids[0] != self.mask_token_id]
+        # ``start`` indexes the last committed token (the bonus token the target sampled
+        # at the end of the previous block), so the generated sequence is exactly
+        # ``[0, start]``; everything past it is still MASK padding.
+        output_ids = output_ids[:, : min(start + 1, max_length)]
         if stop_token_ids is not None:
             stop_ids = torch.tensor(stop_token_ids, device=output_ids.device)
             stop_indices = torch.isin(output_ids[0][num_input_tokens:], stop_ids).nonzero(as_tuple=True)[0]

@@ -71,6 +71,19 @@ class _ConstantGradModule(nn.Module):
         )
 
 
+class _ConstantLossModule(_ConstantGradModule):
+    """Gradient-bearing module with a stable nonzero metric loss."""
+
+    def forward(self, **kwargs):
+        loss = self.w.sum() + 2.0
+        return SimpleNamespace(
+            loss=loss,
+            hidden_loss=loss.detach(),
+            token_loss=torch.zeros((), device=self.w.device),
+            accuracy=torch.tensor(0.5),
+        )
+
+
 class _FakeTargetWrapper:
     def generate_batch(self, input_ids, attention_mask, loss_mask, **packing_kwargs):
         return SimpleNamespace(
@@ -226,6 +239,20 @@ def test_progress_bar_advances_per_optim_step(monkeypatch):
     assert fake.n == recipe.runtime.global_step == 2
     assert fake.closed
     assert set(fake.postfix) == {"loss", "acc", "lr"}
+
+
+def test_logged_loss_averages_over_microbatches(monkeypatch):
+    """Gradient accumulation must not inflate reported loss or components."""
+    logs = []
+    monkeypatch.setattr(TrainEagle1Recipe, "_wandb_log", lambda self, data, step: logs.append((data, step)))
+    recipe = _build_recipe(num_batches=6, grad_accum=3, trainer_module=_ConstantLossModule())
+    recipe.run_train_validation_loop()
+
+    assert [step for _, step in logs] == [1, 2]
+    for data, _ in logs:
+        assert data["train/loss"] == pytest.approx(2.0)
+        assert data["train/hidden_loss"] == pytest.approx(2.0)
+        assert data["train/token_loss"] == pytest.approx(0.0)
 
 
 class _RaisingModule(nn.Module):

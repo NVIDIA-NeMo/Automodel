@@ -18,8 +18,8 @@ When pad_token_id == eos_token_id (e.g. Qwen2.5), a naïve
 ``labels == pad_token_id`` comparison masks **all** EOS tokens, including
 real end-of-sequence markers, causing significant PPL degradation.
 
-These tests load real tokenizers (via ``NeMoAutoTokenizer``, which enforces
-``add_eos_token=True``) from four model families and verify that
+These tests load real tokenizers (via ``NeMoAutoTokenizer`` with
+``add_eos_token=True`` explicitly enabled) from four model families and verify that
 ``_get_right_trailing_pad_mask`` correctly preserves the first (real) EOS in a
 trailing run while masking only the subsequent (padding) positions.
 
@@ -102,7 +102,7 @@ TOKENIZER_MODELS = [
 def tok(request):
     path = Path(request.param)
     assert path.exists(), f"Missing tokenizer data: {path}"
-    return NeMoAutoTokenizer.from_pretrained(request.param, trust_remote_code=True)
+    return NeMoAutoTokenizer.from_pretrained(request.param, trust_remote_code=True, add_eos_token=True)
 
 
 #  Functional tests with real tokenizers (GPT pretrain path)
@@ -297,8 +297,8 @@ _SQUAD_ROWS = {
 class TestSquadCollateEndToEnd:
     """Full SFT pipeline: squad dataset → default_collater → batch verification.
 
-    Uses NeMoAutoTokenizer which enforces add_eos_token=True, matching the
-    real training pipeline.  The SFT path pads labels with -100 and tracks
+    Uses NeMoAutoTokenizer with add_eos_token=True explicitly enabled. The SFT
+    path pads labels with -100 and tracks
     attention_mask independently, so it is inherently safe against the
     pad==eos collision.  These tests confirm that invariant holds end-to-end.
     """
@@ -319,8 +319,6 @@ class TestSquadCollateEndToEnd:
         """Each example must have matching-length keys and -100 masked prompts."""
         ds = squad_module.make_squad_dataset(tok, split="train")
         assert len(ds) == len(_SQUAD_ROWS["id"])
-
-        eos_id = tok.eos_token_id
 
         for i in range(len(ds)):
             ex = ds[i]

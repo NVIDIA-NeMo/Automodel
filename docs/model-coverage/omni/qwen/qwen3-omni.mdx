@@ -1,8 +1,9 @@
 ---
 title: "Qwen3-Omni"
 description: ""
+slug: model-coverage/omni/qwen/qwen3-omni
 ---
-[Qwen3-Omni](https://qwenlm.github.io/blog/qwen3/) is Alibaba Cloud's omnimodal model supporting text, image, audio, and video inputs in a single unified architecture with a MoE language backbone.
+[Qwen3-Omni](https://qwenlm.github.io/blog/qwen3/) is Alibaba Cloud's omnimodal model supporting text, image, audio, and video inputs in a single unified architecture with a MoE language backbone. NeMo AutoModel supports supervised ASR fine-tuning of its audio-capable Thinker stack.
 
 <Info>
 
@@ -34,6 +35,8 @@ description: ""
 | Recipe | Dataset | Description |
 |---|---|---|
 | [qwen3_omni_moe_30b_te_deepep.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3/qwen3_omni_moe_30b_te_deepep.yaml) | MedPix-VQA | SFT — Qwen3-Omni 30B with TE + DeepEP |
+| [ami_sft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/audio_finetune/qwen3_omni_asr/ami_sft.yaml) | AMI | ASR SFT — Qwen3-Omni 30B-A3B |
+| [multi_en_sft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/audio_finetune/qwen3_omni_asr/multi_en_sft.yaml) | Multi-corpus English mixture | ASR SFT — Qwen3-Omni 30B-A3B |
 
 ## Try with NeMo AutoModel
 
@@ -84,7 +87,8 @@ See the [Installation Guide](/get-started/installation) and [Omni Fine-Tuning Gu
 
 ## Fine-Tuning
 
-See the [VLM / Omni Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n).
+See the [VLM / Omni Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n) and
+[Qwen3-Omni ASR Fine-Tuning Guide](/recipes-e2e-examples/qwen3-omni-asr).
 
 ## Hugging Face Model Cards
 

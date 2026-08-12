@@ -24,12 +24,9 @@ Run directly:  python tests/unit_tests/models/inkling/parity_check_inkling.py
 
 import torch
 import torch.nn.functional as F
-from transformers.models.inkling.configuration_inkling import InklingConfig
-from transformers.models.inkling.modeling_inkling import (
-    InklingForConditionalGeneration as HFInklingForConditionalGeneration,
-)
 
 from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.inkling.configuration import InklingConfig
 from nemo_automodel.components.models.inkling.model import InklingForConditionalGeneration
 
 
@@ -73,11 +70,20 @@ def build_tiny_config() -> InklingConfig:
 
 
 def main() -> None:
+    try:
+        from transformers.models.inkling.configuration_inkling import InklingConfig as HFInklingConfig
+        from transformers.models.inkling.modeling_inkling import (
+            InklingForConditionalGeneration as HFInklingForConditionalGeneration,
+        )
+    except ImportError as exc:
+        raise RuntimeError("The development parity script requires Transformers >=5.14 as a reference") from exc
+
     torch.manual_seed(0)
     device, dtype = torch.device("cpu"), torch.float32
     cfg = build_tiny_config()
 
-    hf_model = HFInklingForConditionalGeneration(cfg).to(device=device, dtype=dtype).eval()
+    hf_config = HFInklingConfig.from_dict(cfg.to_dict())
+    hf_model = HFInklingForConditionalGeneration(hf_config).to(device=device, dtype=dtype).eval()
     backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch", experts="torch")
     nemo_model = InklingForConditionalGeneration.from_config(cfg, backend=backend).to(device=device, dtype=dtype).eval()
 

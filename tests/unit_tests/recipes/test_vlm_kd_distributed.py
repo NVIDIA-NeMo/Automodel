@@ -57,8 +57,8 @@ class _Model(nn.Module):
 @pytest.mark.parametrize(
     ("pp_enabled", "expected_aux_scale"),
     [
-        (False, 4.0),
-        (True, 3.0),
+        (False, 1.0),
+        (True, 0.75),
     ],
 )
 def test_vlm_kd_train_step_uses_distributed_step_helpers(monkeypatch, pp_enabled, expected_aux_scale):
@@ -108,6 +108,7 @@ def test_vlm_kd_train_step_uses_distributed_step_helpers(monkeypatch, pp_enabled
     optimizer = _Optimizer()
     recipe.model_parts = [model]
     recipe.pp_enabled = pp_enabled
+    recipe.pp = SimpleNamespace(pp_batch_size=1, pp_microbatch_size=1) if pp_enabled else None
     recipe.device_mesh = None
     recipe.moe_mesh = SimpleNamespace(mesh_dim_names=("ep",))
     recipe.optimizer = [optimizer]

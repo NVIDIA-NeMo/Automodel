@@ -143,3 +143,38 @@ class ModelAdapter(ABC):
         if isinstance(model_pred, tuple):
             return model_pred[0]
         return model_pred
+
+    def compute_loss(self, model_pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """Compute the unreduced flow-matching loss.
+
+        Args:
+            model_pred: Tensor of shape [batch, ...], with arbitrary trailing latent dimensions.
+            target: Tensor of shape [batch, ...] matching ``model_pred``, containing the flow velocity target.
+
+        Returns:
+            Float32 tensor of shape [batch, ...] matching ``model_pred``, containing the per-element loss.
+        """
+        return nn.functional.mse_loss(model_pred.float(), target.float(), reduction="none")
+
+    def auxiliary_losses(self, inputs: Dict[str, Any]) -> Dict[str, torch.Tensor] | None:
+        """
+        Return additional named scalar losses computed from adapter-stashed state.
+
+        Called by ``FlowMatchingPipeline.step()`` after the primary loss is
+        computed. Override for models that train extra prediction streams
+        (e.g. a second modality) alongside the primary latents: stash the
+        needed tensors in the ``inputs`` dict during ``prepare_inputs()`` /
+        ``forward()`` and compute the losses here.
+
+        Args:
+            inputs: The dict returned by ``prepare_inputs()``, after
+                ``forward()`` has run (adapters may stash prediction tensors
+                in it during ``forward()``).
+
+        Returns:
+            Mapping of metric name to scalar loss tensor (each connected to
+            the current autograd graph), or None when the adapter has no
+            extra losses (default). ``step()`` adds the sum to the primary
+            average loss and logs each entry by name.
+        """
+        return None

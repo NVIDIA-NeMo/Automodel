@@ -328,10 +328,11 @@ def _precompute_stage_shapes(
         microbatch_size: Microbatch size used by the pipeline schedule.
         seq_len: Sequence length of the input data.
     """
-    if stages and not hasattr(stages[0], "_configure_outputs_meta"):
-        logger.info(
-            "PipelineStage no longer exposes _configure_outputs_meta; using PyTorch's dynamic stage metadata inference"
-        )
+    if stages and not all(
+        callable(getattr(stage, "_configure_outputs_meta", None)) or getattr(stage, "_user_meta", None) is not None
+        for stage in stages
+    ):
+        logger.info("PipelineStage does not expose a supported static metadata API; using dynamic metadata inference")
         return
 
     hidden_size, vocab_size = _get_hidden_and_vocab_size(model_config)

@@ -219,6 +219,28 @@ def test_from_pretrained_prefers_dtype_over_deprecated_torch_dtype_default(monke
     assert "torch_dtype" not in last_kwargs
 
 
+def test_from_pretrained_defers_omitted_wrapper_options_to_saved_metadata(monkeypatch):
+    last_kwargs = {}
+
+    def fake_build(**kwargs):
+        nonlocal last_kwargs
+        last_kwargs = kwargs
+        return DummyModel()
+
+    _apply_common_mocks(monkeypatch)
+    monkeypatch.setattr(BiEncoderModel, "build", staticmethod(fake_build))
+    monkeypatch.setattr(am, "apply_model_infrastructure", lambda model, **kwargs: model)
+
+    am.NeMoAutoModelBiEncoder.from_pretrained(
+        pretrained_model_name_or_path="some/path",
+        use_liger_kernel=False,
+        use_sdpa_patching=False,
+    )
+
+    assert last_kwargs["pooling"] is None
+    assert last_kwargs["l2_normalize"] is None
+
+
 def _assert_retries_without_liger(monkeypatch, build_model_cls, auto_model_cls):
     """Verify that when liger patching fails, from_pretrained retries without it."""
     calls = {"build": 0, "liger": 0, "sdpa": 0}

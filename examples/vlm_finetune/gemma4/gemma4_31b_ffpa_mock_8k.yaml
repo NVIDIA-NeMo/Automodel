@@ -134,3 +134,10 @@ ci:
   recipe_owner: Butterfingrz
   env_vars:
     MAX_STEPS: 10
+    # Backward needs two large contiguous buffers on an 80 GiB card: the 8.00 GiB fp32
+    # grad of the [1, 8192, 262144] logits (vocab_size 262144 at seqlen 8192), and a
+    # 10.50 GiB FSDP root reduce-scatter. Peak demand is ~66 GiB so they do fit, but the
+    # default allocator strands enough memory in reserved-but-unallocated blocks that one
+    # of the two fails -- CI OOM'd on the 8.00 GiB request with 7.65 GiB free and 10.56 GiB
+    # stranded. Measured on 8xH100-80GB: 10/10 steps at 65.67 GiB peak with this set.
+    PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"

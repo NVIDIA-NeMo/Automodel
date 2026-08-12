@@ -142,3 +142,4 @@ wandb:
 ci:
   recipe_owner: athitten
   nodes: 16
+  time: "01:00:00"

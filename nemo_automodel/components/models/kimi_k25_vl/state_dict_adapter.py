@@ -212,7 +212,12 @@ class KimiK25VLStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
 
         expert_result = self._convert_single_merged_expert_to_hf_split_experts(fqn, tensor, **kwargs)
         if expert_result is not None:
-            result = [("language_model." + k, v) for k, v in expert_result]
+            # The mixin's weight branch resets expert keys to the bare "model." prefix,
+            # so full-fine-tune saves need "language_model." re-applied here. Its LoRA
+            # branch instead PRESERVES the incoming fqn (which already contains
+            # "language_model." and, on PEFT saves, the "base_model.model." outer
+            # prefix), so wrapping those again would corrupt the adapter keys.
+            result = [((k, v) if ".lora_" in k else ("language_model." + k, v)) for k, v in expert_result]
         else:
             result = [(fqn, tensor)]
 
@@ -266,10 +271,18 @@ class KimiK25VLStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
         return result
 
     def _is_quantized_expert_key(self, key: str) -> bool:
-        if "mlp.experts." in key and ".weight" in key:
+        # ``endswith`` rather than ``in``: a substring test also matches keys that
+        # merely contain ".weight", such as the ".weight_packed"/".weight_scale"
+        # triplet this function's callers emit.
+        if "mlp.experts." in key and key.endswith(".weight"):
             if "shared_experts" in key:
                 return False
             if ".layers.0." in key:
+                return False
+            # LoRA adapter tensors sit under the same expert paths but are not part
+            # of the INT4-quantized checkpoint. PEFT expects plain lora_A/lora_B
+            # weights, and quantizing them makes the saved adapter unloadable.
+            if ".lora_" in key:
                 return False
             return True
         return False
@@ -355,9 +368,16 @@ class KimiK25VLStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
         effective_state_dict.update(dequantized)
 
         llm_keys = {}
+        peft_keys = {}
 
         for key, value in effective_state_dict.items():
-            if key.startswith("language_model.model."):
+            if key.startswith("base_model."):
+                # PEFT adapter namespace. These keys are saved with their native-format
+                # path preserved (including the "base_model.model." outer prefix), so no
+                # HF->native renaming applies — only the per-expert expert-LoRA keys need
+                # recombining into the grouped tensors the model actually holds.
+                peft_keys[key] = value
+            elif key.startswith("language_model.model."):
                 llm_key = key.replace("language_model.model.", "model.")
                 llm_keys[llm_key] = value
             elif key.startswith("language_model.lm_head."):
@@ -376,6 +396,9 @@ class KimiK25VLStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
                 native_state_dict["model." + key] = value
             else:
                 native_state_dict[key] = value
+
+        if peft_keys:
+            native_state_dict.update(self._recombine_lora_expert_keys(peft_keys))
 
         if llm_keys:
             # Check if these are individual expert keys that need fusion

@@ -56,6 +56,11 @@ class Qwen3MoeStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
         self.dtype = dtype
         self._uses_model_prefix = True
 
+    @property
+    def _v5_peft_target_parameters(self) -> tuple[str, ...]:
+        """Qwen3 MoE is validated for fused PEFT v5 ParamWrapper export."""
+        return ("mlp.experts.gate_up_proj", "mlp.experts.down_proj")
+
     def to_hf(
         self, state_dict: dict[str, Any], exclude_key_regex: Optional[str] = None, quantization: bool = False, **kwargs
     ) -> dict[str, Any]:
@@ -111,60 +116,6 @@ class Qwen3MoeStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
 
         return result
 
-    def _convert_lora_to_paramwrapper(self, fqn: str, tensor: torch.Tensor) -> list[tuple[str, torch.Tensor]]:
-        """Convert a single grouped MoE LoRA tensor to PEFT ParamWrapper format.
-
-        ParamWrapper format stores fused 3-D expert LoRA parameters as 2-D
-        tensors with the expert dimension folded into the rank dimension.
-
-        Shape mapping (automodel native -> ParamWrapper):
-
-        down_proj (outer wrapper, NO ``base_layer`` prefix — processed first alphabetically):
-          - ``lora_down_B``  (E, r, H) -> ``lora_A.weight``  (r*E, H)  reshape
-          - ``lora_down_A``  (E, I, r) -> ``lora_B.weight``  (I, r*E)  permute+reshape
-
-        gate_up_proj (inner wrapper, HAS ``base_layer.`` prefix):
-          - ``lora_gate_and_up_B``  (E, r, 2*I) -> ``base_layer.lora_A.weight``  (r*E, 2*I)  reshape
-          - ``lora_gate_and_up_A``  (E, H, r)   -> ``base_layer.lora_B.weight``  (H, r*E)    permute+reshape
-
-        Returns:
-            List containing one ``(fqn, tensor)`` tuple in ParamWrapper format.
-        """
-        match = re.search(r"(.*)layers\.(\d+)\.", fqn)
-        if not match:
-            return [(fqn, tensor)]
-
-        prefix = match.group(1)
-        layer_num = match.group(2)
-        expert_segment = self._expert_path_segment
-        suffix = fqn.rsplit(".", 1)[-1]
-
-        # PEFT ParamWrapper nesting: target_parameters are sorted alphabetically
-        # and wrapped in order. The FIRST wrapped becomes the OUTER ParamWrapper.
-        # "down_proj" < "gate_up_proj", so down_proj is outer (no base_layer prefix)
-        # and gate_up_proj is inner (has base_layer prefix).
-        if suffix == "lora_gate_and_up_B":
-            # (E, r, 2*I) -> (r*E, 2*I)
-            out = tensor.reshape(-1, tensor.shape[2]).contiguous()
-            pw_suffix = "base_layer.lora_A.weight"
-        elif suffix == "lora_gate_and_up_A":
-            # (E, H, r) -> permute(1,2,0) -> (H, r, E) -> (H, r*E)
-            out = tensor.permute(1, 2, 0).contiguous().reshape(tensor.shape[1], -1)
-            pw_suffix = "base_layer.lora_B.weight"
-        elif suffix == "lora_down_B":
-            # (E, r, H) -> (r*E, H)
-            out = tensor.reshape(-1, tensor.shape[2]).contiguous()
-            pw_suffix = "lora_A.weight"
-        elif suffix == "lora_down_A":
-            # (E, I, r) -> permute(1,2,0) -> (I, r, E) -> (I, r*E)
-            out = tensor.permute(1, 2, 0).contiguous().reshape(tensor.shape[1], -1)
-            pw_suffix = "lora_B.weight"
-        else:
-            return [(fqn, tensor)]
-
-        out_fqn = f"{prefix}layers.{layer_num}.{expert_segment}.{pw_suffix}"
-        return [(out_fqn, out)]
-
     def from_hf(
         self,
         hf_state_dict: dict[str, Any],
@@ -188,77 +139,3 @@ class Qwen3MoeStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
         hf_state_dict = self._convert_paramwrapper_to_native(hf_state_dict)
 
         return self._from_hf_w_merged_experts(hf_state_dict, device_mesh)
-
-    def _convert_paramwrapper_to_native(self, state_dict: dict[str, Any]) -> dict[str, Any]:
-        """Convert PEFT ParamWrapper LoRA keys to native grouped MoE LoRA format.
-
-        This is the reverse of ``_convert_lora_to_paramwrapper``.  It detects
-        ParamWrapper-format keys and converts them back to the 3-D grouped
-        tensors expected by GroupedExpertsLoRA.
-
-        Reverse transforms (down_proj is outer, gate_up_proj is inner):
-          - ``experts.lora_A.weight``            (r*E, H)   -> (E, r, H)    = lora_down_B
-          - ``experts.lora_B.weight``            (I, r*E)   -> (E, I, r)    = lora_down_A
-          - ``experts.base_layer.lora_A.weight`` (r*E, 2*I) -> (E, r, 2*I)  = lora_gate_and_up_B
-          - ``experts.base_layer.lora_B.weight`` (H, r*E)   -> (E, H, r)    = lora_gate_and_up_A
-        """
-        expert_segment = re.escape(self._expert_path_segment)
-        n_experts = self.moe_config.n_routed_experts
-
-        # Detect ParamWrapper keys
-        pw_pattern = re.compile(
-            rf"(?P<prefix>.*)layers\.(?P<layer>\d+)\.{expert_segment}\."
-            rf"(?P<pw_suffix>(?:base_layer\.)?lora_[AB]\.weight)$"
-        )
-
-        consumed_keys: set[str] = set()
-        new_entries: dict[str, torch.Tensor] = {}
-
-        for key, tensor in state_dict.items():
-            m = pw_pattern.match(key)
-            if m is None:
-                continue
-
-            pw_suffix = m.group("pw_suffix")
-            # Preserve the full prefix from the input key (e.g. "base_model.model.model.")
-            # so downstream prefix stripping (_drop_outer_prefix) works correctly.
-            prefix = m.group("prefix")
-            layer_num = m.group("layer")
-            base_key = f"{prefix}layers.{layer_num}.{self._expert_path_segment}"
-
-            # down_proj is outer (no base_layer), gate_up_proj is inner (base_layer)
-            if pw_suffix == "lora_A.weight":
-                # (r*E, H) -> (E, r, H) = lora_down_B
-                r = tensor.shape[0] // n_experts
-                out = tensor.reshape(n_experts, r, tensor.shape[1]).contiguous()
-                new_entries[f"{base_key}.lora_down_B"] = out
-
-            elif pw_suffix == "lora_B.weight":
-                # (I, r*E) -> reshape (I, r, E) -> permute(2,0,1) -> (E, I, r) = lora_down_A
-                r = tensor.shape[1] // n_experts
-                out = tensor.reshape(tensor.shape[0], r, n_experts).permute(2, 0, 1).contiguous()
-                new_entries[f"{base_key}.lora_down_A"] = out
-
-            elif pw_suffix == "base_layer.lora_A.weight":
-                # (r*E, 2*I) -> (E, r, 2*I) = lora_gate_and_up_B
-                r = tensor.shape[0] // n_experts
-                out = tensor.reshape(n_experts, r, tensor.shape[1]).contiguous()
-                new_entries[f"{base_key}.lora_gate_and_up_B"] = out
-
-            elif pw_suffix == "base_layer.lora_B.weight":
-                # (H, r*E) -> reshape (H, r, E) -> permute(2,0,1) -> (E, H, r) = lora_gate_and_up_A
-                r = tensor.shape[1] // n_experts
-                out = tensor.reshape(tensor.shape[0], r, n_experts).permute(2, 0, 1).contiguous()
-                new_entries[f"{base_key}.lora_gate_and_up_A"] = out
-
-            else:
-                continue
-
-            consumed_keys.add(key)
-
-        if not consumed_keys:
-            return state_dict
-
-        result = {k: v for k, v in state_dict.items() if k not in consumed_keys}
-        result.update(new_entries)
-        return result

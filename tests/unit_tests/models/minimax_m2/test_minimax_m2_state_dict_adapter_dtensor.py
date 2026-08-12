@@ -65,3 +65,13 @@ def test_to_hf_quantization_adds_scale_inv_for_quantized_weights(adapter):
     assert "model.layers.0.self_attn.q_proj.weight_scale_inv" in hf_state_dict
     # q_norm is explicitly excluded from quantization
     assert "model.layers.0.self_attn.q_norm.weight_scale_inv" not in hf_state_dict
+
+
+def test_to_hf_quantization_leaves_lora_weights_unchanged(adapter):
+    lora = torch.randn(8, 64)
+    native_state_dict = {"model.layers.0.mlp.experts.lora_A.weight": lora}
+
+    hf_state_dict = adapter.to_hf(native_state_dict, quantization=True)
+
+    assert set(hf_state_dict) == set(native_state_dict)
+    torch.testing.assert_close(hf_state_dict["model.layers.0.mlp.experts.lora_A.weight"], lora)

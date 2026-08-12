@@ -20,7 +20,7 @@ Several CUDA runtime components initialize lazily on first use:
   each dtype;
 - Triton autotuners benchmark every candidate config on a kernel's first
   launch (flash-linear-attention's gated-delta-rule backward kernels are the
-  heavy case);
+  heavy case, as are Mamba SSD backward kernels);
 - NCCL creates a process group's communicator (and cudaMallocs its scratch
   buffers outside the torch caching-allocator pool) on the group's first
   collective.
@@ -37,6 +37,7 @@ Prewarms are opt-in from the recipe config::
     prewarm:
       cublas_backward: true
       fla_gdn_autotune: true
+      mamba_ssd_autotune: true
       comm_groups: true
 
 All prewarms are best-effort: failures are logged and never abort setup.
@@ -54,6 +55,8 @@ from typing import Any, Protocol, runtime_checkable
 import torch
 from torch.distributed.device_mesh import DeviceMesh
 
+from nemo_automodel.components.training._mamba_ssd_prewarm import _prewarm_mamba_ssd_autotune
+from nemo_automodel.components.training._prewarm_utils import _resolve_cuda_device
 from nemo_automodel.shared.import_utils import safe_import, safe_import_from
 
 logger = logging.getLogger(__name__)
@@ -69,12 +72,15 @@ class PrewarmConfig:
         fla_gdn_autotune: Pre-populate the flash-linear-attention
             gated-delta-net Triton autotune caches for every GDN shape in the
             model.
+        mamba_ssd_autotune: Pre-populate the Mamba SSD Triton autotune caches
+            for every Mamba mixer shape in the model.
         comm_groups: Eagerly create the NCCL communicators that grad-norm
             clipping will use on its first collective.
     """
 
     cublas_backward: bool = False
     fla_gdn_autotune: bool = False
+    mamba_ssd_autotune: bool = False
     comm_groups: bool = False
 
     def apply(
@@ -82,6 +88,7 @@ class PrewarmConfig:
         *,
         model_parts: list[torch.nn.Module],
         device: torch.device | int | str | None,
+        batch_size: int = 1,
         pp_mesh: DeviceMesh | None = None,
     ) -> None:
         """Run the enabled prewarms.
@@ -90,6 +97,8 @@ class PrewarmConfig:
             model_parts: The (already parallelized) model parts.
             device: The device assigned to this rank, or None when no
                 accelerator is available.
+            batch_size: Per-rank training batch size. FLA keys its dense GDN
+                cumulative-sum autotuner on this value.
             pp_mesh: The pipeline-parallel submesh, if pipeline parallelism is
                 enabled (its process group is warmed for the grad-norm
                 all-reduce).
@@ -101,32 +110,19 @@ class PrewarmConfig:
                 logger.exception("cuBLAS backward prewarm failed; continuing without it.")
         if self.fla_gdn_autotune:
             try:
-                _prewarm_fla_gdn_autotune(model_parts, device)
+                _prewarm_fla_gdn_autotune(model_parts, device, batch_size=batch_size)
             except Exception:
                 logger.exception("fla GDN autotune prewarm failed; continuing without it.")
+        if self.mamba_ssd_autotune:
+            try:
+                _prewarm_mamba_ssd_autotune(model_parts, device)
+            except Exception:
+                logger.exception("Mamba SSD autotune prewarm failed; continuing without it.")
         if self.comm_groups:
             try:
                 _prewarm_comm_groups(model_parts, device, pp_mesh=pp_mesh)
             except Exception:
                 logger.exception("Communication-group prewarm failed; continuing without it.")
-
-
-def _resolve_cuda_device(device: torch.device | int | str | None, label: str) -> torch.device | None:
-    """Normalize ``device`` and return it if it is a usable CUDA device, else None."""
-    if device is None:
-        logger.info("Skipping %s prewarm: no device assigned.", label)
-        return None
-    device = torch.device("cuda", device) if isinstance(device, int) else torch.device(device)
-    if not torch.cuda.is_available() or device.type != "cuda":
-        logger.info(
-            "Skipping %s prewarm: device=%s cuda_available=%s",
-            label,
-            device,
-            torch.cuda.is_available(),
-        )
-        return None
-    torch.cuda.set_device(device)
-    return device
 
 
 def _prewarm_cublas_backward(device: torch.device | int | str | None, size: int = 16) -> bool:
@@ -186,9 +182,10 @@ def _collect_gdn_autotune_shapes(
     """Discover the gated-delta-net kernel shapes present in ``model_parts``.
 
     A module counts as a GDN attention module when it structurally matches
-    :class:`_GDNAttention`. The fla autotune caches are keyed on (H, K, V[,
-    BT]) -- never on sequence length or batch -- so one tiny warmup per unique
-    shape covers the real workload.
+    :class:`_GDNAttention`. Most fla autotune caches are keyed on
+    ``(H, K, V[, BT])`` rather than sequence length. Dense cumulative-sum
+    kernels additionally key on batch size; that runtime value is handled by
+    the warmup rather than shape discovery.
 
     Args:
         model_parts: Model parts to scan for GDN modules.
@@ -217,29 +214,35 @@ def _prewarm_fla_gdn_autotune(
     model_parts: list[torch.nn.Module],
     device: torch.device | int | str | None,
     seq_len: int = 64,
+    batch_size: int = 1,
 ) -> bool:
     """Pre-populate fla gated-delta-net autotune caches before large activations exist.
 
     On its first launch each Triton-autotuned kernel benchmarks all candidate
     configs; when that first launch is the step-1 backward at peak memory, the
     benchmark allocations can fail with ``Triton Error [CUDA]: out of
-    memory``. The autotune cache keys are shape-based -- (H, K, V) and the
-    chunk size, never the sequence length -- so launching each kernel once
-    here with tiny tensors caches the winning configs for the real workload.
+    memory``. The autotune cache keys include shape, chunk size, and
+    variable-length mode, but not sequence length. Dense cumulative-sum
+    kernels additionally key on batch size, so the real per-rank batch size
+    is used for that path.
 
-    Two warmups run per unique GDN shape found in ``model_parts``:
+    Three warmup paths run per unique GDN shape found in ``model_parts``:
 
     1. the context-parallel backward kernels (pre-process and state merge),
-       which the end-to-end warmup below cannot reach, and
-    2. a tiny end-to-end fwd+bwd through the public ``chunk_gated_delta_rule``
-       op, which covers every autotuned kernel in its call graph (per-kernel
-       prewarms alone are whack-a-mole: warming one kernel just moves the
-       step-1 autotune OOM to the next cold kernel).
+       which the end-to-end warmups below cannot reach,
+    2. a dense end-to-end fwd+bwd using the real per-rank batch size, and
+    3. a packed end-to-end fwd+bwd with ``cu_seqlens``.
+
+    The end-to-end paths cover every autotuned kernel in the public
+    ``chunk_gated_delta_rule`` call graph. Per-kernel prewarms alone are
+    whack-a-mole: warming one kernel just moves the step-1 autotune OOM to the
+    next cold kernel.
 
     Args:
         model_parts: Model parts to scan for GDN modules.
         device: Target CUDA device (skipped when None or not CUDA).
         seq_len: Warmup sequence length (not part of the autotune key).
+        batch_size: Per-rank dense training batch size.
 
     Returns:
         True if at least the end-to-end prewarm ran, False if skipped.
@@ -260,7 +263,7 @@ def _prewarm_fla_gdn_autotune(
     )
 
     _prewarm_fla_gdn_cp_kernels(shapes, device, seq_len)
-    return _prewarm_fla_gdn_end_to_end(shapes, device, seq_len)
+    return _prewarm_fla_gdn_end_to_end(shapes, device, seq_len, batch_size)
 
 
 # Keyword arguments the launches in _prewarm_fla_gdn_cp_kernels pass to the
@@ -456,9 +459,9 @@ def _prewarm_fla_gdn_cp_kernels(
             # backward the first CP rank skips pre_process_bwd_kernel_merged
             # and hits merge_fwd_bwd_kernel cold; its autotuner then
             # benchmarks its configs at peak backward memory. The autotune
-            # key is (H, K, V) -- num_ranks and rank are not part of it -- so
-            # a tiny launch here caches the winning config for real world
-            # sizes.
+            # key is (H, K, V, BT, USE_EXP2) -- num_ranks and rank are not
+            # part of it -- so a tiny launch here caches the winning config
+            # for real world sizes.
             #
             # CP-mode indexing inside the kernel: the BWD variant reads
             # all-gathered rank-slices rank+1 .. rank+num_ranks and the FWD
@@ -506,18 +509,24 @@ def _prewarm_fla_gdn_end_to_end(
     shapes: dict[tuple[int, int, int, torch.dtype], str],
     device: torch.device,
     seq_len: int,
+    batch_size: int = 1,
 ) -> bool:
-    """Run a tiny fwd+bwd through ``chunk_gated_delta_rule`` per unique shape.
+    """Run dense and packed fwd+bwd warmups through ``chunk_gated_delta_rule``.
 
     This caches the autotune config of every kernel in the op's call graph
-    (chunk fwd, dqkwg backward, dhu pre-process, ...) while the allocator pool
-    is empty. Must run with grad enabled so the backward kernels fire.
+    (chunk fwd, dqkwg backward, dhu pre-process, ...) for both
+    ``IS_VARLEN=False`` and ``IS_VARLEN=True`` while the allocator pool is
+    empty. Must run with grad enabled so the backward kernels fire. The dense
+    path uses the real per-rank batch size because FLA's cumulative-sum
+    autotuner includes it in its cache key; packed GDN always flattens to
+    batch size 1.
 
     Args:
         shapes: Mapping of ``(num_v_heads, head_k_dim, head_v_dim, dtype)`` to
             a module name, as returned by :func:`_collect_gdn_autotune_shapes`.
         device: Target CUDA device.
         seq_len: Warmup sequence length (not part of the autotune key).
+        batch_size: Per-rank batch size for the dense path.
 
     Returns:
         True if the warmup ran for at least one shape.
@@ -528,25 +537,72 @@ def _prewarm_fla_gdn_end_to_end(
         return False
 
     ran = False
-    device_index = device.index if device.index is not None else torch.cuda.current_device()
-    with torch.random.fork_rng(devices=[device_index]):
+    rng_devices = []
+    if device.type == "cuda":
+        device_index = device.index if device.index is not None else torch.cuda.current_device()
+        rng_devices = [device_index]
+    with torch.random.fork_rng(devices=rng_devices), torch.enable_grad():
         for (num_heads, head_k_dim, head_v_dim, dtype), module_name in shapes.items():
-            q = k = v = g = beta = out = None
-            try:
-                q = torch.randn((1, seq_len, num_heads, head_k_dim), device=device, dtype=dtype, requires_grad=True)
-                k = torch.randn((1, seq_len, num_heads, head_k_dim), device=device, dtype=dtype, requires_grad=True)
-                v = torch.randn((1, seq_len, num_heads, head_v_dim), device=device, dtype=dtype, requires_grad=True)
-                g = torch.zeros((1, seq_len, num_heads), device=device, dtype=torch.float32, requires_grad=True)
-                beta = torch.full((1, seq_len, num_heads), 0.5, device=device, dtype=dtype, requires_grad=True)
-                out, _ = chunk_gated_delta_rule(q, k, v, g=g, beta=beta, use_qk_l2norm_in_kernel=True)
-                out.sum().backward()
-                torch.cuda.synchronize(device)
-                ran = True
-            except Exception:
-                logger.exception("fla GDN end-to-end prewarm failed for %s; continuing.", module_name)
-            finally:
-                del q, k, v, g, beta, out
-                torch.cuda.empty_cache()
+            for mode, warmup_batch_size in (("dense", batch_size), ("packed", 1)):
+                q = k = v = g = beta = cu_seqlens = out = None
+                try:
+                    q = torch.randn(
+                        (warmup_batch_size, seq_len, num_heads, head_k_dim),
+                        device=device,
+                        dtype=dtype,
+                        requires_grad=True,
+                    )
+                    k = torch.randn_like(q, requires_grad=True)
+                    v = torch.randn(
+                        (warmup_batch_size, seq_len, num_heads, head_v_dim),
+                        device=device,
+                        dtype=dtype,
+                        requires_grad=True,
+                    )
+                    g = torch.zeros(
+                        (warmup_batch_size, seq_len, num_heads),
+                        device=device,
+                        dtype=torch.float32,
+                        requires_grad=True,
+                    )
+                    beta = torch.full(
+                        (warmup_batch_size, seq_len, num_heads),
+                        0.5,
+                        device=device,
+                        dtype=dtype,
+                        requires_grad=True,
+                    )
+                    if mode == "packed":
+                        cu_seqlens = torch.tensor([0, seq_len], device=device, dtype=torch.long)
+                    logger.info(
+                        "Prewarming fla GDN %s path | module=%s B=%d H=%d K=%d V=%d dtype=%s",
+                        mode,
+                        module_name,
+                        warmup_batch_size,
+                        num_heads,
+                        head_k_dim,
+                        head_v_dim,
+                        dtype,
+                    )
+                    out, _ = chunk_gated_delta_rule(
+                        q,
+                        k,
+                        v,
+                        g=g,
+                        beta=beta,
+                        use_qk_l2norm_in_kernel=True,
+                        cu_seqlens=cu_seqlens,
+                    )
+                    out.sum().backward()
+                    if device.type == "cuda":
+                        torch.cuda.synchronize(device)
+                    ran = True
+                except Exception:
+                    logger.exception("fla GDN %s end-to-end prewarm failed for %s; continuing.", mode, module_name)
+                finally:
+                    del q, k, v, g, beta, cu_seqlens, out
+                    if device.type == "cuda":
+                        torch.cuda.empty_cache()
 
     logger.info("Finished fla GDN autotune prewarm.")
     return ran

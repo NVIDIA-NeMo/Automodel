@@ -1,0 +1,45 @@
+---
+title: "MuseGlimmer"
+description: "Training support for the dense MuseGlimmer vision-language model"
+slug: model-coverage/vision-language-models/muse/muse-glimmer
+---
+
+[Muse-Glimmer-30B](https://huggingface.co/meta-models/Muse-Glimmer-30B) is a dense vision-language model with a 52-layer language backbone, a 50-layer vision tower, and a multimodal projector.
+
+<Info>
+
+| | |
+|---|---|
+| **Task** | Image-Text-to-Text |
+| **Architecture** | `MuseGlimmerForConditionalGeneration` |
+| **Model types** | `muse_glimmer`, `muse_glimmer_text`, `muse_glimmer_vision` |
+| **Parameters** | 30B |
+| **HF ID** | [`meta-models/Muse-Glimmer-30B`](https://huggingface.co/meta-models/Muse-Glimmer-30B) |
+
+</Info>
+
+## Architecture
+
+- Dense grouped-query attention language model with 32 query heads and 2 key-value heads
+- Alternating sliding and full attention across a 52-layer text backbone
+- Vision transformer with window and full attention across 50 layers
+- One-dimensional position IDs for packed Transformer Engine context parallelism
+
+## Example Recipes
+
+| Recipe | Dataset | Description |
+|---|---|---|
+| [muse_glimmer_30b_medpix.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/muse_glimmer/muse_glimmer_30b_medpix.yaml) | MedPix-VQA | Full-parameter VLM SFT |
+| [muse_glimmer_30b_medpix_lora.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/muse_glimmer/muse_glimmer_30b_medpix_lora.yaml) | MedPix-VQA | Single-node LoRA SFT |
+| [muse_glimmer_30b_tulu3_te_tp2_cp4_packed_16k.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/muse_glimmer/muse_glimmer_30b_tulu3_te_tp2_cp4_packed_16k.yaml) | Tulu 3 | Single-node 16K packed text SFT with TP2 and CP4 |
+
+## Try with NeMo AutoModel
+
+The recipes use the Hugging Face checkpoint `meta-models/Muse-Glimmer-30B` by default:
+
+```bash
+uv run automodel --nproc-per-node=8 \
+  examples/vlm_finetune/muse_glimmer/muse_glimmer_30b_medpix.yaml
+```
+
+The implementation supports FSDP2, activation checkpointing, TP1/TP2, context parallelism, Transformer Engine packed THD inputs, pipeline parallelism, and LoRA. Multi-axis mRoPE with packed THD context parallelism is not supported.

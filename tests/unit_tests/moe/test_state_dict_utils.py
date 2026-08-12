@@ -37,6 +37,7 @@ class TestIsDtensor:
 
     def test_dtensor_mock(self):
         from torch.distributed._tensor import DTensor
+
         with patch("nemo_automodel.components.moe.state_dict_utils.DTensor", DTensor):
             mock_tensor = Mock(spec=DTensor)
             mock_tensor.__class__ = DTensor
@@ -77,8 +78,9 @@ class TestGetExpertSliceForRank:
 
         # Mock placement - sharded on dim 0
         from torch.distributed._tensor.placement_types import Shard
+
         mock_placement = Shard(0)
-        mock_dtensor.placements = [Mock(), mock_placement]
+        mock_dtensor.placements = [mock_placement, Mock()]
 
         local_tensor, start_expert, end_expert = get_expert_slice_for_rank(mock_dtensor, 8)
 
@@ -104,6 +106,7 @@ class TestGetExpertSliceForRank:
 
         # Mock placement - replicated
         from torch.distributed._tensor.placement_types import Replicate
+
         mock_placement = Replicate()
         mock_dtensor.placements = [mock_placement]
 
@@ -112,6 +115,30 @@ class TestGetExpertSliceForRank:
         assert torch.equal(local_tensor, mock_local_tensor)
         assert start_expert == 0
         assert end_expert == 8
+
+    @patch("nemo_automodel.components.moe.state_dict_utils.is_dtensor")
+    @patch("nemo_automodel.components.moe.state_dict_utils.get_submesh")
+    def test_ep_free_fsdp_sharded_expert_dimension(self, mock_get_submesh, mock_is_dtensor):
+        from torch.distributed._tensor.placement_types import Shard
+
+        mock_is_dtensor.return_value = True
+
+        mock_dtensor = Mock()
+        mock_local_tensor = torch.randn(2, 16, 32)
+        mock_dtensor.to_local.return_value = mock_local_tensor
+        mock_dtensor.device_mesh.mesh_dim_names = ("dp_shard_cp",)
+        mock_dtensor.placements = (Shard(0),)
+
+        mock_dp_mesh = Mock()
+        mock_dp_mesh.get_local_rank.return_value = 2
+        mock_dp_mesh.size.return_value = 4
+        mock_get_submesh.return_value = mock_dp_mesh
+
+        local_tensor, start_expert, end_expert = get_expert_slice_for_rank(mock_dtensor, 8)
+
+        assert torch.equal(local_tensor, mock_local_tensor)
+        assert start_expert == 4
+        assert end_expert == 6
 
 
 class TestSplitExpertsWeightsDtensorAware:
@@ -179,6 +206,7 @@ class TestValidateDtensorExpertSharding:
         mock_dtensor.shape = [8, 16, 32]
 
         from torch.distributed._tensor.placement_types import Shard
+
         mock_placement = Shard(0)
         mock_dtensor.placements = [mock_placement]
 

@@ -27,6 +27,7 @@ from torch import nn
 from nemo_automodel.components.speculative.dspark.draft_deepseek_v4 import DeepseekV4DSparkModel
 from nemo_automodel.components.speculative.dspark.draft_gemma4 import Gemma4DSparkModel
 from nemo_automodel.components.speculative.dspark.draft_glm_5_2 import Glm5_2DSparkModel
+from nemo_automodel.components.speculative.dspark.draft_kimi_k3 import KimiK3DSparkModel
 from nemo_automodel.components.speculative.dspark.draft_minimax_m3 import MiniMaxM3DSparkModel
 from nemo_automodel.components.speculative.dspark.draft_qwen3 import Qwen3DSparkModel
 
@@ -58,6 +59,8 @@ DSPARK_DRAFT_REGISTRY["DeepseekV4ForCausalLM"] = DraftSpec(draft_cls=DeepseekV4D
 # Q-LoRA + compressed KV latent + interleaved complex RoPE), with the DSA indexer and MoE
 # dropped. Registered separately because its MLA backbone differs from V4's.
 DSPARK_DRAFT_REGISTRY["GlmMoeDsaForCausalLM"] = DraftSpec(draft_cls=Glm5_2DSparkModel)
+DSPARK_DRAFT_REGISTRY["KimiK3ForCausalLM"] = DraftSpec(draft_cls=KimiK3DSparkModel)
+DSPARK_DRAFT_REGISTRY["KimiK3ForConditionalGeneration"] = DraftSpec(draft_cls=KimiK3DSparkModel)
 # Gemma4 targets: the MoE VLM (model_type "gemma4") and the encoder-free unified model
 # (model_type "gemma4_unified") share one dense Gemma4 draft built from the target's
 # text sub-config.

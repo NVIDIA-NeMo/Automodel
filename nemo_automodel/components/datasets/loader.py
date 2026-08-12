@@ -429,9 +429,18 @@ _DATASET_CONFIGS: dict[str, str] = {
     f"{_DATASETS}.llm.retrieval_dataset_inline.make_retrieval_dataset": (
         f"{_DATASETS}.llm.retrieval_dataset_inline.InlineRetrievalDatasetConfig"
     ),
+    f"{_DATASETS}.llm.retrieval_dataset_normalized.make_normalized_retrieval_dataset": (
+        f"{_DATASETS}.llm.retrieval_dataset_normalized.NormalizedRetrievalDatasetConfig"
+    ),
+    f"{_DATASETS}.llm.make_normalized_retrieval_dataset": (
+        f"{_DATASETS}.llm.retrieval_dataset_normalized.NormalizedRetrievalDatasetConfig"
+    ),
     f"{_DATASETS}.vlm.datasets.make_rdr_dataset": f"{_DATASETS}.vlm.datasets.RdrDatasetConfig",
     f"{_DATASETS}.vlm.datasets.make_cord_v2_dataset": f"{_DATASETS}.vlm.datasets.CordV2DatasetConfig",
     f"{_DATASETS}.vlm.datasets.make_medpix_dataset": f"{_DATASETS}.vlm.datasets.MedPixDatasetConfig",
+    f"{_DATASETS}.vlm.datasets.make_shopify_product_catalogue_dataset": (
+        f"{_DATASETS}.vlm.datasets.ShopifyProductCatalogueDatasetConfig"
+    ),
     f"{_DATASETS}.vlm.datasets.make_llava_onevision_dataset": (f"{_DATASETS}.vlm.datasets.LlavaOnevisionDatasetConfig"),
     f"{_DATASETS}.vlm.datasets.make_tulu3_magicoder_text_mix_dataset": (
         f"{_DATASETS}.vlm.datasets.Tulu3MagicoderTextMixDatasetConfig"
@@ -588,6 +597,13 @@ class DataloaderConfig:
     def dataset_builds_on_all_ranks(self) -> bool:
         """Whether dataset construction must bypass rank-zero-first ordering."""
         return isinstance(self.dataset_config, AllRanksDatasetConfig)
+
+    @property
+    def emits_thd(self) -> bool:
+        """Whether this configuration produces THD-formatted batches."""
+        from nemo_automodel.components.datasets.utils import packed_sequence_thd_collater
+
+        return isinstance(self.packing, ThdPackingConfig) or self.collate_fn is packed_sequence_thd_collater
 
     def _build_dataset(
         self,

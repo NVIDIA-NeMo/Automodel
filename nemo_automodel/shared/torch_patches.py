@@ -28,6 +28,82 @@ _logger = logging.getLogger(__name__)
 _TORCH_PATCHES_APPLIED = False
 
 
+def patch_fsdp_unused_param_reduction() -> None:
+    """Backport FSDP2 unused-parameter reduction when the public API is absent.
+
+    The patch is process-global and idempotent. It only fills a missing local
+    gradient with zeros immediately before FSDP2 post-backward reduction, so
+    ranks that skipped a parameter still participate in the same collective as
+    ranks that used it. Callers must first prefer the public
+    ``FSDPModule.set_reduce_scatter_unused_params`` API.
+
+    Raises:
+        RuntimeError: If the installed PyTorch exposes neither the public API
+            nor the compatible private FSDP2 implementation.
+    """
+    try:
+        import torch
+        from torch.distributed.fsdp._fully_shard._fsdp_common import TrainingState
+        from torch.distributed.fsdp._fully_shard._fsdp_param_group import FSDPParamGroup
+    except ImportError as error:
+        raise RuntimeError(
+            "Context parallelism requires FSDP unused-parameter reduction, but this PyTorch "
+            "version provides neither the public API nor the compatible FSDP2 implementation."
+        ) from error
+
+    original_post_backward = FSDPParamGroup.post_backward
+    if getattr(original_post_backward, "_automodel_reduce_scatter_unused_params", False):
+        return
+
+    def _post_backward_with_unused_param_reduction(self, *args, **kwargs):
+        if self.reduce_grads and self._training_state == TrainingState.PRE_BACKWARD:
+            for fsdp_param in self.fsdp_params:
+                if not hasattr(fsdp_param, "_unsharded_param"):
+                    continue
+                if fsdp_param.unsharded_accumulated_grad is not None:
+                    continue
+                param = fsdp_param.unsharded_param
+                if param.requires_grad and param.grad is None:
+                    param.grad = torch.zeros_like(param, memory_format=torch.preserve_format)
+        return original_post_backward(self, *args, **kwargs)
+
+    _post_backward_with_unused_param_reduction._automodel_reduce_scatter_unused_params = True
+    FSDPParamGroup.post_backward = _post_backward_with_unused_param_reduction
+
+
+def patch_fsdp_accumulated_grad_guard() -> None:
+    """Guard FSDP2 post-backward against params that were never unsharded.
+
+    PyTorch FSDP2 creates ``_unsharded_param`` lazily from an FSDP unit's
+    forward pre-hook. If a separately wrapped unit is skipped by the batch
+    (for example a vision tower on text-only data), deferred post-backward can
+    dereference that missing field. Missing lazy state means there is no
+    unsharded grad to upcast, so the exact missing-field case can return early.
+    """
+    try:
+        from torch.distributed.fsdp._fully_shard._fsdp_param import FSDPParam
+    except Exception:
+        return
+
+    orig = FSDPParam.to_accumulated_grad_if_needed
+    if getattr(orig, "_nemo_automodel_guarded", False):
+        return
+
+    def guarded(self):
+        try:
+            return orig(self)
+        except AttributeError as exc:
+            if "_unsharded_param" not in str(exc) or hasattr(self, "_unsharded_param"):
+                raise
+            return None
+
+    setattr(guarded, "_nemo_automodel_guarded", True)
+    # Preserve the previous Gemma4 marker name for callers/tests that only need
+    # idempotency and do not care which entry point installed the patch.
+    setattr(guarded, "_gemma4_guarded", True)
+    FSDPParam.to_accumulated_grad_if_needed = guarded
+
+
 def apply_torch_patches() -> None:
     """
     Apply small, version/packaging-specific torch monkey patches.

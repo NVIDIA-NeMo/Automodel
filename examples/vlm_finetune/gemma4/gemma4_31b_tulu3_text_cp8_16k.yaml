@@ -56,6 +56,9 @@ checkpoint:
 
 distributed:
   strategy: fsdp2
+  multimodal:
+    # Every rank receives text-only batches, so the frozen multimodal modules are skipped uniformly.
+    frozen_sharding: per_layer
   dp_size: none
   tp_size: 1
   cp_size: 8
@@ -105,3 +108,9 @@ wandb:
   entity: <your_wandb_entity>
   name: <your_wandb_name>
   dir: <your_wandb_save_dir>
+
+ci:
+  time: "01:00:00"
+  env_vars:
+    # CP backward fragments the allocator; NCCL then cannot get its connection buffers, leads to OOM.
+    PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"

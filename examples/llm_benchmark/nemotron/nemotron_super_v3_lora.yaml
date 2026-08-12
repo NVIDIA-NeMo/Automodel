@@ -51,6 +51,9 @@ distributed:
   activation_checkpointing: true
   moe:
     reshard_after_forward: true
+    # fake_balanced_gate makes routing deterministic, so recompute it directly instead of
+    # using the selective router cache around Nemotron V3's nested fp32 FSDP holder.
+    ignore_router_for_ac: false
 
 dist_env:
   backend: nccl

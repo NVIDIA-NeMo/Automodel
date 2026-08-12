@@ -42,6 +42,7 @@ GDN_FP32_CHECKPOINT_ARCHITECTURES = frozenset(
         "Qwen3NextForCausalLM",
         "Qwen3_5ForCausalLM",
         "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5MoeForCausalLM",
         "Qwen3_5MoeForConditionalGeneration",
     )
 )

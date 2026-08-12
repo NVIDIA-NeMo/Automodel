@@ -455,6 +455,73 @@ class TestApplyCacheCompatibilityPatchesIntegration:
         assert isinstance(model._nemo_tied_weights_keys, dict)
         assert model._nemo_tied_weights_keys["lm_head.weight"] == "embed_tokens.weight"
 
+    def test_tied_weights_keys_patch_skips_input_dependent_embedding_accessor(self):
+        """The post_init patch falls back to module discovery for nonstandard remote-code accessors."""
+        apply_cache_compatibility_patches()
+        import torch.nn as nn
+        from transformers import PretrainedConfig
+        from transformers.modeling_utils import PreTrainedModel
+
+        class _MockConfig(PretrainedConfig):
+            model_type = "input-dependent-embedding-test"
+
+        class _Model(PreTrainedModel):
+            config_class = _MockConfig
+
+            def __init__(self, config):
+                super().__init__(config)
+                self.embed_tokens = nn.Embedding(100, 16)
+                self.lm_head = nn.Linear(16, 100, bias=False)
+                self._tied_weights_keys = ["lm_head.weight"]
+                self.post_init()
+
+            def get_input_embeddings(self, input_ids):
+                return self.embed_tokens(input_ids)
+
+            def forward(self, input_ids):
+                return self.lm_head(self.get_input_embeddings(input_ids))
+
+        model = _Model(_MockConfig())
+
+        assert model._tied_weights_keys == {"lm_head.weight": "embed_tokens.weight"}
+        assert model._nemo_tied_weights_keys == model._tied_weights_keys
+
+    def test_tied_weights_keys_patch_handles_wrapper_around_input_dependent_accessor(self):
+        """The post_init patch tolerates a standard outer accessor delegating to a nonstandard inner one."""
+        apply_cache_compatibility_patches()
+        import torch.nn as nn
+        from transformers import PretrainedConfig
+        from transformers.modeling_utils import PreTrainedModel
+
+        class _MockConfig(PretrainedConfig):
+            model_type = "wrapped-input-dependent-embedding-test"
+
+        class _InnerModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.embed_tokens = nn.Embedding(100, 16)
+
+            def get_input_embeddings(self, input_ids):
+                return self.embed_tokens(input_ids)
+
+        class _Model(PreTrainedModel):
+            config_class = _MockConfig
+
+            def __init__(self, config):
+                super().__init__(config)
+                self.model = _InnerModel()
+                self.lm_head = nn.Linear(16, 100, bias=False)
+                self._tied_weights_keys = ["lm_head.weight"]
+                self.post_init()
+
+            def get_input_embeddings(self):
+                return self.model.get_input_embeddings()
+
+        model = _Model(_MockConfig())
+
+        assert model._tied_weights_keys == {"lm_head.weight": "model.embed_tokens.weight"}
+        assert model._nemo_tied_weights_keys == model._tied_weights_keys
+
     def test_patches_peft_prepare_inputs(self):
         """PeftModelForCausalLM.__init__ should be patched for missing prepare_inputs_for_generation."""
         apply_cache_compatibility_patches()

@@ -15,6 +15,73 @@
 import torch
 
 
+def thd_padding_mask_from_token_ids(input_ids: torch.Tensor, padding_token_id: int) -> torch.Tensor:
+    """Mark padding by token value, rejecting a pad id that is also content.
+
+    Only for callers with no pack metadata. A value comparison is correct just
+    when the pad id fills a right-padded tail and appears nowhere else, so
+    validate exactly that: a colliding id then fails loudly instead of silently
+    masking content out of the MoE experts. GLM-5.2, for instance, sets
+    ``pad_token_id`` to ``<|endoftext|>``, which is also its first
+    ``eos_token_id``.
+
+    Args:
+        input_ids: Token ids ``[total_tokens]``.
+        padding_token_id: Token id used as filler.
+
+    Returns:
+        Boolean tensor ``[total_tokens]``; True marks padding.
+
+    Raises:
+        ValueError: If ``padding_token_id`` also occurs as content.
+    """
+    padding = input_ids == padding_token_id
+    real = int((~padding).sum().item())
+    if not torch.equal(padding, torch.arange(input_ids.shape[0], device=input_ids.device) >= real):
+        raise ValueError(
+            f"padding_token_id={padding_token_id} also occurs as content, so padding cannot be inferred "
+            "from token values. Supply seq_lens/seq_lens_padded (or an unused padding_token_id)."
+        )
+    return padding
+
+
+def _thd_padding_mask(
+    *,
+    total_tokens: int,
+    valid_seq_lens: torch.Tensor,
+    valid_seq_lens_padded: torch.Tensor | None,
+    device: torch.device,
+) -> torch.Tensor:
+    """Mark padding slots in a packed THD stream from the pack layout.
+
+    Sequence ``i`` occupies ``[start_i, start_i + padded_i)`` and only its first
+    ``real_i`` slots hold tokens, so everything else is padding regardless of
+    which token id fills it. Deriving this by comparing against a pad token id
+    instead misclassifies real tokens whenever that id is also content -- see
+    :func:`thd_padding_mask_from_token_ids` for the metadata-free fallback.
+
+    Args:
+        total_tokens: Length of the packed stream.
+        valid_seq_lens: Real (unpadded) length of each packed sequence.
+        valid_seq_lens_padded: Slot count reserved for each packed sequence, or
+            None when sequences carry no individual padding.
+        device: Device of the packed stream.
+
+    Returns:
+        Boolean tensor ``[total_tokens]``; True marks padding.
+    """
+    reals = valid_seq_lens.to(device=device, dtype=torch.long)
+    slots = reals if valid_seq_lens_padded is None else valid_seq_lens_padded.to(device=device, dtype=torch.long)
+    starts = torch.cat([torch.zeros(1, dtype=torch.long, device=device), torch.cumsum(slots, dim=0)])
+
+    positions = torch.arange(total_tokens, device=device)
+    # Slots past the last sequence are trailing pack pad; clamp so the gather is
+    # in range and mark them below.
+    segment = torch.clamp(torch.searchsorted(starts[1:], positions, right=True), max=reals.numel() - 1)
+    padding = (positions - starts[segment]) >= reals[segment]
+    return padding | (positions >= int(starts[-1].item()))
+
+
 def process_input_for_thd(
     batch: dict[str, torch.Tensor],
     seq_lens_padding_value: int = -1000,
@@ -47,7 +114,9 @@ def process_input_for_thd(
                 seq_lens_padding_value indicate padding and are filtered out.
         seq_lens_padding_value: Value used to indicate padding in seq_lens/seq_lens_padded
             tensors that should be filtered out (default: -1000)
-        padding_token_id: Token ID used for padding in input_ids to generate padding_mask (default: 0)
+        padding_token_id: Filler token id. The padding mask is derived from the pack
+            layout, so this is only consulted by callers that have no pack metadata
+            (see thd_padding_mask_from_token_ids).
 
     Returns:
         Dictionary containing:
@@ -130,6 +199,8 @@ def process_input_for_thd(
     cu_seqlens = None
     cu_seqlens_padded = None
     max_seqlen = None
+    valid_seq_lens = None
+    valid_seq_lens_padded = None
     if seq_lens is not None:
         seq_lens_flat = seq_lens.reshape(-1)
         valid_seq_lens = seq_lens_flat[seq_lens_flat != seq_lens_padding_value]
@@ -176,12 +247,22 @@ def process_input_for_thd(
         if cu_seqlens is not None and cu_seqlens.numel() > 1:
             max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().to(dtype=torch.int32)
 
+    if valid_seq_lens is None:
+        padding_mask = thd_padding_mask_from_token_ids(input_ids_thd, padding_token_id)
+    else:
+        padding_mask = _thd_padding_mask(
+            total_tokens=int(total_tokens),
+            valid_seq_lens=valid_seq_lens,
+            valid_seq_lens_padded=valid_seq_lens_padded,
+            device=input_ids_thd.device,
+        )
+
     result = {
         "input_ids": input_ids_thd,
         "position_ids": position_ids_thd,
         "cu_seqlens": cu_seqlens,
         "labels": labels_thd,
-        "padding_mask": (input_ids_thd == padding_token_id),
+        "padding_mask": padding_mask,
     }
     # Emit cu_seqlens_padded only when it differs from cu_seqlens — its
     # presence is what flips TE's pad_between_seqs=True path in
@@ -231,7 +312,8 @@ def split_batch_into_thd_chunks(
             If num_chunks <= 1, returns the result from process_input_for_thd directly.
         seq_lens_padding_value: Value used to indicate padding in seq_lens/seq_lens_padded
             tensors and for padding cu_seqlens to uniform length (default: -1000)
-        padding_token_id: Token ID used for padding in input_ids to generate padding_mask (default: 0)
+        padding_token_id: Filler token id. Only consulted by the metadata-free
+            fallback when a chunk has no pack metadata.
 
     Returns:
         Dictionary containing:

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 import logging
 from collections import deque
 from collections.abc import Callable
@@ -270,10 +271,35 @@ def apply_cache_compatibility_patches():
         def _find_embedding_source(model):
             """Resolve the weight name of the input embedding layer.
 
-            Prefer get_input_embeddings() (explicit HF contract), fall back
-            to scanning for the first nn.Embedding in the module tree.
+            Try the no-argument get_input_embeddings() HF contract, then scan
+            for the first nn.Embedding in the module tree.
             """
-            embed = model.get_input_embeddings()
+            get_input_embeddings = model.get_input_embeddings
+            call_get_input_embeddings = True
+            try:
+                parameters = inspect.signature(get_input_embeddings).parameters.values()
+            except (TypeError, ValueError):
+                pass
+            else:
+                has_required_argument = any(
+                    parameter.default is inspect.Parameter.empty
+                    and parameter.kind
+                    in (
+                        inspect.Parameter.POSITIONAL_ONLY,
+                        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                        inspect.Parameter.KEYWORD_ONLY,
+                    )
+                    for parameter in parameters
+                )
+                call_get_input_embeddings = not has_required_argument
+            embed = None
+            if call_get_input_embeddings:
+                try:
+                    embed = get_input_embeddings()
+                except TypeError:
+                    # Some remote-code wrappers expose the standard zero-argument
+                    # signature but delegate to an input-dependent inner accessor.
+                    pass
             if embed is not None:
                 for name, module in model.named_modules():
                     if module is embed:
@@ -409,7 +435,7 @@ def _patch_peft_prepare_inputs():
         from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM
 
         if not getattr(Qwen3ForCausalLM.forward, "__nemo_dtensor_logits_to_keep_patched__", False):
-            from transformers.modeling_outputs import CausalLMOutputWithPast  # noqa: WPS433
+            from transformers.modeling_outputs import CausalLMOutputWithPast
 
             _orig_forward = Qwen3ForCausalLM.forward
 

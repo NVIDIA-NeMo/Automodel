@@ -326,7 +326,6 @@ def _saving_recipe(tmp_path):
     recipe.rng = MagicMock()
     recipe._module = lambda: SimpleNamespace(draft_model=nn.Linear(2, 2))
     recipe._save_extra_state = lambda path, epoch: None
-    recipe._update_latest_symlink = lambda path: None
     recipe.cfg = SimpleNamespace()
     return recipe
 

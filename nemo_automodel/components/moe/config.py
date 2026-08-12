@@ -43,6 +43,8 @@ class MoEConfig:
     router_bias: bool = False
     expert_bias: bool = False
     expert_activation: Literal["swiglu", "swigluoai", "quick_geglu", "geglu", "relu2"] = "swiglu"
+    # Preserve models whose low-precision numerics require routing after the down projection.
+    apply_router_weight_after_down: bool = False
     activation_alpha: float = 1.702
     activation_limit: float = 7.0
     # When > 0, ``expert_activation="swiglu"`` dispatches to a clamped FP32
@@ -51,6 +53,8 @@ class MoEConfig:
     # Default 0.0 preserves the existing ``weighted_bias_swiglu_impl`` path.
     swiglu_limit: float = 0.0
     softmax_before_topk: bool = False
+    router_weights_fp32: bool = False
+    router_weight_uses_score_correction_bias: bool = False
     dtype: str | torch.dtype = torch.bfloat16
     shared_expert_gate: bool = False
     shared_expert_inter_dim: int | None = None

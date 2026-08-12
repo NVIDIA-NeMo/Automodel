@@ -220,6 +220,8 @@ def _fusible(module) -> bool:
     lora_B = getattr(module, "lora_B", None)
     if lora_A is None or lora_B is None:
         return False
+    if not getattr(module, "use_memory_efficient_lora", False):
+        return False
     if getattr(module, "use_dora", False):
         return False
     if getattr(module, "dropout_p", 0.0) and module.training:

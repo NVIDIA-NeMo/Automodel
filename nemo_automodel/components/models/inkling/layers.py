@@ -12,15 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Expert-parallel Mixture-of-Experts layer for the Inkling model.
+"""Native feed-forward and short-convolution layers for Inkling.
 
-Only the MoE feed-forward is reimplemented here; every other Inkling submodule
-(attention, short convolutions, relative-position logits, norms, vision/audio
-towers) is reused verbatim from HuggingFace transformers. The routing math and
-shared-expert formulation mirror ``transformers.models.inkling.modeling_inkling``
-exactly, while the routed experts run through NeMo AutoModel's
-:class:`~nemo_automodel.components.moe.experts.GroupedExperts`, which provides
-grouped-GEMM compute and expert-parallel (EP) sharding.
+The equations follow the published Transformers 5.14 Inkling implementation,
+while the routed experts use NeMo AutoModel's grouped-GEMM and expert-parallel
+implementations.
 """
 
 from __future__ import annotations
@@ -31,37 +27,81 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-try:
-    from transformers.models.inkling.modeling_inkling import (
-        apply_mask_to_padding_states,
-        causal_conv1d_fn,
-        causal_conv1d_update,
-    )
-except ImportError as exc:  # transformers < 5.14 does not ship the Inkling model
-    from nemo_automodel.shared.import_utils import UnavailableError
-
-    raise UnavailableError(
-        "The Inkling model requires a transformers build that ships transformers.models.inkling (transformers >= 5.14)."
-    ) from exc
-
 from nemo_automodel.components.models.common.utils import BackendConfig
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.layers import MoE
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
+def _mask_padding_states(hidden_states: torch.Tensor, attention_mask: torch.Tensor | None) -> torch.Tensor:
+    """Zero padded tokens before a short convolution.
+
+    Args:
+        hidden_states: Tensor of shape ``[batch, sequence, hidden]``.
+        attention_mask: Optional boolean tensor of shape ``[batch, sequence]`` where
+            ``True`` marks a valid token.
+
+    Returns:
+        Tensor of shape ``[batch, sequence, hidden]``. The output aliases the input
+        when no masking is required.
+    """
+    if attention_mask is None or attention_mask.shape[1] <= 1 or attention_mask.shape[0] <= 1:
+        return hidden_states
+    return (hidden_states * attention_mask[:, :, None]).to(hidden_states.dtype)
+
+
+def _causal_conv1d_update(
+    hidden_states: torch.Tensor,
+    conv_state: torch.Tensor,
+    weight: torch.Tensor,
+) -> torch.Tensor:
+    """Update cached depthwise-convolution state for one decoding step.
+
+    Args:
+        hidden_states: Tensor of shape ``[batch, hidden, sequence]`` containing new tokens.
+        conv_state: Mutable cache tensor of shape ``[batch, hidden, kernel]``.
+        weight: Depthwise weights of shape ``[hidden, 1, kernel]``.
+
+    Returns:
+        Tensor of shape ``[batch, hidden, sequence]``. ``conv_state`` is updated in place.
+    """
+    sequence = hidden_states.shape[-1]
+    state_length = conv_state.shape[-1]
+    full_states = torch.cat((conv_state, hidden_states), dim=-1).to(weight.dtype)
+    conv_state.copy_(full_states[:, :, -state_length:])
+    output = F.conv1d(full_states, weight, padding=0, groups=weight.shape[0])
+    return output[:, :, -sequence:].to(hidden_states.dtype)
+
+
+def _causal_conv1d(hidden_states: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """Apply a causal depthwise convolution to a full sequence.
+
+    Args:
+        hidden_states: Tensor of shape ``[batch, hidden, sequence]``.
+        weight: Depthwise weights of shape ``[hidden, 1, kernel]``.
+
+    Returns:
+        Tensor of shape ``[batch, hidden, sequence]``.
+    """
+    sequence = hidden_states.shape[-1]
+    output = F.conv1d(
+        hidden_states.to(weight.dtype),
+        weight=weight,
+        padding=weight.shape[-1] - 1,
+        groups=weight.shape[0],
+    )
+    return output[:, :, :sequence].to(hidden_states.dtype)
+
+
 class _InklingShortConvolutionFP32(nn.Module):
     """Run one short convolution inside a dtype-uniform fp32 FSDP unit."""
 
-    def __init__(self, source: nn.Module) -> None:
+    def __init__(self, hidden_size: int, conv_kernel_size: int, layer_idx: int, conv_idx: int) -> None:
         super().__init__()
-        self.layer_idx = source.layer_idx
-        self.conv_idx = source.conv_idx
-        self.conv_kernel_size = source.conv_kernel_size
-        self.weight = nn.Parameter(
-            source.conv1d.weight.detach(),
-            requires_grad=source.conv1d.weight.requires_grad,
-        )
+        self.layer_idx = layer_idx
+        self.conv_idx = conv_idx
+        self.conv_kernel_size = conv_kernel_size
+        self.weight = nn.Parameter(torch.empty(hidden_size, 1, conv_kernel_size, dtype=torch.float32))
 
     def forward(
         self,
@@ -86,17 +126,17 @@ class _InklingShortConvolutionFP32(nn.Module):
             convolution output).
         """
         residual = hidden_states
-        hidden_states = apply_mask_to_padding_states(hidden_states, conv_mask)
+        hidden_states = _mask_padding_states(hidden_states, conv_mask)
         seq_len = hidden_states.shape[1]
         hidden_states = hidden_states.transpose(1, 2)
-        weight = self.weight.squeeze(1)
+        weight = self.weight
 
         use_precomputed_states = past_key_values is not None and past_key_values.has_previous_state(
             self.layer_idx, self.conv_idx
         )
         if use_precomputed_states and seq_len == 1 and not past_key_values.layers[self.layer_idx].record_past:
             conv_state = past_key_values.layers[self.layer_idx].conv_states[self.conv_idx]
-            hidden_states = causal_conv1d_update(hidden_states, conv_state, weight, None)
+            hidden_states = _causal_conv1d_update(hidden_states, conv_state, weight)
         else:
             if past_key_values is not None:
                 hidden_states = past_key_values.update_conv_state(
@@ -105,19 +145,27 @@ class _InklingShortConvolutionFP32(nn.Module):
                     state_idx=self.conv_idx,
                     conv_kernel_size=self.conv_kernel_size,
                 )
-            hidden_states = causal_conv1d_fn(hidden_states, weight, None, seq_idx=kwargs.get("seq_idx"))
-            if use_precomputed_states:
+            hidden_states = _causal_conv1d(hidden_states, weight)
+            # Initial cached prefills shorter than the kernel are left-padded by
+            # the cache, while later multi-token updates prepend cached state.
+            # In both cases return only the tokens from this invocation.
+            if past_key_values is not None:
                 hidden_states = hidden_states[:, :, -seq_len:]
 
         return hidden_states.transpose(1, 2) + residual
 
 
 class InklingShortConvolution(nn.Module):
-    """Keep short-convolution weights in an existing model-owned fp32 holder."""
+    """Keep short-convolution weights in a model-owned fp32 holder."""
 
-    def __init__(self, source: nn.Module) -> None:
+    def __init__(self, hidden_size: int, conv_kernel_size: int, layer_idx: int, conv_idx: int) -> None:
         super().__init__()
-        self._fp32_params = _InklingShortConvolutionFP32(source)
+        self._fp32_params = _InklingShortConvolutionFP32(hidden_size, conv_kernel_size, layer_idx, conv_idx)
+
+    @torch.no_grad()
+    def init_weights(self, init_std: float) -> None:
+        """Initialize the fp32 depthwise-convolution weights."""
+        nn.init.normal_(self._fp32_params.weight, mean=0.0, std=init_std)
 
     def forward(
         self,
@@ -156,7 +204,7 @@ def build_inkling_moe_config(text_config, backend: BackendConfig) -> MoEConfig:
     neutral defaults.
 
     Args:
-        text_config: HuggingFace ``InklingTextConfig``.
+        text_config: Local ``InklingTextConfig``.
         backend: Backend configuration selecting the expert compute/dispatch kernels.
 
     Returns:

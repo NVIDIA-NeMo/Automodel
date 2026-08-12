@@ -302,3 +302,111 @@ def test_forward_confidence_without_markov_features():
         out = _forward(model, _batch())
     assert out.confidence_pred.shape == (BATCH, NUM_ANCHORS, BLOCK_SIZE)
     assert torch.isfinite(out.confidence_pred).all()
+
+
+def _yarn_rope_parameters() -> dict:
+    """A full YaRN spec: what a long-context GLM-5.2 checkpoint ships."""
+    return {
+        "rope_theta": 1000000.0,
+        "rope_type": "yarn",
+        "factor": 4.0,
+        "mscale": 1.0,
+        "beta_fast": 32.0,
+        "beta_slow": 1.0,
+        "original_max_position_embeddings": 64,
+    }
+
+
+def test_softmax_scale_matches_target_without_yarn():
+    """A "default" rope leaves the plain qk_head_dim ** -0.5 scale untouched."""
+    draft_config = build_glm_5_2_draft_config(_tiny_target_config(), _tiny_model_args())
+    model = Glm5_2DSparkModel(draft_config)
+    attn = model.layers[0].self_attn
+    assert attn.scaling == pytest.approx(attn.qk_head_dim**-0.5)
+
+
+def test_softmax_scale_applies_yarn_mscale_like_the_target():
+    """A YaRN-scaled target scales its MLA softmax by mscale**2; the draft must match.
+
+    Without this the draft trains at a different attention temperature than the target
+    whose hidden states supervise it, which only shows up as lost acceptance.
+    """
+    from nemo_automodel.components.models.deepseek_v3.rope_utils import yarn_get_mscale
+
+    target_config = _tiny_target_config()
+    target_config.rope_parameters = _yarn_rope_parameters()
+    draft_config = build_glm_5_2_draft_config(target_config, _tiny_model_args())
+    attn = Glm5_2DSparkModel(draft_config).layers[0].self_attn
+
+    mscale = yarn_get_mscale(4.0, 1.0)
+    assert mscale > 1.0
+    assert attn.scaling == pytest.approx(attn.qk_head_dim**-0.5 * mscale * mscale)
+
+
+def test_softmax_scale_skips_mscale_within_original_context():
+    """mscale only applies once the context is extended past the original window."""
+    target_config = _tiny_target_config()
+    rope_parameters = _yarn_rope_parameters()
+    rope_parameters["original_max_position_embeddings"] = target_config.max_position_embeddings
+    target_config.rope_parameters = rope_parameters
+    draft_config = build_glm_5_2_draft_config(target_config, _tiny_model_args())
+    attn = Glm5_2DSparkModel(draft_config).layers[0].self_attn
+    assert attn.scaling == pytest.approx(attn.qk_head_dim**-0.5)
+
+
+def test_rope_table_honors_rope_scaling():
+    """The frequency table must be the YaRN-corrected one the target builds."""
+    from nemo_automodel.components.models.deepseek_v3.rope_utils import precompute_freqs_cis
+
+    target_config = _tiny_target_config()
+    target_config.rope_parameters = _yarn_rope_parameters()
+    draft_config = build_glm_5_2_draft_config(target_config, _tiny_model_args())
+    model = Glm5_2DSparkModel(draft_config)
+
+    expected = precompute_freqs_cis(
+        qk_rope_head_dim=draft_config.qk_rope_head_dim,
+        max_seq_len=draft_config.max_position_embeddings,
+        rope_theta=1000000.0,
+        rope_scaling=_yarn_rope_parameters(),
+    )
+    unscaled = precompute_freqs_cis(
+        qk_rope_head_dim=draft_config.qk_rope_head_dim,
+        max_seq_len=draft_config.max_position_embeddings,
+        rope_theta=1000000.0,
+        rope_scaling=None,
+    )
+    torch.testing.assert_close(model.freqs, expected.to(torch.float32))
+    assert not torch.allclose(expected, unscaled)
+
+
+def test_rope_theta_comes_from_the_config_not_a_default():
+    target_config = _tiny_target_config()
+    target_config.rope_parameters = {"rope_theta": 1000000.0, "rope_type": "default"}
+    draft_config = build_glm_5_2_draft_config(target_config, _tiny_model_args())
+    model = Glm5_2DSparkModel(draft_config)
+
+    from nemo_automodel.components.models.deepseek_v3.rope_utils import precompute_freqs_cis
+
+    expected = precompute_freqs_cis(
+        qk_rope_head_dim=draft_config.qk_rope_head_dim,
+        max_seq_len=draft_config.max_position_embeddings,
+        rope_theta=1000000.0,
+        rope_scaling=None,
+    )
+    torch.testing.assert_close(model.freqs, expected.to(torch.float32))
+
+
+def test_missing_rope_theta_raises_instead_of_defaulting():
+    """A config with no rope_theta anywhere must fail loudly, not train at theta=10000."""
+    target_config = _tiny_target_config()
+    target_config.rope_parameters = {}
+    draft_config = build_glm_5_2_draft_config(target_config, _tiny_model_args())
+    with pytest.raises(ValueError, match="no rope_theta"):
+        Glm5_2DSparkModel(draft_config)
+
+
+def test_qk_head_dim_follows_the_config_field():
+    """The target reads config.qk_head_dim; the draft must use the same value."""
+    draft_config = build_glm_5_2_draft_config(_tiny_target_config(), _tiny_model_args())
+    attn = Glm5_2DSparkModel(draft_config).layers[0].self_attn
+    assert attn.qk_head_dim == draft_config.qk_head_dim

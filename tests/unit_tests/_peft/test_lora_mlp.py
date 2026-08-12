@@ -126,9 +126,16 @@ def test_install_fuses_relu2_mlp():
     assert (out - unfused).abs().max().item() < 1e-5
 
 
-def _make_lora(in_f, out_f, rank, *, dropout=0.0, use_triton=False):
+def _make_lora(in_f, out_f, rank, *, dropout=0.0, use_memory_efficient_lora=True, use_triton=False):
     base = nn.Linear(in_f, out_f, bias=False)
-    return patch_linear_module(base, dim=rank, alpha=rank, dropout=dropout, use_triton=use_triton)
+    return patch_linear_module(
+        base,
+        dim=rank,
+        alpha=rank,
+        dropout=dropout,
+        use_memory_efficient_lora=use_memory_efficient_lora,
+        use_triton=use_triton,
+    )
 
 
 def test_fused_helper_matches_unfused_linear_lora():
@@ -275,3 +282,25 @@ def test_install_fused_lora_mlp_skips_plain_and_is_idempotent():
     lora = _lora_swiglu_mlp(64, 96, 8)
     assert install_fused_lora_mlp(lora) == 1
     assert install_fused_lora_mlp(lora) == 0  # idempotent
+
+
+def test_apply_lora_respects_memory_efficient_lora_toggle():
+    """The memory-efficient LoRA opt-out must keep the original per-linear MLP forward."""
+    from nemo_automodel.components._peft.lora import PeftConfig, apply_lora_to_linear_modules
+    from nemo_automodel.components._peft.lora_mlp import install_fused_lora_mlp
+    from nemo_automodel.components.moe.layers import MLP
+
+    mlp = MLP(dim=64, inter_dim=96, backend="torch", dtype=torch.float32, activation="swiglu")
+    original_forward = mlp.forward.__func__
+    config = PeftConfig(
+        target_modules=["gate_proj", "up_proj", "down_proj"],
+        dim=8,
+        alpha=8,
+        use_triton=False,
+    )
+    config.use_memory_efficient_lora = False
+    apply_lora_to_linear_modules(mlp, config)
+
+    assert not getattr(mlp, "_lora_mlp_fused", False)
+    assert mlp.forward.__func__ is original_forward
+    assert install_fused_lora_mlp(mlp) == 0

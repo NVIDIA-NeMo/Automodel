@@ -192,6 +192,14 @@ Every model must be added to `MODEL_ARCH_MAPPING` in
 `_transformers/registry.py`. Without this entry the `NeMoAuto*` classes will
 not find the model.
 
+If the checkpoint's `model_type` is not reliably present in the installed
+Transformers `CONFIG_MAPPING`, or Automodel needs a local config class to
+preserve its model contract, also add the `model_type` to
+`_CUSTOM_CONFIG_REGISTRATIONS` in `_transformers/registry.py`. Include a focused
+test that proves `AutoConfig` or `get_hf_config` resolves the local config from a
+checkpoint-style `config.json`, especially when the failure mode is an older
+Transformers package.
+
 ### Combined Projections
 
 Combined projections (fused QKV, fused GateUp) use **interleaved layout** so
