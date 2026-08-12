@@ -450,40 +450,6 @@ def pack_features_for_thd(features: list[dict], *, ignore_index: int = -100) -> 
     }
 
 
-def thd_packing_collater(batch):
-    """Pack the whole batch into one flat THD row at collate time.
-
-    The dynamic alternative to offline ``pack_dataset`` preprocessing: the
-    sampler decides which examples share the batch, and this collater
-    concatenates them into a single ``[1, total_tokens]`` pack via
-    :func:`pack_features_for_thd` + :func:`packed_sequence_thd_collater`, so
-    unpacked datasets (e.g. ``ChatDataset``) get cross-sample sequence packing
-    without a preprocessing pass. Packing density is bounded by the sampler's
-    batch composition.
-
-    Examples must be unpadded; a right-padded example may carry
-    ``attention_mask`` (1 for real tokens), which is used to trim the padding
-    before packing.
-
-    Args:
-        batch: list of example dicts with ``input_ids``, ``labels``, and
-            optionally ``attention_mask``.
-
-    Returns:
-        One ``[1, total_tokens]`` THD batch (``qkv_format="thd"``).
-    """
-    features = []
-    for example in batch:
-        ids = list(example["input_ids"])
-        example_labels = list(example["labels"])
-        if "attention_mask" in example:
-            real_len = int(sum(example["attention_mask"]))
-            ids = ids[:real_len]
-            example_labels = example_labels[:real_len]
-        features.append({"input_ids": ids, "labels": example_labels})
-    return packed_sequence_thd_collater([pack_features_for_thd(features)])
-
-
 def packed_sequence_thd_collater_vlm(examples, processor=None, **kwargs):
     """THD collater adapter for the VLM recipe's ``(examples, processor)`` call convention.
 
