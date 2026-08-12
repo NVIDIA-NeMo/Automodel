@@ -68,7 +68,7 @@ def test_to_features_applies_masking_convention():
 
 def test_to_features_omits_labels_without_targets():
     feats = Datum(input_ids=torch.tensor([1, 2, 3])).to_features()
-    assert feats == {"input_ids": [1, 2, 3]}
+    assert feats == {"input_ids": [1, 2, 3], "attention_mask": [1, 1, 1]}
 
 
 def test_to_features_native_python_ints():
@@ -176,3 +176,13 @@ def test_collate_rejects_inconsistent_loss_input_keys():
 def test_collate_reads_a_length_one_entry_on_a_single_token_sequence_as_per_token():
     datums = [Datum(input_ids=torch.tensor([7]), loss_inputs={"advantages": torch.tensor([0.5])})]
     assert collate_datums(datums)["advantages"].shape == (1, 1)
+
+
+def test_collate_padding_mask_does_not_misread_a_real_pad_valued_token():
+    # A Datum holds only real tokens, so the mask must come from its length, not
+    # from matching the pad id -- id 0 is a real token here (and pad_token_id ==
+    # eos_token_id is a common config).
+    datums = [Datum(input_ids=torch.tensor([5, 0, 7])), Datum(input_ids=torch.tensor([9, 9]))]
+    batch = collate_datums(datums)
+    assert batch["padding_mask"].tolist() == [[False, False, False], [False, False, True]]
+    assert batch["attention_mask"].tolist() == [[1, 1, 1], [1, 1, 0]]

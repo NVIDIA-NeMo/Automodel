@@ -94,6 +94,12 @@ class Datum:
     def to_features(self, *, ignore_index: int = CROSS_ENTROPY_IGNORE_IDX) -> dict[str, list[int]]:
         """Emit the per-example dict the canonical collaters expect.
 
+        Every position of a ``Datum`` is a real token, so ``attention_mask`` is
+        all ones: it tells the padded collater exactly which positions it added,
+        instead of leaving it to infer them from the pad token *value* — which
+        misreads a real token that happens to equal the pad id (commonly
+        ``pad_token_id == eos_token_id``) as padding.
+
         ``labels`` is included only when ``loss_inputs["target_tokens"]`` is
         present, with positions where ``loss_inputs["weights"] == 0`` set to
         ``ignore_index``. Only integer token fields are emitted here — the
@@ -101,9 +107,13 @@ class Datum:
         separately by :func:`collate_datums`.
 
         Returns:
-            ``{"input_ids": [...], "labels": [...]}`` as plain ``list[int]``.
+            ``{"input_ids": [...], "attention_mask": [...], "labels": [...]}``
+            as plain ``list[int]``.
         """
-        features: dict[str, list[int]] = {"input_ids": self.input_ids.tolist()}
+        features: dict[str, list[int]] = {
+            "input_ids": self.input_ids.tolist(),
+            "attention_mask": [1] * self.seq_len,
+        }
         if "target_tokens" in self.loss_inputs:
             labels = self.loss_inputs["target_tokens"].clone()
             weights = self.loss_inputs.get("weights")
