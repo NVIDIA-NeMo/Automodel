@@ -130,6 +130,7 @@ wandb:
   dir: <your_wandb_save_dir>
 
 ci:
+  recipe_owner: athitten
   nodes: 1
   time: "01:00:00"
   env_vars:
