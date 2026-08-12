@@ -901,10 +901,19 @@ def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p
                 # installs its own SDPA hook + mask handling.
                 self_attn.setup_cp_attention(cp_mesh)
             else:
-                logger.warning(
-                    "Skipping CP setup for block with unsupported attention module "
-                    "(neither TE DotProductAttention nor model-owned setup_cp_attention): %s",
-                    type(attn_module).__name__ if attn_module is not None else type(self_attn).__name__,
+                # Skipping is not a safe default: the sequence is already sharded across the CP
+                # ranks by the time we get here, so an attention block left without CP silently
+                # attends only this rank's shard. The loss still descends when most blocks are
+                # set up correctly, which makes the resulting model quietly wrong rather than
+                # visibly broken. Fail instead, and say what to do about it.
+                raise ValueError(
+                    f"Context parallelism is enabled (cp_size={cp_mesh.size()}) but block "
+                    f"{_layer_id} has an attention module that provides no CP implementation: "
+                    f"{type(attn_module).__name__ if attn_module is not None else type(self_attn).__name__}. "
+                    "Its queries would attend only this rank's shard of the sequence, silently "
+                    "producing wrong results. Give the module a setup_cp_attention(cp_mesh) "
+                    "method (model-owned CP, as Gemma4 and MiniMax-M3's sparse layers do), or "
+                    "use Transformer Engine attention, or run with cp_size=1."
                 )
         elif layer_type == "mamba":
             from nemo_automodel.components.distributed.context_parallel.mamba import MambaContextParallel
