@@ -537,7 +537,7 @@ def save_encoder_pretrained(model: nn.Module, save_directory: str, **kwargs) -> 
         )
 
         try:
-            _validate_sentence_transformer_export(model, tokenizer, original_model_path)
+            _validate_sentence_transformer_export(model, tokenizer, original_model_path, export_config)
             deploy_config = model.get_hf_export_config()
         except (TypeError, ValueError) as exc:
             logger.warning(
@@ -583,9 +583,11 @@ def _init_encoder_common(encoder: nn.Module, model: PreTrainedModel) -> None:
     """Shared init for BiEncoderModel and CrossEncoderModel."""
     encoder.model = model
     encoder.config = model.config
+    encoder._sentence_transformer_input_mode = "text"
     if model.__class__.__name__ == "Mistral3BidirectionalModel":
         encoder._export_as_stock_model = True
         model._export_as_stock_model = True
+        encoder._sentence_transformer_input_mode = "structured_multimodal"
         encoder.name_or_path = None
     elif ModelRegistry.has_retrieval_model(model.__class__.__name__):
         encoder.name_or_path = os.path.dirname(inspect.getfile(type(model)))
@@ -614,9 +616,10 @@ class BiEncoderModel(nn.Module):
         _init_encoder_common(self, model)
         self.pooling = pooling
         self.l2_normalize = l2_normalize
+        export_config = SentenceTransformerExportConfig(input_mode=self._sentence_transformer_input_mode)
         self.sentence_transformer_export_config: SentenceTransformerExportConfig | None = None
-        if _supports_standard_sentence_transformer_export(model, pooling):
-            self.sentence_transformer_export_config = SentenceTransformerExportConfig()
+        if _supports_standard_sentence_transformer_export(model, pooling, export_config):
+            self.sentence_transformer_export_config = export_config
         self.do_distributed_inbatch_negative = do_distributed_inbatch_negative
         self.detach_distributed_inbatch_negatives = detach_distributed_inbatch_negatives
         resolved_output_embedding_quantization = output_embedding_quantization

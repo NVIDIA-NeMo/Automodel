@@ -951,6 +951,7 @@ def test_mistral3_vlm_exports_sentence_transformers_checkpoint(tmp_path, monkeyp
         document_prompt="passage: ",
     )
     assert encoder.sentence_transformer_export_config is not None
+    assert encoder.sentence_transformer_export_config.input_mode == "structured_multimodal"
     image = Image.new("RGB", (16, 16), (255, 0, 0))
     training_batch = processor.process_documents(
         {"images": [image], "texts": ["Image doc"]},
