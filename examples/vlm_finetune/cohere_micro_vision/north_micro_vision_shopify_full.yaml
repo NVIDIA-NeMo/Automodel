@@ -118,3 +118,8 @@ peft:
 freeze_config:
   freeze_vision_tower: true
   freeze_language_model: false
+
+ci:
+  recipe_owner: HuiyingLi
+  time: "00:10:00"
+  nodes: 1
