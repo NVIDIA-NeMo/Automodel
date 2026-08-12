@@ -313,7 +313,8 @@ class TestBiEncoderCheckpointRestoration:
             )
             hf_peft_config = PeftConfig(match_all_linear=True, dim=8, alpha=32, use_triton=False)
             apply_lora_to_linear_modules(hf_model, hf_peft_config, quantization_config=None)
-            hf_model.load_state_dict(saved_sd, strict=False, assign=True)
+            hf_full_sd = _load_safetensors_from_dir(save_dir)
+            hf_model.load_state_dict(hf_full_sd, strict=False)
 
             # ---- Step 7: Compare ALL weights (base + LoRA) ----------------
             nemo_sd = nemo_model.model.state_dict()
