@@ -99,7 +99,9 @@ def test_gemma4_draft_forward_shapes():
             )
     assert out.draft_logits.shape == (b, anchors, block, VOCAB)
     assert out.confidence_pred.shape == (b, anchors, block)
-    assert torch.isfinite(out.draft_logits).all()
+    # Tail slots outside the evaluation mask may have every attention key masked.
+    assert out.eval_mask.any()
+    assert torch.isfinite(out.draft_logits[out.eval_mask]).all()
 
 
 def test_gemma4_rope_inv_freq_stays_fp32_after_bf16_cast():
