@@ -846,6 +846,7 @@ def test_mistral3_vlm_saves_as_stock_bidirectional_model_without_remote_code(tmp
     config = _tiny_mistral3_bidirectional_vlm_config()
     backbone = Mistral3BidirectionalModel(config).eval()
     encoder = BiEncoderModel(backbone, pooling="avg", l2_normalize=True)
+    encoder.disable_sentence_transformer_export()
     input_ids = torch.tensor([[1, 2, 3, 4]])
     attention_mask = torch.ones_like(input_ids)
 
@@ -924,6 +925,53 @@ def test_mistral3_vlm_saves_as_stock_bidirectional_model_without_remote_code(tmp
     assert not torch.allclose(actual[0, 0], changed[0, 0], atol=1e-6)
 
 
+def test_mistral3_vlm_portable_export_requires_processor(tmp_path):
+    encoder = BiEncoderModel(
+        Mistral3BidirectionalModel(_tiny_mistral3_bidirectional_vlm_config()).eval(),
+        pooling="avg",
+        l2_normalize=True,
+    )
+
+    with pytest.raises(ValueError, match="requires a processor"):
+        encoder.save_pretrained(tmp_path)
+    assert not any(tmp_path.iterdir())
+    with pytest.raises(ValueError, match="requires a processor"):
+        encoder._get_consolidated_hf_metadata_exporter(tokenizer=None, original_model_path=None)
+
+
+@pytest.mark.parametrize(
+    ("attribute", "value", "message"),
+    [
+        ("tokenizer", None, "processor with a tokenizer"),
+        ("image_processor", None, "processor with an image processor"),
+        ("chat_template", "", "processor with a chat template"),
+    ],
+)
+def test_mistral3_vlm_portable_export_rejects_incomplete_processor(
+    tmp_path,
+    attribute,
+    value,
+    message,
+):
+    encoder = BiEncoderModel(
+        Mistral3BidirectionalModel(_tiny_mistral3_bidirectional_vlm_config()).eval(),
+        pooling="avg",
+        l2_normalize=True,
+    )
+    processor = SimpleNamespace(
+        tokenizer=SimpleNamespace(model_max_length=64),
+        image_processor=object(),
+        chat_template="{{ messages }}",
+        model_max_length=64,
+    )
+    setattr(processor, attribute, value)
+
+    with pytest.raises(ValueError, match=message):
+        encoder.save_pretrained(tmp_path, tokenizer=processor)
+    with pytest.raises(ValueError, match=message):
+        encoder._get_consolidated_hf_metadata_exporter(tokenizer=processor, original_model_path=None)
+
+
 def test_mistral3_vlm_exports_sentence_transformers_checkpoint(tmp_path, monkeypatch):
     from sentence_transformers import SentenceTransformer
 
@@ -988,7 +1036,7 @@ def test_mistral3_vlm_exports_sentence_transformers_checkpoint(tmp_path, monkeyp
         "tokenizer_config.json",
     ):
         assert (tmp_path / asset).is_file(), asset
-    assert not list(tmp_path.glob("*.py"))
+    assert not list(tmp_path.rglob("*.py"))
 
     reloaded_processor = AutoProcessor.from_pretrained(tmp_path, trust_remote_code=False)
     assert type(reloaded_processor) is PixtralProcessor
@@ -1004,6 +1052,15 @@ def test_mistral3_vlm_exports_sentence_transformers_checkpoint(tmp_path, monkeyp
         expected_query = encoder(query_batch)
     actual_query = sentence_transformer.encode_query(["Text query"], convert_to_tensor=True)
     torch.testing.assert_close(actual_query, expected_query)
+
+    text_document_batch = processor.process_documents(
+        {"images": [None], "texts": ["Text doc"]},
+        return_tensors="pt",
+    )
+    with torch.no_grad():
+        expected_text_document = encoder(text_document_batch)
+    actual_text_document = sentence_transformer.encode_document(["Text doc"], convert_to_tensor=True)
+    torch.testing.assert_close(actual_text_document, expected_text_document)
 
     message = [
         {
@@ -1037,7 +1094,7 @@ def test_mistral3_vlm_exports_sentence_transformers_checkpoint(tmp_path, monkeyp
     consolidated_actual = consolidated.encode_document([message], convert_to_tensor=True)
     assert type(consolidated[0].model) is Mistral3Model
     assert type(consolidated[0].processor) is PixtralProcessor
-    assert not list(consolidated_dir.glob("*.py"))
+    assert not list(consolidated_dir.rglob("*.py"))
     torch.testing.assert_close(consolidated_actual, expected)
 
 

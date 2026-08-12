@@ -23,6 +23,7 @@ from typing import Literal
 from huggingface_hub import hf_hub_download, snapshot_download, try_to_load_from_cache
 from huggingface_hub.utils import EntryNotFoundError, LocalEntryNotFoundError
 from torch import nn
+from transformers import PretrainedConfig
 from transformers.utils import logging
 
 _SENTENCE_TRANSFORMER_POOLING_KEYS = {
@@ -299,7 +300,7 @@ def _supports_standard_sentence_transformer_export(
     return (
         pooling in _SENTENCE_TRANSFORMER_POOLING_KEYS
         and getattr(model, "main_input_name", "input_ids") == "input_ids"
-        and config is not None
+        and isinstance(config, PretrainedConfig)
         and isinstance(hidden_size, int)
         and hidden_size > 0
     )

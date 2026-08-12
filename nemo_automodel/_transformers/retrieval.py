@@ -518,6 +518,8 @@ def save_encoder_pretrained(model: nn.Module, save_directory: str, **kwargs) -> 
     export_config = getattr(model, "sentence_transformer_export_config", None)
     tokenizer = kwargs.get("tokenizer", None)
     if export_config is not None and tokenizer is None:
+        if getattr(export_config, "input_mode", "text") == "structured_multimodal":
+            raise ValueError("Structured multimodal Sentence Transformers export requires a processor.")
         logger.warning(
             "Sentence Transformers metadata export is disabled because no tokenizer was provided; "
             "saving the standard encoder checkpoint instead."
@@ -540,6 +542,8 @@ def save_encoder_pretrained(model: nn.Module, save_directory: str, **kwargs) -> 
             _validate_sentence_transformer_export(model, tokenizer, original_model_path, export_config)
             deploy_config = model.get_hf_export_config()
         except (TypeError, ValueError) as exc:
+            if getattr(export_config, "input_mode", "text") == "structured_multimodal":
+                raise
             logger.warning(
                 "Sentence Transformers metadata export is disabled because this checkpoint cannot be "
                 "represented faithfully; saving the standard encoder checkpoint instead: %s",
@@ -733,6 +737,8 @@ class BiEncoderModel(nn.Module):
         if export_config is None:
             return None
         if tokenizer is None:
+            if getattr(export_config, "input_mode", "text") == "structured_multimodal":
+                raise ValueError("Structured multimodal Sentence Transformers export requires a processor.")
             logger.warning(
                 "Sentence Transformers metadata export is disabled because no tokenizer was provided; "
                 "saving the standard Hugging Face checkpoint metadata instead."
@@ -743,6 +749,8 @@ class BiEncoderModel(nn.Module):
             exporter.validate(tokenizer=tokenizer, original_model_path=original_model_path)
             self.get_hf_export_config()
         except (TypeError, ValueError) as exc:
+            if getattr(export_config, "input_mode", "text") == "structured_multimodal":
+                raise
             logger.warning(
                 "Sentence Transformers metadata export is disabled because this checkpoint cannot be "
                 "represented faithfully; saving the standard Hugging Face checkpoint metadata instead: %s",
