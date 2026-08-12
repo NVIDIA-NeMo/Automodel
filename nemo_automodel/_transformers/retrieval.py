@@ -15,6 +15,7 @@
 """Encoder models for bi-encoder and cross-encoder tasks."""
 
 import inspect
+import os
 from collections.abc import Iterable, Sequence
 from typing import Optional
 
@@ -587,7 +588,7 @@ def _init_encoder_common(encoder: nn.Module, model: PreTrainedModel) -> None:
         model._export_as_stock_model = True
         encoder.name_or_path = None
     elif ModelRegistry.has_retrieval_model(model.__class__.__name__):
-        encoder.name_or_path = inspect.getfile(type(model))
+        encoder.name_or_path = os.path.dirname(inspect.getfile(type(model)))
     else:
         encoder.name_or_path = getattr(model.config, "name_or_path", "")
     encoder.state_dict_adapter = EncoderStateDictAdapter()

@@ -788,7 +788,7 @@ def test_configure_encoder_metadata_sets_auto_map_for_ministral_retrieval():
 
 
 def test_init_encoder_common_name_or_path_ministral_retrieval(tmp_path):
-    """Retrieval architectures advertise only the model source file for checkpoint export.
+    """Registered retrieval architectures advertise their source package for checkpoint export.
 
     Must use the real ``Ministral3BidirectionalModel`` class: a class defined in this test
     file would resolve to this test file, not ``.../ministral_bidirectional/model.py``.
@@ -799,12 +799,12 @@ def test_init_encoder_common_name_or_path_ministral_retrieval(tmp_path):
     encoder = nn.Module()
     _init_encoder_common(encoder, backbone)
 
-    assert encoder.name_or_path.endswith("ministral_bidirectional/model.py")
+    assert encoder.name_or_path.endswith("ministral_bidirectional")
 
     _maybe_save_custom_model_code(encoder.name_or_path, str(tmp_path))
 
     assert (tmp_path / "model.py").is_file()
-    assert not (tmp_path / "processor.py").exists()
+    assert (tmp_path / "processor.py").is_file()
 
 
 def _tiny_mistral3_bidirectional_vlm_config() -> Mistral3BidirectionalConfig:
@@ -922,6 +922,122 @@ def test_mistral3_vlm_saves_as_stock_bidirectional_model_without_remote_code(tmp
     with torch.no_grad():
         changed = reloaded(input_ids=changed_ids, attention_mask=attention_mask).last_hidden_state
     assert not torch.allclose(actual[0, 0], changed[0, 0], atol=1e-6)
+
+
+def test_mistral3_vlm_exports_sentence_transformers_checkpoint(tmp_path, monkeypatch):
+    from sentence_transformers import SentenceTransformer
+
+    monkeypatch.setattr(Mistral3BiEncoderProcessor, "check_argument_for_proper_class", lambda *args, **kwargs: None)
+    processor = Mistral3BiEncoderProcessor(
+        image_processor=PixtralImageProcessor(size={"longest_edge": 16}),
+        tokenizer=FakePixtralTokenizer(),
+        patch_size=4,
+        q_max_length=64,
+        p_max_length=64,
+        padding=True,
+        query_prefix="query:",
+        passage_prefix="passage:",
+    )
+    config = _tiny_mistral3_bidirectional_vlm_config()
+    assert hasattr(config, "image_token_id")
+    config.image_token_id = processor.tokenizer.convert_tokens_to_ids("[IMG]")
+    encoder = BiEncoderModel(
+        Mistral3BidirectionalModel(config).eval(),
+        pooling="avg",
+        l2_normalize=True,
+    ).eval()
+    encoder.configure_sentence_transformer_prompts(
+        query_prompt="query: ",
+        document_prompt="passage: ",
+    )
+    assert encoder.sentence_transformer_export_config is not None
+    image = Image.new("RGB", (16, 16), (255, 0, 0))
+    training_batch = processor.process_documents(
+        {"images": [image], "texts": ["Image doc"]},
+        return_tensors="pt",
+    )
+    with torch.no_grad():
+        expected = encoder(training_batch)
+
+    encoder.save_pretrained(tmp_path, tokenizer=processor)
+
+    assert json.loads((tmp_path / "modules.json").read_text()) == [
+        {"idx": 0, "name": "0", "path": "", "type": "sentence_transformers.models.Transformer"},
+        {"idx": 1, "name": "1", "path": "1_Pooling", "type": "sentence_transformers.models.Pooling"},
+        {"idx": 2, "name": "2", "path": "2_Normalize", "type": "sentence_transformers.models.Normalize"},
+    ]
+    sentence_transformer_config = json.loads((tmp_path / "config_sentence_transformers.json").read_text())
+    assert sentence_transformer_config["prompts"] == {
+        "query": "query: ",
+        "document": "passage: ",
+    }
+    transformer_config = json.loads((tmp_path / "sentence_bert_config.json").read_text())
+    assert transformer_config["max_seq_length"] == 64
+    assert transformer_config["do_lower_case"] is False
+    assert transformer_config["module_output_name"] == "token_embeddings"
+    assert set(transformer_config["modality_config"]) == {"text", "message"}
+    assert transformer_config["modality_config"]["message"]["format"] == "structured"
+    pooling_config = json.loads((tmp_path / "1_Pooling" / "config.json").read_text())
+    assert pooling_config["pooling_mode_mean_tokens"] is True
+    assert pooling_config["include_prompt"] is True
+    for asset in (
+        "processor_config.json",
+        "chat_template.jinja",
+        "tokenizer.json",
+        "tokenizer_config.json",
+    ):
+        assert (tmp_path / asset).is_file(), asset
+    assert not list(tmp_path.glob("*.py"))
+
+    reloaded_processor = AutoProcessor.from_pretrained(tmp_path, trust_remote_code=False)
+    assert type(reloaded_processor) is PixtralProcessor
+    sentence_transformer = SentenceTransformer(str(tmp_path), device="cpu", trust_remote_code=False)
+    assert sentence_transformer.prompts == {"query": "query: ", "document": "passage: "}
+    assert [type(module).__name__ for module in sentence_transformer] == ["Transformer", "Pooling", "Normalize"]
+    assert type(sentence_transformer[0].processor) is PixtralProcessor
+    assert sentence_transformer[1].pooling_mode == "mean"
+    assert type(sentence_transformer[0].model) is Mistral3Model
+
+    query_batch = processor.process_queries(["Text query"], return_tensors="pt")
+    with torch.no_grad():
+        expected_query = encoder(query_batch)
+    actual_query = sentence_transformer.encode_query(["Text query"], convert_to_tensor=True)
+    torch.testing.assert_close(actual_query, expected_query)
+
+    message = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": image},
+                {"type": "text", "text": "Image doc"},
+            ],
+        }
+    ]
+    actual = sentence_transformer.encode_document([message], convert_to_tensor=True)
+
+    assert actual.shape == expected.shape == (1, 16)
+    torch.testing.assert_close(torch.linalg.vector_norm(actual, dim=-1), torch.ones(1))
+    torch.testing.assert_close(actual, expected)
+
+    consolidated_dir = tmp_path / "consolidated"
+    encoder.model.save_pretrained(consolidated_dir)
+    ConsolidatedHFAddon().pre_save(
+        model_state=SimpleNamespace(model=[encoder]),
+        hf_metadata_dir=str(consolidated_dir),
+        tokenizer=processor,
+        fqn_to_file_index_mapping={},
+        original_model_path=None,
+    )
+    consolidated = SentenceTransformer(
+        str(consolidated_dir),
+        device="cpu",
+        trust_remote_code=False,
+    )
+    consolidated_actual = consolidated.encode_document([message], convert_to_tensor=True)
+    assert type(consolidated[0].model) is Mistral3Model
+    assert type(consolidated[0].processor) is PixtralProcessor
+    assert not list(consolidated_dir.glob("*.py"))
+    torch.testing.assert_close(consolidated_actual, expected)
 
 
 def test_mistral3_vlm_liger_patch_targets_text_tower():

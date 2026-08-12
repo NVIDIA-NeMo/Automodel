@@ -273,15 +273,38 @@ def _cache_hub_source_legal_assets(model_name_or_path: str, config, hf_kwargs: d
         return None
 
 
+def _is_supported_mistral3_vl_export(model_part: nn.Module, processor=None) -> bool:
+    """Return whether the stock Mistral3 VL Sentence Transformers path is available."""
+    backbone = getattr(model_part, "model", model_part)
+    config = getattr(backbone, "config", None)
+    processor_supported = processor is None or getattr(processor, "image_processor", None) is not None
+    return (
+        type(backbone).__name__ == "Mistral3BidirectionalModel"
+        and bool(getattr(config, "is_composition", False))
+        and processor_supported
+    )
+
+
+def _resolve_effective_text_config(model_part: nn.Module) -> PretrainedConfig | None:
+    """Return the Transformers-defined config for the text tower."""
+    config = getattr(model_part, "config", None)
+    if not isinstance(config, PretrainedConfig):
+        return None
+    text_config = config.get_text_config()
+    return text_config if isinstance(text_config, PretrainedConfig) else None
+
+
 def _supports_standard_sentence_transformer_export(model: nn.Module, pooling: str) -> bool:
     """Return whether a backbone can be represented by the standard text module stack."""
-    config = getattr(model, "config", None)
+    outer_config = getattr(model, "config", None)
+    if bool(getattr(outer_config, "is_composition", False)) and not _is_supported_mistral3_vl_export(model):
+        return False
+    config = _resolve_effective_text_config(model)
     hidden_size = getattr(config, "hidden_size", None)
     return (
         pooling in _SENTENCE_TRANSFORMER_POOLING_KEYS
         and getattr(model, "main_input_name", "input_ids") == "input_ids"
-        and isinstance(config, PretrainedConfig)
-        and not bool(getattr(config, "is_composition", False))
+        and config is not None
         and isinstance(hidden_size, int)
         and hidden_size > 0
     )
@@ -400,7 +423,7 @@ def _resolve_sentence_transformer_max_seq_length(
     """Resolve deployment sequence length without using training-time truncation."""
     source_max_seq_length = _read_source_sentence_transformer_max_seq_length(original_model_path)
     if source_max_seq_length is not None:
-        model_max_seq_length = getattr(getattr(model_part, "config", None), "max_position_embeddings", None)
+        model_max_seq_length = getattr(_resolve_effective_text_config(model_part), "max_position_embeddings", None)
         if model_max_seq_length is not None:
             model_max_seq_length = int(model_max_seq_length)
             if 0 < model_max_seq_length < 1_000_000_000 and source_max_seq_length > model_max_seq_length:
@@ -409,7 +432,7 @@ def _resolve_sentence_transformer_max_seq_length(
 
     candidates = [
         getattr(tokenizer, "model_max_length", None),
-        getattr(getattr(model_part, "config", None), "max_position_embeddings", None),
+        getattr(_resolve_effective_text_config(model_part), "max_position_embeddings", None),
     ]
     finite_candidates = []
     for candidate in candidates:
@@ -433,7 +456,7 @@ def _validate_sentence_transformer_export(
     if pooling not in _SENTENCE_TRANSFORMER_POOLING_KEYS:
         raise ValueError(f"Pooling mode {pooling!r} cannot be represented by standard Sentence Transformers metadata.")
 
-    model_config = getattr(model_part, "config", None)
+    model_config = _resolve_effective_text_config(model_part)
     embedding_dimension = getattr(model_config, "hidden_size", None)
     if not isinstance(embedding_dimension, int) or embedding_dimension <= 0:
         raise ValueError("Bi-encoder config must expose a positive hidden_size for Sentence Transformers export.")
@@ -454,7 +477,7 @@ def _save_generated_sentence_transformer_assets(
     """Generate Sentence Transformers metadata from the effective bi-encoder behavior."""
     _validate_sentence_transformer_export(model_part, tokenizer, original_model_path)
     pooling = getattr(model_part, "pooling", None)
-    model_config = getattr(model_part, "config", None)
+    model_config = _resolve_effective_text_config(model_part)
     embedding_dimension = getattr(model_config, "hidden_size", None)
 
     query_prompt = export_config.query_prompt or ""
@@ -511,13 +534,23 @@ def _save_generated_sentence_transformer_assets(
             "similarity_fn_name": similarity_fn_name,
         },
     )
+    transformer_config = {"max_seq_length": max_seq_length, "do_lower_case": False}
+    if _is_supported_mistral3_vl_export(model_part, tokenizer):
+        forward_output = {"method": "forward", "method_output_name": "last_hidden_state"}
+        transformer_config["modality_config"] = {
+            "text": forward_output,
+            "message": {**forward_output, "format": "structured"},
+        }
+        transformer_config["module_output_name"] = "token_embeddings"
     _write_json(
         os.path.join(hf_metadata_dir, "sentence_bert_config.json"),
-        {"max_seq_length": max_seq_length, "do_lower_case": False},
+        transformer_config,
     )
     _write_json(os.path.join(hf_metadata_dir, "1_Pooling", "config.json"), pooling_config)
-    _restore_source_tokenizer_serialization_state(original_model_path, hf_metadata_dir, tokenizer)
-    _remove_stale_text_processor_assets(hf_metadata_dir)
+    text_tokenizer = getattr(tokenizer, "tokenizer", tokenizer)
+    _restore_source_tokenizer_serialization_state(original_model_path, hf_metadata_dir, text_tokenizer)
+    if not _is_supported_mistral3_vl_export(model_part, tokenizer):
+        _remove_stale_text_processor_assets(hf_metadata_dir)
     _copy_source_legal_assets(
         original_model_path,
         hf_metadata_dir,
