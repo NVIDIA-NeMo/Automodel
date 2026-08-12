@@ -758,8 +758,9 @@ class MoE(nn.Module):
             self.gate = Gate(config, gate_precision=backend.gate_precision)
             self.gate.use_routing_core = "moe_router" in backend.cuda_graph.modules
         if backend.dispatcher == "mok":
-            if get_world_size_safe() == 1:
-                raise ValueError("dispatcher='mok' requires expert parallelism with at least 4 GPUs")
+            world_size = get_world_size_safe()
+            if world_size % 4 != 0:
+                raise ValueError(f"dispatcher='mok' requires world size to be divisible by 4; got {world_size}")
             self.experts = GroupedExpertsMoK(config, backend)
         elif backend.dispatcher in ("deepep", "hybridep", "uccl_ep") and get_world_size_safe() == 1:
             warnings.warn(

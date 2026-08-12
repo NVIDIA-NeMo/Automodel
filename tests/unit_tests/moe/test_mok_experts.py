@@ -141,7 +141,7 @@ def test_mok_passes_swiglu_limit_to_functional_forward_and_backward(
             return ()
 
     monkeypatch.setattr(mok_experts, "_mok_functional", FakeFunctional)
-    runtime = mok_experts._MoKRuntime(BackendConfig(dispatcher="mok"), swiglu_limit=configured_limit)
+    runtime = mok_experts._MoKRuntime(MoKBackendConfig(), swiglu_limit=configured_limit)
     runtime.config = object()
     runtime.ep_group = object()
     x = torch.empty(4, 256, dtype=torch.bfloat16)
@@ -286,6 +286,16 @@ def test_mok_rejects_lora_patching() -> None:
     model.experts = experts
     with pytest.raises(NotImplementedError, match="LoRA is not supported for Mixture-of-Kittens"):
         apply_lora_to_linear_modules(model, PeftConfig(target_modules=["experts"]))
+
+
+@pytest.mark.parametrize("world_size", [1, 2, 3, 5, 6])
+def test_mok_requires_world_size_divisible_by_four(
+    monkeypatch: pytest.MonkeyPatch, world_size: int
+) -> None:
+    monkeypatch.setattr("nemo_automodel.components.moe.layers.get_world_size_safe", lambda: world_size)
+
+    with pytest.raises(ValueError, match=rf"world size to be divisible by 4; got {world_size}"):
+        MoE(_valid_moe_config(), BackendConfig(dispatcher="mok", linear="torch"))
 
 
 def test_mok_dispatches_pre_aligned_extent_directly(monkeypatch: pytest.MonkeyPatch) -> None:

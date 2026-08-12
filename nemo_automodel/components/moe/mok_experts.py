@@ -25,7 +25,7 @@ import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
 
-from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.common import BackendConfig, MoKBackendConfig
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.state_dict_utils import create_dtensor_from_local
 from nemo_automodel.shared.import_utils import safe_import
@@ -130,8 +130,8 @@ def _unflatten_mok_tensor_dataclass(
 class _MoKRuntime:
     """Own one layer's MoK configuration and expert-parallel process group."""
 
-    def __init__(self, backend: BackendConfig, *, swiglu_limit: float) -> None:
-        self.backend = backend
+    def __init__(self, mok_config: MoKBackendConfig, *, swiglu_limit: float) -> None:
+        self.mok_config = mok_config
         self.swiglu_limit = None if swiglu_limit == 0.0 else float(swiglu_limit)
         self.config: object | None = None
         self.ep_group: dist.ProcessGroup | None = None
@@ -156,7 +156,7 @@ class _MoKRuntime:
         # Load the CUDA extension only after torchrun has bound this worker to
         # its local device.  This avoids all workers creating a context on GPU 0.
         _load_mok_functional()
-        self.config = self.backend.mok.build()
+        self.config = self.mok_config.build()
         self.ep_group = ep_mesh.get_group()
 
     def forward(
@@ -445,12 +445,12 @@ class GroupedExpertsMoK(nn.Module):
         self.routed_down_weights = nn.Parameter(
             torch.empty(config.n_routed_experts, config.dim, config.moe_inter_dim, dtype=config.dtype)
         )
-        self.runtime = _MoKRuntime(backend, swiglu_limit=config.swiglu_limit)
+        self.runtime = _MoKRuntime(backend.mok, swiglu_limit=config.swiglu_limit)
         self.ep_mesh: DeviceMesh | None = None
         self.ep_rank = 0
 
     @staticmethod
-    def ._validate_model_mok_config(config: MoEConfig) -> None:
+    def _validate_model_mok_config(config: MoEConfig) -> None:
         """Reject MoE variants outside MoK's current fused-kernel contract."""
         unsupported: list[str] = []
         if config.dtype != torch.bfloat16:
