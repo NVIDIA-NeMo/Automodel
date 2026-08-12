@@ -860,6 +860,95 @@ class WanParallelizationStrategy(ParallelizationStrategy):
         )
 
 
+class WanAnimate2ParallelizationStrategy(DefaultParallelizationStrategy):
+    """Reject unsupported parallelism for Wan-Animate-2, then shard as usual.
+
+    Wan-Animate-2 needs no model-specific sharding: the default strategy already
+    finds its ``blocks`` container, applies per-block activation checkpointing,
+    and leaves the root unresharded after forward, which matters here because
+    each step runs the transformer twice (``forward_ref`` then ``forward_gen``).
+    Only the unsupported axes need rejecting, so callers get an error instead of
+    a silently ineffective plan.
+    """
+
+    def parallelize(self, model: nn.Module, device_mesh: DeviceMesh, **kwargs) -> nn.Module:
+        """Validate the mesh, then delegate to the default strategy.
+
+        Args:
+            model: Upstream ``WanAnimate2Transformer3DModel``. Sharding does not
+                change tensor layouts; blocks consume packed token sequences of
+                shape [batch, tokens, hidden].
+            device_mesh: Device mesh for this run.
+            **kwargs: Keyword arguments accepted by
+                :meth:`DefaultParallelizationStrategy.parallelize`.
+
+        Returns:
+            The same model with FSDP2 DTensor parameters on distributed runs.
+
+        Raises:
+            ValueError: If tensor parallelism is requested. The attention
+                projections are named ``q``/``k``/``v``/``o`` inside a nested
+                ``block`` module, so no tensor-parallel plan resolves against them.
+        """
+        tp_mesh_name = kwargs.get("tp_mesh_name", "tp")
+        if tp_mesh_name in device_mesh.mesh_dim_names and device_mesh[tp_mesh_name].size() > 1:
+            raise ValueError(
+                "Wan-Animate-2 does not support tensor parallelism: its attention projections are named "
+                "q/k/v/o inside a nested block module, so no TP plan applies. Set tp_size=1."
+            )
+
+        # Each block asserts `e.dtype == torch.float32` on the modulation tensor
+        # it receives, which the transformer computes under its own inner
+        # float32 autocast. The shared FSDP2 default sets cast_forward_inputs=True,
+        # which would downcast that tensor to the parameter dtype on the way into
+        # every sharded block and trip the assertion on the first step.
+        mp_policy = kwargs.get("mp_policy")
+        if mp_policy is not None and getattr(mp_policy, "cast_forward_inputs", False):
+            kwargs["mp_policy"] = MixedPrecisionPolicy(
+                param_dtype=mp_policy.param_dtype,
+                reduce_dtype=mp_policy.reduce_dtype,
+                output_dtype=mp_policy.output_dtype,
+                cast_forward_inputs=False,
+            )
+
+        model = super().parallelize(model, device_mesh, **kwargs)
+
+        # Checkpoint whole blocks rather than their sub-modules. This model runs
+        # two streams through every block, so twice the activations are live for
+        # the backward compared with a single-stream video model, and sub-module
+        # checkpointing does not recover enough. Wrapping the block recomputes
+        # both streams together and ends up below the single-stream arrangement
+        # it replaces. Wrapping happens once here, at setup, so the forward can
+        # stay a plain sequence of block calls.
+        requested = kwargs.get("activation_checkpointing", True)
+        if requested:
+            from nemo_automodel.components.distributed.activation_checkpointing import (
+                apply_selective_checkpointing_to_layers,
+                is_selective_activation_checkpointing,
+            )
+
+            inner = getattr(model, "module", model)
+            blocks = getattr(inner, "blocks", None)
+            if blocks is not None:
+                pending = [b for b in blocks if not _is_checkpoint_wrapped(b)]
+                if not pending:
+                    pass
+                elif is_selective_activation_checkpointing(requested):
+                    # Selective checkpointing saves matmul and attention outputs
+                    # instead of recomputing them, so a compiled attention region
+                    # is not replayed on the backward. Full checkpointing of a
+                    # block that encloses one conflicts with CUDA graph recording
+                    # ("an input tensor deallocate during graph recording that
+                    # did not occur during replay").
+                    apply_selective_checkpointing_to_layers(inner, pending, has_kv_sharing=False)
+                else:
+                    for index, block in enumerate(blocks):
+                        if not _is_checkpoint_wrapped(block):
+                            blocks[index] = checkpoint_wrapper(block, checkpoint_impl=CheckpointImpl.NO_REENTRANT)
+
+        return model
+
+
 class HunyuanParallelizationStrategy(ParallelizationStrategy):
     """Parallelization strategy for Hunyuan-style transformer modules used in HunyuanVideo."""
 
@@ -1025,6 +1114,7 @@ PARALLELIZATION_STRATEGIES: Dict[str, ParallelizationStrategy] = {
     "Qwen3_5ForConditionalGeneration": Qwen3_5ParallelizationStrategy(),
     "Qwen3_5ForCausalLM": Qwen3_5ParallelizationStrategy(),
     "WanTransformer3DModel": WanParallelizationStrategy(),
+    "WanAnimate2Transformer3DModel": WanAnimate2ParallelizationStrategy(),
     "HunyuanVideo15Transformer3DModel": HunyuanParallelizationStrategy(),
     "LTX2VideoTransformer3DModel": LTX2ParallelizationStrategy(),
     "QwenImageTransformer2DModel": QwenImageEditParallelizationStrategy(),
