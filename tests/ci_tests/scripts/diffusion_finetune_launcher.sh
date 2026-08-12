@@ -55,7 +55,11 @@ DIFFUSION_EXTRAS="--extra diffusion --extra diffusion-media"
 echo "============================================"
 echo "[data] Resolving dataset..."
 echo "============================================"
-if [ "$MEDIA_TYPE" = "image" ]; then
+if [ "$MEDIA_TYPE" = "image_edit" ]; then
+    # The image-edit preprocess CLI resolves its HF dataset itself (via
+    # HF_HOME), so there is no separate download stage.
+    echo "[data] image-edit dataset is resolved by the preprocess stage"
+elif [ "$MEDIA_TYPE" = "image" ]; then
     RAW_DATA_DIR="$DATA_DIR/raw"
     uv run $DIFFUSION_EXTRAS python -c "
 from datasets import load_dataset
@@ -93,7 +97,13 @@ fi
 echo "============================================"
 echo "[preprocess] Converting ${MEDIA_TYPE}s to latents..."
 echo "============================================"
-if [ "$MEDIA_TYPE" = "image" ]; then
+if [ "$MEDIA_TYPE" = "image_edit" ]; then
+    uv run $DIFFUSION_EXTRAS python -m tools.diffusion.preprocessing_multiprocess image-edit \
+        --output_dir "$DATA_DIR/cache" \
+        --processor "$PROCESSOR" \
+        --model_name "$MODEL_NAME" \
+        $PREPROCESS_EXTRA_ARGS
+elif [ "$MEDIA_TYPE" = "image" ]; then
     uv run $DIFFUSION_EXTRAS python -m tools.diffusion.preprocessing_multiprocess image \
         --image_dir "$RAW_DATA_DIR" \
         --output_dir "$DATA_DIR/cache" \
@@ -130,6 +140,7 @@ CONFIG="--config /opt/Automodel/${CONFIG_PATH} \
     --step_scheduler.max_steps ${MAX_STEPS:-100} \
     --step_scheduler.ckpt_every_steps 100 \
     --step_scheduler.save_checkpoint_every_epoch false \
+    --lr_scheduler.lr_warmup_steps ${LR_WARMUP_STEPS:-10} \
     ${DIST_OVERRIDE} \
     --wandb.mode disabled"
 
@@ -158,15 +169,27 @@ if [ "$IS_LORA" = "true" ]; then
     CKPT_FLAG="--model.lora_weights"
     CKPT_STEP_DIR="$CKPT_STEP_DIR/model"
 else
-    CKPT_FLAG="--model.checkpoint"
+    # Two-transformer pipelines (Wan2.2) reject --model.checkpoint; their recipe
+    # config sets CKPT_FLAG_OVERRIDE to the stage flag matching model.stage and
+    # GENERATE_EXTRA_ARGS to reset the other stage to hub-pretrained weights.
+    CKPT_FLAG="${CKPT_FLAG_OVERRIDE:---model.checkpoint}"
 fi
 
-if [ "$MEDIA_TYPE" = "image" ]; then
+if [ "$MEDIA_TYPE" = "image" ] || [ "$MEDIA_TYPE" = "image_edit" ]; then
+    # Edit pipelines require one source image per prompt; reuse a source image
+    # materialized by the image-edit preprocess stage.
+    INPUT_IMAGES_OVERRIDE=""
+    if [ "$MEDIA_TYPE" = "image_edit" ]; then
+        # -print -quit avoids a SIGPIPE from `find | head` under pipefail.
+        SOURCE_IMAGE=$(find "$DATA_DIR/cache/_hf_dataset" \( -name '*.png' -o -name '*.jpg' \) -print -quit)
+        INPUT_IMAGES_OVERRIDE="--inference.input_images [\"$SOURCE_IMAGE\"]"
+    fi
     uv run $DIFFUSION_EXTRAS python examples/diffusion/generate/generate.py \
         --config "$GENERATE_CONFIG" \
         --model.pretrained_model_name_or_path "$MODEL_NAME" \
         $CKPT_FLAG "$CKPT_STEP_DIR" \
         --inference.num_inference_steps 5 \
+        $INPUT_IMAGES_OVERRIDE \
         --output.output_dir "$INFER_DIR" \
         --vae.enable_slicing true \
         --vae.enable_tiling true
@@ -182,6 +205,7 @@ else
         --config "$GENERATE_CONFIG" \
         --model.pretrained_model_name_or_path "$MODEL_NAME" \
         $CKPT_FLAG "$CKPT_STEP_DIR" \
+        ${GENERATE_EXTRA_ARGS:-} \
         --inference.num_inference_steps 5 \
         --inference.pipeline_kwargs.num_frames "$INFER_NUM_FRAMES" \
         --output.output_dir "$INFER_DIR" \

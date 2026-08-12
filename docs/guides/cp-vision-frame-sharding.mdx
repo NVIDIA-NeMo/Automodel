@@ -6,19 +6,20 @@ description: "Reduce duplicated vision-tower work by distributing image and vide
 ## Overview
 
 Context parallelism (CP) splits a model's language sequence across multiple GPUs. In a
-vision-language model, however, the vision tower normally processes every image and video
+vision-language model (VLM), the vision tower normally processes every image and video
 on every CP rank before the language sequence is split. This repeats the same vision
 computation on each rank.
 
 Context-parallel vision frame sharding does not apply context-parallel attention inside
 the vision tower. Instead, it distributes independent image and video frames over the
-existing CP ranks. Each rank processes only its assigned frames, the resulting visual
+existing CP ranks. Each rank processes only its assigned frames. The resulting visual
 embeddings are gathered in their original order, and ordinary sequence CP then shards
 the assembled multimodal sequence. This reduces duplicated vision-tower computation
 while preserving the model's input ordering and gradients.
 
 Only vision encoders that compute each image or video frame independently can use this
-feature. The built-in integration currently supports the following model families:
+feature. The built-in integration currently supports the following model families, including
+dense and mixture-of-experts (MoE) variants:
 
 | Model | Support |
 |---|---|
@@ -40,11 +41,12 @@ distributed:
         enabled: true
         mesh_dims: [cp]
         min_tokens: 2048
+        min_frames: 32
         cost_alpha: auto
 ```
 
-Vision frame sharding is disabled by default. A CP size greater than 1 and a supported model are
-required for the sharded path.
+Vision frame sharding is disabled by default. You need a CP size greater than 1 and a supported
+model for the sharded path.
 
 The following example recipes are available:
 
@@ -52,7 +54,7 @@ The following example recipes are available:
 - [Dense Qwen3.5 4B with CP2 and vision frame sharding](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5/qwen3_5_4b_cp2_vision_frame_shard.yaml)
 - [Qwen3.5-MoE 122B with EP8, CP32, and 128K packing](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5_moe/qwen3_5_122b_128k_ep8cp32.yaml)
 
-For example, run the Qwen3-VL recipe on eight GPUs:
+For example, run the Qwen3-VL recipe on 8 GPUs:
 
 ```bash
 uv run automodel --nproc-per-node=8 \
@@ -61,12 +63,20 @@ uv run automodel --nproc-per-node=8 \
 
 ### Configuration Fields
 
+The following table describes the vision frame sharding fields:
+
 | Field | Default | Description |
 |---|---|---|
 | `enabled` | `false` | Enables vision frame sharding across the CP group. |
 | `mesh_dims` | `[cp]` | Selects the device-mesh dimensions used to distribute frames. Only `[cp]` is currently supported. |
-| `min_tokens` | `2048` | Uses the replicated path when the batch has fewer visual tokens than this threshold. Set it to `0` to always exercise vision frame sharding. |
-| `cost_alpha` | `auto` | Controls how frame cost is estimated for load balancing. `auto` uses the vision hidden size and is the recommended setting. A nonnegative integer overrides the inferred value; `0` uses a purely quadratic attention-cost estimate. |
+| `min_tokens` | `2048` | Minimum number of merged visual tokens that can activate sharding. Set it to `0` to always satisfy the token threshold. |
+| `min_frames` | `32` | Minimum number of independent image or video-frame units that can activate sharding even below `min_tokens`. Set it to `0` to always satisfy the frame threshold. |
+| `cost_alpha` | `auto` | Controls how frame cost is estimated for load balancing. `auto` uses the vision hidden size and is the recommended setting. A nonnegative integer overrides the inferred value. Setting it to `0` uses a purely quadratic attention-cost estimate. |
+
+Vision frame sharding uses the replicated path only when both the merged visual-token count is below
+`min_tokens` and the image or frame count is below `min_frames`. The frame threshold
+ensures that long videos can use sharding even when reduced per-frame spatial resolution
+keeps their merged-token count low.
 
 ## How It Works
 
@@ -86,7 +96,7 @@ frames contiguous allows the gathered outputs to be concatenated without reorder
 
 The gather operation supports autograd, so a trainable vision tower receives the same
 gradient contributions as the replicated path. Built-in integrations shard across the CP
-dimension only, even when tensor parallelism is also enabled. This avoids over-counting
+dimension only, even when tensor parallelism (TP) is also enabled. This avoids over-counting
 gradients for vision-tower weights that are replicated across TP ranks.
 
 If a batch contains fewer frames than CP ranks, the implementation adds minimal dummy
@@ -97,8 +107,9 @@ embeddings are discarded and contribute no gradient.
 
 The benefit depends on the amount and shape of visual input, the CP size, activation
 checkpointing, and communication between ranks. Small visual workloads can spend more time
-gathering embeddings than they save in vision computation, which is why `min_tokens`
-defaults to `2048`.
+gathering embeddings than they save in vision computation. The default `min_tokens=2048`
+keeps small image workloads replicated, while `min_frames=32` lets long videos select
+sharding when their frame count still represents substantial vision-tower work.
 
 Compare a sharded run with the replicated baseline by disabling the policy from the command
 line:

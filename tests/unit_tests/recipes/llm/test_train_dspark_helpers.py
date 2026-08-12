@@ -1216,6 +1216,131 @@ def test_dspark_load_extra_state_accepts_legacy_meta_without_mask_token_id(tmp_p
     assert obj._resume_epoch == 1
 
 
+# ---------------------------------------------------------------------------
+# _run_eval acceptance diagnostics
+# ---------------------------------------------------------------------------
+
+
+def _eval_metrics_batch(
+    *,
+    loss: float,
+    accept_num: list[float],
+    accept_den: list[float],
+    tau_num: float = 0.0,
+    tau_den: float = 0.0,
+    conf_abs_err: float = 0.0,
+    conf_bias: float = 0.0,
+    conf_cumprod_bias: float = 0.0,
+    conf_den: float = 0.0,
+):
+    """One batch's worth of DSparkStepMetrics, as the trainer module returns it."""
+    return DSparkStepMetrics(
+        loss=torch.tensor(loss),
+        ce_loss=torch.tensor(0.0),
+        l1_loss=torch.tensor(0.0),
+        confidence_loss=torch.tensor(0.0),
+        accept_rate_per_pos_num=torch.tensor(accept_num),
+        accept_rate_per_pos_den=torch.tensor(accept_den),
+        tau_num=torch.tensor(tau_num),
+        tau_den=torch.tensor(tau_den),
+        confidence_abs_error_num=torch.tensor(conf_abs_err),
+        confidence_bias_num=torch.tensor(conf_bias),
+        confidence_cumprod_bias_num=torch.tensor(conf_cumprod_bias),
+        confidence_diag_den=torch.tensor(conf_den),
+    )
+
+
+def _eval_recipe(batches):
+    obj = TrainDSparkRecipe.__new__(TrainDSparkRecipe)
+    obj.val_dataloader = [object()] * len(batches)
+    obj.device = torch.device("cpu")
+    obj.block_size = len(batches[0].accept_rate_per_pos_num)
+    obj.trainer_module = SimpleNamespace(eval=lambda: None, train=lambda: None)
+    obj._dp_allreduce = lambda tensor: tensor
+    remaining = list(batches)
+    obj._forward_batch = lambda batch: remaining.pop(0)
+    return obj
+
+
+def test_run_eval_returns_none_without_val_dataloader():
+    obj = TrainDSparkRecipe.__new__(TrainDSparkRecipe)
+    obj.val_dataloader = None
+
+    assert TrainDSparkRecipe._run_eval(obj) is None
+
+
+def test_run_eval_forms_acceptance_ratio_over_the_whole_split():
+    # Batch-level ratios are 0.75 and 0.0; averaging those would give 0.375,
+    # which over-weights the batch with fewer measured positions. The reported
+    # rate must be the ratio of the summed numerator to the summed denominator.
+    batches = [
+        _eval_metrics_batch(loss=1.0, accept_num=[3.0, 1.0], accept_den=[4.0, 2.0]),
+        _eval_metrics_batch(loss=3.0, accept_num=[0.0, 0.0], accept_den=[6.0, 0.0]),
+    ]
+
+    metrics = TrainDSparkRecipe._run_eval(_eval_recipe(batches))
+
+    assert metrics["val_loss"] == pytest.approx(2.0)
+    assert metrics["accept_rate"] == pytest.approx(4.0 / 12.0)
+    assert metrics["accept_rate@0"] == pytest.approx(3.0 / 10.0)
+    # Position 1 was measured only in the first batch, so its denominator stays 2.
+    assert metrics["accept_rate@1"] == pytest.approx(0.5)
+
+
+def test_run_eval_reports_tau_and_confidence_calibration():
+    batches = [
+        _eval_metrics_batch(
+            loss=1.0,
+            accept_num=[1.0],
+            accept_den=[2.0],
+            tau_num=3.0,
+            tau_den=2.0,
+            conf_abs_err=0.4,
+            conf_bias=-0.2,
+            conf_cumprod_bias=0.1,
+            conf_den=2.0,
+        ),
+        _eval_metrics_batch(
+            loss=1.0,
+            accept_num=[1.0],
+            accept_den=[2.0],
+            tau_num=1.0,
+            tau_den=2.0,
+            conf_abs_err=0.2,
+            conf_bias=0.2,
+            conf_cumprod_bias=0.1,
+            conf_den=2.0,
+        ),
+    ]
+
+    metrics = TrainDSparkRecipe._run_eval(_eval_recipe(batches))
+
+    assert metrics["tau"] == pytest.approx(1.0)
+    assert metrics["confidence_abs_error"] == pytest.approx(0.15)
+    assert metrics["confidence_bias"] == pytest.approx(0.0)
+    assert metrics["confidence_cumprod_bias"] == pytest.approx(0.05)
+
+
+def test_run_eval_omits_diagnostics_that_were_not_measured():
+    # No teacher signal and no confidence head: reporting these as 0.0 would read
+    # as collapsed acceptance and a perfectly calibrated head.
+    batches = [_eval_metrics_batch(loss=2.0, accept_num=[0.0], accept_den=[0.0])]
+
+    metrics = TrainDSparkRecipe._run_eval(_eval_recipe(batches))
+
+    assert metrics == {"val_loss": pytest.approx(2.0)}
+
+
+def test_run_eval_restores_training_mode():
+    events = []
+    obj = _eval_recipe([_eval_metrics_batch(loss=1.0, accept_num=[1.0], accept_den=[2.0])])
+    obj.trainer_module = SimpleNamespace(eval=lambda: events.append("eval"), train=lambda: events.append("train"))
+
+    TrainDSparkRecipe._run_eval(obj)
+
+    assert events == ["eval", "train"]
+
+
 def test_parallelism_axes_allow_data_and_expert_parallel_topologies():
     """The supported DSpark topologies (pure DP, EP-sharded target, CP) pass the gate."""
     for section in (

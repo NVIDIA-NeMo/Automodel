@@ -145,13 +145,15 @@ def _ensure_resume_compatible(cache_dir: str, manifest: dict[str, Any], existing
     """Refuse to ``--resume`` into a cache produced with a different configuration.
 
     Every manifest field shapes the shard contents or their addressing: the
-    ``target_probs`` columns follow ``selected_token_ids`` (which moves with the
-    dataset, shuffle seed, and draft vocab size), sample order follows the
-    dataset, and tensor shapes follow ``seq_length`` / ``dtype``. Shards from a
-    mismatched run are indistinguishable by shape alone, so without this check a
-    resume after changing e.g. ``--input-data`` or ``--shuffle-seed`` would keep
-    the old shards and bless them with the new manifest, silently corrupting the
-    supervision that training reads back.
+    ``target_probs`` columns follow ``selected_token_ids``, tensor shapes follow
+    ``seq_length`` / ``dtype``, and shard addressing follows the dataset sample
+    order. That order is not captured by ``num_samples`` or the frequency-based
+    ``selected_token_ids`` (both order-invariant), so the dataset-identity fields
+    ``input_data`` / ``split`` / ``shuffle_seed`` are recorded explicitly. Shards
+    from a mismatched run are indistinguishable by shape alone, so without this
+    check a resume after changing e.g. ``--shuffle-seed`` would keep the old
+    shards and bless them with the new manifest, silently interleaving two
+    orderings and corrupting the supervision that training reads back.
     """
     if existing_shards:
         resume_start_sample(existing_shards, int(manifest["shard_size"]))
@@ -241,6 +243,15 @@ def _run(args: argparse.Namespace) -> int:
         "aux_hidden_dim": int(target_model.config.hidden_size) * len(target_wrapper.aux_layer_ids),
         "aux_layer_ids": list(target_wrapper.aux_layer_ids),
         "selected_token_ids": selected_token_ids.cpu().tolist(),
+        # Dataset-identity fields. Shards are addressed by sample position, but
+        # num_samples and the frequency-based selected_token_ids are both
+        # order-invariant, so a resume that changed the sample ordering (a
+        # different --shuffle-seed, or an equally-sized --input-data / --split
+        # slice) would otherwise produce a byte-identical manifest and silently
+        # interleave shards from two different orderings.
+        "input_data": str(args.input_data),
+        "split": args.split,
+        "shuffle_seed": int(args.shuffle_seed),
     }
     if args.resume:
         _ensure_resume_compatible(args.output_dir, manifest, existing)
