@@ -405,8 +405,8 @@ def test_mok_packed_thd_dispatches_padding_as_physical_tokens(monkeypatch: pytes
     torch.testing.assert_close(captured["gate_x"], x.detach())
     torch.testing.assert_close(captured["gate_token_mask"], ~padding_mask)
     torch.testing.assert_close(captured["x"], x.detach())
-    torch.testing.assert_close(captured["weights"], captured["gate_weights"])
-    torch.testing.assert_close(captured["indices"], captured["gate_indices"])
+    assert captured["weights"] is captured["gate_weights"]
+    assert captured["indices"] is captured["gate_indices"]
     torch.testing.assert_close(output, x + 1)
 
     output.sum().backward()
@@ -487,8 +487,8 @@ def test_mok_all_padding_still_enters_collective_dispatch(monkeypatch: pytest.Mo
     assert len(calls) == 1
     expert_x, weights, indices = calls[0]
     torch.testing.assert_close(expert_x, x)
-    torch.testing.assert_close(weights, gate_outputs[0][0])
-    torch.testing.assert_close(indices, gate_outputs[0][1])
+    assert weights is gate_outputs[0][0]
+    assert indices is gate_outputs[0][1]
     torch.testing.assert_close(output, torch.zeros_like(output))
 
 
