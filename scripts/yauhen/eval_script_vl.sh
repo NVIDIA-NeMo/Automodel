@@ -156,8 +156,6 @@ case "$EVAL_TYPE" in
             --max_length 10240 \
             --batch_size 16 \
             --model_type mistral3 \
-            --pooling avg \
-            --corpus_modalities image \
             --log_json True \
             "$@" 2>&1 | tee "$LOG_FILE"
         ;;

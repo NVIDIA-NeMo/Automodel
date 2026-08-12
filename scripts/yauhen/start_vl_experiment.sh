@@ -195,25 +195,24 @@ python3 submit_nemo_run.py \
 python3 submit_nemo_run.py \
     --cluster nrt \
     --partition interactive \
-    --experiment_name eval_ministral3_vl \
+    --experiment_name eval_ministral3_vl_new \
     --checkpoint_directory /lustre/fsw/portfolios/nemotron/projects/nemotron_retriever_dev/users/ybabakhin/model_checkpoints \
     --num_nodes 1 \
     --container_image /lustre/fsw/portfolios/nemotron/projects/nemotron_retriever_dev/retriever_models_research/03_sqsh/nvidian-nemo-automodel-26.08.rc5.sqsh \
     --train_script "" \
     --eval_script ./scripts/yauhen/eval_script_vl.sh \
-    --eval_datasets 20250405 small_textqa_eval_20250508 \
+    --eval_datasets VISION_EVAL TEXT_EVAL VISION_EVAL_MULTILINGUAL TEXT_PLUS_VISION_EVAL \
     --more_eval_args " \
-        --model_name_or_path /lustre/fsw/portfolios/nemotron/projects/nemotron_retriever_dev/users/ybabakhin/model_checkpoints/nemorun_gabriel_stage_1_epoch_2_new_start_08-10-081740/LATEST/model/consolidated \
+        --model_name_or_path /lustre/fsw/portfolios/nemotron/projects/nemotron_retriever_dev/users/ybabakhin/model_checkpoints/nemorun_gabriel_stage_2_new_start_08-10-130144/LATEST/model/consolidated \
         --model_type mistral3 \
         --batch_size 16 \
         --max_length 10240 \
-        --pooling avg \
-        --corpus_modalities image \
+        --log_wandb False \
     " \
     --num_training_rounds 0
 
 
-# /lustre/fsw/portfolios/nemotron/projects/nemotron_retriever_dev/users/ybabakhin/model_checkpoints/nemorun_gabriel_stage_1_epoch_2_new_start_08-10-081740/LATEST/model/consolidated
+# /lustre/fsw/portfolios/nemotron/projects/nemotron_retriever_dev/users/ybabakhin/model_checkpoints/nemorun_gabriel_stage_2_new_start_08-10-130144/LATEST/model/consolidated
 # 20250405 small_textqa_eval_20250508
 
 # Nemotron-3-embed eval ##############################################################

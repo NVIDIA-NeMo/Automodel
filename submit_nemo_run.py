@@ -399,10 +399,9 @@ def main():
 
             if args.eval_datasets is not None and len(args.eval_datasets) > 0:
                 for eval_dataset in args.eval_datasets:
-                    eval_commands = []
                     if eval_dataset not in eval_datasets.keys():
                         eval_datasets[eval_dataset] = [(eval_dataset, "")]
-                    for (dataset_list, extra_eval_args) in eval_datasets[eval_dataset]:
+                    for job_idx, (dataset_list, extra_eval_args) in enumerate(eval_datasets[eval_dataset]):
                         logger.info(f"Evaluating on {dataset_list}")
                         eval_args = args.more_eval_args
                         if "--eval_group_name" not in eval_args and "--eval_group_name" not in extra_eval_args:
@@ -413,18 +412,16 @@ def main():
                             eval_args += f" --dataset_mapping {eval_dataset}"
                             logger.info("Using dataset mapping version: %s", eval_dataset)
                         eval_args += " --dataset " + dataset_list + extra_eval_args
-                        eval_commands.append(f"{args.eval_script} {eval_args}")
-
-                    combined_eval_inline = "\n".join(eval_commands)
-                    script = run.Script(inline=combined_eval_inline)
-                    logger.info("Evaluation Script for %s", eval_dataset)
-                    logger.info(script)
-                    exp.add(
-                        script,
-                        name=f"eval_{eval_dataset}",
-                        executor=eval_executor,
-                        dependencies=[train_job_name] if train_job_name else None
-                    )
+                        script = run.Script(inline=f"{args.eval_script} {eval_args}")
+                        job_name = f"eval_{eval_dataset}_{job_idx}"
+                        logger.info("Evaluation Script for %s", job_name)
+                        logger.info(script)
+                        exp.add(
+                            script,
+                            name=job_name,
+                            executor=eval_executor,
+                            dependencies=[train_job_name] if train_job_name else None
+                        )
 
             # Launches the experiment Slurm tasks 
             if args.run_local:
