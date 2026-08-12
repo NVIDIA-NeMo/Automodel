@@ -363,20 +363,22 @@ def test_ministral3_biencoder_processor_chat_template_matches_training_helpers(m
         q_max_length=64,
         p_max_length=64,
         padding=False,
+        query_prefix="query: [INST]",
+        passage_prefix="passage: [INST]",
         chat_template='{{ bos_token }}[INST]{{ messages[0]["content"] }}[/INST]',
     )
     image = Image.new("RGB", (4, 4), (255, 0, 0))
 
     query_rendered = processor.apply_chat_template(
         [
-            {"role": "system", "content": "query:"},
+            {"role": "system", "content": "query: [INST]"},
             {"role": "user", "content": "literal [IMG]"},
         ],
         tokenize=False,
     )
     document_rendered = processor.apply_chat_template(
         [
-            {"role": "system", "content": [{"type": "text", "text": "passage:"}]},
+            {"role": "system", "content": [{"type": "text", "text": "passage: [INST]"}]},
             {
                 "role": "user",
                 "content": [
@@ -388,9 +390,10 @@ def test_ministral3_biencoder_processor_chat_template_matches_training_helpers(m
         tokenize=False,
     )
 
-    assert query_rendered == "query: literal [\u200cIMG]"
-    assert document_rendered == "passage: [IMG] literal [\u200cIMG_END]"
-    assert "[INST]" not in query_rendered + document_rendered
+    assert query_rendered == "query: [INST] literal [\u200cIMG]"
+    assert document_rendered == "passage: [INST] [IMG] literal [\u200cIMG_END]"
+    assert (query_rendered + document_rendered).count("[INST]") == 2
+    assert "[/INST]" not in query_rendered + document_rendered
 
     query_inference = processor(text=[query_rendered], padding=False, return_tensors="pt")
     document_inference = processor(images=[image], text=[document_rendered], padding=False, return_tensors="pt")
@@ -845,8 +848,14 @@ def _tiny_mistral3_bidirectional_vlm_config() -> Mistral3BidirectionalConfig:
 
 def test_mistral3_vlm_saves_as_stock_bidirectional_model_without_remote_code(tmp_path):
     config = _tiny_mistral3_bidirectional_vlm_config()
+    config.task_instructions = {"query": "stale query: "}
+    training_config = config.to_dict()
+    assert training_config["model_type"] == "mistral3_bidirec"
+    assert training_config["text_config"]["model_type"] == "ministral3_bidirec"
+
     backbone = Mistral3BidirectionalModel(config).eval()
     encoder = BiEncoderModel(backbone, pooling="avg", l2_normalize=True)
+    assert encoder.config.architectures == ["Mistral3BidirectionalModel"]
     encoder.disable_sentence_transformer_export()
     input_ids = torch.tensor([[1, 2, 3, 4]])
     attention_mask = torch.ones_like(input_ids)
@@ -901,6 +910,7 @@ def test_mistral3_vlm_saves_as_stock_bidirectional_model_without_remote_code(tmp
     assert "auto_map" not in saved_config["text_config"]
     assert "auto_map" not in saved_config["vision_config"]
     assert "auto_map" not in saved_config
+    assert "task_instructions" not in saved_config
     assert not list(tmp_path.glob("*.py"))
     assert encoder.name_or_path is None
     assert set(reloaded.state_dict()) == set(backbone.state_dict())
@@ -973,6 +983,27 @@ def test_mistral3_vlm_portable_export_rejects_incomplete_processor(
         encoder._get_consolidated_hf_metadata_exporter(tokenizer=processor, original_model_path=None)
 
 
+def test_mistral3_vlm_portable_export_rejects_non_processor_before_writing(tmp_path):
+    encoder = BiEncoderModel(
+        Mistral3BidirectionalModel(_tiny_mistral3_bidirectional_vlm_config()).eval(),
+        pooling="avg",
+        l2_normalize=True,
+    )
+    processor_like = SimpleNamespace(
+        tokenizer=SimpleNamespace(model_max_length=64),
+        image_processor=object(),
+        chat_template="{{ messages }}",
+        model_max_length=64,
+        save_pretrained=lambda *_args, **_kwargs: None,
+        apply_chat_template=lambda *_args, **_kwargs: "",
+    )
+
+    with pytest.raises(TypeError, match="ProcessorMixin"):
+        encoder.save_pretrained(tmp_path, tokenizer=processor_like)
+
+    assert not any(tmp_path.iterdir())
+
+
 def test_mistral3_vlm_exports_sentence_transformers_checkpoint(tmp_path, monkeypatch):
     from sentence_transformers import SentenceTransformer
 
@@ -996,8 +1027,8 @@ def test_mistral3_vlm_exports_sentence_transformers_checkpoint(tmp_path, monkeyp
         l2_normalize=True,
     ).eval()
     encoder.configure_sentence_transformer_prompts(
-        query_prompt="query: ",
-        document_prompt="passage: ",
+        query_prompt="query:",
+        document_prompt="passage:",
     )
     assert encoder.sentence_transformer_export_config is not None
     assert encoder.sentence_transformer_export_config.input_mode == "structured_multimodal"
@@ -1018,14 +1049,14 @@ def test_mistral3_vlm_exports_sentence_transformers_checkpoint(tmp_path, monkeyp
     ]
     sentence_transformer_config = json.loads((tmp_path / "config_sentence_transformers.json").read_text())
     assert sentence_transformer_config["prompts"] == {
-        "query": "query: ",
-        "document": "passage: ",
+        "query": "query:",
+        "document": "passage:",
     }
     transformer_config = json.loads((tmp_path / "sentence_bert_config.json").read_text())
     assert transformer_config["max_seq_length"] == 64
     assert transformer_config["do_lower_case"] is False
     assert transformer_config["module_output_name"] == "token_embeddings"
-    assert set(transformer_config["modality_config"]) == {"text", "message"}
+    assert set(transformer_config["modality_config"]) == {"text", "image", "message"}
     assert transformer_config["modality_config"]["message"]["format"] == "structured"
     pooling_config = json.loads((tmp_path / "1_Pooling" / "config.json").read_text())
     assert pooling_config["pooling_mode_mean_tokens"] is True
@@ -1042,7 +1073,7 @@ def test_mistral3_vlm_exports_sentence_transformers_checkpoint(tmp_path, monkeyp
     reloaded_processor = AutoProcessor.from_pretrained(tmp_path, trust_remote_code=False)
     assert type(reloaded_processor) is PixtralProcessor
     sentence_transformer = SentenceTransformer(str(tmp_path), device="cpu", trust_remote_code=False)
-    assert sentence_transformer.prompts == {"query": "query: ", "document": "passage: "}
+    assert sentence_transformer.prompts == {"query": "query:", "document": "passage:"}
     assert [type(module).__name__ for module in sentence_transformer] == ["Transformer", "Pooling", "Normalize"]
     assert type(sentence_transformer[0].processor) is PixtralProcessor
     assert sentence_transformer[1].pooling_mode == "mean"
@@ -1062,6 +1093,15 @@ def test_mistral3_vlm_exports_sentence_transformers_checkpoint(tmp_path, monkeyp
         expected_text_document = encoder(text_document_batch)
     actual_text_document = sentence_transformer.encode_document(["Text doc"], convert_to_tensor=True)
     torch.testing.assert_close(actual_text_document, expected_text_document)
+
+    image_only_batch = processor.process_documents(
+        {"images": [image], "texts": [None]},
+        return_tensors="pt",
+    )
+    with torch.no_grad():
+        expected_image_only = encoder(image_only_batch)
+    actual_image_only = sentence_transformer.encode_document([image], convert_to_tensor=True)
+    torch.testing.assert_close(actual_image_only, expected_image_only)
 
     message = [
         {

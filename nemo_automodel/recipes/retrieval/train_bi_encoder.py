@@ -81,17 +81,23 @@ def _configure_sentence_transformer_export(model, collate_fn) -> None:
             )
         return
     else:
-        if not hasattr(collate_fn, "query_prefix") or not hasattr(collate_fn, "passage_prefix"):
+        prompt_source = getattr(collate_fn, "processor", None)
+        if prompt_source is None:
+            collator_method = getattr(collate_fn, "collate_fn", collate_fn)
+            prompt_source = getattr(collator_method, "__self__", collate_fn)
+        if not hasattr(prompt_source, "query_prefix") or not hasattr(prompt_source, "passage_prefix"):
             disable_export = getattr(model, "disable_sentence_transformer_export", None)
             if disable_export is not None:
                 disable_export()
                 logger.warning(
-                    "Standard Sentence Transformers export is disabled because the configured collator "
+                    "Standard Sentence Transformers export is disabled because the configured collator or processor "
                     "does not expose static query_prefix and passage_prefix metadata."
                 )
             return
-        query_prompt = f"{collate_fn.query_prefix} " if collate_fn.query_prefix else ""
-        document_prompt = f"{collate_fn.passage_prefix} " if collate_fn.passage_prefix else ""
+        export_config = getattr(model, "sentence_transformer_export_config", None)
+        prompt_separator = "" if getattr(export_config, "input_mode", "text") == "structured_multimodal" else " "
+        query_prompt = f"{prompt_source.query_prefix}{prompt_separator}" if prompt_source.query_prefix else ""
+        document_prompt = f"{prompt_source.passage_prefix}{prompt_separator}" if prompt_source.passage_prefix else ""
 
     configure_prompts(query_prompt=query_prompt, document_prompt=document_prompt)
 

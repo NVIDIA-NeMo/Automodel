@@ -145,7 +145,11 @@ class NeMoAutoTokenizer:
         if resolved_backend == "tokenizers":
             from transformers.tokenization_utils_tokenizers import TokenizersBackend
 
-            return TokenizersBackend.from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
+            tokenizer = TokenizersBackend.from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
+            from nemo_automodel._transformers.tokenization.nemo_auto_tokenizer import _ensure_pad_token_id
+
+            _ensure_pad_token_id(tokenizer, pretrained_model_name_or_path)
+            return tokenizer
 
         # Try to determine model type from config
         model_type = _get_model_type(pretrained_model_name_or_path, trust_remote_code=trust_remote_code)

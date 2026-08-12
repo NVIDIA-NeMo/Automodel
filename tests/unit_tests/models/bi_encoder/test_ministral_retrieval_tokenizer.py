@@ -16,6 +16,7 @@
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -29,7 +30,7 @@ from nemo_automodel import NeMoAutoTokenizer
 
 
 def test_loader_uses_tokenizers_backend_directly_with_retrieval_policy(monkeypatch):
-    expected = object()
+    expected = SimpleNamespace(pad_token_id=7)
     calls = []
 
     def fake_from_pretrained(model_id, *args, **kwargs):

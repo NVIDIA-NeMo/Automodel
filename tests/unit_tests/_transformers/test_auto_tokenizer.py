@@ -17,6 +17,9 @@ import os
 from unittest.mock import patch
 
 import pytest
+from tokenizers import Tokenizer
+from tokenizers.models import WordLevel
+from tokenizers.pre_tokenizers import Whitespace
 from transformers.tokenization_utils_base import BatchEncoding
 
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
@@ -275,6 +278,24 @@ class TestNeMoAutoTokenizerFromPretrained:
 
         assert tokenizer is stub
         load_transformers.assert_called_once_with("dummy/model", trust_remote_code=False, padding_side="left")
+
+    def test_tokenizers_backend_initializes_pad_token_for_batched_padding(self, tmp_path):
+        backend = Tokenizer(WordLevel({"[UNK]": 0, "short": 1, "long": 2, "input": 3}, unk_token="[UNK]"))
+        backend.pre_tokenizer = Whitespace()
+        backend.save(str(tmp_path / "tokenizer.json"))
+        (tmp_path / "tokenizer_config.json").write_text(json.dumps({"unk_token": "[UNK]"}))
+
+        tokenizer = NeMoAutoTokenizer.from_pretrained(tmp_path, tokenizer_backend="tokenizers")
+        batch = tokenizer(["short", "long input"], padding=True)
+
+        assert tokenizer.pad_token_id == 0
+        assert len(batch["input_ids"][0]) == len(batch["input_ids"][1])
+
+        saved_dir = tmp_path / "saved"
+        tokenizer.save_pretrained(saved_dir)
+        reloaded = NeMoAutoTokenizer.from_pretrained(saved_dir, tokenizer_backend="tokenizers")
+        assert reloaded.pad_token_id == 0
+        assert len(reloaded(["short", "long input"], padding=True)["input_ids"][0]) == 2
 
     def test_force_hf_accepts_equivalent_explicit_backend(self):
         stub = _StubHFTokenizer()

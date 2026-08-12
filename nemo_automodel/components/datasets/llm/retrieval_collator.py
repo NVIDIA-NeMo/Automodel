@@ -28,8 +28,9 @@ MODELS_WITH_PROCESSOR = {
     "mistral3": Mistral3BiEncoderProcessor,
     "mistral3_bidirec": Mistral3BiEncoderProcessor,
     "ministral3": Mistral3BiEncoderProcessor,
-    "ministral3_bidirec": Mistral3BiEncoderProcessor
+    "ministral3_bidirec": Mistral3BiEncoderProcessor,
 }
+
 
 def _doc_id_str_to_int64(doc_id: str) -> int:
     """Stable 63-bit int for corpus doc id strings (for in-batch duplicate masking)."""
@@ -331,6 +332,7 @@ class ProcessorMethodCollator:
             tokenizer: Runtime multimodal processor.
             collator_fn_name: Processor method used to collate each batch.
         """
+        self.processor = tokenizer
         self.collate_fn = cast(
             Callable[[list[dict[str, object]]], dict[str, object]],
             getattr(tokenizer, collator_fn_name),

@@ -20,7 +20,7 @@ import pytest
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import Whitespace
-from transformers import AutoTokenizer, PretrainedConfig, PreTrainedTokenizerFast
+from transformers import AutoTokenizer, PretrainedConfig, PreTrainedTokenizerFast, ProcessorMixin
 
 from nemo_automodel import NeMoAutoTokenizer
 from nemo_automodel._transformers import sentence_transformer_export
@@ -60,12 +60,11 @@ def test_multimodal_export_profile_preserves_processor_assets(tmp_path):
         l2_normalize=True,
         config=SimpleNamespace(hidden_size=8, max_position_embeddings=512),
     )
-    processor = SimpleNamespace(
-        tokenizer=SimpleNamespace(model_max_length=512, pad_token=None),
-        image_processor=object(),
-        chat_template="{{ messages }}",
-        model_max_length=512,
-    )
+    processor = MagicMock(spec=ProcessorMixin)
+    processor.tokenizer = SimpleNamespace(model_max_length=512, pad_token=None)
+    processor.image_processor = object()
+    processor.chat_template = "{{ messages }}"
+    processor.model_max_length = 512
 
     _save_generated_sentence_transformer_assets(
         model,
@@ -76,7 +75,7 @@ def test_multimodal_export_profile_preserves_processor_assets(tmp_path):
     )
 
     transformer_config = json.loads((tmp_path / "sentence_bert_config.json").read_text())
-    assert set(transformer_config["modality_config"]) == {"text", "message"}
+    assert set(transformer_config["modality_config"]) == {"text", "image", "message"}
     assert transformer_config["module_output_name"] == "token_embeddings"
     assert (tmp_path / "processor_config.json").is_file()
     assert (tmp_path / "preprocessor_config.json").is_file()
@@ -278,6 +277,26 @@ def test_generated_sentence_transformer_assets_preserve_repository_and_model_roo
     assert not (metadata_dir / ".gitattributes").exists()
     assert not (metadata_dir / "COPYING").exists()
     assert not (metadata_dir / "LICENSE.txt").exists()
+
+
+def test_generated_sentence_transformer_assets_reject_output_embedding_quantization(tmp_path):
+    model = SimpleNamespace(
+        pooling="avg",
+        l2_normalize=True,
+        output_embedding_quantization="int8",
+        config=SimpleNamespace(hidden_size=8, max_position_embeddings=512),
+    )
+
+    with pytest.raises(ValueError, match="does not support output_embedding_quantization"):
+        _save_generated_sentence_transformer_assets(
+            model,
+            SentenceTransformerExportConfig(),
+            original_model_path=None,
+            hf_metadata_dir=str(tmp_path),
+            tokenizer=SimpleNamespace(model_max_length=512),
+        )
+
+    assert not any(tmp_path.iterdir())
 
 
 def test_generated_sentence_transformer_assets_reject_unrepresentable_pooling(tmp_path):

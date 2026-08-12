@@ -44,13 +44,13 @@ _MISTRAL_RETRIEVAL_CHAT_TEMPLATE = """
 {%- endmacro -%}
 {%- macro render_text_content(content, context_name) -%}
 {%- if content is string -%}
-    {{- mark_user_text(content) -}}
+    {{- content -}}
 {%- elif content is sequence -%}
     {%- set ns = namespace(has_output=false) -%}
     {%- for block in content -%}
         {%- if block["type"] == "text" -%}
             {%- if ns.has_output %}{{ "\\n\\n" }}{% endif -%}
-            {{- mark_user_text(block["text"]) -}}
+            {{- block["text"] -}}
             {%- set ns.has_output = true -%}
         {%- else -%}
             {{- raise_exception(context_name + " may contain only text blocks") -}}

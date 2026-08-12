@@ -19,6 +19,7 @@ from types import SimpleNamespace
 import torch
 
 from nemo_automodel.components.config.loader import ConfigNode
+from nemo_automodel.components.datasets.llm.retrieval_collator import ProcessorMethodCollator
 from nemo_automodel.components.distributed.config import DDPConfig, FSDP2Config
 from nemo_automodel.recipes.retrieval import train_bi_encoder
 from nemo_automodel.recipes.retrieval.train_bi_encoder import (
@@ -89,6 +90,48 @@ def test_configure_sentence_transformer_export_binds_exact_static_collator_promp
     _configure_sentence_transformer_export(wrapped, collator)
 
     assert captured == {"query_prompt": "query: ", "document_prompt": "passage: "}
+
+
+def test_configure_sentence_transformer_export_avoids_duplicate_structured_prompt_separator():
+    captured = {}
+
+    class _Model(torch.nn.Module):
+        sentence_transformer_export_config = SimpleNamespace(input_mode="structured_multimodal")
+
+        def configure_sentence_transformer_prompts(self, **kwargs):
+            captured.update(kwargs)
+
+    collator = SimpleNamespace(
+        query_prefix="query:",
+        passage_prefix="passage:",
+        use_dataset_instruction=False,
+    )
+
+    _configure_sentence_transformer_export(_Model(), collator)
+
+    assert captured == {"query_prompt": "query:", "document_prompt": "passage:"}
+
+
+def test_configure_sentence_transformer_export_reads_processor_method_collator_prompts():
+    captured = {}
+
+    class _Model(torch.nn.Module):
+        sentence_transformer_export_config = SimpleNamespace(input_mode="structured_multimodal")
+
+        def configure_sentence_transformer_prompts(self, **kwargs):
+            captured.update(kwargs)
+
+    class _Processor:
+        query_prefix = "query:"
+        passage_prefix = "passage:"
+
+        def collate(self, batch):
+            return batch
+
+    collator = ProcessorMethodCollator(_Processor(), "collate")
+    _configure_sentence_transformer_export(_Model(), collator)
+
+    assert captured == {"query_prompt": "query:", "document_prompt": "passage:"}
 
 
 def test_configure_sentence_transformer_export_ignores_collator_when_export_is_disabled():
