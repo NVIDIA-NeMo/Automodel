@@ -131,6 +131,7 @@ class MetricLogger:
     def close(self) -> None:
         with self._lock:
             self._save(self._move_to_cpu(self.buffer))
+            self.buffer = []
             try:
                 self._fp.flush()
             except Exception:
@@ -150,8 +151,8 @@ class MetricLogger:
 class MetricLoggerDist(MetricLogger):
     """Rank-zero JSON Lines metric logger for distributed jobs."""
 
-    def __init__(self, filepath: str, *, flush: bool = False, append: bool = True) -> None:
-        super().__init__(filepath, flush=flush, append=append)
+    def __init__(self, filepath: str, *, flush: bool = False, append: bool = True, buffer_size: int = 100) -> None:
+        super().__init__(filepath, flush=flush, append=append, buffer_size=buffer_size)
         assert dist.is_initialized(), "torch.distributed must be initialized with MetricLoggerDist"
         self.rank = dist.get_rank()
         self.world_size = dist.get_world_size()
@@ -175,9 +176,11 @@ class MetricLoggerDist(MetricLogger):
         self.close()
 
 
-def build_metric_logger(filepath: str, *, flush: bool = False, append: bool = True) -> MetricLogger:
+def build_metric_logger(
+    filepath: str, *, flush: bool = False, append: bool = True, buffer_size: int = 100
+) -> MetricLogger:
     """Build a local or distributed metric logger depending on distributed state."""
     if dist.is_initialized():
-        return MetricLoggerDist(filepath, flush=flush, append=append)
+        return MetricLoggerDist(filepath, flush=flush, append=append, buffer_size=buffer_size)
     else:
-        return MetricLogger(filepath, flush=flush, append=append)
+        return MetricLogger(filepath, flush=flush, append=append, buffer_size=buffer_size)
