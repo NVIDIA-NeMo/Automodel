@@ -63,6 +63,10 @@ The shipped example configs only cover a subset.
   `config.get_text_config()` and the draft consumes post-block hidden states, so
   images do not participate in drafting. Configs: `eagle3/gemma4_e2b_eagle3.yaml`,
   `gemma4_e4b_eagle3.yaml`, `gemma4_31b_eagle3.yaml`, `gemma4_26b_a4b_eagle3.yaml`.
+- **Kimi K3** (`KimiK3ForCausalLM`, `KimiK3ForConditionalGeneration`): EAGLE-3
+  only, using a dedicated NoPE-MLA draft class (eager attention, no context or
+  tensor parallelism and no sequence packing, see
+  `eagle3/README_kimi_k3.md`).
 - **DFlash / Domino / JetSpec**: `Qwen3ForCausalLM`, `Qwen3MoeForCausalLM`.
 - **DSpark**: `Qwen3ForCausalLM`, `Qwen3MoeForCausalLM`,
   `DeepseekV4ForCausalLM`, GLM-5.2 (`GlmMoeDsaForCausalLM`), Gemma4
@@ -580,7 +584,7 @@ The following tree shows the implementation layout:
 ```
 nemo_automodel/components/speculative/
   eagle/        core(.py/_v12), draft_llama(.py/_v12), draft_gpt_oss,
-                draft_deepseek, draft_gemma, backend, registry,
+                draft_deepseek, draft_gemma, draft_kimi_k3, backend, registry,
                 target(.py/_v12), peagle_*, remote/,
                 msd*                        # MSD core (no recipe yet)
                 ring_attention, zigzag_ring_attention   # draft-side CP

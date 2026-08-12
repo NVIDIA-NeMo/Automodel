@@ -678,6 +678,25 @@ class IndexedDataset(torch.utils.data.Dataset):
         self.bin_reader = bin_reader
         self.index = index_reader
 
+    def __getstate__(self) -> Dict[str, Any]:
+        """Serialize only the configuration needed to reopen the dataset.
+
+        Memory-mapped readers hold open files, mmap objects, and memoryviews,
+        none of which can be sent to dataloader workers started with ``spawn``.
+        Keep the parent-process readers alive and omit them from the serialized
+        state so each worker can open its own readers after unpickling.
+        """
+        return {
+            "path_prefix": self.path_prefix,
+            "multimodal": self.multimodal,
+            "mmap": self.mmap,
+            "object_storage_config": self.object_storage_config,
+        }
+
+    def __setstate__(self, state: Dict[str, Any]) -> None:
+        """Restore the dataset and reopen process-local readers."""
+        self.initialize(**state)
+
     def __len__(self) -> int:
         return len(self.index)
 

@@ -79,6 +79,9 @@ from nemo_automodel.components.speculative.dspark.target_utils import (
     GLM_5_2_MODEL_TYPE as _GLM_5_2_MODEL_TYPE,
 )
 from nemo_automodel.components.speculative.dspark.target_utils import (
+    KIMI_K3_MODEL_TYPES as _KIMI_K3_MODEL_TYPES,
+)
+from nemo_automodel.components.speculative.dspark.target_utils import (
     MINIMAX_M3_MODEL_TYPES as _MINIMAX_M3_MODEL_TYPES,
 )
 from nemo_automodel.components.speculative.dspark.target_utils import (
@@ -90,6 +93,7 @@ from nemo_automodel.components.speculative.dspark.target_utils import (
 from nemo_automodel.recipes.llm._dspark_target_build import (
     build_deepseek_v4_target,
     build_glm_5_2_target,
+    build_kimi_k3_target,
     gather_full_weight_module,
     validate_dspark_parallelism_axes,
 )
@@ -152,8 +156,9 @@ def _build_target(
 ):
     """Build the frozen target for capture, dispatching on model type.
 
-    DeepSeek V4 / GLM-5.2 load through the sharded EP/FSDP path; other single-process
-    text targets (Qwen3, Gemma4) load replicated for data-parallel throughput.
+    DeepSeek V4 / GLM-5.2 / Kimi K3 load through the sharded EP/FSDP path; other
+    single-process text targets (Qwen3, Gemma4) load replicated for data-parallel
+    throughput.
     Returns ``(target_config, target_model)``.
     """
     if model_type in _MINIMAX_M3_MODEL_TYPES:
@@ -174,6 +179,17 @@ def _build_target(
         return target_config, target_model
     if model_type == _GLM_5_2_MODEL_TYPE:
         target_config, target_model, _ = build_glm_5_2_target(
+            cfg=cfg,
+            world_size=world_size,
+            device=device,
+            compute_dtype=compute_dtype,
+            target_path=target_path,
+            recipe_cfg=recipe_cfg,
+            trust_remote_code=trust_remote_code,
+        )
+        return target_config, target_model
+    if model_type in _KIMI_K3_MODEL_TYPES:
+        target_config, target_model, _ = build_kimi_k3_target(
             cfg=cfg,
             world_size=world_size,
             device=device,

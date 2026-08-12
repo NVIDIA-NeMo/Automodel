@@ -37,6 +37,7 @@ import torch.nn.functional as F
 from torch import nn
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     CheckpointImpl,
+    CheckpointWrapper,
     checkpoint_wrapper,
 )
 from torch.nn.attention import SDPBackend, sdpa_kernel
@@ -640,6 +641,26 @@ def _replace_child_module(root: nn.Module, target: nn.Module, replacement: nn.Mo
         if _replace_child_module(child, target, replacement):
             return True
     return False
+
+
+def apply_full_layer_checkpointing_to_layers(model: nn.Module, layers: List[nn.Module]) -> None:
+    """Wrap transformer layers with non-reentrant activation checkpointing."""
+    context_fn = functools.partial(
+        transformer_engine_attention_backend_snapshot_context_fn,
+        sdpa_backend_snapshot_context_fn,
+    )
+    for index, layer in enumerate(layers):
+        if isinstance(layer, CheckpointWrapper):
+            continue
+        wrapped_layer = checkpoint_wrapper(
+            layer,
+            checkpoint_impl=CheckpointImpl.NO_REENTRANT,
+            context_fn=context_fn,
+            preserve_rng_state=True,
+        )
+        if not _replace_child_module(model, layer, wrapped_layer):
+            raise RuntimeError(f"Could not replace layer {index} with an activation checkpoint wrapper.")
+        layers[index] = wrapped_layer
 
 
 def detect_kv_sharing_and_maybe_disable_cache(model: nn.Module) -> bool:
