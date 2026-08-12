@@ -12,19 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Gemma 4 E4B text-only SFT on one 8xH100-80GB node: dp4 x tp2.
+# Gemma 4 E4B text-only SFT on one 8xH100-80GB node: dp2 x tp2 x cp2.
 #
 # TP2 is the maximum standard head-wise TP degree for E4B because it has only
 # two KV heads. The model-owned plan shards both the tied token embedding and
 # the 2.8B-parameter packed per-layer embedding table. The Gemma4-specific
 # fused CE gathers only the tied LM-head weight, not [B, S, 262k] logits.
 #
-# Validated with a full cached google/gemma-4-E4B-it checkpoint and deterministic
-# 2048-token text batches. The Gemma4-safe selective activation-checkpointing
-# policy recomputes each decoder layer's MLP and norms while leaving attention
-# out because E4B shares mutable K/V state across layers. With fused CE and
-# master-weight FusedAdam with parameter remainders and FP32 moments, LBS4 /
-# GBS16 completed 10 steps at 57.11 GiB per GPU.
+# Validated for 50 Tulu3 SFT steps with a full cached google/gemma-4-E4B-it
+# checkpoint and deterministic 2048-token packed batches. The Gemma4-safe
+# selective activation-checkpointing policy recomputes each decoder layer's MLP
+# and norms while leaving attention out because E4B shares mutable K/V state
+# across layers. With fused CE and master-weight FusedAdam with parameter
+# remainders and FP32 moments, TP2 x CP2, LBS4 / GBS16 completed at 50.03 GiB
+# per GPU. Its loss stayed aligned with the exact-data FSDP2-only baseline.
 #
 # torchrun --nproc-per-node=8 nemo_automodel/recipes/vlm/finetune.py \
 #   -c examples/vlm_finetune/gemma4/gemma4_e4b_tulu3_text_tp2.yaml
@@ -69,7 +70,7 @@ distributed:
   strategy: fsdp2
   dp_size: none
   tp_size: 2
-  cp_size: 1
+  cp_size: 2
   sequence_parallel: false
   # E4B shares K/V across layers through one mutable store, so its model-owned
   # selective policy checkpoints only the MLP and norms in those layers.
