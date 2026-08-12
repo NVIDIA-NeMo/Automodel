@@ -76,6 +76,8 @@ navigation:
             path: ../../model-coverage/llm/qwen/qwen3.mdx
           - page: "Qwen3 MoE"
             path: ../../model-coverage/llm/qwen/qwen3-moe.mdx
+          - page: "Qwen3.8-Max"
+            path: ../../model-coverage/llm/qwen/qwen3-8-max.mdx
           - page: "Qwen3-Next"
             path: ../../model-coverage/llm/qwen/qwen3-next.mdx
           - page: "ERNIE 4.5"
