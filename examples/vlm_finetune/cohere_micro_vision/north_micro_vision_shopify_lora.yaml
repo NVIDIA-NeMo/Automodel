@@ -1,0 +1,111 @@
+# LoRA fine-tune of Cohere North Micro Vision Instruct (preview) on
+# Shopify/product-catalogue -- product image -> taxonomy category.
+#
+# 2-GPU data-parallel (FSDP2) run:
+#   automodel north_micro_vision_shopify_lora.yaml --nproc-per-node 2
+#
+# NOTE: requires transformers 5.15.0.dev0 (git main), NOT the transformers==5.8.1
+# that nemo-automodel==0.5.0 pins. See north_micro_vision_shopify_full.yaml for details.
+
+recipe: FinetuneRecipeForVLM
+
+step_scheduler:
+  # 8 per GPU x 2 GPUs = 16 global; local_batch_size 2 => grad accum 4
+  global_batch_size: 16
+  local_batch_size: 2
+  ckpt_every_steps: 100
+  val_every_steps: 100
+  num_epochs: 1
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 20
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 42
+  ranked: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
+  pretrained_model_name_or_path: CohereLabs/North-Micro-Vision-instruct-preview
+  attn_implementation: sdpa
+  trust_remote_code: true
+
+processor:
+  _target_: transformers.AutoProcessor.from_pretrained
+  pretrained_model_name_or_path: CohereLabs/North-Micro-Vision-instruct-preview
+  trust_remote_code: true
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: checkpoints_shopify/
+  model_save_format: safetensors
+
+distributed:
+  strategy: fsdp2
+  dp_size: none   # none => use all visible ranks for data parallel
+  tp_size: 1
+  cp_size: 1
+  sequence_parallel: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_shopify_product_catalogue_dataset
+  path_or_dataset: Shopify/product-catalogue
+  split: train
+  limit_dataset_samples: 2000
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_shopify_product_catalogue_dataset
+  path_or_dataset: Shopify/product-catalogue
+  split: test
+  limit_dataset_samples: 200
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 4
+  pin_memory: true
+  collate_fn:
+    # No max_length => dynamic padding to the longest sample in the batch.
+    # Setting max_length forces padding="max_length" (pads every row to 2047),
+    # which is ~70% wasted compute given images are capped to <=768px (~620 tok).
+    _target_: nemo_automodel.components.datasets.vlm.collate_fns.default_collate_fn
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 2
+  pin_memory: true
+  collate_fn:
+    # No max_length => dynamic padding to the longest sample in the batch.
+    # Setting max_length forces padding="max_length" (pads every row to 2047),
+    # which is ~70% wasted compute given images are capped to <=768px (~620 tok).
+    _target_: nemo_automodel.components.datasets.vlm.collate_fns.default_collate_fn
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1e-4
+  weight_decay: 0.01
+  betas: [0.9, 0.95]
+
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  match_all_linear: false
+  target_modules:
+    - "*q_proj"
+    - "*k_proj"
+    - "*v_proj"
+    - "*o_proj"
+    - "*gate_proj"
+    - "*up_proj"
+    - "*down_proj"
+  dim: 16
+  alpha: 32
+  dropout: 0.05
+  use_triton: true
+
+freeze_config:
+  freeze_vision_tower: true
+  freeze_language_model: false
