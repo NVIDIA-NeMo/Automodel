@@ -16,4 +16,30 @@ COPY --chown=65532:65532 tests/unit_tests/speculative/test_dspark_gemma4.py test
 # `uv pip install` step while still enforcing this checkout's lockfile.
 RUN . /opt/venv/env.sh && uv sync --locked --extra vlm-media --inexact
 
-ENV UV_OFFLINE=1
+ARG RUNTIME_UID=65532
+ARG RUNTIME_GID=65532
+USER root
+RUN if ! getent group "${RUNTIME_GID}" >/dev/null; then \
+        groupadd --gid "${RUNTIME_GID}" nemo-runtime; \
+    fi && \
+    if ! getent passwd "${RUNTIME_UID}" >/dev/null; then \
+        useradd --no-log-init --uid "${RUNTIME_UID}" --gid "${RUNTIME_GID}" \
+            --create-home --home-dir /home/nemo-runtime --shell /bin/bash nemo-runtime; \
+    fi && \
+    install -d -o "${RUNTIME_UID}" -g "${RUNTIME_GID}" /home/nemo-runtime /opt/uv_cache && \
+    chown -R "${RUNTIME_UID}:${RUNTIME_GID}" /opt/Automodel /opt/venv /opt/uv_cache
+
+ENV HOME=/home/nemo-runtime \
+    XDG_CACHE_HOME=/tmp/regent-cache/xdg \
+    UV_CACHE_DIR=/tmp/regent-cache/uv \
+    UV_OFFLINE=1
+
+USER ${RUNTIME_UID}:${RUNTIME_GID}
+RUN test "$(id -u)" = "${RUNTIME_UID}" && \
+    test "$(id -g)" = "${RUNTIME_GID}" && \
+    test ! -e /nemo_run && \
+    test -x /opt/venv/bin/python && \
+    test -z "$(find /opt/venv -xdev -type l -lname '/root/*' -print -quit)" && \
+    mkdir -p "${XDG_CACHE_HOME}" "${UV_CACHE_DIR}" && \
+    touch /opt/Automodel/.nonroot-write-probe /opt/venv/.nonroot-write-probe && \
+    rm /opt/Automodel/.nonroot-write-probe /opt/venv/.nonroot-write-probe
