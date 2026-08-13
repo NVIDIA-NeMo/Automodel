@@ -618,6 +618,9 @@ def apply_fsdp(
     # but trainable multimodal towers still get standalone FSDP units. Install
     # the same lazy-state guard as dense FSDP for modality-free batches.
     _patch_fsdp_accumulated_grad_guard()
+    from nemo_automodel.shared.torch_patches import patch_fsdp_log_reduce_groups
+
+    patch_fsdp_log_reduce_groups()
 
     if isinstance(lm_head_precision, str):
         lm_head_precision = dtype_from_str(lm_head_precision, default=None)
