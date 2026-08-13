@@ -1246,24 +1246,6 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
                 if past_key_values is None and _kv_sharing_active(text_config):
                     past_key_values = _Gemma4KVShareHolder()
 
-                if tp_e_series_enabled and not cp_enabled:
-                    # Match HFGemma4Model.forward exactly. Calling the text
-                    # model with a raw mask would use its generic full/sliding
-                    # builders, while E2B/E4B select create_masks_for_generate
-                    # at the multimodal-model level.
-                    if position_ids is None:
-                        past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
-                        position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device)
-                        position_ids = (position_ids + past_seen_tokens).unsqueeze(0)
-                    if not isinstance(attention_mask, dict):
-                        attention_mask = _g4.create_masks_for_generate(
-                            self.config,
-                            inputs_embeds,
-                            attention_mask,
-                            past_key_values,
-                            position_ids,
-                        )
-
                 # Dense Gemma4 rides HF's decoder layers, which don't thread the
                 # CP/vision metadata down to self_attn (the MoE backend passes it via
                 # kwargs). Stash the CP-sharded metadata on each ring-hooked attention
