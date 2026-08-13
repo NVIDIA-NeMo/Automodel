@@ -19,10 +19,7 @@ same seed and data order -- once on a single rank, once with one parallelism
 axis enabled -- and asserts both follow the same loss and gradient-norm
 trajectory. Divergence means the sharding changed the computation.
 
-These cover the gap that let commit 00f40419 reach main: every pre-existing PP
-test in GitHub CI ran stock HuggingFace Mixtral through the generic pipeline
-path at ``tp_size=1``, so none of them failed while the real gemma4_31b and
-mistral3p5 recipes broke in nemo-ci.
+Covers the gap from PR #2983 (commit 00f40419).
 """
 
 from tests.utils.test_utils import run_test_script

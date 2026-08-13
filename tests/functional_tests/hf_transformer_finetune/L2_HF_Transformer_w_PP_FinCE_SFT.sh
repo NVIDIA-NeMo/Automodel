@@ -63,11 +63,7 @@ if grep -q "Using MaskedCrossEntropy instead" "$LOG_FILE"; then
     exit 1
 fi
 
-# Same class of silent degradation, one layer down: when `_precompute_stage_shapes`
-# cannot install static stage metadata it logs this line and lets PyTorch infer
-# shapes dynamically. The generic dense path survives that, so this test would
-# still pass while models with their own PP tensor contract break -- the
-# regression introduced by commit 00f40419.
+# Guard against bug in commit 00f40419 (PR #2983).
 if grep -Eiq "dynamic .*metadata inference" "$LOG_FILE"; then
     echo "ERROR: pipeline stages fell back to dynamic metadata inference instead of static metadata"
     exit 1

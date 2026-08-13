@@ -20,11 +20,7 @@
 # gradient-norm trajectory. `dp_size` is 1 in both runs, so the dataloader yields
 # identical batches and any divergence is attributable to the pipeline split.
 #
-# Covers the gap that let PR #2983 (commit 00f40419) reach main: it disabled
-# static pipeline-stage metadata for every PP model, but the only PP tests in
-# GitHub CI ran stock HuggingFace Mixtral through the generic path at tp_size=1,
-# so nothing failed while the real gemma4_31b_tp4_pp2 / tp4_pp4 recipes broke in
-# nemo-ci.
+# Covers the gap from PR #2983 (commit 00f40419).
 #
 # Required CI environment:
 #   * `$TEST_DATA_DIR/hf_gemma4_e4b_2l/` -- staged Gemma4 processor (already
@@ -84,27 +80,14 @@ TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnod
     --distributed.pipeline.pp_microbatch_size 1 \
     2>&1 | tee "$LOG_FILE"
 
-# Guard against a silent capability loss. `_precompute_stage_shapes` falls back
-# to PyTorch's dynamic shape inference when it cannot install static stage
-# metadata, which keeps the run alive on the generic dense path but produces
-# wrong metadata for models that declare their own PP tensor contract. This is
-# the exact regression from commit 00f40419, and it is axis-independent: the
-# line is emitted whatever the tp/cp/ep sizes are.
+# Guard against the `_precompute_stage_shapes` bug from PR #2983.
 if grep -Eiq "dynamic .*metadata inference" "$LOG_FILE"; then
     echo "ERROR: pipeline stages fell back to dynamic metadata inference instead of static metadata"
     exit 1
 fi
 
-# The gradient-norm bound is looser than the loss bound for a structural reason:
-# FSDP2Manager skips parallelization entirely at world_size 1, so the baseline
-# runs unwrapped while the pp2 run gets FSDP2's default bf16 MixedPrecisionPolicy.
-# The two are therefore not bit-comparable, and measured no-accumulation runs sit
-# within ~15%. This still catches the failures worth catching -- a wrong stage
-# metadata, a gradient reduced over the wrong group, or a missing scale move the
-# norm by integer factors, not percent.
-#
-# `global_batch_size` equals `local_batch_size` here, so each step is a single
-# accumulation window.
+# The gradient-norm bound is looser than the loss bound because the single-rank
+# baseline runs unwrapped while the pp2 run goes through FSDP2 in bf16.
 python tests/functional_tests/parallelism/compare_parallel_parity.py \
     "$RUN_DIR/baseline/training.jsonl" \
     "$RUN_DIR/pp2/training.jsonl" \

@@ -26,6 +26,7 @@ from torch.distributed.pipelining.schedules import (
 from nemo_automodel.components.distributed.pipelining.functional import (
     _get_hidden_and_vocab_size,
     _precompute_stage_shapes,
+    _preserve_grads_across_stage_reinit,
     _set_stage_metas,
     _use_static_pipeline_stage_metadata,
     _warmup_pipeline_stage_neighbors,
@@ -1768,9 +1769,8 @@ class _UserMetaStage:
     """PipelineStage stand-in exposing only PyTorch 2.13's ``_user_meta`` API.
 
     PyTorch 2.13 removed ``PipelineStage._configure_outputs_meta``. Stages that
-    expose ``_user_meta`` instead are the ones that regressed in commit
-    00f40419, which skipped static metadata entirely when the old attribute was
-    missing and silently fell back to dynamic shape inference.
+    expose ``_user_meta`` instead are the ones that regressed in commit 00f40419
+    of PR #2983.
     """
 
     def __init__(self, *, is_first: bool, has_lm_head: bool, dtype: torch.dtype = torch.bfloat16) -> None:
@@ -1782,7 +1782,7 @@ class _UserMetaStage:
 class TestPrecomputeStageShapesNewStageApi:
     """The PyTorch 2.13 stage API must still receive static metadata.
 
-    Regression guard for commit 00f40419 on the generic (no
+    Regression guard for commit 00f40419 of PR #2983 on the generic (no
     ``get_pipeline_stage_metas`` hook) path that gemma4 and mistral3p5 take.
     """
 
@@ -1823,3 +1823,69 @@ class TestPrecomputeStageShapesNewStageApi:
         assert stages[0]._user_meta.inputs[0].requires_grad is False
         assert stages[1]._user_meta.inputs[0].requires_grad is True
         assert stages[0]._user_meta.outputs[0].requires_grad is True
+
+
+class TestPreserveGradsAcrossStageReinit:
+    """Stage re-initialization must not discard accumulated gradients.
+
+    ``_initialize_pp_stages`` always ends by calling
+    ``_post_metadata_inference_cleanup``, which nulls parameter gradients.
+    ``reset_pp_stage_shapes`` re-initializes on every sequence-length change, so
+    under gradient accumulation that cleanup lands between micro-batches and drops
+    everything accumulated so far.
+    """
+
+    def _make_stage(self, inference_mode):
+        """Build a stage stand-in whose cleanup nulls its submodule's gradients.
+
+        Args:
+            inference_mode: Value to expose as the stage's ``_inference_mode``.
+
+        Returns:
+            Tuple of (stage, param) where ``param`` is a tensor of shape [2] whose
+            ``.grad`` is also shape [2].
+        """
+        submod = torch.nn.Linear(2, 1, bias=False)
+        param = submod.weight
+        param.grad = torch.ones_like(param)
+
+        stage = types.SimpleNamespace(submod=submod, _inference_mode=inference_mode)
+
+        def _cleanup():
+            for p in submod.parameters():
+                p.grad = None
+
+        stage._post_metadata_inference_cleanup = _cleanup
+        return stage, param
+
+    def test_static_mode_keeps_accumulated_grads(self, monkeypatch):
+        """With static metadata no inference ran, so gradients must survive."""
+        from torch.distributed.pipelining._utils import InferenceMode
+
+        stage, param = self._make_stage(InferenceMode.STATIC)
+        expected = param.grad.clone()
+
+        _preserve_grads_across_stage_reinit([stage])
+        stage._post_metadata_inference_cleanup()
+
+        assert param.grad is not None, "accumulated gradients were discarded on stage re-init"
+        torch.testing.assert_close(param.grad, expected)
+
+    def test_dynamic_mode_still_clears_stale_grads(self):
+        """Dynamic inference runs a throwaway backward, so its grads must be cleared."""
+        from torch.distributed.pipelining._utils import InferenceMode
+
+        stage, param = self._make_stage(InferenceMode.DYNAMIC)
+
+        _preserve_grads_across_stage_reinit([stage])
+        stage._post_metadata_inference_cleanup()
+
+        assert param.grad is None
+
+    def test_stage_without_cleanup_hook_is_skipped(self):
+        """Older PyTorch stages have no cleanup hook and must not raise."""
+        stage = types.SimpleNamespace(submod=torch.nn.Linear(2, 1))
+
+        _preserve_grads_across_stage_reinit([stage])
+
+        assert not hasattr(stage, "_post_metadata_inference_cleanup")

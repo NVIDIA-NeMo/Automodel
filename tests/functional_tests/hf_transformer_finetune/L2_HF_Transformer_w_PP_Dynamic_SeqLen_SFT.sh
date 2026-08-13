@@ -54,12 +54,8 @@ COMMON_ARGS=(
 LOG_FILE=$(mktemp)
 trap 'rm -f "$LOG_FILE"' EXIT
 
-# `_precompute_stage_shapes` logs this line when it cannot install static stage
-# metadata and lets PyTorch infer shapes dynamically instead. The generic dense
-# path keeps running, so without this guard the test passes as a smoke test
-# while models declaring their own PP tensor contract silently break -- the
-# regression from commit 00f40419. Checked after each schedule because the
-# metadata path differs between PipelineScheduleSingle and ...Multi.
+# Guard against bug in commit 00f40419 (PR #2983). Checked after each schedule
+# because the metadata path differs between PipelineScheduleSingle and ...Multi.
 assert_static_pp_metadata() {
     if grep -Eiq "dynamic .*metadata inference" "$LOG_FILE"; then
         echo "ERROR: pipeline stages fell back to dynamic metadata inference instead of static metadata"

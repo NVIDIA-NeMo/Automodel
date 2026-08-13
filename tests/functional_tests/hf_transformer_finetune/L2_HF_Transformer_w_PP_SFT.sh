@@ -45,12 +45,7 @@ TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnod
     --distributed.pipeline.scale_grads_in_schedule false \
     2>&1 | tee "$LOG_FILE"
 
-# Guard against a silent capability loss. `_precompute_stage_shapes` installs
-# static stage metadata to bypass PyTorch's serial shape-inference chain; when
-# it cannot, it logs this line and lets PyTorch infer shapes dynamically. On the
-# generic dense path that still runs, so this test would pass as a plain smoke
-# test while models declaring their own PP tensor contract silently break --
-# exactly what happened in commit 00f40419.
+# Guard against bug in commit 00f40419 (PR #2983).
 if grep -Eiq "dynamic .*metadata inference" "$LOG_FILE"; then
     echo "ERROR: pipeline stages fell back to dynamic metadata inference instead of static metadata"
     exit 1

@@ -16,8 +16,7 @@
 
 Compares two ``training.jsonl`` logs produced by the same recipe and seed: a
 single-rank baseline and a run with one parallelism axis enabled (TP, PP, CP, or
-EP). Sharding a model changes *how* the step is computed, never *what* it
-computes, so both runs must follow the same loss and gradient-norm trajectory.
+EP). Both runs must follow the same loss and gradient-norm trajectory.
 
 This is the generic net for parallelism correctness. A smoke test only fails on
 a crash or a hang, but wrong stage metadata, a gradient that syncs over the

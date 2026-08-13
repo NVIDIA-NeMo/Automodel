@@ -52,8 +52,6 @@ model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
   pretrained_model_name_or_path: /dev/null  # overridden per-test
   torch_dtype: torch.bfloat16
-  # Matches the real recipe: SDPA backward NaNs in bf16 on Gemma4 31B at
-  # local_batch_size >= 2, so the 31B recipes pin eager attention.
   attn_implementation: eager
   use_liger_kernel: false
   use_sdpa_patching: false
@@ -100,10 +98,8 @@ dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   num_workers: 0
   pin_memory: true
-  # No `max_length`, matching the real 31B recipes. Passing one truncates every
-  # 2D batch tensor except `pixel_values`, so `image_position_ids` is clipped
-  # while the patch tensor keeps its full length and the vision tower fails on
-  # `hidden_states + position_embeddings`.
+  # No `max_length`, matching the real 31B recipes. Passing one used to corrupt
+  # image batches; fixed in PR #3531.
   collate_fn:
     _target_: nemo_automodel.components.datasets.vlm.collate_fns.gemma4_prefix_collate_fn
 
