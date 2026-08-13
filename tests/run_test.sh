@@ -58,6 +58,9 @@ fi
 # Install opt-in media extras (kept out of the default media-free image) per folder.
 case "$TEST_NAME" in
     hf_transformer_vlm) MEDIA_EXTRA="vlm-media" ;;
+    # The parallelism suite drives VLM proxies (gemma4) through the VLM recipe,
+    # so it needs the same image-decoding extras.
+    parallelism) MEDIA_EXTRA="vlm-media" ;;
     *) MEDIA_EXTRA="" ;;
 esac
 if [[ -n "$MEDIA_EXTRA" ]]; then

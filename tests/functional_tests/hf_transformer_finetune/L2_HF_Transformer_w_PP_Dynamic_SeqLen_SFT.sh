@@ -51,15 +51,35 @@ COMMON_ARGS=(
     --distributed.pipeline.scale_grads_in_schedule false
 )
 
+LOG_FILE=$(mktemp)
+trap 'rm -f "$LOG_FILE"' EXIT
+
+# `_precompute_stage_shapes` logs this line when it cannot install static stage
+# metadata and lets PyTorch infer shapes dynamically instead. The generic dense
+# path keeps running, so without this guard the test passes as a smoke test
+# while models declaring their own PP tensor contract silently break -- the
+# regression from commit 00f40419. Checked after each schedule because the
+# metadata path differs between PipelineScheduleSingle and ...Multi.
+assert_static_pp_metadata() {
+    if grep -Eiq "dynamic .*metadata inference" "$LOG_FILE"; then
+        echo "ERROR: pipeline stages fell back to dynamic metadata inference instead of static metadata"
+        exit 1
+    fi
+}
+
 # --- Run 1: 1f1b (PipelineScheduleSingle) ---
 echo "=== PP dynamic seq_len: 1f1b ==="
 TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnodes=1 -m coverage run examples/llm_finetune/finetune.py \
     "${COMMON_ARGS[@]}" \
-    --distributed.pipeline.pp_schedule 1f1b
+    --distributed.pipeline.pp_schedule 1f1b \
+    2>&1 | tee "$LOG_FILE"
+assert_static_pp_metadata
 
 # --- Run 2: interleaved1f1b (PipelineScheduleMulti) ---
 echo "=== PP dynamic seq_len: interleaved1f1b ==="
 TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnodes=1 -m coverage run examples/llm_finetune/finetune.py \
     "${COMMON_ARGS[@]}" \
     --model.num_hidden_layers 8 \
-    --distributed.pipeline.pp_schedule interleaved1f1b
+    --distributed.pipeline.pp_schedule interleaved1f1b \
+    2>&1 | tee "$LOG_FILE"
+assert_static_pp_metadata
