@@ -113,6 +113,7 @@ lr_scheduler:
 ci:
   recipe_owner: huiyingl
   time: "00:30:00"
+  cluster_tag: gb10
   nproc_per_node: 1
   env_vars:
     OMP_NUM_THREADS: 8
