@@ -108,6 +108,36 @@ def test_expert_weight_save_layout_unchanged():
     assert all(k.endswith((".w1.weight", ".w3.weight")) for k in out)
 
 
+def test_peft_target_modules_get_hf_renames():
+    """adapter_config.json target_modules need the same renames as the keys.
+
+    Found in a real K3 expert-LoRA run: the state-dict keys converted but
+    target_modules kept internal names, so PEFT couldn't resolve the expert
+    entries against the actual model.
+    """
+    adapter = _tiny_adapter()
+
+    assert (
+        adapter.map_peft_target_module_to_hf("model.layers.5.mlp.experts.3.gate_proj")
+        == "model.layers.5.block_sparse_moe.experts.3.w1"
+    )
+    assert (
+        adapter.map_peft_target_module_to_hf("model.layers.5.mlp.experts.0.up_proj")
+        == "model.layers.5.block_sparse_moe.experts.0.w3"
+    )
+    assert (
+        adapter.map_peft_target_module_to_hf("model.layers.12.mlp.experts.671.down_proj")
+        == "model.layers.12.block_sparse_moe.experts.671.w2"
+    )
+    # non-expert entries pass through untouched
+    for name in (
+        "model.layers.5.self_attn.q_proj",
+        "model.layers.5.mlp.gate_proj",  # dense-layer mlp, not an expert
+        "model.layers.5.mlp.shared_experts.gate_proj",
+    ):
+        assert adapter.map_peft_target_module_to_hf(name) == name
+
+
 def test_kda_fp32_holder_keys_round_trip_to_hf_layout():
     hf_to_native = {
         "model.layers.9.self_attn.A_log": "model.layers.9.self_attn._fp32_params.A_log",

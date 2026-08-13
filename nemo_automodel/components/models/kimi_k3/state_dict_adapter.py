@@ -194,6 +194,24 @@ class KimiK3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
         lora = match.group("lora") or ""
         return f"{match.group('prefix')}.mlp.experts.{match.group('expert')}.{projection}{lora}.weight"
 
+    def map_peft_target_module_to_hf(self, name: str) -> str:
+        """Convert a native PEFT target-module path to the checkpoint layout.
+
+        adapter_config.json's target_modules must name modules that exist in the
+        HF model (PEFT suffix-matches them), so the per-expert entries need the
+        same w1/w2/w3 + block_sparse_moe renames the state-dict keys get. Paths
+        that aren't per-expert projections pass through unchanged.
+        """
+        match = re.match(
+            r"(?P<prefix>.*?layers\.\d+)\.mlp\.experts\.(?P<expert>\d+)\."
+            r"(?P<proj>gate_proj|up_proj|down_proj)$",
+            name,
+        )
+        if match is None:
+            return name
+        projection = _GENERIC_TO_HF_EXPERT_PROJ[match.group("proj")]
+        return f"{match.group('prefix')}.block_sparse_moe.experts.{match.group('expert')}.{projection}"
+
     def _map_generic_expert_key_to_hf(self, key: str) -> str:
         match = re.match(
             r"(?P<prefix>.*?layers\.\d+)\.mlp\.experts\.(?P<expert>\d+)\."
