@@ -34,6 +34,10 @@ rng:
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: Qwen/Qwen3-8B
+  # Keep packed training on the HF FlashAttention path for GB10. TE's packed THD
+  # backward requests ragged LSE, which cuDNN does not support on SM12x GPUs.
+  force_hf: true
+  attn_implementation: flash_attention_2
 
 # torch.compile configuration
 compile:
