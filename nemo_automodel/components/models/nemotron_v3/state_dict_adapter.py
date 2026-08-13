@@ -146,7 +146,7 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
             key,
         )
 
-    def to_hf(self, state_dict: dict[str, Any], exclude_key_regex: Optional[str] = None, **kwargs) -> dict[str, Any]:
+    def to_hf(self, state_dict: dict[str, Any], exclude_key_regex: str | None = None, **kwargs) -> dict[str, Any]:
         """Convert from internal model state dict to HuggingFace format.
 
         Args:

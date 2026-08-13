@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Any, Optional
+from typing import Any
 
 import torch
 from torch.distributed.device_mesh import DeviceMesh
@@ -41,7 +41,7 @@ class Ernie4_5StateDictAdapter(StateDictAdapter):
     def to_hf(
         self,
         state_dict: dict[str, Any],
-        exclude_key_regex: Optional[str] = None,
+        exclude_key_regex: str | None = None,
         **kwargs,
     ) -> dict[str, Any]:
         if exclude_key_regex is None:
@@ -80,7 +80,7 @@ class Ernie4_5_MoeStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapt
     def from_hf(
         self,
         hf_state_dict: dict[str, Any],
-        device_mesh: Optional["DeviceMesh"] = None,
+        device_mesh: "DeviceMesh" | None = None,
         **kwargs,
     ) -> dict[str, Any]:
         for key in list(hf_state_dict.keys()):
@@ -101,7 +101,7 @@ class Ernie4_5_MoeStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapt
     def to_hf(
         self,
         state_dict: dict[str, Any],
-        exclude_key_regex: Optional[str] = None,
+        exclude_key_regex: str | None = None,
         quantization: bool = False,
         **kwargs,
     ) -> dict[str, Any]:

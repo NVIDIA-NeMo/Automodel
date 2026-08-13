@@ -18,7 +18,7 @@ import logging
 import signal
 from dataclasses import asdict, dataclass
 from math import ceil
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 from torch.distributed.checkpoint.stateful import Stateful
 
@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 
 def _calculate_max_steps(
     num_epochs: int,
-    epoch_len: Optional[int],
+    epoch_len: int | None,
     default_max_steps: int = 9223372036854775807,
 ) -> int:
     """
@@ -44,7 +44,7 @@ def _calculate_max_steps(
     return num_epochs * epoch_len
 
 
-def _calculate_num_epochs(max_steps: Optional[int], epoch_len: Optional[int], default_num_epochs: int = 10) -> int:
+def _calculate_num_epochs(max_steps: int | None, epoch_len: int | None, default_num_epochs: int = 10) -> int:
     """
     Calculate the number of epochs out of maximum number of steps.
     """
@@ -63,17 +63,17 @@ class StepScheduler(Stateful):
         global_batch_size: int,
         local_batch_size: int,
         dp_size: int,
-        dataloader: Optional[int],
-        ckpt_every_steps: Optional[int] = None,
+        dataloader: int | None,
+        ckpt_every_steps: int | None = None,
         save_checkpoint_every_epoch: bool = True,
-        val_every_steps: Optional[int] = None,
+        val_every_steps: int | None = None,
         log_remote_every_steps: int = 1,
         loss_average_window_steps: int = 50,
-        gc_every_steps: Optional[int] = None,
+        gc_every_steps: int | None = None,
         start_step: int = 0,
         start_epoch: int = 0,
-        num_epochs: Optional[int] = None,
-        max_steps: Optional[int] = None,
+        num_epochs: int | None = None,
+        max_steps: int | None = None,
         preemption_signal: SignalLike | list[SignalLike] | None = signal.SIGTERM,
         process_group: ProcessGroup | None = None,
     ):
@@ -183,7 +183,7 @@ class StepScheduler(Stateful):
         else:
             self.sig_handler = DistributedSignalHandler(sig=preemption_signal, group=process_group).__enter__()
         self.sigterm_flag = False
-        self._sig_polled_step: Optional[int] = None
+        self._sig_polled_step: int | None = None
 
     def __iter__(self):
         """

@@ -51,7 +51,7 @@ from __future__ import annotations
 import logging
 import pathlib
 import re
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any
 
 from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
 
@@ -203,9 +203,9 @@ class BagelStateDictAdapter(StateDictAdapter):
     def from_hf(
         self,
         hf_state_dict: dict[str, "torch.Tensor"],
-        device_mesh: Optional["DeviceMesh"] = None,
+        device_mesh: "DeviceMesh" | None = None,
         *,
-        stage: Optional[Any] = None,
+        stage: Any | None = None,
         strict: bool = True,
         **kwargs: Any,
     ) -> dict[str, "torch.Tensor"]:

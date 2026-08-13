@@ -20,7 +20,7 @@ MoE parallelizer.
 """
 
 from collections.abc import MutableMapping
-from typing import Any, Iterator, Optional, Union
+from typing import Any, Iterator, Union
 
 import torch
 import torch.nn as nn
@@ -214,7 +214,7 @@ class Gemma4Gate(nn.Module):
 
         # Rollout Routing Replay (R3): owns a handle only when enabled so the
         # default routing path stays a no-op.
-        self.router_replay: Optional[RouterReplay] = RouterReplay() if enable_routing_replay else None
+        self.router_replay: RouterReplay | None = RouterReplay() if enable_routing_replay else None
 
         # Thread dtype explicitly from config.torch_dtype so the router's own
         # params (proj weight + scale) stay aligned with the rest of the model
@@ -1181,7 +1181,7 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
         image_position_ids: torch.Tensor | None = None,
         mm_token_type_ids: torch.Tensor | None = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
-        output_hidden_states: Optional[bool] = None,
+        output_hidden_states: bool | None = None,
         **kwargs: Any,
     ):
         output_hidden_states = (

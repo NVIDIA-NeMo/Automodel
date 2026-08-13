@@ -13,7 +13,6 @@
 # limitations under the License.
 
 from dataclasses import dataclass
-from typing import Optional
 
 import torch
 import torch.distributed as dist
@@ -37,11 +36,11 @@ def calculate_mtp_loss(
     labels: torch.Tensor,
     model: nn.Module,
     scaling_factor: float = 0.1,
-    num_label_tokens: Optional[int] = None,
+    num_label_tokens: int | None = None,
     ignore_index: int = -100,
-    cu_seqlens: Optional[torch.Tensor] = None,
-    seq_idx: Optional[torch.Tensor] = None,
-    lm_weight: Optional[torch.Tensor] = None,
+    cu_seqlens: torch.Tensor | None = None,
+    seq_idx: torch.Tensor | None = None,
+    lm_weight: torch.Tensor | None = None,
     grad_reduce_group: dist.ProcessGroup | None = None,
 ) -> torch.Tensor:
     """Compute the DeepSeek-V3 Multi-Token Prediction auxiliary loss.
@@ -214,10 +213,10 @@ class PipelineCausalLMLoss(nn.Module):
         self.ignore_index = ignore_index
         self.grad_reduce_group = grad_reduce_group
         # Legacy THD-pack fallback used when the model has no seq_idx tail.
-        self.cu_seqlens: Optional[torch.Tensor] = None
+        self.cu_seqlens: torch.Tensor | None = None
 
     @staticmethod
-    def _extract_seq_idx_tail(output) -> tuple[Optional[torch.Tensor], object]:
+    def _extract_seq_idx_tail(output) -> tuple[torch.Tensor | None, object]:
         """Detect and strip a trailing per-microbatch seq_idx from output.
 
         Convention: with MTP enabled the last-stage output is

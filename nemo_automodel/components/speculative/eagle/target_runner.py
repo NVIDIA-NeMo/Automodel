@@ -38,7 +38,7 @@ contract stays unit-testable on CPU against a fake runner.
 from __future__ import annotations
 
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Optional, Protocol, Sequence
+from typing import TYPE_CHECKING, Protocol, Sequence
 
 import torch
 
@@ -101,7 +101,7 @@ class RunnerEagle3TargetModel(Eagle3TargetBackend):
         the shared EAGLE-3 default recipe is used, matching every other backend.
     """
 
-    def __init__(self, runner: TargetRunner, aux_layer_ids: Optional[Sequence[int]] = None):
+    def __init__(self, runner: TargetRunner, aux_layer_ids: Sequence[int] | None = None):
         self._runner = runner
         # Expose ``.model`` so the remote server can read the target's config
         # and infer its device the same way it does for the co-located backend.

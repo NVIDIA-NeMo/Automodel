@@ -20,7 +20,7 @@ MFU calculation for various model architectures.
 
 import logging
 from os import PathLike
-from typing import TYPE_CHECKING, Dict, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Dict, Tuple, Union
 
 import torch
 
@@ -74,7 +74,7 @@ _CONFIG_ALIAS_ATTRS = (
 )
 
 
-def get_device_flops(unit: str = "T", device_name: Optional[str] = None) -> float:
+def get_device_flops(unit: str = "T", device_name: str | None = None) -> float:
     """Get theoretical device FLOPS in a requested unit.
 
     Args:
@@ -184,7 +184,7 @@ class AutoMFU:
         input_ids_or_tensor: Union[torch.Tensor, Tuple[int, int]],
         time_delta: float,
         world_size: int,
-    ) -> Optional[float]:
+    ) -> float | None:
         """Calculate MFU percentage.
 
         Args:
@@ -205,7 +205,7 @@ class AutoMFU:
     def get_flops(
         self,
         input_ids_or_tensor: Union[torch.Tensor, Tuple[int, int]],
-    ) -> Optional[float]:
+    ) -> float | None:
         """Calculate FLOPs for given input shape.
 
         Args:

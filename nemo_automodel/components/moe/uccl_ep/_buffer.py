@@ -15,7 +15,7 @@
 
 import os
 from contextlib import nullcontext
-from typing import Callable, List, Optional, Tuple, Union
+from typing import Callable, List, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -249,8 +249,8 @@ class Buffer:
         topk_idx: torch.Tensor,
         num_max_dispatch_tokens_per_rank: int,
         num_experts: int,
-        cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
-        dispatch_wait_recv_cost_stats: Optional[torch.Tensor] = None,
+        cumulative_local_expert_recv_stats: torch.Tensor | None = None,
+        dispatch_wait_recv_cost_stats: torch.Tensor | None = None,
         use_fp8: bool = True,
         round_scale: bool = False,
         use_ue8m0: bool = False,
@@ -401,8 +401,8 @@ class Buffer:
         zero_copy: bool = False,
         async_finish: bool = False,
         return_recv_hook: bool = False,
-        out: Optional[torch.Tensor] = None,
-        combine_wait_recv_cost_stats: Optional[torch.Tensor] = None,
+        out: torch.Tensor | None = None,
+        combine_wait_recv_cost_stats: torch.Tensor | None = None,
     ) -> Tuple[torch.Tensor, EventOverlap, Callable]:
         """
         A low-latency implementation for combining tokens (reduce **with weights**) with IBGDA.
@@ -559,7 +559,7 @@ class Buffer:
     def get_local_buffer_tensor(
         self,
         dtype: torch.dtype,
-        size: Optional[torch.Size] = None,
+        size: torch.Size | None = None,
         offset: int = 0,
         use_rdma_buffer: bool = False,
     ) -> torch.Tensor:
@@ -688,10 +688,10 @@ class Buffer:
         self,
         topk_idx: torch.Tensor,
         num_experts: int,
-        previous_event: Optional[EventOverlap] = None,
+        previous_event: EventOverlap | None = None,
         async_finish: bool = False,
         allocate_on_comm_stream: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor, EventOverlap]:
+    ) -> Tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor, EventOverlap]:
         """
         Calculate the layout required for later communication.
 
@@ -759,23 +759,23 @@ class Buffer:
     def dispatch(
         self,
         x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
-        handle: Optional[Tuple] = None,
-        num_tokens_per_rank: Optional[torch.Tensor] = None,
-        num_tokens_per_rdma_rank: Optional[torch.Tensor] = None,
-        is_token_in_rank: Optional[torch.Tensor] = None,
-        num_tokens_per_expert: Optional[torch.Tensor] = None,
-        topk_idx: Optional[torch.Tensor] = None,
-        topk_weights: Optional[torch.Tensor] = None,
+        handle: Tuple | None = None,
+        num_tokens_per_rank: torch.Tensor | None = None,
+        num_tokens_per_rdma_rank: torch.Tensor | None = None,
+        is_token_in_rank: torch.Tensor | None = None,
+        num_tokens_per_expert: torch.Tensor | None = None,
+        topk_idx: torch.Tensor | None = None,
+        topk_weights: torch.Tensor | None = None,
         expert_alignment: int = 1,
         num_worst_tokens: int = 0,
-        config: Optional[Config] = None,
-        previous_event: Optional[EventOverlap] = None,
+        config: Config | None = None,
+        previous_event: EventOverlap | None = None,
         async_finish: bool = False,
         allocate_on_comm_stream: bool = False,
     ) -> Tuple[
         Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor],
-        Optional[torch.Tensor],
-        Optional[torch.Tensor],
+        torch.Tensor | None,
+        torch.Tensor | None,
         List[int],
         Tuple,
         EventOverlap,
@@ -1020,13 +1020,13 @@ class Buffer:
         self,
         x: torch.Tensor,
         handle: Tuple,
-        topk_weights: Optional[torch.Tensor] = None,
+        topk_weights: torch.Tensor | None = None,
         bias: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]] = None,
-        config: Optional[Config] = None,
-        previous_event: Optional[EventOverlap] = None,
+        config: Config | None = None,
+        previous_event: EventOverlap | None = None,
         async_finish: bool = False,
         allocate_on_comm_stream: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], EventOverlap]:
+    ) -> Tuple[torch.Tensor, torch.Tensor | None, EventOverlap]:
         """
         Combine (reduce) tokens (addition **without** weights) from different ranks, both intranode and internode
             settings are supported.
@@ -1119,23 +1119,23 @@ class Buffer:
     def internode_dispatch(
         self,
         x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
-        handle: Optional[Tuple] = None,
-        num_tokens_per_rank: Optional[torch.Tensor] = None,
-        num_tokens_per_rdma_rank: Optional[torch.Tensor] = None,
-        is_token_in_rank: Optional[torch.Tensor] = None,
-        num_tokens_per_expert: Optional[torch.Tensor] = None,
-        topk_idx: Optional[torch.Tensor] = None,
-        topk_weights: Optional[torch.Tensor] = None,
+        handle: Tuple | None = None,
+        num_tokens_per_rank: torch.Tensor | None = None,
+        num_tokens_per_rdma_rank: torch.Tensor | None = None,
+        is_token_in_rank: torch.Tensor | None = None,
+        num_tokens_per_expert: torch.Tensor | None = None,
+        topk_idx: torch.Tensor | None = None,
+        topk_weights: torch.Tensor | None = None,
         expert_alignment: int = 1,
         num_worst_tokens: int = 0,
-        config: Optional[Config] = None,
-        previous_event: Optional[EventOverlap] = None,
+        config: Config | None = None,
+        previous_event: EventOverlap | None = None,
         async_finish: bool = False,
         allocate_on_comm_stream: bool = False,
     ) -> Tuple[
         Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor],
-        Optional[torch.Tensor],
-        Optional[torch.Tensor],
+        torch.Tensor | None,
+        torch.Tensor | None,
         List[int],
         Tuple,
         EventOverlap,
@@ -1373,13 +1373,13 @@ class Buffer:
         self,
         x: torch.Tensor,
         handle: Union[tuple, list],
-        topk_weights: Optional[torch.Tensor] = None,
+        topk_weights: torch.Tensor | None = None,
         bias: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]] = None,
-        config: Optional[Config] = None,
-        previous_event: Optional[EventOverlap] = None,
+        config: Config | None = None,
+        previous_event: EventOverlap | None = None,
         async_finish: bool = False,
         allocate_on_comm_stream: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], EventOverlap]:
+    ) -> Tuple[torch.Tensor, torch.Tensor | None, EventOverlap]:
         """
         Internode combine implementation, for more details, please refer to the `combine` docs.
         Normally, you should not directly call this function.

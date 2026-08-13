@@ -20,7 +20,7 @@ import math
 import os
 import time
 import types
-from typing import Callable, Optional, Protocol
+from typing import Callable, Protocol
 
 import torch
 import torch.nn as nn
@@ -102,7 +102,7 @@ def generate_hf_model_fqn_per_model_part(
     include_lm_head: bool = True,
     include_rotary_emb: bool = True,
     include_multimodal_encoders: bool = True,
-    extra_module_fqns: Optional[list[str]] = None,
+    extra_module_fqns: list[str] | None = None,
     fqn_prefix: str = "model.",
     lm_head_fqn: str = "lm_head",
 ) -> list[list[str]]:
@@ -181,7 +181,7 @@ def generate_hf_model_fqn_per_model_part(
 
 def calculate_virtual_stages(
     num_layers: int,
-    layers_per_stage: Optional[int],
+    layers_per_stage: int | None,
     pp_size: int,
     is_single_stage_schedule: bool,
     round_to_pp_multiple: str | None = None,
@@ -556,8 +556,8 @@ def split_model_into_stages(
     pp_axis_name: str,
     pp_schedule: str,
     device: torch.device,
-    module_names_per_stage: Optional[list[list[str]]] = None,
-    layers_per_stage: Optional[int] = None,
+    module_names_per_stage: list[list[str]] | None = None,
+    layers_per_stage: int | None = None,
     patch_inner_model: bool = True,
     patch_causal_lm_model: bool = True,
     round_to_pp_multiple: str | None = None,

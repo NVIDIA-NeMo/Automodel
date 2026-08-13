@@ -38,7 +38,7 @@ Structurally modelled after
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable
 
 import torch
 
@@ -225,7 +225,7 @@ class Mistral3FP8StateDictAdapter(StateDictAdapter):
     def to_hf(
         self,
         state_dict: dict[str, Any],
-        exclude_key_regex: Optional[str] = None,
+        exclude_key_regex: str | None = None,
         quantization: bool = False,
         **kwargs,
     ) -> dict[str, Any]:
@@ -261,7 +261,7 @@ class Mistral3FP8StateDictAdapter(StateDictAdapter):
     def from_hf(
         self,
         hf_state_dict: dict[str, Any],
-        device_mesh: Optional["DeviceMesh"] = None,
+        device_mesh: "DeviceMesh" | None = None,
         **kwargs,
     ) -> dict[str, Any]:
         """Convert an HF-format (possibly FP8) state dict to model-native format."""

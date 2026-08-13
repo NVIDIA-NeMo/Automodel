@@ -21,7 +21,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Optional, Tuple, Union
+from typing import Any, Tuple, Union
 
 import numpy as np
 import torch
@@ -201,8 +201,8 @@ class EventOverlap:
 
     def __init__(
         self,
-        event: Optional[EventHandle] = None,
-        extra_tensors: Optional[Tuple[torch.Tensor]] = None,
+        event: EventHandle | None = None,
+        extra_tensors: Tuple[torch.Tensor] | None = None,
     ) -> None:
         """
         Initialize the class.
@@ -362,7 +362,7 @@ def bench_kineto(
     kernel_names: Union[str, tuple],
     num_tests: int = 30,
     suppress_kineto_output: bool = False,
-    trace_path: Optional[str] = None,
+    trace_path: str | None = None,
     barrier_comm_profiling: bool = False,
     num_kernels_per_period: int = 1,
 ):

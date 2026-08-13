@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import logging
-from typing import Optional
 
 from torch.distributed.device_mesh import DeviceMesh
 
@@ -91,7 +90,7 @@ class FSDP2Manager:
         self,
         config: FSDP2Config,
         device_mesh: DeviceMesh,
-        moe_mesh: Optional[DeviceMesh] = None,
+        moe_mesh: DeviceMesh | None = None,
     ):
         self.config = config
         self.device_mesh = device_mesh

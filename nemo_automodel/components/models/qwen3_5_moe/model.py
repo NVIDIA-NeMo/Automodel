@@ -18,7 +18,7 @@ import copy
 import inspect
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, Optional, Union
+from typing import Any, Union
 
 import torch
 import torch.nn as nn
@@ -1440,7 +1440,7 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
         inputs_embeds: torch.Tensor | None = None,
         cache_position: torch.Tensor | None = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
-        output_hidden_states: Optional[bool] = None,
+        output_hidden_states: bool | None = None,
         **kwargs: Any,
     ):
         """Run Qwen3.5-MoE VLM generation with model-owned CP embedding.

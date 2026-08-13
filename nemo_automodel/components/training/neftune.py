@@ -20,7 +20,6 @@ training to improve generalization, with no additional compute or data overhead.
 """
 
 import logging
-from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -50,7 +49,7 @@ class NEFTune:
         if noise_alpha < 0:
             raise ValueError(f"noise_alpha must be non-negative, got {noise_alpha}")
         self.noise_alpha = noise_alpha
-        self._hook_handle: Optional[torch.utils.hooks.RemovableHook] = None
+        self._hook_handle: torch.utils.hooks.RemovableHook | None = None
         self._original_forward = None
 
     def _neftune_forward_hook(self, module: nn.Module, input: tuple, output: torch.Tensor) -> torch.Tensor:
@@ -103,7 +102,7 @@ class NEFTune:
         return self._hook_handle is not None
 
 
-def _get_input_embeddings(model: nn.Module) -> Optional[nn.Module]:
+def _get_input_embeddings(model: nn.Module) -> nn.Module | None:
     """Find the input embedding layer on a model.
 
     Checks for ``get_input_embeddings()`` method first (HF models),

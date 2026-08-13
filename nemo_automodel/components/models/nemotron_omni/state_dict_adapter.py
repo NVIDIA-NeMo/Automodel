@@ -250,7 +250,7 @@ class NemotronOmniStateDictAdapter(StateDictAdapter):
     def to_hf(
         self,
         state_dict: dict[str, Any],
-        exclude_key_regex: Optional[str] = None,
+        exclude_key_regex: str | None = None,
         **kwargs,
     ) -> dict[str, Any]:
         """Convert custom Automodel state dict to HF format.

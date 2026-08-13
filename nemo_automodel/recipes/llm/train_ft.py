@@ -32,7 +32,7 @@ import pathlib
 import time
 from contextlib import nullcontext
 from dataclasses import replace
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any
 
 import mlflow
 import torch
@@ -1161,7 +1161,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         torch.distributed.broadcast(tensor, src=pp_src_rank, group=pp_group)
         return tensor
 
-    def _run_train_optim_step(self, batches, max_grad_norm: Optional[float] = None):
+    def _run_train_optim_step(self, batches, max_grad_norm: float | None = None):
         """Execute a single training step.
 
         Args:

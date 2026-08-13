@@ -27,7 +27,7 @@ loadable via ``transformers.AutoModelForImageTextToText.from_pretrained``.
 from __future__ import annotations
 
 import re
-from typing import Any, Optional
+from typing import Any
 
 from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
 from nemo_automodel.components.models.common.gated_delta_net_fp32 import (
@@ -88,7 +88,7 @@ class Qwen3_5DenseStateDictAdapter(StateDictAdapter):
     def from_hf(
         self,
         hf_state_dict: dict[str, Any],
-        device_mesh: Optional[Any] = None,
+        device_mesh: Any | None = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
         del device_mesh, kwargs

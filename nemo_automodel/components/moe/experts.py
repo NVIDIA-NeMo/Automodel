@@ -1232,7 +1232,7 @@ class GroupedExpertsTE(nn.Module):
             stacked = stacked.transpose(-1, -2)  # [num_experts, in, out]
         return stacked
 
-    def _get_stacked_bias(self, linear: "GroupedLinear") -> Optional[torch.Tensor]:
+    def _get_stacked_bias(self, linear: "GroupedLinear") -> torch.Tensor | None:
         if not linear.use_bias:
             return None
         biases = []
@@ -1266,7 +1266,7 @@ class GroupedExpertsTE(nn.Module):
         dtensor = create_dtensor_from_local(tensor, device_mesh, self.ep_rank if device_mesh is not None else None)
         return dtensor
 
-    def _normalize_moe_mesh(self, moe_mesh: Optional[DeviceMesh]) -> Optional[DeviceMesh]:
+    def _normalize_moe_mesh(self, moe_mesh: DeviceMesh | None) -> DeviceMesh | None:
         if moe_mesh is None:
             return None
         allowed_dims = ("ep", "ep_shard", "ep_replicate")
@@ -1277,7 +1277,7 @@ class GroupedExpertsTE(nn.Module):
             return moe_mesh
         return moe_mesh[dims]
 
-    def set_moe_mesh(self, moe_mesh: Optional[DeviceMesh]) -> None:
+    def set_moe_mesh(self, moe_mesh: DeviceMesh | None) -> None:
         self.moe_mesh = self._normalize_moe_mesh(moe_mesh)
 
     @property
@@ -1286,7 +1286,7 @@ class GroupedExpertsTE(nn.Module):
         return tensor
 
     @gate_and_up_projs.setter
-    def gate_and_up_projs(self, value: Optional[torch.Tensor]) -> None:
+    def gate_and_up_projs(self, value: torch.Tensor | None) -> None:
         if value is None:
             return
         if isinstance(value, DTensor):
@@ -1299,7 +1299,7 @@ class GroupedExpertsTE(nn.Module):
         return self._to_ep_dtensor(self._get_stacked_weight(self.down_linear, transpose=True))
 
     @down_projs.setter
-    def down_projs(self, value: Optional[torch.Tensor]) -> None:
+    def down_projs(self, value: torch.Tensor | None) -> None:
         if value is None:
             return
         if isinstance(value, DTensor):
@@ -1308,7 +1308,7 @@ class GroupedExpertsTE(nn.Module):
         self._weights_loaded_from_checkpoint = True
 
     @property
-    def gate_up_proj_bias(self) -> Optional[torch.Tensor]:
+    def gate_up_proj_bias(self) -> torch.Tensor | None:
         if not self.expert_bias:
             return None
         bias = self._get_stacked_bias(self.gate_up_linear)
@@ -1317,7 +1317,7 @@ class GroupedExpertsTE(nn.Module):
         return self._to_ep_dtensor(bias)
 
     @gate_up_proj_bias.setter
-    def gate_up_proj_bias(self, value: Optional[torch.Tensor]) -> None:
+    def gate_up_proj_bias(self, value: torch.Tensor | None) -> None:
         if not self.expert_bias or value is None:
             return
         if isinstance(value, DTensor):
@@ -1325,7 +1325,7 @@ class GroupedExpertsTE(nn.Module):
         self._set_stacked_bias(self.gate_up_linear, value)
 
     @property
-    def down_proj_bias(self) -> Optional[torch.Tensor]:
+    def down_proj_bias(self) -> torch.Tensor | None:
         if not self.expert_bias:
             return None
         bias = self._get_stacked_bias(self.down_linear)
@@ -1334,7 +1334,7 @@ class GroupedExpertsTE(nn.Module):
         return self._to_ep_dtensor(bias)
 
     @down_proj_bias.setter
-    def down_proj_bias(self, value: Optional[torch.Tensor]) -> None:
+    def down_proj_bias(self, value: torch.Tensor | None) -> None:
         if not self.expert_bias or value is None:
             return
         if isinstance(value, DTensor):
@@ -1436,7 +1436,7 @@ class GroupedExpertsTE(nn.Module):
             else:
                 missing_keys.append(down_bias_key)
 
-    def init_token_dispatcher(self, ep_mesh: DeviceMesh, moe_mesh: Optional[DeviceMesh] = None):
+    def init_token_dispatcher(self, ep_mesh: DeviceMesh, moe_mesh: DeviceMesh | None = None):
         """
         Initialize the token dispatcher for expert parallelism.
 
