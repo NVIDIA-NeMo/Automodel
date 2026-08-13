@@ -28,7 +28,7 @@
 # per GPU. Its loss stayed aligned with the exact-data FSDP2-only baseline.
 #
 # torchrun --nproc-per-node=8 nemo_automodel/recipes/vlm/finetune.py \
-#   -c examples/vlm_finetune/gemma4/gemma4_e4b_tulu3_text_tp2.yaml
+#   -c examples/vlm_finetune/gemma4/gemma4_e4b_tulu3_text_tp2_cp2.yaml
 
 recipe: FinetuneRecipeForVLM
 
