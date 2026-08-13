@@ -706,7 +706,7 @@ def test_ministral3_crossencoder_processor_collates_flattened_mixed_pairs(pixtra
     assert [text.startswith("[IMG]") for text in texts] == [True, False, False, True]
 
 
-def test_ministral3_crossencoder_processor_escapes_reserved_tokens_in_user_text(pixtral_processor):
+def test_ministral3_crossencoder_processor_marks_user_owned_reserved_tokens(pixtral_processor):
     image = Image.new("RGB", (4, 4), (255, 0, 0))
     pixtral_processor.rerank_max_length = 64
     pixtral_processor.use_prompt_template = True
@@ -723,8 +723,8 @@ def test_ministral3_crossencoder_processor_escapes_reserved_tokens_in_user_text(
     text = pixtral_processor.tokenizer.calls[-1]["texts"][0]
     assert text.startswith("[IMG]")
     assert text.count("[IMG]") == 1
-    assert "question: Question [ IMG]" in text
-    assert "passage: Passage [ IMG] [ IMG_BREAK] [ IMG_END]" in text
+    assert "question: Question [\u200cIMG]" in text
+    assert "passage: Passage [\u200cIMG] [\u200cIMG_BREAK] [\u200cIMG_END]" in text
 
 
 def test_ministral3_biencoder_processor_returns_numpy_batch(pixtral_processor):

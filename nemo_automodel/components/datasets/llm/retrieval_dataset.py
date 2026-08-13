@@ -147,8 +147,19 @@ class VDRDataset(AbstractDataset):
     def get_document_by_id(self, id):
         from PIL import Image
 
+        image = self.data[self.docid2idx[id]]["image"]
+        if isinstance(image, dict):
+            if image.get("bytes") is not None:
+                image = Image.open(io.BytesIO(image["bytes"]))
+            elif image.get("path") is not None:
+                image = Image.open(image["path"])
+            else:
+                raise ValueError(f"VDR image for document {id!r} has neither bytes nor path.")
+        elif not isinstance(image, Image.Image):
+            raise TypeError(f"Unsupported VDR image type for document {id!r}: {type(image).__name__}")
+
         example = deepcopy(EXAMPLE_TEMPLATE)
-        example["image"] = Image.open(io.BytesIO(self.data[self.docid2idx[id]]["image"]["bytes"]))
+        example["image"] = image
         return example
 
     def get_all_ids(self):

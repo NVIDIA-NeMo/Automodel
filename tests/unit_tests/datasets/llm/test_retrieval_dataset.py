@@ -15,10 +15,12 @@
 import json
 import runpy
 import sys
+from io import BytesIO
 from typing import Any, Dict
 
 import pytest
 from datasets import Dataset
+from PIL import Image
 
 import nemo_automodel.components.datasets.llm.retrieval_dataset as rd
 import nemo_automodel.components.datasets.llm.retrieval_dataset_inline as rdi
@@ -54,6 +56,26 @@ class DummyCorpus(rd.AbstractDataset):
 
     def get_all_ids(self):
         return sorted(list(self._id_to_doc.keys()))
+
+
+@pytest.mark.parametrize("encoded", [False, True])
+def test_vdr_dataset_accepts_decoded_and_encoded_hf_images(encoded):
+    image = Image.new("RGB", (3, 2), (255, 0, 0))
+    stored_image = image
+    if encoded:
+        buffer = BytesIO()
+        image.save(buffer, format="PNG")
+        stored_image = {"bytes": buffer.getvalue(), "path": None}
+
+    dataset = rd.VDRDataset.__new__(rd.VDRDataset)
+    dataset.data = [{"id": "doc-1", "image": stored_image}]
+    dataset.docid2idx = {"doc-1": 0}
+
+    document = dataset.get_document_by_id("doc-1")
+
+    assert isinstance(document["image"], Image.Image)
+    assert document["image"].size == (3, 2)
+    assert document["text"] == ""
 
 
 def _mock_hf_load_dataset_returning(train_examples):
