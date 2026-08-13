@@ -683,7 +683,7 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
         inputs_embeds: torch.Tensor | None = None,
         logits_to_keep: int | None = None,
         **kwargs: Any,
-    ) -> torch.Tensor:
+) -> torch.Tensor | MiniMaxM3CausalLMOutput | dict[str, torch.Tensor]:
         is_pp_stage = self._is_pipeline_parallel_stage()
 
         # Authoritative MTP-under-PP guard: keyed on the config (which survives the
