@@ -9,11 +9,12 @@ printf "Arguments:"
 printf " %q" "$@"
 printf "\n"
 
-/opt/venv/bin/python -m pip install -e .
-# /opt/venv/bin/python -m pip install -e . --no-deps
-# For 25.11 image
-# /opt/venv/bin/python -m pip install transformers==5.5.0
-export TRITON_CACHE_DIR="/lustre/fsw/portfolios/llmservice/users/$SLURM_JOB_USER/triton_cache"
+# TODO: change TRITON_CACHE_DIR or add it to .bashrc
+export TRITON_CACHE_DIR="/lustre/fsw/portfolios/nemotron/projects/nemotron_retriever_dev/users/$SLURM_JOB_USER/triton_cache"
+
+# /opt/venv/bin/python -m pip install -e .
+/opt/venv/bin/python -m pip install -e . --no-deps
+/opt/venv/bin/python -m pip uninstall -y mistral_common
 pip install --index-url=https://sc-hw-artf.nvidia.com/artifactory/api/pypi/hwinf-mlwfo-pypi/simple --upgrade one-logger-utils
 
 # Use torchrun for distributed training
@@ -34,26 +35,29 @@ else
         "$@"
 fi
 
-# Example usage for multi-node training:
+# Sample command
 # python3 submit_nemo_run.py \
-#     --experiment_name llama_1b_bidirectional_avg_explicit_config_no_padding \
-#     --num_nodes 4 \
-#     --checkpoint_directory /lustre/fsw/portfolios/llmservice/users/ybabakhin/model_checkpoints \
-#     --container_image /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/03_sqsh/nvidia-nemo-automodel-26.04.00.sqsh \
-#     --train_script ./scripts/yauhen/train_biencoder.sh \
-#     --yaml_config examples/retrieval/bi_encoder/llama3_2_1b_release.yaml \
-#     --eval_script ./scripts/yauhen/eval_script_rteb.sh \
-#     --eval_datasets RTEB_QUICK \
-#     --more_train_args " \
-#         --optimizer.lr 5.0e-6 \
-#         --model.pooling avg \
-#     " \
-#     --more_eval_args " \
-#         --max_length 4096 \
-#         --batch_size 4 \
-#         --pooling avg \
-#         --padding_side left \
-#         --precision bf16 \
-#         --attn_implementation flash_attention_2 \
-#     " \
-#     --num_training_rounds 1
+    # --cluster nrt \
+    # --experiment_name nemorun_gabriel_stage_1_epoch_1_new_start \
+    # --num_nodes 4 \
+    # --checkpoint_directory /lustre/fsw/portfolios/nemotron/projects/nemotron_retriever_dev/users/ybabakhin/model_checkpoints \
+    # --container_image /lustre/fsw/portfolios/nemotron/projects/nemotron_retriever_dev/retriever_models_research/03_sqsh/nvidian-nemo-automodel-26.08.rc5.sqsh \
+    # --train_script ./scripts/yauhen/train_biencoder.sh \
+    # --yaml_config examples/retrieval/bi_encoder/yauhen/nrt_gabriel_stage_1.yaml \
+    # --more_train_args " \
+    #     --model.pretrained_model_name_or_path /lustre/fsw/portfolios/nemotron/projects/nemotron_retriever_dev/retriever_models_research/nemotron_4_embed_vl/pixtral_nemotron_3_embed_1B \
+    #     --tokenizer.pretrained_model_name_or_path /lustre/fsw/portfolios/nemotron/projects/nemotron_retriever_dev/retriever_models_research/nemotron_4_embed_vl/pixtral_nemotron_3_embed_1B \
+    #     --optimizer.lr 1.0e-4 \
+    #     --freeze_config.freeze_vision_tower true \
+    #     --freeze_config.freeze_language_model true \
+    # " \
+    # --eval_script ./scripts/yauhen/eval_script_vl.sh \
+    # --eval_datasets 20250405 small_textqa_eval_20250508 \
+    # --more_eval_args " \
+    #     --model_type mistral3 \
+    #     --batch_size 16 \
+    #     --max_length 10240 \
+    #     --pooling avg \
+    #     --corpus_modalities image \
+    # " \
+    # --num_training_rounds 1

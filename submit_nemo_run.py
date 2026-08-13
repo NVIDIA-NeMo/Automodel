@@ -12,20 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Usage: python3 submit_nemo_run.py -n test_qwen  -tr scripts/mengyaox/local_qwen2_5_vl_train_script.sh -e scripts/mengyaox/local_qwen2_5_eval_script.sh --eval_datasets vision_split small_textqa_eval_20250508  --run_local -r 2
+# Usage: python3 submit_nemo_run.py -n test_qwen  -tr scripts/mengyaox/local_qwen2_5_vl_train_script.sh -e scripts/mengyaox/local_qwen2_5_eval_script.sh --eval_datasets 20250405 small_textqa_eval_20250508  --run_local -r 2
 
-import os
 import argparse
+import csv
+import logging
+import os
+import time
 from datetime import datetime
 
 import nemo_run as run
-
-from automation.utils import eval_datasets, draco, get_script, validate_args
-from torchx.specs.api import AppState
-import csv
 import wandb
-import time
-import logging
+from torchx.specs.api import AppState
+
+from automation.utils import cluster_executor, eval_datasets, get_script, validate_args
 
 
 logging.basicConfig(level=logging.INFO)
@@ -36,6 +36,29 @@ IDLE_REAPER_COMMENT = (
     '"description":"Draco cluster is in the broken state and kills false positive IDLE jobs. '
     'These runs are critical for the release. MARSSUP-6917"}}'
 )
+
+_EVAL_DATASET_DIRS_BY_CLUSTER = {
+    "draco": (
+        "/lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/"
+        "retriever_models_research/01_datasets/01_evaluation_datasets/"
+    ),
+    "nrt": (
+        "/lustre/fsw/portfolios/nemotron/projects/nemotron_retriever_dev/"
+        "retriever_models_research/01_datasets/01_evaluation_datasets/"
+    ),
+}
+
+_CLUSTER_RUN_KWARGS = {
+    "draco": {
+        "partition": "batch_block1,batch_block3,batch_block4",
+        "ssh_host": "draco-oci-dc-02.draco-oci-iad.nvidia.com",
+    },
+    "nrt": {
+        "partition": "batch_block1",
+        "ssh_host": "oci-nrt-cs-001-dc-02.nvidia.com",
+    },
+}
+
 
 def str2bool(v):
     if isinstance(v, bool):
@@ -59,7 +82,19 @@ def get_args():
         '--container_image',
         type=str,
         help='Container used for training and evaluation',
-        default='/home/bschifferer/llm2/team_folder/03_sqsh/inform-python3.10-vidore-beir-flashattn-nemorun-ncclupdate.sqsh'
+        default='/lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/03_sqsh/nvidia-nemo-automodel-26.06.sqsh'
+    )
+    parser.add_argument(
+        '--job_dir',
+        type=str,
+        help='Directory for the job files to be rsynced to',
+        default=f"/lustre/fsw/portfolios/nemotron/projects/nemotron_retriever_dev/users/{os.getenv('USER')}/jobs",
+    )
+    parser.add_argument(
+        "--use_remote_code_symlink",
+        action="store_true",
+        default=False,
+        help="Use this AutoModel checkout directly for training jobs instead of packaging it",
     )
     parser.add_argument(
         '-ckpd', '--checkpoint_directory',
@@ -68,16 +103,23 @@ def get_args():
         default=None
     )
     parser.add_argument(
+        "--cluster",
+        type=str,
+        choices=("draco", "nrt"),
+        default=None,
+        help="Cluster used for Slurm execution",
+    )
+    parser.add_argument(
+        "--partition",
+        type=str,
+        default=None,
+        help="Slurm partition override",
+    )
+    parser.add_argument(
         '--account',
         type=str,
         help='Slurm account to use for the job',
         default='nemotron_retriever_dev',
-    )
-    parser.add_argument(
-        '--partition',
-        type=str,
-        help='Partition - e.g. interactive',
-        default="batch_block1,batch_block3,batch_block4"
     )
     parser.add_argument(
         '--num_nodes',
@@ -128,13 +170,11 @@ def get_args():
         help='Datasets to evaluate (can specify multiple datasets)',
         default=None
     )
-
     parser.add_argument(
         '--run_local',
         help='Run locally',
         action='store_true',
     )
-
     parser.add_argument(
         '-nt', '--no_append_timestamp',
         action='store_true',
@@ -248,7 +288,6 @@ def main():
     logger.info('User: ' + str(username))
     logger.info("########################## " + "args" + " #######################")
     logger.info(args)
-      
 
     if args.experiment_name is None:
         experiment_id = "train_model_experiment"
@@ -267,25 +306,38 @@ def main():
         train_executor = run.LocalExecutor()
         eval_executor = run.LocalExecutor()
     else:
-        train_executor = draco(
+        if args.cluster not in _CLUSTER_RUN_KWARGS:
+            raise ValueError(
+                f"Invalid cluster: {args.cluster}. Available clusters: "
+                f"{', '.join(_CLUSTER_RUN_KWARGS)}. Please use --cluster to specify the cluster."
+            )
+        run_kwargs = dict(_CLUSTER_RUN_KWARGS[args.cluster])
+        if args.partition is not None:
+            run_kwargs["partition"] = args.partition
+
+        remote_code_dir = os.path.dirname(os.path.abspath(__file__))
+        train_executor = cluster_executor(
             account=args.account,
-            container_image = args.container_image,
-            partition = args.partition,
-            nodes = int(args.num_nodes),        
+            container_image=args.container_image,
+            job_dir=args.job_dir,
+            nodes = int(args.num_nodes),
             dependency_type="afterany",
             job_name_prefix=experiment_id,
             gpus_per_node=0 if args.partition == "cpu" else 8,
+            symlink_from_remote_dir=remote_code_dir if args.use_remote_code_symlink else None,
             # comment=IDLE_REAPER_COMMENT,
+            **run_kwargs,
         )
-        eval_executor = draco(
+        eval_executor = cluster_executor(
             account=args.account,
-            container_image = args.container_image,
-            partition = args.partition,
-            nodes = 1,
+            container_image=args.container_image,
+            job_dir=args.job_dir,
+            nodes=1,
             job_name_prefix='e_' + experiment_id,
+            symlink_from_remote_dir=remote_code_dir,
             # comment=IDLE_REAPER_COMMENT,
+            **run_kwargs,
         )
-    
     
     if args.checkpoint_directory is None:
         if isinstance(train_executor, run.SlurmExecutor):
@@ -299,6 +351,12 @@ def main():
     args.more_train_args += f' --config {args.yaml_config} --checkpoint.checkpoint_dir {experiment_checkpoint_directory} --wandb.name {experiment_id} '
     if 'model_name_or_path' not in args.more_eval_args: 
         args.more_eval_args += f' --model_name_or_path {experiment_checkpoint_directory}/LATEST/model/consolidated'
+    if (
+        args.eval_datasets
+        and "--dataset_dir" not in args.more_eval_args
+        and args.cluster in _EVAL_DATASET_DIRS_BY_CLUSTER
+    ):
+        args.more_eval_args += f" --dataset_dir {_EVAL_DATASET_DIRS_BY_CLUSTER[args.cluster]}"
 
     logger.info("########################## " + "more_train_args" + " #######################")
     logger.info(args.more_train_args)
@@ -341,10 +399,9 @@ def main():
 
             if args.eval_datasets is not None and len(args.eval_datasets) > 0:
                 for eval_dataset in args.eval_datasets:
-                    eval_commands = []
                     if eval_dataset not in eval_datasets.keys():
                         eval_datasets[eval_dataset] = [(eval_dataset, "")]
-                    for (dataset_list, extra_eval_args) in eval_datasets[eval_dataset]:
+                    for job_idx, (dataset_list, extra_eval_args) in enumerate(eval_datasets[eval_dataset]):
                         logger.info(f"Evaluating on {dataset_list}")
                         eval_args = args.more_eval_args
                         if "--eval_group_name" not in eval_args and "--eval_group_name" not in extra_eval_args:
@@ -353,20 +410,18 @@ def main():
                             eval_args += f" --results_dir_name {args.results_dir_name}/{eval_dataset}"
                         if "--dataset_mapping" not in eval_args and "--dataset_mapping" not in extra_eval_args:
                             eval_args += f" --dataset_mapping {eval_dataset}"
-                            logger.info("Dataset mappings module not available, using default mapping")
+                            logger.info("Using dataset mapping version: %s", eval_dataset)
                         eval_args += " --dataset " + dataset_list + extra_eval_args
-                        eval_commands.append(f"{args.eval_script} {eval_args}")
-
-                    combined_eval_inline = "\n".join(eval_commands)
-                    script = run.Script(inline=combined_eval_inline)
-                    logger.info("Evaluation Script for %s", eval_dataset)
-                    logger.info(script)
-                    exp.add(
-                        script,
-                        name=f"eval_{eval_dataset}",
-                        executor=eval_executor,
-                        dependencies=[train_job_name] if train_job_name else None
-                    )
+                        script = run.Script(inline=f"{args.eval_script} {eval_args}")
+                        job_name = f"eval_{eval_dataset}_{job_idx}"
+                        logger.info("Evaluation Script for %s", job_name)
+                        logger.info(script)
+                        exp.add(
+                            script,
+                            name=job_name,
+                            executor=eval_executor,
+                            dependencies=[train_job_name] if train_job_name else None
+                        )
 
             # Launches the experiment Slurm tasks 
             if args.run_local:
