@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from math import ceil
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -43,7 +44,12 @@ def _require_fastgen() -> Any:
     """Import ModelOpt only when DMD2 is configured."""
     has_fastgen, fastgen = safe_import("modelopt.torch.fastgen")
     if not has_fastgen:
-        raise ImportError("DMD2 requires ModelOpt FastGen; install with `uv sync --extra dmd2`.")
+        raise ImportError(
+            "DMD2 requires ModelOpt FastGen; install with `uv sync --extra dmd2`, which resolves the "
+            "rev pinned in [tool.uv.sources]. Note that `pip install nemo_automodel[dmd2]` resolves a "
+            "PyPI release instead, whose Qwen-Image plugin still passes `txt_seq_lens` and therefore "
+            "does not work with the diffusers>=0.39 this package requires."
+        )
     return fastgen
 
 
@@ -77,8 +83,14 @@ class _DMD2Objective:
         for key in ("discriminator", "feature_capture", "negative_prompt_embedding_path", "pipeline"):
             config.pop(key, None)
         self.dmd_config = fastgen.DMDConfig(**config)
-        if self.dmd_config.student_update_freq < 1:
-            raise ValueError("dmd2.student_update_freq must be at least 1.")
+        if self.dmd_config.student_update_freq < 2:
+            raise ValueError(
+                "dmd2.student_update_freq must be at least 2, got "
+                f"{self.dmd_config.student_update_freq}. The trainer runs a student update when "
+                "`step % student_update_freq == 0` and a fake-score/discriminator update otherwise, "
+                "so student_update_freq=1 makes every step a student step and never trains the fake "
+                "score or discriminator."
+            )
 
         self.dmd_pipeline: Any | None = None
         self.teacher: nn.Module | None = None
@@ -221,21 +233,46 @@ class _DMD2Objective:
                 f"expected {expected_student_steps}, restored {restored_student_steps}."
             )
 
+    @contextmanager
+    def _discriminator_trainable(self):
+        """Expose the discriminator as trainable while DCP materializes its optimizer state.
+
+        ``torch.distributed.checkpoint``'s ``_init_optim_state`` only zero-fills gradients for
+        parameters with ``requires_grad=True``, so it creates no optimizer state for a frozen
+        model. :meth:`_set_phase` leaves the discriminator frozen after every student phase,
+        so without this a checkpoint taken during a student phase — the first outer step, a
+        ``ckpt_every_steps: 1`` run, or any preemption — would persist ``param_groups`` with no
+        ``state`` entries. The resume-side load rebuilds the discriminator trainable and then
+        asks DCP for keys that were never written, failing with
+        "Missing key in checkpoint state_dict: discriminator_optimizer.optim.state...".
+        """
+        if self.discriminator is None:
+            yield
+            return
+        was_trainable = [parameter.requires_grad for parameter in self.discriminator.parameters()]
+        self.discriminator.requires_grad_(True)
+        try:
+            yield
+        finally:
+            for parameter, trainable in zip(self.discriminator.parameters(), was_trainable):
+                parameter.requires_grad_(trainable)
+
     def state_dict(self) -> dict[str, Any]:
         """Return DCP-compatible fake-score, discriminator, optimizer, and EMA state."""
         self._require_ready()
         assert self._fake_score_state is not None
         assert self._fake_score_optimizer_state is not None
-        state = {
-            "fake_score": self._fake_score_state.state_dict(),
-            "fake_score_optimizer": self._fake_score_optimizer_state.state_dict(),
-        }
-        if self._discriminator_state is not None:
-            state["discriminator"] = self._discriminator_state.state_dict()
-        if self._discriminator_optimizer_state is not None:
-            state["discriminator_optimizer"] = self._discriminator_optimizer_state.state_dict()
-        if self.dmd_pipeline.ema is not None:
-            state["ema"] = self.dmd_pipeline.ema.state_dict()
+        with self._discriminator_trainable():
+            state = {
+                "fake_score": self._fake_score_state.state_dict(),
+                "fake_score_optimizer": self._fake_score_optimizer_state.state_dict(),
+            }
+            if self._discriminator_state is not None:
+                state["discriminator"] = self._discriminator_state.state_dict()
+            if self._discriminator_optimizer_state is not None:
+                state["discriminator_optimizer"] = self._discriminator_optimizer_state.state_dict()
+            if self.dmd_pipeline.ema is not None:
+                state["ema"] = self.dmd_pipeline.ema.state_dict()
         return state
 
     def load_state_dict(self, state: dict[str, Any]) -> None:
@@ -250,14 +287,15 @@ class _DMD2Objective:
         self._require_ready()
         assert self._fake_score_state is not None
         assert self._fake_score_optimizer_state is not None
-        self._fake_score_state.load_state_dict(state["fake_score"])
-        self._fake_score_optimizer_state.load_state_dict(state["fake_score_optimizer"])
-        if self._discriminator_state is not None:
-            self._discriminator_state.load_state_dict(state["discriminator"])
-        if self._discriminator_optimizer_state is not None:
-            self._discriminator_optimizer_state.load_state_dict(state["discriminator_optimizer"])
-        if self.dmd_pipeline.ema is not None:
-            self.dmd_pipeline.ema.load_state_dict(state["ema"])
+        with self._discriminator_trainable():
+            self._fake_score_state.load_state_dict(state["fake_score"])
+            self._fake_score_optimizer_state.load_state_dict(state["fake_score_optimizer"])
+            if self._discriminator_state is not None:
+                self._discriminator_state.load_state_dict(state["discriminator"])
+            if self._discriminator_optimizer_state is not None:
+                self._discriminator_optimizer_state.load_state_dict(state["discriminator_optimizer"])
+            if self.dmd_pipeline.ema is not None:
+                self.dmd_pipeline.ema.load_state_dict(state["ema"])
 
     def train_batch_group(
         self,
@@ -499,10 +537,30 @@ class _DMD2Objective:
         return latents, torch.randn_like(latents), text_embeddings, text_mask, negative, negative_mask
 
     def _set_phase(self, recipe: TrainDiffusionRecipe, student_phase: bool) -> None:
+        """Select the active model for this phase.
+
+        Only ``train()``/``eval()`` is toggled on the FSDP2-sharded student and fake score;
+        their ``requires_grad`` flags are deliberately left enabled. FSDP2 caches a parameter
+        group's ``_orig_dtype``/``_reduce_dtype`` on the module's *first* forward, computed
+        only from parameters with ``requires_grad=True``
+        (``FSDPParamGroup._init_mp_dtypes``), and caches ``None`` when that set is empty.
+        Step 0 is always a student phase and ModelOpt evaluates the fake score inside
+        ``compute_student_loss``, so freezing here would make the fake score's first forward a
+        frozen one and poison that cache for the whole run: its gradients would then be
+        reduce-scattered in the parameter dtype instead of the configured
+        ``fsdp.reduce_dtype``, and fp32 master weights would fail outright with
+        "attempting to assign a gradient with dtype 'c10::BFloat16'".
+
+        Gradients still cannot leak into the inactive transformer: ModelOpt wraps the
+        fake-score forward in ``compute_student_loss`` and the student forward in both
+        ``compute_fake_score_loss`` and ``compute_discriminator_loss`` in ``torch.no_grad()``.
+
+        The discriminator is replicated rather than sharded, so it has no cached
+        mixed-precision state to corrupt. It stays frozen outside its own phase so the student
+        phase does not build discriminator gradients that the next phase would discard.
+        """
         recipe.model.train(student_phase)
-        recipe.model.requires_grad_(student_phase)
         self.fake_score.train(not student_phase)
-        self.fake_score.requires_grad_(not student_phase)
         if self.discriminator is not None:
             self.discriminator.train(not student_phase)
             self.discriminator.requires_grad_(not student_phase)

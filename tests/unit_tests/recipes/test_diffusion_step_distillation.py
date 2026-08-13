@@ -417,6 +417,69 @@ def test_dmd2_production_checkpoint_resumes_all_training_state(tmp_path):
         restored.checkpointer.close()
 
 
+def test_set_phase_keeps_sharded_transformers_trainable():
+    """The student and fake score must stay ``requires_grad=True`` in both phases.
+
+    FSDP2 caches a parameter group's ``_orig_dtype``/``_reduce_dtype`` from its *trainable*
+    parameters at the module's first forward. Step 0 is a student phase and ModelOpt
+    evaluates the fake score inside ``compute_student_loss``, so freezing either sharded
+    transformer here would poison that cache for the rest of the run — silently reducing
+    gradients in the parameter dtype instead of ``fsdp.reduce_dtype``, and raising
+    "attempting to assign a gradient with dtype 'c10::BFloat16'" under fp32 master weights.
+    Only the replicated discriminator, which has no such cached state, is toggled.
+    """
+    objective = _objective()
+    objective.fake_score = _linear()
+    objective.discriminator = _linear()
+    recipe = SimpleNamespace(model=_linear())
+
+    for student_phase in (True, False, True):
+        objective._set_phase(recipe, student_phase)
+
+        assert all(parameter.requires_grad for parameter in recipe.model.parameters())
+        assert all(parameter.requires_grad for parameter in objective.fake_score.parameters())
+        assert recipe.model.training is student_phase
+        assert objective.fake_score.training is not student_phase
+
+        assert objective.discriminator.training is not student_phase
+        assert all(parameter.requires_grad is not student_phase for parameter in objective.discriminator.parameters())
+
+
+def test_checkpoint_taken_during_student_phase_resumes(tmp_path):
+    """A checkpoint saved before the first fake-score phase must stay resumable.
+
+    ``_set_phase`` leaves the discriminator frozen after a student phase, and DCP's
+    ``_init_optim_state`` only materializes optimizer state for trainable parameters. Without
+    :meth:`_DMD2Objective._discriminator_trainable` the saved discriminator optimizer carries
+    ``param_groups`` and no ``state``, and the resume-side load fails with
+    "Missing key in checkpoint state_dict: discriminator_optimizer.optim.state...".
+    """
+    source = _checkpoint_recipe(tmp_path, base_weight=1.0)
+    restored = _checkpoint_recipe(tmp_path, base_weight=-4.0)
+    try:
+        # One outer step only: with student_update_freq=2 that is the student phase, so the
+        # discriminator optimizer has never stepped and the discriminator is frozen.
+        source._train_batch_group(next(iter(source.step_scheduler)), global_step=-1)
+        assert not any(parameter.requires_grad for parameter in source._dmd2.discriminator.parameters())
+        assert not source._dmd2.discriminator_optimizer.state
+        source.save_checkpoint(epoch=0, step=1, train_loss=0.0)
+
+        restored.load_checkpoint("LATEST")
+        restored._dmd2.after_restore(restored)
+
+        assert restored.step_scheduler.step == 1
+        for name in ("fake_score", "discriminator"):
+            torch.testing.assert_close(
+                getattr(restored._dmd2, name).state_dict(),
+                getattr(source._dmd2, name).state_dict(),
+            )
+        # The checkpoint hook restores the phase toggle rather than leaving it enabled.
+        assert not any(parameter.requires_grad for parameter in source._dmd2.discriminator.parameters())
+    finally:
+        source.checkpointer.close()
+        restored.checkpointer.close()
+
+
 def _run_discriminator_sync(rank: int, world_size: int, init_file: str) -> None:
     dist.init_process_group(
         "gloo",
@@ -565,9 +628,12 @@ def test_load_negative_prompt_embedding_rejects_missing_and_non_finite_files(tmp
         _load_negative_prompt_embedding(str(path))
 
 
-def test_init_rejects_nonpositive_student_update_freq():
+@pytest.mark.parametrize("student_update_freq", [0, 1])
+def test_init_rejects_student_update_freq_below_two(student_update_freq):
+    # freq=1 makes `step % freq == 0` true on every step, so the fake score and
+    # discriminator would never be trained while still feeding the student loss.
     with pytest.raises(ValueError, match="student_update_freq"):
-        _objective(student_update_freq=0)
+        _objective(student_update_freq=student_update_freq)
 
 
 @pytest.mark.parametrize(

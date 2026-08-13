@@ -12,8 +12,17 @@ Install the DMD2 dependency:
 uv sync --extra dmd2
 ```
 
-The required FastGen APIs are currently pinned to a ModelOpt commit, so use
-this source-checkout `uv` workflow until they are included in a ModelOpt release.
+Use this `uv` workflow rather than `pip install nemo_automodel[dmd2]`. The pinned
+ModelOpt rev is required, not a convenience: released ModelOpt (through
+`0.46.0rc1`) still passes `txt_seq_lens` to `QwenImageTransformer2DModel`, which
+diffusers removed in `0.39` — the version this package requires. Only the pinned
+rev guards that call behind a diffusers-version check. `[tool.uv.sources]` is not
+carried in the published wheel metadata, so the PyPI install path resolves a
+release that does not work here.
+
+If you already have an environment, add the extra rather than replacing it:
+`uv sync --extra all --extra dmd2` (a bare `uv sync --extra dmd2` syncs *only*
+that extra and drops the rest).
 
 The negative-prompt embedding is required by CFG, not by DMD2 itself. Because
 this example uses `guidance_scale: 4.0`, generate it once with the same
