@@ -163,22 +163,6 @@ def load_torch_ckpt(
         raise RuntimeError(_format_restricted_load_error(f)) from err
 
 
-# NOTE [nemotron-singlegpu-lora]: the branches tagged with this marker below exist to make
-# single-GPU LoRA SFT of merged-expert Nemotron-H MoE (30B-class) fit on one 80GB GPU.  The
-# default DCP / set_model_state_dict load path transiently materializes a second on-device
-# copy of the (merged) expert weights, which OOMs when the whole model lives on one device.
-# The affected sites are:
-#   * Checkpointer.load                -- route single-device custom safetensors through the
-#                                         frugal full-state path instead of DCP
-#   * _load_full_state_dict_into_model -- normalize stray real (CPU) buffers onto the param
-#                                         device, and use plain load_state_dict when the model
-#                                         is not DTensor-sharded
-# Exercised by: examples/llm_finetune/nemotron/nemotron_nano_v3_singlegpu_lora.yaml
-# These are point fixes bolted onto an already-overloaded load path; a future checkpoint
-# refactor should consolidate the single-device vs. sharded loading logic into one place.
-# `grep -n nemotron-singlegpu-lora` finds every affected site.
-
-
 def _unwrap_ddp_model(model: nn.Module) -> nn.Module:
     """Return the module that owns model metadata hidden by DDP."""
     if isinstance(model, DistributedDataParallel):
@@ -844,27 +828,13 @@ class Checkpointer:
         # the broadcast_from_rank0 hang where rank 0's synchronous CPU→GPU copies
         # fall behind other ranks' async allocations.
         is_safetensors = _is_safetensors_checkpoint(model_path)
-        # [nemotron-singlegpu-lora] (see module note at top of file)
-        # Custom models (e.g. NemotronH) normally take the DCP path below, which converts the
-        # model's state dict to_hf to build load destinations.  For merged-expert MoE models that
-        # transiently materializes a second copy of the expert weights on-device, which OOMs when
-        # the whole model lives on one GPU.  On a single device there is no DTensor sharding, so the
-        # frugal full-state path (load to CPU, from_hf-merge on CPU, copy into the model) is correct
-        # and keeps device memory at ~model size — letting 30B-class MoE LoRA SFT fit on one 80GB GPU.
-        # World size inline (not via components.distributed) so the checkpoint component stays
-        # independent per the import-linter contract.
-        if torch.distributed.is_initialized():
-            world_size = torch.distributed.get_world_size()
-        else:
-            world_size = int(os.environ.get("WORLD_SIZE", "1"))
-        single_device_custom_safetensors = is_safetensors and _is_custom_model(model_state.model[0]) and world_size == 1
+        is_custom_model = _is_custom_model(model_state.model[0])
         if (
             is_init_step
             and len(model_state.model) == 1
             and (
                 _is_bin_checkpoint(model_path)
-                or (is_safetensors and not _is_custom_model(model_state.model[0]))
-                or single_device_custom_safetensors
+                or (is_safetensors and not is_custom_model)
             )
         ):
             t0 = time.monotonic()
@@ -2327,7 +2297,6 @@ def _load_full_state_dict_into_model(
                 if key not in state_dict:
                     state_dict[key] = torch.tensor([], dtype=torch.uint8)
 
-    # [nemotron-singlegpu-lora] (see module note at top of file)
     # set_model_state_dict(full_state_dict=True) requires every parameter/buffer of a
     # part to live on a single device.  Custom models (e.g. NemotronH/Mamba) can leave a
     # concrete CPU buffer behind after meta materialization (initialize_model_weights only
@@ -2356,7 +2325,6 @@ def _load_full_state_dict_into_model(
     except ImportError:  # pragma: no cover - older torch
         from torch.distributed._tensor import DTensor
 
-    # [nemotron-singlegpu-lora] (see module note at top of file)
     for part in model_parts:
         if any(isinstance(p, DTensor) for p in part.parameters()):
             # Sharded model (FSDP/TP): set_model_state_dict slices each rank's local
