@@ -79,7 +79,7 @@ def datums_from_verl(mb) -> list[Datum]:
         datums.append(
             Datum(
                 input_ids=seq,
-                loss_inputs={
+                loss_fn_inputs={
                     "target_tokens": torch.roll(seq, -1),  # verl derives targets by roll(-1)
                     "weights": mb["loss_mask"][a:b],
                     "advantages": mb["advantages"][a:b],
@@ -95,8 +95,8 @@ def _datum_ppo_loss(model_output, datums, *, clip_eps=0.2, **kwargs):
     Engine built-ins; the consumer provides them."""
     out = []
     for lp, d in zip(model_output.logprobs, datums):
-        old = d.loss_inputs["logprobs"].to(lp)
-        adv = d.loss_inputs["advantages"].to(lp)
+        old = d.loss_fn_inputs["logprobs"].to(lp)
+        adv = d.loss_fn_inputs["advantages"].to(lp)
         ratio = torch.exp(lp - old)
         out.append(-torch.minimum(ratio * adv, torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps) * adv))
     return out

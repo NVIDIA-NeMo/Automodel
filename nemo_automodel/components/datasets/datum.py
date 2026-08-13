@@ -29,7 +29,7 @@ it is a forward concern, not a dataset one.
 Conventions
 -----------
 * A ``Datum`` holds **one** sequence. ``input_ids`` is 1-D, shape ``[T]``.
-* ``loss_inputs`` carries everything the loss needs, aligned to ``input_ids``
+* ``loss_fn_inputs`` carries everything the loss needs, aligned to ``input_ids``
   token positions (length ``T``) for per-token entries:
 
   ===============  =======================================================
@@ -98,22 +98,22 @@ class Datum:
 
     Args:
         input_ids: 1-D ``LongTensor`` of token ids, shape ``[T]``.
-        loss_inputs: per-key tensors the loss consumes. Per-token entries are
+        loss_fn_inputs: per-key tensors the loss consumes. Per-token entries are
             1-D and length ``T``; per-sample entries are scalar or shape ``[1]``.
             See the module docstring for the well-known keys.
     """
 
     input_ids: torch.Tensor
-    loss_inputs: dict[str, torch.Tensor] = field(default_factory=dict)
+    loss_fn_inputs: dict[str, torch.Tensor] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not isinstance(self.input_ids, torch.Tensor):
             self.input_ids = torch.as_tensor(self.input_ids, dtype=torch.long)
         if self.input_ids.dim() != 1:
             raise ValueError(f"Datum.input_ids must be 1-D [T]; got shape {tuple(self.input_ids.shape)}")
-        for key, value in self.loss_inputs.items():
+        for key, value in self.loss_fn_inputs.items():
             if not isinstance(value, torch.Tensor):
-                self.loss_inputs[key] = torch.as_tensor(value)
+                self.loss_fn_inputs[key] = torch.as_tensor(value)
 
     @property
     def seq_len(self) -> int:
@@ -124,14 +124,14 @@ class Datum:
         """Return a copy with all tensors moved to ``device``."""
         return Datum(
             input_ids=self.input_ids.to(device, non_blocking=non_blocking),
-            loss_inputs={k: v.to(device, non_blocking=non_blocking) for k, v in self.loss_inputs.items()},
+            loss_fn_inputs={k: v.to(device, non_blocking=non_blocking) for k, v in self.loss_fn_inputs.items()},
         )
 
     def to_features(self, *, ignore_index: int = CROSS_ENTROPY_IGNORE_IDX) -> dict[str, list[int]]:
         """Emit the per-example dict the canonical collaters expect.
 
-        ``labels`` is included only when ``loss_inputs["target_tokens"]`` is
-        present, with positions where ``loss_inputs["weights"] == 0`` set to
+        ``labels`` is included only when ``loss_fn_inputs["target_tokens"]`` is
+        present, with positions where ``loss_fn_inputs["weights"] == 0`` set to
         ``ignore_index``. Only integer token fields are emitted here — the
         collaters cast to ``LongTensor``; float side-inputs are batched
         separately by :func:`collate_datums`.
@@ -140,9 +140,9 @@ class Datum:
             ``{"input_ids": [...], "labels": [...]}`` as plain ``list[int]``.
         """
         features: dict[str, list[int]] = {"input_ids": self.input_ids.tolist()}
-        if "target_tokens" in self.loss_inputs:
-            labels = self.loss_inputs["target_tokens"].clone()
-            weights = self.loss_inputs.get("weights")
+        if "target_tokens" in self.loss_fn_inputs:
+            labels = self.loss_fn_inputs["target_tokens"].clone()
+            weights = self.loss_fn_inputs.get("weights")
             if weights is not None:
                 labels = labels.masked_fill(weights == 0, ignore_index)
             features["labels"] = labels.tolist()
@@ -150,11 +150,11 @@ class Datum:
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to plain tensors (round-trips with :meth:`from_dict`)."""
-        return {"input_ids": self.input_ids, "loss_inputs": dict(self.loss_inputs)}
+        return {"input_ids": self.input_ids, "loss_fn_inputs": dict(self.loss_fn_inputs)}
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Datum":
-        return cls(input_ids=data["input_ids"], loss_inputs=dict(data.get("loss_inputs", {})))
+        return cls(input_ids=data["input_ids"], loss_fn_inputs=dict(data.get("loss_fn_inputs", {})))
 
 
 def collate_datums(
@@ -176,7 +176,7 @@ def collate_datums(
       the flat ``[1, total_tokens]`` THD schema (``qkv_format="thd"``,
       per-sequence ``seq_lens`` for splitting outputs back per datum).
 
-    Float per-token side-inputs (every ``loss_inputs`` key shared by all datums
+    Float per-token side-inputs (every ``loss_fn_inputs`` key shared by all datums
     except ``target_tokens``, e.g. ``weights`` / ``logprobs`` / ``advantages``)
     are batched under their own key — this is the part the token collaters
     cannot carry (they cast to ``LongTensor``). Padded mode right-pads them to
@@ -209,11 +209,11 @@ def collate_datums(
         batch = default_collater([dict(f) for f in features], pad_seq_len_divisible)
 
     width = int(batch["input_ids"].shape[-1])
-    shared_keys = set(datums[0].loss_inputs)
+    shared_keys = set(datums[0].loss_fn_inputs)
     for d in datums[1:]:
-        shared_keys &= set(d.loss_inputs)
+        shared_keys &= set(d.loss_fn_inputs)
     for key in sorted(shared_keys - {"target_tokens"}):
-        rows = [d.loss_inputs[key].to(torch.float).flatten() for d in datums]
+        rows = [d.loss_fn_inputs[key].to(torch.float).flatten() for d in datums]
         if all(r.shape[0] == d.seq_len for r, d in zip(rows, datums)):
             if packed:
                 # Per-token field, packed: concatenate in datum order so the

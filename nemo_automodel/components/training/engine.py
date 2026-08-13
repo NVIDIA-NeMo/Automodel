@@ -624,7 +624,7 @@ class Engine:
         With ``Config.pack_datums`` each microbatch is packed into one flat
         ``[1, total_tokens]`` THD row (text-only; rejected under CP). The loss
         contract is unaffected: ``loss_fn`` still receives per-datum
-        ``ModelOutput`` lists and reads ``loss_inputs`` from the ``Datum``
+        ``ModelOutput`` lists and reads ``loss_fn_inputs`` from the ``Datum``
         objects, so padded and packed layouts produce identical losses.
         """
         from nemo_automodel.components.distributed.utils import get_sync_ctx
@@ -707,7 +707,7 @@ class Engine:
             if sample_level:
                 contrib = loss_i.reshape(())
             else:
-                w = d.loss_inputs.get("weights")
+                w = d.loss_fn_inputs.get("weights")
                 contrib = (loss_i * w.to(loss_i)).sum() if w is not None else loss_i.sum()
             total = contrib if total is None else total + contrib
         denom = sample_denom if sample_level else token_denom
@@ -833,7 +833,7 @@ class Engine:
         """
         token_local = 0.0
         for d in datums:
-            w = d.loss_inputs.get("weights")
+            w = d.loss_fn_inputs.get("weights")
             token_local += float(w.sum()) if w is not None else float(d.seq_len)
         sample_local = float(len(datums))
 
@@ -1038,7 +1038,7 @@ class Engine:
         if self._cp_size() > 1:
             raise NotImplementedError(
                 "pack_datums is not supported with context parallelism yet: the Engine "
-                "does not co-shard Datum.loss_inputs or gather per-datum logprobs across "
+                "does not co-shard Datum.loss_fn_inputs or gather per-datum logprobs across "
                 "CP ranks (planned follow-up, see Automodel issue #2861). "
                 "Use padded datums (pack_datums=False) under CP."
             )

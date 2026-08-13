@@ -52,11 +52,11 @@ def _datums(vocab=16):
     return [
         Datum(
             input_ids=torch.randint(0, vocab, (5,)),
-            loss_inputs={"target_tokens": torch.randint(0, vocab, (5,)), "weights": torch.ones(5)},
+            loss_fn_inputs={"target_tokens": torch.randint(0, vocab, (5,)), "weights": torch.ones(5)},
         ),
         Datum(
             input_ids=torch.randint(0, vocab, (3,)),
-            loss_inputs={"target_tokens": torch.randint(0, vocab, (3,)), "weights": torch.ones(3)},
+            loss_fn_inputs={"target_tokens": torch.randint(0, vocab, (3,)), "weights": torch.ones(3)},
         ),
     ]
 
@@ -90,7 +90,7 @@ def _rl_datums(vocab=16):
     return [
         Datum(
             input_ids=torch.randint(0, vocab, (5,)),
-            loss_inputs={
+            loss_fn_inputs={
                 "target_tokens": torch.randint(0, vocab, (5,)),
                 "weights": torch.ones(5),
                 "logprobs": -torch.rand(5),
@@ -99,7 +99,7 @@ def _rl_datums(vocab=16):
         ),
         Datum(
             input_ids=torch.randint(0, vocab, (3,)),
-            loss_inputs={
+            loss_fn_inputs={
                 "target_tokens": torch.randint(0, vocab, (3,)),
                 "weights": torch.tensor([1.0, 1.0, 0.0]),
                 "logprobs": -torch.rand(3),
@@ -126,8 +126,8 @@ def test_caller_supplied_rl_lossfn_runs_and_backprops():
     def importance_sampling(model_output, datums, **kwargs):
         out = []
         for lp, d in zip(model_output.logprobs, datums):
-            old = d.loss_inputs["logprobs"].to(lp)
-            adv = d.loss_inputs["advantages"].to(lp)
+            old = d.loss_fn_inputs["logprobs"].to(lp)
+            adv = d.loss_fn_inputs["advantages"].to(lp)
             out.append(-(torch.exp(lp - old) * adv))
         return out
 
@@ -168,8 +168,8 @@ def test_multiple_microbatches_accumulate_datums():
 def test_reduce_token_level_normalization():
     # Two datums, token-level loss; weighted sum / global token count.
     d = [
-        Datum(input_ids=torch.tensor([1, 2]), loss_inputs={"weights": torch.tensor([1.0, 1.0])}),
-        Datum(input_ids=torch.tensor([3]), loss_inputs={"weights": torch.tensor([0.0])}),
+        Datum(input_ids=torch.tensor([1, 2]), loss_fn_inputs={"weights": torch.tensor([1.0, 1.0])}),
+        Datum(input_ids=torch.tensor([3]), loss_fn_inputs={"weights": torch.tensor([0.0])}),
     ]
     per = [torch.tensor([2.0, 4.0]), torch.tensor([8.0])]  # token-level
     # weighted sum = 2*1 + 4*1 + 8*0 = 6; global token count = 2 -> 3.0
@@ -411,9 +411,9 @@ def _parity_datums():
     datums = _datums()
     # Exercise the alignment-sensitive cases: a masked position and a
     # per-sample advantage next to per-token weights.
-    datums[0].loss_inputs["weights"][-1] = 0.0
-    datums[0].loss_inputs["advantages"] = torch.tensor([0.3])
-    datums[1].loss_inputs["advantages"] = torch.tensor([0.7])
+    datums[0].loss_fn_inputs["weights"][-1] = 0.0
+    datums[0].loss_fn_inputs["advantages"] = torch.tensor([0.3])
+    datums[1].loss_fn_inputs["advantages"] = torch.tensor([0.7])
     return datums
 
 

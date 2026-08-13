@@ -28,8 +28,8 @@ import torch
 import torch.nn as nn
 
 from nemo_automodel.components.datasets.datum import Datum
-from nemo_automodel.components.training.model_output import ModelOutput
 from nemo_automodel.components.training.engine import Engine
+from nemo_automodel.components.training.model_output import ModelOutput
 
 
 class ToyLM(nn.Module):
@@ -83,11 +83,11 @@ def _datums(vocab=16):
     return [
         Datum(
             input_ids=torch.randint(0, vocab, (4,)),
-            loss_inputs={"target_tokens": torch.randint(0, vocab, (4,)), "weights": torch.ones(4)},
+            loss_fn_inputs={"target_tokens": torch.randint(0, vocab, (4,)), "weights": torch.ones(4)},
         ),
         Datum(
             input_ids=torch.randint(0, vocab, (2,)),
-            loss_inputs={"target_tokens": torch.randint(0, vocab, (2,)), "weights": torch.ones(2)},
+            loss_fn_inputs={"target_tokens": torch.randint(0, vocab, (2,)), "weights": torch.ones(2)},
         ),
     ]
 
