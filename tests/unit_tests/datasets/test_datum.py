@@ -26,7 +26,7 @@ def _toy_datums():
     return [
         Datum(
             input_ids=torch.tensor([10, 11, 12]),
-            loss_inputs={
+            loss_fn_inputs={
                 "target_tokens": torch.tensor([11, 12, 13]),
                 "weights": torch.tensor([1.0, 1.0, 0.0]),
                 "advantages": torch.tensor([0.5, 0.5, 0.5]),
@@ -34,7 +34,7 @@ def _toy_datums():
         ),
         Datum(
             input_ids=torch.tensor([20, 21]),
-            loss_inputs={
+            loss_fn_inputs={
                 "target_tokens": torch.tensor([21, 22]),
                 "weights": torch.tensor([1.0, 1.0]),
                 "advantages": torch.tensor([0.9, 0.9]),
@@ -47,11 +47,11 @@ def _toy_datums():
 
 
 def test_datum_coerces_and_validates():
-    d = Datum(input_ids=[1, 2, 3], loss_inputs={"weights": [1, 1, 0]})
+    d = Datum(input_ids=[1, 2, 3], loss_fn_inputs={"weights": [1, 1, 0]})
     assert isinstance(d.input_ids, torch.Tensor)
     assert d.input_ids.dtype == torch.long
     assert d.seq_len == 3
-    assert isinstance(d.loss_inputs["weights"], torch.Tensor)
+    assert isinstance(d.loss_fn_inputs["weights"], torch.Tensor)
 
 
 def test_datum_rejects_non_1d_input_ids():
@@ -118,8 +118,8 @@ def test_collate_packed_side_inputs_ride_the_flat_axis():
 
 def test_collate_packed_per_sample_side_input_is_one_per_datum():
     datums = [
-        Datum(input_ids=torch.tensor([1, 2]), loss_inputs={"advantages": torch.tensor([0.5])}),
-        Datum(input_ids=torch.tensor([3, 4, 5]), loss_inputs={"advantages": torch.tensor([0.9])}),
+        Datum(input_ids=torch.tensor([1, 2]), loss_fn_inputs={"advantages": torch.tensor([0.5])}),
+        Datum(input_ids=torch.tensor([3, 4, 5]), loss_fn_inputs={"advantages": torch.tensor([0.9])}),
     ]
     batch = collate_datums(datums, packed=True)
     assert batch["input_ids"].shape == (1, 5)
@@ -137,8 +137,8 @@ def test_collate_carries_per_token_float_side_inputs():
 
 def test_collate_per_sample_scalar_side_input():
     datums = [
-        Datum(input_ids=torch.tensor([1, 2]), loss_inputs={"advantages": torch.tensor([0.5])}),
-        Datum(input_ids=torch.tensor([3, 4, 5]), loss_inputs={"advantages": torch.tensor([0.9])}),
+        Datum(input_ids=torch.tensor([1, 2]), loss_fn_inputs={"advantages": torch.tensor([0.5])}),
+        Datum(input_ids=torch.tensor([3, 4, 5]), loss_fn_inputs={"advantages": torch.tensor([0.9])}),
     ]
     batch = collate_datums(datums)
     # length-1 != seq_len -> treated as per-sample, one value per datum.
@@ -159,22 +159,22 @@ def test_collate_empty_raises():
 
 
 def test_to_features_without_weights_leaves_labels_unmasked():
-    d = Datum(input_ids=torch.tensor([1, 2, 3]), loss_inputs={"target_tokens": torch.tensor([2, 3, 4])})
+    d = Datum(input_ids=torch.tensor([1, 2, 3]), loss_fn_inputs={"target_tokens": torch.tensor([2, 3, 4])})
     assert d.to_features()["labels"] == [2, 3, 4]
 
 
 def test_collate_rejects_inconsistent_loss_input_keys():
     datums = [
-        Datum(input_ids=torch.tensor([1, 2]), loss_inputs={"advantages": torch.zeros(2), "weights": torch.ones(2)}),
-        Datum(input_ids=torch.tensor([3, 4]), loss_inputs={"advantages": torch.zeros(2)}),
+        Datum(input_ids=torch.tensor([1, 2]), loss_fn_inputs={"advantages": torch.zeros(2), "weights": torch.ones(2)}),
+        Datum(input_ids=torch.tensor([3, 4]), loss_fn_inputs={"advantages": torch.zeros(2)}),
     ]
     # Silently intersecting the keys would drop the loss mask for the whole batch.
-    with pytest.raises(ValueError, match="same loss_inputs keys"):
+    with pytest.raises(ValueError, match="same loss_fn_inputs keys"):
         collate_datums(datums)
 
 
 def test_collate_reads_a_length_one_entry_on_a_single_token_sequence_as_per_token():
-    datums = [Datum(input_ids=torch.tensor([7]), loss_inputs={"advantages": torch.tensor([0.5])})]
+    datums = [Datum(input_ids=torch.tensor([7]), loss_fn_inputs={"advantages": torch.tensor([0.5])})]
     assert collate_datums(datums)["advantages"].shape == (1, 1)
 
 
