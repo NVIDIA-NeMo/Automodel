@@ -76,6 +76,8 @@ navigation:
             path: ../../model-coverage/llm/qwen/qwen3.mdx
           - page: "Qwen3 MoE"
             path: ../../model-coverage/llm/qwen/qwen3-moe.mdx
+          - page: "Qwen3.8-Max"
+            path: ../../model-coverage/llm/qwen/qwen3-8-max.mdx
           - page: "Qwen3-Next"
             path: ../../model-coverage/llm/qwen/qwen3-next.mdx
           - page: "ERNIE 4.5"
@@ -170,6 +172,8 @@ navigation:
             path: ../../model-coverage/llm/openbmb/minicpm.mdx
           - page: "Moonlight"
             path: ../../model-coverage/llm/moonshotai/moonlight.mdx
+          - page: "Kimi Linear"
+            path: ../../model-coverage/llm/moonshotai/kimi-linear.mdx
           - page: "Kimi K3"
             path: ../../model-coverage/llm/moonshotai/kimi-k3.mdx
             slug: kimi-k3
@@ -206,10 +210,15 @@ navigation:
           - page: "Overview"
             path: ../../model-coverage/vlm/index.mdx
             slug: overview
+          - page: "MuseGlimmer"
+            path: ../../model-coverage/vlm/muse/muse_glimmer.mdx
           - page: "Kimi-VL"
             path: ../../model-coverage/vlm/moonshotai/kimi-vl.mdx
           - page: "Kimi-K3"
             path: ../../model-coverage/vlm/moonshotai/kimi-k3.mdx
+          - page: "North Micro Vision"
+            path: ../../model-coverage/vlm/coherelabs/north-micro-vision.mdx
+            slug: north-micro-vision
           - page: "Inkling"
             path: ../../model-coverage/vlm/thinkingmachines/inkling.mdx
           - page: "Gemma 3 / Gemma 3n"
@@ -332,7 +341,7 @@ navigation:
           - page: "Llama (Bidirectional)"
             path: ../../model-coverage/embedding/nvidia/llama-bidirectional.mdx
             slug: llama-bidirectional
-          - page: "Ministral3 (Bidirectional)"
+          - page: "Ministral3"
             path: ../../model-coverage/embedding/mistralai/ministral3-bidirectional.mdx
             slug: ministral3-bidirectional
       - section: "Reranking Models"

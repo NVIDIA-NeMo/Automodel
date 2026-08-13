@@ -36,6 +36,8 @@ from nemo_automodel.components.checkpoint.utils import (
 )
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
+from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.recipes.base_recipe import BaseRecipe, is_distributed_stateful
 
 try:
@@ -87,6 +89,8 @@ def _patch_checkpoint_ops(monkeypatch):
             self.lifecycle = CheckpointLifecycle(config=config, process_group=process_group)
             self.distributed_saves = []
             self.distributed_loads = []
+            self.global_rank_saves = []
+            self.global_rank_loads = []
             self.staging_waits = 0
 
         def save_model(
@@ -149,14 +153,27 @@ def _patch_checkpoint_ops(monkeypatch):
             self.staging_waits += 1
 
         def save_on_dp_ranks(self, state, state_name, path):
-            """Save stateful object (e.g., dataloader, rng)."""
+            """Save data-parallel-scoped state such as a dataloader."""
             state_dir = os.path.join(path, state_name)
             os.makedirs(state_dir, exist_ok=True)
             if self.tp_rank == 0 and self.pp_rank == 0:
                 torch.save(state.state_dict(), os.path.join(state_dir, f"{state_name}.pt"))
 
         def load_on_dp_ranks(self, state, state_name, path):
-            """Load stateful object (e.g., dataloader, rng)."""
+            """Load data-parallel-scoped state such as a dataloader."""
+            state_dir = os.path.join(path, state_name)
+            state.load_state_dict(torch.load(os.path.join(state_dir, f"{state_name}.pt"), weights_only=False))
+
+        def save_on_global_ranks(self, state, state_name, path):
+            """Save state unique to each global process rank."""
+            self.global_rank_saves.append((state_name, path))
+            state_dir = os.path.join(path, state_name)
+            os.makedirs(state_dir, exist_ok=True)
+            torch.save(state.state_dict(), os.path.join(state_dir, f"{state_name}.pt"))
+
+        def load_on_global_ranks(self, state, state_name, path):
+            """Load state unique to each global process rank."""
+            self.global_rank_loads.append((state_name, path))
             state_dir = os.path.join(path, state_name)
             state.load_state_dict(torch.load(os.path.join(state_dir, f"{state_name}.pt"), weights_only=False))
 
@@ -422,6 +439,19 @@ def test_distributed_stateful_routes_through_distributed_checkpointing(tmp_path)
     assert torch.allclose(recipe_inst.distributed_state.foo, saved_foo)
     assert recipe_inst.checkpointer.distributed_saves == [("distributed_state", ckpt_dir)]
     assert recipe_inst.checkpointer.distributed_loads == [("distributed_state", ckpt_dir)]
+
+
+def test_ranked_rng_routes_through_global_rank_checkpointing(tmp_path):
+    """BaseRecipe saves and loads ranked RNG state through the global-rank helpers."""
+    recipe_inst = _ToyRecipe(tmp_path)
+    recipe_inst.rng = StatefulRNG(seed=42, ranked=True)
+
+    recipe_inst.save_checkpoint(epoch=0, step=10, train_loss=1.0)
+    recipe_inst.load_checkpoint(restore_from="LATEST")
+
+    ckpt_dir = str(tmp_path / "epoch_0_step_10")
+    assert recipe_inst.checkpointer.global_rank_saves == [("rng", ckpt_dir)]
+    assert recipe_inst.checkpointer.global_rank_loads == [("rng", ckpt_dir)]
 
 
 @pytest.mark.parametrize("wait_for_staging", [False, True])
@@ -1861,7 +1891,7 @@ def test_load_checkpoint_path_with_separator_treated_as_full_path(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Tests for _make_progress_bar and _update_progress_bar
+# Progress-bar test helpers
 # ---------------------------------------------------------------------------
 
 
@@ -1876,6 +1906,89 @@ def _make_fake_recipe(max_steps=10, step=0):
     r = _FakeRecipe()
     r.step_scheduler = SimpleNamespace(max_steps=max_steps, step=step)
     return r
+
+
+# ---------------------------------------------------------------------------
+# Tests for MoE auxiliary-loss scaling
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("pp_enabled", "dp_size", "cp_size", "num_batches", "pp_microbatches", "num_label_tokens"),
+    [
+        (False, 1, 1, 1, 1, 0),
+        (False, 2, 1, 4, 1, 0),
+        (False, 1, 2, 3, 1, 0),
+        (True, 2, 1, 2, 2, 96),
+        (True, 1, 2, 3, 1, 96),
+        (True, 2, 1, 3, 1, 0),
+    ],
+)
+def test_moe_aux_gradient_matches_single_process_optimizer_step(
+    monkeypatch,
+    pp_enabled,
+    dp_size,
+    cp_size,
+    num_batches,
+    pp_microbatches,
+    num_label_tokens,
+):
+    """DP/CP/PP accumulation must match one fp32 auxiliary objective."""
+    monkeypatch.setattr(MoEAuxLossAutoScaler, "main_loss_backward_scale", None)
+    dp_cp_size = dp_size * cp_size
+    num_microbatches = num_batches * pp_microbatches
+    recipe = SimpleNamespace(
+        pp_enabled=pp_enabled,
+        pp=SimpleNamespace(
+            pp_batch_size=pp_microbatches,
+            pp_microbatch_size=1,
+            info=SimpleNamespace(schedule=SimpleNamespace(_n_microbatches=pp_microbatches)),
+        ),
+        _get_cp_group_size=lambda: cp_size,
+        _get_dp_group_size=lambda include_cp=False: dp_cp_size,
+    )
+    BaseRecipe._set_moe_aux_loss_backward_scale(
+        recipe,
+        num_batches=num_batches,
+        num_label_tokens=num_label_tokens,
+    )
+
+    initial_value = 1.25
+    coefficients = torch.arange(1, dp_cp_size * num_microbatches + 1, dtype=torch.float32).reshape(
+        dp_cp_size, num_microbatches
+    )
+    local_gradients = []
+    for rank_coefficients in coefficients:
+        local_parameter = nn.Parameter(torch.tensor(initial_value))
+        for coefficient in rank_coefficients:
+            output = local_parameter * 0.0
+            aux_loss = coefficient * local_parameter.square()
+            MoEAuxLossAutoScaler.apply(output, aux_loss).backward()
+        local_gradients.append(local_parameter.grad.detach().clone())
+
+    distributed_gradient = torch.stack(local_gradients).sum() / dp_cp_size
+    if pp_enabled and num_label_tokens > 0:
+        distributed_gradient /= num_label_tokens / dp_cp_size
+
+    reference_parameter = nn.Parameter(torch.tensor(initial_value))
+    reference_loss = coefficients.sum() * reference_parameter.square() / (dp_size * num_microbatches)
+    reference_loss.backward()
+
+    torch.testing.assert_close(distributed_gradient, reference_parameter.grad)
+    torch.testing.assert_close(distributed_gradient.abs(), reference_parameter.grad.norm())
+
+    distributed_parameter = nn.Parameter(torch.tensor(initial_value))
+    distributed_parameter.grad = distributed_gradient.clone()
+    distributed_optimizer = torch.optim.SGD([distributed_parameter], lr=0.05)
+    reference_optimizer = torch.optim.SGD([reference_parameter], lr=0.05)
+    distributed_optimizer.step()
+    reference_optimizer.step()
+    torch.testing.assert_close(distributed_parameter, reference_parameter)
+
+
+# ---------------------------------------------------------------------------
+# Tests for _make_progress_bar and _update_progress_bar
+# ---------------------------------------------------------------------------
 
 
 class TestMakeProgressBar:

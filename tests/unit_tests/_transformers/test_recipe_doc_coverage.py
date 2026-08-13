@@ -234,6 +234,7 @@ _HF_ORG_TO_DOC_SLUG = {
     "diffusers": "lightricks",  # LTX-2.3 conversion shares the Lightricks family page
     "ibm-granite": "ibm",
     "meta-llama": "meta",
+    "meta-models": "muse",  # Muse-branded models use the dedicated Muse docs directory
     "MiniMaxAI": "minimax",
     "OpenGVLab": "internlm",  # InternVL docs live on internlm/ alongside InternLM
     "openai-community": "openai",  # gpt2 mirror

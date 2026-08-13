@@ -660,5 +660,51 @@ class TestParallelizeFalconH1:
             assert PARALLELIZE_FUNCTIONS[key] is _parallelize_falcon_h1
 
 
+class TestParallelizeMuseGlimmer:
+    """MuseGlimmer uses one complete language TP plan for its supported TP1/TP2 sizes."""
+
+    def test_tp2_shards_complete_language_backbone(self):
+        from nemo_automodel.components.distributed.optimized_tp_plans import _parallelize_muse_glimmer
+
+        plan = _parallelize_muse_glimmer(model=None)
+        for key in (
+            "model.layers.*.self_attn.q_proj",
+            "model.layers.*.self_attn.k_proj",
+            "model.layers.*.self_attn.v_proj",
+            "model.layers.*.self_attn.output_gate_proj",
+            "model.layers.*.mlp.gate_proj",
+            "model.layers.*.mlp.up_proj",
+            "lm_head",
+        ):
+            assert isinstance(plan[key], ColwiseParallel)
+        for key in (
+            "model.layers.*.self_attn.o_proj",
+            "model.layers.*.mlp.down_proj",
+        ):
+            assert isinstance(plan[key], RowwiseParallel)
+        assert not any("vision" in key for key in plan)
+
+    def test_sequence_parallel_is_explicitly_ignored(self):
+        from nemo_automodel.components.distributed.optimized_tp_plans import _parallelize_muse_glimmer
+
+        with pytest.warns(UserWarning, match="not yet supported for MuseGlimmer"):
+            plan_sp = _parallelize_muse_glimmer(model=None, sequence_parallel=True)
+        plan = _parallelize_muse_glimmer(model=None, sequence_parallel=False)
+        assert plan.keys() == plan_sp.keys()
+        assert {key: type(style) for key, style in plan.items()} == {key: type(style) for key, style in plan_sp.items()}
+
+    def test_native_class_qualname_is_registered(self):
+        from nemo_automodel._transformers.capabilities import _has_optimized_tp_plan
+        from nemo_automodel.components.distributed.optimized_tp_plans import (
+            PARALLELIZE_FUNCTIONS,
+            _parallelize_muse_glimmer,
+        )
+        from nemo_automodel.components.models.muse_glimmer.model import MuseGlimmerForConditionalGeneration
+
+        key = "nemo_automodel.components.models.muse_glimmer.model.MuseGlimmerForConditionalGeneration"
+        assert PARALLELIZE_FUNCTIONS[key] is _parallelize_muse_glimmer
+        assert _has_optimized_tp_plan(MuseGlimmerForConditionalGeneration)
+
+
 if __name__ == "__main__":
     pytest.main([__file__])
