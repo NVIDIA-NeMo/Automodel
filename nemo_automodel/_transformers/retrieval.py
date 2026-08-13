@@ -345,9 +345,8 @@ def configure_encoder_metadata(model: PreTrainedModel, config) -> None:
     Sets ``config.architectures`` unconditionally. For custom retrieval
     architectures registered in :class:`ModelRegistry`, also writes
     ``config.auto_map`` so that the saved checkpoint can be reloaded via
-    HuggingFace Auto classes. Mistral 3 VL retrieval is exported as the stock
-    ``Mistral3Model`` with ``is_causal=False`` and therefore needs no custom
-    model code. Other standard HF models already have their own auto-resolution.
+    Hugging Face Auto classes. Models that opt into stock export replace this
+    training metadata through their model-owned export configuration.
 
     Args:
         model: The backbone ``PreTrainedModel`` instance.

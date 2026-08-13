@@ -178,7 +178,18 @@ class Mistral3BidirectionalModel(Mistral3Model):
     _sentence_transformer_input_mode = "structured_multimodal"
 
     def get_hf_export_config(self) -> Mistral3Config:
-        """Return the stock Transformers config used for portable inference export."""
+        """Return the stock Transformers config used for portable inference export.
+
+        Subclasses must explicitly re-assert ``_export_as_stock_model = True``.
+        This prevents inherited export from silently discarding custom forward
+        behavior that a stock ``Mistral3Model`` cannot reproduce.
+        """
+        if type(self).__dict__.get("_export_as_stock_model") is not True:
+            raise TypeError(
+                f"{type(self).__name__} must explicitly opt in to stock model export after verifying that "
+                "its forward behavior is representable by Mistral3Model configuration and weights."
+            )
+
         config_dict = self.config.to_dict()
         config_dict["pooling"] = config_dict.pop("_pooling", "avg")
         config_dict.pop("model_type", None)

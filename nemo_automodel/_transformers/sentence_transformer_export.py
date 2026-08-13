@@ -482,6 +482,9 @@ def _validate_sentence_transformer_export(
             raise TypeError("Structured multimodal export requires a processor with save_pretrained().")
         if not callable(getattr(tokenizer, "apply_chat_template", None)):
             raise TypeError("Structured multimodal export requires a processor with apply_chat_template().")
+        get_hf_export_processor = getattr(tokenizer, "get_hf_export_processor", None)
+        if callable(get_hf_export_processor):
+            get_hf_export_processor()
 
     _resolve_sentence_transformer_max_seq_length(model_part, tokenizer, original_model_path)
 

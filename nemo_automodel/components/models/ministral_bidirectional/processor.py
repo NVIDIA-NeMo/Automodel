@@ -144,6 +144,8 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
     stock Pixtral implementation; it does not change the configured behavior.
     """
 
+    _export_as_stock_processor = True
+
     def check_argument_for_proper_class(
         self,
         argument_name: str,
@@ -428,6 +430,36 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
                 ) from error
             raise
 
+    def get_hf_export_processor(self) -> PixtralProcessor:
+        """Return the behaviorally equivalent stock processor for portable export.
+
+        Subclasses must explicitly re-assert ``_export_as_stock_processor = True``.
+        This prevents inherited export from silently discarding custom image or
+        text preprocessing that stock ``PixtralProcessor`` cannot reproduce.
+
+        Returns:
+            Stock processor configured with the persistent retrieval behavior.
+
+        Raises:
+            TypeError: If a subclass has not explicitly opted into stock export.
+        """
+        if type(self).__dict__.get("_export_as_stock_processor") is not True:
+            raise TypeError(
+                f"{type(self).__name__} must explicitly opt in to stock processor export after verifying that "
+                "its preprocessing behavior is representable by PixtralProcessor assets."
+            )
+
+        return PixtralProcessor(
+            image_processor=self.image_processor,
+            tokenizer=self.tokenizer,
+            patch_size=self.patch_size,
+            spatial_merge_size=self.spatial_merge_size,
+            chat_template=self.chat_template,
+            image_token=self.image_token,
+            image_break_token=self.image_break_token,
+            image_end_token=self.image_end_token,
+        )
+
     def save_pretrained(
         self,
         save_directory: str | os.PathLike,
@@ -444,17 +476,11 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
         Returns:
             Paths written by the standard processor save operation.
         """
-        standard_processor = PixtralProcessor(
-            image_processor=self.image_processor,
-            tokenizer=self.tokenizer,
-            patch_size=self.patch_size,
-            spatial_merge_size=self.spatial_merge_size,
-            chat_template=self.chat_template,
-            image_token=self.image_token,
-            image_break_token=self.image_break_token,
-            image_end_token=self.image_end_token,
+        return self.get_hf_export_processor().save_pretrained(
+            save_directory,
+            push_to_hub=push_to_hub,
+            **kwargs,
         )
-        return standard_processor.save_pretrained(save_directory, push_to_hub=push_to_hub, **kwargs)
 
     @staticmethod
     def _extract_document_fields(documents: dict[str, list[Any]] | list[dict[str, Any]]) -> tuple[list[Any], list[Any]]:

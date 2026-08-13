@@ -129,6 +129,8 @@ def test_configure_sentence_transformer_export_reads_processor_method_collator_p
             return batch
 
     collator = ProcessorMethodCollator(_Processor(), "collate")
+    assert collator.query_prefix == "query:"
+    assert collator.passage_prefix == "passage:"
     _configure_sentence_transformer_export(_Model(), collator)
 
     assert captured == {"query_prompt": "query:", "document_prompt": "passage:"}

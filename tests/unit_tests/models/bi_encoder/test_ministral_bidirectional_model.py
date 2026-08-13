@@ -354,6 +354,55 @@ def test_ministral3_biencoder_processor_saves_as_stock_pixtral_without_remote_co
     assert training_reload.tokenizer.backend_tokenizer.normalizer.normalize_str(marked_source) == source_with_zwnj
 
 
+@pytest.mark.parametrize("image_size", [(16, 16), (8, 16), (16, 8)])
+def test_ministral3_exported_stock_processor_matches_training_image_preprocessing(
+    tmp_path,
+    monkeypatch,
+    image_size,
+):
+    monkeypatch.setattr(Mistral3BiEncoderProcessor, "check_argument_for_proper_class", lambda *args, **kwargs: None)
+    processor = Mistral3BiEncoderProcessor(
+        image_processor=PixtralImageProcessor(size={"longest_edge": 16}),
+        tokenizer=FakePixtralTokenizer(),
+        patch_size=4,
+        p_max_length=128,
+        padding=False,
+        passage_prefix="passage:",
+    )
+    image = Image.new("RGB", image_size, (255, 0, 0))
+    training = processor.process_documents(
+        {"images": [image], "texts": ["literal [IMG]"]},
+        return_tensors="pt",
+    )
+
+    processor.save_pretrained(tmp_path)
+    exported = AutoProcessor.from_pretrained(tmp_path, trust_remote_code=False)
+    rendered = exported.apply_chat_template(
+        [
+            {"role": "system", "content": "passage:"},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image"},
+                    {"type": "text", "text": "literal [IMG]"},
+                ],
+            },
+        ],
+        tokenize=False,
+    )
+    inference = exported(
+        images=[image],
+        text=[rendered],
+        return_tensors="pt",
+        padding=False,
+        truncation=True,
+        max_length=128,
+    )
+
+    for key in ("input_ids", "attention_mask", "pixel_values", "image_sizes"):
+        torch.testing.assert_close(inference[key], training[key])
+
+
 def test_ministral3_biencoder_processor_chat_template_matches_training_helpers(monkeypatch):
     monkeypatch.setattr(Mistral3BiEncoderProcessor, "check_argument_for_proper_class", lambda *args, **kwargs: None)
     processor = Mistral3BiEncoderProcessor(
@@ -1002,6 +1051,64 @@ def test_mistral3_vlm_portable_export_rejects_non_processor_before_writing(tmp_p
         encoder.save_pretrained(tmp_path, tokenizer=processor_like)
 
     assert not any(tmp_path.iterdir())
+
+
+def test_mistral3_vlm_portable_export_rejects_processor_subclass_without_explicit_opt_in(tmp_path, monkeypatch):
+    class _NonPortableProcessor(Mistral3BiEncoderProcessor):
+        def process_documents(self, *args, **kwargs):
+            raise AssertionError("custom preprocessing is not representable by stock PixtralProcessor")
+
+    monkeypatch.setattr(_NonPortableProcessor, "check_argument_for_proper_class", lambda *args, **kwargs: None)
+    processor = _NonPortableProcessor(
+        image_processor=PixtralImageProcessor(size={"longest_edge": 16}),
+        tokenizer=FakePixtralTokenizer(),
+        patch_size=4,
+    )
+    encoder = BiEncoderModel(
+        Mistral3BidirectionalModel(_tiny_mistral3_bidirectional_vlm_config()).eval(),
+        pooling="avg",
+        l2_normalize=True,
+    )
+
+    with pytest.raises(TypeError, match="explicitly opt in to stock processor export"):
+        encoder.save_pretrained(tmp_path, tokenizer=processor)
+
+    assert not any(tmp_path.iterdir())
+
+
+def test_mistral3_vlm_portable_export_rejects_model_subclass_without_explicit_opt_in(tmp_path):
+    class _NonPortableModel(Mistral3BidirectionalModel):
+        pass
+
+    encoder = BiEncoderModel(
+        _NonPortableModel(_tiny_mistral3_bidirectional_vlm_config()).eval(),
+        pooling="avg",
+        l2_normalize=True,
+    )
+
+    with pytest.raises(TypeError, match="explicitly opt in to stock model export"):
+        encoder.save_pretrained(tmp_path, tokenizer=MagicMock())
+
+    assert not any(tmp_path.iterdir())
+
+
+def test_mistral3_vlm_portable_export_allows_subclasses_to_explicitly_reassert_compatibility(monkeypatch):
+    class _PortableProcessor(Mistral3BiEncoderProcessor):
+        _export_as_stock_processor = True
+
+    class _PortableModel(Mistral3BidirectionalModel):
+        _export_as_stock_model = True
+
+    monkeypatch.setattr(_PortableProcessor, "check_argument_for_proper_class", lambda *args, **kwargs: None)
+    processor = _PortableProcessor(
+        image_processor=PixtralImageProcessor(size={"longest_edge": 16}),
+        tokenizer=FakePixtralTokenizer(),
+        patch_size=4,
+    )
+    model = _PortableModel(_tiny_mistral3_bidirectional_vlm_config())
+
+    assert type(processor.get_hf_export_processor()) is PixtralProcessor
+    assert model.get_hf_export_config().model_type == "mistral3"
 
 
 def test_mistral3_vlm_exports_sentence_transformers_checkpoint(tmp_path, monkeypatch):
