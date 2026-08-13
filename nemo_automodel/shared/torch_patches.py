@@ -243,8 +243,13 @@ def apply_torch_patches() -> None:
     _TORCH_PATCHES_APPLIED = True
 
 
-def patch_fsdp_log_reduce_groups(limit: int = 10) -> None:
-    """DEBUG ONLY (NVBug 6599894): print what each reduce-scatter group contains."""
+def patch_fsdp_log_reduce_groups(limit: int = 3) -> None:
+    """DEBUG ONLY (NVBug 6599894): print reduce-group composition, including the failing one.
+
+    Prints from EVERY rank: under pipeline parallelism rank 0 reduces last, so a
+    rank-0-only print never fires when a mid-pipeline rank dies first. Also prints
+    the group whose reduction raised, which is the one that OOMs.
+    """
     import torch.distributed as dist
     import torch.distributed.fsdp._fully_shard._fsdp_collectives as coll
     import torch.distributed.fsdp._fully_shard._fsdp_param_group as pg
@@ -254,21 +259,32 @@ def patch_fsdp_log_reduce_groups(limit: int = 10) -> None:
         return
     seen = {"n": 0}
 
+    def describe(fsdp_params, unsharded_grads):
+        rank = dist.get_rank() if dist.is_initialized() else -1
+        total = sum(g.numel() for g in unsharded_grads)
+        rows = [
+            (
+                getattr(p, "_param_fqn", None) or p._module_info.param_name,
+                tuple(g.shape),
+                type(g).__name__,
+                getattr(p, "is_dtensor", None),
+            )
+            for p, g in zip(fsdp_params, unsharded_grads)
+        ]
+        return f"rank={rank} numel={total} ({total * 4 / 1024**3:.2f} GiB fp32) params={rows}"
+
     def logged(fsdp_params, unsharded_grads, *args, **kwargs):
-        rank = dist.get_rank() if dist.is_initialized() else 0
-        if rank == 0 and seen["n"] < limit:
+        if seen["n"] < limit:
             seen["n"] += 1
-            total = sum(g.numel() for g in unsharded_grads)
-            names = [
-                (getattr(p, "_param_fqn", None) or p._module_info.param_name, tuple(g.shape))
-                for p, g in zip(fsdp_params, unsharded_grads)
-            ]
+            print(f"NVBUG6599894 group {seen['n']}: {describe(fsdp_params, unsharded_grads)}", flush=True)
+        try:
+            return original(fsdp_params, unsharded_grads, *args, **kwargs)
+        except Exception as error:
             print(
-                f"NVBUG6599894 reduce-group {seen['n']}: numel={total} "
-                f"({total * 4 / 1024**3:.2f} GiB fp32) params={names}",
+                f"NVBUG6599894 FAILING GROUP ({type(error).__name__}): {describe(fsdp_params, unsharded_grads)}",
                 flush=True,
             )
-        return original(fsdp_params, unsharded_grads, *args, **kwargs)
+            raise
 
     logged._nvbug6599894 = True
     coll.foreach_reduce = logged
