@@ -15,8 +15,9 @@
 """Tests for the parallelization strategy pattern."""
 
 import logging
+import sys
 from abc import ABC
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
 import pytest
@@ -81,6 +82,17 @@ class MockNemotronHModel(nn.Module):
 
     def __init__(self):
         super().__init__()
+
+        class MockSupports:
+            def __init__(self, model):
+                self.model = model
+                self.supports_mtp_cp_pp = False
+
+            @property
+            def mtp_enabled(self):
+                return bool(getattr(getattr(self.model, "mtp_config", None), "enabled", False))
+
+        self.supports = MockSupports(self)
         self.config = SimpleNamespace(
             num_attention_heads=8,
             num_key_value_heads=8,
@@ -459,6 +471,173 @@ class TestNemotronHParallelizationStrategy:
         """Test that NemotronHParallelizationStrategy can be instantiated."""
         assert isinstance(strategy, NemotronHParallelizationStrategy)
         assert isinstance(strategy, ParallelizationStrategy)
+
+    @pytest.mark.parametrize("mtp_enabled", [True, False])
+    def test_configures_only_enabled_mtp_attention_and_mamba_for_cp(
+        self,
+        strategy,
+        mock_device_mesh,
+        nemotron_model,
+        monkeypatch,
+        mtp_enabled,
+    ):
+        """The strategy installs CP collectives only on enabled MTP blocks."""
+        mesh, dp_replicate_mesh, dp_shard_mesh, tp_mesh = mock_device_mesh
+        cp_group = object()
+        cp_mesh = MagicMock()
+        cp_mesh.size.return_value = 2
+        cp_mesh.get_group.return_value = cp_group
+        mesh.mesh_dim_names = ("dp_replicate", "dp_shard_cp", "cp", "tp")
+        mesh.__getitem__.side_effect = lambda key: {
+            "dp_replicate": dp_replicate_mesh,
+            "dp_shard_cp": dp_shard_mesh,
+            "cp": cp_mesh,
+            "tp": tp_mesh,
+            ("dp_replicate", "dp_shard_cp"): dp_shard_mesh,
+        }[key]
+
+        class FakeDotProductAttention(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.set_context_parallel_group = MagicMock()
+
+        attention_module = FakeDotProductAttention()
+        attention_layer = nn.Module()
+        attention_layer.block_type = "attention"
+        attention_layer.mixer = nn.Module()
+        attention_layer.mixer.attn_module = attention_module
+        attention_module_2 = FakeDotProductAttention()
+        attention_layer_2 = nn.Module()
+        attention_layer_2.block_type = "attention"
+        attention_layer_2.mixer = nn.Module()
+        attention_layer_2.mixer.attn_module = attention_module_2
+
+        mamba_layer = nn.Module()
+        mamba_layer.block_type = "mamba"
+        mamba_layer.mixer = nn.Module()
+        mamba_layer.mixer.num_heads = 8
+        mamba_layer.mixer.head_dim = 16
+        mamba_layer.mixer.n_groups = 2
+        mamba_layer.mixer.ssm_state_size = 64
+
+        nemotron_model.mtp_config = SimpleNamespace(enabled=mtp_enabled)
+        nemotron_model.mtp = nn.Module()
+        nemotron_model.mtp.layers = nn.ModuleList([attention_layer, attention_layer_2, mamba_layer])
+
+        transformer_engine = ModuleType("transformer_engine")
+        transformer_engine.__path__ = []
+        transformer_engine_pytorch = ModuleType("transformer_engine.pytorch")
+        transformer_engine_pytorch.__path__ = []
+        transformer_engine_attention = ModuleType("transformer_engine.pytorch.attention")
+        transformer_engine_attention.DotProductAttention = FakeDotProductAttention
+        monkeypatch.setitem(sys.modules, "transformer_engine", transformer_engine)
+        monkeypatch.setitem(sys.modules, "transformer_engine.pytorch", transformer_engine_pytorch)
+        monkeypatch.setitem(sys.modules, "transformer_engine.pytorch.attention", transformer_engine_attention)
+
+        from nemo_automodel.components.distributed.context_parallel import mamba as mamba_module
+
+        mamba_cp = object()
+        mamba_cp_ctor = MagicMock(return_value=mamba_cp)
+        monkeypatch.setattr(mamba_module, "MambaContextParallel", mamba_cp_ctor)
+        cp_ranks = [0, 1]
+        get_cp_ranks = MagicMock(return_value=cp_ranks)
+        cp_stream = object()
+        monkeypatch.setattr(parallelizer_mod.torch.distributed, "get_process_group_ranks", get_cp_ranks)
+        monkeypatch.setattr(parallelizer_mod.torch.cuda, "Stream", lambda: cp_stream)
+        monkeypatch.setattr(parallelizer_mod, "fully_shard", lambda model, **_kwargs: model)
+        monkeypatch.setattr(
+            parallelizer_mod.parallelizer_utils,
+            "fully_shard_by_dtype",
+            lambda model, **_kwargs: model,
+        )
+
+        strategy.parallelize(model=nemotron_model, device_mesh=mesh)
+
+        if not mtp_enabled:
+            attention_module.set_context_parallel_group.assert_not_called()
+            attention_module_2.set_context_parallel_group.assert_not_called()
+            mamba_cp_ctor.assert_not_called()
+            assert not hasattr(mamba_layer.mixer, "cp")
+            return
+
+        attention_module.set_context_parallel_group.assert_called_once_with(
+            cp_group,
+            cp_ranks,
+            cp_stream,
+            cp_comm_type="p2p",
+        )
+        attention_module_2.set_context_parallel_group.assert_called_once_with(
+            cp_group,
+            cp_ranks,
+            cp_stream,
+            cp_comm_type="p2p",
+        )
+        get_cp_ranks.assert_called_once_with(cp_group)
+        mamba_cp_ctor.assert_called_once_with(
+            cp_group=cp_group,
+            num_heads=8,
+            head_dim=16,
+            n_groups=2,
+            d_state=64,
+            mixer=mamba_layer.mixer,
+        )
+        assert mamba_layer.mixer.cp is mamba_cp
+
+    def test_cp_mtp_pipeline_stage_raises_explicit_unsupported_topology(
+        self,
+        strategy,
+        mock_device_mesh,
+        nemotron_model,
+        monkeypatch,
+    ):
+        """Every trimmed PP stage must fail before stage-specific CP wiring."""
+        mesh, dp_replicate_mesh, dp_shard_mesh, tp_mesh = mock_device_mesh
+        cp_group = object()
+        cp_mesh = MagicMock()
+        cp_mesh.size.return_value = 2
+        cp_mesh.get_group.return_value = cp_group
+        mesh.mesh_dim_names = ("dp_replicate", "dp_shard_cp", "cp", "tp")
+        mesh.__getitem__.side_effect = lambda key: {
+            "dp_replicate": dp_replicate_mesh,
+            "dp_shard_cp": dp_shard_mesh,
+            "cp": cp_mesh,
+            "tp": tp_mesh,
+            ("dp_replicate", "dp_shard_cp"): dp_shard_mesh,
+        }[key]
+        nemotron_model.mtp_config = SimpleNamespace(enabled=True)
+        nemotron_model.mtp = None
+        nemotron_model._is_pipeline_parallel_stage = lambda: True
+        monkeypatch.setattr(parallelizer_mod.torch.distributed, "get_process_group_ranks", lambda _group: [0, 1])
+
+        with pytest.raises(NotImplementedError, match="MTP with context and pipeline parallelism"):
+            strategy.parallelize(model=nemotron_model, device_mesh=mesh)
+
+    def test_cp_raises_when_enabled_mtp_layers_are_unavailable(
+        self,
+        strategy,
+        mock_device_mesh,
+        nemotron_model,
+        monkeypatch,
+    ):
+        mesh, dp_replicate_mesh, dp_shard_mesh, tp_mesh = mock_device_mesh
+        cp_group = object()
+        cp_mesh = MagicMock()
+        cp_mesh.size.return_value = 2
+        cp_mesh.get_group.return_value = cp_group
+        mesh.mesh_dim_names = ("dp_replicate", "dp_shard_cp", "cp", "tp")
+        mesh.__getitem__.side_effect = lambda key: {
+            "dp_replicate": dp_replicate_mesh,
+            "dp_shard_cp": dp_shard_mesh,
+            "cp": cp_mesh,
+            "tp": tp_mesh,
+            ("dp_replicate", "dp_shard_cp"): dp_shard_mesh,
+        }[key]
+        nemotron_model.mtp_config = SimpleNamespace(enabled=True)
+        nemotron_model.mtp = nn.Module()
+        monkeypatch.setattr(parallelizer_mod.torch.distributed, "get_process_group_ranks", lambda _group: [0, 1])
+
+        with pytest.raises(RuntimeError, match=r"MTP is enabled but model\.mtp\.layers is unavailable"):
+            strategy.parallelize(model=nemotron_model, device_mesh=mesh)
 
     def test_sequence_parallel_not_supported(self, strategy, mock_device_mesh, nemotron_model):
         """Test that sequence parallelism raises assertion error."""

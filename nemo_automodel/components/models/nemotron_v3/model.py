@@ -325,7 +325,7 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
         is_moe = getattr(config, "n_routed_experts", None) is not None or "moe" in (
             getattr(config, "layers_block_type", None) or []
         )
-        return ModelCapabilities(supports_cp=True, supports_pp=True, supports_ep=is_moe)
+        return ModelCapabilities(supports_cp=True, supports_pp=True, supports_ep=is_moe, supports_mtp_cp=True)
 
     @classmethod
     def from_config(
@@ -663,6 +663,7 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
         use_cache: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
+        mtp_per_depth_position_ids: tuple[torch.LongTensor, ...] | None = None,
         padding_mask: Optional[torch.Tensor] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
         output_hidden_states: Optional[bool] = None,
@@ -701,6 +702,11 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
             use_cache: Whether to return ``past_key_values`` for subsequent steps.
             cache_position: Token position indices for cache updates.
             position_ids: Position IDs (forwarded into MTP sublayer kwargs).
+            mtp_per_depth_position_ids: Optional pre-computed future-token
+                position IDs, one tensor per MTP depth. Each tensor has shape
+                [batch, sequence], or [tokens] for THD, matching the local CP
+                layout of ``position_ids``. When supplied, MTP consumes these
+                tensors directly instead of rolling rank-local positions.
             padding_mask: Padding mask ``[B, S]`` used by the THD squeeze helper
                 and as the MoE / mamba 2D mask source.
             logits_to_keep: If > 0, only compute logits for the last
@@ -862,6 +868,7 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
             # tensors for the same reason.
             mtp_hidden = hidden_states
             mtp_embeds_for_call = tuple(mtp_embed_inputs) if mtp_embed_inputs else ()
+            mtp_position_ids_for_call = mtp_per_depth_position_ids
             # SALM / multimodal: when inputs_embeds (pre-fused audio+text) are present
             # and no PP embeddings were provided, pre-roll them per depth so audio
             # positions carry the correct audio embedding rather than embed_fn(padding_id).
@@ -874,12 +881,18 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
                     cur_emb = roll_tensor(cur_emb, shifts=-1, dim=-2)
                     salm_embed_inputs.append(cur_emb)
                 mtp_embeds_for_call = tuple(salm_embed_inputs)
-            if is_thd:
+            if squeeze_for_thd:
                 if mtp_hidden.dim() == 3 and mtp_hidden.shape[0] == 1:
                     mtp_hidden = mtp_hidden.squeeze(0)
                 mtp_embeds_for_call = tuple(
                     e.squeeze(0) if (e.dim() == 3 and e.shape[0] == 1) else e for e in mtp_embeds_for_call
                 )
+                if mtp_position_ids_for_call is not None:
+                    mtp_position_ids_for_call = tuple(
+                        p.squeeze(0) if (p.dim() == 2 and p.shape[0] == 1) else p for p in mtp_position_ids_for_call
+                    )
+            if mtp_position_ids_for_call is not None:
+                mtp_kwargs["position_ids_per_depth"] = mtp_position_ids_for_call
 
             if mtp_embeds_for_call:
                 # Final PP stage: embeddings produced upstream.
@@ -896,7 +909,7 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
                     embed_fn=self.model.embed_tokens,
                     **mtp_kwargs,
                 )
-            if is_thd and mtp_per_depth_h is not None:
+            if squeeze_for_thd and mtp_per_depth_h is not None:
                 mtp_per_depth_h = [h.unsqueeze(0) if h.dim() == 2 else h for h in mtp_per_depth_h]
         elif pp_mtp_enabled and has_lm_head:
             # Eval, or no MTP on this rank — emit empties to keep tuple arity.
