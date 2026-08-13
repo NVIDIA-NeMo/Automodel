@@ -386,6 +386,14 @@ def instantiate_infrastructure(
     autopipeline = _instantiate_pipeline(pipeline_config, mesh, device, distributed_config)
 
     parallelize_fn = None
+    import torch.distributed as _dist
+
+    if not _dist.is_initialized() or _dist.get_rank() == 0:
+        print(
+            f"NVBUG6599894 mesh: ep_size={mesh.ep_size} moe_mesh={mesh.moe_mesh} "
+            f"pp_size={mesh.pp_size} cp_size={mesh.cp_size} tp_size={mesh.tp_size} dp_size={mesh.dp_size}",
+            flush=True,
+        )
     if mesh.ep_size > 1:
         from nemo_automodel.components.moe.parallelizer import parallelize_model
 
@@ -428,6 +436,8 @@ def instantiate_infrastructure(
         )
     elif autopipeline is not None and model_wrapper is not None:
         parallelize_fn = partial(parallelize_for_pp, model_wrapper=model_wrapper)
+        if not _dist.is_initialized() or _dist.get_rank() == 0:
+            print("NVBUG6599894 parallelize_fn=parallelize_for_pp (DENSE path, EP dropped)", flush=True)
 
     qat_quantizer = _instantiate_qat(qat_config)
 

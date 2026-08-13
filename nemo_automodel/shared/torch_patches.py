@@ -241,3 +241,35 @@ def apply_torch_patches() -> None:
         _logger.debug(f"Could not apply aten.alias.default sharding strategy patch: {e}")
 
     _TORCH_PATCHES_APPLIED = True
+
+
+def patch_fsdp_log_reduce_groups(limit: int = 10) -> None:
+    """DEBUG ONLY (NVBug 6599894): print what each reduce-scatter group contains."""
+    import torch.distributed as dist
+    import torch.distributed.fsdp._fully_shard._fsdp_collectives as coll
+    import torch.distributed.fsdp._fully_shard._fsdp_param_group as pg
+
+    original = coll.foreach_reduce
+    if getattr(original, "_nvbug6599894", False):
+        return
+    seen = {"n": 0}
+
+    def logged(fsdp_params, unsharded_grads, *args, **kwargs):
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        if rank == 0 and seen["n"] < limit:
+            seen["n"] += 1
+            total = sum(g.numel() for g in unsharded_grads)
+            names = [
+                (getattr(p, "_param_fqn", None) or p._module_info.param_name, tuple(g.shape))
+                for p, g in zip(fsdp_params, unsharded_grads)
+            ]
+            print(
+                f"NVBUG6599894 reduce-group {seen['n']}: numel={total} "
+                f"({total * 4 / 1024**3:.2f} GiB fp32) params={names}",
+                flush=True,
+            )
+        return original(fsdp_params, unsharded_grads, *args, **kwargs)
+
+    logged._nvbug6599894 = True
+    coll.foreach_reduce = logged
+    pg.foreach_reduce = logged
