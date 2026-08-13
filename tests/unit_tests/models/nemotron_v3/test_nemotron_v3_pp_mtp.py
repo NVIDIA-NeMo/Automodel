@@ -335,7 +335,7 @@ class TestPPForward:
         mtp_embed_inputs = () if missing == "embeddings" else (inputs_embeds.clone(),)
         mtp_position_ids = None if missing == "position_ids" else (torch.tensor([[1, 2, 3, 0]]),)
 
-        with pytest.raises(ValueError, match="requires precomputed per-depth embeddings and position IDs together"):
+        with pytest.raises(ValueError, match="requires exactly one of precomputed per-depth embeddings or input IDs"):
             model(
                 None,
                 *mtp_embed_inputs,
@@ -344,6 +344,44 @@ class TestPPForward:
                 mtp_per_depth_position_ids=mtp_position_ids,
                 cp_size=2,
             )
+
+    def test_context_parallel_accepts_pre_sharded_mtp_input_ids(self, backend):
+        model, cfg = _make_model(
+            backend,
+            mtp_layers=1,
+            mtp_layers_block_type=["attention", "moe"],
+        )
+        model.train()
+        captured = {}
+
+        def fake_inner(self, input_ids, **kwargs):
+            del self, kwargs
+            return torch.ones(input_ids.shape[0], input_ids.shape[1], cfg.hidden_size, dtype=torch.bfloat16)
+
+        def fake_mtp_forward(self, **kwargs):
+            captured.update(kwargs)
+            return [kwargs["hidden_states"].clone()]
+
+        model.model.forward = types.MethodType(fake_inner, model.model)
+        model.mtp.forward = types.MethodType(fake_mtp_forward, model.mtp)
+
+        input_ids = torch.tensor([[10, 11, 20, 21]])
+        mtp_input_ids = (torch.tensor([[11, 12, 21, 0]]),)
+        position_ids = torch.tensor([[0, 1, 0, 1]])
+        mtp_position_ids = (torch.tensor([[1, 2, 1, 0]]),)
+
+        out = model(
+            input_ids,
+            position_ids=position_ids,
+            mtp_per_depth_input_ids=mtp_input_ids,
+            mtp_per_depth_position_ids=mtp_position_ids,
+            cp_size=2,
+        )
+
+        assert out.mtp_per_depth_h is not None
+        torch.testing.assert_close(captured["input_ids_per_depth"][0], mtp_input_ids[0])
+        torch.testing.assert_close(captured["position_ids_per_depth"][0], mtp_position_ids[0])
+        assert captured.get("input_ids") is None
 
     def test_sdpa_thd_keeps_mtp_tensors_batched(self, backend):
         model, cfg = _make_model(

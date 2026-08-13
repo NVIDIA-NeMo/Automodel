@@ -16,11 +16,30 @@
 
 from __future__ import annotations
 
+from collections.abc import MutableMapping
 from dataclasses import dataclass
 from typing import Callable
 
 import torch
 import torch.nn as nn
+
+
+@dataclass(frozen=True)
+class MTPContextParallelInputs:
+    """Globally shifted MTP tensors prepared before context-parallel sharding.
+
+    Attributes:
+        input_ids: Per-depth token IDs of shape ``[batch, sequence]`` in global
+            sequence order.
+        position_ids: Optional per-depth position IDs of shape ``[batch,
+            sequence]`` in global sequence order.
+        targets: Per-depth loss targets of shape ``[batch, sequence]`` in global
+            sequence order, with invalid positions set to the loss ignore index.
+    """
+
+    input_ids: tuple[torch.LongTensor, ...]
+    position_ids: tuple[torch.LongTensor, ...] | None
+    targets: tuple[torch.LongTensor, ...]
 
 
 def roll_tensor(t: torch.Tensor, shifts: int = -1, dim: int = -1) -> torch.Tensor:
@@ -92,6 +111,191 @@ def shift_packed_tensor(
     while valid.dim() < shifted.dim():
         valid = valid.unsqueeze(-1)
     return torch.where(valid, shifted, torch.as_tensor(fill_value, dtype=tensor.dtype, device=tensor.device))
+
+
+def _packed_seq_ids_from_padded_lengths(
+    seq_lens_padded: torch.Tensor,
+    *,
+    batch_size: int,
+    seq_len: int,
+    device: torch.device,
+) -> torch.LongTensor:
+    """Expand padded packed-sequence lengths into token-aligned sequence IDs.
+
+    Args:
+        seq_lens_padded: Tensor of shape [batch, num_sequences] or
+            [num_sequences] for a single batch row. Negative entries are
+            unused sentinels; nonnegative entries are materialized sequence
+            lengths including padding.
+        batch_size: Expected batch dimension of the returned tensor.
+        seq_len: Expected materialized token count in each batch row.
+        device: Device for the returned token-aligned IDs.
+
+    Returns:
+        Sequence-ID tensor of shape [batch, sequence] on device.
+    """
+    if seq_lens_padded.dim() == 1:
+        seq_lens_padded = seq_lens_padded.unsqueeze(0)
+    if seq_lens_padded.dim() != 2 or seq_lens_padded.shape[0] != batch_size:
+        raise ValueError(
+            "seq_lens_padded must have shape [batch, num_sequences], "
+            f"got {tuple(seq_lens_padded.shape)} for batch size {batch_size}"
+        )
+
+    seq_idx = torch.zeros((batch_size, seq_len), dtype=torch.long, device=device)
+    for batch_idx, row in enumerate(seq_lens_padded.tolist()):
+        offset = 0
+        sequence_id = 1
+        for raw_length in row:
+            length = int(raw_length)
+            if length < 0:
+                continue
+            end = offset + length
+            if end > seq_len:
+                raise ValueError(
+                    f"seq_lens_padded row {batch_idx} covers more than the input sequence length {seq_len}"
+                )
+            seq_idx[batch_idx, offset:end] = sequence_id
+            offset = end
+            sequence_id += 1
+        if offset != seq_len:
+            raise ValueError(
+                f"seq_lens_padded row {batch_idx} covers {offset} tokens, expected the full input length {seq_len}"
+            )
+    return seq_idx
+
+
+def _packed_seq_ids_from_batch(
+    batch: MutableMapping[str, object],
+    *,
+    input_ids: torch.Tensor,
+) -> torch.LongTensor | None:
+    """Normalize supported packed-boundary metadata to token-aligned IDs.
+
+    Args:
+        batch: Unsharded batch. Optional seq_idx or _packed_seq_ids tensors
+            have shape [batch, sequence] (or [sequence] when batch is one).
+            seq_lens_padded has shape [batch, num_sequences].
+            cu_seqlens_padded or cu_seqlens contains flattened cumulative
+            boundaries of shape [num_sequences + 1] with optional negative
+            sentinels.
+        input_ids: Global token-ID tensor of shape [batch, sequence] whose
+            materialized token layout defines the expected output shape.
+
+    Returns:
+        Sequence-ID tensor of shape [batch, sequence] on the input device,
+        or None when the batch has no packed-boundary metadata.
+    """
+    seq_idx = batch.get("seq_idx")
+    if not isinstance(seq_idx, torch.Tensor):
+        seq_idx = batch.get("_packed_seq_ids")
+    if isinstance(seq_idx, torch.Tensor):
+        if seq_idx.dim() == 1 and input_ids.shape[0] == 1:
+            seq_idx = seq_idx.unsqueeze(0)
+        if seq_idx.shape != input_ids.shape:
+            raise ValueError(
+                f"packed sequence IDs must match input_ids, got {tuple(seq_idx.shape)} and {tuple(input_ids.shape)}"
+            )
+        return seq_idx.to(device=input_ids.device)
+
+    seq_lens_padded = batch.get("seq_lens_padded")
+    if isinstance(seq_lens_padded, torch.Tensor):
+        return _packed_seq_ids_from_padded_lengths(
+            seq_lens_padded,
+            batch_size=input_ids.shape[0],
+            seq_len=input_ids.shape[1],
+            device=input_ids.device,
+        )
+
+    # Padded boundaries describe the materialized token layout. Real
+    # cu_seqlens alone would shift across inter-sequence pad slots.
+    cu_seqlens = batch.get("cu_seqlens_padded", batch.get("cu_seqlens"))
+    if not isinstance(cu_seqlens, torch.Tensor):
+        return None
+    if input_ids.shape[0] != 1:
+        raise ValueError("cu_seqlens MTP boundary metadata requires batch size 1")
+
+    cu_seqlens = cu_seqlens.reshape(-1)
+    cu_seqlens = cu_seqlens[cu_seqlens >= 0].to(device=input_ids.device)
+    if cu_seqlens.numel() < 2:
+        return None
+    positions = torch.arange(input_ids.shape[1], device=input_ids.device)
+    return torch.searchsorted(cu_seqlens[1:].contiguous(), positions, right=True).unsqueeze(0)
+
+
+def prepare_mtp_context_parallel_inputs(
+    batch: MutableMapping[str, object],
+    *,
+    num_depths: int,
+    ignore_index: int = -100,
+) -> MTPContextParallelInputs:
+    """Prepare global future-token tensors before context-parallel sharding.
+
+    Each MTP depth is shifted in global sequence order before CP partitions the
+    token axis. Packed boundaries are preserved, so no future token, position,
+    or target crosses from one document into another. Missing or shared
+    position IDs are materialized in batch so the main model and MTP heads are
+    subsequently sharded from the same global source.
+
+    Args:
+        batch: Mutable unsharded batch. input_ids and labels are tensors of
+            shape [batch, sequence]. Optional position_ids has shape
+            [batch, sequence] or shared shape [1, sequence]. Packed boundaries
+            may use the tensor layouts documented by
+            _packed_seq_ids_from_batch.
+        num_depths: Number of MTP future-token depths; must be positive.
+        ignore_index: Fill value for invalid targets at trailing and packed
+            boundary positions.
+
+    Returns:
+        Per-depth input IDs, position IDs, and targets. Every tensor has global
+        shape [batch, sequence] and independent storage; targets without a
+        valid same-sequence future token contain ignore_index.
+    """
+    if num_depths <= 0:
+        raise ValueError(f"num_depths must be positive, got {num_depths}")
+
+    input_ids = batch.get("input_ids")
+    labels = batch.get("labels")
+    if not isinstance(input_ids, torch.Tensor) or not isinstance(labels, torch.Tensor):
+        raise ValueError("MTP with context parallelism requires tensor input_ids and labels")
+    if input_ids.dim() != 2 or labels.shape != input_ids.shape:
+        raise ValueError(
+            "MTP with context parallelism requires input_ids and labels with matching "
+            f"[batch, sequence] shapes, got {tuple(input_ids.shape)} and {tuple(labels.shape)}"
+        )
+
+    position_ids = batch.get("position_ids")
+    if position_ids is None:
+        position_ids = (
+            torch.arange(input_ids.shape[1], device=input_ids.device)
+            .unsqueeze(0)
+            .expand(input_ids.shape[0], -1)
+            .contiguous()
+        )
+        batch["position_ids"] = position_ids
+    elif (
+        isinstance(position_ids, torch.Tensor)
+        and position_ids.dim() == 2
+        and position_ids.shape == (1, input_ids.shape[1])
+    ):
+        position_ids = position_ids.expand(input_ids.shape[0], -1).contiguous()
+        batch["position_ids"] = position_ids
+    elif not isinstance(position_ids, torch.Tensor) or position_ids.shape != input_ids.shape:
+        position_shape = tuple(position_ids.shape) if isinstance(position_ids, torch.Tensor) else type(position_ids)
+        raise ValueError(
+            f"MTP position_ids must be a tensor matching input_ids, got {position_shape} and {tuple(input_ids.shape)}"
+        )
+
+    seq_idx = _packed_seq_ids_from_batch(batch, input_ids=input_ids)
+    depths = range(1, num_depths + 1)
+    return MTPContextParallelInputs(
+        input_ids=tuple(shift_packed_tensor(input_ids, depth=depth, seq_idx=seq_idx) for depth in depths),
+        position_ids=tuple(shift_packed_tensor(position_ids, depth=depth, seq_idx=seq_idx) for depth in depths),
+        targets=tuple(
+            shift_packed_tensor(labels, depth=depth, seq_idx=seq_idx, fill_value=ignore_index) for depth in depths
+        ),
+    )
 
 
 def get_mtp_loss_scaling_factor(model: nn.Module, default: float = 0.1) -> float:
@@ -217,6 +421,7 @@ class MTPModule(nn.Module):
         hidden_states: torch.Tensor,
         *,
         input_ids: torch.LongTensor | None = None,
+        input_ids_per_depth: tuple[torch.LongTensor, ...] | None = None,
         embed_fn: Callable[[torch.LongTensor], torch.Tensor] | None = None,
         embed_inputs: tuple[torch.Tensor, ...] | None = None,
         position_ids: torch.LongTensor | None = None,
@@ -225,12 +430,16 @@ class MTPModule(nn.Module):
     ) -> list[torch.Tensor]:
         """Iterate over MTP depths and return per-depth hidden states.
 
-        Two mutually-exclusive input modes:
+        Three mutually-exclusive input modes:
 
         * **Single-rank / first-stage PP** (default): pass ``input_ids`` plus
           ``embed_fn``. The module rolls ``input_ids`` cumulatively left by 1
           per depth and applies ``embed_fn`` to produce the future-token
           embedding for that depth.
+        * **Context parallel**: pass ``input_ids_per_depth`` plus ``embed_fn``.
+          Each tensor is globally shifted and then sharded into the local CP
+          token layout, so this module embeds it directly without a rank-local
+          roll.
         * **Final-stage PP / multimodal**: pass ``embed_inputs`` (a tuple of
           pre-rolled per-depth embeddings, length ``num_depths``). Used when
           the last PP stage no longer owns ``embed_tokens``, or for multimodal
@@ -244,13 +453,17 @@ class MTPModule(nn.Module):
                 shape matches the model's residual stream.
             input_ids: Token ids ``[B, S]`` (or ``[T]`` in THD). Rolled
                 cumulatively left by 1 per depth. Mutually exclusive with
-                ``embed_inputs``.
+                ``input_ids_per_depth`` and ``embed_inputs``.
+            input_ids_per_depth: Optional tuple of ``num_depths`` pre-shifted
+                token-ID tensors. Each has the local CP layout ``[B, S]`` or
+                ``[T]`` and is embedded directly with ``embed_fn``.
             embed_fn: Callable applied to rolled ``input_ids`` to produce the
                 future-token embedding (typically the model's input embedding
                 layer). Required when ``input_ids`` is supplied.
             embed_inputs: Optional tuple of ``num_depths`` pre-computed
                 future-token embeddings, one per depth in MTP order.
-                Mutually exclusive with ``input_ids``/``embed_fn``.
+                Mutually exclusive with ``input_ids``/
+                ``input_ids_per_depth``/``embed_fn``.
             position_ids: Position ids matching ``input_ids``. When supplied,
                 rolled cumulatively per depth in lockstep with ``input_ids``
                 (so slot ``t`` carries the original position of the rolled
@@ -271,17 +484,28 @@ class MTPModule(nn.Module):
             produced at each depth.
         """
         if embed_inputs is not None:
-            if input_ids is not None or embed_fn is not None:
-                raise ValueError("embed_inputs is mutually exclusive with input_ids/embed_fn")
+            if input_ids is not None or input_ids_per_depth is not None or embed_fn is not None:
+                raise ValueError("embed_inputs is mutually exclusive with input_ids/input_ids_per_depth/embed_fn")
             if len(embed_inputs) != self.num_depths:
                 raise ValueError(f"embed_inputs length {len(embed_inputs)} does not match num_depths {self.num_depths}")
+        elif input_ids_per_depth is not None:
+            if input_ids is not None or embed_fn is None:
+                raise ValueError("input_ids_per_depth requires embed_fn and is mutually exclusive with input_ids")
+            if len(input_ids_per_depth) != self.num_depths:
+                raise ValueError(
+                    f"input_ids_per_depth length {len(input_ids_per_depth)} does not match num_depths {self.num_depths}"
+                )
         else:
             if input_ids is None or embed_fn is None:
-                raise ValueError("MTPModule.forward requires either embed_inputs or (input_ids, embed_fn)")
-        if position_ids_per_depth is not None and embed_inputs is None:
+                raise ValueError(
+                    "MTPModule.forward requires embed_inputs, (input_ids_per_depth, embed_fn), or (input_ids, embed_fn)"
+                )
+        if input_ids_per_depth is not None and position_ids_per_depth is None:
+            raise ValueError("input_ids_per_depth and position_ids_per_depth must be provided together")
+        if input_ids is not None and position_ids_per_depth is not None:
             raise ValueError(
-                "position_ids_per_depth requires precomputed embed_inputs; "
-                "rank-local input_ids rolling cannot be combined with globally shifted positions"
+                "position_ids_per_depth cannot be combined with rank-local input_ids rolling; "
+                "provide input_ids_per_depth or precomputed embed_inputs"
             )
         if position_ids_per_depth is not None:
             if len(position_ids_per_depth) != self.num_depths:
@@ -295,6 +519,9 @@ class MTPModule(nn.Module):
             elif input_ids is not None:
                 expected_position_shape = input_ids.shape
                 expected_position_source = "input_ids"
+            elif input_ids_per_depth is not None:
+                expected_position_shape = input_ids_per_depth[0].shape
+                expected_position_source = "input_ids_per_depth token shape"
             else:
                 expected_position_shape = embed_inputs[0].shape[:-1]
                 expected_position_source = "embed_inputs token shape"
@@ -314,6 +541,8 @@ class MTPModule(nn.Module):
         for depth in range(num_iterations):
             if embed_inputs is not None:
                 decoder_input = embed_inputs[depth]
+            elif input_ids_per_depth is not None:
+                decoder_input = embed_fn(input_ids_per_depth[depth])
             else:
                 cur_input_ids = roll_tensor(cur_input_ids, shifts=-1, dim=-1)
                 decoder_input = embed_fn(cur_input_ids)
