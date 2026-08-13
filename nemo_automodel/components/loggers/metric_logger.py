@@ -22,6 +22,10 @@ from typing import Any, Dict, List
 import torch
 import torch.distributed as dist
 
+# Records buffered in memory before a write. Referenced by every signature that exposes
+# the setting so the three defaults cannot drift apart.
+DEFAULT_BUFFER_SIZE = 100
+
 
 @dataclass
 class MetricsSample:
@@ -95,7 +99,9 @@ class MetricLogger:
     - UTF-8 without BOM, newline per record.
     """
 
-    def __init__(self, filepath: str, *, flush: bool = False, append: bool = True, buffer_size: int = 100) -> None:
+    def __init__(
+        self, filepath: str, *, flush: bool = False, append: bool = True, buffer_size: int = DEFAULT_BUFFER_SIZE
+    ) -> None:
         # Validate before opening the file so a bad value cannot leak a descriptor.
         if not isinstance(buffer_size, int) or buffer_size < 1:
             raise ValueError("buffer_size must be a positive integer")
@@ -154,7 +160,9 @@ class MetricLogger:
 class MetricLoggerDist(MetricLogger):
     """Rank-zero JSON Lines metric logger for distributed jobs."""
 
-    def __init__(self, filepath: str, *, flush: bool = False, append: bool = True, buffer_size: int = 100) -> None:
+    def __init__(
+        self, filepath: str, *, flush: bool = False, append: bool = True, buffer_size: int = DEFAULT_BUFFER_SIZE
+    ) -> None:
         super().__init__(filepath, flush=flush, append=append, buffer_size=buffer_size)
         assert dist.is_initialized(), "torch.distributed must be initialized with MetricLoggerDist"
         self.rank = dist.get_rank()
@@ -180,7 +188,7 @@ class MetricLoggerDist(MetricLogger):
 
 
 def build_metric_logger(
-    filepath: str, *, flush: bool = False, append: bool = True, buffer_size: int = 100
+    filepath: str, *, flush: bool = False, append: bool = True, buffer_size: int = DEFAULT_BUFFER_SIZE
 ) -> MetricLogger:
     """Build a local or distributed metric logger depending on distributed state."""
     if dist.is_initialized():
