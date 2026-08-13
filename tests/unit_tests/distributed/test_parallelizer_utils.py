@@ -50,9 +50,16 @@ def test_configure_fsdp_unused_param_reduction_uses_public_fsdp_api(monkeypatch)
             self.calls.append((enabled, recurse))
 
     monkeypatch.setattr(parallelizer_utils, "FSDPModule", FakeFSDPModule)
+    install_compatibility_patch = Mock()
+    monkeypatch.setattr(
+        parallelizer_utils,
+        "_patch_fsdp_unused_param_reduction",
+        install_compatibility_patch,
+    )
     model = nn.Sequential(FakeFSDPModule(), nn.Sequential(FakeFSDPModule()))
 
     assert configure_fsdp_unused_param_reduction(model) == 2
+    install_compatibility_patch.assert_called_once_with()
     assert model[0].calls == [(True, False)]
     assert model[1][0].calls == [(True, False)]
 
@@ -73,6 +80,7 @@ def test_configure_fsdp_unused_param_reduction_uses_legacy_fallback(monkeypatch)
 
 
 def test_legacy_fsdp_unused_param_reduction_fills_missing_local_grad(monkeypatch):
+    from torch.distributed.fsdp import FSDPModule
     from torch.distributed.fsdp._fully_shard._fsdp_common import TrainingState
     from torch.distributed.fsdp._fully_shard._fsdp_param_group import FSDPParamGroup
 
@@ -82,6 +90,7 @@ def test_legacy_fsdp_unused_param_reduction_fills_missing_local_grad(monkeypatch
         calls.append((self, args, kwargs))
         return "post-backward-result"
 
+    monkeypatch.delattr(FSDPModule, "set_reduce_scatter_unused_params", raising=False)
     monkeypatch.setattr(FSDPParamGroup, "post_backward", original_post_backward)
     patch_fsdp_unused_param_reduction()
     patched_post_backward = FSDPParamGroup.post_backward
@@ -105,6 +114,89 @@ def test_legacy_fsdp_unused_param_reduction_fills_missing_local_grad(monkeypatch
     assert torch.equal(param.grad, torch.zeros_like(param))
     assert calls == [(param_group, ("arg",), {"flag": True})]
     assert FSDPParamGroup.post_backward is patched_post_backward
+
+
+def test_public_fsdp_unused_param_reduction_prefills_only_missing_dtensor_grad(monkeypatch):
+    """AMINT-273: keep the public API's chunk-cat inputs all local tensors."""
+    from torch.distributed.fsdp import FSDPModule
+    from torch.distributed.fsdp._fully_shard._fsdp_param_group import FSDPParamGroup
+
+    gradients_seen_by_upstream = []
+
+    def original_post_backward(self, *args, **kwargs):
+        gradients_seen_by_upstream.append([fsdp_param.unsharded_param.grad for fsdp_param in self.fsdp_params])
+
+    if not hasattr(FSDPModule, "set_reduce_scatter_unused_params"):
+        monkeypatch.setattr(
+            FSDPModule,
+            "set_reduce_scatter_unused_params",
+            lambda *args, **kwargs: None,
+            raising=False,
+        )
+    monkeypatch.setattr(FSDPParamGroup, "post_backward", original_post_backward)
+    patch_fsdp_unused_param_reduction()
+
+    dtensor_param = torch.nn.Parameter(torch.ones(2))
+    tensor_param = torch.nn.Parameter(torch.ones(2))
+    param_group = SimpleNamespace(
+        reduce_grads=True,
+        reduce_scatter_unused_params=True,
+        _training_state=object(),
+        fsdp_params=[
+            SimpleNamespace(
+                _unsharded_param=dtensor_param,
+                unsharded_accumulated_grad=None,
+                unsharded_param=dtensor_param,
+                is_dtensor=True,
+            ),
+            SimpleNamespace(
+                _unsharded_param=tensor_param,
+                unsharded_accumulated_grad=None,
+                unsharded_param=tensor_param,
+                is_dtensor=False,
+            ),
+        ],
+    )
+
+    FSDPParamGroup.post_backward(param_group)
+
+    assert torch.equal(dtensor_param.grad, torch.zeros_like(dtensor_param))
+    assert tensor_param.grad is None
+    assert gradients_seen_by_upstream == [[dtensor_param.grad, None]]
+
+
+def test_public_fsdp_unused_param_reduction_leaves_unconfigured_group_unchanged(monkeypatch):
+    """The DTensor workaround is dormant unless unused-parameter reduction is enabled."""
+    from torch.distributed.fsdp import FSDPModule
+    from torch.distributed.fsdp._fully_shard._fsdp_param_group import FSDPParamGroup
+
+    if not hasattr(FSDPModule, "set_reduce_scatter_unused_params"):
+        monkeypatch.setattr(
+            FSDPModule,
+            "set_reduce_scatter_unused_params",
+            lambda *args, **kwargs: None,
+            raising=False,
+        )
+    monkeypatch.setattr(FSDPParamGroup, "post_backward", lambda self, *args, **kwargs: None)
+    patch_fsdp_unused_param_reduction()
+
+    param = torch.nn.Parameter(torch.ones(2))
+    fsdp_param = SimpleNamespace(
+        _unsharded_param=param,
+        unsharded_accumulated_grad=None,
+        unsharded_param=param,
+        is_dtensor=True,
+    )
+    param_group = SimpleNamespace(
+        reduce_grads=True,
+        reduce_scatter_unused_params=False,
+        _training_state=object(),
+        fsdp_params=[fsdp_param],
+    )
+
+    FSDPParamGroup.post_backward(param_group)
+
+    assert param.grad is None
 
 
 def _fsdp_param_stub(param: torch.nn.Parameter, *, reduce_dtype, accumulated=None):

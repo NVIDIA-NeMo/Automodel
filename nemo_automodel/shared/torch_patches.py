@@ -108,13 +108,22 @@ def patch_fsdp_uniform_reduce_dtype() -> None:
 
 
 def patch_fsdp_unused_param_reduction() -> None:
-    """Backport FSDP2 unused-parameter reduction when the public API is absent.
+    """Make FSDP2 unused-parameter reduction safe for DTensor parameters.
 
-    The patch is process-global and idempotent. It only fills a missing local
-    gradient with zeros immediately before FSDP2 post-backward reduction, so
-    ranks that skipped a parameter still participate in the same collective as
-    ranks that used it. Callers must first prefer the public
-    ``FSDPModule.set_reduce_scatter_unused_params`` API.
+    The public ``set_reduce_scatter_unused_params`` implementation in PyTorch
+    2.13 creates its missing gradient with ``zeros_like(unsharded_param)``. The
+    missing zero for a TP/EP-owned parameter is therefore a DTensor, while real
+    gradients are unwrapped to local tensors before ``fsdp.chunk_cat``.
+    Pre-populating only the missing DTensor gradients routes them through FSDP's
+    normal gradient accessor, which performs the same unwrap and keeps the
+    collective input homogeneous. Ordinary tensors stay on the upstream path.
+
+    On PyTorch versions without the public flag, the patch retains AutoModel's
+    existing backport and fills every missing local gradient immediately before
+    FSDP2 post-backward reduction. Remove the public-API branch once the minimum
+    supported PyTorch version normalizes its synthesized DTensor gradients.
+
+    The patch is process-global and idempotent.
 
     Raises:
         RuntimeError: If the installed PyTorch exposes neither the public API
@@ -122,9 +131,20 @@ def patch_fsdp_unused_param_reduction() -> None:
     """
     try:
         import torch
+        from torch.distributed.fsdp import FSDPModule
+    except ImportError as error:
+        raise RuntimeError("Context parallelism requires PyTorch FSDP2.") from error
+
+    public_api_available = hasattr(FSDPModule, "set_reduce_scatter_unused_params")
+    try:
         from torch.distributed.fsdp._fully_shard._fsdp_common import TrainingState
         from torch.distributed.fsdp._fully_shard._fsdp_param_group import FSDPParamGroup
     except ImportError as error:
+        if public_api_available:
+            # A future public implementation may move its private internals. In
+            # that case, trust the supported API instead of making the
+            # compatibility shim a new failure mode.
+            return
         raise RuntimeError(
             "Context parallelism requires FSDP unused-parameter reduction, but this PyTorch "
             "version provides neither the public API nor the compatible FSDP2 implementation."
@@ -135,11 +155,17 @@ def patch_fsdp_unused_param_reduction() -> None:
         return
 
     def _post_backward_with_unused_param_reduction(self, *args, **kwargs):
-        if self.reduce_grads and self._training_state == TrainingState.PRE_BACKWARD:
+        public_api_enabled = public_api_available and getattr(self, "reduce_scatter_unused_params", False)
+        legacy_api_enabled = not public_api_available and self._training_state == TrainingState.PRE_BACKWARD
+        if self.reduce_grads and (public_api_enabled or legacy_api_enabled):
             for fsdp_param in self.fsdp_params:
                 if not hasattr(fsdp_param, "_unsharded_param"):
                     continue
                 if fsdp_param.unsharded_accumulated_grad is not None:
+                    continue
+                # The public API already handles ordinary tensors correctly.
+                # Intervene only for its mixed Tensor/DTensor construction.
+                if public_api_enabled and not getattr(fsdp_param, "is_dtensor", False):
                     continue
                 param = fsdp_param.unsharded_param
                 if param.requires_grad and param.grad is None:

@@ -27,6 +27,7 @@ import torch.nn as nn
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 from torch.distributed.tensor import DTensor, Shard, distribute_tensor
+from torch.distributed.tensor.parallel import ColwiseParallel, parallelize_module
 
 from nemo_automodel.components.distributed.parallelizer_utils import configure_fsdp_unused_param_reduction
 from nemo_automodel.components.loss.linear_ce import HAVE_CUT_CROSS_ENTROPY, FusedLinearCrossEntropy
@@ -225,6 +226,64 @@ def _assert_accumulated_unused_param_grad_dtype(device: torch.device) -> None:
     torch.testing.assert_close(_full_grad(model.used.weight), expected_used, rtol=2e-2, atol=2e-2)
 
 
+def _assert_dtensor_unused_param_grad_parity(device: torch.device) -> None:
+    """Keep a DTensor-owned unused gradient compatible with FSDP reduce-scatter.
+
+    Regression for AMINT-273: PyTorch 2.13's public unused-parameter path
+    appends ``zeros_like(DTensor)`` beside the local Tensor gradient from
+    ``used`` and then rejects the mixed list in ``fsdp.chunk_cat``. Complementary
+    2x1 and 1x2 DP/TP meshes cover a real two-rank reduce-scatter and a genuinely
+    sharded model-parallel DTensor without exceeding the two-GPU test budget.
+    """
+    world = dist.get_world_size()
+    for topology_index, (dp_size, tp_size) in enumerate(((world, 1), (1, world))):
+        root_mesh = init_device_mesh("cuda", (dp_size, tp_size), mesh_dim_names=("dp_cp", "tp"))
+        dp_mesh = root_mesh["dp_cp"]
+        tp_mesh = root_mesh["tp"]
+
+        torch.manual_seed(273 + topology_index)
+        model = _PartiallyUsedFSDPModel().to(device)
+        reference = _PartiallyUsedFSDPModel().to(device)
+        reference.load_state_dict(model.state_dict())
+
+        parallelize_module(
+            model,
+            device_mesh=tp_mesh,
+            parallelize_plan={
+                "used": ColwiseParallel(use_local_output=False),
+                "unused": ColwiseParallel(use_local_output=False),
+            },
+        )
+        assert isinstance(model.used.weight, DTensor)
+        assert isinstance(model.unused.weight, DTensor)
+        fully_shard(model, mesh=dp_mesh, reshard_after_forward=False)
+        configured_units = configure_fsdp_unused_param_reduction(model)
+        assert configured_units >= 1
+
+        inputs = []
+        for data_rank in range(dp_size):
+            generator = torch.Generator(device=device).manual_seed(2730 + 10 * topology_index + data_rank)
+            inputs.append(torch.randn(2, 3, 8, device=device, generator=generator))
+        dp_rank = dist.get_rank(dp_mesh.get_group())
+
+        output = model(inputs[dp_rank])
+        assert isinstance(output, DTensor)
+        output.to_local().sum().backward()
+
+        reference_loss = sum(reference(batch).sum() for batch in inputs) / dp_size
+        reference_loss.backward()
+
+        unused_grad = _full_grad(model.unused.weight)
+        torch.testing.assert_close(unused_grad, torch.zeros_like(unused_grad), rtol=0, atol=0)
+        torch.testing.assert_close(
+            _full_grad(model.used.weight),
+            reference.used.weight.grad.float(),
+            rtol=1e-5,
+            atol=1e-6,
+        )
+        dist.barrier()
+
+
 def _run_worker() -> None:
     dist.init_process_group("nccl")
     try:
@@ -240,6 +299,8 @@ def _run_worker() -> None:
         dist.barrier()
         _assert_accumulated_unused_param_grad_dtype(device)
         dist.barrier()
+        _assert_dtensor_unused_param_grad_parity(device)
+        dist.barrier()
 
         if dist.get_rank() == 0:
             print(_RESULT_PREFIX + "PASS", flush=True)
@@ -249,7 +310,7 @@ def _run_worker() -> None:
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires at least 2 CUDA devices")
 def test_cp_flce_and_empty_rank_fsdp_two_rank_gradient_parity() -> None:
-    """FLCE and rank-asymmetric FSDP gradients match full references on two GPUs."""
+    """FLCE, rank-asymmetric, and DTensor FSDP gradients match full references."""
     command = [
         sys.executable,
         "-m",

@@ -43,8 +43,9 @@ def configure_fsdp_unused_param_reduction(module: nn.Module) -> int:
     sequence everywhere; otherwise a rank with ``grad is None`` can omit a
     collective and discard peer contributions. PyTorch's public API fills the
     missing local contribution with zero, analogous to DDP unused-parameter
-    handling. AutoModel keeps a compatibility fallback for supported PyTorch
-    versions that predate that public API.
+    handling. AutoModel keeps a compatibility patch for supported PyTorch
+    versions that predate that public API and for public versions that otherwise
+    synthesize a DTensor zero alongside local Tensor gradients.
 
     Args:
         module: Root module containing the FSDP units to configure.
@@ -60,11 +61,10 @@ def configure_fsdp_unused_param_reduction(module: nn.Module) -> int:
     # dtype and must be aligned with the peers' reduce-dtype accumulations before
     # the group reaches ``foreach_reduce``.
     _patch_fsdp_uniform_reduce_dtype()
+    _patch_fsdp_unused_param_reduction()
     if hasattr(fsdp_modules[0], "set_reduce_scatter_unused_params"):
         for fsdp_module in fsdp_modules:
             fsdp_module.set_reduce_scatter_unused_params(True, recurse=False)
-    else:
-        _patch_fsdp_unused_param_reduction()
     return len(fsdp_modules)
 
 
