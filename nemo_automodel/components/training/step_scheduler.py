@@ -63,7 +63,7 @@ class StepScheduler(Stateful):
         global_batch_size: int,
         local_batch_size: int,
         dp_size: int,
-        dataloader: int | None,
+        dataloader: DataLoader | None,
         ckpt_every_steps: int | None = None,
         save_checkpoint_every_epoch: bool = True,
         val_every_steps: int | None = None,
