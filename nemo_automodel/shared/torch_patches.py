@@ -244,11 +244,12 @@ def apply_torch_patches() -> None:
 
 
 def patch_fsdp_log_reduce_groups(limit: int = 3) -> None:
-    """DEBUG ONLY (NVBug 6599894): print reduce-group composition, including the failing one.
+    """DEBUG ONLY (NVBug 6599894 / AMINT-274): identify the reduce group that fails.
 
-    Prints from EVERY rank: under pipeline parallelism rank 0 reduces last, so a
-    rank-0-only print never fires when a mid-pipeline rank dies first. Also prints
-    the group whose reduction raised, which is the one that OOMs.
+    Only rank 0's stdout reaches the CI log, and under pipeline parallelism rank 0
+    reduces last, so a print never survives a mid-pipeline failure. Fold the group
+    description into the raised exception instead: torch elastic propagates
+    tracebacks from every rank.
     """
     import torch.distributed as dist
     import torch.distributed.fsdp._fully_shard._fsdp_collectives as coll
@@ -266,6 +267,7 @@ def patch_fsdp_log_reduce_groups(limit: int = 3) -> None:
             (
                 getattr(p, "_param_fqn", None) or p._module_info.param_name,
                 tuple(g.shape),
+                str(g.dtype),
                 type(g).__name__,
                 getattr(p, "is_dtensor", None),
             )
@@ -280,11 +282,11 @@ def patch_fsdp_log_reduce_groups(limit: int = 3) -> None:
         try:
             return original(fsdp_params, unsharded_grads, *args, **kwargs)
         except Exception as error:
-            print(
-                f"NVBUG6599894 FAILING GROUP ({type(error).__name__}): {describe(fsdp_params, unsharded_grads)}",
-                flush=True,
-            )
-            raise
+            # Re-raise with the group identity embedded so it survives to the log.
+            raise RuntimeError(
+                f"NVBUG6599894 FAILING GROUP: {describe(fsdp_params, unsharded_grads)} "
+                f"orig={type(error).__name__}: {error}"
+            ) from error
 
     logged._nvbug6599894 = True
     coll.foreach_reduce = logged
