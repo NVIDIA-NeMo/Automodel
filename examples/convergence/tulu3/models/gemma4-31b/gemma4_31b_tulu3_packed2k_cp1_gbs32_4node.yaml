@@ -113,7 +113,8 @@ wandb:
   dir: /tmp/wandb
 
 # ── Weekly Tulu-3 convergence CI (train 1000 steps -> IFEval -> threshold gate) ──
-# Passes iff |CI IFEval prompt_level_strict_acc - baseline| < k * stderr. baseline/stderr
+# Regression gate, one-sided: passes iff CI IFEval prompt_level_strict_acc >
+# baseline - k * stderr. A higher score always passes. baseline/stderr
 # measured (see README.md). `tokenizer: checkpoint` -> eval uses the trained checkpoint's
 # tokenizer (it carries the chat_template.jinja).
 # google/gemma-4-31B (base) ships no chat template; it is supplied via dataset.chat_template

@@ -61,8 +61,118 @@ from nemo_automodel.components.models.qwen3_5.state_dict_adapter import (
 from nemo_automodel.components.moe import state_dict_utils
 from nemo_automodel.components.moe.layers import MoEConfig
 
+_FP8_BLOCK_SIZE = 128
+
+_BASE_SPLIT_FP8_EXPERT_KEY = re.compile(
+    r"(?:model\.)?(?:language_model\.)?layers\.\d+\.mlp\.experts\.\d+"
+    r"\.(?:gate_proj|up_proj|down_proj)\.weight$"
+)
+_BASE_GROUPED_EXPERT_KEY = re.compile(
+    r"(?:model\.)?(?:language_model\.)?layers\.\d+\.mlp\.experts\.(?:gate_up_proj|down_proj)$"
+)
+_BASE_SPLIT_FP8_EXPERT_PARAM = re.compile(
+    r"(?:model\.)?(?:language_model\.)?layers\.(\d+)\.mlp\.experts\.(\d+)\."
+    r"(gate_proj|up_proj|down_proj)\.weight(?P<scale>_scale_inv)?$"
+)
 _MTP_SPLIT_EXPERT_KEY = re.compile(r"mtp\.layers\.\d+\.mlp\.experts\.\d+\.(?:gate_proj|up_proj|down_proj)\.weight")
 _MTP_GROUPED_EXPERT_KEY = re.compile(r"mtp\.layers\.\d+\.mlp\.experts\.(?:gate_up_proj|down_proj)")
+
+
+def _block_scale_placeholder(weight: Any) -> torch.Tensor:
+    """Create a regular 128x128 block-scale load target for a 2-D weight.
+
+    Args:
+        weight: FP8 weight Tensor or DTensor of shape [out, in].
+
+    Returns:
+        Tensor of shape [ceil(out / 128), ceil(in / 128)] with one scale for each 128x128 block.
+    """
+    shape = weight.shape
+    local = weight.to_local() if state_dict_utils.is_dtensor(weight) else weight
+    return torch.ones(
+        (
+            (shape[0] + _FP8_BLOCK_SIZE - 1) // _FP8_BLOCK_SIZE,
+            (shape[1] + _FP8_BLOCK_SIZE - 1) // _FP8_BLOCK_SIZE,
+        ),
+        dtype=torch.bfloat16,
+        device=local.device,
+    )
+
+
+def _dequantize_block_fp8(weight: Any, scale_inv: Any, dtype: torch.dtype) -> torch.Tensor:
+    """Dequantize one local 2-D 128x128 block-scaled FP8 expert weight.
+
+    Args:
+        weight: FP8 weight Tensor or DTensor of shape [out, in].
+        scale_inv: Block-scale Tensor or DTensor of shape [ceil(out / 128), ceil(in / 128)], with one scale for
+            each 128x128 block.
+        dtype: Output dtype.
+
+    Returns:
+        Dequantized Tensor of shape [out, in] in ``dtype``.
+    """
+    local_weight = weight.to_local() if state_dict_utils.is_dtensor(weight) else weight
+    local_scale = scale_inv.to_local() if state_dict_utils.is_dtensor(scale_inv) else scale_inv
+    rows, cols = local_weight.shape
+    expected_shape = (
+        (rows + _FP8_BLOCK_SIZE - 1) // _FP8_BLOCK_SIZE,
+        (cols + _FP8_BLOCK_SIZE - 1) // _FP8_BLOCK_SIZE,
+    )
+    if tuple(local_scale.shape) != expected_shape:
+        raise ValueError(
+            f"FP8 scale shape {tuple(local_scale.shape)} does not match weight shape "
+            f"{tuple(local_weight.shape)} (expected {expected_shape})"
+        )
+    expanded_scale = (
+        local_scale.float().repeat_interleave(_FP8_BLOCK_SIZE, dim=0).repeat_interleave(_FP8_BLOCK_SIZE, dim=1)
+    )
+    return (local_weight.float() * expanded_scale[:rows, :cols]).to(dtype)
+
+
+def _slice_ep_shard_dim1(
+    local_tensor: torch.Tensor,
+    ep_shard_rank: int,
+    ep_shard_size: int,
+    tensor_name: str,
+) -> torch.Tensor:
+    """Slice dim 1 of a local expert tensor for the ``ep_shard`` mesh dimension."""
+    if ep_shard_size == 1:
+        return local_tensor
+    if local_tensor.shape[1] % ep_shard_size != 0:
+        raise ValueError(
+            f"{tensor_name} dim 1 ({local_tensor.shape[1]}) is not divisible by ep_shard_size={ep_shard_size}"
+        )
+    chunk = local_tensor.shape[1] // ep_shard_size
+    return local_tensor[:, ep_shard_rank * chunk : (ep_shard_rank + 1) * chunk, :]
+
+
+def _filter_excluded(result: list[tuple[str, Any]], exclude_key_regex: str | None) -> list[tuple[str, Any]]:
+    """Remove exported HF entries matched by ``exclude_key_regex``."""
+    if not exclude_key_regex:
+        return result
+    return [(key, value) for key, value in result if not re.match(exclude_key_regex, key)]
+
+
+def _infer_base_expert_hf_layout(checkpoint_keys: Iterable[str]) -> str | None:
+    """Infer the decoder expert layout from checkpoint key names."""
+    split_key = None
+    grouped_key = None
+    checkpoint_keys = set(checkpoint_keys)
+    for key in checkpoint_keys:
+        if split_key is None and _BASE_SPLIT_FP8_EXPERT_KEY.fullmatch(key) and f"{key}_scale_inv" in checkpoint_keys:
+            split_key = key
+        elif grouped_key is None and _BASE_GROUPED_EXPERT_KEY.fullmatch(key):
+            grouped_key = key
+        if split_key is not None and grouped_key is not None:
+            raise ValueError(
+                "Checkpoint contains both split-FP8 and grouped decoder expert keys; "
+                f"cannot infer one layout (examples: {split_key!r}, {grouped_key!r})"
+            )
+    if split_key is not None:
+        return "split-fp8"
+    if grouped_key is not None:
+        return "grouped"
+    return None
 
 
 def _infer_mtp_expert_hf_layout(checkpoint_keys: Iterable[str]) -> str | None:
@@ -171,6 +281,7 @@ class Qwen3_5MoeStateDictAdapter(StateDictAdapter):
         self.pretrained_model_name_or_path = pretrained_model_name_or_path
         self.mtp_expert_hf_layout = mtp_expert_hf_layout
         self.text_only = text_only
+        self._expert_hf_layout: str | None = None
         self._inferred_mtp_expert_hf_layout: str | None = None
         self._local_checkpoint_layout_checked = False
         self._uses_model_prefix = True
@@ -179,6 +290,33 @@ class Qwen3_5MoeStateDictAdapter(StateDictAdapter):
             ".mlp.shared_expert.": ".mlp.shared_experts.",
         }
         self.internal_to_hf_map = {v: k for k, v in self.hf_to_internal_map.items()}
+
+    def _get_expert_hf_layout(self, checkpoint_keys: Iterable[str] | None = None) -> str:
+        """Resolve and remember whether decoder experts use grouped BF16 or split block-FP8 HF keys."""
+        if checkpoint_keys is not None:
+            inferred_layout = _infer_base_expert_hf_layout(checkpoint_keys)
+            if inferred_layout is not None:
+                self._expert_hf_layout = inferred_layout
+                return inferred_layout
+
+        if self._expert_hf_layout is not None:
+            return self._expert_hf_layout
+
+        model_paths = [self.pretrained_model_name_or_path]
+        for attr in ("_name_or_path", "name_or_path"):
+            value = getattr(self.config, attr, None)
+            if isinstance(value, str) and value:
+                model_paths.append(value)
+        for model_path in model_paths:
+            inferred_layout = _infer_base_expert_hf_layout(_get_local_safetensors_keys(model_path))
+            if inferred_layout is not None:
+                self._expert_hf_layout = inferred_layout
+                return inferred_layout
+
+        # Preserve the established Qwen3.5/Qwen3.6 grouped BF16 contract when
+        # checkpoint metadata is unavailable or inconclusive.
+        self._expert_hf_layout = "grouped"
+        return self._expert_hf_layout
 
     def _get_mtp_expert_hf_layout(self, checkpoint_keys: Iterable[str] | None = None) -> str:
         """Resolve and remember whether MTP experts use split or grouped HF keys."""
@@ -262,6 +400,7 @@ class Qwen3_5MoeStateDictAdapter(StateDictAdapter):
                 tensor,
                 exclude_key_regex=exclude_key_regex,
                 mtp_expert_hf_layout=mtp_expert_hf_layout,
+                quantization=quantization,
             ):
                 hf_state_dict[key] = value
         return hf_state_dict
@@ -278,7 +417,9 @@ class Qwen3_5MoeStateDictAdapter(StateDictAdapter):
         reassembled without applying EP-shard slicing again.
         Plain tensors (init path): slice to local EP shard, transpose, create DTensor.
         """
-        self._get_mtp_expert_hf_layout(set(hf_state_dict))
+        checkpoint_keys = set(hf_state_dict)
+        self._get_expert_hf_layout(checkpoint_keys)
+        self._get_mtp_expert_hf_layout(checkpoint_keys)
         self._uses_model_prefix = any(key.startswith("model.") for key in hf_state_dict if not key.startswith("mtp."))
         model_prefix = "model." if self._uses_model_prefix else ""
 
@@ -301,6 +442,7 @@ class Qwen3_5MoeStateDictAdapter(StateDictAdapter):
                     ep_shard_size = ep_shard_sub.size()
 
         state_dict: dict[str, Any] = {}
+        base_expert_parts: dict[str, dict[str, dict[int, dict[str, Any]]]] = {}
         mtp_expert_parts: dict[str, dict[str, dict[int, torch.Tensor]]] = {}
 
         def store_native_key(native_key: str, tensor: Any) -> None:
@@ -308,6 +450,21 @@ class Qwen3_5MoeStateDictAdapter(StateDictAdapter):
             state_dict[native_key] = upcast_gated_delta_net_fp32_state_tensor(native_key, tensor)
 
         for key, value in hf_state_dict.items():
+            base_split_match = _BASE_SPLIT_FP8_EXPERT_PARAM.match(key)
+            if base_split_match:
+                layer_num = base_split_match.group(1)
+                expert_num = int(base_split_match.group(2))
+                projection = base_split_match.group(3)
+                if not state_dict_utils.should_load_expert_for_rank(expert_num, device_mesh, n_experts):
+                    continue
+                projection_parts = base_expert_parts.setdefault(
+                    layer_num,
+                    {"gate_proj": {}, "up_proj": {}, "down_proj": {}},
+                )
+                expert_parts = projection_parts[projection].setdefault(expert_num, {})
+                expert_parts["scale" if base_split_match.group("scale") else "weight"] = value
+                continue
+
             mapped_mtp_key = map_qwen3_5_mtp_from_hf_key(key)
             if mapped_mtp_key != key:
                 store_native_key(mapped_mtp_key, value)
@@ -380,6 +537,58 @@ class Qwen3_5MoeStateDictAdapter(StateDictAdapter):
                     f"{model_prefix}{mapped_key}" if not mapped_key.startswith("model.") else mapped_key, value
                 )
 
+        language_model_prefix = "" if self.text_only else "language_model."
+        for layer_num, parts in base_expert_parts.items():
+            expert_ids = sorted(set(parts["gate_proj"]) | set(parts["up_proj"]) | set(parts["down_proj"]))
+            gate_up_tensors = []
+            down_tensors = []
+            for expert_id in expert_ids:
+                projections = {}
+                for projection in ("gate_proj", "up_proj", "down_proj"):
+                    projection_parts = parts[projection].get(expert_id, {})
+                    if "weight" not in projection_parts or "scale" not in projection_parts:
+                        raise RuntimeError(
+                            f"Missing FP8 {projection} weight/scale for layer {layer_num}, expert {expert_id}"
+                        )
+                    projections[projection] = _dequantize_block_fp8(
+                        projection_parts["weight"],
+                        projection_parts["scale"],
+                        self.dtype,
+                    )
+                gate_t = projections["gate_proj"].transpose(0, 1)
+                up_t = projections["up_proj"].transpose(0, 1)
+                down_t = projections["down_proj"].transpose(0, 1)
+                gate_up_tensors.append(torch.cat((gate_t, up_t), dim=1))
+                down_tensors.append(down_t)
+
+            gate_up_tensor = torch.stack(gate_up_tensors, dim=0)
+            down_tensor = torch.stack(down_tensors, dim=0)
+            if ep_shard_size > 1:
+                gate_up_tensor = _slice_ep_shard_dim1(
+                    gate_up_tensor,
+                    ep_shard_rank,
+                    ep_shard_size,
+                    "Base gate_and_up_projs",
+                )
+                down_tensor = _slice_ep_shard_dim1(
+                    down_tensor,
+                    ep_shard_rank,
+                    ep_shard_size,
+                    "Base down_projs",
+                )
+
+            native_prefix = f"{model_prefix}{language_model_prefix}layers.{layer_num}.mlp.experts."
+            state_dict[f"{native_prefix}gate_and_up_projs"] = state_dict_utils.create_dtensor_from_local(
+                gate_up_tensor,
+                device_mesh,
+                rank,
+            )
+            state_dict[f"{native_prefix}down_projs"] = state_dict_utils.create_dtensor_from_local(
+                down_tensor,
+                device_mesh,
+                rank,
+            )
+
         for layer_num, parts in mtp_expert_parts.items():
             expert_ids = sorted(set(parts["gate_proj"]) | set(parts["up_proj"]) | set(parts["down_proj"]))
             gate_up_tensors = []
@@ -409,16 +618,18 @@ class Qwen3_5MoeStateDictAdapter(StateDictAdapter):
                 gate_up_tensor = gate_up_tensor.to_local()
                 down_tensor = down_tensor.to_local()
             elif ep_shard_size > 1:
-                for tensor_name, local_tensor in (("gate_and_up_projs", gate_up_tensor), ("down_projs", down_tensor)):
-                    if local_tensor.shape[1] % ep_shard_size != 0:
-                        raise ValueError(
-                            f"MTP {tensor_name} dim 1 ({local_tensor.shape[1]}) is not divisible by "
-                            f"ep_shard_size={ep_shard_size}"
-                        )
-                gate_chunk = gate_up_tensor.shape[1] // ep_shard_size
-                down_chunk = down_tensor.shape[1] // ep_shard_size
-                gate_up_tensor = gate_up_tensor[:, ep_shard_rank * gate_chunk : (ep_shard_rank + 1) * gate_chunk, :]
-                down_tensor = down_tensor[:, ep_shard_rank * down_chunk : (ep_shard_rank + 1) * down_chunk, :]
+                gate_up_tensor = _slice_ep_shard_dim1(
+                    gate_up_tensor,
+                    ep_shard_rank,
+                    ep_shard_size,
+                    "MTP gate_and_up_projs",
+                )
+                down_tensor = _slice_ep_shard_dim1(
+                    down_tensor,
+                    ep_shard_rank,
+                    ep_shard_size,
+                    "MTP down_projs",
+                )
 
             state_dict[f"mtp.layers.{layer_num}.mlp.experts.gate_and_up_projs"] = (
                 state_dict_utils.create_dtensor_from_local(gate_up_tensor, device_mesh, rank)
@@ -432,6 +643,50 @@ class Qwen3_5MoeStateDictAdapter(StateDictAdapter):
     def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs) -> list[tuple[str, Any]]:
         """Rename a single native key to HF format and transpose expert tensors."""
         exclude_key_regex = kwargs.get("exclude_key_regex")
+        quantization = kwargs.get("quantization", False)
+
+        base_gate_up_match = re.match(r"(.+layers\.(\d+)\.mlp\.experts)\.gate_and_up_projs$", fqn)
+        base_down_match = re.match(r"(.+layers\.(\d+)\.mlp\.experts)\.down_projs$", fqn)
+        if quantization and self._get_expert_hf_layout() == "split-fp8":
+            if base_gate_up_match:
+                expert_prefix = base_gate_up_match.group(1)
+                splits, expert_ids = state_dict_utils.split_experts_weights_dtensor_aware(
+                    tensor,
+                    self.moe_config.n_routed_experts,
+                )
+                result = []
+                inter_dim = self.moe_config.moe_inter_dim
+                for expert_tensor, expert_id in zip(splits, expert_ids):
+                    gate = expert_tensor[:, :inter_dim].transpose(0, 1).to(dtype=torch.float8_e4m3fn)
+                    up = expert_tensor[:, inter_dim:].transpose(0, 1).to(dtype=torch.float8_e4m3fn)
+                    gate_key = f"{expert_prefix}.{expert_id}.gate_proj.weight"
+                    up_key = f"{expert_prefix}.{expert_id}.up_proj.weight"
+                    result.extend(
+                        (
+                            (gate_key, gate),
+                            (f"{gate_key}_scale_inv", _block_scale_placeholder(gate)),
+                            (up_key, up),
+                            (f"{up_key}_scale_inv", _block_scale_placeholder(up)),
+                        )
+                    )
+                return _filter_excluded(result, exclude_key_regex)
+            if base_down_match:
+                expert_prefix = base_down_match.group(1)
+                splits, expert_ids = state_dict_utils.split_experts_weights_dtensor_aware(
+                    tensor,
+                    self.moe_config.n_routed_experts,
+                )
+                result = []
+                for expert_tensor, expert_id in zip(splits, expert_ids):
+                    down = expert_tensor.transpose(0, 1).to(dtype=torch.float8_e4m3fn)
+                    down_key = f"{expert_prefix}.{expert_id}.down_proj.weight"
+                    result.extend(
+                        (
+                            (down_key, down),
+                            (f"{down_key}_scale_inv", _block_scale_placeholder(down)),
+                        )
+                    )
+                return _filter_excluded(result, exclude_key_regex)
 
         new_fqn = fqn
         value = tensor
@@ -457,9 +712,7 @@ class Qwen3_5MoeStateDictAdapter(StateDictAdapter):
                         up = up.contiguous()
                     result.append((f"mtp.layers.{layer_num}.mlp.experts.{expert_id}.gate_proj.weight", gate))
                     result.append((f"mtp.layers.{layer_num}.mlp.experts.{expert_id}.up_proj.weight", up))
-                if exclude_key_regex:
-                    result = [(key, val) for key, val in result if not re.match(exclude_key_regex, key)]
-                return result
+                return _filter_excluded(result, exclude_key_regex)
             if mtp_down_match:
                 layer_num = mtp_down_match.group(1)
                 splits, expert_ids = state_dict_utils.split_experts_weights_dtensor_aware(
@@ -471,9 +724,7 @@ class Qwen3_5MoeStateDictAdapter(StateDictAdapter):
                     if not state_dict_utils.is_dtensor(down):
                         down = down.contiguous()
                     result.append((f"mtp.layers.{layer_num}.mlp.experts.{expert_id}.down_proj.weight", down))
-                if exclude_key_regex:
-                    result = [(key, val) for key, val in result if not re.match(exclude_key_regex, key)]
-                return result
+                return _filter_excluded(result, exclude_key_regex)
 
         # Qwen3.6 stores MTP experts in the same grouped layout as decoder experts,
         # while Qwen3.5 stores MTP experts as per-expert tensors handled above.
