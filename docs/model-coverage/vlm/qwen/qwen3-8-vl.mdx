@@ -1,0 +1,45 @@
+---
+title: "Qwen3.8"
+description: "Supported Qwen3.8-27B full SFT and LoRA recipes in NeMo AutoModel."
+slug: model-coverage/vision-language-models/qwen/qwen3-8-vl
+---
+
+Qwen3.8-27B is Qwen's dense 27B native vision-language model for text, image,
+and video inputs. It retains the Qwen3.5 hybrid Gated DeltaNet and gated-attention
+architecture, so NeMo AutoModel uses its existing native
+`Qwen3_5ForConditionalGeneration` implementation for the checkpoint.
+
+<Info>
+
+| | |
+|---|---|
+| **Task** | Image-Text-to-Text |
+| **Architecture** | `Qwen3_5ForConditionalGeneration` |
+| **Parameters** | 27B dense |
+| **Context length** | 262,144 tokens |
+| **HF Org** | [Qwen](https://huggingface.co/Qwen) |
+
+</Info>
+
+## Example Models and Recipes
+
+| Model | Recipe | Description |
+|---|---|---|
+| [`Qwen/Qwen3.8-27B`](https://huggingface.co/Qwen/Qwen3.8-27B) | [qwen3_8_27b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5/qwen3_8_27b.yaml) | Full-parameter SFT on MedPix-VQA |
+| [`Qwen/Qwen3.8-27B`](https://huggingface.co/Qwen/Qwen3.8-27B) | [qwen3_8_27b_lora.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5/qwen3_8_27b_lora.yaml) | LoRA on MedPix-VQA |
+
+## Run the Recipes
+
+```bash
+uv run automodel --nproc-per-node=8 examples/vlm_finetune/qwen3_5/qwen3_8_27b.yaml
+uv run automodel --nproc-per-node=8 examples/vlm_finetune/qwen3_5/qwen3_8_27b_lora.yaml
+```
+
+Install the `vlm-media` extra before running either recipe. See the
+[Installation Guide](/get-started/installation) and the
+[Qwen3.8 fine-tuning guide](/recipes-e2e-examples/qwen3-8-27b) for setup,
+validation details, and measured training-loss curves.
+
+The checked-in recipes use FSDP2 data parallelism on eight GPUs. The shared
+Qwen3.5 dense model implementation also supports TP, CP, and PP, but the
+Qwen3.8 runs documented here validate the DP8 recipes specifically.
