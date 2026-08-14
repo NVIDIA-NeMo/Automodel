@@ -400,6 +400,56 @@ def packed_sequence_thd_collater(batch):
     }
 
 
+def pack_features_for_thd(features: list[dict], *, ignore_index: int = -100) -> dict:
+    """Concatenate loose single-sequence features into one pre-packed THD record.
+
+    Each input feature holds one unpadded variable-length sequence
+    (``input_ids`` and optionally ``labels``). The output is a single record in
+    the pre-packed schema :func:`packed_sequence_thd_collater` accepts: flat
+    ``input_ids``/``labels``, ``position_ids`` restarting at every sequence
+    boundary, and per-sequence ``seq_lens``/``seq_lens_padded`` (no separator
+    tokens, so the two are equal).
+
+    Deciding *which* sequences share a pack is the caller's job (the sampler,
+    or an RL framework's microbatcher); this helper only executes the
+    concatenation.
+
+    Args:
+        features: per-example dicts with ``input_ids`` and optional ``labels``
+            (``list[int]`` or 1-D tensors). An example without ``labels``
+            contributes ``ignore_index`` at every position (no loss).
+        ignore_index: label fill value for examples without labels.
+
+    Returns:
+        One pre-packed feature record (plain lists), suitable as a batch item
+        for :func:`packed_sequence_thd_collater`.
+    """
+    if not features:
+        raise ValueError("pack_features_for_thd requires at least one feature")
+    input_ids: list[int] = []
+    labels: list[int] = []
+    position_ids: list[int] = []
+    seq_lens: list[int] = []
+    for feature in features:
+        ids = list(feature["input_ids"])
+        if not ids:
+            raise ValueError("cannot pack an empty sequence")
+        example_labels = list(feature["labels"]) if "labels" in feature else [ignore_index] * len(ids)
+        if len(example_labels) != len(ids):
+            raise ValueError(f"labels length {len(example_labels)} does not match input_ids length {len(ids)}")
+        input_ids.extend(ids)
+        labels.extend(example_labels)
+        position_ids.extend(range(len(ids)))
+        seq_lens.append(len(ids))
+    return {
+        "input_ids": input_ids,
+        "labels": labels,
+        "position_ids": position_ids,
+        "seq_lens": seq_lens,
+        "seq_lens_padded": list(seq_lens),
+    }
+
+
 def packed_sequence_thd_collater_vlm(examples, processor=None, **kwargs):
     """THD collater adapter for the VLM recipe's ``(examples, processor)`` call convention.
 
