@@ -514,7 +514,7 @@ def test_prepare_model_inputs_consumes_nothing(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# get_capabilities: dense 31B supports CP; E2B/E4B (audio) does not; MoE does
+# get_capabilities: dense 31B and E2B/E4B support TP/CP; MoE supports CP/EP
 # ---------------------------------------------------------------------------
 def test_get_capabilities_plain_dense_supports_cp():
     caps = Gemma4ForConditionalGeneration.get_capabilities(_cfg(enable_moe_block=False))
@@ -525,13 +525,13 @@ def test_get_capabilities_plain_dense_supports_cp():
 
 
 def test_get_capabilities_dense_audio_variant_supports_cp():
-    # E2B/E4B: dense + audio_config present -> CP supported (kv-sharing +
-    # per-layer-inputs flow through the model-owned ring). TP/PP/EP stay off.
+    # E2B/E4B: dense + audio_config present -> TP/CP supported (kv-sharing +
+    # per-layer-inputs flow through model-owned distributed paths). PP/EP stay off.
     cfg = _cfg(enable_moe_block=False)
     cfg.audio_config = {}  # non-None marks the dense+audio variant (E2B/E4B)
     caps = Gemma4ForConditionalGeneration.get_capabilities(cfg)
     assert caps.supports_cp is True
-    assert caps.supports_tp is False
+    assert caps.supports_tp is True
     assert caps.supports_pp is False
     assert caps.supports_ep is False
 

@@ -28,6 +28,7 @@ from nemo_automodel.components.checkpoint._backports.hf_utils import (
 )
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState
 from nemo_automodel.components.moe.state_dict_mixin import MoESplitExpertsStateDictMixin
+from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 
 if TYPE_CHECKING:
     from peft import PeftConfig
@@ -467,7 +468,7 @@ def _extract_target_modules(
                 target_name = name.rsplit(".", 1)[0]
                 if target_name.startswith("_orig_mod."):
                     target_name = target_name[len("_orig_mod.") :]
-                target_name = target_name.replace("_checkpoint_wrapped_module.", "")
+                target_name = canonical_parameter_fqn(target_name)
 
                 # Expand combined projection names to individual HF projection names
                 last_component = target_name.rsplit(".", 1)[-1]
@@ -502,7 +503,7 @@ def _extract_target_modules(
                         expert_path = name[: -len(f".{lora_suffix}")]
                         if expert_path.startswith("_orig_mod."):
                             expert_path = expert_path[len("_orig_mod.") :]
-                        expert_path = expert_path.replace("_checkpoint_wrapped_module.", "")
+                        expert_path = canonical_parameter_fqn(expert_path)
 
                         group = "gate_and_up" if "gate_and_up" in lora_suffix else "down"
                         if (expert_path, group) in seen_expert_groups:

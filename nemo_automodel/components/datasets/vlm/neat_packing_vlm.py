@@ -358,21 +358,34 @@ def _shift_sample(sample: dict, has_mrope: bool = False) -> dict:
     return out
 
 
+def _aligned_length(length: int, alignment: int) -> int:
+    """Round ``length`` up to ``alignment`` without changing zero-length samples."""
+    if alignment < 1:
+        raise ValueError(f"sequence_alignment must be at least 1, got {alignment}.")
+    return ((length + alignment - 1) // alignment) * alignment
+
+
 def _build_packed_vlm_sample(
     samples: list[dict],
     pack_size: int,
     padding_idx: int,
     has_mrope: bool = False,
+    sequence_alignment: int = 1,
 ) -> dict:
-    """Concatenate multiple shifted VLM samples into one packed sample."""
+    """Concatenate shifted VLM samples, including per-document alignment padding."""
+    if has_mrope and sequence_alignment > 1:
+        raise NotImplementedError("Context-parallel THD packing for multi-axis mRoPE VLMs is not yet implemented.")
+
     all_input_ids: list[int] = []
     all_labels: list[int] = []
     all_attention_mask: list[int] = []
     all_mm_token_type_ids: list[int] = []
     all_position_ids_1d: list[int] = []
     mrope_position_ids_list: list[torch.Tensor] = []
+    seq_lens: list[int] = []
+    seq_lens_padded: list[int] = []
 
-    pixel_values_list: list[torch.Tensor] = []
+    pixel_values_list: list[torch.Tensor | list[torch.Tensor]] = []
     image_grid_thw_list: list[torch.Tensor] = []
     image_position_ids_list: list[torch.Tensor] = []
     pixel_values_videos_list: list[torch.Tensor] = []
@@ -390,20 +403,25 @@ def _build_packed_vlm_sample(
             labs = labs.tolist()
 
         seq_len = len(ids)
-        all_input_ids.extend(ids)
-        all_labels.extend(labs)
-        all_attention_mask.extend([seq_idx] * seq_len)
+        padded_seq_len = _aligned_length(seq_len, sequence_alignment)
+        pad = padded_seq_len - seq_len
+        seq_lens.append(seq_len)
+        seq_lens_padded.append(padded_seq_len)
+        all_input_ids.extend(ids + [padding_idx] * pad)
+        all_labels.extend(labs + [-100] * pad)
+        all_attention_mask.extend([seq_idx] * padded_seq_len)
 
         mm_ttids = sample.get("mm_token_type_ids")
         if mm_ttids is not None:
-            all_mm_token_type_ids.extend(mm_ttids.tolist() if isinstance(mm_ttids, torch.Tensor) else mm_ttids)
+            mm_ttids = mm_ttids.tolist() if isinstance(mm_ttids, torch.Tensor) else list(mm_ttids)
+            all_mm_token_type_ids.extend(mm_ttids + [0] * pad)
         else:
-            all_mm_token_type_ids.extend([0] * seq_len)
+            all_mm_token_type_ids.extend([0] * padded_seq_len)
 
         if has_mrope and "position_ids" in sample:
             mrope_position_ids_list.append(sample["position_ids"])
         else:
-            all_position_ids_1d.extend(range(seq_len))
+            all_position_ids_1d.extend(range(padded_seq_len))
 
         if "pixel_values" in sample and sample["pixel_values"] is not None:
             pixel_values_list.append(sample["pixel_values"])
@@ -426,6 +444,8 @@ def _build_packed_vlm_sample(
         "labels": torch.tensor(all_labels, dtype=torch.long),
         "attention_mask": torch.tensor(all_attention_mask, dtype=torch.long),
         "mm_token_type_ids": torch.tensor(all_mm_token_type_ids, dtype=torch.long),
+        "seq_lens": seq_lens,
+        "seq_lens_padded": seq_lens_padded,
         "n_images": n_images,
         "n_videos": n_videos,
     }
@@ -435,7 +455,14 @@ def _build_packed_vlm_sample(
     else:
         packed["position_ids"] = torch.tensor(all_position_ids_1d, dtype=torch.long)
 
-    packed["pixel_values"] = torch.cat(pixel_values_list, dim=0) if pixel_values_list else None
+    if pixel_values_list and all(isinstance(value, torch.Tensor) for value in pixel_values_list):
+        packed["pixel_values"] = torch.cat(pixel_values_list, dim=0)
+    elif pixel_values_list and all(isinstance(value, (list, tuple)) for value in pixel_values_list):
+        packed["pixel_values"] = [item for value in pixel_values_list for item in value]
+    elif pixel_values_list:
+        raise TypeError("Packed VLM pixel_values must be consistently tensors or variable-resolution lists.")
+    else:
+        packed["pixel_values"] = None
     packed["image_grid_thw"] = torch.cat(image_grid_thw_list, dim=0) if image_grid_thw_list else None
     packed["image_position_ids"] = torch.cat(image_position_ids_list, dim=0) if image_position_ids_list else None
     packed["pixel_values_videos"] = torch.cat(pixel_values_videos_list, dim=0) if pixel_values_videos_list else None
@@ -456,6 +483,8 @@ class PackedDatasetWrapperConfig:
 
     pack_size: int = 2048
     """Target packed sequence length (after autoregressive shift)."""
+    sequence_alignment: int = 1
+    """Per-document token alignment applied during materialization."""
     max_retries: int = 10
     """Max retries when a sample fails to tokenize during materialization."""
 
@@ -473,6 +502,7 @@ class PackedDatasetWrapperConfig:
             inner_dataset: The tokenizing dataset (e.g. ``PreTokenizedDatasetWrapper``).
             bins: Bin assignments from ``greedy_knapsack`` / ``neat_pack_dataset_vlm``.
             padding_idx: Runtime tokenizer padding token ID.
+            sequence_alignment: Per-document token alignment from this config.
             get_rope_index: Optional ``model.get_rope_index`` callable for mRoPE support.
         """
         return PackedDatasetWrapper(
@@ -480,6 +510,7 @@ class PackedDatasetWrapperConfig:
             bins=bins,
             pack_size=self.pack_size,
             padding_idx=padding_idx,
+            sequence_alignment=self.sequence_alignment,
             get_rope_index=get_rope_index,
             max_retries=self.max_retries,
         )
@@ -500,6 +531,8 @@ class PackedDatasetWrapper(torch.utils.data.Dataset):
             list of sample indices into ``inner_dataset``.
         pack_size: Target packed sequence length (after shift).
         padding_idx: Token ID for padding.
+        sequence_alignment: Per-document token alignment included in capacity
+            checks and materialization.
         get_rope_index: Optional ``model.get_rope_index`` for mRoPE.
         max_retries: Max retries when a sample fails to tokenize.
     """
@@ -510,6 +543,7 @@ class PackedDatasetWrapper(torch.utils.data.Dataset):
         bins: list[list[int]],
         pack_size: int,
         padding_idx: int = 0,
+        sequence_alignment: int = 1,
         get_rope_index: Callable | None = None,
         max_retries: int = 10,
     ):
@@ -517,8 +551,13 @@ class PackedDatasetWrapper(torch.utils.data.Dataset):
         self.bins = bins
         self.pack_size = pack_size
         self.padding_idx = padding_idx
+        if sequence_alignment < 1:
+            raise ValueError(f"sequence_alignment must be at least 1, got {sequence_alignment}.")
+        self.sequence_alignment = sequence_alignment
         self.get_rope_index = get_rope_index
         self.has_mrope = get_rope_index is not None
+        if self.has_mrope and self.sequence_alignment > 1:
+            raise NotImplementedError("Context-parallel THD packing for multi-axis mRoPE VLMs is not yet implemented.")
         self.max_retries = max_retries
 
     def __len__(self):
@@ -539,13 +578,15 @@ class PackedDatasetWrapper(torch.utils.data.Dataset):
 
             shifted = _shift_sample(sample, has_mrope=self.has_mrope)
             seq_len = shifted["input_ids"].shape[0]
+            aligned_seq_len = _aligned_length(seq_len, self.sequence_alignment)
 
-            # If real length exceeds pack_size after shift, skip this sample
-            if seq_len > self.pack_size:
+            # The aligned length is the actual capacity consumed by THD CP.
+            if aligned_seq_len > self.pack_size:
                 logger.warning(
-                    "Pack %d: sample %d has %d tokens (> pack_size %d), skipping.",
+                    "Pack %d: sample %d needs %d aligned tokens (%d real, pack_size %d), skipping.",
                     pack_idx,
                     sample_idx,
+                    aligned_seq_len,
                     seq_len,
                     self.pack_size,
                 )
@@ -558,14 +599,16 @@ class PackedDatasetWrapper(torch.utils.data.Dataset):
         kept: list[dict] = []
         for s in shifted_samples:
             slen = s["input_ids"].shape[0]
-            if total + slen <= self.pack_size:
+            aligned_slen = _aligned_length(slen, self.sequence_alignment)
+            if total + aligned_slen <= self.pack_size:
                 kept.append(s)
-                total += slen
+                total += aligned_slen
             else:
                 logger.debug(
-                    "Pack %d: dropping overflow sample (%d tokens, %d/%d used).",
+                    "Pack %d: dropping overflow sample (%d real, %d aligned tokens, %d/%d used).",
                     pack_idx,
                     slen,
+                    aligned_slen,
                     total,
                     self.pack_size,
                 )
@@ -574,7 +617,13 @@ class PackedDatasetWrapper(torch.utils.data.Dataset):
             # Fallback: return a padding-only pack
             kept = [{"input_ids": torch.tensor([], dtype=torch.long), "labels": torch.tensor([], dtype=torch.long)}]
 
-        return _build_packed_vlm_sample(kept, self.pack_size, self.padding_idx, has_mrope=self.has_mrope)
+        return _build_packed_vlm_sample(
+            kept,
+            self.pack_size,
+            self.padding_idx,
+            has_mrope=self.has_mrope,
+            sequence_alignment=self.sequence_alignment,
+        )
 
     def robust_collate(self, collate_fn):
         """Wrap collate_fn with retry logic, delegating to inner dataset."""
@@ -621,6 +670,7 @@ class NeatPackConfig:
         ds_raw: torch.utils.data.Dataset | Sequence[dict[str, object]] | None = None,
         get_rope_index: Callable[..., object] | None = None,
         processor: "ProcessorMixin | None" = None,
+        cp_size: int = 1,
     ) -> "PackedDatasetWrapper":
         """Build a neat-packed VLM dataset from this config.
 
@@ -631,7 +681,22 @@ class NeatPackConfig:
                 ``len(dataset)`` when ``None``.
             get_rope_index: Optional ``model.get_rope_index`` callable for mRoPE support.
             processor: Optional HuggingFace processor for accurate media token estimation.
+            cp_size: Runtime context-parallel size. THD packing aligns every
+                document to ``2 * cp_size`` when greater than one.
         """
+        if cp_size < 1:
+            raise ValueError(f"cp_size must be at least 1, got {cp_size}.")
+        sequence_alignment = 2 * cp_size if self.packing_format == "thd" and cp_size > 1 else 1
+        if sequence_alignment > 1:
+            if get_rope_index is not None:
+                raise NotImplementedError(
+                    "Context-parallel THD packing for multi-axis mRoPE VLMs is not yet implemented."
+                )
+            if self.collate_max_length is not None and self.collate_max_length % sequence_alignment != 0:
+                raise ValueError(
+                    "VLM THD collate_max_length must be divisible by 2 * cp_size, "
+                    f"got collate_max_length={self.collate_max_length}, cp_size={cp_size}."
+                )
         return neat_pack_dataset_vlm(
             dataset=dataset,
             pack_size=self.pack_size,
@@ -643,6 +708,7 @@ class NeatPackConfig:
             packing_ratio=self.packing_ratio,
             processor=processor,
             balance_media_tokens=self.balance_media_tokens,
+            sequence_alignment=sequence_alignment,
         )
 
 
@@ -657,6 +723,7 @@ def neat_pack_dataset_vlm(
     packing_ratio: float = 1.0,
     processor=None,
     balance_media_tokens: bool = True,
+    sequence_alignment: int = 1,
 ) -> PackedDatasetWrapper:
     """Create a lazily-packed VLM dataset.
 
@@ -689,10 +756,17 @@ def neat_pack_dataset_vlm(
         balance_media_tokens: If True (default), use VT-balanced knapsack
             that distributes visual tokens evenly across packs.  Falls back
             to standard knapsack if no media tokens are detected.
+        sequence_alignment: Per-document token alignment included in both
+            knapsack capacity and lazy materialization.
 
     Returns:
         A ``PackedDatasetWrapper`` (torch Dataset).
     """
+    if sequence_alignment < 1:
+        raise ValueError(f"sequence_alignment must be at least 1, got {sequence_alignment}.")
+    if get_rope_index is not None and sequence_alignment > 1:
+        raise NotImplementedError("Context-parallel THD packing for multi-axis mRoPE VLMs is not yet implemented.")
+
     # Extract processor configs for accurate media token estimation
     image_cfg = LengthGroupedSampler._extract_image_config(processor) if processor is not None else None
     video_cfg = LengthGroupedSampler._extract_video_config(processor) if processor is not None else None
@@ -734,7 +808,7 @@ def neat_pack_dataset_vlm(
                 video_cfg=video_cfg,
                 return_media_tokens=True,
             )
-            est_len -= 1  # -1 for shift
+            est_len = _aligned_length(max(est_len - 1, 0), sequence_alignment)  # -1 for shift
             if est_len > pack_size:
                 if drop_long_samples:
                     dropped_count += 1
@@ -770,7 +844,8 @@ def neat_pack_dataset_vlm(
         # No raw dataset — use dataset length, assume uniform distribution
         N = len(dataset)
         logger.info("Neat packing VLM: no ds_raw, using uniform estimate for %d samples.", N)
-        estimated_lengths = [knapsack_capacity // 2] * N
+        uniform_estimate = _aligned_length(knapsack_capacity // 2, sequence_alignment)
+        estimated_lengths = [min(uniform_estimate, knapsack_capacity)] * N
         estimated_media_tokens = [0] * N
         valid_indices = list(range(N))
 
@@ -841,7 +916,7 @@ def neat_pack_dataset_vlm(
     )
 
     # ── Return lazy dataset ──────────────────────────────────────
-    return PackedDatasetWrapperConfig(pack_size=pack_size).build(
+    return PackedDatasetWrapperConfig(pack_size=pack_size, sequence_alignment=sequence_alignment).build(
         inner_dataset=dataset,
         bins=bins,
         padding_idx=padding_idx,

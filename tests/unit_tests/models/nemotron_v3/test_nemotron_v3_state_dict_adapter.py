@@ -162,6 +162,53 @@ class TestNemotronV3AdapterDense:
         assert set(back.keys()) == set(hf_sd.keys())
 
 
+class TestNemotronV3AdapterMTP:
+    """MTP checkpoint namespace regressions."""
+
+    def test_view_loaded_mtp_experts_keep_native_namespace(self):
+        config = MockNemotronV3Config()
+        moe_config = MoEConfig(
+            n_routed_experts=2,
+            n_shared_experts=1,
+            n_activated_experts=1,
+            n_expert_groups=1,
+            n_limited_groups=1,
+            train_gate=True,
+            gate_bias_update_factor=0.0,
+            aux_loss_coeff=0.0,
+            score_func="sigmoid",
+            route_scale=1.0,
+            dim=256,
+            inter_dim=512,
+            moe_inter_dim=128,
+            norm_topk_prob=False,
+            expert_bias=False,
+            expert_activation="relu2",
+            dtype=torch.bfloat16,
+        )
+        adapter = NemotronV3StateDictAdapter(config, moe_config, BackendConfig(), dtype=torch.bfloat16)
+
+        # DCP writes these split tensors through views into the native grouped
+        # parameters. The merge therefore returns no tensor for them and uses
+        # view_loaded_native_keys to tell the loader they were loaded.
+        adapter._inplace_loaded_native_keys = {
+            "layers.1.mixer.experts.gate_and_up_projs",
+            "layers.1.mixer.experts.down_projs",
+        }
+        hf_state = {}
+        for expert_id in range(2):
+            hf_state[f"mtp.layers.1.mixer.experts.{expert_id}.up_proj.weight"] = torch.randn(128, 256)
+            hf_state[f"mtp.layers.1.mixer.experts.{expert_id}.down_proj.weight"] = torch.randn(256, 128)
+
+        native = adapter.from_hf(hf_state)
+
+        assert not native
+        assert adapter.view_loaded_native_keys == {
+            "mtp.layers.1.mixer.experts.gate_and_up_projs",
+            "mtp.layers.1.mixer.experts.down_projs",
+        }
+
+
 class TestNemotronV3AdapterToHf:
     """Test to_hf conversion."""
 

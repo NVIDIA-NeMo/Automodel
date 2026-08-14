@@ -693,9 +693,24 @@ def test_ministral_embedding_uses_stock_bidirectional_model(tmp_path):
     reloaded = AutoModel.from_pretrained(save_dir)
     assert (save_dir / "tokenizer.json").exists()
     assert json.loads((save_dir / "modules.json").read_text()) == [
-        {"idx": 0, "name": "0", "path": "", "type": "sentence_transformers.models.Transformer"},
-        {"idx": 1, "name": "1", "path": "1_Pooling", "type": "sentence_transformers.models.Pooling"},
-        {"idx": 2, "name": "2", "path": "2_Normalize", "type": "sentence_transformers.models.Normalize"},
+        {
+            "idx": 0,
+            "name": "0",
+            "path": "",
+            "type": "sentence_transformers.base.modules.transformer.Transformer",
+        },
+        {
+            "idx": 1,
+            "name": "1",
+            "path": "1_Pooling",
+            "type": "sentence_transformers.sentence_transformer.modules.pooling.Pooling",
+        },
+        {
+            "idx": 2,
+            "name": "2",
+            "path": "2_Normalize",
+            "type": "sentence_transformers.sentence_transformer.modules.normalize.Normalize",
+        },
     ]
     assert json.loads((save_dir / "config_sentence_transformers.json").read_text())["prompts"]["query"] == "query: "
 
