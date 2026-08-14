@@ -218,6 +218,40 @@ def test_uniform_reduce_dtype_widens_mixed_group(monkeypatch):
     assert torch.equal(grads[1], torch.full((2,), 5.0))
 
 
+def test_uniform_reduce_dtype_localizes_residual_dtensor(monkeypatch):
+    """The old public unused-param zero is localized before ``chunk_cat``."""
+    import torch.distributed.fsdp._fully_shard._fsdp_collectives as collectives
+    import torch.distributed.fsdp._fully_shard._fsdp_param_group as param_group
+    import torch.distributed.tensor as tensor_module
+
+    class FakeDTensor(torch.Tensor):
+        @staticmethod
+        def __new__(cls, tensor):
+            return torch.Tensor._make_subclass(cls, tensor, False)
+
+        def to_local(self):
+            # Model an EP-local tensor with half of the global expert storage.
+            return self.as_subclass(torch.Tensor)[:2]
+
+    seen = []
+
+    def stub(fsdp_params, unsharded_grads, *args, **kwargs):
+        seen.append([(type(grad), grad.numel()) for grad in unsharded_grads])
+        return "reduced"
+
+    monkeypatch.setattr(tensor_module, "DTensor", FakeDTensor)
+    monkeypatch.setattr(collectives, "foreach_reduce", stub)
+    monkeypatch.setattr(param_group, "foreach_reduce", stub)
+    patch_fsdp_uniform_reduce_dtype()
+
+    grads = [torch.ones(2), FakeDTensor(torch.ones(4))]
+    result = collectives.foreach_reduce(["used", "unused"], grads)
+
+    assert result == "reduced"
+    assert seen == [[(torch.Tensor, 2), (torch.Tensor, 2)]]
+    assert all(type(grad) is torch.Tensor for grad in grads)
+
+
 def test_uniform_reduce_dtype_leaves_uniform_group_untouched(monkeypatch):
     """Uniform groups pass straight through, preserving upstream's own checks."""
     seen = []
