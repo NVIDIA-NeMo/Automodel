@@ -55,11 +55,18 @@ ENV PATH="$UV_PROJECT_ENVIRONMENT/bin:$PATH"
 ENV UV_LINK_MODE=copy UV_COMPILE_BYTECODE=1
 ARG RUNTIME_UID=65532
 ARG RUNTIME_GID=65532
-RUN groupadd --gid "${RUNTIME_GID}" nemo-runtime && \
-    useradd --no-log-init --uid "${RUNTIME_UID}" --gid "${RUNTIME_GID}" \
-        --create-home --home-dir /home/nemo-runtime --shell /bin/bash nemo-runtime && \
+RUN if ! getent group "${RUNTIME_GID}" >/dev/null; then \
+        groupadd --gid "${RUNTIME_GID}" nemo-runtime; \
+    fi && \
+    if ! getent passwd "${RUNTIME_UID}" >/dev/null; then \
+        useradd --no-log-init --uid "${RUNTIME_UID}" --gid "${RUNTIME_GID}" \
+            --create-home --home-dir /home/nemo-runtime --shell /bin/bash nemo-runtime; \
+    fi && \
     install -d -o "${RUNTIME_UID}" -g "${RUNTIME_GID}" \
-        /opt/Automodel /opt/uv_cache && \
+        /home/nemo-runtime \
+        /opt/Automodel \
+        /opt/uv_cache \
+        /opt/uv_cache/xdg && \
     uv venv ${UV_PROJECT_ENVIRONMENT} --system-site-packages && \
     chown -R "${RUNTIME_UID}:${RUNTIME_GID}" ${UV_PROJECT_ENVIRONMENT}
 
@@ -268,18 +275,27 @@ ARG TARGETARCH
 RUN echo "This distribution includes open source which is archived at the following URL: https://opensource.nvidia.com/oss/teams/nvidia/nemo-automodel/${RC_DATE}:linux-${TARGETARCH}/index.html" > NOTICES.txt && \
     echo "For further inquiries or assistance, contact us at oss-requests@nvidia.com" >> NOTICES.txt
 
-# Exercise the supported sandbox identity without changing the image's root
-# default. Runtime-specific HOME and cache overrides belong to the launcher.
+# Runtime callers select this UID and set HOME/cache variables explicitly; the
+# published image remains root by default. Prove that the non-root contract
+# works before restoring that default.
 USER ${RUNTIME_UID}:${RUNTIME_GID}
-RUN test "$(id -u)" = "${RUNTIME_UID}" && \
+RUN export HOME=/home/nemo-runtime \
+        XDG_CACHE_HOME=/opt/uv_cache/xdg && \
+    test "$(id -u)" = "${RUNTIME_UID}" && \
+    test -w "${HOME}" && \
+    test -w "${XDG_CACHE_HOME}" && \
+    test -w "${UV_CACHE_DIR}" && \
     test -x /usr/local/bin/uv && \
     test -x /usr/local/bin/uvx && \
     test -x /opt/venv/bin/python && \
+    venv_site_packages="$(python -c 'import site; print(site.getsitepackages()[0])')" && \
     touch /opt/Automodel/.nonroot-write-probe \
         /opt/venv/.nonroot-write-probe \
-        /opt/uv_cache/.nonroot-write-probe && \
+        /opt/uv_cache/.nonroot-write-probe \
+        "${venv_site_packages}/.nonroot-write-probe" && \
     rm /opt/Automodel/.nonroot-write-probe \
         /opt/venv/.nonroot-write-probe \
-        /opt/uv_cache/.nonroot-write-probe
+        /opt/uv_cache/.nonroot-write-probe \
+        "${venv_site_packages}/.nonroot-write-probe"
 
 USER root
