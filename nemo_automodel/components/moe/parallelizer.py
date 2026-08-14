@@ -567,24 +567,9 @@ def apply_ac(
         return False
 
     router_topk = getattr(getattr(torch.ops.aten, "topk", None), "default", None)
-    # Dispatch/combine are part of the routed-token assignment just like the
-    # router projection and top-k outputs. Replaying them during backward adds
-    # another EP communication pass and can change empty-rank tensor metadata
-    # under mixed-precision parameter lifecycles. Save their outputs instead;
-    # this is much smaller than broad selective AC because every other GEMM is
-    # still recomputed.
-    moe_comm_ops = {
-        getattr(getattr(getattr(torch.ops, "deepep", None), op_name, None), "default", None)
-        for op_name in ("dispatch", "combine")
-    }
-    moe_comm_ops.discard(None)
 
     def _custom_policy(ctx, func, *args, **kwargs):
-        if (
-            func in moe_comm_ops
-            or (router_topk is not None and func == router_topk)
-            or _is_router_projection(func, args)
-        ):
+        if (router_topk is not None and func == router_topk) or _is_router_projection(func, args):
             return CheckpointPolicy.MUST_SAVE
         return CheckpointPolicy.PREFER_RECOMPUTE
 
