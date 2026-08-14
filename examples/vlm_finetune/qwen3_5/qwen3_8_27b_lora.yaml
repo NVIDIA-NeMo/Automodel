@@ -134,6 +134,8 @@ wandb:
   dir: logs/qwen3_8_27b_lora_medpix/wandb
 
 ci:
+  recipe_owner: akoumpa
+  nodes: 1
   time: "00:15:00"
   env_vars:
     MAX_STEPS: 10
