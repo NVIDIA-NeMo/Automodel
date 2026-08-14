@@ -37,7 +37,9 @@ UniformSubtreeItem = Union[Tuple[nn.Module, torch.dtype], Tuple[str, nn.Module, 
 
 def reject_unsupported_mtp_cp_pp(model: nn.Module) -> None:
     """Reject MTP+CP on every trimmed pipeline stage before CP collectives."""
-    supports = model.supports
+    supports = getattr(model, "supports", None)
+    if supports is None:
+        return
     is_pp_stage_fn = getattr(model, "_is_pipeline_parallel_stage", None)
     if supports.mtp_enabled and not supports.supports_mtp_cp_pp and callable(is_pp_stage_fn) and is_pp_stage_fn():
         raise NotImplementedError(

@@ -30,11 +30,16 @@ from nemo_automodel.components.distributed.parallelizer_utils import (
     configure_fsdp_unused_param_reduction,
     fully_shard_by_dtype,
     iter_maximal_uniform_dtype_subtrees,
+    reject_unsupported_mtp_cp_pp,
 )
 from nemo_automodel.shared.torch_patches import (
     patch_fsdp_uniform_reduce_dtype,
     patch_fsdp_unused_param_reduction,
 )
+
+
+def test_reject_unsupported_mtp_cp_pp_ignores_model_without_capabilities():
+    reject_unsupported_mtp_cp_pp(nn.Linear(2, 2))
 
 
 def test_configure_fsdp_unused_param_reduction_uses_public_fsdp_api(monkeypatch):
