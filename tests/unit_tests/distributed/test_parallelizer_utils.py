@@ -252,6 +252,92 @@ def test_uniform_reduce_dtype_localizes_residual_dtensor(monkeypatch):
     assert all(type(grad) is torch.Tensor for grad in grads)
 
 
+def test_uniform_reduce_dtype_localizes_through_fsdp_param_contract(monkeypatch):
+    """Localization honours the parameter's placements instead of reading raw storage.
+
+    ``DTensor.to_local`` on a gradient whose placements disagree with the
+    parameter's returns storage that means something else. FSDP's own
+    ``_get_grad_inner_tensor`` redistributes first, so prefer it when present.
+    """
+    import torch.distributed.fsdp._fully_shard._fsdp_collectives as collectives
+    import torch.distributed.fsdp._fully_shard._fsdp_param_group as param_group
+    import torch.distributed.tensor as tensor_module
+
+    class FakeDTensor(torch.Tensor):
+        @staticmethod
+        def __new__(cls, tensor):
+            return torch.Tensor._make_subclass(cls, tensor, False)
+
+        def to_local(self):
+            # What a placement-blind read would surface.
+            return self.as_subclass(torch.Tensor)[:2]
+
+    class FakeParam:
+        """Stands in for an ``FSDPParam`` whose gradient needs redistribution."""
+
+        is_dtensor = True
+
+        def __init__(self):
+            self.calls = 0
+
+        def _get_grad_inner_tensor(self, grad):
+            self.calls += 1
+            # Deliberately a different slice than ``to_local`` so the two are
+            # distinguishable in the assertions below.
+            return grad.as_subclass(torch.Tensor)[2:]
+
+    seen = []
+
+    def stub(fsdp_params, unsharded_grads, *args, **kwargs):
+        seen.append([grad.numel() for grad in unsharded_grads])
+        return "reduced"
+
+    monkeypatch.setattr(tensor_module, "DTensor", FakeDTensor)
+    monkeypatch.setattr(collectives, "foreach_reduce", stub)
+    monkeypatch.setattr(param_group, "foreach_reduce", stub)
+    patch_fsdp_uniform_reduce_dtype()
+
+    param = FakeParam()
+    grads = [torch.ones(2), FakeDTensor(torch.tensor([1.0, 1.0, 7.0, 7.0]))]
+    collectives.foreach_reduce(["used", param], grads)
+
+    assert param.calls == 1
+    assert seen == [[2, 2]]
+    assert torch.equal(grads[1], torch.tensor([7.0, 7.0]))
+
+
+def test_uniform_reduce_dtype_waits_on_pending_collective(monkeypatch):
+    """A gradient still owned by an in-flight collective is waited on before use."""
+    import torch.distributed._functional_collectives as funcol
+    import torch.distributed.fsdp._fully_shard._fsdp_collectives as collectives
+    import torch.distributed.fsdp._fully_shard._fsdp_param_group as param_group
+
+    waited = []
+
+    class FakeAsyncCollectiveTensor(torch.Tensor):
+        @staticmethod
+        def __new__(cls, tensor):
+            return torch.Tensor._make_subclass(cls, tensor, False)
+
+        def wait(self):
+            waited.append(True)
+            return self.as_subclass(torch.Tensor)
+
+    def stub(fsdp_params, unsharded_grads, *args, **kwargs):
+        return "reduced"
+
+    monkeypatch.setattr(funcol, "AsyncCollectiveTensor", FakeAsyncCollectiveTensor)
+    monkeypatch.setattr(collectives, "foreach_reduce", stub)
+    monkeypatch.setattr(param_group, "foreach_reduce", stub)
+    patch_fsdp_uniform_reduce_dtype()
+
+    grads = [torch.ones(2), FakeAsyncCollectiveTensor(torch.ones(2))]
+    collectives.foreach_reduce(["p0", "p1"], grads)
+
+    assert waited == [True]
+    assert all(type(grad) is torch.Tensor for grad in grads)
+
+
 def test_uniform_reduce_dtype_leaves_uniform_group_untouched(monkeypatch):
     """Uniform groups pass straight through, preserving upstream's own checks."""
     seen = []

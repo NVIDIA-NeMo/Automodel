@@ -45,6 +45,36 @@ def _widest_float_dtype(dtypes: Iterable[Any]) -> Any:
     return max(dtypes, key=lambda dtype: (torch.finfo(dtype).bits, dtype is torch.float32))
 
 
+def _localized_grad(fsdp_param: Any, grad: Any) -> Any:
+    """Reduce a residual ``DTensor`` gradient to the local shard FSDP2 expects.
+
+    Mirrors ``FSDPParam._get_grad_inner_tensor`` rather than calling
+    ``DTensor.to_local`` outright: a pending collective must be waited on, and a
+    gradient whose placements disagree with the parameter's must be
+    redistributed, before its local storage means anything. Reading local
+    storage directly would silently reinterpret such a gradient.
+
+    Args:
+        fsdp_param: ``FSDPParam`` owning ``grad``.
+        grad: Gradient that may still be a ``DTensor``.
+
+    Returns:
+        The local tensor backing ``grad``, or ``grad`` unchanged when it is
+        already a plain tensor.
+    """
+    from torch.distributed._functional_collectives import AsyncCollectiveTensor
+    from torch.distributed.tensor import DTensor
+
+    if isinstance(grad, AsyncCollectiveTensor):
+        grad = grad.wait()
+    if not isinstance(grad, DTensor):
+        return grad
+    unwrap = getattr(fsdp_param, "_get_grad_inner_tensor", None)
+    if unwrap is not None and getattr(fsdp_param, "is_dtensor", False):
+        return unwrap(grad)
+    return grad.to_local()
+
+
 def patch_fsdp_uniform_reduce_dtype() -> None:
     """Give every FSDP2 reduce-scatter group local gradients of one dtype.
 
@@ -85,15 +115,15 @@ def patch_fsdp_uniform_reduce_dtype() -> None:
         return
 
     def foreach_reduce_uniform_dtype(fsdp_params, unsharded_grads, *args, **kwargs):
-        from torch.distributed.tensor import DTensor
-
         # PyTorch 2.13a0's unused-parameter branch can append a DTensor zero
         # directly, while gradients from used parameters are already local
         # tensors. Besides making ``fsdp.chunk_cat`` reject the mixed list, the
         # DTensor's global numel makes FSDP size a global-shape staging buffer.
         # Current PyTorch routes the zero through ``_get_grad_inner_tensor``;
         # localizing here is the equivalent compatibility path for that build.
-        unsharded_grads[:] = [grad.to_local() if isinstance(grad, DTensor) else grad for grad in unsharded_grads]
+        unsharded_grads[:] = [
+            _localized_grad(fsdp_param, grad) for fsdp_param, grad in zip(fsdp_params, unsharded_grads)
+        ]
         dtypes = {grad.dtype for grad in unsharded_grads}
         if len(dtypes) > 1 and all(dtype.is_floating_point for dtype in dtypes):
             target = _widest_float_dtype(dtypes)
