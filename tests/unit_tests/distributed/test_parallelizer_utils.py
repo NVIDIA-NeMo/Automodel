@@ -48,13 +48,13 @@ def test_configure_fsdp_unused_param_reduction_uses_public_fsdp_api(monkeypatch)
         def set_reduce_scatter_unused_params(self, enabled, *, recurse):
             self.calls.append((enabled, recurse))
 
-    install_compat = Mock()
+    install_fallback = Mock()
     monkeypatch.setattr(parallelizer_utils, "FSDPModule", FakeFSDPModule)
-    monkeypatch.setattr(parallelizer_utils, "_patch_fsdp_unused_param_reduction", install_compat)
+    monkeypatch.setattr(parallelizer_utils, "_patch_fsdp_unused_param_reduction", install_fallback)
     model = nn.Sequential(FakeFSDPModule(), nn.Sequential(FakeFSDPModule()))
 
     assert configure_fsdp_unused_param_reduction(model) == 2
-    install_compat.assert_called_once_with()
+    install_fallback.assert_not_called()
     assert model[0].calls == [(True, False)]
     assert model[1][0].calls == [(True, False)]
 
@@ -74,7 +74,7 @@ def test_configure_fsdp_unused_param_reduction_uses_legacy_fallback(monkeypatch)
     install_fallback.assert_called_once_with()
 
 
-def test_fsdp_unused_param_reduction_fills_missing_local_grad(monkeypatch):
+def test_legacy_fsdp_unused_param_reduction_fills_missing_local_grad(monkeypatch):
     from torch.distributed.fsdp._fully_shard._fsdp_common import TrainingState
     from torch.distributed.fsdp._fully_shard._fsdp_param_group import FSDPParamGroup
 
@@ -107,85 +107,6 @@ def test_fsdp_unused_param_reduction_fills_missing_local_grad(monkeypatch):
     assert torch.equal(param.grad, torch.zeros_like(param))
     assert calls == [(param_group, ("arg",), {"flag": True})]
     assert FSDPParamGroup.post_backward is patched_post_backward
-
-
-def test_fsdp_unused_param_reduction_routes_dtensor_zero_through_local_grad(monkeypatch):
-    """The compatibility fill avoids the old public API's global-DTensor buffer."""
-    from torch.distributed.fsdp._fully_shard._fsdp_common import TrainingState
-    from torch.distributed.fsdp._fully_shard._fsdp_param_group import FSDPParamGroup
-
-    class FakeDTensor(torch.Tensor):
-        @staticmethod
-        def __new__(cls, tensor):
-            return torch.Tensor._make_subclass(cls, tensor, False)
-
-        def to_local(self):
-            # Model an EP-local tensor with half of the global expert storage.
-            return self.as_subclass(torch.Tensor)[:2]
-
-    class FakeFSDPParam:
-        def __init__(self):
-            self._unsharded_param = torch.nn.Parameter(FakeDTensor(torch.ones(4)))
-            self.unsharded_accumulated_grad = None
-
-        @property
-        def unsharded_param(self):
-            return self._unsharded_param
-
-        @property
-        def unsharded_grad_data(self):
-            return self.unsharded_param.grad.to_local()
-
-    reduced = []
-
-    def old_public_post_backward(self):
-        fsdp_param = self.fsdp_params[0]
-        if fsdp_param.unsharded_param.grad is not None:
-            reduced.append(fsdp_param.unsharded_grad_data)
-        elif self.reduce_scatter_unused_params:
-            # PyTorch 2.13a0 used this branch, passing the global-shape wrapper
-            # directly to foreach_reduce instead of extracting its local tensor.
-            reduced.append(torch.zeros_like(fsdp_param.unsharded_param))
-
-    monkeypatch.setattr(FSDPParamGroup, "post_backward", old_public_post_backward)
-    patch_fsdp_unused_param_reduction()
-    param_group = SimpleNamespace(
-        reduce_grads=True,
-        reduce_scatter_unused_params=True,
-        _training_state=TrainingState.PRE_BACKWARD,
-        fsdp_params=[FakeFSDPParam()],
-    )
-
-    FSDPParamGroup.post_backward(param_group)
-
-    assert len(reduced) == 1
-    assert type(reduced[0]) is torch.Tensor
-    assert reduced[0].numel() == 2
-
-
-def test_fsdp_unused_param_reduction_respects_public_api_flag(monkeypatch):
-    from torch.distributed.fsdp._fully_shard._fsdp_common import TrainingState
-    from torch.distributed.fsdp._fully_shard._fsdp_param_group import FSDPParamGroup
-
-    monkeypatch.setattr(FSDPParamGroup, "post_backward", lambda self: None)
-    patch_fsdp_unused_param_reduction()
-
-    param = torch.nn.Parameter(torch.ones(2))
-    fsdp_param = SimpleNamespace(
-        _unsharded_param=param,
-        unsharded_accumulated_grad=None,
-        unsharded_param=param,
-    )
-    param_group = SimpleNamespace(
-        reduce_grads=True,
-        reduce_scatter_unused_params=False,
-        _training_state=TrainingState.PRE_BACKWARD,
-        fsdp_params=[fsdp_param],
-    )
-
-    FSDPParamGroup.post_backward(param_group)
-
-    assert param.grad is None
 
 
 def _install_uniform_reduce_dtype(monkeypatch, recorder):
