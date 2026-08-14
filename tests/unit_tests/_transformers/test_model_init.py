@@ -14,6 +14,7 @@
 
 """Tests for nested config override handling in get_hf_config and _consume_config_overrides."""
 
+import logging
 import os
 import types
 from unittest.mock import MagicMock, patch
@@ -782,6 +783,26 @@ class TestStreamLoadBnbWeights:
         assert model.running_scale.device.type == "cpu"
         assert model.lin.weight.dtype == torch.float32
         torch.testing.assert_close(model.running_scale, torch.arange(8, dtype=torch.float32))
+
+    def test_logs_streaming_profile(self, tmp_path, caplog):
+        with torch.device("meta"):
+            model = _TinyModelOnMeta()
+
+        _save_safetensors(
+            tmp_path / "model.safetensors",
+            {
+                "lin.weight": torch.randn(8, 4),
+                "lin.bias": torch.randn(8),
+                "running_scale": torch.arange(8, dtype=torch.float32),
+            },
+        )
+
+        with caplog.at_level(logging.INFO, logger="nemo_automodel._transformers.model_init"):
+            _stream_load_bnb_weights(model, str(tmp_path), torch.device("cpu"), torch.float32)
+
+        assert "Streaming BnB profile shard 1/1" in caplog.text
+        assert "tensors=3" in caplog.text
+        assert "Streaming BnB profile complete" in caplog.text
 
     def test_missing_key_raises_runtime_error(self, tmp_path):
         with torch.device("meta"):

@@ -24,8 +24,10 @@ import inspect
 import json
 import logging
 import os
+import resource
 import shutil
 import threading
+import time
 from contextlib import contextmanager
 
 import torch
@@ -787,9 +789,33 @@ def _stream_load_bnb_weights(model, model_dir, device, torch_dtype):
 
     loaded_keys: set[str] = set()
     device = torch.device(device) if not isinstance(device, torch.device) else device
+    load_started = time.perf_counter()
+    total_checkpoint_bytes = 0
+    total_read_host_s = 0.0
+    total_cast_host_s = 0.0
+    total_quantize_host_s = 0.0
+    total_quantize_cuda_s = 0.0
+    total_materialize_host_s = 0.0
+    total_materialize_cuda_s = 0.0
+    total_cleanup_s = 0.0
+    slowest_tensors: list[tuple[float, str, str, int, float, float]] = []
 
     for shard_idx, shard_file in enumerate(shard_files):
         shard_path = os.path.join(model_dir, shard_file)
+        shard_started = time.perf_counter()
+        usage_before = resource.getrusage(resource.RUSAGE_SELF)
+        shard_file_bytes = os.path.getsize(shard_path)
+        total_checkpoint_bytes += shard_file_bytes
+        shard_tensor_bytes = 0
+        shard_tensor_count = 0
+        shard_read_host_s = 0.0
+        shard_cast_host_s = 0.0
+        shard_quantize_host_s = 0.0
+        shard_materialize_host_s = 0.0
+        quantize_events: list[tuple[str, int, float, torch.cuda.Event, torch.cuda.Event]] = []
+        materialize_events: list[tuple[str, int, float, torch.cuda.Event, torch.cuda.Event]] = []
+        cpu_tensor_profiles: list[tuple[str, str, int, float]] = []
+        shard_tensor_profiles: list[tuple[float, str, str, int, float, float]] = []
         logger.info(
             "Streaming BnB shard %d/%d: %s",
             shard_idx + 1,
@@ -799,7 +825,13 @@ def _stream_load_bnb_weights(model, model_dir, device, torch_dtype):
 
         with safe_open(shard_path, framework="pt") as f:
             for key in f.keys():
+                read_started = time.perf_counter()
                 tensor = f.get_tensor(key)
+                read_host_s = time.perf_counter() - read_started
+                shard_read_host_s += read_host_s
+                tensor_bytes = tensor.numel() * tensor.element_size()
+                shard_tensor_bytes += tensor_bytes
+                shard_tensor_count += 1
 
                 if key not in param_map:
                     logger.debug("Skipping key not in model: %s", key)
@@ -810,7 +842,9 @@ def _stream_load_bnb_weights(model, model_dir, device, torch_dtype):
 
                 if isinstance(old_param, bnb.nn.Params4bit):
                     if torch_dtype is not None:
+                        cast_started = time.perf_counter()
                         tensor = tensor.to(dtype=torch_dtype)
+                        shard_cast_host_s += time.perf_counter() - cast_started
                     new_param = bnb.nn.Params4bit(
                         data=tensor,
                         requires_grad=False,
@@ -821,11 +855,37 @@ def _stream_load_bnb_weights(model, model_dir, device, torch_dtype):
                         bnb_quantized=False,
                     )
                     del tensor
+                    cuda_start = cuda_end = None
+                    if device.type == "cuda":
+                        cuda_start = torch.cuda.Event(enable_timing=True)
+                        cuda_end = torch.cuda.Event(enable_timing=True)
+                        cuda_start.record()
+                    quantize_started = time.perf_counter()
                     new_param._quantize(device)
+                    quantize_host_s = time.perf_counter() - quantize_started
+                    shard_quantize_host_s += quantize_host_s
+                    if cuda_end is not None and cuda_start is not None:
+                        cuda_end.record()
+                        quantize_events.append((key, tensor_bytes, quantize_host_s, cuda_start, cuda_end))
+                    else:
+                        cpu_tensor_profiles.append((key, "quantize", tensor_bytes, quantize_host_s))
                     mod._parameters[attr] = new_param
                 else:
                     target_dtype = torch_dtype if torch_dtype is not None else tensor.dtype
+                    cuda_start = cuda_end = None
+                    if device.type == "cuda":
+                        cuda_start = torch.cuda.Event(enable_timing=True)
+                        cuda_end = torch.cuda.Event(enable_timing=True)
+                        cuda_start.record()
+                    materialize_started = time.perf_counter()
                     materialized = tensor.to(device=device, dtype=target_dtype)
+                    materialize_host_s = time.perf_counter() - materialize_started
+                    shard_materialize_host_s += materialize_host_s
+                    if cuda_end is not None and cuda_start is not None:
+                        cuda_end.record()
+                        materialize_events.append((key, tensor_bytes, materialize_host_s, cuda_start, cuda_end))
+                    else:
+                        cpu_tensor_profiles.append((key, "materialize", tensor_bytes, materialize_host_s))
                     del tensor
                     if isinstance(old_param, torch.nn.Parameter):
                         mod._parameters[attr] = torch.nn.Parameter(materialized, requires_grad=old_param.requires_grad)
@@ -834,8 +894,81 @@ def _stream_load_bnb_weights(model, model_dir, device, torch_dtype):
 
                 loaded_keys.add(key)
 
+        if device.type == "cuda" and (quantize_events or materialize_events):
+            torch.cuda.synchronize(device)
+
+        shard_quantize_cuda_s = 0.0
+        shard_materialize_cuda_s = 0.0
+        for key, tensor_bytes, host_s, cuda_start, cuda_end in quantize_events:
+            cuda_s = cuda_start.elapsed_time(cuda_end) / 1000.0
+            shard_quantize_cuda_s += cuda_s
+            shard_tensor_profiles.append((max(host_s, cuda_s), key, "quantize", tensor_bytes, host_s, cuda_s))
+        for key, tensor_bytes, host_s, cuda_start, cuda_end in materialize_events:
+            cuda_s = cuda_start.elapsed_time(cuda_end) / 1000.0
+            shard_materialize_cuda_s += cuda_s
+            shard_tensor_profiles.append((max(host_s, cuda_s), key, "materialize", tensor_bytes, host_s, cuda_s))
+        for key, operation, tensor_bytes, host_s in cpu_tensor_profiles:
+            shard_tensor_profiles.append((host_s, key, operation, tensor_bytes, host_s, 0.0))
+        slowest_tensors.extend(shard_tensor_profiles)
+
+        cleanup_started = time.perf_counter()
         gc.collect()
         torch.cuda.empty_cache()
+        cleanup_s = time.perf_counter() - cleanup_started
+        shard_wall_s = time.perf_counter() - shard_started
+        usage_after = resource.getrusage(resource.RUSAGE_SELF)
+        major_faults = usage_after.ru_majflt - usage_before.ru_majflt
+        minor_faults = usage_after.ru_minflt - usage_before.ru_minflt
+        allocated_gib = torch.cuda.memory_allocated(device) / 1024**3 if device.type == "cuda" else 0.0
+        reserved_gib = torch.cuda.memory_reserved(device) / 1024**3 if device.type == "cuda" else 0.0
+
+        total_read_host_s += shard_read_host_s
+        total_cast_host_s += shard_cast_host_s
+        total_quantize_host_s += shard_quantize_host_s
+        total_quantize_cuda_s += shard_quantize_cuda_s
+        total_materialize_host_s += shard_materialize_host_s
+        total_materialize_cuda_s += shard_materialize_cuda_s
+        total_cleanup_s += cleanup_s
+
+        logger.info(
+            "Streaming BnB profile shard %d/%d: file=%s file_size=%.2f GiB tensor_size=%.2f GiB "
+            "tensors=%d wall=%.2fs throughput=%.3f GiB/s read_host=%.2fs cast_host=%.2fs "
+            "quantize_host=%.2fs quantize_cuda=%.2fs materialize_host=%.2fs materialize_cuda=%.2fs "
+            "cleanup=%.2fs faults_major=%d faults_minor=%d cuda_allocated=%.2f GiB cuda_reserved=%.2f GiB",
+            shard_idx + 1,
+            len(shard_files),
+            shard_file,
+            shard_file_bytes / 1024**3,
+            shard_tensor_bytes / 1024**3,
+            shard_tensor_count,
+            shard_wall_s,
+            shard_file_bytes / 1024**3 / shard_wall_s if shard_wall_s else 0.0,
+            shard_read_host_s,
+            shard_cast_host_s,
+            shard_quantize_host_s,
+            shard_quantize_cuda_s,
+            shard_materialize_host_s,
+            shard_materialize_cuda_s,
+            cleanup_s,
+            major_faults,
+            minor_faults,
+            allocated_gib,
+            reserved_gib,
+        )
+
+        shard_slowest = sorted(shard_tensor_profiles, reverse=True)[:3]
+        for rank, (_, key, operation, tensor_bytes, host_s, cuda_s) in enumerate(shard_slowest, start=1):
+            logger.info(
+                "Streaming BnB profile shard %d slow tensor %d: key=%s operation=%s size=%.2f GiB "
+                "host=%.2fs cuda=%.2fs",
+                shard_idx + 1,
+                rank,
+                key,
+                operation,
+                tensor_bytes / 1024**3,
+                host_s,
+                cuda_s,
+            )
 
     # Tie weights before validating: safetensors typically stores only one copy
     # of a tied pair (e.g. Llama's lm_head.weight tied to embed_tokens.weight),
@@ -867,6 +1000,34 @@ def _stream_load_bnb_weights(model, model_dir, device, torch_dtype):
         len(loaded_keys),
         len(param_map) - len(loaded_keys),
     )
+    load_wall_s = time.perf_counter() - load_started
+    logger.info(
+        "Streaming BnB profile complete: checkpoint_size=%.2f GiB wall=%.2fs throughput=%.3f GiB/s "
+        "read_host=%.2fs cast_host=%.2fs quantize_host=%.2fs quantize_cuda=%.2fs "
+        "materialize_host=%.2fs materialize_cuda=%.2fs cleanup=%.2fs",
+        total_checkpoint_bytes / 1024**3,
+        load_wall_s,
+        total_checkpoint_bytes / 1024**3 / load_wall_s if load_wall_s else 0.0,
+        total_read_host_s,
+        total_cast_host_s,
+        total_quantize_host_s,
+        total_quantize_cuda_s,
+        total_materialize_host_s,
+        total_materialize_cuda_s,
+        total_cleanup_s,
+    )
+    for rank, (_, key, operation, tensor_bytes, host_s, cuda_s) in enumerate(
+        sorted(slowest_tensors, reverse=True)[:10], start=1
+    ):
+        logger.info(
+            "Streaming BnB profile slow tensor %d: key=%s operation=%s size=%.2f GiB host=%.2fs cuda=%.2fs",
+            rank,
+            key,
+            operation,
+            tensor_bytes / 1024**3,
+            host_s,
+            cuda_s,
+        )
 
 
 def _streaming_bnb_supported(cls, hf_config) -> bool:
