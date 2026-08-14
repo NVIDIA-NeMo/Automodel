@@ -120,15 +120,14 @@ class Datum:
         """Number of tokens in this example."""
         return int(self.input_ids.shape[0])
 
-    def to(self, device: torch.device | str, *, non_blocking: bool = False) -> "Datum":
-        """Return a copy with all tensors moved to ``device``."""
-        return Datum(
-            input_ids=self.input_ids.to(device, non_blocking=non_blocking),
-            loss_fn_inputs={k: v.to(device, non_blocking=non_blocking) for k, v in self.loss_fn_inputs.items()},
-        )
-
     def to_features(self, *, ignore_index: int = CROSS_ENTROPY_IGNORE_IDX) -> dict[str, list[int]]:
         """Emit the per-example dict the canonical collaters expect.
+
+        Every position of a ``Datum`` is a real token, so ``attention_mask`` is
+        all ones: it tells the padded collater exactly which positions it added,
+        instead of leaving it to infer them from the pad token *value* — which
+        misreads a real token that happens to equal the pad id (commonly
+        ``pad_token_id == eos_token_id``) as padding.
 
         ``labels`` is included only when ``loss_fn_inputs["target_tokens"]`` is
         present, with positions where ``loss_fn_inputs["weights"] == 0`` set to
@@ -137,9 +136,13 @@ class Datum:
         separately by :func:`collate_datums`.
 
         Returns:
-            ``{"input_ids": [...], "labels": [...]}`` as plain ``list[int]``.
+            ``{"input_ids": [...], "attention_mask": [...], "labels": [...]}``
+            as plain ``list[int]``.
         """
-        features: dict[str, list[int]] = {"input_ids": self.input_ids.tolist()}
+        features: dict[str, list[int]] = {
+            "input_ids": self.input_ids.tolist(),
+            "attention_mask": [1] * self.seq_len,
+        }
         if "target_tokens" in self.loss_fn_inputs:
             labels = self.loss_fn_inputs["target_tokens"].clone()
             weights = self.loss_fn_inputs.get("weights")
@@ -147,14 +150,6 @@ class Datum:
                 labels = labels.masked_fill(weights == 0, ignore_index)
             features["labels"] = labels.tolist()
         return features
-
-    def to_dict(self) -> dict[str, Any]:
-        """Serialize to plain tensors (round-trips with :meth:`from_dict`)."""
-        return {"input_ids": self.input_ids, "loss_fn_inputs": dict(self.loss_fn_inputs)}
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "Datum":
-        return cls(input_ids=data["input_ids"], loss_fn_inputs=dict(data.get("loss_fn_inputs", {})))
 
 
 def collate_datums(
@@ -183,7 +178,8 @@ def collate_datums(
     the collated width and stacks to ``[B, T]``; packed mode concatenates them
     in datum order to ``[1, total_tokens]``, aligned with ``input_ids``.
     Per-sample (scalar / length-1) entries are stacked into a ``[num_datums]``
-    tensor without padding in both modes.
+    tensor without padding in both modes. A length-1 entry on a single-token
+    sequence matches both shapes; it is read as per-token.
 
     Args:
         datums: examples for this microbatch. Must be non-empty. One ``Datum``
@@ -209,10 +205,15 @@ def collate_datums(
         batch = default_collater([dict(f) for f in features], pad_seq_len_divisible)
 
     width = int(batch["input_ids"].shape[-1])
-    shared_keys = set(datums[0].loss_fn_inputs)
+    keys = set(datums[0].loss_fn_inputs)
     for d in datums[1:]:
-        shared_keys &= set(d.loss_fn_inputs)
-    for key in sorted(shared_keys - {"target_tokens"}):
+        if set(d.loss_fn_inputs) != keys:
+            raise ValueError(
+                "every Datum in a batch must carry the same loss_fn_inputs keys "
+                f"(got {sorted(keys)} and {sorted(d.loss_fn_inputs)}); a missing key would "
+                "silently drop it -- for `weights` that means losing the loss mask"
+            )
+    for key in sorted(keys - {"target_tokens"}):
         rows = [d.loss_fn_inputs[key].to(torch.float).flatten() for d in datums]
         if all(r.shape[0] == d.seq_len for r, d in zip(rows, datums)):
             if packed:

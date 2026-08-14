@@ -59,23 +59,6 @@ def test_datum_rejects_non_1d_input_ids():
         Datum(input_ids=torch.zeros(2, 3, dtype=torch.long))
 
 
-def test_datum_to_device_is_a_copy():
-    d = Datum(input_ids=torch.tensor([1, 2]), loss_fn_inputs={"weights": torch.tensor([1.0, 1.0])})
-    moved = d.to("cpu")
-    assert moved is not d
-    assert torch.equal(moved.input_ids, d.input_ids)
-
-
-def test_datum_dict_roundtrip():
-    d = Datum(input_ids=torch.tensor([5, 6, 7]), loss_fn_inputs={"advantages": torch.tensor([0.1, 0.2, 0.3])})
-    d2 = Datum.from_dict(d.to_dict())
-    assert torch.equal(d.input_ids, d2.input_ids)
-    assert torch.equal(d.loss_fn_inputs["advantages"], d2.loss_fn_inputs["advantages"])
-
-
-# ── Datum.to_features ───────────────────────────────────────────────────────
-
-
 def test_to_features_applies_masking_convention():
     feats = _toy_datums()[0].to_features()
     assert feats["input_ids"] == [10, 11, 12]
@@ -85,7 +68,7 @@ def test_to_features_applies_masking_convention():
 
 def test_to_features_omits_labels_without_targets():
     feats = Datum(input_ids=torch.tensor([1, 2, 3])).to_features()
-    assert feats == {"input_ids": [1, 2, 3]}
+    assert feats == {"input_ids": [1, 2, 3], "attention_mask": [1, 1, 1]}
 
 
 def test_to_features_native_python_ints():
@@ -173,3 +156,33 @@ def test_collate_pad_seq_len_divisible():
 def test_collate_empty_raises():
     with pytest.raises(ValueError, match="at least one"):
         collate_datums([])
+
+
+def test_to_features_without_weights_leaves_labels_unmasked():
+    d = Datum(input_ids=torch.tensor([1, 2, 3]), loss_fn_inputs={"target_tokens": torch.tensor([2, 3, 4])})
+    assert d.to_features()["labels"] == [2, 3, 4]
+
+
+def test_collate_rejects_inconsistent_loss_input_keys():
+    datums = [
+        Datum(input_ids=torch.tensor([1, 2]), loss_fn_inputs={"advantages": torch.zeros(2), "weights": torch.ones(2)}),
+        Datum(input_ids=torch.tensor([3, 4]), loss_fn_inputs={"advantages": torch.zeros(2)}),
+    ]
+    # Silently intersecting the keys would drop the loss mask for the whole batch.
+    with pytest.raises(ValueError, match="same loss_fn_inputs keys"):
+        collate_datums(datums)
+
+
+def test_collate_reads_a_length_one_entry_on_a_single_token_sequence_as_per_token():
+    datums = [Datum(input_ids=torch.tensor([7]), loss_fn_inputs={"advantages": torch.tensor([0.5])})]
+    assert collate_datums(datums)["advantages"].shape == (1, 1)
+
+
+def test_collate_padding_mask_does_not_misread_a_real_pad_valued_token():
+    # A Datum holds only real tokens, so the mask must come from its length, not
+    # from matching the pad id -- id 0 is a real token here (and pad_token_id ==
+    # eos_token_id is a common config).
+    datums = [Datum(input_ids=torch.tensor([5, 0, 7])), Datum(input_ids=torch.tensor([9, 9]))]
+    batch = collate_datums(datums)
+    assert batch["padding_mask"].tolist() == [[False, False, False], [False, False, True]]
+    assert batch["attention_mask"].tolist() == [[1, 1, 1], [1, 1, 0]]

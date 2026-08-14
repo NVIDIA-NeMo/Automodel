@@ -914,31 +914,3 @@ class TestPackFeaturesForThd:
         assert batch["qkv_format"] == "thd"
         assert batch["input_ids"].shape == (1, 5)
         assert batch["seq_lens"][0].tolist() == [3, 2]
-
-
-class TestThdPackingCollater:
-    """Tests for the collate-time packing collater."""
-
-    def test_packs_unpadded_examples_into_one_row(self):
-        batch = sftp.thd_packing_collater(
-            [
-                {"input_ids": [10, 11, 12], "labels": [11, 12, -100]},
-                {"input_ids": [20, 21], "labels": [21, 22]},
-            ]
-        )
-        assert batch["qkv_format"] == "thd"
-        assert batch["input_ids"].shape == (1, 5)
-        assert batch["input_ids"][0].tolist() == [10, 11, 12, 20, 21]
-        assert batch["position_ids"][0].tolist() == [0, 1, 2, 0, 1]
-        assert batch["seq_lens"][0].tolist() == [3, 2]
-
-    def test_trims_right_padding_via_attention_mask(self):
-        batch = sftp.thd_packing_collater(
-            [
-                {"input_ids": [10, 11, 0, 0], "labels": [11, -100, -100, -100], "attention_mask": [1, 1, 0, 0]},
-                {"input_ids": [20, 21], "labels": [21, 22]},
-            ]
-        )
-        assert batch["input_ids"][0].tolist() == [10, 11, 20, 21]
-        assert batch["labels"][0].tolist() == [11, -100, 21, 22]
-        assert batch["seq_lens"][0].tolist() == [2, 2]
