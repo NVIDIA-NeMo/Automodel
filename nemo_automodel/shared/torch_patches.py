@@ -97,13 +97,16 @@ def patch_fsdp_uniform_reduce_dtype() -> None:
 
 
 def patch_fsdp_unused_param_reduction() -> None:
-    """Backport FSDP2 unused-parameter reduction when the public API is absent.
+    """Make FSDP2 unused-parameter reduction safe across PyTorch versions.
 
     The patch is process-global and idempotent. It only fills a missing local
     gradient with zeros immediately before FSDP2 post-backward reduction, so
     ranks that skipped a parameter still participate in the same collective as
-    ranks that used it. Callers must first prefer the public
-    ``FSDPModule.set_reduce_scatter_unused_params`` API.
+    ranks that used it. This backports the behavior when
+    ``FSDPModule.set_reduce_scatter_unused_params`` is absent. It also works
+    around earlier public implementations that passed ``zeros_like`` of an
+    unsharded ``DTensor`` directly to ``foreach_reduce``: assigning the zero to
+    ``param.grad`` makes upstream use its normal local-tensor extraction path.
 
     Raises:
         RuntimeError: If the installed PyTorch exposes neither the public API
@@ -124,7 +127,12 @@ def patch_fsdp_unused_param_reduction() -> None:
         return
 
     def _post_backward_with_unused_param_reduction(self, *args, **kwargs):
-        if self.reduce_grads and self._training_state == TrainingState.PRE_BACKWARD:
+        # Newer versions expose this flag on the parameter group. Respect it so
+        # installing the process-global compatibility wrapper does not change
+        # unconfigured FSDP units. Versions predating the public API have no
+        # flag and are configured by installing this wrapper itself.
+        reduce_unused = getattr(self, "reduce_scatter_unused_params", True)
+        if self.reduce_grads and reduce_unused and self._training_state == TrainingState.PRE_BACKWARD:
             for fsdp_param in self.fsdp_params:
                 if not hasattr(fsdp_param, "_unsharded_param"):
                     continue
@@ -133,10 +141,10 @@ def patch_fsdp_unused_param_reduction() -> None:
                 param = fsdp_param.unsharded_param
                 if param.requires_grad and param.grad is None:
                     # ``zeros_like`` on the *unsharded* parameter is the dtype
-                    # autograd would have produced under any precision policy
-                    # (bf16 compute over fp32 storage, an fp32-pinned unit, or no
-                    # casting at all). ``_align_accumulated_grad_dtype`` then
-                    # promotes it to ``reduce_dtype`` if the group is accumulating.
+                    # autograd would have produced under any precision policy.
+                    # For a DTensor this still allocates only local storage;
+                    # upstream then unwraps that local tensor through the same
+                    # path as a real gradient before calling ``foreach_reduce``.
                     param.grad = torch.zeros_like(param, memory_format=torch.preserve_format)
         return original_post_backward(self, *args, **kwargs)
 
