@@ -622,10 +622,10 @@ def apply_fsdp(
     # but trainable multimodal towers still get standalone FSDP units. Install
     # the same lazy-state guard as dense FSDP for modality-free batches.
     _patch_fsdp_accumulated_grad_guard()
-    # ``moe/fsdp_mixin`` drives post-backward by hand under pipeline parallelism,
-    # so a group can reach the reduction holding both reduce-dtype accumulations
-    # and a param-dtype gradient that arrived after its last no-sync reduction.
-    _patch_fsdp_uniform_reduce_dtype()
+    # A/B ARM: the apply_fsdp install is removed here on purpose. The CP path in
+    # ``configure_fsdp_unused_param_reduction`` still installs it, so cp>1 recipes
+    # are unaffected; only cp==1 MoE recipes such as gpt_oss_20b lose the wrapper.
+    _ = _patch_fsdp_uniform_reduce_dtype
 
     if isinstance(lm_head_precision, str):
         lm_head_precision = dtype_from_str(lm_head_precision, default=None)
