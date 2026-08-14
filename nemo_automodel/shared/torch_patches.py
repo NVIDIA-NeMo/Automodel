@@ -84,6 +84,8 @@ def patch_fsdp_uniform_reduce_dtype() -> None:
     if getattr(original_foreach_reduce, "_automodel_uniform_reduce_dtype", False):
         return
 
+    _probe = {"calls": 0, "localized": 0, "widened": 0, "dtypes": set()}
+
     def foreach_reduce_uniform_dtype(fsdp_params, unsharded_grads, *args, **kwargs):
         from torch.distributed.tensor import DTensor
 
@@ -93,13 +95,25 @@ def patch_fsdp_uniform_reduce_dtype() -> None:
         # DTensor's global numel makes FSDP size a global-shape staging buffer.
         # Current PyTorch routes the zero through ``_get_grad_inner_tensor``;
         # localizing here is the equivalent compatibility path for that build.
+        _probe["calls"] += 1
+        n_dtensor = sum(1 for grad in unsharded_grads if isinstance(grad, DTensor))
+        _probe["localized"] += n_dtensor
         unsharded_grads[:] = [grad.to_local() if isinstance(grad, DTensor) else grad for grad in unsharded_grads]
         dtypes = {grad.dtype for grad in unsharded_grads}
+        _probe["dtypes"] |= {str(d) for d in dtypes}
         if len(dtypes) > 1 and all(dtype.is_floating_point for dtype in dtypes):
+            _probe["widened"] += 1
             target = _widest_float_dtype(dtypes)
             # Mutate in place: ``foreach_reduce`` frees the gradients by clearing
             # this list, and that must still release the caller's references.
             unsharded_grads[:] = [grad if grad.dtype is target else grad.to(target) for grad in unsharded_grads]
+        if _probe["calls"] % 100 == 0 or n_dtensor or len(dtypes) > 1:
+            print(
+                f"WIDENPROBE calls={_probe['calls']} localized={_probe['localized']} "
+                f"widened={_probe['widened']} dtypes_seen={sorted(_probe['dtypes'])} "
+                f"this_call_dtensors={n_dtensor} this_call_dtypes={sorted(str(d) for d in dtypes)}",
+                flush=True,
+            )
         return original_foreach_reduce(fsdp_params, unsharded_grads, *args, **kwargs)
 
     foreach_reduce_uniform_dtype._automodel_uniform_reduce_dtype = True
