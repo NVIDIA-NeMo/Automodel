@@ -18,7 +18,7 @@ import pytest
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-RECIPE_DIR = REPO_ROOT / "examples/vlm_finetune/qwen3_5"
+RECIPE_DIR = REPO_ROOT / "examples/vlm_finetune/qwen3_8"
 MODEL_ID = "Qwen/Qwen3.8-27B"
 
 

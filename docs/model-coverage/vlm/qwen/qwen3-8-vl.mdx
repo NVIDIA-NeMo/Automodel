@@ -25,14 +25,14 @@ architecture, so NeMo AutoModel uses its existing native
 
 | Model | Recipe | Description |
 |---|---|---|
-| [`Qwen/Qwen3.8-27B`](https://huggingface.co/Qwen/Qwen3.8-27B) | [qwen3_8_27b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5/qwen3_8_27b.yaml) | Full-parameter SFT on MedPix-VQA |
-| [`Qwen/Qwen3.8-27B`](https://huggingface.co/Qwen/Qwen3.8-27B) | [qwen3_8_27b_lora.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5/qwen3_8_27b_lora.yaml) | LoRA on MedPix-VQA |
+| [`Qwen/Qwen3.8-27B`](https://huggingface.co/Qwen/Qwen3.8-27B) | [qwen3_8_27b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_8/qwen3_8_27b.yaml) | Full-parameter SFT on MedPix-VQA |
+| [`Qwen/Qwen3.8-27B`](https://huggingface.co/Qwen/Qwen3.8-27B) | [qwen3_8_27b_lora.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_8/qwen3_8_27b_lora.yaml) | LoRA on MedPix-VQA |
 
 ## Run the Recipes
 
 ```bash
-uv run automodel --nproc-per-node=8 examples/vlm_finetune/qwen3_5/qwen3_8_27b.yaml
-uv run automodel --nproc-per-node=8 examples/vlm_finetune/qwen3_5/qwen3_8_27b_lora.yaml
+uv run automodel --nproc-per-node=8 examples/vlm_finetune/qwen3_8/qwen3_8_27b.yaml
+uv run automodel --nproc-per-node=8 examples/vlm_finetune/qwen3_8/qwen3_8_27b_lora.yaml
 ```
 
 Install the `vlm-media` extra before running either recipe. See the

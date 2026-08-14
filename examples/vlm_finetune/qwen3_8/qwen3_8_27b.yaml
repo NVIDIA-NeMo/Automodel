@@ -12,16 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# LoRA fine-tuning for Qwen/Qwen3.8-27B on MedPix-VQA.
-# automodel examples/vlm_finetune/qwen3_5/qwen3_8_27b_lora.yaml --nproc-per-node 8
+# Full-parameter fine-tuning for Qwen/Qwen3.8-27B on MedPix-VQA.
+# automodel examples/vlm_finetune/qwen3_8/qwen3_8_27b.yaml --nproc-per-node 8
 
 recipe: FinetuneRecipeForVLM
 
 step_scheduler:
   global_batch_size: 8
   local_batch_size: 1
-  ckpt_every_steps: 1000
-  val_every_steps: 100
+  ckpt_every_steps: 2000
+  val_every_steps: 500
   num_epochs: 2
   max_steps: 100
 
@@ -45,30 +45,19 @@ model:
     rope_fusion: false
   attn_implementation: sdpa
   torch_dtype: bfloat16
+  text_config:
+    mtp_num_hidden_layers: 1
+  mtp_loss_scaling_factor: 0.1
 
 processor:
   _target_: transformers.AutoProcessor.from_pretrained
   pretrained_model_name_or_path: Qwen/Qwen3.8-27B
 
-peft:
-  _target_: nemo_automodel.components._peft.lora.PeftConfig
-  match_all_linear: false
-  exclude_modules:
-    - "*vision_tower*"
-    - "*vision*"
-    - "*visual*"
-    - "*image_encoder*"
-    - "*lm_head*"
-    - "*audio*"
-  dim: 8
-  alpha: 32
-  use_triton: true
-
 checkpoint:
-  enabled: false
-  checkpoint_dir: /tmp/checkpoints/qwen3_8_27b_lora/
+  enabled: true
+  checkpoint_dir: /tmp/checkpoints/qwen3_8_27b/
   model_save_format: safetensors
-  save_consolidated: false
+  save_consolidated: final
 
 distributed:
   _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
@@ -122,16 +111,16 @@ optimizer:
   _target_: torch.optim.AdamW
   betas: [0.9, 0.95]
   eps: 1e-8
-  lr: 1.0e-4
-  weight_decay: 0.01
+  lr: 1.0e-5
+  weight_decay: 0.1
 
 wandb:
   enable: false
   project: automodel-pr-validation
   entity: Nemo-automodel
-  name: qwen3_8_27b_lora_medpix
-  tags: [qwen3.8-27b, medpix, lora]
-  dir: logs/qwen3_8_27b_lora_medpix/wandb
+  name: qwen3_8_27b_sft_medpix
+  tags: [qwen3.8-27b, medpix, sft]
+  dir: logs/qwen3_8_27b_sft_medpix/wandb
 
 ci:
   recipe_owner: akoumpa
