@@ -338,6 +338,27 @@ def test_uniform_reduce_dtype_waits_on_pending_collective(monkeypatch):
     assert all(type(grad) is torch.Tensor for grad in grads)
 
 
+def test_uniform_reduce_dtype_promotes_mixed_16bit_floats_to_float32(monkeypatch):
+    """bfloat16 + float16 must widen to float32, since neither contains the other.
+
+    Casting bfloat16 to float16 overflows to inf above 65504; casting float16 to
+    bfloat16 drops mantissa bits. Picking either 2-byte dtype silently corrupts
+    the gradients that get reduced.
+    """
+    seen = []
+    collectives = _install_uniform_reduce_dtype(monkeypatch, seen)
+
+    grads = [
+        torch.tensor([70000.0], dtype=torch.bfloat16),
+        torch.tensor([1.0], dtype=torch.float16),
+    ]
+    collectives.foreach_reduce(["p0", "p1"], grads)
+
+    assert seen == [[torch.float32, torch.float32]]
+    assert torch.isfinite(grads[0]).all()
+    assert grads[0].item() == pytest.approx(70000.0, rel=1e-2)
+
+
 def test_uniform_reduce_dtype_leaves_uniform_group_untouched(monkeypatch):
     """Uniform groups pass straight through, preserving upstream's own checks."""
     seen = []

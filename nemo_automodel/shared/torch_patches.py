@@ -31,18 +31,28 @@ _TORCH_PATCHES_APPLIED = False
 
 
 def _widest_float_dtype(dtypes: Iterable[Any]) -> Any:
-    """Return the float dtype among ``dtypes`` that every other one converts into losslessly.
+    """Return the float dtype that every dtype in ``dtypes`` converts into losslessly.
+
+    Widest-by-element-size is not sufficient on its own. ``bfloat16`` and
+    ``float16`` are both 2 bytes yet neither contains the other: casting
+    ``bfloat16`` to ``float16`` overflows to ``inf`` above 65504, and casting
+    ``float16`` to ``bfloat16`` drops three mantissa bits. When the widest
+    candidates tie like that, step up to ``float32``, which holds both exactly.
 
     Args:
         dtypes: Gradient dtypes from a single reduce-scatter group.
 
     Returns:
-        The dtype with the largest element size; ties resolve to float32 over
-        the 2-byte float types.
+        The narrowest float dtype that represents every input exactly.
     """
     import torch
 
-    return max(dtypes, key=lambda dtype: (torch.finfo(dtype).bits, dtype is torch.float32))
+    candidates = set(dtypes)
+    widest_bits = max(torch.finfo(dtype).bits for dtype in candidates)
+    widest = {dtype for dtype in candidates if torch.finfo(dtype).bits == widest_bits}
+    if len(widest) > 1:
+        return torch.float32
+    return next(iter(widest))
 
 
 def _localized_grad(fsdp_param: Any, grad: Any) -> Any:
