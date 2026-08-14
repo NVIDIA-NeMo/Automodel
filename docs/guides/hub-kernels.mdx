@@ -114,7 +114,7 @@ Layer replacements for custom models still use top-level `use_kernels: true`.
 | Avoid compiling `flash-attn` | `hub_kernels` extra and Hub `attn_implementation` |
 | Match Transformers default Hub layers | `use_kernels: true` |
 | Pin or remap individual ops | `kernel_config` and `use_kernels: true` |
-| TE, DeepEP, TileLang, or QuACK | Keep existing `backend:` fields. Do not mix TE attention with Hub FA |
+| TE, DeepEP, or TileLang | Keep existing `backend:` fields. Do not mix TE attention with Hub FA |
 | EAGLE ring attention or some VLMs | Still need pip `flash-attn` (direct imports) |
 
 ## Limitations
