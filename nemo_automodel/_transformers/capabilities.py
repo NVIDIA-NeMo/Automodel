@@ -283,6 +283,9 @@ class ModelSupports:
             or _uses_te_attention(model)
             or _uses_magi_attention(model)
             or (self.supports_thd and backend_attn == "tilelang")
+            # Models that build their own per-document masks (MiniMax M3's
+            # document-blocked FlexAttention mask) need no packing-aware backend.
+            or getattr(model, "_owns_packed_attention", False)
         )
         return _supports_seq_lens(model) and sp_attn_backend
 
@@ -359,6 +362,8 @@ class ModelSupports:
         if model_owned_backends is not None:
             backend_attn = getattr(getattr(model, "backend", None), "attn", None)
             return _supports_seq_lens(model) and backend_attn in model_owned_backends
+        if getattr(model, "_owns_cp_attention", False):
+            return True
         if self.supports_thd:
             backend_attn = getattr(getattr(model, "backend", None), "attn", None)
             return backend_attn == "tilelang"
