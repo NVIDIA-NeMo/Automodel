@@ -76,38 +76,20 @@ def _build_gemma4_draft():
 
 
 def test_gemma4_draft_forward_shapes():
-    # This is a CPU-only shape check. Isolate it from any earlier test that
-    # temporarily selected CUDA as PyTorch's default device. Keep its tiny SDPA
-    # workload independent of the process-wide thread pool used by earlier tests.
-    previous_num_threads = torch.get_num_threads()
-    torch.set_num_threads(1)
-    try:
-        with torch.device("cpu"), torch.random.fork_rng(devices=[]):
-            torch.manual_seed(7)
-            model = _build_gemma4_draft()
-            # This test exercises shapes, not initialization. Use fixed nonzero
-            # weights so prior tests cannot influence the fixture through RNG state.
-            with torch.no_grad():
-                for parameter in model.parameters():
-                    if parameter.is_floating_point():
-                        parameter.fill_(0.01)
-            b, s, block, anchors = 2, 16, 4, 8
-            gen = torch.Generator().manual_seed(0)
-            torch.manual_seed(0)
-            with torch.no_grad():
-                out = model(
-                    input_ids=torch.randint(0, VOCAB, (b, s), generator=gen),
-                    target_hidden_states=torch.randn(b, s, len(TARGET_LAYER_IDS) * HIDDEN, generator=gen),
-                    loss_mask=torch.ones(b, s, dtype=torch.uint8),
-                    target_last_hidden_states=torch.randn(b, s, HIDDEN, generator=gen),
-                )
-    finally:
-        torch.set_num_threads(previous_num_threads)
+    model = _build_gemma4_draft()
+    b, s, block, anchors = 2, 16, 4, 8
+    gen = torch.Generator().manual_seed(0)
+    with torch.no_grad():
+        torch.manual_seed(7)
+        out = model(
+            input_ids=torch.randint(0, VOCAB, (b, s), generator=gen),
+            target_hidden_states=torch.randn(b, s, len(TARGET_LAYER_IDS) * HIDDEN, generator=gen),
+            loss_mask=torch.ones(b, s, dtype=torch.uint8),
+            target_last_hidden_states=torch.randn(b, s, HIDDEN, generator=gen),
+        )
     assert out.draft_logits.shape == (b, anchors, block, VOCAB)
     assert out.confidence_pred.shape == (b, anchors, block)
-    # Tail slots outside the evaluation mask may have every attention key masked.
-    assert out.eval_mask.any()
-    assert torch.isfinite(out.draft_logits[out.eval_mask]).all()
+    assert torch.isfinite(out.draft_logits).all()
 
 
 def test_gemma4_rope_inv_freq_stays_fp32_after_bf16_cast():

@@ -43,12 +43,11 @@ RUN apt-get update && apt-get install -y --only-upgrade gnupg && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
-# Install the pinned uv outside /root so arbitrary runtime UIDs can execute it.
-# Overwrite the base image's vulnerable /usr/local/bin copy.
+# Install the pinned uv and uvx on the system path so runtime user overrides can
+# execute them. This also overwrites the base image's vulnerable copies.
 ENV UV_VERSION="0.11.24"
-RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh && \
-    install -m 0755 /root/.local/bin/uv /usr/local/bin/uv && \
-    rm -f /usr/local/bin/uvx
+RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | \
+    env UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 sh
 ENV PATH="/usr/local/bin:$PATH"
 ENV UV_PROJECT_ENVIRONMENT=/opt/venv
 ENV UV_CACHE_DIR=/opt/uv_cache
@@ -269,18 +268,18 @@ ARG TARGETARCH
 RUN echo "This distribution includes open source which is archived at the following URL: https://opensource.nvidia.com/oss/teams/nvidia/nemo-automodel/${RC_DATE}:linux-${TARGETARCH}/index.html" > NOTICES.txt && \
     echo "For further inquiries or assistance, contact us at oss-requests@nvidia.com" >> NOTICES.txt
 
-ENV HOME=/home/nemo-runtime \
-    XDG_CACHE_HOME=/tmp/regent-cache/xdg \
-    UV_CACHE_DIR=/tmp/regent-cache/uv
-
+# Exercise the supported sandbox identity without changing the image's root
+# default. Runtime-specific HOME and cache overrides belong to the launcher.
 USER ${RUNTIME_UID}:${RUNTIME_GID}
-
-# Validate the final user after the complete source and environment layers are
-# present. Runtime writes are limited to the source tree, test overlay venv,
-# and declared cache roots.
 RUN test "$(id -u)" = "${RUNTIME_UID}" && \
     test -x /usr/local/bin/uv && \
+    test -x /usr/local/bin/uvx && \
     test -x /opt/venv/bin/python && \
-    mkdir -p "${XDG_CACHE_HOME}" "${UV_CACHE_DIR}" && \
-    touch /opt/Automodel/.nonroot-write-probe /opt/venv/.nonroot-write-probe && \
-    rm /opt/Automodel/.nonroot-write-probe /opt/venv/.nonroot-write-probe
+    touch /opt/Automodel/.nonroot-write-probe \
+        /opt/venv/.nonroot-write-probe \
+        /opt/uv_cache/.nonroot-write-probe && \
+    rm /opt/Automodel/.nonroot-write-probe \
+        /opt/venv/.nonroot-write-probe \
+        /opt/uv_cache/.nonroot-write-probe
+
+USER root
