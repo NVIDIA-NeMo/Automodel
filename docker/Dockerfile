@@ -184,7 +184,7 @@ RUN pip install --no-cache-dir --no-deps /tmp/wheels/*.whl && \
 # Address base image CVE
 RUN pip install "aiohttp>=3.14.3" \
         "black>=26.3.1" \
-        "GitPython>=3.1.50" \
+        "GitPython>=3.1.59" \
         "jaraco-context>=6.1.0" \
         "jupyter-server>=2.20.0" \
         "jupyterlab>=4.5.7" \
