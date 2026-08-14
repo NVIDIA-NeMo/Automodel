@@ -86,6 +86,7 @@ class MockNemotronHModel(nn.Module):
         class MockSupports:
             def __init__(self, model):
                 self.model = model
+                self.supports_mtp_cp = True
                 self.supports_mtp_cp_pp = False
 
             @property
@@ -637,6 +638,34 @@ class TestNemotronHParallelizationStrategy:
         monkeypatch.setattr(parallelizer_mod.torch.distributed, "get_process_group_ranks", lambda _group: [0, 1])
 
         with pytest.raises(RuntimeError, match=r"MTP is enabled but model\.mtp\.layers is unavailable"):
+            strategy.parallelize(model=nemotron_model, device_mesh=mesh)
+
+    def test_cp_rejects_enabled_mtp_without_capability(
+        self,
+        strategy,
+        mock_device_mesh,
+        nemotron_model,
+        monkeypatch,
+    ):
+        mesh, dp_replicate_mesh, dp_shard_mesh, tp_mesh = mock_device_mesh
+        cp_mesh = MagicMock()
+        cp_mesh.size.return_value = 2
+        cp_mesh.get_group.return_value = object()
+        mesh.mesh_dim_names = ("dp_replicate", "dp_shard_cp", "cp", "tp")
+        mesh.__getitem__.side_effect = lambda key: {
+            "dp_replicate": dp_replicate_mesh,
+            "dp_shard_cp": dp_shard_mesh,
+            "cp": cp_mesh,
+            "tp": tp_mesh,
+            ("dp_replicate", "dp_shard_cp"): dp_shard_mesh,
+        }[key]
+        nemotron_model.mtp_config = SimpleNamespace(enabled=True)
+        nemotron_model.mtp = nn.Module()
+        nemotron_model.mtp.layers = nn.ModuleList([nn.Module()])
+        nemotron_model.supports.supports_mtp_cp = False
+        monkeypatch.setattr(parallelizer_mod.torch.distributed, "get_process_group_ranks", lambda _group: [0, 1])
+
+        with pytest.raises(RuntimeError, match="does not support MTP with context parallelism"):
             strategy.parallelize(model=nemotron_model, device_mesh=mesh)
 
     def test_sequence_parallel_not_supported(self, strategy, mock_device_mesh, nemotron_model):

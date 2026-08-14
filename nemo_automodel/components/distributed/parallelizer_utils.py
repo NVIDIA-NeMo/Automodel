@@ -35,6 +35,14 @@ from nemo_automodel.shared.torch_patches import (
 UniformSubtreeItem = Union[Tuple[nn.Module, torch.dtype], Tuple[str, nn.Module, torch.dtype]]
 
 
+def reject_unsupported_mtp_cp(model: nn.Module) -> None:
+    """Reject enabled MTP when the model has not declared CP support."""
+    supports = getattr(model, "supports", None)
+    mtp_enabled = bool(getattr(supports, "mtp_enabled", getattr(getattr(model, "mtp_config", None), "enabled", False)))
+    if mtp_enabled and not bool(getattr(supports, "supports_mtp_cp", False)):
+        raise RuntimeError(f"{type(model).__name__} does not support MTP with context parallelism")
+
+
 def reject_unsupported_mtp_cp_pp(model: nn.Module) -> None:
     """Reject MTP+CP on every trimmed pipeline stage before CP collectives."""
     supports = getattr(model, "supports", None)

@@ -424,6 +424,16 @@ def _import_parallelizer_with_stubs(monkeypatch):
     parallelizer_utils_stub.fully_shard_by_dtype = fully_shard_by_dtype
     parallelizer_utils_stub.configure_fsdp_unused_param_reduction = lambda module: 0
 
+    def reject_unsupported_mtp_cp(model):
+        supports = getattr(model, "supports", None)
+        mtp_enabled = bool(
+            getattr(supports, "mtp_enabled", getattr(getattr(model, "mtp_config", None), "enabled", False))
+        )
+        if mtp_enabled and not bool(getattr(supports, "supports_mtp_cp", False)):
+            raise RuntimeError("Model does not support MTP with context parallelism")
+
+    parallelizer_utils_stub.reject_unsupported_mtp_cp = reject_unsupported_mtp_cp
+
     def reject_unsupported_mtp_cp_pp(model):
         supports = getattr(model, "supports", None)
         is_pp_stage_fn = getattr(model, "_is_pipeline_parallel_stage", None)
@@ -1647,6 +1657,44 @@ def test_parallelize_model_rejects_cp_mtp_pipeline_stage_before_ep_or_cp(monkeyp
     )()
 
     with pytest.raises(NotImplementedError, match="MTP with context and pipeline parallelism"):
+        P.parallelize_model(
+            model=model,
+            world_mesh=world_mesh,
+            moe_mesh=moe_mesh,
+            dp_axis_names=("dp",),
+            cp_axis_name="cp",
+            ep_axis_name="ep",
+        )
+
+    apply_cp_mock.assert_not_called()
+    apply_ep_mock.assert_not_called()
+
+
+def test_parallelize_model_rejects_cp_mtp_without_capability_before_ep_or_cp(monkeypatch):
+    """The MoE/EP path must enforce the same MTP+CP capability as the dense path."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    apply_cp_mock = MagicMock()
+    apply_ep_mock = MagicMock()
+    monkeypatch.setattr(P, "apply_cp", apply_cp_mock)
+    monkeypatch.setattr(P, "apply_ep", apply_ep_mock)
+
+    world_mesh = FakeWorldMesh({"cp": 2, ("dp",): 2}, mesh_dim_names=["dp", "cp"])
+    moe_mesh = FakeMoeMesh({"ep": 2})
+    model = type(
+        "UnsupportedMTPModel",
+        (),
+        {
+            "supports": types.SimpleNamespace(
+                mtp_enabled=True,
+                supports_mtp_cp=False,
+                supports_mtp_cp_pp=False,
+            ),
+            "mtp_config": type("MTP", (), {"enabled": True})(),
+            "moe_config": type("MC", (), {"n_routed_experts": 4})(),
+        },
+    )()
+
+    with pytest.raises(RuntimeError, match="does not support MTP with context parallelism"):
         P.parallelize_model(
             model=model,
             world_mesh=world_mesh,

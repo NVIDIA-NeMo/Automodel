@@ -162,7 +162,14 @@ def test_precomputed_target_shape_must_match_local_labels():
         )
 
 
-def test_precomputed_targets_are_mutually_exclusive_with_sequence_metadata():
+@pytest.mark.parametrize(
+    "sequence_metadata",
+    [
+        {"cu_seqlens": torch.tensor([0, 4], dtype=torch.int32)},
+        {"seq_idx": torch.zeros(4, dtype=torch.long)},
+    ],
+)
+def test_precomputed_targets_are_mutually_exclusive_with_sequence_metadata(sequence_metadata):
     labels = torch.zeros(4, dtype=torch.long)
 
     with pytest.raises(ValueError, match="cannot be combined"):
@@ -172,7 +179,7 @@ def test_precomputed_targets_are_mutually_exclusive_with_sequence_metadata():
             mtp_per_depth_targets=[torch.zeros(4, dtype=torch.long)],
             labels=labels,
             model=mock.MagicMock(),
-            cu_seqlens=torch.tensor([0, 4], dtype=torch.int32),
+            **sequence_metadata,
         )
 
 
