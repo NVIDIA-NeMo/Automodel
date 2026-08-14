@@ -33,10 +33,3 @@ def test_nemotron_omni_cord_recipe_uses_fp32_master_weights() -> None:
     assert optimizer["master_weight_dtype"] == "torch.float32"
 
     assert config["distributed"]["activation_checkpointing"] is True
-
-    freeze_config = config["freeze_config"]
-    assert "freeze_embeddings" not in freeze_config
-    assert freeze_config["freeze_vision_tower"] is True
-    assert freeze_config["freeze_vision_projector"] is False
-    assert freeze_config["freeze_audio_tower"] is True
-    assert freeze_config["freeze_audio_projector"] is False

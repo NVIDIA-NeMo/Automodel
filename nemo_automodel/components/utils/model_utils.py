@@ -370,9 +370,7 @@ def apply_parameter_freezing(model, freeze_config):
 
     freeze_config can contain:
         - freeze_vision_tower: bool (default True)
-        - freeze_vision_projector: bool (default unchanged)
         - freeze_audio_tower: bool (default False)
-        - freeze_audio_projector: bool (default unchanged)
         - freeze_language_model: bool (default False)
         - freeze_video_embedder: bool (default False)
     """
@@ -384,22 +382,10 @@ def apply_parameter_freezing(model, freeze_config):
     # Freeze vision tower
     if freeze_vision_tower:
         _freeze_module_by_attribute_and_patterns(model, "vision_tower", ["vision", "visual", "image_encoder"])
-    if "freeze_vision_projector" in freeze_config:
-        freeze_vision_projector = freeze_config["freeze_vision_projector"]
-        for projector_name in ("vision_projector", "vision_projection", "multi_modal_projector", "mm_projector"):
-            projector = getattr(model, projector_name, None)
-            if projector is not None:
-                projector.requires_grad_(not freeze_vision_projector)
 
     # Freeze audio tower
     if freeze_audio_tower:
         _freeze_module_by_attribute_and_patterns(model, "audio_tower", ["audio", "audio_encoder", "speech", "sound"])
-    if "freeze_audio_projector" in freeze_config:
-        freeze_audio_projector = freeze_config["freeze_audio_projector"]
-        for projector_name in ("audio_projector", "audio_projection", "sound_projector", "sound_projection"):
-            projector = getattr(model, projector_name, None)
-            if projector is not None:
-                projector.requires_grad_(not freeze_audio_projector)
 
     # Freeze language model backbone
     if freeze_language_model:
