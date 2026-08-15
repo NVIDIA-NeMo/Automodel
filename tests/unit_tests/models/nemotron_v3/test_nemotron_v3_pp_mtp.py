@@ -316,6 +316,35 @@ class TestPPForward:
         assert captured.get("input_ids") is None
         assert captured.get("embed_fn") is None
 
+    @pytest.mark.parametrize("missing", ["embeddings", "position_ids"])
+    def test_context_parallel_requires_paired_mtp_embeddings_and_positions(self, backend, missing):
+        model, cfg = _make_model(
+            backend,
+            mtp_layers=1,
+            mtp_layers_block_type=["attention", "moe"],
+        )
+        model.train()
+
+        def fake_inner(self, input_ids, **kwargs):
+            del self, kwargs
+            source = input_ids if input_ids is not None else inputs_embeds
+            return torch.ones(source.shape[0], source.shape[1], cfg.hidden_size, dtype=torch.bfloat16)
+
+        inputs_embeds = torch.zeros(1, 4, cfg.hidden_size, dtype=torch.bfloat16)
+        model.model.forward = types.MethodType(fake_inner, model.model)
+        mtp_embed_inputs = () if missing == "embeddings" else (inputs_embeds.clone(),)
+        mtp_position_ids = None if missing == "position_ids" else (torch.tensor([[1, 2, 3, 0]]),)
+
+        with pytest.raises(ValueError, match="requires precomputed per-depth embeddings and position IDs together"):
+            model(
+                None,
+                *mtp_embed_inputs,
+                inputs_embeds=inputs_embeds,
+                position_ids=torch.arange(4).unsqueeze(0),
+                mtp_per_depth_position_ids=mtp_position_ids,
+                cp_size=2,
+            )
+
     def test_sdpa_thd_keeps_mtp_tensors_batched(self, backend):
         model, cfg = _make_model(
             backend,

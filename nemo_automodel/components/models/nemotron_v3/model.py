@@ -734,6 +734,16 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
         has_lm_head = self.lm_head is not None
         mtp_depth = int(getattr(self.mtp_config, "num_layers", 0) or 0)
         pp_mtp_enabled = is_pp_stage and self.mtp_config.enabled
+        # CP shards are not contiguous sequence slices. MTP therefore cannot
+        # derive future-token embeddings or positions by rolling rank-local
+        # tensors; callers must provide both globally shifted tensors.
+        mtp_active = self.mtp is not None and (self.training or (self.compute_mtp_in_eval and not use_cache))
+        cp_size = int(kwargs.get("cp_size", 1) or 1)
+        if cp_size > 1 and mtp_active:
+            if not mtp_embed_inputs or mtp_per_depth_position_ids is None:
+                raise ValueError(
+                    "Context-parallel MTP requires precomputed per-depth embeddings and position IDs together"
+                )
 
         # Neat-packed SDPA: convert _packed_seq_ids (1-based [B,S] int, 0=pad)
         # to mamba's seq_idx and derive a 2D padding_mask. The neat collater
@@ -823,7 +833,6 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
         # Run the MTP heads in training, or in eval when explicitly requested for
         # validation acceptance metrics. Never on the cached generation path —
         # decoding feeds one token at a time and must not pay the MTP cost.
-        mtp_active = self.mtp is not None and (self.training or (self.compute_mtp_in_eval and not use_cache))
         if mtp_active:
             mtp_attention_mask = (
                 causal_mask_mapping.get("full_attention") if causal_mask_mapping is not None else attention_mask
