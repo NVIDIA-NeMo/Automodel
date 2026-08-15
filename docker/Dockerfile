@@ -169,7 +169,7 @@ RUN if [ "$INSTALL_UCCL_EP" = "True" ]; then \
     fi
 
 # ---- Wheel builder: compile the heavy AOT source packages off the uv-sync path (cached across uv.lock bumps).
-# torchao then FA3/FA4 as sequential steps so each compiles alone at full MAX_JOBS — no cross-compile OOM. FA3 is the long pole.
+# Build torchao then FA3/FA4 sequentially and cap compiler parallelism to stay within CI memory limits.
 FROM automodel_dep AS wheel_builder
 
 # torchao MXFP8: build w/ submodules (PyPI wheels omit mxfp8 CUDA kernels on aarch64); pin v0.17.0 (v0.14.1 ~2.5x slower; main needs nvidia-cutlass-dsl).
@@ -194,7 +194,7 @@ RUN if [ "$TARGETARCH" = "arm64" ]; then INSTALL_FA3=false; fi && \
     fi && \
     if [ "$INSTALL_FA3" = "true" ]; then \
         cd /tmp/fa/hopper && \
-        FLASH_ATTENTION_DISABLE_SM80=TRUE MAX_JOBS=$(nproc) NVCC_THREADS=2 \
+        FLASH_ATTENTION_DISABLE_SM80=TRUE MAX_JOBS=16 NVCC_THREADS=2 \
         pip wheel --no-cache-dir --no-build-isolation --no-deps -w /wheels . ; \
     fi && \
     if [ "$INSTALL_FA4" = "true" ]; then \
