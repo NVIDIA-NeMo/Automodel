@@ -55,6 +55,9 @@ from nemo_automodel.shared.tied_weights import ensure_tied_lm_head
 from nemo_automodel.shared.torch_patches import (
     patch_fsdp_accumulated_grad_guard as _patch_fsdp_accumulated_grad_guard,
 )
+from nemo_automodel.shared.torch_patches import (
+    patch_fsdp_uniform_reduce_dtype as _patch_fsdp_uniform_reduce_dtype,
+)
 from nemo_automodel.shared.utils import dtype_from_str
 
 logger = logging.getLogger(__name__)
@@ -618,6 +621,10 @@ def apply_fsdp(
     # but trainable multimodal towers still get standalone FSDP units. Install
     # the same lazy-state guard as dense FSDP for modality-free batches.
     _patch_fsdp_accumulated_grad_guard()
+    # ``moe/fsdp_mixin`` drives post-backward by hand under pipeline parallelism,
+    # so a group can reach the reduction holding both reduce-dtype accumulations
+    # and a param-dtype gradient that arrived after its last no-sync reduction.
+    _patch_fsdp_uniform_reduce_dtype()
 
     if isinstance(lm_head_precision, str):
         lm_head_precision = dtype_from_str(lm_head_precision, default=None)

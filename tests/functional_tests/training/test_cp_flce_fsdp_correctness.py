@@ -25,7 +25,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.fsdp import fully_shard
+from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 from torch.distributed.tensor import DTensor, Shard, distribute_tensor
 
 from nemo_automodel.components.distributed.parallelizer_utils import configure_fsdp_unused_param_reduction
@@ -130,9 +130,9 @@ def _assert_empty_rank_fsdp_grad_parity(device: torch.device) -> None:
     use_conditional = rank == 0
     model(inputs[rank], use_conditional=use_conditional).sum().backward()
 
-    reference_loss = sum(
-        reference(batch, use_conditional=data_rank == 0).sum() for data_rank, batch in enumerate(inputs)
-    ) / world
+    reference_loss = (
+        sum(reference(batch, use_conditional=data_rank == 0).sum() for data_rank, batch in enumerate(inputs)) / world
+    )
     reference_loss.backward()
 
     torch.testing.assert_close(
@@ -141,6 +141,88 @@ def _assert_empty_rank_fsdp_grad_parity(device: torch.device) -> None:
         rtol=1e-5,
         atol=1e-6,
     )
+
+
+class _PartiallyUsedFSDPModel(nn.Module):
+    """One FSDP unit whose second branch never runs, so it never gets a local gradient."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.used = nn.Linear(8, 8, bias=False)
+        self.unused = nn.Linear(8, 8, bias=False)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        """Run only the `used` branch.
+
+        Args:
+            inputs: Tensor of shape [batch, sequence, hidden].
+
+        Returns:
+            Tensor of shape [batch, sequence, hidden].
+        """
+        return self.used(inputs)
+
+
+def _assert_accumulated_unused_param_grad_dtype(device: torch.device) -> None:
+    """Reduce one dtype when CP zero-fill meets mixed-precision gradient accumulation.
+
+    Regression for NVBug 6599894: `used` carries an fp32 accumulation from the
+    first micro-batch while the CP unused-parameter fill contributes a bf16 zero
+    for `unused`, and FSDP2's `foreach_reduce` rejects a mixed-dtype group with
+    "FSDP reduce-scatter expects uniform gradient dtype".
+    """
+    world = dist.get_world_size()
+    rank = dist.get_rank()
+    mesh = init_device_mesh("cuda", (world,), mesh_dim_names=("dp_cp",))
+
+    torch.manual_seed(6599894)
+    model = _PartiallyUsedFSDPModel().to(device)
+    reference = _PartiallyUsedFSDPModel().to(device)
+    reference.load_state_dict(model.state_dict())
+
+    fully_shard(
+        model,
+        mesh=mesh,
+        mp_policy=MixedPrecisionPolicy(
+            param_dtype=torch.bfloat16,
+            reduce_dtype=torch.float32,
+            output_dtype=torch.bfloat16,
+            cast_forward_inputs=True,
+        ),
+        reshard_after_forward=True,
+    )
+    configured_units = configure_fsdp_unused_param_reduction(model)
+    assert configured_units >= 1
+
+    def _micro_batch(micro_index: int, data_rank: int) -> torch.Tensor:
+        generator = torch.Generator(device=device).manual_seed(5000 + 17 * micro_index + data_rank)
+        return torch.randn(2, 3, 8, device=device, generator=generator)
+
+    micro_batches = 2
+    for micro_index in range(micro_batches):
+        # Defer reduction to the final micro-batch, as fsdp_mixin does.
+        is_final = micro_index == micro_batches - 1
+        model.set_is_last_backward(is_final)
+        model.set_reshard_after_backward(is_final)
+        model.set_requires_gradient_sync(is_final)
+        model(_micro_batch(micro_index, rank)).float().sum().backward()
+
+    # FSDP2 computes in param dtype and averages the reduction over the mesh, so
+    # mirror both to keep the reference comparable.
+    reference_bf16 = reference.to(torch.bfloat16)
+    expected_used = torch.zeros_like(reference_bf16.used.weight, dtype=torch.float32)
+    for micro_index in range(micro_batches):
+        for data_rank in range(world):
+            (grad,) = torch.autograd.grad(
+                reference_bf16(_micro_batch(micro_index, data_rank).to(torch.bfloat16)).float().sum(),
+                reference_bf16.used.weight,
+            )
+            expected_used += grad.float()
+    expected_used /= world
+
+    unused_grad = _full_grad(model.unused.weight)
+    torch.testing.assert_close(unused_grad, torch.zeros_like(unused_grad), rtol=0, atol=0)
+    torch.testing.assert_close(_full_grad(model.used.weight), expected_used, rtol=2e-2, atol=2e-2)
 
 
 def _run_worker() -> None:
@@ -155,6 +237,8 @@ def _run_worker() -> None:
         _assert_flce_weight_grad_parity(device)
         dist.barrier()
         _assert_empty_rank_fsdp_grad_parity(device)
+        dist.barrier()
+        _assert_accumulated_unused_param_grad_dtype(device)
         dist.barrier()
 
         if dist.get_rank() == 0:
