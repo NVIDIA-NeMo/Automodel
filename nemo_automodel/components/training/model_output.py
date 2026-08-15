@@ -51,14 +51,15 @@ class ModelOutput:
         logprobs: per-datum selected-token logprobs, each shape ``[T_i]``.
         entropy: per-datum per-token entropy, each shape ``[T_i]``.
         values: per-datum value-head outputs, each shape ``[T_i]``.
-        metrics: scalar metrics (loss components, grad-norm, etc.).
+        metrics: scalar metrics (loss components, grad-norm, etc.), represented
+            as Python floats or zero-dimensional tensors.
     """
 
     loss: torch.Tensor | None = None
     logprobs: list[torch.Tensor] | None = None
     entropy: list[torch.Tensor] | None = None
     values: list[torch.Tensor] | None = None
-    metrics: dict[str, float] = field(default_factory=dict)
+    metrics: dict[str, float | torch.Tensor] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {

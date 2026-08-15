@@ -17,6 +17,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.multiprocessing as mp
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -165,16 +166,116 @@ def test_multiple_microbatches_accumulate_datums():
     assert len(out.logprobs) == 4  # 2 datums x 2 microbatches, in order
 
 
-def test_reduce_token_level_normalization():
-    # Two datums, token-level loss; weighted sum / global token count.
-    d = [
-        Datum(input_ids=torch.tensor([1, 2]), loss_fn_inputs={"weights": torch.tensor([1.0, 1.0])}),
-        Datum(input_ids=torch.tensor([3]), loss_fn_inputs={"weights": torch.tensor([0.0])}),
+def test_structured_datum_metric_is_weighted_across_microbatches_without_changing_gradients():
+    microbatches = [
+        [
+            Datum(
+                input_ids=torch.tensor([1, 2, 3]),
+                loss_fn_inputs={
+                    "target_tokens": torch.tensor([2, 3, 4]),
+                    "weights": torch.tensor([1.0, 0.0, 1.0]),
+                },
+            )
+        ],
+        [
+            Datum(
+                input_ids=torch.tensor([4]),
+                loss_fn_inputs={"target_tokens": torch.tensor([5]), "weights": torch.tensor([0.0])},
+            ),
+            Datum(
+                input_ids=torch.tensor([6, 7]),
+                loss_fn_inputs={
+                    "target_tokens": torch.tensor([7, 8]),
+                    "weights": torch.tensor([0.0, 1.0]),
+                },
+            ),
+        ],
     ]
-    per = [torch.tensor([2.0, 4.0]), torch.tensor([8.0])]  # token-level
-    # weighted sum = 2*1 + 4*1 + 8*0 = 6; global token count = 2 -> 3.0
-    loss = Engine._reduce_datum_losses(per, d, token_denom=2.0, sample_denom=2.0)
-    assert float(loss) == pytest.approx(3.0)
+
+    def losses_only(model_output, datums):
+        return [-logprobs for logprobs in model_output.logprobs]
+
+    def losses_and_metric(model_output, datums):
+        losses = losses_only(model_output, datums)
+        metric_sum = losses[0].new_zeros(())
+        for loss, datum in zip(losses, datums, strict=True):
+            metric_sum = metric_sum + (loss * datum.loss_fn_inputs["weights"].to(loss)).sum()
+        return losses, {"nll": metric_sum}
+
+    legacy_engine, legacy_model = _engine()
+    structured_engine, structured_model = _engine()
+    legacy_out = legacy_engine.forward_backward(microbatches, loss_fn=losses_only)
+    structured_out = structured_engine.forward_backward(microbatches, loss_fn=losses_and_metric)
+
+    assert torch.allclose(structured_out.loss, legacy_out.loss)
+    assert isinstance(structured_out.metrics["nll"], torch.Tensor)
+    assert structured_out.metrics["nll"].ndim == 0
+    assert not structured_out.metrics["nll"].requires_grad
+    assert torch.allclose(structured_out.metrics["nll"], structured_out.loss)
+    for legacy_parameter, structured_parameter in zip(
+        legacy_model.parameters(), structured_model.parameters(), strict=True
+    ):
+        assert torch.allclose(structured_parameter.grad, legacy_parameter.grad)
+
+
+def test_legacy_two_loss_tuple_is_not_parsed_as_structured_metrics():
+    datums = _datums()
+
+    def list_losses(model_output, datums):
+        return [-logprobs for logprobs in model_output.logprobs]
+
+    def tuple_losses(model_output, datums):
+        return tuple(-logprobs for logprobs in model_output.logprobs)
+
+    list_engine, list_model = _engine()
+    tuple_engine, tuple_model = _engine()
+    list_out = list_engine.forward_backward(datums, loss_fn=list_losses)
+    tuple_out = tuple_engine.forward_backward(datums, loss_fn=tuple_losses)
+
+    assert torch.allclose(tuple_out.loss, list_out.loss)
+    assert tuple_out.metrics.keys() == {"loss"}
+    for list_parameter, tuple_parameter in zip(list_model.parameters(), tuple_model.parameters(), strict=True):
+        assert torch.allclose(tuple_parameter.grad, list_parameter.grad)
+
+
+def _default_world_metric_worker(rank, world_size, init_file):
+    torch.distributed.init_process_group("gloo", init_method=f"file://{init_file}", rank=rank, world_size=world_size)
+    try:
+        engine, _ = _engine()
+        num_tokens = 3 if rank == 0 else 5
+        datum = Datum(
+            input_ids=torch.arange(1, num_tokens + 1),
+            loss_fn_inputs={
+                "target_tokens": torch.arange(2, num_tokens + 2),
+                "weights": torch.ones(num_tokens),
+            },
+        )
+
+        def loss_with_metric(model_output, datums):
+            losses = [torch.zeros_like(logprobs) for logprobs in model_output.logprobs]
+            local_sum = losses[0].new_tensor(9.0 if rank == 0 else 30.0)
+            return losses, {"weighted": local_sum}
+
+        output = engine.forward_backward([datum], loss_fn=loss_with_metric, forward_only=True)
+        assert torch.allclose(output.metrics["weighted"], torch.tensor(39.0 / 8.0))
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+def test_structured_datum_metrics_reduce_over_default_world_group(tmp_path):
+    mp.spawn(_default_world_metric_worker, args=(2, str(tmp_path / "default_world")), nprocs=2, join=True)
+
+
+def test_reduce_token_level_normalization():
+    # The singleton is first: shape [1] is token-level, while shape [] is sample-level.
+    d = [
+        Datum(input_ids=torch.tensor([1]), loss_fn_inputs={"weights": torch.tensor([1.0])}),
+        Datum(input_ids=torch.tensor([2, 3]), loss_fn_inputs={"weights": torch.tensor([1.0, 0.0])}),
+    ]
+    per = [torch.tensor([8.0]), torch.tensor([2.0, 4.0])]  # token-level
+    # weighted sum = 8*1 + 2*1 + 4*0 = 10; global token count = 2 -> 5.0
+    loss = Engine._reduce_datum_losses(per, d, token_denom=2.0, sample_denom=99.0)
+    assert float(loss) == pytest.approx(5.0)
 
 
 def test_reduce_sample_level_normalization():

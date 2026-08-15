@@ -47,7 +47,7 @@ from __future__ import annotations
 
 import math
 import os
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Any
@@ -70,7 +70,10 @@ __all__ = ["Engine", "CheckpointHandle"]
 # every RL consumer (verl, slime, nemo-rl) and verl's other backends (megatron,
 # fsdp) bring their own loss, so no loss library lives here — just the type and
 # the default SFT cross-entropy used when no ``loss_fn`` is given.
-LossFn = Callable[["ModelOutput", Sequence["Datum"]], Sequence[torch.Tensor]]
+LossFn = Callable[
+    ["ModelOutput", Sequence["Datum"]],
+    Sequence[torch.Tensor] | tuple[Sequence[torch.Tensor], Mapping[str, torch.Tensor]],
+]
 
 
 def cross_entropy(model_output: "ModelOutput", datums: "Sequence[Datum]", **kwargs) -> list[torch.Tensor]:
@@ -400,10 +403,14 @@ class Engine:
         * **Datum mode** (``list[Datum]`` or ``list[list[Datum]]``): the tinker
           path. ``loss_fn`` is a ``LossFn`` callable
           ``(ModelOutput, Sequence[Datum]) -> Sequence[Tensor]`` (defaults to
-          token-level cross-entropy when ``None``) — RL objectives (PPO, etc.)
-          are supplied by the caller, not built in. The Engine owns
-          weighting, the global token/sample denominator across data ranks, and
-          backward. Returns a :class:`ModelOutput`.
+          token-level cross-entropy when ``None``), or it may return
+          ``(per_datum_losses, metric_sums)``. Each metric sum is an
+          unnormalized scalar tensor for the current microbatch in the same
+          token/sample domain as the losses; keys must be stable across
+          microbatches and data ranks. The Engine owns weighting, backward, and
+          the global denominator applied to both the loss and the summed
+          metrics. RL objectives are supplied by the caller. Returns a
+          :class:`ModelOutput`.
         * **Dict mode** (``dict`` or ``list[dict]``): the legacy SFT path.
           ``loss_fn`` is an Automodel loss instance (or ``None`` to use the
           model's own loss); reduction goes through ``calculate_loss``. Returns
@@ -689,6 +696,9 @@ class Engine:
         agg_logprobs: list[torch.Tensor] = []
         agg_entropy: list[torch.Tensor] = []
         loss_sum = torch.zeros((), device=device)
+        loss_is_sample_level: bool | None = None
+        metric_names: tuple[str, ...] | None = None
+        accumulated_metric_sums: dict[str, torch.Tensor] = {}
         for i, mb in enumerate(mb_datum_lists):
             is_last = i == n - 1
             if is_train and is_last:
@@ -707,8 +717,45 @@ class Engine:
             with fwd_ctx, train_ctx(), sync_ctx:
                 out = model(**filter_forward_kwargs(model, batch))
                 mo = self._build_model_output(out, mb, labels, detach=False, packed=packed, sharder=sharder)
-                per_datum_losses = loss_fn(mo, mb, **loss_kwargs)
+                loss_result = loss_fn(mo, mb, **loss_kwargs)
+                if isinstance(loss_result, tuple) and len(loss_result) == 2 and isinstance(loss_result[1], Mapping):
+                    per_datum_losses, microbatch_metric_sums = loss_result
+                else:
+                    # In particular, preserve a legacy two-loss tuple: its
+                    # second item is a Tensor, not a Mapping.
+                    per_datum_losses = loss_result
+                    microbatch_metric_sums = {}
+
                 loss = self._reduce_datum_losses(per_datum_losses, mb, token_denom, sample_denom)
+                sample_level = per_datum_losses[0].ndim == 0
+                if loss_is_sample_level is None:
+                    loss_is_sample_level = sample_level
+                elif sample_level != loss_is_sample_level:
+                    raise ValueError("loss reduction domain must be identical across all microbatches")
+
+                if any(not isinstance(name, str) or not name or name == "loss" for name in microbatch_metric_sums):
+                    raise ValueError("metric_sums keys must be non-empty strings other than reserved key 'loss'")
+                names = tuple(sorted(microbatch_metric_sums))
+                if metric_names is None:
+                    metric_names = names
+                elif names != metric_names:
+                    raise ValueError(
+                        "metric_sums keys must be identical across all microbatches; "
+                        f"expected {metric_names}, got {names}"
+                    )
+                for name in names:
+                    value = microbatch_metric_sums[name]
+                    if not isinstance(value, torch.Tensor):
+                        raise TypeError(f"metric_sums[{name!r}] must be a Tensor")
+                    if value.ndim != 0:
+                        raise ValueError(f"metric_sums[{name!r}] must be a scalar Tensor")
+                    if value.device != per_datum_losses[0].device:
+                        raise ValueError(f"metric_sums[{name!r}] must be on the loss device")
+                    value = value.detach().float()
+                    if name in accumulated_metric_sums:
+                        accumulated_metric_sums[name] = accumulated_metric_sums[name] + value
+                    else:
+                        accumulated_metric_sums[name] = value
                 if is_train:
                     # The loss is normalized by the global (DP-reduced) token count,
                     # so summing grads across DP ranks — not FSDP's average — yields
@@ -722,11 +769,22 @@ class Engine:
             if is_train and i == 0:
                 prepare_after_first_microbatch()
 
+        metrics: dict[str, float | torch.Tensor] = {"loss": float(loss_sum)}
+        if accumulated_metric_sums:
+            names = tuple(accumulated_metric_sums)
+            reduced_metric_sums = torch.stack([accumulated_metric_sums[name] for name in names])
+            group = self._dp_group(include_cp=False)
+            if dist.is_initialized():
+                dist.all_reduce(reduced_metric_sums, op=dist.ReduceOp.SUM, group=group)
+            denominator = sample_denom if loss_is_sample_level else token_denom
+            normalized_metrics = reduced_metric_sums / max(denominator, 1e-8)
+            metrics.update(dict(zip(names, normalized_metrics.unbind(), strict=True)))
+
         return ModelOutput(
             loss=loss_sum,
             logprobs=agg_logprobs or None,
             entropy=agg_entropy or None,
-            metrics={"loss": float(loss_sum)},
+            metrics=metrics,
         )
 
     @staticmethod
@@ -738,18 +796,42 @@ class Engine:
     ) -> torch.Tensor:
         """Weight + sum per-datum losses, normalized by the global denominator.
 
-        Token-level (per-token tensors) are multiplied by ``weights`` and summed,
-        divided by the global token count. Sample-level (scalar per datum) are
-        summed and divided by the global sample count. Homogeneity is decided
-        from the first datum's loss shape.
+        Token-level ``[datum.seq_len]`` tensors are multiplied by ``weights``
+        and summed, divided by the global token count. Sample-level scalar
+        tensors are summed and divided by the global sample count.
+
+        Args:
+            per_datum_losses: One Tensor per Datum, homogeneously shaped either
+                ``[]`` (sample-level) or ``[datum.seq_len]`` (token-level).
+            datums: Datums aligned one-to-one with ``per_datum_losses``.
+            token_denom: Global weighted token count.
+            sample_denom: Global Datum count.
+
+        Returns:
+            A scalar Tensor containing the globally normalized local loss sum.
         """
-        sample_level = per_datum_losses[0].numel() == 1
+        if not isinstance(per_datum_losses, Sequence):
+            raise TypeError("loss_fn must return a sequence of Tensors")
+        if not per_datum_losses or len(per_datum_losses) != len(datums):
+            raise ValueError("loss_fn must return exactly one loss Tensor per Datum")
+        if not isinstance(per_datum_losses[0], torch.Tensor):
+            raise TypeError("loss_fn must return Tensors")
+        sample_level = per_datum_losses[0].ndim == 0
         total = None
-        for loss_i, d in zip(per_datum_losses, datums):
+        for i, (loss_i, d) in enumerate(zip(per_datum_losses, datums, strict=True)):
+            expected_shape = () if sample_level else (d.seq_len,)
+            if not isinstance(loss_i, torch.Tensor):
+                raise TypeError(f"loss {i} must be a Tensor")
+            if tuple(loss_i.shape) != expected_shape:
+                raise ValueError(
+                    f"loss {i} must have shape {list(expected_shape)}, got {getattr(loss_i, 'shape', None)}"
+                )
             if sample_level:
-                contrib = loss_i.reshape(())
+                contrib = loss_i
             else:
                 w = d.loss_fn_inputs.get("weights")
+                if w is not None and w.shape != loss_i.shape:
+                    raise ValueError(f"weights {i} must have shape {list(loss_i.shape)}, got {list(w.shape)}")
                 contrib = (loss_i * w.to(loss_i)).sum() if w is not None else loss_i.sum()
             total = contrib if total is None else total + contrib
         denom = sample_denom if sample_level else token_denom
@@ -882,7 +964,7 @@ class Engine:
         # Reduce over DP only: CP ranks hold the same datums (double-counting
         # over CP would shrink the loss by cp_size).
         group = self._dp_group(include_cp=False)
-        if group is not None and dist.is_initialized():
+        if dist.is_initialized():
             t = torch.tensor([token_local, sample_local], device=self.device)
             dist.all_reduce(t, op=dist.ReduceOp.SUM, group=group)
             token_local, sample_local = float(t[0]), float(t[1])
