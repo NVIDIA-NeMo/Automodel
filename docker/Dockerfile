@@ -46,8 +46,29 @@ RUN apt-get update && apt-get install -y --only-upgrade gnupg && \
 # Install the pinned uv and uvx on the system path so runtime user overrides can
 # execute them. This also overwrites the base image's vulnerable copies.
 ENV UV_VERSION="0.11.24"
-RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | \
-    env UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 sh
+ARG TARGETARCH
+RUN case "${TARGETARCH}" in \
+        amd64) \
+            uv_arch="x86_64"; \
+            uv_sha256="5ce1ad074a78f96c5c8122088bb85a12eb282195bc1453151a48762e4fc31fed"; \
+            ;; \
+        arm64) \
+            uv_arch="aarch64"; \
+            uv_sha256="e22c66d36a0098b17cff80a8647e0b8c58202af899d4e9eb820fc7ad126435a1"; \
+            ;; \
+        *) \
+            echo "Unsupported TARGETARCH for uv: ${TARGETARCH}" >&2; \
+            exit 1; \
+            ;; \
+    esac && \
+    uv_archive="uv-${uv_arch}-unknown-linux-gnu.tar.gz" && \
+    curl -fLSs -o "/tmp/${uv_archive}" \
+        "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/${uv_archive}" && \
+    echo "${uv_sha256}  /tmp/${uv_archive}" | sha256sum -c - && \
+    tar -xzf "/tmp/${uv_archive}" -C /tmp && \
+    install -m 0755 "/tmp/uv-${uv_arch}-unknown-linux-gnu/uv" /usr/local/bin/uv && \
+    install -m 0755 "/tmp/uv-${uv_arch}-unknown-linux-gnu/uvx" /usr/local/bin/uvx && \
+    rm -rf "/tmp/${uv_archive}" "/tmp/uv-${uv_arch}-unknown-linux-gnu"
 ENV PATH="/usr/local/bin:$PATH"
 ENV UV_PROJECT_ENVIRONMENT=/opt/venv
 ENV UV_CACHE_DIR=/opt/uv_cache
