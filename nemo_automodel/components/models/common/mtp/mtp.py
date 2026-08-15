@@ -31,14 +31,14 @@ class MTPContextParallelInputs:
     Attributes:
         input_ids: Per-depth token IDs of shape ``[batch, sequence]`` in global
             sequence order.
-        position_ids: Optional per-depth position IDs of shape ``[batch,
-            sequence]`` in global sequence order.
+        position_ids: Per-depth position IDs of shape ``[batch, sequence]`` in
+            global sequence order.
         targets: Per-depth loss targets of shape ``[batch, sequence]`` in global
             sequence order, with invalid positions set to the loss ignore index.
     """
 
     input_ids: tuple[torch.LongTensor, ...]
-    position_ids: tuple[torch.LongTensor, ...] | None
+    position_ids: tuple[torch.LongTensor, ...]
     targets: tuple[torch.LongTensor, ...]
 
 
@@ -143,25 +143,15 @@ def _packed_seq_ids_from_padded_lengths(
         )
 
     seq_idx = torch.zeros((batch_size, seq_len), dtype=torch.long, device=device)
-    for batch_idx, row in enumerate(seq_lens_padded.tolist()):
-        offset = 0
-        sequence_id = 1
-        for raw_length in row:
-            length = int(raw_length)
-            if length < 0:
-                continue
-            end = offset + length
-            if end > seq_len:
-                raise ValueError(
-                    f"seq_lens_padded row {batch_idx} covers more than the input sequence length {seq_len}"
-                )
-            seq_idx[batch_idx, offset:end] = sequence_id
-            offset = end
-            sequence_id += 1
-        if offset != seq_len:
+    for batch_idx, row in enumerate(seq_lens_padded):
+        lengths = row.to(device=device, dtype=torch.long).clamp_min(0)
+        sequence_ids = torch.arange(1, row.numel() + 1, dtype=torch.long, device=device)
+        try:
+            seq_idx[batch_idx] = torch.repeat_interleave(sequence_ids, lengths, output_size=seq_len)
+        except RuntimeError as exc:
             raise ValueError(
-                f"seq_lens_padded row {batch_idx} covers {offset} tokens, expected the full input length {seq_len}"
-            )
+                f"seq_lens_padded row {batch_idx} must cover exactly the input sequence length {seq_len}"
+            ) from exc
     return seq_idx
 
 
@@ -208,8 +198,11 @@ def _packed_seq_ids_from_batch(
         )
 
     # Padded boundaries describe the materialized token layout. Real
-    # cu_seqlens alone would shift across inter-sequence pad slots.
-    cu_seqlens = batch.get("cu_seqlens_padded", batch.get("cu_seqlens"))
+    # cu_seqlens alone are safe only when the materialized layout is unpadded.
+    cu_seqlens = batch.get("cu_seqlens_padded")
+    uses_unpadded_boundaries = not isinstance(cu_seqlens, torch.Tensor)
+    if uses_unpadded_boundaries:
+        cu_seqlens = batch.get("cu_seqlens")
     if not isinstance(cu_seqlens, torch.Tensor):
         return None
     if input_ids.shape[0] != 1:
@@ -219,6 +212,12 @@ def _packed_seq_ids_from_batch(
     cu_seqlens = cu_seqlens[cu_seqlens >= 0].to(device=input_ids.device)
     if cu_seqlens.numel() < 2:
         return None
+    if uses_unpadded_boundaries and bool(cu_seqlens[-1] != input_ids.shape[1]):
+        raise ValueError(
+            "cu_seqlens cannot describe a padded materialized MTP token layout: "
+            f"its final boundary must equal input sequence length {input_ids.shape[1]}; "
+            "provide cu_seqlens_padded"
+        )
     positions = torch.arange(input_ids.shape[1], device=input_ids.device)
     return torch.searchsorted(cu_seqlens[1:].contiguous(), positions, right=True).unsqueeze(0)
 
@@ -456,7 +455,8 @@ class MTPModule(nn.Module):
                 ``input_ids_per_depth`` and ``embed_inputs``.
             input_ids_per_depth: Optional tuple of ``num_depths`` pre-shifted
                 token-ID tensors. Each has the local CP layout ``[B, S]`` or
-                ``[T]`` and is embedded directly with ``embed_fn``.
+                ``[T]`` and is embedded directly with ``embed_fn``. Requires
+                ``position_ids_per_depth``.
             embed_fn: Callable applied to rolled ``input_ids`` to produce the
                 future-token embedding (typically the model's input embedding
                 layer). Required when ``input_ids`` is supplied.
@@ -476,6 +476,8 @@ class MTPModule(nn.Module):
                 ``position_ids``. When supplied, these tensors are forwarded
                 directly instead of rolling rank-local ``position_ids``. Use
                 this when context parallelism has already sharded the sequence.
+                Required with ``input_ids_per_depth`` and incompatible with
+                rank-local ``input_ids`` rolling.
             **block_kwargs: Forwarded to each sublayer's ``__call__`` (e.g.
                 ``attention_mask``).
 

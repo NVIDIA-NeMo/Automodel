@@ -1027,9 +1027,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         }
         model = self.model_parts[0] if hasattr(self, "model_parts") else None
         supports = getattr(model, "supports", None)
+        mtp_enabled = bool(
+            getattr(supports, "mtp_enabled", getattr(getattr(model, "mtp_config", None), "enabled", False))
+        )
         mtp_cp_inputs = None
-        if not self.pp_enabled and self._get_cp_group_size() > 1 and supports is not None and supports.mtp_enabled:
-            if not supports.supports_mtp_cp:
+        if not self.pp_enabled and self._get_cp_group_size() > 1 and mtp_enabled:
+            if not bool(getattr(supports, "supports_mtp_cp", False)):
                 raise NotImplementedError(
                     f"{type(model).__name__} declares supports_mtp_cp=False; "
                     "MTP target preparation for context parallelism is unavailable"
@@ -1051,10 +1054,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             batch["mtp_per_depth_input_ids"] = tuple(
                 cp_sharder.shard_token_tensor(ids, seq_dim=1, fill=0) for ids in mtp_cp_inputs.input_ids
             )
-            if mtp_cp_inputs.position_ids is not None:
-                batch["mtp_per_depth_position_ids"] = tuple(
-                    cp_sharder.shard_token_tensor(ids, seq_dim=1, fill=0) for ids in mtp_cp_inputs.position_ids
-                )
+            batch["mtp_per_depth_position_ids"] = tuple(
+                cp_sharder.shard_token_tensor(ids, seq_dim=1, fill=0) for ids in mtp_cp_inputs.position_ids
+            )
             mtp_per_depth_targets = tuple(
                 cp_sharder.shard_token_tensor(targets, seq_dim=1, fill=self.cfg.mtp.ignore_index)
                 for targets in mtp_cp_inputs.targets

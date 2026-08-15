@@ -206,17 +206,33 @@ def test_precomputed_input_ids_skip_rank_local_rolling():
         torch.tensor([2, 3, 8, 0], dtype=torch.long),
         torch.tensor([3, 4, 0, 0], dtype=torch.long),
     )
+    local_position_ids_per_depth = (
+        torch.tensor([1, 2, 7, 0], dtype=torch.long),
+        torch.tensor([2, 3, 0, 0], dtype=torch.long),
+    )
     hidden = torch.zeros(4, 3)
 
     mtp(
         hidden,
         input_ids_per_depth=local_input_ids_per_depth,
         embed_fn=_embed_fn_identity,
+        position_ids_per_depth=local_position_ids_per_depth,
     )
 
     for depth in range(2):
         got_ids = mtp.layers[depth].calls[0]["embed_input"].squeeze(-1).to(torch.long)
         torch.testing.assert_close(got_ids, local_input_ids_per_depth[depth])
+
+
+def test_precomputed_input_ids_require_precomputed_position_ids():
+    mtp = _build_module(num_depths=2, pattern_length=1)
+
+    with pytest.raises(ValueError, match="input_ids_per_depth and position_ids_per_depth must be provided together"):
+        mtp(
+            torch.zeros(4, 3),
+            input_ids_per_depth=(torch.arange(4), torch.arange(4)),
+            embed_fn=_embed_fn_identity,
+        )
 
 
 def test_precomputed_position_ids_skip_rank_local_rolling():
@@ -245,7 +261,7 @@ def test_precomputed_position_ids_skip_rank_local_rolling():
 def test_precomputed_position_ids_reject_rank_local_token_rolling():
     mtp = _build_module(num_depths=2, pattern_length=1)
 
-    with pytest.raises(ValueError, match="position_ids_per_depth requires precomputed embed_inputs"):
+    with pytest.raises(ValueError, match="cannot be combined with rank-local input_ids rolling"):
         mtp(
             torch.zeros(4, 3),
             input_ids=torch.arange(4),
@@ -365,6 +381,16 @@ class TestMTPContextParallelPreparation:
         assert prepared.position_ids[0].tolist() == [[1, 2, 0, 1, 2, 0]]
         assert prepared.targets[0].tolist() == [[12, -100, -100, 22, -100, -100]]
 
+    def test_seq_lens_padded_must_cover_materialized_layout(self):
+        batch = {
+            "input_ids": torch.tensor([[10, 11, 12, 20, 21, 22]]),
+            "labels": torch.tensor([[11, 12, -100, 21, 22, -100]]),
+            "seq_lens_padded": torch.tensor([[2, 2, -1000]]),
+        }
+
+        with pytest.raises(ValueError, match="must cover exactly the input sequence length 6"):
+            self._prepare(batch, num_depths=1)
+
     def test_missing_position_ids_are_synthesized_globally_before_sharding(self):
         batch = {
             "input_ids": torch.tensor([[10, 11, 12, 13, 14, 15]]),
@@ -413,6 +439,16 @@ class TestMTPContextParallelPreparation:
         assert prepared.input_ids[0].tolist() == [[11, 12, 0, 21, 22, 0]]
         assert prepared.position_ids[0].tolist() == [[1, 2, 0, 4, 5, 0]]
         assert prepared.targets[0].tolist() == [[12, -100, -100, 22, -100, -100]]
+
+    def test_unpadded_cu_seqlens_rejects_padded_materialized_layout(self):
+        batch = {
+            "input_ids": torch.tensor([[10, 11, 12, 0, 20, 21, 22, 0]]),
+            "labels": torch.tensor([[11, 12, -100, -100, 21, 22, -100, -100]]),
+            "cu_seqlens": torch.tensor([0, 3, 6], dtype=torch.int32),
+        }
+
+        with pytest.raises(ValueError, match="provide cu_seqlens_padded"):
+            self._prepare(batch, num_depths=1)
 
     def test_rejects_nonpositive_depth_count(self):
         with pytest.raises(ValueError, match="num_depths must be positive"):
