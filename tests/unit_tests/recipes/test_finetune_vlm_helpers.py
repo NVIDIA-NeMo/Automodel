@@ -532,6 +532,116 @@ def test_forward_backward_step_rejects_mrope_thd_with_context_parallelism():
         )
 
 
+@pytest.mark.cuda(False)
+def test_forward_backward_step_shards_global_vlm_mtp_inputs_with_mrope(monkeypatch):
+    """The VLM recipe prepares MTP after the model CP hook creates full mRoPE positions."""
+    from nemo_automodel.components.models.common.mtp import MTPConfig
+
+    captured = {}
+    local_indices = torch.tensor([0, 1, 4, 5])
+
+    class _MTPVLM(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.scale = torch.nn.Parameter(torch.tensor(1.0))
+            self.mtp_config = MTPConfig(num_layers=1, layer_pattern="*")
+            self.supports = SimpleNamespace(mtp_enabled=True, supports_mtp_cp=True)
+
+        def forward(
+            self,
+            input_ids,
+            *,
+            mtp_per_depth_input_ids,
+            mtp_per_depth_position_ids,
+            mtp_per_depth_valid_masks,
+            **kwargs,
+        ):
+            del kwargs
+            captured["input_ids"] = input_ids.detach().clone()
+            captured["mtp_input_ids"] = tuple(t.detach().clone() for t in mtp_per_depth_input_ids)
+            captured["mtp_position_ids"] = tuple(t.detach().clone() for t in mtp_per_depth_position_ids)
+            captured["mtp_valid_masks"] = tuple(t.detach().clone() for t in mtp_per_depth_valid_masks)
+            hidden = self.scale * mtp_per_depth_input_ids[0].float().unsqueeze(-1)
+            return SimpleNamespace(
+                logits=hidden,
+                mtp_per_depth_h=[hidden],
+                mtp_per_depth_logits=None,
+                mtp_loss_scaling_factor=1.0,
+            )
+
+    model = _MTPVLM()
+
+    class _FakeContextParallelSharder:
+        def __init__(self, resolved_model, device_mesh, batch, **kwargs):
+            del device_mesh, kwargs
+            assert resolved_model is model
+            assert "position_ids" not in batch
+            base = torch.tensor([[0, 1, 2, 0, 1, 2]])
+            batch["position_ids"] = torch.stack((base, base + 10, base + 20))
+
+        def shard(self, batch):
+            local_batch = dict(batch)
+            local_batch["labels"] = batch["labels"].index_select(1, local_indices)
+            local_batch["position_ids"] = batch["position_ids"].index_select(2, local_indices)
+            local_batch.pop("_packed_seq_ids")
+            return nullcontext, local_batch
+
+        def shard_token_tensor(self, tensor, seq_dim=1, fill=None):
+            del fill
+            return tensor.index_select(seq_dim, local_indices)
+
+    recipe = _create_non_pp_recipe(model)
+    recipe.__dict__["device_mesh"] = _DummyCPDeviceMesh(cp_size=2)
+    recipe.__dict__["mesh_context"] = SimpleNamespace(cp_size=2)
+    recipe.__dict__["processor"] = SimpleNamespace(tokenizer=SimpleNamespace(pad_token_id=0))
+    recipe.__dict__["cfg"] = SimpleNamespace(mtp=SimpleNamespace(ignore_index=-100, scaling_factor=1.0))
+    recipe.__dict__["loss_fn"] = object()
+    recipe.__dict__["_get_dp_group"] = lambda include_cp=True: None
+
+    monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.ContextParallelSharder", _FakeContextParallelSharder)
+    monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.get_sync_ctx", lambda *args, **kwargs: nullcontext())
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.vlm.finetune.calculate_loss",
+        lambda loss_fn, *, logits, **kwargs: logits.sum() * 0.0,
+    )
+
+    def _fake_calculate_mtp_loss(loss_fn, *, mtp_per_depth_h, mtp_per_depth_targets, cu_seqlens, **kwargs):
+        del loss_fn, kwargs
+        captured["mtp_targets"] = tuple(t.detach().clone() for t in mtp_per_depth_targets)
+        captured["cu_seqlens"] = cu_seqlens
+        return sum(hidden.sum() for hidden in mtp_per_depth_h) * 0.01
+
+    monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.calculate_mtp_loss", _fake_calculate_mtp_loss)
+    monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.get_final_hidden_states", lambda out: None)
+
+    loss_buffer = []
+    recipe._forward_backward_step(
+        idx=0,
+        batch={
+            "input_ids": torch.tensor([[10, 11, 12, 20, 21, 22]]),
+            "labels": torch.tensor([[11, 12, -100, 21, 22, -100]]),
+            "_packed_seq_ids": torch.tensor([[1, 1, 1, 2, 2, 2]]),
+        },
+        loss_buffer=loss_buffer,
+        num_label_tokens=4,
+        num_batches=1,
+        is_train=True,
+    )
+
+    assert captured["input_ids"].tolist() == [[10, 11, 12, 20, 21, 22]]
+    assert captured["mtp_input_ids"][0].tolist() == [[11, 12, 22, 0]]
+    assert captured["mtp_position_ids"][0][:, 0].tolist() == [
+        [1, 2, 2, 0],
+        [11, 12, 12, 0],
+        [21, 22, 22, 0],
+    ]
+    assert captured["mtp_valid_masks"][0].tolist() == [[True, True, True, False]]
+    assert captured["mtp_targets"][0].tolist() == [[12, -100, -100, -100]]
+    assert captured["cu_seqlens"] is None
+    assert model.scale.grad is not None
+    assert len(loss_buffer) == 1
+
+
 def _build_pp_recipe_for_optim_step(num_label_tokens_in_batch: int):
     """Shared setup for _run_train_optim_step tests with pp_enabled=True."""
     recipe = FinetuneRecipeForVLM.__new__(FinetuneRecipeForVLM)
