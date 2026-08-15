@@ -111,7 +111,11 @@ class TrainCrossEncoderRecipe(TrainBiEncoderRecipe):
         with train_ctx, sync_ctx:
             outputs = model(**batch, return_dict=True)
 
-            outputs.logits = outputs.logits.view(-1, self.train_n_passages)
+            # Listwise softmax over each query's candidates, scaled by the recipe-level
+            # temperature as the bi-encoder path does. Backbones that scale inside
+            # forward (LlamaBidirectionalForSequenceClassification) apply model.temperature
+            # there; the two compose, and both default to 1.0.
+            outputs.logits = outputs.logits.view(-1, self.train_n_passages) / self.temperature
             loss = F.cross_entropy(outputs.logits, labels)
 
             loss_buffer.append(loss.clone().detach())
@@ -145,7 +149,7 @@ class TrainCrossEncoderRecipe(TrainBiEncoderRecipe):
 
                     with autocast_ctx:
                         outputs = model(**batch, return_dict=True)
-                        logits = outputs.logits.view(-1, self.val_n_passages)
+                        logits = outputs.logits.view(-1, self.val_n_passages) / self.temperature
                         loss = F.cross_entropy(logits, labels)
 
                     loss_buffer.append(loss.clone().detach())

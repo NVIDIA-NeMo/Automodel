@@ -204,6 +204,10 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ),
         ),
         (
+            "Qwen3RerankerForCausalReranking",
+            ("nemo_automodel.components.models.qwen3_reranker.model", "Qwen3RerankerForCausalReranking"),
+        ),
+        (
             "NemotronHForCausalLM",
             ("nemo_automodel.components.models.nemotron_v3.model", "NemotronHForCausalLM"),
         ),

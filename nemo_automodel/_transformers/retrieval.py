@@ -467,11 +467,18 @@ _MINISTRAL3_BIDIREC_TASKS = {
 _LLAMA_NEMOTRON_VL_TASKS = {
     "embedding": "LlamaNemotronVLModel",
 }
+# Only "qwen3" is needed, with no "qwen3_reranker" alias: Qwen3RerankerConfig.to_dict()
+# rewrites the serialized identity to plain qwen3 so checkpoints load in vLLM, and no
+# config.json ever carries the custom name. Contrast llama_bidirec, which keeps its own
+# identity on disk and therefore needs both keys.
+_QWEN3_RERANKER_TASKS = {"score": "Qwen3RerankerForCausalReranking"}
+
 SUPPORTED_BACKBONES = {
     "llama": _LLAMA_TASKS,
     "llama_bidirec": _LLAMA_TASKS,
     "ministral3_bidirec": _MINISTRAL3_BIDIREC_TASKS,
     "llama_nemotron_vl": _LLAMA_NEMOTRON_VL_TASKS,
+    "qwen3": _QWEN3_RERANKER_TASKS,
 }
 
 
