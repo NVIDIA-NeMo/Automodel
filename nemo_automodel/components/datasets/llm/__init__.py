@@ -24,6 +24,7 @@ from .nanogpt_dataset import NanogptDataset  # noqa: F401
 from .neat_packing import neat_pack_dataset  # noqa: F401
 from .retrieval_collator import (  # noqa: F401
     BiEncoderCollator,
+    ContextAwareRerankerCollator,
     CrossEncoderCollator,
     ProcessorMethodCollator,
     make_vision_collator_from_processor_method,
@@ -43,6 +44,7 @@ __all__ = [
     "make_agent_chat_dataset",
     "BiEncoderCollator",
     "BiEncoderDistillCollator",
+    "ContextAwareRerankerCollator",
     "CrossEncoderCollator",
     "ProcessorMethodCollator",
     "make_vision_collator_from_processor_method",

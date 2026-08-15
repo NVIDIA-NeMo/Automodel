@@ -16,7 +16,7 @@ import json
 import logging
 import os
 from dataclasses import dataclass
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List, Optional, Union
 
 from datasets import Dataset, concatenate_datasets
 
@@ -103,7 +103,8 @@ def _resolve_doc_to_example(doc: Any) -> dict:
     return example
 
 
-def load_datasets(data_dir_list: Union[List[str], str], concatenate: bool = True):
+def load_datasets(data_dir_list: Union[List[str], str], concatenate: bool = True,
+                  extra_columns: Optional[tuple[str, ...]] = None):
     """
     Load retrieval datasets from JSON/JSONL files.
 
@@ -111,6 +112,10 @@ def load_datasets(data_dir_list: Union[List[str], str], concatenate: bool = True
 
     Returns:
         Tuple of (dataset, corpus_dict)
+
+    Columns named in *extra_columns* are carried through verbatim; every other key
+    outside the normalized set is dropped. Absent values become None so the column
+    stays present on every row.
     """
     if not isinstance(data_dir_list, list):
         data_dir_list = [data_dir_list]
@@ -169,6 +174,8 @@ def load_datasets(data_dir_list: Union[List[str], str], concatenate: bool = True
                 "pos_doc": [_normalize_inline_doc(d) for d in pos_docs_raw],
                 "neg_doc": [_normalize_inline_doc(d) for d in _coerce_to_list(item.get("neg_doc"))],
             }
+            for column in extra_columns or ():
+                normalized_item[column] = item.get(column)
             normalized_data.append(normalized_item)
 
         datasets.append(Dataset.from_list(normalized_data))
@@ -432,6 +439,140 @@ def make_retrieval_dataset(
     return dataset
 
 
+def _flatten_context_columns(data: dict, context_columns: tuple[str, ...]) -> dict:
+    """Flatten a bi-encoder batch and repeat the extra per-query columns per document.
+
+    ``flatten_bi_encoder_to_cross_encoder`` returns a fixed set of keys, so any column
+    beyond question/doc_text is dropped. Context fields are per-query, so they repeat
+    exactly like the question does.
+    """
+    flattened = flatten_bi_encoder_to_cross_encoder(data)
+    docs_per_query = [len(group) for group in data["doc_image"]]
+    for column in context_columns:
+        values = data.get(column)
+        if values is None:
+            continue
+        flattened[column] = [v for v, n in zip(values, docs_per_query) for _ in range(n)]
+    return flattened
+
+
+def _group_aware_split(dataset, validation_fraction: float, group_key: str | None,
+                       data_type: str, seed: int):
+    """Carve a deterministic held-out slice, keeping rows that share a group together.
+
+    Splitting on rows alone leaks when one query contributes several rows -- a mixed
+    dataset holding two labelings of the same query is the case that motivated this.
+    Grouping on ``group_key`` puts every row of a group on the same side.
+    """
+    import random
+
+    if group_key is None:
+        groups = list(range(len(dataset)))
+        row_groups = groups
+    else:
+        row_groups = dataset[group_key]
+        groups = sorted(set(row_groups))
+
+    shuffled = list(groups)
+    random.Random(seed).shuffle(shuffled)
+    n_val = int(round(len(shuffled) * validation_fraction))
+    val_groups = set(shuffled[len(shuffled) - n_val:]) if n_val else set()
+
+    keep_val = data_type in ("validation", "eval")
+    indices = [i for i, g in enumerate(row_groups) if (g in val_groups) == keep_val]
+    logging.info(
+        "group-aware split on %r: %d groups -> %d validation, %d rows selected for %s",
+        group_key, len(groups), len(val_groups), len(indices), data_type,
+    )
+    return dataset.select(indices)
+
+
+def make_context_aware_retrieval_dataset(
+    data_dir_list: Union[List[str], str],
+    model_type: str = "cross_encoder",
+    data_type: str = "train",
+    n_passages: int = 8,
+    validation_fraction: float = 0.0,
+    validation_group_key: Optional[str] = None,
+    reasoning_column: Optional[str] = None,
+    global_query_column: Optional[str] = None,
+    seed: int = 42,
+    do_shuffle: bool = False,
+    max_train_samples: Optional[int] = None,
+    train_data_select_offset: int = 0,
+):
+    """Inline retrieval dataset that also carries per-query context columns.
+
+    Same ``pos_doc``/``neg_doc`` schema and loader as :func:`make_retrieval_dataset`,
+    plus two things it does not provide:
+
+    * ``reasoning_column`` / ``global_query_column`` are passed through as ``reasoning``
+      and ``global_query``. ``Qwen3RerankerCollator`` reads both with ``.get()`` and
+      selects its prompt mode from whichever survive its drop probabilities, so rows
+      missing them simply train in a narrower mode.
+    * ``validation_fraction`` carves a held-out slice at the level of
+      ``validation_group_key`` rather than the row, so rows sharing a group cannot land
+      on opposite sides.
+
+    Args:
+        data_dir_list: Path(s) to inline JSON/JSONL with ``query``/``pos_doc``/``neg_doc``.
+        model_type: ``"cross_encoder"`` or ``"bi_encoder"``.
+        data_type: ``"train"``, or ``"validation"``/``"eval"`` for the held-out side.
+        n_passages: Passages per query (1 positive + ``n_passages - 1`` negatives).
+        validation_fraction: Fraction of groups held out. 0 uses the whole split.
+        validation_group_key: Column defining a group; None groups by row.
+        reasoning_column: Column holding the reasoning trace.
+        global_query_column: Column holding the originating question.
+        seed: Seeds the split and any shuffle.
+        do_shuffle: Shuffle before subsetting (train only).
+        max_train_samples: Cap on training rows, applied after the split.
+        train_data_select_offset: Offset of the selected window.
+
+    Returns:
+        A ``Dataset`` whose transform emits question/doc_text plus the context columns.
+    """
+    _VALID_MODEL_TYPES = ("bi_encoder", "cross_encoder")
+    if model_type not in _VALID_MODEL_TYPES:
+        raise ValueError(f"model_type must be one of {_VALID_MODEL_TYPES}, got {model_type!r}")
+    if data_type not in ("train", "validation", "eval"):
+        raise ValueError(f"Invalid data type: {data_type}")
+
+    requested = tuple(
+        c for c in (reasoning_column, global_query_column, validation_group_key) if c
+    )
+    dataset, corpus_dict = load_datasets(data_dir_list, concatenate=True, extra_columns=requested)
+    logging.info(f"Loaded dataset with {len(dataset)} examples")
+
+    if validation_fraction > 0:
+        dataset = _group_aware_split(dataset, validation_fraction, validation_group_key, data_type, seed)
+
+    if data_type == "train":
+        if do_shuffle:
+            dataset = dataset.shuffle(seed=seed)
+        if max_train_samples is not None:
+            dataset = dataset.select(
+                range(train_data_select_offset, min(train_data_select_offset + max_train_samples, len(dataset)))
+            )
+
+    context_columns = tuple(
+        c for c in ((reasoning_column, "reasoning"), (global_query_column, "global_query")) if c[0]
+    )
+    negative_size = n_passages - 1
+
+    def transform(examples):
+        data = _retrieval_transform_func(examples, negative_size, corpus_dict)
+        for source, target in context_columns:
+            if source in examples:
+                data[target] = examples[source]
+        if model_type == "bi_encoder":
+            return data
+        return _flatten_context_columns(data, tuple(t for _, t in context_columns))
+
+    dataset.set_transform(transform)
+    logging.info(f"Created {data_type} dataset with {len(dataset)} examples")
+    return dataset
+
+
 @dataclass
 class InlineRetrievalDatasetConfig:
     """Construction-time configuration for inline retrieval datasets."""
@@ -460,4 +601,39 @@ class InlineRetrievalDatasetConfig:
             max_train_samples=self.max_train_samples,
             train_data_select_offset=self.train_data_select_offset,
             use_dataset_instruction=self.use_dataset_instruction,
+        )
+
+
+@dataclass
+class ContextAwareRetrievalDatasetConfig:
+    """Construction-time configuration for context-aware inline retrieval datasets."""
+
+    data_dir_list: list[str] | str
+    model_type: str = "cross_encoder"
+    data_type: str = "train"
+    n_passages: int = 8
+    validation_fraction: float = 0.0
+    validation_group_key: str | None = None
+    reasoning_column: str | None = None
+    global_query_column: str | None = None
+    seed: int = 42
+    do_shuffle: bool = False
+    max_train_samples: int | None = None
+    train_data_select_offset: int = 0
+
+    def build(self) -> Dataset:
+        """Build the context-aware retrieval dataset from this config."""
+        return make_context_aware_retrieval_dataset(
+            data_dir_list=self.data_dir_list,
+            model_type=self.model_type,
+            data_type=self.data_type,
+            n_passages=self.n_passages,
+            validation_fraction=self.validation_fraction,
+            validation_group_key=self.validation_group_key,
+            reasoning_column=self.reasoning_column,
+            global_query_column=self.global_query_column,
+            seed=self.seed,
+            do_shuffle=self.do_shuffle,
+            max_train_samples=self.max_train_samples,
+            train_data_select_offset=self.train_data_select_offset,
         )

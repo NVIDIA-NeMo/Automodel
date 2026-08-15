@@ -1,0 +1,142 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Qwen3-Reranker-4B on AgentIR/DR-Synth, listwise: 1 positive + 7 hard negatives per query,
+# scored as one softmax per group.
+#
+# The data is the released AgentIR set converted by care/dataset/agentir_to_inline.py, which
+# splits the merged "Reasoning: ... Query: ..." field into separate reasoning/query columns
+# and renames the passages to pos_doc/neg_doc.
+#
+#   automodel examples/retrieval/cross_encoder/qwen3_4b_reranker_agentir.yaml --nproc-per-node 8
+
+recipe: TrainCrossEncoderRecipe
+
+seed: 42
+
+# Divides the listwise logits before cross-entropy. It belongs to the training objective,
+# not to the model, so it lives here and never reaches the checkpoint.
+temperature: 0.1
+
+step_scheduler:
+  global_batch_size: 32
+  local_batch_size: 1
+  ckpt_every_steps: 40
+  val_every_steps: 40
+  num_epochs: 2
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 10
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelCrossEncoder.from_pretrained
+  pretrained_model_name_or_path: Qwen/Qwen3-Reranker-4B
+  use_liger_kernel: true
+  use_sdpa_patching: true
+  torch_dtype: bfloat16
+
+tokenizer:
+  _target_: nemo_automodel.NeMoAutoTokenizer.from_pretrained
+  pretrained_model_name_or_path: Qwen/Qwen3-Reranker-4B
+  add_eos_token: false
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.retrieval_dataset_inline.ContextAwareRetrievalDatasetConfig
+  data_dir_list: ./data/agentir_inline.jsonl
+  model_type: cross_encoder
+  n_passages: 8
+  data_type: train
+  # Held out by group so every row of a query lands on one side.
+  validation_fraction: 0.1
+  validation_group_key: query_id
+  reasoning_column: reasoning
+  do_shuffle: true
+  seed: 42
+
+dataloader:
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.llm.ContextAwareRerankerCollator
+    rerank_max_length: 5120
+    sub_query_max_length: 256
+    reasoning_max_length: 512
+    pad_to_multiple_of: 8
+    # Each context field is dropped independently per query, so one model covers the
+    # base and reasoning prompt modes.
+    reasoning_drop_prob: 0.5
+    drop_seed: 42
+  shuffle: true
+  num_workers: 0
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.llm.retrieval_dataset_inline.ContextAwareRetrievalDatasetConfig
+  data_dir_list: ./data/agentir_inline.jsonl
+  model_type: cross_encoder
+  n_passages: 8
+  data_type: validation
+  validation_fraction: 0.1
+  validation_group_key: query_id
+  reasoning_column: reasoning
+  seed: 42
+
+validation_dataloader:
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.llm.ContextAwareRerankerCollator
+    rerank_max_length: 5120
+    sub_query_max_length: 256
+    reasoning_max_length: 512
+    pad_to_multiple_of: 8
+    # Fixed prompt mix at eval: a val_loss that moved because the mix changed would be
+    # indistinguishable from one that moved because the model did.
+    reasoning_drop_prob: 0.0
+    drop_seed: 42
+  batch_size: 2
+  shuffle: false
+  num_workers: 0
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 5.0e-6
+  weight_decay: 0.01
+
+lr_scheduler:
+  lr_warmup_steps: 20
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: ./output/qwen3_4b_reranker_agentir/checkpoints
+  model_save_format: safetensors
+  save_consolidated: final
+
+distributed:
+  strategy: fsdp2
+  dp_size: none
+  tp_size: 1
+  cp_size: 1
+  sequence_parallel: false
+  activation_checkpointing: true
+
+wandb:
+  project: qwen3-reranker
+  name: qwen3_4b_reranker_agentir
+  dir: ./output/qwen3_4b_reranker_agentir/wandb
+  # A stable id plus resume: allow keeps every autoresume chunk attached to one run;
+  # without them each chunk calls wandb.init() fresh and the curve arrives split.
+  id: qwen3_4b_reranker_agentir
+  resume: allow
+
+ci:
+  recipe_owner: ssharifymogh
+  time: "08:00:00"
+  nodes: 1
