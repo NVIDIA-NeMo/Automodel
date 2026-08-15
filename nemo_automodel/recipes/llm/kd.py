@@ -51,18 +51,20 @@ from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.distributed.config import DistributedSetup
-from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
+from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
 from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
 from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.loss.utils import calculate_loss
 from nemo_automodel.components.optim.precision_warnings import resolve_storage_dtype
+from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
 from nemo_automodel.components.training.rng import ScopedRNG
 from nemo_automodel.components.training.signal_handler import DistributedSignalHandler
 from nemo_automodel.components.training.utils import (
     ScopedModuleOffloading,
     count_tail_padding,
+    get_expert_tp_replication_factor,
     prepare_after_first_microbatch,
     prepare_for_final_backward,
     prepare_for_grad_accumulation,
@@ -78,9 +80,6 @@ from nemo_automodel.recipes.kd_utils import (
 )
 from nemo_automodel.recipes.llm.train_ft import (
     TrainFinetuneRecipeForNextTokenPrediction,
-    _get_num_thd_chunks,
-    _uses_te_dot_product_attention,
-    _uses_thd_collater,
     build_model,
 )
 
@@ -502,15 +501,17 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         """
         batch = self.kd_mesh_bridge.move_to_device(batch)
         sequence_length = batch["labels"].shape[1]
-        train_ctx, batch = make_cp_batch_and_ctx(
+        cp_sharder = ContextParallelSharder(
+            self.teacher_model,
             self.device_mesh,
             batch,
-            use_te=False,
         )
+        train_ctx, batch = cp_sharder.shard(batch)
         labels = batch.pop("labels")
         with train_ctx(), torch.no_grad():
             if self.pp_enabled:
                 input_ids = batch.pop("input_ids")
+                self.teacher_pp.update_seq_len(input_ids.shape[1])
                 batch_filtered = {
                     key: value
                     for key, value in batch.items()
@@ -603,15 +604,17 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         if separate_teacher_logits is not None:
             batch["teacher_logits"] = separate_teacher_logits
         labels = batch.pop("labels")
-        if separate_teacher_logits is not None:
-            train_ctx, batch = make_cp_batch_and_ctx(
-                self.device_mesh,
-                batch,
-                labels,
-                extra_seq_buffers={"teacher_logits": 1},
-            )
-        else:
-            train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch, labels)
+        # KD has not wired model-owned CP; skip the pre-embed hook explicitly.
+        # Separate-mesh teacher logits ride the batch through CP sharding.
+        cp_sharder = ContextParallelSharder(
+            self.model_parts[0],
+            self.device_mesh,
+            batch,
+            loss_mask=labels,
+            invoke_pre_embed=False,
+            extra_seq_buffers={"teacher_logits": 1} if separate_teacher_logits is not None else None,
+        )
+        train_ctx, batch = cp_sharder.shard(batch)
         separate_teacher_logits = batch.pop("teacher_logits", None)
 
         model = self.model_parts[0]
@@ -639,11 +642,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
 
             # Student forward.
             student_batch = filter_forward_kwargs(model, batch)
-            student_keep_last = isinstance(self.loss_fn, FusedLinearCrossEntropy)
-            if student_keep_last:
-                student_out = model(logits_to_keep=1, **student_batch)
-            else:
-                student_out = model(**student_batch)
+            student_out = model(**student_batch)
 
             student_logits = getattr(student_out, "logits", student_out)  # shape (B, S, V)
             if separate_teacher_logits is not None:
@@ -658,8 +657,9 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                     logits=student_logits,
                     labels=labels,
                     model=model,
-                    hidden_states=student_out.hidden_states[-1] if "hidden_states" in student_out else None,
+                    hidden_states=get_final_hidden_states(student_out),
                     num_label_tokens=num_label_tokens,
+                    grad_reduce_group=self._get_dp_group(include_cp=True) if is_train else None,
                 )
 
             # Reminder: kd_loss is normalized by num_label_tokens, which is typically
@@ -718,14 +718,17 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         }
         if separate_teacher_logits is not None:
             batch["teacher_logits"] = separate_teacher_logits
-        cp_kwargs = {
-            "use_te": _uses_te_dot_product_attention(self.cfg.model) and _uses_thd_collater(self.cfg.dataloader),
-            "padding_token_id": self.tokenizer.pad_token_id if self.tokenizer else 0,
-            "num_chunks": _get_num_thd_chunks(True, self.cfg),
-        }
-        if separate_teacher_logits is not None:
-            cp_kwargs["extra_seq_buffers"] = {"teacher_logits": 1}
-        train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch, **cp_kwargs)
+        # KD has not wired model-owned CP; skip the pre-embed hook explicitly.
+        cp_sharder = ContextParallelSharder(
+            self.model_parts[0],
+            self.device_mesh,
+            batch,
+            padding_token_id=self.tokenizer.pad_token_id if self.tokenizer else 0,
+            num_chunks=self.pp.pp_batch_size // self.pp.pp_microbatch_size,
+            invoke_pre_embed=False,
+            extra_seq_buffers={"teacher_logits": 1} if separate_teacher_logits is not None else None,
+        )
+        train_ctx, batch = cp_sharder.shard(batch)
         separate_teacher_logits = batch.pop("teacher_logits", None)
         labels = batch.pop("labels")
         input_ids = batch.pop("input_ids")
@@ -793,6 +796,8 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         )
         num_label_tokens = self._dp_allreduce(num_label_tokens).item()
         loss_buffer = []
+        num_batches = len(batches)
+        self._set_moe_aux_loss_backward_scale(num_batches=num_batches, num_label_tokens=num_label_tokens)
 
         # number of tokens in the batch, excluding any tail padding.
         num_tokens_in_batch = torch.tensor(
@@ -800,7 +805,6 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             dtype=torch.long,
         )
         num_tokens_in_batch = self._dp_allreduce(num_tokens_in_batch).item()
-        num_batches = len(batches)
         for i, batch in enumerate(batches):
             local_loss, kd_loss, ce_loss = self._forward_backward_step(
                 i, batch, num_label_tokens=num_label_tokens, num_batches=num_batches
@@ -809,19 +813,20 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             self._ce_loss_buffer.append(ce_loss)
             self._kd_loss_buffer.append(kd_loss)
 
-        grad_norm = 0
-        # Clip gradients **after** any rescaling.
-        # TODO(@boxiangw): Fix TP gradient clipping
-        if max_grad_norm is not None:
-            if not self.device_mesh or self.device_mesh["tp"].size() == 1:
-                grad_norm = torch.nn.utils.clip_grad_norm_(
-                    [p for p in self.model_parts[0].parameters() if p.requires_grad], max_grad_norm
-                )
-                if hasattr(grad_norm, "full_tensor"):
-                    grad_norm = grad_norm.full_tensor()  # collect the summed grad norm across ranks
-
-            if isinstance(grad_norm, torch.Tensor):
-                grad_norm = grad_norm.item()
+        grad_norm = scale_grads_and_clip_grad_norm(
+            max_grad_norm,
+            self.model_parts,
+            norm_type=2.0,
+            pp_enabled=False,
+            device_mesh=self.device_mesh,
+            moe_mesh=self.moe_mesh,
+            ep_axis_name="ep" if self.moe_mesh is not None and "ep" in self.moe_mesh.mesh_dim_names else None,
+            pp_axis_name=None,
+            foreach=True,
+            num_label_tokens=num_label_tokens,
+            dp_group_size=self._get_dp_group_size(include_cp=True),
+            expert_tp_replication_factor=get_expert_tp_replication_factor(self.model_parts, self.device_mesh),
+        )
 
         self.checkpointer.maybe_wait_for_staging()
         for opt in self.optimizer:
@@ -889,6 +894,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         )
         num_tokens_in_batch = self._dp_allreduce(num_tokens_in_batch).item()
         num_batches = len(batches)
+        self._set_moe_aux_loss_backward_scale(num_batches=num_batches, num_label_tokens=num_label_tokens)
 
         prepare_for_grad_accumulation(self.model_parts, pp_enabled=True)
 
@@ -917,6 +923,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             foreach=True,
             num_label_tokens=num_label_tokens,
             dp_group_size=self._get_dp_group_size(include_cp=True),
+            expert_tp_replication_factor=get_expert_tp_replication_factor(self.model_parts, self.device_mesh),
         )
 
         self.checkpointer.maybe_wait_for_staging()

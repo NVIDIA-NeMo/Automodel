@@ -513,7 +513,7 @@ def _run_thd_te_qwen_deepseek(model_type, config, rank, world_size, device, attn
         dist.broadcast(param_with_cp.data, src=0)
 
     # Create packed sequence batch
-    from nemo_automodel.components.distributed.cp_utils import make_cp_batch_for_te
+    from nemo_automodel.components.distributed.context_parallel.utils import make_cp_batch_for_te
 
     batch_size = 4
     seq_lens_per_batch = [[32], [40], [36], [44]]

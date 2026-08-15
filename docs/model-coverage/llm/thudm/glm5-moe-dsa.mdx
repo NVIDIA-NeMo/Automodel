@@ -1,8 +1,9 @@
 ---
 title: "GLM-5 / GLM-5.1 / GLM-5.2 (MoE + DSA)"
 description: ""
+slug: model-coverage/large-language-models/thudm/glm-5-moe-dsa
 ---
-[GLM-5](https://huggingface.co/zai-org/GLM-5), [GLM-5.1](https://huggingface.co/zai-org/GLM-5.1), and [GLM-5.2](https://huggingface.co/zai-org/GLM-5.2) are Zhipu AI's open-source large Mixture-of-Experts models featuring a DeepSeek-style MLA (Multi-head Latent Attention) + DSA (Dynamic Sparse Attention) architecture. GLM-5.2 uses the same `glm_moe_dsa` AutoModel architecture with IndexShare DSA support, optional TileLang sparse kernels, packed-sequence training, and context-parallel long-context recipes.
+[GLM-5](https://huggingface.co/zai-org/GLM-5), [GLM-5.1](https://huggingface.co/zai-org/GLM-5.1), and [GLM-5.2](https://huggingface.co/zai-org/GLM-5.2) are Zhipu AI's open-source large Mixture-of-Experts models featuring a DeepSeek-style MLA (Multi-head Latent Attention) + DSA (Dynamic Sparse Attention) architecture. GLM-5.2 uses the same `glm_moe_dsa` AutoModel architecture with IndexShare DSA support, optional TileLang or cuDNN sparse kernels, packed-sequence training, and context-parallel long-context recipes.
 
 <Info>
 
@@ -20,6 +21,7 @@ description: ""
 - **Mixture of Experts (MoE)** with DeepSeek-style MLA and sparse DSA attention
 - **IndexShare DSA for GLM-5.2**: shared DSA layers reuse the previous full layer's top-k sparse attention selection, including pipeline-parallel carry support
 - **Optional TileLang kernels** for GLM-5.2 DSA indexer and sparse MLA paths through `backend.attn: tilelang`
+- **Optional cuDNN DSA indexer and FlashMLA sparse attention** on SM90+ GPUs through `backend.attn: cudnn`
 - **Packed-sequence and context-parallel recipes** for 4K and 32K Tulu3-style SFT runs
 - **Large-scale parallelism** with FSDP2, Expert Parallelism, Pipeline Parallelism, and optional Context Parallelism
 
@@ -27,7 +29,7 @@ description: ""
 
 - **GLM-5** (`GlmMoeDsaForCausalLM`)
 - **GLM-5.1** (`GlmMoeDsaForCausalLM`): updated weights
-- **GLM-5.2** (`GlmMoeDsaForCausalLM`): IndexShare DSA, TileLang sparse-kernel recipes, and long-context CP coverage
+- **GLM-5.2** (`GlmMoeDsaForCausalLM`): IndexShare DSA, TileLang and cuDNN sparse kernels, and long-context CP coverage
 
 ## Example HF Models
 
@@ -80,11 +82,11 @@ distributed:
 model:
   pretrained_model_name_or_path: zai-org/GLM-5.2
   backend:
-    attn: tilelang
+    attn: tilelang  # Use cudnn for the cuDNN DSA + FlashMLA path.
     linear: torch
     rms_norm: torch_fp32
     rope_fusion: false
-    enable_deepep: true
+    dispatcher: hybridep
     gate_precision: float32
 ```
 
@@ -96,6 +98,17 @@ model:
 git clone https://github.com/NVIDIA-NeMo/Automodel.git
 cd Automodel
 uv sync --locked --all-groups --all-extras
+```
+
+The cuDNN backend additionally requires FlashMLA's `flash_mla_sparse_fwd`, which is not
+published as a complete source distribution on PyPI. Install the tested revision with its
+submodules before selecting `backend.attn: cudnn`:
+
+```bash
+git clone --recursive https://github.com/deepseek-ai/FlashMLA.git /tmp/FlashMLA
+git -C /tmp/FlashMLA checkout b7643bd54521f563b839b98289b5cd048c062ba2
+git -C /tmp/FlashMLA submodule update --init --recursive
+uv pip install --no-build-isolation /tmp/FlashMLA
 ```
 
 <Note>

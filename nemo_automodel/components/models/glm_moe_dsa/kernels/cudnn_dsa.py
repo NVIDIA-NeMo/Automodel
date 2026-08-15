@@ -49,7 +49,28 @@ _TOPK_ROW_ALIGNMENT = 512
 
 @dataclass(frozen=True)
 class CudnnDsaPackedMetadata:
-    """Reusable THD metadata for local-query/global-key cuDNN DSA."""
+    """Reusable THD metadata for local-query/global-key cuDNN DSA.
+
+    Attributes:
+        starts: Global padded-storage start of each query's document, int32
+            ``[T_q]``.
+        causal_lengths: Number of real document keys visible to each query, int32
+            ``[T_q]``.
+        query_valid: Boolean ``[T_q]`` mask for real, non-padding query rows.
+        valid_row_indices: Optional int64 indices of valid queries, ``[T_valid]``;
+            ``None`` when every query is valid.
+        segment_cu_q: Local query-segment offsets, int32 ``[segments + 1]``.
+        segment_cu_k: Repacked key-prefix segment offsets, int32
+            ``[segments + 1]``.
+        q_causal_offsets: Uncompressed document-relative position of each segment's
+            first local query, int32 ``[segments]``.
+        key_source_indices: Optional int64 ``[segmented_key_tokens]`` indices into
+            the gathered padded-storage K/V tensor.
+        max_seqlen_q: Maximum local query-segment length.
+        max_seqlen_k: Maximum repacked key-prefix segment length.
+        total_key_tokens: Number of rows in the gathered padded-storage K/V tensor.
+        all_rows_nonempty: Whether every query row has at least one valid key.
+    """
 
     starts: torch.Tensor
     causal_lengths: torch.Tensor
@@ -57,6 +78,7 @@ class CudnnDsaPackedMetadata:
     valid_row_indices: torch.Tensor | None
     segment_cu_q: torch.Tensor
     segment_cu_k: torch.Tensor
+    q_causal_offsets: torch.Tensor
     key_source_indices: torch.Tensor | None
     max_seqlen_q: int
     max_seqlen_k: int
@@ -110,21 +132,25 @@ def prepare_cudnn_dsa_packed_metadata(
     """Build segmented THD metadata for local queries and gathered global keys.
 
     Args:
-        cu_seqlens: Cumulative real sequence lengths, int32 ``[sequences + 1]``.
+        cu_seqlens: Cumulative compact real-token lengths, int32 tensor of shape
+            ``[sequences + 1]``.
         total_key_tokens: Number of tokens in the gathered, padded THD key tensor.
         max_seqlen: Optional precomputed maximum sequence length as a Python integer or
             scalar integer tensor. Its value is checked against ``cu_seqlens``.
-        query_indices: Optional contiguous global padded-token coordinates for the local
-            query rows. When absent, queries cover all global key tokens (CP=1).
-        cu_seqlens_padded: Optional cumulative padded layout boundaries. When absent,
-            the real boundaries in ``cu_seqlens`` are also the storage boundaries.
-        padding_mask: Optional local boolean padding mask ``[T_q]``. This remains
-            authoritative when THD preprocessing has absorbed trailing pack padding
-            into ``cu_seqlens``.
+        query_indices: Optional contiguous integer tensor of shape ``[T_q]`` with
+            global padded-storage coordinates for the local query rows. When absent,
+            queries cover all global key tokens (CP=1).
+        cu_seqlens_padded: Optional cumulative padded-storage boundaries, int32 tensor
+            of shape ``[sequences + 1]``. When absent, ``cu_seqlens`` also defines
+            storage coordinates.
+        padding_mask: Optional local boolean padding mask of shape ``[T_q]``. This
+            remains authoritative when THD preprocessing has absorbed trailing pack
+            padding into ``cu_seqlens``.
 
     Returns:
-        Cached global starts and real causal lengths per query, positive-length cuDNN
-        Q/K segments, optional indices that repack gathered K prefixes, and maxima.
+        Metadata with per-query global padded-storage starts and real causal lengths,
+        positive-length local-Q/global-K segments, each segment's first-query causal
+        offset, and optional gathered-key source indices.
 
     This validation intentionally performs one device-to-host synchronization. The model
     prepares the object once per pipeline stage and reuses it across every indexer and
@@ -173,14 +199,15 @@ def prepare_cudnn_dsa_packed_metadata(
 
     # AutoModel CP keeps one contiguous interval of global padded-token rows per rank.
     # Filter non-intersecting documents, then pair each local Q segment with that
-    # document's K prefix. The unequal Q/K lengths give cuDNN the required bottom-right
-    # causal alignment without a per-query causal-offset API.
+    # document's K prefix. cuDNN Frontend 1.27+ requires the first local query's
+    # document-relative position explicitly for rectangular Q/K segments.
     document_ids = torch.searchsorted(layout_cu, global_queries, right=True).sub(1)
     safe_document_ids = document_ids.clamp(0, real_lengths.numel() - 1).to(torch.long)
     segment_documents, query_counts = torch.unique_consecutive(safe_document_ids, return_counts=True)
     segment_cu_q64 = torch.nn.functional.pad(query_counts.cumsum(0), (1, 0))
     segment_query_starts = global_queries.index_select(0, segment_cu_q64[:-1])
     segment_document_starts = layout_cu.to(torch.int64).index_select(0, segment_documents)
+    q_causal_offsets64 = segment_query_starts - segment_document_starts
     key_counts = segment_query_starts + query_counts - segment_document_starts
     segment_cu_k64 = torch.nn.functional.pad(key_counts.cumsum(0), (1, 0))
     starts64 = layout_cu.to(torch.int64).index_select(0, safe_document_ids)
@@ -296,6 +323,7 @@ def prepare_cudnn_dsa_packed_metadata(
         valid_row_indices=valid_row_indices,
         segment_cu_q=segment_cu_q64.to(torch.int32).contiguous(),
         segment_cu_k=segment_cu_k64.to(torch.int32).contiguous(),
+        q_causal_offsets=q_causal_offsets64.to(torch.int32).contiguous(),
         key_source_indices=key_source_indices.contiguous() if key_source_indices is not None else None,
         max_seqlen_q=max_query_count,
         max_seqlen_k=max_key_count,
@@ -311,7 +339,18 @@ def _unpack_packed_metadata(
     total_key_tokens: int,
     device: torch.device,
 ) -> CudnnDsaPackedMetadata:
-    """Validate reusable packed metadata without synchronizing CUDA values to the host."""
+    """Validate reusable packed metadata without a CUDA-to-host synchronization.
+
+    Args:
+        packed_metadata: Metadata whose per-query fields have shape ``[T_q]`` and
+            whose key-source indices address the gathered padded-storage K/V tensor.
+        total_query_tokens: Expected local query row count ``T_q``.
+        total_key_tokens: Expected gathered padded-storage K/V row count ``T_k``.
+        device: CUDA device shared by the metadata and kernel inputs.
+
+    Returns:
+        The validated metadata object, unchanged.
+    """
     if not isinstance(packed_metadata, CudnnDsaPackedMetadata):
         raise TypeError("packed_metadata must be a CudnnDsaPackedMetadata object.")
     expected_shape = (total_query_tokens,)
@@ -355,6 +394,15 @@ def _unpack_packed_metadata(
             raise ValueError(f"packed {name} must be contiguous.")
     if packed_metadata.segment_cu_q.shape != packed_metadata.segment_cu_k.shape:
         raise ValueError("packed segment_cu_q and segment_cu_k must have the same shape.")
+    q_causal_offsets = packed_metadata.q_causal_offsets
+    expected_offsets_shape = (packed_metadata.segment_cu_q.numel() - 1,)
+    if (
+        q_causal_offsets.shape != expected_offsets_shape
+        or q_causal_offsets.dtype != torch.int32
+        or q_causal_offsets.device != device
+        or not q_causal_offsets.is_contiguous()
+    ):
+        raise ValueError(f"packed q_causal_offsets must be contiguous int32 {expected_offsets_shape} on {device}.")
     if packed_metadata.total_key_tokens != total_key_tokens:
         raise ValueError(f"packed total_key_tokens must be {total_key_tokens}, got {packed_metadata.total_key_tokens}.")
     if packed_metadata.max_seqlen_q <= 0 or packed_metadata.max_seqlen_k <= 0:
@@ -438,7 +486,7 @@ def cudnn_indexer_topk(
             and synchronizing the same metadata in every full-indexer layer.
 
     Returns:
-        CUDA int32 top-k indices in global compact-THD coordinates,
+        CUDA int32 top-k indices in global padded-storage THD coordinates,
         ``[T, 1, K]``. Each row contains an ascending, compact valid prefix and
         a ``-1`` suffix, and the tensor is contiguous.
 
@@ -496,6 +544,7 @@ def cudnn_indexer_topk(
         cu_seqlens_k=packed_metadata.segment_cu_k,
         max_seqlen_q=packed_metadata.max_seqlen_q,
         max_seqlen_k=packed_metadata.max_seqlen_k,
+        q_causal_offsets=packed_metadata.q_causal_offsets,
     )["scores"]
     actual_topk = min(index_topk, packed_metadata.max_seqlen_k)
     if actual_topk == packed_metadata.max_seqlen_k:
@@ -560,7 +609,24 @@ class _CudnnSparseAttention(torch.autograd.Function):
         all_rows_nonempty: bool,
         valid_row_indices: torch.Tensor | None,
     ) -> torch.Tensor:
-        """Produce latent values ``[T_q, H, 512]`` from Q/KV and ``[T_q, 1, K]`` indices."""
+        """Run FlashMLA forward and save tensors required by cuDNN backward.
+
+        Args:
+            ctx: Autograd context used to save forward tensors and scalar metadata.
+            q: CUDA BF16 query tensor of shape ``[T_q, H, 576]``.
+            kv_latent: CUDA BF16 gathered K/V tensor of shape ``[T_k, 1, 576]``.
+            topk_indices: CUDA int32 tensor of shape ``[T_q, 1, K]`` containing
+                global padded-storage K/V coordinates and a ``-1`` suffix.
+            softmax_scale: Scale applied to query-key scores.
+            padded_heads: FlashMLA-compatible padded head count.
+            topk_length: Optional int32 valid-prefix lengths of shape ``[T_q]``.
+            all_rows_nonempty: Whether every query has a positive valid prefix.
+            valid_row_indices: Optional int64 indices of nonempty queries with shape
+                ``[T_valid]``.
+
+        Returns:
+            CUDA BF16 latent values of shape ``[T_q, H, 512]``.
+        """
         kv = kv_latent.squeeze(1).contiguous()
         if topk_length is None:
             indices, topk_length = _compact_and_sort_indices(topk_indices.squeeze(1), kv.shape[0])
@@ -600,7 +666,17 @@ class _CudnnSparseAttention(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
-        """Map output gradients ``[T_q, H, 512]`` to Q and latent KV layouts."""
+        """Map output gradients to query and gathered latent-KV layouts.
+
+        Args:
+            ctx: Autograd context populated by :meth:`forward`.
+            grad_output: CUDA BF16 output gradient of shape ``[T_q, H, 512]``.
+
+        Returns:
+            Gradients for the eight forward inputs: query ``[T_q, H, 576]``,
+            gathered latent K/V ``[T_k, 1, 576]``, then ``None`` for the index
+            and metadata inputs.
+        """
         q, kv, out, lse, attn_sink, indices, topk_length, cached_valid_rows = ctx.saved_tensors
         valid_row_indices = None
         if not ctx.all_rows_nonempty:
@@ -683,7 +759,7 @@ def cudnn_sparse_attention(
         q: Absorbed MLA query, CUDA BF16 THD ``[T_q, H, 576]``. The final
             dimension is ``kv_lora_rank + qk_rope_head_dim`` (``512 + 64``).
         kv_latent: Shared latent key/value, CUDA BF16 THD ``[T_kv, 1, 576]``.
-        topk_indices: Global flattened-KV indices, CUDA int32
+        topk_indices: Global padded-storage K/V indices, CUDA int32
             ``[T_q, 1, K]`` with ``-1`` for invalid slots.
         softmax_scale: Already-computed MLA attention scale. It is forwarded
             unchanged to both FlashMLA and cuDNN backward.

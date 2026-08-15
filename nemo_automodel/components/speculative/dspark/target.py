@@ -74,7 +74,7 @@ class HFDSparkTargetModel:
         self.cp_mesh = cp_mesh
         self._cp_size = cp_mesh.size() if cp_mesh is not None else 1
         if self._cp_size > 1:
-            from nemo_automodel.components.distributed.cp_utils import attach_context_parallel_hooks
+            from nemo_automodel.components.distributed.context_parallel.utils import attach_context_parallel_hooks
             from nemo_automodel.components.speculative.target_cp import attach_cp_kv_gather_hooks
 
             # Strip the 4D mask (self_attn then calls SDPA on the local shard), and

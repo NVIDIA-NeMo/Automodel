@@ -54,6 +54,7 @@ from torch.distributed.tensor import DTensor
 from nemo_automodel.components.optim.dion import build_dion_optimizer, is_dion_optimizer
 from nemo_automodel.components.optim.precision_warnings import warn_if_torch_adam_with_bf16_params
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
+from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 from nemo_automodel.shared.utils import dtype_from_str
 
 if TYPE_CHECKING:
@@ -141,7 +142,8 @@ def _build_param_groups(
     compiled = [re.compile(override.pattern) for override in overrides]
     default_params: list[torch.nn.Parameter] = []
     matched_params: list[list[torch.nn.Parameter]] = [[] for _ in overrides]
-    for name, param in named_params:
+    for raw_name, param in named_params:
+        name = canonical_parameter_fqn(raw_name)
         for idx, regex in enumerate(compiled):
             if regex.search(name):
                 matched_params[idx].append(param)
@@ -598,6 +600,14 @@ class LRSchedulerConfig:
         Returns:
             One :class:`OptimizerParamScheduler` per optimizer.
         """
+        # The removed diffusion-only LR builder accepted a float in (0, 1) as a
+        # fraction of total steps; here it would silently disable warmup (warmup
+        # ends before step 1), so reject it explicitly.
+        if self.lr_warmup_steps is not None and 0 < self.lr_warmup_steps < 1:
+            raise ValueError(
+                f"lr_warmup_steps must be an integer step count, got {self.lr_warmup_steps!r}. "
+                "Fractional warmup is not supported; set the number of warmup steps directly."
+            )
         # ``epoch_len`` is already expressed in optimizer steps (StepScheduler computes it as
         # ``ceil(len(dataloader) / grad_acc_steps)``) and is ``None`` for iterable/streaming
         # dataloaders, where ``len()`` is undefined.  Never call ``len(dataloader)`` here.

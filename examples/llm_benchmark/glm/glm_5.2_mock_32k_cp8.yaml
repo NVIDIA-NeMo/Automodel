@@ -108,11 +108,13 @@ optimizer:
   lr: 1e-5
   weight_decay: 0
 
-wandb:
-  project: huiyingl_workspace
-  entity: Nemo-automodel
-  name: overridden_by_launcher
-  group: glm52-dsa-mock-32k-cp8-parity
-  tags: [glm52, dsa, mock, 32k, cp8, parity]
-  mode: online
-  resume: never
+# wandb:
+#   project: <your_wandb_project>
+#   entity: <your_wandb_entity>
+#   name: <your_wandb_exp_name>
+
+ci:
+  # 32k CP8 requires 64 nodes to stay within H100 memory.
+  recipe_owner: huiyingl
+  nodes: 64
+  time: "01:00:00"

@@ -15,6 +15,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 import torch
 from transformers.models.glm_moe_dsa.configuration_glm_moe_dsa import GlmMoeDsaConfig
@@ -81,6 +83,7 @@ class _FakeIndexerDsa:
         cu_seqlens_k: torch.Tensor,
         max_seqlen_q: int,
         max_seqlen_k: int,
+        q_causal_offsets: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
         """Return fake packed indexer scores after checking kernel layouts.
 
@@ -94,6 +97,8 @@ class _FakeIndexerDsa:
             cu_seqlens_k: Tensor of shape [sequences + 1] for packed keys.
             max_seqlen_q: Maximum packed query length.
             max_seqlen_k: Maximum packed key length.
+            q_causal_offsets: Per-segment position of the first local query,
+                shaped ``[segments]``.
 
         Returns:
             Mapping whose ``scores`` tensor has shape [tokens, max_sequence].
@@ -112,6 +117,7 @@ class _FakeIndexerDsa:
         assert sm_scale == 1.0
         torch.testing.assert_close(cu_seqlens_q, torch.tensor([0, 2, 5], dtype=torch.int32))
         torch.testing.assert_close(cu_seqlens_k, cu_seqlens_q)
+        torch.testing.assert_close(q_causal_offsets, torch.tensor([0, 0], dtype=torch.int32))
         assert max_seqlen_q == max_seqlen_k == 3
 
         self.forward_called = True
@@ -177,6 +183,7 @@ class _FakeCpIndexerDsa:
         assert head_weights.shape == (2, INDEX_HEADS)
         torch.testing.assert_close(kwargs["cu_seqlens_q"], torch.tensor([0, 2], dtype=torch.int32))
         torch.testing.assert_close(kwargs["cu_seqlens_k"], torch.tensor([0, 4], dtype=torch.int32))
+        torch.testing.assert_close(kwargs["q_causal_offsets"], torch.tensor([2], dtype=torch.int32))
         assert kwargs["max_seqlen_q"] == 2
         assert kwargs["max_seqlen_k"] == 4
         assert kwargs["ratio"] == 1
@@ -210,6 +217,7 @@ class _FakePaddedCpIndexerDsa:
         assert head_weights.shape == (8, INDEX_HEADS)
         torch.testing.assert_close(kwargs["cu_seqlens_q"], torch.tensor([0, 2, 7, 8], dtype=torch.int32))
         torch.testing.assert_close(kwargs["cu_seqlens_k"], torch.tensor([0, 4, 9, 10], dtype=torch.int32))
+        torch.testing.assert_close(kwargs["q_causal_offsets"], torch.tensor([2, 0, 0], dtype=torch.int32))
         assert kwargs["max_seqlen_q"] == 5
         assert kwargs["max_seqlen_k"] == 5
         return {"scores": torch.zeros(8, 5, dtype=torch.float32)}
@@ -513,6 +521,7 @@ def test_cudnn_metadata_segments_cp_queries_and_padded_documents() -> None:
 
     torch.testing.assert_close(metadata.segment_cu_q, torch.tensor([0, 2, 7, 8], dtype=torch.int32))
     torch.testing.assert_close(metadata.segment_cu_k, torch.tensor([0, 4, 9, 10], dtype=torch.int32))
+    torch.testing.assert_close(metadata.q_causal_offsets, torch.tensor([2, 0, 0], dtype=torch.int32))
     torch.testing.assert_close(metadata.key_source_indices, torch.arange(10))
     torch.testing.assert_close(metadata.starts, torch.tensor([0, 0, 4, 4, 4, 4, 4, 9], dtype=torch.int32))
     torch.testing.assert_close(metadata.causal_lengths, torch.tensor([3, 0, 1, 2, 3, 4, 0, 1], dtype=torch.int32))
@@ -542,6 +551,23 @@ def test_cudnn_metadata_uses_padding_mask_after_thd_absorption() -> None:
     )
     torch.testing.assert_close(metadata.valid_row_indices, torch.arange(5))
     assert metadata.all_rows_nonempty is False
+
+
+def test_cudnn_cached_metadata_rejects_malformed_q_causal_offsets() -> None:
+    """Cached metadata rejects a causal-offset tensor with one row per query."""
+    metadata = cudnn_dsa.prepare_cudnn_dsa_packed_metadata(
+        torch.tensor([0, 4], dtype=torch.int32),
+        total_key_tokens=4,
+    )
+    malformed = replace(metadata, q_causal_offsets=torch.zeros(2, dtype=torch.int32))
+
+    with pytest.raises(ValueError, match="q_causal_offsets must be contiguous int32"):
+        cudnn_dsa._unpack_packed_metadata(
+            malformed,
+            total_query_tokens=4,
+            total_key_tokens=4,
+            device=torch.device("cpu"),
+        )
 
 
 def test_cudnn_indexer_maps_cp_segment_indices_to_global_keys(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -595,7 +621,7 @@ def test_cudnn_indexer_masks_padded_cp_query_rows(monkeypatch: pytest.MonkeyPatc
 
 
 def test_cudnn_indexer_rejects_unsupported_sm90_head_count(monkeypatch: pytest.MonkeyPatch) -> None:
-    """cuDNN frontend 1.25 supports 32 or 64 index heads on Hopper."""
+    """cuDNN Frontend 1.27 supports 32 or 64 index heads on Hopper."""
     monkeypatch.setattr(cudnn_dsa, "_HAS_CUDNN_DSA", True)
     monkeypatch.setattr(cudnn_dsa, "_HAS_FLASH_MLA", True)
     monkeypatch.setattr(cudnn_dsa, "_require_cuda_tensors", _accept_cpu_tensors)
@@ -1018,8 +1044,8 @@ def test_cudnn_model_requires_packing_and_fixed_pipeline_topk() -> None:
     assert inputs[1].shape == (32, 1, config.index_topk)
     assert outputs[0].shape == inputs[0].shape
     assert outputs[1].shape == inputs[1].shape
-    prepared = model.prepare_model_inputs_for_cp(input_ids=torch.arange(32).view(1, 32))
-    assert callable(prepared["_cp_make_batch_fn"])
+    prepared = model.prepare_model_inputs_for_cp({"input_ids": torch.arange(32).view(1, 32)})
+    assert callable(prepared["cp_sharder"].shard_batch)
 
 
 def _dense_packed_indexer_topk(

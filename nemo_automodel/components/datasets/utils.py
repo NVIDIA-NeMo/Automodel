@@ -358,73 +358,26 @@ def packed_sequence_thd_collater(batch: list[dict] | dict) -> dict:
 
         input_ids = torch.as_tensor(batch["input_ids"])
         labels = torch.as_tensor(batch["labels"], device=input_ids.device)
-        if input_ids.ndim == 1:
-            input_ids = input_ids.unsqueeze(0)
-        if labels.ndim == 1:
-            labels = labels.unsqueeze(0)
-        if input_ids.ndim != 2 or labels.shape != input_ids.shape:
+        position_ids = torch.as_tensor(batch["position_ids"], device=input_ids.device)
+        if input_ids.ndim != 2 or labels.shape != input_ids.shape or position_ids.shape != input_ids.shape:
             raise ValueError(
-                "Pre-batched THD input_ids and labels must have matching [batch_size, seq_len] shapes; "
-                f"got input_ids={tuple(input_ids.shape)}, labels={tuple(labels.shape)}."
+                "Pre-batched THD input_ids, labels, and position_ids must have matching "
+                "[batch_size, seq_len] shapes; "
+                f"got input_ids={tuple(input_ids.shape)}, labels={tuple(labels.shape)}, "
+                f"position_ids={tuple(position_ids.shape)}."
             )
 
         batch_size, seq_len = input_ids.shape
-        position_ids_value = batch.get("position_ids")
-        if position_ids_value is None:
-            position_ids = torch.arange(seq_len, device=input_ids.device).unsqueeze(0).expand(batch_size, -1)
-        else:
-            position_ids = torch.as_tensor(position_ids_value, device=input_ids.device)
-            if position_ids.ndim == 1:
-                position_ids = position_ids.unsqueeze(0).expand(batch_size, -1)
-            if position_ids.shape != input_ids.shape:
-                raise ValueError(
-                    "Pre-batched THD position_ids must match input_ids shape; "
-                    f"got position_ids={tuple(position_ids.shape)}, input_ids={tuple(input_ids.shape)}."
-                )
-
-        seq_lens_value = batch.get("seq_lens")
-        if seq_lens_value is None:
-            attention_mask = batch.get("attention_mask")
-            if attention_mask is None:
-                actual_seq_lens = torch.full((batch_size,), seq_len, dtype=torch.long, device=input_ids.device)
-            else:
-                attention_mask = torch.as_tensor(attention_mask, device=input_ids.device)
-                if attention_mask.ndim == 1:
-                    attention_mask = attention_mask.unsqueeze(0)
-                if attention_mask.shape != input_ids.shape:
-                    raise ValueError(
-                        "Pre-batched THD attention_mask must match input_ids shape; "
-                        f"got attention_mask={tuple(attention_mask.shape)}, input_ids={tuple(input_ids.shape)}."
-                    )
-                actual_seq_lens = attention_mask.to(torch.long).sum(dim=1)
-            seq_lens = actual_seq_lens.unsqueeze(1)
-        else:
-            seq_lens = torch.as_tensor(seq_lens_value, dtype=torch.long, device=input_ids.device)
-            if seq_lens.ndim == 1:
-                seq_lens = seq_lens.unsqueeze(1) if seq_lens.numel() == batch_size else seq_lens.unsqueeze(0)
-
-        seq_lens_padded_value = batch.get("seq_lens_padded")
-        if seq_lens_padded_value is None:
-            seq_lens_padded = torch.full((batch_size, 1), seq_len, dtype=torch.long, device=input_ids.device)
-        else:
-            seq_lens_padded = torch.as_tensor(seq_lens_padded_value, dtype=torch.long, device=input_ids.device)
-            if seq_lens_padded.ndim == 1:
-                seq_lens_padded = (
-                    seq_lens_padded.unsqueeze(1)
-                    if seq_lens_padded.numel() == batch_size
-                    else seq_lens_padded.unsqueeze(0)
-                )
+        seq_lens = torch.full((batch_size, 1), seq_len, dtype=torch.long, device=input_ids.device)
 
         result = {
             "input_ids": input_ids.to(torch.long),
             "labels": labels.to(torch.long),
             "position_ids": position_ids.to(torch.long),
             "seq_lens": seq_lens,
-            "seq_lens_padded": seq_lens_padded,
+            "seq_lens_padded": seq_lens.clone(),
             "qkv_format": "thd",
         }
-        if "mock_data_fingerprint" in batch:
-            result["mock_data_fingerprint"] = str(batch["mock_data_fingerprint"])
         return result
 
     # Extract and remove padding token metadata if present
@@ -477,6 +430,56 @@ def packed_sequence_thd_collater(batch: list[dict] | dict) -> dict:
         "seq_lens": seq_lens,
         "seq_lens_padded": seq_lens_padded,
         "qkv_format": "thd",
+    }
+
+
+def pack_features_for_thd(features: list[dict], *, ignore_index: int = -100) -> dict:
+    """Concatenate loose single-sequence features into one pre-packed THD record.
+
+    Each input feature holds one unpadded variable-length sequence
+    (``input_ids`` and optionally ``labels``). The output is a single record in
+    the pre-packed schema :func:`packed_sequence_thd_collater` accepts: flat
+    ``input_ids``/``labels``, ``position_ids`` restarting at every sequence
+    boundary, and per-sequence ``seq_lens``/``seq_lens_padded`` (no separator
+    tokens, so the two are equal).
+
+    Deciding *which* sequences share a pack is the caller's job (the sampler,
+    or an RL framework's microbatcher); this helper only executes the
+    concatenation.
+
+    Args:
+        features: per-example dicts with ``input_ids`` and optional ``labels``
+            (``list[int]`` or 1-D tensors). An example without ``labels``
+            contributes ``ignore_index`` at every position (no loss).
+        ignore_index: label fill value for examples without labels.
+
+    Returns:
+        One pre-packed feature record (plain lists), suitable as a batch item
+        for :func:`packed_sequence_thd_collater`.
+    """
+    if not features:
+        raise ValueError("pack_features_for_thd requires at least one feature")
+    input_ids: list[int] = []
+    labels: list[int] = []
+    position_ids: list[int] = []
+    seq_lens: list[int] = []
+    for feature in features:
+        ids = list(feature["input_ids"])
+        if not ids:
+            raise ValueError("cannot pack an empty sequence")
+        example_labels = list(feature["labels"]) if "labels" in feature else [ignore_index] * len(ids)
+        if len(example_labels) != len(ids):
+            raise ValueError(f"labels length {len(example_labels)} does not match input_ids length {len(ids)}")
+        input_ids.extend(ids)
+        labels.extend(example_labels)
+        position_ids.extend(range(len(ids)))
+        seq_lens.append(len(ids))
+    return {
+        "input_ids": input_ids,
+        "labels": labels,
+        "position_ids": position_ids,
+        "seq_lens": seq_lens,
+        "seq_lens_padded": list(seq_lens),
     }
 
 

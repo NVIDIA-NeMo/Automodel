@@ -12,107 +12,32 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for GLM MoE DSA context-parallel helpers."""
+"""CPU-runnable tests for GLM MoE DSA context-parallel batch helpers."""
 
 from __future__ import annotations
 
 import contextlib
-import math
-import os
-import socket
 
 import pytest
 import torch
-import torch.distributed as dist
-import torch.multiprocessing as mp
 
 from nemo_automodel.components.models.glm_moe_dsa import cp as glm_cp
 
 
-def _free_port() -> int:
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.bind(("127.0.0.1", 0))
-    port = sock.getsockname()[1]
-    sock.close()
-    return port
-
-
-def _nccl_all_gather_worker(rank: int, world_size: int, port: int) -> None:
-    try:
-        os.environ["MASTER_ADDR"] = "127.0.0.1"
-        os.environ["MASTER_PORT"] = str(port)
-        os.environ["RANK"] = str(rank)
-        os.environ["LOCAL_RANK"] = str(rank)
-        os.environ["WORLD_SIZE"] = str(world_size)
-
-        torch.cuda.set_device(rank)
-        device = torch.device("cuda", rank)
-        dist.init_process_group("nccl", rank=rank, world_size=world_size)
-
-        # Rank-dependent loss weights make the expected gradient sensitive to
-        # both gather ordering and routing gradients back to the source rank.
-        local = torch.arange(rank * 4, rank * 4 + 4, device=device, dtype=torch.float32).view(2, 2)
-        local.requires_grad_(True)
-        gathered = glm_cp.glm_dsa_cp_all_gather(local, dim=0, cp_group=dist.group.WORLD)
-        expected = torch.arange(world_size * 4, device=device, dtype=torch.float32).view(world_size * 2, 2)
-        torch.testing.assert_close(gathered, expected)
-
-        weights = torch.arange(1, gathered.numel() + 1, device=device, dtype=torch.float32).view_as(gathered)
-        ((rank + 1) * gathered * weights).sum().backward()
-        rank_scale_sum = world_size * (world_size + 1) // 2
-        expected_grad = rank_scale_sum * weights[rank * 2 : (rank + 1) * 2]
-        torch.testing.assert_close(local.grad, expected_grad)
-
-        # Match the production CP shape: local Q attends causally to gathered
-        # global K/V, while K/V gradients accumulate losses from every rank.
-        global_seq, head_dim = world_size * 2, 4
-        start, end = rank * 2, (rank + 1) * 2
-        full_q_data = torch.sin(torch.arange(global_seq * head_dim, device=device).view(global_seq, head_dim) / 7)
-        full_k_data = torch.cos(torch.arange(global_seq * head_dim, device=device).view(global_seq, head_dim) / 5)
-        full_v_data = torch.tanh(torch.arange(global_seq * head_dim, device=device).view(global_seq, head_dim) / 9)
-
-        local_q = full_q_data[start:end].clone().requires_grad_(True)
-        local_k = full_k_data[start:end].clone().requires_grad_(True)
-        local_v = full_v_data[start:end].clone().requires_grad_(True)
-        global_k = glm_cp.glm_dsa_cp_all_gather(local_k, dim=0, cp_group=dist.group.WORLD)
-        global_v = glm_cp.glm_dsa_cp_all_gather(local_v, dim=0, cp_group=dist.group.WORLD)
-
-        query_positions = torch.arange(start, end, device=device)
-        key_positions = torch.arange(global_seq, device=device)
-        local_scores = local_q @ global_k.transpose(0, 1) / math.sqrt(head_dim)
-        local_scores = local_scores.masked_fill(key_positions[None, :] > query_positions[:, None], -torch.inf)
-        local_out = torch.softmax(local_scores, dim=-1) @ global_v
-
-        ref_q = full_q_data.clone().requires_grad_(True)
-        ref_k = full_k_data.clone().requires_grad_(True)
-        ref_v = full_v_data.clone().requires_grad_(True)
-        ref_scores = ref_q @ ref_k.transpose(0, 1) / math.sqrt(head_dim)
-        causal_mask = key_positions[None, :] > key_positions[:, None]
-        ref_scores = ref_scores.masked_fill(causal_mask, -torch.inf)
-        ref_out = torch.softmax(ref_scores, dim=-1) @ ref_v
-        torch.testing.assert_close(local_out, ref_out[start:end], rtol=1e-5, atol=1e-6)
-
-        output_weights = torch.linspace(0.25, 2.0, global_seq * head_dim, device=device).view(global_seq, head_dim)
-        (local_out * output_weights[start:end]).sum().backward()
-        (ref_out * output_weights).sum().backward()
-        torch.testing.assert_close(local_q.grad, ref_q.grad[start:end], rtol=1e-5, atol=1e-6)
-        torch.testing.assert_close(local_k.grad, ref_k.grad[start:end], rtol=1e-5, atol=1e-6)
-        torch.testing.assert_close(local_v.grad, ref_v.grad[start:end], rtol=1e-5, atol=1e-6)
-    finally:
-        if dist.is_initialized():
-            dist.destroy_process_group()
-
-
 class _FakeMesh:
-    def __init__(self, size=2, group="cp-group"):
+    def __init__(self, size=2, group="cp-group", rank=0):
         self._size = size
         self._group = group
+        self._rank = rank
 
     def size(self):
         return self._size
 
     def get_group(self):
         return self._group
+
+    def get_local_rank(self):
+        return self._rank
 
 
 def _thd_chunk(num_tokens=6):
@@ -123,6 +48,8 @@ def _thd_chunk(num_tokens=6):
         "cu_seqlens": torch.tensor([0, num_tokens // 2, num_tokens], dtype=torch.int64),
         "max_seqlen": torch.tensor(num_tokens // 2, dtype=torch.int64),
         "cu_seqlens_padded": torch.tensor([0, num_tokens // 2 + 1, num_tokens + 2], dtype=torch.int64),
+        # Pack-derived, as process_input_for_thd emits it.
+        "padding_mask": torch.tensor([i == 3 for i in range(num_tokens)]),
     }
 
 
@@ -158,26 +85,24 @@ def test_glm_dsa_cp_all_gather_concatenates_autograd_gather(monkeypatch):
     assert out.tolist() == [[0, 1], [2, 3], [10, 11], [12, 13]]
 
 
-@pytest.mark.run_only_on("GPU")
-@pytest.mark.skipif(
-    not dist.is_nccl_available() or torch.cuda.device_count() < 2,
-    reason="GLM DSA CP all-gather requires two CUDA devices and NCCL",
-)
-def test_glm_dsa_cp_all_gather_nccl_forward_backward():
-    world_size = 2
-    mp.spawn(_nccl_all_gather_worker, args=(world_size, _free_port()), nprocs=world_size, join=True)
-
-
-def test_contiguous_cp_indices_requires_even_divisibility():
-    with pytest.raises(ValueError, match="total tokens divisible"):
-        glm_cp._contiguous_cp_indices(total_tokens=5, cp_size=2, cp_rank=0, device=torch.device("cpu"))
-
-    assert glm_cp._contiguous_cp_indices(6, 3, 1, torch.device("cpu")).tolist() == [2, 3]
+def test_slice_thd_chunk_requires_even_divisibility():
+    # The shared contiguous index map owns the divisibility contract; GLM no
+    # longer carries its own copy of the arithmetic.
+    with pytest.raises(ValueError, match="divisible by cp_size"):
+        glm_cp._slice_thd_chunk_for_cp(
+            _thd_chunk(num_tokens=5),
+            cp_mesh=_FakeMesh(size=2, rank=0),
+            cp_group="cp-group",
+            cp_size=2,
+            cp_rank=0,
+            padding_token_id=3,
+        )
 
 
 def test_slice_thd_chunk_for_cp_preserves_global_metadata_and_padding_mask():
     out = glm_cp._slice_thd_chunk_for_cp(
         _thd_chunk(),
+        cp_mesh=_FakeMesh(size=3, rank=1),
         cp_group="cp-group",
         cp_size=3,
         cp_rank=1,
@@ -196,37 +121,6 @@ def test_slice_thd_chunk_for_cp_preserves_global_metadata_and_padding_mask():
     assert out["padding_mask"].tolist() == [False, True]
     assert out["qkv_format"] == "thd"
     assert out["_glm_dsa_cp_group"] == "cp-group"
-
-
-def test_slice_thd_chunk_for_cp_preserves_explicit_padding_mask():
-    chunk = _thd_chunk()
-    chunk["padding_mask"] = torch.tensor([False, True, False, False, True, False])
-
-    out = glm_cp._slice_thd_chunk_for_cp(
-        chunk,
-        cp_group="cp-group",
-        cp_size=3,
-        cp_rank=1,
-        padding_token_id=3,
-    )
-
-    assert out["input_ids"].tolist() == [2, 3]
-    assert out["padding_mask"].tolist() == [False, False]
-
-
-def test_slice_thd_chunk_for_cp_omits_identity_query_indices_at_cp1():
-    chunk = _thd_chunk()
-
-    out = glm_cp._slice_thd_chunk_for_cp(
-        chunk,
-        cp_group="cp-group",
-        cp_size=1,
-        cp_rank=0,
-        padding_token_id=3,
-    )
-
-    assert out["input_ids"].data_ptr() == chunk["input_ids"].data_ptr()
-    assert "glm_dsa_cp_query_indices" not in out
 
 
 def test_make_glm_dsa_packed_cp_batch_single_chunk(monkeypatch):
@@ -258,6 +152,25 @@ def test_make_glm_dsa_packed_cp_batch_single_chunk(monkeypatch):
     assert out["cp_rank"] == 0
 
 
+def test_shard_glm_dsa_packed_cp_batch_reports_single_chunk_layout(monkeypatch):
+    monkeypatch.setattr(glm_cp, "split_batch_into_thd_chunks", lambda *args, **kwargs: _thd_chunk())
+    monkeypatch.setattr(glm_cp.dist, "is_available", lambda: False)
+    monkeypatch.setattr(glm_cp.dist, "is_initialized", lambda: False)
+
+    ctx, out, layout = glm_cp.shard_glm_dsa_packed_cp_batch(
+        _FakeMesh(size=3),
+        None,
+        {"input_ids": torch.arange(6).view(1, 6)},
+        padding_token_id=3,
+        num_chunks=1,
+    )
+
+    assert ctx is contextlib.nullcontext
+    assert out["input_ids"].tolist() == [0, 1]
+    assert layout.padded_seq_len == 6
+    assert layout.input_row_shape == (1, 6)
+
+
 def test_make_glm_dsa_packed_cp_batch_stacks_pipeline_chunks(monkeypatch):
     thd_batch = {
         "input_ids": torch.tensor([[0, 1, 2, 3], [10, 11, 12, 13]]),
@@ -266,6 +179,7 @@ def test_make_glm_dsa_packed_cp_batch_stacks_pipeline_chunks(monkeypatch):
         "cu_seqlens": torch.tensor([[0, 4], [0, 4]], dtype=torch.int64),
         "max_seqlen": torch.tensor([4, 4], dtype=torch.int64),
         "cu_seqlens_padded": torch.tensor([[0, 4], [0, 4]], dtype=torch.int64),
+        "padding_mask": torch.tensor([[False, False, False, False], [False, False, True, False]]),
     }
     monkeypatch.setattr(glm_cp, "split_batch_into_thd_chunks", lambda *args, **kwargs: thd_batch)
     monkeypatch.setattr(glm_cp.dist, "is_available", lambda: True)

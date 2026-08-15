@@ -106,11 +106,13 @@ optimizer:
   lr: 1e-5
   weight_decay: 0
 
-wandb:
-  project: huiyingl_workspace
-  entity: Nemo-automodel
-  name: overridden_by_launcher
-  group: glm52-dsa-mock-4k-cp1-parity
-  tags: [glm52, dsa, mock, 4k, cp1, parity]
-  mode: online
-  resume: never
+# wandb:
+#   project: <your_wandb_project>
+#   entity: <your_wandb_entity>
+#   name: <your_wandb_exp_name>
+
+ci:
+  # pp4 with ep64 requires 256 ranks.
+  recipe_owner: huiyingl
+  nodes: 32
+  time: "01:00:00"

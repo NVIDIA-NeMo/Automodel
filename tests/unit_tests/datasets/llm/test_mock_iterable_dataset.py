@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -161,9 +163,7 @@ class TestMockIterableDataset:
         different = next(iter(MockIterableDataset(vocab_size=1000, seq_len=64, batch_size=2, seed=18)))
 
         assert torch.equal(first["input_ids"], replay["input_ids"])
-        assert first["mock_data_fingerprint"] == replay["mock_data_fingerprint"]
         assert not torch.equal(first["input_ids"], different["input_ids"])
-        assert first["mock_data_fingerprint"] != different["mock_data_fingerprint"]
 
     def test_shard_replays_for_peers_and_distinguishes_dp_ranks(self):
         """Test that peers on one DP rank agree while separate DP ranks receive unique data."""
@@ -202,6 +202,24 @@ class TestMockIterableDataset:
         next(iter(MockIterableDataset(vocab_size=1000, seq_len=64, batch_size=2, seed=123)))
 
         assert torch.equal(torch.get_rng_state(), state)
+
+    def test_workers_partition_batches_and_use_distinct_streams(self, monkeypatch):
+        """Test that DataLoader workers split work instead of replaying identical batches."""
+        dataset = MockIterableDataset(vocab_size=1000, seq_len=64, num_samples=5, batch_size=2, seed=123)
+
+        monkeypatch.setattr(
+            "nemo_automodel.components.datasets.llm.mock_iterable_dataset.get_worker_info",
+            lambda: SimpleNamespace(id=0, num_workers=2),
+        )
+        worker_zero = list(dataset)
+        monkeypatch.setattr(
+            "nemo_automodel.components.datasets.llm.mock_iterable_dataset.get_worker_info",
+            lambda: SimpleNamespace(id=1, num_workers=2),
+        )
+        worker_one = list(dataset)
+
+        assert len(worker_zero) + len(worker_one) == len(dataset)
+        assert not torch.equal(worker_zero[0]["input_ids"], worker_one[0]["input_ids"])
 
     def test_different_samples_have_different_tokens(self):
         """Test that consecutive samples generate different random tokens."""

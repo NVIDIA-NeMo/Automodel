@@ -69,10 +69,7 @@ from nemo_automodel.components.models.common import (
     initialize_linear_module,
     initialize_rms_norm_module,
 )
-from nemo_automodel.components.models.deepseek_v3.rope_utils import (
-    apply_rotary_emb,
-    yarn_get_mscale,
-)
+from nemo_automodel.components.models.deepseek_v3.rope_utils import apply_rotary_emb
 from nemo_automodel.components.models.glm_moe_dsa.cp import glm_dsa_cp_all_gather, glm_dsa_cp_enabled
 from nemo_automodel.components.models.glm_moe_dsa.optimized_kernels import (
     cudnn_indexer_topk,
@@ -83,6 +80,7 @@ from nemo_automodel.components.models.glm_moe_dsa.optimized_kernels import (
     tilelang_indexer_topk,
     tilelang_sparse_attention,
 )
+from nemo_automodel.components.models.glm_moe_dsa.rope_utils import mla_softmax_scale
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
@@ -503,18 +501,9 @@ class GlmMoeDsaMLA(nn.Module):
             bias=False,
             dtype=dtype,
         )
-        self.softmax_scale = self.qk_head_dim**-0.5
-
-        rope_parameters = config.rope_parameters if hasattr(config, "rope_parameters") else config.rope_scaling
-        if rope_parameters and all(
-            map(lambda x: x in rope_parameters, ["factor", "mscale", "original_max_position_embeddings"])
-        ):
-            factor = rope_parameters["factor"]
-            mscale = rope_parameters["mscale"]
-            original_seq_len = rope_parameters["original_max_position_embeddings"]
-            if config.max_position_embeddings > original_seq_len:
-                mscale = yarn_get_mscale(factor, mscale)
-            self.softmax_scale = self.softmax_scale * mscale * mscale
+        # Shared with the GLM-5.2 DSpark draft, which trains on this model's hidden
+        # states and must use the identical (YaRN-corrected) attention temperature.
+        self.softmax_scale = mla_softmax_scale(config, self.qk_head_dim)
 
         if attn_impl in ("tilelang", "cudnn"):
             # Optimized DSA paths run their sparse kernel directly in forward; neither uses the
@@ -722,7 +711,11 @@ class GlmMoeDsaMLA(nn.Module):
                     f"{dsa_backend} DSA sparse attention requires THD/packed sequences (qkv_format='thd'); "
                     f"got '{qkv_format}'. Use backend.attn in {{te, sdpa}} for the BSHD dense path."
                 )
-            w = self.kv_b_proj.weight.view(self.n_heads, self.qk_nope_head_dim + self.v_head_dim, self.kv_lora_rank)
+            materialize_effective_weight = getattr(self.kv_b_proj, "materialize_effective_weight", None)
+            kv_b_weight = (
+                materialize_effective_weight() if materialize_effective_weight is not None else self.kv_b_proj.weight
+            )
+            w = kv_b_weight.view(self.n_heads, self.qk_nope_head_dim + self.v_head_dim, self.kv_lora_rank)
             w_kc = w[:, : self.qk_nope_head_dim, :]
             w_vc = w[:, self.qk_nope_head_dim :, :]
             q_absorbed = torch.einsum("thd,hdc->thc", q_nope, w_kc.to(q_nope.dtype))

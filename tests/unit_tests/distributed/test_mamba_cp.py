@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for :pyfile:`nemo_automodel/components/distributed/mamba_cp.py`.
+"""Unit tests for :pyfile:`nemo_automodel/components/distributed/context_parallel/mamba.py`.
 
 Tests mock the distributed process group so they can run on CPU-only CI
 systems while still verifying dimension calculations, parameter slicing,
@@ -27,11 +27,12 @@ import pytest
 import torch
 import torch.nn as nn
 
-from nemo_automodel.components.distributed.mamba_cp import MambaContextParallel
+from nemo_automodel.components.distributed.context_parallel.mamba import MambaContextParallel
 
 # ---------------------------------------------------------------------------
 # Lightweight stubs for torch.distributed.ProcessGroup
 # ---------------------------------------------------------------------------
+
 
 class _FakeProcessGroup:
     """Minimal stub emulating ``torch.distributed.ProcessGroup`` for unit tests.
@@ -50,9 +51,11 @@ class _FakeProcessGroup:
     def rank(self) -> int:
         return self._rank
 
+
 # ---------------------------------------------------------------------------
 # Helpers to build a MambaContextParallel instance with dummy parameters
 # ---------------------------------------------------------------------------
+
 
 def _make_conv1d(d_inner: int, n_groups: int, d_state: int, kernel_size: int = 4) -> nn.Conv1d:
     """Create a Conv1d whose weight/bias values are deterministic (arange-based)."""
@@ -63,6 +66,7 @@ def _make_conv1d(d_inner: int, n_groups: int, d_state: int, kernel_size: int = 4
         conv.weight.copy_(torch.arange(conv_dim * kernel_size, dtype=torch.float32).reshape(conv_dim, 1, kernel_size))
         conv.bias.copy_(torch.arange(conv_dim, dtype=torch.float32))
     return conv
+
 
 class _FakeMixer:
     """Minimal object that exposes the attributes MambaContextParallel needs."""
@@ -98,6 +102,7 @@ def _make_mamba_cp(
         d_state=d_state,
         mixer=mixer,
     )
+
 
 @pytest.mark.parametrize(
     "num_heads, n_groups, cp_size, expected_heads_local, expected_d_inner_local, expected_n_groups_local, expected_repeat",
@@ -143,20 +148,24 @@ def test_dimension_calculations(
     assert mcp.group_repeat_count == expected_repeat
     assert mcp.d_inner == num_heads * head_dim
 
+
 def test_validation_error_heads_not_divisible_by_cp():
     """num_heads % cp_size != 0 must raise AssertionError."""
     with pytest.raises(AssertionError, match="num_heads.*must be divisible by cp_size"):
         _make_mamba_cp(num_heads=7, head_dim=2, n_groups=1, d_state=4, cp_size=4)
+
 
 def test_validation_error_cp_not_divisible_by_groups():
     """When n_groups < cp_size, cp_size % n_groups != 0 must raise."""
     with pytest.raises(AssertionError, match="cp_size.*must be divisible by n_groups"):
         _make_mamba_cp(num_heads=12, head_dim=2, n_groups=3, d_state=4, cp_size=4)
 
+
 def test_validation_error_groups_not_divisible_by_cp():
     """When n_groups >= cp_size, n_groups % cp_size != 0 must raise."""
     with pytest.raises(AssertionError, match="n_groups.*must be divisible by cp_size"):
         _make_mamba_cp(num_heads=12, head_dim=2, n_groups=5, d_state=4, cp_size=4)
+
 
 class TestParameterSlicing:
     """Verify that get_conv1d_weight, get_conv1d_bias, get_dt_bias, get_A_log, get_D
@@ -209,9 +218,10 @@ class TestParameterSlicing:
             mcp = self._build(rank)
             sliced = mcp.get_A_log()
             expected_start = rank * mcp.num_heads_local
-            expected = torch.arange(self.NUM_HEADS, dtype=torch.float32)[
-                expected_start : expected_start + mcp.num_heads_local
-            ] + 100.0
+            expected = (
+                torch.arange(self.NUM_HEADS, dtype=torch.float32)[expected_start : expected_start + mcp.num_heads_local]
+                + 100.0
+            )
             assert torch.equal(sliced, expected), f"A_log mismatch on rank {rank}"
 
     def test_D_slicing(self):
@@ -220,9 +230,10 @@ class TestParameterSlicing:
             mcp = self._build(rank)
             sliced = mcp.get_D()
             expected_start = rank * mcp.num_heads_local
-            expected = torch.arange(self.NUM_HEADS, dtype=torch.float32)[
-                expected_start : expected_start + mcp.num_heads_local
-            ] + 200.0
+            expected = (
+                torch.arange(self.NUM_HEADS, dtype=torch.float32)[expected_start : expected_start + mcp.num_heads_local]
+                + 200.0
+            )
             assert torch.equal(sliced, expected), f"D mismatch on rank {rank}"
 
     def test_conv1d_weight_slicing_shape(self):
@@ -287,6 +298,7 @@ class TestParameterSlicing:
         )
         assert mcp.get_conv1d_bias() is None
 
+
 class TestParameterSlicingWithReplication:
     """When n_groups < cp_size, B/C conv param slicing uses group_repeat_count."""
 
@@ -344,6 +356,7 @@ class TestParameterSlicingWithReplication:
         expected_conv_dim_local = d_inner_local + 2 * bc_size_local
         assert w.shape == (expected_conv_dim_local, self.KERNEL_SIZE)
 
+
 class TestGroupReplication:
     """Verify B/C state replication via expand+reshape when n_groups < cp_size."""
 
@@ -378,7 +391,9 @@ class TestGroupReplication:
             H_local = H // cp_size
             return torch.randn(batch_size, L_local * cp_size, H_local)
 
-        with patch("nemo_automodel.components.distributed.mamba_cp._all_to_all_cp2hp", side_effect=fake_cp2hp):
+        with patch(
+            "nemo_automodel.components.distributed.context_parallel.mamba._all_to_all_cp2hp", side_effect=fake_cp2hp
+        ):
             mcp.pre_conv_ssm(projected)
 
         assert len(captured_calls) == 5, f"Expected 5 all-to-all calls, got {len(captured_calls)}"
@@ -425,11 +440,14 @@ class TestGroupReplication:
             H_local = H // cp_size
             return torch.randn(batch_size, L_local * cp_size, H_local)
 
-        with patch("nemo_automodel.components.distributed.mamba_cp._all_to_all_cp2hp", side_effect=fake_cp2hp):
+        with patch(
+            "nemo_automodel.components.distributed.context_parallel.mamba._all_to_all_cp2hp", side_effect=fake_cp2hp
+        ):
             mcp.pre_conv_ssm(projected)
 
         b_state_input = captured_calls[2]
         assert b_state_input.shape == (B, L_local, groups_state_size)
+
 
 class TestPrePostConvSsmShapes:
     """Verify shape transformations of pre_conv_ssm and post_conv_ssm.
@@ -469,7 +487,9 @@ class TestPrePostConvSsmShapes:
             H_local = H_t // cp_size
             return torch.randn(B_t, L_t * cp_size, H_local)
 
-        with patch("nemo_automodel.components.distributed.mamba_cp._all_to_all_cp2hp", side_effect=fake_cp2hp):
+        with patch(
+            "nemo_automodel.components.distributed.context_parallel.mamba._all_to_all_cp2hp", side_effect=fake_cp2hp
+        ):
             output = mcp.pre_conv_ssm(projected)
 
         d_inner_local = d_inner // cp_size
@@ -512,12 +532,12 @@ class TestPrePostConvSsmShapes:
             H_out = H_t * cp_size
             return torch.randn(B_t, L_out, H_out)
 
-        with patch("nemo_automodel.components.distributed.mamba_cp._all_to_all_hp2cp", side_effect=fake_hp2cp):
+        with patch(
+            "nemo_automodel.components.distributed.context_parallel.mamba._all_to_all_hp2cp", side_effect=fake_hp2cp
+        ):
             output = mcp.post_conv_ssm(ssm_output)
 
-        assert output.shape == (B, L_local, d_inner), (
-            f"Expected ({B}, {L_local}, {d_inner}), got {output.shape}"
-        )
+        assert output.shape == (B, L_local, d_inner), f"Expected ({B}, {L_local}, {d_inner}), got {output.shape}"
 
     def test_pre_conv_ssm_noop_cp1(self):
         """When cp_size == 1, pre_conv_ssm should return the input unchanged."""
@@ -533,6 +553,7 @@ class TestPrePostConvSsmShapes:
         out = mcp.post_conv_ssm(inp)
         assert out is inp, "post_conv_ssm should be identity when cp_size==1"
 
+
 class TestAllToAllLayoutTransforms:
     """Test _all_to_all_cp2hp and _all_to_all_hp2cp with mocked all-to-all.
 
@@ -542,7 +563,7 @@ class TestAllToAllLayoutTransforms:
 
     def test_cp2hp_shape(self):
         """Verify _all_to_all_cp2hp output shape with identity all-to-all."""
-        from nemo_automodel.components.distributed.mamba_cp import _all_to_all_cp2hp
+        from nemo_automodel.components.distributed.context_parallel.mamba import _all_to_all_cp2hp
 
         cp_size = 2
         B, L_local, H = 2, 4, 8
@@ -550,14 +571,16 @@ class TestAllToAllLayoutTransforms:
 
         inp = torch.randn(B, L_local, H)
 
-        with patch("nemo_automodel.components.distributed.mamba_cp._all_to_all", side_effect=lambda t, g: t):
+        with patch(
+            "nemo_automodel.components.distributed.context_parallel.mamba._all_to_all", side_effect=lambda t, g: t
+        ):
             out = _all_to_all_cp2hp(inp, pg, B)
 
         assert out.shape == (B, L_local * cp_size, H // cp_size)
 
     def test_hp2cp_shape(self):
         """Verify _all_to_all_hp2cp output shape with identity all-to-all."""
-        from nemo_automodel.components.distributed.mamba_cp import _all_to_all_hp2cp
+        from nemo_automodel.components.distributed.context_parallel.mamba import _all_to_all_hp2cp
 
         cp_size = 2
         B, L_global, H_local = 2, 8, 4
@@ -565,10 +588,13 @@ class TestAllToAllLayoutTransforms:
 
         inp = torch.randn(B, L_global, H_local)
 
-        with patch("nemo_automodel.components.distributed.mamba_cp._all_to_all", side_effect=lambda t, g: t):
+        with patch(
+            "nemo_automodel.components.distributed.context_parallel.mamba._all_to_all", side_effect=lambda t, g: t
+        ):
             out = _all_to_all_hp2cp(inp, pg, B)
 
         assert out.shape == (B, L_global // cp_size, H_local * cp_size)
+
 
 def test_cp_size_1_is_identity():
     """When cp_size == 1, all dimension calculations should match the unpartitioned case."""
@@ -585,6 +611,7 @@ def test_cp_size_1_is_identity():
 
     w = mcp.get_conv1d_weight()
     assert w.shape[0] == 32 + 2 * 4 * 16
+
 
 def test_parameter_slices_allow_gradient_flow():
     """Sliced parameters should maintain gradient connectivity to the originals."""

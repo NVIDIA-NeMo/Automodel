@@ -146,13 +146,19 @@ class BiEncoderCollator:
             if self.passage_prefix:
                 doc_examples_flat = [self.passage_prefix + " " + passage for passage in doc_examples_flat]
 
+        # Some tokenizer backends, including MistralCommonBackend, do not support
+        # the return_token_type_ids kwarg and do not advertise token type IDs.
+        token_type_kwargs = {}
+        if "token_type_ids" in getattr(self.tokenizer, "model_input_names", []):
+            token_type_kwargs["return_token_type_ids"] = False
+
         # Tokenize queries (no padding yet)
         query_encodings = self.tokenizer(
             query_examples,
             max_length=self.q_max_len,
             padding=PaddingStrategy.DO_NOT_PAD,
             truncation=True,
-            return_token_type_ids=False,
+            **token_type_kwargs,
         )
 
         # Tokenize documents (no padding yet)
@@ -161,7 +167,7 @@ class BiEncoderCollator:
             max_length=self.p_max_len,
             padding=PaddingStrategy.DO_NOT_PAD,
             truncation=True,
-            return_token_type_ids=False,
+            **token_type_kwargs,
         )
 
         # Merge into features format for unpacking
@@ -205,10 +211,10 @@ class BiEncoderCollator:
         # Per-passage corpus doc ids (positive + negatives, flattened in d_input_ids
         # order) for distributed in-batch same-doc negative masking. Top-level key
         # so it bypasses the q_/d_ unpacking in the trainer.
-        if batch and batch[0].get("doc_id") is not None:
-            doc_id_flat: List[str] = []
-            for x in batch:
-                doc_id_flat.extend(x["doc_id"])
+        doc_id_groups = [x.get("doc_id") for x in batch]
+        # Inline records may not provide IDs; incomplete IDs are unsafe for same-doc masking.
+        if doc_id_groups and all(doc_ids and all(doc_ids) for doc_ids in doc_id_groups):
+            doc_id_flat = [doc_id for doc_ids in doc_id_groups for doc_id in doc_ids]
             merged_batch_dict["passage_doc_ids"] = torch.tensor(
                 [_doc_id_str_to_int64(s) for s in doc_id_flat],
                 dtype=torch.long,

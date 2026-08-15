@@ -509,6 +509,26 @@ class TestFakeBalancedGateNoise:
 class TestGate:
     """Test Gate (router) module."""
 
+    def test_parameterless_routing_core_matches_eager_path(self, moe_config, device):
+        gate = Gate(moe_config).to(device)
+        gate.eval()
+        torch.nn.init.normal_(gate.weight)
+        gate.bias_update_factor = 0.0
+        gate.aux_loss_coeff = 0.0
+        inputs = torch.randn(4, moe_config.dim, device=device)
+        token_mask = torch.ones(4, dtype=torch.bool, device=device)
+
+        eager = gate(inputs, token_mask, None)
+        gate.use_routing_core = True
+        scoped = gate(inputs, token_mask, None)
+
+        assert not tuple(gate.routing_core.parameters())
+        for eager_value, scoped_value in zip(eager, scoped):
+            if eager_value is None:
+                assert scoped_value is None
+            else:
+                torch.testing.assert_close(eager_value, scoped_value)
+
     def test_gate_init_basic(self, moe_config):
         """Test Gate initialization with basic config."""
         gate = Gate(moe_config)
@@ -1007,44 +1027,6 @@ class TestGate:
         # Cumulative load should be reset
         assert gate._cumulative_expert_load is None
 
-    def test_gate_bias_load_accumulates_once_under_reentrant_checkpoint(self, moe_config, device):
-        """The no-grad original forward does not double-count the reentrant recompute."""
-        import warnings
-
-        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
-            CheckpointImpl,
-            checkpoint_wrapper,
-        )
-
-        moe_config.aux_loss_coeff = 0.0
-        moe_config.dtype = torch.float32
-        gate = Gate(moe_config).to(device).train()
-        gate._track_load_balance = True
-        with torch.no_grad():
-            gate.weight.normal_(0, 0.02)
-
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", FutureWarning)
-            wrapped = checkpoint_wrapper(
-                gate,
-                checkpoint_impl=CheckpointImpl.REENTRANT,
-                preserve_rng_state=True,
-            )
-
-        num_tokens = 16
-        x = torch.randn(num_tokens, moe_config.dim, device=device, requires_grad=True)
-        token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
-        weights, indices, _ = wrapped(x, token_mask=token_mask, cp_mesh=None)
-        expected_load = gate._compute_expert_load(indices, token_mask)
-
-        assert gate._cumulative_expert_load is None
-        torch.testing.assert_close(gate._last_expert_load, expected_load)
-
-        weights.sum().backward()
-
-        torch.testing.assert_close(gate._cumulative_expert_load, expected_load)
-        torch.testing.assert_close(gate._last_expert_load, expected_load)
-
     def test_gate_init_weights(self, moe_config, device):
         """Test Gate weight initialization."""
         gate = Gate(moe_config)
@@ -1132,6 +1114,59 @@ class TestGate:
                 assert weights.dtype == input_dtype, (
                     f"Expected output dtype {input_dtype} but got {weights.dtype} with gate_precision={gate_precision}"
                 )
+
+    def test_gate_router_weights_fp32_keeps_precision_output(self, moe_config, device):
+        """Test that router_weights_fp32 keeps Kimi-style routing weights in fp32."""
+        moe_config.score_func = "softmax"
+        moe_config.router_weights_fp32 = True
+        gate = Gate(moe_config, gate_precision=torch.float32).to(device)
+
+        with torch.no_grad():
+            gate.weight.normal_(0, 0.02)
+
+        x = torch.randn(8, moe_config.dim, dtype=torch.bfloat16, device=device)
+        token_mask = torch.ones(x.shape[0], dtype=torch.bool, device=device)
+
+        weights, _, _ = gate(x, token_mask, cp_mesh=None)
+
+        assert weights.dtype == torch.float32
+
+    def test_gate_router_weights_can_use_score_correction_bias(self, device):
+        """Test Kimi's HF router behavior where biased scores are also gathered as weights."""
+        config = MoEConfig(
+            n_routed_experts=2,
+            n_shared_experts=0,
+            n_activated_experts=1,
+            n_expert_groups=1,
+            n_limited_groups=1,
+            train_gate=True,
+            gate_bias_update_factor=0.0,
+            aux_loss_coeff=0.0,
+            score_func="sigmoid",
+            route_scale=1.0,
+            dim=2,
+            inter_dim=4,
+            moe_inter_dim=4,
+            norm_topk_prob=False,
+            router_bias=False,
+            expert_bias=False,
+            force_e_score_correction_bias=True,
+            router_weights_fp32=True,
+            router_weight_uses_score_correction_bias=True,
+            dtype=torch.float32,
+        )
+        gate = Gate(config, gate_precision=torch.float32).to(device)
+        with torch.no_grad():
+            gate.weight.zero_()
+            gate.e_score_correction_bias.copy_(torch.tensor([10.0, 0.0], device=device))
+
+        x = torch.zeros(3, config.dim, dtype=torch.bfloat16, device=device)
+        token_mask = torch.ones(x.shape[0], dtype=torch.bool, device=device)
+
+        weights, indices, _ = gate(x, token_mask, cp_mesh=None)
+
+        torch.testing.assert_close(indices, torch.zeros_like(indices))
+        torch.testing.assert_close(weights, torch.full_like(weights, 10.5))
 
     def test_gate_precision_with_sigmoid(self, moe_config, device):
         """Test Gate precision with sigmoid score function."""

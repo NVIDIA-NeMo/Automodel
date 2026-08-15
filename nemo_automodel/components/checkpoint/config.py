@@ -35,6 +35,7 @@ from huggingface_hub import constants as hf_constants
 from packaging.version import parse
 
 from nemo_automodel.components.checkpoint._backports.filesystem import SerializationFormat
+from nemo_automodel.components.checkpoint.utils import is_cloud_path
 
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
@@ -106,6 +107,10 @@ class CheckpointingConfig:
         None  # copy of the model state dict keys before any parallelization. Kept for BW compatibility.
     )
     is_async: bool = False
+    wait_for_staging: bool = False  # block on async staging before freeing memory; no effect unless is_async
+    cpu_offload: bool = False  # If True, move DCP model and optimizer state dict tensors to CPU before saving.
+    # Permit pickle-based loading of legacy training state. Enable only for checkpoints from a trusted source.
+    allow_legacy_pickle_restore: bool = False
     dequantize_base_checkpoint: bool | None = None
     original_model_root_dir: str | None = None
     skip_task_head_prefixes_for_base_model: list[str] | None = (
@@ -129,13 +134,15 @@ class CheckpointingConfig:
         """Resolve the cache dir, enforce PEFT constraints, and coerce the save format/mode."""
         if self.consolidation_timeout_minutes <= 0:
             raise ValueError("checkpoint.consolidation_timeout_minutes must be greater than 0")
+        if not isinstance(self.allow_legacy_pickle_restore, bool):
+            raise ValueError("checkpoint.allow_legacy_pickle_restore must be a boolean")
 
         if self.model_cache_dir is None:
             self.model_cache_dir = hf_constants.HF_HUB_CACHE
 
         # PEFT checkpointing is not supported for `torch_save`; flip only the two
         # incompatible fields (format -> safetensors, save_consolidated -> FINAL).
-        # All other user-set fields (is_async, staging_dir, v4_compatible,
+        # All other user-set fields (is_async, cpu_offload, staging_dir, v4_compatible,
         # single_rank_consolidation, ...) are preserved.
         if self.is_peft and self.model_save_format == "torch_save":
             logging.warning(
@@ -152,7 +159,7 @@ class CheckpointingConfig:
                 or self.max_recent_checkpoints < 1
             ):
                 raise ValueError("checkpoint.max_recent_checkpoints must be unset or a positive integer")
-            if str(self.checkpoint_dir).startswith("msc://"):
+            if is_cloud_path(self.checkpoint_dir):
                 raise ValueError(
                     "checkpoint.max_recent_checkpoints is only supported for local checkpoint directories; "
                     "unset it when checkpoint.checkpoint_dir uses msc:// storage"
@@ -170,12 +177,13 @@ class CheckpointingConfig:
 
         # Consolidated HF safetensors export needs local filesystem semantics and is not
         # supported on msc:// cloud storage paths; use DCP (save_consolidated=false) instead.
-        if self.save_consolidated != SaveConsolidatedMode.FALSE and str(self.checkpoint_dir).startswith("msc://"):
+        if self.save_consolidated != SaveConsolidatedMode.FALSE and is_cloud_path(self.checkpoint_dir):
             raise ValueError(
                 f"Consolidated safetensors export (save_consolidated={self.save_consolidated.value}) is not "
                 f"compatible with remote cloud storage paths ('{self.checkpoint_dir}'). Set save_consolidated=false "
                 f"to use DCP format with MSC cloud storage instead."
             )
+
         if self.save_consolidated != SaveConsolidatedMode.FALSE and not self.is_peft:
             if self.model_save_format != SerializationFormat.SAFETENSORS:
                 logging.warning(

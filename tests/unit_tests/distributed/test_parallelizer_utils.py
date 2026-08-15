@@ -12,8 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from types import SimpleNamespace
 from typing import List, Tuple
+from unittest.mock import Mock
 
+import pytest
 import torch
 import torch.nn as nn
 from torch.distributed.fsdp import MixedPrecisionPolicy
@@ -24,9 +27,201 @@ from nemo_automodel.components.distributed.parallelizer_utils import (
     _group_params_by_dtype,
     _make_compute_dtype_fn,
     _mp_policy_with_param_dtype,
+    configure_fsdp_unused_param_reduction,
     fully_shard_by_dtype,
     iter_maximal_uniform_dtype_subtrees,
 )
+from nemo_automodel.shared.torch_patches import (
+    patch_fsdp_uniform_reduce_dtype,
+    patch_fsdp_unused_param_reduction,
+)
+
+
+def test_configure_fsdp_unused_param_reduction_uses_public_fsdp_api(monkeypatch):
+    from nemo_automodel.components.distributed import parallelizer_utils
+
+    class FakeFSDPModule(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.calls = []
+
+        def set_reduce_scatter_unused_params(self, enabled, *, recurse):
+            self.calls.append((enabled, recurse))
+
+    install_fallback = Mock()
+    monkeypatch.setattr(parallelizer_utils, "FSDPModule", FakeFSDPModule)
+    monkeypatch.setattr(parallelizer_utils, "_patch_fsdp_unused_param_reduction", install_fallback)
+    model = nn.Sequential(FakeFSDPModule(), nn.Sequential(FakeFSDPModule()))
+
+    assert configure_fsdp_unused_param_reduction(model) == 2
+    install_fallback.assert_not_called()
+    assert model[0].calls == [(True, False)]
+    assert model[1][0].calls == [(True, False)]
+
+
+def test_configure_fsdp_unused_param_reduction_uses_legacy_fallback(monkeypatch):
+    from nemo_automodel.components.distributed import parallelizer_utils
+
+    class LegacyFSDPModule(nn.Module):
+        pass
+
+    install_fallback = Mock()
+    monkeypatch.setattr(parallelizer_utils, "FSDPModule", LegacyFSDPModule)
+    monkeypatch.setattr(parallelizer_utils, "_patch_fsdp_unused_param_reduction", install_fallback)
+    model = nn.Sequential(LegacyFSDPModule(), nn.Sequential(LegacyFSDPModule()))
+
+    assert configure_fsdp_unused_param_reduction(model) == 2
+    install_fallback.assert_called_once_with()
+
+
+def test_legacy_fsdp_unused_param_reduction_fills_missing_local_grad(monkeypatch):
+    from torch.distributed.fsdp._fully_shard._fsdp_common import TrainingState
+    from torch.distributed.fsdp._fully_shard._fsdp_param_group import FSDPParamGroup
+
+    calls = []
+
+    def original_post_backward(self, *args, **kwargs):
+        calls.append((self, args, kwargs))
+        return "post-backward-result"
+
+    monkeypatch.setattr(FSDPParamGroup, "post_backward", original_post_backward)
+    patch_fsdp_unused_param_reduction()
+    patched_post_backward = FSDPParamGroup.post_backward
+
+    param = torch.nn.Parameter(torch.ones(2))
+    fsdp_param = SimpleNamespace(
+        _unsharded_param=param,
+        unsharded_accumulated_grad=None,
+        unsharded_param=param,
+    )
+    param_group = SimpleNamespace(
+        reduce_grads=True,
+        _training_state=TrainingState.PRE_BACKWARD,
+        fsdp_params=[fsdp_param, SimpleNamespace()],
+    )
+
+    result = patched_post_backward(param_group, "arg", flag=True)
+    patch_fsdp_unused_param_reduction()
+
+    assert result == "post-backward-result"
+    assert torch.equal(param.grad, torch.zeros_like(param))
+    assert calls == [(param_group, ("arg",), {"flag": True})]
+    assert FSDPParamGroup.post_backward is patched_post_backward
+
+
+def _install_uniform_reduce_dtype(monkeypatch, recorder):
+    """Install the patch over a stub foreach_reduce that records what it receives."""
+    import torch.distributed.fsdp._fully_shard._fsdp_collectives as collectives
+    import torch.distributed.fsdp._fully_shard._fsdp_param_group as param_group
+
+    def stub(fsdp_params, unsharded_grads, *args, **kwargs):
+        recorder.append([g.dtype for g in unsharded_grads])
+        return "reduced"
+
+    monkeypatch.setattr(collectives, "foreach_reduce", stub)
+    monkeypatch.setattr(param_group, "foreach_reduce", stub)
+    patch_fsdp_uniform_reduce_dtype()
+    return collectives
+
+
+def test_uniform_reduce_dtype_widens_mixed_group(monkeypatch):
+    """A bf16 straggler is widened to match its fp32 peers before the reduce."""
+    seen = []
+    collectives = _install_uniform_reduce_dtype(monkeypatch, seen)
+
+    grads = [torch.ones(2, dtype=torch.float32), torch.full((2,), 5.0, dtype=torch.bfloat16)]
+    result = collectives.foreach_reduce(["p0", "p1"], grads)
+
+    assert result == "reduced"
+    assert seen == [[torch.float32, torch.float32]]
+    # Mutated in place so foreach_reduce's list.clear() still frees the caller's refs.
+    assert [g.dtype for g in grads] == [torch.float32, torch.float32]
+    assert torch.equal(grads[1], torch.full((2,), 5.0))
+
+
+def test_uniform_reduce_dtype_localizes_residual_dtensor(monkeypatch):
+    """The old public unused-param zero is localized before ``chunk_cat``."""
+    import torch.distributed.fsdp._fully_shard._fsdp_collectives as collectives
+    import torch.distributed.fsdp._fully_shard._fsdp_param_group as param_group
+    import torch.distributed.tensor as tensor_module
+
+    class FakeDTensor(torch.Tensor):
+        @staticmethod
+        def __new__(cls, tensor):
+            return torch.Tensor._make_subclass(cls, tensor, False)
+
+        def to_local(self):
+            # Model an EP-local tensor with half of the global expert storage.
+            return self.as_subclass(torch.Tensor)[:2]
+
+    seen = []
+
+    def stub(fsdp_params, unsharded_grads, *args, **kwargs):
+        seen.append([(type(grad), grad.numel()) for grad in unsharded_grads])
+        return "reduced"
+
+    monkeypatch.setattr(tensor_module, "DTensor", FakeDTensor)
+    monkeypatch.setattr(collectives, "foreach_reduce", stub)
+    monkeypatch.setattr(param_group, "foreach_reduce", stub)
+    patch_fsdp_uniform_reduce_dtype()
+
+    grads = [torch.ones(2), FakeDTensor(torch.ones(4))]
+    result = collectives.foreach_reduce(["used", "unused"], grads)
+
+    assert result == "reduced"
+    assert seen == [[(torch.Tensor, 2), (torch.Tensor, 2)]]
+    assert all(type(grad) is torch.Tensor for grad in grads)
+
+
+def test_uniform_reduce_dtype_leaves_uniform_group_untouched(monkeypatch):
+    """Uniform groups pass straight through, preserving upstream's own checks."""
+    seen = []
+    collectives = _install_uniform_reduce_dtype(monkeypatch, seen)
+
+    grads = [torch.ones(2, dtype=torch.bfloat16), torch.ones(2, dtype=torch.bfloat16)]
+    original = [g for g in grads]
+    collectives.foreach_reduce(["p0", "p1"], grads)
+
+    assert seen == [[torch.bfloat16, torch.bfloat16]]
+    assert all(a is b for a, b in zip(grads, original))
+
+
+def test_uniform_reduce_dtype_ignores_non_float_mixtures(monkeypatch):
+    """Non-float gradients are left alone so the upstream assertion still fires."""
+    seen = []
+    collectives = _install_uniform_reduce_dtype(monkeypatch, seen)
+
+    grads = [torch.ones(2, dtype=torch.float32), torch.ones(2, dtype=torch.int32)]
+    collectives.foreach_reduce(["p0", "p1"], grads)
+
+    assert seen == [[torch.float32, torch.int32]]
+
+
+def test_uniform_reduce_dtype_patch_is_idempotent(monkeypatch):
+    """Re-installing must not stack a second wrapper."""
+    seen = []
+    collectives = _install_uniform_reduce_dtype(monkeypatch, seen)
+    wrapped = collectives.foreach_reduce
+
+    patch_fsdp_uniform_reduce_dtype()
+
+    assert collectives.foreach_reduce is wrapped
+
+
+def test_configure_fsdp_unused_param_reduction_installs_dtype_alignment_first(monkeypatch):
+    """The zero fill must wrap the alignment so filled zeros are aligned too."""
+    from nemo_automodel.components.distributed import parallelizer_utils
+
+    class LegacyFSDPModule(nn.Module):
+        pass
+
+    order = []
+    monkeypatch.setattr(parallelizer_utils, "FSDPModule", LegacyFSDPModule)
+    monkeypatch.setattr(parallelizer_utils, "_patch_fsdp_uniform_reduce_dtype", lambda: order.append("uniform_dtype"))
+    monkeypatch.setattr(parallelizer_utils, "_patch_fsdp_unused_param_reduction", lambda: order.append("zero_fill"))
+
+    assert configure_fsdp_unused_param_reduction(nn.Sequential(LegacyFSDPModule())) == 1
+    assert order == ["uniform_dtype", "zero_fill"]
 
 
 def _tag_hf_compute_dtype(model: nn.Module) -> None:
@@ -227,9 +422,27 @@ def test_mp_policy_with_param_dtype_copies_policy():
 
     assert copied_policy is not mp_policy
     assert copied_policy.param_dtype == torch.float32
-    assert copied_policy.reduce_dtype == mp_policy.reduce_dtype
-    assert copied_policy.output_dtype == mp_policy.output_dtype
+    assert copied_policy.reduce_dtype == torch.float32
+    assert copied_policy.output_dtype == torch.float32
+    assert copied_policy.cast_forward_inputs is False
     assert mp_policy.param_dtype == torch.bfloat16
+
+
+def test_mp_policy_with_bf16_param_dtype_preserves_policy():
+    mp_policy = MixedPrecisionPolicy(
+        param_dtype=torch.float32,
+        reduce_dtype=torch.float32,
+        output_dtype=torch.bfloat16,
+        cast_forward_inputs=True,
+    )
+
+    copied_policy = _mp_policy_with_param_dtype(mp_policy, torch.bfloat16)
+
+    assert copied_policy is not mp_policy
+    assert copied_policy.param_dtype == torch.bfloat16
+    assert copied_policy.reduce_dtype == torch.float32
+    assert copied_policy.output_dtype == torch.bfloat16
+    assert copied_policy.cast_forward_inputs is True
 
 
 def test_fully_shard_by_dtype_no_params(monkeypatch):
@@ -548,6 +761,140 @@ def test_fully_shard_by_dtype_two_dtypes(monkeypatch):
     # The least common dtype is float32 ('a'), so only 'a' subtree should be sharded individually
     assert [mod for mod, _ in sub_calls] == [model.a]
     assert sub_calls[0][1].param_dtype == torch.float32
+
+
+def test_fully_shard_by_dtype_excludes_ep_params_and_uses_custom_sharder():
+    """Ignored EP experts do not affect grouping and remain excluded from the block unit."""
+
+    class Router(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.zeros(4, dtype=torch.float32))
+            self.register_buffer("e_score_correction_bias", torch.zeros(4, dtype=torch.float32))
+
+    class MoEBlock(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.bulk_1 = nn.Linear(4, 4, bias=False).to(torch.bfloat16)
+            self.bulk_2 = nn.Linear(4, 4, bias=False).to(torch.bfloat16)
+            self.gate = Router()
+            self.experts = nn.Linear(4, 4, bias=False).to(torch.bfloat16)
+
+    block = MoEBlock()
+    expert_params = set(block.experts.parameters())
+    calls: list[tuple[nn.Module, dict]] = []
+
+    def custom_fully_shard(module, **kwargs):
+        calls.append((module, kwargs))
+
+    fully_shard_by_dtype(
+        block,
+        mesh=object(),
+        mp_policy=_make_mp_policy(),
+        offload_policy=object(),
+        fp32_compute_module_names=("gate.weight", "gate.e_score_correction_bias"),
+        reshard_after_forward=False,
+        ignored_params=expert_params,
+        fully_shard_fn=custom_fully_shard,
+    )
+
+    assert [module for module, _ in calls] == [block.gate, block]
+    assert calls[0][1]["mp_policy"].param_dtype == torch.float32
+    assert "ignored_params" not in calls[0][1]
+    assert calls[1][1]["mp_policy"].param_dtype == torch.bfloat16
+    assert calls[1][1]["ignored_params"] == expert_params
+    assert all(module is not block.experts for module, _ in calls)
+
+
+def test_fully_shard_by_dtype_fp32_holder_uses_full_fp32_policy():
+    """Callable fp32 holders keep fp32 parameters, reductions, and outputs under FSDP."""
+
+    class Fp32Holder(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.zeros(4, dtype=torch.float32))
+
+        def forward(self, value: torch.Tensor) -> torch.Tensor:
+            return value.float() * self.weight
+
+    class HybridBlock(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.input_projection = nn.Linear(4, 4, bias=False).to(torch.bfloat16)
+            self.output_projection = nn.Linear(4, 4, bias=False).to(torch.bfloat16)
+            self._fp32_params = Fp32Holder()
+
+    block = HybridBlock()
+    calls: list[tuple[nn.Module, dict]] = []
+
+    fully_shard_by_dtype(
+        block,
+        mesh=object(),
+        mp_policy=MixedPrecisionPolicy(
+            param_dtype=torch.bfloat16,
+            reduce_dtype=torch.bfloat16,
+            output_dtype=torch.bfloat16,
+            cast_forward_inputs=True,
+        ),
+        offload_policy=object(),
+        fp32_compute_module_names=("_fp32_params",),
+        fully_shard_fn=lambda module, **kwargs: calls.append((module, kwargs)),
+    )
+
+    holder_policy = next(kwargs["mp_policy"] for module, kwargs in calls if module is block._fp32_params)
+    assert holder_policy.param_dtype == torch.float32
+    assert holder_policy.reduce_dtype == torch.float32
+    assert holder_policy.output_dtype == torch.float32
+    assert holder_policy.cast_forward_inputs is False
+
+
+def test_fully_shard_by_dtype_ignored_params_do_not_change_uniform_storage_fallback():
+    """An ignored expert dtype must not make uniform managed master weights look mixed."""
+
+    class BlockWithIgnoredExperts(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.managed = nn.Linear(4, 4, bias=False).to(torch.float32)
+            self.experts = nn.Linear(4, 4, bias=False).to(torch.bfloat16)
+
+    block = BlockWithIgnoredExperts()
+    expert_params = set(block.experts.parameters())
+    calls: list[tuple[nn.Module, dict]] = []
+
+    fully_shard_by_dtype(
+        block,
+        mesh=object(),
+        mp_policy=_make_mp_policy(),
+        offload_policy=object(),
+        ignored_params=expert_params,
+        fully_shard_fn=lambda module, **kwargs: calls.append((module, kwargs)),
+    )
+
+    assert [module for module, _ in calls] == [block]
+    assert calls[0][1]["mp_policy"].param_dtype == torch.bfloat16
+    assert calls[0][1]["ignored_params"] == expert_params
+
+
+def test_fully_shard_by_dtype_rejects_unisolatable_mixed_parameter_owner():
+    """A direct fp32 parameter sharing an owner with bf16 siblings fails early."""
+
+    class MixedRouter(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.zeros(4, dtype=torch.float32))
+            self.bias = nn.Parameter(torch.zeros(4, dtype=torch.bfloat16))
+
+    router = MixedRouter()
+
+    with pytest.raises(ValueError, match="could not isolate parameters with a distinct dtype"):
+        fully_shard_by_dtype(
+            router,
+            mesh=object(),
+            mp_policy=_make_mp_policy(),
+            offload_policy=object(),
+            fp32_compute_module_names=("weight",),
+            fully_shard_fn=lambda *args, **kwargs: None,
+        )
 
 
 def test_fully_shard_by_dtype_three_dtypes(monkeypatch):

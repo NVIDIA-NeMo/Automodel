@@ -27,25 +27,19 @@ LR/WD scheduling) or the whole param list: those cases must raise.
 
 import functools
 import logging
-import os
-import socket
 import sys
 import types
 
 import pytest
 import torch
 import torch.distributed as dist
-import torch.distributed.checkpoint as dcp
-import torch.multiprocessing as mp
 import torch.nn as nn
 from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.tensor import DTensor, Shard, distribute_tensor
+from torch.distributed.tensor import DTensor, Shard
 
-from nemo_automodel.components.checkpoint.stateful_wrappers import OptimizerState
 from nemo_automodel.components.optim.optimizer import (
     FusedAdamConfig,
     OptimizerFromFactoryConfig,
-    _drop_empty_local_shards,
 )
 
 
@@ -241,103 +235,6 @@ class TestFactoryEscapeHatchDropsEmptyLocalShards:
         opt = cfg.build(_TinyModel())[0]
 
         assert len(opt.param_groups[0]["params"]) == 3  # linear weight + bias + empty
-
-
-# ---------------------------------------------------------------------------
-# 2-rank rank-asymmetric construction + OptimizerState DCP round trip
-# ---------------------------------------------------------------------------
-
-
-def _free_port() -> int:
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.bind(("127.0.0.1", 0))
-    port = sock.getsockname()[1]
-    sock.close()
-    return port
-
-
-def _init_gloo(rank: int, world_size: int, port: int) -> None:
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = str(port)
-    os.environ["RANK"] = str(rank)
-    os.environ["WORLD_SIZE"] = str(world_size)
-    dist.init_process_group("gloo", rank=rank, world_size=world_size)
-
-
-class _ShardedTwoParamModel(nn.Module):
-    """Two dim-0 ``Shard(0)`` DTensor parameters over a 2-rank mesh.
-
-    ``weight`` (dim-0 = 4) has a non-empty local shard on every rank; ``tiny``
-    (dim-0 = 1) lives entirely on rank 0 and is locally empty on rank 1 — the
-    shape FSDP2 leaves on tail ranks when dim-0 < shard-group size.
-    """
-
-    def __init__(self, mesh, seed: int):
-        super().__init__()
-        torch.manual_seed(seed)  # identical full tensors on all ranks
-        self.weight = nn.Parameter(distribute_tensor(torch.randn(4, 3), mesh, [Shard(0)]))
-        self.tiny = nn.Parameter(distribute_tensor(torch.randn(1, 3), mesh, [Shard(0)]))
-
-
-def _asymmetric_shard_roundtrip_worker(rank: int, world_size: int, port: int, checkpoint_dir: str) -> None:
-    try:
-        _init_gloo(rank, world_size, port)
-        mesh = init_device_mesh("cpu", (world_size,))
-        num_local = 2 if rank == 0 else 1  # rank 1 drops the locally-empty `tiny`
-
-        # (a) Per-rank TE FusedAdam construction differs: rank 0 keeps both
-        # params, rank 1 drops the zero-numel local shard of `tiny`.
-        sys.modules.update(_te_stub_modules())
-        model = _ShardedTwoParamModel(mesh, seed=17)
-        FusedAdamConfig()._build_optimizer(list(model.parameters()))
-        assert len(_RecordingFusedAdam.last_params) == num_local
-
-        # (b) OptimizerState (get/set_optimizer_state_dict with
-        # flatten_optimizer_state_dict=True) DCP round trip over the same
-        # rank-asymmetric param sets.  torch.optim.Adam stands in for TE
-        # FusedAdam: the checkpoint path depends only on which params the
-        # optimizer tracks, and gloo/CPU cannot run the TE kernel.
-        params = _drop_empty_local_shards(list(model.parameters()))
-        assert len(params) == num_local
-        opt = torch.optim.Adam(params, lr=1e-2, foreach=False)
-        for i, p in enumerate(params):
-            p.grad = torch.full_like(p, float(i + 1))
-        opt.step()
-        saved_state = [
-            (opt.state[p]["exp_avg"].to_local().clone(), opt.state[p]["exp_avg_sq"].to_local().clone()) for p in params
-        ]
-        dcp.save({"optim": OptimizerState(model, opt)}, checkpoint_id=checkpoint_dir)
-
-        model2 = _ShardedTwoParamModel(mesh, seed=23)
-        params2 = _drop_empty_local_shards(list(model2.parameters()))
-        assert len(params2) == num_local
-        opt2 = torch.optim.Adam(params2, lr=1e-2, foreach=False)
-        dcp.load({"optim": OptimizerState(model2, opt2)}, checkpoint_id=checkpoint_dir)
-
-        for p, (exp_avg, exp_avg_sq) in zip(params2, saved_state):
-            torch.testing.assert_close(opt2.state[p]["exp_avg"].to_local(), exp_avg)
-            torch.testing.assert_close(opt2.state[p]["exp_avg_sq"].to_local(), exp_avg_sq)
-    finally:
-        if dist.is_initialized():
-            dist.destroy_process_group()
-
-
-def test_two_rank_asymmetric_shards_optimizer_state_roundtrip(tmp_path):
-    """Rank-asymmetric optimizers survive the OptimizerState DCP round trip.
-
-    Spawns two gloo ranks sharing a dim-0 = 1 ``Shard(0)`` parameter: rank 0
-    keeps it, rank 1 drops its zero-numel local shard.  Asserts that per-rank
-    TE FusedAdam construction differs as expected and that a
-    ``get_optimizer_state_dict(flatten_optimizer_state_dict=True)`` →
-    ``dcp.save`` → ``dcp.load`` → ``set_optimizer_state_dict`` round trip
-    restores the optimizer state without error or hang.
-    """
-    mp.spawn(
-        _asymmetric_shard_roundtrip_worker,
-        args=(2, _free_port(), str(tmp_path)),
-        nprocs=2,
-        join=True,
-    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

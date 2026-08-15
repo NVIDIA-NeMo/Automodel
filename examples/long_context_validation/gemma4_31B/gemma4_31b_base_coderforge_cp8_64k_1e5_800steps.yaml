@@ -55,6 +55,9 @@ checkpoint:
 
 distributed:
   strategy: fsdp2
+  multimodal:
+    # Every rank receives text-only batches, so the frozen multimodal modules are skipped uniformly.
+    frozen_sharding: per_layer
   dp_size: none               # auto: 128 / (tp1 * cp8) = 16
   tp_size: 1
   cp_size: 8                  # 65536 / (2*8) = 4096 -> divisible; 8192 tokens/rank
@@ -78,6 +81,11 @@ dataset:
   split: train
   seq_length: 65536
   padding: do_not_pad
+  # Assistant-only masking comes from a Gemma4 chat template with {% generation %}
+  # blocks (tokenizer returns the assistant mask directly). The stock Gemma4
+  # template has no generation block, forcing the prefix-arithmetic fallback that
+  # #3024's guard rejects for multi-turn conversations. Renders byte-identically.
+  chat_template: examples/long_context_validation/gemma4_31B/gemma4_coderforge_chat_template.jinja
   shuffle_seed: 42
 
 dataloader:

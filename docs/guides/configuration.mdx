@@ -3,16 +3,16 @@ title: "YAML Configuration"
 description: ""
 position: 4
 ---
-NeMo AutoModel recipes are configured with YAML. Under the hood, YAML is parsed into a `ConfigNode` which:
+NeMo AutoModel recipes use YAML configs. The YAML parser creates a `ConfigNode` that performs the following actions:
 
-- Translates common scalar strings into typed Python values (e.g., `"10"` → `10`).
-- Resolves `_target_` (and `*_fn`) into Python callables/classes.
-- Supports environment variable interpolation inside YAML strings.
-- Tries to make config printing safe by preserving original placeholders (to avoid leaking secrets).
+- Translates common scalar strings into typed Python values (for example, `"10"` → `10`)
+- Resolves `_target_` and `*_fn` into Python callables and classes
+- Supports environment variable interpolation inside YAML strings
+- Makes config printing safer by preserving original placeholders to avoid leaking secrets
 
 ## Load Model and Dataset Configs
 
-Most recipes load YAML configs by using `nemo_automodel.components.config.loader.load_yaml_config()`, which returns a `ConfigNode`.
+Most recipes load YAML configs using `nemo_automodel.components.config.loader.load_yaml_config()`, which returns a `ConfigNode`.
 
 A `ConfigNode` handles values as follows:
 
@@ -33,7 +33,7 @@ YAML-native types (such as `step_size: 10` without quotes) are already typed by 
 
 ## Use `_target_` for Instantiation
 
-Any mapping containing a `_target_` key can be instantiated using `ConfigNode.instantiate()`:
+Any mapping containing a `_target_` key can be instantiated using `ConfigNode.instantiate()`.
 
 ```yaml
 model:
@@ -56,6 +56,7 @@ Target resolution is intentionally permissive and should be treated as code exec
 
 <Warning>
 Only load configuration files and `_target_` values from trusted sources. A YAML file that names an importable package or Python file can execute arbitrary Python code during target resolution.
+
 </Warning>
 
 ## Distributed Section (Strategy-Based)
@@ -64,12 +65,15 @@ The `distributed:` section is **not** instantiated using `_target_`. Recipes par
 
 ## Prewarm One-Time CUDA Initialization
 
-The LLM training/fine-tuning and VLM fine-tuning recipes accept an optional `prewarm:` section:
+{/* docs-review-start: mamba-ssd-prewarm */}
+
+The LLM training, LLM fine-tuning, and VLM fine-tuning recipes accept an optional `prewarm:` section.
 
 ```yaml
 prewarm:
   cublas_backward: true
   fla_gdn_autotune: true
+  mamba_ssd_autotune: true
   comm_groups: true
 ```
 
@@ -77,6 +81,7 @@ All options default to `false`. Enable only the warmup associated with an observ
 
 - `cublas_backward` initializes cuBLAS backward workspaces during setup.
 - `fla_gdn_autotune` autotunes flash-linear-attention gated-delta-net Triton kernels during setup.
+- `mamba_ssd_autotune` autotunes Mamba SSD Triton kernels during setup.
 - `comm_groups` initializes the process groups used by gradient-norm collectives.
 
 <Info>
@@ -84,11 +89,15 @@ Prewarming is most useful for long-context or otherwise memory-constrained runs.
 
 Adding GPUs helps only when it sufficiently reduces the relevant per-rank tensors. Each rank still initializes its own resources, and additional parallel dimensions can introduce more communication groups. Shorter contexts can leave enough memory for lazy initialization, while longer contexts might require the same initialization during setup. Long-context hybrid-attention MoE workloads are one common case. Enable each prewarm based on the observed first-step failure rather than a model name. Prewarming does not reduce steady-state memory or imply support for a particular context length.
 
+Triton reuses an autotuned configuration according to each kernel's explicit cache key. The Mamba SSD warmup therefore matches the real head, state, group, chunk, and dtype geometry but uses batch size 1 and two chunks. Batch size and sequence length change the launch grid and activation footprint, but they are not cache keys in the pinned Mamba SSD kernels. Keeping those dimensions small is intentional: using the full training batch and sequence would recreate the peak-memory condition that setup prewarming is meant to avoid.
+
 </Info>
+
+{/* docs-review-end: mamba-ssd-prewarm */}
 
 ## Repair Near-Zero Input Embeddings
 
-The LLM training/fine-tuning recipe can repair a small number of damaged input-embedding rows after loading the base checkpoint and before creating the optimizer:
+The LLM training and fine-tuning recipe can repair a small number of damaged input-embedding rows after loading the base checkpoint and before creating the optimizer.
 
 ```yaml
 embedding_row_repair:
@@ -99,6 +108,27 @@ embedding_row_repair:
 Rows with a non-finite L2 norm or a norm at or below `min_norm` are replaced with the corresponding output-embedding direction, scaled to the RMS norm of healthy input rows. Setup logs the affected token IDs. `max_rows` is a safety limit: setup aborts instead of rewriting a broadly damaged or mismatched checkpoint.
 
 This option is intended for diagnosed checkpoint defects where rare token IDs produce extreme input-embedding gradients. It is disabled when the section is absent and is not currently supported with pipeline parallelism.
+
+For diagnosis, safety behavior, verification steps, and performance impact, see [Repair Damaged Input-Embedding Rows](/model-coverage/troubleshooting#repair-damaged-input-embedding-rows).
+
+### Frozen Multimodal FSDP Policy
+
+FSDP2 uses the correctness-first `root` policy for fully frozen vision/audio towers and multimodal projectors.
+
+```yaml
+distributed:
+  strategy: fsdp2
+  multimodal:
+    frozen_sharding: root
+```
+
+The supported policies are:
+
+- `root` (default): the always-run outer FSDP root owns frozen multimodal parameters. This keeps collective ordering aligned when some ranks execute a modality branch and others skip it.
+- `per_layer`: layers inside the frozen multimodal module get their normal FSDP units. This can reduce peak unshard memory, but it is an expert option: every rank in the FSDP group must execute or skip those units the same number of times and in the same order on every microbatch.
+- `replicate`: frozen multimodal parameters are excluded from FSDP and copied on every rank. This removes their collectives at the cost of higher per-rank parameter memory.
+
+This setting does not change modules that contain any trainable parameters. For nested MoE or VLM models, `root` requires `distributed.moe.wrap_outer_model: true` when a fully frozen multimodal module is outside the inner text-model FSDP root. Use `per_layer` or `replicate` if the outer model must remain unwrapped.
 
 ## Interpolate Environment Variables in YAML
 
@@ -125,6 +155,8 @@ NeMo AutoModel supports env var interpolation inside YAML **string values**.
 
 ### Example (Databricks Delta)
 
+The following configuration shows an example of environment variable interpolation for a Databricks Delta dataset.
+
 ```yaml
 dataset:
   _target_: nemo_automodel.components.datasets.llm.column_mapped_text_instruction_iterable_dataset.ColumnMappedTextInstructionIterableDataset
@@ -137,9 +169,9 @@ dataset:
 
 ## Prevent Secret Leakage in Logs
 
-When an env var placeholder is resolved, the config keeps the original placeholder in an internal `._orig_value` field for **safe printing**:
+When an env var placeholder is resolved, the config keeps the original placeholder in an internal `._orig_value` field for **safe printing**.
 
-- `str(cfg)` / `repr(cfg)` prints placeholders (e.g. `${DATABRICKS_TOKEN}`), not resolved secrets.
+- `str(cfg)` or `repr(cfg)` prints placeholders (for example, `${DATABRICKS_TOKEN}`), not resolved secrets.
 - `cfg.to_yaml_dict(use_orig_values=True, redact_sensitive=True)` is the recommended way to produce a loggable YAML dict.
 
 <Info>

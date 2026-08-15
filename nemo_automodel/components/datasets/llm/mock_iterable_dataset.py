@@ -14,13 +14,12 @@
 
 from __future__ import annotations
 
-import hashlib
 from collections.abc import Iterator
 from copy import copy
 from dataclasses import dataclass
 
 import torch
-from torch.utils.data import IterableDataset
+from torch.utils.data import IterableDataset, get_worker_info
 
 
 @dataclass
@@ -103,7 +102,7 @@ class MockIterableDataset(IterableDataset):
         sharded._shard_index = index
         return sharded
 
-    def __iter__(self) -> Iterator[dict[str, torch.Tensor | str]]:
+    def __iter__(self) -> Iterator[dict[str, torch.Tensor]]:
         """Generate deterministic synthetic batches.
 
         Yields:
@@ -111,8 +110,11 @@ class MockIterableDataset(IterableDataset):
             [batch, sequence] on CPU. Labels are shifted input IDs with the last token set to -100.
         """
         generator = torch.Generator(device="cpu")
-        generator.manual_seed(self.seed + self._shard_index)
-        for _ in range(self.num_samples):
+        worker_info = get_worker_info()
+        worker_id = worker_info.id if worker_info is not None else 0
+        num_workers = worker_info.num_workers if worker_info is not None else 1
+        generator.manual_seed(self.seed + self._shard_index * num_workers + worker_id)
+        for _ in range(worker_id, self.num_samples, num_workers):
             # Generate random tokens for the batch
             tokens = torch.randint(0, self.vocab_size, (self.batch_size, self.seq_len), generator=generator)
 
@@ -122,15 +124,10 @@ class MockIterableDataset(IterableDataset):
             # Create position ids
             position_ids = torch.arange(self.seq_len).unsqueeze(0).expand(self.batch_size, -1)
 
-            fingerprint = hashlib.sha256()
-            fingerprint.update(tokens.numpy().tobytes())
-            fingerprint.update(labels.numpy().tobytes())
-
             yield {
                 "input_ids": tokens,
                 "labels": labels,
                 "position_ids": position_ids,
-                "mock_data_fingerprint": fingerprint.hexdigest(),
             }
 
     def __len__(self) -> int:

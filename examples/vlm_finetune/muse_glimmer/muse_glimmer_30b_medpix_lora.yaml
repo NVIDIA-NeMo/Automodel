@@ -1,0 +1,145 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Single-node LoRA fine-tuning for the 30B dense MuseGlimmer VLM on MedPix-VQA.
+# The 8-GPU FSDP2 mesh shards the frozen base model while LoRA updates only
+# language attention and MLP projections. The vision tower remains frozen.
+#
+# Run on one 8-GPU node:
+#   automodel examples/vlm_finetune/muse_glimmer/muse_glimmer_30b_medpix_lora.yaml --nproc-per-node 8
+
+recipe: FinetuneRecipeForVLM
+seed: 1234
+
+step_scheduler:
+  global_batch_size: 8
+  local_batch_size: 1
+  ckpt_every_steps: 1000
+  val_every_steps: 1000
+  log_remote_every_steps: 1
+  gc_every_steps: 5
+  num_epochs: 1
+  max_steps: 100
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 1234
+  ranked: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: meta-models/Muse-Glimmer-30B
+  torch_dtype: bfloat16
+  attn_implementation: sdpa
+  backend:
+    attn: sdpa
+    linear: torch
+    rms_norm: torch_fp32
+    rope_fusion: false
+  use_liger_kernel: false
+
+processor:
+  _target_: transformers.AutoProcessor.from_pretrained
+  pretrained_model_name_or_path: meta-models/Muse-Glimmer-30B
+  trust_remote_code: true
+
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  match_all_linear: false
+  target_modules:
+    - "model.layers.*.self_attn.q_proj"
+    - "model.layers.*.self_attn.k_proj"
+    - "model.layers.*.self_attn.v_proj"
+    - "model.layers.*.self_attn.o_proj"
+    - "model.layers.*.self_attn.output_gate_proj"
+    - "model.layers.*.mlp.gate_proj"
+    - "model.layers.*.mlp.up_proj"
+    - "model.layers.*.mlp.down_proj"
+  dim: 16
+  alpha: 32
+  dropout: 0.0
+  use_memory_efficient_lora: true
+  use_triton: true
+
+checkpoint:
+  enabled: false
+  checkpoint_dir: checkpoints/muse_glimmer_30b_medpix_lora/
+  model_save_format: safetensors
+  save_consolidated: false
+
+distributed:
+  strategy: fsdp2
+  dp_size: none
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  ep_size: 1
+  sequence_parallel: false
+  activation_checkpointing: true
+  defer_fsdp_grad_sync: false
+
+freeze_config:
+  freeze_vision_tower: true
+  freeze_audio_tower: true
+  freeze_language_model: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset
+  path_or_dataset: mmoukouba/MedPix-VQA
+  split: train
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 0
+  drop_last: true
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.vlm.collate_fns.default_collate_fn
+    max_length: 1024
+
+# Keep the W&B artifact to exactly 100 optimizer steps.
+validation_dataset: none
+validation_dataloader: none
+
+optimizer:
+  _target_: torch.optim.AdamW
+  betas: [0.9, 0.999]
+  eps: 1e-8
+  lr: 1.0e-4
+  weight_decay: 0
+
+lr_scheduler:
+  lr_decay_style: cosine
+  min_lr: 1.0e-6
+
+wandb:
+  enable: false
+  project: automodel-muse-glimmer
+  entity: <your_wandb_entity>
+  name: muse_glimmer_30b_medpix_lora_100steps
+  group: muse_glimmer_30b_medpix_lora
+  tags: [muse_glimmer, 30b, dense, vlm, medpix, lora, fsdp2, single-node]
+  dir: logs/muse_glimmer_30b_medpix_lora/wandb
+
+ci:
+  recipe_owner: HuiyingLi
+  nodes: 1
+  time: "01:00:00"
+  max_steps: 5

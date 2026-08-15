@@ -64,8 +64,11 @@ from nemo_automodel.components.checkpoint.utils import (
     is_tied_word_embeddings,
     materialize_missing_tied_lm_head,
 )
+from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 
 _PREFIX = "model."
+_OPTIMIZER_PARTS_KEY = "optimizer_parts"
+_OPTIMIZER_PART_KEY_PREFIX = "stage_"
 
 
 def _is_quantized_module(module: torch.nn.Module) -> bool:
@@ -92,6 +95,49 @@ def _has_expert_parallelism(model: torch.nn.Module) -> bool:
     return any(getattr(m, "ep_size", 1) > 1 for m in model.modules())
 
 
+def _zeros_like_optimizer_param(param: torch.Tensor) -> torch.Tensor:
+    """Allocate zero optimizer state matching a parameter.
+
+    Args:
+        param: Tensor of arbitrary shape representing one optimizer parameter.
+
+    Returns:
+        Zero tensor with the same shape, dtype, device, and layout as ``param``.
+    """
+    try:
+        return torch.zeros_like(param, memory_format=torch.preserve_format)
+    except TypeError:
+        return torch.zeros_like(param)
+
+
+def _materialize_missing_adam_state(optimizer: torch.optim.Optimizer) -> None:
+    """Create zero-valued Adam state for parameters that do not have state yet."""
+    if not isinstance(optimizer, (torch.optim.Adam, torch.optim.AdamW)):
+        return
+
+    for group in optimizer.param_groups:
+        step_dtype = (
+            torch.float32
+            if group.get("fused", False)
+            else torch.float64
+            if torch.get_default_dtype() == torch.float64
+            else torch.float32
+        )
+        for param in group["params"]:
+            state = optimizer.state[param]
+            if "step" not in state:
+                if group.get("capturable", False) or group.get("fused", False):
+                    state["step"] = torch.zeros((), dtype=step_dtype, device=param.device)
+                else:
+                    state["step"] = torch.tensor(0.0, dtype=step_dtype)
+            if "exp_avg" not in state:
+                state["exp_avg"] = _zeros_like_optimizer_param(param)
+            if "exp_avg_sq" not in state:
+                state["exp_avg_sq"] = _zeros_like_optimizer_param(param)
+            if group.get("amsgrad", False) and "max_exp_avg_sq" not in state:
+                state["max_exp_avg_sq"] = _zeros_like_optimizer_param(param)
+
+
 def _get_peft_state_dict(model: torch.nn.Module) -> dict[str, Any]:
     """Extract only trainable PEFT adapter weights, bypassing DCP.
 
@@ -105,7 +151,7 @@ def _get_peft_state_dict(model: torch.nn.Module) -> dict[str, Any]:
         if param.requires_grad:
             # Strip _checkpoint_wrapped_module. from FQNs to match DCP's normalization.
             # Without this, activation checkpointing causes key mismatches on reload.
-            name = name.replace("_checkpoint_wrapped_module.", "")
+            name = canonical_parameter_fqn(name)
             param = param.full_tensor() if hasattr(param, "full_tensor") else param
             state_dict[name] = param.detach().cpu()
     return state_dict
@@ -196,7 +242,7 @@ def _set_peft_state_dict(model: torch.nn.Module, state_dict: dict[str, Any]) -> 
 
     # Strip _checkpoint_wrapped_module. from FQNs to match DCP's normalization.
     # Without this, activation checkpointing causes key mismatches on reload.
-    param_dict = {name.replace("_checkpoint_wrapped_module.", ""): param for name, param in model.named_parameters()}
+    param_dict = {canonical_parameter_fqn(name): param for name, param in model.named_parameters()}
     loaded, skipped = 0, 0
 
     for name, saved_tensor in state_dict.items():
@@ -296,7 +342,10 @@ class ModelState:
         is_peft: bool = False,
         is_init_step: bool = False,
         skip_task_head_prefixes: list[str] | None = None,
+        cpu_offload: bool = False,
         pp_group: "torch.distributed.ProcessGroup | None" = None,
+        *,
+        has_expert_parallelism: bool = False,
     ):
         """
         Initialize a ModelState instance for distributed checkpointing.
@@ -316,12 +365,17 @@ class ModelState:
                 - ["classifier."] for sequence/token classification
                 - ["qa_outputs."] for question answering
                 - ["score."] for some classification heads
+            cpu_offload: Whether DCP should move sharded tensors to CPU before saving.
             pp_group (ProcessGroup | None): Pipeline-parallel process group. When
                 set and ``pp_size > 1``, PEFT adapter weights are all-gathered
                 across this group at save time so the on-disk adapter contains
                 every PP stage's layers (not just the local stage's). Required
                 for correct PEFT saves under pipeline parallelism; ignored for
                 non-PEFT models and no-op when ``pp_size == 1``.
+            has_expert_parallelism: Whether the distributed topology uses expert
+                parallelism. This runtime topology signal keeps PEFT loading on
+                the same path across pipeline ranks, including stages without a
+                local expert module.
         """
         self.model = [model] if isinstance(model, torch.nn.Module) else model
         self.uses_tied_lm_head = is_tied_word_embeddings(self.model[0])
@@ -333,7 +387,9 @@ class ModelState:
         self.is_peft = is_peft
         self.is_init_step = is_init_step
         self.skip_task_head_prefixes = skip_task_head_prefixes or []
+        self.cpu_offload = cpu_offload
         self.pp_group = pp_group
+        self.has_expert_parallelism = has_expert_parallelism
 
     def _refresh_local_tied_lm_head(self) -> None:
         """Refresh tied-head metadata after DCP has normalized module state."""
@@ -347,7 +403,7 @@ class ModelState:
         Get the model's state dictionary.
 
         Returns:
-            dict: Dictionary containing the model's state dict with CPU offloading enabled.
+            Dictionary containing the model state dict, optionally offloaded to CPU.
         """
         if self.is_init_step:
             return self._get_base_model_state_dict()
@@ -373,7 +429,7 @@ class ModelState:
         if use_local_peft_collection:
             model_state_dict = {k: v for sd in map(_get_peft_state_dict, self.model) for k, v in sd.items()}
         else:
-            options = None
+            options = StateDictOptions(cpu_offload=True) if self.cpu_offload else None
             if self.is_peft:
                 options = StateDictOptions(full_state_dict=True, cpu_offload=True, ignore_frozen_params=True)
 
@@ -439,11 +495,14 @@ class ModelState:
             _drop_outer_prefix(state_dict, "base_model.model.")
             # DoRA: reverse the HF PEFT key rename so DCP can match model params
             _rename_dora_keys_from_hf(state_dict)
-            # @akoumpa: I'm not sure about this code.
             # For EP models, DCP's set_model_state_dict silently skips EP-sharded
             # LoRA params (strict=False hides the FQN mismatch caused by custom
             # expert state_dict() keys like gate_up_linear.weight0). Bypass DCP.
-            if _has_expert_parallelism(self.model[0]):
+            # Use the global topology signal first: under PP, some ranks may not
+            # own an expert layer, and choosing from local modules would make
+            # ranks enter different DCP collectives. Inspect every local model
+            # part as a fallback for callers that do not provide the topology.
+            if self.has_expert_parallelism or any(_has_expert_parallelism(part) for part in self.model):
                 for model_part in self.model:
                     _set_peft_state_dict(model_part, state_dict)
                 return
@@ -516,9 +575,13 @@ class OptimizerState:
     def __init__(
         self,
         model: torch.nn.Module | list[torch.nn.Module],
-        optimizer: torch.optim.Optimizer,
+        optimizer: torch.optim.Optimizer | list[torch.optim.Optimizer],
         scheduler: Optional[Any] = None,
         is_peft: bool = False,
+        cpu_offload: bool = False,
+        *,
+        has_expert_parallelism: bool = False,
+        optimizer_part_ids: list[int] | None = None,
     ):
         """
         Initialize an OptimizerState instance.
@@ -528,27 +591,50 @@ class OptimizerState:
         and restored by the Distributed Checkpointing (DCP) framework.
 
         Args:
-            model (torch.nn.Module): The neural-network model whose parameters the
-                optimizer updates. Keeping the reference allows DCP to re-establish
-                the model–optimizer relationship when loading a checkpoint.
-            optimizer (torch.optim.Optimizer): Optimizer whose internal buffers
-                (e.g., momentum, Adam moments, step counters) need to be saved and
-                restored.
+            model: Neural-network model or pipeline model parts whose parameters
+                the optimizer updates. Keeping the references allows DCP to
+                re-establish each model–optimizer relationship when loading a
+                checkpoint.
+            optimizer: Optimizer or per-model-part optimizers whose internal
+                buffers (e.g., momentum, Adam moments, step counters) need to be
+                saved and restored.
             scheduler (Optional[Any], optional): Learning-rate scheduler to track
                 alongside the optimizer. Pass ``None`` if no scheduler is used.
             is_peft (bool): Whether the model uses PEFT adapters (e.g. LoRA/QLoRA).
+            cpu_offload: Whether DCP should move sharded tensors to CPU before saving.
+            has_expert_parallelism: Whether the distributed topology uses expert
+                parallelism. This runtime topology signal avoids inferring global
+                EP state from only one local pipeline part.
+            optimizer_part_ids: Global pipeline-stage indices corresponding to
+                ``optimizer``. These namespace native optimizer state across PP
+                ranks so different stages cannot produce overlapping DCP keys.
         """
         self.model = [model] if isinstance(model, torch.nn.Module) else model
         self.optimizer = [optimizer] if isinstance(optimizer, torch.optim.Optimizer) else optimizer
         self.scheduler = [scheduler] if isinstance(scheduler, torch.optim.lr_scheduler.LRScheduler) else scheduler
         self.is_peft = is_peft
+        self.cpu_offload = cpu_offload
+        self.optimizer_part_ids = optimizer_part_ids
+        if self.optimizer_part_ids is not None:
+            if len(self.optimizer_part_ids) != len(self.optimizer):
+                raise ValueError(
+                    "Optimizer part IDs must match the local optimizer layout: "
+                    f"received {len(self.optimizer_part_ids)} IDs for {len(self.optimizer)} optimizers."
+                )
+            if len(set(self.optimizer_part_ids)) != len(self.optimizer_part_ids):
+                raise ValueError(f"Optimizer part IDs must be unique, got {self.optimizer_part_ids}.")
+        self._use_native_optimizer_state = self.is_peft and (
+            has_expert_parallelism
+            or any(_has_expert_parallelism(model_part) for model_part in self.model)
+            or any(_has_quantized_params(model_part) for model_part in self.model)
+        )
 
     def state_dict(self) -> dict[str, Any]:
         """
         Get the optimizer and scheduler state dictionaries.
 
         Returns:
-            dict: Dictionary containing the optimizer and scheduler state dicts with CPU offloading enabled.
+            Dictionary containing the optimizer and scheduler state dicts, optionally offloaded to CPU.
         """
         # For PEFT models with quantized parameters or expert parallelism, bypass
         # PyTorch DCP's get_optimizer_state_dict() which fails because DCP cannot
@@ -556,14 +642,29 @@ class OptimizerState:
         # quantized frozen params (Params4bit/Int8Params) alongside trainable LoRA
         # params, or when expert weights are sharded across EP ranks (MoE+EP) and
         # the optimizer only tracks trainable params. Use native state_dict instead.
-        if self.is_peft and (_has_expert_parallelism(self.model[0]) or _has_quantized_params(self.model[0])):
-            optimizer_state_dict = self.optimizer[0].state_dict()
+        if self._use_native_optimizer_state:
+            for optimizer in self.optimizer:
+                _materialize_missing_adam_state(optimizer)
+            if self.optimizer_part_ids is None:
+                if len(self.optimizer) != 1:
+                    raise ValueError(
+                        "Native optimizer checkpointing requires global optimizer part IDs "
+                        f"when saving {len(self.optimizer)} local optimizer parts."
+                    )
+                optimizer_state_dict = self.optimizer[0].state_dict()
+            else:
+                optimizer_state_dict = {
+                    _OPTIMIZER_PARTS_KEY: {
+                        f"{_OPTIMIZER_PART_KEY_PREFIX}{part_id}": optimizer.state_dict()
+                        for part_id, optimizer in zip(self.optimizer_part_ids, self.optimizer, strict=True)
+                    }
+                }
         else:
             # this line automatically manages FSDP FQN's, as well as sets the default state dict type
             # to FSDP.SHARDED_STATE_DICT
             func = partial(
                 get_optimizer_state_dict,
-                options=StateDictOptions(flatten_optimizer_state_dict=True),
+                options=StateDictOptions(flatten_optimizer_state_dict=True, cpu_offload=self.cpu_offload),
             )
             optimizer_state_dict = {k: v for sd in map(func, self.model, self.optimizer) for k, v in sd.items()}
 
@@ -582,9 +683,30 @@ class OptimizerState:
         Args:
             state_dict (dict): State dictionary containing optimizer and scheduler states to load.
         """
-        # For PEFT + quantized or expert-parallel models, use native load to match the native save path.
-        if self.is_peft and (_has_expert_parallelism(self.model[0]) or _has_quantized_params(self.model[0])):
-            self.optimizer[0].load_state_dict(state_dict["optim"])
+        # Mirror state_dict(): PEFT with quantized parameters or EP topology uses native optimizer state.
+        if self._use_native_optimizer_state:
+            optimizer_state_dict = state_dict["optim"]
+            if self.optimizer_part_ids is None:
+                if len(self.optimizer) != 1:
+                    raise ValueError(
+                        "Native optimizer checkpointing requires global optimizer part IDs "
+                        f"when loading {len(self.optimizer)} local optimizer parts."
+                    )
+                self.optimizer[0].load_state_dict(optimizer_state_dict)
+            else:
+                optimizer_parts = optimizer_state_dict.get(_OPTIMIZER_PARTS_KEY)
+                if not isinstance(optimizer_parts, dict):
+                    raise ValueError(
+                        f"Pipeline native optimizer checkpoint is missing the '{_OPTIMIZER_PARTS_KEY}' state mapping."
+                    )
+                expected_part_keys = [f"{_OPTIMIZER_PART_KEY_PREFIX}{part_id}" for part_id in self.optimizer_part_ids]
+                if set(optimizer_parts) != set(expected_part_keys):
+                    raise ValueError(
+                        "Optimizer checkpoint parts do not match the current pipeline layout: "
+                        f"checkpoint has {sorted(optimizer_parts)}, current rank expects {sorted(expected_part_keys)}."
+                    )
+                for optimizer, part_key in zip(self.optimizer, expected_part_keys, strict=True):
+                    optimizer.load_state_dict(optimizer_parts[part_key])
         else:
             # sets our state dicts on the optimizer, now that we've loaded
             func = partial(

@@ -35,7 +35,7 @@ from nemo_automodel.components.models.deepseek_v3.rope_utils import (
     freqs_cis_from_position_ids,
     precompute_freqs_cis,
 )
-from nemo_automodel.components.models.glm_moe_dsa.cp import make_glm_dsa_packed_cp_batch_and_ctx
+from nemo_automodel.components.models.glm_moe_dsa.cp import shard_glm_dsa_packed_cp_batch
 from nemo_automodel.components.models.glm_moe_dsa.layers import GlmMoeDsaMLA
 from nemo_automodel.components.models.glm_moe_dsa.optimized_kernels import prepare_cudnn_dsa_packed_metadata
 from nemo_automodel.components.models.glm_moe_dsa.state_dict_adapter import GlmMoeDsaStateDictAdapter
@@ -208,10 +208,27 @@ class GlmMoeDsaModel(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Run the decoder stack, returning ``(hidden_states, topk_indices)``.
 
-        ``prev_topk_indices`` seeds the IndexShare running selection (used under pipeline
-        parallelism, where an earlier "full" layer lives on the previous stage); it is ``None``
-        in the single-process path. The returned ``topk_indices`` is the running selection at the
-        end of this stage's layers, so it can be carried to the next pipeline stage.
+        Args:
+            input_ids: Token IDs with shape ``[batch, sequence]`` (or packed
+                ``[tokens]``), or previous-stage hidden states with the matching token
+                axes plus ``[hidden]`` when this pipeline stage has no embedding.
+            position_ids: Optional integer positions with the same token axes as
+                ``input_ids``. Packed THD callers supply shape ``[tokens]``.
+            attention_mask: Optional token mask with shape ``[batch, sequence]`` or
+                additive attention mask broadcastable to ``[batch, heads, query, key]``.
+            padding_mask: Optional boolean mask with the input token axes; ``True``
+                marks padding. Packed THD callers supply shape ``[tokens]``.
+            prev_topk_indices: Optional previous pipeline stage's IndexShare selection,
+                shaped ``[batch, sequence, K]`` or packed ``[tokens, 1, K]``. Packed
+                values are global THD padded-storage K/V coordinates.
+            **attn_kwargs: Attention layout metadata. Packed THD uses ``cu_seqlens``
+                and optional ``cu_seqlens_padded`` of shape ``[sequences + 1]``, plus
+                optional ``glm_dsa_cp_query_indices`` of shape ``[tokens]`` containing
+                global padded-storage query coordinates.
+
+        Returns:
+            Hidden states with the input token axes plus ``[hidden]``, and the latest
+            IndexShare top-k tensor in the corresponding BSHD or packed THD layout.
         """
         if position_ids is None:
             position_ids = (
@@ -294,9 +311,17 @@ class GlmMoeDsaModel(nn.Module):
             if layer is not None:
                 layer.init_weights(buffer_device=buffer_device)
 
+    def update_moe_gate_bias(self) -> None:
+        """Update the noaux router correction bias of each local MoE layer; dense layers and disabled gates are skipped."""
+        with torch.no_grad():
+            for block in self.layers.values():
+                if isinstance(block.mlp, MoE) and block.mlp.gate.bias_update_factor > 0:
+                    block.mlp.gate.update_bias()
+
 
 class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
+    _packed_cp_attn_backends = ("tilelang", "cudnn")
 
     @dataclass(frozen=True)
     class ModelCapabilities:
@@ -367,39 +392,50 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     def set_output_embeddings(self, new_embeddings):
         self.lm_head = new_embeddings
 
+    def update_moe_gate_bias(self) -> None:
+        """Delegate the noaux router correction-bias update to the inner model."""
+        self.model.update_moe_gate_bias()
+
     def should_pack_validation_with_training(self) -> bool:
         """Return whether validation must use the optimized packed THD layout."""
         return getattr(self.backend, "attn", None) in ("tilelang", "cudnn")
 
-    def prepare_model_inputs_for_cp(self, input_ids: torch.Tensor, **kwargs: Any) -> dict[str, Any]:
-        """Attach GLM DSA's packed THD batch sharder.
+    def prepare_model_inputs_for_cp(
+        self,
+        batch: dict[str, Any],
+        *,
+        num_chunks: int = 1,
+    ) -> dict[str, Any]:
+        """Attach GLM DSA's packed THD context-parallel batch sharder.
 
         Args:
-            input_ids: Token-ID tensor of shape ``[batch, sequence]`` before CP sharding.
-            **kwargs: Sharding options, including the non-tensor ``num_chunks`` value.
-
-        Returns:
-            Mapping containing the GLM DSA packed-CP batch callback.
-
-        Raises:
-            NotImplementedError: If the attention backend is not a GLM DSA packed backend.
-                TileLang and cuDNN both support the model-owned packed CP path.
+            batch: The batch dict.
+            num_chunks: Number of chunks for load-balanced CP sharding.
         """
         from functools import partial  # noqa: PLC0415
 
+        from nemo_automodel.components.distributed.context_parallel.sharder import (  # noqa: PLC0415
+            ContextParallelSharder,
+            contiguous_local_indices,
+        )
+
         attn_backend = getattr(self.backend, "attn", None)
-        if attn_backend not in ("tilelang", "cudnn"):
+        if attn_backend not in self._packed_cp_attn_backends:
             raise NotImplementedError(
-                "GLM DSA packed batch preparation requires backend.attn in {'tilelang', 'cudnn'}; "
+                "GLM DSA packed context parallelism requires backend.attn in {'tilelang', 'cudnn'}; "
                 f"got backend.attn={attn_backend!r}."
             )
 
-        return {
-            "_cp_make_batch_fn": partial(
-                make_glm_dsa_packed_cp_batch_and_ctx,
-                num_chunks=int(kwargs.get("num_chunks", 1)),
+        cp_sharder = ContextParallelSharder(
+            shard_batch=partial(
+                shard_glm_dsa_packed_cp_batch,
+                num_chunks=int(num_chunks),
             ),
-        }
+            # Contiguous over the packed THD token axis: rank r keeps
+            # tokens [r * T/cp, (r + 1) * T/cp).
+            local_token_global_indices=contiguous_local_indices,
+        )
+        return {"cp_sharder": cp_sharder}
 
     def _is_pipeline_parallel_stage(self) -> bool:
         """True when this module is a trimmed pipeline-parallel stage (not the whole model)."""
@@ -482,7 +518,7 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
         *carry: torch.Tensor,
         position_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
@@ -527,6 +563,7 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             float32 top-k carry tensors in the layouts described above; the last stage returns
             a logits tensor of shape ``[batch, sequence, vocab]``.
         """
+
         output_hidden_states = (
             output_hidden_states
             if output_hidden_states is not None

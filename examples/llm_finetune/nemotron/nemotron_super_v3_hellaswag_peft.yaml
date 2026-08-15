@@ -110,6 +110,9 @@ lr_scheduler:
 ci:
   vllm_deploy: true
   vllm_smoke_test: true
+  vllm_deploy_gpus: 8  # the 120B BF16 model requires TP=8 for vLLM deployment
+  vllm_deploy_time: "00:30:00"
+  vllm_enable_expert_parallel: false  # vLLM 0.19 does not support expert parallelism with runtime LoRA
   recipe_owner: adil-a
   time: "00:25:00"
   checkpoint_robustness:
@@ -118,6 +121,9 @@ ci:
     trust_remote_code: true
     tokenizer_name: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16
     hf_device_map_auto: true
+    # Vanilla Transformers intentionally omits the training-only MTP modules.
+    # Exact-match every adapter tensor it can instantiate and allow only MTP keys.
+    hf_adapter_ignored_key_prefix: "base_model.model.mtp."
     no_check_resume: true
     dataset.num_samples_limit: 500
     validation_dataset.num_samples_limit: 500

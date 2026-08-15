@@ -138,6 +138,52 @@ class TestGetAttnImplementation:
         cfg.get = MagicMock(return_value="flash_attention_2")
         assert get_attn_implementation(cfg) == "te"
 
+    def test_built_model_wins_over_stale_config(self):
+        """A packed run force-switches the model to flash; the config keeps saying sdpa."""
+        cfg = MagicMock()
+        del cfg.backend
+        cfg.get.return_value = "sdpa"
+        model = SimpleNamespace(config=SimpleNamespace(_attn_implementation="flash_attention_2"))
+        assert get_attn_implementation(cfg, model=model) == "flash_attention_2"
+
+    def test_backend_config_wins_over_built_model(self):
+        """Custom models keep naming their backend; ``te`` inits through sdpa."""
+        cfg = SimpleNamespace(backend=SimpleNamespace(attn="te"))
+        model = SimpleNamespace(config=SimpleNamespace(_attn_implementation="sdpa"))
+        assert get_attn_implementation(cfg, model=model) == "te"
+
+    def test_reads_through_ddp_wrapper(self):
+        """DDP holds the model as ``.module`` and does not proxy attribute access."""
+        cfg = MagicMock()
+        del cfg.backend
+        cfg.get.return_value = "sdpa"
+        inner = SimpleNamespace(config=SimpleNamespace(_attn_implementation="flash_attention_2"))
+        assert get_attn_implementation(cfg, model=SimpleNamespace(module=inner)) == "flash_attention_2"
+
+    def test_kernels_hub_id_maps_back_to_mainline_flash(self):
+        """Transformers records a kernels-hub id when only ``kernels`` provides FA2."""
+        cfg = MagicMock()
+        del cfg.backend
+        cfg.get.return_value = "flash_attention_2"
+        model = SimpleNamespace(config=SimpleNamespace(_attn_implementation="kernels-community/flash-attn2"))
+        assert get_attn_implementation(cfg, model=model) == "flash_attention_2"
+
+    @pytest.mark.parametrize(
+        "model",
+        [
+            SimpleNamespace(),
+            SimpleNamespace(config=SimpleNamespace()),
+            SimpleNamespace(config=SimpleNamespace(_attn_implementation=None)),
+            # A dispatch key naming no layout packing knows about must not select one.
+            SimpleNamespace(config=SimpleNamespace(_attn_implementation="some_future_backend")),
+        ],
+    )
+    def test_falls_back_to_config_when_model_names_no_known_backend(self, model):
+        cfg = MagicMock()
+        del cfg.backend
+        cfg.get.return_value = "eager"
+        assert get_attn_implementation(cfg, model=model) == "eager"
+
 
 # ---------------------------------------------------------------------------
 # configure_packing
@@ -145,9 +191,9 @@ class TestGetAttnImplementation:
 
 
 class TestConfigurePacking:
-    @pytest.mark.parametrize("attn_implementation", ["sdpa", "flash_attention_3"])
+    @pytest.mark.parametrize("attn_implementation", ["sdpa", "eager"])
     def test_noop_for_unsupported_backends(self, attn_implementation, monkeypatch):
-        """configure_packing should not install FA2 shims for unsupported backends."""
+        """configure_packing should not install flash-attn shims for unsupported backends."""
         patch_preprocess = MagicMock()
         monkeypatch.setattr(
             "nemo_automodel.components.models.common.packing._patch_preprocess_mask_arguments_for_packing",
@@ -158,8 +204,9 @@ class TestConfigurePacking:
 
         patch_preprocess.assert_not_called()
 
-    def test_patches_flash_attention_utils(self):
-        """configure_packing should patch _get_unpad_data for flash_attention_2."""
+    @pytest.mark.parametrize("attn_implementation", ["flash_attention_2", "flash_attention_3", "flash_attention_4"])
+    def test_patches_flash_attention_utils(self, attn_implementation):
+        """configure_packing should patch _get_unpad_data for every flash-attention variant."""
         import transformers.masking_utils as masking_utils
         import transformers.modeling_flash_attention_utils as fa_utils
 
@@ -167,7 +214,7 @@ class TestConfigurePacking:
         original_preprocess = masking_utils._preprocess_mask_arguments
         original_flag = getattr(masking_utils, "_nemo_automodel_packing_preprocess_patched", None)
         try:
-            configure_packing("flash_attention_2")
+            configure_packing(attn_implementation)
             assert fa_utils._get_unpad_data is get_unpad_data
         finally:
             fa_utils._get_unpad_data = original
@@ -257,8 +304,8 @@ class TestConfigurePacking:
             else:
                 masking_utils._nemo_automodel_packing_preprocess_patched = original_flag
 
-    def test_qwen3_uses_generic_preprocess_shim(self):
-        """Qwen3 should preserve indexed masks without a model-specific module patch."""
+    def test_qwen3_preserves_indexed_mask(self):
+        """Qwen3 should preserve indexed masks after packing is configured."""
         import transformers.masking_utils as masking_utils
         import transformers.modeling_flash_attention_utils as fa_utils
         import transformers.models.qwen3.modeling_qwen3 as modeling_qwen3
@@ -266,7 +313,6 @@ class TestConfigurePacking:
         original_unpad = fa_utils._get_unpad_data
         original_preprocess = masking_utils._preprocess_mask_arguments
         original_flag = getattr(masking_utils, "_nemo_automodel_packing_preprocess_patched", None)
-        original_create_causal_mask = modeling_qwen3.create_causal_mask
         try:
             configure_packing("flash_attention_2")
             mask = torch.tensor([[1, 1, 2, 2, 0]], dtype=torch.long)
@@ -278,7 +324,6 @@ class TestConfigurePacking:
                 position_ids=torch.arange(5).unsqueeze(0),
             )
 
-            assert modeling_qwen3.create_causal_mask is original_create_causal_mask
             assert result is mask
         finally:
             fa_utils._get_unpad_data = original_unpad

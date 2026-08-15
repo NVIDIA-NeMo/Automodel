@@ -34,12 +34,15 @@ Mirrors the structure of ``deepseek_v4/optimized_kernels.py``.
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Literal
 
 import torch
 
 from nemo_automodel.components.models.glm_moe_dsa.kernels._tilelang import HAS_TILELANG
 from nemo_automodel.shared.import_utils import safe_import_from
+
+if TYPE_CHECKING:
+    from nemo_automodel.components.models.glm_moe_dsa.kernels.cudnn_dsa import CudnnDsaPackedMetadata
 
 # GLM-5.2 resolves explicit optimized backends in ``_dsa_kernel_backend`` in
 # ``layers.py``; "auto" remains accepted for parity with the V4 dispatcher.
@@ -116,8 +119,27 @@ def prepare_cudnn_dsa_packed_metadata(
     query_indices: torch.Tensor | None = None,
     cu_seqlens_padded: torch.Tensor | None = None,
     padding_mask: torch.Tensor | None = None,
-) -> Any:
-    """Prepare reusable local-query/global-key packed metadata once per stage."""
+) -> CudnnDsaPackedMetadata:
+    """Prepare reusable local-query/global-key packed metadata once per stage.
+
+    Args:
+        cu_seqlens: CUDA int32 compact real-token offsets of shape
+            ``[sequences + 1]``.
+        total_key_tokens: Number of rows in the gathered padded-storage K/V tensor.
+        max_seqlen: Optional maximum real sequence length as an integer or scalar
+            integer tensor.
+        query_indices: Optional CUDA integer tensor of shape ``[local_tokens]``
+            containing each local query's global padded-storage coordinate.
+        cu_seqlens_padded: Optional CUDA int32 padded-storage boundaries of shape
+            ``[sequences + 1]``.
+        padding_mask: Optional local boolean tensor of shape ``[local_tokens]``;
+            ``True`` marks a padded query row.
+
+    Returns:
+        Segmented cuDNN metadata whose query and key-source fields use global
+        padded-storage coordinates and whose causal offsets locate each segment's
+        first local query within its document.
+    """
     return _prepare_cudnn_dsa_packed_metadata(
         cu_seqlens,
         total_key_tokens,
@@ -136,7 +158,7 @@ def cudnn_indexer_topk(
     index_topk: int,
     query_indices: torch.Tensor | None = None,
     cu_seqlens_padded: torch.Tensor | None = None,
-    packed_metadata: Any | None = None,
+    packed_metadata: CudnnDsaPackedMetadata | None = None,
 ) -> torch.Tensor:
     """Select fixed-width top-k indices with the cuDNN DSA indexer.
 
@@ -152,7 +174,7 @@ def cudnn_indexer_topk(
             cumulative lengths for the compact packed-token layout.
         index_topk: Fixed number of key indices emitted for every query token.
         query_indices: Optional CUDA integer tensor of shape ``[tokens]`` containing
-            global query positions. Reserved for context-parallel layouts.
+            global padded-storage query coordinates for context-parallel layouts.
         cu_seqlens_padded: Optional CUDA int32 tensor of shape ``[sequences + 1]``
             containing cumulative lengths for a padded packed-token layout.
         packed_metadata: Optional reusable segmented metadata prepared once for the
@@ -160,7 +182,8 @@ def cudnn_indexer_topk(
 
     Returns:
         Contiguous CUDA int32 tensor of shape ``[tokens, 1, index_topk]``. Invalid
-        or causal-masked slots use ``-1``.
+        or causal-masked slots use ``-1``; valid values are global padded-storage
+        K/V coordinates.
     """
     return _cudnn_indexer_topk(
         index_q,
