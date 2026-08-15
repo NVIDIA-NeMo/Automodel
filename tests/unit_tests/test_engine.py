@@ -365,9 +365,11 @@ def test_forward_backward_sets_moe_scale_in_every_door(monkeypatch):
 
 
 def test_datum_backward_cancels_fsdp_grad_average(monkeypatch):
+    # The Datum-door backward scales by the DP-only size (CP is handled by the
+    # output gather), so a 4x DP group yields 4x the pre-average gradient.
     grads = {}
     for dp in (1, 4):
-        monkeypatch.setattr(Engine, "dp_size", property(lambda self, _dp=dp: _dp))
+        monkeypatch.setattr(Engine, "_dp_only_size", property(lambda self, _dp=dp: _dp))
         engine, model = _engine()
         torch.manual_seed(1)
         engine.forward_backward([_datums()])
@@ -459,14 +461,8 @@ def test_pack_datums_forward_extraction_parity():
         assert torch.allclose(en_a, en_b)
 
 
-def test_pack_datums_rejected_under_cp():
-    engine, _ = _engine()
-    engine.config.pack_datums = True
-    engine.device_mesh = _FakeCpMesh(2)
-    with pytest.raises(NotImplementedError, match="pack_datums"):
-        engine.forward_backward([_datums()])
-    with pytest.raises(NotImplementedError, match="pack_datums"):
-        engine.forward(_datums())
+# CP correctness for the Datum door (padded and packed) is covered by the
+# multi-GPU parity test in tests/functional_tests/ (padded/packed vs CP=1).
 
 
 def test_pack_datums_implies_packed_sequence_model_build(monkeypatch):

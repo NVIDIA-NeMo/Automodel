@@ -400,25 +400,35 @@ def packed_sequence_thd_collater(batch):
     }
 
 
-def pack_features_for_thd(features: list[dict], *, ignore_index: int = -100) -> dict:
+def pack_features_for_thd(
+    features: list[dict], *, ignore_index: int = -100, pad_to_multiple: int = 1, padding_token_id: int = 0
+) -> dict:
     """Concatenate loose single-sequence features into one pre-packed THD record.
 
     Each input feature holds one unpadded variable-length sequence
     (``input_ids`` and optionally ``labels``). The output is a single record in
     the pre-packed schema :func:`packed_sequence_thd_collater` accepts: flat
     ``input_ids``/``labels``, ``position_ids`` restarting at every sequence
-    boundary, and per-sequence ``seq_lens``/``seq_lens_padded`` (no separator
-    tokens, so the two are equal).
+    boundary, and per-sequence ``seq_lens``/``seq_lens_padded``.
 
     Deciding *which* sequences share a pack is the caller's job (the sampler,
     or an RL framework's microbatcher); this helper only executes the
     concatenation.
+
+    ``pad_to_multiple`` (``2 * cp_size`` for TE THD context parallelism) rounds
+    **each** sequence's length up to a multiple, so the pad lands at every
+    sequence boundary and the load-balanced CP split lines up with the sequence
+    boundaries. ``seq_lens`` stays the real per-sequence lengths; only
+    ``seq_lens_padded`` grows (this is the runtime analogue of the recipe's
+    offline ``pack_dataset(cp_size=...)`` per-sequence alignment).
 
     Args:
         features: per-example dicts with ``input_ids`` and optional ``labels``
             (``list[int]`` or 1-D tensors). An example without ``labels``
             contributes ``ignore_index`` at every position (no loss).
         ignore_index: label fill value for examples without labels.
+        pad_to_multiple: round each sequence's length up to a multiple of this.
+        padding_token_id: token id for the per-sequence pad.
 
     Returns:
         One pre-packed feature record (plain lists), suitable as a batch item
@@ -426,10 +436,12 @@ def pack_features_for_thd(features: list[dict], *, ignore_index: int = -100) -> 
     """
     if not features:
         raise ValueError("pack_features_for_thd requires at least one feature")
+    mult = max(pad_to_multiple, 1)
     input_ids: list[int] = []
     labels: list[int] = []
     position_ids: list[int] = []
     seq_lens: list[int] = []
+    seq_lens_padded: list[int] = []
     for feature in features:
         ids = list(feature["input_ids"])
         if not ids:
@@ -437,16 +449,22 @@ def pack_features_for_thd(features: list[dict], *, ignore_index: int = -100) -> 
         example_labels = list(feature["labels"]) if "labels" in feature else [ignore_index] * len(ids)
         if len(example_labels) != len(ids):
             raise ValueError(f"labels length {len(example_labels)} does not match input_ids length {len(ids)}")
-        input_ids.extend(ids)
-        labels.extend(example_labels)
-        position_ids.extend(range(len(ids)))
-        seq_lens.append(len(ids))
+        real = len(ids)
+        padded = -(-real // mult) * mult  # ceil(real, mult)
+        pad = padded - real
+        # Per-sequence pad: masked out (ignore_index) and dropped by the
+        # consumer's real-length slice; positions continue through the pad.
+        input_ids.extend(ids + [padding_token_id] * pad)
+        labels.extend(example_labels + [ignore_index] * pad)
+        position_ids.extend(range(padded))
+        seq_lens.append(real)
+        seq_lens_padded.append(padded)
     return {
         "input_ids": input_ids,
         "labels": labels,
         "position_ids": position_ids,
         "seq_lens": seq_lens,
-        "seq_lens_padded": list(seq_lens),
+        "seq_lens_padded": seq_lens_padded,
     }
 
 

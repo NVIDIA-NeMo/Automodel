@@ -914,3 +914,23 @@ class TestPackFeaturesForThd:
         assert batch["qkv_format"] == "thd"
         assert batch["input_ids"].shape == (1, 5)
         assert batch["seq_lens"][0].tolist() == [3, 2]
+
+    def test_pad_to_multiple_pads_each_sequence(self):
+        # CP alignment: each sequence rounds up to the multiple (3 -> 4, 2 -> 4);
+        # seq_lens stays real, only seq_lens_padded and the token stream grow, and
+        # the pad lands at each sequence boundary (positions continue through it).
+        record = sftp.pack_features_for_thd(
+            [{"input_ids": [10, 11, 12], "labels": [11, 12, -100]}, {"input_ids": [20, 21], "labels": [21, 22]}],
+            pad_to_multiple=4,
+            padding_token_id=0,
+        )
+        assert record["seq_lens"] == [3, 2]
+        assert record["seq_lens_padded"] == [4, 4]
+        assert record["input_ids"] == [10, 11, 12, 0, 20, 21, 0, 0]
+        assert record["labels"] == [11, 12, -100, -100, 21, 22, -100, -100]
+        assert record["position_ids"] == [0, 1, 2, 3, 0, 1, 2, 3]
+
+    def test_pad_to_multiple_one_is_a_noop(self):
+        record = sftp.pack_features_for_thd([{"input_ids": [1, 2, 3]}], pad_to_multiple=1)
+        assert record["seq_lens"] == record["seq_lens_padded"] == [3]
+        assert record["input_ids"] == [1, 2, 3]

@@ -157,6 +157,7 @@ def collate_datums(
     *,
     packed: bool = False,
     pad_seq_len_divisible: int | None = None,
+    pack_pad_to_multiple: int = 1,
     ignore_index: int = CROSS_ENTROPY_IGNORE_IDX,
 ) -> dict[str, torch.Tensor]:
     """Collate a list of :class:`Datum` into a model-ready batch dict.
@@ -199,8 +200,11 @@ def collate_datums(
     features = [datums[i].to_features(ignore_index=ignore_index) for i in range(len(datums))]
     if packed:
         # Concatenate all datums into one pre-packed record and let the
-        # canonical THD collater produce the [1, total] schema.
-        batch = packed_sequence_thd_collater([pack_features_for_thd(features, ignore_index=ignore_index)])
+        # canonical THD collater produce the [1, total] schema. Under CP the
+        # total is rounded up to 2*cp_size with a trailing pad (real per-datum
+        # lengths are unchanged).
+        record = pack_features_for_thd(features, ignore_index=ignore_index, pad_to_multiple=pack_pad_to_multiple)
+        batch = packed_sequence_thd_collater([record])
     else:
         batch = default_collater([dict(f) for f in features], pad_seq_len_divisible)
 

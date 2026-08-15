@@ -140,9 +140,9 @@ class Engine:
         # padded [B, T] layout. Text-only: Datum carries no media fields, and
         # VLM packing needs model-coupled mRoPE positions (see neat_packing_vlm).
         # Implies has_packed_sequence for config-built models so packed-aware
-        # backends (e.g. fused-RoPE disabling) are configured correctly.
-        # Not supported with context parallelism yet (loss-input co-sharding is
-        # a planned follow-up).
+        # backends (e.g. fused-RoPE disabling) are configured correctly. Under CP
+        # each sequence is padded to 2*cp_size and the per-token outputs are
+        # gathered back to full length (see _build_model_output).
         pack_datums: bool = False
         fp8: Any = None
         compile: Any = None
@@ -322,6 +322,19 @@ class Engine:
         return group.size()
 
     @property
+    def _dp_only_size(self) -> int:
+        """DP group size excluding CP — the ranks that hold *different* data.
+
+        CP ranks share the same sequences (one shard each), so token counts and
+        the loss-average compensation must reduce over DP only; the CP dimension
+        is handled by the differentiable gather in :meth:`_build_model_output`.
+        """
+        if not self.device_mesh:
+            return dist.get_world_size() if dist.is_initialized() else 1
+        group = self._dp_group(include_cp=False)
+        return group.size() if group is not None else 1
+
+    @property
     def dp_rank(self) -> int:
         if not self.device_mesh:
             return dist.get_rank() if dist.is_initialized() else 0
@@ -447,7 +460,9 @@ class Engine:
                 prepare_for_final_backward(self.model_parts, pp_enabled=False)
 
             mb = self._batch_to_device(mb, device)
-            train_ctx, mb = self._shard_batch_for_cp(mb)
+            # dict door computes loss on the CP-local shard (recipe pattern), so
+            # it needs no gather — drop the sharder.
+            train_ctx, mb, _ = self._shard_batch_for_cp(mb)
             labels = mb.pop("labels", None)
             sync_ctx = get_sync_ctx(model, is_last, self.config.defer_fsdp_grad_sync) if is_train else nullcontext()
             with train_ctx(), sync_ctx:
@@ -518,16 +533,16 @@ class Engine:
         model = self.model_parts[0]
         device = self.device
         packed = self._packing_datums()
-        batch = self._batch_to_device(collate_datums(datums, packed=packed), device)
-        if packed:
-            train_ctx = nullcontext  # caller-visible CP is rejected; the pack is final
-        else:
-            train_ctx, batch = self._shard_batch_for_cp(batch)
+        pad_mult = 2 * self._cp_size() if (packed and self._cp_size() > 1) else 1  # TE THD needs total % (2*cp) == 0
+        batch = self._batch_to_device(collate_datums(datums, packed=packed, pack_pad_to_multiple=pad_mult), device)
+        # Both layouts CP-shard through the same sharder (padded [B,T] or flat THD),
+        # then gather per-token outputs back to full length in _build_model_output.
+        train_ctx, batch, sharder = self._shard_batch_for_cp(batch)
         labels = batch.pop("labels", None)
         adapter_ctx = self.disable_adapter() if disable_adapters else nullcontext()
         with torch.no_grad(), adapter_ctx, train_ctx():
             out = model(**filter_forward_kwargs(model, batch))
-        return self._build_model_output(out, datums, labels, detach=True, packed=packed)
+        return self._build_model_output(out, datums, labels, detach=True, packed=packed, sharder=sharder)
 
     @contextmanager
     def disable_adapter(self):
@@ -552,12 +567,21 @@ class Engine:
         *,
         detach: bool,
         packed: bool = False,
+        sharder: Any = None,
     ) -> ModelOutput:
         """Slice the model output into per-datum fields.
 
         The padded layout slices row ``i`` of ``[B, T, ...]`` to each datum's
         length; the packed layout (``packed=True``) splits the flat
         ``[1, total_tokens, ...]`` row by the datums' sequence lengths in order.
+
+        Under context parallelism the model output covers only this rank's token
+        shard. The per-token results (logprobs/entropy/values, one scalar per
+        token — cheap to move, unlike the full-vocab logits) are computed locally
+        and then differentiably gathered back to full length via ``sharder``
+        before slicing, so each per-datum tensor is whole and pairs with the
+        caller's full-length ``loss_fn_inputs``. Backward routes each token's
+        gradient back to the rank that owned it.
 
         Duck-typed on what the model *emits*, not on any role config — the
         Engine surfaces what is there, it does not know "actor"/"critic": a
@@ -568,10 +592,21 @@ class Engine:
         per-head engine subclasses). With ``detach`` the graph is dropped.
         """
         seq_lens = [d.seq_len for d in datums]
+        cp_active = sharder is not None and self._cp_size() > 1
+        # Under CP the packed stream is per-sequence padded to 2*cp (matching the
+        # collate); split by those padded lengths, then trim each to its real
+        # length. cp<=1 has no pad, so padded lengths == seq_lens.
+        pad_mult = 2 * self._cp_size() if (packed and cp_active) else 1
+        padded_lens = [-(-sl // pad_mult) * pad_mult for sl in seq_lens]
 
         def per_datum(token_tensor: torch.Tensor) -> list[torch.Tensor]:
+            if cp_active:
+                # Gather this rank's [.., T_local] shard back to the full [.., T]
+                # coordinate (padded [B,T] or flat THD).
+                token_tensor = sharder.gather_token_tensor(token_tensor, seq_dim=1, trim=True, fill=0.0)
             if packed:
-                return list(split_per_datum(token_tensor[0], seq_lens))
+                pieces = split_per_datum(token_tensor[0], padded_lens)
+                return [piece[:sl] for piece, sl in zip(pieces, seq_lens)]
             return [token_tensor[i, : d.seq_len] for i, d in enumerate(datums)]
 
         per_values = None
@@ -594,6 +629,10 @@ class Engine:
             logits = out  # raw logits tensor
         if logits is not None:
             if labels is not None:
+                # The THD path flattens labels to [total] while logits stays
+                # [1, total, V]; realign to the logits' token layout ([B, T] or
+                # [1, total]) so the per-token gather has matching ranks.
+                labels = labels.reshape(logits.shape[:-1])
                 token_lp = selected_token_logprobs(logits, labels.clamp_min(0))  # [B, T] / [1, total]
                 per_logprobs = per_datum(token_lp)
             token_ent = compute_entropy(logits)  # [B, T] / [1, total]
@@ -655,25 +694,28 @@ class Engine:
             if is_train and is_last:
                 prepare_for_final_backward(self.model_parts, pp_enabled=False)
 
-            batch = self._batch_to_device(collate_datums(mb, packed=packed), device)
-            if packed:
-                train_ctx = nullcontext  # CP with pack_datums is rejected upfront
-            else:
-                train_ctx, batch = self._shard_batch_for_cp(batch)
+            pad_mult = (
+                2 * self._cp_size() if (packed and self._cp_size() > 1) else 1
+            )  # TE THD needs total % (2*cp) == 0
+            batch = self._batch_to_device(collate_datums(mb, packed=packed, pack_pad_to_multiple=pad_mult), device)
+            # CP shards the tokens (padded [B,T] or flat THD); _build_model_output
+            # gathers the per-token outputs back to full length via the sharder.
+            train_ctx, batch, sharder = self._shard_batch_for_cp(batch)
             labels = batch.pop("labels", None)
             sync_ctx = get_sync_ctx(model, is_last, self.config.defer_fsdp_grad_sync) if is_train else nullcontext()
             fwd_ctx = nullcontext() if is_train else torch.no_grad()
             with fwd_ctx, train_ctx(), sync_ctx:
                 out = model(**filter_forward_kwargs(model, batch))
-                mo = self._build_model_output(out, mb, labels, detach=False, packed=packed)
+                mo = self._build_model_output(out, mb, labels, detach=False, packed=packed, sharder=sharder)
                 per_datum_losses = loss_fn(mo, mb, **loss_kwargs)
                 loss = self._reduce_datum_losses(per_datum_losses, mb, token_denom, sample_denom)
                 if is_train:
-                    # The loss is normalized by the global (all-reduced) denominator,
-                    # so summing grads across ranks — not FSDP's average — yields the
-                    # exact global mean. Cancel the average over the flattened DP-CP
-                    # group (recipe non-PP convention).
-                    (loss * self.dp_size).backward()
+                    # The loss is normalized by the global (DP-reduced) token count,
+                    # so summing grads across DP ranks — not FSDP's average — yields
+                    # the exact global mean; multiply by the DP size to cancel that
+                    # average. CP is excluded here: its ranks hold the same tokens
+                    # and their gradient is already summed by the gather.
+                    (loss * self._dp_only_size).backward()
             loss_sum = loss_sum + loss.detach()
             agg_logprobs.extend(t.detach() for t in (mo.logprobs or []))
             agg_entropy.extend(t.detach() for t in (mo.entropy or []))
@@ -837,7 +879,9 @@ class Engine:
             token_local += float(w.sum()) if w is not None else float(d.seq_len)
         sample_local = float(len(datums))
 
-        group = self._dp_group(include_cp=True)
+        # Reduce over DP only: CP ranks hold the same datums (double-counting
+        # over CP would shrink the loss by cp_size).
+        group = self._dp_group(include_cp=False)
         if group is not None and dist.is_initialized():
             t = torch.tensor([token_local, sample_local], device=self.device)
             dist.all_reduce(t, op=dist.ReduceOp.SUM, group=group)
@@ -1032,17 +1076,8 @@ class Engine:
         return self.device_mesh["cp"].size()
 
     def _packing_datums(self) -> bool:
-        """Whether the Datum path packs microbatches, validating the CP limit."""
-        if not self.config.pack_datums:
-            return False
-        if self._cp_size() > 1:
-            raise NotImplementedError(
-                "pack_datums is not supported with context parallelism yet: the Engine "
-                "does not co-shard Datum.loss_fn_inputs or gather per-datum logprobs across "
-                "CP ranks (planned follow-up, see Automodel issue #2861). "
-                "Use padded datums (pack_datums=False) under CP."
-            )
-        return True
+        """Whether the Datum path packs each microbatch into one flat THD row."""
+        return bool(self.config.pack_datums)
 
     def _set_moe_scale(self, num_microbatches: int) -> None:
         """Set the per-microbatch MoE auxiliary-loss scale for one optimizer step.
@@ -1087,4 +1122,7 @@ class Engine:
             padding_token_id=self.config.cp_padding_token_id,
             num_chunks=self.config.cp_num_chunks,
         )
-        return sharder.shard(batch)
+        ctx, batch = sharder.shard(batch)
+        # Return the sharder so the Datum path can gather per-token outputs
+        # (logprobs/entropy/values) back to full length before slicing per datum.
+        return ctx, batch, sharder
