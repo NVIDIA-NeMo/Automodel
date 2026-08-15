@@ -268,6 +268,11 @@ ENV FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1
 
 COPY --chown=${RUNTIME_UID}:${RUNTIME_GID} . /opt/Automodel
 
+# The checkout is owned by RUNTIME_UID but the image still runs as root by default,
+# so Git would reject /opt/Automodel for dubious ownership. Trust it system-wide to
+# keep both identities able to read the repository history.
+RUN git config --system --add safe.directory /opt/Automodel
+
 # Re-apply PyTorch overrides after full COPY (which overwrites the modified pyproject.toml/uv.lock)
 RUN if [ "$BASE_IMAGE" = "pytorch" ]; then \
         bash docker/common/update_pyproject_pytorch.sh /opt/Automodel; \
