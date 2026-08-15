@@ -4,28 +4,31 @@ description: "End-to-end multi-turn, function-calling SFT on Qwen2.5-3B with the
 position: 4
 ---
 
-This guide fine-tunes **Qwen2.5-3B** for **multi-turn agentic tool use** with [NeMo AutoModel](https://github.com/NVIDIA-NeMo/Automodel): given a set of tool definitions and a conversation that interleaves tool calls and tool responses, the model learns to emit correct `tool_calls` (tool name + arguments) and to use the returned results across several turns.
+This guide explains how to fine-tune **Qwen2.5-3B** for **multi-turn agentic tool use** with [NeMo AutoModel](https://github.com/NVIDIA-NeMo/Automodel). The model receives tool definitions and a conversation that interleaves tool calls and responses. It learns to emit correct `tool_calls` (tool name and arguments) and use the returned results across several turns.
 
 <Note>
-This is the **multi-turn** counterpart to the single-turn [Function Calling with FunctionGemma](/recipes-e2e-examples/function-calling) guide. That guide maps one user query to one set of tool calls via `make_xlam_dataset`; this guide handles full multi-turn agent traces (`user → tool_call → tool response → assistant → ...`) via `make_agent_chat_dataset`.
+This is the **multi-turn** counterpart to the single-turn [Function Calling with FunctionGemma](/recipes-e2e-examples/function-calling) guide. That guide maps one user query to one set of tool calls using `make_xlam_dataset`. This guide handles full multi-turn agent traces (`user → tool_call → tool response → assistant → ...`) using `make_agent_chat_dataset`.
+
 </Note>
 
-## What is Multi-Turn Agent SFT?
+## Multi-Turn Agent SFT
 
-A multi-turn agent trace contains, in order:
+A multi-turn agent trace contains the following elements in order:
 
-- a **user** request,
-- one or more **assistant** turns that may emit `tool_calls` (with parallel calls in a single turn),
-- **tool** responses paired back to those calls, and
-- a final **assistant** answer that uses the tool results.
+- A **user** request
+- One or more **assistant** turns that might emit `tool_calls` (with parallel calls in a single turn)
+- **Tool** responses paired back to those calls
+- A final **assistant** answer that uses the tool results
 
-The training data is a set of such traces plus the **tool schema** available to the model. The dataset adapter renders each trace through the tokenizer's chat template with `answer_only_loss_mask=True`, so **only assistant and tool-call tokens contribute to the loss** — `user` and `tool` tokens are masked out.
+The training data is a set of such traces plus the **tool schema** available to the model. The dataset adapter renders each trace through the tokenizer's chat template with `answer_only_loss_mask=True`. Only assistant and tool-call tokens contribute to the loss. The adapter masks `user` and `tool` tokens.
 
-## The Task
+## Define the Fine-Tuning Task
 
-We fine-tune on the [llamafactory/glaive_toolcall_en](https://huggingface.co/datasets/llamafactory/glaive_toolcall_en) dataset (ShareGPT function-calling traces).
+You fine-tune on the [llamafactory/glaive_toolcall_en](https://huggingface.co/datasets/llamafactory/glaive_toolcall_en) dataset, which contains ShareGPT function-calling traces.
 
-| | Behavior |
+The following table compares the target behavior with the base model's behavior:
+
+| Model | Behavior |
 |---|---|
 | **Base model** | Often answers in free-form text, invents tool names, or emits malformed argument JSON. |
 | **After SFT** | Emits structured `tool_calls` whose names and arguments match the provided tool schema, and chains them across turns. |
@@ -74,9 +77,11 @@ Trace generation is intentionally maintained by the SynthTraces project. NeMo Au
 
 ## Hardware Requirements
 
-- **Full-parameter SFT**: the example below shards across 8 GPUs with FSDP2. Qwen2.5-3B is small enough to also train on a single 80 GB GPU, which runs unsharded (FSDP2 only applies across multiple GPUs).
-- **LoRA / PEFT**: trainable on a single GPU (see [Use PEFT with LoRA](#use-peft-with-lora) at the end).
-- `glaive_toolcall_en` is small (a few thousand traces), so a full pass is fast.
+Review the following hardware requirements:
+
+- **Full-parameter SFT**: The example below shards across 8 GPUs with FSDP2. Qwen2.5-3B can also train unsharded on a single 80 GB GPU because FSDP2 applies only across multiple GPUs.
+- **PEFT with LoRA**: You can train on a single GPU. See [Use PEFT with LoRA](#use-peft-with-lora).
+- **Dataset size**: The `glaive_toolcall_en` dataset contains a few thousand traces, so a full pass is fast.
 
 ---
 
