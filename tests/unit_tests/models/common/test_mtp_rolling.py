@@ -221,6 +221,18 @@ def test_precomputed_position_ids_skip_rank_local_rolling():
         torch.testing.assert_close(mtp.layers[depth].calls[0]["position_ids"], position_ids_per_depth[depth])
 
 
+def test_precomputed_position_ids_reject_rank_local_token_rolling():
+    mtp = _build_module(num_depths=2, pattern_length=1)
+
+    with pytest.raises(ValueError, match="position_ids_per_depth requires precomputed embed_inputs"):
+        mtp(
+            torch.zeros(4, 3),
+            input_ids=torch.arange(4),
+            embed_fn=_embed_fn_identity,
+            position_ids_per_depth=(torch.arange(4), torch.arange(4)),
+        )
+
+
 def test_precomputed_position_id_count_must_match_depth():
     mtp = _build_module(num_depths=2, pattern_length=1)
 

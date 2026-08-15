@@ -278,6 +278,11 @@ class MTPModule(nn.Module):
         else:
             if input_ids is None or embed_fn is None:
                 raise ValueError("MTPModule.forward requires either embed_inputs or (input_ids, embed_fn)")
+        if position_ids_per_depth is not None and embed_inputs is None:
+            raise ValueError(
+                "position_ids_per_depth requires precomputed embed_inputs; "
+                "rank-local input_ids rolling cannot be combined with globally shifted positions"
+            )
         if position_ids_per_depth is not None:
             if len(position_ids_per_depth) != self.num_depths:
                 raise ValueError(

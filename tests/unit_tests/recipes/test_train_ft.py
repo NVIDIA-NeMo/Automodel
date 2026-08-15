@@ -2583,3 +2583,27 @@ def test_forward_backward_step_model_cp_hook(monkeypatch, cp_size, uses_thd, sup
     # backward through the local loss populated grads
     assert model.lin.weight.grad is not None
     assert torch.isfinite(model.lin.weight.grad).all()
+
+
+def test_forward_backward_step_rejects_mtp_with_cp_before_sharding():
+    recipe = TrainFinetuneRecipeForNextTokenPrediction.__new__(TrainFinetuneRecipeForNextTokenPrediction)
+    model = nn.Module()
+    model.mtp_config = SimpleNamespace(enabled=True)
+    model.supports = SimpleNamespace(mtp_enabled=True, supports_mtp_cp=True)
+    object.__setattr__(recipe, "dist_env", SimpleNamespace(device=torch.device("cpu")))
+    object.__setattr__(recipe, "pp_enabled", False)
+    object.__setattr__(recipe, "model_parts", [model])
+    object.__setattr__(recipe, "_get_cp_group_size", lambda: 2)
+
+    with pytest.raises(NotImplementedError, match="globally shifted per-depth targets"):
+        recipe._forward_backward_step(
+            idx=0,
+            batch={
+                "input_ids": torch.tensor([[10, 11, 12, 13]]),
+                "labels": torch.tensor([[11, 12, 13, -100]]),
+            },
+            loss_buffer=[],
+            num_label_tokens=3,
+            num_batches=1,
+            is_train=True,
+        )
