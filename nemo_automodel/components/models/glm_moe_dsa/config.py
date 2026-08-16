@@ -36,7 +36,6 @@ class GlmMoeDsaConfig(PretrainedConfig):
     """
 
     model_type = "glm_moe_dsa"
-    _precompute_pp_causal_masks = False
     keys_to_ignore_at_inference = ["past_key_values"]
     attribute_map = {"num_local_experts": "n_routed_experts"}
 

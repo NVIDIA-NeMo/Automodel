@@ -40,6 +40,7 @@ import torch.nn as nn
 import wandb
 from huggingface_hub import constants as hf_constants
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
+from transformers import AutoConfig
 
 from nemo_automodel._transformers import (
     NeMoAutoModelForCausalLM,
@@ -52,7 +53,6 @@ from nemo_automodel._transformers.infrastructure import (
     instantiate_infrastructure,
 )
 from nemo_automodel._transformers.mfu import AutoMFU
-from nemo_automodel._transformers.model_init import get_hf_config
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.cuda_graphs import PartialCudaGraphManager
@@ -151,10 +151,7 @@ def _should_pack_validation(
 
 def _should_precompute_pp_causal_masks(model_config: Any) -> bool:
     """Return whether the recipe should attach PP causal-mask precomputation."""
-    model_owned = getattr(model_config, "_precompute_pp_causal_masks", None)
-    if isinstance(model_owned, bool):
-        return model_owned
-    return getattr(model_config, "model_type", None) != "deepseek_v4"
+    return getattr(model_config, "model_type", None) not in ("deepseek_v4", "glm_moe_dsa")
 
 
 def _maybe_downgrade_loss_fn(loss_fn: nn.Module, probe_module: nn.Module, pp_enabled: bool) -> nn.Module:
@@ -356,16 +353,14 @@ def _build_pp_collate_wrapper(cfg_model, pp_enabled: bool):
     """Return a collate-fn wrapper that precomputes pipeline-parallel causal masks, or ``None``.
 
     ``None`` when PP is disabled, the model config can't be loaded, or the model
-    computes masks internally (e.g. ``deepseek_v4``).  Passed to
+    computes masks internally (e.g. ``deepseek_v4`` or ``glm_moe_dsa``).  Passed to
     :meth:`DataloaderConfig.build` as ``collate_wrapper``.
     """
     if not pp_enabled:
         return None
     try:
-        model_config = get_hf_config(
-            _get_model_name(cfg_model),
-            attn_implementation=None,
-            trust_remote_code=compute_trust_remote_code_from_model(cfg_model),
+        hf_model_config = AutoConfig.from_pretrained(
+            _get_model_name(cfg_model), trust_remote_code=compute_trust_remote_code_from_model(cfg_model)
         )
     except Exception:
         logger.warning(
@@ -373,17 +368,17 @@ def _build_pp_collate_wrapper(cfg_model, pp_enabled: bool):
             "Pipeline parallel mask precomputation will be skipped."
         )
         return None
-    if not _should_precompute_pp_causal_masks(model_config):
+    if not _should_precompute_pp_causal_masks(hf_model_config):
         logger.info(
             "Skipping pipeline parallel causal mask precomputation for model_type=%s.",
-            getattr(model_config, "model_type", None),
+            getattr(hf_model_config, "model_type", None),
         )
         return None
 
     from nemo_automodel.components.datasets.utils import add_causal_masks_to_batch
 
     def wrapper(base_collate_fn):
-        def chained_collate_fn(batch, base_fn=base_collate_fn, config=model_config):
+        def chained_collate_fn(batch, base_fn=base_collate_fn, config=hf_model_config):
             """Collate examples and attach pipeline-parallel causal masks.
 
             Args:

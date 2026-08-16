@@ -1810,12 +1810,12 @@ def _pp_loader(cfg_model, cfg_dl, **patches):
 
 
 def test_pp_autoconfig_failure_skips_masks(caplog):
-    """When config resolution raises, the collate is left unwrapped (warning logged)."""
+    """When AutoConfig.from_pretrained raises, the collate is left unwrapped (warning logged)."""
     calls = []
     cfg_dl = ConfigNode({"collate_fn": lambda b: calls.append("base") or b, "num_workers": 0})
     cfg_model = ConfigNode({"pretrained_model_name_or_path": "bad/model"})
     with (
-        patch("nemo_automodel.recipes.llm.train_ft.get_hf_config", side_effect=OSError("not found")),
+        patch("nemo_automodel.recipes.llm.train_ft.AutoConfig.from_pretrained", side_effect=OSError("not found")),
         patch("nemo_automodel.components.datasets.utils.add_causal_masks_to_batch") as add_masks,
         caplog.at_level(logging.WARNING),
     ):
@@ -1828,10 +1828,10 @@ def test_pp_autoconfig_failure_skips_masks(caplog):
 
 
 @pytest.mark.parametrize(
-    ("model_type", "precompute_pp_causal_masks"),
-    [("deepseek_v4", None), ("glm_moe_dsa", False)],
+    "model_type",
+    ["deepseek_v4", "glm_moe_dsa"],
 )
-def test_pp_custom_sparse_model_skips_masks(caplog, model_type, precompute_pp_causal_masks):
+def test_pp_custom_sparse_model_skips_masks(caplog, model_type):
     """Custom sparse models compute masks internally, so PP precomputation is skipped."""
     calls = []
     cfg_dl = ConfigNode({"collate_fn": lambda b: calls.append("base") or b, "num_workers": 0})
@@ -1839,11 +1839,8 @@ def test_pp_custom_sparse_model_skips_masks(caplog, model_type, precompute_pp_ca
     cfg_model = ConfigNode({"pretrained_model_name_or_path": model_name})
     with (
         patch(
-            "nemo_automodel.recipes.llm.train_ft.get_hf_config",
-            return_value=SimpleNamespace(
-                model_type=model_type,
-                _precompute_pp_causal_masks=precompute_pp_causal_masks,
-            ),
+            "nemo_automodel.recipes.llm.train_ft.AutoConfig.from_pretrained",
+            return_value=MagicMock(model_type=model_type),
         ),
         patch("nemo_automodel.components.datasets.utils.add_causal_masks_to_batch") as add_masks,
         caplog.at_level(logging.INFO),
@@ -1854,28 +1851,6 @@ def test_pp_custom_sparse_model_skips_masks(caplog, model_type, precompute_pp_ca
     assert calls == ["base"]
     add_masks.assert_not_called()
     assert f"Skipping pipeline parallel causal mask precomputation for model_type={model_type}" in caplog.text
-
-
-def test_pp_glm_resolves_automodel_config_contract(tmp_path, caplog):
-    """The loader must see AutoModel's GLM config rather than Transformers' built-in config."""
-    (tmp_path / "config.json").write_text(
-        '{"model_type":"glm_moe_dsa","architectures":["GlmMoeDsaForCausalLM"]}',
-        encoding="utf-8",
-    )
-    calls = []
-    cfg_dl = ConfigNode({"collate_fn": lambda b: calls.append("base") or b, "num_workers": 0})
-    cfg_model = ConfigNode({"pretrained_model_name_or_path": str(tmp_path)})
-
-    with (
-        patch("nemo_automodel.components.datasets.utils.add_causal_masks_to_batch") as add_masks,
-        caplog.at_level(logging.INFO),
-    ):
-        collate_fn = _pp_loader(cfg_model, cfg_dl)
-
-    collate_fn(["dummy"])
-    assert calls == ["base"]
-    add_masks.assert_not_called()
-    assert "Skipping pipeline parallel causal mask precomputation for model_type=glm_moe_dsa" in caplog.text
 
 
 def test_pp_autoconfig_success_chains_masks():
@@ -1889,7 +1864,7 @@ def test_pp_autoconfig_success_chains_masks():
         return batch
 
     with (
-        patch("nemo_automodel.recipes.llm.train_ft.get_hf_config", return_value=MagicMock()),
+        patch("nemo_automodel.recipes.llm.train_ft.AutoConfig.from_pretrained", return_value=MagicMock()),
         patch("nemo_automodel.components.datasets.utils.add_causal_masks_to_batch", side_effect=mock_add_masks),
     ):
         collate_fn = _pp_loader(cfg_model, cfg_dl)
