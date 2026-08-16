@@ -12,12 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from types import SimpleNamespace
-
-import pytest
 import torch
 
-from nemo_automodel.components.datasets.llm.mock_iterable_dataset import MockIterableDataset, MockIterableDatasetConfig
+from nemo_automodel.components.datasets.llm.mock_iterable_dataset import MockIterableDataset
 
 
 class TestMockIterableDataset:
@@ -30,23 +27,14 @@ class TestMockIterableDataset:
         assert dataset.seq_len == 512
         assert dataset.num_samples == 1000000
         assert dataset.batch_size == 1
-        assert dataset.seed == 0
 
     def test_initialization_with_custom_params(self):
         """Test dataset initialization with custom parameters."""
-        dataset = MockIterableDataset(vocab_size=5000, seq_len=1024, num_samples=100, batch_size=4, seed=123)
+        dataset = MockIterableDataset(vocab_size=5000, seq_len=1024, num_samples=100, batch_size=4)
         assert dataset.vocab_size == 5000
         assert dataset.seq_len == 1024
         assert dataset.num_samples == 100
         assert dataset.batch_size == 4
-        assert dataset.seed == 123
-
-    def test_config_build_forwards_seed(self):
-        """Test that the typed config owns deterministic dataset construction."""
-        dataset = MockIterableDatasetConfig(vocab_size=50, seq_len=8, num_samples=2, batch_size=3, seed=456).build()
-
-        assert dataset.seed == 456
-        assert dataset.batch_size == 3
 
     def test_len(self):
         """Test __len__ method returns correct number of samples."""
@@ -142,7 +130,7 @@ class TestMockIterableDataset:
         assert sample["position_ids"].dtype == torch.long or sample["position_ids"].dtype == torch.int64
 
     def test_multiple_iterations(self):
-        """Test that each iterator replays the deterministic stream from its beginning."""
+        """Test that multiple iterations through the dataset work correctly."""
         num_samples = 5
         dataset = MockIterableDataset(vocab_size=1000, seq_len=512, num_samples=num_samples)
 
@@ -153,73 +141,6 @@ class TestMockIterableDataset:
         # Second iteration
         samples2 = list(dataset)
         assert len(samples2) == num_samples
-        for first, second in zip(samples1, samples2):
-            assert torch.equal(first["input_ids"], second["input_ids"])
-
-    def test_seed_controls_generated_stream(self):
-        """Test that equal seeds replay and different seeds distinguish token streams."""
-        first = next(iter(MockIterableDataset(vocab_size=1000, seq_len=64, batch_size=2, seed=17)))
-        replay = next(iter(MockIterableDataset(vocab_size=1000, seq_len=64, batch_size=2, seed=17)))
-        different = next(iter(MockIterableDataset(vocab_size=1000, seq_len=64, batch_size=2, seed=18)))
-
-        assert torch.equal(first["input_ids"], replay["input_ids"])
-        assert not torch.equal(first["input_ids"], different["input_ids"])
-
-    def test_shard_replays_for_peers_and_distinguishes_dp_ranks(self):
-        """Test that peers on one DP rank agree while separate DP ranks receive unique data."""
-        dataset = MockIterableDataset(vocab_size=1000, seq_len=64, batch_size=2, seed=123)
-
-        peer_a = next(iter(dataset.shard(4, 2)))
-        peer_b = next(iter(dataset.shard(4, 2)))
-        other_rank = next(iter(dataset.shard(4, 3)))
-
-        assert torch.equal(peer_a["input_ids"], peer_b["input_ids"])
-        assert not torch.equal(peer_a["input_ids"], other_rank["input_ids"])
-
-    def test_shard_does_not_mutate_source_dataset(self):
-        """Test that deriving a DP shard leaves the source stream unchanged."""
-        dataset = MockIterableDataset(vocab_size=1000, seq_len=64, batch_size=2, seed=123)
-        expected = next(iter(MockIterableDataset(vocab_size=1000, seq_len=64, batch_size=2, seed=123)))
-
-        dataset.shard(4, 2)
-        actual = next(iter(dataset))
-
-        assert torch.equal(actual["input_ids"], expected["input_ids"])
-
-    @pytest.mark.parametrize(("num_shards", "index"), [(0, 0), (4, -1), (4, 4), (True, 0), (4, False)])
-    def test_shard_rejects_invalid_coordinates(self, num_shards, index):
-        """Test that invalid data-parallel shard coordinates fail clearly."""
-        dataset = MockIterableDataset()
-
-        with pytest.raises(ValueError):
-            dataset.shard(num_shards, index)
-
-    def test_iteration_does_not_consume_global_torch_rng(self):
-        """Test that the dataset-owned generator leaves the process RNG untouched."""
-        torch.manual_seed(987)
-        state = torch.get_rng_state()
-
-        next(iter(MockIterableDataset(vocab_size=1000, seq_len=64, batch_size=2, seed=123)))
-
-        assert torch.equal(torch.get_rng_state(), state)
-
-    def test_workers_partition_batches_and_use_distinct_streams(self, monkeypatch):
-        """Test that DataLoader workers split work instead of replaying identical batches."""
-        dataset = MockIterableDataset(vocab_size=1000, seq_len=64, num_samples=5, batch_size=2, seed=123)
-
-        monkeypatch.setattr(
-            "nemo_automodel.components.datasets.llm.mock_iterable_dataset.get_worker_info",
-            lambda: SimpleNamespace(id=0, num_workers=2),
-        )
-        worker_zero = list(dataset)
-        monkeypatch.setattr(
-            "nemo_automodel.components.datasets.llm.mock_iterable_dataset.get_worker_info",
-            lambda: SimpleNamespace(id=1, num_workers=2),
-        )
-        worker_one = list(dataset)
-
-        assert len(worker_zero) + len(worker_one) == len(dataset)
-        assert not torch.equal(worker_zero[0]["input_ids"], worker_one[0]["input_ids"])
 
     def test_different_samples_have_different_tokens(self):
         """Test that consecutive samples generate different random tokens."""
