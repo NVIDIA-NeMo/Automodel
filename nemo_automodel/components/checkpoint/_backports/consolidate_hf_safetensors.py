@@ -25,7 +25,7 @@ import shutil
 import struct
 import tempfile
 import time
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 import torch
@@ -335,16 +335,14 @@ def _parse_input_metadata(
                     fqn_to_dtype_mapping,
                     quantized_dtype_mismatches,
                 )
-                # Replaced rather than rebuilt so fields assigned when the output files were
-                # laid out survive; the shard metadata read here is keyed by model FQNs only.
-                output_data.fqn_data[fqn] = replace(
-                    output_data.fqn_data[fqn],
-                    shape_in_file=tensor_size,
-                    dtype_size=_get_dtype_size(output_dtype),
-                    dtype_str=output_dtype_str,
-                    source_dtype_size=_get_dtype_size(source_dtype),
-                    source_dtype_str=dtype_str,
-                )
+                # Preserve the export name assigned during output layout and fill in the
+                # shape and dtype information read from the model-FQN-keyed input shards.
+                fqn_data = output_data.fqn_data[fqn]
+                fqn_data.shape_in_file = tensor_size
+                fqn_data.dtype_size = _get_dtype_size(output_dtype)
+                fqn_data.dtype_str = output_dtype_str
+                fqn_data.source_dtype_size = _get_dtype_size(source_dtype)
+                fqn_data.source_dtype_str = dtype_str
     _warn_quantized_dtype_mismatches(quantized_dtype_mismatches)
     _drop_missing_output_fqns(output_files_data, set(fqn_to_size_mapping))
 
