@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,9 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Matched GLM-5.2 DSA parity/throughput recipe for 32 H100 nodes. The launcher
-# overrides backend.attn with tilelang or cudnn and supplies a unique W&B name.
-
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 seed: 1234
 
@@ -23,7 +20,6 @@ step_scheduler:
   local_batch_size: 4
   ckpt_every_steps: 100000
   val_every_steps: 100000
-  log_remote_every_steps: 1
   gc_every_steps: 10
   num_epochs: 2
   max_steps: 100
@@ -58,17 +54,15 @@ dist_env:
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: zai-org/GLM-5.2
-  config:
-    head_dim: 64
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
-    attn: tilelang
+    attn: cudnn
     linear: torch
     rms_norm: torch_fp32
     rope_fusion: false
     dispatcher: hybridep
-    fake_balanced_gate: false
     gate_precision: float32
+    fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true
 
@@ -80,28 +74,30 @@ loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
 dataset:
-  _target_: nemo_automodel.components.datasets.llm.mock_iterable_dataset.MockIterableDataset
-  vocab_size: 154880
-  seq_len: 4096
-  num_samples: 100000
-  batch_size: 4
-  seed: 1234
-  tokenizer: null
+  _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
+  path_or_dataset_id: allenai/tulu-3-sft-mixture
+  split: train[:100000]
+  shuffle_seed: 42
+  truncation: true
+  seq_length: 4096
+  padding: false
+  tokenizer:
+    _target_: transformers.AutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: zai-org/GLM-5.2
 
 packed_sequence:
   packed_sequence_size: 4096
-  prepacked: true
 
 dataloader:
-  _target_: torch.utils.data.DataLoader
-  batch_size: null
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
   collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
-  shuffle: false
-  num_workers: 0
+  shuffle: true
 
 optimizer:
   _target_: torch.optim.Adam
-  betas: [0.9, 0.999]
+  betas:
+  - 0.9
+  - 0.999
   eps: 1e-8
   lr: 1e-5
   weight_decay: 0
