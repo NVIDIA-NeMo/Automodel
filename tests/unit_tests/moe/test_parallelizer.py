@@ -425,22 +425,16 @@ def _import_parallelizer_with_stubs(monkeypatch):
     parallelizer_utils_stub.configure_fsdp_unused_param_reduction = lambda module: 0
 
     def reject_unsupported_mtp_cp(model):
-        supports = getattr(model, "supports", None)
-        mtp_enabled = bool(
-            getattr(supports, "mtp_enabled", getattr(getattr(model, "mtp_config", None), "enabled", False))
-        )
-        if mtp_enabled and not bool(getattr(supports, "supports_mtp_cp", False)):
+        if model.supports.mtp_enabled and not model.supports.supports_mtp_cp:
             raise RuntimeError("Model does not support MTP with context parallelism")
 
     parallelizer_utils_stub.reject_unsupported_mtp_cp = reject_unsupported_mtp_cp
 
     def reject_unsupported_mtp_cp_pp(model):
-        supports = getattr(model, "supports", None)
         is_pp_stage_fn = getattr(model, "_is_pipeline_parallel_stage", None)
         if (
-            supports is not None
-            and supports.mtp_enabled
-            and not supports.supports_mtp_cp_pp
+            model.supports.mtp_enabled
+            and not model.supports.supports_mtp_cp_pp
             and callable(is_pp_stage_fn)
             and is_pp_stage_fn()
         ):

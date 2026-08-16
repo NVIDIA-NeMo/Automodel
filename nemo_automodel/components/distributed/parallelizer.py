@@ -540,7 +540,7 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
             cp_layers = list(layers)
             mtp_module = getattr(model, "mtp", None)
             mtp_layers = getattr(mtp_module, "layers", None)
-            mtp_enabled = bool(getattr(getattr(model, "mtp_config", None), "enabled", False))
+            mtp_enabled = model.supports.mtp_enabled
             parallelizer_utils.reject_unsupported_mtp_cp_pp(model)
             parallelizer_utils.reject_unsupported_mtp_cp(model)
             if mtp_enabled and mtp_layers is None:

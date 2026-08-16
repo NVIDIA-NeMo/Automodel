@@ -1026,13 +1026,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             for k, v in batch.items()
         }
         model = self.model_parts[0] if hasattr(self, "model_parts") else None
-        supports = getattr(model, "supports", None)
-        mtp_enabled = bool(
-            getattr(supports, "mtp_enabled", getattr(getattr(model, "mtp_config", None), "enabled", False))
-        )
+        mtp_enabled = not self.pp_enabled and model.supports.mtp_enabled
         mtp_cp_inputs = None
         if not self.pp_enabled and self._get_cp_group_size() > 1 and mtp_enabled:
-            if not bool(getattr(supports, "supports_mtp_cp", False)):
+            if not model.supports.supports_mtp_cp:
                 raise NotImplementedError(
                     f"{type(model).__name__} declares supports_mtp_cp=False; "
                     "MTP target preparation for context parallelism is unavailable"
