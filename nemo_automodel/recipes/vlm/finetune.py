@@ -67,10 +67,10 @@ from nemo_automodel.components.loggers.mlflow_utils import (
     to_float_metrics,
 )
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
-from nemo_automodel.components.loss.causal_lm import causal_lm_loss
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
-from nemo_automodel.components.loss.utils import calculate_loss
+from nemo_automodel.components.loss.mtp import calculate_mtp_loss
+from nemo_automodel.components.loss.utils import _get_lm_head_weight, calculate_loss
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
 from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
@@ -814,12 +814,11 @@ class FinetuneRecipeForVLM(BaseRecipe):
             )
         return total_loss
 
-    def _calculate_eager_loss(
+    def _compute_vlm_loss(
         self,
         *,
         out: Any,
         labels: torch.Tensor,
-        model: nn.Module,
         num_label_tokens: int | None,
         is_train: bool,
         cu_seqlens: torch.Tensor | None = None,
@@ -827,17 +826,53 @@ class FinetuneRecipeForVLM(BaseRecipe):
         log_denominator: int | float | None = None,
     ) -> torch.Tensor:
         """Compute base, MTP, and optional joint-drafter losses."""
+        model = self.model_parts[0]
         grad_reduce_group = self._get_dp_group(include_cp=True) if is_train else None
-        loss = causal_lm_loss(
+        hidden_states = get_final_hidden_states(out)
+        if isinstance(self.loss_fn, FusedLinearCrossEntropy) and hidden_states is None:
+            raise ValueError("FusedLinearCrossEntropy requires the model to output hidden states")
+
+        lm_weight = (
+            self.loss_fn.materialize_lm_weight(
+                _get_lm_head_weight(model),
+                grad_reduce_group=grad_reduce_group,
+            )
+            if isinstance(self.loss_fn, FusedLinearCrossEntropy)
+            else None
+        )
+        loss = calculate_loss(
             self.loss_fn,
-            model,
-            out,
-            labels,
-            getattr(getattr(self, "cfg", None), "mtp", None),
+            logits=getattr(out, "logits", out),
+            labels=labels,
+            model=model,
+            hidden_states=hidden_states,
+            lm_weight=lm_weight,
             num_label_tokens=num_label_tokens,
             grad_reduce_group=grad_reduce_group,
-            cu_seqlens=cu_seqlens,
         )
+
+        mtp_hidden = getattr(out, "mtp_per_depth_h", None)
+        mtp_logits = getattr(out, "mtp_per_depth_logits", None)
+        if mtp_hidden is not None or mtp_logits is not None:
+            mtp_config = getattr(getattr(self, "cfg", None), "mtp", None)
+            if mtp_config is None:
+                raise ValueError("MTP model output requires an MTP loss config")
+            scaling_factor = (
+                mtp_config.scaling_factor if mtp_config.scaling_factor is not None else out.mtp_loss_scaling_factor
+            )
+            loss = loss + calculate_mtp_loss(
+                self.loss_fn,
+                mtp_per_depth_h=mtp_hidden,
+                mtp_per_depth_logits=mtp_logits,
+                labels=labels,
+                model=model,
+                scaling_factor=scaling_factor,
+                num_label_tokens=num_label_tokens,
+                ignore_index=mtp_config.ignore_index,
+                cu_seqlens=cu_seqlens,
+                lm_weight=lm_weight,
+                grad_reduce_group=grad_reduce_group,
+            )
 
         return self._maybe_add_drafter_loss(
             out=out,
@@ -871,7 +906,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             },
         )
 
-    def _engine_loss(
+    def _engine_loss_fn(
         self,
         out: Any,
         loss_inputs: dict[str, torch.Tensor],
@@ -879,10 +914,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
         model_inputs: dict[str, Any],
     ) -> torch.Tensor:
         """Return the local loss sum; Engine owns global normalization."""
-        return self._calculate_eager_loss(
+        return self._compute_vlm_loss(
             out=out,
             labels=loss_inputs["labels"],
-            model=self.model_parts[0],
             num_label_tokens=None,
             is_train=True,
             cu_seqlens=model_inputs.get("cu_seqlens"),
@@ -1038,10 +1072,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 else:
                     out = model(**batch)
 
-                local_loss = self._calculate_eager_loss(
+                local_loss = self._compute_vlm_loss(
                     out=out,
                     labels=labels,
-                    model=model,
                     num_label_tokens=num_label_tokens,
                     is_train=is_train,
                     cu_seqlens=batch.get("cu_seqlens"),
@@ -1112,7 +1145,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     ]
                     for index, batch in enumerate(batches)
                 ],
-                self._engine_loss,
+                self._engine_loss_fn,
             )
         else:
             # The eager Engine requires a positive global weight sum. Preserve

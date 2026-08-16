@@ -72,10 +72,12 @@ from nemo_automodel.components.loggers.mlflow_utils import (
     to_float_metrics,
 )
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
-from nemo_automodel.components.loss.causal_lm import causal_lm_loss
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+from nemo_automodel.components.loss.mtp import calculate_mtp_loss
+from nemo_automodel.components.loss.utils import _get_lm_head_weight, calculate_loss
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
+from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.utils import (
     count_tail_padding,
@@ -1026,8 +1028,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self._partial_cuda_graph_capture_pending = False
 
     # ------------------ helpers ------------------
-    def _prepare_eager_batch(self, batch):
-        """Move and CP-prepare one batch before an eager model call."""
+    def _prepare_microbatch(self, batch):
+        """Move and CP-prepare one batch before model execution."""
         batch = {
             k: (
                 {dk: dv.to(self.dist_env.device, non_blocking=True) for dk, dv in v.items() if dv is not None}
@@ -1046,17 +1048,56 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         train_ctx, batch = cp_sharder.shard(batch)
         return train_ctx, batch, batch.pop("labels")
 
-    def _calculate_eager_loss(self, output, labels, model_inputs, *, num_label_tokens, is_train):
-        """Compute the shared CE and optional MTP loss for eager execution."""
-        return causal_lm_loss(
+    def _compute_causal_lm_loss(self, output, labels, model_inputs, *, num_label_tokens, is_train):
+        """Compute the recipe's causal-LM and optional MTP loss."""
+        model = self.model_parts[0]
+        grad_reduce_group = self._get_dp_group(include_cp=True) if is_train else None
+        hidden_states = get_final_hidden_states(output)
+        if isinstance(self.loss_fn, FusedLinearCrossEntropy) and hidden_states is None:
+            raise ValueError("FusedLinearCrossEntropy requires the model to output hidden states")
+
+        lm_weight = (
+            self.loss_fn.materialize_lm_weight(
+                _get_lm_head_weight(model),
+                grad_reduce_group=grad_reduce_group,
+            )
+            if isinstance(self.loss_fn, FusedLinearCrossEntropy)
+            else None
+        )
+        loss = calculate_loss(
             self.loss_fn,
-            self.model_parts[0],
-            output,
-            labels,
-            getattr(self.cfg, "mtp", None),
+            logits=getattr(output, "logits", output),
+            labels=labels,
+            model=model,
+            hidden_states=hidden_states,
+            lm_weight=lm_weight,
             num_label_tokens=num_label_tokens,
-            grad_reduce_group=self._get_dp_group(include_cp=True) if is_train else None,
+            grad_reduce_group=grad_reduce_group,
+        )
+
+        mtp_hidden = getattr(output, "mtp_per_depth_h", None)
+        mtp_logits = getattr(output, "mtp_per_depth_logits", None)
+        if mtp_hidden is None and mtp_logits is None:
+            return loss
+
+        mtp_config = getattr(self.cfg, "mtp", None)
+        if mtp_config is None:
+            raise ValueError("MTP model output requires an MTP loss config")
+        scaling_factor = (
+            mtp_config.scaling_factor if mtp_config.scaling_factor is not None else output.mtp_loss_scaling_factor
+        )
+        return loss + calculate_mtp_loss(
+            self.loss_fn,
+            mtp_per_depth_h=mtp_hidden,
+            mtp_per_depth_logits=mtp_logits,
+            labels=labels,
+            model=model,
+            scaling_factor=scaling_factor,
+            num_label_tokens=num_label_tokens,
+            ignore_index=mtp_config.ignore_index,
             cu_seqlens=model_inputs.get("cu_seqlens"),
+            lm_weight=lm_weight,
+            grad_reduce_group=grad_reduce_group,
         )
 
     def _make_engine_datum(self, batch):
@@ -1069,8 +1110,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             loss_fn_inputs={"labels": labels, "weights": labels.ne(-100)},
         )
 
-    def _engine_loss(self, output, loss_inputs, _datums, model_inputs):
-        return self._calculate_eager_loss(
+    def _engine_loss_fn(self, output, loss_inputs, _datums, model_inputs):
+        return self._compute_causal_lm_loss(
             output,
             loss_inputs["labels"],
             model_inputs,
@@ -1088,7 +1129,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         num_batches,
         is_train: bool = True,
     ):
-        train_ctx, batch, labels = self._prepare_eager_batch(batch)
+        train_ctx, batch, labels = self._prepare_microbatch(batch)
         fp8_ctx = self.te_fp8.maybe_te_autocast() if self.te_fp8 is not None else nullcontext()
 
         if self.pp_enabled:
@@ -1157,7 +1198,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     out = model(logits_to_keep=1, **batch)
                 else:
                     out = model(**batch)
-                local_loss = self._calculate_eager_loss(
+                local_loss = self._compute_causal_lm_loss(
                     out,
                     labels,
                     batch,
@@ -1204,7 +1245,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         if use_engine:
             reporting_loss, _ = engine.forward_backward(
                 [[self._make_engine_datum(batch)] for batch in batches],
-                self._engine_loss,
+                self._engine_loss_fn,
             )
         else:
             # Engine requires a positive global weight sum. Keep the existing

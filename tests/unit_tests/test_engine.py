@@ -37,8 +37,6 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
 )
 from nemo_automodel.components.distributed.mesh import MeshContext, ParallelismSizes
 from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
-from nemo_automodel.components.loss.causal_lm import causal_lm_loss
-from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 from nemo_automodel.engine import Engine, collate_prebatched
 
@@ -336,11 +334,6 @@ class TinyLM(nn.Module):
         return self.output(self.embedding(input_ids))
 
 
-class TinyCausalLM(TinyLM):
-    def forward(self, input_ids, **_):
-        return SimpleNamespace(logits=super().forward(input_ids))
-
-
 def test_raw_output_and_loss_inputs_support_an_rl_loss_callback():
     datum = Datum(
         model_inputs={"input_ids": torch.tensor([1, 2, 3])},
@@ -371,56 +364,6 @@ def test_raw_output_and_loss_inputs_support_an_rl_loss_callback():
     assert not outputs[0]["policy_sum"].requires_grad
     assert model.embedding.weight.grad is not None
     assert model.output.weight.grad is not None
-
-
-def test_causal_lm_loss_matches_a_manual_accumulation_window():
-    torch.manual_seed(7)
-    model = TinyCausalLM()
-    reference = TinyCausalLM()
-    reference.load_state_dict(model.state_dict())
-    batches = [
-        (torch.tensor([[1, 2, 3]]), torch.tensor([[2, 3, -100]])),
-        (torch.tensor([[4, 5]]), torch.tensor([[5, 6]])),
-    ]
-    loss_fn = MaskedCrossEntropy()
-    mtp_config = SimpleNamespace(scaling_factor=None, ignore_index=-100)
-
-    window = [
-        [
-            Datum(
-                model_inputs={"input_ids": input_ids},
-                loss_fn_inputs={"labels": labels, "weights": labels.ne(-100)},
-            )
-        ]
-        for input_ids, labels in batches
-    ]
-
-    def engine_loss(output, inputs, _datums, _model_inputs):
-        return causal_lm_loss(
-            loss_fn,
-            model,
-            output,
-            inputs["labels"],
-            mtp_config,
-            num_label_tokens=None,
-            grad_reduce_group=None,
-        )
-
-    actual_loss, _ = Engine(model, device="cpu", collate_fn=collate_prebatched).forward_backward(window, engine_loss)
-
-    denominator = sum((labels != -100).sum() for _, labels in batches)
-    reference_loss = (
-        sum(
-            F.cross_entropy(reference(input_ids).logits.flatten(0, 1), labels.flatten(), reduction="sum")
-            for input_ids, labels in batches
-        )
-        / denominator
-    )
-    reference_loss.backward()
-
-    torch.testing.assert_close(actual_loss, reference_loss.detach().to(actual_loss))
-    for parameter, expected in zip(model.parameters(), reference.parameters()):
-        torch.testing.assert_close(parameter.grad, expected.grad)
 
 
 def test_lifecycle_marks_only_the_last_microbatch_for_sync(monkeypatch):

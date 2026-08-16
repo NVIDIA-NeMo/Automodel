@@ -22,7 +22,6 @@ import torch
 import torch.nn as nn
 
 from nemo_automodel.components.config.loader import ConfigNode
-from nemo_automodel.components.datasets.datum import Datum
 from nemo_automodel.components.datasets.vlm.pp_media import (
     VLM_PP_MEDIA_KEY,
     chunk_step3_media,
@@ -433,7 +432,7 @@ def test_run_train_step_supports_tensor_outputs(monkeypatch):
     )
 
     calculate_mock = MagicMock(side_effect=fake_calculate_loss)
-    monkeypatch.setattr("nemo_automodel.components.loss.causal_lm.calculate_loss", calculate_mock)
+    monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.calculate_loss", calculate_mock)
 
     grad_clip_mock = MagicMock(return_value=2.5)
     monkeypatch.setattr(
@@ -486,7 +485,7 @@ def test_forward_backward_step_routes_thd_batch_through_te(monkeypatch):
     monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.ContextParallelSharder", make_thd_batch)
     monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.get_sync_ctx", lambda *args, **kwargs: nullcontext())
     monkeypatch.setattr(
-        "nemo_automodel.components.loss.causal_lm.calculate_loss",
+        "nemo_automodel.recipes.vlm.finetune.calculate_loss",
         lambda *args, **kwargs: torch.tensor(1.0, requires_grad=True),
     )
 
@@ -3014,38 +3013,41 @@ def test_vlm_setup_keeps_engine_disabled_for_magi(monkeypatch):
     assert trainer.engine is None
 
 
-def test_vlm_engine_loss_uses_final_thd_sequence_boundaries(monkeypatch):
+def test_vlm_compute_loss_uses_final_thd_sequence_boundaries(monkeypatch):
     recipe = object.__new__(FinetuneRecipeForVLM)
     recipe.model_parts = [nn.Identity()]
     recipe.loss_fn = object()
-    recipe.cfg = SimpleNamespace(mtp=None)
+    recipe.cfg = SimpleNamespace(mtp=SimpleNamespace(scaling_factor=0.5, ignore_index=-100))
     recipe.dist_env = SimpleNamespace(is_main=False)
     recipe._get_dp_group = lambda include_cp=False: None
     recipe._maybe_add_drafter_loss = lambda **kwargs: kwargs["base_loss"]
     seen = {}
 
-    def fake_causal_lm_loss(*args, **kwargs):
+    def fake_mtp_loss(*args, **kwargs):
         seen.update(kwargs)
-        return torch.tensor(1.0)
+        return torch.tensor(2.0)
 
-    monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.causal_lm_loss", fake_causal_lm_loss)
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.vlm.finetune.calculate_loss",
+        lambda *args, **kwargs: torch.tensor(1.0),
+    )
+    monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.calculate_mtp_loss", fake_mtp_loss)
     cu_seqlens = torch.tensor([0, 2, 5], dtype=torch.int32)
-    datum = Datum(
-        model_inputs={"input_ids": torch.arange(5)},
-        loss_fn_inputs={
-            "weights": torch.ones(5),
-            "log_drafter": torch.tensor(False),
-            "log_denominator": torch.tensor(5.0),
-        },
+    out = SimpleNamespace(
+        logits=torch.zeros(5, 8),
+        mtp_per_depth_logits=[torch.zeros(5, 8)],
+        mtp_loss_scaling_factor=0.25,
     )
 
-    recipe._engine_loss(
-        object(),
-        {"labels": torch.arange(5)},
-        [datum],
-        {"cu_seqlens": cu_seqlens},
+    loss = recipe._compute_vlm_loss(
+        out=out,
+        labels=torch.arange(5),
+        num_label_tokens=None,
+        is_train=True,
+        cu_seqlens=cu_seqlens,
     )
 
+    assert loss.item() == pytest.approx(3.0)
     assert seen["cu_seqlens"] is cu_seqlens
 
 
