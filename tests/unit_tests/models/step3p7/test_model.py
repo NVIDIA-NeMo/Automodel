@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -335,6 +336,37 @@ def test_get_pipeline_stage_metas_cp_shards_local_seq_and_mtp():
     assert ins[0].shape == (1, 6) and ins[0].dtype == torch.long
     assert outs[0].shape[1] == 4  # local sequence length on every output
     assert all(o.shape[1] == 4 for o in outs)
+
+
+def test_cp_forward_suspends_ring_dispatcher_for_vision(monkeypatch):
+    class FakeCPMesh:
+        @staticmethod
+        def size():
+            return 2
+
+    wrapper, _ = _wrapper_with_fake_inner()
+    wrapper.cp_mesh = FakeCPMesh()
+    entered = False
+
+    @contextmanager
+    def fake_suspended(mesh):
+        nonlocal entered
+        assert mesh is wrapper.cp_mesh
+        entered = True
+        yield
+
+    monkeypatch.setattr(
+        "nemo_automodel.components.distributed.context_parallel.utils.cp_dispatcher_suspended",
+        fake_suspended,
+    )
+    monkeypatch.setattr(step3p7_model, "shard_sequence_for_cp_round_robin", lambda mesh, value, seq_dim: (value, 0, 0))
+
+    wrapper(
+        input_ids=torch.tensor([[31, 1, 2]]),
+        image_embeds=torch.randn(1, 8),
+    )
+
+    assert entered
 
 
 def test_forward_consumes_pp_vlm_chunks_and_drops_mismatched_masks(monkeypatch):

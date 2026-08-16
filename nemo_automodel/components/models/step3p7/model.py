@@ -664,12 +664,20 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
                     "Step3p7 does not support image microbatch chunking under combined pipeline + "
                     "context parallelism; use a text-only batch for cp>1 and pp>1."
                 )
-            multimodal_embeddings = self.model.get_multimodal_embeddings(
-                pixel_values=kwargs.get("pixel_values", None),
-                patch_pixel_values=kwargs.get("patch_pixel_values", None),
-                num_patches=kwargs.get("num_patches", None),
-                image_embeds=kwargs.get("image_embeds", None),
+            # The vision tower is bidirectional and its patch sequence is not
+            # CP-sharded. Keep it out of torch's causal ring-SDPA dispatcher;
+            # only the text decoder below consumes the CP context.
+            from nemo_automodel.components.distributed.context_parallel.utils import (
+                cp_dispatcher_suspended,  # noqa: PLC0415
             )
+
+            with cp_dispatcher_suspended(self.cp_mesh):
+                multimodal_embeddings = self.model.get_multimodal_embeddings(
+                    pixel_values=kwargs.get("pixel_values", None),
+                    patch_pixel_values=kwargs.get("patch_pixel_values", None),
+                    num_patches=kwargs.get("num_patches", None),
+                    image_embeds=kwargs.get("image_embeds", None),
+                )
             inputs_embeds = self.model.prepare_inputs_embeds(input_ids, multimodal_embeddings)
             if use_mtp:
                 per_depth_inputs = (

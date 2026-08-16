@@ -31,6 +31,10 @@ from nemo_automodel.components.models.minimax_m3_vl.model import MiniMaxM3Causal
 def test_mtp_module_present_and_sparse(mtp_model):
     mtp = mtp_model.model.mtp
     assert mtp is not None and len(mtp.layers) == 1
+    assert mtp_model._optional_base_checkpoint_key_prefixes == (
+        "model.mtp.",
+        "language_model.model.mtp.",
+    )
     block = mtp.layers[0]
     # The MTP transformer_layer is a full MoE + sparse-attention decoder block.
     assert block.transformer_layer.is_moe_layer
@@ -103,6 +107,7 @@ def test_from_hf_drops_mtp_when_disabled(model):
     """A model without MTP (num_mtp_modules=0) drops any MTP tensors on load."""
     adapter = model.state_dict_adapter
     assert not adapter._mtp_enabled
+    assert model._optional_base_checkpoint_key_prefixes == ()
     hf = adapter.to_hf(model.state_dict())
     hf["model.mtp.layers.0.enorm.weight"] = torch.zeros(model.config.hidden_size)
     native = adapter.from_hf(hf)

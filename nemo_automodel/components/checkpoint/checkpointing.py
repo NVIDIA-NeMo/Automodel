@@ -784,6 +784,7 @@ class Checkpointer:
         use_checkpoint_id: bool = True,
         key_mapping: Optional[dict[str, str]] = None,
         allow_checkpoint_key_subset: bool = False,
+        optional_checkpoint_key_prefixes: tuple[str, ...] = (),
     ) -> None:
         """
         Load model weights from `model_path`.
@@ -802,6 +803,9 @@ class Checkpointer:
             key_mapping: Optional key remapping when reading from HF checkpoints.
             allow_checkpoint_key_subset: If True, keep the model's current initialization for
                 parameters that are absent from the checkpoint instead of requiring an exact key match.
+            optional_checkpoint_key_prefixes: Model-owned HF key prefixes whose missing tensors may keep
+                their current initialization. Unlike ``allow_checkpoint_key_subset``, unrelated missing
+                keys remain errors.
         """
         # Validate checkpoint directory
         if not os.path.exists(model_path) and not is_cloud_path(model_path):
@@ -949,7 +953,12 @@ class Checkpointer:
         )
         checkpoint_metadata_keys: set[str] = set()
         extra_state_keys = sorted(key for key in state_dict if key.endswith("_extra_state"))
-        if should_try_tied_lm_head_compat or allow_checkpoint_key_subset or extra_state_keys:
+        if (
+            should_try_tied_lm_head_compat
+            or allow_checkpoint_key_subset
+            or optional_checkpoint_key_prefixes
+            or extra_state_keys
+        ):
             checkpoint_metadata_keys = _get_checkpoint_metadata_keys(model_path, storage_reader)
         if extra_state_keys:
             missing_extra_state_keys = [key for key in extra_state_keys if key not in checkpoint_metadata_keys]
@@ -987,6 +996,23 @@ class Checkpointer:
                         lm_head_param_name,
                     )
                     state_dict.pop(lm_head_param_name, None)
+
+        optional_missing_checkpoint_keys = sorted(
+            key
+            for key in state_dict
+            if key not in checkpoint_metadata_keys and key.startswith(optional_checkpoint_key_prefixes)
+        )
+        if optional_missing_checkpoint_keys:
+            for key in optional_missing_checkpoint_keys:
+                state_dict.pop(key, None)
+            logging.warning(
+                "Checkpoint %s is missing %d model-declared optional keys. Keeping their current "
+                "initialization (prefixes=%s, examples=%s).",
+                model_path,
+                len(optional_missing_checkpoint_keys),
+                optional_checkpoint_key_prefixes,
+                optional_missing_checkpoint_keys[:10],
+            )
 
         if allow_checkpoint_key_subset:
             missing_checkpoint_keys = sorted(key for key in state_dict if key not in checkpoint_metadata_keys)
@@ -1070,7 +1096,12 @@ class Checkpointer:
             )
         model_state.load_state_dict(
             state_dict,
-            strict=not (len(model_state.model) > 1 or has_state_dict_adapter or allow_checkpoint_key_subset),
+            strict=not (
+                len(model_state.model) > 1
+                or has_state_dict_adapter
+                or allow_checkpoint_key_subset
+                or optional_checkpoint_key_prefixes
+            ),
             broadcast_from_rank0=self.process_group is None,
         )
 
@@ -1246,6 +1277,7 @@ class Checkpointer:
                 else _get_hf_safetensors_reference_path(root_dir, model_name),
                 is_init_step=True,
                 key_mapping=key_mapping,
+                optional_checkpoint_key_prefixes=tuple(getattr(model, "_optional_base_checkpoint_key_prefixes", ())),
             )
 
         _reinit_non_persistent_buffers(model, device, model_type=model_type)
