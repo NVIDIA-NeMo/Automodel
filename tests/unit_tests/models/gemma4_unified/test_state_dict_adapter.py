@@ -12,15 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 import torch
 from safetensors.torch import load_file, save_file
+from transformers import Gemma4UnifiedConfig
 
 from nemo_automodel._transformers.model_init import _init_model
+from nemo_automodel._transformers.registry import MODEL_ARCH_MAPPING
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
+from nemo_automodel.components.models.gemma4_unified.model import Gemma4UnifiedForConditionalGeneration
 from nemo_automodel.components.models.gemma4_unified.state_dict_adapter import Gemma4UnifiedStateDictAdapter
 
 GEMMA4_UNIFIED_KEY_PAIRS = [
@@ -80,48 +82,59 @@ class TestGemma4UnifiedStateDictAdapter:
             Gemma4UnifiedStateDictAdapter().to_hf(state_dict)
 
 
-class TestAttachGemma4UnifiedStateDictAdapter:
-    @staticmethod
-    def _run_init(model, *, is_custom_model=False):
-        with patch(
-            "nemo_automodel._transformers.model_init.__init_model",
-            return_value=(is_custom_model, model),
-        ):
-            return _init_model(object(), None, None, None, None, False)
+def _tiny_config() -> Gemma4UnifiedConfig:
+    return Gemma4UnifiedConfig(
+        architectures=["Gemma4UnifiedForConditionalGeneration"],
+        text_config={
+            "vocab_size": 32,
+            "hidden_size": 16,
+            "intermediate_size": 32,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 8,
+            "max_position_embeddings": 32,
+            "sliding_window": 8,
+            "layer_types": ["full_attention"],
+            "global_head_dim": 8,
+            "num_global_key_value_heads": 1,
+        },
+        vision_config={
+            "patch_size": 2,
+            "pooling_kernel_size": 1,
+            "mm_embed_dim": 8,
+            "mm_posemb_size": 4,
+            "output_proj_dims": 8,
+        },
+        audio_config=None,
+        boi_token_id=3,
+        eoi_token_id=4,
+        image_token_id=5,
+        video_token_id=6,
+        boa_token_id=7,
+        eoa_token_index=8,
+        audio_token_id=9,
+    )
 
-    def test_hf_native_gemma4_unified_gets_adapter(self):
-        model = SimpleNamespace(config=SimpleNamespace(model_type="gemma4_unified"))
 
-        is_custom_model, initialized = self._run_init(model)
-
-        assert is_custom_model is False
-        assert initialized is model
-        assert isinstance(model.state_dict_adapter, Gemma4UnifiedStateDictAdapter)
-
-    def test_other_hf_native_model_is_untouched(self):
-        model = SimpleNamespace(config=SimpleNamespace(model_type="gemma4"))
-
-        self._run_init(model)
-
-        assert not hasattr(model, "state_dict_adapter")
-
-    def test_existing_adapter_is_preserved(self):
-        existing = object()
-        model = SimpleNamespace(
-            config=SimpleNamespace(model_type="gemma4_unified"),
-            state_dict_adapter=existing,
+class TestGemma4UnifiedCustomModel:
+    def test_registry_uses_model_specific_wrapper(self):
+        assert MODEL_ARCH_MAPPING["Gemma4UnifiedForConditionalGeneration"] == (
+            "nemo_automodel.components.models.gemma4_unified.model",
+            "Gemma4UnifiedForConditionalGeneration",
         )
 
-        self._run_init(model)
+    def test_init_uses_custom_model_with_adapter(self):
+        is_custom_model, model = _init_model(object(), _tiny_config(), None, "auto", None, False)
 
-        assert model.state_dict_adapter is existing
+        assert is_custom_model is True
+        assert isinstance(model, Gemma4UnifiedForConditionalGeneration)
+        assert isinstance(model.state_dict_adapter, Gemma4UnifiedStateDictAdapter)
+        assert model.lm_head.weight is model.model.language_model.embed_tokens.weight
 
-    def test_custom_model_is_untouched(self):
-        model = SimpleNamespace(config=SimpleNamespace(model_type="gemma4_unified"))
-
-        self._run_init(model, is_custom_model=True)
-
-        assert not hasattr(model, "state_dict_adapter")
+        exported = model.state_dict_adapter.to_hf(model.state_dict())
+        assert "model.vision_embedder.patch_ln1.weight" in exported
+        assert "model.embed_vision.patch_ln1.weight" not in exported
 
 
 def test_checkpointer_save_resume_and_consolidated_export_use_hf_keys(tmp_path):
