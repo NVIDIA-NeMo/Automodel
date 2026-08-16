@@ -23,10 +23,8 @@ from torch import nn
 from torch.nn.parallel import DistributedDataParallel
 
 from nemo_automodel.components.checkpoint._backports.hf_utils import (
-    EXPORT_KEY_RENAMES_FILENAME,
     FQN_TO_DTYPE_MAPPING_FILENAME,
     FQN_TO_FILE_INDEX_MAPPING_FILENAME,
-    INTERNAL_HF_METADATA_FILENAMES,
 )
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState
 from nemo_automodel.components.moe.state_dict_mixin import MoESplitExpertsStateDictMixin
@@ -155,14 +153,12 @@ class ConsolidatedHFAddon:
             hf_metadata_dir (str): Target directory for HF metadata artifacts.
             tokenizer (PreTrainedTokenizerBase | None): Optional tokenizer to save.
             fqn_to_dtype_mapping (dict[str, str] | None): Original HF safetensors dtype map.
-            export_key_renames (dict[str, str] | None): Model FQN to published FQN renames.
             original_model_path (str | None): Authoritative source checkpoint snapshot.
         """
         model_state = kwargs["model_state"]
         hf_metadata_dir = kwargs["hf_metadata_dir"]
         fqn_to_file_index_mapping = kwargs["fqn_to_file_index_mapping"]
         fqn_to_dtype_mapping = kwargs.get("fqn_to_dtype_mapping", None)
-        export_key_renames = kwargs.get("export_key_renames", None)
         tokenizer = kwargs.get("tokenizer", None)
         model_part = model_state.model[0]  # ModelState already converts to list if needed
         original_model_path = kwargs["original_model_path"]
@@ -207,11 +203,6 @@ class ConsolidatedHFAddon:
             if fqn_to_dtype_mapping:
                 with open(os.path.join(hf_metadata_dir, FQN_TO_DTYPE_MAPPING_FILENAME), "w") as f:
                     json.dump(fqn_to_dtype_mapping, f, indent=2, sort_keys=True)
-            # Offline consolidation re-derives nothing from the model, so the export renames
-            # have to travel with the other sidecar metadata.
-            if export_key_renames:
-                with open(os.path.join(hf_metadata_dir, EXPORT_KEY_RENAMES_FILENAME), "w") as f:
-                    json.dump(export_key_renames, f, indent=2, sort_keys=True)
         _group_barrier(process_group)
 
     def post_save(self, **kwargs) -> None:
@@ -237,7 +228,7 @@ class ConsolidatedHFAddon:
             # Copy each public metadata item into consolidated_path while keeping
             # .hf_metadata intact for the offline consolidation helper.
             for item_name in os.listdir(hf_metadata_path):
-                if item_name in INTERNAL_HF_METADATA_FILENAMES:
+                if item_name in {FQN_TO_FILE_INDEX_MAPPING_FILENAME, FQN_TO_DTYPE_MAPPING_FILENAME}:
                     continue  # internal helper metadata, not part of the HF output
                 src_path = os.path.join(hf_metadata_path, item_name)
                 dst_path = os.path.join(consolidated_path, item_name)

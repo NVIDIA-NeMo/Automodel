@@ -42,10 +42,8 @@ from nemo_automodel.components.checkpoint._backports.consolidate_hf_safetensors 
 )
 from nemo_automodel.components.checkpoint._backports.hf_storage import _maybe_rename_index_for_diffusers
 from nemo_automodel.components.checkpoint._backports.hf_utils import (
-    EXPORT_KEY_RENAMES_FILENAME,
     FQN_TO_DTYPE_MAPPING_FILENAME,
     FQN_TO_FILE_INDEX_MAPPING_FILENAME,
-    INTERNAL_HF_METADATA_FILENAMES,
 )
 from nemo_automodel.components.distributed.init_utils import (
     get_rank_safe,
@@ -89,7 +87,7 @@ def _update_config_dtype(config_path: str, cast_dtype: torch.dtype) -> None:
 def copy_metadata_files(input_dir: str, output_dir: str, cast_dtype: torch.dtype | None = None) -> None:
     """Copy metadata files from the temporary metadata directory."""
     for item_name in os.listdir(input_dir):
-        if item_name in INTERNAL_HF_METADATA_FILENAMES:
+        if item_name in {FQN_TO_FILE_INDEX_MAPPING_FILENAME, FQN_TO_DTYPE_MAPPING_FILENAME}:
             continue
         src_path = os.path.join(input_dir, item_name)
         dst_path = os.path.join(output_dir, item_name)
@@ -167,23 +165,6 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _read_optional_sidecar(hf_metadata_dir: str, filename: str) -> dict | None:
-    """Read one of the checkpointer's optional sidecar JSON files.
-
-    Args:
-        hf_metadata_dir: Directory holding the ``.hf_metadata`` sidecars.
-        filename: Sidecar file name to read.
-
-    Returns:
-        The decoded mapping, or None when the checkpoint did not need that sidecar.
-    """
-    path = os.path.join(hf_metadata_dir, filename)
-    if not os.path.exists(path):
-        return None
-    with open(path, "r") as f:
-        return json.load(f)
-
-
 def main() -> None:
     """Run offline HF safetensors consolidation."""
 
@@ -216,8 +197,11 @@ def main() -> None:
 
     with open(os.path.join(hf_metadata_dir, FQN_TO_FILE_INDEX_MAPPING_FILENAME), "r") as f:
         fqn_to_index_mapping = json.load(f)
-    fqn_to_dtype_mapping = _read_optional_sidecar(hf_metadata_dir, FQN_TO_DTYPE_MAPPING_FILENAME)
-    export_key_renames = _read_optional_sidecar(hf_metadata_dir, EXPORT_KEY_RENAMES_FILENAME)
+    fqn_to_dtype_mapping = None
+    fqn_to_dtype_mapping_path = os.path.join(hf_metadata_dir, FQN_TO_DTYPE_MAPPING_FILENAME)
+    if os.path.exists(fqn_to_dtype_mapping_path):
+        with open(fqn_to_dtype_mapping_path, "r") as f:
+            fqn_to_dtype_mapping = json.load(f)
 
     consolidate_safetensors_files_on_every_rank(
         args.input_dir,
@@ -226,7 +210,6 @@ def main() -> None:
         num_threads=args.num_threads,
         cast_dtype=cast_dtype,
         fqn_to_dtype_mapping=fqn_to_dtype_mapping,
-        export_key_renames=export_key_renames,
     )
 
     if get_world_size_safe() > 1:

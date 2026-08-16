@@ -66,8 +66,7 @@ from nemo_automodel.components.checkpoint._backports.hf_storage import (
 )
 from nemo_automodel.components.checkpoint.addons import ConsolidatedHFAddon, PeftAddon
 from nemo_automodel.components.checkpoint.conversion_mapping import (
-    build_hf_export_key_renames,
-    get_hf_load_key_mapping,
+    get_combined_key_mapping,
     requires_tensor_merging,
 )
 from nemo_automodel.components.checkpoint.lifecycle import CheckpointLifecycle
@@ -326,26 +325,6 @@ def _summarize_state_dict_key_diff(
         "missing_examples": missing[:limit],
         "unexpected_examples": unexpected[:limit],
     }
-
-
-def _resolve_hf_load_key_mapping(model: nn.Module) -> dict[str, str] | None:
-    """Resolve the checkpoint-FQN to model-FQN renames Transformers applies to ``model``.
-
-    Shared by the load path and the consolidated-export path so a model is never read under
-    one set of names and written under another.
-
-    Args:
-        model: Model instance, already unwrapped from any DDP wrapper.
-
-    Returns:
-        ``{checkpoint FQN regex: model FQN replacement}``, or None when no renaming applies.
-    """
-    model_type = getattr(getattr(model, "config", None), "model_type", None)
-    # NemotronH remote code (trust_remote_code) uses backbone.* params matching checkpoint keys
-    # skip backbone.*→model.* conversion to avoid key mismatch
-    if model_type == "nemotron_h" and hasattr(model, "backbone"):
-        return None
-    return get_hf_load_key_mapping(model)
 
 
 def _get_checkpoint_metadata_keys(
@@ -660,7 +639,6 @@ class Checkpointer:
         # Build the consolidated model.safetensors.index.json if needed
         fqn_to_file_index_mapping = self._maybe_build_consolidated_index(model_state, state_dict)
         fqn_to_dtype_mapping = self._maybe_build_original_dtype_mapping(model_state, state_dict)
-        export_key_renames = self._maybe_build_export_key_renames(model_state)
         _warn_if_large_inline_consolidation(
             self.config,
             state_dict,
@@ -679,7 +657,6 @@ class Checkpointer:
                 peft_config=peft_config,
                 fqn_to_file_index_mapping=fqn_to_file_index_mapping,
                 fqn_to_dtype_mapping=fqn_to_dtype_mapping,
-                export_key_renames=export_key_renames,
                 original_model_path=self._get_original_model_path(model_state),
                 v4_compatible=self.config.v4_compatible,
                 process_group=consolidation_process_group,
@@ -692,7 +669,6 @@ class Checkpointer:
             fqn_to_dtype_mapping,
             model_dir,
             consolidate_on_all_ranks or defer_consolidation,
-            export_key_renames=export_key_renames,
         )
         self._model_ctx.future = self._do_save(state_dict, model_dir, storage_writer)
 
@@ -713,7 +689,6 @@ class Checkpointer:
                 staging_dir=self.config.staging_dir,
                 fqn_to_dtype_mapping=fqn_to_dtype_mapping,
                 process_group=consolidation_process_group,
-                export_key_renames=export_key_renames,
             )
             if self.config.diffusers_compatible:
                 if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
@@ -728,7 +703,6 @@ class Checkpointer:
                 fqn_to_file_index_mapping,
                 fqn_to_dtype_mapping,
                 consolidation_process_group,
-                export_key_renames,
             )
         self._maybe_log_final_offline_consolidation_hint(model_dir, is_final_checkpoint)
 
@@ -1258,7 +1232,12 @@ class Checkpointer:
         if load_base_model:
             assert model_name is not None, "model_name is required when loading base model"
             # Get combined key mapping from model attribute and model-type specific conversions
-            key_mapping = _resolve_hf_load_key_mapping(model)
+            model_key_mapping = getattr(model, "_checkpoint_conversion_mapping", None)
+            key_mapping = get_combined_key_mapping(model_type, model_key_mapping)
+            # NemotronH remote code (trust_remote_code) uses backbone.* params matching checkpoint keys
+            # skip backbone.*→model.* conversion to avoid key mismatch
+            if model_type == "nemotron_h" and hasattr(model, "backbone"):
+                key_mapping = None
             self.load_model(
                 model,
                 model_path=model_name
@@ -1313,7 +1292,6 @@ class Checkpointer:
         fqn_to_index_mapping: dict[str, int] | None,
         fqn_to_dtype_mapping: dict[str, str] | None,
         process_group: "torch.distributed.ProcessGroup | None",
-        export_key_renames: dict[str, str] | None = None,
     ) -> None:
         """
         Consolidate HF safetensors on a background thread once the async upload completes.
@@ -1331,8 +1309,6 @@ class Checkpointer:
             fqn_to_dtype_mapping: Optional mapping from tensor FQN to original HF dtype string.
             process_group: Group the consolidation collectives run on; the same one the
                 synchronous path and the save addons use.
-            export_key_renames: Optional mapping from model FQN to published FQN, applied to the
-                consolidated safetensors headers and weight index.
         """
         self._join_deferred_consolidation()
 
@@ -1349,7 +1325,6 @@ class Checkpointer:
                     staging_dir=self.config.staging_dir,
                     fqn_to_dtype_mapping=fqn_to_dtype_mapping,
                     process_group=process_group,
-                    export_key_renames=export_key_renames,
                 )
                 if self.config.diffusers_compatible and is_rank_0():
                     _maybe_rename_index_for_diffusers(consolidated_dir)
@@ -1699,10 +1674,9 @@ fi
             self.config.model_repo_id,
         )
         if reference_path:
-            # Transformers may load the model under FQNs that differ from the ones its
-            # checkpoint publishes, so the index has to be keyed by the model's own names.
+            # HF VLM models may contain a special checkpoint mapping attribute
             fqn_to_file_index_mapping = get_fqn_to_file_index_mapping(
-                reference_path, _resolve_hf_load_key_mapping(_unwrap_ddp_model(model))
+                reference_path, getattr(model, "_checkpoint_conversion_mapping", None)
             )
             model_part = model_state.model[0]
             config = getattr(model_part, "config", None)
@@ -1766,43 +1740,6 @@ fi
                 fqn_to_file_index_mapping[fqn] = fqn_to_file_index_mapping.get(fqn, default_index)
         return fqn_to_file_index_mapping
 
-    def _maybe_build_export_key_renames(self, model_state: ModelState) -> Optional[dict[str, str]]:
-        """
-        Build the model-FQN to published-FQN renames applied when exporting consolidated weights.
-
-        Transformers renames some checkpoints' keys while loading them, so a model can be held in
-        memory under FQNs its own checkpoint never uses. DCP keeps those model FQNs, and this
-        mapping restores the published names in the consolidated safetensors headers and weight
-        index so the export stays loadable by Transformers.
-
-        Args:
-            model_state: Wrapper exposing the primary model part.
-
-        Returns:
-            ``{model FQN: published FQN}``, or None when the model is already held under the names
-            its checkpoint publishes.
-        """
-        if not _should_write_hf_metadata(self.config):
-            return None
-        model = _unwrap_ddp_model(model_state.model[0])
-        # Models whose experts Transformers merges are saved in the converted layout, matching
-        # the index built for them in _maybe_build_consolidated_index. Renaming that layout back
-        # to the published names would contradict the tensors actually written.
-        model_type = getattr(getattr(model, "config", None), "model_type", None)
-        if model_type and requires_tensor_merging(model_type) and not hasattr(model, "state_dict_adapter"):
-            return None
-        key_mapping = _resolve_hf_load_key_mapping(model)
-        if not key_mapping:
-            return None
-        reference_path = _get_hf_safetensors_reference_path(
-            self.config.model_cache_dir,
-            self.config.model_repo_id,
-        )
-        if not reference_path:
-            return None
-        published_fqns = get_fqn_to_file_index_mapping(reference_path).keys()
-        return build_hf_export_key_renames(published_fqns, key_mapping) or None
-
     def _maybe_build_original_dtype_mapping(
         self, model_state: ModelState, state_dict: dict[str, torch.Tensor]
     ) -> Optional[dict[str, str]]:
@@ -1823,7 +1760,9 @@ fi
             self.config.model_repo_id,
         )
         if reference_path:
-            dtype_mapping = get_fqn_to_dtype_mapping(reference_path, _resolve_hf_load_key_mapping(model))
+            dtype_mapping = get_fqn_to_dtype_mapping(
+                reference_path, getattr(model, "_checkpoint_conversion_mapping", None)
+            )
             if dtype_mapping:
                 normalized_dtype_mapping = _normalize_dtype_mapping_to_state_dict_keys(
                     dtype_mapping, list(state_dict.keys()), getattr(model, "base_model_prefix", None)
@@ -1838,7 +1777,6 @@ fi
         fqn_to_dtype_mapping: Optional[dict[str, str]],
         model_path: str,
         consolidation_handled_externally: bool = False,
-        export_key_renames: Optional[dict[str, str]] = None,
     ) -> StorageWriter | None:
         """
         Construct a Hugging Face storage writer for sharded safetensors.
@@ -1851,8 +1789,6 @@ fi
             consolidation_handled_externally: If True, consolidation happens outside the writer
                 (inline on all ranks in sync mode, or on a background thread in async mode), so
                 the writer's own finish() consolidation is disabled.
-            export_key_renames: Optional mapping from model FQN to published FQN, applied to the
-                consolidated safetensors headers and weight index.
 
         Returns:
             Configured storage writer or None for non-safetensors.
@@ -1866,7 +1802,6 @@ fi
                 fqn_to_dtype_mapping=fqn_to_dtype_mapping,
                 staging_dir=self.config.staging_dir,
                 diffusers_compatible=self.config.diffusers_compatible,
-                export_key_renames=export_key_renames,
             )
 
     def _get_storage_reader(

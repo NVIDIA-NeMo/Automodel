@@ -33,8 +33,6 @@ The primary entry points are:
 from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
-
     from torch import nn
 
 
@@ -243,72 +241,6 @@ def get_combined_key_mapping(
                                 result[source] = target
 
     return result if result else None
-
-
-def get_hf_load_key_mapping(model: "nn.Module") -> dict[str, str] | None:
-    """
-    Get the checkpoint-FQN to model-FQN key mapping Transformers applies when loading ``model``.
-
-    A model's own ``_checkpoint_conversion_mapping`` takes precedence. Models whose renames are
-    registered only in the Transformers conversion tables, and therefore carry no such attribute,
-    fall back to the mapping derived from those tables.
-
-    Args:
-        model: Model instance whose load-time key renames are requested.
-
-    Returns:
-        ``{checkpoint FQN regex: model FQN replacement}``, or None when the model is loaded
-        under the FQNs its checkpoint already uses.
-    """
-    model_key_mapping = getattr(model, "_checkpoint_conversion_mapping", None)
-    if model_key_mapping:
-        return model_key_mapping
-    model_type = getattr(getattr(model, "config", None), "model_type", None)
-    if not model_type:
-        return None
-    return get_combined_key_mapping(model_type)
-
-
-def build_hf_export_key_renames(
-    checkpoint_fqns: "Iterable[str]",
-    key_mapping: dict[str, str] | None,
-) -> dict[str, str]:
-    """
-    Invert load-time key renames into the model-FQN to checkpoint-FQN map used when exporting.
-
-    Rather than reversing the regexes, every published FQN is pushed through the load-time
-    mapping and the resulting pair is recorded. The renames are therefore exact strings taken
-    from the reference checkpoint, and keys the mapping leaves alone are omitted.
-
-    Args:
-        checkpoint_fqns: Published FQNs of the reference HF checkpoint.
-        key_mapping: Load-time mapping from :func:`get_hf_load_key_mapping`.
-
-    Returns:
-        ``{model FQN: checkpoint FQN}`` for the renamed keys only; empty when nothing is renamed.
-
-    Raises:
-        ValueError: If two published FQNs collapse onto the same model FQN, which would make the
-            export ambiguous.
-    """
-    if not key_mapping:
-        return {}
-    # Imported lazily: hf_storage pulls in the DCP stack, which this module must not require.
-    from nemo_automodel.components.checkpoint._backports.hf_storage import _get_key_renaming_mapping
-
-    renames: dict[str, str] = {}
-    for checkpoint_fqn in checkpoint_fqns:
-        model_fqn = _get_key_renaming_mapping(checkpoint_fqn, key_mapping)
-        if model_fqn == checkpoint_fqn:
-            continue
-        previous = renames.get(model_fqn)
-        if previous is not None and previous != checkpoint_fqn:
-            raise ValueError(
-                f"Checkpoint keys {previous!r} and {checkpoint_fqn!r} both load into model key "
-                f"{model_fqn!r}; the export name is ambiguous."
-            )
-        renames[model_fqn] = checkpoint_fqn
-    return renames
 
 
 def is_transformers_conversion_available() -> bool:

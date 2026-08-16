@@ -66,15 +66,7 @@ def test_main_happy_path_calls_consolidate_and_copies(tmp_path, monkeypatch):
 
     captured = {}
 
-    def fake_consolidate(
-        input_dir,
-        output_dir,
-        fqn_to_index_mapping,
-        num_threads,
-        cast_dtype,
-        fqn_to_dtype_mapping,
-        export_key_renames,
-    ):
+    def fake_consolidate(input_dir, output_dir, fqn_to_index_mapping, num_threads, cast_dtype, fqn_to_dtype_mapping):
         captured["args"] = (
             input_dir,
             output_dir,
@@ -82,7 +74,6 @@ def test_main_happy_path_calls_consolidate_and_copies(tmp_path, monkeypatch):
             num_threads,
             cast_dtype,
             fqn_to_dtype_mapping,
-            export_key_renames,
         )
 
     monkeypatch.setattr(script, "consolidate_safetensors_files_on_every_rank", fake_consolidate)
@@ -107,23 +98,15 @@ def test_main_happy_path_calls_consolidate_and_copies(tmp_path, monkeypatch):
 
     # Consolidation called with expected arguments
     assert "args" in captured
-    (
-        called_in_dir,
-        called_out_dir,
-        called_mapping,
-        called_threads,
-        called_cast_dtype,
-        called_dtype_mapping,
-        called_key_renames,
-    ) = captured["args"]
+    called_in_dir, called_out_dir, called_mapping, called_threads, called_cast_dtype, called_dtype_mapping = captured[
+        "args"
+    ]
     assert Path(called_in_dir) == in_dir
     assert Path(called_out_dir) == out_dir
     assert called_mapping == mapping
     assert called_threads == 2
     assert called_cast_dtype is None
     assert called_dtype_mapping is None
-    # No export_key_renames.json sidecar was written, so nothing is forwarded.
-    assert called_key_renames is None
 
     # Metadata copied (except mapping) and source metadata dir preserved.
     assert (out_dir / "config.json").exists()
@@ -131,48 +114,6 @@ def test_main_happy_path_calls_consolidate_and_copies(tmp_path, monkeypatch):
     assert meta_dir.exists()
     assert (meta_dir / "config.json").exists()
     assert (meta_dir / "fqn_to_file_index_mapping.json").exists()
-
-
-def test_main_forwards_export_key_renames_sidecar(tmp_path, monkeypatch):
-    from tools import offline_hf_consolidation as script
-
-    in_dir = tmp_path / "in"
-    out_dir = tmp_path / "out"
-    meta_dir = in_dir / ".hf_metadata"
-    meta_dir.mkdir(parents=True)
-    out_dir.mkdir(parents=True)
-
-    renames = {"embed_vision.patch_ln1.weight": "vision_embedder.patch_ln1.weight"}
-    (meta_dir / "fqn_to_file_index_mapping.json").write_text(json.dumps({"layer.weight": 0}))
-    (meta_dir / "export_key_renames.json").write_text(json.dumps(renames))
-
-    monkeypatch.setattr(script, "initialize_distributed", lambda backend: None)
-    monkeypatch.setattr(script, "get_world_size_safe", lambda: 1)
-    monkeypatch.setattr(script, "get_rank_safe", lambda: 0)
-
-    captured = {}
-
-    def fake_consolidate(input_dir, output_dir, fqn_to_index_mapping, **kwargs):
-        captured.update(kwargs)
-
-    monkeypatch.setattr(script, "consolidate_safetensors_files_on_every_rank", fake_consolidate)
-
-    argv = [
-        "prog",
-        "--model-name",
-        "meta-llama/Llama-3.2-1B",
-        "--input-dir",
-        str(in_dir),
-        "--output-dir",
-        str(out_dir),
-        "--backend",
-        "gloo",
-    ]
-    monkeypatch.setattr(sys, "argv", argv)
-
-    script.main()
-
-    assert captured["export_key_renames"] == renames
 
 
 def test_main_raises_if_missing_metadata(tmp_path, monkeypatch):
