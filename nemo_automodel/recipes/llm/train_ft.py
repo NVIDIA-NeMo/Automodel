@@ -151,6 +151,7 @@ def _should_pack_validation(
 
 def _should_precompute_pp_causal_masks(model_config: Any) -> bool:
     """Return whether the recipe should attach PP causal-mask precomputation."""
+    # TODO: Replace model-type exceptions with a shared mask-ownership capability.
     return getattr(model_config, "model_type", None) not in ("deepseek_v4", "glm_moe_dsa")
 
 
