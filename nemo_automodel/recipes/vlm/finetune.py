@@ -28,6 +28,7 @@ except ImportError:
 import logging
 import pathlib
 import time
+from collections.abc import Sequence
 from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING, Any, Optional, Protocol
 
@@ -46,6 +47,7 @@ from nemo_automodel._transformers import (
 )
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches, resolve_get_rope_index
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
+from nemo_automodel.components.datasets.datum import Datum
 from nemo_automodel.components.datasets.vlm.pp_media import stage_vlm_media_for_pp
 from nemo_automodel.components.distributed.config import DistributedSetup, FSDP2Config, MegatronFSDPConfig
 from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
@@ -65,10 +67,10 @@ from nemo_automodel.components.loggers.mlflow_utils import (
     to_float_metrics,
 )
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
+from nemo_automodel.components.loss.causal_lm import causal_lm_loss
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
-from nemo_automodel.components.loss.mtp import calculate_mtp_loss
-from nemo_automodel.components.loss.utils import _get_lm_head_weight, calculate_loss
+from nemo_automodel.components.loss.utils import calculate_loss
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
 from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
@@ -82,6 +84,7 @@ from nemo_automodel.components.training.utils import (
 )
 from nemo_automodel.components.utils.compile_utils import build_compile_config
 from nemo_automodel.components.utils.model_utils import VLM_INPUT_KEYS, _supports_logits_to_keep, filter_forward_kwargs
+from nemo_automodel.engine import Engine, collate_prebatched
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config, shard_optimizers_for_megatron_fsdp
 from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.base_recipe import BaseRecipe
@@ -625,6 +628,26 @@ class FinetuneRecipeForVLM(BaseRecipe):
         self.dataloader = dataloader_build.dataloader
         self.processor = dataloader_build.processor
 
+        # Start with the eager path whose inputs need no recipe-owned sharding or
+        # packing preparation. PP, CP, packed, and Magi batches keep using the
+        # existing forward/backward path below.
+        self.engine = None
+        if (
+            not self.pp_enabled
+            and self.mesh_context.cp_size == 1
+            and dataloader_config.packing is None
+            and not self.magi.enabled
+            and getattr(self.loss_fn, "reduction", None) == "sum"
+        ):
+            self.engine = Engine(
+                self.model_parts[0],
+                device=self.dist_env.device,
+                mesh_context=self.mesh_context,
+                collate_fn=collate_prebatched,
+                context_fn=self._cp_vision_frame_sharding_context,
+                defer_fsdp_grad_sync=getattr(self.distributed_config, "defer_fsdp_grad_sync", True),
+            )
+
         # Build validation dataloader if the config provides it
         self.val_dataloader = None
         validation_config = self.cfg.vlm_validation_dataloader
@@ -741,8 +764,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
         base_loss: torch.Tensor,
         labels: torch.Tensor,
         model: nn.Module,
-        num_label_tokens: int,
+        num_label_tokens: int | None,
         log: bool = False,
+        log_denominator: int | float | None = None,
     ) -> torch.Tensor:
         """Return ``base_loss + lambda * sum_k CE(drafter_logits[k], shifted_labels_k)``.
 
@@ -752,7 +776,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
         For drafter step ``k``, labels are shifted left by ``k`` positions to match
         the VLM collate's pre-shifted convention (``labels[t] == input_ids[t+1]``).
         ``log=True`` emits a one-line breakdown on rank 0; callers should gate this
-        on the appropriate step / microbatch index to avoid log spam.
+        on the appropriate step / microbatch index to avoid log spam. A caller
+        that supplies unnormalized sums can set ``log_denominator`` to keep the
+        reported breakdown in mean-loss units.
         """
         drafter_logits = getattr(out, "drafter_logits", None)
         if drafter_logits is None or len(drafter_logits) == 0:
@@ -774,14 +800,88 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
         total_loss = base_loss + drafter_loss_weight * drafter_loss_total
         if log and self.dist_env.is_main:
+            log_scale = 1.0 if log_denominator is None else 1.0 / log_denominator
             logger.info(
                 "[joint-drafter] L_base=%.4f L_drafter=%.4f L_total=%.4f (lambda=%.3f)",
-                base_loss.detach().item(),
-                drafter_loss_total.detach().item(),
-                total_loss.detach().item(),
+                base_loss.detach().item() * log_scale,
+                drafter_loss_total.detach().item() * log_scale,
+                total_loss.detach().item() * log_scale,
                 drafter_loss_weight,
             )
         return total_loss
+
+    def _calculate_eager_loss(
+        self,
+        *,
+        out: Any,
+        labels: torch.Tensor,
+        model: nn.Module,
+        num_label_tokens: int | None,
+        is_train: bool,
+        log_drafter: bool = False,
+        log_denominator: int | float | None = None,
+    ) -> torch.Tensor:
+        """Compute base, MTP, and optional joint-drafter losses."""
+        grad_reduce_group = self._get_dp_group(include_cp=True) if is_train else None
+        loss = causal_lm_loss(
+            self.loss_fn,
+            model,
+            out,
+            labels,
+            getattr(getattr(self, "cfg", None), "mtp", None),
+            num_label_tokens=num_label_tokens,
+            grad_reduce_group=grad_reduce_group,
+        )
+
+        return self._maybe_add_drafter_loss(
+            out=out,
+            base_loss=loss,
+            labels=labels,
+            model=model,
+            num_label_tokens=num_label_tokens,
+            log=log_drafter,
+            log_denominator=log_denominator,
+        )
+
+    def _make_engine_datum(
+        self,
+        batch: dict[str, Any],
+        *,
+        log_drafter: bool = False,
+        log_denominator: int | float = 1,
+    ) -> Datum:
+        """Wrap one processor-collated VLM batch as a Datum."""
+        labels = batch["labels"]
+        model = self.model_parts[0]
+        model_inputs = filter_forward_kwargs(model, {key: value for key, value in batch.items() if key != "labels"})
+        if isinstance(self.loss_fn, FusedLinearCrossEntropy):
+            model_inputs["logits_to_keep"] = 1
+        return Datum(
+            model_inputs=model_inputs,
+            loss_fn_inputs={
+                "labels": labels,
+                "weights": labels.ne(-100),
+                "log_drafter": torch.tensor(log_drafter),
+                "log_denominator": torch.tensor(log_denominator),
+            },
+        )
+
+    def _engine_loss(
+        self,
+        out: Any,
+        loss_inputs: dict[str, torch.Tensor],
+        datums: Sequence[Datum],
+    ) -> torch.Tensor:
+        """Return the local loss sum; Engine owns global normalization."""
+        return self._calculate_eager_loss(
+            out=out,
+            labels=loss_inputs["labels"],
+            model=self.model_parts[0],
+            num_label_tokens=None,
+            is_train=True,
+            log_drafter=bool(datums[0].loss_fn_inputs["log_drafter"].item()),
+            log_denominator=float(datums[0].loss_fn_inputs["log_denominator"].item()),
+        )
 
     def _maybe_set_pp_first_stage_embed_input_meta(self, model_input: torch.Tensor) -> None:
         if (
@@ -928,71 +1028,17 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 if isinstance(self.loss_fn, FusedLinearCrossEntropy):
                     # use num_logits_to_keep to avoid full logits matrix in memory
                     out = model(logits_to_keep=1, **batch)
-                    if "hidden_states" not in out:
-                        raise ValueError(
-                            "FusedLinearCrossEntropy requires the model to output hidden states. "
-                            "Set `model.text_config.output_hidden_states=True` in the config."
-                        )
                 else:
                     out = model(**batch)
 
-                grad_reduce_group = self._get_dp_group(include_cp=True) if is_train else None
-                shared_lm_weight = (
-                    self.loss_fn.materialize_lm_weight(
-                        _get_lm_head_weight(model),
-                        grad_reduce_group=grad_reduce_group,
-                    )
-                    if isinstance(self.loss_fn, FusedLinearCrossEntropy)
-                    else None
-                )
-                local_loss = calculate_loss(
-                    self.loss_fn,
-                    logits=getattr(out, "logits", out),
-                    labels=labels,
-                    model=model,
-                    hidden_states=get_final_hidden_states(out),
-                    lm_weight=shared_lm_weight,
-                    grad_reduce_group=grad_reduce_group,
-                    num_label_tokens=num_label_tokens,
-                )
-                # DSV4-style MTP loss (from main): triggers when the model emits
-                # ``mtp_per_depth_h`` / ``mtp_per_depth_logits``.
-                mtp_per_depth_h = getattr(out, "mtp_per_depth_h", None)
-                mtp_per_depth_logits = getattr(out, "mtp_per_depth_logits", None)
-                if mtp_per_depth_h is not None or mtp_per_depth_logits is not None:
-                    mtp_cfg = self.cfg.mtp
-                    scaling_factor = (
-                        mtp_cfg.scaling_factor if mtp_cfg.scaling_factor is not None else out.mtp_loss_scaling_factor
-                    )
-                    local_loss = local_loss + calculate_mtp_loss(
-                        self.loss_fn,
-                        mtp_per_depth_h=mtp_per_depth_h,
-                        mtp_per_depth_logits=mtp_per_depth_logits,
-                        labels=labels,
-                        model=model,
-                        scaling_factor=scaling_factor,
-                        num_label_tokens=num_label_tokens,
-                        ignore_index=mtp_cfg.ignore_index,
-                        lm_weight=shared_lm_weight,
-                        grad_reduce_group=grad_reduce_group,
-                    )
-
-                # Joint base + drafter co-training (Gemma4WithDrafter and
-                # similar): detect by presence of ``drafter_logits`` on the
-                # model output and add
-                # ``drafter_loss_weight * sum_k CE(drafter_logits[k], shifted_labels_k)``
-                # to the base loss. See ``_shift_labels_left`` for the shift
-                # convention. Mutually exclusive with the DSV4-style MTP path
-                # above -- only one of ``drafter_logits`` /
-                # ``mtp_per_depth_*`` is set per model.
-                local_loss = self._maybe_add_drafter_loss(
+                local_loss = self._calculate_eager_loss(
                     out=out,
-                    base_loss=local_loss,
                     labels=labels,
                     model=model,
                     num_label_tokens=num_label_tokens,
+                    is_train=is_train,
                     # Log once per remote-logging step on the first microbatch.
-                    log=(idx == 0 and self.step_scheduler.is_remote_logging_step),
+                    log_drafter=(idx == 0 and self.step_scheduler.is_remote_logging_step),
                 )
 
                 loss_buffer.append(local_loss.clone().detach())
@@ -1030,9 +1076,6 @@ class FinetuneRecipeForVLM(BaseRecipe):
         num_label_tokens = self._dp_allreduce(num_label_tokens).item()
 
         num_batches = len(batches)
-        self._set_moe_aux_loss_backward_scale(num_batches=num_batches, num_label_tokens=num_label_tokens)
-
-        loss_buffer = []
 
         # number of tokens in the batch, excluding any tail padding.
         num_tokens_in_batch = torch.tensor(
@@ -1041,18 +1084,39 @@ class FinetuneRecipeForVLM(BaseRecipe):
         )
         num_tokens_in_batch = self._dp_allreduce(num_tokens_in_batch).item()
 
-        prepare_for_grad_accumulation(self.model_parts, pp_enabled=self.pp_enabled)
-
-        for i, batch in enumerate(batches):
-            if i == num_batches - 1:
-                prepare_for_final_backward(self.model_parts, pp_enabled=self.pp_enabled)
-
-            self._forward_backward_step(
-                i, batch, loss_buffer=loss_buffer, num_label_tokens=num_label_tokens, num_batches=num_batches
+        engine = getattr(self, "engine", None)
+        use_engine = engine is not None and num_label_tokens > 0
+        if use_engine:
+            reporting_loss, _ = engine.forward_backward(
+                [
+                    [
+                        self._make_engine_datum(
+                            batch,
+                            log_drafter=(index == 0 and self.step_scheduler.is_remote_logging_step),
+                            log_denominator=num_label_tokens,
+                        )
+                    ]
+                    for index, batch in enumerate(batches)
+                ],
+                self._engine_loss,
             )
+        else:
+            # The eager Engine requires a positive global weight sum. Preserve
+            # the established zero-label behavior by using the legacy path.
+            self._set_moe_aux_loss_backward_scale(num_batches=num_batches, num_label_tokens=num_label_tokens)
+            loss_buffer = []
+            prepare_for_grad_accumulation(self.model_parts, pp_enabled=self.pp_enabled)
 
-            if i == 0:
-                prepare_after_first_microbatch()
+            for i, batch in enumerate(batches):
+                if i == num_batches - 1:
+                    prepare_for_final_backward(self.model_parts, pp_enabled=self.pp_enabled)
+
+                self._forward_backward_step(
+                    i, batch, loss_buffer=loss_buffer, num_label_tokens=num_label_tokens, num_batches=num_batches
+                )
+
+                if i == 0:
+                    prepare_after_first_microbatch()
 
         grad_norm = scale_grads_and_clip_grad_norm(
             max_grad_norm=max_grad_norm,
@@ -1104,9 +1168,10 @@ class FinetuneRecipeForVLM(BaseRecipe):
         time_delta = t - self.timestamp
         self.timestamp = t
         tps = num_tokens_in_batch / time_delta
-        reporting_loss = torch.sum(torch.stack(loss_buffer))
-        reporting_loss = self._dp_allreduce(reporting_loss, include_cp=True)
-        if self.pp_enabled:
+        if not use_engine:
+            reporting_loss = torch.sum(torch.stack(loss_buffer))
+            reporting_loss = self._dp_allreduce(reporting_loss, include_cp=True)
+        if not use_engine and self.pp_enabled:
             # PP uses sum reduction per microbatch (no internal normalization).
             # Divide by num_label_tokens to get the mean loss, same as non-PP.
             reporting_loss = reporting_loss / num_label_tokens if num_label_tokens > 0 else reporting_loss * 0.0

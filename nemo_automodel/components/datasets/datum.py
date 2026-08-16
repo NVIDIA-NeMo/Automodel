@@ -35,17 +35,17 @@ __all__ = ["Datum", "collate_datums"]
 
 @dataclass(init=False)
 class Datum:
-    """One processor-ready training example.
+    """One processor-ready training item.
 
     ``model_inputs`` contains exactly the keyword arguments needed by the
-    model for one example. Text examples usually contain ``input_ids``;
-    multimodal examples may additionally contain fields such as
-    ``pixel_values`` and ``image_grid_thw``. ``loss_fn_inputs`` is kept
-    separate so algorithm data such as targets, weights, old log-probabilities,
-    and advantages is never passed to the model.
+    model. The default collater treats each Datum as one text sequence. A
+    custom collater may also consume processor-ready multimodal fields or an
+    already-collated batch. ``loss_fn_inputs`` is kept separate so algorithm
+    data such as targets, weights, old log-probabilities, and advantages is
+    never passed to the model.
 
     Args:
-        model_inputs: Model-ready values for one example. Values are
+        model_inputs: Model-ready values for one training item. Values are
             model-specific because LLM and VLM processors emit different
             fields.
         loss_fn_inputs: Tensor values consumed by the loss function.
@@ -90,11 +90,8 @@ class Datum:
             if not isinstance(input_ids, torch.Tensor):
                 input_ids = torch.as_tensor(input_ids, dtype=torch.long)
                 self.model_inputs["input_ids"] = input_ids
-            if input_ids.ndim != 1:
-                raise ValueError(
-                    "Datum.model_inputs['input_ids'] must be 1-D [T] for one token sequence; "
-                    f"got shape {tuple(input_ids.shape)}"
-                )
+            if input_ids.ndim == 0:
+                raise ValueError("Datum.model_inputs['input_ids'] must have at least one dimension")
 
         for key, value in self.loss_fn_inputs.items():
             if not isinstance(value, torch.Tensor):
@@ -112,7 +109,10 @@ class Datum:
     def seq_len(self) -> int:
         """Token length used by the default text collater."""
         if isinstance(self.model_inputs.get("input_ids"), torch.Tensor):
-            return int(self.model_inputs["input_ids"].shape[0])
+            input_ids = self.model_inputs["input_ids"]
+            if input_ids.ndim == 1:
+                return int(input_ids.shape[0])
+            raise ValueError("the default collater requires 1-D input_ids; use a custom collate_fn")
         for key in ("target_tokens", "weights"):
             value = self.loss_fn_inputs.get(key)
             if isinstance(value, torch.Tensor) and value.ndim == 1:
@@ -129,6 +129,8 @@ class Datum:
         """
         if "input_ids" not in self.model_inputs:
             raise ValueError("the default collater requires model_inputs['input_ids']")
+        if self.input_ids.ndim != 1:
+            raise ValueError("the default collater requires 1-D input_ids; use a custom collate_fn")
 
         features: dict[str, Any] = {}
         for key, value in self.model_inputs.items():
@@ -166,7 +168,7 @@ def collate_datums(
     ``Engine`` instead.
 
     Args:
-        datums: Non-empty examples for one microbatch.
+        datums: Non-empty training items for one microbatch.
         packed: Produce one flat THD token row instead of a padded batch.
         pad_seq_len_divisible: Round the padded token width to this multiple.
         ignore_index: Label fill value used internally by the THD collater.

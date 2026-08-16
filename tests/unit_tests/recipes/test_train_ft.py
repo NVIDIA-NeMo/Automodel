@@ -1080,6 +1080,31 @@ def test_nvtx_false_skips_patching(monkeypatch):
     assert patch_calls == []
 
 
+def test_setup_keeps_engine_disabled_for_loss_without_sum_contract(monkeypatch):
+    cfg = _minimal_cfg_with_nvtx(nvtx_value=False)
+    _patch_setup_minimals(monkeypatch, lambda *args, **kwargs: None)
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft._supports_logits_to_keep", lambda _model: True)
+
+    trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
+    trainer.setup()
+
+    assert trainer.loss_fn == "loss_fn"
+    assert trainer.engine is None
+
+
+def test_setup_builds_engine_for_eager_sum_loss(monkeypatch):
+    from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+
+    cfg = _minimal_cfg_with_nvtx(nvtx_value=False)
+    _patch_setup_minimals(monkeypatch, lambda *args, **kwargs: None)
+
+    trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
+    trainer.setup()
+
+    assert isinstance(trainer.loss_fn, MaskedCrossEntropy)
+    assert trainer.engine is not None
+
+
 def test_setup_does_not_change_storage_dtype_for_non_kd_recipe(monkeypatch):
     cfg = _minimal_cfg_with_nvtx(nvtx_value=False, optimizer_target="torch.optim.AdamW")
 
@@ -2549,11 +2574,14 @@ def test_forward_backward_step_model_cp_hook(monkeypatch, cp_size, uses_thd, sup
     object.__setattr__(recipe, "model_parts", [model])
     object.__setattr__(recipe, "distributed_config", SimpleNamespace(defer_fsdp_grad_sync=True))
     object.__setattr__(recipe, "loss_fn", object())  # not FusedLinearCrossEntropy
+    object.__setattr__(recipe, "_get_dp_group", lambda include_cp=False: None)
     object.__setattr__(recipe, "_get_dp_group_size", lambda include_cp=False: 1)
 
     captured = {}
 
-    def _fake_calc_loss(loss_fn, *, logits, labels, model, hidden_states, lm_weight, num_label_tokens):
+    def _fake_calc_loss(
+        loss_fn, *, logits, labels, model, hidden_states, lm_weight, num_label_tokens, grad_reduce_group
+    ):
         captured["logits_is_tensor"] = isinstance(logits, torch.Tensor)
         assert lm_weight is None
         return logits.mean()
@@ -2562,8 +2590,8 @@ def test_forward_backward_step_model_cp_hook(monkeypatch, cp_size, uses_thd, sup
         "nemo_automodel.components.distributed.context_parallel.utils._make_cp_batch_and_ctx",
         lambda device_mesh, batch, *a, **k: (nullcontext, batch, None),
     )
-    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.calculate_loss", _fake_calc_loss)
-    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.get_final_hidden_states", lambda out: None)
+    monkeypatch.setattr("nemo_automodel.components.loss.causal_lm.calculate_loss", _fake_calc_loss)
+    monkeypatch.setattr("nemo_automodel.components.loss.causal_lm._get_final_hidden_states", lambda out: None)
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.get_sync_ctx", lambda *a, **k: nullcontext())
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.filter_forward_kwargs", lambda model, batch: batch)
 

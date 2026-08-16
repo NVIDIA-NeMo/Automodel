@@ -56,6 +56,7 @@ from nemo_automodel._transformers.mfu import AutoMFU
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.cuda_graphs import PartialCudaGraphManager
+from nemo_automodel.components.datasets.datum import Datum
 from nemo_automodel.components.datasets.loader import DataloaderConfig
 from nemo_automodel.components.distributed.config import DistributedSetup, FSDP2Config, MegatronFSDPConfig
 from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
@@ -71,12 +72,10 @@ from nemo_automodel.components.loggers.mlflow_utils import (
     to_float_metrics,
 )
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
+from nemo_automodel.components.loss.causal_lm import causal_lm_loss
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
-from nemo_automodel.components.loss.mtp import calculate_mtp_loss
-from nemo_automodel.components.loss.utils import _get_lm_head_weight, calculate_loss
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
-from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.utils import (
     count_tail_padding,
@@ -96,6 +95,7 @@ from nemo_automodel.components.utils.model_utils import (
     filter_forward_kwargs,
     resolve_trust_remote_code,
 )
+from nemo_automodel.engine import Engine, collate_prebatched
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config, shard_optimizers_for_megatron_fsdp
 from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.base_recipe import BaseRecipe
@@ -658,6 +658,26 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # Extract TE FP8 config from model backend (set after model construction)
         self.te_fp8 = self.model_parts[0].backend.te_fp8 if hasattr(self.model_parts[0], "backend") else None
 
+        # Packed and CP/Magi batches need recipe-owned input preparation, so
+        # they keep using the existing forward/backward path for now.
+        self.engine = None
+        if (
+            not self.pp_enabled
+            and self.mesh_context.cp_size == 1
+            and getattr(self.cfg.dataloader, "packing", None) is None
+            and not getattr(self.cfg.dataloader, "emits_thd", False)
+            and not self.magi.enabled
+            and getattr(self.loss_fn, "reduction", None) == "sum"
+        ):
+            self.engine = Engine(
+                self.model_parts[0],
+                device=self.dist_env.device,
+                mesh_context=self.mesh_context,
+                collate_fn=collate_prebatched,
+                context_fn=self.te_fp8.maybe_te_autocast if self.te_fp8 is not None else nullcontext,
+                defer_fsdp_grad_sync=getattr(self.distributed_config, "defer_fsdp_grad_sync", True),
+            )
+
         if self.pp_enabled:
             self._configure_pipeline_loss_fn()
 
@@ -1006,17 +1026,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self._partial_cuda_graph_capture_pending = False
 
     # ------------------ helpers ------------------
-    def _forward_backward_step(
-        self,
-        idx,
-        batch,
-        *,
-        loss_buffer,
-        num_label_tokens,
-        num_batches,
-        is_train: bool = True,
-    ):
-        # Move batch to device (handle both tensors and dicts of tensors like causal_mask_mapping)
+    def _prepare_eager_batch(self, batch):
+        """Move and CP-prepare one batch before an eager model call."""
         batch = {
             k: (
                 {dk: dv.to(self.dist_env.device, non_blocking=True) for dk, dv in v.items() if dv is not None}
@@ -1033,7 +1044,53 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             num_chunks=self.pp.pp_batch_size // self.pp.pp_microbatch_size if self.pp_enabled else 1,
         )
         train_ctx, batch = cp_sharder.shard(batch)
-        labels = batch.pop("labels")
+        return train_ctx, batch, batch.pop("labels")
+
+    def _calculate_eager_loss(self, output, labels, model_inputs, *, num_label_tokens, is_train):
+        """Compute the shared CE and optional MTP loss for eager execution."""
+        return causal_lm_loss(
+            self.loss_fn,
+            self.model_parts[0],
+            output,
+            labels,
+            getattr(self.cfg, "mtp", None),
+            num_label_tokens=num_label_tokens,
+            grad_reduce_group=self._get_dp_group(include_cp=True) if is_train else None,
+            cu_seqlens=model_inputs.get("cu_seqlens"),
+        )
+
+    def _make_engine_datum(self, batch):
+        labels = batch["labels"]
+        model_inputs = filter_forward_kwargs(
+            self.model_parts[0], {key: value for key, value in batch.items() if key != "labels"}
+        )
+        if isinstance(self.loss_fn, FusedLinearCrossEntropy):
+            model_inputs["logits_to_keep"] = 1
+        return Datum(
+            model_inputs=model_inputs,
+            loss_fn_inputs={"labels": labels, "weights": labels.ne(-100)},
+        )
+
+    def _engine_loss(self, output, loss_inputs, datums):
+        return self._calculate_eager_loss(
+            output,
+            loss_inputs["labels"],
+            datums[0].model_inputs,
+            num_label_tokens=None,
+            is_train=True,
+        )
+
+    def _forward_backward_step(
+        self,
+        idx,
+        batch,
+        *,
+        loss_buffer,
+        num_label_tokens,
+        num_batches,
+        is_train: bool = True,
+    ):
+        train_ctx, batch, labels = self._prepare_eager_batch(batch)
         fp8_ctx = self.te_fp8.maybe_te_autocast() if self.te_fp8 is not None else nullcontext()
 
         if self.pp_enabled:
@@ -1100,56 +1157,15 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 if isinstance(self.loss_fn, FusedLinearCrossEntropy):
                     # use num_logits_to_keep to avoid full logits matrix in memory
                     out = model(logits_to_keep=1, **batch)
-                    if "hidden_states" not in out:
-                        raise ValueError(
-                            "FusedLinearCrossEntropy requires the model to output hidden states. Set `model.output_hidden_states=True` in the config."
-                        )
                 else:
                     out = model(**batch)
-
-                # Gather the LM head once and share it across the main loss and
-                # all MTP depths (FusedLinearCrossEntropy path) to avoid redundant
-                # full_tensor() gathers that accumulate on-device and OOM.
-                loss_distributed_kwargs = {}
-                shared_lm_weight = None
-                if isinstance(self.loss_fn, FusedLinearCrossEntropy):
-                    grad_reduce_group = self._get_dp_group(include_cp=True) if is_train else None
-                    shared_lm_weight = self.loss_fn.materialize_lm_weight(
-                        _get_lm_head_weight(model),
-                        grad_reduce_group=grad_reduce_group,
-                    )
-                    loss_distributed_kwargs["grad_reduce_group"] = grad_reduce_group
-                local_loss = calculate_loss(
-                    self.loss_fn,
-                    logits=getattr(out, "logits", out),
-                    labels=labels,
-                    model=model,
-                    hidden_states=get_final_hidden_states(out),
-                    lm_weight=shared_lm_weight,
+                local_loss = self._calculate_eager_loss(
+                    out,
+                    labels,
+                    batch,
                     num_label_tokens=num_label_tokens,
-                    **loss_distributed_kwargs,
+                    is_train=is_train,
                 )
-                mtp_per_depth_h = getattr(out, "mtp_per_depth_h", None)
-                mtp_per_depth_logits = getattr(out, "mtp_per_depth_logits", None)
-                if mtp_per_depth_h is not None or mtp_per_depth_logits is not None:
-                    mtp_cfg = self.cfg.mtp
-                    scaling_factor = (
-                        mtp_cfg.scaling_factor if mtp_cfg.scaling_factor is not None else out.mtp_loss_scaling_factor
-                    )
-                    local_loss = local_loss + calculate_mtp_loss(
-                        self.loss_fn,
-                        mtp_per_depth_h=mtp_per_depth_h,
-                        mtp_per_depth_logits=mtp_per_depth_logits,
-                        labels=labels,
-                        model=model,
-                        scaling_factor=scaling_factor,
-                        num_label_tokens=num_label_tokens,
-                        ignore_index=mtp_cfg.ignore_index,
-                        # mask cross-boundary MTP label rolls in THD packing (matches the PP path)
-                        cu_seqlens=batch.get("cu_seqlens"),
-                        lm_weight=shared_lm_weight,
-                        **loss_distributed_kwargs,
-                    )
                 loss_buffer.append(local_loss.clone().detach())
                 if is_train:
                     (local_loss * self._get_dp_group_size(include_cp=True)).backward()
@@ -1175,7 +1191,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         num_label_tokens = self._dp_allreduce(num_label_tokens).item()
 
         num_batches = len(batches)
-        self._set_moe_aux_loss_backward_scale(num_batches=num_batches, num_label_tokens=num_label_tokens)
 
         loss_buffer = []
 
@@ -1186,18 +1201,29 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         )
         num_tokens_in_batch = self._dp_allreduce(num_tokens_in_batch).item()
 
-        prepare_for_grad_accumulation(self.model_parts, pp_enabled=self.pp_enabled)
-
-        for i, batch in enumerate(batches):
-            if i == num_batches - 1:
-                prepare_for_final_backward(self.model_parts, pp_enabled=self.pp_enabled)
-
-            self._forward_backward_step(
-                i, batch, loss_buffer=loss_buffer, num_label_tokens=num_label_tokens, num_batches=num_batches
+        engine = getattr(self, "engine", None)
+        use_engine = engine is not None and num_label_tokens > 0
+        if use_engine:
+            reporting_loss, _ = engine.forward_backward(
+                [[self._make_engine_datum(batch)] for batch in batches],
+                self._engine_loss,
             )
+        else:
+            # Engine requires a positive global weight sum. Keep the existing
+            # zero-label behavior on the legacy path.
+            self._set_moe_aux_loss_backward_scale(num_batches=num_batches, num_label_tokens=num_label_tokens)
+            prepare_for_grad_accumulation(self.model_parts, pp_enabled=self.pp_enabled)
 
-            if i == 0:
-                prepare_after_first_microbatch()
+            for i, batch in enumerate(batches):
+                if i == num_batches - 1:
+                    prepare_for_final_backward(self.model_parts, pp_enabled=self.pp_enabled)
+
+                self._forward_backward_step(
+                    i, batch, loss_buffer=loss_buffer, num_label_tokens=num_label_tokens, num_batches=num_batches
+                )
+
+                if i == 0:
+                    prepare_after_first_microbatch()
 
         grad_norm = scale_grads_and_clip_grad_norm(
             max_grad_norm,
@@ -1273,12 +1299,13 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 ).item()
                 mfu = calculate_mfu(step_flops / 1e12, self.dist_env.world_size, time_delta)
 
-        reporting_loss = torch.sum(torch.stack(loss_buffer))
-        reporting_loss = self._dp_allreduce(reporting_loss, include_cp=True)
-        if self.pp_enabled:
-            reporting_loss = reporting_loss / num_label_tokens
-            reporting_loss = reporting_loss.to(self.dist_env.device)
-            reporting_loss = self._broadcast_from_last_pp_stage(reporting_loss)
+        if not use_engine:
+            reporting_loss = torch.sum(torch.stack(loss_buffer))
+            reporting_loss = self._dp_allreduce(reporting_loss, include_cp=True)
+            if self.pp_enabled:
+                reporting_loss = reporting_loss / num_label_tokens
+                reporting_loss = reporting_loss.to(self.dist_env.device)
+                reporting_loss = self._broadcast_from_last_pp_stage(reporting_loss)
 
         reporting_loss = reporting_loss.cpu().item()
         # fix reporting_loss, tps across ranks

@@ -432,7 +432,7 @@ def test_run_train_step_supports_tensor_outputs(monkeypatch):
     )
 
     calculate_mock = MagicMock(side_effect=fake_calculate_loss)
-    monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.calculate_loss", calculate_mock)
+    monkeypatch.setattr("nemo_automodel.components.loss.causal_lm.calculate_loss", calculate_mock)
 
     grad_clip_mock = MagicMock(return_value=2.5)
     monkeypatch.setattr(
@@ -485,7 +485,7 @@ def test_forward_backward_step_routes_thd_batch_through_te(monkeypatch):
     monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.ContextParallelSharder", make_thd_batch)
     monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.get_sync_ctx", lambda *args, **kwargs: nullcontext())
     monkeypatch.setattr(
-        "nemo_automodel.recipes.vlm.finetune.calculate_loss",
+        "nemo_automodel.components.loss.causal_lm.calculate_loss",
         lambda *args, **kwargs: torch.tensor(1.0, requires_grad=True),
     )
 
@@ -2994,6 +2994,31 @@ def test_vlm_rope_fusion_unchanged_when_cp_eq_1(monkeypatch):
     trainer.setup()
 
     assert cfg.model.backend.rope_fusion is True
+
+
+def test_vlm_setup_keeps_engine_disabled_for_loss_without_sum_contract(monkeypatch):
+    cfg = _minimal_vlm_cfg(cp_size=1, rope_fusion=True)
+    _patch_vlm_setup_minimals(monkeypatch, cp_size=1)
+    monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep", lambda _model: True)
+
+    trainer = FinetuneRecipeForVLM(cfg)
+    trainer.setup()
+
+    assert trainer.loss_fn == "loss_fn"
+    assert trainer.engine is None
+
+
+def test_vlm_setup_builds_engine_for_eager_sum_loss(monkeypatch):
+    from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+
+    cfg = _minimal_vlm_cfg(cp_size=1, rope_fusion=True)
+    _patch_vlm_setup_minimals(monkeypatch, cp_size=1)
+
+    trainer = FinetuneRecipeForVLM(cfg)
+    trainer.setup()
+
+    assert isinstance(trainer.loss_fn, MaskedCrossEntropy)
+    assert trainer.engine is not None
 
 
 def test_vlm_setup_does_not_change_storage_dtype_for_non_kd_recipe(monkeypatch):

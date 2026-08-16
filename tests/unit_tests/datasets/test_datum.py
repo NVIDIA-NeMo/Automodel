@@ -57,9 +57,11 @@ def test_datum_keeps_old_input_ids_convenience():
     assert positional.input_ids.tolist() == [4, 5]
 
 
-def test_datum_rejects_non_1d_input_ids():
-    with pytest.raises(ValueError, match="must be 1-D"):
-        Datum(model_inputs={"input_ids": torch.zeros(2, 3, dtype=torch.long)})
+def test_datum_allows_prebatched_inputs_only_with_a_custom_collater():
+    datum = Datum(model_inputs={"input_ids": torch.zeros(2, 3, dtype=torch.long)})
+    assert datum.model_inputs["input_ids"].shape == (2, 3)
+    with pytest.raises(ValueError, match="default collater requires 1-D"):
+        collate_datums([datum])
 
 
 def test_datum_accepts_model_specific_inputs():

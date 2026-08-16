@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import AbstractContextManager, nullcontext
 from typing import Any
 
 import torch
@@ -40,7 +41,28 @@ LossFn = Callable[
     torch.Tensor | tuple[torch.Tensor, Sequence[Mapping[str, Any]]],
 ]
 
-__all__ = ["Engine"]
+__all__ = ["Engine", "collate_prebatched"]
+
+
+def collate_prebatched(datums: list[Datum]) -> tuple[dict[str, Any], dict[str, torch.Tensor]]:
+    """Return one already-collated Datum without changing its layout.
+
+    The Datum represents the whole prebatched item. Consequently, one
+    optional ``loss_fn_output`` mapping also describes that whole batch, not
+    each sample inside it.
+
+    Args:
+        datums: A one-item list whose model and loss tensor fields already have
+            the batch layout expected by the model and loss callback.
+
+    Returns:
+        Separate shallow copies of the Datum's model-input and loss-input
+        mappings. Tensor shapes, dtypes, devices, and storage are unchanged.
+    """
+    if len(datums) != 1:
+        raise ValueError("collate_prebatched expects exactly one Datum per microbatch")
+    datum = datums[0]
+    return dict(datum.model_inputs), dict(datum.loss_fn_inputs)
 
 
 class Engine:
@@ -59,17 +81,19 @@ class Engine:
         mesh_context: Runtime topology. When omitted, an initialized default
             process group is treated as pure data parallelism.
         collate_fn: Batches one microbatch of Datums into separate model and
-            loss inputs. The default supports padded or packed text;
-            VLMs pass a thin callable around their model-specific collater.
-            The callable must keep model inputs and loss inputs aligned and
-            preserve the sum of ``weights``.
+            loss inputs. The default supports padded text. Packed text and
+            VLMs pass a model-specific collater that returns final model-ready
+            inputs. Existing recipes whose dataloaders already collate can use
+            :func:`collate_prebatched`. The callable must keep model inputs and
+            loss inputs aligned and preserve the sum of ``weights``.
+        context_fn: Creates an optional context around model forward, loss,
+            and backward. Recipes use this for runtime contexts such as FP8.
         defer_fsdp_grad_sync: Defer FSDP/DDP gradient synchronization until the
             final microbatch.
 
     Note:
         This first execution backend is eager and weight-normalized. Pipeline
-        and context parallel schedules and pre-reduced scalar losses are
-        intentionally deferred.
+        and context parallel schedules are intentionally deferred.
     """
 
     def __init__(
@@ -79,12 +103,14 @@ class Engine:
         device: torch.device | str,
         mesh_context: MeshContext | None = None,
         collate_fn: CollateFn = collate_datums,
+        context_fn: Callable[[], AbstractContextManager[Any]] = nullcontext,
         defer_fsdp_grad_sync: bool = True,
     ) -> None:
         self.model = model
         self.device = torch.device(device)
         self.mesh_context = mesh_context
         self.collate_fn = collate_fn
+        self.context_fn = context_fn
         self.defer_fsdp_grad_sync = defer_fsdp_grad_sync
 
     def forward_backward(
@@ -97,10 +123,22 @@ class Engine:
         ``window`` is explicit: each inner sequence is one eager microbatch.
         ``loss_fn`` receives the raw model output, collated
         ``loss_fn_inputs``, and the original Datums for that microbatch. It
-        returns unreduced losses with exactly the same shape as
-        ``loss_fn_inputs["weights"]``. It may also return one output mapping
-        per Datum. Those mappings are detached and preserved in input order;
-        the Engine deliberately does not interpret or reduce them.
+        returns either per-element losses with exactly the same shape as
+        ``loss_fn_inputs["weights"]``, or a scalar local weighted-sum
+        numerator. For a scalar, the callback must apply weights and masks;
+        the Engine will only apply global normalization. The callback may
+        also return one output mapping per Datum.
+        Those mappings are detached and preserved in input order; the Engine
+        deliberately does not interpret or reduce them.
+
+        Args:
+            window: The complete optimizer accumulation window. Each inner
+                sequence is one microbatch of Datums. A Datum's token weights
+                may have shape ``[tokens]`` or the custom collater's batched
+                token layout; the loss tensor must use the identical shape.
+            loss_fn: Computes either that per-token loss tensor or a scalar
+                local weighted-sum numerator from the raw model output and
+                collated loss inputs.
 
         Returns:
             ``(loss, loss_fn_outputs)``. ``loss`` is a detached, DP-reduced
@@ -129,11 +167,18 @@ class Engine:
                 prepare_for_final_backward([self.model], pp_enabled=False)
 
             model_inputs, loss_inputs = self.collate_fn(datums)
+            if model_inputs.get("qkv_format") == "thd" and (
+                "seq_lens" in model_inputs or "seq_lens_padded" in model_inputs
+            ):
+                raise ValueError(
+                    "packed collate_fn must return final model-ready THD inputs, not seq_lens packing metadata"
+                )
+            self._validate_collated_weights(datums, loss_inputs)
             model_inputs = _to_device(model_inputs, self.device)
             loss_inputs = _to_device(loss_inputs, self.device)
-            weights = self._validate_collated_weights(datums, loss_inputs)
+            weights = loss_inputs["weights"]
 
-            with get_sync_ctx(self.model, is_last, self.defer_fsdp_grad_sync):
+            with get_sync_ctx(self.model, is_last, self.defer_fsdp_grad_sync), self.context_fn():
                 output = self.model(**model_inputs)
                 result = loss_fn(output, loss_inputs, datums)
                 has_outputs = isinstance(result, tuple)
@@ -155,15 +200,18 @@ class Engine:
                     losses = result
                 if not isinstance(losses, torch.Tensor):
                     raise TypeError("loss_fn must return a Tensor, optionally followed by per-Datum outputs")
-                if losses.shape != weights.shape:
+                if losses.ndim == 0:
+                    numerator = losses
+                elif losses.shape == weights.shape:
+                    numerator = (losses * weights.to(losses)).sum()
+                else:
                     raise ValueError(
-                        "loss_fn losses must have exactly the same shape as weights; "
+                        "loss_fn must return a scalar local weighted sum or losses with exactly the same shape as weights; "
                         f"got losses={tuple(losses.shape)}, weights={tuple(weights.shape)}"
                     )
                 if losses.device != weights.device:
                     raise ValueError("loss_fn losses and weights must be on the same device")
 
-                numerator = (losses * weights.to(losses)).sum()
                 (numerator * (dp_size / denominator)).backward()
 
             local_loss_sum.add_(numerator.detach().to(torch.float64))
@@ -248,7 +296,7 @@ class Engine:
     def _validate_collated_weights(
         datums: list[Datum],
         loss_inputs: dict[str, torch.Tensor],
-    ) -> torch.Tensor:
+    ) -> None:
         weights = loss_inputs.get("weights")
         if not isinstance(weights, torch.Tensor):
             raise ValueError("collate_fn must return a Tensor loss input named 'weights'")
@@ -259,13 +307,12 @@ class Engine:
         actual_sum = weights.to(torch.float64).sum()
         if not torch.isclose(actual_sum, actual_sum.new_tensor(expected_sum)):
             raise ValueError("collate_fn changed the sum of Datum weights")
-        return weights
 
 
 def _to_device(value: Any, device: torch.device) -> Any:
     """Move tensors in common model-input containers without changing layout."""
     if isinstance(value, torch.Tensor):
-        return value.to(device)
+        return value.to(device, non_blocking=True)
     if isinstance(value, dict):
         return {key: _to_device(item, device) for key, item in value.items()}
     if isinstance(value, list):

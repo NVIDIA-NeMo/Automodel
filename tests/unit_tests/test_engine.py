@@ -29,8 +29,10 @@ import nemo_automodel.engine as engine_module
 from nemo_automodel import Datum as PublicDatum
 from nemo_automodel import Engine as PublicEngine
 from nemo_automodel.components.datasets.datum import Datum, collate_datums
+from nemo_automodel.components.loss.causal_lm import causal_lm_loss
+from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
-from nemo_automodel.engine import Engine
+from nemo_automodel.engine import Engine, collate_prebatched
 
 
 class ScaleModel(nn.Module):
@@ -76,25 +78,60 @@ def test_forward_backward_uses_one_denominator_for_the_window():
     assert model.forward_calls == 2
 
 
-def test_padded_and_packed_windows_have_the_same_loss_and_gradient():
-    padded_model = ScaleModel()
-    packed_model = ScaleModel()
-    window = [[_datum([1, 2]), _datum([3])]]
+def test_pre_thd_packed_collater_requires_model_ready_inputs():
+    model = ScaleModel()
 
-    padded_loss, _ = Engine(padded_model, device="cpu").forward_backward(window, _identity_loss)
+    with pytest.raises(ValueError, match="final model-ready THD"):
+        Engine(
+            model,
+            device="cpu",
+            collate_fn=partial(collate_datums, packed=True),
+        ).forward_backward([[_datum([1, 2]), _datum([3])]], _identity_loss)
 
-    def packed_identity_loss(output, loss_inputs, datums):
-        assert [datum.seq_len for datum in datums] == [2, 1]
-        return _identity_loss(output, loss_inputs, datums)
+    assert model.forward_calls == 0
 
-    packed_loss, _ = Engine(
-        packed_model,
+
+def _model_ready_packed_collate(datums):
+    model_inputs, loss_inputs = collate_datums(datums, packed=True)
+    lengths = torch.tensor([datum.seq_len for datum in datums], dtype=torch.int32)
+    model_inputs = {
+        "input_ids": model_inputs["input_ids"].flatten(),
+        "position_ids": model_inputs["position_ids"].flatten(),
+        "cu_seqlens": F.pad(lengths.cumsum(0), (1, 0)),
+        "max_seqlen": lengths.max(),
+        "qkv_format": "thd",
+    }
+    loss_inputs = {
+        key: value.flatten() if value.ndim == 2 and value.shape[0] == 1 else value for key, value in loss_inputs.items()
+    }
+    return model_inputs, loss_inputs
+
+
+def test_packed_rl_callback_keeps_per_datum_sequence_boundaries():
+    model = ScaleModel()
+    first = _datum([1, 2])
+    second = _datum([3])
+    first.loss_fn_inputs["sequence_scale"] = torch.tensor(2.0)
+    second.loss_fn_inputs["sequence_scale"] = torch.tensor(0.5)
+
+    def sequence_loss(output, _loss_inputs, datums):
+        chunks = output.squeeze(0).split([datum.seq_len for datum in datums])
+        losses = torch.cat([chunk * datum.loss_fn_inputs["sequence_scale"] for chunk, datum in zip(chunks, datums)])
+        outputs = [
+            {"sequence_sum": chunk.sum(), "sequence_length": datum.seq_len} for chunk, datum in zip(chunks, datums)
+        ]
+        return losses, outputs
+
+    loss, outputs = Engine(
+        model,
         device="cpu",
-        collate_fn=partial(collate_datums, packed=True),
-    ).forward_backward(window, packed_identity_loss)
+        collate_fn=_model_ready_packed_collate,
+    ).forward_backward([[first, second]], sequence_loss)
 
-    torch.testing.assert_close(padded_loss, packed_loss)
-    torch.testing.assert_close(padded_model.weight.grad, packed_model.weight.grad)
+    assert loss.item() == pytest.approx(2.5)
+    assert model.weight.grad.item() == pytest.approx(2.5)
+    assert [item["sequence_length"] for item in outputs] == [2, 1]
+    assert [item["sequence_sum"].item() for item in outputs] == pytest.approx([3.0, 3.0])
 
 
 def test_weights_mask_loss_and_denominator():
@@ -159,6 +196,11 @@ class TinyLM(nn.Module):
         return self.output(self.embedding(input_ids))
 
 
+class TinyCausalLM(TinyLM):
+    def forward(self, input_ids, **_):
+        return SimpleNamespace(logits=super().forward(input_ids))
+
+
 def test_raw_output_and_loss_inputs_support_an_rl_loss_callback():
     datum = Datum(
         model_inputs={"input_ids": torch.tensor([1, 2, 3])},
@@ -191,6 +233,56 @@ def test_raw_output_and_loss_inputs_support_an_rl_loss_callback():
     assert model.output.weight.grad is not None
 
 
+def test_causal_lm_loss_matches_a_manual_accumulation_window():
+    torch.manual_seed(7)
+    model = TinyCausalLM()
+    reference = TinyCausalLM()
+    reference.load_state_dict(model.state_dict())
+    batches = [
+        (torch.tensor([[1, 2, 3]]), torch.tensor([[2, 3, -100]])),
+        (torch.tensor([[4, 5]]), torch.tensor([[5, 6]])),
+    ]
+    loss_fn = MaskedCrossEntropy()
+    mtp_config = SimpleNamespace(scaling_factor=None, ignore_index=-100)
+
+    window = [
+        [
+            Datum(
+                model_inputs={"input_ids": input_ids},
+                loss_fn_inputs={"labels": labels, "weights": labels.ne(-100)},
+            )
+        ]
+        for input_ids, labels in batches
+    ]
+
+    def engine_loss(output, inputs, _datums):
+        return causal_lm_loss(
+            loss_fn,
+            model,
+            output,
+            inputs["labels"],
+            mtp_config,
+            num_label_tokens=None,
+            grad_reduce_group=None,
+        )
+
+    actual_loss, _ = Engine(model, device="cpu", collate_fn=collate_prebatched).forward_backward(window, engine_loss)
+
+    denominator = sum((labels != -100).sum() for _, labels in batches)
+    reference_loss = (
+        sum(
+            F.cross_entropy(reference(input_ids).logits.flatten(0, 1), labels.flatten(), reduction="sum")
+            for input_ids, labels in batches
+        )
+        / denominator
+    )
+    reference_loss.backward()
+
+    torch.testing.assert_close(actual_loss, reference_loss.detach().to(actual_loss))
+    for parameter, expected in zip(model.parameters(), reference.parameters()):
+        torch.testing.assert_close(parameter.grad, expected.grad)
+
+
 def test_lifecycle_marks_only_the_last_microbatch_for_sync(monkeypatch):
     events = []
 
@@ -213,6 +305,34 @@ def test_lifecycle_marks_only_the_last_microbatch_for_sync(monkeypatch):
     )
 
     assert events == ["prepare", "sync:False", "after_first", "final", "sync:True"]
+
+
+def test_forward_context_covers_forward_loss_and_backward():
+    active = False
+
+    @contextmanager
+    def forward_context():
+        nonlocal active
+        active = True
+        try:
+            yield
+        finally:
+            active = False
+
+    class ContextModel(ScaleModel):
+        def forward(self, input_ids, **kwargs):
+            assert active
+            return super().forward(input_ids, **kwargs)
+
+    model = ContextModel()
+    model.weight.register_hook(lambda grad: grad if active else pytest.fail("context ended before backward"))
+
+    def loss_fn(output, _inputs, _datums):
+        assert active
+        return output
+
+    Engine(model, device="cpu", context_fn=forward_context).forward_backward([[_datum([1, 2])]], loss_fn)
+    assert not active
 
 
 def test_window_sets_the_same_moe_aux_scale_as_the_recipes(monkeypatch):
@@ -270,6 +390,48 @@ def test_model_specific_collater_keeps_multimodal_inputs_and_gradients():
     assert model.vision.weight.grad.abs().sum() > 0
 
 
+def test_prebatched_datum_keeps_existing_recipe_batch_layout():
+    model = ScaleModel()
+    datum = Datum(
+        model_inputs={"input_ids": torch.tensor([[1, 2], [3, 4]])},
+        loss_fn_inputs={"weights": torch.tensor([[1.0, 1.0], [1.0, 0.0]])},
+    )
+
+    loss, _ = Engine(model, device="cpu", collate_fn=collate_prebatched).forward_backward([[datum]], _identity_loss)
+
+    assert loss.item() == pytest.approx(2.0)
+    assert model.weight.grad.item() == pytest.approx(2.0)
+
+
+def test_prebatched_datum_keeps_vlm_media_layout():
+    model = TinyVLM()
+    datum = Datum(
+        model_inputs={
+            "input_ids": torch.tensor([[1, 2], [3, 4]]),
+            "pixel_values": [torch.tensor([0.5]), torch.tensor([1.5])],
+        },
+        loss_fn_inputs={"weights": torch.ones(2)},
+    )
+
+    loss, _ = Engine(model, device="cpu", collate_fn=collate_prebatched).forward_backward([[datum]], _identity_loss)
+
+    assert torch.isfinite(loss)
+    assert model.text.weight.grad is not None
+    assert model.vision.weight.grad is not None
+
+
+def test_scalar_loss_is_a_local_weighted_sum_numerator():
+    model = ScaleModel()
+
+    loss, _ = Engine(model, device="cpu").forward_backward(
+        [[_datum([1, 100], [1.0, 0.0])], [_datum([3, 5], [0.5, 1.0])]],
+        lambda output, inputs, _datums: (output * inputs["weights"]).sum(),
+    )
+
+    assert loss.item() == pytest.approx(3.0)
+    assert model.weight.grad.item() == pytest.approx(3.0)
+
+
 def test_zero_weights_fail_before_forward():
     model = ScaleModel()
     with pytest.raises(ValueError, match="positive global weight sum"):
@@ -300,7 +462,7 @@ def test_loss_shape_must_exactly_match_weights():
     with pytest.raises(ValueError, match="exactly the same shape"):
         Engine(model, device="cpu").forward_backward(
             [[_datum([1, 2])]],
-            lambda output, _inputs, _datums: output.sum(),
+            lambda output, _inputs, _datums: output[:, :1],
         )
     assert model.weight.grad is None
 

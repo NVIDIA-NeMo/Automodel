@@ -475,7 +475,7 @@ class TestMTPLossDispatch:
         by stubbing ``linear_cross_entropy`` and asserting it is called once
         per MTP depth with the expected kwargs."""
         from nemo_automodel.components.loss import linear_ce as linear_ce_mod
-        from nemo_automodel.recipes.llm.train_ft import calculate_mtp_loss
+        from nemo_automodel.components.loss.mtp import calculate_mtp_loss
 
         if not linear_ce_mod.HAVE_CUT_CROSS_ENTROPY:
             pytest.skip("cut_cross_entropy not installed")
