@@ -72,10 +72,7 @@ from nemo_automodel.components.models.common.utils import (
     initialize_linear_module,
     initialize_rms_norm_module,
 )
-from nemo_automodel.components.models.gemma4_unified.state_dict_adapter import (
-    GEMMA4_UNIFIED_MODEL_TYPE,
-    Gemma4UnifiedStateDictAdapter,
-)
+from nemo_automodel.components.models.gemma4_unified.model import maybe_attach_state_dict_adapter
 from nemo_automodel.components.utils.model_utils import resolve_trust_remote_code, skip_random_init
 from nemo_automodel.shared.utils import dtype_from_str
 
@@ -1438,12 +1435,7 @@ def _init_model(
         *model_args,
         **kwargs,
     )
-    if (
-        not is_custom_model
-        and getattr(getattr(model, "config", None), "model_type", None) == GEMMA4_UNIFIED_MODEL_TYPE
-        and getattr(model, "state_dict_adapter", None) is None
-    ):
-        model.state_dict_adapter = Gemma4UnifiedStateDictAdapter()
+    maybe_attach_state_dict_adapter(model, is_custom_model=is_custom_model)
     if is_custom_model and requested_backend is not None:
         _apply_backend_module_overrides(model, requested_backend)
         if not hasattr(model, "backend"):
