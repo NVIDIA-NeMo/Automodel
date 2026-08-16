@@ -379,6 +379,7 @@ class _TensorModel(torch.nn.Module):
     def __init__(self):
         super().__init__()
         self.weight = torch.nn.Parameter(torch.zeros(1))
+        self.supports = SimpleNamespace(mtp_enabled=False)
 
     def forward(self, **batch):
         return torch.zeros((), requires_grad=True)
@@ -2374,6 +2375,8 @@ class _ModelWithHiddenStates(torch.nn.Module):
 
 def _create_non_pp_recipe(model, device="cpu"):
     """Helper to create a non-PP recipe bypassing BaseRecipe tracking."""
+    if not hasattr(model, "supports"):
+        model.supports = SimpleNamespace(mtp_enabled=False)
     recipe = object.__new__(FinetuneRecipeForVLM)
     # Initialize __dict__ directly to bypass BaseRecipe.__setattr__ tracking
     recipe.__dict__["__state_tracked"] = set()
