@@ -335,14 +335,15 @@ def _parse_input_metadata(
                     fqn_to_dtype_mapping,
                     quantized_dtype_mismatches,
                 )
-                # Preserve the export name assigned during output layout and fill in the
-                # shape and dtype information read from the model-FQN-keyed input shards.
-                fqn_data = output_data.fqn_data[fqn]
-                fqn_data.shape_in_file = tensor_size
-                fqn_data.dtype_size = _get_dtype_size(output_dtype)
-                fqn_data.dtype_str = output_dtype_str
-                fqn_data.source_dtype_size = _get_dtype_size(source_dtype)
-                fqn_data.source_dtype_str = dtype_str
+                export_name = output_data.fqn_data[fqn].export_name
+                output_data.fqn_data[fqn] = _FqnData(
+                    shape_in_file=tensor_size,
+                    dtype_size=_get_dtype_size(output_dtype),
+                    dtype_str=output_dtype_str,
+                    source_dtype_size=_get_dtype_size(source_dtype),
+                    source_dtype_str=dtype_str,
+                )
+                output_data.fqn_data[fqn].export_name = export_name
     _warn_quantized_dtype_mismatches(quantized_dtype_mismatches)
     _drop_missing_output_fqns(output_files_data, set(fqn_to_size_mapping))
 
