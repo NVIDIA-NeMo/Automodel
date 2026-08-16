@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from collections.abc import MutableMapping
 from dataclasses import dataclass
+from enum import Enum
 from typing import Callable
 
 import torch
@@ -46,6 +47,18 @@ class MTPContextParallelInputs:
     targets: tuple[torch.LongTensor, ...]
     valid_masks: tuple[torch.BoolTensor, ...]
     position_ids_seq_dim: int
+
+
+class MTPPositionPolicy(Enum):
+    """How an MTP depth assigns positions to its future-token input.
+
+    ``FUTURE`` advances positions with the future token, as used by the common
+    Nemotron/Qwen MTP block. ``CURRENT`` keeps the backbone query position at
+    every depth, as used by DeepSeek V4, Step3.7, and MiniMax M3.
+    """
+
+    FUTURE = "future"
+    CURRENT = "current"
 
 
 def roll_tensor(t: torch.Tensor, shifts: int = -1, dim: int = -1) -> torch.Tensor:
@@ -242,6 +255,7 @@ def prepare_mtp_context_parallel_inputs(
     *,
     num_depths: int,
     ignore_index: int = -100,
+    position_policy: MTPPositionPolicy = MTPPositionPolicy.FUTURE,
 ) -> MTPContextParallelInputs:
     """Prepare global future-token tensors before context-parallel sharding.
 
@@ -260,6 +274,8 @@ def prepare_mtp_context_parallel_inputs(
         num_depths: Number of MTP future-token depths; must be positive.
         ignore_index: Fill value for invalid targets at trailing and packed
             boundary positions.
+        position_policy: Whether each depth uses the future token's position or
+            retains the backbone query position.
 
     Returns:
         Per-depth input IDs, position IDs, targets, and validity masks. Token
@@ -309,9 +325,8 @@ def prepare_mtp_context_parallel_inputs(
     position_seq_dim = 2 if position_ids.dim() == 3 else 1
     seq_idx = _packed_seq_ids_from_batch(batch, input_ids=input_ids)
     depths = tuple(range(1, num_depths + 1))
-    return MTPContextParallelInputs(
-        input_ids=tuple(shift_packed_tensor(input_ids, depth=depth, seq_idx=seq_idx) for depth in depths),
-        position_ids=tuple(
+    if position_policy is MTPPositionPolicy.FUTURE:
+        per_depth_position_ids = tuple(
             shift_packed_tensor(
                 position_ids,
                 depth=depth,
@@ -320,7 +335,15 @@ def prepare_mtp_context_parallel_inputs(
                 seq_dim=position_seq_dim,
             )
             for depth in depths
-        ),
+        )
+    elif position_policy is MTPPositionPolicy.CURRENT:
+        per_depth_position_ids = tuple(position_ids.clone() for _ in depths)
+    else:
+        raise ValueError(f"Unsupported MTP position policy: {position_policy!r}")
+
+    return MTPContextParallelInputs(
+        input_ids=tuple(shift_packed_tensor(input_ids, depth=depth, seq_idx=seq_idx) for depth in depths),
+        position_ids=per_depth_position_ids,
         targets=tuple(
             shift_packed_tensor(labels, depth=depth, seq_idx=seq_idx, fill_value=ignore_index) for depth in depths
         ),

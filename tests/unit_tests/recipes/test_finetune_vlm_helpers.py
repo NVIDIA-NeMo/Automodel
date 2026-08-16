@@ -535,7 +535,7 @@ def test_forward_backward_step_rejects_mrope_thd_with_context_parallelism():
 @pytest.mark.cuda(False)
 def test_forward_backward_step_shards_global_vlm_mtp_inputs_with_mrope(monkeypatch):
     """The VLM recipe prepares MTP after the model CP hook creates full mRoPE positions."""
-    from nemo_automodel.components.models.common.mtp import MTPConfig
+    from nemo_automodel.components.models.common.mtp import MTPConfig, prepare_mtp_context_parallel_inputs
 
     captured = {}
     local_indices = torch.tensor([0, 1, 4, 5])
@@ -546,6 +546,13 @@ def test_forward_backward_step_shards_global_vlm_mtp_inputs_with_mrope(monkeypat
             self.scale = torch.nn.Parameter(torch.tensor(1.0))
             self.mtp_config = MTPConfig(num_layers=1, layer_pattern="*")
             self.supports = SimpleNamespace(mtp_enabled=True, supports_mtp_cp=True)
+
+        def prepare_mtp_inputs_for_cp(self, batch, *, ignore_index=-100):
+            return prepare_mtp_context_parallel_inputs(
+                batch,
+                num_depths=self.mtp_config.num_layers,
+                ignore_index=ignore_index,
+            )
 
         def forward(
             self,

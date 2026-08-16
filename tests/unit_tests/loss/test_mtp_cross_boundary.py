@@ -372,3 +372,26 @@ def test_2d_labels_and_3d_hidden_states_unchanged():
 
     for d, h in enumerate(captured_hidden):
         assert h.shape == (B, S, H), f"depth {d}: BSHD path should be unchanged, got {tuple(h.shape)}"
+
+
+def test_mtp_hidden_is_cast_to_fp32_lm_head_dtype():
+    """DeepSeek V4 keeps its LM head in fp32 while the MTP block runs in bf16."""
+    from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+
+    model = torch.nn.Module()
+    model.lm_head = torch.nn.Linear(4, 8, bias=False, dtype=torch.float32)
+    hidden = torch.randn(1, 4, 4, dtype=torch.bfloat16, requires_grad=True)
+    labels = torch.tensor([[1, 2, 3, IGNORE]])
+
+    loss = calculate_mtp_loss(
+        MaskedCrossEntropy(),
+        mtp_per_depth_h=[hidden],
+        mtp_per_depth_targets=[labels],
+        labels=labels,
+        model=model,
+    )
+
+    assert loss.dtype == torch.float32
+    loss.backward()
+    assert hidden.grad is not None
+    assert model.lm_head.weight.grad is not None

@@ -38,6 +38,13 @@ from nemo_automodel.components.models.common import (
     initialize_linear_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.mtp import (
+    MTPConfig,
+    MTPContextParallelInputs,
+    MTPPositionPolicy,
+    prepare_mtp_context_parallel_inputs,
+    roll_tensor,
+)
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -64,6 +71,7 @@ class MiniMaxM3CausalLMOutput:
 
     logits: torch.Tensor
     mtp_per_depth_logits: list[torch.Tensor] | None = None
+    mtp_loss_scaling_factor: float | None = None
 
 
 def build_moe_config(config: Any, dtype: torch.dtype) -> MoEConfig:
@@ -231,9 +239,10 @@ class MiniMaxM3TextModel(nn.Module):
     def mtp_logits(
         self,
         hidden_states: torch.Tensor,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None,
         lm_head: nn.Module,
         *,
+        embed_inputs: tuple[torch.Tensor, ...] | None = None,
         position_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
@@ -251,10 +260,12 @@ class MiniMaxM3TextModel(nn.Module):
             hidden_states,
             input_ids=input_ids,
             embed_fn=self.embed_tokens,
+            embed_inputs=embed_inputs,
             lm_head=lm_head,
             freqs_cis=freqs_cis,
             attention_mask=attention_mask,
             padding_mask=padding_mask,
+            position_ids=position_ids,
             **attn_kwargs,
         )
 
@@ -293,6 +304,13 @@ class MiniMaxM3SparseForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMix
         reject_unsupported_tie_word_embeddings(type(self), config)
         self.backend = backend or BackendConfig()
         self.model = MiniMaxM3TextModel(config, backend=self.backend, moe_config=moe_config)
+        mtp_loss_scaling_factor = kwargs.pop("mtp_loss_scaling_factor", 0.1)
+        num_mtp_modules = int(getattr(config, "num_mtp_modules", 0) or 0)
+        self.mtp_config = MTPConfig(
+            num_layers=num_mtp_modules,
+            layer_pattern="*" if num_mtp_modules > 0 else "",
+            loss_scaling_factor=mtp_loss_scaling_factor,
+        )
         self.lm_head = initialize_linear_module(self.backend.linear, config.hidden_size, config.vocab_size, bias=False)
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = MiniMaxM3StateDictAdapter(
@@ -313,6 +331,11 @@ class MiniMaxM3SparseForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMix
 
     def set_output_embeddings(self, new_embeddings):
         self.lm_head = new_embeddings
+
+    @property
+    def mtp(self):
+        """Expose the text model's MTP module without duplicate registration."""
+        return self.model.mtp
 
     def forward(
         self,
@@ -349,7 +372,11 @@ class MiniMaxM3SparseForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMix
                 padding_mask=padding_mask,
                 **attn_kwargs,
             )
-            return MiniMaxM3CausalLMOutput(logits=logits, mtp_per_depth_logits=mtp_logits)
+            return MiniMaxM3CausalLMOutput(
+                logits=logits,
+                mtp_per_depth_logits=mtp_logits,
+                mtp_loss_scaling_factor=self.mtp_config.loss_scaling_factor,
+            )
         return logits
 
     @torch.no_grad()
@@ -421,6 +448,7 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
         supports_cp: bool = True
         supports_pp: bool = True
         supports_ep: bool = True
+        supports_mtp_cp: bool = True
 
     @classmethod
     def from_config(
@@ -446,6 +474,13 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
         text_config = config.text_config
         self.backend = backend or BackendConfig()
         self.model = MiniMaxM3TextModel(text_config, backend=self.backend, moe_config=moe_config)
+        mtp_loss_scaling_factor = kwargs.pop("mtp_loss_scaling_factor", 0.1)
+        num_mtp_modules = int(getattr(text_config, "num_mtp_modules", 0) or 0)
+        self.mtp_config = MTPConfig(
+            num_layers=num_mtp_modules,
+            layer_pattern="*" if num_mtp_modules > 0 else "",
+            loss_scaling_factor=mtp_loss_scaling_factor,
+        )
         self.lm_head = initialize_linear_module(
             self.backend.linear, text_config.hidden_size, text_config.vocab_size, bias=False
         )
@@ -471,6 +506,11 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
     @property
     def language_model(self):
         return self.model
+
+    @property
+    def mtp(self):
+        """Expose the text model's MTP module without registering duplicate state-dict keys."""
+        return self.model.mtp
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
@@ -670,6 +710,15 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
             )
         }
 
+    def prepare_mtp_inputs_for_cp(self, batch: dict[str, Any], *, ignore_index: int = -100) -> MTPContextParallelInputs:
+        """Prepare future-token IDs while retaining MiniMax's current query positions."""
+        return prepare_mtp_context_parallel_inputs(
+            batch,
+            num_depths=self.mtp_config.num_layers,
+            ignore_index=ignore_index,
+            position_policy=MTPPositionPolicy.CURRENT,
+        )
+
     def forward(
         self,
         input_ids: torch.Tensor | None = None,
@@ -680,7 +729,11 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
         video_grid_thw=None,
         position_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
+        padding_mask: torch.Tensor | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        mtp_per_depth_input_ids: tuple[torch.LongTensor, ...] | None = None,
+        mtp_per_depth_position_ids: tuple[torch.LongTensor, ...] | None = None,
+        mtp_per_depth_valid_masks: tuple[torch.BoolTensor, ...] | None = None,
         logits_to_keep: int | None = None,
         **kwargs: Any,
     ) -> torch.Tensor | MiniMaxM3CausalLMOutput | dict[str, torch.Tensor]:
@@ -744,6 +797,7 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
             inputs_embeds = input_ids
             input_ids = None
 
+        mtp_embed_inputs = None
         if inputs_embeds is None:
             inputs_embeds = self._embed_and_splice(
                 input_ids,
@@ -756,6 +810,35 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
             # freshly embedded full sequence (aux streams + ring-SDPA context aligned
             # by shard_batch_aux_only). Differentiable: gradients reach embeddings/vision.
             if cp_size > 1:
+                if self.mtp is not None and self.training:
+                    per_depth_inputs = (
+                        mtp_per_depth_input_ids,
+                        mtp_per_depth_position_ids,
+                        mtp_per_depth_valid_masks,
+                    )
+                    if any(value is None for value in per_depth_inputs):
+                        raise ValueError(
+                            "Context-parallel MiniMax M3 MTP requires precomputed per-depth inputs, positions, "
+                            "and masks"
+                        )
+                    expected_depths = self.mtp_config.num_layers
+                    if any(len(value) != expected_depths for value in per_depth_inputs):
+                        raise ValueError(f"Expected {expected_depths} tensors for every MiniMax M3 MTP stream")
+                    cur_embeds = inputs_embeds
+                    global_mtp_embeds = []
+                    for _ in range(expected_depths):
+                        cur_embeds = roll_tensor(cur_embeds, shifts=-1, dim=1)
+                        global_mtp_embeds.append(cur_embeds)
+                    mtp_embed_inputs = tuple(
+                        shard_sequence_for_cp_round_robin(self.cp_mesh, embed_input, seq_dim=1)[0].masked_fill(
+                            ~valid_mask.unsqueeze(-1), 0
+                        )
+                        for embed_input, valid_mask in zip(
+                            global_mtp_embeds,
+                            mtp_per_depth_valid_masks,
+                            strict=True,
+                        )
+                    )
                 inputs_embeds, _, _ = shard_sequence_for_cp_round_robin(self.cp_mesh, inputs_embeds, seq_dim=1)
 
         hidden = self.model(
@@ -763,6 +846,7 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
             inputs_embeds=inputs_embeds,
             position_ids=position_ids,
             attention_mask=attention_mask,
+            padding_mask=padding_mask,
             **kwargs,
         )
         # Fused-loss path: hand back hidden states and skip lm_head, so the
@@ -770,7 +854,7 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
         # alongside MTP raises rather than returning something mtp_logits cannot
         # consume, matching the MTP-under-PP guard above.
         if logits_to_keep is not None and not is_pp_stage:
-            if self.model.mtp is not None and self.training and input_ids is not None:
+            if self.model.mtp is not None and self.training:
                 raise NotImplementedError(
                     "logits_to_keep (fused-loss path) is not supported together with MTP "
                     "modules, which need full logits; set text_config.num_mtp_modules=0."
@@ -785,11 +869,24 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
         if is_pp_stage:
             return logits
 
-        if self.model.mtp is not None and self.training and input_ids is not None:
+        if self.model.mtp is not None and self.training:
+            if mtp_per_depth_position_ids is not None:
+                position_ids = mtp_per_depth_position_ids[0]
             mtp_logits = self.model.mtp_logits(
-                hidden, input_ids, self.lm_head, position_ids=position_ids, attention_mask=attention_mask, **kwargs
+                hidden,
+                input_ids,
+                self.lm_head,
+                embed_inputs=mtp_embed_inputs,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                padding_mask=padding_mask,
+                **kwargs,
             )
-            return MiniMaxM3CausalLMOutput(logits=logits, mtp_per_depth_logits=mtp_logits)
+            return MiniMaxM3CausalLMOutput(
+                logits=logits,
+                mtp_per_depth_logits=mtp_logits,
+                mtp_loss_scaling_factor=self.mtp_config.loss_scaling_factor,
+            )
         return logits
 
     @torch.no_grad()

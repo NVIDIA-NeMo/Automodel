@@ -55,6 +55,11 @@ from nemo_automodel.components.models.common import (
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.mtp import (
+    MTPContextParallelInputs,
+    MTPPositionPolicy,
+    prepare_mtp_context_parallel_inputs,
+)
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -695,6 +700,7 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         supports_pp: bool = True
         supports_ep: bool = True
         supports_thd: bool = True
+        supports_mtp_cp: bool = True
 
     @classmethod
     def from_config(
@@ -899,6 +905,15 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         )
         return {"cp_sharder": cp_sharder}
 
+    def prepare_mtp_inputs_for_cp(self, batch: dict[str, Any], *, ignore_index: int = -100) -> MTPContextParallelInputs:
+        """Prepare future-token IDs while retaining DSV4's current query positions."""
+        return prepare_mtp_context_parallel_inputs(
+            batch,
+            num_depths=self.mtp_config.num_layers,
+            ignore_index=ignore_index,
+            position_policy=MTPPositionPolicy.CURRENT,
+        )
+
     def forward(
         self,
         input_ids: torch.Tensor | None = None,
@@ -906,6 +921,8 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         position_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
+        mtp_per_depth_input_ids: tuple[torch.LongTensor, ...] | None = None,
+        mtp_per_depth_position_ids: tuple[torch.LongTensor, ...] | None = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
         output_hidden_states: Optional[bool] = None,
         **attn_kwargs: Any,
@@ -962,6 +979,10 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             sliding_window = int(getattr(self.config, "sliding_window", 0) or 0) or None
             cp_group = attn_kwargs.get("_dsv4_cp_group")
             if dsv4_cp_enabled(cp_group):
+                if mtp_per_depth_input_ids is None or mtp_per_depth_position_ids is None:
+                    raise ValueError(
+                        "Context-parallel DeepSeek V4 MTP requires precomputed per-depth inputs and positions"
+                    )
                 cp_padding_mask = padding_mask
                 if cp_padding_mask is None and attention_mask is not None and attention_mask.dim() == 2:
                     cp_padding_mask = attention_mask.bool().logical_not()
@@ -993,6 +1014,10 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                 mtp_kwargs["_dsv4_cp_group"] = cp_group
             if mtp_embed_inputs:
                 mtp_kwargs["embed_inputs"] = tuple(mtp_embed_inputs)
+            elif mtp_per_depth_input_ids is not None:
+                mtp_kwargs["input_ids_per_depth"] = mtp_per_depth_input_ids
+                mtp_kwargs["position_ids_per_depth"] = mtp_per_depth_position_ids
+                mtp_kwargs["embed_fn"] = self.model.embed_tokens
             else:
                 mtp_kwargs["input_ids"] = input_ids
                 mtp_kwargs["embed_fn"] = self.model.embed_tokens

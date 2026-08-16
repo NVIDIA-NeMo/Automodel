@@ -31,7 +31,12 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
 )
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.common.mtp import roll_tensor
+from nemo_automodel.components.models.common.mtp import (
+    MTPContextParallelInputs,
+    MTPPositionPolicy,
+    prepare_mtp_context_parallel_inputs,
+    roll_tensor,
+)
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -340,6 +345,7 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
         supports_cp: bool = True
         supports_pp: bool = True
         supports_ep: bool = True
+        supports_mtp_cp: bool = True
 
     @classmethod
     def from_config(
@@ -543,6 +549,15 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
             )
         }
 
+    def prepare_mtp_inputs_for_cp(self, batch: dict[str, Any], *, ignore_index: int = -100) -> MTPContextParallelInputs:
+        """Prepare future-token IDs while retaining Step's current query positions."""
+        return prepare_mtp_context_parallel_inputs(
+            batch,
+            num_depths=self.mtp_config.num_layers,
+            ignore_index=ignore_index,
+            position_policy=MTPPositionPolicy.CURRENT,
+        )
+
     def forward(
         self,
         input_ids: torch.Tensor | None = None,
@@ -552,6 +567,9 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
         padding_mask: torch.Tensor | None = None,
         inputs_embeds: torch.Tensor | None = None,
         cache_position: torch.Tensor | None = None,
+        mtp_per_depth_input_ids: tuple[torch.LongTensor, ...] | None = None,
+        mtp_per_depth_position_ids: tuple[torch.LongTensor, ...] | None = None,
+        mtp_per_depth_valid_masks: tuple[torch.BoolTensor, ...] | None = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
         output_hidden_states: Optional[bool] = None,
         **kwargs: Any,
@@ -653,6 +671,29 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
                 image_embeds=kwargs.get("image_embeds", None),
             )
             inputs_embeds = self.model.prepare_inputs_embeds(input_ids, multimodal_embeddings)
+            if use_mtp:
+                per_depth_inputs = (
+                    mtp_per_depth_input_ids,
+                    mtp_per_depth_position_ids,
+                    mtp_per_depth_valid_masks,
+                )
+                if any(value is None for value in per_depth_inputs):
+                    raise ValueError(
+                        "Context-parallel Step3.7 MTP requires precomputed per-depth inputs, positions, and masks"
+                    )
+                if any(len(value) != self.mtp_config.num_layers for value in per_depth_inputs):
+                    raise ValueError(f"Expected {self.mtp_config.num_layers} tensors for every Step3.7 MTP stream")
+                mtp_embed_inputs = tuple(
+                    local_embed.masked_fill(~valid_mask.unsqueeze(-1), 0)
+                    for local_embed, valid_mask in zip(
+                        (
+                            shard_sequence_for_cp_round_robin(self.cp_mesh, embed_input, seq_dim=1)[0]
+                            for embed_input in self._build_mtp_embed_inputs_from_embeds(inputs_embeds)
+                        ),
+                        mtp_per_depth_valid_masks,
+                        strict=True,
+                    )
+                )
             inputs_embeds, _, _ = shard_sequence_for_cp_round_robin(self.cp_mesh, inputs_embeds, seq_dim=1)
             input_ids = None
             # Media consumed into inputs_embeds; drop so self.model does not re-splice.
@@ -700,6 +741,8 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
         if use_mtp:
             if is_pp_stage and not mtp_embed_inputs:
                 raise ValueError("Final PP stage requires propagated MTP embeddings")
+            if mtp_per_depth_position_ids is not None:
+                position_ids = mtp_per_depth_position_ids[0]
             position_ids = self._make_position_ids(hidden_states, position_ids)
             freqs_cis = position_ids_to_freqs_cis(
                 self.model.language_model.rotary_emb,

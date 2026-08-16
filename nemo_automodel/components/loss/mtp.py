@@ -278,6 +278,9 @@ def calculate_mtp_loss(
                 num_label_tokens=num_label_tokens,
             )
         elif isinstance(loss_fn, FusedLinearCrossEntropy):
+            # Some models (notably DeepSeek V4) deliberately keep the shared
+            # LM head in fp32 while decoder/MTP activations are bf16.
+            mtp_output = mtp_output.to(dtype=lm_weight.dtype)
             depth_loss = calculate_loss(
                 loss_fn,
                 hidden_states=mtp_output,
@@ -291,6 +294,11 @@ def calculate_mtp_loss(
             lm_head = _get_lm_head_module(model)
             if lm_head is None:
                 raise ValueError("lm_head module not found in model")
+            lm_head_weight = getattr(lm_head, "weight", None)
+            if isinstance(lm_head_weight, torch.Tensor):
+                # Match the projection's parameter dtype instead of relying on
+                # linear kernels to accept mixed input/weight dtypes.
+                mtp_output = mtp_output.to(dtype=lm_head_weight.dtype)
             depth_loss = calculate_loss(
                 loss_fn,
                 logits=lm_head(mtp_output),
