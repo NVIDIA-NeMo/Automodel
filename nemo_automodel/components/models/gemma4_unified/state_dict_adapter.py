@@ -22,8 +22,6 @@ from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAda
 if TYPE_CHECKING:
     from torch.distributed.device_mesh import DeviceMesh
 
-GEMMA4_UNIFIED_MODEL_TYPE = "gemma4_unified"
-
 # Model FQN prefix -> published Hugging Face checkpoint FQN prefix.
 _HF_KEY_RENAMES = {
     "embed_vision.patch_ln1": "vision_embedder.patch_ln1",
