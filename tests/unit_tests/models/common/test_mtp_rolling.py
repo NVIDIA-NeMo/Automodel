@@ -365,6 +365,34 @@ class TestMTPContextParallelPreparation:
             [[12, -100, -100, 22, -100, -100]],
             [[-100, -100, -100, -100, -100, -100]],
         ]
+        assert [tensor.tolist() for tensor in prepared.valid_masks] == [
+            [[True, True, False, True, True, False]],
+            [[True, False, False, True, False, False]],
+        ]
+        assert prepared.position_ids_seq_dim == 1
+
+    def test_multi_axis_positions_shift_on_the_sequence_axis(self):
+        batch = {
+            "input_ids": torch.tensor([[10, 11, 12, 13]]),
+            "labels": torch.tensor([[11, 12, 13, -100]]),
+            "position_ids": torch.tensor(
+                [
+                    [[0, 1, 2, 3]],
+                    [[10, 11, 12, 13]],
+                    [[20, 21, 22, 23]],
+                ]
+            ),
+        }
+
+        prepared = self._prepare(batch, num_depths=1)
+
+        assert prepared.position_ids_seq_dim == 2
+        assert prepared.position_ids[0].tolist() == [
+            [[1, 2, 3, 0]],
+            [[11, 12, 13, 0]],
+            [[21, 22, 23, 0]],
+        ]
+        assert prepared.valid_masks[0].tolist() == [[True, True, True, False]]
 
     def test_raw_thd_lengths_mask_boundaries_before_sharding(self):
         batch = {

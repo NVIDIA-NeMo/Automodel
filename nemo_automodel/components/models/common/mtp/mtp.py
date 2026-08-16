@@ -31,15 +31,21 @@ class MTPContextParallelInputs:
     Attributes:
         input_ids: Per-depth token IDs of shape ``[batch, sequence]`` in global
             sequence order.
-        position_ids: Per-depth position IDs of shape ``[batch, sequence]`` in
-            global sequence order.
+        position_ids: Per-depth position IDs in global sequence order. Standard
+            positions have shape ``[batch, sequence]``; multi-axis RoPE uses
+            ``[axes, batch, sequence]``.
         targets: Per-depth loss targets of shape ``[batch, sequence]`` in global
             sequence order, with invalid positions set to the loss ignore index.
+        valid_masks: Per-depth masks of shape ``[batch, sequence]`` identifying
+            positions whose future token remains in the same packed sequence.
+        position_ids_seq_dim: Sequence dimension of each position-ID tensor.
     """
 
     input_ids: tuple[torch.LongTensor, ...]
     position_ids: tuple[torch.LongTensor, ...]
     targets: tuple[torch.LongTensor, ...]
+    valid_masks: tuple[torch.BoolTensor, ...]
+    position_ids_seq_dim: int
 
 
 def roll_tensor(t: torch.Tensor, shifts: int = -1, dim: int = -1) -> torch.Tensor:
@@ -76,16 +82,20 @@ def shift_packed_tensor(
     depth: int,
     seq_idx: torch.Tensor | None = None,
     fill_value: float | int = 0,
+    batch_dim: int = 0,
+    seq_dim: int = 1,
 ) -> torch.Tensor:
     """Shift a token-aligned tensor left without crossing sequence boundaries.
 
     Args:
-        tensor: Tensor of shape ``[batch, sequence, ...]`` in global token
-            order. The sequence axis is dimension 1.
+        tensor: Token-aligned tensor in global sequence order. Its batch and
+            sequence axes are selected by ``batch_dim`` and ``seq_dim``.
         depth: Number of future-token positions to shift; must be positive.
         seq_idx: Optional sequence IDs of shape ``[batch, sequence]``. Tokens
             whose shifted source has a different ID are filled.
         fill_value: Scalar used for trailing and cross-sequence positions.
+        batch_dim: Batch dimension in ``tensor``.
+        seq_dim: Sequence dimension in ``tensor``.
 
     Returns:
         Tensor with the same shape, dtype, and device as ``tensor``. The output
@@ -93,23 +103,28 @@ def shift_packed_tensor(
         contain ``fill_value``.
     """
     if tensor.dim() < 2:
-        raise ValueError(f"tensor must have shape [batch, sequence, ...], got {tuple(tensor.shape)}")
+        raise ValueError(f"tensor must have batch and sequence dimensions, got {tuple(tensor.shape)}")
     if depth <= 0:
         raise ValueError(f"depth must be positive, got {depth}")
-    if seq_idx is not None and seq_idx.shape != tensor.shape[:2]:
-        raise ValueError(
-            f"seq_idx shape {tuple(seq_idx.shape)} must match tensor token shape {tuple(tensor.shape[:2])}"
-        )
+    batch_dim %= tensor.dim()
+    seq_dim %= tensor.dim()
+    if batch_dim == seq_dim:
+        raise ValueError("batch_dim and seq_dim must be different")
+    token_shape = (tensor.shape[batch_dim], tensor.shape[seq_dim])
+    if seq_idx is not None and seq_idx.shape != token_shape:
+        raise ValueError(f"seq_idx shape {tuple(seq_idx.shape)} must match tensor token shape {token_shape}")
 
-    shifted = torch.roll(tensor, shifts=-depth, dims=1)
-    sequence = tensor.shape[1]
+    shifted = torch.roll(tensor, shifts=-depth, dims=seq_dim)
+    sequence = tensor.shape[seq_dim]
     positions = torch.arange(sequence, device=tensor.device)
-    valid = (positions + depth < sequence).unsqueeze(0).expand(tensor.shape[0], -1)
+    valid = (positions + depth < sequence).unsqueeze(0).expand(tensor.shape[batch_dim], -1)
     if seq_idx is not None:
         shifted_seq_idx = torch.roll(seq_idx, shifts=-depth, dims=1)
         valid = valid & (shifted_seq_idx == seq_idx)
-    while valid.dim() < shifted.dim():
-        valid = valid.unsqueeze(-1)
+    valid_shape = [1] * tensor.dim()
+    valid_shape[batch_dim] = tensor.shape[batch_dim]
+    valid_shape[seq_dim] = sequence
+    valid = valid.reshape(valid_shape)
     return torch.where(valid, shifted, torch.as_tensor(fill_value, dtype=tensor.dtype, device=tensor.device))
 
 
@@ -239,17 +254,17 @@ def prepare_mtp_context_parallel_inputs(
     Args:
         batch: Mutable unsharded batch. input_ids and labels are tensors of
             shape [batch, sequence]. Optional position_ids has shape
-            [batch, sequence] or shared shape [1, sequence]. Packed boundaries
-            may use the tensor layouts documented by
+            [batch, sequence], shared shape [1, sequence], or multi-axis RoPE
+            shape [axes, batch, sequence]. Packed boundaries may use the tensor layouts documented by
             _packed_seq_ids_from_batch.
         num_depths: Number of MTP future-token depths; must be positive.
         ignore_index: Fill value for invalid targets at trailing and packed
             boundary positions.
 
     Returns:
-        Per-depth input IDs, position IDs, and targets. Every tensor has global
-        shape [batch, sequence] and independent storage; targets without a
-        valid same-sequence future token contain ignore_index.
+        Per-depth input IDs, position IDs, targets, and validity masks. Token
+        tensors have global shape [batch, sequence] and independent storage;
+        targets without a valid same-sequence future token contain ignore_index.
     """
     if num_depths <= 0:
         raise ValueError(f"num_depths must be positive, got {num_depths}")
@@ -280,20 +295,42 @@ def prepare_mtp_context_parallel_inputs(
     ):
         position_ids = position_ids.expand(input_ids.shape[0], -1).contiguous()
         batch["position_ids"] = position_ids
+    elif (
+        isinstance(position_ids, torch.Tensor) and position_ids.dim() == 3 and position_ids.shape[1:] == input_ids.shape
+    ):
+        pass
     elif not isinstance(position_ids, torch.Tensor) or position_ids.shape != input_ids.shape:
         position_shape = tuple(position_ids.shape) if isinstance(position_ids, torch.Tensor) else type(position_ids)
         raise ValueError(
             f"MTP position_ids must be a tensor matching input_ids, got {position_shape} and {tuple(input_ids.shape)}"
         )
 
+    position_batch_dim = 1 if position_ids.dim() == 3 else 0
+    position_seq_dim = 2 if position_ids.dim() == 3 else 1
     seq_idx = _packed_seq_ids_from_batch(batch, input_ids=input_ids)
-    depths = range(1, num_depths + 1)
+    depths = tuple(range(1, num_depths + 1))
     return MTPContextParallelInputs(
         input_ids=tuple(shift_packed_tensor(input_ids, depth=depth, seq_idx=seq_idx) for depth in depths),
-        position_ids=tuple(shift_packed_tensor(position_ids, depth=depth, seq_idx=seq_idx) for depth in depths),
+        position_ids=tuple(
+            shift_packed_tensor(
+                position_ids,
+                depth=depth,
+                seq_idx=seq_idx,
+                batch_dim=position_batch_dim,
+                seq_dim=position_seq_dim,
+            )
+            for depth in depths
+        ),
         targets=tuple(
             shift_packed_tensor(labels, depth=depth, seq_idx=seq_idx, fill_value=ignore_index) for depth in depths
         ),
+        valid_masks=tuple(
+            shift_packed_tensor(
+                torch.ones_like(input_ids, dtype=torch.bool), depth=depth, seq_idx=seq_idx, fill_value=False
+            )
+            for depth in depths
+        ),
+        position_ids_seq_dim=position_seq_dim,
     )
 
 
@@ -449,19 +486,22 @@ class MTPModule(nn.Module):
 
         Args:
             hidden_states: Output of the main model's final norm (``h_0``);
-                shape matches the model's residual stream.
-            input_ids: Token ids ``[B, S]`` (or ``[T]`` in THD). Rolled
+                tensor of shape ``[batch, sequence, hidden]`` or
+                ``[tokens, hidden]`` for THD.
+            input_ids: Token ids of shape ``[batch, sequence]`` (or
+                ``[tokens]`` in THD). Rolled
                 cumulatively left by 1 per depth. Mutually exclusive with
                 ``input_ids_per_depth`` and ``embed_inputs``.
             input_ids_per_depth: Optional tuple of ``num_depths`` pre-shifted
-                token-ID tensors. Each has the local CP layout ``[B, S]`` or
-                ``[T]`` and is embedded directly with ``embed_fn``. Requires
-                ``position_ids_per_depth``.
+                token-ID tensors. Each has local CP shape
+                ``[batch, sequence]`` or ``[tokens]`` and is embedded directly
+                with ``embed_fn``. Requires ``position_ids_per_depth``.
             embed_fn: Callable applied to rolled ``input_ids`` to produce the
                 future-token embedding (typically the model's input embedding
                 layer). Required when ``input_ids`` is supplied.
             embed_inputs: Optional tuple of ``num_depths`` pre-computed
-                future-token embeddings, one per depth in MTP order.
+                future-token embeddings, each of shape
+                ``[batch, sequence, hidden]`` or ``[tokens, hidden]``.
                 Mutually exclusive with ``input_ids``/
                 ``input_ids_per_depth``/``embed_fn``.
             position_ids: Position ids matching ``input_ids``. When supplied,
@@ -472,18 +512,18 @@ class MTPModule(nn.Module):
                 don't consume it.
             position_ids_per_depth: Optional tuple of ``num_depths``
                 pre-computed future-token position tensors. Each tensor has
-                shape [batch, sequence], or [tokens] for THD, matching
-                ``position_ids``. When supplied, these tensors are forwarded
-                directly instead of rolling rank-local ``position_ids``. Use
-                this when context parallelism has already sharded the sequence.
+                shape ``[batch, sequence]``, ``[axes, batch, sequence]`` for
+                multi-axis RoPE, or ``[tokens]`` for THD. When supplied, these
+                tensors are forwarded directly instead of rolling rank-local
+                ``position_ids``. Use this when context parallelism has already sharded the sequence.
                 Required with ``input_ids_per_depth`` and incompatible with
                 rank-local ``input_ids`` rolling.
             **block_kwargs: Forwarded to each sublayer's ``__call__`` (e.g.
                 ``attention_mask``).
 
         Returns:
-            List of length ``num_depths`` containing the hidden state
-            produced at each depth.
+            List of length ``num_depths`` containing hidden states of shape
+            ``[batch, sequence, hidden]`` or ``[tokens, hidden]``.
         """
         if embed_inputs is not None:
             if input_ids is not None or input_ids_per_depth is not None or embed_fn is not None:
@@ -528,7 +568,12 @@ class MTPModule(nn.Module):
                 expected_position_shape = embed_inputs[0].shape[:-1]
                 expected_position_source = "embed_inputs token shape"
             for depth, depth_position_ids in enumerate(position_ids_per_depth, start=1):
-                if depth_position_ids.shape != expected_position_shape:
+                position_shape_matches = depth_position_ids.shape == expected_position_shape
+                if len(expected_position_shape) == 2:
+                    position_shape_matches = position_shape_matches or (
+                        depth_position_ids.dim() == 3 and depth_position_ids.shape[1:] == expected_position_shape
+                    )
+                if not position_shape_matches:
                     raise ValueError(
                         f"MTP depth {depth} position_ids shape {tuple(depth_position_ids.shape)} "
                         f"does not match {expected_position_source} {tuple(expected_position_shape)}"
