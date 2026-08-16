@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,42 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Typed input contract for training: :class:`Datum` and :func:`collate_datums`.
-
-A ``Datum`` is the single-example input boundary between user/algorithm code
-(SFT, RL post-training) and the training loop. It lives in ``components.datasets``
-because feeding and collating examples is a data concern — and, crucially,
-because that lets :func:`collate_datums` **reuse the canonical collaters**
-(``default_collater`` for padded ``[B, T]`` and ``packed_sequence_thd_collater``
-for THD) instead of forking a second padding/packing implementation that could
-drift from them.
-
-The companion output contract (``ModelOutput`` and the per-token extraction
-helpers) lives in ``components.training`` — that side touches model logits, so
-it is a forward concern, not a dataset one.
-
-Conventions
------------
-* A ``Datum`` holds **one** sequence. ``input_ids`` is 1-D, shape ``[T]``.
-* ``loss_fn_inputs`` carries everything the loss needs, aligned to ``input_ids``
-  token positions (length ``T``) for per-token entries:
-
-  ===============  =======================================================
-  key              meaning
-  ===============  =======================================================
-  ``target_tokens``  next-token targets, shape ``[T]`` (becomes ``labels``)
-  ``weights``        per-token loss mask / weight (0 disables a position)
-  ``logprobs``       old/behavior-policy logprobs (importance sampling)
-  ``advantages``     advantage signal (PPO/GRPO), per-token or per-sample
-  ===============  =======================================================
-
-* Masking convention matches the codebase: a target position with
-  ``weights == 0`` becomes ``ignore_index`` (default ``-100``) in ``labels``.
-"""
+"""The model-input and loss-input boundary used by training engines."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -63,57 +33,116 @@ CROSS_ENTROPY_IGNORE_IDX = -100
 __all__ = ["Datum", "collate_datums"]
 
 
-@dataclass
+@dataclass(init=False)
 class Datum:
-    """A single training example.
+    """One processor-ready training example.
+
+    ``model_inputs`` contains exactly the keyword arguments needed by the
+    model for one example. Text examples usually contain ``input_ids``;
+    multimodal examples may additionally contain fields such as
+    ``pixel_values`` and ``image_grid_thw``. ``loss_fn_inputs`` is kept
+    separate so algorithm data such as targets, weights, old log-probabilities,
+    and advantages is never passed to the model.
 
     Args:
-        input_ids: 1-D ``LongTensor`` of token ids, shape ``[T]``.
-        loss_fn_inputs: per-key tensors the loss consumes. Per-token entries are
-            1-D and length ``T``; per-sample entries are scalar or shape ``[1]``.
-            See the module docstring for the well-known keys.
+        model_inputs: Model-ready values for one example. Values are
+            model-specific because LLM and VLM processors emit different
+            fields.
+        loss_fn_inputs: Tensor values consumed by the loss function.
+        input_ids: Deprecated convenience spelling for the old text-only API.
+            It cannot be combined with ``model_inputs``.
     """
 
-    input_ids: torch.Tensor
+    model_inputs: dict[str, Any]
     loss_fn_inputs: dict[str, torch.Tensor] = field(default_factory=dict)
 
+    def __init__(
+        self,
+        model_inputs: dict[str, Any] | torch.Tensor | list[int] | None = None,
+        loss_fn_inputs: dict[str, torch.Tensor] | None = None,
+        *,
+        input_ids: torch.Tensor | list[int] | None = None,
+    ) -> None:
+        # Preserve the old positional ``Datum(input_ids, loss_fn_inputs)`` form
+        # while downstream users move to the model-ready mapping.
+        if model_inputs is not None and not isinstance(model_inputs, dict):
+            if input_ids is not None:
+                raise ValueError("pass either model_inputs or input_ids, not both")
+            input_ids = model_inputs
+            model_inputs = None
+        if model_inputs is not None and input_ids is not None:
+            raise ValueError("pass either model_inputs or input_ids, not both")
+        if model_inputs is None:
+            if input_ids is None:
+                raise ValueError("Datum requires model_inputs")
+            model_inputs = {"input_ids": input_ids}
+
+        self.model_inputs = dict(model_inputs)
+        self.loss_fn_inputs = dict(loss_fn_inputs or {})
+        self.__post_init__()
+
     def __post_init__(self) -> None:
-        if not isinstance(self.input_ids, torch.Tensor):
-            self.input_ids = torch.as_tensor(self.input_ids, dtype=torch.long)
-        if self.input_ids.dim() != 1:
-            raise ValueError(f"Datum.input_ids must be 1-D [T]; got shape {tuple(self.input_ids.shape)}")
+        if not self.model_inputs:
+            raise ValueError("Datum.model_inputs cannot be empty")
+
+        input_ids = self.model_inputs.get("input_ids")
+        if input_ids is not None:
+            if not isinstance(input_ids, torch.Tensor):
+                input_ids = torch.as_tensor(input_ids, dtype=torch.long)
+                self.model_inputs["input_ids"] = input_ids
+            if input_ids.ndim != 1:
+                raise ValueError(
+                    "Datum.model_inputs['input_ids'] must be 1-D [T] for one token sequence; "
+                    f"got shape {tuple(input_ids.shape)}"
+                )
+
         for key, value in self.loss_fn_inputs.items():
             if not isinstance(value, torch.Tensor):
                 self.loss_fn_inputs[key] = torch.as_tensor(value)
 
     @property
+    def input_ids(self) -> torch.Tensor:
+        """The text token sequence, retained for source compatibility."""
+        input_ids = self.model_inputs.get("input_ids")
+        if not isinstance(input_ids, torch.Tensor):
+            raise AttributeError("this Datum has no tensor model input named 'input_ids'")
+        return input_ids
+
+    @property
     def seq_len(self) -> int:
-        """Number of tokens in this example."""
-        return int(self.input_ids.shape[0])
+        """Token length used by the default text collater."""
+        if isinstance(self.model_inputs.get("input_ids"), torch.Tensor):
+            return int(self.model_inputs["input_ids"].shape[0])
+        for key in ("target_tokens", "weights"):
+            value = self.loss_fn_inputs.get(key)
+            if isinstance(value, torch.Tensor) and value.ndim == 1:
+                return int(value.shape[0])
+        raise ValueError("cannot infer token length; use a model-specific collate_fn for this Datum")
 
-    def to_features(self, *, ignore_index: int = CROSS_ENTROPY_IGNORE_IDX) -> dict[str, list[int]]:
-        """Emit the per-example dict the canonical collaters expect.
+    def to_features(self, *, ignore_index: int = CROSS_ENTROPY_IGNORE_IDX) -> dict[str, Any]:
+        """Convert one text Datum for the repository's canonical collaters.
 
-        Every position of a ``Datum`` is a real token, so ``attention_mask`` is
-        all ones: it tells the padded collater exactly which positions it added,
-        instead of leaving it to infer them from the pad token *value* — which
-        misreads a real token that happens to equal the pad id (commonly
-        ``pad_token_id == eos_token_id``) as padding.
-
-        ``labels`` is included only when ``loss_fn_inputs["target_tokens"]`` is
-        present, with positions where ``loss_fn_inputs["weights"] == 0`` set to
-        ``ignore_index``. Only integer token fields are emitted here — the
-        collaters cast to ``LongTensor``; float side-inputs are batched
-        separately by :func:`collate_datums`.
-
-        Returns:
-            ``{"input_ids": [...], "attention_mask": [...], "labels": [...]}``
-            as plain ``list[int]``.
+        Token-aligned 1-D model inputs become Python lists so
+        :func:`default_collater` can pad ragged examples. Other model inputs are
+        passed through unchanged. A model-specific collater should be used for
+        layouts such as multimodal mRoPE positions or variable media tensors.
         """
-        features: dict[str, list[int]] = {
-            "input_ids": self.input_ids.tolist(),
-            "attention_mask": [1] * self.seq_len,
-        }
+        if "input_ids" not in self.model_inputs:
+            raise ValueError("the default collater requires model_inputs['input_ids']")
+
+        features: dict[str, Any] = {}
+        for key, value in self.model_inputs.items():
+            if isinstance(value, torch.Tensor) and value.ndim == 1 and value.shape[0] == self.seq_len:
+                if value.is_floating_point():
+                    raise ValueError(
+                        f"the default text collater cannot preserve floating-point token field {key!r}; "
+                        "use a model-specific collate_fn"
+                    )
+                features[key] = value.tolist()
+            else:
+                features[key] = value
+        features.setdefault("attention_mask", [1] * self.seq_len)
+
         if "target_tokens" in self.loss_fn_inputs:
             labels = self.loss_fn_inputs["target_tokens"].clone()
             weights = self.loss_fn_inputs.get("weights")
@@ -129,73 +158,74 @@ def collate_datums(
     packed: bool = False,
     pad_seq_len_divisible: int | None = None,
     ignore_index: int = CROSS_ENTROPY_IGNORE_IDX,
-) -> dict[str, torch.Tensor]:
-    """Collate a list of :class:`Datum` into a model-ready batch dict.
+) -> tuple[dict[str, Any], dict[str, torch.Tensor]]:
+    """Collate text Datums into separate model and loss inputs.
 
-    Token fields are delegated to the **existing** canonical collaters so the
-    padded / THD schema (``attention_mask`` / ``qkv_format`` / ``seq_lens``) is
-    produced by the same code paths the dataset pipeline uses — no fork:
-
-    * ``packed=False`` → ``default_collater`` (padded ``[B, T]``).
-    * ``packed=True``  → :func:`pack_features_for_thd` concatenates all datums
-      into one pre-packed record, then ``packed_sequence_thd_collater`` emits
-      the flat ``[1, total_tokens]`` THD schema (``qkv_format="thd"``,
-      per-sequence ``seq_lens`` for splitting outputs back per datum).
-
-    Float per-token side-inputs (every ``loss_fn_inputs`` key shared by all datums
-    except ``target_tokens``, e.g. ``weights`` / ``logprobs`` / ``advantages``)
-    are batched under their own key — this is the part the token collaters
-    cannot carry (they cast to ``LongTensor``). Padded mode right-pads them to
-    the collated width and stacks to ``[B, T]``; packed mode concatenates them
-    in datum order to ``[1, total_tokens]``, aligned with ``input_ids``.
-    Per-sample (scalar / length-1) entries are stacked into a ``[num_datums]``
-    tensor without padding in both modes. A length-1 entry on a single-token
-    sequence matches both shapes; it is read as per-token.
+    This is the default text collater. Callers with model-specific VLM
+    batching rules pass a thin callable around their existing collater to
+    ``Engine`` instead.
 
     Args:
-        datums: examples for this microbatch. Must be non-empty. One ``Datum``
-            is treated as one sequence.
-        packed: pack all datums into one flat ``[1, total_tokens]`` THD row
-            instead of the padded ``[B, T]`` layout.
-        pad_seq_len_divisible: pad sequence length to a multiple of this value
-            (padded mode only; TP/CP/FP8 alignment).
-        ignore_index: label value for masked positions.
+        datums: Non-empty examples for one microbatch.
+        packed: Produce one flat THD token row instead of a padded batch.
+        pad_seq_len_divisible: Round the padded token width to this multiple.
+        ignore_index: Label fill value used internally by the THD collater.
 
     Returns:
-        The collater output dict, augmented with the float side-input tensors.
+        ``(model_inputs, loss_fn_inputs)``. Per-token loss inputs have shape
+        ``[B, T]`` in padded mode and ``[1, total_tokens]`` in packed mode;
+        scalar loss inputs have shape ``[B]``.
     """
-    if len(datums) == 0:
+    if not datums:
         raise ValueError("collate_datums requires at least one Datum")
 
-    features = [datums[i].to_features(ignore_index=ignore_index) for i in range(len(datums))]
-    if packed:
-        # Concatenate all datums into one pre-packed record and let the
-        # canonical THD collater produce the [1, total] schema.
-        batch = packed_sequence_thd_collater([pack_features_for_thd(features, ignore_index=ignore_index)])
-    else:
-        batch = default_collater([dict(f) for f in features], pad_seq_len_divisible)
+    model_keys = set(datums[0].model_inputs)
+    loss_keys = set(datums[0].loss_fn_inputs)
+    for datum in datums[1:]:
+        if set(datum.model_inputs) != model_keys:
+            raise ValueError("every Datum in a microbatch must carry the same model_inputs keys")
+        if set(datum.loss_fn_inputs) != loss_keys:
+            raise ValueError("every Datum in a microbatch must carry the same loss_fn_inputs keys")
 
-    width = int(batch["input_ids"].shape[-1])
-    keys = set(datums[0].loss_fn_inputs)
-    for d in datums[1:]:
-        if set(d.loss_fn_inputs) != keys:
+    features = [datum.to_features(ignore_index=ignore_index) for datum in datums]
+    if packed:
+        unsupported = model_keys - {"input_ids", "attention_mask"}
+        if unsupported:
             raise ValueError(
-                "every Datum in a batch must carry the same loss_fn_inputs keys "
-                f"(got {sorted(keys)} and {sorted(d.loss_fn_inputs)}); a missing key would "
-                "silently drop it -- for `weights` that means losing the loss mask"
+                "the default packed collater only supports text input_ids; "
+                f"use a model-specific collate_fn for {sorted(unsupported)}"
             )
-    for key in sorted(keys - {"target_tokens"}):
-        rows = [d.loss_fn_inputs[key].to(torch.float).flatten() for d in datums]
-        if all(r.shape[0] == d.seq_len for r, d in zip(rows, datums)):
+        for datum in datums:
+            attention_mask = datum.model_inputs.get("attention_mask")
+            if attention_mask is not None and not bool(torch.as_tensor(attention_mask).bool().all()):
+                raise ValueError(
+                    "packed Datums must contain only real tokens; explicit attention_mask padding is unsupported"
+                )
+        model_inputs = packed_sequence_thd_collater([pack_features_for_thd(features, ignore_index=ignore_index)])
+    else:
+        model_inputs = default_collater([dict(feature) for feature in features], pad_seq_len_divisible)
+
+    # Labels are loss data, not model input. The canonical collaters only see
+    # them so their padding/THD machinery can be reused unchanged.
+    model_inputs.pop("labels", None)
+    width = int(model_inputs["input_ids"].shape[-1])
+
+    loss_inputs: dict[str, torch.Tensor] = {}
+    for key in sorted(loss_keys):
+        values = [datum.loss_fn_inputs[key] for datum in datums]
+        per_token = all(value.ndim == 1 and value.shape[0] == datum.seq_len for value, datum in zip(values, datums))
+        if per_token:
             if packed:
-                # Per-token field, packed: concatenate in datum order so the
-                # values ride the same flat [1, total] axis as input_ids.
-                batch[key] = torch.cat(rows).unsqueeze(0)
+                loss_inputs[key] = torch.cat(values).unsqueeze(0)
             else:
-                # Per-token field, padded: right-pad to the collated width and stack.
-                batch[key] = torch.stack([F.pad(r, (0, width - r.shape[0])) for r in rows])
-        else:
-            # Per-sample field: one value per datum (shape [num_datums], which in
-            # packed mode is deliberately NOT the batch dim of the [1, total] rows).
-            batch[key] = torch.stack([r.reshape(-1)[0] for r in rows])
-    return batch
+                loss_inputs[key] = torch.stack([F.pad(value, (0, width - value.shape[0])) for value in values])
+            continue
+
+        if not all(value.numel() == 1 for value in values):
+            shapes = [tuple(value.shape) for value in values]
+            raise ValueError(
+                f"the default collater only supports scalar or 1-D token-aligned loss inputs; {key!r} has {shapes}"
+            )
+        loss_inputs[key] = torch.stack([value.reshape(()) for value in values])
+
+    return model_inputs, loss_inputs
