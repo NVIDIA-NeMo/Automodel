@@ -217,8 +217,8 @@ class ShardLayout:
     Attributes:
         local_token_global_indices: The partition actually computed, for
             data-dependent layouts (TE's ``thd_get_partitioned_indices``
-            result, magi's ``get_position_ids``); None for layouts whose index
-            map is a closed-form function already on the sharder.
+            result, magi's dispatched global token indices); None for layouts
+            whose index map is a closed-form function already on the sharder.
         original_seq_len: Pre-pad sequence length; None when the layout has no
             single original length (packed streams).
         padded_seq_len: Post-pad global sequence length; the token verbs
@@ -476,6 +476,8 @@ class ContextParallelSharder:
             out = full.gather(1, positions.clamp(min=0).to(torch.long))
             return out.masked_fill(positions < 0, fill)
         if layout.input_row_shape is not None:
+            if layout.original_seq_len is not None:
+                full = full.narrow(seq_dim, 0, layout.original_seq_len)
             return full.reshape(*layout.input_row_shape, *full.shape[seq_dim + 1 :])
         if layout.original_seq_len is not None:
             return full.narrow(seq_dim, 0, layout.original_seq_len)

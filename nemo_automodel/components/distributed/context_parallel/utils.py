@@ -499,11 +499,11 @@ def _resolve_cp_sharder(
         # so like the TE path shard_batch returns (nullcontext, prepped_batch).
         # All magi internals (HF-vs-custom, recipe domain, cp group) stay in
         # context_parallel.magi. The dispatch-solver partition is data-dependent, so
-        # shard_batch installs the index map it just computed (magi's
-        # get_position_ids) on the sharder for the token verbs.
+        # shard_batch installs the token-stream permutation it just computed on the
+        # sharder for the token verbs.
         def _shard_batch_magi(cp_mesh, tp_mesh, batch, *, loss_mask=None, padding_token_id=0):
-            input_ids = batch.get("input_ids")
-            row_shape = tuple(input_ids.shape[:2]) if input_ids is not None and input_ids.dim() >= 2 else None
+            primary = batch.get("inputs_embeds", batch.get("input_ids"))
+            row_shape = tuple(primary.shape[:2]) if primary is not None and primary.dim() >= 2 else None
             prepped, local_indices = magi.make_cp_batch(
                 cp_mesh,
                 batch,
@@ -513,15 +513,28 @@ def _resolve_cp_sharder(
                 model=model,
                 return_local_indices=True,
             )
+            prepped_primary = prepped.get("inputs_embeds", prepped.get("input_ids"))
+            flattened = (
+                row_shape is not None
+                and isinstance(prepped_primary, torch.Tensor)
+                and prepped_primary.dim() == primary.dim() - 1
+            )
+            cp_size = cp_mesh.size() if cp_mesh is not None else 1
+            if local_indices is None and cp_size == 1 and isinstance(prepped_primary, torch.Tensor):
+                token_dim = 0 if flattened or prepped_primary.dim() == 1 else 1
+                local_indices = torch.arange(
+                    prepped_primary.shape[token_dim], device=prepped_primary.device, dtype=torch.long
+                )
             layout = None
             if local_indices is not None:
-                padded = local_indices.numel() * max(getattr(magi, "cp_size", 1) or 1, 1)
+                padded = local_indices.numel() * cp_size
                 original, in_rows = None, None
                 if row_shape is not None:
-                    if padded == row_shape[0] * row_shape[1]:
-                        # Flatten moved no tokens and dispatch added no pad: the
-                        # pre-flatten rows are the caller's coordinate system.
+                    if flattened:
+                        # THD flattens the caller's rows before magi dispatches
+                        # (and may add dispatch padding after that).
                         in_rows = row_shape
+                        original = row_shape[0] * row_shape[1]
                     elif row_shape[0] == 1 and padded >= row_shape[1]:
                         # Single-sequence HF path: dispatch pads at the tail of
                         # the global order, so trim restores the original length.

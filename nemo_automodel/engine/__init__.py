@@ -25,6 +25,11 @@ import torch.distributed as dist
 from torch import nn
 
 from nemo_automodel.components.datasets.datum import Datum, collate_datums
+from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
+from nemo_automodel.components.distributed.context_parallel.sharder import (
+    identity_local_indices,
+    shard_batch_identity,
+)
 from nemo_automodel.components.distributed.mesh import MeshContext
 from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
 from nemo_automodel.components.distributed.utils import get_sync_ctx
@@ -34,10 +39,11 @@ from nemo_automodel.components.training.utils import (
     prepare_for_final_backward,
     prepare_for_grad_accumulation,
 )
+from nemo_automodel.components.utils.model_utils import filter_forward_kwargs
 
 CollateFn = Callable[[list[Datum]], tuple[dict[str, Any], dict[str, torch.Tensor]]]
 LossFn = Callable[
-    [Any, dict[str, torch.Tensor], Sequence[Datum]],
+    [Any, dict[str, torch.Tensor], Sequence[Datum], dict[str, Any]],
     torch.Tensor | tuple[torch.Tensor, Sequence[Mapping[str, Any]]],
 ]
 
@@ -81,11 +87,13 @@ class Engine:
         mesh_context: Runtime topology. When omitted, an initialized default
             process group is treated as pure data parallelism.
         collate_fn: Batches one microbatch of Datums into separate model and
-            loss inputs. The default supports padded text. Packed text and
-            VLMs pass a model-specific collater that returns final model-ready
-            inputs. Existing recipes whose dataloaders already collate can use
-            :func:`collate_prebatched`. The callable must keep model inputs and
-            loss inputs aligned and preserve the sum of ``weights``.
+            loss inputs. The default supports padded and packed text. VLMs pass
+            a model-specific collater. Existing recipes whose dataloaders
+            already collate can use :func:`collate_prebatched`; the Engine then
+            applies any remaining CP/THD preparation. The callable must keep
+            model inputs and loss inputs aligned and preserve the sum of
+            ``weights``.
+        padding_token_id: Token used when the CP sharder pads ``input_ids``.
         context_fn: Creates an optional context around model forward, loss,
             and backward. Recipes use this for runtime contexts such as FP8.
         defer_fsdp_grad_sync: Defer FSDP/DDP gradient synchronization until the
@@ -93,7 +101,8 @@ class Engine:
 
     Note:
         This first execution backend is eager and weight-normalized. Pipeline
-        and context parallel schedules are intentionally deferred.
+        schedules are intentionally deferred; context-parallel input layout
+        and transport are delegated to :class:`ContextParallelSharder`.
     """
 
     def __init__(
@@ -103,6 +112,7 @@ class Engine:
         device: torch.device | str,
         mesh_context: MeshContext | None = None,
         collate_fn: CollateFn = collate_datums,
+        padding_token_id: int = 0,
         context_fn: Callable[[], AbstractContextManager[Any]] = nullcontext,
         defer_fsdp_grad_sync: bool = True,
     ) -> None:
@@ -110,6 +120,7 @@ class Engine:
         self.device = torch.device(device)
         self.mesh_context = mesh_context
         self.collate_fn = collate_fn
+        self.padding_token_id = padding_token_id
         self.context_fn = context_fn
         self.defer_fsdp_grad_sync = defer_fsdp_grad_sync
 
@@ -121,9 +132,10 @@ class Engine:
         """Accumulate gradients for a complete optimizer window.
 
         ``window`` is explicit: each inner sequence is one eager microbatch.
-        ``loss_fn`` receives the raw model output, collated
-        ``loss_fn_inputs``, and the original Datums for that microbatch. It
-        returns either per-element losses with exactly the same shape as
+        ``loss_fn`` receives the raw model output, CP-local
+        ``loss_fn_inputs``, the original Datums, and the final CP-local model
+        inputs produced by the sharder. It returns either per-element losses
+        with exactly the same shape as
         ``loss_fn_inputs["weights"]``, or a scalar local weighted-sum
         numerator. For a scalar, the callback must apply weights and masks;
         the Engine will only apply global normalization. The callback may
@@ -141,21 +153,22 @@ class Engine:
                 collated loss inputs.
 
         Returns:
-            ``(loss, loss_fn_outputs)``. ``loss`` is a detached, DP-reduced
-            scalar. ``loss_fn_outputs`` contains local-rank, per-Datum mappings
-            in window order. Model parameters are unchanged, but their
-            gradients contain the complete window's globally normalized
-            backward result.
+            ``(loss, loss_fn_outputs)``. ``loss`` is a detached scalar reduced
+            over the DP-CP gradient group. ``loss_fn_outputs`` contains
+            local-rank, per-Datum mappings in window order. Model parameters
+            are unchanged, but their gradients contain the complete window's
+            globally normalized backward result.
         """
         microbatches = self._validate_window(window)
         self._validate_parallelism()
         dp_group, dp_size = self._dp_group_and_size()
-        self._validate_window_size_across_dp(len(microbatches), dp_group, dp_size)
+        grad_group, grad_group_size = self._gradient_group_and_size(dp_group, dp_size)
+        self._validate_window_size_across_group(len(microbatches), grad_group, grad_group_size)
         denominator = self._global_weight_sum(microbatches, dp_group, dp_size)
 
         self.model.train()
         prepare_for_grad_accumulation([self.model], pp_enabled=False)
-        MoEAuxLossAutoScaler.main_loss_backward_scale = torch.tensor(1.0 / len(microbatches))
+        MoEAuxLossAutoScaler.main_loss_backward_scale = torch.tensor(self._cp_size() / len(microbatches))
 
         local_loss_sum = torch.zeros((), dtype=torch.float64, device=self.device)
         loss_fn_outputs: list[dict[str, Any]] = []
@@ -167,20 +180,59 @@ class Engine:
                 prepare_for_final_backward([self.model], pp_enabled=False)
 
             model_inputs, loss_inputs = self.collate_fn(datums)
+            self._validate_collated_weights(datums, loss_inputs)
+            model_inputs = _to_device(model_inputs, self.device)
+            loss_inputs = _to_device(loss_inputs, self.device)
+            full_weights = loss_inputs["weights"]
+            loss_seq_dim = _loss_sequence_dim(model_inputs, full_weights)
+
+            # ContextParallelSharder is the single owner of padded, THD, Magi,
+            # and model-specific CP layouts. Labels are temporarily present in
+            # its batch because each backend historically shards them with the
+            # model inputs; all other loss tensors use the sharder token verb.
+            cp_batch = dict(model_inputs)
+            labels = loss_inputs.get("labels")
+            cp_batch["labels"] = (
+                labels.clone() if isinstance(labels, torch.Tensor) else torch.zeros_like(full_weights, dtype=torch.long)
+            )
+            device_mesh = self.mesh_context.device_mesh if self.mesh_context is not None else None
+            final_thd = _is_final_thd(cp_batch)
+            if final_thd and self._cp_size() > 1:
+                raise ValueError(
+                    "context parallelism requires raw THD inputs so ContextParallelSharder can partition them"
+                )
+            if final_thd:
+                sharder = ContextParallelSharder(
+                    device_mesh=device_mesh,
+                    shard_batch=shard_batch_identity,
+                    local_token_global_indices=identity_local_indices,
+                    padding_token_id=self.padding_token_id,
+                )
+            else:
+                sharder = ContextParallelSharder(
+                    self.model,
+                    device_mesh,
+                    cp_batch,
+                    padding_token_id=self.padding_token_id,
+                )
+            cp_context, model_inputs = sharder.shard(cp_batch)
             if model_inputs.get("qkv_format") == "thd" and (
                 "seq_lens" in model_inputs or "seq_lens_padded" in model_inputs
             ):
                 raise ValueError(
-                    "packed collate_fn must return final model-ready THD inputs, not seq_lens packing metadata"
+                    "ContextParallelSharder could not prepare raw THD inputs for this model; "
+                    "use a THD-capable attention backend or provide final THD inputs at cp_size=1"
                 )
-            self._validate_collated_weights(datums, loss_inputs)
-            model_inputs = _to_device(model_inputs, self.device)
-            loss_inputs = _to_device(loss_inputs, self.device)
+            local_labels = model_inputs.pop("labels")
+            loss_inputs = self._shard_loss_inputs(sharder, loss_inputs, loss_seq_dim)
+            if labels is not None:
+                loss_inputs["labels"] = local_labels
             weights = loss_inputs["weights"]
+            forward_inputs = filter_forward_kwargs(self.model, model_inputs)
 
-            with get_sync_ctx(self.model, is_last, self.defer_fsdp_grad_sync), self.context_fn():
-                output = self.model(**model_inputs)
-                result = loss_fn(output, loss_inputs, datums)
+            with get_sync_ctx(self.model, is_last, self.defer_fsdp_grad_sync), self.context_fn(), cp_context():
+                output = self.model(**forward_inputs)
+                result = loss_fn(output, loss_inputs, datums, model_inputs)
                 has_outputs = isinstance(result, tuple)
                 if returns_outputs is None:
                     returns_outputs = has_outputs
@@ -212,14 +264,14 @@ class Engine:
                 if losses.device != weights.device:
                     raise ValueError("loss_fn losses and weights must be on the same device")
 
-                (numerator * (dp_size / denominator)).backward()
+                (numerator * (grad_group_size / denominator)).backward()
 
             local_loss_sum.add_(numerator.detach().to(torch.float64))
             if index == 0:
                 prepare_after_first_microbatch()
 
-        if dp_size > 1:
-            dist.all_reduce(local_loss_sum, op=dist.ReduceOp.SUM, group=dp_group)
+        if grad_group_size > 1:
+            dist.all_reduce(local_loss_sum, op=dist.ReduceOp.SUM, group=grad_group)
 
         loss = (local_loss_sum / denominator).detach()
         return loss, loss_fn_outputs
@@ -238,12 +290,20 @@ class Engine:
         return microbatches
 
     def _validate_parallelism(self) -> None:
+        if any(bool(getattr(module, "calculate_per_token_loss", False)) for module in self.model.modules()):
+            raise NotImplementedError(
+                "Engine.forward_backward requires averaged distributed gradients; "
+                "MegatronFSDP calculate_per_token_loss=True uses summed gradients"
+            )
         if self.mesh_context is None:
             return
         if self.mesh_context.pp_size > 1:
             raise NotImplementedError("Engine.forward_backward does not yet support pipeline parallelism")
-        if self.mesh_context.cp_size > 1:
-            raise NotImplementedError("Engine.forward_backward does not yet support context parallelism")
+        if self.mesh_context.cp_size > 1 and self.mesh_context.device_mesh is None:
+            raise ValueError("context parallelism requires a device mesh")
+
+    def _cp_size(self) -> int:
+        return self.mesh_context.cp_size if self.mesh_context is not None else 1
 
     def _dp_group_and_size(self) -> tuple[dist.ProcessGroup | None, int]:
         if self.mesh_context is not None and self.mesh_context.device_mesh is not None:
@@ -255,6 +315,17 @@ class Engine:
         if dist.is_available() and dist.is_initialized():
             return group, dist.get_world_size(group=group)
         return None, 1
+
+    def _gradient_group_and_size(
+        self,
+        dp_group: dist.ProcessGroup | None,
+        dp_size: int,
+    ) -> tuple[dist.ProcessGroup | None, int]:
+        if self.mesh_context is None or self.mesh_context.device_mesh is None or self._cp_size() == 1:
+            return dp_group, dp_size
+        dp_cp_mesh = get_flat_mesh(self.mesh_context.device_mesh, "dp_cp")
+        size = int(dp_cp_mesh.size())
+        return (dp_cp_mesh.get_group() if size > 1 else None), size
 
     def _global_weight_sum(
         self,
@@ -272,25 +343,81 @@ class Engine:
             local_sum += float(weights.to(torch.float64).sum())
 
         denominator = torch.tensor(local_sum, dtype=torch.float64, device=self.device)
+        self._validate_weight_sum_across_cp(denominator)
         if dp_size > 1:
             dist.all_reduce(denominator, op=dist.ReduceOp.SUM, group=dp_group)
         if float(denominator) <= 0:
             raise ValueError("forward_backward requires a positive global weight sum")
         return denominator
 
-    def _validate_window_size_across_dp(
+    def _validate_window_size_across_group(
         self,
         size: int,
-        dp_group: dist.ProcessGroup | None,
-        dp_size: int,
+        group: dist.ProcessGroup | None,
+        group_size: int,
     ) -> None:
-        if dp_size <= 1:
+        if group_size <= 1:
             return
         local_size = torch.tensor([size], dtype=torch.int64, device=self.device)
-        sizes = torch.empty(dp_size, dtype=torch.int64, device=self.device)
-        dist.all_gather_into_tensor(sizes, local_size, group=dp_group)
+        sizes = torch.empty(group_size, dtype=torch.int64, device=self.device)
+        dist.all_gather_into_tensor(sizes, local_size, group=group)
         if not bool((sizes == sizes[0]).all()):
-            raise ValueError(f"every data-parallel rank must use the same number of microbatches; got {sizes.tolist()}")
+            raise ValueError(f"every gradient rank must use the same number of microbatches; got {sizes.tolist()}")
+
+    def _validate_weight_sum_across_cp(self, local_weight_sum: torch.Tensor) -> None:
+        """Verify that CP replicas started from the same full-sequence weights."""
+        if self._cp_size() <= 1 or not dist.is_available() or not dist.is_initialized():
+            return
+        cp_group = self.mesh_context.device_mesh["cp"].get_group()
+        values = torch.empty(self._cp_size(), dtype=local_weight_sum.dtype, device=local_weight_sum.device)
+        dist.all_gather_into_tensor(values, local_weight_sum.reshape(1), group=cp_group)
+        if not torch.allclose(values, values[0].expand_as(values), rtol=1e-8, atol=1e-12):
+            raise ValueError(f"context-parallel ranks must use identical full-sequence weights; got {values.tolist()}")
+
+    def _shard_loss_inputs(
+        self,
+        sharder: ContextParallelSharder,
+        loss_inputs: dict[str, torch.Tensor],
+        seq_dim: int | None,
+    ) -> dict[str, torch.Tensor]:
+        """Apply the model batch's CP token layout to loss-only tensors.
+
+        Args:
+            sharder: Sharder after it has prepared the current model batch.
+            loss_inputs: Tensors in the pre-CP layout. ``weights`` has shape
+                ``[batch, sequence]`` or ``[tokens]``; any tensor with those
+                leading token axes is sharded identically.
+            seq_dim: Sequence axis in the pre-CP loss tensors, or ``None`` when
+                the weights do not follow the model's token axes.
+
+        Returns:
+            Loss tensors in the model output's CP-local token layout. Non-token
+            tensors are returned unchanged; the input mapping is not mutated.
+        """
+        weights = loss_inputs["weights"]
+        layout = sharder.shard_layout
+        if self._cp_size() == 1 and layout is None:
+            return {name: value for name, value in loss_inputs.items() if name != "labels"}
+        layout_changed = self._cp_size() > 1 or (
+            layout is not None
+            and (
+                layout.input_row_shape is not None
+                or layout.input_token_stream_positions is not None
+                or layout.original_seq_len != layout.padded_seq_len
+            )
+        )
+        if seq_dim is None:
+            if layout_changed:
+                raise ValueError("context-parallel loss weights must match the model's token axes")
+            return dict(loss_inputs)
+
+        local: dict[str, torch.Tensor] = {}
+        for name, value in loss_inputs.items():
+            if name == "labels":
+                continue
+            token_aligned = value.ndim >= weights.ndim and tuple(value.shape[: weights.ndim]) == tuple(weights.shape)
+            local[name] = sharder.shard_token_tensor(value, seq_dim=seq_dim, fill=0) if token_aligned else value
+        return local
 
     @staticmethod
     def _validate_collated_weights(
@@ -320,6 +447,38 @@ def _to_device(value: Any, device: torch.device) -> Any:
     if isinstance(value, tuple):
         return tuple(_to_device(item, device) for item in value)
     return value
+
+
+def _loss_sequence_dim(model_inputs: dict[str, Any], weights: torch.Tensor) -> int | None:
+    """Find the sequence axis shared by primary model tokens and loss weights.
+
+    Args:
+        model_inputs: Pre-CP model mapping whose ``input_ids`` has shape
+            ``[batch, sequence]`` or ``[tokens]``, or whose ``inputs_embeds``
+            has shape ``[batch, sequence, hidden]``.
+        weights: Loss weights of shape ``[batch, sequence]`` or ``[tokens]``.
+
+    Returns:
+        The sequence axis in ``weights``, or ``None`` when the layouts do not
+        describe the same token stream.
+    """
+    primary = model_inputs.get("inputs_embeds", model_inputs.get("input_ids"))
+    if not isinstance(primary, torch.Tensor):
+        return None
+    if primary.ndim >= 2 and weights.ndim >= 2 and tuple(weights.shape[:2]) == tuple(primary.shape[:2]):
+        return 1
+    if primary.ndim == 1 and weights.ndim == 1 and weights.shape == primary.shape:
+        return 0
+    return None
+
+
+def _is_final_thd(model_inputs: dict[str, Any]) -> bool:
+    """Return whether a CP1 caller already supplied the final flat THD layout."""
+    if model_inputs.get("qkv_format") != "thd" or "cu_seqlens" not in model_inputs:
+        return False
+    if "seq_lens" in model_inputs or "seq_lens_padded" in model_inputs:
+        raise ValueError("THD inputs cannot contain both raw seq_lens and final cu_seqlens metadata")
+    return True
 
 
 def _detach(value: Any) -> Any:

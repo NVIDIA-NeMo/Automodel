@@ -658,26 +658,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # Extract TE FP8 config from model backend (set after model construction)
         self.te_fp8 = self.model_parts[0].backend.te_fp8 if hasattr(self.model_parts[0], "backend") else None
 
-        # Packed and CP/Magi batches need recipe-owned input preparation, so
-        # they keep using the existing forward/backward path for now.
-        self.engine = None
-        if (
-            not self.pp_enabled
-            and self.mesh_context.cp_size == 1
-            and getattr(self.cfg.dataloader, "packing", None) is None
-            and not getattr(self.cfg.dataloader, "emits_thd", False)
-            and not self.magi.enabled
-            and getattr(self.loss_fn, "reduction", None) == "sum"
-        ):
-            self.engine = Engine(
-                self.model_parts[0],
-                device=self.dist_env.device,
-                mesh_context=self.mesh_context,
-                collate_fn=collate_prebatched,
-                context_fn=self.te_fp8.maybe_te_autocast if self.te_fp8 is not None else nullcontext,
-                defer_fsdp_grad_sync=getattr(self.distributed_config, "defer_fsdp_grad_sync", True),
-            )
-
         if self.pp_enabled:
             self._configure_pipeline_loss_fn()
 
@@ -715,6 +695,26 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # Tokenizer + model-derived values are runtime concerns: build them here and pass them to
         # each DataloaderConfig.build(); the configs themselves are resolved at the RecipeConfig boundary.
         _, self.tokenizer = _build_tokenizer(self.cfg.model, self.cfg.dataset)
+        model_has_mtp = not self.pp_enabled and any(
+            getattr(module, "mtp", None) is not None for module in self.model_parts[0].modules()
+        )
+        self.engine = None
+        if (
+            not self.pp_enabled
+            and not self.magi.enabled
+            and not (self.mesh_context.cp_size > 1 and model_has_mtp)
+            and not getattr(self.distributed_config, "calculate_per_token_loss", False)
+            and getattr(self.loss_fn, "reduction", None) == "sum"
+        ):
+            self.engine = Engine(
+                self.model_parts[0],
+                device=self.dist_env.device,
+                mesh_context=self.mesh_context,
+                collate_fn=collate_prebatched,
+                padding_token_id=(self.tokenizer.pad_token_id if self.tokenizer is not None else 0) or 0,
+                context_fn=self.te_fp8.maybe_te_autocast if self.te_fp8 is not None else nullcontext,
+                defer_fsdp_grad_sync=getattr(self.distributed_config, "defer_fsdp_grad_sync", True),
+            )
         attn_implementation = None
         if (
             self.cfg.get("packed_sequence.packed_sequence_size", 0) > 0
@@ -1061,9 +1061,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
     def _make_engine_datum(self, batch):
         labels = batch["labels"]
-        model_inputs = filter_forward_kwargs(
-            self.model_parts[0], {key: value for key, value in batch.items() if key != "labels"}
-        )
+        model_inputs = {key: value for key, value in batch.items() if key != "labels"}
         if isinstance(self.loss_fn, FusedLinearCrossEntropy):
             model_inputs["logits_to_keep"] = 1
         return Datum(
@@ -1071,11 +1069,11 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             loss_fn_inputs={"labels": labels, "weights": labels.ne(-100)},
         )
 
-    def _engine_loss(self, output, loss_inputs, datums):
+    def _engine_loss(self, output, loss_inputs, _datums, model_inputs):
         return self._calculate_eager_loss(
             output,
             loss_inputs["labels"],
-            datums[0].model_inputs,
+            model_inputs,
             num_label_tokens=None,
             is_train=True,
         )

@@ -916,13 +916,19 @@ class _FakeMagiState:
 
     enabled = True
     domain = "llm"
-    cp_size = 2
 
-    def __init__(self, local_indices):
+    def __init__(self, local_indices, *, cp_size=2, flatten=False):
         self._local_indices = local_indices
+        self.cp_size = cp_size
+        self._flatten = flatten
 
     def make_cp_batch(self, cp_mesh, batch, *, return_local_indices=False, **kwargs):
-        prepped = {"prepared": True}
+        prepped = dict(batch)
+        if self._flatten:
+            flat = batch["input_ids"].reshape(-1)
+            prepped["input_ids"] = flat if self._local_indices is None else flat[: self._local_indices.numel()]
+        elif self._local_indices is not None:
+            prepped["input_ids"] = batch["input_ids"][:, : self._local_indices.numel()]
         return (prepped, self._local_indices) if return_local_indices else prepped
 
 
@@ -955,7 +961,7 @@ def test_magi_sharder_captures_packed_row_shape():
     strategy = _cu._resolve_cp_sharder(
         cp2,
         None,
-        magi=_FakeMagiState(torch.tensor([[0, 3]])),
+        magi=_FakeMagiState(torch.tensor([0, 3]), flatten=True),
         is_thd=True,
         num_chunks=1,
         seq_lens_padding_value=-1000,
@@ -967,6 +973,69 @@ def test_magi_sharder_captures_packed_row_shape():
     assert sharder.shard_layout.padded_seq_len == 4
     rows = torch.tensor([[10.0, 20.0], [30.0, 40.0]])
     assert torch.equal(sharder.shard_token_tensor(rows), torch.tensor([10.0, 40.0]))
+
+
+def test_magi_cp1_vlm_no_dispatch_has_identity_token_layout():
+    """VLM Magi does not dispatch at CP1, but its token verbs remain identity."""
+    cp1 = _DummySubMesh(1)
+    strategy = _cu._resolve_cp_sharder(
+        cp1,
+        None,
+        magi=_FakeMagiState(None, cp_size=1),
+        is_thd=False,
+        num_chunks=1,
+        seq_lens_padding_value=-1000,
+        model=None,
+    )
+    sharder = _construct_strategy_sharder(strategy, _DummyDeviceMesh(cp_size=1, tp_size=1))
+    sharder.shard({"input_ids": torch.tensor([[1, 2, 3]])})
+
+    assert (sharder.shard_layout.original_seq_len, sharder.shard_layout.padded_seq_len) == (3, 3)
+    weights = torch.tensor([[10.0, 20.0, 30.0]])
+    assert torch.equal(sharder.shard_token_tensor(weights), weights)
+
+
+def test_magi_cp1_custom_thd_flattens_with_identity_token_layout():
+    """A CP1 custom Magi BxS -> T conversion exposes an identity THD map."""
+    cp1 = _DummySubMesh(1)
+    strategy = _cu._resolve_cp_sharder(
+        cp1,
+        None,
+        magi=_FakeMagiState(None, cp_size=1, flatten=True),
+        is_thd=True,
+        num_chunks=1,
+        seq_lens_padding_value=-1000,
+        model=None,
+    )
+    sharder = _construct_strategy_sharder(strategy, _DummyDeviceMesh(cp_size=1, tp_size=1))
+    _, model_inputs = sharder.shard({"input_ids": torch.tensor([[1, 2], [3, 4]])})
+
+    assert model_inputs["input_ids"].shape == (4,)
+    assert sharder.shard_layout.input_row_shape == (2, 2)
+    assert (sharder.shard_layout.original_seq_len, sharder.shard_layout.padded_seq_len) == (4, 4)
+    rows = torch.tensor([[10.0, 20.0], [30.0, 40.0]])
+    assert torch.equal(sharder.shard_token_tensor(rows), rows.reshape(-1))
+
+
+def test_magi_packed_dispatch_padding_uses_zero_weight_sentinel():
+    """Packed Magi can flatten BxS, add dispatch padding, and select zero-filled weights."""
+    cp2 = _DummySubMesh(2)
+    strategy = _cu._resolve_cp_sharder(
+        cp2,
+        None,
+        magi=_FakeMagiState(torch.tensor([0, 3, 4]), flatten=True),
+        is_thd=True,
+        num_chunks=1,
+        seq_lens_padding_value=-1000,
+        model=None,
+    )
+    sharder = _construct_strategy_sharder(strategy, _DummyDeviceMesh(cp_size=2, tp_size=1))
+    sharder.shard({"input_ids": torch.tensor([[1, 2], [3, 4]])})
+
+    layout = sharder.shard_layout
+    assert (layout.original_seq_len, layout.padded_seq_len, layout.input_row_shape) == (4, 6, (2, 2))
+    rows = torch.tensor([[10.0, 20.0], [30.0, 40.0]])
+    assert torch.equal(sharder.shard_token_tensor(rows, fill=0), torch.tensor([10.0, 40.0, 0.0]))
 
 
 def test_make_cp_batch_for_te_identity_indices_without_cp():

@@ -628,22 +628,26 @@ class FinetuneRecipeForVLM(BaseRecipe):
         self.dataloader = dataloader_build.dataloader
         self.processor = dataloader_build.processor
 
-        # Start with the eager path whose inputs need no recipe-owned sharding or
-        # packing preparation. PP, CP, packed, and Magi batches keep using the
-        # existing forward/backward path below.
+        model_has_mtp = not self.pp_enabled and any(
+            getattr(module, "mtp", None) is not None for module in self.model_parts[0].modules()
+        )
         self.engine = None
         if (
             not self.pp_enabled
-            and self.mesh_context.cp_size == 1
-            and dataloader_config.packing is None
             and not self.magi.enabled
+            and not (self.mesh_context.cp_size > 1 and model_has_mtp)
+            and not getattr(self.distributed_config, "calculate_per_token_loss", False)
             and getattr(self.loss_fn, "reduction", None) == "sum"
         ):
+            padding_token_id = (
+                getattr(getattr(getattr(self, "processor", None), "tokenizer", None), "pad_token_id", 0) or 0
+            )
             self.engine = Engine(
                 self.model_parts[0],
                 device=self.dist_env.device,
                 mesh_context=self.mesh_context,
                 collate_fn=collate_prebatched,
+                padding_token_id=padding_token_id,
                 context_fn=self._cp_vision_frame_sharding_context,
                 defer_fsdp_grad_sync=getattr(self.distributed_config, "defer_fsdp_grad_sync", True),
             )
@@ -818,6 +822,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         model: nn.Module,
         num_label_tokens: int | None,
         is_train: bool,
+        cu_seqlens: torch.Tensor | None = None,
         log_drafter: bool = False,
         log_denominator: int | float | None = None,
     ) -> torch.Tensor:
@@ -831,6 +836,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             getattr(getattr(self, "cfg", None), "mtp", None),
             num_label_tokens=num_label_tokens,
             grad_reduce_group=grad_reduce_group,
+            cu_seqlens=cu_seqlens,
         )
 
         return self._maybe_add_drafter_loss(
@@ -852,8 +858,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
     ) -> Datum:
         """Wrap one processor-collated VLM batch as a Datum."""
         labels = batch["labels"]
-        model = self.model_parts[0]
-        model_inputs = filter_forward_kwargs(model, {key: value for key, value in batch.items() if key != "labels"})
+        model_inputs = {key: value for key, value in batch.items() if key != "labels"}
         if isinstance(self.loss_fn, FusedLinearCrossEntropy):
             model_inputs["logits_to_keep"] = 1
         return Datum(
@@ -871,6 +876,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         out: Any,
         loss_inputs: dict[str, torch.Tensor],
         datums: Sequence[Datum],
+        model_inputs: dict[str, Any],
     ) -> torch.Tensor:
         """Return the local loss sum; Engine owns global normalization."""
         return self._calculate_eager_loss(
@@ -879,6 +885,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             model=self.model_parts[0],
             num_label_tokens=None,
             is_train=True,
+            cu_seqlens=model_inputs.get("cu_seqlens"),
             log_drafter=bool(datums[0].loss_fn_inputs["log_drafter"].item()),
             log_denominator=float(datums[0].loss_fn_inputs["log_denominator"].item()),
         )
@@ -1037,6 +1044,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     model=model,
                     num_label_tokens=num_label_tokens,
                     is_train=is_train,
+                    cu_seqlens=batch.get("cu_seqlens"),
                     # Log once per remote-logging step on the first microbatch.
                     log_drafter=(idx == 0 and self.step_scheduler.is_remote_logging_step),
                 )
@@ -1085,7 +1093,13 @@ class FinetuneRecipeForVLM(BaseRecipe):
         num_tokens_in_batch = self._dp_allreduce(num_tokens_in_batch).item()
 
         engine = getattr(self, "engine", None)
-        use_engine = engine is not None and num_label_tokens > 0
+        unsupported_thd_mrope = self._get_cp_group_size() > 1 and any(
+            batch.get("qkv_format") == "thd"
+            and isinstance(batch.get("position_ids"), torch.Tensor)
+            and batch["position_ids"].ndim == 3
+            for batch in batches
+        )
+        use_engine = engine is not None and num_label_tokens > 0 and not unsupported_thd_mrope
         if use_engine:
             reporting_loss, _ = engine.forward_backward(
                 [

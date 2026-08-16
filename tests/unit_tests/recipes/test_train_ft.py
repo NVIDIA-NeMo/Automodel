@@ -2253,6 +2253,34 @@ def test_rope_fusion_disabled_when_cp_gt_1(monkeypatch):
     trainer.setup()
 
     assert cfg.model.backend.rope_fusion is False
+    assert trainer.engine is not None
+
+
+def test_setup_keeps_engine_disabled_for_cp_with_mtp(monkeypatch):
+    cfg = _minimal_cfg_with_rope_fusion(cp_size=2, rope_fusion=True)
+    _patch_setup_minimals_with_cp(monkeypatch, cp_size=2)
+    model = DummyModel()
+    model.mtp = nn.Identity()
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.build_model", lambda *args, **kwargs: model)
+
+    trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
+    trainer.setup()
+
+    assert trainer.engine is None
+
+
+def test_setup_keeps_engine_disabled_for_magi(monkeypatch):
+    cfg = _minimal_cfg_with_rope_fusion(cp_size=1, rope_fusion=True)
+    _patch_setup_minimals_with_cp(monkeypatch, cp_size=1)
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.llm.train_ft.setup_magi",
+        lambda *args, **kwargs: SimpleNamespace(enabled=True, hf_dispatch=False),
+    )
+
+    trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
+    trainer.setup()
+
+    assert trainer.engine is None
 
 
 def test_rope_fusion_unchanged_when_cp_eq_1(monkeypatch):

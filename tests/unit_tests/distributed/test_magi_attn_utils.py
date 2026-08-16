@@ -22,7 +22,8 @@ CPU CI runner. The FFA kernel parity tests at the bottom are gated behind CUDA +
 
 from __future__ import annotations
 
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -324,6 +325,48 @@ class TestPackedCpDocSeqlens:
         batch = {"cu_seqlens": torch.tensor([0, 400, 944])}
         with pytest.raises(ValueError, match="!= flat input length 1024"):
             mu._packed_cp_doc_seqlens(batch, 1024)
+
+    def test_packed_dispatch_returns_token_indices_not_rope_positions(self, monkeypatch):
+        """The sharder map follows dispatch itself, not per-document RoPE ids."""
+        expected_key = object()
+        order = torch.tensor([2, 5, 6, 7])
+        dispatch_calls = []
+
+        def dispatch(value, *, key, pad_value=0):
+            assert key is expected_key
+            dispatch_calls.append((value.clone(), pad_value))
+            padding = value.new_full((2,), pad_value)
+            return torch.cat((value, padding)).index_select(0, order)
+
+        api = ModuleType("magi_attention.api")
+        api.dispatch = dispatch
+        api.get_position_ids = lambda key: torch.tensor([2, 0, 1, 0])
+        package = ModuleType("magi_attention")
+        package.api = api
+        monkeypatch.setitem(sys.modules, "magi_attention", package)
+        monkeypatch.setitem(sys.modules, "magi_attention.api", api)
+        monkeypatch.setattr(mu, "build_flex_key", lambda *args, **kwargs: expected_key)
+
+        model = SimpleNamespace(config=SimpleNamespace(num_attention_heads=2, num_key_value_heads=2, head_dim=4))
+        batch = {
+            "input_ids": torch.tensor([10, 11, 12, 13, 14, 15]),
+            "labels": torch.tensor([20, 21, 22, 23, 24, 25]),
+            "cu_seqlens_padded": torch.tensor([0, 3, 6]),
+        }
+        default_result = mu.magi_prepare_packed_cp(model, batch, _FakeGroup(2))
+        assert len(default_result) == 2
+        assert not any(torch.equal(value, torch.arange(6)) and pad_value == 6 for value, pad_value in dispatch_calls)
+
+        dispatch_calls.clear()
+        out, returned_key, local_indices = mu.magi_prepare_packed_cp(
+            model, batch, _FakeGroup(2), return_local_indices=True
+        )
+
+        assert returned_key is expected_key
+        assert torch.equal(out["position_ids"], torch.tensor([2, 0, 1, 0]))
+        assert torch.equal(local_indices, torch.tensor([2, 5, 6, 6]))
+        assert torch.equal(out["labels"], torch.tensor([22, 25, -100, -100]))
+        assert any(torch.equal(value, torch.arange(6)) and pad_value == 6 for value, pad_value in dispatch_calls)
 
 
 class TestActiveStateAccessors:

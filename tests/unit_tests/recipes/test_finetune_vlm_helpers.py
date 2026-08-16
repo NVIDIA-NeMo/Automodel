@@ -22,6 +22,7 @@ import torch
 import torch.nn as nn
 
 from nemo_automodel.components.config.loader import ConfigNode
+from nemo_automodel.components.datasets.datum import Datum
 from nemo_automodel.components.datasets.vlm.pp_media import (
     VLM_PP_MEDIA_KEY,
     chunk_step3_media,
@@ -2983,6 +2984,69 @@ def test_vlm_rope_fusion_disabled_when_cp_gt_1(monkeypatch):
     trainer.setup()
 
     assert cfg.model.backend.rope_fusion is False
+    assert trainer.engine is not None
+
+
+def test_vlm_setup_keeps_engine_disabled_for_cp_with_mtp(monkeypatch):
+    cfg = _minimal_vlm_cfg(cp_size=2, rope_fusion=True)
+    _patch_vlm_setup_minimals(monkeypatch, cp_size=2)
+    model = DummyModel()
+    model.mtp = nn.Identity()
+    monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.build_model", lambda *args, **kwargs: model)
+
+    trainer = FinetuneRecipeForVLM(cfg)
+    trainer.setup()
+
+    assert trainer.engine is None
+
+
+def test_vlm_setup_keeps_engine_disabled_for_magi(monkeypatch):
+    cfg = _minimal_vlm_cfg(cp_size=1, rope_fusion=True)
+    _patch_vlm_setup_minimals(monkeypatch, cp_size=1)
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.vlm.finetune.setup_magi",
+        lambda *args, **kwargs: SimpleNamespace(enabled=True),
+    )
+
+    trainer = FinetuneRecipeForVLM(cfg)
+    trainer.setup()
+
+    assert trainer.engine is None
+
+
+def test_vlm_engine_loss_uses_final_thd_sequence_boundaries(monkeypatch):
+    recipe = object.__new__(FinetuneRecipeForVLM)
+    recipe.model_parts = [nn.Identity()]
+    recipe.loss_fn = object()
+    recipe.cfg = SimpleNamespace(mtp=None)
+    recipe.dist_env = SimpleNamespace(is_main=False)
+    recipe._get_dp_group = lambda include_cp=False: None
+    recipe._maybe_add_drafter_loss = lambda **kwargs: kwargs["base_loss"]
+    seen = {}
+
+    def fake_causal_lm_loss(*args, **kwargs):
+        seen.update(kwargs)
+        return torch.tensor(1.0)
+
+    monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.causal_lm_loss", fake_causal_lm_loss)
+    cu_seqlens = torch.tensor([0, 2, 5], dtype=torch.int32)
+    datum = Datum(
+        model_inputs={"input_ids": torch.arange(5)},
+        loss_fn_inputs={
+            "weights": torch.ones(5),
+            "log_drafter": torch.tensor(False),
+            "log_denominator": torch.tensor(5.0),
+        },
+    )
+
+    recipe._engine_loss(
+        object(),
+        {"labels": torch.arange(5)},
+        [datum],
+        {"cu_seqlens": cu_seqlens},
+    )
+
+    assert seen["cu_seqlens"] is cu_seqlens
 
 
 def test_vlm_rope_fusion_unchanged_when_cp_eq_1(monkeypatch):
