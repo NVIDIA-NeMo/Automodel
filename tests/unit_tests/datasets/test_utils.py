@@ -425,43 +425,6 @@ class TestPackedSequenceTHDCollater:
         result = sftp.packed_sequence_thd_collater([])
         assert result == {}
 
-    def test_prebatched_tensor_dict(self):
-        """Test a pre-batched item from an iterable benchmark dataset."""
-        batch = {
-            "input_ids": torch.tensor([[1, 2, 3, 4], [5, 6, 7, 8]]),
-            "labels": torch.tensor([[2, 3, 4, -100], [6, 7, 8, -100]]),
-            "position_ids": torch.tensor([[0, 1, 2, 3], [0, 1, 2, 3]]),
-        }
-
-        result = sftp.packed_sequence_thd_collater(batch)
-
-        assert result["qkv_format"] == "thd"
-        assert torch.equal(result["input_ids"], batch["input_ids"])
-        assert torch.equal(result["labels"], batch["labels"])
-        assert torch.equal(result["position_ids"], batch["position_ids"])
-        assert torch.equal(result["seq_lens"], torch.tensor([[4], [4]]))
-        assert torch.equal(result["seq_lens_padded"], torch.tensor([[4], [4]]))
-        assert set(batch) == {"input_ids", "labels", "position_ids"}
-
-    @pytest.mark.parametrize(
-        "batch",
-        [
-            {
-                "input_ids": torch.arange(4),
-                "labels": torch.arange(4),
-                "position_ids": torch.arange(4),
-            },
-            {
-                "input_ids": torch.arange(8).reshape(2, 4),
-                "labels": torch.arange(8).reshape(2, 4),
-                "position_ids": torch.arange(4).reshape(1, 4),
-            },
-        ],
-    )
-    def test_prebatched_tensor_dict_rejects_nonmatching_shapes(self, batch):
-        with pytest.raises(ValueError, match="matching.*shapes"):
-            sftp.packed_sequence_thd_collater(batch)
-
     def test_single_example_single_sequence(self):
         """Test collater with single example containing one sequence."""
         batch = [
