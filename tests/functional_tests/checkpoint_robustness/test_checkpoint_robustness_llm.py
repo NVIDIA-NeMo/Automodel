@@ -446,7 +446,11 @@ def _assert_peft_adapter_matches_checkpoint(
     from safetensors import safe_open
 
     assert adapter_path.exists(), f"adapter_model.safetensors not found at {adapter_path}"
-    loaded_adapter = get_peft_model_state_dict(peft_model)
+    # This comparison is against AutoModel's adapter-only safetensors export.
+    # PEFT's default ``save_embedding_layers="auto"`` treats a targeted output
+    # head as an embedding and adds its base-layer weight, even though that
+    # tensor is not adapter state and is intentionally absent from the file.
+    loaded_adapter = get_peft_model_state_dict(peft_model, save_embedding_layers=False)
     normalized_parameter_names = {}
     if any(tensor.is_meta for tensor in loaded_adapter.values()):
         for parameter_name, _ in peft_model.named_parameters():
@@ -462,19 +466,11 @@ def _assert_peft_adapter_matches_checkpoint(
         ignored_missing = [key for key in missing if ignored_key_prefix and key.startswith(ignored_key_prefix)]
         required_missing = sorted(set(missing) - set(ignored_missing))
         unexpected = sorted(loaded_keys - expected_keys)
-        # PEFT can expose the wrapped output head's base-layer tensor from
-        # get_peft_model_state_dict even though it is not adapter state and was
-        # therefore not written to adapter_model.safetensors. Keep unexpected
-        # adapter tensors strict while excluding this base-model-only value.
-        ignored_unexpected = [key for key in unexpected if ".lm_head.base_layer." in key]
-        required_unexpected = sorted(set(unexpected) - set(ignored_unexpected))
-        assert not required_missing and not required_unexpected, (
+        assert not required_missing and not unexpected, (
             "Vanilla PEFT adapter key mismatch: "
-            f"missing={required_missing[:10]}, unexpected={required_unexpected[:10]}, "
-            f"ignored_missing={ignored_missing[:10]}, ignored_non_adapter={ignored_unexpected[:10]}"
+            f"missing={required_missing[:10]}, unexpected={unexpected[:10]}, "
+            f"ignored_missing={ignored_missing[:10]}"
         )
-        if ignored_unexpected:
-            print(f"[HF reload] Ignored PEFT-reported non-adapter base-layer tensors: {ignored_unexpected}")
 
         mismatches = []
         matched_keys = expected_keys - set(ignored_missing)
@@ -1560,6 +1556,12 @@ def _run_vanilla_hf_reload(
         for key in ("revision", "token"):
             if model_kwargs.get(key) is not None:
                 hf_kwargs[key] = model_kwargs[key]
+        # Load HF with the attention backend the recipe pins, the same way the
+        # source-load phase does. Attention backends are not bit-identical in bf16,
+        # so without this the two sides can run different backends and the reload
+        # reports a logit gap that the checkpoint did not cause.
+        if model_kwargs.get("attn_implementation") is not None:
+            hf_kwargs["attn_implementation"] = model_kwargs["attn_implementation"]
         # Remote-code models can ship attention names that transformers 5.x
         # rejects. Select a supported implementation while keeping Nemotron-H
         # off HF's incompatible FlashAttention varlen path.

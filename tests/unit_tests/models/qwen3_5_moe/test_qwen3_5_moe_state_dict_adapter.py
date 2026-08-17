@@ -23,7 +23,10 @@ from safetensors.torch import save_file
 
 import nemo_automodel._transformers.models.qwen3_5_moe.model as qwen3_5_moe_model
 from nemo_automodel._transformers.models.common import BackendConfig
-from nemo_automodel._transformers.models.qwen3_5_moe.state_dict_adapter import Qwen3_5MoeStateDictAdapter
+from nemo_automodel._transformers.models.qwen3_5_moe.state_dict_adapter import (
+    Qwen3_5MoeStateDictAdapter,
+    _infer_base_expert_hf_layout,
+)
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 from nemo_automodel.components.moe.layers import MoEConfig
 
@@ -86,6 +89,75 @@ def backend_config():
 @pytest.fixture
 def adapter(config, moe_config, backend_config):
     return Qwen3_5MoeStateDictAdapter(config=config, moe_config=moe_config, backend=backend_config, dtype=torch.float32)
+
+
+@pytest.fixture
+def split_fp8_adapter(backend_config):
+    moe_config = MoEConfig(
+        dim=3,
+        inter_dim=2,
+        moe_inter_dim=2,
+        n_routed_experts=2,
+        n_shared_experts=0,
+        n_activated_experts=1,
+        n_expert_groups=0,
+        n_limited_groups=0,
+        train_gate=True,
+        gate_bias_update_factor=0.0,
+        score_func="softmax",
+        route_scale=1.0,
+        aux_loss_coeff=0.0,
+        norm_topk_prob=True,
+        expert_bias=False,
+        router_bias=False,
+        expert_activation="swiglu",
+        softmax_before_topk=True,
+    )
+    return Qwen3_5MoeStateDictAdapter(
+        config=SimpleNamespace(_name_or_path="", name_or_path=""),
+        moe_config=moe_config,
+        backend=backend_config,
+        dtype=torch.float32,
+        text_only=True,
+    )
+
+
+def _fp8_weight(rows, cols, offset):
+    values = torch.arange(rows * cols, dtype=torch.float32).reshape(rows, cols)
+    return (values / 16.0 + offset).to(dtype=torch.float8_e4m3fn)
+
+
+def _build_split_fp8_hf_state(adapter):
+    hidden_dim = adapter.moe_config.dim
+    inter_dim = adapter.moe_config.moe_inter_dim
+    hf_state = {}
+    expected_gate_up = []
+    expected_down = []
+
+    for expert_id in range(adapter.moe_config.n_routed_experts):
+        projections = {}
+        projection_specs = (
+            ("gate_proj", (inter_dim, hidden_dim), 1.0),
+            ("up_proj", (inter_dim, hidden_dim), 0.5),
+            ("down_proj", (hidden_dim, inter_dim), 0.25),
+        )
+        for projection_index, (projection, shape, scale) in enumerate(projection_specs):
+            key = f"model.layers.0.mlp.experts.{expert_id}.{projection}.weight"
+            weight = _fp8_weight(*shape, offset=0.25 + expert_id + projection_index / 8.0)
+            scale_inv = torch.full((1, 1), scale, dtype=torch.bfloat16)
+            hf_state[key] = weight
+            hf_state[f"{key}_scale_inv"] = scale_inv
+            projections[projection] = weight.float() * scale_inv.float()[0, 0]
+
+        expected_gate_up.append(
+            torch.cat(
+                (projections["gate_proj"].transpose(0, 1), projections["up_proj"].transpose(0, 1)),
+                dim=1,
+            )
+        )
+        expected_down.append(projections["down_proj"].transpose(0, 1))
+
+    return hf_state, torch.stack(expected_gate_up, dim=0), torch.stack(expected_down, dim=0)
 
 
 # ---------------------------------------------------------------------------
@@ -170,6 +242,53 @@ class TestInitialization:
 
         with pytest.raises(ValueError, match="both split and grouped MTP expert keys"):
             adapter._get_mtp_expert_hf_layout(checkpoint_keys)
+
+    def test_base_layout_rejects_mixed_checkpoint_keys(self):
+        split_key = "model.layers.0.mlp.experts.0.gate_proj.weight"
+        checkpoint_keys = {
+            split_key,
+            f"{split_key}_scale_inv",
+            "model.layers.0.mlp.experts.gate_up_proj",
+        }
+
+        with pytest.raises(ValueError, match="both split-FP8 and grouped decoder expert keys"):
+            _infer_base_expert_hf_layout(checkpoint_keys)
+
+
+class TestSplitFp8BaseExperts:
+    def test_from_hf_dequantizes_and_exports_split_fp8(self, split_fp8_adapter):
+        hf_state, expected_gate_up, expected_down = _build_split_fp8_hf_state(split_fp8_adapter)
+
+        assert split_fp8_adapter._get_expert_hf_layout(hf_state) == "split-fp8"
+
+        native = split_fp8_adapter.from_hf(dict(hf_state))
+        gate_key = "model.layers.0.mlp.experts.gate_and_up_projs"
+        down_key = "model.layers.0.mlp.experts.down_projs"
+
+        assert native[gate_key].shape == (2, 3, 4)
+        assert native[down_key].shape == (2, 2, 3)
+        torch.testing.assert_close(native[gate_key], expected_gate_up)
+        torch.testing.assert_close(native[down_key], expected_down)
+
+        exported = split_fp8_adapter.to_hf(native, quantization=True)
+
+        assert set(exported) == set(hf_state)
+        inter_dim = split_fp8_adapter.moe_config.moe_inter_dim
+        for expert_id in range(split_fp8_adapter.moe_config.n_routed_experts):
+            expected_exports = {
+                "gate_proj": native[gate_key][expert_id, :, :inter_dim].transpose(0, 1),
+                "up_proj": native[gate_key][expert_id, :, inter_dim:].transpose(0, 1),
+                "down_proj": native[down_key][expert_id].transpose(0, 1),
+            }
+            for projection, expected in expected_exports.items():
+                key = f"model.layers.0.mlp.experts.{expert_id}.{projection}.weight"
+                assert exported[key].dtype == torch.float8_e4m3fn
+                torch.testing.assert_close(exported[key].float(), expected.to(dtype=torch.float8_e4m3fn).float())
+
+                scale_key = f"{key}_scale_inv"
+                assert exported[scale_key].shape == (1, 1)
+                assert exported[scale_key].dtype == torch.bfloat16
+                torch.testing.assert_close(exported[scale_key], torch.ones_like(exported[scale_key]))
 
 
 # ---------------------------------------------------------------------------

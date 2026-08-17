@@ -108,13 +108,14 @@ RUN apt-get update && apt-get install -y --allow-change-held-packages \
 # Install Bitsandbytes
 ARG INSTALL_BITSANDBYTES=True
 ARG BITSANDBYTES_COMMIT=0.49.2
+# Include native Blackwell targets, especially SM121 for DGX Spark, instead of relying on forward-compatible PTX.
 RUN if [ $INSTALL_BITSANDBYTES = "True" ]; then \
     git clone https://github.com/bitsandbytes-foundation/bitsandbytes.git && \
     cd bitsandbytes && \
     git pull && \
     git fetch origin $BITSANDBYTES_COMMIT && \
     git checkout FETCH_HEAD && \
-    cmake -DCOMPUTE_BACKEND=cuda -DCOMPUTE_CAPABILITY="80;86;90;100;110" -S . && \
+    cmake -DCOMPUTE_BACKEND=cuda -DCOMPUTE_CAPABILITY="80;86;90;100;110;120;121" -S . && \
     make && \
     cmake -DCOMPUTE_BACKEND=cpu -S . && \
     make && \
@@ -184,7 +185,7 @@ RUN pip install --no-cache-dir --no-deps /tmp/wheels/*.whl && \
 # Address base image CVE
 RUN pip install "aiohttp>=3.14.3" \
         "black>=26.3.1" \
-        "GitPython>=3.1.50" \
+        "GitPython>=3.1.59" \
         "jaraco-context>=6.1.0" \
         "jupyter-server>=2.20.0" \
         "jupyterlab>=4.5.7" \

@@ -152,6 +152,7 @@ class Glm4MoeLiteModel(nn.Module):
             expert_bias=False,
             router_bias=False,
             expert_activation="swiglu",
+            apply_router_weight_after_down=True,
             softmax_before_topk=False,  # GLM4 uses sigmoid, not softmax
             dtype=model_dtype,
         )

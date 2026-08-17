@@ -27,6 +27,7 @@ import torch
 
 from nemo_automodel._transformers.models.nemotron_omni.model import (
     NemotronOmniConfig,
+    NemotronOmniForConditionalGeneration,
     RMSNorm,
     SoundProjection,
     SquaredReLU,
@@ -156,6 +157,23 @@ def test_nemotron_omni_config_overrides_propagate():
     assert cfg.patch_size == 14
     assert cfg.vit_hidden_size == 2048
     assert cfg.video_pruning_rate == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Model compatibility properties
+# ---------------------------------------------------------------------------
+
+
+def test_lm_head_property_exposes_nested_head_without_registering_alias():
+    """The FSDP-facing property must preserve the nested checkpoint hierarchy."""
+    model = object.__new__(NemotronOmniForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    model.language_model = torch.nn.Module()
+    model.language_model.lm_head = torch.nn.Linear(4, 8, bias=False)
+
+    assert model.lm_head is model.language_model.lm_head
+    assert "lm_head" not in model._modules
+    assert set(model.state_dict()) == {"language_model.lm_head.weight"}
 
 
 # ---------------------------------------------------------------------------

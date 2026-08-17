@@ -25,6 +25,8 @@ from typing import TYPE_CHECKING, Any, Dict
 
 import torch
 
+from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
+
 if TYPE_CHECKING:
     from nemo_automodel._transformers.models.bagel.configuration import BagelBackendConfig
 
@@ -46,9 +48,8 @@ def _load_siglip_vision_config(vit_path: str):
 
 def _normalize_wrapped_param_name(name: str) -> str:
     """Remove wrapper path fragments that are not part of logical parameter FQNs."""
-    for fragment in ("._checkpoint_wrapped_module", "._fsdp_wrapped_module"):
-        name = name.replace(fragment, "")
-    for fragment in ("_checkpoint_wrapped_module.", "_fsdp_wrapped_module."):
+    name = canonical_parameter_fqn(name)
+    for fragment in ("._fsdp_wrapped_module", "_fsdp_wrapped_module."):
         name = name.replace(fragment, "")
     return name
 

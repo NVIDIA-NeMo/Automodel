@@ -236,6 +236,7 @@ class TestGlm4MoeModel:
         assert model.moe_config.n_activated_experts == glm_config.num_experts_per_tok
         assert model.moe_config.score_func == "sigmoid"  # GLM4 uses sigmoid
         assert model.moe_config.softmax_before_topk is False
+        assert model.moe_config.apply_router_weight_after_down is True
         assert model.moe_config.route_scale == glm_config.routed_scaling_factor
 
     def test_model_initializes_moe_config_with_expert_groups(self, glm_config, backend_config):
@@ -287,7 +288,9 @@ class TestGlm4MoeModel:
             with patch.object(
                 Block, "forward", side_effect=lambda *_, **kwargs: torch.randn(batch, seq_len, glm_config.hidden_size)
             ):
-                with patch("nemo_automodel._transformers.models.glm4_moe.model.position_ids_to_freqs_cis") as mock_freqs:
+                with patch(
+                    "nemo_automodel._transformers.models.glm4_moe.model.position_ids_to_freqs_cis"
+                ) as mock_freqs:
                     mock_freqs.return_value = torch.randn(
                         batch, seq_len, int(glm_config.head_dim * glm_config.partial_rotary_factor)
                     )
