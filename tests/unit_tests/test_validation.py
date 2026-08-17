@@ -27,6 +27,7 @@ from nemo_automodel._transformers.capabilities import (
     ModelSupports,
     _build_class_dict,
     attach_capabilities_and_validate,
+    get_model_supports,
     validate_for_mesh,
 )
 from nemo_automodel.components.distributed.optimized_tp_plans import _get_class_qualname
@@ -414,6 +415,15 @@ class TestModelSupportsEP:
 
 
 class TestModelSupportsMTP:
+    def test_raw_model_uses_temporary_descriptor_without_attachment(self):
+        model = _Bare()
+        model.mtp_config = SimpleNamespace(enabled=True)
+
+        supports = get_model_supports(model)
+
+        assert supports.mtp_enabled is True
+        assert not hasattr(model, "supports")
+
     def test_mtp_enabled_reflects_live_config(self):
         model = _Bare()
         model.mtp_config = SimpleNamespace(enabled=False)

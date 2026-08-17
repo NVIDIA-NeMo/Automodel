@@ -540,9 +540,10 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
             cp_layers = list(layers)
             mtp_module = getattr(model, "mtp", None)
             mtp_layers = getattr(mtp_module, "layers", None)
-            mtp_enabled = model.supports.mtp_enabled
-            parallelizer_utils.reject_unsupported_mtp_cp_pp(model)
-            parallelizer_utils.reject_unsupported_mtp_cp(model)
+            mtp_enabled = parallelizer_utils.is_mtp_enabled(model)
+            if mtp_enabled:
+                parallelizer_utils.reject_unsupported_mtp_cp_pp(model)
+                parallelizer_utils.reject_unsupported_mtp_cp(model)
             if mtp_enabled and mtp_layers is None:
                 raise RuntimeError(
                     "MTP is enabled but model.mtp.layers is unavailable; cannot configure context parallelism for MTP"
