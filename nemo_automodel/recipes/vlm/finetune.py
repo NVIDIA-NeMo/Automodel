@@ -883,9 +883,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
             invoke_pre_embed=True,
         )
         model = self.model_parts[0]
-        mtp_enabled = _cp_active and not self.pp_enabled and model.supports.mtp_enabled
+        mtp_cp_enabled = _cp_active and not self.pp_enabled and model.supports.mtp_enabled
         mtp_cp_inputs = None
-        if mtp_enabled:
+        if mtp_cp_enabled:
             if not model.supports.supports_mtp_cp:
                 raise NotImplementedError(
                     f"{type(model).__name__} declares supports_mtp_cp=False; "
