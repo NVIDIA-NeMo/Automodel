@@ -424,11 +424,6 @@ class Mistral3VLBidirectionalForSequenceClassification(Mistral3PreTrainedModel):
         """Apply compatible Liger kernels to the nested Mistral text tower."""
         self.model._nemo_apply_liger_kernel(liger_kernel_transformers)
 
-    @property
-    def _nemo_layer_group_root(self) -> nn.Module:
-        """Return the VLM body that owns the language and vision transformer blocks."""
-        return self.model
-
     @torch.no_grad()
     def _init_weights(self, module: nn.Module) -> None:
         """Initialize the scoring head in its configured dtype.
