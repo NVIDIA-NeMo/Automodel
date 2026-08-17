@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Literal, cast
 
 import pytest
 import torch
@@ -29,6 +29,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 _TensorFormat = Literal["sbhd", "bshd", "thd"]
+_Arithmetic = Literal["fp32", "input"]
 _TOLERANCES = {
     torch.float32: 2e-6,
     torch.float16: 2e-3,
@@ -98,30 +99,48 @@ def _cp_position_indices(
 
 def _rotate_reference(
     input_tensor: torch.Tensor,
-    angles: torch.Tensor,
+    cosine: torch.Tensor,
+    sine: torch.Tensor,
     *,
     interleaved: bool,
+    arithmetic: _Arithmetic,
 ) -> torch.Tensor:
-    """Apply an explicit eager PyTorch RoPE reference in FP32.
+    """Apply an explicit eager PyTorch RoPE reference.
 
     Args:
         input_tensor: Tensor of shape [..., heads, head_dim], with arbitrary
             leading dimensions.
-        angles: Float32 tensor broadcastable to shape [..., heads, rotary_dim].
-            Values are raw angles arranged in the kernel's rotary pairing layout.
+        cosine: Cosine table broadcastable to shape [..., heads, rotary_dim].
+        sine: Sine table with the same shape and dtype as `cosine`.
         interleaved: Whether rotary pairs occupy adjacent head-dimension elements.
+        arithmetic: Whether to use the scalar FP32/FMA contract or materialized
+            input-dtype multiply intermediates.
 
     Returns:
         Tensor with the same shape, dtype, and device as `input_tensor`.
     """
-    rotary_dim = angles.shape[-1]
-    source = input_tensor[..., :rotary_dim].float()
+    rotary_dim = cosine.shape[-1]
+    source = input_tensor[..., :rotary_dim]
+    if arithmetic == "fp32":
+        source = source.float()
+        cosine = cosine.float()
+        sine = sine.float()
+    else:
+        cosine = cosine.to(input_tensor.dtype)
+        sine = sine.to(input_tensor.dtype)
     if interleaved:
         rotated = torch.stack((-source[..., 1::2], source[..., 0::2]), dim=-1).flatten(-2)
     else:
         first, second = source.chunk(2, dim=-1)
         rotated = torch.cat((-second, first), dim=-1)
-    rotary_output = source * torch.cos(angles) + rotated * torch.sin(angles)
+    rotated_term = rotated * sine
+    if arithmetic == "fp32":
+        # addcmul is an independent PyTorch scalar-FMA oracle: `rotated_term`
+        # materializes the rounded MUL, then addcmul evaluates source*cos + term.
+        rotary_output = torch.addcmul(rotated_term, source, cosine)
+    else:
+        source_term = source * cosine
+        rotary_output = source_term + rotated_term
     if rotary_dim == input_tensor.shape[-1]:
         return rotary_output.to(input_tensor.dtype)
     return torch.cat((rotary_output, input_tensor[..., rotary_dim:].float()), dim=-1).to(input_tensor.dtype)
@@ -131,8 +150,10 @@ def _reference_rope(
     input_tensor: torch.Tensor,
     freqs: torch.Tensor,
     *,
+    sin: torch.Tensor | None,
     tensor_format: _TensorFormat,
     interleaved: bool,
+    arithmetic: _Arithmetic,
     cu_seqlens: torch.Tensor | None,
     cp_size: int,
     cp_rank: int,
@@ -144,9 +165,12 @@ def _reference_rope(
         input_tensor: Tensor in SBHD [sequence, batch, heads, head_dim], BSHD
             [batch, sequence, heads, head_dim], or THD [tokens, heads, head_dim]
             layout.
-        freqs: Float32 tensor of raw angles with shape [positions, 1, 1, rotary_dim].
+        freqs: Raw angles or a precomputed cosine table with shape
+            [positions, 1, 1, rotary_dim].
+        sin: Matching precomputed sine table, or `None` for raw angles.
         tensor_format: Semantic layout of `input_tensor`.
         interleaved: Whether rotary pairs occupy adjacent head-dimension elements.
+        arithmetic: FP32/FMA or input-dtype table arithmetic.
         cu_seqlens: For THD, int32 offsets of shape [batch + 1] describing global
             padded sequence spans; otherwise `None`.
         cp_size: Number of context-parallel shards.
@@ -156,11 +180,26 @@ def _reference_rope(
     Returns:
         Reference tensor with the same shape, dtype, and device as `input_tensor`.
     """
+    if sin is None:
+        cosine_table = torch.cos(freqs)
+        sine_table = torch.sin(freqs)
+    else:
+        table_dtype = torch.float32 if arithmetic == "fp32" else input_tensor.dtype
+        cosine_table = freqs.to(table_dtype)
+        sine_table = sin.to(table_dtype)
+
     if tensor_format != "thd":
         padded = input_tensor.transpose(0, 1) if tensor_format == "sbhd" else input_tensor
         positions = _cp_position_indices(padded.shape[1], cp_size, cp_rank, device=input_tensor.device)
-        angles = freqs[positions, 0, 0, :][None, :, None, :]
-        output = _rotate_reference(padded, angles, interleaved=interleaved)
+        cosine = cosine_table[positions, 0, 0, :][None, :, None, :]
+        sine_values = sine_table[positions, 0, 0, :][None, :, None, :]
+        output = _rotate_reference(
+            padded,
+            cosine,
+            sine_values,
+            interleaved=interleaved,
+            arithmetic=arithmetic,
+        )
         return output.transpose(0, 1).contiguous() if tensor_format == "sbhd" else output
 
     if cu_seqlens is None:
@@ -176,9 +215,18 @@ def _reference_rope(
         positions = _cp_position_indices(local_sequence, cp_size, cp_rank, device=input_tensor.device)
         if tokenwise_freqs:
             positions = positions + global_start
-        angles = freqs[positions, 0, 0, :][:, None, :]
+        cosine = cosine_table[positions, 0, 0, :][:, None, :]
+        sine_values = sine_table[positions, 0, 0, :][:, None, :]
         local_input = input_tensor.narrow(0, local_start, local_sequence)
-        pieces.append(_rotate_reference(local_input, angles, interleaved=interleaved))
+        pieces.append(
+            _rotate_reference(
+                local_input,
+                cosine,
+                sine_values,
+                interleaved=interleaved,
+                arithmetic=arithmetic,
+            )
+        )
         local_start += local_sequence
     if local_start != input_tensor.shape[0]:
         raise ValueError("cu_seqlens does not cover the local THD input")
@@ -189,8 +237,10 @@ def _assert_matches_reference(
     input_tensor: torch.Tensor,
     freqs: torch.Tensor,
     *,
+    sin: torch.Tensor | None = None,
     tensor_format: _TensorFormat,
     interleaved: bool,
+    arithmetic: _Arithmetic,
     cu_seqlens: torch.Tensor | None = None,
     cp_size: int = 1,
     cp_rank: int = 0,
@@ -202,9 +252,12 @@ def _assert_matches_reference(
         input_tensor: Contiguous CUDA tensor in SBHD [sequence, batch, heads,
             head_dim], BSHD [batch, sequence, heads, head_dim], or THD
             [tokens, heads, head_dim] layout.
-        freqs: Contiguous float32 CUDA tensor of shape [positions, 1, 1, rotary_dim].
+        freqs: Contiguous raw-angle or cosine CUDA tensor of shape
+            [positions, 1, 1, rotary_dim].
+        sin: Optional matching precomputed sine table.
         tensor_format: Semantic layout of `input_tensor`.
         interleaved: Whether rotary pairs occupy adjacent head-dimension elements.
+        arithmetic: FP32/FMA or input-dtype table arithmetic.
         cu_seqlens: For THD, contiguous int32 CUDA offsets of shape [batch + 1];
             otherwise `None`.
         cp_size: Number of context-parallel shards.
@@ -219,8 +272,10 @@ def _assert_matches_reference(
     actual = apply_fused_rope(
         actual_input,
         freqs,
+        sin=sin,
         tensor_format=tensor_format,
         interleaved=interleaved,
+        arithmetic=arithmetic,
         cu_seqlens=cu_seqlens,
         cp_size=cp_size,
         cp_rank=cp_rank,
@@ -229,8 +284,10 @@ def _assert_matches_reference(
     reference = _reference_rope(
         reference_input,
         freqs,
+        sin=sin,
         tensor_format=tensor_format,
         interleaved=interleaved,
+        arithmetic=arithmetic,
         cu_seqlens=cu_seqlens,
         cp_size=cp_size,
         cp_rank=cp_rank,
@@ -242,7 +299,7 @@ def _assert_matches_reference(
     assert actual.device == reference.device == input_tensor.device
     assert actual.is_contiguous()
 
-    tolerance = _TOLERANCES[input_tensor.dtype]
+    tolerance = 0 if arithmetic == "input" else _TOLERANCES[input_tensor.dtype]
     torch.testing.assert_close(actual, reference, rtol=0, atol=tolerance)
 
     grad_storage = torch.randn(
@@ -266,13 +323,15 @@ def _assert_matches_reference(
 @pytest.mark.parametrize("tensor_format", ("sbhd", "bshd", "thd"))
 @pytest.mark.parametrize("interleaved", (False, True))
 @pytest.mark.parametrize("rotary_dim", (32, 64))
+@pytest.mark.parametrize("arithmetic", ("fp32", "input"))
 def test_forward_and_backward_match_reference(
     dtype: torch.dtype,
     tensor_format: _TensorFormat,
     interleaved: bool,
     rotary_dim: int,
+    arithmetic: _Arithmetic,
 ) -> None:
-    """Cover every supported layout, dtype, pairing, and partial-rotation path."""
+    """Cover every layout, dtype, pairing, partial rotation, and arithmetic path."""
     torch.manual_seed(1439)
     sequence, batch, heads, head_dim = 16, 2, 3, 64
     if tensor_format == "sbhd":
@@ -292,16 +351,19 @@ def test_forward_and_backward_match_reference(
         freqs,
         tensor_format=tensor_format,
         interleaved=interleaved,
+        arithmetic=arithmetic,
         cu_seqlens=cu_seqlens,
     )
 
 
 @pytest.mark.parametrize("tensor_format", ("sbhd", "bshd", "thd"))
 @pytest.mark.parametrize("cp_size,cp_rank", ((2, 0), (2, 1), (4, 0), (4, 3)))
+@pytest.mark.parametrize("arithmetic", ("fp32", "input"))
 def test_context_parallel_forward_and_backward_match_reference(
     tensor_format: _TensorFormat,
     cp_size: int,
     cp_rank: int,
+    arithmetic: _Arithmetic,
 ) -> None:
     """Cover mirrored dual-chunk indexing for padded and variable-length THD input."""
     torch.manual_seed(811 + cp_rank)
@@ -335,6 +397,7 @@ def test_context_parallel_forward_and_backward_match_reference(
         freqs,
         tensor_format=tensor_format,
         interleaved=interleaved,
+        arithmetic=arithmetic,
         cu_seqlens=cu_seqlens,
         cp_size=cp_size,
         cp_rank=cp_rank,
@@ -344,11 +407,13 @@ def test_context_parallel_forward_and_backward_match_reference(
 @pytest.mark.parametrize("dtype", (torch.float32, torch.float16, torch.bfloat16))
 @pytest.mark.parametrize("interleaved", (False, True))
 @pytest.mark.parametrize("cp_size,cp_rank", ((1, 0), (2, 0), (2, 1)))
+@pytest.mark.parametrize("arithmetic", ("fp32", "input"))
 def test_tokenwise_packed_thd_forward_and_backward_match_reference(
     dtype: torch.dtype,
     interleaved: bool,
     cp_size: int,
     cp_rank: int,
+    arithmetic: _Arithmetic,
 ) -> None:
     """Cover distinct raw-angle rows for every packed physical token."""
     torch.manual_seed(1931 + cp_rank)
@@ -377,11 +442,104 @@ def test_tokenwise_packed_thd_forward_and_backward_match_reference(
         freqs,
         tensor_format="thd",
         interleaved=interleaved,
+        arithmetic=arithmetic,
         cu_seqlens=cu_seqlens,
         cp_size=cp_size,
         cp_rank=cp_rank,
         tokenwise_freqs=True,
     )
+
+
+@pytest.mark.parametrize("dtype", (torch.float32, torch.float16, torch.bfloat16))
+@pytest.mark.parametrize("tensor_format", ("bshd", "thd"))
+@pytest.mark.parametrize("interleaved", (False, True))
+@pytest.mark.parametrize("arithmetic", ("fp32", "input"))
+@pytest.mark.parametrize("table_storage", ("float32", "input"))
+def test_precomputed_scaled_tables_match_reference(
+    dtype: torch.dtype,
+    tensor_format: _TensorFormat,
+    interleaved: bool,
+    arithmetic: _Arithmetic,
+    table_storage: Literal["float32", "input"],
+) -> None:
+    """Cover HF-style tables plus YaRN/attention scaling in both arithmetic modes."""
+    torch.manual_seed(2307)
+    sequence, batch, heads, head_dim, rotary_dim = 12, 2, 2, 80, 64
+    if tensor_format == "bshd":
+        shape = (batch, sequence, heads, head_dim)
+        cu_seqlens = None
+    else:
+        shape = (batch * sequence, heads, head_dim)
+        cu_seqlens = torch.arange(batch + 1, device="cuda", dtype=torch.int32) * sequence
+
+    input_tensor = torch.randn(shape, device="cuda", dtype=dtype)
+    angles = _make_freqs(sequence, rotary_dim, interleaved=interleaved, device=input_tensor.device)
+    scaling = torch.linspace(0.75, 1.25, rotary_dim, device=input_tensor.device).view(1, 1, 1, -1)
+    cosine = torch.cos(angles) * scaling
+    sine = torch.sin(angles) * scaling
+    storage_dtype = torch.float32 if table_storage == "float32" else dtype
+    cosine = cosine.to(storage_dtype)
+    sine = sine.to(storage_dtype)
+
+    _assert_matches_reference(
+        input_tensor,
+        cosine,
+        sin=sine,
+        tensor_format=tensor_format,
+        interleaved=interleaved,
+        arithmetic=arithmetic,
+        cu_seqlens=cu_seqlens,
+    )
+
+
+@pytest.mark.parametrize("interleaved", (False, True))
+@pytest.mark.parametrize("arithmetic", ("fp32", "input"))
+def test_128k_sequence_forward_and_backward_match_reference(
+    interleaved: bool,
+    arithmetic: _Arithmetic,
+) -> None:
+    """Exercise long-position indexing and numerics at the 128K model context scale."""
+    torch.manual_seed(128_1439)
+    sequence, heads, head_dim, rotary_dim = 128 * 1024, 1, 16, 16
+    input_tensor = torch.randn((1, sequence, heads, head_dim), device="cuda", dtype=torch.bfloat16)
+    freqs = _make_freqs(sequence, rotary_dim, interleaved=interleaved, device=input_tensor.device)
+    _assert_matches_reference(
+        input_tensor,
+        freqs,
+        tensor_format="bshd",
+        interleaved=interleaved,
+        arithmetic=arithmetic,
+    )
+
+
+@pytest.mark.parametrize("interleaved", (False, True))
+def test_bf16_arithmetic_modes_are_distinct_near_cancellation(interleaved: bool) -> None:
+    """Prove the mode switch selects distinct BF16 operation ordering."""
+    torch.manual_seed(1439)
+    shape = (1, 256, 2, 64)
+    input_tensor = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
+    half_angles = torch.randn((256, 32), device="cuda", dtype=torch.float32) * 32
+    angles = (
+        torch.repeat_interleave(half_angles, 2, dim=-1)
+        if interleaved
+        else torch.cat((half_angles, half_angles), dim=-1)
+    )
+    freqs = angles[:, None, None, :].contiguous()
+    fp32_output = apply_fused_rope(
+        input_tensor,
+        freqs,
+        tensor_format="bshd",
+        interleaved=interleaved,
+        arithmetic="fp32",
+    )
+    input_output = apply_fused_rope(
+        input_tensor,
+        freqs,
+        tensor_format="bshd",
+        interleaved=interleaved,
+        arithmetic="input",
+    )
+    assert torch.count_nonzero(fp32_output != input_output) > 0
 
 
 def test_rejects_unpadded_offsets_for_padded_thd_storage() -> None:
@@ -406,12 +564,40 @@ def test_rejects_frequency_gradients() -> None:
         apply_fused_rope(input_tensor, freqs, tensor_format="sbhd")
 
 
+def test_rejects_precomputed_sine_gradients() -> None:
+    """Reject gradients on either half of a precomputed table."""
+    input_tensor = torch.randn((8, 1, 2, 64), device="cuda")
+    angles = _make_freqs(8, 64, interleaved=False, device=input_tensor.device)
+    cosine = torch.cos(angles)
+    sine = torch.sin(angles).requires_grad_(True)
+    with pytest.raises(ValueError, match="does not compute frequency gradients"):
+        apply_fused_rope(input_tensor, cosine, sin=sine, tensor_format="sbhd")
+
+
 def test_rejects_cpu_tensors_before_compilation() -> None:
     """Reject CPU input through the public contract before loading the extension."""
     input_tensor = torch.randn((8, 1, 2, 64))
     freqs = _make_freqs(8, 64, interleaved=False, device=input_tensor.device)
     with pytest.raises(RuntimeError, match="must be CUDA tensors"):
         apply_fused_rope(input_tensor, freqs, tensor_format="sbhd")
+
+
+def test_rejects_unknown_arithmetic_before_compilation() -> None:
+    """Reject unknown numerical contracts through the public API."""
+    input_tensor = torch.randn((8, 1, 2, 64))
+    freqs = _make_freqs(8, 64, interleaved=False, device=input_tensor.device)
+    with pytest.raises(ValueError, match="unsupported arithmetic"):
+        apply_fused_rope(input_tensor, freqs, tensor_format="sbhd", arithmetic=cast(_Arithmetic, "tf32"))
+
+
+def test_rejects_mismatched_precomputed_tables() -> None:
+    """Reject cosine/sine tables that cannot share one indexing contract."""
+    input_tensor = torch.randn((8, 1, 2, 64), device="cuda", dtype=torch.bfloat16)
+    angles = _make_freqs(8, 64, interleaved=False, device=input_tensor.device)
+    cosine = torch.cos(angles)
+    sine = torch.sin(angles[..., :-2])
+    with pytest.raises(RuntimeError, match="identical contiguous shapes"):
+        apply_fused_rope(input_tensor, cosine, sin=sine, tensor_format="sbhd", arithmetic="input")
 
 
 def test_rejects_odd_local_sequence_with_context_parallelism() -> None:
