@@ -130,10 +130,12 @@ rank-0 OOM.
 
 ### Full-Logit Metrics and Profiles
 
-Phases 0, 2, 3, and 5 compare every vocabulary logit for every prompt token. The deterministic token pattern is
-expanded to `parity_sequence_length` tokens (default 2048), exercising long-position attention and RoPE behavior.
-Reduce this field only when a model has a documented memory limit or a pipeline schedule with a shorter static sequence
-length.
+Phases 0, 2, 3, and 5 compare every vocabulary logit for every prompt token. The fixed Apache License 2.0 document
+already checked into the repository is tokenized with each model's tokenizer, then truncated to
+`parity_sequence_length` tokens (default 2048). If a tokenizer produces fewer tokens, the complete document is repeated
+only as needed. This gives the test realistic long-form structure and token variety while remaining identical across
+isolated phases and CI runs. Reduce the length only when a model has a documented memory limit or a pipeline schedule
+with a shorter static sequence length.
 
 Every comparison reports mean, p95, and max per-token `KL(reference || candidate)`; whole-tensor cosine similarity;
 and mean/max absolute logit difference. The full record is printed as `CHECKPOINT_PARITY_METRICS <json>` and saved

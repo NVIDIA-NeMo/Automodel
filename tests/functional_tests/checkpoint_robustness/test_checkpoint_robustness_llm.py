@@ -87,9 +87,7 @@ from tests.functional_tests.checkpoint_robustness.resume_trajectory import (
 
 datasets.disable_caching()
 
-# Llama token IDs for "The quick brown fox jumps over the lazy dog"
-_DEFAULT_INPUT_IDS = [791, 4996, 14198, 39935, 35308, 927, 279, 16053, 5679]
-_DEFAULT_PROMPT = "The quick brown fox jumps over the lazy dog"
+_PARITY_DOCUMENT_PATH = Path(__file__).resolve().parents[3] / "LICENSE"
 
 
 @dataclass(frozen=True)
@@ -239,9 +237,9 @@ def _extract_custom_args(argv: list[str]) -> tuple[dict[str, str | bool], list[s
 
 
 def _get_input_ids(tokenizer_name: str | None) -> list[int]:
-    """Return input IDs for the test prompt, using dynamic tokenization if tokenizer_name is set."""
+    """Tokenize the repository's Apache License document for parity testing."""
     if tokenizer_name is None:
-        return _DEFAULT_INPUT_IDS
+        raise ValueError("tokenizer_name is required to tokenize the checkpoint parity document")
     from nemo_automodel import NeMoAutoTokenizer
 
     tokenizer = NeMoAutoTokenizer.from_pretrained(
@@ -249,7 +247,15 @@ def _get_input_ids(tokenizer_name: str | None) -> list[int]:
         trust_remote_code=True,
         local_files_only=os.environ.get("HF_HUB_OFFLINE", "0") == "1",
     )
-    return tokenizer.encode(_DEFAULT_PROMPT, add_special_tokens=False)
+    return tokenizer.encode(_get_parity_document(), add_special_tokens=False)
+
+
+def _get_parity_document() -> str:
+    """Load the fixed long-form document shared by LLM and VLM parity tests."""
+    try:
+        return _PARITY_DOCUMENT_PATH.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise RuntimeError(f"Unable to load checkpoint parity document: {_PARITY_DOCUMENT_PATH}") from exc
 
 
 def _load_hf_config(
@@ -438,10 +444,10 @@ def _rss_gb() -> float:
     return rss_pages * page_size / 1024**3
 
 
-def _expand_input_ids(input_ids: list[int], sequence_length: int) -> list[int]:
-    """Repeat a deterministic token pattern to the requested parity length."""
+def _fit_input_ids_to_sequence_length(input_ids: list[int], sequence_length: int) -> list[int]:
+    """Truncate or repeat a tokenized document to the requested parity length."""
     if not input_ids:
-        raise ValueError("Parity input token pattern must not be empty")
+        raise ValueError("Tokenized parity document must not be empty")
     if sequence_length <= 0:
         raise ValueError(f"parity_sequence_length must be positive, got {sequence_length}")
     repeats, remainder = divmod(sequence_length, len(input_ids))
@@ -1045,7 +1051,7 @@ def _load_input_ids_once(
     storm, so rank 0 writes the small result for the other ranks to read.
     """
     if tokenizer_name is None or _preinit_world_size() == 1:
-        return _expand_input_ids(input_ids_loader(tokenizer_name), sequence_length)
+        return _fit_input_ids_to_sequence_length(input_ids_loader(tokenizer_name), sequence_length)
 
     sync_dir, payload_path, done_path, fail_path = _input_ids_sync_paths(cfg)
     if _preinit_global_rank() != 0:
@@ -1059,7 +1065,7 @@ def _load_input_ids_once(
     done_path.unlink(missing_ok=True)
     fail_path.unlink(missing_ok=True)
     try:
-        input_ids = _expand_input_ids(input_ids_loader(tokenizer_name), sequence_length)
+        input_ids = _fit_input_ids_to_sequence_length(input_ids_loader(tokenizer_name), sequence_length)
         temporary_payload_path = payload_path.with_suffix(".tmp")
         temporary_payload_path.write_text(json.dumps(input_ids))
         temporary_payload_path.replace(payload_path)

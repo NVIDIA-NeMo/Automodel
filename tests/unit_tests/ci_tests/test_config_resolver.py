@@ -316,9 +316,18 @@ def test_nemotron_flash_peft_robustness_keeps_supported_tp_topology(tmp_path):
     assert "resume_first_loss_threshold" not in resolved["ci"]["checkpoint_robustness"]
 
 
-def test_qwen3_moe_lora_robustness_keeps_source_and_checkpoint_gates(tmp_path):
-    """Qwen MoE LoRA retains both source-load and checkpoint reload coverage."""
-    recipe_path = REPO_ROOT / "examples/llm_finetune/qwen/qwen3_moe_30b_lora.yaml"
+@pytest.mark.parametrize(
+    "recipe_path",
+    [
+        "examples/llm_finetune/qwen/qwen3_moe_30b_lora.yaml",
+        "examples/llm_finetune/minimax_m2/minimax_m2.7_hellaswag_lora.yaml",
+        "examples/vlm_finetune/gemma4/gemma4_26b_a4b_moe.yaml",
+        "examples/vlm_finetune/stepfun/step3p7_medpix_200b_lora_pp8ep8_8node.yaml",
+    ],
+)
+def test_calibration_recipes_enable_all_checkpoint_gates(tmp_path, recipe_path):
+    """Previously skipped parity recipes expose source, reload, and resume gates."""
+    recipe_path = REPO_ROOT / recipe_path
     out = tmp_path / "resolved.yaml"
     env = {"PIPELINE_DIR": str(tmp_path), "TEST_NAME": recipe_path.stem}
     _run_resolver(
@@ -330,7 +339,8 @@ def test_qwen3_moe_lora_robustness_keeps_source_and_checkpoint_gates(tmp_path):
     assert "check_source_load_parity" not in robustness
     assert "skip_source_load_parity" not in robustness
     assert "skip_automodel_reload_logit_parity" not in robustness
-    assert robustness["skip_hf_reload_logit_parity"] is True
+    assert "skip_hf_reload_logit_parity" not in robustness
+    assert "skip_resume" not in robustness
 
 
 def test_end_to_end_fixture_keys_not_applied_as_overrides(tmp_path):
@@ -419,13 +429,8 @@ def test_vlm_checkpoint_robustness_recipes_resolve(tmp_path, recipe_path):
     assert resolved["checkpoint"]["enabled"] is True
     assert resolved["checkpoint"]["model_save_format"] == "safetensors"
     assert resolved["checkpoint"]["save_consolidated"] is True
-    if Path(recipe_path).stem == "gemma4_26b_a4b_moe":
-        # Opted out: source-load logit KL tracks the host's reduction order for
-        # this recipe's DeepEP MoE routing, not checkpoint integrity.
-        assert robustness["skip_source_load_parity"] is True
-    else:
-        assert "skip_source_load_parity" not in robustness
-        assert "check_source_load_parity" not in robustness
+    assert "skip_source_load_parity" not in robustness
+    assert "check_source_load_parity" not in robustness
     assert robustness["tokenizer_name"] == resolved["model"]["pretrained_model_name_or_path"]
     if Path(recipe_path).stem == "gemma4_26b_a4b_moe":
         assert resolved["distributed"]["multimodal"]["frozen_sharding"] == "replicate"

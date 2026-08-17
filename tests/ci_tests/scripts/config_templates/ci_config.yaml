@@ -131,8 +131,9 @@ fixture_keys:
     - kl_threshold
     - hf_source_post_load_dequantize
     - no_check_resume
-    # Full-logit parity defaults to a deterministic 2048-token prompt. Named
-    # profiles gate mean and p95 KL; all metrics are emitted for calibration.
+    # Full-logit parity defaults to 2048 tokens from the repository's fixed
+    # long-form document. Named profiles gate mean and p95 KL; all metrics are
+    # emitted for calibration.
     - parity_sequence_length
     - parity_tolerance_profile
     - process_isolation

@@ -32,6 +32,7 @@ from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm
     _finish_hf_reload_sync,
     _get_input_ids,
     _get_logits_pp,
+    _get_parity_document,
     _hf_device_map_max_memory,
     _hf_fp32_module_names,
     _hf_model_load_context,
@@ -492,7 +493,8 @@ def test_get_input_ids_respects_hf_offline(monkeypatch, offline, expected_local_
         monkeypatch.delenv("HF_HUB_OFFLINE", raising=False)
     else:
         monkeypatch.setenv("HF_HUB_OFFLINE", offline)
-    tokenizer = SimpleNamespace(encode=lambda *args, **kwargs: [11, 12, 13])
+    tokenizer = Mock()
+    tokenizer.encode.return_value = [11, 12, 13]
 
     with patch("nemo_automodel.NeMoAutoTokenizer.from_pretrained", return_value=tokenizer) as from_pretrained:
         input_ids = _get_input_ids("mistralai/Ministral-3-3B-Instruct-2512")
@@ -503,6 +505,7 @@ def test_get_input_ids_respects_hf_offline(monkeypatch, offline, expected_local_
         trust_remote_code=True,
         local_files_only=expected_local_files_only,
     )
+    tokenizer.encode.assert_called_once_with(_get_parity_document(), add_special_tokens=False)
 
 
 @pytest.mark.parametrize(("offline", "expected_local_files_only"), [(None, False), ("1", True)])
@@ -511,7 +514,8 @@ def test_get_vlm_input_ids_uses_processor_tokenizer(monkeypatch, offline, expect
         monkeypatch.delenv("HF_HUB_OFFLINE", raising=False)
     else:
         monkeypatch.setenv("HF_HUB_OFFLINE", offline)
-    tokenizer = SimpleNamespace(encode=lambda *args, **kwargs: [21, 22, 23])
+    tokenizer = Mock()
+    tokenizer.encode.return_value = [21, 22, 23]
     processor = SimpleNamespace(tokenizer=tokenizer)
 
     with patch("transformers.AutoProcessor.from_pretrained", return_value=processor) as from_pretrained:
@@ -523,6 +527,21 @@ def test_get_vlm_input_ids_uses_processor_tokenizer(monkeypatch, offline, expect
         trust_remote_code=True,
         local_files_only=expected_local_files_only,
     )
+    tokenizer.encode.assert_called_once_with(_get_parity_document(), add_special_tokens=False)
+
+
+def test_parity_document_is_the_checked_in_long_form_license():
+    document = _get_parity_document()
+
+    assert "Apache License" in document[:200]
+    assert "TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION" in document
+    assert len(document.split()) > 1_500
+
+
+@pytest.mark.parametrize("input_ids_loader", [_get_input_ids, _get_vlm_input_ids])
+def test_parity_input_requires_a_model_tokenizer(input_ids_loader):
+    with pytest.raises(ValueError, match="tokenizer_name is required"):
+        input_ids_loader(None)
 
 
 def test_load_input_ids_once_shares_rank0_result(tmp_path, monkeypatch):
@@ -548,12 +567,20 @@ def test_load_input_ids_once_shares_rank0_result(tmp_path, monkeypatch):
     rank0_reuse_loader.assert_not_called()
 
 
-def test_load_input_ids_once_repeats_token_pattern_to_parity_length(tmp_path):
+def test_load_input_ids_once_repeats_short_document_to_parity_length(tmp_path):
     cfg = SimpleNamespace(checkpoint=SimpleNamespace(checkpoint_dir=tmp_path / "checkpoints"))
 
     input_ids = _load_input_ids_once(cfg, Mock(return_value=[7, 8, 9]), None, sequence_length=8)
 
     assert input_ids == [7, 8, 9, 7, 8, 9, 7, 8]
+
+
+def test_load_input_ids_once_truncates_long_document_to_parity_length(tmp_path):
+    cfg = SimpleNamespace(checkpoint=SimpleNamespace(checkpoint_dir=tmp_path / "checkpoints"))
+
+    input_ids = _load_input_ids_once(cfg, Mock(return_value=[7, 8, 9, 10, 11]), None, sequence_length=3)
+
+    assert input_ids == [7, 8, 9]
 
 
 def test_load_input_ids_once_waits_for_payload_visibility(tmp_path, monkeypatch):

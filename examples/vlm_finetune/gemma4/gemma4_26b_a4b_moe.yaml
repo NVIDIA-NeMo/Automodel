@@ -119,22 +119,13 @@ freeze_config:
 ci:
   recipe_owner: athitten
   nodes: 1
-  # Full robustness takes about 50 minutes.
-  time: "01:15:00"
+  # Include source parity in addition to the approximately 50-minute reload/resume path.
+  time: "01:30:00"
   # Keep failures blocking; residual MoE drift is tracked by AM-707/AM-719.
   checkpoint_robustness:
     # The shared robustness batch of 2 exceeds this 26B MoE recipe's memory
     # envelope; 1 matches the recipe's validated per-rank image batch.
     step_scheduler.local_batch_size: 1
-    # Source-load logit parity is not a checkpoint-integrity signal for this
-    # recipe. The same commit gives max KL 0.28 locally and 4.xx on nemo-ci with
-    # the same container, byte-identical weights, config, tokenizer and token
-    # IDs, so the value tracks the hardware's reduction order rather than the
-    # checkpoint: top-k MoE routing amplifies normal BF16 implementation-order
-    # differences through 30 layers. Everything else stays gated -- checkpoint
-    # load, adapter key coverage, the AutoModel reload, the HF reload forward
-    # and resume.
-    skip_source_load_parity: true
     hf_device_map_auto: true
     tokenizer_name: google/gemma-4-26B-A4B-it
     # Attention, dense MLP and every norm are bit-exact against HF; the residual

@@ -199,7 +199,7 @@ ci:
     assert jobs[""]["variables"]["CHECKPOINT_ROBUSTNESS_PHASES"] == "train_and_save automodel_reload"
 
 
-def test_generate_qwen3_moe_lora_uses_isolated_reload_phases():
+def test_generate_qwen3_moe_lora_uses_all_isolated_checkpoint_phases():
     config = Path("examples/llm_finetune/qwen/qwen3_moe_30b_lora.yaml")
 
     jobs = dict(generate_job(config, {}, "release", "llm_finetune", "."))
@@ -209,13 +209,16 @@ def test_generate_qwen3_moe_lora_uses_isolated_reload_phases():
     variables = jobs[""]["variables"]
     assert "CHECKPOINT_ROBUSTNESS_PHASES" not in ci_config.get("env_vars", {})
     assert variables["PYTORCH_CUDA_ALLOC_CONF"] == "expandable_segments:True"
+    assert variables["TIME"] == "01:00:00"
     assert variables["CHECKPOINT_ROBUSTNESS_PROCESS_ISOLATION"] == "true"
     assert variables["CHECKPOINT_ROBUSTNESS_PHASES"] == (
-        "source_load_reference source_load_parity train_and_save automodel_reload hf_reload"
+        "source_load_reference source_load_parity train_and_save automodel_reload hf_reload resume"
     )
     assert "check_source_load_parity" not in robustness
     assert "skip_source_load_parity" not in robustness
-    assert robustness["skip_hf_reload_logit_parity"] is True
+    assert "skip_automodel_reload_logit_parity" not in robustness
+    assert "skip_hf_reload_logit_parity" not in robustness
+    assert "skip_resume" not in robustness
     assert robustness["source_load_kl_threshold"] == 3e-2
     assert robustness["source_load_mean_kl_threshold"] == 6e-3
     assert robustness["source_load_cosine_threshold"] == 0.997
