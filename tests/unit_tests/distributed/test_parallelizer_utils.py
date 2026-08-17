@@ -29,7 +29,6 @@ from nemo_automodel.components.distributed.parallelizer_utils import (
     _mp_policy_with_param_dtype,
     configure_fsdp_unused_param_reduction,
     fully_shard_by_dtype,
-    is_mtp_enabled,
     iter_maximal_uniform_dtype_subtrees,
     reject_unsupported_mtp_cp,
     reject_unsupported_mtp_cp_pp,
@@ -43,14 +42,6 @@ from nemo_automodel.shared.torch_patches import (
 def test_reject_unsupported_mtp_cp_pp_allows_disabled_model():
     model = nn.Linear(2, 2)
     model.supports = SimpleNamespace(mtp_enabled=False, supports_mtp_cp_pp=False)
-    reject_unsupported_mtp_cp_pp(model)
-
-
-def test_mtp_guards_allow_raw_model_without_mtp():
-    model = nn.Linear(2, 2)
-
-    assert is_mtp_enabled(model) is False
-    reject_unsupported_mtp_cp(model)
     reject_unsupported_mtp_cp_pp(model)
 
 

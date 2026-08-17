@@ -424,11 +424,6 @@ def _import_parallelizer_with_stubs(monkeypatch):
     parallelizer_utils_stub.fully_shard_by_dtype = fully_shard_by_dtype
     parallelizer_utils_stub.configure_fsdp_unused_param_reduction = lambda module: 0
 
-    def is_mtp_enabled(model):
-        return bool(getattr(getattr(model, "mtp_config", None), "enabled", False))
-
-    parallelizer_utils_stub.is_mtp_enabled = is_mtp_enabled
-
     def reject_unsupported_mtp_cp(model):
         if model.supports.mtp_enabled and not model.supports.supports_mtp_cp:
             raise RuntimeError("Model does not support MTP with context parallelism")
@@ -1606,7 +1601,14 @@ def test_parallelize_model_applies_tp_before_cp_ep_ac_and_fsdp(monkeypatch):
     model = type(
         "Outer",
         (),
-        {"moe_config": type("MC", (), {"n_routed_experts": 4})()},
+        {
+            "moe_config": type("MC", (), {"n_routed_experts": 4})(),
+            "supports": types.SimpleNamespace(
+                mtp_enabled=False,
+                supports_mtp_cp=False,
+                supports_mtp_cp_pp=False,
+            ),
+        },
     )()
 
     P.parallelize_model(

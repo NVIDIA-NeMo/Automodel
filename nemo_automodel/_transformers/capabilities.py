@@ -15,8 +15,7 @@
 """Model capabilities introspection and input validation.
 
 Provides :class:`ModelSupports` (a read-only descriptor of what a model can
-do), :func:`get_model_supports` for callers that also accept raw model
-instances, and :func:`attach_capabilities_and_validate` which attaches
+do) and :func:`attach_capabilities_and_validate` which attaches
 ``model.supports``, ``model.supports_*``, and ``model.validate_for_mesh``
 to any ``nn.Module``.
 
@@ -407,20 +406,6 @@ class ModelSupports:
         return _uses_te_attention(model) or _uses_magi_attention(model)
 
 
-def get_model_supports(model: "nn.Module", mesh: "MeshContext | None" = None) -> ModelSupports:
-    """Return the model's capability descriptor without requiring attachment.
-
-    Models loaded through ``NeMoAutoModel`` have a persistent ``supports``
-    descriptor. Lower-level parallelizer APIs also accept directly constructed
-    modules, so use a temporary descriptor for those models instead of requiring
-    every caller to mutate the model class first.
-    """
-    try:
-        return model.supports  # type: ignore[attr-defined, no-any-return]
-    except AttributeError:
-        return ModelSupports(model, mesh)
-
-
 def validate_for_mesh(model: "nn.Module", mesh: "MeshContext") -> None:
     """Validate *mesh* parallelism sizes against this model's capabilities.
 
@@ -432,7 +417,11 @@ def validate_for_mesh(model: "nn.Module", mesh: "MeshContext") -> None:
     if mesh is None:
         return
 
-    supports = get_model_supports(model, mesh)
+    # If capabilities haven't been attached yet, use a temporary ModelSupports.
+    if not hasattr(model, "supports"):
+        supports = ModelSupports(model, mesh)
+    else:
+        supports = model.supports
 
     tp_size = getattr(mesh, "tp_size", 1)
     pp_size = getattr(mesh, "pp_size", 1)

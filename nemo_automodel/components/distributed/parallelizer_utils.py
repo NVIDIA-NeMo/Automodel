@@ -25,7 +25,6 @@ from torch.distributed.fsdp import (
     fully_shard,
 )
 
-from nemo_automodel._transformers.capabilities import get_model_supports
 from nemo_automodel.shared.torch_patches import (
     patch_fsdp_uniform_reduce_dtype as _patch_fsdp_uniform_reduce_dtype,
 )
@@ -36,23 +35,21 @@ from nemo_automodel.shared.torch_patches import (
 UniformSubtreeItem = Union[Tuple[nn.Module, torch.dtype], Tuple[str, nn.Module, torch.dtype]]
 
 
-def is_mtp_enabled(model: nn.Module) -> bool:
-    """Return whether MTP is enabled, including for raw unattached models."""
-    return get_model_supports(model).mtp_enabled
-
-
 def reject_unsupported_mtp_cp(model: nn.Module) -> None:
     """Reject enabled MTP when the model has not declared CP support."""
-    supports = get_model_supports(model)
-    if supports.mtp_enabled and not supports.supports_mtp_cp:
+    if model.supports.mtp_enabled and not model.supports.supports_mtp_cp:
         raise RuntimeError(f"{type(model).__name__} does not support MTP with context parallelism")
 
 
 def reject_unsupported_mtp_cp_pp(model: nn.Module) -> None:
     """Reject MTP+CP on every trimmed pipeline stage before CP collectives."""
-    supports = get_model_supports(model)
     is_pp_stage_fn = getattr(model, "_is_pipeline_parallel_stage", None)
-    if supports.mtp_enabled and not supports.supports_mtp_cp_pp and callable(is_pp_stage_fn) and is_pp_stage_fn():
+    if (
+        model.supports.mtp_enabled
+        and not model.supports.supports_mtp_cp_pp
+        and callable(is_pp_stage_fn)
+        and is_pp_stage_fn()
+    ):
         raise NotImplementedError(
             "MTP with context and pipeline parallelism is not supported; use PP size 1 or CP size 1"
         )
