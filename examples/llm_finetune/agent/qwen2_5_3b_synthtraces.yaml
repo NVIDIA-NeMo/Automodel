@@ -20,6 +20,11 @@
 
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
+ci:
+  recipe_owner: khazic
+  nodes: 1
+  time: "01:00:00"
+
 step_scheduler:
   global_batch_size: 32
   local_batch_size: 1
