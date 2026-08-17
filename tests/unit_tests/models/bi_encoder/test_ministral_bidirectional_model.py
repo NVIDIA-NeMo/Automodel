@@ -153,6 +153,23 @@ def test_ministral3_bidirectional_config_fields():
     assert cfg.model_type == "ministral3_bidirec"
 
 
+def test_mistral3_vlm_initializes_parent_once(monkeypatch):
+    config = _tiny_mistral3_bidirectional_vlm_config()
+    parent_init = Mistral3Model.__init__
+    calls = []
+
+    def tracking_init(model, model_config):
+        calls.append(model_config)
+        parent_init(model, model_config)
+
+    monkeypatch.setattr(Mistral3Model, "__init__", tracking_init)
+
+    model = Mistral3BidirectionalModel(config)
+
+    assert calls == [config]
+    assert isinstance(model.language_model, Ministral3BidirectionalModel)
+
+
 def test_ministral3_biencoder_processor_loads_tokenizers_backend_directly(monkeypatch):
     expected = object()
     calls = []

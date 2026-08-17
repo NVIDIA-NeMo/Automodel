@@ -266,7 +266,6 @@ class Mistral3BidirectionalModel(Mistral3Model):
         self.multi_modal_projector = Mistral3MultiModalProjector(config)
         self.language_model = Ministral3BidirectionalModel(config.text_config)
         self.post_init()
-        super().__init__(config)
 
     def _nemo_apply_liger_kernel(self, liger_kernel_transformers) -> None:
         """Apply compatible Liger kernels to the Ministral text tower only."""
