@@ -1400,6 +1400,25 @@ def test_mistral3_vlm_crossencoder_scores_vision_inputs_and_backpropagates():
     config.text_config._attn_implementation = "eager"
     config.vision_config._attn_implementation = "eager"
     model = Mistral3VLBidirectionalForSequenceClassification(config)
+
+    model.eval()
+    text_only_input_ids = torch.tensor([[1, 2, 3, 4]])
+    modified_input_ids = text_only_input_ids.clone()
+    modified_input_ids[0, -1] = 5
+    text_only_attention_mask = torch.ones_like(text_only_input_ids)
+    with torch.no_grad():
+        original_hidden_states = model.model(
+            input_ids=text_only_input_ids,
+            attention_mask=text_only_attention_mask,
+            run_dummy_vision=False,
+        ).last_hidden_state
+        modified_hidden_states = model.model(
+            input_ids=modified_input_ids,
+            attention_mask=text_only_attention_mask,
+            run_dummy_vision=False,
+        ).last_hidden_state
+    assert not torch.allclose(original_hidden_states[0, 0], modified_hidden_states[0, 0], atol=1e-6)
+
     input_ids = torch.tensor([[10, 10, 10, 10, 1, 2]])
     attention_mask = torch.ones_like(input_ids)
     pixel_values = torch.randn(1, 3, 8, 8)

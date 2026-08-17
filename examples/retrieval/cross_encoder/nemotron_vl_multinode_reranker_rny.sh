@@ -150,12 +150,13 @@ srun \
         --container-entrypoint \
         --no-container-mount-home \
         --export=ALL \
-        bash -c "set -euo pipefail
+        bash -c 'set -euo pipefail
             cd /opt/Automodel/
-            [[ -f \"${CONTAINER_CONFIG_YAML}\" ]] || { echo \"Config YAML not found in container: ${CONTAINER_CONFIG_YAML}\" >&2; exit 2; }
+            [[ -f "$1" ]] || { echo "Config YAML not found in container: $1" >&2; exit 2; }
             torchrun \
             --nproc_per_node=${SLURM_GPUS_PER_NODE:-8} \
             --nnodes=${SLURM_NNODES:-1} \
             --rdzv_backend=c10d \
             --rdzv_endpoint=${MASTER_ADDR}:${MASTER_PORT} \
-            examples/retrieval/cross_encoder/finetune.py --config \"${CONTAINER_CONFIG_YAML}\" ${CONFIG_OVERRIDES[*]}"
+            examples/retrieval/cross_encoder/finetune.py --config "$1" "${@:2}"' \
+        _ "${CONTAINER_CONFIG_YAML}" "${CONFIG_OVERRIDES[@]}"
