@@ -59,9 +59,6 @@ model:
     rope_fusion: false
   attn_implementation: sdpa
   torch_dtype: bfloat16
-  # MTP's future-token shift is not yet context-parallel aware.
-  num_nextn_predict_layers: 0
-
 processor:
   _target_: transformers.AutoProcessor.from_pretrained
   pretrained_model_name_or_path: Qwen/Qwen3.5-4B
