@@ -64,6 +64,7 @@ from nemo_automodel.components.checkpoint.utils import (
     is_tied_word_embeddings,
     materialize_missing_tied_lm_head,
 )
+from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 
 _PREFIX = "model."
 _OPTIMIZER_PARTS_KEY = "optimizer_parts"
@@ -150,7 +151,7 @@ def _get_peft_state_dict(model: torch.nn.Module) -> dict[str, Any]:
         if param.requires_grad:
             # Strip _checkpoint_wrapped_module. from FQNs to match DCP's normalization.
             # Without this, activation checkpointing causes key mismatches on reload.
-            name = name.replace("_checkpoint_wrapped_module.", "")
+            name = canonical_parameter_fqn(name)
             param = param.full_tensor() if hasattr(param, "full_tensor") else param
             state_dict[name] = param.detach().cpu()
     return state_dict
@@ -241,7 +242,7 @@ def _set_peft_state_dict(model: torch.nn.Module, state_dict: dict[str, Any]) -> 
 
     # Strip _checkpoint_wrapped_module. from FQNs to match DCP's normalization.
     # Without this, activation checkpointing causes key mismatches on reload.
-    param_dict = {name.replace("_checkpoint_wrapped_module.", ""): param for name, param in model.named_parameters()}
+    param_dict = {canonical_parameter_fqn(name): param for name, param in model.named_parameters()}
     loaded, skipped = 0, 0
 
     for name, saved_tensor in state_dict.items():

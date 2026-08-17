@@ -110,6 +110,19 @@ class MoESplitExpertsStateDictMixin:
         """
         return ()
 
+    def _v5_peft_hf_expert_path_segment(self) -> str:
+        """Return the common HF module path that owns the fused expert parameters."""
+        target_parameters = self._v5_peft_target_parameters
+        if not target_parameters:
+            return self._expert_path_segment
+
+        expert_segments = {target.rsplit(".", 1)[0] for target in target_parameters}
+        if len(expert_segments) != 1:
+            raise ValueError(
+                f"PEFT v5 expert target parameters must share one parent module, got {sorted(target_parameters)}"
+            )
+        return next(iter(expert_segments))
+
     def _validate_expert_availability(
         self,
         hf_state_dict: dict[str, Any],
@@ -272,8 +285,9 @@ class MoESplitExpertsStateDictMixin:
           - ``lora_down_B``  (E, r, H) -> ``lora_A.weight``  (r*E, H)  reshape
           - ``lora_down_A``  (E, I, r) -> ``lora_B.weight``  (I, r*E)  permute+reshape
 
-        gate_up_proj (inner wrapper, HAS ``base_layer.`` prefix):
-          - ``lora_gate_and_up_B``  (E, r, 2*I) -> ``base_layer.lora_A.weight``  (r*E, 2*I)  reshape
+        input projection (``gate_up_proj`` or ``up_proj``; inner wrapper, HAS
+        ``base_layer.`` prefix):
+          - ``lora_gate_and_up_B``  (E, r, U) -> ``base_layer.lora_A.weight``  (r*E, U)  reshape
           - ``lora_gate_and_up_A``  (E, H, r)   -> ``base_layer.lora_B.weight``  (H, r*E)    permute+reshape
 
         Returns:
@@ -285,7 +299,7 @@ class MoESplitExpertsStateDictMixin:
 
         prefix = match.group(1)
         layer_num = match.group(2)
-        expert_segment = self._expert_path_segment
+        expert_segment = self._v5_peft_hf_expert_path_segment()
         suffix = fqn.rsplit(".", 1)[-1]
 
         # PEFT ParamWrapper nesting: target_parameters are sorted alphabetically
@@ -321,18 +335,18 @@ class MoESplitExpertsStateDictMixin:
         ParamWrapper-format keys and converts them back to the 3-D grouped
         tensors expected by GroupedExpertsLoRA.
 
-        Reverse transforms (down_proj is outer, gate_up_proj is inner):
+        Reverse transforms (down_proj is outer, the input projection is inner):
           - ``experts.lora_A.weight``            (r*E, H)   -> (E, r, H)    = lora_down_B
           - ``experts.lora_B.weight``            (I, r*E)   -> (E, I, r)    = lora_down_A
           - ``experts.base_layer.lora_A.weight`` (r*E, 2*I) -> (E, r, 2*I)  = lora_gate_and_up_B
           - ``experts.base_layer.lora_B.weight`` (H, r*E)   -> (E, H, r)    = lora_gate_and_up_A
         """
-        expert_segment = re.escape(self._expert_path_segment)
+        hf_expert_segment = re.escape(self._v5_peft_hf_expert_path_segment())
         n_experts = self.moe_config.n_routed_experts
 
         # Detect ParamWrapper keys
         pw_pattern = re.compile(
-            rf"(?P<prefix>.*)layers\.(?P<layer>\d+)\.{expert_segment}\."
+            rf"(?P<prefix>.*)layers\.(?P<layer>\d+)\.{hf_expert_segment}\."
             rf"(?P<pw_suffix>(?:base_layer\.)?lora_[AB]\.weight)$"
         )
 
@@ -806,12 +820,16 @@ class MoESplitExpertsStateDictMixin:
         # rebuild path: never mark these keys in-place-loaded when ``quantization`` is set.
         quantization = kwargs.get("quantization", False)
 
-        # GroupedExpertsTE (backend.experts == "te") exposes gate_and_up_projs/down_projs as a
-        # torch.stack COPY of TE's per-expert weight{i} params; it does not alias the model's
-        # grouped storage, so an in-place copy_ would write that throwaway buffer and leave the TE
-        # experts at their initial values. Force the rebuild path for it. Other expert backends
-        # keep a real aliasing stacked Parameter and are unaffected.
-        experts_alias_grouped_storage = getattr(getattr(self, "backend", None), "experts", None) != "te"
+        # GroupedExpertsTE (backend.experts == "te") exposes both virtual grouped tensors as
+        # torch.stack copies, so neither can be loaded through in-place views. GroupedExpertsMoK
+        # keeps separate contiguous gate/up parameters and exposes gate_and_up_projs through a
+        # torch.cat copy; its down_projs is still an aliasing transpose view. Treat the two native
+        # keys independently so MoK rebuilds gate/up during from_hf without giving up the
+        # zero-copy down-projection load.
+        backend = getattr(self, "backend", None)
+        grouped_storage_aliases = getattr(backend, "experts", None) != "te"
+        gate_up_storage_aliases = grouped_storage_aliases and getattr(backend, "dispatcher", None) != "mok"
+        down_storage_aliases = grouped_storage_aliases
 
         from nemo_automodel.components.moe.state_dict_utils import (
             is_dtensor,
@@ -831,7 +849,7 @@ class MoESplitExpertsStateDictMixin:
                 and len(splits) > 0
                 and not is_dtensor(splits[0])
                 and not quantization
-                and experts_alias_grouped_storage
+                and gate_up_storage_aliases
             )
             if inplace_ok:
                 self._register_inplace_loaded_key(fqn, prefix_override)
@@ -879,7 +897,7 @@ class MoESplitExpertsStateDictMixin:
                 and len(splits) > 0
                 and not is_dtensor(splits[0])
                 and not quantization
-                and experts_alias_grouped_storage
+                and down_storage_aliases
             )
             if inplace_ok:
                 self._register_inplace_loaded_key(fqn, prefix_override)

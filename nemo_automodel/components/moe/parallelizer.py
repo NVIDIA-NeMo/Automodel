@@ -39,6 +39,7 @@ from nemo_automodel.components.moe.layers import (
     Gate,
     MoE,
 )
+from nemo_automodel.components.moe.mok_experts import GroupedExpertsMoK
 from nemo_automodel.components.moe.tp_plan_validation import _validate_moe_tp_plan
 from nemo_automodel.shared.model_utils import iter_transformer_and_mtp_blocks
 from nemo_automodel.shared.multimodal_fsdp import (
@@ -54,6 +55,9 @@ from nemo_automodel.shared.multimodal_fsdp import (
 from nemo_automodel.shared.tied_weights import ensure_tied_lm_head
 from nemo_automodel.shared.torch_patches import (
     patch_fsdp_accumulated_grad_guard as _patch_fsdp_accumulated_grad_guard,
+)
+from nemo_automodel.shared.torch_patches import (
+    patch_fsdp_uniform_reduce_dtype as _patch_fsdp_uniform_reduce_dtype,
 )
 from nemo_automodel.shared.utils import dtype_from_str
 
@@ -255,7 +259,7 @@ class ExpertParallel(ParallelStyle):
             dist_param.requires_grad = param.requires_grad
             module.register_parameter(name, dist_param)
 
-        if isinstance(module, GroupedExpertsDeepEP):
+        if isinstance(module, (GroupedExpertsDeepEP, GroupedExpertsMoK)):
             module.init_token_dispatcher(ep_mesh=device_mesh)
 
     def _apply(self, module: nn.Module, device_mesh: DeviceMesh) -> nn.Module:
@@ -618,6 +622,10 @@ def apply_fsdp(
     # but trainable multimodal towers still get standalone FSDP units. Install
     # the same lazy-state guard as dense FSDP for modality-free batches.
     _patch_fsdp_accumulated_grad_guard()
+    # ``moe/fsdp_mixin`` drives post-backward by hand under pipeline parallelism,
+    # so a group can reach the reduction holding both reduce-dtype accumulations
+    # and a param-dtype gradient that arrived after its last no-sync reduction.
+    _patch_fsdp_uniform_reduce_dtype()
 
     if isinstance(lm_head_precision, str):
         lm_head_precision = dtype_from_str(lm_head_precision, default=None)
@@ -1052,3 +1060,9 @@ def parallelize_model(
             wrap_outer_model=wrap_outer_model,
             frozen_multimodal_sharding=frozen_multimodal_sharding,
         )
+        if cp_enabled:
+            configured_units = parallelizer_utils.configure_fsdp_unused_param_reduction(model)
+            logger.info(
+                "Enabled unused-parameter reduce-scatter on %d MoE FSDP units for context parallelism",
+                configured_units,
+            )

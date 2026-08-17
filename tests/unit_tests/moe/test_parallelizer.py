@@ -422,6 +422,7 @@ def _import_parallelizer_with_stubs(monkeypatch):
         fully_shard_fn(module, **kwargs)
 
     parallelizer_utils_stub.fully_shard_by_dtype = fully_shard_by_dtype
+    parallelizer_utils_stub.configure_fsdp_unused_param_reduction = lambda module: 0
     monkeypatch.setitem(
         sys.modules,
         "nemo_automodel.components.distributed.parallelizer_utils",

@@ -19,6 +19,7 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 import torch.nn as nn
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
 
 from nemo_automodel.components.optim.optimizer import (
     AdamConfig,
@@ -485,6 +486,19 @@ class TestParamGroupOverrides:
         assert groups["default"]["lr"] == pytest.approx(1e-3)
         # default group is placed first so base-LR detection reads the unscaled lr.
         assert opt.param_groups[0]["lr"] == pytest.approx(1e-3)
+
+    def test_group_pattern_matches_canonical_name_through_checkpoint_wrapper(self):
+        model = _RouterModel()
+        router_weight = model.router.weight
+        model.router = checkpoint_wrapper(model.router)
+
+        opt = AdamWConfig(
+            lr=1e-3,
+            param_group_overrides=[ParamGroupOverride(r"^router\.weight$", lr_mult=0.1)],
+        ).build(model)[0]
+
+        override_group = next(group for group in opt.param_groups if group.get("lr_mult") == 0.1)
+        assert override_group["params"] == [router_weight]
 
     def test_non_matching_pattern_dropped(self, caplog):
         with caplog.at_level("WARNING"):

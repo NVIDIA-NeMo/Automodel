@@ -63,6 +63,7 @@ except (ImportError, ModuleNotFoundError):
 
 from nemo_automodel.components.distributed.activation_checkpointing import (
     SELECTIVE_AC_WRAPPER_FLAG,
+    apply_full_layer_checkpointing_to_layers,
     apply_selective_checkpointing_to_layers,
     apply_submodule_checkpointing,
     detect_kv_sharing_and_maybe_disable_cache,
@@ -405,15 +406,18 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
                         if m is not None:
                             setattr(layer, attr, checkpoint_wrapper(m, checkpoint_impl=CheckpointImpl.NO_REENTRANT))
             else:
-                if _should_use_hf_native_gradient_checkpointing(
-                    model,
-                    layer_groups,
-                    ac_scopes,
-                    enable_compile=enable_compile,
+                if (
+                    _should_use_hf_native_gradient_checkpointing(
+                        model,
+                        layer_groups,
+                        ac_scopes,
+                        enable_compile=enable_compile,
+                    )
+                    and not _has_kv_sharing
                 ):
-                    # Reentrant HF checkpointing reruns FSDP2 forward hooks during backward and can retrigger
-                    # explicit forward-prefetch chains, issuing duplicate parameter all-gathers.
-                    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+                    # Work around a PyTorch FSDP2 bug that skips mixed-precision input casts during
+                    # checkpoint recomputation. Remove when the minimum PyTorch version is 2.13.
+                    apply_full_layer_checkpointing_to_layers(model, ac_layers)
                 else:
                     apply_submodule_checkpointing(ac_layers, _has_kv_sharing)
 
@@ -458,6 +462,14 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
         if root_ignored_params is not None:
             root_kwargs["ignored_params"] = root_ignored_params
         model = fully_shard_fn(model, **root_kwargs)
+
+        cp_enabled = "cp" in device_mesh.mesh_dim_names and device_mesh["cp"].size() > 1
+        if cp_enabled:
+            configured_units = parallelizer_utils.configure_fsdp_unused_param_reduction(model)
+            logger.info(
+                "Enabled unused-parameter reduce-scatter on %d FSDP units for context parallelism",
+                configured_units,
+            )
 
         return model
 

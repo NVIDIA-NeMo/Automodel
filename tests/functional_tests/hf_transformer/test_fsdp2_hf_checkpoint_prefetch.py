@@ -32,6 +32,7 @@ from torch.utils.checkpoint import checkpoint
 from transformers.modeling_layers import GradientCheckpointingLayer
 
 from nemo_automodel.components.distributed.parallelizer import DefaultParallelizationStrategy
+from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 
 _WORLD_SIZE = 2
 _NUM_LAYERS = 4
@@ -45,6 +46,7 @@ class _HFCheckpointLayer(GradientCheckpointingLayer):
         super().__init__()
         self.up = nn.Linear(_HIDDEN_SIZE, 2 * _HIDDEN_SIZE)
         self.down = nn.Linear(2 * _HIDDEN_SIZE, _HIDDEN_SIZE)
+        self.observed_dtypes: list[torch.dtype] = []
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Apply a residual MLP.
@@ -55,6 +57,7 @@ class _HFCheckpointLayer(GradientCheckpointingLayer):
         Returns:
             Tensor of shape [batch, sequence, hidden].
         """
+        self.observed_dtypes.append(hidden_states.dtype)
         return hidden_states + self.down(torch.nn.functional.silu(self.up(hidden_states)))
 
 
@@ -144,7 +147,7 @@ def _worker(rank: int, port: int) -> None:
     try:
         torch.manual_seed(1234)
         model = _TinyHFModel().cuda(rank)
-        reference = copy.deepcopy(model)
+        reference = copy.deepcopy(model).to(torch.bfloat16)
         mesh = init_device_mesh(
             "cuda",
             (1, _WORLD_SIZE, 1),
@@ -166,7 +169,7 @@ def _worker(rank: int, port: int) -> None:
             model=model,
             device_mesh=mesh,
             mp_policy=MixedPrecisionPolicy(
-                param_dtype=torch.float32,
+                param_dtype=torch.bfloat16,
                 reduce_dtype=torch.float32,
                 output_dtype=torch.float32,
             ),
@@ -177,26 +180,42 @@ def _worker(rank: int, port: int) -> None:
             reshard_after_forward=True,
         )
 
+        assert all(parameter.dtype == torch.float32 for parameter in model.parameters())
+        assert set(model.state_dict()) == set(reference.state_dict())
         for layer in model.model.layers:
-            assert layer._gradient_checkpointing_func.keywords["use_reentrant"] is False
+            assert hasattr(layer, "_checkpoint_wrapped_module")
+            assert not hasattr(layer._checkpoint_wrapped_module, "_gradient_checkpointing_func")
 
         torch.manual_seed(5678)
         inputs = torch.randn(2, 4, _HIDDEN_SIZE, device=rank)
 
         phase["name"] = "forward"
-        output = model(inputs)
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            output = model(inputs)
         phase["name"] = "backward"
         output.sum().backward()
         phase["name"] = "done"
 
-        reference_output = reference(inputs)
+        assert all(
+            layer._checkpoint_wrapped_module.observed_dtypes == [torch.bfloat16, torch.bfloat16]
+            for layer in model.model.layers
+        )
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            reference_output = reference(inputs.to(torch.bfloat16)).float()
         reference_output.sum().backward()
 
         assert all_gather_counts == {"forward": _NUM_LAYERS + 1, "backward": _NUM_LAYERS}
-        torch.testing.assert_close(output, reference_output)
+        torch.testing.assert_close(output, reference_output, rtol=1e-2, atol=1e-2)
         reference_parameters = dict(reference.named_parameters())
         for name, parameter in model.named_parameters():
-            torch.testing.assert_close(_full_gradient(parameter), reference_parameters[name].grad)
+            reference_name = canonical_parameter_fqn(name)
+            torch.testing.assert_close(
+                _full_gradient(parameter),
+                reference_parameters[reference_name].grad,
+                rtol=1e-2,
+                atol=1e-2,
+                check_dtype=False,
+            )
     finally:
         FSDPParamGroup.unshard = original_unshard
         dist.destroy_process_group()

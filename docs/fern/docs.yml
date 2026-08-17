@@ -18,6 +18,13 @@ title: NVIDIA NeMo AutoModel
 # js / css) intentionally do NOT appear below.
 global-theme: nvidia
 
+# NVIDIA green (#76B900) does not meet WCAG AA contrast for normal text on
+# white. Keep the brand hue while using accessible light and dark variants.
+colors:
+  accent-primary:
+    light: "#418326"
+    dark: "#ADFF8C"
+
 # Override only the `right-text` slot of the theme's logo; SVG paths, height,
 # href stay inherited from the global theme. Same pattern as NeMo Curator.
 logo:
@@ -186,6 +193,8 @@ redirects:
     destination: "/nemo/automodel/nightly/model-coverage/large-language-models/qwen/qwen3-moe"
   - source: "/nemo/automodel/nightly/model-coverage/large-language-models/qwen3-next"
     destination: "/nemo/automodel/nightly/model-coverage/large-language-models/qwen/qwen3-next"
+  - source: "/nemo/automodel/nightly/model-coverage/large-language-models/qwen/qwen3-8-max"
+    destination: "/nemo/automodel/nightly/model-coverage/large-language-models/qwen/qwen3-8-2-4t-a95b"
   - source: "/nemo/automodel/nightly/model-coverage/large-language-models/seed-bytedance"
     destination: "/nemo/automodel/nightly/model-coverage/large-language-models/bytedance-seed/seed-bytedance"
   - source: "/nemo/automodel/nightly/model-coverage/large-language-models/solar-pro"

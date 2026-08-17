@@ -37,6 +37,7 @@ from nemo_automodel.components.checkpoint.utils import (
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
+from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.recipes.base_recipe import BaseRecipe, is_distributed_stateful
 
 try:
@@ -88,6 +89,8 @@ def _patch_checkpoint_ops(monkeypatch):
             self.lifecycle = CheckpointLifecycle(config=config, process_group=process_group)
             self.distributed_saves = []
             self.distributed_loads = []
+            self.global_rank_saves = []
+            self.global_rank_loads = []
             self.staging_waits = 0
 
         def save_model(
@@ -150,14 +153,27 @@ def _patch_checkpoint_ops(monkeypatch):
             self.staging_waits += 1
 
         def save_on_dp_ranks(self, state, state_name, path):
-            """Save stateful object (e.g., dataloader, rng)."""
+            """Save data-parallel-scoped state such as a dataloader."""
             state_dir = os.path.join(path, state_name)
             os.makedirs(state_dir, exist_ok=True)
             if self.tp_rank == 0 and self.pp_rank == 0:
                 torch.save(state.state_dict(), os.path.join(state_dir, f"{state_name}.pt"))
 
         def load_on_dp_ranks(self, state, state_name, path):
-            """Load stateful object (e.g., dataloader, rng)."""
+            """Load data-parallel-scoped state such as a dataloader."""
+            state_dir = os.path.join(path, state_name)
+            state.load_state_dict(torch.load(os.path.join(state_dir, f"{state_name}.pt"), weights_only=False))
+
+        def save_on_global_ranks(self, state, state_name, path):
+            """Save state unique to each global process rank."""
+            self.global_rank_saves.append((state_name, path))
+            state_dir = os.path.join(path, state_name)
+            os.makedirs(state_dir, exist_ok=True)
+            torch.save(state.state_dict(), os.path.join(state_dir, f"{state_name}.pt"))
+
+        def load_on_global_ranks(self, state, state_name, path):
+            """Load state unique to each global process rank."""
+            self.global_rank_loads.append((state_name, path))
             state_dir = os.path.join(path, state_name)
             state.load_state_dict(torch.load(os.path.join(state_dir, f"{state_name}.pt"), weights_only=False))
 
@@ -423,6 +439,19 @@ def test_distributed_stateful_routes_through_distributed_checkpointing(tmp_path)
     assert torch.allclose(recipe_inst.distributed_state.foo, saved_foo)
     assert recipe_inst.checkpointer.distributed_saves == [("distributed_state", ckpt_dir)]
     assert recipe_inst.checkpointer.distributed_loads == [("distributed_state", ckpt_dir)]
+
+
+def test_ranked_rng_routes_through_global_rank_checkpointing(tmp_path):
+    """BaseRecipe saves and loads ranked RNG state through the global-rank helpers."""
+    recipe_inst = _ToyRecipe(tmp_path)
+    recipe_inst.rng = StatefulRNG(seed=42, ranked=True)
+
+    recipe_inst.save_checkpoint(epoch=0, step=10, train_loss=1.0)
+    recipe_inst.load_checkpoint(restore_from="LATEST")
+
+    ckpt_dir = str(tmp_path / "epoch_0_step_10")
+    assert recipe_inst.checkpointer.global_rank_saves == [("rng", ckpt_dir)]
+    assert recipe_inst.checkpointer.global_rank_loads == [("rng", ckpt_dir)]
 
 
 @pytest.mark.parametrize("wait_for_staging", [False, True])
