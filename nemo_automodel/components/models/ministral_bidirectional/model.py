@@ -25,6 +25,7 @@ from transformers.models.ministral3.modeling_ministral3 import Ministral3Model
 from transformers.models.mistral3.configuration_mistral3 import Mistral3Config
 from transformers.models.mistral3.modeling_mistral3 import (
     Mistral3Model,
+    Mistral3MultiModalProjector,
     Mistral3PreTrainedModel,
 )
 from transformers.utils import logging
