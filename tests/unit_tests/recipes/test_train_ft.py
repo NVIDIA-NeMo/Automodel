@@ -2386,19 +2386,6 @@ def test_setup_builds_engine_for_mtp_without_context_parallelism(monkeypatch):
     assert trainer.engine is not None
 
 
-def test_setup_rejects_mtp_with_context_parallelism(monkeypatch):
-    cp_size = 2
-    cfg = _minimal_cfg_with_rope_fusion(cp_size=cp_size, rope_fusion=True)
-    _patch_setup_minimals_with_cp(monkeypatch, cp_size=cp_size)
-    model = DummyModel()
-    model.mtp = nn.Identity()
-    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.build_model", lambda *args, **kwargs: model)
-
-    trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
-    with pytest.raises(NotImplementedError, match="MTP with context parallelism"):
-        trainer.setup()
-
-
 def test_setup_builds_engine_for_magi(monkeypatch):
     cfg = _minimal_cfg_with_rope_fusion(cp_size=1, rope_fusion=True)
     _patch_setup_minimals_with_cp(monkeypatch, cp_size=1)

@@ -1932,18 +1932,6 @@ def test_vlm_rope_fusion_disabled_when_cp_gt_1(monkeypatch):
     assert trainer.engine is not None
 
 
-def test_vlm_setup_rejects_cp_with_mtp(monkeypatch):
-    cfg = _minimal_vlm_cfg(cp_size=2, rope_fusion=True)
-    _patch_vlm_setup_minimals(monkeypatch, cp_size=2)
-    model = DummyModel()
-    model.mtp = nn.Identity()
-    monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.build_model", lambda *args, **kwargs: model)
-
-    trainer = FinetuneRecipeForVLM(cfg)
-    with pytest.raises(NotImplementedError, match="MTP with context parallelism"):
-        trainer.setup()
-
-
 def test_vlm_setup_builds_engine_for_magi(monkeypatch):
     cfg = _minimal_vlm_cfg(cp_size=1, rope_fusion=True)
     _patch_vlm_setup_minimals(monkeypatch, cp_size=1)

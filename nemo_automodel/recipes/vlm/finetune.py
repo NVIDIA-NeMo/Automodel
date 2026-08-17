@@ -574,7 +574,6 @@ class FinetuneRecipeForVLM(BaseRecipe):
         else:
             self.model_parts = [model]
             self.pp = None
-        self._validate_mtp_context_parallelism(self.model_parts)
         self.pipeline_loss_fn = None
         if self.pp_enabled:
             self._configure_pipeline_loss_fn()

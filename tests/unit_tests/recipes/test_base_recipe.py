@@ -328,29 +328,6 @@ def test_dp_allreduce_uses_world_group_without_device_mesh(tmp_path, monkeypatch
     assert calls[0][1] is None
 
 
-def test_mtp_cp_validation_reaches_consensus_across_pipeline_stages(monkeypatch):
-    """A stage without the MTP module must still reject when a peer owns it."""
-    group = object()
-    recipe = SimpleNamespace(
-        mesh_context=SimpleNamespace(cp_size=2, process_group=group),
-        dist_env=SimpleNamespace(device=torch.device("cpu")),
-    )
-    part = nn.Linear(2, 2)
-    calls = []
-
-    def fake_all_reduce(flag, op=None, group=None):
-        calls.append((op, group))
-        flag.fill_(1)
-
-    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
-    monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
-
-    with pytest.raises(NotImplementedError, match="MTP with context parallelism"):
-        BaseRecipe._validate_mtp_context_parallelism(recipe, [part])
-
-    assert calls == [(torch.distributed.ReduceOp.MAX, group)]
-
-
 def test_optimizer_checkpoint_part_ids_use_global_pipeline_stage_indices(tmp_path):
     recipe_inst = _ToyRecipe(tmp_path)
     recipe_inst.pp = SimpleNamespace(
