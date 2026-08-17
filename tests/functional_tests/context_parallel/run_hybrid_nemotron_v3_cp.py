@@ -16,13 +16,14 @@
 """End-to-end hybrid NemotronV3 CP test.
 
 Validates that a hybrid model with interleaved attention and mamba layers
-produces matching outputs/gradients between CP=1 and CP=2 across four
+produces matching outputs/gradients between CP=1 and CP=N across five
 configurations:
 
   Config 1 (bshd_te):        3D BSHD input, TE p2p CP, DualChunkSwap
   Config 2 (thd_te):         2D THD input, TE p2p CP, DualChunkSwap, cu_seqlens
   Config 3 (thd_te_packed):  2D THD input, TE p2p CP, multi-sequence packing, seq_idx
   Config 4 (bshd_sdpa):      3D BSHD input, DTensor context_parallel(), SDPA backend
+  Config 5 (thd_te_mtp):     packed THD MTP loss, activations, gradients, optimizer step
 
 Usage:
     torchrun --nproc_per_node=2 tests/functional_tests/context_parallel/run_hybrid_nemotron_v3_cp.py
@@ -33,6 +34,8 @@ import sys
 
 import torch
 import torch.distributed as dist
+
+from nemo_automodel._transformers.models.common.mtp import shift_packed_tensor
 
 
 def dual_chunk_swap_unsplit(chunks_per_rank, cp_size, seq_dim=1):
@@ -62,7 +65,7 @@ class MockHybridConfig:
     values that avoid errors without activating MoE layers.
     """
 
-    def __init__(self):
+    def __init__(self, cp_size=2):
         # Attention config
         self.num_attention_heads = 8
         self.num_key_value_heads = 4
@@ -72,10 +75,13 @@ class MockHybridConfig:
         self.attention_dropout = 0.0
 
         # Mamba config
-        self.mamba_num_heads = 8
+        # Preserve the established 8-head CP=2/4 test topology. Odd CP sizes
+        # need a synthetic divisible topology to exercise the generic MTP path.
+        uses_default_mamba_topology = 8 % cp_size == 0
+        self.mamba_num_heads = 8 if uses_default_mamba_topology else 2 * cp_size
         self.mamba_head_dim = 32
         self.ssm_state_size = 16
-        self.n_groups = 2  # must be >= cp_size for non-replicated mode
+        self.n_groups = 2 if uses_default_mamba_topology else cp_size
         self.chunk_size = 256
         self.conv_kernel = 4
         self.use_conv_bias = True
@@ -104,14 +110,22 @@ class MockHybridConfig:
         self.mlp_hidden_act = "silu"
 
         # MoE config fields
-        self.n_routed_experts = 1
-        self.num_experts_per_tok = 1
+        self.n_routed_experts = 4
+        self.num_experts_per_tok = 2
         self.n_group = 1
         self.topk_group = 1
         self.routed_scaling_factor = 1.0
         self.moe_intermediate_size = self.intermediate_size
         self.norm_topk_prob = False
         self.moe_shared_expert_intermediate_size = self.intermediate_size
+
+        # MTP config: one native Nemotron depth (attention + MoE).
+        self.num_nextn_predict_layers = 1
+        self.mtp_hybrid_override_pattern = "*E"
+
+    def to_dict(self):
+        """Return the config fields expected by the Hugging Face-compatible wrapper."""
+        return vars(self)
 
 
 def _create_baseline_model(config, backend, device):
@@ -142,7 +156,8 @@ def _wire_te_cp(model, cp_group, config):
 
     from nemo_automodel.components.distributed.context_parallel.mamba import MambaContextParallel
 
-    for layer in model.layers.values():
+    layers = model.layers.values() if hasattr(model.layers, "values") else model.layers
+    for layer in layers:
         if layer.block_type == "mamba":
             mixer = layer.mixer
             mixer.cp = MambaContextParallel(
@@ -549,28 +564,347 @@ def run_bshd_sdpa(rank, world_size, device, config):
     )
 
 
+# ---------------------------------------------------------------------------
+# Config 5: THD + TE + packed MTP
+# ---------------------------------------------------------------------------
+def _gather_te_partition(local_tensor, local_indices, full_tokens, cp_group):
+    """Restore a tensor sharded with TE packed-CP indices to global order.
+
+    Args:
+        local_tensor: Per-rank tensor of shape [local_tokens, ...].
+        local_indices: Tensor of shape [local_tokens] containing global positions.
+        full_tokens: Global packed-token count.
+        cp_group: Context-parallel process group.
+
+    Returns:
+        Tensor of shape [full_tokens, ...] in global packed-token order.
+    """
+    cp_size = dist.get_world_size(group=cp_group)
+    gathered_tensors = [torch.empty_like(local_tensor) for _ in range(cp_size)]
+    gathered_indices = [torch.empty_like(local_indices) for _ in range(cp_size)]
+    dist.all_gather(gathered_tensors, local_tensor.contiguous(), group=cp_group)
+    dist.all_gather(gathered_indices, local_indices.contiguous(), group=cp_group)
+    output = local_tensor.new_empty((full_tokens, *local_tensor.shape[1:]))
+    for indices, tensor in zip(gathered_indices, gathered_tensors):
+        output.index_copy_(0, indices.to(torch.long), tensor)
+    return output
+
+
+def _create_mtp_model(config, backend, device):
+    """Create a synchronized causal LM with its native Nemotron MTP head."""
+    from nemo_automodel._transformers.models.nemotron_v3.model import NemotronHForCausalLM
+
+    model = NemotronHForCausalLM(config, backend=backend).to(device=device, dtype=torch.bfloat16)
+    model.initialize_weights(buffer_device=device, dtype=torch.bfloat16)
+    model.train()
+    for parameter in model.parameters():
+        dist.broadcast(parameter.data, src=0)
+    return model
+
+
+def run_thd_te_mtp(rank, world_size, device, config):
+    """Config 5: packed THD MTP CP=1/CP=N numerical training parity."""
+    import transformer_engine.pytorch  # noqa: F401
+    import transformer_engine_torch as tex
+    from torch.distributed.device_mesh import init_device_mesh
+
+    from nemo_automodel._transformers.models.common import BackendConfig
+    from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+    from nemo_automodel.components.loss.mtp import calculate_mtp_loss
+
+    backend = BackendConfig(
+        linear="torch",
+        attn="te",
+        rms_norm="torch",
+        experts="torch",
+        dispatcher="torch",
+        fake_balanced_gate=False,
+        enable_hf_state_dict_adapter=False,
+    )
+    model_baseline = _create_mtp_model(config, backend, device)
+
+    # Two unequal documents expose both packed-document boundaries and TE's
+    # head/tail CP partition boundaries. Each length remains divisible by
+    # 2 * CP, so unequal sequence lengths must still contribute the same
+    # aggregate token count to every rank.
+    # TE's DualChunkSwap needs each packed sequence divisible by 2 * CP.
+    # Keeping 32 aggregate tokens per rank also gives every tested size the
+    # same amount of local work (12 from the first document, 20 from the second).
+    seq_len_a = 12 * world_size
+    seq_len_b = 20 * world_size
+    total_len = seq_len_a + seq_len_b
+    cu_seqlens = torch.tensor([0, seq_len_a, total_len], dtype=torch.int32, device=device)
+    seq_idx = torch.repeat_interleave(
+        torch.arange(2, dtype=torch.int32, device=device),
+        torch.tensor([seq_len_a, seq_len_b], device=device),
+    )
+    position_ids = torch.cat([torch.arange(seq_len_a, device=device), torch.arange(seq_len_b, device=device)])
+
+    torch.manual_seed(2026)
+    input_ids = torch.randint(0, config.vocab_size, (1, total_len), device=device)
+    dist.broadcast(input_ids, src=0)
+
+    # SALM labels are already next-token targets. MTP depth 1 therefore needs
+    # one additional global shift, with the final two positions in each
+    # document ignored.
+    seq_idx_batched = seq_idx.unsqueeze(0)
+    labels_full = shift_packed_tensor(input_ids, depth=1, seq_idx=seq_idx_batched, fill_value=-100).squeeze(0)
+    mtp_targets_full = shift_packed_tensor(
+        labels_full.unsqueeze(0), depth=1, seq_idx=seq_idx_batched, fill_value=-100
+    ).squeeze(0)
+    mtp_position_ids_full = shift_packed_tensor(
+        position_ids.unsqueeze(0),
+        depth=1,
+        seq_idx=seq_idx_batched,
+    ).squeeze(0)
+    num_label_tokens = int((labels_full != -100).sum().item())
+    max_seqlen = torch.tensor(max(seq_len_a, seq_len_b), dtype=torch.int32, device=device)
+
+    embeddings_full = model_baseline.model.embed_tokens(input_ids).squeeze(0)
+    mtp_embeddings_full = shift_packed_tensor(
+        embeddings_full.unsqueeze(0),
+        depth=1,
+        seq_idx=seq_idx_batched,
+    ).squeeze(0)
+    output_baseline = model_baseline(
+        None,
+        mtp_embeddings_full,
+        inputs_embeds=embeddings_full,
+        position_ids=position_ids,
+        mtp_per_depth_position_ids=(mtp_position_ids_full,),
+        qkv_format="thd",
+        cu_seqlens=cu_seqlens,
+        max_seqlen=max_seqlen,
+        cp_rank=0,
+        cp_size=1,
+    )
+    mtp_hidden_baseline = output_baseline.mtp_per_depth_h[0].squeeze(0)
+    loss_fn = MaskedCrossEntropy(reduction="sum")
+    mtp_loss_baseline = calculate_mtp_loss(
+        loss_fn,
+        mtp_per_depth_h=output_baseline.mtp_per_depth_h,
+        mtp_per_depth_targets=(mtp_targets_full,),
+        labels=labels_full,
+        model=model_baseline,
+        scaling_factor=1.0,
+        num_label_tokens=num_label_tokens,
+    )
+    mtp_loss_baseline.backward()
+
+    selected_names = (
+        "model.embed_tokens.weight",
+        "lm_head.weight",
+        "mtp.layers.0.eh_proj.weight",
+        "mtp.layers.0.mixer.q_proj.weight",
+    )
+    baseline_params = dict(model_baseline.named_parameters())
+    baseline_grads = {name: baseline_params[name].grad.detach().clone() for name in selected_names}
+    baseline_before_step = {name: baseline_params[name].detach().clone() for name in selected_names}
+
+    model_cp = _create_mtp_model(config, backend, device)
+    model_cp.load_state_dict(model_baseline.state_dict())
+    model_cp.zero_grad(set_to_none=True)
+    cp_mesh = init_device_mesh("cuda", (world_size,), mesh_dim_names=("cp",))
+    cp_group = cp_mesh["cp"].get_group()
+    _wire_te_cp(model_cp.model, cp_group, config)
+    _wire_te_cp(model_cp.mtp, cp_group, config)
+
+    local_indices = tex.thd_get_partitioned_indices(cu_seqlens, total_len, world_size, rank).to(torch.long)
+    local_token_count = torch.tensor(local_indices.numel(), dtype=torch.int64, device=device)
+    token_counts = [torch.empty_like(local_token_count) for _ in range(world_size)]
+    dist.all_gather(token_counts, local_token_count, group=cp_group)
+    token_counts = [int(count.item()) for count in token_counts]
+    if len(set(token_counts)) != 1:
+        raise AssertionError(f"TE packed CP assigned unequal aggregate token counts across ranks: {token_counts}")
+    if token_counts[0] != total_len // world_size:
+        raise AssertionError(
+            f"TE packed CP assigned {token_counts[0]} tokens per rank; expected {total_len // world_size}"
+        )
+    embeddings_cp_full = model_cp.model.embed_tokens(input_ids).squeeze(0)
+    mtp_embeddings_cp_full = shift_packed_tensor(
+        embeddings_cp_full.unsqueeze(0),
+        depth=1,
+        seq_idx=seq_idx_batched,
+    ).squeeze(0)
+    embeddings_local = embeddings_cp_full.index_select(0, local_indices)
+    mtp_embeddings_local = mtp_embeddings_cp_full.index_select(0, local_indices)
+    position_ids_local = position_ids.index_select(0, local_indices)
+    mtp_position_ids_local = mtp_position_ids_full.index_select(0, local_indices)
+    labels_local = labels_full.index_select(0, local_indices)
+    mtp_targets_local = mtp_targets_full.index_select(0, local_indices)
+
+    output_cp = model_cp(
+        None,
+        mtp_embeddings_local,
+        inputs_embeds=embeddings_local,
+        position_ids=position_ids_local,
+        mtp_per_depth_position_ids=(mtp_position_ids_local,),
+        qkv_format="thd",
+        cu_seqlens=cu_seqlens,
+        max_seqlen=max_seqlen,
+        cp_rank=rank,
+        cp_size=world_size,
+    )
+    mtp_loss_cp = calculate_mtp_loss(
+        loss_fn,
+        mtp_per_depth_h=output_cp.mtp_per_depth_h,
+        mtp_per_depth_targets=(mtp_targets_local,),
+        labels=labels_local,
+        model=model_cp,
+        scaling_factor=1.0,
+        num_label_tokens=num_label_tokens,
+    )
+    mtp_loss_cp.backward()
+
+    mtp_hidden_cp = _gather_te_partition(
+        output_cp.mtp_per_depth_h[0].squeeze(0).detach(),
+        local_indices,
+        total_len,
+        cp_group,
+    )
+    logits_cp = _gather_te_partition(
+        output_cp.logits.squeeze(0).detach(),
+        local_indices,
+        total_len,
+        cp_group,
+    )
+    targets_cp = _gather_te_partition(mtp_targets_local, local_indices, total_len, cp_group)
+    mtp_loss_cp_global = mtp_loss_cp.detach().clone()
+    dist.all_reduce(mtp_loss_cp_global, op=dist.ReduceOp.SUM, group=cp_group)
+
+    for parameter in model_cp.parameters():
+        if parameter.grad is not None:
+            dist.all_reduce(parameter.grad, op=dist.ReduceOp.SUM, group=cp_group)
+
+    cp_params = dict(model_cp.named_parameters())
+
+    logits_baseline = output_baseline.logits.squeeze(0).detach()
+    if rank == 0:
+        logits_diff = (logits_cp - logits_baseline).abs()
+        hidden_diff = (mtp_hidden_cp - mtp_hidden_baseline.detach()).abs()
+        logits_cosine = torch.nn.functional.cosine_similarity(
+            logits_cp.float().flatten(), logits_baseline.float().flatten(), dim=0
+        )
+        hidden_cosine = torch.nn.functional.cosine_similarity(
+            mtp_hidden_cp.float().flatten(), mtp_hidden_baseline.detach().float().flatten(), dim=0
+        )
+        print("\n" + "=" * 70)
+        print("Config: thd_te_mtp - packed Nemotron MTP training parity")
+        print("=" * 70)
+        print(f"Targets: exact global reconstruction = {torch.equal(targets_cp, mtp_targets_full)}")
+        print(
+            f"Backbone logits diff - mean: {logits_diff.mean().item():.6f}, "
+            f"max: {logits_diff.max().item():.6f}, cosine: {logits_cosine.item():.8f}"
+        )
+        print(
+            f"MTP hidden diff - mean: {hidden_diff.mean().item():.6f}, "
+            f"max: {hidden_diff.max().item():.6f}, cosine: {hidden_cosine.item():.8f}"
+        )
+        print(f"MTP loss: CP={mtp_loss_cp_global.item():.6f}, baseline={mtp_loss_baseline.detach().item():.6f}")
+        for name in selected_names:
+            grad_diff = (cp_params[name].grad - baseline_grads[name]).abs()
+            print(f"Grad {name} - mean: {grad_diff.mean().item():.6f}, max: {grad_diff.max().item():.6f}")
+    try:
+        torch.testing.assert_close(targets_cp, mtp_targets_full, rtol=0, atol=0)
+        torch.testing.assert_close(
+            logits_cp,
+            logits_baseline,
+            rtol=2e-2,
+            atol=5e-2,
+            msg="CP backbone logits differ from CP=1",
+        )
+        torch.testing.assert_close(
+            mtp_hidden_cp,
+            mtp_hidden_baseline.detach(),
+            rtol=2e-2,
+            # BF16 P2P accumulation error grows slightly with CP rank count;
+            # loss and gradient parity below provide stricter end-result checks.
+            atol=1.25e-1,
+            msg="CP MTP hidden states differ from CP=1",
+        )
+        torch.testing.assert_close(
+            mtp_loss_cp_global,
+            mtp_loss_baseline.detach(),
+            rtol=2e-2,
+            atol=3e-2,
+            msg="global CP MTP loss differs from CP=1",
+        )
+        for name in selected_names:
+            torch.testing.assert_close(
+                cp_params[name].grad,
+                baseline_grads[name],
+                rtol=5e-2,
+                atol=1e-2,
+                msg=f"CP MTP gradient differs for {name}",
+            )
+
+        learning_rate = 0.25
+        torch.optim.SGD(model_baseline.parameters(), lr=learning_rate).step()
+        torch.optim.SGD(model_cp.parameters(), lr=learning_rate).step()
+        for name in selected_names:
+            before = baseline_before_step[name].float()
+            baseline_update = baseline_params[name].detach().float() - before
+            cp_update = cp_params[name].detach().float() - before
+            if not torch.count_nonzero(baseline_update):
+                raise AssertionError(f"baseline optimizer did not update {name}")
+            if not torch.count_nonzero(cp_update):
+                raise AssertionError(f"CP optimizer did not update {name}")
+            if rank == 0:
+                update_diff = (cp_update - baseline_update).abs()
+                print(
+                    f"Update {name} - mean diff: {update_diff.mean().item():.6f}, "
+                    f"max diff: {update_diff.max().item():.6f}"
+                )
+            # Compare update vectors, not final BF16 parameters. The old
+            # parameter atol (5e-2) exactly equaled learning_rate * old grad_atol
+            # (0.25 * 2e-1). The update atol below is also stricter than
+            # learning_rate * current grad_atol (0.25 * 1e-2 = 2.5e-3).
+            torch.testing.assert_close(
+                cp_update,
+                baseline_update,
+                rtol=5e-2,
+                atol=2e-3,
+                msg=f"CP optimizer update differs for {name}",
+            )
+    except AssertionError as error:
+        if rank == 0:
+            print(f"  thd_te_mtp: FAILED - {error}")
+        return 1
+
+    if rank == 0:
+        print("  PASSED")
+        print("=" * 70)
+    return 0
+
+
 def main():
     init_distributed()
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     device = torch.device(f"cuda:{rank}")
 
-    if world_size != 2:
+    if world_size < 2:
         if rank == 0:
-            print(f"ERROR: This test requires exactly 2 GPUs, got {world_size}", file=sys.stderr)
+            print(f"ERROR: This test requires at least 2 GPUs, got {world_size}", file=sys.stderr)
         sys.exit(1)
 
     torch.manual_seed(42)
     torch.cuda.manual_seed_all(42)
 
-    config = MockHybridConfig()
+    config = MockHybridConfig(cp_size=world_size)
 
     configs = {
         "bshd_te": lambda: run_bshd_te(rank, world_size, device, config),
         "thd_te": lambda: run_thd_te(rank, world_size, device, config),
         "thd_te_packed": lambda: run_thd_te_packed(rank, world_size, device, config),
         "bshd_sdpa": lambda: run_bshd_sdpa(rank, world_size, device, config),
+        "thd_te_mtp": lambda: run_thd_te_mtp(rank, world_size, device, config),
     }
+    requested_config = os.environ.get("NEMOTRON_CP_TEST_CONFIG")
+    if requested_config:
+        if requested_config not in configs:
+            raise ValueError(f"Unknown NEMOTRON_CP_TEST_CONFIG={requested_config!r}; choose from {tuple(configs)}")
+        configs = {requested_config: configs[requested_config]}
 
     results = {}
     for name, fn in configs.items():

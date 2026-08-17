@@ -29,6 +29,7 @@ from nemo_automodel._transformers.models.common.mtp.mtp import (
     MTPModule,
     get_mtp_loss_scaling_factor,
     roll_tensor,
+    shift_packed_tensor,
 )
 
 __all__ = [
@@ -36,4 +37,5 @@ __all__ = [
     "MTPModule",
     "get_mtp_loss_scaling_factor",
     "roll_tensor",
+    "shift_packed_tensor",
 ]

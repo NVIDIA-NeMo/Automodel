@@ -536,8 +536,23 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
         cp_mesh = device_mesh["cp"] if "cp" in device_mesh.mesh_dim_names else None
         if cp_mesh is not None and cp_mesh.size() > 1:
             cp_group = cp_mesh.get_group()
+            cp_global_ranks = torch.distributed.get_process_group_ranks(cp_group)
+            cp_layers = list(layers)
+            mtp_module = getattr(model, "mtp", None)
+            mtp_layers = getattr(mtp_module, "layers", None)
+            mtp_enabled = bool(getattr(getattr(model, "mtp_config", None), "enabled", False))
+            parallelizer_utils.reject_unsupported_mtp_cp_pp(model)
+            parallelizer_utils.reject_unsupported_mtp_cp(model)
+            if mtp_enabled and mtp_layers is None:
+                raise RuntimeError(
+                    "MTP is enabled but model.mtp.layers is unavailable; cannot configure context parallelism for MTP"
+                )
+            if mtp_enabled and mtp_layers is not None:
+                # MTP blocks live outside the backbone container but execute
+                # the same attention/Mamba CP collectives.
+                cp_layers.extend(mtp_layers)
 
-            for layer in layers:
+            for layer in cp_layers:
                 if hasattr(layer, "block_type") and layer.block_type == "mamba":
                     from nemo_automodel.components.distributed.context_parallel.mamba import MambaContextParallel
 
@@ -557,7 +572,7 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
                     if isinstance(attn_module, DotProductAttention):
                         attn_module.set_context_parallel_group(
                             cp_group,
-                            torch.distributed.get_process_group_ranks(cp_group),
+                            cp_global_ranks,
                             torch.cuda.Stream(),
                             cp_comm_type="p2p",
                         )
