@@ -1,6 +1,6 @@
 ---
 title: "Multi-Turn Agent (Tool-Calling) SFT with NeMo AutoModel"
-description: "End-to-end multi-turn, function-calling SFT on Qwen2.5-3B with the glaive_toolcall dataset"
+description: "End-to-end multi-turn, function-calling SFT on Qwen2.5-3B with the glaive_toolcall and SynthTraces datasets"
 position: 4
 ---
 
@@ -44,7 +44,7 @@ https://github.com/NVIDIA-NeMo/Automodel.git
 https://github.com/NVIDIA/NeMo.git
 ```
 
-The upstream generator currently defines repository names in `src/constants.ts` and constructs clone URLs in `src/pull.ts`. Update both locations in the fork so each matrix entry stores a complete owner and repository pair. Keep the generated Pi session files unchanged. Hugging Face converts those trace files into the OpenAI-format `messages` rows consumed by `make_agent_chat_dataset`.
+The upstream generator lists bare repository names in `src/constants.ts` (`TOP_HF_REPOS`) and hard-codes the owner when it builds the clone URL in `src/pull.ts`, which resolves every entry against `https://github.com/huggingface/<name>.git`. Because the NeMo repositories live under different owners, change both locations in your fork so each matrix entry carries a complete owner and repository pair and `pull.ts` uses that owner instead of the fixed one. Keep the generated Pi session files unchanged. Hugging Face converts those trace files into the OpenAI-format `messages` rows consumed by `make_agent_chat_dataset`.
 
 After configuring the matrix, install and prepare the generator:
 
@@ -56,7 +56,21 @@ npm install
 npm run pull
 ```
 
-Start the OpenAI-compatible llama.cpp server used by the user model, then generate a small validation batch before scaling up:
+The coding agent runs on the Hugging Face router, so export a token before generating. `src/single-session.ts` raises `HF_TOKEN is not set` without it:
+
+```bash
+export HF_TOKEN=<your-hugging-face-token>
+```
+
+The user model runs locally under llama.cpp. Serve the first entry of `LOCAL_MODELS` on the port the generator expects:
+
+```bash
+llama-server -hf ggml-org/Qwen3.6-27B-GGUF:Q8_0 --port 8080
+```
+
+`src/constants.ts` reads `LLAMA_BASE_URL` and falls back to `http://localhost:8080/v1`, so set that variable if you serve the model elsewhere. `src/generate.ts` always picks `LOCAL_MODELS[0]` as the user model, so serve that entry rather than another one from the list.
+
+With the server up, generate a small validation batch before scaling up:
 
 ```bash
 BATCH_SIZE=8 CONCURRENCY=2 node src/generate.ts
@@ -68,7 +82,36 @@ Upload the generated dataset with the current Hugging Face CLI:
 hf upload <owner>/<dataset> dataset . --repo-type dataset --exclude '.git/*'
 ```
 
-Point the SynthTraces recipe at that dataset by overriding `dataset.dataset_name` and `validation_dataset.dataset_name`. The dataset must expose parsed OpenAI-format rows through its normal dataset revision or through `refs/convert/parquet`.
+### Train on the Generated Traces
+
+Use the ready-made config at [`examples/llm_finetune/agent/qwen2_5_3b_synthtraces.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/agent/qwen2_5_3b_synthtraces.yaml). It reads `julien-c/synthtraces` through `refs/convert/parquet` and renders traces with [`qwen2_5_synthtraces_chat_template.jinja`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/agent/qwen2_5_synthtraces_chat_template.jinja):
+
+```bash
+automodel --nproc-per-node=8 examples/llm_finetune/agent/qwen2_5_3b_synthtraces.yaml 2>&1 | tee train_synthtraces.log
+```
+
+To train on your own generated dataset instead, override `dataset.dataset_name` and `validation_dataset.dataset_name`. The dataset must expose parsed OpenAI-format rows through its normal dataset revision or through `refs/convert/parquet`.
+
+A short run of this recipe produces training output in this shape:
+
+```text
+step  0 | epoch 0 | loss 1.2708 | grad_norm 3.0633 | lr 4.00e-06 | mem 34.45 GiB | tps 210.68/gpu  | num_label_tokens 4707
+step  6 | epoch 0 | loss 1.3184 | grad_norm 2.0623 | lr 9.52e-06 | mem 35.89 GiB | tps 2734.08/gpu | num_label_tokens 42963
+step  9 | epoch 0 | loss 1.1696 | grad_norm 1.6721 | lr 8.59e-06 | mem 48.55 GiB | tps 2075.14/gpu | num_label_tokens 38437
+step 10 | epoch 0 | loss 1.2296 | grad_norm 1.6987 | lr 8.19e-06 | mem 36.24 GiB | tps 830.26/gpu  | num_label_tokens 46638
+
+Updated LOWEST_VAL checkpoint symlink to epoch_0_step_29 (val_loss=1.1862)
+```
+
+<Warning>
+This recipe reports `loss` and `val_loss` only. It declares no `tool_call_eval` block, so none of the `tool_call/*` metrics described in [Monitor Training](#monitor-training) appear in its logs. Those metrics belong to the `glaive_toolcall` walkthrough below, which supplies the evaluator and the tool schema it scores against.
+
+</Warning>
+
+<Warning>
+The SynthTraces chat template renders assistant `reasoning_content` as `<think>` inside its `{% generation %}` block, and `mask_reasoning_content` defaults to `false`. Reasoning tokens therefore contribute to the loss, and the fine-tuned model learns to emit `<think>` blocks. In the published `julien-c/synthtraces` training split, roughly two-thirds of the traces carry reasoning content, so this is the common case rather than an edge case. Set `dataset.mask_reasoning_content: true` to keep reasoning in the prompt but out of the loss, or `dataset.drop_history_reasoning_content: true` to strip prior-turn reasoning from the prompt entirely.
+
+</Warning>
 
 <Note>
 Trace generation is intentionally maintained by the SynthTraces project. NeMo AutoModel consumes the generated traces and does not vendor the Pi runtime, llama.cpp server, or remote inference provider.
@@ -79,9 +122,11 @@ Trace generation is intentionally maintained by the SynthTraces project. NeMo Au
 
 Review the following hardware requirements:
 
-- **Full-parameter SFT**: The example below shards across 8 GPUs with FSDP2. Qwen2.5-3B can also train unsharded on a single 80 GB GPU because FSDP2 applies only across multiple GPUs.
+- **Full-parameter SFT**: Both recipes shard across 8 GPUs with FSDP2. Qwen2.5-3B can also train unsharded on a single 80 GB GPU because FSDP2 applies only across multiple GPUs.
 - **PEFT with LoRA**: You can train on a single GPU. See [Use PEFT with LoRA](#use-peft-with-lora).
-- **Dataset size**: The `glaive_toolcall_en` dataset contains a few thousand traces, so a full pass is fast.
+- **Dataset size**: Both datasets hold a few thousand traces, so a full pass is fast. SynthTraces traces are long multi-turn coding sessions, so its recipe uses `seq_length: 8192` against `4096` for `glaive_toolcall_en`.
+
+The rest of this guide walks through the `glaive_toolcall_en` recipe, which pairs a tool schema with a generation-based tool-call accuracy evaluator. The SynthTraces recipe covered in [Train on the Generated Traces](#train-on-the-generated-traces) shares the same adapter and training loop, but supplies no tool schema, so it reports `loss` and `val_loss` only.
 
 ---
 
@@ -278,7 +323,7 @@ tool_call_eval:
 `make_agent_chat_dataset` exposes three flags worth knowing for agent traces:
 
 - `train_on_last_turn_only`: Supervises only the final assistant turn (`mask_history`).
-- `mask_reasoning_content`: Renders assistant `reasoning_content` (thinking) into the prompt but excludes it from the loss.
+- `mask_reasoning_content`: Renders assistant `reasoning_content` (thinking) into the prompt but excludes it from the loss. Defaults to `false`, so a chat template that emits `reasoning_content` inside its `{% generation %}` block trains the model to reproduce that reasoning. The SynthTraces template does exactly this; see the warning in [Train on the Generated Traces](#train-on-the-generated-traces).
 - `drop_history_reasoning_content`: Strips prior-turn thinking from the prompt entirely to match inference. This option works best with `train_on_last_turn_only=true`.
 
 </Tip>
@@ -301,14 +346,14 @@ automodel --nproc-per-node=8 examples/llm_finetune/agent/qwen2_5_3b_function_cal
 Monitor the following metrics:
 
 - **`loss`** should fall steadily as the model learns the tool-call format.
-- **`tool_call/accuracy`** (and related `tool_call/*` keys) report generation-based tool-call correctness at each validation step. This metric distinguishes whether the model learned the format or selected the correct tools.
+- **`val_loss`** is reported at every validation step.
 
 <Note>
-Under **FSDP2** (the default strategy here), the in-loop generation evaluation is skipped because generation with sharded weights is expensive. Set `tool_call_eval.run_on_fsdp2: true` to enable it. If you keep it disabled, evaluate tool-call accuracy from a saved checkpoint as described in [Evaluate the Fine-Tuned Model](#evaluate-the-fine-tuned-model).
+The command above runs under **FSDP2**, where the in-loop generation evaluation is skipped by default because generation with sharded weights is expensive. `tool_call_eval.run_on_fsdp2` defaults to `false`, so **`tool_call/accuracy` and the other `tool_call/*` keys do not appear in the logs of the command above**. Set `tool_call_eval.run_on_fsdp2: true` to compute them in-loop, or evaluate tool-call accuracy from a saved checkpoint as described in [Evaluate the Fine-Tuned Model](#evaluate-the-fine-tuned-model).
 
 </Note>
 
-Replace the placeholders in the following illustrative training log with values from your run:
+The training log has this shape. Values depend on your run:
 
 ```text
 step    0 | loss 1.84 | grad_norm 12.1 | lr 1.0e-6 | mem 41 GiB | tps/gpu 380
@@ -317,10 +362,12 @@ step  200 | loss 0.21 | grad_norm  2.1 | lr 7.4e-6 | mem 41 GiB | tps/gpu 412
 step  500 | loss 0.14 | grad_norm  1.6 | lr 3.1e-6 | mem 41 GiB | tps/gpu 415
 
 Validation:
-  step 100 | val_loss 0.23 | tool_call/accuracy 0.61
-  step 300 | val_loss 0.18 | tool_call/accuracy 0.78
-  step 500 | val_loss 0.16 | tool_call/accuracy 0.83
+  step 100 | val_loss 0.23
+  step 300 | val_loss 0.18
+  step 500 | val_loss 0.16
 ```
+
+With `tool_call_eval.run_on_fsdp2: true`, each validation line also carries the `tool_call/*` keys.
 
 The example does not override checkpoint settings, so checkpoints are written under the default `checkpoints/` root with `save_consolidated: final`. Every Safetensors checkpoint includes `model/consolidate.sh`. Only the final checkpoint is exported inline to `model/consolidated/`. The root also contains `LATEST` and `LOWEST_VAL` symlinks.
 
