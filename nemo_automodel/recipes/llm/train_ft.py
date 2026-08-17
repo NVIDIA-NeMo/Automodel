@@ -1025,8 +1025,18 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             )
             for k, v in batch.items()
         }
+        model = self.model_parts[0] if hasattr(self, "model_parts") else None
+        supports = getattr(model, "supports", None)
+        mtp_enabled = bool(
+            getattr(supports, "mtp_enabled", getattr(getattr(model, "mtp_config", None), "enabled", False))
+        )
+        if not self.pp_enabled and self._get_cp_group_size() > 1 and mtp_enabled:
+            raise NotImplementedError(
+                "train_ft does not yet support MTP with context parallelism because it cannot prepare "
+                "globally shifted per-depth targets; use CP size 1"
+            )
         cp_sharder = ContextParallelSharder(
-            self.model_parts[0] if hasattr(self, "model_parts") else None,
+            model,
             self.device_mesh,
             batch,
             padding_token_id=self.tokenizer.pad_token_id if self.tokenizer else 0,
