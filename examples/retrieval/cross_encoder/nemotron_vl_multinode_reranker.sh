@@ -26,12 +26,19 @@ if [[ -z "${1:-}" ]]; then
   echo "Usage: sbatch nemotron_vl_multinode_reranker.sh <config_yaml>"
   exit 2
 fi
-CONFIG_YAML="$1"
+HOST_AUTOMODEL_DIR=/lustre/fsw/portfolios/llmservice/users/ronaya/automodel-internal
+CONTAINER_AUTOMODEL_DIR=/opt/Automodel
+CONFIG_YAML="$(realpath "$1")"
 if [[ ! -f "${CONFIG_YAML}" ]]; then
-  echo "Config YAML not found: ${CONFIG_YAML}" >&2
+  echo "Config YAML not found: $1" >&2
   exit 2
 fi
-echo "Config YAML: ${CONFIG_YAML}"
+if [[ "${CONFIG_YAML}" != "${HOST_AUTOMODEL_DIR}/"* ]]; then
+  echo "Config YAML must be under ${HOST_AUTOMODEL_DIR}: ${CONFIG_YAML}" >&2
+  exit 2
+fi
+CONTAINER_CONFIG_YAML="${CONTAINER_AUTOMODEL_DIR}/${CONFIG_YAML#${HOST_AUTOMODEL_DIR}/}"
+echo "Config YAML: ${CONFIG_YAML} -> ${CONTAINER_CONFIG_YAML}"
 
 CONT=/lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/03_sqsh/nvidia-nemo-automodel-26.04.00.sqsh
 DS_RAPIDS=/lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/01_datasets
@@ -39,7 +46,7 @@ HF_CACHE=/lustre/fsw/portfolios/llmservice/users/ronaya/hf_cache
 TRITON_CACHE=/lustre/fsw/portfolios/llmservice/users/ronaya/triton_cache
 CHECKPOINT_DIR=/lustre/fsw/portfolios/llmservice/users/ronaya/model_checkpoints
 PYXIS_MOUNTS=(
-  "/lustre/fsw/portfolios/llmservice/users/ronaya/automodel-internal:/opt/Automodel"
+  "${HOST_AUTOMODEL_DIR}:${CONTAINER_AUTOMODEL_DIR}"
   "${HF_CACHE}:${HF_CACHE}"
   "${TRITON_CACHE}:${TRITON_CACHE}"
   "${CHECKPOINT_DIR}:${CHECKPOINT_DIR}"
@@ -53,7 +60,7 @@ PYXIS_MOUNTS=(
 CONT_MOUNT=$(IFS=,; echo "${PYXIS_MOUNTS[*]}")
 
 export MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n 1)
-export MASTER_PORT=13742
+export MASTER_PORT="${MASTER_PORT:-$((10000 + SLURM_JOB_ID % 50000))}"
 export HF_HOME="${HF_CACHE}"
 export HUGGINGFACE_HUB_CACHE="${HF_CACHE}"
 export HF_DATASETS_CACHE="${HF_CACHE}"
@@ -103,9 +110,10 @@ srun \
         --export=ALL \
         bash -c 'set -euo pipefail
             cd /opt/Automodel/
+            [[ -f "$1" ]] || { echo "Config YAML not found in container: $1" >&2; exit 2; }
             torchrun \
             --nproc_per_node=${SLURM_GPUS_PER_NODE:-8} \
             --nnodes=${SLURM_NNODES:-1} \
             --rdzv_backend=c10d \
             --rdzv_endpoint=${MASTER_ADDR}:${MASTER_PORT} \
-            examples/retrieval/cross_encoder/finetune.py --config "$1"' _ "${CONFIG_YAML}"
+            examples/retrieval/cross_encoder/finetune.py --config "$1"' _ "${CONTAINER_CONFIG_YAML}"
