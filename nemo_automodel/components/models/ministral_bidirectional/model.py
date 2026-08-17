@@ -18,9 +18,8 @@ import torch
 import torch.nn as nn
 from transformers import AutoConfig, AutoModel, AutoModelForSequenceClassification
 from transformers import initialization as init
-from transformers.cache_utils import Cache, DynamicCache
-from transformers.masking_utils import create_bidirectional_mask
-from transformers.modeling_outputs import BaseModelOutputWithPast, SequenceClassifierOutputWithPast
+from transformers.cache_utils import Cache
+from transformers.modeling_outputs import SequenceClassifierOutputWithPast
 from transformers.models.ministral3.configuration_ministral3 import Ministral3Config
 from transformers.models.ministral3.modeling_ministral3 import Ministral3Model
 from transformers.models.mistral3.configuration_mistral3 import Mistral3Config
@@ -39,35 +38,23 @@ class Ministral3BidirectionalConfig(Ministral3Config):
 
     model_type = "ministral3_bidirec"
 
-    def __init__(self, pooling: str = "avg", temperature: float = 1.0, **kwargs) -> None:
+    def __init__(
+        self,
+        pooling: str = "avg",
+        temperature: float = 1.0,
+        is_causal: bool = False,
+        **kwargs,
+    ) -> None:
         self.pooling = pooling
         self.temperature = temperature
-        super().__init__(**kwargs)
+        super().__init__(is_causal=is_causal, **kwargs)
 
 
 class Ministral3BidirectionalModel(Ministral3Model):
     """
-    Ministral3Model modified to use bidirectional (non-causal) attention.
+    Ministral3 retrieval model with a configurable attention mode.
 
-    This class is not selected automatically for standard ``ministral3`` embedding
-    checkpoints. It remains registered for explicit and legacy use.
-
-    In causal Ministral3, each token can only attend to previous tokens (causal
-    attention). This model removes that restriction, allowing each token to attend
-    to all tokens in the sequence, which is useful for embedding tasks.
-
-    The key modifications are:
-        1. Setting is_causal=False on all attention layers
-        2. Using a bidirectional attention mask instead of causal mask
-
-    Loading a Mistral3 VLM checkpoint (e.g. ``mistralai/Ministral-3-3B-Base-2512``
-    or ``mistralai/Ministral-3-3B-Instruct-2512``) requires extracting the language
-    tower; this is driven by the recipe YAML via
-    ``extract_submodel: language_model`` and handled by
-    :func:`nemo_automodel._transformers.retrieval.build_encoder_backbone`.
-
-    Text-only checkpoints (e.g. ``mistralai/Ministral-3B-Instruct``) load directly
-    via the standard ``from_pretrained`` path with no extraction needed.
+    The historical class identity is retained for legacy checkpoint compatibility.
     """
 
     config_class = Ministral3BidirectionalConfig
@@ -83,63 +70,9 @@ class Ministral3BidirectionalModel(Ministral3Model):
 
     def __init__(self, config) -> None:
         super().__init__(config)
+        is_causal = getattr(config, "is_causal", False)
         for layer in self.layers:
-            layer.self_attn.is_causal = False
-
-    def forward(
-        self,
-        input_ids: torch.LongTensor | None = None,
-        attention_mask: torch.Tensor | None = None,
-        position_ids: torch.LongTensor | None = None,
-        past_key_values: Cache | None = None,
-        inputs_embeds: torch.FloatTensor | None = None,
-        use_cache: bool | None = None,
-        **kwargs,
-    ) -> BaseModelOutputWithPast:
-        """Forward pass with bidirectional attention.
-
-        Identical to Ministral3Model.forward() except the causal mask is replaced
-        with a bidirectional mask, allowing all tokens to attend to each other.
-        """
-        if (input_ids is None) ^ (inputs_embeds is not None):
-            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
-
-        if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids)
-
-        if use_cache and past_key_values is None:
-            past_key_values = DynamicCache(config=self.config)
-
-        if position_ids is None:
-            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
-            position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen_tokens
-            position_ids = position_ids.unsqueeze(0)
-
-        bidirectional_mask = create_bidirectional_mask(
-            config=self.config,
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            past_key_values=past_key_values,
-        )
-
-        hidden_states = inputs_embeds
-        position_embeddings = self.rotary_emb(hidden_states, position_ids=position_ids)
-
-        for decoder_layer in self.layers[: self.config.num_hidden_layers]:
-            hidden_states = decoder_layer(
-                hidden_states,
-                attention_mask=bidirectional_mask,
-                position_ids=position_ids,
-                past_key_values=past_key_values,
-                use_cache=use_cache,
-                position_embeddings=position_embeddings,
-                **kwargs,
-            )
-        hidden_states = self.norm(hidden_states)
-        return BaseModelOutputWithPast(
-            last_hidden_state=hidden_states,
-            past_key_values=past_key_values if use_cache else None,
-        )
+            layer.self_attn.is_causal = is_causal
 
 
 class Mistral3BidirectionalConfig(Mistral3Config):
@@ -183,11 +116,9 @@ class Mistral3BidirectionalConfig(Mistral3Config):
 
 class Mistral3BidirectionalModel(Mistral3Model):
     """
-    Mistral3Model modified to use bidirectional (non-causal) attention (Ministral3BidirectionalModel).
+    Mistral3 retrieval model with a configurable Ministral3 text tower.
 
-    In standard Mistral3, each token can only attend to previous tokens (causal
-    attention). This model removes that restriction, allowing each token to attend
-    to all tokens in the sequence, which is useful for embedding tasks.
+    The historical class identity is retained while the text tower honors either policy.
     """
 
     config_class = Mistral3BidirectionalConfig
@@ -213,18 +144,19 @@ class Mistral3BidirectionalModel(Mistral3Model):
         config_dict.pop("auto_map", None)
         config_dict.pop("task_instructions", None)
         text_config = config_dict.get("text_config")
+        is_causal = False
         if isinstance(text_config, dict):
             text_config.pop("auto_map", None)
             text_config["model_type"] = "ministral3"
-            text_config["is_causal"] = False
+            is_causal = bool(text_config.get("is_causal", False))
         vision_config = config_dict.get("vision_config")
         if isinstance(vision_config, dict):
             vision_config.pop("auto_map", None)
 
         export_config = Mistral3Config.from_dict(config_dict)
         export_config.architectures = ["Mistral3Model"]
-        export_config.is_causal = False
-        export_config.text_config.is_causal = False
+        export_config.is_causal = is_causal
+        export_config.text_config.is_causal = is_causal
         return export_config
 
     @dataclass(frozen=True)

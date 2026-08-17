@@ -33,6 +33,7 @@ from transformers.tokenization_utils_tokenizers import TokenizersBackend
 
 pytest.importorskip("transformers.models.ministral3", reason="Ministral3 not available in this transformers version")
 
+from transformers.models.ministral3.modeling_ministral3 import Ministral3Model as HFMinistral3Model
 from transformers.models.mistral3.modeling_mistral3 import Mistral3Model
 
 from nemo_automodel._transformers.registry import ModelRegistry
@@ -806,12 +807,14 @@ def test_legacy_ministral_checkpoint_loads_in_fresh_process(tmp_path):
     assert completed.returncode == 0, completed.stderr
 
 
-def test_ministral3_bidirectional_model_init_and_mask():
+@pytest.mark.parametrize("is_causal", [False, True])
+def test_ministral3_bidirectional_model_init_and_mask(is_causal):
     cfg = tiny_bidirectional_config()
+    cfg.is_causal = is_causal
     model = Ministral3BidirectionalModel(cfg)
     model.eval()
 
-    assert all(getattr(layer.self_attn, "is_causal", True) is False for layer in model.layers)
+    assert all(getattr(layer.self_attn, "is_causal", None) is is_causal for layer in model.layers)
 
     input_ids = torch.randint(0, cfg.vocab_size, (1, 3))
     mask = torch.tensor([[1, 1, 0]])
@@ -841,6 +844,37 @@ def test_ministral3_bidirectional_attention_symmetric():
     assert not torch.allclose(out_base[0, 0], out_modified[0, 0], atol=1e-6), (
         "Bidirectional Ministral3: changing last token should affect first token hidden state"
     )
+
+
+@pytest.mark.parametrize("is_causal", [False, True])
+def test_ministral3_dual_mode_matches_hf_parent(is_causal):
+    torch.manual_seed(42)
+    config = tiny_bidirectional_config()
+    config.is_causal = is_causal
+    actual_model = Ministral3BidirectionalModel(config).eval()
+    reference_model = HFMinistral3Model(config).eval()
+    reference_model.load_state_dict(actual_model.state_dict())
+    input_ids = torch.randint(0, config.vocab_size, (1, 4))
+    attention_mask = torch.ones_like(input_ids)
+
+    with torch.no_grad():
+        actual = actual_model(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+        reference = reference_model(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+
+    torch.testing.assert_close(actual, reference, rtol=1e-5, atol=1e-5)
+
+
+def test_ministral3_causal_attention_blocks_future_token_influence():
+    cfg = tiny_bidirectional_config()
+    cfg.is_causal = True
+    model = Ministral3BidirectionalModel(cfg).eval()
+    input_ids = torch.randint(0, cfg.vocab_size, (1, 4))
+    modified = input_ids.clone()
+    modified[0, -1] = (modified[0, -1] + 1) % cfg.vocab_size
+    with torch.no_grad():
+        original = model(input_ids=input_ids).last_hidden_state
+        changed = model(input_ids=modified).last_hidden_state
+    torch.testing.assert_close(original[0, 0], changed[0, 0])
 
 
 def test_ministral3_bidirectional_forward_paths():
@@ -915,7 +949,8 @@ def test_encoder_build_legacy_ministral_registry_path(tmp_path, monkeypatch):
     assert any("save1" in p for p in model.model.saved)
 
 
-def test_ministral_dispatch_uses_custom_class_only_for_legacy_checkpoints():
+def test_ministral_dispatch_preserves_standard_and_legacy_mappings():
+    """Verify standard and legacy Ministral dispatch mappings remain stable."""
     from nemo_automodel._transformers.retrieval import SUPPORTED_BACKBONES
 
     assert "ministral3" not in SUPPORTED_BACKBONES

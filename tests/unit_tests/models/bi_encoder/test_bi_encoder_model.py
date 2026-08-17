@@ -180,6 +180,7 @@ def test_from_pretrained_happy_path(monkeypatch):
         l2_normalize=True,
         do_distributed_inbatch_negative=True,
         detach_distributed_inbatch_negatives=False,
+        is_causal=True,
         use_liger_kernel=True,
         use_sdpa_patching=True,
         sdpa_method=None,
@@ -192,6 +193,7 @@ def test_from_pretrained_happy_path(monkeypatch):
     assert last_kwargs["attn_implementation"] == am.DEFAULT_ATTN_IMPLEMENTATION
     assert last_kwargs["do_distributed_inbatch_negative"] is True
     assert last_kwargs["detach_distributed_inbatch_negatives"] is False
+    assert last_kwargs["is_causal"] is True
     assert last_kwargs["some_other_kwarg"] == "x"
 
 
@@ -326,12 +328,13 @@ def test_cross_encoder_from_pretrained(monkeypatch):
     monkeypatch.setattr(am, "_patch_attention", lambda m, _: m)
     monkeypatch.setattr(am, "apply_model_infrastructure", fake_apply_infrastructure)
 
-    model = am.NeMoAutoModelCrossEncoder.from_pretrained("mock-model")
+    model = am.NeMoAutoModelCrossEncoder.from_pretrained("mock-model", is_causal=True)
     assert isinstance(model, DummyModel)
     assert calls["build"] == 1
     # CrossEncoder build should NOT receive pooling or l2_normalize
     assert "pooling" not in last_kwargs
     assert "l2_normalize" not in last_kwargs
+    assert last_kwargs["is_causal"] is True
     assert last_kwargs["model_name_or_path"] == "mock-model"
 
 
