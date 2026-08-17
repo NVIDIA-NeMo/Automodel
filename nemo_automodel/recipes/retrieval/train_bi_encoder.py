@@ -90,8 +90,10 @@ def _configure_sentence_transformer_export(model, collate_fn) -> None:
                     "does not expose static query_prefix and passage_prefix metadata."
                 )
             return
-        query_prompt = f"{collate_fn.query_prefix} " if collate_fn.query_prefix else ""
-        document_prompt = f"{collate_fn.passage_prefix} " if collate_fn.passage_prefix else ""
+        export_config = getattr(model, "sentence_transformer_export_config", None)
+        prompt_separator = "" if getattr(export_config, "input_mode", "text") == "structured_multimodal" else " "
+        query_prompt = f"{collate_fn.query_prefix}{prompt_separator}" if collate_fn.query_prefix else ""
+        document_prompt = f"{collate_fn.passage_prefix}{prompt_separator}" if collate_fn.passage_prefix else ""
 
     configure_prompts(query_prompt=query_prompt, document_prompt=document_prompt)
 

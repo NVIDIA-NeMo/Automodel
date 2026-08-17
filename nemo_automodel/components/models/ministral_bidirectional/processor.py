@@ -24,7 +24,95 @@ from typing import Any, Literal
 import numpy as np
 import torch
 from PIL import Image
+from tokenizers.normalizers import Replace, Sequence
 from transformers import BatchEncoding, PixtralProcessor
+from transformers.tokenization_utils_tokenizers import TokenizersBackend
+
+_CONTROL_TOKEN_ESCAPE = "\u200c"
+_CONTROL_TOKEN_ESCAPE_POLICY = "mistral_retrieval_zwnj_prefix_v1"
+_CONTROL_TOKEN_PREFIXES = ("[", "<")
+
+_MISTRAL_RETRIEVAL_CHAT_TEMPLATE = """
+{# nemo-mistral-retrieval-v1
+   Derived from the Mistral Ministral-3 instruct chat template render_content
+   macro and its image-before-text canonicalization. Retrieval adaptation:
+   system content is the retrieval prefix; generation wrappers and BOS/EOS are
+   deliberately omitted so message inference matches training token for token.
+#}
+{%- macro mark_user_text(text) -%}
+{{- text | replace("[", "[\u200c") | replace("<", "<\u200c") -}}
+{%- endmacro -%}
+{%- macro render_text_content(content, context_name) -%}
+{%- if content is string -%}
+    {{- content -}}
+{%- elif content is sequence -%}
+    {%- set ns = namespace(has_output=false) -%}
+    {%- for block in content -%}
+        {%- if block["type"] == "text" -%}
+            {%- if ns.has_output %}{{ "\\n\\n" }}{% endif -%}
+            {{- block["text"] -}}
+            {%- set ns.has_output = true -%}
+        {%- else -%}
+            {{- raise_exception(context_name + " may contain only text blocks") -}}
+        {%- endif -%}
+    {%- endfor -%}
+{%- else -%}
+    {{- raise_exception(context_name + " must be a string or a list of text blocks") -}}
+{%- endif -%}
+{%- endmacro -%}
+{%- macro render_user_content(content) -%}
+{%- if content is string -%}
+    {{- mark_user_text(content) -}}
+{%- elif content is sequence -%}
+    {%- set ns = namespace(has_output=false) -%}
+    {%- for block in content -%}
+        {%- if block["type"] in ["image", "image_url"] -%}
+            {%- if ns.has_output %}{{ " " }}{% endif -%}
+            {{- "[IMG]" -}}
+            {%- set ns.has_output = true -%}
+        {%- endif -%}
+    {%- endfor -%}
+    {%- for block in content -%}
+        {%- if block["type"] == "text" -%}
+            {%- if ns.has_output %}{{ " " }}{% endif -%}
+            {{- mark_user_text(block["text"]) -}}
+            {%- set ns.has_output = true -%}
+        {%- elif block["type"] not in ["image", "image_url"] -%}
+            {{- raise_exception("User content supports only text and image blocks") -}}
+        {%- endif -%}
+    {%- endfor -%}
+{%- else -%}
+    {{- raise_exception("User content must be a string or a list of text and image blocks") -}}
+{%- endif -%}
+{%- endmacro -%}
+{%- if messages | length == 1 and messages[0]["role"] == "user" -%}
+    {{- render_user_content(messages[0]["content"]) -}}
+{%- elif messages | length == 2
+    and messages[0]["role"] == "system"
+    and messages[1]["role"] == "user" -%}
+    {{- render_text_content(messages[0]["content"], "System content") -}}
+    {{- " " -}}
+    {{- render_user_content(messages[1]["content"]) -}}
+{%- else -%}
+    {{- raise_exception("Retrieval inputs require one user message with an optional leading system prefix") -}}
+{%- endif -%}
+""".strip()
+
+
+def _apply_mistral_retrieval_ownership_policy(tokenizer: TokenizersBackend) -> str:
+    """Configure persistent tokenizer and retrieval-template ownership behavior."""
+    tokenizer.split_special_tokens = False
+    tokenizer.init_kwargs["split_special_tokens"] = False
+    if tokenizer.init_kwargs.get("nemo_control_token_escape_policy") != _CONTROL_TOKEN_ESCAPE_POLICY:
+        existing_normalizer = tokenizer.backend_tokenizer.normalizer
+        ownership_normalizers = [
+            Replace(f"{prefix}{_CONTROL_TOKEN_ESCAPE}", prefix) for prefix in _CONTROL_TOKEN_PREFIXES
+        ]
+        if existing_normalizer is not None:
+            ownership_normalizers.append(existing_normalizer)
+        tokenizer.backend_tokenizer.normalizer = Sequence(ownership_normalizers)
+        tokenizer.init_kwargs["nemo_control_token_escape_policy"] = _CONTROL_TOKEN_ESCAPE_POLICY
+    return _MISTRAL_RETRIEVAL_CHAT_TEMPLATE
 
 
 def load_image(image: Any) -> Image.Image:
@@ -46,7 +134,78 @@ def load_image(image: Any) -> Image.Image:
 
 
 class Mistral3BiEncoderProcessor(PixtralProcessor):
-    """Pixtral processor with retrieval-specific query/document batching helpers."""
+    """Pixtral processor with retrieval-specific query/document batching helpers.
+
+    The persistent ownership policy is applied when the processor is constructed:
+    its tokenizer treats raw control markers as processor-owned, while its chat
+    template marks externally supplied text for ordinary tokenization. Direct
+    retrieval query/document helpers apply the same text marker because they do
+    not render the chat template. Saving changes only the processor class to the
+    stock Pixtral implementation; it does not change the configured behavior.
+    """
+
+    _export_as_stock_processor = True
+
+    def check_argument_for_proper_class(
+        self,
+        argument_name: str,
+        argument: Any,
+    ) -> type | tuple[type, ...]:
+        """Validate the retrieval tokenizer without importing MistralCommonBackend.
+
+        Transformers validates processor tokenizers against every generally supported
+        tokenizer class, which imports ``mistral-common`` even when the selected tokenizer
+        is already a ``TokenizersBackend``. This processor supports only the latter so its
+        image markers and escaped user text retain the retrieval-specific semantics.
+
+        Args:
+            argument_name: Processor attribute being validated.
+            argument: Runtime processor component.
+
+        Returns:
+            The accepted component class, or the superclass validation result.
+
+        Raises:
+            TypeError: If a non-TokenizersBackend tokenizer is supplied.
+        """
+        if argument_name == "tokenizer":
+            if not isinstance(argument, TokenizersBackend):
+                raise TypeError(
+                    "Mistral3BiEncoderProcessor requires a Transformers TokenizersBackend tokenizer; "
+                    f"got {type(argument).__name__}. Load it with "
+                    "Mistral3BiEncoderProcessor.from_pretrained(...), which selects the required backend "
+                    "automatically."
+                )
+            return TokenizersBackend
+        return super().check_argument_for_proper_class(argument_name, argument)
+
+    @classmethod
+    def _load_tokenizer_from_pretrained(
+        cls,
+        sub_processor_type: str,
+        pretrained_model_name_or_path: str,
+        subfolder: str = "",
+        **kwargs: Any,
+    ) -> TokenizersBackend:
+        """Load the processor tokenizer directly, bypassing automatic backend selection."""
+        tokenizer_subfolder = (
+            subfolder if sub_processor_type == "tokenizer" else os.path.join(subfolder, sub_processor_type)
+        )
+        if "backend" in kwargs and kwargs["backend"] != "tokenizers":
+            raise ValueError(
+                f"backend must be 'tokenizers' for Mistral retrieval processors, got {kwargs['backend']!r}."
+            )
+        if "split_special_tokens" in kwargs and kwargs["split_special_tokens"] is not False:
+            raise ValueError("split_special_tokens must be False for Mistral retrieval processors.")
+        kwargs.pop("backend", None)
+        kwargs.pop("split_special_tokens", None)
+        return TokenizersBackend.from_pretrained(
+            pretrained_model_name_or_path,
+            subfolder=tokenizer_subfolder,
+            fix_mistral_regex=True,
+            split_special_tokens=False,
+            **kwargs,
+        )
 
     def __init__(
         self,
@@ -80,6 +239,7 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
             image_end_token=image_end_token,
             **kwargs,
         )
+        self.chat_template = _apply_mistral_retrieval_ownership_policy(self.tokenizer)
         self.q_max_length = q_max_length if q_max_length is not None else q_max_len
         self.p_max_length = p_max_length if p_max_length is not None else p_max_len
         self.pad_to_multiple_of = pad_to_multiple_of
@@ -110,7 +270,12 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
         if return_tensors not in ("pt", "np"):
             raise ValueError(f"Invalid return_tensors: {return_tensors!r}. Must be 'pt' or 'np'.")
 
-        query_prompts = [f"{self.query_prefix} {query}" if self.query_prefix else query for query in queries]
+        query_prompts = [
+            f"{self.query_prefix} {self._mark_user_text_ownership(query)}"
+            if self.query_prefix
+            else self._mark_user_text_ownership(query)
+            for query in queries
+        ]
         return self._process_text(
             query_prompts,
             max_length=self.q_max_length,
@@ -149,7 +314,7 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
         contents = []
         processor_images = []
         for image, text in zip(images, texts):
-            content = "" if text is None else str(text)
+            content = "" if text is None else self._mark_user_text_ownership(str(text))
             if image is not None and image != "":
                 processor_images.append(load_image(image).convert("RGB"))
                 content = f"{self.image_token} {content}".strip()
@@ -246,14 +411,74 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
         if truncation and max_length is None:
             max_length = getattr(self.tokenizer, "model_max_length", None)
 
-        return self(
-            images=images,
-            text=text,
-            return_tensors=return_tensors,
-            padding=padding,
-            truncation=truncation,
-            max_length=max_length,
-            pad_to_multiple_of=self.pad_to_multiple_of,
+        try:
+            return self(
+                images=images,
+                text=text,
+                return_tensors=return_tensors,
+                padding=padding,
+                truncation=truncation,
+                max_length=max_length,
+                pad_to_multiple_of=self.pad_to_multiple_of,
+                **kwargs,
+            )
+        except ValueError as error:
+            if images and "Mismatch in `image` token count" in str(error):
+                raise ValueError(
+                    "A complete image token structure plus the passage prefix cannot fit within "
+                    f"p_max_length={max_length}; increase p_max_length or reduce the processed image size."
+                ) from error
+            raise
+
+    def get_hf_export_processor(self) -> PixtralProcessor:
+        """Return the behaviorally equivalent stock processor for portable export.
+
+        Subclasses must explicitly re-assert ``_export_as_stock_processor = True``.
+        This prevents inherited export from silently discarding custom image or
+        text preprocessing that stock ``PixtralProcessor`` cannot reproduce.
+
+        Returns:
+            Stock processor configured with the persistent retrieval behavior.
+
+        Raises:
+            TypeError: If a subclass has not explicitly opted into stock export.
+        """
+        if type(self).__dict__.get("_export_as_stock_processor") is not True:
+            raise TypeError(
+                f"{type(self).__name__} must explicitly opt in to stock processor export after verifying that "
+                "its preprocessing behavior is representable by PixtralProcessor assets."
+            )
+
+        return PixtralProcessor(
+            image_processor=self.image_processor,
+            tokenizer=self.tokenizer,
+            patch_size=self.patch_size,
+            spatial_merge_size=self.spatial_merge_size,
+            chat_template=self.chat_template,
+            image_token=self.image_token,
+            image_break_token=self.image_break_token,
+            image_end_token=self.image_end_token,
+        )
+
+    def save_pretrained(
+        self,
+        save_directory: str | os.PathLike,
+        push_to_hub: bool = False,
+        **kwargs: Any,
+    ) -> list[str]:
+        """Save a stock Pixtral processor without retrieval custom code.
+
+        Args:
+            save_directory: Directory for the standard Transformers processor assets.
+            push_to_hub: Whether to upload the saved assets to the Hugging Face Hub.
+            **kwargs: Additional arguments forwarded to the standard processor save.
+
+        Returns:
+            Paths written by the standard processor save operation.
+        """
+        return self.get_hf_export_processor().save_pretrained(
+            save_directory,
+            push_to_hub=push_to_hub,
             **kwargs,
         )
 
@@ -268,6 +493,13 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
         if isinstance(documents, list):
             return [pair["image"] for pair in documents], [pair["text"] for pair in documents]
         raise ValueError("The documents need to be a dict or list of dicts.")
+
+    @staticmethod
+    def _mark_user_text_ownership(text: str) -> str:
+        """Mark user-owned control-token prefixes for ordinary tokenization."""
+        for prefix in _CONTROL_TOKEN_PREFIXES:
+            text = text.replace(prefix, f"{prefix}{_CONTROL_TOKEN_ESCAPE}")
+        return text
 
 
 def _register_with_hf_auto_classes() -> None:

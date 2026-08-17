@@ -163,11 +163,6 @@ class Mistral3BidirectionalConfig(Mistral3Config):
                 self.text_config = Ministral3BidirectionalConfig(**self.text_config)
         super().__post_init__(**kwargs)
 
-    def to_dict(self):
-        config_dict = super().to_dict()
-        config_dict.pop("_pooling", None)
-        return config_dict
-
 
 class Mistral3BidirectionalModel(Mistral3Model):
     """
@@ -179,6 +174,42 @@ class Mistral3BidirectionalModel(Mistral3Model):
     """
 
     config_class = Mistral3BidirectionalConfig
+
+    _export_as_stock_model = True
+    _sentence_transformer_input_mode = "structured_multimodal"
+
+    def get_hf_export_config(self) -> Mistral3Config:
+        """Return the stock Transformers config used for portable inference export.
+
+        Subclasses must explicitly re-assert ``_export_as_stock_model = True``.
+        This prevents inherited export from silently discarding custom forward
+        behavior that a stock ``Mistral3Model`` cannot reproduce.
+        """
+        if type(self).__dict__.get("_export_as_stock_model") is not True:
+            raise TypeError(
+                f"{type(self).__name__} must explicitly opt in to stock model export after verifying that "
+                "its forward behavior is representable by Mistral3Model configuration and weights."
+            )
+
+        config_dict = self.config.to_dict()
+        config_dict["pooling"] = config_dict.pop("_pooling", "avg")
+        config_dict.pop("model_type", None)
+        config_dict.pop("auto_map", None)
+        config_dict.pop("task_instructions", None)
+        text_config = config_dict.get("text_config")
+        if isinstance(text_config, dict):
+            text_config.pop("auto_map", None)
+            text_config["model_type"] = "ministral3"
+            text_config["is_causal"] = False
+        vision_config = config_dict.get("vision_config")
+        if isinstance(vision_config, dict):
+            vision_config.pop("auto_map", None)
+
+        export_config = Mistral3Config.from_dict(config_dict)
+        export_config.architectures = ["Mistral3Model"]
+        export_config.is_causal = False
+        export_config.text_config.is_causal = False
+        return export_config
 
     @dataclass(frozen=True)
     class ModelCapabilities:

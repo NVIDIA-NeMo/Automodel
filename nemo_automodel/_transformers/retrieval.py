@@ -342,11 +342,11 @@ def _dummy_vision_sum(model: nn.Module) -> torch.Tensor | None:
 def configure_encoder_metadata(model: PreTrainedModel, config) -> None:
     """Configure HuggingFace consolidated checkpoint metadata on a model.
 
-    Sets ``config.architectures`` unconditionally.  For custom retrieval
+    Sets ``config.architectures`` unconditionally. For custom retrieval
     architectures registered in :class:`ModelRegistry`, also writes
     ``config.auto_map`` so that the saved checkpoint can be reloaded via
-    HuggingFace Auto classes.  Standard HF models already have their own
-    auto-resolution and do not need ``auto_map`` entries.
+    Hugging Face Auto classes. Models that opt into stock export replace this
+    training metadata through their model-owned export configuration.
 
     Args:
         model: The backbone ``PreTrainedModel`` instance.
@@ -509,12 +509,14 @@ def save_encoder_pretrained(model: nn.Module, save_directory: str, **kwargs) -> 
     export_config = getattr(model, "sentence_transformer_export_config", None)
     tokenizer = kwargs.get("tokenizer", None)
     if export_config is not None and tokenizer is None:
+        if getattr(export_config, "input_mode", "text") == "structured_multimodal":
+            raise ValueError("Structured multimodal Sentence Transformers export requires a processor.")
         logger.warning(
             "Sentence Transformers metadata export is disabled because no tokenizer was provided; "
             "saving the standard encoder checkpoint instead."
         )
         export_config = None
-    deploy_config = None
+    deploy_config = model.get_hf_export_config() if getattr(model, "_export_as_stock_model", False) else None
     original_model_path = getattr(model, "source_model_path", None)
     if original_model_path is None:
         model_reference = getattr(model.model, "name_or_path", None) or getattr(
@@ -528,9 +530,11 @@ def save_encoder_pretrained(model: nn.Module, save_directory: str, **kwargs) -> 
         )
 
         try:
-            _validate_sentence_transformer_export(model, tokenizer, original_model_path)
+            _validate_sentence_transformer_export(model, tokenizer, original_model_path, export_config)
             deploy_config = model.get_hf_export_config()
         except (TypeError, ValueError) as exc:
+            if getattr(export_config, "input_mode", "text") == "structured_multimodal":
+                raise
             logger.warning(
                 "Sentence Transformers metadata export is disabled because this checkpoint cannot be "
                 "represented faithfully; saving the standard encoder checkpoint instead: %s",
@@ -538,10 +542,10 @@ def save_encoder_pretrained(model: nn.Module, save_directory: str, **kwargs) -> 
             )
             export_config = None
     model.model.save_pretrained(save_directory)
+    if deploy_config is not None:
+        deploy_config.save_pretrained(save_directory)
     if export_config is None:
         return
-
-    deploy_config.save_pretrained(save_directory)
     tokenizer.save_pretrained(save_directory)
     _save_generated_sentence_transformer_assets(model, export_config, original_model_path, save_directory, tokenizer)
 
@@ -574,12 +578,43 @@ def _init_encoder_common(encoder: nn.Module, model: PreTrainedModel) -> None:
     """Shared init for BiEncoderModel and CrossEncoderModel."""
     encoder.model = model
     encoder.config = model.config
-    if ModelRegistry.has_retrieval_model(model.__class__.__name__):
+    encoder._sentence_transformer_input_mode = getattr(model, "_sentence_transformer_input_mode", "text")
+    encoder._export_as_stock_model = bool(getattr(model, "_export_as_stock_model", False))
+    if encoder._export_as_stock_model:
+        encoder.name_or_path = None
+    elif ModelRegistry.has_retrieval_model(model.__class__.__name__):
         encoder.name_or_path = os.path.dirname(inspect.getfile(type(model)))
     else:
         encoder.name_or_path = getattr(model.config, "name_or_path", "")
     encoder.state_dict_adapter = EncoderStateDictAdapter()
     configure_encoder_metadata(model, model.config)
+
+
+class _StockHFMetadataExporter:
+    """Write stock Hugging Face metadata for a custom training backbone."""
+
+    def __init__(self, model_part: nn.Module) -> None:
+        self.model_part = model_part
+
+    def validate(self, *, tokenizer, original_model_path: str | None) -> None:
+        """Validate that the model exposes a deployable stock config."""
+        del tokenizer, original_model_path
+        self.model_part.get_hf_export_config()
+
+    def save(self, *, hf_metadata_dir: str, tokenizer, original_model_path: str | None) -> None:
+        """Write stock model metadata and optional processor assets."""
+        from nemo_automodel.components.checkpoint.addons import _save_generated_hf_assets
+
+        deploy_config = self.model_part.get_hf_export_config()
+        _save_generated_hf_assets(
+            self.model_part,
+            original_model_path,
+            hf_metadata_dir,
+            tokenizer,
+            v4_compatible=False,
+            model_config=deploy_config,
+            save_custom_model_code=False,
+        )
 
 
 class BiEncoderModel(nn.Module):
@@ -601,9 +636,10 @@ class BiEncoderModel(nn.Module):
         _init_encoder_common(self, model)
         self.pooling = pooling
         self.l2_normalize = l2_normalize
+        export_config = SentenceTransformerExportConfig(input_mode=self._sentence_transformer_input_mode)
         self.sentence_transformer_export_config: SentenceTransformerExportConfig | None = None
-        if _supports_standard_sentence_transformer_export(model, pooling):
-            self.sentence_transformer_export_config = SentenceTransformerExportConfig()
+        if _supports_standard_sentence_transformer_export(model, pooling, export_config):
+            self.sentence_transformer_export_config = export_config
         self.do_distributed_inbatch_negative = do_distributed_inbatch_negative
         self.detach_distributed_inbatch_negatives = detach_distributed_inbatch_negatives
         resolved_output_embedding_quantization = output_embedding_quantization
@@ -711,12 +747,14 @@ class BiEncoderModel(nn.Module):
         *,
         tokenizer=None,
         original_model_path: str | None = None,
-    ) -> _SentenceTransformerMetadataExporter | None:
+    ) -> _SentenceTransformerMetadataExporter | _StockHFMetadataExporter | None:
         """Return the retrieval-owned exporter for consolidated Hugging Face metadata."""
         export_config = self.sentence_transformer_export_config
         if export_config is None:
-            return None
+            return _StockHFMetadataExporter(self) if getattr(self, "_export_as_stock_model", False) else None
         if tokenizer is None:
+            if getattr(export_config, "input_mode", "text") == "structured_multimodal":
+                raise ValueError("Structured multimodal Sentence Transformers export requires a processor.")
             logger.warning(
                 "Sentence Transformers metadata export is disabled because no tokenizer was provided; "
                 "saving the standard Hugging Face checkpoint metadata instead."
@@ -727,6 +765,8 @@ class BiEncoderModel(nn.Module):
             exporter.validate(tokenizer=tokenizer, original_model_path=original_model_path)
             self.get_hf_export_config()
         except (TypeError, ValueError) as exc:
+            if getattr(export_config, "input_mode", "text") == "structured_multimodal":
+                raise
             logger.warning(
                 "Sentence Transformers metadata export is disabled because this checkpoint cannot be "
                 "represented faithfully; saving the standard Hugging Face checkpoint metadata instead: %s",
@@ -737,26 +777,32 @@ class BiEncoderModel(nn.Module):
 
     def get_hf_export_config(self) -> PretrainedConfig:
         """Return a deployable Hugging Face config describing the effective bi-encoder."""
-        config_dict = self.config.to_dict()
-        model_type = getattr(type(self.config), "model_type", "")
-        if model_type.endswith("_bidirec"):
-            export_config_class = type(self.config).__mro__[1]
-            if not issubclass(export_config_class, PretrainedConfig):
-                raise TypeError(f"Unable to determine deployable Hugging Face classes for {type(self.model).__name__}.")
-
-            config_dict.pop("model_type", None)
-            config_dict.pop("auto_map", None)
-            export_config = export_config_class.from_dict(config_dict)
-            try:
-                export_model_class = MODEL_MAPPING[type(export_config)]
-            except KeyError as exc:
-                raise TypeError(
-                    f"Unable to determine deployable Hugging Face classes for {type(self.model).__name__}."
-                ) from exc
-            export_config.architectures = [export_model_class.__name__]
-            export_config.is_causal = False
+        model_export_config = getattr(self.model, "get_hf_export_config", None)
+        if callable(model_export_config):
+            export_config = model_export_config()
         else:
-            export_config = self.config.__class__.from_dict(config_dict)
+            config_dict = self.config.to_dict()
+            model_type = getattr(type(self.config), "model_type", "")
+            if model_type.endswith("_bidirec"):
+                export_config_class = type(self.config).__mro__[1]
+                if not issubclass(export_config_class, PretrainedConfig):
+                    raise TypeError(
+                        f"Unable to determine deployable Hugging Face classes for {type(self.model).__name__}."
+                    )
+
+                config_dict.pop("model_type", None)
+                config_dict.pop("auto_map", None)
+                export_config = export_config_class.from_dict(config_dict)
+                try:
+                    export_model_class = MODEL_MAPPING[type(export_config)]
+                except KeyError as exc:
+                    raise TypeError(
+                        f"Unable to determine deployable Hugging Face classes for {type(self.model).__name__}."
+                    ) from exc
+                export_config.architectures = [export_model_class.__name__]
+                export_config.is_causal = False
+            else:
+                export_config = self.config.__class__.from_dict(config_dict)
 
         export_config.pooling = self.pooling
         return export_config
