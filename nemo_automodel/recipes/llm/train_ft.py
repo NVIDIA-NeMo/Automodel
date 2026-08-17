@@ -32,7 +32,7 @@ import pathlib
 import time
 from contextlib import nullcontext
 from dataclasses import replace
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any
 
 import mlflow
 import torch
@@ -64,7 +64,7 @@ from nemo_automodel.components.distributed.context_parallel.magi import MagiStat
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.mesh import MeshContext
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
-from nemo_automodel.components.distributed.utils import FirstRankPerNode, dp_eval_sample_shard, get_sync_ctx
+from nemo_automodel.components.distributed.utils import FirstRankPerNode, dp_eval_sample_shard
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
 from nemo_automodel.components.loggers.mlflow_utils import (
@@ -82,9 +82,6 @@ from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.utils import (
     count_tail_padding,
     get_expert_tp_replication_factor,
-    prepare_after_first_microbatch,
-    prepare_for_final_backward,
-    prepare_for_grad_accumulation,
     scale_grads_and_clip_grad_norm,
 )
 from nemo_automodel.components.utils.compile_utils import (
@@ -148,6 +145,31 @@ def _should_pack_validation(
         attention_backend in ("te", "magi")
         or bool(getattr(model, "_te_attention_injected", False))
         or model_requires_packing
+    )
+
+
+def _validate_pipeline_thd_model(model: nn.Module) -> None:
+    """Require an explicit model-owned THD path for pipeline training.
+
+    Args:
+        model: First local pipeline model part.
+
+    Raises:
+        ValueError: If the model has no native THD capability, CP preparation
+            hook, or model-owned TE/Magi attention backend.
+    """
+    backend_attn = getattr(getattr(model, "backend", None), "attn", None)
+    if (
+        bool(getattr(model, "supports_thd", False))
+        or callable(getattr(model, "prepare_model_inputs_for_cp", None))
+        or backend_attn in ("te", "magi")
+    ):
+        return
+
+    raise ValueError(
+        f"Pipeline parallelism with THD batches is not supported for {type(model).__name__}. "
+        "Generic Hugging Face pipeline stages do not consume packed document boundaries. "
+        "Use a model with native THD support or disable THD packing."
     )
 
 
@@ -441,9 +463,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
     This class orchestrates training, from setup to main training loop.
     """
 
-    # MagiAttention is disabled until setup() resolves it from config; this
-    # disabled default keeps _forward_backward_step working if setup() is skipped
-    # (e.g. unit tests that exercise the step directly). It is read-only.
+    # MagiAttention is disabled until setup() resolves it from config. It is read-only.
     magi = MagiState()
 
     def __init__(self, cfg):
@@ -508,6 +528,14 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         if not self._should_setup_training_components():
             return
 
+        if getattr(self.distributed_config, "calculate_per_token_loss", False):
+            raise NotImplementedError(
+                "Engine-backed finetuning does not support "
+                "MegatronFSDP calculate_per_token_loss=True; use averaged gradients instead."
+            )
+        if self.pp_enabled and getattr(self.pipeline_config, "scale_grads_in_schedule", False):
+            raise ValueError("Engine-backed finetuning requires distributed.pipeline.scale_grads_in_schedule=False")
+
         # MagiAttention (FFA / context-parallel) backend, enabled via
         # model.attn_implementation="magi" (HF) or model.backend.attn="magi" (custom).
         self.magi = setup_magi(self.cfg, self.device_mesh)
@@ -546,9 +574,18 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             pp_batch_size = self.cfg.get("step_scheduler.local_batch_size", 1)
             pp_microbatch_size = self.cfg.get("distributed.pipeline.pp_microbatch_size", 1)
 
-            assert pp_batch_size // pp_microbatch_size >= self.mesh_context.pp_size, (
-                f"pp_batch_size {pp_batch_size} // pp_microbatch_size {pp_microbatch_size} must be >= pp_size {self.mesh_context.pp_size}"
-            )
+            if self.magi.enabled:
+                if pp_batch_size != 1 or pp_microbatch_size != 1:
+                    raise ValueError(
+                        "Magi pipeline training requires local_batch_size=1 and pp_microbatch_size=1; "
+                        "use outer gradient accumulation for larger optimizer windows"
+                    )
+            else:
+                if pp_batch_size // pp_microbatch_size < self.mesh_context.pp_size:
+                    raise ValueError(
+                        f"pp_batch_size {pp_batch_size} // pp_microbatch_size {pp_microbatch_size} "
+                        f"must be >= pp_size {self.mesh_context.pp_size}"
+                    )
 
             # THD override logic
             if (
@@ -563,9 +600,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     f"Overriding pp_batch_size: {pp_batch_size}, pp_microbatch_size: {pp_microbatch_size} for THD"
                 )
 
-            assert not isinstance(self.distributed_config, MegatronFSDPConfig), (
-                "MegatronFSDPConfig is not supported when pipeline parallelism is enabled"
-            )
+            if isinstance(self.distributed_config, MegatronFSDPConfig):
+                raise ValueError("MegatronFSDPConfig is not supported when pipeline parallelism is enabled")
 
             # Update pipeline_config runtime fields
             self.pipeline_config.pp_batch_size = pp_batch_size
@@ -624,6 +660,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             cfg_qat=self.cfg.get("qat", None),
             sdpa_method=self.cfg.get("sdpa_method", None),
         )
+        if self.pp_enabled and self.cfg.dataloader.emits_thd:
+            first_model_part = model.parts[0] if isinstance(model, AutoPipeline) else model
+            _validate_pipeline_thd_model(first_model_part)
         self.embedding_row_repair_report = None
         embedding_row_repair = self.cfg.embedding_row_repair
         if embedding_row_repair is not None and embedding_row_repair.enabled:
@@ -654,12 +693,15 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self.model_parts = [model]
             self.pp = None
 
+        self._validate_mtp_context_parallelism(self.model_parts)
+
         # Loss-function capability check
         self.loss_fn = _maybe_downgrade_loss_fn(self.loss_fn, self.model_parts[0], self.pp is not None)
 
         # Extract TE FP8 config from model backend (set after model construction)
         self.te_fp8 = self.model_parts[0].backend.te_fp8 if hasattr(self.model_parts[0], "backend") else None
 
+        self.pipeline_loss_fn = None
         if self.pp_enabled:
             self._configure_pipeline_loss_fn()
 
@@ -697,42 +739,22 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # Tokenizer + model-derived values are runtime concerns: build them here and pass them to
         # each DataloaderConfig.build(); the configs themselves are resolved at the RecipeConfig boundary.
         _, self.tokenizer = _build_tokenizer(self.cfg.model, self.cfg.dataset)
-        model_has_mtp = any(
-            getattr(module, "mtp", None) is not None
-            for model_part in self.model_parts
-            for module in model_part.modules()
+        if getattr(self.loss_fn, "reduction", None) != "sum":
+            raise ValueError("Engine-backed finetuning requires a loss with reduction='sum'")
+        self.engine = Engine(
+            self.pp if self.pp_enabled else self.model_parts[0],
+            device=self.dist_env.device,
+            mesh_context=self.mesh_context,
+            microbatch_size=1,
+            collate_fn=collate_prebatched,
+            padding_token_id=(self.tokenizer.pad_token_id if self.tokenizer is not None else 0) or 0,
+            context_fn=(
+                (lambda _model_inputs: self.te_fp8.maybe_te_autocast())
+                if self.te_fp8 is not None
+                else (lambda _model_inputs: nullcontext())
+            ),
+            defer_fsdp_grad_sync=getattr(self.distributed_config, "defer_fsdp_grad_sync", True),
         )
-        pp_group = self._get_pp_group() if self.pp_enabled else None
-        if pp_group is not None:
-            # The MTP head may exist only on the last PP stage; all stages must choose the same path.
-            model_has_mtp_flag = torch.tensor(int(model_has_mtp), device=self.dist_env.device)
-            torch.distributed.all_reduce(model_has_mtp_flag, op=torch.distributed.ReduceOp.MAX, group=pp_group)
-            model_has_mtp = bool(model_has_mtp_flag.item())
-
-        dataloader_config = self.cfg.dataloader
-        pp_uses_packed_batches = self.pp_enabled and (
-            _packed_seq_size > 0 or bool(getattr(dataloader_config, "emits_thd", False))
-        )
-        self.engine = None
-        if (
-            not self.magi.enabled
-            and not (model_has_mtp and (self.pp_enabled or self.mesh_context.cp_size > 1))
-            and not pp_uses_packed_batches
-            and not (self.pp_enabled and self.mesh_context.cp_size > 1)
-            and not (self.pp_enabled and isinstance(self.loss_fn, FusedLinearCrossEntropy))
-            and not (self.pp_enabled and self.pp.scale_grads_in_schedule)
-            and not getattr(self.distributed_config, "calculate_per_token_loss", False)
-            and getattr(self.loss_fn, "reduction", None) == "sum"
-        ):
-            self.engine = Engine(
-                self.pp if self.pp_enabled else self.model_parts[0],
-                device=self.dist_env.device,
-                mesh_context=self.mesh_context,
-                collate_fn=collate_prebatched,
-                padding_token_id=(self.tokenizer.pad_token_id if self.tokenizer is not None else 0) or 0,
-                context_fn=self.te_fp8.maybe_te_autocast if self.te_fp8 is not None else nullcontext,
-                defer_fsdp_grad_sync=getattr(self.distributed_config, "defer_fsdp_grad_sync", True),
-            )
         attn_implementation = None
         if (
             self.cfg.get("packed_sequence.packed_sequence_size", 0) > 0
@@ -759,7 +781,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     supports_seq_lens=_supports_seq_lens(self.model_parts[0]),
                     cp_size=self.cfg.get("distributed.cp_size", 1),
                     attn_implementation=attn_implementation,
-                    collate_wrapper=collate_wrapper,
+                    # Raw THD batches already encode causal document boundaries
+                    # in cu_seqlens.  Building a dense [B, 1, S, S] PP mask is
+                    # both redundant and prohibitive for long packed streams.
+                    collate_wrapper=None if getattr(config, "emits_thd", False) else collate_wrapper,
                 )
 
         self.dataloader = materialize_loader(self.cfg.dataloader)
@@ -922,11 +947,14 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         if isinstance(self.loss_fn, FusedLinearCrossEntropy):
             last_stage_model._pp_return_hidden_states = True
 
-        self.pp.info.schedule._loss_fn = self.cfg.mtp.build(
+        self.pipeline_loss_fn = self.cfg.mtp.build(
             self.loss_fn,
             last_stage_model,
             grad_reduce_group=self._get_dp_group(include_cp=True),
         )
+        # Validation still executes the schedule directly. Training supplies the
+        # same loss through Engine's per-microbatch callback.
+        self.pp.info.schedule._loss_fn = self.pipeline_loss_fn
 
     def _setup_qat(self, cfg, model_parts: list[nn.Module]):
         if not cfg.get("qat.enabled", False):
@@ -1044,8 +1072,17 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self._partial_cuda_graph_capture_pending = False
 
     # ------------------ helpers ------------------
-    def _prepare_microbatch(self, batch):
-        """Move and CP-prepare one batch before model execution."""
+    def _prepare_validation_batch(self, batch: dict[str, Any]):
+        """Move and CP-prepare one validation batch.
+
+        Args:
+            batch: Worker-collated inputs. Padded token tensors have shape
+                [batch, sequence]; packed THD token tensors have shape [tokens].
+
+        Returns:
+            The CP context factory, CP-local model-input mapping, and labels
+            matching the model output's local token axes.
+        """
         batch = {
             k: (
                 {dk: dv.to(self.dist_env.device, non_blocking=True) for dk, dv in v.items() if dv is not None}
@@ -1120,7 +1157,17 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             grad_reduce_group=grad_reduce_group,
         )
 
-    def _make_engine_datum(self, batch):
+    def _make_engine_datum(self, batch: dict[str, Any]) -> Datum:
+        """Wrap one worker-collated text batch for ``collate_prebatched``.
+
+        Args:
+            batch: Model inputs plus labels. Padded labels have shape [batch,
+                sequence]; packed labels have shape [tokens].
+
+        Returns:
+            A Datum whose model tensors preserve their input layout and whose
+            labels and weights share the same token axes.
+        """
         labels = batch["labels"]
         model_inputs = {key: value for key, value in batch.items() if key != "labels"}
         if isinstance(self.loss_fn, FusedLinearCrossEntropy):
@@ -1130,26 +1177,42 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             loss_fn_inputs={"labels": labels, "weights": labels.ne(-100)},
         )
 
-    def _engine_loss_fn(self, output, loss_inputs, _datums, model_inputs):
+    def _engine_loss_fn(self, output: Any, loss_inputs: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Compute a local summed causal-LM loss for Engine normalization.
+
+        Args:
+            output: Model output with logits shaped [batch, sequence, vocab],
+                packed logits shaped [tokens, vocab], or the PP/MTP tuple contract.
+            loss_inputs: CP-local labels and weights with matching token axes,
+                plus optional packed-sequence metadata.
+
+        Returns:
+            Scalar local loss-sum tensor.
+        """
+        if self.pp_enabled:
+            if self.pipeline_loss_fn is None:
+                raise RuntimeError("The last pipeline stage has no configured causal-LM loss")
+            self.pipeline_loss_fn.cu_seqlens = loss_inputs.get("cu_seqlens")
+            return self.pipeline_loss_fn(output, loss_inputs["labels"])
         return self._compute_causal_lm_loss(
             output,
             loss_inputs["labels"],
-            model_inputs,
+            loss_inputs,
             num_label_tokens=None,
             is_train=True,
         )
 
-    def _forward_backward_step(
-        self,
-        idx,
-        batch,
-        *,
-        loss_buffer,
-        num_label_tokens,
-        num_batches,
-        is_train: bool = True,
-    ):
-        train_ctx, batch, labels = self._prepare_microbatch(batch)
+    def _forward_validation_step(self, batch: dict[str, Any]) -> torch.Tensor:
+        """Run one recipe-owned forward-only validation step.
+
+        Args:
+            batch: Worker-collated inputs and labels. Padded token tensors have
+                shape [batch, sequence]; packed THD token tensors have shape [tokens].
+
+        Returns:
+            Detached scalar local loss-sum tensor.
+        """
+        train_ctx, batch, labels = self._prepare_validation_batch(batch)
         fp8_ctx = self.te_fp8.maybe_te_autocast() if self.te_fp8 is not None else nullcontext()
 
         if self.pp_enabled:
@@ -1178,56 +1241,31 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 cu_seqlens = batch_filtered.get("cu_seqlens")
                 if isinstance(cu_seqlens, torch.Tensor) and cu_seqlens.dim() == 2:
                     cu_seqlens = cu_seqlens.squeeze(0)  # [1, T] -> [T]
-                pp_loss_fn = getattr(self.pp.info.schedule, "_loss_fn", None) if self.pp.info.has_last_stage else None
-                if pp_loss_fn is not None and hasattr(pp_loss_fn, "cu_seqlens"):
-                    pp_loss_fn.cu_seqlens = cu_seqlens
-                if is_train:
-                    # Use step for training (forward + backward)
-                    if self.pp.info.has_first_stage:
-                        self.pp.info.schedule.step(input_ids, target=targets, losses=losses, **batch_filtered)
-                    else:
-                        self.pp.info.schedule.step(target=targets, losses=losses, **batch_filtered)
+                if self.pipeline_loss_fn is not None:
+                    self.pipeline_loss_fn.cu_seqlens = cu_seqlens
+                if self.pp.info.has_first_stage:
+                    self.pp.info.schedule.eval(input_ids, target=targets, losses=losses, **batch_filtered)
                 else:
-                    # Use eval for validation (forward only, no backward)
-                    if self.pp.info.has_first_stage:
-                        self.pp.info.schedule.eval(input_ids, target=targets, losses=losses, **batch_filtered)
-                    else:
-                        self.pp.info.schedule.eval(target=targets, losses=losses, **batch_filtered)
+                    self.pp.info.schedule.eval(target=targets, losses=losses, **batch_filtered)
 
             if self.pp.info.has_last_stage:
-                local_loss = torch.sum(torch.stack(losses))
-            else:
-                local_loss = torch.tensor(0.0, device=self.dist_env.device)
+                return torch.sum(torch.stack(losses)).detach()
+            return torch.zeros((), device=self.dist_env.device)
 
-            loss_buffer.append(local_loss.clone().detach())
-        else:
-            model = self.model_parts[0]
-            sync_ctx = (
-                get_sync_ctx(
-                    model,
-                    idx == num_batches - 1,
-                    defer_fsdp_grad_sync=getattr(self.distributed_config, "defer_fsdp_grad_sync", True),
-                )
-                if is_train
-                else nullcontext()
-            )
-            with train_ctx(), sync_ctx, fp8_ctx:
-                batch = filter_forward_kwargs(model, batch)
-                if isinstance(self.loss_fn, FusedLinearCrossEntropy):
-                    # use num_logits_to_keep to avoid full logits matrix in memory
-                    out = model(logits_to_keep=1, **batch)
-                else:
-                    out = model(**batch)
-                local_loss = self._compute_causal_lm_loss(
-                    out,
-                    labels,
-                    batch,
-                    num_label_tokens=num_label_tokens,
-                    is_train=is_train,
-                )
-                loss_buffer.append(local_loss.clone().detach())
-                if is_train:
-                    (local_loss * self._get_dp_group_size(include_cp=True)).backward()
+        model = self.model_parts[0]
+        with train_ctx(), fp8_ctx:
+            batch = filter_forward_kwargs(model, batch)
+            if isinstance(self.loss_fn, FusedLinearCrossEntropy):
+                out = model(logits_to_keep=1, **batch)
+            else:
+                out = model(**batch)
+            return self._compute_causal_lm_loss(
+                out,
+                labels,
+                batch,
+                num_label_tokens=None,
+                is_train=False,
+            ).detach()
 
     def _broadcast_from_last_pp_stage(self, tensor: torch.Tensor) -> torch.Tensor:
         """Broadcast a PP last-stage scalar to the other ranks in its pipeline group."""
@@ -1236,22 +1274,22 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         torch.distributed.broadcast(tensor, src=pp_src_rank, group=pp_group)
         return tensor
 
-    def _run_train_optim_step(self, batches, max_grad_norm: Optional[float] = None):
+    def _run_train_optim_step(self, batches: list[dict[str, Any]], max_grad_norm: float | None = None) -> MetricsSample:
         """Execute a single training step.
 
         Args:
-            batches: List of batches of training data.
+            batches: Worker-collated optimizer window. Padded token tensors use
+                shape [batch, sequence]; packed tensors use their THD token layout.
             max_grad_norm: Gradient clipping norm. Optional, if None will not clip gradients.
+
+        Returns:
+            Metrics for the completed optimizer step.
         """
 
         num_label_tokens = torch.tensor(
             sum((batch["labels"] != -100).sum().item() for batch in batches), dtype=torch.long
         )
         num_label_tokens = self._dp_allreduce(num_label_tokens).item()
-
-        num_batches = len(batches)
-
-        loss_buffer = []
 
         # number of tokens in the batch, excluding any tail padding.
         num_tokens_in_batch = torch.tensor(
@@ -1260,31 +1298,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         )
         num_tokens_in_batch = self._dp_allreduce(num_tokens_in_batch).item()
 
-        engine = getattr(self, "engine", None)
-        # A custom prepacked loader may emit THD even when setup did not advertise packing.
-        pp_uses_thd = self.pp_enabled and any(batch.get("qkv_format") == "thd" for batch in batches)
-        use_engine = engine is not None and num_label_tokens > 0 and not pp_uses_thd
-        if use_engine:
-            reporting_loss, _ = engine.forward_backward(
-                [[self._make_engine_datum(batch)] for batch in batches],
-                self._engine_loss_fn,
-            )
-        else:
-            # Engine requires a positive global weight sum. Keep the existing
-            # zero-label behavior on the legacy path.
-            self._set_moe_aux_loss_backward_scale(num_batches=num_batches, num_label_tokens=num_label_tokens)
-            prepare_for_grad_accumulation(self.model_parts, pp_enabled=self.pp_enabled)
-
-            for i, batch in enumerate(batches):
-                if i == num_batches - 1:
-                    prepare_for_final_backward(self.model_parts, pp_enabled=self.pp_enabled)
-
-                self._forward_backward_step(
-                    i, batch, loss_buffer=loss_buffer, num_label_tokens=num_label_tokens, num_batches=num_batches
-                )
-
-                if i == 0:
-                    prepare_after_first_microbatch()
+        reporting_loss, _ = self.engine.forward_backward(
+            [self._make_engine_datum(batch) for batch in batches],
+            self._engine_loss_fn,
+        )
 
         grad_norm = scale_grads_and_clip_grad_norm(
             max_grad_norm,
@@ -1296,7 +1313,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             ep_axis_name="ep" if self.moe_mesh is not None and "ep" in self.moe_mesh.mesh_dim_names else None,
             pp_axis_name="pp" if self.pp_enabled else None,
             foreach=True,
-            num_label_tokens=None if use_engine else num_label_tokens,
+            num_label_tokens=None,
             dp_group_size=self._get_dp_group_size(include_cp=True),
             expert_tp_replication_factor=get_expert_tp_replication_factor(self.model_parts, self.device_mesh),
         )
@@ -1360,14 +1377,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 ).item()
                 mfu = calculate_mfu(step_flops / 1e12, self.dist_env.world_size, time_delta)
 
-        if not use_engine:
-            reporting_loss = torch.sum(torch.stack(loss_buffer))
-            reporting_loss = self._dp_allreduce(reporting_loss, include_cp=True)
-            if self.pp_enabled:
-                reporting_loss = reporting_loss / num_label_tokens
-                reporting_loss = reporting_loss.to(self.dist_env.device)
-                reporting_loss = self._broadcast_from_last_pp_stage(reporting_loss)
-
         reporting_loss = reporting_loss.cpu().item()
         # fix reporting_loss, tps across ranks
 
@@ -1403,18 +1412,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             total_num_label_tokens = 0
 
             for batch in val_dataloader:
-                loss_buffer = []
                 num_label_tokens = (batch["labels"] != -100).sum().item()
-                self._forward_backward_step(
-                    0,
-                    batch,
-                    loss_buffer=loss_buffer,
-                    num_label_tokens=None,  # we will normalize outside.
-                    num_batches=1,
-                    is_train=False,
-                )
-
-                total_loss += torch.sum(torch.stack(loss_buffer)).item()
+                total_loss += self._forward_validation_step(batch).item()
                 total_num_label_tokens += num_label_tokens
 
         total_loss = self._dp_allreduce(total_loss, include_cp=True)

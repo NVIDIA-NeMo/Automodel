@@ -12,20 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for the VLM-CP wiring in ``recipes/vlm/finetune.py``.
+"""Tests for VLM context-parallel wiring in ``recipes/vlm/finetune.py``.
 
-These reproduce the ``_forward_backward_step``-style and
-``_run_validation_epoch``-style batch handling without instantiating the
-full recipe — exercising the code shape that gets shipped:
-
-  - Invoke the sharder-only ``prepare_model_inputs_for_cp`` directly through
-    ``ContextParallelSharder`` construction (a plain method call; nothing consumed, so input_ids
-    and multimodal inputs stay in the batch for the model's own forward)
-  - PP gating: the sharder-only hook is invoked on every stage (all PP-capable
-    VLMs are sunk — they embed + shard in their own forward); media is dropped on
-    non-first stages so those stage forwards see only text inputs
-  - Validation: count labels after ``ContextParallelSharder.shard`` and inside train_ctx
-  - Validation: position_ids ``.to(self.dist_env.device)`` (not model.device)
+Training forward/backward and CP sharding are owned by :class:`Engine`. These
+tests cover the VLM recipe responsibilities that remain around that core:
+pipeline media staging setup, vision-frame context publication, and the
+recipe-owned validation forward path.
 """
 
 from __future__ import annotations
@@ -39,6 +31,7 @@ import torch
 import nemo_automodel.recipes.vlm.finetune as vlm_finetune
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.distributed.cp_vision_frame_shard import CpVisionFrameShardingConfig
+from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM
 
 
@@ -55,59 +48,6 @@ def _identity_cp_shard(sharder, batch):
     """
     del sharder
     return nullcontext, batch
-
-
-def _make_recipe_with_pp_stages(*, pp_enabled=True, has_first_stage=True, pp_microbatch_size=2):
-    first_stage = SimpleNamespace(is_first=True, inputs_meta=("old-first",))
-    later_stage = SimpleNamespace(is_first=False, inputs_meta=("old-later",))
-    recipe = SimpleNamespace(
-        pp_enabled=pp_enabled,
-        pp=SimpleNamespace(
-            pp_microbatch_size=pp_microbatch_size,
-            info=SimpleNamespace(has_first_stage=has_first_stage, stages=[first_stage, later_stage]),
-        ),
-    )
-    return recipe, first_stage, later_stage
-
-
-def test_maybe_set_pp_first_stage_embed_input_meta_sets_first_stage_meta():
-    recipe, first_stage, later_stage = _make_recipe_with_pp_stages(pp_microbatch_size=3)
-    model_input = torch.empty(5, 11, 13, dtype=torch.bfloat16)
-
-    FinetuneRecipeForVLM._maybe_set_pp_first_stage_embed_input_meta(recipe, model_input)
-
-    assert later_stage.inputs_meta == ("old-later",)
-    assert len(first_stage.inputs_meta) == 1
-    meta = first_stage.inputs_meta[0]
-    assert tuple(meta.shape) == (3, 11, 13)
-    assert meta.dtype == torch.bfloat16
-    assert meta.device.type == "meta"
-
-
-@pytest.mark.parametrize(
-    ("recipe_kwargs", "model_input"),
-    [
-        ({"pp_enabled": False}, torch.empty(5, 11, 13)),
-        ({"has_first_stage": False}, torch.empty(5, 11, 13)),
-        ({}, torch.empty(5, 11, 13, dtype=torch.int64)),
-        ({}, torch.empty(5, 11)),
-    ],
-)
-def test_maybe_set_pp_first_stage_embed_input_meta_guard_conditions(recipe_kwargs, model_input):
-    recipe, first_stage, later_stage = _make_recipe_with_pp_stages(**recipe_kwargs)
-
-    FinetuneRecipeForVLM._maybe_set_pp_first_stage_embed_input_meta(recipe, model_input)
-
-    assert first_stage.inputs_meta == ("old-first",)
-    assert later_stage.inputs_meta == ("old-later",)
-
-
-class _FakeCPMesh:
-    mesh_dim_names = ("cp",)
-
-    def __getitem__(self, key):
-        assert key == "cp"
-        return SimpleNamespace(size=lambda: 2, get_group=lambda: "cp-group")
 
 
 class _UnsupportedVisionModel:
@@ -205,212 +145,13 @@ def test_cp_vision_frame_sharding_context_resets_published_group_after_failure(m
     assert events[2] == ("reset", token)
 
 
-class _ScheduleSpy:
-    def __init__(self):
-        self.calls = []
-
-    def step(self, model_input=None, *, target=None, losses=None, **batch):
-        self.calls.append({"model_input": model_input, "target": target, "batch": batch})
-        if losses is not None:
-            losses.append(torch.tensor(1.25))
-
-
-class _PPSpy(SimpleNamespace):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.step_batches = []
-
-    def step(self, model_input, *, target=None, losses=None, **kwargs):
-        """Record and forward an AutoPipeline step.
-
-        Args:
-            model_input: Tensor of shape [batch, ...] containing the first
-                pipeline stage's input.
-            target: Optional tensor of shape [batch, sequence] containing loss
-                targets.
-            losses: Optional mutable list populated with scalar loss tensors.
-            **kwargs: Keyword schedule inputs. Tensor values have arbitrary
-                model-defined layouts.
-
-        Returns:
-            The value returned by the schedule spy.
-        """
-        self.step_batches.append(dict(kwargs))
-        schedule_args = (model_input,) if self.info.has_first_stage else ()
-        return self.info.schedule.step(*schedule_args, target=target, losses=losses, **kwargs)
-
-
-def test_forward_backward_step_pp_cp_first_stage_sunk_keeps_input_ids_full(monkeypatch):
-    """Sunk model on the FIRST PP stage under CP: the sharder-only hook is invoked
-    (consumes nothing), so input_ids stays full-length, update_seq_len sees the
-    full seq_len, and the full-length input_ids is fed to the pipeline schedule
-    (the model embeds + shards inside its own forward)."""
-    labels = torch.arange(12, dtype=torch.long).reshape(2, 6)
-    model = _SunkSpyVLM()
-    schedule = _ScheduleSpy()
-    seq_lens = []
-    first_stage = SimpleNamespace(is_first=True, inputs_meta=None)
-    recipe = object.__new__(FinetuneRecipeForVLM)
-    recipe.dist_env = SimpleNamespace(device=torch.device("cpu"))
-    recipe.device_mesh = _FakeCPMesh()
-    recipe.cp_vision_frame_sharding = CpVisionFrameShardingConfig(enabled=True)
-    recipe.distributed_config = SimpleNamespace(defer_fsdp_grad_sync=True)
-    recipe.model_parts = [model]
-    recipe.pp_enabled = True
-    recipe.pp = _PPSpy(
-        pp_microbatch_size=2,
-        info=SimpleNamespace(
-            has_first_stage=True,
-            has_last_stage=True,
-            stages=[first_stage, SimpleNamespace(is_first=False, inputs_meta=None)],
-            schedule=schedule,
-        ),
-        update_seq_len=seq_lens.append,
-    )
-    batch = {
-        "input_ids": torch.ones(2, 6, dtype=torch.long),
-        "pixel_values": torch.zeros(2, 3, 4, 4),
-        "labels": labels,
-    }
-    seen_cp_batch = {}
-
-    def _shard(sharder, cp_batch):
-        """Capture the global model-input mapping before CP transport.
-
-        Args:
-            sharder: Sharder configured by the VLM recipe.
-            cp_batch: Mutable model-input mapping whose tensor values have
-                global batch and sequence extents.
-
-        Returns:
-            The null context factory and the same input mapping.
-        """
-        del sharder
-        seen_cp_batch.update(cp_batch)
-        return nullcontext, cp_batch
-
-    monkeypatch.setattr(vlm_finetune.ContextParallelSharder, "shard", _shard)
-    monkeypatch.setattr(vlm_finetune, "stage_vlm_media_for_pp", lambda *args, **kwargs: nullcontext())
-    monkeypatch.setattr(FinetuneRecipeForVLM, "_maybe_set_pp_first_stage_embed_input_meta", lambda self, mi: None)
-
-    loss_buffer = []
-    FinetuneRecipeForVLM._forward_backward_step(
-        recipe,
-        0,
-        batch,
-        loss_buffer=loss_buffer,
-        num_label_tokens=labels.numel(),
-        num_batches=1,
-    )
-
-    assert len(model.calls) == 1
-    # Sharder-only: input_ids stays full, no inputs_embeds injected.
-    assert "input_ids" in seen_cp_batch
-    assert tuple(seen_cp_batch["input_ids"].shape) == (2, 6)
-    assert "inputs_embeds" not in seen_cp_batch
-    assert seq_lens == [6]
-    assert [set(call.keys()) for call in recipe.pp.step_batches] == [{"pixel_values"}]
-    assert len(schedule.calls) == 1
-    assert tuple(schedule.calls[0]["model_input"].shape) == (2, 6)
-    assert torch.equal(schedule.calls[0]["target"], labels)
-    assert torch.equal(loss_buffer[0], torch.tensor(1.25))
-
-
-class _SunkSpyVLM:
-    """Sunk VLM: sharder-only CP hook (embeds/shards in forward, consumes nothing)."""
-
-    def __init__(self):
-        self.calls = []
-
-    def prepare_model_inputs_for_cp(self, batch, *, num_chunks=1):
-        # Sharder-only: nothing consumed, no inputs_embeds — input_ids stays full.
-        self.calls.append({"batch": dict(batch), "num_chunks": num_chunks})
-        return {}
-
-    def __call__(self, **kwargs):
-        raise AssertionError("CP prepare must call prepare_model_inputs_for_cp directly, not __call__")
-
-
-def _run_nonfirst_stage_fbstep(monkeypatch, model):
-    """Drive _forward_backward_step for a non-first (has_first_stage=False) PP+CP stage."""
-    labels = torch.arange(12, dtype=torch.long).reshape(2, 6)
-    schedule = _ScheduleSpy()
-    seq_lens = []
-    recipe = object.__new__(FinetuneRecipeForVLM)
-    recipe.dist_env = SimpleNamespace(device=torch.device("cpu"))
-    recipe.device_mesh = _FakeCPMesh()
-    recipe.cp_vision_frame_sharding = CpVisionFrameShardingConfig(enabled=True)
-    recipe.distributed_config = SimpleNamespace(defer_fsdp_grad_sync=True)
-    recipe.model_parts = [model]
-    recipe.pp_enabled = True
-    recipe.pp = _PPSpy(
-        pp_microbatch_size=2,
-        info=SimpleNamespace(
-            has_first_stage=False,
-            has_last_stage=True,
-            stages=[SimpleNamespace(is_first=False, inputs_meta=None)],
-            schedule=schedule,
-        ),
-        update_seq_len=seq_lens.append,
-    )
-    batch = {
-        "input_ids": torch.ones(2, 6, dtype=torch.long),
-        "pixel_values": torch.zeros(2, 3, 4, 4),
-        "labels": labels,
-    }
-    seen_cp_batch = {}
-
-    def _shard(sharder, cp_batch):
-        """Capture the global model-input mapping before CP transport.
-
-        Args:
-            sharder: Sharder configured by the VLM recipe.
-            cp_batch: Mutable model-input mapping whose tensor values have
-                global batch and sequence extents.
-
-        Returns:
-            The null context factory and the same input mapping.
-        """
-        del sharder
-        seen_cp_batch.update(cp_batch)
-        return nullcontext, cp_batch
-
-    monkeypatch.setattr(vlm_finetune.ContextParallelSharder, "shard", _shard)
-    monkeypatch.setattr(vlm_finetune, "stage_vlm_media_for_pp", lambda *args, **kwargs: nullcontext())
-    monkeypatch.setattr(FinetuneRecipeForVLM, "_maybe_set_pp_first_stage_embed_input_meta", lambda self, mi: None)
-
-    FinetuneRecipeForVLM._forward_backward_step(
-        recipe, 0, batch, loss_buffer=[], num_label_tokens=labels.numel(), num_batches=1
-    )
-    return seen_cp_batch, seq_lens, recipe.pp.step_batches, schedule.calls
-
-
-def test_forward_backward_step_pp_cp_sunk_model_nonfirst_stage_invokes_hook_keeps_input_ids_full(monkeypatch):
-    """Regression: a sunk model must invoke its sharder-only hook on NON-first PP
-    stages under cp>1, so input_ids stays full-length and update_seq_len (which
-    drives the CP-aware stage metas) sees the FULL seq_len — not the local length
-    the generic sharder would produce, which would ÷cp a second time and truncate
-    the inter-stage hidden (the text-decoder RoPE size mismatch)."""
-    model = _SunkSpyVLM()
-    seen_cp_batch, seq_lens, step_batches, schedule_calls = _run_nonfirst_stage_fbstep(monkeypatch, model)
-
-    # Hook invoked on the non-first stage (this is the fix).
-    assert len(model.calls) == 1
-    # Sharder-only hook consumes nothing: input_ids stays full-length (seq=6).
-    assert "input_ids" in seen_cp_batch
-    assert tuple(seen_cp_batch["input_ids"].shape) == (2, 6)
-    # All pp ranks feed the FULL seq_len to update_seq_len.
-    assert seq_lens == [6]
-    assert step_batches == [{}]
-    assert schedule_calls[0]["model_input"] is None
-
-
 class _FakePPModel:
     def __init__(self, stage0):
         self.parts = [stage0]
         self.pp_batch_size = 4
         self.pp_microbatch_size = 2
-        self.info = SimpleNamespace(has_last_stage=False, stages=[], schedule=None)
+        self.scale_grads_in_schedule = False
+        self.info = SimpleNamespace(has_first_stage=True, has_last_stage=False, stages=[], schedule=None)
 
 
 class _StageWithCPPreembedInForward:
@@ -427,6 +168,7 @@ class _StageWithoutCPPrepare:
 
 def _patch_pp_setup_minimals(monkeypatch, *, cp_size, stage0, dataloader_calls):
     monkeypatch.setattr(vlm_finetune, "AutoPipeline", _FakePPModel)
+    monkeypatch.setattr("nemo_automodel.engine.AutoPipeline", _FakePPModel)
     monkeypatch.setattr(
         vlm_finetune,
         "initialize_distributed",
@@ -437,7 +179,7 @@ def _patch_pp_setup_minimals(monkeypatch, *, cp_size, stage0, dataloader_calls):
     monkeypatch.setattr(vlm_finetune, "StatefulRNG", lambda *args, **kwargs: "rng")
     monkeypatch.setattr(
         "nemo_automodel.recipes._typed_config.RecipeConfig.loss_fn",
-        property(lambda self: SimpleNamespace(build=lambda: "loss_fn")),
+        property(lambda self: SimpleNamespace(build=lambda: MaskedCrossEntropy(reduction="sum"))),
     )
     monkeypatch.setattr(vlm_finetune, "_supports_logits_to_keep", lambda model: True)
     monkeypatch.setattr(
@@ -452,7 +194,7 @@ def _patch_pp_setup_minimals(monkeypatch, *, cp_size, stage0, dataloader_calls):
                 pp_size=2,
             ),
             strategy_config=SimpleNamespace(),
-            pipeline_config=SimpleNamespace(),
+            pipeline_config=SimpleNamespace(scale_grads_in_schedule=False),
             moe_parallel_config=None,
             activation_checkpointing=False,
         ),
@@ -574,6 +316,8 @@ def test_setup_always_stages_pp_media_under_pp(
 
     assert dataloader_calls[0]["pp_n_microbatches"] == expected_pp_n_microbatches
     assert dataloader_calls[0]["cp_size"] == cp_size
+    assert trainer.engine.pipeline is trainer.pp
+    assert trainer.engine.microbatch_size == 1
 
 
 # -----------------------------------------------------------------------------

@@ -260,6 +260,29 @@ def test_pipeline_loss_fused_ce_routes_bare_tensor_as_hidden_states():
     assert captured["logits"] is None
 
 
+def test_pipeline_loss_fused_ce_aligns_single_thd_hidden_states_with_flat_labels():
+    """The synthetic PP axis on a single THD chunk is not a token axis."""
+    from nemo_automodel.components.loss.mtp import PipelineCausalLMLoss
+
+    m = _TinyModel()
+    m.training = False
+    loss_mod = PipelineCausalLMLoss(FusedLinearCrossEntropy(), m)
+    hidden = torch.randn(1, S, H)
+    labels = torch.randint(0, V, (S,))
+    captured = {}
+
+    def fake_calc(loss_fn, **kw):
+        captured.update(kw)
+        return torch.zeros((), requires_grad=True)
+
+    with mock.patch.object(_mtp, "calculate_loss", side_effect=fake_calc):
+        loss_mod(hidden, labels)
+
+    assert captured["hidden_states"].shape == (S, H)
+    torch.testing.assert_close(captured["hidden_states"], hidden.squeeze(0))
+    assert captured["logits"] is None
+
+
 def test_pipeline_loss_fused_ce_with_mtp_tuple_raises():
     """FusedLinearCrossEntropy cannot consume an MTP tuple output (it carries
     logits, not the hidden states the fused loss needs), so the last-stage loss

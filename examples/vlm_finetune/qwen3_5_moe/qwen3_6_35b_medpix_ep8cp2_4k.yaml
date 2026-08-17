@@ -31,6 +31,8 @@ model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
   pretrained_model_name_or_path: Qwen/Qwen3.6-35B-A3B
   trust_remote_code: false
+  # MTP's future-token shift is not yet context-parallel aware.
+  num_nextn_predict_layers: 0
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
     attn: te

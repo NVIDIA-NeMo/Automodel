@@ -358,6 +358,17 @@ class PipelineCausalLMLoss(nn.Module):
             if isinstance(self.loss_fn, FusedLinearCrossEntropy) and isinstance(output, torch.Tensor):
                 logits = None
                 hidden_states = output
+                # A single THD pipeline microbatch keeps a synthetic leading
+                # pipeline axis on the last-stage hidden states, while its
+                # labels use the native flat token layout.  Remove only that
+                # synthetic axis before invoking fused linear CE.
+                if (
+                    labels.ndim == 1
+                    and hidden_states.ndim == 3
+                    and hidden_states.shape[0] == 1
+                    and hidden_states.shape[1] == labels.shape[0]
+                ):
+                    hidden_states = hidden_states.squeeze(0)
             else:
                 logits = getattr(output, "logits", output)
                 hidden_states = _get_final_hidden_states(output)

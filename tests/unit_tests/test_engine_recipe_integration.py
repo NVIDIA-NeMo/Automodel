@@ -23,6 +23,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+from nemo_automodel.components.models.nemotron_parse.nemotron_parse_loss import NemotronParseLoss
 from nemo_automodel.engine import Engine, collate_prebatched
 from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
 from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM
@@ -66,26 +67,31 @@ class _CountingSGD(torch.optim.SGD):
 
 
 @pytest.mark.parametrize(
-    ("recipe_cls", "vlm"),
+    ("recipe_cls", "vlm", "loss_kind"),
     [
-        (TrainFinetuneRecipeForNextTokenPrediction, False),
-        (FinetuneRecipeForVLM, True),
+        (TrainFinetuneRecipeForNextTokenPrediction, False, "masked"),
+        (FinetuneRecipeForVLM, True, "masked"),
+        (FinetuneRecipeForVLM, True, "nemotron_parse"),
     ],
 )
-def test_recipes_run_one_datum_engine_window_then_one_optimizer_step(recipe_cls, vlm):
+def test_recipes_run_one_datum_engine_window_then_one_optimizer_step(recipe_cls, vlm, loss_kind):
     model = _TinyLM(vlm=vlm)
     reference = _TinyLM(vlm=vlm)
     reference.load_state_dict(model.state_dict())
     recipe = object.__new__(recipe_cls)
     recipe.cfg = _Config()
-    recipe.loss_fn = MaskedCrossEntropy()
+    recipe.loss_fn = (
+        NemotronParseLoss(class_token_start_idx=100, reduction="sum")
+        if loss_kind == "nemotron_parse"
+        else MaskedCrossEntropy()
+    )
     recipe.model_parts = [model]
     recipe.device_mesh = None
     recipe.moe_mesh = None
     recipe.pp_enabled = False
     recipe.dist_env = SimpleNamespace(device=torch.device("cpu"), world_size=1, is_main=True)
     recipe.distributed_config = SimpleNamespace(defer_fsdp_grad_sync=True)
-    recipe.engine = Engine(model, device="cpu", collate_fn=collate_prebatched)
+    recipe.engine = Engine(model, device="cpu", microbatch_size=1, collate_fn=collate_prebatched)
     optimizer = _CountingSGD(model.parameters())
     recipe.optimizer = [optimizer]
     recipe.lr_scheduler = None

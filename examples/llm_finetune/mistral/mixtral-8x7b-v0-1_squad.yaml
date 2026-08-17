@@ -71,14 +71,12 @@ dataset:
   split: train
 
 packed_sequence:
-  # Set packed_sequence_size > 0 to run with packed sequences
-  packed_sequence_size: 1024
-  packing_strategy: thd
+  packed_sequence_size: 0
 
-# StatefulDataLoader with packed-sequence collate
+# StatefulDataLoader with default padded collate
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
   shuffle: true
 
 validation_dataset:
@@ -88,7 +86,7 @@ validation_dataset:
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
 
 optimizer:
   _target_: torch.optim.Adam

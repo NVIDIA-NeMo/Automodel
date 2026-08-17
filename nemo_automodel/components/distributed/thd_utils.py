@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import Any
+
 import torch
 
 
@@ -83,7 +85,7 @@ def _thd_padding_mask(
 
 
 def process_input_for_thd(
-    batch: dict[str, torch.Tensor],
+    batch: dict[str, Any],
     seq_lens_padding_value: int = -1000,
     padding_token_id: int = 0,
 ) -> dict[str, torch.Tensor]:
@@ -272,19 +274,161 @@ def process_input_for_thd(
     if max_seqlen is not None:
         result["max_seqlen"] = max_seqlen
 
-    # Pass through any field this function neither transforms nor consumes (e.g.
-    # VLM media tensors like pixel_values / image_grid_thw), tensor or not, so
-    # callers don't need to pop and restore them around the THD conversion.
-    _consumed = {"seq_lens", "seq_lens_padded"}
+    # Engine-prefixed loss fields use the primary stream's [B, S] -> [T]
+    # transform. The prefix makes the token-layout intent explicit: model-owned
+    # tensors may coincidentally start with [B, S] but need their original
+    # layout (for example a VLM's global vision mask).
+    _consumed = {"input_ids", "labels", "position_ids", "seq_lens", "seq_lens_padded"}
     for key, value in batch.items():
-        if key not in result and key not in _consumed:
+        if key in result or key in _consumed:
+            continue
+        if (
+            key.startswith("__engine_loss__")
+            and isinstance(value, torch.Tensor)
+            and value.ndim >= 2
+            and tuple(value.shape[:2]) == (batch_size, seq_len)
+        ):
+            result[key] = value.reshape(total_tokens, *value.shape[2:])
+        else:
             result[key] = value
 
     return result
 
 
+def stack_thd_chunks(chunks: list[dict[str, Any]], seq_lens_padding_value: int = -1000) -> dict[str, Any]:
+    """Stack independently prepared THD microbatches.
+
+    Args:
+        chunks: Non-empty list of THD mappings. Token tensors have shape
+            [tokens, ...]; cumulative-length tensors have shape [sequences + 1]
+            and may differ in length across chunks.
+        seq_lens_padding_value: Right-padding sentinel for cumulative-length
+            tensors.
+
+    Returns:
+        One mapping whose tensor fields have a leading [microbatches] axis.
+        Cumulative-length fields are padded to
+        [microbatches, max_sequences + 1]; non-tensor metadata is replicated.
+    """
+    if not chunks:
+        raise ValueError("stack_thd_chunks requires at least one chunk")
+
+    result: dict[str, Any] = {}
+    keys = set().union(*(chunk.keys() for chunk in chunks))
+    for key in keys:
+        if key == "cu_seqlens_padded":
+            values = [chunk.get("cu_seqlens_padded", chunk["cu_seqlens"]) for chunk in chunks]
+        else:
+            if not all(key in chunk for chunk in chunks):
+                raise ValueError(f"THD chunks have inconsistent field {key!r}")
+            values = [chunk[key] for chunk in chunks]
+        tensor_fields = [isinstance(value, torch.Tensor) for value in values]
+        if any(tensor_fields) and not all(tensor_fields):
+            raise ValueError(f"THD chunks disagree whether field {key!r} is a tensor")
+        if not all(tensor_fields):
+            result[key] = values[0]
+            continue
+        tensors = values
+        if key in {"cu_seqlens", "cu_seqlens_padded"}:
+            max_length = max(tensor.numel() for tensor in tensors)
+            tensors = [
+                torch.cat(
+                    (
+                        tensor,
+                        torch.full(
+                            (max_length - tensor.numel(),),
+                            seq_lens_padding_value,
+                            dtype=tensor.dtype,
+                            device=tensor.device,
+                        ),
+                    )
+                )
+                if tensor.numel() < max_length
+                else tensor
+                for tensor in tensors
+            ]
+        result[key] = torch.stack(tensors)
+    return result
+
+
+def split_final_thd_batch(
+    batch: dict[str, Any],
+    num_chunks: int,
+    seq_lens_padding_value: int = -1000,
+) -> list[dict[str, Any]]:
+    """Split an already flattened THD stream at equal token boundaries.
+
+    Args:
+        batch: Final THD mapping. ``input_ids`` has shape [tokens] or
+            ``inputs_embeds`` has shape [tokens, hidden]. Token-aligned
+            auxiliary tensors use shape [tokens, ...]. ``cu_seqlens`` and
+            optional ``cu_seqlens_padded`` have shape [sequences + 1].
+        num_chunks: Number of equal token chunks. Every boundary must also be
+            a packed-sequence boundary.
+        seq_lens_padding_value: Padding sentinel in cumulative-length tensors.
+
+    Returns:
+        THD mappings in microbatch order. Token tensors have shape
+        [tokens / num_chunks, ...] and cumulative lengths are rebased to zero.
+    """
+    if num_chunks <= 0:
+        raise ValueError(f"num_chunks must be positive, got {num_chunks}")
+    primary_name = "inputs_embeds" if "inputs_embeds" in batch else "input_ids"
+    primary = batch.get(primary_name)
+    if not isinstance(primary, torch.Tensor) or primary.ndim == 0:
+        raise ValueError("final THD input requires tensor input_ids or inputs_embeds")
+    position_ids = batch.get("position_ids")
+    if isinstance(position_ids, torch.Tensor) and position_ids.ndim == 3 and num_chunks > 1:
+        raise NotImplementedError("chunked final THD does not support three-dimensional mRoPE position_ids")
+
+    total_tokens = primary.shape[0]
+    if total_tokens % num_chunks != 0:
+        raise ValueError(f"final THD token count {total_tokens} must be divisible by {num_chunks} chunks")
+    tokens_per_chunk = total_tokens // num_chunks
+
+    cu_seqlens = batch.get("cu_seqlens")
+    if not isinstance(cu_seqlens, torch.Tensor) or cu_seqlens.ndim != 1:
+        raise ValueError("final THD input requires one-dimensional cu_seqlens")
+    cu_seqlens = cu_seqlens[cu_seqlens != seq_lens_padding_value]
+    cu_seqlens_padded = batch.get("cu_seqlens_padded", cu_seqlens)
+    if not isinstance(cu_seqlens_padded, torch.Tensor) or cu_seqlens_padded.ndim != 1:
+        raise ValueError("final THD cu_seqlens_padded must be one-dimensional")
+    cu_seqlens_padded = cu_seqlens_padded[cu_seqlens_padded != seq_lens_padding_value]
+    if cu_seqlens.numel() != cu_seqlens_padded.numel():
+        raise ValueError("cu_seqlens and cu_seqlens_padded must describe the same sequences")
+
+    boundary_indices: list[int] = []
+    for offset in range(0, total_tokens + 1, tokens_per_chunk):
+        matches = (cu_seqlens_padded == offset).nonzero(as_tuple=False).flatten()
+        if matches.numel() != 1:
+            raise ValueError(f"final THD chunk boundary {offset} is not a unique packed-sequence boundary")
+        boundary_indices.append(int(matches.item()))
+
+    chunks: list[dict[str, Any]] = []
+    for index in range(num_chunks):
+        token_start = index * tokens_per_chunk
+        sequence_start = boundary_indices[index]
+        sequence_end = boundary_indices[index + 1]
+        local_cu = cu_seqlens[sequence_start : sequence_end + 1] - cu_seqlens[sequence_start]
+        local_cu_padded = cu_seqlens_padded[sequence_start : sequence_end + 1] - cu_seqlens_padded[sequence_start]
+        chunk: dict[str, Any] = {}
+        for key, value in batch.items():
+            if key in {"cu_seqlens", "cu_seqlens_padded", "max_seqlen"}:
+                continue
+            if isinstance(value, torch.Tensor) and value.ndim > 0 and value.shape[0] == total_tokens:
+                chunk[key] = value.narrow(0, token_start, tokens_per_chunk)
+            else:
+                chunk[key] = value
+        chunk["cu_seqlens"] = local_cu.to(torch.int32)
+        if not torch.equal(local_cu, local_cu_padded):
+            chunk["cu_seqlens_padded"] = local_cu_padded.to(torch.int32)
+        chunk["max_seqlen"] = (local_cu[1:] - local_cu[:-1]).max().to(torch.int32)
+        chunks.append(chunk)
+    return chunks
+
+
 def split_batch_into_thd_chunks(
-    batch: dict[str, torch.Tensor],
+    batch: dict[str, Any],
     num_chunks: int,
     seq_lens_padding_value: int = -1000,
     padding_token_id: int = 0,
@@ -308,8 +452,12 @@ def split_batch_into_thd_chunks(
             - 'position_ids': [batch_size, seq_len] (required)
             - 'seq_lens': [batch_size, num_packs]
             - 'seq_lens_padded': [batch_size, num_packs]
-        num_chunks: Number of chunks to split the batch into. Must evenly divide batch_size.
-            If num_chunks <= 1, returns the result from process_input_for_thd directly.
+        num_chunks: Number of chunks to split the batch into. Normally this
+            must evenly divide ``batch_size``. A single already-packed row is
+            instead split by its sequence metadata; every chunk must receive
+            the same number of sequences and the same padded token width. If
+            ``num_chunks <= 1``, returns the result from
+            :func:`process_input_for_thd` directly.
         seq_lens_padding_value: Value used to indicate padding in seq_lens/seq_lens_padded
             tensors and for padding cu_seqlens to uniform length (default: -1000)
         padding_token_id: Filler token id. Only consulted by the metadata-free
@@ -353,53 +501,78 @@ def split_batch_into_thd_chunks(
         >>> # result['cu_seqlens'][0]: tensor([0, 6, 12], dtype=torch.int32)
         >>> # result['cu_seqlens'][1]: tensor([0, 6, 12], dtype=torch.int32)
     """
-    # NOTE: 3D mRoPE position_ids ([n_rope, batch, seq]) are only validated for the
-    # num_chunks<=1 path (cp_size=1). The multi-chunk stacking below has not been
-    # validated for mRoPE and should not be used for VLM+CP/PP THD yet.
     if num_chunks <= 1:
         return process_input_for_thd(batch, seq_lens_padding_value, padding_token_id)
+    position_ids = batch.get("position_ids")
+    if isinstance(position_ids, torch.Tensor) and position_ids.ndim == 3:
+        raise NotImplementedError("chunked THD does not support three-dimensional mRoPE position_ids")
 
-    def pad_and_stack(tensor_list, padding_value):
-        """Pad tensors to same length and stack them."""
-        max_len = max(len(t) for t in tensor_list)
-        padded = []
-        for t in tensor_list:
-            if len(t) < max_len:
-                pad = torch.full((max_len - len(t),), padding_value, dtype=t.dtype, device=t.device)
-                t = torch.cat([t, pad])
-            padded.append(t)
-        return torch.stack(padded)
+    batch_size = batch["input_ids"].shape[0]
+    if batch_size == 1:
+        seq_lens = batch.get("seq_lens")
+        seq_lens_padded = batch.get("seq_lens_padded", seq_lens)
+        if not isinstance(seq_lens, torch.Tensor) or not isinstance(seq_lens_padded, torch.Tensor):
+            raise ValueError("a single packed THD row requires seq_lens and seq_lens_padded for chunking")
+        real_lengths = seq_lens.reshape(-1)
+        padded_lengths = seq_lens_padded.reshape(-1)
+        real_lengths = real_lengths[real_lengths != seq_lens_padding_value]
+        padded_lengths = padded_lengths[padded_lengths != seq_lens_padding_value]
+        if (
+            real_lengths.numel() < num_chunks
+            or real_lengths.numel() != padded_lengths.numel()
+            or real_lengths.numel() % num_chunks != 0
+        ):
+            raise ValueError(
+                f"packed THD sequence count {real_lengths.numel()} must divide evenly across {num_chunks} chunks"
+            )
+        sequences_per_chunk = real_lengths.numel() // num_chunks
+        padded_by_chunk = padded_lengths.reshape(num_chunks, sequences_per_chunk)
+        chunk_widths = padded_by_chunk.sum(dim=1)
+        if not bool((chunk_widths == chunk_widths[0]).all()):
+            raise ValueError(f"packed THD pipeline chunks must have equal token widths; got {chunk_widths.tolist()}")
+        total_tokens = batch["input_ids"].shape[1]
+        if int(chunk_widths.sum().item()) != total_tokens:
+            raise ValueError(
+                f"packed THD metadata spans {int(chunk_widths.sum().item())} tokens, "
+                f"but input_ids has width {total_tokens}"
+            )
 
-    chunk_size = batch["input_ids"].shape[0] // num_chunks
+        token_keys = {"input_ids", "labels", "position_ids", "attention_mask", "padding_mask"}
+        chunk_results = []
+        token_start = 0
+        for index in range(num_chunks):
+            width = int(chunk_widths[index].item())
+            sequence_start = index * sequences_per_chunk
+            chunk: dict[str, Any] = {}
+            for key, value in batch.items():
+                if key in {"seq_lens", "seq_lens_padded"}:
+                    chunk[key] = value.narrow(1, sequence_start, sequences_per_chunk)
+                elif (
+                    (key in token_keys or key.startswith("__engine_loss__"))
+                    and isinstance(value, torch.Tensor)
+                    and value.ndim >= 2
+                    and tuple(value.shape[:2]) == (1, total_tokens)
+                ):
+                    chunk[key] = value.narrow(1, token_start, width)
+                else:
+                    chunk[key] = value
+            chunk_results.append(process_input_for_thd(chunk, seq_lens_padding_value, padding_token_id))
+            token_start += width
+        return stack_thd_chunks(chunk_results, seq_lens_padding_value)
 
-    # Process all chunks
-    chunk_results = [
-        process_input_for_thd(
-            {
-                k: v[i * chunk_size : (i + 1) * chunk_size] if isinstance(v, torch.Tensor) else v
-                for k, v in batch.items()
-            },
-            seq_lens_padding_value,
-            padding_token_id,
-        )
-        for i in range(num_chunks)
-    ]
+    if batch_size % num_chunks != 0:
+        raise ValueError(f"THD batch size {batch_size} must be divisible by {num_chunks} chunks")
+    chunk_size = batch_size // num_chunks
 
-    stacked: dict = {
-        "input_ids": torch.stack([c["input_ids"] for c in chunk_results]),
-        "labels": torch.stack([c["labels"] for c in chunk_results]),
-        "position_ids": torch.stack([c["position_ids"] for c in chunk_results]),
-        "cu_seqlens": pad_and_stack([c["cu_seqlens"] for c in chunk_results], seq_lens_padding_value),
-        "padding_mask": torch.stack([c["padding_mask"] for c in chunk_results]),
-    }
-    # Emit cu_seqlens_padded whenever any chunk emits it; absorbed chunks
-    # fall back to their cu_seqlens (semantically equal) for rectangularity.
-    if any("cu_seqlens_padded" in c for c in chunk_results):
-        stacked["cu_seqlens_padded"] = pad_and_stack(
-            [c.get("cu_seqlens_padded", c["cu_seqlens"]) for c in chunk_results],
-            seq_lens_padding_value,
-        )
-    if all("max_seqlen" in c for c in chunk_results):
-        stacked["max_seqlen"] = torch.stack([c["max_seqlen"] for c in chunk_results])
-    stacked.update({k: v for k, v in chunk_results[0].items() if not isinstance(v, torch.Tensor)})
-    return stacked
+    chunk_results = []
+    for index in range(num_chunks):
+        chunk = {
+            key: (
+                value.narrow(0, index * chunk_size, chunk_size)
+                if isinstance(value, torch.Tensor) and value.ndim > 0 and value.shape[0] == batch_size
+                else value
+            )
+            for key, value in batch.items()
+        }
+        chunk_results.append(process_input_for_thd(chunk, seq_lens_padding_value, padding_token_id))
+    return stack_thd_chunks(chunk_results, seq_lens_padding_value)
