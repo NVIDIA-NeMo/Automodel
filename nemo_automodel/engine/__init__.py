@@ -32,6 +32,7 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
 )
 from nemo_automodel.components.distributed.mesh import MeshContext
 from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
+from nemo_automodel.components.distributed.pipelining import AutoPipeline
 from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 from nemo_automodel.components.training.utils import (
@@ -82,10 +83,12 @@ class Engine:
     gradient-finalization path.
 
     Args:
-        model: An already configured and distributed model.
+        model: An already configured and distributed model, or a built
+            :class:`AutoPipeline`.
         device: Device on which model inputs and losses are evaluated.
-        mesh_context: Runtime topology. When omitted, an initialized default
-            process group is treated as pure data parallelism.
+        mesh_context: Runtime topology. Required for an ``AutoPipeline``. For
+            eager models, an initialized default process group is treated as
+            pure data parallelism when omitted.
         collate_fn: Batches one microbatch of Datums into separate model and
             loss inputs. The default supports padded and packed text. VLMs pass
             a model-specific collater. Existing recipes whose dataloaders
@@ -100,14 +103,17 @@ class Engine:
             final microbatch.
 
     Note:
-        This first execution backend is eager and weight-normalized. Pipeline
-        schedules are intentionally deferred; context-parallel input layout
-        and transport are delegated to :class:`ContextParallelSharder`.
+        Context-parallel input layout and transport are delegated to
+        :class:`ContextParallelSharder`. With an :class:`AutoPipeline`, the
+        pipeline schedule owns its internal microbatching and backward calls;
+        the Engine still owns the complete outer accumulation window and loss
+        normalization. Pipeline execution currently requires context-parallel
+        size one.
     """
 
     def __init__(
         self,
-        model: nn.Module,
+        model: nn.Module | AutoPipeline,
         *,
         device: torch.device | str,
         mesh_context: MeshContext | None = None,
@@ -116,7 +122,9 @@ class Engine:
         context_fn: Callable[[], AbstractContextManager[Any]] = nullcontext,
         defer_fsdp_grad_sync: bool = True,
     ) -> None:
-        self.model = model
+        self.pipeline = model if isinstance(model, AutoPipeline) else None
+        self.model_parts = model.parts if self.pipeline is not None else [model]
+        self.model = self.model_parts[0]
         self.device = torch.device(device)
         self.mesh_context = mesh_context
         self.collate_fn = collate_fn
@@ -131,7 +139,9 @@ class Engine:
     ) -> tuple[torch.Tensor, list[dict[str, Any]]]:
         """Accumulate gradients for a complete optimizer window.
 
-        ``window`` is explicit: each inner sequence is one eager microbatch.
+        ``window`` is explicit: each inner sequence is one eager microbatch, or
+        one outer pipeline batch that the schedule splits internally. Pipeline
+        batches currently contain exactly one already-batched Datum.
         ``loss_fn`` receives the raw model output, CP-local
         ``loss_fn_inputs``, the original Datums, and the final CP-local model
         inputs produced by the sharder. It returns either per-element losses
@@ -139,13 +149,16 @@ class Engine:
         ``loss_fn_inputs["weights"]``, or a scalar local weighted-sum
         numerator. For a scalar, the callback must apply weights and masks;
         the Engine will only apply global normalization. The callback may
-        also return one output mapping per Datum.
+        also return one output mapping per Datum during eager execution.
         Those mappings are detached and preserved in input order; the Engine
-        deliberately does not interpret or reduce them.
+        deliberately does not interpret or reduce them. Pipeline execution
+        does not yet support per-Datum outputs.
 
         Args:
             window: The complete optimizer accumulation window. Each inner
-                sequence is one microbatch of Datums. A Datum's token weights
+                sequence is one eager microbatch or outer pipeline batch of
+                Datums. A pipeline batch must contain exactly one prebatched
+                Datum. A Datum's token weights
                 may have shape ``[tokens]`` or the custom collater's batched
                 token layout; the loss tensor must use the identical shape.
             loss_fn: Computes either that per-token loss tensor or a scalar
@@ -154,21 +167,30 @@ class Engine:
 
         Returns:
             ``(loss, loss_fn_outputs)``. ``loss`` is a detached scalar reduced
-            over the DP-CP gradient group. ``loss_fn_outputs`` contains
+            over the DP-CP gradient group and, for pipeline execution,
+            synchronized across PP stages. ``loss_fn_outputs`` contains
             local-rank, per-Datum mappings in window order. Model parameters
             are unchanged, but their gradients contain the complete window's
             globally normalized backward result.
         """
         microbatches = self._validate_window(window)
         self._validate_parallelism()
+        if self.pipeline is not None and any(len(microbatch) != 1 for microbatch in microbatches):
+            raise ValueError("pipeline Engine requires exactly one prebatched Datum in each outer batch")
         dp_group, dp_size = self._dp_group_and_size()
         grad_group, grad_group_size = self._gradient_group_and_size(dp_group, dp_size)
         self._validate_window_size_across_group(len(microbatches), grad_group, grad_group_size)
         denominator = self._global_weight_sum(microbatches, dp_group, dp_size)
+        self._validate_pipeline_window(len(microbatches), denominator)
 
-        self.model.train()
-        prepare_for_grad_accumulation([self.model], pp_enabled=False)
-        MoEAuxLossAutoScaler.main_loss_backward_scale = torch.tensor(self._cp_size() / len(microbatches))
+        pp_enabled = self.pipeline is not None
+        for part in self.model_parts:
+            part.train()
+        prepare_for_grad_accumulation(self.model_parts, pp_enabled=pp_enabled)
+        inner_microbatches = self.pipeline.num_microbatches if self.pipeline is not None else 1
+        MoEAuxLossAutoScaler.main_loss_backward_scale = torch.tensor(
+            self._cp_size() / (len(microbatches) * inner_microbatches)
+        )
 
         local_loss_sum = torch.zeros((), dtype=torch.float64, device=self.device)
         loss_fn_outputs: list[dict[str, Any]] = []
@@ -177,7 +199,7 @@ class Engine:
         for index, datums in enumerate(microbatches):
             is_last = index == len(microbatches) - 1
             if is_last:
-                prepare_for_final_backward([self.model], pp_enabled=False)
+                prepare_for_final_backward(self.model_parts, pp_enabled=pp_enabled)
 
             model_inputs, loss_inputs = self.collate_fn(datums)
             self._validate_collated_weights(datums, loss_inputs)
@@ -202,6 +224,11 @@ class Engine:
                     "context parallelism requires raw THD inputs so ContextParallelSharder can partition them"
                 )
             if final_thd:
+                if self.pipeline is not None and self.pipeline.num_microbatches > 1:
+                    raise ValueError(
+                        "pipeline Engine requires raw THD inputs so ContextParallelSharder can split them "
+                        "for the schedule's internal microbatches"
+                    )
                 sharder = ContextParallelSharder(
                     device_mesh=device_mesh,
                     shard_batch=shard_batch_identity,
@@ -214,6 +241,7 @@ class Engine:
                     device_mesh,
                     cp_batch,
                     padding_token_id=self.padding_token_id,
+                    num_chunks=inner_microbatches,
                 )
             cp_context, model_inputs = sharder.shard(cp_batch)
             if model_inputs.get("qkv_format") == "thd" and (
@@ -228,50 +256,52 @@ class Engine:
             if labels is not None:
                 loss_inputs["labels"] = local_labels
             weights = loss_inputs["weights"]
-            forward_inputs = filter_forward_kwargs(self.model, model_inputs)
 
-            with get_sync_ctx(self.model, is_last, self.defer_fsdp_grad_sync), self.context_fn(), cp_context():
-                output = self.model(**forward_inputs)
-                result = loss_fn(output, loss_inputs, datums, model_inputs)
-                has_outputs = isinstance(result, tuple)
-                if returns_outputs is None:
-                    returns_outputs = has_outputs
-                elif returns_outputs != has_outputs:
-                    raise ValueError("loss_fn must return per-Datum outputs for every microbatch or none of them")
-                if isinstance(result, tuple):
-                    losses, outputs = result
-                    if (
-                        not isinstance(outputs, Sequence)
-                        or isinstance(outputs, (str, bytes))
-                        or len(outputs) != len(datums)
-                        or not all(isinstance(item, Mapping) for item in outputs)
-                    ):
-                        raise ValueError("loss_fn outputs must contain one mapping per Datum")
-                    loss_fn_outputs.extend(_detach(dict(item)) for item in outputs)
-                else:
-                    losses = result
-                if not isinstance(losses, torch.Tensor):
-                    raise TypeError("loss_fn must return a Tensor, optionally followed by per-Datum outputs")
-                if losses.ndim == 0:
-                    numerator = losses
-                elif losses.shape == weights.shape:
-                    numerator = (losses * weights.to(losses)).sum()
-                else:
-                    raise ValueError(
-                        "loss_fn must return a scalar local weighted sum or losses with exactly the same shape as weights; "
-                        f"got losses={tuple(losses.shape)}, weights={tuple(weights.shape)}"
-                    )
-                if losses.device != weights.device:
-                    raise ValueError("loss_fn losses and weights must be on the same device")
+            if self.pipeline is not None:
+                self._pipeline_step(
+                    model_inputs,
+                    loss_inputs,
+                    datums,
+                    loss_fn,
+                    denominator,
+                    grad_group_size,
+                    local_loss_sum,
+                    cp_context,
+                )
+            else:
+                forward_inputs = filter_forward_kwargs(self.model, model_inputs)
+                with get_sync_ctx(self.model, is_last, self.defer_fsdp_grad_sync), self.context_fn(), cp_context():
+                    output = self.model(**forward_inputs)
+                    result = loss_fn(output, loss_inputs, datums, model_inputs)
+                    has_outputs = isinstance(result, tuple)
+                    if returns_outputs is None:
+                        returns_outputs = has_outputs
+                    elif returns_outputs != has_outputs:
+                        raise ValueError("loss_fn must return per-Datum outputs for every microbatch or none of them")
+                    if isinstance(result, tuple):
+                        losses, outputs = result
+                        if (
+                            not isinstance(outputs, Sequence)
+                            or isinstance(outputs, (str, bytes))
+                            or len(outputs) != len(datums)
+                            or not all(isinstance(item, Mapping) for item in outputs)
+                        ):
+                            raise ValueError("loss_fn outputs must contain one mapping per Datum")
+                        loss_fn_outputs.extend(_detach(dict(item)) for item in outputs)
+                    else:
+                        losses = result
+                    numerator = _weighted_numerator(losses, weights)
+                    (numerator * (grad_group_size / denominator)).backward()
 
-                (numerator * (grad_group_size / denominator)).backward()
-
-            local_loss_sum.add_(numerator.detach().to(torch.float64))
+                local_loss_sum.add_(numerator.detach().to(torch.float64))
             if index == 0:
                 prepare_after_first_microbatch()
 
         if grad_group_size > 1:
             dist.all_reduce(local_loss_sum, op=dist.ReduceOp.SUM, group=grad_group)
+        pp_group, pp_size = self._pp_group_and_size()
+        if pp_size > 1:
+            dist.all_reduce(local_loss_sum, op=dist.ReduceOp.SUM, group=pp_group)
 
         loss = (local_loss_sum / denominator).detach()
         return loss, loss_fn_outputs
@@ -289,16 +319,72 @@ class Engine:
             microbatches.append(list(microbatch))
         return microbatches
 
+    def _pipeline_step(
+        self,
+        model_inputs: dict[str, Any],
+        loss_inputs: dict[str, torch.Tensor],
+        datums: Sequence[Datum],
+        loss_fn: LossFn,
+        denominator: torch.Tensor,
+        grad_group_size: int,
+        local_loss_sum: torch.Tensor,
+        cp_context: Callable[[], AbstractContextManager[Any]],
+    ) -> None:
+        primary_names = [name for name in ("input_ids", "inputs_embeds") if name in model_inputs]
+        if len(primary_names) != 1:
+            raise ValueError("pipeline Engine requires exactly one of input_ids or inputs_embeds")
+        primary_name = primary_names[0]
+        primary = model_inputs.pop(primary_name)
+        if not isinstance(primary, torch.Tensor) or primary.ndim < 2:
+            raise ValueError(f"pipeline Engine requires batched {primary_name} with a sequence dimension")
+
+        self.pipeline.update_seq_len(primary.shape[1])
+        pipeline_kwargs = {
+            name: value
+            for name, value in model_inputs.items()
+            if value is not None and not (isinstance(value, dict) and not value)
+        }
+
+        def pipeline_loss(output, loss_inputs_mb, model_args_mb, model_kwargs_mb):
+            if not model_args_mb:
+                raise RuntimeError("AutoPipeline loss callback did not receive the primary model input")
+            final_model_inputs = {primary_name: model_args_mb[0], **model_kwargs_mb}
+            result = loss_fn(output, loss_inputs_mb, datums, final_model_inputs)
+            if isinstance(result, tuple):
+                raise ValueError("pipeline Engine does not yet support per-Datum loss_fn outputs")
+            numerator = _weighted_numerator(result, loss_inputs_mb["weights"])
+            local_loss_sum.add_(numerator.detach().to(torch.float64))
+            return numerator * (grad_group_size / denominator)
+
+        with self.context_fn(), cp_context():
+            self.pipeline.step(
+                primary,
+                loss_inputs=loss_inputs,
+                loss_fn=pipeline_loss,
+                return_outputs=False,
+                **pipeline_kwargs,
+            )
+
     def _validate_parallelism(self) -> None:
-        if any(bool(getattr(module, "calculate_per_token_loss", False)) for module in self.model.modules()):
+        if any(
+            bool(getattr(module, "calculate_per_token_loss", False))
+            for part in self.model_parts
+            for module in part.modules()
+        ):
             raise NotImplementedError(
                 "Engine.forward_backward requires averaged distributed gradients; "
                 "MegatronFSDP calculate_per_token_loss=True uses summed gradients"
             )
+        if self.pipeline is not None and self.pipeline.scale_grads_in_schedule:
+            raise ValueError("Engine requires AutoPipeline scale_grads_in_schedule=False")
+        if self.pipeline is not None and self.mesh_context is None:
+            raise ValueError("pipeline Engine requires mesh_context")
+        if self.pipeline is not None and self._cp_size() > 1:
+            raise NotImplementedError("pipeline Engine does not yet support context parallelism")
         if self.mesh_context is None:
             return
-        if self.mesh_context.pp_size > 1:
-            raise NotImplementedError("Engine.forward_backward does not yet support pipeline parallelism")
+        if self.mesh_context.pp_size > 1 and self.pipeline is None:
+            raise NotImplementedError("pipeline parallelism requires an AutoPipeline")
         if self.mesh_context.cp_size > 1 and self.mesh_context.device_mesh is None:
             raise ValueError("context parallelism requires a device mesh")
 
@@ -326,6 +412,27 @@ class Engine:
         dp_cp_mesh = get_flat_mesh(self.mesh_context.device_mesh, "dp_cp")
         size = int(dp_cp_mesh.size())
         return (dp_cp_mesh.get_group() if size > 1 else None), size
+
+    def _pp_group_and_size(self) -> tuple[dist.ProcessGroup | None, int]:
+        if self.pipeline is None or not dist.is_available() or not dist.is_initialized():
+            return None, 1
+        size = int(self.pipeline.pp_mesh.size())
+        return (self.pipeline.pp_mesh.get_group() if size > 1 else None), size
+
+    def _validate_pipeline_window(self, size: int, denominator: torch.Tensor) -> None:
+        pp_group, pp_size = self._pp_group_and_size()
+        if pp_size <= 1:
+            return
+        local = torch.stack((denominator.new_tensor(size), denominator))
+        gathered = torch.empty(pp_size * 2, dtype=denominator.dtype, device=denominator.device)
+        dist.all_gather_into_tensor(gathered, local, group=pp_group)
+        gathered = gathered.view(pp_size, 2)
+        if not bool((gathered[:, 0] == gathered[0, 0]).all()):
+            raise ValueError(f"pipeline stages must use the same outer window size; got {gathered[:, 0].tolist()}")
+        if not torch.allclose(gathered[:, 1], gathered[0, 1].expand(pp_size), rtol=1e-8, atol=1e-12):
+            raise ValueError(
+                f"pipeline stages must use the same DP-reduced weight denominator; got {gathered[:, 1].tolist()}"
+            )
 
     def _global_weight_sum(
         self,
@@ -479,6 +586,23 @@ def _is_final_thd(model_inputs: dict[str, Any]) -> bool:
     if "seq_lens" in model_inputs or "seq_lens_padded" in model_inputs:
         raise ValueError("THD inputs cannot contain both raw seq_lens and final cu_seqlens metadata")
     return True
+
+
+def _weighted_numerator(losses: Any, weights: torch.Tensor) -> torch.Tensor:
+    if not isinstance(losses, torch.Tensor):
+        raise TypeError("loss_fn must return a Tensor, optionally followed by per-Datum outputs")
+    if losses.ndim == 0:
+        numerator = losses
+    elif losses.shape == weights.shape:
+        numerator = (losses * weights.to(losses)).sum()
+    else:
+        raise ValueError(
+            "loss_fn must return a scalar local weighted sum or losses with exactly the same shape as weights; "
+            f"got losses={tuple(losses.shape)}, weights={tuple(weights.shape)}"
+        )
+    if losses.device != weights.device:
+        raise ValueError("loss_fn losses and weights must be on the same device")
+    return numerator
 
 
 def _detach(value: Any) -> Any:

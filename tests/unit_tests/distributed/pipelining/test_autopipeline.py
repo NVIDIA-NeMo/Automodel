@@ -161,6 +161,7 @@ class TestAutoPipelineValidation:
         assert ap.pp_schedule == "1f1b"
         assert ap.pp_microbatch_size == 1
         assert ap.pp_batch_size == 4
+        assert ap.num_microbatches == 4
         assert ap._device == torch.device("cpu")
 
     def test_invalid_batch_size(self):
@@ -237,31 +238,41 @@ class _UnknownKwargsChunkHookPart(nn.Module):
 
 
 class _KwargsChunkSchedule:
-    def __init__(self, *, fail_on_step: bool = False):
+    def __init__(self, *, fail_on_step: bool = False, invoke_loss: bool = False):
         self._kwargs_chunk_spec = None
+        self._loss_fn = Mock(return_value=torch.tensor(0.0))
         self.fail_on_step = fail_on_step
+        self.invoke_loss = invoke_loss
         self.args_during_step = None
         self.kwargs_chunk_spec_during_step = None
+        self.loss_fn_during_step = None
         self.kwargs_split = None
+        self.target_during_step = None
+        self.return_outputs_during_step = None
+        self.loss_results = []
 
-    def step(self, *args, target=None, losses=None, **kwargs):
+    def step(self, *args, target=None, losses=None, return_outputs=True, **kwargs):
         """Split schedule inputs using the chunk spec active during the call.
 
         Args:
             *args: Positional schedule inputs. Tensor values have arbitrary
                 model-defined layouts.
-            target: Optional tensor of shape [batch, sequence] containing loss
-                targets.
+            target: Optional tensor of shape [batch, ...] containing loss targets
+                or structured-loss microbatch IDs.
             losses: Optional mutable list populated with scalar loss tensors.
+            return_outputs: Whether to return the schedule result.
             **kwargs: Keyword schedule inputs. Tensor values have arbitrary
                 model-defined layouts.
 
         Returns:
             A sentinel string identifying the schedule result.
         """
-        del target, losses
+        del losses
         self.args_during_step = args
         self.kwargs_chunk_spec_during_step = self._kwargs_chunk_spec
+        self.loss_fn_during_step = self._loss_fn
+        self.target_during_step = target
+        self.return_outputs_during_step = return_outputs
         if self.fail_on_step:
             raise RuntimeError("schedule failed")
         _, self.kwargs_split = split_args_kwargs_into_chunks(
@@ -270,7 +281,24 @@ class _KwargsChunkSchedule:
             2,
             kwargs_chunk_spec=self._kwargs_chunk_spec,
         )
+        if self.invoke_loss:
+            assert target is not None
+            target_chunks = torch.tensor_split(target, 2)
+            for index in (1, 0):
+                self.loss_results.append(self._loss_fn(torch.tensor(float(index)), target_chunks[index]))
         return "schedule-result"
+
+
+class _LegacyStepSchedule(_KwargsChunkSchedule):
+    """Schedule with the PyTorch 2.6-2.9 step signature."""
+
+    def __init__(self):
+        super().__init__()
+        self.received_return_outputs = False
+
+    def step(self, *args, target=None, losses=None, **kwargs):
+        self.received_return_outputs = "return_outputs" in kwargs
+        return super().step(*args, target=target, losses=losses, **kwargs)
 
 
 class TestAutoPipelineKwargsChunkSpec:
@@ -318,12 +346,29 @@ class TestAutoPipelineKwargsChunkSpec:
 
     def test_step_without_model_hook_uses_pytorch_default_chunking(self):
         ap = self._pipeline_with_parts(nn.Module())
+        original_loss_fn = ap.info.schedule._loss_fn
 
         ap.step(torch.zeros(2, 8), attention_mask=torch.ones(2, 8))
 
         assert ap.info.schedule.kwargs_chunk_spec_during_step is None
         assert ap.info.schedule.kwargs_split[0]["attention_mask"].shape == (1, 8)
         assert ap.info.schedule._kwargs_chunk_spec is None
+        assert ap.info.schedule._loss_fn is original_loss_fn
+        assert ap.info.schedule.return_outputs_during_step is True
+
+    @pytest.mark.parametrize("structured", [False, True])
+    def test_step_does_not_forward_return_outputs_to_older_pytorch(self, structured):
+        schedule = _LegacyStepSchedule()
+        ap = self._pipeline_with_parts(nn.Module(), schedule=schedule)
+        structured_kwargs = (
+            {"loss_inputs": {"weights": torch.ones(2, 8)}, "loss_fn": lambda *_: torch.tensor(0.0)}
+            if structured
+            else {}
+        )
+
+        ap.step(torch.zeros(2, 8), return_outputs=False, **structured_kwargs)
+
+        assert schedule.received_return_outputs is False
 
     def test_only_canonical_model_part_supplies_chunk_policy(self):
         ap = self._pipeline_with_parts(
@@ -360,6 +405,137 @@ class TestAutoPipelineKwargsChunkSpec:
 
         with pytest.raises(ValueError, match="unknown kwarg"):
             ap.step(torch.zeros(2, 8), attention_mask=torch.ones(2, 8))
+
+    def test_structured_loss_receives_aligned_microbatches(self):
+        schedule = _KwargsChunkSchedule(invoke_loss=True)
+        ap = self._pipeline_with_parts(
+            _KwargsChunkHookPart({"position_ids": 1}),
+            schedule=schedule,
+            has_first_stage=False,
+        )
+        input_ids = torch.arange(16).view(2, 8)
+        position_ids = torch.arange(48).view(3, 2, 8)
+        weights = torch.arange(16).view(2, 8)
+        scale = torch.tensor(0.5)
+        seen = []
+
+        def loss_fn(output, loss_inputs_mb, model_args_mb, model_kwargs_mb):
+            """Record one structured-loss callback.
+
+            Args:
+                output: Scalar tensor produced by the fake last stage.
+                loss_inputs_mb: Mapping containing ``weights`` with shape
+                    [microbatch, sequence] and scalar tensor ``scale``.
+                model_args_mb: Tuple containing input IDs with shape
+                    [microbatch, sequence].
+                model_kwargs_mb: Mapping containing position IDs with shape
+                    [axes, microbatch, sequence].
+
+            Returns:
+                Scalar loss tensor.
+            """
+            seen.append((output, loss_inputs_mb, model_args_mb, model_kwargs_mb))
+            return output
+
+        result = ap.step(
+            input_ids,
+            loss_inputs={"weights": weights, "scale": scale, "label": "train"},
+            loss_fn=loss_fn,
+            return_outputs=False,
+            position_ids=position_ids,
+        )
+
+        assert result == "schedule-result"
+        assert schedule.args_during_step == ()
+        torch.testing.assert_close(schedule.target_during_step, torch.arange(2))
+        assert schedule.target_during_step.device == ap.device
+        assert schedule.return_outputs_during_step is False
+        assert [item[0].item() for item in seen] == [1.0, 0.0]
+        for index, (_, loss_inputs_mb, model_args_mb, model_kwargs_mb) in zip((1, 0), seen):
+            torch.testing.assert_close(loss_inputs_mb["weights"], weights[index : index + 1])
+            assert loss_inputs_mb["scale"] is scale
+            assert loss_inputs_mb["label"] == "train"
+            torch.testing.assert_close(model_args_mb[0], input_ids[index : index + 1])
+            torch.testing.assert_close(model_kwargs_mb["position_ids"], position_ids[:, index : index + 1])
+
+    @pytest.mark.parametrize(
+        ("loss_inputs", "loss_fn"),
+        [
+            ({"weights": torch.ones(2, 8)}, None),
+            (None, Mock()),
+        ],
+    )
+    def test_structured_loss_requires_inputs_and_callback(self, loss_inputs, loss_fn):
+        ap = self._pipeline_with_parts(nn.Module())
+
+        with pytest.raises(ValueError, match="must be provided together"):
+            ap.step(torch.zeros(2, 8), loss_inputs=loss_inputs, loss_fn=loss_fn)
+
+    def test_structured_loss_rejects_legacy_target(self):
+        ap = self._pipeline_with_parts(nn.Module())
+
+        with pytest.raises(ValueError, match="target cannot be used"):
+            ap.step(
+                torch.zeros(2, 8),
+                target=torch.zeros(2, 8),
+                loss_inputs={"weights": torch.ones(2, 8)},
+                loss_fn=Mock(),
+            )
+
+    def test_structured_loss_requires_exact_microbatch_count(self):
+        ap = self._pipeline_with_parts(nn.Module())
+
+        with pytest.raises(ValueError, match="Expected 2 model input microbatches, got 1"):
+            ap.step(
+                torch.zeros(1, 8),
+                loss_inputs={"weights": torch.ones(2, 8)},
+                loss_fn=Mock(),
+            )
+
+        with pytest.raises(ValueError, match="Expected 2 loss input microbatches, got 1"):
+            ap.step(
+                torch.zeros(2, 8),
+                loss_inputs={"weights": torch.ones(1, 8)},
+                loss_fn=Mock(),
+            )
+
+    def test_structured_loss_restores_schedule_state_after_callback_failure(self):
+        schedule = _KwargsChunkSchedule(invoke_loss=True)
+        original_loss_fn = schedule._loss_fn
+        original_chunk_spec = {"position_ids": TensorChunkSpec(0)}
+        schedule._kwargs_chunk_spec = original_chunk_spec
+        ap = self._pipeline_with_parts(_KwargsChunkHookPart({"position_ids": 1}), schedule=schedule)
+
+        def failing_loss(output, loss_inputs_mb, model_args_mb, model_kwargs_mb):
+            """Raise while evaluating a structured microbatch loss.
+
+            Args:
+                output: Scalar tensor produced by the fake last stage.
+                loss_inputs_mb: Mapping containing weights with shape
+                    [microbatch, sequence].
+                model_args_mb: Tuple containing input IDs with shape
+                    [microbatch, sequence].
+                model_kwargs_mb: Mapping containing position IDs with shape
+                    [axes, microbatch, sequence].
+
+            Raises:
+                RuntimeError: Always.
+            """
+            del output, loss_inputs_mb, model_args_mb, model_kwargs_mb
+            raise RuntimeError("loss failed")
+
+        with pytest.raises(RuntimeError, match="loss failed"):
+            ap.step(
+                torch.zeros(2, 8),
+                loss_inputs={"weights": torch.ones(2, 8)},
+                loss_fn=failing_loss,
+                position_ids=torch.zeros(3, 2, 8),
+            )
+
+        assert schedule.loss_fn_during_step is not original_loss_fn
+        assert schedule.kwargs_chunk_spec_during_step["position_ids"].split_dim == 1
+        assert schedule._loss_fn is original_loss_fn
+        assert schedule._kwargs_chunk_spec is original_chunk_spec
 
 
 # -----------------------------

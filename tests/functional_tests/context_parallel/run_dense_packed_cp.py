@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Packed-THD CP and composed TP+CP parity for dense Llama, Qwen2, and Qwen3.
+"""Engine/FSDP2 packed-THD CP and TP+CP parity for dense Llama, Qwen2, and Qwen3.
 
 Run with::
 
@@ -29,25 +29,23 @@ import warnings
 
 import torch
 import torch.distributed as dist
-from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor
-from torch.distributed.tensor.parallel import parallelize_module
 from transformer_engine.pytorch import DotProductAttention
 from transformers import LlamaConfig, Qwen2Config, Qwen3Config
 
+from nemo_automodel.components.datasets.datum import Datum
+from nemo_automodel.components.distributed.config import FSDP2Config
 from nemo_automodel.components.distributed.context_parallel.utils import (
     attach_te_context_parallel,
     make_cp_batch_for_te,
 )
-from nemo_automodel.components.distributed.parallelizer import (
-    _attention_is_head_sharded,
-    _get_parallel_plan,
-    _update_attention_head_counts_for_tp,
-)
+from nemo_automodel.components.distributed.fsdp2 import FSDP2Manager
+from nemo_automodel.components.distributed.mesh import MeshContext, ParallelismSizes
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.llama.model import LlamaForCausalLM
 from nemo_automodel.components.models.qwen2.model import Qwen2ForCausalLM
 from nemo_automodel.components.models.qwen3.model import Qwen3ForCausalLM
+from nemo_automodel.engine import Engine, collate_prebatched
 
 NUM_HIDDEN_LAYERS = 2
 
@@ -110,31 +108,14 @@ def _build_model(
     return model.to(device=device, dtype=torch.bfloat16).train()
 
 
-def _apply_tensor_parallel(model: torch.nn.Module, tp_mesh) -> None:
-    """Apply the production dense-model TP plan without an additional FSDP axis.
-
-    Args:
-        model: Replicated model whose projection parameters are plain tensors.
-        tp_mesh: One-dimensional tensor-parallel mesh.
-    """
-    if tp_mesh.size() == 1:
-        return
-    plan = _get_parallel_plan(model, tp_size=tp_mesh.size())
-    with warnings.catch_warnings():
-        warnings.filterwarnings("ignore", message=".*could not be resolved.*", category=UserWarning)
-        parallelize_module(model, tp_mesh, plan)
-    if _attention_is_head_sharded(plan):
-        _update_attention_head_counts_for_tp(model, tp_mesh.size())
-
-
 def _full_tensor(tensor: torch.Tensor) -> torch.Tensor:
-    """Materialize a replicated local tensor from a TP-sharded DTensor.
+    """Materialize a replicated global tensor from a distributed tensor.
 
     Args:
-        tensor: Plain tensor or DTensor with a sharded vocabulary or parameter axis.
+        tensor: Plain tensor or DTensor sharded by FSDP, TP, or both.
 
     Returns:
-        Plain tensor with the global TP shape, replicated within the TP group.
+        Plain tensor with the global shape, replicated over its device mesh.
     """
     return tensor.full_tensor() if isinstance(tensor, DTensor) else tensor
 
@@ -171,11 +152,14 @@ def _reconstruct_global_tokens(
 def _run_model(
     model_kind: str,
     device: torch.device,
-    cp_mesh,
-    tp_mesh,
+    mesh_context: MeshContext,
+    distributed_config: FSDP2Config,
 ) -> None:
     import transformer_engine_torch as tex
 
+    assert mesh_context.device_mesh is not None
+    cp_mesh = mesh_context.device_mesh["cp"]
+    tp_mesh = mesh_context.device_mesh["tp"]
     cp_rank = cp_mesh.get_local_rank()
     cp_group = cp_mesh.get_group()
     batch = {
@@ -191,22 +175,48 @@ def _run_model(
     baseline_batch = make_cp_batch_for_te(None, _clone_batch(batch))
     baseline_labels = baseline_batch.pop("labels")
     baseline_logits = baseline_model(**baseline_batch).logits.squeeze(0)
-    loss_normalizer = baseline_logits.numel()
-    (baseline_logits.float().square().sum() / loss_normalizer).backward()
+    baseline_loss = baseline_logits.float().square().mean()
+    baseline_loss.backward()
     baseline_grads = [layer.self_attn.q_proj.weight.grad.detach().float() for layer in baseline_model.model.layers]
     assert baseline_labels.shape == (8,)
 
     cp_model = _build_model(model_kind, device)
-    _apply_tensor_parallel(cp_model, tp_mesh)
+    cp_model = FSDP2Manager(distributed_config, device_mesh=mesh_context.device_mesh).parallelize(cp_model)
     attention_cp_mesh = cp_mesh if cp_mesh.size() > 1 else None
     configured = attach_te_context_parallel(cp_model, attention_cp_mesh, tp_mesh)
     assert configured == NUM_HIDDEN_LAYERS
-    cp_batch = make_cp_batch_for_te(attention_cp_mesh, _clone_batch(batch))
-    cp_batch.pop("labels")
-    local_logits = _full_tensor(cp_model(**cp_batch).logits).squeeze(0)
-    (local_logits.float().square().sum() / loss_normalizer).backward()
 
-    cu_seqlens = cp_batch["cu_seqlens"]
+    raw_model_inputs = _clone_batch(batch)
+    raw_labels = raw_model_inputs.pop("labels")
+    datum = Datum(
+        model_inputs=raw_model_inputs,
+        loss_fn_inputs={
+            "labels": raw_labels,
+            "weights": torch.ones_like(raw_labels, dtype=torch.float32),
+        },
+    )
+    assert "seq_lens" in datum.model_inputs and "cu_seqlens" not in datum.model_inputs
+
+    observed: dict[str, torch.Tensor] = {}
+
+    def loss_fn(output, loss_inputs, _datums, model_inputs):
+        local_logits = _full_tensor(output.logits).squeeze(0)
+        observed["logits"] = local_logits.detach()
+        observed["cu_seqlens"] = model_inputs["cu_seqlens"].detach()
+        observed["labels"] = loss_inputs["labels"].detach()
+        return local_logits.float().square().mean(dim=-1)
+
+    engine_loss, _ = Engine(
+        cp_model,
+        device=device,
+        mesh_context=mesh_context,
+        collate_fn=collate_prebatched,
+        defer_fsdp_grad_sync=distributed_config.defer_fsdp_grad_sync,
+    ).forward_backward([[datum]], loss_fn)
+
+    local_logits = observed["logits"]
+    assert observed["labels"].shape == (8 // cp_mesh.size(),)
+    cu_seqlens = observed["cu_seqlens"]
     indices = tex.thd_get_partitioned_indices(cu_seqlens, 8, cp_mesh.size(), cp_rank).to(torch.int32)
     cp_logits = _reconstruct_global_tokens(
         local_logits,
@@ -215,22 +225,30 @@ def _run_model(
         group=cp_group,
     )
     cp_grads = [_full_tensor(layer.self_attn.q_proj.weight.grad).detach().float() for layer in cp_model.model.layers]
-    for cp_grad in cp_grads:
-        dist.all_reduce(cp_grad, group=cp_group)
 
+    cp_loss = cp_logits.float().square().mean()
+    # The Engine must normalize the exact distributed logits tightly. The
+    # baseline comparison is looser because independently executed BF16
+    # attention paths can differ by roughly one ULP, which doubles under x**2.
+    torch.testing.assert_close(engine_loss.float(), cp_loss, atol=1e-6, rtol=1e-5)
+    torch.testing.assert_close(engine_loss.float(), baseline_loss.detach(), atol=1e-6, rtol=1e-2)
     torch.testing.assert_close(cp_logits, baseline_logits, atol=3e-2, rtol=3e-2)
     for cp_grad, baseline_grad in zip(cp_grads, baseline_grads):
         torch.testing.assert_close(cp_grad, baseline_grad, atol=1e-3, rtol=5e-2)
     assert torch.isfinite(cp_logits).all()
     assert all(torch.isfinite(cp_grad).all() for cp_grad in cp_grads)
     if dist.get_rank() == 0:
+        loss_diff = (engine_loss.float() - baseline_loss.detach()).abs().item()
+        normalization_diff = (engine_loss.float() - cp_loss).abs().item()
         output_diff = (cp_logits.float() - baseline_logits.float()).abs().max().item()
         grad_diff = max(
             (cp_grad - baseline_grad).abs().max().item() for cp_grad, baseline_grad in zip(cp_grads, baseline_grads)
         )
         print(
             f"{model_kind} full TP={tp_mesh.size()} CP={cp_mesh.size()}: "
-            f"packed parity passed (logits max={output_diff:.6f}, grad max={grad_diff:.6f})"
+            f"Engine packed parity passed "
+            f"(loss={loss_diff:.6f}, normalization={normalization_diff:.6f}, "
+            f"logits max={output_diff:.6f}, grad max={grad_diff:.6f})"
         )
 
 
@@ -296,12 +314,17 @@ def main() -> None:
     if dist.get_world_size() % args.tp_size != 0:
         raise ValueError(f"World size {dist.get_world_size()} must be divisible by TP size {args.tp_size}.")
     cp_size = dist.get_world_size() // args.tp_size
-    mesh = init_device_mesh("cuda", (cp_size, args.tp_size), mesh_dim_names=("cp", "tp"))
-    cp_mesh = mesh["cp"]
-    tp_mesh = mesh["tp"]
+    distributed_config = FSDP2Config()
+    mesh_context = MeshContext.build(
+        distributed_config,
+        ParallelismSizes(dp_size=1, cp_size=cp_size, tp_size=args.tp_size),
+        world_size=dist.get_world_size(),
+    )
+    assert mesh_context.device_mesh is not None
+    assert mesh_context.device_mesh["dp_shard_cp"].size() == cp_size
     try:
         for model_kind in ("llama", "qwen2", "qwen3"):
-            _run_model(model_kind, device, cp_mesh, tp_mesh)
+            _run_model(model_kind, device, mesh_context, distributed_config)
             dist.barrier()
         if args.tp_size == 1:
             for model_kind in ("qwen2", "qwen3"):

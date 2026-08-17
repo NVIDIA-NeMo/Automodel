@@ -697,19 +697,35 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # Tokenizer + model-derived values are runtime concerns: build them here and pass them to
         # each DataloaderConfig.build(); the configs themselves are resolved at the RecipeConfig boundary.
         _, self.tokenizer = _build_tokenizer(self.cfg.model, self.cfg.dataset)
-        model_has_mtp = not self.pp_enabled and any(
-            getattr(module, "mtp", None) is not None for module in self.model_parts[0].modules()
+        model_has_mtp = any(
+            getattr(module, "mtp", None) is not None
+            for model_part in self.model_parts
+            for module in model_part.modules()
+        )
+        pp_group = self._get_pp_group() if self.pp_enabled else None
+        if pp_group is not None:
+            # The MTP head may exist only on the last PP stage; all stages must choose the same path.
+            model_has_mtp_flag = torch.tensor(int(model_has_mtp), device=self.dist_env.device)
+            torch.distributed.all_reduce(model_has_mtp_flag, op=torch.distributed.ReduceOp.MAX, group=pp_group)
+            model_has_mtp = bool(model_has_mtp_flag.item())
+
+        dataloader_config = self.cfg.dataloader
+        pp_uses_packed_batches = self.pp_enabled and (
+            _packed_seq_size > 0 or bool(getattr(dataloader_config, "emits_thd", False))
         )
         self.engine = None
         if (
-            not self.pp_enabled
-            and not self.magi.enabled
-            and not (self.mesh_context.cp_size > 1 and model_has_mtp)
+            not self.magi.enabled
+            and not (model_has_mtp and (self.pp_enabled or self.mesh_context.cp_size > 1))
+            and not pp_uses_packed_batches
+            and not (self.pp_enabled and self.mesh_context.cp_size > 1)
+            and not (self.pp_enabled and isinstance(self.loss_fn, FusedLinearCrossEntropy))
+            and not (self.pp_enabled and self.pp.scale_grads_in_schedule)
             and not getattr(self.distributed_config, "calculate_per_token_loss", False)
             and getattr(self.loss_fn, "reduction", None) == "sum"
         ):
             self.engine = Engine(
-                self.model_parts[0],
+                self.pp if self.pp_enabled else self.model_parts[0],
                 device=self.dist_env.device,
                 mesh_context=self.mesh_context,
                 collate_fn=collate_prebatched,
@@ -1051,6 +1067,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
     def _compute_causal_lm_loss(self, output, labels, model_inputs, *, num_label_tokens, is_train):
         """Compute the recipe's causal-LM and optional MTP loss."""
         model = self.model_parts[0]
+        if self.pp_enabled:
+            model = next(
+                model_part for model_part, stage in zip(self.model_parts, self.pp.info.stages) if stage.is_last
+            )
         grad_reduce_group = self._get_dp_group(include_cp=True) if is_train else None
         hidden_states = get_final_hidden_states(output)
         if isinstance(self.loss_fn, FusedLinearCrossEntropy) and hidden_states is None:
@@ -1241,7 +1261,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         num_tokens_in_batch = self._dp_allreduce(num_tokens_in_batch).item()
 
         engine = getattr(self, "engine", None)
-        use_engine = engine is not None and num_label_tokens > 0
+        # A custom prepacked loader may emit THD even when setup did not advertise packing.
+        pp_uses_thd = self.pp_enabled and any(batch.get("qkv_format") == "thd" for batch in batches)
+        use_engine = engine is not None and num_label_tokens > 0 and not pp_uses_thd
         if use_engine:
             reporting_loss, _ = engine.forward_backward(
                 [[self._make_engine_datum(batch)] for batch in batches],
@@ -1274,7 +1296,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             ep_axis_name="ep" if self.moe_mesh is not None and "ep" in self.moe_mesh.mesh_dim_names else None,
             pp_axis_name="pp" if self.pp_enabled else None,
             foreach=True,
-            num_label_tokens=num_label_tokens,
+            num_label_tokens=None if use_engine else num_label_tokens,
             dp_group_size=self._get_dp_group_size(include_cp=True),
             expert_tp_replication_factor=get_expert_tp_replication_factor(self.model_parts, self.device_mesh),
         )

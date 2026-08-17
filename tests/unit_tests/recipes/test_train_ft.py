@@ -1105,6 +1105,175 @@ def test_setup_builds_engine_for_eager_sum_loss(monkeypatch):
     assert trainer.engine is not None
 
 
+def test_setup_builds_engine_for_eager_fused_loss(monkeypatch):
+    from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
+
+    cfg = _minimal_cfg_with_nvtx(nvtx_value=False)
+    _patch_setup_minimals(monkeypatch, lambda *args, **kwargs: None)
+    fused_loss = FusedLinearCrossEntropy()
+    monkeypatch.setattr(
+        RecipeConfig,
+        "loss_fn",
+        property(lambda self: SimpleNamespace(build=lambda: fused_loss)),
+    )
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft._supports_logits_to_keep", lambda _model: True)
+
+    trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
+    trainer.setup()
+
+    assert trainer.loss_fn is fused_loss
+    assert trainer.engine is not None
+
+
+@pytest.mark.parametrize(
+    (
+        "local_has_mtp",
+        "peer_has_mtp",
+        "cp_size",
+        "packed_sequence_size",
+        "dataloader_emits_thd",
+        "fused_loss",
+        "scale_grads_in_schedule",
+        "expect_engine",
+    ),
+    [
+        (False, False, 1, 0, False, False, False, True),
+        (True, False, 1, 0, False, False, False, False),
+        (False, True, 1, 0, False, False, False, False),
+        (False, False, 2, 0, False, False, False, False),
+        (False, False, 1, 8, False, False, False, False),
+        (False, False, 1, 0, True, False, False, False),
+        (False, False, 1, 0, False, True, False, False),
+        (False, False, 1, 0, False, False, True, False),
+    ],
+)
+def test_setup_engine_gate_for_pipeline(
+    monkeypatch,
+    local_has_mtp,
+    peer_has_mtp,
+    cp_size,
+    packed_sequence_size,
+    dataloader_emits_thd,
+    fused_loss,
+    scale_grads_in_schedule,
+    expect_engine,
+):
+    from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
+
+    cfg = _minimal_cfg_with_nvtx(nvtx_value=False)
+    cfg.step_scheduler.local_batch_size = 2
+    cfg.step_scheduler.global_batch_size = 2
+    cfg.packed_sequence = ConfigNode({"packed_sequence_size": packed_sequence_size})
+    _patch_setup_minimals(monkeypatch, lambda *args, **kwargs: None)
+    fused_loss_fn = FusedLinearCrossEntropy() if fused_loss else None
+    if fused_loss_fn is not None:
+        monkeypatch.setattr(
+            RecipeConfig,
+            "loss_fn",
+            property(lambda self: SimpleNamespace(build=lambda: fused_loss_fn)),
+        )
+        monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft._supports_logits_to_keep", lambda _model: True)
+    monkeypatch.setattr(
+        RecipeConfig,
+        "dataloader",
+        property(
+            lambda self: SimpleNamespace(
+                build=lambda **kwargs: "dl",
+                dataset_builds_on_all_ranks=False,
+                emits_thd=dataloader_emits_thd,
+                seed=42,
+            )
+        ),
+    )
+
+    class DummyAutoPipeline(SimpleNamespace):
+        pass
+
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.AutoPipeline", DummyAutoPipeline)
+    monkeypatch.setattr("nemo_automodel.engine.AutoPipeline", DummyAutoPipeline)
+    parts = [DummyModel()]
+    parts[0]._pp_return_hidden_states_supported = True
+    if local_has_mtp:
+        parts[0].mtp = nn.Identity()
+    pipeline = DummyAutoPipeline(
+        parts=parts,
+        pp_batch_size=2,
+        pp_microbatch_size=1,
+        scale_grads_in_schedule=scale_grads_in_schedule,
+        info=SimpleNamespace(
+            has_first_stage=True,
+            has_last_stage=False,
+            schedule=SimpleNamespace(),
+            stages=[SimpleNamespace(is_last=False)],
+        ),
+    )
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.build_model", lambda *args, **kwargs: pipeline)
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.llm.train_ft.create_distributed_setup_from_config",
+        lambda cfg, world_size: SimpleNamespace(
+            mesh_context=SimpleNamespace(
+                pp_enabled=True,
+                device_mesh=None,
+                moe_mesh=None,
+                cp_size=cp_size,
+                pp_size=2,
+            ),
+            strategy_config=None,
+            pipeline_config=SimpleNamespace(pp_seq_len=None),
+            moe_parallel_config=None,
+            activation_checkpointing=False,
+        ),
+    )
+    pp_group = object()
+    monkeypatch.setattr(TrainFinetuneRecipeForNextTokenPrediction, "_get_pp_group", lambda self: pp_group)
+    reduced_mtp_flags = []
+
+    def all_reduce_mtp_flag(flag, *, op, group):
+        assert op == torch.distributed.ReduceOp.MAX
+        assert group is pp_group
+        reduced_mtp_flags.append(bool(flag.item()))
+        if peer_has_mtp:
+            flag.fill_(1)
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce_mtp_flag)
+
+    trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
+    trainer.setup()
+
+    assert reduced_mtp_flags == [local_has_mtp]
+    if fused_loss_fn is not None:
+        assert trainer.loss_fn is fused_loss_fn
+    assert (trainer.engine is not None) is expect_engine
+    if expect_engine:
+        assert trainer.engine.pipeline is pipeline
+
+
+def test_setup_keeps_engine_disabled_for_per_token_megatron_fsdp(monkeypatch):
+    cfg = _minimal_cfg_with_nvtx(nvtx_value=False)
+    _patch_setup_minimals(monkeypatch, lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.llm.train_ft.create_distributed_setup_from_config",
+        lambda cfg, world_size: SimpleNamespace(
+            mesh_context=SimpleNamespace(
+                pp_enabled=False,
+                device_mesh=None,
+                moe_mesh=None,
+                cp_size=1,
+                pp_size=1,
+            ),
+            strategy_config=SimpleNamespace(calculate_per_token_loss=True),
+            pipeline_config=None,
+            moe_parallel_config=None,
+            activation_checkpointing=False,
+        ),
+    )
+
+    trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
+    trainer.setup()
+
+    assert trainer.engine is None
+
+
 def test_setup_does_not_change_storage_dtype_for_non_kd_recipe(monkeypatch):
     cfg = _minimal_cfg_with_nvtx(nvtx_value=False, optimizer_target="torch.optim.AdamW")
 
@@ -2167,6 +2336,78 @@ class TestRunTrainOptimStepSetsMoEScale:
         # Base CP-aware average: 2 / 8. PP post-normalization compensation: 6 / 8.
         assert MoEAuxLossAutoScaler.main_loss_backward_scale.item() == pytest.approx(0.1875)
 
+    def test_pp_engine_owns_forward_backward_and_token_normalization(self, monkeypatch):
+        recipe = self._make_recipe(monkeypatch, pp_enabled=True)
+        batches = [
+            {"input_ids": torch.tensor([[1, 2, 3]]), "labels": torch.tensor([[1, 2, -100]])},
+            {"input_ids": torch.tensor([[4, 5, 6]]), "labels": torch.tensor([[4, 5, -100]])},
+        ]
+        datums = [object(), object()]
+        make_datum = MagicMock(side_effect=datums)
+        monkeypatch.setattr(recipe, "_make_engine_datum", make_datum)
+        monkeypatch.setattr(recipe, "_forward_backward_step", MagicMock(side_effect=AssertionError("legacy path")))
+        monkeypatch.setattr(
+            recipe,
+            "_broadcast_from_last_pp_stage",
+            MagicMock(side_effect=AssertionError("Engine loss must not be broadcast again")),
+        )
+
+        engine = MagicMock()
+        engine.forward_backward.return_value = (torch.tensor(0.25), [])
+        object.__setattr__(recipe, "engine", engine)
+
+        finalizer_calls = []
+
+        def finalize_grads(*args, **kwargs):
+            finalizer_calls.append((args, kwargs))
+            return torch.tensor(1.0)
+
+        monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.scale_grads_and_clip_grad_norm", finalize_grads)
+        optimizer = SimpleNamespace(
+            step=MagicMock(),
+            zero_grad=MagicMock(),
+            param_groups=[{"lr": 0.01}],
+        )
+        object.__setattr__(recipe, "optimizer", [optimizer])
+        monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda: 0)
+
+        metrics = recipe._run_train_optim_step(batches)
+
+        engine.forward_backward.assert_called_once_with([[datums[0]], [datums[1]]], recipe._engine_loss_fn)
+        assert make_datum.call_count == 2
+        assert len(finalizer_calls) == 1
+        assert finalizer_calls[0][1]["num_label_tokens"] is None
+        assert finalizer_calls[0][1]["pp_enabled"] is True
+        assert finalizer_calls[0][1]["pp_axis_name"] == "pp"
+        optimizer.step.assert_called_once_with()
+        optimizer.zero_grad.assert_called_once_with()
+        assert metrics.metrics["loss"] == pytest.approx(0.25)
+
+    def test_pp_thd_batch_uses_legacy_forward_backward(self, monkeypatch):
+        recipe = self._make_recipe(monkeypatch, pp_enabled=True)
+        batch = {
+            "input_ids": torch.tensor([[1, 2, 3]]),
+            "labels": torch.tensor([[1, 2, -100]]),
+            "qkv_format": "thd",
+        }
+        engine = MagicMock()
+        object.__setattr__(recipe, "engine", engine)
+
+        def legacy_step(_idx, _batch, *, loss_buffer, **_kwargs):
+            loss_buffer.append(torch.tensor(0.5))
+
+        legacy_step = MagicMock(side_effect=legacy_step)
+        monkeypatch.setattr(recipe, "_forward_backward_step", legacy_step)
+        finalizer = MagicMock(return_value=torch.tensor(1.0))
+        monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.scale_grads_and_clip_grad_norm", finalizer)
+        monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda: 0)
+
+        recipe._run_train_optim_step([batch])
+
+        engine.forward_backward.assert_not_called()
+        legacy_step.assert_called_once()
+        assert finalizer.call_args.kwargs["num_label_tokens"] == 2
+
     @pytest.mark.parametrize("dp_size", [1, 8])
     def test_non_pp_scale_is_independent_of_dp_size(self, monkeypatch, dp_size):
         from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
@@ -2256,9 +2497,10 @@ def test_rope_fusion_disabled_when_cp_gt_1(monkeypatch):
     assert trainer.engine is not None
 
 
-def test_setup_keeps_engine_disabled_for_cp_with_mtp(monkeypatch):
-    cfg = _minimal_cfg_with_rope_fusion(cp_size=2, rope_fusion=True)
-    _patch_setup_minimals_with_cp(monkeypatch, cp_size=2)
+@pytest.mark.parametrize(("cp_size", "expect_engine"), [(1, True), (2, False)])
+def test_setup_engine_gate_for_mtp_with_context_parallelism(monkeypatch, cp_size, expect_engine):
+    cfg = _minimal_cfg_with_rope_fusion(cp_size=cp_size, rope_fusion=True)
+    _patch_setup_minimals_with_cp(monkeypatch, cp_size=cp_size)
     model = DummyModel()
     model.mtp = nn.Identity()
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.build_model", lambda *args, **kwargs: model)
@@ -2266,7 +2508,7 @@ def test_setup_keeps_engine_disabled_for_cp_with_mtp(monkeypatch):
     trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
     trainer.setup()
 
-    assert trainer.engine is None
+    assert (trainer.engine is not None) is expect_engine
 
 
 def test_setup_keeps_engine_disabled_for_magi(monkeypatch):

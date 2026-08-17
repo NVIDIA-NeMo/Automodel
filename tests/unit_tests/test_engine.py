@@ -37,6 +37,7 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
 )
 from nemo_automodel.components.distributed.mesh import MeshContext, ParallelismSizes
 from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
+from nemo_automodel.components.distributed.pipelining import AutoPipeline
 from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 from nemo_automodel.engine import Engine, collate_prebatched
 
@@ -71,6 +72,58 @@ class _CPMesh(dict):
     def __init__(self, size, rank):
         super().__init__(cp=_SubMesh(size, rank), tp=_SubMesh(1))
         self.mesh_dim_names = ("cp", "tp")
+
+
+class _FakeAutoPipeline(AutoPipeline):
+    def __init__(self, model, *, parts=None, num_microbatches=2, scale_grads=False, events=None):
+        self.compute_model = model
+        self._parts = parts or [model]
+        self._num_microbatches = num_microbatches
+        self.scale_grads_in_schedule = scale_grads
+        self.pp_mesh = _SubMesh(2)
+        self.events = events
+        self.step_calls = 0
+        self.backward_calls = 0
+        self.updated_seq_lens = []
+        self.callback_losses = []
+
+    @property
+    def parts(self):
+        return self._parts
+
+    @property
+    def num_microbatches(self):
+        return self._num_microbatches
+
+    def update_seq_len(self, seq_len):
+        self.updated_seq_lens.append(seq_len)
+
+    def step(self, model_input, *, loss_inputs, loss_fn, return_outputs, **kwargs):
+        assert return_outputs is False
+        self.step_calls += 1
+        if self.events is not None:
+            self.events.append("step")
+
+        def chunks(value):
+            if isinstance(value, torch.Tensor) and value.ndim > 0:
+                return value.chunk(self.num_microbatches, dim=0)
+            return (value,) * self.num_microbatches
+
+        model_chunks = chunks(model_input)
+        kwargs_chunks = {name: chunks(value) for name, value in kwargs.items()}
+        loss_chunks = {name: chunks(value) for name, value in loss_inputs.items()}
+        for index in range(self.num_microbatches):
+            model_kwargs = {name: values[index] for name, values in kwargs_chunks.items()}
+            loss_inputs_mb = {name: values[index] for name, values in loss_chunks.items()}
+            output = self.compute_model(model_chunks[index], **model_kwargs)
+            scaled_loss = loss_fn(output, loss_inputs_mb, (model_chunks[index],), model_kwargs)
+            self.callback_losses.append(scaled_loss.detach())
+            scaled_loss.backward()
+            self.backward_calls += 1
+
+
+def _pipeline_mesh_context():
+    return SimpleNamespace(pp_size=2, cp_size=1, device_mesh=None, process_group=None)
 
 
 class _DDPWithCP(nn.parallel.DistributedDataParallel):
@@ -388,6 +441,202 @@ def test_lifecycle_marks_only_the_last_microbatch_for_sync(monkeypatch):
     )
 
     assert events == ["prepare", "sync:False", "after_first", "final", "sync:True"]
+
+
+def test_pipeline_window_uses_schedule_microbatches_and_global_normalization():
+    active = False
+    context_events = []
+    backward_calls = 0
+
+    @contextmanager
+    def forward_context():
+        nonlocal active
+        assert not active
+        active = True
+        context_events.append("enter")
+        try:
+            yield
+        finally:
+            active = False
+            context_events.append("exit")
+
+    class PipelineModel(ScaleModel):
+        def forward(self, input_ids, **kwargs):
+            assert active
+            return super().forward(input_ids, **kwargs)
+
+    model = PipelineModel()
+    pipeline = _FakeAutoPipeline(model, num_microbatches=2)
+
+    def check_backward_context(grad):
+        nonlocal backward_calls
+        assert active
+        backward_calls += 1
+        return grad
+
+    model.weight.register_hook(check_backward_context)
+
+    def loss_fn(output, inputs, datums, model_inputs):
+        assert active
+        assert len(datums) == 1
+        assert output.shape == inputs["weights"].shape == model_inputs["input_ids"].shape == (1, 2)
+        return output
+
+    loss, outputs = Engine(
+        pipeline,
+        device="cpu",
+        mesh_context=_pipeline_mesh_context(),
+        collate_fn=collate_prebatched,
+        context_fn=forward_context,
+    ).forward_backward(
+        [
+            [_datum([[1, 2], [3, 4]])],
+            [_datum([[5, 6], [7, 8]])],
+        ],
+        loss_fn,
+    )
+
+    assert loss.item() == pytest.approx(4.5)
+    assert model.weight.grad.item() == pytest.approx(4.5)
+    assert outputs == []
+    assert pipeline.step_calls == 2
+    # The fake schedule performs and counts every backward, then returns None.
+    # A second Engine-owned backward would either fail or change these counts.
+    assert pipeline.backward_calls == backward_calls == 4
+    assert model.forward_calls == 4
+    assert pipeline.updated_seq_lens == [2, 2]
+    scaled_losses = torch.stack(pipeline.callback_losses)
+    torch.testing.assert_close(
+        scaled_losses,
+        torch.tensor([3 / 8, 7 / 8, 11 / 8, 15 / 8], dtype=scaled_losses.dtype),
+    )
+    assert context_events == ["enter", "exit", "enter", "exit"]
+    assert not active
+
+
+def test_pipeline_lifecycle_and_moe_scale_cover_outer_and_inner_microbatches(monkeypatch):
+    events = []
+    model = ScaleModel()
+    other_part = ScaleModel()
+    model.eval()
+    other_part.eval()
+    pipeline = _FakeAutoPipeline(
+        model,
+        parts=[model, other_part],
+        num_microbatches=2,
+        events=events,
+    )
+
+    def prepare(parts, *, pp_enabled):
+        assert parts == [model, other_part]
+        assert pp_enabled is True
+        events.append("prepare")
+
+    def prepare_final(parts, *, pp_enabled):
+        assert parts == [model, other_part]
+        assert pp_enabled is True
+        events.append("final")
+
+    monkeypatch.setattr(engine_module, "prepare_for_grad_accumulation", prepare)
+    monkeypatch.setattr(engine_module, "prepare_for_final_backward", prepare_final)
+    monkeypatch.setattr(engine_module, "prepare_after_first_microbatch", lambda: events.append("after_first"))
+    monkeypatch.setattr(MoEAuxLossAutoScaler, "main_loss_backward_scale", None)
+
+    Engine(
+        pipeline,
+        device="cpu",
+        mesh_context=_pipeline_mesh_context(),
+        collate_fn=collate_prebatched,
+    ).forward_backward(
+        [
+            [_datum([[1], [2]])],
+            [_datum([[3], [4]])],
+        ],
+        _identity_loss,
+    )
+
+    assert events == ["prepare", "step", "after_first", "final", "step"]
+    assert model.training
+    assert other_part.training
+    assert MoEAuxLossAutoScaler.main_loss_backward_scale.item() == pytest.approx(0.25)
+
+
+def test_pipeline_rejects_per_datum_outputs_before_schedule_backward():
+    model = ScaleModel()
+    pipeline = _FakeAutoPipeline(model, num_microbatches=2)
+
+    with pytest.raises(ValueError, match="per-Datum"):
+        Engine(
+            pipeline,
+            device="cpu",
+            mesh_context=_pipeline_mesh_context(),
+            collate_fn=collate_prebatched,
+        ).forward_backward(
+            [[_datum([[1], [2]])]],
+            lambda output, _inputs, _datums, _model_inputs: (output, [{"metric": output.sum()}]),
+        )
+
+    assert pipeline.step_calls == 1
+    assert pipeline.backward_calls == 0
+    assert model.forward_calls == 1
+    assert model.weight.grad is None
+
+
+def test_pipeline_rejects_schedule_gradient_scaling_before_forward():
+    model = ScaleModel()
+    pipeline = _FakeAutoPipeline(model, scale_grads=True)
+
+    with pytest.raises(ValueError, match="scale_grads_in_schedule=False"):
+        Engine(pipeline, device="cpu", mesh_context=_pipeline_mesh_context()).forward_backward(
+            [[_datum([1])]], _identity_loss
+        )
+
+    assert pipeline.step_calls == 0
+    assert model.forward_calls == 0
+    assert model.weight.grad is None
+
+
+def test_pipeline_rejects_multiple_datums_in_one_outer_batch_before_forward():
+    model = ScaleModel()
+    pipeline = _FakeAutoPipeline(model)
+
+    with pytest.raises(ValueError, match="exactly one prebatched Datum"):
+        Engine(pipeline, device="cpu", mesh_context=_pipeline_mesh_context()).forward_backward(
+            [[_datum([1]), _datum([2])]],
+            _identity_loss,
+        )
+
+    assert pipeline.step_calls == 0
+    assert model.forward_calls == 0
+    assert model.weight.grad is None
+
+
+def test_pipeline_requires_mesh_context_before_forward():
+    model = ScaleModel()
+    pipeline = _FakeAutoPipeline(model)
+
+    with pytest.raises(ValueError, match="requires mesh_context"):
+        Engine(pipeline, device="cpu").forward_backward([[_datum([1])]], _identity_loss)
+
+    assert pipeline.step_calls == 0
+    assert model.forward_calls == 0
+    assert model.weight.grad is None
+
+
+def test_pipeline_rejects_context_parallelism_before_forward():
+    model = ScaleModel()
+    pipeline = _FakeAutoPipeline(model)
+    mesh_context = SimpleNamespace(pp_size=2, cp_size=2, device_mesh=_CPMesh(size=2, rank=0))
+
+    with pytest.raises(NotImplementedError, match="does not yet support context parallelism"):
+        Engine(pipeline, device="cpu", mesh_context=mesh_context).forward_backward(
+            [[_datum([1])]],
+            _identity_loss,
+        )
+
+    assert pipeline.step_calls == 0
+    assert model.forward_calls == 0
+    assert model.weight.grad is None
 
 
 def test_forward_context_covers_forward_loss_and_backward():
