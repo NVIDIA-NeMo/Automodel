@@ -18,8 +18,9 @@ architectures themselves come from upstream ``diffusers`` pipelines, which
 :class:`NeMoAutoDiffusionPipeline` constructs -- so most adapters here never
 import ``diffusers`` directly.
 
-Models trained through the ``transformers`` bridge live in
-:mod:`nemo_automodel._transformers.models`.
+General model families owned by the ``transformers`` bridge live in
+:mod:`nemo_automodel._transformers.models`; retrieval-specific families live in
+:mod:`nemo_automodel.retrieval.models`.
 
 Kept import-light on purpose: importing this package must not pull in
 ``diffusers`` or ``torch``. Sub-packages import them lazily.
@@ -29,7 +30,11 @@ import importlib.abc
 import pathlib
 import sys
 
-from nemo_automodel._model_locations import TRANSFORMERS_MODELS_PACKAGE
+from nemo_automodel._model_locations import (
+    RETRIEVAL_MODELS,
+    RETRIEVAL_MODELS_PACKAGE,
+    TRANSFORMERS_MODELS_PACKAGE,
+)
 
 __all__: list[str] = []
 
@@ -47,6 +52,12 @@ def _available_model_submodules() -> set[str]:
 
 
 def _make_upgrade_message(name: str) -> str:
+    if name in RETRIEVAL_MODELS:
+        return (
+            f"Model '{name}' is a retrieval model and lives in "
+            f"'{RETRIEVAL_MODELS_PACKAGE}', not '{__name__}'. "
+            f"Import it as '{RETRIEVAL_MODELS_PACKAGE}.{name}'."
+        )
     return (
         f"Module '{__name__}' has no submodule '{name}'. "
         f"Available diffusion model submodules in this installation: "

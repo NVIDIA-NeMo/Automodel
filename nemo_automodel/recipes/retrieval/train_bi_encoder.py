@@ -473,7 +473,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
             n_passages = self.train_n_passages
             use_multi_vector_scoring = _uses_multi_vector_scoring(model)
             if is_train and getattr(attr_model, "do_distributed_inbatch_negative", False):
-                from nemo_automodel._transformers.models.common.inbatch_neg_utils import (
+                from nemo_automodel.retrieval.inbatch_negatives import (
                     dist_gather_tensor,
                     dist_gather_tensor_with_dim1_padding,
                     mask_gathered_passages_same_doc_as_positive,

@@ -13,7 +13,7 @@
 # limitations under the License.
 """Single source of truth for where model sub-packages live.
 
-Model implementations are split by which bridge trains them:
+Model implementations are organized by bridge and task ownership:
 
 * :mod:`nemo_automodel._transformers.models` -- models trained through the
   HuggingFace ``transformers`` bridge: dense/MoE LLMs, VLMs, omni and dLLM
@@ -23,6 +23,9 @@ Model implementations are split by which bridge trains them:
   that drive an upstream ``diffusers`` pipeline; most do not import
   ``diffusers`` themselves, because the pipeline is constructed for them by
   :class:`NeMoAutoDiffusionPipeline`.
+* :mod:`nemo_automodel.retrieval.models` -- embedding and retrieval model
+  families. They use the transformers bridge, but live with the task-level
+  retrieval APIs instead of being mixed into the generic bridge internals.
 
 Note this is a *domain* split, not "which upstream package does the file
 import". ``qwen_image_edit`` is the only diffusers-side package that imports
@@ -31,9 +34,8 @@ pipeline. The reliable invariant is the one asserted in
 ``tests/unit_tests/test_model_locations.py``: diffusers-side packages expose a
 ``ModelAdapter``, transformers-side packages do not.
 
-Three call sites need to agree on that split -- the two ``models/__init__.py``
-"unknown model" error messages and the import aliases in
-:mod:`nemo_automodel` -- so the tables live here.
+Import aliases and bridge-specific error messages need to agree on that split,
+so the routing tables live here.
 
 This module must stay import-light (stdlib only): it is imported from
 ``nemo_automodel/__init__.py`` and must not drag in ``torch`` or
@@ -42,8 +44,9 @@ This module must stay import-light (stdlib only): it is imported from
 
 from __future__ import annotations
 
-TRANSFORMERS_MODELS_PACKAGE = "nemo_automodel._transformers.models"
 DIFFUSERS_MODELS_PACKAGE = "nemo_automodel._diffusers.models"
+RETRIEVAL_MODELS_PACKAGE = "nemo_automodel.retrieval.models"
+TRANSFORMERS_MODELS_PACKAGE = "nemo_automodel._transformers.models"
 
 # Where each model sub-package lives today. Keep in sync with the directory
 # contents; ``tests/unit_tests/test_model_locations.py`` asserts they match.
@@ -62,6 +65,14 @@ DIFFUSERS_MODELS: frozenset[str] = frozenset(
     }
 )
 
+RETRIEVAL_MODELS: frozenset[str] = frozenset(
+    {
+        "llama_bidirectional",
+        "llama_nemotron_vl",
+        "ministral_bidirectional",
+    }
+)
+
 # Model names that were *actually* reachable under the pre-split
 # ``nemo_automodel.components.models`` namespace and now live on the diffusers
 # side. Deliberately narrower than ``DIFFUSERS_MODELS``: the flow-matching
@@ -69,6 +80,14 @@ DIFFUSERS_MODELS: frozenset[str] = frozenset(
 # them there would invent a history that never existed and would swallow the
 # "unknown model" error for those names.
 _LEGACY_DIFFUSERS_MODELS: frozenset[str] = frozenset({"qwen_image_edit"})
+
+# Retrieval-only helpers historically nested below the shared ``common`` model
+# package. Their parent package remains transformers-owned, so these need exact
+# routing rather than model-family routing.
+_RELOCATED_MODEL_MODULES: dict[str, str] = {
+    "common.bidirectional": "nemo_automodel.retrieval.state_dict_adapter",
+    "common.inbatch_neg_utils": "nemo_automodel.retrieval.inbatch_negatives",
+}
 
 
 def models_package_for(name: str) -> str:
@@ -80,7 +99,11 @@ def models_package_for(name: str) -> str:
     Returns:
         The dotted package path that ``name`` lives under.
     """
-    return DIFFUSERS_MODELS_PACKAGE if name in DIFFUSERS_MODELS else TRANSFORMERS_MODELS_PACKAGE
+    if name in RETRIEVAL_MODELS:
+        return RETRIEVAL_MODELS_PACKAGE
+    if name in DIFFUSERS_MODELS:
+        return DIFFUSERS_MODELS_PACKAGE
+    return TRANSFORMERS_MODELS_PACKAGE
 
 
 def resolve_model_module(suffix: str, *, legacy: bool = False) -> str:
@@ -99,12 +122,15 @@ def resolve_model_module(suffix: str, *, legacy: bool = False) -> str:
             fires instead of silently resolving.
 
     Returns:
-        The fully-qualified module path under the transformers- or
-        diffusers-side models package.
+        The fully-qualified canonical module path.
     """
     if not suffix:
         return TRANSFORMERS_MODELS_PACKAGE
+    if suffix in _RELOCATED_MODEL_MODULES:
+        return _RELOCATED_MODEL_MODULES[suffix]
     head = suffix.split(".", 1)[0]
+    if head in RETRIEVAL_MODELS:
+        return f"{RETRIEVAL_MODELS_PACKAGE}.{suffix}"
     diffusers_names = _LEGACY_DIFFUSERS_MODELS if legacy else DIFFUSERS_MODELS
     package = DIFFUSERS_MODELS_PACKAGE if head in diffusers_names else TRANSFORMERS_MODELS_PACKAGE
     return f"{package}.{suffix}"

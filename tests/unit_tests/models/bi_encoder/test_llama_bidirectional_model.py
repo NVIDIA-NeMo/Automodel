@@ -19,19 +19,19 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers.modeling_outputs import BaseModelOutputWithPast, SequenceClassifierOutputWithPast
 
-from nemo_automodel.recipes.retrieval.train_bi_encoder import contrastive_scores_and_labels
-from nemo_automodel._transformers.models.llama_bidirectional.model import (
-    LlamaBidirectionalConfig,
-    LlamaBidirectionalForSequenceClassification,
-    LlamaBidirectionalModel,
-)
 from nemo_automodel._transformers.registry import ModelRegistry
-from nemo_automodel._transformers.retrieval import (
+from nemo_automodel.recipes.retrieval.train_bi_encoder import contrastive_scores_and_labels
+from nemo_automodel.retrieval.modeling import (
     BiEncoderModel,
     CrossEncoderModel,
     _init_encoder_common,
     configure_encoder_metadata,
     pool,
+)
+from nemo_automodel.retrieval.models.llama_bidirectional.model import (
+    LlamaBidirectionalConfig,
+    LlamaBidirectionalForSequenceClassification,
+    LlamaBidirectionalModel,
 )
 
 
@@ -419,7 +419,7 @@ def test_encoder_build_llama_bidirec_model_type_generic_path(tmp_path, monkeypat
     (model_dir / "config.json").write_text(json.dumps({"model_type": "llama_bidirec"}))
 
     # Mock AutoConfig.from_pretrained to return a config with the llama_bidirec model_type
-    import nemo_automodel._transformers.retrieval as encoder_module
+    import nemo_automodel.retrieval.modeling as encoder_module
 
     class FakeConfig:
         model_type = "llama_bidirec"
@@ -448,7 +448,7 @@ def test_encoder_build_hub_and_errors(tmp_path, monkeypatch):
     ModelRegistry.model_arch_name_to_cls["LlamaBidirectionalModel"] = FakeBidirectionalModel
 
     # Model type not in SUPPORTED_BACKBONES should fall back to AutoModel
-    import nemo_automodel._transformers.retrieval as encoder_module
+    import nemo_automodel.retrieval.modeling as encoder_module
 
     class FakeAutoModel(FakeLM):
         @classmethod
@@ -467,7 +467,7 @@ def test_encoder_build_hub_and_errors(tmp_path, monkeypatch):
 
     # For hub path tests, we need to mock AutoConfig.from_pretrained since the new code
     # calls it first to determine model type before using the registry
-    import nemo_automodel._transformers.retrieval as encoder_module
+    import nemo_automodel.retrieval.modeling as encoder_module
 
     class FakeConfig:
         model_type = "llama"
@@ -486,7 +486,7 @@ def test_encoder_build_hub_and_errors(tmp_path, monkeypatch):
 
 def test_build_generic_hf_model_score_task(tmp_path, monkeypatch):
     """CrossEncoderModel should use AutoModelForSequenceClassification for unsupported model types."""
-    import nemo_automodel._transformers.retrieval as encoder_module
+    import nemo_automodel.retrieval.modeling as encoder_module
 
     class FakeSeqClsModel(FakeLM):
         @classmethod

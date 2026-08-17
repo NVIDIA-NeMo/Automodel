@@ -38,19 +38,19 @@ from transformers.models.ministral3.modeling_ministral3 import (
     Ministral3Model,
 )
 
-from nemo_automodel._transformers.models.llama_bidirectional.model import (
+from nemo_automodel.retrieval.models.llama_bidirectional.model import (
     LlamaBidirectionalConfig,
     LlamaBidirectionalForSequenceClassification,
     LlamaBidirectionalModel,
 )
-from nemo_automodel._transformers.models.ministral_bidirectional.model import (
+from nemo_automodel.retrieval.models.ministral_bidirectional.model import (
     Ministral3BidirectionalConfig,
     Ministral3BidirectionalModel,
 )
 
 
 def test_llama_nemotron_vl_supported_backbone_for_embedding():
-    from nemo_automodel._transformers.retrieval import SUPPORTED_BACKBONES
+    from nemo_automodel.retrieval.modeling import SUPPORTED_BACKBONES
 
     assert SUPPORTED_BACKBONES["llama_nemotron_vl"]["embedding"] == "LlamaNemotronVLModel"
 
@@ -145,7 +145,7 @@ def _assert_no_language_model_prefix(model: nn.Module) -> None:
 @pytest.mark.parametrize(("kwargs", "expected_is_final"), [({}, False), ({"is_final_checkpoint": True}, True)])
 def test_save_encoder_pretrained_forwards_is_final_checkpoint(tmp_path, kwargs, expected_is_final):
     """Direct retrieval saves default to non-final unless the caller says otherwise."""
-    from nemo_automodel._transformers.retrieval import save_encoder_pretrained
+    from nemo_automodel.retrieval.modeling import save_encoder_pretrained
 
     model = nn.Module()
     checkpointer = MagicMock()
@@ -162,7 +162,7 @@ def test_save_encoder_pretrained_forwards_is_final_checkpoint(tmp_path, kwargs, 
 
 
 def test_bi_encoder_public_api_excludes_export_format_overrides():
-    from nemo_automodel._transformers import auto_model, retrieval
+    from nemo_automodel.retrieval import auto_model, modeling
 
     export_only_parameters = {
         "query_prompt",
@@ -172,8 +172,8 @@ def test_bi_encoder_public_api_excludes_export_format_overrides():
         "do_lower_case",
     }
     for callable_ in (
-        retrieval.BiEncoderModel.__init__,
-        retrieval.BiEncoderModel.build,
+        modeling.BiEncoderModel.__init__,
+        modeling.BiEncoderModel.build,
         auto_model.NeMoAutoModelBiEncoder.from_pretrained,
     ):
         parameters = inspect.signature(callable_).parameters
@@ -182,7 +182,7 @@ def test_bi_encoder_public_api_excludes_export_format_overrides():
 
 
 def test_effective_pipeline_prompts_replace_restored_export_defaults():
-    from nemo_automodel._transformers import retrieval
+    from nemo_automodel.retrieval import modeling as retrieval
 
     encoder = SimpleNamespace(
         sentence_transformer_export_config=retrieval.SentenceTransformerExportConfig(
@@ -202,7 +202,7 @@ def test_effective_pipeline_prompts_replace_restored_export_defaults():
 
 
 def test_direct_save_without_tokenizer_omits_sentence_transformer_metadata(tmp_path, caplog):
-    from nemo_automodel._transformers import retrieval
+    from nemo_automodel.retrieval import modeling as retrieval
 
     backbone = LlamaBidirectionalModel(
         LlamaBidirectionalConfig(
@@ -226,7 +226,7 @@ def test_direct_save_without_tokenizer_omits_sentence_transformer_metadata(tmp_p
 
 
 def test_direct_save_omits_unrepresentable_sentence_transformer_metadata(tmp_path, caplog):
-    from nemo_automodel._transformers import retrieval
+    from nemo_automodel.retrieval import modeling as retrieval
 
     backbone = LlamaBidirectionalModel(
         LlamaBidirectionalConfig(
@@ -255,7 +255,7 @@ def test_direct_save_omits_unrepresentable_sentence_transformer_metadata(tmp_pat
 
 
 def test_direct_standard_export_uses_general_sequence_capabilities(tmp_path):
-    from nemo_automodel._transformers import retrieval
+    from nemo_automodel.retrieval import modeling as retrieval
 
     backbone = LlamaBidirectionalModel(
         LlamaBidirectionalConfig(
@@ -279,7 +279,7 @@ def test_direct_standard_export_uses_general_sequence_capabilities(tmp_path):
 
 
 def test_direct_standard_export_preserves_cached_source_deployment_limit(tmp_path):
-    from nemo_automodel._transformers import retrieval
+    from nemo_automodel.retrieval import modeling as retrieval
 
     source_dir = tmp_path / "source"
     source_dir.mkdir()
@@ -310,7 +310,7 @@ def test_direct_standard_export_preserves_cached_source_deployment_limit(tmp_pat
 
 def test_extract_submodel_embedding_fallback_is_bidirectional(tmp_path):
     """Extracted HuggingFace embedding fallbacks use bidirectional attention."""
-    from nemo_automodel._transformers import retrieval
+    from nemo_automodel.retrieval import modeling as retrieval
 
     model_dir, language_state_dict = _save_tiny_vlm(tmp_path, "mistral")
 
@@ -345,7 +345,7 @@ def test_extract_submodel_embedding_fallback_is_bidirectional(tmp_path):
 
 def test_extract_submodel_dequantizes_native_fp8_for_training(monkeypatch):
     """FP8 parent checkpoints are materialized without scalar scale parameters."""
-    from nemo_automodel._transformers import retrieval
+    from nemo_automodel.retrieval import modeling as retrieval
 
     config = SimpleNamespace(
         model_type="mistral3",
@@ -381,7 +381,7 @@ def test_extract_submodel_dequantizes_native_fp8_for_training(monkeypatch):
 
 def test_extract_submodel_llama_embedding_from_local_vlm_converts_to_supported_backbone(tmp_path):
     """A supported extracted Llama text backbone becomes the retrieval Llama encoder."""
-    from nemo_automodel._transformers import retrieval
+    from nemo_automodel.retrieval import modeling as retrieval
 
     model_dir, language_state_dict = _save_tiny_vlm(tmp_path, "llama")
 
@@ -408,7 +408,7 @@ def test_extract_submodel_llama_embedding_from_local_vlm_converts_to_supported_b
 
 def test_embedding_fallback_forwards_hf_kwargs_and_disables_causal_attention(monkeypatch):
     """Embedding fallbacks preserve loader options and disable causal attention."""
-    from nemo_automodel._transformers import retrieval
+    from nemo_automodel.retrieval import modeling as retrieval
 
     config = MagicMock()
     config.model_type = "mistral"
@@ -456,7 +456,7 @@ def test_embedding_fallback_forwards_hf_kwargs_and_disables_causal_attention(mon
 
 def test_standard_ministral_score_uses_sequence_classification_model(tmp_path):
     """Standard Ministral score checkpoints retain the HuggingFace reranker path."""
-    from nemo_automodel._transformers import retrieval
+    from nemo_automodel.retrieval import modeling as retrieval
 
     model_dir, source_state_dict = _save_tiny_ministral_text_model(tmp_path)
 
@@ -481,7 +481,7 @@ def test_standard_ministral_score_uses_sequence_classification_model(tmp_path):
 
 def test_ministral_embedding_preserves_hf_config_overrides(tmp_path):
     """Valid HuggingFace config overrides retain native loader behavior."""
-    from nemo_automodel._transformers import retrieval
+    from nemo_automodel.retrieval import modeling as retrieval
 
     model_dir, _ = _save_tiny_ministral_text_model(tmp_path)
 
@@ -496,7 +496,7 @@ def test_ministral_embedding_preserves_hf_config_overrides(tmp_path):
 
 def test_bi_encoder_build_forwards_native_hf_kwargs_to_config_and_backbone(monkeypatch):
     """The preliminary config load retains native HuggingFace loader behavior."""
-    from nemo_automodel._transformers import retrieval
+    from nemo_automodel.retrieval import modeling as retrieval
 
     config = PretrainedConfig()
     config.model_type = "test"
@@ -540,7 +540,7 @@ def test_bi_encoder_build_forwards_native_hf_kwargs_to_config_and_backbone(monke
 
 @pytest.mark.parametrize("pooling", ["weighted_avg", "colbert", "multi_vector"])
 def test_bi_encoder_skips_standard_export_for_unrepresentable_pooling(pooling, tmp_path):
-    from nemo_automodel._transformers import retrieval
+    from nemo_automodel.retrieval import modeling as retrieval
 
     backbone = LlamaBidirectionalModel(
         LlamaBidirectionalConfig(
@@ -563,7 +563,7 @@ def test_bi_encoder_skips_standard_export_for_unrepresentable_pooling(pooling, t
 
 
 def test_bi_encoder_skips_standard_export_for_multimodal_backbone():
-    from nemo_automodel._transformers import retrieval
+    from nemo_automodel.retrieval import modeling as retrieval
 
     class CompositeBackbone(nn.Module):
         main_input_name = "pixel_values"
@@ -582,7 +582,7 @@ def test_bi_encoder_skips_standard_export_for_multimodal_backbone():
 
 
 def test_bi_encoder_export_config_uses_deployable_hf_base_classes():
-    from nemo_automodel._transformers import retrieval
+    from nemo_automodel.retrieval import modeling as retrieval
 
     backbone = LlamaBidirectionalModel(
         LlamaBidirectionalConfig(
@@ -611,7 +611,7 @@ def test_bi_encoder_export_config_uses_deployable_hf_base_classes():
 
 
 def test_bi_encoder_export_config_uses_class_model_type_when_source_type_is_retained():
-    from nemo_automodel._transformers import retrieval
+    from nemo_automodel.retrieval import modeling as retrieval
 
     config = Ministral3BidirectionalConfig.from_dict(
         {
@@ -645,7 +645,7 @@ def test_bi_encoder_export_config_uses_class_model_type_when_source_type_is_reta
 
 def test_ministral_embedding_uses_stock_bidirectional_model(tmp_path):
     """Standard Ministral checkpoints use and save the stock non-causal model."""
-    from nemo_automodel._transformers import retrieval
+    from nemo_automodel.retrieval import modeling as retrieval
 
     model_dir, source_state_dict = _save_tiny_ministral_text_model(tmp_path)
 
@@ -725,7 +725,7 @@ def test_ministral_embedding_uses_bidirectional_flash_attention(tmp_path, monkey
     """Stock Ministral selects non-causal attention at the FlashAttention kernel boundary."""
     from transformers.integrations import flash_attention
 
-    from nemo_automodel._transformers import retrieval
+    from nemo_automodel.retrieval import modeling as retrieval
 
     model_dir, _ = _save_tiny_ministral_text_model(tmp_path)
     backbone = retrieval.build_encoder_backbone(
@@ -785,8 +785,8 @@ def test_sentence_transformers_and_nemo_round_trip_generated_ministral_checkpoin
 ):
     from sentence_transformers import SentenceTransformer
 
-    from nemo_automodel._transformers import auto_model as auto_model_module
-    from nemo_automodel._transformers import retrieval
+    from nemo_automodel.retrieval import auto_model as auto_model_module
+    from nemo_automodel.retrieval import modeling as retrieval
 
     model_dir, _ = _save_tiny_ministral_text_model(tmp_path)
     backbone = retrieval.build_encoder_backbone(
@@ -861,9 +861,9 @@ def test_sentence_transformers_and_nemo_round_trip_generated_ministral_checkpoin
 def test_consolidated_checkpointer_round_trip_through_sentence_transformers_and_nemo(tmp_path, monkeypatch):
     from sentence_transformers import SentenceTransformer
 
-    from nemo_automodel._transformers import auto_model as auto_model_module
-    from nemo_automodel._transformers import retrieval
     from nemo_automodel.components.checkpoint.config import CheckpointingConfig
+    from nemo_automodel.retrieval import auto_model as auto_model_module
+    from nemo_automodel.retrieval import modeling as retrieval
 
     model_dir, _ = _save_tiny_ministral_text_model(tmp_path)
     encoder = retrieval.BiEncoderModel.build(
@@ -953,7 +953,7 @@ def test_consolidated_checkpointer_round_trip_through_sentence_transformers_and_
 
 
 def test_nemo_bi_encoder_explicit_options_override_sentence_transformer_metadata(tmp_path):
-    from nemo_automodel._transformers import retrieval
+    from nemo_automodel.retrieval import modeling as retrieval
 
     model_dir, _ = _save_tiny_ministral_text_model(tmp_path)
     backbone = retrieval.build_encoder_backbone(
@@ -976,7 +976,7 @@ def test_nemo_bi_encoder_explicit_options_override_sentence_transformer_metadata
 
 
 def test_nemo_bi_encoder_saved_prompts_round_trip_through_reexport(tmp_path):
-    from nemo_automodel._transformers import retrieval
+    from nemo_automodel.retrieval import modeling as retrieval
 
     model_dir, _ = _save_tiny_ministral_text_model(tmp_path)
     backbone = retrieval.build_encoder_backbone(
@@ -1001,7 +1001,7 @@ def test_nemo_bi_encoder_saved_prompts_round_trip_through_reexport(tmp_path):
 
 
 def test_mean_pooling_alias_matches_avg():
-    from nemo_automodel._transformers import retrieval
+    from nemo_automodel.retrieval import modeling as retrieval
 
     hidden_states = torch.tensor([[[1.0, 2.0], [3.0, 4.0], [100.0, 100.0]]])
     attention_mask = torch.tensor([[1, 1, 0]])
@@ -1013,7 +1013,7 @@ def test_mean_pooling_alias_matches_avg():
 
 
 def test_nemo_bi_encoder_uses_defaults_without_sentence_transformer_metadata():
-    from nemo_automodel._transformers import retrieval
+    from nemo_automodel.retrieval import modeling as retrieval
 
     config = PretrainedConfig()
 
@@ -1023,7 +1023,7 @@ def test_nemo_bi_encoder_uses_defaults_without_sentence_transformer_metadata():
 
 
 def test_nemo_bi_encoder_build_canonicalizes_mean_pooling(tmp_path):
-    from nemo_automodel._transformers import retrieval
+    from nemo_automodel.retrieval import modeling as retrieval
 
     model_dir, _ = _save_tiny_ministral_text_model(tmp_path)
 
@@ -1040,7 +1040,7 @@ def test_nemo_bi_encoder_build_canonicalizes_mean_pooling(tmp_path):
 
 def test_extract_submodel_ministral_embedding_from_local_vlm_converts_to_supported_backbone(tmp_path):
     """A Ministral3 VLM text backbone becomes a stock non-causal Ministral model."""
-    from nemo_automodel._transformers import retrieval
+    from nemo_automodel.retrieval import modeling as retrieval
 
     model_dir, language_state_dict = _save_tiny_vlm(tmp_path, "ministral3")
 
@@ -1069,7 +1069,7 @@ def test_extract_submodel_ministral_embedding_from_local_vlm_converts_to_support
 
 def test_extract_submodel_llama_score_from_local_vlm_converts_to_supported_cross_encoder(tmp_path):
     """A supported extracted Llama text backbone becomes the retrieval reranker."""
-    from nemo_automodel._transformers import retrieval
+    from nemo_automodel.retrieval import modeling as retrieval
 
     model_dir, language_state_dict = _save_tiny_vlm(tmp_path, "llama")
 
@@ -1099,7 +1099,7 @@ def test_extract_submodel_llama_score_from_local_vlm_converts_to_supported_cross
 
 def test_extract_submodel_ministral_score_from_local_vlm_converts_to_hf_cross_encoder(tmp_path):
     """Reranking still works when no registered score backbone exists for the text model."""
-    from nemo_automodel._transformers import retrieval
+    from nemo_automodel.retrieval import modeling as retrieval
 
     model_dir, language_state_dict = _save_tiny_vlm(tmp_path, "ministral3")
 
@@ -1131,7 +1131,7 @@ class _PlainSubmodule(nn.Module):
 
 def test_extract_submodel_without_config_raises():
     """The extracted object must carry a config so it can be saved/reloaded."""
-    from nemo_automodel._transformers.retrieval import _extract_submodel
+    from nemo_automodel.retrieval.modeling import _extract_submodel
 
     model = nn.Module()
     model.language_model = _PlainSubmodule()

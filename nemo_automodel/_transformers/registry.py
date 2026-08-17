@@ -132,18 +132,18 @@ MODEL_ARCH_MAPPING = OrderedDict(
         (
             "LlamaBidirectionalForSequenceClassification",
             (
-                "nemo_automodel._transformers.models.llama_bidirectional.model",
+                "nemo_automodel.retrieval.models.llama_bidirectional.model",
                 "LlamaBidirectionalForSequenceClassification",
                 {"retrieval"},
             ),
         ),
         (
             "LlamaBidirectionalModel",
-            ("nemo_automodel._transformers.models.llama_bidirectional.model", "LlamaBidirectionalModel", {"retrieval"}),
+            ("nemo_automodel.retrieval.models.llama_bidirectional.model", "LlamaBidirectionalModel", {"retrieval"}),
         ),
         (
             "LlamaNemotronVLModel",
-            ("nemo_automodel._transformers.models.llama_nemotron_vl.model", "LlamaNemotronVLModel", {"retrieval"}),
+            ("nemo_automodel.retrieval.models.llama_nemotron_vl.model", "LlamaNemotronVLModel", {"retrieval"}),
         ),
         (
             "LlamaForCausalLM",
@@ -175,7 +175,7 @@ MODEL_ARCH_MAPPING = OrderedDict(
         (
             "Ministral3BidirectionalModel",
             (
-                "nemo_automodel._transformers.models.ministral_bidirectional.model",
+                "nemo_automodel.retrieval.models.ministral_bidirectional.model",
                 "Ministral3BidirectionalModel",
                 {"retrieval"},
             ),
@@ -339,7 +339,7 @@ _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
     "mimo_v2_flash": ("nemo_automodel._transformers.models.mimo_v2_flash.config", "MiMoV2FlashConfig"),
     "minimax_m3_vl": ("nemo_automodel._transformers.models.minimax_m3_vl.config", "MiniMaxM3VLConfig"),
     "ministral3_bidirec": (
-        "nemo_automodel._transformers.models.ministral_bidirectional.model",
+        "nemo_automodel.retrieval.models.ministral_bidirectional.model",
         "Ministral3BidirectionalConfig",
     ),
     "mistral4": ("nemo_automodel._transformers.models.mistral4.configuration", "Mistral4Config"),

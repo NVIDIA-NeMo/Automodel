@@ -179,7 +179,7 @@ def test_llama_nemotron_vl_registry_entry_is_retrieval_model():
     from nemo_automodel._transformers.registry import MODEL_ARCH_MAPPING, ModelRegistry
 
     assert MODEL_ARCH_MAPPING["LlamaNemotronVLModel"] == (
-        "nemo_automodel._transformers.models.llama_nemotron_vl.model",
+        "nemo_automodel.retrieval.models.llama_nemotron_vl.model",
         "LlamaNemotronVLModel",
         {"retrieval"},
     )

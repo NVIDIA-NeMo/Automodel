@@ -37,7 +37,7 @@ from .package_info import __package_name__, __version__
 # Heavy dependencies (e.g., torch/transformers) are intentionally imported lazily
 # via __getattr__ so importing tokenizers doesn't pull in the full training stack.
 
-_SUBMODULES = {"recipes", "shared", "components", "models"}
+_SUBMODULES = {"recipes", "shared", "components", "models", "retrieval"}
 
 _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     "NeMoAutoModelForCausalLM": ("nemo_automodel._transformers.auto_model", "NeMoAutoModelForCausalLM"),
@@ -53,8 +53,8 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
         "NeMoAutoModelForTokenClassification",
     ),
     "NeMoAutoModelForTextToWaveform": ("nemo_automodel._transformers.auto_model", "NeMoAutoModelForTextToWaveform"),
-    "NeMoAutoModelBiEncoder": ("nemo_automodel._transformers.auto_model", "NeMoAutoModelBiEncoder"),
-    "NeMoAutoModelCrossEncoder": ("nemo_automodel._transformers.auto_model", "NeMoAutoModelCrossEncoder"),
+    "NeMoAutoModelBiEncoder": ("nemo_automodel.retrieval.auto_model", "NeMoAutoModelBiEncoder"),
+    "NeMoAutoModelCrossEncoder": ("nemo_automodel.retrieval.auto_model", "NeMoAutoModelCrossEncoder"),
     "NeMoAutoTokenizer": ("nemo_automodel._transformers.auto_tokenizer", "NeMoAutoTokenizer"),
     "NeMoAutoDiffusionPipeline": ("nemo_automodel._diffusers.auto_diffusion_pipeline", "NeMoAutoDiffusionPipeline"),
     "ModelCapabilities": ("nemo_automodel._transformers.model_capabilities", "ModelCapabilities"),
@@ -87,19 +87,35 @@ from ._model_locations import resolve_model_module as _resolve_model_module  # n
 _MODELS_ALIAS = "nemo_automodel.models"
 _LEGACY_MODELS_ALIAS = "nemo_automodel.components.models"
 
-# Individual modules that moved to a different name. The flow-matching adapters
-# moved next to the model they adapt; only ``base`` (the adapter contract) stays
-# with the pipeline, so this is a per-module map rather than a prefix rename.
+# Individual modules that moved to a different name. The flow-matching adapter
+# contract stays in components, while concrete adapters moved beside their
+# diffusers models. Retrieval implementation modules moved to the task package.
 _RENAMED_MODULES = {
-    f"nemo_automodel.components.flow_matching.adapters.{old}": f"nemo_automodel._diffusers.models.{new}.adapter"
-    for old, new in (
-        ("flux", "flux"),
-        ("flux2", "flux2"),
-        ("hunyuan", "hunyuan"),
-        ("ltx2", "ltx2"),
-        ("qwen_image", "qwen_image"),
-        ("simple", "wan"),
-    )
+    **{
+        f"nemo_automodel.components.flow_matching.adapters.{old}": (f"nemo_automodel._diffusers.models.{new}.adapter")
+        for old, new in (
+            ("flux", "flux"),
+            ("flux2", "flux2"),
+            ("hunyuan", "hunyuan"),
+            ("ltx2", "ltx2"),
+            ("qwen_image", "qwen_image"),
+            ("simple", "wan"),
+        )
+    },
+    "nemo_automodel._transformers.retrieval": "nemo_automodel.retrieval.modeling",
+    "nemo_automodel._transformers.sentence_transformer_export": (
+        "nemo_automodel.retrieval.sentence_transformer_export"
+    ),
+    "nemo_automodel._transformers.models.common.bidirectional": ("nemo_automodel.retrieval.state_dict_adapter"),
+    "nemo_automodel._transformers.models.common.inbatch_neg_utils": ("nemo_automodel.retrieval.inbatch_negatives"),
+}
+
+# Whole model families retain their former internal paths as aliases. Prefix
+# routing preserves children such as ``.model``, ``.processor`` and
+# ``.export_onnx`` as the exact same canonical module objects.
+_RENAMED_PACKAGES = {
+    f"nemo_automodel._transformers.models.{name}": f"nemo_automodel.retrieval.models.{name}"
+    for name in ("llama_bidirectional", "llama_nemotron_vl", "ministral_bidirectional")
 }
 
 
@@ -174,6 +190,14 @@ class _ModelsAliasFinder(importlib.abc.MetaPathFinder):
         renamed = _RENAMED_MODULES.get(fullname)
         if renamed is not None:
             return self._spec(fullname, renamed, True, suffix="relocated")
+
+        # Entire relocated packages, including their child modules.
+        for old_prefix, new_prefix in _RENAMED_PACKAGES.items():
+            suffix = _alias_suffix(fullname, old_prefix)
+            if suffix is None:
+                continue
+            real_name = new_prefix if not suffix else f"{new_prefix}.{suffix}"
+            return self._spec(fullname, real_name, True, suffix=suffix)
 
         return None
 

@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,14 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Bidirectional Ministral3 model for embedding and retrieval tasks."""
+"""Concrete embedding and retrieval model families."""
 
-from nemo_automodel._transformers.models.ministral_bidirectional.model import (
-    Ministral3BidirectionalConfig,
-    Ministral3BidirectionalModel,
-)
-
-__all__ = [
-    "Ministral3BidirectionalModel",
-    "Ministral3BidirectionalConfig",
-]
+__all__: list[str] = []

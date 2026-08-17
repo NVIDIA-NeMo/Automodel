@@ -13,7 +13,8 @@ This reference is built from docstrings in the [source code](https://github.com/
 |--------|-------------|
 | `nemo_automodel._transformers` | HuggingFace bridge — `NeMoAutoModelForCausalLM`, `NeMoAutoModelForImageTextToText`, model registry, capability flags, device-mesh infrastructure |
 | `nemo_automodel._diffusers` | Diffusion pipeline wrapper (`NeMoAutoDiffusionPipeline`) |
-| `nemo_automodel._transformers.models` | 27+ model families (LLM, VLM, MoE, retrieval) and their state-dict adapters |
+| `nemo_automodel._transformers.models` | Model families trained through the Transformers bridge (LLM, VLM, MoE, and dLLM) and their state-dict adapters |
+| `nemo_automodel.retrieval` | Bi-encoder and cross-encoder APIs, retrieval checkpoint/export support, and retrieval-specific model families |
 | `nemo_automodel.components.datasets` | LLM, VLM, and diffusion data pipelines |
 | `nemo_automodel.components.distributed` | FSDP2, HSDP, DDP utilities and device-mesh helpers |
 | `nemo_automodel.components.checkpoint` | Async DCP and SafeTensors checkpointing |

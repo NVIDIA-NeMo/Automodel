@@ -1199,6 +1199,12 @@ class TestIsCustomModel:
         instance = Child()
         assert _is_custom_model(instance) is True
 
+    def test_retrieval_model_namespace_is_custom(self):
+        """Task-owned retrieval implementations remain custom checkpoint models."""
+        FakeRetrievalModel = type("FakeRetrievalModel", (torch.nn.Module,), {})
+        FakeRetrievalModel.__module__ = "nemo_automodel.retrieval.models.llama_bidirectional.model"
+        assert _is_custom_model(FakeRetrievalModel()) is True
+
     def test_none_module_attr_does_not_crash(self):
         """Classes where __module__ is None don't cause an error."""
         FakeClass = type("FakeClass", (torch.nn.Module,), {})
@@ -1285,7 +1291,7 @@ def test_load_hf_bin_checkpoint_rejects_pickled_module(tmp_path):
 
 def test_load_model_uses_state_dict_adapter_from_ddp_module(tmp_path):
     """A DDP-wrapped encoder restores HF-format checkpoint keys through its adapter."""
-    from nemo_automodel._transformers.models.common.bidirectional import EncoderStateDictAdapter
+    from nemo_automodel.retrieval.state_dict_adapter import EncoderStateDictAdapter
 
     class Encoder(torch.nn.Module):
         def __init__(self):

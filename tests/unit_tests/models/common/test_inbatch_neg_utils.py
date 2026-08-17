@@ -17,8 +17,8 @@
 import pytest
 import torch
 
-import nemo_automodel._transformers.models.common.inbatch_neg_utils as inbatch_neg_utils
-from nemo_automodel._transformers.models.common.inbatch_neg_utils import (
+import nemo_automodel.retrieval.inbatch_negatives as inbatch_negatives
+from nemo_automodel.retrieval.inbatch_negatives import (
     dist_gather_tensor,
     dist_gather_tensor_with_dim1_padding,
     mask_gathered_passages_same_doc_as_positive,
@@ -51,9 +51,9 @@ def test_dist_gather_tensor_none_returns_none():
 
 
 def test_dist_gather_tensor_uses_autograd_gather_for_grad_tensors(monkeypatch):
-    monkeypatch.setattr(inbatch_neg_utils.dist, "is_available", lambda: True)
-    monkeypatch.setattr(inbatch_neg_utils.dist, "is_initialized", lambda: True)
-    monkeypatch.setattr(inbatch_neg_utils.dist, "get_world_size", lambda: 2)
+    monkeypatch.setattr(inbatch_negatives.dist, "is_available", lambda: True)
+    monkeypatch.setattr(inbatch_negatives.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(inbatch_negatives.dist, "get_world_size", lambda: 2)
 
     def fail_regular_all_gather(*args, **kwargs):
         raise AssertionError("regular all_gather should not handle grad tensors")
@@ -61,8 +61,8 @@ def test_dist_gather_tensor_uses_autograd_gather_for_grad_tensors(monkeypatch):
     def fake_autograd_all_gather(tensor):
         return (tensor.detach().clone(), tensor)
 
-    monkeypatch.setattr(inbatch_neg_utils.dist, "all_gather", fail_regular_all_gather)
-    monkeypatch.setattr(inbatch_neg_utils.dist_nn_func, "all_gather", fake_autograd_all_gather)
+    monkeypatch.setattr(inbatch_negatives.dist, "all_gather", fail_regular_all_gather)
+    monkeypatch.setattr(inbatch_negatives.dist_nn_func, "all_gather", fake_autograd_all_gather)
 
     t = torch.tensor([[1.0], [2.0]], requires_grad=True)
     gathered = dist_gather_tensor(t, preserve_grad=True)
@@ -73,10 +73,10 @@ def test_dist_gather_tensor_uses_autograd_gather_for_grad_tensors(monkeypatch):
 
 
 def test_dist_gather_tensor_detaches_remote_grad_tensors_by_default(monkeypatch):
-    monkeypatch.setattr(inbatch_neg_utils.dist, "is_available", lambda: True)
-    monkeypatch.setattr(inbatch_neg_utils.dist, "is_initialized", lambda: True)
-    monkeypatch.setattr(inbatch_neg_utils.dist, "get_world_size", lambda: 2)
-    monkeypatch.setattr(inbatch_neg_utils.dist, "get_rank", lambda: 1)
+    monkeypatch.setattr(inbatch_negatives.dist, "is_available", lambda: True)
+    monkeypatch.setattr(inbatch_negatives.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(inbatch_negatives.dist, "get_world_size", lambda: 2)
+    monkeypatch.setattr(inbatch_negatives.dist, "get_rank", lambda: 1)
 
     def fail_autograd_all_gather(*args, **kwargs):
         raise AssertionError("autograd all_gather should not handle detached mode")
@@ -85,8 +85,8 @@ def test_dist_gather_tensor_detaches_remote_grad_tensors_by_default(monkeypatch)
         gathered[0].copy_(tensor.detach() + 10)
         gathered[1].copy_(tensor.detach() + 20)
 
-    monkeypatch.setattr(inbatch_neg_utils.dist, "all_gather", fake_regular_all_gather)
-    monkeypatch.setattr(inbatch_neg_utils.dist_nn_func, "all_gather", fail_autograd_all_gather)
+    monkeypatch.setattr(inbatch_negatives.dist, "all_gather", fake_regular_all_gather)
+    monkeypatch.setattr(inbatch_negatives.dist_nn_func, "all_gather", fail_autograd_all_gather)
 
     t = torch.tensor([[1.0], [2.0]], requires_grad=True)
     gathered = dist_gather_tensor(t)
@@ -98,9 +98,9 @@ def test_dist_gather_tensor_detaches_remote_grad_tensors_by_default(monkeypatch)
 
 
 def test_dist_gather_tensor_uses_regular_gather_for_non_grad_tensors(monkeypatch):
-    monkeypatch.setattr(inbatch_neg_utils.dist, "is_available", lambda: True)
-    monkeypatch.setattr(inbatch_neg_utils.dist, "is_initialized", lambda: True)
-    monkeypatch.setattr(inbatch_neg_utils.dist, "get_world_size", lambda: 2)
+    monkeypatch.setattr(inbatch_negatives.dist, "is_available", lambda: True)
+    monkeypatch.setattr(inbatch_negatives.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(inbatch_negatives.dist, "get_world_size", lambda: 2)
 
     def fail_autograd_all_gather(*args, **kwargs):
         raise AssertionError("autograd all_gather should not handle metadata tensors")
@@ -109,8 +109,8 @@ def test_dist_gather_tensor_uses_regular_gather_for_non_grad_tensors(monkeypatch
         gathered[0].copy_(tensor + 10)
         gathered[1].copy_(tensor + 20)
 
-    monkeypatch.setattr(inbatch_neg_utils.dist, "all_gather", fake_regular_all_gather)
-    monkeypatch.setattr(inbatch_neg_utils.dist_nn_func, "all_gather", fail_autograd_all_gather)
+    monkeypatch.setattr(inbatch_negatives.dist, "all_gather", fake_regular_all_gather)
+    monkeypatch.setattr(inbatch_negatives.dist_nn_func, "all_gather", fail_autograd_all_gather)
 
     t = torch.tensor([[1], [2]], dtype=torch.long)
     gathered = dist_gather_tensor(t)
@@ -129,9 +129,9 @@ def test_dist_gather_tensor_with_dim1_padding_none_returns_none():
 
 
 def test_dist_gather_tensor_with_dim1_padding_preserves_grad_through_padding(monkeypatch):
-    monkeypatch.setattr(inbatch_neg_utils.dist, "is_available", lambda: True)
-    monkeypatch.setattr(inbatch_neg_utils.dist, "is_initialized", lambda: True)
-    monkeypatch.setattr(inbatch_neg_utils.dist, "get_world_size", lambda: 2)
+    monkeypatch.setattr(inbatch_negatives.dist, "is_available", lambda: True)
+    monkeypatch.setattr(inbatch_negatives.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(inbatch_negatives.dist, "get_world_size", lambda: 2)
 
     def fake_regular_all_gather(gathered, tensor):
         if tensor.dtype != torch.long:
@@ -143,8 +143,8 @@ def test_dist_gather_tensor_with_dim1_padding_preserves_grad_through_padding(mon
         assert tensor.shape == (2, 4, 3)
         return (tensor.detach().clone(), tensor)
 
-    monkeypatch.setattr(inbatch_neg_utils.dist, "all_gather", fake_regular_all_gather)
-    monkeypatch.setattr(inbatch_neg_utils.dist_nn_func, "all_gather", fake_autograd_all_gather)
+    monkeypatch.setattr(inbatch_negatives.dist, "all_gather", fake_regular_all_gather)
+    monkeypatch.setattr(inbatch_negatives.dist_nn_func, "all_gather", fake_autograd_all_gather)
 
     t = torch.randn(2, 2, 3, requires_grad=True)
     gathered = dist_gather_tensor_with_dim1_padding(t, preserve_grad=True)
@@ -155,10 +155,10 @@ def test_dist_gather_tensor_with_dim1_padding_preserves_grad_through_padding(mon
 
 
 def test_dist_gather_tensor_with_dim1_padding_detaches_remote_grad_tensors_by_default(monkeypatch):
-    monkeypatch.setattr(inbatch_neg_utils.dist, "is_available", lambda: True)
-    monkeypatch.setattr(inbatch_neg_utils.dist, "is_initialized", lambda: True)
-    monkeypatch.setattr(inbatch_neg_utils.dist, "get_world_size", lambda: 2)
-    monkeypatch.setattr(inbatch_neg_utils.dist, "get_rank", lambda: 1)
+    monkeypatch.setattr(inbatch_negatives.dist, "is_available", lambda: True)
+    monkeypatch.setattr(inbatch_negatives.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(inbatch_negatives.dist, "get_world_size", lambda: 2)
+    monkeypatch.setattr(inbatch_negatives.dist, "get_rank", lambda: 1)
 
     def fake_regular_all_gather(gathered, tensor):
         if tensor.dtype == torch.long:
@@ -172,8 +172,8 @@ def test_dist_gather_tensor_with_dim1_padding_detaches_remote_grad_tensors_by_de
     def fail_autograd_all_gather(*args, **kwargs):
         raise AssertionError("autograd all_gather should not handle detached mode")
 
-    monkeypatch.setattr(inbatch_neg_utils.dist, "all_gather", fake_regular_all_gather)
-    monkeypatch.setattr(inbatch_neg_utils.dist_nn_func, "all_gather", fail_autograd_all_gather)
+    monkeypatch.setattr(inbatch_negatives.dist, "all_gather", fake_regular_all_gather)
+    monkeypatch.setattr(inbatch_negatives.dist_nn_func, "all_gather", fail_autograd_all_gather)
 
     t = torch.randn(2, 2, 3, requires_grad=True)
     gathered = dist_gather_tensor_with_dim1_padding(t)

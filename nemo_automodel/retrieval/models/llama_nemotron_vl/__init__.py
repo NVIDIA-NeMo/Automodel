@@ -1,10 +1,10 @@
 """Llama Nemotron VL model for multimodal embedding and retrieval tasks."""
 
-from nemo_automodel._transformers.models.llama_nemotron_vl.model import (
+from nemo_automodel.retrieval.models.llama_nemotron_vl.model import (
     LlamaNemotronVLConfig,
     LlamaNemotronVLModel,
 )
-from nemo_automodel._transformers.models.llama_nemotron_vl.processor import LlamaNemotronVLProcessor
+from nemo_automodel.retrieval.models.llama_nemotron_vl.processor import LlamaNemotronVLProcessor
 
 __all__ = [
     "LlamaNemotronVLModel",

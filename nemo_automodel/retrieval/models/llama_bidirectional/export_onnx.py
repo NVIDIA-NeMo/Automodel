@@ -23,13 +23,13 @@ The export wraps the bare transformer with average-pooling and L2
 normalisation so that the ONNX model produces ready-to-use embeddings.
 
 Usage (standalone):
-    python -m nemo_automodel._transformers.models.llama_bidirectional.export_onnx \
+    python -m nemo_automodel.retrieval.models.llama_bidirectional.export_onnx \
         --model-path /path/to/hf_checkpoint \
         --output-dir /path/to/onnx_output \
         [--pooling avg] [--normalize] [--opset 17] [--dtype fp32]
 
 Usage (from Python):
-    from nemo_automodel._transformers.models.llama_bidirectional.export_onnx import export_to_onnx
+    from nemo_automodel.retrieval.models.llama_bidirectional.export_onnx import export_to_onnx
     onnx_path = export_to_onnx("/path/to/hf_checkpoint", "/path/to/onnx_output")
 """
 

@@ -15,7 +15,7 @@
 import pytest
 import torch
 
-from nemo_automodel._transformers.models.common.bidirectional import EncoderStateDictAdapter
+from nemo_automodel.retrieval.state_dict_adapter import EncoderStateDictAdapter
 
 
 class TestEncoderStateDictAdapter:

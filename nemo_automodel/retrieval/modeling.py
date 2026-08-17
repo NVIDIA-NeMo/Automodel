@@ -33,9 +33,9 @@ from transformers import (
 from transformers.models.auto.modeling_auto import MODEL_FOR_SEQUENCE_CLASSIFICATION_MAPPING, MODEL_MAPPING
 from transformers.utils import logging
 
-from nemo_automodel._transformers.models.common.bidirectional import EncoderStateDictAdapter
 from nemo_automodel._transformers.registry import ModelRegistry
-from nemo_automodel._transformers.sentence_transformer_export import (
+from nemo_automodel.components.loss.intermediate_distill import LayerCapture
+from nemo_automodel.retrieval.sentence_transformer_export import (
     SentenceTransformerExportConfig,
     SentenceTransformerWrapperOptions,
     _cache_hub_source_legal_assets,
@@ -45,7 +45,7 @@ from nemo_automodel._transformers.sentence_transformer_export import (
     _SentenceTransformerMetadataExporter,
     _supports_standard_sentence_transformer_export,
 )
-from nemo_automodel.components.loss.intermediate_distill import LayerCapture
+from nemo_automodel.retrieval.state_dict_adapter import EncoderStateDictAdapter
 
 logger = logging.get_logger(__name__)
 
@@ -433,7 +433,7 @@ def save_encoder_pretrained(model: nn.Module, save_directory: str, **kwargs) -> 
         )
         original_model_path = str(model_reference) if model_reference and os.path.isdir(str(model_reference)) else None
     if export_config is not None:
-        from nemo_automodel._transformers.sentence_transformer_export import (
+        from nemo_automodel.retrieval.sentence_transformer_export import (
             _save_generated_sentence_transformer_assets,
             _validate_sentence_transformer_export,
         )

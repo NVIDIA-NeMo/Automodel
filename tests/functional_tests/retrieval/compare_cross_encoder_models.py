@@ -26,9 +26,9 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from nemo_automodel._transformers.auto_model import NeMoAutoModelCrossEncoder
 from nemo_automodel.components.datasets.llm import retrieval_dataset_inline as rdi
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
+from nemo_automodel.retrieval.auto_model import NeMoAutoModelCrossEncoder
 
 PROMPT_TEMPLATE = "question:{query} \n \n passage:{passage}"
 

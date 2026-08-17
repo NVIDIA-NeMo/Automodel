@@ -54,7 +54,7 @@ class Ministral3BidirectionalModel(Ministral3Model):
     or ``mistralai/Ministral-3-3B-Instruct-2512``) requires extracting the language
     tower; this is driven by the recipe YAML via
     ``extract_submodel: language_model`` and handled by
-    :func:`nemo_automodel._transformers.retrieval.build_encoder_backbone`.
+    :func:`nemo_automodel.retrieval.modeling.build_encoder_backbone`.
 
     Text-only checkpoints (e.g. ``mistralai/Ministral-3B-Instruct``) load directly
     via the standard ``from_pretrained`` path with no extraction needed.

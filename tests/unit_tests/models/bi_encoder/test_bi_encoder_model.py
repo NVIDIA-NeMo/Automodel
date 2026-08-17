@@ -17,14 +17,14 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-import nemo_automodel._transformers.auto_model as am
 import nemo_automodel.recipes.retrieval.train_bi_encoder as tbe
-from nemo_automodel._transformers.retrieval import BiEncoderModel, CrossEncoderModel
+import nemo_automodel.retrieval.auto_model as am
 from nemo_automodel.recipes.retrieval.train_bi_encoder import (
     TrainBiEncoderRecipe,
     distributed_maxsim_scores_and_labels,
     maxsim_scores_and_labels,
 )
+from nemo_automodel.retrieval.modeling import BiEncoderModel, CrossEncoderModel
 
 
 class DummyModel:
@@ -95,7 +95,14 @@ def _apply_common_mocks(monkeypatch):
     """Mock CUDA-dependent infrastructure so tests run without a GPU."""
     monkeypatch.setattr(am, "instantiate_infrastructure", lambda **kwargs: (None, None, None, None))
     monkeypatch.setattr(
-        am, "MeshContext", type("MeshContext", (), {"from_meshes": staticmethod(lambda *a, **k: DummyMesh())})
+        am,
+        "_resolve_distributed_setup",
+        lambda **kwargs: SimpleNamespace(
+            mesh_context=DummyMesh(),
+            strategy_config=None,
+            moe_parallel_config=None,
+            activation_checkpointing=None,
+        ),
     )
     monkeypatch.setattr(am.torch.cuda, "current_device", lambda: 0)
 
@@ -491,7 +498,7 @@ def test_forward_backward_step_supports_distributed_multi_vector_inbatch_negativ
     detach_distributed_inbatch_negatives,
 ):
     """Exercise the trainer branch that gathers token embeddings across ranks."""
-    import nemo_automodel._transformers.models.common.inbatch_neg_utils as inbatch_neg_utils
+    import nemo_automodel.retrieval.inbatch_negatives as inbatch_negatives
 
     recipe = TrainBiEncoderRecipe.__new__(TrainBiEncoderRecipe)
     recipe.dist_env = SimpleNamespace(device="cpu")
@@ -528,8 +535,8 @@ def test_forward_backward_step_supports_distributed_multi_vector_inbatch_negativ
         captured["labels"] = labels.detach().clone()
         return -scores.gather(1, labels.unsqueeze(1)).mean()
 
-    monkeypatch.setattr(inbatch_neg_utils, "dist_gather_tensor_with_dim1_padding", fake_gather_with_dim1_padding)
-    monkeypatch.setattr(inbatch_neg_utils, "dist_gather_tensor", fake_gather_tensor)
+    monkeypatch.setattr(inbatch_negatives, "dist_gather_tensor_with_dim1_padding", fake_gather_with_dim1_padding)
+    monkeypatch.setattr(inbatch_negatives, "dist_gather_tensor", fake_gather_tensor)
     monkeypatch.setattr(tbe.F, "cross_entropy", fake_cross_entropy)
 
     batch = {

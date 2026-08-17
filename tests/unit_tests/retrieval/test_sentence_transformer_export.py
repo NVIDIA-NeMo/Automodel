@@ -23,8 +23,8 @@ from tokenizers.pre_tokenizers import Whitespace
 from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
 from nemo_automodel import NeMoAutoTokenizer
-from nemo_automodel._transformers import sentence_transformer_export
-from nemo_automodel._transformers.sentence_transformer_export import (
+from nemo_automodel.retrieval import sentence_transformer_export
+from nemo_automodel.retrieval.sentence_transformer_export import (
     _resolve_sentence_transformer_max_seq_length,
     _save_generated_sentence_transformer_assets,
 )

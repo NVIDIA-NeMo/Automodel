@@ -12,16 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Llama Bidirectional model for embedding and retrieval tasks."""
+"""Bidirectional Ministral3 model for embedding and retrieval tasks."""
 
-from nemo_automodel._transformers.models.llama_bidirectional.model import (
-    LlamaBidirectionalConfig,
-    LlamaBidirectionalForSequenceClassification,
-    LlamaBidirectionalModel,
+from nemo_automodel.retrieval.models.ministral_bidirectional.model import (
+    Ministral3BidirectionalConfig,
+    Ministral3BidirectionalModel,
 )
 
 __all__ = [
-    "LlamaBidirectionalModel",
-    "LlamaBidirectionalConfig",
-    "LlamaBidirectionalForSequenceClassification",
+    "Ministral3BidirectionalModel",
+    "Ministral3BidirectionalConfig",
 ]

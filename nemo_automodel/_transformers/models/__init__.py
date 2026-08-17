@@ -11,10 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Models trained through the HuggingFace ``transformers`` bridge.
+"""General model families owned by the HuggingFace ``transformers`` bridge.
 
-These subclass ``PreTrainedModel``. Models trained through the flow-matching /
-diffusion bridge live in :mod:`nemo_automodel._diffusers.models`.
+These subclass ``PreTrainedModel``. Retrieval-specific model families use this
+bridge but live with their task APIs in :mod:`nemo_automodel.retrieval.models`.
+Models trained through the flow-matching / diffusion bridge live in
+:mod:`nemo_automodel._diffusers.models`.
 
 Also includes convenience model builders:
     • build_gpt2_model – returns a GPT-2 causal language model (Flash-Attention-2 by default).
@@ -24,7 +26,12 @@ import importlib.abc
 import pathlib
 import sys
 
-from nemo_automodel._model_locations import DIFFUSERS_MODELS, DIFFUSERS_MODELS_PACKAGE
+from nemo_automodel._model_locations import (
+    DIFFUSERS_MODELS,
+    DIFFUSERS_MODELS_PACKAGE,
+    RETRIEVAL_MODELS,
+    RETRIEVAL_MODELS_PACKAGE,
+)
 
 from .gpt2 import build_gpt2_model  # noqa: F401
 
@@ -46,6 +53,12 @@ def _available_model_submodules() -> set[str]:
 
 
 def _make_upgrade_message(name: str) -> str:
+    if name in RETRIEVAL_MODELS:
+        return (
+            f"Model '{name}' is a retrieval model and lives in "
+            f"'{RETRIEVAL_MODELS_PACKAGE}', not '{__name__}'. "
+            f"Import it as '{RETRIEVAL_MODELS_PACKAGE}.{name}'."
+        )
     if name in DIFFUSERS_MODELS:
         return (
             f"Model '{name}' is trained through the diffusion bridge and lives in "
@@ -65,7 +78,7 @@ def _make_upgrade_message(name: str) -> str:
 
 
 def __getattr__(name: str):
-    if name in _available_model_submodules():
+    if name in _available_model_submodules() or name in RETRIEVAL_MODELS:
         # A real submodule that just has not been imported yet. Raise
         # AttributeError so ``hasattr`` in the import machinery falls through to
         # importing ``<pkg>.<name>``; raising ModuleNotFoundError here would

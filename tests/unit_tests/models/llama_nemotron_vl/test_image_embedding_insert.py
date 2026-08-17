@@ -17,9 +17,7 @@ from pathlib import Path
 
 import torch
 
-_MODEL_PATH = (
-    Path(__file__).resolve().parents[4] / "nemo_automodel/_transformers/models/llama_nemotron_vl/model.py"
-)
+_MODEL_PATH = Path(__file__).resolve().parents[4] / "nemo_automodel/retrieval/models/llama_nemotron_vl/model.py"
 _MODEL_SPEC = importlib.util.spec_from_file_location("_llama_nemotron_vl_model_for_test", _MODEL_PATH)
 _MODEL_MODULE = importlib.util.module_from_spec(_MODEL_SPEC)
 assert _MODEL_SPEC.loader is not None

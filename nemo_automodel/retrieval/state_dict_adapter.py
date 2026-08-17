@@ -24,6 +24,7 @@ class EncoderStateDictAdapter(StateDictAdapter):
     """
 
     _PEFT_PREFIX = "base_model.model."
+    peft_target_module_prefix = "model."
 
     def __init__(self):
         self._uses_model_prefix = True

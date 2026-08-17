@@ -100,7 +100,7 @@ def _run_training() -> Path:
 
 def _build_eval_model(device: torch.device):
     """Build a NeMoAutoModelBiEncoder for evaluation."""
-    from nemo_automodel._transformers.auto_model import NeMoAutoModelBiEncoder
+    from nemo_automodel.retrieval.auto_model import NeMoAutoModelBiEncoder
 
     return (
         NeMoAutoModelBiEncoder.from_pretrained(
@@ -321,7 +321,7 @@ class TestCustomizerRetrieval:
         import onnxruntime
         from transformers import AutoTokenizer
 
-        from nemo_automodel._transformers.models.llama_bidirectional.export_onnx import export_to_onnx
+        from nemo_automodel.retrieval.models.llama_bidirectional.export_onnx import export_to_onnx
 
         # The recipe sets save_consolidated=true, so the checkpoint has a
         # model/consolidated/ directory with standard HF-named safetensors

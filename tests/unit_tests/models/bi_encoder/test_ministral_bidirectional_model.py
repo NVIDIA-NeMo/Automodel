@@ -24,12 +24,12 @@ import torch.nn as nn
 
 pytest.importorskip("transformers.models.ministral3", reason="Ministral3 not available in this transformers version")
 
-from nemo_automodel._transformers.models.ministral_bidirectional.model import (
+from nemo_automodel._transformers.registry import ModelRegistry
+from nemo_automodel.retrieval.modeling import BiEncoderModel, _init_encoder_common, configure_encoder_metadata
+from nemo_automodel.retrieval.models.ministral_bidirectional.model import (
     Ministral3BidirectionalConfig,
     Ministral3BidirectionalModel,
 )
-from nemo_automodel._transformers.registry import ModelRegistry
-from nemo_automodel._transformers.retrieval import BiEncoderModel, _init_encoder_common, configure_encoder_metadata
 
 
 def tiny_bidirectional_config() -> Ministral3BidirectionalConfig:
@@ -62,7 +62,7 @@ def test_legacy_ministral_checkpoint_loads_in_fresh_process(tmp_path):
     Ministral3BidirectionalModel(tiny_bidirectional_config()).save_pretrained(model_dir)
 
     code = (
-        "from nemo_automodel._transformers.retrieval import build_encoder_backbone; "
+        "from nemo_automodel.retrieval.modeling import build_encoder_backbone; "
         f"model = build_encoder_backbone(r'{model_dir}', 'embedding', pooling='avg'); "
         "assert type(model).__name__ == 'Ministral3BidirectionalModel'; "
         "assert model.config.model_type == 'ministral3_bidirec'"
@@ -183,7 +183,7 @@ def test_encoder_build_legacy_ministral_registry_path(tmp_path, monkeypatch):
 
 
 def test_ministral_dispatch_uses_custom_class_only_for_legacy_checkpoints():
-    from nemo_automodel._transformers.retrieval import SUPPORTED_BACKBONES
+    from nemo_automodel.retrieval.modeling import SUPPORTED_BACKBONES
 
     assert "ministral3" not in SUPPORTED_BACKBONES
     assert SUPPORTED_BACKBONES["ministral3_bidirec"]["embedding"] == "Ministral3BidirectionalModel"

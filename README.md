@@ -427,6 +427,8 @@ NeMo-Automodel/
 │   │   └── models/                 # Flux, Hunyuan, LTX-2, Qwen-Image, Wan adapters
 │   ├── _transformers/              # HF Transformers integration
 │   │   └── models/                 # Model families built on Transformers (LLM, VLM, MoE, ...)
+│   ├── retrieval/                  # Bi-encoder, cross-encoder, export, and retrieval-specific models
+│   │   └── models/                 # Bidirectional Llama, Ministral, and Llama Nemotron VL
 │   ├── components/                 # Core library
 │   │   ├── _peft/                  # PEFT implementations (LoRA, QLoRA)
 │   │   ├── attention/              # Attention implementations
@@ -434,6 +436,7 @@ NeMo-Automodel/
 │   │   ├── config/
 │   │   ├── datasets/               # LLM, VLM, diffusion, retrieval datasets
 │   │   ├── distributed/            # FSDP2, Megatron FSDP, pipelining, CP, etc.
+│   │   ├── flow_matching/          # Reusable flow-matching pipeline and adapter contract
 │   │   ├── launcher/               # Launcher backends (SLURM, NeMo-Run, SkyPilot)
 │   │   ├── loggers/                # Loggers
 │   │   ├── loss/                   # Optimized loss functions
