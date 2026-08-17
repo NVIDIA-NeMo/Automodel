@@ -101,10 +101,11 @@ def test_forward_supports_dpace_loss_and_grads_flow_to_draft():
     out = trainer(input_ids=input_ids, hidden_states=hidden, loss_mask=loss_mask)
     assert isinstance(out, DFlashStepMetrics)
     assert torch.isfinite(out.loss) and out.loss.item() > 0
-    # D-PACE reports loss_weight = bsz (the denominator it divides by, matching the
-    # reference), not the decay-weight sum used for dflash, so the recipe's
-    # token-weighted validation average stays consistent with the objective.
-    assert out.loss_weight.item() == float(bsz)
+    # D-PACE reports loss_weight = bsz * n_blocks (the denominator it divides by),
+    # not the decay-weight sum used for dflash, so the recipe's token-weighted
+    # validation average stays consistent with the objective. These inputs supply
+    # more valid anchors than num_anchors, so n_blocks is num_anchors exactly.
+    assert out.loss_weight.item() == float(bsz * trainer.num_anchors)
     out.loss.backward()
     grad = sum(p.grad.abs().sum().item() for p in trainer.draft_model.parameters() if p.grad is not None)
     assert grad > 0

@@ -398,9 +398,11 @@ class DFlashDecayLoss(nn.Module):
             sum by ``num_tokens``, a global all-reduced count that keeps the loss
             consistent across DP replicas and grad-accum. ``"mean"`` divides by
             the effective weight sum ``(w_k * block_mask).sum()`` for dflash, and
-            by the batch size for D-PACE -- whose weights carry the objective's
+            by ``batch * blocks`` for D-PACE -- whose weights carry the objective's
             signal, so a weight-sum denominator would cancel it (and, being
-            per-rank, would bias the DP gradient average).
+            per-rank, would bias the DP gradient average). The block count counts
+            sampled anchors rather than tokens, so it keeps both ``loss_type``
+            values on a comparable scale without changing the D-PACE optimum.
         loss_type: Loss variant. ``"dflash"`` keeps the original decay-weighted
             cross entropy. The ``"dpace*"`` variants use detached Dynamic
             Position-Aware Cross-Entropy weights (D-PACE, arXiv:2605.18810).
@@ -448,38 +450,64 @@ class DFlashDecayLoss(nn.Module):
 
     def _dpace_weight(
         self,
-        prob: torch.Tensor,
+        token_nll: torch.Tensor,
         binary_mask: torch.Tensor,
         binary_mask_bool: torch.Tensor,
     ) -> torch.Tensor:
         """Compute detached D-PACE position weights.
 
         Args:
-            prob: Draft confidence ``exp(-nll)``, shape ``[batch, blocks, k]``.
+            token_nll: Per-token NLL of the draft on the target token, shape
+                ``[batch, blocks, k]``; the draft confidence is ``exp(-token_nll)``.
+                Taken as the NLL rather than the confidence so the smoothed
+                log-confidence stays finite even where ``exp(-token_nll)``
+                underflows.
             binary_mask: Float valid-position mask, same shape.
             binary_mask_bool: Boolean valid-position mask, same shape.
 
         Returns:
-            Detached weights of shape ``[batch, blocks, k]``. The ``cumprod`` /
-            reverse-``cumsum`` run over the last (``k``) axis, so the confidence
-            product resets at every block boundary by construction.
+            Detached weights of shape ``[batch, blocks, k]``, in ``token_nll``'s
+            dtype. The ``cumprod`` / reverse-``cumsum`` run over the last (``k``)
+            axis, so the confidence product resets at every block boundary by
+            construction. Accumulated in float32: the per-block products span many
+            orders of magnitude at small ``dpace_alpha``, which bf16's 8-bit
+            mantissa cannot carry.
         """
-        smooth = (1.0 - self.dpace_alpha) * prob + self.dpace_alpha
+        nll = token_nll.float()
+        smooth = (1.0 - self.dpace_alpha) * torch.exp(-nll) + self.dpace_alpha
         smooth = torch.where(binary_mask_bool, smooth, torch.ones_like(smooth))
         prefix = torch.cumprod(smooth, dim=-1)
 
         if self.loss_type == "dpace-cumulative-confidence-only":
-            return prefix
-
-        suffix = torch.flip(
-            torch.cumsum(torch.flip(prefix * binary_mask, dims=[-1]), dim=-1),
-            dims=[-1],
-        )
+            return prefix.to(token_nll.dtype)
 
         if self.loss_type == "dpace":
-            return suffix
+            suffix = torch.flip(
+                torch.cumsum(torch.flip(prefix * binary_mask.to(prefix.dtype), dims=[-1]), dim=-1),
+                dims=[-1],
+            )
+            return suffix.to(token_nll.dtype)
+
         if self.loss_type == "dpace-continuation-value-only":
-            return suffix / prefix.clamp_min(torch.finfo(prefix.dtype).tiny)
+            # The same suffix/prefix ratio, evaluated in log space. Computing it as a
+            # division underflows for small dpace_alpha: alpha=0 leaves a bare product
+            # of block_size-1 confidences, so a merely lukewarm draft (0.3 per position
+            # over 15 positions) already reaches 1e-8 and keeps falling, and once both
+            # operands flush to zero the ratio is lost. log(smooth) is built from the
+            # NLL via logaddexp, so it stays finite even where exp(-nll) is zero.
+            log_alpha = nll.new_tensor(self.dpace_alpha).log()
+            log_one_minus_alpha = torch.log1p(nll.new_tensor(-self.dpace_alpha))
+            log_smooth = torch.logaddexp(log_one_minus_alpha - nll, log_alpha.expand_as(nll))
+            log_smooth = torch.where(binary_mask_bool, log_smooth, torch.zeros_like(log_smooth))
+            log_prefix = torch.cumsum(log_smooth, dim=-1)
+            log_suffix = torch.flip(
+                torch.logcumsumexp(
+                    torch.flip(log_prefix.masked_fill(~binary_mask_bool, float("-inf")), dims=[-1]),
+                    dim=-1,
+                ),
+                dims=[-1],
+            )
+            return torch.exp(log_suffix - log_prefix).to(token_nll.dtype)
         raise ValueError(f"unknown D-PACE loss_type {self.loss_type!r}")
 
     def _reduce(
@@ -509,19 +537,19 @@ class DFlashDecayLoss(nn.Module):
         ``loss_type`` selects the weights (decay for ``"dflash"``, detached D-PACE
         confidence for the ``"dpace*"`` variants -- the ``cumprod`` runs over the
         last (``k``) axis, so it resets per block by construction). The denominator
-        is data-independent for D-PACE (the global ``num_tokens`` or the batch size)
-        so the DP gradient average stays exact and the objective's weight
-        magnitudes are preserved.
+        for D-PACE (the global ``num_tokens``, or ``batch * blocks``) counts
+        sequences and sampled blocks rather than surviving tokens, so it does not
+        vary with the mask: the DP gradient average is not skewed and the
+        objective's weight magnitudes are preserved.
         """
-        bsz, _, k = token_nll.shape
+        bsz, n_blocks, k = token_nll.shape
         block_mask = block_mask.to(token_nll.dtype)
         if self.loss_type == "dflash":
             w = self._decay_weights(k, token_nll.device, token_nll.dtype)
             weights = w.view(1, 1, k) * block_mask  # [batch, blocks, k]
         elif self.loss_type in _DPACE_LOSS_TYPES:
             with torch.no_grad():
-                prob = torch.exp(-token_nll.detach())
-                dpace_weights = self._dpace_weight(prob, block_mask, block_mask > 0)
+                dpace_weights = self._dpace_weight(token_nll.detach(), block_mask, block_mask > 0)
             weights = block_mask * dpace_weights
         else:
             raise ValueError(f"unknown loss_type {self.loss_type!r}")
@@ -529,14 +557,23 @@ class DFlashDecayLoss(nn.Module):
         weighted_sum = (token_nll * weights).sum()
         if self.normalize == "mean":
             if self.loss_type in _DPACE_LOSS_TYPES:
-                # D-PACE is a weighted *sum* normalized per sequence: the weight
-                # magnitude is the signal (the expected accepted-prefix length), so a
-                # weight-sum denominator would cancel exactly the variation the
-                # objective encodes, and a data-dependent denominator would desync the
-                # DP gradient average (exact only when every rank divides by the same
-                # constant). Divide by the batch size, as the reference implementation
-                # does -- independent of the sampled anchor count.
-                denom = weighted_sum.new_tensor(max(float(bsz), 1.0))
+                # D-PACE is a weighted *sum*: the weight magnitude is the signal (the
+                # expected accepted-prefix length), so a weight-sum denominator would
+                # cancel exactly the variation the objective encodes, and a
+                # data-dependent denominator would desync the DP gradient average
+                # (exact only when every rank divides by the same constant).
+                #
+                # The published objective divides by the batch size alone. We also
+                # divide by the block count: it counts sampled anchors, not unmasked
+                # tokens, so unlike a weight sum it cancels nothing the objective
+                # encodes, and it is ``num_anchors`` whenever the batch supplies that
+                # many valid anchors -- i.e. a constant, leaving the gradient direction
+                # and the optimum unchanged. What it buys is scale: without it,
+                # flipping ``loss_type`` in the YAML moves the effective learning rate
+                # by orders of magnitude and the run diverges instead of erroring. The
+                # reported value is correspondingly ``n_blocks`` times smaller than the
+                # published one.
+                denom = weighted_sum.new_tensor(max(float(bsz * n_blocks), 1.0))
             else:
                 denom = weights.sum() + 1e-6
         elif num_tokens is not None:

@@ -190,7 +190,11 @@ The following table describes the key configuration fields for DFlash fine-tunin
 <Note>
 The `dpace*` variants implement D-PACE (Dynamic Position-Aware Cross-Entropy),
 which reweights each position by detached cumulative draft confidence; see
-[arXiv:2605.18810](https://arxiv.org/abs/2605.18810).
+[arXiv:2605.18810](https://arxiv.org/abs/2605.18810). They are normalized to the
+same scale as `dflash` (the weighted sum is divided by the batch size times the
+sampled block count), so switching `loss_type` needs no change to `optimizer.lr`.
+Note that this makes the reported loss smaller than the published D-PACE value by
+the block count, which is a constant and so leaves the objective unchanged.
 </Note>
 
 #### DFlash Training Metrics

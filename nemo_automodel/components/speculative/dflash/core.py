@@ -589,9 +589,9 @@ class DFlashTrainerModule(nn.Module):
         assert loss_fn is not None, "loss_fn is constructed for every loss_type except 'variable_prefix'"
         loss_out = loss_fn(pred_logits, pred_targets, pred_mask, num_tokens=None)
 
-        # The loss reports the exact denominator it divided by (per-sequence batch
-        # size for D-PACE, the effective decay-weight sum for dflash), so read it
-        # directly -- the metric can never drift from the loss's own normalization.
+        # The loss reports the exact denominator it divided by (batch * blocks for
+        # D-PACE, the effective decay-weight sum for dflash), so read it directly --
+        # the metric can never drift from the loss's own normalization.
         loss_weight = loss_out.loss_denominator
 
         count_per_pos = loss_out.draft_count_per_pos

@@ -350,28 +350,29 @@ class TestDFlashDecayLoss:
         if loss_type == "dpace-cumulative-confidence-only":
             ref_weight = prefix
         elif loss_type == "dpace-continuation-value-only":
-            ref_weight = suffix / prefix.clamp_min(torch.finfo(prefix.dtype).tiny)
+            ref_weight = suffix / prefix
         else:
             ref_weight = suffix
-        # normalize="mean" => the reference's per-sequence normalization (divide by
-        # the batch size, independent of the sampled anchor count). Dividing by the
-        # D-PACE weight sum instead would cancel the weight magnitudes the objective
-        # encodes (and bias the DP gradient average).
-        expected = (token_nll * mask * ref_weight).sum() / float(bsz)
+        # normalize="mean" => a per-sequence weighted sum over a data-independent
+        # denominator: the batch size times the (config-fixed) block count. Dividing
+        # by the D-PACE weight sum instead would cancel the weight magnitudes the
+        # objective encodes (and bias the DP gradient average).
+        expected = (token_nll * mask * ref_weight).sum() / float(bsz * n)
 
         out = DFlashDecayLoss(loss_type=loss_type, dpace_alpha=alpha, normalize="mean")(logits, target_ids, mask)
 
         assert torch.isclose(expected, out.total_loss, atol=1e-6)
-        assert out.loss_denominator.item() == float(bsz)
+        assert out.loss_denominator.item() == float(bsz * n)
 
-    def test_dpace_mean_divides_by_batch_size_not_weight_sum(self):
-        """``normalize="mean"`` normalizes D-PACE per sequence, as the reference does.
+    def test_dpace_mean_divides_by_batch_and_blocks_not_weight_sum(self):
+        """``normalize="mean"`` normalizes D-PACE over a data-independent denominator.
 
-        The reference divides the D-PACE weighted sum by the batch size, independent
-        of the sampled anchor count. The D-PACE weights carry the objective's signal,
-        so a weight-sum denominator would cancel it; it is also data-dependent, hence
-        different on every DP rank, which would bias the gradient average (that stays
-        exact only when every rank divides by the same constant).
+        The D-PACE weights carry the objective's signal, so a weight-sum denominator
+        would cancel it; it is also data-dependent, hence different on every DP rank,
+        which would bias the gradient average (that stays exact only when every rank
+        divides by the same constant). ``batch * blocks`` is constant across ranks and
+        keeps the loss on the same scale as the ``"dflash"`` weighted mean, so the two
+        ``loss_type`` values train at the same learning rate.
         """
         torch.manual_seed(21)
         bsz, n, k, vocab = 2, 3, 4, 17
@@ -380,23 +381,99 @@ class TestDFlashDecayLoss:
         mask = (torch.rand(bsz, n, k) > 0.25).float()
         alpha = 0.35
 
-        token_nll = F.cross_entropy(logits.reshape(-1, vocab), target_ids.reshape(-1), reduction="none").view(
-            bsz, n, k
-        )
+        token_nll = F.cross_entropy(logits.reshape(-1, vocab), target_ids.reshape(-1), reduction="none").view(bsz, n, k)
         prob = torch.exp(-token_nll)
         smooth = torch.where(mask > 0, (1.0 - alpha) * prob + alpha, torch.ones_like(prob))
         prefix = torch.cumprod(smooth, dim=-1)
         weight = torch.flip(torch.cumsum(torch.flip(prefix * mask, dims=[-1]), dim=-1), dims=[-1])
 
         weighted_sum = (token_nll * mask * weight).sum()
-        batch_loss = weighted_sum / float(bsz)
+        batch_block_loss = weighted_sum / float(bsz * n)
         weight_sum_loss = weighted_sum / ((mask * weight).sum() + 1e-6)
 
         out = DFlashDecayLoss(loss_type="dpace", dpace_alpha=alpha, normalize="mean")(logits, target_ids, mask)
 
-        assert torch.isclose(out.total_loss, batch_loss, atol=1e-6)
+        assert torch.isclose(out.total_loss, batch_block_loss, atol=1e-6)
         assert not torch.isclose(out.total_loss, weight_sum_loss, atol=1e-6)
-        assert out.loss_denominator.item() == float(bsz)
+        assert out.loss_denominator.item() == float(bsz * n)
+
+    def test_dpace_continuation_ratio_survives_alpha_zero(self):
+        """At ``dpace_alpha=0`` the prefix is a bare confidence product that underflows.
+
+        Over a 16-token block that is 15 factors, so a low-confidence draft drives the
+        float32 product to zero well before the block ends. The suffix/prefix ratio is
+        still perfectly well defined there, so it is taken in log space; computing it
+        as a division loses it entirely once both operands flush to zero.
+        """
+        bsz, n, k = 1, 1, 15
+        token_nll = torch.full((bsz, n, k), 14.0)  # ~8e-7 confidence per position
+        mask = torch.ones(bsz, n, k)
+
+        weights = DFlashDecayLoss(loss_type="dpace-continuation-value-only", dpace_alpha=0.0)._dpace_weight(
+            token_nll, mask, mask > 0
+        )
+
+        prob64 = torch.exp(-token_nll.double())
+        prefix64 = torch.cumprod(prob64, dim=-1)
+        suffix64 = torch.flip(torch.cumsum(torch.flip(prefix64, dims=[-1]), dim=-1), dims=[-1])
+        expected = (suffix64 / prefix64).float()
+
+        # The float32 product is gone, so the naive division cannot recover the ratio.
+        assert torch.cumprod(prob64.float(), dim=-1)[0, 0, -1].item() == 0.0
+        assert torch.isfinite(weights).all()
+        assert (weights > 0.5).all()  # the collapsed 0/tiny path would return zeros
+        assert torch.allclose(weights, expected, rtol=1e-5)
+
+    @pytest.mark.parametrize("alpha", [0.0, 1.0])
+    def test_dpace_alpha_bounds_produce_finite_loss(self, alpha):
+        """Both ends of the validated ``dpace_alpha`` range must stay finite."""
+        torch.manual_seed(25)
+        bsz, n, k, vocab = 2, 3, 15, 17
+        logits = torch.randn(bsz, n, k, vocab) * 8.0  # confident and often wrong
+        target_ids = torch.randint(0, vocab, (bsz, n, k))
+        mask = (torch.rand(bsz, n, k) > 0.25).float()
+
+        for loss_type in ("dpace", "dpace-cumulative-confidence-only", "dpace-continuation-value-only"):
+            out = DFlashDecayLoss(loss_type=loss_type, dpace_alpha=alpha, normalize="mean")(logits, target_ids, mask)
+            assert torch.isfinite(out.total_loss), f"{loss_type} at alpha={alpha}"
+
+    def test_dpace_mean_denominator_is_independent_of_the_data(self):
+        """The denominator must not move with the mask, or DP ranks disagree on it.
+
+        ``batch * blocks`` comes from the tensor shape, which is fixed by
+        ``num_anchors`` in the config -- identical on every rank and every step,
+        unlike the number of unmasked positions.
+        """
+        torch.manual_seed(22)
+        bsz, n, k, vocab = 2, 3, 4, 17
+        logits = torch.randn(bsz, n, k, vocab)
+        target_ids = torch.randint(0, vocab, (bsz, n, k))
+        loss_fn = DFlashDecayLoss(loss_type="dpace", dpace_alpha=0.35, normalize="mean")
+
+        full = loss_fn(logits, target_ids, torch.ones(bsz, n, k))
+        sparse = loss_fn(logits, target_ids, (torch.rand(bsz, n, k) > 0.5).float())
+
+        assert full.loss_denominator.item() == sparse.loss_denominator.item() == float(bsz * n)
+
+    def test_dpace_scale_is_comparable_to_dflash(self):
+        """Flipping ``loss_type`` must not move the loss by orders of magnitude.
+
+        Both variants weight the same per-token NLLs by O(1) weights over the same
+        denominator, so the ratio stays within a small factor -- the property that
+        lets one config and one ``optimizer.lr`` cover both.
+        """
+        torch.manual_seed(23)
+        bsz, n, k, vocab = 2, 8, 15, 17
+        logits = torch.randn(bsz, n, k, vocab)
+        target_ids = torch.randint(0, vocab, (bsz, n, k))
+        block_mask = torch.ones(bsz, n, k)
+
+        dflash = DFlashDecayLoss(loss_gamma=7.0, normalize="mean")(logits, target_ids, block_mask).total_loss
+        dpace = DFlashDecayLoss(loss_type="dpace", dpace_alpha=0.5, normalize="mean")(
+            logits, target_ids, block_mask
+        ).total_loss
+
+        assert 0.1 < (dpace / dflash).item() < 100.0
 
     def test_dpace_honors_num_tokens_not_batch_size(self):
         """D-PACE must normalize by the global ``num_tokens`` (the default
@@ -533,9 +610,7 @@ class TestDFlashDraftAccuracy:
             k = block_size - 1
             w = loss_fn._decay_weights(k, torch.device("cpu"), torch.float32)
             assert w.shape == (k,), f"block_size={block_size}: weights shape mismatch"
-            assert torch.isclose(w[0], torch.tensor(1.0)), (
-                f"block_size={block_size}: first weight {w[0].item()} != 1.0"
-            )
+            assert torch.isclose(w[0], torch.tensor(1.0)), f"block_size={block_size}: first weight {w[0].item()} != 1.0"
             assert w[0] > w[-1], f"block_size={block_size}: weights do not decay within block"
 
     def test_recipe_per_pos_metrics_dict_construction(self):
