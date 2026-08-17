@@ -147,11 +147,11 @@ class Mistral3BidirectionalConfig(Mistral3Config):
     model_type = "mistral3_bidirec"
 
     @property
-    def pooling(self):
+    def pooling(self) -> str:
         return self._pooling
 
     @pooling.setter
-    def pooling(self, value):
+    def pooling(self, value: str) -> None:
         self._pooling = value
         if self.text_config is not None:
             if isinstance(self.text_config, dict):
@@ -166,13 +166,14 @@ class Mistral3BidirectionalConfig(Mistral3Config):
         self.pooling = pooling
         self.temperature = temperature
 
-    def __post_init__(self, **kwargs):
+    def __post_init__(self, **kwargs: Any) -> None:
         if self.text_config is not None:
             if isinstance(self.text_config, dict):
                 self.text_config = Ministral3BidirectionalConfig(**self.text_config)
         super().__post_init__(**kwargs)
 
-    def to_dict(self):
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize pooling under its public configuration key."""
         config_dict = super().to_dict()
         config_dict.pop("_pooling", None)
         config_dict["pooling"] = self.pooling
@@ -207,7 +208,6 @@ class Mistral3BidirectionalModel(Mistral3Model):
             )
 
         config_dict = self.config.to_dict()
-        config_dict["pooling"] = config_dict.pop("_pooling", config_dict.get("pooling", "avg"))
         config_dict.pop("model_type", None)
         config_dict.pop("auto_map", None)
         config_dict.pop("task_instructions", None)

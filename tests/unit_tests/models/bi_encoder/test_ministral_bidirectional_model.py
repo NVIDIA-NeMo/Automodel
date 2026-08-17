@@ -153,6 +153,23 @@ def test_ministral3_bidirectional_config_fields():
     assert cfg.model_type == "ministral3_bidirec"
 
 
+def test_mistral3_vlm_config_pooling_round_trips_and_exports():
+    config = _tiny_mistral3_bidirectional_vlm_config()
+    config.pooling = "cls"
+
+    serialized = config.to_dict()
+    reloaded = Mistral3BidirectionalConfig.from_dict(serialized)
+    exported = Mistral3BidirectionalModel(config).get_hf_export_config()
+
+    assert serialized["pooling"] == "cls"
+    assert "_pooling" not in serialized
+    assert serialized["text_config"]["pooling"] == "cls"
+    assert reloaded.pooling == "cls"
+    assert reloaded.text_config.pooling == "cls"
+    assert exported.pooling == "cls"
+    assert exported.text_config.pooling == "cls"
+
+
 def test_mistral3_vlm_initializes_parent_once(monkeypatch):
     config = _tiny_mistral3_bidirectional_vlm_config()
     parent_init = Mistral3Model.__init__
