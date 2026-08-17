@@ -1280,6 +1280,24 @@ class TestResetPpStageShapes:
         assert schedule._stages_forward_initialized is False
         assert schedule._stages_backward_initialized is False
 
+    def test_exact_first_stage_input_meta_overrides_default_token_ids(self):
+        stage = self._make_stage(is_first=True, is_last=False, has_lm_head=False)
+        schedule = self._make_schedule()
+        config = self._make_config()
+        embeds_meta = torch.empty(1, 32, 64, device="meta", dtype=torch.bfloat16)
+
+        reset_pp_stage_shapes(
+            schedule,
+            [stage],
+            config,
+            microbatch_size=1,
+            seq_len=32,
+            first_stage_input_meta=embeds_meta,
+        )
+
+        assert stage.inputs_meta[0].shape == (1, 32, 64)
+        assert stage.inputs_meta[0].dtype == torch.bfloat16
+
     def test_shapes_change_on_new_seq_len(self):
         """Calling reset twice with different seq_lens should produce different shapes."""
         stage = self._make_stage(is_first=True, is_last=False, has_lm_head=False)

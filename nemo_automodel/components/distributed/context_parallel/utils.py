@@ -29,6 +29,8 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
 )
 from nemo_automodel.components.distributed.thd_utils import (
     split_batch_into_thd_chunks,
+    split_final_thd_batch,
+    stack_thd_chunks,
     thd_padding_mask_from_token_ids,
 )
 
@@ -419,6 +421,11 @@ def _prepare_cp_sharder(
     """
 
     batch_is_thd = batch.get("qkv_format") == "thd"
+    if batch_is_thd and bool(getattr(model, "_te_attention_injected", False)):
+        raise NotImplementedError(
+            "THD inputs require a native THD-capable model backend; "
+            "Transformer Engine injected into a stock Hugging Face model supports padded BSHD only"
+        )
     magi_state = _magi_state_from_model(model, device_mesh)
     magi_enabled = magi_state is not None and getattr(magi_state, "enabled", False)
     backend_uses_thd = batch_is_thd and (magi_enabled or _uses_te_attention(model))
@@ -770,21 +777,30 @@ def make_cp_batch_for_te(
     if qkv_format != "thd":
         raise ValueError(f"Currently only 'thd' format is supported, got: {qkv_format}")
 
-    batch = split_batch_into_thd_chunks(
-        batch,
-        num_chunks=num_chunks,
-        seq_lens_padding_value=seq_lens_padding_value,
-        padding_token_id=padding_token_id,
-    )
+    final_thd = "cu_seqlens" in batch and "seq_lens" not in batch and "seq_lens_padded" not in batch
+    if final_thd and num_chunks > 1:
+        batch = stack_thd_chunks(
+            split_final_thd_batch(batch, num_chunks, seq_lens_padding_value),
+            seq_lens_padding_value,
+        )
+    elif not final_thd:
+        batch = split_batch_into_thd_chunks(
+            batch,
+            num_chunks=num_chunks,
+            seq_lens_padding_value=seq_lens_padding_value,
+            padding_token_id=padding_token_id,
+        )
 
     if cp_mesh is None or cp_mesh.size() <= 1:
         if not return_local_indices:
             return batch
         # Unsharded THD stream: identity index map. Chunked streams are
         # per-chunk token spaces with no single step-wide map -> None.
-        input_ids = batch["input_ids"]
+        primary = batch.get("inputs_embeds", batch.get("input_ids"))
+        if not isinstance(primary, torch.Tensor):
+            raise ValueError("THD batch requires tensor input_ids or inputs_embeds")
         local_indices = (
-            torch.arange(input_ids.shape[-1], device=input_ids.device, dtype=torch.long) if num_chunks <= 1 else None
+            torch.arange(primary.shape[0], device=primary.device, dtype=torch.long) if num_chunks <= 1 else None
         )
         return batch, local_indices
 
@@ -797,22 +813,16 @@ def make_cp_batch_for_te(
     # Extract each chunk from the batched result and shard it
     chunks = []
     for i in range(num_chunks):
-        chunk_batch = {k: v[i] if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+        chunk_batch = {
+            key: value[i]
+            if isinstance(value, torch.Tensor) and value.ndim > 0 and value.shape[0] == num_chunks
+            else value
+            for key, value in batch.items()
+        }
         chunks.append(
             _shard_thd_chunk_for_te(chunk_batch, cp_mesh, qkv_format, seq_lens_padding_value, padding_token_id)[0]
         )
-
-    return_dict = {
-        "input_ids": torch.stack([chunk["input_ids"] for chunk in chunks]),
-        "labels": torch.stack([chunk["labels"] for chunk in chunks]),
-        "position_ids": torch.stack([chunk["position_ids"] for chunk in chunks]),
-        "cu_seqlens": torch.stack([chunk["cu_seqlens"] for chunk in chunks]),
-        "max_seqlen": torch.stack([chunk["max_seqlen"] for chunk in chunks]),
-        "qkv_format": qkv_format,
-        "padding_mask": torch.stack([chunk["padding_mask"] for chunk in chunks]),
-        "cp_size": cp_mesh.size() if cp_mesh is not None else 1,
-        "cp_rank": torch.distributed.get_rank(group=cp_mesh.get_group()) if cp_mesh is not None else 0,
-    }
+    return_dict = stack_thd_chunks(chunks, seq_lens_padding_value)
 
     # Chunked mode: each chunk is its own token space, so there is no single
     # step-wide local-token index map to expose.
@@ -846,13 +856,19 @@ def _shard_thd_chunk_for_te(
     # The partition is the same for every token-aligned key; it is also this
     # rank's local-token global index map, returned so the caller can install
     # it on the THD sharder (ContextParallelSharder token verbs).
-    local_indices = tex.thd_get_partitioned_indices(
-        filtered_cu_seqlens_padded, batch["input_ids"].size(0), cp_size, cp_rank
-    )
-    mask_keys = ["input_ids", "labels", "position_ids", "padding_mask"]
-    for key in mask_keys:
-        if key in batch:
-            batch[key] = batch[key].index_select(0, local_indices)
+    primary_name = "inputs_embeds" if "inputs_embeds" in batch else "input_ids"
+    primary = batch[primary_name]
+    total_tokens = primary.size(0)
+    local_indices = tex.thd_get_partitioned_indices(filtered_cu_seqlens_padded, total_tokens, cp_size, cp_rank)
+    token_keys = {"input_ids", "inputs_embeds", "labels", "position_ids", "padding_mask"}
+    for key, value in batch.items():
+        if (
+            (key in token_keys or key.startswith("__engine_loss__"))
+            and isinstance(value, torch.Tensor)
+            and value.ndim > 0
+            and value.shape[0] == total_tokens
+        ):
+            batch[key] = value.index_select(0, local_indices)
 
     # Keep model-owned payloads (for example VLM media) by default. Only remove
     # source metadata that is invalid after the THD CP conversion; the update
@@ -862,11 +878,16 @@ def _shard_thd_chunk_for_te(
     output_batch.pop("cu_seqlens_padded", None)
 
     max_seqlen = (filtered_cu_seqlens_padded[1:] - filtered_cu_seqlens_padded[:-1]).max().item()
+    output_batch[primary_name] = (
+        batch[primary_name].to(torch.int64).contiguous()
+        if primary_name == "input_ids"
+        else batch[primary_name].contiguous()
+    )
+    output_batch["labels"] = batch["labels"].to(torch.int64).contiguous()
+    if isinstance(batch.get("position_ids"), torch.Tensor):
+        output_batch["position_ids"] = batch["position_ids"].to(torch.int64).contiguous()
     output_batch.update(
         {
-            "input_ids": batch["input_ids"].to(torch.int64).contiguous(),
-            "labels": batch["labels"].to(torch.int64).contiguous(),
-            "position_ids": batch["position_ids"].to(torch.int64).contiguous(),
             "cu_seqlens": cu_seqlens_padded.to(torch.int32).contiguous(),
             "max_seqlen": torch.tensor(max_seqlen).to(torch.int32).to(device=cu_seqlens_padded.device),
             "qkv_format": qkv_format,
@@ -881,6 +902,8 @@ def _shard_thd_chunk_for_te(
     if "padding_mask" in batch:
         output_batch["padding_mask"] = batch["padding_mask"].bool().contiguous()
     else:
+        if primary_name != "input_ids":
+            raise ValueError("THD inputs_embeds require an explicit padding_mask")
         output_batch["padding_mask"] = thd_padding_mask_from_token_ids(
             output_batch["input_ids"], padding_token_id
         ).contiguous()

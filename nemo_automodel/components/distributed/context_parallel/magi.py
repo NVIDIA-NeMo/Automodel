@@ -780,6 +780,11 @@ class MagiState:
         # (a spec or None) is self-clearing, so a stale spec never leaks into the next
         # batch; plain batches omit "prefix_tree".
         prefix_tree = batch.pop("prefix_tree", None)
+        if prefix_tree is not None and self.cp_size > 1:
+            raise NotImplementedError(
+                "The prefix-tree attention mask currently requires cp_size=1; "
+                "distributed prefix-tree dispatch is not wired yet."
+            )
         if prefix_tree is not None and self.hf_dispatch:
             # The prefix-tree mask is handed to the attn_func out-of-band (the HF
             # attention interface has a fixed signature and cannot receive a custom
@@ -798,6 +803,12 @@ class MagiState:
         set_active_attn_spec(spec)
         local_indices = None
         if self.hf_dispatch:
+            if is_thd:
+                raise NotImplementedError(
+                    "The HF magi backend does not support packed THD batches because its fixed "
+                    "attention interface cannot preserve packed document boundaries; use the custom-model "
+                    "magi backend (model.backend.attn='magi')."
+                )
             # HF path: dispatch the (single causal) sequence across the CP group.
             batch, _, local_indices = magi_prepare_batch(model, batch, self.cp_group, return_local_indices=True)
         elif self.custom and self.cp_size > 1 and is_thd:
@@ -805,6 +816,11 @@ class MagiState:
             # sharding) then dispatch it with magi's own load-balancing solver.
             batch = make_cp_batch_for_te(None, batch, qkv_format="thd", padding_token_id=pad_id, num_chunks=1)
             batch, _, local_indices = magi_prepare_packed_cp(model, batch, self.cp_group, return_local_indices=True)
+        elif self.custom and self.cp_size > 1:
+            # A plain causal custom-model batch uses the same dist key and
+            # dispatch as the HF path. The custom attention callable reads the
+            # key from the active CP group instead of the stamped modules.
+            batch, _, local_indices = magi_prepare_batch(model, batch, self.cp_group, return_local_indices=True)
         elif is_thd:
             # cp=1 packing: THD conversion (no sharding) so the batch carries
             # cu_seqlens -> the magi attn_func builds the per-document mask.
@@ -866,6 +882,11 @@ class MagiState:
         """
         del cp_mesh
         local_indices = None
+        if self.custom:
+            # Engine callers do not have to run recipe-level setup_magi first.
+            # Refreshing this process-local handle also makes the active group
+            # explicit for every outer PP accumulation batch.
+            set_active_cp_group(self.cp_group)
         if self.domain == "vlm":
             _, batch = self.prepare_vlm_batch(model, batch)
         else:

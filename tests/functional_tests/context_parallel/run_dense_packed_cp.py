@@ -199,10 +199,10 @@ def _run_model(
 
     observed: dict[str, torch.Tensor] = {}
 
-    def loss_fn(output, loss_inputs, _datums, model_inputs):
+    def loss_fn(output, loss_inputs):
         local_logits = _full_tensor(output.logits).squeeze(0)
         observed["logits"] = local_logits.detach()
-        observed["cu_seqlens"] = model_inputs["cu_seqlens"].detach()
+        observed["cu_seqlens"] = loss_inputs["cu_seqlens"].detach()
         observed["labels"] = loss_inputs["labels"].detach()
         return local_logits.float().square().mean(dim=-1)
 
@@ -212,7 +212,7 @@ def _run_model(
         mesh_context=mesh_context,
         collate_fn=collate_prebatched,
         defer_fsdp_grad_sync=distributed_config.defer_fsdp_grad_sync,
-    ).forward_backward([[datum]], loss_fn)
+    ).forward_backward([datum], loss_fn)
 
     local_logits = observed["logits"]
     assert observed["labels"].shape == (8 // cp_mesh.size(),)

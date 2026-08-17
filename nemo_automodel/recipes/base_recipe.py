@@ -756,6 +756,42 @@ class BaseRecipe:
             return 1
         return device_mesh["cp"].size()
 
+    def _validate_mtp_context_parallelism(self, model_parts: list[nn.Module]) -> None:
+        """Reject MTP until future-token shifts are CP-aware.
+
+        MTP currently rolls inputs and labels after context-parallel sharding.
+        A local roll cannot recover the next token across CP rank boundaries,
+        and round-robin layouts introduce additional false adjacencies.  The
+        model-wide reduction makes the decision identical on every PP stage,
+        including stages that do not locally own the MTP module.
+        """
+        mesh_context = getattr(self, "mesh_context", None)
+        if mesh_context is None or mesh_context.cp_size <= 1:
+            return
+
+        modules = (
+            module
+            for part in model_parts
+            for module in (part.modules() if callable(getattr(part, "modules", None)) else (part,))
+        )
+        local_has_mtp = any(
+            getattr(module, "mtp", None) is not None
+            or bool(getattr(getattr(module, "mtp_config", None), "enabled", False))
+            for module in modules
+        )
+        enabled = torch.tensor(
+            int(local_has_mtp),
+            dtype=torch.int32,
+            device=getattr(getattr(self, "dist_env", None), "device", torch.device("cpu")),
+        )
+        if dist.is_initialized():
+            dist.all_reduce(enabled, op=dist.ReduceOp.MAX, group=getattr(mesh_context, "process_group", None))
+        if bool(enabled.item()):
+            raise NotImplementedError(
+                "MTP with context parallelism is not supported because future-token shifts are not CP-aware; "
+                "set the model's MTP layer count to 0 or use cp_size=1"
+            )
+
     def _set_moe_aux_loss_backward_scale(self, *, num_batches: int, num_label_tokens: int) -> None:
         """Set the per-microbatch MoE auxiliary-loss scale for one optimizer step.
 

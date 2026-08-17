@@ -20,7 +20,7 @@ from typing import Any, Callable, Literal, Optional
 import torch
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.pipelining.microbatch import BlockMask, TensorChunkSpec, split_args_kwargs_into_chunks
+from torch.distributed.pipelining.microbatch import BlockMask, TensorChunkSpec
 from torch.distributed.pipelining.microbatch import _Replicate as ReplicateChunkSpec
 from torch.distributed.pipelining.schedules import _PipelineSchedule
 from torch.distributed.pipelining.stage import PipelineStage
@@ -129,6 +129,8 @@ class AutoPipeline:
         )
         self._model_config = None
         self._pp_current_seq_len: Optional[int] = None
+        self._pp_current_microbatch_size: Optional[int] = None
+        self._pp_current_input_signature: tuple[tuple[int, ...], torch.dtype] | None = None
 
     def build(
         self,
@@ -190,8 +192,14 @@ class AutoPipeline:
     def info(self) -> PipelineInfo:
         return self._info
 
-    def update_seq_len(self, seq_len: int) -> None:
-        """Reset pipeline stage infrastructure for a new sequence length.
+    def update_seq_len(
+        self,
+        seq_len: int,
+        *,
+        microbatch_size: int | None = None,
+        input_tensor: torch.Tensor | None = None,
+    ) -> None:
+        """Reset pipeline stage infrastructure for a new input shape.
 
         VLM training batches can have wildly different sequence lengths across steps
         (image batches vs. text-only batches).  PyTorch's PipelineStage locks in recv
@@ -203,8 +211,25 @@ class AutoPipeline:
 
         Args:
             seq_len: Sequence length of the upcoming batch (``input_ids.shape[1]``).
+            microbatch_size: Materialized leading batch extent. Defaults to the
+                configured padded microbatch size. Packed THD streams use one
+                synthetic batch row even when they were formed from multiple
+                source examples.
+            input_tensor: Actual positional input for the first stage. When
+                provided, its shape and dtype define first-stage metadata;
+                this supports floating-point embeddings and flat THD tensors.
         """
-        if seq_len == self._pp_current_seq_len:
+        effective_microbatch_size = self.pp_microbatch_size if microbatch_size is None else microbatch_size
+        input_signature = (
+            (tuple(input_tensor.shape), input_tensor.dtype) if isinstance(input_tensor, torch.Tensor) else None
+        )
+        if effective_microbatch_size <= 0:
+            raise ValueError(f"microbatch_size must be positive, got {effective_microbatch_size}")
+        if (
+            seq_len == self._pp_current_seq_len
+            and effective_microbatch_size == self._pp_current_microbatch_size
+            and input_signature == self._pp_current_input_signature
+        ):
             return
         if self._model_config is None:
             raise RuntimeError("AutoPipeline.build() must be called before update_seq_len()")
@@ -212,12 +237,23 @@ class AutoPipeline:
             self._info.schedule,
             self._info.stages,
             self._model_config,
-            self.pp_microbatch_size,
+            effective_microbatch_size,
             seq_len,
             tensor_dtype=self.dtype,
+            first_stage_input_meta=(
+                torch.empty(tuple(input_tensor.shape), device="meta", dtype=input_tensor.dtype)
+                if isinstance(input_tensor, torch.Tensor)
+                else None
+            ),
         )
         self._pp_current_seq_len = seq_len
-        logger.debug(f"PP stage shapes updated for seq_len={seq_len}")
+        self._pp_current_microbatch_size = effective_microbatch_size
+        self._pp_current_input_signature = input_signature
+        logger.debug(
+            "PP stage shapes updated for seq_len=%s, microbatch_size=%s",
+            seq_len,
+            effective_microbatch_size,
+        )
 
     def _get_schedule_kwargs_chunk_spec(self, kwargs: dict[str, Any]) -> dict[str, Any] | None:
         """Build pipeline microbatch chunking metadata for keyword inputs.
@@ -269,8 +305,6 @@ class AutoPipeline:
         *,
         target: torch.Tensor | None = None,
         losses: list[torch.Tensor] | None = None,
-        loss_inputs: dict[str, Any] | None = None,
-        loss_fn: Callable | None = None,
         return_outputs: bool = True,
         **kwargs: Any,
     ) -> Any:
@@ -283,14 +317,6 @@ class AutoPipeline:
                 ranks without the last pipeline stage.
             losses: Mutable list populated with scalar loss tensors, or ``None``
                 on ranks without the last pipeline stage.
-            loss_inputs: Structured loss inputs. Tensor fields of shape
-                [batch, ...] are split on the batch axis; scalar tensors and
-                non-tensor fields are replicated. Must be provided together
-                with ``loss_fn`` and without ``target``.
-            loss_fn: Callback invoked as ``loss_fn(output, loss_inputs_mb,
-                model_args_mb, model_kwargs_mb)`` for each microbatch. Model
-                tensor arguments use shape [microbatch, ...], while keyword
-                tensors retain their model-defined layouts.
             return_outputs: Whether the last pipeline stage returns merged model
                 outputs when supported by the installed PyTorch version. Tensor
                 layouts are defined by the underlying model.
@@ -305,11 +331,6 @@ class AutoPipeline:
         if schedule is None:
             raise RuntimeError("AutoPipeline.build() must be called before running a PP schedule step")
 
-        if (loss_inputs is None) != (loss_fn is None):
-            raise ValueError("loss_inputs and loss_fn must be provided together")
-        if loss_inputs is not None and target is not None:
-            raise ValueError("target cannot be used together with loss_inputs and loss_fn")
-
         schedule_args = (model_input,) if self._info.has_first_stage else ()
         kwargs_chunk_spec = self._get_schedule_kwargs_chunk_spec(kwargs)
         schedule_options = (
@@ -318,88 +339,98 @@ class AutoPipeline:
             else {}
         )
 
-        if loss_inputs is None:
-            if kwargs_chunk_spec is None:
-                return schedule.step(
-                    *schedule_args,
-                    target=target,
-                    losses=losses,
-                    **schedule_options,
-                    **kwargs,
-                )
-
-            previous_kwargs_chunk_spec = schedule._kwargs_chunk_spec
-            schedule._kwargs_chunk_spec = kwargs_chunk_spec
-            try:
-                return schedule.step(
-                    *schedule_args,
-                    target=target,
-                    losses=losses,
-                    **schedule_options,
-                    **kwargs,
-                )
-            finally:
-                schedule._kwargs_chunk_spec = previous_kwargs_chunk_spec
-
-        model_args_chunks, model_kwargs_chunks = split_args_kwargs_into_chunks(
-            (model_input,),
-            kwargs,
-            self.num_microbatches,
-            kwargs_chunk_spec=kwargs_chunk_spec,
-        )
-        if len(model_args_chunks) != self.num_microbatches:
-            raise ValueError(f"Expected {self.num_microbatches} model input microbatches, got {len(model_args_chunks)}")
-
-        loss_inputs_chunk_spec = tree_map(
-            lambda value: (
-                TensorChunkSpec(0) if isinstance(value, torch.Tensor) and value.ndim > 0 else ReplicateChunkSpec()
-            ),
-            loss_inputs,
-            is_leaf=lambda value: isinstance(value, BlockMask),
-        )
-        _, loss_inputs_chunks = split_args_kwargs_into_chunks(
-            (),
-            loss_inputs,
-            self.num_microbatches,
-            kwargs_chunk_spec=loss_inputs_chunk_spec,
-        )
-        if len(loss_inputs_chunks) != self.num_microbatches:
-            raise ValueError(f"Expected {self.num_microbatches} loss input microbatches, got {len(loss_inputs_chunks)}")
-
-        def microbatch_loss(output: Any, microbatch_id: torch.Tensor) -> Any:
-            """Evaluate the structured loss for one pipeline microbatch.
-
-            Args:
-                output: Model output whose tensor layouts are defined by the model.
-                microbatch_id: Tensor of shape [1] identifying the microbatch.
-
-            Returns:
-                The loss value returned by ``loss_fn``. Tensor layout is defined
-                by the callback.
-            """
-            index = int(microbatch_id.item())
-            return loss_fn(
-                output,
-                loss_inputs_chunks[index],
-                model_args_chunks[index],
-                model_kwargs_chunks[index],
+        if kwargs_chunk_spec is None:
+            return schedule.step(
+                *schedule_args,
+                target=target,
+                losses=losses,
+                **schedule_options,
+                **kwargs,
             )
 
         previous_kwargs_chunk_spec = schedule._kwargs_chunk_spec
-        previous_loss_fn = schedule._loss_fn
         schedule._kwargs_chunk_spec = kwargs_chunk_spec
-        schedule._loss_fn = microbatch_loss
         try:
             return schedule.step(
                 *schedule_args,
-                target=torch.arange(self.num_microbatches, device=self.device),
+                target=target,
                 losses=losses,
                 **schedule_options,
                 **kwargs,
             )
         finally:
-            schedule._loss_fn = previous_loss_fn
             schedule._kwargs_chunk_spec = previous_kwargs_chunk_spec
+
+    def step_microbatches(
+        self,
+        model_inputs: list[dict[str, Any]],
+        *,
+        loss_fn: Callable[[Any, int], Any],
+        losses: list[torch.Tensor] | None = None,
+        return_outputs: bool = False,
+    ) -> Any:
+        """Run a schedule step over already prepared model microbatches.
+
+        The caller owns microbatch preparation. This method passes the prepared
+        inputs to the PyTorch schedule unchanged, while the schedule continues
+        to own execution order and backward calls.
+
+        Args:
+            model_inputs: Exactly :attr:`num_microbatches` complete model-input
+                mappings. Each mapping contains exactly one of ``input_ids`` or
+                ``inputs_embeds``; all remaining items are model keyword inputs.
+            loss_fn: Callback invoked as ``loss_fn(output, microbatch_index)``.
+                The index identifies the corresponding item in ``model_inputs``
+                regardless of the schedule's execution order.
+            losses: Mutable list populated by the schedule on the last stage.
+            return_outputs: Whether the last stage returns merged model outputs
+                when supported by the installed PyTorch version.
+
+        Returns:
+            The value returned by the underlying PyTorch pipeline schedule.
+        """
+        schedule = self._info.schedule
+        if schedule is None:
+            raise RuntimeError("AutoPipeline.build() must be called before running a PP schedule step")
+        if len(model_inputs) != self.num_microbatches:
+            raise ValueError(f"Expected {self.num_microbatches} model input microbatches, got {len(model_inputs)}")
+
+        model_args_chunks: list[tuple[Any, ...]] = []
+        model_kwargs_chunks: list[dict[str, Any]] = []
+        for index, inputs in enumerate(model_inputs):
+            if not isinstance(inputs, dict):
+                raise TypeError(f"model input microbatch {index} must be a dict")
+            primary_names = [name for name in ("input_ids", "inputs_embeds") if name in inputs]
+            if len(primary_names) != 1:
+                raise ValueError(
+                    f"model input microbatch {index} must contain exactly one of input_ids or inputs_embeds"
+                )
+            kwargs = dict(inputs)
+            primary = kwargs.pop(primary_names[0])
+            model_args_chunks.append((primary,) if self._info.has_first_stage else ())
+            model_kwargs_chunks.append(kwargs)
+
+        def indexed_loss(output: Any, microbatch_id: torch.Tensor) -> Any:
+            return loss_fn(output, int(microbatch_id.item()))
+
+        schedule_options = (
+            {"return_outputs": return_outputs}
+            if "return_outputs" in inspect.signature(schedule.step).parameters
+            else {}
+        )
+        previous_split_inputs = schedule._split_inputs
+        previous_loss_fn = schedule._loss_fn
+        schedule._split_inputs = lambda _args, _kwargs=None: (model_args_chunks, model_kwargs_chunks)
+        schedule._loss_fn = indexed_loss
+        try:
+            return schedule.step(
+                target=torch.arange(self.num_microbatches, device=self.device),
+                losses=losses,
+                **schedule_options,
+            )
+        finally:
+            schedule._loss_fn = previous_loss_fn
+            schedule._split_inputs = previous_split_inputs
 
     @property
     def parts(self) -> list[nn.Module]:

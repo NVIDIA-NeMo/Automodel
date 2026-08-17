@@ -618,8 +618,8 @@ def test_make_cp_batch_for_te_multi_chunk(monkeypatch):
     assert result["padding_mask"].shape == result["input_ids"].shape
 
 
-def test_shard_thd_chunk_skips_missing_padding_mask(monkeypatch):
-    """Test that _shard_thd_chunk_for_te handles missing padding_mask gracefully."""
+def test_shard_thd_chunk_only_partitions_explicit_token_fields(monkeypatch):
+    """Token loss fields follow TE indices while same-length model payloads remain global."""
     cp_mesh = _DummySubMesh(size=2)
 
     def mock_get_rank(group=None):
@@ -628,7 +628,7 @@ def test_shard_thd_chunk_skips_missing_padding_mask(monkeypatch):
     class MockTex:
         @staticmethod
         def thd_get_partitioned_indices(cu_seqlens_padded, total_tokens, cp_size, cp_rank):
-            return torch.arange(total_tokens)
+            return torch.tensor([0, total_tokens - 1])
 
     import sys
 
@@ -637,12 +637,15 @@ def test_shard_thd_chunk_skips_missing_padding_mask(monkeypatch):
     monkeypatch.setattr(torch.distributed, "get_rank", mock_get_rank)
 
     # Batch without padding_mask — should not raise KeyError
+    media_payload = torch.arange(4.0)
     batch = {
         "input_ids": torch.tensor([1, 2, 3, 4]),
         "labels": torch.tensor([10, 20, 30, 40]),
         "position_ids": torch.tensor([0, 1, 2, 3]),
         "cu_seqlens": torch.tensor([0, 4], dtype=torch.int32),
         "cu_seqlens_padded": torch.tensor([0, 4], dtype=torch.int32),
+        "__engine_loss__advantages": torch.tensor([10.0, 20.0, 30.0, 40.0]),
+        "media_payload": media_payload,
     }
 
     result, local_indices = _cu._shard_thd_chunk_for_te(batch, cp_mesh, "thd", -1000, 0)
@@ -650,8 +653,10 @@ def test_shard_thd_chunk_skips_missing_padding_mask(monkeypatch):
     assert "input_ids" in result
     assert "attention_mask" not in result
     assert "cu_seqlens_padded" not in result
-    # the partition IS the local-token global index map (mock returns arange)
-    assert torch.equal(local_indices, torch.arange(4))
+    assert torch.equal(local_indices, torch.tensor([0, 3]))
+    assert torch.equal(result["input_ids"], torch.tensor([1, 4]))
+    assert torch.equal(result["__engine_loss__advantages"], torch.tensor([10.0, 40.0]))
+    assert result["media_payload"] is media_payload
 
 
 def test_make_cp_batch_for_te_unsupported_format():
@@ -811,6 +816,15 @@ def test_sharder_constructor_derives_te_from_model_and_thd_from_batch(monkeypatc
     assert batch == {"thd": True}
     assert seen["cp_mesh"] is device_mesh["cp"]
     assert (seen["pad"], seen["fmt"], seen["chunks"], seen["sent"]) == (7, "thd", 3, -1000)
+
+
+def test_sharder_constructor_rejects_injected_hf_te_for_thd():
+    """Injected HF TE attention is still BSHD-only and cannot consume THD metadata."""
+    model = type("_Model", (), {"_te_attention_injected": True})()
+    batch = {"input_ids": torch.tensor([[1, 2]]), "qkv_format": "thd"}
+
+    with pytest.raises(NotImplementedError, match="stock Hugging Face model supports padded BSHD only"):
+        ContextParallelSharder(model, _DummyDeviceMesh(cp_size=1, tp_size=1), batch)
 
 
 def test_sharder_constructor_does_not_infer_te_from_batch_alone(monkeypatch):

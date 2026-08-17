@@ -28,9 +28,8 @@ except ImportError:
 import logging
 import pathlib
 import time
-from collections.abc import Sequence
-from contextlib import contextmanager, nullcontext
-from typing import TYPE_CHECKING, Any, Optional, Protocol
+from contextlib import contextmanager
+from typing import TYPE_CHECKING, Any, Protocol
 
 import mlflow
 import torch
@@ -48,7 +47,7 @@ from nemo_automodel._transformers import (
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches, resolve_get_rope_index
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.datum import Datum
-from nemo_automodel.components.datasets.vlm.pp_media import stage_vlm_media_for_pp
+from nemo_automodel.components.datasets.vlm.pp_media import VLM_PP_MEDIA_KEY, stage_vlm_media_for_pp
 from nemo_automodel.components.distributed.config import DistributedSetup, FSDP2Config, MegatronFSDPConfig
 from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
 from nemo_automodel.components.distributed.context_parallel.magi import MagiState, setup_magi
@@ -59,7 +58,7 @@ from nemo_automodel.components.distributed.cp_vision_frame_shard import (
 )
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
-from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
+from nemo_automodel.components.distributed.utils import FirstRankPerNode
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
 from nemo_automodel.components.loggers.mlflow_utils import (
@@ -77,9 +76,6 @@ from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.utils import (
     count_tail_padding,
     get_expert_tp_replication_factor,
-    prepare_after_first_microbatch,
-    prepare_for_final_backward,
-    prepare_for_grad_accumulation,
     scale_grads_and_clip_grad_norm,
 )
 from nemo_automodel.components.utils.compile_utils import build_compile_config
@@ -400,9 +396,7 @@ def build_dataloader(
 class FinetuneRecipeForVLM(BaseRecipe):
     """Recipe for fine-tuning a VLM model."""
 
-    # MagiAttention is disabled until setup() resolves it from config; this
-    # disabled default keeps the train step working if setup() is skipped (e.g.
-    # unit tests that exercise the step directly). It is read-only.
+    # MagiAttention is disabled until setup() resolves it from config. It is read-only.
     magi = MagiState()
 
     def __init__(self, cfg):
@@ -462,6 +456,14 @@ class FinetuneRecipeForVLM(BaseRecipe):
         if not self._should_setup_training_components():
             return
 
+        if getattr(self.distributed_config, "calculate_per_token_loss", False):
+            raise NotImplementedError(
+                "Engine-backed VLM finetuning does not support "
+                "MegatronFSDP calculate_per_token_loss=True; use averaged gradients instead."
+            )
+        if self.pp_enabled and getattr(self.pipeline_config, "scale_grads_in_schedule", False):
+            raise ValueError("Engine-backed VLM finetuning requires distributed.pipeline.scale_grads_in_schedule=False")
+
         # MagiAttention (FFA) backend for the language backbone; the vision tower
         # stays on SDPA. Enabled via model.attn_implementation="magi" (HF VLMs) or
         # model.backend.attn="magi" (custom VLMs, e.g. qwen3_vl_moe).
@@ -490,13 +492,21 @@ class FinetuneRecipeForVLM(BaseRecipe):
             pp_batch_size = self.cfg.get("step_scheduler.local_batch_size", 1)
             pp_microbatch_size = self.cfg.get("distributed.pipeline.pp_microbatch_size", 1)
 
-            assert pp_batch_size // pp_microbatch_size >= self.mesh_context.pp_size, (
-                f"pp_batch_size {pp_batch_size} // pp_microbatch_size {pp_microbatch_size} must be >= pp_size {self.mesh_context.pp_size}"
-            )
+            if self.magi.enabled:
+                if pp_batch_size != 1 or pp_microbatch_size != 1:
+                    raise ValueError(
+                        "Magi pipeline training requires local_batch_size=1 and pp_microbatch_size=1; "
+                        "use outer gradient accumulation for larger optimizer windows"
+                    )
+            else:
+                if pp_batch_size // pp_microbatch_size < self.mesh_context.pp_size:
+                    raise ValueError(
+                        f"pp_batch_size {pp_batch_size} // pp_microbatch_size {pp_microbatch_size} "
+                        f"must be >= pp_size {self.mesh_context.pp_size}"
+                    )
 
-            assert not isinstance(self.distributed_config, MegatronFSDPConfig), (
-                "MegatronFSDPConfig is not supported when pipeline parallelism is enabled"
-            )
+            if isinstance(self.distributed_config, MegatronFSDPConfig):
+                raise ValueError("MegatronFSDPConfig is not supported when pipeline parallelism is enabled")
 
             # Update pipeline_config runtime fields
             self.pipeline_config.pp_batch_size = pp_batch_size
@@ -564,6 +574,8 @@ class FinetuneRecipeForVLM(BaseRecipe):
         else:
             self.model_parts = [model]
             self.pp = None
+        self._validate_mtp_context_parallelism(self.model_parts)
+        self.pipeline_loss_fn = None
         if self.pp_enabled:
             self._configure_pipeline_loss_fn()
 
@@ -628,29 +640,19 @@ class FinetuneRecipeForVLM(BaseRecipe):
         self.dataloader = dataloader_build.dataloader
         self.processor = dataloader_build.processor
 
-        model_has_mtp = not self.pp_enabled and any(
-            getattr(module, "mtp", None) is not None for module in self.model_parts[0].modules()
+        if getattr(self.loss_fn, "reduction", None) != "sum":
+            raise ValueError("Engine-backed VLM finetuning requires a loss with reduction='sum'")
+        padding_token_id = getattr(getattr(getattr(self, "processor", None), "tokenizer", None), "pad_token_id", 0) or 0
+        self.engine = Engine(
+            self.pp if self.pp_enabled else self.model_parts[0],
+            device=self.dist_env.device,
+            mesh_context=self.mesh_context,
+            microbatch_size=1,
+            collate_fn=collate_prebatched,
+            padding_token_id=padding_token_id,
+            context_fn=self._engine_context,
+            defer_fsdp_grad_sync=getattr(self.distributed_config, "defer_fsdp_grad_sync", True),
         )
-        self.engine = None
-        if (
-            not self.pp_enabled
-            and not self.magi.enabled
-            and not (self.mesh_context.cp_size > 1 and model_has_mtp)
-            and not getattr(self.distributed_config, "calculate_per_token_loss", False)
-            and getattr(self.loss_fn, "reduction", None) == "sum"
-        ):
-            padding_token_id = (
-                getattr(getattr(getattr(self, "processor", None), "tokenizer", None), "pad_token_id", 0) or 0
-            )
-            self.engine = Engine(
-                self.model_parts[0],
-                device=self.dist_env.device,
-                mesh_context=self.mesh_context,
-                collate_fn=collate_prebatched,
-                padding_token_id=padding_token_id,
-                context_fn=self._cp_vision_frame_sharding_context,
-                defer_fsdp_grad_sync=getattr(self.distributed_config, "defer_fsdp_grad_sync", True),
-            )
 
         # Build validation dataloader if the config provides it
         self.val_dataloader = None
@@ -884,66 +886,64 @@ class FinetuneRecipeForVLM(BaseRecipe):
             log_denominator=log_denominator,
         )
 
-    def _make_engine_datum(
-        self,
-        batch: dict[str, Any],
-        *,
-        log_drafter: bool = False,
-        log_denominator: int | float = 1,
-    ) -> Datum:
-        """Wrap one processor-collated VLM batch as a Datum."""
+    def _make_engine_datum(self, batch: dict[str, Any]) -> Datum:
+        """Wrap one processor-collated VLM batch for ``collate_prebatched``.
+
+        Args:
+            batch: Model and media inputs plus labels. Padded labels have shape
+                [batch, sequence]; packed labels have shape [tokens].
+
+        Returns:
+            A Datum preserving model/media layouts with labels and weights on
+            matching token axes. Non-first PP stages omit raw media tensors.
+        """
         labels = batch["labels"]
         model_inputs = {key: value for key, value in batch.items() if key != "labels"}
+        if self.pp_enabled and not self.pp.info.has_first_stage:
+            for key in VLM_INPUT_KEYS:
+                if key != "input_ids":
+                    model_inputs.pop(key, None)
+            model_inputs.pop(VLM_PP_MEDIA_KEY, None)
         if isinstance(self.loss_fn, FusedLinearCrossEntropy):
             model_inputs["logits_to_keep"] = 1
         return Datum(
             model_inputs=model_inputs,
-            loss_fn_inputs={
-                "labels": labels,
-                "weights": labels.ne(-100),
-                "log_drafter": torch.tensor(log_drafter),
-                "log_denominator": torch.tensor(log_denominator),
-            },
+            loss_fn_inputs={"labels": labels, "weights": labels.ne(-100)},
         )
 
     def _engine_loss_fn(
         self,
         out: Any,
         loss_inputs: dict[str, torch.Tensor],
-        datums: Sequence[Datum],
-        model_inputs: dict[str, Any],
+        *,
+        log_drafter: bool = False,
+        log_denominator: int | float | None = None,
     ) -> torch.Tensor:
-        """Return the local loss sum; Engine owns global normalization."""
+        """Compute a local summed VLM loss for Engine normalization.
+
+        Args:
+            out: Model output with logits shaped [batch, sequence, vocab],
+                packed logits shaped [tokens, vocab], or the PP/MTP tuple contract.
+            loss_inputs: CP-local labels and weights with matching token axes,
+                plus optional packed-sequence metadata.
+
+        Returns:
+            Scalar local loss-sum tensor.
+        """
+        if self.pp_enabled:
+            if self.pipeline_loss_fn is None:
+                raise RuntimeError("The last pipeline stage has no configured causal-LM loss")
+            self.pipeline_loss_fn.cu_seqlens = loss_inputs.get("cu_seqlens")
+            return self.pipeline_loss_fn(out, loss_inputs["labels"])
         return self._compute_vlm_loss(
             out=out,
             labels=loss_inputs["labels"],
             num_label_tokens=None,
             is_train=True,
-            cu_seqlens=model_inputs.get("cu_seqlens"),
-            log_drafter=bool(datums[0].loss_fn_inputs["log_drafter"].item()),
-            log_denominator=float(datums[0].loss_fn_inputs["log_denominator"].item()),
+            cu_seqlens=loss_inputs.get("cu_seqlens"),
+            log_drafter=log_drafter,
+            log_denominator=log_denominator,
         )
-
-    def _maybe_set_pp_first_stage_embed_input_meta(self, model_input: torch.Tensor) -> None:
-        if (
-            not self.pp_enabled
-            or not getattr(self.pp.info, "has_first_stage", False)
-            or not model_input.dtype.is_floating_point
-            or model_input.ndim != 3
-        ):
-            return
-
-        for stage in self.pp.info.stages:
-            if stage.is_first:
-                stage.inputs_meta = (
-                    torch.empty(
-                        self.pp.pp_microbatch_size,
-                        model_input.shape[1],
-                        model_input.shape[2],
-                        device="meta",
-                        dtype=model_input.dtype,
-                    ),
-                )
 
     @contextmanager
     def _cp_vision_frame_sharding_context(self):
@@ -967,124 +967,22 @@ class FinetuneRecipeForVLM(BaseRecipe):
         finally:
             reset_cp_vision_group(token)
 
-    def _forward_backward_step(
-        self,
-        idx,
-        batch,
-        *,
-        loss_buffer,
-        num_label_tokens,
-        num_batches,
-        is_train: bool = True,
-    ):
-        batch = {k: _move_to_device(v, self.dist_env.device) for k, v in batch.items()}
+    @contextmanager
+    def _engine_context(self, model_inputs: dict[str, Any]):
+        """Install VLM runtime state around one Engine forward/backward call.
 
-        # Single CP dispatch (magi / model-owned / generic). The pre-embed hook is
-        # a plain method call (prepare_model_inputs_for_cp): sharder-only, it
-        # touches no weights and consumes nothing. Invoke it on EVERY pp stage so
-        # its aux-only sharder keeps input_ids full-length everywhere; otherwise
-        # non-first stages hit the generic round-robin sharder, feed an
-        # already-local seq_len to update_seq_len, and get_pipeline_stage_metas
-        # ÷cp a second time -> the inter-stage hidden truncates to S/cp²
-        # (text-decoder RoPE size mismatch).
-        _is_first_or_no_pp = not self.pp_enabled or getattr(self.pp.info, "has_first_stage", False)
-        _cp_active = (
-            self.device_mesh is not None
-            and "cp" in getattr(self.device_mesh, "mesh_dim_names", ())
-            and self.device_mesh["cp"].size() > 1
-        )
-        if _cp_active and not _is_first_or_no_pp and hasattr(self.model_parts[0], "prepare_model_inputs_for_cp"):
-            # Non-first PP stages don't embed; drop raw multimodal inputs so their
-            # forwards see only text.
-            for k in VLM_INPUT_KEYS:
-                if k != "input_ids":
-                    batch.pop(k, None)
-        # THD packed VLM inputs (qkv_format='thd' from the packing collator) use TE
-        # sequence metadata even without context parallelism (#3052). Standard
-        # one-dimensional RoPE can follow the generic TE CP partition. Multi-axis
-        # mRoPE still needs axis-aware sharding before it can use this path.
-        _use_te_vlm = batch.get("qkv_format", None) == "thd"
-        position_ids = batch.get("position_ids")
-        if (
-            _use_te_vlm
-            and self.mesh_context.cp_size > 1
-            and isinstance(position_ids, torch.Tensor)
-            and position_ids.ndim == 3
-        ):
-            raise NotImplementedError(
-                "Context-parallel THD packing for multi-axis mRoPE VLMs is not yet implemented; "
-                "use one-dimensional position_ids or cp_size=1."
-            )
-        _padding_id = getattr(getattr(getattr(self, "processor", None), "tokenizer", None), "pad_token_id", 0) or 0
-        cp_sharder = ContextParallelSharder(
-            self.model_parts[0],
-            self.device_mesh,
-            batch,
-            padding_token_id=_padding_id,
-            invoke_pre_embed=True,
-        )
-        train_ctx, batch = cp_sharder.shard(batch)
-        labels = batch.pop("labels")
+        Args:
+            model_inputs: CP-local outer-batch mapping. Padded token tensors use
+                shape [batch, sequence]; THD tensors use the sharder-produced
+                packed layout. PP media is stored as per-microbatch tensor lists.
+        """
+        if not self.pp_enabled:
+            with self._cp_vision_frame_sharding_context():
+                yield
+            return
 
-        if self.pp_enabled:
-            if not is_train:
-                logging.info("Skipping forward pass for validation because pipeline parallelism is enabled")
-                return
-
-            with self._cp_vision_frame_sharding_context(), train_ctx():
-                losses = [] if self.pp.info.has_last_stage else None
-                if self.pp.info.has_last_stage:
-                    masked_labels = labels.clone()
-                    targets = masked_labels
-                else:
-                    targets = None
-
-                model_input_key = "inputs_embeds" if "inputs_embeds" in batch else "input_ids"
-                model_input = batch.pop(model_input_key)
-                self.pp.update_seq_len(model_input.shape[1])
-                self._maybe_set_pp_first_stage_embed_input_meta(model_input)
-
-                with stage_vlm_media_for_pp(self.pp, self.model_parts, batch):
-                    self.pp.step(model_input, target=targets, losses=losses, **batch)
-
-            if self.pp.info.has_last_stage:
-                local_loss = torch.sum(torch.stack(losses))
-            else:
-                local_loss = torch.tensor(0.0, device=self.dist_env.device)
-
-            loss_buffer.append(local_loss.clone().detach())
-        else:
-            model = self.model_parts[0]
-            sync_ctx = (
-                get_sync_ctx(
-                    model,
-                    idx == num_batches - 1,
-                    defer_fsdp_grad_sync=getattr(self.distributed_config, "defer_fsdp_grad_sync", True),
-                )
-                if is_train
-                else nullcontext()
-            )
-            with sync_ctx, self._cp_vision_frame_sharding_context(), train_ctx():
-                batch = filter_forward_kwargs(model, batch)
-                if isinstance(self.loss_fn, FusedLinearCrossEntropy):
-                    # use num_logits_to_keep to avoid full logits matrix in memory
-                    out = model(logits_to_keep=1, **batch)
-                else:
-                    out = model(**batch)
-
-                local_loss = self._compute_vlm_loss(
-                    out=out,
-                    labels=labels,
-                    num_label_tokens=num_label_tokens,
-                    is_train=is_train,
-                    cu_seqlens=batch.get("cu_seqlens"),
-                    # Log once per remote-logging step on the first microbatch.
-                    log_drafter=(idx == 0 and self.step_scheduler.is_remote_logging_step),
-                )
-
-                loss_buffer.append(local_loss.clone().detach())
-                if is_train:
-                    (local_loss * self._get_dp_group_size(include_cp=True)).backward()
+        with self._cp_vision_frame_sharding_context(), stage_vlm_media_for_pp(self.pp, self.model_parts, model_inputs):
+            yield
 
     def _configure_pipeline_loss_fn(self):
         if self.pp is None or not self.pp.info.has_last_stage:
@@ -1098,25 +996,32 @@ class FinetuneRecipeForVLM(BaseRecipe):
         if last_stage_model is None:
             raise RuntimeError("Pipeline reports a last stage, but no last-stage model part was found")
 
-        self.pp.info.schedule._loss_fn = self.cfg.mtp.build(
+        if isinstance(self.loss_fn, FusedLinearCrossEntropy):
+            last_stage_model._pp_return_hidden_states = True
+
+        self.pipeline_loss_fn = self.cfg.mtp.build(
             self.loss_fn,
             last_stage_model,
             grad_reduce_group=self._get_dp_group(include_cp=True),
         )
+        self.pp.info.schedule._loss_fn = self.pipeline_loss_fn
 
-    def _run_train_optim_step(self, batches, max_grad_norm: Optional[float] = None):
+    def _run_train_optim_step(self, batches: list[dict[str, Any]], max_grad_norm: float | None = None) -> MetricsSample:
         """Execute a single training step.
 
         Args:
-            batches: List of batches of training data.
+            batches: Processor-collated optimizer window. Padded token tensors
+                use shape [batch, sequence]; packed tensors use their THD token
+                layout, and media tensors retain model-specific layouts.
             max_grad_norm: Gradient clipping norm. Optional, if None will not clip gradients.
+
+        Returns:
+            Metrics for the completed optimizer step.
         """
         num_label_tokens = torch.tensor(
             sum((batch["labels"] != -100).sum().item() for batch in batches), dtype=torch.long
         )
         num_label_tokens = self._dp_allreduce(num_label_tokens).item()
-
-        num_batches = len(batches)
 
         # number of tokens in the batch, excluding any tail padding.
         num_tokens_in_batch = torch.tensor(
@@ -1125,45 +1030,23 @@ class FinetuneRecipeForVLM(BaseRecipe):
         )
         num_tokens_in_batch = self._dp_allreduce(num_tokens_in_batch).item()
 
-        engine = getattr(self, "engine", None)
-        unsupported_thd_mrope = self._get_cp_group_size() > 1 and any(
-            batch.get("qkv_format") == "thd"
-            and isinstance(batch.get("position_ids"), torch.Tensor)
-            and batch["position_ids"].ndim == 3
-            for batch in batches
-        )
-        use_engine = engine is not None and num_label_tokens > 0 and not unsupported_thd_mrope
-        if use_engine:
-            reporting_loss, _ = engine.forward_backward(
-                [
-                    [
-                        self._make_engine_datum(
-                            batch,
-                            log_drafter=(index == 0 and self.step_scheduler.is_remote_logging_step),
-                            log_denominator=num_label_tokens,
-                        )
-                    ]
-                    for index, batch in enumerate(batches)
-                ],
-                self._engine_loss_fn,
+        log_drafter = self.step_scheduler.is_remote_logging_step
+
+        def engine_loss_fn(out: Any, loss_inputs: dict[str, torch.Tensor]) -> torch.Tensor:
+            nonlocal log_drafter
+            should_log = log_drafter
+            log_drafter = False
+            return self._engine_loss_fn(
+                out,
+                loss_inputs,
+                log_drafter=should_log,
+                log_denominator=max(num_label_tokens, 1),
             )
-        else:
-            # The eager Engine requires a positive global weight sum. Preserve
-            # the established zero-label behavior by using the legacy path.
-            self._set_moe_aux_loss_backward_scale(num_batches=num_batches, num_label_tokens=num_label_tokens)
-            loss_buffer = []
-            prepare_for_grad_accumulation(self.model_parts, pp_enabled=self.pp_enabled)
 
-            for i, batch in enumerate(batches):
-                if i == num_batches - 1:
-                    prepare_for_final_backward(self.model_parts, pp_enabled=self.pp_enabled)
-
-                self._forward_backward_step(
-                    i, batch, loss_buffer=loss_buffer, num_label_tokens=num_label_tokens, num_batches=num_batches
-                )
-
-                if i == 0:
-                    prepare_after_first_microbatch()
+        reporting_loss, _ = self.engine.forward_backward(
+            [self._make_engine_datum(batch) for batch in batches],
+            engine_loss_fn,
+        )
 
         grad_norm = scale_grads_and_clip_grad_norm(
             max_grad_norm=max_grad_norm,
@@ -1175,7 +1058,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             ep_axis_name="ep" if self.moe_mesh is not None and "ep" in self.moe_mesh.mesh_dim_names else None,
             pp_axis_name="pp" if self.pp_enabled else None,
             foreach=True,
-            num_label_tokens=num_label_tokens,
+            num_label_tokens=None,
             dp_group_size=self._get_dp_group_size(include_cp=True),
             expert_tp_replication_factor=get_expert_tp_replication_factor(self.model_parts, self.device_mesh),
         )
@@ -1215,33 +1098,6 @@ class FinetuneRecipeForVLM(BaseRecipe):
         time_delta = t - self.timestamp
         self.timestamp = t
         tps = num_tokens_in_batch / time_delta
-        if not use_engine:
-            reporting_loss = torch.sum(torch.stack(loss_buffer))
-            reporting_loss = self._dp_allreduce(reporting_loss, include_cp=True)
-        if not use_engine and self.pp_enabled:
-            # PP uses sum reduction per microbatch (no internal normalization).
-            # Divide by num_label_tokens to get the mean loss, same as non-PP.
-            reporting_loss = reporting_loss / num_label_tokens if num_label_tokens > 0 else reporting_loss * 0.0
-            reporting_loss = reporting_loss.float().to(self.dist_env.device)
-            # Send loss to first rank from the last PP stage of rank0's mesh coords.
-            # This avoids picking a global-rank sender from a different EP/PP group.
-            if self.device_mesh is not None and "pp" in self.device_mesh.mesh_dim_names:
-                dim_names = list(self.device_mesh.mesh_dim_names)
-                mesh = self.device_mesh.mesh
-                idx = []
-                for name in dim_names:
-                    if name == "pp":
-                        idx.append(-1)
-                    else:
-                        idx.append(0)
-                src_rank = mesh[tuple(idx)].item()
-            else:
-                src_rank = self.device_mesh.mesh.reshape(-1)[-1].item()
-            if self.dist_env.rank == src_rank:
-                torch.distributed.send(reporting_loss, dst=0)
-            elif self.dist_env.is_main:
-                torch.distributed.recv(reporting_loss, src=src_rank)
-
         reporting_loss = reporting_loss.item()
         # fix reporting_loss, tps across ranks
 
