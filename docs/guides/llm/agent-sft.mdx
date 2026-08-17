@@ -70,6 +70,21 @@ llama-server -hf ggml-org/Qwen3.6-27B-GGUF:Q8_0 --port 8080
 
 `src/constants.ts` reads `LLAMA_BASE_URL` and falls back to `http://localhost:8080/v1`, so set that variable if you serve the model elsewhere. `src/generate.ts` always picks `LOCAL_MODELS[0]` as the user model, so serve that entry rather than another one from the list.
 
+<Tip>
+**Serving the user model with vLLM or SGLang.** llama.cpp is not a requirement. `src/single-session.ts` registers the user model as a generic OpenAI provider (`api: "openai-completions"`) whose base URL is `LLAMA_BASE_URL`, so any OpenAI-compatible server works and no generator code has to change:
+
+```bash
+vllm serve Qwen/Qwen3.6-27B --served-model-name Qwen/Qwen3.6-27B --port 8080
+```
+
+```bash
+export LLAMA_BASE_URL=http://localhost:8080/v1
+```
+
+Two things to keep aligned. `LOCAL_MODELS` ships GGUF repository ids, which vLLM supports only partially and SGLang does not serve, so replace `LOCAL_MODELS[0]` with the unquantized repository you actually serve. The generator sends that entry as the model id, so the served model name has to match it exactly. The placeholder `apiKey: "no-key"` in the provider registration is harmless, because neither server requires a key by default.
+
+</Tip>
+
 With the server up, generate a small validation batch before scaling up:
 
 ```bash
