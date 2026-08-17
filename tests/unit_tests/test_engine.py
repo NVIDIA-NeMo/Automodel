@@ -30,6 +30,7 @@ import nemo_automodel.engine as engine_module
 from nemo_automodel import Datum as PublicDatum
 from nemo_automodel import Engine as PublicEngine
 from nemo_automodel.components.datasets.datum import Datum, collate_datums
+from nemo_automodel.components.datasets.vlm.pp_media import VLM_PP_MEDIA_KEY, stage_vlm_media_for_pp
 from nemo_automodel.components.distributed.config import MegatronFSDPConfig
 from nemo_automodel.components.distributed.context_parallel.sharder import (
     ContextParallelSharder,
@@ -571,6 +572,66 @@ def test_pipeline_window_uses_schedule_microbatches_and_global_normalization():
     )
     assert context_events == ["enter", "exit", "enter", "exit"]
     assert not active
+
+
+def test_pipeline_stage_metadata_prevents_real_forward_from_resetting_media_cursor():
+    class MediaModel(ScaleModel):
+        def __init__(self):
+            super().__init__()
+            self.consumed_media = []
+
+        def forward(self, input_ids, **kwargs):
+            chunk = self._vlm_pixel_values_chunks[self._vlm_chunk_idx]
+            self._vlm_chunk_idx += 1
+            self.consumed_media.append(int(chunk.item()))
+            assert int(input_ids.item()) == int(chunk.item())
+            return super().forward(input_ids, **kwargs)
+
+    model = MediaModel()
+    pipeline = _FakeAutoPipeline(model, num_microbatches=2)
+    stage = SimpleNamespace(is_first=True, _user_meta=None)
+    schedule = SimpleNamespace(_stage_forward_initialized=False)
+    pipeline._info = SimpleNamespace(
+        has_first_stage=True,
+        has_last_stage=True,
+        stages=[stage],
+        schedule=schedule,
+    )
+    original_update_seq_len = pipeline.update_seq_len
+
+    def update_seq_len(seq_len, *, microbatch_size=None, input_tensor=None):
+        original_update_seq_len(seq_len, microbatch_size=microbatch_size, input_tensor=input_tensor)
+        stage._user_meta = SimpleNamespace(inputs=(object(),), outputs=(object(),))
+
+    pipeline.update_seq_len = update_seq_len
+
+    @contextmanager
+    def batch_context(model_inputs):
+        with stage_vlm_media_for_pp(pipeline, [model], model_inputs):
+            yield
+
+    datum = Datum(
+        model_inputs={
+            "input_ids": torch.tensor([[1], [2]]),
+            VLM_PP_MEDIA_KEY: {
+                "pixel_values": [torch.tensor([1.0]), torch.tensor([2.0])],
+                "image_grid_hws": [torch.ones(1), torch.ones(1)],
+            },
+        },
+        loss_fn_inputs={"weights": torch.ones(2, 1)},
+    )
+
+    Engine(
+        pipeline,
+        device="cpu",
+        mesh_context=_pipeline_mesh_context(),
+        collate_fn=collate_prebatched,
+        context_fn=batch_context,
+    ).forward_backward([datum], _identity_loss)
+
+    assert model.consumed_media == [1, 2]
+    assert pipeline.updated_seq_lens == [1]
+    assert pipeline.step_calls == 1
 
 
 def test_pipeline_lifecycle_and_moe_scale_cover_outer_and_inner_microbatches(monkeypatch):
