@@ -114,15 +114,16 @@ def test_generate_checkpoint_robustness_process_isolation_preserves_full_default
     (tmp_path / config).write_text(
         """
 ci:
-  checkpoint_robustness:
-    process_isolation: true
+  checkpoint_robustness: {}
 """,
         encoding="utf-8",
     )
 
     jobs = dict(generate_job(config, {}, "release", "llm_finetune", str(tmp_path)))
 
-    assert jobs[""]["variables"]["CHECKPOINT_ROBUSTNESS_PHASES"] == ("train_and_save automodel_reload hf_reload resume")
+    assert jobs[""]["variables"]["CHECKPOINT_ROBUSTNESS_PHASES"] == (
+        "source_load_reference source_load_parity train_and_save automodel_reload hf_reload resume"
+    )
 
 
 def test_generate_checkpoint_robustness_process_isolation_honors_skips(tmp_path):
@@ -132,8 +133,9 @@ def test_generate_checkpoint_robustness_process_isolation_honors_skips(tmp_path)
 ci:
   checkpoint_robustness:
     process_isolation: true
+    skip_source_load_parity: true
     skip_hf_reload: true
-    no_check_resume: true
+    skip_resume: true
 """,
         encoding="utf-8",
     )
@@ -141,6 +143,42 @@ ci:
     jobs = dict(generate_job(config, {}, "release", "llm_finetune", str(tmp_path)))
 
     assert jobs[""]["variables"]["CHECKPOINT_ROBUSTNESS_PHASES"] == "train_and_save automodel_reload"
+
+
+def test_generate_checkpoint_robustness_process_isolation_is_default_and_cross_tp_is_last(tmp_path):
+    config = Path("dense_model.yaml")
+    (tmp_path / config).write_text(
+        """
+ci:
+  checkpoint_robustness:
+    cross_tp_size: 2
+""",
+        encoding="utf-8",
+    )
+
+    jobs = dict(generate_job(config, {}, "release", "llm_finetune", str(tmp_path)))
+
+    assert jobs[""]["variables"]["CHECKPOINT_ROBUSTNESS_PROCESS_ISOLATION"] == "true"
+    assert jobs[""]["variables"]["CHECKPOINT_ROBUSTNESS_PHASES"] == (
+        "source_load_reference source_load_parity train_and_save automodel_reload hf_reload resume cross_tp_reload"
+    )
+
+
+def test_generate_checkpoint_robustness_allows_single_process_fallback(tmp_path):
+    config = Path("fallback_model.yaml")
+    (tmp_path / config).write_text(
+        """
+ci:
+  checkpoint_robustness:
+    process_isolation: false
+""",
+        encoding="utf-8",
+    )
+
+    jobs = dict(generate_job(config, {}, "release", "llm_finetune", str(tmp_path)))
+
+    assert "CHECKPOINT_ROBUSTNESS_PROCESS_ISOLATION" not in jobs[""]["variables"]
+    assert "CHECKPOINT_ROBUSTNESS_PHASES" not in jobs[""]["variables"]
 
 
 def test_generate_checkpoint_robustness_process_isolation_allows_phase_override(tmp_path):
@@ -175,8 +213,9 @@ def test_generate_qwen3_moe_lora_uses_isolated_reload_phases():
     assert variables["CHECKPOINT_ROBUSTNESS_PHASES"] == (
         "source_load_reference source_load_parity train_and_save automodel_reload hf_reload"
     )
-    assert robustness["check_source_load_parity"] is True
-    assert robustness["skip_hf_logit_parity"] is True
+    assert "check_source_load_parity" not in robustness
+    assert "skip_source_load_parity" not in robustness
+    assert robustness["skip_hf_reload_logit_parity"] is True
     assert robustness["source_load_kl_threshold"] == 3e-2
     assert robustness["source_load_mean_kl_threshold"] == 6e-3
     assert robustness["source_load_cosine_threshold"] == 0.997
@@ -196,7 +235,8 @@ def test_generate_qwen3_moe_te_deepep_uses_isolated_source_and_reload_phases():
     assert variables["CHECKPOINT_ROBUSTNESS_PHASES"] == (
         "source_load_reference source_load_parity train_and_save automodel_reload hf_reload"
     )
-    assert robustness["check_source_load_parity"] is True
+    assert "check_source_load_parity" not in robustness
+    assert "skip_source_load_parity" not in robustness
     assert robustness["source_load_kl_threshold"] == 3e-2
     assert robustness["source_load_mean_kl_threshold"] == 6e-3
     assert robustness["source_load_cosine_threshold"] == 0.997

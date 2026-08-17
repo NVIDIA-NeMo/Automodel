@@ -106,7 +106,6 @@ ci:
   nodes: 1
   time: "00:15:00"
   checkpoint_robustness:
-    check_source_load_parity: true
     # Source max/mean KL are exactly zero in scoped CI; BF16 logits retain a
     # bounded cosine of 0.9998064 after the FP8 checkpoint is dequantized.
     source_load_cosine_threshold: 0.9995

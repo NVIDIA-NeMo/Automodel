@@ -107,7 +107,6 @@ ci:
   known_issue_id: AM-647
   allow_failure: true
   checkpoint_robustness:
-    check_source_load_parity: true
     # Exact-image BF16 HF reload measured 0.00435; retain a narrow parity bound.
     hf_kl_threshold: 5e-3
     source_load_kl_threshold: 5e-3
@@ -118,6 +117,6 @@ ci:
     hf_device_map_auto: true
     cross_tp_size: 2
     cross_tp_kl_threshold: 5e-3
-    no_check_resume: true
+    skip_resume: true
     dataset.limit_dataset_samples: 500
     validation_dataset.limit_dataset_samples: 500

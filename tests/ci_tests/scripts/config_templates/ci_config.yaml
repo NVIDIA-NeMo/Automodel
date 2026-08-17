@@ -131,6 +131,10 @@ fixture_keys:
     - kl_threshold
     - hf_source_post_load_dequantize
     - no_check_resume
+    # Full-logit parity defaults to a deterministic 2048-token prompt. Named
+    # profiles gate mean and p95 KL; all metrics are emitted for calibration.
+    - parity_sequence_length
+    - parity_tolerance_profile
     - process_isolation
     # Independent normal-finetune versus checkpoint-Phase-1 metric. This is
     # reported separately and never gates checkpoint resume correctness.
@@ -142,9 +146,13 @@ fixture_keys:
     - resume_tolerance_profile
     - resume_first_loss_threshold
     - resume_loss_threshold
+    - skip_resume
+    - skip_source_load_parity
     - skip_hf_reload
     - skip_automodel_logit_parity
+    - skip_automodel_reload_logit_parity
     - skip_hf_logit_parity
+    - skip_hf_reload_logit_parity
     - source_load_cosine_threshold
     - source_load_kl_threshold
     - source_load_mean_kl_threshold

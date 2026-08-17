@@ -134,11 +134,7 @@ ci:
     # differences through 30 layers. Everything else stays gated -- checkpoint
     # load, adapter key coverage, the AutoModel reload, the HF reload forward
     # and resume.
-    check_source_load_parity: false
-    # Keep training and reload forwards independent; same-process CI retains
-    # accelerator state and inflates parity numbers.
-    process_isolation: true
-    check_resume: true
+    skip_source_load_parity: true
     hf_device_map_auto: true
     tokenizer_name: google/gemma-4-26B-A4B-it
     # Attention, dense MLP and every norm are bit-exact against HF; the residual

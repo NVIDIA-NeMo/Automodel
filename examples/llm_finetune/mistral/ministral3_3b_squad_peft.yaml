@@ -120,7 +120,6 @@ ci:
   recipe_owner: akoumpa
   time: "00:15:00"
   checkpoint_robustness:
-    check_source_load_parity: true
     # LoRA merge stays within the TP=2-to-HF drift measured by source parity.
     hf_kl_threshold: 2.5e-2
     # TP=2 BF16 reductions add bounded source-load drift; retain independent
@@ -135,7 +134,7 @@ ci:
     # vision_tower params receive no grads from text-only batches, so Adam
     # never materialises per-param `step` state for them; DCP resume load is
     # strict and fails with `Missing key ... optim.state.model.vision_tower.*`.
-    no_check_resume: true
+    skip_resume: true
 
 # Uncomment and configure for W&B logging
 # wandb:

@@ -121,6 +121,6 @@ ci:
     # tp_size stays at the base value (1): the dense Nemotron-H custom path is FSDP2-only.
     tokenizer_name: nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16
     trust_remote_code: true
-    no_check_resume: true
+    skip_resume: true
     dataset.limit_dataset_samples: 500
     validation_dataset.limit_dataset_samples: 500

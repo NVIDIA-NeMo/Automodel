@@ -327,9 +327,10 @@ def test_qwen3_moe_lora_robustness_keeps_source_and_checkpoint_gates(tmp_path):
     )
 
     robustness = yaml.load(out.open())["ci"]["checkpoint_robustness"]
-    assert robustness["check_source_load_parity"] is True
-    assert "skip_automodel_logit_parity" not in robustness
-    assert robustness["skip_hf_logit_parity"] is True
+    assert "check_source_load_parity" not in robustness
+    assert "skip_source_load_parity" not in robustness
+    assert "skip_automodel_reload_logit_parity" not in robustness
+    assert robustness["skip_hf_reload_logit_parity"] is True
 
 
 def test_end_to_end_fixture_keys_not_applied_as_overrides(tmp_path):
@@ -339,14 +340,16 @@ def test_end_to_end_fixture_keys_not_applied_as_overrides(tmp_path):
         "step_scheduler: {global_batch_size: 8}\n"
         "ci:\n"
         "  checkpoint_robustness:\n"
-        "    check_source_load_parity: true             # fixture arg, must NOT become top-level\n"
-        "    skip_automodel_logit_parity: true          # fixture arg, must NOT become top-level\n"
-        "    skip_hf_logit_parity: true                 # fixture arg, must NOT become top-level\n"
+        "    skip_source_load_parity: true               # fixture arg, must NOT become top-level\n"
+        "    skip_automodel_reload_logit_parity: true    # fixture arg, must NOT become top-level\n"
+        "    skip_hf_reload_logit_parity: true           # fixture arg, must NOT become top-level\n"
         "    hf_adapter_ignored_key_prefix: base_model.model.mtp.  # fixture arg, must NOT become top-level\n"
         "    hf_kl_threshold: 5e-3                       # fixture arg, must NOT become top-level\n"
         "    training_reproducibility_loss_threshold: 1e-2  # fixture arg, must NOT become top-level\n"
         "    resume_tolerance_profile: relaxed             # fixture arg, must NOT become top-level\n"
         "    resume_first_loss_threshold: 1e-6           # fixture arg, must NOT become top-level\n"
+        "    parity_sequence_length: 1024                # fixture arg, must NOT become top-level\n"
+        "    parity_tolerance_profile: strict            # fixture arg, must NOT become top-level\n"
         "    source_load_kl_threshold: 1e-2              # fixture arg, must NOT become top-level\n"
         "    source_load_mean_kl_threshold: 1e-3         # fixture arg, must NOT become top-level\n"
         "    source_load_cosine_threshold: 0.999         # fixture arg, must NOT become top-level\n"
@@ -363,25 +366,29 @@ def test_end_to_end_fixture_keys_not_applied_as_overrides(tmp_path):
     # Fixture args stay under ci.checkpoint_robustness for the consumer (pytest) to read,
     # and do NOT pollute the top level.
     assert "hf_kl_threshold" not in resolved
-    assert "check_source_load_parity" not in resolved
-    assert "skip_automodel_logit_parity" not in resolved
-    assert "skip_hf_logit_parity" not in resolved
+    assert "skip_source_load_parity" not in resolved
+    assert "skip_automodel_reload_logit_parity" not in resolved
+    assert "skip_hf_reload_logit_parity" not in resolved
     assert "hf_adapter_ignored_key_prefix" not in resolved
     assert "training_reproducibility_loss_threshold" not in resolved
     assert "resume_tolerance_profile" not in resolved
     assert "resume_first_loss_threshold" not in resolved
+    assert "parity_sequence_length" not in resolved
+    assert "parity_tolerance_profile" not in resolved
     assert "source_load_kl_threshold" not in resolved
     assert "source_load_mean_kl_threshold" not in resolved
     assert "source_load_cosine_threshold" not in resolved
     assert "tokenizer_name" not in resolved
     assert resolved["ci"]["checkpoint_robustness"]["hf_kl_threshold"] == 5e-3
-    assert resolved["ci"]["checkpoint_robustness"]["check_source_load_parity"] is True
-    assert resolved["ci"]["checkpoint_robustness"]["skip_automodel_logit_parity"] is True
-    assert resolved["ci"]["checkpoint_robustness"]["skip_hf_logit_parity"] is True
+    assert resolved["ci"]["checkpoint_robustness"]["skip_source_load_parity"] is True
+    assert resolved["ci"]["checkpoint_robustness"]["skip_automodel_reload_logit_parity"] is True
+    assert resolved["ci"]["checkpoint_robustness"]["skip_hf_reload_logit_parity"] is True
     assert resolved["ci"]["checkpoint_robustness"]["hf_adapter_ignored_key_prefix"] == "base_model.model.mtp."
     assert resolved["ci"]["checkpoint_robustness"]["training_reproducibility_loss_threshold"] == 1e-2
     assert resolved["ci"]["checkpoint_robustness"]["resume_tolerance_profile"] == "relaxed"
     assert resolved["ci"]["checkpoint_robustness"]["resume_first_loss_threshold"] == 1e-6
+    assert resolved["ci"]["checkpoint_robustness"]["parity_sequence_length"] == 1024
+    assert resolved["ci"]["checkpoint_robustness"]["parity_tolerance_profile"] == "strict"
     assert resolved["ci"]["checkpoint_robustness"]["source_load_kl_threshold"] == 1e-2
     assert resolved["ci"]["checkpoint_robustness"]["source_load_mean_kl_threshold"] == 1e-3
     assert resolved["ci"]["checkpoint_robustness"]["source_load_cosine_threshold"] == 0.999
@@ -415,9 +422,10 @@ def test_vlm_checkpoint_robustness_recipes_resolve(tmp_path, recipe_path):
     if Path(recipe_path).stem == "gemma4_26b_a4b_moe":
         # Opted out: source-load logit KL tracks the host's reduction order for
         # this recipe's DeepEP MoE routing, not checkpoint integrity.
-        assert robustness["check_source_load_parity"] is False
+        assert robustness["skip_source_load_parity"] is True
     else:
-        assert robustness["check_source_load_parity"] is True
+        assert "skip_source_load_parity" not in robustness
+        assert "check_source_load_parity" not in robustness
     assert robustness["tokenizer_name"] == resolved["model"]["pretrained_model_name_or_path"]
     if Path(recipe_path).stem == "gemma4_26b_a4b_moe":
         assert resolved["distributed"]["multimodal"]["frozen_sharding"] == "replicate"

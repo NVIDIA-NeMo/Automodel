@@ -93,7 +93,6 @@ ci:
   recipe_owner: akoumpa
   time: "00:15:00"
   checkpoint_robustness:
-    check_source_load_parity: true
     hf_kl_threshold: 5e-3
     source_load_kl_threshold: 5e-3
     source_load_cosine_threshold: 0.9995

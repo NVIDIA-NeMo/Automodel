@@ -513,4 +513,4 @@ ci:
   checkpoint_robustness:
     hf_kl_threshold: 5e-2
     tokenizer_name: openai/gpt-oss-20b
-    no_check_resume: true
+    skip_resume: true

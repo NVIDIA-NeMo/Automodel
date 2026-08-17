@@ -119,7 +119,6 @@ ci:
   time: "00:30:00"
   # Keep failures blocking; source/reload defects are tracked by AM-711/AM-717.
   checkpoint_robustness:
-    check_source_load_parity: true
     experts_implementation: grouped_mm
     hf_device_map_auto: true
     # Qwen3.5 BF16 parity has known model/backend drift: AutoModel applies routing

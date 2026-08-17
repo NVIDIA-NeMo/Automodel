@@ -126,6 +126,6 @@ ci:
     hf_kl_threshold: 1e-1
     tokenizer_name: openai/gpt-oss-20b
     check_phantom_keys: true
-    no_check_resume: true
+    skip_resume: true
     dataset.num_samples_limit: 500
     validation_dataset.num_samples_limit: 500

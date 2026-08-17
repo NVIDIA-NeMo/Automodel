@@ -156,17 +156,16 @@ ci:
     # One optimizer step materializes Adam state; AutoModel setup then restores it from DCP.
     step_scheduler.max_steps: 1
     step_scheduler.ckpt_every_steps: 1
-    # Match a real restart and let each large trainer exit before the next one starts.
-    process_isolation: true
+    # Process isolation is the harness default, so each large trainer exits before the next one starts.
     # AutoModel reload restores model and optimizer state; skip the separate resume/loss-continuity check.
-    no_check_resume: true
+    skip_resume: true
     # Cross-process PP+EP BF16 logits are not a stable checkpoint-integrity signal (AMINT-238).
     # Keep the exact per-rank LoRA fingerprints as the blocking AutoModel reload gate.
-    skip_automodel_logit_parity: true
+    skip_automodel_reload_logit_parity: true
     # HF reload still exact-matches every supported adapter tensor and runs a forward smoke.
     # Cross-implementation KL is not a checkpoint-integrity gate: Step-3.7's top-k MoE routing
     # amplifies normal BF16 implementation-order differences into different expert choices.
-    skip_hf_logit_parity: true
+    skip_hf_reload_logit_parity: true
     # Vanilla HF needs remote model code and shards the 403 GB base over rank 0's local GPU node.
     trust_remote_code: true
     hf_device_map_auto: true

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -24,6 +25,7 @@ from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_bie
 )
 from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm import (
     _assert_peft_adapter_matches_checkpoint,
+    _compare_logits,
     _compare_source_load_parity,
     _dequantize_hf_fp8_weights_in_place,
     _extract_custom_args,
@@ -33,20 +35,22 @@ from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm
     _hf_device_map_max_memory,
     _hf_fp32_module_names,
     _hf_model_load_context,
-    _hf_reload_kl_error,
     _hf_source_load_kwargs,
     _keep_hf_modules_in_fp32,
     _lm_head_embedding_aliased,
     _load_hf_fp8_dequantized_config,
     _load_input_ids_once,
+    _LogitParityPolicy,
     _normalize_peft_no_split_modules,
     _patch_remote_masking_api_compatibility,
     _peft_adapter_load_kwargs,
     _post_load_dequant_max_memory,
+    _prepare_consolidated_hf_cache_once,
     _raise_distributed_failure,
     _record_deferred_failure,
     _resolve_hf_model_class,
     _run_process_isolated_checkpoint_phase,
+    _source_load_parity_policy,
     _trainable_parameter_digests,
     _wait_for_hf_reload_rank0,
     _wait_for_source_load_artifacts,
@@ -528,20 +532,28 @@ def test_load_input_ids_once_shares_rank0_result(tmp_path, monkeypatch):
     monkeypatch.setenv("SLURM_JOB_ID", "input-id-test")
     monkeypatch.setenv("RANK", "0")
 
-    assert _load_input_ids_once(cfg, rank0_loader, "model/tokenizer") == [31, 32, 33]
+    assert _load_input_ids_once(cfg, rank0_loader, "model/tokenizer", sequence_length=3) == [31, 32, 33]
     rank0_loader.assert_called_once_with("model/tokenizer")
 
     rank1_loader = Mock(side_effect=AssertionError("nonzero rank must not load the tokenizer"))
     monkeypatch.setenv("RANK", "1")
 
-    assert _load_input_ids_once(cfg, rank1_loader, "model/tokenizer") == [31, 32, 33]
+    assert _load_input_ids_once(cfg, rank1_loader, "model/tokenizer", sequence_length=3) == [31, 32, 33]
     rank1_loader.assert_not_called()
 
     rank0_reuse_loader = Mock(side_effect=AssertionError("rank 0 must reuse the published input IDs"))
     monkeypatch.setenv("RANK", "0")
 
-    assert _load_input_ids_once(cfg, rank0_reuse_loader, "model/tokenizer") == [31, 32, 33]
+    assert _load_input_ids_once(cfg, rank0_reuse_loader, "model/tokenizer", sequence_length=3) == [31, 32, 33]
     rank0_reuse_loader.assert_not_called()
+
+
+def test_load_input_ids_once_repeats_token_pattern_to_parity_length(tmp_path):
+    cfg = SimpleNamespace(checkpoint=SimpleNamespace(checkpoint_dir=tmp_path / "checkpoints"))
+
+    input_ids = _load_input_ids_once(cfg, Mock(return_value=[7, 8, 9]), None, sequence_length=8)
+
+    assert input_ids == [7, 8, 9, 7, 8, 9, 7, 8]
 
 
 def test_load_input_ids_once_waits_for_payload_visibility(tmp_path, monkeypatch):
@@ -563,7 +575,7 @@ def test_load_input_ids_once_waits_for_payload_visibility(tmp_path, monkeypatch)
         "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm.time.sleep",
         side_effect=publish_payload,
     ):
-        assert _load_input_ids_once(cfg, loader, "model/tokenizer") == [41, 42, 43]
+        assert _load_input_ids_once(cfg, loader, "model/tokenizer", sequence_length=3) == [41, 42, 43]
 
     loader.assert_not_called()
 
@@ -575,11 +587,16 @@ def test_load_input_ids_once_propagates_rank0_failure(tmp_path, monkeypatch):
     monkeypatch.setenv("RANK", "0")
 
     with pytest.raises(ValueError, match="tokenizer failed"):
-        _load_input_ids_once(cfg, Mock(side_effect=ValueError("tokenizer failed")), "model/tokenizer")
+        _load_input_ids_once(
+            cfg,
+            Mock(side_effect=ValueError("tokenizer failed")),
+            "model/tokenizer",
+            sequence_length=3,
+        )
 
     monkeypatch.setenv("RANK", "1")
     with pytest.raises(RuntimeError, match="Rank 0 input-ID loading failed"):
-        _load_input_ids_once(cfg, Mock(), "model/tokenizer")
+        _load_input_ids_once(cfg, Mock(), "model/tokenizer", sequence_length=3)
 
 
 def test_vllm_deploy_tokenization_omits_token_type_ids():
@@ -615,6 +632,38 @@ def test_extract_custom_args_accepts_isolated_phase():
 
     assert custom["isolated_phase"] == "train_and_save"
     assert remaining == ["--other-arg"]
+
+
+def test_extract_custom_args_enables_core_source_and_resume_checks_by_default():
+    custom, remaining = _extract_custom_args(["--other-arg"])
+
+    assert custom["check_source_load_parity"] is True
+    assert custom["check_resume"] is True
+    assert remaining == ["--other-arg"]
+
+
+def test_extract_custom_args_reads_semantic_skips_and_parity_settings(tmp_path):
+    config_path = tmp_path / "recipe.yaml"
+    config_path.write_text(
+        "ci:\n"
+        "  checkpoint_robustness:\n"
+        "    skip_source_load_parity: true\n"
+        "    skip_resume: true\n"
+        "    skip_automodel_reload_logit_parity: true\n"
+        "    skip_hf_reload_logit_parity: true\n"
+        "    parity_sequence_length: 1024\n"
+        "    parity_tolerance_profile: relaxed\n"
+    )
+
+    custom, remaining = _extract_custom_args(["--config", str(config_path)])
+
+    assert custom["check_source_load_parity"] is False
+    assert custom["check_resume"] is False
+    assert custom["skip_automodel_reload_logit_parity"] is True
+    assert custom["skip_hf_reload_logit_parity"] is True
+    assert custom["parity_sequence_length"] == "1024"
+    assert custom["parity_tolerance_profile"] == "relaxed"
+    assert remaining == ["--config", str(config_path)]
 
 
 def test_extract_custom_args_accepts_resume_tolerance_profile_and_numeric_override():
@@ -732,8 +781,81 @@ def test_process_isolated_hf_reload_runs_rank0_hf_loader(tmp_path):
     recipe_cls.assert_not_called()
 
 
+def test_process_isolated_cross_tp_reload_uses_exported_weights_and_reports_parity(tmp_path):
+    checkpoint_dir = tmp_path / "checkpoint"
+    consolidated_dir = checkpoint_dir / "epoch_0_step_5/model/consolidated"
+    consolidated_dir.mkdir(parents=True)
+    artifact_dir = checkpoint_dir / ".checkpoint_robustness"
+    artifact_dir.mkdir()
+    reference_logits = torch.randn(1, 2, 3)
+    candidate_logits = reference_logits.clone()
+    torch.save(reference_logits, artifact_dir / "reference_logits.pt")
+    cfg = SimpleNamespace(
+        checkpoint=SimpleNamespace(checkpoint_dir=checkpoint_dir, enabled=True),
+        model=SimpleNamespace(pretrained_model_name_or_path="source-model"),
+        distributed=SimpleNamespace(tp_size=1, dp_size=8),
+    )
+    model_part = torch.nn.Linear(2, 2, bias=False)
+    cross_tp_trainer = SimpleNamespace(model_parts=[model_part], setup=Mock())
+    recipe_cls = Mock(return_value=cross_tp_trainer)
+    custom_args = {"cross_tp_size": "2", "parity_sequence_length": "2"}
+
+    with (
+        patch(
+            "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm.parse_args_and_load_config",
+            return_value=cfg,
+        ),
+        patch(
+            "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm."
+            "_disable_distributed_atexit_teardown"
+        ),
+        patch(
+            "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm._load_input_ids_once",
+            return_value=[11, 12],
+        ),
+        patch(
+            "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm."
+            "_prepare_consolidated_hf_cache_once"
+        ) as prepare_cache,
+        patch(
+            "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm._get_logits",
+            return_value=candidate_logits,
+        ),
+        patch(
+            "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm._compare_logits",
+            return_value=None,
+        ) as compare_logits,
+        patch(
+            "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm._raise_distributed_failure"
+        ) as raise_distributed_failure,
+        patch("tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm._release_recipe_memory"),
+    ):
+        _run_process_isolated_checkpoint_phase(
+            "cross_tp_reload",
+            custom_args=custom_args,
+            recipe_cls=recipe_cls,
+            hf_model_cls=Mock(),
+            input_ids_loader=Mock(),
+        )
+
+    prepare_cache.assert_called_once_with(cfg, consolidated_dir)
+    assert cfg.model.pretrained_model_name_or_path == str(consolidated_dir)
+    assert cfg.checkpoint.enabled is False
+    assert cfg.distributed.tp_size == 2
+    assert cfg.distributed.dp_size is None
+    recipe_cls.assert_called_once_with(cfg)
+    cross_tp_trainer.setup.assert_called_once_with()
+    compare_args = compare_logits.call_args.args
+    assert compare_args[0] == artifact_dir
+    torch.testing.assert_close(compare_args[1], reference_logits)
+    torch.testing.assert_close(compare_args[2], candidate_logits)
+    assert compare_args[3].phase == "phase_5"
+    assert compare_args[3].comparison == "cross_tp_reload"
+    raise_distributed_failure.assert_called_once_with(None)
+
+
 def test_process_isolated_resume_rejects_no_check_resume():
-    with pytest.raises(ValueError, match="conflicts with no_check_resume=true"):
+    with pytest.raises(ValueError, match="conflicts with skip_resume=true"):
         _run_process_isolated_checkpoint_phase(
             "resume",
             custom_args={"no_check_resume": True},
@@ -741,11 +863,6 @@ def test_process_isolated_resume_rejects_no_check_resume():
             hf_model_cls=Mock(),
             input_ids_loader=Mock(),
         )
-
-
-@pytest.mark.parametrize("non_finite_kl", [float("nan"), float("inf"), float("-inf")])
-def test_hf_reload_rejects_non_finite_kl(non_finite_kl):
-    assert "non-finite KL divergence" in _hf_reload_kl_error(non_finite_kl, 7e-2)
 
 
 def test_process_isolated_source_load_reference_persists_hf_artifacts(tmp_path):
@@ -831,6 +948,38 @@ def test_wait_for_source_load_artifacts_waits_for_both_files(tmp_path):
     assert sleep_calls == 2
 
 
+def test_prepare_consolidated_hf_cache_once_serializes_preinit_workers(tmp_path, monkeypatch):
+    consolidated_dir = tmp_path / "checkpoint/model/consolidated"
+    consolidated_dir.mkdir(parents=True)
+    cfg = SimpleNamespace(checkpoint=SimpleNamespace(checkpoint_dir=tmp_path / "checkpoint"))
+    monkeypatch.delenv("SLURM_NTASKS", raising=False)
+    monkeypatch.delenv("SLURM_PROCID", raising=False)
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    monkeypatch.setenv("RANK", "0")
+
+    with (
+        patch(
+            "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm."
+            "_prepopulate_hf_dynamic_modules_cache"
+        ) as prepopulate,
+        patch("transformers.AutoConfig.from_pretrained") as auto_config,
+    ):
+        _prepare_consolidated_hf_cache_once(cfg, consolidated_dir)
+
+    prepopulate.assert_called_once_with(consolidated_dir)
+    auto_config.assert_called_once_with(str(consolidated_dir), trust_remote_code=True)
+
+    monkeypatch.setenv("RANK", "1")
+    with patch(
+        "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm."
+        "_prepopulate_hf_dynamic_modules_cache",
+        side_effect=AssertionError("nonzero rank must reuse the completed cache marker"),
+    ) as nonzero_prepopulate:
+        _prepare_consolidated_hf_cache_once(cfg, consolidated_dir)
+
+    nonzero_prepopulate.assert_not_called()
+
+
 def test_process_isolated_source_load_parity_compares_persisted_reference(tmp_path):
     artifact_dir = tmp_path / ".checkpoint_robustness"
     artifact_dir.mkdir()
@@ -899,9 +1048,8 @@ def test_process_isolated_source_load_parity_compares_persisted_reference(tmp_pa
     assert compare_args.args[0][1:] == (False, False)
     assert compare_args.args[1:] == (candidate_logits, False)
     assert compare_args.kwargs == {
-        "source_load_kl_threshold": 4e-2,
-        "source_load_mean_kl_threshold": 1e-2,
-        "source_load_cosine_threshold": 0.9985,
+        "artifact_dir": artifact_dir,
+        "policy": _source_load_parity_policy(custom_args),
     }
     cleanup_source_load.assert_called_once_with(cfg)
     raise_distributed_failure.assert_called_once_with(None)
@@ -996,7 +1144,7 @@ def test_hf_fp32_module_names_is_empty_without_model_contract():
         assert _hf_fp32_module_names(SimpleNamespace(architectures=["LlamaForCausalLM"])) == ()
 
 
-def test_source_load_parity_failure_is_returned_for_later_reporting():
+def test_source_load_parity_failure_is_returned_for_later_reporting(tmp_path):
     reference_logits = torch.tensor([[[2.0, -2.0], [1.0, -1.0]]])
     candidate_logits = -reference_logits
 
@@ -1004,28 +1152,84 @@ def test_source_load_parity_failure_is_returned_for_later_reporting():
         (reference_logits, None, None),
         candidate_logits,
         None,
-        source_load_kl_threshold=0.0,
-        source_load_mean_kl_threshold=0.0,
-        source_load_cosine_threshold=1.0,
+        artifact_dir=tmp_path,
+        policy=_source_load_parity_policy(
+            {
+                "source_load_kl_threshold": "0.0",
+                "source_load_mean_kl_threshold": "0.0",
+                "source_load_cosine_threshold": "1.0",
+            }
+        ),
     )
 
     assert failure is not None
-    assert "KL divergence between original HF source load and constructed trainer model too large" in failure
+    assert "source_load parity failed" in failure
 
 
-def test_source_load_parity_success_returns_no_deferred_failure():
+def test_source_load_parity_success_returns_no_deferred_failure(tmp_path):
     logits = torch.tensor([[[2.0, -2.0], [1.0, -1.0]]])
 
     failure = _compare_source_load_parity(
         (logits, None, None),
         logits.clone(),
         None,
-        source_load_kl_threshold=0.0,
-        source_load_mean_kl_threshold=0.0,
-        source_load_cosine_threshold=1.0,
+        artifact_dir=tmp_path,
+        policy=_source_load_parity_policy(
+            {
+                "source_load_kl_threshold": "0.0",
+                "source_load_mean_kl_threshold": "0.0",
+                "source_load_cosine_threshold": "1.0",
+            }
+        ),
     )
 
     assert failure is None
+
+
+def test_compare_logits_persists_machine_readable_metrics(tmp_path):
+    logits = torch.tensor([[[2.0, -2.0], [1.0, -1.0]]])
+    policy = _LogitParityPolicy(
+        phase="phase_2",
+        comparison="automodel_model_reload",
+        comparison_kind="same_implementation",
+        profile="standard",
+    )
+
+    failure = _compare_logits(tmp_path, logits, logits.clone(), policy)
+
+    assert failure is None
+    payload = json.loads((tmp_path / "parity_metrics/phase_2_automodel_model_reload.json").read_text())
+    assert payload["schema_version"] == 1
+    assert payload["threshold_mode"] == "profile"
+    assert payload["passed"] is True
+    assert payload["within_active_thresholds"] is True
+    assert payload["would_pass_profile"] is True
+    assert payload["reference_logits"] == {"dtype": "torch.float32", "shape": [1, 2, 2]}
+    assert payload["candidate_logits"] == {"dtype": "torch.float32", "shape": [1, 2, 2]}
+    assert payload["metrics"]["token_count"] == 2
+    assert payload["metrics"]["mean_kl"] == pytest.approx(0.0, abs=1e-8)
+
+
+def test_compare_logits_marks_skipped_gate_as_informational(tmp_path):
+    reference_logits = torch.tensor([[[20.0, -20.0]]])
+    candidate_logits = -reference_logits
+    policy = _LogitParityPolicy(
+        phase="phase_3",
+        comparison="hf_export_reload",
+        comparison_kind="cross_framework",
+        profile="strict",
+        enforce=False,
+    )
+
+    failure = _compare_logits(tmp_path, reference_logits, candidate_logits, policy)
+
+    assert failure is None
+    payload = json.loads((tmp_path / "parity_metrics/phase_3_hf_export_reload.json").read_text())
+    assert payload["enforced"] is False
+    assert payload["passed"] is True
+    assert payload["within_active_thresholds"] is False
+    assert payload["failures"] == []
+    assert payload["threshold_failures"]
 
 
 def test_dequantize_hf_fp8_weights_in_place_handles_linear_and_expert_parameters():

@@ -6,6 +6,10 @@ Historical model matrix last measured: 2026-04-02 UTC
 
 > **Note:** vLLM deployment tests moved to separate PR.
 
+> **Historical numbering:** The April matrix predates the current six-phase contract. Its “Phases 1–3” cover
+> train/reference/AutoModel reload, and its “Phase 4” means the vanilla-HF reload that is now Phase 3. Historical
+> labels below are preserved so they continue to match the archived logs.
+
 ## Resume oracle policy
 
 Enabled LLM, VLM, and retrieval resume coverage now compares a restored trainer
@@ -34,7 +38,7 @@ independent-run report is opportunistic rather than guaranteed coverage when
 phase-specific overrides make the existing runs incomparable; the blocking
 reproducibility oracle is the shared-trajectory resume comparison.
 
-Recipes with `no_check_resume: true` remain explicitly exempt rather than being
+Recipes with `skip_resume: true` remain explicitly exempt rather than being
 treated as passing. Those exemptions cover model/topology-specific restore
 blockers already documented in the recipe or this file (for example DeepEP/MoE
 state, hybrid Mamba state, or strict optimizer-state loading for unused/frozen
