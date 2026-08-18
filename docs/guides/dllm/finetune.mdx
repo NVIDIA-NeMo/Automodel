@@ -379,7 +379,7 @@ python examples/dllm_generate/generate.py \
 
 The sampler selected with the `--sampler` argument supplies these preset values. LLaDA uses the standalone AutoModel sampler. LLaDA2, Nemotron, and DiffusionGemma call the built-in `generate()` methods of their models. DiffusionGemma only forwards `--steps` (as `max_denoising_steps`, default 48) and `--max_new_tokens` (default 256). The remaining flags keep their upstream Hugging Face defaults. The `--remasking` and `--no_kv_cache` arguments do not affect LLaDA2 or DiffusionGemma generation.
 
-The following table lists the default and preset values for the generation parameters.
+The following table lists the default and preset values for the generation parameters:
 
 | Parameter | Description | LLaDA Default | LLaDA2 Preset | Nemotron Preset |
 |-----------|-------------|---------------|----------------|------------------|
