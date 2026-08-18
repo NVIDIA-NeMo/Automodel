@@ -93,6 +93,11 @@ class CpVisionFrameShardingConfig:
         min_frames: Minimum number of independent image/frame units that can select
             sharding even below ``min_tokens``. Long videos reduce per-frame spatial
             resolution, so merged-token count alone underestimates their ViT work.
+        min_local_patch_rows: Minimum number of pre-merge patch rows processed by each
+            rank that owns real frames. Smaller local shards append whole, same-shaped
+            zero frames before the vision forward and remove their outputs before the
+            gather. This avoids unstable reduced-precision kernels for tiny ViT shapes.
+            Set to ``0`` to disable local padding.
         cost_alpha: Non-negative linear term in the partition cost
             ``p * (p + cost_alpha)``. ``"auto"`` infers ``3 * vision_hidden_size``
             and falls back to ``0`` when the width is unavailable. ``None`` remains
@@ -103,6 +108,7 @@ class CpVisionFrameShardingConfig:
     mesh_dims: tuple[Literal["cp"]] = ("cp",)
     min_tokens: int = 2048
     min_frames: int = 32
+    min_local_patch_rows: int = 96
     cost_alpha: int | Literal["auto"] | None = "auto"
 
     def __post_init__(self) -> None:
@@ -118,6 +124,12 @@ class CpVisionFrameShardingConfig:
             raise ValueError(f"{config_path}.min_tokens must be a non-negative integer")
         if isinstance(self.min_frames, bool) or not isinstance(self.min_frames, int) or self.min_frames < 0:
             raise ValueError(f"{config_path}.min_frames must be a non-negative integer")
+        if (
+            isinstance(self.min_local_patch_rows, bool)
+            or not isinstance(self.min_local_patch_rows, int)
+            or self.min_local_patch_rows < 0
+        ):
+            raise ValueError(f"{config_path}.min_local_patch_rows must be a non-negative integer")
         if self.cost_alpha not in (None, "auto") and (
             isinstance(self.cost_alpha, bool) or not isinstance(self.cost_alpha, int) or self.cost_alpha < 0
         ):
@@ -536,6 +548,18 @@ def _all_gather_var_tokens(
     return torch.cat(blocks, dim=0)
 
 
+def _padding_frames_for_min_patch_rows(
+    local_patch_rows: int,
+    frame_patch_rows: int,
+    min_patch_rows: int,
+) -> int:
+    """Return the whole same-shaped frames needed to reach a local patch-row floor."""
+    if min_patch_rows <= local_patch_rows or frame_patch_rows <= 0:
+        return 0
+    missing_rows = min_patch_rows - local_patch_rows
+    return (missing_rows + frame_patch_rows - 1) // frame_patch_rows
+
+
 def _raise_if_any_rank_failed(
     local_ok: bool,
     group: dist.ProcessGroup,
@@ -757,6 +781,34 @@ def maybe_distribute_visual(
             local_rows[-1][0] += 1
         else:
             local_rows.append([1, h, w, f_entry[i]])
+
+    # Very small reduced-precision ViT shards can select materially different GEMM
+    # kernels. Keep ranks that own real frames above a resolution-aware patch-row floor
+    # by appending whole, same-shaped zero frames. Ranks that own only a global rank-fill
+    # dummy stay minimal. The synthetic outputs are validated and sliced below before
+    # they enter the differentiable gather, so they cannot reach the loss or vision grads.
+    numeric_pad_frames = 0
+    numeric_pad_patch_rows = 0
+    local_real_start = min(cuts[rank], n_units)
+    local_real_end = min(cuts[rank + 1], n_units)
+    if scope.config.min_local_patch_rows > 0 and local_real_end > local_real_start:
+        pad_h, pad_w = f_hw[local_real_end - 1]
+        frame_patch_rows = pad_h * pad_w
+        numeric_pad_frames = _padding_frames_for_min_patch_rows(
+            int(local_pixel.shape[0]),
+            frame_patch_rows,
+            scope.config.min_local_patch_rows,
+        )
+        if numeric_pad_frames:
+            numeric_pad_patch_rows = numeric_pad_frames * frame_patch_rows
+            local_pixel = torch.cat(
+                [
+                    local_pixel,
+                    local_pixel.new_zeros(numeric_pad_patch_rows, local_pixel.shape[1]),
+                ],
+                dim=0,
+            )
+            local_rows.append([numeric_pad_frames, pad_h, pad_w, -1])
     local_grid = torch.tensor(
         [[c, h, w] for c, h, w, _ in local_rows],
         dtype=grid_host.dtype,
@@ -771,14 +823,21 @@ def maybe_distribute_visual(
     # rank makes EVERY rank raise -- a bare per-rank ``raise`` here would hang the group,
     # since the failing rank would raise while peers block in the all-gather below.
     expected_local_tokens = token_counts[rank]
+    numeric_pad_tokens = numeric_pad_patch_rows // sms_sq
+    expected_visual_tokens = expected_local_tokens + numeric_pad_tokens
     actual_local_tokens = local_out.pooler_output.shape[0]
     _raise_if_any_rank_failed(
-        actual_local_tokens == expected_local_tokens,
+        actual_local_tokens == expected_visual_tokens,
         group,
         local_out.pooler_output.device,
         f"cp_vision_frame_shard: rank {rank} produced {actual_local_tokens} visual tokens for its "
-        f"frame slice, expected {expected_local_tokens}.",
+        f"frame slice, expected {expected_visual_tokens} including {numeric_pad_tokens} local "
+        "padding tokens.",
     )
+
+    # Local numerical padding is not part of the gather contract. Removing it here gives
+    # every synthetic output zero upstream gradient and keeps token_counts unchanged.
+    local_out.pooler_output = local_out.pooler_output[:expected_local_tokens]
 
     # Gather all per-rank blocks (real + any dummy) in rank order, then slice to the real
     # token count: dummy frames live on the last `n_pad` ranks, so their tokens are the
@@ -793,7 +852,7 @@ def maybe_distribute_visual(
     if deepstack is not None:
         # Same consensus contract as the pooler check above: a per-rank ``raise`` before the
         # deepstack all-gathers would deadlock, so agree across the group first.
-        bad_k = next((k for k, d in enumerate(deepstack) if d.shape[0] != expected_local_tokens), None)
+        bad_k = next((k for k, d in enumerate(deepstack) if d.shape[0] != expected_visual_tokens), None)
         _raise_if_any_rank_failed(
             bad_k is None,
             group,
@@ -802,9 +861,11 @@ def maybe_distribute_visual(
             if bad_k is None
             else (
                 f"cp_vision_frame_shard: rank {rank} deepstack feature {bad_k} has "
-                f"{deepstack[bad_k].shape[0]} visual tokens, expected {expected_local_tokens}."
+                f"{deepstack[bad_k].shape[0]} visual tokens, expected {expected_visual_tokens} "
+                f"including {numeric_pad_tokens} local padding tokens."
             ),
         )
+        deepstack = [d[:expected_local_tokens] for d in deepstack]
         local_out.deepstack_features = [
             _all_gather_var_tokens(d, group, world, token_counts)[:n_real_tokens] for d in deepstack
         ]
