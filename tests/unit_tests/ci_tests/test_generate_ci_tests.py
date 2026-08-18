@@ -66,6 +66,29 @@ def test_generate_gpt_oss_120b_benchmark_job_uses_ep64_without_activation_checkp
     assert recipe["distributed"]["activation_checkpointing"] is False
 
 
+def test_generate_deepseek_v3_gb200_256gpu_benchmark_job_matches_topology_and_batch():
+    config = Path("examples/llm_benchmark/deepseek/deepseek_v3_te_mxfp8_gb200_256gpu.yaml")
+
+    jobs = dict(generate_job(config, {}, "performance", "llm_benchmark", "."))
+    recipe = YAML(typ="safe").load(config)
+
+    variables = jobs[""]["variables"]
+    assert variables["TEST_NODE_COUNT"] == 64
+    assert variables["CONFIG_NPROC_PER_NODE"] == 4
+    assert variables["RESERVED_CLUSTER_TAG"] == "/gb200/"
+    assert variables["MAX_STEPS"] == 50
+    assert variables["EP_SIZE"] == 64
+
+    assert recipe["benchmark"]["num_nodes"] == 64
+    assert recipe["step_scheduler"]["global_batch_size"] == 256
+    assert recipe["step_scheduler"]["local_batch_size"] == 4
+    assert recipe["dataset"]["seq_len"] == 4096
+    assert recipe["distributed"]["pp_size"] == 4
+    assert recipe["distributed"]["ep_size"] == 64
+    assert recipe["distributed"]["pipeline"]["pp_microbatch_size"] == 1
+    assert recipe["distributed"]["pipeline"]["layers_per_stage"] == 4
+
+
 def test_generate_vllm_deploy_time_override(tmp_path):
     config = Path("model_peft.yaml")
     (tmp_path / config).write_text(
