@@ -89,6 +89,8 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
     Note: NemotronV3 uses 'mixer' instead of 'mlp' in layer paths.
     """
 
+    _supports_inplace_checkpoint_load = True
+
     def __init__(
         self,
         config,
@@ -110,11 +112,6 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
             "model.layers.{}.mixer.experts.{}.up_proj.weight": "model.layers.{}.mixer.experts.gate_and_up_projs",
             "model.layers.{}.mixer.experts.{}.down_proj.weight": "model.layers.{}.mixer.experts.down_projs",
         }
-
-    @property
-    def supports_inplace_checkpoint_load(self) -> bool:
-        """Whether every base-checkpoint destination aliases model storage."""
-        return self.moe_config is None or self._supports_inplace_expert_checkpoint_load
 
     @property
     def _hf_prefix(self) -> str:

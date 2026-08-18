@@ -50,6 +50,12 @@ class MoESplitExpertsStateDictMixin:
     # - self.backend: Backend configuration object
 
     @property
+    def supports_inplace_checkpoint_load(self) -> bool:
+        """Whether non-expert and grouped-expert destinations both alias model storage."""
+        experts_alias = self.moe_config is None or self._supports_inplace_expert_checkpoint_load
+        return self._supports_inplace_checkpoint_load and experts_alias
+
+    @property
     def _supports_inplace_expert_checkpoint_load(self) -> bool:
         """Whether all grouped expert destinations alias final model storage.
 

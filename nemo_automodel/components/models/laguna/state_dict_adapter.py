@@ -46,6 +46,8 @@ def _apply_renames(key: str, renames: tuple[tuple[re.Pattern[str], str], ...]) -
 class LagunaStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
     """Convert Laguna HF checkpoints to Automodel's grouped-MoE layout."""
 
+    _supports_inplace_checkpoint_load = True
+
     def __init__(
         self,
         config: Any,

@@ -26,16 +26,18 @@ class StateDictAdapter(ABC):
     state dict format and other model state dict formats.
     """
 
+    _supports_inplace_checkpoint_load: bool = False
+
     @property
     def supports_inplace_checkpoint_load(self) -> bool:
         """Whether load destinations can alias the final model storage.
 
-        Adapters should opt in only when every tensor produced by ``to_hf`` for
-        base-checkpoint loading is either the original model tensor or a view
+        Adapters should set ``_supports_inplace_checkpoint_load`` only when every tensor
+        produced by ``to_hf`` for base-checkpoint loading is either the original model tensor or a view
         that writes through to it. The checkpoint loader uses this guarantee to
         avoid materializing a converted full state dict on the host.
         """
-        return False
+        return self._supports_inplace_checkpoint_load
 
     @abstractmethod
     def to_hf(self, state_dict: dict[str, Any], **kwargs) -> dict[str, Any]:

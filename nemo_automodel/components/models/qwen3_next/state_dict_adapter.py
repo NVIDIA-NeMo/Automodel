@@ -55,6 +55,8 @@ class Qwen3NextStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
       model.layers.{L}.mlp.shared_experts.down_proj.weight
     """
 
+    _supports_inplace_checkpoint_load = True
+
     def __init__(
         self,
         config: Any,

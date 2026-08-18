@@ -50,6 +50,8 @@ class Qwen2_5OmniStateDictAdapter(StateDictAdapter):
     needed — this is a thin key-renaming adapter.
     """
 
+    _supports_inplace_checkpoint_load = True
+
     def __init__(
         self,
         config: Any,
