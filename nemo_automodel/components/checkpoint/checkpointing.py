@@ -868,6 +868,7 @@ class Checkpointer:
                 )
             else:
                 state_dict_from_disk = {}
+            t_adapt = time.monotonic()
 
             # Apply key_mapping (e.g. _checkpoint_conversion_mapping) so that
             # HF checkpoint keys are renamed to match the model's parameter FQNs.
@@ -896,13 +897,14 @@ class Checkpointer:
             t_end = time.monotonic()
 
             disk_s = t_disk - t0
-            dist_s = t_end - t_disk
+            adapt_s = t_adapt - t_disk
+            install_s = t_end - t_adapt
             total_s = t_end - t0
             gb = total_bytes / (1 << 30)
             logging.info(
                 f"load_model: {gb:.2f} GB loaded in {total_s:.2f}s "
                 f"({gb / total_s:.2f} GB/s overall | "
-                f"disk read {disk_s:.2f}s, distribute {dist_s:.2f}s)"
+                f"disk read {disk_s:.2f}s, adapt {adapt_s:.2f}s, install {install_s:.2f}s)"
             )
             del state_dict_from_disk
             gc.collect()

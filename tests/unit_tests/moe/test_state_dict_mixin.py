@@ -44,8 +44,15 @@ class MockBackend:
 
 
 class MockMoEStateDictMixin(MoESplitExpertsStateDictMixin):
-    def __init__(self, n_experts=8, inter_dim=512, dtype=torch.float32, uses_model_prefix=True):
-        self.moe_config = MockMoEConfig(n_experts, inter_dim)
+    def __init__(
+        self,
+        n_experts=8,
+        inter_dim=512,
+        dtype=torch.float32,
+        uses_model_prefix=True,
+        expert_activation="swiglu",
+    ):
+        self.moe_config = MockMoEConfig(n_experts, inter_dim, expert_activation)
         self.config = MockConfig()
         self.backend = MockBackend()
         self.dtype = dtype
@@ -530,6 +537,110 @@ class TestToHfWSplitExperts:
 
 
 class TestFromHfWMergedExperts:
+    def test_direct_fill_gated_experts_preserves_values_dtype_and_layout(self):
+        mixin = MockMoEStateDictMixin(n_experts=2, inter_dim=2, dtype=torch.bfloat16)
+        hf_state_dict = {}
+        for expert_id, gate_start, up_start in ((0, 0, 10), (1, 20, 30)):
+            gate_weight = torch.arange(gate_start, gate_start + 6, dtype=torch.float32).reshape(3, 2).T
+            up_weight = torch.arange(up_start, up_start + 6, dtype=torch.float32).reshape(3, 2).T
+            assert not gate_weight.is_contiguous()
+            assert not up_weight.is_contiguous()
+            hf_state_dict[f"model.layers.0.mlp.experts.{expert_id}.gate_proj.weight"] = gate_weight
+            hf_state_dict[f"model.layers.0.mlp.experts.{expert_id}.up_proj.weight"] = up_weight
+
+        with (
+            patch.object(mixin, "_validate_expert_availability"),
+            patch("nemo_automodel.components.moe.state_dict_mixin.gc.collect") as collect,
+            patch("torch.cuda.is_available", return_value=True),
+            patch("torch.cuda.empty_cache") as empty_cache,
+        ):
+            result = mixin._from_hf_w_merged_experts(hf_state_dict)
+
+        grouped = result["model.layers.0.mlp.experts.gate_and_up_projs"]
+        expected = torch.tensor(
+            [
+                [[0, 1, 10, 11], [2, 3, 12, 13], [4, 5, 14, 15]],
+                [[20, 21, 30, 31], [22, 23, 32, 33], [24, 25, 34, 35]],
+            ],
+            dtype=torch.bfloat16,
+        )
+        torch.testing.assert_close(grouped, expected, rtol=0, atol=0)
+        assert grouped.dtype == torch.bfloat16
+        assert grouped.is_contiguous()
+        collect.assert_called_once_with(0)
+        empty_cache.assert_not_called()
+
+    def test_direct_fill_non_gated_and_down_experts_preserves_values(self):
+        mixin = MockMoEStateDictMixin(
+            n_experts=2,
+            inter_dim=2,
+            dtype=torch.float32,
+            expert_activation="relu2",
+        )
+        hf_state_dict = {}
+        for expert_id, up_start, down_start in ((0, 0, 10), (1, 20, 30)):
+            hf_state_dict[f"model.layers.0.mlp.experts.{expert_id}.up_proj.weight"] = (
+                torch.arange(up_start, up_start + 6, dtype=torch.float64).reshape(3, 2).T
+            )
+            hf_state_dict[f"model.layers.0.mlp.experts.{expert_id}.down_proj.weight"] = (
+                torch.arange(down_start, down_start + 6, dtype=torch.float64).reshape(2, 3).T
+            )
+
+        with patch.object(mixin, "_validate_expert_availability"):
+            result = mixin._from_hf_w_merged_experts(hf_state_dict)
+
+        up = result["model.layers.0.mlp.experts.gate_and_up_projs"]
+        down = result["model.layers.0.mlp.experts.down_projs"]
+        expected_up = torch.tensor(
+            [
+                [[0, 1], [2, 3], [4, 5]],
+                [[20, 21], [22, 23], [24, 25]],
+            ],
+            dtype=torch.float32,
+        )
+        expected_down = torch.tensor(
+            [
+                [[10, 11, 12], [13, 14, 15]],
+                [[30, 31, 32], [33, 34, 35]],
+            ],
+            dtype=torch.float32,
+        )
+        torch.testing.assert_close(up, expected_up, rtol=0, atol=0)
+        torch.testing.assert_close(down, expected_down, rtol=0, atol=0)
+        assert up.is_contiguous()
+        assert down.is_contiguous()
+
+    def test_direct_fill_rejects_inconsistent_expert_shapes(self):
+        mixin = MockMoEStateDictMixin(dtype=torch.float32)
+        expert_parts = [
+            (torch.zeros(3, 2), torch.zeros(3, 2)),
+            (torch.zeros(3, 2), torch.zeros(3, 3)),
+        ]
+
+        with pytest.raises(ValueError, match="Expert 1 projection shapes"):
+            mixin._direct_fill_grouped_expert_tensor(expert_parts)
+
+    def test_direct_fill_merge_kernels_write_into_final_storage(self):
+        mixin = MockMoEStateDictMixin(dtype=torch.float32)
+        gated_parts = [
+            (torch.zeros(3, 2), torch.ones(3, 2)),
+            (torch.full((3, 2), 2.0), torch.full((3, 2), 3.0)),
+        ]
+
+        with patch("torch.cat", wraps=torch.cat) as cat:
+            grouped = mixin._direct_fill_grouped_expert_tensor(gated_parts)
+
+        grouped_ptr = grouped.untyped_storage().data_ptr()
+        assert cat.call_count == 2
+        assert all(call.kwargs["out"].untyped_storage().data_ptr() == grouped_ptr for call in cat.call_args_list)
+
+        single_parts = [(torch.zeros(3, 2),), (torch.ones(3, 2),)]
+        with patch("torch.stack", wraps=torch.stack) as stack:
+            grouped = mixin._direct_fill_grouped_expert_tensor(single_parts)
+
+        assert stack.call_count == 1
+        assert stack.call_args.kwargs["out"] is grouped
+
     @patch("nemo_automodel.components.moe.state_dict_mixin.create_dtensor_from_local")
     @patch("nemo_automodel.components.moe.state_dict_mixin.should_load_expert_for_rank")
     def test_basic_conversion(self, mock_should_load, mock_create_dtensor):

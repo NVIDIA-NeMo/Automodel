@@ -598,12 +598,23 @@ class MoESplitExpertsStateDictMixin:
             Creates gate_and_up_projs [n_experts, dim, inter_dim] and transposed down_projs tensors.
 
         Args:
+            hf_state_dict: State mapping consumed by this method. Per-expert gate and up tensors have shape
+                [expert_hidden, hidden], while down tensors have shape [hidden, expert_hidden]. DTensor values
+                use the same global layouts and are localized before merging.
+            device_mesh: Optional device mesh whose expert-parallel dimension selects the local experts. The
+                returned grouped expert tensors use the placements created by ``create_dtensor_from_local``.
             reset_view_loaded_keys: Clear the in-place (strided-view) loaded-key record at the
                 start of this call. A single ``from_hf`` may invoke this method more than once
                 (e.g. backbone then MTP merge); the later call(s) pass ``False`` so the view-loaded
                 keys accumulate across one logical load. Resetting here (rather than in the loader)
                 keeps the whole view-key lifecycle inside the adapter and ensures each load starts
                 clean (no leak from a prior load such as an init-time partial load).
+
+        Returns:
+            Native state mapping. Gated input projections have shape
+            [local_experts, hidden, 2 * expert_hidden], non-gated input projections have shape
+            [local_experts, hidden, expert_hidden], and down projections have shape
+            [local_experts, expert_hidden, hidden].
         """
         if reset_view_loaded_keys:
             self._view_loaded_native_keys = set()
@@ -696,7 +707,7 @@ class MoESplitExpertsStateDictMixin:
 
                     if all_complete:
                         expert_ids = sorted(expert_weights_by_layer[layer_num][native_key].keys())
-                        tensors = []
+                        expert_parts = []
                         for expert_id in expert_ids:
                             expert_data = expert_weights_by_layer[layer_num][native_key][expert_id]
 
@@ -709,29 +720,26 @@ class MoESplitExpertsStateDictMixin:
                                     up_weight = up_weight.to_local()
                                 gate_t = gate_weight.transpose(0, 1)
                                 up_t = up_weight.transpose(0, 1)
-                                tensors.append(torch.cat([gate_t, up_t], dim=-1))
+                                expert_parts.append((gate_t, up_t))
                             else:
                                 up_weight = expert_data
                                 if is_dtensor(up_weight):
                                     up_weight = up_weight.to_local()
-                                tensors.append(up_weight.transpose(0, 1))
+                                expert_parts.append((up_weight.transpose(0, 1),))
 
-                        stacked = torch.stack(tensors, dim=0).to(self.dtype)
-                        state_dict[native_key] = create_dtensor_from_local(stacked, device_mesh, rank)
+                        merged = self._direct_fill_grouped_expert_tensor(expert_parts)
+                        state_dict[native_key] = create_dtensor_from_local(merged, device_mesh, rank)
+                        merged_on_cuda = merged.is_cuda
 
-                        # Aggressively release intermediates so the per-layer
-                        # transient does not pile on top of the model's
-                        # already-materialized GPU DTensors. Without this,
-                        # ``tensors``/``stacked`` and the per-expert dict
-                        # entries hang around until Python's refcount GC
-                        # eventually runs — too late under tight GPU budgets
-                        # (e.g. a large MoE on 2 nodes / 8 GPUs).
-                        del tensors, stacked
+                        # Release the per-expert sources before processing the next projection or layer so they
+                        # do not accumulate alongside the grouped output. Only trim the CUDA allocator when the
+                        # merge itself used CUDA storage; the single-device fallback merges on the host.
+                        del expert_parts, merged
                         del expert_weights_by_layer[layer_num][native_key]
                         if not expert_weights_by_layer[layer_num]:
                             del expert_weights_by_layer[layer_num]
-                        gc.collect()
-                        if torch.cuda.is_available():
+                        gc.collect(0)
+                        if merged_on_cuda:
                             torch.cuda.empty_cache()
 
                 else:  # down_proj
@@ -740,7 +748,7 @@ class MoESplitExpertsStateDictMixin:
                     if len(expert_weights_by_layer[layer_num][native_key]) == expected_experts_per_rank:
                         expert_ids = sorted(expert_weights_by_layer[layer_num][native_key].keys())
 
-                        ordered = []
+                        expert_parts = []
                         for expert_id in expert_ids:
                             down_weight = expert_weights_by_layer[layer_num][native_key][expert_id]  # [dim, inter_dim]
 
@@ -749,20 +757,19 @@ class MoESplitExpertsStateDictMixin:
                                 down_weight = down_weight.to_local()
 
                             down_t = down_weight.transpose(0, 1)  # [inter_dim, dim]
-                            ordered.append(down_t)
+                            expert_parts.append((down_t,))
 
-                        stacked = torch.stack(ordered, dim=0)
-                        stacked = stacked.to(self.dtype)
-
-                        state_dict[native_key] = create_dtensor_from_local(stacked, device_mesh, rank)
+                        merged = self._direct_fill_grouped_expert_tensor(expert_parts)
+                        state_dict[native_key] = create_dtensor_from_local(merged, device_mesh, rank)
+                        merged_on_cuda = merged.is_cuda
 
                         # See gate/up branch above for the cleanup rationale.
-                        del ordered, stacked
+                        del expert_parts, merged
                         del expert_weights_by_layer[layer_num][native_key]
                         if not expert_weights_by_layer[layer_num]:
                             del expert_weights_by_layer[layer_num]
-                        gc.collect()
-                        if torch.cuda.is_available():
+                        gc.collect(0)
+                        if merged_on_cuda:
                             torch.cuda.empty_cache()
 
             else:
@@ -787,6 +794,63 @@ class MoESplitExpertsStateDictMixin:
         state_dict = self._convert_paramwrapper_to_native(state_dict)
 
         return state_dict
+
+    def _direct_fill_grouped_expert_tensor(self, expert_parts: list[tuple[torch.Tensor, ...]]) -> torch.Tensor:
+        """Fill one grouped expert tensor without concatenation or stacking temporaries.
+
+        Args:
+            expert_parts: One tuple per local expert. Each tensor has shape [..., columns_part], with arbitrary
+                shared leading dimensions. Parts within each tuple are concatenated logically along the last
+                axis, and tuple order defines the expert axis order. All parts must have matching shapes and
+                devices across experts.
+
+        Returns:
+            Fresh contiguous tensor of shape [local_experts, ..., combined_columns], where combined_columns is
+            the sum of the first expert's columns_part dimensions. The result uses ``self.dtype`` and the first
+            part's device and does not alias an input tensor.
+
+        Raises:
+            ValueError: If there are no expert parts or their shapes or devices are inconsistent.
+        """
+        if not expert_parts or not expert_parts[0]:
+            raise ValueError("At least one expert projection tensor is required")
+
+        expected_shapes = tuple(tuple(part.shape) for part in expert_parts[0])
+        expected_device = expert_parts[0][0].device
+        leading_shape = expected_shapes[0][:-1]
+        if any(shape[:-1] != leading_shape for shape in expected_shapes):
+            raise ValueError(f"Expert 0 projection parts have inconsistent leading shapes: {expected_shapes}")
+
+        combined_columns = sum(shape[-1] for shape in expected_shapes)
+        for expert_index, parts in enumerate(expert_parts):
+            actual_shapes = tuple(tuple(part.shape) for part in parts)
+            if actual_shapes != expected_shapes:
+                raise ValueError(
+                    f"Expert {expert_index} projection shapes {actual_shapes} do not match {expected_shapes}"
+                )
+
+            for part in parts:
+                if part.device != expected_device:
+                    raise ValueError(
+                        f"Expert {expert_index} projection device {part.device} does not match {expected_device}"
+                    )
+
+        grouped = torch.empty(
+            (len(expert_parts), *leading_shape, combined_columns),
+            dtype=self.dtype,
+            device=expected_device,
+        )
+        if len(expected_shapes) == 1:
+            torch.stack(
+                [parts[0] for parts in expert_parts],
+                dim=0,
+                out=grouped,
+            )
+        else:
+            for expert_index, parts in enumerate(expert_parts):
+                torch.cat(parts, dim=-1, out=grouped[expert_index])
+
+        return grouped
 
     def _convert_single_merged_expert_to_hf_split_experts(
         self,
