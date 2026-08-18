@@ -832,10 +832,7 @@ class Checkpointer:
         if (
             is_init_step
             and len(model_state.model) == 1
-            and (
-                _is_bin_checkpoint(model_path)
-                or (is_safetensors and not is_custom_model)
-            )
+            and (_is_bin_checkpoint(model_path) or (is_safetensors and not is_custom_model))
         ):
             t0 = time.monotonic()
             state_dict_from_disk = _load_hf_checkpoint_preserving_dtype(model_path)
