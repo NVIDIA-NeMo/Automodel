@@ -236,7 +236,7 @@ def test_generate_qwen3_moe_te_deepep_uses_isolated_source_and_reload_phases():
 
     variables = jobs[""]["variables"]
     assert "CHECKPOINT_ROBUSTNESS_PHASES" not in ci_config.get("env_vars", {})
-    assert variables["TIME"] == "00:20:00"
+    assert variables["TIME"] == "00:30:00"
     assert variables["CHECKPOINT_ROBUSTNESS_PROCESS_ISOLATION"] == "true"
     assert variables["CHECKPOINT_ROBUSTNESS_PHASES"] == (
         "source_load_reference source_load_parity train_and_save automodel_reload hf_reload resume"

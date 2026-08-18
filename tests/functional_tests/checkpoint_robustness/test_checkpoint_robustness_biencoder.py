@@ -43,6 +43,7 @@ from tests.functional_tests.checkpoint_robustness.resume_trajectory import (
     _checkpoint_state_snapshot,
     _configure_resumed_run,
     _configure_uninterrupted_run,
+    _disable_checkpoint_saves_after_restore,
     _gather_rank_failures,
     _load_reference_trajectory,
     _persist_reference_trajectory,
@@ -335,6 +336,7 @@ def test_checkpoint_robustness_biencoder():
         _configure_resumed_run(cfg, resume_plan, checkpoint_path)
         resume_trainer = TrainBiEncoderRecipe(cfg)
         resume_trainer.setup()
+        _disable_checkpoint_saves_after_restore(resume_trainer)
         restored_state = _checkpoint_state_snapshot(resume_trainer, state_is_being_saved=False)
         local_failure = _restored_state_mismatch(reference_trajectory["boundary_state"], restored_state)
         failure_message = _gather_rank_failures(local_failure, check="restored_state")

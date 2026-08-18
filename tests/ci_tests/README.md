@@ -101,6 +101,9 @@ it requires exact rank-local model parameters and optimizer tensors. Persistent 
 plus post-update model/optimizer fingerprints, are recorded diagnostically so a numerical divergence can be localized.
 Exact loss deltas and diagnostic comparisons are written for successful and failed runs.
 
+After the native checkpoint has been restored, Phase 4 disables further checkpoint writes: the continuation is an
+oracle for restored state and training trajectory, and its final checkpoint is not consumed by any later phase.
+
 Select the Phase 4 shared scale-aware loss envelope with `resume_tolerance_profile`. Each stage allows
 `atol + rtol * max(abs(uninterrupted_loss), abs(resumed_loss))`: `strict` uses `1e-6 + 0%` for both stages;
 `standard` (default) uses `1e-5 + 0.2%` for the first step and `5e-3 + 0.2%` later; `relaxed` uses

@@ -327,6 +327,11 @@ def _configure_resumed_run(cfg: object, plan: _ResumePlan, checkpoint_path: Path
     cfg.checkpoint.save_consolidated = False
 
 
+def _disable_checkpoint_saves_after_restore(trainer: object) -> None:
+    """Disable new checkpoint writes after the resume checkpoint has loaded."""
+    trainer.checkpointer.config.enabled = False
+
+
 def _checkpoint_for_completed_steps(plan: _ResumePlan, completed_steps: int) -> Path:
     """Locate the checkpoint written after exactly ``completed_steps`` optimizer steps."""
     checkpoint_step = completed_steps - 1

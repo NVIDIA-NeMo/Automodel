@@ -29,6 +29,7 @@ from tests.functional_tests.checkpoint_robustness.resume_trajectory import (
     _compare_training_reproducibility,
     _configure_resumed_run,
     _configure_uninterrupted_run,
+    _disable_checkpoint_saves_after_restore,
     _report_resume_comparison,
     _report_training_reproducibility,
     _resolve_resume_loss_tolerance,
@@ -109,6 +110,14 @@ def test_shared_resume_plan_extends_phase_one_from_the_checkpoint_boundary(tmp_p
     assert cfg.checkpoint.restore_from == str(checkpoint_path)
     assert cfg.checkpoint.checkpoint_dir == str(plan.resume_checkpoint_dir)
     assert cfg.checkpoint.save_consolidated is False
+
+
+def test_resume_continuation_disables_checkpoint_writes_after_restore():
+    trainer = SimpleNamespace(checkpointer=SimpleNamespace(config=SimpleNamespace(enabled=True)))
+
+    _disable_checkpoint_saves_after_restore(trainer)
+
+    assert trainer.checkpointer.config.enabled is False
 
 
 def test_resume_state_check_detects_omitted_rng_state():

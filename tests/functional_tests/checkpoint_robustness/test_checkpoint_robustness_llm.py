@@ -73,6 +73,7 @@ from tests.functional_tests.checkpoint_robustness.resume_trajectory import (
     _checkpoint_state_snapshot,
     _configure_resumed_run,
     _configure_uninterrupted_run,
+    _disable_checkpoint_saves_after_restore,
     _gather_rank_failures,
     _load_reference_trajectory,
     _persist_reference_trajectory,
@@ -2601,6 +2602,9 @@ def _run_process_isolated_checkpoint_phase(
     _report_phase("Isolated Phase 4 native resume: starting setup and optimizer checkpoint load")
     resume_trainer = recipe_cls(cfg)
     resume_trainer.setup()
+    # The restore is complete. Phase 4 validates the continuation but does not
+    # need to publish another large distributed checkpoint at its final step.
+    _disable_checkpoint_saves_after_restore(resume_trainer)
     restored_state = _checkpoint_state_snapshot(resume_trainer, state_is_being_saved=False)
     local_failure = _restored_state_mismatch(reference_trajectory["boundary_state"], restored_state)
     failure_message = _gather_rank_failures(local_failure, check="restored_state")
@@ -2956,6 +2960,9 @@ def run_checkpoint_robustness(
         _report_phase("Phase 4: starting native-checkpoint resume setup and load")
         resume_trainer = recipe_cls(cfg)
         resume_trainer.setup()
+        # The restore is complete. Phase 4 validates the continuation but does not
+        # need to publish another large distributed checkpoint at its final step.
+        _disable_checkpoint_saves_after_restore(resume_trainer)
         restored_state = _checkpoint_state_snapshot(resume_trainer, state_is_being_saved=False)
         local_failure = _restored_state_mismatch(reference_trajectory["boundary_state"], restored_state)
         failure_message = _gather_rank_failures(local_failure, check="restored_state")
