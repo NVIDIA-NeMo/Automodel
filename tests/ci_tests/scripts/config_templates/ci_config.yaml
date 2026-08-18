@@ -135,9 +135,11 @@ fixture_keys:
     # Independent normal-finetune versus checkpoint-Phase-1 metric. This is
     # reported separately and never gates checkpoint resume correctness.
     - training_reproducibility_loss_threshold
-    # The first threshold gates the exact first loss after restoring state and
-    # batch identity. The existing resume_loss_threshold is only the numerical
-    # envelope for later optimizer steps on the same shared trajectory.
+    # Named profiles provide scale-aware absolute-plus-relative envelopes for
+    # the first forward and later optimizer steps. Prefer
+    # resume_tolerance_profile (strict, standard, or relaxed) over numeric
+    # overrides; the numeric fields remain absolute-only and authoritative.
+    - resume_tolerance_profile
     - resume_first_loss_threshold
     - resume_loss_threshold
     - skip_hf_reload
