@@ -14,7 +14,7 @@ NeMo AutoModel currently supports the following dLLM model families:
 - **LLaDA or LLaDA2 (Masked Diffusion Language Model or MDLM)**: This bidirectional masked diffusion model receives corrupted tokens and predicts the clean token at each masked position. For details, refer to the [LLaDA2 paper](https://arxiv.org/abs/2602.08676).
 - **Nemotron-Labs-Diffusion (hybrid)**: This model combines diffusion with an autoregressive loss. During training, the model processes clean tokens and a `masked_indices` sidecar, learning both a diffusion objective and an autoregressive objective simultaneously.
 - **DiffusionGemma (block diffusion)**: A causal encoder reads the clean prompt and response; a bidirectional decoder denoises a response canvas corrupted with uniform-random vocabulary tokens. Training adds a co-trained encoder AR loss. See the [DiffusionGemma Fine-Tuning Guide](/recipes-e2e-examples/diffusiongemma).
-- **DFlash**: This speculative block diffusion model uses a small draft model that proposes tokens for a block conditioned on hidden states from a frozen target language model (LM). A decay-weighted loss trains the draft model to predict target tokens (see the [DFlash paper](https://arxiv.org/abs/2602.06036)).
+- **DFlash**: This speculative block diffusion model uses a small draft model that proposes tokens for a block conditioned on hidden states from a frozen target language model (LM). A decay-weighted loss trains the draft model to predict target tokens. See the [DFlash paper](https://arxiv.org/abs/2602.06036).
 
 ### Workflow Overview
 
