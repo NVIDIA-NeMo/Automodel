@@ -365,14 +365,17 @@ def build_dataloader(
         if "cp" in getattr(device_mesh, "mesh_dim_names", ()):
             cp_size = device_mesh["cp"].size()
 
-    from nemo_automodel.components.models.common.packing import configure_packing, get_attn_implementation
+    from nemo_automodel.components.models.common.packing import (
+        get_attn_implementation,
+        validate_flash_packing_support,
+    )
 
     packing_attn_implementation = config.resolve_packing_attn_implementation(
         model_attn_implementation=get_attn_implementation(cfg_model),
         cp_size=cp_size,
     )
     if config.packing is not None and config.packing.packing_format != "thd":
-        configure_packing(attn_implementation=packing_attn_implementation)
+        validate_flash_packing_support(attn_implementation=packing_attn_implementation)
 
     with ScopedRNG(seed=seed, ranked=True):
         result = config.build(
@@ -600,14 +603,17 @@ class FinetuneRecipeForVLM(BaseRecipe):
             packing_enabled=dataloader_config.packing is not None,
             cp_size=self.mesh_context.cp_size,
         )
-        from nemo_automodel.components.models.common.packing import configure_packing, get_attn_implementation
+        from nemo_automodel.components.models.common.packing import (
+            get_attn_implementation,
+            validate_flash_packing_support,
+        )
 
         packing_attn_implementation = dataloader_config.resolve_packing_attn_implementation(
             model_attn_implementation=get_attn_implementation(self.cfg.model, model=self.model_parts[0]),
             cp_size=self.mesh_context.cp_size,
         )
         if dataloader_config.packing is not None and dataloader_config.packing.packing_format != "thd":
-            configure_packing(attn_implementation=packing_attn_implementation)
+            validate_flash_packing_support(attn_implementation=packing_attn_implementation, model=self.model_parts[0])
         process_group = getattr(self.mesh_context, "process_group", None)
         dataset_build_context = FirstRankPerNode(group=process_group)
         with ScopedRNG(seed=self.cfg.get("seed", 42), ranked=True):

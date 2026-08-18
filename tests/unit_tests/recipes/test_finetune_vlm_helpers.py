@@ -3429,7 +3429,7 @@ def _patches_for_packing(neat_pack_side_effect):
             side_effect=neat_pack_side_effect,
         ),
         patch("nemo_automodel.components.datasets.vlm.loader.StatefulDataLoader", return_value=MagicMock()),
-        patch("nemo_automodel.components.models.common.packing.configure_packing"),
+        patch("nemo_automodel.components.models.common.packing.validate_flash_packing_support"),
         patch(
             "nemo_automodel.components.models.common.packing.get_attn_implementation",
             return_value="sdpa",

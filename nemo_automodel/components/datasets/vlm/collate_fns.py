@@ -1514,10 +1514,12 @@ def neat_packed_vlm_collater(
 
     1. Pads all text tensors to a common length.
     2. Converts the indexed ``attention_mask`` to the appropriate format:
-       - ``flash_attention_2``: keeps the indexed ``[B, S]`` mask (values
-         1, 2, … for documents, 0 for padding).  The monkey-patched
-         ``_get_unpad_data`` converts this to ``cu_seqlens`` for
-         ``flash_attn_varlen_func``.
+       - ``flash_attention_2``: emits typed packed-sequence metadata as the
+         public ``FlashAttentionKwargs`` (``cu_seq_lens_q``/``cu_seq_lens_k``/
+         ``max_length_q``/``max_length_k``) and omits ``attention_mask`` so
+         HuggingFace routes the batch through ``flash_attn_varlen_func`` on its
+         supported path (no monkeypatching of private Transformers functions).
+         The indexed ``[B, S]`` document map is preserved as ``_packed_seq_ids``.
        - ``sdpa`` / ``eager``: converts to a 4D block-causal bool mask.
     3. Concatenates media tensors across the batch dimension.
 
@@ -1575,16 +1577,6 @@ def neat_packed_vlm_collater(
 
     mm_token_type_ids = torch.stack([_pad_1d(_get_mm_token_type_ids(x), 0, max_len) for x in batch])
 
-    if use_flash or not materialize_4d_mask:
-        # Keep the compact indexed [B, S] document map. FlashAttention derives
-        # cu_seqlens from it; block-diagonal CP rebuilds its local mask from the
-        # identical _packed_seq_ids emitted below.
-        attention_mask_out = attention_mask
-    else:
-        from nemo_automodel.components.datasets.utils import _indexed_mask_to_4d_block_causal
-
-        attention_mask_out = _indexed_mask_to_4d_block_causal(attention_mask)
-
     # Handle position_ids: 1D [seq_len] or 3D mRoPE [3, seq_len]
     pos_sample = torch.as_tensor(batch[0]["position_ids"])
     if pos_sample.ndim == 2:
@@ -1605,17 +1597,34 @@ def neat_packed_vlm_collater(
         "input_ids": input_ids,
         "labels": labels,
         "position_ids": position_ids,
-        "attention_mask": attention_mask_out,
         "mm_token_type_ids": mm_token_type_ids,
     }
 
-    # Store indexed attention mask for loss functions that need per-sample
-    # boundaries (e.g. SqrtCrossEntropy).  The indexed mask [B, S] uses
-    # values 1,2,3,... per original sample and 0 for padding.  For SDPA the
-    # ``attention_mask_out`` is already converted to 4D, so keep a copy.
-    has_multiple_docs = attention_mask.numel() > 0 and bool(attention_mask.max().item() > 1)
-    if has_multiple_docs or not materialize_4d_mask:
-        result["_packed_seq_ids"] = attention_mask
+    if use_flash:
+        # No attention_mask: HF then takes its varlen-kwargs branch, not the binary-mask unpad path.
+        from nemo_automodel.components.datasets.packed_seq import (
+            packed_seq_params_from_doc_ids,
+            to_flash_attention_kwargs,
+        )
+
+        params = packed_seq_params_from_doc_ids(attention_mask)
+        result.update(to_flash_attention_kwargs(params))
+        # Emitted only for 2+ docs, matching the sdpa path; consumed by loss / CP.
+        if attention_mask.numel() > 0 and attention_mask.max().item() > 1:
+            result["_packed_seq_ids"] = attention_mask
+    else:
+        if not materialize_4d_mask:
+            # CP rebuilds its local mask from _packed_seq_ids; keep the compact indexed [B, S] map here.
+            result["attention_mask"] = attention_mask
+        else:
+            from nemo_automodel.components.datasets.utils import _indexed_mask_to_4d_block_causal
+
+            result["attention_mask"] = _indexed_mask_to_4d_block_causal(attention_mask)
+
+        # Keep the indexed [B, S] map for loss (e.g. SqrtCrossEntropy) and CP mask rebuild.
+        has_multiple_docs = attention_mask.numel() > 0 and bool(attention_mask.max().item() > 1)
+        if has_multiple_docs or not materialize_4d_mask:
+            result["_packed_seq_ids"] = attention_mask
 
     # Concatenate media tensors across batch (variable count, no padding needed)
     for key in ("pixel_values", "pixel_values_videos"):

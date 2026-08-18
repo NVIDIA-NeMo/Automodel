@@ -16,8 +16,7 @@
 
 Verifies that:
 1. get_unpad_data correctly extracts per-document cu_seqlens from indexed masks
-2. neat_packed_vlm_collater returns the right mask format per attn_implementation
-3. configure_packing patches the right functions
+2. neat_packed_vlm_collater returns the right metadata per attn_implementation
 """
 
 import pytest
@@ -65,8 +64,8 @@ def test_get_unpad_data_single_doc():
     assert max_seqlen == 4
 
 
-def test_collater_flash_returns_2d_mask():
-    """With flash_attention_2, collater should return 2D indexed mask."""
+def test_collater_flash_emits_varlen_kwargs():
+    """With flash_attention_2, the collater emits FlashAttentionKwargs and no mask."""
     from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
 
     batch = [
@@ -80,10 +79,13 @@ def test_collater_flash_returns_2d_mask():
         },
     ]
     result = neat_packed_vlm_collater(batch, attn_implementation="flash_attention_2")
-    assert result["attention_mask"].ndim == 2  # [B, S]
-    assert result["attention_mask"].shape == (1, 5)
-    # Values preserved
-    assert result["attention_mask"][0].tolist() == [1, 1, 2, 2, 2]
+    # No attention_mask so HF takes the varlen-kwargs branch.
+    assert "attention_mask" not in result
+    # doc1 (2) + doc2 (3) span the 5 flattened tokens with no padding.
+    assert result["cu_seq_lens_q"].tolist() == [0, 2, 5]
+    assert result["max_length_q"] == 3
+    # Per-document ids preserved for downstream consumers.
+    assert result["_packed_seq_ids"][0].tolist() == [1, 1, 2, 2, 2]
 
 
 def test_collater_sdpa_returns_4d_mask():
@@ -105,24 +107,15 @@ def test_collater_sdpa_returns_4d_mask():
     assert result["attention_mask"].shape == (1, 1, 5, 5)
 
 
-def test_configure_packing_patches():
-    """Verify monkey-patching works."""
+def test_neat_packing_installs_no_global_patch():
+    """Neat packing must not monkeypatch transformers' private _get_unpad_data."""
     import transformers.modeling_flash_attention_utils as flash_utils
 
+    from nemo_automodel.components.models.common.packing import validate_flash_packing_support
+
     original_fn = flash_utils._get_unpad_data
-
-    from nemo_automodel.components.models.common.packing import configure_packing, get_unpad_data
-
-    # Should not patch for sdpa
-    configure_packing(attn_implementation="sdpa")
+    validate_flash_packing_support(attn_implementation="flash_attention_2")
     assert flash_utils._get_unpad_data is original_fn
-
-    # Should patch for flash_attention_2
-    configure_packing(attn_implementation="flash_attention_2")
-    assert flash_utils._get_unpad_data is get_unpad_data
-
-    # Restore
-    flash_utils._get_unpad_data = original_fn
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
