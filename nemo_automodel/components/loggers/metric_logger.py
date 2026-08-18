@@ -175,9 +175,53 @@ class MetricLoggerDist(MetricLogger):
         self.close()
 
 
+class TensorBoardMetricLogger(MetricLogger):
+    """JSONL metric logger that mirrors numeric metrics to TensorBoard."""
+
+    def __init__(self, filepath: str, *, flush: bool = False, append: bool = True) -> None:
+        super().__init__(filepath, flush=flush, append=append)
+        from torch.utils.tensorboard import SummaryWriter
+
+        log_dir = os.environ.get("TENSORBOARD_LOG_DIR") or os.path.join(os.path.dirname(self.filepath), "tensorboard")
+        stream = "validation" if "validation" in os.path.basename(self.filepath) else "train"
+        self._tb_prefix = stream
+        self._writer = SummaryWriter(log_dir=log_dir)
+
+    def log(self, record: MetricsSample) -> None:
+        values = stack_and_move_tensor_metrics_to_cpu([record])[0]
+        for name, value in values.metrics.items():
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                self._writer.add_scalar(f"{self._tb_prefix}/{name}", value, values.step)
+        super().log(values)
+
+    def close(self) -> None:
+        super().close()
+        self._writer.flush()
+        self._writer.close()
+
+
+class TensorBoardMetricLoggerDist(TensorBoardMetricLogger):
+    """Rank-zero JSONL + TensorBoard logger."""
+
+    def __init__(self, filepath: str, *, flush: bool = False, append: bool = True) -> None:
+        self.rank = dist.get_rank()
+        if self.rank == 0:
+            super().__init__(filepath, flush=flush, append=append)
+
+    def log(self, record: MetricsSample) -> None:
+        if self.rank == 0:
+            super().log(record)
+
+    def close(self) -> None:
+        if self.rank == 0:
+            super().close()
+
+
 def build_metric_logger(filepath: str, *, flush: bool = False, append: bool = True) -> MetricLogger:
-    """Build a local or distributed metric logger depending on distributed state."""
+    """Build a JSONL logger, optionally mirrored to TensorBoard via TENSORBOARD_LOG_DIR."""
+    tensorboard_enabled = bool(os.environ.get("TENSORBOARD_LOG_DIR"))
     if dist.is_initialized():
-        return MetricLoggerDist(filepath, flush=flush, append=append)
+        cls = TensorBoardMetricLoggerDist if tensorboard_enabled else MetricLoggerDist
     else:
-        return MetricLogger(filepath, flush=flush, append=append)
+        cls = TensorBoardMetricLogger if tensorboard_enabled else MetricLogger
+    return cls(filepath, flush=flush, append=append)

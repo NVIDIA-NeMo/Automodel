@@ -455,6 +455,7 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
         microbatch_size: int,
         seq_len: int,
         dtype: torch.dtype,
+        packed_sequence: bool = False,
     ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
         # Under context parallelism the first stage embeds the full sequence and
         # shards it in forward, so every stage output and later-stage input (incl.
@@ -466,15 +467,17 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
             padded_seq_len = seq_len + (-seq_len) % (2 * cp_size)
             local_seq_len = padded_seq_len // cp_size
 
-        hidden_shape = (microbatch_size, local_seq_len, self.config.text_config.hidden_size)
-        vocab_shape = (microbatch_size, local_seq_len, self.config.text_config.vocab_size)
+        batch_seq_shape = (local_seq_len,) if packed_sequence else (microbatch_size, local_seq_len)
+        hidden_shape = (*batch_seq_shape, self.config.text_config.hidden_size)
+        vocab_shape = (*batch_seq_shape, self.config.text_config.vocab_size)
         mtp_depth = int(getattr(self.mtp_config, "num_layers", 0) or 0)
 
         def meta(shape: tuple[int, ...]) -> torch.Tensor:
             return torch.empty(*shape, device="meta", dtype=dtype)
 
         if is_first:
-            inputs_meta = (torch.empty(microbatch_size, seq_len, device="meta", dtype=torch.long),)
+            input_shape = (seq_len,) if packed_sequence else (microbatch_size, seq_len)
+            inputs_meta = (torch.empty(*input_shape, device="meta", dtype=torch.long),)
         else:
             inputs_meta = (meta(hidden_shape), *(meta(hidden_shape) for _ in range(mtp_depth)))
 
@@ -715,6 +718,19 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
                 "attention_mask": attention_mask,
                 "padding_mask": padding_mask,
             }
+            # MTP transformer blocks run attention over the same token layout as
+            # the main decoder. Preserve THD/varlen metadata; otherwise their
+            # 3-D [T, H, D] Q/K/V tensors fall back to TE's default BSHD path.
+            for key in (
+                "qkv_format",
+                "cu_seqlens",
+                "cu_seqlens_padded",
+                "max_seqlen",
+                "cp_size",
+                "cp_rank",
+            ):
+                if key in kwargs:
+                    mtp_kwargs[key] = kwargs[key]
             if mtp_embed_inputs:
                 mtp_kwargs["embed_inputs"] = tuple(mtp_embed_inputs)
             elif inputs_embeds is not None:

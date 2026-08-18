@@ -156,6 +156,19 @@ def test_normalize_messages_rejects_malformed_reasoning_and_tool_fields(message,
         tcd._normalize_messages(message)
 
 
+def test_load_jsonl_preserves_unicode_line_separators_inside_strings(tmp_path):
+    path = tmp_path / "unicode-separator.jsonl"
+    rows = [
+        {"messages": [{"role": "user", "content": "before\u2028after"}]},
+        {"messages": [{"role": "assistant", "content": "before\u2029after"}]},
+    ]
+    with path.open("w", encoding="utf-8") as stream:
+        for row in rows:
+            stream.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    assert tcd._load_openai_messages(str(path)) == rows
+
+
 def test_load_openai_messages_local_and_errors(tmp_path, monkeypatch):
     # Create local files: JSONL and JSON
     jsonl = tmp_path / "data.jsonl"

@@ -99,7 +99,12 @@ def _separate_param_groups(
             lm_head_params.append(param)
             continue
 
-        if param.ndim == 2:
+        # Muon applies to matrix-like weights. Grouped MoE expert tensors are
+        # commonly rank-3 (experts, out, in); treating them as scalar AdamW
+        # parameters creates two full-size moments for almost the entire model.
+        # Dion/Muon can flatten higher-rank tensors internally, so include every
+        # non-embedding/lm-head trainable weight with ndim >= 2.
+        if param.ndim >= 2:
             matrix_params.append(param)
         else:
             vector_params.append(param)

@@ -816,6 +816,28 @@ class TestPrecomputeStageShapes:
         assert out_call[0].shape == (2, 16, 64)
         assert out_call[0].dtype == torch.bfloat16
 
+    def test_packed_thd_stage_shapes_omit_batch_axis(self):
+        stages = [
+            self._make_stage(is_first=True, is_last=False, has_lm_head=False),
+            self._make_stage(is_first=False, is_last=True, has_lm_head=True),
+        ]
+        config = self._make_config(hidden_size=64, vocab_size=128)
+
+        _precompute_stage_shapes(
+            stages,
+            config,
+            microbatch_size=1,
+            seq_len=8192,
+            packed_sequence=True,
+        )
+
+        assert stages[0].inputs_meta[0].shape == (8192,)
+        first_output = stages[0]._configure_outputs_meta.call_args[0][0]
+        assert first_output[0].shape == (8192, 64)
+        assert stages[1].inputs_meta[0].shape == (8192, 64)
+        last_output = stages[1]._configure_outputs_meta.call_args[0][0]
+        assert last_output[0].shape == (8192, 128)
+
     def test_middle_stage_shapes(self):
         """Middle stage input/output should be [mb, seq_len, hidden]."""
         stage = self._make_stage(is_first=False, is_last=False, has_lm_head=False)

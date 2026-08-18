@@ -216,6 +216,17 @@ def _estimate_sample_length(
         return_media_tokens: If True, return ``(total_tokens, media_tokens)``
             instead of just ``total_tokens``.
     """
+    # Tokenizer-aware datasets may already expose exact tokenized samples.
+    # Prefer that length over character heuristics so knapsack planning and
+    # materialization agree for text-only ChatDataset packing.
+    tokenized = example.get("input_ids")
+    if tokenized is not None:
+        tokenized = torch.as_tensor(tokenized)
+        text_tokens = int(tokenized.shape[-1])
+        if return_media_tokens:
+            return text_tokens, 0
+        return text_tokens
+
     # Text tokens
     precomputed = example.get("_text_tokens")
     if precomputed is not None:

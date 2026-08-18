@@ -2007,3 +2007,39 @@ class TestPreTokenizedDatasetWrapperInjectFakeImages:
         )
 
         assert wrapper.inject_fake_images is False
+
+
+class TestPreTokenizedDatasetWrapperPretokenizedInput:
+    def test_passes_through_pretokenized_chat_sample(self):
+        sample = {
+            "input_ids": [10, 11, 12, 13],
+            "attention_mask": [1, 1, 1, 1],
+            "labels": [-100, -100, 12, 13],
+        }
+        wrapper = ds.PreTokenizedDatasetWrapper([sample], _FakeProcessor(), inject_fake_images=False)
+
+        result = wrapper[0]
+
+        assert result["input_ids"].tolist() == [10, 11, 12, 13]
+        assert result["attention_mask"].tolist() == [1, 1, 1, 1]
+        assert result["labels"].tolist() == [-100, -100, 12, 13]
+
+    def test_truncates_pretokenized_chat_sample(self):
+        sample = {
+            "input_ids": [10, 11, 12, 13],
+            "attention_mask": [1, 1, 1, 1],
+            "labels": [-100, -100, 12, 13],
+        }
+        wrapper = ds.PreTokenizedDatasetWrapper(
+            [sample],
+            _FakeProcessor(),
+            max_length=3,
+            truncate=True,
+            inject_fake_images=False,
+        )
+
+        result = wrapper[0]
+
+        assert result["input_ids"].tolist() == [10, 11, 12]
+        assert result["attention_mask"].tolist() == [1, 1, 1]
+        assert result["labels"].tolist() == [-100, -100, 12]

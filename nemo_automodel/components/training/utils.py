@@ -126,6 +126,22 @@ def _clip_grad_norm_impl(
     if target_device is None:
         target_device = torch.device("cpu")
 
+    def _all_reduce_scalar(tensor, *, op, group):
+        # FSDP2 CPUOffloadPolicy leaves gradients and their norm scalars on
+        # CPU, while the mesh process groups use NCCL and cannot reduce CPU
+        # tensors. Shuttle only the scalar through the current CUDA device;
+        # keep the returned value on the original device for CPU clipping.
+        backend = str(torch.distributed.get_backend(group)).lower()
+        if tensor.device.type == "cpu" and "nccl" in backend:
+            reduce_tensor = tensor.to(
+                device=torch.device("cuda", torch.cuda.current_device()),
+                non_blocking=True,
+            )
+            torch.distributed.all_reduce(reduce_tensor, op=op, group=group)
+            return reduce_tensor.to(device=tensor.device)
+        torch.distributed.all_reduce(tensor, op=op, group=group)
+        return tensor
+
     # Compute norm for each sharding group using a scalar-first reduction:
     # sum(|g_local|^p) locally → single-scalar allreduce per Shard mesh dim.
     # Going through torch.nn.utils.get_total_norm on DTensor grads would stack
@@ -157,8 +173,10 @@ def _clip_grad_norm_impl(
             for dim_idx, pl in enumerate(first.placements):
                 if isinstance(pl, Replicate):
                     continue
-                torch.distributed.all_reduce(
-                    local_max, op=torch.distributed.ReduceOp.MAX, group=mesh.get_group(mesh_dim=dim_idx)
+                local_max = _all_reduce_scalar(
+                    local_max,
+                    op=torch.distributed.ReduceOp.MAX,
+                    group=mesh.get_group(mesh_dim=dim_idx),
                 )
 
         if is_inf or local_max == 0 or not torch.isfinite(local_max):
@@ -183,8 +201,10 @@ def _clip_grad_norm_impl(
             for dim_idx, pl in enumerate(first.placements):
                 if isinstance(pl, Replicate):
                     continue
-                torch.distributed.all_reduce(
-                    local_val, op=torch.distributed.ReduceOp.SUM, group=mesh.get_group(mesh_dim=dim_idx)
+                local_val = _all_reduce_scalar(
+                    local_val,
+                    op=torch.distributed.ReduceOp.SUM,
+                    group=mesh.get_group(mesh_dim=dim_idx),
                 )
 
         group_norms.append(local_max * local_val.pow(1.0 / norm_type))
@@ -195,15 +215,27 @@ def _clip_grad_norm_impl(
     # Reduce across pipeline parallel mesh if provided
     if pp_mesh is not None:
         if math.isinf(norm_type):
-            torch.distributed.all_reduce(total_norm, op=torch.distributed.ReduceOp.MAX, group=pp_mesh.get_group())
+            total_norm = _all_reduce_scalar(
+                total_norm,
+                op=torch.distributed.ReduceOp.MAX,
+                group=pp_mesh.get_group(),
+            )
         else:
             pp_max_norm = total_norm.abs().clone()
-            torch.distributed.all_reduce(pp_max_norm, op=torch.distributed.ReduceOp.MAX, group=pp_mesh.get_group())
+            pp_max_norm = _all_reduce_scalar(
+                pp_max_norm,
+                op=torch.distributed.ReduceOp.MAX,
+                group=pp_mesh.get_group(),
+            )
             if pp_max_norm == 0 or not torch.isfinite(pp_max_norm):
                 total_norm = pp_max_norm
             else:
                 total_norm = total_norm.div(pp_max_norm).pow(norm_type)
-                torch.distributed.all_reduce(total_norm, op=torch.distributed.ReduceOp.SUM, group=pp_mesh.get_group())
+                total_norm = _all_reduce_scalar(
+                    total_norm,
+                    op=torch.distributed.ReduceOp.SUM,
+                    group=pp_mesh.get_group(),
+                )
                 total_norm = pp_max_norm * total_norm.pow(1.0 / norm_type)
 
     if error_if_nonfinite and torch.logical_or(total_norm.isnan(), total_norm.isinf()):

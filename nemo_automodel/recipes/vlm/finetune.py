@@ -884,11 +884,15 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 "context-parallel THD for mRoPE VLMs is not yet implemented."
             )
         _padding_id = getattr(getattr(getattr(self, "processor", None), "tokenizer", None), "pad_token_id", 0) or 0
+        pp_n_microbatches = (
+            self.pp.pp_batch_size // self.pp.pp_microbatch_size if self.pp_enabled else 1
+        )
         cp_sharder = ContextParallelSharder(
             self.model_parts[0],
             self.device_mesh,
             batch,
             padding_token_id=_padding_id,
+            num_chunks=pp_n_microbatches,
             invoke_pre_embed=True,
         )
         train_ctx, batch = cp_sharder.shard(batch)
@@ -909,7 +913,12 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
                 model_input_key = "inputs_embeds" if "inputs_embeds" in batch else "input_ids"
                 model_input = batch.pop(model_input_key)
-                self.pp.update_seq_len(model_input.shape[1])
+                # THD+PP is pre-chunked by ContextParallelSharder as
+                # [num_microbatches, T] (or [..., T, H]), so the schedule can
+                # split every tensor and THD metadata consistently on dim 0.
+                # Ordinary padded inputs remain [B, S] / [B, S, H].
+                model_seq_len = model_input.shape[1]
+                self.pp.update_seq_len(model_seq_len, packed_sequence=_use_te_vlm)
                 self._maybe_set_pp_first_stage_embed_input_meta(model_input)
 
                 with stage_vlm_media_for_pp(self.pp, self.model_parts, batch):

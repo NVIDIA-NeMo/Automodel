@@ -128,6 +128,7 @@ class AutoPipeline:
         )
         self._model_config = None
         self._pp_current_seq_len: Optional[int] = None
+        self._pp_current_packed_sequence = False
 
     def build(
         self,
@@ -189,7 +190,7 @@ class AutoPipeline:
     def info(self) -> PipelineInfo:
         return self._info
 
-    def update_seq_len(self, seq_len: int) -> None:
+    def update_seq_len(self, seq_len: int, *, packed_sequence: bool = False) -> None:
         """Reset pipeline stage infrastructure for a new sequence length.
 
         VLM training batches can have wildly different sequence lengths across steps
@@ -203,7 +204,7 @@ class AutoPipeline:
         Args:
             seq_len: Sequence length of the upcoming batch (``input_ids.shape[1]``).
         """
-        if seq_len == self._pp_current_seq_len:
+        if seq_len == self._pp_current_seq_len and packed_sequence == self._pp_current_packed_sequence:
             return
         if self._model_config is None:
             raise RuntimeError("AutoPipeline.build() must be called before update_seq_len()")
@@ -214,8 +215,10 @@ class AutoPipeline:
             self.pp_microbatch_size,
             seq_len,
             tensor_dtype=self.dtype,
+            packed_sequence=packed_sequence,
         )
         self._pp_current_seq_len = seq_len
+        self._pp_current_packed_sequence = packed_sequence
         logger.debug(f"PP stage shapes updated for seq_len={seq_len}")
 
     def _get_schedule_kwargs_chunk_spec(self, kwargs: dict[str, Any]) -> dict[str, Any] | None:
@@ -241,19 +244,30 @@ class AutoPipeline:
             raise RuntimeError("AutoPipeline.build() must be called before running a PP schedule step")
 
         hook = getattr(model_parts[0], "get_pipeline_kwargs_chunk_dims", None)
-        if hook is None:
-            return None
-
-        custom_chunk_dims = hook(kwargs) or {}
+        custom_chunk_dims = (hook(kwargs) or {}) if hook is not None else {}
         for key in custom_chunk_dims:
             if key not in kwargs:
                 raise ValueError(f"Model PP chunk hook returned unknown kwarg: {key}")
 
-        if not custom_chunk_dims:
+        def contains_scalar_tensor(value: Any) -> bool:
+            if isinstance(value, torch.Tensor):
+                return value.ndim == 0
+            if isinstance(value, dict):
+                return any(contains_scalar_tensor(item) for item in value.values())
+            if isinstance(value, (list, tuple)):
+                return any(contains_scalar_tensor(item) for item in value)
+            return False
+
+        # PyTorch's default TensorChunkSpec(0) is invalid for 0-D metadata
+        # tensors such as THD max_seqlen. Install an explicit kwargs spec when
+        # either a model-owned nonstandard split axis or scalar metadata exists.
+        if not custom_chunk_dims and not any(contains_scalar_tensor(value) for value in kwargs.values()):
             return None
 
         def default_spec(value):
-            if isinstance(value, (torch.Tensor, BlockMask)):
+            if isinstance(value, torch.Tensor):
+                return ReplicateChunkSpec() if value.ndim == 0 else TensorChunkSpec(0)
+            if isinstance(value, BlockMask):
                 return TensorChunkSpec(0)
             return ReplicateChunkSpec()
 

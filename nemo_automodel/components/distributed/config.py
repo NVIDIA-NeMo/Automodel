@@ -179,6 +179,13 @@ class MoEParallelizerConfig:
     lm_head_precision: Optional[Union[str, torch.dtype]] = None
     wrap_outer_model: bool = True
     mp_policy: Optional[MixedPrecisionPolicy] = None
+    offload_experts_only: bool = False
+    """When true, apply CPU offload only to grouped MoE experts and outer leftovers.
+
+    Dense transformer blocks remain resident on GPU. This trades GPU memory for
+    lower per-layer host/device traffic while preserving offload for the dominant
+    expert parameter set.
+    """
 
     def to_dict(self) -> Dict[str, Any]:
         return {f.name: getattr(self, f.name) for f in fields(self)}

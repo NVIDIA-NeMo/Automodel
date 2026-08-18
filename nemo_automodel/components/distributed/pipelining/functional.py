@@ -311,6 +311,7 @@ def _precompute_stage_shapes(
     microbatch_size: int,
     seq_len: int,
     tensor_dtype: torch.dtype | None = None,
+    packed_sequence: bool = False,
 ) -> None:
     """Precompute input/output meta tensors for each pipeline stage to bypass serial shape inference.
 
@@ -348,30 +349,35 @@ def _precompute_stage_shapes(
 
         get_stage_metas = _get_optional_hook(stage.submod, "get_pipeline_stage_metas")
         if get_stage_metas is not None:
-            inputs_meta, outputs_meta = get_stage_metas(
-                is_first=stage.is_first,
-                microbatch_size=microbatch_size,
-                seq_len=seq_len,
-                dtype=model_dtype,
-            )
+            stage_meta_kwargs = {
+                "is_first": stage.is_first,
+                "microbatch_size": microbatch_size,
+                "seq_len": seq_len,
+                "dtype": model_dtype,
+            }
+            if "packed_sequence" in inspect.signature(get_stage_metas).parameters:
+                stage_meta_kwargs["packed_sequence"] = packed_sequence
+            inputs_meta, outputs_meta = get_stage_metas(**stage_meta_kwargs)
             _set_stage_metas(stage, inputs_meta, outputs_meta)
             continue
 
+        batch_seq_shape = (seq_len,) if packed_sequence else (microbatch_size, seq_len)
+
         # --- inputs_meta ---
         if stage.is_first:
-            # First stage receives input_ids: [mb, seq_len] int64
-            inputs_meta = (torch.empty(microbatch_size, seq_len, device="meta", dtype=torch.long),)
+            # THD packed microbatches are flat [T]; padded inputs are [mb, S].
+            inputs_meta = (torch.empty(*batch_seq_shape, device="meta", dtype=torch.long),)
         else:
-            inputs_meta = (torch.empty(microbatch_size, seq_len, hidden_size, device="meta", dtype=model_dtype),)
+            inputs_meta = (torch.empty(*batch_seq_shape, hidden_size, device="meta", dtype=model_dtype),)
 
         # --- outputs_meta ---
         has_lm_head = hasattr(stage.submod, "lm_head") and stage.submod.lm_head is not None
         emits_hidden_states = getattr(stage.submod, "_pp_return_hidden_states", False) is True
         if has_lm_head and not emits_hidden_states:
-            # Last stage with lm_head produces logits: [mb, seq_len, vocab_size]
-            primary_output_meta = torch.empty(microbatch_size, seq_len, vocab_size, device="meta", dtype=model_dtype)
+            # Last stage with lm_head produces logits over the same token layout.
+            primary_output_meta = torch.empty(*batch_seq_shape, vocab_size, device="meta", dtype=model_dtype)
         else:
-            primary_output_meta = torch.empty(microbatch_size, seq_len, hidden_size, device="meta", dtype=model_dtype)
+            primary_output_meta = torch.empty(*batch_seq_shape, hidden_size, device="meta", dtype=model_dtype)
         outputs_meta = (primary_output_meta,)
         _set_stage_metas(stage, inputs_meta, outputs_meta)
 
@@ -449,6 +455,7 @@ def reset_pp_stage_shapes(
     microbatch_size: int,
     seq_len: int,
     tensor_dtype: torch.dtype | None = None,
+    packed_sequence: bool = False,
 ) -> None:
     """Reset pipeline stage infrastructure and recompute shapes for a new sequence length.
 
@@ -495,7 +502,14 @@ def reset_pp_stage_shapes(
         stage.grad_send_info = None
 
     # Analytically set shapes for the new seq_len (no forward pass)
-    _precompute_stage_shapes(stages, model_config, microbatch_size, seq_len, tensor_dtype=tensor_dtype)
+    _precompute_stage_shapes(
+        stages,
+        model_config,
+        microbatch_size,
+        seq_len,
+        tensor_dtype=tensor_dtype,
+        packed_sequence=packed_sequence,
+    )
 
     # Trigger _initialize_stage(s) on the next step() call.
     # PipelineScheduleSingle uses singular, PipelineScheduleMulti uses plural.

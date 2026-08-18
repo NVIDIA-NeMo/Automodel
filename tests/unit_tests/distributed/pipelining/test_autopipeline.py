@@ -19,6 +19,7 @@ import pytest
 import torch
 import torch.nn as nn
 from torch.distributed.pipelining.microbatch import TensorChunkSpec, split_args_kwargs_into_chunks
+from torch.distributed.pipelining.microbatch import _Replicate as ReplicateChunkSpec
 
 from nemo_automodel.components.distributed.pipelining.autopipeline import AutoPipeline
 from nemo_automodel.components.distributed.pipelining.functional import (
@@ -323,6 +324,23 @@ class TestAutoPipelineKwargsChunkSpec:
 
         assert ap.info.schedule.kwargs_chunk_spec_during_step is None
         assert ap.info.schedule.kwargs_split[0]["attention_mask"].shape == (1, 8)
+        assert ap.info.schedule._kwargs_chunk_spec is None
+
+    def test_step_replicates_scalar_tensor_metadata_without_model_hook(self):
+        ap = self._pipeline_with_parts(nn.Module())
+        max_seqlen = torch.tensor(8, dtype=torch.int32)
+
+        ap.step(
+            torch.zeros(2, 8),
+            attention_mask=torch.ones(2, 8),
+            max_seqlen=max_seqlen,
+        )
+
+        spec = ap.info.schedule.kwargs_chunk_spec_during_step
+        assert isinstance(spec["max_seqlen"], ReplicateChunkSpec)
+        assert spec["attention_mask"].split_dim == 0
+        assert ap.info.schedule.kwargs_split[0]["max_seqlen"] is max_seqlen
+        assert ap.info.schedule.kwargs_split[1]["max_seqlen"] is max_seqlen
         assert ap.info.schedule._kwargs_chunk_spec is None
 
     def test_only_canonical_model_part_supplies_chunk_policy(self):

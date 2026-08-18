@@ -622,3 +622,18 @@ class TestDropEmptyLocalShards:
         ]
         with pytest.raises(ValueError, match="param group 1"):
             _drop_empty_local_shards(groups)
+
+
+def test_dion_grouping_treats_grouped_expert_weights_as_muon_matrix_params():
+    import torch
+    from nemo_automodel.components.optim.dion import _separate_param_groups
+
+    class GroupedExperts(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.empty(8, 16, 32))
+            self.bias = torch.nn.Parameter(torch.empty(8, 16))
+
+    groups = _separate_param_groups(GroupedExperts(), 1e-4, "adamw", 0.0)
+    assert groups[0]["params"][0].shape == (8, 16, 32)
+    assert all(param.ndim < 2 for param in groups[1]["params"])
