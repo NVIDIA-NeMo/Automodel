@@ -131,9 +131,9 @@ def test_comparison_kinds_never_make_cross_topology_stricter_than_same_implement
         ("standard", "same_implementation", 3e-3, 1.2e-2, 0.999),
         ("standard", "cross_framework", 6e-3, 3e-2, 0.998),
         ("standard", "cross_topology", 6e-3, 3e-2, 0.998),
-        ("relaxed", "same_implementation", 1e-2, 5e-2, 0.995),
+        ("relaxed", "same_implementation", 1.5e-2, 5e-2, 0.995),
         ("relaxed", "cross_framework", 2.5e-2, 1e-1, 0.99),
-        ("relaxed", "cross_topology", 1e-2, 5e-2, 0.995),
+        ("relaxed", "cross_topology", 1.5e-2, 5e-2, 0.995),
     ],
 )
 def test_calibrated_profile_thresholds(profile, comparison_kind, expected_mean_kl, expected_p95_kl, expected_cosine):

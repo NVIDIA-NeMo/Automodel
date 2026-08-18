@@ -118,7 +118,7 @@ ci:
   vllm_deploy: true
   vllm_smoke_test: true
   recipe_owner: akoumpa
-  time: "00:15:00"
+  time: "00:20:00"
   checkpoint_robustness:
     # PEFT source and reload comparisons consistently sit above the standard
     # same-implementation envelope while remaining well inside the shared relaxed profile.

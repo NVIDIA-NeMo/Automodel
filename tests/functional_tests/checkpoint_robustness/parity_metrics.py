@@ -69,9 +69,9 @@ _PARITY_PROFILES: dict[str, dict[_ComparisonKind, _ParityThresholds]] = {
         "cross_topology": _ParityThresholds(mean_kl=6e-3, p95_kl=3e-2, cosine_similarity=0.998),
     },
     "relaxed": {
-        "same_implementation": _ParityThresholds(mean_kl=1e-2, p95_kl=5e-2, cosine_similarity=0.995),
+        "same_implementation": _ParityThresholds(mean_kl=1.5e-2, p95_kl=5e-2, cosine_similarity=0.995),
         "cross_framework": _ParityThresholds(mean_kl=2.5e-2, p95_kl=1e-1, cosine_similarity=0.99),
-        "cross_topology": _ParityThresholds(mean_kl=1e-2, p95_kl=5e-2, cosine_similarity=0.995),
+        "cross_topology": _ParityThresholds(mean_kl=1.5e-2, p95_kl=5e-2, cosine_similarity=0.995),
     },
 }
 

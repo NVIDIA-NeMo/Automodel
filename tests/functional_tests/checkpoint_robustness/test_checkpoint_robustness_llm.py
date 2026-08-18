@@ -88,9 +88,7 @@ from tests.functional_tests.checkpoint_robustness.resume_trajectory import (
 datasets.disable_caching()
 
 _PARITY_DOCUMENT_PATH = Path(__file__).with_name("parity_document.mdx")
-_PARITY_DOCUMENT_SHA256 = (
-    "8f734b2ee925ab82afb56dfa3a512108b70d3c54a2489f7978a036420da34cdb"  # pragma: allowlist secret
-)
+_PARITY_DOCUMENT_SHA256 = "8f734b2ee925ab82afb56dfa3a512108b70d3c54a2489f7978a036420da34cdb"  # pragma: allowlist secret
 
 
 @dataclass(frozen=True)
@@ -579,8 +577,8 @@ def _source_load_parity_policy(custom_args: dict[str, str | bool], *, enforce: b
     )
 
 
-def _hf_repeatability_policy(*, phase: str, comparison: str, profile: str) -> _LogitParityPolicy:
-    """Build an informational policy for two forwards through one loaded HF model."""
+def _repeatability_policy(*, phase: str, comparison: str, profile: str) -> _LogitParityPolicy:
+    """Build an informational policy for two forwards through one loaded model."""
     return _LogitParityPolicy(
         phase=phase,
         comparison=comparison,
@@ -1419,7 +1417,7 @@ def _prepare_source_load_reference_rank0(
         _robustness_artifact_dir(cfg),
         hf_logits,
         repeated_hf_logits,
-        _hf_repeatability_policy(
+        _repeatability_policy(
             phase="phase_0",
             comparison="hf_source_self_repeat",
             profile=parity_tolerance_profile,
@@ -1956,7 +1954,7 @@ def _run_vanilla_hf_reload(
                 _robustness_artifact_dir(cfg),
                 hf_logits,
                 repeated_hf_logits,
-                _hf_repeatability_policy(
+                _repeatability_policy(
                     phase="phase_3",
                     comparison="hf_export_self_repeat",
                     profile=str(custom_args.get("parity_tolerance_profile", "standard")),
@@ -2001,7 +1999,7 @@ def _run_vanilla_hf_reload(
                 _robustness_artifact_dir(cfg),
                 hf_logits,
                 repeated_hf_logits,
-                _hf_repeatability_policy(
+                _repeatability_policy(
                     phase="phase_3",
                     comparison="hf_export_self_repeat",
                     profile=str(custom_args.get("parity_tolerance_profile", "standard")),
@@ -2363,11 +2361,23 @@ def _run_process_isolated_checkpoint_phase(
         device = next(trainer.model_parts[0].parameters()).device
         reference_logits = _get_logits(trainer.model_parts[0], input_ids, device, trainer=trainer)
         token_count, vocab_size = _validate_logits(reference_logits)
+        repeated_reference_logits = _get_logits(trainer.model_parts[0], input_ids, device, trainer=trainer)
         if _rank0():
+            _compare_logits(
+                _robustness_artifact_dir(cfg),
+                reference_logits,
+                repeated_reference_logits,
+                _repeatability_policy(
+                    phase="phase_1",
+                    comparison="automodel_reference_self_repeat",
+                    profile=str(custom_args.get("parity_tolerance_profile", "standard")),
+                ),
+            )
             print(
                 f"[Phase 1] Reference forward produced finite logits for "
                 f"{token_count} tokens and vocab_size={vocab_size}"
             )
+        del repeated_reference_logits
         _checkpoint_paths(cfg)
         artifact_dir = _robustness_artifact_dir(cfg)
         if _rank0():
@@ -2478,6 +2488,7 @@ def _run_process_isolated_checkpoint_phase(
                     )
             _raise_distributed_failure(failure_message)
 
+        reload_policy = _automodel_reload_parity_policy(custom_args)
         failure_message = None
         if _rank0():
             reference_logits = torch.load(reference_path, map_location="cpu", weights_only=True)
@@ -2485,13 +2496,32 @@ def _run_process_isolated_checkpoint_phase(
                 _robustness_artifact_dir(cfg),
                 reference_logits,
                 restored_logits,
-                _automodel_reload_parity_policy(custom_args),
+                reload_policy,
             )
-            if failure_message is not None:
-                failure_message = (
-                    "CHECKPOINT_ROBUSTNESS_PHASE_FAILURE phase=automodel_reload check=full_logit_parity\n"
-                    + failure_message
+        failure_message = _broadcast_rank0_failure(failure_message)
+        if reload_policy.profile == "relaxed" or not reload_policy.enforce or failure_message is not None:
+            repeated_restored_logits = _get_logits(
+                restored_trainer.model_parts[0],
+                input_ids,
+                device,
+                trainer=restored_trainer,
+            )
+            if _rank0():
+                _compare_logits(
+                    _robustness_artifact_dir(cfg),
+                    restored_logits,
+                    repeated_restored_logits,
+                    _repeatability_policy(
+                        phase="phase_2",
+                        comparison="automodel_reload_self_repeat",
+                        profile=reload_policy.profile,
+                    ),
                 )
+            del repeated_restored_logits
+        if failure_message is not None:
+            failure_message = (
+                "CHECKPOINT_ROBUSTNESS_PHASE_FAILURE phase=automodel_reload check=full_logit_parity\n" + failure_message
+            )
         _raise_distributed_failure(failure_message)
         _report_phase(
             f"Isolated AutoModel reload: parity complete for {ckpt_step_dir.relative_to(checkpoint_dir)}; exiting phase"
@@ -2773,10 +2803,22 @@ def run_checkpoint_robustness(
     device = next(trainer.model_parts[0].parameters()).device
     reference_logits = _get_logits(trainer.model_parts[0], input_ids, device, trainer=trainer)
     token_count, vocab_size = _validate_logits(reference_logits)
+    repeated_reference_logits = _get_logits(trainer.model_parts[0], input_ids, device, trainer=trainer)
     if _rank0():
+        _compare_logits(
+            _robustness_artifact_dir(cfg),
+            reference_logits,
+            repeated_reference_logits,
+            _repeatability_policy(
+                phase="phase_1",
+                comparison="automodel_reference_self_repeat",
+                profile=str(custom_args.get("parity_tolerance_profile", "standard")),
+            ),
+        )
         print(
             f"[Phase 1] Reference forward produced finite logits for {token_count} tokens and vocab_size={vocab_size}"
         )
+    del repeated_reference_logits
     _report_phase("Phase 1: reference-logits capture complete")
 
     # Locate the Phase 1 checkpoint used by the reload and resume checks.
@@ -2837,15 +2879,35 @@ def run_checkpoint_robustness(
     restored_logits = _get_logits(restored_trainer.model_parts[0], input_ids, device, trainer=restored_trainer)
     _report_phase("Phase 2: restored-logits capture complete")
 
+    reload_policy = _automodel_reload_parity_policy(custom_args)
     automodel_reload_error = None
     if _rank0():
         automodel_reload_error = _compare_logits(
             _robustness_artifact_dir(cfg),
             reference_logits,
             restored_logits,
-            _automodel_reload_parity_policy(custom_args),
+            reload_policy,
         )
     automodel_reload_error = _broadcast_rank0_failure(automodel_reload_error)
+    if reload_policy.profile == "relaxed" or not reload_policy.enforce or automodel_reload_error is not None:
+        repeated_restored_logits = _get_logits(
+            restored_trainer.model_parts[0],
+            input_ids,
+            device,
+            trainer=restored_trainer,
+        )
+        if _rank0():
+            _compare_logits(
+                _robustness_artifact_dir(cfg),
+                restored_logits,
+                repeated_restored_logits,
+                _repeatability_policy(
+                    phase="phase_2",
+                    comparison="automodel_reload_self_repeat",
+                    profile=reload_policy.profile,
+                ),
+            )
+        del repeated_restored_logits
     _record_deferred_failure(deferred_failures, "Phase 2 AutoModel model reload parity", automodel_reload_error)
 
     _release_recipe_memory(restored_trainer)

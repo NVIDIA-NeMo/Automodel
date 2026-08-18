@@ -51,6 +51,7 @@ from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm
     _prepare_consolidated_hf_cache_once,
     _raise_distributed_failure,
     _record_deferred_failure,
+    _repeatability_policy,
     _resolve_hf_model_class,
     _run_process_isolated_checkpoint_phase,
     _set_model_pretrained_path,
@@ -1274,6 +1275,18 @@ def test_source_load_parity_success_returns_no_deferred_failure(tmp_path):
 def test_source_load_logit_skip_keeps_metrics_informational():
     policy = _source_load_parity_policy({"skip_source_load_logit_parity": True})
 
+    assert policy.enforce is False
+
+
+def test_repeatability_policy_is_same_implementation_and_informational():
+    policy = _repeatability_policy(
+        phase="phase_2",
+        comparison="automodel_reload_self_repeat",
+        profile="relaxed",
+    )
+
+    assert policy.comparison_kind == "same_implementation"
+    assert policy.profile == "relaxed"
     assert policy.enforce is False
 
 
