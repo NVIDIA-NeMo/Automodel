@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 import os
 from contextlib import nullcontext
 from typing import Callable, List, Tuple, Union
