@@ -95,6 +95,26 @@ Triton reuses an autotuned configuration according to each kernel's explicit cac
 
 {/* docs-review-end: mamba-ssd-prewarm */}
 
+## Configure the MFU Reference Peak
+
+Recipes that report model FLOP utilization automatically detect the current
+device and use its dense-BF16 peak from AutoMFU's device table. Ordinary BF16
+training does not need an `mfu:` section.
+
+Use an explicit override when the hardware is not in the table or when the
+training precision has a different theoretical peak, such as dense FP8:
+
+```yaml
+mfu:
+  device: h100
+  peak_tflops: 1979.0
+```
+
+`peak_tflops` takes precedence over `device`. A device name alone selects an
+entry from AutoMFU's table; omitting both fields uses the current CUDA device.
+Hardware detection cannot determine the effective training precision, so FP8
+and structured-sparse runs must provide the appropriate peak explicitly.
+
 ## Repair Near-Zero Input Embeddings
 
 The LLM training and fine-tuning recipe can repair a small number of damaged input-embedding rows after loading the base checkpoint and before creating the optimizer.

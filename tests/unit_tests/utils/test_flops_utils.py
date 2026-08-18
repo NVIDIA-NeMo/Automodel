@@ -16,7 +16,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from nemo_automodel._transformers.mfu import get_device_flops
+from nemo_automodel._transformers import mfu as mfu_module
+from nemo_automodel._transformers.mfu import AutoMFU, get_device_flops
 from nemo_automodel.components.utils import flops_utils
 
 
@@ -221,10 +222,34 @@ def _nemotronh_super_v3_cfg() -> SimpleNamespace:
         ("transformer", flops_utils.transformer_flops, _transformer_cfg, dict(gbs=1, seq_len=1024), 8363320541184),
         ("gpt_oss", flops_utils.gpt_oss_flops, _gpt_oss_cfg, dict(gbs=1, seq_len=1024), 7356800827392),
         ("glm4_moe", flops_utils.glm4_moe_flops, _glm4_moe_cfg, dict(gbs=1, seq_len=2048), 120277337899008),
-        ("deepseekv3_moonlight", flops_utils.deepseekv3_flops, _moonlight_16b_config, dict(gbs=1, seq_len=2048), 30625801175040),
-        ("deepseekv3_dsv3", flops_utils.deepseekv3_flops, _deepseek_v3_config, dict(gbs=1, seq_len=1024), 233225179889664),
-        ("nemotronh_nano_v3", flops_utils.nemotronh_flops, _nemotronh_nano_v3_cfg, dict(gbs=1, seq_len=2048), 39982504869888),
-        ("nemotronh_super_v3", flops_utils.nemotronh_flops, _nemotronh_super_v3_cfg, dict(gbs=1, seq_len=2048), 152918015606784),
+        (
+            "deepseekv3_moonlight",
+            flops_utils.deepseekv3_flops,
+            _moonlight_16b_config,
+            dict(gbs=1, seq_len=2048),
+            30625801175040,
+        ),
+        (
+            "deepseekv3_dsv3",
+            flops_utils.deepseekv3_flops,
+            _deepseek_v3_config,
+            dict(gbs=1, seq_len=1024),
+            233225179889664,
+        ),
+        (
+            "nemotronh_nano_v3",
+            flops_utils.nemotronh_flops,
+            _nemotronh_nano_v3_cfg,
+            dict(gbs=1, seq_len=2048),
+            39982504869888,
+        ),
+        (
+            "nemotronh_super_v3",
+            flops_utils.nemotronh_flops,
+            _nemotronh_super_v3_cfg,
+            dict(gbs=1, seq_len=2048),
+            152918015606784,
+        ),
     ],
 )
 def test_flops_formulas_with_precomputed_values(name, func, cfg_factory, kwargs, expected):
@@ -269,19 +294,57 @@ def test_gpt_oss_flops_uses_head_dim_from_hf_config():
 )
 def test_calculate_mfu(tflops, world_size, time_seconds, reference_mfu, expected_mfu):
     """Test calculate_mfu function with various scenarios."""
-    actual_mfu = flops_utils.calculate_mfu(tflops, world_size, time_seconds, reference_mfu)
+    actual_mfu = flops_utils.calculate_mfu(
+        tflops,
+        world_size,
+        time_seconds,
+        reference_mfu=reference_mfu,
+    )
     assert pytest.approx(actual_mfu, rel=1e-3) == expected_mfu
 
 
-def test_calculate_mfu_default_reference():
-    """Test calculate_mfu with the legacy dense FP8 H100 reference."""
-    actual_mfu = flops_utils.calculate_mfu(tflops=1979.0, world_size=1, time_seconds=1.0)
-
-    assert pytest.approx(actual_mfu, rel=1e-6) == 100.0
+def test_calculate_mfu_requires_explicit_reference():
+    """A hidden hardware or precision assumption must not enter MFU."""
+    with pytest.raises(TypeError, match="reference_mfu"):
+        flops_utils.calculate_mfu(tflops=989.0, world_size=1, time_seconds=1.0)
 
 
 def test_automfu_h100_reference_uses_dense_bf16_peak():
-    """Test AutoMFU's default H100 training-precision convention."""
+    """Test AutoMFU's H100 dense-BF16 training convention."""
     h100_tflops = get_device_flops(unit="T", device_name="H100")
 
     assert h100_tflops == 989.0
+
+
+def test_get_device_flops_detects_current_cuda_device(monkeypatch):
+    monkeypatch.setattr(mfu_module.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(mfu_module.torch.cuda, "current_device", lambda: 3)
+    monkeypatch.setattr(
+        mfu_module.torch.cuda,
+        "get_device_name",
+        lambda device: "NVIDIA H100 80GB HBM3" if device == 3 else "unexpected",
+    )
+
+    assert get_device_flops(unit="T") == 989.0
+
+
+def test_automfu_defaults_to_detected_device_peak(monkeypatch):
+    monkeypatch.setattr(mfu_module, "get_flops_formula_for_hf_config", lambda config: None)
+    monkeypatch.setattr(mfu_module, "get_device_flops", lambda *, unit, device_name: 989.0)
+
+    calculator = AutoMFU(SimpleNamespace())
+
+    assert calculator.reference_mfu == 989.0
+
+
+def test_automfu_accepts_precision_peak_override(monkeypatch):
+    monkeypatch.setattr(mfu_module, "get_flops_formula_for_hf_config", lambda config: None)
+    monkeypatch.setattr(
+        mfu_module,
+        "get_device_flops",
+        lambda **kwargs: pytest.fail("explicit peak must bypass device lookup"),
+    )
+
+    calculator = AutoMFU(SimpleNamespace(), peak_tflops=1979.0)
+
+    assert calculator.reference_mfu == 1979.0

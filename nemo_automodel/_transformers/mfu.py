@@ -114,16 +114,24 @@ class AutoMFU:
     Model FLOPs Utilization (MFU) during training.
     """
 
-    def __init__(self, config: "PretrainedConfig", device: str = "h100"):
+    def __init__(
+        self,
+        config: "PretrainedConfig",
+        device: Optional[str] = None,
+        peak_tflops: Optional[float] = None,
+    ):
         """Initialize AutoMFU with a model config.
 
         Args:
             config: HuggingFace PretrainedConfig object
-            device: Device name (e.g. ``"h100"``)
+            device: Optional device name override. By default, infer the current device.
+            peak_tflops: Optional peak TFLOPs/s override for the training precision.
         """
         self.config = config
         self.flops_formula = get_flops_formula_for_hf_config(config)
-        self.reference_mfu = get_device_flops(unit="T", device_name=device)
+        self.reference_mfu = (
+            float(peak_tflops) if peak_tflops is not None else get_device_flops(unit="T", device_name=device)
+        )
 
     @classmethod
     def register_device(cls, device: str, peak_tflops: float) -> None:
@@ -134,7 +142,8 @@ class AutoMFU:
     def from_config(
         cls,
         config_or_path_or_model: Union["PretrainedConfig", str, PathLike[str], object],
-        device: str = "h100",
+        device: Optional[str] = None,
+        peak_tflops: Optional[float] = None,
         **kwargs,
     ) -> "AutoMFU":
         """Create AutoMFU from a config object, model object, or model path/ID.
@@ -142,7 +151,8 @@ class AutoMFU:
         Args:
             config_or_path_or_model: Either a PretrainedConfig object, a model object
                 (the .config attribute will be extracted), or a model ID/local path.
-            device: Device name (e.g. ``"h100"``)
+            device: Optional device name override. By default, infer the current device.
+            peak_tflops: Optional peak TFLOPs/s override for the training precision.
             **kwargs: Additional arguments passed to AutoConfig.from_pretrained
                 when loading from model ID/path.
 
@@ -157,13 +167,14 @@ class AutoMFU:
         else:
             config = cls._unwrap_config(config)
             cls._ensure_common_config_aliases(config)
-        return cls(config, device=device)
+        return cls(config, device=device, peak_tflops=peak_tflops)
 
     @classmethod
     def from_pretrained(
         cls,
         model_id_or_local_path_or_model: Union[str, PathLike[str], object],
-        device: str = "h100",
+        device: Optional[str] = None,
+        peak_tflops: Optional[float] = None,
         **kwargs,
     ) -> "AutoMFU":
         """Create AutoMFU from model ID, local path, or a model object.
@@ -171,13 +182,19 @@ class AutoMFU:
         Args:
             model_id_or_local_path_or_model: Model ID (e.g., "meta-llama/llama-3-70b"),
                 local path, or model object (the .config attribute will be extracted)
-            device: Device name (e.g. ``"h100"``)
+            device: Optional device name override. By default, infer the current device.
+            peak_tflops: Optional peak TFLOPs/s override for the training precision.
             **kwargs: Additional arguments passed to AutoConfig.from_pretrained
 
         Returns:
             AutoMFU instance
         """
-        return cls.from_config(model_id_or_local_path_or_model, device=device, **kwargs)
+        return cls.from_config(
+            model_id_or_local_path_or_model,
+            device=device,
+            peak_tflops=peak_tflops,
+            **kwargs,
+        )
 
     def __call__(
         self,

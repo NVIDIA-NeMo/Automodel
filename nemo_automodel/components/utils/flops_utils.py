@@ -15,14 +15,14 @@
 from typing import Any, Callable, Optional
 
 
-def calculate_mfu(tflops, world_size, time_seconds, reference_mfu=1979.0):
+def calculate_mfu(tflops, world_size, time_seconds, reference_mfu):
     """Calculate Model FLOPs Utilization (MFU).
 
     Args:
         tflops: TFLOPs per GPU
         world_size: Total number of GPUs
         time_seconds: Time taken for computation
-        reference_mfu: Peak TFLOPs of the hardware (default: dense FP8 or sparse BF16 on H100 SXM)
+        reference_mfu: Peak TFLOPs/s per device for the training precision
 
     Returns:
         MFU as a percentage

@@ -777,7 +777,11 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             for mp in self.model_parts:
                 enable_load_balance_tracking(mp)
 
-        self.mfu_calculator = AutoMFU.from_config(self.model_parts[0])
+        self.mfu_calculator = AutoMFU.from_config(
+            self.model_parts[0],
+            device=self.cfg.get("mfu.device", None),
+            peak_tflops=self.cfg.get("mfu.peak_tflops", None),
+        )
 
         # NEFTune: noisy embeddings for improved instruction fine-tuning
         neftune_cfg = self.cfg.get("neftune", None)

@@ -124,7 +124,11 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
         )
 
         self.model_parts = [model]
-        self.mfu_calculator = AutoMFU.from_config(self.model_parts[0])
+        self.mfu_calculator = AutoMFU.from_config(
+            self.model_parts[0],
+            device=self.cfg.get("mfu.device", None),
+            peak_tflops=self.cfg.get("mfu.peak_tflops", None),
+        )
 
         _, self.tokenizer = _build_tokenizer(self.cfg.model, self.cfg.dataset)
 
