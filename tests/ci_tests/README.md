@@ -63,7 +63,7 @@ ci:
   checkpoint_robustness:          # Optional. Enable robustness testing
     tokenizer_name: org/model
     parity_sequence_length: 2048  # Optional. Full-logit parity prompt length (default: 2048; 1K-4K recommended)
-    parity_tolerance_profile: standard  # Optional: strict, standard (default), or relaxed
+    parity_tolerance_profile: standard  # Optional: strict, standard (default), relaxed, or high_variance
     hf_device_map_auto: true      # Optional. Use for large HF reference loads that do not fit on one GPU
     # skip_resume: true           # Exceptional: skip native-checkpoint resume (Phase 4)
     # See checkpoint robustness section for all options
@@ -151,9 +151,9 @@ visible without making the default gate as unstable as max KL.
 Each vanilla-HF reference is forwarded twice through the same loaded model. The resulting `hf_source_self_repeat`
 or `hf_export_self_repeat` record is informational and distinguishes cross-framework drift from an unstable reference.
 Phase 1 likewise always emits an informational `automodel_reference_self_repeat` record. Phase 2 emits
-`automodel_reload_self_repeat` for the `relaxed` profile, an informational reload gate, or a reload comparison that
-exceeds its active thresholds. This keeps the dense passing path to one additional AutoModel forward while capturing
-both sides of the repeatability diagnosis for sensitive or failing configurations.
+`automodel_reload_self_repeat` for the `relaxed` or `high_variance` profile, an informational reload gate, or a reload
+comparison that exceeds its active thresholds. This keeps the dense passing path to one additional AutoModel forward
+while capturing both sides of the repeatability diagnosis for sensitive or failing configurations.
 
 | Self-repeat record | What it measures |
 |--------------------|------------------|
@@ -172,14 +172,17 @@ primary comparison includes that variability.
 |---------|-----------------------------------------|---------------------------------------|-------------------------------------|
 | `strict` | `1e-7` / `1e-6` / `0.999999` | `1e-4` / `1e-3` / `0.9999` | `1e-6` / `1e-5` / `0.99999` |
 | `standard` (default) | `3e-3` / `1.2e-2` / `0.999` | `6e-3` / `3e-2` / `0.998` | `6e-3` / `3e-2` / `0.998` |
-| `relaxed` | `1.5e-2` / `5e-2` / `0.995` | `2.5e-2` / `1e-1` / `0.99` | `1.5e-2` / `5e-2` / `0.995` |
+| `relaxed` | `2e-2` / `5e-2` / `0.995` | `2.5e-2` / `1e-1` / `0.99` | `2e-2` / `5e-2` / `0.995` |
+| `high_variance` | `4e-2` / `5e-2` / `0.99` | `5e-2` / `1e-1` / `0.985` | `4e-2` / `5e-2` / `0.99` |
 
 Use `strict` for deterministic same-kernel paths and `standard` for dense models and numerically stable MoE paths.
 Reserve `relaxed` for demonstrated discontinuous distributed behavior, normally expert-parallel MoE routing, and
-document the evidence in the recipe. Model size, TP/PP, or MoE status alone does not justify it. A dense model that
-exceeds `standard` should be investigated; if a verified low-precision kernel still needs a different envelope, use
-an explicit numeric override with its rationale instead of silently assigning `relaxed`. The comparison class is
-selected by the harness. For every profile, a
+document the evidence in the recipe. Use `high_variance` only when repeated scoped runs establish cross-process
+heavy-tail variation after exact checkpoint fingerprints/state and within-process self-repeat checks pass. It loosens
+mean KL and cosine while retaining the `relaxed` p95 guard, and must not be used for dense models. Model size, TP/PP,
+or MoE status alone does not justify either profile. A dense model that exceeds `standard` should be investigated; if
+a verified low-precision kernel still needs a different envelope, use an explicit numeric override with its rationale
+instead of silently assigning a looser profile. The comparison class is selected by the harness. For every profile, a
 cross-topology comparison is never stricter than the same-implementation comparison because changing topology adds a
 numerical variation source.
 

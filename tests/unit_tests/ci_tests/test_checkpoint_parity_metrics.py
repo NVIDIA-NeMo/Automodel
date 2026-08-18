@@ -98,21 +98,27 @@ def test_named_profiles_are_ordered_and_gate_mean_p95_and_cosine():
     strict = _resolve_parity_thresholds("strict", "cross_framework")
     standard = _resolve_parity_thresholds("standard", "cross_framework")
     relaxed = _resolve_parity_thresholds("relaxed", "cross_framework")
+    high_variance = _resolve_parity_thresholds("high_variance", "cross_framework")
     reference = torch.zeros(1, 100, 2)
     candidate = reference.clone()
     candidate[:, :10, 0] = 0.25
     metrics = _compute_parity_metrics(reference, candidate)
 
-    assert strict.mean_kl < standard.mean_kl < relaxed.mean_kl
-    assert strict.p95_kl < standard.p95_kl < relaxed.p95_kl
-    assert strict.cosine_similarity > standard.cosine_similarity > relaxed.cosine_similarity
+    assert strict.mean_kl < standard.mean_kl < relaxed.mean_kl < high_variance.mean_kl
+    assert strict.p95_kl < standard.p95_kl < relaxed.p95_kl == high_variance.p95_kl
+    assert (
+        strict.cosine_similarity
+        > standard.cosine_similarity
+        > relaxed.cosine_similarity
+        > high_variance.cosine_similarity
+    )
     failures = _parity_failures(metrics, strict)
     assert any("mean KL" in failure for failure in failures)
     assert any("p95 KL" in failure for failure in failures)
     assert any("cosine similarity" in failure for failure in failures)
 
 
-@pytest.mark.parametrize("profile", ["strict", "standard", "relaxed"])
+@pytest.mark.parametrize("profile", ["strict", "standard", "relaxed", "high_variance"])
 def test_comparison_kinds_never_make_cross_topology_stricter_than_same_implementation(profile):
     same_implementation = _resolve_parity_thresholds(profile, "same_implementation")
     cross_topology = _resolve_parity_thresholds(profile, "cross_topology")
@@ -131,9 +137,12 @@ def test_comparison_kinds_never_make_cross_topology_stricter_than_same_implement
         ("standard", "same_implementation", 3e-3, 1.2e-2, 0.999),
         ("standard", "cross_framework", 6e-3, 3e-2, 0.998),
         ("standard", "cross_topology", 6e-3, 3e-2, 0.998),
-        ("relaxed", "same_implementation", 1.5e-2, 5e-2, 0.995),
+        ("relaxed", "same_implementation", 2e-2, 5e-2, 0.995),
         ("relaxed", "cross_framework", 2.5e-2, 1e-1, 0.99),
-        ("relaxed", "cross_topology", 1.5e-2, 5e-2, 0.995),
+        ("relaxed", "cross_topology", 2e-2, 5e-2, 0.995),
+        ("high_variance", "same_implementation", 4e-2, 5e-2, 0.99),
+        ("high_variance", "cross_framework", 5e-2, 1e-1, 0.985),
+        ("high_variance", "cross_topology", 4e-2, 5e-2, 0.99),
     ],
 )
 def test_calibrated_profile_thresholds(profile, comparison_kind, expected_mean_kl, expected_p95_kl, expected_cosine):

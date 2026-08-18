@@ -122,7 +122,9 @@ optimizer:
 ci:
   recipe_owner: hemildesai
   node_multiplier: true
-  time: "00:20:00"
+  # The full 2K source/reload matrix completes inside 20 minutes, but the
+  # default native-resume phase needs additional setup and continuation time.
+  time: "00:30:00"
   vllm_deploy: true
   vllm_smoke_test: true
   checkpoint_robustness:

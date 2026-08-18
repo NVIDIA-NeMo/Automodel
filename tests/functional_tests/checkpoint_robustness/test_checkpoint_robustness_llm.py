@@ -21,6 +21,7 @@ Launch: torchrun --nproc-per-node=<N> -m <this_module> --config <config.yaml>
     [--tokenizer_name <str>]
     [--source_load_kl_threshold <float>] [--source_load_mean_kl_threshold <float>]
     [--check_source_load_parity] [--check_fused_qkv_keys] [--check_phantom_keys] [--check_resume]
+    [--parity_tolerance_profile <strict|standard|relaxed|high_variance>]
     [--resume_tolerance_profile <strict|standard|relaxed>]
     [--resume_first_loss_threshold <float>] [--resume_loss_threshold <float>]
     [--skip_automodel_logit_parity] [--skip_hf_logit_parity] [--hf_adapter_ignored_key_prefix <str>]
@@ -2499,7 +2500,11 @@ def _run_process_isolated_checkpoint_phase(
                 reload_policy,
             )
         failure_message = _broadcast_rank0_failure(failure_message)
-        if reload_policy.profile == "relaxed" or not reload_policy.enforce or failure_message is not None:
+        if (
+            reload_policy.profile in {"relaxed", "high_variance"}
+            or not reload_policy.enforce
+            or failure_message is not None
+        ):
             repeated_restored_logits = _get_logits(
                 restored_trainer.model_parts[0],
                 input_ids,
@@ -2889,7 +2894,11 @@ def run_checkpoint_robustness(
             reload_policy,
         )
     automodel_reload_error = _broadcast_rank0_failure(automodel_reload_error)
-    if reload_policy.profile == "relaxed" or not reload_policy.enforce or automodel_reload_error is not None:
+    if (
+        reload_policy.profile in {"relaxed", "high_variance"}
+        or not reload_policy.enforce
+        or automodel_reload_error is not None
+    ):
         repeated_restored_logits = _get_logits(
             restored_trainer.model_parts[0],
             input_ids,

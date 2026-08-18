@@ -170,8 +170,10 @@ ci:
     # adapter tensor HF can instantiate, while allowing only the saved MTP adapter namespace.
     hf_adapter_ignored_key_prefix: "base_model.model.mtp."
     # HF is not self-repeatable, so only the two HF-based numerical gates are
-    # informational. AutoModel reload remains blocking under the relaxed profile.
-    parity_tolerance_profile: relaxed
+    # informational. AutoModel reload remains blocking. Across three exact-state
+    # scoped runs its mean KL varied from 0.00447 to 0.03215 while within-process
+    # self-repeat stayed bitwise zero, which is the high-variance routed-MoE policy.
+    parity_tolerance_profile: high_variance
     skip_source_load_logit_parity: true
     skip_hf_reload_logit_parity: true
     # Restored model/optimizer state and the first forward are exact. The
