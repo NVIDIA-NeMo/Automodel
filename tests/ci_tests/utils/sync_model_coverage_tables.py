@@ -23,6 +23,8 @@ from pathlib import Path
 
 import yaml
 
+MODEL_VERIFICATION_CARD_SUFFIX = "_verification_card.yaml"
+
 TABLE_ROW_COUNT = 10
 HOMEPAGE_START_MARKER = "{/* BEGIN GENERATED LATEST MODEL SUPPORT */}"
 HOMEPAGE_END_MARKER = "{/* END GENERATED LATEST MODEL SUPPORT */}"
@@ -214,7 +216,11 @@ def _load_recipe_addition_dates(repo_root: Path) -> dict[str, str]:
             commit, commit_date = line.removeprefix("@@COMMIT@@").split(" ", 1)
         elif line.endswith(".yaml") and commit_date is not None:
             additions.setdefault(line, (commit_date, commit))
-    current_recipes = {str(path.relative_to(repo_root)) for path in (repo_root / "examples").rglob("*.yaml")}
+    current_recipes = {
+        str(path.relative_to(repo_root))
+        for path in (repo_root / "examples").rglob("*.yaml")
+        if not path.name.endswith(MODEL_VERIFICATION_CARD_SUFFIX)
+    }
     missing_recipes = current_recipes - additions.keys()
     if missing_recipes:
         raise ValueError(
@@ -380,6 +386,8 @@ def _load_model_releases(repo_root: Path, model_docs: dict[str, list[_ModelDoc]]
     introduction_dates = _load_model_introduction_dates(repo_root)
     releases_by_model_type: dict[tuple[str, str], _ModelRelease] = {}
     for path in sorted((repo_root / "examples").rglob("*.yaml")):
+        if path.name.endswith(MODEL_VERIFICATION_CARD_SUFFIX):
+            continue
         recipe = path.relative_to(repo_root)
         recipe_text = path.read_text(encoding="utf-8")
         try:

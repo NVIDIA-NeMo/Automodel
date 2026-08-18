@@ -16,7 +16,19 @@ from pathlib import Path
 
 from ruamel.yaml import YAML
 
-from tests.ci_tests.utils.generate_ci_tests import generate_job, generate_pipeline
+from tests.ci_tests.utils.generate_ci_tests import detect_yml_configurations, generate_job, generate_pipeline
+
+
+def test_auto_discovery_excludes_model_verification_cards(tmp_path):
+    examples_dir = tmp_path / "examples" / "llm_benchmark" / "model"
+    examples_dir.mkdir(parents=True)
+    recipe = examples_dir / "recipe.yaml"
+    recipe.write_text("recipe: BenchmarkingRecipeForNextTokenPrediction\n", encoding="utf-8")
+    (examples_dir / "model_verification_card.yaml").write_text("title: model\n", encoding="utf-8")
+
+    discovered = detect_yml_configurations(str(tmp_path), "performance", "llm_benchmark")
+
+    assert discovered == [Path("examples/llm_benchmark/model/recipe.yaml")]
 
 
 def test_generate_deepseek_v4_pretrain_nightly_job():

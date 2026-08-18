@@ -41,6 +41,8 @@ EXCLUDED_RECIPE_PREFIXES = (
     Path("examples/convergence"),
 )
 
+MODEL_VERIFICATION_CARD_SUFFIX = "_verification_card.yaml"
+
 EXCLUDED_RECIPE_FILES = {
     Path("examples/retrieval/data_utils/mining_config.yaml"),
     # Command-only configs: launched via
@@ -229,6 +231,8 @@ def _top_level_key_lines(document: yaml.MappingNode) -> list[tuple[str, int]]:
 
 def _should_require_recipe(path: Path, automodel_dir: Path) -> bool:
     rel_path = _relative_path(path, automodel_dir)
+    if rel_path.name.endswith(MODEL_VERIFICATION_CARD_SUFFIX):
+        return False
     if rel_path in EXCLUDED_RECIPE_FILES:
         return False
     return not any(_is_relative_to(rel_path, prefix) for prefix in EXCLUDED_RECIPE_PREFIXES)

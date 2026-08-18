@@ -1,0 +1,161 @@
+# Agent-readable model verification card.
+# status: verified | not_verified
+
+title: qwen3_30b_a3b
+summary: >
+  Qwen3-30B-A3B has completed bounded RedPajama2 pretraining and a direct
+  middle-checkpoint resume on 16 H100 GPUs using the Megatron Bridge convergence
+  contract. Timing and throughput from those real-data runs are functional
+  observations, not tuned performance results. SFT, 128K CoderForge SFT, PEFT,
+  vLLM checkpoint loading, and the canonical performance recipe remain to be
+  verified.
+
+model:
+  hf_id: Qwen/Qwen3-30B-A3B
+  hf_revision: ad44e777bcd18fa416d9da3bd8f70d33ebb85d39
+  architecture: Qwen3MoeForCausalLM
+
+verification_environment:
+  automodel_commit: cb03cf61ae2da0a591516fac4f21cfc6eecf48c1
+
+reference:
+  framework: Megatron Bridge
+  card: https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/main/examples/model_verification_cards/qwen3-30b-a3b/card.yaml
+  convergence_contract: qwen3_30b_a3b_convergence_v2
+
+verification_index:
+  training:
+    H100:
+      verified: [pretrain, checkpoint_resume]
+      not_verified: [sft, sft_long_context, peft]
+  deployment:
+    H100:
+      verified: []
+      not_verified: [vllm_checkpoint_compatibility]
+  performance:
+    H100:
+      verified: []
+      not_verified: [pretrain_performance]
+
+items:
+  pretrain:
+    H100:
+      status: verified
+      precision: bf16
+      automodel_commit: cb03cf61ae2da0a591516fac4f21cfc6eecf48c1
+      recipe: examples/llm_pretrain/qwen/qwen3_moe_30b_a3b_rp2_verification.yaml
+      command: >
+        python -m torch.distributed.run --nnodes=2 --nproc_per_node=8
+        --rdzv_backend=c10d --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT
+        -m nemo_automodel.cli.app
+        examples/llm_pretrain/qwen/qwen3_moe_30b_a3b_rp2_verification.yaml
+        --checkpoint.checkpoint_dir=/work/output/checkpoints
+      last_verified: "2026-08-18"
+      workload:
+        hardware: 16x H100
+        dataset: RedPajama2 head_01
+        sequence_length: 4096
+        global_batch_size: 1024
+        local_batch_size: 1
+        optimizer_steps: 100
+        optimizer: FusedAdam
+        learning_rate: 0.0003
+        minimum_learning_rate: 0.00003
+        warmup_steps: 40
+        scheduler: cosine
+        seed: 1234
+        topology: TP1/PP1/CP1/EP16/DP16
+      metrics:
+        initial_loss: 12.4135513306
+        final_loss: 7.3661632538
+        last_10_steps_step_time_ms_avg: 44525.5678
+        last_10_steps_model_tflops_per_gpu_avg: 135.4928
+        last_10_steps_tokens_per_second_per_gpu_avg: 5887.4937
+        peak_allocated_memory_gib: 72.436
+      expected_result: >
+        The 16-GPU run completes exactly 100 optimizer steps with finite loss,
+        saves complete checkpoints after optimizer updates 50 and 100, and
+        records all five standard metrics. Loss decreases from 12.4135513306 to
+        7.3661632538 with no skipped or NaN iterations.
+
+  checkpoint_resume:
+    H100:
+      status: verified
+      precision: bf16
+      automodel_commit: cb03cf61ae2da0a591516fac4f21cfc6eecf48c1
+      recipe: examples/llm_pretrain/qwen/qwen3_moe_30b_a3b_rp2_verification.yaml
+      depends_on: pretrain
+      command: >
+        python -m torch.distributed.run --nnodes=2 --nproc_per_node=8
+        --rdzv_backend=c10d --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT
+        -m nemo_automodel.cli.app
+        examples/llm_pretrain/qwen/qwen3_moe_30b_a3b_rp2_verification.yaml
+        --checkpoint.checkpoint_dir=/work/resume-output/checkpoints
+        --checkpoint.restore_from=/work/reference/checkpoints/epoch_0_step_49
+      last_verified: "2026-08-18"
+      metrics:
+        initial_loss: 7.3997955322
+        final_loss: 7.3668651581
+        last_10_steps_step_time_ms_avg: 44173.0926
+        last_10_steps_model_tflops_per_gpu_avg: 136.5429
+        last_10_steps_tokens_per_second_per_gpu_avg: 5934.4724
+      resume_comparison:
+        shared_steps: 50
+        passed_steps: 50
+        loss_tolerance: 1.0e-6 + 1% of abs(reference)
+        maximum_absolute_loss_difference: 0.0007162094
+        maximum_relative_loss_difference: 0.0000970991
+        learning_rate_exact: true
+        consumed_tokens_exact: true
+      expected_result: >
+        Loading the checkpoint saved after optimizer update 50 resumes directly
+        through update 100 in a fresh output root. All 50 shared losses pass the
+        declared tolerance; learning rates and processed-token counts match
+        exactly. The final-loss absolute difference is 0.0007019043.
+
+  sft:
+    H100:
+      status: not_verified
+      verification_contract:
+        workload: full supervised fine-tuning
+        bounded_optimizer_steps: 100
+
+  sft_long_context:
+    H100:
+      status: not_verified
+      verification_contract:
+        workload: full supervised fine-tuning with context parallelism
+        dataset: togethercomputer/CoderForge-Preview
+        sequence_length: 131072
+        starting_example: examples/long_context_validation/gemma4_31B/gemma4_31b_base_coderforge_cp8_64k_1e5_800steps.yaml
+
+  peft:
+    H100:
+      status: not_verified
+      verification_contract:
+        workload: LoRA supervised fine-tuning
+        bounded_optimizer_steps: 100
+
+  vllm_checkpoint_compatibility:
+    H100:
+      status: not_verified
+      verification_contract:
+        checkpoint: consolidated AutoModel checkpoint
+        loader: vLLM
+        generation: deterministic bounded generation
+
+  pretrain_performance:
+    H100:
+      status: not_verified
+      verification_contract:
+        recipe: examples/llm_benchmark/qwen/qwen3_moe_30b_te_deepep.yaml
+        data: mock
+        warmup_steps: 10
+        measured_steps: 20
+      latest_functional_observation:
+        model_tflops_per_gpu: 135.4928
+        tokens_per_second_per_gpu: 5887.4937
+        megatron_bridge_model_tflops_per_gpu: 199.120
+        megatron_bridge_tokens_per_second_per_gpu: 8654.602
+        model_tflops_vs_megatron_bridge_percent: -31.9542
+      next_step: Tune and run the public benchmark recipe before marking this item verified.
