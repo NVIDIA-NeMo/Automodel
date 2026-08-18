@@ -1577,7 +1577,7 @@ class TestLoadModelCustomModelGuard:
     @patch("nemo_automodel.components.checkpoint.checkpointing._is_safetensors_checkpoint", return_value=True)
     @patch("nemo_automodel.components.checkpoint.checkpointing._load_hf_checkpoint_preserving_dtype")
     @patch("nemo_automodel.components.checkpoint.checkpointing._load_full_state_dict_into_model")
-    def test_single_device_custom_model_uses_fast_path(self, mock_load_full, mock_load_hf, mock_is_st):
+    def test_single_device_custom_model_uses_fast_path(self, mock_load_full, mock_load_hf, mock_is_st, caplog):
         """A custom model without a write-through guarantee uses the full-state path.
 
         The fast path applies the state_dict_adapter from_hf conversion on CPU (via
@@ -1594,6 +1594,7 @@ class TestLoadModelCustomModelGuard:
         assert _is_custom_model(model) is True
 
         mock_load_hf.return_value = {"layer.weight": torch.randn(4, 4), "layer.bias": torch.randn(4)}
+        caplog.set_level(logging.INFO)
 
         with (
             patch("os.path.exists", return_value=True),
@@ -1607,6 +1608,9 @@ class TestLoadModelCustomModelGuard:
         # Single-device custom model takes the frugal fast path, not DCP.
         mock_load_full.assert_called_once()
         mock_dcp_load.assert_not_called()
+        assert "disk read" in caplog.text
+        assert "adapt" in caplog.text
+        assert "install" in caplog.text
 
     @patch("nemo_automodel.components.checkpoint.checkpointing._is_safetensors_checkpoint", return_value=True)
     @patch("nemo_automodel.components.checkpoint.checkpointing._load_hf_checkpoint_preserving_dtype")
