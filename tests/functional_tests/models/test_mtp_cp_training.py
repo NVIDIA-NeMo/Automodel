@@ -173,65 +173,11 @@ def _qwen3_5_model():
     return Qwen3_5ForConditionalGeneration(config, backend=_backend())
 
 
-def _minimax_model():
-    from nemo_automodel.components.models.minimax_m3_vl.config import MiniMaxM3VLConfig
-    from nemo_automodel.components.models.minimax_m3_vl.model import MiniMaxM3SparseForConditionalGeneration
-
-    config = MiniMaxM3VLConfig(
-        vision_config={
-            "hidden_size": 32,
-            "num_attention_heads": 4,
-            "num_hidden_layers": 0,
-            "intermediate_size": 64,
-            "patch_size": 2,
-            "num_channels": 3,
-            "img_token_compression_config": {"spatial_merge_size": 2, "temporal_patch_size": 2},
-        },
-        text_config={
-            "hidden_size": 256,
-            "intermediate_size": 64,
-            "dense_intermediate_size": 128,
-            "shared_intermediate_size": 64,
-            "num_hidden_layers": 4,
-            "num_attention_heads": 4,
-            "num_key_value_heads": 2,
-            "head_dim": 64,
-            "rotary_dim": 32,
-            "partial_rotary_factor": 0.5,
-            "vocab_size": 128,
-            "max_position_embeddings": 128,
-            "num_local_experts": 4,
-            "num_experts_per_tok": 2,
-            "n_shared_experts": 1,
-            "moe_layer_freq": [0, 1, 1, 1],
-            "num_mtp_modules": 1,
-            "sparse_attention_config": {
-                "use_sparse_attention": True,
-                "sparse_index_dim": 64,
-                "sparse_num_index_heads": 2,
-                "sparse_topk_blocks": 2,
-                "sparse_block_size": 128,
-                "sparse_score_type": "max",
-                "sparse_init_block": 0,
-                "sparse_local_block": 1,
-                "sparse_attention_freq": [0, 1, 1, 1],
-                "sparse_disable_index_value": [0, 1, 1, 1],
-            },
-            "torch_dtype": "float32",
-        },
-        image_token_index=126,
-        video_token_index=127,
-        projector_hidden_size=256,
-    )
-    return MiniMaxM3SparseForConditionalGeneration(config, backend=_backend())
-
-
 def _model_from_name(name: str):
     builders = {
         "deepseek_v4": _deepseek_model,
         "step3p7": _step_model,
         "qwen3_5": _qwen3_5_model,
-        "minimax_m3": _minimax_model,
     }
     return builders[name]()
 
@@ -246,7 +192,7 @@ def _initialize_model(name: str, device: torch.device):
 
 def _make_batch(name: str, device: torch.device) -> dict[str, torch.Tensor]:
     generator = torch.Generator(device=device).manual_seed(1234)
-    seq_len = 256 if name == "minimax_m3" else 64
+    seq_len = 64
     input_ids = torch.randint(2, 120, (1, seq_len), generator=generator, device=device)
     labels = torch.roll(input_ids, shifts=-1, dims=1)
     labels[:, -1] = _IGNORE_INDEX
@@ -405,8 +351,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--models",
         nargs="+",
-        default=["deepseek_v4", "step3p7", "qwen3_5", "minimax_m3"],
-        choices=["deepseek_v4", "step3p7", "qwen3_5", "minimax_m3"],
+        default=["deepseek_v4", "step3p7", "qwen3_5"],
+        choices=["deepseek_v4", "step3p7", "qwen3_5"],
     )
     args = parser.parse_args()
     if not args.worker:

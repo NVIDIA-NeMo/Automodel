@@ -54,16 +54,6 @@ class MiniMaxM3MTPBlock(nn.Module):
         self.transformer_layer = Block(config.num_hidden_layers - 1, config, moe_config, backend)
         self.final_layernorm = MiniMaxM3RMSNorm(config.hidden_size, eps=config.rms_norm_eps, gemma=gemma)
 
-    @property
-    def self_attn(self):
-        """Expose the nested decoder attention to the generic CP parallelizer."""
-        return self.transformer_layer.self_attn
-
-    @property
-    def mlp(self):
-        """Expose the nested decoder MoE to the generic EP/FSDP parallelizers."""
-        return self.transformer_layer.mlp
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -99,9 +89,8 @@ class MiniMaxM3MTP(nn.Module):
         self,
         hidden_states: torch.Tensor,
         *,
-        input_ids: torch.Tensor | None = None,
+        input_ids: torch.Tensor,
         embed_fn,
-        embed_inputs: tuple[torch.Tensor, ...] | list[torch.Tensor] | None = None,
         lm_head: nn.Module,
         freqs_cis: torch.Tensor,
         **block_kwargs: Any,
@@ -110,17 +99,9 @@ class MiniMaxM3MTP(nn.Module):
         per_depth_logits: list[torch.Tensor] = []
         cur_ids = input_ids
         hidden = hidden_states
-        if embed_inputs is not None and len(embed_inputs) != len(self.layers):
-            raise ValueError(f"Expected {len(self.layers)} MTP embedding tensors, got {len(embed_inputs)}")
-        if embed_inputs is None and cur_ids is None:
-            raise ValueError("MiniMax M3 MTP requires input_ids or embed_inputs")
-        for depth, block in enumerate(self.layers):
-            if embed_inputs is None:
-                cur_ids = roll_tensor(cur_ids, shifts=-1, dim=-1)
-                embed_input = embed_fn(cur_ids)
-            else:
-                embed_input = embed_inputs[depth]
-            hidden = block(hidden, embed_input=embed_input, freqs_cis=freqs_cis, **block_kwargs)
+        for block in self.layers:
+            cur_ids = roll_tensor(cur_ids, shifts=-1, dim=-1)
+            hidden = block(hidden, embed_input=embed_fn(cur_ids), freqs_cis=freqs_cis, **block_kwargs)
             per_depth_logits.append(lm_head(hidden))
         return per_depth_logits
 
