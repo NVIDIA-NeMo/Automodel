@@ -25,8 +25,8 @@ TieSupport.UNTIED_ONLY`` and is validated by
 import pytest
 from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.qwen3_moe.model import Qwen3MoeForCausalLM
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.qwen3_moe.model import Qwen3MoeForCausalLM
 
 
 def _tiny_config(tie_word_embeddings: bool) -> Qwen3MoeConfig:

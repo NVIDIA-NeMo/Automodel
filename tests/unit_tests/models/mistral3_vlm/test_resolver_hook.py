@@ -24,9 +24,9 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 # Importing the package installs the hook (idempotent).
-import nemo_automodel.components.models.mistral3_vlm  # noqa: F401
+import nemo_automodel._transformers.models.mistral3_vlm  # noqa: F401
 from nemo_automodel._transformers import model_init as _mi
-from nemo_automodel.components.models.mistral3_vlm.model import (
+from nemo_automodel._transformers.models.mistral3_vlm.model import (
     Mistral3FP8VLMForConditionalGeneration,
 )
 
@@ -64,7 +64,7 @@ class TestHookInstallation:
     def test_reimport_is_idempotent(self):
         before = _mi._resolve_custom_model_cls_for_config
         # The package's _install_resolver_hook short-circuits if already installed.
-        from nemo_automodel.components.models.mistral3_vlm import _install_resolver_hook
+        from nemo_automodel._transformers.models.mistral3_vlm import _install_resolver_hook
 
         _install_resolver_hook()
         assert _mi._resolve_custom_model_cls_for_config is before

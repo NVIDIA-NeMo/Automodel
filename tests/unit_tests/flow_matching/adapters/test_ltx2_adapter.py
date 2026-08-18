@@ -30,13 +30,13 @@ import pytest
 import torch
 import torch.nn as nn
 
-import nemo_automodel.components.flow_matching.adapters.ltx2 as ltx2_module
+import nemo_automodel._diffusers.models.ltx2.adapter as ltx2_module
 from nemo_automodel.components.flow_matching.adapters import (
     FlowMatchingContext,
     LTX2Adapter,
     SimpleAdapter,
 )
-from nemo_automodel.components.flow_matching.adapters.ltx2 import (
+from nemo_automodel._diffusers.models.ltx2.adapter import (
     _pack_audio_latents,
     _pack_video_latents,
     _unpack_audio_latents,

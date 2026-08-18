@@ -17,9 +17,9 @@
 import pytest
 import torch
 
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.mistral4.configuration import Mistral4Config
-from nemo_automodel.components.models.mistral4.model import (
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.mistral4.configuration import Mistral4Config
+from nemo_automodel._transformers.models.mistral4.model import (
     _HF_MISTRAL3_AVAILABLE,
     Mistral4ForCausalLM,
 )
@@ -82,7 +82,7 @@ def test_text_initialize_weights_bf16_keeps_router_bias_fp32() -> None:
 def test_multimodal_initialize_weights_bf16_keeps_router_bias_fp32() -> None:
     from transformers.models.mistral3.configuration_mistral3 import Mistral3Config
 
-    from nemo_automodel.components.models.mistral4.model import Mistral3ForConditionalGeneration
+    from nemo_automodel._transformers.models.mistral4.model import Mistral3ForConditionalGeneration
 
     config = Mistral3Config(
         text_config=_tiny_text_config().to_dict(),

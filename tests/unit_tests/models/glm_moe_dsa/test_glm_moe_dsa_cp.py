@@ -21,7 +21,7 @@ import contextlib
 import pytest
 import torch
 
-from nemo_automodel.components.models.glm_moe_dsa import cp as glm_cp
+from nemo_automodel._transformers.models.glm_moe_dsa import cp as glm_cp
 
 
 class _FakeMesh:

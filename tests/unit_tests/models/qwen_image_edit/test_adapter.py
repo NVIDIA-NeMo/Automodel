@@ -19,8 +19,8 @@ from __future__ import annotations
 import pytest
 import torch
 
+from nemo_automodel._diffusers.models.qwen_image_edit.adapter import QwenImageEditAdapter
 from nemo_automodel.components.flow_matching.adapters.base import FlowMatchingContext
-from nemo_automodel.components.models.qwen_image_edit.adapter import QwenImageEditAdapter
 
 
 def _make_context(

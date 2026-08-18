@@ -344,7 +344,7 @@ class BaseRecipe:
             # Models without it (e.g. diffusers) would use their native save_pretrained which fails on
             # FSDP2-sharded DTensors, so fall back to checkpointer.save_model directly.
             if hasattr(unwrapped_model, "save_pretrained") and hasattr(unwrapped_model.save_pretrained, "__func__"):
-                from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+                from nemo_automodel._transformers.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 
                 if isinstance(unwrapped_model, HFCheckpointingMixin):
                     unwrapped_model.save_pretrained(

@@ -18,8 +18,8 @@ import pytest
 import torch
 from transformers.models.glm4_moe.configuration_glm4_moe import Glm4MoeConfig
 
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.glm4_moe.model import Block, Glm4MoeForCausalLM, Glm4MoeModel
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.glm4_moe.model import Block, Glm4MoeForCausalLM, Glm4MoeModel
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.layers import MLP, MoE
 
@@ -288,7 +288,9 @@ class TestGlm4MoeModel:
             with patch.object(
                 Block, "forward", side_effect=lambda *_, **kwargs: torch.randn(batch, seq_len, glm_config.hidden_size)
             ):
-                with patch("nemo_automodel.components.models.glm4_moe.model.position_ids_to_freqs_cis") as mock_freqs:
+                with patch(
+                    "nemo_automodel._transformers.models.glm4_moe.model.position_ids_to_freqs_cis"
+                ) as mock_freqs:
                     mock_freqs.return_value = torch.randn(
                         batch, seq_len, int(glm_config.head_dim * glm_config.partial_rotary_factor)
                     )
@@ -328,7 +330,7 @@ class TestGlm4MoeModel:
             "_compute_concentration_and_inv_freq",
             return_value=(1.0, torch.ones(glm_config.head_dim // 2)),
         ):
-            with patch("nemo_automodel.components.models.glm4_moe.model.position_ids_to_freqs_cis") as mock_freqs:
+            with patch("nemo_automodel._transformers.models.glm4_moe.model.position_ids_to_freqs_cis") as mock_freqs:
                 mock_freqs.return_value = torch.randn(
                     batch, seq_len, int(glm_config.head_dim * glm_config.partial_rotary_factor)
                 )
@@ -388,7 +390,7 @@ class TestGlm4MoeForCausalLM:
         input_ids = torch.randint(0, glm_config.vocab_size, (batch, seq_len), device=device)
 
         with (
-            patch("nemo_automodel.components.models.glm4_moe.model.squeeze_input_for_thd") as mock_squeeze,
+            patch("nemo_automodel._transformers.models.glm4_moe.model.squeeze_input_for_thd") as mock_squeeze,
             patch.object(
                 model.model,
                 "forward",
@@ -515,7 +517,7 @@ class TestGlm4MoeModelClassmethods:
 
     def test_modelclass_export_exists(self):
         """Ensure ModelClass pointer is defined and points to class."""
-        from nemo_automodel.components.models.glm4_moe import model as glm_mod
+        from nemo_automodel._transformers.models.glm4_moe import model as glm_mod
 
         assert hasattr(glm_mod, "ModelClass")
         assert glm_mod.ModelClass is Glm4MoeForCausalLM

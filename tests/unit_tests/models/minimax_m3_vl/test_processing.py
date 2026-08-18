@@ -25,9 +25,9 @@ file is absent.
 from types import SimpleNamespace
 from unittest import mock
 
-from nemo_automodel.components.models.minimax_m3_vl.processing import build_minimax_m3_vl_processor
+from nemo_automodel._transformers.models.minimax_m3_vl.processing import build_minimax_m3_vl_processor
 
-_PROCESSING = "nemo_automodel.components.models.minimax_m3_vl.processing.AutoProcessor"
+_PROCESSING = "nemo_automodel._transformers.models.minimax_m3_vl.processing.AutoProcessor"
 
 
 @mock.patch(_PROCESSING)
@@ -78,7 +78,7 @@ def test_reattaches_chat_template_from_hub_cache(mock_auto_processor, mock_hf_hu
     mock_hf_hub_download.return_value = "/cache/MiniMax-M3/chat_template.jinja"
 
     with mock.patch(
-        "nemo_automodel.components.models.minimax_m3_vl.processing.os.path.isfile",
+        "nemo_automodel._transformers.models.minimax_m3_vl.processing.os.path.isfile",
         return_value=False,
     ), mock.patch(
         "builtins.open",

@@ -32,8 +32,8 @@ from transformers.models.qwen3_5.configuration_qwen3_5 import (
     Qwen3_5VisionConfig,
 )
 
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.qwen3_5.model import (
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.qwen3_5.model import (
     Qwen3_5ForCausalLM,
     Qwen3_5ForConditionalGeneration,
 )

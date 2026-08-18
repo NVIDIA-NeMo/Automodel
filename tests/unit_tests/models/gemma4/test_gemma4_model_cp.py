@@ -24,8 +24,8 @@ from unittest import mock
 import pytest
 import torch
 
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.gemma4_moe.model import (
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.gemma4_moe.model import (
     Gemma4Config,
     Gemma4ForConditionalGeneration,
     Gemma4TextConfig,
@@ -403,7 +403,7 @@ def test_backend_forward_vision_without_mm_synthesizes_zeros():
 def test_decoder_forward_flex_kernel_options_and_padding_branches():
     from unittest.mock import patch
 
-    from nemo_automodel.components.models.gemma4_moe.model import Gemma4MoEDecoderLayer
+    from nemo_automodel._transformers.models.gemma4_moe.model import Gemma4MoEDecoderLayer
     from nemo_automodel.components.moe.layers import MoEConfig
 
     tc = _text_config()
@@ -620,7 +620,7 @@ def test_cp_shard_batch_aux_only_installs_ring_records_mesh_then_delegates(monke
         return sentinel
 
     monkeypatch.setattr(
-        "nemo_automodel.components.models.gemma4_moe.model.make_contiguous_aux_only_shard_cp_batch_and_ctx",
+        "nemo_automodel._transformers.models.gemma4_moe.model.make_contiguous_aux_only_shard_cp_batch_and_ctx",
         fake_shard,
     )
 

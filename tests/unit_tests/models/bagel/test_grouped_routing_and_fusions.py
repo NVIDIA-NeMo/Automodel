@@ -34,11 +34,11 @@ from __future__ import annotations
 import pytest
 import torch
 
-MODELING = "nemo_automodel.components.models.bagel.modeling_qwen2_packed"
+MODELING = "nemo_automodel._transformers.models.bagel.modeling_qwen2_packed"
 
 
 def _mot_config():
-    from nemo_automodel.components.models.bagel.modeling_qwen2_packed import Qwen2Config
+    from nemo_automodel._transformers.models.bagel.modeling_qwen2_packed import Qwen2Config
 
     return Qwen2Config(
         vocab_size=32,
@@ -58,8 +58,8 @@ def _mot_config():
 
 def test_fused_swiglu_matches_eager():
     """``Qwen2MLP`` with the fused SwiGLU kernel matches the eager path exactly."""
-    from nemo_automodel.components.models.bagel.configuration import BagelBackendConfig
-    from nemo_automodel.components.models.bagel.modeling_qwen2_packed import Qwen2MLP
+    from nemo_automodel._transformers.models.bagel.configuration import BagelBackendConfig
+    from nemo_automodel._transformers.models.bagel.modeling_qwen2_packed import Qwen2MLP
 
     # The backend flag drives the fused path.
     assert Qwen2MLP(_mot_config(), backend=BagelBackendConfig(fused_swiglu=True))._fuse_silu_mul is True
@@ -79,7 +79,7 @@ def test_fused_swiglu_matches_eager():
 
 def test_fused_rope_matches_eager():
     """The fused rotary apply (``fused=True``) matches the eager path."""
-    from nemo_automodel.components.models.bagel.modeling_qwen2_packed import apply_rotary_pos_emb
+    from nemo_automodel._transformers.models.bagel.modeling_qwen2_packed import apply_rotary_pos_emb
 
     torch.manual_seed(0)
     n, heads, kv_heads, head_dim = 8, 4, 2, 16
@@ -141,7 +141,7 @@ def test_grouped_routing_matches_default():
     inputs + ``mot_perm``/``mot_inv`` and un-permuting the output must reproduce
     the default (interleaved gather/scatter) output.
     """
-    from nemo_automodel.components.models.bagel.modeling_qwen2_packed import Qwen2MoTDecoderLayer
+    from nemo_automodel._transformers.models.bagel.modeling_qwen2_packed import Qwen2MoTDecoderLayer
 
     device = "cuda"
     cfg = _mot_config()

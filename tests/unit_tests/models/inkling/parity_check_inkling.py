@@ -25,9 +25,9 @@ Run directly:  python tests/unit_tests/models/inkling/parity_check_inkling.py
 import torch
 import torch.nn.functional as F
 
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.inkling.configuration import InklingConfig
-from nemo_automodel.components.models.inkling.model import InklingForConditionalGeneration
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.inkling.configuration import InklingConfig
+from nemo_automodel._transformers.models.inkling.model import InklingForConditionalGeneration
 
 
 def build_tiny_config() -> InklingConfig:

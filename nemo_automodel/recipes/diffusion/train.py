@@ -711,7 +711,7 @@ class TrainDiffusionRecipe(BaseRecipe):
             )
 
         if self.optimize_hunyuan_flash_varlen_mask:
-            from nemo_automodel.components.flow_matching.adapters.hunyuan import (
+            from nemo_automodel._diffusers.models.hunyuan.adapter import (
                 enable_hunyuan_flash_varlen_mask_optimization,
             )
 

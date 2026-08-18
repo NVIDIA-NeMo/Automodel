@@ -20,7 +20,7 @@ import pytest
 import torch
 
 from nemo_automodel.components.flow_matching.adapters.base import FlowMatchingContext
-from nemo_automodel.components.flow_matching.adapters.flux import FluxAdapter
+from nemo_automodel._diffusers.models.flux.adapter import FluxAdapter
 
 
 # =============================================================================

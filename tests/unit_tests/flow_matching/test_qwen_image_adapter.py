@@ -20,7 +20,7 @@ import pytest
 import torch
 
 from nemo_automodel.components.flow_matching.adapters.base import FlowMatchingContext
-from nemo_automodel.components.flow_matching.adapters.qwen_image import (
+from nemo_automodel._diffusers.models.qwen_image.adapter import (
     QwenImageAdapter,
 )
 

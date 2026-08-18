@@ -18,7 +18,7 @@ shared ``_resolve_custom_model_cls_for_config`` entry point."""
 from types import SimpleNamespace
 
 from nemo_automodel._transformers.model_init import _resolve_custom_model_cls_for_config
-from nemo_automodel.components.models.hy_mt2.dispatch import is_hy_mt2_config
+from nemo_automodel._transformers.models.hy_mt2.dispatch import is_hy_mt2_config
 
 
 def _hy_mt2_config() -> SimpleNamespace:
@@ -74,11 +74,11 @@ class TestHyMT2ModelResolution:
     """Hy-MT2 shares ``HYV3ForCausalLM`` metadata but needs its own implementation."""
 
     def test_hy_mt2_config_resolves_to_hy_mt2_model(self):
-        from nemo_automodel.components.models.hy_mt2.model import HyMT2ForCausalLM
+        from nemo_automodel._transformers.models.hy_mt2.model import HyMT2ForCausalLM
 
         assert _resolve_custom_model_cls_for_config(_hy_mt2_config()) is HyMT2ForCausalLM
 
     def test_hy_v3_config_still_resolves_to_hy_v3_model(self):
-        from nemo_automodel.components.models.hy_v3.model import HYV3ForCausalLM
+        from nemo_automodel._transformers.models.hy_v3.model import HYV3ForCausalLM
 
         assert _resolve_custom_model_cls_for_config(_hy3_preview_config()) is HYV3ForCausalLM

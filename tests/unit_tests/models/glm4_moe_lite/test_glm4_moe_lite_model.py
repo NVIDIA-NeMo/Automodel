@@ -18,8 +18,8 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from nemo_automodel.components.models.common.utils import BackendConfig
-from nemo_automodel.components.models.glm4_moe_lite.model import (
+from nemo_automodel._transformers.models.common.utils import BackendConfig
+from nemo_automodel._transformers.models.glm4_moe_lite.model import (
     Block,
     Glm4MoeLiteForCausalLM,
     Glm4MoeLiteModel,
@@ -131,7 +131,7 @@ class TestBlock:
     def test_block_initializes_with_mla_attention(self, config, moe_config, backend_config):
         block = Block(layer_idx=1, config=config, moe_config=moe_config, backend=backend_config)
 
-        from nemo_automodel.components.models.deepseek_v3.layers import MLA
+        from nemo_automodel._transformers.models.deepseek_v3.layers import MLA
 
         assert isinstance(block.self_attn, MLA)
 
@@ -342,7 +342,7 @@ class TestGlm4MoeLiteForCausalLM:
 
 class TestModelClass:
     def test_modelclass_export_exists(self):
-        from nemo_automodel.components.models.glm4_moe_lite import model as glm4_moe_lite_mod
+        from nemo_automodel._transformers.models.glm4_moe_lite import model as glm4_moe_lite_mod
 
         assert hasattr(glm4_moe_lite_mod, "ModelClass")
         assert glm4_moe_lite_mod.ModelClass is Glm4MoeLiteForCausalLM

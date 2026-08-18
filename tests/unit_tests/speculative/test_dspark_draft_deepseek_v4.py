@@ -23,7 +23,7 @@ three-term objective, mirroring ``test_dspark_draft.py``.
 import pytest
 import torch
 
-from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
+from nemo_automodel._transformers.models.deepseek_v4.config import DeepseekV4Config
 from nemo_automodel.components.speculative.dspark.config import build_deepseek_v4_draft_config
 from nemo_automodel.components.speculative.dspark.draft_deepseek_v4 import DeepseekV4DSparkModel
 from nemo_automodel.components.speculative.dspark.loss import compute_dspark_loss

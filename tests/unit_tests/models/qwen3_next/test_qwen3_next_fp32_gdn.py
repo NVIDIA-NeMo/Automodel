@@ -10,8 +10,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers.models.qwen3_next.configuration_qwen3_next import Qwen3NextConfig
 
-from nemo_automodel.components.models.common.gated_delta_net_fp32 import HOLDER_NAME
-from nemo_automodel.components.models.qwen3_next.layers import Qwen3NextFp32GatedDeltaNet
+from nemo_automodel._transformers.models.common.gated_delta_net_fp32 import HOLDER_NAME
+from nemo_automodel._transformers.models.qwen3_next.layers import Qwen3NextFp32GatedDeltaNet
 
 
 def _bare_gdn(num_v: int = 4, dtype: torch.dtype = torch.float32) -> Qwen3NextFp32GatedDeltaNet:

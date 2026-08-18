@@ -36,7 +36,7 @@ import sys
 import torch
 import torch.distributed as dist
 
-from nemo_automodel.components.models.common.mtp import shift_packed_tensor
+from nemo_automodel._transformers.models.common.mtp import shift_packed_tensor
 
 
 def dual_chunk_swap_unsplit(chunks_per_rank, cp_size, seq_dim=1):
@@ -131,7 +131,7 @@ class MockHybridConfig:
 
 def _create_baseline_model(config, backend, device):
     """Create and sync a baseline model (CP=1)."""
-    from nemo_automodel.components.models.nemotron_v3.model import NemotronV3Model
+    from nemo_automodel._transformers.models.nemotron_v3.model import NemotronV3Model
 
     model = NemotronV3Model(config, backend=backend).to(device=device, dtype=torch.bfloat16)
     model.train()
@@ -142,7 +142,7 @@ def _create_baseline_model(config, backend, device):
 
 def _create_cp_model(config, backend, baseline_model, device):
     """Create a CP model with weights copied from baseline."""
-    from nemo_automodel.components.models.nemotron_v3.model import NemotronV3Model
+    from nemo_automodel._transformers.models.nemotron_v3.model import NemotronV3Model
 
     model = NemotronV3Model(config, backend=backend).to(device=device, dtype=torch.bfloat16)
     model.train()
@@ -261,7 +261,7 @@ def run_bshd_te(rank, world_size, device, config):
     """Config 1: 3D BSHD input with TE p2p CP and DualChunkSwap."""
     from torch.distributed.device_mesh import init_device_mesh
 
-    from nemo_automodel.components.models.common import BackendConfig
+    from nemo_automodel._transformers.models.common import BackendConfig
 
     backend = BackendConfig(linear="torch", attn="te", rms_norm="torch", enable_hf_state_dict_adapter=False)
 
@@ -326,7 +326,7 @@ def run_thd_te(rank, world_size, device, config):
     """Config 2: 2D THD input with TE p2p CP and DualChunkSwap."""
     from torch.distributed.device_mesh import init_device_mesh
 
-    from nemo_automodel.components.models.common import BackendConfig
+    from nemo_automodel._transformers.models.common import BackendConfig
 
     backend = BackendConfig(linear="torch", attn="te", rms_norm="torch", enable_hf_state_dict_adapter=False)
 
@@ -396,7 +396,7 @@ def run_thd_te_packed(rank, world_size, device, config):
     """Config 3: 2D THD with TE p2p CP, multi-sequence packing, and seq_idx."""
     from torch.distributed.device_mesh import init_device_mesh
 
-    from nemo_automodel.components.models.common import BackendConfig
+    from nemo_automodel._transformers.models.common import BackendConfig
 
     backend = BackendConfig(linear="torch", attn="te", rms_norm="torch", enable_hf_state_dict_adapter=False)
 
@@ -485,7 +485,7 @@ def run_bshd_sdpa(rank, world_size, device, config):
     from torch.distributed.tensor.experimental._attention import context_parallel_unshard, set_rotate_method
     from torch.nn.attention import SDPBackend, sdpa_kernel
 
-    from nemo_automodel.components.models.common import BackendConfig
+    from nemo_automodel._transformers.models.common import BackendConfig
 
     backend = BackendConfig(linear="torch", attn="sdpa", rms_norm="torch", enable_hf_state_dict_adapter=False)
 
@@ -594,7 +594,7 @@ def _gather_te_partition(local_tensor, local_indices, full_tokens, cp_group):
 
 def _create_mtp_model(config, backend, device):
     """Create a synchronized causal LM with its native Nemotron MTP head."""
-    from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
+    from nemo_automodel._transformers.models.nemotron_v3.model import NemotronHForCausalLM
 
     model = NemotronHForCausalLM(config, backend=backend).to(device=device, dtype=torch.bfloat16)
     model.initialize_weights(buffer_device=device, dtype=torch.bfloat16)
@@ -610,9 +610,9 @@ def run_thd_te_mtp(rank, world_size, device, config):
     import transformer_engine_torch as tex
     from torch.distributed.device_mesh import init_device_mesh
 
+    from nemo_automodel._transformers.models.common import BackendConfig
     from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
     from nemo_automodel.components.loss.mtp import calculate_mtp_loss
-    from nemo_automodel.components.models.common import BackendConfig
 
     backend = BackendConfig(
         linear="torch",
@@ -896,10 +896,10 @@ def run_bshd_sdpa_mtp(rank, world_size, device, config):
     from torch.distributed.tensor.experimental._attention import context_parallel_unshard, set_rotate_method
     from torch.nn.attention import SDPBackend, sdpa_kernel
 
+    from nemo_automodel._transformers.models.common import BackendConfig
+    from nemo_automodel._transformers.models.common.mtp import shift_packed_tensor
     from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
     from nemo_automodel.components.loss.mtp import calculate_mtp_loss
-    from nemo_automodel.components.models.common import BackendConfig
-    from nemo_automodel.components.models.common.mtp import shift_packed_tensor
 
     config.mtp_hybrid_override_pattern = "M"
     backend = BackendConfig(

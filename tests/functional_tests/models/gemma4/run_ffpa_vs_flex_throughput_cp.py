@@ -38,7 +38,7 @@ import torch
 import torch.distributed as dist
 from torch.nn.attention.flex_attention import flex_attention
 
-from nemo_automodel.components.models.gemma4_moe import cp_attention as cpa
+from nemo_automodel._transformers.models.gemma4_moe import cp_attention as cpa
 
 
 def _ctx(module, q, k, v, *, rank, cp_size, S_local, scale, Hq, Hkv, ids):

@@ -20,8 +20,8 @@ import pytest
 import torch
 from torch.utils.checkpoint import checkpoint
 
+from nemo_automodel._transformers.models.common import BackendConfig, MoKBackendConfig
 from nemo_automodel.components._peft.lora import PeftConfig, apply_lora_to_linear_modules, patch_moe_module
-from nemo_automodel.components.models.common import BackendConfig, MoKBackendConfig
 from nemo_automodel.components.moe import mok_experts
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.experts import GroupedExperts
@@ -78,7 +78,7 @@ def test_mok_backend_config_build_settings(monkeypatch: pytest.MonkeyPatch) -> N
                 captured.update(kwargs)
 
     monkeypatch.setattr(
-        "nemo_automodel.components.models.common.utils.safe_import",
+        "nemo_automodel._transformers.models.common.utils.safe_import",
         lambda *args, **kwargs: (True, FakeFunctional),
     )
     config = MoKBackendConfig(
@@ -289,9 +289,7 @@ def test_mok_rejects_lora_patching() -> None:
 
 
 @pytest.mark.parametrize("world_size", [1, 2, 3, 5, 6])
-def test_mok_requires_world_size_divisible_by_four(
-    monkeypatch: pytest.MonkeyPatch, world_size: int
-) -> None:
+def test_mok_requires_world_size_divisible_by_four(monkeypatch: pytest.MonkeyPatch, world_size: int) -> None:
     monkeypatch.setattr("nemo_automodel.components.moe.layers.get_world_size_safe", lambda: world_size)
 
     with pytest.raises(ValueError, match=rf"world size to be divisible by 4; got {world_size}"):

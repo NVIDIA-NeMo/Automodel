@@ -18,8 +18,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.step3p5.model import (
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.step3p5.model import (
     Block,
     Step3p5ForCausalLM,
     Step3p5Model,

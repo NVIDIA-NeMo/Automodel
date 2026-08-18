@@ -47,9 +47,9 @@ import torch.nn.functional as F
 
 
 def build_step3p7(device):
-    from nemo_automodel.components.models.common import BackendConfig
-    from nemo_automodel.components.models.step3p7.configuration_step3p7 import Step3p7Config
-    from nemo_automodel.components.models.step3p7.model import Step3p7ForConditionalGeneration
+    from nemo_automodel._transformers.models.common import BackendConfig
+    from nemo_automodel._transformers.models.step3p7.configuration_step3p7 import Step3p7Config
+    from nemo_automodel._transformers.models.step3p7.model import Step3p7ForConditionalGeneration
 
     layers = 4
     cfg = Step3p7Config(
@@ -70,9 +70,9 @@ def build_step3p7(device):
 
 
 def build_minimax(device):
-    from nemo_automodel.components.models.common import BackendConfig
-    from nemo_automodel.components.models.minimax_m3_vl.config import MiniMaxM3VLConfig
-    from nemo_automodel.components.models.minimax_m3_vl.model import MiniMaxM3SparseForConditionalGeneration
+    from nemo_automodel._transformers.models.common import BackendConfig
+    from nemo_automodel._transformers.models.minimax_m3_vl.config import MiniMaxM3VLConfig
+    from nemo_automodel._transformers.models.minimax_m3_vl.model import MiniMaxM3SparseForConditionalGeneration
 
     tiny = dict(
         hidden_size=64, intermediate_size=32, dense_intermediate_size=48, shared_intermediate_size=32,

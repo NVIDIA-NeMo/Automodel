@@ -16,8 +16,8 @@
 import pytest
 import torch
 
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.nemotron_v3.layers import (
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.nemotron_v3.layers import (
     NemotronV3Attention,
     NemotronV3Block,
 )
@@ -406,7 +406,7 @@ class TestNemotronV3MambaRMSNormGated:
 
     def test_gated_rmsnorm_init(self):
         """Test gated RMSNorm initialization."""
-        from nemo_automodel.components.models.nemotron_v3.layers import NemotronV3MambaRMSNormGated
+        from nemo_automodel._transformers.models.nemotron_v3.layers import NemotronV3MambaRMSNormGated
 
         hidden_size = 512
         group_size = 128
@@ -419,7 +419,7 @@ class TestNemotronV3MambaRMSNormGated:
     @skip_if_no_mamba
     def test_gated_rmsnorm_forward_requires_cuda(self):
         """Test that forward requires CUDA for Triton kernels."""
-        from nemo_automodel.components.models.nemotron_v3.layers import NemotronV3MambaRMSNormGated
+        from nemo_automodel._transformers.models.nemotron_v3.layers import NemotronV3MambaRMSNormGated
 
         hidden_size = 512
         group_size = 128
@@ -436,7 +436,7 @@ class TestNemotronV3Mamba2Mixer:
 
     def test_full_tensor_if_dtensor_clones_gathered_value(self, monkeypatch):
         """Gathered fp32 holder outputs must not alias storage FSDP may reshard."""
-        from nemo_automodel.components.models.nemotron_v3 import layers as layers_mod
+        from nemo_automodel._transformers.models.nemotron_v3 import layers as layers_mod
 
         full = torch.arange(4, dtype=torch.float32, requires_grad=True)
 
@@ -455,7 +455,7 @@ class TestNemotronV3Mamba2Mixer:
 
     def test_full_tensor_if_dtensor_clones_regular_tensor(self):
         """FSDP can reshard a regular-looking tensor returned from an fp32 holder."""
-        from nemo_automodel.components.models.nemotron_v3 import layers as layers_mod
+        from nemo_automodel._transformers.models.nemotron_v3 import layers as layers_mod
 
         tensor = torch.arange(4, dtype=torch.float32, requires_grad=True)
 
@@ -468,7 +468,7 @@ class TestNemotronV3Mamba2Mixer:
 
     def test_get_fp32_ssm_params_passes_reference(self, config):
         """FSDP2 root pre-forward expects a non-empty args tuple for the holder."""
-        from nemo_automodel.components.models.nemotron_v3.layers import NemotronV3Mamba2Mixer
+        from nemo_automodel._transformers.models.nemotron_v3.layers import NemotronV3Mamba2Mixer
 
         mixer = NemotronV3Mamba2Mixer(config, layer_idx=0)
         reference = torch.randn(1, 2, mixer.in_proj.out_features)
@@ -490,7 +490,7 @@ class TestNemotronV3Mamba2Mixer:
 
     def test_mamba2_mixer_init(self, config):
         """Test Mamba2Mixer initialization."""
-        from nemo_automodel.components.models.nemotron_v3.layers import NemotronV3Mamba2Mixer
+        from nemo_automodel._transformers.models.nemotron_v3.layers import NemotronV3Mamba2Mixer
 
         mixer = NemotronV3Mamba2Mixer(config, layer_idx=0)
 
@@ -505,7 +505,7 @@ class TestNemotronV3Mamba2Mixer:
 
     def test_mamba2_mixer_derived_dimensions(self, config):
         """Test Mamba2Mixer derived dimensions."""
-        from nemo_automodel.components.models.nemotron_v3.layers import NemotronV3Mamba2Mixer
+        from nemo_automodel._transformers.models.nemotron_v3.layers import NemotronV3Mamba2Mixer
 
         mixer = NemotronV3Mamba2Mixer(config, layer_idx=0)
 
@@ -517,7 +517,7 @@ class TestNemotronV3Mamba2Mixer:
 
     def test_mamba2_mixer_projection_sizes(self, config):
         """Test Mamba2Mixer projection dimensions."""
-        from nemo_automodel.components.models.nemotron_v3.layers import NemotronV3Mamba2Mixer
+        from nemo_automodel._transformers.models.nemotron_v3.layers import NemotronV3Mamba2Mixer
 
         mixer = NemotronV3Mamba2Mixer(config, layer_idx=0)
 
@@ -530,7 +530,7 @@ class TestNemotronV3Mamba2Mixer:
 
     def test_mamba2_mixer_ssm_parameters(self, config):
         """Test Mamba2Mixer SSM parameters."""
-        from nemo_automodel.components.models.nemotron_v3.layers import NemotronV3Mamba2Mixer
+        from nemo_automodel._transformers.models.nemotron_v3.layers import NemotronV3Mamba2Mixer
 
         mixer = NemotronV3Mamba2Mixer(config, layer_idx=0)
 
@@ -552,7 +552,7 @@ class TestNemotronV3Mamba2Mixer:
 
     def test_mamba2_mixer_conv1d(self, config):
         """Test Mamba2Mixer conv1d layer."""
-        from nemo_automodel.components.models.nemotron_v3.layers import NemotronV3Mamba2Mixer
+        from nemo_automodel._transformers.models.nemotron_v3.layers import NemotronV3Mamba2Mixer
 
         mixer = NemotronV3Mamba2Mixer(config, layer_idx=0)
 
@@ -667,7 +667,7 @@ class TestMambaMixerSeqIdxConstruction:
         monkeypatch.setitem(sys.modules, "mamba_ssm.ops.triton.ssd_combined", fake_ssd)
 
     def test_bshd_b_gt_1_with_cu_seqlens_yields_per_row_seq_idx(self, monkeypatch, config):
-        from nemo_automodel.components.models.nemotron_v3.layers import NemotronV3Mamba2Mixer
+        from nemo_automodel._transformers.models.nemotron_v3.layers import NemotronV3Mamba2Mixer
 
         mixer = NemotronV3Mamba2Mixer(config, layer_idx=0)
 
@@ -689,7 +689,7 @@ class TestMambaMixerSeqIdxConstruction:
     def test_bshd_b_eq_1_with_cu_seqlens_keeps_flat_construction(self, monkeypatch, config):
         """When B == 1 (THD flat layout), the legacy searchsorted construction
         still applies and should yield shape (1, S)."""
-        from nemo_automodel.components.models.nemotron_v3.layers import NemotronV3Mamba2Mixer
+        from nemo_automodel._transformers.models.nemotron_v3.layers import NemotronV3Mamba2Mixer
 
         mixer = NemotronV3Mamba2Mixer(config, layer_idx=0)
 
@@ -714,7 +714,7 @@ class TestMambaMixerSeqIdxConstruction:
         import sys
         import types
 
-        from nemo_automodel.components.models.nemotron_v3.layers import NemotronV3Mamba2Mixer
+        from nemo_automodel._transformers.models.nemotron_v3.layers import NemotronV3Mamba2Mixer
 
         mixer = NemotronV3Mamba2Mixer(config, layer_idx=0)
         calls: dict[str, object] = {}
@@ -787,7 +787,7 @@ class TestMambaMixerSeqIdxConstruction:
     def test_bshd_b_gt_1_passes_through_upstream_seq_idx(self, monkeypatch, config):
         """If seq_idx is supplied upstream (e.g. via _packed_seq_ids), the
         construction path must NOT override it — neat-packing semantics."""
-        from nemo_automodel.components.models.nemotron_v3.layers import NemotronV3Mamba2Mixer
+        from nemo_automodel._transformers.models.nemotron_v3.layers import NemotronV3Mamba2Mixer
 
         mixer = NemotronV3Mamba2Mixer(config, layer_idx=0)
 

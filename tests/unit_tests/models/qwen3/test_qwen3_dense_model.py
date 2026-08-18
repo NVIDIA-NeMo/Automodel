@@ -19,9 +19,9 @@ import torch
 from transformers import Qwen3Config
 from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM as HFQwen3ForCausalLM
 
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.qwen3.model import Qwen3ForCausalLM
-from nemo_automodel.components.models.qwen3.state_dict_adapter import Qwen3StateDictAdapter
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.qwen3.model import Qwen3ForCausalLM
+from nemo_automodel._transformers.models.qwen3.state_dict_adapter import Qwen3StateDictAdapter
 
 
 def _tiny_config() -> Qwen3Config:

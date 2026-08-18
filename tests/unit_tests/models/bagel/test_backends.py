@@ -7,8 +7,8 @@ import torch
 import torch.nn as nn
 from transformers import Qwen2Config
 
-from nemo_automodel.components.models.bagel.configuration import resolve_bagel_backend
-from nemo_automodel.components.models.bagel.modeling_qwen2_packed import (
+from nemo_automodel._transformers.models.bagel.configuration import resolve_bagel_backend
+from nemo_automodel._transformers.models.bagel.modeling_qwen2_packed import (
     Qwen2ForCausalLM,
     _apply_qk_norm,
 )
@@ -55,7 +55,7 @@ def test_bagel_backend_rejects_unknown_fields() -> None:
 
 
 def test_lm_head_uses_configured_linear_backend(monkeypatch) -> None:
-    import nemo_automodel.components.models.bagel.modeling_qwen2_packed as qwen_module
+    import nemo_automodel._transformers.models.bagel.modeling_qwen2_packed as qwen_module
 
     def _fake_initialize_linear_module(_backend, in_features, out_features, *, bias, dtype):
         del dtype
@@ -95,7 +95,7 @@ def test_te_mot_forward_backward_smoke() -> None:
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
 
-    from nemo_automodel.components.models.bagel.modeling_qwen2_packed import Qwen2MoTDecoderLayer
+    from nemo_automodel._transformers.models.bagel.modeling_qwen2_packed import Qwen2MoTDecoderLayer
 
     config = _config()
     config.freeze_und = False

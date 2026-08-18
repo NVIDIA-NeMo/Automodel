@@ -42,14 +42,14 @@ from transformers.models.phi3.modeling_phi3 import Phi3ForCausalLM
 from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
 from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM, Qwen3ForSequenceClassification
 
-from nemo_automodel.components.models.baichuan.model import BaichuanForCausalLM
-from nemo_automodel.components.models.llama.model import LlamaForCausalLM as CustomLlamaForCausalLM
-from nemo_automodel.components.models.mistral3_vlm.model import Mistral3FP8VLMForConditionalGeneration
-from nemo_automodel.components.models.qwen2.model import Qwen2ForCausalLM as CustomQwen2ForCausalLM
-from nemo_automodel.components.models.qwen3.model import Qwen3ForCausalLM as CustomQwen3ForCausalLM
+from nemo_automodel._transformers.models.baichuan.model import BaichuanForCausalLM
+from nemo_automodel._transformers.models.llama.model import LlamaForCausalLM as CustomLlamaForCausalLM
+from nemo_automodel._transformers.models.mistral3_vlm.model import Mistral3FP8VLMForConditionalGeneration
+from nemo_automodel._transformers.models.qwen2.model import Qwen2ForCausalLM as CustomQwen2ForCausalLM
+from nemo_automodel._transformers.models.qwen3.model import Qwen3ForCausalLM as CustomQwen3ForCausalLM
 
 if TYPE_CHECKING:
-    from nemo_automodel.components.models.mistral3.model import Ministral3ForCausalLM
+    from nemo_automodel._transformers.models.mistral3.model import Ministral3ForCausalLM
 
 
 class SequenceParallelAllGatherActivation(SequenceParallel):
@@ -730,8 +730,8 @@ PARALLELIZE_FUNCTIONS: Dict[str, Callable[..., Dict[str, ParallelStyle]]] = {
     "transformers.models.qwen3_5.modeling_qwen3_5.Qwen3_5ForConditionalGeneration": _parallelize_qwen3_5_vlm,
     # NeMo-native Qwen3.5 dense (custom-model port): same plan — shard self_attn +
     # MLP, leave the GatedDeltaNet (linear_attn) replicated.
-    "nemo_automodel.components.models.qwen3_5.model.Qwen3_5ForConditionalGeneration": _parallelize_qwen3_5_vlm,
-    "nemo_automodel.components.models.qwen3_5.model.Qwen3_5ForCausalLM": _parallelize_qwen3_5_vlm,
+    "nemo_automodel._transformers.models.qwen3_5.model.Qwen3_5ForConditionalGeneration": _parallelize_qwen3_5_vlm,
+    "nemo_automodel._transformers.models.qwen3_5.model.Qwen3_5ForCausalLM": _parallelize_qwen3_5_vlm,
     # Falcon-H1 (hybrid Transformer + Mamba2). HF ships only a minimal
     # _tp_plan ({"lm_head": "colwise_gather_output"}) and names its MLP
     # "feed_forward", so the generic fallback plan leaves feed_forward replicated
@@ -742,7 +742,7 @@ PARALLELIZE_FUNCTIONS: Dict[str, Callable[..., Dict[str, ParallelStyle]]] = {
     "transformers.models.falcon_h1.modeling_falcon_h1.FalconH1ForCausalLM": _parallelize_falcon_h1,
     "FalconH1ForCausalLM": _parallelize_falcon_h1,
     _get_class_qualname(LlamaForCausalLM): _parallelize_llama,
-    "nemo_automodel.components.models.mistral3.model.Ministral3ForCausalLM": _parallelize_ministral3,
+    "nemo_automodel._transformers.models.mistral3.model.Ministral3ForCausalLM": _parallelize_ministral3,
     # Mistral3 VLM (Pixtral + Ministral3) — native HF class plus the Automodel
     # FP8-VLM subclass that owns FP8 dequant.
     _get_class_qualname(Mistral3ForConditionalGeneration): _parallelize_mistral3_vlm,
@@ -761,5 +761,5 @@ PARALLELIZE_FUNCTIONS: Dict[str, Callable[..., Dict[str, ParallelStyle]]] = {
     "NemotronFlashForCausalLM": _parallelize_llama,
     "DeciLMForCausalLM": _parallelize_decilm_nemotron,
     "NemotronLabsDiffusionModel": _parallelize_nemotron_labs_diffusion,
-    "nemo_automodel.components.models.muse_glimmer.model.MuseGlimmerForConditionalGeneration": _parallelize_muse_glimmer,
+    "nemo_automodel._transformers.models.muse_glimmer.model.MuseGlimmerForConditionalGeneration": _parallelize_muse_glimmer,
 }

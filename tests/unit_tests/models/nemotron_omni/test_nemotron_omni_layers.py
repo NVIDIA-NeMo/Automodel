@@ -25,7 +25,7 @@ suites — not here.
 import pytest
 import torch
 
-from nemo_automodel.components.models.nemotron_omni.model import (
+from nemo_automodel._transformers.models.nemotron_omni.model import (
     NemotronOmniConfig,
     NemotronOmniForConditionalGeneration,
     RMSNorm,
@@ -188,7 +188,7 @@ def test_registry_entry_present():
     mapping = dict(MODEL_ARCH_MAPPING)
     assert "NemotronH_Nano_Omni_Reasoning_V3" in mapping
     module_path, class_name, *_ = mapping["NemotronH_Nano_Omni_Reasoning_V3"]
-    assert module_path == "nemo_automodel.components.models.nemotron_omni.model"
+    assert module_path == "nemo_automodel._transformers.models.nemotron_omni.model"
     assert class_name == "NemotronOmniForConditionalGeneration"
 
 

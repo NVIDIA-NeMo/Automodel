@@ -12,12 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib.util
 import sys
 import types
-import importlib.util
+from unittest.mock import Mock, patch
+
 import pytest
 import torch
-from unittest.mock import Mock, patch, MagicMock
 
 # Check if fast_hadamard_transform is available
 HADAMARD_AVAILABLE = False
@@ -32,13 +33,13 @@ except ImportError:
         mock_hadamard.hadamard_transform = lambda x, scale: x
         sys.modules['fast_hadamard_transform'] = mock_hadamard
 
-from nemo_automodel.components.models.deepseek_v32.config import DeepseekV32Config
-from nemo_automodel.components.models.deepseek_v32.layers import (
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.deepseek_v32.config import DeepseekV32Config
+from nemo_automodel._transformers.models.deepseek_v32.layers import (
     DeepseekV32Indexer,
     DeepseekV32MLA,
     _rotate_activation,
 )
-from nemo_automodel.components.models.common import BackendConfig
 
 # Skip Transformer Engine tests by default unless explicitly enabled
 TE_AVAILABLE = False
@@ -88,7 +89,7 @@ class TestDeepseekV32IndexerInit:
             setattr(config, key, value)
         return config
 
-    @patch("nemo_automodel.components.models.deepseek_v32.layers.initialize_linear_module")
+    @patch("nemo_automodel._transformers.models.deepseek_v32.layers.initialize_linear_module")
     def test_indexer_initialization(self, mock_init_linear):
         """Test that indexer initializes correctly."""
         config = self.create_mock_config()
@@ -106,7 +107,7 @@ class TestDeepseekV32IndexerInit:
         assert indexer.q_lora_rank == 128
         assert indexer.hidden_size == 256
 
-    @patch("nemo_automodel.components.models.deepseek_v32.layers.initialize_linear_module")
+    @patch("nemo_automodel._transformers.models.deepseek_v32.layers.initialize_linear_module")
     def test_indexer_has_k_norm_layernorm(self, mock_init_linear):
         """Test that indexer uses LayerNorm (not RMSNorm) for k_norm."""
         config = self.create_mock_config()
@@ -120,7 +121,7 @@ class TestDeepseekV32IndexerInit:
         assert hasattr(indexer, 'k_norm')
         assert isinstance(indexer.k_norm, torch.nn.LayerNorm)
 
-    @patch("nemo_automodel.components.models.deepseek_v32.layers.initialize_linear_module")
+    @patch("nemo_automodel._transformers.models.deepseek_v32.layers.initialize_linear_module")
     def test_indexer_projections(self, mock_init_linear):
         """Test that indexer has required projection layers."""
         config = self.create_mock_config()
@@ -159,9 +160,9 @@ class TestDeepseekV32MLAInit:
             setattr(config, key, value)
         return config
 
-    @patch("nemo_automodel.components.models.deepseek_v32.layers.initialize_linear_module")
-    @patch("nemo_automodel.components.models.deepseek_v32.layers.initialize_rms_norm_module")
-    @patch("nemo_automodel.components.models.deepseek_v32.layers.initialize_attn_module_and_func")
+    @patch("nemo_automodel._transformers.models.deepseek_v32.layers.initialize_linear_module")
+    @patch("nemo_automodel._transformers.models.deepseek_v32.layers.initialize_rms_norm_module")
+    @patch("nemo_automodel._transformers.models.deepseek_v32.layers.initialize_attn_module_and_func")
     def test_mla_init_with_q_lora(self, mock_init_attn, mock_init_rms, mock_init_linear):
         """Test MLA initialization with q_lora (V3.2 always uses q_lora)."""
         config = self.create_mock_config()
@@ -188,9 +189,9 @@ class TestDeepseekV32MLAInit:
         assert hasattr(mla, 'indexer')
         assert isinstance(mla.indexer, DeepseekV32Indexer)
 
-    @patch("nemo_automodel.components.models.deepseek_v32.layers.initialize_linear_module")
-    @patch("nemo_automodel.components.models.deepseek_v32.layers.initialize_rms_norm_module")
-    @patch("nemo_automodel.components.models.deepseek_v32.layers.initialize_attn_module_and_func")
+    @patch("nemo_automodel._transformers.models.deepseek_v32.layers.initialize_linear_module")
+    @patch("nemo_automodel._transformers.models.deepseek_v32.layers.initialize_rms_norm_module")
+    @patch("nemo_automodel._transformers.models.deepseek_v32.layers.initialize_attn_module_and_func")
     def test_mla_attributes(self, mock_init_attn, mock_init_rms, mock_init_linear):
         """Test MLA has correct attribute values."""
         config = self.create_mock_config()
@@ -211,10 +212,10 @@ class TestDeepseekV32MLAInit:
         assert mla.v_head_dim == 32
         assert mla.index_topk == 16
 
-    @patch("nemo_automodel.components.models.deepseek_v32.layers.yarn_get_mscale")
-    @patch("nemo_automodel.components.models.deepseek_v32.layers.initialize_linear_module")
-    @patch("nemo_automodel.components.models.deepseek_v32.layers.initialize_rms_norm_module")
-    @patch("nemo_automodel.components.models.deepseek_v32.layers.initialize_attn_module_and_func")
+    @patch("nemo_automodel._transformers.models.deepseek_v32.layers.yarn_get_mscale")
+    @patch("nemo_automodel._transformers.models.deepseek_v32.layers.initialize_linear_module")
+    @patch("nemo_automodel._transformers.models.deepseek_v32.layers.initialize_rms_norm_module")
+    @patch("nemo_automodel._transformers.models.deepseek_v32.layers.initialize_attn_module_and_func")
     def test_mla_with_rope_scaling(self, mock_init_attn, mock_init_rms, mock_init_linear, mock_yarn_get_mscale):
         """Test MLA with rope_scaling configuration."""
         rope_scaling = {
@@ -262,9 +263,9 @@ class TestDeepseekV32MLASparseMask:
             setattr(config, key, value)
         return config
 
-    @patch("nemo_automodel.components.models.deepseek_v32.layers.initialize_linear_module")
-    @patch("nemo_automodel.components.models.deepseek_v32.layers.initialize_rms_norm_module")
-    @patch("nemo_automodel.components.models.deepseek_v32.layers.initialize_attn_module_and_func")
+    @patch("nemo_automodel._transformers.models.deepseek_v32.layers.initialize_linear_module")
+    @patch("nemo_automodel._transformers.models.deepseek_v32.layers.initialize_rms_norm_module")
+    @patch("nemo_automodel._transformers.models.deepseek_v32.layers.initialize_attn_module_and_func")
     def test_build_sparse_mask_bshd_format(self, mock_init_attn, mock_init_rms, mock_init_linear):
         """Test sparse mask building for bshd format."""
         config = self.create_mock_config()
@@ -293,9 +294,9 @@ class TestDeepseekV32MLASparseMask:
         # For SDPA (union_across_batches=False), shape should be [B, n_heads, S, S]
         assert sparse_mask.shape == (bsz, 8, seq_len, seq_len)
 
-    @patch("nemo_automodel.components.models.deepseek_v32.layers.initialize_linear_module")
-    @patch("nemo_automodel.components.models.deepseek_v32.layers.initialize_rms_norm_module")
-    @patch("nemo_automodel.components.models.deepseek_v32.layers.initialize_attn_module_and_func")
+    @patch("nemo_automodel._transformers.models.deepseek_v32.layers.initialize_linear_module")
+    @patch("nemo_automodel._transformers.models.deepseek_v32.layers.initialize_rms_norm_module")
+    @patch("nemo_automodel._transformers.models.deepseek_v32.layers.initialize_attn_module_and_func")
     def test_build_sparse_mask_union_across_batches(self, mock_init_attn, mock_init_rms, mock_init_linear):
         """Test sparse mask building with union across batches (for TE)."""
         config = self.create_mock_config()
@@ -323,9 +324,9 @@ class TestDeepseekV32MLASparseMask:
         # For TE (union_across_batches=True), shape should be [1, n_heads, S, S]
         assert sparse_mask.shape == (1, 8, seq_len, seq_len)
 
-    @patch("nemo_automodel.components.models.deepseek_v32.layers.initialize_linear_module")
-    @patch("nemo_automodel.components.models.deepseek_v32.layers.initialize_rms_norm_module")
-    @patch("nemo_automodel.components.models.deepseek_v32.layers.initialize_attn_module_and_func")
+    @patch("nemo_automodel._transformers.models.deepseek_v32.layers.initialize_linear_module")
+    @patch("nemo_automodel._transformers.models.deepseek_v32.layers.initialize_rms_norm_module")
+    @patch("nemo_automodel._transformers.models.deepseek_v32.layers.initialize_attn_module_and_func")
     def test_build_sparse_mask_thd_format(self, mock_init_attn, mock_init_rms, mock_init_linear):
         """Test sparse mask building for thd format."""
         config = self.create_mock_config()
@@ -380,9 +381,9 @@ class TestDeepseekV32MLAInitWeights:
         config = self.create_mock_config()
         backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch")
 
-        with patch("nemo_automodel.components.models.deepseek_v32.layers.initialize_linear_module") as mock_init_linear, \
-             patch("nemo_automodel.components.models.deepseek_v32.layers.initialize_rms_norm_module") as mock_init_rms, \
-             patch("nemo_automodel.components.models.deepseek_v32.layers.initialize_attn_module_and_func") as mock_init_attn:
+        with patch("nemo_automodel._transformers.models.deepseek_v32.layers.initialize_linear_module") as mock_init_linear, \
+             patch("nemo_automodel._transformers.models.deepseek_v32.layers.initialize_rms_norm_module") as mock_init_rms, \
+             patch("nemo_automodel._transformers.models.deepseek_v32.layers.initialize_attn_module_and_func") as mock_init_attn:
 
             mock_linear = Mock()
             mock_linear.weight = torch.randn(64, 256)
@@ -426,7 +427,7 @@ class TestDeepseekV32IndexerInitWeights:
         return config
 
     @patch("torch.nn.init.trunc_normal_")
-    @patch("nemo_automodel.components.models.deepseek_v32.layers.initialize_linear_module")
+    @patch("nemo_automodel._transformers.models.deepseek_v32.layers.initialize_linear_module")
     def test_indexer_init_weights(self, mock_init_linear, mock_trunc_normal):
         """Test Indexer weight initialization directly."""
         config = self.create_mock_config()
@@ -696,9 +697,9 @@ class TestBuildSparseMaskWithAttentionMask:
             setattr(config, key, value)
         return config
 
-    @patch("nemo_automodel.components.models.deepseek_v32.layers.initialize_linear_module")
-    @patch("nemo_automodel.components.models.deepseek_v32.layers.initialize_rms_norm_module")
-    @patch("nemo_automodel.components.models.deepseek_v32.layers.initialize_attn_module_and_func")
+    @patch("nemo_automodel._transformers.models.deepseek_v32.layers.initialize_linear_module")
+    @patch("nemo_automodel._transformers.models.deepseek_v32.layers.initialize_rms_norm_module")
+    @patch("nemo_automodel._transformers.models.deepseek_v32.layers.initialize_attn_module_and_func")
     def test_build_sparse_mask_combines_with_attention_mask(self, mock_init_attn, mock_init_rms, mock_init_linear):
         """Test that sparse mask is combined with attention mask."""
         config = self.create_mock_config()
@@ -748,7 +749,7 @@ class TestHadamardTransformFallback:
     def test_hadamard_transform_torch_basic(self):
         """Test basic hadamard transform functionality."""
         # Import the torch fallback implementation directly
-        from nemo_automodel.components.models.deepseek_v32 import layers
+        from nemo_automodel._transformers.models.deepseek_v32 import layers
 
         # Check if we're using the fallback
         if not layers._FAST_HADAMARD_AVAILABLE:
@@ -765,7 +766,7 @@ class TestHadamardTransformFallback:
 
     def test_hadamard_transform_torch_power_of_2(self):
         """Test that hadamard transform works with different power-of-2 sizes."""
-        from nemo_automodel.components.models.deepseek_v32 import layers
+        from nemo_automodel._transformers.models.deepseek_v32 import layers
 
         if not layers._FAST_HADAMARD_AVAILABLE:
             for n in [8, 16, 32, 64, 128]:
@@ -790,7 +791,7 @@ class TestRotateActivationEdgeCases:
 
     def test_rotate_activation_applies_scale(self):
         """Test that rotation applies the correct scale factor."""
-        from nemo_automodel.components.models.deepseek_v32 import layers
+        from nemo_automodel._transformers.models.deepseek_v32 import layers
 
         if not layers._FAST_HADAMARD_AVAILABLE:
             # With fallback, we can verify the scale is applied

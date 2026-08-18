@@ -1,0 +1,321 @@
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""
+HunyuanVideo model adapter for FlowMatching Pipeline.
+
+This adapter supports HunyuanVideo 1.5 style models with dual text encoders
+and image embeddings for image-to-video conditioning.
+"""
+
+import logging
+from typing import Any, Dict, Tuple
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from nemo_automodel.components.flow_matching.adapters.base import FlowMatchingContext, ModelAdapter
+from nemo_automodel.shared.import_utils import safe_import_from
+
+logger = logging.getLogger(__name__)
+
+
+def _is_flash_varlen_attention_backend(backend: Any) -> bool:
+    backend_name = getattr(backend, "value", backend)
+    return backend_name == "flash_varlen"
+
+
+def enable_hunyuan_flash_varlen_mask_optimization() -> bool:
+    """Patch Diffusers Hunyuan attention to avoid dense mask construction for flash-varlen attention."""
+    has_processor, processor_cls = safe_import_from(
+        "diffusers.models.transformers.transformer_hunyuan_video15",
+        "HunyuanVideo15AttnProcessor2_0",
+    )
+    has_dispatch, dispatch_attention_fn = safe_import_from(
+        "diffusers.models.attention_dispatch",
+        "dispatch_attention_fn",
+    )
+    has_rope, apply_rotary_emb = safe_import_from(
+        "diffusers.models.embeddings",
+        "apply_rotary_emb",
+    )
+    if not (has_processor and has_dispatch and has_rope):
+        logger.warning("Could not enable Hunyuan flash_varlen mask optimization because Diffusers imports failed.")
+        return False
+
+    if getattr(processor_cls, "_nemo_flash_varlen_mask_optimized", False):
+        return True
+
+    original_call = processor_cls.__call__
+
+    def _flash_varlen_mask_optimized_call(
+        self: Any,
+        attn: nn.Module,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        image_rotary_emb: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if attention_mask is None or not _is_flash_varlen_attention_backend(getattr(self, "_attention_backend", None)):
+            return original_call(
+                self,
+                attn,
+                hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                attention_mask=attention_mask,
+                image_rotary_emb=image_rotary_emb,
+            )
+
+        query = attn.to_q(hidden_states)
+        key = attn.to_k(hidden_states)
+        value = attn.to_v(hidden_states)
+
+        query = query.unflatten(2, (attn.heads, -1))
+        key = key.unflatten(2, (attn.heads, -1))
+        value = value.unflatten(2, (attn.heads, -1))
+
+        query = attn.norm_q(query)
+        key = attn.norm_k(key)
+
+        if image_rotary_emb is not None:
+            query = apply_rotary_emb(query, image_rotary_emb, sequence_dim=1)
+            key = apply_rotary_emb(key, image_rotary_emb, sequence_dim=1)
+
+        if encoder_hidden_states is not None:
+            encoder_query = attn.add_q_proj(encoder_hidden_states)
+            encoder_key = attn.add_k_proj(encoder_hidden_states)
+            encoder_value = attn.add_v_proj(encoder_hidden_states)
+
+            encoder_query = encoder_query.unflatten(2, (attn.heads, -1))
+            encoder_key = encoder_key.unflatten(2, (attn.heads, -1))
+            encoder_value = encoder_value.unflatten(2, (attn.heads, -1))
+
+            if attn.norm_added_q is not None:
+                encoder_query = attn.norm_added_q(encoder_query)
+            if attn.norm_added_k is not None:
+                encoder_key = attn.norm_added_k(encoder_key)
+
+            query = torch.cat([query, encoder_query], dim=1)
+            key = torch.cat([key, encoder_key], dim=1)
+            value = torch.cat([value, encoder_value], dim=1)
+
+        _, seq_len, _, _ = query.shape
+        attention_mask = F.pad(attention_mask, (seq_len - attention_mask.shape[1], 0), value=True).bool()
+
+        hidden_states = dispatch_attention_fn(
+            query,
+            key,
+            value,
+            attn_mask=attention_mask,
+            dropout_p=0.0,
+            is_causal=False,
+            backend=self._attention_backend,
+            parallel_config=self._parallel_config,
+        )
+
+        hidden_states = hidden_states.flatten(2, 3)
+        hidden_states = hidden_states.to(query.dtype)
+
+        if encoder_hidden_states is not None:
+            hidden_states, encoder_hidden_states = (
+                hidden_states[:, : -encoder_hidden_states.shape[1]],
+                hidden_states[:, -encoder_hidden_states.shape[1] :],
+            )
+
+            if getattr(attn, "to_out", None) is not None:
+                hidden_states = attn.to_out[0](hidden_states)
+                hidden_states = attn.to_out[1](hidden_states)
+
+            if getattr(attn, "to_add_out", None) is not None:
+                encoder_hidden_states = attn.to_add_out(encoder_hidden_states)
+
+        return hidden_states, encoder_hidden_states
+
+    processor_cls._nemo_original_call = original_call
+    processor_cls.__call__ = _flash_varlen_mask_optimized_call
+    processor_cls._nemo_flash_varlen_mask_optimized = True
+    return True
+
+
+class HunyuanAdapter(ModelAdapter):
+    """
+    Model adapter for HunyuanVideo 1.5 style models.
+
+    These models use:
+    - Condition latents concatenated with noisy latents
+    - Dual text encoders with attention masks
+    - Image embeddings for i2v
+
+    Expected batch keys:
+    - text_embeddings: Primary text encoder output [B, seq_len, dim]
+    - text_mask: Attention mask for primary encoder [B, seq_len] (optional)
+    - text_embeddings_2: Secondary text encoder output [B, seq_len, dim] (optional)
+    - text_mask_2: Attention mask for secondary encoder [B, seq_len] (optional)
+    - image_embeds: Image embeddings for i2v [B, seq_len, dim] (optional)
+
+    Example:
+        adapter = HunyuanAdapter()
+        pipeline = FlowMatchingPipelineV2(model_adapter=adapter)
+    """
+
+    def __init__(
+        self,
+        default_image_embed_shape: Tuple[int, int] = (729, 1152),
+        use_condition_latents: bool = True,
+    ):
+        """
+        Initialize the HunyuanAdapter.
+
+        Args:
+            default_image_embed_shape: Default shape for image embeddings (seq_len, dim)
+                when not provided in batch. Defaults to (729, 1152).
+            use_condition_latents: Whether to concatenate condition latents with
+                noisy latents. Defaults to True.
+        """
+        self.default_image_embed_shape = default_image_embed_shape
+        self.use_condition_latents = use_condition_latents
+
+    def get_condition_latents(self, latents: torch.Tensor, task_type: str) -> torch.Tensor:
+        """
+        Generate conditional latents based on task type.
+
+        Args:
+            latents: Input latents [B, C, F, H, W]
+            task_type: Task type ("t2v" or "i2v")
+
+        Returns:
+            Conditional latents [B, C+1, F, H, W]
+        """
+        b, c, f, h, w = latents.shape
+        cond = torch.zeros([b, c + 1, f, h, w], device=latents.device, dtype=latents.dtype)
+
+        if task_type == "t2v":
+            return cond
+        elif task_type == "i2v":
+            cond[:, :-1, :1] = latents[:, :, :1]
+            cond[:, -1, 0] = 1
+            return cond
+        else:
+            raise ValueError(f"Unsupported task type: {task_type}")
+
+    def prepare_inputs(self, context: FlowMatchingContext) -> Dict[str, Any]:
+        """
+        Prepare inputs for HunyuanVideo model.
+
+        Args:
+            context: FlowMatchingContext with batch data
+
+        Returns:
+            Dictionary containing:
+            - latents: Noisy latents (optionally concatenated with condition latents)
+            - timesteps: Timestep values
+            - encoder_hidden_states: Primary text embeddings
+            - encoder_attention_mask: Primary attention mask
+            - encoder_hidden_states_2: Secondary text embeddings
+            - encoder_attention_mask_2: Secondary attention mask
+            - image_embeds: Image embeddings
+        """
+        batch = context.batch
+        batch_size = context.noisy_latents.shape[0]
+        device = context.device
+        dtype = context.dtype
+
+        # Get text embeddings
+        text_embeddings = batch["text_embeddings"].to(device, dtype=dtype, non_blocking=True)
+        if text_embeddings.ndim == 2:
+            text_embeddings = text_embeddings.unsqueeze(0)
+
+        # Get optional elements
+        text_mask = batch.get("text_mask")
+        text_embeddings_2 = batch.get("text_embeddings_2")
+        text_mask_2 = batch.get("text_mask_2")
+
+        # Truncate text embeddings to valid (non-padding) tokens only.
+        # The HunyuanVideo15 token refiner uses self-attention with a mask
+        # derived from encoder_attention_mask.  Attention backends like flash
+        # attention silently drop this mask, causing the backward pass through
+        # padding positions to produce NaN gradients.  By removing padding
+        # tokens entirely the mask becomes all-ones and masking is unnecessary.
+        if text_mask is not None:
+            text_mask = text_mask.to(device, dtype=dtype, non_blocking=True)
+            valid_len = max(int(text_mask.sum(dim=-1).max().item()), 1)
+            text_embeddings = text_embeddings[:, :valid_len, :]
+            text_mask = text_mask[:, :valid_len]
+        if text_mask_2 is not None:
+            text_mask_2 = text_mask_2.to(device, dtype=dtype, non_blocking=True)
+            valid_len_2 = max(int(text_mask_2.sum(dim=-1).max().item()), 1)
+            text_mask_2 = text_mask_2[:, :valid_len_2]
+        if text_embeddings_2 is not None:
+            text_embeddings_2 = text_embeddings_2.to(device, dtype=dtype, non_blocking=True)
+            if text_mask_2 is not None:
+                text_embeddings_2 = text_embeddings_2[:, :valid_len_2, :]
+
+        # Handle image embeds for i2v
+        if context.task_type == "i2v" and "image_embeds" in batch:
+            image_embeds = batch["image_embeds"].to(device, dtype=dtype, non_blocking=True)
+        else:
+            seq_len, dim = self.default_image_embed_shape
+            image_embeds = torch.zeros(
+                batch_size,
+                seq_len,
+                dim,
+                dtype=dtype,
+                device=device,
+            )
+
+        # Prepare latents (with or without condition)
+        if self.use_condition_latents:
+            cond_latents = self.get_condition_latents(context.latents, context.task_type)
+            latents = torch.cat([context.noisy_latents, cond_latents], dim=1)
+        else:
+            latents = context.noisy_latents
+
+        return {
+            "latents": latents,
+            "timesteps": context.timesteps.to(dtype),
+            "encoder_hidden_states": text_embeddings,
+            "encoder_attention_mask": text_mask,
+            "encoder_hidden_states_2": text_embeddings_2,
+            "encoder_attention_mask_2": text_mask_2,
+            "image_embeds": image_embeds,
+            # Pass so @apply_lora_scale on HunyuanVideo15Transformer3DModel.forward()
+            # applies the correct LoRA scale. scale=1.0 = full contribution
+            # during training. At inference, set via attention_kwargs={"scale": s}.
+            "attention_kwargs": {"scale": 1.0},
+        }
+
+    def forward(self, model: nn.Module, inputs: Dict[str, Any]) -> torch.Tensor:
+        """
+        Execute forward pass for HunyuanVideo model.
+
+        Args:
+            model: HunyuanVideo model
+            inputs: Dictionary from prepare_inputs()
+
+        Returns:
+            Model prediction tensor
+        """
+        model_pred = model(
+            inputs["latents"],
+            inputs["timesteps"],
+            encoder_hidden_states=inputs["encoder_hidden_states"],
+            encoder_attention_mask=inputs["encoder_attention_mask"],
+            encoder_hidden_states_2=inputs["encoder_hidden_states_2"],
+            encoder_attention_mask_2=inputs["encoder_attention_mask_2"],
+            image_embeds=inputs["image_embeds"],
+            attention_kwargs=inputs.get("attention_kwargs"),
+            return_dict=False,
+        )
+        return self.post_process_prediction(model_pred)

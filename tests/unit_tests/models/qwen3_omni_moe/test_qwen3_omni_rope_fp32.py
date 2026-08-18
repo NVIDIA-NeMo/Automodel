@@ -15,9 +15,9 @@
 import torch
 from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.common.utils import cast_model_to_dtype
-from nemo_automodel.components.models.qwen3_omni_moe.model import Qwen3OmniMoeThinkerTextModel
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.common.utils import cast_model_to_dtype
+from nemo_automodel._transformers.models.qwen3_omni_moe.model import Qwen3OmniMoeThinkerTextModel
 
 
 def _backend() -> BackendConfig:

@@ -48,8 +48,8 @@ def init_distributed():
 
 def _run_packed_contiguous_case(config, cp_mesh, device):
     """Check packed GDN CP against the same layer's non-CP packed kernel."""
+    from nemo_automodel._transformers.models.qwen3_5_moe.cp_linear_attn import CPAwareGatedDeltaNet
     from nemo_automodel.components.distributed.blockdiag_cp import make_cp_blockdiag_batch_and_ctx
-    from nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn import CPAwareGatedDeltaNet
 
     rank = dist.get_rank()
     world_size = dist.get_world_size()
@@ -148,7 +148,7 @@ def run_test():
             print("ERROR: fla library is required but not installed", file=sys.stderr)
         return 1
 
-    from nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn import CPAwareGatedDeltaNet
+    from nemo_automodel._transformers.models.qwen3_5_moe.cp_linear_attn import CPAwareGatedDeltaNet
 
     # -- model config (small for testing) --
     config = Qwen3_5MoeTextConfig(

@@ -50,7 +50,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from nemo_automodel.components.models.gemma4_drafter.composite import (
+from nemo_automodel._transformers.models.gemma4_drafter.composite import (
     Gemma4JointOutput,
     Gemma4WithDrafter,
 )

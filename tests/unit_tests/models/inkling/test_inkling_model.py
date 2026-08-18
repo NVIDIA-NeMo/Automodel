@@ -20,17 +20,17 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.common.tie_word_embeddings import TieSupport
+from nemo_automodel._transformers.models.inkling.configuration import InklingConfig
+from nemo_automodel._transformers.models.inkling.layers import InklingDenseMLP, InklingMoE
+from nemo_automodel._transformers.models.inkling.model import InklingForConditionalGeneration
+from nemo_automodel._transformers.models.inkling.state_dict_adapter import _interleave
+from nemo_automodel._transformers.models.inkling.text import InklingAttention
 from nemo_automodel.components.datasets.vlm.collate_fns import (
     build_labels_from_template,
     default_collate_fn,
 )
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.common.tie_word_embeddings import TieSupport
-from nemo_automodel.components.models.inkling.configuration import InklingConfig
-from nemo_automodel.components.models.inkling.layers import InklingDenseMLP, InklingMoE
-from nemo_automodel.components.models.inkling.model import InklingForConditionalGeneration
-from nemo_automodel.components.models.inkling.state_dict_adapter import _interleave
-from nemo_automodel.components.models.inkling.text import InklingAttention
 
 from .parity_check_inkling import build_tiny_config
 
@@ -65,7 +65,7 @@ def test_sparse_layers_use_inkling_moe():
     for i, layer in enumerate(layers):
         if mlp_types[i] == "sparse":
             assert isinstance(layer.mlp, InklingMoE)
-            assert type(layer.mlp).__module__ == "nemo_automodel.components.models.inkling.layers"
+            assert type(layer.mlp).__module__ == "nemo_automodel._transformers.models.inkling.layers"
         else:
             assert isinstance(layer.mlp, InklingDenseMLP)
 
@@ -298,7 +298,7 @@ def test_native_state_dict_roundtrip_is_exact():
 
 
 def test_processor_builder_configures_padding(monkeypatch):
-    from nemo_automodel.components.models.inkling import processing
+    from nemo_automodel._transformers.models.inkling import processing
 
     class FakeProcessor:
         @classmethod
@@ -331,9 +331,9 @@ def test_native_processor_expands_image_and_audio_placeholders():
     from tokenizers.pre_tokenizers import WhitespaceSplit
     from transformers import PreTrainedTokenizerFast
 
-    from nemo_automodel.components.models.inkling.feature_extraction import InklingFeatureExtractor
-    from nemo_automodel.components.models.inkling.image_processing import InklingImageProcessor
-    from nemo_automodel.components.models.inkling.processing import InklingProcessor
+    from nemo_automodel._transformers.models.inkling.feature_extraction import InklingFeatureExtractor
+    from nemo_automodel._transformers.models.inkling.image_processing import InklingImageProcessor
+    from nemo_automodel._transformers.models.inkling.processing import InklingProcessor
 
     vocab = {
         "[UNK]": 0,

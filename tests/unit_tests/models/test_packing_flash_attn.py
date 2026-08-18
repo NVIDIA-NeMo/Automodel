@@ -25,7 +25,7 @@ import torch
 
 
 def test_get_seqlens_in_batch():
-    from nemo_automodel.components.models.common.packing import get_seqlens_in_batch
+    from nemo_automodel._transformers.models.common.packing import get_seqlens_in_batch
 
     mask = torch.tensor(
         [
@@ -38,7 +38,7 @@ def test_get_seqlens_in_batch():
 
 
 def test_get_unpad_data():
-    from nemo_automodel.components.models.common.packing import get_unpad_data
+    from nemo_automodel._transformers.models.common.packing import get_unpad_data
 
     mask = torch.tensor(
         [
@@ -55,7 +55,7 @@ def test_get_unpad_data():
 
 def test_get_unpad_data_single_doc():
     """Single document per batch element (no packing)."""
-    from nemo_automodel.components.models.common.packing import get_unpad_data
+    from nemo_automodel._transformers.models.common.packing import get_unpad_data
 
     mask = torch.tensor([[1, 1, 1, 1, 0, 0]])
     indices, cu_seqlens, max_seqlen = get_unpad_data(mask)
@@ -111,7 +111,7 @@ def test_configure_packing_patches():
 
     original_fn = flash_utils._get_unpad_data
 
-    from nemo_automodel.components.models.common.packing import configure_packing, get_unpad_data
+    from nemo_automodel._transformers.models.common.packing import configure_packing, get_unpad_data
 
     # Should not patch for sdpa
     configure_packing(attn_implementation="sdpa")
@@ -133,7 +133,7 @@ def test_flash_varlen_with_indexed_mask():
     except ImportError:
         pytest.skip("flash_attn not installed")
 
-    from nemo_automodel.components.models.common.packing import get_unpad_data
+    from nemo_automodel._transformers.models.common.packing import get_unpad_data
 
     B, S, H, D = 1, 12, 4, 64
     num_docs = 3

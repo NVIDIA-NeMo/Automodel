@@ -17,7 +17,7 @@ import math
 import pytest
 import torch
 
-from nemo_automodel.components.models.mimo_v2_flash.model import (
+from nemo_automodel._transformers.models.mimo_v2_flash.model import (
     MiMoV2FlashRotaryEmbedding,
     MiMoV2RMSNorm,
     _apply_rotary_pos_emb,

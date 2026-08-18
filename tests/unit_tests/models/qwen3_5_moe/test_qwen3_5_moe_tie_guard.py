@@ -20,7 +20,7 @@ pytest.importorskip("transformers.models.qwen3_5_moe")
 
 from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeTextConfig
 
-from nemo_automodel.components.models.qwen3_5_moe.model import Qwen3_5MoeForCausalLM
+from nemo_automodel._transformers.models.qwen3_5_moe.model import Qwen3_5MoeForCausalLM
 
 
 def test_qwen3_5_moe_causal_lm_rejects_tied_word_embeddings():

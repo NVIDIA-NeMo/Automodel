@@ -19,7 +19,7 @@ from types import SimpleNamespace
 import torch
 from torch import nn
 
-from nemo_automodel.components.models.bagel.hf_backbone_loader import initialize_bagel_non_backbone_weights
+from nemo_automodel._transformers.models.bagel.hf_backbone_loader import initialize_bagel_non_backbone_weights
 
 
 class _PositionEmbedding(nn.Module):

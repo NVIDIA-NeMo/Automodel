@@ -12,42 +12,67 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Adapter contract for the FlowMatching pipeline.
+
+This package owns the *contract* -- :class:`ModelAdapter` and
+:class:`FlowMatchingContext` -- which belongs to the flow-matching algorithm
+rather than to any one model.
+
+The per-model implementations live with their model, under
+``nemo_automodel._diffusers.models.<arch>.adapter``:
+
+===================  ==============================================
+``adapter_type``     module
+===================  ==============================================
+``hunyuan``          ``diffusers.models.hunyuan.adapter``
+``simple``           ``diffusers.models.wan.adapter`` (Wan)
+``flux``             ``diffusers.models.flux.adapter``
+``flux2``            ``diffusers.models.flux2.adapter``
+``qwen_image``       ``diffusers.models.qwen_image.adapter``
+``qwen_image_edit``  ``diffusers.models.qwen_image_edit.adapter``
+``ltx2``             ``diffusers.models.ltx2.adapter``
+===================  ==============================================
+
+Use ``create_adapter(adapter_type)`` from
+:mod:`nemo_automodel.components.flow_matching.pipeline` rather than importing a
+concrete adapter directly.  The adapter classes remain importable from here for
+backwards compatibility; they resolve lazily so that touching this package does
+not pull in every model's code.
 """
-Model adapters for FlowMatching Pipeline.
 
-This module provides model-specific adapters that decouple the flow matching
-logic from model-specific implementation details.
-
-Available Adapters:
-- ModelAdapter: Abstract base class for all adapters
-- HunyuanAdapter: For HunyuanVideo 1.5 style models
-- SimpleAdapter: For simple transformer models (e.g., Wan)
-- FluxAdapter: For FLUX.1 text-to-image models
-- QwenImageAdapter: For Qwen-Image text-to-image models
-- LTX2Adapter: For LTX-2 dual-stream video+audio models
-
-Usage:
-    from automodel.flow_matching.adapters import HunyuanAdapter, SimpleAdapter, FluxAdapter
-
-    # Or import the base class to create custom adapters
-    from automodel.flow_matching.adapters import ModelAdapter
-"""
+import importlib
+from typing import Any
 
 from .base import FlowMatchingContext, ModelAdapter
-from .flux import FluxAdapter
-from .flux2 import Flux2Adapter
-from .hunyuan import HunyuanAdapter
-from .ltx2 import LTX2Adapter
-from .qwen_image import QwenImageAdapter
-from .simple import SimpleAdapter
+
+# Adapter class name -> model package holding it.
+_RELOCATED_ADAPTERS = {
+    "FluxAdapter": "flux",
+    "Flux2Adapter": "flux2",
+    "HunyuanAdapter": "hunyuan",
+    "LTX2Adapter": "ltx2",
+    "QwenImageAdapter": "qwen_image",
+    "QwenImageEditAdapter": "qwen_image_edit",
+    "SimpleAdapter": "wan",
+}
 
 __all__ = [
     "FlowMatchingContext",
     "ModelAdapter",
-    "FluxAdapter",
-    "Flux2Adapter",
-    "HunyuanAdapter",
-    "LTX2Adapter",
-    "QwenImageAdapter",
-    "SimpleAdapter",
+    *sorted(_RELOCATED_ADAPTERS),
 ]
+
+
+def __getattr__(name: str) -> Any:
+    """Resolve a relocated adapter class on first access."""
+    package = _RELOCATED_ADAPTERS.get(name)
+    if package is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module = importlib.import_module(f"nemo_automodel._diffusers.models.{package}.adapter")
+    attr = getattr(module, name)
+    globals()[name] = attr
+    return attr
+
+
+def __dir__() -> list[str]:
+    return sorted(__all__)

@@ -18,8 +18,8 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.mimo_v2_flash.state_dict_adapter import (
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.mimo_v2_flash.state_dict_adapter import (
     NON_QUANTIZED_KEY_PATTERNS,
     MiMoV2FlashStateDictAdapter,
     _should_quantize_key,
@@ -143,7 +143,7 @@ class TestFromHf:
         }
         with patch.object(adapter, "_from_hf_w_merged_experts", side_effect=lambda sd, _: sd) as mock_merge:
             with patch(
-                "nemo_automodel.components.models.mimo_v2_flash.state_dict_adapter.dequantize_from_fp8",
+                "nemo_automodel._transformers.models.mimo_v2_flash.state_dict_adapter.dequantize_from_fp8",
                 side_effect=lambda w, _, dtype, name: w.to(dtype),
             ) as mock_dequant:
                 out = adapter.from_hf(hf_state)
@@ -224,7 +224,7 @@ class TestKPadScaleInv:
         # Mock the underlying scale_inv helper to return a 3-row tensor (< 8 rows)
         fake_scale_inv = torch.ones(3, 4)
         with patch(
-            "nemo_automodel.components.models.mimo_v2_flash.state_dict_adapter.create_scale_inv_for_weight",
+            "nemo_automodel._transformers.models.mimo_v2_flash.state_dict_adapter.create_scale_inv_for_weight",
             return_value=fake_scale_inv,
         ):
             weight = torch.zeros(32, 64)
@@ -242,7 +242,7 @@ class TestKPadScaleInv:
 
         fake_scale_inv = torch.ones(8, 4)
         with patch(
-            "nemo_automodel.components.models.mimo_v2_flash.state_dict_adapter.create_scale_inv_for_weight",
+            "nemo_automodel._transformers.models.mimo_v2_flash.state_dict_adapter.create_scale_inv_for_weight",
             return_value=fake_scale_inv,
         ):
             weight = torch.zeros(32, 64)
@@ -253,7 +253,7 @@ class TestKPadScaleInv:
         adapter = MiMoV2FlashStateDictAdapter(hf_config, moe_config, backend_config, dtype=torch.float32)
         fake_scale_inv = torch.ones(3, 4)
         with patch(
-            "nemo_automodel.components.models.mimo_v2_flash.state_dict_adapter.create_scale_inv_for_weight",
+            "nemo_automodel._transformers.models.mimo_v2_flash.state_dict_adapter.create_scale_inv_for_weight",
             return_value=fake_scale_inv,
         ):
             weight = torch.zeros(16, 64)
@@ -271,7 +271,7 @@ class TestDequantize:
             "model.embed_tokens.weight": torch.randn(4, 4),
         }
         with patch(
-            "nemo_automodel.components.models.mimo_v2_flash.state_dict_adapter.dequantize_from_fp8",
+            "nemo_automodel._transformers.models.mimo_v2_flash.state_dict_adapter.dequantize_from_fp8",
             side_effect=lambda w, _, dtype, name: torch.zeros(4, 4, dtype=dtype),
         ):
             out = adapter._dequantize(state)
@@ -318,7 +318,7 @@ class TestRoundTrip:
 
     @pytest.fixture
     def real_config(self):
-        from nemo_automodel.components.models.mimo_v2_flash.config import MiMoV2FlashConfig
+        from nemo_automodel._transformers.models.mimo_v2_flash.config import MiMoV2FlashConfig
 
         return MiMoV2FlashConfig(
             vocab_size=32,
@@ -360,7 +360,7 @@ class TestRoundTrip:
 
     @pytest.fixture
     def tiny_model(self, real_config, backend_config):
-        from nemo_automodel.components.models.mimo_v2_flash.model import MiMoV2FlashForCausalLM
+        from nemo_automodel._transformers.models.mimo_v2_flash.model import MiMoV2FlashForCausalLM
 
         torch.manual_seed(0)
         model = MiMoV2FlashForCausalLM(real_config, backend=backend_config)
@@ -420,7 +420,7 @@ class TestRoundTrip:
         # Disable FP8 quantization so the round-trip can be compared directly.
         # The FP8 path itself is tested by TestConvertSingleTensorToHf above.
         with patch(
-            "nemo_automodel.components.models.mimo_v2_flash.state_dict_adapter._should_quantize_key",
+            "nemo_automodel._transformers.models.mimo_v2_flash.state_dict_adapter._should_quantize_key",
             return_value=False,
         ):
             hf_sd = round_trip_adapter.to_hf(original_sd)

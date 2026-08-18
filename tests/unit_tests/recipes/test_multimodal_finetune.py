@@ -15,8 +15,8 @@
 import ast
 from pathlib import Path
 
+from nemo_automodel._transformers.models.bagel.configuration import BagelBackendConfig
 from nemo_automodel.components.config.loader import load_yaml_config
-from nemo_automodel.components.models.bagel.configuration import BagelBackendConfig
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 BAGEL_SFT_CONFIG_PATH = REPO_ROOT / "examples/multimodal_finetune/bagel/bagel_sft.yaml"

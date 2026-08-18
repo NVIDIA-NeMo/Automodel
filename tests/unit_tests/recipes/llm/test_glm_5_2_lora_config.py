@@ -16,9 +16,9 @@
 
 from pathlib import Path
 
+from nemo_automodel._transformers.models.common import BackendConfig
 from nemo_automodel.components.config.loader import load_yaml_config
 from nemo_automodel.components.datasets.utils import packed_sequence_thd_collater
-from nemo_automodel.components.models.common import BackendConfig
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 CONFIG_PATH = REPO_ROOT / "examples" / "llm_finetune" / "glm" / "glm_5.2_lora.yaml"

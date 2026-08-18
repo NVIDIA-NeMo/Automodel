@@ -30,7 +30,7 @@ import pytest
 import torch
 from torch.nn.attention.flex_attention import flex_attention as _eager_flex
 
-from nemo_automodel.components.models.gemma4_moe import cp_attention as cpa
+from nemo_automodel._transformers.models.gemma4_moe import cp_attention as cpa
 
 
 def _flex_module(sliding_window=None):

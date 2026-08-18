@@ -26,8 +26,8 @@ if "fast_hadamard_transform" not in sys.modules:
     mock_hadamard.hadamard_transform = lambda x, scale: x
     sys.modules["fast_hadamard_transform"] = mock_hadamard
 
-from nemo_automodel.components.models.deepseek_v32.config import DeepseekV32Config
-from nemo_automodel.components.models.deepseek_v32.model import DeepseekV32ForCausalLM
+from nemo_automodel._transformers.models.deepseek_v32.config import DeepseekV32Config
+from nemo_automodel._transformers.models.deepseek_v32.model import DeepseekV32ForCausalLM
 
 
 class TestDeepseekV32ModelUpdates:
@@ -69,7 +69,7 @@ class TestDeepseekV32ModelUpdates:
 
     def test_modelclass_export_exists(self):
         """Ensure ModelClass pointer is defined and points to class."""
-        from nemo_automodel.components.models.deepseek_v32 import model as dsv32_mod
+        from nemo_automodel._transformers.models.deepseek_v32 import model as dsv32_mod
 
         assert hasattr(dsv32_mod, "ModelClass")
         assert dsv32_mod.ModelClass is DeepseekV32ForCausalLM
@@ -145,8 +145,8 @@ class TestDeepseekV32Block:
 
     def test_block_with_dense_layer(self):
         """Test DeepseekV32Block initialization with dense layer (layer_idx < first_k_dense_replace)."""
-        from nemo_automodel.components.models.common import BackendConfig
-        from nemo_automodel.components.models.deepseek_v32.model import DeepseekV32Block
+        from nemo_automodel._transformers.models.common import BackendConfig
+        from nemo_automodel._transformers.models.deepseek_v32.model import DeepseekV32Block
 
         cfg = DeepseekV32Config(
             vocab_size=100,
@@ -190,8 +190,8 @@ class TestDeepseekV32Block:
 
     def test_block_with_moe_layer(self):
         """Test DeepseekV32Block initialization with MoE layer (layer_idx >= first_k_dense_replace)."""
-        from nemo_automodel.components.models.common import BackendConfig
-        from nemo_automodel.components.models.deepseek_v32.model import DeepseekV32Block
+        from nemo_automodel._transformers.models.common import BackendConfig
+        from nemo_automodel._transformers.models.deepseek_v32.model import DeepseekV32Block
 
         cfg = DeepseekV32Config(
             vocab_size=100,
@@ -233,8 +233,8 @@ class TestDeepseekV32Block:
 class TestDeepseekV32Model:
     def test_model_initialization(self):
         """Test DeepseekV32Model initialization."""
-        from nemo_automodel.components.models.common import BackendConfig
-        from nemo_automodel.components.models.deepseek_v32.model import DeepseekV32Model
+        from nemo_automodel._transformers.models.common import BackendConfig
+        from nemo_automodel._transformers.models.deepseek_v32.model import DeepseekV32Model
 
         cfg = DeepseekV32Config(
             vocab_size=100,
@@ -269,8 +269,8 @@ class TestDeepseekV32Model:
 
     def test_model_initialization_with_moe_config(self):
         """Test DeepseekV32Model initialization with explicit MoE config."""
-        from nemo_automodel.components.models.common import BackendConfig
-        from nemo_automodel.components.models.deepseek_v32.model import DeepseekV32Model
+        from nemo_automodel._transformers.models.common import BackendConfig
+        from nemo_automodel._transformers.models.deepseek_v32.model import DeepseekV32Model
         from nemo_automodel.components.moe.config import MoEConfig
 
         cfg = DeepseekV32Config(
@@ -321,7 +321,7 @@ class TestDeepseekV32Model:
 class TestDeepseekV32ForCausalLM:
     def test_from_config_with_explicit_backend(self):
         """Test from_config with explicit backend parameter."""
-        from nemo_automodel.components.models.common import BackendConfig
+        from nemo_automodel._transformers.models.common import BackendConfig
 
         cfg = DeepseekV32Config(
             vocab_size=100,
@@ -353,7 +353,7 @@ class TestDeepseekV32ForCausalLM:
 
     def test_from_config_with_moe_config(self):
         """Test from_config with explicit MoE config."""
-        from nemo_automodel.components.models.common import BackendConfig
+        from nemo_automodel._transformers.models.common import BackendConfig
         from nemo_automodel.components.moe.config import MoEConfig
 
         cfg = DeepseekV32Config(
@@ -403,7 +403,7 @@ class TestDeepseekV32ForCausalLM:
 
     def test_init_with_state_dict_adapter_disabled(self):
         """Test initialization without state dict adapter."""
-        from nemo_automodel.components.models.common import BackendConfig
+        from nemo_automodel._transformers.models.common import BackendConfig
 
         cfg = DeepseekV32Config(
             vocab_size=100,
@@ -434,7 +434,7 @@ class TestDeepseekV32ForCausalLM:
 
     def test_init_with_state_dict_adapter_enabled(self):
         """Test initialization with state dict adapter enabled."""
-        from nemo_automodel.components.models.common import BackendConfig
+        from nemo_automodel._transformers.models.common import BackendConfig
 
         cfg = DeepseekV32Config(
             vocab_size=100,
@@ -462,13 +462,13 @@ class TestDeepseekV32ForCausalLM:
         model = DeepseekV32ForCausalLM(cfg, backend=backend)
 
         assert hasattr(model, "state_dict_adapter")
-        from nemo_automodel.components.models.deepseek_v32.state_dict_adapter import DeepSeekV32StateDictAdapter
+        from nemo_automodel._transformers.models.deepseek_v32.state_dict_adapter import DeepSeekV32StateDictAdapter
 
         assert isinstance(model.state_dict_adapter, DeepSeekV32StateDictAdapter)
 
     def test_model_has_lm_head(self):
         """Test that model has lm_head for language modeling."""
-        from nemo_automodel.components.models.common import BackendConfig
+        from nemo_automodel._transformers.models.common import BackendConfig
 
         cfg = DeepseekV32Config(
             vocab_size=100,
@@ -502,7 +502,7 @@ class TestDeepseekV32ForCausalLM:
 
     def test_forward_thd_hidden_states_match_logits_layout(self):
         """THD hidden states should keep the same restored batch layout as logits."""
-        from nemo_automodel.components.models.common import BackendConfig
+        from nemo_automodel._transformers.models.common import BackendConfig
 
         cfg = DeepseekV32Config(
             vocab_size=100,

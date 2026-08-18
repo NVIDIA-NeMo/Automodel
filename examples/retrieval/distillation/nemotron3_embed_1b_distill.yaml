@@ -16,7 +16,7 @@ step_scheduler:
   num_epochs: 1
 
 model:
-  _target_: nemo_automodel._transformers.retrieval.RetrieverStudentWithProjection.build
+  _target_: nemo_automodel.retrieval.modeling.RetrieverStudentWithProjection.build
   pretrained_model_name_or_path: <your_path>
   teacher_hidden_size: 4096
   pooling: avg
@@ -27,7 +27,7 @@ model:
   attn_implementation: flash_attention_2
 
 teacher_model:
-  _target_: nemo_automodel._transformers.retrieval.RetrieverTeacherEmbeddingEncoder.build
+  _target_: nemo_automodel.retrieval.modeling.RetrieverTeacherEmbeddingEncoder.build
   pretrained_model_name_or_path: <your_path>
   pooling: avg
   l2_normalize: false

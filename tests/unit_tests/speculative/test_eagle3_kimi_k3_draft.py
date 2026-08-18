@@ -27,8 +27,8 @@ from __future__ import annotations
 import pytest
 import torch
 
-from nemo_automodel.components.models.kimi_k3.config import KimiK3Config, KimiK3TextConfig
-from nemo_automodel.components.models.kimi_k3.model import KimiK3MLP, KimiRMSNorm
+from nemo_automodel._transformers.models.kimi_k3.config import KimiK3Config, KimiK3TextConfig
+from nemo_automodel._transformers.models.kimi_k3.model import KimiK3MLP, KimiRMSNorm
 from nemo_automodel.components.speculative.eagle.core import Eagle3TrainerModule
 from nemo_automodel.components.speculative.eagle.draft_kimi_k3 import (
     KimiK3Eagle3DraftModel,

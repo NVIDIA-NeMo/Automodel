@@ -5,8 +5,8 @@ from dataclasses import dataclass
 import pytest
 import torch
 
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.minimax_m2.state_dict_adapter import MiniMaxM2StateDictAdapter
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.minimax_m2.state_dict_adapter import MiniMaxM2StateDictAdapter
 from nemo_automodel.components.moe.layers import MoEConfig
 
 

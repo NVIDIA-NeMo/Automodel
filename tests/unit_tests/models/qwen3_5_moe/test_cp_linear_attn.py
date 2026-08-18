@@ -35,7 +35,7 @@ pytest.importorskip("fla")
 
 from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeTextConfig
 
-from nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn import (
+from nemo_automodel._transformers.models.qwen3_5_moe.cp_linear_attn import (
     CPAwareGatedDeltaNet,
     _AllGatherConcatFn,
 )
@@ -107,9 +107,9 @@ def _patch_dist_for_cp(rank=0, world_size=2):
     """Context manager that patches dist rank/world_size for CP testing."""
     with (
         patch(
-            "nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn.dist.get_world_size", return_value=world_size
+            "nemo_automodel._transformers.models.qwen3_5_moe.cp_linear_attn.dist.get_world_size", return_value=world_size
         ),
-        patch("nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn.dist.get_rank", return_value=rank),
+        patch("nemo_automodel._transformers.models.qwen3_5_moe.cp_linear_attn.dist.get_rank", return_value=rank),
     ):
         yield
 
@@ -201,7 +201,7 @@ class TestUndoAttentionLoadBalancing:
         fake_ag = _make_fake_all_gather(positions, rank1_positions, hidden, rank1_hidden, device)
 
         with (
-            patch("nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn.dist.all_gather", fake_ag),
+            patch("nemo_automodel._transformers.models.qwen3_5_moe.cp_linear_attn.dist.all_gather", fake_ag),
             _patch_dist_for_cp(rank=0, world_size=2),
         ):
             result_hidden, sorted_pos = module._undo_attention_load_balancing(hidden, positions, MagicMock())
@@ -223,7 +223,7 @@ class TestUndoAttentionLoadBalancing:
         fake_ag = _make_fake_all_gather(positions, rank1_positions, hidden, rank1_hidden, device)
 
         with (
-            patch("nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn.dist.all_gather", fake_ag),
+            patch("nemo_automodel._transformers.models.qwen3_5_moe.cp_linear_attn.dist.all_gather", fake_ag),
             _patch_dist_for_cp(rank=0, world_size=2),
         ):
             with pytest.raises(RuntimeError, match="dense global token positions"):
@@ -263,7 +263,7 @@ class TestRedoAttentionLoadBalancing:
             gathered[1].copy_(rank1_output)
 
         with (
-            patch("nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn.dist.all_gather", fake_all_gather),
+            patch("nemo_automodel._transformers.models.qwen3_5_moe.cp_linear_attn.dist.all_gather", fake_all_gather),
             _patch_dist_for_cp(rank=0, world_size=2),
         ):
             result = module._redo_attention_load_balancing(output, original_positions, sorted_positions, MagicMock())
@@ -462,9 +462,9 @@ class TestAllGatherConcatFn:
             gathered[1].copy_(tensor * 2)
 
         with (
-            patch("nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn.dist.get_world_size", return_value=2),
-            patch("nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn.dist.get_rank", return_value=0),
-            patch("nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn.dist.all_gather", fake_all_gather),
+            patch("nemo_automodel._transformers.models.qwen3_5_moe.cp_linear_attn.dist.get_world_size", return_value=2),
+            patch("nemo_automodel._transformers.models.qwen3_5_moe.cp_linear_attn.dist.get_rank", return_value=0),
+            patch("nemo_automodel._transformers.models.qwen3_5_moe.cp_linear_attn.dist.all_gather", fake_all_gather),
         ):
             result = _AllGatherConcatFn.apply(local, group, 1)
 
@@ -481,9 +481,9 @@ class TestAllGatherConcatFn:
             gathered[1].copy_(tensor + 10)
 
         with (
-            patch("nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn.dist.get_world_size", return_value=2),
-            patch("nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn.dist.get_rank", return_value=0),
-            patch("nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn.dist.all_gather", fake_all_gather),
+            patch("nemo_automodel._transformers.models.qwen3_5_moe.cp_linear_attn.dist.get_world_size", return_value=2),
+            patch("nemo_automodel._transformers.models.qwen3_5_moe.cp_linear_attn.dist.get_rank", return_value=0),
+            patch("nemo_automodel._transformers.models.qwen3_5_moe.cp_linear_attn.dist.all_gather", fake_all_gather),
         ):
             result = _AllGatherConcatFn.apply(local, group, 0)
 

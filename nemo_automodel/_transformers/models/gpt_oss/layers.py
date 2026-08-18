@@ -1,0 +1,187 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific governing permissions and
+# limitations under the License.
+
+from typing import TYPE_CHECKING, Any
+
+import torch
+from torch import nn
+from torch.distributed.tensor import DTensor
+
+from nemo_automodel._transformers.models.deepseek_v3.rope_utils import yarn_get_mscale
+from nemo_automodel.shared.import_utils import is_te_min_version
+
+if TYPE_CHECKING:
+    from transformers.models.gpt_oss.configuration_gpt_oss import GptOssConfig
+
+from nemo_automodel._transformers.models.common import (
+    BackendConfig,
+    initialize_linear_module,
+)
+from nemo_automodel._transformers.models.gpt_oss.rope_utils import apply_rotary_emb_qk
+from nemo_automodel.components.attention.utils import (
+    initialize_attn_module_and_func,
+    postprocess_output_for_attn,
+    preprocess_args_and_kwargs_for_attn,
+)
+from nemo_automodel.shared.utils import dtype_from_str as get_dtype
+
+
+def _has_thd_metadata(attn_kwargs: dict[str, Any]) -> bool:
+    return attn_kwargs.get("cu_seqlens") is not None or (
+        attn_kwargs.get("cu_seqlens_q") is not None and attn_kwargs.get("cu_seqlens_kv") is not None
+    )
+
+
+class GptOssAttention(nn.Module):
+    def __init__(self, config: "GptOssConfig", backend: BackendConfig, use_sliding_attention: bool = False):
+        super().__init__()
+
+        self.sliding_window = config.sliding_window if use_sliding_attention else None
+        self.head_dim = config.head_dim
+        self.num_attention_heads = config.num_attention_heads
+        self.num_key_value_heads = config.num_key_value_heads
+        self.head_dim = config.head_dim
+        self.hidden_size = config.hidden_size
+
+        dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+
+        self.q_proj = initialize_linear_module(
+            backend.linear, self.hidden_size, self.num_attention_heads * self.head_dim, bias=True, dtype=dtype
+        )
+        self.k_proj = initialize_linear_module(
+            backend.linear, self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True, dtype=dtype
+        )
+        self.v_proj = initialize_linear_module(
+            backend.linear, self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True, dtype=dtype
+        )
+        self.o_proj = initialize_linear_module(
+            backend.linear, self.num_attention_heads * self.head_dim, self.hidden_size, bias=True, dtype=dtype
+        )
+
+        self.softmax_scale = self.head_dim**-0.5
+        # When using fused rope, YaRN concentration is not baked into freqs_cis,
+        # so we need to apply concentration to q and k after fused rope
+        if backend.rope_fusion:
+            self.yarn_concentration = yarn_get_mscale(config.rope_scaling["factor"])
+        else:
+            self.yarn_concentration = None
+
+        assert backend.attn in ("flex", "te"), "Only Flex and TE Attention are supported for GPT-OSS"
+        if backend.attn == "te" and not is_te_min_version("2.8.0"):
+            raise ValueError(
+                "Transformer Engine DotProductAttention for GPT-OSS is only supported for TE version 2.8.0 or higher"
+            )
+
+        self.backend = backend
+        self.attn_module, self.attn_func = initialize_attn_module_and_func(
+            attn_impl=backend.attn,
+            num_attention_heads=config.num_attention_heads,
+            num_qk_channels=config.head_dim,
+            num_v_channels=config.head_dim,
+            softmax_scale=self.softmax_scale,
+            num_gqa_groups=self.num_key_value_heads,
+            softmax_type="learnable",
+        )
+        # TE initializes sinks inside the attn_module
+        self.sinks = nn.Parameter(torch.empty(self.num_attention_heads)) if backend.attn == "flex" else None
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        freqs_cis: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        **attn_kwargs: Any,
+    ) -> torch.Tensor:
+        # Detect THD format: either 2D [T, hidden], explicit THD metadata, or
+        # 3D [1, T, hidden] with cu_seqlens from PP schedule splitting.
+        explicit_thd = attn_kwargs.get("qkv_format") == "thd" or _has_thd_metadata(attn_kwargs)
+        if len(x.shape) == 2 or explicit_thd:
+            qkv_format = "thd"
+            if len(x.shape) == 3:
+                if x.shape[0] != 1:
+                    raise ValueError("GPT-OSS THD attention expects a singleton batch dimension before flattening.")
+                x = x.squeeze(0)
+            num_tokens = x.shape[0]
+        else:
+            qkv_format = "bshd"
+            bsz, seqlen, _ = x.size()
+
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+
+        if qkv_format == "thd":
+            q = q.view(num_tokens, self.num_attention_heads, self.head_dim)
+            k = k.view(num_tokens, self.num_key_value_heads, self.head_dim)
+            v = v.view(num_tokens, self.num_key_value_heads, self.head_dim)
+        else:
+            q = q.view(bsz, seqlen, self.num_attention_heads, self.head_dim)
+            k = k.view(bsz, seqlen, self.num_key_value_heads, self.head_dim)
+            v = v.view(bsz, seqlen, self.num_key_value_heads, self.head_dim)
+
+        # Apply rotary positional embeddings
+        q, k = apply_rotary_emb_qk(
+            q,
+            k,
+            freqs_cis,
+            format=qkv_format,
+            rope_fusion=self.backend.rope_fusion,
+            cu_seqlens=attn_kwargs.get("cu_seqlens", None),
+            concentration=self.yarn_concentration,
+            cp_size=attn_kwargs.get("cp_size", 1),
+            cp_rank=attn_kwargs.get("cp_rank", 0),
+        )
+
+        if self.backend.attn == "flex":
+            updated_attn_kwargs = {
+                "scale": self.softmax_scale,
+                "sink_weights": (self.sinks.to_local() if isinstance(self.sinks, DTensor) else self.sinks),
+                "sliding_window": (self.sliding_window if self.sliding_window is not None else 0),
+                "enable_gqa": True,
+            }
+        else:
+            updated_attn_kwargs = attn_kwargs
+            if qkv_format == "thd":
+                updated_attn_kwargs = {**updated_attn_kwargs, "qkv_format": "thd"}
+                attention_mask = None
+            if self.sliding_window is not None:
+                updated_attn_kwargs["window_size"] = (self.sliding_window, 0)
+
+        q, k, v, _attn_kwargs = preprocess_args_and_kwargs_for_attn(
+            q, k, v, attention_mask, self.backend.attn, **updated_attn_kwargs
+        )
+        output = self.attn_func(q, k, v, **_attn_kwargs)
+        output = postprocess_output_for_attn(output, self.backend.attn)
+
+        # Reshape and project output
+        flatten_dim = 2 if qkv_format == "bshd" else 1
+        output = self.o_proj(output.flatten(flatten_dim))
+        return output
+
+    @torch.no_grad()
+    def init_weights(self, buffer_device: torch.device, init_std: float = 0.02):
+        with buffer_device:
+            linear_list = [
+                self.q_proj,
+                self.k_proj,
+                self.v_proj,
+                self.o_proj,
+            ]
+
+            if self.backend.attn == "flex":
+                nn.init.normal_(self.sinks, mean=0.0, std=init_std)
+            else:
+                nn.init.normal_(self.attn_module.softmax_offset, mean=0.0, std=init_std)
+            for linear in linear_list:
+                nn.init.trunc_normal_(linear.weight, mean=0.0, std=init_std)

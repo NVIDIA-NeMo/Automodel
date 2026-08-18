@@ -23,9 +23,9 @@ Stage-1/2 tests."""
 
 import torch
 
-from nemo_automodel.components.models.common.mtp.mtp import roll_tensor
-from nemo_automodel.components.models.minimax_m3_vl.layers import MiniMaxM3Indexer
-from nemo_automodel.components.models.minimax_m3_vl.model import MiniMaxM3CausalLMOutput
+from nemo_automodel._transformers.models.common.mtp.mtp import roll_tensor
+from nemo_automodel._transformers.models.minimax_m3_vl.layers import MiniMaxM3Indexer
+from nemo_automodel._transformers.models.minimax_m3_vl.model import MiniMaxM3CausalLMOutput
 
 
 def test_mtp_module_present_and_sparse(mtp_model):

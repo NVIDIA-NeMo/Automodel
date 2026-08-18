@@ -1183,21 +1183,27 @@ class TestIsCustomModel:
         assert _is_custom_model(model) is False
 
     def test_module_from_custom_namespace_is_custom(self):
-        """A class whose __module__ starts with nemo_automodel.components.models. is custom."""
+        """A class whose __module__ starts with nemo_automodel._transformers.models. is custom."""
         # Simulate a custom model by patching __module__ on the class's MRO
         FakeCustom = type("FakeCustom", (torch.nn.Module,), {})
-        FakeCustom.__module__ = "nemo_automodel.components.models.deepseek_v3.model"
+        FakeCustom.__module__ = "nemo_automodel._transformers.models.deepseek_v3.model"
         instance = FakeCustom()
         assert _is_custom_model(instance) is True
 
     def test_subclass_of_custom_model_is_custom(self):
         """A subclass of a custom model class is also detected as custom."""
         Base = type("Base", (torch.nn.Module,), {})
-        Base.__module__ = "nemo_automodel.components.models.kimivl.model"
+        Base.__module__ = "nemo_automodel._transformers.models.kimivl.model"
         Child = type("Child", (Base,), {})
         Child.__module__ = "some_other_module"
         instance = Child()
         assert _is_custom_model(instance) is True
+
+    def test_retrieval_model_namespace_is_custom(self):
+        """Task-owned retrieval implementations remain custom checkpoint models."""
+        FakeRetrievalModel = type("FakeRetrievalModel", (torch.nn.Module,), {})
+        FakeRetrievalModel.__module__ = "nemo_automodel.retrieval.models.llama_bidirectional.model"
+        assert _is_custom_model(FakeRetrievalModel()) is True
 
     def test_none_module_attr_does_not_crash(self):
         """Classes where __module__ is None don't cause an error."""
@@ -1285,7 +1291,7 @@ def test_load_hf_bin_checkpoint_rejects_pickled_module(tmp_path):
 
 def test_load_model_uses_state_dict_adapter_from_ddp_module(tmp_path):
     """A DDP-wrapped encoder restores HF-format checkpoint keys through its adapter."""
-    from nemo_automodel.components.models.common.bidirectional import EncoderStateDictAdapter
+    from nemo_automodel.retrieval.state_dict_adapter import EncoderStateDictAdapter
 
     class Encoder(torch.nn.Module):
         def __init__(self):
@@ -1492,7 +1498,7 @@ class TestLoadModelCustomModelGuard:
 
         # Create a model class in the custom namespace
         CustomModel = type("CustomModel", (torch.nn.Module,), {})
-        CustomModel.__module__ = "nemo_automodel.components.models.kimivl.model"
+        CustomModel.__module__ = "nemo_automodel._transformers.models.kimivl.model"
         model = CustomModel()
         model.layer = torch.nn.Linear(4, 4)
 
@@ -1532,14 +1538,12 @@ class TestLoadModelCustomModelGuard:
     @patch("nemo_automodel.components.checkpoint.checkpointing._is_safetensors_checkpoint", return_value=True)
     @patch("nemo_automodel.components.checkpoint.checkpointing._load_hf_checkpoint_preserving_dtype")
     @patch("nemo_automodel.components.checkpoint.checkpointing._load_full_state_dict_into_model")
-    def test_single_device_custom_model_uses_dcp(
-        self, mock_load_full, mock_load_hf, mock_is_st
-    ):
+    def test_single_device_custom_model_uses_dcp(self, mock_load_full, mock_load_hf, mock_is_st):
         """A single-device custom model uses DCP instead of a full host state dict."""
         checkpointer = self._make_checkpointer()
 
         CustomModel = type("CustomModel", (torch.nn.Module,), {})
-        CustomModel.__module__ = "nemo_automodel.components.models.nemotron_v3.model"
+        CustomModel.__module__ = "nemo_automodel._transformers.models.nemotron_v3.model"
         model = CustomModel()
         model.layer = torch.nn.Linear(4, 4)
         assert _is_custom_model(model) is True

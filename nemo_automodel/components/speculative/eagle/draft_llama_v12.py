@@ -28,12 +28,12 @@ import torch
 import torch.nn as nn
 from transformers import PretrainedConfig, PreTrainedModel
 
-from nemo_automodel.components.datasets.llm.packed_sequence import build_block_causal_additive_mask
-from nemo_automodel.components.models.common import initialize_rms_norm_module
-from nemo_automodel.components.models.llama.rope_utils import (
+from nemo_automodel._transformers.models.common import initialize_rms_norm_module
+from nemo_automodel._transformers.models.llama.rope_utils import (
     LlamaRotaryEmbedding,
     apply_rotary_pos_emb,
 )
+from nemo_automodel.components.datasets.llm.packed_sequence import build_block_causal_additive_mask
 
 
 def _build_causal_mask(

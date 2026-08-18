@@ -22,7 +22,7 @@ from torch import nn
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
 from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
 
-from nemo_automodel.components.models.deepseek_v3.model import Block, DeepseekV3ForCausalLM, DeepseekV3Model
+from nemo_automodel._transformers.models.deepseek_v3.model import Block, DeepseekV3ForCausalLM, DeepseekV3Model
 
 
 class _RecordingMlp(nn.Module):
@@ -65,7 +65,7 @@ class TestDeepseekV3ModelUpdates:
 
     def test_modelclass_export_exists(self):
         """Ensure ModelClass pointer is defined and points to class."""
-        from nemo_automodel.components.models.deepseek_v3 import model as dsv3_mod
+        from nemo_automodel._transformers.models.deepseek_v3 import model as dsv3_mod
 
         assert hasattr(dsv3_mod, "ModelClass")
         assert dsv3_mod.ModelClass is DeepseekV3ForCausalLM
@@ -117,7 +117,7 @@ class TestDeepseekV3GatePrecision:
         )
 
     def test_gate_precision_defaults_to_fp32(self):
-        from nemo_automodel.components.models.common.utils import BackendConfig
+        from nemo_automodel._transformers.models.common.utils import BackendConfig
 
         backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch", experts="torch", dispatcher="torch")
         assert backend.gate_precision is None
@@ -125,7 +125,7 @@ class TestDeepseekV3GatePrecision:
         assert model.backend.gate_precision == torch.float32
 
     def test_gate_precision_respects_explicit_override(self):
-        from nemo_automodel.components.models.common.utils import BackendConfig
+        from nemo_automodel._transformers.models.common.utils import BackendConfig
 
         backend = BackendConfig(
             attn="sdpa",

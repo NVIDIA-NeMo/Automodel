@@ -15,10 +15,10 @@
 """Tests for user-friendly error messages when models are unavailable.
 
 Covers three scenarios:
-1. Importing a non-existent model submodule (e.g. ``nemo_automodel.components.models.qwen3_1024``)
+1. Importing a non-existent model submodule (e.g. ``nemo_automodel._transformers.models.qwen3_1024``)
 2. Using ``get_hf_config`` / ``from_pretrained`` with a checkpoint whose model type
    is not recognized by the installed Transformers version.
-3. The ``nemo_automodel.models`` → ``nemo_automodel.components.models`` alias.
+3. The ``nemo_automodel.models`` → ``nemo_automodel._transformers.models`` alias.
 """
 
 import importlib
@@ -38,73 +38,73 @@ class TestModelsImportError:
     """Importing a non-existent model subpackage should raise a helpful error."""
 
     def test_import_nonexistent_model_raises_module_not_found(self):
-        """``import nemo_automodel.components.models.qwen3_1024`` should give a helpful error."""
+        """``import nemo_automodel._transformers.models.qwen3_1024`` should give a helpful error."""
         with pytest.raises(ModuleNotFoundError, match="has no submodule 'qwen3_1024'"):
-            importlib.import_module("nemo_automodel.components.models.qwen3_1024")
+            importlib.import_module("nemo_automodel._transformers.models.qwen3_1024")
 
     def test_import_error_suggests_upgrade(self):
         with pytest.raises(ModuleNotFoundError, match="pip install --upgrade nemo_automodel"):
-            importlib.import_module("nemo_automodel.components.models.qwen3_1024")
+            importlib.import_module("nemo_automodel._transformers.models.qwen3_1024")
 
     def test_import_error_suggests_install_from_source(self):
         with pytest.raises(
             ModuleNotFoundError, match=r"pip install git\+https://github\.com/NVIDIA-NeMo/Automodel\.git"
         ):
-            importlib.import_module("nemo_automodel.components.models.qwen3_1024")
+            importlib.import_module("nemo_automodel._transformers.models.qwen3_1024")
 
     def test_import_error_lists_available_submodules(self):
         with pytest.raises(ModuleNotFoundError, match="Available model submodules in this installation"):
-            importlib.import_module("nemo_automodel.components.models.qwen3_1024")
+            importlib.import_module("nemo_automodel._transformers.models.qwen3_1024")
 
     def test_import_error_mentions_requested_name(self):
         """The error message should contain the name the user asked for."""
         with pytest.raises(ModuleNotFoundError, match="nonexistent_model_xyz"):
-            importlib.import_module("nemo_automodel.components.models.nonexistent_model_xyz")
+            importlib.import_module("nemo_automodel._transformers.models.nonexistent_model_xyz")
 
     def test_existing_submodule_still_imports(self):
         """Sanity: importing a real model submodule should still work."""
-        mod = importlib.import_module("nemo_automodel.components.models.common")
+        mod = importlib.import_module("nemo_automodel._transformers.models.common")
         assert mod is not None
 
     def test_getattr_import_error(self):
         """Direct attribute access on the package should also produce the friendly error."""
-        import nemo_automodel.components.models as models_pkg
+        import nemo_automodel._transformers.models as models_pkg
 
         with pytest.raises(ModuleNotFoundError, match="has no submodule 'does_not_exist'"):
             _ = models_pkg.does_not_exist
 
     def test_getattr_suggests_upgrade(self):
-        import nemo_automodel.components.models as models_pkg
+        import nemo_automodel._transformers.models as models_pkg
 
         with pytest.raises(ModuleNotFoundError, match="pip install --upgrade nemo_automodel"):
             _ = models_pkg.qwen3_1024
 
 
 # ============================================================================
-# 2. nemo_automodel.models → nemo_automodel.components.models alias
+# 2. nemo_automodel.models → nemo_automodel._transformers.models alias
 # ============================================================================
 
 
 class TestModelsAlias:
     """``nemo_automodel.models`` should be a transparent alias for
-    ``nemo_automodel.components.models``."""
+    ``nemo_automodel._transformers.models``."""
 
     def test_alias_package_is_same_object(self):
-        import nemo_automodel.components.models as real
+        import nemo_automodel._transformers.models as real
         import nemo_automodel.models as alias
 
         assert alias is real
 
     def test_alias_submodule_import(self):
         """``import nemo_automodel.models.common`` should give the same module."""
-        real = importlib.import_module("nemo_automodel.components.models.common")
+        real = importlib.import_module("nemo_automodel._transformers.models.common")
         alias = importlib.import_module("nemo_automodel.models.common")
         assert alias is real
 
     def test_alias_submodule_is_same_object_in_sys_modules(self):
         importlib.import_module("nemo_automodel.models.common")
-        importlib.import_module("nemo_automodel.components.models.common")
-        assert sys.modules["nemo_automodel.models.common"] is sys.modules["nemo_automodel.components.models.common"]
+        importlib.import_module("nemo_automodel._transformers.models.common")
+        assert sys.modules["nemo_automodel.models.common"] is sys.modules["nemo_automodel._transformers.models.common"]
 
     def test_alias_nonexistent_model_gives_helpful_error(self):
         """The nice error should also fire via the short path."""

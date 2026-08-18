@@ -165,10 +165,10 @@ from collections import OrderedDict
 
 MODEL_ARCH_MAPPING = OrderedDict(
     [
-        ("ZuluForCausalLM", ("nemo_automodel.components.models.zulu.model", "ZuluForCausalLM")),
+        ("ZuluForCausalLM", ("nemo_automodel._transformers.models.zulu.model", "ZuluForCausalLM")),
         (
             "AlphaModel",
-            ("nemo_automodel.components.models.alpha.model", "AlphaModel", {"retrieval"}),
+            ("nemo_automodel._transformers.models.alpha.model", "AlphaModel", {"retrieval"}),
         ),
     ]
 )
@@ -178,12 +178,12 @@ MODEL_ARCH_MAPPING = OrderedDict(
     generated = _render_registry_table(entries, {"AlphaModel", "ExternalModel", "ZuluForCausalLM"}, {})
 
     assert entries == [
-        ("AlphaModel", "nemo_automodel.components.models.alpha.model", "AlphaModel"),
-        ("ZuluForCausalLM", "nemo_automodel.components.models.zulu.model", "ZuluForCausalLM"),
+        ("AlphaModel", "nemo_automodel._transformers.models.alpha.model", "AlphaModel"),
+        ("ZuluForCausalLM", "nemo_automodel._transformers.models.zulu.model", "ZuluForCausalLM"),
     ]
-    assert "| `AlphaModel` | NeMo native | `nemo_automodel.components.models.alpha.model.AlphaModel` |" in generated
+    assert "| `AlphaModel` | NeMo native | `nemo_automodel._transformers.models.alpha.model.AlphaModel` |" in generated
     assert (
-        "| `ZuluForCausalLM` | NeMo native | `nemo_automodel.components.models.zulu.model.ZuluForCausalLM` |"
+        "| `ZuluForCausalLM` | NeMo native | `nemo_automodel._transformers.models.zulu.model.ZuluForCausalLM` |"
         in generated
     )
     assert "| `ExternalModel` | Hugging Face | `transformers` |" in generated
@@ -195,7 +195,7 @@ def test_registry_table_uses_documentation_aliases_for_native_models():
         [
             (
                 "NativeArchitecture",
-                "nemo_automodel.components.models.native.model",
+                "nemo_automodel._transformers.models.native.model",
                 "NativeArchitecture",
             )
         ],
@@ -205,7 +205,7 @@ def test_registry_table_uses_documentation_aliases_for_native_models():
 
     assert (
         "| `DocumentedArchitecture` (`NativeArchitecture`) | NeMo native | "
-        "`nemo_automodel.components.models.native.model.NativeArchitecture` |"
+        "`nemo_automodel._transformers.models.native.model.NativeArchitecture` |"
     ) in generated
 
 

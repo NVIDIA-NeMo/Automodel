@@ -25,7 +25,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import LlamaConfig, Qwen2Config, Qwen3Config
 
-from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel._transformers.models.common import BackendConfig
 
 MODEL_KINDS = ("llama", "qwen2", "qwen3")
 
@@ -115,7 +115,7 @@ def _build_model(
     sliding_window: int | None = None,
 ) -> nn.Module:
     if model_kind == "llama":
-        module = importlib.import_module("nemo_automodel.components.models.llama.model")
+        module = importlib.import_module("nemo_automodel._transformers.models.llama.model")
         model_cls = module.LlamaForCausalLM
         config = LlamaConfig(
             vocab_size=32,
@@ -129,7 +129,7 @@ def _build_model(
             tie_word_embeddings=False,
         )
     elif model_kind == "qwen2":
-        module = importlib.import_module("nemo_automodel.components.models.qwen2.model")
+        module = importlib.import_module("nemo_automodel._transformers.models.qwen2.model")
         model_cls = module.Qwen2ForCausalLM
         config = Qwen2Config(
             vocab_size=32,
@@ -143,7 +143,7 @@ def _build_model(
             tie_word_embeddings=False,
         )
     else:
-        module = importlib.import_module("nemo_automodel.components.models.qwen3.model")
+        module = importlib.import_module("nemo_automodel._transformers.models.qwen3.model")
         model_cls = module.Qwen3ForCausalLM
         config = Qwen3Config(
             vocab_size=32,
@@ -292,7 +292,7 @@ def test_packed_sliding_attention_matches_huggingface_window(model_kind, monkeyp
 @pytest.mark.parametrize("model_kind", MODEL_KINDS)
 def test_bshd_mask_call_matches_transformers_5_12_signature(model_kind, monkeypatch):
     """Ordinary BSHD forward must not pass the removed cache_position mask argument."""
-    module = importlib.import_module(f"nemo_automodel.components.models.{model_kind}.model")
+    module = importlib.import_module(f"nemo_automodel._transformers.models.{model_kind}.model")
     monkeypatch.setattr(module, "create_causal_mask", _create_causal_mask_without_cache_position)
     model = _build_model(model_kind, monkeypatch).eval()
     input_ids = torch.tensor([[1, 2, 3, 4]])

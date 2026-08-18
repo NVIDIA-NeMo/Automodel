@@ -4,12 +4,12 @@
     "question": "I want to add support for a new dense Hugging Face causal LM in NeMo AutoModel. What are the phases and files I should touch?",
     "expected_skill": "nemo-automodel-model-onboarding",
     "expected_script": null,
-    "ground_truth": "The agent routes to nemo-automodel-model-onboarding, starts with config discovery from Hugging Face config.json, identifies dense LLM indicators, creates components/models/<name>/ with model.py and state_dict_adapter.py plus optional config.py, registers the architecture in _transformers/registry.py, adds example YAML, and adds unit tests with tiny configs and layer equivalence tests when layers are rewritten.",
+    "ground_truth": "The agent routes to nemo-automodel-model-onboarding, starts with config discovery from Hugging Face config.json, identifies dense LLM indicators, creates _transformers/models/<name>/ with model.py and state_dict_adapter.py plus optional config.py, registers the architecture in _transformers/registry.py, adds example YAML, and adds unit tests with tiny configs and layer equivalence tests when layers are rewritten.",
     "expected_behavior": [
       "Routes to nemo-automodel-model-onboarding",
       "Starts with Hugging Face config.json discovery",
       "Classifies dense LLMs using ForCausalLM and absence of expert fields",
-      "Names components/models/<name>/model.py and state_dict_adapter.py",
+      "Names _transformers/models/<name>/model.py and state_dict_adapter.py",
       "Mentions MODEL_ARCH_MAPPING in _transformers/registry.py",
       "Mentions example YAML and unit tests"
     ]

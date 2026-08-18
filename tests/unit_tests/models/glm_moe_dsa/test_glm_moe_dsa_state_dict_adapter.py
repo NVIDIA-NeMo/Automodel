@@ -29,9 +29,9 @@ except ImportError:
         mock_hadamard.hadamard_transform = lambda x, scale: x
         sys.modules["fast_hadamard_transform"] = mock_hadamard
 
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.glm4_moe.state_dict_adapter import Glm4MoeStateDictAdapter
-from nemo_automodel.components.models.glm_moe_dsa.state_dict_adapter import GlmMoeDsaStateDictAdapter
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.glm4_moe.state_dict_adapter import Glm4MoeStateDictAdapter
+from nemo_automodel._transformers.models.glm_moe_dsa.state_dict_adapter import GlmMoeDsaStateDictAdapter
 from nemo_automodel.components.moe.config import MoEConfig
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")

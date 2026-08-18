@@ -15,9 +15,9 @@
 import pytest
 import torch
 
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.laguna.config import LagunaConfig
-from nemo_automodel.components.models.laguna.model import LagunaForCausalLM
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.laguna.config import LagunaConfig
+from nemo_automodel._transformers.models.laguna.model import LagunaForCausalLM
 from nemo_automodel.components.moe.layers import MoE
 from nemo_automodel.components.moe.megatron import moe_utils
 

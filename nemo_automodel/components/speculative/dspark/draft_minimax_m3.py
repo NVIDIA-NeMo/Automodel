@@ -34,14 +34,14 @@ import torch.nn.functional as F
 from torch import nn
 from torch.nn.attention.flex_attention import flex_attention
 
-from nemo_automodel.components.attention.dflash_mask import create_dflash_block_mask, create_dflash_sdpa_mask
-from nemo_automodel.components.models.common import get_rope_config
-from nemo_automodel.components.models.gpt_oss.rope_utils import (
+from nemo_automodel._transformers.models.common import get_rope_config
+from nemo_automodel._transformers.models.gpt_oss.rope_utils import (
     RotaryEmbedding,
     apply_rotary_emb,
     position_ids_to_freqs_cis,
 )
-from nemo_automodel.components.models.minimax_m3_vl.layers import MiniMaxM3RMSNorm, swiglu_oai
+from nemo_automodel._transformers.models.minimax_m3_vl.layers import MiniMaxM3RMSNorm, swiglu_oai
+from nemo_automodel.components.attention.dflash_mask import create_dflash_block_mask, create_dflash_sdpa_mask
 from nemo_automodel.components.speculative.dspark._sampling import sample_tokens
 from nemo_automodel.components.speculative.dspark.common import (
     AcceptRatePredictor,

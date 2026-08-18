@@ -11,6 +11,6 @@ examples @NVIDIA-NeMo/core-am
 README.md @akoumpa @HuiyingLi @athitten @snowmanwwg
 
 nemo_automodel/components/datasets/llm/retrieval_*.py @NVIDIA-NeMo/core-am @NVIDIA-NeMo/automodel_retriever_maintainers
-nemo_automodel/_transformers/retrieval.py @NVIDIA-NeMo/core-am @NVIDIA-NeMo/automodel_retriever_maintainers
+nemo_automodel/retrieval/ @NVIDIA-NeMo/core-am @NVIDIA-NeMo/automodel_retriever_maintainers
 nemo_automodel/recipes/retrieval/ @NVIDIA-NeMo/core-am @NVIDIA-NeMo/automodel_retriever_maintainers
 examples/retrieval/ @NVIDIA-NeMo/core-am @NVIDIA-NeMo/automodel_retriever_maintainers

@@ -30,14 +30,14 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.distributed.tensor import DTensor, Shard, distribute_tensor
 
-from nemo_automodel.components.distributed.parallelizer import fsdp2_strategy_parallelize
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.gemma4_moe.loss import Gemma4TensorParallelFusedLinearCrossEntropy
-from nemo_automodel.components.models.gemma4_moe.model import (
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.gemma4_moe.loss import Gemma4TensorParallelFusedLinearCrossEntropy
+from nemo_automodel._transformers.models.gemma4_moe.model import (
     Gemma4Config,
     Gemma4ForConditionalGeneration,
     Gemma4TextConfig,
 )
+from nemo_automodel.components.distributed.parallelizer import fsdp2_strategy_parallelize
 
 
 def _tiny_e4b_config() -> Gemma4Config:

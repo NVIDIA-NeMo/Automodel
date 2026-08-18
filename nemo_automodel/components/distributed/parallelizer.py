@@ -729,7 +729,7 @@ class Qwen3_5ParallelizationStrategy(DefaultParallelizationStrategy):
 
         # Set CP mesh on CPAwareGatedDeltaNet modules
         if cp_enabled:
-            from nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn import CPAwareGatedDeltaNet
+            from nemo_automodel._transformers.models.qwen3_5_moe.cp_linear_attn import CPAwareGatedDeltaNet
 
             cp_mesh = device_mesh[cp_mesh_name]
             for _, mod in model.named_modules():
@@ -748,7 +748,7 @@ class DeepseekV4ParallelizationStrategy(DefaultParallelizationStrategy):
     """DeepSeek-V4 keeps a small set of reference-sensitive parameters in fp32."""
 
     def parallelize(self, model, device_mesh, dp_shard_cp_mesh_name="dp_shard_cp", **kwargs):
-        from nemo_automodel.components.models.deepseek_v4.fsdp import fully_shard_deepseek_v4
+        from nemo_automodel._transformers.models.deepseek_v4.fsdp import fully_shard_deepseek_v4
 
         return super().parallelize(
             model,
@@ -1857,9 +1857,9 @@ def _get_model_layer_group_specs() -> Dict[Any, Dict[str, List[str]]]:
                 "model.vision_tower.transformer.layers",
             ],
         },
-        # Retrieval text encoder in components.models.ministral_bidirectional.model.
+        # Retrieval text encoder in retrieval.models.ministral_bidirectional.model.
         "Ministral3BidirectionalModel": {"language": ["layers"]},
-        # Retrieval VLM in components.models.llama_nemotron_vl.model. String-keyed
+        # Retrieval VLM in retrieval.models.llama_nemotron_vl.model. String-keyed
         # to keep distributed core from importing optional model-specific deps.
         "LlamaNemotronVLModel": {
             "language": ["language_model.layers"],
@@ -1908,7 +1908,7 @@ def _get_model_layer_group_specs() -> Dict[Any, Dict[str, List[str]]]:
         },
         # BAGEL (text-to-image + understanding). String-keyed to avoid an
         # import cycle: parallelizer is core distributed code, the BAGEL
-        # model lives under components/models/bagel/. Lists both the Qwen2
+        # model lives under _transformers/models/bagel/. Lists both the Qwen2
         # decoder ModuleList and the SigLIP encoder ModuleList so each
         # member becomes its own FSDP unit (matching upstream BAGEL's
         # transformer_auto_wrap_policy class set; without the SigLIP

@@ -15,9 +15,9 @@
 import pytest
 import torch
 
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.kimi_k3.config import KimiK3Config, KimiK3TextConfig, KimiK3VisionConfig
-from nemo_automodel.components.models.kimi_k3.multimodal import KimiK3ForConditionalGeneration
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.kimi_k3.config import KimiK3Config, KimiK3TextConfig, KimiK3VisionConfig
+from nemo_automodel._transformers.models.kimi_k3.multimodal import KimiK3ForConditionalGeneration
 
 
 def _tiny_vlm() -> KimiK3ForConditionalGeneration:

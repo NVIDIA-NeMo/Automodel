@@ -28,7 +28,7 @@ import pytest
 
 
 def test_bagel_imports() -> None:
-    from nemo_automodel.components.models.bagel import (
+    from nemo_automodel._transformers.models.bagel import (
         BagelConfig,
         BagelForUnifiedMultimodal,
     )
@@ -40,8 +40,8 @@ def test_bagel_imports() -> None:
 
 
 def test_bagel_stage2_config_selects_mot_decoder() -> None:
-    from nemo_automodel.components.models.bagel.configuration import BagelConfig
-    from nemo_automodel.components.models.bagel.model import _prepare_config_for_stage
+    from nemo_automodel._transformers.models.bagel.configuration import BagelConfig
+    from nemo_automodel._transformers.models.bagel.model import _prepare_config_for_stage
 
     cfg = BagelConfig(visual_gen=False, stage=2)
 
@@ -52,8 +52,8 @@ def test_bagel_stage2_config_selects_mot_decoder() -> None:
 
 
 def test_bagel_stage1_config_drops_generation_path() -> None:
-    from nemo_automodel.components.models.bagel.configuration import BagelConfig
-    from nemo_automodel.components.models.bagel.model import _prepare_config_for_stage
+    from nemo_automodel._transformers.models.bagel.configuration import BagelConfig
+    from nemo_automodel._transformers.models.bagel.model import _prepare_config_for_stage
 
     cfg = BagelConfig(visual_gen=True, stage=1)
     cfg.text_config.layer_module = None
@@ -65,8 +65,8 @@ def test_bagel_stage1_config_drops_generation_path() -> None:
 
 
 def test_bagel_rejects_tied_word_embeddings() -> None:
-    from nemo_automodel.components.models.bagel.configuration import BagelConfig
-    from nemo_automodel.components.models.bagel.model import BagelForUnifiedMultimodal
+    from nemo_automodel._transformers.models.bagel.configuration import BagelConfig
+    from nemo_automodel._transformers.models.bagel.model import BagelForUnifiedMultimodal
 
     # UNTIED_ONLY: the guard reads the nested text_config tie flag and raises at the
     # top of __init__, before the (checkpoint-sized) model is constructed.
@@ -85,7 +85,7 @@ def test_bagel_rejects_tied_word_embeddings() -> None:
 
 
 def test_bagel_from_pretrained_passes_backend_to_model(monkeypatch, tmp_path) -> None:
-    import nemo_automodel.components.models.bagel.model as bagel_model
+    import nemo_automodel._transformers.models.bagel.model as bagel_model
 
     config = SimpleNamespace(stage=None)
     captured = {}

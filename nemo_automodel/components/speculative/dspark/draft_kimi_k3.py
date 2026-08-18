@@ -20,7 +20,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from nemo_automodel.components.models.kimi_k3.model import KimiK3MLP, KimiRMSNorm
+from nemo_automodel._transformers.models.kimi_k3.model import KimiK3MLP, KimiRMSNorm
 from nemo_automodel.components.speculative.dspark.common import AcceptRatePredictor
 from nemo_automodel.components.speculative.dspark.draft_deepseek_v4 import DeepseekV4DSparkModel
 from nemo_automodel.components.speculative.dspark.markov_head import build_markov_head

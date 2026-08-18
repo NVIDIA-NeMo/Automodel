@@ -17,7 +17,7 @@ import logging
 import pytest
 import torch
 
-from nemo_automodel.components.models.common import BackendConfig, CudaGraphConfig
+from nemo_automodel._transformers.models.common import BackendConfig, CudaGraphConfig
 from nemo_automodel.components.moe.config import MoEConfig
 
 
@@ -333,14 +333,14 @@ class TestTEFp8ConfigRecipe:
     """TEFp8Config.build_recipe recipe-string mapping (the 'mxfp8' shorthand)."""
 
     def test_recipe_field_accepts_mxfp8(self):
-        from nemo_automodel.components.models.common.utils import TEFp8Config
+        from nemo_automodel._transformers.models.common.utils import TEFp8Config
 
         cfg = TEFp8Config(recipe="mxfp8")
         assert cfg.recipe == "mxfp8"
 
     def test_build_recipe_mxfp8_maps_to_mxfp8blockscaling(self):
         """recipe='mxfp8' -> a TE MXFP8BlockScaling instance (when TE is importable)."""
-        from nemo_automodel.components.models.common.utils import HAVE_TE, TEFp8Config
+        from nemo_automodel._transformers.models.common.utils import HAVE_TE, TEFp8Config
 
         if not HAVE_TE:
             pytest.skip("transformer_engine not importable")
@@ -351,7 +351,7 @@ class TestTEFp8ConfigRecipe:
 
     def test_build_recipe_prebuilt_object_passthrough(self):
         """A pre-built recipe object is returned unchanged (when TE is importable)."""
-        from nemo_automodel.components.models.common.utils import HAVE_TE, TEFp8Config
+        from nemo_automodel._transformers.models.common.utils import HAVE_TE, TEFp8Config
 
         if not HAVE_TE:
             pytest.skip("transformer_engine not importable")

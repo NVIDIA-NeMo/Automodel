@@ -17,8 +17,8 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.mistral4.state_dict_adapter import (
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.mistral4.state_dict_adapter import (
     Mistral4MultimodalStateDictAdapter,
     Mistral4StateDictAdapter,
     _convert_aggregated_experts,
@@ -286,7 +286,7 @@ class TestDequantizeMultiDimMesh:
 
         with (
             patch(
-                "nemo_automodel.components.models.mistral4.state_dict_adapter.is_dtensor",
+                "nemo_automodel._transformers.models.mistral4.state_dict_adapter.is_dtensor",
                 side_effect=lambda t: t is mock_weight,
             ),
             patch("torch.distributed._tensor.DTensor.from_local", side_effect=lambda t, *a, **kw: t),

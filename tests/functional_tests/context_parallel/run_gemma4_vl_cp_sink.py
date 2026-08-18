@@ -58,13 +58,13 @@ def main():
 
     from torch.distributed.device_mesh import init_device_mesh
 
-    from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
-    from nemo_automodel.components.models.common import BackendConfig
-    from nemo_automodel.components.models.gemma4_moe.model import (
+    from nemo_automodel._transformers.models.common import BackendConfig
+    from nemo_automodel._transformers.models.gemma4_moe.model import (
         Gemma4Config,
         Gemma4ForConditionalGeneration,
         Gemma4TextConfig,
     )
+    from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
     from nemo_automodel.components.moe.parallelizer import apply_cp
 
     backend = BackendConfig(

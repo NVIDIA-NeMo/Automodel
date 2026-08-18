@@ -15,10 +15,10 @@
 from transformers import AutoConfig
 from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.inkling.configuration import InklingConfig
+from nemo_automodel._transformers.models.inkling.model import InklingForConditionalGeneration
 from nemo_automodel._transformers.registry import ModelRegistry
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.inkling.configuration import InklingConfig
-from nemo_automodel.components.models.inkling.model import InklingForConditionalGeneration
 
 from .parity_check_inkling import build_tiny_config
 

@@ -20,10 +20,10 @@ from safetensors.torch import load_file, save_file
 from transformers import Gemma4UnifiedConfig
 
 from nemo_automodel._transformers.model_init import _init_model
+from nemo_automodel._transformers.models.gemma4_unified.model import Gemma4UnifiedForConditionalGeneration
+from nemo_automodel._transformers.models.gemma4_unified.state_dict_adapter import Gemma4UnifiedStateDictAdapter
 from nemo_automodel._transformers.registry import MODEL_ARCH_MAPPING
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
-from nemo_automodel.components.models.gemma4_unified.model import Gemma4UnifiedForConditionalGeneration
-from nemo_automodel.components.models.gemma4_unified.state_dict_adapter import Gemma4UnifiedStateDictAdapter
 
 GEMMA4_UNIFIED_KEY_PAIRS = [
     ("embed_vision.patch_ln1.weight", "vision_embedder.patch_ln1.weight"),
@@ -120,7 +120,7 @@ def _tiny_config() -> Gemma4UnifiedConfig:
 class TestGemma4UnifiedCustomModel:
     def test_registry_uses_model_specific_wrapper(self):
         assert MODEL_ARCH_MAPPING["Gemma4UnifiedForConditionalGeneration"] == (
-            "nemo_automodel.components.models.gemma4_unified.model",
+            "nemo_automodel._transformers.models.gemma4_unified.model",
             "Gemma4UnifiedForConditionalGeneration",
         )
 

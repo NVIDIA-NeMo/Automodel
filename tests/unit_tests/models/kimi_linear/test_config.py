@@ -2,13 +2,13 @@
 
 import pytest
 
+from nemo_automodel._transformers.models.kimi_linear.config import KimiLinear48BConfig
+from nemo_automodel._transformers.models.kimi_linear.model import KimiLinear48BForCausalLM
 from nemo_automodel._transformers.registry import (
     _CUSTOM_CONFIG_REGISTRATIONS,
     MODEL_ARCH_MAPPING,
     resolve_custom_config_cls,
 )
-from nemo_automodel.components.models.kimi_linear.config import KimiLinear48BConfig
-from nemo_automodel.components.models.kimi_linear.model import KimiLinear48BForCausalLM
 
 
 def test_kimi_linear_config_flags():
@@ -71,14 +71,14 @@ def test_kimi_linear_config_stamps_automodel_identity(tmp_path):
 
 def test_kimi_linear_registry_and_capabilities():
     assert MODEL_ARCH_MAPPING["KimiLinear48BForCausalLM"] == (
-        "nemo_automodel.components.models.kimi_linear.model",
+        "nemo_automodel._transformers.models.kimi_linear.model",
         "KimiLinear48BForCausalLM",
     )
     # Moonshot publishes this model and the Kimi K3 text backbone under the same
     # model_type and the same architecture name, so Automodel gives this one its own
     # identity instead of disambiguating between them.
     assert _CUSTOM_CONFIG_REGISTRATIONS["kimi_linear_48b_a3b"] == (
-        "nemo_automodel.components.models.kimi_linear.config",
+        "nemo_automodel._transformers.models.kimi_linear.config",
         "KimiLinear48BConfig",
     )
     assert resolve_custom_config_cls("kimi_linear_48b_a3b") is KimiLinear48BConfig

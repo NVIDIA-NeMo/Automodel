@@ -49,7 +49,7 @@ model:
   mtp_use_repeated_layer: true
   mtp_loss_scaling_factor: 0.1
   backend:
-    _target_: nemo_automodel.components.models.common.BackendConfig
+    _target_: nemo_automodel._transformers.models.common.BackendConfig
     attn: te
     linear: torch
     rms_norm: torch_fp32

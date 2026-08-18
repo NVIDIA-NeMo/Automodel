@@ -24,11 +24,9 @@ import torch
 from transformers import AutoConfig
 
 from nemo_automodel import NeMoAutoModelForCausalLM, NeMoAutoModelForImageTextToText
-from nemo_automodel._transformers.registry import ModelRegistry
-from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.muse_glimmer.config import MuseGlimmerConfig
-from nemo_automodel.components.models.muse_glimmer.model import (
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.muse_glimmer.config import MuseGlimmerConfig
+from nemo_automodel._transformers.models.muse_glimmer.model import (
     MuseGlimmerAttention,
     MuseGlimmerFinalRMSNorm,
     MuseGlimmerForConditionalGeneration,
@@ -37,7 +35,9 @@ from nemo_automodel.components.models.muse_glimmer.model import (
     MuseGlimmerScalelessRMSNorm,
     apply_rotary_emb,
 )
-from nemo_automodel.components.models.muse_glimmer.state_dict_adapter import MuseGlimmerStateDictAdapter
+from nemo_automodel._transformers.models.muse_glimmer.state_dict_adapter import MuseGlimmerStateDictAdapter
+from nemo_automodel._transformers.registry import ModelRegistry
+from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
 
 
 def _tiny_config(*, has_vision: bool = False, **overrides) -> MuseGlimmerConfig:
@@ -554,7 +554,7 @@ def test_te_attention_is_constructed_natively(monkeypatch):
         return sentinel, sentinel.forward
 
     monkeypatch.setattr(
-        "nemo_automodel.components.models.muse_glimmer.model.initialize_attn_module_and_func",
+        "nemo_automodel._transformers.models.muse_glimmer.model.initialize_attn_module_and_func",
         _fake_initialize,
     )
     config = _tiny_config()

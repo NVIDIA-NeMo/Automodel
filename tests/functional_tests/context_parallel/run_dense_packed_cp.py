@@ -35,6 +35,10 @@ from torch.distributed.tensor.parallel import parallelize_module
 from transformer_engine.pytorch import DotProductAttention
 from transformers import LlamaConfig, Qwen2Config, Qwen3Config
 
+from nemo_automodel._transformers.models.common import BackendConfig
+from nemo_automodel._transformers.models.llama.model import LlamaForCausalLM
+from nemo_automodel._transformers.models.qwen2.model import Qwen2ForCausalLM
+from nemo_automodel._transformers.models.qwen3.model import Qwen3ForCausalLM
 from nemo_automodel.components.distributed.context_parallel.utils import (
     attach_te_context_parallel,
     make_cp_batch_for_te,
@@ -44,10 +48,6 @@ from nemo_automodel.components.distributed.parallelizer import (
     _get_parallel_plan,
     _update_attention_head_counts_for_tp,
 )
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.llama.model import LlamaForCausalLM
-from nemo_automodel.components.models.qwen2.model import Qwen2ForCausalLM
-from nemo_automodel.components.models.qwen3.model import Qwen3ForCausalLM
 
 NUM_HIDDEN_LAYERS = 2
 

@@ -29,13 +29,13 @@ from transformers.models.qwen3_vl.modeling_qwen3_vl import (
     Qwen3VLForConditionalGeneration as HFQwen3VLForConditionalGeneration,
 )
 
-import nemo_automodel.components.models.qwen3_vl.model as qwen3_vl_model_module
+import nemo_automodel._transformers.models.qwen3_vl.model as qwen3_vl_model_module
+from nemo_automodel._transformers.models.qwen3_vl.model import Qwen3VLForConditionalGeneration
 from nemo_automodel.components.distributed.context_parallel.sharder import ContextParallelSharder
 from nemo_automodel.components.distributed.parallelizer import (
     DefaultParallelizationStrategy,
     get_parallelization_strategy,
 )
-from nemo_automodel.components.models.qwen3_vl.model import Qwen3VLForConditionalGeneration
 
 
 def _bare_model() -> Qwen3VLForConditionalGeneration:

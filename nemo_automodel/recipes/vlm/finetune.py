@@ -244,7 +244,7 @@ def _accepted_targets() -> set:
         NeMoAutoModelForMultimodalLM.from_config,
     }
     try:
-        from nemo_automodel.components.models.gemma4_drafter.composite import (
+        from nemo_automodel._transformers.models.gemma4_drafter.composite import (
             Gemma4WithDrafter,
         )
 
@@ -365,7 +365,7 @@ def build_dataloader(
         if "cp" in getattr(device_mesh, "mesh_dim_names", ()):
             cp_size = device_mesh["cp"].size()
 
-    from nemo_automodel.components.models.common.packing import configure_packing, get_attn_implementation
+    from nemo_automodel._transformers.models.common.packing import configure_packing, get_attn_implementation
 
     packing_attn_implementation = config.resolve_packing_attn_implementation(
         model_attn_implementation=get_attn_implementation(cfg_model),
@@ -600,7 +600,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             packing_enabled=dataloader_config.packing is not None,
             cp_size=self.mesh_context.cp_size,
         )
-        from nemo_automodel.components.models.common.packing import configure_packing, get_attn_implementation
+        from nemo_automodel._transformers.models.common.packing import configure_packing, get_attn_implementation
 
         packing_attn_implementation = dataloader_config.resolve_packing_attn_implementation(
             model_attn_implementation=get_attn_implementation(self.cfg.model, model=self.model_parts[0]),

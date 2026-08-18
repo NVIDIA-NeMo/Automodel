@@ -17,8 +17,8 @@ from types import SimpleNamespace
 import pytest
 import torch.nn as nn
 
+import nemo_automodel._transformers.models.common.tie_word_embeddings as tie_utils
 import nemo_automodel.components.checkpoint.utils as checkpoint_utils
-import nemo_automodel.components.models.common.tie_word_embeddings as tie_utils
 from nemo_automodel.shared import tied_weights
 
 

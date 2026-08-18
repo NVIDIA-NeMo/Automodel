@@ -21,6 +21,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+from nemo_automodel._transformers.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.checkpoint.checkpointing import save_losses
 from nemo_automodel.components.checkpoint.lifecycle import (
     _RESERVATION_STAGING_SUFFIX,
@@ -35,7 +36,6 @@ from nemo_automodel.components.checkpoint.utils import (
     resolve_restore_from_to_checkpoint_dir,
 )
 from nemo_automodel.components.config.loader import ConfigNode
-from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.recipes.base_recipe import BaseRecipe, is_distributed_stateful

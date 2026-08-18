@@ -17,8 +17,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from nemo_automodel.components.models.deepseek_v3.rope_utils import yarn_get_mscale
-from nemo_automodel.components.models.glm_moe_dsa.rope_utils import mla_softmax_scale
+from nemo_automodel._transformers.models.deepseek_v3.rope_utils import yarn_get_mscale
+from nemo_automodel._transformers.models.glm_moe_dsa.rope_utils import mla_softmax_scale
 
 
 class TestMlaSoftmaxScale:

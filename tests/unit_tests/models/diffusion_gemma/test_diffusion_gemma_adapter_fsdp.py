@@ -22,7 +22,7 @@ would break the DCP global-shape match).
 
 import torch
 
-from nemo_automodel.components.models.diffusion_gemma.state_dict_adapter import (
+from nemo_automodel._transformers.models.diffusion_gemma.state_dict_adapter import (
     DiffusionGemmaStateDictAdapter,
 )
 

@@ -21,8 +21,8 @@ import torch.nn.functional as F
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Partial, Replicate
 
+from nemo_automodel._transformers.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.distributed.init_utils import get_world_size_safe
-from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.experts import (
     GroupedExperts,
