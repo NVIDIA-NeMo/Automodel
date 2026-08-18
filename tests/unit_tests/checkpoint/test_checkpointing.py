@@ -1532,11 +1532,7 @@ class TestLoadModelCustomModelGuard:
     @patch("nemo_automodel.components.checkpoint.checkpointing._load_hf_checkpoint_preserving_dtype")
     @patch("nemo_automodel.components.checkpoint.checkpointing._load_full_state_dict_into_model")
     def test_custom_model_skips_fast_path_uses_dcp(self, mock_load_full, mock_load_hf, mock_is_st):
-        """Under sharded (multi-rank) loading, a custom model uses the standard DCP path.
-
-        DCP lets each rank slice its local DTensor shard. The single-device exception is
-        covered by test_single_device_custom_model_uses_fast_path.
-        """
+        """Under sharded loading, a custom model uses DCP to load its local shard."""
         checkpointer = self._make_checkpointer()
 
         # Create a model class in the custom namespace
