@@ -155,6 +155,19 @@ Phase 1 likewise always emits an informational `automodel_reference_self_repeat`
 exceeds its active thresholds. This keeps the dense passing path to one additional AutoModel forward while capturing
 both sides of the repeatability diagnosis for sensitive or failing configurations.
 
+| Self-repeat record | What it measures |
+|--------------------|------------------|
+| `hf_source_self_repeat` | Repeatability of the original loaded HF checkpoint. |
+| `automodel_reference_self_repeat` | Repeatability of the trained Phase 1 AutoModel reference. |
+| `automodel_reload_self_repeat` | Repeatability of the independently reloaded Phase 2 AutoModel. |
+| `hf_export_self_repeat` | Repeatability of the exported checkpoint reloaded in vanilla HF. |
+
+All self-repeat records have `enforced: false`: they cannot fail the job, select a profile, or change an active
+threshold. Use their logged JSON metrics for offline diagnosis and profile calibration. If a primary reload comparison
+is large while both relevant self-repeat comparisons are small, investigate checkpoint/load correctness. If a
+self-repeat comparison is already large, the model or reference execution is itself numerically variable and the
+primary comparison includes that variability.
+
 | Profile | Same implementation mean / p95 / cosine | Cross-framework mean / p95 / cosine | Cross-topology mean / p95 / cosine |
 |---------|-----------------------------------------|---------------------------------------|-------------------------------------|
 | `strict` | `1e-7` / `1e-6` / `0.999999` | `1e-4` / `1e-3` / `0.9999` | `1e-6` / `1e-5` / `0.99999` |
