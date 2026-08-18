@@ -1,15 +1,26 @@
 #!/bin/bash
 set -euo pipefail
 
+cd "/lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/nemotron_4_embed_vl/nemo-retriever-research"
 # TODO: change paths
-cd "/lustre/fsw/portfolios/nemotron/projects/nemotron_retriever_dev/users/$SLURM_JOB_USER/git/nemo-retriever-research"
 export TRITON_CACHE_DIR="/lustre/fsw/portfolios/nemotron/projects/nemotron_retriever_dev/users/$SLURM_JOB_USER/triton_cache"
 LOGS_DIR="/lustre/fsw/portfolios/nemotron/projects/nemotron_retriever_dev/users/$SLURM_JOB_USER/eval_logs"
 
 echo "$HF_HOME"
 echo "$@"
 
-/opt/venv/bin/python -m pip install beir==2.0.0 mteb[xet]==2.18.16 polars==1.35.2
+INSTALL_ATTEMPTS=5
+for ((attempt = 1; attempt <= INSTALL_ATTEMPTS; attempt++)); do
+    if /opt/venv/bin/python -m pip install beir==2.0.0 mteb[xet]==2.18.16 polars==1.35.2; then
+        break
+    fi
+    if ((attempt == INSTALL_ATTEMPTS)); then
+        echo "Error: dependency installation failed after $INSTALL_ATTEMPTS attempts."
+        exit 1
+    fi
+    echo "Dependency installation attempt $attempt failed; retrying in 30 seconds."
+    sleep 30
+done
 /opt/venv/bin/python -m pip uninstall -y mistral_common
 
 # /opt/venv/bin/python -m pip install beir==2.0.0 polars==1.35.2 -e "/lustre/fsw/portfolios/llmservice/users/ybabakhin/git/codex/mteb"
@@ -71,7 +82,7 @@ printf "\n"
 
 MTEB_ARGS=("$@")
 if [[ "$EVAL_TYPE" == "mteb" ]]; then
-    # mteb_text_eval.py forwards unknown args into model construction, so keep
+    # mteb_eval.py forwards unknown args into model construction, so keep
     # eval result/export metadata only for beir_embedding_eval.
     MTEB_ARGS=()
     ORIGINAL_ARGS=("$@")
@@ -79,14 +90,14 @@ if [[ "$EVAL_TYPE" == "mteb" ]]; then
     while ((ARG_INDEX < ${#ORIGINAL_ARGS[@]})); do
         ARG="${ORIGINAL_ARGS[$ARG_INDEX]}"
         case "$ARG" in
-            --eval_group_name|--results_dir_name|--dataset_mapping)
+            --eval_group_name|--results_dir_name|--dataset_mapping|--log_wandb|--dataset_dir)
                 if ((ARG_INDEX + 1 >= ${#ORIGINAL_ARGS[@]})); then
                     echo "Error: $ARG requires a value"
                     exit 1
                 fi
                 ARG_INDEX=$((ARG_INDEX + 2))
                 ;;
-            --eval_group_name=*|--results_dir_name=*|--dataset_mapping=*)
+            --eval_group_name=*|--results_dir_name=*|--dataset_mapping=*|--log_wandb=*|--dataset_dir=*)
                 ARG_INDEX=$((ARG_INDEX + 1))
                 ;;
             *)
@@ -122,6 +133,7 @@ case "$EVAL_TYPE" in
 
         echo "Total cores: $TOTAL_CORES, CPUs per process: $CPUS_PER_PROCESS"
 
+        MTEB_WORKERS=()
         for i in $(seq 0 $((NUM_GPUS - 1))); do
             # Calculate CPU core range for this process
             START_CPU=$((i * CPUS_PER_PROCESS))
@@ -131,21 +143,25 @@ case "$EVAL_TYPE" in
             LOG_FILE="$LOGS_DIR/mteb_gpu_${i}_$(date +%Y%m%d_%H%M%S)${MODEL_SUFFIX}.log"
 
             # Run process bound to specific CPU cores with logging
-            CUDA_VISIBLE_DEVICES="$i" taskset -c "$START_CPU-$END_CPU" python3 src/nemo_retriever_research/evaluation/mteb_text_eval.py \
+            CUDA_VISIBLE_DEVICES="$i" taskset -c "$START_CPU-$END_CPU" /opt/venv/bin/python \
+            src/nemo_retriever_research/evaluation/mteb_eval.py \
             --part="$i" \
-            --total_parts="$NUM_GPUS" \
-            --max_length 4096 \
-            --embedding_dim 4096 \
-            --batch_size 4 \
-            --model_type HF \
-            --precision bf16 \
-            --padding_side left \
-            --pooling avg \
-            --normalize_embeddings True "${MTEB_ARGS[@]}" > "$LOG_FILE" 2>&1 &
+            --total_parts="$NUM_GPUS" "${MTEB_ARGS[@]}" > "$LOG_FILE" 2>&1 &
+            MTEB_WORKERS+=("$!")
 
         done
 
-        wait
+        for _ in "${MTEB_WORKERS[@]}"; do
+            if ! wait -n; then
+                echo "Error: an MTEB worker failed; terminating the remaining workers."
+                mapfile -t RUNNING_WORKERS < <(jobs -pr)
+                if ((${#RUNNING_WORKERS[@]} > 0)); then
+                    kill "${RUNNING_WORKERS[@]}" 2>/dev/null || true
+                    wait "${RUNNING_WORKERS[@]}" 2>/dev/null || true
+                fi
+                exit 1
+            fi
+        done
         ;;
 
     beir_embedding_eval)
@@ -157,7 +173,10 @@ case "$EVAL_TYPE" in
             --batch_size 16 \
             --model_type mistral3 \
             --log_json True \
-            "$@" 2>&1 | tee "$LOG_FILE"
+            "$@" \
+            --skip_existing_results True \
+            --export_results_only_when_complete True \
+            2>&1 | tee "$LOG_FILE"
         ;;
 
     *)
