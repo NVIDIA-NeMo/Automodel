@@ -17,12 +17,11 @@
 NeMo AutoModel's neat packing encodes document boundaries in an indexed map
 ``[B, S]`` where each position holds the 1-based document index it belongs to
 (``0`` = padding), e.g. ``[1, 1, 2, 2, 2, 0]``. This module turns that map into
-typed metadata that drives HuggingFace's *public* varlen FlashAttention path via
+typed metadata that drives HuggingFace's varlen FlashAttention path via
 :class:`transformers.modeling_flash_attention_utils.FlashAttentionKwargs`
-(``cu_seq_lens_q``/``cu_seq_lens_k``/``max_length_q``/``max_length_k``), so no
-private Transformers function is monkeypatched.
+(``cu_seq_lens_q``/``cu_seq_lens_k``/``max_length_q``/``max_length_k``).
 
-The varlen path reshapes ``[B, S, ...]`` to ``[B * S, ...]`` *without* unpadding
+The varlen path reshapes ``[B, S, ...]`` to ``[B * S, ...]`` without unpadding
 (see the ``is_fa_with_varlen_kwargs`` branch in
 ``transformers.modeling_flash_attention_utils._flash_attention_forward``).
 ``cu_seqlens`` therefore spans the whole flattened batch, including padding runs,
@@ -107,9 +106,8 @@ def to_flash_attention_kwargs(params: PackedSeqParams) -> dict[str, torch.Tensor
     """Convert packed-sequence params to HuggingFace ``FlashAttentionKwargs``.
 
     The returned mapping matches ``transformers`` ``FlashAttentionKwargs`` so a
-    packed batch drives ``flash_attn_varlen_func`` through the supported public
-    path, with no monkeypatching of private Transformers functions. Query and key
-    share one layout (self-attention), so the ``q`` and ``k`` entries are equal.
+    packed batch drives ``flash_attn_varlen_func`` directly. Query and key share
+    one layout (self-attention), so the ``q`` and ``k`` entries are equal.
 
     Args:
         params: Packed-sequence metadata. ``params.cu_seqlens`` is an int32 tensor

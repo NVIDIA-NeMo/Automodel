@@ -1514,11 +1514,10 @@ def neat_packed_vlm_collater(
 
     1. Pads all text tensors to a common length.
     2. Converts the indexed ``attention_mask`` to the appropriate format:
-       - ``flash_attention_2``: emits typed packed-sequence metadata as the
-         public ``FlashAttentionKwargs`` (``cu_seq_lens_q``/``cu_seq_lens_k``/
+       - ``flash_attention_2``: emits typed packed-sequence metadata as
+         ``FlashAttentionKwargs`` (``cu_seq_lens_q``/``cu_seq_lens_k``/
          ``max_length_q``/``max_length_k``) and omits ``attention_mask`` so
-         HuggingFace routes the batch through ``flash_attn_varlen_func`` on its
-         supported path (no monkeypatching of private Transformers functions).
+         HuggingFace routes the batch through ``flash_attn_varlen_func``.
          The indexed ``[B, S]`` document map is preserved as ``_packed_seq_ids``.
        - ``sdpa`` / ``eager``: converts to a 4D block-causal bool mask.
     3. Concatenates media tensors across the batch dimension.

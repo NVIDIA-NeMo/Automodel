@@ -20,11 +20,10 @@ For example::
 
     [1, 1, 2, 2, 2, 0]   # 2 tokens in doc 1, 3 in doc 2, 1 padding
 
-HuggingFace models consume this through the *public* varlen FlashAttention path:
-the collater emits ``FlashAttentionKwargs`` (``cu_seq_lens_q``/``cu_seq_lens_k``/
+HuggingFace models consume this through the varlen FlashAttention path: the
+collater emits ``FlashAttentionKwargs`` (``cu_seq_lens_q``/``cu_seq_lens_k``/
 ``max_length_q``/``max_length_k``) built by
-:mod:`nemo_automodel.components.datasets.packed_seq`, so no private Transformers
-function is monkeypatched.
+:mod:`nemo_automodel.components.datasets.packed_seq`.
 
 This module keeps the shared helpers that in-tree custom models
 (``qwen3_5``, ``kimi_*``, ...) use to derive per-document ``cu_seqlens`` inside their
@@ -181,8 +180,8 @@ _PACKED_VARLEN_KWARGS = ("cu_seq_lens_q", "cu_seq_lens_k", "max_length_q", "max_
 def validate_flash_packing_support(attn_implementation: str = "sdpa", model: torch.nn.Module | None = None) -> None:
     """Fail loudly when flash neat packing cannot be consumed by the backend or model.
 
-    Neat packing under flash attention relies on the *public* varlen contract:
-    the collater emits ``FlashAttentionKwargs`` (``cu_seq_lens_q``/
+    Neat packing under flash attention relies on the varlen FlashAttention
+    contract: the collater emits ``FlashAttentionKwargs`` (``cu_seq_lens_q``/
     ``cu_seq_lens_k``/``max_length_q``/``max_length_k``) which HuggingFace threads
     into ``flash_attn_varlen_func``. This function verifies, before training
     starts, that (1) the installed Transformers build exposes that contract and

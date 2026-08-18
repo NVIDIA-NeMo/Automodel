@@ -510,14 +510,13 @@ def neat_packed_collater(batch: list[dict], attn_implementation: str = "sdpa") -
     each attention backend consumes:
 
     - Flash attention (``flash_attention_2`` / ``flash_attention_3`` /
-      ``flash_attention_4``): emits typed packed-sequence metadata as the public
+      ``flash_attention_4``): emits typed packed-sequence metadata as
       ``FlashAttentionKwargs`` (``cu_seq_lens_q``/``cu_seq_lens_k``/
       ``max_length_q``/``max_length_k``) so HuggingFace routes the batch through
-      ``flash_attn_varlen_func`` with no monkeypatching of private Transformers
-      functions. No ``attention_mask`` is emitted so HF takes the varlen-kwargs
-      branch; the per-document map is preserved as ``_packed_seq_ids`` for loss
-      and context-parallel consumers.
-    - ``sdpa`` / ``eager``: converts to a 4D block-causal bool mask (unchanged).
+      ``flash_attn_varlen_func``. No ``attention_mask`` is emitted so HF takes the
+      varlen-kwargs branch; the per-document map is preserved as ``_packed_seq_ids``
+      for loss and context-parallel consumers.
+    - ``sdpa`` / ``eager``: converts to a 4D block-causal bool mask.
 
     Args:
         batch: List of sample dicts produced by ``neat_pack_dataset``. Each holds

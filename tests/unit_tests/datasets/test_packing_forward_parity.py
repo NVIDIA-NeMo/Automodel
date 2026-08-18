@@ -19,8 +19,8 @@ must reproduce. This test proves the reference has no leakage -- a packed row's
 per-document logits equal each document run alone -- which, combined with the
 mask-equivalence test in ``test_packed_seq.py`` (flash cu_seqlens segmentation ==
 sdpa block-causal mask), pins the flash path to the same isolation. It also
-guards that removing the global ``create_causal_mask`` monkeypatch did not break
-the sdpa 4D-mask path (HuggingFace must pass a prebuilt 4D mask through natively).
+covers the sdpa 4D-mask path, where HuggingFace passes the prebuilt block-causal
+mask through natively.
 """
 
 import pytest
