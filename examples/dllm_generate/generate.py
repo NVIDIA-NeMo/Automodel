@@ -573,7 +573,9 @@ class SCDDSampler(DLLMSampler):
     * a ``[MASK]`` position un-absorbs into the denoiser's distribution or stays
       masked.
 
-    A final argmax denoise at the last time point clears any residual ``[MASK]``.
+    A final argmax denoise at the last time point (SCDD's ``noise_removal``)
+    rewrites every generated position, clearing residual ``[MASK]`` and any
+    wrong-but-visible tokens the uniform channel left behind.
 
     Unsupported knobs: ``use_kv_cache`` (every position is rewritten each step,
     so nothing can be cached), ``block_size``, ``remasking`` and ``threshold``
@@ -718,12 +720,13 @@ class SCDDSampler(DLLMSampler):
             x = x.clone()
             x[canvas] = torch.multinomial(rows, 1).squeeze(-1)
 
-        # Residual [MASK] positions cannot survive into the output; the final
-        # denoise reads them off the model's own distribution.
-        leftover = canvas & (x == self.mask_id)
-        if leftover.any():
+        # Final noise-removal denoise: argmax every canvas position, not just the
+        # residual [MASK]. At t = eps the uniform channel still leaves wrong-but-
+        # visible tokens that only this pass corrects; the mask column is -inf, so
+        # leftover [MASK] resolves too. The prompt is off-canvas and untouched.
+        if canvas.any():
             final = self._denoiser_log_probs(x, attention_mask, 0.0).argmax(-1)
-            x = torch.where(leftover, final, x)
+            x = torch.where(canvas, final, x)
 
         return x
 
