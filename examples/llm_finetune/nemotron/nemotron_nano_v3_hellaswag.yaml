@@ -104,7 +104,6 @@ ci:
     hf_device_map_auto: true
     experts_implementation: grouped_mm
     tokenizer_name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
-    skip_resume: true
     dataset.num_samples_limit: 500
     validation_dataset.num_samples_limit: 500
 

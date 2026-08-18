@@ -120,3 +120,10 @@ optimizer:
 
 ci:
   recipe_owner: hemildesai
+  nodes: 1
+  time: "01:00:00"
+  checkpoint_robustness:
+    tokenizer_name: zai-org/GLM-4.7-Flash
+    hf_device_map_auto: true
+    dataset.num_samples_limit: 500
+    validation_dataset.num_samples_limit: 500

@@ -319,17 +319,32 @@ def test_nemotron_flash_peft_robustness_keeps_supported_tp_topology(tmp_path):
 @pytest.mark.parametrize(
     "recipe_path",
     [
-        "examples/llm_finetune/qwen/qwen3_moe_30b_lora.yaml",
+        "examples/llm_finetune/deepseek_v4/deepseek_v4_flash_hellaswag_lora.yaml",
+        "examples/llm_finetune/ernie4_5/ernie4_5_21b_a3b_hellaswag.yaml",
+        "examples/llm_finetune/glm/glm_4.7_flash_te_deepep.yaml",
+        "examples/llm_finetune/gpt_oss/gpt_oss_20b.yaml",
+        "examples/llm_finetune/kimi/kimi_linear_48b_a3b_hellaswag.yaml",
+        "examples/llm_finetune/llama3_1/customizer_llama_3_1_8b_full_sft_tp.yaml",
+        "examples/llm_finetune/llama3_2/llama3_2_1b_hellaswag.yaml",
         "examples/llm_finetune/minimax_m2/minimax_m2.7_hellaswag_lora.yaml",
+        "examples/llm_finetune/mistral/mistral_7b_hellaswag_fp8.yaml",
+        "examples/llm_finetune/nemotron/nemotron_nano_v3_hellaswag.yaml",
+        "examples/llm_finetune/nemotron/nemotron_super_v3_hellaswag.yaml",
+        "examples/llm_finetune/nemotron_flash/nemotron_flash_1b_squad.yaml",
+        "examples/llm_finetune/qwen/qwen3_moe_30b_lora.yaml",
         "examples/vlm_finetune/gemma4/gemma4_26b_a4b_moe.yaml",
+        "examples/vlm_finetune/mistral4/mistral4_medpix.yaml",
+        "examples/vlm_finetune/qwen3/qwen3_vl_moe_30b_te_deepep.yaml",
+        "examples/vlm_finetune/qwen3_5_moe/qwen3_5_35b.yaml",
+        "examples/vlm_finetune/qwen3_8/qwen3_8_27b.yaml",
         "examples/vlm_finetune/stepfun/step3p7_medpix_200b_lora_pp8ep8_8node.yaml",
     ],
 )
 def test_calibration_recipes_enable_all_checkpoint_gates(tmp_path, recipe_path):
-    """Previously skipped parity recipes expose source, reload, and resume gates."""
+    """The representative calibration cohort exposes source, reload, and resume gates."""
     recipe_path = REPO_ROOT / recipe_path
     out = tmp_path / "resolved.yaml"
-    env = {"PIPELINE_DIR": str(tmp_path), "TEST_NAME": recipe_path.stem}
+    env = {"PIPELINE_DIR": str(tmp_path), "TEST_NAME": recipe_path.stem, "NEMO_CI_PATH": "/mnt/nci"}
     _run_resolver(
         ["--base", str(recipe_path), "--phase", "checkpoint_robustness", "--output", str(out)],
         env=env,
@@ -486,6 +501,8 @@ def test_retrieval_checkpoint_robustness_retains_calibrated_resume_threshold(tmp
     )
 
     robustness = yaml.load(out.open())["ci"]["checkpoint_robustness"]
+    assert robustness["check_hf_reload"] is True
+    assert robustness["check_resume"] is True
     assert robustness["resume_loss_threshold"] == 5e-2
     assert robustness["training_reproducibility_loss_threshold"] == 5e-2
 

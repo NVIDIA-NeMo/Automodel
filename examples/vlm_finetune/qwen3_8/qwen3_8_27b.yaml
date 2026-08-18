@@ -125,6 +125,9 @@ wandb:
 ci:
   recipe_owner: akoumpa
   nodes: 1
-  time: "00:15:00"
+  time: "01:00:00"
   env_vars:
     MAX_STEPS: 10
+  checkpoint_robustness:
+    tokenizer_name: Qwen/Qwen3.8-27B
+    hf_device_map_auto: true

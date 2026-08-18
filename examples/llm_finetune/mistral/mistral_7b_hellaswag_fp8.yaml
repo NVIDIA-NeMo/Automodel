@@ -129,6 +129,5 @@ ci:
     source_load_mean_kl_threshold: 3e-3
     source_load_cosine_threshold: 0.999
     tokenizer_name: mistralai/Mistral-7B-v0.1
-    skip_resume: true
     dataset.num_samples_limit: 500
     validation_dataset.num_samples_limit: 500
