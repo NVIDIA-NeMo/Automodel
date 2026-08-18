@@ -1,6 +1,6 @@
 ---
 title: "Kimi Linear"
-description: ""
+description: "Fine-tune Moonshot AI Kimi Linear 48B A3B with hybrid KDA and MLA attention on NeMo AutoModel."
 slug: model-coverage/large-language-models/moonshotai/kimi-linear
 ---
 [Kimi Linear](https://huggingface.co/moonshotai/Kimi-Linear-48B-A3B-Instruct) is a hybrid-attention Mixture-of-Experts language model from Moonshot AI. Most layers use Kimi Delta Attention (KDA), a gated linear-attention variant with a recurrent state, and the remaining layers use full Multi-Head Latent Attention (MLA). NeMo AutoModel ships a native `KimiLinear48BForCausalLM` implementation with expert parallelism, packed sequences, and context parallelism.
