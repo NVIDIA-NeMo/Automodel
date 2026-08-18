@@ -26,6 +26,7 @@ from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_bie
 from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm import (
     _PARITY_DOCUMENT_SHA256,
     _assert_peft_adapter_matches_checkpoint,
+    _automodel_reload_parity_policy,
     _compare_logits,
     _compare_source_load_parity,
     _dequantize_hf_fp8_weights_in_place,
@@ -734,6 +735,8 @@ def test_extract_custom_args_reads_semantic_skips_and_parity_settings(tmp_path):
         "    trust_remote_code: false\n"
         "    parity_sequence_length: 1024\n"
         "    parity_tolerance_profile: relaxed\n"
+        "    automodel_reload_mean_kl_threshold: 0.04\n"
+        "    automodel_reload_cosine_threshold: 0.99\n"
         "    hf_reload_timeout_seconds: 3600\n"
     )
 
@@ -747,6 +750,8 @@ def test_extract_custom_args_reads_semantic_skips_and_parity_settings(tmp_path):
     assert custom["trust_remote_code"] is False
     assert custom["parity_sequence_length"] == "1024"
     assert custom["parity_tolerance_profile"] == "relaxed"
+    assert custom["automodel_reload_mean_kl_threshold"] == "0.04"
+    assert custom["automodel_reload_cosine_threshold"] == "0.99"
     assert custom["hf_reload_timeout_seconds"] == "3600"
     assert remaining == ["--config", str(config_path)]
 
@@ -1290,6 +1295,21 @@ def test_repeatability_policy_is_same_implementation_and_informational():
     assert policy.enforce is False
 
 
+def test_automodel_reload_policy_uses_targeted_profile_threshold_overrides():
+    policy = _automodel_reload_parity_policy(
+        {
+            "parity_tolerance_profile": "relaxed",
+            "automodel_reload_mean_kl_threshold": "0.04",
+            "automodel_reload_cosine_threshold": "0.99",
+        }
+    )
+
+    assert policy.profile == "relaxed"
+    assert policy.mean_kl_threshold_override == 0.04
+    assert policy.p95_kl_threshold_override is None
+    assert policy.cosine_threshold_override == 0.99
+
+
 def test_compare_logits_persists_machine_readable_metrics(tmp_path):
     logits = torch.tensor([[[2.0, -2.0], [1.0, -1.0]]])
     policy = _LogitParityPolicy(
@@ -1335,6 +1355,33 @@ def test_compare_logits_marks_skipped_gate_as_informational(tmp_path):
     assert payload["within_active_thresholds"] is False
     assert payload["failures"] == []
     assert payload["threshold_failures"]
+
+
+def test_compare_logits_reports_and_applies_targeted_profile_threshold_overrides(tmp_path):
+    reference_logits = torch.tensor([[[20.0, -20.0]]])
+    candidate_logits = -reference_logits
+    policy = _LogitParityPolicy(
+        phase="phase_2",
+        comparison="automodel_model_reload",
+        comparison_kind="same_implementation",
+        profile="strict",
+        mean_kl_threshold_override=100.0,
+        p95_kl_threshold_override=100.0,
+        cosine_threshold_override=-1.0,
+    )
+
+    failure = _compare_logits(tmp_path, reference_logits, candidate_logits, policy)
+
+    assert failure is None
+    payload = json.loads((tmp_path / "parity_metrics/phase_2_automodel_model_reload.json").read_text())
+    assert payload["threshold_mode"] == "profile_with_numeric_overrides"
+    assert payload["profile_failures"]
+    assert payload["threshold_failures"] == []
+    assert payload["threshold_overrides"] == {
+        "mean_kl": 100.0,
+        "p95_kl": 100.0,
+        "cosine_similarity": -1.0,
+    }
 
 
 def test_dequantize_hf_fp8_weights_in_place_handles_linear_and_expert_parameters():

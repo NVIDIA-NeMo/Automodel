@@ -21,7 +21,9 @@ Launch: torchrun --nproc-per-node=<N> -m <this_module> --config <config.yaml>
     [--tokenizer_name <str>]
     [--source_load_kl_threshold <float>] [--source_load_mean_kl_threshold <float>]
     [--check_source_load_parity] [--check_fused_qkv_keys] [--check_phantom_keys] [--check_resume]
-    [--parity_tolerance_profile <strict|standard|relaxed|high_variance>]
+    [--parity_tolerance_profile <strict|standard|relaxed>]
+    [--automodel_reload_mean_kl_threshold <float>] [--automodel_reload_p95_kl_threshold <float>]
+    [--automodel_reload_cosine_threshold <float>]
     [--resume_tolerance_profile <strict|standard|relaxed>]
     [--resume_first_loss_threshold <float>] [--resume_loss_threshold <float>]
     [--skip_automodel_logit_parity] [--skip_hf_logit_parity] [--hf_adapter_ignored_key_prefix <str>]
@@ -63,6 +65,7 @@ from nemo_automodel.components.config._arg_parser import parse_args_and_load_con
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.shared.utils import dtype_from_str
 from tests.functional_tests.checkpoint_robustness.parity_metrics import (
+    _apply_parity_threshold_overrides,
     _compute_parity_metrics,
     _parity_failures,
     _resolve_parity_thresholds,
@@ -105,6 +108,9 @@ class _LogitParityPolicy:
     legacy_max_kl_threshold: float | None = None
     legacy_mean_kl_threshold: float | None = None
     legacy_cosine_threshold: float | None = None
+    mean_kl_threshold_override: float | None = None
+    p95_kl_threshold_override: float | None = None
+    cosine_threshold_override: float | None = None
 
 
 def _extract_custom_args(argv: list[str]) -> tuple[dict[str, str | bool], list[str]]:
@@ -115,6 +121,9 @@ def _extract_custom_args(argv: list[str]) -> tuple[dict[str, str | bool], list[s
         "--isolated_phase",
         "--cross_tp_size",
         "--cross_tp_kl_threshold",
+        "--automodel_reload_cosine_threshold",
+        "--automodel_reload_mean_kl_threshold",
+        "--automodel_reload_p95_kl_threshold",
         "--experts_implementation",
         "--hf_adapter_ignored_key_prefix",
         "--hf_device_map_max_memory_gib",
@@ -492,21 +501,40 @@ def _compare_logits(
         A failure message when an enforced gate fails, otherwise ``None``.
     """
     metrics = _compute_parity_metrics(reference_logits, candidate_logits)
-    thresholds = _resolve_parity_thresholds(policy.profile, policy.comparison_kind)
-    profile_failures = _parity_failures(metrics, thresholds)
-    active_failures = _parity_failures(
-        metrics,
-        thresholds,
-        legacy_max_kl_threshold=policy.legacy_max_kl_threshold,
-        legacy_mean_kl_threshold=policy.legacy_mean_kl_threshold,
-        legacy_cosine_threshold=policy.legacy_cosine_threshold,
-    )
+    profile_thresholds = _resolve_parity_thresholds(policy.profile, policy.comparison_kind)
+    threshold_overrides = {
+        "mean_kl": policy.mean_kl_threshold_override,
+        "p95_kl": policy.p95_kl_threshold_override,
+        "cosine_similarity": policy.cosine_threshold_override,
+    }
     legacy_thresholds = {
         "max_kl": policy.legacy_max_kl_threshold,
         "mean_kl": policy.legacy_mean_kl_threshold,
         "cosine_similarity": policy.legacy_cosine_threshold,
     }
+    uses_threshold_overrides = any(value is not None for value in threshold_overrides.values())
     uses_legacy_thresholds = any(value is not None for value in legacy_thresholds.values())
+    if uses_legacy_thresholds and uses_threshold_overrides:
+        raise ValueError("Cannot combine legacy parity thresholds with profile threshold overrides")
+    active_profile_thresholds = _apply_parity_threshold_overrides(
+        profile_thresholds,
+        mean_kl=policy.mean_kl_threshold_override,
+        p95_kl=policy.p95_kl_threshold_override,
+        cosine_similarity=policy.cosine_threshold_override,
+    )
+    profile_failures = _parity_failures(metrics, profile_thresholds)
+    active_failures = _parity_failures(
+        metrics,
+        active_profile_thresholds,
+        legacy_max_kl_threshold=policy.legacy_max_kl_threshold,
+        legacy_mean_kl_threshold=policy.legacy_mean_kl_threshold,
+        legacy_cosine_threshold=policy.legacy_cosine_threshold,
+    )
+    threshold_mode = "profile"
+    if uses_legacy_thresholds:
+        threshold_mode = "legacy_numeric"
+    elif uses_threshold_overrides:
+        threshold_mode = "profile_with_numeric_overrides"
     payload = {
         "schema_version": 1,
         "parity_document_sha256": _PARITY_DOCUMENT_SHA256,
@@ -514,9 +542,11 @@ def _compare_logits(
         "comparison": policy.comparison,
         "comparison_kind": policy.comparison_kind,
         "profile": policy.profile,
-        "profile_thresholds": thresholds.to_dict(),
+        "profile_thresholds": profile_thresholds.to_dict(),
+        "threshold_overrides": threshold_overrides,
+        "active_thresholds": None if uses_legacy_thresholds else active_profile_thresholds.to_dict(),
         "legacy_thresholds": legacy_thresholds,
-        "threshold_mode": "legacy_numeric" if uses_legacy_thresholds else "profile",
+        "threshold_mode": threshold_mode,
         "enforced": policy.enforce,
         "passed": not policy.enforce or not active_failures,
         "within_active_thresholds": not active_failures,
@@ -603,6 +633,21 @@ def _automodel_reload_parity_policy(custom_args: dict[str, str | bool]) -> _Logi
             or custom_args.get("skip_automodel_logit_parity", False)
         ),
         legacy_max_kl_threshold=legacy_max_kl_threshold,
+        mean_kl_threshold_override=(
+            float(custom_args["automodel_reload_mean_kl_threshold"])
+            if "automodel_reload_mean_kl_threshold" in custom_args
+            else None
+        ),
+        p95_kl_threshold_override=(
+            float(custom_args["automodel_reload_p95_kl_threshold"])
+            if "automodel_reload_p95_kl_threshold" in custom_args
+            else None
+        ),
+        cosine_threshold_override=(
+            float(custom_args["automodel_reload_cosine_threshold"])
+            if "automodel_reload_cosine_threshold" in custom_args
+            else None
+        ),
     )
 
 
@@ -2501,11 +2546,7 @@ def _run_process_isolated_checkpoint_phase(
                 reload_policy,
             )
         failure_message = _broadcast_rank0_failure(failure_message)
-        if (
-            reload_policy.profile in {"relaxed", "high_variance"}
-            or not reload_policy.enforce
-            or failure_message is not None
-        ):
+        if reload_policy.profile == "relaxed" or not reload_policy.enforce or failure_message is not None:
             repeated_restored_logits = _get_logits(
                 restored_trainer.model_parts[0],
                 input_ids,
@@ -2898,11 +2939,7 @@ def run_checkpoint_robustness(
             reload_policy,
         )
     automodel_reload_error = _broadcast_rank0_failure(automodel_reload_error)
-    if (
-        reload_policy.profile in {"relaxed", "high_variance"}
-        or not reload_policy.enforce
-        or automodel_reload_error is not None
-    ):
+    if reload_policy.profile == "relaxed" or not reload_policy.enforce or automodel_reload_error is not None:
         repeated_restored_logits = _get_logits(
             restored_trainer.model_parts[0],
             input_ids,

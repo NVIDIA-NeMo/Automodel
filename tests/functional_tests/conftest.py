@@ -122,6 +122,9 @@ _OVERRIDES = [
     "hf_adapter_ignored_key_prefix",
     "hf_reload_timeout_seconds",
     "resume_tolerance_profile",
+    "automodel_reload_mean_kl_threshold",
+    "automodel_reload_p95_kl_threshold",
+    "automodel_reload_cosine_threshold",
 ]
 
 _BOOLEAN_OVERRIDES = [

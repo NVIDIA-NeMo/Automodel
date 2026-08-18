@@ -73,11 +73,6 @@ _PARITY_PROFILES: dict[str, dict[_ComparisonKind, _ParityThresholds]] = {
         "cross_framework": _ParityThresholds(mean_kl=2.5e-2, p95_kl=1e-1, cosine_similarity=0.99),
         "cross_topology": _ParityThresholds(mean_kl=2e-2, p95_kl=5e-2, cosine_similarity=0.995),
     },
-    "high_variance": {
-        "same_implementation": _ParityThresholds(mean_kl=4e-2, p95_kl=5e-2, cosine_similarity=0.99),
-        "cross_framework": _ParityThresholds(mean_kl=5e-2, p95_kl=1e-1, cosine_similarity=0.985),
-        "cross_topology": _ParityThresholds(mean_kl=4e-2, p95_kl=5e-2, cosine_similarity=0.99),
-    },
 }
 
 
@@ -197,6 +192,28 @@ def _resolve_parity_thresholds(profile: str, comparison_kind: _ComparisonKind) -
     if profile not in _PARITY_PROFILES:
         raise ValueError(f"Unknown parity tolerance profile {profile!r}; expected one of {sorted(_PARITY_PROFILES)}")
     return _PARITY_PROFILES[profile][comparison_kind]
+
+
+def _apply_parity_threshold_overrides(
+    thresholds: _ParityThresholds,
+    *,
+    mean_kl: float | None = None,
+    p95_kl: float | None = None,
+    cosine_similarity: float | None = None,
+) -> _ParityThresholds:
+    """Replace selected profile gates with explicit model-specific values."""
+    for name, value in (("mean_kl", mean_kl), ("p95_kl", p95_kl)):
+        if value is not None and (not math.isfinite(value) or value < 0):
+            raise ValueError(f"{name} threshold override must be finite and non-negative, got {value}")
+    if cosine_similarity is not None and (not math.isfinite(cosine_similarity) or not -1.0 <= cosine_similarity <= 1.0):
+        raise ValueError(
+            f"cosine_similarity threshold override must be finite and between -1 and 1, got {cosine_similarity}"
+        )
+    return _ParityThresholds(
+        mean_kl=thresholds.mean_kl if mean_kl is None else mean_kl,
+        p95_kl=thresholds.p95_kl if p95_kl is None else p95_kl,
+        cosine_similarity=thresholds.cosine_similarity if cosine_similarity is None else cosine_similarity,
+    )
 
 
 def _parity_failures(

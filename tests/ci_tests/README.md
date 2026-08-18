@@ -63,7 +63,7 @@ ci:
   checkpoint_robustness:          # Optional. Enable robustness testing
     tokenizer_name: org/model
     parity_sequence_length: 2048  # Optional. Full-logit parity prompt length (default: 2048; 1K-4K recommended)
-    parity_tolerance_profile: standard  # Optional: strict, standard (default), relaxed, or high_variance
+    parity_tolerance_profile: standard  # Optional: strict, standard (default), or relaxed
     hf_device_map_auto: true      # Optional. Use for large HF reference loads that do not fit on one GPU
     # skip_resume: true           # Exceptional: skip native-checkpoint resume (Phase 4)
     # See checkpoint robustness section for all options
@@ -154,7 +154,7 @@ visible without making the default gate as unstable as max KL.
 Each vanilla-HF reference is forwarded twice through the same loaded model. The resulting `hf_source_self_repeat`
 or `hf_export_self_repeat` record is informational and distinguishes cross-framework drift from an unstable reference.
 Phase 1 likewise always emits an informational `automodel_reference_self_repeat` record. Phase 2 emits
-`automodel_reload_self_repeat` for the `relaxed` or `high_variance` profile, an informational reload gate, or a reload
+`automodel_reload_self_repeat` for the `relaxed` profile, an informational reload gate, or a reload
 comparison that exceeds its active thresholds. This keeps the dense passing path to one additional AutoModel forward
 while capturing both sides of the repeatability diagnosis for sensitive or failing configurations.
 
@@ -176,24 +176,22 @@ primary comparison includes that variability.
 | `strict` | `1e-7` / `1e-6` / `0.999999` | `1e-4` / `1e-3` / `0.9999` | `1e-6` / `1e-5` / `0.99999` |
 | `standard` (default) | `3e-3` / `1.2e-2` / `0.999` | `6e-3` / `3e-2` / `0.998` | `6e-3` / `3e-2` / `0.998` |
 | `relaxed` | `2e-2` / `5e-2` / `0.995` | `2.5e-2` / `1e-1` / `0.99` | `2e-2` / `5e-2` / `0.995` |
-| `high_variance` | `4e-2` / `5e-2` / `0.99` | `5e-2` / `1e-1` / `0.985` | `4e-2` / `5e-2` / `0.99` |
-
 Use `strict` for deterministic same-kernel paths and `standard` for dense models and numerically stable MoE paths.
 Reserve `relaxed` for demonstrated discontinuous distributed behavior, normally expert-parallel MoE routing, and
-document the evidence in the recipe. Use `high_variance` only when repeated scoped runs establish cross-process
-heavy-tail variation after exact checkpoint fingerprints/state and within-process self-repeat checks pass. It loosens
-mean KL and cosine while retaining the `relaxed` p95 guard, and must not be used for dense models. Model size, TP/PP,
-or MoE status alone does not justify either profile. A dense model that exceeds `standard` should be investigated; if
-a verified low-precision kernel still needs a different envelope, use an explicit numeric override with its rationale
-instead of silently assigning a looser profile. The comparison class is selected by the harness. For every profile, a
-cross-topology comparison is never stricter than the same-implementation comparison because changing topology adds a
-numerical variation source.
+document the evidence in the recipe. Model size, TP/PP, or MoE status alone does not justify it. A dense model that
+exceeds `standard` should be investigated. If one verified model exceeds a shared profile after exact checkpoint
+state and within-process repeatability checks pass, override only its necessary Phase 2 gate with
+`automodel_reload_mean_kl_threshold`, `automodel_reload_p95_kl_threshold`, or
+`automodel_reload_cosine_threshold`; every unspecified gate remains inherited from the selected profile. The
+comparison class is selected by the harness. For every profile, a cross-topology comparison is never stricter than
+the same-implementation comparison because changing topology adds a numerical variation source.
 
 Legacy numeric fields remain supported for exceptional models and preserve their existing semantics:
 `kl_threshold`, `hf_kl_threshold`, `cross_tp_kl_threshold`, and `source_load_kl_threshold` gate max KL;
 `source_load_mean_kl_threshold` gates mean KL; and `source_load_cosine_threshold` gates cosine similarity. If any
 legacy numeric field applies to a comparison, those explicit numeric gates are authoritative. Prefer a named profile
-for new recipes so broad CI calibration can converge on a small set of shared policies.
+for new recipes so broad CI calibration can converge on a small set of shared policies. The targeted
+`automodel_reload_*_threshold` fields are not legacy max-KL mode: they replace only the named Phase 2 profile gate.
 
 ### Phase Controls
 

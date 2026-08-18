@@ -354,7 +354,9 @@ def test_calibration_recipes_enable_all_checkpoint_gates(tmp_path, recipe_path):
     assert "check_source_load_parity" not in robustness
     assert "skip_source_load_parity" not in robustness
     if recipe_path.stem == "step3p7_medpix_200b_lora_pp8ep8_8node":
-        assert robustness["parity_tolerance_profile"] == "high_variance"
+        assert robustness["parity_tolerance_profile"] == "relaxed"
+        assert robustness["automodel_reload_mean_kl_threshold"] == 4e-2
+        assert robustness["automodel_reload_cosine_threshold"] == 0.99
         assert robustness["resume_tolerance_profile"] == "relaxed"
     assert "skip_automodel_reload_logit_parity" not in robustness
     informational_source_and_hf = {

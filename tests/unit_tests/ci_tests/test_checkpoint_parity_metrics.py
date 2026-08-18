@@ -17,6 +17,7 @@ import torch
 import torch.nn.functional as F
 
 from tests.functional_tests.checkpoint_robustness.parity_metrics import (
+    _apply_parity_threshold_overrides,
     _compute_parity_metrics,
     _parity_failures,
     _resolve_parity_thresholds,
@@ -98,27 +99,21 @@ def test_named_profiles_are_ordered_and_gate_mean_p95_and_cosine():
     strict = _resolve_parity_thresholds("strict", "cross_framework")
     standard = _resolve_parity_thresholds("standard", "cross_framework")
     relaxed = _resolve_parity_thresholds("relaxed", "cross_framework")
-    high_variance = _resolve_parity_thresholds("high_variance", "cross_framework")
     reference = torch.zeros(1, 100, 2)
     candidate = reference.clone()
     candidate[:, :10, 0] = 0.25
     metrics = _compute_parity_metrics(reference, candidate)
 
-    assert strict.mean_kl < standard.mean_kl < relaxed.mean_kl < high_variance.mean_kl
-    assert strict.p95_kl < standard.p95_kl < relaxed.p95_kl == high_variance.p95_kl
-    assert (
-        strict.cosine_similarity
-        > standard.cosine_similarity
-        > relaxed.cosine_similarity
-        > high_variance.cosine_similarity
-    )
+    assert strict.mean_kl < standard.mean_kl < relaxed.mean_kl
+    assert strict.p95_kl < standard.p95_kl < relaxed.p95_kl
+    assert strict.cosine_similarity > standard.cosine_similarity > relaxed.cosine_similarity
     failures = _parity_failures(metrics, strict)
     assert any("mean KL" in failure for failure in failures)
     assert any("p95 KL" in failure for failure in failures)
     assert any("cosine similarity" in failure for failure in failures)
 
 
-@pytest.mark.parametrize("profile", ["strict", "standard", "relaxed", "high_variance"])
+@pytest.mark.parametrize("profile", ["strict", "standard", "relaxed"])
 def test_comparison_kinds_never_make_cross_topology_stricter_than_same_implementation(profile):
     same_implementation = _resolve_parity_thresholds(profile, "same_implementation")
     cross_topology = _resolve_parity_thresholds(profile, "cross_topology")
@@ -140,9 +135,6 @@ def test_comparison_kinds_never_make_cross_topology_stricter_than_same_implement
         ("relaxed", "same_implementation", 2e-2, 5e-2, 0.995),
         ("relaxed", "cross_framework", 2.5e-2, 1e-1, 0.99),
         ("relaxed", "cross_topology", 2e-2, 5e-2, 0.995),
-        ("high_variance", "same_implementation", 4e-2, 5e-2, 0.99),
-        ("high_variance", "cross_framework", 5e-2, 1e-1, 0.985),
-        ("high_variance", "cross_topology", 4e-2, 5e-2, 0.99),
     ],
 )
 def test_calibrated_profile_thresholds(profile, comparison_kind, expected_mean_kl, expected_p95_kl, expected_cosine):
@@ -164,6 +156,24 @@ def test_legacy_numeric_overrides_preserve_max_kl_semantics():
 
     assert len(failures) == 1
     assert failures[0].startswith("max KL")
+
+
+def test_selected_numeric_overrides_preserve_other_profile_gates():
+    relaxed = _resolve_parity_thresholds("relaxed", "same_implementation")
+
+    overridden = _apply_parity_threshold_overrides(relaxed, mean_kl=4e-2, cosine_similarity=0.99)
+
+    assert overridden.mean_kl == 4e-2
+    assert overridden.p95_kl == relaxed.p95_kl
+    assert overridden.cosine_similarity == 0.99
+
+
+@pytest.mark.parametrize("bad_threshold", [float("nan"), float("inf"), -1.0])
+def test_invalid_profile_threshold_override_is_rejected(bad_threshold):
+    thresholds = _resolve_parity_thresholds("relaxed", "same_implementation")
+
+    with pytest.raises(ValueError, match="finite and non-negative"):
+        _apply_parity_threshold_overrides(thresholds, mean_kl=bad_threshold)
 
 
 def test_unknown_profile_is_rejected():

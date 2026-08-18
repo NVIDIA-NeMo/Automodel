@@ -172,8 +172,11 @@ ci:
     # HF is not self-repeatable, so only the two HF-based numerical gates are
     # informational. AutoModel reload remains blocking. Across three exact-state
     # scoped runs its mean KL varied from 0.00447 to 0.03215 while within-process
-    # self-repeat stayed bitwise zero, which is the high-variance routed-MoE policy.
-    parity_tolerance_profile: high_variance
+    # self-repeat stayed bitwise zero. Keep the shared relaxed profile and override
+    # only the two Phase 2 gates exceeded by this model; relaxed p95 remains active.
+    parity_tolerance_profile: relaxed
+    automodel_reload_mean_kl_threshold: 4e-2
+    automodel_reload_cosine_threshold: 0.99
     skip_source_load_logit_parity: true
     skip_hf_reload_logit_parity: true
     # Restored model/optimizer state and the first forward are exact. The
