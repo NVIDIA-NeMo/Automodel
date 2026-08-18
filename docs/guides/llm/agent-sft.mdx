@@ -74,16 +74,42 @@ llama-server -hf ggml-org/Qwen3.6-27B-GGUF:Q8_0 --port 8080
 **Serving the user model with vLLM or SGLang.** llama.cpp is not a requirement. `src/single-session.ts` registers the user model as a generic OpenAI provider (`api: "openai-completions"`) whose base URL is `LLAMA_BASE_URL`, so any OpenAI-compatible server works and no generator code has to change:
 
 ```bash
-vllm serve Qwen/Qwen3.6-27B --served-model-name Qwen/Qwen3.6-27B --port 8080
+vllm serve Qwen/Qwen3.6-27B --served-model-name Qwen/Qwen3.6-27B --port 8080 --default-chat-template-kwargs '{"enable_thinking": false}'
 ```
 
 ```bash
 export LLAMA_BASE_URL=http://localhost:8080/v1
 ```
 
+Disable thinking on the server, as shown above. The generator registers the user model with `reasoning: false` and opens its session with `thinkingLevel: "off"`, so it never sends the control that would turn thinking off at inference time. The packaged GGUF build answers without thinking anyway, which is why llama.cpp needs no flag, but a stock Qwen checkpoint served directly has it enabled by default. Leave it on and every generated user turn arrives wrapped in `</think>` and runs to thousands of characters instead of a short question, which lands in the persisted trace and then in the training data. The thinking block also stays in the message content rather than in a separate reasoning field, because the provider registration declares no reasoning support and the server parses none, so `lastAssistantText()` picks it up along with the question. On SGLang, disable thinking through the equivalent server-side option. As an alternative to the server flag, register the user model with Qwen chat-template compatibility (`reasoning: true` plus `compat.thinkingFormat: "qwen-chat-template"`) and keep the session thinking level off.
+
 Two things to keep aligned. `LOCAL_MODELS` ships GGUF repository ids, which vLLM supports only partially and SGLang does not serve, so replace `LOCAL_MODELS[0]` with the unquantized repository you actually serve. The generator sends that entry as the model id, so the served model name has to match it exactly. The placeholder `apiKey: "no-key"` in the provider registration is harmless, because neither server requires a key by default.
 
 </Tip>
+
+<Warning>
+**Make provider failures fail the run.** `runSession` awaits each `prompt()` without inspecting the
+result, so a provider error (an exhausted quota, a rate limit, an HTTP 402 or 429) produces an
+assistant message whose `stopReason` is `error`, and the loop moves on. The process still exits 0,
+still prints `Trace saved to ...`, and the batch path still counts the session as complete, so a
+truncated conversation reaches the dataset looking like a finished one. Add the check in your fork,
+next to the matrix changes above:
+
+```ts
+function assertCompleted(session: AgentSession, who: string) {
+	const last = session.messages.findLast((message) => message.role === "assistant");
+	if (last?.role === "assistant" && (last.stopReason === "error" || last.stopReason === "aborted")) {
+		throw new Error(`${who} turn ended with stopReason=${last.stopReason}`);
+	}
+}
+```
+
+Call it after each `prompt()` in the turn loop. The run then exits non-zero on the first failed
+turn instead of printing `Trace saved to ...`, so the batch path cannot count it as complete. Pi
+streams the session file as the conversation goes, so a partial file still lands on disk and
+should be discarded rather than uploaded.
+
+</Warning>
 
 With the server up, generate a small validation batch before scaling up:
 
