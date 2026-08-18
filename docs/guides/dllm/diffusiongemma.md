@@ -110,6 +110,6 @@ SFT training curves:
 
 ![DiffusionGemma SFT training curves](./diffusiongemma_sft.png)
 
-**LoRA**
+LoRA training curves:
 
 ![DiffusionGemma LoRA training curves](./diffusiongemma_lora.png)
