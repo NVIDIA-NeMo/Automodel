@@ -530,12 +530,13 @@ def test_get_vlm_input_ids_uses_processor_tokenizer(monkeypatch, offline, expect
     tokenizer.encode.assert_called_once_with(_get_parity_document(), add_special_tokens=False)
 
 
-def test_parity_document_is_the_checked_in_long_form_license():
+def test_parity_document_is_the_checked_in_long_form_finetuning_guide():
     document = _get_parity_document()
 
-    assert "Apache License" in document[:200]
-    assert "TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION" in document
-    assert len(document.split()) > 1_500
+    assert "Supervised Fine-Tuning (SFT) and Parameter-Efficient Fine-Tuning (PEFT)" in document[:200]
+    assert "## Configure Your Training Recipe" in document
+    assert "## Next Steps" in document
+    assert len(document.split()) > 6_000
 
 
 @pytest.mark.parametrize("input_ids_loader", [_get_input_ids, _get_vlm_input_ids])
@@ -567,12 +568,11 @@ def test_load_input_ids_once_shares_rank0_result(tmp_path, monkeypatch):
     rank0_reuse_loader.assert_not_called()
 
 
-def test_load_input_ids_once_repeats_short_document_to_parity_length(tmp_path):
+def test_load_input_ids_once_rejects_short_document_for_parity_length(tmp_path):
     cfg = SimpleNamespace(checkpoint=SimpleNamespace(checkpoint_dir=tmp_path / "checkpoints"))
 
-    input_ids = _load_input_ids_once(cfg, Mock(return_value=[7, 8, 9]), None, sequence_length=8)
-
-    assert input_ids == [7, 8, 9, 7, 8, 9, 7, 8]
+    with pytest.raises(ValueError, match="contains 3 tokens, but parity_sequence_length requires 8"):
+        _load_input_ids_once(cfg, Mock(return_value=[7, 8, 9]), None, sequence_length=8)
 
 
 def test_load_input_ids_once_truncates_long_document_to_parity_length(tmp_path):

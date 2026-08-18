@@ -343,6 +343,27 @@ def test_calibration_recipes_enable_all_checkpoint_gates(tmp_path, recipe_path):
     assert "skip_resume" not in robustness
 
 
+@pytest.mark.parametrize(
+    "recipe_path",
+    [
+        "examples/vlm_finetune/mistral4/mistral4_medpix.yaml",
+        "examples/vlm_finetune/stepfun/step3p7_medpix_200b_lora_pp8ep8_8node.yaml",
+    ],
+)
+def test_pp_vlm_checkpoint_parity_fits_static_sequence_length(tmp_path, recipe_path):
+    """PP VLM parity uses the full static next-token sequence without exceeding it."""
+    recipe_path = REPO_ROOT / recipe_path
+    out = tmp_path / "resolved.yaml"
+    env = {"PIPELINE_DIR": str(tmp_path), "TEST_NAME": recipe_path.stem}
+    _run_resolver(
+        ["--base", str(recipe_path), "--phase", "checkpoint_robustness", "--output", str(out)],
+        env=env,
+    )
+
+    robustness = yaml.load(out.open())["ci"]["checkpoint_robustness"]
+    assert robustness["parity_sequence_length"] == 2047
+
+
 def test_end_to_end_fixture_keys_not_applied_as_overrides(tmp_path):
     """Non-config fixture-arg keys in ci.checkpoint_robustness must not leak into the top-level config."""
     recipe = tmp_path / "llama_squad.yaml"

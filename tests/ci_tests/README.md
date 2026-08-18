@@ -62,7 +62,7 @@ ci:
   vllm_deploy_time: "00:30:00"    # Optional. Override the vLLM deploy SLURM wall time (defaults to 00:10:00)
   checkpoint_robustness:          # Optional. Enable robustness testing
     tokenizer_name: org/model
-    parity_sequence_length: 2048  # Optional. Full-logit parity prompt length (default: 2048)
+    parity_sequence_length: 2048  # Optional. Full-logit parity prompt length (default: 2048; 1K-4K recommended)
     parity_tolerance_profile: standard  # Optional: strict, standard (default), or relaxed
     hf_device_map_auto: true      # Optional. Use for large HF reference loads that do not fit on one GPU
     # skip_resume: true           # Exceptional: skip native-checkpoint resume (Phase 4)
@@ -130,11 +130,11 @@ rank-0 OOM.
 
 ### Full-Logit Metrics and Profiles
 
-Phases 0, 2, 3, and 5 compare every vocabulary logit for every prompt token. The fixed Apache License 2.0 document
-already checked into the repository is tokenized with each model's tokenizer, then truncated to
-`parity_sequence_length` tokens (default 2048). If a tokenizer produces fewer tokens, the complete document is repeated
-only as needed. This gives the test realistic long-form structure and token variety while remaining identical across
-isolated phases and CI runs. Reduce the length only when a model has a documented memory limit or a pipeline schedule
+Phases 0, 2, 3, and 5 compare every vocabulary logit for every prompt token. The checked-in long-form finetuning guide
+is tokenized with each model's tokenizer, then truncated to `parity_sequence_length` tokens (default 2048; 1K-4K is the
+recommended range). The guide contains more than 6,000 words, so a 4K test uses unique document content rather than a
+repeated short prompt. The harness fails with an actionable error instead of repeating content if a requested length
+exceeds the tokenized document. Reduce the length only when a model has a documented memory limit or a pipeline schedule
 with a shorter static sequence length.
 
 Every comparison reports mean, p95, and max per-token `KL(reference || candidate)`; whole-tensor cosine similarity;

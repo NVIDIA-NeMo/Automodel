@@ -87,7 +87,7 @@ from tests.functional_tests.checkpoint_robustness.resume_trajectory import (
 
 datasets.disable_caching()
 
-_PARITY_DOCUMENT_PATH = Path(__file__).resolve().parents[3] / "LICENSE"
+_PARITY_DOCUMENT_PATH = Path(__file__).resolve().parents[3] / "docs" / "guides" / "llm" / "finetune.mdx"
 
 
 @dataclass(frozen=True)
@@ -237,7 +237,7 @@ def _extract_custom_args(argv: list[str]) -> tuple[dict[str, str | bool], list[s
 
 
 def _get_input_ids(tokenizer_name: str | None) -> list[int]:
-    """Tokenize the repository's Apache License document for parity testing."""
+    """Tokenize the repository's long-form finetuning guide for parity testing."""
     if tokenizer_name is None:
         raise ValueError("tokenizer_name is required to tokenize the checkpoint parity document")
     from nemo_automodel import NeMoAutoTokenizer
@@ -445,13 +445,17 @@ def _rss_gb() -> float:
 
 
 def _fit_input_ids_to_sequence_length(input_ids: list[int], sequence_length: int) -> list[int]:
-    """Truncate or repeat a tokenized document to the requested parity length."""
+    """Truncate a tokenized document to the requested parity length."""
     if not input_ids:
         raise ValueError("Tokenized parity document must not be empty")
     if sequence_length <= 0:
         raise ValueError(f"parity_sequence_length must be positive, got {sequence_length}")
-    repeats, remainder = divmod(sequence_length, len(input_ids))
-    return input_ids * repeats + input_ids[:remainder]
+    if len(input_ids) < sequence_length:
+        raise ValueError(
+            f"Tokenized parity document contains {len(input_ids)} tokens, but parity_sequence_length requires "
+            f"{sequence_length}; choose a shorter sequence length or a longer parity document"
+        )
+    return input_ids[:sequence_length]
 
 
 def _compare_logits(
