@@ -16,7 +16,7 @@
 """End-to-end hybrid NemotronV3 CP test.
 
 Validates that a hybrid model with interleaved attention and mamba layers
-produces matching outputs/gradients between CP=1 and CP=N across five
+produces matching outputs/gradients between CP=1 and CP=N across six
 configurations:
 
   Config 1 (bshd_te):        3D BSHD input, TE p2p CP, DualChunkSwap
@@ -24,6 +24,7 @@ configurations:
   Config 3 (thd_te_packed):  2D THD input, TE p2p CP, multi-sequence packing, seq_idx
   Config 4 (bshd_sdpa):      3D BSHD input, DTensor context_parallel(), SDPA backend
   Config 5 (thd_te_mtp):     packed THD MTP loss, activations, gradients, optimizer step
+  Config 6 (bshd_sdpa_mtp):  packed BSHD SDPA MTP-Mamba loss and gradient parity
 
 Usage:
     torchrun --nproc_per_node=2 tests/functional_tests/context_parallel/run_hybrid_nemotron_v3_cp.py
@@ -188,7 +189,8 @@ def _wire_sdpa_cp(model, cp_group):
     """
     from nemo_automodel.components.distributed.context_parallel.mamba import MambaContextParallel
 
-    for layer in model.layers.values():
+    layers = model.layers.values() if hasattr(model.layers, "values") else model.layers
+    for layer in layers:
         if layer.block_type == "mamba":
             mixer = layer.mixer
             mixer.cp = MambaContextParallel(
@@ -649,28 +651,32 @@ def run_thd_te_mtp(rank, world_size, device, config):
     # document ignored.
     seq_idx_batched = seq_idx.unsqueeze(0)
     labels_full = shift_packed_tensor(input_ids, depth=1, seq_idx=seq_idx_batched, fill_value=-100).squeeze(0)
-    mtp_targets_full = shift_packed_tensor(
-        labels_full.unsqueeze(0), depth=1, seq_idx=seq_idx_batched, fill_value=-100
-    ).squeeze(0)
-    mtp_position_ids_full = shift_packed_tensor(
-        position_ids.unsqueeze(0),
-        depth=1,
-        seq_idx=seq_idx_batched,
-    ).squeeze(0)
+    mtp_inputs_full = model_baseline.prepare_mtp_inputs_for_cp(
+        {
+            "input_ids": input_ids,
+            "labels": labels_full.unsqueeze(0),
+            "position_ids": position_ids.unsqueeze(0),
+            "seq_idx": seq_idx.unsqueeze(0),
+        }
+    )
+    assert mtp_inputs_full is not None
+    mtp_input_ids_full = mtp_inputs_full.input_ids[0]
+    assert mtp_inputs_full.position_ids is not None
+    mtp_position_ids_full = mtp_inputs_full.position_ids[0]
+    mtp_targets_full = mtp_inputs_full.targets[0].squeeze(0)
+    torch.testing.assert_close(
+        mtp_targets_full,
+        shift_packed_tensor(labels_full.unsqueeze(0), depth=1, seq_idx=seq_idx_batched, fill_value=-100).squeeze(0),
+        rtol=0,
+        atol=0,
+    )
     num_label_tokens = int((labels_full != -100).sum().item())
     max_seqlen = torch.tensor(max(seq_len_a, seq_len_b), dtype=torch.int32, device=device)
 
-    embeddings_full = model_baseline.model.embed_tokens(input_ids).squeeze(0)
-    mtp_embeddings_full = shift_packed_tensor(
-        embeddings_full.unsqueeze(0),
-        depth=1,
-        seq_idx=seq_idx_batched,
-    ).squeeze(0)
     output_baseline = model_baseline(
-        None,
-        mtp_embeddings_full,
-        inputs_embeds=embeddings_full,
+        input_ids,
         position_ids=position_ids,
+        mtp_per_depth_input_ids=(mtp_input_ids_full,),
         mtp_per_depth_position_ids=(mtp_position_ids_full,),
         qkv_format="thd",
         cu_seqlens=cu_seqlens,
@@ -720,24 +726,27 @@ def run_thd_te_mtp(rank, world_size, device, config):
         raise AssertionError(
             f"TE packed CP assigned {token_counts[0]} tokens per rank; expected {total_len // world_size}"
         )
-    embeddings_cp_full = model_cp.model.embed_tokens(input_ids).squeeze(0)
-    mtp_embeddings_cp_full = shift_packed_tensor(
-        embeddings_cp_full.unsqueeze(0),
-        depth=1,
-        seq_idx=seq_idx_batched,
-    ).squeeze(0)
-    embeddings_local = embeddings_cp_full.index_select(0, local_indices)
-    mtp_embeddings_local = mtp_embeddings_cp_full.index_select(0, local_indices)
+    mtp_inputs_cp = model_cp.prepare_mtp_inputs_for_cp(
+        {
+            "input_ids": input_ids,
+            "labels": labels_full.unsqueeze(0),
+            "position_ids": position_ids.unsqueeze(0),
+            "seq_idx": seq_idx.unsqueeze(0),
+        }
+    )
+    assert mtp_inputs_cp is not None
+    assert mtp_inputs_cp.position_ids is not None
+    input_ids_local = input_ids.reshape(-1).index_select(0, local_indices)
+    mtp_input_ids_local = mtp_inputs_cp.input_ids[0].reshape(-1).index_select(0, local_indices)
     position_ids_local = position_ids.index_select(0, local_indices)
-    mtp_position_ids_local = mtp_position_ids_full.index_select(0, local_indices)
+    mtp_position_ids_local = mtp_inputs_cp.position_ids[0].reshape(-1).index_select(0, local_indices)
     labels_local = labels_full.index_select(0, local_indices)
-    mtp_targets_local = mtp_targets_full.index_select(0, local_indices)
+    mtp_targets_local = mtp_inputs_cp.targets[0].reshape(-1).index_select(0, local_indices)
 
     output_cp = model_cp(
-        None,
-        mtp_embeddings_local,
-        inputs_embeds=embeddings_local,
+        input_ids_local,
         position_ids=position_ids_local,
+        mtp_per_depth_input_ids=(mtp_input_ids_local,),
         mtp_per_depth_position_ids=(mtp_position_ids_local,),
         qkv_format="thd",
         cu_seqlens=cu_seqlens,
@@ -877,6 +886,211 @@ def run_thd_te_mtp(rank, world_size, device, config):
     return 0
 
 
+# ---------------------------------------------------------------------------
+# Config 6: BSHD + SDPA + packed MTP Mamba
+# ---------------------------------------------------------------------------
+def run_bshd_sdpa_mtp(rank, world_size, device, config):
+    """Packed BSHD MTP-Mamba CP=1/CP=N loss and gradient parity."""
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.tensor.experimental import context_parallel
+    from torch.distributed.tensor.experimental._attention import context_parallel_unshard, set_rotate_method
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+
+    from nemo_automodel._transformers.models.common import BackendConfig
+    from nemo_automodel._transformers.models.common.mtp import shift_packed_tensor
+    from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+    from nemo_automodel.components.loss.mtp import calculate_mtp_loss
+
+    config.mtp_hybrid_override_pattern = "M"
+    backend = BackendConfig(
+        linear="torch",
+        attn="sdpa",
+        rms_norm="torch",
+        experts="torch",
+        dispatcher="torch",
+        fake_balanced_gate=False,
+        enable_hf_state_dict_adapter=False,
+    )
+    model_baseline = _create_mtp_model(config, backend, device)
+
+    seq_len_a = seq_len_b = 32 * world_size
+    total_len = seq_len_a + seq_len_b
+    cu_seqlens = torch.tensor([0, seq_len_a, total_len], dtype=torch.int32, device=device)
+    seq_idx = torch.repeat_interleave(
+        torch.arange(2, dtype=torch.long, device=device),
+        torch.tensor([seq_len_a, seq_len_b], device=device),
+    ).unsqueeze(0)
+    position_ids = torch.cat(
+        [torch.arange(seq_len_a, device=device), torch.arange(seq_len_b, device=device)]
+    ).unsqueeze(0)
+
+    torch.manual_seed(2027)
+    input_ids = torch.randint(0, config.vocab_size, (1, total_len), device=device)
+    dist.broadcast(input_ids, src=0)
+    labels_full = shift_packed_tensor(input_ids, depth=1, seq_idx=seq_idx, fill_value=-100)
+    raw_packed_batch = {
+        "input_ids": input_ids,
+        "labels": labels_full,
+        "position_ids": position_ids,
+        "seq_lens": torch.tensor([[seq_len_a, seq_len_b]], device=device),
+        "seq_lens_padded": torch.tensor([[seq_len_a, seq_len_b]], device=device),
+    }
+    mtp_inputs_full = model_baseline.prepare_mtp_inputs_for_cp(raw_packed_batch)
+    assert mtp_inputs_full is not None
+    assert mtp_inputs_full.position_ids is not None
+    mtp_input_ids_full = mtp_inputs_full.input_ids[0]
+    mtp_position_ids_full = mtp_inputs_full.position_ids[0]
+    mtp_targets_full = mtp_inputs_full.targets[0]
+    num_label_tokens = int((labels_full != -100).sum().item())
+
+    with sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]):
+        output_baseline = model_baseline(
+            input_ids,
+            position_ids=position_ids,
+            mtp_per_depth_input_ids=(mtp_input_ids_full,),
+            mtp_per_depth_position_ids=(mtp_position_ids_full,),
+            qkv_format="thd",
+            cu_seqlens=cu_seqlens,
+            cp_rank=0,
+            cp_size=1,
+        )
+        loss_fn = MaskedCrossEntropy(reduction="sum")
+        mtp_loss_baseline = calculate_mtp_loss(
+            loss_fn,
+            mtp_per_depth_h=output_baseline.mtp_per_depth_h,
+            mtp_per_depth_targets=(mtp_targets_full,),
+            labels=labels_full,
+            model=model_baseline,
+            scaling_factor=1.0,
+            num_label_tokens=num_label_tokens,
+        )
+        mtp_loss_baseline.backward()
+
+    selected_names = (
+        "model.embed_tokens.weight",
+        "lm_head.weight",
+        "mtp.layers.0.mixer.in_proj.weight",
+    )
+    baseline_params = dict(model_baseline.named_parameters())
+    baseline_grads = {name: baseline_params[name].grad.detach().clone() for name in selected_names}
+
+    model_cp = _create_mtp_model(config, backend, device)
+    model_cp.load_state_dict(model_baseline.state_dict())
+    model_cp.zero_grad(set_to_none=True)
+    cp_mesh = init_device_mesh("cuda", (world_size,), mesh_dim_names=("cp",))
+    cp_group = cp_mesh["cp"].get_group()
+    _wire_sdpa_cp(model_cp.model, cp_group)
+    _wire_sdpa_cp(model_cp.mtp, cp_group)
+    set_rotate_method("allgather")
+
+    mtp_inputs_cp = model_cp.prepare_mtp_inputs_for_cp(
+        {
+            "input_ids": input_ids,
+            "labels": labels_full,
+            "position_ids": position_ids,
+            "seq_lens": raw_packed_batch["seq_lens"],
+            "seq_lens_padded": raw_packed_batch["seq_lens_padded"],
+        }
+    )
+    assert mtp_inputs_cp is not None
+    assert mtp_inputs_cp.position_ids is not None
+
+    input_ids_cp = input_ids.clone()
+    position_ids_cp = position_ids.clone()
+    labels_cp = labels_full.clone()
+    mtp_input_ids_cp = mtp_inputs_cp.input_ids[0].clone()
+    mtp_position_ids_cp = mtp_inputs_cp.position_ids[0].clone()
+    mtp_targets_cp = mtp_inputs_cp.targets[0].clone()
+    cp_buffers = [
+        input_ids_cp,
+        position_ids_cp,
+        labels_cp,
+        mtp_input_ids_cp,
+        mtp_position_ids_cp,
+        mtp_targets_cp,
+    ]
+    cp_ctx = context_parallel(
+        cp_mesh,
+        buffers=cp_buffers,
+        buffer_seq_dims=[1] * len(cp_buffers),
+        no_restore_buffers=set(cp_buffers),
+    )
+
+    with sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]):
+        with cp_ctx:
+            output_cp = model_cp(
+                input_ids_cp,
+                position_ids=position_ids_cp,
+                mtp_per_depth_input_ids=(mtp_input_ids_cp,),
+                mtp_per_depth_position_ids=(mtp_position_ids_cp,),
+                qkv_format="thd",
+                cu_seqlens=cu_seqlens,
+                cp_rank=rank,
+                cp_size=world_size,
+            )
+            mtp_loss_cp = calculate_mtp_loss(
+                loss_fn,
+                mtp_per_depth_h=output_cp.mtp_per_depth_h,
+                mtp_per_depth_targets=(mtp_targets_cp,),
+                labels=labels_cp,
+                model=model_cp,
+                scaling_factor=1.0,
+                num_label_tokens=num_label_tokens,
+            )
+            mtp_loss_cp.backward()
+
+    logits_cp, mtp_hidden_cp, targets_cp = context_parallel_unshard(
+        cp_mesh,
+        [
+            output_cp.logits.detach(),
+            output_cp.mtp_per_depth_h[0].detach(),
+            mtp_targets_cp,
+        ],
+        seq_dims=[1, 1, 1],
+    )
+    mtp_loss_cp_global = mtp_loss_cp.detach().clone()
+    dist.all_reduce(mtp_loss_cp_global, op=dist.ReduceOp.SUM, group=cp_group)
+    for parameter in model_cp.parameters():
+        if parameter.grad is not None:
+            dist.all_reduce(parameter.grad, op=dist.ReduceOp.SUM, group=cp_group)
+
+    cp_params = dict(model_cp.named_parameters())
+    logits_baseline = output_baseline.logits.detach()
+    mtp_hidden_baseline = output_baseline.mtp_per_depth_h[0].detach()
+
+    if rank == 0:
+        print("\n" + "=" * 70)
+        print("Config: bshd_sdpa_mtp - packed SDPA MTP-Mamba training parity")
+        print("=" * 70)
+        print(f"Targets: exact global reconstruction = {torch.equal(targets_cp, mtp_targets_full)}")
+        print(f"MTP loss: CP={mtp_loss_cp_global.item():.6f}, baseline={mtp_loss_baseline.detach().item():.6f}")
+        print(f"Backbone logits max diff: {(logits_cp - logits_baseline).abs().max().item():.6f}")
+        print(f"MTP hidden max diff: {(mtp_hidden_cp - mtp_hidden_baseline).abs().max().item():.6f}")
+
+    try:
+        torch.testing.assert_close(targets_cp, mtp_targets_full, rtol=0, atol=0)
+        torch.testing.assert_close(logits_cp, logits_baseline, rtol=2e-2, atol=5e-2)
+        torch.testing.assert_close(mtp_hidden_cp, mtp_hidden_baseline, rtol=2e-2, atol=1.25e-1)
+        torch.testing.assert_close(mtp_loss_cp_global, mtp_loss_baseline.detach(), rtol=2e-2, atol=3e-2)
+        for name in selected_names:
+            torch.testing.assert_close(
+                cp_params[name].grad,
+                baseline_grads[name],
+                rtol=1e-1,
+                atol=2e-1,
+                msg=f"CP MTP gradient differs for {name}",
+            )
+    except AssertionError as error:
+        if rank == 0:
+            print(f"  bshd_sdpa_mtp: FAILED - {error}")
+        return 1
+
+    if rank == 0:
+        print("  PASSED")
+        print("=" * 70)
+    return 0
+
+
 def main():
     init_distributed()
     rank = dist.get_rank()
@@ -899,6 +1113,7 @@ def main():
         "thd_te_packed": lambda: run_thd_te_packed(rank, world_size, device, config),
         "bshd_sdpa": lambda: run_bshd_sdpa(rank, world_size, device, config),
         "thd_te_mtp": lambda: run_thd_te_mtp(rank, world_size, device, config),
+        "bshd_sdpa_mtp": lambda: run_bshd_sdpa_mtp(rank, world_size, device, config),
     }
     requested_config = os.environ.get("NEMOTRON_CP_TEST_CONFIG")
     if requested_config:

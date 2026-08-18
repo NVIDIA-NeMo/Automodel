@@ -43,6 +43,7 @@ from nemo_automodel._transformers.models.common.tie_word_embeddings import (
     reject_unsupported_tie_word_embeddings,
 )
 from nemo_automodel._transformers.models.common.utils import compute_lm_head_logits
+from nemo_automodel._transformers.models.mistral3.state_dict_adapter import Mistral3FP8StateDictAdapter
 
 logger = logging.get_logger(__name__)
 
@@ -515,6 +516,7 @@ class Ministral3ForCausalLM(HFCheckpointingMixin, Ministral3PreTrainedModel, Gen
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
     _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
+    _supports_streaming_fp8_checkpoint_load = True
 
     @dataclass(frozen=True)
     class ModelCapabilities:
@@ -526,12 +528,31 @@ class Ministral3ForCausalLM(HFCheckpointingMixin, Ministral3PreTrainedModel, Gen
         supports_ep: bool = False
 
     def __init__(self, config: Ministral3Config):
+        quantization_config = getattr(config, "quantization_config", None)
+        quant_method = (
+            quantization_config.get("quant_method")
+            if isinstance(quantization_config, dict)
+            else getattr(quantization_config, "quant_method", None)
+        )
+        weight_block_size = (
+            quantization_config.get("weight_block_size")
+            if isinstance(quantization_config, dict)
+            else getattr(quantization_config, "weight_block_size", None)
+        )
+        if quant_method == "fp8" and weight_block_size is not None:
+            raise NotImplementedError(
+                "Ministral3ForCausalLM streaming FP8 loading currently supports per-tensor checkpoints only "
+                f"(weight_block_size must be null, got {weight_block_size!r})."
+            )
+
         reject_unsupported_tie_word_embeddings(type(self), config)
         super().__init__(config)
         self.model = Ministral3Model(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.post_init()
+        if quant_method == "fp8":
+            self.state_dict_adapter = Mistral3FP8StateDictAdapter.for_causal_lm()
 
     def get_input_embeddings(self):
         return self.model.embed_tokens

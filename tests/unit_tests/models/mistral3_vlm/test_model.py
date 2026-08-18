@@ -32,12 +32,12 @@ import torch.nn as nn
 from transformers import Mistral3Config
 
 from nemo_automodel._transformers.models.common.tie_word_embeddings import TieSupport, reject_tie_word_embeddings_flip
+from nemo_automodel._transformers.models.mistral3.state_dict_adapter import (
+    Mistral3FP8StateDictAdapter,
+)
 from nemo_automodel._transformers.models.mistral3_vlm.model import (
     Mistral3FP8VLMForConditionalGeneration,
     _rotary_reinit_self_hook,
-)
-from nemo_automodel._transformers.models.mistral3_vlm.state_dict_adapter import (
-    Mistral3FP8StateDictAdapter,
 )
 
 

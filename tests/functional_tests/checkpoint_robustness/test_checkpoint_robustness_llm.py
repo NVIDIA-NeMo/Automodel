@@ -21,6 +21,8 @@ Launch: torchrun --nproc-per-node=<N> -m <this_module> --config <config.yaml>
     [--tokenizer_name <str>]
     [--source_load_kl_threshold <float>] [--source_load_mean_kl_threshold <float>]
     [--check_source_load_parity] [--check_fused_qkv_keys] [--check_phantom_keys] [--check_resume]
+    [--resume_tolerance_profile <strict|standard|relaxed>]
+    [--resume_first_loss_threshold <float>] [--resume_loss_threshold <float>]
     [--skip_automodel_logit_parity] [--skip_hf_logit_parity] [--hf_adapter_ignored_key_prefix <str>]
     [--hf_source_post_load_dequantize]
     [--max_vram_gb <float>] [--max_cpu_gb <float>]
@@ -69,11 +71,12 @@ from tests.functional_tests.checkpoint_robustness.resume_trajectory import (
     _load_reference_trajectory,
     _persist_reference_trajectory,
     _persist_training_reproducibility,
+    _report_resume_comparison,
     _report_training_reproducibility,
+    _resolve_resume_loss_tolerance,
     _restored_state_mismatch,
     _resume_plan_from_config,
     _TrainingReproducibilityRecorder,
-    _trajectory_mismatch,
     _TrajectoryRecorder,
 )
 
@@ -101,6 +104,7 @@ def _extract_custom_args(argv):
         "--training_reproducibility_loss_threshold",
         "--resume_first_loss_threshold",
         "--resume_loss_threshold",
+        "--resume_tolerance_profile",
         "--source_load_cosine_threshold",
         "--source_load_kl_threshold",
         "--source_load_mean_kl_threshold",
@@ -2161,8 +2165,9 @@ def _run_process_isolated_checkpoint_phase(
     _raise_distributed_failure(failure_message)
     if _rank0():
         print(
-            "[Resume correctness] Model-adjacent checkpoint state matched exactly: optimizer, "
-            "LR/weight-decay schedulers, and RNG; dataloader position is verified by exact resumed batch identity"
+            "[Resume correctness] Optimizer counters/groups, LR scheduler, and RNG matched exactly after load; "
+            "model parameters and optimizer tensors are compared at the first pre-update point, after both "
+            "branches have entered the same FSDP lifecycle"
         )
 
     resume_recorder = _TrajectoryRecorder(resume_plan, capture_boundary_state=False)
@@ -2172,12 +2177,18 @@ def _run_process_isolated_checkpoint_phase(
     _report_phase("Isolated resume: training complete")
 
     resumed_trajectory = resume_recorder.to_dict()
-    local_failure = _trajectory_mismatch(
+    resume_tolerance = _resolve_resume_loss_tolerance(
+        custom_args.get("resume_tolerance_profile", "standard"),
+        first_step_override=custom_args.get("resume_first_loss_threshold"),
+        later_step_override=custom_args.get("resume_loss_threshold"),
+    )
+    comparison_report = _report_resume_comparison(
+        resume_plan,
         reference_trajectory,
         resumed_trajectory,
-        first_loss_threshold=float(custom_args.get("resume_first_loss_threshold", "1e-6")),
-        later_loss_threshold=float(custom_args.get("resume_loss_threshold", "5e-3")),
+        resume_tolerance,
     )
+    local_failure = comparison_report["blocking_failure"]
     failure_message = _gather_rank_failures(local_failure, check="shared_trajectory")
     _raise_distributed_failure(failure_message)
     _report_phase("Isolated resume: shared-trajectory checkpoint continuation verified; exiting phase")
@@ -2226,8 +2237,11 @@ def run_checkpoint_robustness(
     max_cpu_gb = float(custom_args.get("max_cpu_gb", "0"))
     check_phantom_keys = bool(custom_args.get("check_phantom_keys", False))
     check_resume = bool(custom_args.get("check_resume", False))
-    resume_first_loss_threshold = float(custom_args.get("resume_first_loss_threshold", "1e-6"))
-    resume_loss_threshold = float(custom_args.get("resume_loss_threshold", "5e-3"))
+    resume_tolerance = _resolve_resume_loss_tolerance(
+        custom_args.get("resume_tolerance_profile", "standard"),
+        first_step_override=custom_args.get("resume_first_loss_threshold"),
+        later_step_override=custom_args.get("resume_loss_threshold"),
+    )
     training_reproducibility_loss_threshold = float(custom_args.get("training_reproducibility_loss_threshold", "5e-2"))
     hf_device_map_auto = bool(custom_args.get("hf_device_map_auto", False))
     hf_source_post_load_dequantize = bool(custom_args.get("hf_source_post_load_dequantize", False))
@@ -2502,8 +2516,9 @@ def run_checkpoint_robustness(
         _raise_distributed_failure(failure_message)
         if _rank0():
             print(
-                "[Resume correctness] Restored optimizer, LR/weight-decay schedulers, and RNG exactly at the "
-                "Phase 1 boundary; dataloader position is verified by exact resumed batch identity"
+                "[Resume correctness] Restored optimizer counters/groups, LR scheduler, and RNG exactly at the "
+                "Phase 1 boundary; model parameters and optimizer tensors are compared at the first pre-update "
+                "point after both branches have entered the same FSDP lifecycle"
             )
 
         resumed_recorder = _TrajectoryRecorder(resume_plan, capture_boundary_state=False)
@@ -2513,19 +2528,22 @@ def run_checkpoint_robustness(
         _report_phase("Phase 6: resumed training complete")
 
         resumed_trajectory = resumed_recorder.to_dict()
-        local_failure = _trajectory_mismatch(
+        comparison_report = _report_resume_comparison(
+            resume_plan,
             reference_trajectory,
             resumed_trajectory,
-            first_loss_threshold=resume_first_loss_threshold,
-            later_loss_threshold=resume_loss_threshold,
+            resume_tolerance,
         )
+        local_failure = comparison_report["blocking_failure"]
         failure_message = _gather_rank_failures(local_failure, check="shared_trajectory")
         _raise_distributed_failure(failure_message)
         if _rank0():
             print(
                 f"[Resume correctness] Shared-trajectory continuation verified for "
-                f"{resume_plan.continuation_steps} steps; first-step threshold={resume_first_loss_threshold:.3e}, "
-                f"later-step threshold={resume_loss_threshold:.3e}"
+                f"{resume_plan.continuation_steps} steps; profile={resume_tolerance.profile}, "
+                f"first-step atol/rtol={resume_tolerance.first_step_atol:.3e}/"
+                f"{resume_tolerance.first_step_rtol:.3e}, later-step atol/rtol="
+                f"{resume_tolerance.later_step_atol:.3e}/{resume_tolerance.later_step_rtol:.3e}"
             )
 
         _release_recipe_memory(resume_trainer)

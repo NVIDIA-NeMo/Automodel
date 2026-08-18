@@ -48,7 +48,7 @@ from nemo_automodel._transformers.models.common.tie_word_embeddings import (
     reject_unsupported_tie_word_embeddings,
 )
 from nemo_automodel._transformers.models.common.utils import compute_lm_head_logits
-from nemo_automodel._transformers.models.mistral3_vlm.state_dict_adapter import (
+from nemo_automodel._transformers.models.mistral3.state_dict_adapter import (
     Mistral3FP8StateDictAdapter,
 )
 
@@ -130,6 +130,7 @@ class Mistral3FP8VLMForConditionalGeneration(_HFMistral3ForConditionalGeneration
     # indefinitely (empirically verified: without this attribute the 4-layer
     # smoke never reaches the adapter load stage within 300s).
     _skip_init_weights_on_load = True
+    _supports_streaming_fp8_checkpoint_load = True
 
     @dataclass(frozen=True)
     class ModelCapabilities:
