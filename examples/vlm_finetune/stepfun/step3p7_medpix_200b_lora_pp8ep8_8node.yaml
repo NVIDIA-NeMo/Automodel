@@ -173,4 +173,7 @@ ci:
     skip_source_load_logit_parity: true
     skip_automodel_reload_logit_parity: true
     skip_hf_reload_logit_parity: true
+    # Restored model/optimizer state and the first forward are exact. The
+    # process-sensitive MoE path diverges only after computing the next update.
+    resume_tolerance_profile: relaxed
     tokenizer_name: stepfun-ai/Step-3.7-Flash
