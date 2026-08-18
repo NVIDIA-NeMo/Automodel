@@ -43,6 +43,7 @@ from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm
     _load_hf_fp8_dequantized_config,
     _load_input_ids_once,
     _LogitParityPolicy,
+    _model_pretrained_path,
     _normalize_peft_no_split_modules,
     _patch_remote_masking_api_compatibility,
     _peft_adapter_load_kwargs,
@@ -52,6 +53,7 @@ from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm
     _record_deferred_failure,
     _resolve_hf_model_class,
     _run_process_isolated_checkpoint_phase,
+    _set_model_pretrained_path,
     _source_load_parity_policy,
     _trainable_parameter_digests,
     _wait_for_hf_reload_rank0,
@@ -59,6 +61,42 @@ from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm
 )
 from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_vlm import _get_vlm_input_ids
 from tests.functional_tests.checkpoint_robustness.test_checkpoint_vllm_deploy import _tokenize_for_generation
+
+
+def test_model_pretrained_path_resolves_direct_recipe_path():
+    model_cfg = SimpleNamespace(pretrained_model_name_or_path="org/direct-model")
+
+    assert _model_pretrained_path(model_cfg) == "org/direct-model"
+
+
+def test_model_pretrained_path_resolves_config_based_recipe_path():
+    model_cfg = SimpleNamespace(
+        config=SimpleNamespace(
+            pretrained_model_name_or_path="org/config-model",
+            name_or_path="org/config-model",
+        )
+    )
+
+    assert _model_pretrained_path(model_cfg) == "org/config-model"
+
+
+def test_set_model_pretrained_path_retargets_config_based_recipe():
+    nested_config = SimpleNamespace(
+        pretrained_model_name_or_path="org/source-model",
+        name_or_path="org/source-model",
+    )
+    model_cfg = SimpleNamespace(config=nested_config)
+
+    _set_model_pretrained_path(model_cfg, "/tmp/exported-model")
+
+    assert nested_config.pretrained_model_name_or_path == "/tmp/exported-model"
+    assert nested_config.name_or_path == "/tmp/exported-model"
+    assert not hasattr(model_cfg, "pretrained_model_name_or_path")
+
+
+def test_model_pretrained_path_rejects_recipe_without_source_path():
+    with pytest.raises(ValueError, match="model.config.pretrained_model_name_or_path"):
+        _model_pretrained_path(SimpleNamespace())
 
 
 def test_resolve_hf_model_class_uses_advertised_causal_lm_for_vlm_checkpoint():
@@ -389,6 +427,20 @@ def test_explicit_attention_implementation_is_preserved():
     assert hf_kwargs["attn_implementation"] == "eager"
 
 
+def test_hf_source_load_kwargs_explicit_false_disables_recipe_remote_code():
+    hf_kwargs = _hf_source_load_kwargs(
+        {"trust_remote_code": True},
+        pretrained_model_name_or_path="model-path",
+        source_dtype=torch.bfloat16,
+        trust_remote_code=False,
+        experts_implementation=None,
+        device=torch.device("cpu"),
+        hf_device_map_auto=False,
+    )
+
+    assert hf_kwargs["trust_remote_code"] is False
+
+
 def test_hf_source_load_kwargs_passes_grouped_experts_implementation():
     hf_kwargs = _hf_source_load_kwargs(
         {},
@@ -669,9 +721,11 @@ def test_extract_custom_args_reads_semantic_skips_and_parity_settings(tmp_path):
         "ci:\n"
         "  checkpoint_robustness:\n"
         "    skip_source_load_parity: true\n"
+        "    skip_source_load_logit_parity: true\n"
         "    skip_resume: true\n"
         "    skip_automodel_reload_logit_parity: true\n"
         "    skip_hf_reload_logit_parity: true\n"
+        "    trust_remote_code: false\n"
         "    parity_sequence_length: 1024\n"
         "    parity_tolerance_profile: relaxed\n"
     )
@@ -680,8 +734,10 @@ def test_extract_custom_args_reads_semantic_skips_and_parity_settings(tmp_path):
 
     assert custom["check_source_load_parity"] is False
     assert custom["check_resume"] is False
+    assert custom["skip_source_load_logit_parity"] is True
     assert custom["skip_automodel_reload_logit_parity"] is True
     assert custom["skip_hf_reload_logit_parity"] is True
+    assert custom["trust_remote_code"] is False
     assert custom["parity_sequence_length"] == "1024"
     assert custom["parity_tolerance_profile"] == "relaxed"
     assert remaining == ["--config", str(config_path)]
@@ -933,6 +989,7 @@ def test_process_isolated_source_load_reference_persists_hf_artifacts(tmp_path):
         experts_implementation=None,
         hf_device_map_auto=True,
         hf_source_post_load_dequantize=False,
+        parity_tolerance_profile="standard",
     )
     persisted_logits = torch.load(
         tmp_path / ".checkpoint_robustness" / "source_load_reference_logits.pt",
@@ -1205,6 +1262,12 @@ def test_source_load_parity_success_returns_no_deferred_failure(tmp_path):
     )
 
     assert failure is None
+
+
+def test_source_load_logit_skip_keeps_metrics_informational():
+    policy = _source_load_parity_policy({"skip_source_load_logit_parity": True})
+
+    assert policy.enforce is False
 
 
 def test_compare_logits_persists_machine_readable_metrics(tmp_path):

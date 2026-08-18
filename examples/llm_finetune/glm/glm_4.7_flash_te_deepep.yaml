@@ -123,6 +123,10 @@ ci:
   nodes: 1
   time: "01:00:00"
   checkpoint_robustness:
+    # Keep reference loads and full metrics, but do not calibrate shared profiles
+    # from the currently mismatched HF implementation.
+    skip_source_load_logit_parity: true
+    skip_hf_reload_logit_parity: true
     tokenizer_name: zai-org/GLM-4.7-Flash
     hf_device_map_auto: true
     dataset.num_samples_limit: 500

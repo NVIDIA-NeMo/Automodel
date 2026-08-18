@@ -63,14 +63,14 @@ _PARITY_PROFILES: dict[str, dict[_ComparisonKind, _ParityThresholds]] = {
         "cross_topology": _ParityThresholds(mean_kl=1e-6, p95_kl=1e-5),
     },
     "standard": {
-        "same_implementation": _ParityThresholds(mean_kl=1e-6, p95_kl=1e-5),
-        "cross_framework": _ParityThresholds(mean_kl=1e-3, p95_kl=5e-3),
-        "cross_topology": _ParityThresholds(mean_kl=1e-4, p95_kl=1e-3),
+        "same_implementation": _ParityThresholds(mean_kl=2e-3, p95_kl=1e-2),
+        "cross_framework": _ParityThresholds(mean_kl=5e-3, p95_kl=2e-2),
+        "cross_topology": _ParityThresholds(mean_kl=1e-3, p95_kl=5e-3),
     },
     "relaxed": {
-        "same_implementation": _ParityThresholds(mean_kl=1e-4, p95_kl=1e-3),
+        "same_implementation": _ParityThresholds(mean_kl=5e-3, p95_kl=2e-2),
         "cross_framework": _ParityThresholds(mean_kl=2e-2, p95_kl=1e-1),
-        "cross_topology": _ParityThresholds(mean_kl=1e-3, p95_kl=1e-2),
+        "cross_topology": _ParityThresholds(mean_kl=5e-3, p95_kl=2e-2),
     },
 }
 

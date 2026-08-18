@@ -341,7 +341,7 @@ def test_nemotron_flash_peft_robustness_keeps_supported_tp_topology(tmp_path):
     ],
 )
 def test_calibration_recipes_enable_all_checkpoint_gates(tmp_path, recipe_path):
-    """The representative calibration cohort exposes source, reload, and resume gates."""
+    """The calibration cohort runs every phase and documents any informational logit gate."""
     recipe_path = REPO_ROOT / recipe_path
     out = tmp_path / "resolved.yaml"
     env = {"PIPELINE_DIR": str(tmp_path), "TEST_NAME": recipe_path.stem, "NEMO_CI_PATH": "/mnt/nci"}
@@ -353,9 +353,28 @@ def test_calibration_recipes_enable_all_checkpoint_gates(tmp_path, recipe_path):
     robustness = yaml.load(out.open())["ci"]["checkpoint_robustness"]
     assert "check_source_load_parity" not in robustness
     assert "skip_source_load_parity" not in robustness
-    assert "skip_automodel_reload_logit_parity" not in robustness
-    assert "skip_hf_reload_logit_parity" not in robustness
-    assert "skip_resume" not in robustness
+    if recipe_path.stem == "step3p7_medpix_200b_lora_pp8ep8_8node":
+        assert robustness["skip_automodel_reload_logit_parity"] is True
+    else:
+        assert "skip_automodel_reload_logit_parity" not in robustness
+    informational_source_and_hf = {
+        "gemma4_26b_a4b_moe",
+        "glm_4.7_flash_te_deepep",
+        "minimax_m2.7_hellaswag_lora",
+        "step3p7_medpix_200b_lora_pp8ep8_8node",
+    }
+    if recipe_path.stem in informational_source_and_hf:
+        assert robustness["skip_source_load_logit_parity"] is True
+        assert robustness["skip_hf_reload_logit_parity"] is True
+    else:
+        assert "skip_source_load_logit_parity" not in robustness
+        assert "skip_hf_reload_logit_parity" not in robustness
+    if recipe_path.stem == "nemotron_flash_1b_squad":
+        assert robustness["skip_hf_reload"] is True
+    if recipe_path.stem == "customizer_llama_3_1_8b_full_sft_tp":
+        assert robustness["skip_resume"] is True
+    else:
+        assert "skip_resume" not in robustness
 
 
 def test_end_to_end_fixture_keys_not_applied_as_overrides(tmp_path):
@@ -366,6 +385,7 @@ def test_end_to_end_fixture_keys_not_applied_as_overrides(tmp_path):
         "ci:\n"
         "  checkpoint_robustness:\n"
         "    skip_source_load_parity: true               # fixture arg, must NOT become top-level\n"
+        "    skip_source_load_logit_parity: true         # fixture arg, must NOT become top-level\n"
         "    skip_automodel_reload_logit_parity: true    # fixture arg, must NOT become top-level\n"
         "    skip_hf_reload_logit_parity: true           # fixture arg, must NOT become top-level\n"
         "    hf_adapter_ignored_key_prefix: base_model.model.mtp.  # fixture arg, must NOT become top-level\n"
@@ -392,6 +412,7 @@ def test_end_to_end_fixture_keys_not_applied_as_overrides(tmp_path):
     # and do NOT pollute the top level.
     assert "hf_kl_threshold" not in resolved
     assert "skip_source_load_parity" not in resolved
+    assert "skip_source_load_logit_parity" not in resolved
     assert "skip_automodel_reload_logit_parity" not in resolved
     assert "skip_hf_reload_logit_parity" not in resolved
     assert "hf_adapter_ignored_key_prefix" not in resolved
@@ -406,6 +427,7 @@ def test_end_to_end_fixture_keys_not_applied_as_overrides(tmp_path):
     assert "tokenizer_name" not in resolved
     assert resolved["ci"]["checkpoint_robustness"]["hf_kl_threshold"] == 5e-3
     assert resolved["ci"]["checkpoint_robustness"]["skip_source_load_parity"] is True
+    assert resolved["ci"]["checkpoint_robustness"]["skip_source_load_logit_parity"] is True
     assert resolved["ci"]["checkpoint_robustness"]["skip_automodel_reload_logit_parity"] is True
     assert resolved["ci"]["checkpoint_robustness"]["skip_hf_reload_logit_parity"] is True
     assert resolved["ci"]["checkpoint_robustness"]["hf_adapter_ignored_key_prefix"] == "base_model.model.mtp."
@@ -456,28 +478,36 @@ def test_vlm_checkpoint_robustness_recipes_resolve(tmp_path, recipe_path):
         assert robustness["hf_device_map_auto"] is True
     if "/mistral4/" in recipe_path:
         assert robustness["hf_source_post_load_dequantize"] is True
-        assert robustness["kl_threshold"] == 5e-2
-        assert robustness["source_load_kl_threshold"] == 1e-2
-        assert robustness["source_load_mean_kl_threshold"] == 2e-3
-        assert robustness["source_load_cosine_threshold"] == 0.999
-        assert robustness["hf_kl_threshold"] == 5e-2
+        assert robustness["parity_tolerance_profile"] == "relaxed"
+        for key in (
+            "kl_threshold",
+            "source_load_kl_threshold",
+            "source_load_mean_kl_threshold",
+            "source_load_cosine_threshold",
+            "hf_kl_threshold",
+        ):
+            assert key not in robustness
     if Path(recipe_path).stem == "qwen3_vl_moe_30b_te_deepep":
-        assert robustness["hf_kl_threshold"] == 2.5e-2
         assert "resume_loss_threshold" not in robustness
         assert robustness["training_reproducibility_loss_threshold"] == 2e-2
-        assert robustness["source_load_kl_threshold"] == 4e-2
-        assert robustness["source_load_mean_kl_threshold"] == 7e-3
+        for key in (
+            "hf_kl_threshold",
+            "source_load_kl_threshold",
+            "source_load_mean_kl_threshold",
+            "source_load_cosine_threshold",
+        ):
+            assert key not in robustness
     if Path(recipe_path).stem == "qwen3_5_35b":
         assert robustness["experts_implementation"] == "grouped_mm"
         for key in (
             "hf_keep_in_fp32_modules",
             "resume_loss_threshold",
+            "hf_kl_threshold",
+            "source_load_cosine_threshold",
+            "source_load_kl_threshold",
+            "source_load_mean_kl_threshold",
         ):
             assert key not in robustness
-        assert robustness["hf_kl_threshold"] == 1e-1
-        assert robustness["source_load_cosine_threshold"] == 0.9985
-        assert robustness["source_load_kl_threshold"] == 1e-1
-        assert robustness["source_load_mean_kl_threshold"] == 1e-2
         assert resolved["loss_fn"]["_target_"] == ("nemo_automodel.components.loss.chunked_ce.ChunkedCrossEntropy")
         assert resolved["model"]["backend"]["experts"] == "torch_mm"
         assert resolved["step_scheduler"]["global_batch_size"] == 16

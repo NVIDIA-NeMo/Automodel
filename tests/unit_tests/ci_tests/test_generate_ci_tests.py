@@ -219,9 +219,12 @@ def test_generate_qwen3_moe_lora_uses_all_isolated_checkpoint_phases():
     assert "skip_automodel_reload_logit_parity" not in robustness
     assert "skip_hf_reload_logit_parity" not in robustness
     assert "skip_resume" not in robustness
-    assert robustness["source_load_kl_threshold"] == 3e-2
-    assert robustness["source_load_mean_kl_threshold"] == 6e-3
-    assert robustness["source_load_cosine_threshold"] == 0.997
+    for key in (
+        "source_load_kl_threshold",
+        "source_load_mean_kl_threshold",
+        "source_load_cosine_threshold",
+    ):
+        assert key not in robustness
 
 
 def test_generate_qwen3_moe_te_deepep_uses_isolated_source_and_reload_phases():

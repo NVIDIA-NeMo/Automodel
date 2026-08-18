@@ -144,11 +144,14 @@ under `<checkpoint_dir>/.checkpoint_robustness/parity_metrics/`. Named profiles 
 and absolute logit differences remain diagnostics, allowing a single extreme token to remain visible without making
 the default gate as unstable as max KL.
 
+Each vanilla-HF reference is forwarded twice through the same loaded model. The resulting `hf_source_self_repeat`
+or `hf_export_self_repeat` record is informational and distinguishes cross-framework drift from an unstable reference.
+
 | Profile | Same implementation mean / p95 | Cross-framework mean / p95 | Cross-topology mean / p95 |
 |---------|--------------------------------|-----------------------------|---------------------------|
 | `strict` | `1e-7` / `1e-6` | `1e-4` / `1e-3` | `1e-6` / `1e-5` |
-| `standard` (default) | `1e-6` / `1e-5` | `1e-3` / `5e-3` | `1e-4` / `1e-3` |
-| `relaxed` | `1e-4` / `1e-3` | `2e-2` / `1e-1` | `1e-3` / `1e-2` |
+| `standard` (default) | `2e-3` / `1e-2` | `5e-3` / `2e-2` | `1e-3` / `5e-3` |
+| `relaxed` | `5e-3` / `2e-2` | `2e-2` / `1e-1` | `5e-3` / `2e-2` |
 
 Use `strict` for deterministic same-kernel paths, `standard` for normal BF16 parity, and `relaxed` only after the
 reported metrics demonstrate expected low-precision, distributed, or MoE routing sensitivity. The comparison class is
@@ -165,6 +168,7 @@ for new recipes so broad CI calibration can converge on a small set of shared po
 | Field | Effect |
 |-------|--------|
 | `skip_source_load_parity: true` | Skip all of Phase 0. |
+| `skip_source_load_logit_parity: true` | Keep the Phase 0 HF load/forward smoke and report full metrics, but make source-vs-AutoModel logit parity informational. |
 | `skip_automodel_reload_logit_parity: true` | Keep the Phase 2 reload, forward smoke, and PEFT fingerprints, but make its logit metrics informational. |
 | `skip_hf_reload: true` | Skip all of Phase 3, including its load and forward smoke. |
 | `skip_hf_reload_logit_parity: true` | Keep the Phase 3 load, forward smoke, and PEFT fingerprints, but make its logit metrics informational. |

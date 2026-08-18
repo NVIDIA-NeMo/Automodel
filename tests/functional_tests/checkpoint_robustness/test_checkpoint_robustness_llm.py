@@ -140,6 +140,7 @@ def _extract_custom_args(argv: list[str]) -> tuple[dict[str, str | bool], list[s
         "--no_check_resume",
         "--skip_resume",
         "--skip_source_load_parity",
+        "--skip_source_load_logit_parity",
         "--skip_hf_reload",
         "--skip_automodel_logit_parity",
         "--skip_automodel_reload_logit_parity",
@@ -190,8 +191,10 @@ def _extract_custom_args(argv: list[str]) -> tuple[dict[str, str | bool], list[s
                     # Dotted keys are config overrides (e.g. distributed.tp_size),
                     # route them to the config parser instead of the custom dict.
                     remaining.extend([f"--{k}", str(v)])
-                elif isinstance(v, bool) and v:
-                    custom[k] = True
+                elif isinstance(v, bool) and (v or k == "trust_remote_code"):
+                    # ``false`` is meaningful for trust_remote_code: it must be
+                    # able to override a recipe model that normally uses remote code.
+                    custom[k] = v
                 elif not isinstance(v, bool):
                     custom[k] = str(v)
 
@@ -558,7 +561,7 @@ def _source_load_parity_policy(custom_args: dict[str, str | bool], *, enforce: b
         comparison="source_load",
         comparison_kind="cross_framework",
         profile=str(custom_args.get("parity_tolerance_profile", "standard")),
-        enforce=enforce,
+        enforce=enforce and not bool(custom_args.get("skip_source_load_logit_parity", False)),
         legacy_max_kl_threshold=(
             float(custom_args.get("source_load_kl_threshold", "5e-3")) if uses_legacy_thresholds else None
         ),
@@ -568,6 +571,17 @@ def _source_load_parity_policy(custom_args: dict[str, str | bool], *, enforce: b
         legacy_cosine_threshold=(
             float(custom_args.get("source_load_cosine_threshold", "0.9999")) if uses_legacy_thresholds else None
         ),
+    )
+
+
+def _hf_repeatability_policy(*, phase: str, comparison: str, profile: str) -> _LogitParityPolicy:
+    """Build an informational policy for two forwards through one loaded HF model."""
+    return _LogitParityPolicy(
+        phase=phase,
+        comparison=comparison,
+        comparison_kind="same_implementation",
+        profile=profile,
+        enforce=False,
     )
 
 
@@ -751,6 +765,48 @@ def _model_kwargs_from_config(model_cfg: ConfigNode) -> dict:
     }
 
 
+def _model_pretrained_path(model_cfg: ConfigNode, model_kwargs: dict | None = None) -> str | Path:
+    """Resolve the source checkpoint for from-pretrained and config-based recipes."""
+    direct_path = getattr(model_cfg, "pretrained_model_name_or_path", None)
+    if direct_path:
+        return direct_path
+
+    nested_config = getattr(model_cfg, "config", None)
+    nested_path = getattr(nested_config, "pretrained_model_name_or_path", None)
+    if nested_path:
+        return nested_path
+    nested_name_or_path = getattr(nested_config, "name_or_path", None)
+    if nested_name_or_path:
+        return nested_name_or_path
+
+    if model_kwargs is not None:
+        materialized_config = model_kwargs.get("config")
+        for attribute in ("pretrained_model_name_or_path", "name_or_path", "_name_or_path"):
+            materialized_path = getattr(materialized_config, attribute, None)
+            if materialized_path:
+                return materialized_path
+
+    raise ValueError(
+        "Checkpoint robustness requires model.pretrained_model_name_or_path or "
+        "model.config.pretrained_model_name_or_path"
+    )
+
+
+def _set_model_pretrained_path(model_cfg: ConfigNode, pretrained_model_name_or_path: str | Path) -> None:
+    """Retarget both from-pretrained and config-based recipes to an exported checkpoint."""
+    path = str(pretrained_model_name_or_path)
+    nested_config = getattr(model_cfg, "config", None)
+    if nested_config is not None and (
+        hasattr(nested_config, "pretrained_model_name_or_path") or hasattr(nested_config, "name_or_path")
+    ):
+        if hasattr(nested_config, "pretrained_model_name_or_path"):
+            nested_config.pretrained_model_name_or_path = path
+        if hasattr(nested_config, "name_or_path"):
+            nested_config.name_or_path = path
+        return
+    model_cfg.pretrained_model_name_or_path = path
+
+
 def _resolve_hf_model_class(
     pretrained_model_name_or_path: str | Path,
     default_model_cls: type,
@@ -836,7 +892,7 @@ def _hf_source_load_kwargs(
     }
     hf_kwargs = {k: v for k, v in model_kwargs.items() if k in hf_allowed_keys}
     hf_kwargs["torch_dtype"] = source_dtype
-    hf_kwargs["trust_remote_code"] = trust_remote_code or bool(hf_kwargs.get("trust_remote_code", False))
+    hf_kwargs["trust_remote_code"] = trust_remote_code
     hf_kwargs["local_files_only"] = os.environ.get("HF_HUB_OFFLINE", "0") == "1"
     if hf_kwargs["trust_remote_code"] and "attn_implementation" not in hf_kwargs:
         hf_kwargs["attn_implementation"] = _get_trust_remote_code_attn_implementation(
@@ -1215,10 +1271,11 @@ def _prepare_source_load_reference(
     input_ids: list[int],
     *,
     hf_model_cls: type,
-    trust_remote_code: bool,
+    trust_remote_code: bool | None,
     experts_implementation: str | None,
     hf_device_map_auto: bool,
     hf_source_post_load_dequantize: bool,
+    parity_tolerance_profile: str = "standard",
 ) -> tuple[torch.Tensor, bool | None, bool | None] | None:
     """Compute vanilla HF source-load reference logits before trainer construction."""
     if _preinit_world_size() > 1:
@@ -1245,6 +1302,7 @@ def _prepare_source_load_reference(
             experts_implementation=experts_implementation,
             hf_device_map_auto=hf_device_map_auto,
             hf_source_post_load_dequantize=hf_source_post_load_dequantize,
+            parity_tolerance_profile=parity_tolerance_profile,
         )
     except Exception:
         if fail_path is not None:
@@ -1261,10 +1319,11 @@ def _prepare_source_load_reference_rank0(
     input_ids: list[int],
     *,
     hf_model_cls: type,
-    trust_remote_code: bool,
+    trust_remote_code: bool | None,
     experts_implementation: str | None,
     hf_device_map_auto: bool,
     hf_source_post_load_dequantize: bool,
+    parity_tolerance_profile: str = "standard",
 ) -> tuple[torch.Tensor, bool | None, bool | None]:
     """Rank-0 implementation of vanilla HF source-load reference capture."""
     from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
@@ -1273,8 +1332,7 @@ def _prepare_source_load_reference_rank0(
     _patch_remote_masking_api_compatibility()
 
     model_kwargs = _model_kwargs_from_config(cfg.model)
-    original_pretrained_path = model_kwargs.get("pretrained_model_name_or_path")
-    assert original_pretrained_path is not None, "source-load parity requires model.pretrained_model_name_or_path"
+    original_pretrained_path = _model_pretrained_path(cfg.model, model_kwargs)
     hf_model_cls = _resolve_hf_model_class(
         original_pretrained_path,
         hf_model_cls,
@@ -1282,7 +1340,8 @@ def _prepare_source_load_reference_rank0(
         token=model_kwargs.get("token"),
     )
     source_dtype = _resolve_source_load_dtype(model_kwargs)
-    trust_remote_code = trust_remote_code or bool(model_kwargs.get("trust_remote_code", False))
+    if trust_remote_code is None:
+        trust_remote_code = bool(model_kwargs.get("trust_remote_code", False))
 
     device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
     hf_kwargs = _hf_source_load_kwargs(
@@ -1349,6 +1408,18 @@ def _prepare_source_load_reference_rank0(
             fix_rotary_embeddings([hf_model])
 
     hf_logits = _get_logits(hf_model, input_ids, device)
+    repeated_hf_logits = _get_logits(hf_model, input_ids, device)
+    _compare_logits(
+        _robustness_artifact_dir(cfg),
+        hf_logits,
+        repeated_hf_logits,
+        _hf_repeatability_policy(
+            phase="phase_0",
+            comparison="hf_source_self_repeat",
+            profile=parity_tolerance_profile,
+        ),
+    )
+    del repeated_hf_logits
     hf_aliased = _lm_head_embedding_aliased(hf_model)
     explicit_tie_word_embeddings = _explicit_tie_word_embeddings(hf_model.config)
     del hf_model
@@ -1748,10 +1819,15 @@ def _run_vanilla_hf_reload(
         _patch_remote_masking_api_compatibility()
         _, ckpt_step_dir, consolidated_dir = _checkpoint_paths(cfg)
         is_peft = hasattr(cfg, "peft")
-        original_pretrained_path = cfg.model.pretrained_model_name_or_path
         model_kwargs = _model_kwargs_from_config(cfg.model)
+        original_pretrained_path = _model_pretrained_path(cfg.model, model_kwargs)
         original_quantization_config = _materialize_hf_quantization_config(cfg)
-        trust_remote_code = bool(custom_args.get("trust_remote_code", False))
+        configured_trust_remote_code = custom_args.get("trust_remote_code")
+        trust_remote_code = (
+            bool(model_kwargs.get("trust_remote_code", False))
+            if configured_trust_remote_code is None
+            else bool(configured_trust_remote_code)
+        )
         experts_implementation = custom_args.get("experts_implementation", None)
         hf_device_map_auto = bool(custom_args.get("hf_device_map_auto", False))
         check_fused_qkv_keys = bool(custom_args.get("check_fused_qkv_keys", False))
@@ -1869,6 +1945,18 @@ def _run_vanilla_hf_reload(
                     f"{hf_adapter_ignored_key_prefix!r} ({ignored_adapter_tensors} tensors)"
                 )
             hf_logits = _get_logits(peft_model, input_ids, device)
+            repeated_hf_logits = _get_logits(peft_model, input_ids, device)
+            _compare_logits(
+                _robustness_artifact_dir(cfg),
+                hf_logits,
+                repeated_hf_logits,
+                _hf_repeatability_policy(
+                    phase="phase_3",
+                    comparison="hf_export_self_repeat",
+                    profile=str(custom_args.get("parity_tolerance_profile", "standard")),
+                ),
+            )
+            del repeated_hf_logits
 
             if check_fused_qkv_keys:
                 from safetensors import safe_open
@@ -1902,6 +1990,18 @@ def _run_vanilla_hf_reload(
                 if should_fix_rotary_embeddings([hf_model]):
                     fix_rotary_embeddings([hf_model])
             hf_logits = _get_logits(hf_model, input_ids, device)
+            repeated_hf_logits = _get_logits(hf_model, input_ids, device)
+            _compare_logits(
+                _robustness_artifact_dir(cfg),
+                hf_logits,
+                repeated_hf_logits,
+                _hf_repeatability_policy(
+                    phase="phase_3",
+                    comparison="hf_export_self_repeat",
+                    profile=str(custom_args.get("parity_tolerance_profile", "standard")),
+                ),
+            )
+            del repeated_hf_logits
             del hf_model
 
         hf_reload_error = _compare_logits(
@@ -2033,10 +2133,11 @@ def _run_process_isolated_checkpoint_phase(
             cfg,
             input_ids,
             hf_model_cls=hf_model_cls,
-            trust_remote_code=bool(custom_args.get("trust_remote_code", False)),
+            trust_remote_code=custom_args.get("trust_remote_code"),
             experts_implementation=custom_args.get("experts_implementation", None),
             hf_device_map_auto=bool(custom_args.get("hf_device_map_auto", False)),
             hf_source_post_load_dequantize=bool(custom_args.get("hf_source_post_load_dequantize", False)),
+            parity_tolerance_profile=str(custom_args.get("parity_tolerance_profile", "standard")),
         )
         if _preinit_global_rank() == 0:
             assert source_load_reference is not None, "rank 0 source-load reference was not captured"
@@ -2301,7 +2402,7 @@ def _run_process_isolated_checkpoint_phase(
 
         if not is_peft:
             _prepare_consolidated_hf_cache_once(cfg, consolidated_dir)
-            cfg.model.pretrained_model_name_or_path = str(consolidated_dir)
+            _set_model_pretrained_path(cfg.model, consolidated_dir)
             cfg.checkpoint.enabled = False
 
         _report_phase("Isolated Phase 2 AutoModel model reload: starting trainer setup")
@@ -2404,7 +2505,7 @@ def _run_process_isolated_checkpoint_phase(
             raise FileNotFoundError(f"Reference logits not found at {reference_path}")
 
         _prepare_consolidated_hf_cache_once(cfg, consolidated_dir)
-        cfg.model.pretrained_model_name_or_path = str(consolidated_dir)
+        _set_model_pretrained_path(cfg.model, consolidated_dir)
         cfg.checkpoint.enabled = False
         cfg.distributed.tp_size = int(custom_args["cross_tp_size"])
         cfg.distributed.dp_size = None
@@ -2517,7 +2618,7 @@ def run_checkpoint_robustness(
         )
         return
     cross_tp_size = int(custom_args.get("cross_tp_size", "0"))
-    trust_remote_code = bool(custom_args.get("trust_remote_code", False))
+    trust_remote_code = custom_args.get("trust_remote_code")
     experts_implementation = custom_args.get("experts_implementation", None)
     tokenizer_name = custom_args.get("tokenizer_name", None)
     parity_sequence_length = int(custom_args.get("parity_sequence_length", "2048"))
@@ -2559,6 +2660,7 @@ def run_checkpoint_robustness(
             experts_implementation=experts_implementation,
             hf_device_map_auto=hf_device_map_auto,
             hf_source_post_load_dequantize=hf_source_post_load_dequantize,
+            parity_tolerance_profile=str(custom_args.get("parity_tolerance_profile", "standard")),
         )
         _barrier()
         _report_phase("Phase 0: vanilla-HF source-load reference complete")
@@ -2715,7 +2817,7 @@ def run_checkpoint_robustness(
 
     cfg = parse_args_and_load_config()
     if not is_peft:
-        cfg.model.pretrained_model_name_or_path = str(consolidated_dir)
+        _set_model_pretrained_path(cfg.model, consolidated_dir)
         cfg.checkpoint.enabled = False
     _report_phase("Phase 2: starting AutoModel model reload setup")
     restored_trainer = recipe_cls(cfg)
@@ -2816,7 +2918,7 @@ def run_checkpoint_robustness(
     if cross_tp_size > 0 and not is_peft:
         _report_phase("Phase 5: starting optional cross-TP consolidated reload")
         cfg = parse_args_and_load_config()
-        cfg.model.pretrained_model_name_or_path = str(consolidated_dir)
+        _set_model_pretrained_path(cfg.model, consolidated_dir)
         cfg.checkpoint.enabled = False
         cfg.distributed.tp_size = cross_tp_size
         cfg.distributed.dp_size = None

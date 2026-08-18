@@ -129,5 +129,9 @@ ci:
   env_vars:
     MAX_STEPS: 10
   checkpoint_robustness:
+    # The shared robustness batch of two OOMs this 27B full-SFT recipe; retain
+    # the recipe's validated per-rank batch of one.
+    step_scheduler.global_batch_size: 8
+    step_scheduler.local_batch_size: 1
     tokenizer_name: Qwen/Qwen3.8-27B
     hf_device_map_auto: true

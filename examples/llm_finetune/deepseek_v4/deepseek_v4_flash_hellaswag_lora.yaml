@@ -133,6 +133,8 @@ ci:
   time: "04:00:00"
   nodes: 4
   checkpoint_robustness:
+    step_scheduler.global_batch_size: 32
+    step_scheduler.local_batch_size: 1
     tokenizer_name: deepseek-ai/DeepSeek-V4-Flash
     trust_remote_code: true
     hf_device_map_auto: true

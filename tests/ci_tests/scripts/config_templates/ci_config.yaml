@@ -149,6 +149,7 @@ fixture_keys:
     - resume_loss_threshold
     - skip_resume
     - skip_source_load_parity
+    - skip_source_load_logit_parity
     - skip_hf_reload
     - skip_automodel_logit_parity
     - skip_automodel_reload_logit_parity

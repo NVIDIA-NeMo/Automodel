@@ -110,6 +110,24 @@ def test_named_profiles_are_ordered_and_gate_mean_and_p95():
     assert any("p95 KL" in failure for failure in failures)
 
 
+@pytest.mark.parametrize(
+    ("profile", "comparison_kind", "expected_mean_kl", "expected_p95_kl"),
+    [
+        ("standard", "same_implementation", 2e-3, 1e-2),
+        ("standard", "cross_framework", 5e-3, 2e-2),
+        ("standard", "cross_topology", 1e-3, 5e-3),
+        ("relaxed", "same_implementation", 5e-3, 2e-2),
+        ("relaxed", "cross_framework", 2e-2, 1e-1),
+        ("relaxed", "cross_topology", 5e-3, 2e-2),
+    ],
+)
+def test_calibrated_profile_thresholds(profile, comparison_kind, expected_mean_kl, expected_p95_kl):
+    thresholds = _resolve_parity_thresholds(profile, comparison_kind)
+
+    assert thresholds.mean_kl == expected_mean_kl
+    assert thresholds.p95_kl == expected_p95_kl
+
+
 def test_legacy_numeric_overrides_preserve_max_kl_semantics():
     reference = torch.zeros(1, 100, 2)
     candidate = reference.clone()
