@@ -89,6 +89,22 @@ def test_generate_deepseek_v3_gb200_256gpu_benchmark_job_matches_topology_and_ba
     assert recipe["distributed"]["pipeline"]["layers_per_stage"] == 4
 
 
+def test_generate_deepseek_v3_gb200_256gpu_profile_job_keeps_matched_topology():
+    config = Path("examples/llm_benchmark/deepseek/deepseek_v3_te_mxfp8_gb200_256gpu_profile.yaml")
+
+    jobs = dict(generate_job(config, {}, "performance", "llm_benchmark", "."))
+    recipe = YAML(typ="safe").load(config)
+
+    variables = jobs[""]["variables"]
+    assert variables["TEST_NODE_COUNT"] == 64
+    assert variables["CONFIG_NPROC_PER_NODE"] == 4
+    assert variables["MAX_STEPS"] == 13
+    assert recipe["benchmark"]["torch_profile_iteration"] == 12
+    assert recipe["benchmark"]["torch_profile_ranks"] == [0, 64, 128, 192]
+    assert recipe["distributed"]["pp_size"] == 4
+    assert recipe["distributed"]["ep_size"] == 64
+
+
 def test_generate_vllm_deploy_time_override(tmp_path):
     config = Path("model_peft.yaml")
     (tmp_path / config).write_text(

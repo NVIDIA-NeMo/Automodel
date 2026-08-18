@@ -88,6 +88,9 @@ def mock_config(monkeypatch):
             nsys_start=-1,
             nsys_end=-1,
             nsys_ranks=[],
+            torch_profile_iteration=-1,
+            torch_profile_ranks=[],
+            torch_profile_output_path=None,
         ),
         step_scheduler=SimpleNamespace(
             max_steps=30,
@@ -145,6 +148,9 @@ def mock_recipe(mock_config, monkeypatch):
         recipe._bench_nsys_start = -1
         recipe._bench_nsys_end = -1
         recipe._bench_nsys_ranks = []
+        recipe._bench_torch_profile_iteration = -1
+        recipe._bench_torch_profile_ranks = set()
+        recipe._bench_torch_profile_output_path = None
         recipe._bench_seq_len = 2048
         recipe._bench_json_output_path = None
         recipe._wandb_enabled = False
@@ -172,6 +178,9 @@ class TestBenchmarkingRecipeInitialization:
             assert recipe._bench_nsys_start == -1  # from benchmark.nsys_start
             assert recipe._bench_nsys_end == -1  # from benchmark.nsys_end
             assert recipe._bench_nsys_ranks == []  # from benchmark.nsys_ranks
+            assert recipe._bench_torch_profile_iteration == -1
+            assert recipe._bench_torch_profile_ranks == set()
+            assert recipe._bench_torch_profile_output_path is None
             assert recipe._bench_seq_len == 2048  # from dataset.seq_len
 
     def test_init_infers_max_steps_from_step_scheduler(self, mock_config):
@@ -548,6 +557,64 @@ class TestBenchmarkingRecipeRunBenchmark:
             mock_recipe.run_benchmark()
 
         assert mock_recipe._maybe_collect_garbage.call_count == 30
+
+    def test_run_benchmark_exports_torch_profile_and_summary_after_run(self, mock_recipe, tmp_path):
+        mock_recipe._bench_steps = 1
+        mock_recipe._bench_warmup_steps = 0
+        mock_recipe._bench_torch_profile_iteration = 0
+        mock_recipe._bench_torch_profile_ranks = {0}
+        mock_recipe._bench_torch_profile_output_path = str(tmp_path)
+        mock_recipe._get_dp_group_size = MagicMock(return_value=8)
+        mock_recipe._log_iteration_metrics = MagicMock()
+        mock_recipe._collect_moe_load_balance = MagicMock()
+        mock_recipe._maybe_collect_garbage = MagicMock()
+
+        def mock_forward_backward_step(ga_step_idx, batch, loss_buffer=None, **kwargs):
+            if loss_buffer is not None:
+                loss_buffer.append(torch.tensor(0.5))
+
+        mock_recipe._forward_backward_step = MagicMock(side_effect=mock_forward_backward_step)
+        mock_recipe.dataloader.__iter__ = MagicMock(
+            return_value=iter(
+                [
+                    {
+                        "input_ids": torch.tensor([[1, 2, 3]]),
+                        "labels": torch.tensor([[1, 2, 3]]),
+                        "position_ids": torch.tensor([[0, 1, 2]]),
+                    }
+                ]
+                * 8
+            )
+        )
+
+        call_order = []
+        mock_recipe._log_benchmark_summary = MagicMock(side_effect=lambda *_args: call_order.append("summary"))
+        event = SimpleNamespace(
+            key="example_kernel",
+            count=3,
+            self_cpu_time_total=1.0,
+            cpu_time_total=2.0,
+            self_device_time_total=3.0,
+            device_time_total=4.0,
+        )
+        profiler = MagicMock()
+        profiler.export_chrome_trace.side_effect = lambda *_args: call_order.append("export")
+        profiler.key_averages.return_value = [event]
+        profiler_context = MagicMock()
+        profiler_context.__enter__.return_value = profiler
+        profiler_context.__exit__.return_value = False
+
+        with (
+            patch("torch.distributed.barrier"),
+            patch("torch.profiler.profile", return_value=profiler_context),
+            patch("torch.profiler.record_function"),
+        ):
+            mock_recipe.run_benchmark()
+
+        profiler.export_chrome_trace.assert_called_once_with(str(tmp_path / "rank0_iteration0.json"))
+        summary = (tmp_path / "rank0_iteration0_summary.json").read_text(encoding="utf-8")
+        assert '"name": "example_kernel"' in summary
+        assert call_order == ["summary", "export"]
 
 
 @pytest.mark.usefixtures("patch_torch_distributed_for_benchmark")
