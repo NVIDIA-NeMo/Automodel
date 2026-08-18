@@ -93,11 +93,11 @@ class CpVisionFrameShardingConfig:
         min_frames: Minimum number of independent image/frame units that can select
             sharding even below ``min_tokens``. Long videos reduce per-frame spatial
             resolution, so merged-token count alone underestimates their ViT work.
-        min_local_patch_rows: Minimum number of pre-merge patch rows processed by each
-            rank that owns real frames. Smaller local shards append whole, same-shaped
-            zero frames before the vision forward and remove their outputs before the
-            gather. This avoids unstable reduced-precision kernels for tiny ViT shapes.
-            Set to ``0`` to disable local padding.
+        min_local_patch_rows: Optional minimum number of pre-merge patch rows processed
+            by each rank that owns real frames. Smaller local shards append whole,
+            same-shaped zero frames before the vision forward and remove their outputs
+            before the gather. This can reduce shape-dependent numerical variation from
+            tiny reduced-precision ViT kernels. ``0`` disables local padding.
         cost_alpha: Non-negative linear term in the partition cost
             ``p * (p + cost_alpha)``. ``"auto"`` infers ``3 * vision_hidden_size``
             and falls back to ``0`` when the width is unavailable. ``None`` remains

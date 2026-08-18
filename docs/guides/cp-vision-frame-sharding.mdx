@@ -105,11 +105,23 @@ If a batch contains fewer frames than CP ranks, the implementation adds minimal 
 frames so every rank participates in the vision forward and collectives. The corresponding
 embeddings are discarded and contribute no gradient.
 
-After partitioning, a rank with fewer than `min_local_patch_rows` pre-merge patch rows
-appends enough whole zero frames of the same resolution to reach the configured floor.
-Their outputs are removed before the differentiable gather, so the padding changes only
-the local vision-kernel shape and contributes no token or gradient to training. Ranks that
-own only a rank-fill dummy remain at the minimal shape.
+Frame sharding without local padding is mathematically valid. However, enabling frame
+sharding can make each rank's reduced-precision ViT input much smaller than the input used
+when frame sharding is disabled and the full vision tower is replicated. Tiny local shapes
+can select different kernel tiling and accumulation orders, increasing numerical variation
+relative to that replicated baseline. The default `min_local_patch_rows=96` is a
+conservative kernel-shape floor intended to improve this sharded-versus-replicated parity.
+
+A rank below the floor appends enough whole zero frames of the same resolution to reach it.
+Their outputs are removed before the differentiable gather, so they contribute no model
+token or gradient; they only change the local vision-kernel shape. Ranks that own only a
+rank-fill dummy remain minimal.
+
+This padding is a minor parity aid, not a correctness requirement, a bitwise-equivalence
+guarantee, or a throughput optimization. It adds some vision work and may be unnecessary
+for workloads whose unpadded sharded training already matches the frame-sharding-disabled
+baseline closely. Set `min_local_patch_rows: 0` after workload-specific convergence
+validation when avoiding that extra work is preferred.
 
 ## Check Your Workload
 
