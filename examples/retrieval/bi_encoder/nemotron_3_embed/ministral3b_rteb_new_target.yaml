@@ -50,7 +50,12 @@ model:
   attn_implementation: flash_attention_2
 
 tokenizer:
-  _target_: transformers.AutoTokenizer.from_pretrained
+  _target_: nemo_automodel.NeMoAutoTokenizer.from_pretrained
+  tokenizer_backend: tokenizers
+  fix_mistral_regex: true
+  split_special_tokens: true
+  add_bos_token: true
+  add_eos_token: false
   pretrained_model_name_or_path: mistralai/Ministral-3-3B-Instruct-2512
   padding_side: left
 
