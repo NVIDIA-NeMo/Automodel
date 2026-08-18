@@ -63,7 +63,7 @@ class StepScheduler(Stateful):
         global_batch_size: int,
         local_batch_size: int,
         dp_size: int,
-        dataloader: int | None,
+        dataloader: DataLoader | None,
         ckpt_every_steps: int | None = None,
         save_checkpoint_every_epoch: bool = True,
         val_every_steps: int | None = None,
@@ -85,20 +85,20 @@ class StepScheduler(Stateful):
             local_batch_size (int): Number of samples per micro-batch per GPU. This is the batch size for a single forward/backward pass on one GPU.
             dp_size (int): Number of GPUs for data parallelism.
             dataloader: The training dataloader.
-            ckpt_every_steps (Optional[int]): Frequency of checkpoint steps.
+            ckpt_every_steps (int | None): Frequency of checkpoint steps.
             save_checkpoint_every_epoch (bool): Whether to save checkpoints at epoch boundaries.
                 When True, checkpoints are saved at the end of each epoch (is_last_batch).
                 When False, only periodic, last-step, and SIGTERM checkpoints are saved.
                 Default: True.
-            val_every_steps (Optional[int]): Number of training steps between validation.
+            val_every_steps (int | None): Number of training steps between validation.
             log_remote_every_steps (int): Frequency of remote logging (e.g., WandB, MLflow). Default: 1 (every step).
             loss_average_window_steps (int): Rolling window size for averaged training loss metrics.
-            gc_every_steps (Optional[int]): Frequency of manual garbage collection steps.
+            gc_every_steps (int | None): Frequency of manual garbage collection steps.
             start_step (int): Initial global step. Used when resuming from checkpoint. Default: 0.
             start_epoch (int): Initial epoch. Used when resuming from checkpoint. Default: 0.
-            num_epochs (Optional[int]): Total number of epochs. Default: None or calculated from max_steps if num_epochs is None or 10 if max_steps and num_epochs are both None.
-            max_steps (Optional[int]): Maximum number of steps to run. If None, calculated from num_epochs.
-            preemption_signal (Optional[SignalLike | list[SignalLike]]): Signal(s) that trigger a graceful
+            num_epochs (int | None): Total number of epochs. Default: None or calculated from max_steps if num_epochs is None or 10 if max_steps and num_epochs are both None.
+            max_steps (int | None): Maximum number of steps to run. If None, calculated from num_epochs.
+            preemption_signal (SignalLike | list[SignalLike] | None): Signal(s) that trigger a graceful
                 preemption checkpoint, each given as a signal number, name (e.g. "SIGTERM"), or
                 ``signal.Signals`` member. When ``None``, no signal handler is installed and preemption
                 checkpointing is disabled. Default: ``signal.SIGTERM``.

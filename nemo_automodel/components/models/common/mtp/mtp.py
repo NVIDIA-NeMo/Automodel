@@ -51,6 +51,49 @@ def roll_tensor(t: torch.Tensor, shifts: int = -1, dim: int = -1) -> torch.Tenso
     return rolled
 
 
+def shift_packed_tensor(
+    tensor: torch.Tensor,
+    *,
+    depth: int,
+    seq_idx: torch.Tensor | None = None,
+    fill_value: float | int = 0,
+) -> torch.Tensor:
+    """Shift a token-aligned tensor left without crossing sequence boundaries.
+
+    Args:
+        tensor: Tensor of shape ``[batch, sequence, ...]`` in global token
+            order. The sequence axis is dimension 1.
+        depth: Number of future-token positions to shift; must be positive.
+        seq_idx: Optional sequence IDs of shape ``[batch, sequence]``. Tokens
+            whose shifted source has a different ID are filled.
+        fill_value: Scalar used for trailing and cross-sequence positions.
+
+    Returns:
+        Tensor with the same shape, dtype, and device as ``tensor``. The output
+        owns independent storage and positions without a valid future source
+        contain ``fill_value``.
+    """
+    if tensor.dim() < 2:
+        raise ValueError(f"tensor must have shape [batch, sequence, ...], got {tuple(tensor.shape)}")
+    if depth <= 0:
+        raise ValueError(f"depth must be positive, got {depth}")
+    if seq_idx is not None and seq_idx.shape != tensor.shape[:2]:
+        raise ValueError(
+            f"seq_idx shape {tuple(seq_idx.shape)} must match tensor token shape {tuple(tensor.shape[:2])}"
+        )
+
+    shifted = torch.roll(tensor, shifts=-depth, dims=1)
+    sequence = tensor.shape[1]
+    positions = torch.arange(sequence, device=tensor.device)
+    valid = (positions + depth < sequence).unsqueeze(0).expand(tensor.shape[0], -1)
+    if seq_idx is not None:
+        shifted_seq_idx = torch.roll(seq_idx, shifts=-depth, dims=1)
+        valid = valid & (shifted_seq_idx == seq_idx)
+    while valid.dim() < shifted.dim():
+        valid = valid.unsqueeze(-1)
+    return torch.where(valid, shifted, torch.as_tensor(fill_value, dtype=tensor.dtype, device=tensor.device))
+
+
 def get_mtp_loss_scaling_factor(model: nn.Module, default: float = 0.1) -> float:
     """Return the model's configured MTP auxiliary-loss scaling factor."""
     mtp_config = getattr(model, "mtp_config", None)
@@ -177,6 +220,7 @@ class MTPModule(nn.Module):
         embed_fn: Callable[[torch.LongTensor], torch.Tensor] | None = None,
         embed_inputs: tuple[torch.Tensor, ...] | None = None,
         position_ids: torch.LongTensor | None = None,
+        position_ids_per_depth: tuple[torch.LongTensor, ...] | None = None,
         **block_kwargs,
     ) -> list[torch.Tensor]:
         """Iterate over MTP depths and return per-depth hidden states.
@@ -213,6 +257,12 @@ class MTPModule(nn.Module):
                 token) and forwarded to each sublayer via ``block_kwargs``.
                 Required for RoPE-using sublayers; ignored by sublayers that
                 don't consume it.
+            position_ids_per_depth: Optional tuple of ``num_depths``
+                pre-computed future-token position tensors. Each tensor has
+                shape [batch, sequence], or [tokens] for THD, matching
+                ``position_ids``. When supplied, these tensors are forwarded
+                directly instead of rolling rank-local ``position_ids``. Use
+                this when context parallelism has already sharded the sequence.
             **block_kwargs: Forwarded to each sublayer's ``__call__`` (e.g.
                 ``attention_mask``).
 
@@ -228,6 +278,32 @@ class MTPModule(nn.Module):
         else:
             if input_ids is None or embed_fn is None:
                 raise ValueError("MTPModule.forward requires either embed_inputs or (input_ids, embed_fn)")
+        if position_ids_per_depth is not None and embed_inputs is None:
+            raise ValueError(
+                "position_ids_per_depth requires precomputed embed_inputs; "
+                "rank-local input_ids rolling cannot be combined with globally shifted positions"
+            )
+        if position_ids_per_depth is not None:
+            if len(position_ids_per_depth) != self.num_depths:
+                raise ValueError(
+                    f"position_ids_per_depth length {len(position_ids_per_depth)} "
+                    f"does not match num_depths {self.num_depths}"
+                )
+            if position_ids is not None:
+                expected_position_shape = position_ids.shape
+                expected_position_source = "base position_ids"
+            elif input_ids is not None:
+                expected_position_shape = input_ids.shape
+                expected_position_source = "input_ids"
+            else:
+                expected_position_shape = embed_inputs[0].shape[:-1]
+                expected_position_source = "embed_inputs token shape"
+            for depth, depth_position_ids in enumerate(position_ids_per_depth, start=1):
+                if depth_position_ids.shape != expected_position_shape:
+                    raise ValueError(
+                        f"MTP depth {depth} position_ids shape {tuple(depth_position_ids.shape)} "
+                        f"does not match {expected_position_source} {tuple(expected_position_shape)}"
+                    )
 
         num_iterations = self.num_depths
         num_sublayers_per_depth = self.pattern_length
@@ -241,15 +317,20 @@ class MTPModule(nn.Module):
             else:
                 cur_input_ids = roll_tensor(cur_input_ids, shifts=-1, dim=-1)
                 decoder_input = embed_fn(cur_input_ids)
-            if cur_position_ids is not None:
+            if position_ids_per_depth is not None:
+                depth_position_ids = position_ids_per_depth[depth]
+            elif cur_position_ids is not None:
                 cur_position_ids = roll_tensor(cur_position_ids, shifts=-1, dim=-1)
+                depth_position_ids = cur_position_ids
+            else:
+                depth_position_ids = None
 
             physical_depth = 0 if use_repeated else depth
             for sublayer_idx in range(num_sublayers_per_depth):
                 sublayer = self.layers[physical_depth * num_sublayers_per_depth + sublayer_idx]
                 kwargs = dict(block_kwargs)
-                if cur_position_ids is not None:
-                    kwargs["position_ids"] = cur_position_ids
+                if depth_position_ids is not None:
+                    kwargs["position_ids"] = depth_position_ids
                 if sublayer_idx == 0:
                     kwargs["embed_input"] = decoder_input
                 hidden_states = sublayer(hidden_states, **kwargs)

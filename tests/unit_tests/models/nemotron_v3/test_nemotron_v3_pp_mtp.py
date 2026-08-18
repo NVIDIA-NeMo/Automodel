@@ -295,7 +295,14 @@ class TestPPForward:
 
         activation = torch.zeros(1, 4, cfg.hidden_size, dtype=torch.bfloat16)
         mtp_embed = torch.randn(1, 4, cfg.hidden_size, dtype=torch.bfloat16)
-        out = model(activation, mtp_embed)
+        position_ids = torch.arange(4).unsqueeze(0)
+        mtp_position_ids = (torch.tensor([[1, 2, 3, 0]]),)
+        out = model(
+            activation,
+            mtp_embed,
+            position_ids=position_ids,
+            mtp_per_depth_position_ids=mtp_position_ids,
+        )
 
         assert isinstance(out, tuple)
         assert len(out) == 3  # (logits, mtp_per_depth_h[0], seq_idx)
@@ -305,8 +312,77 @@ class TestPPForward:
         # NOT via the input_ids/embed_fn path.
         assert "embed_inputs" in captured
         torch.testing.assert_close(captured["embed_inputs"][0], mtp_embed)
+        torch.testing.assert_close(captured["position_ids_per_depth"][0], mtp_position_ids[0])
         assert captured.get("input_ids") is None
         assert captured.get("embed_fn") is None
+
+    @pytest.mark.parametrize("missing", ["embeddings", "position_ids"])
+    def test_context_parallel_requires_paired_mtp_embeddings_and_positions(self, backend, missing):
+        model, cfg = _make_model(
+            backend,
+            mtp_layers=1,
+            mtp_layers_block_type=["attention", "moe"],
+        )
+        model.train()
+
+        def fake_inner(self, input_ids, **kwargs):
+            del self, kwargs
+            source = input_ids if input_ids is not None else inputs_embeds
+            return torch.ones(source.shape[0], source.shape[1], cfg.hidden_size, dtype=torch.bfloat16)
+
+        inputs_embeds = torch.zeros(1, 4, cfg.hidden_size, dtype=torch.bfloat16)
+        model.model.forward = types.MethodType(fake_inner, model.model)
+        mtp_embed_inputs = () if missing == "embeddings" else (inputs_embeds.clone(),)
+        mtp_position_ids = None if missing == "position_ids" else (torch.tensor([[1, 2, 3, 0]]),)
+
+        with pytest.raises(ValueError, match="requires precomputed per-depth embeddings and position IDs together"):
+            model(
+                None,
+                *mtp_embed_inputs,
+                inputs_embeds=inputs_embeds,
+                position_ids=torch.arange(4).unsqueeze(0),
+                mtp_per_depth_position_ids=mtp_position_ids,
+                cp_size=2,
+            )
+
+    def test_sdpa_thd_keeps_mtp_tensors_batched(self, backend):
+        model, cfg = _make_model(
+            backend,
+            mtp_layers=1,
+            mtp_layers_block_type=["attention", "moe"],
+        )
+        model.train()
+        model.model.embed_tokens = None
+        captured = {}
+
+        def fake_inner(self, input_ids, **kwargs):
+            del self, kwargs
+            return torch.ones(input_ids.shape[0], input_ids.shape[1], cfg.hidden_size, dtype=torch.bfloat16)
+
+        def fake_mtp_forward(self, **kwargs):
+            captured.update(kwargs)
+            return [kwargs["hidden_states"].clone()]
+
+        model.model.forward = types.MethodType(fake_inner, model.model)
+        model.mtp.forward = types.MethodType(fake_mtp_forward, model.mtp)
+
+        activation = torch.zeros(1, 4, cfg.hidden_size, dtype=torch.bfloat16)
+        mtp_embed = torch.randn(1, 4, cfg.hidden_size, dtype=torch.bfloat16)
+        position_ids = torch.arange(4).unsqueeze(0)
+        mtp_position_ids = (torch.tensor([[1, 2, 3, 0]]),)
+
+        model(
+            activation,
+            mtp_embed,
+            position_ids=position_ids,
+            mtp_per_depth_position_ids=mtp_position_ids,
+            qkv_format="thd",
+        )
+
+        assert captured["hidden_states"].shape == (1, 4, cfg.hidden_size)
+        assert captured["embed_inputs"][0].shape == (1, 4, cfg.hidden_size)
+        assert captured["position_ids"].shape == (1, 4)
+        assert captured["position_ids_per_depth"][0].shape == (1, 4)
 
     def test_final_stage_eval_emits_placeholders(self, backend):
         """In eval mode, the last stage keeps the (1 + D + seq_idx) tuple arity."""

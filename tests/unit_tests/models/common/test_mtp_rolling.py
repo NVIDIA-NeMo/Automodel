@@ -26,10 +26,16 @@ covered separately by ``tests/unit_tests/loss/test_mtp_cross_boundary.py``.
 
 from __future__ import annotations
 
+import pytest
 import torch
 import torch.nn as nn
 
-from nemo_automodel.components.models.common.mtp.mtp import MTPConfig, MTPModule, roll_tensor
+from nemo_automodel.components.models.common.mtp.mtp import (
+    MTPConfig,
+    MTPModule,
+    roll_tensor,
+    shift_packed_tensor,
+)
 
 
 class _RecordingSublayer(nn.Module):
@@ -192,6 +198,53 @@ def test_precomputed_embed_inputs_path_skips_token_rolling():
         assert got_pos == expected_pos, f"depth {depth}: position_ids rolling expected on embed_inputs path"
 
 
+def test_precomputed_position_ids_skip_rank_local_rolling():
+    """CP callers can provide globally shifted positions in local shard order."""
+    mtp = _build_module(num_depths=2, pattern_length=1)
+    embeddings = (torch.full((4, 3), 11.0), torch.full((4, 3), 22.0))
+    local_position_ids = torch.tensor([0, 1, 6, 7], dtype=torch.long)
+    position_ids_per_depth = (
+        torch.tensor([1, 2, 7, 8], dtype=torch.long),
+        torch.tensor([2, 3, 8, 9], dtype=torch.long),
+    )
+    hidden = torch.zeros(4, 3)
+
+    mtp(
+        hidden,
+        embed_inputs=embeddings,
+        position_ids=local_position_ids,
+        position_ids_per_depth=position_ids_per_depth,
+    )
+
+    for depth in range(2):
+        torch.testing.assert_close(mtp.layers[depth].calls[0]["embed_input"], embeddings[depth])
+        torch.testing.assert_close(mtp.layers[depth].calls[0]["position_ids"], position_ids_per_depth[depth])
+
+
+def test_precomputed_position_ids_reject_rank_local_token_rolling():
+    mtp = _build_module(num_depths=2, pattern_length=1)
+
+    with pytest.raises(ValueError, match="position_ids_per_depth requires precomputed embed_inputs"):
+        mtp(
+            torch.zeros(4, 3),
+            input_ids=torch.arange(4),
+            embed_fn=_embed_fn_identity,
+            position_ids_per_depth=(torch.arange(4), torch.arange(4)),
+        )
+
+
+def test_precomputed_position_id_count_must_match_depth():
+    mtp = _build_module(num_depths=2, pattern_length=1)
+
+    with pytest.raises(ValueError, match="position_ids_per_depth length 1 does not match num_depths 2"):
+        mtp(
+            torch.zeros(4, 3),
+            embed_inputs=(torch.zeros(4, 3), torch.zeros(4, 3)),
+            position_ids=torch.arange(4),
+            position_ids_per_depth=(torch.arange(4),),
+        )
+
+
 def test_trailing_positions_zero_after_roll():
     """The roll is left-shift with trailing zeros (not wrap-around). At depth
     k, the last ``k+1`` slots of the rolled tensor are zero — these are the
@@ -211,3 +264,34 @@ def test_trailing_positions_zero_after_roll():
         )
         # The remaining prefix should match the original IDs shifted by n_trailing.
         assert ids[:-n_trailing] == input_ids[n_trailing:].tolist()
+
+
+def test_precomputed_position_id_shape_checked_without_base_positions():
+    mtp = _build_module(num_depths=2, pattern_length=1)
+    embeddings = (torch.zeros(4, 3), torch.zeros(4, 3))
+
+    with pytest.raises(ValueError, match=r"MTP depth 2 position_ids shape \(1, 4\).*token shape \(4,\)"):
+        mtp(
+            torch.zeros(4, 3),
+            embed_inputs=embeddings,
+            position_ids_per_depth=(torch.arange(4), torch.arange(4).unsqueeze(0)),
+        )
+
+
+def test_shift_packed_tensor_masks_trailing_and_cross_sequence_positions():
+    values = torch.tensor([[10, 11, 12, 20, 21, 22]])
+    seq_idx = torch.tensor([[0, 0, 0, 1, 1, 1]])
+
+    depth_1 = shift_packed_tensor(values, depth=1, seq_idx=seq_idx, fill_value=-1)
+    depth_2 = shift_packed_tensor(values, depth=2, seq_idx=seq_idx, fill_value=-1)
+
+    assert depth_1.tolist() == [[11, 12, -1, 21, 22, -1]]
+    assert depth_2.tolist() == [[12, -1, -1, 22, -1, -1]]
+
+
+def test_shift_packed_tensor_supports_trailing_feature_dimensions():
+    values = torch.arange(12).reshape(1, 3, 4)
+    shifted = shift_packed_tensor(values, depth=1, fill_value=-1)
+
+    assert torch.equal(shifted[:, :2], values[:, 1:])
+    assert shifted[:, -1].tolist() == [[-1, -1, -1, -1]]

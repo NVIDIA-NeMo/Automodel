@@ -573,14 +573,20 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
             x = x.permute(0, 2, 1, 3).contiguous()
         return x
 
-    def extract_feature(self, pixel_values: torch.Tensor) -> torch.Tensor:
+    def extract_feature(self, pixel_values: "torch.Tensor | list[torch.Tensor]") -> "torch.Tensor | list[torch.Tensor]":
         """Extract vision features from pixel values through RADIO + projector.
 
         Args:
-            pixel_values: Image tensors [num_tiles, C, H, W]
+            pixel_values: Image tensors [num_tiles, C, H, W], or a list of
+                per-image tensors ([C, H, W] or [num_tiles, C, H, W]) when the
+                batch mixes resolutions and cannot be stacked. The collate fn
+                (`nemotron_omni_collate_fn`) emits the list form whenever the
+                dataset is variable-resolution and `local_batch_size > 1`.
 
         Returns:
-            Vision embeddings [num_tiles, num_tokens, llm_hidden_size]
+            Vision embeddings [num_tiles, num_tokens, llm_hidden_size], or, for
+            list input, one such tensor per list element. Each element keeps its
+            own `num_tokens` because that depends on the image resolution.
         """
         # Force vision model to eval mode for deterministic spectral reparam.
         # RADIO uses spectral reparameterization with power iteration that is
@@ -589,9 +595,19 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
         # reproducible outputs.
         was_training = self.vision_model.training
         self.vision_model.eval()
+        try:
+            if isinstance(pixel_values, (list, tuple)):
+                # RADIO only accepts a dense (B, C, H, W) tensor, so variable
+                # resolutions have to be run one at a time.
+                return [self._extract_feature_dense(pv[None] if pv.dim() == 3 else pv) for pv in pixel_values]
+            return self._extract_feature_dense(pixel_values)
+        finally:
+            if was_training:
+                self.vision_model.train()
+
+    def _extract_feature_dense(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        """RADIO + pixel-shuffle + projector for one dense [B, C, H, W] batch."""
         vit_embeds = self.vision_model(pixel_values).features
-        if was_training:
-            self.vision_model.train()
         vit_embeds = vit_embeds.to(dtype=torch.bfloat16)
 
         # Patch grid comes from input dims so non-square dynamic-res tiles also work.
@@ -933,7 +949,10 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
 
             selected = input_ids_flat == self.img_context_token_id
 
-            vit_batch_size = pixel_values.shape[0]
+            # Mixed-resolution batches arrive as a list of per-image tensors
+            # (they cannot be stacked), so there is no leading batch dim.
+            pv_is_list = isinstance(pixel_values, (list, tuple))
+            vit_batch_size = len(pixel_values) if pv_is_list else pixel_values.shape[0]
             with cp_dispatcher_suspended(self.cp_mesh):
                 vit_embeds = self.extract_feature(pixel_values)
 
@@ -945,7 +964,13 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
                 )
 
             # Filter by image_flags (1 = real image, 0 = padding)
-            vit_embeds = vit_embeds[image_flags == 1]
+            if pv_is_list:
+                # Token count per image varies with resolution, so the features
+                # can't be stacked — select then concatenate along the token dim.
+                kept = [e.reshape(-1, C) for e, flag in zip(vit_embeds, image_flags.tolist()) if flag == 1]
+                vit_embeds = torch.cat(kept, dim=0) if kept else vit_embeds[0].new_zeros((0, C))
+            else:
+                vit_embeds = vit_embeds[image_flags == 1]
 
             try:
                 inputs_embeds[selected] = inputs_embeds[selected] * 0.0 + vit_embeds.reshape(-1, C)

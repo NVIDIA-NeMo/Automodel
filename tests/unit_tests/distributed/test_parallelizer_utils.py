@@ -30,8 +30,38 @@ from nemo_automodel.components.distributed.parallelizer_utils import (
     configure_fsdp_unused_param_reduction,
     fully_shard_by_dtype,
     iter_maximal_uniform_dtype_subtrees,
+    reject_unsupported_mtp_cp,
+    reject_unsupported_mtp_cp_pp,
 )
-from nemo_automodel.shared.torch_patches import patch_fsdp_unused_param_reduction
+from nemo_automodel.shared.torch_patches import (
+    patch_fsdp_uniform_reduce_dtype,
+    patch_fsdp_unused_param_reduction,
+)
+
+
+def test_reject_unsupported_mtp_cp_pp_ignores_model_without_capabilities():
+    reject_unsupported_mtp_cp_pp(nn.Linear(2, 2))
+
+
+def test_reject_unsupported_mtp_cp_rejects_enabled_unsupported_model():
+    model = nn.Module()
+    model.mtp_config = SimpleNamespace(enabled=True)
+    model.supports = SimpleNamespace(mtp_enabled=True, supports_mtp_cp=False)
+
+    with pytest.raises(RuntimeError, match="does not support MTP with context parallelism"):
+        reject_unsupported_mtp_cp(model)
+
+
+def test_reject_unsupported_mtp_cp_allows_supported_or_disabled_model():
+    model = nn.Module()
+    model.mtp_config = SimpleNamespace(enabled=True)
+    model.supports = SimpleNamespace(mtp_enabled=True, supports_mtp_cp=True)
+    reject_unsupported_mtp_cp(model)
+
+    model.mtp_config.enabled = False
+    model.supports.mtp_enabled = False
+    model.supports.supports_mtp_cp = False
+    reject_unsupported_mtp_cp(model)
 
 
 def test_configure_fsdp_unused_param_reduction_uses_public_fsdp_api(monkeypatch):
@@ -45,10 +75,13 @@ def test_configure_fsdp_unused_param_reduction_uses_public_fsdp_api(monkeypatch)
         def set_reduce_scatter_unused_params(self, enabled, *, recurse):
             self.calls.append((enabled, recurse))
 
+    install_fallback = Mock()
     monkeypatch.setattr(parallelizer_utils, "FSDPModule", FakeFSDPModule)
+    monkeypatch.setattr(parallelizer_utils, "_patch_fsdp_unused_param_reduction", install_fallback)
     model = nn.Sequential(FakeFSDPModule(), nn.Sequential(FakeFSDPModule()))
 
     assert configure_fsdp_unused_param_reduction(model) == 2
+    install_fallback.assert_not_called()
     assert model[0].calls == [(True, False)]
     assert model[1][0].calls == [(True, False)]
 
@@ -101,6 +134,121 @@ def test_legacy_fsdp_unused_param_reduction_fills_missing_local_grad(monkeypatch
     assert torch.equal(param.grad, torch.zeros_like(param))
     assert calls == [(param_group, ("arg",), {"flag": True})]
     assert FSDPParamGroup.post_backward is patched_post_backward
+
+
+def _install_uniform_reduce_dtype(monkeypatch, recorder):
+    """Install the patch over a stub foreach_reduce that records what it receives."""
+    import torch.distributed.fsdp._fully_shard._fsdp_collectives as collectives
+    import torch.distributed.fsdp._fully_shard._fsdp_param_group as param_group
+
+    def stub(fsdp_params, unsharded_grads, *args, **kwargs):
+        recorder.append([g.dtype for g in unsharded_grads])
+        return "reduced"
+
+    monkeypatch.setattr(collectives, "foreach_reduce", stub)
+    monkeypatch.setattr(param_group, "foreach_reduce", stub)
+    patch_fsdp_uniform_reduce_dtype()
+    return collectives
+
+
+def test_uniform_reduce_dtype_widens_mixed_group(monkeypatch):
+    """A bf16 straggler is widened to match its fp32 peers before the reduce."""
+    seen = []
+    collectives = _install_uniform_reduce_dtype(monkeypatch, seen)
+
+    grads = [torch.ones(2, dtype=torch.float32), torch.full((2,), 5.0, dtype=torch.bfloat16)]
+    result = collectives.foreach_reduce(["p0", "p1"], grads)
+
+    assert result == "reduced"
+    assert seen == [[torch.float32, torch.float32]]
+    # Mutated in place so foreach_reduce's list.clear() still frees the caller's refs.
+    assert [g.dtype for g in grads] == [torch.float32, torch.float32]
+    assert torch.equal(grads[1], torch.full((2,), 5.0))
+
+
+def test_uniform_reduce_dtype_localizes_residual_dtensor(monkeypatch):
+    """The old public unused-param zero is localized before ``chunk_cat``."""
+    import torch.distributed.fsdp._fully_shard._fsdp_collectives as collectives
+    import torch.distributed.fsdp._fully_shard._fsdp_param_group as param_group
+    import torch.distributed.tensor as tensor_module
+
+    class FakeDTensor(torch.Tensor):
+        @staticmethod
+        def __new__(cls, tensor):
+            return torch.Tensor._make_subclass(cls, tensor, False)
+
+        def to_local(self):
+            # Model an EP-local tensor with half of the global expert storage.
+            return self.as_subclass(torch.Tensor)[:2]
+
+    seen = []
+
+    def stub(fsdp_params, unsharded_grads, *args, **kwargs):
+        seen.append([(type(grad), grad.numel()) for grad in unsharded_grads])
+        return "reduced"
+
+    monkeypatch.setattr(tensor_module, "DTensor", FakeDTensor)
+    monkeypatch.setattr(collectives, "foreach_reduce", stub)
+    monkeypatch.setattr(param_group, "foreach_reduce", stub)
+    patch_fsdp_uniform_reduce_dtype()
+
+    grads = [torch.ones(2), FakeDTensor(torch.ones(4))]
+    result = collectives.foreach_reduce(["used", "unused"], grads)
+
+    assert result == "reduced"
+    assert seen == [[(torch.Tensor, 2), (torch.Tensor, 2)]]
+    assert all(type(grad) is torch.Tensor for grad in grads)
+
+
+def test_uniform_reduce_dtype_leaves_uniform_group_untouched(monkeypatch):
+    """Uniform groups pass straight through, preserving upstream's own checks."""
+    seen = []
+    collectives = _install_uniform_reduce_dtype(monkeypatch, seen)
+
+    grads = [torch.ones(2, dtype=torch.bfloat16), torch.ones(2, dtype=torch.bfloat16)]
+    original = [g for g in grads]
+    collectives.foreach_reduce(["p0", "p1"], grads)
+
+    assert seen == [[torch.bfloat16, torch.bfloat16]]
+    assert all(a is b for a, b in zip(grads, original))
+
+
+def test_uniform_reduce_dtype_ignores_non_float_mixtures(monkeypatch):
+    """Non-float gradients are left alone so the upstream assertion still fires."""
+    seen = []
+    collectives = _install_uniform_reduce_dtype(monkeypatch, seen)
+
+    grads = [torch.ones(2, dtype=torch.float32), torch.ones(2, dtype=torch.int32)]
+    collectives.foreach_reduce(["p0", "p1"], grads)
+
+    assert seen == [[torch.float32, torch.int32]]
+
+
+def test_uniform_reduce_dtype_patch_is_idempotent(monkeypatch):
+    """Re-installing must not stack a second wrapper."""
+    seen = []
+    collectives = _install_uniform_reduce_dtype(monkeypatch, seen)
+    wrapped = collectives.foreach_reduce
+
+    patch_fsdp_uniform_reduce_dtype()
+
+    assert collectives.foreach_reduce is wrapped
+
+
+def test_configure_fsdp_unused_param_reduction_installs_dtype_alignment_first(monkeypatch):
+    """The zero fill must wrap the alignment so filled zeros are aligned too."""
+    from nemo_automodel.components.distributed import parallelizer_utils
+
+    class LegacyFSDPModule(nn.Module):
+        pass
+
+    order = []
+    monkeypatch.setattr(parallelizer_utils, "FSDPModule", LegacyFSDPModule)
+    monkeypatch.setattr(parallelizer_utils, "_patch_fsdp_uniform_reduce_dtype", lambda: order.append("uniform_dtype"))
+    monkeypatch.setattr(parallelizer_utils, "_patch_fsdp_unused_param_reduction", lambda: order.append("zero_fill"))
+
+    assert configure_fsdp_unused_param_reduction(nn.Sequential(LegacyFSDPModule())) == 1
+    assert order == ["uniform_dtype", "zero_fill"]
 
 
 def _tag_hf_compute_dtype(model: nn.Module) -> None:
