@@ -154,8 +154,6 @@ ci:
     # PP=8 with pp_microbatch_size=1 requires at least eight pipeline microbatches.
     step_scheduler.global_batch_size: 64
     step_scheduler.local_batch_size: 8
-    # The VLM next-token pipeline schedule has a static 2047-token input after label shifting.
-    parity_sequence_length: 2047
     # One optimizer step materializes Adam state; AutoModel setup then restores it from DCP.
     step_scheduler.max_steps: 1
     step_scheduler.ckpt_every_steps: 1

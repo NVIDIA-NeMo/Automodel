@@ -130,12 +130,13 @@ rank-0 OOM.
 
 ### Full-Logit Metrics and Profiles
 
-Phases 0, 2, 3, and 5 compare every vocabulary logit for every prompt token. The checked-in long-form finetuning guide
-is tokenized with each model's tokenizer, then truncated to `parity_sequence_length` tokens (default 2048; 1K-4K is the
-recommended range). The guide contains more than 6,000 words, so a 4K test uses unique document content rather than a
-repeated short prompt. The harness fails with an actionable error instead of repeating content if a requested length
-exceeds the tokenized document. Reduce the length only when a model has a documented memory limit or a pipeline schedule
-with a shorter static sequence length.
+Phases 0, 2, 3, and 5 compare every vocabulary logit for every prompt token. A version-controlled snapshot of the
+long-form finetuning guide is tokenized with each model's tokenizer, then truncated to `parity_sequence_length` tokens
+(default 2048; 1K-4K is the recommended range). The snapshot contains more than 6,000 words and is protected by a
+checked SHA-256 digest, so a 4K test uses stable, unique document content rather than a repeated short prompt. The
+harness fails with an actionable error instead of repeating content if a requested length exceeds the tokenized
+document. Pipeline-parallel runs resize their stage activation buffers to the configured parity length; reduce the
+length only when a model has a documented memory limit.
 
 Every comparison reports mean, p95, and max per-token `KL(reference || candidate)`; whole-tensor cosine similarity;
 and mean/max absolute logit difference. The full record is printed as `CHECKPOINT_PARITY_METRICS <json>` and saved

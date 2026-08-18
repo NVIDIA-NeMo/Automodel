@@ -87,7 +87,8 @@ from tests.functional_tests.checkpoint_robustness.resume_trajectory import (
 
 datasets.disable_caching()
 
-_PARITY_DOCUMENT_PATH = Path(__file__).resolve().parents[3] / "docs" / "guides" / "llm" / "finetune.mdx"
+_PARITY_DOCUMENT_PATH = Path(__file__).with_name("parity_document.mdx")
+_PARITY_DOCUMENT_SHA256 = "8f734b2ee925ab82afb56dfa3a512108b70d3c54a2489f7978a036420da34cdb"
 
 
 @dataclass(frozen=True)
@@ -251,11 +252,18 @@ def _get_input_ids(tokenizer_name: str | None) -> list[int]:
 
 
 def _get_parity_document() -> str:
-    """Load the fixed long-form document shared by LLM and VLM parity tests."""
+    """Load and validate the fixed long-form document shared by LLM and VLM parity tests."""
     try:
-        return _PARITY_DOCUMENT_PATH.read_text(encoding="utf-8")
+        document_bytes = _PARITY_DOCUMENT_PATH.read_bytes()
     except OSError as exc:
         raise RuntimeError(f"Unable to load checkpoint parity document: {_PARITY_DOCUMENT_PATH}") from exc
+    document_sha256 = hashlib.sha256(document_bytes).hexdigest()
+    if document_sha256 != _PARITY_DOCUMENT_SHA256:
+        raise RuntimeError(
+            "Checkpoint parity document changed unexpectedly: "
+            f"expected sha256={_PARITY_DOCUMENT_SHA256}, got sha256={document_sha256}"
+        )
+    return document_bytes.decode("utf-8")
 
 
 def _load_hf_config(
@@ -493,6 +501,7 @@ def _compare_logits(
     uses_legacy_thresholds = any(value is not None for value in legacy_thresholds.values())
     payload = {
         "schema_version": 1,
+        "parity_document_sha256": _PARITY_DOCUMENT_SHA256,
         "phase": policy.phase,
         "comparison": policy.comparison,
         "comparison_kind": policy.comparison_kind,
@@ -1421,42 +1430,14 @@ def _get_logits_pp(trainer, input_ids, device) -> torch.Tensor:
     pp_batch_size = trainer.pipeline_config.pp_batch_size
     orig_seq_len = len(input_ids)
 
-    # PP recv buffer shapes are locked at first forward. r0.4.0 lacks
-    # AutoPipeline.update_seq_len (added in #1689) to resize on the fly, so
-    # discover the locked seq_len from the stages and pad input_ids to match
-    # for the forward pass. Captured logits are sliced back to orig_seq_len.
-    def _discover_pp_seq_len() -> int:
-        pp_seq_len = getattr(trainer.pp, "pp_seq_len", None)
-        if pp_seq_len:
-            return pp_seq_len
-        for stage in getattr(trainer.pp.info, "stages", None) or ():
-            inputs_meta = getattr(stage, "inputs_meta", None)
-            if not inputs_meta:
-                inputs_meta = getattr(getattr(stage, "_user_meta", None), "inputs", None)
-            for meta in inputs_meta or ():
-                shape = getattr(meta, "shape", ())
-                if len(shape) >= 2 and shape[1] > 0:
-                    return shape[1]
-        ds_seq_length = trainer.cfg.get("dataset.seq_length", None)
-        return ds_seq_length or orig_seq_len
-
-    pp_seq_len = _discover_pp_seq_len()
-    if orig_seq_len > pp_seq_len:
-        raise ValueError(
-            f"parity_sequence_length={orig_seq_len} exceeds the pipeline schedule sequence length "
-            f"{pp_seq_len}; set ci.checkpoint_robustness.parity_sequence_length to at most {pp_seq_len}"
-        )
-    if orig_seq_len < pp_seq_len:
-        input_ids = list(input_ids) + [0] * (pp_seq_len - orig_seq_len)
+    # PyTorch pipeline stages preallocate activation buffers for one sequence
+    # shape. Resize those buffers before this parity-only forward just as the
+    # training recipes do before every schedule step.
+    trainer.pp.update_seq_len(orig_seq_len)
 
     # Replicate the prompt to pp_batch_size so the schedule's batch split is valid.
     ids = torch.tensor([input_ids] * pp_batch_size, device=device, dtype=torch.long)
-    # The PP schedule requires the static stage sequence length, but the parity
-    # prompt is usually much shorter. Keep synthetic tail tokens out of both
-    # attention and MoE dispatch so this forward represents the same prompt as
-    # the unpadded HF reference.
-    attention_mask = torch.zeros_like(ids)
-    attention_mask[:, :orig_seq_len] = 1
+    attention_mask = torch.ones_like(ids)
     targets = torch.zeros_like(ids) if trainer.pp.info.has_last_stage else None
 
     captured = [None]

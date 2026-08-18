@@ -24,6 +24,7 @@ from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_bie
     _extract_custom_args as _extract_biencoder_custom_args,
 )
 from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm import (
+    _PARITY_DOCUMENT_SHA256,
     _assert_peft_adapter_matches_checkpoint,
     _compare_logits,
     _compare_source_load_parity,
@@ -282,8 +283,7 @@ def test_remote_masking_api_compatibility_preserves_supported_api(monkeypatch):
     assert masking_utils.create_sliding_window_causal_mask is create_mask
 
 
-@pytest.mark.parametrize("metadata_api", ["legacy", "user"])
-def test_get_logits_pp_pads_prompt_to_static_stage_sequence_length(metadata_api):
+def test_get_logits_pp_updates_pipeline_sequence_length():
     class _Schedule:
         def __init__(self):
             self._loss_fn = None
@@ -291,7 +291,7 @@ def test_get_logits_pp_pads_prompt_to_static_stage_sequence_length(metadata_api)
             self.attention_mask = None
 
         def eval(self, ids, *, target, losses, attention_mask):
-            """Capture a padded pipeline batch and invoke the active loss callback.
+            """Capture a pipeline batch and invoke the active loss callback.
 
             Args:
                 ids: Tensor of shape [batch, sequence].
@@ -314,19 +314,13 @@ def test_get_logits_pp_pads_prompt_to_static_stage_sequence_length(metadata_api)
         def size():
             return 1
 
-    if metadata_api == "legacy":
-        stage = SimpleNamespace(inputs_meta=(torch.empty(1, 16),))
-    else:
-        tensor_meta = SimpleNamespace(shape=torch.Size([1, 16]))
-        stage = SimpleNamespace(_user_meta=SimpleNamespace(inputs=(tensor_meta,), outputs=()))
-
     schedule = _Schedule()
+    update_seq_len = Mock()
     trainer = SimpleNamespace(
         pp=SimpleNamespace(
-            pp_seq_len=None,
+            update_seq_len=update_seq_len,
             info=SimpleNamespace(
                 schedule=schedule,
-                stages=[stage],
                 has_first_stage=True,
                 has_last_stage=True,
             ),
@@ -334,7 +328,6 @@ def test_get_logits_pp_pads_prompt_to_static_stage_sequence_length(metadata_api)
         pipeline_config=SimpleNamespace(pp_batch_size=1),
         model_parts=[SimpleNamespace(eval=lambda: None, config=SimpleNamespace(vocab_size=7))],
         device_mesh={"pp": _PipelineMesh()},
-        cfg=SimpleNamespace(get=lambda *_args: None),
     )
 
     with (
@@ -346,9 +339,10 @@ def test_get_logits_pp_pads_prompt_to_static_stage_sequence_length(metadata_api)
     ):
         logits = _get_logits_pp(trainer, [11, 12, 13], torch.device("cpu"))
 
-    assert schedule.ids.tolist() == [[11, 12, 13] + [0] * 13]
-    assert schedule.attention_mask.shape == (1, 16)
-    assert schedule.attention_mask.tolist() == [[1, 1, 1] + [0] * 13]
+    update_seq_len.assert_called_once_with(3)
+    assert schedule.ids.tolist() == [[11, 12, 13]]
+    assert schedule.attention_mask.shape == (1, 3)
+    assert schedule.attention_mask.tolist() == [[1, 1, 1]]
     assert logits.shape == (1, 3, 7)
 
 
@@ -530,7 +524,7 @@ def test_get_vlm_input_ids_uses_processor_tokenizer(monkeypatch, offline, expect
     tokenizer.encode.assert_called_once_with(_get_parity_document(), add_special_tokens=False)
 
 
-def test_parity_document_is_the_checked_in_long_form_finetuning_guide():
+def test_parity_document_is_the_frozen_long_form_finetuning_guide_snapshot():
     document = _get_parity_document()
 
     assert "Supervised Fine-Tuning (SFT) and Parameter-Efficient Fine-Tuning (PEFT)" in document[:200]
@@ -1227,6 +1221,7 @@ def test_compare_logits_persists_machine_readable_metrics(tmp_path):
     assert failure is None
     payload = json.loads((tmp_path / "parity_metrics/phase_2_automodel_model_reload.json").read_text())
     assert payload["schema_version"] == 1
+    assert payload["parity_document_sha256"] == _PARITY_DOCUMENT_SHA256
     assert payload["threshold_mode"] == "profile"
     assert payload["passed"] is True
     assert payload["within_active_thresholds"] is True
