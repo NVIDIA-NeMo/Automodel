@@ -76,6 +76,8 @@ navigation:
             path: ../../model-coverage/llm/qwen/qwen3.mdx
           - page: "Qwen3 MoE"
             path: ../../model-coverage/llm/qwen/qwen3-moe.mdx
+          - page: "Qwen3.8-2.4T-A95B"
+            path: ../../model-coverage/llm/qwen/qwen3-8-2-4t-a95b.mdx
           - page: "Qwen3-Next"
             path: ../../model-coverage/llm/qwen/qwen3-next.mdx
           - page: "ERNIE 4.5"
@@ -214,6 +216,9 @@ navigation:
             path: ../../model-coverage/vlm/moonshotai/kimi-vl.mdx
           - page: "Kimi-K3"
             path: ../../model-coverage/vlm/moonshotai/kimi-k3.mdx
+          - page: "North Micro Vision"
+            path: ../../model-coverage/vlm/coherelabs/north-micro-vision.mdx
+            slug: north-micro-vision
           - page: "Inkling"
             path: ../../model-coverage/vlm/thinkingmachines/inkling.mdx
           - page: "Gemma 3 / Gemma 3n"
@@ -233,6 +238,9 @@ navigation:
           - page: "Qwen3.6"
             path: ../../model-coverage/vlm/qwen/qwen3-6-vl.mdx
             slug: qwen3-6-vl
+          - page: "Qwen3.8"
+            path: ../../model-coverage/vlm/qwen/qwen3-8-vl.mdx
+            slug: qwen3-8-vl
           - page: "Nemotron-Parse"
             path: ../../model-coverage/vlm/nvidia/nemotron-parse.mdx
           - page: "Ministral3 VL"
@@ -402,6 +410,9 @@ navigation:
       - page: "Qwen3.5-VL"
         path: ../../guides/vlm/qwen3-5.mdx
         slug: qwen3-5-vl
+      - page: "Fine-Tune Qwen3.8-27B"
+        path: ../../guides/vlm/qwen3-8.mdx
+        slug: qwen3-8-27b
       - page: "Nemotron-Omni"
         path: ../../guides/vlm/nemotron-omni.mdx
         slug: nemotron-omni

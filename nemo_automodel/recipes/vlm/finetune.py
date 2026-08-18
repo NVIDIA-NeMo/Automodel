@@ -859,13 +859,20 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 if k != "input_ids":
                     batch.pop(k, None)
         # THD packed VLM inputs (qkv_format='thd' from the packing collator) use TE
-        # sequence metadata even without context parallelism (#3052); CP over THD for
-        # mRoPE VLMs is not implemented.
+        # sequence metadata even without context parallelism (#3052). Standard
+        # one-dimensional RoPE can follow the generic TE CP partition. Multi-axis
+        # mRoPE still needs axis-aware sharding before it can use this path.
         _use_te_vlm = batch.get("qkv_format", None) == "thd"
-        if _use_te_vlm and self.mesh_context.cp_size > 1:
+        position_ids = batch.get("position_ids")
+        if (
+            _use_te_vlm
+            and self.mesh_context.cp_size > 1
+            and isinstance(position_ids, torch.Tensor)
+            and position_ids.ndim == 3
+        ):
             raise NotImplementedError(
-                "THD packing (packing_format='thd') for VLM currently supports cp_size=1 only; "
-                "context-parallel THD for mRoPE VLMs is not yet implemented."
+                "Context-parallel THD packing for multi-axis mRoPE VLMs is not yet implemented; "
+                "use one-dimensional position_ids or cp_size=1."
             )
         _padding_id = getattr(getattr(getattr(self, "processor", None), "tokenizer", None), "pad_token_id", 0) or 0
         cp_sharder = ContextParallelSharder(
@@ -875,7 +882,36 @@ class FinetuneRecipeForVLM(BaseRecipe):
             padding_token_id=_padding_id,
             invoke_pre_embed=True,
         )
+        model = self.model_parts[0]
+        mtp_cp_enabled = _cp_active and not self.pp_enabled and model.supports.mtp_enabled
+        mtp_cp_inputs = None
+        if mtp_cp_enabled:
+            if not model.supports.supports_mtp_cp:
+                raise NotImplementedError(
+                    f"{type(model).__name__} declares supports_mtp_cp=False; "
+                    "MTP target preparation for context parallelism is unavailable"
+                )
+            mtp_cp_inputs = model.prepare_mtp_inputs_for_cp(
+                batch,
+                ignore_index=self.cfg.mtp.ignore_index,
+            )
         train_ctx, batch = cp_sharder.shard(batch)
+        mtp_per_depth_targets = None
+        if mtp_cp_inputs is not None:
+            batch["mtp_per_depth_input_ids"] = tuple(
+                cp_sharder.shard_token_tensor(ids, seq_dim=1, fill=0) for ids in mtp_cp_inputs.input_ids
+            )
+            batch["mtp_per_depth_position_ids"] = tuple(
+                cp_sharder.shard_token_tensor(ids, seq_dim=mtp_cp_inputs.position_ids_seq_dim, fill=0)
+                for ids in mtp_cp_inputs.position_ids
+            )
+            batch["mtp_per_depth_valid_masks"] = tuple(
+                cp_sharder.shard_token_tensor(mask, seq_dim=1, fill=False) for mask in mtp_cp_inputs.valid_masks
+            )
+            mtp_per_depth_targets = tuple(
+                cp_sharder.shard_token_tensor(targets, seq_dim=1, fill=self.cfg.mtp.ignore_index)
+                for targets in mtp_cp_inputs.targets
+            )
         labels = batch.pop("labels")
 
         if self.pp_enabled:
@@ -953,6 +989,8 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 mtp_per_depth_h = getattr(out, "mtp_per_depth_h", None)
                 mtp_per_depth_logits = getattr(out, "mtp_per_depth_logits", None)
                 if mtp_per_depth_h is not None or mtp_per_depth_logits is not None:
+                    if _cp_active and mtp_per_depth_targets is None:
+                        raise RuntimeError("MTP with context parallelism requires globally prepared per-depth targets")
                     mtp_cfg = self.cfg.mtp
                     scaling_factor = (
                         mtp_cfg.scaling_factor if mtp_cfg.scaling_factor is not None else out.mtp_loss_scaling_factor
@@ -961,6 +999,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                         self.loss_fn,
                         mtp_per_depth_h=mtp_per_depth_h,
                         mtp_per_depth_logits=mtp_per_depth_logits,
+                        mtp_per_depth_targets=mtp_per_depth_targets,
                         labels=labels,
                         model=model,
                         scaling_factor=scaling_factor,
@@ -968,6 +1007,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                         ignore_index=mtp_cfg.ignore_index,
                         lm_weight=shared_lm_weight,
                         grad_reduce_group=grad_reduce_group,
+                        cu_seqlens=None if mtp_per_depth_targets is not None else batch.get("cu_seqlens"),
                     )
 
                 # Joint base + drafter co-training (Gemma4WithDrafter and
