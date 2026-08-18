@@ -41,7 +41,6 @@ from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFChe
 from nemo_automodel.components.models.common.mtp import (
     MTPConfig,
     MTPContextParallelInputs,
-    MTPPositionPolicy,
     prepare_mtp_context_parallel_inputs,
     roll_tensor,
 )
@@ -711,12 +710,11 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
         }
 
     def prepare_mtp_inputs_for_cp(self, batch: dict[str, Any], *, ignore_index: int = -100) -> MTPContextParallelInputs:
-        """Prepare future-token IDs while retaining MiniMax's current query positions."""
+        """Prepare MiniMax's future-token MTP streams before CP sharding."""
         return prepare_mtp_context_parallel_inputs(
             batch,
             num_depths=self.mtp_config.num_layers,
             ignore_index=ignore_index,
-            position_policy=MTPPositionPolicy.CURRENT,
         )
 
     def forward(

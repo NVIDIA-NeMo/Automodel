@@ -33,7 +33,6 @@ import torch.nn as nn
 from nemo_automodel.components.models.common.mtp.mtp import (
     MTPConfig,
     MTPModule,
-    MTPPositionPolicy,
     prepare_mtp_context_parallel_inputs,
     roll_tensor,
     shift_packed_tensor,
@@ -394,26 +393,6 @@ class TestMTPContextParallelPreparation:
             [[21, 22, 23, 0]],
         ]
         assert prepared.valid_masks[0].tolist() == [[True, True, True, False]]
-
-    def test_current_position_policy_keeps_query_positions_at_every_depth(self):
-        batch = {
-            "input_ids": torch.tensor([[10, 11, 12, 20, 21, 22]]),
-            "labels": torch.tensor([[11, 12, -100, 21, 22, -100]]),
-            "position_ids": torch.tensor([[0, 1, 2, 0, 1, 2]]),
-            "_packed_seq_ids": torch.tensor([[1, 1, 1, 2, 2, 2]]),
-        }
-
-        prepared = prepare_mtp_context_parallel_inputs(
-            batch,
-            num_depths=2,
-            position_policy=MTPPositionPolicy.CURRENT,
-        )
-
-        assert [tensor.tolist() for tensor in prepared.position_ids] == [
-            [[0, 1, 2, 0, 1, 2]],
-            [[0, 1, 2, 0, 1, 2]],
-        ]
-        assert prepared.position_ids[0].data_ptr() != prepared.position_ids[1].data_ptr()
 
     def test_raw_thd_lengths_mask_boundaries_before_sharding(self):
         batch = {

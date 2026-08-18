@@ -57,7 +57,6 @@ from nemo_automodel.components.models.common import (
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.mtp import (
     MTPContextParallelInputs,
-    MTPPositionPolicy,
     prepare_mtp_context_parallel_inputs,
 )
 from nemo_automodel.components.models.common.tie_word_embeddings import (
@@ -906,12 +905,11 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         return {"cp_sharder": cp_sharder}
 
     def prepare_mtp_inputs_for_cp(self, batch: dict[str, Any], *, ignore_index: int = -100) -> MTPContextParallelInputs:
-        """Prepare future-token IDs while retaining DSV4's current query positions."""
+        """Prepare DSV4's future-token MTP streams before CP sharding."""
         return prepare_mtp_context_parallel_inputs(
             batch,
             num_depths=self.mtp_config.num_layers,
             ignore_index=ignore_index,
-            position_policy=MTPPositionPolicy.CURRENT,
         )
 
     def forward(
