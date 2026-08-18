@@ -311,9 +311,6 @@ class MiniMaxM3SparseForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMix
             layer_pattern="*" if num_mtp_modules > 0 else "",
             loss_scaling_factor=mtp_loss_scaling_factor,
         )
-        self._optional_base_checkpoint_key_prefixes = (
-            ("model.mtp.", "language_model.model.mtp.") if num_mtp_modules > 0 else ()
-        )
         self.lm_head = initialize_linear_module(self.backend.linear, config.hidden_size, config.vocab_size, bias=False)
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = MiniMaxM3StateDictAdapter(
@@ -483,12 +480,6 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
             num_layers=num_mtp_modules,
             layer_pattern="*" if num_mtp_modules > 0 else "",
             loss_scaling_factor=mtp_loss_scaling_factor,
-        )
-        # MiniMaxAI/MiniMax-M3 declares MTP in its config but its public
-        # safetensors omit the MTP module. Keep only those explicitly scoped
-        # tensors at random initialization; every unrelated base key stays strict.
-        self._optional_base_checkpoint_key_prefixes = (
-            ("model.mtp.", "language_model.model.mtp.") if num_mtp_modules > 0 else ()
         )
         self.lm_head = initialize_linear_module(
             self.backend.linear, text_config.hidden_size, text_config.vocab_size, bias=False
