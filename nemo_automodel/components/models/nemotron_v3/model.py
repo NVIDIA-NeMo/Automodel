@@ -708,6 +708,7 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
         logits_to_keep: Union[int, torch.Tensor] = 0,
         output_hidden_states: bool | None = None,
         return_dict: bool | None = None,
+        compute_logits: bool = True,
         **kwargs: Any,
     ) -> CausalLMOutputWithPast:
         """Forward pass with optional loss computation.
@@ -759,6 +760,8 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
             output_hidden_states: Whether to return hidden states.
             return_dict: Accepted for API compatibility (always returns a
                 ``NemotronHCausalLMOutputWithPast`` off-PP).
+            compute_logits: Whether to materialize logits. Fused-linear loss callers
+                may disable this off-PP when they consume final hidden states directly.
             **kwargs: Additional arguments forwarded to the base model
                 (e.g. ``qkv_format``, ``cu_seqlens``, ``cu_seqlens_padded``,
                 ``max_seqlen``, ``seq_idx``, ``cp_rank``, ``cp_size``,
@@ -862,7 +865,12 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
         if past_key_values is not None:
             past_key_values.has_previous_state = True
 
-        logits = compute_lm_head_logits(self.lm_head, hidden_states, logits_to_keep).logits
+        if compute_logits:
+            logits = compute_lm_head_logits(self.lm_head, hidden_states, logits_to_keep).logits
+        else:
+            if labels is not None or is_pp_stage:
+                raise ValueError("compute_logits=False is only supported off-PP without labels.")
+            logits = hidden_states.new_empty((*hidden_states.shape[:-1], 0))
 
         loss = None
         # PP path defers loss to PipelineCausalLMLoss; only compute here off-PP.
