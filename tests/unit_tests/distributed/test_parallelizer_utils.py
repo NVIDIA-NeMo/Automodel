@@ -39,8 +39,10 @@ from nemo_automodel.shared.torch_patches import (
 )
 
 
-def test_reject_unsupported_mtp_cp_pp_ignores_model_without_capabilities():
-    reject_unsupported_mtp_cp_pp(nn.Linear(2, 2))
+def test_reject_unsupported_mtp_cp_pp_allows_disabled_model():
+    model = nn.Linear(2, 2)
+    model.supports = SimpleNamespace(mtp_enabled=False, supports_mtp_cp_pp=False)
+    reject_unsupported_mtp_cp_pp(model)
 
 
 def test_reject_unsupported_mtp_cp_rejects_enabled_unsupported_model():
