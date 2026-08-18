@@ -36,7 +36,7 @@ env:
 
 jobs:
   pre-flight:
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@c1a0837f362a1a696e647238ab1cf916b2a7cf4a # v1.8.6
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@cf5acebace78c7c339bc1f804357a991336f1c4d # v1.8.10
     with:
       default_runner_prefix: ${{ vars.DEFAULT_RUNNER_PREFIX }}
       non_nvidia_runner_prefix: ${{ vars.NON_NVIDIA_RUNNER_PREFIX }}
@@ -284,6 +284,7 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ steps.sha.outputs.main }}
+          fetch-depth: 0
 
       - name: Setup python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
@@ -371,6 +372,13 @@ jobs:
           # after the build would create an archive that no step persists.
           skip-extraction: ${{ github.ref != 'refs/heads/main' || steps.uv-build-cache-main.outputs.cache-hit == 'true' }}
 
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.BOT_ID }}
+          private-key: ${{ secrets.BOT_KEY }}
+
       - name: Build and push
         uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
         with:
@@ -387,7 +395,7 @@ jobs:
             ${{ matrix.registry }}/automodel:${{ steps.cache_keys.outputs.key }}
             ${{ matrix.registry }}/automodel:${{ github.sha }}
           secrets: |
-            GH_TOKEN=${{ secrets.PAT }}
+            GH_TOKEN=${{ steps.app-token.outputs.token }}
 
   cicd-unit-tests:
     strategy:
@@ -424,6 +432,13 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.BOT_ID }}
+          private-key: ${{ secrets.BOT_KEY }}
+
       - name: main
         uses: ./.github/actions/test-template
         with:
@@ -432,7 +447,7 @@ jobs:
           cpu-only: ${{ matrix.cpu-only || false }}
           shard-id: ${{ matrix.shard-id }}
           num-shards: ${{ matrix.num-shards }}
-          PAT: ${{ secrets.PAT }}
+          PAT: ${{ steps.app-token.outputs.token }}
           test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
           container-image: ${{ env.container-registry }}/${{ vars.CI_CONTAINER_NAME || 'automodel' }}:${{ github.sha }}
           runner: ${{ matrix.runner }}
@@ -511,13 +526,20 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.BOT_ID }}
+          private-key: ${{ secrets.BOT_KEY }}
+
       - name: main
         uses: ./.github/actions/test-template
         with:
           test-folder: ${{ matrix.test-folder }}
           timeout: ${{ matrix.timeout }}
           is_unit_test: "false"
-          PAT: ${{ secrets.PAT }}
+          PAT: ${{ steps.app-token.outputs.token }}
           test-data-path: ${{ matrix.test-data-path }}
           container-image: ${{ env.container-registry }}/${{ vars.CI_CONTAINER_NAME || 'automodel' }}:${{ github.sha }}
           runner: ${{ matrix.runner }}
@@ -584,6 +606,13 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.BOT_ID }}
+          private-key: ${{ secrets.BOT_KEY }}
+
       - name: main
         uses: ./.github/actions/test-template
         with:
@@ -591,7 +620,7 @@ jobs:
           timeout: ${{ matrix.timeout }}
           is-optional: ${{ matrix.is-optional || 'false' }}
           is_unit_test: "false"
-          PAT: ${{ secrets.PAT }}
+          PAT: ${{ steps.app-token.outputs.token }}
           test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
           container-image: ${{ env.container-registry-gb200 }}/automodel:${{ github.sha }}
           runner: ${{ matrix.runner || 'nemo-ci-gcp-gpu-x2' }}
@@ -654,10 +683,17 @@ jobs:
       && !cancelled()
       && vars.ENABLE_CODECOV == 'true'
     steps:
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.BOT_ID }}
+          private-key: ${{ secrets.BOT_KEY }}
+
       - name: Generate fake coverage report
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         with:
-          github-token: ${{ secrets.PAT }}
+          github-token: ${{ steps.app-token.outputs.token }}
           script: |
             await github.rest.repos.createCommitStatus({
               owner: context.repo.owner,

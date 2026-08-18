@@ -98,7 +98,7 @@ flow_matching:
 step_scheduler:
   num_epochs: 1000
   local_batch_size: 1
-  global_batch_size: 4
+  global_batch_size: 8
   ckpt_every_steps: 500
   log_remote_every_steps: 10
   # max_steps: null  # Set to limit training to a specific number of steps

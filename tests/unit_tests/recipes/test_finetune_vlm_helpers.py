@@ -466,7 +466,7 @@ def test_forward_backward_step_routes_thd_batch_through_te(monkeypatch):
     recipe = FinetuneRecipeForVLM.__new__(FinetuneRecipeForVLM)
     recipe.dist_env = SimpleNamespace(device="cpu")
     recipe.device_mesh = None
-    recipe.mesh_context = SimpleNamespace(cp_size=1)
+    recipe.mesh_context = SimpleNamespace(cp_size=2)
     recipe.processor = SimpleNamespace(tokenizer=SimpleNamespace(pad_token_id=7))
     recipe.model_parts = [_TensorModel()]
     recipe.pp_enabled = False
@@ -508,7 +508,7 @@ def test_forward_backward_step_routes_thd_batch_through_te(monkeypatch):
 
 
 @pytest.mark.cuda(False)
-def test_forward_backward_step_rejects_thd_with_context_parallelism():
+def test_forward_backward_step_rejects_mrope_thd_with_context_parallelism():
     recipe = FinetuneRecipeForVLM.__new__(FinetuneRecipeForVLM)
     recipe.dist_env = SimpleNamespace(device="cpu")
     recipe.device_mesh = None
@@ -517,12 +517,13 @@ def test_forward_backward_step_rejects_thd_with_context_parallelism():
     recipe.pp_enabled = False
     recipe.magi = SimpleNamespace(enabled=False)
 
-    with pytest.raises(NotImplementedError, match="currently supports cp_size=1 only"):
+    with pytest.raises(NotImplementedError, match="multi-axis mRoPE"):
         recipe._forward_backward_step(
             idx=0,
             batch={
                 "input_ids": torch.tensor([[1, 2]]),
                 "labels": torch.tensor([[2, -100]]),
+                "position_ids": torch.zeros((3, 1, 2), dtype=torch.long),
                 "qkv_format": "thd",
             },
             loss_buffer=[],
@@ -1462,12 +1463,13 @@ class TestCalculateLoss:
         hidden_states = torch.randn(2, 5, 32, device="cuda")
         labels = torch.randint(0, 50, (2, 5), device="cuda")
 
-        # Use a plain object that has lm_head but no get_output_embeddings
+        # Use a module that has lm_head parameters but no get_output_embeddings
         # This tests the fallback path in calculate_loss
-        class ModelWithLmHeadOnly:
-            """Non-nn.Module model without get_output_embeddings."""
+        class ModelWithLmHeadOnly(torch.nn.Module):
+            """nn.Module model without get_output_embeddings."""
 
             def __init__(self):
+                super().__init__()
                 self._lm_head = torch.nn.Linear(32, 50).cuda()
 
             def named_parameters(self, remove_duplicate=False):
@@ -2299,6 +2301,7 @@ class _CPPreEmbedModel(torch.nn.Module):
     def __init__(self):
         super().__init__()
         self.scale = torch.nn.Parameter(torch.tensor(1.0))
+        self.supports = SimpleNamespace(mtp_enabled=False, supports_mtp_cp=False)
         self.hook_calls = []
 
     def prepare_model_inputs_for_cp(self, batch, *, num_chunks=1):

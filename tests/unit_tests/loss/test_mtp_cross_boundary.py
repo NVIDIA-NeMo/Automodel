@@ -111,6 +111,78 @@ def _run_capture(
     return cap.captured_labels
 
 
+def test_precomputed_targets_preserve_global_shift_after_context_parallel_sharding():
+    """CP-local targets are consumed directly instead of rolled in local order."""
+    labels = torch.tensor([10, 12, 21, 23], dtype=torch.long)
+    mtp_per_depth_h = [torch.zeros((4, 3), requires_grad=True) for _ in range(2)]
+    precomputed_targets = [
+        torch.tensor([11, IGNORE, 22, IGNORE]),
+        torch.tensor([12, IGNORE, 23, IGNORE]),
+    ]
+    cap = _CaptureLoss()
+
+    with mock.patch("nemo_automodel.components.loss.mtp.calculate_loss", side_effect=lambda loss_fn, **kw: cap(**kw)):
+        calculate_mtp_loss(
+            loss_fn=mock.MagicMock(),
+            mtp_per_depth_h=mtp_per_depth_h,
+            mtp_per_depth_targets=precomputed_targets,
+            labels=labels,
+            model=mock.MagicMock(),
+            scaling_factor=1.0,
+        )
+
+    assert len(cap.captured_labels) == 2
+    for actual, expected in zip(cap.captured_labels, precomputed_targets):
+        torch.testing.assert_close(actual, expected)
+
+
+def test_precomputed_target_count_must_match_mtp_depth():
+    labels = torch.zeros(4, dtype=torch.long)
+
+    with pytest.raises(ValueError, match="Expected 2 mtp_per_depth_targets"):
+        calculate_mtp_loss(
+            loss_fn=mock.MagicMock(),
+            mtp_per_depth_h=[torch.zeros(4, 3), torch.zeros(4, 3)],
+            mtp_per_depth_targets=[torch.zeros(4, dtype=torch.long)],
+            labels=labels,
+            model=mock.MagicMock(),
+        )
+
+
+def test_precomputed_target_shape_must_match_local_labels():
+    labels = torch.zeros(4, dtype=torch.long)
+
+    with pytest.raises(ValueError, match="target shape .* does not match labels shape"):
+        calculate_mtp_loss(
+            loss_fn=mock.MagicMock(),
+            mtp_per_depth_h=[torch.zeros(4, 3)],
+            mtp_per_depth_targets=[torch.zeros(5, dtype=torch.long)],
+            labels=labels,
+            model=mock.MagicMock(),
+        )
+
+
+@pytest.mark.parametrize(
+    "sequence_metadata",
+    [
+        {"cu_seqlens": torch.tensor([0, 4], dtype=torch.int32)},
+        {"seq_idx": torch.zeros(4, dtype=torch.long)},
+    ],
+)
+def test_precomputed_targets_are_mutually_exclusive_with_sequence_metadata(sequence_metadata):
+    labels = torch.zeros(4, dtype=torch.long)
+
+    with pytest.raises(ValueError, match="cannot be combined"):
+        calculate_mtp_loss(
+            loss_fn=mock.MagicMock(),
+            mtp_per_depth_h=[torch.zeros(4, 3)],
+            mtp_per_depth_targets=[torch.zeros(4, dtype=torch.long)],
+            labels=labels,
+            model=mock.MagicMock(),
+            **sequence_metadata,
+        )
+
+
 def test_cross_boundary_masked_via_seq_idx_1d():
     """Two 4-token sub-seqs in an 8-token packed sample. With seq_idx supplied
     directly, depth-0 must mask position 3 (rolls into sub-seq 1); depth-1 must
@@ -258,6 +330,7 @@ def test_thd_flat_labels_squeeze_3d_hidden_states():
             mtp_per_depth_h=mtp_per_depth_h,
             labels=labels,
             model=mock.MagicMock(),
+            lm_weight=torch.zeros((1, H), requires_grad=True),
             scaling_factor=1.0,
             ignore_index=IGNORE,
         )
@@ -292,6 +365,7 @@ def test_2d_labels_and_3d_hidden_states_unchanged():
             mtp_per_depth_h=mtp_per_depth_h,
             labels=labels,
             model=mock.MagicMock(),
+            lm_weight=torch.zeros((1, H), requires_grad=True),
             scaling_factor=1.0,
             ignore_index=IGNORE,
         )

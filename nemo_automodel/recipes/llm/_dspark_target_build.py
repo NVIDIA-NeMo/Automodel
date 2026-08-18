@@ -14,8 +14,8 @@
 
 """Shared builders for the large expert-parallel / FSDP DSpark targets.
 
-DeepSeek V4 and GLM-5.2 targets are too large to load on a single 8x80GB node, so
-both the online training recipe (``train_dspark.py``) and the distributed offline
+DeepSeek V4, GLM-5.2, and Kimi K3 targets are too large to load on a single 8x80GB
+node, so both the online training recipe (``train_dspark.py``) and the distributed offline
 precompute (``precompute_dspark_dist.py``) load them frozen through the same
 expert-parallel / FSDP distributed path: ``create_distributed_setup_from_config``
 builds the ``device_mesh`` + ``moe_mesh`` from the recipe's ``distributed:`` block
@@ -104,7 +104,7 @@ def validate_dspark_parallelism_axes(cfg) -> None:
 def gather_full_weight_module(module):
     """Return an object exposing a full (non-DTensor) ``.weight`` tensor.
 
-    The expert-parallel / FSDP-sharded DeepSeek V4 / GLM-5.2 targets store
+    The expert-parallel / FSDP-sharded DeepSeek V4 / GLM-5.2 / Kimi K3 targets store
     ``embed_tokens`` and ``lm_head`` weights as DTensors, while a draft (or the
     offline cache) wants plain tensors. Gather the sharded weight to a full tensor
     first (an all-gather, so every rank must call this in lockstep); non-sharded
@@ -327,11 +327,111 @@ def build_glm_5_2_target(
     return target_config, target_model, distributed_setup
 
 
+def build_kimi_k3_backend(recipe_cfg) -> BackendConfig:
+    """Build the backend used by the frozen expert-parallel Kimi K3 target.
+
+    Mirrors :func:`build_glm_5_2_backend`: the hybrid-EP token dispatcher shards the
+    routed experts and the HF state-dict adapter maps (and dequantizes, when the base
+    checkpoint is FP8) the HF weights on load. ``target_experts`` defaults to
+    ``torch_mm`` (like the V4 and GLM DSpark backends) because ``gmm`` needs the
+    optional ``grouped_gemm`` package, which the current AutoModel image does not ship.
+
+    Two fields differ from the GLM backend by design:
+
+    - ``attn`` defaults to ``eager`` and is inert for this target: ``KimiK3ForCausalLM``
+      never reads ``backend.attn`` (its MLA and KDA layers each have a fixed attention
+      path), so the field only records that no fused-kernel build is required.
+    - no ``gate_precision`` override is passed, because ``KimiK3ForCausalLM`` already
+      defaults ``backend.gate_precision`` to ``torch.float32`` itself.
+    """
+    return BackendConfig(
+        attn=str(recipe_cfg.get("target_attn_backend", "eager")),
+        linear="torch",
+        rms_norm="torch_fp32",
+        rope_fusion=False,
+        dispatcher=str(recipe_cfg.get("target_dispatcher", "hybridep")),
+        experts=str(recipe_cfg.get("target_experts", "torch_mm")),
+        enable_hf_state_dict_adapter=True,
+        enable_fsdp_optimizations=bool(recipe_cfg.get("target_enable_fsdp_optimizations", True)),
+    )
+
+
+def build_kimi_k3_target(
+    *,
+    cfg: Any,
+    world_size: int,
+    device: torch.device,
+    compute_dtype: torch.dtype,
+    target_path: str,
+    recipe_cfg,
+    trust_remote_code: bool,
+):
+    """Load Kimi K3 as a frozen, expert-parallel / FSDP target for online DSpark training.
+
+    Mirrors :func:`build_glm_5_2_target`: an expert-parallel / FSDP distributed setup
+    (derived from ``cfg``'s ``distributed`` block) shards the routed experts across
+    ranks, and the model is built with ``from_config`` + ``load_base_model=True`` so the
+    ``target_num_hidden_layers`` reduction survives (``from_pretrained`` would re-read
+    the checkpoint's own config and rebuild the full-depth target, which OOMs on one
+    node). Unlike GLM, the config may be the multimodal ``kimi_k3`` wrapper, so the text
+    sub-config is unwrapped and re-tagged as ``KimiK3ForCausalLM``: DSpark captures
+    hidden states from the text backbone only.
+
+    The forward-hook hidden-state capture needs one non-pipelined ``model(...)`` call,
+    so ``pp_size`` must be 1 in the recipe's ``distributed:`` block; use a larger
+    ``ep_size`` instead of PP to shard the parameter memory.
+
+    Returns ``(text_config, target_model, distributed_setup)``.
+    """
+    if device.type != "cuda":
+        raise RuntimeError(
+            "Kimi K3 DSpark target requires CUDA: the target is loaded with the "
+            "expert-parallel / FSDP distributed path."
+        )
+    target_config = AutoConfig.from_pretrained(target_path, trust_remote_code=trust_remote_code)
+    text_config = getattr(target_config, "text_config", target_config)
+    n_reduced = resolve_reduced_target_layers(
+        text_config.num_hidden_layers,
+        recipe_cfg.get("target_num_hidden_layers", None),
+    )
+    if n_reduced is not None:
+        logger.warning(
+            "Reducing the Kimi K3 target from %d to %d layers "
+            "(target_num_hidden_layers): diagnostic/CI only, not a usable cache.",
+            text_config.num_hidden_layers,
+            n_reduced,
+        )
+        text_config.num_hidden_layers = n_reduced
+        text_config.linear_attn_config = {
+            **text_config.linear_attn_config,
+            "kda_layers": [
+                layer_idx for layer_idx in text_config.linear_attn_config["kda_layers"] if layer_idx <= n_reduced
+            ],
+            "full_attn_layers": [
+                layer_idx for layer_idx in text_config.linear_attn_config["full_attn_layers"] if layer_idx <= n_reduced
+            ],
+        }
+    text_config.architectures = ["KimiK3ForCausalLM"]
+    text_config.name_or_path = target_path
+    distributed_setup = create_distributed_setup_from_config(cfg, world_size=world_size)
+    target_model = NeMoAutoModelForCausalLM.from_config(
+        config=text_config,
+        backend=build_kimi_k3_backend(recipe_cfg),
+        distributed_setup=distributed_setup,
+        load_base_model=True,
+        torch_dtype=compute_dtype,
+        trust_remote_code=trust_remote_code,
+    )
+    return text_config, target_model, distributed_setup
+
+
 __all__ = [
     "build_deepseek_v4_backend",
     "build_deepseek_v4_target",
     "build_glm_5_2_backend",
     "build_glm_5_2_target",
+    "build_kimi_k3_backend",
+    "build_kimi_k3_target",
     "distributed_section_dict",
     "gather_full_weight_module",
     "repair_glm_5_2_qk_rope_head_dim",

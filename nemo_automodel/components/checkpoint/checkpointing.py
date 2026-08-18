@@ -84,6 +84,7 @@ from nemo_automodel.components.checkpoint.utils import (
     is_rank_0,
     materialize_missing_tied_lm_head,
 )
+from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 
 if TYPE_CHECKING:
     from peft import PeftConfig
@@ -500,8 +501,8 @@ class Checkpointer:
     - PEFT adapter save/load handling
     - Async save for torch >= 2.9.0
 
-    Also provides DP-aware helpers for saving/loading auxiliary state and
-    utilities to initialize from a base HF checkpoint.
+    Also provides DP- and global-rank-aware helpers for saving/loading
+    auxiliary state and utilities to initialize from a base HF checkpoint.
     """
 
     def __init__(
@@ -1350,10 +1351,10 @@ class Checkpointer:
             raise error
 
     def save_on_dp_ranks(self, state: Any, state_name: str, path: str) -> None:
-        """
-        Save the stateful object.
+        """Save state shared by all tensor- and pipeline-parallel peers.
 
-        This function is a helper function currently used to save the dataloader and rng state.
+        This helper is intended for data-parallel-scoped state such as a
+        stateful dataloader. Only the TP0/PP0 peer writes each DP rank's state.
 
         Args:
             state: Stateful object to save
@@ -1366,10 +1367,10 @@ class Checkpointer:
             torch.save(state.state_dict(), os.path.join(state_dir, f"{state_name}_dp_rank_{self.dp_rank}.pt"))
 
     def load_on_dp_ranks(self, state: Any, state_name: str, path: str) -> None:
-        """
-        Load the stateful object.
+        """Load state shared by all tensor- and pipeline-parallel peers.
 
-        This function is a helper function currently used to load the dataloader and rng state.
+        This helper is intended for data-parallel-scoped state such as a
+        stateful dataloader. All TP/PP peers in a DP rank load the same state.
 
         Args:
             state: Stateful object to load
@@ -1380,6 +1381,46 @@ class Checkpointer:
         state.load_state_dict(
             load_torch_ckpt(
                 os.path.join(state_dir, f"{state_name}_dp_rank_{self.dp_rank}.pt"),
+                weights_only=not self.config.allow_legacy_pickle_restore,
+            )
+        )
+
+    def save_on_global_ranks(self, state: Any, state_name: str, path: str) -> None:
+        """Save state that is unique to every global process rank.
+
+        Args:
+            state: Stateful object to save.
+            state_name: Name of the stateful object.
+            path: Path to save the stateful object.
+        """
+        state_dir = os.path.join(path, state_name)
+        _ensure_dirs(state_dir, process_group=self.process_group)
+        global_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        torch.save(state.state_dict(), os.path.join(state_dir, f"{state_name}_global_rank_{global_rank}.pt"))
+
+    def load_on_global_ranks(self, state: Any, state_name: str, path: str) -> None:
+        """Load state unique to this global rank, with legacy DP fallback.
+
+        Args:
+            state: Stateful object to load.
+            state_name: Name of the stateful object.
+            path: Path containing the stateful object.
+        """
+        state_dir = os.path.join(path, state_name)
+        global_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        state_file = os.path.join(state_dir, f"{state_name}_global_rank_{global_rank}.pt")
+        if not os.path.exists(state_file):
+            state_file = os.path.join(state_dir, f"{state_name}_dp_rank_{self.dp_rank}.pt")
+            if os.path.exists(state_file) and global_rank == 0:
+                logger.warning(
+                    "Loading legacy per-DP %s state from %s. Exact rank-local restoration is not guaranteed under "
+                    "tensor or pipeline parallelism.",
+                    state_name,
+                    state_file,
+                )
+        state.load_state_dict(
+            load_torch_ckpt(
+                state_file,
                 weights_only=not self.config.allow_legacy_pickle_restore,
             )
         )
@@ -2274,18 +2315,15 @@ def _load_full_state_dict_into_model(
     """
     # IMPORTANT: named_modules() returns paths that include wrapper prefixes
     # like _checkpoint_wrapped_module, but PyTorch's _get_fqns() strips
-    # _CHECKPOINT_PREFIX from FQNs.  We must do the same so our keys match
+    # checkpoint-wrapper components from FQNs. We must do the same so our keys match
     # what _load_model_state_dict actually looks up.
-    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
-        _CHECKPOINT_PREFIX,
-    )
     from torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
 
     for model in model_parts:
         for name, module in model.named_modules():
             if type(module).get_extra_state is not nn.Module.get_extra_state:
                 key = f"{name}._extra_state" if name else "_extra_state"
-                key = key.replace(_CHECKPOINT_PREFIX, "")
+                key = canonical_parameter_fqn(key)
                 if key not in state_dict:
                     state_dict[key] = torch.tensor([], dtype=torch.uint8)
 

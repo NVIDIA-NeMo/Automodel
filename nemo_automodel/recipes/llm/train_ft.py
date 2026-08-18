@@ -884,7 +884,11 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         if isinstance(self.loss_fn, FusedLinearCrossEntropy):
             last_stage_model._pp_return_hidden_states = True
 
-        self.pp.info.schedule._loss_fn = self.cfg.mtp.build(self.loss_fn, last_stage_model)
+        self.pp.info.schedule._loss_fn = self.cfg.mtp.build(
+            self.loss_fn,
+            last_stage_model,
+            grad_reduce_group=self._get_dp_group(include_cp=True),
+        )
 
     def _setup_qat(self, cfg, model_parts: list[nn.Module]):
         if not cfg.get("qat.enabled", False):
@@ -1021,14 +1025,39 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             )
             for k, v in batch.items()
         }
+        model = self.model_parts[0] if hasattr(self, "model_parts") else None
+        mtp_cp_enabled = not self.pp_enabled and self._get_cp_group_size() > 1 and model.supports.mtp_enabled
+        mtp_cp_inputs = None
+        if mtp_cp_enabled:
+            if not model.supports.supports_mtp_cp:
+                raise NotImplementedError(
+                    f"{type(model).__name__} declares supports_mtp_cp=False; "
+                    "MTP target preparation for context parallelism is unavailable"
+                )
+            mtp_cp_inputs = model.prepare_mtp_inputs_for_cp(
+                batch,
+                ignore_index=self.cfg.mtp.ignore_index,
+            )
         cp_sharder = ContextParallelSharder(
-            self.model_parts[0] if hasattr(self, "model_parts") else None,
+            model,
             self.device_mesh,
             batch,
             padding_token_id=self.tokenizer.pad_token_id if self.tokenizer else 0,
             num_chunks=self.pp.pp_batch_size // self.pp.pp_microbatch_size if self.pp_enabled else 1,
         )
         train_ctx, batch = cp_sharder.shard(batch)
+        mtp_per_depth_targets = None
+        if mtp_cp_inputs is not None:
+            batch["mtp_per_depth_input_ids"] = tuple(
+                cp_sharder.shard_token_tensor(ids, seq_dim=1, fill=0) for ids in mtp_cp_inputs.input_ids
+            )
+            batch["mtp_per_depth_position_ids"] = tuple(
+                cp_sharder.shard_token_tensor(ids, seq_dim=1, fill=0) for ids in mtp_cp_inputs.position_ids
+            )
+            mtp_per_depth_targets = tuple(
+                cp_sharder.shard_token_tensor(targets, seq_dim=1, fill=self.cfg.mtp.ignore_index)
+                for targets in mtp_cp_inputs.targets
+            )
         labels = batch.pop("labels")
         fp8_ctx = self.te_fp8.maybe_te_autocast() if self.te_fp8 is not None else nullcontext()
 
@@ -1106,9 +1135,15 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 # Gather the LM head once and share it across the main loss and
                 # all MTP depths (FusedLinearCrossEntropy path) to avoid redundant
                 # full_tensor() gathers that accumulate on-device and OOM.
-                shared_lm_weight = (
-                    _get_lm_head_weight(model) if isinstance(self.loss_fn, FusedLinearCrossEntropy) else None
-                )
+                loss_distributed_kwargs = {}
+                shared_lm_weight = None
+                if isinstance(self.loss_fn, FusedLinearCrossEntropy):
+                    grad_reduce_group = self._get_dp_group(include_cp=True) if is_train else None
+                    shared_lm_weight = self.loss_fn.materialize_lm_weight(
+                        _get_lm_head_weight(model),
+                        grad_reduce_group=grad_reduce_group,
+                    )
+                    loss_distributed_kwargs["grad_reduce_group"] = grad_reduce_group
                 local_loss = calculate_loss(
                     self.loss_fn,
                     logits=getattr(out, "logits", out),
@@ -1117,11 +1152,17 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     hidden_states=get_final_hidden_states(out),
                     lm_weight=shared_lm_weight,
                     num_label_tokens=num_label_tokens,
+                    **loss_distributed_kwargs,
                 )
                 mtp_per_depth_h = getattr(out, "mtp_per_depth_h", None)
                 mtp_per_depth_logits = getattr(out, "mtp_per_depth_logits", None)
                 if mtp_per_depth_h is not None or mtp_per_depth_logits is not None:
                     mtp_cfg = self.cfg.mtp
+                    if self._get_cp_group_size() > 1 and mtp_per_depth_targets is None:
+                        raise NotImplementedError(
+                            f"{type(model).__name__} produced MTP outputs under context parallelism "
+                            "without globally prepared targets"
+                        )
                     scaling_factor = (
                         mtp_cfg.scaling_factor if mtp_cfg.scaling_factor is not None else out.mtp_loss_scaling_factor
                     )
@@ -1129,14 +1170,16 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         self.loss_fn,
                         mtp_per_depth_h=mtp_per_depth_h,
                         mtp_per_depth_logits=mtp_per_depth_logits,
+                        mtp_per_depth_targets=mtp_per_depth_targets,
                         labels=labels,
                         model=model,
                         scaling_factor=scaling_factor,
                         num_label_tokens=num_label_tokens,
                         ignore_index=mtp_cfg.ignore_index,
                         # mask cross-boundary MTP label rolls in THD packing (matches the PP path)
-                        cu_seqlens=batch.get("cu_seqlens"),
+                        cu_seqlens=None if mtp_per_depth_targets is not None else batch.get("cu_seqlens"),
                         lm_weight=shared_lm_weight,
+                        **loss_distributed_kwargs,
                     )
                 loss_buffer.append(local_loss.clone().detach())
                 if is_train:
