@@ -652,11 +652,12 @@ class _FakeProgressBar:
 
 
 class _FakeStepScheduler:
-    def __init__(self, batch_group):
+    def __init__(self, batch_group, is_val_step=False):
         self.step = 0
         self.epochs = [0]
         self.dataloader = None
         self.is_ckpt_step = False
+        self.is_val_step = is_val_step
         self.log_remote_every_steps = 1
         self._batch_group = batch_group
 
@@ -700,6 +701,7 @@ def test_run_train_validation_loop_uses_hot_path_and_logs_perf_metrics(monkeypat
     recipe.sampler = SimpleNamespace(set_epoch=MagicMock())
     recipe.dataloader = [object()]
     recipe.step_scheduler = _FakeStepScheduler(batch_group)
+    recipe.val_dataloader = None
     recipe.optimizer = [
         SimpleNamespace(
             zero_grad=MagicMock(),
@@ -763,3 +765,149 @@ def test_run_train_validation_loop_uses_hot_path_and_logs_perf_metrics(monkeypat
         "s/s": "2.5",
         "s/s/gpu": "2.50",
     }
+
+
+class _FakeValidationPipeline:
+    """Flow-matching stub recording how each validation batch was executed."""
+
+    def __init__(self, losses):
+        self.losses = list(losses)
+        self.calls = 0
+        self.grad_enabled = []
+        self.model_was_training = []
+        self.random_draws = []
+
+    def step(self, *, model, batch, device, dtype, global_step, collect_metrics, check_loss):
+        self.grad_enabled.append(torch.is_grad_enabled())
+        self.model_was_training.append(model.training)
+        # Flow matching draws timesteps and noise per step; record the draw to check repeatability.
+        self.random_draws.append(float(torch.rand(())))
+        self.calls += 1
+        return None, self.losses[(self.calls - 1) % len(self.losses)], None, {}
+
+
+def _make_validation_recipe(losses, num_batches=2):
+    recipe = object.__new__(TrainDiffusionRecipe)
+    recipe.model = nn.Linear(1, 1)
+    recipe.model.train()
+    recipe.device = torch.device("cpu")
+    recipe.compute_dtype = torch.float32
+    recipe.seed = 1234
+    recipe.val_dataloader = [{"video_latents": torch.zeros(1, 1)} for _ in range(num_batches)]
+    recipe.flow_matching_pipeline = _FakeValidationPipeline(losses)
+    return recipe
+
+
+def test_run_validation_epoch_averages_batch_losses_in_eval_mode(monkeypatch):
+    monkeypatch.setattr(diffusion_train.dist, "is_initialized", lambda: False)
+    recipe = _make_validation_recipe([torch.tensor(2.0), torch.tensor(4.0)])
+
+    val_loss = recipe._run_validation_epoch(global_step=7)
+
+    assert val_loss == pytest.approx(3.0)
+    assert recipe.flow_matching_pipeline.grad_enabled == [False, False]
+    assert recipe.flow_matching_pipeline.model_was_training == [False, False]
+    assert recipe.model.training is True
+
+
+def test_run_validation_epoch_restores_train_mode_when_a_batch_fails(monkeypatch):
+    monkeypatch.setattr(diffusion_train.dist, "is_initialized", lambda: False)
+    recipe = _make_validation_recipe([torch.tensor(2.0)])
+    recipe.flow_matching_pipeline.step = MagicMock(side_effect=RuntimeError("boom"))
+
+    with pytest.raises(RuntimeError, match="boom"):
+        recipe._run_validation_epoch(global_step=0)
+
+    assert recipe.model.training is True
+
+
+def test_run_validation_epoch_repeats_sampling_and_leaves_training_rng_untouched(monkeypatch):
+    monkeypatch.setattr(diffusion_train.dist, "is_initialized", lambda: False)
+    recipe = _make_validation_recipe([torch.tensor(1.0), torch.tensor(3.0)])
+
+    torch.manual_seed(7)
+    expected_train_draw = float(torch.rand(()))
+
+    torch.manual_seed(7)
+    recipe._run_validation_epoch(global_step=0)
+    first_draws = list(recipe.flow_matching_pipeline.random_draws)
+    train_draw = float(torch.rand(()))
+    recipe.flow_matching_pipeline.random_draws.clear()
+    recipe._run_validation_epoch(global_step=1)
+
+    assert recipe.flow_matching_pipeline.random_draws == first_draws
+    assert train_draw == pytest.approx(expected_train_draw)
+
+
+def test_run_validation_epoch_reduces_sum_and_count_over_dp_group(monkeypatch):
+    recipe = _make_validation_recipe([torch.tensor(2.0), torch.tensor(4.0)])
+    recipe._get_dp_group = MagicMock(return_value="dp-group")
+    all_reduce_calls = []
+
+    def fake_all_reduce(tensor, op=None, group=None):
+        all_reduce_calls.append((op, group, tensor.tolist()))
+        # Emulate a second data-parallel rank holding an identical shard.
+        tensor.mul_(2)
+
+    monkeypatch.setattr(diffusion_train.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(diffusion_train.dist, "get_backend", lambda: "gloo")
+    monkeypatch.setattr(diffusion_train.dist, "all_reduce", fake_all_reduce)
+
+    val_loss = recipe._run_validation_epoch(global_step=0)
+
+    assert all_reduce_calls == [(diffusion_train.dist.ReduceOp.SUM, "dp-group", [6.0, 2.0])]
+    # 12.0 summed loss over 4 summed batches: the mean is invariant to the rank count.
+    assert val_loss == pytest.approx(3.0)
+
+
+@pytest.mark.parametrize("with_val_dataloader", [True, False])
+def test_run_train_validation_loop_validates_only_with_a_val_dataloader(monkeypatch, with_val_dataloader):
+    batch_group = [{"video_latents": torch.zeros(2, 1), "text_embeddings": torch.zeros(2, 1)}]
+
+    monkeypatch.setitem(sys.modules, "tqdm", SimpleNamespace(tqdm=lambda iterable, desc: iterable))
+    monkeypatch.setattr(diffusion_train, "prepare_for_grad_accumulation", MagicMock())
+    monkeypatch.setattr(diffusion_train, "prepare_for_final_backward", MagicMock())
+    monkeypatch.setattr(diffusion_train, "prepare_after_first_microbatch", MagicMock())
+    monkeypatch.setattr(diffusion_train, "clip_grad_norm", MagicMock(return_value=torch.tensor(0.25)))
+    monkeypatch.setattr(diffusion_train.torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(diffusion_train.wandb, "run", None, raising=False)
+
+    recipe = object.__new__(TrainDiffusionRecipe)
+    recipe.dist_env = SimpleNamespace(is_main=True)
+    recipe.global_batch_size = 2
+    recipe.local_batch_size = 2
+    recipe.num_nodes = 1
+    recipe.dp_size = 1
+    recipe.cp_size = 1
+    recipe.world_size = 1
+    recipe.num_epochs = 1
+    recipe.sampler = None
+    recipe.dataloader = [object()]
+    recipe.step_scheduler = _FakeStepScheduler(batch_group, is_val_step=True)
+    recipe.optimizer = [SimpleNamespace(zero_grad=MagicMock(), step=MagicMock(), param_groups=[{"lr": 0.01}])]
+    recipe.lr_scheduler = None
+    recipe.model = nn.Linear(1, 1)
+    recipe.device = torch.device("cpu")
+    recipe.compute_dtype = torch.float32
+    recipe.check_loss = False
+    recipe.clip_grad_max_norm = 0.5
+    recipe.grad_clip_foreach = False
+    recipe.defer_fsdp_grad_sync = True
+    recipe.transformer_engine_fp8 = False
+    recipe.peft_cfg = None
+    recipe._elapsed_seconds_since = MagicMock(return_value=(2.0, 10.0))
+    recipe._count_global_samples = MagicMock(return_value=2)
+    recipe._get_memory_metrics = MagicMock(return_value={"mem": 0.0, "max_memory_allocated_gb": 0.0})
+    recipe.save_checkpoint = MagicMock()
+    recipe.val_dataloader = [{"video_latents": torch.zeros(1, 1)}] if with_val_dataloader else None
+    recipe._run_validation_epoch = MagicMock(return_value=1.25)
+    recipe.flow_matching_pipeline = SimpleNamespace(
+        step=MagicMock(return_value=(None, torch.tensor(2.0, requires_grad=True), None, {}))
+    )
+
+    recipe.run_train_validation_loop()
+
+    if with_val_dataloader:
+        recipe._run_validation_epoch.assert_called_once_with(1)
+    else:
+        recipe._run_validation_epoch.assert_not_called()

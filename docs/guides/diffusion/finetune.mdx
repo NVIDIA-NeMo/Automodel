@@ -245,7 +245,41 @@ checkpoint:
 | `flow_matching` | Yes | `adapter_type` must match the model (`simple` for Wan, `flux` for FLUX, `hunyuan` for HunyuanVideo, or `ltx2` for LTX-2.3). |
 | `fsdp` | Yes | Set `dp_size` to the number of GPUs on your node. |
 | `checkpoint` | Recommended | Set `checkpoint_dir` to a persistent path, especially in Docker. |
+| `data.validation_dataloader` | Optional | Held-out cache used for the periodic validation loss. Pair it with `step_scheduler.val_every_steps`; see [Validation Loss](#validation-loss). |
 | `wandb` | Optional | Configure to enable Weights & Biases logging. |
+
+### Validation Loss
+
+To track a held-out loss during training, add a `data.validation_dataloader` block and set
+`step_scheduler.val_every_steps`:
+
+```yaml
+step_scheduler:
+  val_every_steps: 500       # Run validation every N optimizer steps
+
+data:
+  dataloader:
+    _target_: nemo_automodel.components.datasets.diffusion.build_video_multiresolution_dataloader
+    cache_dir: PATH_TO_YOUR_DATA
+    model_type: wan
+  validation_dataloader:
+    _target_: nemo_automodel.components.datasets.diffusion.build_video_multiresolution_dataloader
+    cache_dir: PATH_TO_YOUR_VAL_DATA
+    model_type: wan
+    shuffle: false
+```
+
+The validation loader takes the same builders and fields as the training one and is sharded across
+data-parallel ranks the same way. Validation scores the held-out set with the training flow-matching
+objective in `eval()` mode under `torch.no_grad()`, and logs `val_loss` to the console and to
+Weights & Biases, on the same scale as `train_loss`.
+
+Timesteps and noise are drawn under a fixed seed, and the training RNG state is restored afterwards,
+so the curve reflects the model rather than the sampling and enabling validation does not change the
+training trajectory.
+
+The two keys are independent: a `validation_dataloader` without `val_every_steps` validates on
+checkpoint steps only, and `val_every_steps` without a loader logs a warning and skips validation.
 
 ## Fine-Tune the Model
 

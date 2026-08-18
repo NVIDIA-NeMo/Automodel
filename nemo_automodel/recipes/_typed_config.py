@@ -559,6 +559,12 @@ class RecipeConfig:
         return self.resolve_diffusion_dataloader(node) if node is not None else None
 
     @cached_property
+    def diffusion_validation_dataloader(self) -> "DiffusionDataloaderConfig" | None:
+        """Typed diffusion validation dataloader config resolved from ``data.validation_dataloader``."""
+        node = self._raw.get("data.validation_dataloader", None)
+        return self.resolve_diffusion_dataloader(node) if node is not None else None
+
+    @cached_property
     def bagel_dataloader(self) -> "BagelDataloaderConfig" | None:
         """Typed packed-dataset and dataloader config for BAGEL recipes."""
         from nemo_automodel.components.datasets.multimodal.datasets import BagelDatasetConfig
