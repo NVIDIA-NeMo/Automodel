@@ -29,6 +29,10 @@ from nemo_automodel.components.models.common import (
     initialize_linear_module,
     initialize_rms_norm_module,
 )
+from nemo_automodel.components.models.common.mtp import (
+    MTPContextParallelInputs,
+    prepare_mtp_context_parallel_inputs,
+)
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -585,6 +589,41 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
             embeds.append(self.model.embed_tokens(cur_input_ids))
         return tuple(embeds)
 
+    def prepare_mtp_inputs_for_cp(
+        self,
+        batch: dict[str, Any],
+        *,
+        ignore_index: int = -100,
+    ) -> MTPContextParallelInputs | None:
+        """Prepare global MTP futures before context-parallel sharding.
+
+        The recipe calls this hook while ``batch`` is still in global sequence
+        order. It shifts future-token IDs, positions, and loss targets without
+        crossing packed-sequence boundaries. The recipe then shards each tensor
+        with the same :class:`ContextParallelSharder` instance as the main
+        inputs, avoiding both rank-local rolls and an all-gather.
+
+        Args:
+            batch: Unsharded model batch containing ``input_ids`` and ``labels``
+                with shape ``[batch, sequence]``. Missing ``position_ids`` are
+                synthesized in global order. ``seq_idx``, ``_packed_seq_ids``,
+                raw ``seq_lens_padded``, or ``cu_seqlens`` may describe
+                packed-sequence boundaries.
+            ignore_index: Fill value for invalid MTP loss targets.
+
+        Returns:
+            Globally ordered tensors for every enabled MTP depth, or ``None``
+            when MTP is disabled.
+        """
+        if not self.mtp_config.enabled:
+            return None
+
+        return prepare_mtp_context_parallel_inputs(
+            batch,
+            num_depths=self.mtp_config.num_layers,
+            ignore_index=ignore_index,
+        )
+
     def customize_pipeline_stage_modules(
         self,
         module_names_per_stage: list[list[str]],
@@ -663,6 +702,7 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
         use_cache: bool | None = None,
         cache_position: torch.LongTensor | None = None,
         position_ids: torch.LongTensor | None = None,
+        mtp_per_depth_input_ids: tuple[torch.LongTensor, ...] | None = None,
         mtp_per_depth_position_ids: tuple[torch.LongTensor, ...] | None = None,
         padding_mask: torch.Tensor | None = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
@@ -702,6 +742,11 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
             use_cache: Whether to return ``past_key_values`` for subsequent steps.
             cache_position: Token position indices for cache updates.
             position_ids: Position IDs (forwarded into MTP sublayer kwargs).
+            mtp_per_depth_input_ids: Optional globally shifted future-token IDs,
+                one tensor per MTP depth. Each tensor has shape [batch,
+                sequence], or [tokens] for THD, matching the local CP layout.
+                When supplied, MTP embeds these tensors directly instead of
+                rolling rank-local ``input_ids``.
             mtp_per_depth_position_ids: Optional pre-computed future-token
                 position IDs, one tensor per MTP depth. Each tensor has shape
                 [batch, sequence], or [tokens] for THD, matching the local CP
@@ -740,9 +785,11 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
         mtp_active = self.mtp is not None and (self.training or (self.compute_mtp_in_eval and not use_cache))
         cp_size = int(kwargs.get("cp_size", 1) or 1)
         if cp_size > 1 and mtp_active:
-            if not mtp_embed_inputs or mtp_per_depth_position_ids is None:
+            precomputed_token_sources = int(bool(mtp_embed_inputs)) + int(mtp_per_depth_input_ids is not None)
+            if precomputed_token_sources != 1 or mtp_per_depth_position_ids is None:
                 raise ValueError(
-                    "Context-parallel MTP requires precomputed per-depth embeddings and position IDs together"
+                    "Context-parallel MTP requires exactly one of precomputed per-depth embeddings or input IDs, "
+                    "together with per-depth position IDs"
                 )
 
         # Neat-packed SDPA: convert _packed_seq_ids (1-based [B,S] int, 0=pad)
@@ -877,6 +924,7 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
             # tensors for the same reason.
             mtp_hidden = hidden_states
             mtp_embeds_for_call = tuple(mtp_embed_inputs) if mtp_embed_inputs else ()
+            mtp_input_ids_for_call = mtp_per_depth_input_ids
             mtp_position_ids_for_call = mtp_per_depth_position_ids
             # SALM / multimodal: when inputs_embeds (pre-fused audio+text) are present
             # and no PP embeddings were provided, pre-roll them per depth so audio
@@ -896,6 +944,11 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
                 mtp_embeds_for_call = tuple(
                     e.squeeze(0) if (e.dim() == 3 and e.shape[0] == 1) else e for e in mtp_embeds_for_call
                 )
+                if mtp_input_ids_for_call is not None:
+                    mtp_input_ids_for_call = tuple(
+                        ids.squeeze(0) if (ids.dim() == 2 and ids.shape[0] == 1) else ids
+                        for ids in mtp_input_ids_for_call
+                    )
                 if mtp_position_ids_for_call is not None:
                     mtp_position_ids_for_call = tuple(
                         p.squeeze(0) if (p.dim() == 2 and p.shape[0] == 1) else p for p in mtp_position_ids_for_call
@@ -903,11 +956,22 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
             if mtp_position_ids_for_call is not None:
                 mtp_kwargs["position_ids_per_depth"] = mtp_position_ids_for_call
 
+            if mtp_embeds_for_call and mtp_input_ids_for_call is not None:
+                raise ValueError("MTP per-depth input IDs cannot be combined with pre-computed embeddings")
+
             if mtp_embeds_for_call:
                 # Final PP stage: embeddings produced upstream.
                 mtp_per_depth_h = self.mtp(
                     hidden_states=mtp_hidden,
                     embed_inputs=mtp_embeds_for_call,
+                    **mtp_kwargs,
+                )
+            elif mtp_input_ids_for_call is not None:
+                # Context parallel: IDs were shifted globally, then sharded.
+                mtp_per_depth_h = self.mtp(
+                    hidden_states=mtp_hidden,
+                    input_ids_per_depth=mtp_input_ids_for_call,
+                    embed_fn=self.model.embed_tokens,
                     **mtp_kwargs,
                 )
             else:

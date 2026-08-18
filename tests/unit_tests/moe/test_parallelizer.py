@@ -261,6 +261,7 @@ def _install_torch_and_layers_stubs(monkeypatch):
         return "CTX"
 
     utils_checkpoint_stub.CheckpointPolicy = CheckpointPolicy
+    utils_checkpoint_stub._allowed_determinism_checks_to_fns = {"default": object(), "none": object()}
     utils_checkpoint_stub.create_selective_checkpoint_contexts = create_selective_checkpoint_contexts
 
     # Router ops used by the targeted activation-checkpointing policy.
@@ -425,22 +426,16 @@ def _import_parallelizer_with_stubs(monkeypatch):
     parallelizer_utils_stub.configure_fsdp_unused_param_reduction = lambda module: 0
 
     def reject_unsupported_mtp_cp(model):
-        supports = getattr(model, "supports", None)
-        mtp_enabled = bool(
-            getattr(supports, "mtp_enabled", getattr(getattr(model, "mtp_config", None), "enabled", False))
-        )
-        if mtp_enabled and not bool(getattr(supports, "supports_mtp_cp", False)):
+        if model.supports.mtp_enabled and not model.supports.supports_mtp_cp:
             raise RuntimeError("Model does not support MTP with context parallelism")
 
     parallelizer_utils_stub.reject_unsupported_mtp_cp = reject_unsupported_mtp_cp
 
     def reject_unsupported_mtp_cp_pp(model):
-        supports = getattr(model, "supports", None)
         is_pp_stage_fn = getattr(model, "_is_pipeline_parallel_stage", None)
         if (
-            supports is not None
-            and supports.mtp_enabled
-            and not supports.supports_mtp_cp_pp
+            model.supports.mtp_enabled
+            and not model.supports.supports_mtp_cp_pp
             and callable(is_pp_stage_fn)
             and is_pp_stage_fn()
         ):
@@ -667,7 +662,7 @@ def test_apply_ac_wraps_blocks_with_and_without_context(monkeypatch):
     P = _import_parallelizer_with_stubs(monkeypatch)
     wrapper_returns = [object(), object()]
 
-    def fake_wrapper(block, preserve_rng_state, context_fn=None):
+    def fake_wrapper(block, preserve_rng_state, determinism_check=None, context_fn=None):
         assert preserve_rng_state is True
         # if ignore_router=True, context_fn should be provided
         return wrapper_returns.pop(0)
@@ -754,7 +749,7 @@ def test_apply_ac_custom_policy_saves_router_projection_and_topk(monkeypatch):
         captured_policy = policy_cb
         return "CTX"
 
-    def fake_wrapper(block, preserve_rng_state, context_fn=None):
+    def fake_wrapper(block, preserve_rng_state, determinism_check=None, context_fn=None):
         assert preserve_rng_state is True
         assert callable(context_fn)
         assert context_fn() == "CTX"
@@ -1607,7 +1602,14 @@ def test_parallelize_model_applies_tp_before_cp_ep_ac_and_fsdp(monkeypatch):
     model = type(
         "Outer",
         (),
-        {"moe_config": type("MC", (), {"n_routed_experts": 4})()},
+        {
+            "moe_config": type("MC", (), {"n_routed_experts": 4})(),
+            "supports": types.SimpleNamespace(
+                mtp_enabled=False,
+                supports_mtp_cp=False,
+                supports_mtp_cp_pp=False,
+            ),
+        },
     )()
 
     P.parallelize_model(
@@ -2164,7 +2166,7 @@ def test_apply_ac_derives_hidden_size_and_num_experts_from_config(monkeypatch):
                 break
         return "CTX"
 
-    def fake_wrapper(block, preserve_rng_state, context_fn=None):
+    def fake_wrapper(block, preserve_rng_state, determinism_check=None, context_fn=None):
         if context_fn is not None:
             context_fn()  # Trigger the context function to capture values
         return block
@@ -2240,7 +2242,7 @@ def test_apply_ac_derives_num_experts_from_num_local_experts(monkeypatch):
                 captured_num_experts = ne
         return "CTX"
 
-    def fake_wrapper(block, preserve_rng_state, context_fn=None):
+    def fake_wrapper(block, preserve_rng_state, determinism_check=None, context_fn=None):
         if context_fn is not None:
             context_fn()
         return block
@@ -2282,7 +2284,7 @@ def test_apply_ac_accepts_explicit_hidden_size_and_num_experts(monkeypatch):
             captured_num_experts = 32
         return "CTX"
 
-    def fake_wrapper(block, preserve_rng_state, context_fn=None):
+    def fake_wrapper(block, preserve_rng_state, determinism_check=None, context_fn=None):
         if context_fn is not None:
             context_fn()
         return block
@@ -2321,7 +2323,7 @@ def test_apply_ac_explicit_params_override_config(monkeypatch):
             captured_num_experts = 64
         return "CTX"
 
-    def fake_wrapper(block, preserve_rng_state, context_fn=None):
+    def fake_wrapper(block, preserve_rng_state, determinism_check=None, context_fn=None):
         if context_fn is not None:
             context_fn()
         return block
@@ -2369,7 +2371,7 @@ def test_apply_ac_derives_from_llm_config(monkeypatch):
                 break
         return "CTX"
 
-    def fake_wrapper(block, preserve_rng_state, context_fn=None):
+    def fake_wrapper(block, preserve_rng_state, determinism_check=None, context_fn=None):
         if context_fn is not None:
             context_fn()
         return block
@@ -2617,7 +2619,7 @@ def test_apply_ac_selective_wraps_blocks_with_shared_policy(monkeypatch):
         def __init__(self, block):
             self.block = block
 
-    def fake_wrapper(block, preserve_rng_state, context_fn=None):
+    def fake_wrapper(block, preserve_rng_state, determinism_check=None, context_fn=None):
         assert preserve_rng_state is True
         assert callable(context_fn)
         assert context_fn() is sentinel_ctx
@@ -2738,7 +2740,7 @@ def test_apply_ac_derives_num_experts_from_moe_num_experts(monkeypatch):
                 break
         return "CTX"
 
-    def fake_wrapper(block, preserve_rng_state, context_fn=None):
+    def fake_wrapper(block, preserve_rng_state, determinism_check=None, context_fn=None):
         if context_fn is not None:
             context_fn()
         return block
@@ -2781,7 +2783,7 @@ def test_apply_ac_prefers_num_experts_over_moe_num_experts(monkeypatch):
                 break
         return "CTX"
 
-    def fake_wrapper(block, preserve_rng_state, context_fn=None):
+    def fake_wrapper(block, preserve_rng_state, determinism_check=None, context_fn=None):
         if context_fn is not None:
             context_fn()
         return block
@@ -2825,7 +2827,7 @@ def test_apply_ac_derives_num_experts_from_moe_config(monkeypatch):
                 break
         return "CTX"
 
-    def fake_wrapper(block, preserve_rng_state, context_fn=None):
+    def fake_wrapper(block, preserve_rng_state, determinism_check=None, context_fn=None):
         if context_fn is not None:
             context_fn()
         return block
@@ -2873,7 +2875,7 @@ def test_apply_ac_prefers_moe_config_over_config_attrs(monkeypatch):
                 break
         return "CTX"
 
-    def fake_wrapper(block, preserve_rng_state, context_fn=None):
+    def fake_wrapper(block, preserve_rng_state, determinism_check=None, context_fn=None):
         if context_fn is not None:
             context_fn()
         return block
@@ -3074,7 +3076,7 @@ def test_apply_ac_derives_hidden_size_and_num_experts_from_text_config(monkeypat
                 break
         return "CTX"
 
-    def fake_wrapper(block, preserve_rng_state, context_fn=None):
+    def fake_wrapper(block, preserve_rng_state, determinism_check=None, context_fn=None):
         if context_fn is not None:
             context_fn()
         return block

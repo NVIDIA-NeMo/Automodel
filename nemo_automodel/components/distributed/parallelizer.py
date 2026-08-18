@@ -540,14 +540,14 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
             cp_layers = list(layers)
             mtp_module = getattr(model, "mtp", None)
             mtp_layers = getattr(mtp_module, "layers", None)
-            mtp_enabled = bool(getattr(getattr(model, "mtp_config", None), "enabled", False))
+            mtp_cp_enabled = model.supports.mtp_enabled
             parallelizer_utils.reject_unsupported_mtp_cp_pp(model)
             parallelizer_utils.reject_unsupported_mtp_cp(model)
-            if mtp_enabled and mtp_layers is None:
+            if mtp_cp_enabled and mtp_layers is None:
                 raise RuntimeError(
                     "MTP is enabled but model.mtp.layers is unavailable; cannot configure context parallelism for MTP"
                 )
-            if mtp_enabled and mtp_layers is not None:
+            if mtp_cp_enabled and mtp_layers is not None:
                 # MTP blocks live outside the backbone container but execute
                 # the same attention/Mamba CP collectives.
                 cp_layers.extend(mtp_layers)

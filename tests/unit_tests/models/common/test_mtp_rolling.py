@@ -33,6 +33,7 @@ import torch.nn as nn
 from nemo_automodel.components.models.common.mtp.mtp import (
     MTPConfig,
     MTPModule,
+    prepare_mtp_context_parallel_inputs,
     roll_tensor,
     shift_packed_tensor,
 )
@@ -198,6 +199,42 @@ def test_precomputed_embed_inputs_path_skips_token_rolling():
         assert got_pos == expected_pos, f"depth {depth}: position_ids rolling expected on embed_inputs path"
 
 
+def test_precomputed_input_ids_skip_rank_local_rolling():
+    """CP callers can embed globally shifted IDs already in local shard order."""
+    mtp = _build_module(num_depths=2, pattern_length=1)
+    local_input_ids_per_depth = (
+        torch.tensor([2, 3, 8, 0], dtype=torch.long),
+        torch.tensor([3, 4, 0, 0], dtype=torch.long),
+    )
+    local_position_ids_per_depth = (
+        torch.tensor([1, 2, 7, 0], dtype=torch.long),
+        torch.tensor([2, 3, 0, 0], dtype=torch.long),
+    )
+    hidden = torch.zeros(4, 3)
+
+    mtp(
+        hidden,
+        input_ids_per_depth=local_input_ids_per_depth,
+        embed_fn=_embed_fn_identity,
+        position_ids_per_depth=local_position_ids_per_depth,
+    )
+
+    for depth in range(2):
+        got_ids = mtp.layers[depth].calls[0]["embed_input"].squeeze(-1).to(torch.long)
+        torch.testing.assert_close(got_ids, local_input_ids_per_depth[depth])
+
+
+def test_precomputed_input_ids_require_precomputed_position_ids():
+    mtp = _build_module(num_depths=2, pattern_length=1)
+
+    with pytest.raises(ValueError, match="input_ids_per_depth and position_ids_per_depth must be provided together"):
+        mtp(
+            torch.zeros(4, 3),
+            input_ids_per_depth=(torch.arange(4), torch.arange(4)),
+            embed_fn=_embed_fn_identity,
+        )
+
+
 def test_precomputed_position_ids_skip_rank_local_rolling():
     """CP callers can provide globally shifted positions in local shard order."""
     mtp = _build_module(num_depths=2, pattern_length=1)
@@ -224,7 +261,7 @@ def test_precomputed_position_ids_skip_rank_local_rolling():
 def test_precomputed_position_ids_reject_rank_local_token_rolling():
     mtp = _build_module(num_depths=2, pattern_length=1)
 
-    with pytest.raises(ValueError, match="position_ids_per_depth requires precomputed embed_inputs"):
+    with pytest.raises(ValueError, match="cannot be combined with rank-local input_ids rolling"):
         mtp(
             torch.zeros(4, 3),
             input_ids=torch.arange(4),
@@ -295,3 +332,158 @@ def test_shift_packed_tensor_supports_trailing_feature_dimensions():
 
     assert torch.equal(shifted[:, :2], values[:, 1:])
     assert shifted[:, -1].tolist() == [[-1, -1, -1, -1]]
+
+
+class TestMTPContextParallelPreparation:
+    @staticmethod
+    def _prepare(batch, *, num_depths=2):
+        return prepare_mtp_context_parallel_inputs(
+            batch,
+            num_depths=num_depths,
+            ignore_index=-100,
+        )
+
+    def test_prepares_all_depths_in_global_packed_order(self):
+        batch = {
+            "input_ids": torch.tensor([[10, 11, 12, 20, 21, 22]]),
+            "labels": torch.tensor([[11, 12, -100, 21, 22, -100]]),
+            "position_ids": torch.tensor([[0, 1, 2, 0, 1, 2]]),
+            "_packed_seq_ids": torch.tensor([[1, 1, 1, 2, 2, 2]]),
+        }
+
+        prepared = self._prepare(batch)
+
+        assert [tensor.tolist() for tensor in prepared.input_ids] == [
+            [[11, 12, 0, 21, 22, 0]],
+            [[12, 0, 0, 22, 0, 0]],
+        ]
+        assert [tensor.tolist() for tensor in prepared.position_ids] == [
+            [[1, 2, 0, 1, 2, 0]],
+            [[2, 0, 0, 2, 0, 0]],
+        ]
+        assert [tensor.tolist() for tensor in prepared.targets] == [
+            [[12, -100, -100, 22, -100, -100]],
+            [[-100, -100, -100, -100, -100, -100]],
+        ]
+        assert [tensor.tolist() for tensor in prepared.valid_masks] == [
+            [[True, True, False, True, True, False]],
+            [[True, False, False, True, False, False]],
+        ]
+        assert prepared.position_ids_seq_dim == 1
+
+    def test_multi_axis_positions_shift_on_the_sequence_axis(self):
+        batch = {
+            "input_ids": torch.tensor([[10, 11, 12, 13]]),
+            "labels": torch.tensor([[11, 12, 13, -100]]),
+            "position_ids": torch.tensor(
+                [
+                    [[0, 1, 2, 3]],
+                    [[10, 11, 12, 13]],
+                    [[20, 21, 22, 23]],
+                ]
+            ),
+        }
+
+        prepared = self._prepare(batch, num_depths=1)
+
+        assert prepared.position_ids_seq_dim == 2
+        assert prepared.position_ids[0].tolist() == [
+            [[1, 2, 3, 0]],
+            [[11, 12, 13, 0]],
+            [[21, 22, 23, 0]],
+        ]
+        assert prepared.valid_masks[0].tolist() == [[True, True, True, False]]
+
+    def test_raw_thd_lengths_mask_boundaries_before_sharding(self):
+        batch = {
+            "input_ids": torch.tensor([[10, 11, 12, 20, 21, 22]]),
+            "labels": torch.tensor([[11, 12, -100, 21, 22, -100]]),
+            "position_ids": torch.tensor([[0, 1, 2, 0, 1, 2]]),
+            "seq_lens": torch.tensor([[3, 3, -1000]]),
+            "seq_lens_padded": torch.tensor([[3, 3, -1000]]),
+        }
+
+        prepared = self._prepare(batch, num_depths=1)
+
+        assert prepared.input_ids[0].tolist() == [[11, 12, 0, 21, 22, 0]]
+        assert prepared.position_ids[0].tolist() == [[1, 2, 0, 1, 2, 0]]
+        assert prepared.targets[0].tolist() == [[12, -100, -100, 22, -100, -100]]
+
+    def test_seq_lens_padded_must_cover_materialized_layout(self):
+        batch = {
+            "input_ids": torch.tensor([[10, 11, 12, 20, 21, 22]]),
+            "labels": torch.tensor([[11, 12, -100, 21, 22, -100]]),
+            "seq_lens_padded": torch.tensor([[2, 2, -1000]]),
+        }
+
+        with pytest.raises(ValueError, match="must cover exactly the input sequence length 6"):
+            self._prepare(batch, num_depths=1)
+
+    def test_missing_position_ids_are_synthesized_globally_before_sharding(self):
+        batch = {
+            "input_ids": torch.tensor([[10, 11, 12, 13, 14, 15]]),
+            "labels": torch.tensor([[11, 12, 13, 14, 15, -100]]),
+        }
+
+        prepared = self._prepare(batch, num_depths=1)
+
+        assert batch["position_ids"].tolist() == [[0, 1, 2, 3, 4, 5]]
+        assert prepared.position_ids[0].tolist() == [[1, 2, 3, 4, 5, 0]]
+
+    def test_cu_seqlens_padded_preserves_inter_sequence_padding(self):
+        batch = {
+            "input_ids": torch.tensor([[10, 11, 12, 0, 20, 21, 22, 0]]),
+            "labels": torch.tensor([[11, 12, -100, -100, 21, 22, -100, -100]]),
+            "cu_seqlens": torch.tensor([0, 3, 6], dtype=torch.int32),
+            "cu_seqlens_padded": torch.tensor([0, 4, 8], dtype=torch.int32),
+        }
+
+        prepared = self._prepare(batch, num_depths=1)
+
+        assert prepared.input_ids[0].tolist() == [[11, 12, 0, 0, 21, 22, 0, 0]]
+        assert prepared.targets[0].tolist() == [[12, -100, -100, -100, 22, -100, -100, -100]]
+
+    def test_shared_position_ids_expand_to_batch_before_shifting(self):
+        batch = {
+            "input_ids": torch.tensor([[10, 11, 12, 13], [20, 21, 22, 23]]),
+            "labels": torch.tensor([[11, 12, 13, -100], [21, 22, 23, -100]]),
+            "position_ids": torch.tensor([[0, 1, 2, 3]]),
+        }
+
+        prepared = self._prepare(batch, num_depths=1)
+
+        assert batch["position_ids"].tolist() == [[0, 1, 2, 3], [0, 1, 2, 3]]
+        assert prepared.position_ids[0].tolist() == [[1, 2, 3, 0], [1, 2, 3, 0]]
+
+    def test_cu_seqlens_masks_boundaries_and_ignores_padding_sentinels(self):
+        batch = {
+            "input_ids": torch.tensor([[10, 11, 12, 20, 21, 22]]),
+            "labels": torch.tensor([[11, 12, -100, 21, 22, -100]]),
+            "cu_seqlens": torch.tensor([[0, 3, 6, -1000]]),
+        }
+
+        prepared = self._prepare(batch, num_depths=1)
+
+        assert prepared.input_ids[0].tolist() == [[11, 12, 0, 21, 22, 0]]
+        assert prepared.position_ids[0].tolist() == [[1, 2, 0, 4, 5, 0]]
+        assert prepared.targets[0].tolist() == [[12, -100, -100, 22, -100, -100]]
+
+    def test_unpadded_cu_seqlens_rejects_padded_materialized_layout(self):
+        batch = {
+            "input_ids": torch.tensor([[10, 11, 12, 0, 20, 21, 22, 0]]),
+            "labels": torch.tensor([[11, 12, -100, -100, 21, 22, -100, -100]]),
+            "cu_seqlens": torch.tensor([0, 3, 6], dtype=torch.int32),
+        }
+
+        with pytest.raises(ValueError, match="provide cu_seqlens_padded"):
+            self._prepare(batch, num_depths=1)
+
+    def test_rejects_nonpositive_depth_count(self):
+        with pytest.raises(ValueError, match="num_depths must be positive"):
+            self._prepare(
+                {
+                    "input_ids": torch.tensor([[10, 11]]),
+                    "labels": torch.tensor([[11, -100]]),
+                },
+                num_depths=0,
+            )
