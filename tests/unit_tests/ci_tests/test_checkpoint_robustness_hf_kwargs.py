@@ -617,6 +617,16 @@ def test_extract_custom_args_accepts_isolated_phase():
     assert remaining == ["--other-arg"]
 
 
+def test_extract_custom_args_accepts_resume_tolerance_profile_and_numeric_override():
+    custom, remaining = _extract_custom_args(
+        ["--resume_tolerance_profile", "relaxed", "--resume_loss_threshold", "0.02", "--other-arg"]
+    )
+
+    assert custom["resume_tolerance_profile"] == "relaxed"
+    assert custom["resume_loss_threshold"] == "0.02"
+    assert remaining == ["--other-arg"]
+
+
 def test_extract_custom_args_accepts_skip_hf_logit_parity():
     custom, remaining = _extract_custom_args(["--skip_hf_logit_parity", "--other-arg"])
 
@@ -1184,6 +1194,7 @@ def test_biencoder_robustness_reads_hf_reload_settings_from_config(tmp_path):
         "    check_resume: true\n"
         "    cosine_threshold: 0.998\n"
         "    hf_cosine_threshold: 0.997\n"
+        "    resume_tolerance_profile: relaxed\n"
         "    dataloader.num_workers: 0\n"
     )
 
@@ -1194,6 +1205,7 @@ def test_biencoder_robustness_reads_hf_reload_settings_from_config(tmp_path):
         "check_resume": True,
         "cosine_threshold": "0.998",
         "hf_cosine_threshold": "0.997",
+        "resume_tolerance_profile": "relaxed",
     }
     assert remaining == ["--config", str(config_path)]
 
