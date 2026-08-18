@@ -106,7 +106,7 @@ torchrun --standalone --nproc-per-node=8 \
 The following sections show the SFT and LoRA training curves on the GSM8K dataset for the
 first 200 steps.
 
-**SFT**
+SFT training curves:
 
 ![DiffusionGemma SFT training curves](./diffusiongemma_sft.png)
 
