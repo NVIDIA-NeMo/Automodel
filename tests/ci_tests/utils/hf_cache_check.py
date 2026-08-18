@@ -31,7 +31,9 @@ The inversion (0 = "please act") lets the caller shell reduce to::
 """
 
 import argparse
+import json
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any, Iterable
@@ -45,6 +47,8 @@ import yaml
 #   - ci.checkpoint_robustness.tokenizer_name
 #   - any future nested block using the same keys
 REPO_ID_KEYS = ("pretrained_model_name_or_path", "tokenizer_name")
+_WEIGHT_INDEX_FILENAMES = ("model.safetensors.index.json", "pytorch_model.bin.index.json")
+_SHARD_FILENAME_PATTERN = re.compile(r"^(?P<prefix>.+)-(?P<index>\d+)-of-(?P<total>\d+)\.(?P<suffix>safetensors|bin)$")
 
 
 def _walk_repo_ids(node: Any) -> Iterable[str]:
@@ -96,13 +100,59 @@ def _repo_folder(repo_id: str) -> str:
         return "models--" + repo_id.replace("/", "--")
 
 
+def _snapshot_is_complete(snapshot_dir: Path) -> bool:
+    """Return whether a cached snapshot has every discoverable weight shard."""
+    for index_filename in _WEIGHT_INDEX_FILENAMES:
+        index_path = snapshot_dir / index_filename
+        if not index_path.is_file():
+            continue
+        try:
+            weight_map = json.loads(index_path.read_text(encoding="utf-8"))["weight_map"]
+        except (OSError, ValueError, KeyError, TypeError):
+            return False
+        if not isinstance(weight_map, dict) or not weight_map:
+            return False
+        filenames = list(weight_map.values())
+        if not all(isinstance(filename, str) for filename in filenames):
+            return False
+        filenames = set(filenames)
+        return all(
+            not Path(filename).is_absolute()
+            and ".." not in Path(filename).parts
+            and (snapshot_dir / filename).is_file()
+            for filename in filenames
+        )
+
+    for path in snapshot_dir.iterdir():
+        if path.is_file() and _SHARD_FILENAME_PATTERN.match(path.name):
+            # A sharded checkpoint is not self-describing without its index.
+            # Even an apparently contiguous filename series may be stale while
+            # config files already point at a newer Hub revision.
+            return False
+
+    # Preserve the existing behavior for unsharded checkpoints and tokenizer-only repos.
+    return any(snapshot_dir.iterdir())
+
+
 def _has_snapshot(repo_dir: Path) -> bool:
-    """A cache entry is usable iff ``snapshots/<rev>/`` exists with at least one file."""
+    """Return whether the active cached snapshot has a complete weight-shard series."""
     snapshots = repo_dir / "snapshots"
     if not snapshots.is_dir():
         return False
+
+    main_ref = repo_dir / "refs" / "main"
+    if main_ref.is_file():
+        try:
+            revision = main_ref.read_text(encoding="utf-8").strip()
+        except OSError:
+            return False
+        if not revision or Path(revision).name != revision or revision in {".", ".."}:
+            return False
+        snapshot_dir = snapshots / revision
+        return snapshot_dir.is_dir() and _snapshot_is_complete(snapshot_dir)
+
     for rev in snapshots.iterdir():
-        if rev.is_dir() and any(rev.iterdir()):
+        if rev.is_dir() and _snapshot_is_complete(rev):
             return True
     return False
 

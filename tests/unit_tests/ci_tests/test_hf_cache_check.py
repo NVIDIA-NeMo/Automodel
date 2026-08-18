@@ -117,13 +117,14 @@ def test_is_hf_repo_id(value, expected):
 # ---------------------------------------------------------------------------
 
 
-def _seed_cache(hf_home: Path, repo_id: str, with_file: bool = True) -> None:
+def _seed_cache(hf_home: Path, repo_id: str, with_file: bool = True) -> Path:
     """Create a ``$HF_HOME/hub/models--<org>--<name>/snapshots/<rev>/`` layout."""
     folder = "models--" + repo_id.replace("/", "--")
     rev_dir = hf_home / "hub" / folder / "snapshots" / "abc123"
     rev_dir.mkdir(parents=True, exist_ok=True)
     if with_file:
         (rev_dir / "config.json").write_text("{}", encoding="utf-8")
+    return rev_dir
 
 
 def test_check_cache_partitions_hits_and_misses(tmp_path):
@@ -151,6 +152,82 @@ def test_check_cache_empty_snapshot_dir_counts_as_missing(tmp_path):
         "meta-llama/Llama-3.2-1B",
         "meta-llama/Llama-3.2-3B-Instruct",
     }
+
+
+def test_check_cache_partial_shard_series_counts_as_missing(tmp_path):
+    hf_home = tmp_path / "hf_home"
+    snapshot = _seed_cache(hf_home, "Qwen/Qwen3-VL-4B-Thinking", with_file=False)
+    for index in (1, 2, 4):
+        (snapshot / f"model-{index:05d}-of-00004.safetensors").touch()
+
+    recipe = _write_recipe(tmp_path, "vlm.yaml", VLM_RECIPE)
+    cached, missing = hf_cache_check.check_cache(recipe, hf_home)
+
+    assert cached == []
+    assert missing == ["Qwen/Qwen3-VL-4B-Thinking"]
+
+
+def test_check_cache_complete_shard_series_without_index_counts_as_missing(tmp_path):
+    hf_home = tmp_path / "hf_home"
+    snapshot = _seed_cache(hf_home, "Qwen/Qwen3-VL-4B-Thinking", with_file=False)
+    for index in range(1, 5):
+        (snapshot / f"model-{index:05d}-of-00004.safetensors").touch()
+
+    recipe = _write_recipe(tmp_path, "vlm.yaml", VLM_RECIPE)
+    cached, missing = hf_cache_check.check_cache(recipe, hf_home)
+
+    assert cached == []
+    assert missing == ["Qwen/Qwen3-VL-4B-Thinking"]
+
+
+def test_check_cache_index_with_missing_shard_counts_as_missing(tmp_path):
+    hf_home = tmp_path / "hf_home"
+    snapshot = _seed_cache(hf_home, "Qwen/Qwen3-VL-4B-Thinking", with_file=False)
+    (snapshot / "model-00001-of-00002.safetensors").touch()
+    (snapshot / "model.safetensors.index.json").write_text(
+        '{"weight_map":{"layer.0":"model-00001-of-00002.safetensors","layer.1":"model-00002-of-00002.safetensors"}}',
+        encoding="utf-8",
+    )
+
+    recipe = _write_recipe(tmp_path, "vlm.yaml", VLM_RECIPE)
+    cached, missing = hf_cache_check.check_cache(recipe, hf_home)
+
+    assert cached == []
+    assert missing == ["Qwen/Qwen3-VL-4B-Thinking"]
+
+
+def test_check_cache_complete_index_counts_as_cached(tmp_path):
+    hf_home = tmp_path / "hf_home"
+    snapshot = _seed_cache(hf_home, "Qwen/Qwen3-VL-4B-Thinking", with_file=False)
+    for index in range(1, 3):
+        (snapshot / f"model-{index:05d}-of-00002.safetensors").touch()
+    (snapshot / "model.safetensors.index.json").write_text(
+        '{"weight_map":{"layer.0":"model-00001-of-00002.safetensors","layer.1":"model-00002-of-00002.safetensors"}}',
+        encoding="utf-8",
+    )
+
+    recipe = _write_recipe(tmp_path, "vlm.yaml", VLM_RECIPE)
+    cached, missing = hf_cache_check.check_cache(recipe, hf_home)
+
+    assert cached == ["Qwen/Qwen3-VL-4B-Thinking"]
+    assert missing == []
+
+
+def test_check_cache_uses_main_ref_instead_of_unreferenced_snapshot(tmp_path):
+    hf_home = tmp_path / "hf_home"
+    complete_snapshot = _seed_cache(hf_home, "Qwen/Qwen3-VL-4B-Thinking")
+    repo_dir = complete_snapshot.parents[1]
+    incomplete_snapshot = complete_snapshot.parent / "def456"
+    incomplete_snapshot.mkdir()
+    (incomplete_snapshot / "model-00001-of-00002.safetensors").touch()
+    (repo_dir / "refs").mkdir()
+    (repo_dir / "refs" / "main").write_text("def456", encoding="utf-8")
+
+    recipe = _write_recipe(tmp_path, "vlm.yaml", VLM_RECIPE)
+    cached, missing = hf_cache_check.check_cache(recipe, hf_home)
+
+    assert cached == []
+    assert missing == ["Qwen/Qwen3-VL-4B-Thinking"]
 
 
 # ---------------------------------------------------------------------------
