@@ -50,6 +50,16 @@ class MoESplitExpertsStateDictMixin:
     # - self.backend: Backend configuration object
 
     @property
+    def _supports_inplace_expert_checkpoint_load(self) -> bool:
+        """Whether all grouped expert destinations alias final model storage.
+
+        This only describes the shared expert conversion. Concrete adapters
+        must separately verify that their non-expert conversions also alias
+        model storage before opting into an in-place full-checkpoint load.
+        """
+        return self.backend.experts != "te" and self.backend.dispatcher != "mok"
+
+    @property
     def _is_gated_moe(self) -> bool:
         """Check if the MoE uses gated activation (e.g., SwiGLU) or non-gated (e.g., ReLU²)."""
         from nemo_automodel.components.moe.experts import is_gated_activation

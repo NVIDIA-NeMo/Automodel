@@ -112,6 +112,11 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
         }
 
     @property
+    def supports_inplace_checkpoint_load(self) -> bool:
+        """Whether every base-checkpoint destination aliases model storage."""
+        return self.moe_config is None or self._supports_inplace_expert_checkpoint_load
+
+    @property
     def _hf_prefix(self) -> str:
         """NemotronV3 HF format uses 'backbone.' prefix."""
         return "backbone."
