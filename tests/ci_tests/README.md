@@ -128,6 +128,10 @@ whole reference load on one rank's GPU. This remains opt-in: small models keep t
 while large models (for example 9B+ or configs that already require multi-GPU HF reloads) should enable it to avoid
 rank-0 OOM.
 
+The other ranks wait up to 1,800 seconds for the rank-0-only vanilla-HF reload by default. Set
+`hf_reload_timeout_seconds` only when a documented large or CPU-offloaded reference can legitimately take longer;
+this changes the synchronization timeout, not any numerical gate.
+
 ### Full-Logit Metrics and Profiles
 
 Phases 0, 2, 3, and 5 compare every vocabulary logit for every prompt token. A version-controlled snapshot of the
@@ -140,22 +144,24 @@ length only when a model has a documented memory limit.
 
 Every comparison reports mean, p95, and max per-token `KL(reference || candidate)`; whole-tensor cosine similarity;
 and mean/max absolute logit difference. The full record is printed as `CHECKPOINT_PARITY_METRICS <json>` and saved
-under `<checkpoint_dir>/.checkpoint_robustness/parity_metrics/`. Named profiles gate mean and p95 KL. Max KL, cosine,
-and absolute logit differences remain diagnostics, allowing a single extreme token to remain visible without making
-the default gate as unstable as max KL.
+under `<checkpoint_dir>/.checkpoint_robustness/parity_metrics/`. Named profiles gate mean KL, p95 KL, and cosine
+similarity. Max KL and absolute logit differences remain diagnostics, allowing a single extreme token to remain
+visible without making the default gate as unstable as max KL.
 
 Each vanilla-HF reference is forwarded twice through the same loaded model. The resulting `hf_source_self_repeat`
 or `hf_export_self_repeat` record is informational and distinguishes cross-framework drift from an unstable reference.
 
-| Profile | Same implementation mean / p95 | Cross-framework mean / p95 | Cross-topology mean / p95 |
-|---------|--------------------------------|-----------------------------|---------------------------|
-| `strict` | `1e-7` / `1e-6` | `1e-4` / `1e-3` | `1e-6` / `1e-5` |
-| `standard` (default) | `2e-3` / `1e-2` | `5e-3` / `2e-2` | `1e-3` / `5e-3` |
-| `relaxed` | `5e-3` / `2e-2` | `2e-2` / `1e-1` | `5e-3` / `2e-2` |
+| Profile | Same implementation mean / p95 / cosine | Cross-framework mean / p95 / cosine | Cross-topology mean / p95 / cosine |
+|---------|-----------------------------------------|---------------------------------------|-------------------------------------|
+| `strict` | `1e-7` / `1e-6` / `0.999999` | `1e-4` / `1e-3` / `0.9999` | `1e-6` / `1e-5` / `0.99999` |
+| `standard` (default) | `3e-3` / `1.2e-2` / `0.999` | `6e-3` / `3e-2` / `0.998` | `6e-3` / `3e-2` / `0.998` |
+| `relaxed` | `1e-2` / `5e-2` / `0.995` | `2.5e-2` / `1e-1` / `0.99` | `1e-2` / `5e-2` / `0.995` |
 
 Use `strict` for deterministic same-kernel paths, `standard` for normal BF16 parity, and `relaxed` only after the
 reported metrics demonstrate expected low-precision, distributed, or MoE routing sensitivity. The comparison class is
-selected by the harness; model size or MoE status does not silently relax the gate.
+selected by the harness; model size or MoE status does not silently relax the gate. For every profile, a
+cross-topology comparison is never stricter than the same-implementation comparison because changing topology adds a
+numerical variation source.
 
 Legacy numeric fields remain supported for exceptional models and preserve their existing semantics:
 `kl_threshold`, `hf_kl_threshold`, `cross_tp_kl_threshold`, and `source_load_kl_threshold` gate max KL;

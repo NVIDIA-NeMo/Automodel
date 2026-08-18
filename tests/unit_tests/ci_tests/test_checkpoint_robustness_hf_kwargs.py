@@ -386,7 +386,12 @@ def test_get_logits_pp_updates_pipeline_sequence_length():
 
 @pytest.mark.parametrize(
     ("model_type", "expected_attn_implementation"),
-    [("nemotron_h", "eager"), ("step3p7", "eager"), ("nemotron_flash", "flash_attention_2")],
+    [
+        ("deepseek_v4", "eager"),
+        ("nemotron_h", "eager"),
+        ("step3p7", "eager"),
+        ("nemotron_flash", "flash_attention_2"),
+    ],
 )
 def test_remote_code_attention_implementation(model_type, expected_attn_implementation):
     with patch(
@@ -728,6 +733,7 @@ def test_extract_custom_args_reads_semantic_skips_and_parity_settings(tmp_path):
         "    trust_remote_code: false\n"
         "    parity_sequence_length: 1024\n"
         "    parity_tolerance_profile: relaxed\n"
+        "    hf_reload_timeout_seconds: 3600\n"
     )
 
     custom, remaining = _extract_custom_args(["--config", str(config_path)])
@@ -740,6 +746,7 @@ def test_extract_custom_args_reads_semantic_skips_and_parity_settings(tmp_path):
     assert custom["trust_remote_code"] is False
     assert custom["parity_sequence_length"] == "1024"
     assert custom["parity_tolerance_profile"] == "relaxed"
+    assert custom["hf_reload_timeout_seconds"] == "3600"
     assert remaining == ["--config", str(config_path)]
 
 
@@ -1468,6 +1475,11 @@ def test_hf_reload_wait_has_separate_timeout(tmp_path, monkeypatch):
 
     with pytest.raises(TimeoutError, match="rank 0 vanilla-HF reload"):
         _wait_for_hf_reload_rank0(tmp_path / "done")
+
+
+def test_hf_reload_wait_accepts_explicit_timeout(tmp_path):
+    with pytest.raises(TimeoutError, match="Timed out waiting 0s"):
+        _wait_for_hf_reload_rank0(tmp_path / "done", timeout_s=0)
 
 
 def test_hf_reload_finish_returns_error_without_distributed_sync():

@@ -120,6 +120,7 @@ _OVERRIDES = [
     "deploy_mode",
     "max_new_tokens",
     "hf_adapter_ignored_key_prefix",
+    "hf_reload_timeout_seconds",
     "resume_tolerance_profile",
 ]
 

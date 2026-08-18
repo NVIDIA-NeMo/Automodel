@@ -116,7 +116,6 @@ ci:
   recipe_owner: adil-a
   time: "00:25:00"
   checkpoint_robustness:
-    hf_kl_threshold: 7e-2
     experts_implementation: grouped_mm
     trust_remote_code: true
     tokenizer_name: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16
@@ -124,7 +123,6 @@ ci:
     # Vanilla Transformers intentionally omits the training-only MTP modules.
     # Exact-match every adapter tensor it can instantiate and allow only MTP keys.
     hf_adapter_ignored_key_prefix: "base_model.model.mtp."
-    skip_resume: true
     dataset.num_samples_limit: 500
     validation_dataset.num_samples_limit: 500
 

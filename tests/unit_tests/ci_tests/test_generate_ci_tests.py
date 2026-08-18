@@ -239,12 +239,13 @@ def test_generate_qwen3_moe_te_deepep_uses_isolated_source_and_reload_phases():
     assert variables["TIME"] == "00:20:00"
     assert variables["CHECKPOINT_ROBUSTNESS_PROCESS_ISOLATION"] == "true"
     assert variables["CHECKPOINT_ROBUSTNESS_PHASES"] == (
-        "source_load_reference source_load_parity train_and_save automodel_reload hf_reload"
+        "source_load_reference source_load_parity train_and_save automodel_reload hf_reload resume"
     )
     assert "check_source_load_parity" not in robustness
     assert "skip_source_load_parity" not in robustness
-    assert robustness["source_load_kl_threshold"] == 3e-2
-    assert robustness["source_load_mean_kl_threshold"] == 6e-3
-    assert robustness["source_load_cosine_threshold"] == 0.997
+    assert "source_load_kl_threshold" not in robustness
+    assert "source_load_mean_kl_threshold" not in robustness
+    assert "source_load_cosine_threshold" not in robustness
+    assert "skip_resume" not in robustness
     assert robustness["trust_remote_code"] is True
     assert robustness["hf_device_map_auto"] is True

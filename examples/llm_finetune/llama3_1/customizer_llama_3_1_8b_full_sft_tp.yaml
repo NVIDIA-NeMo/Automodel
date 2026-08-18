@@ -80,7 +80,4 @@ loss_fn:
 ci:
   time: "00:30:00"
   checkpoint_robustness:
-    # Scoped CI found an exact two-tensor optimizer-state mismatch at the resume
-    # boundary. Keep the other phases enabled while that restore bug is investigated.
-    skip_resume: true
     tokenizer_name: meta-llama/Llama-3.1-8B-Instruct

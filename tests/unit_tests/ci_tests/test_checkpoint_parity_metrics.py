@@ -94,7 +94,7 @@ def test_non_finite_logits_are_rejected(bad_value):
         _compute_parity_metrics(torch.zeros_like(logits), logits)
 
 
-def test_named_profiles_are_ordered_and_gate_mean_and_p95():
+def test_named_profiles_are_ordered_and_gate_mean_p95_and_cosine():
     strict = _resolve_parity_thresholds("strict", "cross_framework")
     standard = _resolve_parity_thresholds("standard", "cross_framework")
     relaxed = _resolve_parity_thresholds("relaxed", "cross_framework")
@@ -105,27 +105,43 @@ def test_named_profiles_are_ordered_and_gate_mean_and_p95():
 
     assert strict.mean_kl < standard.mean_kl < relaxed.mean_kl
     assert strict.p95_kl < standard.p95_kl < relaxed.p95_kl
+    assert strict.cosine_similarity > standard.cosine_similarity > relaxed.cosine_similarity
     failures = _parity_failures(metrics, strict)
     assert any("mean KL" in failure for failure in failures)
     assert any("p95 KL" in failure for failure in failures)
+    assert any("cosine similarity" in failure for failure in failures)
+
+
+@pytest.mark.parametrize("profile", ["strict", "standard", "relaxed"])
+def test_comparison_kinds_never_make_cross_topology_stricter_than_same_implementation(profile):
+    same_implementation = _resolve_parity_thresholds(profile, "same_implementation")
+    cross_topology = _resolve_parity_thresholds(profile, "cross_topology")
+    cross_framework = _resolve_parity_thresholds(profile, "cross_framework")
+
+    assert same_implementation.mean_kl <= cross_topology.mean_kl <= cross_framework.mean_kl
+    assert same_implementation.p95_kl <= cross_topology.p95_kl <= cross_framework.p95_kl
+    assert (
+        same_implementation.cosine_similarity >= cross_topology.cosine_similarity >= cross_framework.cosine_similarity
+    )
 
 
 @pytest.mark.parametrize(
-    ("profile", "comparison_kind", "expected_mean_kl", "expected_p95_kl"),
+    ("profile", "comparison_kind", "expected_mean_kl", "expected_p95_kl", "expected_cosine"),
     [
-        ("standard", "same_implementation", 2e-3, 1e-2),
-        ("standard", "cross_framework", 5e-3, 2e-2),
-        ("standard", "cross_topology", 1e-3, 5e-3),
-        ("relaxed", "same_implementation", 5e-3, 2e-2),
-        ("relaxed", "cross_framework", 2e-2, 1e-1),
-        ("relaxed", "cross_topology", 5e-3, 2e-2),
+        ("standard", "same_implementation", 3e-3, 1.2e-2, 0.999),
+        ("standard", "cross_framework", 6e-3, 3e-2, 0.998),
+        ("standard", "cross_topology", 6e-3, 3e-2, 0.998),
+        ("relaxed", "same_implementation", 1e-2, 5e-2, 0.995),
+        ("relaxed", "cross_framework", 2.5e-2, 1e-1, 0.99),
+        ("relaxed", "cross_topology", 1e-2, 5e-2, 0.995),
     ],
 )
-def test_calibrated_profile_thresholds(profile, comparison_kind, expected_mean_kl, expected_p95_kl):
+def test_calibrated_profile_thresholds(profile, comparison_kind, expected_mean_kl, expected_p95_kl, expected_cosine):
     thresholds = _resolve_parity_thresholds(profile, comparison_kind)
 
     assert thresholds.mean_kl == expected_mean_kl
     assert thresholds.p95_kl == expected_p95_kl
+    assert thresholds.cosine_similarity == expected_cosine
 
 
 def test_legacy_numeric_overrides_preserve_max_kl_semantics():

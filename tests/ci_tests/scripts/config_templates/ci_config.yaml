@@ -126,6 +126,7 @@ fixture_keys:
     - hf_device_map_auto
     - hf_device_map_cpu_max_memory_gib
     - hf_device_map_max_memory_gib
+    - hf_reload_timeout_seconds
     - hf_cosine_threshold
     - hf_kl_threshold
     - kl_threshold

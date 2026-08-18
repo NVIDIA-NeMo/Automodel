@@ -88,7 +88,9 @@ from tests.functional_tests.checkpoint_robustness.resume_trajectory import (
 datasets.disable_caching()
 
 _PARITY_DOCUMENT_PATH = Path(__file__).with_name("parity_document.mdx")
-_PARITY_DOCUMENT_SHA256 = "8f734b2ee925ab82afb56dfa3a512108b70d3c54a2489f7978a036420da34cdb"
+_PARITY_DOCUMENT_SHA256 = (
+    "8f734b2ee925ab82afb56dfa3a512108b70d3c54a2489f7978a036420da34cdb"  # pragma: allowlist secret
+)
 
 
 @dataclass(frozen=True)
@@ -116,6 +118,7 @@ def _extract_custom_args(argv: list[str]) -> tuple[dict[str, str | bool], list[s
         "--experts_implementation",
         "--hf_adapter_ignored_key_prefix",
         "--hf_device_map_max_memory_gib",
+        "--hf_reload_timeout_seconds",
         "--tokenizer_name",
         "--max_vram_gb",
         "--max_cpu_gb",
@@ -235,6 +238,8 @@ def _extract_custom_args(argv: list[str]) -> tuple[dict[str, str | bool], list[s
     parity_sequence_length = int(custom.get("parity_sequence_length", "2048"))
     if parity_sequence_length <= 0:
         raise ValueError(f"parity_sequence_length must be positive, got {parity_sequence_length}")
+    if "hf_reload_timeout_seconds" in custom and int(custom["hf_reload_timeout_seconds"]) <= 0:
+        raise ValueError("hf_reload_timeout_seconds must be positive")
     _resolve_parity_thresholds(str(custom.get("parity_tolerance_profile", "standard")), "same_implementation")
 
     return custom, remaining
@@ -868,7 +873,7 @@ def _get_trust_remote_code_attn_implementation(
     # Nemotron-H has incompatible FA2/SDPA paths, and Step-3.7 explicitly rejects
     # FA2. Eager is their common HF reference path. Other remote-code models
     # (notably Nemotron-Flash) still require FA2.
-    return "eager" if config.model_type in {"nemotron_h", "step3p7"} else "flash_attention_2"
+    return "eager" if config.model_type in {"deepseek_v4", "nemotron_h", "step3p7"} else "flash_attention_2"
 
 
 def _hf_source_load_kwargs(
@@ -1192,9 +1197,10 @@ def _hf_reload_sync_paths(cfg) -> tuple[Path, Path]:
     return sync_dir, sync_dir / "done"
 
 
-def _wait_for_hf_reload_rank0(done_path: Path) -> None:
+def _wait_for_hf_reload_rank0(done_path: Path, *, timeout_s: int | None = None) -> None:
     """Wait without an active collective for rank 0 to finish the vanilla-HF reload."""
-    timeout_s = int(os.environ.get("HF_RELOAD_TIMEOUT_SECONDS", "1800"))
+    if timeout_s is None:
+        timeout_s = int(os.environ.get("HF_RELOAD_TIMEOUT_SECONDS", "1800"))
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         if done_path.exists():
@@ -1203,7 +1209,7 @@ def _wait_for_hf_reload_rank0(done_path: Path) -> None:
     raise TimeoutError(f"Timed out waiting {timeout_s}s for rank 0 vanilla-HF reload")
 
 
-def _prepare_hf_reload_sync(cfg) -> tuple[Path, Path] | None:
+def _prepare_hf_reload_sync(cfg, *, timeout_s: int | None = None) -> tuple[Path, Path] | None:
     """Prepare ranks for a long rank-0-only HF reload without starting an NCCL wait."""
     if not dist.is_initialized() or dist.get_world_size() == 1:
         return None
@@ -1214,7 +1220,7 @@ def _prepare_hf_reload_sync(cfg) -> tuple[Path, Path] | None:
         done_path.unlink(missing_ok=True)
     _barrier()  # ensure all ranks released recipe memory and rank 0 reset the marker
     if not _rank0():
-        _wait_for_hf_reload_rank0(done_path)
+        _wait_for_hf_reload_rank0(done_path, timeout_s=timeout_s)
     return sync_dir, done_path
 
 
@@ -2258,7 +2264,10 @@ def _run_process_isolated_checkpoint_phase(
             _barrier()
 
         reference_path = _robustness_artifact_dir(cfg) / "reference_logits.pt"
-        hf_reload_sync_paths = _prepare_hf_reload_sync(cfg)
+        hf_reload_timeout_s = (
+            int(custom_args["hf_reload_timeout_seconds"]) if "hf_reload_timeout_seconds" in custom_args else None
+        )
+        hf_reload_sync_paths = _prepare_hf_reload_sync(cfg, timeout_s=hf_reload_timeout_s)
         hf_reload_error = None
         if _rank0():
             if not reference_path.exists():
@@ -2844,7 +2853,10 @@ def run_checkpoint_robustness(
 
     # Phase 3: Load the same exported weights into vanilla HF (rank 0 only).
     _report_phase("Phase 3: starting vanilla-HF export reload")
-    hf_reload_sync_paths = _prepare_hf_reload_sync(cfg)
+    hf_reload_timeout_s = (
+        int(custom_args["hf_reload_timeout_seconds"]) if "hf_reload_timeout_seconds" in custom_args else None
+    )
+    hf_reload_sync_paths = _prepare_hf_reload_sync(cfg, timeout_s=hf_reload_timeout_s)
 
     hf_reload_error = None
     if skip_hf_reload:

@@ -125,10 +125,8 @@ ci:
     # Use Transformers' built-in MiniMax M2 implementation for the HF+PEFT
     # reload; the checkpoint's remote code targets an older Transformers API.
     trust_remote_code: false
-    # The built-in HF implementation is retained as a smoke/reference diagnostic,
-    # but its logits are not yet a valid oracle for the remote-code AutoModel path.
-    skip_source_load_logit_parity: true
-    skip_hf_reload_logit_parity: true
+    # Keep the cross-framework gates blocking: the current built-in-HF mismatch
+    # must be fixed or explicitly proven to be an invalid reference before it is skipped.
     tokenizer_name: MiniMaxAI/MiniMax-M2.7
     hf_device_map_auto: true
     dataset.num_samples_limit: 500

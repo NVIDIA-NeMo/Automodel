@@ -354,14 +354,10 @@ def test_calibration_recipes_enable_all_checkpoint_gates(tmp_path, recipe_path):
     assert "check_source_load_parity" not in robustness
     assert "skip_source_load_parity" not in robustness
     if recipe_path.stem == "step3p7_medpix_200b_lora_pp8ep8_8node":
-        assert robustness["skip_automodel_reload_logit_parity"] is True
         assert robustness["resume_tolerance_profile"] == "relaxed"
-    else:
-        assert "skip_automodel_reload_logit_parity" not in robustness
+    assert "skip_automodel_reload_logit_parity" not in robustness
     informational_source_and_hf = {
         "gemma4_26b_a4b_moe",
-        "glm_4.7_flash_te_deepep",
-        "minimax_m2.7_hellaswag_lora",
         "step3p7_medpix_200b_lora_pp8ep8_8node",
     }
     if recipe_path.stem in informational_source_and_hf:
@@ -372,10 +368,7 @@ def test_calibration_recipes_enable_all_checkpoint_gates(tmp_path, recipe_path):
         assert "skip_hf_reload_logit_parity" not in robustness
     if recipe_path.stem == "nemotron_flash_1b_squad":
         assert robustness["skip_hf_reload"] is True
-    if recipe_path.stem == "customizer_llama_3_1_8b_full_sft_tp":
-        assert robustness["skip_resume"] is True
-    else:
-        assert "skip_resume" not in robustness
+    assert "skip_resume" not in robustness
 
 
 def test_end_to_end_fixture_keys_not_applied_as_overrides(tmp_path):

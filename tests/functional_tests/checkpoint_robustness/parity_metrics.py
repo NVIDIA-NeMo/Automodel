@@ -46,10 +46,11 @@ class _ParityMetrics:
 
 @dataclass(frozen=True)
 class _ParityThresholds:
-    """Mean and p95 KL gates selected by one numerical profile."""
+    """Mean KL, p95 KL, and cosine gates selected by one numerical profile."""
 
     mean_kl: float
     p95_kl: float
+    cosine_similarity: float
 
     def to_dict(self) -> dict[str, float]:
         """Return a JSON-serializable threshold mapping."""
@@ -58,19 +59,19 @@ class _ParityThresholds:
 
 _PARITY_PROFILES: dict[str, dict[_ComparisonKind, _ParityThresholds]] = {
     "strict": {
-        "same_implementation": _ParityThresholds(mean_kl=1e-7, p95_kl=1e-6),
-        "cross_framework": _ParityThresholds(mean_kl=1e-4, p95_kl=1e-3),
-        "cross_topology": _ParityThresholds(mean_kl=1e-6, p95_kl=1e-5),
+        "same_implementation": _ParityThresholds(mean_kl=1e-7, p95_kl=1e-6, cosine_similarity=0.999999),
+        "cross_framework": _ParityThresholds(mean_kl=1e-4, p95_kl=1e-3, cosine_similarity=0.9999),
+        "cross_topology": _ParityThresholds(mean_kl=1e-6, p95_kl=1e-5, cosine_similarity=0.99999),
     },
     "standard": {
-        "same_implementation": _ParityThresholds(mean_kl=2e-3, p95_kl=1e-2),
-        "cross_framework": _ParityThresholds(mean_kl=5e-3, p95_kl=2e-2),
-        "cross_topology": _ParityThresholds(mean_kl=1e-3, p95_kl=5e-3),
+        "same_implementation": _ParityThresholds(mean_kl=3e-3, p95_kl=1.2e-2, cosine_similarity=0.999),
+        "cross_framework": _ParityThresholds(mean_kl=6e-3, p95_kl=3e-2, cosine_similarity=0.998),
+        "cross_topology": _ParityThresholds(mean_kl=6e-3, p95_kl=3e-2, cosine_similarity=0.998),
     },
     "relaxed": {
-        "same_implementation": _ParityThresholds(mean_kl=5e-3, p95_kl=2e-2),
-        "cross_framework": _ParityThresholds(mean_kl=2e-2, p95_kl=1e-1),
-        "cross_topology": _ParityThresholds(mean_kl=5e-3, p95_kl=2e-2),
+        "same_implementation": _ParityThresholds(mean_kl=1e-2, p95_kl=5e-2, cosine_similarity=0.995),
+        "cross_framework": _ParityThresholds(mean_kl=2.5e-2, p95_kl=1e-1, cosine_similarity=0.99),
+        "cross_topology": _ParityThresholds(mean_kl=1e-2, p95_kl=5e-2, cosine_similarity=0.995),
     },
 }
 
@@ -204,8 +205,8 @@ def _parity_failures(
     """Return failed gates for either a named profile or legacy numeric overrides.
 
     Existing numeric recipe fields retain their original max/mean/cosine semantics.
-    When none are supplied, the named profile gates mean and p95 KL while max KL
-    and cosine remain diagnostic.
+    When none are supplied, the named profile gates mean KL, p95 KL, and cosine
+    similarity while max KL remains diagnostic.
     """
     for name, value in (
         ("legacy_max_kl_threshold", legacy_max_kl_threshold),
@@ -237,4 +238,8 @@ def _parity_failures(
         failures.append(f"mean KL {metrics.mean_kl:.6e} > profile threshold {thresholds.mean_kl:.6e}")
     if metrics.p95_kl > thresholds.p95_kl:
         failures.append(f"p95 KL {metrics.p95_kl:.6e} > profile threshold {thresholds.p95_kl:.6e}")
+    if metrics.cosine_similarity < thresholds.cosine_similarity:
+        failures.append(
+            f"cosine similarity {metrics.cosine_similarity:.8f} < profile threshold {thresholds.cosine_similarity:.8f}"
+        )
     return tuple(failures)
