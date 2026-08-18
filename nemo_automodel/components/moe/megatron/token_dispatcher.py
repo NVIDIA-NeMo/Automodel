@@ -531,7 +531,7 @@ class TokenDispatcherConfig:
     """Share one communication manager instance across MoE layers for the configured backend."""
 
     moe_deepep_async_dispatch: bool = False
-    """Use asynchronous DeepEP/UCCL-EP dispatch and allocate dispatched tensors on the communication stream."""
+    """Use asynchronous DeepEP/UCCL-EP dispatch/combine and communication-stream allocations."""
 
 
 class MoEFlexTokenDispatcher:
@@ -838,7 +838,12 @@ class MoEFlexTokenDispatcher:
         3. Post-process the combined tokens to match the original input shape
         """
         hidden_states = self.combine_preprocess(hidden_states)
-        hidden_states = self.combine_all_to_all(hidden_states, False, False)
+        async_combine = isinstance(self._comm_manager, _DeepepManager) and self.config.moe_deepep_async_dispatch
+        hidden_states = self.combine_all_to_all(
+            hidden_states,
+            async_finish=async_combine,
+            allocate_on_comm_stream=async_combine,
+        )
         hidden_states = self.combine_postprocess(hidden_states)
 
         return hidden_states
