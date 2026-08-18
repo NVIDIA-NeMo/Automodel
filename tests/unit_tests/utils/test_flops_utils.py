@@ -16,6 +16,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from nemo_automodel._transformers.mfu import get_device_flops
 from nemo_automodel.components.utils import flops_utils
 
 
@@ -260,7 +261,7 @@ def test_gpt_oss_flops_uses_head_dim_from_hf_config():
         (1.0, 8, 1.0, 1.0, 12.5),
         # Longer time: 10 TFLOPs per GPU, 1 GPU, 10 seconds, reference 1 TFLOPs -> 100% MFU
         (10.0, 1, 10.0, 1.0, 100.0),
-        # H100 reference (default): 989 TFLOPs per GPU, 8 GPUs, 1 second, reference 1979 TFLOPs -> 6.25% MFU
+        # Sparse BF16 or dense FP8 H100 reference: 989 TFLOPs per GPU, 8 GPUs, reference 1979 TFLOPs
         (989.0, 8, 1.0, 1979.0, 6.2468418393127845),
         # Real-world scenario: 500 TFLOPs per GPU, 64 GPUs, 2 seconds, H100 reference -> 0.197% MFU
         (500.0, 64, 2.0, 1979.0, 0.19738504295098536),
@@ -273,7 +274,14 @@ def test_calculate_mfu(tflops, world_size, time_seconds, reference_mfu, expected
 
 
 def test_calculate_mfu_default_reference():
-    """Test calculate_mfu with default H100 reference."""
-    # Using default reference_mfu (1979.0 for H100)
+    """Test calculate_mfu with the legacy dense FP8 H100 reference."""
     actual_mfu = flops_utils.calculate_mfu(tflops=1979.0, world_size=1, time_seconds=1.0)
+
     assert pytest.approx(actual_mfu, rel=1e-6) == 100.0
+
+
+def test_automfu_h100_reference_uses_dense_bf16_peak():
+    """Test AutoMFU's default H100 training-precision convention."""
+    h100_tflops = get_device_flops(unit="T", device_name="H100")
+
+    assert h100_tflops == 989.0

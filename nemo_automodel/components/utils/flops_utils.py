@@ -22,7 +22,7 @@ def calculate_mfu(tflops, world_size, time_seconds, reference_mfu=1979.0):
         tflops: TFLOPs per GPU
         world_size: Total number of GPUs
         time_seconds: Time taken for computation
-        reference_mfu: Peak TFLOPs of the hardware (default: H100)
+        reference_mfu: Peak TFLOPs of the hardware (default: dense FP8 or sparse BF16 on H100 SXM)
 
     Returns:
         MFU as a percentage
