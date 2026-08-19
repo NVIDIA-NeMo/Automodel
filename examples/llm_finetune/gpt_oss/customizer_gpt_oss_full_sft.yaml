@@ -91,5 +91,4 @@ ci:
     # p95 KL and cosine pass standard; retain every gate with the shared profile.
     parity_tolerance_profile: relaxed
     tokenizer_name: openai/gpt-oss-20b
-    skip_resume: true
     check_phantom_keys: true

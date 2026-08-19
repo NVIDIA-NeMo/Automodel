@@ -88,5 +88,4 @@ ci:
   time: "00:30:00"
   checkpoint_robustness:
     tokenizer_name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
-    skip_resume: true
     experts_implementation: grouped_mm

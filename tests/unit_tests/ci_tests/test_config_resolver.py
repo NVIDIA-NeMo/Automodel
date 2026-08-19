@@ -396,6 +396,29 @@ def test_gpt_oss_customizers_use_routed_moe_parity_profile(tmp_path, recipe_name
     assert robustness["parity_tolerance_profile"] == "relaxed"
     assert "skip_source_load_logit_parity" not in robustness
     assert "skip_hf_reload_logit_parity" not in robustness
+    assert "skip_resume" not in robustness
+
+
+@pytest.mark.parametrize(
+    "recipe_path",
+    [
+        "examples/llm_finetune/nemotron/customizer_nemotron_nano_full_sft.yaml",
+        "examples/llm_finetune/nemotron/customizer_nemotron_nano_full_sft_chat.yaml",
+        "examples/llm_finetune/qwen/qwen3_moe_30b_hellaswag.yaml",
+    ],
+)
+def test_additional_routed_moe_configs_enable_resume(tmp_path, recipe_path):
+    """Expanded routed-MoE coverage keeps the native-resume phase active."""
+    recipe_path = REPO_ROOT / recipe_path
+    out = tmp_path / "resolved.yaml"
+    env = {"PIPELINE_DIR": str(tmp_path), "TEST_NAME": recipe_path.stem, "NEMO_CI_PATH": "/mnt/nci"}
+    _run_resolver(
+        ["--base", str(recipe_path), "--phase", "checkpoint_robustness", "--output", str(out)],
+        env=env,
+    )
+
+    robustness = yaml.load(out.open())["ci"]["checkpoint_robustness"]
+    assert "skip_resume" not in robustness
 
 
 def test_nemotron_nano_4b_peft_uses_cached_family_tokenizer(tmp_path):
