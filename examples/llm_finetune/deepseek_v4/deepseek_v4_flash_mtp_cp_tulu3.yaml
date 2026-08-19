@@ -25,8 +25,8 @@
 #   * CP is NOT compatible with packed sequences (packed_sequence_size must be 0).
 #     Use a fixed sequence length with padding=max_length instead — each CP rank
 #     owns a contiguous query shard of that fixed length.
-#   * Mesh: dp(4) * tp(1) * pp(4) * cp(8) = 128 GPUs => 16 nodes (8 H100/node);
-#     ep_size(32) shards experts within the dp*cp group (4*8=32).
+#   * Mesh: dp(16) * tp(1) * pp(1) * cp(8) = 128 GPUs => 16 nodes (8 H100/node);
+#     ep_size(64) shards experts within the dp*cp group (16*8=128).
 #
 #   torchrun --nproc-per-node 8 examples/llm_finetune/deepseek_v4/deepseek_v4_flash_mtp_cp_tulu3.yaml --nproc-per-node 8
 
@@ -48,24 +48,15 @@ distributed:
   strategy: fsdp2
   tp_size: 1
   cp_size: 8
-  pp_size: 4
-  ep_size: 32
+  pp_size: 1
+  ep_size: 64
 
   sequence_parallel: false
   activation_checkpointing: true
 
-  pipeline:
-    pp_schedule: 1f1b
-    pp_microbatch_size: 1
-    layers_per_stage: 11
-    round_virtual_stages_to_pp_multiple: down
-    scale_grads_in_schedule: false
-    patch_inner_model: false
-    patch_causal_lm_model: false
-
   moe:
     ignore_router_for_ac: true
-    reshard_after_forward: false
+    reshard_after_forward: true
     wrap_outer_model: false
 
 dist_env:
@@ -147,8 +138,8 @@ optimizer:
   weight_decay: 0.1
 
 ci:
-  # dp(4) * tp(1) * pp(4) * cp(8) = 128 GPUs => 16 nodes (8 H100/node).
-  # ep_size(32) shards experts within the dp*cp group (4*8=32); it does not
+  # dp(16) * tp(1) * pp(1) * cp(8) = 128 GPUs => 16 nodes (8 H100/node).
+  # ep_size(64) shards experts within the dp*cp group (16*8=128); it does not
   # multiply the mesh.
   recipe_owner: huiyingl
   nodes: 16
