@@ -1,6 +1,6 @@
 ---
 title: "YAML Configuration"
-description: ""
+description: "Configure NeMo AutoModel recipes with YAML, including target instantiation, distributed settings, prewarm options, and environment variable interpolation."
 position: 4
 ---
 NeMo AutoModel recipes use YAML configs. The YAML parser creates a `ConfigNode` that performs the following actions:
@@ -113,7 +113,9 @@ mfu:
 `peak_tflops` takes precedence over `device`. A device name alone selects an
 entry from AutoMFU's table; omitting both fields uses the current CUDA device.
 Hardware detection cannot determine the effective training precision, so FP8
-and structured-sparse runs must provide the appropriate peak explicitly.
+and structured-sparse runs must provide the appropriate peak explicitly. An
+unknown device emits a warning and reports 0% MFU until you configure a
+supported `device` value or an explicit `peak_tflops` value.
 
 ## Repair Near-Zero Input Embeddings
 
@@ -144,9 +146,9 @@ distributed:
 
 The supported policies are:
 
-- `root` (default): the always-run outer FSDP root owns frozen multimodal parameters. This keeps collective ordering aligned when some ranks execute a modality branch and others skip it.
-- `per_layer`: layers inside the frozen multimodal module get their normal FSDP units. This can reduce peak unshard memory, but it is an expert option: every rank in the FSDP group must execute or skip those units the same number of times and in the same order on every microbatch.
-- `replicate`: frozen multimodal parameters are excluded from FSDP and copied on every rank. This removes their collectives at the cost of higher per-rank parameter memory.
+- `root` (default): The always-run outer FSDP root owns frozen multimodal parameters. This keeps collective ordering aligned when some ranks execute a modality branch and others skip it.
+- `per_layer`: Layers inside the frozen multimodal module get their normal FSDP units. This can reduce peak unshard memory, but it is an expert option: every rank in the FSDP group must execute or skip those units the same number of times and in the same order on every microbatch.
+- `replicate`: Frozen multimodal parameters are excluded from FSDP and copied on every rank. This removes their collectives at the cost of higher per-rank parameter memory.
 
 This setting does not change modules that contain any trainable parameters. For nested MoE or VLM models, `root` requires `distributed.moe.wrap_outer_model: true` when a fully frozen multimodal module is outside the inner text-model FSDP root. Use `per_layer` or `replicate` if the outer model must remain unwrapped.
 

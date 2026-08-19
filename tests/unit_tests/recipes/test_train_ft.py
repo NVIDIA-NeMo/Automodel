@@ -30,6 +30,7 @@ from nemo_automodel.components.config.loader import ConfigNode
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 from torch.utils.data import IterableDataset
 
+from nemo_automodel._transformers.mfu import MFUConfig
 from nemo_automodel._transformers.model_init import resolve_sdpa_method
 from nemo_automodel.components.datasets.loader import (
     DataloaderConfig,
@@ -47,6 +48,16 @@ from nemo_automodel.recipes.llm.train_ft import (
     build_model,
     compute_trust_remote_code_from_model,
 )
+
+
+def test_recipe_config_resolves_mfu_settings():
+    config = RecipeConfig(ConfigNode({"mfu": {"device": "h100", "peak_tflops": 1979.0}}))
+
+    assert config.mfu == MFUConfig(device="h100", peak_tflops=1979.0)
+
+
+def test_recipe_config_defaults_mfu_settings():
+    assert RecipeConfig(ConfigNode({})).mfu == MFUConfig()
 
 
 def _build_loader(

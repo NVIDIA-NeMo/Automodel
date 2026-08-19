@@ -18,9 +18,13 @@ Similar interface to HuggingFace AutoModel, this module provides automatic
 MFU calculation for various model architectures.
 """
 
+from __future__ import annotations
+
 import logging
+import math
+from dataclasses import dataclass
 from os import PathLike
-from typing import TYPE_CHECKING, Dict, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -35,7 +39,7 @@ from nemo_automodel.components.utils.flops_utils import (
 logger = logging.getLogger(__name__)
 
 # Device theoretical FLOPS (FLOPs/s) adapted from https://github.com/verl-project/verl/blob/main/verl/utils/flops_counter.py#L22-L85
-_DEVICE_FLOPS: Dict[str, float] = {
+_DEVICE_FLOPS: dict[str, float] = {
     "CPU": 448e9,
     "GB200": 2.5e15,
     "B200": 2.25e15,
@@ -74,7 +78,7 @@ _CONFIG_ALIAS_ATTRS = (
 )
 
 
-def get_device_flops(unit: str = "T", device_name: Optional[str] = None) -> float:
+def get_device_flops(unit: str = "T", device_name: str | None = None) -> float:
     """Get theoretical device FLOPS in a requested unit.
 
     Args:
@@ -116,10 +120,10 @@ class AutoMFU:
 
     def __init__(
         self,
-        config: "PretrainedConfig",
-        device: Optional[str] = None,
-        peak_tflops: Optional[float] = None,
-    ):
+        config: PretrainedConfig,
+        device: str | None = None,
+        peak_tflops: float | None = None,
+    ) -> None:
         """Initialize AutoMFU with a model config.
 
         Args:
@@ -130,8 +134,17 @@ class AutoMFU:
         self.config = config
         self.flops_formula = get_flops_formula_for_hf_config(config)
         self.reference_mfu = (
-            float(peak_tflops) if peak_tflops is not None else get_device_flops(unit="T", device_name=device)
+            _validate_peak_tflops(peak_tflops)
+            if peak_tflops is not None
+            else get_device_flops(unit="T", device_name=device)
         )
+        if not math.isfinite(self.reference_mfu):
+            device_description = repr(device) if device is not None else "the current device"
+            logger.warning(
+                "Unable to determine the theoretical peak for %s; MFU will be reported as 0%%. "
+                "Pass a supported device or peak_tflops directly, or set mfu.device or mfu.peak_tflops in recipe YAML.",
+                device_description,
+            )
 
     @classmethod
     def register_device(cls, device: str, peak_tflops: float) -> None:
@@ -141,11 +154,11 @@ class AutoMFU:
     @classmethod
     def from_config(
         cls,
-        config_or_path_or_model: Union["PretrainedConfig", str, PathLike[str], object],
-        device: Optional[str] = None,
-        peak_tflops: Optional[float] = None,
-        **kwargs,
-    ) -> "AutoMFU":
+        config_or_path_or_model: PretrainedConfig | str | PathLike[str] | object,
+        device: str | None = None,
+        peak_tflops: float | None = None,
+        **kwargs: Any,
+    ) -> AutoMFU:
         """Create AutoMFU from a config object, model object, or model path/ID.
 
         Args:
@@ -172,11 +185,11 @@ class AutoMFU:
     @classmethod
     def from_pretrained(
         cls,
-        model_id_or_local_path_or_model: Union[str, PathLike[str], object],
-        device: Optional[str] = None,
-        peak_tflops: Optional[float] = None,
-        **kwargs,
-    ) -> "AutoMFU":
+        model_id_or_local_path_or_model: str | PathLike[str] | object,
+        device: str | None = None,
+        peak_tflops: float | None = None,
+        **kwargs: Any,
+    ) -> AutoMFU:
         """Create AutoMFU from model ID, local path, or a model object.
 
         Args:
@@ -198,10 +211,10 @@ class AutoMFU:
 
     def __call__(
         self,
-        input_ids_or_tensor: Union[torch.Tensor, Tuple[int, int]],
+        input_ids_or_tensor: torch.Tensor | tuple[int, int],
         time_delta: float,
         world_size: int,
-    ) -> Optional[float]:
+    ) -> float | None:
         """Calculate MFU percentage.
 
         Args:
@@ -221,8 +234,8 @@ class AutoMFU:
 
     def get_flops(
         self,
-        input_ids_or_tensor: Union[torch.Tensor, Tuple[int, int]],
-    ) -> Optional[float]:
+        input_ids_or_tensor: torch.Tensor | tuple[int, int],
+    ) -> float | None:
         """Calculate FLOPs for given input shape.
 
         Args:
@@ -235,14 +248,14 @@ class AutoMFU:
         if self.flops_formula is None:
             return None
 
-        if hasattr(input_ids_or_tensor, "shape"):
+        if isinstance(input_ids_or_tensor, torch.Tensor):
             batch_size, seq_len = input_ids_or_tensor.shape[:2]
         else:
             batch_size, seq_len = input_ids_or_tensor
 
         try:
             # Explicitly gate transformer fallback on required attributes.
-            if self.flops_formula.__name__ == "transformer_flops":
+            if getattr(self.flops_formula, "__name__", None) == "transformer_flops":
                 required = (
                     "hidden_size",
                     "num_hidden_layers",
@@ -292,3 +305,39 @@ class AutoMFU:
                     # Some config objects may block dynamic attrs; fallback
                     # behavior will return None if attrs remain unavailable.
                     pass
+
+
+@dataclass(frozen=True)
+class MFUConfig:
+    """Typed settings for constructing an :class:`AutoMFU` calculator.
+
+    Attributes:
+        device: Optional device name used to look up the theoretical peak.
+        peak_tflops: Optional theoretical peak TFLOPs/s for the training precision.
+            When set, this takes precedence over ``device``.
+    """
+
+    device: str | None = None
+    peak_tflops: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.peak_tflops is not None:
+            _validate_peak_tflops(self.peak_tflops)
+
+    def build(self, *, model: torch.nn.Module) -> AutoMFU:
+        """Build the calculator for an initialized model.
+
+        Args:
+            model: Model whose Hugging Face configuration supplies the FLOPs formula.
+
+        Returns:
+            The configured MFU calculator.
+        """
+        return AutoMFU.from_config(model, device=self.device, peak_tflops=self.peak_tflops)
+
+
+def _validate_peak_tflops(peak_tflops: float) -> float:
+    peak = float(peak_tflops)
+    if not math.isfinite(peak) or peak <= 0:
+        raise ValueError("peak_tflops must be a finite value greater than zero")
+    return peak
