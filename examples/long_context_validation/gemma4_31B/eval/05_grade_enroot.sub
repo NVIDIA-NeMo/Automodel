@@ -1,0 +1,91 @@
+#!/bin/bash
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# Phase 3 step 5 — LOCAL SWE-bench grading via enroot (no Docker, no cloud). CPU-only.
+# Grades a predictions file with the official swebench spec inside per-instance enroot
+# containers. Replaces the broken sb-cli cloud grader.
+#
+# Env knobs:
+#   PREDS=<preds.json>  SUBSET=lite SPLIT=test WORKERS=8 RUN_TAG=grade_sft_v5  INSTANCE_IDS=""
+# Submit:
+#   PREDS=/lustre/.../runs/dryrun_sft_v5/preds.json RUN_TAG=grade_sft_v5 sbatch 05_grade_enroot.sub
+#SBATCH -A <account>
+#SBATCH -p cpu
+#SBATCH -t 06:00:00
+#SBATCH -N 1
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=48
+#SBATCH -J swebench_grade
+#SBATCH --output=/path/to/coderforge_cache/slurm_jobs/%x_%j.out
+#SBATCH --error=/path/to/coderforge_cache/slurm_jobs/%x_%j.err
+
+set -euxo pipefail
+
+CACHE=/path/to/coderforge_cache
+EVAL_DIR=/path/to/Automodel/examples/long_context_validation/gemma4_31B/eval
+VENV="${CACHE}/eval_venv"
+
+PREDS="${PREDS:?set PREDS=<preds.json>}"
+SUBSET="${SUBSET:-lite}"; SPLIT="${SPLIT:-test}"; WORKERS="${WORKERS:-8}"
+RUN_TAG="${RUN_TAG:-grade}"
+INSTANCE_IDS="${INSTANCE_IDS:-}"
+OUTDIR="${CACHE}/eval/grades/${RUN_TAG}"
+mkdir -p "${OUTDIR}"
+
+# enroot: node-local temp/data/sqsh (lustre CANNOT do overlay whiteouts -> data path MUST be
+# node-local, never lustre); cap zstd; no host-home mount.
+# GOTCHA (bit us 3x): each swebench image extracts ~2.7GB / ~42k files into ENROOT_DATA_PATH; on a
+# node with a SMALL node-local /tmp, ~10 containers fill it and the rest fail `enroot create` with a
+# swallowed CalledProcessError -> false 0/N resolve. So prefer a BIG node-local disk if one exists,
+# fall back to /tmp, and log df at start. ALWAYS check the "enroot-errs" count printed below before
+# trusting a low/zero resolve rate.
+EBASE="/tmp"
+for CAND in /raid /lscratch /scratch; do
+  if [ -d "${CAND}" ] && [ -w "${CAND}" ]; then EBASE="${CAND}"; break; fi
+done
+EROOT="${EBASE}/enroot_${SLURM_JOB_ID}"
+echo "grade node=$(hostname)  ENROOT base=${EBASE}"; df -h "${EBASE}" | tail -1
+export ENROOT_TEMP_PATH="${EROOT}/tmp"
+export ENROOT_DATA_PATH="${EROOT}/data"
+export ENROOT_CACHE_PATH="${EROOT}/cache"
+export ENROOT_MAX_PROCESSORS=8
+export ENROOT_MOUNT_HOME=n
+# Shared lustre image cache (reused from the agent runs; atomic imports -> concurrency-safe).
+export MSWEA_ENROOT_SQSH_DIR="${SWEBENCH_IMAGES:-/path/to/coderforge_cache/swebench_images}"
+mkdir -p "${ENROOT_TEMP_PATH}" "${ENROOT_DATA_PATH}" "${ENROOT_CACHE_PATH}" "${MSWEA_ENROOT_SQSH_DIR}"
+
+# shellcheck disable=SC1091
+source "${VENV}/bin/activate"
+export HF_HOME="/path/to/hf_cache"
+
+python "${EVAL_DIR}/grade_enroot.py" \
+  --subset "${SUBSET}" --split "${SPLIT}" \
+  --preds "${PREDS}" \
+  --output-dir "${OUTDIR}" \
+  --workers "${WORKERS}" \
+  ${INSTANCE_IDS:+--instance-ids "${INSTANCE_IDS}"}
+
+# Report summary + the enroot-error count. A non-zero enroot-errs means containers failed to build
+# (disk pressure) and the resolve rate is UNDERCOUNTED -> re-run (this hardened script picks a big
+# node-local disk, so it should be 0; if not, the node's node-local disk is too small).
+echo "=== grade report ==="
+python - "${OUTDIR}/report.json" <<'PY'
+import json,sys
+r=json.load(open(sys.argv[1])); s=r["summary"]; reps=r.get("reports",{})
+enr=sum(1 for v in reps.values() if "enroot" in str(v.get("error","")))
+print(json.dumps(s,indent=2))
+print(f"enroot-errs={enr}  (>0 => resolve UNDERCOUNTED, re-run)")
+PY
+rm -rf "${EROOT}"
+echo "=== DONE (${RUN_TAG}) ==="
