@@ -126,6 +126,11 @@ Phase 0 makes the initial HF checkpoint load part of the default contract. The r
 long enough to capture logits and is released before the trainer model is constructed. This catches remote-code,
 force-HF, custom-model, and tied/untied `lm_head` regressions before training can obscure them.
 
+The AutoModel side always keeps the recipe's configured attention backend. The independent vanilla-HF reference uses
+that backend when the pinned Transformers model declares support for it; otherwise it uses `eager` and logs an
+attention-compatibility fallback. This preserves a working HF reference instead of making a recipe backend that HF
+cannot execute look like a checkpoint failure.
+
 For large reference models, set `hf_device_map_auto: true` so HF can use `device_map="auto"` instead of placing the
 whole reference load on one rank's GPU. This remains opt-in: small models keep the simpler single-device HF load,
 while large models (for example 9B+ or configs that already require multi-GPU HF reloads) should enable it to avoid

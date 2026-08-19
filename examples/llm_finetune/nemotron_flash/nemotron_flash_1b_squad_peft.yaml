@@ -112,8 +112,6 @@ ci:
   recipe_owner: akoumpa
   time: "00:15:00"
   checkpoint_robustness:
-    hf_kl_threshold: 5e-3
-    kl_threshold: 5e-3
     # Nemotron Flash's hybrid Mamba/DeltaNet layers do not have a native TP
     # plan. Keep checkpoint reload and strict resume parity on the recipe's
     # supported TP=1 topology instead of introducing row-parallel BF16 drift.

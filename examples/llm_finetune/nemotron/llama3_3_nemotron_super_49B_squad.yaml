@@ -125,8 +125,6 @@ ci:
   checkpoint_robustness:
     # PP buffers are fixed to the recipe's 1024-token sequence length.
     parity_sequence_length: 1024
-    kl_threshold: 5e-3  # 49B bf16 consolidated round-trip drifts ~3e-4; the 1e-5 tp>1 default is too tight
-    hf_kl_threshold: 5e-3
     training_reproducibility_loss_threshold: 5e-2
     # TP8/PP2 shared-trajectory runs show ~0.35-0.55% first-forward loss drift.
     # Exact pre-update parameters and optimizer state are still required.

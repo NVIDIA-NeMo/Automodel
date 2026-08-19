@@ -116,10 +116,10 @@ ci:
   nodes: 1
   checkpoint_robustness:
     vllm_merge_lora: true  # vLLM can't serve LoRA on fused mamba layers; deploy the merged adapter instead
-    kl_threshold: 5e-3
-    hf_kl_threshold: 5e-3
     # tp_size stays at the base value (1): the dense Nemotron-H custom path is FSDP2-only.
-    tokenizer_name: nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16
+    # The mounted offline 4B snapshot omits tokenizer artifacts; the 30B checkpoint
+    # publishes the same family tokenizer and 131072-token vocabulary.
+    tokenizer_name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
     trust_remote_code: true
     skip_resume: true
     dataset.limit_dataset_samples: 500

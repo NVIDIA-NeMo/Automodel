@@ -864,8 +864,12 @@ def _resolve_hf_model_class(
     revision: str | None = None,
     token: str | bool | None = None,
 ) -> type:
-    """Honor a checkpoint's advertised HF auto-model class when the VLM default is absent."""
+    """Select the vanilla-HF auto-model class supported by the checkpoint."""
     from transformers import AutoModelForCausalLM, AutoModelForImageTextToText, PretrainedConfig
+    from transformers.models.auto.modeling_auto import (
+        MODEL_FOR_CAUSAL_LM_MAPPING_NAMES,
+        MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING_NAMES,
+    )
 
     config_kwargs: dict[str, str | bool] = {
         "local_files_only": os.environ.get("HF_HUB_OFFLINE", "0") == "1",
@@ -876,15 +880,26 @@ def _resolve_hf_model_class(
         config_kwargs["token"] = token
     config_dict, _ = PretrainedConfig.get_config_dict(pretrained_model_name_or_path, **config_kwargs)
     auto_map = config_dict.get("auto_map") or {}
-    if not auto_map or default_model_cls.__name__ in auto_map:
-        return default_model_cls
-
     supported_classes = {
         model_cls.__name__: model_cls for model_cls in (AutoModelForImageTextToText, AutoModelForCausalLM)
     }
-    advertised_classes = [model_cls for name, model_cls in supported_classes.items() if name in auto_map]
-    if len(advertised_classes) == 1:
-        return advertised_classes[0]
+
+    if auto_map:
+        if default_model_cls.__name__ in auto_map:
+            return default_model_cls
+        advertised_classes = [model_cls for name, model_cls in supported_classes.items() if name in auto_map]
+        if len(advertised_classes) == 1:
+            return advertised_classes[0]
+        return default_model_cls
+
+    model_type = config_dict.get("model_type")
+    native_mappings = {
+        AutoModelForCausalLM: MODEL_FOR_CAUSAL_LM_MAPPING_NAMES,
+        AutoModelForImageTextToText: MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING_NAMES,
+    }
+    native_classes = [model_cls for model_cls, mapping in native_mappings.items() if model_type in mapping]
+    if len(native_classes) == 1:
+        return native_classes[0]
     return default_model_cls
 
 
@@ -905,20 +920,69 @@ def _get_trust_remote_code_attn_implementation(
     token: str | bool | None = None,
 ) -> str:
     """Select the vanilla-HF attention implementation for a remote-code model."""
+    from transformers import PretrainedConfig
+
+    config_kwargs: dict[str, str | bool] = {
+        "local_files_only": os.environ.get("HF_HUB_OFFLINE", "0") == "1",
+    }
+    if revision is not None:
+        config_kwargs["revision"] = revision
+    if token is not None:
+        config_kwargs["token"] = token
+    config_dict, _ = PretrainedConfig.get_config_dict(pretrained_model_name_or_path, **config_kwargs)
+
+    # Remote-code checkpoints do not share optimized attention backend support:
+    # these models reject the recipe backend under the pinned Transformers
+    # version. Eager is their common vanilla-HF reference path.
+    eager_model_types = {"deepseek_v4", "nemotron-nas", "nemotron_flash", "nemotron_h", "step3p7"}
+    return "eager" if config_dict.get("model_type") in eager_model_types else "flash_attention_2"
+
+
+def _resolve_hf_attn_implementation(
+    pretrained_model_name_or_path: str | Path,
+    requested_implementation: str | None,
+    *,
+    hf_model_cls: type,
+    trust_remote_code: bool,
+    revision: str | None = None,
+    token: str | bool | None = None,
+) -> str | None:
+    """Use the recipe backend when vanilla HF supports it, otherwise use eager."""
+    if trust_remote_code:
+        compatible_implementation = _get_trust_remote_code_attn_implementation(
+            pretrained_model_name_or_path,
+            revision=revision,
+            token=token,
+        )
+        if compatible_implementation == "eager" or requested_implementation is None:
+            return compatible_implementation
+        return requested_implementation
+
+    if requested_implementation not in {"sdpa", "flash_attention_2"}:
+        return requested_implementation
+
     from transformers import AutoConfig
 
-    config_kwargs: dict[str, str | bool] = {"trust_remote_code": True}
+    config_kwargs: dict[str, str | bool] = {
+        "local_files_only": os.environ.get("HF_HUB_OFFLINE", "0") == "1",
+    }
     if revision is not None:
         config_kwargs["revision"] = revision
     if token is not None:
         config_kwargs["token"] = token
     config = AutoConfig.from_pretrained(pretrained_model_name_or_path, **config_kwargs)
+    try:
+        concrete_model_cls = hf_model_cls._model_mapping[type(config)]
+    except (AttributeError, KeyError):
+        return requested_implementation
 
-    # Remote-code checkpoints do not share optimized attention backend support:
-    # Nemotron-H has incompatible FA2/SDPA paths, and Step-3.7 explicitly rejects
-    # FA2. Eager is their common HF reference path. Other remote-code models
-    # (notably Nemotron-Flash) still require FA2.
-    return "eager" if config.model_type in {"deepseek_v4", "nemotron_h", "step3p7"} else "flash_attention_2"
+    support_attribute = {
+        "sdpa": "_supports_sdpa",
+        "flash_attention_2": "_supports_flash_attn",
+    }[requested_implementation]
+    if not bool(getattr(concrete_model_cls, support_attribute, False)):
+        return "eager"
+    return requested_implementation
 
 
 def _hf_source_load_kwargs(
@@ -928,6 +992,7 @@ def _hf_source_load_kwargs(
     source_dtype: torch.dtype,
     trust_remote_code: bool,
     experts_implementation: str | None,
+    hf_model_cls: type,
     device: torch.device,
     hf_device_map_auto: bool,
 ) -> dict:
@@ -944,12 +1009,16 @@ def _hf_source_load_kwargs(
     hf_kwargs["torch_dtype"] = source_dtype
     hf_kwargs["trust_remote_code"] = trust_remote_code
     hf_kwargs["local_files_only"] = os.environ.get("HF_HUB_OFFLINE", "0") == "1"
-    if hf_kwargs["trust_remote_code"] and "attn_implementation" not in hf_kwargs:
-        hf_kwargs["attn_implementation"] = _get_trust_remote_code_attn_implementation(
-            pretrained_model_name_or_path,
-            revision=hf_kwargs.get("revision"),
-            token=hf_kwargs.get("token"),
-        )
+    attn_implementation = _resolve_hf_attn_implementation(
+        pretrained_model_name_or_path,
+        hf_kwargs.get("attn_implementation"),
+        hf_model_cls=hf_model_cls,
+        trust_remote_code=hf_kwargs["trust_remote_code"],
+        revision=hf_kwargs.get("revision"),
+        token=hf_kwargs.get("token"),
+    )
+    if attn_implementation is not None:
+        hf_kwargs["attn_implementation"] = attn_implementation
     if experts_implementation and not trust_remote_code:
         hf_kwargs["experts_implementation"] = experts_implementation
         hf_kwargs["trust_remote_code"] = False
@@ -1401,9 +1470,16 @@ def _prepare_source_load_reference_rank0(
         source_dtype=source_dtype,
         trust_remote_code=trust_remote_code,
         experts_implementation=experts_implementation,
+        hf_model_cls=hf_model_cls,
         device=device,
         hf_device_map_auto=hf_device_map_auto,
     )
+    requested_attn_implementation = model_kwargs.get("attn_implementation")
+    if hf_kwargs.get("attn_implementation") != requested_attn_implementation:
+        print(
+            "[Phase 0] Vanilla-HF attention compatibility fallback: "
+            f"requested={requested_attn_implementation!r}, selected={hf_kwargs.get('attn_implementation')!r}"
+        )
     if hf_source_post_load_dequantize and hf_kwargs.get("device_map") == "auto" and torch.cuda.is_available():
         # Accelerate sizes the automatic map for the on-disk FP8 tensors. The
         # post-load BF16 representation needs roughly twice that memory, so cap
@@ -1900,17 +1976,24 @@ def _run_vanilla_hf_reload(
         for key in ("revision", "token"):
             if model_kwargs.get(key) is not None:
                 hf_kwargs[key] = model_kwargs[key]
-        # Load HF with the attention backend the recipe pins, the same way the
-        # source-load phase does. Attention backends are not bit-identical in bf16,
-        # so without this the two sides can run different backends and the reload
-        # reports a logit gap that the checkpoint did not cause.
-        if model_kwargs.get("attn_implementation") is not None:
-            hf_kwargs["attn_implementation"] = model_kwargs["attn_implementation"]
-        # Remote-code models can ship attention names that transformers 5.x
-        # rejects. Select a supported implementation while keeping Nemotron-H
-        # off HF's incompatible FlashAttention varlen path.
-        if trust_remote_code and "attn_implementation" not in hf_kwargs:
-            hf_kwargs["attn_implementation"] = _get_trust_remote_code_attn_implementation(config_path)
+        # Keep the recipe backend when vanilla HF supports it. Some model
+        # implementations reject that backend under the pinned Transformers
+        # version, so their independent HF reference uses eager instead.
+        attn_implementation = _resolve_hf_attn_implementation(
+            config_path,
+            model_kwargs.get("attn_implementation"),
+            hf_model_cls=hf_model_cls,
+            trust_remote_code=trust_remote_code,
+            revision=model_kwargs.get("revision"),
+            token=model_kwargs.get("token"),
+        )
+        if attn_implementation is not None:
+            hf_kwargs["attn_implementation"] = attn_implementation
+        if attn_implementation != model_kwargs.get("attn_implementation") and _rank0():
+            print(
+                "[Phase 3] Vanilla-HF attention compatibility fallback: "
+                f"requested={model_kwargs.get('attn_implementation')!r}, selected={attn_implementation!r}"
+            )
         if experts_implementation and not trust_remote_code:
             hf_kwargs["experts_implementation"] = experts_implementation
             hf_kwargs["trust_remote_code"] = False

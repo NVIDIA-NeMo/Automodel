@@ -19,6 +19,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 import torch
+from transformers import AutoModelForCausalLM
 
 from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_biencoder import (
     _extract_custom_args as _extract_biencoder_custom_args,
@@ -53,6 +54,7 @@ from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm
     _raise_distributed_failure,
     _record_deferred_failure,
     _repeatability_policy,
+    _resolve_hf_attn_implementation,
     _resolve_hf_model_class,
     _run_process_isolated_checkpoint_phase,
     _set_model_pretrained_path,
@@ -114,6 +116,18 @@ def test_resolve_hf_model_class_uses_advertised_causal_lm_for_vlm_checkpoint():
         resolved_cls = _resolve_hf_model_class("model-path", AutoModelForImageTextToText)
 
     assert resolved_cls is AutoModelForCausalLM
+
+
+def test_resolve_hf_model_class_uses_native_image_text_mapping_for_mistral3():
+    from transformers import AutoModelForImageTextToText
+
+    with patch(
+        "transformers.PretrainedConfig.get_config_dict",
+        return_value=({"model_type": "mistral3", "architectures": ["Mistral3ForConditionalGeneration"]}, {}),
+    ):
+        resolved_cls = _resolve_hf_model_class("model-path", AutoModelForCausalLM)
+
+    assert resolved_cls is AutoModelForImageTextToText
 
 
 def test_hf_device_map_max_memory_caps_each_visible_gpu():
@@ -390,48 +404,72 @@ def test_get_logits_pp_updates_pipeline_sequence_length():
     ("model_type", "expected_attn_implementation"),
     [
         ("deepseek_v4", "eager"),
+        ("nemotron-nas", "eager"),
         ("nemotron_h", "eager"),
         ("step3p7", "eager"),
-        ("nemotron_flash", "flash_attention_2"),
+        ("nemotron_flash", "eager"),
     ],
 )
 def test_remote_code_attention_implementation(model_type, expected_attn_implementation):
     with patch(
-        "transformers.AutoConfig.from_pretrained",
-        return_value=SimpleNamespace(model_type=model_type),
-    ) as from_pretrained:
+        "transformers.PretrainedConfig.get_config_dict",
+        return_value=({"model_type": model_type}, {}),
+    ) as get_config_dict:
         hf_kwargs = _hf_source_load_kwargs(
             {"revision": "model-revision", "token": "model-token"},
             pretrained_model_name_or_path="model-path",
             source_dtype=torch.bfloat16,
             trust_remote_code=True,
             experts_implementation=None,
+            hf_model_cls=AutoModelForCausalLM,
             device=torch.device("cpu"),
             hf_device_map_auto=False,
         )
 
     assert hf_kwargs["attn_implementation"] == expected_attn_implementation
-    from_pretrained.assert_called_once_with(
+    get_config_dict.assert_called_once_with(
         "model-path",
-        trust_remote_code=True,
+        local_files_only=False,
         revision="model-revision",
         token="model-token",
     )
 
 
 def test_explicit_attention_implementation_is_preserved():
-    with patch("transformers.AutoConfig.from_pretrained", side_effect=AssertionError("must not probe config")):
+    with patch(
+        "transformers.PretrainedConfig.get_config_dict",
+        return_value=({"model_type": "unknown_remote_model"}, {}),
+    ):
         hf_kwargs = _hf_source_load_kwargs(
             {"attn_implementation": "eager"},
             pretrained_model_name_or_path="model-path",
             source_dtype=torch.bfloat16,
             trust_remote_code=True,
             experts_implementation=None,
+            hf_model_cls=AutoModelForCausalLM,
             device=torch.device("cpu"),
             hf_device_map_auto=False,
         )
 
     assert hf_kwargs["attn_implementation"] == "eager"
+
+
+@pytest.mark.parametrize(("supported", "expected"), [(True, "sdpa"), (False, "eager")])
+def test_builtin_attention_implementation_uses_supported_recipe_backend_or_eager(supported, expected):
+    class FakeConfig:
+        pass
+
+    concrete_model_cls = SimpleNamespace(_supports_sdpa=supported)
+    auto_model_cls = SimpleNamespace(_model_mapping={FakeConfig: concrete_model_cls})
+    with patch("transformers.AutoConfig.from_pretrained", return_value=FakeConfig()):
+        implementation = _resolve_hf_attn_implementation(
+            "model-path",
+            "sdpa",
+            hf_model_cls=auto_model_cls,
+            trust_remote_code=False,
+        )
+
+    assert implementation == expected
 
 
 def test_hf_source_load_kwargs_explicit_false_disables_recipe_remote_code():
@@ -441,6 +479,7 @@ def test_hf_source_load_kwargs_explicit_false_disables_recipe_remote_code():
         source_dtype=torch.bfloat16,
         trust_remote_code=False,
         experts_implementation=None,
+        hf_model_cls=AutoModelForCausalLM,
         device=torch.device("cpu"),
         hf_device_map_auto=False,
     )
@@ -455,6 +494,7 @@ def test_hf_source_load_kwargs_passes_grouped_experts_implementation():
         source_dtype=torch.bfloat16,
         trust_remote_code=False,
         experts_implementation="grouped_mm",
+        hf_model_cls=AutoModelForCausalLM,
         device=torch.device("cpu"),
         hf_device_map_auto=False,
     )
@@ -533,6 +573,7 @@ def test_hf_source_load_kwargs_respects_hf_offline(monkeypatch, offline, expecte
         source_dtype=torch.bfloat16,
         trust_remote_code=False,
         experts_implementation=None,
+        hf_model_cls=AutoModelForCausalLM,
         device=torch.device("cpu"),
         hf_device_map_auto=False,
     )
