@@ -12,21 +12,35 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import warnings
 from typing import Any, Callable
 
 
-def calculate_mfu(tflops, world_size, time_seconds, reference_mfu=1979.0):
+def calculate_mfu(
+    tflops: float,
+    world_size: int,
+    time_seconds: float,
+    reference_mfu: float | None = None,
+) -> float:
     """Calculate Model FLOPs Utilization (MFU).
 
     Args:
-        tflops: TFLOPs per GPU
-        world_size: Total number of GPUs
-        time_seconds: Time taken for computation
-        reference_mfu: Peak TFLOPs of the hardware (default: H100)
+        tflops: Total TFLOPs across all devices for the measured step.
+        world_size: Total number of GPUs.
+        time_seconds: Time taken for computation.
+        reference_mfu: Peak TFLOPs/s per device for the training precision. The
+            legacy default is the H100 dense-FP8 peak.
 
     Returns:
-        MFU as a percentage
+        MFU as a percentage.
     """
+    if reference_mfu is None:
+        warnings.warn(
+            "Omitting reference_mfu is deprecated; pass the peak TFLOPs/s for the training precision.",
+            FutureWarning,
+            stacklevel=2,
+        )
+        reference_mfu = 1979.0
     mfu = tflops / (world_size * time_seconds)
     mfu = mfu / reference_mfu
     return mfu * 100
