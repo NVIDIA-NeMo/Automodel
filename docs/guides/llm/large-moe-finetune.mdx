@@ -14,7 +14,7 @@ Mixture-of-Experts (MoE) architectures have become the dominant design for front
 | Step-3.5 Flash | [`stepfun-ai/Step-3.5-Flash`](https://huggingface.co/stepfun-ai/Step-3.5-Flash) | 64 H100 GPUs (8 nodes x 8) |
 | DeepSeek-V3.2 | [`deepseek-ai/DeepSeek-V3.2`](https://huggingface.co/deepseek-ai/DeepSeek-V3.2) | 256 H100 GPUs (32 nodes x 8) |
 
-To set up your environment to run NeMo Automodel, follow the [installation guide](https://github.com/NVIDIA-NeMo/Automodel#-install-nemo-automodel).
+To set up your environment to run NeMo Automodel, follow the [installation guide](/get-started/installation).
 
 ## Data
 
@@ -98,15 +98,18 @@ distributed:
 
 ## Launch Training
 
-NeMo Automodel supports several ways to launch training—via the Automodel CLI with Slurm, interactive sessions, `torchrun`, and more. For full details on all launch options (Slurm batch jobs, multi-node configuration, environment variables, etc.), see the [Run on a Cluster](/job-launchers/slurm-cluster) guide.
+NeMo Automodel supports direct Slurm submission, local interactive runs through the Automodel CLI, and external `torchrun`. For full details on Slurm batch jobs, multi-node configuration, environment variables, and other launch options, see the [Run on a Cluster](/job-launchers/slurm-cluster) guide.
 
 ### Automodel CLI
 
 ```bash
-automodel finetune llm -c examples/llm_finetune/glm/glm_5_hellaswag_pp.yaml
+uv run automodel your_single_node_config.yaml --nproc-per-node 8
 ```
 
-Replace the recipe path with the one for your target model.
+The CLI takes the recipe config as its positional argument. Use this form only
+with a config whose distributed topology fits one node; the four configs above
+use multi-node PP/EP sizes and should be launched through Slurm or external
+`torchrun` as shown below.
 
 ### torchrun
 
@@ -115,17 +118,21 @@ export TRANSFORMERS_OFFLINE=1
 export HF_HOME=your/path/to/hf_cache
 export HF_DATASETS_OFFLINE=1
 export WANDB_API_KEY=your_wandb_key
+export MASTER_ADDR=${MASTER_ADDR:?Set MASTER_ADDR to the rank-0 hostname}
+export MASTER_PORT=${MASTER_PORT:-29500}
 
 torchrun --nproc-per-node=8 \
-         --nnodes=8 \
+         --nnodes=32 \
          --rdzv_backend=c10d \
-         --rdzv_endpoint=${MASTER_ADDR}:${PORT} \
-  nemo_automodel/recipes/llm/benchmark.py \
+         --rdzv_endpoint="${MASTER_ADDR}:${MASTER_PORT}" \
+  -m nemo_automodel.recipes.llm.train_ft \
     -c examples/llm_finetune/glm/glm_5_hellaswag_pp.yaml \
     --model.pretrained_model_name_or_path=/your/local/model_weights
 ```
 
-Replace the `-c` path, `--nnodes`, and `--model.pretrained_model_name_or_path` for the model you want to fine-tune.
+This command uses the GLM-5 config and its `model.pretrained_model_name_or_path`
+field. For another recipe, replace the `-c` path and `--nnodes`, then update the
+model and tokenizer path fields defined by that YAML.
 
 **Before you start**:
 - Hugging Face applies rate limits on downloads. We recommend cloning the model repository to your local filesystem beforehand.

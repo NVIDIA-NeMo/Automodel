@@ -13,7 +13,11 @@
 # limitations under the License.
 
 import json
+import logging
+import math
 import os
+import re
+import stat
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -21,6 +25,23 @@ from typing import Any
 import torch
 import torch.nn as nn
 from transformers.modeling_utils import _get_resolved_checkpoint_files, load_state_dict
+
+from nemo_automodel.shared.tied_weights import (
+    ensure_tied_lm_head as ensure_tied_lm_head,
+)
+from nemo_automodel.shared.tied_weights import (
+    get_input_embeddings_weight_and_name,
+    get_lm_head_weight_and_name,
+    is_tied_word_embeddings,
+)
+from nemo_automodel.shared.tied_weights import (
+    has_local_tied_lm_head as has_local_tied_lm_head,
+)
+
+logger = logging.getLogger(__name__)
+_AUTOMODEL_CHECKPOINT_RE = re.compile(r"^epoch_\d+_step_(\d+)$")
+_CHECKPOINT_STEP_RE = re.compile(r"step_(\d+)$")
+_INCOMPLETE_CHECKPOINT_MARKER = ".incomplete"
 
 
 def get_rank_safe() -> int:
@@ -85,6 +106,285 @@ def format_output_file_count(count: int) -> str:
     return f"{count} output {'file' if count == 1 else 'files'}"
 
 
+def _checkpoint_step_num(path: Path) -> int:
+    """Return the trailing checkpoint step number, or -1 when the name is not a checkpoint."""
+    match = _CHECKPOINT_STEP_RE.search(path.name)
+    return int(match.group(1)) if match else -1
+
+
+def _list_existing_checkpoints(ckpt_root: Path) -> list[Path]:
+    """Return existing checkpoint directories whose names end in ``step_<N>``."""
+    if not ckpt_root.exists():
+        return []
+    checkpoints = [path for path in ckpt_root.glob("*step_*") if path.is_dir() and not path.is_symlink()]
+    return sorted((path for path in checkpoints if _checkpoint_step_num(path) >= 0), key=_checkpoint_step_num)
+
+
+def list_automodel_checkpoints(ckpt_root: Path) -> list[Path]:
+    """Return canonical AutoModel ``epoch_<E>_step_<S>`` checkpoint directories."""
+    return [path for path in _list_existing_checkpoints(ckpt_root) if _AUTOMODEL_CHECKPOINT_RE.fullmatch(path.name)]
+
+
+def is_cloud_path(path: str | Path) -> bool:
+    """Check if path is a cloud storage path (MSC)."""
+    return os.fspath(path).startswith("msc://")
+
+
+def mark_checkpoint_incomplete(checkpoint_dir: str | Path) -> None:
+    """Mark a checkpoint directory as still being written.
+
+    A save that is interrupted (wall-clock limit, preemption, OOM) leaves the
+    directory behind with only some of its components written. The marker makes
+    that state observable so a resumed run neither loads nor retains it; it is
+    removed by :func:`clear_checkpoint_incomplete` once the checkpoint is
+    published.
+
+    Args:
+        checkpoint_dir: Directory of the checkpoint being written.
+    """
+    (Path(checkpoint_dir) / _INCOMPLETE_CHECKPOINT_MARKER).touch(exist_ok=True)
+
+
+def clear_checkpoint_incomplete(checkpoint_dir: str | Path) -> None:
+    """Clear the marker written by :func:`mark_checkpoint_incomplete`.
+
+    Args:
+        checkpoint_dir: Directory of the checkpoint that finished writing.
+    """
+    (Path(checkpoint_dir) / _INCOMPLETE_CHECKPOINT_MARKER).unlink(missing_ok=True)
+
+
+def is_checkpoint_incomplete(checkpoint_dir: str | Path) -> bool:
+    """Return whether a checkpoint directory was left behind by an interrupted save.
+
+    Args:
+        checkpoint_dir: Directory to inspect.
+
+    Returns:
+        True when the in-progress marker is still present.
+    """
+    return (Path(checkpoint_dir) / _INCOMPLETE_CHECKPOINT_MARKER).exists()
+
+
+def _resolve_checkpoint_pointer_target(ckpt_root: Path, raw_target: str) -> Path | None:
+    """Resolve a checkpoint pointer target relative to ckpt_root."""
+    if not raw_target:
+        return None
+    target = Path(raw_target)
+    if not target.is_absolute():
+        target = ckpt_root / target
+    return Path(os.path.abspath(target))
+
+
+def read_checkpoint_pointer(ckpt_root: str | Path, link_name: str) -> Path | None:
+    """Resolve a checkpoint pointer symlink or fallback text file."""
+    root = Path(ckpt_root)
+    link_path = root / link_name
+    raw_target = None
+    if os.path.islink(link_path):
+        try:
+            raw_target = os.readlink(link_path)
+        except OSError:
+            pass
+    elif os.path.isfile(f"{link_path}.txt"):
+        try:
+            with open(f"{link_path}.txt", "r") as f:
+                raw_target = f.read().strip()
+        except (OSError, UnicodeError):
+            pass
+
+    return _resolve_checkpoint_pointer_target(root, raw_target) if raw_target else None
+
+
+def _checkpoint_contains_target(checkpoint: Path, target: Path) -> bool:
+    """Return whether target points at or inside checkpoint."""
+    checkpoint_abs = Path(os.path.abspath(checkpoint))
+    target_abs = Path(os.path.abspath(target))
+    return target_abs == checkpoint_abs or checkpoint_abs in target_abs.parents
+
+
+def read_checkpoint_metric(checkpoint: Path, metric_key: str | None) -> float | None:
+    """Read a validation metric from checkpoint loss metadata."""
+    try:
+        with open(checkpoint / "losses.json", "r") as f:
+            losses = json.load(f)
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(losses, Mapping):
+        return None
+
+    candidate_keys = []
+    if metric_key is not None:
+        candidate_keys.append(metric_key)
+    candidate_keys.extend(["val_loss", "default"])
+
+    for key in candidate_keys:
+        if key not in losses:
+            continue
+        try:
+            value = float(losses[key])
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if math.isfinite(value):
+            return value
+    return None
+
+
+def _is_checkpoint_pointer_text_file(path: Path, mode: int) -> bool:
+    """Return whether path looks like a symlink fallback checkpoint pointer."""
+    return stat.S_ISREG(mode) and path.suffix == ".txt" and path.stem.isupper()
+
+
+def find_pointer_protected_checkpoints(ckpt_root: Path, checkpoints: list[Path]) -> set[Path]:
+    """Return checkpoints targeted by top-level symlinks or symlink fallback text files."""
+    protected = set()
+    if not ckpt_root.exists():
+        return protected
+
+    entries = list(ckpt_root.iterdir())
+
+    for entry in entries:
+        raw_target = None
+        entry_mode = entry.lstat().st_mode
+        if stat.S_ISLNK(entry_mode):
+            raw_target = os.readlink(entry)
+        elif _is_checkpoint_pointer_text_file(entry, entry_mode):
+            raw_target = entry.read_text().strip()
+
+        target = _resolve_checkpoint_pointer_target(ckpt_root, raw_target) if raw_target else None
+        if target is None:
+            continue
+        for checkpoint in checkpoints:
+            if _checkpoint_contains_target(checkpoint, target):
+                protected.add(checkpoint)
+                break
+    return protected
+
+
+def resolve_restore_from_to_checkpoint_dir(checkpoint_dir: str | Path, restore_from: str) -> str | None:
+    """
+    Resolve restore_from to a checkpoint directory.
+
+    Returns:
+        - str: resolved checkpoint directory
+        - None: if restore_from='LATEST' but no checkpoint found (caller should start fresh)
+
+    Raises:
+        RuntimeError: If restore_from selects a checkpoint that an interrupted save
+            left incomplete.
+    """
+    # Handle checkpoint-root pointers such as LATEST and LOWEST_VAL. A pointer whose
+    # target an interrupted save left incomplete is not resumable. LATEST falls back
+    # to the most recent complete checkpoint below; any other pointer raises, because
+    # falling through would return the pointer path itself, which resolves straight
+    # back to the incomplete target.
+    if os.path.sep not in restore_from and not os.path.isabs(restore_from):
+        pointed_checkpoint = read_checkpoint_pointer(checkpoint_dir, restore_from)
+        if pointed_checkpoint is not None and pointed_checkpoint.is_dir():
+            if not is_checkpoint_incomplete(pointed_checkpoint):
+                return os.fspath(pointed_checkpoint)
+            if restore_from.upper() != "LATEST":
+                raise RuntimeError(
+                    f"checkpoint.restore_from={restore_from!r} points at {pointed_checkpoint}, which an "
+                    "interrupted save left incomplete. Set checkpoint.restore_from to a complete "
+                    "checkpoint directory, or remove the pointer to fall back to the most recent one."
+                )
+            logger.warning(
+                "checkpoint.restore_from=%r points at %s, which an interrupted save left incomplete; "
+                "falling back to the most recent complete checkpoint",
+                restore_from,
+                pointed_checkpoint,
+            )
+    if restore_from.upper() == "LATEST":
+        return find_latest_checkpoint(checkpoint_dir)
+
+    # If restore_from is just a directory name (no path separator), treat it as
+    # relative to checkpoint_dir. Otherwise use as-is (absolute or relative path).
+    if os.path.sep not in restore_from and not os.path.isabs(restore_from):
+        resolved_checkpoint = os.path.join(checkpoint_dir, restore_from)
+    else:
+        resolved_checkpoint = restore_from
+
+    if is_checkpoint_incomplete(resolved_checkpoint):
+        raise RuntimeError(
+            f"checkpoint.restore_from={restore_from!r} resolves to {resolved_checkpoint}, which an interrupted "
+            "save left incomplete. Set checkpoint.restore_from to a complete checkpoint directory."
+        )
+    return resolved_checkpoint
+
+
+def format_missing_checkpoint_dir_error(checkpoint_dir: str, restore_from: str, resolved_ckpt_dir: str) -> str:
+    """Format a helpful error message for a missing checkpoint directory."""
+    error_msg = [
+        f"\n{'=' * 80}",
+        "ERROR: Checkpoint directory does not exist",
+        f"{'=' * 80}",
+        f"Specified: checkpoint.restore_from: '{restore_from}'",
+        f"Resolved to: {resolved_ckpt_dir}",
+        "",
+        "Please check:",
+        "  1. The checkpoint directory exists",
+        f"  2. The path is correct (restore_from: '{restore_from}')",
+        f"  3. Available checkpoints in {checkpoint_dir}:",
+    ]
+
+    ckpt_root = Path(checkpoint_dir)
+    available_ckpts = _list_existing_checkpoints(ckpt_root)
+    if available_ckpts:
+        error_msg += [f"       {', '.join([p.name for p in available_ckpts[:5]])}"]
+        if len(available_ckpts) > 5:
+            error_msg += [f"       ... and {len(available_ckpts) - 5} more"]
+    else:
+        error_msg += (
+            ["       (no checkpoints found)"] if ckpt_root.exists() else ["       (checkpoint_dir does not exist)"]
+        )
+
+    error_msg += [f"{'=' * 80}"]
+    return "\n".join(error_msg)
+
+
+def find_latest_checkpoint(checkpoint_dir: str | Path) -> str | Path | None:
+    """
+    Resolve the most recent checkpoint directory.
+
+    Preference order:
+      1) Valid LATEST symlink or txt file under checkpoint_dir
+      2) Highest step directory under checkpoint_dir whose name ends in ``step_<N>``
+
+    Directories left behind by an interrupted save are skipped at both steps.
+    The LATEST target needs the same filter as the step scan: re-saving a step
+    whose directory LATEST already points at leaves the pointer aimed at a
+    directory that is being rewritten, so an interruption there would otherwise
+    resume from a partially written checkpoint.
+
+    Returns:
+        Path (or str) of the latest checkpoint directory, or None.
+    """
+    root = Path(checkpoint_dir)
+    if not root.exists():
+        return
+
+    latest = read_checkpoint_pointer(root, "LATEST")
+    if latest is not None and latest.is_dir():
+        if not is_checkpoint_incomplete(latest):
+            return os.fspath(latest)
+        logger.warning(
+            "LATEST points at %s, which an interrupted save left incomplete; "
+            "falling back to the most recent complete checkpoint",
+            latest,
+        )
+
+    checkpoint_files = [path for path in _list_existing_checkpoints(root) if not is_checkpoint_incomplete(path)]
+    if not checkpoint_files:
+        return
+
+    latest = max(checkpoint_files, key=_checkpoint_step_num)
+    if _checkpoint_step_num(latest) == -1:
+        return
+
+    return latest
+
+
 def resolve_trust_remote_code(pretrained_model_name_or_path):
     """
     Whitelist NVIDIA models to allow remote code execution.
@@ -99,85 +399,6 @@ def resolve_trust_remote_code(pretrained_model_name_or_path):
         return False
     # pretrained_model_name_or_path can be something like nvidia/NVIDIA-Nemotron-Nano-9B-v2
     return not os.path.isdir(pretrained_model_name_or_path) and pretrained_model_name_or_path.startswith("nvidia/")
-
-
-def is_tied_word_embeddings(model: nn.Module) -> bool:
-    """
-    Check if the model's word embeddings are tied.
-
-    Args:
-        model (nn.Module): The model to check.
-
-    Returns:
-        bool: True if the model's word embeddings are tied, False otherwise.
-    """
-    non_tied_lm_head_models = {
-        "Qwen3OmniMoeThinkerForConditionalGeneration",  # complicated config structure
-        "Qwen3VLMoeForConditionalGeneration",  # top-level lm_head is untied despite nested text config
-    }
-    model_class_name = type(model).__name__
-    for m in non_tied_lm_head_models:
-        if m in model_class_name:
-            return False
-    config = getattr(model, "config", None)
-    text_config = getattr(config, "get_text_config", lambda: None)()
-    return bool(getattr(text_config, "tie_word_embeddings", getattr(config, "tie_word_embeddings", False)))
-
-
-def _normalize_param_name(name: str) -> str:
-    """Strip wrapper-specific prefixes from a parameter name."""
-    return name.replace("_orig_mod.", "")
-
-
-def get_lm_head_weight_and_name(model: nn.Module) -> tuple[torch.Tensor | None, str | None]:
-    """Return the first ``lm_head.weight`` parameter found on a model.
-
-    Args:
-        model: Model to inspect.
-
-    Returns:
-        Tuple of the parameter tensor and its normalized FQN, or ``(None, None)``
-        when the model has no LM head weight.
-    """
-    for name, param in model.named_parameters(remove_duplicate=False):
-        normalized_name = _normalize_param_name(name)
-        if "lm_head" in normalized_name and normalized_name.endswith(".weight"):
-            return param, normalized_name
-    return None, None
-
-
-def get_input_embeddings_weight_and_name(model: nn.Module) -> tuple[torch.Tensor | None, str | None]:
-    """Return the input embedding weight and normalized name if present.
-
-    Args:
-        model: Model to inspect.
-
-    Returns:
-        Tuple of the embedding weight tensor and its normalized FQN, or
-        ``(None, None)`` when the current model partition does not own the input
-        embedding.
-    """
-    get_input_embeddings = getattr(model, "get_input_embeddings", None)
-    if callable(get_input_embeddings):
-        try:
-            input_embeddings = get_input_embeddings()
-        except Exception:
-            input_embeddings = None
-        if input_embeddings is not None and hasattr(input_embeddings, "weight"):
-            for name, param in model.named_parameters(remove_duplicate=False):
-                if param is input_embeddings.weight:
-                    return param, _normalize_param_name(name)
-
-    candidate_suffixes = (
-        "embed_tokens.weight",
-        "language_model.embed_tokens.weight",
-        "model.language_model.embed_tokens.weight",
-    )
-    for name, param in model.named_parameters(remove_duplicate=False):
-        normalized_name = _normalize_param_name(name)
-        if normalized_name.endswith(candidate_suffixes):
-            return param, normalized_name
-    return None, None
 
 
 def get_tied_lm_head_source_names(model: nn.Module, lm_head_param_name: str | None = None) -> list[str]:
@@ -232,50 +453,6 @@ def get_tied_lm_head_source_names(model: nn.Module, lm_head_param_name: str | No
         seen_source_names.add(source_name)
         deduped_source_names.append(source_name)
     return deduped_source_names
-
-
-def has_local_tied_lm_head(model: nn.Module) -> bool:
-    """Return whether the current model partition can locally satisfy a tied LM head.
-
-    This is intentionally stricter than ``is_tied_word_embeddings()``: pipeline
-    stages often keep the config flag set to ``True`` even though ``lm_head`` and
-    ``embed_tokens`` live on different partitions and therefore cannot be
-    reconstructed from each other locally.
-
-    Note: we purposefully do NOT check ``lm_head.weight is embed_tokens.weight``.
-    After FSDP/TP sharding both are wrapped into separate ``DTensor``s and the
-    ``is``-identity is broken, but HF's ``tie_weights()`` can still relink them
-    locally on load. The only case we actually need to distinguish is "is the
-    embedding source present on this partition at all?", which answers "can we
-    safely omit ``lm_head.weight`` during save and rematerialize on load?".
-
-    Args:
-        model: Model or pipeline stage to inspect.
-
-    Returns:
-        ``True`` when the model is configured with tied word embeddings AND
-        both the local ``lm_head`` and the input embedding live on this
-        partition. ``False`` when the config isn't tied, or when the local
-        partition is missing one of the two (typical for PP non-last / non-first
-        stages).
-    """
-    if not is_tied_word_embeddings(model):
-        return False
-    lm_head_weight, _ = get_lm_head_weight_and_name(model)
-    input_embeddings_weight, _ = get_input_embeddings_weight_and_name(model)
-    if lm_head_weight is None or input_embeddings_weight is None:
-        return False
-    # Even when ``config.tie_word_embeddings`` is ``True``, refuse to treat
-    # the two as locally tied if their shapes disagree. This handles
-    # speculative-decoding draft models that intentionally keep a
-    # full-vocab ``embed_tokens`` but a shrunk-vocab ``lm_head`` (e.g.
-    # EAGLE-3 with ``draft_vocab_size < target_vocab_size``). Without this
-    # check the save path would drop ``lm_head.weight`` from the state
-    # dict and the load path would resurrect it from ``embed_tokens``,
-    # producing a strict-load shape mismatch on resume.
-    if tuple(lm_head_weight.shape) != tuple(input_embeddings_weight.shape):
-        return False
-    return True
 
 
 def materialize_missing_tied_lm_head(

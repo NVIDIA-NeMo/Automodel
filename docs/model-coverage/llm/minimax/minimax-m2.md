@@ -41,17 +41,12 @@
 
 ## Try with NeMo AutoModel
 
-**1. Install** ([full instructions](../../../guides/installation.mdx)):
-
-```bash
-pip install nemo-automodel
-```
-
-**2. Clone the repo** to get the example recipes:
+**1. Clone and install from source** ([full instructions](/get-started/installation)):
 
 ```bash
 git clone https://github.com/NVIDIA-NeMo/Automodel.git
 cd Automodel
+uv sync --locked --all-groups --all-extras
 ```
 
 <Note>
@@ -59,10 +54,10 @@ This recipe was validated on **8 nodes × 8 GPUs (64 H100s)**. See the [Launcher
 
 </Note>
 
-**3. Run the recipe** from inside the repo:
+**2. Run the recipe** from inside the repo:
 
 ```bash
-automodel --nproc-per-node=8 examples/llm_finetune/minimax_m2/minimax_m2.1_hellaswag_pp.yaml
+uv run automodel --nproc-per-node=8 examples/llm_finetune/minimax_m2/minimax_m2.1_hellaswag_pp.yaml
 ```
 
 <Accordion title="Run with Docker">
@@ -72,7 +67,7 @@ automodel --nproc-per-node=8 examples/llm_finetune/minimax_m2/minimax_m2.1_hella
 docker run --gpus all -it --rm \
   --shm-size=8g \
   -v $(pwd)/checkpoints:/opt/Automodel/checkpoints \
-  nvcr.io/nvidia/nemo-automodel:26.02.00
+  nvcr.io/nvidia/nemo-automodel:26.06.00
 ```
 
 **2.** Navigate to the AutoModel directory (where the recipes are):

@@ -17,16 +17,21 @@
 
 name: Fern docs (check)
 
-# Triggers on push to mirrored PR branches (`pull-request/<n>`) created by the
-# FW-CI mirror bot. This runs in the trusted base-repo context, so
-# DOCS_FERN_TOKEN is available even for fork PRs.
+# Runs `fern check` on every push to a `pull-request/<n>` branch -- i.e. whenever
+# `/ok to test <sha>` is posted: copy-pr-bot copies the PR onto pull-request/<n>
+# and pushes it, which fires this (exactly like the main `CICD NeMo` pipeline).
+#
+# Deliberately NO `paths:` filter. GitHub evaluates a push `paths:` filter against
+# the branch-creation diff, which is unreliable for the first push copy-pr-bot
+# makes to a brand-new pull-request/<n> branch, so a docs-only PR can skip a
+# path-filtered check entirely -- that is how a malformed nightly.yml slipped past
+# CI and broke the publish on main. cicd-main.yml omits the filter for the same
+# reason. `fern check` is ~25s and needs no secrets, so running it on every mirror
+# push is cheap and safe.
 on:
   push:
     branches:
       - "pull-request/[0-9]+"
-    paths:
-      - 'docs/**'
-      - '.github/workflows/fern-docs-ci.yml'
 
 permissions:
   contents: read
@@ -36,7 +41,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
 
       # `fern check` validates that every path: referenced by docs.yml / the
       # version YAMLs exists on disk. The frozen v0.4 pages are archived off main,
@@ -46,11 +53,23 @@ jobs:
         with:
           archived-versions: |
             v0.4=docs-archive
+            v0.5=docs-archive
 
       - name: Setup Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: '20'
+
+      - name: Generate model coverage tables
+        run: python3 tests/ci_tests/utils/sync_model_coverage_tables.py
+
+      - name: Validate MDX syntax
+        run: |
+          mdx_lint_dir="${RUNNER_TEMP}/mdx-lint"
+          mkdir -p "$mdx_lint_dir"
+          printf '%s\n' '{"private":true,"type":"module"}' > "$mdx_lint_dir/package.json"
+          npm --prefix "$mdx_lint_dir" install --silent @mdx-js/mdx@3 remark-frontmatter@5 remark-math@6 >/dev/null
+          MDX_LINT_PREFIX="$mdx_lint_dir" node tools/validate_mdx_syntax.mjs docs
 
       - name: Validate Fern configuration
         working-directory: ./docs/fern

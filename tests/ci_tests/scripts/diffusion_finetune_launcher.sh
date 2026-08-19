@@ -18,6 +18,9 @@ set -euo pipefail
 #   CONFIG_PATH, TEST_LEVEL, NPROC_PER_NODE, TEST_NODE_COUNT,
 #   MASTER_ADDR, MASTER_PORT, SLURM_JOB_ID, PIPELINE_DIR, TEST_NAME
 
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+source "$SCRIPT_DIR/diffusion_finetune_recipe_config.sh"
+
 DATA_DIR="$PIPELINE_DIR/$TEST_NAME/data"
 CKPT_DIR="$PIPELINE_DIR/$TEST_NAME/checkpoint"
 INFER_DIR="$PIPELINE_DIR/$TEST_NAME/inference_output"
@@ -28,42 +31,7 @@ cd /opt/Automodel
 # Derive model-specific settings from config
 # ============================================
 RECIPE_NAME=$(basename "$CONFIG_PATH" .yaml)
-case "$RECIPE_NAME" in
-    wan2_1_t2v_flow*)
-        MEDIA_TYPE="video"
-        PROCESSOR="wan"
-        GENERATE_CONFIG="examples/diffusion/generate/configs/generate_wan.yaml"
-        MODEL_NAME="Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
-        INFER_NUM_FRAMES=9
-        PREPROCESS_EXTRA_ARGS=""
-        ;;
-    hunyuan_t2v_flow*)
-        MEDIA_TYPE="video"
-        PROCESSOR="hunyuan"
-        GENERATE_CONFIG="examples/diffusion/generate/configs/generate_hunyuan.yaml"
-        MODEL_NAME="hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v"
-        INFER_NUM_FRAMES=5
-        PREPROCESS_EXTRA_ARGS="--target_frames 13"
-        ;;
-    flux_t2i_flow*)
-        MEDIA_TYPE="image"
-        PROCESSOR="flux"
-        GENERATE_CONFIG="examples/diffusion/generate/configs/generate_flux.yaml"
-        MODEL_NAME="black-forest-labs/FLUX.1-dev"
-        PREPROCESS_EXTRA_ARGS=""
-        ;;
-    qwen_image_t2i_flow*)
-        MEDIA_TYPE="image"
-        PROCESSOR="qwen_image"
-        GENERATE_CONFIG="examples/diffusion/generate/configs/generate_qwen_image.yaml"
-        MODEL_NAME="Qwen/Qwen-Image"
-        PREPROCESS_EXTRA_ARGS=""
-        ;;
-    *)
-        echo "ERROR: Unknown recipe '$RECIPE_NAME'. Add a case to diffusion_finetune_launcher.sh."
-        exit 1
-        ;;
-esac
+configure_diffusion_finetune_recipe "$RECIPE_NAME"
 
 # LoRA recipes are named *_lora.yaml — they save PEFT adapter artifacts
 # (adapter_model.safetensors + adapter_config.json) that generate.py loads via
@@ -73,6 +41,9 @@ if [[ "$RECIPE_NAME" == *_lora ]]; then
     IS_LORA=true
 fi
 echo "[config] Recipe=$RECIPE_NAME  MediaType=$MEDIA_TYPE  Processor=$PROCESSOR  Model=$MODEL_NAME  LoRA=$IS_LORA"
+
+# Video decodes via imageio-ffmpeg (opt-in diffusion-media extra, kept out of the image).
+DIFFUSION_EXTRAS="--extra diffusion --extra diffusion-media"
 
 # ============================================
 # Stage 1: Download dataset
@@ -84,9 +55,13 @@ echo "[config] Recipe=$RECIPE_NAME  MediaType=$MEDIA_TYPE  Processor=$PROCESSOR 
 echo "============================================"
 echo "[data] Resolving dataset..."
 echo "============================================"
-if [ "$MEDIA_TYPE" = "image" ]; then
+if [ "$MEDIA_TYPE" = "image_edit" ]; then
+    # The image-edit preprocess CLI resolves its HF dataset itself (via
+    # HF_HOME), so there is no separate download stage.
+    echo "[data] image-edit dataset is resolved by the preprocess stage"
+elif [ "$MEDIA_TYPE" = "image" ]; then
     RAW_DATA_DIR="$DATA_DIR/raw"
-    uv run --extra diffusion python -c "
+    uv run $DIFFUSION_EXTRAS python -c "
 from datasets import load_dataset
 from pathlib import Path
 import json
@@ -109,7 +84,7 @@ with open(jsonl_path, 'w') as jf:
 print(f'Extracted {len(ds)} images to {out_dir}')
 "
 else
-    RAW_DATA_DIR=$(uv run --extra diffusion python -c "
+    RAW_DATA_DIR=$(uv run $DIFFUSION_EXTRAS python -c "
 from huggingface_hub import snapshot_download
 print(snapshot_download('modal-labs/dissolve', repo_type='dataset'))
 " | tail -n 1)
@@ -122,14 +97,20 @@ fi
 echo "============================================"
 echo "[preprocess] Converting ${MEDIA_TYPE}s to latents..."
 echo "============================================"
-if [ "$MEDIA_TYPE" = "image" ]; then
-    uv run --extra diffusion python -m tools.diffusion.preprocessing_multiprocess image \
+if [ "$MEDIA_TYPE" = "image_edit" ]; then
+    uv run $DIFFUSION_EXTRAS python -m tools.diffusion.preprocessing_multiprocess image-edit \
+        --output_dir "$DATA_DIR/cache" \
+        --processor "$PROCESSOR" \
+        --model_name "$MODEL_NAME" \
+        $PREPROCESS_EXTRA_ARGS
+elif [ "$MEDIA_TYPE" = "image" ]; then
+    uv run $DIFFUSION_EXTRAS python -m tools.diffusion.preprocessing_multiprocess image \
         --image_dir "$RAW_DATA_DIR" \
         --output_dir "$DATA_DIR/cache" \
         --processor "$PROCESSOR" \
         $PREPROCESS_EXTRA_ARGS
 else
-    uv run --extra diffusion python -m tools.diffusion.preprocessing_multiprocess video \
+    uv run $DIFFUSION_EXTRAS python -m tools.diffusion.preprocessing_multiprocess video \
         --video_dir "$RAW_DATA_DIR" \
         --output_dir "$DATA_DIR/cache" \
         --processor "$PROCESSOR" \
@@ -144,16 +125,26 @@ fi
 echo "============================================"
 echo "[finetune] Running finetuning..."
 echo "============================================"
+# The recipe rejects configs that contain both 'fsdp' and 'ddp' sections, and
+# a --fsdp.* CLI override injects an 'fsdp' section. Only pass it for FSDP
+# recipes; DDP replicates across all ranks and needs no dp_size.
+DIST_OVERRIDE="--fsdp.dp_size ${NPROC_PER_NODE}"
+if grep -qE '^ddp:' "/opt/Automodel/${CONFIG_PATH}"; then
+    DIST_OVERRIDE=""
+fi
+
 CONFIG="--config /opt/Automodel/${CONFIG_PATH} \
+    --model.pretrained_model_name_or_path $MODEL_NAME \
     --data.dataloader.cache_dir $DATA_DIR/cache \
     --checkpoint.checkpoint_dir $CKPT_DIR \
     --step_scheduler.max_steps ${MAX_STEPS:-100} \
     --step_scheduler.ckpt_every_steps 100 \
     --step_scheduler.save_checkpoint_every_epoch false \
-    --fsdp.dp_size ${NPROC_PER_NODE} \
+    --lr_scheduler.lr_warmup_steps ${LR_WARMUP_STEPS:-10} \
+    ${DIST_OVERRIDE} \
     --wandb.mode disabled"
 
-CMD="uv run --extra diffusion torchrun --nproc-per-node=${NPROC_PER_NODE} \
+CMD="uv run $DIFFUSION_EXTRAS torchrun --nproc-per-node=${NPROC_PER_NODE} \
               --nnodes=${TEST_NODE_COUNT} \
               --rdzv_backend=c10d \
               --rdzv_endpoint=${MASTER_ADDR}:${MASTER_PORT} \
@@ -178,15 +169,27 @@ if [ "$IS_LORA" = "true" ]; then
     CKPT_FLAG="--model.lora_weights"
     CKPT_STEP_DIR="$CKPT_STEP_DIR/model"
 else
-    CKPT_FLAG="--model.checkpoint"
+    # Two-transformer pipelines (Wan2.2) reject --model.checkpoint; their recipe
+    # config sets CKPT_FLAG_OVERRIDE to the stage flag matching model.stage and
+    # GENERATE_EXTRA_ARGS to reset the other stage to hub-pretrained weights.
+    CKPT_FLAG="${CKPT_FLAG_OVERRIDE:---model.checkpoint}"
 fi
 
-if [ "$MEDIA_TYPE" = "image" ]; then
-    uv run --extra diffusion python examples/diffusion/generate/generate.py \
+if [ "$MEDIA_TYPE" = "image" ] || [ "$MEDIA_TYPE" = "image_edit" ]; then
+    # Edit pipelines require one source image per prompt; reuse a source image
+    # materialized by the image-edit preprocess stage.
+    INPUT_IMAGES_OVERRIDE=""
+    if [ "$MEDIA_TYPE" = "image_edit" ]; then
+        # -print -quit avoids a SIGPIPE from `find | head` under pipefail.
+        SOURCE_IMAGE=$(find "$DATA_DIR/cache/_hf_dataset" \( -name '*.png' -o -name '*.jpg' \) -print -quit)
+        INPUT_IMAGES_OVERRIDE="--inference.input_images [\"$SOURCE_IMAGE\"]"
+    fi
+    uv run $DIFFUSION_EXTRAS python examples/diffusion/generate/generate.py \
         --config "$GENERATE_CONFIG" \
         --model.pretrained_model_name_or_path "$MODEL_NAME" \
         $CKPT_FLAG "$CKPT_STEP_DIR" \
         --inference.num_inference_steps 5 \
+        $INPUT_IMAGES_OVERRIDE \
         --output.output_dir "$INFER_DIR" \
         --vae.enable_slicing true \
         --vae.enable_tiling true
@@ -198,10 +201,11 @@ if [ "$MEDIA_TYPE" = "image" ]; then
         exit 1
     fi
 else
-    uv run --extra diffusion python examples/diffusion/generate/generate.py \
+    uv run $DIFFUSION_EXTRAS python examples/diffusion/generate/generate.py \
         --config "$GENERATE_CONFIG" \
         --model.pretrained_model_name_or_path "$MODEL_NAME" \
         $CKPT_FLAG "$CKPT_STEP_DIR" \
+        ${GENERATE_EXTRA_ARGS:-} \
         --inference.num_inference_steps 5 \
         --inference.pipeline_kwargs.num_frames "$INFER_NUM_FRAMES" \
         --output.output_dir "$INFER_DIR" \

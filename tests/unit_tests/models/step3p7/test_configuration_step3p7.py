@@ -156,3 +156,16 @@ def test_step3p7_config_accepts_dicts_and_existing_text_config():
     assert reused.text_config is text_config
     assert text_config.rope_scaling["type"] == "linear"
     assert text_config.rope_scaling["factor"] == 2.0
+
+
+def test_step3p7_config_yarn_without_original_max_position_embeddings():
+    """Regression for NVBug 6333464: a minimal yarn rope_scaling (no
+    ``original_max_position_embeddings``) must still construct, with the key
+    defaulted from the text config's ``max_position_embeddings``."""
+    config = Step3p7Config(
+        text_config={"hidden_size": 16, "max_position_embeddings": 4096},
+        rope_scaling={"rope_type": "yarn", "factor": 2.0},
+    )
+    assert config.rope_scaling["rope_type"] == "yarn"
+    assert config.rope_scaling["factor"] == 2.0
+    assert config.rope_scaling["original_max_position_embeddings"] == 4096

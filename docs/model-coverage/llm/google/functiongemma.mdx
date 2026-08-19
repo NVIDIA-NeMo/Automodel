@@ -1,0 +1,30 @@
+---
+title: "FunctionGemma"
+description: "Supported FunctionGemma checkpoint and NeMo AutoModel function-calling recipe."
+slug: model-coverage/large-language-models/google/functiongemma
+---
+
+[FunctionGemma](https://huggingface.co/google/functiongemma-270m-it) is a compact Gemma model specialized for function calling.
+
+<Info>
+
+| | |
+|---|---|
+| **Task** | Function Calling / Text Generation |
+| **Architecture** | `Gemma3ForCausalLM` |
+| **Parameters** | 270M |
+| **HF Org** | [google](https://huggingface.co/google) |
+
+</Info>
+
+## Example Model and Recipe
+
+| Model | Recipe |
+|---|---|
+| [`google/functiongemma-270m-it`](https://huggingface.co/google/functiongemma-270m-it) | [xLAM function-calling SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gemma/functiongemma_xlam.yaml) |
+
+```bash
+uv run automodel --nproc-per-node=8 examples/llm_finetune/gemma/functiongemma_xlam.yaml
+```
+
+See the [FunctionGemma Fine-Tuning Guide](/recipes-e2e-examples/function-calling).

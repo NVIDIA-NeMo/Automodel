@@ -14,19 +14,22 @@
 
 from unittest.mock import patch
 
+import pytest
 import torch
 from transformers import AutoConfig, AutoModel
 from transformers.modeling_outputs import BaseModelOutputWithPast
 
+from nemo_automodel._transformers.model_init import _resolve_custom_model_cls_for_config
 from nemo_automodel.components.models.mistral3 import model as mistral_mod
 from nemo_automodel.components.models.mistral3.model import (
     Ministral3Config,
     Ministral3ForCausalLM,
     Ministral3Model,
 )
+from nemo_automodel.components.models.mistral3.state_dict_adapter import Mistral3FP8StateDictAdapter
 
 
-def tiny_config() -> Ministral3Config:
+def tiny_config(**overrides) -> Ministral3Config:
     cfg = Ministral3Config(
         vocab_size=32,
         hidden_size=16,
@@ -37,6 +40,7 @@ def tiny_config() -> Ministral3Config:
         head_dim=8,
         max_position_embeddings=64,
         attention_dropout=0.0,
+        **overrides,
     )
     # Ensure eager attention path in tests to avoid optional backends.
     cfg._attn_implementation = "eager"
@@ -60,6 +64,21 @@ class TestConfigAndAutoIntegration:
         lm = mistral_mod.AutoModelForCausalLM.from_config(cfg)  # type: ignore[attr-defined]
         # May return transformers or nemo_automodel version, check by class name
         assert type(lm).__name__ == "Ministral3ForCausalLM"
+
+    def test_fp8_devstral_config_resolves_streaming_custom_model(self):
+        cfg = tiny_config(
+            architectures=["Ministral3ForCausalLM"],
+            quantization_config={
+                "quant_method": "fp8",
+                "dequantize": False,
+                "weight_block_size": None,
+            },
+        )
+
+        model_cls = _resolve_custom_model_cls_for_config(cfg)
+
+        assert model_cls is Ministral3ForCausalLM
+        assert isinstance(model_cls(cfg).state_dict_adapter, Mistral3FP8StateDictAdapter)
 
 
 class TestMinistral3Model:
@@ -86,6 +105,11 @@ class TestMinistral3Model:
 
 
 class TestMinistral3ForCausalLM:
+    def test_rejects_tied_word_embeddings(self):
+        # UNTIED_ONLY: the guard raises at the top of __init__ before construction.
+        with pytest.raises(NotImplementedError, match="does not support tie_word_embeddings=True"):
+            Ministral3ForCausalLM(tiny_config(tie_word_embeddings=True))
+
     def test_forward_emits_logits(self):
         cfg = tiny_config()
         model = Ministral3ForCausalLM(cfg)
@@ -99,6 +123,39 @@ class TestMinistral3ForCausalLM:
 
         assert outputs.logits.shape == (batch, seq_len, cfg.vocab_size)
         mock_forward.assert_called_once()
+
+    @pytest.mark.parametrize("dequantize", [False, True])
+    def test_per_tensor_fp8_checkpoint_attaches_streaming_adapter(self, dequantize):
+        cfg = tiny_config(
+            quantization_config={
+                "quant_method": "fp8",
+                "dequantize": dequantize,
+                "weight_block_size": None,
+            }
+        )
+
+        model = Ministral3ForCausalLM(cfg)
+
+        assert isinstance(model.state_dict_adapter, Mistral3FP8StateDictAdapter)
+        assert model.state_dict_adapter._layout_name == "causal_lm"
+        assert isinstance(model.model.layers[0].self_attn.q_proj, torch.nn.Linear)
+
+    def test_non_fp8_checkpoint_does_not_attach_fp8_adapter(self):
+        model = Ministral3ForCausalLM(tiny_config())
+
+        assert not hasattr(model, "state_dict_adapter")
+
+    def test_per_block_fp8_checkpoint_is_rejected(self):
+        cfg = tiny_config(
+            quantization_config={
+                "quant_method": "fp8",
+                "dequantize": False,
+                "weight_block_size": [128, 128],
+            }
+        )
+
+        with pytest.raises(NotImplementedError, match="supports per-tensor checkpoints only"):
+            Ministral3ForCausalLM(cfg)
 
 
 # NOTE: HFCheckpointingMixin tests are now in tests/unit_tests/models/common/test_hf_checkpointing_mixin.py

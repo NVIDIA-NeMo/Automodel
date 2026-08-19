@@ -1,0 +1,58 @@
+---
+title: "North Micro Vision"
+description: "LoRA fine-tune North Micro Vision Instruct, a native-resolution vision language model, with FSDP2 on two GPUs."
+slug: model-coverage/vision-language-models/coherelabs/north-micro-vision
+---
+[North Micro Vision](https://huggingface.co/CohereLabs/North-Micro-Vision-Instruct) is Cohere Labs' 2.4B-parameter vision language model with native-resolution image support. NeMo AutoModel loads it through `NeMoAutoModelForImageTextToText` with `trust_remote_code`, since the architecture is not yet registered upstream.
+
+
+<Warning>
+`nemo-automodel==0.5.0` pins `transformers==5.8.1`, but the model's remote code calls 5.15 APIs. Install transformers separately with `--no-deps` at commit `71c6f699`; `uv pip check` will then report the environment as inconsistent, which is expected.
+</Warning>
+
+<Info>
+
+| | |
+|---|---|
+| **Task** | Image-Text-to-Text (native resolution) |
+| **Architecture** | `CohereCompassForConditionalGeneration` |
+| **Parameters** | 2.4B total (2B language / 400M vision) |
+| **Layers** | 28 language (21 sliding + 7 full attention), 27 vision |
+| **Context Length** | 64K input, 8K output |
+| **HF Org** | [CohereLabs](https://huggingface.co/CohereLabs) |
+
+</Info>
+
+## Architecture
+
+- Hybrid attention interleaves three sliding-window layers (window 4,096) with one full-attention layer. The full-attention layers carry no positional embeddings; RoPE is applied on the sliding layers only.
+- Attention is grouped-query, 16 heads over 8 key-value heads, with parallel transformer blocks and LayerNorm. Embeddings are tied across a 262,144-token vocabulary.
+- The vision encoder feeds the language model through DeepStack: patch embeddings are injected at language layers 8, 16 and 24 rather than only prepended, preserving fine detail for documents and charts.
+- Positional encoding is interleaved mRoPE with sections `[24, 20, 20]`, so visual token count scales with image resolution rather than a fixed patch budget.
+
+## Example Recipe
+
+| Recipe | Description |
+|---|---|
+| [`north_micro_vision_rdr.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/cohere_micro_vision/north_micro_vision_rdr.yaml) | 18-step LoRA SFT on the built-in RDR dataset; smallest end-to-end check |
+| [`north_micro_vision_shopify_full.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/cohere_micro_vision/north_micro_vision_shopify_full.yaml) | Full-epoch LoRA SFT on Shopify product-catalogue with FSDP2 and DP2 |
+| [`north_micro_vision_shopify_lora.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/cohere_micro_vision/north_micro_vision_shopify_lora.yaml) | 2,000-sample bounded variant for pipeline smoke tests |
+| [`north_micro_vision_shopify_resume.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/cohere_micro_vision/north_micro_vision_shopify_resume.yaml) | Resumes from a saved checkpoint to validate the restore path |
+
+## Run the Recipe
+
+
+```bash
+uv run automodel --nproc-per-node=2 examples/vlm_finetune/cohere_micro_vision/north_micro_vision_rdr.yaml
+```
+
+Weights are pulled from the Hub and checkpoints are written relative to the working directory. Containers must use a `-devel` CUDA image, because `use_triton: true` JIT-compiles the LoRA kernels and needs a C compiler.
+
+The RDR recipe is 18 optimizer steps and exists to prove the pipeline. A full epoch of the Shopify recipe is 2,415 steps, completes in about an hour on two GPUs, and takes validation loss from 0.90 to 0.43.
+
+Both datasets feed the generic `default_collate_fn`, since `CohereCompassProcessor` is not registered in `COLLATE_FNS`. Leave `max_length` unset there so padding stays dynamic: native-resolution images make visual token count a function of image size, and product photos reach 3,756 tokens, which a fixed `max_length` would reject outright.
+
+## References
+
+- [North Micro Vision model card](https://huggingface.co/CohereLabs/North-Micro-Vision-Instruct)
+- [Shopify product-catalogue dataset](https://huggingface.co/datasets/Shopify/product-catalogue)

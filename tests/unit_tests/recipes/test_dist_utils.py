@@ -20,16 +20,21 @@ Typed validation tests live in ``tests/unit_tests/distributed/test_mesh.py``.
 import pytest
 import torch
 
+from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.distributed.config import (
     DDPConfig,
     DistributedSetup,
     FSDP2Config,
     MegatronFSDPConfig,
     MoEParallelizerConfig,
+    MultimodalDistributedConfig,
+    MultimodalVisionConfig,
 )
+from nemo_automodel.components.distributed.cp_vision_frame_shard import CpVisionFrameShardingConfig
 from nemo_automodel.components.distributed.mesh import MeshAxisName, MeshContext, ParallelismSizes
 from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
 from nemo_automodel.recipes._dist_utils import (
+    _distributed_cfg_to_dict,
     create_distributed_setup_from_config,
     parse_distributed_section,
 )
@@ -87,9 +92,25 @@ class TestParsing:
         assert result["strategy_config"].zero_dp_strategy == 3
 
     def test_ddp(self):
-        result = parse_distributed_section({"strategy": "ddp"})
+        result = parse_distributed_section(
+            {
+                "strategy": "ddp",
+                "broadcast_buffers": True,
+                "find_unused_parameters": True,
+                "static_graph": True,
+                "bucket_cap_mb": 64,
+                "gradient_as_bucket_view": True,
+                "autocast_dtype": "bfloat16",
+            }
+        )
         assert isinstance(result["strategy_config"], DDPConfig)
         assert result["strategy_config"].activation_checkpointing is False
+        assert result["strategy_config"].broadcast_buffers is True
+        assert result["strategy_config"].find_unused_parameters is True
+        assert result["strategy_config"].static_graph is True
+        assert result["strategy_config"].bucket_cap_mb == 64
+        assert result["strategy_config"].gradient_as_bucket_view is True
+        assert result["strategy_config"].autocast_dtype == torch.bfloat16
 
     def test_all_parallelism_keys(self):
         cfg = {
@@ -100,6 +121,7 @@ class TestParsing:
             "cp_size": 2,
             "ep_size": 2,
             "dp_replicate_size": 2,
+            "pipeline": {},  # pp_size>1 requires a pipeline block (empty = defaults)
         }
         result = parse_distributed_section(cfg)
         assert result["dp_size"] == 4
@@ -118,6 +140,55 @@ class TestParsing:
         result = parse_distributed_section(cfg)
         assert result["strategy_config"].sequence_parallel is True
         assert result["strategy_config"].defer_fsdp_grad_sync is False
+
+    def test_vision_frame_sharding_is_typed_under_multimodal(self):
+        cfg = {
+            "strategy": "fsdp2",
+            "multimodal": {
+                "vision": {
+                    "frame_sharding": {
+                        "enabled": True,
+                        "mesh_dims": ["cp"],
+                        "min_tokens": 0,
+                        "cost_alpha": 0,
+                    }
+                }
+            },
+        }
+
+        result = parse_distributed_section(cfg)
+
+        policy = result["strategy_config"].multimodal.vision.frame_sharding
+        assert policy == CpVisionFrameShardingConfig(
+            enabled=True,
+            mesh_dims=("cp",),
+            min_tokens=0,
+            cost_alpha=0,
+        )
+        assert cfg["multimodal"]["vision"]["frame_sharding"]["mesh_dims"] == ["cp"]
+
+    @pytest.mark.parametrize("mesh_dims", [["cp", "tp"], ["tp"], []])
+    def test_vision_frame_sharding_rejects_unsupported_mesh_dims(self, mesh_dims):
+        with pytest.raises(ValueError, match=r'mesh_dims currently supports only \["cp"\]'):
+            parse_distributed_section(
+                {
+                    "strategy": "fsdp2",
+                    "multimodal": {"vision": {"frame_sharding": {"mesh_dims": mesh_dims}}},
+                }
+            )
+
+    def test_vision_frame_sharding_rejects_non_list_mesh_dims(self):
+        with pytest.raises(TypeError, match="mesh_dims must be a list"):
+            parse_distributed_section(
+                {
+                    "strategy": "fsdp2",
+                    "multimodal": {"vision": {"frame_sharding": {"mesh_dims": "cp"}}},
+                }
+            )
+
+    def test_flat_cp_vision_frame_sharding_key_is_rejected(self):
+        with pytest.raises(ValueError, match="cp_vision_frame_sharding"):
+            parse_distributed_section({"strategy": "fsdp2", "cp_vision_frame_sharding": {"enabled": True}})
 
     def test_config_dict_not_mutated(self):
         original = {"strategy": "fsdp2", "tp_size": 2, "activation_checkpointing": True}
@@ -156,21 +227,32 @@ class TestPipeline:
         assert result["pipeline_config"].pp_schedule == "1f1b"
 
     def test_pp_enabled_true_when_pp_gt_1(self):
-        assert parse_distributed_section({"pp_size": 2})["pp_enabled"] is True
+        assert parse_distributed_section({"pp_size": 2, "pipeline": {}})["pp_enabled"] is True
 
-    def test_default_pipeline_config_created_when_pp_gt_1_and_no_pipeline_dict(self):
-        """pp_size > 1 without a pipeline section must still yield a PipelineConfig."""
-        result = parse_distributed_section({"pp_size": 4})
-        assert result["pp_enabled"] is True
-        assert isinstance(result["pipeline_config"], PipelineConfig)
-        assert result["pipeline_config"].pp_schedule == "1f1b"
+    def test_pp_gt_1_without_pipeline_raises(self):
+        """pp_size > 1 with no pipeline section is an unambiguous misconfiguration
+        (PP requested but schedule/microbatch unspecified), so it must raise. An
+        explicit empty `pipeline: {}` opts into defaults instead."""
+        with pytest.raises(ValueError, match="pipeline"):
+            parse_distributed_section({"pp_size": 4})
 
     def test_pp_enabled_false_when_pp_eq_1(self):
         assert parse_distributed_section({"pp_size": 1})["pp_enabled"] is False
 
+    def test_pipeline_with_pp_le_1_warns_and_is_dropped(self, caplog):
+        """A pipeline block with pp_size<=1 is inert: it is dropped (not an error) and a
+        warning is logged. Recipes legitimately keep the section as a reference and toggle
+        pp_size via CLI (e.g. ep8/pp1 vs ep4/pp2 parity debugging)."""
+        cfg = {"pp_size": 1, "pipeline": {"pp_schedule": "1f1b", "pp_microbatch_size": 4}}
+        with caplog.at_level("WARNING"):
+            result = parse_distributed_section(cfg)
+        assert result["pipeline_config"] is None
+        assert result["pp_enabled"] is False
+        assert "pipeline parallelism is disabled" in caplog.text
+
     def test_pipeline_dtype_defaults_to_mp_policy_output_dtype(self):
         """Unset pipeline.dtype is derived from the FSDP mp_policy output dtype (bf16 default)."""
-        result = parse_distributed_section({"pp_size": 2})
+        result = parse_distributed_section({"pp_size": 2, "pipeline": {}})
         assert result["pipeline_config"].dtype == torch.bfloat16
 
     def test_pipeline_dtype_explicit_match_kept(self, caplog):
@@ -217,7 +299,7 @@ class TestMoE:
     def test_empty_moe_dict_uses_defaults(self):
         result = parse_distributed_section({"ep_size": 2, "moe": {}})
         assert isinstance(result["moe_parallel_config"], MoEParallelizerConfig)
-        assert result["moe_parallel_config"].ignore_router_for_ac is False
+        assert result["moe_parallel_config"].ignore_router_for_ac is True
 
     def test_mp_policy_none_when_omitted(self):
         result = parse_distributed_section({"ep_size": 2, "moe": {}})
@@ -305,6 +387,19 @@ class TestActivationCheckpointingParsing:
         assert result["strategy_config"].activation_checkpointing is False
         assert result["activation_checkpointing"] is True
 
+    @pytest.mark.parametrize("strategy", ["fsdp2", "ddp"])
+    def test_scope_forwarded_to_strategy_config(self, strategy):
+        result = parse_distributed_section(
+            {
+                "strategy": strategy,
+                "activation_checkpointing": True,
+                "activation_checkpointing_scope": "language",
+            }
+        )
+        assert result["strategy_config"].activation_checkpointing is False
+        assert result["strategy_config"].activation_checkpointing_scope == ("language",)
+        assert result["activation_checkpointing"] is True
+
     def test_selective_parsed_for_fsdp2_when_no_ep(self):
         result = parse_distributed_section({"strategy": "fsdp2", "activation_checkpointing": "selective", "ep_size": 1})
         # AC is kept off the strategy config and carried on the parsed value.
@@ -314,6 +409,11 @@ class TestActivationCheckpointingParsing:
     def test_full_string_normalized_to_true(self):
         result = parse_distributed_section({"strategy": "fsdp2", "activation_checkpointing": "full"})
         # "full" normalizes to True and is carried on the parsed value, not the strategy config.
+        assert result["strategy_config"].activation_checkpointing is False
+        assert result["activation_checkpointing"] is True
+
+    def test_full_string_normalized_to_true_for_ddp(self):
+        result = parse_distributed_section({"strategy": "ddp", "activation_checkpointing": "full"})
         assert result["strategy_config"].activation_checkpointing is False
         assert result["activation_checkpointing"] is True
 
@@ -327,9 +427,10 @@ class TestActivationCheckpointingParsing:
         assert result["strategy_config"].activation_checkpointing is False
         assert result["activation_checkpointing"] == "selective"
 
-    def test_selective_rejected_for_non_fsdp2(self):
-        with pytest.raises(ValueError, match="FSDP2"):
-            parse_distributed_section({"strategy": "ddp", "activation_checkpointing": "selective"})
+    def test_selective_allowed_for_ddp(self):
+        result = parse_distributed_section({"strategy": "ddp", "activation_checkpointing": "selective"})
+        assert result["strategy_config"].activation_checkpointing is False
+        assert result["activation_checkpointing"] == "selective"
 
     def test_unknown_activation_checkpointing_mode_rejected(self):
         with pytest.raises(ValueError, match="activation_checkpointing"):
@@ -342,24 +443,6 @@ class TestActivationCheckpointingParsing:
         # infrastructure._with_activation_checkpointing, not here.
         assert result["strategy_config"].activation_checkpointing is False
         assert result["activation_checkpointing"] == "selective"
-
-    def test_selective_allowed_for_ep(self):
-        # Selective AC is now supported with expert parallelism via the MoE
-        # parallelizer. For EP it is kept off the strategy config and carried on
-        # the parsed value (consumed by parallelize_model -> apply_ac).
-        result = parse_distributed_section(
-            {"strategy": "fsdp2", "activation_checkpointing": "selective", "ep_size": 2, "moe": {}}
-        )
-        assert result["strategy_config"].activation_checkpointing is False
-        assert result["activation_checkpointing"] == "selective"
-
-    def test_selective_rejected_for_non_fsdp2(self):
-        with pytest.raises(ValueError, match="FSDP2"):
-            parse_distributed_section({"strategy": "ddp", "activation_checkpointing": "selective"})
-
-    def test_unknown_activation_checkpointing_mode_rejected(self):
-        with pytest.raises(ValueError, match="activation_checkpointing"):
-            parse_distributed_section({"strategy": "fsdp2", "activation_checkpointing": "sometimes"})
 
 
 # ---------------------------------------------------------------------------
@@ -375,14 +458,14 @@ class TestValidation:
             parse_distributed_section({"strategy": "unknown"})
 
     def test_pipeline_requires_pp_gt_1(self):
-        """Pipeline section is silently discarded when pp_size <= 1
+        """Pipeline section is discarded (with a warning) when pp_size <= 1
         (common when a YAML template is overridden via CLI)."""
         result = parse_distributed_section({"pp_size": 1, "pipeline": {"pp_schedule": "1f1b"}})
         assert result["pipeline_config"] is None
         assert result["pp_enabled"] is False
 
     def test_pipeline_rejects_default_pp_size(self):
-        """Pipeline section is silently discarded when pp_size defaults to 1."""
+        """Pipeline section is discarded (with a warning) when pp_size defaults to 1."""
         result = parse_distributed_section({"pipeline": {"pp_schedule": "1f1b"}})
         assert result["pipeline_config"] is None
         assert result["pp_enabled"] is False
@@ -414,6 +497,26 @@ class TestValidation:
         cfg = {"strategy": "fsdp2", meta_key: "value"}
         result = parse_distributed_section(cfg)
         assert isinstance(result["strategy_config"], FSDP2Config)
+
+    @pytest.mark.parametrize("policy", ["root", "per_layer", "replicate"])
+    def test_fsdp2_accepts_frozen_multimodal_sharding(self, policy):
+        result = parse_distributed_section({"strategy": "fsdp2", "multimodal": {"frozen_sharding": policy}})
+        assert result["strategy_config"].multimodal.frozen_sharding == policy
+
+    def test_fsdp2_defaults_frozen_multimodal_sharding_to_root(self):
+        result = parse_distributed_section({"strategy": "fsdp2"})
+        assert result["strategy_config"].multimodal == MultimodalDistributedConfig(frozen_sharding="root")
+        assert result["strategy_config"].multimodal.vision == MultimodalVisionConfig()
+        assert result["strategy_config"].multimodal.vision.frame_sharding.mesh_dims == ("cp",)
+
+    @pytest.mark.parametrize("policy", ["off", "shard"])
+    def test_fsdp2_rejects_unknown_frozen_multimodal_sharding(self, policy):
+        with pytest.raises(ValueError, match="distributed.multimodal.frozen_sharding"):
+            parse_distributed_section({"strategy": "fsdp2", "multimodal": {"frozen_sharding": policy}})
+
+    def test_fsdp2_rejects_unmerged_flat_frozen_multimodal_sharding_key(self):
+        with pytest.raises(ValueError, match="frozen_multimodal_sharding"):
+            parse_distributed_section({"strategy": "fsdp2", "frozen_multimodal_sharding": "root"})
 
 
 # ---------------------------------------------------------------------------
@@ -593,6 +696,33 @@ class TestCreateDistributedSetupFromConfigWorldSizeAutoDetect:
         assert result.strategy_config.activation_checkpointing is False
         assert result.activation_checkpointing is True
 
+    def test_top_level_dist_env_timeout_passed_to_mesh(self, patched_mesh):
+        create_distributed_setup_from_config(
+            {
+                "distributed": {
+                    "strategy": "fsdp2",
+                    "pp_size": 2,
+                    "pipeline": {},
+                },
+                "dist_env": {"timeout_minutes": 30},
+            },
+            world_size=4,
+        )
+
+        assert patched_mesh["timeout_minutes"] == 30
+
+    def test_explicit_timeout_overrides_cfg_timeout(self, patched_mesh):
+        create_distributed_setup_from_config(
+            {
+                "distributed": {"strategy": "fsdp2"},
+                "dist_env": {"timeout_minutes": 10},
+            },
+            timeout_minutes=45,
+            world_size=4,
+        )
+
+        assert patched_mesh["timeout_minutes"] == 45
+
     @pytest.mark.parametrize("strategy", ["megatron_fsdp", "megatron-fsdp", "mfsdp"])
     def test_programmatic_megatron_fsdp_names(self, strategy, patched_mesh):
         result = create_distributed_setup_from_config(strategy=strategy, world_size=1)
@@ -619,3 +749,31 @@ class TestCreateDistributedSetupFromConfigWorldSizeAutoDetect:
 
         assert result.strategy_config.sequence_parallel is True
         assert result.strategy_config.defer_fsdp_grad_sync is False
+
+    def test_none_cfg_builds_default_fsdp2(self, patched_mesh):
+        """``cfg=None`` resolves to the default FSDP2 setup on the given world size (the
+        path dspark's ``shard_dense_target`` uses when a config omits ``distributed:``)."""
+        result = create_distributed_setup_from_config(None, world_size=4)
+
+        assert isinstance(result, DistributedSetup)
+        assert isinstance(result.strategy_config, FSDP2Config)
+        assert patched_mesh["world_size"] == 4
+
+    def test_confignode_without_distributed_block_fails_loud(self, patched_mesh):
+        """A config object lacking the ``distributed:`` block keeps its fail-loud contract:
+        a mis-nested block in a config that requires one must not silently build a default
+        FSDP2 setup. Callers with an optional block pass ``None`` instead."""
+        with pytest.raises(AttributeError):
+            create_distributed_setup_from_config(ConfigNode({}), world_size=4)
+
+    def test_confignode_with_distributed_block_is_honoured(self, patched_mesh):
+        """A present ``distributed:`` block on a ConfigNode is read from the object path."""
+        result = create_distributed_setup_from_config(ConfigNode({"distributed": {"strategy": "ddp"}}), world_size=2)
+
+        assert isinstance(result.strategy_config, DDPConfig)
+        assert patched_mesh["world_size"] == 2
+
+
+def test_distributed_cfg_to_dict_confignode_with_block_returns_block():
+    cfg = ConfigNode({"distributed": {"strategy": "fsdp2", "dp_size": 4}})
+    assert _distributed_cfg_to_dict(cfg) == {"strategy": "fsdp2", "dp_size": 4}

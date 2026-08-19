@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -238,6 +238,22 @@ class TestFromHf:
             assert f"model.language_model.layers.{layer_idx}.moe.experts.down_projs" in nemo_sd
             assert f"model.language_model.layers.{layer_idx}.moe.gate.proj.weight" in nemo_sd
             assert f"model.language_model.layers.{layer_idx}.moe.gate.scale" in nemo_sd
+
+
+class TestStateDictKeys:
+    pytestmark = []
+
+    def test_uses_meta_tensors(self, adapter):
+        state_dict = {
+            "model.language_model.layers.0.moe.experts.down_projs": torch.empty(N_EXPERTS, EXPERT_INTER, HIDDEN)
+        }
+
+        with patch.object(adapter, "to_hf", wraps=adapter.to_hf) as to_hf:
+            keys = adapter.get_hf_state_dict_keys(state_dict)
+
+        assert to_hf.call_args.args[0]["model.language_model.layers.0.moe.experts.down_projs"].device.type == "meta"
+        assert "model.language_model.layers.0.experts.down_proj" in keys
+        assert "model.language_model.layers.0.router.per_expert_scale" in keys
 
 
 # ---------------------------------------------------------------------------

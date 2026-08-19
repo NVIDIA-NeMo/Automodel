@@ -39,6 +39,7 @@ dist_env:
 seed: 42
 
 wandb:
+  enable: false
   project: dflash-sft
   name: dflash-qwen3-4b-run
 

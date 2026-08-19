@@ -20,6 +20,9 @@ rng:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  # FusedLinearCrossEntropy fuses the lm_head projection with cross-entropy and
+  # needs the final hidden state instead of the full [bsz, seq, vocab] logits.
+  output_hidden_states: true
   pretrained_model_name_or_path: Qwen/Qwen3-30B-A3B-Base
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
@@ -57,7 +60,9 @@ distributed:
     layers_per_stage: 2
 
 loss_fn:
-  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+  # Avoids the full bf16->fp32 logit upcast that OOMs MaskedCrossEntropy on long
+  # tulu3 samples (truncation: false) on 8xH100-80GB. See PR #1554.
+  _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
 
 dataset:
   _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
@@ -104,3 +109,34 @@ optimizer:
   store_param_remainders: true
   exp_avg_dtype: torch.bfloat16
   exp_avg_sq_dtype: torch.bfloat16
+
+wandb:
+  enable: false
+  entity: Nemo-automodel
+  project: automodel_convergence_runs
+  name: qwen3_moe_30b_ep8_te_fusedadam
+  dir: /tmp/wandb
+
+# ── Weekly Tulu-3 convergence CI (train 1000 steps -> IFEval -> threshold gate) ──
+# Regression gate, one-sided: passes iff CI IFEval prompt_level_strict_acc >
+# baseline - k * stderr. A higher score always passes. The SFT model is evaluated WITH
+# --thinking (its training mode); without it the empty <think> prefill sends the model
+# OOD and IFEval collapses. baseline/stderr measured.
+ci:
+  recipe_owner: athitten
+  nodes: 1
+  time: "02:00:00"                     # full 1000-step train + IFEval
+  convergence:
+    step_scheduler.max_steps: 1000     # phases.convergence abbreviates to 200; restore full run
+  downstream_eval:
+    tasks: ifeval
+    tokenizer: Qwen/Qwen3-30B-A3B
+    tp_size: 1
+    dp_size: 1
+    thinking: true
+    extra_model_args: "think_end_token=</think>,max_model_len=8192"
+    metric: prompt_level_strict_acc
+    # Re-baselined after #3359: the eval score improved.
+    baseline: 0.6380
+    stderr: 0.0204
+    k: 2

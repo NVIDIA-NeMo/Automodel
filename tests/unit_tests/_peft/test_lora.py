@@ -12,20 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from unittest.mock import patch
+
 import pytest
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.autograd.graph import saved_tensors_hooks
+from torch.distributed.tensor import DeviceMesh, DTensor, Replicate, Shard, distribute_tensor
 
 from nemo_automodel.components._peft.lora import (
     LinearLoRA,
     LoRATritonFunction,
     PeftConfig,
     apply_lora_to_linear_modules,
+    apply_memory_efficient_lora,
     patch_linear_module,
 )
+from nemo_automodel.components.distributed.parallel_styles import TPLinear
 from nemo_automodel.shared.import_utils import safe_import_te
+from nemo_automodel.shared.tp_linear import _async_tp_linear
 
 HAS_TE, transformer_engine = safe_import_te()
 
@@ -173,7 +180,7 @@ def test_memory_efficient_lora_matches_legacy_forward_and_backward(input_shape):
     lora_A_ref = lora_A.detach().clone().requires_grad_(True)
     lora_B_ref = lora_B.detach().clone().requires_grad_(True)
 
-    efficient = LoRATritonFunction.apply(x, lora_A, lora_B, scale, x.dtype, False)
+    efficient = apply_memory_efficient_lora(x, lora_A, lora_B, scale, False)
     legacy = F.linear(F.linear(x_ref, lora_A_ref) * scale, lora_B_ref)
 
     grad = torch.randn_like(legacy)
@@ -204,7 +211,7 @@ def test_memory_efficient_lora_with_residual_matches_legacy_forward_and_backward
     lora_B_ref = lora_B.detach().clone().requires_grad_(True)
     res_ref = res.detach().clone().requires_grad_(True)
 
-    efficient = LoRATritonFunction.apply(x, lora_A, lora_B, scale, x.dtype, False, res)
+    efficient = apply_memory_efficient_lora(x, lora_A, lora_B, scale, False, res)
     legacy = res_ref + F.linear(F.linear(x_ref, lora_A_ref) * scale, lora_B_ref)
 
     grad = torch.randn_like(legacy)
@@ -298,6 +305,75 @@ def test_linear_lora_memory_efficient_matches_legacy_module_forward_and_backward
     assert torch.allclose(x.grad, x_ref.grad)
     assert torch.allclose(efficient.lora_A.weight.grad, legacy.lora_A.weight.grad)
     assert torch.allclose(efficient.lora_B.weight.grad, legacy.lora_B.weight.grad)
+
+
+def test_materialized_effective_weight_matches_linear_lora_forward_and_backward():
+    """The effective dense weight must preserve ordinary LoRA outputs and gradients."""
+    torch.manual_seed(1234)
+    base = nn.Linear(7, 5, bias=True, dtype=torch.float32)
+    direct = LinearLoRA(base, dim=3, alpha=6, use_memory_efficient_lora=False)
+    materialized = LinearLoRA(base, dim=3, alpha=6, use_memory_efficient_lora=False)
+    with torch.no_grad():
+        direct.lora_A.weight.normal_()
+        direct.lora_B.weight.normal_()
+        materialized.lora_A.weight.copy_(direct.lora_A.weight)
+        materialized.lora_B.weight.copy_(direct.lora_B.weight)
+
+    x_direct = torch.randn(2, 4, 7, requires_grad=True)
+    x_materialized = x_direct.detach().clone().requires_grad_(True)
+    direct_out = direct(x_direct)
+    materialized_out = F.linear(
+        x_materialized,
+        materialized.materialize_effective_weight(),
+        materialized.bias,
+    )
+    output_grad = torch.randn_like(direct_out)
+    direct_out.backward(output_grad)
+    materialized_out.backward(output_grad)
+
+    torch.testing.assert_close(materialized_out, direct_out)
+    torch.testing.assert_close(x_materialized.grad, x_direct.grad)
+    torch.testing.assert_close(materialized.lora_A.weight.grad, direct.lora_A.weight.grad)
+    torch.testing.assert_close(materialized.lora_B.weight.grad, direct.lora_B.weight.grad)
+
+
+def test_materialized_effective_weight_allows_inactive_dropout():
+    """Evaluation-time dropout must reduce to the same deterministic effective weight."""
+    torch.manual_seed(1234)
+    lora = LinearLoRA(nn.Linear(7, 5, bias=False), dim=3, alpha=6, dropout=0.5)
+    with torch.no_grad():
+        lora.lora_A.weight.normal_()
+        lora.lora_B.weight.normal_()
+    lora.eval()
+    x = torch.randn(2, 7)
+
+    torch.testing.assert_close(F.linear(x, lora.materialize_effective_weight()), lora(x))
+
+
+def test_materialized_effective_weight_rejects_active_dropout():
+    """Training dropout cannot be represented by one deterministic dense weight."""
+    lora = LinearLoRA(nn.Linear(7, 5, bias=False), dim=3, alpha=6, dropout=0.5)
+    lora.train()
+
+    with pytest.raises(RuntimeError, match="active LoRA training dropout"):
+        lora.materialize_effective_weight()
+
+
+def test_materialized_effective_weight_rejects_dora():
+    """DoRA has magnitude normalization that the ordinary LoRA formula omits."""
+    dora = LinearLoRA(nn.Linear(7, 5, bias=False), dim=3, alpha=6, use_dora=True)
+
+    with pytest.raises(NotImplementedError, match="does not support DoRA"):
+        dora.materialize_effective_weight()
+
+
+def test_materialized_effective_weight_rejects_quantized_layout():
+    """Quantized base weights must not silently use the ordinary dense formula."""
+    lora = LinearLoRA(nn.Linear(7, 5, bias=False), dim=3, alpha=6)
+    lora.quant_state = object()
+
+    with pytest.raises(NotImplementedError, match="quantized linear implementations"):
+        lora.materialize_effective_weight()
 
 
 def test_lora_layers_are_trainable():
@@ -429,3 +505,239 @@ class TestTELinearLoRA:
         assert patched.lora_B.weight.grad is not None, "lora_B should have gradients"
         assert torch.isfinite(patched.lora_A.weight.grad).all(), "lora_A gradients should be finite"
         assert torch.isfinite(patched.lora_B.weight.grad).all(), "lora_B gradients should be finite"
+
+
+class _Gemma3nTextModelMini(nn.Module):
+    """Minimal stand-in for transformers ``Gemma3nTextModel`` exercising the bug.
+
+    Owns a ``per_layer_model_projection`` linear and a ``project_per_layer_inputs`` method whose
+    first op mutates the projection output in place (``*=``), exactly like the real HF method.
+    """
+
+    class _Cfg:
+        num_hidden_layers = 3
+
+    class _Norm(nn.Module):
+        def __init__(self, d):
+            super().__init__()
+            self.weight = nn.Parameter(torch.zeros(d))
+
+        def forward(self, x):
+            var = x.float().pow(2).mean(-1, keepdim=True)
+            return (x * torch.rsqrt(var + 1e-6).to(x.dtype)) * (1.0 + self.weight)
+
+    def __init__(self, p=8, d=5, nlayers=3):
+        super().__init__()
+        self.config = self._Cfg()
+        self.config.num_hidden_layers = nlayers
+        self.hidden_size_per_layer_input = d
+        self.per_layer_model_projection = nn.Linear(p, d * nlayers, bias=False)
+        self.per_layer_projection_norm = self._Norm(d)
+        self.register_buffer("per_layer_projection_scale", torch.tensor(d**-0.5))
+        self.register_buffer("per_layer_input_scale", torch.tensor(2.0**0.5))
+
+    def project_per_layer_inputs(self, inputs_embeds, per_layer_inputs=None, inplace=True):
+        per_layer_projection = self.per_layer_model_projection(inputs_embeds)
+        scale = self.per_layer_projection_scale.to(dtype=inputs_embeds.dtype, device=per_layer_projection.device)
+        if inplace:
+            per_layer_projection *= scale  # the offending in-place op (HF parity)
+        else:
+            per_layer_projection = per_layer_projection * scale
+        per_layer_projection = per_layer_projection.reshape(
+            *inputs_embeds.shape[:-1], self.config.num_hidden_layers, self.hidden_size_per_layer_input
+        )
+        per_layer_projection = self.per_layer_projection_norm(per_layer_projection)
+        if per_layer_inputs is None:
+            return per_layer_projection
+        if per_layer_projection.shape != per_layer_inputs.shape:
+            per_layer_inputs = per_layer_inputs[..., : self.config.num_hidden_layers, :]
+        return (per_layer_projection + per_layer_inputs) * self.per_layer_input_scale.to(
+            dtype=inputs_embeds.dtype, device=per_layer_projection.device
+        )
+
+
+def test_memory_efficient_lora_output_is_inplace_safe():
+    """A consumer may mutate the memory-efficient LoRA output in place, with no model-specific patch.
+
+    Regression for AM-453: transformers gemma3n ``project_per_layer_inputs`` does
+    ``per_layer_projection *= scale`` on the projection output. Previously the memory-efficient LoRA
+    returned a *view of a custom-autograd-Function output*, so the in-place op raised
+    "Output 0 of LoRATritonFunctionBackward is a view and is being modified inplace". The
+    ``(N, out) -> (bs, seq, out)`` reshape now happens outside the Function, so its output is an
+    ordinary (in-place-safe) view -- fixing the bug class generically (no gemma3n-specific code).
+    """
+    p, d, nlayers = 8, 5, 3
+    torch.manual_seed(0)
+    model = _Gemma3nTextModelMini(p, d, nlayers)
+    patch_linear_module(
+        model.per_layer_model_projection, dim=4, alpha=8, use_triton=False, use_memory_efficient_lora=True
+    )
+
+    # Reference: identical weights, out-of-place consumer.
+    torch.manual_seed(0)
+    ref_model = _Gemma3nTextModelMini(p, d, nlayers)
+    patch_linear_module(
+        ref_model.per_layer_model_projection, dim=4, alpha=8, use_triton=False, use_memory_efficient_lora=True
+    )
+
+    inputs_embeds = torch.randn(2, 3, p)
+    per_layer_inputs = torch.randn(2, 3, nlayers, d)
+
+    for with_pli in (False, True):
+        pli = per_layer_inputs if with_pli else None
+
+        for m in (model, ref_model):
+            m.per_layer_model_projection.lora_A.weight.grad = None
+            m.per_layer_model_projection.lora_B.weight.grad = None
+
+        x_in = inputs_embeds.detach().clone().requires_grad_(True)
+        # The in-place consumer must NOT raise -- this is the regression.
+        out = model.project_per_layer_inputs(x_in, pli.detach().clone() if with_pli else None, inplace=True)
+        out.sum().backward()
+
+        x_ref = inputs_embeds.detach().clone().requires_grad_(True)
+        out_ref = ref_model.project_per_layer_inputs(x_ref, pli.detach().clone() if with_pli else None, inplace=False)
+        out_ref.sum().backward()
+
+        assert torch.allclose(out, out_ref, atol=1e-6)
+        assert torch.allclose(x_in.grad, x_ref.grad, atol=1e-6)
+        assert torch.allclose(
+            model.per_layer_model_projection.lora_A.weight.grad,
+            ref_model.per_layer_model_projection.lora_A.weight.grad,
+            atol=1e-6,
+        )
+        assert torch.allclose(
+            model.per_layer_model_projection.lora_B.weight.grad,
+            ref_model.per_layer_model_projection.lora_B.weight.grad,
+            atol=1e-6,
+        )
+
+
+def _make_lora_with_random_adapters(in_features: int = 16, out_features: int = 12) -> LinearLoRA:
+    """Build a LinearLoRA with non-zero adapters so the LoRA delta is exercised."""
+    base = nn.Linear(in_features, out_features)
+    lora = LinearLoRA(base, dim=4, alpha=8, use_memory_efficient_lora=False)
+    with torch.no_grad():
+        lora.lora_A.weight.normal_()
+        lora.lora_B.weight.normal_()
+    return lora
+
+
+def test_linear_lora_async_tp_mode_matches_eager():
+    """The async-TP F.linear shaping must stay numerically identical to eager."""
+    torch.manual_seed(0)
+    lora = _make_lora_with_random_adapters()
+    x = torch.randn(2, 5, 16)
+    ref = lora(x)
+
+    original = torch._inductor.config._micro_pipeline_tp
+    torch._inductor.config._micro_pipeline_tp = True
+    try:
+        with patch("torch.compiler.is_compiling", return_value=True):
+            out = lora(x)
+    finally:
+        torch._inductor.config._micro_pipeline_tp = original
+
+    assert torch.allclose(out, ref, atol=1e-6)
+
+
+def test_linear_lora_2d_input_under_compile_uses_f_linear():
+    """2-D input while compile-tracing must skip the 3-D bmm path and match eager."""
+    torch.manual_seed(0)
+    lora = _make_lora_with_random_adapters()
+    x = torch.randn(8, 16)
+    ref = lora(x)
+
+    with (
+        patch.object(torch._inductor.config, "_micro_pipeline_tp", False),
+        patch("torch.compiler.is_compiling", return_value=True),
+    ):
+        out = lora(x)
+
+    assert torch.allclose(out, ref, atol=1e-6)
+
+
+@pytest.fixture
+def single_rank_pg():
+    """Provide a single-rank gloo process group for DTensor placement tests."""
+    if not dist.is_available():
+        pytest.skip("torch.distributed is not available")
+    already = dist.is_initialized()
+    if not already:
+        dist.init_process_group(backend="gloo", rank=0, world_size=1, store=dist.HashStore())
+    try:
+        yield
+    finally:
+        if not already:
+            dist.destroy_process_group()
+
+
+def test_linear_lora_dim1_sharded_dtensor_takes_bmm_not_async_shaping(single_rank_pg):
+    """A sequence-sharded DTensor input must bypass async-TP shaping and not crash.
+
+    Builds a LinearLoRA whose base and adapter weights are replicated DTensors
+    on a world-size-1 mesh (adapters converted to TPLinear, matching
+    parallel_styles) and feeds a ``[B, S, in_features]`` DTensor input sharded
+    on dim 1 (the sequence-parallel layout async-TP mandates), with the
+    async-TP gate mocked open.  The base projection must route through
+    ``torch.bmm``, never through ``_async_tp_linear`` (whose ``F.linear`` view
+    cannot flatten the sharded dim), and match the eager local reference.
+    """
+    torch.manual_seed(0)
+    lora = _make_lora_with_random_adapters()
+    x_local = torch.randn(2, 5, 16)
+    ref = lora(x_local)
+
+    mesh = DeviceMesh("cpu", torch.arange(1))
+    for mod in (lora, lora.lora_A, lora.lora_B):
+        mod.weight = nn.Parameter(distribute_tensor(mod.weight.detach().clone(), mesh, [Replicate()]))
+    lora.bias = nn.Parameter(distribute_tensor(lora.bias.detach().clone(), mesh, [Replicate()]))
+    lora.lora_A.__class__ = TPLinear
+    lora.lora_B.__class__ = TPLinear
+    x = DTensor.from_local(x_local, mesh, [Shard(1)], run_check=False)
+
+    with (
+        patch("nemo_automodel.shared.tp_linear._is_async_tp_linear_enabled", return_value=True),
+        patch("nemo_automodel.shared.tp_linear._async_tp_linear") as async_spy,
+        patch("torch.bmm", wraps=torch.bmm) as bmm_spy,
+    ):
+        out = lora(x)
+
+    async_spy.assert_not_called()
+    assert bmm_spy.call_count == 3  # base projection + lora_A + lora_B
+    assert isinstance(out, DTensor)
+    assert torch.allclose(out.full_tensor(), ref, atol=1e-6)
+
+
+def test_linear_lora_negative_last_dim_shard_takes_async_shaping(single_rank_pg):
+    """A ``Shard(-1)`` LoRA input must take the fusable async-TP linear graph.
+
+    Builds a LinearLoRA with replicated base and adapter weights on a
+    world-size-1 mesh and feeds a ``[B, S, in_features]`` DTensor input sharded
+    on its last/feature dimension. The base, LoRA-A, and LoRA-B projections must
+    all avoid the batch/sequence-sharded ``bmm`` fallback.
+    """
+    torch.manual_seed(0)
+    lora = _make_lora_with_random_adapters()
+    x_local = torch.randn(2, 5, 16)
+    ref = lora(x_local)
+
+    mesh = DeviceMesh("cpu", torch.arange(1))
+    for mod in (lora, lora.lora_A, lora.lora_B):
+        mod.weight = nn.Parameter(distribute_tensor(mod.weight.detach().clone(), mesh, [Replicate()]))
+    lora.bias = nn.Parameter(distribute_tensor(lora.bias.detach().clone(), mesh, [Replicate()]))
+    lora.lora_A.__class__ = TPLinear
+    lora.lora_B.__class__ = TPLinear
+    x = DTensor.from_local(x_local, mesh, [Shard(-1)], run_check=False)
+
+    with (
+        patch("nemo_automodel.shared.tp_linear._is_async_tp_linear_enabled", return_value=True),
+        patch("nemo_automodel.shared.tp_linear._async_tp_linear", wraps=_async_tp_linear) as async_spy,
+        patch("torch.bmm", wraps=torch.bmm) as bmm_spy,
+    ):
+        out = lora(x)
+
+    assert async_spy.call_count == 3  # base projection + lora_A + lora_B
+    bmm_spy.assert_not_called()
+    assert isinstance(out, DTensor)
+    assert torch.allclose(out.full_tensor(), ref, atol=1e-6)

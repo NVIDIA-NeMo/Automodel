@@ -16,6 +16,9 @@ from unittest.mock import Mock, patch
 
 import pytest
 import torch
+import torch.distributed as dist
+from torch.distributed._tensor import Shard, distribute_tensor
+from torch.distributed.device_mesh import DeviceMesh
 
 skip_if_no_gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for GPU operations")
 
@@ -49,6 +52,66 @@ class MockMoEStateDictMixin(MoESplitExpertsStateDictMixin):
         self._last_expert_ids = []
 
 
+def _run_ep_free_dtensor_split(rank: int, world_size: int, init_file: str) -> None:
+    """Verify non-EP DTensors split without collecting full expert weights."""
+    dist.init_process_group("gloo", init_method=f"file://{init_file}", rank=rank, world_size=world_size)
+    try:
+        mesh = DeviceMesh("cpu", torch.arange(world_size), mesh_dim_names=("dp_shard_cp",))
+        full_weight = torch.arange(4 * 6 * 4, dtype=torch.float32).reshape(4, 6, 4)
+        mixin = MockMoEStateDictMixin(n_experts=4, inter_dim=2)
+
+        expert_sharded_weight = distribute_tensor(full_weight, mesh, [Shard(0)])
+        splits = mixin._split_experts_weights(expert_sharded_weight, 4)
+
+        local_expert_ids = [rank * 2, rank * 2 + 1]
+        assert mixin._last_expert_ids == local_expert_ids
+        assert len(splits) == 2
+        for expert_id, expert_weight in zip(local_expert_ids, splits):
+            assert not hasattr(expert_weight, "placements")
+            torch.testing.assert_close(expert_weight, full_weight[expert_id])
+
+        inner_sharded_weight = distribute_tensor(full_weight, mesh, [Shard(1)])
+        splits = mixin._split_experts_weights(inner_sharded_weight, 4)
+
+        assert mixin._last_expert_ids == [0, 1, 2, 3]
+        assert len(splits) == 4
+        for expert_id, expert_weight in enumerate(splits):
+            assert expert_weight.placements == (Shard(0),)
+            torch.testing.assert_close(expert_weight.full_tensor(), full_weight[expert_id])
+
+        converted = dict(
+            mixin._convert_single_merged_expert_to_hf_split_experts(
+                "model.layers.0.mlp.experts.gate_and_up_projs",
+                expert_sharded_weight,
+            )
+        )
+        assert len(converted) == 4
+        for expert_id in local_expert_ids:
+            gate_key = f"model.layers.0.mlp.experts.{expert_id}.gate_proj.weight"
+            up_key = f"model.layers.0.mlp.experts.{expert_id}.up_proj.weight"
+            torch.testing.assert_close(converted[gate_key], full_weight[expert_id, :, :2].T)
+            torch.testing.assert_close(converted[up_key], full_weight[expert_id, :, 2:].T)
+
+        full_down_weight = torch.arange(4 * 2 * 6, dtype=torch.float32).reshape(4, 2, 6)
+        down_weight = distribute_tensor(full_down_weight, mesh, [Shard(0)])
+        converted.update(
+            mixin._convert_single_merged_expert_to_hf_split_experts(
+                "model.layers.0.mlp.experts.down_projs",
+                down_weight,
+            )
+        )
+
+        restored = mixin._from_hf_w_merged_experts(converted)
+        assert restored == {}
+        assert mixin.view_loaded_native_keys == {
+            "model.layers.0.mlp.experts.gate_and_up_projs",
+            "model.layers.0.mlp.experts.down_projs",
+        }
+        assert mixin._inplace_loaded_native_keys == set()
+    finally:
+        dist.destroy_process_group()
+
+
 class TestValidateExpertAvailability:
     def test_no_expert_weights_in_state_dict(self):
         mixin = MockMoEStateDictMixin()
@@ -80,6 +143,36 @@ class TestValidateExpertAvailability:
                     hf_state_dict[key] = torch.randn(512, 1024)
 
         with pytest.raises(RuntimeError, match="Expert weights missing from checkpoint"):
+            mixin._validate_expert_availability(hf_state_dict, 8)
+
+    def test_inplace_loaded_experts_are_not_reported_missing(self):
+        mixin = MockMoEStateDictMixin()
+        hf_state_dict = {}
+
+        for expert in [0, 1]:
+            for proj in ["gate_proj", "up_proj", "down_proj"]:
+                key = f"model.layers.0.mlp.experts.{expert}.{proj}.weight"
+                hf_state_dict[key] = torch.randn(512, 1024)
+
+        mixin._inplace_loaded_native_keys = {
+            "model.layers.0.mlp.experts.gate_and_up_projs",
+            "model.layers.0.mlp.experts.down_projs",
+        }
+        mixin._last_expert_ids = [0, 1]
+
+        mixin._validate_expert_availability(hf_state_dict, 8)
+
+    def test_inplace_loaded_gate_up_still_validates_down_projection(self):
+        mixin = MockMoEStateDictMixin()
+        hf_state_dict = {
+            "model.layers.0.mlp.experts.0.gate_proj.weight": torch.randn(512, 1024),
+            "model.layers.0.mlp.experts.0.up_proj.weight": torch.randn(512, 1024),
+            "model.layers.0.mlp.experts.0.down_proj.weight": torch.randn(512, 1024),
+        }
+        mixin._inplace_loaded_native_keys = {"model.layers.0.mlp.experts.gate_and_up_projs"}
+        mixin._last_expert_ids = [0]
+
+        with pytest.raises(RuntimeError, match=r"model\.layers\.0\.mlp\.experts\.1\.down_proj\.weight"):
             mixin._validate_expert_availability(hf_state_dict, 8)
 
     def test_without_model_prefix(self):
@@ -185,12 +278,21 @@ class TestSplitExpertsWeights:
 
         mixin = MockMoEStateDictMixin()
         mock_weight = Mock()
+        mock_weight.device_mesh.mesh_dim_names = ("ep",)
 
         result = mixin._split_experts_weights(mock_weight, 8)
 
         assert len(result) == 2
         assert mixin._last_expert_ids == [2, 3]
         mock_split_dtensor.assert_called_once_with(mock_weight, 8)
+
+    def test_dtensor_without_ep_mesh_avoids_collecting_experts(self, tmp_path):
+        torch.multiprocessing.spawn(
+            _run_ep_free_dtensor_split,
+            args=(2, str(tmp_path / "ep_free_dtensor_split")),
+            nprocs=2,
+            join=True,
+        )
 
 
 class TestConcatenateExpertWeights:
@@ -895,3 +997,85 @@ class TestInplaceLoadViews:
         assert "model.layers.0.mlp.experts.gate_and_up_projs" not in out
         assert "model.layers.0.mlp.experts.down_projs" not in out
         assert mixin._inplace_loaded_native_keys == set()
+
+    def test_inplace_load_skips_when_backend_experts_is_te_gate_and_up(self):
+        # GroupedExpertsTE (backend.experts == "te") exposes gate_and_up_projs as a
+        # torch.stack copy of per-expert weights that does not alias the model's grouped
+        # storage. Even for a DTensor source the in-place path must not engage, otherwise
+        # the copy_ would write the throwaway and the experts would never be loaded.
+        mixin = MockMoEStateDictMixin(n_experts=2, inter_dim=512)
+        mixin.backend.experts = "te"
+        local_storage = torch.randn(2, 1024, 1024)
+        splits = [local_storage[i] for i in range(2)]
+        mock_dtensor = Mock()
+
+        result = self._run_inplace_conversion(
+            mixin, "model.layers.0.mlp.experts.gate_and_up_projs", mock_dtensor, splits
+        )
+
+        assert result is not None
+        for _, v in result:
+            assert v.is_contiguous(), "experts=='te' must emit contiguous copies, not in-place views"
+        assert not hasattr(mixin, "_inplace_loaded_native_keys") or (
+            "model.layers.0.mlp.experts.gate_and_up_projs" not in (mixin._inplace_loaded_native_keys or set())
+        )
+
+    def test_inplace_load_skips_when_backend_experts_is_te_down_projs(self):
+        # Same non-aliasing reason as the gate_and_up case, for the down_projs branch.
+        mixin = MockMoEStateDictMixin(n_experts=2, inter_dim=512)
+        mixin.backend.experts = "te"
+        local_storage = torch.randn(2, 512, 1024)
+        splits = [local_storage[i] for i in range(2)]
+        mock_dtensor = Mock(spec=["ndim", "shape", "is_meta"])
+        mock_dtensor.ndim = 3
+        mock_dtensor.shape = (2, 512, 1024)
+        mock_dtensor.is_meta = False
+
+        result = self._run_inplace_conversion(mixin, "model.layers.3.mlp.experts.down_projs", mock_dtensor, splits)
+
+        assert result is not None and len(result) == 2
+        for _, v in result:
+            assert v.is_contiguous(), "experts=='te' must emit contiguous copies, not in-place views"
+        assert not hasattr(mixin, "_inplace_loaded_native_keys") or (
+            "model.layers.3.mlp.experts.down_projs" not in (mixin._inplace_loaded_native_keys or set())
+        )
+
+    def test_inplace_load_skips_mok_gate_up_copy_but_keeps_down_view(self):
+        # GroupedExpertsMoK stores gate and up in separate contiguous Parameters;
+        # its virtual gate_and_up_projs is a torch.cat copy and cannot be a DCP
+        # write-through target. Its virtual down_projs remains a transpose view.
+        mixin = MockMoEStateDictMixin(n_experts=2, inter_dim=512)
+        mixin.backend.experts = "gmm"
+        mixin.backend.dispatcher = "mok"
+
+        gate_up_storage = torch.randn(2, 1024, 1024)
+        gate_up_dtensor = Mock()
+        gate_up_result = self._run_inplace_conversion(
+            mixin,
+            "model.layers.0.mlp.experts.gate_and_up_projs",
+            gate_up_dtensor,
+            [gate_up_storage[i] for i in range(2)],
+        )
+
+        assert gate_up_result is not None
+        assert all(value.is_contiguous() for _, value in gate_up_result)
+        assert not hasattr(mixin, "_inplace_loaded_native_keys") or (
+            "model.layers.0.mlp.experts.gate_and_up_projs" not in (mixin._inplace_loaded_native_keys or set())
+        )
+
+        down_storage = torch.randn(2, 512, 1024)
+        down_dtensor = Mock(spec=["ndim", "shape", "is_meta"])
+        down_dtensor.ndim = 3
+        down_dtensor.shape = (2, 512, 1024)
+        down_dtensor.is_meta = False
+        down_result = self._run_inplace_conversion(
+            mixin,
+            "model.layers.3.mlp.experts.down_projs",
+            down_dtensor,
+            [down_storage[i] for i in range(2)],
+        )
+
+        assert down_result is not None
+        down_ptr = down_storage.untyped_storage().data_ptr()
+        assert all(value.untyped_storage().data_ptr() == down_ptr for _, value in down_result)
+        assert "model.layers.3.mlp.experts.down_projs" in mixin._inplace_loaded_native_keys

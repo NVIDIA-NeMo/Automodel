@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Protocol
 
 import torch
 from torch import nn
+from torch.nn.parallel import DistributedDataParallel
 
 from nemo_automodel.components.checkpoint._backports.hf_utils import (
     FQN_TO_DTYPE_MAPPING_FILENAME,
@@ -27,9 +28,84 @@ from nemo_automodel.components.checkpoint._backports.hf_utils import (
 )
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState
 from nemo_automodel.components.moe.state_dict_mixin import MoESplitExpertsStateDictMixin
+from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 
 if TYPE_CHECKING:
     from peft import PeftConfig
+    from torch.distributed import ProcessGroup
+
+
+_MOE_LORA_PARAMETER_SUFFIXES = ("lora_gate_and_up_A", "lora_gate_and_up_B", "lora_down_A", "lora_down_B")
+
+
+def _is_group_rank_0(process_group: "ProcessGroup | None") -> bool:
+    return not torch.distributed.is_initialized() or torch.distributed.get_rank(group=process_group) == 0
+
+
+def _group_barrier(process_group: "ProcessGroup | None") -> None:
+    if torch.distributed.is_initialized():
+        torch.distributed.barrier(group=process_group)
+
+
+def _unwrap_ddp_model(model: nn.Module) -> nn.Module:
+    """Return the module that owns export metadata hidden by DDP."""
+    if isinstance(model, DistributedDataParallel):
+        return model.module
+    return model
+
+
+def _save_generated_hf_assets(
+    model_part: nn.Module,
+    metadata_reference_path: str | None,
+    hf_metadata_dir: str,
+    tokenizer,
+    v4_compatible: bool,
+    model_config=None,
+    save_custom_model_code: bool = True,
+) -> None:
+    """Run the existing generated Hugging Face metadata export path."""
+    if save_custom_model_code:
+        _maybe_save_custom_model_code(metadata_reference_path, hf_metadata_dir, model_part=model_part)
+
+    config = model_config if model_config is not None else getattr(model_part, "config", None)
+    if config is not None:
+        config_name = "config.json"
+        if v4_compatible and _config_exists(metadata_reference_path, config_name):
+            _save_original_config_json(metadata_reference_path, hf_metadata_dir, config_name)
+            config_name = "config.v5.json"
+
+        _maybe_strip_quantization_config(model_part, config=config)
+        with open(os.path.join(hf_metadata_dir, config_name), "w") as f:
+            if hasattr(config, "to_json_string"):
+                # Use ``use_diff=False`` so the full config (not the
+                # diff against class defaults) is serialized. For
+                # remote-code configs registered via
+                # ``register_for_auto_class`` (e.g. DeciLM /
+                # Llama-Nemotron-Super-49B ``model_type='nemotron-nas'``),
+                # ``to_diff_dict`` sees the class-level ``model_type``
+                # attribute as equal to the class default and drops
+                # it from the serialized JSON. Reloading via
+                # ``AutoConfig.from_pretrained`` on the resulting
+                # consolidated directory then raises
+                # ``Unrecognized model ... Should have a 'model_type'
+                # key``. Writing the full dict guarantees
+                # ``model_type``, ``architectures`` and ``auto_map``
+                # land in the saved config regardless of class defaults.
+                f.write(config.to_json_string(use_diff=False))
+            else:
+                # Diffusers models use FrozenDict for config instead of PretrainedConfig
+                json.dump(dict(config), f, indent=2, default=str)
+
+    if getattr(model_part, "generation_config", None) is not None:
+        config_name = "generation_config.json"
+        if v4_compatible and _config_exists(metadata_reference_path, config_name):
+            _save_original_config_json(metadata_reference_path, hf_metadata_dir, config_name)
+            config_name = "generation_config.v5.json"
+        with open(os.path.join(hf_metadata_dir, config_name), "w") as f:
+            f.write(model_part.generation_config.to_json_string())
+
+    if tokenizer is not None:
+        tokenizer.save_pretrained(hf_metadata_dir)
 
 
 class CheckpointAddon(Protocol):
@@ -42,12 +118,31 @@ class CheckpointAddon(Protocol):
     def post_save(self, **kwargs) -> None: ...
 
 
+class _ConsolidatedHFMetadataExporter(Protocol):
+    """Model-provided writer for consolidated Hugging Face metadata."""
+
+    def validate(self, *, tokenizer: object, original_model_path: str | None) -> None:
+        """Validate exporter inputs before any distributed rank writes files."""
+        ...
+
+    def save(
+        self,
+        *,
+        hf_metadata_dir: str,
+        tokenizer: object,
+        original_model_path: str | None,
+    ) -> None:
+        """Write model-specific metadata into the shared Hugging Face metadata directory."""
+        ...
+
+
 class ConsolidatedHFAddon:
     """
     Addon that writes consolidated Hugging Face metadata alongside sharded weights.
 
-    On rank 0, this saves `config.json`, `generation_config.json`, and tokenizer
-    artifacts into the provided consolidated directory, then synchronizes ranks.
+    Models can provide a custom consolidated metadata exporter; all other models
+    retain the generated config, custom-code, and tokenizer path. Rank 0 writes
+    the artifacts, then synchronizes ranks.
     """
 
     def pre_save(self, **kwargs) -> None:
@@ -59,6 +154,7 @@ class ConsolidatedHFAddon:
             hf_metadata_dir (str): Target directory for HF metadata artifacts.
             tokenizer (PreTrainedTokenizerBase | None): Optional tokenizer to save.
             fqn_to_dtype_mapping (dict[str, str] | None): Original HF safetensors dtype map.
+            original_model_path (str | None): Authoritative source checkpoint snapshot.
         """
         model_state = kwargs["model_state"]
         hf_metadata_dir = kwargs["hf_metadata_dir"]
@@ -67,53 +163,40 @@ class ConsolidatedHFAddon:
         tokenizer = kwargs.get("tokenizer", None)
         model_part = model_state.model[0]  # ModelState already converts to list if needed
         original_model_path = kwargs["original_model_path"]
+        process_group = kwargs.get("process_group")
+
+        export_model = _unwrap_ddp_model(model_part)
+        get_metadata_exporter = getattr(export_model, "_get_consolidated_hf_metadata_exporter", None)
+        metadata_exporter: _ConsolidatedHFMetadataExporter | None = (
+            get_metadata_exporter(
+                tokenizer=tokenizer,
+                original_model_path=original_model_path,
+            )
+            if callable(get_metadata_exporter)
+            else None
+        )
+        if metadata_exporter is not None:
+            metadata_exporter.validate(
+                tokenizer=tokenizer,
+                original_model_path=original_model_path,
+            )
 
         # Perform save operations on rank 0
-        if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-            # if the HF model has custom model code, we need to save it as part of the checkpoint
-            _maybe_save_custom_model_code(original_model_path, hf_metadata_dir, model_part=model_part)
-            # save the config.json file
-            if hasattr(model_part, "config"):
-                v4_compatible = kwargs.get("v4_compatible", False)
-                config_name = "config.json"
-                if v4_compatible and _config_exists(original_model_path, config_name):
-                    _save_original_config_json(original_model_path, hf_metadata_dir, config_name)
-                    config_name = "config.v5.json"
-
-                _maybe_strip_quantization_config(model_part)
-                with open(os.path.join(hf_metadata_dir, config_name), "w") as f:
-                    if hasattr(model_part.config, "to_json_string"):
-                        # Use ``use_diff=False`` so the full config (not the
-                        # diff against class defaults) is serialized. For
-                        # remote-code configs registered via
-                        # ``register_for_auto_class`` (e.g. DeciLM /
-                        # Llama-Nemotron-Super-49B ``model_type='nemotron-nas'``),
-                        # ``to_diff_dict`` sees the class-level ``model_type``
-                        # attribute as equal to the class default and drops
-                        # it from the serialized JSON. Reloading via
-                        # ``AutoConfig.from_pretrained`` on the resulting
-                        # consolidated directory then raises
-                        # ``Unrecognized model ... Should have a 'model_type'
-                        # key``. Writing the full dict guarantees
-                        # ``model_type``, ``architectures`` and ``auto_map``
-                        # land in the saved config regardless of class defaults.
-                        f.write(model_part.config.to_json_string(use_diff=False))
-                    else:
-                        # Diffusers models use FrozenDict for config instead of PretrainedConfig
-                        json.dump(dict(model_part.config), f, indent=2, default=str)
-
-            # save the generation_config.json file
-            if getattr(model_part, "generation_config", None) is not None:
-                config_name = "generation_config.json"
-                if v4_compatible and _config_exists(original_model_path, config_name):
-                    _save_original_config_json(original_model_path, hf_metadata_dir, config_name)
-                    config_name = "generation_config.v5.json"
-                with open(os.path.join(hf_metadata_dir, config_name), "w") as f:
-                    f.write(model_part.generation_config.to_json_string())
-
-            # save the tokenizer
-            if tokenizer is not None:
-                tokenizer.save_pretrained(hf_metadata_dir)
+        if _is_group_rank_0(process_group):
+            if metadata_exporter is not None:
+                metadata_exporter.save(
+                    hf_metadata_dir=hf_metadata_dir,
+                    tokenizer=tokenizer,
+                    original_model_path=original_model_path,
+                )
+            else:
+                _save_generated_hf_assets(
+                    model_part,
+                    original_model_path,
+                    hf_metadata_dir,
+                    tokenizer,
+                    v4_compatible=kwargs.get("v4_compatible", False),
+                )
 
             # save the fqn_to_file_index_mapping file
             with open(os.path.join(hf_metadata_dir, FQN_TO_FILE_INDEX_MAPPING_FILENAME), "w") as f:
@@ -121,8 +204,7 @@ class ConsolidatedHFAddon:
             if fqn_to_dtype_mapping:
                 with open(os.path.join(hf_metadata_dir, FQN_TO_DTYPE_MAPPING_FILENAME), "w") as f:
                     json.dump(fqn_to_dtype_mapping, f, indent=2, sort_keys=True)
-        if torch.distributed.is_initialized():
-            torch.distributed.barrier()
+        _group_barrier(process_group)
 
     def post_save(self, **kwargs) -> None:
         """
@@ -138,11 +220,12 @@ class ConsolidatedHFAddon:
         """
         consolidated_path = kwargs["consolidated_path"]
         hf_metadata_path = kwargs["hf_metadata_path"]
+        process_group = kwargs.get("process_group")
         if not consolidated_path:
             # in this case we are just saving the sharded HF safetensors
             return
 
-        if (not torch.distributed.is_initialized()) or (torch.distributed.get_rank() == 0):
+        if _is_group_rank_0(process_group):
             # Copy each public metadata item into consolidated_path while keeping
             # .hf_metadata intact for the offline consolidation helper.
             for item_name in os.listdir(hf_metadata_path):
@@ -154,8 +237,7 @@ class ConsolidatedHFAddon:
                     shutil.copytree(src_path, dst_path, dirs_exist_ok=True)
                 else:
                     shutil.copy2(src_path, dst_path)
-        if torch.distributed.is_initialized():
-            torch.distributed.barrier()
+        _group_barrier(process_group)
 
 
 class PeftAddon:
@@ -182,9 +264,10 @@ class PeftAddon:
         peft_config = kwargs["peft_config"]
         original_model_path = kwargs["original_model_path"]
         v4_compatible = kwargs.get("v4_compatible", False)
+        process_group = kwargs.get("process_group")
         hf_peft_config = _get_hf_peft_config(peft_config, model_state, v4_compatible=v4_compatible)
         automodel_peft_metadata = _get_automodel_peft_metadata(peft_config)
-        if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+        if _is_group_rank_0(process_group):
             # if the HF model has custom model code, we need to save it as part of the checkpoint
             model_part = model_state.model[0] if model_state is not None else None
             _maybe_save_custom_model_code(original_model_path, model_path, model_part=model_part)
@@ -197,8 +280,7 @@ class PeftAddon:
             # save the full PEFT config for inference loading inside Automodel.
             with open(os.path.join(model_path, "automodel_peft_config.json"), "w") as f:
                 json.dump(automodel_peft_metadata, f, indent=2, sort_keys=True)
-        if torch.distributed.is_initialized():
-            torch.distributed.barrier()
+        _group_barrier(process_group)
 
     def post_save(self, **kwargs) -> None:
         pass
@@ -225,9 +307,18 @@ def _get_hf_peft_config(peft_config: "PeftConfig", model_state: ModelState, v4_c
         "QuestionAnswering": "QUESTION_ANS",
         "FeatureExtraction": "FEATURE_EXTRACTION",
     }
-    model_part = model_state.model[0]
-    target_modules = _extract_target_modules(model_part, v4_compatible=v4_compatible)
-    target_parameters = _extract_target_parameters(model_part, v4_compatible=v4_compatible)
+    # Walk ALL local model parts, not just model[0]: under pipeline parallelism
+    # ModelState.model is the list of this rank's virtual stages (each holding a
+    # subset of layers). Using only model[0] would capture just the first virtual
+    # stage's layers, so adapter_config.json would under-list target_modules even
+    # after the cross-PP union. _extract_target_modules / _extract_target_parameters
+    # union across the parts internally. The model-class properties (config,
+    # architecture) are identical across parts, so read those from model[0].
+    model_parts = model_state.model
+    model_part = model_parts[0]
+    pp_group = getattr(model_state, "pp_group", None)
+    target_modules = _extract_target_modules(model_parts, v4_compatible=v4_compatible, pp_group=pp_group)
+    target_parameters = _extract_target_parameters(model_parts, v4_compatible=v4_compatible, pp_group=pp_group)
     try:
         arch_name = model_part.config.architectures[0]
         # "LlamaForCausalLM".split("For") → ["Llama", "CausalLM"]
@@ -284,30 +375,62 @@ def _get_automodel_peft_metadata(peft_config: "PeftConfig") -> dict:
     return result
 
 
-def _is_qwen3_moe(model: nn.Module) -> bool:
-    """Check whether *model* uses the Qwen3 MoE state-dict adapter."""
-    adapter = getattr(model, "state_dict_adapter", None)
-    if adapter is None:
-        return False
-    from nemo_automodel.components.models.qwen3_moe.state_dict_adapter import Qwen3MoeStateDictAdapter
+def _has_trainable_moe_lora_parameters(
+    model: "nn.Module | list[nn.Module]",
+    pp_group: "torch.distributed.ProcessGroup | None" = None,
+) -> bool:
+    """Return whether any pipeline stage owns trainable grouped-expert LoRA parameters."""
+    model_parts = model if isinstance(model, (list, tuple)) else [model]
+    parameter_endings = tuple(f".{suffix}" for suffix in _MOE_LORA_PARAMETER_SUFFIXES)
+    local_has_moe_lora = any(
+        param.requires_grad and name.endswith(parameter_endings)
+        for model_part in model_parts
+        for name, param in model_part.named_parameters()
+    )
 
-    return isinstance(adapter, Qwen3MoeStateDictAdapter)
+    if pp_group is not None and torch.distributed.get_world_size(group=pp_group) > 1:
+        world = torch.distributed.get_world_size(group=pp_group)
+        gathered = [False] * world
+        torch.distributed.all_gather_object(gathered, local_has_moe_lora, group=pp_group)
+        return any(gathered)
+
+    return local_has_moe_lora
 
 
-def _extract_target_parameters(model: nn.Module, v4_compatible: bool = False) -> list[str]:
+def _extract_target_parameters(
+    model: "nn.Module | list[nn.Module]",
+    v4_compatible: bool = False,
+    pp_group: "torch.distributed.ProcessGroup | None" = None,
+) -> list[str]:
     """Extract ``target_parameters`` for PEFT v0.18+ ParamWrapper format.
 
-    Returns fused expert parameter paths for Qwen3 MoE when not in legacy mode,
-    or an empty list otherwise.
+    Returns fused expert parameter paths for adapters that explicitly opt in
+    to PEFT v5 ParamWrapper export and have trainable grouped-expert LoRA
+    parameters, or an empty list otherwise.
+
+    ``model`` may be a single module or a list of local PP parts. When a PP
+    group is provided, expert-LoRA presence is unioned across its ranks so all
+    stages emit identical metadata.
     """
+    model_part = model[0] if isinstance(model, (list, tuple)) else model
     if v4_compatible:
         return []
-    if _is_qwen3_moe(model):
-        return ["mlp.experts.gate_up_proj", "mlp.experts.down_proj"]
+    adapter = getattr(model_part, "state_dict_adapter", None)
+    if (
+        adapter is not None
+        and isinstance(adapter, MoESplitExpertsStateDictMixin)
+        and adapter._v5_peft_target_parameters
+        and _has_trainable_moe_lora_parameters(model, pp_group=pp_group)
+    ):
+        return list(adapter._v5_peft_target_parameters)
     return []
 
 
-def _extract_target_modules(model: nn.Module, v4_compatible: bool = False) -> list[str]:
+def _extract_target_modules(
+    model: "nn.Module | list[nn.Module]",
+    v4_compatible: bool = False,
+    pp_group: "torch.distributed.ProcessGroup | None" = None,
+) -> list[str]:
     """
     Extract the target modules from the model used by LoRA/PEFT layers.
 
@@ -316,74 +439,89 @@ def _extract_target_modules(model: nn.Module, v4_compatible: bool = False) -> li
     compatibility with vLLM, TensorRT-LLM, and HF PEFT.
 
     For MoE expert LoRA, grouped 3-D adapter parameters are expanded to
-    per-expert HF projection names unless the model is Qwen3 MoE in
-    non-legacy mode (where ``target_parameters`` is used instead).
+    per-expert HF projection names when in v4-compatible mode (where
+    per-expert ``target_modules`` are used).  In v5 mode (``v4_compatible=False``)
+    the expansion is skipped because ``target_parameters`` provides the
+    fused ParamWrapper paths instead.
 
     Strips ``_orig_mod.`` (torch.compile) and ``_checkpoint_wrapped_module.``
     (activation checkpointing) prefixes from module names.
+
+    ``model`` may be a single module or a list of modules. Under pipeline
+    parallelism the caller passes the full list of this rank's virtual stages,
+    so names are unioned across all local parts (using only the first part would
+    miss the other stages' layers). When ``pp_group`` is also provided, the
+    discovered names are additionally unioned across the PP group so the result
+    covers every rank's layers too.
     """
+    model_parts = model if isinstance(model, (list, tuple)) else [model]
     # Mapping from combined projection names to their HF-compatible split names.
     _COMBINED_TO_SPLIT = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
 
-    _MOE_LORA_SUFFIXES = ("lora_gate_and_up_A", "lora_gate_and_up_B", "lora_down_A", "lora_down_B")
-
     final_target_modules = set()
-    for name, _ in model.named_modules():
-        if "lora" in name.lower():
-            target_name = name.rsplit(".", 1)[0]
-            if target_name.startswith("_orig_mod."):
-                target_name = target_name[len("_orig_mod.") :]
-            target_name = target_name.replace("_checkpoint_wrapped_module.", "")
+    for _mp in model_parts:
+        for name, _ in _mp.named_modules():
+            if "lora" in name.lower():
+                target_name = name.rsplit(".", 1)[0]
+                if target_name.startswith("_orig_mod."):
+                    target_name = target_name[len("_orig_mod.") :]
+                target_name = canonical_parameter_fqn(target_name)
 
-            # Expand combined projection names to individual HF projection names
-            last_component = target_name.rsplit(".", 1)[-1]
-            if last_component in _COMBINED_TO_SPLIT:
-                parent = target_name.rsplit(".", 1)[0] if "." in target_name else ""
-                for split_name in _COMBINED_TO_SPLIT[last_component]:
-                    expanded = f"{parent}.{split_name}" if parent else split_name
-                    final_target_modules.add(expanded)
-            else:
-                final_target_modules.add(target_name)
+                # Expand combined projection names to individual HF projection names
+                last_component = target_name.rsplit(".", 1)[-1]
+                if last_component in _COMBINED_TO_SPLIT:
+                    parent = target_name.rsplit(".", 1)[0] if "." in target_name else ""
+                    for split_name in _COMBINED_TO_SPLIT[last_component]:
+                        expanded = f"{parent}.{split_name}" if parent else split_name
+                        final_target_modules.add(expanded)
+                else:
+                    final_target_modules.add(target_name)
 
     # MoE expert LoRA: adapter weights are nn.Parameter (not nn.Module) so
     # they don't appear in named_modules(). Expand to per-expert HF names,
-    # unless Qwen3 MoE in non-legacy mode (uses target_parameters instead).
-    _has_split_expert_mixin = hasattr(model, "state_dict_adapter") and isinstance(
-        model.state_dict_adapter, MoESplitExpertsStateDictMixin
+    # unless the adapter explicitly opts into v5 fused target_parameters.
+    # Unvalidated MoE adapters keep the legacy expansion as their default.
+    adapter = getattr(model_parts[0], "state_dict_adapter", None)
+    _has_split_expert_mixin = isinstance(adapter, MoESplitExpertsStateDictMixin)
+    _uses_v5_target_parameters = bool(
+        _has_split_expert_mixin
+        and not v4_compatible
+        and adapter._v5_peft_target_parameters
+        and _has_trainable_moe_lora_parameters(model_parts)
     )
-    _skip_for_qwen3 = not v4_compatible and _is_qwen3_moe(model)
-    if _has_split_expert_mixin and not _skip_for_qwen3:
+    if _has_split_expert_mixin and not _uses_v5_target_parameters:
         seen_expert_groups: set[tuple[str, str]] = set()
-        for name, param in model.named_parameters():
-            if not param.requires_grad:
-                continue
-            for lora_suffix in _MOE_LORA_SUFFIXES:
-                if name.endswith(f".{lora_suffix}"):
-                    expert_path = name[: -len(f".{lora_suffix}")]
-                    if expert_path.startswith("_orig_mod."):
-                        expert_path = expert_path[len("_orig_mod.") :]
-                    expert_path = expert_path.replace("_checkpoint_wrapped_module.", "")
+        for _mp in model_parts:
+            for name, param in _mp.named_parameters():
+                if not param.requires_grad:
+                    continue
+                for lora_suffix in _MOE_LORA_PARAMETER_SUFFIXES:
+                    if name.endswith(f".{lora_suffix}"):
+                        expert_path = name[: -len(f".{lora_suffix}")]
+                        if expert_path.startswith("_orig_mod."):
+                            expert_path = expert_path[len("_orig_mod.") :]
+                        expert_path = canonical_parameter_fqn(expert_path)
 
-                    group = "gate_and_up" if "gate_and_up" in lora_suffix else "down"
-                    if (expert_path, group) in seen_expert_groups:
+                        group = "gate_and_up" if "gate_and_up" in lora_suffix else "down"
+                        if (expert_path, group) in seen_expert_groups:
+                            break
+                        seen_expert_groups.add((expert_path, group))
+
+                        n_experts = param.shape[0]
+                        for expert_id in range(n_experts):
+                            if group == "gate_and_up":
+                                final_target_modules.add(f"{expert_path}.{expert_id}.gate_proj")
+                                final_target_modules.add(f"{expert_path}.{expert_id}.up_proj")
+                            else:
+                                final_target_modules.add(f"{expert_path}.{expert_id}.down_proj")
                         break
-                    seen_expert_groups.add((expert_path, group))
-
-                    n_experts = param.shape[0]
-                    for expert_id in range(n_experts):
-                        if group == "gate_and_up":
-                            final_target_modules.add(f"{expert_path}.{expert_id}.gate_proj")
-                            final_target_modules.add(f"{expert_path}.{expert_id}.up_proj")
-                        else:
-                            final_target_modules.add(f"{expert_path}.{expert_id}.down_proj")
-                    break
 
     # Strip "model." prefix for encoder adapters so adapter_config.json
     # is compatible with HF PEFT / merge_lora.
-    adapter = getattr(model, "state_dict_adapter", None)
+    adapter = getattr(model_parts[0], "state_dict_adapter", None)
     if adapter is not None:
         from nemo_automodel.components.models.common.bidirectional import EncoderStateDictAdapter
 
@@ -392,10 +530,24 @@ def _extract_target_modules(model: nn.Module, v4_compatible: bool = False) -> li
                 name[len("model.") :] if name.startswith("model.") else name for name in final_target_modules
             }
 
+    # Under pipeline parallelism each rank only holds the local stage's layers,
+    # so named_modules() above yields layer-specific target names for that stage
+    # only. Union the sets across the PP group so adapter_config.json lists every
+    # trained layer, matching the gathered adapter weights (see
+    # ModelState.state_dict). Without this the config would advertise only ~1/pp
+    # of the layers.
+    if pp_group is not None and torch.distributed.get_world_size(group=pp_group) > 1:
+        world = torch.distributed.get_world_size(group=pp_group)
+        gathered: list[list[str]] = [None] * world
+        torch.distributed.all_gather_object(gathered, sorted(final_target_modules), group=pp_group)
+        for part in gathered:
+            if part:
+                final_target_modules.update(part)
+
     return sorted(final_target_modules)
 
 
-def _maybe_strip_quantization_config(model_part: nn.Module) -> None:
+def _maybe_strip_quantization_config(model_part: nn.Module, config=None) -> None:
     """Remove ``quantization_config`` from the HF config when no parameters are quantized.
 
     Models loaded from quantized checkpoints (e.g. mxfp4 GPT-OSS) carry a
@@ -405,7 +557,8 @@ def _maybe_strip_quantization_config(model_part: nn.Module) -> None:
     checkpoint is a clean bf16 checkpoint, consistent with e.g.
     ``unsloth/gpt-oss-20b-BF16``.
     """
-    config = getattr(model_part, "config", None)
+    if config is None:
+        config = getattr(model_part, "config", None)
     if config is None or not hasattr(config, "quantization_config"):
         return
 
@@ -416,7 +569,7 @@ def _maybe_strip_quantization_config(model_part: nn.Module) -> None:
     delattr(config, "quantization_config")
 
 
-def _config_exists(original_model_path: str, config_name: str) -> bool:
+def _config_exists(original_model_path: str | None, config_name: str) -> bool:
     if original_model_path is None or not os.path.isdir(original_model_path):
         return False
     src = os.path.join(original_model_path, config_name)
@@ -440,6 +593,57 @@ def _save_original_config_json(original_model_path: str, hf_metadata_dir: str, c
     dst = os.path.join(hf_metadata_dir, config_name)
     with open(dst, "w") as f:
         json.dump(cfg, f, indent=2)
+
+
+# Symbols some trust_remote_code models import at module load that newer transformers
+# removed. Map symbol -> (module, fallback literal) so a consolidated checkpoint reloads
+# under a deploy container whose transformers dropped them (e.g. DeciLM/Nemotron-Super
+# imports NEED_SETUP_CACHE_CLASSES_MAPPING, gone since transformers 4.57).
+_REMOVED_TRANSFORMERS_SYMBOLS = {
+    "NEED_SETUP_CACHE_CLASSES_MAPPING": ("transformers.generation.utils", "{}"),
+}
+
+
+def _apply_transformers_compat_guards(py_path: str) -> None:
+    """Guard imports of transformers symbols removed in newer versions.
+
+    For each copied ``.py`` that does ``from <module> import ... <symbol> ...`` where
+    ``<symbol>`` was removed upstream, insert a preamble defining the symbol on
+    ``<module>`` if absent, so the subsequent import resolves. Files that don't
+    reference such symbols are left byte-for-byte unchanged.
+    """
+    try:
+        with open(py_path, encoding="utf-8") as f:
+            text = f.read()
+    except (OSError, UnicodeDecodeError):
+        return
+
+    # Seed with symbols already guarded (cross-call idempotency); also dedups multiple
+    # import lines of the same symbol within one file.
+    guarded = {sym for sym in _REMOVED_TRANSFORMERS_SYMBOLS if f"_nemo_compat_mod.{sym}" in text}
+
+    out: list[str] = []
+    changed = False
+    for line in text.splitlines(keepends=True):
+        stripped = line.lstrip()
+        if stripped.startswith("from ") and " import " in stripped:
+            for symbol, (module, fallback) in _REMOVED_TRANSFORMERS_SYMBOLS.items():
+                if symbol not in guarded and symbol in stripped and f"from {module} import" in stripped:
+                    indent = line[: len(line) - len(stripped)]
+                    out.append(
+                        f"{indent}import {module} as _nemo_compat_mod  # noqa\n"
+                        f'{indent}if not hasattr(_nemo_compat_mod, "{symbol}"):\n'
+                        f"{indent}    _nemo_compat_mod.{symbol} = {fallback}\n"
+                        f"{indent}del _nemo_compat_mod\n"
+                    )
+                    guarded.add(symbol)
+                    changed = True
+                    break
+        out.append(line)
+
+    if changed:
+        with open(py_path, "w", encoding="utf-8") as f:
+            f.writelines(out)
 
 
 def _maybe_save_custom_model_code(
@@ -468,6 +672,7 @@ def _maybe_save_custom_model_code(
                 continue
             os.makedirs(os.path.dirname(dst_path) or hf_metadata_dir, exist_ok=True)
             shutil.copy2(src_path, dst_path)
+            _apply_transformers_compat_guards(dst_path)
             copied.add(dst_path)
 
     if original_model_path is not None:

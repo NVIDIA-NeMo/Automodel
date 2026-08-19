@@ -28,6 +28,10 @@ from nemo_automodel.components.models.common import (
     initialize_linear_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.tie_word_embeddings import (
+    TieSupport,
+    reject_unsupported_tie_word_embeddings,
+)
 from nemo_automodel.components.models.common.utils import (
     _has_dtensor_params,
     cast_model_to_dtype,
@@ -489,7 +493,6 @@ class MiMoV2FlashModel(nn.Module):
             "config": self.config,
             "inputs_embeds": inputs_embeds,
             "attention_mask": attention_mask,
-            "cache_position": cache_position,
             "past_key_values": None,
             "position_ids": position_ids,
         }
@@ -585,7 +588,12 @@ class MiMoV2FlashModel(nn.Module):
 class MiMoV2FlashForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     """Causal LM wrapper for MiMo-V2-Flash with Automodel checkpoint adapters."""
 
-    _keep_in_fp32_modules_strict = ["mlp.gate.e_score_correction_bias", "attention_sink_bias"]
+    tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
+
+    # "rotary_emb" (matches self.rotary_emb + self.swa_rotary_emb) pins their inv_freq
+    # buffers in fp32: cast_model_to_dtype's bf16 cast would otherwise round inv_freq and
+    # degrade RoPE precision vs HF (see llama/rope_utils.py).
+    _keep_in_fp32_modules_strict = ["mlp.gate.e_score_correction_bias", "attention_sink_bias", "rotary_emb"]
     _pp_keep_self_forward = True
     _skip_init_weights_on_load = True
 
@@ -627,6 +635,7 @@ class MiMoV2FlashForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     ):
         super().__init__()
         self.config = config
+        reject_unsupported_tie_word_embeddings(type(self), config)
         self.backend = backend or BackendConfig()
         moe_overrides = kwargs.pop("moe_overrides", None)
         self.model = MiMoV2FlashModel(

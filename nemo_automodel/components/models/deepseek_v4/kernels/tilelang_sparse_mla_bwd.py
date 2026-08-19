@@ -25,13 +25,9 @@
 #   - Single-head KV: kv shape [B, S_kv, D] (no kv_group, no D/D_tail split)
 #   - Index shape: [B, S, topk] (no kv_group dim)
 #   - Outputs: dQ [B, S, H, D], dKV [B, S_kv, D], dAttnSink [H]
-try:
-    import tilelang
-    from tilelang import language as T
-except ImportError as _e:
-    # See comment in tilelang_indexer_bwd.py.
-    raise ImportError(f"UnavailableError: tilelang is required for {__name__}: {_e}") from _e
 import torch
+
+from nemo_automodel.components.models.deepseek_v4.kernels._tilelang import T, tilelang
 
 
 @tilelang.jit(out_idx=[-1])
@@ -166,7 +162,13 @@ def bwd(
             Q_shared = T.alloc_shared([block_H, D], dtype)
             KV_shared = T.alloc_shared([BS, D], dtype)
             dO_shared = T.alloc_shared([block_H, D], dtype)
-            mask = T.alloc_fragment([BS], "bool")
+            # TileLang 0.1.11 vectorizes this fragment store.  Keeping the
+            # predicate as bool makes CUDA codegen try to materialize boolx8,
+            # which has no CUDA storage type on Blackwell.  ValidMask is
+            # already normalized to 0/1 int32 by the Python interface, so keep
+            # it in that representation and only form scalar predicates at use
+            # sites.
+            mask = T.alloc_fragment([BS], T.int32)
             valid_count = T.alloc_fragment([1], T.int32)
 
             P_shared_cast = T.alloc_shared([block_H, BS], dtype)
@@ -188,10 +190,10 @@ def bwd(
             for i_i in T.Pipelined(NS, num_stages=num_stages):
                 T.clear(valid_count)
                 for bi_i in T.Parallel(BS):
-                    mask[bi_i] = ValidMask[by, s_i, i_i * BS + bi_i] != 0
+                    mask[bi_i] = ValidMask[by, s_i, i_i * BS + bi_i]
 
                 for bi_i in T.serial(BS):
-                    valid_count[0] += T.if_then_else(mask[bi_i], 1, 0)
+                    valid_count[0] += mask[bi_i]
 
                 # AutoModel pads causal rows with all-invalid top-k blocks; skip those blocks before MMA.
                 if valid_count[0] != 0:
@@ -204,7 +206,7 @@ def bwd(
                     # P = exp2(scores * sm_scale_log2e - LSE)
                     for h_i, bi_i in T.Parallel(block_H, BS):
                         acc_p[h_i, bi_i] = T.if_then_else(
-                            mask[bi_i],
+                            mask[bi_i] != 0,
                             T.exp2(acc_p[h_i, bi_i] * sm_scale_mul_reciprocal_log2 - Lse[by, s_i, bz * block_H + h_i]),
                             0,
                         )

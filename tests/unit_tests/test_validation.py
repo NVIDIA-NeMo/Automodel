@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -23,6 +24,7 @@ import pytest
 import torch.nn as nn
 
 from nemo_automodel._transformers.capabilities import (
+    ModelSupports,
     _build_class_dict,
     attach_capabilities_and_validate,
     validate_for_mesh,
@@ -79,6 +81,65 @@ class _WithKwargs(nn.Module):
         return input_ids
 
 
+class _ModelOwnedPackedCP(nn.Module):
+    _packed_cp_attn_backends = ("sdpa",)
+    _supports_sdpa = True
+
+    def __init__(self, backend_attn):
+        super().__init__()
+        self.backend = SimpleNamespace(attn=backend_attn)
+
+    def forward(self, input_ids, **kwargs):
+        return input_ids
+
+
+@dataclass(frozen=True)
+class _THDCapabilities:
+    supports_tp: bool = False
+    supports_cp: bool = True
+    supports_pp: bool = True
+    supports_ep: bool = True
+    supports_thd: bool = True
+
+
+class _DeepseekV4Like(nn.Module):
+    ModelCapabilities = _THDCapabilities
+
+    def __init__(self, backend_attn="tilelang"):
+        super().__init__()
+        self.config = SimpleNamespace(model_type="deepseek_v4")
+        self.backend = SimpleNamespace(attn=backend_attn)
+
+    def forward(self, input_ids, seq_lens=None, **kwargs):
+        return input_ids
+
+
+class _GlmMoeDsaLike(nn.Module):
+    ModelCapabilities = _THDCapabilities
+
+    def __init__(self, backend_attn="tilelang"):
+        super().__init__()
+        self.config = SimpleNamespace(model_type="glm_moe_dsa")
+        self.backend = SimpleNamespace(attn=backend_attn)
+
+    def forward(self, input_ids, seq_lens=None, **kwargs):
+        return input_ids
+
+
+@dataclass(frozen=True)
+class _VisionShardingCapabilities:
+    supports_tp: bool = False
+    supports_cp: bool = True
+    supports_pp: bool = False
+    supports_ep: bool = False
+    supports_thd: bool = False
+    supports_cp_vision_frame_sharding: bool = True
+
+
+class _VisionShardingModel(nn.Module):
+    ModelCapabilities = _VisionShardingCapabilities
+
+
 def _mesh(tp=1, pp=1, cp=1, ep=1):
     return SimpleNamespace(tp_size=tp, pp_size=pp, cp_size=cp, ep_size=ep)
 
@@ -106,6 +167,24 @@ def _make_moe_cls():
             return input_ids
 
     return _MoE
+
+
+def _make_owns_cp_cls(backend_attn="eager"):
+    """MoE model that ships its own CP transport (Kimi Linear style)."""
+    from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
+
+    class _OwnsCP(MoEFSDPSyncMixin, nn.Module):
+        _owns_cp_attention = True
+        _owns_packed_attention = True
+
+        def __init__(self):
+            super().__init__()
+            self.backend = SimpleNamespace(attn=backend_attn)
+
+        def forward(self, input_ids, seq_lens=None):
+            return input_ids
+
+    return _OwnsCP
 
 
 def _make_moe_te_cls():
@@ -179,6 +258,36 @@ class TestModelSupportsTP:
         _attach(model)
         with patch(_PARALLELIZE_PATH, {}):
             assert model.supports.supports_tp is False
+
+
+class TestModelSupportsTHD:
+    def test_native_thd_capability_is_exposed(self):
+        model = _DeepseekV4Like()
+        _attach(model)
+        assert model.supports.supports_thd is True
+        assert model.supports_thd is True
+
+    def test_native_thd_defaults_false(self):
+        model = _Bare()
+        _attach(model)
+        assert model.supports.supports_thd is False
+        assert model.supports_thd is False
+
+
+class TestModelSupportsCpVisionFrameSharding:
+    def test_verified_model_capability_is_exposed(self):
+        model = _VisionShardingModel()
+        _attach(model)
+
+        assert model.supports.supports_cp_vision_frame_sharding is True
+        assert model.supports_cp_vision_frame_sharding is True
+
+    def test_undeclared_capability_defaults_false(self):
+        model = _Bare()
+        _attach(model)
+
+        assert model.supports.supports_cp_vision_frame_sharding is False
+        assert model.supports_cp_vision_frame_sharding is False
 
 
 class TestModelSupportsPP:
@@ -257,6 +366,39 @@ class TestModelSupportsCP:
         _attach(model)
         assert model.supports.supports_cp is False
 
+    def test_custom_true_when_model_owns_cp(self):
+        """A model owning its CP transport needs no TE/Magi attention backend."""
+        model = _make_owns_cp_cls()()
+        _attach(model)
+        assert model.supports.supports_cp is True
+
+    def test_deepseek_v4_true_with_tilelang(self):
+        model = _DeepseekV4Like(backend_attn="tilelang")
+        _attach(model)
+        assert model.supports.supports_cp is True
+
+    def test_deepseek_v4_false_with_te(self):
+        model = _DeepseekV4Like(backend_attn="te")
+        _attach(model)
+        assert model.supports.supports_cp is False
+
+    @pytest.mark.parametrize("backend_attn", ["torch", "sdpa"])
+    def test_deepseek_v4_false_without_tilelang(self, backend_attn):
+        model = _DeepseekV4Like(backend_attn=backend_attn)
+        _attach(model)
+        assert model.supports.supports_cp is False
+
+    def test_glm_moe_dsa_true_with_tilelang(self):
+        model = _GlmMoeDsaLike(backend_attn="tilelang")
+        _attach(model)
+        assert model.supports.supports_cp is True
+
+    @pytest.mark.parametrize("backend_attn", ["te", "sdpa", "torch"])
+    def test_glm_moe_dsa_false_without_tilelang(self, backend_attn):
+        model = _GlmMoeDsaLike(backend_attn=backend_attn)
+        _attach(model)
+        assert model.supports.supports_cp is False
+
 
 class TestModelSupportsEP:
     def test_ep_true_for_moe(self):
@@ -269,6 +411,19 @@ class TestModelSupportsEP:
         model = _Bare()
         _attach(model)
         assert model.supports.supports_ep is False
+
+
+class TestModelSupportsMTP:
+    def test_mtp_enabled_reflects_live_config(self):
+        model = _Bare()
+        model.mtp_config = SimpleNamespace(enabled=False)
+        _attach(model)
+
+        assert model.supports.mtp_enabled is False
+        model.mtp_config.enabled = True
+        assert model.supports.mtp_enabled is True
+        assert model.supports.supports_mtp_cp is False
+        assert model.supports.supports_mtp_cp_pp is False
 
 
 class TestModelSupportsSequencePacking:
@@ -313,6 +468,21 @@ class TestModelSupportsGradientCheckpointing:
 
 
 class TestModelSupportsCPWithSequencePacking:
+    @pytest.mark.parametrize(("backend", "expected"), [("sdpa", True), ("te", False)])
+    def test_model_owned_packed_cp_backend_contract(self, backend, expected):
+        model = _ModelOwnedPackedCP(backend)
+        _attach(model)
+        model._mesh = _mesh(cp=2)
+
+        assert model.supports.supports_cp_with_sequence_packing is expected
+
+    def test_model_owned_backend_contract_does_not_restrict_cp1_packing(self):
+        model = _ModelOwnedPackedCP("te")
+        _attach(model)
+        model._mesh = _mesh(cp=1)
+
+        assert model.supports.supports_cp_with_sequence_packing is True
+
     def test_cp1_seq_packing_supported(self):
         """When cp_size=1, just checks seq_lens support."""
         model = _WithSeqLens()
@@ -351,6 +521,48 @@ class TestModelSupportsCPWithSequencePacking:
         _attach(model)
         model._mesh = _mesh(cp=2)
         assert model.supports.supports_cp_with_sequence_packing is False
+
+    def test_cp_gt1_sequence_packing_supported_when_model_owns_cp(self):
+        model = _make_owns_cp_cls()()
+        _attach(model)
+        model._mesh = _mesh(cp=2)
+        assert model.supports.supports_sequence_packing is True
+        assert model.supports.supports_cp_with_sequence_packing is True
+
+    def test_deepseek_v4_cp_gt1_sequence_packing_supported_with_tilelang(self):
+        model = _DeepseekV4Like()
+        _attach(model)
+        model._mesh = _mesh(cp=2)
+        assert model.supports.supports_cp_with_sequence_packing is True
+
+    def test_deepseek_v4_cp_gt1_sequence_packing_rejects_sdpa(self):
+        model = _DeepseekV4Like(backend_attn="sdpa")
+        _attach(model)
+        model._mesh = _mesh(cp=2)
+        assert model.supports.supports_cp_with_sequence_packing is False
+
+    def test_glm_moe_dsa_cp_gt1_sequence_packing_supported_with_tilelang(self):
+        model = _GlmMoeDsaLike(backend_attn="tilelang")
+        _attach(model)
+        model._mesh = _mesh(cp=2)
+        assert model.supports.supports_cp_with_sequence_packing is True
+
+    def test_glm_moe_dsa_cp_gt1_sequence_packing_rejects_sdpa(self):
+        model = _GlmMoeDsaLike(backend_attn="sdpa")
+        _attach(model)
+        model._mesh = _mesh(cp=2)
+        assert model.supports.supports_cp_with_sequence_packing is False
+
+    def test_stale_weakref_supports_descriptor_is_rebuilt(self):
+        model = _WithSDPA()
+        stale_model = _WithSDPA()
+        model._supports = ModelSupports(stale_model, _mesh())
+        del stale_model
+
+        _attach(model)
+
+        assert model.supports_cp is True
+        assert model.supports._model is model
 
 
 class TestModelSupportsRepr:
@@ -436,6 +648,24 @@ class TestValidateForMesh:
 
     def test_cp_passes_hf_sdpa(self):
         model = _WithSDPA()
+        _attach(model)
+        validate_for_mesh(model, _mesh(cp=2))
+
+    @pytest.mark.parametrize("backend_attn", ["te", "sdpa", "flex"])
+    def test_cp_fails_deepseek_v4_non_tilelang(self, backend_attn):
+        """DSV4 + non-tilelang + cp>1 must point the user at tilelang, not TE."""
+        model = _DeepseekV4Like(backend_attn=backend_attn)
+        _attach(model)
+        with pytest.raises(ValueError, match="Context parallelism.*TileLang attention backend"):
+            validate_for_mesh(model, _mesh(cp=2))
+
+    def test_cp_passes_deepseek_v4_tilelang(self):
+        model = _DeepseekV4Like(backend_attn="tilelang")
+        _attach(model)
+        validate_for_mesh(model, _mesh(cp=2))
+
+    def test_cp_passes_glm_moe_dsa_tilelang(self):
+        model = _GlmMoeDsaLike(backend_attn="tilelang")
         _attach(model)
         validate_for_mesh(model, _mesh(cp=2))
 

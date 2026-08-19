@@ -1,0 +1,31 @@
+---
+title: "FLUX.2-dev"
+description: "Supported FLUX.2-dev checkpoint and NeMo AutoModel diffusion recipes."
+slug: model-coverage/diffusion/black-forest-labs/flux-2-dev
+---
+
+[FLUX.2-dev](https://huggingface.co/black-forest-labs/FLUX.2-dev) is a text-to-image diffusion model supported by NeMo AutoModel's flow-matching training recipe.
+
+<Info>
+
+| | |
+|---|---|
+| **Task** | Text-to-Image |
+| **Architecture** | Diffusion Transformer (Flow Matching) |
+| **HF Org** | [black-forest-labs](https://huggingface.co/black-forest-labs) |
+
+</Info>
+
+## Example Model and Recipes
+
+| Model | Recipe |
+|---|---|
+| [`black-forest-labs/FLUX.2-dev`](https://huggingface.co/black-forest-labs/FLUX.2-dev) | [Full fine-tuning](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/flux2_t2i_flow.yaml) |
+| [`black-forest-labs/FLUX.2-dev`](https://huggingface.co/black-forest-labs/FLUX.2-dev) | [LoRA](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/flux2_t2i_flow_lora.yaml) |
+
+```bash
+uv run torchrun --nproc-per-node=8 examples/diffusion/finetune/finetune.py \
+  -c examples/diffusion/finetune/flux2_t2i_flow.yaml
+```
+
+See the [Diffusion Fine-Tuning Guide](/recipes-e2e-examples/diffusion-fine-tuning).

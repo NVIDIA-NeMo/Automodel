@@ -155,9 +155,22 @@ def destroy_global_state():
 
     This function is registered to execute at exit to ensure the process group is properly destroyed.
     It temporarily ignores SIGINT to avoid interruption during cleanup.
+
+    For MoE runs that use DeepEP, the process-global DeepEP ``Buffer`` (NVSHMEM symmetric memory
+    plus its own NCCL sub-groups) is destroyed *before* ``destroy_process_group()``. Tearing the
+    buffer down first releases that pending collective state; otherwise ``destroy_process_group()``
+    hangs on it. Freeing the buffer is a no-op when DeepEP was never used.
     """
     # Don't allow Ctrl+C to interrupt this handler
     signal.signal(signal.SIGINT, signal.SIG_IGN)
+    try:
+        from nemo_automodel.components.moe.megatron.fused_a2a import free_buffer
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        free_buffer()
+    except Exception:  # pragma: no cover - best effort; deep_ep may be absent
+        pass
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         torch.distributed.destroy_process_group()
     signal.signal(signal.SIGINT, signal.SIG_DFL)

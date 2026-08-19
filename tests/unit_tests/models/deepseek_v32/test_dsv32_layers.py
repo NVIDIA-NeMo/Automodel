@@ -725,19 +725,21 @@ class TestBuildSparseMaskWithAttentionMask:
             qkv_format="bshd",
             bsz=bsz,
             n_heads=1,
-            dtype=torch.float32,
+            dtype=torch.bfloat16,
             attention_mask=attention_mask,
             union_across_batches=False,
+            as_bool=True,
         )
 
         # Result should combine both masks
         assert sparse_mask.shape == (bsz, 1, seq_len, seq_len)
+        assert sparse_mask.dtype == torch.bool
 
-        # Check that causal structure is preserved (upper triangle should be -inf)
+        # Check that causal structure is preserved (upper triangle should be masked out)
         for b in range(bsz):
             for i in range(seq_len):
                 for j in range(i + 1, seq_len):
-                    assert sparse_mask[b, 0, i, j] == float("-inf")
+                    assert not sparse_mask[b, 0, i, j]
 
 
 class TestHadamardTransformFallback:

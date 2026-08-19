@@ -223,7 +223,7 @@ def backend():
         linear="torch",
         attn="sdpa",
         rms_norm="torch",
-        enable_deepep=False,
+        dispatcher="torch",
         fake_balanced_gate=True,
         enable_hf_state_dict_adapter=False,
     )
@@ -242,6 +242,20 @@ def _make_model(backend, *, mtp_layers=0, mtp_pattern="", **cfg_overrides):
 
 
 class TestMTPDisabled:
+    def test_constructor_override_disables_native_mtp_config(self, backend):
+        """SpeechLM can skip a checkpoint-provided MTP head at load time."""
+        from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
+
+        config = MockNemotronV3Config(
+            num_nextn_predict_layers=1,
+            mtp_hybrid_override_pattern=None,
+            mtp_layers_block_type=["attention", "moe"],
+        )
+        model = NemotronHForCausalLM(config, backend=backend, num_nextn_predict_layers=0)
+
+        assert model.mtp is None
+        assert not model.mtp_config.enabled
+
     @pytest.mark.run_only_on("GPU")
     def test_no_mtp_when_config_omits_fields(self, backend):
         """When num_nextn_predict_layers is 0, self.mtp must be None and
@@ -256,6 +270,22 @@ class TestMTPDisabled:
         assert getattr(out, "mtp_loss_scaling_factor", None) is None
         assert out.loss is not None
         assert out.logits.shape == (2, 8, config.vocab_size)
+
+    @pytest.mark.run_only_on("GPU")
+    def test_compute_logits_false_skips_lm_head_and_returns_hidden_states(self, backend, monkeypatch):
+        model, config = _make_model(backend)
+        model.eval()
+        input_ids = torch.randint(0, config.vocab_size, (2, 8))
+
+        def reject_lm_head(*args, **kwargs):
+            raise AssertionError("LM head must not run when compute_logits=False")
+
+        monkeypatch.setattr(model.lm_head, "forward", reject_lm_head)
+        out = model(input_ids, compute_logits=False, output_hidden_states=True)
+
+        assert out.logits.shape == (2, 8, 0)
+        assert out.hidden_states is not None
+        assert out.hidden_states[-1].shape == (2, 8, config.hidden_size)
 
 
 class TestMTPEnabled:
@@ -324,6 +354,48 @@ class TestMTPEnabled:
         assert model.mtp.layers[0].hnorm.weight.grad is not None
         assert model.mtp.layers[0].eh_proj.weight.grad is not None
         assert model.mtp.layers[1].final_layernorm.weight.grad is not None
+
+
+class TestMTPComputeInEval:
+    """The ``compute_mtp_in_eval`` flag lets validation run the MTP heads to
+    measure per-head token acceptance, while the cached generation/decoding
+    path (``use_cache``) never pays the MTP cost. The flag defaults to False so
+    behavior is unchanged unless a harness explicitly opts in."""
+
+    def test_flag_defaults_false(self, backend):
+        """A freshly built model must not run MTP in eval by default."""
+        model, _ = _make_model(backend, mtp_layers=1, mtp_pattern="*E")
+        assert model.compute_mtp_in_eval is False
+
+    @pytest.mark.run_only_on("GPU")
+    def test_eval_runs_mtp_when_flag_enabled(self, backend):
+        """With the flag on and no KV cache, eval must emit per-depth hidden
+        states even though ``self.training`` is False."""
+        model, config = _make_model(backend, mtp_layers=1, mtp_pattern="*E")
+        model.eval()
+        model.compute_mtp_in_eval = True
+        input_ids = torch.randint(0, config.vocab_size, (2, 8))
+        out = model(input_ids, labels=input_ids.clone())
+        assert out.mtp_per_depth_h is not None
+        # D=1 in this fixture.
+        assert len(out.mtp_per_depth_h) == 1
+        assert out.mtp_loss_scaling_factor == 0.1
+
+    @pytest.mark.run_only_on("GPU")
+    def test_eval_skips_mtp_on_cached_decode_path(self, backend):
+        """Even with the flag on, the cached generation path (``use_cache``)
+        must skip MTP — decoding feeds one token at a time and must not pay
+        the MTP cost."""
+        from nemo_automodel.components.models.nemotron_v3.cache import NemotronHybridCache
+
+        model, config = _make_model(backend, mtp_layers=1, mtp_pattern="*E")
+        model.eval()
+        model.compute_mtp_in_eval = True
+        cache = NemotronHybridCache(config, batch_size=2, dtype=torch.bfloat16, device=torch.device("cuda"))
+        input_ids = torch.randint(0, config.vocab_size, (2, 8), device="cuda")
+        out = model.to("cuda")(input_ids, past_key_values=cache, use_cache=True)
+        assert out.mtp_per_depth_h is None
+        assert out.mtp_loss_scaling_factor is None
 
 
 # ---------------------------------------------------------------------------
@@ -477,6 +549,123 @@ class TestMTPLossDispatch:
         expected = 0.1 / len(mtp_per_depth_h) * (1.0 / (bsz * seq_len)) * len(mtp_per_depth_h)
         assert torch.isfinite(out).item()
         assert abs(out.item() - expected) < 1e-6, f"expected {expected}, got {out.item()}"
+
+
+class TestMTPInputEmbeds:
+    """Verify that NemotronHForCausalLM correctly uses pre-fused embeddings (inputs_embeds)
+    as the MTP future-token signal instead of re-embedding from input_ids.
+
+    This is the multimodal fix: in SALM, audio positions carry padding_id in mtp_input_ids
+    but the correct audio embedding in inputs_embeds.  Without this path, embed_fn(padding_id)
+    would be used at every audio position, injecting wrong future-token signal into MTP fusion.
+
+    The fix lives in model.py: when inputs_embeds is provided, it is pre-rolled per depth
+    and passed to MTPModule as embed_inputs, bypassing the embed_fn path entirely.
+    """
+
+    @pytest.mark.run_only_on("GPU")
+    def test_embed_inputs_overrides_embed_fn(self, backend):
+        """When embed_inputs is passed to MTPModule, the fusion sublayer receives it
+        directly instead of calling embed_fn(rolled_input_ids)."""
+        from nemo_automodel.components.models.common.mtp import MTPConfig, roll_tensor
+        from nemo_automodel.components.models.nemotron_v3.mtp import build_nemotron_v3_mtp
+
+        H = 64
+        B, S = 2, 10
+        config = MockNemotronV3Config(num_nextn_predict_layers=1, mtp_hybrid_override_pattern="*")
+        mtp_config = MTPConfig(num_layers=1, layer_pattern="*")
+        mtp = build_nemotron_v3_mtp(
+            config, mtp_config=mtp_config, backend=backend, moe_config=None, dtype=torch.bfloat16
+        ).to(torch.bfloat16)
+
+        hidden_states = torch.randn(B, S, H, dtype=torch.bfloat16)
+        # Pre-fused embeddings (e.g. SALM audio+text): fill with a recognizable value.
+        input_embeds = torch.full((B, S, H), 7.0, dtype=torch.bfloat16)
+        # Pre-roll once for depth 0 (as model.py does before calling mtp).
+        rolled = roll_tensor(input_embeds, shifts=-1, dim=-2)
+
+        captured_embed_inputs = []
+        original_first_sublayer_call = mtp.layers[0].forward
+
+        def patched_first_sublayer(h, **kwargs):
+            if "embed_input" in kwargs:
+                captured_embed_inputs.append(kwargs["embed_input"].detach().clone())
+            return original_first_sublayer_call(h, **kwargs)
+
+        mtp.layers[0].forward = patched_first_sublayer
+
+        # Pass via embed_inputs tuple (the path model.py takes for multimodal).
+        mtp(hidden_states=hidden_states, embed_inputs=(rolled,))
+
+        assert len(captured_embed_inputs) == 1
+        assert torch.allclose(captured_embed_inputs[0], rolled), (
+            "embed_input to fusion sublayer should equal the pre-rolled embed_inputs tensor"
+        )
+
+    @pytest.mark.run_only_on("GPU")
+    def test_without_inputs_embeds_uses_embed_fn(self, backend):
+        """Regression: when inputs_embeds is absent the original embed_fn path is unchanged."""
+        from nemo_automodel.components.models.common.mtp import MTPConfig
+        from nemo_automodel.components.models.nemotron_v3.mtp import build_nemotron_v3_mtp
+
+        H = 64
+        B, S = 2, 10
+        config = MockNemotronV3Config(num_nextn_predict_layers=1, mtp_hybrid_override_pattern="*")
+        mtp_config = MTPConfig(num_layers=1, layer_pattern="*")
+        mtp = build_nemotron_v3_mtp(
+            config, mtp_config=mtp_config, backend=backend, moe_config=None, dtype=torch.bfloat16
+        ).to(torch.bfloat16)
+
+        hidden_states = torch.randn(B, S, H, dtype=torch.bfloat16)
+        input_ids = torch.randint(0, 64, (B, S))
+        sentinel = torch.full((B, S, H), 5.0, dtype=torch.bfloat16)
+
+        embed_fn_calls = []
+
+        def embed_fn(ids):
+            embed_fn_calls.append(ids.clone())
+            return sentinel.clone()
+
+        captured_embed_inputs = []
+        original_first_sublayer_call = mtp.layers[0].forward
+
+        def patched_first_sublayer(h, **kwargs):
+            if "embed_input" in kwargs:
+                captured_embed_inputs.append(kwargs["embed_input"].detach().clone())
+            return original_first_sublayer_call(h, **kwargs)
+
+        mtp.layers[0].forward = patched_first_sublayer
+
+        mtp(hidden_states=hidden_states, input_ids=input_ids, embed_fn=embed_fn)
+
+        assert len(embed_fn_calls) == 1, "embed_fn must be called when no embed_inputs provided"
+        assert len(captured_embed_inputs) == 1
+        assert torch.allclose(captured_embed_inputs[0], sentinel), (
+            "embed_input must equal embed_fn output when embed_inputs is None"
+        )
+
+    @pytest.mark.run_only_on("GPU")
+    def test_model_forward_passes_inputs_embeds_to_mtp(self, backend):
+        """NemotronHForCausalLM.forward() must thread inputs_embeds into self.mtp() so
+        that the per-depth hidden states differ from the inputs_embeds-absent case."""
+        model, config = _make_model(backend, mtp_layers=1, mtp_pattern="*E")
+        model.train()
+        B, S = 2, 8
+        input_ids = torch.randint(0, config.vocab_size, (B, S))
+        # Craft inputs_embeds that differ from what embed_tokens(input_ids) would give.
+        inputs_embeds = torch.randn(B, S, config.hidden_size, dtype=torch.bfloat16)
+
+        # Forward with input_ids only (embed_fn path).
+        out_ids = model(input_ids=input_ids, labels=input_ids.clone())
+        # Forward with inputs_embeds (rolled-embeds path), keeping input_ids for MTP token rolling.
+        out_embs = model(input_ids=input_ids, inputs_embeds=inputs_embeds, labels=input_ids.clone())
+
+        assert out_embs.mtp_per_depth_h is not None
+        # The two forwards used different future-token embeddings in MTP, so the
+        # per-depth hidden states must differ.
+        assert not torch.allclose(out_ids.mtp_per_depth_h[0], out_embs.mtp_per_depth_h[0]), (
+            "mtp_per_depth_h should differ when inputs_embeds differ from embed_tokens(input_ids)"
+        )
 
 
 class TestMTPStateDictAdapter:

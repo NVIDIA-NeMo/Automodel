@@ -28,7 +28,9 @@ from nemo_automodel.components.moe.experts import (
     GroupedExperts,
     GroupedExpertsDeepEP,
     _apply_bias,
+    _DeterministicBiasRepeatInterleave,
     _permute_tokens_for_grouped_mm,
+    _stabilize_empty_routing_probs_dtype,
     _torch_mm_experts_fwd,
     get_expert_activation_for_deepep,
     is_gated_activation,
@@ -206,6 +208,101 @@ class TestSwigluClampedDeepEP:
 
         assert out.dtype == torch.bfloat16
         assert out.shape == (2, 4)
+
+
+class TestGroupedExpertsRouteWeightAfterDown:
+    """Tests for Kimi-style expert output weighting."""
+
+    def _tiny_config(self, *, apply_router_weight_after_down: bool = True, expert_activation: str = "swiglu"):
+        return MoEConfig(
+            n_routed_experts=2,
+            n_shared_experts=0,
+            n_activated_experts=2,
+            n_expert_groups=1,
+            n_limited_groups=1,
+            train_gate=True,
+            gate_bias_update_factor=0.0,
+            aux_loss_coeff=0.0,
+            score_func="sigmoid",
+            route_scale=1.0,
+            dim=2,
+            inter_dim=4,
+            moe_inter_dim=2,
+            norm_topk_prob=False,
+            router_bias=False,
+            expert_bias=True,
+            expert_activation=expert_activation,
+            apply_router_weight_after_down=apply_router_weight_after_down,
+            dtype=torch.float32,
+        )
+
+    def test_loop_matches_reference_weight_after_down_projection(self):
+        config = self._tiny_config()
+        experts = GroupedExperts(config)
+        with torch.no_grad():
+            experts.gate_and_up_projs.copy_(
+                torch.tensor(
+                    [
+                        [[1.0, 0.0, 0.5, 0.0], [0.0, 1.0, 0.0, 0.5]],
+                        [[0.25, -0.5, 1.0, 0.25], [0.75, 0.5, -0.25, 1.0]],
+                    ]
+                )
+            )
+            experts.down_projs.copy_(
+                torch.tensor(
+                    [
+                        [[1.0, 0.5], [-0.25, 0.75]],
+                        [[0.5, -1.0], [1.25, 0.25]],
+                    ]
+                )
+            )
+            experts.gate_up_proj_bias.copy_(torch.tensor([[0.1, -0.2, 0.3, -0.4], [0.2, 0.1, -0.1, 0.4]]))
+            experts.down_proj_bias.copy_(torch.tensor([[0.05, -0.1], [-0.2, 0.15]]))
+
+        x = torch.tensor([[1.0, -2.0], [0.5, 1.5], [-1.0, 0.25]])
+        weights = torch.tensor([[0.2, 0.7], [0.4, 0.3], [0.9, 0.1]])
+        indices = torch.tensor([[0, 1], [1, 0], [0, 1]])
+        token_mask = torch.ones(x.shape[0], dtype=torch.bool)
+
+        output = experts(x, token_mask, weights, indices)
+
+        expected = torch.zeros_like(x)
+        for token_idx in range(x.shape[0]):
+            for top_idx in range(indices.shape[1]):
+                expert_idx = indices[token_idx, top_idx]
+                gate_up = x[token_idx : token_idx + 1] @ experts.gate_and_up_projs[expert_idx]
+                gate_up = gate_up + experts.gate_up_proj_bias[expert_idx]
+                gate, up = torch.chunk(gate_up, 2, dim=-1)
+                expert_out = torch.nn.functional.silu(gate) * up
+                expert_out = expert_out @ experts.down_projs[expert_idx]
+                expert_out = expert_out + experts.down_proj_bias[expert_idx]
+                expected[token_idx] += expert_out.squeeze(0) * weights[token_idx, top_idx]
+
+        torch.testing.assert_close(output, expected)
+
+    def test_default_down_bias_stays_weighted_by_route(self):
+        config = self._tiny_config(apply_router_weight_after_down=False)
+        experts = GroupedExperts(config)
+        with torch.no_grad():
+            experts.gate_and_up_projs.zero_()
+            experts.down_projs.zero_()
+            experts.gate_up_proj_bias.zero_()
+            experts.down_proj_bias.copy_(torch.tensor([[1.0, -2.0], [3.0, 4.0]]))
+
+        x = torch.tensor([[0.5, -1.0], [1.5, 2.0]])
+        weights = torch.tensor([[0.2, 0.7], [0.4, 0.3]])
+        indices = torch.tensor([[0, 1], [1, 0]])
+        token_mask = torch.ones(x.shape[0], dtype=torch.bool)
+
+        output = experts(x, token_mask, weights, indices)
+
+        expected = torch.stack(
+            [
+                experts.down_proj_bias[0] * weights[0, 0] + experts.down_proj_bias[1] * weights[0, 1],
+                experts.down_proj_bias[1] * weights[1, 0] + experts.down_proj_bias[0] * weights[1, 1],
+            ]
+        )
+        torch.testing.assert_close(output, expected)
 
 
 class TestGroupedExpertsZeroActiveExperts:
@@ -736,6 +833,17 @@ class TestGroupedExpertsDeepEP:
         expected_shape = (moe_config.n_routed_experts, moe_config.dim, moe_config.moe_inter_dim * 2)
         assert experts.gate_and_up_projs.shape == expected_shape
 
+    def test_empty_routing_probs_match_activation_dtype(self):
+        """Empty DeepEP metadata is stable across checkpoint recomputation."""
+        empty_probs = torch.empty(0, dtype=torch.float32)
+        nonempty_probs = torch.ones(1, dtype=torch.float32)
+
+        stabilized = _stabilize_empty_routing_probs_dtype(empty_probs, torch.bfloat16)
+
+        assert stabilized.shape == empty_probs.shape
+        assert stabilized.dtype == torch.bfloat16
+        assert _stabilize_empty_routing_probs_dtype(nonempty_probs, torch.bfloat16) is nonempty_probs
+
     def test_grouped_experts_deepep_token_dispatcher_init(self, moe_config):
         """Test token dispatcher initialization."""
         experts = GroupedExpertsDeepEP(moe_config)
@@ -779,32 +887,155 @@ class TestGroupedExpertsDeepEP:
         """Test _apply_bias method with bias."""
         _ = GroupedExpertsDeepEP(moe_config)
 
-        value = torch.randn(4, 8)
-        bias = [torch.randn(8), torch.randn(8)]
+        value = torch.randn(4, 8, requires_grad=True)
+        bias = [torch.randn(8, requires_grad=True), torch.randn(8, requires_grad=True)]
         tokens_per_expert = torch.tensor([2, 2])
 
         result = _apply_bias(value, bias=bias, tokens_per_expert=tokens_per_expert)
+        expected = torch.cat([value[:2] + bias[0], value[2:] + bias[1]])
 
-        assert result.shape == value.shape
-        assert result.dtype == value.dtype
+        torch.testing.assert_close(result, expected)
+
+        result.sum().backward()
+        torch.testing.assert_close(value.grad, torch.ones_like(value))
+        for expert_bias in bias:
+            torch.testing.assert_close(expert_bias.grad, torch.full_like(expert_bias, 2))
 
     def test_grouped_experts_deepep_apply_bias_with_probs(self, moe_config):
         """Test _apply_bias method with permuted probabilities."""
         _ = GroupedExpertsDeepEP(moe_config)
 
-        # The bias application works on flattened tokens (4 tokens total)
-        # Split by tokens_per_expert: [2, 2] means first 2 tokens go to expert 0, next 2 to expert 1
-        value = torch.randn(4, 8)  # 4 tokens, 8 features each
-        bias = [torch.randn(8), torch.randn(8)]  # One bias per expert (8 features each)
-        tokens_per_expert = torch.tensor([2, 2])  # 2 tokens per expert
-        # Permuted probs need to match the shape after broadcasting with bias
-        # Each expert gets 2 tokens, and bias has shape (8,), so probs should have shape (2, 8) total
-        # But looking at the code, it seems like permuted_probs should be per-token, not per-feature
-        permuted_probs = torch.randn(4, 8)  # 4 tokens, 8 features each to match bias shape
+        value = torch.randn(4, 8, requires_grad=True)
+        bias = torch.randn(2, 8, requires_grad=True)
+        tokens_per_expert = torch.tensor([2, 2])
+        permuted_probs = torch.randn(4, 1, requires_grad=True)
 
         result = _apply_bias(value, bias=bias, tokens_per_expert=tokens_per_expert, permuted_probs=permuted_probs)
+        expected_bias = torch.cat([bias[0].expand(2, -1), bias[1].expand(2, -1)])
+        expected = value + expected_bias * permuted_probs
 
-        assert result.shape == value.shape
+        torch.testing.assert_close(result, expected)
+
+        result.sum().backward()
+        torch.testing.assert_close(value.grad, torch.ones_like(value))
+        expected_bias_grad = torch.stack(
+            [
+                permuted_probs[:2].detach().sum().expand_as(bias[0]),
+                permuted_probs[2:].detach().sum().expand_as(bias[1]),
+            ]
+        )
+        expected_probs_grad = expected_bias.detach().sum(dim=-1, keepdim=True)
+        torch.testing.assert_close(bias.grad, expected_bias_grad)
+        torch.testing.assert_close(permuted_probs.grad, expected_probs_grad)
+
+    @pytest.mark.parametrize(
+        ("bias_requires_grad", "use_probs", "expected_bias_grad_dtype", "expected_probs_grad_dtype"),
+        [
+            pytest.param(True, False, torch.bfloat16, None, id="trainable-unweighted"),
+            pytest.param(True, True, torch.bfloat16, torch.float32, id="trainable-fp32-weighted"),
+            pytest.param(False, True, None, torch.float32, id="frozen-fp32-weighted"),
+        ],
+    )
+    def test_grouped_experts_deepep_apply_bias_dtypes(
+        self,
+        moe_config,
+        bias_requires_grad,
+        use_probs,
+        expected_bias_grad_dtype,
+        expected_probs_grad_dtype,
+    ):
+        """Trainable, promoted, and frozen bias paths preserve their public dtypes."""
+        _ = GroupedExpertsDeepEP(moe_config)
+        value = torch.randn(4, 8, dtype=torch.bfloat16, requires_grad=True)
+        bias = torch.randn(2, 8, dtype=torch.bfloat16, requires_grad=bias_requires_grad)
+        tokens_per_expert = torch.tensor([1, 3])
+        permuted_probs = torch.rand(4, 1, dtype=torch.float32, requires_grad=True) if use_probs else None
+
+        result = _apply_bias(value, bias, tokens_per_expert, permuted_probs)
+        result.backward(torch.randn_like(result))
+
+        assert result.dtype == torch.bfloat16
+        assert value.grad is not None
+        assert value.grad.dtype == torch.bfloat16
+        if expected_bias_grad_dtype is None:
+            assert bias.grad is None
+        else:
+            assert bias.grad is not None
+            assert bias.grad.dtype == expected_bias_grad_dtype
+        if expected_probs_grad_dtype is not None:
+            assert permuted_probs is not None
+            assert permuted_probs.grad is not None
+            assert permuted_probs.grad.dtype == expected_probs_grad_dtype
+
+    def test_grouped_experts_deepep_apply_bias_with_empty_experts(self, moe_config):
+        """Zero-token experts and higher-rank outputs preserve grouped order."""
+        _ = GroupedExpertsDeepEP(moe_config)
+
+        value = torch.randn(2, 2, 8)
+        bias = torch.randn(4, 8)
+        tokens_per_expert = torch.tensor([2, 0, 2, 0])
+
+        result = _apply_bias(value, bias=bias, tokens_per_expert=tokens_per_expert)
+        flat_value = value.view(-1, value.shape[-1])
+        expected = torch.cat([flat_value[:2] + bias[0], flat_value[2:] + bias[2]]).view_as(value)
+
+        torch.testing.assert_close(result, expected)
+
+    def test_grouped_experts_deepep_apply_bias_cpu_fallback_matches_fp64_cancellation(self, moe_config):
+        """The CPU fallback retains small residuals after large cancellation."""
+        _ = GroupedExpertsDeepEP(moe_config)
+        n_tokens = 4096
+        hidden = 8
+        value = torch.zeros(n_tokens, hidden, dtype=torch.float32)
+        bias = torch.zeros(2, hidden, dtype=torch.float32, requires_grad=True)
+        tokens_per_expert = torch.tensor([n_tokens, 0])
+        permuted_probs = torch.ones(n_tokens, 1, dtype=torch.float32)
+        permuted_probs[n_tokens // 2 :] = 0.9999
+        upstream_grad = torch.ones(n_tokens, hidden, dtype=torch.float32)
+        upstream_grad[n_tokens // 2 :] = -1
+
+        _apply_bias(value, bias, tokens_per_expert, permuted_probs).backward(upstream_grad)
+
+        expected_grad = torch.zeros_like(bias)
+        expected_grad[0] = (upstream_grad * permuted_probs).double().sum(dim=0).float()
+        assert bias.grad is not None
+        torch.testing.assert_close(bias.grad, expected_grad, rtol=0, atol=0)
+
+    def test_deterministic_bias_repeat_interleave_supports_higher_order_gradients(self):
+        """The differentiable fallback preserves the custom function's double backward."""
+        bias = torch.randn(3, 2, dtype=torch.float64, requires_grad=True)
+        token_counts = torch.tensor([0, 2, 1], dtype=torch.long)
+
+        def expand(candidate_bias: torch.Tensor) -> torch.Tensor:
+            """Expand an expert bias for numerical differentiation.
+
+            Args:
+                candidate_bias: Tensor of shape [experts, hidden].
+
+            Returns:
+                Tensor of shape [tokens, hidden].
+            """
+            return _DeterministicBiasRepeatInterleave.apply(candidate_bias, token_counts, 3)
+
+        assert torch.autograd.gradcheck(expand, (bias,))
+        assert torch.autograd.gradgradcheck(expand, (bias,))
+
+    @pytest.mark.parametrize("use_probs", [False, True], ids=["unweighted", "fp32-weighted"])
+    def test_grouped_experts_deepep_apply_bias_backward_is_fullgraph_compatible(self, moe_config, use_probs):
+        """The deterministic bias backward remains traceable by AOTAutograd."""
+        _ = GroupedExpertsDeepEP(moe_config)
+        value = torch.randn(4, 8, requires_grad=True)
+        bias = torch.randn(3, 8, requires_grad=True)
+        tokens_per_expert = torch.tensor([0, 1, 3])
+        permuted_probs = torch.rand(4, 1, dtype=torch.float32, requires_grad=True) if use_probs else None
+        compiled_apply_bias = torch.compile(_apply_bias, backend="aot_eager", fullgraph=True)
+
+        compiled_apply_bias(value, bias, tokens_per_expert, permuted_probs).square().sum().backward()
+
+        assert value.grad is not None
+        assert bias.grad is not None
+        if permuted_probs is not None:
+            assert permuted_probs.grad is not None
 
     def test_grouped_experts_deepep_init_with_hybridep_backend(self, moe_config):
         """Test GroupedExpertsDeepEP initialization with hybridep backend."""
@@ -1039,6 +1270,16 @@ class TestNonGatedActivations:
             swiglu_config.dim,
             swiglu_config.moe_inter_dim * 2,
         )
+
+
+def test_grouped_experts_te_rejects_router_weight_after_down_without_te_import(moe_config):
+    """TE must fail loudly before importing optional TE when route weights would be applied incorrectly."""
+    from nemo_automodel.components.moe.experts import GroupedExpertsTE
+
+    moe_config.apply_router_weight_after_down = True
+
+    with pytest.raises(ValueError, match="GroupedExpertsTE"):
+        GroupedExpertsTE(moe_config)
 
 
 @pytest.mark.skipif(SKIP_TE_TESTS, reason="TransformerEngine and CUDA required")
@@ -1814,6 +2055,46 @@ class TestGroupedExpertsTE:
             assert experts.gate_up_linear.out_features == config.moe_inter_dim
             assert experts.gate_up_linear.num_gemms == config.n_routed_experts // 2
 
+    def test_grouped_experts_te_zero_routed_tokens_grads_all_local_experts(self, te_moe_config):
+        """All local expert params must get (zero) grads when no tokens are routed locally.
+
+        Grouped GEMM produces explicit zero gradients for every local expert.
+        The zero-token fallback must do the same: a parameter left with
+        ``grad=None`` skips momentum decay, decoupled weight decay, and its
+        optimizer step, so its optimizer state silently diverges from ranks
+        that did receive tokens.
+        """
+        from nemo_automodel.components.moe.experts import GroupedExpertsTE
+
+        device = torch.device(f"cuda:{torch.cuda.current_device()}")
+        experts = GroupedExpertsTE(te_moe_config)
+        self._materialize_weights(experts, device)
+
+        num_tokens = 4
+        x = torch.randn(num_tokens, te_moe_config.dim, dtype=te_moe_config.dtype, device=device)
+        token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+        weights = torch.rand(num_tokens, te_moe_config.n_activated_experts, device=device)
+        indices = torch.zeros(num_tokens, te_moe_config.n_activated_experts, dtype=torch.long, device=device)
+
+        # Simulate an EP step where the dispatcher hands this rank zero tokens.
+        empty_hidden = torch.zeros(0, te_moe_config.dim, dtype=te_moe_config.dtype, device=device)
+        empty_probs = torch.zeros(0, dtype=te_moe_config.dtype, device=device)
+        zero_splits = [0] * te_moe_config.n_routed_experts
+        dispatcher = Mock()
+        dispatcher.token_permutation2 = Mock(return_value=(empty_hidden, zero_splits, empty_probs))
+        dispatcher.token_unpermutation = Mock(side_effect=lambda output: output)
+        experts.token_dispatcher = dispatcher
+        experts.ep_size = 1
+
+        y = experts(x, token_mask, weights, indices)
+        y.sum().backward()
+
+        params = list(experts.gate_up_linear.parameters()) + list(experts.down_linear.parameters())
+        assert len(params) == 2 * te_moe_config.n_routed_experts
+        for param in params:
+            assert param.grad is not None, "expert parameter received no gradient in the zero-token fallback"
+            assert torch.count_nonzero(param.grad) == 0
+
 
 class TestPermuteTokensForGroupedMM:
     """Test _permute_tokens_for_grouped_mm helper function."""
@@ -1895,13 +2176,19 @@ class TestPermuteTokensForGroupedMM:
         weights = torch.tensor([[0.7, 0.3]], device=device)
         token_mask = torch.ones(1, dtype=torch.bool, device=device)
 
-        sorted_ids, sorted_weights, tpe, offs = _permute_tokens_for_grouped_mm(
-            indices, weights, token_mask, n_local_experts=2, experts_start_idx=0
+        sorted_ids, sorted_slots, sorted_weights, tpe, offs = _permute_tokens_for_grouped_mm(
+            indices,
+            weights,
+            token_mask,
+            n_local_experts=2,
+            experts_start_idx=0,
+            return_slot_ids=True,
         )
 
         # Sorted by expert: expert 0 first (weight 0.3), expert 1 second (weight 0.7)
         assert tpe[0].item() == 1  # expert 0
         assert tpe[1].item() == 1  # expert 1
+        torch.testing.assert_close(sorted_slots, torch.tensor([1, 0], device=device))
         torch.testing.assert_close(sorted_weights[0], torch.tensor(0.3, device=device))
         torch.testing.assert_close(sorted_weights[1], torch.tensor(0.7, device=device))
 

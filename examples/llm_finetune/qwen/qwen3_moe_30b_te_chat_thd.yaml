@@ -65,7 +65,7 @@ distributed:
   strategy: fsdp2
   tp_size: 1
   cp_size: 2
-  pp_size: 1
+  pp_size: 2
   ep_size: 4
 
   sequence_parallel: false
@@ -73,7 +73,7 @@ distributed:
 
   pipeline:
     pp_schedule: interleaved1f1b
-    pp_microbatch_size: 4
+    pp_microbatch_size: 1
     round_virtual_stages_to_pp_multiple: down
     scale_grads_in_schedule: false
     patch_inner_model: false
@@ -91,6 +91,7 @@ dataset:
   truncation: true
   seq_length: 1024
   padding: max_length
+  chat_template: examples/convergence/tulu3/models/qwen3-moe-30b/chat_template.jinja
 
 packed_sequence:
   # No packing — the THD collater synthesizes seq_lens from ChatDataset output.
@@ -109,6 +110,7 @@ validation_dataset:
   truncation: true
   seq_length: 1024
   padding: max_length
+  chat_template: examples/convergence/tulu3/models/qwen3-moe-30b/chat_template.jinja
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
@@ -131,3 +133,7 @@ optimizer:
 
 ci:
   recipe_owner: hemildesai
+  # pp_size=2 splits the model across 2 pipeline stages; needs 2 nodes (16xH100)
+  # so each stage's shard fits in 80GB (pp=2 on a single node is memory-neutral
+  # vs pp=1 and still OOMs). Verified at ~19 GiB/GPU on cw-dfw.
+  nodes: 2

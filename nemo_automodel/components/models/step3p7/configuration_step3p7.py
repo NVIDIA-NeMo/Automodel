@@ -323,7 +323,11 @@ class Step3p7Config(PretrainedConfig):
 
         rope_scaling = kwargs.get("rope_scaling")
         if isinstance(rope_scaling, dict):
-            kwargs["rope_scaling"] = dict(rope_scaling)
+            rope_scaling = dict(rope_scaling)
+            rope_type = rope_scaling.get("rope_type", rope_scaling.get("type"))
+            if rope_type == "yarn" and "original_max_position_embeddings" not in rope_scaling:
+                rope_scaling["original_max_position_embeddings"] = text_config.max_position_embeddings
+            kwargs["rope_scaling"] = rope_scaling
 
         self.understand_projector_stride = understand_projector_stride
         self.projector_bias = projector_bias
