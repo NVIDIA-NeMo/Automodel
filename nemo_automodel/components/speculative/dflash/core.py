@@ -157,7 +157,17 @@ def compute_acceptance_stats(
         Three scalar tensors: mean acceptance length, its additive sum, and the
         number of blocks containing at least one valid drafted token.
     """
-    block_accept = compute_accept_len(pred_ids_4d, target_ids_4d, valid_mask_4d)
+    correct_4d = pred_ids_4d == target_ids_4d
+    return _compute_acceptance_stats_from_correct(correct_4d, valid_mask_4d)
+
+
+def _compute_acceptance_stats_from_correct(
+    correct_4d: torch.Tensor,
+    valid_mask_4d: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return acceptance statistics from ``[batch, blocks, depth]`` correctness."""
+    correct_or_invalid = correct_4d | (~valid_mask_4d)
+    block_accept = (correct_or_invalid.long().cumprod(dim=2) * valid_mask_4d.long()).sum(dim=2).float()
     valid_block_mask = valid_mask_4d.any(dim=2)
     valid_blocks = valid_block_mask.sum()
     accept_len_sum = ((block_accept + 1.0) * valid_block_mask).sum()
@@ -184,12 +194,24 @@ class DFlashTrainerModule(nn.Module):
         loss_type: str = "dflash",
         prefix_weight_base: float = 0.9,
         sliding_window: int | None = None,
+        *,
+        max_total_anchors: int | None = None,
+        use_fused_linear_ce: bool = False,
+        linear_ce_chunk_size: int = 1024,
     ):
         super().__init__()
         if loss_type not in _DFLASH_LOSS_TYPES:
             raise ValueError(f"loss_type must be one of {_DFLASH_LOSS_TYPES}, got {loss_type!r}")
         if prefix_weight_base <= 0:
             raise ValueError(f"prefix_weight_base must be > 0, got {prefix_weight_base}")
+        if num_anchors <= 0:
+            raise ValueError(f"num_anchors must be > 0, got {num_anchors}")
+        if max_total_anchors is not None and max_total_anchors <= 0:
+            raise ValueError(f"max_total_anchors must be > 0 or None, got {max_total_anchors}")
+        if linear_ce_chunk_size <= 0:
+            raise ValueError(f"linear_ce_chunk_size must be > 0, got {linear_ce_chunk_size}")
+        if use_fused_linear_ce and loss_type != "dflash":
+            raise ValueError("use_fused_linear_ce is only supported with loss_type='dflash'")
         self.draft_model = draft_model
         # Keep the frozen target lm_head / embed_tokens as NON-registered
         # references. Under tensor parallelism their weights are DTensors; a
@@ -210,9 +232,11 @@ class DFlashTrainerModule(nn.Module):
         if sliding_window is not None and sliding_window < 1:
             raise ValueError(f"sliding_window must be >= 1 when set, got {sliding_window}.")
         self.sliding_window = sliding_window
+        self.max_total_anchors = max_total_anchors
         self.loss_decay_gamma = loss_decay_gamma
         self.loss_type = loss_type
         self.prefix_weight_base = float(prefix_weight_base)
+        self.use_fused_linear_ce = bool(use_fused_linear_ce)
         # Smallest visible-prefix length variable-prefix training samples (and the
         # slice point of its loss); single source of truth for both methods.
         self._min_prefix = min(2, block_size - 1)
@@ -222,7 +246,16 @@ class DFlashTrainerModule(nn.Module):
         # ``loss_decay_gamma=None`` disables decay (uniform weights). The
         # variable-prefix objective needs per-block data-dependent weights and
         # computes its loss inline instead (see _variable_prefix_loss).
-        self.loss_fn = DFlashDecayLoss(loss_gamma=loss_decay_gamma, normalize="mean") if loss_type == "dflash" else None
+        self.loss_fn = (
+            DFlashDecayLoss(
+                loss_gamma=loss_decay_gamma,
+                use_fused_linear_ce=use_fused_linear_ce,
+                chunk_size=linear_ce_chunk_size,
+                normalize="mean",
+            )
+            if loss_type == "dflash"
+            else None
+        )
 
         # Per-block offset constant (block_size,) for label gathering / position ids.
         self.register_buffer("_block_offsets", torch.arange(block_size).view(1, 1, -1), persistent=False)
@@ -263,6 +296,15 @@ class DFlashTrainerModule(nn.Module):
         # by ``keep_mask`` below); no -1, which would spuriously raise when the
         # richest sample has exactly one valid anchor and always drop one otherwise.
         max_n = min(self.num_anchors, int(valid_counts.max().item()))
+        if self.max_total_anchors is not None:
+            if self.max_total_anchors < bsz:
+                raise ValueError(
+                    f"max_total_anchors ({self.max_total_anchors}) must be at least the local batch size ({bsz})"
+                )
+            # Blocks are represented by rectangular [B, N, ...] tensors. Cap N
+            # uniformly so the number of constructed slots B*N stays within the
+            # local micro-batch budget, including padded slots.
+            max_n = min(max_n, self.max_total_anchors // bsz)
         if max_n <= 0:
             doc_note = " with block_size-1 further real tokens in its document" if doc_remaining is not None else ""
             raise NoValidAnchorsError(
@@ -546,10 +588,6 @@ class DFlashTrainerModule(nn.Module):
             target_hidden=hidden_states,
             attention_mask=dflash_attn_mask,
         )
-        # A tensor-parallel target's lm_head is column-parallel and returns
-        # vocab-sharded (DTensor) logits; gather to a full tensor for the loss.
-        logits = _to_full_tensor(self.lm_head(output_hidden))
-
         n = anchor_positions.size(1)
         bs = self.block_size
 
@@ -559,17 +597,34 @@ class DFlashTrainerModule(nn.Module):
         )
 
         if self.loss_type == "variable_prefix":
+            # Variable-prefix training has data-dependent per-block suffixes and
+            # still uses the dense objective.
+            logits = _to_full_tensor(self.lm_head(output_hidden))
             return self._variable_prefix_loss(logits.view(bsz, n, bs, -1), target_ids, block_mask, prefix_lengths)
 
         # Drop block position 0 (the clean anchor token, never a target); the
         # remaining bs-1 predicted positions are what the loss supervises.
-        pred_logits = logits.view(bsz, n, bs, -1)[:, :, 1:, :].reshape(bsz, n * (bs - 1), -1)
+        pred_hidden = output_hidden.view(bsz, n, bs, -1)[:, :, 1:, :].reshape(bsz, n * (bs - 1), -1)
         pred_targets = target_ids[:, :, 1:].reshape(bsz, n * (bs - 1))
         pred_mask = block_mask[:, :, 1:].reshape(bsz, n * (bs - 1))
 
         loss_fn = self.loss_fn
         assert loss_fn is not None, "loss_fn is always constructed for loss_type='dflash'"
-        loss_out = loss_fn(pred_logits, pred_targets, pred_mask, num_tokens=None, block_size=bs)
+        if self.use_fused_linear_ce:
+            loss_out = loss_fn.forward_fused(
+                hidden=pred_hidden,
+                lm_head_weight=None,
+                target_ids=pred_targets,
+                block_mask=pred_mask,
+                num_tokens=None,
+                block_size=bs,
+                lm_head=self.lm_head,
+            )
+        else:
+            # A tensor-parallel target's lm_head returns vocab-sharded DTensor
+            # logits; gather the full tensor for the dense fallback loss.
+            pred_logits = _to_full_tensor(self.lm_head(pred_hidden))
+            loss_out = loss_fn(pred_logits, pred_targets, pred_mask, num_tokens=None, block_size=bs)
 
         loss_weights = pred_mask.view(bsz, n, bs - 1)
         if self.loss_decay_gamma is not None:
@@ -580,12 +635,14 @@ class DFlashTrainerModule(nn.Module):
         loss_weight = loss_weights.sum()
 
         count_per_pos = loss_out.draft_count_per_pos
+        correct_per_pos = loss_out.draft_correct_per_pos
+        draft_correct = loss_out.draft_correct
+        assert count_per_pos is not None and correct_per_pos is not None and draft_correct is not None
         valid_tokens = count_per_pos.sum()
-        correct_tokens = loss_out.draft_correct_per_pos.sum()
+        correct_tokens = correct_per_pos.sum()
         accuracy = correct_tokens / valid_tokens.clamp_min(1)
-        accept_len, accept_len_sum, valid_blocks = compute_acceptance_stats(
-            pred_logits.argmax(dim=-1).view(bsz, n, bs - 1),
-            pred_targets.view(bsz, n, bs - 1),
+        accept_len, accept_len_sum, valid_blocks = _compute_acceptance_stats_from_correct(
+            draft_correct.view(bsz, n, bs - 1),
             pred_mask.view(bsz, n, bs - 1).bool(),
         )
 

@@ -35,7 +35,15 @@ BLOCK_SIZE = 4
 MASK_ID = VOCAB - 1
 
 
-def _build_trainer(num_anchors=8, loss_decay_gamma=None, attention_backend="sdpa", sliding_window=None):
+def _build_trainer(
+    num_anchors=8,
+    loss_decay_gamma=None,
+    attention_backend="sdpa",
+    sliding_window=None,
+    max_total_anchors=None,
+    use_fused_linear_ce=False,
+    linear_ce_chunk_size=1024,
+):
     cfg = Qwen3Config(
         vocab_size=VOCAB,
         hidden_size=HIDDEN,
@@ -64,8 +72,11 @@ def _build_trainer(num_anchors=8, loss_decay_gamma=None, attention_backend="sdpa
         block_size=BLOCK_SIZE,
         attention_backend=attention_backend,
         num_anchors=num_anchors,
+        max_total_anchors=max_total_anchors,
         loss_decay_gamma=loss_decay_gamma,
         sliding_window=sliding_window,
+        use_fused_linear_ce=use_fused_linear_ce,
+        linear_ce_chunk_size=linear_ce_chunk_size,
     )
 
 
@@ -151,6 +162,28 @@ def test_sample_anchor_positions_respect_loss_mask():
     assert (valid_anchors < 10).all()
 
 
+def test_max_total_anchors_caps_constructed_batch_slots():
+    trainer = _build_trainer(num_anchors=8, max_total_anchors=5)
+    loss_mask = torch.ones(3, 20)
+
+    anchors, keep = trainer._sample_anchor_positions(20, loss_mask, torch.device("cpu"))
+
+    # Anchor tensors are rectangular, so the cap is divided uniformly across
+    # the local micro-batch. The unused remainder is intentional: it keeps the
+    # actual draft-block allocation, not only the valid-count sum, under budget.
+    assert anchors.shape == (3, 1)
+    assert anchors.numel() <= 5
+    assert keep.sum().item() == 3
+
+
+def test_max_total_anchors_must_cover_local_batch():
+    trainer = _build_trainer(num_anchors=8, max_total_anchors=1)
+    loss_mask = torch.ones(2, 20)
+
+    with pytest.raises(ValueError, match="max_total_anchors"):
+        trainer._sample_anchor_positions(20, loss_mask, torch.device("cpu"))
+
+
 def test_no_valid_anchors_raises():
     trainer = _build_trainer()
     seq_len = 20
@@ -200,6 +233,45 @@ def test_invalid_prefix_weight_base_raises():
             loss_type="variable_prefix",
             prefix_weight_base=0.0,
         )
+
+
+def test_fused_linear_ce_rejects_variable_prefix_objective():
+    trainer = _build_trainer()
+    with pytest.raises(ValueError, match="use_fused_linear_ce"):
+        DFlashTrainerModule(
+            draft_model=trainer.draft_model,
+            target_lm_head=trainer.lm_head,
+            target_embed_tokens=trainer.embed_tokens,
+            mask_token_id=MASK_ID,
+            block_size=BLOCK_SIZE,
+            loss_type="variable_prefix",
+            use_fused_linear_ce=True,
+        )
+
+
+def test_fused_linear_ce_matches_dense_metrics_and_draft_gradients():
+    trainer = _build_trainer(loss_decay_gamma=4.0, use_fused_linear_ce=False, linear_ce_chunk_size=3)
+    input_ids, hidden, loss_mask = _inputs(bsz=2, seq_len=16)
+
+    torch.manual_seed(11)
+    dense = trainer(input_ids=input_ids, hidden_states=hidden, loss_mask=loss_mask)
+    dense.loss.backward()
+    dense_grads = [p.grad.detach().clone() for p in trainer.draft_model.parameters() if p.grad is not None]
+
+    trainer.zero_grad(set_to_none=True)
+    trainer.use_fused_linear_ce = True
+    torch.manual_seed(11)
+    fused = trainer(input_ids=input_ids, hidden_states=hidden, loss_mask=loss_mask)
+    fused.loss.backward()
+    fused_grads = [p.grad.detach().clone() for p in trainer.draft_model.parameters() if p.grad is not None]
+
+    torch.testing.assert_close(fused.loss, dense.loss, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(fused.accuracy, dense.accuracy)
+    torch.testing.assert_close(fused.accept_len, dense.accept_len)
+    torch.testing.assert_close(fused.correct_tokens, dense.correct_tokens)
+    assert len(fused_grads) == len(dense_grads)
+    for fused_grad, dense_grad in zip(fused_grads, dense_grads):
+        torch.testing.assert_close(fused_grad, dense_grad, atol=1e-5, rtol=1e-4)
 
 
 def test_variable_prefix_forward_finite_loss_and_grads():

@@ -36,8 +36,11 @@ recipe_args:
   # --- DFlash-specific ---
   draft_num_hidden_layers: 5
   block_size: 16
-  num_anchors: 512
+  num_anchors: 512                    # per-sequence candidate block limit
+  max_total_anchors: 512              # cap constructed block slots across the local microbatch
   loss_decay_gamma: 7.0
+  use_fused_linear_ce: true
+  linear_ce_chunk_size: 256
   mask_token_id: 151669               # REQUIRED reserved token for non-anchor block positions
   attention_backend: flex_attention
 
