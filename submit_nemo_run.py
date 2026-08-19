@@ -106,7 +106,7 @@ def get_args():
         "--cluster",
         type=str,
         choices=("draco", "nrt"),
-        default=None,
+        default="draco",
         help="Cluster used for Slurm execution",
     )
     parser.add_argument(

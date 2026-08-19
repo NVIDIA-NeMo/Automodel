@@ -75,6 +75,14 @@ eval_datasets['MTEB_ALL_QUICK'] = [
     ('MTEB_ENG', ' --max_length 2048 --batch_size 16 '),
 ]
 
+eval_datasets["MMTEB_QUICK"] = [
+    ("MMTEB_QUICK", " --max_length 4096 "),
+]
+
+eval_datasets["RTEB_QUICK"] = [
+    ("RTEB_QUICK", " --max_length 4096 "),
+]
+
 eval_datasets["vidore_v3_complex_ocr"] = [
     ("vidore_v3_finance_bank_reports_en_complex_ocr vidore_v3_military_technical_reports_complex_ocr vidore_v3_education_computer_science_en_complex_ocr vidore_v3_healthcare_fda_en_complex_ocr vidore_v3_hr_european_reports_en_complex_ocr vidore_v3_energy_reports_fr_complex_ocr vidore_v3_education_physics_fr_complex_ocr vidore_v3_luxury_financial_reports_fr_complex_ocr",
      " --eval_type beir_embedding_eval "),
@@ -87,7 +95,18 @@ eval_datasets["text_embedding_eval"] = [
 
 eval_datasets["VISION_EVAL"] = [
     ("dc10k", " --eval_type beir_embedding_eval --corpus_modalities image "),
-    ("vidore_all earnings_v2", " --eval_type beir_embedding_eval --corpus_modalities image "),
+    (
+        "earnings_v2 "
+        "vidore_v3_finance_bank_reports_en "
+        "vidore_v3_military_technical_reports "
+        "vidore_v3_education_computer_science_en "
+        "vidore_v3_healthcare_fda_en "
+        "vidore_v3_hr_european_reports_en "
+        "vidore_v3_energy_reports_fr "
+        "vidore_v3_education_physics_fr "
+        "vidore_v3_luxury_financial_reports_fr",
+        " --eval_type beir_embedding_eval --corpus_modalities image ",
+    ),
 ]
 
 eval_datasets["VISION_EVAL_MULTILINGUAL"] = [
