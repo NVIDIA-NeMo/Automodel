@@ -150,7 +150,7 @@ class Step3p7Model(nn.Module):
             dtype = get_dtype(getattr(self.config.text_config, "torch_dtype", "bfloat16"), torch.bfloat16)
             return dtype, torch.device(f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else "cpu")
 
-    def _process_image_features(self, image_features: torch.Tensor) -> torch.Tensor:
+    def _downsample_image_features(self, image_features: torch.Tensor) -> torch.Tensor:
         bsz, patches = image_features.shape[:2]
         grid = int(patches**0.5)
         if grid * grid != patches:
@@ -160,8 +160,10 @@ class Step3p7Model(nn.Module):
         image_features = self.vision_model.vit_downsampler1(image_features)
         image_features = self.vision_model.vit_downsampler2(image_features)
         bsz, channels, grid_h, grid_w = image_features.shape
-        image_features = image_features.reshape(bsz, channels, grid_h * grid_w).permute(0, 2, 1)
-        return self.vit_large_projector(image_features)
+        return image_features.reshape(bsz, channels, grid_h * grid_w).permute(0, 2, 1)
+
+    def _process_image_features(self, image_features: torch.Tensor) -> torch.Tensor:
+        return self.vit_large_projector(self._downsample_image_features(image_features))
 
     def _process_image_input(
         self,
@@ -183,15 +185,43 @@ class Step3p7Model(nn.Module):
         else:
             num_patches_list = [int(x) for x in num_patches]
 
-        patch_image_features = None
+        patch_projector_inputs = None
         if patch_pixel_values is not None and patch_pixel_values.numel() > 0:
             patch_pixel_values = patch_pixel_values.reshape(-1, *patch_pixel_values.shape[-3:]).to(
                 device=vision_device,
                 dtype=vision_dtype,
             )
-            patch_image_features = self._process_image_features(self.vision_model(patch_pixel_values))
+            patch_projector_inputs = self._downsample_image_features(self.vision_model(patch_pixel_values))
 
-        image_features = self._process_image_features(self.vision_model(pixel_values))
+        image_projector_inputs = self._downsample_image_features(self.vision_model(pixel_values))
+
+        # Patch crops are 504x504 while full images are 728x728, so their vision
+        # sequences have different lengths and cannot share one vision batch. The
+        # projector is token-wise, however: flatten both streams, project them in
+        # one call, and split the result back afterward. This is important under
+        # FSDP because every rank must invoke a sharded trainable module the same
+        # number of times and in the same order. Some Step3.7 samples have crops
+        # and some do not; conditionally invoking the projector for crops made one
+        # rank all-gather the projector while another all-gathered embed_tokens.
+        image_shape = image_projector_inputs.shape[:2]
+        image_projector_inputs = image_projector_inputs.flatten(0, 1)
+        if patch_projector_inputs is not None:
+            patch_shape = patch_projector_inputs.shape[:2]
+            patch_num_tokens = patch_shape[0] * patch_shape[1]
+            projector_inputs = torch.cat(
+                (patch_projector_inputs.flatten(0, 1), image_projector_inputs),
+                dim=0,
+            )
+        else:
+            patch_shape = None
+            patch_num_tokens = 0
+            projector_inputs = image_projector_inputs
+
+        projected_features = self.vit_large_projector(projector_inputs)
+        patch_image_features = None
+        if patch_shape is not None:
+            patch_image_features = projected_features[:patch_num_tokens].unflatten(0, patch_shape)
+        image_features = projected_features[patch_num_tokens:].unflatten(0, image_shape)
 
         merged_image_features: list[torch.Tensor] = []
         cur_patch_idx = 0

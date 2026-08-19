@@ -141,8 +141,11 @@ def test_process_image_input_merges_patches_and_logs(monkeypatch):
     tensor_patches = model._process_image_input(pixel_values[:1], num_patches=torch.tensor([0]))
     assert tensor_patches[0].shape == (1, 8)
 
+    projector_forward = MagicMock(wraps=model.vit_large_projector.forward)
+    monkeypatch.setattr(model.vit_large_projector, "forward", projector_forward)
     merged = model._process_image_input(pixel_values, patch_pixel_values=patch_pixel_values, num_patches=[1, 0])
     assert [item.shape for item in merged] == [torch.Size([2, 8]), torch.Size([1, 8])]
+    projector_forward.assert_called_once()
 
     with pytest.raises(ValueError, match="patch_pixel_values is missing"):
         model._process_image_input(pixel_values, num_patches=[1, 0])
