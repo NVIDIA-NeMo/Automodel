@@ -1943,6 +1943,11 @@ def _run_vanilla_hf_reload(
         An error message when loading or parity fails, otherwise ``None``.
     """
     try:
+        from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
+
+        # Match Phase 0's vanilla-HF setup. Exported trust-remote-code models can
+        # still carry Transformers-v4 list-form ``_tied_weights_keys``.
+        apply_cache_compatibility_patches()
         _patch_remote_masking_api_compatibility()
         _, ckpt_step_dir, consolidated_dir = _checkpoint_paths(cfg)
         is_peft = hasattr(cfg, "peft")

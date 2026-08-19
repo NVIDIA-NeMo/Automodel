@@ -373,6 +373,31 @@ def test_calibration_recipes_enable_all_checkpoint_gates(tmp_path, recipe_path):
     assert "skip_resume" not in robustness
 
 
+@pytest.mark.parametrize(
+    "recipe_name",
+    [
+        "customizer_gpt_oss_full_sft.yaml",
+        "customizer_gpt_oss_full_sft_chat.yaml",
+        "customizer_gpt_oss_peft.yaml",
+        "customizer_gpt_oss_peft_packing.yaml",
+    ],
+)
+def test_gpt_oss_customizers_use_routed_moe_parity_profile(tmp_path, recipe_name):
+    """GPT-OSS Customizer variants retain parity gates with the routed-MoE profile."""
+    recipe_path = REPO_ROOT / "examples/llm_finetune/gpt_oss" / recipe_name
+    out = tmp_path / "resolved.yaml"
+    env = {"PIPELINE_DIR": str(tmp_path), "TEST_NAME": recipe_path.stem, "NEMO_CI_PATH": "/mnt/nci"}
+    _run_resolver(
+        ["--base", str(recipe_path), "--phase", "checkpoint_robustness", "--output", str(out)],
+        env=env,
+    )
+
+    robustness = yaml.load(out.open())["ci"]["checkpoint_robustness"]
+    assert robustness["parity_tolerance_profile"] == "relaxed"
+    assert "skip_source_load_logit_parity" not in robustness
+    assert "skip_hf_reload_logit_parity" not in robustness
+
+
 def test_end_to_end_fixture_keys_not_applied_as_overrides(tmp_path):
     """Non-config fixture-arg keys in ci.checkpoint_robustness must not leak into the top-level config."""
     recipe = tmp_path / "llama_squad.yaml"

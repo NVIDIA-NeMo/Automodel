@@ -57,6 +57,7 @@ from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm
     _resolve_hf_attn_implementation,
     _resolve_hf_model_class,
     _run_process_isolated_checkpoint_phase,
+    _run_vanilla_hf_reload,
     _set_model_pretrained_path,
     _source_load_parity_policy,
     _trainable_parameter_digests,
@@ -910,6 +911,25 @@ def test_process_isolated_hf_reload_runs_rank0_hf_loader(tmp_path):
     )
     raise_distributed_failure.assert_called_once_with(None)
     recipe_cls.assert_not_called()
+
+
+def test_hf_reload_applies_remote_code_compatibility_patches():
+    """Phase 3 installs the same remote-code compatibility setup as Phase 0."""
+    with patch(
+        "nemo_automodel._transformers.utils.apply_cache_compatibility_patches",
+        side_effect=RuntimeError("compatibility sentinel"),
+    ) as apply_compatibility:
+        error = _run_vanilla_hf_reload(
+            SimpleNamespace(),
+            [],
+            torch.empty(1, 0, 0),
+            hf_model_cls=Mock(),
+            custom_args={},
+        )
+
+    apply_compatibility.assert_called_once_with()
+    assert error is not None
+    assert "RuntimeError: compatibility sentinel" in error
 
 
 def test_process_isolated_cross_tp_reload_uses_exported_weights_and_reports_parity(tmp_path):
