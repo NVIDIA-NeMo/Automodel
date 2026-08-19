@@ -94,10 +94,8 @@ parallelizer:
 ci:
   time: "00:30:00"
   nproc_per_node: 4
-  known_issue_id: AM-149
   checkpoint_robustness:
     hf_kl_threshold: 1e-1
     tokenizer_name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
-    skip_resume: true
     experts_implementation: grouped_mm
     trust_remote_code: true

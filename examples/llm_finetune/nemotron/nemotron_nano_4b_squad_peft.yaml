@@ -118,7 +118,7 @@ lr_scheduler:
 ci:
   vllm_deploy: true
   recipe_owner: akoumpa  # stanley1208 original committer
-  time: "00:25:00"
+  time: "00:30:00"
   nodes: 1
   checkpoint_robustness:
     vllm_merge_lora: true  # vLLM can't serve LoRA on fused mamba layers; deploy the merged adapter instead
@@ -126,6 +126,5 @@ ci:
     # Use the same cached family tokenizer for the long parity document.
     tokenizer_name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
     trust_remote_code: true
-    skip_resume: true
     dataset.limit_dataset_samples: 500
     validation_dataset.limit_dataset_samples: 500

@@ -101,8 +101,7 @@ lr_scheduler:
 
 ci:
   recipe_owner: adil-a
-  time: "00:20:00"
-  known_issue_id: AM-153
+  time: "00:25:00"
   checkpoint_robustness:
     kl_threshold: 5e-3
     hf_kl_threshold: 5e-3
@@ -111,6 +110,5 @@ ci:
     tokenizer_name: nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16
     trust_remote_code: true
     hf_device_map_auto: true
-    skip_resume: true
     dataset.limit_dataset_samples: 500
     validation_dataset.limit_dataset_samples: 500

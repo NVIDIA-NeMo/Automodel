@@ -125,7 +125,7 @@ wandb:
 ci:
   recipe_owner: akoumpa
   nodes: 1
-  time: "01:00:00"
+  time: "00:40:00"
   env_vars:
     MAX_STEPS: 10
   checkpoint_robustness:

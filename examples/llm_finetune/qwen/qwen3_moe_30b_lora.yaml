@@ -102,8 +102,8 @@ optimizer:
 
 ci:
   recipe_owner: adil-a
-  # Allow the complete source, reload, and resume calibration matrix to finish.
-  time: "01:00:00"
+  # Allow the complete source, reload, and resume matrix to finish.
+  time: "00:30:00"
   nodes: 1
   env_vars:
     PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"

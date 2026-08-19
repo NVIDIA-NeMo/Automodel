@@ -120,7 +120,7 @@ ci:
   recipe_owner: athitten
   nodes: 1
   # Include source parity in addition to the approximately 50-minute reload/resume path.
-  time: "01:30:00"
+  time: "01:15:00"
   # Keep failures blocking; residual MoE drift is tracked by AM-707/AM-719.
   checkpoint_robustness:
     # The shared robustness batch of 2 exceeds this 26B MoE recipe's memory

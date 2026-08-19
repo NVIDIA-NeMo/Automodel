@@ -209,7 +209,7 @@ def test_generate_qwen3_moe_lora_uses_all_isolated_checkpoint_phases():
     variables = jobs[""]["variables"]
     assert "CHECKPOINT_ROBUSTNESS_PHASES" not in ci_config.get("env_vars", {})
     assert variables["PYTORCH_CUDA_ALLOC_CONF"] == "expandable_segments:True"
-    assert variables["TIME"] == "01:00:00"
+    assert variables["TIME"] == "00:30:00"
     assert variables["CHECKPOINT_ROBUSTNESS_PROCESS_ISOLATION"] == "true"
     assert variables["CHECKPOINT_ROBUSTNESS_PHASES"] == (
         "source_load_reference source_load_parity train_and_save automodel_reload hf_reload resume"
@@ -225,6 +225,33 @@ def test_generate_qwen3_moe_lora_uses_all_isolated_checkpoint_phases():
         "source_load_cosine_threshold",
     ):
         assert key not in robustness
+
+
+def test_generate_nemotron_resume_cohort_is_blocking_and_complete():
+    expected_times = {
+        "customizer_nemotron_nano_peft": "00:30:00",
+        "customizer_nemotron_nano_peft_packing": "00:30:00",
+        "nemotron_nano_4b_squad": "00:25:00",
+        "nemotron_nano_4b_squad_peft": "00:30:00",
+        "nemotron_nano_8b_v1_squad": "00:25:00",
+        "nemotron_nano_8b_v1_squad_peft": "00:25:00",
+        "nemotron_nano_9b_squad": "00:30:00",
+        "nemotron_nano_9b_squad_peft": "00:30:00",
+        "nemotron_nano_v3_hellaswag_peft": "00:30:00",
+    }
+
+    for recipe_name, expected_time in expected_times.items():
+        config = Path(f"examples/llm_finetune/nemotron/{recipe_name}.yaml")
+        jobs = dict(generate_job(config, {}, "release", "llm_finetune", "."))
+
+        job = jobs[""]
+        assert job.get("allow_failure") is None
+        assert job["variables"]["TIME"] == expected_time
+        assert job["variables"]["CHECKPOINT_ROBUSTNESS_PROCESS_ISOLATION"] == "true"
+        expected_phases = "source_load_reference source_load_parity train_and_save automodel_reload hf_reload resume"
+        if recipe_name == "nemotron_nano_8b_v1_squad":
+            expected_phases += " cross_tp_reload"
+        assert job["variables"]["CHECKPOINT_ROBUSTNESS_PHASES"] == expected_phases
 
 
 def test_generate_qwen3_moe_te_deepep_uses_isolated_source_and_reload_phases():

@@ -121,7 +121,7 @@ optimizer:
 ci:
   recipe_owner: hemildesai
   nodes: 1
-  time: "01:00:00"
+  time: "00:30:00"
   checkpoint_robustness:
     # Keep the currently mismatched HF comparisons blocking until the model or
     # reference path is fixed; an observed mismatch alone is not a reason to skip.
