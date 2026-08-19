@@ -858,6 +858,7 @@ class MoESplitExpertsStateDictMixin:
         tensor: torch.Tensor,
         *,
         prefix_override: str | None = None,
+        load_into_empty_destinations: bool = False,
         **kwargs,
     ) -> list[tuple[str, torch.Tensor]]:
         """Convert a single merged expert tensor from native format to split HuggingFace format.
@@ -883,6 +884,9 @@ class MoESplitExpertsStateDictMixin:
             prefix_override: When provided, replaces ``self._hf_prefix`` in
                 emitted HF keys. Used to route conversions through namespaces
                 outside the main backbone, e.g. ``"mtp."`` for the MTP head.
+            load_into_empty_destinations: Allocate contiguous destination tensors without copying source values
+                when the result cannot alias final model storage and DCP will fully overwrite it. This mode is only
+                valid for checkpoint loading; save conversion must preserve tensor values.
             **kwargs: Absorbed for forward-compatibility with base callers
                 that forward arbitrary state-dict kwargs (e.g. ``exclude_key_regex``).
 
@@ -899,6 +903,7 @@ class MoESplitExpertsStateDictMixin:
         # model (experts stay at random init -> garbage loss). So fp8 loads must take the
         # rebuild path: never mark these keys in-place-loaded when ``quantization`` is set.
         quantization = kwargs.get("quantization", False)
+        used_empty_load_destinations = False
 
         # GroupedExpertsTE (backend.experts == "te") exposes both virtual grouped tensors as
         # torch.stack copies, so neither can be loaded through in-place views. GroupedExpertsMoK
@@ -943,21 +948,34 @@ class MoESplitExpertsStateDictMixin:
                         w_gate = w[:, :inter_dim].transpose(0, 1)
                         w_up = w[:, inter_dim:].transpose(0, 1)
                     else:
-                        w_gate = w[:, :inter_dim].transpose(0, 1).contiguous()
-                        w_up = w[:, inter_dim:].transpose(0, 1).contiguous()
+                        w_gate_view = w[:, :inter_dim].transpose(0, 1)
+                        w_up_view = w[:, inter_dim:].transpose(0, 1)
+                        if load_into_empty_destinations and not quantization and not is_dtensor(w):
+                            w_gate = torch.empty_like(w_gate_view, memory_format=torch.contiguous_format)
+                            w_up = torch.empty_like(w_up_view, memory_format=torch.contiguous_format)
+                            used_empty_load_destinations = True
+                        else:
+                            w_gate = w_gate_view.contiguous()
+                            w_up = w_up_view.contiguous()
                     result.append((f"{prefix}layers.{layer_num}.{expert_segment}.{expert_id}.gate_proj.weight", w_gate))
                     result.append((f"{prefix}layers.{layer_num}.{expert_segment}.{expert_id}.up_proj.weight", w_up))
                 else:
                     # Non-gated: only up_proj (tensor is [dim, inter_dim], not [dim, 2*inter_dim])
                     if inplace_ok:
                         w_up = w.transpose(0, 1)
+                    elif load_into_empty_destinations and not quantization and not is_dtensor(w):
+                        w_up = torch.empty_like(w.transpose(0, 1), memory_format=torch.contiguous_format)
+                        used_empty_load_destinations = True
                     else:
                         w_up = w.transpose(0, 1).contiguous()
                     result.append((f"{prefix}layers.{layer_num}.{expert_segment}.{expert_id}.up_proj.weight", w_up))
             del splits
             if not inplace_ok and isinstance(tensor, torch.Tensor) and not tensor.is_meta and torch.cuda.is_available():
-                gc.collect()
-                torch.cuda.empty_cache()
+                if used_empty_load_destinations:
+                    gc.collect(0)
+                elif tensor.is_cuda:
+                    gc.collect()
+                    torch.cuda.empty_cache()
             return result
 
         elif (
@@ -987,6 +1005,9 @@ class MoESplitExpertsStateDictMixin:
                 expert_id = self._last_expert_ids[i]
                 if inplace_ok:
                     w_down = w.transpose(0, 1)
+                elif load_into_empty_destinations and not quantization and not is_dtensor(w):
+                    w_down = torch.empty_like(w.transpose(0, 1), memory_format=torch.contiguous_format)
+                    used_empty_load_destinations = True
                 else:
                     w_down = w.transpose(0, 1).contiguous()
                 result.append(
@@ -998,8 +1019,11 @@ class MoESplitExpertsStateDictMixin:
             # See gate_and_up branch above for the cleanup rationale.
             del splits
             if not inplace_ok and isinstance(tensor, torch.Tensor) and not tensor.is_meta and torch.cuda.is_available():
-                gc.collect()
-                torch.cuda.empty_cache()
+                if used_empty_load_destinations:
+                    gc.collect(0)
+                elif tensor.is_cuda:
+                    gc.collect()
+                    torch.cuda.empty_cache()
             return result
 
         # MoE expert LoRA keys: convert to HF-PEFT-compatible format.

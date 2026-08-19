@@ -1137,10 +1137,89 @@ class TestInplaceLoadViews:
         )
 
         assert result is not None
+        converted = dict(result)
         for _, v in result:
             assert v.is_contiguous(), "experts=='te' must emit contiguous copies, not in-place views"
+        for expert_id in range(2):
+            torch.testing.assert_close(
+                converted[f"model.layers.0.mlp.experts.{expert_id}.gate_proj.weight"],
+                local_storage[expert_id, :, :512].T,
+            )
+            torch.testing.assert_close(
+                converted[f"model.layers.0.mlp.experts.{expert_id}.up_proj.weight"],
+                local_storage[expert_id, :, 512:].T,
+            )
         assert not hasattr(mixin, "_inplace_loaded_native_keys") or (
             "model.layers.0.mlp.experts.gate_and_up_projs" not in (mixin._inplace_loaded_native_keys or set())
+        )
+
+    def test_te_load_destinations_do_not_copy_initialized_gate_and_up_values(self):
+        mixin = MockMoEStateDictMixin(n_experts=2, inter_dim=3)
+        mixin.backend.experts = "te"
+        initialized = torch.arange(2 * 4 * 6, dtype=torch.float32).reshape(2, 4, 6)
+
+        def sentinel_empty_like(tensor, **kwargs):
+            return torch.full_like(tensor, -17.0, **kwargs)
+
+        with (
+            patch("nemo_automodel.components.moe.state_dict_utils.is_dtensor", return_value=False),
+            patch("torch.empty_like", side_effect=sentinel_empty_like) as mock_empty_like,
+        ):
+            result = mixin._convert_single_merged_expert_to_hf_split_experts(
+                "model.layers.0.mlp.experts.gate_and_up_projs",
+                initialized,
+                load_into_empty_destinations=True,
+            )
+
+        assert result is not None and len(result) == 4
+        assert mock_empty_like.call_count == 4
+        for _, destination in result:
+            assert destination.is_contiguous()
+            torch.testing.assert_close(destination, torch.full_like(destination, -17.0))
+
+    def test_empty_te_destinations_round_trip_checkpoint_values(self):
+        mixin = MockMoEStateDictMixin(n_experts=2, inter_dim=3)
+        mixin.backend.experts = "te"
+        initialized_gate_up = torch.full((2, 4, 6), 99.0)
+        initialized_down = torch.full((2, 3, 4), 99.0)
+
+        with patch("nemo_automodel.components.moe.state_dict_utils.is_dtensor", return_value=False):
+            destinations = dict(
+                mixin._convert_single_merged_expert_to_hf_split_experts(
+                    "model.layers.0.mlp.experts.gate_and_up_projs",
+                    initialized_gate_up,
+                    load_into_empty_destinations=True,
+                )
+            )
+            destinations.update(
+                mixin._convert_single_merged_expert_to_hf_split_experts(
+                    "model.layers.0.mlp.experts.down_projs",
+                    initialized_down,
+                    load_into_empty_destinations=True,
+                )
+            )
+
+        expected_gate_up = torch.empty_like(initialized_gate_up)
+        expected_down = torch.empty_like(initialized_down)
+        for expert_id in range(2):
+            gate = torch.full((3, 4), 10.0 + expert_id)
+            up = torch.full((3, 4), 20.0 + expert_id)
+            down = torch.full((4, 3), 30.0 + expert_id)
+            destinations[f"model.layers.0.mlp.experts.{expert_id}.gate_proj.weight"].copy_(gate)
+            destinations[f"model.layers.0.mlp.experts.{expert_id}.up_proj.weight"].copy_(up)
+            destinations[f"model.layers.0.mlp.experts.{expert_id}.down_proj.weight"].copy_(down)
+            expected_gate_up[expert_id] = torch.cat((gate.T, up.T), dim=-1)
+            expected_down[expert_id] = down.T
+
+        restored = mixin._from_hf_w_merged_experts(destinations)
+
+        torch.testing.assert_close(
+            restored["model.layers.0.mlp.experts.gate_and_up_projs"],
+            expected_gate_up,
+        )
+        torch.testing.assert_close(
+            restored["model.layers.0.mlp.experts.down_projs"],
+            expected_down,
         )
 
     def test_inplace_load_skips_when_backend_experts_is_te_down_projs(self):

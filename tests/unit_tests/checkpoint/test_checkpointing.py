@@ -1392,6 +1392,7 @@ def test_load_model_only_requests_quantized_adapter_keys_for_base_checkpoint(
         checkpointer.load_model(model, model_path=str(tmp_path / "model"), is_init_step=is_init_step)
 
     assert adapter.to_hf.call_args.kwargs["quantization"] is expected_quantization
+    assert adapter.to_hf.call_args.kwargs["load_into_empty_destinations"] is True
 
 
 def test_training_checkpoint_resume_ignores_base_fp8_metadata(tmp_path):
