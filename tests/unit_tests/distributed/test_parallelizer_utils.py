@@ -30,11 +30,40 @@ from nemo_automodel.components.distributed.parallelizer_utils import (
     configure_fsdp_unused_param_reduction,
     fully_shard_by_dtype,
     iter_maximal_uniform_dtype_subtrees,
+    reject_unsupported_mtp_cp,
+    reject_unsupported_mtp_cp_pp,
 )
 from nemo_automodel.shared.torch_patches import (
     patch_fsdp_uniform_reduce_dtype,
     patch_fsdp_unused_param_reduction,
 )
+
+
+def test_reject_unsupported_mtp_cp_pp_allows_disabled_model():
+    model = nn.Linear(2, 2)
+    model.supports = SimpleNamespace(mtp_enabled=False, supports_mtp_cp_pp=False)
+    reject_unsupported_mtp_cp_pp(model)
+
+
+def test_reject_unsupported_mtp_cp_rejects_enabled_unsupported_model():
+    model = nn.Module()
+    model.mtp_config = SimpleNamespace(enabled=True)
+    model.supports = SimpleNamespace(mtp_enabled=True, supports_mtp_cp=False)
+
+    with pytest.raises(RuntimeError, match="does not support MTP with context parallelism"):
+        reject_unsupported_mtp_cp(model)
+
+
+def test_reject_unsupported_mtp_cp_allows_supported_or_disabled_model():
+    model = nn.Module()
+    model.mtp_config = SimpleNamespace(enabled=True)
+    model.supports = SimpleNamespace(mtp_enabled=True, supports_mtp_cp=True)
+    reject_unsupported_mtp_cp(model)
+
+    model.mtp_config.enabled = False
+    model.supports.mtp_enabled = False
+    model.supports.supports_mtp_cp = False
+    reject_unsupported_mtp_cp(model)
 
 
 def test_configure_fsdp_unused_param_reduction_uses_public_fsdp_api(monkeypatch):

@@ -191,11 +191,14 @@ class ModelSupports:
             "cp",
             "ep",
             "sequence_packing",
+            "mtp_cp",
+            "mtp_cp_pp",
             "cp_vision_frame_sharding",
             "gradient_checkpointing",
             "generate",
         )
         flags = ", ".join("{}={}".format(name, getattr(self, "supports_" + name)) for name in names)
+        flags += ", mtp_enabled={}".format(self.mtp_enabled)
         flags += ", is_custom_model={}".format(self.is_custom_model)
         return "ModelSupports({})".format(flags)
 
@@ -304,6 +307,30 @@ class ModelSupports:
         except AttributeError:
             return False
         return capabilities.supports_thd
+
+    @property
+    def supports_mtp_cp(self) -> bool:
+        """Model owns a verified MTP training path under context parallelism."""
+        try:
+            capabilities = query_capabilities(self._model)
+        except AttributeError:
+            return False
+        return capabilities.supports_mtp_cp
+
+    @property
+    def supports_mtp_cp_pp(self) -> bool:
+        """Model owns a verified MTP training path with both CP and PP."""
+        try:
+            capabilities = query_capabilities(self._model)
+        except AttributeError:
+            return False
+        return capabilities.supports_mtp_cp_pp
+
+    @property
+    def mtp_enabled(self) -> bool:
+        """Whether MTP is active for this configured model instance."""
+        mtp_config = getattr(self._model, "mtp_config", None)
+        return bool(getattr(mtp_config, "enabled", False))
 
     @property
     def supports_cp_vision_frame_sharding(self) -> bool:
