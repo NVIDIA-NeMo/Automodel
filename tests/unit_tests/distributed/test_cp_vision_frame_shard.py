@@ -69,6 +69,18 @@ class _RecordingStubVisual(_StubVisual):
         self.patch_rows = []
 
     def forward(self, pixel_values, grid_thw=None, return_dict=True):
+        """Record the local patch-row count and delegate to the stub vision tower.
+
+        Args:
+            pixel_values: Tensor of shape [patch_rows, patch_dim].
+            grid_thw: Optional tensor of shape [entries, 3] containing ``(time, height, width)`` rows.
+            return_dict: Whether to return the vision output as a structured object.
+
+        Returns:
+            Vision output whose ``pooler_output`` tensor has shape [tokens, hidden],
+            ``last_hidden_state`` tensor has shape [patch_rows, hidden], and optional
+            ``deepstack_features`` tensors each have shape [tokens, hidden].
+        """
         self.patch_rows.append(int(pixel_values.shape[0]))
         return super().forward(pixel_values, grid_thw=grid_thw, return_dict=return_dict)
 
