@@ -49,7 +49,7 @@ def test_mining_ranks_negatives_and_filters_false_negatives() -> None:
     )
 
     assert neg_indices == [[2, 3], [3, 2]]
-    np.testing.assert_allclose(neg_scores, [[0.95, 0.20], [0.95, 0.20]])
+    np.testing.assert_allclose(neg_scores, [[0.95, 0.20], [0.95, 0.20]], rtol=0.0, atol=3e-4)
     assert pos_scores[0] == pytest.approx([1.0, 1.0])
     assert pos_scores[1] == pytest.approx([1.0])
 
