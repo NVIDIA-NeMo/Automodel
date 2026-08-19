@@ -1,7 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 #
 # Full StepFun Step3.7/Step3.5-VL MedPix fine-tune with MTP and CP.
-# The 128-GPU layout is DP16 x CP8 x PP1, with EP64 composed over DP x CP.
+# The 128-GPU layout is DP16 x CP8 x PP1, with EP32 composed over DP x CP.
 
 recipe: FinetuneRecipeForVLM
 
@@ -9,7 +9,7 @@ seed: 1234
 
 step_scheduler:
   global_batch_size: 512
-  local_batch_size: 8
+  local_batch_size: 1
   ckpt_every_steps: 100
   val_every_steps: 25
   log_remote_every_steps: 1
@@ -53,7 +53,7 @@ processor:
 
 checkpoint:
   enabled: true
-  checkpoint_dir: vlm_checkpoints/step3p7_medpix_200b_mtp_cp8_ep64pp1/
+  checkpoint_dir: vlm_checkpoints/step3p7_medpix_200b_mtp_cp8_ep32pp1/
   model_save_format: safetensors
   save_consolidated: false
 
@@ -62,7 +62,7 @@ distributed:
   tp_size: 1
   cp_size: 8
   pp_size: 1
-  ep_size: 64
+  ep_size: 32
   sequence_parallel: false
   activation_checkpointing: true
   moe:
@@ -126,6 +126,6 @@ wandb:
 
 ci:
   time: "00:30:00"
-  # dp_size(16) * cp_size(8) * pp_size(1) = 128 GPUs; ep_size(64) is carved from DP x CP.
+  # dp_size(16) * cp_size(8) * pp_size(1) = 128 GPUs; ep_size(32) is carved from DP x CP.
   recipe_owner: huiyingl
   nodes: 16

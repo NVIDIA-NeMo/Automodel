@@ -37,7 +37,7 @@ seed: 1234
 
 step_scheduler:
   global_batch_size: 256
-  local_batch_size: 4
+  local_batch_size: 1
   ckpt_every_steps: 500
   val_every_steps: 500
   gc_every_steps: 10
