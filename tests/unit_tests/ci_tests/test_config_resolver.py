@@ -400,15 +400,15 @@ def test_gpt_oss_customizers_use_routed_moe_parity_profile(tmp_path, recipe_name
 
 
 @pytest.mark.parametrize(
-    "recipe_path",
+    ("recipe_path", "expected_resume_profile"),
     [
-        "examples/llm_finetune/nemotron/customizer_nemotron_nano_full_sft.yaml",
-        "examples/llm_finetune/nemotron/customizer_nemotron_nano_full_sft_chat.yaml",
-        "examples/llm_finetune/qwen/qwen3_moe_30b_hellaswag.yaml",
+        ("examples/llm_finetune/nemotron/customizer_nemotron_nano_full_sft.yaml", None),
+        ("examples/llm_finetune/nemotron/customizer_nemotron_nano_full_sft_chat.yaml", "relaxed"),
+        ("examples/llm_finetune/qwen/qwen3_moe_30b_hellaswag.yaml", None),
     ],
 )
-def test_additional_routed_moe_configs_enable_resume(tmp_path, recipe_path):
-    """Expanded routed-MoE coverage keeps the native-resume phase active."""
+def test_additional_routed_moe_configs_enable_resume(tmp_path, recipe_path, expected_resume_profile):
+    """Expanded routed-MoE coverage keeps resume active with narrowly calibrated loss drift."""
     recipe_path = REPO_ROOT / recipe_path
     out = tmp_path / "resolved.yaml"
     env = {"PIPELINE_DIR": str(tmp_path), "TEST_NAME": recipe_path.stem, "NEMO_CI_PATH": "/mnt/nci"}
@@ -419,6 +419,13 @@ def test_additional_routed_moe_configs_enable_resume(tmp_path, recipe_path):
 
     robustness = yaml.load(out.open())["ci"]["checkpoint_robustness"]
     assert "skip_resume" not in robustness
+    if expected_resume_profile is None:
+        assert "resume_tolerance_profile" not in robustness
+    else:
+        assert robustness["resume_tolerance_profile"] == expected_resume_profile
+    assert "parity_tolerance_profile" not in robustness
+    assert "resume_first_loss_threshold" not in robustness
+    assert "resume_loss_threshold" not in robustness
 
 
 def test_nemotron_nano_4b_peft_uses_cached_family_tokenizer(tmp_path):
