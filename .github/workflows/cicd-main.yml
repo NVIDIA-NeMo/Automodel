@@ -459,8 +459,8 @@ jobs:
       matrix:
         include:
           - test-name: L2_Pretrain_and_KD
-            test-folder: llm_pretrain_and_kd
-            timeout: 20
+            test-folder: llm_pretrain_and_kd,speculative
+            timeout: 30
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
           - test-name: L2_HF_DCP
@@ -508,18 +508,8 @@ jobs:
             timeout: 20
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
-          - test-name: L2_DLLM
-            test-folder: dllm
-            timeout: 20
-            runner: ${{ needs.pre-flight.outputs.runner_prefix }}
-            test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
-          - test-name: L2_DSpark
-            test-folder: speculative
-            timeout: 30
-            runner: ${{ needs.pre-flight.outputs.runner_prefix }}
-            test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
           - test-name: L2_Diffusion
-            test-folder: diffusion
+            test-folder: diffusion,dllm
             timeout: 30
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
