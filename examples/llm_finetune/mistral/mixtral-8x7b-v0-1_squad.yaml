@@ -109,9 +109,6 @@ ci:
   checkpoint_robustness:
     # PP buffers are fixed to the 1024-token packed-sequence size.
     parity_sequence_length: 1024
-    hf_kl_threshold: 1e-2
-    source_load_kl_threshold: 1e-2
-    source_load_cosine_threshold: 0.9995
     tokenizer_name: mistralai/Mixtral-8x7B-v0.1
     trust_remote_code: true
     hf_device_map_auto: true

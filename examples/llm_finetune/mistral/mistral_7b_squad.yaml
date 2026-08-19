@@ -104,9 +104,6 @@ ci:
   recipe_owner: HuiyingLi
   time: "00:20:00"
   checkpoint_robustness:
-    hf_kl_threshold: 5e-3
-    source_load_kl_threshold: 5e-3
-    source_load_cosine_threshold: 0.9995
     tokenizer_name: mistralai/Mistral-7B-v0.1
     skip_resume: true
     dataset.limit_dataset_samples: 500

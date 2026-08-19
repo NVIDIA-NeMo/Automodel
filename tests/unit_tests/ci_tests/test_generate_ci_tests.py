@@ -19,6 +19,25 @@ from ruamel.yaml import YAML
 from tests.ci_tests.utils.generate_ci_tests import generate_job, generate_pipeline
 
 
+def test_example_checkpoint_robustness_configs_do_not_use_legacy_max_kl_thresholds():
+    legacy_keys = {
+        "kl_threshold",
+        "hf_kl_threshold",
+        "source_load_kl_threshold",
+        "cross_tp_kl_threshold",
+    }
+    violations = []
+
+    for config in Path("examples").rglob("*.yaml"):
+        recipe = YAML(typ="safe").load(config) or {}
+        robustness = (recipe.get("ci") or {}).get("checkpoint_robustness") or {}
+        found = sorted(legacy_keys & robustness.keys())
+        if found:
+            violations.append(f"{config}: {', '.join(found)}")
+
+    assert not violations, "Legacy max-KL thresholds remain:\n" + "\n".join(violations)
+
+
 def test_generate_deepseek_v4_pretrain_nightly_job():
     pipeline = generate_pipeline(".", "nightly", "llm_pretrain")
 
