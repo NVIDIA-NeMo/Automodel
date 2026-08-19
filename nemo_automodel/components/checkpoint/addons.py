@@ -529,6 +529,9 @@ def _extract_target_modules(
             final_target_modules = {
                 name[len("model.") :] if name.startswith("model.") else name for name in final_target_modules
             }
+        target_module_to_hf = getattr(adapter, "convert_peft_target_module_to_hf", None)
+        if callable(target_module_to_hf):
+            final_target_modules = {target_module_to_hf(name) for name in final_target_modules}
 
     # Adapters whose HF checkpoint layout renames modules (e.g. Kimi K3's
     # mlp.experts.{E}.gate_proj -> block_sparse_moe.experts.{E}.w1) convert the

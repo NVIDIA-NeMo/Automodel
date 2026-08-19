@@ -411,6 +411,25 @@ class TestExtractTargetModules:
         assert "model.layers.0.self_attn.q_proj" in result
         assert all(".mlp.experts." not in m for m in result)
 
+    def test_state_dict_adapter_target_modules_remapped(self):
+        """Custom-model PEFT targets use the same public HF namespace as saved tensors."""
+        model = _make_model_with_named_modules(
+            [
+                "model.layers.0.mixer.in_proj.lora_A",
+                "model.layers.1.mixer.down_proj.lora_A",
+            ]
+        )
+        model.state_dict_adapter = SimpleNamespace(
+            convert_peft_target_module_to_hf=lambda name: name.replace("model.", "backbone.", 1)
+        )
+
+        result = _extract_target_modules(model)
+
+        assert result == [
+            "backbone.layers.0.mixer.in_proj",
+            "backbone.layers.1.mixer.down_proj",
+        ]
+
 
 class TestMaybeStripQuantizationConfig:
     """Tests for _maybe_strip_quantization_config."""
