@@ -32,6 +32,8 @@ from transformers import (
     Mistral3Config,
     PretrainedConfig,
     PreTrainedTokenizerFast,
+    Qwen2Config,
+    Qwen2Model,
 )
 from transformers.models.ministral3.modeling_ministral3 import (
     Ministral3ForSequenceClassification,
@@ -178,7 +180,7 @@ def test_bi_encoder_public_api_excludes_export_format_overrides():
     ):
         parameters = inspect.signature(callable_).parameters
         assert export_only_parameters.isdisjoint(parameters)
-        assert {"pooling", "l2_normalize"} <= parameters.keys()
+        assert {"pooling", "l2_normalize", "is_causal"} <= parameters.keys()
 
 
 def test_effective_pipeline_prompts_replace_restored_export_defaults():
@@ -245,9 +247,7 @@ def test_direct_save_omits_unrepresentable_sentence_transformer_metadata(tmp_pat
     tokenizer.model_max_length = int(1e30)
     save_dir = tmp_path / "unrepresentable_export"
 
-    assert (
-        encoder._get_consolidated_hf_metadata_exporter(tokenizer=tokenizer, original_model_path=None) is None
-    )
+    assert encoder._get_consolidated_hf_metadata_exporter(tokenizer=tokenizer, original_model_path=None) is None
     encoder.save_pretrained(save_dir, tokenizer=tokenizer)
 
     assert (save_dir / "config.json").is_file()
@@ -345,6 +345,53 @@ def test_extract_submodel_embedding_fallback_is_bidirectional(tmp_path):
     assert saved_config["is_causal"] is False
 
 
+@pytest.mark.parametrize("is_causal", [False, True])
+def test_generic_embedding_backbone_honors_and_persists_is_causal(tmp_path, is_causal):
+    """Generic Hugging Face backbones honor and persist both attention policies."""
+    from nemo_automodel._transformers import retrieval
+
+    torch.manual_seed(1234)
+    config = Qwen2Config(
+        vocab_size=64,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        max_position_embeddings=64,
+        attention_dropout=0.0,
+    )
+    model_dir = tmp_path / "qwen2"
+    Qwen2Model(config).eval().save_pretrained(model_dir)
+
+    backbone = retrieval.build_encoder_backbone(
+        model_name_or_path=str(model_dir),
+        task="embedding",
+        is_causal=is_causal,
+        attn_implementation="eager",
+    )
+
+    assert backbone.config.is_causal is is_causal
+    assert all(layer.self_attn.is_causal is is_causal for layer in backbone.layers)
+
+    input_ids = torch.tensor([[1, 2, 3, 0]])
+    modified_input_ids = torch.tensor([[1, 2, 5, 0]])
+    attention_mask = torch.tensor([[1, 1, 1, 0]])
+    backbone.eval()
+    with torch.no_grad():
+        original = backbone(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+        modified = backbone(input_ids=modified_input_ids, attention_mask=attention_mask).last_hidden_state
+
+    if is_causal:
+        torch.testing.assert_close(original[:, 0], modified[:, 0])
+    else:
+        assert not torch.allclose(original[:, 0], modified[:, 0], atol=1e-7, rtol=1e-7)
+
+    save_dir = tmp_path / "saved"
+    backbone.save_pretrained(save_dir)
+    assert json.loads((save_dir / "config.json").read_text())["is_causal"] is is_causal
+
+
 def test_extract_submodel_dequantizes_native_fp8_for_training(monkeypatch):
     """FP8 parent checkpoints are materialized without scalar scale parameters."""
     from nemo_automodel._transformers import retrieval
@@ -412,9 +459,9 @@ def test_embedding_fallback_forwards_hf_kwargs_and_disables_causal_attention(mon
     """Embedding fallbacks preserve loader options and disable causal attention."""
     from nemo_automodel._transformers import retrieval
 
-    config = MagicMock()
-    config.model_type = "mistral"
+    config = SimpleNamespace(model_type="mistral")
     backbone = MagicMock()
+    backbone.config = config
     auto_config_from_pretrained = MagicMock(return_value=config)
     auto_model_from_pretrained = MagicMock(return_value=backbone)
     monkeypatch.setattr(retrieval.AutoConfig, "from_pretrained", auto_config_from_pretrained)
@@ -500,7 +547,7 @@ def test_bi_encoder_build_forwards_native_hf_kwargs_to_config_and_backbone(monke
     """The preliminary config load retains native HuggingFace loader behavior."""
     from nemo_automodel._transformers import retrieval
 
-    config = PretrainedConfig()
+    config = PretrainedConfig(is_causal=True)
     config.model_type = "test"
     backbone = MagicMock(spec=nn.Module)
     backbone.config = config
@@ -533,6 +580,7 @@ def test_bi_encoder_build_forwards_native_hf_kwargs_to_config_and_backbone(monke
         "embedding",
         trust_remote_code=False,
         pooling="avg",
+        is_causal=True,
         loaded_config=config,
         revision="revision-a",
         output_attentions=True,
@@ -564,6 +612,62 @@ def test_bi_encoder_skips_standard_export_for_unrepresentable_pooling(pooling, t
     assert not (save_dir / "modules.json").exists()
 
 
+def test_bi_encoder_rejects_composite_without_text_config_contract():
+    """Unknown composite layouts fail before causality can leak into vision modules."""
+    from nemo_automodel._transformers import retrieval
+
+    backbone = nn.Module()
+    backbone.config = SimpleNamespace(is_composition=True, name_or_path="")
+
+    with pytest.raises(ValueError, match="must identify their text config"):
+        retrieval.BiEncoderModel(backbone, pooling="last", l2_normalize=True, is_causal=False)
+
+
+def test_bi_encoder_scopes_is_causal_to_composite_text_tower():
+    """Composite bi-encoders update text attention without changing vision attention."""
+    from nemo_automodel._transformers import retrieval
+
+    class CompositeConfig:
+        is_composition = True
+        name_or_path = ""
+
+        def __init__(self):
+            self.text_config = PretrainedConfig(hidden_size=16)
+
+        def get_text_config(self, decoder=None, encoder=None):
+            return self.text_config if decoder else self
+
+        def to_dict(self):
+            return {"text_config": self.text_config.to_dict()}
+
+    class Tower(nn.Module):
+        def __init__(self, config=None):
+            super().__init__()
+            self.config = config
+            self.attention = nn.Module()
+            self.attention.is_causal = True
+
+    class CompositeBackbone(nn.Module):
+        main_input_name = "pixel_values"
+
+        def __init__(self):
+            super().__init__()
+            self.config = CompositeConfig()
+            self.text_tower = Tower(self.config.text_config)
+            self.vision_tower = Tower()
+
+        def get_decoder(self):
+            return self.text_tower
+
+    backbone = CompositeBackbone()
+    encoder = retrieval.BiEncoderModel(backbone, pooling="last", l2_normalize=True, is_causal=False)
+
+    assert encoder.is_causal is False
+    assert backbone.config.text_config.is_causal is False
+    assert backbone.text_tower.attention.is_causal is False
+    assert backbone.vision_tower.attention.is_causal is True
+
+
 def test_bi_encoder_skips_standard_export_for_multimodal_backbone():
     from nemo_automodel._transformers import retrieval
 
@@ -572,10 +676,16 @@ def test_bi_encoder_skips_standard_export_for_multimodal_backbone():
 
         def __init__(self):
             super().__init__()
-            self.config = PretrainedConfig()
-            self.config.is_composition = True
+            self.config = SimpleNamespace(is_composition=True, name_or_path="")
             self.config.llm_config = PretrainedConfig(hidden_size=16)
-            self.config.name_or_path = ""
+            self.config.get_text_config = lambda decoder=None, encoder=None: (
+                self.config.llm_config if decoder else self.config
+            )
+            self.language_model = nn.Module()
+            self.language_model.config = self.config.llm_config
+
+        def get_decoder(self):
+            return self.language_model
 
     encoder = retrieval.BiEncoderModel(CompositeBackbone(), pooling="last", l2_normalize=True)
 
@@ -738,7 +848,7 @@ def test_ministral_embedding_uses_bidirectional_flash_attention(tmp_path, monkey
     assert backbone.config.is_causal is False
     assert hasattr(backbone.config, "_attn_implementation")
     backbone.config._attn_implementation = "flash_attention_2"
-    assert all(layer.self_attn.is_causal is True for layer in backbone.layers)
+    assert all(layer.self_attn.is_causal is False for layer in backbone.layers)
 
     kernel_calls = []
 
