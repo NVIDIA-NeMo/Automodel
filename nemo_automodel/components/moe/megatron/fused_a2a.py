@@ -44,6 +44,8 @@ except ImportError:
 
 import torch
 
+from nemo_automodel.components.distributed.hang_debug import marker
+
 _buffer = None
 _nvshmem_available = None
 _uccl_buffer = None
@@ -375,6 +377,14 @@ def init_hybrid_ep_buffer(
         num_sms_combine_api: Number of SMs used by the combine API.
         fp8_dispatch: Whether to use FP8 communication during the dispatch phase.
     """
+    marker(
+        "hybridep.buffer_init.start",
+        hidden_dim=hidden_dim,
+        seq_len=seq_len,
+        num_local_experts=num_local_experts,
+        group_size=group.size(),
+        group_rank=group.rank(),
+    )
     assert not fp8_dispatch, "HybridEP dispatcher does not support fp8 dispatch now"
     global _hybrid_ep_buffer
     _hybrid_ep_buffer = HybridEPBuffer(
@@ -386,6 +396,7 @@ def init_hybrid_ep_buffer(
         num_sms_dispatch_api=num_sms_dispatch_api,
         num_sms_combine_api=num_sms_combine_api,
     )
+    marker("hybridep.buffer_init.end")
 
 
 def reset_hybrid_ep_buffer():
@@ -411,6 +422,13 @@ class HybridEPDispatch(torch.autograd.Function):
         pad_multiple=None,
     ):
         """Forward pass of fused dispatch of the HybridEP backend."""
+        marker(
+            "hybridep.dispatch.forward.start",
+            hidden=x,
+            routing_map=routing_map,
+            probs=probs,
+            buffer_initialized=_hybrid_ep_buffer is not None,
+        )
         if _hybrid_ep_buffer is None:
             seq_len, hidden_dim = x.shape[-2:]
             fp8_dispatch = False
@@ -424,6 +442,7 @@ class HybridEPDispatch(torch.autograd.Function):
                 fp8_dispatch,
             )
         non_blocking = num_permuted_tokens is not None
+        marker("hybridep.dispatch.forward.before_dispatch_with_permute", non_blocking=non_blocking)
         (
             dispatched_hidden,
             dispatched_probs,
@@ -440,6 +459,11 @@ class HybridEPDispatch(torch.autograd.Function):
             num_permuted_tokens=num_permuted_tokens,
             non_blocking=non_blocking,
         )
+        marker(
+            "hybridep.dispatch.forward.after_dispatch_with_permute",
+            dispatched_hidden=dispatched_hidden,
+            tokens_per_expert=tokens_per_expert,
+        )
 
         ctx.handle = handle
         ctx.pad_multiple = pad_multiple
@@ -455,9 +479,11 @@ class HybridEPDispatch(torch.autograd.Function):
     def backward(ctx, grad_x, grad_probs, grad_scaling_factor, grad_tokens_per_expert, grad_handle):
         """Backward pass of fused dispatch of the HybridEP backend."""
         handle = ctx.handle
+        marker("hybridep.dispatch.backward.before_combine_with_unpermute", grad_x=grad_x)
         combined_hidden, combined_probs = _hybrid_ep_buffer.combine_with_unpermute(
             hidden=grad_x, probs=grad_probs, handle=handle, pad_multiple=ctx.pad_multiple
         )
+        marker("hybridep.dispatch.backward.after_combine_with_unpermute", combined_hidden=combined_hidden)
         return combined_hidden, None, combined_probs, None, None, None, None, None, None
 
 
@@ -467,9 +493,11 @@ class HybridEPCombine(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, handle, num_permuted_tokens=None, pad_multiple=None):
         """Forward pass of fused combine of the HybridEP backend."""
+        marker("hybridep.combine.forward.before_combine_with_unpermute", hidden=x)
         combined_hidden, _ = _hybrid_ep_buffer.combine_with_unpermute(
             hidden=x, handle=handle, pad_multiple=pad_multiple
         )
+        marker("hybridep.combine.forward.after_combine_with_unpermute", combined_hidden=combined_hidden)
         ctx.handle = handle
         ctx.pad_multiple = pad_multiple
         ctx.num_permuted_tokens = num_permuted_tokens
@@ -479,6 +507,7 @@ class HybridEPCombine(torch.autograd.Function):
     def backward(ctx, grad_x):
         """Backward pass of fused combine of the HybridEP backend."""
         handle = ctx.handle
+        marker("hybridep.combine.backward.before_dispatch_with_permute", grad_x=grad_x)
         dispatched_hidden, _, _, _, _ = _hybrid_ep_buffer.dispatch_with_permute(
             hidden=grad_x,
             scaling_factor=None,
@@ -486,6 +515,7 @@ class HybridEPCombine(torch.autograd.Function):
             pad_multiple=ctx.pad_multiple,
             num_permuted_tokens=ctx.num_permuted_tokens,
         )
+        marker("hybridep.combine.backward.after_dispatch_with_permute", dispatched_hidden=dispatched_hidden)
         return dispatched_hidden, None, None, None
 
 

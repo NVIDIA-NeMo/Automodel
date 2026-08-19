@@ -29,6 +29,7 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
     shard_batch_aux_only,
     shard_sequence_for_cp_round_robin,
 )
+from nemo_automodel.components.distributed.hang_debug import marker
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.mtp import (
@@ -292,6 +293,13 @@ class Step3p7Model(nn.Module):
         image_embeds: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> torch.Tensor:
+        marker(
+            "step3p7.multimodal_model.start",
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            pixel_values=pixel_values,
+            patch_pixel_values=patch_pixel_values,
+        )
         if inputs_embeds is None:
             if input_ids is None:
                 raise ValueError("Step3p7Model requires input_ids or inputs_embeds.")
@@ -299,13 +307,17 @@ class Step3p7Model(nn.Module):
                 inputs_embeds = input_ids
                 input_ids = None
             else:
+                marker("step3p7.multimodal_model.before_vision")
                 multimodal_embeddings = self.get_multimodal_embeddings(
                     pixel_values=pixel_values,
                     patch_pixel_values=patch_pixel_values,
                     num_patches=num_patches,
                     image_embeds=image_embeds,
                 )
+                marker("step3p7.multimodal_model.after_vision", multimodal_embeddings=multimodal_embeddings)
+                marker("step3p7.multimodal_model.before_vision_splice")
                 inputs_embeds = self.prepare_inputs_embeds(input_ids, multimodal_embeddings)
+                marker("step3p7.multimodal_model.after_vision_splice", inputs_embeds=inputs_embeds)
 
         if (
             inputs_embeds is not None
@@ -314,13 +326,16 @@ class Step3p7Model(nn.Module):
         ):
             attention_mask = None
 
-        return self.language_model(
+        marker("step3p7.multimodal_model.before_language_model", inputs_embeds=inputs_embeds)
+        output = self.language_model(
             input_ids=None,
             inputs_embeds=inputs_embeds,
             position_ids=position_ids,
             attention_mask=attention_mask,
             **kwargs,
         )
+        marker("step3p7.multimodal_model.after_language_model", output=output)
+        return output
 
 
 class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
@@ -572,6 +587,13 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
         output_hidden_states: Optional[bool] = None,
         **kwargs: Any,
     ) -> torch.Tensor | Step3p7CausalLMOutput:
+        marker(
+            "step3p7.conditional.start",
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            mtp_input_ids=mtp_per_depth_input_ids,
+            mtp_position_ids=mtp_per_depth_position_ids,
+        )
         output_hidden_states = (
             output_hidden_states
             if output_hidden_states is not None
@@ -669,6 +691,7 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
                 cp_dispatcher_suspended,  # noqa: PLC0415
             )
 
+            marker("step3p7.conditional.before_cp_vision", cp_size=cp_size)
             with cp_dispatcher_suspended(self.cp_mesh):
                 multimodal_embeddings = self.model.get_multimodal_embeddings(
                     pixel_values=kwargs.get("pixel_values", None),
@@ -676,7 +699,10 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
                     num_patches=kwargs.get("num_patches", None),
                     image_embeds=kwargs.get("image_embeds", None),
                 )
+            marker("step3p7.conditional.after_cp_vision", multimodal_embeddings=multimodal_embeddings)
+            marker("step3p7.conditional.before_cp_vision_splice")
             inputs_embeds = self.model.prepare_inputs_embeds(input_ids, multimodal_embeddings)
+            marker("step3p7.conditional.after_cp_vision_splice", inputs_embeds=inputs_embeds)
             if use_mtp:
                 per_depth_inputs = (
                     mtp_per_depth_input_ids,
@@ -689,6 +715,7 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
                     )
                 if any(len(value) != self.mtp_config.num_layers for value in per_depth_inputs):
                     raise ValueError(f"Expected {self.mtp_config.num_layers} tensors for every Step3.7 MTP stream")
+                marker("step3p7.conditional.before_mtp_embed_build")
                 mtp_embed_inputs = tuple(
                     local_embed.masked_fill(~valid_mask.unsqueeze(-1), 0)
                     for local_embed, valid_mask in zip(
@@ -700,7 +727,10 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
                         strict=True,
                     )
                 )
+                marker("step3p7.conditional.after_mtp_embed_build", mtp_embed_inputs=mtp_embed_inputs)
+            marker("step3p7.conditional.before_cp_embedding_shard", inputs_embeds=inputs_embeds)
             inputs_embeds, _, _ = shard_sequence_for_cp_round_robin(self.cp_mesh, inputs_embeds, seq_dim=1)
+            marker("step3p7.conditional.after_cp_embedding_shard", inputs_embeds=inputs_embeds)
             input_ids = None
             # Media consumed into inputs_embeds; drop so self.model does not re-splice.
             for media_key in (
@@ -730,6 +760,7 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
                 raise ValueError("First PP stage requires input_ids or inputs_embeds to build MTP embeddings.")
             mtp_embed_inputs = self._build_mtp_embed_inputs_from_embeds(inputs_embeds)
 
+        marker("step3p7.conditional.before_backbone", input_ids=input_ids, inputs_embeds=inputs_embeds)
         hidden_states = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -737,8 +768,11 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
             inputs_embeds=inputs_embeds,
             **kwargs,
         )
+        marker("step3p7.conditional.after_backbone", hidden_states=hidden_states)
 
+        marker("step3p7.conditional.before_lm_head", hidden_states=hidden_states)
         logits = compute_lm_head_logits(self.lm_head, hidden_states, logits_to_keep).logits
+        marker("step3p7.conditional.after_lm_head", logits=logits)
 
         if pp_mtp_enabled and self.lm_head is None:
             return (logits, *mtp_embed_inputs)
@@ -771,7 +805,9 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
             else:
                 mtp_kwargs["input_ids"] = input_ids
                 mtp_kwargs["embed_fn"] = self.model.language_model.embed_tokens
+            marker("step3p7.conditional.before_mtp", mtp_embed_inputs=mtp_embed_inputs)
             mtp_per_depth_logits = self.mtp(**mtp_kwargs)
+            marker("step3p7.conditional.after_mtp", mtp_logits=mtp_per_depth_logits)
         elif pp_mtp_enabled and self.lm_head is not None:
             mtp_per_depth_logits = [
                 logits.new_empty(logits.shape) for _ in range(int(getattr(self.mtp_config, "num_layers", 0) or 0))
@@ -793,6 +829,7 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
                 return logits
             return Step3p7CausalLMOutput(logits=logits, hidden_states=hidden_states)
 
+        marker("step3p7.conditional.end", logits=logits, mtp_logits=mtp_per_depth_logits)
         return Step3p7CausalLMOutput(
             logits=logits,
             hidden_states=(hidden_states if output_hidden_states else None),

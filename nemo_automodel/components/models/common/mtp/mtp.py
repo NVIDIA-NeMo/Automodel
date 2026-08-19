@@ -23,6 +23,8 @@ from typing import Callable
 import torch
 import torch.nn as nn
 
+from nemo_automodel.components.distributed.hang_debug import marker
+
 
 @dataclass(frozen=True)
 class MTPContextParallelInputs:
@@ -526,6 +528,13 @@ class MTPModule(nn.Module):
             List of length ``num_depths`` containing hidden states of shape
             ``[batch, sequence, hidden]`` or ``[tokens, hidden]``.
         """
+        marker(
+            "mtp.module.start",
+            hidden_states=hidden_states,
+            input_ids=input_ids,
+            input_ids_per_depth=input_ids_per_depth,
+            embed_inputs=embed_inputs,
+        )
         if embed_inputs is not None:
             if input_ids is not None or input_ids_per_depth is not None or embed_fn is not None:
                 raise ValueError("embed_inputs is mutually exclusive with input_ids/input_ids_per_depth/embed_fn")
@@ -587,10 +596,13 @@ class MTPModule(nn.Module):
         cur_input_ids = input_ids
         cur_position_ids = position_ids
         for depth in range(num_iterations):
+            marker(f"mtp.depth.{depth}.start", hidden_states=hidden_states)
             if embed_inputs is not None:
                 decoder_input = embed_inputs[depth]
             elif input_ids_per_depth is not None:
+                marker(f"mtp.depth.{depth}.before_embedding", input_ids=input_ids_per_depth[depth])
                 decoder_input = embed_fn(input_ids_per_depth[depth])
+                marker(f"mtp.depth.{depth}.after_embedding", decoder_input=decoder_input)
             else:
                 cur_input_ids = roll_tensor(cur_input_ids, shifts=-1, dim=-1)
                 decoder_input = embed_fn(cur_input_ids)
@@ -610,6 +622,17 @@ class MTPModule(nn.Module):
                     kwargs["position_ids"] = depth_position_ids
                 if sublayer_idx == 0:
                     kwargs["embed_input"] = decoder_input
+                marker(
+                    f"mtp.depth.{depth}.sublayer.{sublayer_idx}.before",
+                    hidden_states=hidden_states,
+                    sublayer=type(sublayer).__name__,
+                )
                 hidden_states = sublayer(hidden_states, **kwargs)
+                marker(
+                    f"mtp.depth.{depth}.sublayer.{sublayer_idx}.after",
+                    hidden_states=hidden_states,
+                )
             per_depth_h.append(hidden_states)
+            marker(f"mtp.depth.{depth}.end", hidden_states=hidden_states)
+        marker("mtp.module.end", per_depth_h=per_depth_h)
         return per_depth_h

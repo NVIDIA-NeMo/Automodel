@@ -19,6 +19,7 @@ import torch
 import torch.nn as nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
+from nemo_automodel.components.distributed.hang_debug import marker
 from nemo_automodel.components.models.common import BackendConfig, get_rope_config, initialize_linear_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.tie_word_embeddings import (
@@ -186,12 +187,19 @@ class Block(nn.Module):
         position_ids: torch.Tensor | None = None,
         **attn_kwargs: Any,
     ) -> torch.Tensor:
+        marker(
+            f"step3.block.{self.layer_idx}.start",
+            hidden=x,
+            is_moe=self.is_moe_layer,
+            grad_enabled=torch.is_grad_enabled(),
+        )
         if attention_mask is not None and padding_mask is None:
             padding_mask = attention_mask.bool().logical_not()
 
         # Attention
         residual = x
         x = self.input_layernorm(x)
+        marker(f"step3.block.{self.layer_idx}.before_attention", hidden=x)
         attn_out = self.self_attn(
             x,
             freqs_cis=freqs_cis,
@@ -199,6 +207,7 @@ class Block(nn.Module):
             position_ids=position_ids,
             **attn_kwargs,
         )
+        marker(f"step3.block.{self.layer_idx}.after_attention", hidden=attn_out)
         x = residual + attn_out
 
         # FFN (MLP or MoE + shared expert)
@@ -206,13 +215,20 @@ class Block(nn.Module):
         x = self.post_attention_layernorm(x)
 
         if self.is_moe_layer:
+            marker(f"step3.block.{self.layer_idx}.before_shared_expert", hidden=x)
             share_out = self.share_expert(x)
+            marker(f"step3.block.{self.layer_idx}.after_shared_expert", hidden=share_out)
+            marker(f"step3.block.{self.layer_idx}.before_moe", hidden=x)
             moe_out = self.moe(x, padding_mask)
+            marker(f"step3.block.{self.layer_idx}.after_moe", hidden=moe_out)
             x = residual + share_out + moe_out
         else:
+            marker(f"step3.block.{self.layer_idx}.before_mlp", hidden=x)
             mlp_out = self.mlp(x)
+            marker(f"step3.block.{self.layer_idx}.after_mlp", hidden=mlp_out)
             x = residual + mlp_out
 
+        marker(f"step3.block.{self.layer_idx}.end", hidden=x)
         return x
 
     def init_weights(self, buffer_device: torch.device) -> None:
@@ -339,6 +355,7 @@ class Step3p5Model(nn.Module):
         padding_mask: torch.Tensor | None = None,
         **attn_kwargs: Any,
     ) -> torch.Tensor:
+        marker("step3.backbone.start", input_ids=input_ids, inputs_embeds=inputs_embeds)
         if input_ids is None and inputs_embeds is None:
             raise ValueError("Step3p5Model requires input_ids or inputs_embeds.")
 
@@ -350,7 +367,9 @@ class Step3p5Model(nn.Module):
                 raise ValueError("inputs_embeds must be provided when embed_tokens is not present.")
 
         if inputs_embeds is None:
+            marker("step3.backbone.before_embedding", input_ids=input_ids)
             inputs_embeds = self.embed_tokens(input_ids)
+            marker("step3.backbone.after_embedding", inputs_embeds=inputs_embeds)
 
         if position_ids is None:
             position_ids = (
@@ -360,6 +379,7 @@ class Step3p5Model(nn.Module):
             )
 
         # Compute freqs_cis from RotaryEmbedding
+        marker("step3.backbone.before_rope", position_ids=position_ids)
         freqs_cis = position_ids_to_freqs_cis(
             self.rotary_emb,
             position_ids,
@@ -367,10 +387,12 @@ class Step3p5Model(nn.Module):
             for_fused_rope=self.backend.rope_fusion,
             cp_size=attn_kwargs.get("cp_size", 1),
         )
+        marker("step3.backbone.after_rope", freqs_cis=freqs_cis)
 
         h = inputs_embeds
 
         for layer in self.layers.values():
+            marker(f"step3.backbone.before_layer.{layer.layer_idx}", hidden=h)
             h = layer(
                 x=h,
                 freqs_cis=freqs_cis,
@@ -379,8 +401,11 @@ class Step3p5Model(nn.Module):
                 position_ids=position_ids,
                 **attn_kwargs,
             )
+            marker(f"step3.backbone.after_layer.{layer.layer_idx}", hidden=h)
 
+        marker("step3.backbone.before_final_norm", hidden=h)
         h = self.norm(h) if self.norm else h
+        marker("step3.backbone.end", hidden=h)
         return h
 
     @torch.no_grad()

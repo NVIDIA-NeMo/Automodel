@@ -20,6 +20,8 @@ from typing import List, Literal, Optional, Tuple
 import torch
 from torch import nn
 
+from nemo_automodel.components.distributed.hang_debug import marker
+
 from .fused_a2a import (
     fused_combine,
     fused_dispatch,
@@ -399,9 +401,11 @@ class _HybridEPManager(_DispatchManager):
 
     def setup_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor):
         """Process routing map and probabilities to prepare dispatch metadata."""
+        marker("hybridep.manager.setup_metadata.start", routing_map=routing_map, probs=probs)
         num_tokens = routing_map.shape[0]
         self.routing_map = routing_map.reshape(num_tokens, self.num_experts)
         self.token_probs = probs.reshape(num_tokens, self.num_experts)
+        marker("hybridep.manager.setup_metadata.end", routing_map=self.routing_map, probs=self.token_probs)
 
     def _indices_to_multihot(self, indices: torch.Tensor, probs: torch.Tensor):
         """Converts a tensor of indices to a multihot vector."""
@@ -427,10 +431,16 @@ class _HybridEPManager(_DispatchManager):
 
     def setup_metadata_from_indices(self, token_indices: torch.Tensor, token_probs: torch.Tensor):
         """Convert from topk indices format to multihot routing_map format."""
+        marker("hybridep.manager.setup_metadata_indices.start", indices=token_indices, probs=token_probs)
         if self.permute_fusion:
             self.routing_map, self.token_probs = fused_indices_to_multihot(token_indices, token_probs, self.num_experts)
         else:
             self.routing_map, self.token_probs = self._indices_to_multihot(token_indices, token_probs)
+        marker(
+            "hybridep.manager.setup_metadata_indices.end",
+            routing_map=self.routing_map,
+            probs=self.token_probs,
+        )
 
     def dispatch(
         self,
@@ -438,6 +448,7 @@ class _HybridEPManager(_DispatchManager):
         async_finish: bool = True,  # noqa: ARG002 - not supported by HybridEP backend
         allocate_on_comm_stream: bool = True,  # noqa: ARG002 - not supported by HybridEP backend
     ) -> torch.Tensor:
+        marker("hybridep.manager.dispatch.start", hidden_states=hidden_states)
         # Reset num_permuted_tokens to None to avoid reusing cached state from a prior dispatch.
         # This can happen in non-reentrant activation checkpointing mode.
         self.num_permuted_tokens = None
@@ -458,6 +469,11 @@ class _HybridEPManager(_DispatchManager):
         self.tokens_per_expert = tokens_per_expert
         self.num_permuted_tokens = self.tokens_per_expert.sum()
 
+        marker(
+            "hybridep.manager.dispatch.end",
+            dispatched_hidden=dispatched_hidden,
+            tokens_per_expert=self.tokens_per_expert,
+        )
         return dispatched_hidden
 
     def combine(
@@ -466,6 +482,7 @@ class _HybridEPManager(_DispatchManager):
         async_finish: bool = True,  # noqa: ARG002 - not supported by HybridEP backend
         allocate_on_comm_stream: bool = True,  # noqa: ARG002 - not supported by HybridEP backend
     ) -> torch.Tensor:
+        marker("hybridep.manager.combine.start", hidden_states=hidden_states)
         hidden_states = hybrid_ep_combine(
             x=hidden_states,
             handle=self.handle,
@@ -474,6 +491,7 @@ class _HybridEPManager(_DispatchManager):
         )
         self.handle = None
         self.num_permuted_tokens = None
+        marker("hybridep.manager.combine.end", hidden_states=hidden_states)
         return hidden_states
 
     def get_dispatched_metadata(self) -> torch.Tensor:

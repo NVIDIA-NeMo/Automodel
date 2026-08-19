@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING
 
 from torch.distributed.checkpoint.stateful import Stateful
 
+from nemo_automodel.components.distributed.hang_debug import marker
 from nemo_automodel.components.training.signal_handler import DistributedSignalHandler, SignalLike
 
 if TYPE_CHECKING:
@@ -198,15 +199,53 @@ class StepScheduler(Stateful):
         if self.step >= self.max_steps:
             return
         batch_buffer = []
-        for batch in self.dataloader:
+        marker(
+            "step_scheduler.iter.before_dataloader",
+            step=self.step,
+            epoch=self.epoch,
+            grad_acc_steps=self.grad_acc_steps,
+        )
+        dataloader_iter = iter(self.dataloader)
+        while True:
+            marker(
+                "step_scheduler.iter.before_next_batch",
+                step=self.step,
+                epoch=self.epoch,
+                buffered=len(batch_buffer),
+            )
+            try:
+                batch = next(dataloader_iter)
+            except StopIteration:
+                marker("step_scheduler.iter.dataloader_exhausted", step=self.step, epoch=self.epoch)
+                break
+            marker(
+                "step_scheduler.iter.got_batch",
+                step=self.step,
+                epoch=self.epoch,
+                buffered=len(batch_buffer),
+                batch_keys=sorted(batch),
+            )
             batch_buffer.append(batch)
             if len(batch_buffer) == self.grad_acc_steps:
+                marker(
+                    "step_scheduler.iter.yield_full_batch",
+                    step=self.step,
+                    epoch=self.epoch,
+                    num_microbatches=len(batch_buffer),
+                )
                 yield batch_buffer
+                marker("step_scheduler.iter.resumed_after_yield", step=self.step, epoch=self.epoch)
                 self.step += 1
                 batch_buffer = []
                 if self.step >= self.max_steps or self.sigterm_flag:
                     return
         if batch_buffer:
+            marker(
+                "step_scheduler.iter.yield_partial_batch",
+                step=self.step,
+                epoch=self.epoch,
+                num_microbatches=len(batch_buffer),
+            )
             yield batch_buffer
             self.step += 1
         self.epoch += 1

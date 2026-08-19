@@ -24,6 +24,7 @@ from torch.autograd import Function
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
 
+from nemo_automodel.components.distributed.hang_debug import marker
 from nemo_automodel.components.moe.state_dict_utils import create_dtensor_from_local
 
 try:
@@ -446,6 +447,14 @@ class GroupedExperts(nn.Module):
             torch.Tensor: Output tensor after expert computation.
                 Shape is [num_tokens, model_dim]
         """
+        marker(
+            "grouped_experts_deepep.forward.start",
+            hidden=x,
+            token_mask=token_mask,
+            weights=weights,
+            indices=indices,
+            dispatcher=self.dispatcher_backend,
+        )
         assert not isinstance(x, DTensor)
         input_dtype = x.dtype
 
@@ -1012,11 +1021,18 @@ class GroupedExpertsDeepEP(nn.Module):
         )
 
         indices = indices.masked_fill(~token_mask.unsqueeze(-1), -1)
+        marker("grouped_experts_deepep.before_token_permutation", hidden=x)
         (permuted_local_hidden_states, tokens_per_expert, permuted_probs) = self.token_dispatcher.token_permutation2(
             hidden_states=x,
             num_local_tokens=x.size(0),
             token_probs=weights,
             token_indices=indices,
+        )
+        marker(
+            "grouped_experts_deepep.after_token_permutation",
+            hidden=permuted_local_hidden_states,
+            tokens_per_expert=tokens_per_expert,
+            probs=permuted_probs,
         )
         permuted_probs = _stabilize_empty_routing_probs_dtype(permuted_probs, self.config.dtype)
         permuted_probs = permuted_probs.unsqueeze(-1)
@@ -1033,6 +1049,7 @@ class GroupedExpertsDeepEP(nn.Module):
         gate_and_up_projs = self.gate_and_up_projs.to_local().to(compute_dtype)
         down_projs = self.down_projs.to_local().to(compute_dtype)
 
+        marker("grouped_experts_deepep.before_expert_compute", hidden=permuted_local_hidden_states)
         if torch.count_nonzero(tokens_per_expert) > 0:
             if self.use_torch_mm:
                 tokens_per_expert_gpu = tokens_per_expert.to(
@@ -1107,7 +1124,11 @@ class GroupedExpertsDeepEP(nn.Module):
             # the multiply in fp32, then cast each routed expert output back.
             output2 = (output2.float() * permuted_probs.float()).to(compute_dtype)
 
+        marker("grouped_experts_deepep.after_expert_compute", hidden=output2)
+        marker("grouped_experts_deepep.before_token_unpermutation", hidden=output2)
         y = self.token_dispatcher.token_unpermutation(output2)
+        marker("grouped_experts_deepep.after_token_unpermutation", hidden=y)
+        marker("grouped_experts_deepep.forward.end", hidden=y)
         return y
 
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:

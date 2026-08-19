@@ -55,6 +55,7 @@ from nemo_automodel.components.distributed.cp_vision_frame_shard import (
     reset_cp_vision_group,
     set_cp_vision_group,
 )
+from nemo_automodel.components.distributed.hang_debug import marker, start_distributed_debug_probe
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
@@ -685,6 +686,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
         For each batch, perform a forward pass, compute loss, backpropagate,
         and update model parameters when necessary. Also prints loss every gradient step.
         """
+        marker("vlm.train_loop.start")
+        start_distributed_debug_probe()
+        marker("vlm.train_loop.probe_started")
         for mp in self.model_parts:
             mp.train()
         self.timestamp = time.perf_counter()
@@ -694,7 +698,14 @@ class FinetuneRecipeForVLM(BaseRecipe):
             for epoch in self.step_scheduler.epochs:
                 self.step_scheduler.set_epoch(epoch)
                 for batch_idx, batches in enumerate(self.step_scheduler):
+                    marker(
+                        "vlm.train_loop.before_optim_step",
+                        epoch=epoch,
+                        batch_idx=batch_idx,
+                        num_microbatches=len(batches),
+                    )
                     log_data = self._run_train_optim_step(batches, self.max_grad_norm)
+                    marker("vlm.train_loop.after_optim_step", epoch=epoch, batch_idx=batch_idx)
                     # log
                     self.log_train_metrics(log_data)
                     self._update_progress_bar(pbar, log_data.metrics)
@@ -836,7 +847,22 @@ class FinetuneRecipeForVLM(BaseRecipe):
         num_batches,
         is_train: bool = True,
     ):
+        marker(
+            "vlm.forward_backward.start",
+            microbatch=idx,
+            num_batches=num_batches,
+            is_train=is_train,
+            batch_keys=sorted(batch),
+        )
+        marker("vlm.forward_backward.before_move_to_device", microbatch=idx)
         batch = {k: _move_to_device(v, self.dist_env.device) for k, v in batch.items()}
+        marker(
+            "vlm.forward_backward.after_move_to_device",
+            microbatch=idx,
+            input_ids=batch.get("input_ids"),
+            labels=batch.get("labels"),
+            pixel_values=batch.get("pixel_values"),
+        )
 
         # Single CP dispatch (magi / model-owned / generic). The pre-embed hook is
         # a plain method call (prepare_model_inputs_for_cp): sharder-only, it
@@ -875,6 +901,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 "use one-dimensional position_ids or cp_size=1."
             )
         _padding_id = getattr(getattr(getattr(self, "processor", None), "tokenizer", None), "pad_token_id", 0) or 0
+        marker("vlm.forward_backward.before_cp_sharder_init", microbatch=idx)
         cp_sharder = ContextParallelSharder(
             self.model_parts[0],
             self.device_mesh,
@@ -882,6 +909,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             padding_token_id=_padding_id,
             invoke_pre_embed=True,
         )
+        marker("vlm.forward_backward.after_cp_sharder_init", microbatch=idx)
         model = self.model_parts[0]
         mtp_cp_enabled = _cp_active and not self.pp_enabled and model.supports.mtp_enabled
         mtp_cp_inputs = None
@@ -891,13 +919,28 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     f"{type(model).__name__} declares supports_mtp_cp=False; "
                     "MTP target preparation for context parallelism is unavailable"
                 )
+            marker("vlm.forward_backward.before_mtp_cp_prepare", microbatch=idx)
             mtp_cp_inputs = model.prepare_mtp_inputs_for_cp(
                 batch,
                 ignore_index=self.cfg.mtp.ignore_index,
             )
+            marker(
+                "vlm.forward_backward.after_mtp_cp_prepare",
+                microbatch=idx,
+                mtp_input_ids=mtp_cp_inputs.input_ids,
+                mtp_targets=mtp_cp_inputs.targets,
+            )
+        marker("vlm.forward_backward.before_cp_shard", microbatch=idx)
         train_ctx, batch = cp_sharder.shard(batch)
+        marker(
+            "vlm.forward_backward.after_cp_shard",
+            microbatch=idx,
+            input_ids=batch.get("input_ids"),
+            position_ids=batch.get("position_ids"),
+        )
         mtp_per_depth_targets = None
         if mtp_cp_inputs is not None:
+            marker("vlm.forward_backward.before_mtp_cp_shard", microbatch=idx)
             batch["mtp_per_depth_input_ids"] = tuple(
                 cp_sharder.shard_token_tensor(ids, seq_dim=1, fill=0) for ids in mtp_cp_inputs.input_ids
             )
@@ -911,6 +954,12 @@ class FinetuneRecipeForVLM(BaseRecipe):
             mtp_per_depth_targets = tuple(
                 cp_sharder.shard_token_tensor(targets, seq_dim=1, fill=self.cfg.mtp.ignore_index)
                 for targets in mtp_cp_inputs.targets
+            )
+            marker(
+                "vlm.forward_backward.after_mtp_cp_shard",
+                microbatch=idx,
+                mtp_input_ids=batch["mtp_per_depth_input_ids"],
+                mtp_targets=mtp_per_depth_targets,
             )
         labels = batch.pop("labels")
 
@@ -953,7 +1002,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 else nullcontext()
             )
             with sync_ctx, self._cp_vision_frame_sharding_context(), train_ctx():
+                marker("vlm.forward_backward.entered_contexts", microbatch=idx)
                 batch = filter_forward_kwargs(model, batch)
+                marker("vlm.forward_backward.after_filter_kwargs", microbatch=idx, batch_keys=sorted(batch))
                 if isinstance(self.loss_fn, FusedLinearCrossEntropy):
                     # use num_logits_to_keep to avoid full logits matrix in memory
                     out = model(logits_to_keep=1, **batch)
@@ -963,7 +1014,14 @@ class FinetuneRecipeForVLM(BaseRecipe):
                             "Set `model.text_config.output_hidden_states=True` in the config."
                         )
                 else:
+                    marker("vlm.forward_backward.before_model", microbatch=idx)
                     out = model(**batch)
+                    marker(
+                        "vlm.forward_backward.after_model",
+                        microbatch=idx,
+                        logits=getattr(out, "logits", out),
+                        mtp_logits=getattr(out, "mtp_per_depth_logits", None),
+                    )
 
                 grad_reduce_group = self._get_dp_group(include_cp=True) if is_train else None
                 shared_lm_weight = (
@@ -974,6 +1032,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     if isinstance(self.loss_fn, FusedLinearCrossEntropy)
                     else None
                 )
+                marker("vlm.forward_backward.before_base_loss", microbatch=idx)
                 local_loss = calculate_loss(
                     self.loss_fn,
                     logits=getattr(out, "logits", out),
@@ -984,6 +1043,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     grad_reduce_group=grad_reduce_group,
                     num_label_tokens=num_label_tokens,
                 )
+                marker("vlm.forward_backward.after_base_loss", microbatch=idx, local_loss=local_loss)
                 # DSV4-style MTP loss (from main): triggers when the model emits
                 # ``mtp_per_depth_h`` / ``mtp_per_depth_logits``.
                 mtp_per_depth_h = getattr(out, "mtp_per_depth_h", None)
@@ -995,6 +1055,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     scaling_factor = (
                         mtp_cfg.scaling_factor if mtp_cfg.scaling_factor is not None else out.mtp_loss_scaling_factor
                     )
+                    marker("vlm.forward_backward.before_mtp_loss", microbatch=idx)
                     local_loss = local_loss + calculate_mtp_loss(
                         self.loss_fn,
                         mtp_per_depth_h=mtp_per_depth_h,
@@ -1009,6 +1070,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                         grad_reduce_group=grad_reduce_group,
                         cu_seqlens=None if mtp_per_depth_targets is not None else batch.get("cu_seqlens"),
                     )
+                    marker("vlm.forward_backward.after_mtp_loss", microbatch=idx, local_loss=local_loss)
 
                 # Joint base + drafter co-training (Gemma4WithDrafter and
                 # similar): detect by presence of ``drafter_logits`` on the
@@ -1030,7 +1092,10 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
                 loss_buffer.append(local_loss.clone().detach())
                 if is_train:
+                    marker("vlm.forward_backward.before_backward", microbatch=idx)
                     (local_loss * self._get_dp_group_size(include_cp=True)).backward()
+                    marker("vlm.forward_backward.after_backward", microbatch=idx)
+        marker("vlm.forward_backward.end", microbatch=idx)
 
     def _configure_pipeline_loss_fn(self):
         if self.pp is None or not self.pp.info.has_last_stage:
@@ -1057,10 +1122,13 @@ class FinetuneRecipeForVLM(BaseRecipe):
             batches: List of batches of training data.
             max_grad_norm: Gradient clipping norm. Optional, if None will not clip gradients.
         """
+        marker("vlm.optim_step.start", num_microbatches=len(batches))
         num_label_tokens = torch.tensor(
             sum((batch["labels"] != -100).sum().item() for batch in batches), dtype=torch.long
         )
+        marker("vlm.optim_step.before_label_allreduce", num_label_tokens=num_label_tokens)
         num_label_tokens = self._dp_allreduce(num_label_tokens).item()
+        marker("vlm.optim_step.after_label_allreduce", num_label_tokens=num_label_tokens)
 
         num_batches = len(batches)
         self._set_moe_aux_loss_backward_scale(num_batches=num_batches, num_label_tokens=num_label_tokens)
@@ -1072,21 +1140,27 @@ class FinetuneRecipeForVLM(BaseRecipe):
             sum(batch["labels"].numel() - count_tail_padding(batch["labels"]) for batch in batches),
             dtype=torch.long,
         )
+        marker("vlm.optim_step.before_token_allreduce", num_tokens_in_batch=num_tokens_in_batch)
         num_tokens_in_batch = self._dp_allreduce(num_tokens_in_batch).item()
+        marker("vlm.optim_step.after_token_allreduce", num_tokens_in_batch=num_tokens_in_batch)
 
         prepare_for_grad_accumulation(self.model_parts, pp_enabled=self.pp_enabled)
+        marker("vlm.optim_step.after_prepare_grad_accumulation")
 
         for i, batch in enumerate(batches):
             if i == num_batches - 1:
                 prepare_for_final_backward(self.model_parts, pp_enabled=self.pp_enabled)
 
+            marker("vlm.optim_step.before_microbatch", microbatch=i, num_batches=num_batches)
             self._forward_backward_step(
                 i, batch, loss_buffer=loss_buffer, num_label_tokens=num_label_tokens, num_batches=num_batches
             )
+            marker("vlm.optim_step.after_microbatch", microbatch=i, num_batches=num_batches)
 
             if i == 0:
                 prepare_after_first_microbatch()
 
+        marker("vlm.optim_step.before_grad_norm")
         grad_norm = scale_grads_and_clip_grad_norm(
             max_grad_norm=max_grad_norm,
             model_parts=self.model_parts,
@@ -1101,14 +1175,17 @@ class FinetuneRecipeForVLM(BaseRecipe):
             dp_group_size=self._get_dp_group_size(include_cp=True),
             expert_tp_replication_factor=get_expert_tp_replication_factor(self.model_parts, self.device_mesh),
         )
+        marker("vlm.optim_step.after_grad_norm", grad_norm=grad_norm)
 
         # Note(MegatronFSDP): Need to call these functions for MegatronFSDP if not using latest api
         # self.model.finish_grad_sync()
 
         self.checkpointer.maybe_wait_for_staging()
+        marker("vlm.optim_step.before_optimizer_step")
         for opt in self.optimizer:
             opt.step()
             opt.zero_grad(set_to_none=True)
+        marker("vlm.optim_step.after_optimizer_step")
 
         if hasattr(self.model_parts[0], "update_moe_gate_bias"):
             for mp in self.model_parts:
