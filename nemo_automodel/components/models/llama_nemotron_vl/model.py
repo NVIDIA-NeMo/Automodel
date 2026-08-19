@@ -40,13 +40,15 @@ class LlamaBidirectionalConfig(LlamaConfig):
 
     def __init__(
         self,
-        pooling="avg",
-        temperature=1.0,
+        pooling: str = "avg",
+        temperature: float = 1.0,
+        is_causal: bool = False,
         **kwargs,
-    ):
+    ) -> None:
         self.pooling = pooling
         self.temperature = temperature
         super().__init__(
+            is_causal=is_causal,
             **kwargs,
         )
 
@@ -137,6 +139,16 @@ class LlamaNemotronVLConfig(PretrainedConfig):
         self.img_context_token_id = img_context_token_id
         self.max_input_tiles = max_input_tiles
         super().__init__(**kwargs)
+
+    def get_text_config(
+        self,
+        decoder: bool | None = None,
+        encoder: bool | None = None,
+    ) -> PretrainedConfig:
+        """Return the language decoder config using the Transformers composite-config contract."""
+        if decoder or decoder == encoder:
+            return self.llm_config
+        return super().get_text_config(decoder=decoder, encoder=encoder)
 
 
 # Check if native create_bidirectional_mask exists (transformers >= 5.0)
@@ -259,17 +271,18 @@ def _filter_vision_embeddings_by_image_flags(
 
 class LlamaBidirectionalModel(LlamaModel):
     """
-    LlamaModel modified to use bidirectional (non-causal) attention.
-    Supports transformers 4.44+ through 5.x with a unified forward() implementation.
-    See https://huggingface.co/nvidia/llama-nemotron-embed-1b-v2 for version notes.
+    Legacy Llama retrieval model supporting causal and bidirectional attention.
+
+    Supports Transformers 4.44 through 5.x with a compatibility forward path.
     """
 
     config_class = LlamaBidirectionalConfig
 
     def __init__(self, config: LlamaBidirectionalConfig):
         super().__init__(config)
+        is_causal = getattr(config, "is_causal", False)
         for layer in self.layers:
-            layer.self_attn.is_causal = False
+            layer.self_attn.is_causal = is_causal
 
     def _create_bidirectional_mask(
         self,
@@ -305,6 +318,19 @@ class LlamaBidirectionalModel(LlamaModel):
         output_hidden_states: bool | None = None,
         **kwargs,
     ) -> BaseModelOutputWithPast:
+        if getattr(self.config, "is_causal", False):
+            return super().forward(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                cache_position=cache_position,
+                use_cache=use_cache,
+                output_hidden_states=output_hidden_states,
+                **kwargs,
+            )
+
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
@@ -666,6 +692,10 @@ class LlamaNemotronVLModel(PreTrainedModel):
         vit_embeds = self.mlp1(vit_embeds)
 
         return vit_embeds
+
+    def get_decoder(self) -> PreTrainedModel:
+        """Return the language tower used as the retrieval text decoder."""
+        return self.language_model
 
     def get_input_embeddings(self):
         return self.language_model.get_input_embeddings()

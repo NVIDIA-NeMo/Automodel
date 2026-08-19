@@ -135,6 +135,7 @@ def test_from_pretrained_happy_path(monkeypatch):
         l2_normalize=True,
         do_distributed_inbatch_negative=True,
         detach_distributed_inbatch_negatives=False,
+        is_causal=True,
         use_liger_kernel=True,
         use_sdpa_patching=True,
         sdpa_method=None,
@@ -147,6 +148,7 @@ def test_from_pretrained_happy_path(monkeypatch):
     assert last_kwargs["attn_implementation"] == am.DEFAULT_ATTN_IMPLEMENTATION
     assert last_kwargs["do_distributed_inbatch_negative"] is True
     assert last_kwargs["detach_distributed_inbatch_negatives"] is False
+    assert last_kwargs["is_causal"] is True
     assert last_kwargs["some_other_kwarg"] == "x"
 
 
@@ -170,6 +172,7 @@ def test_from_pretrained_defers_omitted_wrapper_options_to_saved_metadata(monkey
 
     assert last_kwargs["pooling"] is None
     assert last_kwargs["l2_normalize"] is None
+    assert last_kwargs["is_causal"] is None
 
 
 def _assert_retries_without_liger(monkeypatch, build_model_cls, auto_model_cls):
