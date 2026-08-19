@@ -274,9 +274,7 @@ data-parallel ranks the same way. Validation scores the held-out set with the tr
 objective in `eval()` mode under `torch.no_grad()`, and logs `val_loss` to the console and to
 Weights & Biases, on the same scale as `train_loss`.
 
-Timesteps and noise are drawn under a fixed seed, and the training RNG state is restored afterwards,
-so the curve reflects the model rather than the sampling and enabling validation does not change the
-training trajectory.
+Timesteps and noise are drawn under a fixed seed, and the training RNG state is restored afterward. The curve therefore reflects the model rather than the sampling. Enabling validation does not change the training trajectory.
 
 The two keys are independent: a `validation_dataloader` without `val_every_steps` validates on
 checkpoint steps only, and `val_every_steps` without a loader logs a warning and skips validation.
