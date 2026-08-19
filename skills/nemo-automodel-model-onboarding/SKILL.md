@@ -171,7 +171,12 @@ Implement files in dependency order:
 2. **rope_utils.py** (if needed) -- RoPE implementation
 3. **layers.py** (if needed) -- Attention, MLP, decoder block classes
 4. **model.py** -- The main `ForCausalLM` (or `ForConditionalGeneration`) class
-5. **state_dict_adapter.py** -- HF weight conversion
+5. **state_dict_adapter.py** -- HF weight conversion. Leave
+   `supports_write_through_checkpoint_load` disabled unless every load
+   destination returned by `to_hf` writes through to final model storage for
+   every supported backend and configuration. Any opt-in needs a focused
+   write-through storage test; allocating conversions can otherwise create a
+   model-sized device temporary and cause an out-of-memory failure.
 6. **__init__.py** -- Re-export the main model class
 
 See the pattern files for detailed implementation guidance:
@@ -180,22 +185,6 @@ See the pattern files for detailed implementation guidance:
 - MoE: [moe-patterns.md](./moe-patterns.md)
 - VLM: [vlm-patterns.md](./vlm-patterns.md)
 - Capabilities and fp32 precision: [capabilities-and-precision.md](./capabilities-and-precision.md)
-
-#### Check checkpoint-load write-through
-
-Evaluate `supports_write_through_checkpoint_load` for every new state-dict adapter. On
-single-rank loads, this capability lets the checkpoint reader fill final model
-storage directly instead of materializing a converted full checkpoint on the
-host. A false opt-in is dangerous: operations such as `cat`, `stack`, dtype
-conversion, dequantization, or `contiguous` can create an additional model-sized
-tensor on the device and cause an out-of-memory failure.
-
-Keep the inherited default of `False` unless every tensor returned by `to_hf`
-for base-checkpoint loading is the original model tensor or a view that writes
-through to it for every supported backend and configuration. When opting in,
-add a focused test that writes through the checkpoint destinations and verifies
-that final model storage changes. Also test that allocating backend or
-configuration variants report `False`.
 
 ### 2.3 Causal LM weight tying
 
@@ -430,9 +419,8 @@ that only surface in a full parity comparison.
 - [ ] Implemented layers.py (if custom layers needed)
 - [ ] Implemented rope_utils.py (if custom RoPE needed)
 - [ ] Implemented model.py with `HFCheckpointingMixin`
-- [ ] Implemented state_dict_adapter.py
-- [ ] Evaluated `supports_write_through_checkpoint_load`; added write-through storage tests for any opt-in and covered
-  allocating variants -- see §2.2
+- [ ] Implemented state_dict_adapter.py; any write-through opt-in proves writes reach model storage and reports
+  `False` for allocating variants
 - [ ] Implemented __init__.py with re-export
 - [ ] Registered in `MODEL_ARCH_MAPPING` in `_transformers/registry.py`
 - [ ] Registered custom config in `_CUSTOM_CONFIG_REGISTRATIONS` (if applicable)
