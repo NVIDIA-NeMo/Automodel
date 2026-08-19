@@ -398,6 +398,22 @@ def test_gpt_oss_customizers_use_routed_moe_parity_profile(tmp_path, recipe_name
     assert "skip_hf_reload_logit_parity" not in robustness
 
 
+def test_nemotron_nano_4b_peft_uses_cached_family_tokenizer(tmp_path):
+    """The offline recipe uses one complete family tokenizer for training and parity."""
+    recipe_path = REPO_ROOT / "examples/llm_finetune/nemotron/nemotron_nano_4b_squad_peft.yaml"
+    out = tmp_path / "resolved.yaml"
+    env = {"PIPELINE_DIR": str(tmp_path), "TEST_NAME": recipe_path.stem, "NEMO_CI_PATH": "/mnt/nci"}
+    _run_resolver(
+        ["--base", str(recipe_path), "--phase", "checkpoint_robustness", "--output", str(out)],
+        env=env,
+    )
+
+    resolved = yaml.load(out.open())
+    tokenizer_name = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
+    assert resolved["dataset"]["tokenizer"]["pretrained_model_name_or_path"] == tokenizer_name
+    assert resolved["ci"]["checkpoint_robustness"]["tokenizer_name"] == tokenizer_name
+
+
 def test_end_to_end_fixture_keys_not_applied_as_overrides(tmp_path):
     """Non-config fixture-arg keys in ci.checkpoint_robustness must not leak into the top-level config."""
     recipe = tmp_path / "llama_squad.yaml"
