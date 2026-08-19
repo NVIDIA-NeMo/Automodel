@@ -63,6 +63,37 @@ from nemo_automodel.shared.utils import dtype_from_str
 
 logger = logging.getLogger(__name__)
 _CP_STREAM = None
+_EMPTY_TENSOR_DETERMINISM_CHECK = "moe_empty_tensor_dtype_tolerant"
+
+
+def _moe_checkpoint_metadata_fn(tensor: torch.Tensor):
+    """Checkpoint metadata that ignores dtype only for zero-element tensors.
+
+    Mixed-precision DeepEP can expose an empty routed-token tensor as BF16 in the
+    original forward and FP32 during backward recomputation. Empty tensors have no values
+    whose precision could differ, but PyTorch's default checkpoint check still
+    rejects the dtype-only metadata change. Preserve shape/device checks for every
+    tensor and dtype checks for every non-empty tensor.
+    """
+    return {
+        "shape": tensor.shape,
+        "dtype": tensor.dtype if tensor.numel() else None,
+        "device": tensor.device,
+    }
+
+
+def _register_moe_checkpoint_determinism_check() -> str:
+    """Register the narrow empty-tensor checker with PyTorch checkpointing."""
+    import torch.utils.checkpoint as torch_checkpoint
+
+    checks = getattr(torch_checkpoint, "_allowed_determinism_checks_to_fns", None)
+    if checks is None:
+        raise RuntimeError(
+            "This PyTorch version does not expose checkpoint determinism-check registration; "
+            "cannot safely tolerate empty MoE dtype changes."
+        )
+    checks[_EMPTY_TENSOR_DETERMINISM_CHECK] = _moe_checkpoint_metadata_fn
+    return _EMPTY_TENSOR_DETERMINISM_CHECK
 
 
 def _moe_shard_placement(param):
@@ -586,6 +617,7 @@ def apply_ac(
             block = ptd_checkpoint_wrapper(
                 block,
                 preserve_rng_state=True,
+                determinism_check=_register_moe_checkpoint_determinism_check(),
                 context_fn=_preserve_gate_load_during_recompute(
                     block,
                     _with_attention_backend_snapshot(selective_checkpointing_context_fn),
@@ -1011,6 +1043,8 @@ def parallelize_model(
 
     cp_enabled = cp_axis_name is not None and world_mesh[cp_axis_name].size() > 1
     if cp_enabled:
+        parallelizer_utils.reject_unsupported_mtp_cp_pp(model)
+        parallelizer_utils.reject_unsupported_mtp_cp(model)
         apply_cp(model, world_mesh[cp_axis_name])
 
     ep_enabled = ep_axis_name is not None and moe_mesh is not None and moe_mesh[ep_axis_name].size() > 1

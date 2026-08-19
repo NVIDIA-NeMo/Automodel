@@ -28,8 +28,9 @@ except ImportError:
 import logging
 import pathlib
 import time
+from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import mlflow
 import torch
@@ -649,6 +650,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             microbatch_size=1,
             collate_fn=collate_prebatched,
             padding_token_id=padding_token_id,
+            mtp_ignore_index=self.cfg.mtp.ignore_index,
             context_fn=self._engine_context,
             defer_fsdp_grad_sync=getattr(self.distributed_config, "defer_fsdp_grad_sync", True),
         )
@@ -823,10 +825,30 @@ class FinetuneRecipeForVLM(BaseRecipe):
         num_label_tokens: int | None,
         is_train: bool,
         cu_seqlens: torch.Tensor | None = None,
+        mtp_per_depth_targets: Sequence[torch.Tensor] | None = None,
         log_drafter: bool = False,
         log_denominator: int | float | None = None,
     ) -> torch.Tensor:
-        """Compute base, MTP, and optional joint-drafter losses."""
+        """Compute base, MTP, and optional joint-drafter losses.
+
+        Args:
+            out: Model output with base logits shaped [batch, sequence, vocab]
+                or [tokens, vocab], plus optional per-depth MTP outputs in the
+                matching token layout.
+            labels: Tensor of shape [batch, sequence] or [tokens].
+            num_label_tokens: Optional supervised-token count consumed by the
+                configured loss; Engine supplies ``None`` because it normalizes globally.
+            is_train: Whether distributed training-loss reduction is active.
+            cu_seqlens: Optional tensor of shape [num_sequences + 1] or
+                [1, num_sequences + 1] describing packed THD sequence boundaries.
+            mtp_per_depth_targets: Optional CP-local target tensors, one per MTP
+                depth, each with the same shape and token layout as ``labels``.
+            log_drafter: Whether to log the optional drafter loss breakdown.
+            log_denominator: Optional denominator used only for drafter logging.
+
+        Returns:
+            Scalar local loss-sum tensor.
+        """
         model = self.model_parts[0]
         grad_reduce_group = self._get_dp_group(include_cp=True) if is_train else None
         hidden_states = get_final_hidden_states(out)
@@ -858,6 +880,8 @@ class FinetuneRecipeForVLM(BaseRecipe):
             mtp_config = getattr(getattr(self, "cfg", None), "mtp", None)
             if mtp_config is None:
                 raise ValueError("MTP model output requires an MTP loss config")
+            if self._get_cp_group_size() > 1 and mtp_per_depth_targets is None:
+                raise RuntimeError("MTP with context parallelism requires globally prepared per-depth targets")
             scaling_factor = (
                 mtp_config.scaling_factor if mtp_config.scaling_factor is not None else out.mtp_loss_scaling_factor
             )
@@ -865,12 +889,13 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 self.loss_fn,
                 mtp_per_depth_h=mtp_hidden,
                 mtp_per_depth_logits=mtp_logits,
+                mtp_per_depth_targets=mtp_per_depth_targets,
                 labels=labels,
                 model=model,
                 scaling_factor=scaling_factor,
                 num_label_tokens=num_label_tokens,
                 ignore_index=mtp_config.ignore_index,
-                cu_seqlens=cu_seqlens,
+                cu_seqlens=None if mtp_per_depth_targets is not None else cu_seqlens,
                 lm_weight=lm_weight,
                 grad_reduce_group=grad_reduce_group,
             )
@@ -913,7 +938,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
     def _engine_loss_fn(
         self,
         out: Any,
-        loss_inputs: dict[str, torch.Tensor],
+        loss_inputs: Mapping[str, torch.Tensor | tuple[torch.Tensor, ...]],
         *,
         log_drafter: bool = False,
         log_denominator: int | float | None = None,
@@ -923,23 +948,32 @@ class FinetuneRecipeForVLM(BaseRecipe):
         Args:
             out: Model output with logits shaped [batch, sequence, vocab],
                 packed logits shaped [tokens, vocab], or the PP/MTP tuple contract.
-            loss_inputs: CP-local labels and weights with matching token axes,
-                plus optional packed-sequence metadata.
+            loss_inputs: Mapping whose CP-local ``labels`` and ``weights`` tensors
+                have shape [batch, sequence] or [tokens]. Optional ``cu_seqlens``
+                has shape [num_sequences + 1] or [1, num_sequences + 1], and each
+                ``mtp_per_depth_targets`` tensor matches the labels' local layout.
 
         Returns:
             Scalar local loss-sum tensor.
         """
+        labels = cast(torch.Tensor, loss_inputs["labels"])
+        cu_seqlens = cast(torch.Tensor | None, loss_inputs.get("cu_seqlens"))
         if self.pp_enabled:
             if self.pipeline_loss_fn is None:
                 raise RuntimeError("The last pipeline stage has no configured causal-LM loss")
-            self.pipeline_loss_fn.cu_seqlens = loss_inputs.get("cu_seqlens")
-            return self.pipeline_loss_fn(out, loss_inputs["labels"])
+            self.pipeline_loss_fn.cu_seqlens = cu_seqlens
+            return self.pipeline_loss_fn(out, labels)
+        mtp_per_depth_targets = cast(
+            tuple[torch.Tensor, ...] | None,
+            loss_inputs.get("mtp_per_depth_targets"),
+        )
         return self._compute_vlm_loss(
             out=out,
-            labels=loss_inputs["labels"],
+            labels=labels,
             num_label_tokens=None,
             is_train=True,
-            cu_seqlens=loss_inputs.get("cu_seqlens"),
+            cu_seqlens=cu_seqlens,
+            mtp_per_depth_targets=mtp_per_depth_targets,
             log_drafter=log_drafter,
             log_denominator=log_denominator,
         )
@@ -1031,7 +1065,10 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
         log_drafter = self.step_scheduler.is_remote_logging_step
 
-        def engine_loss_fn(out: Any, loss_inputs: dict[str, torch.Tensor]) -> torch.Tensor:
+        def engine_loss_fn(
+            out: Any,
+            loss_inputs: Mapping[str, torch.Tensor | tuple[torch.Tensor, ...]],
+        ) -> torch.Tensor:
             nonlocal log_drafter
             should_log = log_drafter
             log_drafter = False
@@ -1117,7 +1154,16 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
     @torch.no_grad()
     def _run_validation_epoch(self, val_dataloader):
-        """Run one pass over `self.val_dataloader`."""
+        """Run one recipe-owned pass over a VLM validation dataloader.
+
+        Args:
+            val_dataloader: Iterable of processor-collated batches. Padded token
+                tensors have shape [batch, sequence], while packed tensors use
+                their THD token layout; media tensors retain model-specific layouts.
+
+        Returns:
+            Metrics for the completed validation epoch.
+        """
         with ScopedRNG(seed=1, ranked=True):
             for mp in self.model_parts:
                 mp.eval()
@@ -1132,36 +1178,69 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 }
                 num_label_tokens = (batch["labels"] != -100).sum().item()
 
+                model = self.model_parts[0]
                 cp_sharder = ContextParallelSharder(
-                    self.model_parts[0],
+                    model,
                     self.device_mesh,
                     batch,
                     invoke_pre_embed=not self.pp_enabled,
                 )
+                supports = getattr(model, "supports", None)
+                mtp_cp_inputs = None
+                if (
+                    not self.pp_enabled
+                    and self._get_cp_group_size() > 1
+                    and bool(getattr(supports, "mtp_enabled", False))
+                ):
+                    if not bool(getattr(supports, "supports_mtp_cp", False)):
+                        raise NotImplementedError(
+                            f"{type(model).__name__} declares supports_mtp_cp=False; "
+                            "MTP target preparation for context parallelism is unavailable"
+                        )
+                    mtp_cp_inputs = model.prepare_mtp_inputs_for_cp(
+                        batch,
+                        ignore_index=self.cfg.mtp.ignore_index,
+                    )
                 train_ctx, batch = cp_sharder.shard(batch)
+                mtp_per_depth_targets = None
+                if mtp_cp_inputs is not None:
+                    batch["mtp_per_depth_input_ids"] = tuple(
+                        cp_sharder.shard_token_tensor(ids, seq_dim=1, fill=0) for ids in mtp_cp_inputs.input_ids
+                    )
+                    batch["mtp_per_depth_position_ids"] = tuple(
+                        cp_sharder.shard_token_tensor(
+                            ids,
+                            seq_dim=mtp_cp_inputs.position_ids_seq_dim,
+                            fill=0,
+                        )
+                        for ids in mtp_cp_inputs.position_ids
+                    )
+                    batch["mtp_per_depth_valid_masks"] = tuple(
+                        cp_sharder.shard_token_tensor(mask, seq_dim=1, fill=False) for mask in mtp_cp_inputs.valid_masks
+                    )
+                    mtp_per_depth_targets = tuple(
+                        cp_sharder.shard_token_tensor(
+                            targets,
+                            seq_dim=1,
+                            fill=self.cfg.mtp.ignore_index,
+                        )
+                        for targets in mtp_cp_inputs.targets
+                    )
                 labels = batch.pop("labels")
                 with self._cp_vision_frame_sharding_context(), train_ctx():
-                    batch = filter_forward_kwargs(self.model_parts[0], batch)
+                    cu_seqlens = None if mtp_per_depth_targets is not None else batch.get("cu_seqlens")
+                    batch = filter_forward_kwargs(model, batch)
                     if isinstance(self.loss_fn, FusedLinearCrossEntropy):
-                        out = self.model_parts[0](logits_to_keep=1, **batch)
+                        out = model(logits_to_keep=1, **batch)
                     else:
-                        out = self.model_parts[0](**batch)
-                    local_loss = calculate_loss(
-                        self.loss_fn,
-                        logits=getattr(out, "logits", out),
-                        labels=labels,
-                        model=self.model_parts[0],
-                        hidden_states=get_final_hidden_states(out),
-                        num_label_tokens=num_label_tokens,
-                    )
-                    # Mirror training: include the drafter term so validation
-                    # reflects drafter drift, not just the base.
-                    local_loss = self._maybe_add_drafter_loss(
+                        out = model(**batch)
+                    local_loss = self._compute_vlm_loss(
                         out=out,
-                        base_loss=local_loss,
                         labels=labels,
-                        model=self.model_parts[0],
                         num_label_tokens=num_label_tokens,
+                        is_train=False,
+                        cu_seqlens=cu_seqlens,
+                        mtp_per_depth_targets=mtp_per_depth_targets,
                     )
                     total_num_label_tokens += num_label_tokens
 

@@ -407,7 +407,7 @@ def test_run_validation_epoch_does_not_sum_tokens_over_cp(monkeypatch):
     recipe.dist_env = SimpleNamespace(device=torch.device("cpu"))
     recipe.step_scheduler = SimpleNamespace(step=3, epoch=1)
     recipe.optimizer = [SimpleNamespace(param_groups=[{"lr": 0.001}])]
-    recipe._maybe_add_drafter_loss = lambda *, out, base_loss, labels, model, num_label_tokens: base_loss
+    recipe._maybe_add_drafter_loss = lambda *, base_loss, **kwargs: base_loss
 
     allreduce_calls = []
 
@@ -470,7 +470,7 @@ def test_run_validation_epoch_cp_active_runs_pre_embed(monkeypatch):
     recipe.dist_env = SimpleNamespace(device=torch.device("cpu"))
     recipe.step_scheduler = SimpleNamespace(step=3, epoch=1)
     recipe.optimizer = [SimpleNamespace(param_groups=[{"lr": 0.001}])]
-    recipe._maybe_add_drafter_loss = lambda *, out, base_loss, labels, model, num_label_tokens: base_loss
+    recipe._maybe_add_drafter_loss = lambda *, base_loss, **kwargs: base_loss
     recipe._dp_allreduce = lambda tensor, include_cp=False: tensor
 
     batch = {

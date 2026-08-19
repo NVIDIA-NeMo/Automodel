@@ -40,6 +40,7 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
 from nemo_automodel.components.distributed.mesh import MeshContext, ParallelismSizes
 from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
+from nemo_automodel.components.models.common.mtp import prepare_mtp_context_parallel_inputs
 from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 from nemo_automodel.engine import Engine, collate_prebatched
 
@@ -321,6 +322,140 @@ def test_context_parallel_shards_model_and_rl_loss_inputs_together():
     assert model.weight.grad.item() == pytest.approx(11 / 6)
     assert MoEAuxLossAutoScaler.main_loss_backward_scale.item() == pytest.approx(2.0)
     assert not cp_context_active
+
+
+def test_context_parallel_prepares_mtp_futures_before_sharding():
+    class MTPModel(ScaleModel):
+        def __init__(self):
+            super().__init__()
+            self.supports = SimpleNamespace(mtp_enabled=True, supports_mtp_cp=True, supports_mtp_cp_pp=False)
+            self.cp_inputs_prepared = False
+            self.mtp_forward_inputs = None
+
+        def prepare_model_inputs_for_cp(self, batch, *, num_chunks):
+            assert num_chunks == 1
+            positions = torch.arange(batch["input_ids"].shape[1])
+            batch["position_ids"] = torch.stack((positions, positions + 100)).unsqueeze(1)
+            self.cp_inputs_prepared = True
+            return {
+                "cp_sharder": ContextParallelSharder(
+                    shard_batch=partial(shard_batch_contiguous, pad_multiple=1),
+                    local_token_global_indices=contiguous_local_indices,
+                )
+            }
+
+        def prepare_mtp_inputs_for_cp(self, batch, *, ignore_index):
+            assert self.cp_inputs_prepared
+            assert ignore_index == -7
+            return prepare_mtp_context_parallel_inputs(batch, num_depths=2, ignore_index=ignore_index)
+
+        def forward(
+            self,
+            input_ids,
+            *,
+            mtp_per_depth_input_ids,
+            mtp_per_depth_position_ids,
+            mtp_per_depth_valid_masks,
+            **kwargs,
+        ):
+            self.mtp_forward_inputs = (
+                mtp_per_depth_input_ids,
+                mtp_per_depth_position_ids,
+                mtp_per_depth_valid_masks,
+            )
+            return super().forward(input_ids, **kwargs)
+
+    model = MTPModel()
+    mesh_context = SimpleNamespace(pp_size=1, cp_size=2, device_mesh=_CPMesh(size=2, rank=0))
+    datum = Datum(
+        model_inputs={
+            "input_ids": torch.arange(10, 18).unsqueeze(0),
+            "seq_lens_padded": torch.tensor([[4, 4]], dtype=torch.int32),
+        },
+        loss_fn_inputs={
+            "labels": torch.arange(20, 28).unsqueeze(0),
+            "weights": torch.ones(1, 8),
+        },
+    )
+
+    engine = Engine(
+        model,
+        device="cpu",
+        mesh_context=mesh_context,
+        collate_fn=collate_prebatched,
+        mtp_ignore_index=-7,
+    )
+    engine._dp_group_and_size = lambda: (None, 1)
+    engine._gradient_group_and_size = lambda _group, _size: (None, 1)
+    captured_loss_inputs = {}
+
+    def loss_fn(output, loss_inputs):
+        captured_loss_inputs.update(loss_inputs)
+        return output
+
+    loss, _ = engine.forward_backward([datum], loss_fn)
+
+    input_ids, position_ids, valid_masks = model.mtp_forward_inputs
+
+    assert [value.tolist() for value in input_ids] == [
+        [[11, 12, 13, 0]],
+        [[12, 13, 0, 0]],
+    ]
+    assert [value.tolist() for value in position_ids] == [
+        [[[1, 2, 3, 0]], [[101, 102, 103, 0]]],
+        [[[2, 3, 0, 0]], [[102, 103, 0, 0]]],
+    ]
+    assert [value.tolist() for value in valid_masks] == [
+        [[True, True, True, False]],
+        [[True, True, False, False]],
+    ]
+    assert captured_loss_inputs["labels"].tolist() == [[20, 21, 22, 23]]
+    assert [value.tolist() for value in captured_loss_inputs["mtp_per_depth_targets"]] == [
+        [[21, 22, 23, -7]],
+        [[22, 23, -7, -7]],
+    ]
+    assert loss.item() == pytest.approx(46 / 8)
+    assert model.weight.grad.item() == pytest.approx(46 / 8)
+
+
+def test_context_parallel_rejects_mtp_without_model_capability():
+    class UnsupportedMTPModel(_DistributedCPModel):
+        supports = SimpleNamespace(mtp_enabled=True, supports_mtp_cp=False, supports_mtp_cp_pp=False)
+
+    datum = Datum(
+        model_inputs={"input_ids": torch.arange(8).unsqueeze(0)},
+        loss_fn_inputs={"labels": torch.arange(8).unsqueeze(0), "weights": torch.ones(1, 8)},
+    )
+    engine = Engine(
+        UnsupportedMTPModel(),
+        device="cpu",
+        mesh_context=SimpleNamespace(pp_size=1, cp_size=2, device_mesh=_CPMesh(size=2, rank=0)),
+        collate_fn=collate_prebatched,
+    )
+
+    with pytest.raises(NotImplementedError, match="does not support MTP with context parallelism"):
+        engine._prepare_batch([datum], num_pipeline_microbatches=1)
+
+
+def test_context_pipeline_parallel_rejects_mtp_without_combined_capability():
+    class CPOnlyMTPModel(_DistributedCPModel):
+        supports = SimpleNamespace(mtp_enabled=True, supports_mtp_cp=True, supports_mtp_cp_pp=False)
+
+        def prepare_mtp_inputs_for_cp(self, batch, *, ignore_index):
+            return prepare_mtp_context_parallel_inputs(batch, num_depths=1, ignore_index=ignore_index)
+
+    model = CPOnlyMTPModel()
+    pipeline = _FakeAutoPipeline(model, num_microbatches=1)
+    engine = Engine(
+        pipeline,
+        device="cpu",
+        mesh_context=SimpleNamespace(pp_size=2, cp_size=2, device_mesh=_CPMesh(size=2, rank=0)),
+        collate_fn=collate_prebatched,
+    )
+
+    with pytest.raises(NotImplementedError, match="MTP with context and pipeline parallelism"):
+        engine._validate_parallelism()
+    assert model.forward_calls == 0
 
 
 def _model_ready_packed_collate(datums):

@@ -1095,6 +1095,11 @@ def test_setup_builds_engine_for_eager_sum_loss(monkeypatch):
 
     cfg = _minimal_cfg_with_nvtx(nvtx_value=False)
     _patch_setup_minimals(monkeypatch, lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        RecipeConfig,
+        "mtp",
+        property(lambda self: SimpleNamespace(ignore_index=-321)),
+    )
 
     trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
     trainer.setup()
@@ -1102,6 +1107,7 @@ def test_setup_builds_engine_for_eager_sum_loss(monkeypatch):
     assert isinstance(trainer.loss_fn, MaskedCrossEntropy)
     assert trainer.engine is not None
     assert trainer.engine.microbatch_size == 1
+    assert trainer.engine.mtp_ignore_index == -321
 
 
 def test_setup_builds_engine_for_eager_fused_loss(monkeypatch):
@@ -1313,6 +1319,51 @@ def test_engine_pipeline_loss_reuses_configured_loss_and_thd_metadata():
     assert loss.item() == pytest.approx(3.0)
     assert recipe.pipeline_loss_fn.cu_seqlens is cu_seqlens
     recipe.pipeline_loss_fn.assert_called_once_with(output, labels)
+
+
+def test_engine_loss_passes_precomputed_mtp_targets(monkeypatch):
+    """The recipe callback consumes Engine-prepared MTP targets without rolling them again."""
+    recipe = object.__new__(TrainFinetuneRecipeForNextTokenPrediction)
+    recipe.pp_enabled = False
+    recipe.model_parts = [nn.Identity()]
+    recipe.loss_fn = object()
+    recipe.cfg = SimpleNamespace(mtp=SimpleNamespace(ignore_index=-100, scaling_factor=0.5))
+    recipe._get_dp_group = lambda include_cp=False: None
+    recipe._get_cp_group_size = lambda: 2
+
+    labels = torch.tensor([[1, 2, -100]])
+    mtp_targets = (torch.tensor([[2, -100, -100]]),)
+    cu_seqlens = torch.tensor([0, 3], dtype=torch.int32)
+    output = SimpleNamespace(
+        logits=torch.randn(1, 3, 5),
+        mtp_per_depth_h=None,
+        mtp_per_depth_logits=(torch.randn(1, 3, 5),),
+        mtp_loss_scaling_factor=1.0,
+    )
+    calculate_mtp_loss_mock = MagicMock(return_value=torch.tensor(3.0))
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.calculate_loss", MagicMock(return_value=torch.tensor(2.0)))
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.calculate_mtp_loss", calculate_mtp_loss_mock)
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.get_final_hidden_states", lambda _output: None)
+
+    loss = recipe._engine_loss_fn(
+        output,
+        {
+            "labels": labels,
+            "weights": labels.ne(-100),
+            "cu_seqlens": cu_seqlens,
+            "mtp_per_depth_targets": mtp_targets,
+        },
+    )
+
+    assert loss.item() == pytest.approx(5.0)
+    assert calculate_mtp_loss_mock.call_args.kwargs["mtp_per_depth_targets"] is mtp_targets
+    assert calculate_mtp_loss_mock.call_args.kwargs["cu_seqlens"] is None
+
+    with pytest.raises(RuntimeError, match="globally prepared per-depth targets"):
+        recipe._engine_loss_fn(
+            output,
+            {"labels": labels, "weights": labels.ne(-100), "cu_seqlens": cu_seqlens},
+        )
 
 
 def test_setup_does_not_change_storage_dtype_for_non_kd_recipe(monkeypatch):
@@ -2670,6 +2721,7 @@ def test_forward_validation_step_model_cp_hook(monkeypatch, cp_size, uses_thd, s
             super().__init__()
             self.lin = nn.Linear(4, 8)
             self.prepared = False
+            self.supports = SimpleNamespace(mtp_enabled=False, supports_mtp_cp=False)
 
         def prepare_model_inputs_for_cp(self, batch, **kwargs):
             self.prepared = True
@@ -2749,3 +2801,244 @@ def test_forward_validation_step_model_cp_hook(monkeypatch, cp_size, uses_thd, s
     assert captured["logits_is_tensor"]
     assert torch.isfinite(loss).all()
     assert model.lin.weight.grad is None
+
+
+def test_forward_validation_step_shards_global_mtp_inputs_and_targets(monkeypatch):
+    """Validation shifts MTP inputs globally and reuses the model-input CP layout."""
+    from nemo_automodel.components.models.common.mtp import (
+        MTPConfig,
+        prepare_mtp_context_parallel_inputs,
+    )
+
+    captured = {}
+    local_indices = torch.tensor([0, 1, 4, 5])
+
+    class _MTPModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.scale = nn.Parameter(torch.tensor(1.0))
+            self.mtp_config = MTPConfig(num_layers=1, layer_pattern="*")
+            self.cp_prepared = False
+            self.mtp_prepared = False
+            self.supports = SimpleNamespace(mtp_enabled=True, supports_mtp_cp=True)
+
+        def prepare_model_inputs_for_cp(self, batch, *, num_chunks=1):
+            """Materialize global multi-axis positions before MTP preparation.
+
+            Args:
+                batch: Mutable mapping whose token tensors have shape [batch,
+                    sequence].
+                num_chunks: Number of downstream sharding chunks.
+
+            Returns:
+                Empty update mapping; ``batch`` receives ``position_ids`` of
+                shape [axes, batch, sequence] in place.
+            """
+            assert num_chunks == 1
+            assert not self.mtp_prepared
+            self.cp_prepared = True
+            base_positions = torch.tensor([[0, 1, 2, 0, 1, 2]])
+            batch["position_ids"] = torch.stack(
+                (base_positions, base_positions + 10, base_positions + 20),
+                dim=0,
+            )
+            return {}
+
+        def prepare_mtp_inputs_for_cp(self, batch, *, ignore_index=-100):
+            """Build global MTP tensors after multi-axis positions exist.
+
+            Args:
+                batch: Mutable mapping whose token tensors have shape [batch,
+                    sequence] and positions have shape [axes, batch, sequence].
+                ignore_index: Fill value for invalid target positions.
+
+            Returns:
+                Global per-depth MTP tensors matching the batch token axes.
+            """
+            assert self.cp_prepared
+            assert batch["position_ids"].shape == (3, 1, 6)
+            self.mtp_prepared = True
+            return prepare_mtp_context_parallel_inputs(
+                batch,
+                num_depths=self.mtp_config.num_layers,
+                ignore_index=ignore_index,
+            )
+
+        def forward(
+            self,
+            input_ids,
+            *,
+            mtp_per_depth_input_ids,
+            mtp_per_depth_position_ids,
+            mtp_per_depth_valid_masks,
+            **kwargs,
+        ):
+            """Emit MTP outputs while recording the CP-local auxiliary inputs.
+
+            Args:
+                input_ids: Token IDs of shape [batch, local_sequence].
+                mtp_per_depth_input_ids: Per-depth token IDs, each of shape
+                    [batch, local_sequence].
+                mtp_per_depth_position_ids: Per-depth positions, each of shape
+                    [axes, batch, local_sequence].
+                mtp_per_depth_valid_masks: Per-depth masks, each of shape
+                    [batch, local_sequence].
+                **kwargs: Remaining CP-local model tensors.
+
+            Returns:
+                Model output whose logits and MTP hidden states have shape
+                [batch, local_sequence, hidden].
+            """
+            captured["model_input_ids"] = input_ids.detach().clone()
+            captured["mtp_input_ids"] = tuple(t.detach().clone() for t in mtp_per_depth_input_ids)
+            captured["mtp_position_ids"] = tuple(t.detach().clone() for t in mtp_per_depth_position_ids)
+            captured["mtp_valid_masks"] = tuple(t.detach().clone() for t in mtp_per_depth_valid_masks)
+            hidden = self.scale * input_ids.float().unsqueeze(-1)
+            return SimpleNamespace(
+                logits=hidden,
+                mtp_per_depth_h=[hidden],
+                mtp_per_depth_logits=None,
+                mtp_loss_scaling_factor=1.0,
+            )
+
+    model = _MTPModel()
+
+    class _FakeContextParallelSharder:
+        def __init__(self, resolved_model, device_mesh, batch, **kwargs):
+            """Run the model-owned CP preparation phase without sharding.
+
+            Args:
+                resolved_model: Model that owns the CP preparation hook.
+                device_mesh: Unused fake device mesh.
+                batch: Mutable global batch whose token tensors have shape
+                    [batch, sequence].
+                **kwargs: Sharder options including the number of chunks.
+            """
+            del device_mesh
+            assert resolved_model is model
+            assert not model.mtp_prepared
+            assert batch["input_ids"].shape == (1, 6)
+            assert batch["seq_lens_padded"].tolist() == [[3, 3, -1000]]
+            updates = model.prepare_model_inputs_for_cp(batch, num_chunks=kwargs["num_chunks"])
+            batch.update(updates)
+
+        def shard(self, batch):
+            """Select this fake rank's token positions from every main input.
+
+            Args:
+                batch: Global model-input mapping with token tensors of shape
+                    [batch, sequence] and positions of shape [axes, batch,
+                    sequence].
+
+            Returns:
+                A null context factory and mapping in the CP-local token layout.
+            """
+            assert model.mtp_prepared
+            local_batch = dict(batch)
+            for key in ("input_ids", "labels"):
+                local_batch[key] = local_batch[key].index_select(1, local_indices)
+            local_batch["position_ids"] = local_batch["position_ids"].index_select(2, local_indices)
+            local_batch.pop("seq_lens")
+            local_batch.pop("seq_lens_padded")
+            return nullcontext, local_batch
+
+        def shard_token_tensor(self, tensor, seq_dim=1, fill=None):
+            """Apply the captured CP index selection to an auxiliary tensor.
+
+            Args:
+                tensor: Tensor of shape [batch, sequence] or [axes, batch,
+                    sequence].
+                seq_dim: Sequence axis selected by ``local_indices``.
+                fill: Padding value required by the production sharder.
+
+            Returns:
+                Tensor with the same axis order and a CP-local sequence axis.
+            """
+            if tensor.ndim == 3:
+                captured["mtp_position_seq_dim"] = seq_dim
+            if tensor.dtype == torch.bool:
+                captured["mtp_valid_mask_fill"] = fill
+            return tensor.index_select(seq_dim, local_indices)
+
+    recipe = TrainFinetuneRecipeForNextTokenPrediction.__new__(TrainFinetuneRecipeForNextTokenPrediction)
+    object.__setattr__(
+        recipe,
+        "cfg",
+        SimpleNamespace(mtp=SimpleNamespace(ignore_index=-100, scaling_factor=1.0)),
+    )
+    object.__setattr__(recipe, "dist_env", SimpleNamespace(device=torch.device("cpu")))
+    object.__setattr__(recipe, "device_mesh", object())
+    object.__setattr__(recipe, "pp_enabled", False)
+    object.__setattr__(recipe, "tokenizer", SimpleNamespace(pad_token_id=0))
+    object.__setattr__(recipe, "te_fp8", None)
+    object.__setattr__(recipe, "model_parts", [model])
+    object.__setattr__(recipe, "distributed_config", SimpleNamespace(defer_fsdp_grad_sync=True))
+    object.__setattr__(recipe, "loss_fn", object())
+    object.__setattr__(recipe, "_get_cp_group_size", lambda: 2)
+    object.__setattr__(recipe, "_get_dp_group_size", lambda include_cp=False: 1)
+
+    def _fake_calculate_loss(loss_fn, *, logits, **kwargs):
+        """Return a differentiable scalar from local logits.
+
+        Args:
+            loss_fn: Unused configured loss object.
+            logits: Tensor of shape [batch, local_sequence, hidden].
+            **kwargs: Remaining loss inputs.
+
+        Returns:
+            Scalar loss tensor.
+        """
+        del loss_fn, kwargs
+        return logits.sum() * 0.0
+
+    def _fake_calculate_mtp_loss(loss_fn, *, mtp_per_depth_h, mtp_per_depth_targets, cu_seqlens, **kwargs):
+        """Capture precomputed targets and return a scalar auxiliary loss.
+
+        Args:
+            loss_fn: Unused configured loss object.
+            mtp_per_depth_h: Per-depth hidden tensors of shape [batch,
+                local_sequence, hidden].
+            mtp_per_depth_targets: Per-depth targets of shape [batch,
+                local_sequence].
+            cu_seqlens: Optional packed-boundary tensor; must be absent when
+                precomputed targets are supplied.
+            **kwargs: Remaining MTP loss inputs.
+
+        Returns:
+            Scalar MTP loss tensor.
+        """
+        del loss_fn, kwargs
+        captured["mtp_targets"] = tuple(t.detach().clone() for t in mtp_per_depth_targets)
+        captured["cu_seqlens"] = cu_seqlens
+        return sum(hidden.sum() for hidden in mtp_per_depth_h) * 0.01
+
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.ContextParallelSharder", _FakeContextParallelSharder)
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.calculate_loss", _fake_calculate_loss)
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.calculate_mtp_loss", _fake_calculate_mtp_loss)
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.get_final_hidden_states", lambda out: None)
+
+    batch = {
+        "input_ids": torch.tensor([[10, 11, 12, 20, 21, 22]]),
+        "labels": torch.tensor([[11, 12, -100, 21, 22, -100]]),
+        "seq_lens": torch.tensor([[3, 3, -1000]]),
+        "seq_lens_padded": torch.tensor([[3, 3, -1000]]),
+    }
+    model.supports.supports_mtp_cp = False
+    with pytest.raises(NotImplementedError, match="supports_mtp_cp=False"):
+        recipe._forward_validation_step(batch)
+    assert not model.cp_prepared
+    assert not model.mtp_prepared
+    model.supports.supports_mtp_cp = True
+
+    loss = recipe._forward_validation_step(batch)
+
+    assert captured["model_input_ids"].tolist() == [[10, 11, 21, 22]]
+    assert captured["mtp_input_ids"][0].tolist() == [[11, 12, 22, 0]]
+    assert captured["mtp_position_ids"][0][0].tolist() == [[1, 2, 2, 0]]
+    assert captured["mtp_position_seq_dim"] == 2
+    assert captured["mtp_valid_masks"][0].tolist() == [[True, True, True, False]]
+    assert captured["mtp_valid_mask_fill"] is False
+    assert captured["mtp_targets"][0].tolist() == [[12, -100, -100, -100]]
+    assert captured["cu_seqlens"] is None
+    assert torch.isfinite(loss)
+    assert model.scale.grad is None

@@ -746,6 +746,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             microbatch_size=1,
             collate_fn=collate_prebatched,
             padding_token_id=(self.tokenizer.pad_token_id if self.tokenizer is not None else 0) or 0,
+            mtp_ignore_index=self.cfg.mtp.ignore_index,
             context_fn=(
                 (lambda _model_inputs: self.te_fp8.maybe_te_autocast())
                 if self.te_fp8 is not None
@@ -1074,12 +1075,19 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         """Move and CP-prepare one validation batch.
 
         Args:
-            batch: Worker-collated inputs. Padded token tensors have shape
-                [batch, sequence]; packed THD token tensors have shape [tokens].
+            batch: Worker-collated inputs. ``input_ids`` and ``labels`` have
+                shape [batch, sequence], while optional ``position_ids`` has
+                shape [batch, sequence] or [axes, batch, sequence]. Packed THD
+                token tensors have shape [tokens].
 
         Returns:
-            The CP context factory, CP-local model-input mapping, and labels
-            matching the model output's local token axes.
+            The CP context factory; a CP-local model-input mapping; CP-local
+            labels; and optional per-depth MTP targets. The model mapping's
+            token IDs and validity masks have shape [batch, local_sequence],
+            while multi-axis positions have shape [axes, batch,
+            local_sequence]. Labels and each target tensor have shape [batch,
+            local_sequence]. Packed outputs use the corresponding CP-local
+            [tokens] layout.
         """
         batch = {
             k: (
@@ -1089,18 +1097,63 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             )
             for k, v in batch.items()
         }
+        model = self.model_parts[0] if hasattr(self, "model_parts") else None
+        supports = getattr(model, "supports", None)
+        mtp_cp_enabled = (
+            not self.pp_enabled and self._get_cp_group_size() > 1 and bool(getattr(supports, "mtp_enabled", False))
+        )
+        if mtp_cp_enabled and not bool(getattr(supports, "supports_mtp_cp", False)):
+            raise NotImplementedError(
+                f"{type(model).__name__} declares supports_mtp_cp=False; "
+                "MTP target preparation for context parallelism is unavailable"
+            )
         cp_sharder = ContextParallelSharder(
-            self.model_parts[0] if hasattr(self, "model_parts") else None,
+            model,
             self.device_mesh,
             batch,
             padding_token_id=self.tokenizer.pad_token_id if self.tokenizer else 0,
             num_chunks=self.pp.pp_batch_size // self.pp.pp_microbatch_size if self.pp_enabled else 1,
         )
+        mtp_cp_inputs = (
+            model.prepare_mtp_inputs_for_cp(batch, ignore_index=self.cfg.mtp.ignore_index) if mtp_cp_enabled else None
+        )
         train_ctx, batch = cp_sharder.shard(batch)
-        return train_ctx, batch, batch.pop("labels")
+        mtp_per_depth_targets = None
+        if mtp_cp_inputs is not None:
+            batch["mtp_per_depth_input_ids"] = tuple(
+                cp_sharder.shard_token_tensor(ids, seq_dim=1, fill=0) for ids in mtp_cp_inputs.input_ids
+            )
+            batch["mtp_per_depth_position_ids"] = tuple(
+                cp_sharder.shard_token_tensor(ids, seq_dim=mtp_cp_inputs.position_ids_seq_dim, fill=0)
+                for ids in mtp_cp_inputs.position_ids
+            )
+            batch["mtp_per_depth_valid_masks"] = tuple(
+                cp_sharder.shard_token_tensor(mask, seq_dim=1, fill=False) for mask in mtp_cp_inputs.valid_masks
+            )
+            mtp_per_depth_targets = tuple(
+                cp_sharder.shard_token_tensor(targets, seq_dim=1, fill=self.cfg.mtp.ignore_index)
+                for targets in mtp_cp_inputs.targets
+            )
+        return train_ctx, batch, batch.pop("labels"), mtp_per_depth_targets
 
     def _compute_causal_lm_loss(self, output, labels, model_inputs, *, num_label_tokens, is_train):
-        """Compute the recipe's causal-LM and optional MTP loss."""
+        """Compute the recipe's causal-LM and optional MTP loss.
+
+        Args:
+            output: Model output containing logits of shape [batch, sequence,
+                vocab] or [tokens, vocab], plus optional per-depth MTP outputs
+                with the same token axes.
+            labels: Target token IDs of shape [batch, sequence] or [tokens].
+            model_inputs: Loss metadata whose optional ``cu_seqlens`` tensor
+                describes packed boundaries and whose optional
+                ``mtp_per_depth_targets`` sequence contains one target tensor
+                per MTP depth, each with the same token axes as ``labels``.
+            num_label_tokens: Optional global count of supervised label tokens.
+            is_train: Whether the loss participates in training gradients.
+
+        Returns:
+            Scalar local causal-LM plus MTP loss sum.
+        """
         model = self.model_parts[0]
         if self.pp_enabled:
             model = next(
@@ -1138,6 +1191,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         mtp_config = getattr(self.cfg, "mtp", None)
         if mtp_config is None:
             raise ValueError("MTP model output requires an MTP loss config")
+        mtp_per_depth_targets = model_inputs.get("mtp_per_depth_targets")
+        if self._get_cp_group_size() > 1 and mtp_per_depth_targets is None:
+            raise RuntimeError("MTP with context parallelism requires globally prepared per-depth targets")
         scaling_factor = (
             mtp_config.scaling_factor if mtp_config.scaling_factor is not None else output.mtp_loss_scaling_factor
         )
@@ -1145,12 +1201,13 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self.loss_fn,
             mtp_per_depth_h=mtp_hidden,
             mtp_per_depth_logits=mtp_logits,
+            mtp_per_depth_targets=mtp_per_depth_targets,
             labels=labels,
             model=model,
             scaling_factor=scaling_factor,
             num_label_tokens=num_label_tokens,
             ignore_index=mtp_config.ignore_index,
-            cu_seqlens=model_inputs.get("cu_seqlens"),
+            cu_seqlens=None if mtp_per_depth_targets is not None else model_inputs.get("cu_seqlens"),
             lm_weight=lm_weight,
             grad_reduce_group=grad_reduce_group,
         )
@@ -1175,14 +1232,19 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             loss_fn_inputs={"labels": labels, "weights": labels.ne(-100)},
         )
 
-    def _engine_loss_fn(self, output: Any, loss_inputs: dict[str, torch.Tensor]) -> torch.Tensor:
+    def _engine_loss_fn(
+        self,
+        output: Any,
+        loss_inputs: dict[str, torch.Tensor | tuple[torch.Tensor, ...]],
+    ) -> torch.Tensor:
         """Compute a local summed causal-LM loss for Engine normalization.
 
         Args:
             output: Model output with logits shaped [batch, sequence, vocab],
                 packed logits shaped [tokens, vocab], or the PP/MTP tuple contract.
             loss_inputs: CP-local labels and weights with matching token axes,
-                plus optional packed-sequence metadata.
+                optional packed-sequence metadata, and optional per-depth MTP
+                targets whose tensors share the labels' token axes.
 
         Returns:
             Scalar local loss-sum tensor.
@@ -1210,7 +1272,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         Returns:
             Detached scalar local loss-sum tensor.
         """
-        train_ctx, batch, labels = self._prepare_validation_batch(batch)
+        train_ctx, batch, labels, mtp_per_depth_targets = self._prepare_validation_batch(batch)
         fp8_ctx = self.te_fp8.maybe_te_autocast() if self.te_fp8 is not None else nullcontext()
 
         if self.pp_enabled:
@@ -1252,6 +1314,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         model = self.model_parts[0]
         with train_ctx(), fp8_ctx:
+            loss_inputs = dict(batch)
+            if mtp_per_depth_targets is not None:
+                loss_inputs["mtp_per_depth_targets"] = mtp_per_depth_targets
             batch = filter_forward_kwargs(model, batch)
             if isinstance(self.loss_fn, FusedLinearCrossEntropy):
                 out = model(logits_to_keep=1, **batch)
@@ -1260,7 +1325,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             return self._compute_causal_lm_loss(
                 out,
                 labels,
-                batch,
+                loss_inputs,
                 num_label_tokens=None,
                 is_train=False,
             ).detach()

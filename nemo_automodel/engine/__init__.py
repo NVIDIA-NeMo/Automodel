@@ -30,6 +30,7 @@ from nemo_automodel.components.distributed.mesh import MeshContext
 from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
 from nemo_automodel.components.distributed.utils import get_sync_ctx
+from nemo_automodel.components.models.common.mtp import MTPContextParallelInputs
 from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 from nemo_automodel.components.training.utils import (
     prepare_after_first_microbatch,
@@ -39,8 +40,10 @@ from nemo_automodel.components.training.utils import (
 from nemo_automodel.components.utils.model_utils import filter_forward_kwargs
 
 CollateFn = Callable[[list[Datum]], tuple[dict[str, Any], dict[str, torch.Tensor]]]
+LossInputValue = torch.Tensor | tuple[torch.Tensor, ...]
+LossInputs = dict[str, LossInputValue]
 LossFn = Callable[
-    [Any, dict[str, torch.Tensor]],
+    [Any, LossInputs],
     torch.Tensor | tuple[torch.Tensor, Sequence[Mapping[str, Any]]],
 ]
 
@@ -102,6 +105,8 @@ class Engine:
             model inputs and loss inputs aligned and preserve the sum of
             ``weights``.
         padding_token_id: Token used when the CP sharder pads ``input_ids``.
+        mtp_ignore_index: Label value used for invalid globally shifted MTP
+            targets before context-parallel sharding.
         context_fn: Creates an optional context from the CP-prepared model-input
             mapping. It covers model forward, loss, and backward, or the full
             pipeline schedule. Recipes use it for FP8 and model input staging.
@@ -132,11 +137,14 @@ class Engine:
         microbatch_size: int = 1,
         collate_fn: CollateFn = collate_datums,
         padding_token_id: int = 0,
+        mtp_ignore_index: int = -100,
         context_fn: Callable[[dict[str, Any]], AbstractContextManager[Any]] = _nullcontext_for_batch,
         defer_fsdp_grad_sync: bool = True,
     ) -> None:
         if isinstance(microbatch_size, bool) or not isinstance(microbatch_size, int) or microbatch_size <= 0:
             raise ValueError(f"microbatch_size must be a positive integer, got {microbatch_size!r}")
+        if isinstance(mtp_ignore_index, bool) or not isinstance(mtp_ignore_index, int):
+            raise ValueError(f"mtp_ignore_index must be an integer, got {mtp_ignore_index!r}")
         self.pipeline = model if isinstance(model, AutoPipeline) else None
         self.model_parts = model.parts if self.pipeline is not None else [model]
         self.model = self.model_parts[0]
@@ -145,6 +153,7 @@ class Engine:
         self.microbatch_size = microbatch_size
         self.collate_fn = collate_fn
         self.padding_token_id = padding_token_id
+        self.mtp_ignore_index = mtp_ignore_index
         self.context_fn = context_fn
         self.defer_fsdp_grad_sync = defer_fsdp_grad_sync
 
@@ -303,7 +312,7 @@ class Engine:
         self,
         datums: list[Datum],
         num_pipeline_microbatches: int,
-    ) -> tuple[Callable[[], AbstractContextManager[Any]], dict[str, Any], dict[str, torch.Tensor]]:
+    ) -> tuple[Callable[[], AbstractContextManager[Any]], dict[str, Any], LossInputs]:
         """Collate, move, and CP-shard one outer batch.
 
         Args:
@@ -375,6 +384,7 @@ class Engine:
             padding_token_id=self.padding_token_id,
             num_chunks=num_pipeline_microbatches,
         )
+        mtp_cp_inputs = self._prepare_mtp_cp_inputs(cp_batch)
         cp_context, model_inputs = sharder.shard(cp_batch)
         if model_inputs.get("qkv_format") == "thd" and (
             "seq_lens" in model_inputs or "seq_lens_padded" in model_inputs
@@ -401,12 +411,95 @@ class Engine:
             loss_inputs = self._shard_loss_inputs(sharder, loss_inputs, loss_seq_dim)
         if labels is not None:
             loss_inputs["labels"] = local_labels
+        if mtp_cp_inputs is not None:
+            loss_inputs = self._attach_mtp_cp_inputs(sharder, mtp_cp_inputs, model_inputs, loss_inputs)
         return cp_context, model_inputs, loss_inputs
+
+    def _prepare_mtp_cp_inputs(self, batch: dict[str, Any]) -> MTPContextParallelInputs | None:
+        """Prepare global MTP future-token tensors before CP shards the batch.
+
+        Args:
+            batch: Unsharded model batch. ``input_ids`` and ``labels`` have
+                shape [batch, sequence]; ``position_ids`` has shape [batch,
+                sequence] or [axes, batch, sequence]. Model-owned CP setup has
+                already populated any required position metadata.
+
+        Returns:
+            Globally ordered per-depth MTP tensors, or ``None`` when CP or MTP
+            is inactive. Token tensors have shape [batch, sequence]; multi-axis
+            positions have shape [axes, batch, sequence].
+        """
+        if self._cp_size() <= 1:
+            return None
+
+        supports = getattr(self.model, "supports", None)
+        if supports is None or not bool(getattr(supports, "mtp_enabled", False)):
+            return None
+        if not bool(getattr(supports, "supports_mtp_cp", False)):
+            raise NotImplementedError(f"{type(self.model).__name__} does not support MTP with context parallelism")
+        if self.pipeline is not None and not bool(getattr(supports, "supports_mtp_cp_pp", False)):
+            raise NotImplementedError(
+                "MTP with context and pipeline parallelism is not supported; use PP size 1 or CP size 1"
+            )
+
+        prepare = getattr(self.model, "prepare_mtp_inputs_for_cp", None)
+        if not callable(prepare):
+            raise RuntimeError(
+                f"{type(self.model).__name__} declares MTP+CP support but has no prepare_mtp_inputs_for_cp hook"
+            )
+        prepared = prepare(batch, ignore_index=self.mtp_ignore_index)
+        if not isinstance(prepared, MTPContextParallelInputs):
+            raise TypeError(
+                "prepare_mtp_inputs_for_cp must return MTPContextParallelInputs when MTP and CP are enabled"
+            )
+        return prepared
+
+    def _attach_mtp_cp_inputs(
+        self,
+        sharder: ContextParallelSharder,
+        prepared: MTPContextParallelInputs,
+        model_inputs: dict[str, Any],
+        loss_inputs: LossInputs,
+    ) -> LossInputs:
+        """Shard prepared MTP tensors with the main batch's captured CP layout.
+
+        Args:
+            sharder: Sharder that has already partitioned the main batch and
+                captured its local token layout.
+            prepared: Global per-depth token IDs, positions, targets, and masks.
+                Token tensors have shape [batch, sequence]; multi-axis positions
+                have shape [axes, batch, sequence].
+            model_inputs: CP-local model mapping updated in place. Added token
+                tensors have shape [batch, local_sequence] (or [local_tokens]
+                for THD), and multi-axis positions have shape [axes, batch,
+                local_sequence].
+            loss_inputs: CP-local loss mapping. ``mtp_per_depth_targets`` is
+                added with the same local token layout as labels.
+
+        Returns:
+            A shallow copy of ``loss_inputs`` containing CP-local per-depth
+            targets. Existing tensor storage is preserved.
+        """
+        model_inputs["mtp_per_depth_input_ids"] = tuple(
+            sharder.shard_token_tensor(value, seq_dim=1, fill=0) for value in prepared.input_ids
+        )
+        model_inputs["mtp_per_depth_position_ids"] = tuple(
+            sharder.shard_token_tensor(value, seq_dim=prepared.position_ids_seq_dim, fill=0)
+            for value in prepared.position_ids
+        )
+        model_inputs["mtp_per_depth_valid_masks"] = tuple(
+            sharder.shard_token_tensor(value, seq_dim=1, fill=False) for value in prepared.valid_masks
+        )
+        result = dict(loss_inputs)
+        result["mtp_per_depth_targets"] = tuple(
+            sharder.shard_token_tensor(value, seq_dim=1, fill=self.mtp_ignore_index) for value in prepared.targets
+        )
+        return result
 
     def _pipeline_step(
         self,
         model_inputs: dict[str, Any],
-        loss_inputs: dict[str, torch.Tensor],
+        loss_inputs: LossInputs,
         datums: Sequence[Datum],
         loss_fn: LossFn,
         denominator: torch.Tensor,
@@ -554,8 +647,8 @@ class Engine:
     def _materialize_pipeline_microbatches(
         self,
         model_inputs: dict[str, Any],
-        loss_inputs: dict[str, torch.Tensor],
-    ) -> tuple[list[dict[str, Any]], list[dict[str, torch.Tensor]]]:
+        loss_inputs: LossInputs,
+    ) -> tuple[list[dict[str, Any]], list[LossInputs]]:
         """Split one CP-prepared outer batch into exact pipeline inputs.
 
         Args:
@@ -630,6 +723,18 @@ class Engine:
             raise NotImplementedError(
                 "Engine.forward_backward requires averaged distributed gradients; "
                 "MegatronFSDP calculate_per_token_loss=True uses summed gradients"
+            )
+        if (
+            self.pipeline is not None
+            and self._cp_size() > 1
+            and any(
+                bool(getattr(getattr(part, "supports", None), "mtp_enabled", False))
+                and not bool(getattr(getattr(part, "supports", None), "supports_mtp_cp_pp", False))
+                for part in self.model_parts
+            )
+        ):
+            raise NotImplementedError(
+                "MTP with context and pipeline parallelism is not supported; use PP size 1 or CP size 1"
             )
         if self.pipeline is not None and self.pipeline.scale_grads_in_schedule:
             raise ValueError("Engine requires AutoPipeline scale_grads_in_schedule=False")
@@ -859,9 +964,7 @@ def _matches_primary_token_layout(tensor: torch.Tensor, model_inputs: Mapping[st
     return tensor.ndim >= token_dims and tuple(tensor.shape[:token_dims]) == tuple(primary.shape[:token_dims])
 
 
-def _with_loss_metadata(
-    model_inputs: Mapping[str, Any], loss_inputs: Mapping[str, torch.Tensor]
-) -> dict[str, torch.Tensor]:
+def _with_loss_metadata(model_inputs: Mapping[str, Any], loss_inputs: Mapping[str, LossInputValue]) -> LossInputs:
     result = dict(loss_inputs)
     for name in _LOSS_METADATA:
         value = model_inputs.get(name)
