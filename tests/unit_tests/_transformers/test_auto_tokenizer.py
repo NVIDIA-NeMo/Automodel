@@ -78,6 +78,10 @@ class _StubConfig:
     model_type = "stub"
 
 
+class _Ministral3Config:
+    model_type = "ministral3"
+
+
 class TestNeMoAutoTokenizerFromPretrained:
     def test_default_preserves_tokenizer_special_token_behavior(self):
         stub = _StubHFTokenizer()
@@ -116,6 +120,25 @@ class TestNeMoAutoTokenizerFromPretrained:
 
             enc = tok.encode("x", add_special_tokens=False)
             assert enc == [5, 6]
+
+    def test_ministral3_uses_custom_tokenizer_offline(self, monkeypatch):
+        stub = _StubHFTokenizer()
+        monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+
+        with (
+            patch("transformers.AutoConfig.from_pretrained", return_value=_Ministral3Config()),
+            patch(
+                "nemo_automodel._transformers.tokenization.tokenization_mistral_common."
+                "MistralCommonBackend.from_pretrained",
+                return_value=stub,
+            ) as custom_from_pretrained,
+            patch("transformers.AutoTokenizer.from_pretrained") as hf_from_pretrained,
+        ):
+            tok = NeMoAutoTokenizer.from_pretrained("mistralai/Devstral-2-123B-Instruct-2512")
+
+        assert tok is stub
+        custom_from_pretrained.assert_called_once_with("mistralai/Devstral-2-123B-Instruct-2512")
+        hf_from_pretrained.assert_not_called()
 
     def test_cls_sep_pattern_fixed_when_tokens_missing(self):
         """Transformers >=5.0 defaults special_tokens_pattern to 'cls_sep'.
