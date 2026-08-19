@@ -227,11 +227,10 @@ def test_generate_qwen3_moe_lora_uses_all_isolated_checkpoint_phases():
         assert key not in robustness
 
 
-def test_generate_nemotron_resume_cohort_is_blocking_and_complete():
+def test_generate_nemotron_resume_cohort_preserves_known_issue_gating():
     expected_times = {
         "customizer_nemotron_nano_peft": "00:30:00",
         "customizer_nemotron_nano_peft_packing": "00:30:00",
-        "nemotron_nano_4b_squad": "00:25:00",
         "nemotron_nano_4b_squad_peft": "00:30:00",
         "nemotron_nano_8b_v1_squad": "00:25:00",
         "nemotron_nano_8b_v1_squad_peft": "00:25:00",
@@ -252,6 +251,9 @@ def test_generate_nemotron_resume_cohort_is_blocking_and_complete():
         if recipe_name == "nemotron_nano_8b_v1_squad":
             expected_phases += " cross_tp_reload"
         assert job["variables"]["CHECKPOINT_ROBUSTNESS_PHASES"] == expected_phases
+
+    known_issue_config = Path("examples/llm_finetune/nemotron/nemotron_nano_4b_squad.yaml")
+    assert generate_job(known_issue_config, {}, "release", "llm_finetune", ".") == []
 
 
 def test_generate_qwen3_moe_te_deepep_uses_isolated_source_and_reload_phases():

@@ -102,6 +102,7 @@ lr_scheduler:
 ci:
   recipe_owner: adil-a
   time: "00:25:00"
+  known_issue_id: AM-153
   checkpoint_robustness:
     kl_threshold: 5e-3
     hf_kl_threshold: 5e-3
