@@ -14,21 +14,15 @@
 
 """Train, checkpoint, and validate AutoModel and vanilla-HF reloads.
 
-Launch: torchrun --nproc-per-node=<N> -m <this_module> --config <config.yaml>
-    [--isolated_phase <source_load_reference|source_load_parity|train_and_save|automodel_reload|hf_reload|resume>]
-    [--kl_threshold <float>] [--hf_kl_threshold <float>]
-    [--cross_tp_size <int>] [--cross_tp_kl_threshold <float>]
-    [--tokenizer_name <str>]
-    [--source_load_kl_threshold <float>] [--source_load_mean_kl_threshold <float>]
-    [--check_source_load_parity] [--check_fused_qkv_keys] [--check_phantom_keys] [--check_resume]
-    [--parity_tolerance_profile <strict|standard|relaxed>]
-    [--automodel_reload_mean_kl_threshold <float>] [--automodel_reload_p95_kl_threshold <float>]
-    [--automodel_reload_cosine_threshold <float>]
-    [--resume_tolerance_profile <strict|standard|relaxed>]
-    [--resume_first_loss_threshold <float>] [--resume_loss_threshold <float>]
-    [--skip_automodel_logit_parity] [--skip_hf_logit_parity] [--hf_adapter_ignored_key_prefix <str>]
-    [--hf_source_post_load_dequantize]
-    [--max_vram_gb <float>] [--max_cpu_gb <float>]
+Launch with ``torchrun --nproc-per-node=<N> -m <this_module> --config <config.yaml>``.
+
+The CI launcher runs phases in isolated processes by default through ``--isolated_phase``. Accepted phase names are
+``source_load_reference``, ``source_load_parity``, ``train_and_save``, ``automodel_reload``, ``hf_reload``, ``resume``,
+and ``cross_tp_reload``. Direct invocation without ``--isolated_phase`` retains the compatibility single-process
+lifecycle.
+
+See ``tests/ci_tests/README.md#checkpoint-robustness`` for the public phase contract, tolerance profiles, and supported
+recipe controls.
 """
 
 from __future__ import annotations

@@ -73,7 +73,8 @@ ci:
 
 When `checkpoint_robustness` is present, the robustness test runs after the finetune under the same SLURM allocation.
 LLM and VLM tests run each lifecycle phase in a fresh process by default so the test models a real restart and does not
-depend on Python object teardown. `process_isolation: false` retains the old single-process path as a temporary fallback.
+depend on Python object teardown. `process_isolation: false` retains the old single-process path as a compatibility
+fallback.
 
 The public phase model is deliberately numbered 0 through 5. The two isolated jobs that produce and consume the
 source reference are implementation details of Phase 0, not separate phases.
@@ -209,7 +210,7 @@ for new recipes so broad CI calibration can converge on a small set of shared po
 | `skip_hf_reload_logit_parity: true` | Keep the Phase 3 load, forward smoke, and PEFT fingerprints, but make its logit metrics informational. |
 | `skip_resume: true` | Skip Phase 4. |
 | `cross_tp_size: N` | Enable Phase 5 with tensor-parallel size `N` for dense models. |
-| `process_isolation: false` | Use the legacy single-process lifecycle as a temporary fallback. |
+| `process_isolation: false` | Use the legacy single-process lifecycle as a compatibility fallback. |
 
 The legacy names `check_source_load_parity`, `no_check_resume`, `skip_automodel_logit_parity`, and
 `skip_hf_logit_parity` remain accepted during migration. New and updated recipes should use the semantic `skip_*`
