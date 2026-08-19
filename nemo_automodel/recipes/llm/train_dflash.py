@@ -616,6 +616,9 @@ class TrainDFlashRecipe(BaseRecipe):
             block_size=self.block_size,
             attention_backend=attention_backend,
             num_anchors=int(recipe_cfg.get("num_anchors", 512)),
+            max_total_anchors=(
+                int(recipe_cfg["max_total_anchors"]) if recipe_cfg.get("max_total_anchors", None) is not None else None
+            ),
             # Paper default (Appendix A.1) for the shipped block_size=16 configs;
             # matches DFlashDecayLoss's own default. Set null explicitly in YAML
             # to disable the position decay (uniform weighting).
@@ -625,6 +628,8 @@ class TrainDFlashRecipe(BaseRecipe):
             loss_type=str(recipe_cfg.get("loss_type", None) or "dflash"),
             prefix_weight_base=float(recipe_cfg.get("prefix_weight_base", 0.9)),
             sliding_window=self.draft_sliding_window,
+            use_fused_linear_ce=bool(recipe_cfg.get("use_fused_linear_ce", False)),
+            linear_ce_chunk_size=int(recipe_cfg.get("linear_ce_chunk_size", 1024)),
         )
 
     def _run_trainer_step(self, target_batch):

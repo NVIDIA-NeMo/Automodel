@@ -75,6 +75,27 @@ def _bare_dflash_recipe():
     return recipe
 
 
+def test_build_trainer_module_wires_fused_ce_and_anchor_budget():
+    recipe = _bare_dflash_recipe()
+
+    module = recipe._build_trainer_module(
+        "sdpa",
+        {
+            "num_anchors": 512,
+            "max_total_anchors": 512,
+            "use_fused_linear_ce": True,
+            "linear_ce_chunk_size": 256,
+            "loss_decay_gamma": 4.0,
+        },
+    )
+
+    assert module.num_anchors == 512
+    assert module.max_total_anchors == 512
+    assert module.use_fused_linear_ce is True
+    assert module.loss_fn.chunk_size == 256
+    assert module.loss_decay_gamma == 4.0
+
+
 def _ckpt_self(ckpt_every_steps, save_every_epoch, global_step, total_optim_steps=None):
     calls = []
     return (

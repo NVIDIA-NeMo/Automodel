@@ -124,7 +124,8 @@ def test_to_full_tensor_gathers_vocab_sharded_dtensor(single_rank_pg):
 # --------------------------------------------------------------------------- #
 # Trainer with a tensor-parallel target lm_head + embed_tokens
 # --------------------------------------------------------------------------- #
-def test_trainer_runs_with_tensor_parallel_target(single_rank_pg):
+@pytest.mark.parametrize("use_fused_linear_ce", [False, True])
+def test_trainer_runs_with_tensor_parallel_target(single_rank_pg, use_fused_linear_ce):
     """A column-parallel lm_head and vocab-parallel embed_tokens return DTensors;
     the trainer must gather them, keep them non-registered (so DDP sees only the
     draft), run a finite forward, and flow gradients to the draft."""
@@ -141,6 +142,8 @@ def test_trainer_runs_with_tensor_parallel_target(single_rank_pg):
         attention_backend="sdpa",
         num_anchors=8,
         loss_decay_gamma=7.0,
+        use_fused_linear_ce=use_fused_linear_ce,
+        linear_ce_chunk_size=3,
     )
 
     # The frozen target modules are non-registered: a DDP-wrapped trainer must

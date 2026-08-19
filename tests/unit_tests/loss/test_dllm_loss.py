@@ -410,6 +410,32 @@ class TestDFlashDraftAccuracy:
         assert torch.allclose(ref.total_loss, fused.total_loss, atol=1e-4)
         assert torch.equal(ref.draft_correct_per_pos, fused.draft_correct_per_pos)
         assert torch.equal(ref.draft_count_per_pos, fused.draft_count_per_pos)
+        assert torch.equal(ref.draft_correct, fused.draft_correct)
+
+    def test_fused_module_projection_matches_nonfused(self):
+        """Module projection preserves forward hooks and gathers chunk results."""
+        torch.manual_seed(4)
+        B, N, bs, D, V = 2, 2, 4, 16, 32
+        T = N * (bs - 1)
+        hidden = torch.randn(B, T, D, requires_grad=True)
+        lm_head = torch.nn.Linear(D, V)
+        target_ids = torch.randint(0, V, (B, T))
+        block_mask = torch.ones(B, T)
+        loss_fn = DFlashDecayLoss(loss_gamma=4.0, use_fused_linear_ce=True, chunk_size=3)
+
+        ref = loss_fn(lm_head(hidden), target_ids, block_mask, num_tokens=B * T, block_size=bs)
+        fused = loss_fn.forward_fused(
+            hidden,
+            None,
+            target_ids,
+            block_mask,
+            num_tokens=B * T,
+            block_size=bs,
+            lm_head=lm_head,
+        )
+
+        torch.testing.assert_close(fused.total_loss, ref.total_loss, atol=1e-5, rtol=1e-5)
+        assert torch.equal(fused.draft_correct, ref.draft_correct)
 
     def test_paper_default_first_offset_weight_is_one(self):
         """The first predicted position of every block must have decay weight 1.0

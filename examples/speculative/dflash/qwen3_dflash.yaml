@@ -29,8 +29,11 @@ recipe_args:
   # --- DFlash-specific ---
   draft_num_hidden_layers: 5          # depth of the draft transformer stack
   block_size: 16                      # tokens drafted in parallel per block
-  num_anchors: 512                    # blocks sampled per sequence per step
+  num_anchors: 512                    # per-sequence candidate block limit
+  max_total_anchors: 512              # cap constructed block slots across the local microbatch
   loss_decay_gamma: 7.0               # block-position loss decay: exp(-(k-1)/gamma)
+  use_fused_linear_ce: true            # chunk LM-head + CE instead of retaining full-vocabulary logits
+  linear_ce_chunk_size: 256            # projected positions per chunk; lower uses less peak memory
   # loss_type: dflash                 # "dflash" (fixed anchor) or "variable_prefix" (D2SD VP-Drafter:
   #                                   # per-block visible prefix sampled ~ prefix_weight_base**l, only the
   #                                   # masked suffix is supervised, decay re-anchored at the prefix)
