@@ -28,6 +28,7 @@ managers, the pipeline-parallel path, any extra model-output-driven losses
 backward call.
 """
 
+from collections.abc import Sequence
 from typing import Any, Optional
 
 import torch
@@ -48,6 +49,7 @@ def forward_backward_step(
     *,
     num_label_tokens: Optional[int] = None,
     mtp_cfg: Any = None,
+    mtp_per_depth_targets: Optional[Sequence[torch.Tensor]] = None,
     cu_seqlens: Optional[torch.Tensor] = None,
     grad_reduce_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> tuple[Any, torch.Tensor]:
@@ -72,8 +74,12 @@ def forward_backward_step(
         mtp_cfg: MTP config exposing ``scaling_factor`` / ``ignore_index``. When the
             model emits ``mtp_per_depth_*`` outputs and this is not ``None``, the
             MTP loss is added.
+        mtp_per_depth_targets: Optional globally prepared, locally sharded MTP
+            targets. Context-parallel callers must provide these because target
+            shifts cannot be reconstructed from a rank-local sequence shard.
         cu_seqlens: THD packing boundaries forwarded to the MTP loss to mask
-            cross-sequence label rolls (``None`` for unpacked batches).
+            cross-sequence label rolls (``None`` for unpacked batches or when
+            ``mtp_per_depth_targets`` is provided).
         grad_reduce_group: Process group whose ranks contribute independent
             fused-loss shards (the flattened DP-CP group during training).
             Forwarded to ``FusedLinearCrossEntropy.materialize_lm_weight`` so
@@ -130,6 +136,7 @@ def forward_backward_step(
             loss_fn,
             mtp_per_depth_h=mtp_per_depth_h,
             mtp_per_depth_logits=mtp_per_depth_logits,
+            mtp_per_depth_targets=mtp_per_depth_targets,
             labels=labels,
             model=model,
             scaling_factor=scaling_factor,

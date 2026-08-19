@@ -881,7 +881,36 @@ class FinetuneRecipeForVLM(BaseRecipe):
             padding_token_id=_padding_id,
             invoke_pre_embed=True,
         )
+        model = self.model_parts[0]
+        mtp_cp_enabled = _cp_active and not self.pp_enabled and model.supports.mtp_enabled
+        mtp_cp_inputs = None
+        if mtp_cp_enabled:
+            if not model.supports.supports_mtp_cp:
+                raise NotImplementedError(
+                    f"{type(model).__name__} declares supports_mtp_cp=False; "
+                    "MTP target preparation for context parallelism is unavailable"
+                )
+            mtp_cp_inputs = model.prepare_mtp_inputs_for_cp(
+                batch,
+                ignore_index=self.cfg.mtp.ignore_index,
+            )
         train_ctx, batch = cp_sharder.shard(batch)
+        mtp_per_depth_targets = None
+        if mtp_cp_inputs is not None:
+            batch["mtp_per_depth_input_ids"] = tuple(
+                cp_sharder.shard_token_tensor(ids, seq_dim=1, fill=0) for ids in mtp_cp_inputs.input_ids
+            )
+            batch["mtp_per_depth_position_ids"] = tuple(
+                cp_sharder.shard_token_tensor(ids, seq_dim=mtp_cp_inputs.position_ids_seq_dim, fill=0)
+                for ids in mtp_cp_inputs.position_ids
+            )
+            batch["mtp_per_depth_valid_masks"] = tuple(
+                cp_sharder.shard_token_tensor(mask, seq_dim=1, fill=False) for mask in mtp_cp_inputs.valid_masks
+            )
+            mtp_per_depth_targets = tuple(
+                cp_sharder.shard_token_tensor(targets, seq_dim=1, fill=self.cfg.mtp.ignore_index)
+                for targets in mtp_cp_inputs.targets
+            )
         labels = batch.pop("labels")
 
         if self.pp_enabled:
@@ -938,7 +967,8 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     self.loss_fn,
                     num_label_tokens=num_label_tokens,
                     mtp_cfg=getattr(getattr(self, "cfg", None), "mtp", None),
-                    cu_seqlens=batch.get("cu_seqlens"),
+                    mtp_per_depth_targets=mtp_per_depth_targets,
+                    cu_seqlens=None if mtp_per_depth_targets is not None else batch.get("cu_seqlens"),
                     grad_reduce_group=grad_reduce_group,
                 )
 

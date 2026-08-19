@@ -2306,6 +2306,7 @@ class _CPPreEmbedModel(torch.nn.Module):
     def __init__(self):
         super().__init__()
         self.scale = torch.nn.Parameter(torch.tensor(1.0))
+        self.supports = SimpleNamespace(mtp_enabled=False, supports_mtp_cp=False)
         self.hook_calls = []
 
     def prepare_model_inputs_for_cp(self, batch, *, num_chunks=1):
