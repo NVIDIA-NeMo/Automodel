@@ -8,7 +8,7 @@ recipe: FinetuneRecipeForVLM
 seed: 1234
 
 step_scheduler:
-  global_batch_size: 512
+  global_batch_size: 64
   local_batch_size: 1
   ckpt_every_steps: 100
   val_every_steps: 25
