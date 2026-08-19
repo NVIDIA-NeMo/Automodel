@@ -113,9 +113,6 @@ ci:
     # the mirror of the untied Nemotron-Nano-9B-v2 coverage.
     tokenizer_name: nvidia/Nemotron-Flash-1B
     trust_remote_code: true
-    # The consolidated Transformers class currently rejects FlashAttention2
-    # before forward; preserve the other phases until that HF load path is fixed.
-    skip_hf_reload: true
     # Exact restored state passes; the first shared forward has small hybrid-kernel drift.
     resume_tolerance_profile: relaxed
     # Preserve the independently calibrated hybrid-attention/Mamba/DeltaNet

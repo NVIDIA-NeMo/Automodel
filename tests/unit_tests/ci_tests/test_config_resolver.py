@@ -369,8 +369,7 @@ def test_calibration_recipes_enable_all_checkpoint_gates(tmp_path, recipe_path):
     else:
         assert "skip_source_load_logit_parity" not in robustness
         assert "skip_hf_reload_logit_parity" not in robustness
-    if recipe_path.stem == "nemotron_flash_1b_squad":
-        assert robustness["skip_hf_reload"] is True
+    assert "skip_hf_reload" not in robustness
     assert "skip_resume" not in robustness
 
 
