@@ -932,6 +932,7 @@ class Checkpointer:
             # Only base-checkpoint initialization needs FP8 scale destinations.
             quantization=bool(is_init_step and self.config.dequantize_base_checkpoint),
             device_mesh=self.moe_mesh,
+            load_into_empty_destinations=True,
         )
         destinations_ready = time.monotonic()
         requested_bytes = sum(
