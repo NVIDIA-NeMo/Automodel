@@ -15,10 +15,11 @@
 import json
 import os
 from types import SimpleNamespace
+from typing import Any, get_type_hints
 from unittest.mock import patch
 
 import pytest
-from tokenizers import Tokenizer
+from tokenizers import AddedToken, Tokenizer
 from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import Whitespace
 from transformers.tokenization_utils_base import BatchEncoding
@@ -88,6 +89,9 @@ class _Ministral3Config:
 
 
 class TestNeMoAutoTokenizerFromPretrained:
+    def test_runtime_return_annotation_resolves_without_eager_transformers_import(self):
+        assert get_type_hints(NeMoAutoTokenizer.from_pretrained)["return"] is Any
+
     @pytest.mark.parametrize("tokenizer_backend", [None, "nemo_auto"])
     def test_default_preserves_tokenizer_special_token_behavior(self, tokenizer_backend):
         stub = _StubHFTokenizer()
@@ -310,6 +314,62 @@ class TestNeMoAutoTokenizerFromPretrained:
         reloaded = NeMoAutoTokenizer.from_pretrained(saved_dir, tokenizer_backend="tokenizers")
         assert reloaded.pad_token_id == 0
         assert len(reloaded(["short", "long input"], padding=True)["input_ids"][0]) == 2
+
+    def test_tokenizers_backend_preserves_policy_and_portable_save(self, tmp_path):
+        backend = Tokenizer(
+            WordLevel(
+                {
+                    "[UNK]": 0,
+                    "<s>": 1,
+                    "</s>": 2,
+                    "[INST]": 3,
+                    "hello": 4,
+                    "[": 5,
+                    "INST": 6,
+                    "]": 7,
+                },
+                unk_token="[UNK]",
+            )
+        )
+        backend.pre_tokenizer = Whitespace()
+        backend.add_special_tokens([AddedToken("[INST]", special=True)])
+        backend.save(str(tmp_path / "tokenizer.json"))
+        (tmp_path / "tokenizer_config.json").write_text(
+            json.dumps(
+                {
+                    "tokenizer_class": "TokenizersBackend",
+                    "unk_token": "[UNK]",
+                    "bos_token": "<s>",
+                    "eos_token": "</s>",
+                    "additional_special_tokens": ["[INST]"],
+                }
+            )
+        )
+
+        tokenizer = NeMoAutoTokenizer.from_pretrained(
+            tmp_path,
+            tokenizer_backend="tokenizers",
+            split_special_tokens=True,
+            add_bos_token=True,
+            add_eos_token=False,
+            padding_side="left",
+        )
+
+        assert tokenizer.encode("hello") == [1, 4]
+        assert tokenizer.encode("[INST]", add_special_tokens=False) == [5, 6, 7]
+        assert tokenizer.padding_side == "left"
+        assert tokenizer.pad_token_id == 0
+
+        saved_dir = tmp_path / "saved"
+        tokenizer.save_pretrained(saved_dir)
+        saved_config = json.loads((saved_dir / "tokenizer_config.json").read_text())
+        assert saved_config["split_special_tokens"] is True
+        assert "auto_map" not in saved_config
+        assert not (saved_dir / "tekken.json").exists()
+
+        reloaded = NeMoAutoTokenizer.from_pretrained(saved_dir, tokenizer_backend="tokenizers")
+        assert reloaded.encode("hello") == [1, 4]
+        assert reloaded.encode("[INST]", add_special_tokens=False) == [5, 6, 7]
 
     def test_tokenizers_backend_forwards_retrieval_policy_directly(self):
         expected = SimpleNamespace(pad_token_id=7)

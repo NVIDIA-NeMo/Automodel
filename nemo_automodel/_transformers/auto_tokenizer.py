@@ -14,10 +14,14 @@
 
 import importlib
 import logging
-from typing import TYPE_CHECKING, Callable, Literal, Type, Union
+from typing import TYPE_CHECKING, Any, Callable, Literal, Type, Union
 
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
+else:
+    # Keep importing NeMoAutoTokenizer lightweight while allowing runtime
+    # annotation consumers such as typing.get_type_hints() to resolve the name.
+    PreTrainedTokenizerBase = Any
 
 logger = logging.getLogger(__name__)
 
@@ -61,9 +65,12 @@ class NeMoAutoTokenizer:
     Similar to HuggingFace's AutoTokenizer, but with a custom registry for specialized
     tokenizer implementations.
 
-    The dispatch logic is:
-    1. If a custom tokenizer is registered for the model type, use it
-    2. Otherwise, fall back to the wrapped HuggingFace tokenizer
+    ``tokenizer_backend`` selects one of three loading routes:
+    1. ``"nemo_auto"`` (default) uses a registered tokenizer when available,
+       otherwise it falls back to the wrapped HuggingFace tokenizer.
+    2. ``"transformers_auto"`` uses Transformers ``AutoTokenizer`` directly.
+    3. ``"tokenizers"`` loads ``tokenizer.json`` through Transformers
+       ``TokenizersBackend``.
 
     Example:
         >>> # Will use MistralCommonBackend if available for Mistral models
@@ -106,7 +113,8 @@ class NeMoAutoTokenizer:
 
         Args:
             pretrained_model_name_or_path: Model identifier or path
-            force_default: If True, always use the wrapped HuggingFace tokenizer.
+            force_default: Backward-compatible option that selects the wrapped fallback within the
+                ``"nemo_auto"`` route, bypassing registered tokenizers.
             force_hf: Backward-compatible alias for ``tokenizer_backend="transformers_auto"``.
             tokenizer_backend: Tokenizer loading route. ``"nemo_auto"`` preserves the default NeMo dispatch,
                 ``"transformers_auto"`` uses Transformers AutoTokenizer, and ``"tokenizers"`` loads
@@ -124,7 +132,7 @@ class NeMoAutoTokenizer:
             raise ValueError("force_default=True and force_hf=True are mutually exclusive.")
         if force_default and tokenizer_backend not in (None, "nemo_auto"):
             raise ValueError(
-                "force_default=True uses the nemo_auto route and cannot be combined "
+                "force_default=True selects the wrapped fallback within the nemo_auto route and cannot be combined "
                 f"with tokenizer_backend={tokenizer_backend!r}."
             )
         if force_hf and tokenizer_backend not in (None, "transformers_auto"):

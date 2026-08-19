@@ -232,6 +232,33 @@ tok = NeMoAutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1")`}</code></p
   </tbody>
 </table>
 
+Select the loading route with `tokenizer_backend`:
+
+- `"nemo_auto"` (the default) uses NeMo AutoModel's model-type registry and falls back to its
+  Transformers-compatible wrapper.
+- `"transformers_auto"` calls Transformers `AutoTokenizer` directly.
+- `"tokenizers"` loads `tokenizer.json` directly through Transformers `TokenizersBackend`. Use this route
+  when the serialized tokenizer should be authoritative and no repository-provided tokenizer code is needed.
+  Tokenizer policy arguments such as `add_bos_token`, `add_eos_token`, `split_special_tokens`,
+  `fix_mistral_regex`, and `padding_side` are forwarded to that backend.
+
+For example:
+
+```python
+tok = NeMoAutoTokenizer.from_pretrained(
+    "mistralai/Ministral-3-3B-Instruct-2512-BF16",
+    tokenizer_backend="tokenizers",
+    fix_mistral_regex=True,
+    split_special_tokens=True,
+    add_bos_token=True,
+    add_eos_token=False,
+)
+```
+
+The legacy `force_hf=True` option is equivalent to `tokenizer_backend="transformers_auto"`.
+`force_default=True` bypasses registered NeMo tokenizers while remaining on the wrapped fallback route.
+Contradictory route selections raise `ValueError` instead of silently choosing one.
+
 ## Save Checkpoints in NeMo AutoModel and Load Everywhere
 
 NeMo AutoModel training recipes write checkpoints as sharded safetensors by default and generate a per-checkpoint helper that can export Hugging Face-compatible consolidated safetensors after training:
