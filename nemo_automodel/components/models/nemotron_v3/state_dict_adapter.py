@@ -89,7 +89,7 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
     Note: NemotronV3 uses 'mixer' instead of 'mlp' in layer paths.
     """
 
-    _supports_inplace_checkpoint_load = True
+    _supports_write_through_checkpoint_load = True
 
     def __init__(
         self,

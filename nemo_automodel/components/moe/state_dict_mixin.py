@@ -50,18 +50,18 @@ class MoESplitExpertsStateDictMixin:
     # - self.backend: Backend configuration object
 
     @property
-    def supports_inplace_checkpoint_load(self) -> bool:
+    def supports_write_through_checkpoint_load(self) -> bool:
         """Whether non-expert and grouped-expert destinations both alias model storage."""
-        experts_alias = self.moe_config is None or self._supports_inplace_expert_checkpoint_load
-        return self._supports_inplace_checkpoint_load and experts_alias
+        experts_alias = self.moe_config is None or self._supports_write_through_expert_checkpoint_load
+        return self._supports_write_through_checkpoint_load and experts_alias
 
     @property
-    def _supports_inplace_expert_checkpoint_load(self) -> bool:
+    def _supports_write_through_expert_checkpoint_load(self) -> bool:
         """Whether all grouped expert destinations alias final model storage.
 
         This only describes the shared expert conversion. Concrete adapters
         must separately verify that their non-expert conversions also alias
-        model storage before opting into an in-place full-checkpoint load.
+        model storage before opting into a write-through full-checkpoint load.
         """
         return self.backend.experts != "te" and self.backend.dispatcher != "mok"
 

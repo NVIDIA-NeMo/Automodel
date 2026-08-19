@@ -1621,7 +1621,7 @@ class TestLoadModelCustomModelGuard:
         model = CustomModel()
         model.layer = torch.nn.Linear(4, 4)
         model.state_dict_adapter = MagicMock(spec=StateDictAdapter)
-        model.state_dict_adapter.supports_inplace_checkpoint_load = True
+        model.state_dict_adapter.supports_write_through_checkpoint_load = True
         mock_state_dict = {"layer.weight": torch.randn(4, 4), "layer.bias": torch.randn(4)}
         mock_load_hf.return_value = mock_state_dict
 

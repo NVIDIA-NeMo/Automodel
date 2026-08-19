@@ -889,14 +889,14 @@ class TestInplaceLoadViews:
 
     def test_expert_write_through_capability_matches_grouped_storage_aliasing(self):
         mixin = MockMoEStateDictMixin()
-        assert mixin._supports_inplace_expert_checkpoint_load is True
+        assert mixin._supports_write_through_expert_checkpoint_load is True
 
         mixin.backend.experts = "te"
-        assert mixin._supports_inplace_expert_checkpoint_load is False
+        assert mixin._supports_write_through_expert_checkpoint_load is False
 
         mixin.backend.experts = "gmm"
         mixin.backend.dispatcher = "mok"
-        assert mixin._supports_inplace_expert_checkpoint_load is False
+        assert mixin._supports_write_through_expert_checkpoint_load is False
 
     def _run_inplace_conversion(self, mixin, fqn, mock_dtensor, splits):
         mixin._split_experts_weights = Mock(return_value=splits)

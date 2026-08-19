@@ -70,7 +70,7 @@ _HF_TO_NATIVE_RENAMES: tuple[tuple[re.Pattern[str], str], ...] = (
 class HyMT2StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
     """Bridges Automodel native (grouped experts) and on-disk Hy-MT2 HF format."""
 
-    _supports_inplace_checkpoint_load = True
+    _supports_write_through_checkpoint_load = True
 
     def __init__(
         self,

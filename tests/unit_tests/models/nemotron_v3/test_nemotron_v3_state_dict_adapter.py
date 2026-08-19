@@ -104,16 +104,16 @@ class TestNemotronV3StateDictAdapter:
 
         assert adapter._expert_path_segment == "mixer.experts"
 
-    def test_inplace_load_capability_requires_aliasing_expert_backend(self, config, moe_config, backend):
+    def test_write_through_load_capability_requires_aliasing_expert_backend(self, config, moe_config, backend):
         adapter = NemotronV3StateDictAdapter(config, moe_config, backend)
-        assert adapter.supports_inplace_checkpoint_load is True
+        assert adapter.supports_write_through_checkpoint_load is True
 
         adapter.backend.experts = "te"
-        assert adapter.supports_inplace_checkpoint_load is False
+        assert adapter.supports_write_through_checkpoint_load is False
 
         adapter.backend.experts = "gmm"
         adapter.backend.dispatcher = "mok"
-        assert adapter.supports_inplace_checkpoint_load is False
+        assert adapter.supports_write_through_checkpoint_load is False
 
     def test_from_hf_map_structure(self, config, moe_config, backend):
         """Test from_hf_map structure."""
@@ -142,7 +142,7 @@ class TestNemotronV3AdapterDense:
 
     def test_init_accepts_none_moe_config(self, adapter):
         assert adapter.moe_config is None
-        assert adapter.supports_inplace_checkpoint_load is True
+        assert adapter.supports_write_through_checkpoint_load is True
 
     def test_from_hf_renames_without_experts(self, adapter):
         hf_sd = {

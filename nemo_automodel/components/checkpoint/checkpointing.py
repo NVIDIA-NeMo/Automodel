@@ -842,13 +842,13 @@ class Checkpointer:
         else:
             world_size = int(os.environ.get("WORLD_SIZE", "1"))
         state_dict_adapter = getattr(_unwrap_ddp_model(model_state.model[0]), "state_dict_adapter", None)
-        supports_inplace_checkpoint_load = (
+        supports_write_through_checkpoint_load = (
             isinstance(state_dict_adapter, StateDictAdapter)
-            and state_dict_adapter.supports_inplace_checkpoint_load
+            and state_dict_adapter.supports_write_through_checkpoint_load
             and not self.config.dequantize_base_checkpoint
         )
         single_device_custom_safetensors = (
-            is_safetensors and is_custom_model and world_size == 1 and not supports_inplace_checkpoint_load
+            is_safetensors and is_custom_model and world_size == 1 and not supports_write_through_checkpoint_load
         )
         if (
             is_init_step

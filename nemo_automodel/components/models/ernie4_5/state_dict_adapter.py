@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 class Ernie4_5StateDictAdapter(StateDictAdapter):
     """Passthrough adapter for dense ERNIE 4.5 checkpoints."""
 
-    _supports_inplace_checkpoint_load = True
+    _supports_write_through_checkpoint_load = True
 
     def __init__(self, config: Any):
         self.config = config
@@ -60,7 +60,7 @@ class Ernie4_5StateDictAdapter(StateDictAdapter):
 class Ernie4_5_MoeStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
     """Convert ERNIE 4.5 MoE HF checkpoints to AutoModel grouped-expert format."""
 
-    _supports_inplace_checkpoint_load = True
+    _supports_write_through_checkpoint_load = True
 
     def __init__(
         self,

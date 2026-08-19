@@ -181,6 +181,22 @@ See the pattern files for detailed implementation guidance:
 - VLM: [vlm-patterns.md](./vlm-patterns.md)
 - Capabilities and fp32 precision: [capabilities-and-precision.md](./capabilities-and-precision.md)
 
+#### Check checkpoint-load write-through
+
+Evaluate `supports_write_through_checkpoint_load` for every new state-dict adapter. On
+single-rank loads, this capability lets the checkpoint reader fill final model
+storage directly instead of materializing a converted full checkpoint on the
+host. A false opt-in is dangerous: operations such as `cat`, `stack`, dtype
+conversion, dequantization, or `contiguous` can create an additional model-sized
+tensor on the device and cause an out-of-memory failure.
+
+Keep the inherited default of `False` unless every tensor returned by `to_hf`
+for base-checkpoint loading is the original model tensor or a view that writes
+through to it for every supported backend and configuration. When opting in,
+add a focused test that writes through the checkpoint destinations and verifies
+that final model storage changes. Also test that allocating backend or
+configuration variants report `False`.
+
 ### 2.3 Causal LM weight tying
 
 Every registered model class with a causal `lm_head` must:
@@ -415,6 +431,8 @@ that only surface in a full parity comparison.
 - [ ] Implemented rope_utils.py (if custom RoPE needed)
 - [ ] Implemented model.py with `HFCheckpointingMixin`
 - [ ] Implemented state_dict_adapter.py
+- [ ] Evaluated `supports_write_through_checkpoint_load`; added write-through storage tests for any opt-in and covered
+  allocating variants -- see §2.2
 - [ ] Implemented __init__.py with re-export
 - [ ] Registered in `MODEL_ARCH_MAPPING` in `_transformers/registry.py`
 - [ ] Registered custom config in `_CUSTOM_CONFIG_REGISTRATIONS` (if applicable)
