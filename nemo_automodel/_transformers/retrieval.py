@@ -339,8 +339,8 @@ def build_encoder_backbone(
     extract_submodel: Optional[str] = None,
     num_labels: Optional[int] = None,
     temperature: Optional[float] = None,
-    is_causal: bool | None = None,
     loaded_config: PretrainedConfig | None = None,
+    is_causal: bool | None = None,
     **hf_kwargs,
 ) -> PreTrainedModel:
     """Build an encoder backbone from a pretrained checkpoint.
@@ -368,8 +368,8 @@ def build_encoder_backbone(
             (e.g. ``"language_model"`` to extract the text backbone from a VLM).
         num_labels: Number of labels for reranking/classification backbones.
         temperature: Optional retrieval score temperature for custom retrieval backbones.
-        is_causal: Whether an embedding backbone uses causal self-attention.
         loaded_config: A previously loaded config used to keep model and metadata resolution on the same revision.
+        is_causal: Whether an embedding backbone uses causal self-attention.
         **hf_kwargs: Extra keyword arguments forwarded to ``from_pretrained``.
 
     Returns:
@@ -583,8 +583,8 @@ class BiEncoderModel(nn.Module):
         l2_normalize: bool | None = None,
         do_distributed_inbatch_negative: bool = False,
         detach_distributed_inbatch_negatives: bool = True,
-        is_causal: bool | None = None,
         trust_remote_code: bool = False,
+        is_causal: bool | None = None,
         **hf_kwargs,
     ):
         """Build bi-encoder model from a pretrained backbone."""

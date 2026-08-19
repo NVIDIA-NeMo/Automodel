@@ -42,19 +42,12 @@ class Ministral3BidirectionalConfig(Ministral3Config):
 
 
 class Ministral3BidirectionalModel(Ministral3Model):
-    """
-    Ministral3Model modified to use bidirectional (non-causal) attention.
+    """Legacy Ministral3 retrieval model with configurable attention.
 
     This class is not selected automatically for standard ``ministral3`` embedding
-    checkpoints. It remains registered for explicit and legacy use.
-
-    In causal Ministral3, each token can only attend to previous tokens (causal
-    attention). This model removes that restriction, allowing each token to attend
-    to all tokens in the sequence, which is useful for embedding tasks.
-
-    The key modifications are:
-        1. Setting is_causal=False on all attention layers
-        2. Using a bidirectional attention mask instead of causal mask
+    checkpoints. It remains registered for explicit and legacy use, defaults to
+    bidirectional attention, and delegates to the Hugging Face causal path when
+    ``config.is_causal`` is true.
 
     Loading a Mistral3 VLM checkpoint (e.g. ``mistralai/Ministral-3-3B-Base-2512``
     or ``mistralai/Ministral-3-3B-Instruct-2512``) requires extracting the language

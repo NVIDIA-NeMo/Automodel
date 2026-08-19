@@ -79,12 +79,10 @@ class LlamaBidirectionalConfig(LlamaConfig):
 
 
 class LlamaBidirectionalModel(LlamaModel):
-    """
-    Llama Model with bidirectional attention.
+    """Legacy Llama retrieval model with configurable attention.
 
-    This model removes causal masking from all attention layers, allowing tokens
-    to attend to all other tokens in the sequence. This is useful for embedding
-    and retrieval tasks where bidirectional context is beneficial.
+    The model defaults to bidirectional attention for embedding and retrieval
+    workloads. Setting ``config.is_causal`` enables standard causal attention.
 
     The model is auto-discovered by ModelRegistry via the ModelClass export,
     enabling it to be loaded via NeMoAutoModelBiEncoder.from_pretrained().

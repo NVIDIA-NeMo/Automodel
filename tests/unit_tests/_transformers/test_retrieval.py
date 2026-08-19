@@ -588,6 +588,59 @@ def test_bi_encoder_build_forwards_native_hf_kwargs_to_config_and_backbone(monke
     )
 
 
+def test_build_encoder_backbone_preserves_positional_loaded_config(monkeypatch):
+    """Adding attention policy does not reinterpret the existing loaded-config position."""
+    from nemo_automodel._transformers import retrieval
+
+    config = PretrainedConfig()
+    config.model_type = "test"
+    backbone = nn.Module()
+    backbone.config = config
+    auto_config_from_pretrained = MagicMock(return_value=config)
+    auto_model_from_pretrained = MagicMock(return_value=backbone)
+    monkeypatch.setattr(retrieval.AutoConfig, "from_pretrained", auto_config_from_pretrained)
+    monkeypatch.setattr(retrieval.AutoModel, "from_pretrained", auto_model_from_pretrained)
+
+    result = retrieval.build_encoder_backbone(
+        "org/model",
+        "embedding",
+        False,
+        None,
+        None,
+        None,
+        None,
+        config,
+    )
+
+    assert result is backbone
+    assert result.config.is_causal is False
+    auto_model_from_pretrained.assert_called_once_with("org/model", trust_remote_code=False)
+
+
+def test_bi_encoder_build_preserves_positional_trust_remote_code(monkeypatch):
+    """Adding attention policy does not reinterpret the existing remote-code position."""
+    from nemo_automodel._transformers import retrieval
+
+    config = PretrainedConfig()
+    config.model_type = "test"
+    backbone = MagicMock(spec=nn.Module)
+    backbone.config = config
+    backbone.main_input_name = "input_ids"
+    backbone.forward = MagicMock()
+    auto_config_from_pretrained = MagicMock(return_value=config)
+    build_encoder_backbone = MagicMock(return_value=backbone)
+    monkeypatch.setattr(retrieval.AutoConfig, "from_pretrained", auto_config_from_pretrained)
+    monkeypatch.setattr(retrieval, "build_encoder_backbone", build_encoder_backbone)
+    monkeypatch.setattr(retrieval, "_load_sentence_transformer_wrapper_options", MagicMock(return_value=None))
+    monkeypatch.setattr(retrieval, "_resolve_cached_source_model_path", MagicMock(return_value=None))
+
+    retrieval.BiEncoderModel.build("org/model", None, None, None, False, True, True)
+
+    auto_config_from_pretrained.assert_called_once_with("org/model", trust_remote_code=True)
+    assert build_encoder_backbone.call_args.kwargs["trust_remote_code"] is True
+    assert build_encoder_backbone.call_args.kwargs["is_causal"] is False
+
+
 @pytest.mark.parametrize("pooling", ["weighted_avg", "colbert", "multi_vector"])
 def test_bi_encoder_skips_standard_export_for_unrepresentable_pooling(pooling, tmp_path):
     from nemo_automodel._transformers import retrieval
