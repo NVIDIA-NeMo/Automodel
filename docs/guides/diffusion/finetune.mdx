@@ -299,7 +299,7 @@ When a single node does not provide enough GPUs or memory for your workload, you
 
 The main change is in the `fsdp` section. Set `dp_size` to the **total number of GPUs across all nodes**, and optionally increase `dp_replicate_size` for gradient replication across nodes.
 
-For example, to train on 2 nodes with 8 GPUs each (16 GPUs total):
+For example, to train on two nodes with eight GPUs each (16 GPUs total):
 
 ```yaml
 fsdp:
