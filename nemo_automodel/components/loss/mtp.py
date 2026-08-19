@@ -12,8 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Optional
+from typing import Literal, Optional, overload
 
 import torch
 import torch.distributed as dist
@@ -29,21 +30,97 @@ from nemo_automodel.components.loss.utils import (
 from nemo_automodel.components.models.common.mtp import get_mtp_loss_scaling_factor, roll_tensor
 
 
+@dataclass(frozen=True)
+class MTPLossOutput:
+    """Aggregate MTP loss and its per-depth components.
+
+    Attributes:
+        loss: Scalar loss tensor after applying ``scaling_factor / num_depths``.
+        per_depth_losses: Scalar loss tensor for each MTP depth before applying
+            ``scaling_factor / num_depths``. The tensors retain their autograd graphs.
+    """
+
+    loss: torch.Tensor
+    per_depth_losses: list[torch.Tensor]
+
+
+@overload
 def calculate_mtp_loss(
-    loss_fn,
+    loss_fn: nn.Module,
     *,
     mtp_per_depth_h: list[torch.Tensor] | None = None,
     mtp_per_depth_logits: list[torch.Tensor] | None = None,
+    mtp_per_depth_targets: Sequence[torch.Tensor] | None = None,
     labels: torch.Tensor,
     model: nn.Module,
     scaling_factor: float = 0.1,
-    num_label_tokens: Optional[int] = None,
+    num_label_tokens: int | None = None,
     ignore_index: int = -100,
-    cu_seqlens: Optional[torch.Tensor] = None,
-    seq_idx: Optional[torch.Tensor] = None,
-    lm_weight: Optional[torch.Tensor] = None,
+    cu_seqlens: torch.Tensor | None = None,
+    seq_idx: torch.Tensor | None = None,
+    lm_weight: torch.Tensor | None = None,
     grad_reduce_group: dist.ProcessGroup | None = None,
-) -> torch.Tensor:
+    return_per_depth: Literal[False] = False,
+) -> torch.Tensor: ...
+
+
+@overload
+def calculate_mtp_loss(
+    loss_fn: nn.Module,
+    *,
+    mtp_per_depth_h: list[torch.Tensor] | None = None,
+    mtp_per_depth_logits: list[torch.Tensor] | None = None,
+    mtp_per_depth_targets: Sequence[torch.Tensor] | None = None,
+    labels: torch.Tensor,
+    model: nn.Module,
+    scaling_factor: float = 0.1,
+    num_label_tokens: int | None = None,
+    ignore_index: int = -100,
+    cu_seqlens: torch.Tensor | None = None,
+    seq_idx: torch.Tensor | None = None,
+    lm_weight: torch.Tensor | None = None,
+    grad_reduce_group: dist.ProcessGroup | None = None,
+    return_per_depth: Literal[True],
+) -> MTPLossOutput: ...
+
+
+@overload
+def calculate_mtp_loss(
+    loss_fn: nn.Module,
+    *,
+    mtp_per_depth_h: list[torch.Tensor] | None = None,
+    mtp_per_depth_logits: list[torch.Tensor] | None = None,
+    mtp_per_depth_targets: Sequence[torch.Tensor] | None = None,
+    labels: torch.Tensor,
+    model: nn.Module,
+    scaling_factor: float = 0.1,
+    num_label_tokens: int | None = None,
+    ignore_index: int = -100,
+    cu_seqlens: torch.Tensor | None = None,
+    seq_idx: torch.Tensor | None = None,
+    lm_weight: torch.Tensor | None = None,
+    grad_reduce_group: dist.ProcessGroup | None = None,
+    return_per_depth: bool,
+) -> torch.Tensor | MTPLossOutput: ...
+
+
+def calculate_mtp_loss(
+    loss_fn: nn.Module,
+    *,
+    mtp_per_depth_h: list[torch.Tensor] | None = None,
+    mtp_per_depth_logits: list[torch.Tensor] | None = None,
+    mtp_per_depth_targets: Sequence[torch.Tensor] | None = None,
+    labels: torch.Tensor,
+    model: nn.Module,
+    scaling_factor: float = 0.1,
+    num_label_tokens: int | None = None,
+    ignore_index: int = -100,
+    cu_seqlens: torch.Tensor | None = None,
+    seq_idx: torch.Tensor | None = None,
+    lm_weight: torch.Tensor | None = None,
+    grad_reduce_group: dist.ProcessGroup | None = None,
+    return_per_depth: bool = False,
+) -> torch.Tensor | MTPLossOutput:
     """Compute the DeepSeek-V3 Multi-Token Prediction auxiliary loss.
 
     Each depth's CE is dispatched through :func:`calculate_loss` with the
@@ -53,14 +130,25 @@ def calculate_mtp_loss(
     Args:
         loss_fn: Configured per-token loss class (same instance the main
             path uses).
-        mtp_per_depth_h: Per-depth hidden states from the model's MTP head,
-            one ``[B, S, H]`` tensor per depth.
-        labels: Original (unshifted) labels.
+        mtp_per_depth_h: Per-depth hidden-state tensors of shape
+            ``[batch, sequence, hidden]``, or ``[1, tokens, hidden]`` for a
+            flattened THD-packed stream.
+        mtp_per_depth_logits: Per-depth logit tensors of shape
+            ``[batch, sequence, vocab]``, or ``[1, tokens, vocab]`` for a
+            flattened THD-packed stream.
+        mtp_per_depth_targets: Optional precomputed target tensors, one per
+            MTP depth, with the same local shape and token layout as ``labels``.
+            Context-parallel callers must shift and boundary-mask them in global
+            sequence order before applying the model input shard. These targets
+            are authoritative: this function cannot infer or repair global
+            packed-sequence boundaries from a rank-local CP shard.
+        labels: Original unshifted label tensor of shape ``[batch, sequence]``
+            or ``[tokens]`` for a flattened THD-packed stream.
         model: The wrapped model; used to fetch the shared LM head when the
             loss class needs materialized logits (non-FusedLinearCE path).
         scaling_factor: Coefficient applied to the summed per-depth CE.
-        num_label_tokens: Total non-ignore label tokens (forwarded to the
-            base loss for sum-reduction normalization).
+        num_label_tokens: Total non-ignore label-token count used for
+            sum-reduction normalization.
         ignore_index: Label value masked out of the CE loss for the trailing
             ``k+1`` rolled positions at depth ``k``.
         cu_seqlens: Optional cumulative sequence lengths ``[num_seqs+1]``
@@ -71,19 +159,28 @@ def calculate_mtp_loss(
             Equality classes are what matter; absolute values can be any
             ints. Takes precedence over ``cu_seqlens``. Used to mask label
             rolls whose source position lies in a different sub-sequence.
-        lm_weight: Optional caller-materialized LM-head weight. Supplying this
-            lets the main loss and all MTP depths share one DTensor
+        lm_weight: Optional LM-head weight tensor of shape ``[vocab, hidden]``.
+            Supplying it lets the main loss and all MTP depths share one DTensor
             ``full_tensor()`` gather on the FusedLinearCrossEntropy path.
         grad_reduce_group: Group that contributes independent loss shards when
             the shared LM-head weight is a DTensor.
+        return_per_depth: Return the aggregate loss together with the unscaled
+            loss for each MTP depth. Defaults to ``False`` to preserve the
+            scalar return expected by existing callers.
 
     Returns:
-        Scalar MTP loss with autograd graph.
+        Scalar MTP loss tensor. When ``return_per_depth=True``, returns an
+        :class:`MTPLossOutput` containing the scalar aggregate and scalar
+        per-depth losses. All returned tensors retain their autograd graphs.
     """
-    if (mtp_per_depth_h is None) == (mtp_per_depth_logits is None):
+    if mtp_per_depth_logits is not None:
+        if mtp_per_depth_h is not None:
+            raise ValueError("Provide exactly one of mtp_per_depth_h or mtp_per_depth_logits")
+        mtp_outputs = mtp_per_depth_logits
+    elif mtp_per_depth_h is not None:
+        mtp_outputs = mtp_per_depth_h
+    else:
         raise ValueError("Provide exactly one of mtp_per_depth_h or mtp_per_depth_logits")
-
-    mtp_outputs = mtp_per_depth_logits if mtp_per_depth_logits is not None else mtp_per_depth_h
 
     # Reconcile per-depth output and label dims for the THD-packed non-PP path:
     # the model unsqueezes outputs from ``[T, *]`` back to ``[1, T, *]`` (model.py
@@ -95,8 +192,23 @@ def calculate_mtp_loss(
         mtp_outputs = [h.squeeze(0) if (h.dim() == 3 and h.shape[0] == 1) else h for h in mtp_outputs]
 
     D = len(mtp_outputs)
+    if mtp_per_depth_targets is not None:
+        if cu_seqlens is not None or seq_idx is not None:
+            raise ValueError("mtp_per_depth_targets cannot be combined with cu_seqlens or seq_idx")
+        if len(mtp_per_depth_targets) != D:
+            raise ValueError(
+                f"Expected {D} mtp_per_depth_targets for {D} MTP outputs, got {len(mtp_per_depth_targets)}"
+            )
+        for depth, targets in enumerate(mtp_per_depth_targets, start=1):
+            if targets.shape != labels.shape:
+                raise ValueError(
+                    f"MTP depth {depth} target shape {tuple(targets.shape)} does not match "
+                    f"labels shape {tuple(labels.shape)}"
+                )
+
     cur_labels = labels
     total = mtp_outputs[0].new_zeros(())
+    per_depth_losses = []
 
     # Materialize the (possibly DTensor-sharded) LM head ONCE for all depths
     # under FusedLinearCrossEntropy. calculate_loss would otherwise re-gather it
@@ -139,18 +251,21 @@ def calculate_mtp_loss(
             )
 
     for k, mtp_output in enumerate(mtp_outputs):
-        cur_labels = roll_tensor(cur_labels, shifts=-1, dim=-1)
-        masked = cur_labels.clone()
-        n_invalid = min(k + 1, masked.shape[-1])
-        masked[..., -n_invalid:] = ignore_index
+        if mtp_per_depth_targets is None:
+            cur_labels = roll_tensor(cur_labels, shifts=-1, dim=-1)
+            masked = cur_labels.clone()
+            n_invalid = min(k + 1, masked.shape[-1])
+            masked[..., -n_invalid:] = ignore_index
 
-        # Mask labels whose rolled source (position t+k+1) lives in a
-        # different sub-seq than position t — predictions across sub-seq
-        # boundaries are nonsensical.
-        if seq_idx is not None:
-            rolled_seq_idx = roll_tensor(seq_idx, shifts=-(k + 1), dim=-1)
-            cross_seq = rolled_seq_idx != seq_idx
-            masked = torch.where(cross_seq, torch.full_like(masked, ignore_index), masked)
+            # Mask labels whose rolled source (position t+k+1) lives in a
+            # different sub-seq than position t — predictions across sub-seq
+            # boundaries are nonsensical.
+            if seq_idx is not None:
+                rolled_seq_idx = roll_tensor(seq_idx, shifts=-(k + 1), dim=-1)
+                cross_seq = rolled_seq_idx != seq_idx
+                masked = torch.where(cross_seq, torch.full_like(masked, ignore_index), masked)
+        else:
+            masked = mtp_per_depth_targets[k]
 
         if mtp_per_depth_logits is not None:
             if isinstance(loss_fn, FusedLinearCrossEntropy):
@@ -183,9 +298,13 @@ def calculate_mtp_loss(
                 model=model,
                 num_label_tokens=num_label_tokens,
             )
+        per_depth_losses.append(depth_loss)
         total = total + depth_loss
 
-    return total * (scaling_factor / D)
+    total = total * (scaling_factor / D)
+    if return_per_depth:
+        return MTPLossOutput(loss=total, per_depth_losses=per_depth_losses)
+    return total
 
 
 class PipelineCausalLMLoss(nn.Module):
