@@ -198,10 +198,18 @@ class KimiK3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
         """Convert a native PEFT target-module path to the checkpoint layout.
 
         adapter_config.json's target_modules must name modules that exist in the
-        HF model (PEFT suffix-matches them), so the per-expert entries need the
-        same w1/w2/w3 + block_sparse_moe renames the state-dict keys get. Paths
-        that aren't per-expert projections pass through unchanged.
+        HF model (PEFT suffix-matches them), so entries need the same renames the
+        state-dict keys get: per-expert projections become w1/w2/w3 under
+        block_sparse_moe, and the other MoE-owned children (shared_experts,
+        routed_expert_*, gate) move from mlp. to block_sparse_moe. as well.
+        Dense-layer mlp paths pass through unchanged.
         """
+        # Same segment renames as _native_moe_key_to_hf, but target-module paths
+        # can END at the segment (e.g. ...mlp.routed_expert_up_proj), which the
+        # key-oriented trailing-dot replace never matches.
+        for segment in _MOE_CHILD_SEGMENTS:
+            seg = re.escape(segment.rstrip("."))
+            name = re.sub(rf"\.mlp\.{seg}(?=\.|$)", f".block_sparse_moe.{segment.rstrip('.')}", name)
         match = re.match(
             r"(?P<prefix>.*?layers\.\d+)\.mlp\.experts\.(?P<expert>\d+)\."
             r"(?P<proj>gate_proj|up_proj|down_proj)$",

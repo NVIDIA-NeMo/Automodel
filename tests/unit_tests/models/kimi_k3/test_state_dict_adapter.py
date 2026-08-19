@@ -129,11 +129,25 @@ def test_peft_target_modules_get_hf_renames():
         adapter.map_peft_target_module_to_hf("model.layers.12.mlp.experts.671.down_proj")
         == "model.layers.12.block_sparse_moe.experts.671.w2"
     )
-    # non-expert entries pass through untouched
+    # the other MoE-owned children move to block_sparse_moe too — found as the
+    # 15 leftover unresolved entries in the real-run validation
+    assert (
+        adapter.map_peft_target_module_to_hf("model.layers.5.mlp.shared_experts.gate_proj")
+        == "model.layers.5.block_sparse_moe.shared_experts.gate_proj"
+    )
+    assert (
+        adapter.map_peft_target_module_to_hf("model.layers.5.mlp.routed_expert_up_proj")
+        == "model.layers.5.block_sparse_moe.routed_expert_up_proj"
+    )
+    assert (
+        adapter.map_peft_target_module_to_hf("model.layers.5.mlp.routed_expert_down_proj")
+        == "model.layers.5.block_sparse_moe.routed_expert_down_proj"
+    )
+    # non-MoE entries pass through untouched
     for name in (
         "model.layers.5.self_attn.q_proj",
         "model.layers.5.mlp.gate_proj",  # dense-layer mlp, not an expert
-        "model.layers.5.mlp.shared_experts.gate_proj",
+        "model.layers.5.mlp.up_proj",
     ):
         assert adapter.map_peft_target_module_to_hf(name) == name
 
