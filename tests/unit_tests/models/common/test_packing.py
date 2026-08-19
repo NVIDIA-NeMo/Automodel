@@ -165,7 +165,7 @@ class TestValidateFlashPackingSupport:
             "transformers.modeling_flash_attention_utils._flash_attention_forward",
             _legacy_flash_attention_forward,
         )
-        with pytest.raises(RuntimeError, match="public varlen FlashAttention kwargs"):
+        with pytest.raises(RuntimeError, match="varlen FlashAttention kwargs"):
             validate_flash_packing_support("flash_attention_2")
 
     def test_accepts_model_with_varkwargs(self):
@@ -211,3 +211,24 @@ class TestValidateFlashPackingSupport:
 
         with pytest.raises(RuntimeError, match="_packed_seq_ids"):
             validate_flash_packing_support("flash_attention_2", model=_BlindModel())
+
+    def test_accepts_model_with_all_four_varlen_kwargs(self):
+        """A forward naming all four cumulative-length kwargs consumes the contract."""
+
+        class _VarlenModel:
+            def forward(self, input_ids, cu_seq_lens_q=None, cu_seq_lens_k=None, max_length_q=None, max_length_k=None):
+                """Names the full varlen kwarg set explicitly."""
+
+        validate_flash_packing_support("flash_attention_2", model=_VarlenModel())  # must not raise
+
+    def test_rejects_model_with_partial_varlen_kwargs(self):
+        """A forward exposing only some varlen kwargs must be rejected: HF needs all four,
+        and filter_forward_kwargs would drop the rest, so the packing would silently break.
+        """
+
+        class _PartialModel:
+            def forward(self, input_ids, cu_seq_lens_q=None):
+                """Names one of four varlen kwargs; the other three would be dropped."""
+
+        with pytest.raises(RuntimeError, match="all four varlen"):
+            validate_flash_packing_support("flash_attention_2", model=_PartialModel())

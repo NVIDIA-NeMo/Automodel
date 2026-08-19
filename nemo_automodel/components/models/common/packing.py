@@ -214,20 +214,17 @@ def validate_flash_packing_support(attn_implementation: str = "sdpa", model: tor
         from transformers.modeling_flash_attention_utils import _flash_attention_forward
     except (ImportError, AttributeError) as exc:
         raise RuntimeError(
-            "Cannot enable flash-attention neat packing because "
-            f"transformers.modeling_flash_attention_utils._flash_attention_forward is unavailable in "
-            f"transformers {transformers.__version__}. Refusing to continue because the packed "
-            "cumulative sequence lengths would be dropped, enabling cross-document attention."
+            "Cannot enable flash-attention neat packing: "
+            "transformers.modeling_flash_attention_utils._flash_attention_forward is unavailable in "
+            f"transformers {transformers.__version__}. Upgrade transformers or use sdpa/eager packing."
         ) from exc
 
     available = set(inspect.signature(_flash_attention_forward).parameters)
     missing = set(_PACKED_VARLEN_KWARGS) - available
     if missing:
         raise RuntimeError(
-            "Cannot enable flash-attention neat packing because transformers "
-            f"{transformers.__version__} does not support the public varlen FlashAttention kwargs "
-            f"{sorted(missing)}. Upgrade transformers or use sdpa/eager packing. Refusing to continue "
-            "because dropping the cumulative sequence lengths would enable cross-document attention."
+            f"Cannot enable flash-attention neat packing: transformers {transformers.__version__} lacks "
+            f"the varlen FlashAttention kwargs {sorted(missing)}. Upgrade transformers or use sdpa/eager packing."
         )
 
     _validate_model_consumes_packed_contract(model)
@@ -237,10 +234,9 @@ def _validate_model_consumes_packed_contract(model: torch.nn.Module | None) -> N
     """Raise if ``model``'s ``forward`` cannot receive the typed packing contract.
 
     A model consumes the contract when its ``forward`` accepts ``**kwargs`` (HF
-    models thread ``FlashAttentionKwargs`` this way), names an explicit varlen
-    parameter, or names ``_packed_seq_ids`` (the custom-model document map).
-    Signatures that cannot be introspected are treated as permissive so this
-    check never rejects a valid model it simply cannot read.
+    models thread ``FlashAttentionKwargs`` this way), names ``_packed_seq_ids``
+    (the custom-model document map), or names all four varlen kwargs explicitly.
+    A ``forward`` whose signature cannot be introspected is rejected.
 
     Args:
         model: Already-built model, or a DDP wrapper exposing ``.module``.
@@ -253,15 +249,22 @@ def _validate_model_consumes_packed_contract(model: torch.nn.Module | None) -> N
         return
     try:
         params = inspect.signature(forward).parameters
-    except (TypeError, ValueError):
-        return
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"Cannot introspect {type(target).__name__}.forward to verify it consumes packed-sequence "
+            "metadata; use sdpa/eager packing or expose **kwargs on the model forward."
+        ) from exc
     if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
         return
-    if set(params) & {*_PACKED_VARLEN_KWARGS, "_packed_seq_ids"}:
+    if "_packed_seq_ids" in params:
+        return
+    # Transformers enters its varlen path only when all four cumulative-length
+    # kwargs are present; a forward exposing only some of them would have the rest
+    # dropped by ``filter_forward_kwargs``, so require the full set here.
+    if set(_PACKED_VARLEN_KWARGS).issubset(params):
         return
     raise RuntimeError(
-        f"Cannot enable flash-attention neat packing because {type(target).__name__}.forward accepts "
-        "neither **kwargs, the varlen FlashAttention kwargs, nor _packed_seq_ids, so the typed packing "
-        "metadata would be silently dropped and enable cross-document attention. Add **kwargs to the "
+        f"Cannot enable flash-attention neat packing: {type(target).__name__}.forward accepts neither "
+        "**kwargs, all four varlen FlashAttention kwargs, nor _packed_seq_ids. Add **kwargs to the "
         "model forward or use sdpa/eager packing."
     )
