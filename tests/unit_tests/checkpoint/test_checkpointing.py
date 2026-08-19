@@ -1532,9 +1532,7 @@ class TestLoadModelCustomModelGuard:
     @patch("nemo_automodel.components.checkpoint.checkpointing._is_safetensors_checkpoint", return_value=True)
     @patch("nemo_automodel.components.checkpoint.checkpointing._load_hf_checkpoint_preserving_dtype")
     @patch("nemo_automodel.components.checkpoint.checkpointing._load_full_state_dict_into_model")
-    def test_single_device_custom_model_uses_dcp(
-        self, mock_load_full, mock_load_hf, mock_is_st
-    ):
+    def test_single_device_custom_model_uses_dcp(self, mock_load_full, mock_load_hf, mock_is_st):
         """A single-device custom model uses DCP instead of a full host state dict."""
         checkpointer = self._make_checkpointer()
 

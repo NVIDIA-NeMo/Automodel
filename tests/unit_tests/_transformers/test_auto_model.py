@@ -201,6 +201,66 @@ class TestFromPretrainedDeviceMesh:
         mock_sdpa.assert_called_once_with(None, device_mesh, True)
         assert mock_build.call_args.kwargs["mesh"].moe_mesh is moe_mesh
 
+    def test_from_pretrained_disables_rope_fusion_for_packed_sequence_backend_dict(self):
+        backend = {"attn": "sdpa", "rope_fusion": True}
+        sentinel_model = object()
+
+        with (
+            patch("torch.cuda.current_device", return_value=0),
+            patch("nemo_automodel._transformers.auto_model.instantiate_infrastructure") as mock_infra,
+            patch("nemo_automodel._transformers.auto_model.get_hf_config", return_value=MagicMock()),
+            patch("nemo_automodel._transformers.auto_model.get_is_hf_model", return_value=True),
+            patch("nemo_automodel._transformers.auto_model.resolve_sdpa_method", return_value=None),
+            patch.object(NeMoAutoModelForCausalLM, "_build_model", return_value=sentinel_model) as mock_build,
+        ):
+            mock_infra.return_value = (None, None, None, None)
+
+            result = NeMoAutoModelForCausalLM.from_pretrained(
+                "test-model",
+                has_packed_sequence=True,
+                backend=backend,
+            )
+
+        assert result is sentinel_model
+        assert mock_build.call_args.kwargs["backend"]["rope_fusion"] is False
+        assert backend["rope_fusion"] is True
+
+    def test_from_pretrained_injects_backend_for_packed_sequence_custom_model(self):
+        sentinel_model = object()
+
+        with (
+            patch("torch.cuda.current_device", return_value=0),
+            patch("nemo_automodel._transformers.auto_model.instantiate_infrastructure") as mock_infra,
+            patch("nemo_automodel._transformers.auto_model.get_hf_config", return_value=MagicMock()),
+            patch("nemo_automodel._transformers.auto_model.get_is_hf_model", return_value=False),
+            patch("nemo_automodel._transformers.auto_model.resolve_sdpa_method", return_value=None),
+            patch.object(NeMoAutoModelForCausalLM, "_build_model", return_value=sentinel_model) as mock_build,
+        ):
+            mock_infra.return_value = (None, None, None, None)
+
+            result = NeMoAutoModelForCausalLM.from_pretrained("test-model", has_packed_sequence=True)
+
+        assert result is sentinel_model
+        assert mock_build.call_args.kwargs["backend"] == {"rope_fusion": False}
+
+    def test_from_pretrained_does_not_inject_backend_for_packed_sequence_hf_model(self):
+        sentinel_model = object()
+
+        with (
+            patch("torch.cuda.current_device", return_value=0),
+            patch("nemo_automodel._transformers.auto_model.instantiate_infrastructure") as mock_infra,
+            patch("nemo_automodel._transformers.auto_model.get_hf_config", return_value=MagicMock()),
+            patch("nemo_automodel._transformers.auto_model.get_is_hf_model", return_value=True),
+            patch("nemo_automodel._transformers.auto_model.resolve_sdpa_method", return_value=None),
+            patch.object(NeMoAutoModelForCausalLM, "_build_model", return_value=sentinel_model) as mock_build,
+        ):
+            mock_infra.return_value = (None, None, None, None)
+
+            result = NeMoAutoModelForCausalLM.from_pretrained("test-model", has_packed_sequence=True)
+
+        assert result is sentinel_model
+        assert "backend" not in mock_build.call_args.kwargs
+
     def test_from_pretrained_rejects_distributed_setup_with_device_mesh(self):
         device_mesh = _FakeMesh({MeshAxisName.DP_SHARD: 1, MeshAxisName.CP: 1, MeshAxisName.TP: 1})
         distributed_setup = DistributedSetup(mesh_context=MeshContext())

@@ -47,7 +47,9 @@ Conventions
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -60,7 +62,34 @@ from nemo_automodel.components.datasets.utils import (
 
 CROSS_ENTROPY_IGNORE_IDX = -100
 
-__all__ = ["Datum", "collate_datums"]
+__all__ = ["Datum", "PackedBatch", "collate_datums"]
+
+
+@dataclass
+class PackedBatch:
+    """An already-packed batch — the pass-through door for frameworks that pack.
+
+    Frameworks like verl produce a packed/THD batch themselves (flat tokens +
+    ``cu_seqlens``) and own their own loss normalization. Rather than make them
+    un-pack into :class:`Datum` only for the Engine to re-pack, they hand the
+    Engine a ``PackedBatch`` and a scalar-returning loss closure. The Engine
+    still provides the forward + per-datum :class:`ModelOutput` extraction +
+    microbatch lifecycle + backward; the caller owns packing and normalization.
+
+    Args:
+        model_inputs: kwargs passed straight to ``model(**model_inputs)`` — e.g.
+            ``input_ids`` (``[1, total]`` THD or ``[B, T]``), ``position_ids``,
+            ``cu_seqlens``/``attention_mask``. The caller is responsible for the
+            layout (including any CP sharding).
+        seq_lens: per-sequence lengths used to split flat per-token model
+            outputs back into per-datum tensors (via ``split_per_datum``).
+        targets: optional flat ``[total]`` next-token targets used to extract
+            per-token logprobs. ``None`` skips logprob extraction.
+    """
+
+    model_inputs: dict[str, Any]
+    seq_lens: Sequence[int]
+    targets: torch.Tensor | None = None
 
 
 @dataclass
@@ -128,6 +157,7 @@ def collate_datums(
     *,
     packed: bool = False,
     pad_seq_len_divisible: int | None = None,
+    pack_pad_to_multiple: int = 1,
     ignore_index: int = CROSS_ENTROPY_IGNORE_IDX,
 ) -> dict[str, torch.Tensor]:
     """Collate a list of :class:`Datum` into a model-ready batch dict.
@@ -170,8 +200,11 @@ def collate_datums(
     features = [datums[i].to_features(ignore_index=ignore_index) for i in range(len(datums))]
     if packed:
         # Concatenate all datums into one pre-packed record and let the
-        # canonical THD collater produce the [1, total] schema.
-        batch = packed_sequence_thd_collater([pack_features_for_thd(features, ignore_index=ignore_index)])
+        # canonical THD collater produce the [1, total] schema. Under CP the
+        # total is rounded up to 2*cp_size with a trailing pad (real per-datum
+        # lengths are unchanged).
+        record = pack_features_for_thd(features, ignore_index=ignore_index, pad_to_multiple=pack_pad_to_multiple)
+        batch = packed_sequence_thd_collater([record])
     else:
         batch = default_collater([dict(f) for f in features], pad_seq_len_divisible)
 

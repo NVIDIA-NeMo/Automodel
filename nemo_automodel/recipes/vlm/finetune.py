@@ -67,10 +67,9 @@ from nemo_automodel.components.loggers.mlflow_utils import (
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
-from nemo_automodel.components.loss.mtp import calculate_mtp_loss
-from nemo_automodel.components.loss.utils import _get_lm_head_weight, calculate_loss
+from nemo_automodel.components.loss.utils import calculate_loss
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
-from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
+from nemo_automodel.components.training.forward_backward import forward_backward_step
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.utils import (
     count_tail_padding,
@@ -954,61 +953,24 @@ class FinetuneRecipeForVLM(BaseRecipe):
             )
             with sync_ctx, self._cp_vision_frame_sharding_context(), train_ctx():
                 batch = filter_forward_kwargs(model, batch)
-                if isinstance(self.loss_fn, FusedLinearCrossEntropy):
-                    # use num_logits_to_keep to avoid full logits matrix in memory
-                    out = model(logits_to_keep=1, **batch)
-                    if "hidden_states" not in out:
-                        raise ValueError(
-                            "FusedLinearCrossEntropy requires the model to output hidden states. "
-                            "Set `model.text_config.output_hidden_states=True` in the config."
-                        )
-                else:
-                    out = model(**batch)
-
-                grad_reduce_group = self._get_dp_group(include_cp=True) if is_train else None
-                shared_lm_weight = (
-                    self.loss_fn.materialize_lm_weight(
-                        _get_lm_head_weight(model),
-                        grad_reduce_group=grad_reduce_group,
-                    )
-                    if isinstance(self.loss_fn, FusedLinearCrossEntropy)
+                # The fused-CE LM-head grad reduces over the flattened DP-CP group
+                # during training; other losses (and validation) don't need it.
+                grad_reduce_group = (
+                    self._get_dp_group(include_cp=True)
+                    if is_train and isinstance(self.loss_fn, FusedLinearCrossEntropy)
                     else None
                 )
-                local_loss = calculate_loss(
+                out, local_loss = forward_backward_step(
+                    model,
+                    batch,
+                    labels,
                     self.loss_fn,
-                    logits=getattr(out, "logits", out),
-                    labels=labels,
-                    model=model,
-                    hidden_states=get_final_hidden_states(out),
-                    lm_weight=shared_lm_weight,
-                    grad_reduce_group=grad_reduce_group,
                     num_label_tokens=num_label_tokens,
+                    mtp_cfg=getattr(getattr(self, "cfg", None), "mtp", None),
+                    mtp_per_depth_targets=mtp_per_depth_targets,
+                    cu_seqlens=None if mtp_per_depth_targets is not None else batch.get("cu_seqlens"),
+                    grad_reduce_group=grad_reduce_group,
                 )
-                # DSV4-style MTP loss (from main): triggers when the model emits
-                # ``mtp_per_depth_h`` / ``mtp_per_depth_logits``.
-                mtp_per_depth_h = getattr(out, "mtp_per_depth_h", None)
-                mtp_per_depth_logits = getattr(out, "mtp_per_depth_logits", None)
-                if mtp_per_depth_h is not None or mtp_per_depth_logits is not None:
-                    if _cp_active and mtp_per_depth_targets is None:
-                        raise RuntimeError("MTP with context parallelism requires globally prepared per-depth targets")
-                    mtp_cfg = self.cfg.mtp
-                    scaling_factor = (
-                        mtp_cfg.scaling_factor if mtp_cfg.scaling_factor is not None else out.mtp_loss_scaling_factor
-                    )
-                    local_loss = local_loss + calculate_mtp_loss(
-                        self.loss_fn,
-                        mtp_per_depth_h=mtp_per_depth_h,
-                        mtp_per_depth_logits=mtp_per_depth_logits,
-                        mtp_per_depth_targets=mtp_per_depth_targets,
-                        labels=labels,
-                        model=model,
-                        scaling_factor=scaling_factor,
-                        num_label_tokens=num_label_tokens,
-                        ignore_index=mtp_cfg.ignore_index,
-                        lm_weight=shared_lm_weight,
-                        grad_reduce_group=grad_reduce_group,
-                        cu_seqlens=None if mtp_per_depth_targets is not None else batch.get("cu_seqlens"),
-                    )
 
                 # Joint base + drafter co-training (Gemma4WithDrafter and
                 # similar): detect by presence of ``drafter_logits`` on the
@@ -1208,17 +1170,14 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 labels = batch.pop("labels")
                 with self._cp_vision_frame_sharding_context(), train_ctx():
                     batch = filter_forward_kwargs(self.model_parts[0], batch)
-                    if isinstance(self.loss_fn, FusedLinearCrossEntropy):
-                        out = self.model_parts[0](logits_to_keep=1, **batch)
-                    else:
-                        out = self.model_parts[0](**batch)
-                    local_loss = calculate_loss(
+                    out, local_loss = forward_backward_step(
+                        self.model_parts[0],
+                        batch,
+                        labels,
                         self.loss_fn,
-                        logits=getattr(out, "logits", out),
-                        labels=labels,
-                        model=self.model_parts[0],
-                        hidden_states=get_final_hidden_states(out),
                         num_label_tokens=num_label_tokens,
+                        mtp_cfg=getattr(getattr(self, "cfg", None), "mtp", None),
+                        cu_seqlens=batch.get("cu_seqlens"),
                     )
                     # Mirror training: include the drafter term so validation
                     # reflects drafter drift, not just the base.

@@ -24,6 +24,7 @@ Heavy-lifting helpers live in sibling modules:
 * ``infrastructure`` -- MeshContext, sharding, PEFT/quant application
 """
 
+import copy
 import gc
 import inspect
 import logging
@@ -128,6 +129,22 @@ def _reject_separate_distributed_kwargs(kwargs: dict) -> None:
             "Distributed settings must be passed with distributed_setup; "
             f"separate distributed kwargs are not accepted: {provided}"
         )
+
+
+def _disable_fused_rope_for_packed_sequence(kwargs: dict, *, inject_default_backend: bool) -> None:
+    if not kwargs.get("has_packed_sequence", False):
+        return
+
+    backend = kwargs.get("backend", None)
+    if backend is None:
+        if inject_default_backend:
+            kwargs["backend"] = {"rope_fusion": False}
+    elif isinstance(backend, dict):
+        kwargs["backend"] = {**backend, "rope_fusion": False}
+    elif hasattr(backend, "rope_fusion"):
+        backend_copy = copy.copy(backend)
+        backend_copy.rope_fusion = False
+        kwargs["backend"] = backend_copy
 
 
 def _resolve_distributed_setup(
@@ -751,6 +768,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             else:
                 raise
         is_hf_model = get_is_hf_model(hf_config, force_hf)
+        _disable_fused_rope_for_packed_sequence(kwargs, inject_default_backend=not is_hf_model)
 
         # Layer 2: reject loading a checkpoint with tie_word_embeddings flipped from the
         # value it was saved with (the class-level TieSupport policy cannot catch this).
@@ -860,6 +878,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                     raise
         _consume_config_overrides(config, kwargs)
         is_hf_model = get_is_hf_model(config, force_hf)
+        _disable_fused_rope_for_packed_sequence(kwargs, inject_default_backend=not is_hf_model)
 
         sdpa_method = resolve_sdpa_method(sdpa_method, mesh.device_mesh, activation_checkpointing)
 

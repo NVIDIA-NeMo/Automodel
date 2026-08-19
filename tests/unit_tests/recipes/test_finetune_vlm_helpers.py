@@ -432,7 +432,7 @@ def test_run_train_step_supports_tensor_outputs(monkeypatch):
     )
 
     calculate_mock = MagicMock(side_effect=fake_calculate_loss)
-    monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.calculate_loss", calculate_mock)
+    monkeypatch.setattr("nemo_automodel.components.training.forward_backward.calculate_loss", calculate_mock)
 
     grad_clip_mock = MagicMock(return_value=2.5)
     monkeypatch.setattr(
@@ -485,7 +485,7 @@ def test_forward_backward_step_routes_thd_batch_through_te(monkeypatch):
     monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.ContextParallelSharder", make_thd_batch)
     monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.get_sync_ctx", lambda *args, **kwargs: nullcontext())
     monkeypatch.setattr(
-        "nemo_automodel.recipes.vlm.finetune.calculate_loss",
+        "nemo_automodel.components.training.forward_backward.calculate_loss",
         lambda *args, **kwargs: torch.tensor(1.0, requires_grad=True),
     )
 
@@ -1474,6 +1474,11 @@ class TestCalculateLoss:
 
             def named_parameters(self, remove_duplicate=False):
                 return [("lm_head.weight", self._lm_head.weight), ("lm_head.bias", self._lm_head.bias)]
+
+            def named_modules(self):
+                # No module is named ``lm_head``, so the lookup must fall back to
+                # the parameter-name search this test exercises.
+                return []
 
         model = ModelWithLmHeadOnly()
 
