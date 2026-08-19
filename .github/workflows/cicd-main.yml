@@ -508,6 +508,21 @@ jobs:
             timeout: 20
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
+          - test-name: L2_DLLM
+            test-folder: dllm
+            timeout: 20
+            runner: ${{ needs.pre-flight.outputs.runner_prefix }}
+            test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
+          - test-name: L2_DSpark
+            test-folder: speculative
+            timeout: 30
+            runner: ${{ needs.pre-flight.outputs.runner_prefix }}
+            test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
+          - test-name: L2_Diffusion
+            test-folder: models/qwen_image_edit
+            timeout: 30
+            runner: ${{ needs.pre-flight.outputs.runner_prefix }}
+            test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
           - test-name: L2_MoE
             test-folder: moe
             timeout: 20
