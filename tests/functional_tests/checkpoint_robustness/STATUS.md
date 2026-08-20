@@ -90,7 +90,8 @@ parameters); they require focused fixes before resume coverage is enabled.
 
 ### Known issues recorded in April 2026
 
-- **MoE resume non-determinism**: DeepEP expert routing causes 3e-2 to 1e-1 loss diff. `--check_resume` disabled for MoE models.
+- **MoE resume non-determinism**: DeepEP expert routing caused 3e-2 to 1e-1 loss diff; resume was disabled for those
+  historical runs.
 - **Mamba hybrid resume non-determinism**: Nano-8B-v1 has 0.62 loss diff on resume. Mamba layers have non-deterministic state.
 - **transformers 5.3 compatibility**: Flash 1B (triton_attention.py), Nano V2 (FSDP model attr), Baichuan (meta tensor).
 - **TP=2 failures**: Gemma 3 (1 KV head), Baichuan (custom layers), Mistral3 (FP8 scalars). Phi-4 TP=2 fixed on main.

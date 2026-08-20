@@ -19,23 +19,33 @@ from ruamel.yaml import YAML
 from tests.ci_tests.utils.generate_ci_tests import generate_job, generate_pipeline
 
 
-def test_example_checkpoint_robustness_configs_do_not_use_legacy_max_kl_thresholds():
-    legacy_keys = {
+def test_example_checkpoint_robustness_configs_do_not_use_removed_fields():
+    removed_keys = {
+        "check_hf_reload",
+        "check_resume",
+        "check_source_load_parity",
+        "cosine_threshold",
+        "hf_cosine_threshold",
         "kl_threshold",
         "hf_kl_threshold",
         "source_load_kl_threshold",
+        "source_load_mean_kl_threshold",
+        "source_load_cosine_threshold",
         "cross_tp_kl_threshold",
+        "no_check_resume",
+        "skip_automodel_logit_parity",
+        "skip_hf_logit_parity",
     }
     violations = []
 
     for config in Path("examples").rglob("*.yaml"):
         recipe = YAML(typ="safe").load(config) or {}
         robustness = (recipe.get("ci") or {}).get("checkpoint_robustness") or {}
-        found = sorted(legacy_keys & robustness.keys())
+        found = sorted(removed_keys & robustness.keys())
         if found:
             violations.append(f"{config}: {', '.join(found)}")
 
-    assert not violations, "Legacy max-KL thresholds remain:\n" + "\n".join(violations)
+    assert not violations, "Removed checkpoint-robustness fields remain:\n" + "\n".join(violations)
 
 
 def test_generate_deepseek_v4_pretrain_nightly_job():
@@ -110,8 +120,7 @@ def test_generate_checkpoint_robustness_process_isolation_derives_phases(tmp_pat
 ci:
   checkpoint_robustness:
     process_isolation: true
-    check_source_load_parity: true
-    no_check_resume: true
+    skip_resume: true
     trust_remote_code: true
     hf_device_map_auto: true
     hf_device_map_max_memory_gib: 55

@@ -219,43 +219,9 @@ def _apply_parity_threshold_overrides(
 def _parity_failures(
     metrics: _ParityMetrics,
     thresholds: _ParityThresholds,
-    *,
-    legacy_max_kl_threshold: float | None = None,
-    legacy_mean_kl_threshold: float | None = None,
-    legacy_cosine_threshold: float | None = None,
 ) -> tuple[str, ...]:
-    """Return failed gates for either a named profile or legacy numeric overrides.
-
-    Existing numeric recipe fields retain their original max/mean/cosine semantics.
-    When none are supplied, the named profile gates mean KL, p95 KL, and cosine
-    similarity while max KL remains diagnostic.
-    """
-    for name, value in (
-        ("legacy_max_kl_threshold", legacy_max_kl_threshold),
-        ("legacy_mean_kl_threshold", legacy_mean_kl_threshold),
-    ):
-        if value is not None and (not math.isfinite(value) or value < 0):
-            raise ValueError(f"{name} must be finite and non-negative, got {value}")
-    if legacy_cosine_threshold is not None and (
-        not math.isfinite(legacy_cosine_threshold) or not -1.0 <= legacy_cosine_threshold <= 1.0
-    ):
-        raise ValueError(f"legacy_cosine_threshold must be finite and between -1 and 1, got {legacy_cosine_threshold}")
-
+    """Return failed mean-KL, p95-KL, and cosine gates for a named profile."""
     failures: list[str] = []
-    using_legacy_thresholds = any(
-        value is not None for value in (legacy_max_kl_threshold, legacy_mean_kl_threshold, legacy_cosine_threshold)
-    )
-    if using_legacy_thresholds:
-        if legacy_max_kl_threshold is not None and metrics.max_kl > legacy_max_kl_threshold:
-            failures.append(f"max KL {metrics.max_kl:.6e} > legacy threshold {legacy_max_kl_threshold:.6e}")
-        if legacy_mean_kl_threshold is not None and metrics.mean_kl > legacy_mean_kl_threshold:
-            failures.append(f"mean KL {metrics.mean_kl:.6e} > legacy threshold {legacy_mean_kl_threshold:.6e}")
-        if legacy_cosine_threshold is not None and metrics.cosine_similarity < legacy_cosine_threshold:
-            failures.append(
-                f"cosine similarity {metrics.cosine_similarity:.8f} < legacy threshold {legacy_cosine_threshold:.8f}"
-            )
-        return tuple(failures)
-
     if metrics.mean_kl > thresholds.mean_kl:
         failures.append(f"mean KL {metrics.mean_kl:.6e} > profile threshold {thresholds.mean_kl:.6e}")
     if metrics.p95_kl > thresholds.p95_kl:

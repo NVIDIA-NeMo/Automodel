@@ -759,8 +759,8 @@ def test_extract_custom_args_accepts_isolated_phase():
 def test_extract_custom_args_enables_core_source_and_resume_checks_by_default():
     custom, remaining = _extract_custom_args(["--other-arg"])
 
-    assert custom["check_source_load_parity"] is True
-    assert custom["check_resume"] is True
+    assert custom["source_load_parity_enabled"] is True
+    assert custom["resume_enabled"] is True
     assert remaining == ["--other-arg"]
 
 
@@ -784,8 +784,8 @@ def test_extract_custom_args_reads_semantic_skips_and_parity_settings(tmp_path):
 
     custom, remaining = _extract_custom_args(["--config", str(config_path)])
 
-    assert custom["check_source_load_parity"] is False
-    assert custom["check_resume"] is False
+    assert custom["source_load_parity_enabled"] is False
+    assert custom["resume_enabled"] is False
     assert custom["skip_source_load_logit_parity"] is True
     assert custom["skip_automodel_reload_logit_parity"] is True
     assert custom["skip_hf_reload_logit_parity"] is True
@@ -798,6 +798,14 @@ def test_extract_custom_args_reads_semantic_skips_and_parity_settings(tmp_path):
     assert remaining == ["--config", str(config_path)]
 
 
+def test_extract_custom_args_rejects_removed_config_fields(tmp_path):
+    config_path = tmp_path / "recipe.yaml"
+    config_path.write_text("ci:\n  checkpoint_robustness:\n    hf_kl_threshold: 0.01\n")
+
+    with pytest.raises(ValueError, match="Removed checkpoint-robustness fields.*hf_kl_threshold"):
+        _extract_custom_args(["--config", str(config_path)])
+
+
 def test_extract_custom_args_accepts_resume_tolerance_profile_and_numeric_override():
     custom, remaining = _extract_custom_args(
         ["--resume_tolerance_profile", "relaxed", "--resume_loss_threshold", "0.02", "--other-arg"]
@@ -805,20 +813,6 @@ def test_extract_custom_args_accepts_resume_tolerance_profile_and_numeric_overri
 
     assert custom["resume_tolerance_profile"] == "relaxed"
     assert custom["resume_loss_threshold"] == "0.02"
-    assert remaining == ["--other-arg"]
-
-
-def test_extract_custom_args_accepts_skip_hf_logit_parity():
-    custom, remaining = _extract_custom_args(["--skip_hf_logit_parity", "--other-arg"])
-
-    assert custom["skip_hf_logit_parity"] is True
-    assert remaining == ["--other-arg"]
-
-
-def test_extract_custom_args_accepts_skip_automodel_logit_parity():
-    custom, remaining = _extract_custom_args(["--skip_automodel_logit_parity", "--other-arg"])
-
-    assert custom["skip_automodel_logit_parity"] is True
     assert remaining == ["--other-arg"]
 
 
@@ -858,7 +852,7 @@ def test_process_isolated_hf_reload_runs_rank0_hf_loader(tmp_path):
     reference_logits = torch.randn(1, 2, 3)
     recipe_cls = Mock()
     hf_model_cls = Mock()
-    custom_args = {"hf_device_map_auto": True, "no_check_resume": True, "trust_remote_code": True}
+    custom_args = {"hf_device_map_auto": True, "skip_resume": True, "trust_remote_code": True}
 
     with (
         patch(
@@ -1005,11 +999,11 @@ def test_process_isolated_cross_tp_reload_uses_exported_weights_and_reports_pari
     raise_distributed_failure.assert_called_once_with(None)
 
 
-def test_process_isolated_resume_rejects_no_check_resume():
+def test_process_isolated_resume_rejects_skip_resume():
     with pytest.raises(ValueError, match="conflicts with skip_resume=true"):
         _run_process_isolated_checkpoint_phase(
             "resume",
-            custom_args={"no_check_resume": True},
+            custom_args={"skip_resume": True},
             recipe_cls=Mock(),
             hf_model_cls=Mock(),
             input_ids_loader=Mock(),
@@ -1023,7 +1017,7 @@ def test_process_isolated_source_load_reference_persists_hf_artifacts(tmp_path):
     recipe_cls = Mock()
     hf_model_cls = Mock()
     custom_args = {
-        "check_source_load_parity": True,
+        "source_load_parity_enabled": True,
         "hf_device_map_auto": True,
         "trust_remote_code": True,
     }
@@ -1146,10 +1140,8 @@ def test_process_isolated_source_load_parity_compares_persisted_reference(tmp_pa
     source_trainer = SimpleNamespace(model_parts=[model_part], setup=Mock())
     recipe_cls = Mock(return_value=source_trainer)
     custom_args = {
-        "check_source_load_parity": True,
-        "source_load_kl_threshold": "4e-2",
-        "source_load_mean_kl_threshold": "1e-2",
-        "source_load_cosine_threshold": "0.9985",
+        "source_load_parity_enabled": True,
+        "parity_tolerance_profile": "standard",
     }
 
     with (
@@ -1305,13 +1297,7 @@ def test_source_load_parity_failure_is_returned_for_later_reporting(tmp_path):
         candidate_logits,
         None,
         artifact_dir=tmp_path,
-        policy=_source_load_parity_policy(
-            {
-                "source_load_kl_threshold": "0.0",
-                "source_load_mean_kl_threshold": "0.0",
-                "source_load_cosine_threshold": "1.0",
-            }
-        ),
+        policy=_source_load_parity_policy({"parity_tolerance_profile": "strict"}),
     )
 
     assert failure is not None
@@ -1326,13 +1312,7 @@ def test_source_load_parity_success_returns_no_deferred_failure(tmp_path):
         logits.clone(),
         None,
         artifact_dir=tmp_path,
-        policy=_source_load_parity_policy(
-            {
-                "source_load_kl_threshold": "0.0",
-                "source_load_mean_kl_threshold": "0.0",
-                "source_load_cosine_threshold": "1.0",
-            }
-        ),
+        policy=_source_load_parity_policy({"parity_tolerance_profile": "strict"}),
     )
 
     assert failure is None
@@ -1607,15 +1587,15 @@ def test_hf_reload_finish_returns_error_without_distributed_sync():
     assert _finish_hf_reload_sync(None, "HF parity failed") == "HF parity failed"
 
 
-def test_biencoder_robustness_reads_hf_reload_settings_from_config(tmp_path):
+def test_biencoder_robustness_reads_current_settings_from_config(tmp_path):
     config_path = tmp_path / "recipe.yaml"
     config_path.write_text(
         "ci:\n"
         "  checkpoint_robustness:\n"
-        "    check_hf_reload: true\n"
-        "    check_resume: true\n"
-        "    cosine_threshold: 0.998\n"
-        "    hf_cosine_threshold: 0.997\n"
+        "    skip_hf_reload: true\n"
+        "    skip_resume: true\n"
+        "    parity_tolerance_profile: relaxed\n"
+        "    automodel_reload_cosine_threshold: 0.997\n"
         "    resume_tolerance_profile: relaxed\n"
         "    dataloader.num_workers: 0\n"
     )
@@ -1623,13 +1603,30 @@ def test_biencoder_robustness_reads_hf_reload_settings_from_config(tmp_path):
     custom, remaining = _extract_biencoder_custom_args(["--config", str(config_path)])
 
     assert custom == {
-        "check_hf_reload": True,
-        "check_resume": True,
-        "cosine_threshold": "0.998",
-        "hf_cosine_threshold": "0.997",
+        "skip_hf_reload": True,
+        "skip_resume": True,
+        "parity_tolerance_profile": "relaxed",
+        "automodel_reload_cosine_threshold": "0.997",
         "resume_tolerance_profile": "relaxed",
     }
     assert remaining == ["--config", str(config_path)]
+
+
+def test_biencoder_robustness_defaults_to_standard_profile_and_default_on_phases():
+    custom, remaining = _extract_biencoder_custom_args(["--other-arg"])
+
+    assert custom.get("parity_tolerance_profile", "standard") == "standard"
+    assert custom.get("skip_hf_reload", False) is False
+    assert custom.get("skip_resume", False) is False
+    assert remaining == ["--other-arg"]
+
+
+def test_biencoder_robustness_rejects_removed_config_fields(tmp_path):
+    config_path = tmp_path / "recipe.yaml"
+    config_path.write_text("ci:\n  checkpoint_robustness:\n    cosine_threshold: 0.999\n")
+
+    with pytest.raises(ValueError, match="Removed retrieval checkpoint-robustness fields.*cosine_threshold"):
+        _extract_biencoder_custom_args(["--config", str(config_path)])
 
 
 def test_record_deferred_failure_preserves_all_comparison_failures():

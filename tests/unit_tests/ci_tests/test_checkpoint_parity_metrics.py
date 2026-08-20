@@ -145,19 +145,6 @@ def test_calibrated_profile_thresholds(profile, comparison_kind, expected_mean_k
     assert thresholds.cosine_similarity == expected_cosine
 
 
-def test_legacy_numeric_overrides_preserve_max_kl_semantics():
-    reference = torch.zeros(1, 100, 2)
-    candidate = reference.clone()
-    candidate[0, -1] = torch.tensor([20.0, -20.0])
-    metrics = _compute_parity_metrics(reference, candidate)
-    relaxed = _resolve_parity_thresholds("relaxed", "cross_framework")
-
-    failures = _parity_failures(metrics, relaxed, legacy_max_kl_threshold=1.0)
-
-    assert len(failures) == 1
-    assert failures[0].startswith("max KL")
-
-
 def test_selected_numeric_overrides_preserve_other_profile_gates():
     relaxed = _resolve_parity_thresholds("relaxed", "same_implementation")
 
@@ -179,13 +166,3 @@ def test_invalid_profile_threshold_override_is_rejected(bad_threshold):
 def test_unknown_profile_is_rejected():
     with pytest.raises(ValueError, match="Unknown parity tolerance profile"):
         _resolve_parity_thresholds("custom", "cross_framework")
-
-
-@pytest.mark.parametrize("bad_threshold", [float("nan"), float("inf"), -1.0])
-def test_invalid_legacy_kl_threshold_is_rejected(bad_threshold):
-    logits = torch.zeros(1, 2, 3)
-    metrics = _compute_parity_metrics(logits, logits)
-    thresholds = _resolve_parity_thresholds("standard", "same_implementation")
-
-    with pytest.raises(ValueError, match="finite and non-negative"):
-        _parity_failures(metrics, thresholds, legacy_max_kl_threshold=bad_threshold)

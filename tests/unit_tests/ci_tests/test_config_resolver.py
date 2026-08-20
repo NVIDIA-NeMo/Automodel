@@ -456,15 +456,14 @@ def test_end_to_end_fixture_keys_not_applied_as_overrides(tmp_path):
         "    skip_automodel_reload_logit_parity: true    # fixture arg, must NOT become top-level\n"
         "    skip_hf_reload_logit_parity: true           # fixture arg, must NOT become top-level\n"
         "    hf_adapter_ignored_key_prefix: base_model.model.mtp.  # fixture arg, must NOT become top-level\n"
-        "    hf_kl_threshold: 5e-3                       # fixture arg, must NOT become top-level\n"
+        "    automodel_reload_mean_kl_threshold: 4e-3    # fixture arg, must NOT become top-level\n"
+        "    automodel_reload_p95_kl_threshold: 2e-2     # fixture arg, must NOT become top-level\n"
+        "    automodel_reload_cosine_threshold: 0.998    # fixture arg, must NOT become top-level\n"
         "    training_reproducibility_loss_threshold: 1e-2  # fixture arg, must NOT become top-level\n"
         "    resume_tolerance_profile: relaxed             # fixture arg, must NOT become top-level\n"
         "    resume_first_loss_threshold: 1e-6           # fixture arg, must NOT become top-level\n"
         "    parity_sequence_length: 1024                # fixture arg, must NOT become top-level\n"
         "    parity_tolerance_profile: strict            # fixture arg, must NOT become top-level\n"
-        "    source_load_kl_threshold: 1e-2              # fixture arg, must NOT become top-level\n"
-        "    source_load_mean_kl_threshold: 1e-3         # fixture arg, must NOT become top-level\n"
-        "    source_load_cosine_threshold: 0.999         # fixture arg, must NOT become top-level\n"
         "    tokenizer_name: nvidia/Test                 # fixture arg, must NOT become top-level\n"
         "    dataset.limit_dataset_samples: 500          # dotted -> applied as override\n"
     )
@@ -477,7 +476,9 @@ def test_end_to_end_fixture_keys_not_applied_as_overrides(tmp_path):
     assert resolved["dataset"]["limit_dataset_samples"] == 500
     # Fixture args stay under ci.checkpoint_robustness for the consumer (pytest) to read,
     # and do NOT pollute the top level.
-    assert "hf_kl_threshold" not in resolved
+    assert "automodel_reload_mean_kl_threshold" not in resolved
+    assert "automodel_reload_p95_kl_threshold" not in resolved
+    assert "automodel_reload_cosine_threshold" not in resolved
     assert "skip_source_load_parity" not in resolved
     assert "skip_source_load_logit_parity" not in resolved
     assert "skip_automodel_reload_logit_parity" not in resolved
@@ -488,11 +489,10 @@ def test_end_to_end_fixture_keys_not_applied_as_overrides(tmp_path):
     assert "resume_first_loss_threshold" not in resolved
     assert "parity_sequence_length" not in resolved
     assert "parity_tolerance_profile" not in resolved
-    assert "source_load_kl_threshold" not in resolved
-    assert "source_load_mean_kl_threshold" not in resolved
-    assert "source_load_cosine_threshold" not in resolved
     assert "tokenizer_name" not in resolved
-    assert resolved["ci"]["checkpoint_robustness"]["hf_kl_threshold"] == 5e-3
+    assert resolved["ci"]["checkpoint_robustness"]["automodel_reload_mean_kl_threshold"] == 4e-3
+    assert resolved["ci"]["checkpoint_robustness"]["automodel_reload_p95_kl_threshold"] == 2e-2
+    assert resolved["ci"]["checkpoint_robustness"]["automodel_reload_cosine_threshold"] == 0.998
     assert resolved["ci"]["checkpoint_robustness"]["skip_source_load_parity"] is True
     assert resolved["ci"]["checkpoint_robustness"]["skip_source_load_logit_parity"] is True
     assert resolved["ci"]["checkpoint_robustness"]["skip_automodel_reload_logit_parity"] is True
@@ -503,9 +503,6 @@ def test_end_to_end_fixture_keys_not_applied_as_overrides(tmp_path):
     assert resolved["ci"]["checkpoint_robustness"]["resume_first_loss_threshold"] == 1e-6
     assert resolved["ci"]["checkpoint_robustness"]["parity_sequence_length"] == 1024
     assert resolved["ci"]["checkpoint_robustness"]["parity_tolerance_profile"] == "strict"
-    assert resolved["ci"]["checkpoint_robustness"]["source_load_kl_threshold"] == 1e-2
-    assert resolved["ci"]["checkpoint_robustness"]["source_load_mean_kl_threshold"] == 1e-3
-    assert resolved["ci"]["checkpoint_robustness"]["source_load_cosine_threshold"] == 0.999
 
 
 @pytest.mark.parametrize(
@@ -598,8 +595,9 @@ def test_retrieval_checkpoint_robustness_retains_calibrated_resume_threshold(tmp
     )
 
     robustness = yaml.load(out.open())["ci"]["checkpoint_robustness"]
-    assert robustness["check_hf_reload"] is True
-    assert robustness["check_resume"] is True
+    assert robustness["parity_tolerance_profile"] == "standard"
+    for removed_key in ("check_hf_reload", "check_resume", "cosine_threshold", "hf_cosine_threshold"):
+        assert removed_key not in robustness
     assert robustness["resume_loss_threshold"] == 5e-2
     assert robustness["training_reproducibility_loss_threshold"] == 5e-2
 

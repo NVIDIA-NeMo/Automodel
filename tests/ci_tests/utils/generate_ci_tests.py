@@ -211,15 +211,13 @@ def _enrich_base_job(
         job["variables"]["CHECKPOINT_ROBUSTNESS_PROCESS_ISOLATION"] = "true"
         if "CHECKPOINT_ROBUSTNESS_PHASES" not in job["variables"]:
             robustness_phases = []
-            source_load_parity_enabled = not robustness_config.get(
-                "skip_source_load_parity", False
-            ) and robustness_config.get("check_source_load_parity", True)
+            source_load_parity_enabled = not robustness_config.get("skip_source_load_parity", False)
             if source_load_parity_enabled:
                 robustness_phases.extend(("source_load_reference", "source_load_parity"))
             robustness_phases.extend(("train_and_save", "automodel_reload"))
             if not robustness_config.get("skip_hf_reload"):
                 robustness_phases.append("hf_reload")
-            if not robustness_config.get("skip_resume") and not robustness_config.get("no_check_resume"):
+            if not robustness_config.get("skip_resume"):
                 robustness_phases.append("resume")
             is_peft = "peft" in config.stem or "lora" in config.stem
             if int(robustness_config.get("cross_tp_size") or 0) > 0 and not is_peft:

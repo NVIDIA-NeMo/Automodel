@@ -88,6 +88,22 @@ datasets.disable_caching()
 
 _PARITY_DOCUMENT_PATH = Path(__file__).with_name("parity_document.mdx")
 _PARITY_DOCUMENT_SHA256 = "8f734b2ee925ab82afb56dfa3a512108b70d3c54a2489f7978a036420da34cdb"  # pragma: allowlist secret
+_REMOVED_CHECKPOINT_ROBUSTNESS_FIELDS = {
+    "check_hf_reload",
+    "check_resume",
+    "check_source_load_parity",
+    "cosine_threshold",
+    "cross_tp_kl_threshold",
+    "hf_cosine_threshold",
+    "hf_kl_threshold",
+    "kl_threshold",
+    "no_check_resume",
+    "skip_automodel_logit_parity",
+    "skip_hf_logit_parity",
+    "source_load_cosine_threshold",
+    "source_load_kl_threshold",
+    "source_load_mean_kl_threshold",
+}
 
 
 @dataclass(frozen=True)
@@ -99,9 +115,6 @@ class _LogitParityPolicy:
     comparison_kind: Literal["same_implementation", "cross_framework", "cross_topology"]
     profile: str
     enforce: bool = True
-    legacy_max_kl_threshold: float | None = None
-    legacy_mean_kl_threshold: float | None = None
-    legacy_cosine_threshold: float | None = None
     mean_kl_threshold_override: float | None = None
     p95_kl_threshold_override: float | None = None
     cosine_threshold_override: float | None = None
@@ -110,16 +123,14 @@ class _LogitParityPolicy:
 def _extract_custom_args(argv: list[str]) -> tuple[dict[str, str | bool], list[str]]:
     """Separate test-specific CLI flags from config parser arguments."""
     custom_keys = {
-        "--kl_threshold",
-        "--hf_kl_threshold",
         "--isolated_phase",
         "--cross_tp_size",
-        "--cross_tp_kl_threshold",
         "--automodel_reload_cosine_threshold",
         "--automodel_reload_mean_kl_threshold",
         "--automodel_reload_p95_kl_threshold",
         "--experts_implementation",
         "--hf_adapter_ignored_key_prefix",
+        "--hf_device_map_cpu_max_memory_gib",
         "--hf_device_map_max_memory_gib",
         "--hf_reload_timeout_seconds",
         "--tokenizer_name",
@@ -131,26 +142,18 @@ def _extract_custom_args(argv: list[str]) -> tuple[dict[str, str | bool], list[s
         "--resume_first_loss_threshold",
         "--resume_loss_threshold",
         "--resume_tolerance_profile",
-        "--source_load_cosine_threshold",
-        "--source_load_kl_threshold",
-        "--source_load_mean_kl_threshold",
     }
     boolean_keys = {
         "--trust_remote_code",
-        "--check_source_load_parity",
         "--check_fused_qkv_keys",
         "--check_phantom_keys",
-        "--check_resume",
         "--hf_device_map_auto",
         "--hf_source_post_load_dequantize",
-        "--no_check_resume",
         "--skip_resume",
         "--skip_source_load_parity",
         "--skip_source_load_logit_parity",
         "--skip_hf_reload",
-        "--skip_automodel_logit_parity",
         "--skip_automodel_reload_logit_parity",
-        "--skip_hf_logit_parity",
         "--skip_hf_reload_logit_parity",
     }
     custom = {}
@@ -182,10 +185,10 @@ def _extract_custom_args(argv: list[str]) -> tuple[dict[str, str | bool], list[s
         with open(config_path) as f:
             raw_cfg = yaml.safe_load(f) or {}
         ci_robustness = raw_cfg.get("ci", {}).get("checkpoint_robustness") or {}
+        removed_fields = sorted(_REMOVED_CHECKPOINT_ROBUSTNESS_FIELDS & ci_robustness.keys())
+        if removed_fields:
+            raise ValueError("Removed checkpoint-robustness fields are not supported: " + ", ".join(removed_fields))
         default_on_control_keys = {
-            "check_resume",
-            "check_source_load_parity",
-            "no_check_resume",
             "skip_resume",
             "skip_source_load_parity",
         }
@@ -204,37 +207,23 @@ def _extract_custom_args(argv: list[str]) -> tuple[dict[str, str | bool], list[s
                 elif not isinstance(v, bool):
                     custom[k] = str(v)
 
-    if {"check_source_load_parity", "skip_source_load_parity"}.issubset(cli_custom_keys):
-        raise ValueError("Cannot combine --check_source_load_parity with --skip_source_load_parity")
-    if "check_source_load_parity" in cli_custom_keys:
-        source_load_parity_enabled = True
-    elif "skip_source_load_parity" in cli_custom_keys:
+    if "skip_source_load_parity" in cli_custom_keys:
         source_load_parity_enabled = False
     elif "skip_source_load_parity" in ci_robustness:
         source_load_parity_enabled = not bool(ci_robustness["skip_source_load_parity"])
-    elif "check_source_load_parity" in ci_robustness:
-        source_load_parity_enabled = bool(ci_robustness["check_source_load_parity"])
     else:
         source_load_parity_enabled = True
-    custom["check_source_load_parity"] = source_load_parity_enabled
+    custom["source_load_parity_enabled"] = source_load_parity_enabled
     if not source_load_parity_enabled:
         custom["skip_source_load_parity"] = True
 
-    if "check_resume" in cli_custom_keys and ({"skip_resume", "no_check_resume"} & cli_custom_keys):
-        raise ValueError("Cannot combine --check_resume with --skip_resume or --no_check_resume")
-    if "check_resume" in cli_custom_keys:
-        resume_enabled = True
-    elif {"skip_resume", "no_check_resume"} & cli_custom_keys:
+    if "skip_resume" in cli_custom_keys:
         resume_enabled = False
     elif "skip_resume" in ci_robustness:
         resume_enabled = not bool(ci_robustness["skip_resume"])
-    elif "no_check_resume" in ci_robustness:
-        resume_enabled = not bool(ci_robustness["no_check_resume"])
-    elif "check_resume" in ci_robustness:
-        resume_enabled = bool(ci_robustness["check_resume"])
     else:
         resume_enabled = True
-    custom["check_resume"] = resume_enabled
+    custom["resume_enabled"] = resume_enabled
     if not resume_enabled:
         custom["skip_resume"] = True
 
@@ -489,7 +478,7 @@ def _compare_logits(
         artifact_dir: Directory that owns checkpoint-robustness artifacts.
         reference_logits: Reference tensor of shape [..., vocab], with arbitrary leading token dimensions.
         candidate_logits: Candidate tensor of shape [..., vocab], matching ``reference_logits`` exactly.
-        policy: Comparison identity, numerical profile, legacy overrides, and enforcement state.
+        policy: Comparison identity, numerical profile, targeted overrides, and enforcement state.
 
     Returns:
         A failure message when an enforced gate fails, otherwise ``None``.
@@ -501,15 +490,7 @@ def _compare_logits(
         "p95_kl": policy.p95_kl_threshold_override,
         "cosine_similarity": policy.cosine_threshold_override,
     }
-    legacy_thresholds = {
-        "max_kl": policy.legacy_max_kl_threshold,
-        "mean_kl": policy.legacy_mean_kl_threshold,
-        "cosine_similarity": policy.legacy_cosine_threshold,
-    }
     uses_threshold_overrides = any(value is not None for value in threshold_overrides.values())
-    uses_legacy_thresholds = any(value is not None for value in legacy_thresholds.values())
-    if uses_legacy_thresholds and uses_threshold_overrides:
-        raise ValueError("Cannot combine legacy parity thresholds with profile threshold overrides")
     active_profile_thresholds = _apply_parity_threshold_overrides(
         profile_thresholds,
         mean_kl=policy.mean_kl_threshold_override,
@@ -517,18 +498,8 @@ def _compare_logits(
         cosine_similarity=policy.cosine_threshold_override,
     )
     profile_failures = _parity_failures(metrics, profile_thresholds)
-    active_failures = _parity_failures(
-        metrics,
-        active_profile_thresholds,
-        legacy_max_kl_threshold=policy.legacy_max_kl_threshold,
-        legacy_mean_kl_threshold=policy.legacy_mean_kl_threshold,
-        legacy_cosine_threshold=policy.legacy_cosine_threshold,
-    )
-    threshold_mode = "profile"
-    if uses_legacy_thresholds:
-        threshold_mode = "legacy_numeric"
-    elif uses_threshold_overrides:
-        threshold_mode = "profile_with_numeric_overrides"
+    active_failures = _parity_failures(metrics, active_profile_thresholds)
+    threshold_mode = "profile_with_numeric_overrides" if uses_threshold_overrides else "profile"
     payload = {
         "schema_version": 1,
         "parity_document_sha256": _PARITY_DOCUMENT_SHA256,
@@ -538,8 +509,7 @@ def _compare_logits(
         "profile": policy.profile,
         "profile_thresholds": profile_thresholds.to_dict(),
         "threshold_overrides": threshold_overrides,
-        "active_thresholds": None if uses_legacy_thresholds else active_profile_thresholds.to_dict(),
-        "legacy_thresholds": legacy_thresholds,
+        "active_thresholds": active_profile_thresholds.to_dict(),
         "threshold_mode": threshold_mode,
         "enforced": policy.enforce,
         "passed": not policy.enforce or not active_failures,
@@ -578,28 +548,13 @@ def _compare_logits(
 
 
 def _source_load_parity_policy(custom_args: dict[str, str | bool], *, enforce: bool = True) -> _LogitParityPolicy:
-    """Build the Phase 0 policy while preserving legacy numeric gates."""
-    legacy_keys = {
-        "source_load_kl_threshold",
-        "source_load_mean_kl_threshold",
-        "source_load_cosine_threshold",
-    }
-    uses_legacy_thresholds = any(key in custom_args for key in legacy_keys)
+    """Build the Phase 0 source-load policy."""
     return _LogitParityPolicy(
         phase="phase_0",
         comparison="source_load",
         comparison_kind="cross_framework",
         profile=str(custom_args.get("parity_tolerance_profile", "standard")),
         enforce=enforce and not bool(custom_args.get("skip_source_load_logit_parity", False)),
-        legacy_max_kl_threshold=(
-            float(custom_args.get("source_load_kl_threshold", "5e-3")) if uses_legacy_thresholds else None
-        ),
-        legacy_mean_kl_threshold=(
-            float(custom_args.get("source_load_mean_kl_threshold", "1e-3")) if uses_legacy_thresholds else None
-        ),
-        legacy_cosine_threshold=(
-            float(custom_args.get("source_load_cosine_threshold", "0.9999")) if uses_legacy_thresholds else None
-        ),
     )
 
 
@@ -616,17 +571,12 @@ def _repeatability_policy(*, phase: str, comparison: str, profile: str) -> _Logi
 
 def _automodel_reload_parity_policy(custom_args: dict[str, str | bool]) -> _LogitParityPolicy:
     """Build the Phase 2 AutoModel model-reload policy."""
-    legacy_max_kl_threshold = float(custom_args["kl_threshold"]) if "kl_threshold" in custom_args else None
     return _LogitParityPolicy(
         phase="phase_2",
         comparison="automodel_model_reload",
         comparison_kind="same_implementation",
         profile=str(custom_args.get("parity_tolerance_profile", "standard")),
-        enforce=not bool(
-            custom_args.get("skip_automodel_reload_logit_parity", False)
-            or custom_args.get("skip_automodel_logit_parity", False)
-        ),
-        legacy_max_kl_threshold=legacy_max_kl_threshold,
+        enforce=not bool(custom_args.get("skip_automodel_reload_logit_parity", False)),
         mean_kl_threshold_override=(
             float(custom_args["automodel_reload_mean_kl_threshold"])
             if "automodel_reload_mean_kl_threshold" in custom_args
@@ -647,30 +597,22 @@ def _automodel_reload_parity_policy(custom_args: dict[str, str | bool]) -> _Logi
 
 def _hf_reload_parity_policy(custom_args: dict[str, str | bool]) -> _LogitParityPolicy:
     """Build the Phase 3 vanilla-HF export-reload policy."""
-    legacy_max_kl_threshold = float(custom_args["hf_kl_threshold"]) if "hf_kl_threshold" in custom_args else None
     return _LogitParityPolicy(
         phase="phase_3",
         comparison="hf_export_reload",
         comparison_kind="cross_framework",
         profile=str(custom_args.get("parity_tolerance_profile", "standard")),
-        enforce=not bool(
-            custom_args.get("skip_hf_reload_logit_parity", False) or custom_args.get("skip_hf_logit_parity", False)
-        ),
-        legacy_max_kl_threshold=legacy_max_kl_threshold,
+        enforce=not bool(custom_args.get("skip_hf_reload_logit_parity", False)),
     )
 
 
 def _cross_tp_parity_policy(custom_args: dict[str, str | bool]) -> _LogitParityPolicy:
     """Build the optional Phase 5 cross-topology policy."""
-    legacy_max_kl_threshold = (
-        float(custom_args["cross_tp_kl_threshold"]) if "cross_tp_kl_threshold" in custom_args else None
-    )
     return _LogitParityPolicy(
         phase="phase_5",
         comparison="cross_tp_reload",
         comparison_kind="cross_topology",
         profile=str(custom_args.get("parity_tolerance_profile", "standard")),
-        legacy_max_kl_threshold=legacy_max_kl_threshold,
     )
 
 
@@ -2229,7 +2171,7 @@ def _run_process_isolated_checkpoint_phase(
     }
     if phase not in supported_phases:
         raise ValueError(f"Unsupported isolated checkpoint phase {phase!r}; expected one of {sorted(supported_phases)}")
-    if (custom_args.get("skip_resume", False) or custom_args.get("no_check_resume", False)) and phase == "resume":
+    if custom_args.get("skip_resume", False) and phase == "resume":
         raise ValueError(f"Process-isolated phase {phase!r} conflicts with skip_resume=true")
     if phase == "cross_tp_reload" and int(custom_args.get("cross_tp_size", "0")) <= 0:
         raise ValueError("Process-isolated cross_tp_reload requires cross_tp_size > 0")
@@ -2240,8 +2182,8 @@ def _run_process_isolated_checkpoint_phase(
     parity_sequence_length = int(custom_args.get("parity_sequence_length", "2048"))
 
     if phase == "source_load_reference":
-        if not custom_args.get("check_source_load_parity", False):
-            raise ValueError("Isolated source_load_reference requires check_source_load_parity=true")
+        if not custom_args.get("source_load_parity_enabled", False):
+            raise ValueError("Isolated source_load_reference requires Phase 0 to be enabled")
 
         reference_path, metadata_path = _source_load_artifact_paths(cfg)
         source_load_fail_path = _source_load_sync_paths(cfg)[2] if _preinit_world_size() > 1 else None
@@ -2307,8 +2249,8 @@ def _run_process_isolated_checkpoint_phase(
         return
 
     if phase == "source_load_parity":
-        if not custom_args.get("check_source_load_parity", False):
-            raise ValueError("Isolated source_load_parity requires check_source_load_parity=true")
+        if not custom_args.get("source_load_parity_enabled", False):
+            raise ValueError("Isolated source_load_parity requires Phase 0 to be enabled")
 
         _report_phase("Isolated Phase 0b source parity: loading prompt input IDs")
         input_ids = _load_input_ids_once(
@@ -2426,7 +2368,7 @@ def _run_process_isolated_checkpoint_phase(
             sequence_length=parity_sequence_length,
         )
         resume_plan = None
-        if custom_args.get("check_resume", False):
+        if custom_args.get("resume_enabled", False):
             resume_plan = _resume_plan_from_config(cfg)
             _configure_uninterrupted_run(cfg, resume_plan)
 
@@ -2796,7 +2738,7 @@ def run_checkpoint_robustness(
     max_vram_gb = float(custom_args.get("max_vram_gb", "0"))
     max_cpu_gb = float(custom_args.get("max_cpu_gb", "0"))
     check_phantom_keys = bool(custom_args.get("check_phantom_keys", False))
-    check_resume = bool(custom_args.get("check_resume", False))
+    resume_enabled = bool(custom_args.get("resume_enabled", False))
     resume_tolerance = _resolve_resume_loss_tolerance(
         custom_args.get("resume_tolerance_profile", "standard"),
         first_step_override=custom_args.get("resume_first_loss_threshold"),
@@ -2806,11 +2748,11 @@ def run_checkpoint_robustness(
     hf_device_map_auto = bool(custom_args.get("hf_device_map_auto", False))
     hf_source_post_load_dequantize = bool(custom_args.get("hf_source_post_load_dequantize", False))
     skip_hf_reload = bool(custom_args.get("skip_hf_reload", False))
-    check_source_load_parity = bool(custom_args.get("check_source_load_parity", False))
+    source_load_parity_enabled = bool(custom_args.get("source_load_parity_enabled", False))
     deferred_failures: list[str] = []
 
     cfg = parse_args_and_load_config()
-    resume_plan = _resume_plan_from_config(cfg) if check_resume else None
+    resume_plan = _resume_plan_from_config(cfg) if resume_enabled else None
     if resume_plan is not None:
         _configure_uninterrupted_run(cfg, resume_plan)
     input_ids = _load_input_ids_once(
@@ -2821,7 +2763,7 @@ def run_checkpoint_robustness(
     )
 
     source_load_reference = None
-    if check_source_load_parity:
+    if source_load_parity_enabled:
         _report_phase("Phase 0: starting vanilla-HF source-load reference")
         source_load_reference = _prepare_source_load_reference(
             cfg,
@@ -2849,7 +2791,7 @@ def run_checkpoint_robustness(
             _cleanup_input_ids_sync(cfg)
         _barrier()
 
-    if check_source_load_parity:
+    if source_load_parity_enabled:
         _report_phase("Phase 0: starting constructed-trainer parity forward")
         device = next(trainer.model_parts[0].parameters()).device
         trainer_source_logits = _get_logits(trainer.model_parts[0], input_ids, device, trainer=trainer)
@@ -3070,7 +3012,7 @@ def run_checkpoint_robustness(
     _report_phase("Phase 3: vanilla-HF export reload complete")
 
     # Phase 4: restore the exact Phase 1 boundary and replay its continuation.
-    if check_resume:
+    if resume_enabled:
         assert resume_plan is not None
         reference_trajectory = _load_reference_trajectory(resume_plan)
         checkpoint_path = _checkpoint_for_completed_steps(resume_plan, resume_plan.boundary_step)

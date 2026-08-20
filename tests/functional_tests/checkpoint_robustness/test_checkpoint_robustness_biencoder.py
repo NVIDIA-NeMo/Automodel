@@ -19,8 +19,9 @@ next-token logits, so we compare checkpoint fidelity using cosine similarity ins
 KL divergence.
 
 Launch: torchrun --nproc-per-node=<N> -m <this_module> --config <config.yaml>
-    [--cosine_threshold <float>] [--hf_cosine_threshold <float>]
-    [--check_hf_reload] [--check_resume]
+    [--parity_tolerance_profile <strict|standard|relaxed>]
+    [--automodel_reload_cosine_threshold <float>]
+    [--skip_hf_reload] [--skip_resume]
     [--resume_tolerance_profile <strict|standard|relaxed>]
     [--resume_first_loss_threshold <float>] [--resume_loss_threshold <float>]
 """
@@ -38,6 +39,10 @@ from PIL import Image
 
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.recipes.retrieval.train_bi_encoder import TrainBiEncoderRecipe
+from tests.functional_tests.checkpoint_robustness.parity_metrics import (
+    _apply_parity_threshold_overrides,
+    _resolve_parity_thresholds,
+)
 from tests.functional_tests.checkpoint_robustness.resume_trajectory import (
     _checkpoint_for_completed_steps,
     _checkpoint_state_snapshot,
@@ -64,19 +69,20 @@ from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm
 
 # Default test sentence for embedding extraction
 _DEFAULT_PROMPT = "The quick brown fox jumps over the lazy dog"
+_REMOVED_BIENCODER_FIELDS = {"check_hf_reload", "check_resume", "cosine_threshold", "hf_cosine_threshold"}
 
 
 def _extract_custom_args(argv: list[str]) -> tuple[dict[str, str | bool], list[str]]:
     """Separate test-specific CLI flags from config parser arguments."""
     custom_keys = {
-        "--cosine_threshold",
-        "--hf_cosine_threshold",
+        "--automodel_reload_cosine_threshold",
+        "--parity_tolerance_profile",
         "--training_reproducibility_loss_threshold",
         "--resume_first_loss_threshold",
         "--resume_loss_threshold",
         "--resume_tolerance_profile",
     }
-    boolean_keys = {"--check_hf_reload", "--check_resume"}
+    boolean_keys = {"--skip_hf_reload", "--skip_resume"}
     custom: dict[str, str | bool] = {}
     remaining: list[str] = []
     i = 0
@@ -100,18 +106,23 @@ def _extract_custom_args(argv: list[str]) -> tuple[dict[str, str | bool], list[s
         import yaml
 
         with open(config_path) as f:
-            raw_cfg = yaml.safe_load(f)
+            raw_cfg = yaml.safe_load(f) or {}
         ci_robustness = raw_cfg.get("ci", {}).get("checkpoint_robustness") or {}
+        removed_fields = sorted(_REMOVED_BIENCODER_FIELDS & ci_robustness.keys())
+        if removed_fields:
+            raise ValueError(
+                "Removed retrieval checkpoint-robustness fields are not supported: " + ", ".join(removed_fields)
+            )
         for cli_key in custom_keys | boolean_keys:
             key = cli_key.lstrip("-")
             if key in custom or key not in ci_robustness:
                 continue
             value = ci_robustness[key]
             if isinstance(value, bool):
-                if value:
-                    custom[key] = True
+                custom[key] = value
             else:
                 custom[key] = str(value)
+    _resolve_parity_thresholds(str(custom.get("parity_tolerance_profile", "standard")), "same_implementation")
     return custom, remaining
 
 
@@ -169,10 +180,19 @@ def test_checkpoint_robustness_biencoder():
     """Train biencoder -> checkpoint -> reload from consolidated, compare embeddings."""
     custom_args, config_argv = _extract_custom_args(sys.argv[1:])
     sys.argv = [sys.argv[0]] + config_argv
-    cosine_threshold = float(custom_args.get("cosine_threshold", "0.999"))
-    hf_cosine_threshold = float(custom_args.get("hf_cosine_threshold", "0.999"))
-    check_hf_reload = bool(custom_args.get("check_hf_reload", False))
-    check_resume = bool(custom_args.get("check_resume", False))
+    parity_profile = str(custom_args.get("parity_tolerance_profile", "standard"))
+    automodel_thresholds = _resolve_parity_thresholds(parity_profile, "same_implementation")
+    automodel_thresholds = _apply_parity_threshold_overrides(
+        automodel_thresholds,
+        cosine_similarity=(
+            float(custom_args["automodel_reload_cosine_threshold"])
+            if "automodel_reload_cosine_threshold" in custom_args
+            else None
+        ),
+    )
+    hf_thresholds = _resolve_parity_thresholds(parity_profile, "cross_framework")
+    hf_reload_enabled = not bool(custom_args.get("skip_hf_reload", False))
+    resume_enabled = not bool(custom_args.get("skip_resume", False))
     training_reproducibility_loss_threshold = float(custom_args.get("training_reproducibility_loss_threshold", "5e-2"))
     resume_tolerance = _resolve_resume_loss_tolerance(
         str(custom_args.get("resume_tolerance_profile", "standard")),
@@ -181,11 +201,11 @@ def test_checkpoint_robustness_biencoder():
     )
 
     # ------------------------------------------------------------------
-    # Phase 1: Train biencoder and checkpoint
+    # Phase 1: Train, save, and capture reference artifacts
     # ------------------------------------------------------------------
     torch.cuda.reset_peak_memory_stats()
     cfg = parse_args_and_load_config()
-    resume_plan = _resume_plan_from_config(cfg) if check_resume else None
+    resume_plan = _resume_plan_from_config(cfg) if resume_enabled else None
     if resume_plan is not None:
         _configure_uninterrupted_run(cfg, resume_plan)
     trainer = TrainBiEncoderRecipe(cfg)
@@ -224,22 +244,20 @@ def test_checkpoint_robustness_biencoder():
     if _rank0():
         print(f"\n[Memory] Peak VRAM: {peak_vram_gb:.2f} GB, Peak CPU RSS: {peak_cpu_gb:.2f} GB")
 
-    # ------------------------------------------------------------------
-    # Phase 2: Capture reference embeddings before teardown
-    # ------------------------------------------------------------------
+    # Capture Phase 1 reference embeddings before teardown.
     device = next(trainer.model_parts[0].parameters()).device
     tokenizer = trainer.tokenizer
     reference_embeddings = _get_embeddings(trainer.model_parts[0], tokenizer, _DEFAULT_PROMPT, device)
     hf_reference_query = None
     hf_reference_document = None
-    if check_hf_reload:
+    if hf_reload_enabled:
         hf_reference_query, hf_reference_document = _get_hf_style_embeddings(trainer.model_parts[0], _DEFAULT_PROMPT)
     if _rank0():
-        print(f"\n[Phase 2] Reference embedding shape: {reference_embeddings.shape}")
-        print(f"[Phase 2] Reference embedding norm: {reference_embeddings.norm().item():.6f}")
+        print(f"\n[Phase 1] Reference embedding shape: {reference_embeddings.shape}")
+        print(f"[Phase 1] Reference embedding norm: {reference_embeddings.norm().item():.6f}")
 
     # ------------------------------------------------------------------
-    # Phase 3: Reload from consolidated checkpoint, compare embeddings
+    # Phase 2: Reload the consolidated checkpoint with AutoModel and compare embeddings
     # ------------------------------------------------------------------
     checkpoint_dir = Path(cfg.checkpoint.checkpoint_dir)
     if resume_plan is not None:
@@ -269,12 +287,12 @@ def test_checkpoint_robustness_biencoder():
     cosine_sim = _cosine_similarity(reference_embeddings, restored_embeddings)
     if _rank0():
         print(
-            f"\n[Phase 3] Cosine similarity (original vs consolidated): "
-            f"{cosine_sim:.6f} (threshold: {cosine_threshold})"
+            f"\n[Phase 2] AutoModel reload cosine similarity: {cosine_sim:.6f} "
+            f"(profile: {parity_profile}, threshold: {automodel_thresholds.cosine_similarity})"
         )
-    assert cosine_sim >= cosine_threshold, (
+    assert cosine_sim >= automodel_thresholds.cosine_similarity, (
         f"Cosine similarity between original and consolidated embeddings too low: "
-        f"{cosine_sim:.6f} < threshold {cosine_threshold}"
+        f"{cosine_sim:.6f} < threshold {automodel_thresholds.cosine_similarity}"
     )
 
     del restored_trainer
@@ -282,9 +300,9 @@ def test_checkpoint_robustness_biencoder():
     _barrier()
 
     # ------------------------------------------------------------------
-    # Phase 4 (optional): Reload with vanilla Hugging Face AutoModel
+    # Phase 3: Reload the consolidated checkpoint with vanilla Hugging Face AutoModel
     # ------------------------------------------------------------------
-    if check_hf_reload:
+    if hf_reload_enabled:
         hf_reload_sync_paths = _prepare_hf_reload_sync(cfg)
         hf_reload_error = None
         if _rank0():
@@ -303,19 +321,19 @@ def test_checkpoint_robustness_biencoder():
                 query_cosine_sim = _cosine_similarity(hf_reference_query, hf_query)
                 document_cosine_sim = _cosine_similarity(hf_reference_document, hf_document)
                 print(
-                    f"\n[Phase 4] HF reload query cosine similarity: {query_cosine_sim:.6f}; "
+                    f"\n[Phase 3] HF reload query cosine similarity: {query_cosine_sim:.6f}; "
                     f"image-document cosine similarity: {document_cosine_sim:.6f} "
-                    f"(threshold: {hf_cosine_threshold})"
+                    f"(profile: {parity_profile}, threshold: {hf_thresholds.cosine_similarity})"
                 )
-                if query_cosine_sim < hf_cosine_threshold:
+                if query_cosine_sim < hf_thresholds.cosine_similarity:
                     hf_reload_error = (
                         f"HF-reloaded query embedding cosine similarity too low: "
-                        f"{query_cosine_sim:.6f} < threshold {hf_cosine_threshold}"
+                        f"{query_cosine_sim:.6f} < threshold {hf_thresholds.cosine_similarity}"
                     )
-                if document_cosine_sim < hf_cosine_threshold:
+                if document_cosine_sim < hf_thresholds.cosine_similarity:
                     document_error = (
                         f"HF-reloaded image-document embedding cosine similarity too low: "
-                        f"{document_cosine_sim:.6f} < threshold {hf_cosine_threshold}"
+                        f"{document_cosine_sim:.6f} < threshold {hf_thresholds.cosine_similarity}"
                     )
                     hf_reload_error = "\n".join(filter(None, (hf_reload_error, document_error)))
                 del hf_model
@@ -326,9 +344,9 @@ def test_checkpoint_robustness_biencoder():
         assert hf_reload_error is None, hf_reload_error
 
     # ------------------------------------------------------------------
-    # Phase 5 (optional): restore the exact Phase 1 boundary and replay its continuation.
+    # Phase 4: restore the exact Phase 1 boundary and replay its continuation.
     # ------------------------------------------------------------------
-    if check_resume:
+    if resume_enabled:
         assert resume_plan is not None
         reference_trajectory = _load_reference_trajectory(resume_plan)
         checkpoint_path = _checkpoint_for_completed_steps(resume_plan, resume_plan.boundary_step)
