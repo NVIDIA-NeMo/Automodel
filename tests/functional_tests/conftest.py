@@ -133,6 +133,7 @@ _OVERRIDES = [
     "parity_sequence_length",
     "parity_threshold_overrides",
     "parity_tolerance_profile",
+    "parity_tolerance_profile_overrides",
     "resume_tolerance_profile",
     "resume_first_loss_threshold",
     "resume_loss_threshold",

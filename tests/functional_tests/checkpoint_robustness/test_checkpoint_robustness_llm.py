@@ -61,9 +61,11 @@ from nemo_automodel.shared.utils import dtype_from_str
 from tests.functional_tests.checkpoint_robustness.parity_metrics import (
     _apply_parity_threshold_overrides,
     _compute_parity_metrics,
+    _normalize_parity_profile_overrides,
     _normalize_parity_threshold_overrides,
     _parity_failures,
     _resolve_parity_thresholds,
+    _select_parity_profile,
     _validate_logits,
 )
 from tests.functional_tests.checkpoint_robustness.resume_trajectory import (
@@ -141,6 +143,7 @@ def _extract_custom_args(argv: list[str]) -> tuple[dict[str, object], list[str]]
         "--parity_sequence_length",
         "--parity_threshold_overrides",
         "--parity_tolerance_profile",
+        "--parity_tolerance_profile_overrides",
         "--resume_first_loss_threshold",
         "--resume_loss_threshold",
         "--resume_tolerance_profile",
@@ -192,6 +195,7 @@ def _extract_custom_args(argv: list[str]) -> tuple[dict[str, object], list[str]]
             raise ValueError("Removed checkpoint-robustness fields are not supported: " + ", ".join(removed_fields))
         default_on_control_keys = {
             "parity_threshold_overrides",
+            "parity_tolerance_profile_overrides",
             "skip_resume",
             "skip_source_load_parity",
         }
@@ -219,6 +223,16 @@ def _extract_custom_args(argv: list[str]) -> tuple[dict[str, object], list[str]]
         raw_threshold_overrides = yaml.safe_load(raw_threshold_overrides)
     if raw_threshold_overrides is not None:
         custom["parity_threshold_overrides"] = _normalize_parity_threshold_overrides(raw_threshold_overrides)
+
+    raw_profile_overrides = custom.get("parity_tolerance_profile_overrides")
+    if raw_profile_overrides is None:
+        raw_profile_overrides = ci_robustness.get("parity_tolerance_profile_overrides")
+    if isinstance(raw_profile_overrides, str):
+        import yaml
+
+        raw_profile_overrides = yaml.safe_load(raw_profile_overrides)
+    if raw_profile_overrides is not None:
+        custom["parity_tolerance_profile_overrides"] = _normalize_parity_profile_overrides(raw_profile_overrides)
 
     if "skip_source_load_parity" in cli_custom_keys:
         source_load_parity_enabled = False
@@ -566,6 +580,15 @@ def _comparison_threshold_overrides(custom_args: dict[str, object], comparison: 
     return all_overrides.get(comparison, {})
 
 
+def _comparison_profile(custom_args: dict[str, object], comparison: str) -> str:
+    """Return the comparison profile, falling back to the global profile."""
+    return _select_parity_profile(
+        str(custom_args.get("parity_tolerance_profile", "standard")),
+        custom_args.get("parity_tolerance_profile_overrides"),
+        comparison,
+    )
+
+
 def _source_load_parity_policy(custom_args: dict[str, object], *, enforce: bool = True) -> _LogitParityPolicy:
     """Build the Phase 0 source-load policy."""
     overrides = _comparison_threshold_overrides(custom_args, "source_load")
@@ -573,7 +596,7 @@ def _source_load_parity_policy(custom_args: dict[str, object], *, enforce: bool 
         phase="phase_0",
         comparison="source_load",
         comparison_kind="cross_framework",
-        profile=str(custom_args.get("parity_tolerance_profile", "standard")),
+        profile=_comparison_profile(custom_args, "source_load"),
         enforce=enforce and not bool(custom_args.get("skip_source_load_logit_parity", False)),
         mean_kl_threshold_override=overrides.get("mean_kl"),
         p95_kl_threshold_override=overrides.get("p95_kl"),
@@ -599,7 +622,7 @@ def _automodel_reload_parity_policy(custom_args: dict[str, object]) -> _LogitPar
         phase="phase_2",
         comparison="automodel_model_reload",
         comparison_kind="same_implementation",
-        profile=str(custom_args.get("parity_tolerance_profile", "standard")),
+        profile=_comparison_profile(custom_args, "automodel_reload"),
         enforce=not bool(custom_args.get("skip_automodel_reload_logit_parity", False)),
         mean_kl_threshold_override=overrides.get("mean_kl"),
         p95_kl_threshold_override=overrides.get("p95_kl"),
@@ -614,7 +637,7 @@ def _hf_reload_parity_policy(custom_args: dict[str, object]) -> _LogitParityPoli
         phase="phase_3",
         comparison="hf_export_reload",
         comparison_kind="cross_framework",
-        profile=str(custom_args.get("parity_tolerance_profile", "standard")),
+        profile=_comparison_profile(custom_args, "hf_reload"),
         enforce=not bool(custom_args.get("skip_hf_reload_logit_parity", False)),
         mean_kl_threshold_override=overrides.get("mean_kl"),
         p95_kl_threshold_override=overrides.get("p95_kl"),
@@ -629,7 +652,7 @@ def _cross_tp_parity_policy(custom_args: dict[str, object]) -> _LogitParityPolic
         phase="phase_5",
         comparison="cross_tp_reload",
         comparison_kind="cross_topology",
-        profile=str(custom_args.get("parity_tolerance_profile", "standard")),
+        profile=_comparison_profile(custom_args, "cross_tp"),
         mean_kl_threshold_override=overrides.get("mean_kl"),
         p95_kl_threshold_override=overrides.get("p95_kl"),
         cosine_threshold_override=overrides.get("cosine_similarity"),
@@ -2048,7 +2071,7 @@ def _run_vanilla_hf_reload(
                 _repeatability_policy(
                     phase="phase_3",
                     comparison="hf_export_self_repeat",
-                    profile=str(custom_args.get("parity_tolerance_profile", "standard")),
+                    profile=_comparison_profile(custom_args, "hf_reload"),
                 ),
             )
             del repeated_hf_logits
@@ -2093,7 +2116,7 @@ def _run_vanilla_hf_reload(
                 _repeatability_policy(
                     phase="phase_3",
                     comparison="hf_export_self_repeat",
-                    profile=str(custom_args.get("parity_tolerance_profile", "standard")),
+                    profile=_comparison_profile(custom_args, "hf_reload"),
                 ),
             )
             del repeated_hf_logits
@@ -2232,7 +2255,7 @@ def _run_process_isolated_checkpoint_phase(
             experts_implementation=custom_args.get("experts_implementation", None),
             hf_device_map_auto=bool(custom_args.get("hf_device_map_auto", False)),
             hf_source_post_load_dequantize=bool(custom_args.get("hf_source_post_load_dequantize", False)),
-            parity_tolerance_profile=str(custom_args.get("parity_tolerance_profile", "standard")),
+            parity_tolerance_profile=_comparison_profile(custom_args, "source_load"),
         )
         if _preinit_global_rank() == 0:
             assert source_load_reference is not None, "rank 0 source-load reference was not captured"
@@ -2793,7 +2816,7 @@ def run_checkpoint_robustness(
             experts_implementation=experts_implementation,
             hf_device_map_auto=hf_device_map_auto,
             hf_source_post_load_dequantize=hf_source_post_load_dequantize,
-            parity_tolerance_profile=str(custom_args.get("parity_tolerance_profile", "standard")),
+            parity_tolerance_profile=_comparison_profile(custom_args, "source_load"),
         )
         _barrier()
         _report_phase("Phase 0: vanilla-HF source-load reference complete")

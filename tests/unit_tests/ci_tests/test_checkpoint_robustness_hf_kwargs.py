@@ -779,6 +779,9 @@ def test_extract_custom_args_reads_semantic_skips_and_parity_settings(tmp_path):
         "    trust_remote_code: false\n"
         "    parity_sequence_length: 1024\n"
         "    parity_tolerance_profile: relaxed\n"
+        "    parity_tolerance_profile_overrides:\n"
+        "      source_load: strict\n"
+        "      hf_reload: standard\n"
         "    parity_threshold_overrides:\n"
         "      source_load: {mean_kl: 0.01}\n"
         "      automodel_reload: {mean_kl: 0.04, cosine_similarity: 0.99}\n"
@@ -797,6 +800,10 @@ def test_extract_custom_args_reads_semantic_skips_and_parity_settings(tmp_path):
     assert custom["trust_remote_code"] is False
     assert custom["parity_sequence_length"] == "1024"
     assert custom["parity_tolerance_profile"] == "relaxed"
+    assert custom["parity_tolerance_profile_overrides"] == {
+        "source_load": "strict",
+        "hf_reload": "standard",
+    }
     assert custom["parity_threshold_overrides"] == {
         "source_load": {"mean_kl": 0.01},
         "automodel_reload": {"mean_kl": 0.04, "cosine_similarity": 0.99},
@@ -822,6 +829,15 @@ def test_extract_custom_args_accepts_resume_tolerance_profile_and_numeric_overri
 
     assert custom["resume_tolerance_profile"] == "relaxed"
     assert custom["resume_loss_threshold"] == "0.02"
+    assert remaining == ["--other-arg"]
+
+
+def test_extract_custom_args_accepts_cli_profile_overrides():
+    custom, remaining = _extract_custom_args(
+        ["--parity_tolerance_profile_overrides", "{hf_reload: relaxed}", "--other-arg"]
+    )
+
+    assert custom["parity_tolerance_profile_overrides"] == {"hf_reload": "relaxed"}
     assert remaining == ["--other-arg"]
 
 
@@ -1345,9 +1361,14 @@ def test_repeatability_policy_is_same_implementation_and_informational():
     assert policy.enforce is False
 
 
-def test_parity_policies_use_structured_per_comparison_threshold_overrides():
+def test_parity_policies_use_structured_per_comparison_profile_and_threshold_overrides():
     custom_args = {
-        "parity_tolerance_profile": "relaxed",
+        "parity_tolerance_profile": "standard",
+        "parity_tolerance_profile_overrides": {
+            "source_load": "strict",
+            "hf_reload": "relaxed",
+            "cross_tp": "relaxed",
+        },
         "parity_threshold_overrides": {
             "source_load": {"mean_kl": 0.01},
             "automodel_reload": {"mean_kl": 0.04, "cosine_similarity": 0.99},
@@ -1361,12 +1382,15 @@ def test_parity_policies_use_structured_per_comparison_threshold_overrides():
     hf = _hf_reload_parity_policy(custom_args)
     cross_tp = _cross_tp_parity_policy(custom_args)
 
+    assert source.profile == "strict"
     assert source.mean_kl_threshold_override == 0.01
-    assert automodel.profile == "relaxed"
+    assert automodel.profile == "standard"
     assert automodel.mean_kl_threshold_override == 0.04
     assert automodel.p95_kl_threshold_override is None
     assert automodel.cosine_threshold_override == 0.99
+    assert hf.profile == "relaxed"
     assert hf.p95_kl_threshold_override == 0.08
+    assert cross_tp.profile == "relaxed"
     assert cross_tp.cosine_threshold_override == 0.997
 
 
@@ -1614,6 +1638,8 @@ def test_biencoder_robustness_reads_current_settings_from_config(tmp_path):
         "    skip_hf_reload: true\n"
         "    skip_resume: true\n"
         "    parity_tolerance_profile: relaxed\n"
+        "    parity_tolerance_profile_overrides:\n"
+        "      hf_reload: standard\n"
         "    parity_threshold_overrides:\n"
         "      automodel_reload: {cosine_similarity: 0.997}\n"
         "      hf_reload: {cosine_similarity: 0.996}\n"
@@ -1627,6 +1653,7 @@ def test_biencoder_robustness_reads_current_settings_from_config(tmp_path):
         "skip_hf_reload": True,
         "skip_resume": True,
         "parity_tolerance_profile": "relaxed",
+        "parity_tolerance_profile_overrides": {"hf_reload": "standard"},
         "parity_threshold_overrides": {
             "automodel_reload": {"cosine_similarity": 0.997},
             "hf_reload": {"cosine_similarity": 0.996},
@@ -1660,6 +1687,16 @@ def test_biencoder_robustness_rejects_non_cosine_threshold_overrides(tmp_path):
     )
 
     with pytest.raises(ValueError, match="hf_reload supports only cosine_similarity"):
+        _extract_biencoder_custom_args(["--config", str(config_path)])
+
+
+def test_biencoder_robustness_rejects_unsupported_profile_comparison(tmp_path):
+    config_path = tmp_path / "recipe.yaml"
+    config_path.write_text(
+        "ci:\n  checkpoint_robustness:\n    parity_tolerance_profile_overrides:\n      source_load: relaxed\n"
+    )
+
+    with pytest.raises(ValueError, match="supports only automodel_reload and hf_reload"):
         _extract_biencoder_custom_args(["--config", str(config_path)])
 
 

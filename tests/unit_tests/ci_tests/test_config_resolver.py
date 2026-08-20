@@ -467,6 +467,8 @@ def test_end_to_end_fixture_keys_not_applied_as_overrides(tmp_path):
         "    resume_first_loss_threshold: 1e-6           # fixture arg, must NOT become top-level\n"
         "    parity_sequence_length: 1024                # fixture arg, must NOT become top-level\n"
         "    parity_tolerance_profile: strict            # fixture arg, must NOT become top-level\n"
+        "    parity_tolerance_profile_overrides:         # fixture arg, must NOT become top-level\n"
+        "      hf_reload: relaxed\n"
         "    tokenizer_name: nvidia/Test                 # fixture arg, must NOT become top-level\n"
         "    dataset.limit_dataset_samples: 500          # dotted -> applied as override\n"
     )
@@ -490,6 +492,7 @@ def test_end_to_end_fixture_keys_not_applied_as_overrides(tmp_path):
     assert "resume_first_loss_threshold" not in resolved
     assert "parity_sequence_length" not in resolved
     assert "parity_tolerance_profile" not in resolved
+    assert "parity_tolerance_profile_overrides" not in resolved
     assert "tokenizer_name" not in resolved
     assert resolved["ci"]["checkpoint_robustness"]["parity_threshold_overrides"] == {
         "source_load": {"mean_kl": 1e-2},
@@ -507,6 +510,7 @@ def test_end_to_end_fixture_keys_not_applied_as_overrides(tmp_path):
     assert resolved["ci"]["checkpoint_robustness"]["resume_first_loss_threshold"] == 1e-6
     assert resolved["ci"]["checkpoint_robustness"]["parity_sequence_length"] == 1024
     assert resolved["ci"]["checkpoint_robustness"]["parity_tolerance_profile"] == "strict"
+    assert resolved["ci"]["checkpoint_robustness"]["parity_tolerance_profile_overrides"] == {"hf_reload": "relaxed"}
 
 
 @pytest.mark.parametrize(
@@ -546,7 +550,8 @@ def test_vlm_checkpoint_robustness_recipes_resolve(tmp_path, recipe_path):
         assert robustness["hf_device_map_auto"] is True
     if "/mistral4/" in recipe_path:
         assert robustness["hf_source_post_load_dequantize"] is True
-        assert robustness["parity_tolerance_profile"] == "relaxed"
+        assert "parity_tolerance_profile" not in robustness
+        assert robustness["parity_tolerance_profile_overrides"] == {"hf_reload": "relaxed"}
         for key in (
             "kl_threshold",
             "source_load_kl_threshold",

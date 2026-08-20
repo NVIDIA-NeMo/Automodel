@@ -20,6 +20,7 @@ KL divergence.
 
 Launch: torchrun --nproc-per-node=<N> -m <this_module> --config <config.yaml>
     [--parity_tolerance_profile <strict|standard|relaxed>]
+    [--parity_tolerance_profile_overrides <yaml-mapping>]
     [--parity_threshold_overrides <yaml-mapping>]
     [--skip_hf_reload] [--skip_resume]
     [--resume_tolerance_profile <strict|standard|relaxed>]
@@ -41,8 +42,10 @@ from nemo_automodel.components.config._arg_parser import parse_args_and_load_con
 from nemo_automodel.recipes.retrieval.train_bi_encoder import TrainBiEncoderRecipe
 from tests.functional_tests.checkpoint_robustness.parity_metrics import (
     _apply_parity_threshold_overrides,
+    _normalize_parity_profile_overrides,
     _normalize_parity_threshold_overrides,
     _resolve_parity_thresholds,
+    _select_parity_profile,
 )
 from tests.functional_tests.checkpoint_robustness.resume_trajectory import (
     _checkpoint_for_completed_steps,
@@ -86,6 +89,7 @@ def _extract_custom_args(argv: list[str]) -> tuple[dict[str, object], list[str]]
     custom_keys = {
         "--parity_threshold_overrides",
         "--parity_tolerance_profile",
+        "--parity_tolerance_profile_overrides",
         "--training_reproducibility_loss_threshold",
         "--resume_first_loss_threshold",
         "--resume_loss_threshold",
@@ -127,7 +131,7 @@ def _extract_custom_args(argv: list[str]) -> tuple[dict[str, object], list[str]]
             if key in custom or key not in ci_robustness:
                 continue
             value = ci_robustness[key]
-            if key == "parity_threshold_overrides":
+            if key in {"parity_threshold_overrides", "parity_tolerance_profile_overrides"}:
                 custom[key] = value
                 continue
             if isinstance(value, bool):
@@ -155,6 +159,20 @@ def _extract_custom_args(argv: list[str]) -> tuple[dict[str, object], list[str]]
                     + ", ".join(unsupported_metrics)
                 )
         custom["parity_threshold_overrides"] = threshold_overrides
+    raw_profile_overrides = custom.get("parity_tolerance_profile_overrides")
+    if isinstance(raw_profile_overrides, str):
+        import yaml
+
+        raw_profile_overrides = yaml.safe_load(raw_profile_overrides)
+    if raw_profile_overrides is not None:
+        profile_overrides = _normalize_parity_profile_overrides(raw_profile_overrides)
+        unsupported_comparisons = sorted(set(profile_overrides) - {"automodel_reload", "hf_reload"})
+        if unsupported_comparisons:
+            raise ValueError(
+                "Retrieval parity_tolerance_profile_overrides supports only automodel_reload and hf_reload, got "
+                + ", ".join(unsupported_comparisons)
+            )
+        custom["parity_tolerance_profile_overrides"] = profile_overrides
     _resolve_parity_thresholds(str(custom.get("parity_tolerance_profile", "standard")), "same_implementation")
     return custom, remaining
 
@@ -217,12 +235,22 @@ def test_checkpoint_robustness_biencoder():
     threshold_overrides = _normalize_parity_threshold_overrides(custom_args.get("parity_threshold_overrides"))
     automodel_overrides = threshold_overrides.get("automodel_reload", {})
     hf_overrides = threshold_overrides.get("hf_reload", {})
-    automodel_thresholds = _resolve_parity_thresholds(parity_profile, "same_implementation")
+    automodel_thresholds = _resolve_parity_thresholds(
+        _select_parity_profile(
+            parity_profile,
+            custom_args.get("parity_tolerance_profile_overrides"),
+            "automodel_reload",
+        ),
+        "same_implementation",
+    )
     automodel_thresholds = _apply_parity_threshold_overrides(
         automodel_thresholds,
         cosine_similarity=automodel_overrides.get("cosine_similarity"),
     )
-    hf_thresholds = _resolve_parity_thresholds(parity_profile, "cross_framework")
+    hf_thresholds = _resolve_parity_thresholds(
+        _select_parity_profile(parity_profile, custom_args.get("parity_tolerance_profile_overrides"), "hf_reload"),
+        "cross_framework",
+    )
     hf_thresholds = _apply_parity_threshold_overrides(
         hf_thresholds,
         cosine_similarity=hf_overrides.get("cosine_similarity"),

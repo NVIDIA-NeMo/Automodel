@@ -24,7 +24,7 @@ import torch
 import torch.nn.functional as F
 
 _ComparisonKind = Literal["same_implementation", "cross_framework", "cross_topology"]
-_PARITY_OVERRIDE_COMPARISONS = {"source_load", "automodel_reload", "hf_reload", "cross_tp"}
+_PARITY_COMPARISONS = {"source_load", "automodel_reload", "hf_reload", "cross_tp"}
 _PARITY_OVERRIDE_METRICS = {"mean_kl", "p95_kl", "cosine_similarity"}
 
 
@@ -196,6 +196,43 @@ def _resolve_parity_thresholds(profile: str, comparison_kind: _ComparisonKind) -
     return _PARITY_PROFILES[profile][comparison_kind]
 
 
+def _normalize_parity_profile_overrides(raw_overrides: object) -> dict[str, str]:
+    """Validate and normalize optional per-comparison profile overrides."""
+    if raw_overrides is None:
+        return {}
+    if not isinstance(raw_overrides, dict):
+        raise ValueError("parity_tolerance_profile_overrides must be a mapping")
+
+    non_string_comparisons = [repr(comparison) for comparison in raw_overrides if not isinstance(comparison, str)]
+    if non_string_comparisons:
+        raise ValueError(
+            "parity_tolerance_profile_overrides comparison names must be strings, got "
+            + ", ".join(non_string_comparisons)
+        )
+    unknown_comparisons = sorted(set(raw_overrides) - _PARITY_COMPARISONS)
+    if unknown_comparisons:
+        raise ValueError(
+            "Unknown parity_tolerance_profile_overrides comparisons: "
+            f"{', '.join(unknown_comparisons)}; expected one of {sorted(_PARITY_COMPARISONS)}"
+        )
+
+    normalized: dict[str, str] = {}
+    for comparison, profile in raw_overrides.items():
+        if not isinstance(profile, str):
+            raise ValueError(f"parity_tolerance_profile_overrides.{comparison} must be a profile name")
+        _resolve_parity_thresholds(profile, "same_implementation")
+        normalized[comparison] = profile
+    return normalized
+
+
+def _select_parity_profile(default_profile: str, raw_overrides: object, comparison: str) -> str:
+    """Select one comparison profile, falling back to the global profile."""
+    _resolve_parity_thresholds(default_profile, "same_implementation")
+    if comparison not in _PARITY_COMPARISONS:
+        raise ValueError(f"Unknown parity comparison {comparison!r}; expected one of {sorted(_PARITY_COMPARISONS)}")
+    return _normalize_parity_profile_overrides(raw_overrides).get(comparison, default_profile)
+
+
 def _apply_parity_threshold_overrides(
     thresholds: _ParityThresholds,
     *,
@@ -230,11 +267,11 @@ def _normalize_parity_threshold_overrides(raw_overrides: object) -> dict[str, di
         raise ValueError(
             "parity_threshold_overrides comparison names must be strings, got " + ", ".join(non_string_comparisons)
         )
-    unknown_comparisons = sorted(set(raw_overrides) - _PARITY_OVERRIDE_COMPARISONS)
+    unknown_comparisons = sorted(set(raw_overrides) - _PARITY_COMPARISONS)
     if unknown_comparisons:
         raise ValueError(
             "Unknown parity_threshold_overrides comparisons: "
-            f"{', '.join(unknown_comparisons)}; expected one of {sorted(_PARITY_OVERRIDE_COMPARISONS)}"
+            f"{', '.join(unknown_comparisons)}; expected one of {sorted(_PARITY_COMPARISONS)}"
         )
 
     normalized: dict[str, dict[str, float]] = {}

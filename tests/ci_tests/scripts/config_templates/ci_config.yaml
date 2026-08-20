@@ -129,6 +129,9 @@ fixture_keys:
     # emitted for calibration.
     - parity_sequence_length
     - parity_tolerance_profile
+    # Optional source_load, automodel_reload, hf_reload, or cross_tp profile
+    # selections. Unspecified comparisons inherit parity_tolerance_profile.
+    - parity_tolerance_profile_overrides
     # Prefer a profile. This optional mapping overrides only specified gates
     # for a measured one-model exception in source_load, automodel_reload,
     # hf_reload, or cross_tp; every other gate remains profile-owned.

@@ -124,8 +124,10 @@ ci:
   checkpoint_robustness:
     # PP=4 with pp_microbatch_size=1 requires at least four pipeline microbatches.
     step_scheduler.local_batch_size: 4
-    # The PP4/EP8 cross-framework path has measured long-context BF16 drift.
-    parity_tolerance_profile: relaxed
+    # The original source and AutoModel reload pass standard. Only the PP4/EP8
+    # post-training HF reload has measured long-context BF16 drift.
+    parity_tolerance_profile_overrides:
+      hf_reload: relaxed
     hf_device_map_auto: true
     # Transformers' load-time dequantization leaves Mistral4 expert weights in
     # FP8, while native forward requires an optional kernel absent from CI.

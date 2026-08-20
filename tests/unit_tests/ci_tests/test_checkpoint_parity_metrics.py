@@ -19,9 +19,11 @@ import torch.nn.functional as F
 from tests.functional_tests.checkpoint_robustness.parity_metrics import (
     _apply_parity_threshold_overrides,
     _compute_parity_metrics,
+    _normalize_parity_profile_overrides,
     _normalize_parity_threshold_overrides,
     _parity_failures,
     _resolve_parity_thresholds,
+    _select_parity_profile,
     _validate_logits,
 )
 
@@ -154,6 +156,44 @@ def test_selected_numeric_overrides_preserve_other_profile_gates():
     assert overridden.mean_kl == 4e-2
     assert overridden.p95_kl == relaxed.p95_kl
     assert overridden.cosine_similarity == 0.99
+
+
+def test_structured_profile_overrides_accept_every_comparison():
+    overrides = _normalize_parity_profile_overrides(
+        {
+            "source_load": "strict",
+            "automodel_reload": "standard",
+            "hf_reload": "relaxed",
+            "cross_tp": "standard",
+        }
+    )
+
+    assert overrides == {
+        "source_load": "strict",
+        "automodel_reload": "standard",
+        "hf_reload": "relaxed",
+        "cross_tp": "standard",
+    }
+
+
+def test_comparison_profile_override_falls_back_to_global_profile():
+    overrides = {"hf_reload": "relaxed"}
+
+    assert _select_parity_profile("standard", overrides, "hf_reload") == "relaxed"
+    assert _select_parity_profile("standard", overrides, "source_load") == "standard"
+
+
+@pytest.mark.parametrize(
+    ("overrides", "error"),
+    [
+        ({"unknown": "relaxed"}, "Unknown parity_tolerance_profile_overrides comparisons"),
+        ({"hf_reload": 1}, "hf_reload must be a profile name"),
+        ({"hf_reload": "custom"}, "Unknown parity tolerance profile"),
+    ],
+)
+def test_structured_profile_overrides_reject_invalid_schema(overrides, error):
+    with pytest.raises(ValueError, match=error):
+        _normalize_parity_profile_overrides(overrides)
 
 
 def test_structured_threshold_overrides_accept_partial_gates_for_every_comparison():
