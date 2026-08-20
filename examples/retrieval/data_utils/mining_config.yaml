@@ -16,12 +16,20 @@
 # The model is loaded directly from --mining.model_name_or_path,
 # so no model architecture config is needed here.
 #
-# Usage:
-# torchrun --nproc_per_node=8 ./examples/retrieval/data_utils/mine_hard_negatives.py \
+# Single-node usage:
+# uv run torchrun --standalone --nproc_per_node=8 ./examples/retrieval/data_utils/mine_hard_negatives.py \
 #     --config examples/retrieval/data_utils/mining_config.yaml \
-#     --mining.model_name_or_path /path/to/encoder/checkpoint \
+#     --mining.model_name_or_path ./output/llama3_2_1b_encoder/checkpoints/epoch_0_step_499/model/consolidated \
 #     --mining.train_qa_file_path /path/to/input.json \
-#     --mining.train_file_output_path /path/to/output.json
+#     --mining.train_file_output_path /path/to/mined.json \
+#     --mining.cache_embeddings_dir /shared/path/to/cache/<run-specific-name> \
+#     --mining.query_prefix "query: " \
+#     --mining.passage_prefix "passage: " \
+#     --mining.query_max_length 512 \
+#     --mining.passage_max_length 512 \
+#     --mining.add_eos_token false
+#
+# For multi-node torchrun, use explicit rendezvous flags as shown in the retrieval fine-tuning guide.
 
 # Distributed environment settings
 dist_env:
@@ -30,45 +38,48 @@ dist_env:
 
 # Mining parameters - can be overridden via command line
 # Required parameters (must be provided via command line or here):
-#   mining.model_name_or_path: Path to encoder checkpoint
+#   mining.model_name_or_path: Path to a HF-loadable encoder export, such as
+#                              checkpoints/epoch_0_step_499/model/consolidated
 #   mining.train_qa_file_path: Input QA file
 #   mining.train_file_output_path: Output file with mined negatives
+#   mining.cache_embeddings_dir: Required for multi-rank torchrun; optional only for single-process mining.
+#                                Use a fresh path per model/dataset/prefix/length/corpus_chunk_size/world-size combination.
 
 mining:
   # Model path - REQUIRED (override via --mining.model_name_or_path)
-  # model_name_or_path: /path/to/encoder/checkpoint
+  # model_name_or_path: ./output/llama3_2_1b_encoder/checkpoints/epoch_0_step_499/model/consolidated
   
   # Tokenizer path - defaults to model_name_or_path if not specified
   # tokenizer_name_or_path: /path/to/tokenizer
 
-  # Tokenizer special token behavior
-  # 
-  # DEFAULT (recommended for Automodel-trained models):
-  #   Leave commented out to use Automodel's tokenizer defaults.
-  #   This ensures mining stays synchronized with training behavior.
-  #
-  # OVERRIDE (for models trained in other frameworks):
-  #   Uncomment and set explicitly only when mining with models trained
-  #   outside Automodel that used specific tokenizer configurations.
-  #
-  # Examples:
-  #   - Automodel models: Leave commented (uses Automodel defaults)
-  #   - nvidia/llama-embed-nemotron-8b: add_bos_token: true, add_eos_token: false
-  #   - Custom external model: Check training config and set accordingly
+  # Optional attention implementation for model loading: sdpa, eager, or flash_attention_2.
+  # attn_implementation: sdpa
+
+  # Tokenizer special token behavior. Match the tokenizer settings used during training.
+  # If left commented, mining falls back to tokenizer defaults, which may differ from
+  # the fine-tuning config.
   #
   # add_bos_token: true
   # add_eos_token: false
   
   # Input/Output - REQUIRED
   # train_qa_file_path: /path/to/input.json
-  # train_file_output_path: /path/to/output.json
+  # train_file_output_path: /path/to/mined.json
+  # Existing output files are rejected unless overwrite_output is true.
+  overwrite_output: false
   
-  # Caching (optional)
-  # cache_embeddings_dir: /path/to/cache
+  # Caching (required for multi-rank torchrun; use a shared writable path for multi-node).
+  # Use a fresh directory per model, dataset, prefix, sequence-length, corpus_chunk_size, and world-size combination.
+  # The miner validates cache metadata plus consolidated array shape/readability before reuse.
+  # Fresh directories are still clearest for mutable Hub IDs or overwritten local paths.
+  # cache_embeddings_dir: /path/to/cache/<run-specific-name>
+  # Set true only when every cached shard/chunk came from the same model/input/prefix/length/corpus_chunk_size/world-size run.
   load_embeddings_from_cache: false
   
   # Mining parameters
   hard_negatives_to_mine: 20
+  # hard_neg_margin_type=perc removes candidates scoring above min_positive_score * hard_neg_margin.
+  # hard_neg_margin_type=abs removes candidates scoring above min_positive_score - hard_neg_margin.
   hard_neg_margin: 0.95
   hard_neg_margin_type: perc
   mining_batch_size: 128
@@ -78,13 +89,19 @@ mining:
   document_embedding_batch_size: 16
   corpus_chunk_size: 50000
   
-  # Text prefixes (for models trained with prefixes)
+  # Text prefixes (for models trained with prefixes). Mining supports static prefixes only; if training used
+  # use_dataset_instruction, materialize equivalent instruction text into these prefixes or into the mining input.
   query_prefix: ""
   passage_prefix: ""
   
   # Maximum sequence lengths
   query_max_length: 512
   passage_max_length: 512
+  # pooling and l2_normalize are saved model metadata, not mining config keys.
+  # Do not add mining.pooling or mining.l2_normalize here; the miner rejects unknown keys.
+  # The miner supports single-vector pooling modes only (avg, weighted_avg, cls, last), not ColBERT pooling.
   
-  # Whether to include negatives from the input file
+  # Whether to include negatives from the input file. Existing negatives are prepended to the mined output;
+  # deduplicate/audit the final file before training:
+  # uv run python examples/retrieval/data_utils/audit_mined_negatives.py /path/to/mined.json --min-negatives 1 --allow-findings
   use_negatives_from_file: false
