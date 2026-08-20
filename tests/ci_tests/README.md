@@ -186,16 +186,26 @@ Use `strict` for deterministic same-kernel paths and `standard` for dense models
 Reserve `relaxed` for demonstrated discontinuous distributed behavior, normally expert-parallel MoE routing, and
 document the evidence in the recipe. Model size, TP/PP, or MoE status alone does not justify it. A dense model that
 exceeds `standard` should be investigated. If one verified model exceeds a shared profile after exact checkpoint
-state and within-process repeatability checks pass, override only its necessary Phase 2 gate with
-`automodel_reload_mean_kl_threshold`, `automodel_reload_p95_kl_threshold`, or
-`automodel_reload_cosine_threshold`; every unspecified gate remains inherited from the selected profile. The
-comparison class is selected by the harness. For every profile, a cross-topology comparison is never stricter than
-the same-implementation comparison because changing topology adds a numerical variation source.
+state and within-process repeatability checks pass, override only its necessary gate with
+`parity_threshold_overrides`; every unspecified comparison and metric remains inherited from the selected profile.
+The comparison class is selected by the harness. For every profile, a cross-topology comparison is never stricter
+than the same-implementation comparison because changing topology adds a numerical variation source.
+
+```yaml
+parity_tolerance_profile: relaxed
+parity_threshold_overrides:
+  automodel_reload:
+    mean_kl: 4e-2
+    cosine_similarity: 0.99
+```
+
+Supported comparison names are `source_load`, `automodel_reload`, `hf_reload`, and `cross_tp`; supported metric names
+are `mean_kl`, `p95_kl`, and `cosine_similarity`. Overrides are exceptional calibration escape hatches, not additional
+profiles. Max KL remains diagnostic and cannot be overridden.
 
 Legacy positive `check_*` controls, generic numeric cosine fields, and max-KL threshold fields are no longer accepted.
-All live recipes use default-on phases, semantic `skip_*` controls, and named profiles. The targeted
-`automodel_reload_*_threshold` fields replace only the named Phase 2 profile gate and remain available for a measured
-one-model exception.
+All live recipes use default-on phases, semantic `skip_*` controls, and named profiles. The optional structured
+`parity_threshold_overrides` mapping remains available for a measured one-model exception.
 
 Retrieval checkpoint robustness uses the same phase contract for Phases 1–4. Because a biencoder produces embeddings
 rather than language-model logits, its Phase 2 AutoModel reload gates the selected profile's same-implementation
@@ -218,8 +228,8 @@ to embedding outputs. Retrieval currently has no Phase 0 source-load or Phase 5 
 Removed fields map to the current contract as follows: omit `check_source_load_parity`, `check_hf_reload`, and
 `check_resume` to keep their phases enabled; use `skip_source_load_parity`, `skip_hf_reload`, or `skip_resume` to
 disable one. Use `skip_automodel_reload_logit_parity` and `skip_hf_reload_logit_parity` instead of their shorter legacy
-aliases. Replace generic or phase-specific legacy KL/cosine thresholds with `parity_tolerance_profile`; use a targeted
-`automodel_reload_*_threshold` only for a measured Phase 2 exception.
+aliases. Replace generic or phase-specific legacy KL/cosine thresholds with `parity_tolerance_profile`; use
+`parity_threshold_overrides` only for a measured exception that does not fit a shared profile.
 
 `ci.time` must cover both finetune and robustness. Resume adds one short restored continuation; it no longer launches a
 separate fresh baseline.

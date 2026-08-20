@@ -355,8 +355,9 @@ def test_calibration_recipes_enable_all_checkpoint_gates(tmp_path, recipe_path):
     assert "skip_source_load_parity" not in robustness
     if recipe_path.stem == "step3p7_medpix_200b_lora_pp8ep8_8node":
         assert robustness["parity_tolerance_profile"] == "relaxed"
-        assert robustness["automodel_reload_mean_kl_threshold"] == 4e-2
-        assert robustness["automodel_reload_cosine_threshold"] == 0.99
+        assert robustness["parity_threshold_overrides"] == {
+            "automodel_reload": {"mean_kl": 4e-2, "cosine_similarity": 0.99}
+        }
         assert robustness["resume_tolerance_profile"] == "relaxed"
     assert "skip_automodel_reload_logit_parity" not in robustness
     informational_source_and_hf = {
@@ -456,9 +457,11 @@ def test_end_to_end_fixture_keys_not_applied_as_overrides(tmp_path):
         "    skip_automodel_reload_logit_parity: true    # fixture arg, must NOT become top-level\n"
         "    skip_hf_reload_logit_parity: true           # fixture arg, must NOT become top-level\n"
         "    hf_adapter_ignored_key_prefix: base_model.model.mtp.  # fixture arg, must NOT become top-level\n"
-        "    automodel_reload_mean_kl_threshold: 4e-3    # fixture arg, must NOT become top-level\n"
-        "    automodel_reload_p95_kl_threshold: 2e-2     # fixture arg, must NOT become top-level\n"
-        "    automodel_reload_cosine_threshold: 0.998    # fixture arg, must NOT become top-level\n"
+        "    parity_threshold_overrides:                 # fixture arg, must NOT become top-level\n"
+        "      source_load: {mean_kl: 1e-2}\n"
+        "      automodel_reload: {p95_kl: 2e-2, cosine_similarity: 0.998}\n"
+        "      hf_reload: {mean_kl: 3e-2}\n"
+        "      cross_tp: {cosine_similarity: 0.997}\n"
         "    training_reproducibility_loss_threshold: 1e-2  # fixture arg, must NOT become top-level\n"
         "    resume_tolerance_profile: relaxed             # fixture arg, must NOT become top-level\n"
         "    resume_first_loss_threshold: 1e-6           # fixture arg, must NOT become top-level\n"
@@ -476,9 +479,7 @@ def test_end_to_end_fixture_keys_not_applied_as_overrides(tmp_path):
     assert resolved["dataset"]["limit_dataset_samples"] == 500
     # Fixture args stay under ci.checkpoint_robustness for the consumer (pytest) to read,
     # and do NOT pollute the top level.
-    assert "automodel_reload_mean_kl_threshold" not in resolved
-    assert "automodel_reload_p95_kl_threshold" not in resolved
-    assert "automodel_reload_cosine_threshold" not in resolved
+    assert "parity_threshold_overrides" not in resolved
     assert "skip_source_load_parity" not in resolved
     assert "skip_source_load_logit_parity" not in resolved
     assert "skip_automodel_reload_logit_parity" not in resolved
@@ -490,9 +491,12 @@ def test_end_to_end_fixture_keys_not_applied_as_overrides(tmp_path):
     assert "parity_sequence_length" not in resolved
     assert "parity_tolerance_profile" not in resolved
     assert "tokenizer_name" not in resolved
-    assert resolved["ci"]["checkpoint_robustness"]["automodel_reload_mean_kl_threshold"] == 4e-3
-    assert resolved["ci"]["checkpoint_robustness"]["automodel_reload_p95_kl_threshold"] == 2e-2
-    assert resolved["ci"]["checkpoint_robustness"]["automodel_reload_cosine_threshold"] == 0.998
+    assert resolved["ci"]["checkpoint_robustness"]["parity_threshold_overrides"] == {
+        "source_load": {"mean_kl": 1e-2},
+        "automodel_reload": {"p95_kl": 2e-2, "cosine_similarity": 0.998},
+        "hf_reload": {"mean_kl": 3e-2},
+        "cross_tp": {"cosine_similarity": 0.997},
+    }
     assert resolved["ci"]["checkpoint_robustness"]["skip_source_load_parity"] is True
     assert resolved["ci"]["checkpoint_robustness"]["skip_source_load_logit_parity"] is True
     assert resolved["ci"]["checkpoint_robustness"]["skip_automodel_reload_logit_parity"] is True

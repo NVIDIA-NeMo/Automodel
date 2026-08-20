@@ -21,6 +21,9 @@ from tests.ci_tests.utils.generate_ci_tests import generate_job, generate_pipeli
 
 def test_example_checkpoint_robustness_configs_do_not_use_removed_fields():
     removed_keys = {
+        "automodel_reload_cosine_threshold",
+        "automodel_reload_mean_kl_threshold",
+        "automodel_reload_p95_kl_threshold",
         "check_hf_reload",
         "check_resume",
         "check_source_load_parity",

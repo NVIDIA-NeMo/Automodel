@@ -175,8 +175,10 @@ ci:
     # self-repeat stayed bitwise zero. Keep the shared relaxed profile and override
     # only the two Phase 2 gates exceeded by this model; relaxed p95 remains active.
     parity_tolerance_profile: relaxed
-    automodel_reload_mean_kl_threshold: 4e-2
-    automodel_reload_cosine_threshold: 0.99
+    parity_threshold_overrides:
+      automodel_reload:
+        mean_kl: 4e-2
+        cosine_similarity: 0.99
     skip_source_load_logit_parity: true
     skip_hf_reload_logit_parity: true
     # Restored model/optimizer state and the first forward are exact. The

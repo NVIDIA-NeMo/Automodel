@@ -24,6 +24,8 @@ import torch
 import torch.nn.functional as F
 
 _ComparisonKind = Literal["same_implementation", "cross_framework", "cross_topology"]
+_PARITY_OVERRIDE_COMPARISONS = {"source_load", "automodel_reload", "hf_reload", "cross_tp"}
+_PARITY_OVERRIDE_METRICS = {"mean_kl", "p95_kl", "cosine_similarity"}
 
 
 @dataclass(frozen=True)
@@ -214,6 +216,57 @@ def _apply_parity_threshold_overrides(
         p95_kl=thresholds.p95_kl if p95_kl is None else p95_kl,
         cosine_similarity=thresholds.cosine_similarity if cosine_similarity is None else cosine_similarity,
     )
+
+
+def _normalize_parity_threshold_overrides(raw_overrides: object) -> dict[str, dict[str, float]]:
+    """Validate and normalize optional per-comparison profile threshold overrides."""
+    if raw_overrides is None:
+        return {}
+    if not isinstance(raw_overrides, dict):
+        raise ValueError("parity_threshold_overrides must be a mapping")
+
+    non_string_comparisons = [repr(comparison) for comparison in raw_overrides if not isinstance(comparison, str)]
+    if non_string_comparisons:
+        raise ValueError(
+            "parity_threshold_overrides comparison names must be strings, got " + ", ".join(non_string_comparisons)
+        )
+    unknown_comparisons = sorted(set(raw_overrides) - _PARITY_OVERRIDE_COMPARISONS)
+    if unknown_comparisons:
+        raise ValueError(
+            "Unknown parity_threshold_overrides comparisons: "
+            f"{', '.join(unknown_comparisons)}; expected one of {sorted(_PARITY_OVERRIDE_COMPARISONS)}"
+        )
+
+    normalized: dict[str, dict[str, float]] = {}
+    for comparison, raw_metrics in raw_overrides.items():
+        if not isinstance(raw_metrics, dict):
+            raise ValueError(f"parity_threshold_overrides.{comparison} must be a mapping")
+        non_string_metrics = [repr(metric) for metric in raw_metrics if not isinstance(metric, str)]
+        if non_string_metrics:
+            raise ValueError(
+                f"parity_threshold_overrides.{comparison} metric names must be strings, got "
+                + ", ".join(non_string_metrics)
+            )
+        unknown_metrics = sorted(set(raw_metrics) - _PARITY_OVERRIDE_METRICS)
+        if unknown_metrics:
+            raise ValueError(
+                f"Unknown parity_threshold_overrides.{comparison} metrics: {', '.join(unknown_metrics)}; "
+                f"expected one of {sorted(_PARITY_OVERRIDE_METRICS)}"
+            )
+
+        metrics: dict[str, float] = {}
+        for metric, raw_value in raw_metrics.items():
+            if isinstance(raw_value, bool) or not isinstance(raw_value, (int, float)):
+                raise ValueError(f"parity_threshold_overrides.{comparison}.{metric} must be numeric")
+            metrics[metric] = float(raw_value)
+        _apply_parity_threshold_overrides(
+            _ParityThresholds(mean_kl=0.0, p95_kl=0.0, cosine_similarity=0.0),
+            mean_kl=metrics.get("mean_kl"),
+            p95_kl=metrics.get("p95_kl"),
+            cosine_similarity=metrics.get("cosine_similarity"),
+        )
+        normalized[comparison] = metrics
+    return normalized
 
 
 def _parity_failures(

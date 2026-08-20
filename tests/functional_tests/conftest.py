@@ -131,13 +131,11 @@ _OVERRIDES = [
     "hf_reload_timeout_seconds",
     "training_reproducibility_loss_threshold",
     "parity_sequence_length",
+    "parity_threshold_overrides",
     "parity_tolerance_profile",
     "resume_tolerance_profile",
     "resume_first_loss_threshold",
     "resume_loss_threshold",
-    "automodel_reload_mean_kl_threshold",
-    "automodel_reload_p95_kl_threshold",
-    "automodel_reload_cosine_threshold",
 ]
 
 _BOOLEAN_OVERRIDES = [

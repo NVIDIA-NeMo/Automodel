@@ -129,11 +129,10 @@ fixture_keys:
     # emitted for calibration.
     - parity_sequence_length
     - parity_tolerance_profile
-    # Prefer a profile. These Phase 2-only overrides preserve every unspecified
-    # profile gate and are for measured one-model exceptions.
-    - automodel_reload_mean_kl_threshold
-    - automodel_reload_p95_kl_threshold
-    - automodel_reload_cosine_threshold
+    # Prefer a profile. This optional mapping overrides only specified gates
+    # for a measured one-model exception in source_load, automodel_reload,
+    # hf_reload, or cross_tp; every other gate remains profile-owned.
+    - parity_threshold_overrides
     - process_isolation
     # Independent normal-finetune versus checkpoint-Phase-1 metric. This is
     # reported separately and never gates checkpoint resume correctness.

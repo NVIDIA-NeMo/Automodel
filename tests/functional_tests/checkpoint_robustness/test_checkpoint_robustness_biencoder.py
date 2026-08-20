@@ -20,7 +20,7 @@ KL divergence.
 
 Launch: torchrun --nproc-per-node=<N> -m <this_module> --config <config.yaml>
     [--parity_tolerance_profile <strict|standard|relaxed>]
-    [--automodel_reload_cosine_threshold <float>]
+    [--parity_threshold_overrides <yaml-mapping>]
     [--skip_hf_reload] [--skip_resume]
     [--resume_tolerance_profile <strict|standard|relaxed>]
     [--resume_first_loss_threshold <float>] [--resume_loss_threshold <float>]
@@ -41,6 +41,7 @@ from nemo_automodel.components.config._arg_parser import parse_args_and_load_con
 from nemo_automodel.recipes.retrieval.train_bi_encoder import TrainBiEncoderRecipe
 from tests.functional_tests.checkpoint_robustness.parity_metrics import (
     _apply_parity_threshold_overrides,
+    _normalize_parity_threshold_overrides,
     _resolve_parity_thresholds,
 )
 from tests.functional_tests.checkpoint_robustness.resume_trajectory import (
@@ -69,13 +70,21 @@ from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm
 
 # Default test sentence for embedding extraction
 _DEFAULT_PROMPT = "The quick brown fox jumps over the lazy dog"
-_REMOVED_BIENCODER_FIELDS = {"check_hf_reload", "check_resume", "cosine_threshold", "hf_cosine_threshold"}
+_REMOVED_BIENCODER_FIELDS = {
+    "automodel_reload_cosine_threshold",
+    "automodel_reload_mean_kl_threshold",
+    "automodel_reload_p95_kl_threshold",
+    "check_hf_reload",
+    "check_resume",
+    "cosine_threshold",
+    "hf_cosine_threshold",
+}
 
 
-def _extract_custom_args(argv: list[str]) -> tuple[dict[str, str | bool], list[str]]:
+def _extract_custom_args(argv: list[str]) -> tuple[dict[str, object], list[str]]:
     """Separate test-specific CLI flags from config parser arguments."""
     custom_keys = {
-        "--automodel_reload_cosine_threshold",
+        "--parity_threshold_overrides",
         "--parity_tolerance_profile",
         "--training_reproducibility_loss_threshold",
         "--resume_first_loss_threshold",
@@ -83,7 +92,7 @@ def _extract_custom_args(argv: list[str]) -> tuple[dict[str, str | bool], list[s
         "--resume_tolerance_profile",
     }
     boolean_keys = {"--skip_hf_reload", "--skip_resume"}
-    custom: dict[str, str | bool] = {}
+    custom: dict[str, object] = {}
     remaining: list[str] = []
     i = 0
     while i < len(argv):
@@ -118,10 +127,34 @@ def _extract_custom_args(argv: list[str]) -> tuple[dict[str, str | bool], list[s
             if key in custom or key not in ci_robustness:
                 continue
             value = ci_robustness[key]
+            if key == "parity_threshold_overrides":
+                custom[key] = value
+                continue
             if isinstance(value, bool):
                 custom[key] = value
             else:
                 custom[key] = str(value)
+    raw_threshold_overrides = custom.get("parity_threshold_overrides")
+    if isinstance(raw_threshold_overrides, str):
+        import yaml
+
+        raw_threshold_overrides = yaml.safe_load(raw_threshold_overrides)
+    if raw_threshold_overrides is not None:
+        threshold_overrides = _normalize_parity_threshold_overrides(raw_threshold_overrides)
+        unsupported_comparisons = sorted(set(threshold_overrides) - {"automodel_reload", "hf_reload"})
+        if unsupported_comparisons:
+            raise ValueError(
+                "Retrieval parity_threshold_overrides supports only automodel_reload and hf_reload, got "
+                + ", ".join(unsupported_comparisons)
+            )
+        for comparison, overrides in threshold_overrides.items():
+            unsupported_metrics = sorted(set(overrides) - {"cosine_similarity"})
+            if unsupported_metrics:
+                raise ValueError(
+                    f"Retrieval parity_threshold_overrides.{comparison} supports only cosine_similarity, got "
+                    + ", ".join(unsupported_metrics)
+                )
+        custom["parity_threshold_overrides"] = threshold_overrides
     _resolve_parity_thresholds(str(custom.get("parity_tolerance_profile", "standard")), "same_implementation")
     return custom, remaining
 
@@ -181,16 +214,19 @@ def test_checkpoint_robustness_biencoder():
     custom_args, config_argv = _extract_custom_args(sys.argv[1:])
     sys.argv = [sys.argv[0]] + config_argv
     parity_profile = str(custom_args.get("parity_tolerance_profile", "standard"))
+    threshold_overrides = _normalize_parity_threshold_overrides(custom_args.get("parity_threshold_overrides"))
+    automodel_overrides = threshold_overrides.get("automodel_reload", {})
+    hf_overrides = threshold_overrides.get("hf_reload", {})
     automodel_thresholds = _resolve_parity_thresholds(parity_profile, "same_implementation")
     automodel_thresholds = _apply_parity_threshold_overrides(
         automodel_thresholds,
-        cosine_similarity=(
-            float(custom_args["automodel_reload_cosine_threshold"])
-            if "automodel_reload_cosine_threshold" in custom_args
-            else None
-        ),
+        cosine_similarity=automodel_overrides.get("cosine_similarity"),
     )
     hf_thresholds = _resolve_parity_thresholds(parity_profile, "cross_framework")
+    hf_thresholds = _apply_parity_threshold_overrides(
+        hf_thresholds,
+        cosine_similarity=hf_overrides.get("cosine_similarity"),
+    )
     hf_reload_enabled = not bool(custom_args.get("skip_hf_reload", False))
     resume_enabled = not bool(custom_args.get("skip_resume", False))
     training_reproducibility_loss_threshold = float(custom_args.get("training_reproducibility_loss_threshold", "5e-2"))

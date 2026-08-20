@@ -61,6 +61,7 @@ from nemo_automodel.shared.utils import dtype_from_str
 from tests.functional_tests.checkpoint_robustness.parity_metrics import (
     _apply_parity_threshold_overrides,
     _compute_parity_metrics,
+    _normalize_parity_threshold_overrides,
     _parity_failures,
     _resolve_parity_thresholds,
     _validate_logits,
@@ -89,6 +90,9 @@ datasets.disable_caching()
 _PARITY_DOCUMENT_PATH = Path(__file__).with_name("parity_document.mdx")
 _PARITY_DOCUMENT_SHA256 = "8f734b2ee925ab82afb56dfa3a512108b70d3c54a2489f7978a036420da34cdb"  # pragma: allowlist secret
 _REMOVED_CHECKPOINT_ROBUSTNESS_FIELDS = {
+    "automodel_reload_cosine_threshold",
+    "automodel_reload_mean_kl_threshold",
+    "automodel_reload_p95_kl_threshold",
     "check_hf_reload",
     "check_resume",
     "check_source_load_parity",
@@ -120,14 +124,11 @@ class _LogitParityPolicy:
     cosine_threshold_override: float | None = None
 
 
-def _extract_custom_args(argv: list[str]) -> tuple[dict[str, str | bool], list[str]]:
+def _extract_custom_args(argv: list[str]) -> tuple[dict[str, object], list[str]]:
     """Separate test-specific CLI flags from config parser arguments."""
     custom_keys = {
         "--isolated_phase",
         "--cross_tp_size",
-        "--automodel_reload_cosine_threshold",
-        "--automodel_reload_mean_kl_threshold",
-        "--automodel_reload_p95_kl_threshold",
         "--experts_implementation",
         "--hf_adapter_ignored_key_prefix",
         "--hf_device_map_cpu_max_memory_gib",
@@ -138,6 +139,7 @@ def _extract_custom_args(argv: list[str]) -> tuple[dict[str, str | bool], list[s
         "--max_cpu_gb",
         "--training_reproducibility_loss_threshold",
         "--parity_sequence_length",
+        "--parity_threshold_overrides",
         "--parity_tolerance_profile",
         "--resume_first_loss_threshold",
         "--resume_loss_threshold",
@@ -156,7 +158,7 @@ def _extract_custom_args(argv: list[str]) -> tuple[dict[str, str | bool], list[s
         "--skip_automodel_reload_logit_parity",
         "--skip_hf_reload_logit_parity",
     }
-    custom = {}
+    custom: dict[str, object] = {}
     remaining = []
     i = 0
     while i < len(argv):
@@ -189,6 +191,7 @@ def _extract_custom_args(argv: list[str]) -> tuple[dict[str, str | bool], list[s
         if removed_fields:
             raise ValueError("Removed checkpoint-robustness fields are not supported: " + ", ".join(removed_fields))
         default_on_control_keys = {
+            "parity_threshold_overrides",
             "skip_resume",
             "skip_source_load_parity",
         }
@@ -206,6 +209,16 @@ def _extract_custom_args(argv: list[str]) -> tuple[dict[str, str | bool], list[s
                     custom[k] = v
                 elif not isinstance(v, bool):
                     custom[k] = str(v)
+
+    raw_threshold_overrides = custom.get("parity_threshold_overrides")
+    if raw_threshold_overrides is None:
+        raw_threshold_overrides = ci_robustness.get("parity_threshold_overrides")
+    if isinstance(raw_threshold_overrides, str):
+        import yaml
+
+        raw_threshold_overrides = yaml.safe_load(raw_threshold_overrides)
+    if raw_threshold_overrides is not None:
+        custom["parity_threshold_overrides"] = _normalize_parity_threshold_overrides(raw_threshold_overrides)
 
     if "skip_source_load_parity" in cli_custom_keys:
         source_load_parity_enabled = False
@@ -547,14 +560,24 @@ def _compare_logits(
     return f"{policy.comparison} parity failed: " + "; ".join(active_failures)
 
 
-def _source_load_parity_policy(custom_args: dict[str, str | bool], *, enforce: bool = True) -> _LogitParityPolicy:
+def _comparison_threshold_overrides(custom_args: dict[str, object], comparison: str) -> dict[str, float]:
+    """Return normalized overrides for one comparison."""
+    all_overrides = _normalize_parity_threshold_overrides(custom_args.get("parity_threshold_overrides"))
+    return all_overrides.get(comparison, {})
+
+
+def _source_load_parity_policy(custom_args: dict[str, object], *, enforce: bool = True) -> _LogitParityPolicy:
     """Build the Phase 0 source-load policy."""
+    overrides = _comparison_threshold_overrides(custom_args, "source_load")
     return _LogitParityPolicy(
         phase="phase_0",
         comparison="source_load",
         comparison_kind="cross_framework",
         profile=str(custom_args.get("parity_tolerance_profile", "standard")),
         enforce=enforce and not bool(custom_args.get("skip_source_load_logit_parity", False)),
+        mean_kl_threshold_override=overrides.get("mean_kl"),
+        p95_kl_threshold_override=overrides.get("p95_kl"),
+        cosine_threshold_override=overrides.get("cosine_similarity"),
     )
 
 
@@ -569,50 +592,47 @@ def _repeatability_policy(*, phase: str, comparison: str, profile: str) -> _Logi
     )
 
 
-def _automodel_reload_parity_policy(custom_args: dict[str, str | bool]) -> _LogitParityPolicy:
+def _automodel_reload_parity_policy(custom_args: dict[str, object]) -> _LogitParityPolicy:
     """Build the Phase 2 AutoModel model-reload policy."""
+    overrides = _comparison_threshold_overrides(custom_args, "automodel_reload")
     return _LogitParityPolicy(
         phase="phase_2",
         comparison="automodel_model_reload",
         comparison_kind="same_implementation",
         profile=str(custom_args.get("parity_tolerance_profile", "standard")),
         enforce=not bool(custom_args.get("skip_automodel_reload_logit_parity", False)),
-        mean_kl_threshold_override=(
-            float(custom_args["automodel_reload_mean_kl_threshold"])
-            if "automodel_reload_mean_kl_threshold" in custom_args
-            else None
-        ),
-        p95_kl_threshold_override=(
-            float(custom_args["automodel_reload_p95_kl_threshold"])
-            if "automodel_reload_p95_kl_threshold" in custom_args
-            else None
-        ),
-        cosine_threshold_override=(
-            float(custom_args["automodel_reload_cosine_threshold"])
-            if "automodel_reload_cosine_threshold" in custom_args
-            else None
-        ),
+        mean_kl_threshold_override=overrides.get("mean_kl"),
+        p95_kl_threshold_override=overrides.get("p95_kl"),
+        cosine_threshold_override=overrides.get("cosine_similarity"),
     )
 
 
-def _hf_reload_parity_policy(custom_args: dict[str, str | bool]) -> _LogitParityPolicy:
+def _hf_reload_parity_policy(custom_args: dict[str, object]) -> _LogitParityPolicy:
     """Build the Phase 3 vanilla-HF export-reload policy."""
+    overrides = _comparison_threshold_overrides(custom_args, "hf_reload")
     return _LogitParityPolicy(
         phase="phase_3",
         comparison="hf_export_reload",
         comparison_kind="cross_framework",
         profile=str(custom_args.get("parity_tolerance_profile", "standard")),
         enforce=not bool(custom_args.get("skip_hf_reload_logit_parity", False)),
+        mean_kl_threshold_override=overrides.get("mean_kl"),
+        p95_kl_threshold_override=overrides.get("p95_kl"),
+        cosine_threshold_override=overrides.get("cosine_similarity"),
     )
 
 
-def _cross_tp_parity_policy(custom_args: dict[str, str | bool]) -> _LogitParityPolicy:
+def _cross_tp_parity_policy(custom_args: dict[str, object]) -> _LogitParityPolicy:
     """Build the optional Phase 5 cross-topology policy."""
+    overrides = _comparison_threshold_overrides(custom_args, "cross_tp")
     return _LogitParityPolicy(
         phase="phase_5",
         comparison="cross_tp_reload",
         comparison_kind="cross_topology",
         profile=str(custom_args.get("parity_tolerance_profile", "standard")),
+        mean_kl_threshold_override=overrides.get("mean_kl"),
+        p95_kl_threshold_override=overrides.get("p95_kl"),
+        cosine_threshold_override=overrides.get("cosine_similarity"),
     )
 
 
@@ -1864,7 +1884,7 @@ def _run_vanilla_hf_reload(
     reference_logits: torch.Tensor,
     *,
     hf_model_cls: type,
-    custom_args: dict[str, str | bool],
+    custom_args: dict[str, object],
 ) -> str | None:
     """Load the saved model with vanilla HF and validate its adapter and forward pass.
 
@@ -2142,7 +2162,7 @@ def _raise_distributed_failure(failure_message: str | None) -> None:
 def _run_process_isolated_checkpoint_phase(
     phase: str,
     *,
-    custom_args: dict[str, str | bool],
+    custom_args: dict[str, object],
     recipe_cls: type[BaseRecipe],
     hf_model_cls: type,
     input_ids_loader: Callable[[str | None], list[int]],

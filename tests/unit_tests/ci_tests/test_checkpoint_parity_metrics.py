@@ -19,6 +19,7 @@ import torch.nn.functional as F
 from tests.functional_tests.checkpoint_robustness.parity_metrics import (
     _apply_parity_threshold_overrides,
     _compute_parity_metrics,
+    _normalize_parity_threshold_overrides,
     _parity_failures,
     _resolve_parity_thresholds,
     _validate_logits,
@@ -153,6 +154,38 @@ def test_selected_numeric_overrides_preserve_other_profile_gates():
     assert overridden.mean_kl == 4e-2
     assert overridden.p95_kl == relaxed.p95_kl
     assert overridden.cosine_similarity == 0.99
+
+
+def test_structured_threshold_overrides_accept_partial_gates_for_every_comparison():
+    overrides = _normalize_parity_threshold_overrides(
+        {
+            "source_load": {"mean_kl": 0.01},
+            "automodel_reload": {"p95_kl": 0.02},
+            "hf_reload": {"cosine_similarity": 0.995},
+            "cross_tp": {"mean_kl": 0.03, "p95_kl": 0.04},
+        }
+    )
+
+    assert overrides == {
+        "source_load": {"mean_kl": 0.01},
+        "automodel_reload": {"p95_kl": 0.02},
+        "hf_reload": {"cosine_similarity": 0.995},
+        "cross_tp": {"mean_kl": 0.03, "p95_kl": 0.04},
+    }
+
+
+@pytest.mark.parametrize(
+    ("overrides", "error"),
+    [
+        ({"unknown": {"mean_kl": 0.01}}, "Unknown parity_threshold_overrides comparisons"),
+        ({"source_load": {"max_kl": 0.01}}, "Unknown parity_threshold_overrides.source_load metrics"),
+        ({"hf_reload": {"mean_kl": "0.01"}}, "hf_reload.mean_kl must be numeric"),
+        ({"cross_tp": {"cosine_similarity": 2.0}}, "cosine_similarity threshold override"),
+    ],
+)
+def test_structured_threshold_overrides_reject_invalid_schema(overrides, error):
+    with pytest.raises(ValueError, match=error):
+        _normalize_parity_threshold_overrides(overrides)
 
 
 @pytest.mark.parametrize("bad_threshold", [float("nan"), float("inf"), -1.0])
