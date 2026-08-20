@@ -115,14 +115,31 @@ def _save_metadata_shards(
     model_type: str,
     shard_size: int,
     extra_fields: Dict[str, Any],
+    shard_rank: int = 0,
+    shard_world: int = 1,
 ) -> None:
-    """Save metadata in shards and write config file."""
+    """Save metadata in shards and write config file.
+
+    When shard_world > 1, the index file and shard filenames are namespaced with the rank
+    so that multiple jobs sharing an output directory don't overwrite each other. Merge the
+    per-rank index files afterwards to produce a single unified metadata.json.
+    """
+    sharded = shard_world > 1
+    index_filename = f"metadata_r{shard_rank:02d}.json" if sharded else "metadata.json"
+
     shard_files = []
-    for shard_idx in range(0, len(all_metadata), shard_size):
-        shard_data = all_metadata[shard_idx : shard_idx + shard_size]
-        shard_file = output_dir / f"metadata_shard_{shard_idx // shard_size:04d}.json"
+    for chunk_start in range(0, len(all_metadata), shard_size):
+        chunk_data = all_metadata[chunk_start : chunk_start + shard_size]
+        chunk_idx = chunk_start // shard_size
+        # Preserve the original unsharded filename exactly (no rank namespacing) so a
+        # single-job run's output is unchanged; only namespace when actually sharding.
+        if sharded:
+            shard_name = f"metadata_shard_r{shard_rank:02d}_s{chunk_idx:04d}.json"
+        else:
+            shard_name = f"metadata_shard_{chunk_idx:04d}.json"
+        shard_file = output_dir / shard_name
         with open(shard_file, "w") as f:
-            json.dump(shard_data, f, indent=2)
+            json.dump(chunk_data, f, indent=2)
         shard_files.append(shard_file.name)
 
     metadata = {
@@ -135,8 +152,11 @@ def _save_metadata_shards(
         "shards": shard_files,
         **extra_fields,
     }
+    if sharded:
+        metadata["shard_rank"] = shard_rank
+        metadata["shard_world"] = shard_world
 
-    with open(output_dir / "metadata.json", "w") as f:
+    with open(output_dir / index_filename, "w") as f:
         json.dump(metadata, f, indent=2)
 
 
@@ -304,6 +324,8 @@ def preprocess_dataset(
     dataset_dir: Optional[str] = None,
     dataset_streaming: bool = False,
     dataset_trust_remote_code: Optional[bool] = None,
+    shard_idx: int = 0,
+    shard_count: int = 1,
 ):
     """
     Preprocess image dataset with one process per GPU.
@@ -326,6 +348,10 @@ def preprocess_dataset(
         dataset_dir: Optional directory for materialized HF media.
         dataset_streaming: Whether to stream the HF dataset.
         dataset_trust_remote_code: Optional trust_remote_code value for HF datasets.
+        shard_idx: Rank of this job within a multi-job sweep (0-indexed). Each rank
+            processes image_files[shard_idx::shard_count]. Lets preprocessing be split
+            across multiple nodes/jobs sharing one output_dir without collisions.
+        shard_count: Total number of jobs in the sweep. Default 1 (single-job mode).
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -383,6 +409,10 @@ def preprocess_dataset(
     if max_images is not None:
         image_files = image_files[:max_images]
 
+    if shard_count > 1:
+        image_files = image_files[shard_idx::shard_count]
+        logger.info("Shard %d/%d: %d images on this rank", shard_idx, shard_count, len(image_files))
+
     logger.info("Processing %d images", len(image_files))
 
     if not image_files:
@@ -418,6 +448,8 @@ def preprocess_dataset(
         processor.model_type,
         shard_size,
         {"caption_field": caption_field, "max_pixels": max_pixels},
+        shard_rank=shard_idx,
+        shard_world=shard_count,
     )
 
     # Print summary
@@ -1285,6 +1317,15 @@ Examples:
         "--caption_field", type=str, default="internvl", choices=["internvl", "usr"], help="Caption field in JSONL"
     )
     image_parser.add_argument("--max_images", type=int, default=None, help="Max images to process")
+    image_parser.add_argument(
+        "--shard_idx", type=int, default=0, help="Rank of this job within a multi-job sweep (0-indexed)"
+    )
+    image_parser.add_argument(
+        "--shard_count",
+        type=int,
+        default=1,
+        help="Total jobs in the sweep. When >1, this rank processes image_files[shard_idx::shard_count].",
+    )
 
     # Resolution options (mutually exclusive)
     image_res_group = image_parser.add_mutually_exclusive_group()
@@ -1444,6 +1485,10 @@ Examples:
     if args.command == "image":
         if (args.image_dir is None) == (args.dataset_name is None):
             parser.error("image requires exactly one of --image_dir or --dataset_name")
+        if args.shard_count < 1:
+            parser.error("--shard_count must be positive")
+        if not (0 <= args.shard_idx < args.shard_count):
+            parser.error("--shard_idx must satisfy 0 <= shard_idx < shard_count")
 
         if args.resolution_preset:
             max_pixels = MultiTierBucketCalculator.RESOLUTION_PRESETS[args.resolution_preset]
@@ -1470,6 +1515,8 @@ Examples:
             dataset_dir=args.dataset_dir,
             dataset_streaming=args.dataset_streaming,
             dataset_trust_remote_code=args.dataset_trust_remote_code,
+            shard_idx=args.shard_idx,
+            shard_count=args.shard_count,
         )
 
     elif args.command == "image-edit":
