@@ -387,6 +387,30 @@ class TestExtractTargetModules:
         assert "layers.0.mlp.down_proj" in result
         assert all(not m.startswith("model.") for m in result)
 
+    def test_adapter_target_module_hook_applied(self):
+        """An adapter exposing map_peft_target_module_to_hf rewrites the entries.
+
+        Adapters that rename modules between the native and checkpoint layouts
+        (e.g. Kimi K3's expert projections) convert the saved keys, so the
+        target_modules metadata has to follow or PEFT can't resolve it.
+        """
+
+        class _RenamingAdapter:
+            def map_peft_target_module_to_hf(self, name):
+                return name.replace(".mlp.experts.", ".block_sparse_moe.experts.")
+
+        model = _make_model_with_named_modules(
+            [
+                "model.layers.0.mlp.experts.0.gate_proj.lora_A",
+                "model.layers.0.self_attn.q_proj.lora_A",
+            ]
+        )
+        model.state_dict_adapter = _RenamingAdapter()
+        result = _extract_target_modules(model)
+        assert "model.layers.0.block_sparse_moe.experts.0.gate_proj" in result
+        assert "model.layers.0.self_attn.q_proj" in result
+        assert all(".mlp.experts." not in m for m in result)
+
 
 class TestMaybeStripQuantizationConfig:
     """Tests for _maybe_strip_quantization_config."""

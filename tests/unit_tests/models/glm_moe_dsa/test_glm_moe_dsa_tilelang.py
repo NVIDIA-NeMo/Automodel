@@ -1226,6 +1226,7 @@ def test_glm_dsa_tilelang_declares_validation_packing():
 
 def test_glm_dsa_tilelang_pipeline_metas_use_thd_shapes():
     config = _small_dsa_config()
+    config.indexer_types = ["shared"]
     backend = BackendConfig(attn="tilelang", linear="torch", rms_norm="torch", rope_fusion=False)
     model = GlmMoeDsaForCausalLM(config, backend=backend)
     model.lm_head = None
@@ -1251,6 +1252,7 @@ def test_glm_dsa_tilelang_pipeline_metas_use_thd_shapes():
 
 def test_glm_dsa_sdpa_pipeline_metas_cap_topk_by_seq_len():
     config = _small_dsa_config()
+    config.indexer_types = ["shared"]
     backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch", rope_fusion=False)
     model = GlmMoeDsaForCausalLM(config, backend=backend)
     model.lm_head = None
@@ -1265,6 +1267,39 @@ def test_glm_dsa_sdpa_pipeline_metas_cap_topk_by_seq_len():
 
     assert inputs_meta[1].shape == (4, seq_len, seq_len)
     assert outputs_meta[1].shape == (4, seq_len, seq_len)
+
+
+def test_glm_dsa_pipeline_metas_omit_topk_without_indexshare():
+    config = _small_dsa_config()
+    backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch", rope_fusion=False)
+    model = GlmMoeDsaForCausalLM(config, backend=backend)
+    model.lm_head = None
+
+    inputs_meta, outputs_meta = model.get_pipeline_stage_metas(
+        is_first=False,
+        microbatch_size=4,
+        seq_len=32,
+        dtype=torch.bfloat16,
+    )
+
+    assert len(inputs_meta) == 1
+    assert inputs_meta[0].shape == (4, 32, config.hidden_size)
+    assert len(outputs_meta) == 1
+    assert outputs_meta[0].shape == (4, 32, config.hidden_size)
+
+
+def test_glm_dsa_pipeline_stage_returns_only_hidden_without_indexshare(monkeypatch):
+    config = _small_dsa_config()
+    backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch", rope_fusion=False)
+    model = GlmMoeDsaForCausalLM(config, backend=backend)
+    model.model.embed_tokens = None
+    model.lm_head = None
+    hidden = torch.zeros(1, 4, config.hidden_size)
+    monkeypatch.setattr(model.model, "forward", lambda *args, **kwargs: (hidden, None))
+
+    output = model(hidden)
+
+    assert output is hidden
 
 
 @pytest.mark.parametrize("attn_backend", ["tilelang", "cudnn"])

@@ -415,6 +415,19 @@ class TestModelSupportsEP:
         assert model.supports.supports_ep is False
 
 
+class TestModelSupportsMTP:
+    def test_mtp_enabled_reflects_live_config(self):
+        model = _Bare()
+        model.mtp_config = SimpleNamespace(enabled=False)
+        _attach(model)
+
+        assert model.supports.mtp_enabled is False
+        model.mtp_config.enabled = True
+        assert model.supports.mtp_enabled is True
+        assert model.supports.supports_mtp_cp is False
+        assert model.supports.supports_mtp_cp_pp is False
+
+
 class TestModelSupportsSequencePacking:
     def test_true_with_seq_lens(self):
         model = _WithSeqLens()
