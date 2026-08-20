@@ -330,6 +330,7 @@ def test_three_depth_mtp_uses_future_positions_and_depth_aligned_rope(monkeypatc
         "torch_dtype": "float32",
         "moe_layers_enum": (),
         "layer_types": ["sliding_attention"] * 3,
+        "attention_other_setting": {},
     }
     wrapper = Step3p7ForConditionalGeneration(small_config(text_config=text_config), backend=backend())
     wrapper.model = FakeInnerModel()
