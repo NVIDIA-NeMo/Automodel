@@ -1029,6 +1029,7 @@ def test_cudnn_model_threads_padding_aware_attention_metadata(monkeypatch: pytes
 def test_cudnn_model_requires_packing_and_fixed_pipeline_topk() -> None:
     """cuDNN uses the packed CP hook and fixed-width pipeline top-k carry."""
     config = _small_dsa_config()
+    config.indexer_types = ["shared"]
     backend = BackendConfig(attn="cudnn", linear="torch", rms_norm="torch", rope_fusion=False)
     model = GlmMoeDsaForCausalLM(config, backend=backend)
     model.lm_head = None
