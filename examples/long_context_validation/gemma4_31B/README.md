@@ -178,24 +178,28 @@ when a checkpoint switches from text-only planning to structured tool calls.
 
 ### Result — SFT installs agentic behavior; the raw base has none
 
-Same instance, same scaffold; base vs a CoderForge-SFT checkpoint (~1B tokens):
+Base vs the **step-799** CoderForge SFT checkpoint, same OpenHands 3-tool scaffold,
+on 180 SWE-bench Lite tasks (3,988 assistant turns, 4,528 tool calls):
 
-| | Base `gemma-4-31B` (un-SFT'd) | CoderForge SFT on base |
+| | Base `gemma-4-31B` (un-SFT'd) | CoderForge SFT (step 799) |
 |---|---|---|
-| Structured `tool_calls` | **0 / 33** | **60 / 60** |
-| Turn-1 behavior | repeats a planning template | coherent `think`, correct root cause |
-| Intended actions | none | `view /testbed`, `ls -la`, `find *.py`, `cd /testbed` |
-| Failure mode | `never_toolcalled` (aborts) | args garbled by `\uXXXX` tokens |
+| Structured `tool_calls` | **0** (never emits one) | **3988 / 3988 turns = 100%** |
+| Tools used | none | `think` + `execute_bash` + `str_replace_editor` |
+| Turns per task | ~33 identical planning turns, then aborts | avg **22** (range 6–71) |
+| Arg fidelity | — | **clean** (0% `\uXXXX` garbage, 0/4528) |
+| Terminates (`finish`) | never acts (`never_toolcalled`) | 0 / 180 (empty patches) |
 
 **Base — never acts.** The raw base emits **zero** tool calls and repeats the same
-planning checklist verbatim every turn ("Phase 1. READING… 1.1 … 1.2 …"), for 33
-turns until the harness aborts (`never_toolcalled`). It plans forever and never acts.
+planning checklist verbatim every turn ("Phase 1. READING… 1.1 … 1.2 …") until the
+harness aborts (`never_toolcalled`) — a property of the raw pretrained model, not the
+checkpoint. It plans forever and never acts.
 
-**SFT — real agentic behavior.** After CoderForge SFT the model opens with a clean
-`think` that correctly diagnoses the bug, then drives the right exploration —
-**60/60 turns are structured OpenHands tool calls** (`view` → `ls` → `find` → `cd`).
-Its remaining rough edge is arg fidelity: ~83% of calls carry `\uXXXX`
-escape-garbage in arg values (`…ക്കാരിls -la /testbedക്കാരി…`).
+**SFT — real agentic behavior.** After CoderForge SFT the step-799 model opens each
+task with a `think` that diagnoses the bug, then drives real exploration: across 180
+Lite tasks **100% of turns (3988/3988) are structured OpenHands tool calls**
+(`execute_bash` ×3036, `str_replace_editor` ×1306, `think` ×186; ~22 turns/task, args
+clean — 0/4528 garbled). It does not yet emit `finish`, so the runs end without a
+landed patch (0/180).
 
 **Takeaway.** CoderForge SFT **installs the agentic process** (tool-calling,
 think-first, correct targeting) into a base model that had none — the goal of this
