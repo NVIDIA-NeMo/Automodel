@@ -530,14 +530,14 @@ class TestIndexShare:
         assert seen_prev[0] == "carry-in"  # first (shared) layer received the carried selection
         assert out_topk == "carry-in"  # and it is returned for the next stage
 
-    def test_get_pipeline_stage_metas_threads_topk(self, config, backend_config):
+    def test_pipeline_stage_metas_threads_topk(self, config, backend_config):
         model = GlmMoeDsaForCausalLM(config, backend=backend_config)
         mbs, seq_len = 2, 16
         topk = min(config.index_topk, seq_len)
 
         # First stage: input_ids in; (hidden, topk) out (non-last, since the full model here owns
         # both embed and lm_head, lm_head-present means last — so emulate first+non-last by dropping lm_head).
-        first_in, first_out = model.get_pipeline_stage_metas(
+        first_in, first_out = model.pipeline_stage_metas(
             is_first=True, microbatch_size=mbs, seq_len=seq_len, dtype=torch.bfloat16
         )
         assert len(first_in) == 1 and first_in[0].shape == (mbs, seq_len)  # input_ids
@@ -546,7 +546,7 @@ class TestIndexShare:
 
         # Emulate a middle stage: no embed_tokens, no lm_head -> hidden+topk in and out.
         model.lm_head = None
-        mid_in, mid_out = model.get_pipeline_stage_metas(
+        mid_in, mid_out = model.pipeline_stage_metas(
             is_first=False, microbatch_size=mbs, seq_len=seq_len, dtype=torch.bfloat16
         )
         # Top-k carry crosses the pipeline boundary as float32 (recv buffers must be grad-capable);

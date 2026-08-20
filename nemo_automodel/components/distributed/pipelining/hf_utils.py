@@ -20,6 +20,8 @@ from typing import TYPE_CHECKING, Callable, Optional, Union
 import torch
 import torch.nn as nn
 
+from nemo_automodel.shared.pipeline import PipelineForwardStyle, PipelineModelMixin
+
 if TYPE_CHECKING:
     pass
 
@@ -638,15 +640,12 @@ def _is_gemma4_vlm(model: torch.nn.Module) -> bool:
 
 
 def model_keeps_self_forward(model: torch.nn.Module) -> bool:
-    """Return True when *model* opts out of pipeline-aware forward patching.
+    """Return whether a model contract owns its pipeline-aware forward.
 
-    Used by the pipeline split call site to skip ``patch_hf_model_for_pp``
-    entirely for models whose own ``forward`` is already PP-aware (typically
-    because it pulls pixel_values out of ``self._vlm_pixel_values_chunks``
-    set by the training loop). Currently set on Qwen3-VL-MoE, Qwen3.5-MoE,
-    KimiVL, and Kimi-K2.5-VL.
+    Models using the generic HuggingFace pipeline path do not inherit
+    ``PipelineModelMixin`` and are patched by the shared implementation.
     """
-    return bool(getattr(type(model), "_pp_keep_self_forward", False))
+    return isinstance(model, PipelineModelMixin) and model.pipeline_forward_style is PipelineForwardStyle.MODEL
 
 
 def patch_hf_model_for_pp(model, patch_inner_model: bool = True, patch_causal_lm_model: bool = True) -> None:
@@ -762,8 +761,8 @@ def validate_hf_model_for_pipeline_support(model: torch.nn.Module) -> None:
         # VLM PP routing: vision_tower only runs on stage 0, and pixel_values
         # are passed through the training loop's _vlm_pixel_values_chunks
         # mechanism. The model class must either (a) be on the dedicated PP
-        # forward list (Gemma4 / Mistral3) or (b) declare
-        # _pp_keep_self_forward = True so its own forward is preserved.
+        # forward list (Gemma4 / Mistral3) or (b) own its forward through the
+        # explicit PipelineModelMixin contract.
         # Otherwise patch_hf_model_for_pp replaces forward with the generic
         # CausalLM path, which silently drops pixel_values and trains the
         # language model on placeholder text embeddings.
@@ -774,12 +773,12 @@ def validate_hf_model_for_pipeline_support(model: torch.nn.Module) -> None:
                 mt_outer in _PP_VLM_MODEL_TYPES_WITH_DEDICATED_FORWARD
                 or mt_inner in _PP_VLM_MODEL_TYPES_WITH_DEDICATED_FORWARD
             )
-            keeps_own = bool(getattr(type(model), "_pp_keep_self_forward", False))
+            keeps_own = model_keeps_self_forward(model)
             if not has_dedicated and not keeps_own:
                 issues.append(
                     f"VLM model_type='{mt_outer}' is not on the pipeline-aware list "
                     f"({', '.join(_PP_VLM_MODEL_TYPES_WITH_DEDICATED_FORWARD)}) and the model class "
-                    f"{type(model).__name__} does not declare ``_pp_keep_self_forward = True``. "
+                    f"{type(model).__name__} does not declare a model-owned pipeline forward. "
                     "Without one of these, patch_hf_model_for_pp will replace the model's forward "
                     "with the generic CausalLM forward, and pixel_values stored in "
                     "``_vlm_pixel_values_chunks`` will never reach the vision tower."

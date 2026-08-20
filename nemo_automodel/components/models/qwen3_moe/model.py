@@ -40,6 +40,7 @@ from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MLP, MoE
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
+from nemo_automodel.shared.pipeline import PipelineForwardStyle, PipelineModelMixin
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
@@ -238,7 +239,7 @@ class Qwen3MoeModel(nn.Module):
                 layer.init_weights(buffer_device=buffer_device)
 
 
-class Qwen3MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
+class Qwen3MoeForCausalLM(HFCheckpointingMixin, PipelineModelMixin, nn.Module, MoEFSDPSyncMixin):
     # Skip patch_hf_model_for_pp: this model's own forward already handles
     # pipeline-parallel stage routing (embed_tokens/norm/lm_head are None off the
     # owning stage; hidden states arrive in the input_ids slot) AND context
@@ -248,7 +249,7 @@ class Qwen3MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     # (rotary_emb(x, position_ids) -> cos/sin) and crashes on the freqs_cis /
     # THD / CP path, so it must not clobber our forward.
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
-    _pp_keep_self_forward: bool = True
+    pipeline_forward_style = PipelineForwardStyle.MODEL
 
     @dataclass(frozen=True)
     class ModelCapabilities:

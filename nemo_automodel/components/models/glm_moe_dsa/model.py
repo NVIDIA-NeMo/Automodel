@@ -41,6 +41,7 @@ from nemo_automodel.components.models.glm_moe_dsa.state_dict_adapter import GlmM
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MLP, MoE, MoEConfig
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
+from nemo_automodel.shared.pipeline import PipelineModelMixin
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
@@ -266,7 +267,7 @@ class GlmMoeDsaModel(nn.Module):
                     block.mlp.gate.update_bias()
 
 
-class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
+class GlmMoeDsaForCausalLM(HFCheckpointingMixin, PipelineModelMixin, nn.Module, MoEFSDPSyncMixin):
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
 
     @dataclass(frozen=True)
@@ -390,7 +391,7 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         except TypeError:
             return False
 
-    def get_pipeline_stage_metas(
+    def pipeline_stage_metas(
         self,
         *,
         is_first: bool,
@@ -482,7 +483,7 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             else getattr(self.config, "output_hidden_states", False)
         )
 
-        # Carry-in arrives as float32 (see get_pipeline_stage_metas, where the pipeline recv
+        # Carry-in arrives as float32 (see pipeline_stage_metas, where the pipeline recv
         # buffer must be a grad-capable dtype); restore the int64 index values.
         carry_in = carry[0] if carry else None
         is_thd = attn_kwargs.get("qkv_format") == "thd"
@@ -491,7 +492,7 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         if carry_in is not None:
             # The carry arrives in the backend's natural top-k layout (THD: [T, 1, topk]; bshd:
             # [B, S, topk]) as float32. tilelang SparseMLA requires int32 indices; the dense path
-            # uses int64. Only the dtype differs -- no reshape (see get_pipeline_stage_metas).
+            # uses int64. Only the dtype differs -- no reshape (see pipeline_stage_metas).
             prev_topk_indices = carry_in.to(torch.int32) if is_thd else carry_in.to(torch.int64)
 
         # THD: squeeze the leading batch dim on EVERY stage. First stage ``input_ids`` is token ids
@@ -532,7 +533,7 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                 return logits
             # Non-last stage: emit (hidden, float32 top-k carry) to the next stage. The tensors are
             # already in the backend's natural pipeline shape (THD: [T, H] + [T, 1, topk]; bshd:
-            # [B, S, H] + [B, S, topk]) per get_pipeline_stage_metas, so no reshape is needed.
+            # [B, S, H] + [B, S, topk]) per pipeline_stage_metas, so no reshape is needed.
             # (THD requires packed_sequence_size >= index_topk so the tilelang top-k width matches
             # the meta's min(index_topk, seq_len).)
             zero_from_hidden = hidden.float().sum() * 0.0  # connected to grad-bearing hidden

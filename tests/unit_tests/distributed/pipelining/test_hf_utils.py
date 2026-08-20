@@ -28,6 +28,7 @@ from nemo_automodel.components.distributed.pipelining.hf_utils import (
     patch_hf_model_for_pp,
     validate_hf_model_for_pipeline_support,
 )
+from nemo_automodel.shared.pipeline import PipelineForwardStyle, PipelineModelMixin
 
 
 class TestCreatePipelineForwardInner:
@@ -416,18 +417,18 @@ class TestPatchHfModelForPp:
         assert model.forward.__func__.__name__ == "pipeline_forward_gemma4_vlm"
 
     def test_model_keeps_self_forward_helper(self):
-        """``model_keeps_self_forward`` reflects the class-level opt-out flag.
+        """``model_keeps_self_forward`` reflects the typed model contract.
 
         Regression for the silent-vision bug where chunk-aware VLMs (Qwen3-VL-MoE,
         KimiVL, Kimi-K2.5-VL, Qwen3.5-MoE) had their pixel_values-fetching forward
         replaced by the generic CausalLM forward, causing vision_tower to never
-        run. The fix splits responsibility: the model class declares the flag,
+        run. The fix splits responsibility: the model class declares the contract,
         and the pipeline build call site uses ``model_keeps_self_forward`` to
         decide whether to invoke ``patch_hf_model_for_pp`` at all.
         """
 
-        class _OptedIn(nn.Module):
-            _pp_keep_self_forward = True
+        class _OptedIn(PipelineModelMixin, nn.Module):
+            pipeline_forward_style = PipelineForwardStyle.MODEL
 
         class _Default(nn.Module):
             pass
@@ -629,7 +630,7 @@ class TestValidateHfModelForPipelineSupport:
         validate_hf_model_for_pipeline_support(model)
 
     def test_validate_unsupported_vlm_pp_combination_raises(self):
-        """VLMs without dedicated PP forward AND without _pp_keep_self_forward must fail validation."""
+        """VLMs without a dedicated or model-owned PP forward must fail validation."""
 
         class _TextCfg:
             tie_word_embeddings = False
@@ -653,7 +654,7 @@ class TestValidateHfModelForPipelineSupport:
             validate_hf_model_for_pipeline_support(model)
 
     def test_validate_chunk_aware_vlm_passes(self):
-        """VLMs that opt into _pp_keep_self_forward must pass validation."""
+        """VLMs with a model-owned pipeline forward must pass validation."""
 
         class _TextCfg:
             tie_word_embeddings = False
@@ -665,8 +666,8 @@ class TestValidateHfModelForPipelineSupport:
             model_type = "qwen3_vl_moe"
             text_config = _TextCfg()
 
-        class MockVLM(nn.Module):
-            _pp_keep_self_forward = True
+        class MockVLM(PipelineModelMixin, nn.Module):
+            pipeline_forward_style = PipelineForwardStyle.MODEL
 
             def __init__(self):
                 super().__init__()

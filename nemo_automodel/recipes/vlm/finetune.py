@@ -789,7 +789,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         # touches no weights and consumes nothing. Invoke it on EVERY pp stage so
         # its aux-only sharder keeps input_ids full-length everywhere; otherwise
         # non-first stages hit the generic round-robin sharder, feed an
-        # already-local seq_len to update_seq_len, and get_pipeline_stage_metas
+        # already-local seq_len to update_seq_len, and pipeline_stage_metas
         # ÷cp a second time -> the inter-stage hidden truncates to S/cp²
         # (text-decoder RoPE size mismatch).
         _is_first_or_no_pp = not self.pp_enabled or getattr(self.pp.info, "has_first_stage", False)
@@ -932,15 +932,11 @@ class FinetuneRecipeForVLM(BaseRecipe):
         if self.pp is None or not self.pp.info.has_last_stage:
             return
 
-        last_stage_model = None
-        for model_part, stage in zip(self.model_parts, self.pp.info.stages):
-            if stage.is_last:
-                last_stage_model = model_part
-                break
+        last_stage_model = self.pp.last_stage_part
         if last_stage_model is None:
             raise RuntimeError("Pipeline reports a last stage, but no last-stage model part was found")
 
-        self.pp.info.schedule._loss_fn = self.cfg.mtp.build(self.loss_fn, last_stage_model)
+        self.pp.configure_loss_fn(self.cfg.mtp.build(self.loss_fn, last_stage_model))
 
     def _run_train_optim_step(self, batches, max_grad_norm: Optional[float] = None):
         """Execute a single training step.

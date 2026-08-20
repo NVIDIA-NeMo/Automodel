@@ -308,7 +308,7 @@ def test_prepare_model_inputs_for_cp_is_sharder_only():
     assert sharder.local_token_global_indices is round_robin_local_indices
 
 
-def test_get_pipeline_stage_metas_cp_shards_local_seq_and_mtp():
+def test_pipeline_stage_metas_cp_shards_local_seq_and_mtp():
     """Under CP the first stage input stays full-length token ids while every
     stage output (and the propagated MTP hidden states) is the local shard;
     cp_size==1 keeps the pre-CP symmetric shapes."""
@@ -325,13 +325,13 @@ def test_get_pipeline_stage_metas_cp_shards_local_seq_and_mtp():
     mtp_depth = int(getattr(wrapper.mtp_config, "num_layers", 0) or 0)
 
     # cp_size == 1: symmetric (regression against the pre-CP behavior).
-    ins, outs = wrapper.get_pipeline_stage_metas(is_first=False, microbatch_size=1, seq_len=6, dtype=torch.float32)
+    ins, outs = wrapper.pipeline_stage_metas(is_first=False, microbatch_size=1, seq_len=6, dtype=torch.float32)
     assert ins[0].shape == (1, 6, hidden)
     assert len(ins) == 1 + mtp_depth
 
     # cp_size == 2: first-stage input full (6) ids, hidden states local (pad 6->8, //2 = 4).
     wrapper.cp_mesh = _FakeCPMesh(2)
-    ins, outs = wrapper.get_pipeline_stage_metas(is_first=True, microbatch_size=1, seq_len=6, dtype=torch.float32)
+    ins, outs = wrapper.pipeline_stage_metas(is_first=True, microbatch_size=1, seq_len=6, dtype=torch.float32)
     assert ins[0].shape == (1, 6) and ins[0].dtype == torch.long
     assert outs[0].shape[1] == 4  # local sequence length on every output
     assert all(o.shape[1] == 4 for o in outs)

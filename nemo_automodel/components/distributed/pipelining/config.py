@@ -32,9 +32,13 @@ Usage:
 """
 
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Literal, Optional
+from typing import TYPE_CHECKING, Callable, Literal
 
 import torch
+
+if TYPE_CHECKING:
+    from nemo_automodel.components.distributed.mesh import MeshContext
+    from nemo_automodel.components.distributed.pipelining.autopipeline import AutoPipeline
 
 
 @dataclass
@@ -85,36 +89,62 @@ class PipelineConfig:
             shape inference. If None, it will be inferred from the dataset config.
     """
 
-    pp_schedule: Optional[str] = "1f1b"
-    pp_schedule_csv: Optional[str] = None
+    pp_schedule: str | None = "1f1b"
+    pp_schedule_csv: str | None = None
     pp_microbatch_size: int = 1
     pp_batch_size: int = 1
-    layers_per_stage: Optional[int] = None
-    round_virtual_stages_to_pp_multiple: Optional[Literal["up", "down"]] = None
-    module_fqns_per_model_part: Optional[List[List[str]]] = None
+    layers_per_stage: int | None = None
+    round_virtual_stages_to_pp_multiple: Literal["up", "down"] | None = None
+    module_fqns_per_model_part: list[list[str]] | None = None
     patch_inner_model: bool = True
     patch_causal_lm_model: bool = True
     patch_stage_backward_maybe_with_nosync: bool = False
-    dtype: Optional[torch.dtype] = None
+    dtype: torch.dtype | None = None
     scale_grads_in_schedule: bool = False
-    loss_fn: Optional[Callable] = None
-    pp_seq_len: Optional[int] = None
+    loss_fn: Callable | None = None
+    pp_seq_len: int | None = None
 
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert config to dictionary."""
-        return {
-            "pp_schedule": self.pp_schedule,
-            "pp_schedule_csv": self.pp_schedule_csv,
-            "pp_microbatch_size": self.pp_microbatch_size,
-            "pp_batch_size": self.pp_batch_size,
-            "layers_per_stage": self.layers_per_stage,
-            "round_virtual_stages_to_pp_multiple": self.round_virtual_stages_to_pp_multiple,
-            "module_fqns_per_model_part": self.module_fqns_per_model_part,
-            "patch_inner_model": self.patch_inner_model,
-            "patch_causal_lm_model": self.patch_causal_lm_model,
-            "patch_stage_backward_maybe_with_nosync": self.patch_stage_backward_maybe_with_nosync,
-            "dtype": self.dtype,
-            "scale_grads_in_schedule": self.scale_grads_in_schedule,
-            "loss_fn": self.loss_fn,
-            "pp_seq_len": self.pp_seq_len,
-        }
+    def build(
+        self,
+        *,
+        mesh: "MeshContext",
+        device: torch.device | None = None,
+        defer_fsdp_grad_sync: bool = True,
+    ) -> "AutoPipeline | None":
+        """Build the pipeline runtime from declarative configuration.
+
+        Args:
+            mesh: Distributed mesh and its named parallel axes.
+            device: Device on which local pipeline stages execute.
+            defer_fsdp_grad_sync: Whether FSDP gradient synchronization is
+                deferred until the pipeline schedule finishes.
+
+        Returns:
+            A configured pipeline runtime, or ``None`` when pipeline
+            parallelism is disabled by the mesh.
+        """
+        if mesh.device_mesh is None or mesh.pp_size <= 1:
+            return None
+
+        from nemo_automodel.components.distributed.pipelining.autopipeline import AutoPipeline
+
+        return AutoPipeline(
+            world_mesh=mesh.device_mesh,
+            moe_mesh=mesh.moe_mesh,
+            device=device,
+            defer_fsdp_grad_sync=defer_fsdp_grad_sync,
+            **mesh.pipeline_axis_kwargs(),
+            pp_schedule=self.pp_schedule,
+            pp_schedule_csv=self.pp_schedule_csv,
+            pp_microbatch_size=self.pp_microbatch_size,
+            pp_batch_size=self.pp_batch_size,
+            layers_per_stage=self.layers_per_stage,
+            round_virtual_stages_to_pp_multiple=self.round_virtual_stages_to_pp_multiple,
+            module_fqns_per_model_part=self.module_fqns_per_model_part,
+            patch_inner_model=self.patch_inner_model,
+            patch_causal_lm_model=self.patch_causal_lm_model,
+            patch_stage_backward_maybe_with_nosync=self.patch_stage_backward_maybe_with_nosync,
+            dtype=self.dtype,
+            scale_grads_in_schedule=self.scale_grads_in_schedule,
+            pp_seq_len=self.pp_seq_len,
+        )

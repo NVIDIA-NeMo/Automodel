@@ -24,6 +24,12 @@ import torch.nn as nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from nemo_automodel.shared.import_utils import UnavailableError, UnavailableMeta
+from nemo_automodel.shared.pipeline import (
+    PipelineForwardStyle,
+    PipelineModelMixin,
+    causal_lm_stage_metas,
+    context_parallel_seq_len,
+)
 
 
 def _make_missing(name: str):
@@ -689,7 +695,9 @@ class Qwen3_5MoeTextModelBackend(nn.Module):
 # ---------------------------------------------------------------------------
 # Top-level conditional generation model
 # ---------------------------------------------------------------------------
-class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForConditionalGeneration, MoEFSDPSyncMixin):
+class Qwen3_5MoeForConditionalGeneration(
+    HFCheckpointingMixin, PipelineModelMixin, HFQwen3_5MoeForConditionalGeneration, MoEFSDPSyncMixin
+):
     """Qwen3.5-MoE VL conditional generation model using NeMo backend components.
 
     Inherits the HF model to reuse:
@@ -706,7 +714,7 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
 
     # forward() pulls per-microbatch pixel_values from _vlm_pixel_values_chunks;
     # patch_hf_model_for_pp must not replace it under PP.
-    _pp_keep_self_forward: bool = True
+    pipeline_forward_style = PipelineForwardStyle.MODEL
     # CP submesh, installed by Qwen3_5ParallelizationStrategy when context
     # parallelism is active; None means the forward embeds and shards nothing for CP.
     cp_mesh = None
@@ -998,7 +1006,7 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
 
         return inputs_embeds
 
-    def get_pipeline_stage_metas(
+    def pipeline_stage_metas(
         self,
         *,
         is_first: bool,
@@ -1016,27 +1024,18 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
         shapes.
         """
         text_config = getattr(self.config, "text_config", self.config)
-        hidden_size = text_config.hidden_size
-        vocab_size = text_config.vocab_size
-
         cp_size = self.cp_mesh.size() if self.cp_mesh is not None else 1
-        local_seq_len = seq_len
-        if cp_size > 1:
-            padded_seq_len = seq_len + (-seq_len) % (2 * cp_size)
-            local_seq_len = padded_seq_len // cp_size
-
-        if is_first:
-            inputs_meta = (torch.empty(microbatch_size, seq_len, device="meta", dtype=torch.long),)
-        else:
-            inputs_meta = (torch.empty(microbatch_size, local_seq_len, hidden_size, device="meta", dtype=dtype),)
-
-        has_lm_head = getattr(self, "lm_head", None) is not None
-        emits_hidden_states = getattr(self, "_pp_return_hidden_states", False) is True
-        if has_lm_head and not emits_hidden_states:
-            outputs_meta = (torch.empty(microbatch_size, local_seq_len, vocab_size, device="meta", dtype=dtype),)
-        else:
-            outputs_meta = (torch.empty(microbatch_size, local_seq_len, hidden_size, device="meta", dtype=dtype),)
-        return inputs_meta, outputs_meta
+        return causal_lm_stage_metas(
+            is_first=is_first,
+            has_lm_head=self.lm_head is not None,
+            emits_hidden_states=False,
+            microbatch_size=microbatch_size,
+            input_seq_len=seq_len,
+            output_seq_len=context_parallel_seq_len(seq_len, cp_size),
+            hidden_size=text_config.hidden_size,
+            vocab_size=text_config.vocab_size,
+            dtype=dtype,
+        )
 
     def forward(
         self,

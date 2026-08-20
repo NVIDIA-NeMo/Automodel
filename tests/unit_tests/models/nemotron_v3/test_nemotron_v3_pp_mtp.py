@@ -110,7 +110,7 @@ class TestBuildMTPEmbedInputsForPP:
 
 
 # ---------------------------------------------------------------------------
-# customize_pipeline_stage_modules
+# pipeline_stage_modules
 # ---------------------------------------------------------------------------
 
 
@@ -125,19 +125,19 @@ class TestCustomizePipelineStageModules:
             ["model.embed_tokens", "model.layers.0", "model.layers.1"],
             ["model.layers.2", "model.layers.3", "model.norm", "lm_head"],
         ]
-        out = model.customize_pipeline_stage_modules(stages, layers_prefix="model.", text_model=model.model)
+        out = model.pipeline_stage_modules(stages, layers_prefix="model.", text_model=model.model)
         assert "mtp" not in out[0]
         assert "mtp" in out[-1]
 
     def test_no_mtp_when_disabled(self, backend):
         model, _ = _make_model(backend)
         stages = [["model.embed_tokens", "model.layers.0"], ["model.norm", "lm_head"]]
-        out = model.customize_pipeline_stage_modules(stages, layers_prefix="model.", text_model=model.model)
+        out = model.pipeline_stage_modules(stages, layers_prefix="model.", text_model=model.model)
         assert all("mtp" not in s for s in out)
 
 
 # ---------------------------------------------------------------------------
-# get_pipeline_stage_metas
+# pipeline_stage_metas
 # ---------------------------------------------------------------------------
 
 
@@ -152,7 +152,7 @@ class TestPipelineStageMetas:
         first.lm_head = None
         first.model.norm = None
         first.mtp = None
-        f_in, f_out = first.get_pipeline_stage_metas(is_first=True, microbatch_size=2, seq_len=16, dtype=torch.bfloat16)
+        f_in, f_out = first.pipeline_stage_metas(is_first=True, microbatch_size=2, seq_len=16, dtype=torch.bfloat16)
         assert f_in[0].shape == (2, 16) and f_in[0].dtype == torch.long
         assert len(f_out) == 1 + D
         assert f_out[0].shape == (2, 16, cfg.hidden_size)
@@ -168,9 +168,7 @@ class TestPipelineStageMetas:
         middle.lm_head = None
         middle.model.norm = None
         middle.mtp = None
-        m_in, m_out = middle.get_pipeline_stage_metas(
-            is_first=False, microbatch_size=2, seq_len=16, dtype=torch.bfloat16
-        )
+        m_in, m_out = middle.pipeline_stage_metas(is_first=False, microbatch_size=2, seq_len=16, dtype=torch.bfloat16)
         assert len(m_in) == 1 + D and len(m_out) == 1 + D
         assert m_in[0].shape == (2, 16, cfg.hidden_size)
 
@@ -180,9 +178,7 @@ class TestPipelineStageMetas:
             mtp_layers_block_type=["attention", "moe"],
         )
         final.model.embed_tokens = None
-        l_in, l_out = final.get_pipeline_stage_metas(
-            is_first=False, microbatch_size=2, seq_len=16, dtype=torch.bfloat16
-        )
+        l_in, l_out = final.pipeline_stage_metas(is_first=False, microbatch_size=2, seq_len=16, dtype=torch.bfloat16)
         assert len(l_in) == 1 + D
         # Final stage appends an int32 [B, S] seq_idx tail: (logits, *mtp_h, seq_idx).
         assert len(l_out) == 1 + D + 1
@@ -193,7 +189,7 @@ class TestPipelineStageMetas:
 
     def test_no_mtp_arity_is_one(self, backend):
         model, cfg = _make_model(backend)
-        f_in, f_out = model.get_pipeline_stage_metas(is_first=True, microbatch_size=1, seq_len=8, dtype=torch.bfloat16)
+        f_in, f_out = model.pipeline_stage_metas(is_first=True, microbatch_size=1, seq_len=8, dtype=torch.bfloat16)
         assert len(f_in) == 1 and f_in[0].dtype == torch.long
         assert len(f_out) == 1
 

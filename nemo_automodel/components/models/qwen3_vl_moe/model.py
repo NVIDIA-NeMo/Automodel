@@ -41,6 +41,7 @@ from nemo_automodel.components.models.qwen3_moe.model import Block
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
+from nemo_automodel.shared.pipeline import PipelineForwardStyle, PipelineModelMixin
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 from .state_dict_adapter import Qwen3VLMoeStateDictAdapter
@@ -453,14 +454,16 @@ class Qwen3VLMoeTextModelBackend(nn.Module):
             layer.init_weights(buffer_device=buffer_device)
 
 
-class Qwen3VLMoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLMoeForConditionalGeneration, MoEFSDPSyncMixin):
+class Qwen3VLMoeForConditionalGeneration(
+    HFCheckpointingMixin, PipelineModelMixin, HFQwen3VLMoeForConditionalGeneration, MoEFSDPSyncMixin
+):
     """Qwen3-VL conditional generation model using the Qwen3-MoE backend components."""
 
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
 
     # forward() pulls per-microbatch pixel_values from _vlm_pixel_values_chunks;
     # patch_hf_model_for_pp must not replace it under PP.
-    _pp_keep_self_forward: bool = True
+    pipeline_forward_style = PipelineForwardStyle.MODEL
 
     @dataclass(frozen=True)
     class ModelCapabilities:

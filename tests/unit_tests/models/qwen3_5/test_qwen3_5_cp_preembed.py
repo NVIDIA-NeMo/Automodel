@@ -332,7 +332,7 @@ class _FakeCPMesh:
 
 
 class TestPipelineStageMetas:
-    """get_pipeline_stage_metas: CP shards stage outputs; cp=1 stays symmetric."""
+    """pipeline_stage_metas: CP shards stage outputs; cp=1 stays symmetric."""
 
     def _model(self, *, cp_size, lm_head):
         model = Qwen3_5ForConditionalGeneration.__new__(Qwen3_5ForConditionalGeneration)
@@ -344,19 +344,19 @@ class TestPipelineStageMetas:
 
     def test_cp_shards_stage_outputs(self):
         model = self._model(cp_size=2, lm_head=True)
-        ins, outs = model.get_pipeline_stage_metas(is_first=True, microbatch_size=1, seq_len=6, dtype=torch.float32)
+        ins, outs = model.pipeline_stage_metas(is_first=True, microbatch_size=1, seq_len=6, dtype=torch.float32)
         # first stage consumes the FULL token ids; output is the local shard (pad 6->8, //2 = 4)
         assert ins[0].shape == (1, 6) and ins[0].dtype == torch.long
         assert outs[0].shape == (1, 4, 32)  # last stage (lm_head) -> vocab
 
     def test_cp_middle_stage_local_hidden(self):
         model = self._model(cp_size=2, lm_head=False)
-        ins, outs = model.get_pipeline_stage_metas(is_first=False, microbatch_size=1, seq_len=6, dtype=torch.float32)
+        ins, outs = model.pipeline_stage_metas(is_first=False, microbatch_size=1, seq_len=6, dtype=torch.float32)
         assert ins[0].shape == (1, 4, 8)  # local hidden in
         assert outs[0].shape == (1, 4, 8)  # local hidden out (no lm_head)
 
     def test_cp1_symmetric_matches_default(self):
         model = self._model(cp_size=1, lm_head=True)
-        ins, outs = model.get_pipeline_stage_metas(is_first=True, microbatch_size=2, seq_len=5, dtype=torch.float32)
+        ins, outs = model.pipeline_stage_metas(is_first=True, microbatch_size=2, seq_len=5, dtype=torch.float32)
         assert ins[0].shape == (2, 5) and ins[0].dtype == torch.long
         assert outs[0].shape == (2, 5, 32)  # full length, no CP shard

@@ -20,6 +20,7 @@ config) that would otherwise be invisible to a single-variant test."""
 import pytest
 import torch
 
+from nemo_automodel.components.distributed.pipelining.hf_utils import model_keeps_self_forward
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.ling_v2.config import BailingMoeV2Config
 from nemo_automodel.components.models.ling_v2.model import BailingMoeV2ForCausalLM
@@ -95,18 +96,16 @@ def _moe_cfg(cfg: BailingMoeV2Config) -> MoEConfig:
     )
 
 
-def test_pp_keep_self_forward_is_declared():
-    """Pipeline parallelism opts out of patch_hf_model_for_pp via this class flag.
+def test_model_owned_pipeline_forward_is_declared():
+    """Pipeline parallelism preserves the model-owned forward.
     Without it, the framework replaces our forward with a generic HF-style one
     that calls rotary_emb(hidden_states, position_ids) and crashes inside
     apply_rotary_emb because our gpt_oss-style RotaryEmbedding.forward(query, key)
     rotates q and k rather than returning (cos, sin).  See PR #2255 for the
     original symptom (RuntimeError: Sizes of tensors must match... at torch.cat
     in apply_rotary_emb)."""
-    assert getattr(BailingMoeV2ForCausalLM, "_pp_keep_self_forward", False) is True, (
-        "BailingMoeV2ForCausalLM must declare _pp_keep_self_forward = True so "
-        "the PP wrapper preserves the model's own freqs_cis-based forward."
-    )
+    model = BailingMoeV2ForCausalLM.__new__(BailingMoeV2ForCausalLM)
+    assert model_keeps_self_forward(model) is True
 
 
 @pytest.mark.parametrize("variant", ["mini", "flash", "1T"])

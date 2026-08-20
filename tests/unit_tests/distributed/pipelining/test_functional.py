@@ -12,1577 +12,459 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import importlib
 import types
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
-from torch.distributed.pipelining.schedules import (
-    PipelineScheduleMulti,
-    PipelineScheduleSingle,
-)
+import torch.nn as nn
+from torch.distributed.pipelining.schedules import PipelineScheduleMulti, PipelineScheduleSingle
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
-from nemo_automodel.components.distributed.pipelining.functional import (
-    _get_hidden_and_vocab_size,
-    _precompute_stage_shapes,
-    _set_stage_metas,
-    _use_static_pipeline_stage_metadata,
-    _warmup_pipeline_stage_neighbors,
+from nemo_automodel.components.distributed.pipelining.model_parts import (
+    PipelineModelPart,
     _wrap_stage_forward_to_emit_tensor,
-    build_pipeline_schedule,
+    split_model_into_parts,
+)
+from nemo_automodel.components.distributed.pipelining.module_plan import (
     calculate_virtual_stages,
     generate_hf_model_fqn_per_model_part,
-    pipeline_model,
-    reset_pp_stage_shapes,
-    split_model_into_stages,
     stage_ids_this_rank,
 )
+from nemo_automodel.components.distributed.pipelining.schedules import build_pipeline_schedule
+from nemo_automodel.components.distributed.pipelining.stage_runtime import (
+    _get_hidden_and_vocab_size,
+    _get_stage_metas,
+    configure_pipeline_stage_backward,
+    create_pipeline_stages,
+    warmup_pipeline_stage_neighbors,
+)
+from nemo_automodel.shared.pipeline import PipelineModelMixin
 
 
-class TestStageIdsThisRank:
-    """Test stage_ids_this_rank function - no mocks needed as it's pure calculation."""
-
-    def test_loop_style_single_stage_per_rank(self):
-        # Test with 1 stage per rank
-        assert stage_ids_this_rank(0, 4, 4, "loop") == (0,)
-        assert stage_ids_this_rank(1, 4, 4, "loop") == (1,)
-        assert stage_ids_this_rank(2, 4, 4, "loop") == (2,)
-        assert stage_ids_this_rank(3, 4, 4, "loop") == (3,)
-
-    def test_loop_style_multiple_stages_per_rank(self):
-        # Test with 2 stages per rank
-        assert stage_ids_this_rank(0, 4, 8, "loop") == (0, 4)
-        assert stage_ids_this_rank(1, 4, 8, "loop") == (1, 5)
-        assert stage_ids_this_rank(2, 4, 8, "loop") == (2, 6)
-        assert stage_ids_this_rank(3, 4, 8, "loop") == (3, 7)
-
-    def test_v_style(self):
-        # Test V-style scheduling (assumes 2 stages per rank)
-        assert stage_ids_this_rank(0, 4, 8, "v") == (0, 7)
-        assert stage_ids_this_rank(1, 4, 8, "v") == (1, 6)
-        assert stage_ids_this_rank(2, 4, 8, "v") == (2, 5)
-        assert stage_ids_this_rank(3, 4, 8, "v") == (3, 4)
-
-    def test_invalid_stage_distribution(self):
-        # Test when stages not evenly divisible by pp_size
-        with pytest.raises(AssertionError):
-            stage_ids_this_rank(0, 4, 5, "loop")
-
-    def test_v_style_invalid_stages_per_rank(self):
-        # Test V-style with != 2 stages per rank
-        with pytest.raises(AssertionError):
-            stage_ids_this_rank(0, 4, 12, "v")  # 3 stages per rank
+@pytest.mark.parametrize(
+    ("rank", "size", "num_stages", "style", "expected"),
+    [
+        (0, 4, 4, "loop", (0,)),
+        (2, 4, 4, "loop", (2,)),
+        (1, 4, 8, "loop", (1, 5)),
+        (0, 4, 8, "v", (0, 7)),
+        (3, 4, 8, "v", (3, 4)),
+    ],
+)
+def test_stage_ids_this_rank(rank, size, num_stages, style, expected):
+    assert stage_ids_this_rank(rank, size, num_stages, style) == expected
 
 
-class TestGenerateHfModelFqnPerModelPart:
-    """Test generate_hf_model_fqn_per_model_part function - no mocks needed."""
-
-    def test_single_stage(self):
-        result = generate_hf_model_fqn_per_model_part(
-            num_stages=1,
-            num_layers=4,
-            include_embeddings=True,
-            include_lm_head=True,
-            include_rotary_emb=True,
-        )
-        assert len(result) == 1
-        assert "model.embed_tokens" in result[0]
-        assert "model.layers.0" in result[0]
-        assert "model.layers.3" in result[0]
-        assert "model.norm" in result[0]
-        assert "lm_head" in result[0]
-        assert "model.rotary_emb" in result[0]
-
-    def test_multiple_stages_even_distribution(self):
-        result = generate_hf_model_fqn_per_model_part(
-            num_stages=4,
-            num_layers=8,
-        )
-        assert len(result) == 4
-        # First stage has embeddings + 2 layers
-        assert "model.embed_tokens" in result[0]
-        assert "model.layers.0" in result[0]
-        assert "model.layers.1" in result[0]
-        # Middle stages have 2 layers each
-        assert "model.layers.2" in result[1]
-        assert "model.layers.3" in result[1]
-        # Last stage has layers + norm + lm_head
-        assert "model.layers.6" in result[3]
-        assert "model.layers.7" in result[3]
-        assert "model.norm" in result[3]
-        assert "lm_head" in result[3]
-
-    def test_uneven_distribution(self):
-        # 10 layers across 3 stages: 4, 3, 3
-        result = generate_hf_model_fqn_per_model_part(
-            num_stages=3,
-            num_layers=10,
-        )
-        assert len(result) == 3
-        # First stage gets extra layer (4 layers)
-        assert len([m for m in result[0] if "layers." in m]) == 4
-        # Other stages get 3 layers each
-        assert len([m for m in result[1] if "layers." in m]) == 3
-        assert len([m for m in result[2] if "layers." in m]) == 3
-
-    def test_without_embeddings_and_lm_head(self):
-        result = generate_hf_model_fqn_per_model_part(
-            num_stages=2,
-            num_layers=4,
-            include_embeddings=False,
-            include_lm_head=False,
-            include_rotary_emb=False,
-        )
-        # First stage should not have embeddings
-        assert "model.embed_tokens" not in result[0]
-        # Last stage should not have lm_head
-        assert "lm_head" not in result[1]
-        # No stage should have rotary_emb
-        assert all("model.rotary_emb" not in stage for stage in result)
-
-    def test_custom_fqn_prefix(self):
-        result = generate_hf_model_fqn_per_model_part(
-            num_stages=2,
-            num_layers=4,
-            fqn_prefix="custom.",
-        )
-        assert "custom.embed_tokens" in result[0]
-        assert "custom.layers.0" in result[0]
-        assert "custom.norm" in result[1]
-
-    def test_invalid_num_stages(self):
-        with pytest.raises(ValueError):
-            generate_hf_model_fqn_per_model_part(0, 4)
-
-        with pytest.raises(ValueError):
-            generate_hf_model_fqn_per_model_part(5, 4)  # More stages than layers
-
-    def test_include_multimodal_encoders(self):
-        """Test that multimodal encoder suffixes are included in stage 0 when enabled."""
-        from nemo_automodel.components.distributed.pipelining.hf_utils import MULTIMODAL_SUFFIXES
-
-        result = generate_hf_model_fqn_per_model_part(
-            num_stages=2,
-            num_layers=4,
-            include_multimodal_encoders=True,
-        )
-        # Check multimodal suffixes are in first stage
-        for suffix in MULTIMODAL_SUFFIXES:
-            assert f"model.{suffix}" in result[0]
-
-    def test_exclude_multimodal_encoders(self):
-        """Test that multimodal encoder suffixes are excluded when disabled."""
-        from nemo_automodel.components.distributed.pipelining.hf_utils import MULTIMODAL_SUFFIXES
-
-        result = generate_hf_model_fqn_per_model_part(
-            num_stages=2,
-            num_layers=4,
-            include_multimodal_encoders=False,
-        )
-        # Check multimodal suffixes are NOT in first stage
-        for suffix in MULTIMODAL_SUFFIXES:
-            assert f"model.{suffix}" not in result[0]
-
-    def test_extra_module_fqns(self):
-        """Test that extra_module_fqns are included in stage 0."""
-        extra_fqns = ["model.custom_encoder", "model.special_module"]
-        result = generate_hf_model_fqn_per_model_part(
-            num_stages=2,
-            num_layers=4,
-            extra_module_fqns=extra_fqns,
-        )
-        # Check extra FQNs are in first stage
-        for fqn in extra_fqns:
-            assert fqn in result[0]
-        # Check they are NOT in other stages
-        assert "model.custom_encoder" not in result[1]
-
-    def test_custom_lm_head_fqn(self):
-        """Test that custom lm_head_fqn is used in last stage."""
-        result = generate_hf_model_fqn_per_model_part(
-            num_stages=2,
-            num_layers=4,
-            include_lm_head=True,
-            lm_head_fqn="model.language_model.lm_head",
-        )
-        # Check custom lm_head FQN is in last stage
-        assert "model.language_model.lm_head" in result[1]
-        # Check the bare "lm_head" (default) is NOT present as a standalone entry
-        lm_head_entries = [m for m in result[1] if m == "lm_head"]
-        assert len(lm_head_entries) == 0
+def test_stage_ids_reject_invalid_distributions():
+    with pytest.raises(ValueError, match="evenly divisible"):
+        stage_ids_this_rank(0, 4, 5)
+    with pytest.raises(ValueError, match="2 stages per rank"):
+        stage_ids_this_rank(0, 4, 12, "v")
 
 
-class TestCalculateVirtualStages:
-    """Test calculate_virtual_stages function - no mocks needed."""
+def test_generate_standard_hf_stage_modules():
+    stages = generate_hf_model_fqn_per_model_part(num_stages=3, num_layers=8)
 
-    def test_with_layers_per_stage_single_schedule(self):
-        # Single stage schedule with valid config - needs rounding
-        num_virtual, stages_per_rank = calculate_virtual_stages(
-            num_layers=32,
-            layers_per_stage=32,  # This will give exactly 1 stage per rank
-            pp_size=4,
-            is_single_stage_schedule=True,
-            round_to_pp_multiple="up",
-        )
-        assert num_virtual == 4  # ceil(32/32) = 1, rounded up to 4
-        assert stages_per_rank == 1
-
-    def test_with_layers_per_stage_multi_schedule(self):
-        # Multi stage schedule with valid config
-        num_virtual, stages_per_rank = calculate_virtual_stages(
-            num_layers=32,
-            layers_per_stage=4,
-            pp_size=4,
-            is_single_stage_schedule=False,
-            round_to_pp_multiple="down",
-        )
-        assert num_virtual == 8  # ceil(32/4) = 8 (already divisible, no rounding needed)
-        assert stages_per_rank == 2
-
-    def test_round_up(self):
-        # Test rounding up when not divisible
-        num_virtual, stages_per_rank = calculate_virtual_stages(
-            num_layers=32,
-            layers_per_stage=5,
-            pp_size=4,
-            is_single_stage_schedule=False,
-            round_to_pp_multiple="up",
-        )
-        assert num_virtual == 8  # ceil(32/5) = 7, rounded up to 8
-        assert stages_per_rank == 2
-
-    def test_round_down(self):
-        # Test rounding down
-        num_virtual, stages_per_rank = calculate_virtual_stages(
-            num_layers=32,
-            layers_per_stage=3,
-            pp_size=4,
-            is_single_stage_schedule=False,
-            round_to_pp_multiple="down",
-        )
-        assert num_virtual == 8  # ceil(32/3) = 11, rounded down to 8
-        assert stages_per_rank == 2
-
-    def test_invalid_round_option(self):
-        with pytest.raises(ValueError, match="Invalid value for round_to_pp_multiple"):
-            calculate_virtual_stages(
-                num_layers=32,
-                layers_per_stage=7,  # ceil(32/7) = 5, not divisible by 4
-                pp_size=4,
-                is_single_stage_schedule=False,
-                round_to_pp_multiple="invalid",  # Invalid option should trigger error
-            )
-
-    def test_invalid_stages_not_divisible(self):
-        with pytest.raises(ValueError, match="must be divisible by"):
-            calculate_virtual_stages(
-                num_layers=32,
-                layers_per_stage=7,  # ceil(32/7) = 5, not divisible by 4
-                pp_size=4,
-                is_single_stage_schedule=False,
-                round_to_pp_multiple=None,  # Explicitly set to None to ensure error is raised
-            )
-
-    def test_single_schedule_multiple_stages_error(self):
-        with pytest.raises(ValueError, match="Single stage schedule requires exactly 1 stage"):
-            calculate_virtual_stages(
-                num_layers=32,
-                layers_per_stage=6,  # This gives 6 stages total (ceil(32/6) = 6)
-                pp_size=4,
-                is_single_stage_schedule=True,
-                round_to_pp_multiple="up",  # Round 6 up to 8, giving 2 stages per rank
-            )
-
-    def test_multi_schedule_single_stage_error(self):
-        with pytest.raises(ValueError, match="Multi-stage schedule requires at least 2 stages"):
-            calculate_virtual_stages(
-                num_layers=32,
-                layers_per_stage=16,  # This gives 2 stages total (ceil(32/16) = 2)
-                pp_size=2,  # With 2 PP ranks, that's 1 stage per rank
-                is_single_stage_schedule=False,
-            )
-
-    def test_without_layers_per_stage(self):
-        # Default behavior when layers_per_stage is None
-        num_virtual, stages_per_rank = calculate_virtual_stages(
-            num_layers=32,
-            layers_per_stage=None,
-            pp_size=4,
-            is_single_stage_schedule=True,
-        )
-        assert num_virtual == 4
-        assert stages_per_rank == 1
-
-        num_virtual, stages_per_rank = calculate_virtual_stages(
-            num_layers=32,
-            layers_per_stage=None,
-            pp_size=4,
-            is_single_stage_schedule=False,
-        )
-        assert num_virtual == 8
-        assert stages_per_rank == 2
+    assert stages[0][0] == "model.embed_tokens"
+    assert {"model.layers.0", "model.layers.1", "model.layers.2"} <= set(stages[0])
+    assert "model.layers.3" in stages[1]
+    assert stages[-1][-3:] == ["model.norm", "lm_head", "model.rotary_emb"]
+    assert sum(name.startswith("model.layers.") for stage in stages for name in stage) == 8
 
 
-class TestSplitModelIntoStages:
-    """Test split_model_into_stages function with mocks."""
+def test_generate_hf_stage_modules_respects_layout_options():
+    stages = generate_hf_model_fqn_per_model_part(
+        num_stages=2,
+        num_layers=4,
+        include_embeddings=False,
+        include_lm_head=False,
+        include_rotary_emb=False,
+        include_multimodal_encoders=False,
+        extra_module_fqns=["vision_tower"],
+        fqn_prefix="language_model.",
+        lm_head_fqn="language_model.lm_head",
+    )
 
-    @patch("nemo_automodel.components.distributed.pipelining.functional.get_text_module")
-    @patch("nemo_automodel.components.distributed.pipelining.functional.calculate_virtual_stages")
-    @patch("nemo_automodel.components.distributed.pipelining.functional.generate_hf_model_fqn_per_model_part")
-    def test_auto_generate_module_names(self, mock_generate_fqn, mock_calc_stages, mock_get_text_module):
-        # Setup mocks
-        mock_pp_mesh = Mock()
-        mock_pp_mesh.get_local_rank.return_value = 0
-        mock_pp_mesh.size.return_value = 2
+    assert stages[0] == ["vision_tower", "language_model.layers.0", "language_model.layers.1"]
+    assert stages[1] == ["language_model.layers.2", "language_model.layers.3", "language_model.norm"]
 
-        # Create a mock text_model that get_text_module will return
-        mock_text_model = Mock()
-        mock_text_model.layers = [Mock() for _ in range(4)]
-        mock_text_model.rotary_emb = Mock()
-        # Ensure text_model doesn't have 'model' attr (simple model structure)
-        del mock_text_model.model
 
-        mock_get_text_module.return_value = mock_text_model
+@pytest.mark.parametrize("num_stages", [0, 5])
+def test_generate_hf_stage_modules_rejects_invalid_stage_count(num_stages):
+    with pytest.raises(ValueError):
+        generate_hf_model_fqn_per_model_part(num_stages=num_stages, num_layers=4)
 
-        mock_model = Mock()
-        mock_model.model = Mock()
-        mock_model.model.layers = [Mock() for _ in range(4)]
-        mock_model.model.rotary_emb = Mock()
-        mock_model.lm_head = Mock()
-        # Ensure model doesn't have TEXT_MODULE_ATTRS attributes
-        del mock_model.language_model
-        del mock_model.text_model
-        del mock_model.text_decoder
-        del mock_model.model.language_model
-        del mock_model.model.text_model
-        del mock_model.model.text_decoder
 
-        # Mock virtual stages calculation
-        mock_calc_stages.return_value = (2, 1)
+@pytest.mark.parametrize(
+    ("layers", "layers_per_stage", "pp_size", "single", "rounding", "expected"),
+    [
+        (32, 8, 4, True, None, (4, 1)),
+        (32, 4, 4, False, None, (8, 2)),
+        (30, 4, 4, False, "up", (8, 2)),
+        (34, 4, 4, False, "down", (8, 2)),
+        (32, None, 4, True, None, (4, 1)),
+        (32, None, 4, False, None, (8, 2)),
+    ],
+)
+def test_calculate_virtual_stages(layers, layers_per_stage, pp_size, single, rounding, expected):
+    assert calculate_virtual_stages(layers, layers_per_stage, pp_size, single, rounding) == expected
 
-        # Mock FQN generation
-        mock_generate_fqn.return_value = [
-            ["model.embed_tokens", "model.layers.0"],
-            ["model.layers.1", "model.norm"],
-        ]
 
-        with (
-            patch("nemo_automodel.components.distributed.pipelining.functional.PipelineStage"),
-            patch(
-                "nemo_automodel.components.distributed.pipelining.functional.get_schedule_class"
-            ) as mock_get_schedule_class,
-            patch("nemo_automodel.components.distributed.pipelining.functional.stage_ids_this_rank") as mock_stage_ids,
-            patch("copy.deepcopy") as mock_deepcopy,
-        ):
-            # Make sure get_schedule_class returns an actual class
-            mock_get_schedule_class.return_value = PipelineScheduleSingle
+def test_calculate_virtual_stages_rejects_invalid_topology():
+    with pytest.raises(ValueError, match="divisible"):
+        calculate_virtual_stages(30, 4, 3, False)
+    with pytest.raises(ValueError, match="Single stage schedule"):
+        calculate_virtual_stages(32, 4, 4, True)
+    with pytest.raises(ValueError, match="Multi-stage schedule"):
+        calculate_virtual_stages(32, 8, 4, False)
+    with pytest.raises(ValueError, match="Invalid value"):
+        calculate_virtual_stages(33, 4, 4, False, "nearest")
 
-            # Mock stage_ids_this_rank
-            mock_stage_ids.return_value = (0,)
 
-            # Mock deepcopy to return a mock with proper structure
-            mock_copy = Mock()
-            mock_copy.named_children.return_value = []
-            mock_deepcopy.return_value = mock_copy
+class _SingleSchedule(PipelineScheduleSingle):
+    def __init__(self, stage, n_microbatches, loss_fn, scale_grads):
+        self.stage = stage
+        self.n_microbatches = n_microbatches
+        self.loss_fn = loss_fn
+        self.scale_grads = scale_grads
 
-            stages, models = split_model_into_stages(
-                mock_model,
-                mock_pp_mesh,
-                "pp",
-                "PipelineScheduleSingle",
-                torch.device("cuda:0"),
-                layers_per_stage=2,
-            )
+    def _step_microbatches(self, arg_mbs=None, kwarg_mbs=None, target_mbs=None, losses=None):
+        del arg_mbs, kwarg_mbs, target_mbs, losses
 
-            # Verify FQN generation was called
-            mock_generate_fqn.assert_called_once()
 
-    @patch("nemo_automodel.components.distributed.pipelining.functional.get_text_module")
-    @patch("nemo_automodel.components.distributed.pipelining.functional.calculate_virtual_stages")
-    @patch("nemo_automodel.components.distributed.pipelining.functional.generate_hf_model_fqn_per_model_part")
-    @pytest.mark.parametrize("lm_head_on_top_level", [True, False])
-    def test_nested_language_model_structure(
-        self, mock_generate_fqn, mock_calc_stages, mock_get_text_module, lm_head_on_top_level
+class _MultiSchedule(PipelineScheduleMulti):
+    def __init__(self, stages, n_microbatches, loss_fn, scale_grads):
+        self.stages = stages
+        self.n_microbatches = n_microbatches
+        self.loss_fn = loss_fn
+        self.scale_grads = scale_grads
+
+    def _step_microbatches(self, arg_mbs=None, kwarg_mbs=None, target_mbs=None, losses=None):
+        del arg_mbs, kwarg_mbs, target_mbs, losses
+
+
+@pytest.mark.parametrize(("schedule_cls", "stage_count"), [(_SingleSchedule, 1), (_MultiSchedule, 2)])
+def test_build_pipeline_schedule(schedule_cls, stage_count):
+    stages = [Mock() for _ in range(stage_count)]
+    loss_fn = Mock()
+    with patch(
+        "nemo_automodel.components.distributed.pipelining.schedules.get_schedule_class",
+        return_value=schedule_cls,
     ):
-        """Test split_model_into_stages with nested language_model structure (covers lines 311-318)."""
-        mock_pp_mesh = Mock()
-        mock_pp_mesh.get_local_rank.return_value = 0
-        mock_pp_mesh.size.return_value = 2
+        schedule = build_pipeline_schedule(None, "test", 2, 8, stages, loss_fn, scale_grads=True)
 
-        # Create mock text_model with nested .model attribute (like LlamaForCausalLM)
-        mock_text_model = Mock()
-        mock_text_model.model = Mock()  # Has .model attr -> text_model_has_model_attr=True
-        mock_text_model.model.layers = [Mock() for _ in range(4)]
-        mock_text_model.rotary_emb = Mock()
-
-        mock_get_text_module.return_value = mock_text_model
-
-        # Create model with language_model attribute (triggers nested path)
-        mock_model = Mock()
-        mock_model.model = Mock()
-        mock_model.model.language_model = mock_text_model  # TEXT_MODULE_ATTRS match
-
-        # Configure lm_head location
-        if lm_head_on_top_level:
-            mock_model.lm_head = Mock()
-            del mock_text_model.lm_head
-        else:
-            mock_text_model.lm_head = Mock()
-            del mock_model.lm_head
-
-        # Remove other TEXT_MODULE_ATTRS to ensure language_model is matched
-        del mock_model.text_model
-        del mock_model.text_decoder
-        del mock_model.model.text_model
-        del mock_model.model.text_decoder
-
-        mock_calc_stages.return_value = (2, 1)
-        mock_generate_fqn.return_value = [
-            ["model.language_model.model.embed_tokens", "model.language_model.model.layers.0"],
-            ["model.language_model.model.layers.1", "model.language_model.model.norm"],
-        ]
-
-        with (
-            patch("nemo_automodel.components.distributed.pipelining.functional.PipelineStage"),
-            patch(
-                "nemo_automodel.components.distributed.pipelining.functional.get_schedule_class"
-            ) as mock_get_schedule,
-            patch("nemo_automodel.components.distributed.pipelining.functional.stage_ids_this_rank") as mock_stage_ids,
-            patch("copy.deepcopy") as mock_deepcopy,
-        ):
-            mock_get_schedule.return_value = PipelineScheduleSingle
-            mock_stage_ids.return_value = (0,)
-            mock_copy = Mock()
-            mock_copy.named_children.return_value = []
-            mock_deepcopy.return_value = mock_copy
-
-            stages, models = split_model_into_stages(
-                mock_model,
-                mock_pp_mesh,
-                "pp",
-                "PipelineScheduleSingle",
-                torch.device("cuda:0"),
-                layers_per_stage=2,
-            )
-
-            # Verify generate_fqn was called with correct parameters for nested model
-            call_kwargs = mock_generate_fqn.call_args[1]
-            assert call_kwargs["include_multimodal_encoders"] is False
-            assert any("model." in fqn for fqn in call_kwargs["extra_module_fqns"])
-            if lm_head_on_top_level:
-                assert call_kwargs["lm_head_fqn"] == "lm_head"
-            else:
-                assert "language_model.lm_head" in call_kwargs["lm_head_fqn"]
+    assert schedule.n_microbatches == 4
+    assert schedule.loss_fn is loss_fn
+    assert schedule.scale_grads is True
+    if stage_count == 1:
+        assert schedule.stage is stages[0]
+    else:
+        assert schedule.stages is stages
 
 
-class TestBuildPipelineSchedule:
-    """Test build_pipeline_schedule function."""
+def test_build_pipeline_schedule_validates_batch_and_csv(tmp_path):
+    with pytest.raises(ValueError, match="must be divisible"):
+        build_pipeline_schedule(None, "1f1b", 3, 8, [Mock()], Mock())
+    with pytest.raises(FileNotFoundError):
+        build_pipeline_schedule(str(tmp_path / "missing.csv"), None, 2, 8, [Mock()], Mock())
 
-    @patch("nemo_automodel.components.distributed.pipelining.functional.get_schedule_class")
-    def test_build_schedule_single(self, mock_get_schedule):
-        # Create a mock schedule class that properly inherits from PipelineScheduleSingle
-        class MockScheduleSingle(PipelineScheduleSingle):
-            def __init__(self, *args, **kwargs):
-                self.stage = args[0] if args else None
-                self.n_microbatches = kwargs.get("n_microbatches", 0)
-                self.loss_fn = kwargs.get("loss_fn", None)
 
-            def _step_microbatches(self, *args, **kwargs):
-                # Mock implementation of abstract method
-                pass
+class _MetaModule(nn.Module):
+    def __init__(self, *, lm_head: bool = False, dtype: torch.dtype = torch.bfloat16):
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(1, dtype=dtype))
+        self.lm_head = nn.Identity() if lm_head else None
 
-        mock_get_schedule.return_value = MockScheduleSingle
 
-        # Mock stages
-        mock_stage = Mock()
-        stages = [mock_stage]
+@pytest.mark.parametrize(
+    ("index", "lm_head", "input_shape", "output_shape"),
+    [
+        (0, False, (2, 16), (2, 16, 64)),
+        (1, False, (2, 16, 64), (2, 16, 64)),
+        (2, True, (2, 16, 64), (2, 16, 128)),
+    ],
+)
+def test_default_stage_metadata(index, lm_head, input_shape, output_shape):
+    part = PipelineModelPart(_MetaModule(lm_head=lm_head), index, 3)
+    config = types.SimpleNamespace(hidden_size=64, vocab_size=128)
 
-        # Mock loss function
-        loss_fn = Mock()
+    inputs, outputs = _get_stage_metas(part, config, microbatch_size=2, seq_len=16)
 
-        # Call function
-        schedule = build_pipeline_schedule(
-            pipeline_parallel_schedule_csv=None,
-            pipeline_parallel_schedule="PipelineScheduleSingle",
+    assert inputs[0].shape == input_shape
+    assert outputs[0].shape == output_shape
+    assert inputs[0].device.type == outputs[0].device.type == "meta"
+
+
+def test_default_stage_metadata_uses_nested_config_dtype_and_hidden_output_flag():
+    module = _MetaModule(lm_head=True, dtype=torch.float16)
+    module._pp_return_hidden_states = True
+    part = PipelineModelPart(module, 1, 2)
+    config = types.SimpleNamespace(text_config=types.SimpleNamespace(hidden_size=32, vocab_size=96))
+
+    inputs, outputs = _get_stage_metas(part, config, microbatch_size=3, seq_len=7)
+
+    assert inputs[0].shape == outputs[0].shape == (3, 7, 32)
+    assert inputs[0].dtype == outputs[0].dtype == torch.float16
+
+
+def test_model_owned_stage_metadata_is_used():
+    class CustomModule(PipelineModelMixin, _MetaModule):
+        def __init__(self):
+            super().__init__(dtype=torch.float16)
+            self.calls = []
+
+        def pipeline_stage_metas(self, *, is_first, microbatch_size, seq_len, dtype):
+            self.calls.append((is_first, microbatch_size, seq_len, dtype))
+            hidden = torch.empty(microbatch_size, seq_len, 3, device="meta", dtype=dtype)
+            carry = torch.empty(microbatch_size, seq_len, 5, device="meta", dtype=torch.float32)
+            return (hidden, carry), (hidden, carry)
+
+    module = CustomModule()
+    part = PipelineModelPart(module, 1, 2)
+    inputs, outputs = _get_stage_metas(
+        part,
+        types.SimpleNamespace(),
+        microbatch_size=2,
+        seq_len=11,
+    )
+
+    assert module.calls == [(False, 2, 11, torch.float16)]
+    assert [tensor.shape for tensor in inputs] == [(2, 11, 3), (2, 11, 5)]
+    assert [tensor.dtype for tensor in outputs] == [torch.float16, torch.float32]
+
+
+class _FakeMesh:
+    def __init__(self, size=2, rank=0):
+        self._size = size
+        self._rank = rank
+        self.group = object()
+
+    def size(self):
+        return self._size
+
+    def get_local_rank(self):
+        return self._rank
+
+    def get_group(self, _axis=None):
+        return self.group
+
+
+class _RecordingStage:
+    def __init__(
+        self,
+        submod,
+        stage_index,
+        num_stages,
+        device,
+        *,
+        group,
+        input_args=None,
+        output_args=None,
+    ):
+        self.submod = submod
+        self.stage_index = stage_index
+        self.num_stages = num_stages
+        self.device = device
+        self.group = group
+        self.inputs_meta = input_args
+        self.outputs_meta = output_args
+        self.is_first = stage_index == 0
+        self.is_last = stage_index == num_stages - 1
+
+
+def test_create_pipeline_stages_supplies_constructor_metadata():
+    parts = [PipelineModelPart(_MetaModule(), 0, 2), PipelineModelPart(_MetaModule(lm_head=True), 1, 2)]
+    mesh = _FakeMesh()
+    config = types.SimpleNamespace(hidden_size=64, vocab_size=128)
+    with patch("nemo_automodel.components.distributed.pipelining.stage_runtime.PipelineStage", _RecordingStage):
+        stages = create_pipeline_stages(
+            parts,
+            mesh,
+            "pp",
+            torch.device("cpu"),
+            model_config=config,
             microbatch_size=2,
-            local_batch_size=8,
-            stages=stages,
-            loss_fn=loss_fn,
-        )
-
-        # Verify schedule was created correctly
-        assert isinstance(schedule, MockScheduleSingle)
-        assert schedule.stage == mock_stage
-        assert schedule.n_microbatches == 4
-        assert schedule.loss_fn == loss_fn
-
-    @patch("nemo_automodel.components.distributed.pipelining.functional.get_schedule_class")
-    def test_build_schedule_multi(self, mock_get_schedule):
-        # Create a mock schedule class that properly inherits from PipelineScheduleMulti
-        class MockScheduleMulti(PipelineScheduleMulti):
-            def __init__(self, *args, **kwargs):
-                self.stages = args[0] if args else None
-                self.n_microbatches = kwargs.get("n_microbatches", 0)
-                self.loss_fn = kwargs.get("loss_fn", None)
-
-        mock_get_schedule.return_value = MockScheduleMulti
-
-        # Mock stages
-        stages = [Mock(), Mock()]
-
-        # Mock loss function
-        loss_fn = Mock()
-
-        # Call function
-        schedule = build_pipeline_schedule(
-            pipeline_parallel_schedule_csv=None,
-            pipeline_parallel_schedule="PipelineScheduleMulti",
-            microbatch_size=2,
-            local_batch_size=8,
-            stages=stages,
-            loss_fn=loss_fn,
-        )
-
-        # Verify schedule was created correctly
-        assert isinstance(schedule, MockScheduleMulti)
-        assert schedule.stages == stages
-        assert schedule.n_microbatches == 4
-        assert schedule.loss_fn == loss_fn
-
-    def test_invalid_batch_size(self):
-        # Test when batch size not divisible by microbatch size
-        with pytest.raises(ValueError, match="must be divisible by"):
-            build_pipeline_schedule(
-                pipeline_parallel_schedule_csv=None,
-                pipeline_parallel_schedule="PipelineScheduleSingle",
-                microbatch_size=3,
-                local_batch_size=8,
-                stages=[Mock()],
-                loss_fn=Mock(),
-            )
-
-    @patch("os.path.isfile")
-    def test_csv_schedule(self, mock_isfile):
-        # Mock file exists
-        mock_isfile.return_value = True
-
-        # Create a mock _PipelineScheduleRuntime class that can be used with issubclass
-        class MockPipelineScheduleRuntime:
-            def __init__(self, *args, **kwargs):
-                self.stage = args[0] if args else None
-                self.n_microbatches = kwargs.get("n_microbatches", 0)
-                self.loss_fn = kwargs.get("loss_fn", None)
-                self._load_csv = Mock()
-                self._mock_instance = self  # Store reference for assertions
-
-        # Patch _PipelineScheduleRuntime with our mock class
-        with patch(
-            "nemo_automodel.components.distributed.pipelining.functional._PipelineScheduleRuntime",
-            MockPipelineScheduleRuntime,
-        ):
-            # Call with CSV
-            schedule = build_pipeline_schedule(
-                pipeline_parallel_schedule_csv="/path/to/schedule.csv",
-                pipeline_parallel_schedule=None,
-                microbatch_size=2,
-                local_batch_size=8,
-                stages=[Mock()],
-                loss_fn=Mock(),
-            )
-
-            # Verify CSV was loaded
-            schedule._load_csv.assert_called_once_with("/path/to/schedule.csv")
-            assert isinstance(schedule, MockPipelineScheduleRuntime)
-
-    def test_csv_file_not_found(self):
-        with patch("os.path.isfile", return_value=False):
-            with pytest.raises(FileNotFoundError):
-                build_pipeline_schedule(
-                    pipeline_parallel_schedule_csv="/nonexistent/file.csv",
-                    pipeline_parallel_schedule=None,
-                    microbatch_size=2,
-                    local_batch_size=8,
-                    stages=[Mock()],
-                    loss_fn=Mock(),
-                )
-
-
-class TestPipelineModel:
-    """Test pipeline_model function."""
-
-    @patch("nemo_automodel.components.distributed.pipelining.functional.split_model_into_stages")
-    @patch("nemo_automodel.components.distributed.pipelining.functional.build_pipeline_schedule")
-    def test_basic_pipeline_model(self, mock_build_schedule, mock_split_stages):
-        # Setup mocks
-        mock_world_mesh = MagicMock()
-        mock_pp_mesh = Mock()
-        mock_pp_mesh.size.return_value = 2
-        mock_world_mesh.__getitem__.return_value = mock_pp_mesh
-
-        mock_moe_mesh = Mock()
-
-        # Mock model
-        mock_model = Mock()
-
-        # Mock split_model_into_stages return
-        mock_stage1 = Mock()
-        mock_stage1.is_first = True
-        mock_stage1.is_last = False
-        mock_stage1.submod = Mock()
-
-        mock_stage2 = Mock()
-        mock_stage2.is_first = False
-        mock_stage2.is_last = True
-        mock_stage2.submod = Mock()
-
-        mock_model1 = Mock()
-        mock_model2 = Mock()
-
-        mock_split_stages.return_value = ([mock_stage1, mock_stage2], [mock_model1, mock_model2])
-
-        # Mock schedule
-        mock_schedule = Mock()
-        mock_build_schedule.return_value = mock_schedule
-
-        # Call function
-        schedule, models, has_first, has_last, stages = pipeline_model(
-            model=mock_model,
-            world_mesh=mock_world_mesh,
-            moe_mesh=mock_moe_mesh,
-            pp_axis_name="pp",
-            dp_axis_names=("dp",),
-            layers_per_stage=4,
-            pipeline_parallel_schedule_csv=None,
-            pipeline_parallel_schedule="PipelineScheduleSingle",
-            microbatch_size=2,
-            local_batch_size=8,
-            device=torch.device("cuda:0"),
-            loss_fn=Mock(),
-        )
-
-        assert schedule == mock_schedule
-        assert models == [mock_model1, mock_model2]
-        assert has_first is True
-        assert has_last is True
-        assert stages == [mock_stage1, mock_stage2]
-
-    def test_pipeline_size_validation(self):
-        # Test assertion when pp_size <= 1
-        mock_world_mesh = MagicMock()
-        mock_pp_mesh = Mock()
-        mock_pp_mesh.size.return_value = 1
-        mock_world_mesh.__getitem__.return_value = mock_pp_mesh
-
-        with pytest.raises(AssertionError):
-            pipeline_model(
-                model=Mock(),
-                world_mesh=mock_world_mesh,
-                moe_mesh=Mock(),
-                pp_axis_name="pp",
-                dp_axis_names=("dp",),
-                layers_per_stage=4,
-                pipeline_parallel_schedule_csv=None,
-                pipeline_parallel_schedule="PipelineScheduleSingle",
-                microbatch_size=2,
-                local_batch_size=8,
-                device=torch.device("cuda:0"),
-            )
-
-    @patch("nemo_automodel.components.distributed.pipelining.functional.split_model_into_stages")
-    @patch("nemo_automodel.components.distributed.pipelining.functional.build_pipeline_schedule")
-    def test_with_parallelization_fn(self, mock_build_schedule, mock_split_stages):
-        # Setup mocks
-        mock_world_mesh = MagicMock()
-        mock_pp_mesh = Mock()
-        mock_pp_mesh.size.return_value = 2
-        mock_world_mesh.__getitem__.return_value = mock_pp_mesh
-
-        # Mock parallelization function
-        mock_parallelize_fn = Mock()
-
-        # Mock stages and models
-        mock_stage = Mock()
-        mock_stage.is_first = True
-        mock_stage.is_last = False
-        mock_stage.submod = Mock()
-
-        mock_model = Mock()
-        mock_split_stages.return_value = ([mock_stage], [mock_model])
-
-        # Call with parallelization
-        pipeline_model(
-            model=Mock(),
-            world_mesh=mock_world_mesh,
-            moe_mesh=Mock(),
-            pp_axis_name="pp",
-            dp_axis_names=("dp",),
-            layers_per_stage=4,
-            pipeline_parallel_schedule_csv=None,
-            pipeline_parallel_schedule="PipelineScheduleSingle",
-            microbatch_size=2,
-            local_batch_size=8,
-            device=torch.device("cuda:0"),
-            parallelize_fn=mock_parallelize_fn,
-        )
-
-        # Verify parallelize_fn was called
-        mock_parallelize_fn.assert_called_once()
-        call_kwargs = mock_parallelize_fn.call_args[1]
-        assert call_kwargs["dp_axis_names"] == ("dp",)
-
-
-class TestPrecomputeStageShapes:
-    """Test _precompute_stage_shapes function."""
-
-    def _make_stage(self, is_first, is_last, has_lm_head, param_dtype=torch.bfloat16):
-        """Create a mock stage that mimics PipelineStage attributes."""
-        stage = Mock()
-        stage.is_first = is_first
-        stage.is_last = is_last
-        stage.inputs_meta = None
-        stage._outputs_meta = None
-
-        # Build a minimal submod with parameters of the right dtype
-        submod = Mock()
-        param = torch.empty(1, dtype=param_dtype)
-        submod.parameters.return_value = iter([param])
-        if has_lm_head:
-            submod.lm_head = Mock()
-        else:
-            submod.lm_head = None
-        stage.submod = submod
-        return stage
-
-    def _make_config(self, hidden_size=64, vocab_size=128):
-        import types
-
-        return types.SimpleNamespace(hidden_size=hidden_size, vocab_size=vocab_size)
-
-    def test_sets_static_metadata_for_new_pipeline_stage_api(self, monkeypatch):
-        """New PipelineStage stores static metadata in _user_meta."""
-        stage_module = __import__("torch.distributed.pipelining.stage", fromlist=["extract_tensor_metas"])
-
-        def extract_tensor_metas(tensors):
-            return tuple(
-                types.SimpleNamespace(shape=tensor.shape, dtype=tensor.dtype, requires_grad=tensor.requires_grad)
-                for tensor in tensors
-            )
-
-        monkeypatch.setattr(stage_module, "extract_tensor_metas", extract_tensor_metas, raising=False)
-        stage = types.SimpleNamespace(_user_meta=types.SimpleNamespace(inputs=None, outputs=None))
-        inputs = (
-            torch.empty(2, 16, device="meta", dtype=torch.long),
-            torch.empty(2, 16, 64, device="meta", dtype=torch.bfloat16),
-        )
-        outputs = (torch.empty(2, 16, 64, device="meta", dtype=torch.bfloat16),)
-
-        _set_stage_metas(stage, inputs, outputs)
-
-        assert stage._user_meta.inputs[0].requires_grad is False
-        assert stage._user_meta.inputs[1].requires_grad is True
-        assert stage._user_meta.outputs[0].requires_grad is True
-
-    def test_first_stage_shapes(self):
-        """First stage input should be [mb, seq_len] int64, output [mb, seq_len, hidden]."""
-        stage = self._make_stage(is_first=True, is_last=False, has_lm_head=False)
-        config = self._make_config(hidden_size=64, vocab_size=128)
-
-        _precompute_stage_shapes([stage], config, microbatch_size=2, seq_len=16)
-
-        # inputs_meta: input_ids [mb, seq_len] long
-        stage_inputs = stage.inputs_meta
-        assert len(stage_inputs) == 1
-        assert stage_inputs[0].shape == (2, 16)
-        assert stage_inputs[0].dtype == torch.long
-
-        # outputs_meta: hidden_states [mb, seq_len, hidden]
-        out_call = stage._configure_outputs_meta.call_args[0][0]
-        assert len(out_call) == 1
-        assert out_call[0].shape == (2, 16, 64)
-        assert out_call[0].dtype == torch.bfloat16
-
-    def test_middle_stage_shapes(self):
-        """Middle stage input/output should be [mb, seq_len, hidden]."""
-        stage = self._make_stage(is_first=False, is_last=False, has_lm_head=False)
-        config = self._make_config(hidden_size=64, vocab_size=128)
-
-        _precompute_stage_shapes([stage], config, microbatch_size=4, seq_len=32)
-
-        # inputs_meta: hidden_states [mb, seq_len, hidden]
-        assert stage.inputs_meta[0].shape == (4, 32, 64)
-        assert stage.inputs_meta[0].dtype == torch.bfloat16
-
-        # outputs_meta: hidden_states [mb, seq_len, hidden]
-        out_call = stage._configure_outputs_meta.call_args[0][0]
-        assert out_call[0].shape == (4, 32, 64)
-
-    def test_last_stage_with_lm_head(self):
-        """Last stage with lm_head should output [mb, seq_len, vocab_size]."""
-        stage = self._make_stage(is_first=False, is_last=True, has_lm_head=True)
-        config = self._make_config(hidden_size=64, vocab_size=128)
-
-        _precompute_stage_shapes([stage], config, microbatch_size=2, seq_len=16)
-
-        # inputs_meta: hidden_states
-        assert stage.inputs_meta[0].shape == (2, 16, 64)
-
-        # outputs_meta: logits [mb, seq_len, vocab_size]
-        out_call = stage._configure_outputs_meta.call_args[0][0]
-        assert out_call[0].shape == (2, 16, 128)
-        assert out_call[0].dtype == torch.bfloat16
-
-    def test_last_stage_without_lm_head(self):
-        """Last stage without lm_head should output [mb, seq_len, hidden]."""
-        stage = self._make_stage(is_first=False, is_last=True, has_lm_head=False)
-        config = self._make_config(hidden_size=64, vocab_size=128)
-
-        _precompute_stage_shapes([stage], config, microbatch_size=2, seq_len=16)
-
-        out_call = stage._configure_outputs_meta.call_args[0][0]
-        assert out_call[0].shape == (2, 16, 64)
-
-    def test_last_stage_fused_ce_emits_hidden_states(self):
-        """Fused-CE last stage keeps lm_head but skips its projection, so its
-        output is [mb, seq_len, hidden] rather than [mb, seq_len, vocab]."""
-        stage = self._make_stage(is_first=False, is_last=True, has_lm_head=True)
-        stage.submod._pp_return_hidden_states = True
-        config = self._make_config(hidden_size=64, vocab_size=128)
-
-        _precompute_stage_shapes([stage], config, microbatch_size=2, seq_len=16)
-
-        out_call = stage._configure_outputs_meta.call_args[0][0]
-        # Last dim is hidden (64), not vocab (128): the flag skips the lm_head projection
-        assert out_call[0].shape == (2, 16, 64)
-
-    def test_multi_stage_pipeline(self):
-        """Test with 3 stages (first, middle, last with lm_head)."""
-        stages = [
-            self._make_stage(is_first=True, is_last=False, has_lm_head=False),
-            self._make_stage(is_first=False, is_last=False, has_lm_head=False),
-            self._make_stage(is_first=False, is_last=True, has_lm_head=True),
-        ]
-        config = self._make_config(hidden_size=128, vocab_size=256)
-
-        _precompute_stage_shapes(stages, config, microbatch_size=1, seq_len=64)
-
-        # Stage 0: input_ids → hidden_states
-        assert stages[0].inputs_meta[0].shape == (1, 64)
-        assert stages[0].inputs_meta[0].dtype == torch.long
-
-        # Stage 1: hidden_states → hidden_states
-        assert stages[1].inputs_meta[0].shape == (1, 64, 128)
-        assert stages[1].inputs_meta[0].dtype == torch.bfloat16
-
-        # Stage 2: hidden_states → logits
-        assert stages[2].inputs_meta[0].shape == (1, 64, 128)
-        out_call = stages[2]._configure_outputs_meta.call_args[0][0]
-        assert out_call[0].shape == (1, 64, 256)
-
-    def test_dtype_inference_from_params(self):
-        """Test that model dtype is inferred from stage parameters."""
-        stage = self._make_stage(is_first=False, is_last=False, has_lm_head=False, param_dtype=torch.float16)
-        config = self._make_config(hidden_size=64, vocab_size=128)
-
-        _precompute_stage_shapes([stage], config, microbatch_size=2, seq_len=16)
-
-        assert stage.inputs_meta[0].dtype == torch.float16
-
-    def test_all_meta_device(self):
-        """All precomputed tensors should be on meta device."""
-        stage = self._make_stage(is_first=True, is_last=False, has_lm_head=False)
-        config = self._make_config()
-
-        _precompute_stage_shapes([stage], config, microbatch_size=2, seq_len=16)
-
-        assert stage.inputs_meta[0].device.type == "meta"
-        out_call = stage._configure_outputs_meta.call_args[0][0]
-        assert out_call[0].device.type == "meta"
-
-    def test_vl_composite_config_fallback(self):
-        """VL composite configs (no hidden_size on root) should fall back to text_config."""
-        import types
-
-        text_config = types.SimpleNamespace(hidden_size=64, vocab_size=128)
-        vl_config = types.SimpleNamespace(text_config=text_config)
-
-        stage = self._make_stage(is_first=True, is_last=False, has_lm_head=False)
-        _precompute_stage_shapes([stage], vl_config, microbatch_size=2, seq_len=16)
-
-        out_call = stage._configure_outputs_meta.call_args[0][0]
-        assert out_call[0].shape == (2, 16, 64)
-
-    @patch("nemo_automodel.components.distributed.pipelining.functional._warmup_pipeline_stage_neighbors")
-    @patch("nemo_automodel.components.distributed.pipelining.functional.split_model_into_stages")
-    @patch("nemo_automodel.components.distributed.pipelining.functional.build_pipeline_schedule")
-    def test_pipeline_model_with_seq_len(self, mock_build_schedule, mock_split_stages, mock_warmup_neighbors):
-        """Test that pipeline_model calls _precompute_stage_shapes when seq_len is provided."""
-        mock_world_mesh = MagicMock()
-        mock_pp_mesh = Mock()
-        mock_pp_mesh.size.return_value = 2
-        mock_world_mesh.__getitem__.return_value = mock_pp_mesh
-
-        mock_model = Mock()
-        mock_model.config = self._make_config(hidden_size=64, vocab_size=128)
-
-        mock_stage1 = self._make_stage(is_first=True, is_last=False, has_lm_head=False)
-        mock_stage2 = self._make_stage(is_first=False, is_last=True, has_lm_head=True)
-        mock_split_stages.return_value = ([mock_stage1, mock_stage2], [Mock(), Mock()])
-        mock_build_schedule.return_value = Mock()
-
-        pipeline_model(
-            model=mock_model,
-            world_mesh=mock_world_mesh,
-            moe_mesh=Mock(),
-            pp_axis_name="pp",
-            dp_axis_names=("dp",),
-            layers_per_stage=4,
-            pipeline_parallel_schedule_csv=None,
-            pipeline_parallel_schedule="PipelineScheduleSingle",
-            microbatch_size=2,
-            local_batch_size=8,
-            device=torch.device("cuda:0"),
             seq_len=16,
         )
 
-        # Verify shapes were precomputed
-        assert mock_stage1.inputs_meta is not None
-        assert mock_stage1.inputs_meta[0].shape == (2, 16)  # input_ids for first stage
-        assert mock_stage2.inputs_meta is not None
-        assert mock_stage2.inputs_meta[0].shape == (2, 16, 64)  # hidden_states
-        mock_warmup_neighbors.assert_called_once_with(mock_stage1)
+    assert stages[0].submod is parts[0].module
+    assert stages[0].inputs_meta[0].shape == (2, 16)
+    assert stages[1].outputs_meta[0].shape == (2, 16, 128)
+    assert all(stage.group is mesh.group for stage in stages)
 
-    @patch("nemo_automodel.components.distributed.pipelining.functional.split_model_into_stages")
-    @patch("nemo_automodel.components.distributed.pipelining.functional.build_pipeline_schedule")
-    def test_pipeline_model_without_seq_len(self, mock_build_schedule, mock_split_stages):
-        """Test that pipeline_model skips precomputation when seq_len is None."""
-        mock_world_mesh = MagicMock()
-        mock_pp_mesh = Mock()
-        mock_pp_mesh.size.return_value = 2
-        mock_world_mesh.__getitem__.return_value = mock_pp_mesh
 
-        mock_stage = Mock()
-        mock_stage.is_first = True
-        mock_stage.is_last = True
-        mock_stage.inputs_meta = None
-        mock_stage.submod = Mock()
+def test_create_pipeline_stages_allows_dynamic_inference():
+    part = PipelineModelPart(_MetaModule(), 0, 1)
+    with patch("nemo_automodel.components.distributed.pipelining.stage_runtime.PipelineStage", _RecordingStage):
+        stage = create_pipeline_stages(
+            [part],
+            _FakeMesh(size=1),
+            "pp",
+            torch.device("cpu"),
+            model_config=types.SimpleNamespace(hidden_size=64, vocab_size=128),
+            microbatch_size=1,
+            seq_len=None,
+        )[0]
 
-        mock_split_stages.return_value = ([mock_stage], [Mock()])
-        mock_build_schedule.return_value = Mock()
+    assert stage.inputs_meta is None
+    assert stage.outputs_meta is None
 
-        pipeline_model(
-            model=Mock(),
-            world_mesh=mock_world_mesh,
-            moe_mesh=Mock(),
-            pp_axis_name="pp",
-            dp_axis_names=("dp",),
-            layers_per_stage=4,
-            pipeline_parallel_schedule_csv=None,
-            pipeline_parallel_schedule="PipelineScheduleSingle",
-            microbatch_size=2,
-            local_batch_size=8,
-            device=torch.device("cuda:0"),
-            # seq_len not provided — should skip precomputation
+
+def test_create_pipeline_stages_reports_unsupported_public_metadata_api():
+    class IncompatibleStage:
+        def __init__(self, submod, stage_index, num_stages, device, *, group):
+            del submod, stage_index, num_stages, device, group
+
+    with (
+        patch("nemo_automodel.components.distributed.pipelining.stage_runtime.PipelineStage", IncompatibleStage),
+        pytest.raises(RuntimeError, match="accepts input_args and output_args"),
+    ):
+        create_pipeline_stages(
+            [PipelineModelPart(_MetaModule(), 0, 1)],
+            _FakeMesh(size=1),
+            "pp",
+            torch.device("cpu"),
+            model_config=types.SimpleNamespace(hidden_size=64, vocab_size=128),
+            microbatch_size=1,
+            seq_len=8,
         )
 
-        # inputs_meta should remain None (serial shape inference at runtime)
-        assert mock_stage.inputs_meta is None
+
+def test_warmup_pipeline_stage_neighbors_uses_symmetric_edges():
+    stage = Mock(device=torch.device("cpu"), group_size=3)
+    stage.group.rank.return_value = 1
+    with (
+        patch("torch.distributed.get_process_group_ranks", return_value=[0, 1, 2]),
+        patch("torch.distributed.isend") as isend,
+        patch("torch.distributed.irecv") as irecv,
+        patch("torch.cuda.synchronize") as synchronize,
+        patch("torch.cuda.device_count", return_value=8),
+        patch("nemo_automodel.components.distributed.pipelining.stage_runtime.time.sleep"),
+    ):
+        warmup_pipeline_stage_neighbors(stage)
+
+    assert [call.kwargs["group_dst"] for call in isend.call_args_list] == [0, 2]
+    assert [call.kwargs["group_src"] for call in irecv.call_args_list] == [0, 2]
+    synchronize.assert_called_once_with(stage.device)
 
 
-@pytest.mark.skipif(
-    not hasattr(importlib.import_module("torch.distributed.pipelining._utils"), "InferenceMode"),
-    reason="requires the torch>=2.12 pipelining InferenceMode internals",
-)
-class TestStaticPipelineStageMetadata:
-    """Test the Torch 2.12 static metadata warm-up compatibility path."""
-
-    @pytest.mark.parametrize(
-        ("group_rank", "send_peers", "recv_peers"),
-        [(0, [1, 3], [1, 3]), (1, [0, 2], [0, 2])],
+def test_configure_pipeline_stage_backward_is_noop_by_default():
+    stage = Mock()
+    configure_pipeline_stage_backward(
+        [stage],
+        patch_stage_backward_maybe_with_nosync=False,
+        reduce_grad_per_microbatch=False,
     )
-    @patch("nemo_automodel.components.distributed.pipelining.functional.time.sleep")
-    @patch("torch.cuda.device_count", return_value=8)
-    @patch("torch.distributed.get_process_group_ranks", return_value=[8, 72, 136, 200])
-    @patch("torch.distributed.pipelining._utils.InferenceMode.needs_dynamic", return_value=False)
-    @patch("torch.cuda.synchronize")
-    @patch("torch.distributed.irecv")
-    @patch("torch.distributed.isend")
-    def test_warms_neighbor_communicators(
-        self,
-        isend,
-        irecv,
-        synchronize,
-        _needs_dynamic,
-        _get_group_ranks,
-        _device_count,
-        sleep,
-        group_rank,
-        send_peers,
-        recv_peers,
+    assert "backward_maybe_with_nosync" not in stage.__dict__
+
+
+@pytest.mark.parametrize(
+    ("config", "expected"),
+    [
+        (types.SimpleNamespace(hidden_size=64, vocab_size=128), (64, 128)),
+        (types.SimpleNamespace(text_config=types.SimpleNamespace(hidden_size=32, vocab_size=96)), (32, 96)),
+        (
+            types.SimpleNamespace(
+                hidden_size=64,
+                vocab_size=None,
+                text_config=types.SimpleNamespace(hidden_size=32, vocab_size=96),
+            ),
+            (64, 96),
+        ),
+    ],
+)
+def test_get_hidden_and_vocab_size(config, expected):
+    assert _get_hidden_and_vocab_size(config) == expected
+
+
+def test_get_hidden_and_vocab_size_reports_missing_fields():
+    with pytest.raises(ValueError, match="hidden_size"):
+        _get_hidden_and_vocab_size(types.SimpleNamespace())
+    with pytest.raises(ValueError, match="vocab_size"):
+        _get_hidden_and_vocab_size(types.SimpleNamespace(hidden_size=64))
+
+
+def test_split_model_parts_preserves_model_owned_stage_customization():
+    class TextModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed_tokens = nn.Embedding(16, 8, device="meta")
+            self.layers = nn.ModuleList([nn.Linear(8, 8, device="meta") for _ in range(4)])
+            self.norm = nn.LayerNorm(8, device="meta")
+            self.rotary_emb = nn.Identity()
+            self.custom_shared = nn.Identity()
+
+    class Wrapper(PipelineModelMixin, nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = TextModel()
+            self.lm_head = nn.Linear(8, 16, device="meta")
+            self.config = types.SimpleNamespace(hidden_size=8, vocab_size=16)
+
+        def pipeline_stage_modules(self, module_names_per_stage, *, layers_prefix, text_model):
+            assert text_model is self.model
+            return [list(names) + [f"{layers_prefix}custom_shared"] for names in module_names_per_stage]
+
+    with patch(
+        "nemo_automodel.components.distributed.pipelining.model_parts.patch_hf_model_for_pp",
+        lambda *args, **kwargs: None,
     ):
-        from torch.distributed.pipelining._utils import InferenceMode
-
-        class Schedule:
-            _has_backward = True
-
-            def _warmup_p2p(self):
-                raise AssertionError("native Torch 2.12 warm-up should be replaced")
-
-        class Stage:
-            _user_meta = object()
-            _inference_mode = None
-            device = torch.device("cpu")
-            group = Mock()
-            group_size = 4
-
-        Stage.group.rank.return_value = group_rank
-        schedule = Schedule()
-        stages = [Stage(), Stage()]
-
-        _warmup_pipeline_stage_neighbors(stages[0])
-        _use_static_pipeline_stage_metadata(schedule, stages)
-        schedule._warmup_p2p(stages, has_backward=True, p2p_done=False)
-
-        assert all(stage._inference_mode == InferenceMode.STATIC for stage in stages)
-        assert [mock_call.kwargs["group_dst"] for mock_call in isend.call_args_list] == send_peers
-        assert [mock_call.kwargs["group_src"] for mock_call in irecv.call_args_list] == recv_peers
-        assert all(mock_call.kwargs["group"] is stages[0].group for mock_call in isend.call_args_list)
-        assert all(mock_call.kwargs["group"] is stages[0].group for mock_call in irecv.call_args_list)
-        assert isend.return_value.wait.call_count == len(send_peers)
-        assert irecv.return_value.wait.call_count == len(recv_peers)
-        synchronize.assert_called_once_with(stages[0].device)
-        sleep.assert_called_once_with(2)
-
-    @patch("torch.distributed.pipelining._utils.InferenceMode.needs_dynamic", return_value=True)
-    def test_keeps_native_warmup_for_dynamic_metadata(self, _needs_dynamic):
-        class Schedule:
-            _has_backward = True
-
-            def _warmup_p2p(self):
-                return "native"
-
-        class Stage:
-            _user_meta = object()
-
-        schedule = Schedule()
-        original_warmup = schedule._warmup_p2p
-
-        _use_static_pipeline_stage_metadata(schedule, [Stage()])
-
-        assert schedule._warmup_p2p == original_warmup
-
-
-class TestGetHiddenAndVocabSize:
-    """Test _get_hidden_and_vocab_size helper."""
-
-    def _make_config(self, hidden_size=None, vocab_size=None, text_config=None):
-        import types
-
-        cfg = types.SimpleNamespace()
-        if hidden_size is not None:
-            cfg.hidden_size = hidden_size
-        if vocab_size is not None:
-            cfg.vocab_size = vocab_size
-        if text_config is not None:
-            cfg.text_config = text_config
-        return cfg
-
-    def test_flat_config(self):
-        """LLM-style config with hidden_size and vocab_size at top level."""
-        cfg = self._make_config(hidden_size=4096, vocab_size=32000)
-        h, v = _get_hidden_and_vocab_size(cfg)
-        assert h == 4096
-        assert v == 32000
-
-    def test_nested_text_config(self):
-        """VLM-style config where sizes live under text_config."""
-        import types
-
-        text_cfg = types.SimpleNamespace(hidden_size=2048, vocab_size=128256)
-        cfg = self._make_config(text_config=text_cfg)
-        h, v = _get_hidden_and_vocab_size(cfg)
-        assert h == 2048
-        assert v == 128256
-
-    def test_partial_nested_config(self):
-        """Top-level hidden_size with vocab_size only in text_config."""
-        import types
-
-        text_cfg = types.SimpleNamespace(vocab_size=50000)
-        cfg = self._make_config(hidden_size=1024, text_config=text_cfg)
-        h, v = _get_hidden_and_vocab_size(cfg)
-        assert h == 1024
-        assert v == 50000
-
-    def test_top_level_takes_precedence(self):
-        """When both top-level and text_config have values, top-level wins."""
-        import types
-
-        text_cfg = types.SimpleNamespace(hidden_size=999, vocab_size=999)
-        cfg = self._make_config(hidden_size=4096, vocab_size=32000, text_config=text_cfg)
-        h, v = _get_hidden_and_vocab_size(cfg)
-        assert h == 4096
-        assert v == 32000
-
-    def test_missing_hidden_size_raises(self):
-        """Should raise ValueError when hidden_size cannot be found."""
-        cfg = self._make_config(vocab_size=32000)
-        with pytest.raises(ValueError, match="Cannot determine hidden_size"):
-            _get_hidden_and_vocab_size(cfg)
-
-    def test_missing_vocab_size_raises(self):
-        """Should raise ValueError when vocab_size cannot be found."""
-        cfg = self._make_config(hidden_size=4096)
-        with pytest.raises(ValueError, match="Cannot determine vocab_size"):
-            _get_hidden_and_vocab_size(cfg)
-
-    def test_both_missing_raises(self):
-        """Should raise ValueError when both are missing and no text_config."""
-        import types
-
-        cfg = types.SimpleNamespace()
-        with pytest.raises(ValueError, match="Cannot determine hidden_size"):
-            _get_hidden_and_vocab_size(cfg)
-
-    def test_text_config_missing_both_raises(self):
-        """text_config exists but doesn't have the attributes either."""
-        import types
-
-        text_cfg = types.SimpleNamespace()
-        cfg = self._make_config(text_config=text_cfg)
-        with pytest.raises(ValueError, match="Cannot determine hidden_size"):
-            _get_hidden_and_vocab_size(cfg)
-
-
-class TestResetPpStageShapes:
-    """Test reset_pp_stage_shapes function."""
-
-    def _make_stage(self, is_first, is_last, has_lm_head, param_dtype=torch.bfloat16):
-        """Create a mock stage that mimics PipelineStage attributes."""
-        stage = Mock()
-        stage.is_first = is_first
-        stage.is_last = is_last
-        stage.inputs_meta = None
-        stage._outputs_meta = None
-        stage.args_recv_info = {"some_key": "some_val"}
-        stage.grad_recv_info = {"grad_key": "grad_val"}
-        stage.grad_send_info = Mock()
-
-        submod = Mock()
-        param = torch.empty(1, dtype=param_dtype)
-        submod.parameters.return_value = iter([param])
-        if has_lm_head:
-            submod.lm_head = Mock()
-        else:
-            submod.lm_head = None
-        stage.submod = submod
-        return stage
-
-    def _make_config(self, hidden_size=64, vocab_size=128):
-        import types
-
-        return types.SimpleNamespace(hidden_size=hidden_size, vocab_size=vocab_size)
-
-    def _make_schedule(self, initialized=True):
-        schedule = Mock()
-        schedule._stage_forward_initialized = initialized
-        schedule._stage_backward_initialized = initialized
-        schedule._stages_forward_initialized = initialized
-        schedule._stages_backward_initialized = initialized
-        return schedule
-
-    def test_clears_stage_state(self):
-        """reset should clear _outputs_meta, inputs_meta, and recv/send buffers."""
-        stage = self._make_stage(is_first=True, is_last=False, has_lm_head=False)
-        # Pre-populate state to simulate a previously-initialized stage
-        stage._outputs_meta = (torch.empty(2, 16, 64, device="meta"),)
-        stage.inputs_meta = (torch.empty(2, 16, device="meta", dtype=torch.long),)
-        schedule = self._make_schedule()
-        config = self._make_config()
-
-        reset_pp_stage_shapes(schedule, [stage], config, microbatch_size=2, seq_len=32)
-
-        # After reset, inputs_meta should be set to new shapes (seq_len=32)
-        assert stage.inputs_meta[0].shape == (2, 32)
-        # _configure_outputs_meta should have been called with new shapes
-        stage._configure_outputs_meta.assert_called_once()
-
-    def test_schedule_reinitialized(self):
-        """_stages_initialized should be set to False after reset."""
-        stage = self._make_stage(is_first=True, is_last=True, has_lm_head=True)
-        schedule = self._make_schedule(initialized=True)
-        config = self._make_config()
-
-        reset_pp_stage_shapes(schedule, [stage], config, microbatch_size=1, seq_len=64)
-
-        assert schedule._stage_forward_initialized is False
-        assert schedule._stage_backward_initialized is False
-        assert schedule._stages_forward_initialized is False
-        assert schedule._stages_backward_initialized is False
-
-    def test_recv_buffers_cleared(self):
-        """args_recv_info, grad_recv_info, grad_send_info should be cleared."""
-        stage = self._make_stage(is_first=False, is_last=False, has_lm_head=False)
-        schedule = self._make_schedule()
-        config = self._make_config()
-
-        reset_pp_stage_shapes(schedule, [stage], config, microbatch_size=2, seq_len=16)
-
-        assert stage.args_recv_info == {}
-        assert stage.grad_recv_info == {}
-        assert stage.grad_send_info is None
-
-    def test_multi_stage_reset(self):
-        """Reset should work across a full 3-stage pipeline."""
-        stages = [
-            self._make_stage(is_first=True, is_last=False, has_lm_head=False),
-            self._make_stage(is_first=False, is_last=False, has_lm_head=False),
-            self._make_stage(is_first=False, is_last=True, has_lm_head=True),
-        ]
-        schedule = self._make_schedule()
-        config = self._make_config(hidden_size=128, vocab_size=256)
-
-        reset_pp_stage_shapes(schedule, stages, config, microbatch_size=4, seq_len=64)
-
-        # Stage 0: input_ids [4, 64]
-        assert stages[0].inputs_meta[0].shape == (4, 64)
-        assert stages[0].inputs_meta[0].dtype == torch.long
-
-        # Stage 1: hidden [4, 64, 128]
-        assert stages[1].inputs_meta[0].shape == (4, 64, 128)
-
-        # Stage 2: hidden → logits [4, 64, 256]
-        out_call = stages[2]._configure_outputs_meta.call_args[0][0]
-        assert out_call[0].shape == (4, 64, 256)
-
-        # All recv/send buffers should be cleared
-        for stage in stages:
-            assert stage.args_recv_info == {}
-            assert stage.grad_recv_info == {}
-            assert stage.grad_send_info is None
-
-        assert schedule._stage_forward_initialized is False
-        assert schedule._stage_backward_initialized is False
-        assert schedule._stages_forward_initialized is False
-        assert schedule._stages_backward_initialized is False
-
-    def test_shapes_change_on_new_seq_len(self):
-        """Calling reset twice with different seq_lens should produce different shapes."""
-        stage = self._make_stage(is_first=True, is_last=False, has_lm_head=False)
-        schedule = self._make_schedule()
-        config = self._make_config()
-
-        reset_pp_stage_shapes(schedule, [stage], config, microbatch_size=2, seq_len=16)
-        assert stage.inputs_meta[0].shape == (2, 16)
-
-        # Reset for new call — need a fresh stage since _configure_outputs_meta tracks calls
-        stage2 = self._make_stage(is_first=True, is_last=False, has_lm_head=False)
-        schedule2 = self._make_schedule()
-        reset_pp_stage_shapes(schedule2, [stage2], config, microbatch_size=2, seq_len=128)
-        assert stage2.inputs_meta[0].shape == (2, 128)
-
-    def test_vlm_nested_config(self):
-        """reset_pp_stage_shapes should work with VLM-style nested text_config."""
-        import types
-
-        text_cfg = types.SimpleNamespace(hidden_size=2048, vocab_size=128256)
-        config = types.SimpleNamespace(text_config=text_cfg)
-
-        stage = self._make_stage(is_first=False, is_last=True, has_lm_head=True)
-        schedule = self._make_schedule()
-
-        reset_pp_stage_shapes(schedule, [stage], config, microbatch_size=1, seq_len=512)
-
-        # Should use text_config's sizes
-        assert stage.inputs_meta[0].shape == (1, 512, 2048)
-        out_call = stage._configure_outputs_meta.call_args[0][0]
-        assert out_call[0].shape == (1, 512, 128256)
-
-
-# =============================================================================
-# DeepSeek V4: extra hc_mult axis between blocks (4-D inter-stage activations)
-# =============================================================================
-
-
-class TestPrecomputeStageShapesModelHook:
-    """Models with non-standard PP tensor contracts can provide their own metas."""
-
-    def test_uses_model_supplied_pipeline_stage_metas(self):
-        import torch.nn as nn
-
-        class _Submod(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.register_parameter("_dummy", nn.Parameter(torch.empty(1, dtype=torch.float16)))
-                self.calls = []
-
-            def get_pipeline_stage_metas(self, *, is_first, microbatch_size, seq_len, dtype):
-                self.calls.append((is_first, microbatch_size, seq_len, dtype))
-                inputs = (torch.empty(microbatch_size, seq_len, 3, device="meta", dtype=dtype),)
-                outputs = (torch.empty(microbatch_size, seq_len, 5, device="meta", dtype=dtype),)
-                return inputs, outputs
-
-        stage = Mock()
-        stage.is_first = False
-        stage.submod = _Submod()
-
-        config = types.SimpleNamespace(hidden_size=64, vocab_size=128)
-        _precompute_stage_shapes([stage], config, microbatch_size=2, seq_len=16)
-
-        assert stage.submod.calls == [(False, 2, 16, torch.float16)]
-        assert stage.inputs_meta[0].shape == (2, 16, 3)
-        assert stage.inputs_meta[0].dtype == torch.float16
-        out = stage._configure_outputs_meta.call_args[0][0]
-        assert out[0].shape == (2, 16, 5)
-        assert out[0].device.type == "meta"
-
-    def test_non_hook_model_ignores_hc_mult_attribute(self):
-        cfg = types.SimpleNamespace(
-            model_type="any_nonstandard_model",
-            hidden_size=64,
-            vocab_size=128,
-            hc_mult=4,
+        parts = split_model_into_parts(
+            Wrapper(),
+            _FakeMesh(size=2, rank=0),
+            "PipelineScheduleSingle",
+            layers_per_stage=2,
         )
-        stage = Mock()
-        stage.is_first = False
-        stage.submod = Mock()
-        stage.submod.parameters.return_value = iter(())
-        del stage.submod.lm_head
 
-        _precompute_stage_shapes([stage], cfg, microbatch_size=1, seq_len=8)
-
-        assert stage.inputs_meta[0].shape == (1, 8, 64)
-        out = stage._configure_outputs_meta.call_args[0][0]
-        assert out[0].shape == (1, 8, 64)
+    assert len(parts) == 1
+    assert parts[0].stage_index == 0
+    assert parts[0].module.model.custom_shared is not None
+    assert list(parts[0].module.model.layers) == ["0", "1"]
 
 
-# =============================================================================
-# Model keep-list customization hook in split_model_into_stages
-# =============================================================================
+class _OutputModule(nn.Module):
+    def __init__(self, output):
+        super().__init__()
+        self.output = output
+
+    def forward(self, hidden_states: torch.Tensor):
+        """Return the configured output.
+
+        Args:
+            hidden_states: Tensor of shape [batch, sequence, hidden].
+
+        Returns:
+            The configured output, whose tensor leaves preserve the input layout.
+        """
+        if callable(self.output):
+            return self.output(hidden_states)
+        return self.output
 
 
-class TestSplitModelIntoStagesKeepListHook:
-    """Models can customize the generated PP module keep-list without generic model checks."""
+def test_stage_forward_unwraps_model_output_and_preserves_gradients():
+    module = _OutputModule(lambda hidden: CausalLMOutputWithPast(logits=hidden.square()))
+    _wrap_stage_forward_to_emit_tensor(module)
+    hidden = torch.randn(2, 3, 4, requires_grad=True)
 
-    def _capture_module_names(
-        self,
-        *,
-        with_hook,
-        num_stages=2,
-    ):
-        """Run split_model_into_stages with mocks and return generated keep-lists."""
-        import torch.nn as nn
+    output = module(hidden)
+    output.sum().backward()
 
-        class _TextModel(nn.Module):
-            pass
-
-        text_model = _TextModel()
-        text_model.layers = nn.ModuleList([nn.Identity() for _ in range(4)])
-        text_model.rotary_emb = nn.Identity()
-
-        class _Wrapper(nn.Module):
-            pass
-
-        model = _Wrapper()
-        model.model = text_model  # has_model_attr=True, layers_prefix="model."
-        model.lm_head = nn.Identity()
-        model.config = types.SimpleNamespace(model_type="custom")
-
-        captured = {"hook_args": None, "lists": None}
-        if with_hook:
-
-            def customize_pipeline_stage_modules(self, module_names_per_stage, *, layers_prefix, text_model):
-                captured["hook_args"] = (layers_prefix, text_model)
-                for stage_modules in module_names_per_stage:
-                    stage_modules.append(f"{layers_prefix}custom_shared")
-                module_names_per_stage[-1].append("custom_last")
-                return module_names_per_stage
-
-            model.customize_pipeline_stage_modules = types.MethodType(customize_pipeline_stage_modules, model)
-
-        mock_pp_mesh = Mock()
-        mock_pp_mesh.get_local_rank.return_value = 0
-        mock_pp_mesh.size.return_value = num_stages
-
-        # Generated FQNs (BEFORE V4 post-processing)
-        base_fqns = [
-            ["model.embed_tokens", "model.layers.0", "model.layers.1"],
-            ["model.layers.2", "model.layers.3", "model.norm", "lm_head"],
-        ]
-
-        def generate_side_effect(**kwargs):
-            del kwargs
-            captured["lists"] = [list(s) for s in base_fqns]
-            return captured["lists"]
-
-        with (
-            patch(
-                "nemo_automodel.components.distributed.pipelining.functional.get_text_module",
-                return_value=text_model,
-            ),
-            patch(
-                "nemo_automodel.components.distributed.pipelining.functional.calculate_virtual_stages",
-                return_value=(num_stages, 1),
-            ),
-            patch(
-                "nemo_automodel.components.distributed.pipelining.functional.generate_hf_model_fqn_per_model_part",
-                side_effect=generate_side_effect,
-            ),
-            patch("nemo_automodel.components.distributed.pipelining.functional.PipelineStage"),
-            patch(
-                "nemo_automodel.components.distributed.pipelining.functional.get_schedule_class",
-                return_value=PipelineScheduleSingle,
-            ),
-            patch(
-                "nemo_automodel.components.distributed.pipelining.functional.stage_ids_this_rank",
-                return_value=(0,),
-            ),
-            patch("copy.deepcopy") as mock_deepcopy,
-        ):
-            mock_copy = Mock()
-            mock_copy.named_children.return_value = []
-            mock_deepcopy.return_value = mock_copy
-
-            with patch(
-                "nemo_automodel.components.distributed.pipelining.functional.patch_hf_model_for_pp",
-                lambda *a, **kw: None,
-            ):
-                try:
-                    split_model_into_stages(
-                        model,
-                        mock_pp_mesh,
-                        "pp",
-                        "PipelineScheduleSingle",
-                        torch.device("cpu"),
-                        layers_per_stage=2,
-                    )
-                except Exception:
-                    # The build-stages portion needs more scaffolding than we provide;
-                    # we only care about keep-list generation/customization.
-                    pass
-
-        return captured["lists"], captured["hook_args"]
-
-    def test_model_hook_can_extend_generated_keep_list(self):
-        lists, hook_args = self._capture_module_names(with_hook=True)
-        assert lists is not None
-        assert hook_args is not None
-        layers_prefix, text_model = hook_args
-        assert layers_prefix == "model."
-        assert text_model is not None
-        for stage_fqns in lists:
-            assert "model.custom_shared" in stage_fqns
-        assert "custom_last" in lists[-1]
-        assert "custom_last" not in lists[0]
-
-    def test_without_model_hook_keep_list_is_unchanged(self):
-        lists, hook_args = self._capture_module_names(with_hook=False)
-        assert lists is not None
-        assert hook_args is None
-        for stage_fqns in lists:
-            assert "model.custom_shared" not in stage_fqns
-            assert "custom_last" not in stage_fqns
+    assert torch.equal(output, hidden.detach().square())
+    assert torch.equal(hidden.grad, 2 * hidden.detach())
 
 
-class TestWrapStageForwardToEmitTensor:
-    """A PP stage forward must emit tensors, not a HF ModelOutput.
+@pytest.mark.parametrize("output", [torch.ones(2, 3), (torch.ones(2, 3), torch.zeros(2, 3))])
+def test_stage_forward_preserves_tensor_outputs(output):
+    module = _OutputModule(output)
+    original_signature = str(__import__("inspect").signature(module.forward))
+    _wrap_stage_forward_to_emit_tensor(module)
+    _wrap_stage_forward_to_emit_tensor(module)
 
-    Regression test for the ``CausalLMOutputWithPast' object has no attribute
-    'shape'`` crash: custom ``*ForCausalLM`` forwards return a
-    ``CausalLMOutputWithPast`` (fused-linear-CE), but ``torch.distributed.pipelining``
-    calls ``.shape`` on each output leaf. The kept outer forward (``_pp_keep_self_forward``
-    models, and MoE configs with ``patch_causal_lm_model=False``) must be unwrapped.
-    """
+    result = module(torch.zeros(2, 3, 4))
 
-    def test_unwraps_model_output_to_logits(self):
-        from transformers.modeling_outputs import CausalLMOutputWithPast
-
-        logits = torch.randn(2, 3, 8)
-
-        class FinalStage(torch.nn.Module):
-            def forward(self, x, position_ids=None):
-                return CausalLMOutputWithPast(logits=logits, hidden_states=None)
-
-        m = FinalStage()
-        _wrap_stage_forward_to_emit_tensor(m)
-        out = m(torch.randn(2, 3, 8))
-        assert isinstance(out, torch.Tensor)
-        assert torch.equal(out, logits)
-
-    def test_nonfinal_stage_passthrough_hidden_states(self):
-        # lm_head is None on non-final stages -> compute_lm_head_logits returns
-        # CausalLMOutputWithPast(logits=hidden_states); unwrap must yield that tensor.
-        from transformers.modeling_outputs import CausalLMOutputWithPast
-
-        hidden = torch.randn(2, 3, 8)
-
-        class MidStage(torch.nn.Module):
-            def forward(self, x):
-                return CausalLMOutputWithPast(logits=hidden, hidden_states=None)
-
-        m = MidStage()
-        _wrap_stage_forward_to_emit_tensor(m)
-        assert torch.equal(m(torch.randn(2, 3, 8)), hidden)
-
-    def test_grad_flows_through_unwrapped_logits(self):
-        from transformers.modeling_outputs import CausalLMOutputWithPast
-
-        class FinalStage(torch.nn.Module):
-            def forward(self, x):
-                return CausalLMOutputWithPast(logits=x * 2, hidden_states=None)
-
-        m = FinalStage()
-        _wrap_stage_forward_to_emit_tensor(m)
-        x = torch.randn(2, 3, 8, requires_grad=True)
-        m(x).sum().backward()
-        assert x.grad is not None
-
-    def test_bare_tensor_return_is_unchanged(self):
-        # Patched-forward path (create_pipeline_forward_causal_lm) already returns a tensor.
-        class TensorStage(torch.nn.Module):
-            def forward(self, x):
-                return x + 1
-
-        m = TensorStage()
-        _wrap_stage_forward_to_emit_tensor(m)
-        x = torch.randn(2, 3, 8)
-        assert torch.equal(m(x), x + 1)
-
-    def test_tuple_return_is_preserved(self):
-        # MTP last stage emits (logits, *mtp_per_depth_h, seq_idx); must not be unwrapped.
-        class TupleStage(torch.nn.Module):
-            def forward(self, x):
-                return (x, x * 3, torch.zeros(2, 3, dtype=torch.int32))
-
-        m = TupleStage()
-        _wrap_stage_forward_to_emit_tensor(m)
-        out = m(torch.randn(2, 3, 8))
-        assert isinstance(out, tuple) and len(out) == 3
-
-    def test_idempotent(self):
-        from transformers.modeling_outputs import CausalLMOutputWithPast
-
-        class FinalStage(torch.nn.Module):
-            def forward(self, x):
-                return CausalLMOutputWithPast(logits=x, hidden_states=None)
-
-        m = FinalStage()
-        _wrap_stage_forward_to_emit_tensor(m)
-        first = m.forward
-        _wrap_stage_forward_to_emit_tensor(m)
-        assert m.forward is first  # second call is a no-op
-
-    def test_forward_signature_is_preserved(self):
-        # PP / kwarg-filtering introspects the forward signature; it must survive wrapping.
-        import inspect
-
-        from transformers.modeling_outputs import CausalLMOutputWithPast
-
-        class FinalStage(torch.nn.Module):
-            def forward(self, input_ids, position_ids=None, attention_mask=None):
-                return CausalLMOutputWithPast(logits=input_ids, hidden_states=None)
-
-        m = FinalStage()
-        _wrap_stage_forward_to_emit_tensor(m)
-        params = list(inspect.signature(m.forward).parameters)
-        assert params == ["input_ids", "position_ids", "attention_mask"]
+    if isinstance(output, tuple):
+        assert all(torch.equal(actual, expected) for actual, expected in zip(result, output))
+    else:
+        assert torch.equal(result, output)
+    assert str(__import__("inspect").signature(module.forward)) == original_signature

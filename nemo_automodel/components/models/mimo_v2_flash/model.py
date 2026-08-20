@@ -42,6 +42,7 @@ from nemo_automodel.components.models.mimo_v2_flash.state_dict_adapter import Mi
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MLP, MoE
+from nemo_automodel.shared.pipeline import PipelineForwardStyle, PipelineModelMixin
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
@@ -585,7 +586,7 @@ class MiMoV2FlashModel(nn.Module):
             layer.init_weights(buffer_device)
 
 
-class MiMoV2FlashForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
+class MiMoV2FlashForCausalLM(HFCheckpointingMixin, PipelineModelMixin, nn.Module, MoEFSDPSyncMixin):
     """Causal LM wrapper for MiMo-V2-Flash with Automodel checkpoint adapters."""
 
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
@@ -594,7 +595,7 @@ class MiMoV2FlashForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     # buffers in fp32: cast_model_to_dtype's bf16 cast would otherwise round inv_freq and
     # degrade RoPE precision vs HF (see llama/rope_utils.py).
     _keep_in_fp32_modules_strict = ["mlp.gate.e_score_correction_bias", "attention_sink_bias", "rotary_emb"]
-    _pp_keep_self_forward = True
+    pipeline_forward_style = PipelineForwardStyle.MODEL
     _skip_init_weights_on_load = True
 
     @dataclass(frozen=True)
@@ -723,7 +724,7 @@ class MiMoV2FlashForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
 
         return compute_lm_head_logits(self.lm_head, hidden, logits_to_keep, output_hidden_states=output_hidden_states)
 
-    def customize_pipeline_stage_modules(
+    def pipeline_stage_modules(
         self,
         module_names_per_stage: list[list[str]],
         *,

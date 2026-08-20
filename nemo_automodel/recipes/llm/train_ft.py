@@ -816,19 +816,14 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         if self.pp is None or not self.pp.info.has_last_stage:
             return
 
-        last_stage_model = None
-        for model_part, stage in zip(self.model_parts, self.pp.info.stages):
-            if stage.is_last:
-                last_stage_model = model_part
-                break
+        last_stage_model = self.pp.last_stage_part
         if last_stage_model is None:
             raise RuntimeError("Pipeline reports a last stage, but no last-stage model part was found")
 
-        # FusedLinearCrossEntropy consumes hidden states: flag the last stage to emit them
-        if isinstance(self.loss_fn, FusedLinearCrossEntropy):
-            last_stage_model._pp_return_hidden_states = True
-
-        self.pp.info.schedule._loss_fn = self.cfg.mtp.build(self.loss_fn, last_stage_model)
+        self.pp.configure_loss_fn(
+            self.cfg.mtp.build(self.loss_fn, last_stage_model),
+            emits_hidden_states=isinstance(self.loss_fn, FusedLinearCrossEntropy),
+        )
 
     def _setup_qat(self, cfg, model_parts: list[nn.Module]):
         if not cfg.get("qat.enabled", False):
@@ -991,7 +986,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 cu_seqlens = batch_filtered.get("cu_seqlens")
                 if isinstance(cu_seqlens, torch.Tensor) and cu_seqlens.dim() == 2:
                     cu_seqlens = cu_seqlens.squeeze(0)  # [1, T] -> [T]
-                pp_loss_fn = getattr(self.pp.info.schedule, "_loss_fn", None) if self.pp.info.has_last_stage else None
+                pp_loss_fn = self.pp.loss_fn if self.pp.info.has_last_stage else None
                 if pp_loss_fn is not None and hasattr(pp_loss_fn, "cu_seqlens"):
                     pp_loss_fn.cu_seqlens = cu_seqlens
                 if is_train:

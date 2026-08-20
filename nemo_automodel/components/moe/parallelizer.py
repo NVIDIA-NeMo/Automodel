@@ -915,8 +915,13 @@ def parallelize_model(
     sequence_parallel: bool = False,
     enable_async_tensor_parallel: bool = False,
     frozen_multimodal_sharding: FrozenMultimodalSharding = "root",
-) -> None:
-    """Apply tensor, context, expert, activation-checkpointing, and FSDP parallelism."""
+) -> torch.nn.Module:
+    """Apply tensor, context, expert, activation-checkpointing, and FSDP parallelism.
+
+    Returns:
+        The parallelized model. Parallelization is applied in place, so this is
+        the same module instance passed by the caller.
+    """
 
     tp_enabled = tp_axis_name is not None and world_mesh[tp_axis_name].size() > 1
     if tp_enabled:
@@ -1010,3 +1015,5 @@ def parallelize_model(
             wrap_outer_model=wrap_outer_model,
             frozen_multimodal_sharding=frozen_multimodal_sharding,
         )
+
+    return model

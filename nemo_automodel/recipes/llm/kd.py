@@ -350,9 +350,8 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                 self.teacher_model = None
                 self.teacher_pp = None
                 if self.pp_enabled:
-                    schedule = self.pp.info.schedule
-                    self._original_pp_loss_fn = getattr(schedule, "_loss_fn", None)
-                    schedule._loss_fn = self._make_pp_kd_loss_wrapper()
+                    self._original_pp_loss_fn = self.pp.loss_fn
+                    self.pp.configure_loss_fn(self._make_pp_kd_loss_wrapper())
             self.kd_mesh_bridge.synchronize()
             return
 
@@ -393,10 +392,8 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         logger.info(f"Knowledge-distillation enabled: ratio={self.kd_ratio}, T={temperature}")
 
         if self.pp_enabled:
-            schedule = self.pp.info.schedule
-            # Schedule objects expose _loss_fn (e.g. ScheduleInterleaved1F1B uses _loss_fn).
-            self._original_pp_loss_fn = getattr(schedule, "_loss_fn", None)
-            schedule._loss_fn = self._make_pp_kd_loss_wrapper()
+            self._original_pp_loss_fn = self.pp.loss_fn
+            self.pp.configure_loss_fn(self._make_pp_kd_loss_wrapper())
 
     def _make_pp_kd_loss_wrapper(self):
         """Return a student pipeline loss_fn that combines CE and KD using teacher logits.

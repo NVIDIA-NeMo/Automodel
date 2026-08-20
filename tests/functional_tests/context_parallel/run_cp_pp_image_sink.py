@@ -160,6 +160,7 @@ def main():
     def cp_only(m, world_mesh, moe_mesh, *, dp_axis_names, cp_axis_name=None, **kw):
         if cp_axis_name is not None and world_mesh[cp_axis_name].size() > 1:
             apply_cp(m, world_mesh[cp_axis_name])
+        return m
 
     seqlen = 32
     if pp_size > 1:
@@ -238,7 +239,7 @@ def main():
     rc = 0
     if rank == 0:
         finite = all(x == x and abs(x) != float("inf") for x in losses)
-        tag = "cp2xpp1" if pp1 else "cp2xpp2"
+        tag = f"cp{cp_size}xpp{pp_size}"
         print(
             f"\n{'=' * 60}\nIMAGE {tag}: last={last.item():.6f} finite={finite} "
             f"embed_grad={bool(gflag[0].item())} vision_grad={bool(gflag[1].item())}"

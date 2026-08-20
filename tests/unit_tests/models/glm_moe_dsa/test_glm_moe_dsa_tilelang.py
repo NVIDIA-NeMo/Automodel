@@ -1187,7 +1187,7 @@ def test_glm_dsa_tilelang_pipeline_metas_use_thd_shapes():
     seq_len = 32
     topk = config.index_topk
 
-    inputs_meta, outputs_meta = model.get_pipeline_stage_metas(
+    inputs_meta, outputs_meta = model.pipeline_stage_metas(
         is_first=False,
         microbatch_size=4,
         seq_len=seq_len,
@@ -1211,7 +1211,7 @@ def test_glm_dsa_sdpa_pipeline_metas_cap_topk_by_seq_len():
     model.lm_head = None
     seq_len = 32
 
-    inputs_meta, outputs_meta = model.get_pipeline_stage_metas(
+    inputs_meta, outputs_meta = model.pipeline_stage_metas(
         is_first=False,
         microbatch_size=4,
         seq_len=seq_len,

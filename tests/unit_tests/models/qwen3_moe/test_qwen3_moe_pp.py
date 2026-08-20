@@ -15,14 +15,15 @@
 
 from nemo_automodel.components.distributed.pipelining.hf_utils import model_keeps_self_forward
 from nemo_automodel.components.models.qwen3_moe.model import Qwen3MoeForCausalLM
+from nemo_automodel.shared.pipeline import PipelineForwardStyle
 
 
-def test_pp_keep_self_forward_is_declared():
+def test_model_owned_pipeline_forward_is_declared():
     """Pipeline parallelism must preserve Qwen3-MoE's own forward.
 
     Qwen3-MoE uses the gpt_oss-style RoPE (``position_ids_to_freqs_cis`` +
     ``apply_rotary_emb_qk`` with ``cu_seqlens``/``cp_size``/``cp_rank``) and a
-    ``freqs_cis`` decoder-layer API. Without ``_pp_keep_self_forward = True`` the
+    ``freqs_cis`` decoder-layer API. Without a model-owned pipeline contract the
     PP builder replaces the forward with the generic HF one that calls
     ``rotary_emb(hidden_states, position_ids)`` and crashes inside
     ``apply_rotary_emb`` under THD + context parallelism
@@ -31,7 +32,7 @@ def test_pp_keep_self_forward_is_declared():
     ``lm_head`` are ``None`` off the owning stage; hidden states arrive in the
     ``input_ids`` slot) and CP + THD.
     """
-    assert getattr(Qwen3MoeForCausalLM, "_pp_keep_self_forward", False) is True
+    assert Qwen3MoeForCausalLM.pipeline_forward_style is PipelineForwardStyle.MODEL
     # The pipeline build call site keys off model_keeps_self_forward(...).
     model = Qwen3MoeForCausalLM.__new__(Qwen3MoeForCausalLM)
     assert model_keeps_self_forward(model) is True

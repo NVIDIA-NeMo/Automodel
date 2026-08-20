@@ -87,6 +87,7 @@ from nemo_automodel.components.models.deepseek_v4.state_dict_adapter import Deep
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MoE
+from nemo_automodel.shared.pipeline import PipelineModelMixin
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
@@ -652,7 +653,7 @@ class DeepseekV4Model(nn.Module):
             layer.init_weights(buffer_device=buffer_device, init_std=init_std)
 
 
-class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
+class DeepseekV4ForCausalLM(HFCheckpointingMixin, PipelineModelMixin, nn.Module, MoEFSDPSyncMixin):
     # Keep HC mixers and the MoE gate's correction bias in fp32 regardless of
     # the outer cast policy.  Matches HF PR 45616's
     # ``DeepseekV4PreTrainedModel._keep_in_fp32_modules_strict`` (lines 890-900
@@ -782,7 +783,7 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     def set_output_embeddings(self, new_embeddings):
         self.lm_head = new_embeddings
 
-    def customize_pipeline_stage_modules(
+    def pipeline_stage_modules(
         self,
         module_names_per_stage: list[list[str]],
         *,
@@ -808,7 +809,7 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
 
         return stage_modules
 
-    def get_pipeline_stage_metas(
+    def pipeline_stage_metas(
         self,
         *,
         is_first: bool,

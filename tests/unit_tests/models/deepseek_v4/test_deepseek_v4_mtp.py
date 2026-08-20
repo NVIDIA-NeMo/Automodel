@@ -326,7 +326,7 @@ class TestMTPStateDict:
 
 
 class TestPipelineHooks:
-    def test_customize_pipeline_stage_modules_keeps_dsv4_dependencies(self):
+    def test_pipeline_stage_modules_keeps_dsv4_dependencies(self):
         cfg = _tiny_config(num_nextn_predict_layers=1)
         model = _make_model(cfg)
         stages = [
@@ -334,7 +334,7 @@ class TestPipelineHooks:
             ["model.layers.1", "model.norm", "lm_head", "model.rotary_emb"],
         ]
 
-        out = model.customize_pipeline_stage_modules(stages, layers_prefix="model.", text_model=model.model)
+        out = model.pipeline_stage_modules(stages, layers_prefix="model.", text_model=model.model)
 
         for stage_modules in out:
             assert "model.rotary_emb_compress" in stage_modules
@@ -350,7 +350,7 @@ class TestPipelineHooks:
         first.lm_head = None
         first.model.norm = None
         first.mtp = None
-        first_inputs, first_outputs = first.get_pipeline_stage_metas(
+        first_inputs, first_outputs = first.pipeline_stage_metas(
             is_first=True, microbatch_size=2, seq_len=16, dtype=torch.float16
         )
         assert first_inputs[0].shape == (2, 16)
@@ -364,7 +364,7 @@ class TestPipelineHooks:
         middle.lm_head = None
         middle.model.norm = None
         middle.mtp = None
-        middle_inputs, middle_outputs = middle.get_pipeline_stage_metas(
+        middle_inputs, middle_outputs = middle.pipeline_stage_metas(
             is_first=False, microbatch_size=2, seq_len=16, dtype=torch.float16
         )
         assert len(middle_inputs) == 3
@@ -375,7 +375,7 @@ class TestPipelineHooks:
 
         final = _make_model(cfg)
         final.model.embed_tokens = None
-        final_inputs, final_outputs = final.get_pipeline_stage_metas(
+        final_inputs, final_outputs = final.pipeline_stage_metas(
             is_first=False, microbatch_size=2, seq_len=16, dtype=torch.float16
         )
         assert len(final_inputs) == 3

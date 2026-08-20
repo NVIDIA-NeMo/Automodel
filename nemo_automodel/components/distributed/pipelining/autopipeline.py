@@ -22,11 +22,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.pipelining.schedules import _PipelineSchedule
 from torch.distributed.pipelining.stage import PipelineStage
 
-from nemo_automodel.components.distributed.pipelining.functional import (
-    ParallelizeFnProtocol,
-    pipeline_model,
-    reset_pp_stage_shapes,
-)
+from nemo_automodel.components.distributed.pipelining import model_parts, stage_runtime
 from nemo_automodel.components.distributed.pipelining.hf_utils import (
     validate_hf_model_for_pipeline_support,
 )
@@ -34,16 +30,28 @@ from nemo_automodel.components.distributed.pipelining.hf_utils import (
 logger = logging.getLogger(__name__)
 
 
-@dataclass
+@dataclass(frozen=True)
 class PipelineInfo:
     """Runtime state produced by pipeline-parallel setup."""
 
-    enabled: bool
-    schedule: Optional[_PipelineSchedule]
-    has_first_stage: bool
-    has_last_stage: bool
-    model_parts: Optional[list[nn.Module]]
-    stages: Optional[list[PipelineStage]]
+    schedule: _PipelineSchedule | None = None
+    model_parts: list[nn.Module] | None = None
+    stages: list[PipelineStage] | None = None
+
+    @property
+    def enabled(self) -> bool:
+        """Whether pipeline construction has completed."""
+        return self.schedule is not None
+
+    @property
+    def has_first_stage(self) -> bool:
+        """Whether this rank owns the first global stage."""
+        return any(stage.is_first for stage in self.stages or ())
+
+    @property
+    def has_last_stage(self) -> bool:
+        """Whether this rank owns the last global stage."""
+        return any(stage.is_last for stage in self.stages or ())
 
 
 class AutoPipeline:
@@ -115,70 +123,86 @@ class AutoPipeline:
 
         self.pp_mesh: DeviceMesh = self.world_mesh[pp_axis_name]
 
-        self._info = PipelineInfo(
-            enabled=False,
-            schedule=None,
-            has_first_stage=False,
-            has_last_stage=False,
-            model_parts=None,
-            stages=None,
-        )
+        self._info = PipelineInfo()
         self._model_config = None
         self._pp_current_seq_len: Optional[int] = None
+        self._parts: list[model_parts.PipelineModelPart] = []
+
+    def _create_runtime(
+        self,
+        *,
+        seq_len: int | None,
+        loss_fn: Callable,
+        warmup_neighbors: bool,
+    ) -> stage_runtime.PipelineRuntime:
+        """Create fresh runtime objects around the existing model parts."""
+        return stage_runtime.build_pipeline_runtime(
+            self._parts,
+            self.pp_mesh,
+            self.pp_axis_name,
+            self.device,
+            model_config=self._model_config,
+            microbatch_size=self.pp_microbatch_size,
+            local_batch_size=self.pp_batch_size,
+            seq_len=seq_len,
+            tensor_dtype=self.dtype,
+            schedule_name=self.pp_schedule,
+            schedule_csv=self.pp_schedule_csv,
+            loss_fn=loss_fn,
+            scale_grads=self.scale_grads_in_schedule,
+            warmup_neighbors=warmup_neighbors,
+            patch_stage_backward_maybe_with_nosync=self.patch_stage_backward_maybe_with_nosync,
+            reduce_grad_per_microbatch=not self.defer_fsdp_grad_sync,
+        )
 
     def build(
         self,
         model: nn.Module,
         *,
         loss_fn: Optional[Callable] = None,
-        parallelize_fn: Optional[ParallelizeFnProtocol] = None,
-    ):
+        parallelize_fn: Optional[model_parts.ParallelizeFnProtocol] = None,
+    ) -> "AutoPipeline":
         """Build the pipeline: validate -> init meta -> split -> schedule."""
-        # 0. Validation
-        assert loss_fn is not None, "loss_fn must be provided"
-        assert isinstance(model, nn.Module), "model must be a PyTorch module"
+        if loss_fn is None:
+            raise ValueError("loss_fn must be provided")
+        if not isinstance(model, nn.Module):
+            raise TypeError(f"model must be a torch.nn.Module, got {type(model).__name__}")
+        if self.pp_mesh.size() <= 1:
+            raise ValueError("Pipeline parallelism requires a pipeline mesh with at least two ranks")
 
         validate_hf_model_for_pipeline_support(model)
-
-        pp_schedule_obj, model_parts, pp_has_first_stage, pp_has_last_stage, stages = pipeline_model(
+        self._model_config = model.config
+        self._parts = model_parts.split_model_into_parts(
             model,
+            self.pp_mesh,
+            self.pp_schedule,
+            self.module_fqns_per_model_part,
+            layers_per_stage=self.layers_per_stage,
+            patch_inner_model=self.patch_inner_model,
+            patch_causal_lm_model=self.patch_causal_lm_model,
+            round_to_pp_multiple=self.round_virtual_stages_to_pp_multiple,
+        )
+        self._parts = model_parts.parallelize_model_parts(
+            self._parts,
+            parallelize_fn,
             world_mesh=self.world_mesh,
             moe_mesh=self.moe_mesh,
-            pp_axis_name=self.pp_axis_name,
             dp_axis_names=self.dp_axis_names,
             cp_axis_name=self.cp_axis_name,
             tp_axis_name=self.tp_axis_name,
             ep_axis_name=self.ep_axis_name,
             ep_shard_axis_names=self.ep_shard_axis_names,
-            layers_per_stage=self.layers_per_stage,
-            pipeline_parallel_schedule_csv=self.pp_schedule_csv,
-            pipeline_parallel_schedule=self.pp_schedule,
-            microbatch_size=self.pp_microbatch_size,
-            local_batch_size=self.pp_batch_size,
-            device=self.device,
-            loss_fn=loss_fn,
-            parallelize_fn=parallelize_fn,
-            module_fqns_per_model_part=self.module_fqns_per_model_part,
-            patch_inner_model=self.patch_inner_model,
-            patch_causal_lm_model=self.patch_causal_lm_model,
-            scale_grads=self.scale_grads_in_schedule,
-            round_to_pp_multiple=self.round_virtual_stages_to_pp_multiple,
-            patch_stage_backward_maybe_with_nosync=self.patch_stage_backward_maybe_with_nosync,
-            reduce_grad_per_microbatch=not self.defer_fsdp_grad_sync,
-            seq_len=self.pp_seq_len,
-            tensor_dtype=self.dtype,
         )
 
-        # Update PipelineInfo state
-        self._info.enabled = True
-        self._info.schedule = pp_schedule_obj
-        self._info.has_first_stage = pp_has_first_stage
-        self._info.has_last_stage = pp_has_last_stage
-        self._info.model_parts = model_parts
-        self._info.stages = stages
+        runtime = self._create_runtime(
+            seq_len=self.pp_seq_len,
+            loss_fn=loss_fn,
+            warmup_neighbors=True,
+        )
+        part_modules = [part.module for part in self._parts]
 
-        # Store model config for runtime shape updates
-        self._model_config = model.config
+        self._info = PipelineInfo(schedule=runtime.schedule, model_parts=part_modules, stages=runtime.stages)
+        self._pp_current_seq_len = self.pp_seq_len
 
         return self
 
@@ -186,8 +210,56 @@ class AutoPipeline:
     def info(self) -> PipelineInfo:
         return self._info
 
+    @property
+    def loss_fn(self) -> Callable | None:
+        """Return the loss function owned by the current pipeline schedule."""
+        return getattr(self._info.schedule, "_loss_fn", None)
+
+    @property
+    def last_stage_part(self) -> nn.Module | None:
+        """Return the local model part for the last global stage, if owned."""
+        if self._info.model_parts is None or self._info.stages is None:
+            return None
+        return next(
+            (part for part, stage in zip(self._info.model_parts, self._info.stages) if stage.is_last),
+            None,
+        )
+
+    def configure_loss_fn(self, loss_fn: Callable, *, emits_hidden_states: bool = False) -> None:
+        """Configure the schedule loss and its last-stage output contract.
+
+        Rebuilds lightweight stage runtime metadata when the loss changes the
+        final stage from vocabulary logits to hidden-state output.
+
+        Args:
+            loss_fn: Loss callable invoked by the pipeline schedule.
+            emits_hidden_states: Whether the final model part must bypass its
+                LM head and emit hidden activations for a fused loss.
+        """
+        if self._info.schedule is None:
+            raise RuntimeError("AutoPipeline.build() must be called before configure_loss_fn()")
+        last_stage_part = self.last_stage_part
+        output_changed = False
+        if last_stage_part is not None:
+            output_changed = bool(getattr(last_stage_part, "_pp_return_hidden_states", False)) != emits_hidden_states
+            last_stage_part._pp_return_hidden_states = emits_hidden_states
+
+        if output_changed and self._pp_current_seq_len is not None:
+            runtime = self._create_runtime(
+                seq_len=self._pp_current_seq_len,
+                loss_fn=loss_fn,
+                warmup_neighbors=False,
+            )
+            self._info = PipelineInfo(
+                schedule=runtime.schedule,
+                model_parts=self._info.model_parts,
+                stages=runtime.stages,
+            )
+        else:
+            self._info.schedule._loss_fn = loss_fn
+
     def update_seq_len(self, seq_len: int) -> None:
-        """Reset pipeline stage infrastructure for a new sequence length.
+        """Recreate pipeline runtime objects for a new sequence length.
 
         VLM training batches can have wildly different sequence lengths across steps
         (image batches vs. text-only batches).  PyTorch's PipelineStage locks in recv
@@ -204,16 +276,23 @@ class AutoPipeline:
             return
         if self._model_config is None:
             raise RuntimeError("AutoPipeline.build() must be called before update_seq_len()")
-        reset_pp_stage_shapes(
-            self._info.schedule,
-            self._info.stages,
-            self._model_config,
-            self.pp_microbatch_size,
-            seq_len,
-            tensor_dtype=self.dtype,
+        if self._info.schedule is None:
+            raise RuntimeError("AutoPipeline.build() must be called before update_seq_len()")
+        loss_fn = self.loss_fn
+        if loss_fn is None:
+            raise RuntimeError("Pipeline schedule has no loss function")
+        runtime = self._create_runtime(
+            seq_len=seq_len,
+            loss_fn=loss_fn,
+            warmup_neighbors=False,
+        )
+        self._info = PipelineInfo(
+            schedule=runtime.schedule,
+            model_parts=self._info.model_parts,
+            stages=runtime.stages,
         )
         self._pp_current_seq_len = seq_len
-        logger.debug(f"PP stage shapes updated for seq_len={seq_len}")
+        logger.debug("PP runtime rebuilt for seq_len=%d", seq_len)
 
     @property
     def parts(self) -> list[nn.Module]:

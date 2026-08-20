@@ -43,6 +43,7 @@ from nemo_automodel.components.models.nemotron_v3.state_dict_adapter import Nemo
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
+from nemo_automodel.shared.pipeline import PipelineForwardStyle, PipelineModelMixin
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
@@ -279,7 +280,7 @@ class NemotronV3Model(nn.Module):
             block.init_weights(buffer_device=buffer_device)
 
 
-class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoEFSDPSyncMixin):
+class NemotronHForCausalLM(HFCheckpointingMixin, PipelineModelMixin, GenerationMixin, nn.Module, MoEFSDPSyncMixin):
     """NemotronV3 model with language modeling head.
 
     Supports ``.generate()`` from ``transformers.generation.GenerationMixin`` with O(1)
@@ -294,7 +295,7 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
     _keep_in_fp32_modules_strict = ["e_score_correction_bias", "_fp32_params"]
 
     # Skip patch_hf_model_for_pp; our forward already handles PP routing.
-    _pp_keep_self_forward: bool = True
+    pipeline_forward_style = PipelineForwardStyle.MODEL
 
     @dataclass(frozen=True)
     class ModelCapabilities:
@@ -557,7 +558,7 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
             embeds.append(self.model.embed_tokens(cur_input_ids))
         return tuple(embeds)
 
-    def customize_pipeline_stage_modules(
+    def pipeline_stage_modules(
         self,
         module_names_per_stage: list[list[str]],
         *,
@@ -566,7 +567,7 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
     ) -> list[list[str]]:
         """Pin the MTP head to the last PP stage's FQN list.
 
-        Called by ``split_model_into_stages`` (functional.py:494-502) after the
+        Called by ``split_model_into_parts`` after the
         default per-stage FQN auto-generation. The auto-generator includes
         ``embed_tokens`` on the first stage and ``norm``/``lm_head`` on the
         last stage but doesn't know about ``model.mtp``; this hook appends it.
@@ -579,7 +580,7 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
                 last.append("mtp")
         return stage_modules
 
-    def get_pipeline_stage_metas(
+    def pipeline_stage_metas(
         self,
         *,
         is_first: bool,
@@ -720,7 +721,7 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
         # Stash pre-squeeze [B, S] input_ids: the MTP embed tuple must be
         # built AFTER self.model() runs (FSDP2 root lazy-init requires the
         # root forward first) but with the pre-squeeze shape so emitted
-        # tensors match the [B, S, H] contract from get_pipeline_stage_metas.
+        # tensors match the [B, S, H] contract from pipeline_stage_metas.
         pre_squeeze_input_ids = (
             input_ids
             if (
@@ -764,7 +765,7 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
 
         # Root forward has run; FSDP2 lazy-init is satisfied. Build MTP embed
         # tuple from pre-squeeze [B, S] ids so emitted shapes match
-        # get_pipeline_stage_metas.
+        # pipeline_stage_metas.
         if pre_squeeze_input_ids is not None:
             mtp_embed_inputs = self._build_mtp_embed_inputs_for_pp(pre_squeeze_input_ids)
 

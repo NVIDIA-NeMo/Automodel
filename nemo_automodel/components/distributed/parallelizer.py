@@ -1198,7 +1198,7 @@ def apply_fsdp2_sharding_recursively(
     pp_enabled = "pp" in mesh.mesh_dim_names and mesh["pp"].size() > 1
 
     if isinstance(module, (nn.ModuleList, nn.ModuleDict)):
-        # After pipeline splitting, functional.py replaces nn.ModuleList with nn.ModuleDict
+        # After pipeline splitting, model_parts.py replaces nn.ModuleList with nn.ModuleDict
         # (keyed by string layer indices). Normalise both to a list of (key, child) pairs.
         if isinstance(module, nn.ModuleDict):
             all_items = list(module.items())
@@ -1677,7 +1677,7 @@ def _find_largest_module_list(model: nn.Module) -> Optional[Union[nn.ModuleList,
     largest_size = 0
 
     def _is_pp_layer_module_dict(module: nn.ModuleDict) -> bool:
-        # functional.py converts split ModuleLists to ModuleDicts with stringified
+        # model_parts.py converts split ModuleLists to ModuleDicts with stringified
         # numeric indices. Avoid treating arbitrary named ModuleDicts (for example
         # adapter registries) as transformer layer containers in the heuristic path.
         return all(key.isdigit() for key in module.keys())

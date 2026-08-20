@@ -119,6 +119,7 @@ from nemo_automodel.components.models.deepseek_v3.state_dict_adapter import Deep
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
+from nemo_automodel.shared.pipeline import PipelineForwardStyle, PipelineModelMixin
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 # Check for flash attention
@@ -634,14 +635,14 @@ class KimiVLModel(nn.Module):
         return hidden_states
 
 
-class KimiVLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
+class KimiVLForConditionalGeneration(HFCheckpointingMixin, PipelineModelMixin, nn.Module, MoEFSDPSyncMixin):
     """KimiVL model with backend-aware DeepseekV3 language model."""
 
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
 
     # forward() pulls per-microbatch pixel_values from _vlm_pixel_values_chunks;
     # patch_hf_model_for_pp must not replace it under PP.
-    _pp_keep_self_forward: bool = True
+    pipeline_forward_style = PipelineForwardStyle.MODEL
 
     @dataclass(frozen=True)
     class ModelCapabilities:

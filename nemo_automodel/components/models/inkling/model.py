@@ -30,6 +30,7 @@ import torch
 import torch.nn as nn
 
 from nemo_automodel.shared.import_utils import UnavailableError, UnavailableMeta
+from nemo_automodel.shared.pipeline import PipelineForwardStyle, PipelineModelMixin, causal_lm_stage_metas
 
 from .configuration import InklingConfig
 
@@ -161,7 +162,9 @@ class InklingTextModel(HFInklingTextModel):
         return BaseModelOutputWithPast(last_hidden_state=hidden_states, past_key_values=past_key_values)
 
 
-class InklingForConditionalGeneration(HFCheckpointingMixin, HFInklingForConditionalGeneration, MoEFSDPSyncMixin):
+class InklingForConditionalGeneration(
+    HFCheckpointingMixin, PipelineModelMixin, HFInklingForConditionalGeneration, MoEFSDPSyncMixin
+):
     """Inkling VLM with expert-parallel MoE feed-forwards."""
 
     _msg = _INKLING_HF_UNAVAILABLE_MSG
@@ -174,7 +177,7 @@ class InklingForConditionalGeneration(HFCheckpointingMixin, HFInklingForConditio
 
     # Keep the multimodal forward under PP so stage 0 can consume the media
     # chunks staged by the VLM recipe.
-    _pp_keep_self_forward: bool = True
+    pipeline_forward_style = PipelineForwardStyle.MODEL
 
     # Short convolutions and router correction bias use callable fp32 holders.
     _keep_in_fp32_modules_strict = ["_fp32_params"]
@@ -270,7 +273,7 @@ class InklingForConditionalGeneration(HFCheckpointingMixin, HFInklingForConditio
         # short convolutions and router correction-bias holders in strict fp32.
         cast_model_to_dtype(self, model_dtype)
 
-    def customize_pipeline_stage_modules(
+    def pipeline_stage_modules(
         self,
         module_names_per_stage: list[list[str]],
         *,
@@ -282,7 +285,7 @@ class InklingForConditionalGeneration(HFCheckpointingMixin, HFInklingForConditio
         module_names_per_stage[0].append(f"{layers_prefix}embed_norm")
         return module_names_per_stage
 
-    def get_pipeline_stage_metas(
+    def pipeline_stage_metas(
         self,
         *,
         is_first: bool,
@@ -292,20 +295,20 @@ class InklingForConditionalGeneration(HFCheckpointingMixin, HFInklingForConditio
     ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
         """Return PP metadata using Inkling's unpadded runtime vocabulary."""
         text_config = self.config.text_config
-        hidden_shape = (microbatch_size, seq_len, text_config.hidden_size)
         vocab_size = text_config.unpadded_vocab_size or text_config.vocab_size
-
-        if is_first:
-            inputs_meta = (torch.empty(microbatch_size, seq_len, device="meta", dtype=torch.long),)
-        else:
-            inputs_meta = (torch.empty(*hidden_shape, device="meta", dtype=dtype),)
-
-        if self.lm_head is None:
-            outputs_meta = (torch.empty(*hidden_shape, device="meta", dtype=dtype),)
-        else:
-            head_dtype = self.lm_head.weight.dtype
-            outputs_meta = (torch.empty(microbatch_size, seq_len, vocab_size, device="meta", dtype=head_dtype),)
-        return inputs_meta, outputs_meta
+        head_dtype = self.lm_head.weight.dtype if self.lm_head is not None else dtype
+        return causal_lm_stage_metas(
+            is_first=is_first,
+            has_lm_head=self.lm_head is not None,
+            emits_hidden_states=False,
+            microbatch_size=microbatch_size,
+            input_seq_len=seq_len,
+            output_seq_len=seq_len,
+            hidden_size=text_config.hidden_size,
+            vocab_size=vocab_size,
+            dtype=dtype,
+            logits_dtype=head_dtype,
+        )
 
     def forward(
         self,

@@ -188,13 +188,13 @@ class TestPipelineStageMetas:
 
     def test_cp_shards_stage_outputs(self):
         model = self._model(cp_size=2, lm_head=True)
-        ins, outs = model.get_pipeline_stage_metas(is_first=True, microbatch_size=1, seq_len=6, dtype=torch.float32)
+        ins, outs = model.pipeline_stage_metas(is_first=True, microbatch_size=1, seq_len=6, dtype=torch.float32)
         assert ins[0].shape == (1, 6) and ins[0].dtype == torch.long  # full token ids in
         assert outs[0].shape == (1, 4, 32)  # local (pad 6->8, //2) logits out
 
     def test_cp1_symmetric(self):
         model = self._model(cp_size=1, lm_head=True)
-        ins, outs = model.get_pipeline_stage_metas(is_first=True, microbatch_size=2, seq_len=5, dtype=torch.float32)
+        ins, outs = model.pipeline_stage_metas(is_first=True, microbatch_size=2, seq_len=5, dtype=torch.float32)
         assert ins[0].shape == (2, 5) and outs[0].shape == (2, 5, 32)
 
 

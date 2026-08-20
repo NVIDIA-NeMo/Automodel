@@ -61,6 +61,7 @@ from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MLP, MoE
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
+from nemo_automodel.shared.pipeline import PipelineForwardStyle, PipelineModelMixin
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
@@ -277,7 +278,7 @@ class BailingMoeV2Model(nn.Module):
                 layer.init_weights(buffer_device=buffer_device)
 
 
-class BailingMoeV2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
+class BailingMoeV2ForCausalLM(HFCheckpointingMixin, PipelineModelMixin, nn.Module, MoEFSDPSyncMixin):
     """Causal-LM head wrapping ``BailingMoeV2Model``."""
 
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
@@ -294,7 +295,7 @@ class BailingMoeV2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin)
     # ``RotaryEmbedding.forward(query, key)`` and crashes inside
     # ``apply_rotary_emb`` with a tensor-shape mismatch at ``torch.cat``.
     # Setting this flag instructs the PP split to leave our forwards intact.
-    _pp_keep_self_forward: bool = True
+    pipeline_forward_style = PipelineForwardStyle.MODEL
 
     @classmethod
     def get_capabilities(cls, config) -> ModelCapabilities:

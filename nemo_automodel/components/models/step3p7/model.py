@@ -46,6 +46,7 @@ from nemo_automodel.components.models.step3p7.vision_encoder import StepRobotics
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
+from nemo_automodel.shared.pipeline import PipelineForwardStyle, PipelineModelMixin, context_parallel_seq_len
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 logger = logging.getLogger(__name__)
@@ -319,14 +320,14 @@ class Step3p7Model(nn.Module):
         )
 
 
-class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
+class Step3p7ForConditionalGeneration(HFCheckpointingMixin, PipelineModelMixin, nn.Module, MoEFSDPSyncMixin):
     """Native Step3.7 VLM implementation for MedPix fine-tuning with EP and PP."""
 
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
 
     _keep_in_fp32_modules = ["rotary_emb"]
 
-    _pp_keep_self_forward: bool = True
+    pipeline_forward_style = PipelineForwardStyle.MODEL
     mtp_outputs_are_logits = True
     # CP submesh, installed by the MoE parallelizer's apply_cp when context
     # parallelism is active; None means the forward embeds and shards nothing for CP.
@@ -436,7 +437,7 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
     def get_decoder(self):
         return self.model.get_decoder()
 
-    def customize_pipeline_stage_modules(
+    def pipeline_stage_modules(
         self,
         module_names_per_stage: list[list[str]],
         *,
@@ -448,7 +449,7 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
             stage_modules[-1].append("mtp")
         return stage_modules
 
-    def get_pipeline_stage_metas(
+    def pipeline_stage_metas(
         self,
         *,
         is_first: bool,
@@ -461,10 +462,7 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
         # the propagated MTP hidden states) carries the LOCAL (padded-to-2*cp then
         # //cp) sequence length while the first-stage token-id input stays full.
         cp_size = self.cp_mesh.size() if self.cp_mesh is not None else 1
-        local_seq_len = seq_len
-        if cp_size > 1:
-            padded_seq_len = seq_len + (-seq_len) % (2 * cp_size)
-            local_seq_len = padded_seq_len // cp_size
+        local_seq_len = context_parallel_seq_len(seq_len, cp_size)
 
         hidden_shape = (microbatch_size, local_seq_len, self.config.text_config.hidden_size)
         vocab_shape = (microbatch_size, local_seq_len, self.config.text_config.vocab_size)

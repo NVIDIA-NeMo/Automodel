@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
+
+import torch
 
 from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
 
@@ -30,14 +34,54 @@ class TestPipelineConfigPpSeqLen:
         config.pp_seq_len = 4096
         assert config.pp_seq_len == 4096
 
-    def test_pp_seq_len_in_to_dict(self):
-        config = PipelineConfig(pp_seq_len=1024)
-        d = config.to_dict()
-        assert "pp_seq_len" in d
-        assert d["pp_seq_len"] == 1024
 
-    def test_pp_seq_len_none_in_to_dict(self):
-        config = PipelineConfig()
-        d = config.to_dict()
-        assert "pp_seq_len" in d
-        assert d["pp_seq_len"] is None
+class TestPipelineConfigBuild:
+    def test_disabled_mesh_returns_none(self):
+        mesh = SimpleNamespace(device_mesh=None, pp_size=1)
+
+        assert PipelineConfig().build(mesh=mesh) is None
+
+    def test_build_forwards_declarative_and_runtime_values(self):
+        device_mesh = Mock()
+        mesh = SimpleNamespace(
+            device_mesh=device_mesh,
+            moe_mesh=None,
+            pp_size=2,
+            pipeline_axis_kwargs=lambda: {"pp_axis_name": "pp", "dp_axis_names": ("dp",)},
+        )
+        config = PipelineConfig(
+            pp_schedule="gpipe",
+            pp_microbatch_size=2,
+            pp_batch_size=8,
+            pp_seq_len=1024,
+        )
+
+        with patch("nemo_automodel.components.distributed.pipelining.autopipeline.AutoPipeline") as auto_pipeline:
+            result = config.build(
+                mesh=mesh,
+                device=torch.device("cpu"),
+                defer_fsdp_grad_sync=False,
+            )
+
+        assert result is auto_pipeline.return_value
+        auto_pipeline.assert_called_once_with(
+            world_mesh=device_mesh,
+            moe_mesh=None,
+            device=torch.device("cpu"),
+            defer_fsdp_grad_sync=False,
+            pp_axis_name="pp",
+            dp_axis_names=("dp",),
+            pp_schedule="gpipe",
+            pp_schedule_csv=None,
+            pp_microbatch_size=2,
+            pp_batch_size=8,
+            layers_per_stage=None,
+            round_virtual_stages_to_pp_multiple=None,
+            module_fqns_per_model_part=None,
+            patch_inner_model=True,
+            patch_causal_lm_model=True,
+            patch_stage_backward_maybe_with_nosync=False,
+            dtype=None,
+            scale_grads_in_schedule=False,
+            pp_seq_len=1024,
+        )

@@ -55,6 +55,12 @@ from nemo_automodel.components.models.minimax_m3_vl.vision_encoder import MiniMa
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MoEConfig
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
+from nemo_automodel.shared.pipeline import (
+    PipelineForwardStyle,
+    PipelineModelMixin,
+    causal_lm_stage_metas,
+    context_parallel_seq_len,
+)
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
@@ -371,7 +377,7 @@ class MiniMaxM3SparseForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMix
             self.model.rotary_emb.device = buffer_device
 
 
-class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
+class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, PipelineModelMixin, nn.Module, MoEFSDPSyncMixin):
     """MiniMax M3 VL: CLIP-style vision tower + projector/merger + M3 text backbone.
 
     Vision features (``vision_tower(pixel_values, grid_thw)``) are spliced into
@@ -390,7 +396,7 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
     # vision RoPE (see llama/rope_utils.py).
     _keep_in_fp32_modules = ["rotary_emb", "inv_freq"]
     _keep_in_fp32_modules_strict = ["mlp.gate.e_score_correction_bias"]
-    _pp_keep_self_forward: bool = True
+    pipeline_forward_style = PipelineForwardStyle.MODEL
     mtp_outputs_are_logits = True
     # Opt into context parallelism on the SDPA attention backend (M3's block-sparse DSA
     # bias is an explicit additive mask that only SDPA accepts, not TE). Dense layers use
@@ -481,7 +487,7 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
     def get_output_embeddings(self):
         return self.lm_head
 
-    def customize_pipeline_stage_modules(
+    def pipeline_stage_modules(
         self,
         module_names_per_stage: list[list[str]],
         *,
@@ -529,7 +535,7 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
         except (TypeError, AttributeError):
             return False
 
-    def get_pipeline_stage_metas(
+    def pipeline_stage_metas(
         self,
         *,
         is_first: bool,
@@ -551,34 +557,20 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
         ``cp_size == 1`` the lengths coincide and the layout is symmetric.
         """
         text_config = self.config.text_config
-        hidden_size = text_config.hidden_size
-        vocab_size = text_config.vocab_size
-
         cp_size = self.cp_mesh.size() if self.cp_mesh is not None else 1
-        local_seq_len = seq_len
-        if cp_size > 1:
-            padded_seq_len = seq_len + (-seq_len) % (2 * cp_size)
-            local_seq_len = padded_seq_len // cp_size
-
-        def meta(*shape: int) -> torch.Tensor:
-            return torch.empty(*shape, device="meta", dtype=dtype)
-
-        # Inter-stage tensors (hidden states) carry the model/activation dtype the
-        # framework passes in. token ids are always long.
-        if is_first:
-            inputs_meta = (torch.empty(microbatch_size, seq_len, device="meta", dtype=torch.long),)
-        else:
-            inputs_meta = (meta(microbatch_size, local_seq_len, hidden_size),)
-
-        if self.lm_head is not None:
-            # Logits follow lm_head's own param dtype, which may diverge from the
-            # model dtype if lm_head is ever kept in fp32 (_keep_in_fp32_modules);
-            # deriving it here keeps the schedule's output buffer correctly sized.
-            head_dtype = getattr(getattr(self.lm_head, "weight", None), "dtype", dtype)
-            outputs_meta = (torch.empty(microbatch_size, local_seq_len, vocab_size, device="meta", dtype=head_dtype),)
-        else:
-            outputs_meta = (meta(microbatch_size, local_seq_len, hidden_size),)
-        return inputs_meta, outputs_meta
+        head_dtype = getattr(getattr(self.lm_head, "weight", None), "dtype", dtype)
+        return causal_lm_stage_metas(
+            is_first=is_first,
+            has_lm_head=self.lm_head is not None,
+            emits_hidden_states=False,
+            microbatch_size=microbatch_size,
+            input_seq_len=seq_len,
+            output_seq_len=context_parallel_seq_len(seq_len, cp_size),
+            hidden_size=text_config.hidden_size,
+            vocab_size=text_config.vocab_size,
+            dtype=dtype,
+            logits_dtype=head_dtype,
+        )
 
     @staticmethod
     def _to_grid_list(grid_thw) -> list[list[int]]:
@@ -687,7 +679,7 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
 
         # Authoritative MTP-under-PP guard: keyed on the config (which survives the
         # splitter nulling the mtp module) and is_pp_stage, so it fires for both the
-        # auto-generated split (also caught earlier in customize_pipeline_stage_modules)
+        # auto-generated split (also caught earlier in pipeline_stage_modules)
         # and a manually supplied module_fqns_per_model_part that bypasses that hook.
         if is_pp_stage and int(getattr(self.config.text_config, "num_mtp_modules", 0) or 0) > 0:
             raise NotImplementedError(

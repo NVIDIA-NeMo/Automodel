@@ -1327,6 +1327,7 @@ def _create_minimal_recipe_for_pp_test(monkeypatch, pp_info):
         "pp",
         SimpleNamespace(
             info=pp_info,
+            loss_fn=None,
             pp_batch_size=1,
             pp_microbatch_size=1,
             update_seq_len=lambda seq_len: None,

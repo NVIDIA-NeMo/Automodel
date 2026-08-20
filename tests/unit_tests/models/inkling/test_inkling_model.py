@@ -91,7 +91,7 @@ def test_pipeline_metadata_uses_unpadded_vocabulary_size():
     backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch", experts="torch", dispatcher="torch")
     model = InklingForConditionalGeneration.from_config(cfg, backend=backend)
 
-    inputs_meta, outputs_meta = model.get_pipeline_stage_metas(
+    inputs_meta, outputs_meta = model.pipeline_stage_metas(
         is_first=False,
         microbatch_size=2,
         seq_len=16,
@@ -309,7 +309,7 @@ def test_multimodal_tower_parity():
 
 
 def test_two_stage_pipeline_forward_parity(monkeypatch):
-    import nemo_automodel.components.distributed.pipelining.functional as pipeline
+    import nemo_automodel.components.distributed.pipelining.model_parts as pipeline
 
     class FakePPMesh:
         def size(self):
@@ -355,17 +355,16 @@ def test_two_stage_pipeline_forward_parity(monkeypatch):
             use_cache=False,
         ).logits
 
-    _, model_parts = pipeline.split_model_into_stages(
+    parts = pipeline.split_model_into_parts(
         model=nemo,
         pp_mesh=FakePPMesh(),
-        pp_axis_name="pp",
         pp_schedule="interleaved1f1b",
-        device=torch.device("cpu"),
         layers_per_stage=2,
         patch_inner_model=False,
         patch_causal_lm_model=False,
         round_to_pp_multiple="down",
     )
+    model_parts = [part.module for part in parts]
     assert len(model_parts) == 2
     assert model_parts[0].model.language_model.embed_norm is not None
 

@@ -25,8 +25,8 @@ import copy
 import pytest
 import torch
 
-from nemo_automodel.components.distributed.pipelining.functional import generate_hf_model_fqn_per_model_part
 from nemo_automodel.components.distributed.pipelining.hf_utils import MULTIMODAL_SUFFIXES
+from nemo_automodel.components.distributed.pipelining.module_plan import generate_hf_model_fqn_per_model_part
 
 NUM_LAYERS = 3
 
@@ -65,7 +65,7 @@ def _make_image_inputs(model, grid_thw=((1, 4, 4),)):
 
 def test_customize_rewrites_to_real_module_paths(vlm_model):
     raw = _auto_fqns(num_stages=2)
-    fixed = vlm_model.customize_pipeline_stage_modules(raw, layers_prefix="model.language_model.")
+    fixed = vlm_model.pipeline_stage_modules(raw, layers_prefix="model.language_model.")
     flat = [n for stage in fixed for n in stage]
 
     # Text stack rewritten to model.* (never the nested model.language_model.*).
@@ -98,15 +98,15 @@ def test_is_pp_stage_full_model(vlm_model):
 def test_pipeline_stage_metas(vlm_model):
     h = vlm_model.config.text_config.hidden_size
     v = vlm_model.config.text_config.vocab_size
-    ins, outs = vlm_model.get_pipeline_stage_metas(is_first=True, microbatch_size=2, seq_len=5, dtype=torch.float32)
+    ins, outs = vlm_model.pipeline_stage_metas(is_first=True, microbatch_size=2, seq_len=5, dtype=torch.float32)
     assert ins[0].shape == (2, 5) and ins[0].dtype == torch.long
     assert outs[0].shape == (2, 5, v)  # full model owns lm_head
-    ins2, _ = vlm_model.get_pipeline_stage_metas(is_first=False, microbatch_size=2, seq_len=5, dtype=torch.float32)
+    ins2, _ = vlm_model.pipeline_stage_metas(is_first=False, microbatch_size=2, seq_len=5, dtype=torch.float32)
     assert ins2[0].shape == (2, 5, h)
 
     # Logits meta must follow lm_head's own dtype, not the passed model dtype, so
     # it stays correct if lm_head is ever kept in fp32 while the model runs bf16.
-    ins3, outs3 = vlm_model.get_pipeline_stage_metas(is_first=False, microbatch_size=2, seq_len=5, dtype=torch.bfloat16)
+    ins3, outs3 = vlm_model.pipeline_stage_metas(is_first=False, microbatch_size=2, seq_len=5, dtype=torch.bfloat16)
     assert ins3[0].dtype == torch.bfloat16  # inter-stage hidden uses the model dtype
     assert outs3[0].dtype == vlm_model.lm_head.weight.dtype  # logits follow lm_head (float32 here)
     assert outs3[0].dtype != torch.bfloat16
@@ -176,7 +176,7 @@ def test_stage0_consumes_pp_media_chunks(vlm_model):
 def test_mtp_under_pp_raises_on_forward(vlm_model):
     """The forward MTP-under-PP guard is keyed on config (not the nullable mtp
     module), so it fires even when a manual module_fqns split bypasses the
-    customize_pipeline_stage_modules hook."""
+    pipeline-stage ownership contract."""
     m = copy.deepcopy(vlm_model)
     m.config.text_config.num_mtp_modules = 1  # config declares MTP...
     m.model.norm = None
