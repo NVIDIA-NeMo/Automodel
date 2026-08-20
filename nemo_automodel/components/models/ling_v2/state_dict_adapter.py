@@ -41,16 +41,19 @@ adapter only normalises the surrounding key names and splits the fused QKV.
 """
 
 import re
+from collections.abc import Iterator
+from dataclasses import dataclass
 from typing import Any, Optional
 
 import torch
 from torch.distributed.device_mesh import DeviceMesh
 
-from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
+from nemo_automodel.components.checkpoint.state_dict_adapter import CheckpointLoadGroup, StateDictAdapter
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.ling_v2.config import BailingMoeV2Config
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.state_dict_mixin import MoESplitExpertsStateDictMixin
+from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 
 # Map of single-key renames applied in both directions.  Each tuple is
 # (HF substring, native substring); replacement is whole-substring and
@@ -64,6 +67,78 @@ _RENAME_PAIRS_HF_TO_NATIVE: tuple[tuple[str, str], ...] = (
 )
 
 _LAYER_QKV_RE = re.compile(r"^(?P<prefix>(?:.*\.)?layers\.\d+)\.attention\.query_key_value\.weight$")
+_NATIVE_LAYER_QKV_RE = re.compile(r"^(?P<prefix>(?:.*\.)?layers\.\d+)\.self_attn\.(?P<projection>[qkv])_proj\.weight$")
+_STREAMABLE_EXPERT_WEIGHT = re.compile(
+    r"^(?P<root>(?:.*\.)?layers\.\d+\.mlp\.experts)\."
+    r"(?P<projection>gate_and_up_projs|down_projs)$"
+)
+
+
+@dataclass
+class _LingQKVGroupBuilder:
+    """Mutable builder for one fused-QKV checkpoint dependency group.
+
+    Attributes:
+        projections: Mapping from ``q``, ``k``, and ``v`` to a native parameter name and its final tensor. Query
+            tensors have shape [q_hidden, hidden]; key and value tensors have shape [kv_hidden, hidden].
+    """
+
+    projections: dict[str, tuple[str, torch.Tensor]]
+
+
+@dataclass
+class _LingExpertGroupBuilder:
+    """Mutable builder for one split-expert checkpoint dependency group.
+
+    Attributes:
+        destinations: Checkpoint gate/up views of shape [expert_hidden, hidden] and down views of shape
+            [hidden, expert_hidden]. Every view aliases a final grouped expert parameter.
+        native_keys: Names of the final grouped expert parameters completed by ``destinations``.
+        projections: Native grouped projection names already added to the builder.
+    """
+
+    destinations: dict[str, torch.Tensor]
+    native_keys: set[str]
+    projections: set[str]
+
+
+@dataclass
+class _LingFusedQKVLoadGroup(CheckpointLoadGroup):
+    """Bounded fused-QKV destination and its final split parameter storage.
+
+    Attributes:
+        destinations: One checkpoint tensor of shape [q_heads * head_dim + 2 * kv_heads * head_dim, hidden]. The
+            tensor is temporary storage released before the next checkpoint group is requested.
+        native_keys: Names of the three final Q, K, and V parameters completed by this group.
+        q_proj: Final query parameter of shape [q_heads * head_dim, hidden], mutated by :meth:`install`.
+        k_proj: Final key parameter of shape [kv_heads * head_dim, hidden], mutated by :meth:`install`.
+        v_proj: Final value parameter of shape [kv_heads * head_dim, hidden], mutated by :meth:`install`.
+    """
+
+    q_proj: torch.Tensor
+    k_proj: torch.Tensor
+    v_proj: torch.Tensor
+
+    @torch.no_grad()
+    def install(self) -> None:
+        """Split the loaded fused tensor and copy its Q, K, and V slices into final parameter storage."""
+        if len(self.destinations) != 1:
+            raise ValueError(f"Ling fused-QKV group expected one checkpoint destination, got {len(self.destinations)}")
+        fused_qkv = next(iter(self.destinations.values()))
+        expected_shape = (self.q_proj.shape[0] + self.k_proj.shape[0] + self.v_proj.shape[0], self.q_proj.shape[1])
+        if tuple(fused_qkv.shape) != expected_shape:
+            raise ValueError(
+                f"Ling fused-QKV destination has shape {tuple(fused_qkv.shape)}, expected {expected_shape}"
+            )
+
+        q_value, k_value, v_value = torch.split(
+            fused_qkv,
+            [self.q_proj.shape[0], self.k_proj.shape[0], self.v_proj.shape[0]],
+            dim=0,
+        )
+        self.q_proj.copy_(q_value)
+        self.k_proj.copy_(k_value)
+        self.v_proj.copy_(v_value)
 
 
 def _rename_hf_to_native(key: str) -> str:
@@ -98,6 +173,261 @@ class BailingMoeV2StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapt
         self.backend = backend
         self.dtype = dtype
         self._uses_model_prefix = True
+
+    @property
+    def supports_streaming_checkpoint_load(self) -> bool:
+        """Whether Ling can bound its single-device fused-QKV and expert checkpoint transformations."""
+        return (
+            self.backend.experts in {"torch", "torch_mm"}
+            and self.backend.dispatcher == "torch"
+            and not self.moe_config.expert_bias
+        )
+
+    def _add_streaming_expert_destinations(
+        self,
+        builder: _LingExpertGroupBuilder,
+        *,
+        expert_root: str,
+        native_name: str,
+        projection: str,
+        grouped_weight: torch.Tensor,
+    ) -> None:
+        """Add split HF views of one final grouped expert parameter.
+
+        Args:
+            builder: Mutable dependency group that retains the produced final-storage views.
+            expert_root: Checkpoint prefix ending in ``layers.{layer}.mlp.experts``.
+            native_name: Native name completed by ``grouped_weight``.
+            projection: Either ``gate_and_up_projs`` or ``down_projs``.
+            grouped_weight: Final gate/up tensor of shape [experts, hidden, 2 * expert_hidden] or final down tensor of
+                shape [experts, expert_hidden, hidden]. The emitted checkpoint destinations are non-contiguous views
+                that alias this storage.
+
+        Raises:
+            ValueError: If the projection is duplicated or its tensor shape is incompatible with the Ling layout.
+        """
+        if projection in builder.projections:
+            raise ValueError(f"Duplicate Ling expert projection {expert_root}.{projection}")
+
+        n_experts = self.moe_config.n_routed_experts
+        expert_hidden = self.moe_config.moe_inter_dim
+        if projection == "gate_and_up_projs":
+            expected_shape = (n_experts, self.moe_config.dim, 2 * expert_hidden)
+        else:
+            expected_shape = (n_experts, expert_hidden, self.moe_config.dim)
+        if tuple(grouped_weight.shape) != expected_shape:
+            raise ValueError(
+                f"Ling grouped expert parameter {native_name} has shape {tuple(grouped_weight.shape)}, "
+                f"expected {expected_shape}"
+            )
+
+        for expert_id, expert_weight in enumerate(grouped_weight.unbind(0)):
+            if projection == "gate_and_up_projs":
+                checkpoint_tensors = {
+                    "gate_proj": expert_weight[:, :expert_hidden].transpose(0, 1),
+                    "up_proj": expert_weight[:, expert_hidden:].transpose(0, 1),
+                }
+            else:
+                checkpoint_tensors = {"down_proj": expert_weight.transpose(0, 1)}
+            for checkpoint_projection, checkpoint_destination in checkpoint_tensors.items():
+                checkpoint_name = f"{expert_root}.{expert_id}.{checkpoint_projection}.weight"
+                if checkpoint_name in builder.destinations:
+                    raise ValueError(f"Duplicate Ling expert checkpoint destination {checkpoint_name}")
+                builder.destinations[checkpoint_name] = checkpoint_destination
+
+        builder.native_keys.add(native_name)
+        builder.projections.add(projection)
+
+    @staticmethod
+    def _build_qkv_load_group(prefix: str, builder: _LingQKVGroupBuilder) -> _LingFusedQKVLoadGroup:
+        """Allocate one fused checkpoint tensor backed by three final projection parameters.
+
+        Args:
+            prefix: Native layer prefix ending in ``layers.{layer}``.
+            builder: Q/K/V parameters with shapes [q_hidden, hidden], [kv_hidden, hidden], and [kv_hidden, hidden].
+
+        Returns:
+            Load group with one temporary tensor of shape [q_hidden + 2 * kv_hidden, hidden]. Its installation copies
+            the three row ranges into the final Q/K/V parameters.
+
+        Raises:
+            ValueError: If a projection is missing or the final parameters disagree in rank, shape, device, or dtype.
+        """
+        missing_projections = {"q", "k", "v"} - builder.projections.keys()
+        if missing_projections:
+            raise ValueError(f"Incomplete Ling fused-QKV group {prefix}: missing {sorted(missing_projections)}")
+        q_name, q_proj = builder.projections["q"]
+        k_name, k_proj = builder.projections["k"]
+        v_name, v_proj = builder.projections["v"]
+        if q_proj.ndim != 2 or k_proj.ndim != 2 or v_proj.ndim != 2:
+            raise ValueError(
+                f"Ling fused-QKV group {prefix} requires rank-2 parameters, got "
+                f"Q={tuple(q_proj.shape)}, K={tuple(k_proj.shape)}, V={tuple(v_proj.shape)}"
+            )
+        if k_proj.shape != v_proj.shape or q_proj.shape[1] != k_proj.shape[1]:
+            raise ValueError(
+                f"Ling fused-QKV group {prefix} has incompatible shapes "
+                f"Q={tuple(q_proj.shape)}, K={tuple(k_proj.shape)}, V={tuple(v_proj.shape)}"
+            )
+        if q_proj.device != k_proj.device or q_proj.device != v_proj.device:
+            raise ValueError(f"Ling fused-QKV group {prefix} spans multiple devices")
+        if q_proj.dtype != k_proj.dtype or q_proj.dtype != v_proj.dtype:
+            raise ValueError(f"Ling fused-QKV group {prefix} spans multiple dtypes")
+
+        checkpoint_name = f"{prefix}.attention.query_key_value.weight"
+        fused_destination = torch.empty(
+            (q_proj.shape[0] + k_proj.shape[0] + v_proj.shape[0], q_proj.shape[1]),
+            dtype=q_proj.dtype,
+            device=q_proj.device,
+        )
+        return _LingFusedQKVLoadGroup(
+            destinations={checkpoint_name: fused_destination},
+            native_keys=frozenset({q_name, k_name, v_name}),
+            q_proj=q_proj,
+            k_proj=k_proj,
+            v_proj=v_proj,
+        )
+
+    @staticmethod
+    def _build_expert_load_group(
+        expert_root: str,
+        builder: _LingExpertGroupBuilder,
+        n_experts: int,
+    ) -> CheckpointLoadGroup:
+        """Validate and freeze one complete layer of final-storage expert destinations.
+
+        Args:
+            expert_root: Checkpoint prefix ending in ``layers.{layer}.mlp.experts``.
+            builder: Per-expert gate, up, and down checkpoint views. Gate/up views have shape [expert_hidden, hidden],
+                down views have shape [hidden, expert_hidden], and all views alias final grouped parameters.
+            n_experts: Number of checkpoint experts required for the layer.
+
+        Returns:
+            No-op installation group containing exactly three destinations per expert.
+
+        Raises:
+            ValueError: If either grouped projection or any split expert destination is missing.
+        """
+        missing_projections = {"gate_and_up_projs", "down_projs"} - builder.projections
+        if missing_projections:
+            raise ValueError(f"Incomplete Ling expert group {expert_root}: missing {sorted(missing_projections)}")
+        expected_destinations = 3 * n_experts
+        if len(builder.destinations) != expected_destinations:
+            raise ValueError(
+                f"Ling expert group {expert_root} has {len(builder.destinations)} checkpoint destinations, "
+                f"expected {expected_destinations}"
+            )
+        return CheckpointLoadGroup(
+            destinations=builder.destinations,
+            native_keys=frozenset(builder.native_keys),
+        )
+
+    def iter_checkpoint_load_groups(
+        self,
+        model_part: torch.nn.Module,
+        device_mesh: DeviceMesh | None = None,
+    ) -> Iterator[CheckpointLoadGroup]:
+        """Yield final-storage expert groups and bounded fused-QKV groups for Ling.
+
+        Args:
+            model_part: Single-device Ling model. Attention Q/K/V parameters have shapes [q_hidden, hidden],
+                [kv_hidden, hidden], and [kv_hidden, hidden]. Grouped gate/up experts have shape
+                [experts, hidden, 2 * expert_hidden], and grouped down experts have shape
+                [experts, expert_hidden, hidden].
+            device_mesh: Must be ``None``. Distributed Ling loads continue to use the rank-sharded DCP path.
+
+        Returns:
+            Iterator whose ordinary and expert destinations alias final model storage. Each attention group owns one
+            temporary checkpoint tensor of shape [q_hidden + 2 * kv_hidden, hidden] and installs it before advancing.
+
+        Raises:
+            RuntimeError: If the configured expert backend did not opt into streaming.
+            ValueError: If a distributed mesh, unsupported tensor layout, incomplete dependency group, or allocating
+                ordinary destination is encountered.
+        """
+        if not self.supports_streaming_checkpoint_load:
+            raise RuntimeError(
+                f"{type(self).__name__} does not support streaming for experts={self.backend.experts}, "
+                f"dispatcher={self.backend.dispatcher}"
+            )
+        if device_mesh is not None:
+            raise ValueError("Ling streaming checkpoint loading currently requires a single-device model")
+
+        ordinary_destinations: dict[str, torch.Tensor] = {}
+        ordinary_native_keys: set[str] = set()
+        qkv_groups: dict[str, _LingQKVGroupBuilder] = {}
+        expert_groups: dict[str, _LingExpertGroupBuilder] = {}
+        n_experts = self.moe_config.n_routed_experts
+
+        for parameter_name, parameter in model_part.named_parameters():
+            native_name = canonical_parameter_fqn(parameter_name)
+            if "lora" in native_name:
+                continue
+
+            qkv_match = _NATIVE_LAYER_QKV_RE.match(native_name)
+            if qkv_match is not None:
+                prefix = qkv_match.group("prefix")
+                projection = qkv_match.group("projection")
+                builder = qkv_groups.setdefault(prefix, _LingQKVGroupBuilder(projections={}))
+                if projection in builder.projections:
+                    raise ValueError(f"Duplicate Ling {projection.upper()} projection for {prefix}")
+                builder.projections[projection] = (native_name, parameter.detach())
+                continue
+
+            expert_match = _STREAMABLE_EXPERT_WEIGHT.match(native_name)
+            if expert_match is not None:
+                expert_root = expert_match.group("root")
+                projection = expert_match.group("projection")
+                builder = expert_groups.setdefault(
+                    expert_root,
+                    _LingExpertGroupBuilder(destinations={}, native_keys=set(), projections=set()),
+                )
+                self._add_streaming_expert_destinations(
+                    builder,
+                    expert_root=expert_root,
+                    native_name=native_name,
+                    projection=projection,
+                    grouped_weight=parameter.detach(),
+                )
+                continue
+
+            destination = parameter.detach()
+            converted = self.convert_single_tensor_to_hf(native_name, destination, quantization=False)
+            if len(converted) != 1:
+                raise ValueError(f"Ordinary Ling parameter {native_name} produced {len(converted)} destinations")
+            checkpoint_name, checkpoint_destination = converted[0]
+            if not isinstance(checkpoint_destination, torch.Tensor):
+                raise ValueError(
+                    f"Ordinary Ling destination {checkpoint_name} is {type(checkpoint_destination).__name__}, "
+                    "expected Tensor"
+                )
+            aliases_parameter = (
+                checkpoint_destination.device == destination.device
+                and checkpoint_destination.untyped_storage().data_ptr() == destination.untyped_storage().data_ptr()
+            )
+            if not aliases_parameter:
+                raise ValueError(f"Ordinary Ling destination {checkpoint_name} does not alias {native_name}")
+            if checkpoint_name in ordinary_destinations:
+                raise ValueError(f"Duplicate ordinary Ling checkpoint destination {checkpoint_name}")
+            ordinary_destinations[checkpoint_name] = checkpoint_destination
+            ordinary_native_keys.add(native_name)
+
+        if not qkv_groups:
+            raise ValueError("Ling streaming load plan found no fused-QKV layers")
+        if not expert_groups:
+            raise ValueError("Ling streaming load plan found no grouped expert layers")
+
+        if ordinary_destinations:
+            yield CheckpointLoadGroup(
+                destinations=ordinary_destinations,
+                native_keys=frozenset(ordinary_native_keys),
+            )
+
+        for prefix, builder in qkv_groups.items():
+            yield self._build_qkv_load_group(prefix, builder)
+
+        for expert_root, builder in expert_groups.items():
+            yield self._build_expert_load_group(expert_root, builder, n_experts)
 
     # ---- HF -> native ----------------------------------------------------
 
@@ -167,9 +497,9 @@ class BailingMoeV2StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapt
                     hf_state_dict[k] = v
                 continue
 
-            m = re.match(r"^(?P<prefix>(?:.*\.)?layers\.\d+)\.self_attn\.(?P<proj>[qkv])_proj\.weight$", fqn)
+            m = _NATIVE_LAYER_QKV_RE.match(fqn)
             if m:
-                pending_qkv.setdefault(m.group("prefix"), {})[m.group("proj")] = tensor
+                pending_qkv.setdefault(m.group("prefix"), {})[m.group("projection")] = tensor
                 continue
 
             hf_state_dict[_rename_native_to_hf(fqn)] = tensor
@@ -201,8 +531,8 @@ class BailingMoeV2StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapt
         if converted is not None:
             return converted
 
-        m = re.match(r"^(?P<prefix>(?:.*\.)?layers\.\d+)\.self_attn\.(?P<proj>[qkv])_proj\.weight$", fqn)
+        m = _NATIVE_LAYER_QKV_RE.match(fqn)
         if m:
-            return [(f"{m.group('prefix')}.attention.{m.group('proj')}_proj.weight", tensor)]
+            return [(f"{m.group('prefix')}.attention.{m.group('projection')}_proj.weight", tensor)]
 
         return [(_rename_native_to_hf(fqn), tensor)]
