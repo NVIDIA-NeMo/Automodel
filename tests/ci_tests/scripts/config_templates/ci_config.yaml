@@ -132,6 +132,15 @@ fixture_keys:
     - hf_source_post_load_dequantize
     - no_check_resume
     - process_isolation
+    # Independent normal-finetune versus checkpoint-Phase-1 metric. This is
+    # reported separately and never gates checkpoint resume correctness.
+    - training_reproducibility_loss_threshold
+    # Named profiles provide scale-aware absolute-plus-relative envelopes for
+    # the first forward and later optimizer steps. Prefer
+    # resume_tolerance_profile (strict, standard, or relaxed) over numeric
+    # overrides; the numeric fields remain absolute-only and authoritative.
+    - resume_tolerance_profile
+    - resume_first_loss_threshold
     - resume_loss_threshold
     - skip_hf_reload
     - skip_automodel_logit_parity

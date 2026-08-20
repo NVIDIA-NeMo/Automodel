@@ -659,6 +659,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                     model=model,
                     hidden_states=get_final_hidden_states(student_out),
                     num_label_tokens=num_label_tokens,
+                    grad_reduce_group=self._get_dp_group(include_cp=True) if is_train else None,
                 )
 
             # Reminder: kd_loss is normalized by num_label_tokens, which is typically
@@ -795,6 +796,8 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         )
         num_label_tokens = self._dp_allreduce(num_label_tokens).item()
         loss_buffer = []
+        num_batches = len(batches)
+        self._set_moe_aux_loss_backward_scale(num_batches=num_batches, num_label_tokens=num_label_tokens)
 
         # number of tokens in the batch, excluding any tail padding.
         num_tokens_in_batch = torch.tensor(
@@ -802,7 +805,6 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             dtype=torch.long,
         )
         num_tokens_in_batch = self._dp_allreduce(num_tokens_in_batch).item()
-        num_batches = len(batches)
         for i, batch in enumerate(batches):
             local_loss, kd_loss, ce_loss = self._forward_backward_step(
                 i, batch, num_label_tokens=num_label_tokens, num_batches=num_batches
@@ -892,6 +894,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         )
         num_tokens_in_batch = self._dp_allreduce(num_tokens_in_batch).item()
         num_batches = len(batches)
+        self._set_moe_aux_loss_backward_scale(num_batches=num_batches, num_label_tokens=num_label_tokens)
 
         prepare_for_grad_accumulation(self.model_parts, pp_enabled=True)
 

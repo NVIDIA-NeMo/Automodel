@@ -78,6 +78,7 @@ from nemo_automodel.components.speculative.dspark.config import (
     build_deepseek_v4_draft_config,
     build_gemma4_draft_config,
     build_glm_5_2_draft_config,
+    build_kimi_k3_draft_config,
     build_minimax_m3_draft_config,
 )
 from nemo_automodel.components.speculative.dspark.core import DSparkStepMetrics, DSparkTrainerModule
@@ -94,6 +95,9 @@ from nemo_automodel.components.speculative.dspark.target_utils import (
 )
 from nemo_automodel.components.speculative.dspark.target_utils import (
     GLM_5_2_MODEL_TYPE as _GLM_5_2_MODEL_TYPE,
+)
+from nemo_automodel.components.speculative.dspark.target_utils import (
+    KIMI_K3_MODEL_TYPES as _KIMI_K3_MODEL_TYPES,
 )
 from nemo_automodel.components.speculative.dspark.target_utils import (
     MINIMAX_M3_MODEL_TYPES as _MINIMAX_M3_MODEL_TYPES,
@@ -114,6 +118,7 @@ from nemo_automodel.recipes.base_recipe import (
 from nemo_automodel.recipes.llm._dspark_target_build import (
     build_deepseek_v4_target,
     build_glm_5_2_target,
+    build_kimi_k3_target,
     distributed_section_dict,
     gather_full_weight_module,
     repair_glm_5_2_qk_rope_head_dim,
@@ -585,6 +590,7 @@ class TrainDSparkRecipe(BaseRecipe):
         is_glm_5_2_target = target_model_type == _GLM_5_2_MODEL_TYPE
         is_gemma4_target = target_model_type in _GEMMA4_MODEL_TYPES
         is_minimax_m3_target = target_model_type in _MINIMAX_M3_MODEL_TYPES
+        is_kimi_k3_target = target_model_type in _KIMI_K3_MODEL_TYPES
         self.cached_target_path = recipe_cfg.get("cached_target_path", None)
         is_multimodal = bool(recipe_cfg.get("multimodal", False))
         if is_multimodal and not is_minimax_m3_target:
@@ -607,15 +613,21 @@ class TrainDSparkRecipe(BaseRecipe):
         # target forward along the sequence and gather the captured hidden states
         # back to the full sequence, so the draft's anchor/block masks stay intact.
         # Restricted to the dense Qwen3-style target -- the DeepSeek V4 / GLM-5.2 /
-        # Gemma4 / MiniMax M3 targets already run under their own expert-parallel /
-        # FSDP mesh, which CP is not composed with here.
+        # Gemma4 / MiniMax M3 / Kimi K3 targets already run under their own
+        # expert-parallel / FSDP mesh, which CP is not composed with here.
         cp_size = int(self.cfg.get("distributed.cp_size", 1) or 1)
         if cp_size > 1:
-            if is_deepseek_v4_target or is_glm_5_2_target or is_gemma4_target or is_minimax_m3_target:
+            if (
+                is_deepseek_v4_target
+                or is_glm_5_2_target
+                or is_gemma4_target
+                or is_minimax_m3_target
+                or is_kimi_k3_target
+            ):
                 raise NotImplementedError(
                     "Context parallelism (cp_size>1) is only supported for the dense Qwen3-style DSpark "
-                    "target; the DeepSeek V4 / GLM-5.2 / Gemma4 / MiniMax M3 targets already run under "
-                    "their own expert-parallel / FSDP mesh. Set cp_size=1 for those."
+                    "target; the DeepSeek V4 / GLM-5.2 / Gemma4 / MiniMax M3 / Kimi K3 targets already "
+                    "run under their own expert-parallel / FSDP mesh. Set cp_size=1 for those."
                 )
             # The CP hook intercepts the target's F.scaled_dot_product_attention call, so
             # the target must run HuggingFace SDPA: force_hf picks the HF class and
@@ -763,6 +775,28 @@ class TrainDSparkRecipe(BaseRecipe):
                     target_config.num_hidden_layers = n_reduced
                 self.target_model = None
             architectures = list(getattr(target_config, "architectures", None) or ["GlmMoeDsaForCausalLM"])
+        elif is_kimi_k3_target:
+            if self.cached_target_path is None:
+                target_config, self.target_model, self.distributed_setup = build_kimi_k3_target(
+                    cfg=self.cfg,
+                    world_size=self.dist_env.world_size,
+                    device=self.device,
+                    compute_dtype=self.compute_dtype,
+                    target_path=target_path,
+                    recipe_cfg=recipe_cfg,
+                    trust_remote_code=trust_remote_code,
+                )
+            else:
+                target_config = AutoConfig.from_pretrained(target_path, trust_remote_code=trust_remote_code)
+                target_config = getattr(target_config, "text_config", target_config)
+                n_reduced = resolve_reduced_target_layers(
+                    target_config.num_hidden_layers,
+                    recipe_cfg.get("target_num_hidden_layers", None),
+                )
+                if n_reduced is not None:
+                    target_config.num_hidden_layers = n_reduced
+                self.target_model = None
+            architectures = ["KimiK3ForCausalLM"]
         else:
             target_config = AutoConfig.from_pretrained(target_path, trust_remote_code=trust_remote_code)
             architectures = getattr(target_config, "architectures", []) or []
@@ -928,17 +962,20 @@ class TrainDSparkRecipe(BaseRecipe):
                     self.cached_target_path,
                 )
 
-        # The Qwen3 / Gemma4 drafts consume a flex_attention BlockMask during training.
-        # The DeepSeek V4 and GLM-5.2 drafts instead consume a dense additive mask
-        # (the DFlash SDPA path), so they are exempt from the flex_attention requirement.
+        # The Qwen3 / Gemma4 / MiniMax M3 drafts consume a flex_attention BlockMask during
+        # training. The DeepSeek V4, GLM-5.2, and Kimi K3 drafts instead consume a dense
+        # additive mask (the DFlash SDPA path), so they are exempt from the requirement.
         attention_backend = recipe_cfg.get("attention_backend", "flex_attention")
-        if not (is_deepseek_v4_target or is_glm_5_2_target) and attention_backend != "flex_attention":
+        if (
+            not (is_deepseek_v4_target or is_glm_5_2_target or is_kimi_k3_target)
+            and attention_backend != "flex_attention"
+        ):
             raise ValueError(f"DSpark training requires attention_backend='flex_attention', got {attention_backend!r}.")
         confidence_head_alpha = float(recipe_cfg.get("confidence_head_alpha", 1.0))
         markov_rank = int(recipe_cfg.get("markov_rank", 256))
 
-        if is_deepseek_v4_target or is_glm_5_2_target or is_gemma4_target or is_minimax_m3_target:
-            # Gemma4, DeepSeek V4, GLM-5.2, and MiniMax M3 drafts share one typed
+        if is_deepseek_v4_target or is_glm_5_2_target or is_gemma4_target or is_minimax_m3_target or is_kimi_k3_target:
+            # Gemma4, DeepSeek V4, GLM-5.2, MiniMax M3, and Kimi K3 drafts share one typed
             # draft-config builder that takes the same DSpark model-args bundle.
             margs = _DraftArgs(
                 num_draft_layers=draft_num_hidden_layers,
@@ -959,6 +996,8 @@ class TrainDSparkRecipe(BaseRecipe):
                 # The GLM draft is always dense and fixes _attn_implementation to "sdpa"
                 # inside the builder, so it is not overridden by attention_backend.
                 draft_config_obj = build_glm_5_2_draft_config(target_config, margs)
+            elif is_kimi_k3_target:
+                draft_config_obj = build_kimi_k3_draft_config(target_config, margs)
             elif is_minimax_m3_target:
                 # MiniMax M3 draft is built from the target's text sub-config (text_config).
                 draft_config_obj = build_minimax_m3_draft_config(target_config, margs)
@@ -1434,20 +1473,67 @@ class TrainDSparkRecipe(BaseRecipe):
         return True
 
     def _run_eval(self):
+        """Evaluate the draft on the validation stream.
+
+        Reports the loss and the acceptance diagnostics that decide whether the
+        draft is worth serving: the per-position ``accept_rate@k``, its aggregate,
+        the expected accepted block length ``tau``, and the confidence head's
+        calibration against the measured acceptance. Every batch already computes
+        these (:class:`DSparkStepMetrics`); training reduces them over a log
+        window and validation over the whole split, both as unreduced
+        numerator/denominator sums so the ratio is formed once, after the
+        data-parallel reduction, rather than averaged over per-rank ratios.
+
+        Returns:
+            The metric dict, or None when no validation dataloader is configured.
+            Diagnostics whose denominator is zero (no confidence head, or no
+            teacher signal) are omitted rather than reported as zero, which would
+            read as collapsed acceptance.
+        """
         if self.val_dataloader is None:
             return None
         self.trainer_module.eval()
-        total_loss = torch.zeros((), device=self.device)
-        total_batches = torch.zeros((), device=self.device)
+        # [loss, batches, tau_num, tau_den, conf_abs_err_num, conf_bias_num,
+        #  conf_cumprod_bias_num, conf_diag_den]
+        scalars = torch.zeros(8, device=self.device)
+        accept_pos_num = torch.zeros(self.block_size, device=self.device)
+        accept_pos_den = torch.zeros(self.block_size, device=self.device)
         with torch.no_grad():
             for batch in self.val_dataloader:
                 metrics = self._forward_batch(batch)
-                total_loss += metrics.loss.detach()
-                total_batches += 1
-        total_loss = self._dp_allreduce(total_loss)
-        total_batches = self._dp_allreduce(total_batches)
+                scalars += torch.stack(
+                    [
+                        metrics.loss.detach(),
+                        torch.ones((), device=self.device),
+                        metrics.tau_num.detach(),
+                        metrics.tau_den.detach(),
+                        metrics.confidence_abs_error_num.detach(),
+                        metrics.confidence_bias_num.detach(),
+                        metrics.confidence_cumprod_bias_num.detach(),
+                        metrics.confidence_diag_den.detach(),
+                    ]
+                ).to(scalars.dtype)
+                accept_pos_num += metrics.accept_rate_per_pos_num.detach().to(accept_pos_num.dtype)
+                accept_pos_den += metrics.accept_rate_per_pos_den.detach().to(accept_pos_den.dtype)
+
+        reduced = self._dp_allreduce(torch.cat([scalars, accept_pos_num, accept_pos_den]))
+        w = reduced[: scalars.numel()].tolist()
+        pos_num = reduced[scalars.numel() : scalars.numel() + self.block_size]
+        pos_den = reduced[scalars.numel() + self.block_size :]
         self.trainer_module.train()
-        return {"val_loss": (total_loss / total_batches.clamp_min(1)).item()}
+
+        eval_metrics = {"val_loss": w[0] / max(1.0, w[1])}
+        accept_den = pos_den.sum().item()
+        if accept_den > 0:
+            eval_metrics["accept_rate"] = pos_num.sum().item() / accept_den
+            _add_accept_rate_per_position(eval_metrics, pos_num, pos_den)
+        if w[3] > 0:
+            eval_metrics["tau"] = w[2] / w[3]
+        if w[7] > 0:
+            eval_metrics["confidence_abs_error"] = w[4] / w[7]
+            eval_metrics["confidence_bias"] = w[5] / w[7]
+            eval_metrics["confidence_cumprod_bias"] = w[6] / w[7]
+        return eval_metrics
 
     def _wandb_log(self, data: dict, step: int) -> None:
         """Log rank-zero metrics when a W&B run is active."""
@@ -1589,8 +1675,17 @@ class TrainDSparkRecipe(BaseRecipe):
                     msg = f"Finished epoch {epoch_idx + 1}/{self.num_epochs} completed_steps={completed_steps}"
                     if eval_metrics is not None:
                         msg += f" val_loss={eval_metrics['val_loss']:.4f}"
+                        for key in ("accept_rate", "tau"):
+                            if key in eval_metrics:
+                                msg += f" val_{key}={eval_metrics[key]:.4f}"
                         self._wandb_log(
-                            {"val/loss": eval_metrics["val_loss"], "val/epoch": epoch_idx},
+                            {
+                                **{
+                                    ("val/loss" if key == "val_loss" else f"val/{key}"): value
+                                    for key, value in eval_metrics.items()
+                                },
+                                "val/epoch": epoch_idx,
+                            },
                             step=self.runtime.global_step,
                         )
                     logger.info(msg)

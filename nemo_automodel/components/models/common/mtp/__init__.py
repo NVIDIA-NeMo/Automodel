@@ -26,14 +26,20 @@ keys) lives in the model's own package.
 
 from nemo_automodel.components.models.common.mtp.mtp import (
     MTPConfig,
+    MTPContextParallelInputs,
     MTPModule,
     get_mtp_loss_scaling_factor,
+    prepare_mtp_context_parallel_inputs,
     roll_tensor,
+    shift_packed_tensor,
 )
 
 __all__ = [
     "MTPConfig",
+    "MTPContextParallelInputs",
     "MTPModule",
     "get_mtp_loss_scaling_factor",
+    "prepare_mtp_context_parallel_inputs",
     "roll_tensor",
+    "shift_packed_tensor",
 ]

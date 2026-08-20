@@ -70,6 +70,7 @@ from nemo_automodel.components.checkpoint.conversion_mapping import (
     requires_tensor_merging,
 )
 from nemo_automodel.components.checkpoint.lifecycle import CheckpointLifecycle
+from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, OptimizerState
 from nemo_automodel.components.checkpoint.utils import (
     ensure_tied_lm_head,
@@ -84,6 +85,7 @@ from nemo_automodel.components.checkpoint.utils import (
     is_rank_0,
     materialize_missing_tied_lm_head,
 )
+from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 
 if TYPE_CHECKING:
     from peft import PeftConfig
@@ -160,22 +162,6 @@ def load_torch_ckpt(
         )
     except pickle.UnpicklingError as err:
         raise RuntimeError(_format_restricted_load_error(f)) from err
-
-
-# NOTE [nemotron-singlegpu-lora]: the branches tagged with this marker below exist to make
-# single-GPU LoRA SFT of merged-expert Nemotron-H MoE (30B-class) fit on one 80GB GPU.  The
-# default DCP / set_model_state_dict load path transiently materializes a second on-device
-# copy of the (merged) expert weights, which OOMs when the whole model lives on one device.
-# The affected sites are:
-#   * Checkpointer.load                -- route single-device custom safetensors through the
-#                                         frugal full-state path instead of DCP
-#   * _load_full_state_dict_into_model -- normalize stray real (CPU) buffers onto the param
-#                                         device, and use plain load_state_dict when the model
-#                                         is not DTensor-sharded
-# Exercised by: examples/llm_finetune/nemotron/nemotron_nano_v3_singlegpu_lora.yaml
-# These are point fixes bolted onto an already-overloaded load path; a future checkpoint
-# refactor should consolidate the single-device vs. sharded loading logic into one place.
-# `grep -n nemotron-singlegpu-lora` finds every affected site.
 
 
 def _unwrap_ddp_model(model: nn.Module) -> nn.Module:
@@ -500,8 +486,8 @@ class Checkpointer:
     - PEFT adapter save/load handling
     - Async save for torch >= 2.9.0
 
-    Also provides DP-aware helpers for saving/loading auxiliary state and
-    utilities to initialize from a base HF checkpoint.
+    Also provides DP- and global-rank-aware helpers for saving/loading
+    auxiliary state and utilities to initialize from a base HF checkpoint.
     """
 
     def __init__(
@@ -843,26 +829,33 @@ class Checkpointer:
         # the broadcast_from_rank0 hang where rank 0's synchronous CPU→GPU copies
         # fall behind other ranks' async allocations.
         is_safetensors = _is_safetensors_checkpoint(model_path)
-        # [nemotron-singlegpu-lora] (see module note at top of file)
-        # Custom models (e.g. NemotronH) normally take the DCP path below, which converts the
-        # model's state dict to_hf to build load destinations.  For merged-expert MoE models that
-        # transiently materializes a second copy of the expert weights on-device, which OOMs when
-        # the whole model lives on one GPU.  On a single device there is no DTensor sharding, so the
-        # frugal full-state path (load to CPU, from_hf-merge on CPU, copy into the model) is correct
-        # and keeps device memory at ~model size — letting 30B-class MoE LoRA SFT fit on one 80GB GPU.
+        is_custom_model = _is_custom_model(model_state.model[0])
+        # Custom adapters traditionally took the frugal full-state path here because converting
+        # grouped experts into load destinations could materialize a second on-device copy and OOM.
+        # Adapters whose destinations all alias final model storage can now opt into the standard
+        # DCP path below, which writes checkpoint tensors directly through those views. Keep the CPU
+        # path for non-aliasing backends and quantized initialization, whose conversion allocates.
         # World size inline (not via components.distributed) so the checkpoint component stays
         # independent per the import-linter contract.
         if torch.distributed.is_initialized():
             world_size = torch.distributed.get_world_size()
         else:
             world_size = int(os.environ.get("WORLD_SIZE", "1"))
-        single_device_custom_safetensors = is_safetensors and _is_custom_model(model_state.model[0]) and world_size == 1
+        state_dict_adapter = getattr(_unwrap_ddp_model(model_state.model[0]), "state_dict_adapter", None)
+        supports_write_through_checkpoint_load = (
+            isinstance(state_dict_adapter, StateDictAdapter)
+            and state_dict_adapter.supports_write_through_checkpoint_load
+            and not self.config.dequantize_base_checkpoint
+        )
+        single_device_custom_safetensors = (
+            is_safetensors and is_custom_model and world_size == 1 and not supports_write_through_checkpoint_load
+        )
         if (
             is_init_step
             and len(model_state.model) == 1
             and (
                 _is_bin_checkpoint(model_path)
-                or (is_safetensors and not _is_custom_model(model_state.model[0]))
+                or (is_safetensors and not is_custom_model)
                 or single_device_custom_safetensors
             )
         ):
@@ -916,6 +909,7 @@ class Checkpointer:
             return
 
         # Standard loading path (DCP copies into model's existing tensors; dtypes follow the model)
+        direct_load_started = time.monotonic()
         state_dict = model_state.state_dict()
         expected_keys = set(state_dict.keys())
         # When the model has a state_dict_adapter, it handles all key transformations
@@ -936,6 +930,12 @@ class Checkpointer:
             # Only base-checkpoint initialization needs FP8 scale destinations.
             quantization=bool(is_init_step and self.config.dequantize_base_checkpoint),
             device_mesh=self.moe_mesh,
+        )
+        destinations_ready = time.monotonic()
+        requested_bytes = sum(
+            tensor.nelement() * tensor.element_size()
+            for tensor in state_dict.values()
+            if isinstance(tensor, torch.Tensor)
         )
 
         compat_tied_lm_head_source_key: str | None = None
@@ -1028,11 +1028,13 @@ class Checkpointer:
                 )
 
         state_dict = self._do_load(state_dict, model_path, storage_reader, is_init_step=is_init_step)
+        storage_read_complete = time.monotonic()
 
         if compat_tied_lm_head_source_key is not None and isinstance(lm_head_param_name, str):
             state_dict[lm_head_param_name] = state_dict.pop(compat_tied_lm_head_source_key)
 
         state_dict = _maybe_adapt_state_dict_from_hf(model_state.model[0], state_dict, moe_mesh=self.moe_mesh)
+        adapter_complete = time.monotonic()
         expected_keys_for_diff = {k for k in expected_keys if not k.endswith("_extra_state")}
         loaded_keys_for_diff = {k for k in state_dict if not k.endswith("_extra_state")}
         # MoE experts load in-place via strided views into model storage (DCP writes through
@@ -1071,6 +1073,20 @@ class Checkpointer:
             state_dict,
             strict=not (len(model_state.model) > 1 or has_state_dict_adapter or allow_checkpoint_key_subset),
             broadcast_from_rank0=self.process_group is None,
+        )
+        install_complete = time.monotonic()
+        requested_gb = requested_bytes / (1 << 30)
+        direct_load_seconds = install_complete - direct_load_started
+        logging.info(
+            "load_model: %.2f GB loaded in %.2fs "
+            "(%.2f GB/s overall | destinations %.2fs, storage read %.2fs, adapt %.2fs, install %.2fs)",
+            requested_gb,
+            direct_load_seconds,
+            requested_gb / max(direct_load_seconds, 1e-9),
+            destinations_ready - direct_load_started,
+            storage_read_complete - destinations_ready,
+            adapter_complete - storage_read_complete,
+            install_complete - adapter_complete,
         )
 
         del state_dict
@@ -1350,10 +1366,10 @@ class Checkpointer:
             raise error
 
     def save_on_dp_ranks(self, state: Any, state_name: str, path: str) -> None:
-        """
-        Save the stateful object.
+        """Save state shared by all tensor- and pipeline-parallel peers.
 
-        This function is a helper function currently used to save the dataloader and rng state.
+        This helper is intended for data-parallel-scoped state such as a
+        stateful dataloader. Only the TP0/PP0 peer writes each DP rank's state.
 
         Args:
             state: Stateful object to save
@@ -1366,10 +1382,10 @@ class Checkpointer:
             torch.save(state.state_dict(), os.path.join(state_dir, f"{state_name}_dp_rank_{self.dp_rank}.pt"))
 
     def load_on_dp_ranks(self, state: Any, state_name: str, path: str) -> None:
-        """
-        Load the stateful object.
+        """Load state shared by all tensor- and pipeline-parallel peers.
 
-        This function is a helper function currently used to load the dataloader and rng state.
+        This helper is intended for data-parallel-scoped state such as a
+        stateful dataloader. All TP/PP peers in a DP rank load the same state.
 
         Args:
             state: Stateful object to load
@@ -1380,6 +1396,46 @@ class Checkpointer:
         state.load_state_dict(
             load_torch_ckpt(
                 os.path.join(state_dir, f"{state_name}_dp_rank_{self.dp_rank}.pt"),
+                weights_only=not self.config.allow_legacy_pickle_restore,
+            )
+        )
+
+    def save_on_global_ranks(self, state: Any, state_name: str, path: str) -> None:
+        """Save state that is unique to every global process rank.
+
+        Args:
+            state: Stateful object to save.
+            state_name: Name of the stateful object.
+            path: Path to save the stateful object.
+        """
+        state_dir = os.path.join(path, state_name)
+        _ensure_dirs(state_dir, process_group=self.process_group)
+        global_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        torch.save(state.state_dict(), os.path.join(state_dir, f"{state_name}_global_rank_{global_rank}.pt"))
+
+    def load_on_global_ranks(self, state: Any, state_name: str, path: str) -> None:
+        """Load state unique to this global rank, with legacy DP fallback.
+
+        Args:
+            state: Stateful object to load.
+            state_name: Name of the stateful object.
+            path: Path containing the stateful object.
+        """
+        state_dir = os.path.join(path, state_name)
+        global_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        state_file = os.path.join(state_dir, f"{state_name}_global_rank_{global_rank}.pt")
+        if not os.path.exists(state_file):
+            state_file = os.path.join(state_dir, f"{state_name}_dp_rank_{self.dp_rank}.pt")
+            if os.path.exists(state_file) and global_rank == 0:
+                logger.warning(
+                    "Loading legacy per-DP %s state from %s. Exact rank-local restoration is not guaranteed under "
+                    "tensor or pipeline parallelism.",
+                    state_name,
+                    state_file,
+                )
+        state.load_state_dict(
+            load_torch_ckpt(
+                state_file,
                 weights_only=not self.config.allow_legacy_pickle_restore,
             )
         )
@@ -2274,22 +2330,18 @@ def _load_full_state_dict_into_model(
     """
     # IMPORTANT: named_modules() returns paths that include wrapper prefixes
     # like _checkpoint_wrapped_module, but PyTorch's _get_fqns() strips
-    # _CHECKPOINT_PREFIX from FQNs.  We must do the same so our keys match
+    # checkpoint-wrapper components from FQNs. We must do the same so our keys match
     # what _load_model_state_dict actually looks up.
-    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
-        _CHECKPOINT_PREFIX,
-    )
     from torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
 
     for model in model_parts:
         for name, module in model.named_modules():
             if type(module).get_extra_state is not nn.Module.get_extra_state:
                 key = f"{name}._extra_state" if name else "_extra_state"
-                key = key.replace(_CHECKPOINT_PREFIX, "")
+                key = canonical_parameter_fqn(key)
                 if key not in state_dict:
                     state_dict[key] = torch.tensor([], dtype=torch.uint8)
 
-    # [nemotron-singlegpu-lora] (see module note at top of file)
     # set_model_state_dict(full_state_dict=True) requires every parameter/buffer of a
     # part to live on a single device.  Custom models (e.g. NemotronH/Mamba) can leave a
     # concrete CPU buffer behind after meta materialization (initialize_model_weights only
@@ -2318,7 +2370,6 @@ def _load_full_state_dict_into_model(
     except ImportError:  # pragma: no cover - older torch
         from torch.distributed._tensor import DTensor
 
-    # [nemotron-singlegpu-lora] (see module note at top of file)
     for part in model_parts:
         if any(isinstance(p, DTensor) for p in part.parameters()):
             # Sharded model (FSDP/TP): set_model_state_dict slices each rank's local
@@ -2596,14 +2647,18 @@ def _load_hf_safetensors_checkpoint(model_path: str) -> Optional[dict[str, torch
 
         with open(index_file) as f:
             index = json.load(f)
-        weight_map = index.get("weight_map", {})
-        for key, filename in weight_map.items():
+        keys_by_filename: dict[str, list[str]] = {}
+        for key, filename in index.get("weight_map", {}).items():
+            keys_by_filename.setdefault(filename, []).append(key)
+        for filename, keys in keys_by_filename.items():
             sf_path = os.path.join(model_path, filename)
             if not os.path.isfile(sf_path):
                 continue
             with safe_open(sf_path, framework="pt", device="cpu") as f:
-                if key in f.keys():
-                    out[key] = f.get_tensor(key)
+                available_keys = set(f.keys())
+                for key in keys:
+                    if key in available_keys:
+                        out[key] = f.get_tensor(key)
     else:
         for sf_path in glob.glob(os.path.join(model_path, "*.safetensors")):
             with safe_open(sf_path, framework="pt", device="cpu") as f:

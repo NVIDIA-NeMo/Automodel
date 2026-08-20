@@ -1,8 +1,44 @@
 # Checkpoint Robustness Test Status
 
-Last updated: 2026-04-02 UTC
+Resume policy last updated: 2026-08-17 UTC
+
+Historical model matrix last measured: 2026-04-02 UTC
 
 > **Note:** vLLM deployment tests moved to separate PR.
+
+## Resume oracle policy
+
+Enabled LLM, VLM, and retrieval resume coverage now compares a restored trainer
+with the uninterrupted continuation of the same checkpoint-producing training
+trajectory. The check requires exact optimizer/scheduler position, complete
+optimizer parameter-group settings, and RNG state. Stateful-dataloader position
+is verified by exact per-rank post-resume batch identity because a loader may
+normalize its equivalent serialized state during restore. On the first shared
+step, exact rank-local model parameters and optimizer tensors are required
+immediately before the update. Gradients, persistent buffers, and post-update
+state are recorded diagnostically. Loss thresholds use scale-aware absolute
+plus relative envelopes selected by the shared `strict`, `standard`, and
+`relaxed` profiles; the existing numeric fields remain authoritative
+absolute-only overrides. Independently calibrated historical envelopes are
+retained as the non-blocking `training_reproducibility_loss_threshold` metric
+instead of weakening the shared-trajectory resume oracle.
+
+Independent-run reproducibility is not a checkpoint-restore oracle. CI reuses
+the normal finetune and checkpoint Phase 1 to report it separately and
+non-blockingly, without another training run. The comparison runs only when
+their model/seed, data, batch/topology, optimizer, scheduler, loss, and backend
+fingerprints match; exact per-rank batch digests are then checked before loss
+differences are reported. Recipe-specific resume threshold relaxations
+calibrated against the former independent baseline have been removed. This
+independent-run report is opportunistic rather than guaranteed coverage when
+phase-specific overrides make the existing runs incomparable; the blocking
+reproducibility oracle is the shared-trajectory resume comparison.
+
+Recipes with `no_check_resume: true` remain explicitly exempt rather than being
+treated as passing. Those exemptions cover model/topology-specific restore
+blockers already documented in the recipe or this file (for example DeepEP/MoE
+state, hybrid Mamba state, or strict optimizer-state loading for unused/frozen
+parameters); they require focused fixes before resume coverage is enabled.
 
 ## Passing Models (8/15)
 
@@ -63,7 +99,7 @@ Last updated: 2026-04-02 UTC
 8. **Mistral3 3B** — FP8 scalar params vs FSDP2
 
 ### Infrastructure improvements:
-10. **`--resume_loss_threshold`** flag — DONE (added, default 5e-3)
+10. **Shared resume tolerance profiles and numeric overrides** — DONE
 11. **Memory thresholds** for remaining models (Llama, GPT-OSS, Nano V3 still missing)
 
 ## Commits on branch `adil-a/checkpoint-robustness-test`

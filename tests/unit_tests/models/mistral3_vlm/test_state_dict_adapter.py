@@ -12,19 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for the Mistral3 FP8 VLM state-dict adapter."""
+"""Unit tests for the Mistral3 FP8 state-dict adapter."""
 
 from types import SimpleNamespace
 
 import pytest
 import torch
 
-from nemo_automodel.components.models.mistral3_vlm.state_dict_adapter import (
+from nemo_automodel.components.models.mistral3.state_dict_adapter import (
     _NON_QUANTIZED_SUFFIXES,
     Mistral3FP8StateDictAdapter,
     _dequantize_from_fp8,
     _is_fp8_weight_key,
 )
+
+
+def test_legacy_vlm_adapter_import_remains_compatible():
+    from nemo_automodel.components.models.mistral3_vlm.state_dict_adapter import (
+        Mistral3FP8StateDictAdapter as LegacyMistral3FP8StateDictAdapter,
+    )
+
+    assert LegacyMistral3FP8StateDictAdapter is Mistral3FP8StateDictAdapter
 
 
 # --------------------------------------------------------------------------- #
@@ -127,6 +135,55 @@ class TestDequantizeFromFp8:
 # --------------------------------------------------------------------------- #
 # Mistral3FP8StateDictAdapter — factories and key rewrites                    #
 # --------------------------------------------------------------------------- #
+class TestForCausalLmFactory:
+    """The text-only factory preserves Ministral3ForCausalLM key names."""
+
+    def test_identity_layout_and_fp8_placeholders(self):
+        adapter = Mistral3FP8StateDictAdapter.for_causal_lm()
+        weight_key = "model.layers.0.self_attn.q_proj.weight"
+
+        converted = adapter.to_hf(
+            {weight_key: torch.zeros(2, 2, dtype=torch.bfloat16)},
+            quantization=True,
+        )
+
+        assert adapter._layout_name == "causal_lm"
+        assert weight_key in converted
+        assert converted[weight_key].dtype == torch.float8_e4m3fn
+        assert weight_key + "_scale_inv" in converted
+
+    def test_identity_layout_dequantizes_checkpoint_weight(self):
+        adapter = Mistral3FP8StateDictAdapter.for_causal_lm()
+        weight_key = "model.layers.0.mlp.down_proj.weight"
+        checkpoint_state = {
+            weight_key: torch.tensor([[2.0, 4.0]], dtype=torch.float8_e4m3fn),
+            weight_key + "_scale_inv": torch.tensor(0.5, dtype=torch.bfloat16),
+        }
+
+        native_state = adapter.from_hf(checkpoint_state)
+
+        assert set(native_state) == {weight_key}
+        assert native_state[weight_key].dtype == torch.bfloat16
+        assert torch.equal(native_state[weight_key], torch.tensor([[1.0, 2.0]], dtype=torch.bfloat16))
+
+    @pytest.mark.parametrize(
+        "key",
+        [
+            "model.embed_tokens.weight",
+            "model.layers.0.input_layernorm.weight",
+            "model.norm.weight",
+            "lm_head.weight",
+        ],
+    )
+    def test_non_quantized_text_weights_do_not_request_scales(self, key):
+        adapter = Mistral3FP8StateDictAdapter.for_causal_lm()
+        value = torch.zeros(2, dtype=torch.bfloat16)
+
+        converted = adapter.to_hf({key: value}, quantization=True)
+
+        assert converted == {key: value}
+
+
 class TestForVlmFullFactory:
     """The single shipped factory wires layout name and not_fp8_prefixes."""
 

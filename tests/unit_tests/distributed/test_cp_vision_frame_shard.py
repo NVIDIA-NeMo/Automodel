@@ -63,6 +63,28 @@ class _StubVisual(torch.nn.Module):
         return out
 
 
+class _RecordingStubVisual(_StubVisual):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.patch_rows = []
+
+    def forward(self, pixel_values, grid_thw=None, return_dict=True):
+        """Record the local patch-row count and delegate to the stub vision tower.
+
+        Args:
+            pixel_values: Tensor of shape [patch_rows, patch_dim].
+            grid_thw: Optional tensor of shape [entries, 3] containing ``(time, height, width)`` rows.
+            return_dict: Whether to return the vision output as a structured object.
+
+        Returns:
+            Vision output whose ``pooler_output`` tensor has shape [tokens, hidden],
+            ``last_hidden_state`` tensor has shape [patch_rows, hidden], and optional
+            ``deepstack_features`` tensors each have shape [tokens, hidden].
+        """
+        self.patch_rows.append(int(pixel_values.shape[0]))
+        return super().forward(pixel_values, grid_thw=grid_thw, return_dict=return_dict)
+
+
 class _RecorderVisual(torch.nn.Module):
     """Parameter-free stub that records its call args and returns a fixed output.
 
@@ -90,8 +112,14 @@ def _pixels(grid, in_dim=8, seed=0):
     return torch.randn(total_patches, in_dim, generator=g)
 
 
-def _policy(*, enabled=True, min_tokens=0, cost_alpha="auto"):
-    return vs.CpVisionFrameShardingConfig(enabled=enabled, min_tokens=min_tokens, cost_alpha=cost_alpha)
+def _policy(*, enabled=True, min_tokens=0, min_frames=32, min_local_patch_rows=0, cost_alpha="auto"):
+    return vs.CpVisionFrameShardingConfig(
+        enabled=enabled,
+        min_tokens=min_tokens,
+        min_frames=min_frames,
+        min_local_patch_rows=min_local_patch_rows,
+        cost_alpha=cost_alpha,
+    )
 
 
 # entries with varied sizes; every patch count (t*h*w) is a multiple of sms_sq=4.
@@ -224,6 +252,10 @@ def test_cost_alpha_override_and_unknown_model_fallback():
     qwen_visual = SimpleNamespace(config=SimpleNamespace(hidden_size=1152))
 
     assert vs.CpVisionFrameShardingConfig().cost_alpha == "auto"
+    assert vs.CpVisionFrameShardingConfig().min_frames == 32
+
+    with pytest.raises(ValueError, match="min_frames must be a non-negative integer"):
+        vs.CpVisionFrameShardingConfig(min_frames=-1)
     assert vs._vision_cost_alpha(qwen_visual, _policy(cost_alpha="auto")) == 3456
     assert vs._vision_cost_alpha(qwen_visual, _policy(cost_alpha=None)) == 3456
     assert vs._vision_cost_alpha(qwen_visual, _policy(cost_alpha=777)) == 777
@@ -234,6 +266,31 @@ def test_cost_alpha_override_and_unknown_model_fallback():
     for invalid_alpha in (-1, True, "AUTO", "not-auto"):
         with pytest.raises(ValueError, match="cost_alpha"):
             vs.CpVisionFrameShardingConfig(cost_alpha=invalid_alpha)
+
+
+def test_min_local_patch_rows_default_override_and_validation():
+    assert vs.CpVisionFrameShardingConfig().min_local_patch_rows == 96
+    assert vs.CpVisionFrameShardingConfig(min_local_patch_rows=0).min_local_patch_rows == 0
+
+    for invalid_floor in (-1, True, 1.5, "96"):
+        with pytest.raises(ValueError, match="min_local_patch_rows"):
+            vs.CpVisionFrameShardingConfig(min_local_patch_rows=invalid_floor)
+
+
+@pytest.mark.parametrize(
+    ("local_rows", "frame_rows", "floor", "expected"),
+    [
+        (4, 4, 96, 23),
+        (8, 4, 96, 22),
+        (92, 4, 96, 1),
+        (96, 4, 96, 0),
+        (100, 4, 96, 0),
+        (4, 0, 96, 0),
+        (4, 4, 0, 0),
+    ],
+)
+def test_padding_frames_for_min_patch_rows(local_rows, frame_rows, floor, expected):
+    assert vs._padding_frames_for_min_patch_rows(local_rows, frame_rows, floor) == expected
 
 
 def test_partition_cost_alpha_flattens_mixed_frame_sizes():
@@ -432,7 +489,18 @@ def test_all_gather_var_tokens_forward_backward(monkeypatch, world):
 # ======================================================================================
 # D. maybe_distribute_visual end-to-end (simulated ranks) + fallbacks + deepstack
 # ======================================================================================
-def _simulate_maybe_distribute(visual, pixel, grid, world, rank, monkeypatch, *, grad=False, spans_only_cp=True):
+def _simulate_maybe_distribute(
+    visual,
+    pixel,
+    grid,
+    world,
+    rank,
+    monkeypatch,
+    *,
+    grad=False,
+    spans_only_cp=True,
+    policy=None,
+):
     """Drive the real maybe_distribute_visual on `rank` with all ranks' data supplied to a
     mocked all-gather, returning its output object.
 
@@ -444,6 +512,7 @@ def _simulate_maybe_distribute(visual, pixel, grid, world, rank, monkeypatch, *,
     ``test_pad_backward_through_real_code_matches_replicate``."""
     import torch.distributed as dist
 
+    resolved_policy = policy or _policy()
     sms = visual.spatial_merge_size
     sms_sq = sms**2
     # frame-level units (mirror maybe_distribute_visual): expand (t,h,w) -> t x (h*w patches)
@@ -472,7 +541,21 @@ def _simulate_maybe_distribute(visual, pixel, grid, world, rank, monkeypatch, *,
         padded = []
         for r in range(world):
             lp = pixel[pix_bounds[cuts[r]] : pix_bounds[cuts[r + 1]]]
-            t = field_getter(visual(lp))  # stub ignores grid; output depends only on pixel rows
+            local_real_start = min(cuts[r], n_units)
+            local_real_end = min(cuts[r + 1], n_units)
+            if resolved_policy.min_local_patch_rows > 0 and local_real_end > local_real_start:
+                frame_patch_rows = f_patches[local_real_end - 1]
+                pad_frames = vs._padding_frames_for_min_patch_rows(
+                    int(lp.shape[0]),
+                    frame_patch_rows,
+                    resolved_policy.min_local_patch_rows,
+                )
+                if pad_frames:
+                    lp = torch.cat(
+                        [lp, lp.new_zeros(pad_frames * frame_patch_rows, lp.shape[1])],
+                        dim=0,
+                    )
+            t = field_getter(visual(lp))[: token_counts[r]]
             if t.shape[0] < max_tok:
                 t = torch.cat([t, t.new_zeros(max_tok - t.shape[0], t.shape[-1])], 0)
             padded.append(t.detach())
@@ -510,7 +593,7 @@ def _simulate_maybe_distribute(visual, pixel, grid, world, rank, monkeypatch, *,
 
     tok = vs.set_cp_vision_group(
         object(),
-        config=_policy(),
+        config=resolved_policy,
         spans_only_cp=spans_only_cp,
     )  # any non-None group activates the path
     try:
@@ -549,6 +632,84 @@ def test_maybe_distribute_gathers_deepstack(monkeypatch, world):
     for got, exp in zip(out.deepstack_features, rep.deepstack_features):
         assert got.shape == exp.shape
         assert torch.allclose(got, exp, atol=1e-6)
+
+
+def test_min_local_patch_rows_preserves_forward_and_deepstack(monkeypatch):
+    grid = _grid([(8, 2, 2)])
+    pixel = _pixels(grid, seed=23)
+    visual = _RecordingStubVisual(with_deepstack=True)
+    replicated = visual(pixel, grid)
+
+    out = _simulate_maybe_distribute(
+        visual,
+        pixel,
+        grid,
+        world=4,
+        rank=0,
+        monkeypatch=monkeypatch,
+        policy=_policy(min_local_patch_rows=24),
+    )
+
+    assert visual.patch_rows[-1] == 24
+    assert torch.equal(out.pooler_output, replicated.pooler_output)
+    assert out.deepstack_features is not None
+    for got, expected in zip(out.deepstack_features, replicated.deepstack_features):
+        assert torch.equal(got, expected)
+
+
+def test_min_local_patch_rows_does_not_grow_dummy_only_rank(monkeypatch):
+    grid = _grid([(1, 2, 2)])
+    pixel = _pixels(grid, seed=29)
+    visual = _RecordingStubVisual()
+    replicated = visual(pixel, grid).pooler_output
+
+    out = _simulate_maybe_distribute(
+        visual,
+        pixel,
+        grid,
+        world=4,
+        rank=1,
+        monkeypatch=monkeypatch,
+        policy=_policy(min_local_patch_rows=96),
+    )
+
+    assert visual.patch_rows[-1] == 4
+    assert torch.equal(out.pooler_output, replicated)
+
+
+def test_min_local_patch_rows_backward_matches_replicate(monkeypatch):
+    torch.manual_seed(31)
+    grid = _grid([(8, 2, 2)])
+    pixel = _pixels(grid, seed=29)
+    visual = _StubVisual(bias=True)
+    replicated = visual(pixel, grid).pooler_output
+    target = torch.randn_like(replicated)
+
+    visual.zero_grad(set_to_none=True)
+    (visual(pixel, grid).pooler_output * target).sum().backward()
+    expected_weight_grad = visual.proj.weight.grad.clone()
+    expected_bias_grad = visual.proj.bias.grad.clone()
+
+    weight_grads, bias_grads = [], []
+    for rank in range(4):
+        visual.zero_grad(set_to_none=True)
+        out = _simulate_maybe_distribute(
+            visual,
+            pixel,
+            grid,
+            world=4,
+            rank=rank,
+            monkeypatch=monkeypatch,
+            grad=True,
+            policy=_policy(min_local_patch_rows=24),
+        )
+        assert torch.equal(out.pooler_output, replicated)
+        (out.pooler_output * target).sum().backward()
+        weight_grads.append(visual.proj.weight.grad.clone())
+        bias_grads.append(visual.proj.bias.grad.clone())
+
+    assert torch.allclose(torch.stack(weight_grads).sum(0), expected_weight_grad, atol=1e-6)
+    assert torch.allclose(torch.stack(bias_grads).sum(0), expected_bias_grad, atol=1e-6)
 
 
 @pytest.mark.parametrize("world", [2, 4])
@@ -699,13 +860,32 @@ def test_maybe_distribute_falls_back_below_min_tokens(monkeypatch):
     grid = _grid([(1, 2, 2)])
     pixel = _pixels(grid)
     visual = _StubVisual()
-    tok = vs.set_cp_vision_group(object(), config=_policy(min_tokens=999))
+    tok = vs.set_cp_vision_group(object(), config=_policy(min_tokens=999, min_frames=999))
     try:
         out = vs.maybe_distribute_visual(visual, pixel, grid)
     finally:
         vs.reset_cp_vision_group(tok)
 
     assert torch.allclose(out.pooler_output, visual(pixel, grid).pooler_output, atol=1e-6)
+
+
+def test_frame_threshold_shards_long_video_below_token_cutoff(monkeypatch):
+    grid = _grid([(32, 2, 2)])
+    pixel = _pixels(grid, seed=17)
+    visual = _StubVisual()
+    expected = visual(pixel, grid).pooler_output
+    out = _simulate_maybe_distribute(
+        visual,
+        pixel,
+        grid,
+        world=8,
+        rank=0,
+        monkeypatch=monkeypatch,
+        policy=_policy(min_tokens=999, min_frames=32),
+    )
+
+    assert out.pooler_output.shape == expected.shape
+    assert torch.allclose(out.pooler_output, expected, atol=1e-6)
 
 
 @pytest.mark.parametrize(

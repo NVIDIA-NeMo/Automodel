@@ -31,6 +31,7 @@ from nemo_automodel.components.datasets.vlm.pp_media import (
 )
 from nemo_automodel.components.distributed.cp_vision_frame_shard import CpVisionFrameShardingConfig
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
+from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 from nemo_automodel.components.optim.optimizer import LRSchedulerConfig, build_optimizer_config
 from nemo_automodel.components.training.step_scheduler import StepSchedulerConfig
 from nemo_automodel.recipes._typed_config import (
@@ -455,6 +456,7 @@ def test_run_train_step_supports_tensor_outputs(monkeypatch):
     grad_clip_mock.assert_called_once()
     assert calculate_mock.call_args.kwargs["num_label_tokens"] == 1
     assert metrics.metrics["grad_norm"] == 2.5
+    assert MoEAuxLossAutoScaler.main_loss_backward_scale.item() == pytest.approx(1.0)
     assert recipe.optimizer[0].step_called
     assert recipe.optimizer[0].zero_grad_called
 
@@ -464,7 +466,7 @@ def test_forward_backward_step_routes_thd_batch_through_te(monkeypatch):
     recipe = FinetuneRecipeForVLM.__new__(FinetuneRecipeForVLM)
     recipe.dist_env = SimpleNamespace(device="cpu")
     recipe.device_mesh = None
-    recipe.mesh_context = SimpleNamespace(cp_size=1)
+    recipe.mesh_context = SimpleNamespace(cp_size=2)
     recipe.processor = SimpleNamespace(tokenizer=SimpleNamespace(pad_token_id=7))
     recipe.model_parts = [_TensorModel()]
     recipe.pp_enabled = False
@@ -506,7 +508,7 @@ def test_forward_backward_step_routes_thd_batch_through_te(monkeypatch):
 
 
 @pytest.mark.cuda(False)
-def test_forward_backward_step_rejects_thd_with_context_parallelism():
+def test_forward_backward_step_rejects_mrope_thd_with_context_parallelism():
     recipe = FinetuneRecipeForVLM.__new__(FinetuneRecipeForVLM)
     recipe.dist_env = SimpleNamespace(device="cpu")
     recipe.device_mesh = None
@@ -515,12 +517,13 @@ def test_forward_backward_step_rejects_thd_with_context_parallelism():
     recipe.pp_enabled = False
     recipe.magi = SimpleNamespace(enabled=False)
 
-    with pytest.raises(NotImplementedError, match="currently supports cp_size=1 only"):
+    with pytest.raises(NotImplementedError, match="multi-axis mRoPE"):
         recipe._forward_backward_step(
             idx=0,
             batch={
                 "input_ids": torch.tensor([[1, 2]]),
                 "labels": torch.tensor([[2, -100]]),
+                "position_ids": torch.zeros((3, 1, 2), dtype=torch.long),
                 "qkv_format": "thd",
             },
             loss_buffer=[],
@@ -540,6 +543,7 @@ def _build_pp_recipe_for_optim_step(num_label_tokens_in_batch: int):
     recipe.loss_fn = object()
     recipe.model_parts = [_TensorModel()]
     recipe.pp_enabled = True
+    recipe.pp = SimpleNamespace(pp_batch_size=2, pp_microbatch_size=1)
     recipe.optimizer = [_DummyOptimizer()]
     recipe.step_scheduler = SimpleNamespace(step=0, epoch=0, is_remote_logging_step=False)
     recipe.checkpointer = SimpleNamespace(maybe_wait_for_staging=lambda: None)
@@ -622,6 +626,7 @@ def test_run_train_step_clears_first_microbatch_after_first_batch(monkeypatch):
     recipe._run_train_optim_step(batches, max_grad_norm=1.0)
 
     assert events == ["prepare", "forward_0", "after_first", "final", "forward_1"]
+    assert MoEAuxLossAutoScaler.main_loss_backward_scale.item() == pytest.approx(1.0)
 
 
 @pytest.mark.cuda(False)
@@ -646,6 +651,7 @@ def test_run_train_step_pp_zero_label_tokens_no_nan(monkeypatch):
 
     assert isinstance(metrics, MetricsSample)
     assert metrics.metrics["num_label_tokens"] == 0
+    assert MoEAuxLossAutoScaler.main_loss_backward_scale.item() == pytest.approx(0.5)
     loss = metrics.metrics["loss"]
     assert loss == loss, f"reporting loss must not be NaN, got {loss}"
     assert loss == 0.0, f"reporting loss must be 0.0 when num_label_tokens=0, got {loss}"
@@ -666,6 +672,7 @@ def test_run_train_step_pp_nonzero_label_tokens_divides(monkeypatch):
 
     assert metrics.metrics["num_label_tokens"] == 4
     assert metrics.metrics["loss"] == pytest.approx(8.0 / 4)
+    assert MoEAuxLossAutoScaler.main_loss_backward_scale.item() == pytest.approx(2.0)
 
 
 # -----------------------------------------------------------------------------
@@ -1456,12 +1463,13 @@ class TestCalculateLoss:
         hidden_states = torch.randn(2, 5, 32, device="cuda")
         labels = torch.randint(0, 50, (2, 5), device="cuda")
 
-        # Use a plain object that has lm_head but no get_output_embeddings
+        # Use a module that has lm_head parameters but no get_output_embeddings
         # This tests the fallback path in calculate_loss
-        class ModelWithLmHeadOnly:
-            """Non-nn.Module model without get_output_embeddings."""
+        class ModelWithLmHeadOnly(torch.nn.Module):
+            """nn.Module model without get_output_embeddings."""
 
             def __init__(self):
+                super().__init__()
                 self._lm_head = torch.nn.Linear(32, 50).cuda()
 
             def named_parameters(self, remove_duplicate=False):
@@ -2293,6 +2301,7 @@ class _CPPreEmbedModel(torch.nn.Module):
     def __init__(self):
         super().__init__()
         self.scale = torch.nn.Parameter(torch.tensor(1.0))
+        self.supports = SimpleNamespace(mtp_enabled=False, supports_mtp_cp=False)
         self.hook_calls = []
 
     def prepare_model_inputs_for_cp(self, batch, *, num_chunks=1):

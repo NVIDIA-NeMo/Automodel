@@ -208,7 +208,7 @@ def _enrich_base_job(job: Dict[str, Any], ci_config: Dict[str, Any], scope: str)
             if not robustness_config.get("skip_hf_reload"):
                 robustness_phases.append("hf_reload")
             if not robustness_config.get("no_check_resume"):
-                robustness_phases.extend(("resume_baseline", "resume"))
+                robustness_phases.append("resume")
             job["variables"]["CHECKPOINT_ROBUSTNESS_PHASES"] = " ".join(robustness_phases)
 
     # Convergence tests run for 2 epochs; double the slurm time allocation.

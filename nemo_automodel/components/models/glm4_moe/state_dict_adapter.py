@@ -45,6 +45,8 @@ class Glm4MoeStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
       model.layers.{L}.mlp.shared_expert.down_proj.weight
     """
 
+    _supports_write_through_checkpoint_load = True
+
     def __init__(
         self,
         config: Any,
