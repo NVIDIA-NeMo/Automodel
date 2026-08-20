@@ -13,10 +13,39 @@
 # limitations under the License.
 
 from abc import ABC, abstractmethod
+from collections.abc import Iterator
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional
+
+import torch
 
 if TYPE_CHECKING:
     from torch.distributed.device_mesh import DeviceMesh
+
+
+@dataclass
+class CheckpointLoadGroup:
+    """One dependency-complete unit of a bounded checkpoint load.
+
+    Attributes:
+        destinations: Mapping from checkpoint FQNs to destination tensors. Each tensor has the exact shape and axis
+            order recorded for that FQN in checkpoint metadata. A destination may alias final model storage or may be
+            bounded temporary storage consumed by :meth:`install`.
+        native_keys: Native model state-dict keys completed by this group. Their tensors may have arbitrary ranks and
+            model-owned layouts; every key must be fully installed before :meth:`install` returns.
+    """
+
+    destinations: dict[str, torch.Tensor]
+    native_keys: frozenset[str]
+
+    def install(self) -> None:
+        """Install loaded destinations into final model storage.
+
+        The default implementation is a no-op for destinations that already alias final model storage. Allocating
+        conversion groups override this method, complete their model-owned transformation, and release references to
+        temporary storage before returning.
+        """
+        return None
 
 
 class StateDictAdapter(ABC):
@@ -28,6 +57,7 @@ class StateDictAdapter(ABC):
 
     _supports_write_through_checkpoint_load: bool = False
     _supports_checkpoint_load_without_full_copy: bool = False
+    _supports_streaming_checkpoint_load: bool = False
 
     @property
     def supports_write_through_checkpoint_load(self) -> bool:
@@ -47,6 +77,36 @@ class StateDictAdapter(ABC):
         a scale tensor and applies it to already-loaded expert weights.
         """
         return self._supports_checkpoint_load_without_full_copy
+
+    @property
+    def supports_streaming_checkpoint_load(self) -> bool:
+        """Whether the adapter can load a base checkpoint as bounded dependency groups.
+
+        Adapters should opt in only when :meth:`iter_checkpoint_load_groups` covers every required pretrained model
+        tensor and each yielded group writes through to final storage or installs bounded temporary storage before the
+        next group is requested.
+        """
+        return self._supports_streaming_checkpoint_load
+
+    def iter_checkpoint_load_groups(
+        self,
+        model_part: torch.nn.Module,
+        device_mesh: Optional["DeviceMesh"] = None,
+    ) -> Iterator[CheckpointLoadGroup]:
+        """Yield dependency-complete groups for bounded base-checkpoint loading.
+
+        Args:
+            model_part: Model part that owns the final parameter and buffer storage populated by yielded groups.
+            device_mesh: Optional device mesh describing the final distributed tensor placements.
+
+        Returns:
+            Iterator of groups. Each group's destination tensors have checkpoint-native shapes and axis order; the
+            iterator must not retain an installed group's temporary tensors after advancing.
+
+        Raises:
+            NotImplementedError: If the adapter does not implement streaming checkpoint loading.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not implement streaming checkpoint loading")
 
     @abstractmethod
     def to_hf(self, state_dict: dict[str, Any], **kwargs) -> dict[str, Any]:

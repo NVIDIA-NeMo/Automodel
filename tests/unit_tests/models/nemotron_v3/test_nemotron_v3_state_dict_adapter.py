@@ -126,6 +126,64 @@ class TestNemotronV3StateDictAdapter:
         adapter.backend.dispatcher = "mok"
         assert adapter.supports_write_through_checkpoint_load is False
 
+    def test_te_single_device_fallback_streams_through_grouped_parameter_views(self, config, moe_config, backend):
+        backend.experts = "te"
+        adapter = NemotronV3StateDictAdapter(config, moe_config, backend)
+
+        class _FakeSingleDeviceFallbackExperts(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.gate_and_up_projs = torch.nn.Parameter(
+                    torch.zeros(moe_config.n_routed_experts, moe_config.expert_dim, moe_config.moe_inter_dim)
+                )
+                self.down_projs = torch.nn.Parameter(
+                    torch.zeros(moe_config.n_routed_experts, moe_config.moe_inter_dim, moe_config.expert_dim)
+                )
+
+        model = torch.nn.Module()
+        model.model = torch.nn.Module()
+        model.model.embed_tokens = torch.nn.Embedding(8, moe_config.expert_dim)
+        model.model.embed_tokens.lora_A = torch.nn.Linear(moe_config.expert_dim, 2, bias=False)
+        lora_initial = model.model.embed_tokens.lora_A.weight.detach().clone()
+        layer = torch.nn.Module()
+        layer.mixer = torch.nn.Module()
+        layer.mixer.experts = _FakeSingleDeviceFallbackExperts()
+        experts = layer.mixer.experts
+        model.model.layers = torch.nn.ModuleList([layer])
+
+        groups = list(adapter.iter_checkpoint_load_groups(model))
+        assert adapter.supports_streaming_checkpoint_load is True
+        assert len(groups) == 2
+
+        all_destinations = {key: value for group in groups for key, value in group.destinations.items()}
+        assert set(all_destinations) == {
+            "backbone.embeddings.weight",
+            *{
+                f"backbone.layers.0.mixer.experts.{expert_id}.{projection}.weight"
+                for expert_id in range(moe_config.n_routed_experts)
+                for projection in ("up_proj", "down_proj")
+            },
+        }
+        for expert_id in range(moe_config.n_routed_experts):
+            up_destination = all_destinations[f"backbone.layers.0.mixer.experts.{expert_id}.up_proj.weight"]
+            down_destination = all_destinations[f"backbone.layers.0.mixer.experts.{expert_id}.down_proj.weight"]
+            assert up_destination.untyped_storage().data_ptr() == experts.gate_and_up_projs.untyped_storage().data_ptr()
+            assert down_destination.untyped_storage().data_ptr() == experts.down_projs.untyped_storage().data_ptr()
+            assert not up_destination.is_contiguous()
+            assert not down_destination.is_contiguous()
+
+        assert not any("lora" in key for key in all_destinations)
+        for group in groups[1:]:
+            for destination in group.destinations.values():
+                destination.fill_(3)
+            group.install()
+        assert torch.count_nonzero(experts.gate_and_up_projs) == experts.gate_and_up_projs.numel()
+        assert torch.count_nonzero(experts.down_projs) == experts.down_projs.numel()
+        torch.testing.assert_close(model.model.embed_tokens.lora_A.weight, lora_initial)
+
+        moe_config.expert_bias = True
+        assert adapter.supports_streaming_checkpoint_load is False
+
     def test_from_hf_map_structure(self, config, moe_config, backend):
         """Test from_hf_map structure."""
         adapter = NemotronV3StateDictAdapter(config, moe_config, backend)

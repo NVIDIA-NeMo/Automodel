@@ -276,6 +276,14 @@ class _HuggingFaceStorageReader(FsspecReader):
             super().__init__(path=path)
 
         self.key_mapping = key_mapping
+        self._metadata_cache: Metadata | None = None
+
+    def reset(self, checkpoint_id: str | os.PathLike | None = None) -> None:
+        """Reset reader state and invalidate cached metadata when the checkpoint changes."""
+        previous_path = str(self.path)
+        super().reset(checkpoint_id)
+        if checkpoint_id is not None and str(self.path) != previous_path:
+            self._metadata_cache = None
 
     def read_data(self, plan: LoadPlan, planner: LoadPlanner) -> Future[None]:
         per_file: dict[str, list[ReadItem]] = {}
@@ -372,6 +380,11 @@ class _HuggingFaceStorageReader(FsspecReader):
         return fut
 
     def read_metadata(self) -> Metadata:
+        if self._metadata_cache is not None:
+            if getattr(self._metadata_cache, "storage_meta", None) is not None:
+                self._metadata_cache.storage_meta.load_id = self.load_id
+            return self._metadata_cache
+
         state_dict_metadata: dict[str, TensorStorageMetadata] = {}
         storage_data: dict[MetadataIndex, _HFStorageInfo] = {}
 
@@ -443,6 +456,7 @@ class _HuggingFaceStorageReader(FsspecReader):
             metadata.storage_meta = StorageMeta()
         metadata.storage_meta.load_id = self.load_id  # type: ignore[union-attr]
 
+        self._metadata_cache = metadata
         return metadata
 
 

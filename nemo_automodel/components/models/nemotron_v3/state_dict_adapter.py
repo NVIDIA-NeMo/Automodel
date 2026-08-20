@@ -14,20 +14,36 @@
 
 import logging
 import re
+from collections.abc import Iterator
+from dataclasses import dataclass
 from typing import Any, Optional
 
 import torch
 from torch.distributed.device_mesh import DeviceMesh
 
-from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
+from nemo_automodel.components.checkpoint.state_dict_adapter import CheckpointLoadGroup, StateDictAdapter
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.state_dict_mixin import MoESplitExpertsStateDictMixin
+from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 
 logger = logging.getLogger(__name__)
 
 _MAMBA_FP32_PARAMS_TO_BARE = re.compile(r"(\.mixer)\._fp32_params\.")
 _MAMBA_FP32_PARAM_NAMES = ("A_log", "dt_bias", "D")
+_STREAMABLE_EXPERT_WEIGHT = re.compile(
+    r"^(?P<root>(?:.+\.)?layers\.\d+\.mixer\.experts)\."
+    r"(?P<projection>gate_and_up_projs|down_projs)$"
+)
+
+
+@dataclass
+class _NemotronExpertGroupBuilder:
+    """Mutable builder for one dependency-complete expert layer group."""
+
+    destinations: dict[str, torch.Tensor]
+    expert_ids_by_projection: dict[str, set[int]]
+    native_keys: set[str]
 
 
 def _strip_mamba_fp32_holder_key(key: str) -> str:
@@ -112,6 +128,169 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
             "model.layers.{}.mixer.experts.{}.up_proj.weight": "model.layers.{}.mixer.experts.gate_and_up_projs",
             "model.layers.{}.mixer.experts.{}.down_proj.weight": "model.layers.{}.mixer.experts.down_projs",
         }
+
+    @property
+    def supports_streaming_checkpoint_load(self) -> bool:
+        """Whether this adapter can stream split experts into final single-device storage.
+
+        TE/DeepEP is configured for distributed runs, but the MoE layer deliberately falls back to ``GroupedExperts``
+        when world size is one. The adapter configuration still says ``experts="te"``, so the legacy converter assumes
+        the grouped tensors are TE stack copies and rebuilds them. For non-gated ReLU-squared experts, the runtime
+        grouped tensors instead provide per-expert transposed views that write through to final storage. Expert bias
+        and other activations retain the allocating fallback until their layouts have concrete coverage.
+        """
+        return (
+            self.moe_config is not None
+            and self.backend.experts == "te"
+            and self.moe_config.expert_activation == "relu2"
+            and not self.moe_config.expert_bias
+        )
+
+    def iter_checkpoint_load_groups(
+        self,
+        model_part: torch.nn.Module,
+        device_mesh: Optional["DeviceMesh"] = None,
+    ) -> Iterator[CheckpointLoadGroup]:
+        """Yield final-storage destinations for the single-device TE fallback.
+
+        Args:
+            model_part: Nemotron V3 model whose ordinary parameters and grouped expert parameters are final load
+                destinations. Native input projections have shape [experts, hidden, expert_hidden], and native down
+                projections have shape [experts, expert_hidden, hidden].
+            device_mesh: Must be ``None``. Distributed expert parameters require a rank-symmetric group plan.
+
+        Returns:
+            Iterator whose first group contains ordinary parameter aliases and whose remaining groups contain one
+            complete MoE layer each. Expert destinations use HF shapes [expert_hidden, hidden] for ``up_proj`` and
+            [hidden, expert_hidden] for ``down_proj`` and are transposed views of final grouped parameter storage.
+
+        Raises:
+            RuntimeError: If this adapter configuration did not opt into streaming checkpoint loading.
+            ValueError: If a distributed mesh, an allocating ordinary conversion, an expert bias, or an incomplete
+                expert group is encountered.
+        """
+        if not self.supports_streaming_checkpoint_load:
+            raise RuntimeError(f"{type(self).__name__} does not support streaming for backend {self.backend.experts}")
+        if device_mesh is not None:
+            raise ValueError("Nemotron V3 streaming checkpoint loading currently requires a single-device model")
+        moe_config = self.moe_config
+        if moe_config is None:
+            raise RuntimeError("Nemotron V3 streaming checkpoint loading requires an MoE configuration")
+
+        ordinary_destinations: dict[str, torch.Tensor] = {}
+        ordinary_native_keys: set[str] = set()
+        expert_groups: dict[str, _NemotronExpertGroupBuilder] = {}
+        expected_expert_ids = set(range(moe_config.n_routed_experts))
+
+        for parameter_name, parameter in model_part.named_parameters():
+            native_name = canonical_parameter_fqn(parameter_name)
+            # PEFT is applied before the base checkpoint is loaded. Its adapter parameters are intentionally absent
+            # from the pretrained checkpoint and retain the initialization performed by initialize_model_weights().
+            if "lora" in native_name:
+                continue
+
+            expert_match = _STREAMABLE_EXPERT_WEIGHT.match(native_name)
+            if expert_match is not None:
+                expert_root = expert_match.group("root")
+                native_projection_name = expert_match.group("projection")
+                if native_projection_name == "gate_and_up_projs":
+                    projection_name = "up_proj"
+                    expected_shape = (
+                        moe_config.n_routed_experts,
+                        moe_config.expert_dim,
+                        moe_config.moe_inter_dim,
+                    )
+                else:
+                    projection_name = "down_proj"
+                    expected_shape = (
+                        moe_config.n_routed_experts,
+                        moe_config.moe_inter_dim,
+                        moe_config.expert_dim,
+                    )
+
+                if tuple(parameter.shape) != expected_shape:
+                    raise ValueError(
+                        f"Grouped expert parameter {native_name} has shape {tuple(parameter.shape)}, "
+                        f"expected {expected_shape}"
+                    )
+
+                builder = expert_groups.setdefault(
+                    expert_root,
+                    _NemotronExpertGroupBuilder(destinations={}, expert_ids_by_projection={}, native_keys=set()),
+                )
+                split_weights = self._split_experts_weights(parameter.detach(), moe_config.n_routed_experts)
+                expert_ids = list(self._last_expert_ids)
+                for expert_id, expert_weight in zip(expert_ids, split_weights, strict=True):
+                    checkpoint_name = self._native_key_to_hf(f"{expert_root}.{expert_id}.{projection_name}.weight")
+                    if checkpoint_name in builder.destinations:
+                        raise ValueError(f"Duplicate expert checkpoint destination: {checkpoint_name}")
+                    checkpoint_destination = expert_weight.transpose(0, 1)
+                    expected_checkpoint_shape = (
+                        (moe_config.moe_inter_dim, moe_config.expert_dim)
+                        if projection_name == "up_proj"
+                        else (moe_config.expert_dim, moe_config.moe_inter_dim)
+                    )
+                    if tuple(checkpoint_destination.shape) != expected_checkpoint_shape:
+                        raise ValueError(
+                            f"Expert checkpoint destination {checkpoint_name} has shape "
+                            f"{tuple(checkpoint_destination.shape)}, expected {expected_checkpoint_shape}"
+                        )
+                    builder.destinations[checkpoint_name] = checkpoint_destination
+                builder.expert_ids_by_projection[native_projection_name] = set(expert_ids)
+                builder.native_keys.add(native_name)
+                del split_weights
+                continue
+
+            destination = parameter.detach()
+            converted = self.convert_single_tensor_to_hf(native_name, destination, quantization=False)
+            if len(converted) != 1:
+                raise ValueError(
+                    f"Ordinary Nemotron parameter {native_name} produced {len(converted)} checkpoint destinations"
+                )
+            checkpoint_name, checkpoint_destination = converted[0]
+            if not isinstance(checkpoint_destination, torch.Tensor):
+                raise ValueError(
+                    f"Ordinary Nemotron destination {checkpoint_name} is {type(checkpoint_destination).__name__}, "
+                    "expected Tensor"
+                )
+            aliases_parameter = (
+                checkpoint_destination.device == destination.device
+                and checkpoint_destination.untyped_storage().data_ptr() == destination.untyped_storage().data_ptr()
+            )
+            if not aliases_parameter:
+                raise ValueError(
+                    f"Ordinary Nemotron destination {checkpoint_name} does not alias final parameter {native_name}"
+                )
+            if checkpoint_name in ordinary_destinations:
+                raise ValueError(f"Duplicate ordinary Nemotron checkpoint destination: {checkpoint_name}")
+            ordinary_destinations[checkpoint_name] = checkpoint_destination
+            ordinary_native_keys.add(native_name)
+
+        for group_key, builder in expert_groups.items():
+            for projection_name in ("gate_and_up_projs", "down_projs"):
+                expert_ids = builder.expert_ids_by_projection.get(projection_name, set())
+                if expert_ids != expected_expert_ids:
+                    missing_experts = sorted(expected_expert_ids - expert_ids)
+                    raise ValueError(
+                        f"Incomplete expert group {group_key}.{projection_name}: "
+                        f"missing expert ids {missing_experts[:10]}"
+                    )
+
+        if not expert_groups:
+            raise ValueError("Nemotron V3 streaming load plan found no grouped expert layers")
+
+        if ordinary_destinations:
+            yield CheckpointLoadGroup(
+                destinations=ordinary_destinations,
+                native_keys=frozenset(ordinary_native_keys),
+            )
+
+        for group_key in sorted(expert_groups):
+            builder = expert_groups[group_key]
+            yield CheckpointLoadGroup(
+                destinations=builder.destinations,
+                native_keys=frozenset(builder.native_keys),
+            )
 
     @property
     def _hf_prefix(self) -> str:
