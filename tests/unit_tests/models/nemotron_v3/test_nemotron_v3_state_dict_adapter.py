@@ -129,6 +129,12 @@ class TestNemotronV3StateDictAdapter:
                     torch.zeros(moe_config.n_routed_experts, moe_config.moe_inter_dim, moe_config.expert_dim)
                 )
 
+            def get_extra_state(self) -> dict[str, bool]:
+                return {"runtime_only": True}
+
+            def set_extra_state(self, state: object) -> None:
+                del state
+
         model = torch.nn.Module()
         model.model = torch.nn.Module()
         model.model.embed_tokens = torch.nn.Embedding(8, moe_config.expert_dim)
@@ -168,6 +174,7 @@ class TestNemotronV3StateDictAdapter:
             assert not down_destination.is_contiguous()
 
         assert not any("lora" in key for key in all_destinations)
+        assert not any("_extra_state" in key for key in all_destinations)
         correction_bias = all_destinations["backbone.layers.0.mixer.gate.e_score_correction_bias"]
         correction_bias.fill_(2)
         torch.testing.assert_close(
