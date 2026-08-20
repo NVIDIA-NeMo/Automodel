@@ -56,6 +56,9 @@ trap 'rm -f "$LOG_FILE"' EXIT
 
 # Guard against bug in commit 00f40419 (PR #2983). Checked after each schedule
 # because the metadata path differs between PipelineScheduleSingle and ...Multi.
+# The accumulated-gradient loss fixed by PR #3530 is a separate failure that this
+# smoke run cannot see; L2_Parallelism_PP_Grad_Accum_Parity.sh covers it
+# numerically.
 assert_static_pp_metadata() {
     if grep -Eiq "dynamic .*metadata inference" "$LOG_FILE"; then
         echo "ERROR: pipeline stages fell back to dynamic metadata inference instead of static metadata"

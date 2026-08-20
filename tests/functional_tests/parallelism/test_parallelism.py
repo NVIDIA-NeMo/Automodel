@@ -27,6 +27,7 @@ from tests.utils.test_utils import run_test_script
 TEST_FOLDER = "parallelism"
 GEMMA4_PP2_PARITY_FILENAME = "L2_Parallelism_VLM_Gemma4_PP2_Parity.sh"
 GEMMA4_TP2_PARITY_FILENAME = "L2_Parallelism_VLM_Gemma4_TP2_Parity.sh"
+PP_GRAD_ACCUM_PARITY_FILENAME = "L2_Parallelism_PP_Grad_Accum_Parity.sh"
 
 
 class TestParallelismParity:
@@ -35,3 +36,6 @@ class TestParallelismParity:
 
     def test_gemma4_tp2_parity(self):
         run_test_script(TEST_FOLDER, GEMMA4_TP2_PARITY_FILENAME)
+
+    def test_pp_grad_accum_parity(self):
+        run_test_script(TEST_FOLDER, PP_GRAD_ACCUM_PARITY_FILENAME)
