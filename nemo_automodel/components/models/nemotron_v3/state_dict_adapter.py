@@ -154,9 +154,9 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
         """Yield final-storage destinations for the single-device TE fallback.
 
         Args:
-            model_part: Nemotron V3 model whose ordinary parameters and grouped expert parameters are final load
-                destinations. Native input projections have shape [experts, hidden, expert_hidden], and native down
-                projections have shape [experts, expert_hidden, hidden].
+            model_part: Nemotron V3 model whose parameters and persistent buffers are final load destinations. Native
+                input projections have shape [experts, hidden, expert_hidden], and native down projections have shape
+                [experts, expert_hidden, hidden].
             device_mesh: Must be ``None``. Distributed expert parameters require a rank-symmetric group plan.
 
         Returns:
@@ -182,8 +182,8 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
         expert_groups: dict[str, _NemotronExpertGroupBuilder] = {}
         expected_expert_ids = set(range(moe_config.n_routed_experts))
 
-        for parameter_name, parameter in model_part.named_parameters():
-            native_name = canonical_parameter_fqn(parameter_name)
+        for state_name, state_tensor in model_part.state_dict(keep_vars=True).items():
+            native_name = canonical_parameter_fqn(state_name)
             # PEFT is applied before the base checkpoint is loaded. Its adapter parameters are intentionally absent
             # from the pretrained checkpoint and retain the initialization performed by initialize_model_weights().
             if "lora" in native_name:
@@ -208,9 +208,9 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
                         moe_config.expert_dim,
                     )
 
-                if tuple(parameter.shape) != expected_shape:
+                if tuple(state_tensor.shape) != expected_shape:
                     raise ValueError(
-                        f"Grouped expert parameter {native_name} has shape {tuple(parameter.shape)}, "
+                        f"Grouped expert parameter {native_name} has shape {tuple(state_tensor.shape)}, "
                         f"expected {expected_shape}"
                     )
 
@@ -218,7 +218,7 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
                     expert_root,
                     _NemotronExpertGroupBuilder(destinations={}, expert_ids_by_projection={}, native_keys=set()),
                 )
-                split_weights = self._split_experts_weights(parameter.detach(), moe_config.n_routed_experts)
+                split_weights = self._split_experts_weights(state_tensor.detach(), moe_config.n_routed_experts)
                 expert_ids = list(self._last_expert_ids)
                 for expert_id, expert_weight in zip(expert_ids, split_weights, strict=True):
                     checkpoint_name = self._native_key_to_hf(f"{expert_root}.{expert_id}.{projection_name}.weight")
@@ -241,7 +241,7 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
                 del split_weights
                 continue
 
-            destination = parameter.detach()
+            destination = state_tensor.detach()
             converted = self.convert_single_tensor_to_hf(native_name, destination, quantization=False)
             if len(converted) != 1:
                 raise ValueError(
