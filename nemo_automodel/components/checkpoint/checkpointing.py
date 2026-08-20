@@ -70,7 +70,7 @@ from nemo_automodel.components.checkpoint.conversion_mapping import (
     requires_tensor_merging,
 )
 from nemo_automodel.components.checkpoint.lifecycle import CheckpointLifecycle
-from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
+from nemo_automodel.components.checkpoint.state_dict_adapter import CheckpointLoadGroup, StateDictAdapter
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, OptimizerState
 from nemo_automodel.components.checkpoint.utils import (
     ensure_tied_lm_head,
@@ -760,6 +760,112 @@ class Checkpointer:
         self._do_load(state_dict, os.path.join(weights_path, "optim"))
         optimizer_state.load_state_dict(state_dict)
 
+    def _load_model_in_checkpoint_groups(
+        self,
+        model_state: ModelState,
+        adapter: StateDictAdapter,
+        model_path: str,
+        storage_reader: StorageReader,
+    ) -> None:
+        """Load one adapter-owned dependency group at a time.
+
+        Args:
+            model_state: Wrapper around the single model part whose final parameter storage is populated.
+            adapter: Model-owned adapter that maps checkpoint tensors into dependency-complete groups.
+            model_path: Hugging Face safetensors checkpoint directory.
+            storage_reader: Reader already bound to ``model_path``. Its metadata may be reused across groups.
+
+        Raises:
+            RuntimeError: If a group requests checkpoint keys that are missing or if the adapter yields no groups.
+            TypeError: If the adapter yields an object that is not a :class:`CheckpointLoadGroup`.
+            ValueError: If groups are empty or request the same checkpoint key more than once.
+        """
+        model_part = _unwrap_ddp_model(model_state.model[0])
+        ep_mesh_dims = [dim for dim in self.moe_mesh.mesh_dim_names if dim != "pp"] if self.moe_mesh is not None else []
+        ep_mesh = self.moe_mesh[tuple(ep_mesh_dims)] if ep_mesh_dims else self.moe_mesh
+        started = time.monotonic()
+        checkpoint_keys = _get_checkpoint_metadata_keys(model_path, storage_reader)
+        metadata_seconds = time.monotonic() - started
+
+        storage_seconds = 0.0
+        install_seconds = 0.0
+        requested_checkpoint_keys: set[str] = set()
+        loaded_native_keys: set[str] = set()
+        requested_bytes = 0
+        max_group_bytes = 0
+        group_count = 0
+
+        process_group = getattr(self, "process_group", None)
+        process_group_kwargs = {"process_group": process_group} if process_group is not None else {}
+
+        for group in adapter.iter_checkpoint_load_groups(model_part, device_mesh=ep_mesh):
+            if not isinstance(group, CheckpointLoadGroup):
+                raise TypeError(
+                    f"{type(adapter).__name__}.iter_checkpoint_load_groups yielded {type(group).__name__}, "
+                    "expected CheckpointLoadGroup"
+                )
+            if not group.destinations:
+                raise ValueError(f"{type(adapter).__name__} yielded an empty checkpoint load group")
+
+            group_keys = set(group.destinations)
+            duplicate_keys = sorted(group_keys & requested_checkpoint_keys)
+            if duplicate_keys:
+                raise ValueError(
+                    f"{type(adapter).__name__} requested {len(duplicate_keys)} checkpoint keys in multiple groups "
+                    f"(examples={duplicate_keys[:5]})"
+                )
+            missing_keys = sorted(group_keys - checkpoint_keys)
+            if missing_keys:
+                raise RuntimeError(
+                    f"Checkpoint {model_path} is missing {len(missing_keys)} keys required by streaming group "
+                    f"{group_count + 1} (examples={missing_keys[:5]})"
+                )
+
+            group_bytes = sum(estimate_tensor_bytes(tensor) for tensor in group.destinations.values())
+            requested_bytes += group_bytes
+            max_group_bytes = max(max_group_bytes, group_bytes)
+            requested_checkpoint_keys |= group_keys
+
+            storage_started = time.monotonic()
+            # The reader is already bound to ``model_path``. Omitting checkpoint_id prevents DCP from resetting it
+            # for every group, which lets the HF reader reuse parsed safetensors metadata.
+            dcp.load(group.destinations, storage_reader=storage_reader, **process_group_kwargs)
+            storage_seconds += time.monotonic() - storage_started
+
+            install_started = time.monotonic()
+            group.install()
+            install_seconds += time.monotonic() - install_started
+            loaded_native_keys |= set(group.native_keys)
+            group_count += 1
+
+            del group
+
+        if group_count == 0:
+            raise RuntimeError(
+                f"{type(adapter).__name__} opted into streaming checkpoint loading but yielded no groups"
+            )
+
+        if model_state.uses_tied_lm_head and not model_state.is_peft:
+            ensure_tied_lm_head(model_part)
+
+        total_seconds = time.monotonic() - started
+        requested_gb = requested_bytes / (1 << 30)
+        max_group_gb = max_group_bytes / (1 << 30)
+        logger.info(
+            "load_model: streamed %.2f GB in %d groups over %.2fs "
+            "(%.2f GB/s overall | max group %.2f GB, metadata %.2fs, storage read %.2fs, install %.2fs, "
+            "native keys %d)",
+            requested_gb,
+            group_count,
+            total_seconds,
+            requested_gb / max(total_seconds, 1e-9),
+            max_group_gb,
+            metadata_seconds,
+            storage_seconds,
+            install_seconds,
+            len(loaded_native_keys),
+        )
+
     @torch.no_grad()
     def load_model(
         self,
@@ -849,6 +955,30 @@ class Checkpointer:
             )
             and not self.config.dequantize_base_checkpoint
         )
+        supports_streaming_checkpoint_load = (
+            isinstance(state_dict_adapter, StateDictAdapter)
+            and state_dict_adapter.supports_streaming_checkpoint_load
+            and not self.config.dequantize_base_checkpoint
+        )
+        if (
+            is_init_step
+            and is_safetensors
+            and len(model_state.model) == 1
+            and world_size == 1
+            and supports_streaming_checkpoint_load
+            and not allow_checkpoint_key_subset
+        ):
+            storage_reader = self._get_storage_reader(
+                model_path,
+                key_mapping=None,
+                is_init_step=True,
+                is_safetensors=True,
+            )
+            if storage_reader is None:
+                raise RuntimeError(f"No safetensors storage reader is available for streaming load from {model_path}")
+            self._load_model_in_checkpoint_groups(model_state, state_dict_adapter, model_path, storage_reader)
+            return
+
         single_device_custom_safetensors = (
             is_safetensors and is_custom_model and world_size == 1 and not can_load_without_full_copy
         )
