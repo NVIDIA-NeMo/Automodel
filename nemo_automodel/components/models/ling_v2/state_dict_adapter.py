@@ -361,8 +361,10 @@ class BailingMoeV2StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapt
 
         for state_name, state_tensor in model_part.state_dict(keep_vars=True).items():
             native_name = canonical_parameter_fqn(state_name)
-            if "lora" in native_name:
+            if "lora" in native_name or native_name.endswith("._extra_state"):
                 continue
+            if not isinstance(state_tensor, torch.Tensor):
+                raise ValueError(f"Ling state entry {native_name} is {type(state_tensor).__name__}, expected Tensor")
 
             qkv_match = _NATIVE_LAYER_QKV_RE.match(native_name)
             if qkv_match is not None:

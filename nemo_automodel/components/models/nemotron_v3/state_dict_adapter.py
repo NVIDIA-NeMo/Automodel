@@ -186,8 +186,13 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
             native_name = canonical_parameter_fqn(state_name)
             # PEFT is applied before the base checkpoint is loaded. Its adapter parameters are intentionally absent
             # from the pretrained checkpoint and retain the initialization performed by initialize_model_weights().
-            if "lora" in native_name:
+            # Transformer Engine's runtime-only ``_extra_state`` records are likewise absent from HF checkpoints.
+            if "lora" in native_name or native_name.endswith("._extra_state"):
                 continue
+            if not isinstance(state_tensor, torch.Tensor):
+                raise ValueError(
+                    f"Nemotron V3 state entry {native_name} is {type(state_tensor).__name__}, expected Tensor"
+                )
 
             expert_match = _STREAMABLE_EXPERT_WEIGHT.match(native_name)
             if expert_match is not None:
