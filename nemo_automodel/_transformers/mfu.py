@@ -57,6 +57,7 @@ _DEVICE_FLOPS: dict[str, float] = {
     "910B": 354e12,
     "Ascend910": 354e12,
     "RTX 3070 Ti": 21.75e12,
+    "RTX PRO 6000": 503.8e12,
 }
 
 _UNIT_TO_SCALE = {
