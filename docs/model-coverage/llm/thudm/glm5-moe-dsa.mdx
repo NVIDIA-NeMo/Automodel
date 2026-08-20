@@ -103,7 +103,7 @@ cd Automodel
 uv sync --locked --all-groups --all-extras
 ```
 
-The cuDNN backend additionally requires FlashMLA's `flash_mla_sparse_fwd`, which is not
+The cuDNN backend also requires FlashMLA's `flash_mla_sparse_fwd`, which is not
 published as a complete source distribution on PyPI. Install the tested revision with its
 submodules before selecting `backend.attn: cudnn`:
 
