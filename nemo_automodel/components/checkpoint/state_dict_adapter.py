@@ -26,6 +26,19 @@ class StateDictAdapter(ABC):
     state dict format and other model state dict formats.
     """
 
+    _supports_write_through_checkpoint_load: bool = False
+
+    @property
+    def supports_write_through_checkpoint_load(self) -> bool:
+        """Whether all checkpoint-load destinations write through to final model storage.
+
+        Adapters should set ``_supports_write_through_checkpoint_load`` only when every tensor produced by
+        ``to_hf`` for base-checkpoint loading is either the original model tensor or a view that writes through
+        to it. The checkpoint loader uses this guarantee to avoid materializing a converted full state dict on
+        the host.
+        """
+        return self._supports_write_through_checkpoint_load
+
     @abstractmethod
     def to_hf(self, state_dict: dict[str, Any], **kwargs) -> dict[str, Any]:
         """Convert from native model state dict to HuggingFace format.
