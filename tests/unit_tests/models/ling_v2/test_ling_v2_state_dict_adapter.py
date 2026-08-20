@@ -12,13 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import weakref
+
 import pytest
 import torch
 
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.ling_v2.config import BailingMoeV2Config
+from nemo_automodel.components.models.ling_v2.model import BailingMoeV2ForCausalLM
 from nemo_automodel.components.models.ling_v2.state_dict_adapter import BailingMoeV2StateDictAdapter
 from nemo_automodel.components.moe.config import MoEConfig
+from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 
 
 @pytest.fixture
@@ -78,7 +82,7 @@ def backend_config():
         attn="sdpa",
         linear="torch",
         rms_norm="torch",
-        experts="torch",
+        experts="torch_mm",
         dispatcher="torch",
         enable_hf_state_dict_adapter=False,
     )
@@ -222,3 +226,97 @@ class TestRoundTrip:
                 hf_sd[f"model.layers.{L}.attention.dense.weight"],
             )
         torch.testing.assert_close(roundtripped["model.word_embeddings.weight"], hf_sd["model.word_embeddings.weight"])
+
+
+class TestStreamingLoadGroups:
+    def test_loads_fused_qkv_through_one_temporary_and_experts_through_final_views(
+        self,
+        adapter,
+        config,
+        moe_config,
+        backend_config,
+    ):
+        model = BailingMoeV2ForCausalLM(config=config, moe_config=moe_config, backend=backend_config)
+        parameters = {canonical_parameter_fqn(name): parameter for name, parameter in model.named_parameters()}
+        groups = adapter.iter_checkpoint_load_groups(model)
+        loaded_native_keys = set()
+
+        ordinary_group = next(groups)
+        loaded_native_keys.update(ordinary_group.native_keys)
+        assert "model.word_embeddings.weight" in ordinary_group.destinations
+        assert ordinary_group.destinations["model.word_embeddings.weight"].untyped_storage().data_ptr() == (
+            parameters["model.embed_tokens.weight"].untyped_storage().data_ptr()
+        )
+
+        pending_group = None
+        for layer_id in range(config.num_hidden_layers):
+            qkv_group = next(groups) if pending_group is None else pending_group
+            pending_group = None
+            checkpoint_name = f"model.layers.{layer_id}.attention.query_key_value.weight"
+            assert set(qkv_group.destinations) == {checkpoint_name}
+            loaded_native_keys.update(qkv_group.native_keys)
+
+            fused_qkv = qkv_group.destinations[checkpoint_name]
+            fused_values = torch.arange(fused_qkv.numel(), dtype=torch.float32).reshape(fused_qkv.shape)
+            fused_values = fused_values.to(fused_qkv.dtype)
+            fused_qkv.copy_(fused_values)
+            temporary_ref = weakref.ref(fused_qkv)
+            qkv_group.install()
+
+            q_size = config.num_attention_heads * config.head_dim
+            kv_size = config.num_key_value_heads * config.head_dim
+            torch.testing.assert_close(
+                parameters[f"model.layers.{layer_id}.self_attn.q_proj.weight"], fused_values[:q_size]
+            )
+            torch.testing.assert_close(
+                parameters[f"model.layers.{layer_id}.self_attn.k_proj.weight"],
+                fused_values[q_size : q_size + kv_size],
+            )
+            torch.testing.assert_close(
+                parameters[f"model.layers.{layer_id}.self_attn.v_proj.weight"], fused_values[q_size + kv_size :]
+            )
+
+            del fused_qkv, qkv_group
+            pending_group = next(groups)
+            assert temporary_ref() is None
+
+        expert_group = pending_group
+        assert expert_group is not None
+        loaded_native_keys.update(expert_group.native_keys)
+        gate_key = "model.layers.1.mlp.experts.0.gate_proj.weight"
+        gate_destination = expert_group.destinations[gate_key]
+        gate_destination.fill_(7.0)
+        expert_group.install()
+        grouped_gate_up = parameters["model.layers.1.mlp.experts.gate_and_up_projs"]
+        torch.testing.assert_close(
+            grouped_gate_up[0, :, : config.moe_intermediate_size],
+            torch.full_like(grouped_gate_up[0, :, : config.moe_intermediate_size], 7.0),
+        )
+
+        with pytest.raises(StopIteration):
+            next(groups)
+
+        assert loaded_native_keys == set(parameters)
+
+    def test_streaming_guards_backend_and_distributed_mesh(self, adapter, config, moe_config):
+        assert adapter.supports_streaming_checkpoint_load is True
+        with pytest.raises(ValueError, match="single-device"):
+            next(adapter.iter_checkpoint_load_groups(torch.nn.Linear(2, 2), device_mesh=object()))
+
+        unsupported_backend = BackendConfig(
+            attn="sdpa",
+            linear="torch",
+            rms_norm="torch",
+            experts="te",
+            dispatcher="deepep",
+            enable_hf_state_dict_adapter=False,
+        )
+        unsupported_adapter = BailingMoeV2StateDictAdapter(
+            config=config,
+            moe_config=moe_config,
+            backend=unsupported_backend,
+            dtype=torch.float32,
+        )
+        assert unsupported_adapter.supports_streaming_checkpoint_load is False
+        with pytest.raises(RuntimeError, match="does not support streaming"):
+            next(unsupported_adapter.iter_checkpoint_load_groups(torch.nn.Linear(2, 2)))
