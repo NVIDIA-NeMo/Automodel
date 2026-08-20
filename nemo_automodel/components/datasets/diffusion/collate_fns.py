@@ -115,9 +115,20 @@ def collate_fn_production(batch: List[Dict]) -> Dict:
                 sequence_length_multiple = 8 if key == "prompt_embeds" else 1
                 output[key] = _stack_or_pad_text_tensors(tensors, sequence_length_multiple=sequence_length_multiple)
                 if key == "prompt_embeds":
-                    sequence = torch.arange(output[key].shape[1])
-                    lengths = torch.tensor([tensor.shape[0] for tensor in tensors])
-                    output["prompt_embeds_mask"] = (sequence.unsqueeze(0) < lengths.unsqueeze(1)).long()
+                    if "prompt_embeds_mask" in batch[0]:
+                        # Real mask from preprocessing: pad it the same way as prompt_embeds
+                        # itself, so mask and embedding sequence axes stay aligned.
+                        mask_tensors = [item["prompt_embeds_mask"] for item in batch]
+                        output["prompt_embeds_mask"] = _stack_or_pad_text_tensors(
+                            mask_tensors, sequence_length_multiple=sequence_length_multiple
+                        ).long()
+                    else:
+                        # Older caches without a stored mask: fall back to marking every raw
+                        # (pre-padding) position as real. Only exact if the cached embeds were
+                        # already trimmed to the true prompt length.
+                        sequence = torch.arange(output[key].shape[1])
+                        lengths = torch.tensor([tensor.shape[0] for tensor in tensors])
+                        output["prompt_embeds_mask"] = (sequence.unsqueeze(0) < lengths.unsqueeze(1)).long()
             else:
                 output[key] = torch.stack(tensors)
 
