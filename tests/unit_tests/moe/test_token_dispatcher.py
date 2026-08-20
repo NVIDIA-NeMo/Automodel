@@ -12,12 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
 
-from nemo_automodel.components.moe.megatron.token_dispatcher import _HybridEPManager
+from nemo_automodel.components.moe.megatron.token_dispatcher import (
+    MoEFlexTokenDispatcher,
+    _DeepepManager,
+    _HybridEPManager,
+    _HybridEPMetadataProcessor,
+)
 
 
 @pytest.fixture
@@ -55,6 +61,17 @@ class TestIndicesToMultihot:
         assert multihot_probs[0, 3] == pytest.approx(0.4)
         assert multihot_probs[1, 1] == pytest.approx(0.7)
         assert multihot_probs[1, 5] == pytest.approx(0.3)
+
+    def test_scoped_processor_matches_existing_conversion(self, hybrid_ep_manager):
+        indices = torch.tensor([[0, 3], [1, -1]])
+        probs = torch.tensor([[0.6, 0.4], [0.7, 0.0]])
+        processor = _HybridEPMetadataProcessor(num_experts=8, permute_fusion=False)
+
+        expected = hybrid_ep_manager._indices_to_multihot(indices, probs)
+        actual = processor(indices, probs)
+
+        torch.testing.assert_close(actual[0], expected[0])
+        torch.testing.assert_close(actual[1], expected[1])
 
     def test_topk_1(self, hybrid_ep_manager):
         """Each token routed to exactly one expert."""
@@ -98,3 +115,20 @@ class TestIndicesToMultihot:
         assert routing_map.shape == (1, 8)
         assert routing_map.sum() == 2
         assert routing_map[0, 0] and routing_map[0, 7]
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_token_unpermutation_applies_async_setting_to_deepep_combine(enabled):
+    dispatcher = object.__new__(MoEFlexTokenDispatcher)
+    manager = object.__new__(_DeepepManager)
+    manager.get_restored_hidden_states_by_experts = Mock(side_effect=lambda tensor: tensor)
+    manager.combine = Mock(side_effect=lambda tensor, async_finish, allocate_on_comm_stream: tensor)
+    dispatcher._comm_manager = manager
+    dispatcher.config = SimpleNamespace(moe_deepep_async_dispatch=enabled)
+    dispatcher.hidden_shape = (2, 4)
+    hidden_states = torch.randn(2, 4)
+
+    actual = dispatcher.token_unpermutation(hidden_states)
+
+    torch.testing.assert_close(actual, hidden_states)
+    manager.combine.assert_called_once_with(hidden_states, enabled, enabled)

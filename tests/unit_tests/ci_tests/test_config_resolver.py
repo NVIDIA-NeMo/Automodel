@@ -99,33 +99,39 @@ def test_env_layer_skips_when_var_unset(monkeypatch):
 def test_computed_layer_substitutes_env(monkeypatch):
     monkeypatch.setenv("PIPELINE_DIR", "/p")
     monkeypatch.setenv("TEST_NAME", "t1")
-    entries = [{
-        "target": "checkpoint.checkpoint_dir",
-        "format": "{PIPELINE_DIR}/{TEST_NAME}/checkpoint",
-        "phases": ["nightly"],
-    }]
+    entries = [
+        {
+            "target": "checkpoint.checkpoint_dir",
+            "format": "{PIPELINE_DIR}/{TEST_NAME}/checkpoint",
+            "phases": ["nightly"],
+        }
+    ]
     assert config_resolver._resolve_computed_layer(entries, "nightly") == {
         "checkpoint.checkpoint_dir": "/p/t1/checkpoint",
     }
 
 
 def test_computed_layer_substitutes_date(monkeypatch):
-    entries = [{
-        "target": "wandb.project",
-        "format": "test-{date:%Y%m%d}",
-        "phases": ["convergence"],
-    }]
+    entries = [
+        {
+            "target": "wandb.project",
+            "format": "test-{date:%Y%m%d}",
+            "phases": ["convergence"],
+        }
+    ]
     result = config_resolver._resolve_computed_layer(entries, "convergence")
     today = datetime.now().strftime("%Y%m%d")
     assert result == {"wandb.project": f"test-{today}"}
 
 
 def test_computed_layer_phase_filter():
-    entries = [{
-        "target": "wandb.name",
-        "format": "x",
-        "phases": ["convergence"],
-    }]
+    entries = [
+        {
+            "target": "wandb.name",
+            "format": "x",
+            "phases": ["convergence"],
+        }
+    ]
     assert config_resolver._resolve_computed_layer(entries, "nightly") == {}
 
 
@@ -201,6 +207,7 @@ def test_conditional_layer_passes_non_string_values_through():
 
 
 RESOLVER = str(SCRIPTS_DIR / "config_resolver.py")
+REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
 @pytest.fixture
@@ -222,7 +229,9 @@ def synthetic_recipe(tmp_path: Path) -> Path:
 def _run_resolver(args: list[str], env: dict | None = None) -> subprocess.CompletedProcess:
     return subprocess.run(
         [sys.executable, RESOLVER, *args],
-        check=True, capture_output=True, text=True,
+        check=True,
+        capture_output=True,
+        text=True,
         env={**({} if env is None else env), "PATH": "/usr/bin:/bin"},
     )
 
@@ -274,7 +283,10 @@ def test_end_to_end_customizer_chat_path_wins(tmp_path):
 
     resolved = yaml.load(out.open())
     assert resolved["dataset"]["path_or_dataset_id"] == "/mnt/nci/datasets/customizer/sample-datasets/chat/train.jsonl"
-    assert resolved["validation_dataset"]["path_or_dataset_id"] == "/mnt/nci/datasets/customizer/sample-datasets/chat/validation.jsonl"
+    assert (
+        resolved["validation_dataset"]["path_or_dataset_id"]
+        == "/mnt/nci/datasets/customizer/sample-datasets/chat/validation.jsonl"
+    )
 
 
 def test_end_to_end_robustness_peft_disables_triton(tmp_path):
@@ -289,6 +301,37 @@ def test_end_to_end_robustness_peft_disables_triton(tmp_path):
     assert resolved["peft"]["use_triton"] is False
 
 
+def test_nemotron_flash_peft_robustness_keeps_supported_tp_topology(tmp_path):
+    """Flash checkpoint reload must not opt into unsupported TP and numerical resume drift."""
+    recipe_path = REPO_ROOT / "examples/llm_finetune/nemotron_flash/nemotron_flash_1b_squad_peft.yaml"
+    out = tmp_path / "resolved.yaml"
+    env = {"PIPELINE_DIR": str(tmp_path), "TEST_NAME": recipe_path.stem}
+    _run_resolver(
+        ["--base", str(recipe_path), "--phase", "checkpoint_robustness", "--output", str(out)],
+        env=env,
+    )
+
+    resolved = yaml.load(out.open())
+    assert resolved["distributed"]["tp_size"] == 1
+    assert "resume_first_loss_threshold" not in resolved["ci"]["checkpoint_robustness"]
+
+
+def test_qwen3_moe_lora_robustness_keeps_source_and_checkpoint_gates(tmp_path):
+    """Qwen MoE LoRA retains both source-load and checkpoint reload coverage."""
+    recipe_path = REPO_ROOT / "examples/llm_finetune/qwen/qwen3_moe_30b_lora.yaml"
+    out = tmp_path / "resolved.yaml"
+    env = {"PIPELINE_DIR": str(tmp_path), "TEST_NAME": recipe_path.stem}
+    _run_resolver(
+        ["--base", str(recipe_path), "--phase", "checkpoint_robustness", "--output", str(out)],
+        env=env,
+    )
+
+    robustness = yaml.load(out.open())["ci"]["checkpoint_robustness"]
+    assert robustness["check_source_load_parity"] is True
+    assert "skip_automodel_logit_parity" not in robustness
+    assert robustness["skip_hf_logit_parity"] is True
+
+
 def test_end_to_end_fixture_keys_not_applied_as_overrides(tmp_path):
     """Non-config fixture-arg keys in ci.checkpoint_robustness must not leak into the top-level config."""
     recipe = tmp_path / "llama_squad.yaml"
@@ -296,7 +339,17 @@ def test_end_to_end_fixture_keys_not_applied_as_overrides(tmp_path):
         "step_scheduler: {global_batch_size: 8}\n"
         "ci:\n"
         "  checkpoint_robustness:\n"
+        "    check_source_load_parity: true             # fixture arg, must NOT become top-level\n"
+        "    skip_automodel_logit_parity: true          # fixture arg, must NOT become top-level\n"
+        "    skip_hf_logit_parity: true                 # fixture arg, must NOT become top-level\n"
+        "    hf_adapter_ignored_key_prefix: base_model.model.mtp.  # fixture arg, must NOT become top-level\n"
         "    hf_kl_threshold: 5e-3                       # fixture arg, must NOT become top-level\n"
+        "    training_reproducibility_loss_threshold: 1e-2  # fixture arg, must NOT become top-level\n"
+        "    resume_tolerance_profile: relaxed             # fixture arg, must NOT become top-level\n"
+        "    resume_first_loss_threshold: 1e-6           # fixture arg, must NOT become top-level\n"
+        "    source_load_kl_threshold: 1e-2              # fixture arg, must NOT become top-level\n"
+        "    source_load_mean_kl_threshold: 1e-3         # fixture arg, must NOT become top-level\n"
+        "    source_load_cosine_threshold: 0.999         # fixture arg, must NOT become top-level\n"
         "    tokenizer_name: nvidia/Test                 # fixture arg, must NOT become top-level\n"
         "    dataset.limit_dataset_samples: 500          # dotted -> applied as override\n"
     )
@@ -310,8 +363,136 @@ def test_end_to_end_fixture_keys_not_applied_as_overrides(tmp_path):
     # Fixture args stay under ci.checkpoint_robustness for the consumer (pytest) to read,
     # and do NOT pollute the top level.
     assert "hf_kl_threshold" not in resolved
+    assert "check_source_load_parity" not in resolved
+    assert "skip_automodel_logit_parity" not in resolved
+    assert "skip_hf_logit_parity" not in resolved
+    assert "hf_adapter_ignored_key_prefix" not in resolved
+    assert "training_reproducibility_loss_threshold" not in resolved
+    assert "resume_tolerance_profile" not in resolved
+    assert "resume_first_loss_threshold" not in resolved
+    assert "source_load_kl_threshold" not in resolved
+    assert "source_load_mean_kl_threshold" not in resolved
+    assert "source_load_cosine_threshold" not in resolved
     assert "tokenizer_name" not in resolved
     assert resolved["ci"]["checkpoint_robustness"]["hf_kl_threshold"] == 5e-3
+    assert resolved["ci"]["checkpoint_robustness"]["check_source_load_parity"] is True
+    assert resolved["ci"]["checkpoint_robustness"]["skip_automodel_logit_parity"] is True
+    assert resolved["ci"]["checkpoint_robustness"]["skip_hf_logit_parity"] is True
+    assert resolved["ci"]["checkpoint_robustness"]["hf_adapter_ignored_key_prefix"] == "base_model.model.mtp."
+    assert resolved["ci"]["checkpoint_robustness"]["training_reproducibility_loss_threshold"] == 1e-2
+    assert resolved["ci"]["checkpoint_robustness"]["resume_tolerance_profile"] == "relaxed"
+    assert resolved["ci"]["checkpoint_robustness"]["resume_first_loss_threshold"] == 1e-6
+    assert resolved["ci"]["checkpoint_robustness"]["source_load_kl_threshold"] == 1e-2
+    assert resolved["ci"]["checkpoint_robustness"]["source_load_mean_kl_threshold"] == 1e-3
+    assert resolved["ci"]["checkpoint_robustness"]["source_load_cosine_threshold"] == 0.999
+
+
+@pytest.mark.parametrize(
+    "recipe_path",
+    [
+        "examples/vlm_finetune/gemma4/gemma4_2b.yaml",
+        "examples/vlm_finetune/gemma4/gemma4_26b_a4b_moe.yaml",
+        "examples/vlm_finetune/mistral/ministral3_3b_medpix.yaml",
+        "examples/vlm_finetune/mistral4/mistral4_medpix.yaml",
+        "examples/vlm_finetune/qwen3/qwen3_vl_moe_30b_te_deepep.yaml",
+        "examples/vlm_finetune/qwen3_5_moe/qwen3_5_35b.yaml",
+    ],
+)
+def test_vlm_checkpoint_robustness_recipes_resolve(tmp_path, recipe_path):
+    """VLM robustness opt-ins retain fixture settings and receive checkpoint phase defaults."""
+    out = tmp_path / "resolved.yaml"
+    env = {"PIPELINE_DIR": str(tmp_path), "TEST_NAME": Path(recipe_path).stem}
+    _run_resolver(
+        ["--base", str(REPO_ROOT / recipe_path), "--phase", "checkpoint_robustness", "--output", str(out)],
+        env=env,
+    )
+
+    resolved = yaml.load(out.open())
+    robustness = resolved["ci"]["checkpoint_robustness"]
+    assert resolved["checkpoint"]["enabled"] is True
+    assert resolved["checkpoint"]["model_save_format"] == "safetensors"
+    assert resolved["checkpoint"]["save_consolidated"] is True
+    if Path(recipe_path).stem == "gemma4_26b_a4b_moe":
+        # Opted out: source-load logit KL tracks the host's reduction order for
+        # this recipe's DeepEP MoE routing, not checkpoint integrity.
+        assert robustness["check_source_load_parity"] is False
+    else:
+        assert robustness["check_source_load_parity"] is True
+    assert robustness["tokenizer_name"] == resolved["model"]["pretrained_model_name_or_path"]
+    if Path(recipe_path).stem == "gemma4_26b_a4b_moe":
+        assert resolved["distributed"]["multimodal"]["frozen_sharding"] == "replicate"
+    pp_size = resolved["distributed"].get("pp_size", 1)
+    pp_microbatch_size = resolved["distributed"].get("pipeline", {}).get("pp_microbatch_size", 1)
+    assert resolved["step_scheduler"]["local_batch_size"] // pp_microbatch_size >= pp_size
+    if "/qwen" in recipe_path or "/mistral4/" in recipe_path:
+        assert robustness["hf_device_map_auto"] is True
+    if "/mistral4/" in recipe_path:
+        assert robustness["hf_source_post_load_dequantize"] is True
+        assert robustness["kl_threshold"] == 5e-2
+        assert robustness["source_load_kl_threshold"] == 1e-2
+        assert robustness["source_load_mean_kl_threshold"] == 2e-3
+        assert robustness["source_load_cosine_threshold"] == 0.999
+        assert robustness["hf_kl_threshold"] == 5e-2
+    if Path(recipe_path).stem == "qwen3_vl_moe_30b_te_deepep":
+        assert robustness["hf_kl_threshold"] == 2.5e-2
+        assert "resume_loss_threshold" not in robustness
+        assert robustness["training_reproducibility_loss_threshold"] == 2e-2
+        assert robustness["source_load_kl_threshold"] == 4e-2
+        assert robustness["source_load_mean_kl_threshold"] == 7e-3
+    if Path(recipe_path).stem == "qwen3_5_35b":
+        assert robustness["experts_implementation"] == "grouped_mm"
+        for key in (
+            "hf_keep_in_fp32_modules",
+            "resume_loss_threshold",
+        ):
+            assert key not in robustness
+        assert robustness["hf_kl_threshold"] == 1e-1
+        assert robustness["source_load_cosine_threshold"] == 0.9985
+        assert robustness["source_load_kl_threshold"] == 1e-1
+        assert robustness["source_load_mean_kl_threshold"] == 1e-2
+        assert resolved["loss_fn"]["_target_"] == ("nemo_automodel.components.loss.chunked_ce.ChunkedCrossEntropy")
+        assert resolved["model"]["backend"]["experts"] == "torch_mm"
+        assert resolved["step_scheduler"]["global_batch_size"] == 16
+        assert resolved["step_scheduler"]["local_batch_size"] == 1
+    assert "known_issue_id" not in resolved["ci"]
+    assert "allow_failure" not in resolved["ci"]
+    assert "check_source_load_parity" not in resolved
+    assert "hf_device_map_auto" not in resolved
+    assert "hf_source_post_load_dequantize" not in resolved
+    assert "tokenizer_name" not in resolved
+
+
+def test_retrieval_checkpoint_robustness_retains_calibrated_resume_threshold(tmp_path):
+    """Retrieval robustness keeps its shared-trajectory and independent-run envelopes distinct."""
+    recipe_path = "examples/retrieval/bi_encoder/nemotron_vl_1b/nemotron_vl_1b_example.yaml"
+    out = tmp_path / "resolved.yaml"
+    env = {"PIPELINE_DIR": str(tmp_path), "TEST_NAME": Path(recipe_path).stem}
+    _run_resolver(
+        ["--base", str(REPO_ROOT / recipe_path), "--phase", "checkpoint_robustness", "--output", str(out)],
+        env=env,
+    )
+
+    robustness = yaml.load(out.open())["ci"]["checkpoint_robustness"]
+    assert robustness["resume_loss_threshold"] == 5e-2
+    assert robustness["training_reproducibility_loss_threshold"] == 5e-2
+
+
+@pytest.mark.parametrize(
+    "recipe_path",
+    [
+        "examples/long_context_validation/gemma4_31B/gemma4_31b_base_coderforge_cp8_64k_1e5_800steps.yaml",
+        "examples/vlm_finetune/gemma4/gemma4_31b_tulu3_text_cp8_16k.yaml",
+        "examples/vlm_finetune/gemma4/gemma4_e4b_tulu3_text_cp16_64k.yaml",
+        "examples/vlm_finetune/gemma4_joint_drafter/gemma4_4b_joint_drafter_tulu_magicoder_mix.yaml",
+        "examples/vlm_finetune/gemma4_joint_drafter/gemma4_31b_joint_drafter_tulu_magicoder_mix.yaml",
+    ],
+)
+def test_rank_uniform_text_only_vlm_recipes_opt_into_per_layer(recipe_path):
+    """Text-only recipes may retain the faster legacy sharding when every rank skips the frozen tower."""
+    resolved = yaml.load((REPO_ROOT / recipe_path).read_text())
+
+    assert resolved["freeze_config"]["freeze_vision_tower"] is True
+    assert resolved["distributed"]["multimodal"]["frozen_sharding"] == "per_layer"
 
 
 def test_end_to_end_dry_run_does_not_write(tmp_path, synthetic_recipe):

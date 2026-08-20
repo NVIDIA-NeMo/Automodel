@@ -34,36 +34,12 @@ from nemo_automodel.components.attention.ffpa_attention import (
     _ffpa_varlen_fwd,
     _ffpa_varlen_ready,
 )
+from nemo_automodel.shared.torch_patches import (
+    patch_fsdp_accumulated_grad_guard as _patch_fsdp_accumulated_grad_guard,
+)
 
 logger = logging.getLogger(__name__)
 _GEMMA4_CP_FLEX_RING_OK_LOGGED = False
-
-
-def _patch_fsdp_accumulated_grad_guard() -> None:
-    """Guard ``FSDPParam.to_accumulated_grad_if_needed`` against uninitialized params.
-
-    On some torch builds that method reads ``self._unsharded_param`` (the lazily
-    set unsharded tensor) without first checking it exists. In FSDP2 post-backward
-    under fp32 grad-reduce, frozen / never-unsharded params (e.g. the frozen Gemma4
-    vision tower and embeddings) have no ``_unsharded_param`` yet and it raises
-    ``AttributeError``. Such params carry no grad to upcast anyway, so wrap the
-    method to skip them when uninitialized. No-op once applied / on fixed builds.
-    """
-    try:
-        from torch.distributed.fsdp._fully_shard._fsdp_param import FSDPParam
-    except Exception:
-        return
-    orig = FSDPParam.to_accumulated_grad_if_needed
-    if getattr(orig, "_gemma4_guarded", False):
-        return
-
-    def guarded(self):
-        if not hasattr(self, "_unsharded_param"):
-            return
-        return orig(self)
-
-    guarded._gemma4_guarded = True
-    FSDPParam.to_accumulated_grad_if_needed = guarded
 
 
 _patch_fsdp_accumulated_grad_guard()
@@ -1223,7 +1199,7 @@ def _gemma4_cp_manual_attention(
 ) -> torch.Tensor:
     """Gemma4-owned manual ring CP attention entry.
 
-    Plugs into cp_utils' generic ``run_cp_manual_attention`` seam: receives the
+    Plugs into context_parallel.utils' generic ``run_cp_manual_attention`` seam: receives the
     raw local (un-gathered) Q/K/V plus ``cp_mesh``, builds the ring context, and
     runs the p2p ring FlexAttention. K/V are rotated across CP ranks inside the
     ring autograd function -- they are never all-gathered.
@@ -1266,7 +1242,7 @@ def _gemma4_cp_manual_attention(
 def _install_gemma4_cp_ring_sdpa(attention_module: torch.nn.Module, cp_mesh) -> None:
     """Swap ``F.scaled_dot_product_attention`` -> Gemma4 ring CP attention on this module.
 
-    Gemma4 owns its CP attention end-to-end (it does not use cp_utils' generic CP
+    Gemma4 owns its CP attention end-to-end (it does not use context_parallel.utils' generic CP
     SDPA hooks). It installs its own ``@torch._dynamo.disable`` SDPA wrapper -- on
     the inner attention module so it also fires during gradient-checkpointing
     recompute -- that runs the p2p ring FlexAttention. The per-forward attention
@@ -1336,7 +1312,7 @@ def attach_gemma4_cp_ring_attention(
 
     Declares the metadata keys the ring needs and exposes ``setup_cp_attention(cp_mesh)``
     -- the model-owned CP-attention seam the parallelizer calls (with the CP mesh)
-    instead of cp_utils' generic SDPA hooks. ``run_cp_manual_attention`` is also bound
+    instead of context_parallel.utils' generic SDPA hooks. ``run_cp_manual_attention`` is also bound
     as the ring entry point.
 
     ``use_ffpa`` opts the (full-attention, head_dim=512) ring chunks into the FFPA

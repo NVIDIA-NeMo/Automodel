@@ -56,22 +56,21 @@ tokenizer:
   max_input_tiles: 2
 
 
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.retrieval_dataset.RetrievalDatasetConfig
+  model_type: bi_encoder
+  data_dir_list:
+    - path: <DATASETS_PATH>/automodel_colpali/training_datasets/colpali_train.json
+      num_samples: 5000
+    - path: hf://nvidia/embed-nemotron-dataset-v1/MIRACL
+      num_samples: 5000
+  data_type: train
+  n_passages: 5
+  seed: 42
+
 dataloader:
-  _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  dataset:
-    _target_: nemo_automodel.components.datasets.llm.make_retrieval_dataset
-    model_type: bi_encoder
-    data_dir_list:
-      - path: <DATASETS_PATH>/automodel_colpali/training_datasets/colpali_train.json 
-        num_samples: 5000
-      - path: hf://nvidia/embed-nemotron-dataset-v1/MIRACL
-        num_samples: 5000
-    data_type: train
-    n_passages: 5
-    seed: 42
-    do_shuffle: true
   collate_fn:
-    _target_: nemo_automodel.components.datasets.llm.make_vision_collator_from_processor_method
+    _target_: nemo_automodel.components.datasets.llm.ProcessorMethodCollator
     collator_fn_name: process_queries_documents_biencoder
   shuffle: true
   num_workers: 4
@@ -109,3 +108,35 @@ wandb:
   name: nemotron_vl_1b_embedding_example
   enable: false
   #save_dir: <your_wandb_save_dir> 
+
+ci:
+  recipe_owner: yuhez
+  time: "00:45:00"
+  nodes: 1
+  nightly:
+    # CI uses the public text corpus; checkpoint robustness separately tests
+    # vanilla-HF reload with both text and image inputs.
+    dataset.data_dir_list:
+      - path: hf://nvidia/embed-nemotron-dataset-v1/MIRACL
+        num_samples: 5000
+    dataloader.num_workers: 0
+    lr_scheduler.lr_warmup_steps: 2
+  checkpoint_robustness:
+    dataset.data_dir_list:
+      - path: hf://nvidia/embed-nemotron-dataset-v1/MIRACL
+        num_samples: 5000
+    dataloader.num_workers: 0
+    lr_scheduler.lr_warmup_steps: 1
+    step_scheduler.global_batch_size: 8
+    step_scheduler.local_batch_size: 1
+    cosine_threshold: 0.999
+    hf_cosine_threshold: 0.999
+    check_hf_reload: true
+    check_resume: true
+    # Shared-trajectory CI observed later-step loss deltas of 0.0137 and 0.0215.
+    # Keep the exact first resumed step strict, but allow BF16 distributed
+    # contrastive-loss drift to accumulate across the following optimizer steps.
+    resume_loss_threshold: 5e-2
+    # Independently calibrated normal-run comparison; non-blocking and
+    # separate from shared-trajectory resume correctness.
+    training_reproducibility_loss_threshold: 5e-2

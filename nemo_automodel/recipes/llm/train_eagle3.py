@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-import json
+import copy
 import logging
 import os
 import pathlib
@@ -36,8 +36,11 @@ from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
 from nemo_automodel.components.checkpoint.checkpointing import (
     CheckpointingConfig,
     load_hf_safetensors_state_dict,
+    load_torch_ckpt,
     save_config,
+    save_losses,
 )
+from nemo_automodel.components.checkpoint.utils import find_latest_checkpoint, resolve_restore_from_to_checkpoint_dir
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.llm.eagle3 import (
     build_eagle3_dataloader,
@@ -51,6 +54,8 @@ from nemo_automodel.components.distributed.init_utils import initialize_distribu
 from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.wandb_utils import init_wandb_run, suppress_wandb_log_messages
+from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.kimi_k3.config import KimiK3TextConfig
 from nemo_automodel.components.speculative.decode_eval import DecodeEvalRunner, resolve_decode_eval_config
 from nemo_automodel.components.speculative.eagle import (
     Eagle3TrainerModule,
@@ -63,12 +68,7 @@ from nemo_automodel.components.speculative.regen_loop import RegenRunner, resolv
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.utils.model_utils import print_trainable_parameters
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config
-from nemo_automodel.recipes.base_recipe import (
-    BaseRecipe,
-    _find_latest_checkpoint,
-    _is_checkpoint_model_config_compatible,
-    _resolve_restore_from_to_ckpt_dir,
-)
+from nemo_automodel.recipes.base_recipe import BaseRecipe, _is_checkpoint_model_config_compatible
 from nemo_automodel.recipes.llm._spec_train_utils import (
     apply_draft_compile,
     apply_draft_fp8,
@@ -79,6 +79,84 @@ from nemo_automodel.recipes.llm._spec_train_utils import (
 from nemo_automodel.recipes.llm.peagle_recipe import PeagleRecipeMixin
 
 logger = logging.getLogger(__name__)
+
+# Kimi K3 text backbone. Dispatch keys on the *text* config, which both a text-only
+# checkpoint and the text sub-config of a vision-language one report as "kimi_linear".
+# Read it from the config class so a rename stays in sync.
+KIMI_K3_MODEL_TYPE = KimiK3TextConfig.model_type
+
+
+def _validate_kimi_k3_gates(
+    *,
+    backend: str,
+    cp_size: int,
+    tp_size: int,
+    pp_size: int,
+    packed_sequence_size: int,
+    parallel_drafting: bool,
+    target_force_hf: bool,
+) -> None:
+    """Reject the combinations a Kimi K3 target cannot serve, before it is loaded.
+
+    Args:
+        backend: ``recipe_args.target_model_backend``.
+        cp_size: ``distributed.cp_size``.
+        tp_size: ``distributed.tp_size``.
+        pp_size: ``distributed.pp_size``.
+        packed_sequence_size: ``recipe_args.packed_sequence_size``.
+        parallel_drafting: ``recipe_args.parallel_drafting`` (P-EAGLE).
+        target_force_hf: ``recipe_args.target_force_hf``.
+    """
+    if backend != "colocated":
+        # Only the colocated path builds K3 through its expert-parallel custom impl;
+        # SGLang / vLLM / serve_target have no Kimi K3 implementation to serve.
+        raise NotImplementedError(
+            f"Kimi K3 EAGLE-3 training requires target_model_backend='colocated', got {backend!r}."
+        )
+    if target_force_hf:
+        raise ValueError("target_force_hf is not supported for Kimi K3: there is no HuggingFace implementation.")
+    if cp_size > 1 or tp_size > 1:
+        # The EAGLE-3 CP path shards the target by intercepting its
+        # ``F.scaled_dot_product_attention`` call, which K3 does not make: it owns
+        # context parallelism end to end. K3 declares ``supports_tp=False``.
+        raise NotImplementedError(
+            "Kimi K3 EAGLE-3 training supports neither context nor tensor parallelism; "
+            "shard the target with expert parallelism (distributed.ep_size) and set cp_size=tp_size=1."
+        )
+    if pp_size > 1:
+        # Online supervision hooks one complete target forward: a pipelined target holds
+        # only its stage's layers (keyed by global index), so aux-layer capture either
+        # raises a KeyError or silently captures nothing.
+        raise NotImplementedError(
+            "Pipeline parallelism (distributed.pp_size > 1) is not supported for the Kimi K3 "
+            "EAGLE-3 target; the aux hidden states are captured from one non-pipelined forward."
+        )
+    if packed_sequence_size > 0:
+        # K3 owns packed attention itself (its document layout comes from the 2D mask /
+        # cu_seqlens), while the EAGLE-3 wrapper hands packed batches a [B, 1, T, T]
+        # block-causal mask that K3's forward does not accept.
+        raise NotImplementedError(
+            "Sequence packing (packed_sequence_size > 0) is not supported for the Kimi K3 EAGLE-3 target."
+        )
+    if parallel_drafting:
+        raise NotImplementedError("Parallel drafting (P-EAGLE) is not implemented for the Kimi K3 draft.")
+
+
+def _build_kimi_k3_target_backend(recipe_cfg) -> BackendConfig:
+    """Build the backend used by the frozen expert-parallel Kimi K3 target."""
+    return BackendConfig(
+        attn=str(recipe_cfg.get("target_attn_backend", "eager")),
+        linear="torch",
+        rms_norm="torch_fp32",
+        rope_fusion=False,
+        # ``torch`` is the dispatcher K3's own SFT reference config runs expert parallelism
+        # with; the DeepEP-family dispatchers need a matching DeepEP build, so they are opt-in
+        # through ``target_dispatcher`` rather than the default.
+        dispatcher=str(recipe_cfg.get("target_dispatcher", "torch")),
+        experts=str(recipe_cfg.get("target_experts", "torch_mm")),
+        enable_hf_state_dict_adapter=True,
+        enable_fsdp_optimizations=bool(recipe_cfg.get("target_enable_fsdp_optimizations", True)),
+    )
 
 
 def _all_reduce_mean(value: torch.Tensor) -> torch.Tensor:
@@ -409,6 +487,14 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         # ``DraftSpec``) in ``components/speculative/eagle/registry.py``;
         # no recipe change required.
         draft_spec = resolve_eagle3_draft_spec(architectures)
+        # The EAGLE-3 draft mirrors only the text decoder. For a multimodal target
+        # that config is nested under ``text_config`` (a top-level ``Gemma4Config``
+        # has no ``vocab_size`` / ``hidden_size`` / ``num_hidden_layers`` at all);
+        # text-only targets have none, so fall back to the config itself. Every
+        # draft-side dimension (vocab_size, hidden_size, heads, head_dim, rope, ...)
+        # is read from this base config.
+        _text_config = getattr(target_config, "text_config", None)
+        draft_base_config = _text_config if _text_config is not None else target_config
 
         self.tokenizer = NeMoAutoTokenizer.from_pretrained(
             target_path,
@@ -441,7 +527,9 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         self.cp_mesh = None
         self.dp_mesh = None
         if self.cached_target_path is None:
-            selected_token_ids, selected_token_mask = self._setup_online_target(recipe_cfg, target_path, target_config)
+            selected_token_ids, selected_token_mask = self._setup_online_target(
+                recipe_cfg, target_path, draft_base_config
+            )
         else:
             # The cached-target path never builds a cp mesh (only the colocated
             # target does), so cp_size>1 here would silently fall back to plain DP
@@ -451,11 +539,11 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                     "Context parallelism (cp_size>1) is not supported with a cached target; the "
                     "cached path does not build a cp mesh. Use the colocated target or set cp_size=1."
                 )
-            selected_token_ids, selected_token_mask = self._setup_cached_target(recipe_cfg, target_config)
+            selected_token_ids, selected_token_mask = self._setup_cached_target(recipe_cfg, draft_base_config)
 
-        draft_config = target_config.to_dict()
+        draft_config = draft_base_config.to_dict()
         draft_config["draft_vocab_size"] = int(selected_token_ids.numel())
-        draft_config["target_hidden_size"] = target_config.hidden_size
+        draft_config["target_hidden_size"] = draft_base_config.hidden_size
         draft_config["architectures"] = ["LlamaEagle3DraftModel"]
         # The draft owns an independent ``lm_head`` whose vocab can differ
         # from ``embed_tokens`` (vocab shrinking, ``draft_vocab_size <
@@ -492,16 +580,16 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         draft_config["parallel_drafting"] = parallel_drafting
         mask_token_id = None
         if parallel_drafting:
-            mask_token_id = self._configure_peagle_draft_config(recipe_cfg, draft_config, target_config)
+            mask_token_id = self._configure_peagle_draft_config(recipe_cfg, draft_config, draft_base_config)
         # Cast to the target's compute dtype so every linear / embedding / norm
         # in the draft matches the bf16 (cuda) or fp32 (cpu) hidden states fed
         # in from the target. Without this, ``initialize_rms_norm_module`` defaults
         # to bf16 while ``nn.Linear`` defaults to fp32, and ``model.fc`` errors
         # with ``expected mat1 and mat2 to have the same dtype``.
-        # Reuse the target's concrete config class (LlamaConfig / Phi3Config / ...)
-        # so architecture-specific defaults like attention_bias and head_dim
-        # flow into the draft.
-        draft_config_obj = type(target_config).from_dict(draft_config)
+        # Reuse the base config's concrete class (LlamaConfig / Phi3Config /
+        # Gemma4TextConfig / ...) so architecture-specific defaults like
+        # attention_bias and head_dim flow into the draft.
+        draft_config_obj = type(draft_base_config).from_dict(draft_config)
         self.draft_model = draft_spec.draft_cls(draft_config_obj).to(device=self.device, dtype=self.compute_dtype)
         # Seed draft embeddings from the target: directly from the live target,
         # or from the embeddings stored alongside the offline cache.
@@ -848,7 +936,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             )
         return True
 
-    def _setup_online_target(self, recipe_cfg, target_path, target_config):
+    def _setup_online_target(self, recipe_cfg, target_path, draft_base_config):
         """Live path: load the target model and build the live dataloader.
 
         Sets ``self.target_model`` / ``self.target_wrapper`` /
@@ -898,6 +986,19 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             cp_zigzag=bool(recipe_cfg.get("cp_zigzag", False)),
         )
         _validate_tp_gates(tp_size, backend, cp_size)
+        # ``draft_base_config`` is None on the paths that never build a draft
+        # (the non-colocated backends dispatch before reading it), so the K3
+        # gate has to tolerate its absence.
+        if getattr(draft_base_config, "model_type", None) == KIMI_K3_MODEL_TYPE:
+            _validate_kimi_k3_gates(
+                backend=backend,
+                cp_size=cp_size,
+                tp_size=tp_size,
+                pp_size=int(self.cfg.get("distributed.pp_size", 1) or 1),
+                packed_sequence_size=int(packed_sequence_size or 0),
+                parallel_drafting=bool(recipe_cfg.get("parallel_drafting", False)),
+                target_force_hf=bool(recipe_cfg.get("target_force_hf", False)),
+            )
         if backend == "remote":
             self._setup_remote_target(recipe_cfg)
         elif backend == "sglang":
@@ -905,7 +1006,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         elif backend == "vllm":
             self._setup_vllm_target(recipe_cfg, target_path)
         else:  # colocated
-            self._setup_colocated_target(recipe_cfg, target_path)
+            self._setup_colocated_target(recipe_cfg, target_path, draft_base_config)
 
         self.train_dataloader = self._build_train_dataloader(
             recipe_cfg.train_data_path,
@@ -942,7 +1043,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         # mapping -- so the cache only matters for cold starts.
         selected_token_ids, selected_token_mask = load_or_build_eagle3_token_mapping(
             self.train_dataloader,
-            target_vocab_size=target_config.vocab_size,
+            target_vocab_size=draft_base_config.vocab_size,
             draft_vocab_size=recipe_cfg.get("draft_vocab_size", None),
             special_token_ids=special_token_ids,
             cache_path=recipe_cfg.get("selected_token_ids_path", None),
@@ -953,7 +1054,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         self.target_wrapper.set_vocab_mapping(selected_token_ids, selected_token_mask)
         return selected_token_ids, selected_token_mask
 
-    def _setup_colocated_target(self, recipe_cfg, target_path):
+    def _setup_colocated_target(self, recipe_cfg, target_path, draft_base_config):
         """Load the target on this GPU and capture supervision in-process."""
         # Optional ``distributed:`` YAML section. Required for targets that do
         # not fit on a single GPU (e.g. Qwen3-30B-A3B MoE). ``force_hf`` is
@@ -987,7 +1088,10 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             target_kwargs.update(
                 distributed_setup=self.dist_setup,
             )
-        self.target_model = NeMoAutoModelForCausalLM.from_pretrained(target_path, **target_kwargs)
+        if draft_base_config.model_type == KIMI_K3_MODEL_TYPE:
+            self.target_model = self._load_kimi_k3_target(recipe_cfg, target_path, draft_base_config)
+        else:
+            self.target_model = NeMoAutoModelForCausalLM.from_pretrained(target_path, **target_kwargs)
         # ``nn.Module.to`` is in-place; reassigning ``self.target_model`` would
         # re-trigger ``BaseRecipe.__setattr__`` state-tracking and raise.
         if self.dist_setup is None:
@@ -1001,6 +1105,50 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             self.target_model,
             aux_layer_ids=recipe_cfg.get("aux_layer_ids", None),
             cp_mesh=self.cp_mesh,
+        )
+
+    def _load_kimi_k3_target(self, recipe_cfg, target_path, text_config):
+        """Load Kimi K3 as a frozen expert-parallel target.
+
+        Kimi K3 has no HuggingFace implementation and its 896 routed experts do not
+        fit on one GPU, so the target is built from the (possibly nested) text config
+        through AutoModel's custom path with an explicit expert-parallel backend
+        instead of the generic ``from_pretrained`` call. The EAGLE-3 draft only ever
+        consumes the text decoder's hidden states, so a vision-language checkpoint is
+        loaded as its text-only ``KimiK3ForCausalLM``.
+
+        Args:
+            recipe_cfg: ``recipe_args`` config node.
+            target_path: Checkpoint path or hub id of the frozen target.
+            text_config: The target's text config (``config.text_config`` when the
+                checkpoint is vision-language, otherwise the config itself).
+
+        Returns:
+            The frozen Kimi K3 target model.
+        """
+        if self.device.type != "cuda":
+            raise RuntimeError(
+                "Kimi K3 EAGLE-3 target requires CUDA: the target is loaded with the "
+                "expert-parallel / FSDP distributed path."
+            )
+        if self.dist_setup is None:
+            raise ValueError(
+                "Kimi K3 EAGLE-3 training requires a `distributed:` section (the target's "
+                "routed experts are sharded with expert parallelism); none was configured."
+            )
+        # The loaded target config is the recipe's own draft base config, so build the
+        # target from a copy: the draft config is serialized into the draft's config.json
+        # and must not inherit the target's architecture / checkpoint path.
+        target_config = copy.deepcopy(text_config)
+        target_config.architectures = ["KimiK3ForCausalLM"]
+        target_config.name_or_path = target_path
+        return NeMoAutoModelForCausalLM.from_config(
+            config=target_config,
+            backend=_build_kimi_k3_target_backend(recipe_cfg),
+            distributed_setup=self.dist_setup,
+            load_base_model=True,
+            torch_dtype=self.compute_dtype,
+            trust_remote_code=recipe_cfg.get("trust_remote_code", False),
         )
 
     def _setup_sglang_target(self, recipe_cfg, target_path):
@@ -1115,7 +1263,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             logger.info("Capping target_prefetch_depth %d -> %d (one in-flight request per server).", depth, capped)
         return capped
 
-    def _setup_cached_target(self, recipe_cfg, target_config):
+    def _setup_cached_target(self, recipe_cfg, draft_base_config):
         """Offline path: stream a precomputed cache; no target model is loaded.
 
         Reads the cache manifest for the draft-vocab mapping and loads the stored
@@ -1128,24 +1276,24 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         self.target_model = None
         self.target_wrapper = None
         manifest = read_manifest(self.cached_target_path)
-        if int(manifest["target_vocab_size"]) != int(target_config.vocab_size):
+        if int(manifest["target_vocab_size"]) != int(draft_base_config.vocab_size):
             raise ValueError(
                 f"EAGLE-3 cache at {self.cached_target_path} was built for target_vocab_size="
-                f"{manifest['target_vocab_size']}, but the configured target has {target_config.vocab_size}. "
+                f"{manifest['target_vocab_size']}, but the configured target has {draft_base_config.vocab_size}. "
                 "The cache does not match this target."
             )
         # The draft's ``fc`` consumes ``target_hidden_size * 3`` aux features; a
         # cache from a different-width target would otherwise crash deep inside
         # ``fc`` with a confusing shape error.
-        expected_aux_dim = int(target_config.hidden_size) * 3
+        expected_aux_dim = int(draft_base_config.hidden_size) * 3
         if int(manifest["aux_hidden_dim"]) != expected_aux_dim:
             raise ValueError(
                 f"EAGLE-3 cache at {self.cached_target_path} has aux_hidden_dim={manifest['aux_hidden_dim']}, "
-                f"but the configured target needs {expected_aux_dim} (hidden_size {target_config.hidden_size} x 3 "
+                f"but the configured target needs {expected_aux_dim} (hidden_size {draft_base_config.hidden_size} x 3 "
                 "aux layers). The cache was built for a different target."
             )
         selected_token_ids = torch.tensor(manifest["selected_token_ids"], dtype=torch.long)
-        selected_token_mask = torch.zeros(int(target_config.vocab_size), dtype=torch.bool)
+        selected_token_mask = torch.zeros(int(draft_base_config.vocab_size), dtype=torch.bool)
         selected_token_mask[selected_token_ids] = True
         self._cached_embed_source = SimpleNamespace(weight=read_target_embeddings(self.cached_target_path))
 
@@ -1358,6 +1506,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             pp_rank=0,
             moe_mesh=None,
         )
+        self._log_checkpoint_retention_policy(self.checkpoint_config)
 
     def _module(self):
         return (
@@ -1390,36 +1539,18 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         if checkpointer is None or not checkpointer.config.enabled:
             return
         self.checkpointer.async_wait()
-
-        prev_pending = getattr(self, "_last_pending_checkpoint_dir", None)
-        prev_best_pending = getattr(self, "_last_pending_best_checkpoint_info", None)
+        self.checkpointer.lifecycle.complete_pending()
 
         ckpt_root = self.checkpoint_config.checkpoint_dir
         path = os.path.join(str(ckpt_root), f"epoch_{epoch}_step_{step}")
         is_dist_initialized = dist.is_initialized()
         is_rank_0 = (not is_dist_initialized) or dist.get_rank() == 0
-        best_val_metric = (
-            val_loss.get(next(iter(val_loss.keys())) if len(val_loss) == 1 else best_metric_key) if val_loss else None
-        )
+        best_metric_name = next(iter(val_loss.keys())) if val_loss and len(val_loss) == 1 else best_metric_key
+        best_val_metric = val_loss.get(best_metric_name) if val_loss else None
 
-        if prev_pending is not None:
-            if is_rank_0:
-                self._update_latest_symlink(prev_pending)
-            setattr(self, "_last_pending_checkpoint_dir", None)
-            if is_dist_initialized:
-                dist.barrier()
-
-        if prev_best_pending is not None:
-            if is_rank_0 and prev_best_pending.get("val") is not None:
-                self._update_best_symlink(prev_best_pending["path"], float(prev_best_pending["val"]))
-            setattr(self, "_last_pending_best_checkpoint_info", None)
-            if is_dist_initialized:
-                dist.barrier()
+        self.checkpointer.lifecycle.reserve(path)
 
         if is_rank_0:
-            if os.path.exists(path):
-                raise FileExistsError(f"Checkpoint directory {path} already exists")
-            os.makedirs(path, exist_ok=True)
             loss_dict: dict[str, float] = {}
             if train_loss is not None:
                 loss_dict["train_loss"] = float(train_loss)
@@ -1427,8 +1558,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                 for k, v in val_loss.items():
                     loss_dict[k] = float(v)
             if loss_dict:
-                with open(os.path.join(path, "losses.json"), "w") as f:
-                    json.dump(loss_dict, f)
+                save_losses(loss_dict, path)
         if is_dist_initialized:
             dist.barrier()
 
@@ -1448,28 +1578,36 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             merged_dir = _export_merged_lora_draft(draft_model, path)
             logger.info("LoRA final checkpoint: merged consolidated draft exported to %s", merged_dir)
         self.checkpointer.save_optimizer(self.optimizer, draft_model, path, self.lr_scheduler)
-        self.checkpointer.save_on_dp_ranks(self.rng, "rng", path)
+        self.checkpointer.save_on_global_ranks(self.rng, "rng", path)
 
-        if is_rank_0:
+        # Rank-0 writes followed by collectives, so they go through the same guard:
+        # a failure here must abort every rank rather than only this one.
+        def write_recipe_metadata() -> None:
             self._save_extra_state(path, epoch=epoch)
             try:
                 save_config(self.cfg.raw_config, path)
             except (AttributeError, OSError) as e:
                 logger.warning("Failed to save config snapshot: %s", e)
+
+        self.checkpointer.lifecycle.run_coordinator_step(
+            write_recipe_metadata,
+            description=f"write recipe metadata to {path}",
+        )
         if is_dist_initialized:
             dist.barrier()
 
         if getattr(self.checkpointer.config, "is_async", False):
-            setattr(self, "_last_pending_checkpoint_dir", path)
-            if best_val_metric is not None:
-                setattr(self, "_last_pending_best_checkpoint_info", {"path": path, "val": float(best_val_metric)})
+            self.checkpointer.lifecycle.defer_publication(
+                path,
+                best_val_metric=float(best_val_metric) if best_val_metric is not None else None,
+                metric_key=best_metric_name,
+            )
         else:
-            if is_rank_0:
-                self._update_latest_symlink(path)
-                if best_val_metric is not None:
-                    self._update_best_symlink(path, float(best_val_metric))
-            if is_dist_initialized:
-                dist.barrier()
+            self.checkpointer.lifecycle.publish(
+                path,
+                best_val_metric=float(best_val_metric) if best_val_metric is not None else None,
+                metric_key=best_metric_name,
+            )
 
     def _log_saved_checkpoint(self, kind: str, epoch: int, step: int) -> None:
         """Log a saved checkpoint on rank 0 when checkpointing is enabled."""
@@ -1557,7 +1695,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         ckpt_root = self.checkpoint_config.checkpoint_dir
 
         if restore_from:
-            ckpt_dir = _resolve_restore_from_to_ckpt_dir(ckpt_root, restore_from)
+            ckpt_dir = resolve_restore_from_to_checkpoint_dir(ckpt_root, restore_from)
             if ckpt_dir is None:
                 if is_rank_0:
                     logger.warning("restore_from='LATEST' but no checkpoint found in %s", ckpt_root)
@@ -1565,7 +1703,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             if not os.path.isdir(ckpt_dir):
                 raise FileNotFoundError(f"Checkpoint directory does not exist: {ckpt_dir}")
         else:
-            auto = _find_latest_checkpoint(ckpt_root)
+            auto = find_latest_checkpoint(ckpt_root)
             if auto is None:
                 return
             ckpt_dir = str(auto)
@@ -1596,7 +1734,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         self.checkpointer.load_model(draft_model, os.path.join(ckpt_dir, "model"))
         self.checkpointer.load_optimizer(self.optimizer, draft_model, ckpt_dir, self.lr_scheduler)
         try:
-            self.checkpointer.load_on_dp_ranks(self.rng, "rng", ckpt_dir)
+            self.checkpointer.load_on_global_ranks(self.rng, "rng", ckpt_dir)
         except FileNotFoundError:
             logger.warning("RNG state not found in %s; continuing without restoring RNG.", ckpt_dir)
 
@@ -1609,14 +1747,19 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             legacy = os.path.join(ckpt_dir, "eagle3_meta.pt")
             meta_path = legacy if os.path.exists(legacy) else meta_path
         if os.path.exists(meta_path):
-            meta = torch.load(meta_path, weights_only=False, map_location="cpu")
+            meta = load_torch_ckpt(
+                meta_path,
+                map_location="cpu",
+                weights_only=not self.checkpoint_config.allow_legacy_pickle_restore,
+            )
             self.runtime.global_step = int(meta.get("global_step", 0))
             self._resume_epoch = int(meta.get("epoch", 0))
-            # Align the regen launch cadence to the restored step so resume does not
-            # immediately fire a redundant cycle for an already-covered region.
-            regen_runner = getattr(self, "regen_runner", None)
-            if regen_runner is not None:
-                regen_runner.resume_from_step(self.runtime.global_step)
+            # Align the cadence-driven runners to the restored step so resume does
+            # not immediately fire a redundant launch for an already-covered region.
+            for runner_attr in ("regen_runner", "decode_eval_runner"):
+                runner = getattr(self, runner_attr, None)
+                if runner is not None:
+                    runner.resume_from_step(self.runtime.global_step)
             ids = meta.get("selected_token_ids")
             mask = meta.get("selected_token_mask")
             if ids is not None and mask is not None:
@@ -1706,7 +1849,10 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         try:
             self._train_epochs(start_epoch, is_ddp, pbar)
             self._maybe_save_final_checkpoint(self.num_epochs)
-            self._finalize_pending_checkpoint()
+            checkpointer = getattr(self, "checkpointer", None)
+            if checkpointer is not None:
+                checkpointer.async_wait()
+                checkpointer.lifecycle.complete_pending()
             if self.dist_env.is_main:
                 logger.info("Training complete: global_step=%s", self.runtime.global_step)
         finally:
@@ -1728,6 +1874,8 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         loop returns, and ``initialize_distributed`` already destroys it at
         process exit.
         """
+        if getattr(self, "checkpointer", None) is not None:
+            _best_effort("finalizing and closing checkpointer", self.checkpointer.finalize)
         if getattr(self, "target_wrapper", None) is not None:
             _best_effort("closing target backend", self.target_wrapper.close)
         if getattr(self, "decode_eval_runner", None) is not None:

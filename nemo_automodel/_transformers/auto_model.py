@@ -27,6 +27,7 @@ Heavy-lifting helpers live in sibling modules:
 import gc
 import inspect
 import logging
+import os
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, List, Optional, Union
 
@@ -42,6 +43,7 @@ from transformers import (  # noqa: E402
     AutoModelForCausalLM,
     AutoModelForImageTextToText,
     AutoModelForMultimodalLM,
+    AutoModelForSeq2SeqLM,
     AutoModelForSequenceClassification,
     AutoModelForTextToWaveform,
     AutoModelForTokenClassification,
@@ -96,6 +98,7 @@ from nemo_automodel._transformers.model_init import (
     no_hf_meta_device,
     resolve_sdpa_method,
 )
+from nemo_automodel.components.models.common.tie_word_embeddings import reject_tie_word_embeddings_flip
 
 if not hasattr(_gen_utils, "NEED_SETUP_CACHE_CLASSES_MAPPING"):
     from transformers.cache_utils import StaticCache
@@ -252,6 +255,42 @@ def _maybe_dequantize_fp8_for_peft(hf_native_quant_cfg, peft_config, pretrained_
             logger.info("FP8 model with PEFT: setting dequantize=True for compatibility")
             return True
     return False
+
+
+def _maybe_reject_tie_word_embeddings_flip(pretrained_model_name_or_path, hf_config, kwargs):
+    """Reject a from_pretrained request that flips tie_word_embeddings from the checkpoint.
+
+    Re-reads the checkpoint's raw config (no user value-overrides) and compares its
+    controlling tie flag to the requested ``hf_config`` via
+    :func:`reject_tie_word_embeddings_flip`. Conservative by design: path-like sources
+    are normalized with :func:`os.fspath`, non-path sources are skipped, and it silently
+    returns if the raw config cannot be re-read, so it never blocks a load except on a
+    genuine flip.
+
+    Args:
+        pretrained_model_name_or_path: The from_pretrained source (``str`` and
+            ``os.PathLike`` are checked; anything else is skipped).
+        hf_config: The resolved config with user overrides applied (the requested value).
+        kwargs: The from_pretrained kwargs (hub-locating keys are reused for the raw load).
+    """
+    if isinstance(pretrained_model_name_or_path, os.PathLike):
+        pretrained_model_name_or_path = os.fspath(pretrained_model_name_or_path)
+    if not isinstance(pretrained_model_name_or_path, str):
+        # Non-path source (e.g. bytes fspath or preloaded object): nothing to re-read.
+        return
+    hub_kwargs = {k: kwargs[k] for k in _AUTO_CONFIG_HUB_KWARG_KEYS if k in kwargs}
+    try:
+        raw_config = AutoConfig.from_pretrained(
+            pretrained_model_name_or_path,
+            trust_remote_code=kwargs.get("trust_remote_code", resolve_trust_remote_code(pretrained_model_name_or_path)),
+            **hub_kwargs,
+        )
+    except Exception:
+        # Cannot re-read the raw config (offline / custom loader); do not block the load.
+        return
+    architectures = getattr(hf_config, "architectures", None) or []
+    model_class_name = architectures[0] if architectures else type(hf_config).__name__
+    reject_tie_word_embeddings_flip(raw_config, hf_config, model_class_name)
 
 
 class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
@@ -484,6 +523,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
 
         model = None  # Ensure 'model' is always bound for the except handler
         is_custom_model = None
+        process_group = getattr(mesh, "process_group", None)
         try:
             with init_ctx:
                 is_custom_model, model = _init_model(
@@ -494,6 +534,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                     quantization_config,
                     force_hf,
                     *model_args,
+                    _process_group=process_group,
                     **kwargs,
                 )
         except (NotImplementedError, RuntimeError) as e:
@@ -523,6 +564,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                         quantization_config,
                         force_hf,
                         *model_args,
+                        _process_group=process_group,
                         **kwargs,
                     )
             else:
@@ -642,8 +684,8 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 Accepts both SDPBackend enum values and string names (e.g.
                 ``["flash_attention", "efficient_attention"]``). When ``None``,
                 auto-selects based on CP and activation checkpointing.
-            torch_dtype (str | torch.dtype | Literal["auto"], default="auto"):
-                Data type passed to the underlying `from_pretrained` call.
+            torch_dtype (str | torch.dtype):
+                Data type passed to the underlying `from_pretrained` call. Defaults to `auto`.
             attn_implementation (str, optional):
                 Specifies which attention implementation to use (e.g.,
                 ``"flash_attention_2"``, ``"eager"``). Only applied when the
@@ -710,6 +752,10 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 raise
         is_hf_model = get_is_hf_model(hf_config, force_hf)
 
+        # Layer 2: reject loading a checkpoint with tie_word_embeddings flipped from the
+        # value it was saved with (the class-level TieSupport policy cannot catch this).
+        _maybe_reject_tie_word_embeddings_flip(pretrained_model_name_or_path, hf_config, kwargs)
+
         sdpa_method = resolve_sdpa_method(sdpa_method, mesh.device_mesh, activation_checkpointing)
 
         return cls._build_model(
@@ -767,8 +813,8 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 The configuration object used to build the model.
                 If config is passed as a string (e.g., model-id / local checkpoint),
                 it will create a config internally using AutoConfig.
-            torch_dtype (str | torch.dtype, default="auto"):
-                Data type for model parameters. If "auto", defaults to ``torch.bfloat16``.
+            torch_dtype (str | torch.dtype):
+                Data type for model parameters. Defaults to `auto`, which selects ``torch.bfloat16``.
         """
         _reject_separate_distributed_kwargs(kwargs)
         setup = _resolve_distributed_setup(
@@ -958,6 +1004,21 @@ class NeMoAutoModelForTokenClassification(_BaseNeMoAutoModelClass, AutoModelForT
     >>> model = NeMoAutoModelForTokenClassification.from_pretrained("dbmdz/bert-large-cased-finetuned-conll03-english") # try Liger
     >>> model = NeMoAutoModelForTokenClassification.from_pretrained(
     ...     "dbmdz/bert-large-cased-finetuned-conll03-english", use_liger_kernel=False)   # skip Liger
+    """
+
+    pass
+
+
+class NeMoAutoModelForSeq2SeqLM(_BaseNeMoAutoModelClass, AutoModelForSeq2SeqLM):
+    """Drop-in replacement for ``transformers.AutoModelForSeq2SeqLM`` with custom-kernels.
+
+    Resolves encoder-decoder (sequence-to-sequence) architectures such as T5,
+    mT5, BART, and Pegasus to their HF ``*ForConditionalGeneration`` classes via
+    the inherited ``AutoModelForSeq2SeqLM`` mapping. Like the other wrappers it
+    only overrides ``from_pretrained`` / ``from_config`` to add the optional
+    ``use_liger_kernel`` flag; the Liger patch only applies to decoder-only
+    architectures, so for encoder-decoder models it silently falls back and the
+    model is unchanged.
     """
 
     pass
@@ -1171,8 +1232,8 @@ class NeMoAutoModelBiEncoder(_NeMoAutoModelForRetrievalBase):
     def from_pretrained(
         cls,
         pretrained_model_name_or_path: str,
-        pooling: str = "avg",
-        l2_normalize: bool = True,
+        pooling: str | None = None,
+        l2_normalize: bool | None = None,
         do_distributed_inbatch_negative: bool = False,
         detach_distributed_inbatch_negatives: bool = True,
         **kwargs,
@@ -1180,12 +1241,15 @@ class NeMoAutoModelBiEncoder(_NeMoAutoModelForRetrievalBase):
         """Load a bi-encoder model with infrastructure.
 
         Accepts all arguments from ``_NeMoAutoModelForRetrievalBase.from_pretrained``
-        plus the bi-encoder-specific parameters below.
+        plus the bi-encoder-specific parameters below. Sentence Transformers export
+        metadata is derived from effective model, tokenizer, and collator settings.
 
         Args:
             pretrained_model_name_or_path: Path to pretrained model or model identifier.
-            pooling: Pooling strategy (``'avg'``, ``'cls'``, ``'last'``, etc.).
-            l2_normalize: Whether to L2-normalize embeddings.
+            pooling: Pooling strategy (``'avg'``, ``'cls'``, ``'last'``, etc.). When omitted, standard
+                Sentence Transformers metadata is restored when available, otherwise defaults to ``'avg'``.
+            l2_normalize: Whether to L2-normalize embeddings. When omitted, the standard Sentence Transformers
+                module stack is restored when available, otherwise defaults to ``True``.
             do_distributed_inbatch_negative: Whether to gather passages across ranks for distributed in-batch
                 negatives during training.
             detach_distributed_inbatch_negatives: Whether to detach remote passage embeddings in distributed

@@ -140,12 +140,12 @@ def main():
 
         if os.path.exists(ema_path):
             print("[INFO] Loading EMA checkpoint (best quality)...")
-            ema_state = torch.load(ema_path, map_location="cuda")
+            ema_state = torch.load(ema_path, map_location="cuda", weights_only=True)
             pipe.transformer.load_state_dict(ema_state, strict=True)
             print("[INFO] ✅ Loaded from EMA checkpoint")
         elif os.path.exists(consolidated_path):
             print("[INFO] ############Loading consolidated checkpoint...")
-            state_dict = torch.load(consolidated_path, map_location="cuda")
+            state_dict = torch.load(consolidated_path, map_location="cuda", weights_only=True)
             pipe.transformer.load_state_dict(state_dict, strict=True)
             print("[INFO] ✅ ############Loaded from consolidated checkpoint")
         elif os.path.isdir(sharded_dir) and any(name.endswith(".distcp") for name in os.listdir(sharded_dir)):

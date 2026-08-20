@@ -24,7 +24,6 @@ but trains the DFlash draft with its block-wise cross-entropy objective.
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import pathlib
@@ -43,25 +42,24 @@ from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel.components.checkpoint.checkpointing import (
     Checkpointer,
     CheckpointingConfig,
+    load_torch_ckpt,
     save_config,
+    save_losses,
 )
+from nemo_automodel.components.checkpoint.utils import find_latest_checkpoint, resolve_restore_from_to_checkpoint_dir
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.llm.eagle3 import build_eagle3_dataloader
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
 from nemo_automodel.components.loggers.log_utils import setup_logging
+from nemo_automodel.components.loggers.wandb_utils import init_wandb_run, suppress_wandb_log_messages
 from nemo_automodel.components.speculative.dflash.core import DFlashTrainerModule, NoValidAnchorsError
 from nemo_automodel.components.speculative.dflash.draft_qwen3 import build_target_layer_ids
 from nemo_automodel.components.speculative.dflash.registry import resolve_dflash_draft_spec
 from nemo_automodel.components.speculative.dflash.target import HFDFlashTargetModel
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config
-from nemo_automodel.recipes.base_recipe import (
-    BaseRecipe,
-    _find_latest_checkpoint,
-    _is_checkpoint_model_config_compatible,
-    _resolve_restore_from_to_ckpt_dir,
-)
+from nemo_automodel.recipes.base_recipe import BaseRecipe, _is_checkpoint_model_config_compatible
 from nemo_automodel.recipes.llm._spec_train_utils import (
     apply_draft_compile,
     apply_draft_fp8,
@@ -74,10 +72,10 @@ from nemo_automodel.recipes.llm._spec_train_utils import (
 logger = logging.getLogger(__name__)
 
 
-def _all_reduce_mean(value: torch.Tensor) -> torch.Tensor:
+def _all_reduce_sum(value: torch.Tensor) -> torch.Tensor:
+    """Sum a scalar metric tensor across all distributed ranks in place."""
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(value, op=dist.ReduceOp.SUM)
-        value = value / dist.get_world_size()
     return value
 
 
@@ -323,6 +321,15 @@ class TrainDFlashRecipe(BaseRecipe):
         self._build_checkpointer(target_path)
         self.load_checkpoint(self.cfg.get("checkpoint.restore_from", None))
 
+        self.wandb_run = None
+        if self.dist_env.is_main and self.cfg.get("wandb", None) is not None:
+            suppress_wandb_log_messages()
+            self.wandb_run = init_wandb_run(
+                self.cfg.wandb.to_dict(),
+                self.cfg.to_dict(),
+                default_name=type(self).__name__.lower() + "_" + str(target_path).rstrip("/").split("/")[-1],
+            )
+
     def _build_target_model(self, recipe_cfg, target_path: str) -> torch.nn.Module:
         """Load the frozen (optionally tensor-parallel) target model.
 
@@ -454,6 +461,37 @@ class TrainDFlashRecipe(BaseRecipe):
     def _log_extra_train_metrics(self, epoch_idx: int) -> None:
         """Hook for subclasses to log extra per-step metrics at a log point (no-op here)."""
 
+    def _extra_train_metric_sums(self, metrics) -> dict[str, tuple[float, float]]:
+        """Return algorithm-specific training numerator and denominator pairs.
+
+        These are accumulated over the micro-batches between two log points and
+        divided at the log point, the same way ``train/loss`` and
+        ``train/accuracy`` are, so every curve on the dashboard covers the same
+        window. Returning the per-micro-batch mean instead would report a single
+        micro-batch out of ``log_every_steps * grad_accumulation_steps``.
+        """
+        return {"train/accept_len": (float(metrics.accept_len_sum), float(metrics.valid_blocks))}
+
+    def _extra_eval_metric_sums(self, metrics) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
+        """Return additional validation numerator and denominator pairs.
+
+        The base DFlash metrics are accumulated directly by :meth:`_run_eval`.
+        Subclasses use this hook for extra scalar statistics, with both tensors
+        on the same device as ``metrics.loss`` so they can participate in the
+        same ordered distributed SUM reductions.
+        """
+        return {}
+
+    def _empty_extra_eval_metric_sums(self) -> dict[str, list[torch.Tensor]]:
+        """Create zeroed subclass validation accumulators on the trainer device."""
+        return {}
+
+    def _wandb_log(self, data: dict[str, float], step: int) -> None:
+        """Log scalar metrics to the rank-zero W&B run when configured."""
+        run = getattr(self, "wandb_run", None)
+        if run is not None:
+            run.log(data, step=step)
+
     @staticmethod
     def _resolve_mask_token_id(recipe_cfg, vocab_size: int) -> int:
         """Resolve and validate the MASK token id that fills non-anchor block positions.
@@ -520,6 +558,7 @@ class TrainDFlashRecipe(BaseRecipe):
         self.checkpointer = Checkpointer(
             config=self.checkpoint_config, dp_rank=dp_rank, tp_rank=0, pp_rank=0, moe_mesh=None
         )
+        self._log_checkpoint_retention_policy(self.checkpoint_config)
 
     def _module(self):
         return (
@@ -542,35 +581,18 @@ class TrainDFlashRecipe(BaseRecipe):
         if checkpointer is None or not checkpointer.config.enabled:
             return
         self.checkpointer.async_wait()
-
-        prev_pending = getattr(self, "_last_pending_checkpoint_dir", None)
-        prev_best_pending = getattr(self, "_last_pending_best_checkpoint_info", None)
+        self.checkpointer.lifecycle.complete_pending()
 
         ckpt_root = self.checkpoint_config.checkpoint_dir
         path = os.path.join(str(ckpt_root), f"epoch_{epoch}_step_{step}")
         is_dist_initialized = dist.is_initialized()
         is_rank_0 = (not is_dist_initialized) or dist.get_rank() == 0
-        best_val_metric = (
-            val_loss.get(next(iter(val_loss.keys())) if len(val_loss) == 1 else best_metric_key) if val_loss else None
-        )
+        best_metric_name = next(iter(val_loss.keys())) if val_loss and len(val_loss) == 1 else best_metric_key
+        best_val_metric = val_loss.get(best_metric_name) if val_loss else None
 
-        if prev_pending is not None:
-            if is_rank_0:
-                self._update_latest_symlink(prev_pending)
-            setattr(self, "_last_pending_checkpoint_dir", None)
-            if is_dist_initialized:
-                dist.barrier()
-        if prev_best_pending is not None:
-            if is_rank_0 and prev_best_pending.get("val") is not None:
-                self._update_best_symlink(prev_best_pending["path"], float(prev_best_pending["val"]))
-            setattr(self, "_last_pending_best_checkpoint_info", None)
-            if is_dist_initialized:
-                dist.barrier()
+        self.checkpointer.lifecycle.reserve(path)
 
         if is_rank_0:
-            if os.path.exists(path):
-                raise FileExistsError(f"Checkpoint directory {path} already exists")
-            os.makedirs(path, exist_ok=True)
             loss_dict: dict[str, float] = {}
             if train_loss is not None:
                 loss_dict["train_loss"] = float(train_loss)
@@ -578,8 +600,7 @@ class TrainDFlashRecipe(BaseRecipe):
                 for k, v in val_loss.items():
                     loss_dict[k] = float(v)
             if loss_dict:
-                with open(os.path.join(path, "losses.json"), "w") as f:
-                    json.dump(loss_dict, f)
+                save_losses(loss_dict, path)
         if is_dist_initialized:
             dist.barrier()
 
@@ -595,29 +616,38 @@ class TrainDFlashRecipe(BaseRecipe):
         # (and, being seeded per dp_rank, hold identical rng state), so every peer would
         # torch.save the same rng_dp_rank_N.pt and race on a shared FS; let only the
         # first cp peer write it.
-        if self.cp_mesh is None or self.cp_mesh.get_local_rank() == 0:
+        cp_mesh = getattr(self, "cp_mesh", None)
+        if cp_mesh is None or cp_mesh.get_local_rank() == 0:
             self.checkpointer.save_on_dp_ranks(self.rng, "rng", path)
 
-        if is_rank_0:
+        # Rank-0 writes followed by collectives, so they go through the same guard:
+        # a failure here must abort every rank rather than only this one.
+        def write_recipe_metadata() -> None:
             self._save_extra_state(path, epoch=epoch)
             try:
                 save_config(self.cfg.raw_config, path)
             except (AttributeError, OSError) as e:
                 logger.warning("Failed to save config snapshot: %s", e)
+
+        self.checkpointer.lifecycle.run_coordinator_step(
+            write_recipe_metadata,
+            description=f"write recipe metadata to {path}",
+        )
         if is_dist_initialized:
             dist.barrier()
 
         if getattr(self.checkpointer.config, "is_async", False):
-            setattr(self, "_last_pending_checkpoint_dir", path)
-            if best_val_metric is not None:
-                setattr(self, "_last_pending_best_checkpoint_info", {"path": path, "val": float(best_val_metric)})
+            self.checkpointer.lifecycle.defer_publication(
+                path,
+                best_val_metric=float(best_val_metric) if best_val_metric is not None else None,
+                metric_key=best_metric_name,
+            )
         else:
-            if is_rank_0:
-                self._update_latest_symlink(path)
-                if best_val_metric is not None:
-                    self._update_best_symlink(path, float(best_val_metric))
-            if is_dist_initialized:
-                dist.barrier()
+            self.checkpointer.lifecycle.publish(
+                path,
+                best_val_metric=float(best_val_metric) if best_val_metric is not None else None,
+                metric_key=best_metric_name,
+            )
 
     def _save_extra_state(self, path: str, epoch: int) -> None:
         """Persist DFlash meta: global_step, epoch, block_size, and target layers."""
@@ -641,7 +671,7 @@ class TrainDFlashRecipe(BaseRecipe):
         ckpt_root = self.checkpoint_config.checkpoint_dir
 
         if restore_from:
-            ckpt_dir = _resolve_restore_from_to_ckpt_dir(ckpt_root, restore_from)
+            ckpt_dir = resolve_restore_from_to_checkpoint_dir(ckpt_root, restore_from)
             if ckpt_dir is None:
                 if is_rank_0:
                     logger.warning("restore_from='LATEST' but no checkpoint found in %s", ckpt_root)
@@ -649,7 +679,7 @@ class TrainDFlashRecipe(BaseRecipe):
             if not os.path.isdir(ckpt_dir):
                 raise FileNotFoundError(f"Checkpoint directory does not exist: {ckpt_dir}")
         else:
-            auto = _find_latest_checkpoint(ckpt_root)
+            auto = find_latest_checkpoint(ckpt_root)
             if auto is None:
                 return
             ckpt_dir = str(auto)
@@ -678,7 +708,11 @@ class TrainDFlashRecipe(BaseRecipe):
         """Restore DFlash meta: global_step and epoch, and validate mask_token_id."""
         meta_path = os.path.join(ckpt_dir, "dflash_meta.pt")
         if os.path.exists(meta_path):
-            meta = torch.load(meta_path, weights_only=False, map_location="cpu")
+            meta = load_torch_ckpt(
+                meta_path,
+                map_location="cpu",
+                weights_only=not self.checkpoint_config.allow_legacy_pickle_restore,
+            )
             self.runtime.global_step = int(meta.get("global_step", 0))
             self._resume_epoch = int(meta.get("epoch", 0))
             # ``mask_token_id`` comes only from the resume YAML (it is not
@@ -738,9 +772,15 @@ class TrainDFlashRecipe(BaseRecipe):
         if self.val_dataloader is None:
             return None
         self.trainer_module.eval()
-        total_loss = torch.zeros((), device=self.device)
-        total_acc = torch.zeros((), device=self.device)
-        total_batches = torch.zeros((), device=self.device)
+        totals = {
+            "loss_sum": torch.zeros((), device=self.device),
+            "loss_weight": torch.zeros((), device=self.device),
+            "correct_tokens": torch.zeros((), device=self.device),
+            "valid_tokens": torch.zeros((), device=self.device),
+            "accept_len_sum": torch.zeros((), device=self.device),
+            "valid_blocks": torch.zeros((), device=self.device),
+        }
+        extra_totals = self._empty_extra_eval_metric_sums()
         with torch.no_grad():
             for batch in self.val_dataloader:
                 batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
@@ -758,17 +798,35 @@ class TrainDFlashRecipe(BaseRecipe):
                     # Every sample in this micro-batch is too short to form a block;
                     # skip it without counting, mirroring the training loop.
                     continue
-                total_loss += metrics.loss.detach()
-                total_acc += metrics.accuracy.detach()
-                total_batches += 1
-        total_loss = _all_reduce_mean(total_loss)
-        total_acc = _all_reduce_mean(total_acc)
-        total_batches = _all_reduce_mean(total_batches)
+                loss_weight = metrics.loss_weight.detach()
+                valid_tokens = metrics.valid_tokens.detach()
+                totals["loss_sum"] += metrics.loss.detach() * loss_weight
+                totals["loss_weight"] += loss_weight
+                totals["correct_tokens"] += metrics.correct_tokens.detach()
+                totals["valid_tokens"] += valid_tokens
+                totals["accept_len_sum"] += metrics.accept_len_sum.detach()
+                totals["valid_blocks"] += metrics.valid_blocks.detach()
+                for name, (numerator, denominator) in self._extra_eval_metric_sums(metrics).items():
+                    extra_totals[name][0] += numerator
+                    extra_totals[name][1] += denominator
+        for value in totals.values():
+            _all_reduce_sum(value)
+        for numerator, denominator in extra_totals.values():
+            _all_reduce_sum(numerator)
+            _all_reduce_sum(denominator)
         self.trainer_module.train()
-        return {
-            "val_loss": (total_loss / total_batches.clamp_min(1)).item(),
-            "val_accuracy": (total_acc / total_batches.clamp_min(1)).item(),
+        result = {
+            "val_loss": (totals["loss_sum"] / totals["loss_weight"].clamp_min(1)).item(),
+            "val_accuracy": (totals["correct_tokens"] / totals["valid_tokens"].clamp_min(1)).item(),
+            "val_accept_len": (totals["accept_len_sum"] / totals["valid_blocks"].clamp_min(1)).item(),
         }
+        result.update(
+            {
+                name: (numerator / denominator.clamp_min(1)).item()
+                for name, (numerator, denominator) in extra_totals.items()
+            }
+        )
+        return result
 
     def run_train_validation_loop(self):
         """Run the DFlash training loop."""
@@ -788,6 +846,7 @@ class TrainDFlashRecipe(BaseRecipe):
                 running_loss = 0.0
                 running_acc = 0.0
                 running_micro = 0
+                running_extra: dict[str, list[float]] = {}
                 epoch_loss = 0.0
                 micro_step = 0
                 pending_micro_batches = 0
@@ -835,6 +894,13 @@ class TrainDFlashRecipe(BaseRecipe):
                     running_loss += metrics.loss.detach().item()
                     running_acc += metrics.accuracy.detach().item()
                     running_micro += 1
+                    # Accumulated here, past the skip ``continue`` above, so a
+                    # micro-batch excluded from loss/accuracy is excluded from
+                    # these too.
+                    for name, (numerator, denominator) in self._extra_train_metric_sums(metrics).items():
+                        totals = running_extra.setdefault(name, [0.0, 0.0])
+                        totals[0] += numerator
+                        totals[1] += denominator
                     epoch_loss += metrics.loss.detach().item()
                     micro_step += 1
                     pending_micro_batches += 1
@@ -874,9 +940,25 @@ class TrainDFlashRecipe(BaseRecipe):
                                 current_lr,
                             )
                             self._log_extra_train_metrics(epoch_idx)
+                            if getattr(self, "wandb_run", None) is not None:
+                                wandb_data = {
+                                    "train/loss": avg_loss,
+                                    "train/accuracy": avg_acc,
+                                    "train/lr": current_lr,
+                                    "train/epoch": epoch_idx,
+                                }
+                                wandb_data.update(
+                                    {
+                                        name: numerator / denominator
+                                        for name, (numerator, denominator) in running_extra.items()
+                                        if denominator > 0
+                                    }
+                                )
+                                self._wandb_log(wandb_data, step=self.runtime.global_step)
                             running_loss = 0.0
                             running_acc = 0.0
                             running_micro = 0
+                            running_extra.clear()
 
                 # Flush the trailing partial accumulation window (see EAGLE recipes
                 # for the rescale rationale).
@@ -903,8 +985,10 @@ class TrainDFlashRecipe(BaseRecipe):
                         f"skipped_short_micro_batches={self._skipped_micro_batches}"
                     )
                     if eval_metrics is not None:
-                        msg += (
-                            f" val_loss={eval_metrics['val_loss']:.4f} val_accuracy={eval_metrics['val_accuracy']:.4f}"
+                        msg += " " + " ".join(f"{name}={value:.4f}" for name, value in eval_metrics.items())
+                        self._wandb_log(
+                            {name.replace("val_", "val/", 1): value for name, value in eval_metrics.items()},
+                            step=self.runtime.global_step,
                         )
                     logger.info(msg)
 
@@ -921,7 +1005,7 @@ class TrainDFlashRecipe(BaseRecipe):
                     self._log_saved_checkpoint("epoch", epoch_idx + 1, self.runtime.global_step)
 
             self._maybe_save_final_checkpoint(self.num_epochs)
-            self._finalize_pending_checkpoint()
+            self._finalize_and_close_checkpointer()
         finally:
             if pbar is not None:
                 pbar.close()

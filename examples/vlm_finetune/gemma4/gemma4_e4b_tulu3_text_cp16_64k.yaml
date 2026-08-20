@@ -36,8 +36,9 @@
 #   5. FusedLinearCrossEntropy -- avoids materializing the full [S, 262k] logits.
 #
 # Dense CP requires attn_implementation=sdpa (the ring swaps SDPA) and no TE
-# backend. TP is unavailable for E2B/E4B (HF per-layer-input merge crashes under
-# DTensor), so scale with dp_shard x cp only.
+# backend. E2B/E4B now support model-owned TP2, but this fixed 16-GPU recipe
+# deliberately spends every rank on CP16. Keeping both CP16 and TP2 would need
+# 32 GPUs; reducing CP to 8 would double the already tight local sequence to 8k.
 
 recipe: FinetuneRecipeForVLM
 
@@ -77,6 +78,9 @@ checkpoint:
 
 distributed:
   strategy: fsdp2
+  multimodal:
+    # Every rank receives text-only batches, so the frozen multimodal modules are skipped uniformly.
+    frozen_sharding: per_layer
   dp_size: none
   tp_size: 1
   cp_size: 16
@@ -89,8 +93,9 @@ loss_fn:
   reduction: sum
 
 dataset:
-  _target_: nemo_automodel.components.datasets.vlm.datasets.make_meta_dataset
-  path_or_dataset: logs/gemma4_tulu3_seqpack_cp/data/tulu3_train_meta.json
+  # Pull Tulu-3 straight from the HF Hub (no meta-JSON / JSONL data-prep step).
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_tulu3_dataset
+  path_or_dataset: allenai/tulu-3-sft-mixture
   split: train
   truncate: false
   inject_fake_images: false
@@ -123,13 +128,13 @@ freeze_config:
 
 wandb:
   enable: false
-  project: huiyingl_workspace
-  entity: Nemo-automodel
-  name: gemma4_e4b_tulu3_text_cp16_64k_2node
-  group: gemma4_e4b_tulu3_text_cp16_64k
-  tags: [gemma4-e4b, tulu3, text-only, dense, cp16, 64k, 2node]
-  dir: logs/gemma4_e4b_tulu3_text_cp16_64k/wandb
-
+  project: <your_wandb_project>
+  entity: <your_wandb_entity>
+  name: <your_wandb_name>
+  dir: <your_wandb_save_dir>
 ci:
   nodes: 2
-  time: "00:15:00"
+  time: "01:00:00"
+  env_vars:
+    # CP backward fragments the allocator; the FSDP gradient bucket then cannot fit, leads to OOM.
+    PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"

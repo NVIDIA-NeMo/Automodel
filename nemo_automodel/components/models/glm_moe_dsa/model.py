@@ -20,7 +20,6 @@ import torch.nn as nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.models.glm_moe_dsa.configuration_glm_moe_dsa import GlmMoeDsaConfig
 
-from nemo_automodel.components.checkpoint.utils import reject_unsupported_tied_word_embeddings
 from nemo_automodel.components.models.common import (
     BackendConfig,
     compute_lm_head_logits,
@@ -28,17 +27,27 @@ from nemo_automodel.components.models.common import (
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.tie_word_embeddings import (
+    TieSupport,
+    reject_unsupported_tie_word_embeddings,
+)
 from nemo_automodel.components.models.deepseek_v3.rope_utils import (
     freqs_cis_from_position_ids,
     precompute_freqs_cis,
 )
-from nemo_automodel.components.models.glm_moe_dsa.cp import make_glm_dsa_packed_cp_batch_and_ctx
+from nemo_automodel.components.models.glm_moe_dsa.cp import shard_glm_dsa_packed_cp_batch
 from nemo_automodel.components.models.glm_moe_dsa.layers import GlmMoeDsaMLA
 from nemo_automodel.components.models.glm_moe_dsa.state_dict_adapter import GlmMoeDsaStateDictAdapter
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MLP, MoE, MoEConfig
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
+
+
+def _uses_indexshare(config: GlmMoeDsaConfig) -> bool:
+    """Return whether the model has layers that reuse another layer's DSA indices."""
+    indexer_types = getattr(config, "indexer_types", None)
+    return indexer_types is not None and "shared" in indexer_types
 
 
 class Block(nn.Module):
@@ -225,18 +234,21 @@ class GlmMoeDsaModel(nn.Module):
         h = self.embed_tokens(input_ids) if self.embed_tokens is not None else input_ids
 
         # IndexShare: thread the most recent "full" layer's top-k selection forward so the
-        # following "shared" layers can reuse it. Seeded from `prev_topk_indices` (carried from
-        # the previous pipeline stage); `None` on the first stage / all-"full" configs (GLM-5.1).
-        topk_indices = prev_topk_indices
+        # following "shared" layers can reuse it. Legacy GLM configs have no shared layers, so
+        # avoid retaining and propagating their per-layer selections.
+        uses_indexshare = _uses_indexshare(self.config)
+        topk_indices = prev_topk_indices if uses_indexshare else None
         for layer in self.layers.values():
-            h, topk_indices = layer(
+            h, layer_topk_indices = layer(
                 x=h,
                 freqs_cis=freqs_cis,
                 attention_mask=attention_mask,
                 padding_mask=padding_mask,
-                prev_topk_indices=topk_indices,
+                prev_topk_indices=topk_indices if uses_indexshare else None,
                 **attn_kwargs,
             )
+            if uses_indexshare:
+                topk_indices = layer_topk_indices
 
         h = self.norm(h) if self.norm else h
         return h, topk_indices
@@ -255,8 +267,17 @@ class GlmMoeDsaModel(nn.Module):
             if layer is not None:
                 layer.init_weights(buffer_device=buffer_device)
 
+    def update_moe_gate_bias(self) -> None:
+        """Update the noaux router correction bias of each local MoE layer; dense layers and disabled gates are skipped."""
+        with torch.no_grad():
+            for block in self.layers.values():
+                if isinstance(block.mlp, MoE) and block.mlp.gate.bias_update_factor > 0:
+                    block.mlp.gate.update_bias()
+
 
 class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
+    tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
+
     @dataclass(frozen=True)
     class ModelCapabilities:
         """Declared parallelism capabilities for this model class."""
@@ -296,7 +317,7 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     ):
         super().__init__()
         self.config = config
-        reject_unsupported_tied_word_embeddings(config, type(self).__name__)
+        reject_unsupported_tie_word_embeddings(type(self), config)
         self.backend = backend or BackendConfig()
         moe_overrides = kwargs.pop("moe_overrides", None)
         self.model = GlmMoeDsaModel(
@@ -326,23 +347,46 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     def set_output_embeddings(self, new_embeddings):
         self.lm_head = new_embeddings
 
+    def update_moe_gate_bias(self) -> None:
+        """Delegate the noaux router correction-bias update to the inner model."""
+        self.model.update_moe_gate_bias()
+
     def should_pack_validation_with_training(self) -> bool:
         """GLM DSA TileLang kernels require validation to use the THD packed layout."""
         return getattr(self.backend, "attn", None) == "tilelang"
 
-    def prepare_model_inputs_for_cp(self, input_ids: torch.Tensor, **kwargs: Any) -> dict[str, Any]:
-        """Attach GLM DSA's packed THD context-parallel batch sharder."""
+    def prepare_model_inputs_for_cp(
+        self,
+        batch: dict[str, Any],
+        *,
+        num_chunks: int = 1,
+    ) -> dict[str, Any]:
+        """Attach GLM DSA's packed THD context-parallel batch sharder.
+
+        Args:
+            batch: The batch dict.
+            num_chunks: Number of chunks for load-balanced CP sharding.
+        """
         from functools import partial  # noqa: PLC0415
+
+        from nemo_automodel.components.distributed.context_parallel.sharder import (  # noqa: PLC0415
+            ContextParallelSharder,
+            contiguous_local_indices,
+        )
 
         if getattr(self.backend, "attn", None) != "tilelang":
             raise NotImplementedError("GLM DSA context parallelism is implemented only for backend.attn='tilelang'.")
 
-        return {
-            "_cp_make_batch_fn": partial(
-                make_glm_dsa_packed_cp_batch_and_ctx,
-                num_chunks=int(kwargs.get("num_chunks", 1)),
+        cp_sharder = ContextParallelSharder(
+            shard_batch=partial(
+                shard_glm_dsa_packed_cp_batch,
+                num_chunks=int(num_chunks),
             ),
-        }
+            # Contiguous over the packed THD token axis: rank r keeps
+            # tokens [r * T/cp, (r + 1) * T/cp).
+            local_token_global_indices=contiguous_local_indices,
+        )
+        return {"cp_sharder": cp_sharder}
 
     def _is_pipeline_parallel_stage(self) -> bool:
         """True when this module is a trimmed pipeline-parallel stage (not the whole model)."""
@@ -363,11 +407,11 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         seq_len: int,
         dtype: torch.dtype,
     ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
-        """Declare PP inter-stage I/O metas, threading the IndexShare top-k as a carry tensor.
+        """Declare PP inter-stage I/O metas, adding a top-k carry only for IndexShare models.
 
-        Non-first stages additionally receive the previous "full" layer's top-k selection, and
-        non-last stages emit the running selection, so a stage that begins with a "shared" layer
-        has the top-k it needs (correct at any sequence length).
+        IndexShare models additionally receive and emit the previous "full" layer's top-k
+        selection so a stage that begins with a "shared" layer has the indices it needs. Models
+        with all-full indexers need only the hidden-state channel.
         """
         hidden_size = self.config.hidden_size
         vocab_size = self.config.vocab_size
@@ -397,22 +441,27 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             hidden_meta = meta((microbatch_size, seq_len, hidden_size), dtype)
             topk_meta = meta((microbatch_size, seq_len, topk), torch.float32)
 
+        uses_indexshare = _uses_indexshare(self.config)
         if is_first:
             inputs_meta = (meta((microbatch_size, seq_len), torch.long),)
-        else:
+        elif uses_indexshare:
             inputs_meta = (hidden_meta, topk_meta)
+        else:
+            inputs_meta = (hidden_meta,)
 
         if self.lm_head is not None:
             # The last stage emits logits; compute_lm_head_logits restores [1, T, V] under THD.
             outputs_meta = (meta((microbatch_size, seq_len, vocab_size), dtype),)
-        else:
+        elif uses_indexshare:
             outputs_meta = (hidden_meta, topk_meta)
+        else:
+            outputs_meta = (hidden_meta,)
 
         return inputs_meta, outputs_meta
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
         *carry: torch.Tensor,
         position_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
@@ -427,9 +476,10 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         :class:`~transformers.modeling_outputs.CausalLMOutputWithPast`, threading the IndexShare
         top-k internally (seeded ``None``).
 
-        Pipeline parallelism: ``input_ids`` is the upstream hidden state on non-first stages and
-        ``*carry`` holds the previous stage's running top-k selection. Non-last stages return
-        ``(hidden_states, topk_indices)`` and the last stage returns the ``logits`` tensor.
+        Pipeline parallelism: ``input_ids`` is the upstream hidden state on non-first stages.
+        IndexShare models additionally use ``*carry`` for the previous stage's running top-k
+        selection. Non-last stages return the declared pipeline outputs and the last stage returns
+        the ``logits`` tensor.
 
         Args:
             input_ids: Token IDs (BSHD ``[B, S]`` / THD ``[1, T]``) on the first stage, or the
@@ -440,15 +490,18 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             output_hidden_states: When set (single-process), carry final hidden states on the output.
             **attn_kwargs: Additional arguments forwarded to the base model.
         """
+
         output_hidden_states = (
             output_hidden_states
             if output_hidden_states is not None
             else getattr(self.config, "output_hidden_states", False)
         )
 
+        uses_indexshare = _uses_indexshare(self.config)
+
         # Carry-in arrives as float32 (see get_pipeline_stage_metas, where the pipeline recv
         # buffer must be a grad-capable dtype); restore the int64 index values.
-        carry_in = carry[0] if carry else None
+        carry_in = carry[0] if uses_indexshare and carry else None
         is_thd = attn_kwargs.get("qkv_format") == "thd"
 
         prev_topk_indices = None
@@ -483,6 +536,11 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         )
 
         if self._is_pipeline_parallel_stage():
+            if not uses_indexshare:
+                if self.lm_head is not None:
+                    return compute_lm_head_logits(self.lm_head, hidden, logits_to_keep, is_thd=is_thd).logits
+                return hidden
+
             # The top-k carry is non-differentiable (integer indices transported as float32), but
             # torch.distributed.pipelining treats every float inter-stage tensor as an activation
             # and demands a gradient for it on backward. We add zero-weight autograd links so the

@@ -27,8 +27,11 @@ from typing import Any, Dict, Optional
 from nemo_automodel.components.distributed.config import (
     DistributedSetup,
     MoEParallelizerConfig,
+    MultimodalDistributedConfig,
+    MultimodalVisionConfig,
     _resolve_strategy_config,
 )
+from nemo_automodel.components.distributed.cp_vision_frame_shard import CpVisionFrameShardingConfig
 from nemo_automodel.components.distributed.mesh import ParallelismSizes
 from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
 from nemo_automodel.shared.utils import dtype_from_str
@@ -112,6 +115,25 @@ def parse_distributed_section(cfg_dict: dict) -> dict:
 
     # Everything still in *cfg* is forwarded to the strategy constructor.
     strategy_kwargs: Dict[str, Any] = cfg
+
+    # Coerce the serialized multimodal policy at the YAML boundary so the
+    # component layer only receives typed config objects.
+    if "multimodal" in strategy_kwargs:
+        multimodal_raw = strategy_kwargs["multimodal"]
+        if isinstance(multimodal_raw, dict):
+            multimodal_kwargs = multimodal_raw.copy()
+            vision_raw = multimodal_kwargs.get("vision")
+            if isinstance(vision_raw, dict):
+                vision_kwargs = vision_raw.copy()
+                frame_sharding_raw = vision_kwargs.get("frame_sharding")
+                if isinstance(frame_sharding_raw, dict):
+                    frame_sharding_kwargs = frame_sharding_raw.copy()
+                    mesh_dims = frame_sharding_kwargs.get("mesh_dims")
+                    if isinstance(mesh_dims, list):
+                        frame_sharding_kwargs["mesh_dims"] = tuple(mesh_dims)
+                    vision_kwargs["frame_sharding"] = CpVisionFrameShardingConfig(**frame_sharding_kwargs)
+                multimodal_kwargs["vision"] = MultimodalVisionConfig(**vision_kwargs)
+            strategy_kwargs["multimodal"] = MultimodalDistributedConfig(**multimodal_kwargs)
 
     # Instantiate mp_policy from YAML dict for the strategy config.
     # Follows the same ``_target_`` pattern used for MoE mp_policy below.
@@ -284,6 +306,7 @@ def create_distributed_setup_from_config(
     world_size: Optional[int] = None,
     *,
     timeout_minutes: int | None = None,
+    ranks: list[int] | tuple[int, ...] | None = None,
     strategy: str | None = None,
     dp_size: int | None = None,
     dp_replicate_size: int | None = None,
@@ -314,6 +337,7 @@ def create_distributed_setup_from_config(
         timeout_minutes: Optional timeout for process groups created by
             ``DeviceMesh`` axes. If omitted and ``cfg`` is a top-level recipe
             config, ``dist_env.timeout_minutes`` is used.
+        ranks: Optional ordered global ranks used by this setup's device mesh.
         strategy: Distributed strategy name (``fsdp2``, ``megatron_fsdp``,
             ``megatron-fsdp``, ``mfsdp``, or ``ddp``).
         dp_size: Data-parallel size. If ``None``, inferred by mesh creation.
@@ -364,6 +388,7 @@ def create_distributed_setup_from_config(
         activation_checkpointing=parsed["activation_checkpointing"],
         world_size=world_size,
         timeout_minutes=mesh_timeout_minutes,
+        ranks=ranks,
     )
 
 

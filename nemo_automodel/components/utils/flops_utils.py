@@ -12,21 +12,35 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import warnings
 from typing import Any, Callable, Optional
 
 
-def calculate_mfu(tflops, world_size, time_seconds, reference_mfu=1979.0):
+def calculate_mfu(
+    tflops: float,
+    world_size: int,
+    time_seconds: float,
+    reference_mfu: float | None = None,
+) -> float:
     """Calculate Model FLOPs Utilization (MFU).
 
     Args:
-        tflops: TFLOPs per GPU
-        world_size: Total number of GPUs
-        time_seconds: Time taken for computation
-        reference_mfu: Peak TFLOPs of the hardware (default: H100)
+        tflops: Total TFLOPs across all devices for the measured step.
+        world_size: Total number of GPUs.
+        time_seconds: Time taken for computation.
+        reference_mfu: Peak TFLOPs/s per device for the training precision. The
+            legacy default is the H100 dense-FP8 peak.
 
     Returns:
-        MFU as a percentage
+        MFU as a percentage.
     """
+    if reference_mfu is None:
+        warnings.warn(
+            "Omitting reference_mfu is deprecated; pass the peak TFLOPs/s for the training precision.",
+            FutureWarning,
+            stacklevel=2,
+        )
+        reference_mfu = 1979.0
     mfu = tflops / (world_size * time_seconds)
     mfu = mfu / reference_mfu
     return mfu * 100
@@ -837,7 +851,9 @@ def gpt_oss_flops(config, gbs=1, seq_len=None):
         config.moe_ffn_hidden_size if hasattr(config, "moe_ffn_hidden_size") else config.intermediate_size
     )
     moe_router_topk = config.num_experts_per_tok
-    kv_channels = config.kv_channels if hasattr(config, "kv_channels") else (hidden_size // num_attention_heads)
+    kv_channels = getattr(config, "head_dim", None)
+    if kv_channels is None:
+        kv_channels = getattr(config, "kv_channels", hidden_size // num_attention_heads)
     swa_window_size = config.window_size[0] if hasattr(config, "window_size") and config.window_size else 128
     window_attn_skip_freq = config.window_attn_skip_freq if hasattr(config, "window_attn_skip_freq") else 2
 

@@ -28,6 +28,8 @@ from __future__ import annotations
 
 import logging
 
+import torch
+
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.speculative.dflash.domino_core import DominoTrainerModule, get_lambda_base
 from nemo_automodel.recipes.llm.train_dflash import TrainDFlashRecipe
@@ -117,6 +119,49 @@ class TrainDominoRecipe(TrainDFlashRecipe):
             float(m.base_accept_len),
             float(m.lambda_base),
         )
+
+    def _extra_train_metric_sums(self, metrics) -> dict[str, tuple[float, float]]:
+        """Return Domino head and curriculum diagnostics as window sums.
+
+        ``lambda_base`` is a schedule value rather than a statistic, so its
+        denominator is the micro-batch count: averaging it over the window is
+        what makes it comparable with the loss curves beside it.
+        """
+        values = super()._extra_train_metric_sums(metrics)
+        valid_tokens = float(metrics.valid_tokens)
+        values.update(
+            {
+                "train/final_loss": (float(metrics.final_loss), 1.0),
+                "train/base_loss": (float(metrics.base_loss), 1.0),
+                "train/base_accuracy": (float(metrics.base_correct_tokens), valid_tokens),
+                "train/base_accept_len": (float(metrics.base_accept_len_sum), float(metrics.valid_blocks)),
+                "train/lambda_base": (float(metrics.lambda_base), 1.0),
+            }
+        )
+        return values
+
+    def _extra_eval_metric_sums(self, metrics) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
+        """Return additive Domino base-head validation statistics.
+
+        Every returned value is a pair of scalar tensors on the trainer device.
+        The shared validation loop SUM-reduces each pair before division.
+        """
+        loss_weight = metrics.loss_weight.detach()
+        valid_tokens = metrics.valid_tokens.detach()
+        valid_blocks = metrics.valid_blocks.detach()
+        return {
+            "val_final_loss": (metrics.final_loss.detach() * loss_weight, loss_weight),
+            "val_base_loss": (metrics.base_loss.detach() * loss_weight, loss_weight),
+            "val_base_accuracy": (metrics.base_correct_tokens.detach(), valid_tokens),
+            "val_base_accept_len": (metrics.base_accept_len_sum.detach(), valid_blocks),
+        }
+
+    def _empty_extra_eval_metric_sums(self) -> dict[str, list[torch.Tensor]]:
+        """Create rank-symmetric Domino validation accumulators."""
+        return {
+            name: [torch.zeros((), device=self.device), torch.zeros((), device=self.device)]
+            for name in ("val_final_loss", "val_base_loss", "val_base_accuracy", "val_base_accept_len")
+        }
 
 
 def main(config_path: str | None = None):

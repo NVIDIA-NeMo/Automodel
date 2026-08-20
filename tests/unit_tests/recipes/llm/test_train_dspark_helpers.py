@@ -33,6 +33,9 @@ Covers the recipe-level glue added for the DeepSeek-V4-Flash target:
   documentation-only ``enable`` flag is stripped before forwarding to
   ``wandb.init`` and gates whether to log at all; ``_init_dspark_wandb`` also
   gates on rank (``is_main``) and block presence.
+- ``_DSparkMetricWindow``: the log window packs into one all-reduce and unpacks
+  back to the logged metrics, dividing the acceptance diagnostics once so they
+  stay the exact global ratio across DP ranks.
 
 (target_layer_ids range/-1/ordering validation is covered by the shared
 ``common.validate_target_layer_ids``, which HFDSparkTargetModel already calls.)
@@ -40,26 +43,35 @@ Covers the recipe-level glue added for the DeepSeek-V4-Flash target:
 
 from __future__ import annotations
 
+import logging
 from types import SimpleNamespace
 
 import pytest
 import torch
 from transformers import Qwen3Config
 
+from nemo_automodel.components.checkpoint.config import CheckpointingConfig
+from nemo_automodel.components.checkpoint.lifecycle import CheckpointLifecycle
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.datasets.llm.dspark_cache import write_manifest, write_shard, write_target_weights
+from nemo_automodel.components.speculative.dspark.core import DSparkStepMetrics
+from nemo_automodel.recipes.llm import train_dspark
 from nemo_automodel.recipes.llm._dspark_target_build import (
     build_deepseek_v4_backend,
     gather_full_weight_module,
     repair_glm_5_2_qk_rope_head_dim,
     resolve_reduced_target_layers,
+    unsupported_parallel_axes,
+    validate_dspark_parallelism_axes,
 )
 from nemo_automodel.recipes.llm.train_dspark import (
-    _add_accept_rate_per_position,
+    _DSPARK_WINDOW_SCALARS,
     TrainDSparkRecipe,
+    _add_accept_rate_per_position,
     _apply_draft_activation_checkpointing,
     _apply_target_chat_template,
     _build_dspark_optimizer,
+    _DSparkMetricWindow,
     _extract_mm_kwargs,
     _init_dspark_wandb,
     _resolve_dspark_optimizer_spec,
@@ -122,6 +134,139 @@ def test_draft_activation_checkpointing_false_is_noop():
     original_attention = draft.layers[0].self_attn
     _apply_draft_activation_checkpointing(draft, False)
     assert draft.layers[0].self_attn is original_attention
+
+
+def test_save_checkpoint_applies_retention_after_sync_save(tmp_path, monkeypatch):
+    events = []
+    obj = TrainDSparkRecipe.__new__(TrainDSparkRecipe)
+    obj.checkpoint_config = SimpleNamespace(checkpoint_dir=str(tmp_path))
+    config = CheckpointingConfig(checkpoint_dir=str(tmp_path), save_consolidated=False)
+    lifecycle = CheckpointLifecycle(config=config)
+    obj.checkpointer = SimpleNamespace(
+        config=config,
+        lifecycle=lifecycle,
+        async_wait=lambda: events.append("wait"),
+        save_model=lambda *args, **kwargs: events.append("save_model"),
+        save_optimizer=lambda *args, **kwargs: events.append("save_optimizer"),
+        save_on_dp_ranks=lambda *args, **kwargs: events.append("save_rng"),
+    )
+    obj._module = lambda: SimpleNamespace(draft_model=SimpleNamespace())
+    obj.tokenizer = None
+    obj.optimizer = SimpleNamespace()
+    obj.lr_scheduler = SimpleNamespace()
+    obj.rng = SimpleNamespace()
+    obj.runtime = SimpleNamespace(global_step=1)
+    obj.cfg = SimpleNamespace(raw_config={})
+    obj.block_size = 4
+    obj.num_anchors = 2
+    obj.mask_token_id = 99
+    obj.target_layer_ids = [0, 1]
+    obj.target_wrapper = SimpleNamespace(target_layer_ids=[0, 1])
+    monkeypatch.setattr(
+        lifecycle,
+        "_update_best_checkpoint",
+        lambda path, val, metric_key=None: events.append(("best", path, val, metric_key)),
+    )
+    monkeypatch.setattr(lifecycle, "_prune_old_checkpoints", lambda: events.append("prune"))
+
+    TrainDSparkRecipe.save_checkpoint(obj, epoch=0, step=1, val_loss={"val_loss": 0.25})
+
+    assert events[0] == "wait"
+    assert any(event[0] == "best" and event[3] == "val_loss" for event in events if isinstance(event, tuple))
+    assert "prune" in events
+
+
+def test_save_checkpoint_records_async_best_pending_info_without_metric(tmp_path):
+    events = []
+    obj = TrainDSparkRecipe.__new__(TrainDSparkRecipe)
+    obj.checkpoint_config = SimpleNamespace(checkpoint_dir=str(tmp_path))
+    config = CheckpointingConfig(checkpoint_dir=str(tmp_path), save_consolidated=False)
+    config.is_async = True
+    lifecycle = CheckpointLifecycle(config=config)
+    obj.checkpointer = SimpleNamespace(
+        config=config,
+        lifecycle=lifecycle,
+        async_wait=lambda: events.append("wait"),
+        save_model=lambda *args, **kwargs: events.append("save_model"),
+        save_optimizer=lambda *args, **kwargs: events.append("save_optimizer"),
+        save_on_dp_ranks=lambda *args, **kwargs: events.append("save_rng"),
+    )
+    obj._module = lambda: SimpleNamespace(draft_model=SimpleNamespace())
+    obj.tokenizer = None
+    obj.optimizer = SimpleNamespace()
+    obj.lr_scheduler = SimpleNamespace()
+    obj.rng = SimpleNamespace()
+    obj.runtime = SimpleNamespace(global_step=1)
+    obj.cfg = SimpleNamespace(raw_config={})
+    obj.block_size = 4
+    obj.num_anchors = 2
+    obj.mask_token_id = 99
+    obj.target_layer_ids = [0, 1]
+    obj.target_wrapper = SimpleNamespace(target_layer_ids=[0, 1])
+
+    TrainDSparkRecipe.save_checkpoint(obj, epoch=0, step=1, best_metric_key="val_loss")
+
+    expected_path = str(tmp_path / "epoch_0_step_1")
+    assert events[0] == "wait"
+    assert lifecycle._pending_checkpoint_dir == expected_path
+    assert lifecycle._pending_best_checkpoint is not None
+    assert lifecycle._pending_best_checkpoint.path == expected_path
+    assert lifecycle._pending_best_checkpoint.value is None
+    assert lifecycle._pending_best_checkpoint.metric_key == "val_loss"
+
+
+def test_build_checkpointer_logs_retention_policy(tmp_path, monkeypatch, caplog):
+    built = []
+
+    class FakeCheckpointer:
+        def __init__(self, config, **kwargs):
+            self.config = config
+            built.append((config, kwargs))
+
+    monkeypatch.setattr(train_dspark, "Checkpointer", FakeCheckpointer)
+    obj = TrainDSparkRecipe.__new__(TrainDSparkRecipe)
+    obj.cfg = SimpleNamespace(
+        get=lambda key, default=None: (
+            {"checkpoint_dir": str(tmp_path), "max_recent_checkpoints": 1} if key == "checkpoint" else default
+        )
+    )
+    obj.output_dir = tmp_path
+    obj.draft_model = SimpleNamespace(state_dict=lambda: {"weight": torch.zeros(1)})
+
+    with caplog.at_level(logging.INFO):
+        TrainDSparkRecipe._build_checkpointer(obj, "target/repo")
+
+    assert built
+    assert "Checkpoint retention: keeping the most recent 1 checkpoint directory" in caplog.text
+
+
+def test_run_train_validation_loop_finalizes_before_close():
+    events = []
+
+    class FakePbar:
+        def close(self):
+            events.append("pbar_close")
+
+    obj = TrainDSparkRecipe.__new__(TrainDSparkRecipe)
+    obj.trainer_module = SimpleNamespace(train=lambda: None)
+    obj.num_epochs = 1
+    obj._resume_epoch = 0
+    obj.dist_env = SimpleNamespace(is_main=False)
+    obj.total_optim_steps = 1
+    obj.runtime = SimpleNamespace(global_step=1)
+    obj.block_size = 1
+    obj.device = torch.device("cpu")
+    obj.train_dataloader = []
+    obj._make_progress_bar = lambda **kwargs: FakePbar()
+    obj._run_eval = lambda: None
+    obj._maybe_save_final_checkpoint = lambda completed_epochs: events.append(("final", completed_epochs)) or True
+    obj.checkpointer = SimpleNamespace(finalize=lambda: events.append("finalize"))
+    obj.metric_logger = None
+    obj._finish_wandb = lambda: events.append("wandb_finish")
+
+    TrainDSparkRecipe.run_train_validation_loop(obj)
+
+    assert events == [("final", 1), "finalize", "pbar_close", "wandb_finish"]
 
 
 # ---------------------------------------------------------------------------
@@ -869,11 +1014,11 @@ def test_should_shard_dense_target_ignored_on_ddp():
     assert recipe._should_shard_dense_target({"shard_dense_target": True}) is False
 
 
-@pytest.mark.parametrize("axis", ["tp_size", "pp_size", "cp_size", "ep_size", "dp_replicate_size"])
+@pytest.mark.parametrize("axis", ["cp_size", "ep_size", "dp_replicate_size"])
 def test_should_shard_dense_target_rejects_non_pure_dp_axes(axis):
-    # Only a pure FSDP2 data-parallel topology is supported: pp_size>1 builds an
-    # AutoPipeline the target wrapper cannot run, tp/cp/ep are untested here, and
-    # HSDP replication (dp_replicate_size>1) re-replicates the target.
+    # Only a pure FSDP2 data-parallel topology is supported: cp/ep are untested here and
+    # HSDP replication (dp_replicate_size>1) re-replicates the target. tp_size / pp_size
+    # are rejected earlier for every run by validate_dspark_parallelism_axes.
     recipe = _make_shard_recipe(cfg={"distributed": {"strategy": "fsdp2", axis: 2}})
     with pytest.raises(ValueError, match=axis):
         recipe._should_shard_dense_target({"shard_dense_target": True})
@@ -885,3 +1030,361 @@ def test_should_shard_dense_target_allows_explicit_unit_or_null_axes():
         cfg={"distributed": {"strategy": "fsdp2", "tp_size": 1, "pp_size": None, "cp_size": 1, "ep_size": None}}
     )
     assert recipe._should_shard_dense_target({"shard_dense_target": True}) is True
+
+
+# ---------------------------------------------------------------------------
+# _DSparkMetricWindow
+# ---------------------------------------------------------------------------
+
+
+def _step_metrics(*, accept_num, accept_den, **scalars):
+    """One micro-batch of DSparkStepMetrics; unnamed scalars default to zero."""
+    values = {name: 0.0 for name in _DSPARK_WINDOW_SCALARS if name != "num_micro_batches"}
+    values.update(scalars)
+    return DSparkStepMetrics(
+        accept_rate_per_pos_num=torch.tensor(accept_num, dtype=torch.float32),
+        accept_rate_per_pos_den=torch.tensor(accept_den, dtype=torch.float32),
+        **{name: torch.tensor(value, dtype=torch.float32) for name, value in values.items()},
+    )
+
+
+def test_metric_window_pack_layout():
+    window = _DSparkMetricWindow(block_size=3)
+    window.add(_step_metrics(accept_num=[1.0, 2.0, 3.0], accept_den=[4.0, 5.0, 6.0], loss=7.0))
+    packed = window.pack()
+
+    n = len(_DSPARK_WINDOW_SCALARS)
+    assert packed.numel() == n + 2 * 3
+    assert packed[_DSPARK_WINDOW_SCALARS.index("loss")].item() == 7.0
+    assert packed[_DSPARK_WINDOW_SCALARS.index("num_micro_batches")].item() == 1.0
+    assert packed[n : n + 3].tolist() == [1.0, 2.0, 3.0]
+    assert packed[n + 3 :].tolist() == [4.0, 5.0, 6.0]
+
+
+def test_metric_window_unpack_averages_losses_and_divides_diagnostics_once():
+    window = _DSparkMetricWindow(block_size=2)
+    window.add(
+        _step_metrics(
+            accept_num=[2.0, 1.0],
+            accept_den=[4.0, 4.0],
+            loss=1.0,
+            ce_loss=0.5,
+            l1_loss=0.25,
+            confidence_loss=0.125,
+            tau_num=3.0,
+            tau_den=2.0,
+            confidence_abs_error_num=0.4,
+            confidence_bias_num=-0.2,
+            confidence_cumprod_bias_num=0.1,
+            confidence_diag_den=2.0,
+        )
+    )
+    window.add(
+        _step_metrics(
+            accept_num=[3.0, 0.0],
+            accept_den=[4.0, 4.0],
+            loss=3.0,
+            ce_loss=1.5,
+            l1_loss=0.75,
+            confidence_loss=0.375,
+            tau_num=1.0,
+            tau_den=2.0,
+            confidence_abs_error_num=0.2,
+            confidence_bias_num=0.4,
+            confidence_cumprod_bias_num=0.3,
+            confidence_diag_den=2.0,
+        )
+    )
+
+    avg = window.unpack(window.pack())
+
+    assert avg["loss"] == pytest.approx(2.0)
+    assert avg["ce_loss"] == pytest.approx(1.0)
+    assert avg["l1_loss"] == pytest.approx(0.5)
+    assert avg["confidence_loss"] == pytest.approx(0.25)
+    assert avg["accept_rate"] == pytest.approx(6.0 / 16.0)
+    assert avg["accept_rate@0"] == pytest.approx(5.0 / 8.0)
+    assert avg["accept_rate@1"] == pytest.approx(1.0 / 8.0)
+    assert avg["tau"] == pytest.approx(1.0)
+    assert avg["confidence_abs_error"] == pytest.approx(0.15)
+    assert avg["confidence_bias"] == pytest.approx(0.05)
+    assert avg["confidence_cumprod_bias"] == pytest.approx(0.1)
+
+
+def test_metric_window_reduces_as_ratio_of_sums_across_ranks():
+    rank0 = _DSparkMetricWindow(block_size=1)
+    rank0.add(_step_metrics(accept_num=[3.0], accept_den=[3.0], loss=1.0, tau_num=4.0, tau_den=2.0))
+    rank0.add(_step_metrics(accept_num=[0.0], accept_den=[0.0], loss=1.0))
+    rank1 = _DSparkMetricWindow(block_size=1)
+    rank1.add(_step_metrics(accept_num=[0.0], accept_den=[1.0], loss=3.0, tau_num=1.0, tau_den=1.0))
+
+    avg = rank0.unpack(rank0.pack() + rank1.pack())
+
+    assert avg["accept_rate"] == pytest.approx(3.0 / 4.0)
+    assert avg["tau"] == pytest.approx(5.0 / 3.0)
+    assert avg["loss"] == pytest.approx(5.0 / 3.0)
+
+
+def test_metric_window_omits_unmeasured_diagnostics():
+    window = _DSparkMetricWindow(block_size=2)
+    window.add(_step_metrics(accept_num=[0.0, 0.0], accept_den=[0.0, 0.0], loss=2.0))
+
+    avg = window.unpack(window.pack())
+
+    assert avg["loss"] == pytest.approx(2.0)
+    for key in ("accept_rate", "accept_rate@0", "tau", "confidence_abs_error", "confidence_bias"):
+        assert key not in avg
+
+
+def test_metric_window_omits_only_the_unmeasured_positions():
+    window = _DSparkMetricWindow(block_size=3)
+    window.add(_step_metrics(accept_num=[3.0, 1.0, 0.0], accept_den=[4.0, 4.0, 0.0], loss=1.0))
+
+    avg = window.unpack(window.pack())
+
+    assert avg["accept_rate@0"] == pytest.approx(0.75)
+    assert avg["accept_rate@1"] == pytest.approx(0.25)
+    assert "accept_rate@2" not in avg
+
+
+def test_metric_window_reset_clears_the_window():
+    window = _DSparkMetricWindow(block_size=2)
+    window.add(_step_metrics(accept_num=[1.0, 1.0], accept_den=[2.0, 2.0], loss=4.0, tau_num=1.0, tau_den=1.0))
+    window.reset()
+
+    avg = window.unpack(window.pack())
+
+    assert avg["loss"] == 0.0
+    assert "accept_rate" not in avg
+    assert "tau" not in avg
+
+
+def test_metric_window_unpack_rejects_mismatched_length():
+    window = _DSparkMetricWindow(block_size=4)
+    with pytest.raises(ValueError, match="expected"):
+        window.unpack(window.pack()[:-1])
+
+
+# ---------------------------------------------------------------------------
+# _load_extra_state (resume guard)
+# ---------------------------------------------------------------------------
+
+
+def _dspark_resume_self(mask_token_id=7):
+    return SimpleNamespace(
+        runtime=SimpleNamespace(global_step=0),
+        _resume_epoch=0,
+        mask_token_id=mask_token_id,
+        checkpoint_config=SimpleNamespace(allow_legacy_pickle_restore=False),
+    )
+
+
+def _write_dspark_meta(tmp_path, **fields):
+    meta = {"global_step": 5, "epoch": 2, "block_size": 16, "num_anchors": 512, "target_layer_ids": [1, 2]}
+    meta.update(fields)
+    torch.save(meta, tmp_path / "dspark_meta.pt")
+    return str(tmp_path)
+
+
+def test_dspark_load_extra_state_restores_step_and_epoch(tmp_path):
+    ckpt_dir = _write_dspark_meta(tmp_path, mask_token_id=7)
+    obj = _dspark_resume_self(mask_token_id=7)
+    TrainDSparkRecipe._load_extra_state(obj, ckpt_dir)
+    assert obj.runtime.global_step == 5
+    assert obj._resume_epoch == 2
+
+
+def test_dspark_load_extra_state_raises_on_mask_token_id_mismatch(tmp_path):
+    """A resume YAML whose mask_token_id disagrees with the checkpoint must fail loudly.
+
+    The draft's ``embed_tokens`` row at this id is the learned "predict here"
+    signal, so resuming at a different id trains against an untrained row and
+    degrades acceptance silently.
+    """
+    ckpt_dir = _write_dspark_meta(tmp_path, mask_token_id=7)
+    obj = _dspark_resume_self(mask_token_id=99)
+    with pytest.raises(ValueError, match="mask_token_id mismatch on resume"):
+        TrainDSparkRecipe._load_extra_state(obj, ckpt_dir)
+
+
+def test_dspark_load_extra_state_accepts_legacy_meta_without_mask_token_id(tmp_path):
+    """Checkpoints saved before mask_token_id was persisted skip the check."""
+    torch.save({"global_step": 3, "epoch": 1}, tmp_path / "dspark_meta.pt")
+    obj = _dspark_resume_self(mask_token_id=99)
+    TrainDSparkRecipe._load_extra_state(obj, str(tmp_path))
+    assert obj.runtime.global_step == 3
+    assert obj._resume_epoch == 1
+
+
+# ---------------------------------------------------------------------------
+# _run_eval acceptance diagnostics
+# ---------------------------------------------------------------------------
+
+
+def _eval_metrics_batch(
+    *,
+    loss: float,
+    accept_num: list[float],
+    accept_den: list[float],
+    tau_num: float = 0.0,
+    tau_den: float = 0.0,
+    conf_abs_err: float = 0.0,
+    conf_bias: float = 0.0,
+    conf_cumprod_bias: float = 0.0,
+    conf_den: float = 0.0,
+):
+    """One batch's worth of DSparkStepMetrics, as the trainer module returns it."""
+    return DSparkStepMetrics(
+        loss=torch.tensor(loss),
+        ce_loss=torch.tensor(0.0),
+        l1_loss=torch.tensor(0.0),
+        confidence_loss=torch.tensor(0.0),
+        accept_rate_per_pos_num=torch.tensor(accept_num),
+        accept_rate_per_pos_den=torch.tensor(accept_den),
+        tau_num=torch.tensor(tau_num),
+        tau_den=torch.tensor(tau_den),
+        confidence_abs_error_num=torch.tensor(conf_abs_err),
+        confidence_bias_num=torch.tensor(conf_bias),
+        confidence_cumprod_bias_num=torch.tensor(conf_cumprod_bias),
+        confidence_diag_den=torch.tensor(conf_den),
+    )
+
+
+def _eval_recipe(batches):
+    obj = TrainDSparkRecipe.__new__(TrainDSparkRecipe)
+    obj.val_dataloader = [object()] * len(batches)
+    obj.device = torch.device("cpu")
+    obj.block_size = len(batches[0].accept_rate_per_pos_num)
+    obj.trainer_module = SimpleNamespace(eval=lambda: None, train=lambda: None)
+    obj._dp_allreduce = lambda tensor: tensor
+    remaining = list(batches)
+    obj._forward_batch = lambda batch: remaining.pop(0)
+    return obj
+
+
+def test_run_eval_returns_none_without_val_dataloader():
+    obj = TrainDSparkRecipe.__new__(TrainDSparkRecipe)
+    obj.val_dataloader = None
+
+    assert TrainDSparkRecipe._run_eval(obj) is None
+
+
+def test_run_eval_forms_acceptance_ratio_over_the_whole_split():
+    # Batch-level ratios are 0.75 and 0.0; averaging those would give 0.375,
+    # which over-weights the batch with fewer measured positions. The reported
+    # rate must be the ratio of the summed numerator to the summed denominator.
+    batches = [
+        _eval_metrics_batch(loss=1.0, accept_num=[3.0, 1.0], accept_den=[4.0, 2.0]),
+        _eval_metrics_batch(loss=3.0, accept_num=[0.0, 0.0], accept_den=[6.0, 0.0]),
+    ]
+
+    metrics = TrainDSparkRecipe._run_eval(_eval_recipe(batches))
+
+    assert metrics["val_loss"] == pytest.approx(2.0)
+    assert metrics["accept_rate"] == pytest.approx(4.0 / 12.0)
+    assert metrics["accept_rate@0"] == pytest.approx(3.0 / 10.0)
+    # Position 1 was measured only in the first batch, so its denominator stays 2.
+    assert metrics["accept_rate@1"] == pytest.approx(0.5)
+
+
+def test_run_eval_reports_tau_and_confidence_calibration():
+    batches = [
+        _eval_metrics_batch(
+            loss=1.0,
+            accept_num=[1.0],
+            accept_den=[2.0],
+            tau_num=3.0,
+            tau_den=2.0,
+            conf_abs_err=0.4,
+            conf_bias=-0.2,
+            conf_cumprod_bias=0.1,
+            conf_den=2.0,
+        ),
+        _eval_metrics_batch(
+            loss=1.0,
+            accept_num=[1.0],
+            accept_den=[2.0],
+            tau_num=1.0,
+            tau_den=2.0,
+            conf_abs_err=0.2,
+            conf_bias=0.2,
+            conf_cumprod_bias=0.1,
+            conf_den=2.0,
+        ),
+    ]
+
+    metrics = TrainDSparkRecipe._run_eval(_eval_recipe(batches))
+
+    assert metrics["tau"] == pytest.approx(1.0)
+    assert metrics["confidence_abs_error"] == pytest.approx(0.15)
+    assert metrics["confidence_bias"] == pytest.approx(0.0)
+    assert metrics["confidence_cumprod_bias"] == pytest.approx(0.05)
+
+
+def test_run_eval_omits_diagnostics_that_were_not_measured():
+    # No teacher signal and no confidence head: reporting these as 0.0 would read
+    # as collapsed acceptance and a perfectly calibrated head.
+    batches = [_eval_metrics_batch(loss=2.0, accept_num=[0.0], accept_den=[0.0])]
+
+    metrics = TrainDSparkRecipe._run_eval(_eval_recipe(batches))
+
+    assert metrics == {"val_loss": pytest.approx(2.0)}
+
+
+def test_run_eval_restores_training_mode():
+    events = []
+    obj = _eval_recipe([_eval_metrics_batch(loss=1.0, accept_num=[1.0], accept_den=[2.0])])
+    obj.trainer_module = SimpleNamespace(eval=lambda: events.append("eval"), train=lambda: events.append("train"))
+
+    TrainDSparkRecipe._run_eval(obj)
+
+    assert events == ["eval", "train"]
+
+
+def test_parallelism_axes_allow_data_and_expert_parallel_topologies():
+    """The supported DSpark topologies (pure DP, EP-sharded target, CP) pass the gate."""
+    for section in (
+        {},
+        {"ep_size": 8},
+        {"tp_size": 1, "pp_size": 1, "cp_size": 2, "ep_size": 1},
+        # explicit YAML nulls (``tp_size:``) must read as the default 1
+        {"tp_size": None, "pp_size": None},
+    ):
+        validate_dspark_parallelism_axes(ConfigNode({"distributed": section}))
+
+
+def test_parallelism_axes_allow_missing_distributed_block():
+    validate_dspark_parallelism_axes(ConfigNode({}))
+
+
+@pytest.mark.parametrize(
+    "section",
+    [
+        {"tp_size": 2},
+        {"pp_size": 2},
+        {"tp_size": 2, "pp_size": 4},
+    ],
+)
+def test_parallelism_axes_reject_tensor_and_pipeline_parallelism(section):
+    """tp_size/pp_size > 1 corrupt the supervision silently, so they must fail loudly.
+
+    A TP group's ranks each get a different micro-batch from the rank-sharded
+    sampler, and a pipelined target is an AutoPipeline the hidden-state capture
+    hooks cannot run.
+    """
+    with pytest.raises(NotImplementedError, match="DSpark does not support"):
+        validate_dspark_parallelism_axes(ConfigNode({"distributed": section}))
+
+
+def test_parallelism_axes_error_names_the_offending_axes():
+    with pytest.raises(NotImplementedError) as excinfo:
+        validate_dspark_parallelism_axes(ConfigNode({"distributed": {"tp_size": 4, "ep_size": 8}}))
+    message = str(excinfo.value)
+    assert "{'tp_size': 4}" in message
+
+
+def test_unsupported_parallel_axes_reads_absent_and_null_sizes_as_one():
+    """Shared by the up-front gate and the shard_dense_target gate, so both agree."""
+    assert unsupported_parallel_axes({}, ("tp_size", "pp_size")) == {}
+    assert unsupported_parallel_axes({"tp_size": None}, ("tp_size",)) == {}
+    assert unsupported_parallel_axes({"cp_size": 2, "ep_size": 1}, ("cp_size", "ep_size")) == {"cp_size": 2}
