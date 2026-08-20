@@ -349,35 +349,26 @@ class FSDP2Config:
 @dataclass
 class MegatronFSDPConfig:
     """
-    Additional configuration for MegatronFSDP distributed training.
+    Compatibility configuration for Megatron Core MFSDP v2.
 
     Note: Size parameters (dp_size, tp_size, cp_size) are grouped separately in
-    ``ParallelismSizes``. MegatronFSDP does not
-    support pp_size, dp_replicate_size, or ep_size.
+    ``ParallelismSizes``. The initial MFSDP v2 integration supports DP-only
+    ZeRO-3, so TP, CP, PP, EP, and DP replication must all remain size one.
 
     Attributes:
         megatron_fsdp_unit_modules (list[str] | None): Class paths of the submodules to wrap
             as individual MegatronFSDP units. When ``None`` (the default), the wrap classes
             are auto-derived from the model's ``_no_split_modules`` so the real instantiated
             block classes are used regardless of backend (HF or NeMo-custom).
-        zero_dp_strategy (int): Data parallel sharding strategy.
-        init_fsdp_with_meta_device (bool): Initialize MegatronFSDP with meta device if True.
+        zero_dp_strategy (int): Data parallel sharding strategy. Must be 3.
+        init_fsdp_with_meta_device (bool): Legacy compatibility field. MFSDP v2
+            stages meta-initialized models through CPU and rejects a non-default value.
         grad_reduce_in_fp32 (bool): Reduce gradients in fp32 if True.
         preserve_fp32_weights (bool): Preserve fp32 weights if True.
-        overlap_grad_reduce (bool): Overlap gradient reduction if True.
-        overlap_param_gather (bool): Overlap parameter gathering if True.
-        check_for_nan_in_grad (bool): Legacy buffer-level gradient NaN check.
-            BREAKING CHANGE on megatron-fsdp 0.5.0: this flag is a no-op,
-            preserved only for config compatibility. 0.5.0 removed the
-            buffer-level NaN check entirely, so gradient NaN checking is now OFF
-            regardless of this value; a truthy value is dropped with a one-time
-            warning. The default is kept True for config compatibility, but has
-            no effect. To restore gradient NaN checking, enable
-            report_nan_in_param_grad instead.
-        report_nan_in_param_grad (bool): Enable megatron-fsdp 0.5.0's precise
-            per-parameter gradient NaN check. This is the replacement for the
-            removed check_for_nan_in_grad and is OFF by default; enabling it can
-            significantly reduce training throughput.
+        overlap_grad_reduce (bool): Legacy compatibility field; MFSDP v2 owns overlap.
+        overlap_param_gather (bool): Legacy compatibility field; MFSDP v2 owns overlap.
+        check_for_nan_in_grad (bool): Legacy compatibility field with no MFSDP v2 effect.
+        report_nan_in_param_grad (bool): Unsupported legacy compatibility field.
         average_in_collective (bool): Average in collective if True.
         disable_bucketing (bool): Disable bucketing if True.
         calculate_per_token_loss (bool): Calculate per token loss if True.
@@ -404,6 +395,10 @@ class MegatronFSDPConfig:
     nccl_ub: bool = False
     fsdp_double_buffer: bool = False
     activation_checkpointing: bool = False
+
+    def __post_init__(self) -> None:
+        if self.zero_dp_strategy != 3:
+            raise ValueError(f"megatron_fsdp with MFSDP v2 requires zero_dp_strategy=3; got {self.zero_dp_strategy}.")
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert config to dictionary (shallow, preserves objects)."""

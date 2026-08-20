@@ -530,17 +530,20 @@ class TestIntegration:
     def test_megatron_fsdp_with_valid_options(self):
         cfg = {
             "strategy": "megatron_fsdp",
-            "tp_size": 2,
-            "zero_dp_strategy": 2,
-            "overlap_grad_reduce": False,
+            "zero_dp_strategy": 3,
+            "grad_reduce_in_fp32": True,
             "activation_checkpointing": True,
         }
         result = parse_distributed_section(cfg)
-        assert result["strategy_config"].zero_dp_strategy == 2
-        assert result["strategy_config"].overlap_grad_reduce is False
+        assert result["strategy_config"].zero_dp_strategy == 3
+        assert result["strategy_config"].grad_reduce_in_fp32 is True
         assert result["strategy_config"].activation_checkpointing is False
         assert result["activation_checkpointing"] is True
-        assert result["tp_size"] == 2
+        assert result["tp_size"] == 1
+
+    def test_megatron_fsdp_rejects_non_zero3(self):
+        with pytest.raises(ValueError, match="zero_dp_strategy=3"):
+            parse_distributed_section({"strategy": "megatron_fsdp", "zero_dp_strategy": 2})
 
     def test_fsdp2_full_config(self):
         cfg = {
