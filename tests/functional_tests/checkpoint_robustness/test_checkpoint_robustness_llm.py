@@ -798,7 +798,7 @@ def _get_logits_pp(trainer, input_ids, device) -> torch.Tensor:
     orig_seq_len = len(input_ids)
 
     # PP recv buffer shapes are locked at first forward. r0.4.0 lacks
-    # AutoPipeline.update_seq_len (added in #1689) to resize on the fly, so
+    # AutoPipeline's input-driven runtime metadata resizing, so
     # discover the locked seq_len from the stages and pad input_ids to match
     # for the forward pass. Captured logits are sliced back to orig_seq_len.
     def _discover_pp_seq_len() -> int:

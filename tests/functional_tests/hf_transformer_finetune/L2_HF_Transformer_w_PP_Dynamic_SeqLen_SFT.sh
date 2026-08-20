@@ -19,7 +19,7 @@ export PYTHONPATH=${PYTHONPATH:-}:$(pwd)
 export CUDA_VISIBLE_DEVICES="0,1"
 
 # PP with dynamic sequence lengths: no pad_seq_len_divisible, so seq_len varies
-# per batch. Tests update_seq_len() / reset_pp_stage_shapes() code path with
+# per batch. Tests automatic pipeline runtime shape adaptation with
 # both PipelineScheduleSingle (1f1b) and PipelineScheduleMulti (interleaved1f1b).
 #
 # The CI test model (hf_mixtral_2l) has only 2 layers. For interleaved1f1b with

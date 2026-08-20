@@ -138,11 +138,21 @@ class FakeSchedule:
         self._stages = stages
         self.n_microbatches = n_microbatches
         self._loss_fn = loss_fn
+        self.step_calls = []
+        self.eval_calls = []
 
     def step(self, *args, target=None, losses=None, **kwargs):
+        self.step_calls.append((args, target, losses, kwargs))
         # append a tiny dummy loss on last stage
         if losses is not None:
             losses.append(torch.tensor(0.123, device=kwargs.get("device", "cpu")))
+        return "step"
+
+    def eval(self, *args, target=None, losses=None, **kwargs):
+        self.eval_calls.append((args, target, losses, kwargs))
+        if losses is not None:
+            losses.append(torch.tensor(0.123, device=kwargs.get("device", "cpu")))
+        return "eval"
 
 
 def _patch_autopipeline_monkey(monkeypatch):
@@ -150,6 +160,7 @@ def _patch_autopipeline_monkey(monkeypatch):
     from nemo_automodel.components.distributed.pipelining import schedules, stage_runtime
 
     monkeypatch.setattr(stage_runtime, "PipelineStage", DummyPipelineStage)
+    monkeypatch.setattr(stage_runtime, "warmup_pipeline_stage_neighbors", lambda stage: None)
 
     def _fake_build_schedule(pp_schedule_csv, pp_schedule, micro, batch, stages, loss_fn, scale_grads=False):
         return FakeSchedule(stages, n_microbatches=(batch // max(micro, 1)), loss_fn=loss_fn)
@@ -806,11 +817,11 @@ class TestAutoPipelineIntegration:
         assert ap.scale_grads_in_schedule is True
 
 
-class TestAutoPipelineUpdateSeqLen:
-    """Test AutoPipeline.update_seq_len method."""
+class TestAutoPipelineRuntimeShapes:
+    """Test input-driven pipeline runtime metadata."""
 
-    def test_update_seq_len_before_build_raises(self):
-        """update_seq_len should fail if build() hasn't been called."""
+    def test_step_before_build_raises(self):
+        """A schedule cannot run before the model is partitioned."""
         world_mesh = FakeDeviceMesh()
         ap = AutoPipeline(
             world_mesh=world_mesh,
@@ -820,10 +831,10 @@ class TestAutoPipelineUpdateSeqLen:
             pp_batch_size=4,
             device=torch.device("cpu"),
         )
-        with pytest.raises(RuntimeError, match="AutoPipeline.build\\(\\) must be called before update_seq_len"):
-            ap.update_seq_len(128)
+        with pytest.raises(RuntimeError, match="AutoPipeline.build\\(\\) must be called before step"):
+            ap.step(torch.ones(4, 128, dtype=torch.long))
 
-    def test_update_seq_len_rebuilds_runtime_and_preserves_model_parts_and_loss(self, monkeypatch):
+    def test_step_adapts_runtime_and_preserves_model_parts_and_loss(self, monkeypatch):
         """A shape change rebuilds runtime objects without replacing model parts."""
         _patch_autopipeline_monkey(monkeypatch)
 
@@ -855,9 +866,13 @@ class TestAutoPipelineUpdateSeqLen:
         old_schedule = ap.info.schedule
         old_stages = ap.info.stages
         old_parts = tuple(ap.parts)
+        input_ids = torch.ones(2, 100, dtype=torch.long)
+        targets = torch.ones(2, 100, dtype=torch.long)
+        losses = []
 
-        ap.update_seq_len(100)
+        result = ap.step(input_ids, target=targets, losses=losses, attention_mask=None)
 
+        assert result == "step"
         assert ap._pp_current_seq_len == 100
         assert ap.info.schedule is not old_schedule
         assert ap.info.stages is not old_stages
@@ -865,17 +880,115 @@ class TestAutoPipelineUpdateSeqLen:
         assert ap.loss_fn is replacement_loss
         assert ap.info.stages[0].submod is old_parts[0]
         assert ap.info.stages[0].inputs_meta[0].shape == (1, 100)
+        assert ap.info.stages[0].inputs_meta[0].dtype == torch.long
+        assert ap.info.schedule.step_calls == [((input_ids,), targets, losses, {"attention_mask": None})]
 
         current_schedule = ap.info.schedule
         current_stages = ap.info.stages
-        ap.update_seq_len(100)
+        ap.step(input_ids)
         assert ap.info.schedule is current_schedule
         assert ap.info.stages is current_stages
 
-        ap.update_seq_len(200)
+        ap.step(torch.ones(2, 200, dtype=torch.long))
         assert ap._pp_current_seq_len == 200
         assert ap.info.schedule is not current_schedule
         assert ap.info.stages[0].inputs_meta[0].shape == (1, 200)
+
+    def test_configured_token_shape_reuses_initial_runtime(self, monkeypatch):
+        """A matching configured token shape does not rebuild on the first step."""
+        _patch_autopipeline_monkey(monkeypatch)
+        model = DummyQwenForCausalLM(num_layers=4)
+        module_fqns = generate_hf_model_fqn_per_model_part(
+            num_stages=2,
+            num_layers=4,
+            include_embeddings=True,
+            include_lm_head=True,
+            include_rotary_emb=True,
+            fqn_prefix="model.",
+        )
+        world_mesh = FakeWorldMesh()
+        world_mesh["pp"] = FakePPMesh(size=2, local_rank=0)
+        ap = AutoPipeline(
+            world_mesh=world_mesh,
+            pp_axis_name="pp",
+            pp_schedule="1f1b",
+            pp_microbatch_size=1,
+            pp_batch_size=2,
+            pp_seq_len=100,
+            module_fqns_per_model_part=module_fqns,
+            device=torch.device("cpu"),
+        ).build(model, loss_fn=Mock())
+        initial_schedule = ap.info.schedule
+
+        ap.step(torch.ones(2, 100, dtype=torch.long))
+
+        assert ap.info.schedule is initial_schedule
+
+    def test_eval_uses_embedding_metadata(self, monkeypatch):
+        """The first stage receives metadata matching precomputed embeddings."""
+        _patch_autopipeline_monkey(monkeypatch)
+        model = DummyQwenForCausalLM(num_layers=4)
+        module_fqns = generate_hf_model_fqn_per_model_part(
+            num_stages=2,
+            num_layers=4,
+            include_embeddings=True,
+            include_lm_head=True,
+            include_rotary_emb=True,
+            fqn_prefix="model.",
+        )
+        world_mesh = FakeWorldMesh()
+        world_mesh["pp"] = FakePPMesh(size=2, local_rank=0)
+        ap = AutoPipeline(
+            world_mesh=world_mesh,
+            pp_axis_name="pp",
+            pp_schedule="1f1b",
+            pp_microbatch_size=1,
+            pp_batch_size=2,
+            module_fqns_per_model_part=module_fqns,
+            device=torch.device("cpu"),
+        ).build(model, loss_fn=Mock())
+        embeddings = torch.ones(2, 100, 64, dtype=torch.float16)
+
+        result = ap.step(embeddings, forward_only=True)
+
+        assert result == "eval"
+        assert ap.info.stages[0].inputs_meta[0].shape == (1, 100, 64)
+        assert ap.info.stages[0].inputs_meta[0].dtype == torch.float16
+        assert ap.info.schedule.eval_calls[0][0][0] is embeddings
+
+        embedding_schedule = ap.info.schedule
+        ap.step(torch.ones(2, 100, dtype=torch.long), forward_only=True)
+        assert ap.info.schedule is not embedding_schedule
+        assert ap.info.stages[0].inputs_meta[0].shape == (1, 100)
+        assert ap.info.stages[0].inputs_meta[0].dtype == torch.long
+
+    def test_non_first_stage_does_not_forward_model_input_to_schedule(self, monkeypatch):
+        """Non-first stages use the input only to select runtime metadata."""
+        _patch_autopipeline_monkey(monkeypatch)
+        model = DummyQwenForCausalLM(num_layers=4)
+        module_fqns = generate_hf_model_fqn_per_model_part(
+            num_stages=2,
+            num_layers=4,
+            include_embeddings=True,
+            include_lm_head=True,
+            include_rotary_emb=True,
+            fqn_prefix="model.",
+        )
+        world_mesh = FakeWorldMesh()
+        world_mesh["pp"] = FakePPMesh(size=2, local_rank=1)
+        ap = AutoPipeline(
+            world_mesh=world_mesh,
+            pp_axis_name="pp",
+            pp_schedule="1f1b",
+            pp_microbatch_size=1,
+            pp_batch_size=2,
+            module_fqns_per_model_part=module_fqns,
+            device=torch.device("cpu"),
+        ).build(model, loss_fn=Mock())
+
+        ap.step(torch.ones(2, 100, dtype=torch.long))
+
+        assert ap.info.schedule.step_calls[0][0] == ()
 
     def test_configure_fused_loss_rebuilds_last_stage_output_metadata(self, monkeypatch):
         _patch_autopipeline_monkey(monkeypatch)
@@ -894,7 +1007,7 @@ class TestAutoPipelineUpdateSeqLen:
             module_fqns_per_model_part=module_fqns,
             device=torch.device("cpu"),
         ).build(model, loss_fn=Mock())
-        ap.update_seq_len(100)
+        ap.step(torch.ones(2, 100, dtype=torch.long))
         old_stage = ap.info.stages[0]
 
         fused_loss = Mock()
@@ -906,7 +1019,7 @@ class TestAutoPipelineUpdateSeqLen:
         assert ap.info.stages[0].outputs_meta[0].shape == (1, 100, 64)
 
     def test_model_config_stored_after_build(self, monkeypatch):
-        """build() should store model.config for later use by update_seq_len."""
+        """build() stores model configuration for later runtime adaptation."""
         _patch_autopipeline_monkey(monkeypatch)
 
         model = DummyQwenForCausalLM(num_layers=4)

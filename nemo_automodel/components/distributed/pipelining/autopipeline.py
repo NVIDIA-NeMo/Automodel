@@ -126,6 +126,8 @@ class AutoPipeline:
         self._info = PipelineInfo()
         self._model_config = None
         self._pp_current_seq_len: Optional[int] = None
+        self._pp_current_input_spec: tuple[tuple[int, ...], torch.dtype] | None = None
+        self._pp_first_stage_input_meta: torch.Tensor | None = None
         self._parts: list[model_parts.PipelineModelPart] = []
 
     def _create_runtime(
@@ -146,6 +148,7 @@ class AutoPipeline:
             local_batch_size=self.pp_batch_size,
             seq_len=seq_len,
             tensor_dtype=self.dtype,
+            first_stage_input_meta=self._pp_first_stage_input_meta,
             schedule_name=self.pp_schedule,
             schedule_csv=self.pp_schedule_csv,
             loss_fn=loss_fn,
@@ -203,6 +206,8 @@ class AutoPipeline:
 
         self._info = PipelineInfo(schedule=runtime.schedule, model_parts=part_modules, stages=runtime.stages)
         self._pp_current_seq_len = self.pp_seq_len
+        self._pp_current_input_spec = ((self.pp_seq_len,), torch.long) if self.pp_seq_len is not None else None
+        self._pp_first_stage_input_meta = None
 
         return self
 
@@ -258,29 +263,29 @@ class AutoPipeline:
         else:
             self._info.schedule._loss_fn = loss_fn
 
-    def update_seq_len(self, seq_len: int) -> None:
-        """Recreate pipeline runtime objects for a new sequence length.
-
-        VLM training batches can have wildly different sequence lengths across steps
-        (image batches vs. text-only batches).  PyTorch's PipelineStage locks in recv
-        buffer sizes on the first step, causing a shape-mismatch error on later steps
-        with different seq_lens.
-
-        Call this before every ``schedule.step()`` to update the stage shapes without
-        running an expensive forward pass.  A no-op when seq_len has not changed.
-
-        Args:
-            seq_len: Sequence length of the upcoming batch (``input_ids.shape[1]``).
-        """
-        if seq_len == self._pp_current_seq_len:
-            return
+    def _ensure_runtime_for(self, model_input: torch.Tensor) -> None:
+        """Select analytical stage metadata for the upcoming model input."""
+        if model_input.ndim < 2:
+            raise ValueError(f"Pipeline model input must have at least two dimensions, got {model_input.shape}")
         if self._model_config is None:
-            raise RuntimeError("AutoPipeline.build() must be called before update_seq_len()")
+            raise RuntimeError("AutoPipeline.build() must be called before step()")
         if self._info.schedule is None:
-            raise RuntimeError("AutoPipeline.build() must be called before update_seq_len()")
+            raise RuntimeError("AutoPipeline.build() must be called before step()")
+
+        seq_len = model_input.shape[1]
+        input_spec = (tuple(model_input.shape[1:]), model_input.dtype)
+        if input_spec == self._pp_current_input_spec:
+            return
+
         loss_fn = self.loss_fn
         if loss_fn is None:
             raise RuntimeError("Pipeline schedule has no loss function")
+        self._pp_first_stage_input_meta = torch.empty(
+            self.pp_microbatch_size,
+            *model_input.shape[1:],
+            device="meta",
+            dtype=model_input.dtype,
+        )
         runtime = self._create_runtime(
             seq_len=seq_len,
             loss_fn=loss_fn,
@@ -292,7 +297,26 @@ class AutoPipeline:
             stages=runtime.stages,
         )
         self._pp_current_seq_len = seq_len
-        logger.debug("PP runtime rebuilt for seq_len=%d", seq_len)
+        self._pp_current_input_spec = input_spec
+        logger.debug("PP runtime rebuilt for input shape=%s dtype=%s", tuple(model_input.shape), model_input.dtype)
+
+    def step(
+        self,
+        model_input: torch.Tensor,
+        *,
+        target: torch.Tensor | None = None,
+        losses: list[torch.Tensor] | None = None,
+        forward_only: bool = False,
+        **kwargs: object,
+    ) -> object | None:
+        """Run a schedule step after adapting runtime metadata to the input shape."""
+        self._ensure_runtime_for(model_input)
+        schedule = self._info.schedule
+        if schedule is None:
+            raise RuntimeError("Pipeline runtime construction did not produce a schedule")
+        schedule_fn = schedule.eval if forward_only else schedule.step
+        args = (model_input,) if self._info.has_first_stage else ()
+        return schedule_fn(*args, target=target, losses=losses, **kwargs)
 
     @property
     def parts(self) -> list[nn.Module]:

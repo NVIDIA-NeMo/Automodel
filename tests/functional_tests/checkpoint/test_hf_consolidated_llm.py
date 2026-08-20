@@ -151,10 +151,7 @@ def get_validation_loss(
             targets = None
 
         input_ids = val_batch.pop("input_ids")
-        if pp.info.has_first_stage:
-            pp.info.schedule.step(input_ids, target=targets, losses=losses, **val_batch)
-        else:
-            pp.info.schedule.step(target=targets, losses=losses, **val_batch)
+        pp.step(input_ids, target=targets, losses=losses, **val_batch)
         if pp.info.has_last_stage:
             local_loss = torch.sum(torch.stack(losses))
         else:

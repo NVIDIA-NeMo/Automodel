@@ -177,7 +177,7 @@ def main():
             dtype=torch.bfloat16,
             pp_seq_len=seqlen,
         ).build(model, loss_fn=loss_fn, parallelize_fn=cp_only)
-        model_part0, has_last, has_first = pp.parts[0], pp.info.has_last_stage, pp.info.has_first_stage
+        model_part0, has_last = pp.parts[0], pp.info.has_last_stage
     else:
         cp_only(model, mesh, None, dp_axis_names=("dp",), cp_axis_name="cp")
         model_part0 = model
@@ -199,12 +199,7 @@ def main():
             with train_ctx(), stage_vlm_media_for_pp(pp, pp.parts, batch):
                 sl = [] if has_last else None
                 mi = batch.pop("input_ids")
-                pp.update_seq_len(mi.shape[1])
-                (
-                    pp.info.schedule.step(mi, target=labels, losses=sl, **batch)
-                    if has_first
-                    else pp.info.schedule.step(target=labels, losses=sl, **batch)
-                )
+                pp.step(mi, target=labels, losses=sl, **batch)
             local = torch.stack(sl).mean() if has_last else torch.tensor(0.0, device=device)
         else:
             with train_ctx():

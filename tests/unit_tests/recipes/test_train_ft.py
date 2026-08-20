@@ -1322,6 +1322,12 @@ def _create_minimal_recipe_for_pp_test(monkeypatch, pp_info):
     object.__setattr__(recipe, "dist_env", SimpleNamespace(device=torch.device("cpu"), rank=0, is_main=True))
     object.__setattr__(recipe, "device_mesh", None)
     object.__setattr__(recipe, "pp_enabled", True)
+
+    def run_schedule(model_input, *, forward_only=False, **kwargs):
+        schedule_fn = pp_info.schedule.eval if forward_only else pp_info.schedule.step
+        args = (model_input,) if pp_info.has_first_stage else ()
+        return schedule_fn(*args, **kwargs)
+
     object.__setattr__(
         recipe,
         "pp",
@@ -1330,7 +1336,7 @@ def _create_minimal_recipe_for_pp_test(monkeypatch, pp_info):
             loss_fn=None,
             pp_batch_size=1,
             pp_microbatch_size=1,
-            update_seq_len=lambda seq_len: None,
+            step=run_schedule,
         ),
     )
     object.__setattr__(recipe, "tokenizer", SimpleNamespace(pad_token_id=0))
@@ -2068,7 +2074,7 @@ class TestRunTrainOptimStepSetsMoEScale:
 
         if pp_enabled:
             pp_info = SimpleNamespace(has_first_stage=True, has_last_stage=True)
-            object.__setattr__(recipe, "pp", SimpleNamespace(info=pp_info, update_seq_len=lambda seq_len: None))
+            object.__setattr__(recipe, "pp", SimpleNamespace(info=pp_info))
             # Stub the PP last-stage broadcast helper (post-d96f1b20 the recipe
             # broadcasts inside the PP group instead of using send/recv).
             monkeypatch.setattr(recipe, "_broadcast_from_last_pp_stage", lambda t: t)

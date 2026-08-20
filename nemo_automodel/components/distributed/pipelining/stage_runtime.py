@@ -120,6 +120,7 @@ def create_pipeline_stages(
     microbatch_size: int,
     seq_len: int | None,
     tensor_dtype: torch.dtype | None = None,
+    first_stage_input_meta: torch.Tensor | None = None,
 ) -> list[PipelineStage]:
     """Create PyTorch stages from already-parallelized model parts."""
     stages = []
@@ -134,6 +135,8 @@ def create_pipeline_stages(
                 seq_len,
                 tensor_dtype=tensor_dtype,
             )
+            if part.is_first and first_stage_input_meta is not None:
+                inputs_meta = (first_stage_input_meta,)
             metadata = {"input_args": inputs_meta, "output_args": outputs_meta}
         try:
             stage = PipelineStage(
@@ -231,6 +234,7 @@ def build_pipeline_runtime(
     local_batch_size: int,
     seq_len: int | None,
     tensor_dtype: torch.dtype | None,
+    first_stage_input_meta: torch.Tensor | None,
     schedule_name: str | None,
     schedule_csv: str | None,
     loss_fn: Callable,
@@ -249,6 +253,7 @@ def build_pipeline_runtime(
         microbatch_size=microbatch_size,
         seq_len=seq_len,
         tensor_dtype=tensor_dtype,
+        first_stage_input_meta=first_stage_input_meta,
     )
     if warmup_neighbors and seq_len is not None:
         warmup_pipeline_stage_neighbors(stages[0])

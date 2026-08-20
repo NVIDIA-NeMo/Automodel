@@ -14,7 +14,7 @@
 
 """cp2xpp2 layer-2 verification for the sunk pre-embed path (L1, 2/4 GPUs).
 
-Drives the REAL AutoPipeline split + schedule.step under cp2xpp2 (4 GPUs) and
+Drives the real ``AutoPipeline`` split and step boundary under cp2xpp2 (4 GPUs) and
 cp2xpp1 (2 GPUs) with a tiny random-init text-only config, exercising the whole
 sunk layer-2 contract: the sharder-only hook, the in-forward embed +
 shard_sequence_for_cp_round_robin, the asymmetric pipeline_stage_metas (full-length
@@ -235,7 +235,7 @@ def main():
             dtype=torch.bfloat16,
             pp_seq_len=seqlen,
         ).build(model, loss_fn=loss_fn, parallelize_fn=cp_only_parallelize)
-        model_part0, has_last, has_first = pp.parts[0], pp.info.has_last_stage, pp.info.has_first_stage
+        model_part0, has_last = pp.parts[0], pp.info.has_last_stage
     else:
         cp_only_parallelize(model, mesh, None, dp_axis_names=("dp",), cp_axis_name="cp")
         model_part0 = model
@@ -255,11 +255,7 @@ def main():
             with train_ctx():
                 step_losses = [] if has_last else None
                 model_input = batch.pop("input_ids")
-                pp.update_seq_len(model_input.shape[1])
-                if has_first:
-                    pp.info.schedule.step(model_input, target=labels, losses=step_losses, **batch)
-                else:
-                    pp.info.schedule.step(target=labels, losses=step_losses, **batch)
+                pp.step(model_input, target=labels, losses=step_losses, **batch)
             # Per-microbatch loss_fn returns the microbatch mean; averaging over
             # microbatches gives the batch mean, comparable to the cp2xpp1 leg.
             local = torch.stack(step_losses).mean() if has_last else torch.tensor(0.0, device=device)

@@ -971,10 +971,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
                 input_ids = batch.pop("input_ids")
 
-                # Update PP stage shapes for the current batch's seq_len.
-                # This is a no-op when the length hasn't changed.
-                self.pp.update_seq_len(input_ids.shape[1])
-
                 # Filter out None values and empty dicts from batch to avoid PP chunking errors
                 batch_filtered = {
                     k: v for k, v in batch.items() if v is not None and not (isinstance(v, dict) and len(v) == 0)
@@ -989,18 +985,13 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 pp_loss_fn = self.pp.loss_fn if self.pp.info.has_last_stage else None
                 if pp_loss_fn is not None and hasattr(pp_loss_fn, "cu_seqlens"):
                     pp_loss_fn.cu_seqlens = cu_seqlens
-                if is_train:
-                    # Use step for training (forward + backward)
-                    if self.pp.info.has_first_stage:
-                        self.pp.info.schedule.step(input_ids, target=targets, losses=losses, **batch_filtered)
-                    else:
-                        self.pp.info.schedule.step(target=targets, losses=losses, **batch_filtered)
-                else:
-                    # Use eval for validation (forward only, no backward)
-                    if self.pp.info.has_first_stage:
-                        self.pp.info.schedule.eval(input_ids, target=targets, losses=losses, **batch_filtered)
-                    else:
-                        self.pp.info.schedule.eval(target=targets, losses=losses, **batch_filtered)
+                self.pp.step(
+                    input_ids,
+                    target=targets,
+                    losses=losses,
+                    forward_only=not is_train,
+                    **batch_filtered,
+                )
 
             if self.pp.info.has_last_stage:
                 local_loss = torch.sum(torch.stack(losses))

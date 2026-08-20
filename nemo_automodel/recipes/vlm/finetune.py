@@ -751,27 +751,6 @@ class FinetuneRecipeForVLM(BaseRecipe):
             )
         return total_loss
 
-    def _maybe_set_pp_first_stage_embed_input_meta(self, model_input: torch.Tensor) -> None:
-        if (
-            not self.pp_enabled
-            or not getattr(self.pp.info, "has_first_stage", False)
-            or not model_input.dtype.is_floating_point
-            or model_input.ndim != 3
-        ):
-            return
-
-        for stage in self.pp.info.stages:
-            if stage.is_first:
-                stage.inputs_meta = (
-                    torch.empty(
-                        self.pp.pp_microbatch_size,
-                        model_input.shape[1],
-                        model_input.shape[2],
-                        device="meta",
-                        dtype=model_input.dtype,
-                    ),
-                )
-
     def _forward_backward_step(
         self,
         idx,
@@ -789,8 +768,8 @@ class FinetuneRecipeForVLM(BaseRecipe):
         # touches no weights and consumes nothing. Invoke it on EVERY pp stage so
         # its aux-only sharder keeps input_ids full-length everywhere; otherwise
         # non-first stages hit the generic round-robin sharder, feed an
-        # already-local seq_len to update_seq_len, and pipeline_stage_metas
-        # ÷cp a second time -> the inter-stage hidden truncates to S/cp²
+        # already-local sequence length to the pipeline runtime, whose analytical
+        # stage metadata would divide by CP a second time and truncate to S/cp²
         # (text-decoder RoPE size mismatch).
         _is_first_or_no_pp = not self.pp_enabled or getattr(self.pp.info, "has_first_stage", False)
         _cp_active = (
@@ -839,14 +818,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
                 model_input_key = "inputs_embeds" if "inputs_embeds" in batch else "input_ids"
                 model_input = batch.pop(model_input_key)
-                self.pp.update_seq_len(model_input.shape[1])
-                self._maybe_set_pp_first_stage_embed_input_meta(model_input)
 
                 with stage_vlm_media_for_pp(self.pp, self.model_parts, batch):
-                    if self.pp.info.has_first_stage:
-                        self.pp.info.schedule.step(model_input, target=targets, losses=losses, **batch)
-                    else:
-                        self.pp.info.schedule.step(target=targets, losses=losses, **batch)
+                    self.pp.step(model_input, target=targets, losses=losses, **batch)
 
             if self.pp.info.has_last_stage:
                 local_loss = torch.sum(torch.stack(losses))

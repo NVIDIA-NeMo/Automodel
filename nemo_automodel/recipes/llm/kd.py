@@ -513,15 +513,13 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                 }
                 targets = labels.clone() if self.teacher_pp.info.has_last_stage else None
                 losses = [] if self.teacher_pp.info.has_last_stage else None
-                if self.teacher_pp.info.has_first_stage:
-                    self.teacher_pp.info.schedule.eval(
-                        input_ids,
-                        target=targets,
-                        losses=losses,
-                        **batch_filtered,
-                    )
-                else:
-                    self.teacher_pp.info.schedule.eval(target=targets, losses=losses, **batch_filtered)
+                self.teacher_pp.step(
+                    input_ids,
+                    target=targets,
+                    losses=losses,
+                    forward_only=True,
+                    **batch_filtered,
+                )
                 capture = getattr(self.teacher_model, "_teacher_logits_capture", None)
                 captured_logits = capture[0] if capture is not None else None
                 if capture is not None:
@@ -745,12 +743,13 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                 # Run teacher under inference_mode; logits captured by _teacher_capture_loss_fn.
                 with torch.inference_mode():
                     teacher_losses = [] if self.teacher_pp.info.has_last_stage else None
-                    if self.teacher_pp.info.has_first_stage:
-                        self.teacher_pp.info.schedule.eval(
-                            input_ids, target=targets, losses=teacher_losses, **batch_filtered
-                        )
-                    else:
-                        self.teacher_pp.info.schedule.eval(target=targets, losses=teacher_losses, **batch_filtered)
+                    self.teacher_pp.step(
+                        input_ids,
+                        target=targets,
+                        losses=teacher_losses,
+                        forward_only=True,
+                        **batch_filtered,
+                    )
                     # Transfer captured logits into the recipe so pp_kd_loss_fn can read them.
                     capture = getattr(self.teacher_model, "_teacher_logits_capture", None)
                     if capture is not None and capture[0] is not None:
@@ -762,16 +761,13 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
 
             # Run student forward (+ backward if training).
             student_losses = [] if self.pp.info.has_last_stage else None
-            if is_train:
-                if self.pp.info.has_first_stage:
-                    self.pp.info.schedule.step(input_ids, target=targets, losses=student_losses, **batch_filtered)
-                else:
-                    self.pp.info.schedule.step(target=targets, losses=student_losses, **batch_filtered)
-            else:
-                if self.pp.info.has_first_stage:
-                    self.pp.info.schedule.eval(input_ids, target=targets, losses=student_losses, **batch_filtered)
-                else:
-                    self.pp.info.schedule.eval(target=targets, losses=student_losses, **batch_filtered)
+            self.pp.step(
+                input_ids,
+                target=targets,
+                losses=student_losses,
+                forward_only=not is_train,
+                **batch_filtered,
+            )
 
             if self.pp.info.has_last_stage:
                 loss_buffer.append(torch.sum(torch.stack(student_losses)).detach().clone())

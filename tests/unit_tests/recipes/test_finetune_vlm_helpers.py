@@ -1540,10 +1540,10 @@ class _MockAutoPipeline:
         self._info = _MockPPInfo(has_first_stage, has_last_stage, n_microbatches, add_losses)
         self.info = self._info
 
-    def update_seq_len(self, seq_len: int) -> None:
-        # Dynamic seq-len hook is a no-op in tests; AutoPipeline exposes this for
-        # variable-length VLM batches.
-        return None
+    def step(self, model_input: torch.Tensor, **kwargs):
+        """Mirror AutoPipeline's first-stage argument routing."""
+        args = (model_input,) if self.info.has_first_stage else ()
+        return self.info.schedule.step(*args, **kwargs)
 
 
 def _create_pp_recipe(model=None):
