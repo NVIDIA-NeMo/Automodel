@@ -1,0 +1,159 @@
+# LoRA fine-tuning for Qwen/Qwen3.8-27B on Arabic OCR (page image -> Markdown).
+#
+# Launch (the LD_LIBRARY_PATH prefix is required on this cluster so torch's
+# bundled cuBLASLt wins over the system CUDA 13.1 one):
+#
+#   export LD_LIBRARY_PATH=$PWD/.venv/lib/python3.12/site-packages/nvidia/cu13/lib:$LD_LIBRARY_PATH
+#   automodel --nproc-per-node=8 examples/vlm_finetune/qwen3_8/qwen3_8_27b_lora_arabic_ocr.yaml
+#
+# 5 epochs over 1998 pairs, one checkpoint per epoch.
+#
+# Dataset: 1998 usable <id>.png / <id>.md pairs (2 empty transcripts skipped).
+# Exact sequence lengths over all 1998, with the 2 MP image cap below
+# (vision + answer + ~237 template overhead): median 2244, p90 2762, p99 3471,
+# max 5789. Batches pad to their own longest, so nothing is truncated.
+
+recipe: FinetuneRecipeForVLM
+
+step_scheduler:
+  # Effective batch is 32 samples. local_batch_size 4 with accumulation 1 would
+  # give the identical effective batch AND the identical step count -- the only
+  # difference is peak memory. Measured: 26.3 GiB at bs1, 39.6 GiB at bs2, i.e.
+  # ~13.3 GiB per sample over a ~13 GiB base, so bs4 averages ~66 GiB of the
+  # 79.25 GiB available. That average fits, but memory tracks tokens, not
+  # samples, and sequences run to 3805 tokens against a 2190 median -- a batch
+  # that draws several long pages blows past 80 GiB. Accumulation buys the same
+  # optimizer math at bs2 memory.
+  global_batch_size: 32
+  local_batch_size: 2
+  num_epochs: 5
+  # null -> derived as num_epochs * epoch_len. epoch_len = ceil(125 micro-batches
+  # per rank / 2 accumulation) = 63 steps per epoch, so 315 steps total.
+  max_steps: null
+  # null -> defaults to epoch_len, i.e. exactly one checkpoint per epoch.
+  ckpt_every_steps: null
+  save_checkpoint_every_epoch: true
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 10
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 1234
+  ranked: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
+  pretrained_model_name_or_path: Qwen/Qwen3.8-27B
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: sdpa
+    linear: torch
+    rms_norm: torch
+    rope_fusion: false
+  attn_implementation: sdpa
+  torch_dtype: bfloat16
+  # Required by FusedLinearCrossEntropy: it consumes final hidden states and
+  # applies the lm_head itself, chunked.
+  text_config:
+    use_cache: false
+    output_hidden_states: true
+
+processor:
+  _target_: transformers.AutoProcessor.from_pretrained
+  pretrained_model_name_or_path: Qwen/Qwen3.8-27B
+  # Cap the vision budget at 2 MP. The processor default is 16.7 MP, which turns
+  # the largest scans (8000x6000) into ~16400 vision tokens and makes step time
+  # and memory swing wildly. 74% of these pages are already under 2 MP, so the
+  # typical page is untouched and only the oversized outliers are downscaled.
+  size:
+    longest_edge: 2097152
+    shortest_edge: 65536
+
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  match_all_linear: false
+  exclude_modules:
+    - "*vision_tower*"
+    - "*vision*"
+    - "*visual*"
+    - "*image_encoder*"
+    - "*lm_head*"
+    - "*audio*"
+    # The multi-token-prediction head is for speculative decoding, not for this
+    # task; adapting it only complicates the merge and serve steps.
+    - "*mtp*"
+  dim: 16
+  alpha: 32
+  use_triton: true
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: /lustre1/tier2/users/yasser.djilali/nebius/ckpt/qwen3_8_27b_arabic_ocr/
+  model_save_format: safetensors
+  save_consolidated: false
+
+distributed:
+  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  dp_replicate_size: 1
+  ep_size: 1
+  sequence_parallel: false
+  activation_checkpointing: true
+
+freeze_config:
+  freeze_vision_tower: true
+  freeze_audio_tower: true
+  freeze_language_model: false
+
+loss_fn:
+  # Vocab is 248320. With sequences up to 4096, plain cross-entropy materializes
+  # a [4096, 248320] fp32 logits tensor -- 3.79 GiB per micro-batch, which OOMs
+  # on top of the sharded weights. The fused kernel applies the lm_head and the
+  # CE in chunks and never builds that tensor.
+  _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
+  reduction: sum
+
+dataset:
+  _target_: nemo_automodel.components.datasets.vlm.arabic_ocr.make_arabic_ocr_dataset
+  path_or_dataset: /lustre1/tier2/projects/falcon-arabic/data/arabic-ocr/accepted_benchmark/accepted
+  split: train
+  val_fraction: 0.0
+  seed: 1234
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  # Kept at 0: forked workers inherited the rank's CUDA context and showed up as
+  # a second ~40 GiB process on each GPU, which is what triggered the first OOM.
+  num_workers: 0
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.vlm.arabic_ocr.arabic_ocr_collate_fn
+    # No max_length on purpose. Setting it switches padding to "max_length",
+    # which pads every sample to the cap -- mean real length is 2006 tokens, so
+    # a 4096 cap spends 51% of every step on padding -- and right-truncates the
+    # 4 samples (0.20%) that exceed it, cutting the end off their transcription
+    # and teaching the model to stop mid-page. Without it, batches pad to their
+    # own longest and nothing is truncated (tokenizer model_max_length 262144).
+
+optimizer:
+  _target_: torch.optim.AdamW
+  betas: [0.9, 0.95]
+  eps: 1e-8
+  lr: 1.0e-4
+  weight_decay: 0.01
+
+lr_scheduler:
+  lr_warmup_steps: 20
+  lr_decay_style: cosine
+  min_lr: 1.0e-5
+
+wandb:
+  # A present wandb: block enables logging; enable:false drops the whole section.
+  # The flag is stripped before wandb.init(), so it never leaks through as a kwarg.
+  enable: true
+  project: falcon-arabic-ocr
+  name: qwen3_8_27b_lora_arabic_ocr
+  tags: [qwen3.8-27b, arabic-ocr, lora]
