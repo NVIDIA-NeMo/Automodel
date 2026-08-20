@@ -70,6 +70,7 @@ from nemo_automodel.components.checkpoint.conversion_mapping import (
     requires_tensor_merging,
 )
 from nemo_automodel.components.checkpoint.lifecycle import CheckpointLifecycle
+from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, OptimizerState
 from nemo_automodel.components.checkpoint.utils import (
     ensure_tied_lm_head,
@@ -829,10 +830,34 @@ class Checkpointer:
         # fall behind other ranks' async allocations.
         is_safetensors = _is_safetensors_checkpoint(model_path)
         is_custom_model = _is_custom_model(model_state.model[0])
+        # Custom adapters traditionally took the frugal full-state path here because converting
+        # grouped experts into load destinations could materialize a second on-device copy and OOM.
+        # Adapters whose destinations all alias final model storage can now opt into the standard
+        # DCP path below, which writes checkpoint tensors directly through those views. Keep the CPU
+        # path for non-aliasing backends and quantized initialization, whose conversion allocates.
+        # World size inline (not via components.distributed) so the checkpoint component stays
+        # independent per the import-linter contract.
+        if torch.distributed.is_initialized():
+            world_size = torch.distributed.get_world_size()
+        else:
+            world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        state_dict_adapter = getattr(_unwrap_ddp_model(model_state.model[0]), "state_dict_adapter", None)
+        supports_write_through_checkpoint_load = (
+            isinstance(state_dict_adapter, StateDictAdapter)
+            and state_dict_adapter.supports_write_through_checkpoint_load
+            and not self.config.dequantize_base_checkpoint
+        )
+        single_device_custom_safetensors = (
+            is_safetensors and is_custom_model and world_size == 1 and not supports_write_through_checkpoint_load
+        )
         if (
             is_init_step
             and len(model_state.model) == 1
-            and (_is_bin_checkpoint(model_path) or (is_safetensors and not is_custom_model))
+            and (
+                _is_bin_checkpoint(model_path)
+                or (is_safetensors and not is_custom_model)
+                or single_device_custom_safetensors
+            )
         ):
             t0 = time.monotonic()
             state_dict_from_disk = _load_hf_checkpoint_preserving_dtype(model_path)
@@ -884,6 +909,7 @@ class Checkpointer:
             return
 
         # Standard loading path (DCP copies into model's existing tensors; dtypes follow the model)
+        direct_load_started = time.monotonic()
         state_dict = model_state.state_dict()
         expected_keys = set(state_dict.keys())
         # When the model has a state_dict_adapter, it handles all key transformations
@@ -904,6 +930,12 @@ class Checkpointer:
             # Only base-checkpoint initialization needs FP8 scale destinations.
             quantization=bool(is_init_step and self.config.dequantize_base_checkpoint),
             device_mesh=self.moe_mesh,
+        )
+        destinations_ready = time.monotonic()
+        requested_bytes = sum(
+            tensor.nelement() * tensor.element_size()
+            for tensor in state_dict.values()
+            if isinstance(tensor, torch.Tensor)
         )
 
         compat_tied_lm_head_source_key: str | None = None
@@ -996,11 +1028,13 @@ class Checkpointer:
                 )
 
         state_dict = self._do_load(state_dict, model_path, storage_reader, is_init_step=is_init_step)
+        storage_read_complete = time.monotonic()
 
         if compat_tied_lm_head_source_key is not None and isinstance(lm_head_param_name, str):
             state_dict[lm_head_param_name] = state_dict.pop(compat_tied_lm_head_source_key)
 
         state_dict = _maybe_adapt_state_dict_from_hf(model_state.model[0], state_dict, moe_mesh=self.moe_mesh)
+        adapter_complete = time.monotonic()
         expected_keys_for_diff = {k for k in expected_keys if not k.endswith("_extra_state")}
         loaded_keys_for_diff = {k for k in state_dict if not k.endswith("_extra_state")}
         # MoE experts load in-place via strided views into model storage (DCP writes through
@@ -1039,6 +1073,20 @@ class Checkpointer:
             state_dict,
             strict=not (len(model_state.model) > 1 or has_state_dict_adapter or allow_checkpoint_key_subset),
             broadcast_from_rank0=self.process_group is None,
+        )
+        install_complete = time.monotonic()
+        requested_gb = requested_bytes / (1 << 30)
+        direct_load_seconds = install_complete - direct_load_started
+        logging.info(
+            "load_model: %.2f GB loaded in %.2fs "
+            "(%.2f GB/s overall | destinations %.2fs, storage read %.2fs, adapt %.2fs, install %.2fs)",
+            requested_gb,
+            direct_load_seconds,
+            requested_gb / max(direct_load_seconds, 1e-9),
+            destinations_ready - direct_load_started,
+            storage_read_complete - destinations_ready,
+            adapter_complete - storage_read_complete,
+            install_complete - adapter_complete,
         )
 
         del state_dict
@@ -2599,14 +2647,18 @@ def _load_hf_safetensors_checkpoint(model_path: str) -> dict[str, torch.Tensor] 
 
         with open(index_file) as f:
             index = json.load(f)
-        weight_map = index.get("weight_map", {})
-        for key, filename in weight_map.items():
+        keys_by_filename: dict[str, list[str]] = {}
+        for key, filename in index.get("weight_map", {}).items():
+            keys_by_filename.setdefault(filename, []).append(key)
+        for filename, keys in keys_by_filename.items():
             sf_path = os.path.join(model_path, filename)
             if not os.path.isfile(sf_path):
                 continue
             with safe_open(sf_path, framework="pt", device="cpu") as f:
-                if key in f.keys():
-                    out[key] = f.get_tensor(key)
+                available_keys = set(f.keys())
+                for key in keys:
+                    if key in available_keys:
+                        out[key] = f.get_tensor(key)
     else:
         for sf_path in glob.glob(os.path.join(model_path, "*.safetensors")):
             with safe_open(sf_path, framework="pt", device="cpu") as f:

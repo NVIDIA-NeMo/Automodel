@@ -181,6 +181,8 @@ class BagelStateDictAdapter(StateDictAdapter):
             ``1`` / ``2``.
     """
 
+    _supports_write_through_checkpoint_load = True
+
     def __init__(self, config: Any = None, *, stage: Any = "stage1") -> None:
         self.config = config
         self.stage = _normalize_stage(stage)

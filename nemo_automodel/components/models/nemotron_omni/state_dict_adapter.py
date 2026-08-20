@@ -105,6 +105,11 @@ class NemotronOmniStateDictAdapter(StateDictAdapter):
     and MoE expert merging) and handles vision/audio components directly.
     """
 
+    @property
+    def supports_write_through_checkpoint_load(self) -> bool:
+        """Whether the embedded language adapter and all wrapper renames preserve storage."""
+        return self._llm_adapter.supports_write_through_checkpoint_load
+
     def __init__(
         self,
         config,

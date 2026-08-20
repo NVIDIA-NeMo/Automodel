@@ -43,6 +43,8 @@ class Qwen3MoeStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
       model.layers.{L}.mlp.experts.down_projs         # [n_experts, moe_inter_dim, dim]
     """
 
+    _supports_write_through_checkpoint_load = True
+
     def __init__(
         self,
         config: Any,

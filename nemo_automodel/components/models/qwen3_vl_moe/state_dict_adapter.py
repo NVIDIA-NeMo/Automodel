@@ -42,6 +42,8 @@ class Qwen3VLMoeStateDictAdapter(StateDictAdapter):
                  shard, and wraps in DTensor via create_dtensor_from_local.
     """
 
+    _supports_write_through_checkpoint_load = True
+
     def __init__(
         self,
         config: Any,

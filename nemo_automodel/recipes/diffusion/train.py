@@ -26,6 +26,7 @@ import wandb
 from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy
 
 from nemo_automodel._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
+from nemo_automodel.components.distributed.fsdp2 import fsdp2_sharding_enabled
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.flow_matching.pipeline import FlowMatchingPipeline, create_adapter
@@ -693,6 +694,21 @@ class TrainDiffusionRecipe(BaseRecipe):
 
         self.model = self.pipe.transformer
 
+        # FSDP2's MixedPrecisionPolicy is what casts parameters to compute_dtype, and
+        # parallelization is skipped entirely on a single-rank mesh. Autocast covers
+        # that path so split-dtype configs behave the same on 1 GPU as on many, while
+        # leaving resident parameters and their gradients in model_dtype.
+        fsdp_casts_parameters = self.device_mesh is not None and fsdp2_sharding_enabled(self.device_mesh)
+        self._autocast_dtype = None
+        if self.model_dtype != self.compute_dtype and not fsdp_casts_parameters:
+            self._autocast_dtype = self.compute_dtype
+            logging.info(
+                "[INFO] FSDP2 parameter casting inactive (single-rank mesh); running the forward pass under "
+                "torch.autocast(%s) so parameters stay in %s",
+                self._autocast_dtype,
+                self.model_dtype,
+            )
+
         self.cp_size = int((fsdp_cfg or {}).get("cp_size", 1) or 1)
         if self.cp_size > 1:
             # CP peers receive the same batch (dataloader shards by dp rank, cp
@@ -865,6 +881,12 @@ class TrainDiffusionRecipe(BaseRecipe):
         if dist.is_initialized():
             dist.barrier()
 
+    def _autocast_context(self) -> Any:
+        """Return the per-forward autocast context used when FSDP2 does not cast parameters."""
+        if self._autocast_dtype is None:
+            return nullcontext()
+        return torch.autocast(device_type=self.device.type, dtype=self._autocast_dtype)
+
     def _transformer_engine_fp8_context(self) -> Any:
         """Return the per-forward Transformer Engine FP8 context."""
         if not self.transformer_engine_fp8:
@@ -923,7 +945,7 @@ class TrainDiffusionRecipe(BaseRecipe):
                     )
                     with sync_context:
                         try:
-                            with self._transformer_engine_fp8_context():
+                            with self._autocast_context(), self._transformer_engine_fp8_context():
                                 _, average_weighted_loss, _, _ = self.flow_matching_pipeline.step(
                                     model=self.model,
                                     batch=micro_batch,
