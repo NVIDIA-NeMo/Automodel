@@ -330,10 +330,10 @@ class BailingMoeV2StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapt
         """Yield final-storage expert groups and bounded fused-QKV groups for Ling.
 
         Args:
-            model_part: Single-device Ling model. Attention Q/K/V parameters have shapes [q_hidden, hidden],
-                [kv_hidden, hidden], and [kv_hidden, hidden]. Grouped gate/up experts have shape
-                [experts, hidden, 2 * expert_hidden], and grouped down experts have shape
-                [experts, expert_hidden, hidden].
+            model_part: Single-device Ling model whose parameters and persistent buffers are final destinations.
+                Attention Q/K/V parameters have shapes [q_hidden, hidden], [kv_hidden, hidden], and
+                [kv_hidden, hidden]. Grouped gate/up experts have shape [experts, hidden, 2 * expert_hidden], and
+                grouped down experts have shape [experts, expert_hidden, hidden].
             device_mesh: Must be ``None``. Distributed Ling loads continue to use the rank-sharded DCP path.
 
         Returns:
@@ -359,8 +359,8 @@ class BailingMoeV2StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapt
         expert_groups: dict[str, _LingExpertGroupBuilder] = {}
         n_experts = self.moe_config.n_routed_experts
 
-        for parameter_name, parameter in model_part.named_parameters():
-            native_name = canonical_parameter_fqn(parameter_name)
+        for state_name, state_tensor in model_part.state_dict(keep_vars=True).items():
+            native_name = canonical_parameter_fqn(state_name)
             if "lora" in native_name:
                 continue
 
@@ -371,7 +371,7 @@ class BailingMoeV2StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapt
                 builder = qkv_groups.setdefault(prefix, _LingQKVGroupBuilder(projections={}))
                 if projection in builder.projections:
                     raise ValueError(f"Duplicate Ling {projection.upper()} projection for {prefix}")
-                builder.projections[projection] = (native_name, parameter.detach())
+                builder.projections[projection] = (native_name, state_tensor.detach())
                 continue
 
             expert_match = _STREAMABLE_EXPERT_WEIGHT.match(native_name)
@@ -387,14 +387,14 @@ class BailingMoeV2StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapt
                     expert_root=expert_root,
                     native_name=native_name,
                     projection=projection,
-                    grouped_weight=parameter.detach(),
+                    grouped_weight=state_tensor.detach(),
                 )
                 continue
 
-            destination = parameter.detach()
+            destination = state_tensor.detach()
             converted = self.convert_single_tensor_to_hf(native_name, destination, quantization=False)
             if len(converted) != 1:
-                raise ValueError(f"Ordinary Ling parameter {native_name} produced {len(converted)} destinations")
+                raise ValueError(f"Ordinary Ling state tensor {native_name} produced {len(converted)} destinations")
             checkpoint_name, checkpoint_destination = converted[0]
             if not isinstance(checkpoint_destination, torch.Tensor):
                 raise ValueError(

@@ -237,7 +237,9 @@ class TestStreamingLoadGroups:
         backend_config,
     ):
         model = BailingMoeV2ForCausalLM(config=config, moe_config=moe_config, backend=backend_config)
-        parameters = {canonical_parameter_fqn(name): parameter for name, parameter in model.named_parameters()}
+        model_state = {
+            canonical_parameter_fqn(name): tensor for name, tensor in model.state_dict(keep_vars=True).items()
+        }
         groups = adapter.iter_checkpoint_load_groups(model)
         loaded_native_keys = set()
 
@@ -245,7 +247,13 @@ class TestStreamingLoadGroups:
         loaded_native_keys.update(ordinary_group.native_keys)
         assert "model.word_embeddings.weight" in ordinary_group.destinations
         assert ordinary_group.destinations["model.word_embeddings.weight"].untyped_storage().data_ptr() == (
-            parameters["model.embed_tokens.weight"].untyped_storage().data_ptr()
+            model_state["model.embed_tokens.weight"].untyped_storage().data_ptr()
+        )
+        correction_bias = ordinary_group.destinations["model.layers.1.mlp.gate.expert_bias"]
+        correction_bias.fill_(3.0)
+        torch.testing.assert_close(
+            model_state["model.layers.1.mlp.gate.e_score_correction_bias"],
+            torch.full_like(model_state["model.layers.1.mlp.gate.e_score_correction_bias"], 3.0),
         )
 
         pending_group = None
@@ -266,14 +274,14 @@ class TestStreamingLoadGroups:
             q_size = config.num_attention_heads * config.head_dim
             kv_size = config.num_key_value_heads * config.head_dim
             torch.testing.assert_close(
-                parameters[f"model.layers.{layer_id}.self_attn.q_proj.weight"], fused_values[:q_size]
+                model_state[f"model.layers.{layer_id}.self_attn.q_proj.weight"], fused_values[:q_size]
             )
             torch.testing.assert_close(
-                parameters[f"model.layers.{layer_id}.self_attn.k_proj.weight"],
+                model_state[f"model.layers.{layer_id}.self_attn.k_proj.weight"],
                 fused_values[q_size : q_size + kv_size],
             )
             torch.testing.assert_close(
-                parameters[f"model.layers.{layer_id}.self_attn.v_proj.weight"], fused_values[q_size + kv_size :]
+                model_state[f"model.layers.{layer_id}.self_attn.v_proj.weight"], fused_values[q_size + kv_size :]
             )
 
             del fused_qkv, qkv_group
@@ -287,7 +295,7 @@ class TestStreamingLoadGroups:
         gate_destination = expert_group.destinations[gate_key]
         gate_destination.fill_(7.0)
         expert_group.install()
-        grouped_gate_up = parameters["model.layers.1.mlp.experts.gate_and_up_projs"]
+        grouped_gate_up = model_state["model.layers.1.mlp.experts.gate_and_up_projs"]
         torch.testing.assert_close(
             grouped_gate_up[0, :, : config.moe_intermediate_size],
             torch.full_like(grouped_gate_up[0, :, : config.moe_intermediate_size], 7.0),
@@ -296,7 +304,7 @@ class TestStreamingLoadGroups:
         with pytest.raises(StopIteration):
             next(groups)
 
-        assert loaded_native_keys == set(parameters)
+        assert loaded_native_keys == set(model_state)
 
     def test_streaming_guards_backend_and_distributed_mesh(self, adapter, config, moe_config):
         assert adapter.supports_streaming_checkpoint_load is True
