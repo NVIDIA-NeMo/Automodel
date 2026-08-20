@@ -113,6 +113,7 @@ diffusion_kernels = [
 cuda = [
     "causal-conv1d",
     "mamba-ssm",
+    "nvidia-cudnn-frontend[cutedsl]>=1.27.0",
     "nv-grouped-gemm",
     # This is required to prevent ONNX errors arising from TE
     "onnxscript>=0.5.6",
