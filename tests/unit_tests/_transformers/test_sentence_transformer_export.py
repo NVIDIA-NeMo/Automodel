@@ -452,6 +452,91 @@ def test_sentence_transformer_source_accepts_canonical_module_paths(tmp_path, mo
     assert options.l2_normalize is expected_normalize
 
 
+def test_sentence_transformer_source_accepts_v6_normalize_module(tmp_path):
+    (tmp_path / "1_Pooling").mkdir()
+    (tmp_path / "2_Normalize").mkdir()
+    (tmp_path / "modules.json").write_text(
+        json.dumps(
+            [
+                {
+                    "idx": 0,
+                    "path": "",
+                    "type": "sentence_transformers.base.modules.transformer.Transformer",
+                },
+                {
+                    "idx": 1,
+                    "path": "1_Pooling",
+                    "type": "sentence_transformers.sentence_transformer.modules.pooling.Pooling",
+                },
+                {
+                    "idx": 2,
+                    "path": "2_Normalize",
+                    "type": "sentence_transformers.base.modules.normalize.Normalize",
+                },
+            ]
+        )
+    )
+    (tmp_path / "1_Pooling" / "config.json").write_text(json.dumps({"pooling_mode": "mean"}))
+    (tmp_path / "2_Normalize" / "config.json").write_text(
+        json.dumps(
+            {
+                "module_input_name": "sentence_embedding",
+                "module_output_name": "sentence_embedding",
+            }
+        )
+    )
+
+    options = sentence_transformer_export._load_sentence_transformer_wrapper_options(str(tmp_path), {})
+
+    assert options is not None
+    assert options.pooling == "avg"
+    assert options.l2_normalize is True
+
+
+@pytest.mark.parametrize(
+    "normalize_config",
+    [
+        {
+            "module_input_name": "token_embeddings",
+            "module_output_name": "token_embeddings",
+        },
+        {
+            "module_input_name": "sentence_embedding",
+            "module_output_name": "custom_embedding",
+        },
+    ],
+)
+def test_sentence_transformer_source_rejects_unrepresentable_v6_normalize_config(tmp_path, normalize_config):
+    (tmp_path / "1_Pooling").mkdir()
+    (tmp_path / "2_Normalize").mkdir()
+    (tmp_path / "modules.json").write_text(
+        json.dumps(
+            [
+                {
+                    "idx": 0,
+                    "path": "",
+                    "type": "sentence_transformers.base.modules.transformer.Transformer",
+                },
+                {
+                    "idx": 1,
+                    "path": "1_Pooling",
+                    "type": "sentence_transformers.sentence_transformer.modules.pooling.Pooling",
+                },
+                {
+                    "idx": 2,
+                    "path": "2_Normalize",
+                    "type": "sentence_transformers.base.modules.normalize.Normalize",
+                },
+            ]
+        )
+    )
+    (tmp_path / "1_Pooling" / "config.json").write_text(json.dumps({"pooling_mode": "mean"}))
+    (tmp_path / "2_Normalize" / "config.json").write_text(json.dumps(normalize_config))
+
+    with pytest.raises(ValueError, match="final sentence embedding"):
+        sentence_transformer_export._load_sentence_transformer_wrapper_options(str(tmp_path), {})
+
+
 @pytest.mark.parametrize(
     "module_types",
     [

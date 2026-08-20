@@ -64,9 +64,11 @@ _SENTENCE_TRANSFORMER_MODULE_TYPES = {
     "normalize": {
         "sentence_transformers.models.Normalize",
         "sentence_transformers.sentence_transformer.modules.normalize.Normalize",
+        "sentence_transformers.base.modules.normalize.Normalize",
     },
 }
 _SENTENCE_TRANSFORMER_EXPORT_MODULE_TYPES = {
+    # v6 remaps these v5.4-era paths, keeping exported checkpoints loadable across v5.4+.
     "transformer": "sentence_transformers.base.modules.transformer.Transformer",
     "pooling": "sentence_transformers.sentence_transformer.modules.pooling.Pooling",
     "normalize": "sentence_transformers.sentence_transformer.modules.normalize.Normalize",
@@ -171,6 +173,27 @@ def _load_sentence_transformer_wrapper_options(
         )
     if modules[0].get("path") != "":
         raise ValueError("Sentence Transformers Transformer metadata must reference the checkpoint root.")
+
+    if len(modules) == 3:
+        normalize_path = modules[2].get("path")
+        if not isinstance(normalize_path, str) or not normalize_path:
+            raise ValueError("Sentence Transformers Normalize metadata must reference a module path.")
+        normalize_config = _load_sentence_transformer_json(
+            model_name_or_path,
+            os.path.join(normalize_path, "config.json"),
+            hf_kwargs,
+        )
+        if normalize_config is not None:
+            if not isinstance(normalize_config, dict):
+                raise ValueError("Sentence Transformers Normalize config.json is invalid.")
+            normalize_input_name = normalize_config.get("module_input_name", "sentence_embedding")
+            normalize_output_name = normalize_config.get("module_output_name")
+            if normalize_output_name is None:
+                normalize_output_name = normalize_input_name
+            if normalize_input_name != "sentence_embedding" or normalize_output_name != "sentence_embedding":
+                raise ValueError(
+                    "Sentence Transformers Normalize metadata must normalize the final sentence embedding in place."
+                )
 
     sentence_bert_config = _load_sentence_transformer_json(
         model_name_or_path,
