@@ -33,8 +33,12 @@ from nemo_automodel.components.models.gemma4_moe import cp_attention as cpa
 from nemo_automodel.components.models.gemma4_moe import cp_local_ring as clr
 
 
-def _sliding_module(sliding_window):
-    return SimpleNamespace(sliding_window=sliding_window, _gemma4_cp_sliding_backend="fa")
+def _sliding_module(sliding_window, use_bidirectional_attention=None):
+    return SimpleNamespace(
+        sliding_window=sliding_window,
+        config=SimpleNamespace(use_bidirectional_attention=use_bidirectional_attention),
+        _gemma4_cp_sliding_backend="fa",
+    )
 
 
 def _make_ctx(module, *, q_heads=2, kv_heads=2, seq=4, head_dim=8, cp_size=1, cp_rank=0, metadata=None):
@@ -283,6 +287,16 @@ def test_collect_ring_kv_chunks_sliding_collects_only_required(monkeypatch):
     chunks = cpa._collect_ring_kv_chunks(sliding_ctx)
     assert [c[0] for c in chunks] == [3, 2, 1] and calls["n"] == 2
 
+    # Same geometry, but a bidirectional vision group may cross both the local window and
+    # the rank boundary, so every KV owner must remain visible to FlexAttention.
+    calls["n"] = 0
+    vision_ctx = cpa.replace(
+        sliding_ctx,
+        module=_sliding_module(6, use_bidirectional_attention="vision"),
+        use_vision_bidirectional=True,
+    )
+    assert [c[0] for c in cpa._collect_ring_kv_chunks(vision_ctx)] == [3, 2, 1, 0] and calls["n"] == 3
+
     calls["n"] = 0  # a global layer at the same geometry still takes the full rotation
     global_ctx = cpa.replace(sliding_ctx, module=_sliding_module(None))
     assert [c[0] for c in cpa._collect_ring_kv_chunks(global_ctx)] == [3, 2, 1, 0] and calls["n"] == 3
@@ -368,6 +382,16 @@ def test_run_dispatch_routes_sliding_fa_to_local_kernel(monkeypatch):
         cpa._run_gemma4_cp_ring_attention(SimpleNamespace(_gemma4_cp_sliding_backend="fa", sliding_window=None), ctx)
         == "FLEX"
     )
+    # The local FA kernel is causal-only; vision-bidirectional modules must keep the
+    # full-mask Flex path even when the requested sliding backend is FA.
+    vision_module = SimpleNamespace(
+        _gemma4_cp_sliding_backend="fa",
+        sliding_window=512,
+        config=SimpleNamespace(use_bidirectional_attention="vision"),
+    )
+    assert cpa._run_gemma4_cp_ring_attention(vision_module, ctx) == "LOCAL"
+    vision_ctx = SimpleNamespace(**vars(ctx), use_vision_bidirectional=True)
+    assert cpa._run_gemma4_cp_ring_attention(vision_module, vision_ctx) == "FLEX"
 
 
 def test_attach_sets_sliding_backend():

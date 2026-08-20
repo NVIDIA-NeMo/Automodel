@@ -1219,6 +1219,9 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
                 # and cannot participate in HF's Tensor-only torch.where branch.
                 # With CP, the same helper also keeps this rank's sequence slice.
                 vision_group_ids_local = kwargs.get("_gemma4_vision_group_ids")
+                has_vision_tokens = kwargs.get(
+                    "_gemma4_has_vision_tokens", pixel_values is not None or mm_token_type_ids is not None
+                )
                 if inputs_embeds is None:
                     prepared = self._cp_sunk_prepare_inputs(
                         input_ids=input_ids,
@@ -1230,6 +1233,7 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
                     per_layer_inputs = prepared["per_layer_inputs"]
                     mm_token_type_ids = prepared["mm_token_type_ids"]
                     vision_group_ids_local = prepared["_gemma4_vision_group_ids"]
+                    has_vision_tokens = prepared["_gemma4_has_vision_tokens"]
                 elif tp_e_series_enabled and per_layer_inputs is None:
                     raise ValueError(
                         "Gemma4 E-series TP requires input_ids when per_layer_inputs are not provided; "
@@ -1262,6 +1266,7 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
                         "padding_mask": padding_mask,
                         "_packed_seq_ids": kwargs.get("_packed_seq_ids"),
                         "_gemma4_vision_group_ids": vision_group_ids_local,
+                        "_gemma4_has_vision_tokens": has_vision_tokens,
                     }
                     # Left set (not cleared) so the activation-checkpoint recompute in
                     # backward sees the same metadata; each CP forward overwrites it.
@@ -1369,6 +1374,7 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
             inputs_embeds = prepared["inputs_embeds"]
             mm_token_type_ids = prepared["mm_token_type_ids"]
             kwargs["_gemma4_vision_group_ids"] = prepared["_gemma4_vision_group_ids"]
+            kwargs["_gemma4_has_vision_tokens"] = prepared["_gemma4_has_vision_tokens"]
             pixel_values = None  # spliced into inputs_embeds; not re-processed downstream
         else:
             if input_ids is not None and inputs_embeds is None:
@@ -1568,7 +1574,7 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
             ``inputs_embeds`` and ``per_layer_inputs`` (this rank's contiguous
             slice; ``per_layer_inputs`` is None when the variant has none) plus the
             sliced ``mm_token_type_ids`` / ``_gemma4_vision_group_ids`` ring
-            metadata.
+            metadata and a rank-uniform ``_gemma4_has_vision_tokens`` flag.
         """
         cp_mesh = self.cp_mesh
         special_image_mask = self._get_special_image_mask(input_ids, mm_token_type_ids)
@@ -1588,6 +1594,10 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
         # the FULL sequence, so it must be built here before the slice.
         mm_full = mm_token_type_ids if mm_token_type_ids is not None else special_image_mask.to(torch.long)
         vision_group_ids_full = gemma4_vision_group_ids(mm_full)
+        # This is a rank-uniform Python flag because CP receives the full multimodal
+        # inputs on every rank. Avoid inspecting tensor contents here: ``.item()``
+        # would add a host/device synchronization to every training microbatch.
+        has_vision_tokens = pixel_values is not None or mm_token_type_ids is not None
 
         # Keep this rank's contiguous slice of every grad-carrying / per-token
         # stream, on the same layout the aux-only sharder used (pad sentinels match
@@ -1608,6 +1618,7 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
             "per_layer_inputs": per_layer_inputs,
             "mm_token_type_ids": mm_local,
             "_gemma4_vision_group_ids": vision_group_local,
+            "_gemma4_has_vision_tokens": has_vision_tokens,
         }
 
     @torch.no_grad()

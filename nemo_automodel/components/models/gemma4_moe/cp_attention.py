@@ -68,6 +68,7 @@ class CPRingAttentionContext:
     kwargs: dict[str, Any]
     metadata: dict[str, torch.Tensor | None]
     metadata_seq_dims: dict[str, int]
+    use_vision_bidirectional: bool = False
 
 
 def gemma4_vision_group_ids(mm_token_type_ids: torch.Tensor) -> torch.Tensor:
@@ -78,6 +79,11 @@ def gemma4_vision_group_ids(mm_token_type_ids: torch.Tensor) -> torch.Tensor:
     new_vision_starts = is_vision & ~is_prev_vision
     group_ids = torch.cumsum(new_vision_starts.int(), dim=1) - 1
     return torch.where(is_vision, group_ids, torch.full_like(group_ids, -1))
+
+
+def _config_uses_vision_bidirectional(attention_module: torch.nn.Module) -> bool:
+    """Whether the rank-uniform module config enables bidirectional vision attention."""
+    return getattr(getattr(attention_module, "config", None), "use_bidirectional_attention", None) == "vision"
 
 
 # create_block_mask (~7.6ms/call) depends only on attention type + sequence geometry +
@@ -286,9 +292,7 @@ def _run_gemma4_flex_chunk(
         vision_group_ids_kv = gemma4_vision_group_ids(metadata_chunk["mm_token_type_ids"])
 
     sliding_window = getattr(attention_module, "sliding_window", None)
-    config_uses_vision_bidir = (
-        getattr(getattr(attention_module, "config", None), "use_bidirectional_attention", None) == "vision"
-    )
+    config_uses_vision_bidir = _config_uses_vision_bidirectional(attention_module)
     use_vision_bidirectional = (
         sliding_window is not None
         and config_uses_vision_bidir
@@ -437,14 +441,18 @@ def _run_gemma4_flex_chunk(
 def _ring_num_prior_chunks(ctx: Any) -> int:
     """Number of *prior* KV chunks a rank must ring-collect (own chunk excluded).
 
-    Global layers attend every earlier chunk, so they take the full ``cp_size - 1``
-    rotation. For sliding-window layers a query reaches only ``window_left`` tokens back,
-    so at most ``ceil(window_left/seq_local)`` preceding chunks hold any in-window key;
-    collecting the rest just ships KV the mask discards. Forward collection and backward
-    dK/dV routing both derive their hop count from here so they stay symmetric.
+    Global layers and vision-bidirectional layers take the full ``cp_size - 1`` rotation.
+    A vision group can cross the sliding window and CP rank boundaries in either direction.
+    For ordinary sliding-window layers a query reaches only ``window_left`` tokens back, so
+    at most ``ceil(window_left/seq_local)`` preceding chunks hold any in-window key; collecting
+    the rest just ships KV the mask discards. Forward collection and backward dK/dV routing
+    both derive their hop count from here so they stay symmetric.
     """
     full = ctx.cp_size - 1
-    window_left = getattr(getattr(ctx, "module", None), "sliding_window", None)
+    attention_module = getattr(ctx, "module", None)
+    window_left = getattr(attention_module, "sliding_window", None)
+    if getattr(ctx, "use_vision_bidirectional", False):
+        return full
     if not window_left:  # global / full-attention layer: needs the full rotation
         return full
     n_prior = math.ceil(int(window_left) / ctx.seq_local)
@@ -1175,10 +1183,15 @@ def _run_gemma4_cp_ring_attention(attention_module: torch.nn.Module, ctx: Any) -
         return _Gemma4FFPAVarlenRingAttention.apply(ctx.query, ctx.key, ctx.value, ctx)
     # Sliding-window layers: optional FlashAttention-2 backend off compiled flex, fully
     # autograd (no analytical backward, no recompute). Only the plain causal+window+packed
-    # case; vision-bidirectional / padding-mask batches stay on flex. The gate is rank-uniform
-    # (backend + sliding_window); choosing "fa" asserts no vision-bidirectional sliding mask.
+    # case; vision-bidirectional batches stay on flex. The gate is rank-uniform because the
+    # backend, layer type, model config, and full-sequence vision-input flag are identical
+    # across CP ranks.
     sliding_backend = getattr(attention_module, "_gemma4_cp_sliding_backend", "flex")
-    if sliding_backend == "fa" and getattr(attention_module, "sliding_window", None) is not None:
+    if (
+        sliding_backend == "fa"
+        and getattr(attention_module, "sliding_window", None) is not None
+        and not getattr(ctx, "use_vision_bidirectional", False)
+    ):
         return _Gemma4LocalKernelRingAttention.apply(ctx.query, ctx.key, ctx.value, ctx)
     return _Gemma4FlexRingAttention.apply(ctx.query, ctx.key, ctx.value, ctx)
 
@@ -1213,7 +1226,9 @@ def _gemma4_cp_manual_attention(
     if query.shape[1] != key.shape[1]:
         enable_gqa = True
 
-    local_metadata = getattr(attention_module, "_cp_manual_metadata", {})
+    captured_metadata = getattr(attention_module, "_cp_manual_metadata", {})
+    has_vision_tokens = bool(captured_metadata.get("_gemma4_has_vision_tokens", False))
+    local_metadata = {name: value for name, value in captured_metadata.items() if name != "_gemma4_has_vision_tokens"}
     metadata_seq_dims = getattr(attention_module, "_cp_manual_metadata_seq_dims", {})
     ctx = CPRingAttentionContext(
         module=attention_module,
@@ -1235,6 +1250,7 @@ def _gemma4_cp_manual_attention(
         kwargs=kwargs,
         metadata=local_metadata,
         metadata_seq_dims=metadata_seq_dims,
+        use_vision_bidirectional=_config_uses_vision_bidirectional(attention_module) and has_vision_tokens,
     )
     return _run_gemma4_cp_ring_attention(attention_module, ctx)
 
@@ -1329,6 +1345,7 @@ def attach_gemma4_cp_ring_attention(
         "_packed_seq_ids",
         "padding_mask",
         "_gemma4_vision_group_ids",
+        "_gemma4_has_vision_tokens",
     )
     attention_module._cp_manual_metadata_seq_dims = {
         "mm_token_type_ids": 1,
