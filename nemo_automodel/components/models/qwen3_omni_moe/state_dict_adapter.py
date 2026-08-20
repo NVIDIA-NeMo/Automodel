@@ -51,11 +51,7 @@ class Qwen3OmniMoeStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapt
         hf_state_dict = self._to_hf_w_split_experts(state_dict)
 
         if self._uses_thinker_prefix:
-            hf_state_dict_with_prefix = {}
-            for key, value in hf_state_dict.items():
-                new_key = "thinker." + key
-                hf_state_dict_with_prefix[new_key] = value
-            hf_state_dict = hf_state_dict_with_prefix
+            hf_state_dict = {self._add_thinker_prefix(key): value for key, value in hf_state_dict.items()}
 
         if exclude_key_regex:
             import re
@@ -70,23 +66,37 @@ class Qwen3OmniMoeStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapt
         **kwargs,
     ) -> dict[str, Any]:
         for key in hf_state_dict.keys():
-            if ".mlp.experts." in key and key.endswith(".weight"):
+            # Skip LoRA keys: a PEFT adapter dict (resume) carries no thinker
+            # prefix by design and must not flip the flags used for full saves.
+            if ".mlp.experts." in key and key.endswith(".weight") and ".lora_" not in key:
                 self._uses_thinker_prefix = key.startswith("thinker.")
                 self._uses_model_prefix = "model." in key
                 break
 
         # Remove thinker prefix if present to match our internal format
         if self._uses_thinker_prefix:
-            hf_state_dict_no_prefix = {}
-            for key, value in hf_state_dict.items():
-                if key.startswith("thinker."):
-                    new_key = key[len("thinker.") :]
-                    hf_state_dict_no_prefix[new_key] = value
-                else:
-                    hf_state_dict_no_prefix[key] = value
-            hf_state_dict = hf_state_dict_no_prefix
+            hf_state_dict = {self._strip_thinker_prefix(key): value for key, value in hf_state_dict.items()}
 
         return self._from_hf_w_merged_experts(hf_state_dict, device_mesh)
+
+    @staticmethod
+    def _add_thinker_prefix(key: str) -> str:
+        """Namespace a native key the way the HF omni checkpoint expects.
+
+        PEFT adapter keys keep their ``base_model.model.`` outer prefix, so for
+        those the ``thinker.`` namespace goes inside it — matching how PEFT
+        names modules on the actual HF omni model.
+        """
+        if key.startswith("base_model.model."):
+            return "base_model.model.thinker." + key.removeprefix("base_model.model.")
+        return "thinker." + key
+
+    @staticmethod
+    def _strip_thinker_prefix(key: str) -> str:
+        """Remove the omni checkpoint's ``thinker.`` namespace."""
+        if key.startswith("base_model.model.thinker."):
+            return "base_model.model." + key.removeprefix("base_model.model.thinker.")
+        return key.removeprefix("thinker.")
 
     def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs) -> list[tuple[str, Any]]:
         exclude_key_regex = kwargs.get("exclude_key_regex", None)
@@ -96,7 +106,7 @@ class Qwen3OmniMoeStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapt
             converted = [(fqn, tensor)]
 
         if self._uses_thinker_prefix:
-            converted = [(f"thinker.{key}", value) for key, value in converted]
+            converted = [(self._add_thinker_prefix(key), value) for key, value in converted]
 
         if exclude_key_regex:
             import re
