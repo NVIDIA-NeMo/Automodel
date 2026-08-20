@@ -26,6 +26,7 @@ from torch.distributed.pipelining.schedules import (
 from nemo_automodel.components.distributed.pipelining.functional import (
     _get_hidden_and_vocab_size,
     _precompute_stage_shapes,
+    _preserve_grads_across_stage_reinit,
     _set_stage_metas,
     _use_static_pipeline_stage_metadata,
     _warmup_pipeline_stage_neighbors,
@@ -1648,3 +1649,69 @@ class TestWrapStageForwardToEmitTensor:
         _wrap_stage_forward_to_emit_tensor(m)
         params = list(inspect.signature(m.forward).parameters)
         assert params == ["input_ids", "position_ids", "attention_mask"]
+
+
+class TestPreserveGradsAcrossStageReinit:
+    """Stage re-initialization must not discard accumulated gradients.
+
+    ``_initialize_pp_stages`` always ends by calling
+    ``_post_metadata_inference_cleanup``, which nulls parameter gradients.
+    ``reset_pp_stage_shapes`` re-initializes on every sequence-length change, so
+    under gradient accumulation that cleanup lands between micro-batches and drops
+    everything accumulated so far.
+    """
+
+    def _make_stage(self, inference_mode):
+        """Build a stage stand-in whose cleanup nulls its submodule's gradients.
+
+        Args:
+            inference_mode: Value to expose as the stage's ``_inference_mode``.
+
+        Returns:
+            Tuple of (stage, param) where ``param`` is a tensor of shape [2] whose
+            ``.grad`` is also shape [2].
+        """
+        submod = torch.nn.Linear(2, 1, bias=False)
+        param = submod.weight
+        param.grad = torch.ones_like(param)
+
+        stage = types.SimpleNamespace(submod=submod, _inference_mode=inference_mode)
+
+        def _cleanup():
+            for p in submod.parameters():
+                p.grad = None
+
+        stage._post_metadata_inference_cleanup = _cleanup
+        return stage, param
+
+    def test_static_mode_keeps_accumulated_grads(self, monkeypatch):
+        """With static metadata no inference ran, so gradients must survive."""
+        from torch.distributed.pipelining._utils import InferenceMode
+
+        stage, param = self._make_stage(InferenceMode.STATIC)
+        expected = param.grad.clone()
+
+        _preserve_grads_across_stage_reinit([stage])
+        stage._post_metadata_inference_cleanup()
+
+        assert param.grad is not None, "accumulated gradients were discarded on stage re-init"
+        torch.testing.assert_close(param.grad, expected)
+
+    def test_dynamic_mode_still_clears_stale_grads(self):
+        """Dynamic inference runs a throwaway backward, so its grads must be cleared."""
+        from torch.distributed.pipelining._utils import InferenceMode
+
+        stage, param = self._make_stage(InferenceMode.DYNAMIC)
+
+        _preserve_grads_across_stage_reinit([stage])
+        stage._post_metadata_inference_cleanup()
+
+        assert param.grad is None
+
+    def test_stage_without_cleanup_hook_is_skipped(self):
+        """Older PyTorch stages have no cleanup hook and must not raise."""
+        stage = types.SimpleNamespace(submod=torch.nn.Linear(2, 1))
+
+        _preserve_grads_across_stage_reinit([stage])
+
+        assert not hasattr(stage, "_post_metadata_inference_cleanup")
