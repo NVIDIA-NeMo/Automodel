@@ -114,6 +114,63 @@ def initialize_attn_module_and_func(
 
         attn_func = make_magi_attn_func(softmax_scale=softmax_scale)  # pragma: no cover - requires magi_attention
         return None, attn_func  # pragma: no cover - requires magi_attention
+    elif attn_impl == "hub":
+        from nemo_automodel.components.kernels.config import HubKernelConfig
+        from nemo_automodel.components.kernels.hub import HUB_FLASH_ATTN2, get_flash_attn_func
+
+        hub_kernels = kwargs.pop("hub_kernels", None)
+        if isinstance(hub_kernels, dict):
+            hub_kernels = HubKernelConfig(**hub_kernels)
+        repo = (hub_kernels.attn_repo if hub_kernels and hub_kernels.attn_repo else None) or HUB_FLASH_ATTN2
+        flash_attn_func = get_flash_attn_func(attn_implementation=repo)
+        if flash_attn_func is None:
+            raise ImportError(
+                f"Hub flash attention kernel {repo!r} is unavailable. "
+                "Install the optional hub_kernels extra: uv sync --extra hub_kernels"
+            )
+
+        supported_flash_kwargs = {"dropout_p", "softmax_scale", "causal", "deterministic", "is_causal"}
+        unexpected_kwargs = kwargs.keys() - supported_flash_kwargs
+        if unexpected_kwargs:
+            raise TypeError(f"Unsupported Hub flash attention kwargs: {sorted(unexpected_kwargs)}")
+
+        default_dropout_p = cast(float, kwargs.get("dropout_p", 0.0))
+        default_softmax_scale = cast(float | None, kwargs.get("softmax_scale", softmax_scale))
+        default_is_causal = cast(bool, kwargs.get("is_causal", attn_mask_type == "causal"))
+        default_deterministic = cast(bool, kwargs.get("deterministic", False))
+        supported_call_kwargs = {"dropout_p", "softmax_scale", "causal", "is_causal", "deterministic"}
+
+        def attn_func(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, **call_kwargs: Any) -> torch.Tensor:
+            if call_kwargs.get("attn_mask") is not None:
+                raise ValueError(
+                    "backend.attn='hub' does not support dense attention masks. "
+                    "Use attn='sdpa' or attn='te' for padded or windowed batches."
+                )
+            unexpected_call_kwargs = call_kwargs.keys() - supported_call_kwargs
+            if unexpected_call_kwargs:
+                raise TypeError(f"Unsupported Hub flash attention kwargs: {sorted(unexpected_call_kwargs)}")
+
+            dropout_p = cast(float, call_kwargs.get("dropout_p", default_dropout_p))
+            scale = call_kwargs.get("softmax_scale", default_softmax_scale)
+            is_causal = cast(bool, call_kwargs.get("is_causal", default_is_causal))
+            deterministic = cast(bool, call_kwargs.get("deterministic", default_deterministic))
+            q_bshd = q.transpose(1, 2)
+            k_bshd = k.transpose(1, 2)
+            v_bshd = v.transpose(1, 2)
+            out = flash_attn_func(
+                q_bshd,
+                k_bshd,
+                v_bshd,
+                dropout_p=dropout_p,
+                softmax_scale=scale,
+                causal=is_causal,
+                deterministic=deterministic,
+            )
+            if isinstance(out, tuple):
+                out = out[0]
+            return out.transpose(1, 2)
+
+        return None, attn_func
     else:
         raise ValueError(f"Unsupported attention implementation: {attn_impl}")
 
@@ -193,6 +250,29 @@ def preprocess_args_and_kwargs_for_attn(
         q = q.transpose(1, 2).contiguous()
         k = k.transpose(1, 2).contiguous()
         v = v.transpose(1, 2).contiguous()
+    elif attn_impl == "hub":
+        attn_kwargs = {}
+        q = q.transpose(1, 2).contiguous()
+        k = k.transpose(1, 2).contiguous()
+        v = v.transpose(1, 2).contiguous()
+        window_size = kwargs.get("window_size", (-1, 0))
+        left_window, right_window = window_size if isinstance(window_size, tuple) else (window_size, 0)
+        has_local_window = (left_window is not None and left_window >= 0) or (
+            right_window is not None and right_window > 0
+        )
+        if has_local_window:
+            raise ValueError(
+                "backend.attn='hub' does not support sliding-window attention. Use attn='sdpa' or attn='te'."
+            )
+        if attention_mask is not None:
+            if attention_mask.dim() > 2:
+                raise ValueError(
+                    "backend.attn='hub' does not support explicit dense attention masks. Use attn='sdpa' or attn='te'."
+                )
+            key_mask = attention_mask.to(device=q.device, dtype=torch.bool)
+            if not bool(key_mask.all().item()):
+                raise ValueError("backend.attn='hub' does not support padded batches. Use attn='sdpa' or attn='te'.")
+        attn_kwargs["is_causal"] = True
     elif attn_impl == "magi":  # pragma: no cover - requires magi_attention
         # magi's attn_func consumes the native [b, s, nh, hd] / [t, nh, hd] layout
         # directly (no transpose). Forward the genuine mask metadata so the FFA key
@@ -206,7 +286,7 @@ def preprocess_args_and_kwargs_for_attn(
                 attn_kwargs[_k] = kwargs[_k]
     else:  # sdpa
         attn_kwargs = {}
-        # Transpose for SDPA
+        # Transpose for SDPA (BHSD layout expected by attn_func)
         q = q.transpose(1, 2).contiguous()
         k = k.transpose(1, 2).contiguous()
         v = v.transpose(1, 2).contiguous()
@@ -259,6 +339,6 @@ def preprocess_args_and_kwargs_for_attn(
 
 def postprocess_output_for_attn(x: torch.Tensor, attn_impl: str) -> torch.Tensor:
     """Postprocess attention output based on attn_impl requirements."""
-    if attn_impl in ("sdpa", "flex"):
+    if attn_impl in ("sdpa", "flex", "hub"):
         x = x.transpose(1, 2).contiguous()
     return x
