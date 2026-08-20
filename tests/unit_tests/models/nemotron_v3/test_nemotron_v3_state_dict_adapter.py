@@ -136,6 +136,11 @@ class TestNemotronV3StateDictAdapter:
         lora_initial = model.model.embed_tokens.lora_A.weight.detach().clone()
         layer = torch.nn.Module()
         layer.mixer = torch.nn.Module()
+        layer.mixer.gate = torch.nn.Module()
+        layer.mixer.gate.register_buffer(
+            "e_score_correction_bias",
+            torch.zeros(moe_config.n_routed_experts, dtype=torch.float32),
+        )
         layer.mixer.experts = _FakeSingleDeviceFallbackExperts()
         experts = layer.mixer.experts
         model.model.layers = torch.nn.ModuleList([layer])
@@ -147,6 +152,7 @@ class TestNemotronV3StateDictAdapter:
         all_destinations = {key: value for group in groups for key, value in group.destinations.items()}
         assert set(all_destinations) == {
             "backbone.embeddings.weight",
+            "backbone.layers.0.mixer.gate.e_score_correction_bias",
             *{
                 f"backbone.layers.0.mixer.experts.{expert_id}.{projection}.weight"
                 for expert_id in range(moe_config.n_routed_experts)
@@ -162,6 +168,12 @@ class TestNemotronV3StateDictAdapter:
             assert not down_destination.is_contiguous()
 
         assert not any("lora" in key for key in all_destinations)
+        correction_bias = all_destinations["backbone.layers.0.mixer.gate.e_score_correction_bias"]
+        correction_bias.fill_(2)
+        torch.testing.assert_close(
+            layer.mixer.gate.e_score_correction_bias,
+            torch.full_like(layer.mixer.gate.e_score_correction_bias, 2),
+        )
         for group in groups[1:]:
             for destination in group.destinations.values():
                 destination.fill_(3)
