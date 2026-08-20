@@ -35,7 +35,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import Callable, Iterator, Protocol, runtime_checkable
+from typing import Callable, Iterator, Protocol, TypeAlias, runtime_checkable
 
 import torch
 
@@ -44,19 +44,33 @@ from nemo_automodel.components.speculative.streaming.queue import SampleRefQueue
 
 logger = logging.getLogger(__name__)
 
+_PromptBatch: TypeAlias = tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+_PackedPromptBatch: TypeAlias = tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]
+
 
 @runtime_checkable
 class PromptSource(Protocol):
-    """Anything the background thread can pull a prompt batch from.
+    """Zero-argument callable that supplies the next prompt batch."""
 
-    Either a zero-arg callable returning
-    ``(input_ids, attention_mask, loss_mask)`` (or ``None`` when the
-    source is exhausted) or an :class:`Iterator` whose items are the
-    same tuple. ``StopIteration`` from an iterator is normalized to
-    ``None`` so the loop has a single exhausted signal.
-    """
+    def __call__(self) -> _PromptBatch | _PackedPromptBatch | None:
+        """Return the next prompt batch or ``None`` when the source is exhausted.
 
-    def __call__(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None: ...
+        Returns:
+            A three-tuple ``(input_ids, attention_mask, loss_mask)`` where
+            each item is a ``torch.long`` Tensor of shape ``[batch, sequence]``;
+            or a six-tuple that appends ``position_ids`` and ``doc_remaining``
+            (each a ``torch.long`` Tensor of shape ``[batch, sequence]``) and
+            ``seq_lens`` (a ``torch.long`` Tensor of shape ``[batch, max_docs]``
+            containing packed document lengths); or ``None`` when exhausted.
+        """
+        ...
 
 
 class AsyncFeaturePipeline:
@@ -93,7 +107,7 @@ class AsyncFeaturePipeline:
         self,
         producer: FeatureProducer,
         queue: SampleRefQueue,
-        prompt_source: PromptSource | Iterator[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+        prompt_source: PromptSource | Iterator[_PromptBatch | _PackedPromptBatch | torch.Tensor],
         *,
         poll_interval: float = 0.1,
         stop_on_exhausted: bool = True,
@@ -104,10 +118,8 @@ class AsyncFeaturePipeline:
         # and converts ``StopIteration`` into ``None`` so the loop has
         # a single "exhausted" signal.
         if isinstance(prompt_source, Iterator):
-            self._iterator: Iterator | None = prompt_source
-            self._prompt_source: Callable[[], tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None] = (
-                self._pull_from_iterator
-            )
+            self._iterator: Iterator[_PromptBatch | _PackedPromptBatch | torch.Tensor] | None = prompt_source
+            self._prompt_source: Callable[[], _PromptBatch | _PackedPromptBatch | None] = self._pull_from_iterator
         else:
             self._iterator = None
             self._prompt_source = prompt_source
@@ -115,10 +127,9 @@ class AsyncFeaturePipeline:
         self._stop_on_exhausted = stop_on_exhausted
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
-        self._joined_event = threading.Event()
         self._error: BaseException | None = None
 
-    def _pull_from_iterator(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    def _pull_from_iterator(self) -> _PromptBatch | _PackedPromptBatch | None:
         assert self._iterator is not None
         try:
             value = next(self._iterator)
@@ -192,7 +203,6 @@ class AsyncFeaturePipeline:
     def join(self, timeout: float | None = None) -> None:
         if self._thread is not None:
             self._thread.join(timeout=timeout)
-            self._joined_event.set()
 
     def __enter__(self) -> "AsyncFeaturePipeline":
         self.start()
