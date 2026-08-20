@@ -50,7 +50,6 @@ from nemo_automodel.components.config._arg_parser import parse_args_and_load_con
 from nemo_automodel.components.datasets.datum import Datum
 from nemo_automodel.components.datasets.vlm.pp_media import VLM_PP_MEDIA_KEY, stage_vlm_media_for_pp
 from nemo_automodel.components.distributed.config import DistributedSetup, FSDP2Config, MegatronFSDPConfig
-from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
 from nemo_automodel.components.distributed.context_parallel.magi import MagiState, setup_magi
 from nemo_automodel.components.distributed.cp_vision_frame_shard import (
     CpVisionFrameShardingConfig,
@@ -80,7 +79,7 @@ from nemo_automodel.components.training.utils import (
     scale_grads_and_clip_grad_norm,
 )
 from nemo_automodel.components.utils.compile_utils import build_compile_config
-from nemo_automodel.components.utils.model_utils import VLM_INPUT_KEYS, _supports_logits_to_keep, filter_forward_kwargs
+from nemo_automodel.components.utils.model_utils import VLM_INPUT_KEYS, _supports_logits_to_keep
 from nemo_automodel.engine import Engine, collate_prebatched
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config, shard_optimizers_for_megatron_fsdp
 from nemo_automodel.recipes._typed_config import RecipeConfig
@@ -978,6 +977,31 @@ class FinetuneRecipeForVLM(BaseRecipe):
             log_denominator=log_denominator,
         )
 
+    def _engine_validation_loss_fn(
+        self,
+        out: Any,
+        loss_inputs: Mapping[str, torch.Tensor | tuple[torch.Tensor, ...]],
+    ) -> torch.Tensor:
+        """Compute the validation loss numerator without training reductions."""
+        labels = cast(torch.Tensor, loss_inputs["labels"])
+        cu_seqlens = cast(torch.Tensor | None, loss_inputs.get("cu_seqlens"))
+        if self.pp_enabled:
+            if self.pipeline_loss_fn is None:
+                raise RuntimeError("The last pipeline stage has no configured causal-LM loss")
+            self.pipeline_loss_fn.cu_seqlens = cu_seqlens
+            return self.pipeline_loss_fn(out, labels)
+        return self._compute_vlm_loss(
+            out=out,
+            labels=labels,
+            num_label_tokens=None,
+            is_train=False,
+            cu_seqlens=cu_seqlens,
+            mtp_per_depth_targets=cast(
+                tuple[torch.Tensor, ...] | None,
+                loss_inputs.get("mtp_per_depth_targets"),
+            ),
+        )
+
     @contextmanager
     def _cp_vision_frame_sharding_context(self):
         """Publish the CP-only group while a VLM forward may run its vision tower."""
@@ -1168,94 +1192,18 @@ class FinetuneRecipeForVLM(BaseRecipe):
             for mp in self.model_parts:
                 mp.eval()
 
-            total_loss = 0.0
-            total_tokens = 0
-            total_num_label_tokens = 0
+            total_loss = torch.zeros((), dtype=torch.float64, device=self.dist_env.device)
+            total_num_label_tokens = torch.zeros((), dtype=torch.float64, device=self.dist_env.device)
             for batch in val_dataloader:
-                batch = {
-                    k: (v.to(self.dist_env.device, non_blocking=True) if isinstance(v, torch.Tensor) else v)
-                    for k, v in batch.items()
-                }
-                num_label_tokens = (batch["labels"] != -100).sum().item()
+                result = self.engine.forward([self._make_engine_datum(batch)], self._engine_validation_loss_fn)
+                total_loss += result.loss_sum
+                total_num_label_tokens += result.weight_sum
 
-                model = self.model_parts[0]
-                cp_sharder = ContextParallelSharder(
-                    model,
-                    self.device_mesh,
-                    batch,
-                    invoke_pre_embed=not self.pp_enabled,
-                )
-                supports = getattr(model, "supports", None)
-                mtp_cp_inputs = None
-                if (
-                    not self.pp_enabled
-                    and self._get_cp_group_size() > 1
-                    and bool(getattr(supports, "mtp_enabled", False))
-                ):
-                    if not bool(getattr(supports, "supports_mtp_cp", False)):
-                        raise NotImplementedError(
-                            f"{type(model).__name__} declares supports_mtp_cp=False; "
-                            "MTP target preparation for context parallelism is unavailable"
-                        )
-                    mtp_cp_inputs = model.prepare_mtp_inputs_for_cp(
-                        batch,
-                        ignore_index=self.cfg.mtp.ignore_index,
-                    )
-                train_ctx, batch = cp_sharder.shard(batch)
-                mtp_per_depth_targets = None
-                if mtp_cp_inputs is not None:
-                    batch["mtp_per_depth_input_ids"] = tuple(
-                        cp_sharder.shard_token_tensor(ids, seq_dim=1, fill=0) for ids in mtp_cp_inputs.input_ids
-                    )
-                    batch["mtp_per_depth_position_ids"] = tuple(
-                        cp_sharder.shard_token_tensor(
-                            ids,
-                            seq_dim=mtp_cp_inputs.position_ids_seq_dim,
-                            fill=0,
-                        )
-                        for ids in mtp_cp_inputs.position_ids
-                    )
-                    batch["mtp_per_depth_valid_masks"] = tuple(
-                        cp_sharder.shard_token_tensor(mask, seq_dim=1, fill=False) for mask in mtp_cp_inputs.valid_masks
-                    )
-                    mtp_per_depth_targets = tuple(
-                        cp_sharder.shard_token_tensor(
-                            targets,
-                            seq_dim=1,
-                            fill=self.cfg.mtp.ignore_index,
-                        )
-                        for targets in mtp_cp_inputs.targets
-                    )
-                labels = batch.pop("labels")
-                with self._cp_vision_frame_sharding_context(), train_ctx():
-                    cu_seqlens = None if mtp_per_depth_targets is not None else batch.get("cu_seqlens")
-                    batch = filter_forward_kwargs(model, batch)
-                    if isinstance(self.loss_fn, FusedLinearCrossEntropy):
-                        out = model(logits_to_keep=1, **batch)
-                    else:
-                        out = model(**batch)
-                    local_loss = self._compute_vlm_loss(
-                        out=out,
-                        labels=labels,
-                        num_label_tokens=num_label_tokens,
-                        is_train=False,
-                        cu_seqlens=cu_seqlens,
-                        mtp_per_depth_targets=mtp_per_depth_targets,
-                    )
-                    total_num_label_tokens += num_label_tokens
-
-                total_loss += local_loss.item() * num_label_tokens
-                total_tokens += num_label_tokens
-
-        # Aggregate across ranks if distributed is initialized
-        total_loss = self._dp_allreduce(torch.FloatTensor([total_loss]), include_cp=True).item()
-        # `num_label_tokens` is measured before CP sharding, so each CP rank
-        # contributes the full sequence token count while `total_loss` is
-        # reconstructed from CP-sharded loss sums. Do not sum tokens over CP.
-        total_tokens = self._dp_allreduce(torch.LongTensor([total_tokens])).item()
-        total_num_label_tokens = self._dp_allreduce(torch.LongTensor([total_num_label_tokens])).item()
-
-        val_loss = total_loss / max(total_tokens, 1e-8)
+        # Engine.forward has already reconstructed CP shards. Only independent
+        # DP validation shards remain to combine (VLM PP validation stays disabled).
+        total_loss = self._dp_allreduce(total_loss).item()
+        total_num_label_tokens = int(self._dp_allreduce(total_num_label_tokens).item())
+        val_loss = total_loss / max(total_num_label_tokens, 1e-8)
 
         return MetricsSample(
             step=self.step_scheduler.step,

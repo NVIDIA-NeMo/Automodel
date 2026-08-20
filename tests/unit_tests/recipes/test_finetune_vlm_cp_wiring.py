@@ -17,7 +17,7 @@
 Training forward/backward and CP sharding are owned by :class:`Engine`. These
 tests cover the VLM recipe responsibilities that remain around that core:
 pipeline media staging setup, vision-frame context publication, and the
-recipe-owned validation forward path.
+validation handoff plus epoch-level DP aggregation.
 """
 
 from __future__ import annotations
@@ -33,21 +33,6 @@ from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.distributed.cp_vision_frame_shard import CpVisionFrameShardingConfig
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM
-
-
-def _identity_cp_shard(sharder, batch):
-    """Bypass CP transport while preserving constructor-side strategy resolution.
-
-    Args:
-        sharder: Sharder whose resolved strategy is not exercised by this test.
-        batch: Mutable model-input mapping whose tensor values retain their
-            existing shapes.
-
-    Returns:
-        The null context factory and the same input mapping.
-    """
-    del sharder
-    return nullcontext, batch
 
 
 class _UnsupportedVisionModel:
@@ -321,88 +306,36 @@ def test_setup_always_stages_pp_media_under_pp(
 
 
 # -----------------------------------------------------------------------------
-# val-side wiring (the bug-fix territory)
+# validation Engine boundary
 # -----------------------------------------------------------------------------
 
 
-class _ShardLabelsOnEnter:
-    def __init__(self, labels, local_labels):
-        self.labels = labels
-        self.local_labels = local_labels
-
-    def __enter__(self):
-        self.labels.resize_(self.local_labels.shape)
-        self.labels.copy_(self.local_labels)
-
-    def __exit__(self, exc_type, exc, tb):
-        return False
-
-
-def test_val_counts_label_tokens_inside_cp_context_after_labels_are_sharded():
-    """Validation must count label tokens after CP has exposed the local shard."""
-    labels = torch.tensor([[1, 2, -100, 4]])
-    batch = {"labels": labels}
-    local_labels = torch.tensor([[1, -100]])
-
-    def train_ctx():
-        return _ShardLabelsOnEnter(labels, local_labels)
-
-    labels = batch.pop("labels")
-    pre_context_count = (labels != -100).sum().item()
-    with train_ctx():
-        local_num_label_tokens = (labels != -100).sum().item()
-
-    assert pre_context_count == 3
-    assert local_num_label_tokens == 1
-
-
-def test_val_pos_ids_uses_dist_env_device_not_model_device():
-    """Reproduce the bug fix at finetune.py:1281 — val must use
-    ``self.dist_env.device``, not ``self.model_parts[0].device`` which
-    AttributeErrors on FSDP-wrapped models."""
-
-    class _FSDPWrapped:
-        # Intentionally has NO ``.device`` attribute (mirrors real FSDP wrapper).
-        def __getattr__(self, name):
-            if name == "device":
-                raise AttributeError("'FSDPWrapped' object has no attribute 'device'")
-            raise AttributeError(name)
-
-    model = _FSDPWrapped()
-    dist_env = SimpleNamespace(device=torch.device("cpu"))
-
-    # The fixed line:
-    pos = torch.arange(0, 4).unsqueeze(0).to(dist_env.device)
-    assert pos.device.type == "cpu"
-
-    # The buggy line would have raised:
-    with pytest.raises(AttributeError, match="no attribute 'device'"):
-        _ = torch.arange(0, 4).unsqueeze(0).to(model.device)
-
-
 def test_run_validation_epoch_does_not_sum_tokens_over_cp(monkeypatch):
-    """``total_loss`` is all-reduced with include_cp=True, but ``total_tokens``
-    (measured pre-CP-shard) must NOT include CP — otherwise val_loss is scaled
-    down by cp_size. Guards the fix at finetune.py:_run_validation_epoch."""
-    from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM
-
-    # No-op replacements for the heavy collaborators.
+    """Engine returns CP-complete sums, so the epoch reduces only over DP."""
     monkeypatch.setattr(vlm_finetune, "ScopedRNG", lambda *a, **k: nullcontext())
-    monkeypatch.setattr(vlm_finetune.ContextParallelSharder, "shard", _identity_cp_shard)
-    monkeypatch.setattr(vlm_finetune, "filter_forward_kwargs", lambda model, batch: batch)
-    monkeypatch.setattr(vlm_finetune, "calculate_loss", lambda *a, **k: torch.tensor(2.0))
 
     class _Model(torch.nn.Module):
-        def eval(self):  # noqa: D401
-            return self
+        def prepare_model_inputs_for_cp(self, *args, **kwargs):
+            raise AssertionError("the recipe must delegate CP preparation to Engine.forward")
 
-        def forward(self, **batch):
-            return SimpleNamespace(logits=torch.zeros(1, 4, 8), hidden_states=None)
+        def forward(self, *args, **kwargs):
+            raise AssertionError("the recipe must delegate model execution to Engine.forward")
+
+    engine_calls = []
+
+    class _Engine:
+        def forward(self, datums, loss_fn):
+            engine_calls.append((datums, loss_fn))
+            return SimpleNamespace(
+                loss_sum=torch.tensor(6.0, dtype=torch.float64),
+                weight_sum=torch.tensor(3.0, dtype=torch.float64),
+                loss_fn_outputs=[],
+            )
 
     recipe = FinetuneRecipeForVLM.__new__(FinetuneRecipeForVLM)
     recipe.model_parts = [_Model()]
     recipe.loss_fn = object()  # not a FusedLinearCrossEntropy
-    recipe.device_mesh = None  # CP inactive -> skip pre-embed branch
+    recipe.engine = _Engine()
     recipe.pp_enabled = False
     recipe.dist_env = SimpleNamespace(device=torch.device("cpu"))
     recipe.step_scheduler = SimpleNamespace(step=3, epoch=1)
@@ -425,61 +358,12 @@ def test_run_validation_epoch_does_not_sum_tokens_over_cp(monkeypatch):
 
     result = recipe._run_validation_epoch([batch])
 
-    # total_loss all-reduced WITH cp; total_tokens and num_label_tokens WITHOUT.
-    loss_call = allreduce_calls[0]
-    tokens_call = allreduce_calls[1]
-    assert loss_call[1] is True, "total_loss must include CP ranks"
-    assert tokens_call[1] is False, "total_tokens must NOT be summed over CP ranks"
-    # val_loss = (2.0 * 3 tokens) / 3 tokens == 2.0
-    assert result.metrics["val_loss"] == pytest.approx(2.0)
-
-
-def test_run_validation_epoch_cp_active_runs_pre_embed(monkeypatch):
-    """With CP active and a model exposing prepare_model_inputs_for_cp, the
-    validation loop must invoke the model's sharder-only CP hook before sharding.
-    Guards finetune.py:_run_validation_epoch CP pre-embed branch."""
-    from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM
-
-    monkeypatch.setattr(vlm_finetune, "ScopedRNG", lambda *a, **k: nullcontext())
-    monkeypatch.setattr(vlm_finetune.ContextParallelSharder, "shard", _identity_cp_shard)
-    monkeypatch.setattr(vlm_finetune, "filter_forward_kwargs", lambda model, batch: batch)
-    monkeypatch.setattr(vlm_finetune, "calculate_loss", lambda *a, **k: torch.tensor(2.0))
-
-    pre_embed_calls = []
-
-    class _Model(torch.nn.Module):
-        def eval(self):
-            return self
-
-        def prepare_model_inputs_for_cp(self, batch, *, num_chunks=1):  # sharder-only hook
-            pre_embed_calls.append(set(batch))
-            return {}
-
-        def forward(self, **batch):
-            return SimpleNamespace(logits=torch.zeros(1, 4, 8), hidden_states=None)
-
-    class _DM(dict):
-        mesh_dim_names = ["cp"]
-
-    recipe = FinetuneRecipeForVLM.__new__(FinetuneRecipeForVLM)
-    recipe.model_parts = [_Model()]
-    recipe.loss_fn = object()
-    recipe.device_mesh = _DM(cp=SimpleNamespace(size=lambda: 2, get_group=lambda: "cp-group"))
-    recipe.cp_vision_frame_sharding = CpVisionFrameShardingConfig(enabled=True)
-    recipe.pp_enabled = False
-    recipe.dist_env = SimpleNamespace(device=torch.device("cpu"))
-    recipe.step_scheduler = SimpleNamespace(step=3, epoch=1)
-    recipe.optimizer = [SimpleNamespace(param_groups=[{"lr": 0.001}])]
-    recipe._maybe_add_drafter_loss = lambda *, base_loss, **kwargs: base_loss
-    recipe._dp_allreduce = lambda tensor, include_cp=False: tensor
-
-    batch = {
-        "input_ids": torch.tensor([[1, 2, 3, 4]]),
-        "pixel_values": torch.randn(1, 3, 8, 8),
-        "labels": torch.tensor([[1, 2, -100, 4]]),
-    }
-
-    result = recipe._run_validation_epoch([batch])
-
-    assert pre_embed_calls, "the CP hook (prepare_model_inputs_for_cp) must run when CP is active"
+    assert len(engine_calls) == 1
+    datums, loss_fn = engine_calls[0]
+    assert len(datums) == 1
+    assert datums[0].model_inputs["input_ids"] is batch["input_ids"]
+    assert datums[0].loss_fn_inputs["labels"] is batch["labels"]
+    assert loss_fn == recipe._engine_validation_loss_fn
+    assert len(allreduce_calls) == 2
+    assert all(include_cp is False for _, include_cp in allreduce_calls)
     assert result.metrics["val_loss"] == pytest.approx(2.0)

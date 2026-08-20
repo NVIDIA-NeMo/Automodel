@@ -59,7 +59,6 @@ from nemo_automodel.components.cuda_graphs import PartialCudaGraphManager
 from nemo_automodel.components.datasets.datum import Datum
 from nemo_automodel.components.datasets.loader import DataloaderConfig
 from nemo_automodel.components.distributed.config import DistributedSetup, FSDP2Config, MegatronFSDPConfig
-from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
 from nemo_automodel.components.distributed.context_parallel.magi import MagiState, setup_magi
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.mesh import MeshContext
@@ -91,7 +90,6 @@ from nemo_automodel.components.utils.flops_utils import calculate_mfu
 from nemo_automodel.components.utils.model_utils import (
     _supports_logits_to_keep,
     _supports_seq_lens,
-    filter_forward_kwargs,
     resolve_trust_remote_code,
 )
 from nemo_automodel.engine import Engine, collate_prebatched
@@ -951,8 +949,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             last_stage_model,
             grad_reduce_group=self._get_dp_group(include_cp=True),
         )
-        # Validation still executes the schedule directly. Training supplies the
-        # same loss through Engine's per-microbatch callback.
+        # Engine supplies this loss through its training and forward-only
+        # per-microbatch callbacks.
         self.pp.info.schedule._loss_fn = self.pipeline_loss_fn
 
     def _setup_qat(self, cfg, model_parts: list[nn.Module]):
@@ -1071,71 +1069,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self._partial_cuda_graph_capture_pending = False
 
     # ------------------ helpers ------------------
-    def _prepare_validation_batch(self, batch: dict[str, Any]):
-        """Move and CP-prepare one validation batch.
-
-        Args:
-            batch: Worker-collated inputs. ``input_ids`` and ``labels`` have
-                shape [batch, sequence], while optional ``position_ids`` has
-                shape [batch, sequence] or [axes, batch, sequence]. Packed THD
-                token tensors have shape [tokens].
-
-        Returns:
-            The CP context factory; a CP-local model-input mapping; CP-local
-            labels; and optional per-depth MTP targets. The model mapping's
-            token IDs and validity masks have shape [batch, local_sequence],
-            while multi-axis positions have shape [axes, batch,
-            local_sequence]. Labels and each target tensor have shape [batch,
-            local_sequence]. Packed outputs use the corresponding CP-local
-            [tokens] layout.
-        """
-        batch = {
-            k: (
-                {dk: dv.to(self.dist_env.device, non_blocking=True) for dk, dv in v.items() if dv is not None}
-                if isinstance(v, dict)
-                else (v.to(self.dist_env.device, non_blocking=True) if isinstance(v, torch.Tensor) else v)
-            )
-            for k, v in batch.items()
-        }
-        model = self.model_parts[0] if hasattr(self, "model_parts") else None
-        supports = getattr(model, "supports", None)
-        mtp_cp_enabled = (
-            not self.pp_enabled and self._get_cp_group_size() > 1 and bool(getattr(supports, "mtp_enabled", False))
-        )
-        if mtp_cp_enabled and not bool(getattr(supports, "supports_mtp_cp", False)):
-            raise NotImplementedError(
-                f"{type(model).__name__} declares supports_mtp_cp=False; "
-                "MTP target preparation for context parallelism is unavailable"
-            )
-        cp_sharder = ContextParallelSharder(
-            model,
-            self.device_mesh,
-            batch,
-            padding_token_id=self.tokenizer.pad_token_id if self.tokenizer else 0,
-            num_chunks=self.pp.pp_batch_size // self.pp.pp_microbatch_size if self.pp_enabled else 1,
-        )
-        mtp_cp_inputs = (
-            model.prepare_mtp_inputs_for_cp(batch, ignore_index=self.cfg.mtp.ignore_index) if mtp_cp_enabled else None
-        )
-        train_ctx, batch = cp_sharder.shard(batch)
-        mtp_per_depth_targets = None
-        if mtp_cp_inputs is not None:
-            batch["mtp_per_depth_input_ids"] = tuple(
-                cp_sharder.shard_token_tensor(ids, seq_dim=1, fill=0) for ids in mtp_cp_inputs.input_ids
-            )
-            batch["mtp_per_depth_position_ids"] = tuple(
-                cp_sharder.shard_token_tensor(ids, seq_dim=mtp_cp_inputs.position_ids_seq_dim, fill=0)
-                for ids in mtp_cp_inputs.position_ids
-            )
-            batch["mtp_per_depth_valid_masks"] = tuple(
-                cp_sharder.shard_token_tensor(mask, seq_dim=1, fill=False) for mask in mtp_cp_inputs.valid_masks
-            )
-            mtp_per_depth_targets = tuple(
-                cp_sharder.shard_token_tensor(targets, seq_dim=1, fill=self.cfg.mtp.ignore_index)
-                for targets in mtp_cp_inputs.targets
-            )
-        return train_ctx, batch, batch.pop("labels"), mtp_per_depth_targets
-
     def _compute_causal_lm_loss(self, output, labels, model_inputs, *, num_label_tokens, is_train):
         """Compute the recipe's causal-LM and optional MTP loss.
 
@@ -1262,80 +1195,24 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             is_train=True,
         )
 
-    def _forward_validation_step(self, batch: dict[str, Any]) -> torch.Tensor:
-        """Run one recipe-owned forward-only validation step.
-
-        Args:
-            batch: Worker-collated inputs and labels. Padded token tensors have
-                shape [batch, sequence]; packed THD token tensors have shape [tokens].
-
-        Returns:
-            Detached scalar local loss-sum tensor.
-        """
-        train_ctx, batch, labels, mtp_per_depth_targets = self._prepare_validation_batch(batch)
-        fp8_ctx = self.te_fp8.maybe_te_autocast() if self.te_fp8 is not None else nullcontext()
-
+    def _engine_validation_loss_fn(
+        self,
+        output: Any,
+        loss_inputs: dict[str, torch.Tensor | tuple[torch.Tensor, ...]],
+    ) -> torch.Tensor:
+        """Compute the validation loss numerator without training reductions."""
         if self.pp_enabled:
-            with train_ctx(), fp8_ctx:
-                losses = [] if self.pp.info.has_last_stage else None
-                if self.pp.info.has_last_stage:
-                    masked_labels = labels.clone()
-                    targets = masked_labels
-                else:
-                    targets = None
-
-                input_ids = batch.pop("input_ids")
-
-                # Update PP stage shapes for the current batch's seq_len.
-                # This is a no-op when the length hasn't changed.
-                self.pp.update_seq_len(input_ids.shape[1])
-
-                # Filter out None values and empty dicts from batch to avoid PP chunking errors
-                batch_filtered = {
-                    k: v for k, v in batch.items() if v is not None and not (isinstance(v, dict) and len(v) == 0)
-                }
-                # Hand the THD ``cu_seqlens`` to the PP loss to mask cross-sequence boundaries —
-                # the fallback when the model emits no per-microbatch seq_idx tail (which the loss
-                # prefers). One cu_seqlens encodes a single shared layout, so it is only correct at
-                # one pack/microbatch per step; the seq_idx tail handles differing per-microbatch boundaries.
-                cu_seqlens = batch_filtered.get("cu_seqlens")
-                if isinstance(cu_seqlens, torch.Tensor) and cu_seqlens.dim() == 2:
-                    cu_seqlens = cu_seqlens.squeeze(0)  # [1, T] -> [T]
-                if self.pipeline_loss_fn is not None:
-                    self.pipeline_loss_fn.cu_seqlens = cu_seqlens
-                if self.pp.info.has_first_stage:
-                    self.pp.info.schedule.eval(input_ids, target=targets, losses=losses, **batch_filtered)
-                else:
-                    self.pp.info.schedule.eval(target=targets, losses=losses, **batch_filtered)
-
-            if self.pp.info.has_last_stage:
-                return torch.sum(torch.stack(losses)).detach()
-            return torch.zeros((), device=self.dist_env.device)
-
-        model = self.model_parts[0]
-        with train_ctx(), fp8_ctx:
-            loss_inputs = dict(batch)
-            if mtp_per_depth_targets is not None:
-                loss_inputs["mtp_per_depth_targets"] = mtp_per_depth_targets
-            batch = filter_forward_kwargs(model, batch)
-            if isinstance(self.loss_fn, FusedLinearCrossEntropy):
-                out = model(logits_to_keep=1, **batch)
-            else:
-                out = model(**batch)
-            return self._compute_causal_lm_loss(
-                out,
-                labels,
-                loss_inputs,
-                num_label_tokens=None,
-                is_train=False,
-            ).detach()
-
-    def _broadcast_from_last_pp_stage(self, tensor: torch.Tensor) -> torch.Tensor:
-        """Broadcast a PP last-stage scalar to the other ranks in its pipeline group."""
-        pp_group = self.device_mesh["pp"].get_group()
-        pp_src_rank = torch.distributed.get_global_rank(pp_group, torch.distributed.get_world_size(pp_group) - 1)
-        torch.distributed.broadcast(tensor, src=pp_src_rank, group=pp_group)
-        return tensor
+            if self.pipeline_loss_fn is None:
+                raise RuntimeError("The last pipeline stage has no configured causal-LM loss")
+            self.pipeline_loss_fn.cu_seqlens = loss_inputs.get("cu_seqlens")
+            return self.pipeline_loss_fn(output, loss_inputs["labels"])
+        return self._compute_causal_lm_loss(
+            output,
+            loss_inputs["labels"],
+            loss_inputs,
+            num_label_tokens=None,
+            is_train=False,
+        )
 
     def _run_train_optim_step(self, batches: list[dict[str, Any]], max_grad_norm: float | None = None) -> MetricsSample:
         """Execute a single training step.
@@ -1464,36 +1341,25 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         """Run one pass over a single validation dataloader.
 
         Args:
-            val_name: Name of the validation dataset.
             val_dataloader: DataLoader for the validation dataset.
         """
         with ScopedRNG(seed=1, ranked=True):
             for mp in self.model_parts:
                 mp.eval()
 
-            total_loss = torch.tensor(0.0, dtype=torch.float32, device=self.dist_env.device)
-            total_num_label_tokens = 0
+            total_loss = torch.zeros((), dtype=torch.float64, device=self.dist_env.device)
+            total_num_label_tokens = torch.zeros((), dtype=torch.float64, device=self.dist_env.device)
 
             for batch in val_dataloader:
-                num_label_tokens = (batch["labels"] != -100).sum().item()
-                total_loss += self._forward_validation_step(batch).item()
-                total_num_label_tokens += num_label_tokens
+                result = self.engine.forward([self._make_engine_datum(batch)], self._engine_validation_loss_fn)
+                total_loss += result.loss_sum
+                total_num_label_tokens += result.weight_sum
 
-        total_loss = self._dp_allreduce(total_loss, include_cp=True)
-        total_num_label_tokens = self._dp_allreduce(
-            torch.tensor(total_num_label_tokens, dtype=torch.long, device=self.dist_env.device)
-        ).item()
+        # Engine.forward has already reconstructed CP shards and synchronized
+        # PP stages. Only independent DP validation shards remain to combine.
+        total_loss = self._dp_allreduce(total_loss)
+        total_num_label_tokens = int(self._dp_allreduce(total_num_label_tokens).item())
         val_loss = total_loss / max(total_num_label_tokens, 1e-8)
-
-        # For PP, send val_loss and num_label_tokens from last stage to main rank
-        if self.pp_enabled:
-            val_loss = val_loss.to(self.dist_env.device)
-            # On non-last ranks total_num_label_tokens is 0; this tensor is just a recv buffer.
-            pp_num_tokens = torch.tensor(total_num_label_tokens, dtype=torch.long, device=self.dist_env.device)
-            val_loss = self._broadcast_from_last_pp_stage(val_loss)
-            pp_num_tokens = self._broadcast_from_last_pp_stage(pp_num_tokens)
-            if self.dist_env.is_main:
-                total_num_label_tokens = pp_num_tokens.item()
 
         val_loss = val_loss.item() if isinstance(val_loss, torch.Tensor) else val_loss
 

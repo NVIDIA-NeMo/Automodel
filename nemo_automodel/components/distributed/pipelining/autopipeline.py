@@ -389,9 +389,68 @@ class AutoPipeline:
         Returns:
             The value returned by the underlying PyTorch pipeline schedule.
         """
+        return self._run_prepared_microbatches(
+            model_inputs,
+            loss_fn=loss_fn,
+            losses=losses,
+            return_outputs=return_outputs,
+            schedule_method="step",
+        )
+
+    def eval_microbatches(
+        self,
+        model_inputs: list[dict[str, Any]],
+        *,
+        loss_fn: Callable[[Any, int], Any],
+        losses: list[torch.Tensor] | None = None,
+        return_outputs: bool = True,
+    ) -> Any:
+        """Run forward-only evaluation over already prepared model microbatches.
+
+        This is the forward-only counterpart to :meth:`step_microbatches`.
+        The caller owns microbatch preparation, while the pipeline schedule owns
+        pipeline communication and execution order. The underlying
+        ``schedule.eval`` path does not run backward.
+
+        Args:
+            model_inputs: Exactly :attr:`num_microbatches` complete model-input
+                mappings. Each mapping contains exactly one of ``input_ids`` or
+                ``inputs_embeds``; all remaining items are model keyword inputs.
+            loss_fn: Callback invoked as ``loss_fn(output, microbatch_index)``.
+                The index identifies the corresponding item in ``model_inputs``
+                regardless of the schedule's execution order.
+            losses: Mutable list populated by the schedule on the last stage.
+            return_outputs: Whether the last stage returns merged model outputs
+                when supported by the installed PyTorch version.
+
+        Returns:
+            The value returned by the underlying PyTorch pipeline schedule.
+
+        Raises:
+            NotImplementedError: If the installed PyTorch pipeline schedule
+                does not provide forward-only ``eval`` execution.
+        """
+        return self._run_prepared_microbatches(
+            model_inputs,
+            loss_fn=loss_fn,
+            losses=losses,
+            return_outputs=return_outputs,
+            schedule_method="eval",
+        )
+
+    def _run_prepared_microbatches(
+        self,
+        model_inputs: list[dict[str, Any]],
+        *,
+        loss_fn: Callable[[Any, int], Any],
+        losses: list[torch.Tensor] | None,
+        return_outputs: bool,
+        schedule_method: Literal["step", "eval"],
+    ) -> Any:
+        """Run one schedule method with an exact prepared-microbatch split."""
         schedule = self._info.schedule
         if schedule is None:
-            raise RuntimeError("AutoPipeline.build() must be called before running a PP schedule step")
+            raise RuntimeError("AutoPipeline.build() must be called before running a prepared PP schedule")
         if len(model_inputs) != self.num_microbatches:
             raise ValueError(f"Expected {self.num_microbatches} model input microbatches, got {len(model_inputs)}")
 
@@ -413,6 +472,18 @@ class AutoPipeline:
         def indexed_loss(output: Any, microbatch_id: torch.Tensor) -> Any:
             return loss_fn(output, int(microbatch_id.item()))
 
+        run_schedule = getattr(schedule, schedule_method, None)
+        if not callable(run_schedule):
+            if schedule_method == "eval":
+                raise NotImplementedError(
+                    "forward-only pipeline execution requires a PyTorch pipeline schedule with eval(); "
+                    "upgrade PyTorch or use non-pipeline Engine.forward"
+                )
+            raise RuntimeError("PyTorch pipeline schedule has no callable step method")
+        # ``schedule.eval`` forwards arbitrary kwargs to ``schedule.step`` and
+        # does not list ``return_outputs`` explicitly in supported PyTorch
+        # releases. Inspect step for both modes so eval can still suppress the
+        # otherwise-unused merged output without breaking older step APIs.
         schedule_options = (
             {"return_outputs": return_outputs}
             if "return_outputs" in inspect.signature(schedule.step).parameters
@@ -423,7 +494,7 @@ class AutoPipeline:
         schedule._split_inputs = lambda _args, _kwargs=None: (model_args_chunks, model_kwargs_chunks)
         schedule._loss_fn = indexed_loss
         try:
-            return schedule.step(
+            return run_schedule(
                 target=torch.arange(self.num_microbatches, device=self.device),
                 losses=losses,
                 **schedule_options,

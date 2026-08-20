@@ -1548,244 +1548,79 @@ def test_compute_trust_remote_code_falls_back_to_resolve():
 # -----------------
 
 
-class MockSchedule:
-    """Mock PP schedule that tracks step/eval calls."""
+def test_engine_validation_pipeline_loss_reuses_configured_loss_and_thd_metadata():
+    recipe = object.__new__(TrainFinetuneRecipeForNextTokenPrediction)
+    recipe.pp_enabled = True
+    recipe.pipeline_loss_fn = MagicMock(return_value=torch.tensor(3.0))
+    output = object()
+    labels = torch.tensor([[1, 2, -100]])
+    cu_seqlens = torch.tensor([0, 3], dtype=torch.int32)
 
-    def __init__(self):
-        self.step_calls = []
-        self.eval_calls = []
-
-    def step(self, *args, **kwargs):
-        self.step_calls.append((args, kwargs))
-        # Populate losses list if provided
-        if "losses" in kwargs and kwargs["losses"] is not None:
-            kwargs["losses"].append(torch.tensor(0.5))
-
-    def eval(self, *args, **kwargs):
-        self.eval_calls.append((args, kwargs))
-        # Populate losses list if provided
-        if "losses" in kwargs and kwargs["losses"] is not None:
-            kwargs["losses"].append(torch.tensor(0.5))
-
-
-class MockPPInfo:
-    """Mock PP info with configurable first/last stage flags."""
-
-    def __init__(self, has_first_stage=True, has_last_stage=True):
-        self.has_first_stage = has_first_stage
-        self.has_last_stage = has_last_stage
-        self.schedule = MockSchedule()
-
-
-def _create_minimal_recipe_for_pp_test(monkeypatch, pp_info):
-    """Create a minimal TrainFinetuneRecipeForNextTokenPrediction for PP testing."""
-    cfg = ConfigNode(
+    loss = recipe._engine_validation_loss_fn(
+        output,
         {
-            "nvtx": False,
-            "model": {},
-            "dataloader": {"collate_fn": "nemo_automodel.components.datasets.utils.default_collater"},
-            "dataset": {},
-            "validation_dataloader": {},
-            "step_scheduler": {"local_batch_size": 1, "global_batch_size": 1},
-            "optimizer": {},
-            "loss_fn": {},
-            "checkpoint": {"best_metric_key": "default"},
-            "distributed": {"cp_size": 1},
-            "autopipeline": {"pp_microbatch_size": 1},
-        }
+            "labels": labels,
+            "weights": labels.ne(-100),
+            "cu_seqlens": cu_seqlens,
+        },
     )
 
-    # Minimal stubs so we can create the recipe
-    monkeypatch.setattr(
-        "nemo_automodel.recipes.llm.train_ft.initialize_distributed",
-        lambda *a, **k: SimpleNamespace(world_size=1, is_main=True, device=torch.device("cpu"), rank=0),
-    )
-    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.setup_logging", lambda: None)
+    assert loss.item() == pytest.approx(3.0)
+    assert recipe.pipeline_loss_fn.cu_seqlens is cu_seqlens
+    recipe.pipeline_loss_fn.assert_called_once_with(output, labels)
 
-    # Create the recipe without calling setup
-    recipe = TrainFinetuneRecipeForNextTokenPrediction(cfg)
 
-    # Mock out attributes needed for the recipe-owned validation forward.
-    # Use object.__setattr__ to bypass the state tracking
-    object.__setattr__(recipe, "dist_env", SimpleNamespace(device=torch.device("cpu"), rank=0, is_main=True))
-    object.__setattr__(recipe, "device_mesh", None)
-    object.__setattr__(recipe, "pp_enabled", True)
-    object.__setattr__(
-        recipe,
-        "pp",
+def test_run_validation_epoch_uses_engine_forward_for_pp_complete_results(monkeypatch):
+    recipe = TrainFinetuneRecipeForNextTokenPrediction.__new__(TrainFinetuneRecipeForNextTokenPrediction)
+    recipe.model_parts = [MagicMock()]
+    recipe.dist_env = SimpleNamespace(device=torch.device("cpu"), is_main=True)
+    recipe.optimizer = [SimpleNamespace(param_groups=[{"lr": 0.01}])]
+    recipe.step_scheduler = SimpleNamespace(step=1, epoch=0)
+    recipe.pp_enabled = True
+    recipe.pipeline_loss_fn = MagicMock()
+    recipe.loss_fn = object()
+    recipe.tool_call_evaluator = None
+
+    engine = MagicMock()
+    engine.forward.side_effect = [
         SimpleNamespace(
-            info=pp_info,
-            pp_batch_size=1,
-            pp_microbatch_size=1,
-            update_seq_len=lambda seq_len: None,
+            loss_sum=torch.tensor(4.0, dtype=torch.float64),
+            weight_sum=torch.tensor(2.0, dtype=torch.float64),
+            loss_fn_outputs=[],
         ),
-    )
-    object.__setattr__(recipe, "tokenizer", SimpleNamespace(pad_token_id=0))
-    object.__setattr__(recipe, "te_fp8", None)
-    object.__setattr__(recipe, "pipeline_loss_fn", None)
-
-    return recipe
-
-
-def test_forward_validation_step_pp_uses_schedule_eval(monkeypatch):
-    from contextlib import nullcontext
-
-    pp_info = MockPPInfo(has_first_stage=True, has_last_stage=True)
-    recipe = _create_minimal_recipe_for_pp_test(monkeypatch, pp_info)
-
-    # Mock _make_cp_batch_and_ctx to return a no-op context manager
-    monkeypatch.setattr(
-        "nemo_automodel.components.distributed.context_parallel.utils._make_cp_batch_and_ctx",
-        lambda device_mesh, batch, *args, **kwargs: (nullcontext, batch, None),
-    )
-
-    # Create a minimal batch
-    batch = {
-        "input_ids": torch.tensor([[1, 2, 3]]),
-        "labels": torch.tensor([[1, 2, 3]]),
-    }
-
-    loss = recipe._forward_validation_step(batch)
-
-    # Should use eval, not step
-    assert len(pp_info.schedule.eval_calls) == 1, "schedule.eval() should be called once for validation"
-    assert len(pp_info.schedule.step_calls) == 0, "schedule.step() should not be called for validation"
-    assert loss.item() == pytest.approx(0.5)
-
-
-def test_forward_validation_step_pp_non_first_stage_uses_eval_without_input(monkeypatch):
-    """Test schedule.eval() without input_ids when not on first stage."""
-    from contextlib import nullcontext
-
-    pp_info = MockPPInfo(has_first_stage=False, has_last_stage=True)
-    recipe = _create_minimal_recipe_for_pp_test(monkeypatch, pp_info)
-
-    # Mock _make_cp_batch_and_ctx to return a no-op context manager
-    monkeypatch.setattr(
-        "nemo_automodel.components.distributed.context_parallel.utils._make_cp_batch_and_ctx",
-        lambda device_mesh, batch, *args, **kwargs: (nullcontext, batch, None),
-    )
-
-    # Create a minimal batch
-    batch = {
-        "input_ids": torch.tensor([[1, 2, 3]]),
-        "labels": torch.tensor([[1, 2, 3]]),
-    }
-
-    recipe._forward_validation_step(batch)
-
-    # Should use eval without input_ids as first positional arg
-    assert len(pp_info.schedule.eval_calls) == 1
-    args, kwargs = pp_info.schedule.eval_calls[0]
-    assert len(args) == 0, "Non-first stage should not pass input_ids as positional arg"
-    assert "target" in kwargs
-
-
-def test_run_validation_epoch_pp_sends_loss_from_last_stage_to_main(monkeypatch):
-    """Test that _run_validation_epoch broadcasts val_loss from last stage to main rank for PP."""
-    from contextlib import nullcontext
-
-    pp_info = MockPPInfo(has_first_stage=True, has_last_stage=True)
-    recipe = _create_minimal_recipe_for_pp_test(monkeypatch, pp_info)
-
-    # Set up recipe attributes for validation - use object.__setattr__ to bypass state tracking
-    object.__setattr__(recipe, "model_parts", [DummyModel()])
-    object.__setattr__(recipe, "step_scheduler", SimpleNamespace(step=1, epoch=0))
-    object.__setattr__(recipe, "optimizer", [SimpleNamespace(param_groups=[{"lr": 0.01}])])
-
-    # Stub the PP last-stage broadcast helper (post-d96f1b20 the recipe broadcasts
-    # within the PP group instead of doing send/recv to global rank 0).
-    monkeypatch.setattr(recipe, "_broadcast_from_last_pp_stage", lambda t: t)
-
-    # Set dist_env.rank to 0 (last stage and main rank are the same in this test)
-    object.__setattr__(recipe, "dist_env", SimpleNamespace(device=torch.device("cpu"), rank=0, is_main=True))
-
-    monkeypatch.setattr(recipe, "_forward_validation_step", lambda batch: torch.tensor(0.5))
-
-    # Mock _dp_allreduce to return the tensor/value
-    def mock_dp_allreduce(val, include_cp=False):
-        if isinstance(val, torch.Tensor):
-            return val
-        return torch.tensor(val)
-
-    monkeypatch.setattr(recipe, "_dp_allreduce", mock_dp_allreduce)
-
-    # Mock _make_cp_batch_and_ctx
-    monkeypatch.setattr(
-        "nemo_automodel.components.distributed.context_parallel.utils._make_cp_batch_and_ctx",
-        lambda device_mesh, batch, *args, **kwargs: (nullcontext, batch, None),
-    )
-
-    # Mock ScopedRNG
+        SimpleNamespace(
+            loss_sum=torch.tensor(9.0, dtype=torch.float64),
+            weight_sum=torch.tensor(3.0, dtype=torch.float64),
+            loss_fn_outputs=[],
+        ),
+    ]
+    recipe.engine = engine
+    allreduce = MagicMock(side_effect=lambda tensor, **kwargs: tensor)
+    recipe._dp_allreduce = allreduce
+    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda: 0)
     monkeypatch.setattr(
         "nemo_automodel.recipes.llm.train_ft.ScopedRNG",
-        lambda **kwargs: MagicMock(__enter__=lambda s: s, __exit__=lambda s, *a: None),
+        lambda **kwargs: nullcontext(),
     )
 
-    # Create a simple dataloader that yields one batch
-    val_dataloader = [{"input_ids": torch.tensor([[1, 2, 3]]), "labels": torch.tensor([[1, 2, 3]])}]
+    batches = [
+        {"input_ids": torch.tensor([[1, 2, 3]]), "labels": torch.tensor([[1, 2, -100]])},
+        {"input_ids": torch.tensor([[4, 5, 6, 7]]), "labels": torch.tensor([[4, 5, 6, -100]])},
+    ]
+    metrics = recipe._run_validation_epoch(batches)
 
-    result = recipe._run_validation_epoch(val_dataloader)
-
-    # Verify result is a MetricsSample with val_loss
-    assert "val_loss" in result.metrics
-    # val_loss should be a float, not a tensor
-    assert isinstance(result.metrics["val_loss"], float)
-
-
-def test_run_validation_epoch_pp_main_rank_receives_from_last_stage(monkeypatch):
-    """Test that main rank receives val_loss from last stage via the PP broadcast helper."""
-    from contextlib import nullcontext
-
-    pp_info = MockPPInfo(has_first_stage=True, has_last_stage=False)
-    recipe = _create_minimal_recipe_for_pp_test(monkeypatch, pp_info)
-
-    # Set up recipe attributes - use object.__setattr__ to bypass state tracking
-    object.__setattr__(recipe, "model_parts", [DummyModel()])
-    object.__setattr__(recipe, "step_scheduler", SimpleNamespace(step=1, epoch=0))
-    object.__setattr__(recipe, "optimizer", [SimpleNamespace(param_groups=[{"lr": 0.01}])])
-
-    # Track calls to the PP last-stage broadcast helper and simulate the last
-    # stage's value of 0.5 propagating into the non-last-stage tensor.
-    broadcast_calls = []
-
-    def mock_broadcast(tensor):
-        broadcast_calls.append(tensor)
-        tensor.fill_(0.5)
-        return tensor
-
-    monkeypatch.setattr(recipe, "_broadcast_from_last_pp_stage", mock_broadcast)
-
-    # Main rank (0) is different from last stage (3)
-    object.__setattr__(recipe, "dist_env", SimpleNamespace(device=torch.device("cpu"), rank=0, is_main=True))
-
-    monkeypatch.setattr(recipe, "_forward_validation_step", lambda batch: torch.tensor(0.0))
-
-    def mock_dp_allreduce(val, include_cp=False):
-        if isinstance(val, torch.Tensor):
-            return val
-        return torch.tensor(val)
-
-    monkeypatch.setattr(recipe, "_dp_allreduce", mock_dp_allreduce)
-
-    monkeypatch.setattr(
-        "nemo_automodel.components.distributed.context_parallel.utils._make_cp_batch_and_ctx",
-        lambda device_mesh, batch, *args, **kwargs: (nullcontext, batch, None),
-    )
-
-    monkeypatch.setattr(
-        "nemo_automodel.recipes.llm.train_ft.ScopedRNG",
-        lambda **kwargs: MagicMock(__enter__=lambda s: s, __exit__=lambda s, *a: None),
-    )
-
-    val_dataloader = [{"input_ids": torch.tensor([[1, 2, 3]]), "labels": torch.tensor([[1, 2, 3]])}]
-
-    result = recipe._run_validation_epoch(val_dataloader)
-
-    # Main rank should have invoked the PP broadcast helper to pull val_loss
-    # and pp_num_tokens from the last PP stage (two calls total).
-    assert len(broadcast_calls) >= 1, "Main rank should broadcast val_loss from the last PP stage"
-    assert isinstance(result.metrics["val_loss"], float)
+    assert engine.forward.call_count == 2
+    for call, batch in zip(engine.forward.call_args_list, batches):
+        datums, loss_fn = call.args
+        assert len(datums) == 1
+        assert datums[0].model_inputs["input_ids"] is batch["input_ids"]
+        assert datums[0].loss_fn_inputs["labels"] is batch["labels"]
+        torch.testing.assert_close(datums[0].loss_fn_inputs["weights"], batch["labels"].ne(-100))
+        assert loss_fn == recipe._engine_validation_loss_fn
+    assert allreduce.call_count == 2
+    assert all("include_cp" not in call.kwargs for call in allreduce.call_args_list)
+    assert metrics.metrics["val_loss"] == pytest.approx(13.0 / 5.0)
+    assert metrics.metrics["num_label_tokens"] == pytest.approx(5.0)
 
 
 # -----------------
@@ -2273,9 +2108,6 @@ class TestRunTrainOptimStepUsesEngine:
                     update_seq_len=lambda seq_len: None,
                 ),
             )
-            # Stub the PP last-stage broadcast helper (post-d96f1b20 the recipe
-            # broadcasts inside the PP group instead of using send/recv).
-            monkeypatch.setattr(recipe, "_broadcast_from_last_pp_stage", lambda t: t)
         object.__setattr__(recipe, "tokenizer", SimpleNamespace(pad_token_id=0))
 
         monkeypatch.setattr(
@@ -2309,12 +2141,6 @@ class TestRunTrainOptimStepUsesEngine:
         datums = [object(), object()]
         make_datum = MagicMock(side_effect=datums)
         monkeypatch.setattr(recipe, "_make_engine_datum", make_datum)
-        monkeypatch.setattr(
-            recipe,
-            "_broadcast_from_last_pp_stage",
-            MagicMock(side_effect=AssertionError("Engine loss must not be broadcast again")),
-        )
-
         engine = MagicMock()
         engine.forward_backward.return_value = (torch.tensor(0.25), [])
         object.__setattr__(recipe, "engine", engine)
@@ -2683,362 +2509,28 @@ class TestRunValidationToolCallEval:
         assert out.metrics["tool_call/has_call"] == 0.0
 
 
-@pytest.mark.parametrize(
-    ("cp_size", "uses_thd", "supports_thd"),
-    [
-        (2, False, False),
-        (1, True, True),
-    ],
-)
-def test_forward_validation_step_model_cp_hook(monkeypatch, cp_size, uses_thd, supports_thd):
-    """Non-PP validation keeps the recipe-owned CP preparation path."""
-    from contextlib import nullcontext
-
-    cfg = ConfigNode(
-        {
-            "nvtx": False,
-            "model": {},
-            "dataloader": {"collate_fn": "nemo_automodel.components.datasets.utils.default_collater"},
-            "dataset": {},
-            "validation_dataloader": {},
-            "step_scheduler": {"local_batch_size": 1, "global_batch_size": 1},
-            "optimizer": {},
-            "loss_fn": {},
-            "checkpoint": {"best_metric_key": "default"},
-            "distributed": {"cp_size": cp_size},
-            "autopipeline": {"pp_microbatch_size": 1},
-        }
-    )
-    monkeypatch.setattr(
-        "nemo_automodel.recipes.llm.train_ft.initialize_distributed",
-        lambda *a, **k: SimpleNamespace(world_size=1, is_main=True, device=torch.device("cpu"), rank=0),
-    )
-    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.setup_logging", lambda: None)
-    recipe = TrainFinetuneRecipeForNextTokenPrediction(cfg)
-
-    class _CPModel(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.lin = nn.Linear(4, 8)
-            self.prepared = False
-            self.supports = SimpleNamespace(mtp_enabled=False, supports_mtp_cp=False)
-
-        def prepare_model_inputs_for_cp(self, batch, **kwargs):
-            self.prepared = True
-            self.num_chunks = kwargs.get("num_chunks")
-            from nemo_automodel.components.distributed.context_parallel.sharder import (
-                ContextParallelSharder,
-                contiguous_local_indices,
-            )
-
-            return {
-                "cp_sharder": ContextParallelSharder(
-                    shard_batch=lambda cp_mesh, tp_mesh, batch, **k: (nullcontext, batch, None),
-                    local_token_global_indices=contiguous_local_indices,
-                )
-            }
-
-        def forward(self, **batch):
-            logits = self.lin(batch["input_ids"].float())
-            return SimpleNamespace(logits=logits)
-
-    model = _CPModel()
-    model.supports_thd = supports_thd
-
-    # The hook gate reads the CP size from the mesh (the runtime truth), not
-    # from the config: fake a mesh whose "cp" dim matches the parametrization.
-    class _FakeSubMesh:
-        def __init__(self, size):
-            self._size = size
-
-        def size(self):
-            return self._size
-
-        def get_group(self):
-            return None
-
-        def get_local_rank(self):
-            return 0
-
-    fake_mesh = {"cp": _FakeSubMesh(cp_size)}
-    fake_mesh = type("_FakeDeviceMesh", (dict,), {"mesh_dim_names": ("cp",)})(fake_mesh)
-    object.__setattr__(recipe, "dist_env", SimpleNamespace(device=torch.device("cpu"), rank=0, is_main=True))
-    object.__setattr__(recipe, "device_mesh", fake_mesh)
-    object.__setattr__(recipe, "pp_enabled", False)
-    object.__setattr__(recipe, "magi", SimpleNamespace(enabled=False))
-    object.__setattr__(recipe, "tokenizer", SimpleNamespace(pad_token_id=0))
-    object.__setattr__(recipe, "te_fp8", None)
-    object.__setattr__(recipe, "model_parts", [model])
-    object.__setattr__(recipe, "distributed_config", SimpleNamespace(defer_fsdp_grad_sync=True))
-    object.__setattr__(recipe, "loss_fn", object())  # not FusedLinearCrossEntropy
-    object.__setattr__(recipe, "_get_dp_group", lambda include_cp=False: None)
-    object.__setattr__(recipe, "_get_dp_group_size", lambda include_cp=False: 1)
-
-    captured = {}
-
-    def _fake_calc_loss(
-        loss_fn, *, logits, labels, model, hidden_states, lm_weight, num_label_tokens, grad_reduce_group
-    ):
-        captured["logits_is_tensor"] = isinstance(logits, torch.Tensor)
-        assert lm_weight is None
-        return logits.mean()
-
-    monkeypatch.setattr(
-        "nemo_automodel.components.distributed.context_parallel.utils._make_cp_batch_and_ctx",
-        lambda device_mesh, batch, *a, **k: (nullcontext, batch, None),
-    )
-    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.calculate_loss", _fake_calc_loss)
-    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.get_final_hidden_states", lambda out: None)
-    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.filter_forward_kwargs", lambda model, batch: batch)
-
-    batch = {"input_ids": torch.randn(1, 4, 4), "labels": torch.zeros(1, 4, dtype=torch.long)}
-    if uses_thd:
-        batch["qkv_format"] = "thd"
-    loss = recipe._forward_validation_step(batch)
-
-    assert model.prepared is True
-    assert model.num_chunks == 1
-    assert captured["logits_is_tensor"]
-    assert torch.isfinite(loss).all()
-    assert model.lin.weight.grad is None
-
-
-def test_forward_validation_step_shards_global_mtp_inputs_and_targets(monkeypatch):
-    """Validation shifts MTP inputs globally and reuses the model-input CP layout."""
-    from nemo_automodel.components.models.common.mtp import (
-        MTPConfig,
-        prepare_mtp_context_parallel_inputs,
-    )
-
-    captured = {}
-    local_indices = torch.tensor([0, 1, 4, 5])
-
-    class _MTPModel(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.scale = nn.Parameter(torch.tensor(1.0))
-            self.mtp_config = MTPConfig(num_layers=1, layer_pattern="*")
-            self.cp_prepared = False
-            self.mtp_prepared = False
-            self.supports = SimpleNamespace(mtp_enabled=True, supports_mtp_cp=True)
-
-        def prepare_model_inputs_for_cp(self, batch, *, num_chunks=1):
-            """Materialize global multi-axis positions before MTP preparation.
-
-            Args:
-                batch: Mutable mapping whose token tensors have shape [batch,
-                    sequence].
-                num_chunks: Number of downstream sharding chunks.
-
-            Returns:
-                Empty update mapping; ``batch`` receives ``position_ids`` of
-                shape [axes, batch, sequence] in place.
-            """
-            assert num_chunks == 1
-            assert not self.mtp_prepared
-            self.cp_prepared = True
-            base_positions = torch.tensor([[0, 1, 2, 0, 1, 2]])
-            batch["position_ids"] = torch.stack(
-                (base_positions, base_positions + 10, base_positions + 20),
-                dim=0,
-            )
-            return {}
-
-        def prepare_mtp_inputs_for_cp(self, batch, *, ignore_index=-100):
-            """Build global MTP tensors after multi-axis positions exist.
-
-            Args:
-                batch: Mutable mapping whose token tensors have shape [batch,
-                    sequence] and positions have shape [axes, batch, sequence].
-                ignore_index: Fill value for invalid target positions.
-
-            Returns:
-                Global per-depth MTP tensors matching the batch token axes.
-            """
-            assert self.cp_prepared
-            assert batch["position_ids"].shape == (3, 1, 6)
-            self.mtp_prepared = True
-            return prepare_mtp_context_parallel_inputs(
-                batch,
-                num_depths=self.mtp_config.num_layers,
-                ignore_index=ignore_index,
-            )
-
-        def forward(
-            self,
-            input_ids,
-            *,
-            mtp_per_depth_input_ids,
-            mtp_per_depth_position_ids,
-            mtp_per_depth_valid_masks,
-            **kwargs,
-        ):
-            """Emit MTP outputs while recording the CP-local auxiliary inputs.
-
-            Args:
-                input_ids: Token IDs of shape [batch, local_sequence].
-                mtp_per_depth_input_ids: Per-depth token IDs, each of shape
-                    [batch, local_sequence].
-                mtp_per_depth_position_ids: Per-depth positions, each of shape
-                    [axes, batch, local_sequence].
-                mtp_per_depth_valid_masks: Per-depth masks, each of shape
-                    [batch, local_sequence].
-                **kwargs: Remaining CP-local model tensors.
-
-            Returns:
-                Model output whose logits and MTP hidden states have shape
-                [batch, local_sequence, hidden].
-            """
-            captured["model_input_ids"] = input_ids.detach().clone()
-            captured["mtp_input_ids"] = tuple(t.detach().clone() for t in mtp_per_depth_input_ids)
-            captured["mtp_position_ids"] = tuple(t.detach().clone() for t in mtp_per_depth_position_ids)
-            captured["mtp_valid_masks"] = tuple(t.detach().clone() for t in mtp_per_depth_valid_masks)
-            hidden = self.scale * input_ids.float().unsqueeze(-1)
-            return SimpleNamespace(
-                logits=hidden,
-                mtp_per_depth_h=[hidden],
-                mtp_per_depth_logits=None,
-                mtp_loss_scaling_factor=1.0,
-            )
-
-    model = _MTPModel()
-
-    class _FakeContextParallelSharder:
-        def __init__(self, resolved_model, device_mesh, batch, **kwargs):
-            """Run the model-owned CP preparation phase without sharding.
-
-            Args:
-                resolved_model: Model that owns the CP preparation hook.
-                device_mesh: Unused fake device mesh.
-                batch: Mutable global batch whose token tensors have shape
-                    [batch, sequence].
-                **kwargs: Sharder options including the number of chunks.
-            """
-            del device_mesh
-            assert resolved_model is model
-            assert not model.mtp_prepared
-            assert batch["input_ids"].shape == (1, 6)
-            assert batch["seq_lens_padded"].tolist() == [[3, 3, -1000]]
-            updates = model.prepare_model_inputs_for_cp(batch, num_chunks=kwargs["num_chunks"])
-            batch.update(updates)
-
-        def shard(self, batch):
-            """Select this fake rank's token positions from every main input.
-
-            Args:
-                batch: Global model-input mapping with token tensors of shape
-                    [batch, sequence] and positions of shape [axes, batch,
-                    sequence].
-
-            Returns:
-                A null context factory and mapping in the CP-local token layout.
-            """
-            assert model.mtp_prepared
-            local_batch = dict(batch)
-            for key in ("input_ids", "labels"):
-                local_batch[key] = local_batch[key].index_select(1, local_indices)
-            local_batch["position_ids"] = local_batch["position_ids"].index_select(2, local_indices)
-            local_batch.pop("seq_lens")
-            local_batch.pop("seq_lens_padded")
-            return nullcontext, local_batch
-
-        def shard_token_tensor(self, tensor, seq_dim=1, fill=None):
-            """Apply the captured CP index selection to an auxiliary tensor.
-
-            Args:
-                tensor: Tensor of shape [batch, sequence] or [axes, batch,
-                    sequence].
-                seq_dim: Sequence axis selected by ``local_indices``.
-                fill: Padding value required by the production sharder.
-
-            Returns:
-                Tensor with the same axis order and a CP-local sequence axis.
-            """
-            if tensor.ndim == 3:
-                captured["mtp_position_seq_dim"] = seq_dim
-            if tensor.dtype == torch.bool:
-                captured["mtp_valid_mask_fill"] = fill
-            return tensor.index_select(seq_dim, local_indices)
-
+def test_engine_validation_loss_uses_eval_path():
     recipe = TrainFinetuneRecipeForNextTokenPrediction.__new__(TrainFinetuneRecipeForNextTokenPrediction)
-    object.__setattr__(
-        recipe,
-        "cfg",
-        SimpleNamespace(mtp=SimpleNamespace(ignore_index=-100, scaling_factor=1.0)),
-    )
-    object.__setattr__(recipe, "dist_env", SimpleNamespace(device=torch.device("cpu")))
-    object.__setattr__(recipe, "device_mesh", object())
-    object.__setattr__(recipe, "pp_enabled", False)
-    object.__setattr__(recipe, "tokenizer", SimpleNamespace(pad_token_id=0))
-    object.__setattr__(recipe, "te_fp8", None)
-    object.__setattr__(recipe, "model_parts", [model])
-    object.__setattr__(recipe, "distributed_config", SimpleNamespace(defer_fsdp_grad_sync=True))
-    object.__setattr__(recipe, "loss_fn", object())
-    object.__setattr__(recipe, "_get_cp_group_size", lambda: 2)
-    object.__setattr__(recipe, "_get_dp_group_size", lambda include_cp=False: 1)
+    recipe.pp_enabled = False
+    expected = torch.tensor(5.0)
+    compute_loss = MagicMock(return_value=expected)
+    recipe._compute_causal_lm_loss = compute_loss
 
-    def _fake_calculate_loss(loss_fn, *, logits, **kwargs):
-        """Return a differentiable scalar from local logits.
-
-        Args:
-            loss_fn: Unused configured loss object.
-            logits: Tensor of shape [batch, local_sequence, hidden].
-            **kwargs: Remaining loss inputs.
-
-        Returns:
-            Scalar loss tensor.
-        """
-        del loss_fn, kwargs
-        return logits.sum() * 0.0
-
-    def _fake_calculate_mtp_loss(loss_fn, *, mtp_per_depth_h, mtp_per_depth_targets, cu_seqlens, **kwargs):
-        """Capture precomputed targets and return a scalar auxiliary loss.
-
-        Args:
-            loss_fn: Unused configured loss object.
-            mtp_per_depth_h: Per-depth hidden tensors of shape [batch,
-                local_sequence, hidden].
-            mtp_per_depth_targets: Per-depth targets of shape [batch,
-                local_sequence].
-            cu_seqlens: Optional packed-boundary tensor; must be absent when
-                precomputed targets are supplied.
-            **kwargs: Remaining MTP loss inputs.
-
-        Returns:
-            Scalar MTP loss tensor.
-        """
-        del loss_fn, kwargs
-        captured["mtp_targets"] = tuple(t.detach().clone() for t in mtp_per_depth_targets)
-        captured["cu_seqlens"] = cu_seqlens
-        return sum(hidden.sum() for hidden in mtp_per_depth_h) * 0.01
-
-    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.ContextParallelSharder", _FakeContextParallelSharder)
-    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.calculate_loss", _fake_calculate_loss)
-    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.calculate_mtp_loss", _fake_calculate_mtp_loss)
-    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.get_final_hidden_states", lambda out: None)
-
-    batch = {
-        "input_ids": torch.tensor([[10, 11, 12, 20, 21, 22]]),
-        "labels": torch.tensor([[11, 12, -100, 21, 22, -100]]),
-        "seq_lens": torch.tensor([[3, 3, -1000]]),
-        "seq_lens_padded": torch.tensor([[3, 3, -1000]]),
+    output = object()
+    labels = torch.tensor([[1, 2, -100]])
+    loss_inputs = {
+        "labels": labels,
+        "weights": labels.ne(-100),
+        "cu_seqlens": torch.tensor([0, 3], dtype=torch.int32),
     }
-    model.supports.supports_mtp_cp = False
-    with pytest.raises(NotImplementedError, match="supports_mtp_cp=False"):
-        recipe._forward_validation_step(batch)
-    assert not model.cp_prepared
-    assert not model.mtp_prepared
-    model.supports.supports_mtp_cp = True
 
-    loss = recipe._forward_validation_step(batch)
+    loss = recipe._engine_validation_loss_fn(output, loss_inputs)
 
-    assert captured["model_input_ids"].tolist() == [[10, 11, 21, 22]]
-    assert captured["mtp_input_ids"][0].tolist() == [[11, 12, 22, 0]]
-    assert captured["mtp_position_ids"][0][0].tolist() == [[1, 2, 2, 0]]
-    assert captured["mtp_position_seq_dim"] == 2
-    assert captured["mtp_valid_masks"][0].tolist() == [[True, True, True, False]]
-    assert captured["mtp_valid_mask_fill"] is False
-    assert captured["mtp_targets"][0].tolist() == [[12, -100, -100, -100]]
-    assert captured["cu_seqlens"] is None
-    assert torch.isfinite(loss)
-    assert model.scale.grad is None
+    assert loss is expected
+    compute_loss.assert_called_once_with(
+        output,
+        labels,
+        loss_inputs,
+        num_label_tokens=None,
+        is_train=False,
+    )

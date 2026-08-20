@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager, nullcontext
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -50,7 +51,7 @@ LossFn = Callable[
 _LOSS_FIELD_PREFIX = "__engine_loss__"
 _LOSS_METADATA = ("cu_seqlens", "cu_seqlens_padded", "max_seqlen", "padding_mask")
 
-__all__ = ["Engine", "collate_prebatched"]
+__all__ = ["Engine", "ForwardResult", "collate_prebatched"]
 
 
 def _nullcontext_for_batch(_model_inputs: dict[str, Any]) -> AbstractContextManager[Any]:
@@ -78,15 +79,41 @@ def collate_prebatched(datums: list[Datum]) -> tuple[dict[str, Any], dict[str, t
     return dict(datum.model_inputs), dict(datum.loss_fn_inputs)
 
 
+@dataclass(frozen=True)
+class ForwardResult:
+    """Forward-only loss statistics and per-Datum outputs.
+
+    ``loss_sum`` and ``weight_sum`` are complete across model-parallel CP and
+    PP ranks, but remain local to one data-parallel replica. The Engine adds no
+    per-call DP loss-statistic collective, so callers reduce the two sums once
+    at the end of an evaluation epoch. Distributed model wrappers may still
+    communicate during forward and therefore retain their own call-alignment
+    requirements. ``loss_fn_outputs`` remains local to the replica's input
+    Datums; PP stages receive identical detached copies, while any CP-local
+    tensor layout inside those mappings remains caller defined.
+
+    Attributes:
+        loss_sum: Detached weighted numerator for this Datum window.
+        weight_sum: Detached full-sequence weight denominator for this window.
+        loss_fn_outputs: Detached per-Datum mappings in input order.
+    """
+
+    loss_sum: torch.Tensor
+    weight_sum: torch.Tensor
+    loss_fn_outputs: list[dict[str, Any]]
+
+
 class Engine:
-    """Run model forward/backward over one optimizer accumulation window.
+    """Run model forward or forward/backward over Datum windows.
 
     The model and distributed topology are already constructed when they are
-    passed here. The Engine owns batching, global weight normalization,
-    gradient-accumulation synchronization, and backward. It deliberately does
-    not zero, clip, finalize expert gradients, or step them; callers choose the
-    optimizer boundary and retain the repository's existing distributed
-    gradient-finalization path.
+    passed here. The Engine owns batching and model-parallel execution.
+    :meth:`forward` performs evaluation without gradients;
+    :meth:`forward_backward` additionally owns global weight normalization,
+    gradient-accumulation synchronization, and backward. The Engine
+    deliberately does not zero, clip, finalize expert gradients, or step them;
+    callers choose the optimizer boundary and retain the repository's existing
+    distributed gradient-finalization path.
 
     Args:
         model: An already configured and distributed model, or a built
@@ -156,6 +183,114 @@ class Engine:
         self.mtp_ignore_index = mtp_ignore_index
         self.context_fn = context_fn
         self.defer_fsdp_grad_sync = defer_fsdp_grad_sync
+
+    @torch.no_grad()
+    def forward(
+        self,
+        datums: Sequence[Datum],
+        loss_fn: LossFn,
+    ) -> ForwardResult:
+        """Run a forward-only Datum window.
+
+        The Engine groups and collates the flat Datum sequence exactly as in
+        :meth:`forward_backward`, then applies the same device movement,
+        context-parallel layout, packed metadata, batch contexts, and pipeline
+        microbatch materialization. Model parts run in evaluation mode and no
+        autograd graph, gradient synchronization, or backward lifecycle is
+        created.
+
+        Loss statistics are reduced only across model-parallel CP and PP
+        ranks. They deliberately remain local to one DP replica, avoiding an
+        Engine-introduced per-call DP loss collective; callers perform one
+        dataset-level DP reduction afterwards. Distributed wrappers such as
+        DDP/FSDP may still require aligned forward calls for their own model
+        communication.
+
+        Args:
+            datums: Flat sequence of Datum items for this forward-only window.
+            loss_fn: Computes a per-element loss tensor or scalar local
+                weighted numerator from the raw model output and CP-local loss
+                inputs. It may additionally return one output mapping per
+                Datum.
+
+        Returns:
+            Detached model-parallel-complete loss statistics and per-Datum
+            outputs. The sums are local to one data-parallel replica.
+        """
+        microbatches = self._group_datums(datums)
+        self._validate_execution_parallelism()
+        cp_group, cp_size = self._cp_group_and_size()
+        self._validate_window_size_across_group(len(microbatches), cp_group, cp_size)
+        weight_sum = self._local_weight_sum(microbatches)
+        zero_weight_sum = bool(weight_sum == 0)
+        self._validate_pipeline_window(len(microbatches), weight_sum)
+
+        for part in self.model_parts:
+            part.eval()
+        inner_microbatches = self.pipeline.num_microbatches if self.pipeline is not None else 1
+        local_loss_sum = torch.zeros((), dtype=torch.float64, device=self.device)
+        loss_fn_outputs: list[dict[str, Any]] = []
+        returns_outputs: bool | None = None
+
+        for batch_datums in microbatches:
+            cp_context, model_inputs, loss_inputs = self._prepare_batch(batch_datums, inner_microbatches)
+            if self.pipeline is not None:
+                batch_returns_outputs, batch_outputs = self._pipeline_execute(
+                    model_inputs,
+                    loss_inputs,
+                    batch_datums,
+                    loss_fn,
+                    local_loss_sum,
+                    cp_context,
+                    backward_scale=None,
+                    zero_weight_sum=zero_weight_sum,
+                )
+                if batch_returns_outputs is not None:
+                    if returns_outputs is None:
+                        returns_outputs = batch_returns_outputs
+                    elif returns_outputs != batch_returns_outputs:
+                        raise ValueError("loss_fn must return per-Datum outputs for every microbatch or none of them")
+                    loss_fn_outputs.extend(batch_outputs)
+                continue
+
+            loss_inputs = _with_loss_metadata(model_inputs, loss_inputs)
+            with self.context_fn(model_inputs), cp_context():
+                forward_inputs = filter_forward_kwargs(self.model, model_inputs)
+                output = self.model(**forward_inputs)
+                result = loss_fn(output, loss_inputs)
+                has_outputs = isinstance(result, tuple)
+                if returns_outputs is None:
+                    returns_outputs = has_outputs
+                elif returns_outputs != has_outputs:
+                    raise ValueError("loss_fn must return per-Datum outputs for every microbatch or none of them")
+                if isinstance(result, tuple):
+                    losses, outputs = result
+                    if (
+                        not isinstance(outputs, Sequence)
+                        or isinstance(outputs, (str, bytes))
+                        or len(outputs) != len(batch_datums)
+                        or not all(isinstance(item, Mapping) for item in outputs)
+                    ):
+                        raise ValueError("loss_fn outputs must contain one mapping per Datum")
+                    loss_fn_outputs.extend(_detach(dict(item)) for item in outputs)
+                else:
+                    losses = result
+                numerator = _weighted_numerator(losses, loss_inputs["weights"])
+                if zero_weight_sum:
+                    numerator = numerator * 0
+            local_loss_sum.add_(numerator.detach().to(torch.float64))
+
+        if cp_size > 1:
+            dist.all_reduce(local_loss_sum, op=dist.ReduceOp.SUM, group=cp_group)
+        pp_group, pp_size = self._pp_group_and_size()
+        if pp_size > 1:
+            dist.all_reduce(local_loss_sum, op=dist.ReduceOp.SUM, group=pp_group)
+
+        return ForwardResult(
+            loss_sum=local_loss_sum.detach(),
+            weight_sum=weight_sum.detach(),
+            loss_fn_outputs=loss_fn_outputs,
+        )
 
     def forward_backward(
         self,
@@ -237,16 +372,20 @@ class Engine:
             cp_context, model_inputs, loss_inputs = self._prepare_batch(datums, inner_microbatches)
 
             if self.pipeline is not None:
-                batch_returns_outputs, batch_outputs = self._pipeline_step(
+                backward_scale = (
+                    safe_denominator.new_zeros(())
+                    if zero_denominator
+                    else safe_denominator.new_tensor(grad_group_size) / safe_denominator
+                )
+                batch_returns_outputs, batch_outputs = self._pipeline_execute(
                     model_inputs,
                     loss_inputs,
                     datums,
                     loss_fn,
-                    safe_denominator,
-                    zero_denominator,
-                    grad_group_size,
                     local_loss_sum,
                     cp_context,
+                    backward_scale=backward_scale,
+                    zero_weight_sum=zero_denominator,
                 )
                 if batch_returns_outputs is not None:
                     if returns_outputs is None:
@@ -301,9 +440,9 @@ class Engine:
 
     def _group_datums(self, datums: Sequence[Datum]) -> list[list[Datum]]:
         if not isinstance(datums, Sequence) or isinstance(datums, (str, bytes)) or not datums:
-            raise ValueError("forward_backward requires a non-empty flat sequence of Datum")
+            raise ValueError("Engine requires a non-empty flat sequence of Datum")
         if not all(isinstance(datum, Datum) for datum in datums):
-            raise TypeError("forward_backward received a value that is not a Datum")
+            raise TypeError("Engine received a value that is not a Datum")
         return [
             list(datums[start : start + self.microbatch_size]) for start in range(0, len(datums), self.microbatch_size)
         ]
@@ -496,18 +635,36 @@ class Engine:
         )
         return result
 
-    def _pipeline_step(
+    def _pipeline_execute(
         self,
         model_inputs: dict[str, Any],
         loss_inputs: LossInputs,
         datums: Sequence[Datum],
         loss_fn: LossFn,
-        denominator: torch.Tensor,
-        zero_denominator: bool,
-        grad_group_size: int,
         local_loss_sum: torch.Tensor,
         cp_context: Callable[[], AbstractContextManager[Any]],
+        *,
+        backward_scale: torch.Tensor | None,
+        zero_weight_sum: bool,
     ) -> tuple[bool | None, list[dict[str, Any]]]:
+        """Run prepared pipeline microbatches in training or forward-only mode.
+
+        Args:
+            model_inputs: CP-prepared outer-batch model inputs.
+            loss_inputs: CP-prepared outer-batch loss inputs.
+            datums: Datum items represented by the outer batch.
+            loss_fn: Model-output loss callback.
+            local_loss_sum: Accumulator updated with detached numerators.
+            cp_context: Context covering the complete pipeline schedule.
+            backward_scale: Multiplier returned to the training schedule for
+                backward, or ``None`` to run the forward-only schedule.
+            zero_weight_sum: Whether reporting numerators must be forced to
+                graph-connected zero.
+
+        Returns:
+            Whether the callback returned outputs, and its detached outputs in
+            logical Datum order.
+        """
         outputs_by_microbatch: list[list[dict[str, Any]] | None] = [None] * self.pipeline.num_microbatches
         returns_outputs: bool | None = None
 
@@ -588,13 +745,16 @@ class Engine:
                     else:
                         losses = result
                     numerator = _weighted_numerator(losses, loss_inputs_mb["weights"])
-                    if zero_denominator:
+                    if zero_weight_sum:
                         numerator = numerator * 0
                     local_loss_sum.add_(numerator.detach().to(torch.float64))
-                    return numerator * (grad_group_size / denominator)
+                    return numerator if backward_scale is None else numerator * backward_scale
 
                 losses = [] if self.pipeline.info.has_last_stage else None
-                self.pipeline.step_microbatches(
+                run_microbatches = (
+                    self.pipeline.eval_microbatches if backward_scale is None else self.pipeline.step_microbatches
+                )
+                run_microbatches(
                     model_microbatches,
                     loss_fn=pipeline_loss,
                     losses=losses,
@@ -715,6 +875,8 @@ class Engine:
         return model_microbatches, loss_microbatches
 
     def _validate_parallelism(self) -> None:
+        """Validate topology plus backward-specific distributed contracts."""
+        self._validate_execution_parallelism()
         if any(
             bool(getattr(module, "calculate_per_token_loss", False))
             for part in self.model_parts
@@ -724,6 +886,11 @@ class Engine:
                 "Engine.forward_backward requires averaged distributed gradients; "
                 "MegatronFSDP calculate_per_token_loss=True uses summed gradients"
             )
+        if self.pipeline is not None and self.pipeline.scale_grads_in_schedule:
+            raise ValueError("Engine requires AutoPipeline scale_grads_in_schedule=False")
+
+    def _validate_execution_parallelism(self) -> None:
+        """Validate model-parallel topology shared by forward and backward."""
         if (
             self.pipeline is not None
             and self._cp_size() > 1
@@ -736,8 +903,6 @@ class Engine:
             raise NotImplementedError(
                 "MTP with context and pipeline parallelism is not supported; use PP size 1 or CP size 1"
             )
-        if self.pipeline is not None and self.pipeline.scale_grads_in_schedule:
-            raise ValueError("Engine requires AutoPipeline scale_grads_in_schedule=False")
         if self.pipeline is not None and self.mesh_context is None:
             raise ValueError("pipeline Engine requires mesh_context")
         if self.mesh_context is None:
@@ -749,6 +914,19 @@ class Engine:
 
     def _cp_size(self) -> int:
         return self.mesh_context.cp_size if self.mesh_context is not None else 1
+
+    def _cp_group_and_size(self) -> tuple[dist.ProcessGroup | None, int]:
+        if (
+            self.mesh_context is None
+            or self.mesh_context.device_mesh is None
+            or self.mesh_context.cp_size <= 1
+            or not dist.is_available()
+            or not dist.is_initialized()
+        ):
+            return None, 1
+        cp_mesh = self.mesh_context.device_mesh["cp"]
+        size = int(cp_mesh.size())
+        return (cp_mesh.get_group() if size > 1 else None), size
 
     def _dp_group_and_size(self) -> tuple[dist.ProcessGroup | None, int]:
         if self.mesh_context is not None and self.mesh_context.device_mesh is not None:
@@ -789,9 +967,7 @@ class Engine:
         if not bool((gathered[:, 0] == gathered[0, 0]).all()):
             raise ValueError(f"pipeline stages must use the same outer window size; got {gathered[:, 0].tolist()}")
         if not torch.allclose(gathered[:, 1], gathered[0, 1].expand(pp_size), rtol=1e-8, atol=1e-12):
-            raise ValueError(
-                f"pipeline stages must use the same DP-reduced weight denominator; got {gathered[:, 1].tolist()}"
-            )
+            raise ValueError(f"pipeline stages must use the same weight denominator; got {gathered[:, 1].tolist()}")
 
     def _global_weight_sum(
         self,
@@ -799,6 +975,13 @@ class Engine:
         dp_group: dist.ProcessGroup | None,
         dp_size: int,
     ) -> torch.Tensor:
+        denominator = self._local_weight_sum(microbatches)
+        if dp_size > 1:
+            dist.all_reduce(denominator, op=dist.ReduceOp.SUM, group=dp_group)
+        return denominator
+
+    def _local_weight_sum(self, microbatches: list[list[Datum]]) -> torch.Tensor:
+        """Return the full-sequence denominator for one DP replica."""
         local_sum = 0.0
         for datum in (datum for microbatch in microbatches for datum in microbatch):
             weights = datum.loss_fn_inputs.get("weights")
@@ -810,8 +993,6 @@ class Engine:
 
         denominator = torch.tensor(local_sum, dtype=torch.float64, device=self.device)
         self._validate_weight_sum_across_cp(denominator)
-        if dp_size > 1:
-            dist.all_reduce(denominator, op=dist.ReduceOp.SUM, group=dp_group)
         return denominator
 
     def _validate_window_size_across_group(
@@ -826,7 +1007,7 @@ class Engine:
         sizes = torch.empty(group_size, dtype=torch.int64, device=self.device)
         dist.all_gather_into_tensor(sizes, local_size, group=group)
         if not bool((sizes == sizes[0]).all()):
-            raise ValueError(f"every gradient rank must use the same number of microbatches; got {sizes.tolist()}")
+            raise ValueError(f"every participating rank must use the same number of microbatches; got {sizes.tolist()}")
 
     def _validate_weight_sum_across_cp(self, local_weight_sum: torch.Tensor) -> None:
         """Verify that CP replicas started from the same full-sequence weights."""

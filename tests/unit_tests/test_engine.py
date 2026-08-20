@@ -42,7 +42,7 @@ from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
 from nemo_automodel.components.models.common.mtp import prepare_mtp_context_parallel_inputs
 from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
-from nemo_automodel.engine import Engine, collate_prebatched
+from nemo_automodel.engine import Engine, ForwardResult, collate_prebatched
 
 
 class ScaleModel(nn.Module):
@@ -100,6 +100,7 @@ class _FakeAutoPipeline(AutoPipeline):
         self.events = events
         self.callback_order = callback_order or list(range(num_microbatches))
         self.step_calls = 0
+        self.eval_calls = 0
         self.backward_calls = 0
         self.updated_seq_lens = []
         self.updated_microbatch_sizes = []
@@ -142,6 +143,22 @@ class _FakeAutoPipeline(AutoPipeline):
             scaled_loss.backward()
             self.backward_calls += 1
 
+    def eval_microbatches(self, model_inputs, *, loss_fn, losses, return_outputs):
+        assert return_outputs is False
+        assert len(model_inputs) == self.num_microbatches
+        self.prepared_inputs.append(model_inputs)
+        self.eval_calls += 1
+        if self.events is not None:
+            self.events.append("eval")
+
+        for index in self.callback_order:
+            inputs = dict(model_inputs[index])
+            primary_name = "inputs_embeds" if "inputs_embeds" in inputs else "input_ids"
+            primary = inputs.pop(primary_name)
+            output = self.compute_model(primary, **inputs)
+            loss = loss_fn(output, index)
+            self.callback_losses.append(loss.detach())
+
 
 def _pipeline_mesh_context():
     return SimpleNamespace(pp_size=2, cp_size=1, device_mesh=None, process_group=None)
@@ -176,6 +193,69 @@ def _identity_loss(output, _loss_inputs):
 def test_engine_and_datum_are_lazy_top_level_exports():
     assert PublicEngine is Engine
     assert PublicDatum is Datum
+
+
+def test_forward_runs_eval_without_grad_lifecycle_and_returns_local_statistics(monkeypatch):
+    class EvalModel(ScaleModel):
+        def forward(self, input_ids: torch.Tensor, **kwargs) -> torch.Tensor:
+            assert not self.training
+            assert not torch.is_grad_enabled()
+            return super().forward(input_ids, **kwargs)
+
+    model = EvalModel()
+    model.weight.grad = torch.tensor(7.0)
+    monkeypatch.setattr(
+        engine_module,
+        "prepare_for_grad_accumulation",
+        lambda *_args, **_kwargs: pytest.fail("forward-only execution must not prepare gradient accumulation"),
+    )
+    monkeypatch.setattr(
+        engine_module,
+        "prepare_for_final_backward",
+        lambda *_args, **_kwargs: pytest.fail("forward-only execution must not prepare backward"),
+    )
+    monkeypatch.setattr(
+        engine_module,
+        "get_sync_ctx",
+        lambda *_args, **_kwargs: pytest.fail("forward-only execution must not enter a gradient sync context"),
+    )
+    monkeypatch.setattr(MoEAuxLossAutoScaler, "main_loss_backward_scale", torch.tensor(9.0))
+
+    def loss_with_outputs(output, _loss_inputs):
+        assert not torch.is_grad_enabled()
+        return output, [{"value": output.sum()}]
+
+    engine = Engine(model, device="cpu")
+    engine._dp_group_and_size = lambda: pytest.fail("forward must not synchronize data-parallel replicas")
+    result = engine.forward(
+        [_datum([1, 100], [1.0, 0.0]), _datum([3], [0.5])],
+        loss_with_outputs,
+    )
+
+    assert isinstance(result, ForwardResult)
+    assert result.loss_sum.item() == pytest.approx(2.5)
+    assert result.weight_sum.item() == pytest.approx(1.5)
+    assert [item["value"].item() for item in result.loss_fn_outputs] == [101.0, 3.0]
+    assert all(not item["value"].requires_grad for item in result.loss_fn_outputs)
+    assert model.weight.grad.item() == 7.0
+    assert model.forward_calls == 2
+    assert not model.training
+    assert MoEAuxLossAutoScaler.main_loss_backward_scale.item() == 9.0
+
+
+def test_forward_zero_weight_window_still_executes_without_gradients():
+    model = ScaleModel()
+
+    result = Engine(model, device="cpu").forward(
+        [_datum([1, 2], [0.0, 0.0])],
+        lambda output, _inputs: output.sum(),
+    )
+
+    assert result.loss_sum.item() == 0
+    assert result.weight_sum.item() == 0
+    assert result.loss_fn_outputs == []
+    assert model.forward_calls == 1
+    assert model.weight.grad is None
 
 
 def test_forward_backward_uses_one_denominator_for_the_window():
@@ -324,7 +404,8 @@ def test_context_parallel_shards_model_and_rl_loss_inputs_together():
     assert not cp_context_active
 
 
-def test_context_parallel_prepares_mtp_futures_before_sharding():
+@pytest.mark.parametrize("execution", ["forward", "forward_backward"])
+def test_context_parallel_prepares_mtp_futures_before_sharding(execution):
     class MTPModel(ScaleModel):
         def __init__(self):
             super().__init__()
@@ -393,7 +474,7 @@ def test_context_parallel_prepares_mtp_futures_before_sharding():
         captured_loss_inputs.update(loss_inputs)
         return output
 
-    loss, _ = engine.forward_backward([datum], loss_fn)
+    result = getattr(engine, execution)([datum], loss_fn)
 
     input_ids, position_ids, valid_masks = model.mtp_forward_inputs
 
@@ -414,8 +495,14 @@ def test_context_parallel_prepares_mtp_futures_before_sharding():
         [[21, 22, 23, -7]],
         [[22, 23, -7, -7]],
     ]
-    assert loss.item() == pytest.approx(46 / 8)
-    assert model.weight.grad.item() == pytest.approx(46 / 8)
+    if execution == "forward":
+        assert result.loss_sum.item() == pytest.approx(46)
+        assert result.weight_sum.item() == pytest.approx(8)
+        assert model.weight.grad is None
+    else:
+        loss, _ = result
+        assert loss.item() == pytest.approx(46 / 8)
+        assert model.weight.grad.item() == pytest.approx(46 / 8)
 
 
 def test_context_parallel_rejects_mtp_without_model_capability():
@@ -709,7 +796,60 @@ def test_pipeline_window_uses_schedule_microbatches_and_global_normalization():
     assert not active
 
 
-def test_pipeline_stage_metadata_prevents_real_forward_from_resetting_media_cursor():
+def test_pipeline_forward_uses_eval_microbatches_without_backward_and_orders_outputs():
+    model = ScaleModel()
+    other_part = ScaleModel()
+    pipeline = _FakeAutoPipeline(
+        model,
+        parts=[model, other_part],
+        num_microbatches=2,
+        callback_order=[1, 0],
+    )
+
+    result = Engine(
+        pipeline,
+        device="cpu",
+        mesh_context=_pipeline_mesh_context(),
+        microbatch_size=2,
+    ).forward(
+        [_datum([1, 2]), _datum([3, 4])],
+        lambda output, _inputs: (output, [{"first_token": output.flatten()[0]}]),
+    )
+
+    assert result.loss_sum.item() == pytest.approx(10.0)
+    assert result.weight_sum.item() == pytest.approx(4.0)
+    assert [item["first_token"].item() for item in result.loss_fn_outputs] == [1.0, 3.0]
+    assert pipeline.eval_calls == 1
+    assert pipeline.step_calls == 0
+    assert pipeline.backward_calls == 0
+    assert model.weight.grad is None
+    assert model.forward_calls == 2
+    assert not model.training
+    assert not other_part.training
+    torch.testing.assert_close(torch.stack(pipeline.callback_losses), torch.tensor([7.0, 3.0]))
+
+
+def test_forward_does_not_apply_backward_only_parallelism_restrictions():
+    model = ScaleModel()
+    model.calculate_per_token_loss = True
+    eager_result = Engine(model, device="cpu").forward([_datum([1])], _identity_loss)
+
+    pipeline_model = ScaleModel()
+    pipeline = _FakeAutoPipeline(pipeline_model, num_microbatches=1, scale_grads=True)
+    pipeline_result = Engine(
+        pipeline,
+        device="cpu",
+        mesh_context=_pipeline_mesh_context(),
+    ).forward([_datum([2])], _identity_loss)
+
+    assert eager_result.loss_sum.item() == 1.0
+    assert pipeline_result.loss_sum.item() == 2.0
+    assert pipeline.eval_calls == 1
+    assert pipeline.step_calls == 0
+
+
+@pytest.mark.parametrize("execution", ["forward", "forward_backward"])
+def test_pipeline_stage_metadata_prevents_real_forward_from_resetting_media_cursor(execution):
     class MediaModel(ScaleModel):
         def __init__(self):
             super().__init__()
@@ -756,17 +896,19 @@ def test_pipeline_stage_metadata_prevents_real_forward_from_resetting_media_curs
         loss_fn_inputs={"weights": torch.ones(2, 1)},
     )
 
-    Engine(
+    engine = Engine(
         pipeline,
         device="cpu",
         mesh_context=_pipeline_mesh_context(),
         collate_fn=collate_prebatched,
         context_fn=batch_context,
-    ).forward_backward([datum], _identity_loss)
+    )
+    getattr(engine, execution)([datum], _identity_loss)
 
     assert model.consumed_media == [1, 2]
     assert pipeline.updated_seq_lens == [1]
-    assert pipeline.step_calls == 1
+    assert pipeline.step_calls == int(execution == "forward_backward")
+    assert pipeline.eval_calls == int(execution == "forward")
 
 
 def test_pipeline_lifecycle_and_moe_scale_cover_outer_and_inner_microbatches(monkeypatch):
@@ -1316,6 +1458,14 @@ def test_collater_cannot_change_weight_sum():
 def _distributed_worker(rank: int, world_size: int, init_file: str) -> None:
     dist.init_process_group("gloo", init_method=f"file://{init_file}", rank=rank, world_size=world_size)
     try:
+        # With an unwrapped model, forward-only execution adds no DP
+        # collectives and keeps each rank's statistics local. DDP/FSDP wrappers
+        # may impose their own aligned-call requirement.
+        forward_window = [_datum([1])] if rank == 0 else [_datum([2]), _datum([3])]
+        forward_result = Engine(ScaleModel(), device="cpu").forward(forward_window, _identity_loss)
+        assert forward_result.loss_sum.item() == pytest.approx(1.0 if rank == 0 else 5.0)
+        assert forward_result.weight_sum.item() == pytest.approx(1.0 if rank == 0 else 2.0)
+
         model = nn.parallel.DistributedDataParallel(ScaleModel())
         bad_window = [_datum([1])] if rank == 0 else [_datum([1]), _datum([2])]
         with pytest.raises(ValueError, match="same number of microbatches"):
@@ -1371,6 +1521,20 @@ def _context_parallel_worker(rank: int, world_size: int, init_file: str, dp_size
 
         assert loss.item() == pytest.approx(4.5)
         assert model.module.weight.grad.item() == pytest.approx(4.5)
+
+        model.module.weight.grad = None
+        forward_result = Engine(
+            model,
+            device="cpu",
+            mesh_context=mesh_context,
+            collate_fn=collate_prebatched,
+        ).forward(window, _identity_loss)
+        expected_sum = (
+            18.0 if dp_size == 1 else 10.0 + 16.0 * get_flat_mesh(mesh_context.device_mesh, "dp").get_local_rank()
+        )
+        assert forward_result.loss_sum.item() == pytest.approx(expected_sum)
+        assert forward_result.weight_sum.item() == pytest.approx(4.0)
+        assert model.module.weight.grad is None
     finally:
         dist.destroy_process_group()
 

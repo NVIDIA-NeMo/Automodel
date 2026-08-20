@@ -16,9 +16,12 @@
 
 The test runs the same two-microbatch, four-document update through PP=2 from
 both raw THD metadata (``seq_lens``) and final THD metadata (``cu_seqlens``).
-Each path must match a native eager Llama in loss and every local stage
-gradient. A final padded two-Datum update verifies that Engine broadcasts the
-callback's per-Datum mappings to both pipeline ranks in logical input order.
+Each path runs training, forward-only evaluation, then training again on the
+same pipeline. Evaluation must match a native eager Llama in summed loss and
+weight statistics without creating gradients; both surrounding training calls
+must match eager loss plus every local-stage gradient. A final padded two-Datum
+update verifies that Engine broadcasts the callback's per-Datum mappings to
+both pipeline ranks in logical input order.
 
 Run with::
 
@@ -119,7 +122,26 @@ def _token_losses(output, loss_inputs: dict[str, torch.Tensor]) -> torch.Tensor:
 
 def _eager_reference(
     device: torch.device,
-) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, object], torch.Tensor, torch.Tensor]:
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    dict[str, torch.Tensor],
+    dict[str, object],
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """Build eager eval and training references for the shared packed batch.
+
+    Args:
+        device: CUDA device on which the reference model and batch run.
+
+    Returns:
+        The scalar eval loss sum, scalar eval weight sum, scalar normalized
+        training loss, per-parameter gradient mapping, raw model-input mapping,
+        labels of shape [batch, sequence], and weights of shape [batch, sequence].
+        Raw token and position tensors have shape [batch, sequence].
+    """
     raw_inputs, labels, weights = _raw_batch(device)
     prepared = make_cp_batch_for_te(
         None,
@@ -128,13 +150,26 @@ def _eager_reference(
     prepared_labels = prepared.pop("labels")
 
     model = _build_model(device)
+    model.eval()
+    with torch.no_grad():
+        eval_output = model(**prepared)
+        eval_token_losses = _token_losses(
+            eval_output,
+            {"labels": prepared_labels, "weights": weights.reshape(-1)},
+        )
+        eval_loss_sum = (eval_token_losses * weights.reshape(-1)).sum()
+        eval_weight_sum = weights.sum()
+    if any(parameter.grad is not None for parameter in model.parameters()):
+        raise AssertionError("eager forward-only reference unexpectedly created parameter gradients")
+
+    model.train()
     output = model(**prepared)
     token_losses = _token_losses(output, {"labels": prepared_labels, "weights": weights.reshape(-1)})
     loss = (token_losses * weights.reshape(-1)).sum() / weights.sum()
     loss.backward()
     grads = {name: parameter.grad.detach().clone() for name, parameter in model.named_parameters()}
     del model
-    return loss.detach(), grads, raw_inputs, labels, weights
+    return eval_loss_sum.detach(), eval_weight_sum.detach(), loss.detach(), grads, raw_inputs, labels, weights
 
 
 def _build_pipeline(
@@ -184,12 +219,35 @@ def _run_thd_layout(
     layout: str,
     device: torch.device,
     mesh_context: MeshContext,
+    reference_eval_loss_sum: torch.Tensor,
+    reference_eval_weight_sum: torch.Tensor,
     reference_loss: torch.Tensor,
     reference_grads: dict[str, torch.Tensor],
     raw_inputs: dict[str, object],
     labels: torch.Tensor,
     weights: torch.Tensor,
 ) -> AutoPipeline:
+    """Run training, forward-only, then training parity for one THD layout.
+
+    Args:
+        layout: ``raw`` for batch-major pre-THD tensors or ``final`` for the
+            flattened model-ready THD stream.
+        device: CUDA device on which this physical pipeline rank runs.
+        mesh_context: Runtime mesh whose PP axis has size two.
+        reference_eval_loss_sum: Scalar eager forward-only weighted numerator.
+        reference_eval_weight_sum: Scalar eager full-sequence weight sum.
+        reference_loss: Scalar eager normalized training loss.
+        reference_grads: Mapping from parameter names to eager gradient tensors
+            with each parameter's native shape.
+        raw_inputs: Mapping whose token and position tensors have shape [batch,
+            sequence] before THD flattening.
+        labels: Target token IDs of shape [batch, sequence].
+        weights: Token weights of shape [batch, sequence].
+
+    Returns:
+        The two-stage pipeline after the second training pass. Every local
+        parameter has its native gradient shape.
+    """
     pipeline = _build_pipeline(device, mesh_context)
     if layout == "raw":
         model_inputs = _clone_mapping(raw_inputs)
@@ -209,20 +267,55 @@ def _run_thd_layout(
         model_inputs=model_inputs,
         loss_fn_inputs={"labels": loss_labels, "weights": loss_weights},
     )
-    loss, outputs = Engine(
+    engine = Engine(
         pipeline,
         device=device,
         mesh_context=mesh_context,
         collate_fn=collate_prebatched,
-    ).forward_backward([datum], _token_losses)
+    )
+
+    pre_eval_loss, pre_eval_outputs = engine.forward_backward([datum], _token_losses)
+    torch.testing.assert_close(pre_eval_loss.float(), reference_loss.float(), atol=2e-3, rtol=2e-3)
+    assert pre_eval_outputs == []
+    pre_eval_grad_diff = _assert_local_grad_parity(pipeline, reference_grads)
+    for part in pipeline.parts:
+        part.zero_grad(set_to_none=True)
+
+    forward_result = engine.forward([datum], _token_losses)
+
+    torch.testing.assert_close(
+        forward_result.loss_sum.float(),
+        reference_eval_loss_sum.float(),
+        atol=4e-2,
+        rtol=2e-3,
+    )
+    torch.testing.assert_close(
+        forward_result.weight_sum.float(),
+        reference_eval_weight_sum.float(),
+        atol=0,
+        rtol=0,
+    )
+    assert forward_result.loss_fn_outputs == []
+    if any(parameter.grad is not None for part in pipeline.parts for parameter in part.parameters()):
+        raise AssertionError(f"PP2 {layout} THD forward-only evaluation unexpectedly created parameter gradients")
+    if any(part.training for part in pipeline.parts):
+        raise AssertionError(f"PP2 {layout} THD forward-only evaluation did not keep every model part in eval mode")
+
+    # Reuse the exact pipeline immediately. Together with the training call
+    # above, this proves both train->eval and eval->train schedule transitions
+    # restore temporary split/loss callbacks and backward state.
+    loss, outputs = engine.forward_backward([datum], _token_losses)
 
     torch.testing.assert_close(loss.float(), reference_loss.float(), atol=2e-3, rtol=2e-3)
     assert outputs == []
     grad_diff = _assert_local_grad_parity(pipeline, reference_grads)
     if dist.get_rank() == 0:
         print(
-            f"PP2 {layout} THD parity passed "
-            f"(loss diff={(loss.float() - reference_loss.float()).abs().item():.6f}, grad max={grad_diff:.6f})"
+            f"PP2 {layout} THD forward+backward parity passed "
+            f"(eval loss-sum diff="
+            f"{(forward_result.loss_sum.float() - reference_eval_loss_sum.float()).abs().item():.6f}, "
+            f"train loss diff={(loss.float() - reference_loss.float()).abs().item():.6f}, "
+            f"pre/post-eval grad max={pre_eval_grad_diff:.6f}/{grad_diff:.6f})"
         )
     return pipeline
 
@@ -285,11 +378,21 @@ def main() -> None:
         world_size=dist.get_world_size(),
     )
     try:
-        reference_loss, reference_grads, raw_inputs, labels, weights = _eager_reference(device)
+        (
+            reference_eval_loss_sum,
+            reference_eval_weight_sum,
+            reference_loss,
+            reference_grads,
+            raw_inputs,
+            labels,
+            weights,
+        ) = _eager_reference(device)
         _run_thd_layout(
             "raw",
             device,
             mesh_context,
+            reference_eval_loss_sum,
+            reference_eval_weight_sum,
             reference_loss,
             reference_grads,
             raw_inputs,
@@ -301,6 +404,8 @@ def main() -> None:
             "final",
             device,
             mesh_context,
+            reference_eval_loss_sum,
+            reference_eval_weight_sum,
             reference_loss,
             reference_grads,
             raw_inputs,
