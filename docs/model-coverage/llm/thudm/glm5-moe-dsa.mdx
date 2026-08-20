@@ -54,7 +54,7 @@ GLM-5 family models in NeMo AutoModel include the following capabilities:
 
 ## Parallel Setup
 
-The HellaSwag recipes scale training using Expert Parallelism and Pipeline Parallelism (EP=64, PP=4 across 32 nodes of 8× H100 GPUs). The long-context GLM-5.2 recipe additionally enables CP=8, packed THD batches, and the TileLang DSA path.
+The HellaSwag recipes scale training using Expert Parallelism and Pipeline Parallelism (EP=64, PP=4 across 32 nodes of 8× H100 GPUs). The long-context GLM-5.2 recipe also enables CP=8, packed THD batches, and the TileLang DSA path.
 
 ```yaml
 distributed:
