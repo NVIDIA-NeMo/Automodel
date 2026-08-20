@@ -82,7 +82,7 @@ MODEL=Qwen/Qwen3-32B bash data/prefilter.sh
 MODEL=Qwen/Qwen3-32B SEQ_LENGTH=131072 bash data/prefilter.sh
 ```
 
-Run this inside an environment with `nemo_automodel` + `transformers` + `datasets`
+Run the above inside an environment with `nemo_automodel` + `transformers` + `datasets`
 (the nemo-automodel container or a matching venv) — `prefilter_dataset.py` imports
 `nemo_automodel` for the exact chat-template token count. The output `data.jsonl`
 plugs into the recipe (carve a small held-out `val.jsonl` from it for the validation
@@ -113,6 +113,18 @@ you evaluate intermediate checkpoints — the gentler LR kept improving through 
 ones. Launch on 16 nodes with your multi-node launcher
 (`torchrun ... examples/llm_finetune/finetune.py -c <this recipe>`).
 
-_Training / validation loss curve (wandb): link to be added._
+Each checkpoint's `model/` dir is written as DCP shards (one per rank, fast to save) plus
+an auto-generated `model/consolidate.sh` helper. To get an HF-loadable checkpoint for
+eval, run that helper once per step on a CPU node — it calls `tools/offline_hf_consolidation.py`
+to merge the shards into standard HF safetensors under `model/consolidated/`:
+
+```bash
+# from the AutoModel repo root; scale NPROC/threads to the CPU node
+NPROC_PER_NODE=16 NUM_THREADS=5 bash <ckpt>/epoch_0_step_<N>/model/consolidate.sh
+# -> <ckpt>/epoch_0_step_<N>/model/consolidated/  (config.json + tokenizer + model-*.safetensors)
+```
+
+_Training / validation loss curve (wandb):
+<https://wandb.ai/Nemo-automodel/long_context_validation_qwen3_32b/workspace?nw=nwuserathittenaman>._
 
 ## Phase 3 — SWE-bench Verified evaluation — *next*
