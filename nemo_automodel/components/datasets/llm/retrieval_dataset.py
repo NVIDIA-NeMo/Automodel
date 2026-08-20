@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import io
 import json
 import logging
 import os
@@ -132,6 +133,39 @@ class DocMatixDataset(AbstractDataset):
         return [str(x) + "_" + str(0) for x in list(range(len(self.data)))]
 
 
+class VDRDataset(AbstractDataset):
+    """Load VDR corpus images from a HuggingFace dataset path."""
+
+    def __init__(self, path):
+        self.path = path
+        self.data = load_dataset(path)["train"]
+        docid2idx = {}
+        for idx, docid in enumerate(self.data["id"]):
+            docid2idx[str(docid)] = idx
+        self.docid2idx = docid2idx
+
+    def get_document_by_id(self, id):
+        from PIL import Image
+
+        image = self.data[self.docid2idx[id]]["image"]
+        if isinstance(image, dict):
+            if image.get("bytes") is not None:
+                image = Image.open(io.BytesIO(image["bytes"]))
+            elif image.get("path") is not None:
+                image = Image.open(image["path"])
+            else:
+                raise ValueError(f"VDR image for document {id!r} has neither bytes nor path.")
+        elif not isinstance(image, Image.Image):
+            raise TypeError(f"Unsupported VDR image type for document {id!r}: {type(image).__name__}")
+
+        example = deepcopy(EXAMPLE_TEMPLATE)
+        example["image"] = image
+        return example
+
+    def get_all_ids(self):
+        return sorted(list(self.docid2idx.keys()))
+
+
 class HFCorpusDataset(AbstractDataset):
     """Wraps an already-loaded HuggingFace Dataset as a corpus (in-memory, no local Parquet)."""
 
@@ -149,11 +183,45 @@ class HFCorpusDataset(AbstractDataset):
         return sorted(self._docid2idx.keys())
 
 
+class VQA9Dataset(AbstractDataset):
+    """Load VQA9 corpus images from WebDataset tar files."""
+
+    def __init__(self, path):
+        self.path = path
+        # Load WebDataset from tar files in the corpus directory
+        # Use explicit tar file pattern for fastest and most memory-efficient loading
+        tar_pattern = os.path.join(path, "*.tar")
+        self.data = load_dataset("webdataset", data_files=tar_pattern, split="train")
+
+        # Create efficient mapping from training data image IDs to WebDataset indices
+        docid2idx = {}
+        for idx, docid in enumerate(self.data["__key__"]):
+            # WebDataset keys directly match training data IDs
+            training_id = str(docid)
+            docid2idx[training_id] = idx
+
+        self.docid2idx = docid2idx
+
+    def get_document_by_id(self, id):
+        example = deepcopy(EXAMPLE_TEMPLATE)
+        if id in self.docid2idx:
+            # Access the 'md.jpg' field from WebDataset
+            example["image"] = self.data[self.docid2idx[id]]["md.jpg"]
+        else:
+            raise ValueError(f"Image ID not found: {id}")
+        return example
+
+    def get_all_ids(self):
+        return sorted(list(self.docid2idx.keys()))
+
+
 DATASETS = {
     "TextQADataset": TextQADataset,
     "ColPaliDataset": ColPaliDataset,
     "WikiSSNQDataset": WikiSSNQDataset,
     "DocMatixDataset": DocMatixDataset,
+    "VDRDataset": VDRDataset,
+    "VQA9Dataset": VQA9Dataset,
 }
 
 

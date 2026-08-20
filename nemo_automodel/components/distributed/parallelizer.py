@@ -1851,6 +1851,14 @@ def _get_model_layer_group_specs() -> Dict[Any, Dict[str, List[str]]]:
                 "vision_tower.transformer.layers",
             ],
         },
+        "Mistral3VLBidirectionalForSequenceClassification": {
+            "language": ["model.language_model.layers"],
+            "vision": [
+                "model.vision_tower.encoder.layers",
+                "model.vision_tower.vision_model.encoder.layers",
+                "model.vision_tower.transformer.layers",
+            ],
+        },
         # Retrieval VLM in components.models.llama_nemotron_vl.model. String-keyed
         # to keep distributed core from importing optional model-specific deps.
         "LlamaNemotronVLModel": {

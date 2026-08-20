@@ -219,6 +219,7 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
         image_end_token: str = "[IMG_END]",
         q_max_length: int | None = None,
         p_max_length: int | None = None,
+        rerank_max_length: int | None = None,
         q_max_len: int | None = None,
         p_max_len: int | None = None,
         pad_to_multiple_of: int | None = None,
@@ -226,6 +227,7 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
         passage_prefix: str = "passage:",
         padding: bool | str = True,
         image_longest_edge: int | None = None,
+        use_prompt_template: bool = False,
         **kwargs: Any,
     ) -> None:
         super().__init__(
@@ -242,12 +244,14 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
         self.chat_template = _apply_mistral_retrieval_ownership_policy(self.tokenizer)
         self.q_max_length = q_max_length if q_max_length is not None else q_max_len
         self.p_max_length = p_max_length if p_max_length is not None else p_max_len
+        self.rerank_max_length = rerank_max_length
         self.pad_to_multiple_of = pad_to_multiple_of
         self.query_prefix = query_prefix
         self.passage_prefix = passage_prefix
         self.padding = padding
         if image_longest_edge is not None:
             self.image_longest_edge = image_longest_edge
+        self.use_prompt_template = use_prompt_template
 
     @property
     def image_longest_edge(self) -> int | None:
@@ -331,6 +335,7 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
             truncation=truncation,
             **kwargs,
         )
+
         if "pixel_values" not in batch:
             batch["pixel_values"] = None
         if "image_sizes" not in batch:
@@ -360,6 +365,87 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
         )
         merged_batch_dict = self.merge_batch_dict(query_batch_dict, doc_batch_dict)
         return self.add_dummy_labels(queries, merged_batch_dict, return_tensors=return_tensors)
+
+    def prompt_template_question_passage(self, question: str, text: str) -> str:
+        """Format one question-passage pair for cross-encoder scoring.
+
+        Args:
+            question: Query text.
+            text: Passage text, including an image placeholder when applicable.
+
+        Returns:
+            The formatted question-passage text.
+        """
+        return f"question: {question}\n\npassage: {text}"
+
+    def process_queries_documents_crossencoder(
+        self,
+        features: list[dict[str, Any]],
+        return_tensors: Literal["pt", "np"] = "pt",
+        padding: bool | str | None = None,
+        truncation: bool = True,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Process flattened query-document pairs for vision cross-encoder training.
+
+        Each feature contains one ``question``, ``doc_text``, and optional
+        ``doc_image``. Image, text, and image-plus-text documents are supported.
+
+        Args:
+            features: Flattened query-document examples. ``num_labels`` contains
+                the number of original query groups when labels are requested.
+            return_tensors: Output format, ``"pt"`` or ``"np"``.
+            padding: Padding strategy for tokenization.
+            truncation: Whether to truncate the combined sequences.
+            **kwargs: Extra keyword arguments forwarded to ``PixtralProcessor``.
+
+        Returns:
+            A dictionary containing model inputs and a ``labels`` tensor of shape
+            [query_groups] when ``num_labels`` is present.
+        """
+
+        if return_tensors not in ("pt", "np"):
+            raise ValueError(f"Invalid return_tensors: {return_tensors!r}. Must be 'pt' or 'np'.")
+
+        contents = []
+        processor_images = []
+        for feature in features:
+            question = self._mark_user_text_ownership(str(feature["question"]))
+            document_text = (
+                "" if feature["doc_text"] is None else self._mark_user_text_ownership(str(feature["doc_text"]))
+            )
+            if self.use_prompt_template:
+                content = self.prompt_template_question_passage(question, document_text)
+            else:
+                content = f"{question}\n{document_text}"
+
+            image = feature["doc_image"]
+            if image is not None and image != "":
+                processor_images.append(load_image(image).convert("RGB"))
+                content = f"{self.image_token} {content}".strip()
+            contents.append(content)
+
+        batch = self._process_text(
+            contents,
+            images=processor_images or None,
+            max_length=self.rerank_max_length,
+            return_tensors=return_tensors,
+            padding=padding,
+            truncation=truncation,
+            **kwargs,
+        )
+        if "pixel_values" not in batch:
+            batch["pixel_values"] = None
+        if "image_sizes" not in batch:
+            batch["image_sizes"] = None
+        if features and "num_labels" in features[0]:
+            num_queries = int(features[0]["num_labels"])
+            if return_tensors == "pt":
+                batch["labels"] = torch.zeros(num_queries, dtype=torch.long)
+            else:
+                batch["labels"] = np.zeros(num_queries, dtype=np.int64)
+
+        return batch
 
     def merge_batch_dict(self, query_batch_dict: dict[str, Any], doc_batch_dict: dict[str, Any]) -> dict[str, Any]:
         """Prefix and merge query/document processor outputs."""

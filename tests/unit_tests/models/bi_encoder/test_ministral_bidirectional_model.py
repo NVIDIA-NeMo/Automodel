@@ -44,6 +44,7 @@ from nemo_automodel.components.models.ministral_bidirectional.model import (
     Ministral3BidirectionalModel,
     Mistral3BidirectionalConfig,
     Mistral3BidirectionalModel,
+    Mistral3VLBidirectionalForSequenceClassification,
 )
 from nemo_automodel.components.models.ministral_bidirectional.processor import Mistral3BiEncoderProcessor, load_image
 
@@ -150,6 +151,40 @@ def test_ministral3_bidirectional_config_fields():
     assert cfg.pooling == "cls"
     assert isinstance(cfg.temperature, float)
     assert cfg.model_type == "ministral3_bidirec"
+
+
+def test_mistral3_vlm_config_pooling_round_trips_and_exports():
+    config = _tiny_mistral3_bidirectional_vlm_config()
+    config.pooling = "cls"
+
+    serialized = config.to_dict()
+    reloaded = Mistral3BidirectionalConfig.from_dict(serialized)
+    exported = Mistral3BidirectionalModel(config).get_hf_export_config()
+
+    assert serialized["pooling"] == "cls"
+    assert "_pooling" not in serialized
+    assert serialized["text_config"]["pooling"] == "cls"
+    assert reloaded.pooling == "cls"
+    assert reloaded.text_config.pooling == "cls"
+    assert exported.pooling == "cls"
+    assert exported.text_config.pooling == "cls"
+
+
+def test_mistral3_vlm_initializes_parent_once(monkeypatch):
+    config = _tiny_mistral3_bidirectional_vlm_config()
+    parent_init = Mistral3Model.__init__
+    calls = []
+
+    def tracking_init(model, model_config):
+        calls.append(model_config)
+        parent_init(model, model_config)
+
+    monkeypatch.setattr(Mistral3Model, "__init__", tracking_init)
+
+    model = Mistral3BidirectionalModel(config)
+
+    assert calls == [config]
+    assert isinstance(model.language_model, Ministral3BidirectionalModel)
 
 
 def test_ministral3_biencoder_processor_loads_tokenizers_backend_directly(monkeypatch):
@@ -673,6 +708,57 @@ def test_ministral3_biencoder_processor_merges_biencoder_batch(pixtral_processor
     assert output["d_pixel_values"].shape[0] == 2
     assert output["d_image_sizes"].tolist() == [[4, 4], [4, 4]]
     assert torch.equal(output["labels"], torch.zeros(2, dtype=torch.long))
+
+
+def test_ministral3_crossencoder_processor_collates_flattened_mixed_pairs(pixtral_processor):
+    red_image = Image.new("RGB", (4, 4), (255, 0, 0))
+    blue_image = Image.new("RGB", (4, 4), (0, 0, 255))
+    pixtral_processor.rerank_max_length = 64
+    pixtral_processor.use_prompt_template = True
+    features = [
+        {"question": "Question 0", "doc_text": "Image doc", "doc_image": red_image, "num_labels": 2},
+        {"question": "Question 0", "doc_text": "Text doc", "doc_image": "", "num_labels": 2},
+        {"question": "Question 1", "doc_text": "Another text doc", "doc_image": None, "num_labels": 2},
+        {"question": "Question 1", "doc_text": "Another image doc", "doc_image": blue_image, "num_labels": 2},
+    ]
+
+    output = pixtral_processor.process_queries_documents_crossencoder(features)
+
+    assert output["input_ids"].shape[0] == 4
+    assert output["pixel_values"].shape == (2, 3, 4, 4)
+    assert output["image_sizes"].tolist() == [[4, 4], [4, 4]]
+    assert torch.equal(output["labels"], torch.zeros(2, dtype=torch.long))
+
+    image_call = pixtral_processor.image_processor.calls[-1]
+    assert image_call["images"] == [red_image, blue_image]
+    texts = pixtral_processor.tokenizer.calls[-1]["texts"]
+    assert len(texts) == 4
+    assert texts[0].endswith("question: Question 0\n\npassage: Image doc")
+    assert texts[1] == "question: Question 0\n\npassage: Text doc"
+    assert texts[2] == "question: Question 1\n\npassage: Another text doc"
+    assert texts[3].endswith("question: Question 1\n\npassage: Another image doc")
+    assert [text.startswith("[IMG]") for text in texts] == [True, False, False, True]
+
+
+def test_ministral3_crossencoder_processor_marks_user_owned_reserved_tokens(pixtral_processor):
+    image = Image.new("RGB", (4, 4), (255, 0, 0))
+    pixtral_processor.rerank_max_length = 64
+    pixtral_processor.use_prompt_template = True
+    features = [
+        {
+            "question": "Question [IMG]",
+            "doc_text": "Passage [IMG] [IMG_BREAK] [IMG_END]",
+            "doc_image": image,
+        }
+    ]
+
+    pixtral_processor.process_queries_documents_crossencoder(features)
+
+    text = pixtral_processor.tokenizer.calls[-1]["texts"][0]
+    assert text.startswith("[IMG]")
+    assert text.count("[IMG]") == 1
+    assert "question: Question [\u200cIMG]" in text
+    assert "passage: Passage [\u200cIMG] [\u200cIMG_BREAK] [\u200cIMG_END]" in text
 
 
 def test_ministral3_biencoder_processor_returns_numpy_batch(pixtral_processor):
@@ -1311,3 +1397,82 @@ def test_mistral3_vlm_runs_dummy_vision_inside_model_forward(monkeypatch):
     assert events == ["parent"]
     assert torch.equal(outputs["input_ids"], input_ids)
     assert outputs["inputs_embeds"] is None
+
+
+def test_mistral3_vlm_crossencoder_scores_vision_inputs_and_backpropagates():
+    config = Mistral3BidirectionalConfig(
+        text_config={
+            "model_type": "ministral3",
+            "vocab_size": 32,
+            "hidden_size": 16,
+            "intermediate_size": 32,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 8,
+            "max_position_embeddings": 64,
+            "attention_dropout": 0.0,
+            "use_cache": False,
+        },
+        vision_config={
+            "model_type": "pixtral",
+            "hidden_size": 16,
+            "intermediate_size": 32,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 2,
+            "head_dim": 8,
+            "image_size": 8,
+            "patch_size": 4,
+            "num_channels": 3,
+        },
+        image_token_index=10,
+        spatial_merge_size=1,
+        num_labels=1,
+        pooling="avg",
+        temperature=0.5,
+    )
+    config.text_config._attn_implementation = "eager"
+    config.vision_config._attn_implementation = "eager"
+    model = Mistral3VLBidirectionalForSequenceClassification(config)
+
+    model.eval()
+    text_only_input_ids = torch.tensor([[1, 2, 3, 4]])
+    modified_input_ids = text_only_input_ids.clone()
+    modified_input_ids[0, -1] = 5
+    text_only_attention_mask = torch.ones_like(text_only_input_ids)
+    with torch.no_grad():
+        original_hidden_states = model.model(
+            input_ids=text_only_input_ids,
+            attention_mask=text_only_attention_mask,
+            run_dummy_vision=False,
+        ).last_hidden_state
+        modified_hidden_states = model.model(
+            input_ids=modified_input_ids,
+            attention_mask=text_only_attention_mask,
+            run_dummy_vision=False,
+        ).last_hidden_state
+    assert not torch.allclose(original_hidden_states[0, 0], modified_hidden_states[0, 0], atol=1e-6)
+
+    input_ids = torch.tensor([[10, 10, 10, 10, 1, 2]])
+    attention_mask = torch.ones_like(input_ids)
+    pixel_values = torch.randn(1, 3, 8, 8)
+
+    outputs = model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        pixel_values=pixel_values,
+        image_sizes=torch.tensor([[8, 8]]),
+        return_dict=True,
+    )
+
+    assert outputs.logits.shape == (1, 1)
+    assert torch.isfinite(outputs.logits).all()
+
+    outputs.logits.square().mean().backward()
+    for module in (model.model.vision_tower, model.model.multi_modal_projector, model.model.language_model):
+        grad_magnitude = sum(
+            float(parameter.grad.abs().sum()) for parameter in module.parameters() if parameter.grad is not None
+        )
+        assert grad_magnitude > 0.0, f"No nonzero gradient reached {type(module).__name__}"
+    assert model.score.weight.grad is not None
+    assert model.score.weight.grad.abs().sum() > 0.0
