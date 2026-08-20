@@ -94,5 +94,7 @@ class TextToImageDataset(BaseMultiresolutionDataset):
                 output["pooled_prompt_embeds"] = data["pooled_prompt_embeds"].squeeze(0)
             if "prompt_embeds" in data:
                 output["prompt_embeds"] = data["prompt_embeds"].squeeze(0)
+            if "prompt_embeds_mask" in data:
+                output["prompt_embeds_mask"] = data["prompt_embeds_mask"].squeeze(0)
 
         return output

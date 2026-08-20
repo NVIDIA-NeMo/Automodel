@@ -185,6 +185,43 @@ class TestCollateFnProduction:
             ),
         )
 
+    def test_real_prompt_embeds_mask_used_when_present(self):
+        """When items carry a real prompt_embeds_mask, use it instead of synthesizing one
+        from the raw embedding length. Both raw embeddings share length 6, as if the
+        processor's encode_prompt already padded to a fixed max_sequence_length -- exactly
+        the case where a length-derived mask would be wrong (it would mark every position
+        real, including the padding).
+        """
+        batch = []
+        for index, mask in enumerate(([1, 1, 0, 0, 0, 0], [1, 1, 1, 1, 0, 0])):
+            batch.append(
+                {
+                    "latent": torch.full((16, 64, 64), index, dtype=torch.bfloat16),
+                    "crop_resolution": torch.tensor([512, 512]),
+                    "original_resolution": torch.tensor([512, 512]),
+                    "crop_offset": torch.tensor([0, 0]),
+                    "prompt": f"prompt {index}",
+                    "image_path": f"/path/img_{index}.png",
+                    "bucket_id": "512x512",
+                    "aspect_ratio": 1.0,
+                    "prompt_embeds": torch.arange(24, dtype=torch.bfloat16).reshape(6, 4) + index,
+                    "prompt_embeds_mask": torch.tensor(mask, dtype=torch.long),
+                }
+            )
+
+        result = collate_fn_production(batch)
+
+        assert result["prompt_embeds_mask"].shape == (2, 8)
+        torch.testing.assert_close(
+            result["prompt_embeds_mask"],
+            torch.tensor(
+                [
+                    [1, 1, 0, 0, 0, 0, 0, 0],
+                    [1, 1, 1, 1, 0, 0, 0, 0],
+                ]
+            ),
+        )
+
 
 # =============================================================================
 # TestBuildTextToImageMultiresolutionDataloader
