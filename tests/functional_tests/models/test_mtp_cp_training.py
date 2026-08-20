@@ -111,7 +111,7 @@ def _step_model():
             "num_attention_heads": 4,
             "num_attention_groups": 2,
             "num_hidden_layers": 4,
-            "num_nextn_predict_layers": 1,
+            "num_nextn_predict_layers": 3,
             "mtp_base_layer_idx": 4,
             "vocab_size": 128,
             "moe_num_experts": 4,

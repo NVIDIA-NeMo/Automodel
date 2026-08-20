@@ -240,6 +240,32 @@ class DeepseekV4MTPModule(nn.Module):
         position_ids_per_depth: tuple[torch.LongTensor, ...] | list[torch.LongTensor] | None = None,
         **block_kwargs,
     ) -> list[torch.Tensor]:
+        """Run the DeepSeek V4 MTP prediction depths.
+
+        Args:
+            hidden_states: Backbone hidden states of shape [batch, sequence,
+                hidden]. Under CP, sequence is the per-rank local sequence.
+            input_ids: Optional token IDs of shape [batch, sequence]. Each MTP
+                depth rolls this local tensor by one position; use only without CP.
+            input_ids_per_depth: Optional tuple of ``num_depths`` pre-shifted
+                token-ID tensors, each of shape [batch, sequence]. Under CP,
+                sequence is the per-rank local sequence produced after the global shift.
+            embed_fn: Callable mapping token IDs of shape [batch, sequence] to
+                embeddings of shape [batch, sequence, hidden].
+            embed_inputs: Optional tuple of ``num_depths`` precomputed embedding
+                tensors, each of shape [batch, sequence, hidden]. Under CP,
+                sequence is the per-rank local sequence.
+            position_ids: Optional position IDs of shape [batch, sequence] used
+                for every depth when per-depth positions are not supplied.
+            position_ids_per_depth: Optional tuple of ``num_depths`` position-ID
+                tensors, each of shape [batch, sequence]. Under CP, sequence is
+                the per-rank local sequence produced after the global shift.
+            **block_kwargs: Additional arguments forwarded to each MTP block.
+
+        Returns:
+            List of ``num_depths`` prediction-hidden tensors, each of shape
+            [batch, sequence, hidden]. Under CP, sequence is the per-rank local sequence.
+        """
         per_depth_h: list[torch.Tensor] = []
         cur_input_ids = input_ids
         if embed_inputs is not None and len(embed_inputs) != len(self.layers):

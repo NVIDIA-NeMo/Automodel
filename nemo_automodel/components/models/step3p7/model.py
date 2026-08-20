@@ -777,20 +777,26 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
         if use_mtp:
             if is_pp_stage and not mtp_embed_inputs:
                 raise ValueError("Final PP stage requires propagated MTP embeddings")
-            if mtp_per_depth_position_ids is not None:
-                position_ids = mtp_per_depth_position_ids[0]
             position_ids = self._make_position_ids(hidden_states, position_ids)
-            freqs_cis = position_ids_to_freqs_cis(
-                self.model.language_model.rotary_emb,
-                position_ids,
-                qkv_format=kwargs.get("qkv_format", "bshd"),
-                for_fused_rope=self.backend.rope_fusion,
-                cp_size=kwargs.get("cp_size", 1),
+            if mtp_per_depth_position_ids is None:
+                mtp_per_depth_position_ids = tuple(
+                    roll_tensor(position_ids, shifts=-depth, dim=-1)
+                    for depth in range(1, self.mtp_config.num_layers + 1)
+                )
+            freqs_cis_per_depth = tuple(
+                position_ids_to_freqs_cis(
+                    self.model.language_model.rotary_emb,
+                    depth_position_ids,
+                    qkv_format=kwargs.get("qkv_format", "bshd"),
+                    for_fused_rope=self.backend.rope_fusion,
+                    cp_size=kwargs.get("cp_size", 1),
+                )
+                for depth_position_ids in mtp_per_depth_position_ids
             )
             mtp_kwargs = {
                 "hidden_states": hidden_states,
-                "freqs_cis": freqs_cis,
-                "position_ids": position_ids,
+                "freqs_cis_per_depth": freqs_cis_per_depth,
+                "position_ids_per_depth": mtp_per_depth_position_ids,
                 "attention_mask": attention_mask,
                 "padding_mask": padding_mask,
             }

@@ -242,19 +242,48 @@ class Step3p5MTPModule(nn.Module):
         self,
         hidden_states: torch.Tensor,
         *,
-        freqs_cis: torch.Tensor,
+        freqs_cis_per_depth: tuple[torch.Tensor, ...],
         input_ids: torch.LongTensor | None = None,
         embed_fn=None,
         embed_inputs: tuple[torch.Tensor, ...] | list[torch.Tensor] | None = None,
-        position_ids: torch.LongTensor | None = None,
+        position_ids_per_depth: tuple[torch.LongTensor, ...],
         **block_kwargs: Any,
     ) -> list[torch.Tensor]:
+        """Run the Step MTP prediction depths with depth-aligned RoPE inputs.
+
+        Args:
+            hidden_states: Backbone hidden states of shape [batch, sequence,
+                hidden], or [tokens, hidden] for THD. Under CP, sequence or
+                tokens is the per-rank local sequence.
+            freqs_cis_per_depth: Tuple of ``num_depths`` RoPE tensors. For BSHD,
+                each has shape [batch, sequence, rotary] without fused RoPE or
+                [sequence, 1, 1, rotary] with fused RoPE. For THD, each has
+                shape [tokens, rotary] or [tokens, 1, 1, rotary], respectively.
+            input_ids: Optional token IDs of shape [batch, sequence] or [tokens].
+                Each depth rolls this tensor by one position; use only without CP.
+            embed_fn: Callable mapping token IDs to embeddings with shape
+                [batch, sequence, hidden] or [tokens, hidden].
+            embed_inputs: Optional tuple of ``num_depths`` precomputed future-token
+                embeddings, each with the same shape as ``hidden_states``.
+            position_ids_per_depth: Tuple of ``num_depths`` position-ID tensors,
+                each of shape [batch, sequence] or [tokens], aligned with the
+                corresponding future-token input. Under CP, the token axis is local.
+            **block_kwargs: Additional arguments forwarded to each MTP block.
+
+        Returns:
+            List of ``num_depths`` prediction-logit tensors, each of shape
+            [batch, sequence, vocab] or [tokens, vocab].
+        """
         per_depth_logits: list[torch.Tensor] = []
         cur_input_ids = input_ids
         if embed_inputs is not None and len(embed_inputs) != len(self.layers):
             raise ValueError(f"Expected {len(self.layers)} MTP embedding tensors, got {len(embed_inputs)}")
         if embed_inputs is None and (cur_input_ids is None or embed_fn is None):
             raise ValueError("MTP requires either embed_inputs or both input_ids and embed_fn")
+        if len(freqs_cis_per_depth) != len(self.layers):
+            raise ValueError(f"Expected {len(self.layers)} MTP RoPE tensors, got {len(freqs_cis_per_depth)}")
+        if len(position_ids_per_depth) != len(self.layers):
+            raise ValueError(f"Expected {len(self.layers)} MTP position-ID tensors, got {len(position_ids_per_depth)}")
 
         for depth, block in enumerate(self.layers):
             if embed_inputs is None:
@@ -265,8 +294,8 @@ class Step3p5MTPModule(nn.Module):
             hidden_states, logits = block(
                 hidden_states,
                 embed_input=decoder_input,
-                freqs_cis=freqs_cis,
-                position_ids=position_ids,
+                freqs_cis=freqs_cis_per_depth[depth],
+                position_ids=position_ids_per_depth[depth],
                 **block_kwargs,
             )
             per_depth_logits.append(logits)
