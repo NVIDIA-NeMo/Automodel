@@ -75,6 +75,8 @@ def map_qwen3_5_mtp_to_hf_key(key: str) -> str:
 class Qwen3_5DenseStateDictAdapter(StateDictAdapter):
     """Adapter that hides the ``_fp32_params`` wrapping in saved checkpoints."""
 
+    _supports_write_through_checkpoint_load = True
+
     def __init__(self, *, route_linear_attn_fp32_params: bool = True) -> None:
         self.route_linear_attn_fp32_params = route_linear_attn_fp32_params
 

@@ -17,7 +17,6 @@ set -xeuo pipefail # Exit immediately if a command exits with a non-zero status
 
 UNIT_TEST=false
 CPU=false
-TEST_DIR="tests/"
 TEST_NAME=""
 ADDITIONAL_ARGS=""
 SHARD_ID=""
@@ -50,14 +49,22 @@ else
 fi
 
 if [[ "$UNIT_TEST" == "true" ]]; then
-    export TEST_DIR="tests/unit_tests"
+    TEST_DIRS=("tests/unit_tests")
 else
-    export TEST_DIR="tests/functional_tests/$TEST_NAME"
+    IFS=',' read -r -a TEST_FOLDERS <<< "$TEST_NAME"
+    TEST_DIRS=()
+    for TEST_FOLDER in "${TEST_FOLDERS[@]}"; do
+        if [[ -z "$TEST_FOLDER" ]]; then
+            echo "Functional test folder names must not be empty" >&2
+            exit 2
+        fi
+        TEST_DIRS+=("tests/functional_tests/$TEST_FOLDER")
+    done
 fi
 
 # Install opt-in media extras (kept out of the default media-free image) per folder.
-case "$TEST_NAME" in
-    hf_transformer_vlm) MEDIA_EXTRA="vlm-media" ;;
+case ",$TEST_NAME," in
+    *,hf_transformer_vlm,*) MEDIA_EXTRA="vlm-media" ;;
     *) MEDIA_EXTRA="" ;;
 esac
 if [[ -n "$MEDIA_EXTRA" ]]; then
@@ -68,7 +75,7 @@ coverage run \
     -m pytest \
     --durations 32 \
     --durations-min=0 \
-    $TEST_DIR \
+    "${TEST_DIRS[@]}" \
     -o log_cli=true \
     -o log_cli_level=INFO \
     -vs -m "not pleasefixme" --tb=short -rA \

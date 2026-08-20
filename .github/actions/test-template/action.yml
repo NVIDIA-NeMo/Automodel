@@ -20,7 +20,7 @@ inputs:
     required: false
     default: "10"
   test-folder:
-    description: "Name of the folder containg tests suite"
+    description: "Comma-separated names of folders containing test suites"
     required: false
   is-optional:
     description: "Failure will cancel all other tests if set to true"
