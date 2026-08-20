@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""OpenHands-tool-surface SWE-bench agent (approach B).
+"""OpenHands-tool-surface SWE-bench agent.
 
 Gives the model the EXACT 3-tool surface OpenHands v0.52.1 uses — `execute_bash`,
 `str_replace_editor`, `finish` (schemas + names copied verbatim from OpenHands 0.52.1) —
@@ -814,7 +814,7 @@ def solve(inst, endpoint, model, max_iter, max_tokens, cmd_timeout):
 def main():
     """CLI entry point: run the OpenHands 3-tool agent over a slice of SWE-bench instances."""
     ap = argparse.ArgumentParser()
-    ap.add_argument("--subset", default="lite")
+    ap.add_argument("--subset", default="verified")
     ap.add_argument("--split", default="test")
     ap.add_argument("--slice", default="")
     ap.add_argument("--endpoint", required=True)

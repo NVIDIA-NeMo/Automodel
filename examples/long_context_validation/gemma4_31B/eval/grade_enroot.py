@@ -16,9 +16,8 @@
 
 Reuses the OFFICIAL swebench grading logic (`make_test_spec` + `get_eval_report`) so the
 resolved/unresolved verdict matches the benchmark exactly — only the execution backend is
-swapped from Docker to enroot, mirroring `enroot_env.py`. This exists because (a) this cluster
-has no Docker for the standard local harness and (b) the SWE-bench cloud grader (sb-cli) fails
-to complete runs for our account (even gold patches -> "failed"), so cloud scoring is unusable.
+swapped from Docker to enroot, mirroring `enroot_env.py`. This exists because this cluster
+has no Docker for the standard local harness, so grading runs in enroot instead.
 
 Per instance:
   1. enroot container from docker://swebench/sweb.eval.x86_64.<iid> (import cached, ENROOT_MOUNT_HOME=n).
@@ -132,7 +131,7 @@ def grade_one(inst: dict, pred: dict, output_dir: Path, run_timeout: int, import
 def main():
     """CLI entry point: grade a preds.json against SWE-bench specs in local enroot containers."""
     ap = argparse.ArgumentParser()
-    ap.add_argument("--subset", default="lite")
+    ap.add_argument("--subset", default="verified")
     ap.add_argument("--split", default="test")
     ap.add_argument("--preds", required=True, help="predictions json (mini-swe-agent preds.json)")
     ap.add_argument("--output-dir", required=True)

@@ -14,7 +14,7 @@
 # limitations under the License.
 # Phase 3 step 5 — LOCAL SWE-bench grading via enroot (no Docker, no cloud). CPU-only.
 # Grades a predictions file with the official swebench spec inside per-instance enroot
-# containers. Replaces the broken sb-cli cloud grader.
+# containers.
 #
 # Env knobs:
 #   PREDS=<preds.json>  SUBSET=lite SPLIT=test WORKERS=8 RUN_TAG=grade_sft_v5  INSTANCE_IDS=""
@@ -37,7 +37,7 @@ EVAL_DIR=/path/to/Automodel/examples/long_context_validation/gemma4_31B/eval
 VENV="${CACHE}/eval_venv"
 
 PREDS="${PREDS:?set PREDS=<preds.json>}"
-SUBSET="${SUBSET:-lite}"; SPLIT="${SPLIT:-test}"; WORKERS="${WORKERS:-8}"
+SUBSET="${SUBSET:-verified}"; SPLIT="${SPLIT:-test}"; WORKERS="${WORKERS:-8}"
 RUN_TAG="${RUN_TAG:-grade}"
 INSTANCE_IDS="${INSTANCE_IDS:-}"
 OUTDIR="${CACHE}/eval/grades/${RUN_TAG}"

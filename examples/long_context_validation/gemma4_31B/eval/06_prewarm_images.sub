@@ -34,7 +34,7 @@ set -euxo pipefail
 CACHE=/path/to/coderforge_cache
 EVAL_DIR=/path/to/Automodel/examples/long_context_validation/gemma4_31B/eval
 VENV="${CACHE}/eval_venv"
-SUBSET="${SUBSET:-lite}"; SPLIT="${SPLIT:-test}"; WORKERS="${WORKERS:-6}"
+SUBSET="${SUBSET:-verified}"; SPLIT="${SPLIT:-test}"; WORKERS="${WORKERS:-6}"
 
 export ENROOT_TEMP_PATH="/tmp/enroot_${SLURM_JOB_ID}/tmp"
 export ENROOT_DATA_PATH="/tmp/enroot_${SLURM_JOB_ID}/data"

@@ -222,7 +222,7 @@ def main():
     ap.add_argument("--n", type=int, default=3)
     ap.add_argument("--max-tokens", type=int, default=200)
     ap.add_argument("--topk", type=int, default=20, help="top-k logprobs for the decision-point probe (path C)")
-    ap.add_argument("--swe-subset", default="lite")
+    ap.add_argument("--swe-subset", default="verified")
     ap.add_argument("--swe-split", default="test")
     args = ap.parse_args()
 

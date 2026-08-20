@@ -84,7 +84,7 @@ def import_one(iid: str, retries: int, import_timeout: int) -> tuple:
 def main():
     """CLI entry point: pre-import all SWE-bench instance images into the shared enroot cache."""
     ap = argparse.ArgumentParser()
-    ap.add_argument("--subset", default="lite")
+    ap.add_argument("--subset", default="verified")
     ap.add_argument("--split", default="test")
     ap.add_argument("--workers", type=int, default=6, help="LOW concurrency to avoid registry throttling")
     ap.add_argument("--retries", type=int, default=5)

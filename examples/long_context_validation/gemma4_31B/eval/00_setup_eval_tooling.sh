@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # Phase 3 step 0 — set up the SWE-bench eval tooling (login node).
-# Creates an isolated Python 3.10 venv (mini-swe-agent + sb-cli need >=3.10; the
+# Creates an isolated Python 3.10 venv (mini-swe-agent + swebench need >=3.10; the
 # login default is 3.9) and installs the eval tools. Idempotent: re-running only
 # upgrades. These are external eval tools, NOT part of the AutoModel package.
 set -euxo pipefail
@@ -28,12 +28,12 @@ source "${VENV}/bin/activate"
 
 python --version           # expect 3.10.x
 pip install --upgrade pip
-pip install "mini-swe-agent" "sb-cli"
+pip install "mini-swe-agent" "swebench"
 
 # Sanity: import + report versions.
 python - <<'PY'
-import minisweagent
+import minisweagent, swebench
 print("mini-swe-agent:", minisweagent.__version__)
+print("swebench:", swebench.__version__)
 PY
-sb-cli --help >/dev/null && echo "sb-cli OK"
 echo "=== venv ready at ${VENV} ==="

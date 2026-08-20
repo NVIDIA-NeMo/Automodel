@@ -12,15 +12,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# Phase 3 (approach B) — SWE-bench run with the OpenHands 3-tool surface (execute_bash /
+# Phase 3 — SWE-bench run with the OpenHands 3-tool surface (execute_bash /
 # str_replace_editor / finish) over the enroot backend. Serves vLLM (TP=2 x DP=4 by default)
-# and runs oh3_run.py on ONE node (preemption-atomic, like 03b). Reuses the shared warm image
+# and runs oh3_run.py on ONE node (preemption-atomic: serve + agent share one allocation and die
+# together, so a preemption leaves no dangling vLLM endpoint; resubmit to resume, done instances skip).
+# Reuses the shared warm image
 # cache. Grade the resulting preds.json with 05_grade_enroot.sub.
 #
 # Env: MODEL NAME MAXLEN TP DP SUBSET SPLIT SLICE WORKERS MAX_TOKENS RUN_TAG
-# Submit (full 300, DP=4 -> submit with --gpus-per-node=8):
-#   RUN_TAG=oh3_sft_lite  NAME=gemma4cf   SLICE=0:300 WORKERS=32 TP=2 DP=4 sbatch --gpus-per-node=8 07_openhands3_run.sub
-#   RUN_TAG=oh3_base_lite NAME=gemma4base SLICE=0:300 WORKERS=32 TP=2 DP=4 \
+# Submit (full 500 Verified, DP=4 -> submit with --gpus-per-node=8):
+#   RUN_TAG=oh3_sft  NAME=gemma4cf   SLICE=0:500 SUBSET=verified WORKERS=32 TP=2 DP=4 sbatch --gpus-per-node=8 07_openhands3_run.sub
+#   RUN_TAG=oh3_base NAME=gemma4base SLICE=0:500 SUBSET=verified WORKERS=32 TP=2 DP=4 \
 #     MODEL=/path/to/checkpoints/hf_gemma4_31b_it sbatch --gpus-per-node=8 07_openhands3_run.sub
 #SBATCH -A <account>
 #SBATCH -p batch
@@ -45,8 +47,8 @@ DP_FLAG=""; [ "${DP}" -gt 1 ] && DP_FLAG="--data-parallel-size ${DP}"
 # WORKERS: high-attempt models (e.g. base gemma4-it, ~99% attempt) run many concurrent heavy
 # builds/tests (matplotlib/scipy/sympy compiles) and OOM-killed the node at WORKERS=32 -> use 16
 # for such models. Lower-attempt models (the SFT ckpt) are fine at 32.
-SUBSET="${SUBSET:-lite}"; SPLIT="${SPLIT:-test}"; SLICE="${SLICE:-0:300}"; WORKERS="${WORKERS:-16}"
-MAX_TOKENS="${MAX_TOKENS:-8192}"; RUN_TAG="${RUN_TAG:-oh3_sft_lite}"
+SUBSET="${SUBSET:-verified}"; SPLIT="${SPLIT:-test}"; SLICE="${SLICE:-0:500}"; WORKERS="${WORKERS:-16}"
+MAX_TOKENS="${MAX_TOKENS:-8192}"; RUN_TAG="${RUN_TAG:-oh3_sft}"
 OUTDIR="${CACHE}/eval/runs/${RUN_TAG}"; ENDPOINT="http://127.0.0.1:${PORT}/v1"
 SERVELOG="${CACHE}/eval/serve_${SLURM_JOB_ID}.log"
 mkdir -p "${OUTDIR}" "${CACHE}/slurm_jobs"
