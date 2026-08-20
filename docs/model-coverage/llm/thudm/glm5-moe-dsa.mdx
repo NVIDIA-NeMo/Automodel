@@ -18,12 +18,14 @@ slug: model-coverage/large-language-models/thudm/glm-5-moe-dsa
 
 ## Key Features
 
-- **Mixture of Experts (MoE)** with DeepSeek-style MLA and sparse DSA attention
-- **IndexShare DSA for GLM-5.2**: shared DSA layers reuse the previous full layer's top-k sparse attention selection, including pipeline-parallel carry support
-- **Optional TileLang kernels** for GLM-5.2 DSA indexer and sparse MLA paths through `backend.attn: tilelang`
-- **Optional cuDNN DSA indexer and FlashMLA sparse attention** on SM90+ GPUs through `backend.attn: cudnn`
-- **Packed-sequence and context-parallel recipes** for 4K and 32K Tulu3-style SFT runs
-- **Large-scale parallelism** with FSDP2, Expert Parallelism, Pipeline Parallelism, and optional Context Parallelism
+GLM-5 family models in NeMo AutoModel include the following capabilities:
+
+- **Mixture-of-Experts (MoE)**: DeepSeek-style MLA and sparse DSA attention
+- **IndexShare DSA for GLM-5.2**: Shared DSA layers reuse the previous full layer's top-k sparse attention selection, including pipeline-parallel carry support
+- **Optional TileLang kernels**: GLM-5.2 DSA indexer and sparse MLA paths through `backend.attn: tilelang`
+- **Optional cuDNN DSA indexer and FlashMLA sparse attention**: Available on SM90+ GPUs through `backend.attn: cudnn`
+- **Packed-sequence and context-parallel recipes**: Support for 4K and 32K Tulu3-style SFT runs
+- **Large-scale parallelism**: FSDP2, Expert Parallelism, Pipeline Parallelism, and optional Context Parallelism
 
 ## Available Models
 
