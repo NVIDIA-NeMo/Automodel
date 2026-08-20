@@ -73,6 +73,7 @@ from nemo_automodel.components.checkpoint.utils import (
     has_local_tied_lm_head,
     materialize_missing_tied_lm_head,
 )
+from nemo_automodel.components.models.gemma4_moe.state_dict_adapter import Gemma4MoEStateDictAdapter
 from nemo_automodel.components.training.rng import RNGState, StatefulRNG, init_all_rng
 
 CLOUD_PATH_MODEL = "msc://bucket/step-100/model"
@@ -1360,6 +1361,85 @@ def test_load_model_uses_state_dict_adapter_from_ddp_module(tmp_path):
     torch.testing.assert_close(encoder.model.weight, checkpoint_weight)
 
 
+def test_single_device_gemma4_bounded_load_writes_through_transposed_destinations(tmp_path):
+    """A real HF storage reader loads and scales Gemma4 experts without a materialized fallback."""
+
+    class Experts(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.gate_and_up_projs = torch.nn.Parameter(torch.zeros(2, 3, 8))
+            self.down_projs = torch.nn.Parameter(torch.zeros(2, 4, 3))
+
+    class Moe(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.experts = Experts()
+
+    class Layer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.moe = Moe()
+
+    class LanguageModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = torch.nn.ModuleDict({"0": Layer()})
+
+    class InnerModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.language_model = LanguageModel()
+
+    class Gemma4Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = InnerModel()
+            self.state_dict_adapter = Gemma4MoEStateDictAdapter(
+                config=SimpleNamespace(),
+                moe_config=SimpleNamespace(n_routed_experts=2),
+                backend=SimpleNamespace(),
+                dtype=torch.float32,
+            )
+
+    Gemma4Model.__module__ = "nemo_automodel.components.models.gemma4_moe.model"
+    model = Gemma4Model()
+    checkpoint_gate = torch.arange(48, dtype=torch.float32).reshape(2, 8, 3)
+    checkpoint_down = torch.arange(24, dtype=torch.float32).reshape(2, 3, 4)
+    checkpoint_scale = torch.tensor([2.0, 3.0])
+    model_path = tmp_path / "model"
+    model_path.mkdir()
+    save_file(
+        {
+            "model.language_model.layers.0.experts.gate_up_proj": checkpoint_gate,
+            "model.language_model.layers.0.experts.down_proj": checkpoint_down,
+            "model.language_model.layers.0.router.per_expert_scale": checkpoint_scale,
+        },
+        model_path / "model.safetensors",
+    )
+    config = CheckpointingConfig(
+        enabled=True,
+        checkpoint_dir=str(tmp_path),
+        model_save_format="safetensors",
+        model_cache_dir=str(tmp_path / "cache"),
+        model_repo_id="test/gemma4",
+        save_consolidated=False,
+        is_peft=False,
+    )
+    with patch("torch.distributed.is_initialized", return_value=False):
+        checkpointer = Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
+
+    checkpointer.load_model(model, model_path=str(model_path), is_init_step=True)
+
+    torch.testing.assert_close(
+        model.model.language_model.layers["0"].moe.experts.gate_and_up_projs,
+        checkpoint_gate.transpose(-2, -1),
+    )
+    torch.testing.assert_close(
+        model.model.language_model.layers["0"].moe.experts.down_projs,
+        checkpoint_down.transpose(-2, -1) * checkpoint_scale[:, None, None],
+    )
+
+
 @pytest.mark.parametrize(("is_init_step", "expected_quantization"), [(True, True), (False, False)])
 def test_load_model_only_requests_quantized_adapter_keys_for_base_checkpoint(
     tmp_path, is_init_step, expected_quantization
@@ -1616,17 +1696,25 @@ class TestLoadModelCustomModelGuard:
     @patch("nemo_automodel.components.checkpoint.checkpointing._is_safetensors_checkpoint", return_value=True)
     @patch("nemo_automodel.components.checkpoint.checkpointing._load_hf_checkpoint_preserving_dtype")
     @patch("nemo_automodel.components.checkpoint.checkpointing._load_full_state_dict_into_model")
+    @pytest.mark.parametrize("load_capability", ["write_through", "bounded"])
     @pytest.mark.parametrize("dequantize_base_checkpoint", [False, True])
-    def test_single_device_write_through_adapter_routes_by_quantization(
-        self, mock_load_full, mock_load_hf, mock_is_st, caplog, dequantize_base_checkpoint
+    def test_single_device_memory_bounded_adapter_routes_by_quantization(
+        self,
+        mock_load_full,
+        mock_load_hf,
+        mock_is_st,
+        caplog,
+        dequantize_base_checkpoint,
+        load_capability,
     ):
-        """Quantized conversion stays materialized even for a write-through adapter."""
+        """Quantized conversion stays materialized for every memory-bounded adapter capability."""
         CustomModel = type("CustomModel", (torch.nn.Module,), {})
         CustomModel.__module__ = "nemo_automodel.components.models.nemotron_v3.model"
         model = CustomModel()
         model.layer = torch.nn.Linear(4, 4)
         model.state_dict_adapter = MagicMock(spec=StateDictAdapter)
-        model.state_dict_adapter.supports_write_through_checkpoint_load = True
+        model.state_dict_adapter.supports_write_through_checkpoint_load = load_capability == "write_through"
+        model.state_dict_adapter.supports_bounded_checkpoint_load = load_capability == "bounded"
         mock_state_dict = {"layer.weight": torch.randn(4, 4), "layer.bias": torch.randn(4)}
         mock_load_hf.return_value = mock_state_dict
 

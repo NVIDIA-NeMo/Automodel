@@ -27,6 +27,7 @@ class StateDictAdapter(ABC):
     """
 
     _supports_write_through_checkpoint_load: bool = False
+    _supports_bounded_checkpoint_load: bool = False
 
     @property
     def supports_write_through_checkpoint_load(self) -> bool:
@@ -38,6 +39,18 @@ class StateDictAdapter(ABC):
         the host.
         """
         return self._supports_write_through_checkpoint_load
+
+    @property
+    def supports_bounded_checkpoint_load(self) -> bool:
+        """Whether single-device checkpoint loading avoids a full converted state dict.
+
+        Adapters should set ``_supports_bounded_checkpoint_load`` only when every model-sized destination produced by
+        ``to_hf(..., load_into_empty_destinations=True)`` writes through to final model storage. Any allocating
+        destinations must be bounded auxiliary tensors, and ``from_hf`` must complete their conversion without
+        allocating another model-sized tensor. This is weaker than ``supports_write_through_checkpoint_load`` because
+        bounded auxiliary destinations do not need to alias model storage.
+        """
+        return self._supports_bounded_checkpoint_load
 
     @abstractmethod
     def to_hf(self, state_dict: dict[str, Any], **kwargs) -> dict[str, Any]:

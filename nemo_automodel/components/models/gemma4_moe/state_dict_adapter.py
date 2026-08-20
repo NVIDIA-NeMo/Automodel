@@ -59,6 +59,8 @@ class Gemma4MoEStateDictAdapter(StateDictAdapter):
       4. Expert-parallel sharding when a device mesh is provided
     """
 
+    _supports_bounded_checkpoint_load = True
+
     def __init__(
         self,
         config: Any,
@@ -71,6 +73,7 @@ class Gemma4MoEStateDictAdapter(StateDictAdapter):
         self.backend = backend
         self.dtype = dtype
         self._uses_model_prefix = True
+        self._load_destinations_alias_model = False
 
     # ------------------------------------------------------------------
     # HF -> NeMo
@@ -81,6 +84,24 @@ class Gemma4MoEStateDictAdapter(StateDictAdapter):
         device_mesh: Optional[DeviceMesh] = None,
         **kwargs,
     ) -> dict[str, Any]:
+        """Convert Hugging Face Gemma4 weights into native model layout.
+
+        Args:
+            hf_state_dict: Hugging Face state mapping. Expert gate/up tensors have shape
+                ``[experts, 2 * expert_hidden, hidden]`` and down tensors have shape
+                ``[experts, hidden, expert_hidden]``. When prepared by ``to_hf`` for a bounded checkpoint load,
+                those tensors are transposed views of final model storage and are mutated in place.
+            device_mesh: Optional expert-parallel mesh. Distributed conversion slices the global expert axis and may
+                shard the native feature axis according to the mesh.
+            **kwargs: Additional adapter-interface arguments.
+
+        Returns:
+            Native state mapping. Expert gate/up tensors have shape ``[local_experts, hidden, 2 * expert_hidden]``
+            and down tensors have shape ``[local_experts, expert_hidden, hidden]``. Bounded-load outputs alias final
+            model storage; materialized conversion outputs own their storage.
+        """
+        load_destinations_alias_model = self._load_destinations_alias_model and device_mesh is None
+        self._load_destinations_alias_model = False
         self._uses_model_prefix = any(key.startswith("model.") for key in hf_state_dict)
         model_prefix = "model." if self._uses_model_prefix else ""
 
@@ -125,7 +146,7 @@ class Gemma4MoEStateDictAdapter(StateDictAdapter):
             state_dict[key] = value
 
         # Process collected expert weights per layer
-        _REQUIRED_EXPERT_KEYS = {"gate_up_proj", "down_proj"}
+        _REQUIRED_EXPERT_KEYS = {"gate_up_proj", "down_proj", "per_expert_scale"}
         for layer_path, tensors in expert_buffers.items():
             missing = _REQUIRED_EXPERT_KEYS - tensors.keys()
             if missing:
@@ -139,15 +160,22 @@ class Gemma4MoEStateDictAdapter(StateDictAdapter):
             per_expert_scale = tensors["per_expert_scale"]  # [E]
 
             # Transpose gate_up_proj from HF [E, 2*inter, hidden] to NeMo [E, hidden, 2*inter]
-            gate_and_up = gate_up_proj.transpose(-2, -1)  # [E, hidden, 2*inter]
+            if load_destinations_alias_model:
+                # DCP loaded the checkpoint through transposed views of final model storage. Gate/up only needs its
+                # native view restored; down additionally absorbs the small per-expert scale destination in place.
+                gate_and_up_local = gate_up_proj.transpose(-2, -1)
+                down_proj.mul_(per_expert_scale[:, None, None])
+                down_local = down_proj.transpose(-2, -1)
+            else:
+                gate_and_up = gate_up_proj.transpose(-2, -1)  # [E, hidden, 2*inter]
 
-            # Transpose down_proj from HF [E, hidden, inter] to NeMo [E, inter, hidden]
-            # and absorb per_expert_scale
-            down = down_proj.transpose(-2, -1) * per_expert_scale[:, None, None]  # [E, inter, hidden]
+                # Transpose down_proj from HF [E, hidden, inter] to NeMo [E, inter, hidden]
+                # and absorb per_expert_scale
+                down = down_proj.transpose(-2, -1) * per_expert_scale[:, None, None]  # [E, inter, hidden]
 
-            # Slice for EP
-            gate_and_up_local = gate_and_up[start_expert:end_expert].to(self.dtype)
-            down_local = down[start_expert:end_expert].to(self.dtype)
+                # Slice for EP
+                gate_and_up_local = gate_and_up[start_expert:end_expert].to(self.dtype)
+                down_local = down[start_expert:end_expert].to(self.dtype)
 
             # Slice for EP_SHARD across the feature dimension before wrapping as DTensor.
             if device_mesh is not None and "ep_shard" in device_mesh.mesh_dim_names:
@@ -185,10 +213,39 @@ class Gemma4MoEStateDictAdapter(StateDictAdapter):
         quantization: bool = False,
         **kwargs,
     ) -> dict[str, Any]:
+        """Convert native Gemma4 weights to Hugging Face keys and layouts.
+
+        Args:
+            state_dict: Native state mapping. Expert gate/up tensors have shape
+                ``[local_experts, hidden, 2 * expert_hidden]`` and down tensors have shape
+                ``[local_experts, expert_hidden, hidden]``.
+            exclude_key_regex: Optional pattern selecting keys to omit.
+            quantization: Whether checkpoint initialization requires a precision conversion. Quantized loads do not
+                use aliasing destinations.
+            **kwargs: Adapter-interface arguments. ``device_mesh`` describes expert sharding.
+                ``load_into_empty_destinations=True`` requests memory-bounded single-device load destinations.
+
+        Returns:
+            Hugging Face state mapping. Expert gate/up tensors have shape
+            ``[experts, 2 * expert_hidden, hidden]`` and down tensors have shape
+            ``[experts, hidden, expert_hidden]``. For a bounded load, model-sized outputs are transposed views of
+            final model storage and each ``per_expert_scale`` output is an independently owned ``[experts]`` tensor.
+        """
         self._uses_model_prefix = any(key.startswith("model.") for key in state_dict)
         prefix = "model." if self._uses_model_prefix else ""
         device_mesh: Optional[DeviceMesh] = kwargs.get("device_mesh")
         n_experts = self.moe_config.n_routed_experts
+        load_into_model_storage = (
+            bool(kwargs.get("load_into_empty_destinations", False))
+            and not quantization
+            and device_mesh is None
+            and all(
+                isinstance(tensor, torch.Tensor) and not tensor.is_meta and not state_dict_utils.is_dtensor(tensor)
+                for fqn, tensor in state_dict.items()
+                if ".moe.experts." in fqn
+            )
+        )
+        self._load_destinations_alias_model = load_into_model_storage
 
         hf_state_dict: dict[str, Any] = {}
 
@@ -205,20 +262,31 @@ class Gemma4MoEStateDictAdapter(StateDictAdapter):
             # --- Expert: gate_and_up_projs -> experts.gate_up_proj ---
             if ".moe.experts.gate_and_up_projs" in fqn:
                 layer_num = re.search(r"layers\.(\d+)", fqn).group(1)
-                global_tensor = self._gather_expert_tensor(tensor, device_mesh, n_experts)
                 layer_prefix = f"{prefix}language_model.layers.{layer_num}"
-                # Transpose from NeMo [E, hidden, 2*inter] to HF [E, 2*inter, hidden]
-                hf_state_dict[f"{layer_prefix}.experts.gate_up_proj"] = global_tensor.transpose(-2, -1).contiguous()
+                if load_into_model_storage:
+                    # DCP writes the HF [E, 2*inter, hidden] checkpoint directly through this transposed view into
+                    # the native [E, hidden, 2*inter] parameter storage.
+                    hf_state_dict[f"{layer_prefix}.experts.gate_up_proj"] = tensor.transpose(-2, -1)
+                else:
+                    global_tensor = self._gather_expert_tensor(tensor, device_mesh, n_experts)
+                    hf_state_dict[f"{layer_prefix}.experts.gate_up_proj"] = global_tensor.transpose(-2, -1).contiguous()
                 continue
 
             # --- Expert: down_projs -> experts.down_proj + router.per_expert_scale ---
             if ".moe.experts.down_projs" in fqn:
                 layer_num = re.search(r"layers\.(\d+)", fqn).group(1)
-                global_tensor = self._gather_expert_tensor(tensor, device_mesh, n_experts)
                 layer_prefix = f"{prefix}language_model.layers.{layer_num}"
-                # Transpose from NeMo [E, inter, hidden] to HF [E, hidden, inter]
-                hf_state_dict[f"{layer_prefix}.experts.down_proj"] = global_tensor.transpose(-2, -1).contiguous()
-                hf_state_dict[f"{layer_prefix}.router.per_expert_scale"] = torch.ones(n_experts, dtype=self.dtype)
+                if load_into_model_storage:
+                    # The raw HF down weight first lands in final native storage through a transposed view. from_hf
+                    # then multiplies that storage in place by this bounded auxiliary scale vector.
+                    hf_state_dict[f"{layer_prefix}.experts.down_proj"] = tensor.transpose(-2, -1)
+                    hf_state_dict[f"{layer_prefix}.router.per_expert_scale"] = torch.empty(
+                        n_experts, dtype=self.dtype, device=tensor.device
+                    )
+                else:
+                    global_tensor = self._gather_expert_tensor(tensor, device_mesh, n_experts)
+                    hf_state_dict[f"{layer_prefix}.experts.down_proj"] = global_tensor.transpose(-2, -1).contiguous()
+                    hf_state_dict[f"{layer_prefix}.router.per_expert_scale"] = torch.ones(n_experts, dtype=self.dtype)
                 continue
 
             # --- Pass-through ---

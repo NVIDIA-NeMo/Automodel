@@ -832,9 +832,10 @@ class Checkpointer:
         is_custom_model = _is_custom_model(model_state.model[0])
         # Custom adapters traditionally took the frugal full-state path here because converting
         # grouped experts into load destinations could materialize a second on-device copy and OOM.
-        # Adapters whose destinations all alias final model storage can now opt into the standard
-        # DCP path below, which writes checkpoint tensors directly through those views. Keep the CPU
-        # path for non-aliasing backends and quantized initialization, whose conversion allocates.
+        # Adapters whose model-sized destinations alias final model storage can now opt into the standard DCP path
+        # below, which writes checkpoint tensors directly through those views. A bounded adapter may also retain
+        # small auxiliary destinations that it consumes in-place after the read. Keep the CPU path for other
+        # non-aliasing adapters and quantized initialization, whose conversion allocates model-sized tensors.
         # World size inline (not via components.distributed) so the checkpoint component stays
         # independent per the import-linter contract.
         if torch.distributed.is_initialized():
@@ -842,13 +843,16 @@ class Checkpointer:
         else:
             world_size = int(os.environ.get("WORLD_SIZE", "1"))
         state_dict_adapter = getattr(_unwrap_ddp_model(model_state.model[0]), "state_dict_adapter", None)
-        supports_write_through_checkpoint_load = (
+        supports_memory_bounded_checkpoint_load = (
             isinstance(state_dict_adapter, StateDictAdapter)
-            and state_dict_adapter.supports_write_through_checkpoint_load
+            and (
+                state_dict_adapter.supports_write_through_checkpoint_load
+                or state_dict_adapter.supports_bounded_checkpoint_load
+            )
             and not self.config.dequantize_base_checkpoint
         )
         single_device_custom_safetensors = (
-            is_safetensors and is_custom_model and world_size == 1 and not supports_write_through_checkpoint_load
+            is_safetensors and is_custom_model and world_size == 1 and not supports_memory_bounded_checkpoint_load
         )
         if (
             is_init_step
