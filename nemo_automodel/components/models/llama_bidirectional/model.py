@@ -315,10 +315,10 @@ ModelClass = [LlamaBidirectionalModel, LlamaBidirectionalForSequenceClassificati
 
 
 def _register_with_hf_auto_classes():
-    """Register bidirectional models with HuggingFace Auto classes.
+    """Register bidirectional Llama types with Hugging Face Auto classes.
 
-    This is needed so that AutoModel.from_config(LlamaBidirectionalConfig)
-    works inside LlamaForSequenceClassification.__init__.
+    Enables ``AutoConfig``, ``AutoModel``, and ``AutoModelForSequenceClassification``
+    to resolve their corresponding bidirectional config and model classes.
     """
     from transformers import AutoConfig, AutoModel, AutoModelForSequenceClassification
 
