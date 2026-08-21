@@ -51,6 +51,11 @@ tokenizer:
   _target_: nemo_automodel.NeMoAutoTokenizer.from_pretrained
   pretrained_model_name_or_path: mistralai/Ministral-3-3B-Instruct-2512-BF16
   padding_side: left
+  tokenizer_backend: tokenizers
+  fix_mistral_regex: true
+  split_special_tokens: true
+  add_bos_token: true
+  add_eos_token: false
 
 dataset:
   _target_: nemo_automodel.components.datasets.llm.retrieval_dataset.RetrievalDatasetConfig
