@@ -133,13 +133,19 @@ def _sliding_window_mask(query: torch.Tensor, key: torch.Tensor, sliding_window:
         sliding_window: Maximum absolute position distance, exclusive.
 
     Returns:
-        Bool tensor of shape [1, 1, query, key]; ``True`` where attention is kept.
+        Floating-point tensor of shape [1, 1, query, key], in ``query.dtype``;
+        ``0`` where attention is kept and ``-inf`` elsewhere. This additive
+        representation has the same semantics for eager, SDPA, and the dense
+        score-mask path of FlexAttention.
     """
     q_len, k_len = query.shape[-2], key.shape[-2]
     query_position = torch.arange(q_len, device=query.device).unsqueeze(-1) + (k_len - q_len)
     key_position = torch.arange(k_len, device=query.device).unsqueeze(0)
     distance = query_position - key_position
-    return ((distance < sliding_window) & (-distance < sliding_window))[None, None]
+    keep = ((distance < sliding_window) & (-distance < sliding_window))[None, None]
+    zero = torch.zeros((), dtype=query.dtype, device=query.device)
+    neg_inf = torch.full((), float("-inf"), dtype=query.dtype, device=query.device)
+    return torch.where(keep, zero, neg_inf)
 
 
 class Qwen3DFlashAttention(nn.Module):
