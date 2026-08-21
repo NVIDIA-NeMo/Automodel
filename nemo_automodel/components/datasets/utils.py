@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import math
-from typing import Optional
 
 import torch
 from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
@@ -94,7 +93,7 @@ def find_last_non_pad_token(lst: list[int], value: int) -> int | None:
     return None
 
 
-def get_pad_token_from_key(val: str, pad_token_ids: Optional[dict[str, int]] = None) -> int | None:
+def get_pad_token_from_key(val: str, pad_token_ids: dict[str, int] | None = None) -> int | None:
     """Return the default pad token id for a batch field name."""
     PAD_TOKEN_IDS = {
         "labels": -100,

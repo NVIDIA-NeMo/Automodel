@@ -50,6 +50,22 @@ class MoESplitExpertsStateDictMixin:
     # - self.backend: Backend configuration object
 
     @property
+    def supports_write_through_checkpoint_load(self) -> bool:
+        """Whether non-expert and grouped-expert destinations both alias model storage."""
+        experts_alias = self.moe_config is None or self._supports_write_through_expert_checkpoint_load
+        return self._supports_write_through_checkpoint_load and experts_alias
+
+    @property
+    def _supports_write_through_expert_checkpoint_load(self) -> bool:
+        """Whether all grouped expert destinations alias final model storage.
+
+        This only describes the shared expert conversion. Concrete adapters
+        must separately verify that their non-expert conversions also alias
+        model storage before opting into a write-through full-checkpoint load.
+        """
+        return self.backend.experts != "te" and self.backend.dispatcher != "mok"
+
+    @property
     def _is_gated_moe(self) -> bool:
         """Check if the MoE uses gated activation (e.g., SwiGLU) or non-gated (e.g., ReLU²)."""
         from nemo_automodel.components.moe.experts import is_gated_activation
@@ -248,7 +264,7 @@ class MoESplitExpertsStateDictMixin:
 
     def _concatenate_expert_weights(
         self, expert_weights_by_layer: dict[str, Any], n_experts: int
-    ) -> Optional[torch.Tensor]:
+    ) -> torch.Tensor | None:
         """Concatenate the weights of separate experts into GroupedExpert weights.
 
         Args:

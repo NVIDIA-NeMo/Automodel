@@ -6,7 +6,7 @@ import dataclasses
 import os
 from dataclasses import field
 from io import BytesIO
-from typing import Any, Dict, List, Literal, Optional, Tuple, Union
+from typing import Any, Dict, List, Literal, Tuple, Union
 
 import requests
 import torch
@@ -168,7 +168,7 @@ class LlamaNemotronVLImageProcessor(BaseImageProcessorFast):
         use_thumbnail: bool = True,
         dynamic_image_size: bool = True,
         norm_type: str = "siglip",
-        resample: Optional[Union[PILImageResampling, int]] = None,
+        resample: Union[PILImageResampling, int] | None = None,
         **kwargs,
     ):
         if norm_type == "imagenet":
@@ -198,7 +198,7 @@ class LlamaNemotronVLImageProcessor(BaseImageProcessorFast):
         image_size: int = 512,
         max_num_tiles: int = 6,
         use_thumbnail: bool = True,
-        resample: Optional[Union[PILImageResampling, int]] = None,
+        resample: Union[PILImageResampling, int] | None = None,
     ) -> List[torch.Tensor]:
         """Split one channel-first image tensor into dynamically sized square tiles."""
         resample = resample if resample is not None else self.resample
@@ -233,17 +233,17 @@ class LlamaNemotronVLImageProcessor(BaseImageProcessorFast):
     def _preprocess(
         self,
         images: ImageInput,
-        image_size: Optional[int] = None,
-        max_num_tiles: Optional[int] = None,
-        use_thumbnail: Optional[bool] = None,
-        dynamic_image_size: Optional[bool] = None,
-        do_rescale: Optional[bool] = None,
-        rescale_factor: Optional[float] = None,
-        do_normalize: Optional[bool] = None,
-        image_mean: Optional[Union[float, List[float]]] = None,
-        image_std: Optional[Union[float, List[float]]] = None,
-        resample: Optional[Union[PILImageResampling, int]] = None,
-        return_tensors: Optional[Union[str, TensorType]] = None,
+        image_size: int | None = None,
+        max_num_tiles: int | None = None,
+        use_thumbnail: bool | None = None,
+        dynamic_image_size: bool | None = None,
+        do_rescale: bool | None = None,
+        rescale_factor: float | None = None,
+        do_normalize: bool | None = None,
+        image_mean: Union[float, List[float]] | None = None,
+        image_std: Union[float, List[float]] | None = None,
+        resample: Union[PILImageResampling, int] | None = None,
+        return_tensors: Union[str, TensorType] | None = None,
         **kwargs,
     ) -> BatchFeature:
         image_size = image_size if image_size is not None else self.image_size
@@ -296,10 +296,10 @@ class LlamaNemotronVLProcessor(ProcessorMixin):
     def __init__(
         self,
         tokenizer: Any,
-        config: Optional[LlamaNemotronVLProcessorConfig] = None,
-        q_max_length: Optional[int] = None,
-        p_max_length: Optional[int] = None,
-        pad_to_multiple_of: Optional[int] = None,
+        config: LlamaNemotronVLProcessorConfig | None = None,
+        q_max_length: int | None = None,
+        p_max_length: int | None = None,
+        pad_to_multiple_of: int | None = None,
         query_prefix: str = "query:",
         passage_prefix: str = "passage:",
         max_input_tiles: int = 6,
@@ -345,11 +345,11 @@ class LlamaNemotronVLProcessor(ProcessorMixin):
 
     def __call__(
         self,
-        text: Optional[List[str]] = None,
-        images: Optional[List[Any]] = None,
-        text_kwargs: Optional[Dict[str, Any]] = None,
-        images_kwargs: Optional[Dict[str, Any]] = None,
-        common_kwargs: Optional[Dict[str, Any]] = None,
+        text: List[str] | None = None,
+        images: List[Any] | None = None,
+        text_kwargs: Dict[str, Any] | None = None,
+        images_kwargs: Dict[str, Any] | None = None,
+        common_kwargs: Dict[str, Any] | None = None,
         **kwargs,
     ) -> Dict[str, Any]:
         """Process text and/or image inputs into model-ready features.

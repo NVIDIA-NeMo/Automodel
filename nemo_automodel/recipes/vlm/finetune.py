@@ -29,7 +29,7 @@ import logging
 import pathlib
 import time
 from contextlib import contextmanager, nullcontext
-from typing import TYPE_CHECKING, Any, Optional, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 import mlflow
 import torch
@@ -1056,7 +1056,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             grad_reduce_group=self._get_dp_group(include_cp=True),
         )
 
-    def _run_train_optim_step(self, batches, max_grad_norm: Optional[float] = None):
+    def _run_train_optim_step(self, batches, max_grad_norm: float | None = None):
         """Execute a single training step.
 
         Args:
