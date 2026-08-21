@@ -20,11 +20,6 @@ import torch
 
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.training.timers import Timers
-from nemo_automodel.components.training.utils import (
-    prepare_after_first_microbatch,
-    prepare_for_final_backward,
-    prepare_for_grad_accumulation,
-)
 from nemo_automodel.components.utils.flops_utils import calculate_mfu, get_flops_formula_for_hf_config
 from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
 
@@ -104,7 +99,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
 
     This class extends TrainFinetuneRecipeForNextTokenPrediction to provide
     a simplified benchmarking-focused training loop with timers and profiling support.
-    It reuses the setup() and _forward_backward_step() methods from the parent class.
+    It reuses the parent's setup and Engine execution paths.
     """
 
     def __init__(self, cfg):
@@ -288,7 +283,6 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
         with timers and profiling support, similar to the original benchmarking script.
         """
         rank = self.dist_env.rank
-        device = self.dist_env.device
 
         # Get benchmarking config
         steps = self._bench_steps
@@ -327,55 +321,27 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
             if i == nsys_start and rank in nsys_ranks:
                 logger.info(f"Rank {rank} | Starting nsys profiling")
                 torch.cuda.cudart().cudaProfilerStart()
-                # Per-microbatch NVTX ranges below already delimit the work.
+                # Per-window NVTX ranges below already delimit the work.
                 # Entering emit_nvtx() without closing it leaks RecordFunction
                 # callbacks into later DTensor/FSDP operations.
 
             if rank == 0:
                 logger.info(f"Rank {rank} | Iteration {i}")
 
-            # Zero gradients
-            for opt in self.optimizer:
-                opt.zero_grad()
-
             # Time the iteration
             iter_timer = "iteration_warmup" if i < warmup_steps else "iteration"
             with self.timers(iter_timer, log_level=1):
-                # Gradient accumulation loop
-                num_label_tokens = 0
-                loss_buffer = []
-                prepare_for_grad_accumulation(self.model_parts, pp_enabled=self.pp_enabled)
-
-                for ga_step_idx in range(ga_steps):
-                    if ga_step_idx == ga_steps - 1:
-                        prepare_for_final_backward(self.model_parts, pp_enabled=self.pp_enabled)
-
-                    # Get batch from dataloader
-                    batch = next(dataloader_iter)
-                    torch.cuda.nvtx.range_push(f"iteration_{i}_ga_step_{ga_step_idx}")
-
-                    # Accumulate label tokens locally
-                    num_label_tokens += (batch["labels"] != -100).sum().item()
-
-                    with self.timers(f"forward_backward_{ga_step_idx}", log_level=2):
-                        self._forward_backward_step(
-                            ga_step_idx,
-                            batch,
-                            loss_buffer=loss_buffer,
-                            num_label_tokens=None,
-                            num_batches=ga_steps,
-                            is_train=True,
-                        )
-
+                batches = [next(dataloader_iter) for _ in range(ga_steps)]
+                datums = [self._make_engine_datum(batch) for batch in batches]
+                torch.cuda.nvtx.range_push(f"iteration_{i}_forward_backward")
+                try:
+                    with self.timers("forward_backward", log_level=2):
+                        forward_backward_result = self.engine.forward_backward(datums, self._engine_loss_fn)
+                finally:
                     torch.cuda.nvtx.range_pop()
 
-                    if ga_step_idx == 0:
-                        prepare_after_first_microbatch()
-
-                # Optimizer step
                 with self.timers("optimizer", log_level=2):
-                    for opt in self.optimizer:
-                        opt.step()
+                    self.engine.optim_step(before_optimizer_step=self.checkpointer.maybe_wait_for_staging)
                     logger.debug("Optimizer step")
 
             # Match the training-loop lifecycle: record one complete eager
@@ -384,26 +350,8 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                 self.partial_cuda_graph_manager.capture()
                 self._partial_cuda_graph_capture_pending = False
 
-            # Synchronize num_label_tokens across DP ranks
-            num_label_tokens_tensor = torch.tensor(num_label_tokens, dtype=torch.long, device=device)
-            num_label_tokens_tensor = self._dp_allreduce(num_label_tokens_tensor)
-            num_label_tokens = num_label_tokens_tensor.item()
-
-            # Calculate loss - following exact train_ft.py:1059-1071 pattern
-            reporting_loss = torch.sum(torch.stack(loss_buffer))
-            reporting_loss = self._dp_allreduce(reporting_loss, include_cp=True)
-            reporting_loss = reporting_loss.to(torch.float32) / num_label_tokens
-
-            if self.pp_enabled:
-                reporting_loss = reporting_loss.to(self.dist_env.device)
-                # Send loss to first rank if pp group rank is 0
-                src_rank = self.device_mesh.mesh.reshape(-1)[-1].item()
-                if self.dist_env.rank == src_rank:
-                    torch.distributed.send(reporting_loss, dst=0)
-                elif self.dist_env.is_main:
-                    torch.distributed.recv(reporting_loss, src=src_rank)
-
-            reporting_loss = reporting_loss.cpu().item()
+            num_label_tokens = int(forward_backward_result.weight_sum.item())
+            reporting_loss = forward_backward_result.loss.cpu().item()
 
             if rank == 0:
                 print(f"num_label_tokens={num_label_tokens} | loss={reporting_loss:.4f}")
@@ -419,7 +367,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                 self._log_moe_metrics(i, self.wandb_run.log)
 
             # Calculate and log MFU
-            self._log_iteration_metrics(iter_timer, ga_steps, peak_tflops, rank, i)
+            self._log_iteration_metrics(iter_timer, peak_tflops, rank, i)
 
             # Stop nsys profiling if configured
             if i == nsys_end and rank in nsys_ranks:
@@ -434,7 +382,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
         # Final summary
         self._log_benchmark_summary(steps, warmup_steps, peak_tflops, rank)
 
-    def _log_iteration_metrics(self, iter_timer, ga_steps, peak_tflops, rank, iteration):
+    def _log_iteration_metrics(self, iter_timer, peak_tflops, rank, iteration):
         max_iter_time = self.timers._get_global_min_max_time([iter_timer], reset=False, barrier=False, normalizer=1.0)[
             iter_timer
         ][1]
@@ -450,7 +398,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
             logger.info(f"MFU: {mfu:.6f}%")
 
         # Log detailed timers
-        timer_names = [iter_timer, "optimizer"] + [f"forward_backward_{ga_step_idx}" for ga_step_idx in range(ga_steps)]
+        timer_names = [iter_timer, "forward_backward", "optimizer"]
         # Log timers to wandb
         if self._wandb_enabled:
             self.timers.write_to_wandb(
