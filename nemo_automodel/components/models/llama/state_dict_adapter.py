@@ -14,9 +14,8 @@
 
 """State dict adapter for Llama model.
 
-The model uses separate q_proj / k_proj / v_proj / gate_proj / up_proj that match
-HuggingFace key names exactly, so the adapter is a passthrough (only tied-weight
-handling is applied in from_hf).
+The model uses separate q_proj / k_proj / v_proj / gate_proj / up_proj whose keys and tensor representations match
+Hugging Face exactly, so the adapter is a passthrough (only tied-weight handling is applied in ``from_hf``).
 """
 
 import logging
@@ -32,9 +31,8 @@ logger = logging.getLogger(__name__)
 class LlamaStateDictAdapter(PassthroughStateDictAdapter):
     """State dict adapter for Llama models.
 
-    Uses separate projections that match HuggingFace key names exactly, so
-    from_hf / to_hf are simple passthroughs (only tied-weight handling in
-    from_hf).
+    Separate projections already match Hugging Face keys and tensor representations exactly, so ``from_hf`` and
+    ``to_hf`` do not transform tensor data. ``from_hf`` only adds the missing output-weight alias for tied embeddings.
 
     Example:
         from transformers import LlamaConfig
