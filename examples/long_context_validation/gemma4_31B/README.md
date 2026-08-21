@@ -147,4 +147,69 @@ LM head trainable — required to learn 48/49.
   <img src="https://raw.githubusercontent.com/NVIDIA-NeMo/Automodel/main/examples/long_context_validation/gemma4_31B/gemma4_31b_base_coderforge_sft.png" alt="Gemma4-31B base SFT training loss curve on CoderForge" width="700">
 </p>
 
-## Phase 3 — SWE-bench Verified evaluation — *next*
+## Phase 3 — SWE-bench Verified evaluation
+
+Goal: check whether CoderForge SFT gives the **raw base** `google/gemma-4-31B` (a
+pretrained model with *no* instruction/agent tuning) any **agentic** ability at
+all, versus the un-SFT'd base. The scripts referenced below live in
+[`eval/`](./eval); parameterize the `/path/to/...` placeholders and `<account>`
+for your cluster.
+
+**Scaffold.** The [OpenHands](https://github.com/All-Hands-AI/OpenHands) v0.52.1
+3-tool surface (`execute_bash` / `str_replace_editor` / `finish`) — the exact tools
+CoderForge trajectories were generated on — is presented to the served checkpoint
+(vLLM, `--tool-call-parser gemma4`) and executed against each SWE-bench instance's
+repo inside a **Docker-less enroot** container. Grading is local-in-enroot with the
+official `swebench` spec (gold patches → 5/5 resolved, so the grader is trusted).
+
+**Steps** (from `eval/`):
+
+```bash
+bash 00_setup_eval_tooling.sh                    # py3.10 venv + agent + swebench harness
+SUBSET=verified sbatch 06_prewarm_images.sub     # pre-import instance images once (CPU)
+
+# Serve each checkpoint + run the 3-tool agent -> preds.json (serve+agent on one 8-GPU node)
+RUN_TAG=oh3_base NAME=gemma4base MODEL=<base google/gemma-4-31B consolidated> \
+  SLICE=0:500 SUBSET=verified sbatch 07_openhands3_run.sub
+RUN_TAG=oh3_sft  NAME=gemma4cf   MODEL=<CoderForge-SFT consolidated> \
+  SLICE=0:500 SUBSET=verified sbatch 07_openhands3_run.sub
+
+# Grade both locally (always confirm enroot-errs=0 before trusting a 0.0 resolve)
+PREDS=<runs>/oh3_base/preds.json RUN_TAG=grade_base sbatch 05_grade_enroot.sub
+PREDS=<runs>/oh3_sft/preds.json  RUN_TAG=grade_sft  sbatch 05_grade_enroot.sub
+```
+
+Base serve note: the base checkpoint lacks the `-it` serving fields — copy
+`response_schema` into its `tokenizer_config.json`, and `oh3_run.py` forces
+`stop_token_ids=[1,106,50]` (the Gemma4 turn stop `<turn|>`=106 is **not** the
+tokenizer `eos`=1). A quick `probe_indist.py` (served one-call tool test) confirms
+when a checkpoint switches from text-only planning to structured tool calls.
+
+### Result — SFT installs agentic behavior; the raw base has none
+
+Base vs the **step-799** CoderForge SFT checkpoint, same OpenHands 3-tool scaffold,
+on 180 SWE-bench Lite tasks (3,988 assistant turns, 4,528 tool calls):
+
+| | Base `gemma-4-31B` (un-SFT'd) | CoderForge SFT (step 799) |
+|---|---|---|
+| Structured `tool_calls` | **0** (never emits one) | **3988 / 3988 turns = 100%** |
+| Tools used | none | `think` + `execute_bash` + `str_replace_editor` |
+| Turns per task | ~33 identical planning turns, then aborts | avg **22** (range 6–71) |
+| Arg fidelity | — | **clean** (0% `\uXXXX` garbage, 0/4528) |
+| Terminates (`finish`) | never acts (`never_toolcalled`) | 0 / 180 (empty patches) |
+
+**Base — never acts.** The raw base emits **zero** tool calls and repeats the same
+planning checklist verbatim every turn ("Phase 1. READING… 1.1 … 1.2 …") until the
+harness aborts (`never_toolcalled`) — a property of the raw pretrained model, not the
+checkpoint. It plans forever and never acts.
+
+**SFT — real agentic behavior.** After CoderForge SFT the step-799 model opens each
+task with a `think` that diagnoses the bug, then drives real exploration: across 180
+Lite tasks **100% of turns (3988/3988) are structured OpenHands tool calls**
+(`execute_bash` ×3036, `str_replace_editor` ×1306, `think` ×186; ~22 turns/task, args
+clean — 0/4528 garbled). It does not yet emit `finish`, so the runs end without a
+landed patch (0/180).
+
+**Takeaway.** CoderForge SFT **installs the agentic process** (tool-calling,
+think-first, correct targeting) into a base model that had none — the goal of this
+long-context CP-SFT validation.

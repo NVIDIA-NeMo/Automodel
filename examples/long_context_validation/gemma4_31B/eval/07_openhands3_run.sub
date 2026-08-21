@@ -1,0 +1,113 @@
+#!/bin/bash
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# Phase 3 — SWE-bench run with the OpenHands 3-tool surface (execute_bash /
+# str_replace_editor / finish) over the enroot backend. Serves vLLM (TP=2 x DP=4 by default)
+# and runs oh3_run.py on ONE node (preemption-atomic: serve + agent share one allocation and die
+# together, so a preemption leaves no dangling vLLM endpoint; resubmit to resume, done instances skip).
+# Reuses the shared warm image
+# cache. Grade the resulting preds.json with 05_grade_enroot.sub.
+#
+# Env: MODEL NAME MAXLEN TP DP SUBSET SPLIT SLICE WORKERS MAX_TOKENS RUN_TAG
+# Submit (full 500 Verified, DP=4 -> submit with --gpus-per-node=8):
+#   RUN_TAG=oh3_sft  NAME=gemma4cf   SLICE=0:500 SUBSET=verified WORKERS=32 TP=2 DP=4 sbatch --gpus-per-node=8 07_openhands3_run.sub
+#   RUN_TAG=oh3_base NAME=gemma4base SLICE=0:500 SUBSET=verified WORKERS=32 TP=2 DP=4 \
+#     MODEL=/path/to/checkpoints/hf_gemma4_31b_it sbatch --gpus-per-node=8 07_openhands3_run.sub
+#SBATCH -A <account>
+#SBATCH -p batch
+#SBATCH -t 04:00:00
+#SBATCH -N 1
+#SBATCH --gpus-per-node=8
+#SBATCH --ntasks-per-node=1
+#SBATCH -J oh3_swebench
+#SBATCH --output=/path/to/coderforge_cache/slurm_jobs/%x_%j.out
+#SBATCH --error=/path/to/coderforge_cache/slurm_jobs/%x_%j.err
+
+set -euxo pipefail
+
+CACHE=/path/to/coderforge_cache
+EVAL_DIR=/path/to/Automodel/examples/long_context_validation/gemma4_31B/eval
+VENV="${CACHE}/eval_venv"
+SQSH=/path/to/vllm.sqsh
+MODEL="${MODEL:-/path/to/coderforge_ckpts/gemma4_31b_coderforge_cp8_64k_16node_0p3B/epoch_0_step_299/model/consolidated}"
+NAME="${NAME:-gemma4cf}"
+MAXLEN="${MAXLEN:-131072}"; PORT="${PORT:-8000}"; TP="${TP:-2}"; DP="${DP:-4}"
+DP_FLAG=""; [ "${DP}" -gt 1 ] && DP_FLAG="--data-parallel-size ${DP}"
+# WORKERS: high-attempt models (e.g. base gemma4-it, ~99% attempt) run many concurrent heavy
+# builds/tests (matplotlib/scipy/sympy compiles) and OOM-killed the node at WORKERS=32 -> use 16
+# for such models. Lower-attempt models (the SFT ckpt) are fine at 32.
+SUBSET="${SUBSET:-verified}"; SPLIT="${SPLIT:-test}"; SLICE="${SLICE:-0:500}"; WORKERS="${WORKERS:-16}"
+MAX_TOKENS="${MAX_TOKENS:-8192}"; RUN_TAG="${RUN_TAG:-oh3_sft}"
+OUTDIR="${CACHE}/eval/runs/${RUN_TAG}"; ENDPOINT="http://127.0.0.1:${PORT}/v1"
+SERVELOG="${CACHE}/eval/serve_${SLURM_JOB_ID}.log"
+mkdir -p "${OUTDIR}" "${CACHE}/slurm_jobs"
+
+# enroot: node-local temp/data; shared warm image cache on lustre; no host-home mount.
+export ENROOT_TEMP_PATH="/tmp/enroot_${SLURM_JOB_ID}/tmp"
+export ENROOT_DATA_PATH="/tmp/enroot_${SLURM_JOB_ID}/data"
+export ENROOT_CACHE_PATH="/tmp/enroot_${SLURM_JOB_ID}/cache"
+export ENROOT_MAX_PROCESSORS=8
+export ENROOT_MOUNT_HOME=n
+export MSWEA_ENROOT_SQSH_DIR="${SWEBENCH_IMAGES:-/path/to/coderforge_cache/swebench_images}"
+mkdir -p "${ENROOT_TEMP_PATH}" "${ENROOT_DATA_PATH}" "${ENROOT_CACHE_PATH}" "${MSWEA_ENROOT_SQSH_DIR}"
+
+# --- serve vLLM (background) ---
+# PARSER CHOICE depends on which tool-call ARG format the ckpt actually emits (measured, not assumed):
+#   * base-SFT (gemma4_31b_base_*): emits JSON-PRIOR args `call:name{"command":"...","path":"..."}`
+#     (its pretrained JSON prior survives 800 SFT steps). vLLM's gemma4 parser expects gemma4-NATIVE
+#     unquoted `{command:<|"|>v<|"|>}` and MANGLES JSON-prior — it folds `{"`/`"` into the key
+#     (`{"command"`), so 100% of args are unusable (verified: 727/727 execute_bash returncode!=0,
+#     349/349 editor calls rejected). => USE NOPARSER=1: raw `call:name{...}` reaches `content` and
+#     oh3_run.py's json.loads-first fallback recovers the JSON-prior dict cleanly.
+#   * -it ckpts that emit gemma4-native args: leave the parser ON (default below).
+# Either way, temperature>0 + repetition_penalty (set in the run section) is required to stop the
+# temp-0 greedy degeneration that corrupted JSON string values on later turns of the base-SFT run.
+PARSER_FLAGS="--enable-auto-tool-choice --tool-call-parser gemma4"
+if [ "${NOPARSER:-0}" = "1" ]; then PARSER_FLAGS=""; export OH3_TOOL_CHOICE=none; fi
+srun --overlap --container-image="${SQSH}" --container-mounts=/lustre:/lustre --no-container-mount-home bash -lc "
+  vllm serve '${MODEL}' --served-model-name '${NAME}' \
+    --tensor-parallel-size ${TP} ${DP_FLAG} --max-model-len ${MAXLEN} --gpu-memory-utilization 0.92 \
+    --limit-mm-per-prompt '{\"image\":0,\"audio\":0}' \
+    ${PARSER_FLAGS} \
+    --host 0.0.0.0 --port ${PORT}" > "${SERVELOG}" 2>&1 &
+SVPID=$!
+ready=0
+for i in $(seq 1 180); do
+  if curl -sf "${ENDPOINT}/models" >/dev/null 2>&1; then ready=1; break; fi
+  if ! kill -0 $SVPID 2>/dev/null; then echo "vLLM step exited during startup"; break; fi
+  sleep 10
+done
+echo "vLLM READY=${ready} after ~$((i*10))s"
+[ "${ready}" = "1" ] || { echo "serve not ready"; tail -40 "${SERVELOG}"; kill $SVPID 2>/dev/null || true; exit 1; }
+
+# --- run the OpenHands-3-tool agent ---
+# shellcheck disable=SC1091
+source "${VENV}/bin/activate"
+export HF_HOME="/path/to/hf_cache"
+STATS_FLAG=""; [ "${STATS:-0}" = "1" ] && STATS_FLAG="--stats"
+DUMP_FLAG=""; [ "${DUMP:-0}" = "1" ] && DUMP_FLAG="--dump-traj"
+# Sampling: temperature>0 + light repetition_penalty breaks the temp-0 greedy-degeneration loops
+# (corrupted/repeated args -> identical-retry -> aborted_stuck) that zeroed base-SFT. oh3_run.py reads these.
+export OH3_TEMPERATURE="${OH3_TEMPERATURE:-0.4}"
+export OH3_TOP_P="${OH3_TOP_P:-0.95}"
+export OH3_REPETITION_PENALTY="${OH3_REPETITION_PENALTY:-1.05}"
+python "${EVAL_DIR}/oh3_run.py" \
+  --subset "${SUBSET}" --split "${SPLIT}" --slice "${SLICE}" \
+  --endpoint "${ENDPOINT}" --model "${NAME}" \
+  --output-dir "${OUTDIR}" --workers "${WORKERS}" --max-tokens "${MAX_TOKENS}" ${STATS_FLAG} ${DUMP_FLAG}
+
+echo "=== preds.json head ==="; head -c 3000 "${OUTDIR}/preds.json" 2>/dev/null; echo
+kill $SVPID 2>/dev/null || true
+rm -rf "/tmp/enroot_${SLURM_JOB_ID}"
+echo "=== DONE (${RUN_TAG}) ==="

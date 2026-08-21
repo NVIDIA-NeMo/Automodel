@@ -1,0 +1,53 @@
+#!/bin/bash
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# Phase 3 step (pre-req) — pre-warm the shared enroot image cache for a subset.
+# MUST run before the full agent runs: importing images at agent-worker concurrency (16x)
+# triggers Docker Hub burst-throttling (single imports succeed; concurrent bursts fail).
+# This imports every instance image ONCE at LOW concurrency + retries into the shared lustre
+# cache, so the agent runs + grader only read the cache (no concurrent pulls). CPU-only.
+#
+# Submit:  SUBSET=lite sbatch 06_prewarm_images.sub
+#SBATCH -A <account>
+#SBATCH -p cpu
+#SBATCH -t 06:00:00
+#SBATCH -N 1
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=48
+#SBATCH -J swebench_prewarm
+#SBATCH --output=/path/to/coderforge_cache/slurm_jobs/%x_%j.out
+#SBATCH --error=/path/to/coderforge_cache/slurm_jobs/%x_%j.err
+
+set -euxo pipefail
+
+CACHE=/path/to/coderforge_cache
+EVAL_DIR=/path/to/Automodel/examples/long_context_validation/gemma4_31B/eval
+VENV="${CACHE}/eval_venv"
+SUBSET="${SUBSET:-verified}"; SPLIT="${SPLIT:-test}"; WORKERS="${WORKERS:-6}"
+
+export ENROOT_TEMP_PATH="/tmp/enroot_${SLURM_JOB_ID}/tmp"
+export ENROOT_DATA_PATH="/tmp/enroot_${SLURM_JOB_ID}/data"
+export ENROOT_CACHE_PATH="/tmp/enroot_${SLURM_JOB_ID}/cache"
+export ENROOT_MAX_PROCESSORS=8
+export ENROOT_MOUNT_HOME=n
+export MSWEA_ENROOT_SQSH_DIR="${SWEBENCH_IMAGES:-/path/to/coderforge_cache/swebench_images}"
+mkdir -p "${ENROOT_TEMP_PATH}" "${ENROOT_DATA_PATH}" "${ENROOT_CACHE_PATH}" "${MSWEA_ENROOT_SQSH_DIR}"
+
+# shellcheck disable=SC1091
+source "${VENV}/bin/activate"
+export HF_HOME="/path/to/hf_cache"
+
+python "${EVAL_DIR}/prewarm_images.py" --subset "${SUBSET}" --split "${SPLIT}" --workers "${WORKERS}"
+rm -rf "/tmp/enroot_${SLURM_JOB_ID}"
+echo "=== PREWARM DONE (${SUBSET}/${SPLIT}) ==="
