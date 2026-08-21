@@ -1548,8 +1548,8 @@ class TestLoadModelCustomModelGuard:
 
     Under multi-rank (sharded) loading, custom models use the standard DCP path so each
     rank slices its local DTensor shard. On a single device (world_size == 1) there is no
-    sharding, so adapters that cannot expose write-through destinations take the frugal
-    full-state path instead. Adapters with an explicit write-through guarantee use DCP.
+    sharding, so adapters that need large temporary tensors take the frugal full-state path
+    instead. Adapters that need zero or small temporary tensors use DCP.
     """
 
     def _make_checkpointer(self):
@@ -1659,7 +1659,7 @@ class TestLoadModelCustomModelGuard:
     @patch("nemo_automodel.components.checkpoint.checkpointing._load_hf_checkpoint_preserving_dtype")
     @patch("nemo_automodel.components.checkpoint.checkpointing._load_full_state_dict_into_model")
     def test_single_device_custom_model_uses_fast_path(self, mock_load_full, mock_load_hf, mock_is_st, caplog):
-        """A custom model without a write-through guarantee uses the full-state path.
+        """A custom model without low-memory DCP support uses the full-state path.
 
         The fast path applies the state_dict_adapter from_hf conversion on CPU (via
         _maybe_adapt_state_dict_from_hf) and copies into the model, keeping device memory at
@@ -1696,25 +1696,22 @@ class TestLoadModelCustomModelGuard:
     @patch("nemo_automodel.components.checkpoint.checkpointing._is_safetensors_checkpoint", return_value=True)
     @patch("nemo_automodel.components.checkpoint.checkpointing._load_hf_checkpoint_preserving_dtype")
     @patch("nemo_automodel.components.checkpoint.checkpointing._load_full_state_dict_into_model")
-    @pytest.mark.parametrize("load_capability", ["write_through", "without_full_copy"])
     @pytest.mark.parametrize("dequantize_base_checkpoint", [False, True])
-    def test_single_device_adapter_without_full_copy_routes_by_quantization(
+    def test_single_device_low_memory_dcp_routes_by_quantization(
         self,
         mock_load_full,
         mock_load_hf,
         mock_is_st,
         caplog,
         dequantize_base_checkpoint,
-        load_capability,
     ):
-        """Quantized conversion keeps the full CPU fallback for both direct-load capabilities."""
+        """Quantized conversion keeps the full CPU fallback despite low-memory DCP support."""
         CustomModel = type("CustomModel", (torch.nn.Module,), {})
         CustomModel.__module__ = "nemo_automodel.components.models.nemotron_v3.model"
         model = CustomModel()
         model.layer = torch.nn.Linear(4, 4)
         model.state_dict_adapter = MagicMock(spec=StateDictAdapter)
-        model.state_dict_adapter.supports_write_through_checkpoint_load = load_capability == "write_through"
-        model.state_dict_adapter.supports_checkpoint_load_without_full_copy = load_capability == "without_full_copy"
+        model.state_dict_adapter.supports_low_memory_dcp_load = True
         mock_state_dict = {"layer.weight": torch.randn(4, 4), "layer.bias": torch.randn(4)}
         mock_load_hf.return_value = mock_state_dict
 

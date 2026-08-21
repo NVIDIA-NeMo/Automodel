@@ -224,7 +224,7 @@ class TestRoundTrip:
         torch.testing.assert_close(roundtripped["model.word_embeddings.weight"], hf_sd["model.word_embeddings.weight"])
 
 
-class TestCheckpointLoadWithoutFullCopy:
+class TestLowMemoryDcpLoad:
     def test_uses_only_fused_qkv_temporaries(self, adapter, config, moe_config):
         q_size = config.num_attention_heads * config.head_dim
         kv_size = config.num_key_value_heads * config.head_dim
@@ -269,20 +269,20 @@ class TestCheckpointLoadWithoutFullCopy:
         assert down_destination.untyped_storage().data_ptr() == grouped_down.untyped_storage().data_ptr()
 
     def test_capability_matches_runtime_expert_storage(self, adapter, monkeypatch):
-        assert adapter.supports_checkpoint_load_without_full_copy is True
+        assert adapter.supports_low_memory_dcp_load is True
 
         adapter.backend.experts = "te"
         adapter.backend.dispatcher = "deepep"
         monkeypatch.setattr("nemo_automodel.components.moe.state_dict_mixin.get_world_size_safe", lambda: 1)
-        assert adapter.supports_checkpoint_load_without_full_copy is True
+        assert adapter.supports_low_memory_dcp_load is True
 
         monkeypatch.setattr("nemo_automodel.components.moe.state_dict_mixin.get_world_size_safe", lambda: 8)
-        assert adapter.supports_checkpoint_load_without_full_copy is False
+        assert adapter.supports_low_memory_dcp_load is False
 
         adapter.backend.experts = "torch_mm"
         adapter.backend.dispatcher = "mok"
-        assert adapter.supports_checkpoint_load_without_full_copy is False
+        assert adapter.supports_low_memory_dcp_load is False
 
         adapter.backend.dispatcher = "torch"
         adapter.moe_config.expert_bias = True
-        assert adapter.supports_checkpoint_load_without_full_copy is False
+        assert adapter.supports_low_memory_dcp_load is False

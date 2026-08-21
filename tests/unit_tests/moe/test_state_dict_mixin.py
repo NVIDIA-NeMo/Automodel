@@ -1009,23 +1009,23 @@ class TestInplaceLoadViews:
     conversion function, so patches must target that module path.
     """
 
-    def test_expert_write_through_capability_matches_grouped_storage_aliasing(self):
+    def test_expert_checkpoint_storage_capability_matches_grouped_storage_aliasing(self):
         mixin = MockMoEStateDictMixin()
-        assert mixin._supports_write_through_expert_checkpoint_load is True
+        assert mixin._expert_checkpoint_tensors_use_model_storage is True
 
         mixin.backend.experts = "te"
         mixin.backend.dispatcher = "deepep"
         with patch("nemo_automodel.components.moe.state_dict_mixin.get_world_size_safe", return_value=8):
-            assert mixin._supports_write_through_expert_checkpoint_load is False
+            assert mixin._expert_checkpoint_tensors_use_model_storage is False
         with patch("nemo_automodel.components.moe.state_dict_mixin.get_world_size_safe", return_value=1):
-            assert mixin._supports_write_through_expert_checkpoint_load is True
+            assert mixin._expert_checkpoint_tensors_use_model_storage is True
 
         mixin.backend.dispatcher = "torch"
-        assert mixin._supports_write_through_expert_checkpoint_load is True
+        assert mixin._expert_checkpoint_tensors_use_model_storage is True
 
         mixin.backend.experts = "gmm"
         mixin.backend.dispatcher = "mok"
-        assert mixin._supports_write_through_expert_checkpoint_load is False
+        assert mixin._expert_checkpoint_tensors_use_model_storage is False
 
     def _run_inplace_conversion(self, mixin, fqn, mock_dtensor, splits):
         mixin._split_experts_weights = Mock(return_value=splits)

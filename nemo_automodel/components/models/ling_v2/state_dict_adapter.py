@@ -101,9 +101,9 @@ class BailingMoeV2StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapt
         self._uses_model_prefix = True
 
     @property
-    def supports_checkpoint_load_without_full_copy(self) -> bool:
-        """Whether Ling can use DCP with only its small fused-QKV temporary tensors."""
-        return self._supports_write_through_expert_checkpoint_load and not self.moe_config.expert_bias
+    def supports_low_memory_dcp_load(self) -> bool:
+        """Whether Ling's DCP load needs only small fused-QKV temporary tensors."""
+        return self._expert_checkpoint_tensors_use_model_storage and not self.moe_config.expert_bias
 
     # ---- HF -> native ----------------------------------------------------
 
