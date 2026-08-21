@@ -63,6 +63,7 @@ from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from nemo_automodel.components.speculative.dflash.draft_qwen3 import (
     Qwen3DFlashDecoderLayer,
     Qwen3DFlashDraftModel,
+    assert_target_supports_rollback,
     extract_context_feature,
     sample,
 )
@@ -561,6 +562,7 @@ class Qwen3DFlash2DraftModel(Qwen3DFlashDraftModel):
             followed by the accepted tokens.
         """
         self.eval()
+        assert_target_supports_rollback(target)
         num_input_tokens = input_ids.shape[1]
         max_length = num_input_tokens + max_new_tokens
         block_size = self.block_size

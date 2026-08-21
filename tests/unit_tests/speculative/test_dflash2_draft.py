@@ -429,6 +429,51 @@ class _ConstantTarget(torch.nn.Module):
         return SimpleNamespace(logits=logits, hidden_states=[hidden] * (self.num_layers + 1))
 
 
+def test_spec_generate_refuses_a_target_whose_state_cannot_be_rewound():
+    """A hybrid target must fail loudly rather than decode to the wrong tokens.
+
+    Verified on a real Qwen3.5 checkpoint: run a block, crop the cache back to
+    the prompt, and the next logits differ from a never-speculated run by up to
+    5.9 -- ``crop`` drops the KV rows but leaves the linear-attention layers'
+    recurrent state holding the rejected tokens. Greedy decoding then stops
+    reproducing the target's own output, which is the one guarantee speculative
+    decoding is supposed to give.
+    """
+    cfg = _draft_cfg()
+    draft = Qwen3DFlash2DraftModel(cfg)
+    target = _ConstantTarget(cfg, forced_token_id=3)
+
+    target.config = Qwen3Config(
+        vocab_size=VOCAB,
+        hidden_size=HIDDEN,
+        num_hidden_layers=4,
+        layer_types=["linear_attention", "linear_attention", "linear_attention", "full_attention"],
+    )
+    with pytest.raises(ValueError, match="linear_attention"):
+        draft.spec_generate(
+            target=target,
+            input_ids=torch.tensor([[1, 2, 3]]),
+            max_new_tokens=BLOCK_SIZE,
+            stop_token_ids=None,
+            temperature=0.0,
+        )
+
+    # A pure-attention target is untouched (verified lossless on Qwen3-8B).
+    target.config = Qwen3Config(
+        vocab_size=VOCAB,
+        hidden_size=HIDDEN,
+        num_hidden_layers=2,
+        layer_types=["full_attention", "full_attention"],
+    )
+    draft.spec_generate(
+        target=target,
+        input_ids=torch.tensor([[1, 2, 3]]),
+        max_new_tokens=BLOCK_SIZE,
+        stop_token_ids=None,
+        temperature=0.0,
+    )
+
+
 def test_spec_generate_builds_the_targets_own_cache_type():
     """The target's KV cache must be built from the target's config.
 

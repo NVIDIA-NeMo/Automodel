@@ -73,6 +73,49 @@ def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
     return q_embed, k_embed
 
 
+# Layer kinds whose cache a rejected block can be rewound out of by dropping KV
+# rows. Anything else -- notably the ``linear_attention`` layers the Qwen3.5
+# family interleaves -- carries a recurrent state that cropping cannot rewind.
+_REWINDABLE_LAYER_TYPES = frozenset({"full_attention", "sliding_attention", "chunked_attention"})
+
+
+def assert_target_supports_rollback(target: nn.Module) -> None:
+    """Reject targets whose cache cannot be rewound after a rejected block.
+
+    Speculative decoding verifies a whole block and then rewinds the target to
+    the accepted prefix. For attention layers that is just dropping KV rows, but
+    a linear-attention layer keeps a recurrent state that has already absorbed
+    the rejected tokens; ``Cache.crop`` truncates the KV entries and leaves that
+    state where it is. The target then predicts from a corrupted state, so the
+    "lossless" guarantee quietly stops holding -- greedy decoding drifts away
+    from the target's own output instead of reproducing it.
+
+    Training is unaffected: it is a single forward with no cache and no rewind.
+
+    Args:
+        target: The frozen verifier.
+
+    Raises:
+        ValueError: If the target has any layer whose state cropping cannot
+            rewind.
+    """
+    config = getattr(target, "config", None)
+    if config is None:
+        return
+    text_config = getattr(config, "text_config", None) or config
+    layer_types = getattr(text_config, "layer_types", None)
+    if not layer_types:
+        return
+    unsupported = sorted(set(layer_types) - _REWINDABLE_LAYER_TYPES)
+    if unsupported:
+        raise ValueError(
+            f"Speculative decoding cannot verify against this target: its {', '.join(unsupported)} layers keep a "
+            "recurrent state that cropping the KV cache does not rewind, so a rejected block permanently corrupts "
+            "the target and the decoded output stops matching the target's own. Training against such a target is "
+            "fine (a single forward, no cache); serve the trained draft with an engine that rewinds hybrid state."
+        )
+
+
 def _sliding_window_mask(query: torch.Tensor, key: torch.Tensor, sliding_window: int) -> torch.Tensor:
     """Band mask keeping keys within ``sliding_window`` of each query's position.
 
@@ -376,6 +419,7 @@ class Qwen3DFlashDraftModel(Qwen3PreTrainedModel):
     ) -> torch.LongTensor:
         """Block-parallel speculative decoding: draft a block, verify with the target, accept the matching prefix."""
         self.eval()
+        assert_target_supports_rollback(target)
         num_input_tokens = input_ids.shape[1]
         max_length = num_input_tokens + max_new_tokens
         block_size = self.block_size
