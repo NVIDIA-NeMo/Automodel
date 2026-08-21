@@ -105,7 +105,6 @@ from __future__ import annotations
 import argparse
 import math
 from dataclasses import dataclass, replace
-from typing import Optional
 
 import torch
 from utils import (
@@ -140,9 +139,9 @@ class SamplerConfig:
     temperature: float = 0.0
     remasking: str = "low_confidence"
     use_kv_cache: bool = False
-    threshold: Optional[float] = None
+    threshold: float | None = None
     causal_context: bool = False
-    eos_token_id: Optional[int] = None
+    eos_token_id: int | None = None
     # SCDD forward-process hyperparameters; must match the values the checkpoint
     # was trained with (``dllm.uniform_ratio`` / ``schedule_shape`` /
     # ``schedule_peak`` / ``eps`` in the training config). Ignored by the

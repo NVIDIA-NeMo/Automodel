@@ -36,7 +36,7 @@ import argparse
 import json
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 import imageio
 import numpy as np
@@ -103,7 +103,7 @@ def format_text_input(prompt: List[str], system_message: str) -> List[Dict[str, 
     return template
 
 
-def load_video(video_path: str, start_frame: int = 0, end_frame: Optional[int] = None) -> np.ndarray:
+def load_video(video_path: str, start_frame: int = 0, end_frame: int | None = None) -> np.ndarray:
     """
     Load video from file.
 
@@ -134,7 +134,7 @@ def load_video(video_path: str, start_frame: int = 0, end_frame: Optional[int] =
     return np.stack(frames, axis=0)  # [F, H, W, C]
 
 
-def adjust_frames_to_4n_plus_1(frames: np.ndarray, target_frames: Optional[int] = None) -> np.ndarray:
+def adjust_frames_to_4n_plus_1(frames: np.ndarray, target_frames: int | None = None) -> np.ndarray:
     """
     Adjust number of frames to 4n+1 format required by VAE.
 
@@ -307,8 +307,8 @@ class VideoPreprocessor:
         video_path: str,
         caption: str,
         start_frame: int = 0,
-        end_frame: Optional[int] = None,
-        target_frames: Optional[int] = None,
+        end_frame: int | None = None,
+        target_frames: int | None = None,
         target_height: int = 720,
         target_width: int = 1280,
         data_type: str = "video",
