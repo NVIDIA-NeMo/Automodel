@@ -1,0 +1,79 @@
+# DFlash 2 draft training for Qwen3.8-27B (online target hidden-state capture).
+#
+# Qwen/Qwen3.8-27B ships as `Qwen3_5ForConditionalGeneration` (model_type qwen3_5),
+# so its decoder hyper-parameters live on a nested `text_config`; the recipe unwraps
+# that automatically. The draft itself is a plain Qwen3-shaped stack.
+#
+# The draft_* overrides below reproduce the published z-lab/Qwen3.8-27B-DFlash2
+# drafter, whose attention is deliberately sized differently from the target
+# (32 heads / 8 kv / head_dim 128 against the target's 24 / 4 / 256). Drop them to
+# inherit the target's shape instead.
+#
+# IMPORTANT: regenerate the training responses with the target model before
+# training -- training uses teacher forcing on ground-truth tokens while
+# inference is autoregressive, and the distribution mismatch hurts acceptance
+# length otherwise.
+
+recipe: TrainDFlash2Recipe
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+# The 27B target is frozen (no gradients, no optimizer state); tp_size shards its
+# weights across the two ranks. The draft stays DDP-replicated on both.
+# Context parallelism is not supported together with tensor parallelism here.
+distributed:
+  strategy: fsdp2
+  tp_size: 2
+
+recipe_args:
+  target_model_name_or_path: Qwen/Qwen3.8-27B
+  train_data_path: /path/to/perfectblend_qwen3.8-27b_regen.jsonl   # regenerate with the target first
+  val_data_path: null
+  output_dir: ./outputs/dflash2_qwen3_8_27b
+  seq_length: 3072
+  micro_batch_size: 1
+  grad_accumulation_steps: 8
+  num_workers: 4
+  num_epochs: 1
+
+  # --- DFlash backbone ---
+  draft_num_hidden_layers: 5
+  block_size: 8                       # the block size the published drafter uses
+  num_anchors: 64                     # blocks per sequence per step; the 248k-token
+  #                                   # vocab makes the block logits the memory driver
+  loss_decay_gamma: 4.0               # paper default for block_size 8
+  mask_token_id: 248070               # reserved token, matching the published drafter
+  target_layer_ids: [5, 19, 33, 47, 61]
+  attention_backend: flex_attention
+
+  # --- draft attention shape (omit to inherit the target's) ---
+  draft_num_attention_heads: 32
+  draft_num_key_value_heads: 8
+  draft_head_dim: 128
+
+  # --- DFlash 2 convolution + path selector ---
+  conv_kernel_size: 2
+  conv_group_size: 16
+  selector_rank: 256
+  selector_top_k: 16
+  selector_loss_weight: 1.0
+
+  trust_remote_code: false
+  shuffle_seed: 42
+  log_every_steps: 10
+  max_grad_norm: 1.0
+
+optimizer:
+  lr: 6.0e-4
+  betas: [0.9, 0.95]
+  weight_decay: 0.0
+  warmup_ratio: 0.04
+  min_lr_ratio: 0.1
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: ./outputs/dflash2_qwen3_8_27b/checkpoints
+  model_save_format: safetensors
+  save_consolidated: true
