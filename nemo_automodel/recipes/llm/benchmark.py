@@ -376,6 +376,10 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                 with self.timers("optimizer", log_level=2):
                     for opt in self.optimizer:
                         opt.step()
+                    if mok_mxfp8_runtimes := getattr(self, "_mok_mxfp8_runtimes", ()):
+                        from nemo_automodel.components.moe.mok_experts import clear_mok_mxfp8_optimizer_step_cache
+
+                        clear_mok_mxfp8_optimizer_step_cache(mok_mxfp8_runtimes)
                     logger.debug("Optimizer step")
 
             # Match the training-loop lifecycle: record one complete eager
@@ -412,6 +416,8 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                     f"Max Memory Allocated: {torch.cuda.max_memory_allocated() / 1024**3:.2f} GB | "
                     f"loss={reporting_loss:.4f}"
                 )
+                if self._wandb_enabled and self.wandb_run is not None:
+                    self.wandb_run.log({"loss": reporting_loss}, step=i)
 
             # Collect and log MoE load balance metrics (inherited from train_ft)
             self._collect_moe_load_balance()
