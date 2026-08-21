@@ -19,7 +19,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TypeVar
 
 import torch
 import torch.distributed as dist
@@ -38,10 +38,13 @@ from nemo_automodel.components.distributed.pipelining import AutoPipeline
 from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.models.common.mtp import MTPContextParallelInputs
 from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
+from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.training.utils import (
+    get_expert_tp_replication_factor,
     prepare_after_first_microbatch,
     prepare_for_final_backward,
     prepare_for_grad_accumulation,
+    scale_grads_and_clip_grad_norm,
 )
 from nemo_automodel.components.utils.model_utils import filter_forward_kwargs
 
@@ -58,12 +61,21 @@ LossFn = Callable[
 
 _LOSS_FIELD_PREFIX = "__engine_loss__"
 _LOSS_METADATA = ("cu_seqlens", "cu_seqlens_padded", "max_seqlen", "padding_mask")
+_T = TypeVar("_T")
 
-__all__ = ["Engine", "ForwardResult", "collate_prebatched"]
+__all__ = ["Engine", "ForwardResult", "OptimStepResult", "collate_prebatched"]
 
 
 def _nullcontext_for_batch(_model_inputs: dict[str, Any]) -> AbstractContextManager[Any]:
     return nullcontext()
+
+
+def _as_tuple(value: _T | Sequence[_T] | None) -> tuple[_T, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, Sequence):
+        return tuple(value)
+    return (value,)
 
 
 def collate_prebatched(datums: list[Datum]) -> tuple[dict[str, Any], CollatedLossInputs | dict[str, torch.Tensor]]:
@@ -131,6 +143,22 @@ class ForwardResult:
     loss_fn_outputs: list[dict[str, Any]]
 
 
+@dataclass(frozen=True)
+class OptimStepResult:
+    """Statistics from one completed optimizer step.
+
+    Attributes:
+        grad_norm: Gradient norm reported before clipping. This is a scalar
+            tensor on the gradients' device, or ``0.0`` when clipping is
+            disabled by ``max_grad_norm=None``.
+        learning_rates: Learning rates of every optimizer parameter group after
+            the configured schedulers advance.
+    """
+
+    grad_norm: torch.Tensor | float
+    learning_rates: tuple[float, ...]
+
+
 class Engine:
     """Run model forward or forward/backward over Datum windows.
 
@@ -138,10 +166,13 @@ class Engine:
     passed here. The Engine owns batching and model-parallel execution.
     :meth:`forward` performs evaluation without gradients;
     :meth:`forward_backward` additionally owns global weight normalization,
-    gradient-accumulation synchronization, and backward. The Engine
-    deliberately does not zero, clip, finalize expert gradients, or step them;
-    callers choose the optimizer boundary and retain the repository's existing
-    distributed gradient-finalization path.
+    gradient-accumulation synchronization, and backward. When optimizers are
+    provided, :meth:`optim_step` owns distributed gradient finalization,
+    clipping, parameter updates, gradient clearing, model post-step hooks, and
+    LR-scheduler advancement. One :meth:`forward_backward` call represents the
+    complete optimizer accumulation window whose gradients :meth:`optim_step`
+    consumes. Dynamic loss scaling and overflow-skipped updates are not part of
+    this contract.
 
     Args:
         model: An already configured and distributed model, or a built
@@ -167,6 +198,13 @@ class Engine:
             pipeline schedule. Recipes use it for FP8 and model input staging.
         defer_fsdp_grad_sync: Defer FSDP/DDP gradient synchronization until the
             final microbatch.
+        optimizers: Already-built optimizer or optimizers for these model parts.
+            The Engine retains the same objects; it does not build or copy them.
+        lr_schedulers: Already-built optimizer parameter scheduler or schedulers.
+            They advance once after a completed optimizer update.
+        max_grad_norm: Maximum gradient norm. ``None`` preserves gradients
+            without clipping while still running distributed expert-gradient
+            finalization.
 
     Note:
         Context-parallel input layout and transport are delegated to
@@ -200,6 +238,9 @@ class Engine:
         mtp_ignore_index: int = -100,
         context_fn: Callable[[dict[str, Any]], AbstractContextManager[Any]] = _nullcontext_for_batch,
         defer_fsdp_grad_sync: bool = True,
+        optimizers: torch.optim.Optimizer | Sequence[torch.optim.Optimizer] | None = None,
+        lr_schedulers: OptimizerParamScheduler | Sequence[OptimizerParamScheduler] | None = None,
+        max_grad_norm: float | None = 1.0,
     ) -> None:
         if isinstance(microbatch_size, bool) or not isinstance(microbatch_size, int) or microbatch_size <= 0:
             raise ValueError(f"microbatch_size must be a positive integer, got {microbatch_size!r}")
@@ -216,6 +257,9 @@ class Engine:
         self.mtp_ignore_index = mtp_ignore_index
         self.context_fn = context_fn
         self.defer_fsdp_grad_sync = defer_fsdp_grad_sync
+        self.optimizers = _as_tuple(optimizers)
+        self.lr_schedulers = _as_tuple(lr_schedulers)
+        self.max_grad_norm = max_grad_norm
 
     @torch.no_grad()
     def forward(
@@ -474,6 +518,78 @@ class Engine:
 
         loss = (local_loss_sum / safe_denominator).detach()
         return loss, loss_fn_outputs
+
+    @torch.no_grad()
+    def optim_step(
+        self,
+        *,
+        before_optimizer_step: Callable[[], None] | None = None,
+    ) -> OptimStepResult:
+        """Finalize accumulated gradients and perform one optimizer update.
+
+        Gradient normalization performed by :meth:`forward_backward` is not
+        repeated here. This method applies the repository's model-parallel
+        expert-gradient correction and global clipping once, then invokes an
+        optional mutation fence before any optimizer changes. Async
+        checkpointers use that fence to preserve ``finalize/clip -> wait ->
+        step`` overlap.
+
+        Args:
+            before_optimizer_step: Optional callback invoked exactly once after
+                gradient finalization and clipping, but before the first
+                optimizer step. If it raises, parameters, optimizer state,
+                model post-step state, and schedulers remain untouched; the
+                finalized gradients remain available.
+
+        Returns:
+            Gradient norm and post-scheduler learning rates for the completed
+            optimizer update.
+
+        Raises:
+            RuntimeError: If this Engine was constructed without optimizers.
+        """
+        if not self.optimizers:
+            raise RuntimeError("Engine.optim_step requires at least one optimizer")
+        if before_optimizer_step is not None and not callable(before_optimizer_step):
+            raise TypeError("before_optimizer_step must be callable or None")
+
+        device_mesh = self.mesh_context.device_mesh if self.mesh_context is not None else None
+        moe_mesh = self.mesh_context.moe_mesh if self.mesh_context is not None else None
+        dp_group, dp_size = self._dp_group_and_size()
+        _, grad_group_size = self._gradient_group_and_size(dp_group, dp_size)
+        pp_enabled = self.pipeline is not None
+        grad_norm = scale_grads_and_clip_grad_norm(
+            max_grad_norm=self.max_grad_norm,
+            model_parts=self.model_parts,
+            norm_type=2.0,
+            pp_enabled=pp_enabled,
+            device_mesh=device_mesh,
+            moe_mesh=moe_mesh,
+            ep_axis_name="ep" if moe_mesh is not None and "ep" in (moe_mesh.mesh_dim_names or ()) else None,
+            pp_axis_name="pp" if pp_enabled else None,
+            foreach=True,
+            num_label_tokens=None,
+            dp_group_size=grad_group_size,
+            expert_tp_replication_factor=get_expert_tp_replication_factor(self.model_parts, device_mesh),
+        )
+
+        if before_optimizer_step is not None:
+            before_optimizer_step()
+
+        for optimizer in self.optimizers:
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+
+        for part in self.model_parts:
+            update_moe_gate_bias = getattr(part, "update_moe_gate_bias", None)
+            if callable(update_moe_gate_bias):
+                update_moe_gate_bias()
+
+        for scheduler in self.lr_schedulers:
+            scheduler.step(1)
+
+        learning_rates = tuple(float(group["lr"]) for optimizer in self.optimizers for group in optimizer.param_groups)
+        return OptimStepResult(grad_norm=grad_norm, learning_rates=learning_rates)
 
     def _group_datums(self, datums: Sequence[Datum]) -> list[list[Datum]]:
         if not isinstance(datums, Sequence) or isinstance(datums, (str, bytes)) or not datums:

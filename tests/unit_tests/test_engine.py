@@ -49,7 +49,7 @@ from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
 from nemo_automodel.components.models.common.mtp import prepare_mtp_context_parallel_inputs
 from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
-from nemo_automodel.engine import Engine, ForwardResult, collate_prebatched
+from nemo_automodel.engine import Engine, ForwardResult, OptimStepResult, collate_prebatched
 
 
 class ScaleModel(nn.Module):
@@ -82,6 +82,12 @@ class _CPMesh(dict):
     def __init__(self, size, rank):
         super().__init__(cp=_SubMesh(size, rank), tp=_SubMesh(1))
         self.mesh_dim_names = ("cp", "tp")
+
+
+class _NamedMesh(dict):
+    def __init__(self, names, **axes):
+        super().__init__(axes)
+        self.mesh_dim_names = tuple(names)
 
 
 class _FakeAutoPipeline(AutoPipeline):
@@ -202,6 +208,207 @@ def test_engine_and_datum_are_lazy_top_level_exports():
     assert PublicDatum is Datum
     assert PublicLossInputLayout is LossInputLayout
     assert PublicCollatedLossInputs is CollatedLossInputs
+
+
+def test_optim_step_clips_updates_and_clears_real_gradients():
+    model = ScaleModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    engine = Engine(model, device="cpu", optimizers=optimizer, max_grad_norm=0.5)
+
+    engine.forward_backward([_datum([4])], _identity_loss)
+    torch.testing.assert_close(model.weight.grad, torch.tensor(4.0))
+
+    result = engine.optim_step()
+
+    assert isinstance(result, OptimStepResult)
+    torch.testing.assert_close(result.grad_norm, torch.tensor(4.0, dtype=torch.float64))
+    torch.testing.assert_close(model.weight, torch.tensor(0.95))
+    assert model.weight.grad is None
+    assert result.learning_rates == (0.1,)
+
+
+def test_optim_step_orders_multi_optimizer_topology_and_post_step_work(monkeypatch):
+    events = []
+
+    class GateModel(ScaleModel):
+        def __init__(self, name):
+            super().__init__()
+            self.name = name
+
+        def update_moe_gate_bias(self):
+            events.append(f"gate-{self.name}")
+
+    class RecordingSGD(torch.optim.SGD):
+        def __init__(self, name, parameters, lr):
+            self.name = name
+            super().__init__(parameters, lr=lr)
+
+        def step(self, closure=None):
+            events.append(f"step-{self.name}")
+            return super().step(closure)
+
+        def zero_grad(self, set_to_none=True):
+            assert set_to_none is True
+            events.append(f"zero-{self.name}")
+            return super().zero_grad(set_to_none=set_to_none)
+
+    class RecordingScheduler:
+        def __init__(self, name, optimizer):
+            self.name = name
+            self.optimizer = optimizer
+
+        def step(self, increment):
+            assert increment == 1
+            events.append(f"scheduler-{self.name}")
+            for group in self.optimizer.param_groups:
+                group["lr"] += 0.01
+
+    first = GateModel("first")
+    second = GateModel("second")
+    first._nemo_moe_tp_requires_replica_sync = True
+    first.weight.grad = torch.tensor(2.0)
+    second.weight.grad = torch.tensor(3.0)
+    pipeline = _FakeAutoPipeline(first, parts=[first, second])
+    first_optimizer = RecordingSGD("first", first.parameters(), lr=0.1)
+    second_optimizer = RecordingSGD("second", second.parameters(), lr=0.2)
+    first_scheduler = RecordingScheduler("first", first_optimizer)
+    second_scheduler = RecordingScheduler("second", second_optimizer)
+    device_mesh = _NamedMesh(("cp", "tp"), cp=_SubMesh(2), tp=_SubMesh(4))
+    moe_mesh = _NamedMesh(("ep_shard", "ep"), ep_shard=_SubMesh(2), ep=_SubMesh(2))
+    engine = Engine(
+        pipeline,
+        device="cpu",
+        mesh_context=SimpleNamespace(
+            device_mesh=device_mesh,
+            moe_mesh=moe_mesh,
+            cp_size=2,
+            pp_size=2,
+            process_group=None,
+        ),
+        optimizers=[first_optimizer, second_optimizer],
+        lr_schedulers=[first_scheduler, second_scheduler],
+        max_grad_norm=None,
+    )
+    engine._dp_group_and_size = lambda: (None, 2)
+    engine._gradient_group_and_size = lambda _group, _size: (None, 8)
+    observed = {}
+
+    def finalize(**kwargs):
+        events.append("finalize")
+        observed.update(kwargs)
+        return torch.tensor(7.0)
+
+    monkeypatch.setattr(engine_module, "scale_grads_and_clip_grad_norm", finalize)
+
+    def before_optimizer_step():
+        events.append("before-step")
+
+    result = engine.optim_step(before_optimizer_step=before_optimizer_step)
+
+    assert engine.optimizers == (first_optimizer, second_optimizer)
+    assert engine.lr_schedulers == (first_scheduler, second_scheduler)
+    assert events == [
+        "finalize",
+        "before-step",
+        "step-first",
+        "zero-first",
+        "step-second",
+        "zero-second",
+        "gate-first",
+        "gate-second",
+        "scheduler-first",
+        "scheduler-second",
+    ]
+    assert observed == {
+        "max_grad_norm": None,
+        "model_parts": [first, second],
+        "norm_type": 2.0,
+        "pp_enabled": True,
+        "device_mesh": device_mesh,
+        "moe_mesh": moe_mesh,
+        "ep_axis_name": "ep",
+        "pp_axis_name": "pp",
+        "foreach": True,
+        "num_label_tokens": None,
+        "dp_group_size": 8,
+        "expert_tp_replication_factor": 4,
+    }
+    assert result.grad_norm.item() == pytest.approx(7.0)
+    assert result.learning_rates == pytest.approx((0.11, 0.21))
+    assert first.weight.grad is None
+    assert second.weight.grad is None
+
+
+def test_optim_step_callback_failure_preserves_optimizer_and_post_step_state(monkeypatch):
+    events = []
+
+    class GateModel(ScaleModel):
+        def update_moe_gate_bias(self):
+            events.append("gate")
+
+    class RecordingSGD(torch.optim.SGD):
+        def step(self, closure=None):
+            events.append("step")
+            return super().step(closure)
+
+        def zero_grad(self, set_to_none=True):
+            events.append("zero")
+            return super().zero_grad(set_to_none=set_to_none)
+
+    class RecordingScheduler:
+        def step(self, increment):
+            events.append("scheduler")
+
+    model = GateModel()
+    model.weight.grad = torch.tensor(2.0)
+    optimizer = RecordingSGD(model.parameters(), lr=0.1)
+    engine = Engine(
+        model,
+        device="cpu",
+        optimizers=optimizer,
+        lr_schedulers=RecordingScheduler(),
+    )
+
+    def finalize(**_kwargs):
+        events.append("finalize")
+        return torch.tensor(2.0)
+
+    monkeypatch.setattr(engine_module, "scale_grads_and_clip_grad_norm", finalize)
+
+    def fail_before_step():
+        events.append("before-step")
+        raise ValueError("staging failed")
+
+    with pytest.raises(ValueError, match="staging failed"):
+        engine.optim_step(before_optimizer_step=fail_before_step)
+
+    assert events == ["finalize", "before-step"]
+    torch.testing.assert_close(model.weight, torch.tensor(1.0))
+    torch.testing.assert_close(model.weight.grad, torch.tensor(2.0))
+
+
+def test_optim_step_requires_an_optimizer(monkeypatch):
+    monkeypatch.setattr(
+        engine_module,
+        "scale_grads_and_clip_grad_norm",
+        lambda **_kwargs: pytest.fail("gradient finalization must not run without an optimizer"),
+    )
+
+    with pytest.raises(RuntimeError, match="requires at least one optimizer"):
+        Engine(ScaleModel(), device="cpu").optim_step()
+
+
+def test_optim_step_rejects_noncallable_mutation_fence_before_finalization(monkeypatch):
+    model = ScaleModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    monkeypatch.setattr(
+        engine_module,
+        "scale_grads_and_clip_grad_norm",
+        lambda **_kwargs: pytest.fail("invalid callback must fail before gradient finalization"),
+    )
+
+    with pytest.raises(TypeError, match="before_optimizer_step must be callable or None"):
+        Engine(model, device="cpu", optimizers=optimizer).optim_step(before_optimizer_step=object())
 
 
 def test_forward_runs_eval_without_grad_lifecycle_and_returns_local_statistics(monkeypatch):

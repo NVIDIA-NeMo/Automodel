@@ -40,10 +40,6 @@ from nemo_automodel.components.datasets.datum import Datum
 from nemo_automodel.components.distributed.mesh import MeshContext
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.experts import GroupedExperts
-from nemo_automodel.components.training.utils import (
-    get_expert_tp_replication_factor,
-    scale_grads_and_clip_grad_norm,
-)
 from nemo_automodel.engine import Engine, collate_prebatched
 
 _TP_SIZE = 2
@@ -209,12 +205,18 @@ def _ep_tp_grad_parity_worker(rank: int, world_size: int, port: int) -> None:
             observed["output"] = output.detach()
             return output.square()
 
-        engine_loss, _ = Engine(
-            _ExpertModel(experts),
+        model = _ExpertModel(experts)
+        model._nemo_moe_tp_requires_replica_sync = True
+        optimizer = torch.optim.SGD(model.parameters(), lr=_LEARNING_RATE)
+        engine = Engine(
+            model,
             device="cpu",
             mesh_context=MeshContext.from_meshes(world_mesh, ep_mesh),
             collate_fn=collate_prebatched,
-        ).forward_backward([datum], loss_fn)
+            optimizers=optimizer,
+            max_grad_norm=1e6,
+        )
+        engine_loss, _ = engine.forward_backward([datum], loss_fn)
         torch.testing.assert_close(observed["output"], y_ref, rtol=1e-4, atol=1e-5)
         torch.testing.assert_close(engine_loss, loss_ref.to(torch.float64), rtol=1e-5, atol=1e-7)
 
@@ -235,27 +237,24 @@ def _ep_tp_grad_parity_worker(rank: int, world_size: int, port: int) -> None:
             experts.down_projs.grad.to_local(), _TP_SIZE * down_grad_ref_local, rtol=1e-4, atol=1e-5
         )
 
-        # The recipe-side scaling must remove exactly that factor. With no FSDP
-        # gradient averaging in this test, dp_group_size=1 and no ep_shard axis
-        # make the TP replication factor the only expert divisor.
-        replication_factor = get_expert_tp_replication_factor([experts], world_mesh)
-        assert replication_factor == _TP_SIZE
-        grad_norm = scale_grads_and_clip_grad_norm(
-            max_grad_norm=1e6,
-            model_parts=[experts],
-            moe_mesh=ep_mesh,
-            ep_axis_name="ep",
-            dp_group_size=1,
-            expert_tp_replication_factor=replication_factor,
-        )
-        torch.testing.assert_close(
-            experts.gate_and_up_projs.grad.to_local(), gate_up_grad_ref_local, rtol=1e-4, atol=1e-5
-        )
-        torch.testing.assert_close(experts.down_projs.grad.to_local(), down_grad_ref_local, rtol=1e-4, atol=1e-5)
-        torch.testing.assert_close(grad_norm, reference_grad_norm, rtol=1e-5, atol=1e-7)
+        # Engine.optim_step must remove exactly that factor before any parameter
+        # mutation. Capture the corrected gradients at its staging-fence hook;
+        # the method then performs the SGD update and clears all gradients.
+        corrected_grads: dict[str, torch.Tensor] = {}
+
+        def capture_corrected_grads() -> None:
+            corrected_grads["gate_up"] = experts.gate_and_up_projs.grad.to_local().detach().clone()
+            corrected_grads["down"] = experts.down_projs.grad.to_local().detach().clone()
+
+        step_result = engine.optim_step(before_optimizer_step=capture_corrected_grads)
+        torch.testing.assert_close(corrected_grads["gate_up"], gate_up_grad_ref_local, rtol=1e-4, atol=1e-5)
+        torch.testing.assert_close(corrected_grads["down"], down_grad_ref_local, rtol=1e-4, atol=1e-5)
+        torch.testing.assert_close(step_result.grad_norm, reference_grad_norm, rtol=1e-5, atol=1e-7)
+        assert step_result.learning_rates == (_LEARNING_RATE,)
+        assert experts.gate_and_up_projs.grad is None
+        assert experts.down_projs.grad is None
 
         torch.optim.SGD(reference_experts.parameters(), lr=_LEARNING_RATE).step()
-        torch.optim.SGD(experts.parameters(), lr=_LEARNING_RATE).step()
         torch.testing.assert_close(
             experts.gate_and_up_projs.to_local(),
             reference_experts.gate_and_up_projs[start:end],

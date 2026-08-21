@@ -1109,6 +1109,9 @@ def test_setup_builds_engine_for_eager_sum_loss(monkeypatch):
     assert trainer.engine is not None
     assert trainer.engine.microbatch_size == 1
     assert trainer.engine.mtp_ignore_index == -321
+    assert trainer.engine.optimizers == tuple(trainer.optimizer)
+    assert trainer.engine.lr_schedulers == tuple(trainer.lr_scheduler or ())
+    assert trainer.engine.max_grad_norm == trainer.max_grad_norm
 
 
 def test_setup_builds_engine_for_eager_fused_loss(monkeypatch):
@@ -2123,15 +2126,12 @@ class TestRunTrainOptimStepUsesEngine:
         monkeypatch.setattr(recipe, "_get_dp_group_size", lambda include_cp=False: dp_group_size)
         monkeypatch.setattr(recipe, "_get_cp_group_size", lambda: cp_group_size)
 
-        monkeypatch.setattr(
-            "nemo_automodel.recipes.llm.train_ft.scale_grads_and_clip_grad_norm",
-            lambda *a, **k: torch.tensor(1.0),
-        )
         object.__setattr__(recipe, "checkpointer", SimpleNamespace(maybe_wait_for_staging=lambda: None))
         object.__setattr__(recipe, "lr_scheduler", None)
         object.__setattr__(recipe, "loss_fn", object())
         engine = MagicMock()
         engine.forward_backward.return_value = (torch.tensor(0.5), [])
+        engine.optim_step.return_value = SimpleNamespace(grad_norm=torch.tensor(1.0), learning_rates=(0.01,))
         object.__setattr__(recipe, "engine", engine)
         object.__setattr__(recipe, "timestamp", 0.0)
         monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda: 0)
@@ -2148,15 +2148,8 @@ class TestRunTrainOptimStepUsesEngine:
         monkeypatch.setattr(recipe, "_make_engine_datum", make_datum)
         engine = MagicMock()
         engine.forward_backward.return_value = (torch.tensor(0.25), [])
+        engine.optim_step.return_value = SimpleNamespace(grad_norm=torch.tensor(1.0), learning_rates=(0.02,))
         object.__setattr__(recipe, "engine", engine)
-
-        finalizer_calls = []
-
-        def finalize_grads(*args, **kwargs):
-            finalizer_calls.append((args, kwargs))
-            return torch.tensor(1.0)
-
-        monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.scale_grads_and_clip_grad_norm", finalize_grads)
         optimizer = SimpleNamespace(
             step=MagicMock(),
             zero_grad=MagicMock(),
@@ -2166,14 +2159,13 @@ class TestRunTrainOptimStepUsesEngine:
         metrics = recipe._run_train_optim_step(batches)
 
         engine.forward_backward.assert_called_once_with(datums, recipe._engine_loss_fn)
+        engine.optim_step.assert_called_once_with(before_optimizer_step=recipe.checkpointer.maybe_wait_for_staging)
         assert make_datum.call_count == 2
-        assert len(finalizer_calls) == 1
-        assert finalizer_calls[0][1]["num_label_tokens"] is None
-        assert finalizer_calls[0][1]["pp_enabled"] is True
-        assert finalizer_calls[0][1]["pp_axis_name"] == "pp"
-        optimizer.step.assert_called_once_with()
-        optimizer.zero_grad.assert_called_once_with()
+        optimizer.step.assert_not_called()
+        optimizer.zero_grad.assert_not_called()
         assert metrics.metrics["loss"] == pytest.approx(0.25)
+        assert metrics.metrics["grad_norm"] == pytest.approx(1.0)
+        assert metrics.metrics["lr"] == pytest.approx(0.02)
 
     def test_pp_thd_batch_uses_engine(self, monkeypatch):
         recipe = self._make_recipe(monkeypatch, pp_enabled=True)
@@ -2184,18 +2176,62 @@ class TestRunTrainOptimStepUsesEngine:
         }
         engine = MagicMock()
         engine.forward_backward.return_value = (torch.tensor(0.5), [])
+        engine.optim_step.return_value = SimpleNamespace(grad_norm=torch.tensor(1.0), learning_rates=(0.01,))
         object.__setattr__(recipe, "engine", engine)
-        finalizer = MagicMock(return_value=torch.tensor(1.0))
-        monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.scale_grads_and_clip_grad_norm", finalizer)
 
         recipe._run_train_optim_step([batch])
 
         engine.forward_backward.assert_called_once()
+        engine.optim_step.assert_called_once_with(before_optimizer_step=recipe.checkpointer.maybe_wait_for_staging)
         datums, loss_fn = engine.forward_backward.call_args.args
         assert len(datums) == 1
         assert datums[0].model_inputs["qkv_format"] == "thd"
         assert loss_fn == recipe._engine_loss_fn
-        assert finalizer.call_args.kwargs["num_label_tokens"] is None
+
+    def test_fp8_scale_precompute_stays_after_engine_optim_step(self, monkeypatch):
+        recipe = self._make_recipe(monkeypatch, pp_enabled=False)
+        object.__setattr__(
+            recipe,
+            "cfg",
+            ConfigNode(
+                {
+                    "fp8": {
+                        "enabled": True,
+                        "precompute_float8_dynamic_scale_for_fsdp": True,
+                    }
+                }
+            ),
+        )
+
+        class _DeviceMesh:
+            def __getitem__(self, name):
+                assert name == "dp_shard"
+                return SimpleNamespace(size=lambda: 2)
+
+        object.__setattr__(recipe, "device_mesh", _DeviceMesh())
+        events = []
+        recipe.checkpointer.maybe_wait_for_staging = lambda: events.append("checkpoint_wait")
+
+        def optim_step(*, before_optimizer_step):
+            events.append("optim_step_start")
+            before_optimizer_step()
+            events.append("optim_step_done")
+            return SimpleNamespace(grad_norm=torch.tensor(1.0), learning_rates=(0.01,))
+
+        recipe.engine.optim_step.side_effect = optim_step
+        monkeypatch.setattr(
+            "nemo_automodel.recipes.llm.train_ft.precompute_float8_dynamic_scale_for_fsdp",
+            lambda model: events.append(("fp8_precompute", model)),
+        )
+
+        recipe._run_train_optim_step([{"input_ids": torch.tensor([[1, 2]]), "labels": torch.tensor([[2, -100]])}])
+
+        assert events == [
+            "optim_step_start",
+            "checkpoint_wait",
+            "optim_step_done",
+            ("fp8_precompute", recipe.model_parts[0]),
+        ]
 
 
 # -----------------------------------------------------------------------------

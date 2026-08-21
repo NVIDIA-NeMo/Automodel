@@ -91,10 +91,17 @@ def test_recipes_run_one_datum_engine_window_then_one_optimizer_step(recipe_cls,
     recipe.pp_enabled = False
     recipe.dist_env = SimpleNamespace(device=torch.device("cpu"), world_size=1, is_main=True)
     recipe.distributed_config = SimpleNamespace(defer_fsdp_grad_sync=True)
-    recipe.engine = Engine(model, device="cpu", microbatch_size=1, collate_fn=collate_prebatched)
     optimizer = _CountingSGD(model.parameters())
     recipe.optimizer = [optimizer]
     recipe.lr_scheduler = None
+    recipe.engine = Engine(
+        model,
+        device="cpu",
+        microbatch_size=1,
+        collate_fn=collate_prebatched,
+        optimizers=recipe.optimizer,
+        max_grad_norm=None,
+    )
     recipe.checkpointer = SimpleNamespace(maybe_wait_for_staging=lambda: None)
     recipe.step_scheduler = SimpleNamespace(step=1, epoch=0, is_remote_logging_step=False)
     recipe.timestamp = time.perf_counter() - 1.0
@@ -135,7 +142,7 @@ def test_recipes_run_one_datum_engine_window_then_one_optimizer_step(recipe_cls,
     reference_loss.backward()
     reference_optimizer.step()
 
-    metrics = recipe._run_train_optim_step(batches, max_grad_norm=None)
+    metrics = recipe._run_train_optim_step(batches)
 
     assert metrics.metrics["loss"] == pytest.approx(reference_loss.item())
     assert model.forward_calls == 2

@@ -407,11 +407,12 @@ def _build_engine_recipe_for_optim_step(*, pp_enabled: bool = False):
     recipe._get_cp_group_size = lambda: 1
     recipe.engine = MagicMock()
     recipe.engine.forward_backward.return_value = (torch.tensor(0.25), [])
+    recipe.engine.optim_step.return_value = SimpleNamespace(grad_norm=2.5, learning_rates=(0.01,))
     return recipe
 
 
 @pytest.mark.cuda(False)
-def test_run_train_step_passes_flat_prebatched_datums_to_engine(monkeypatch):
+def test_run_train_step_passes_flat_prebatched_datums_to_engine():
     recipe = _build_engine_recipe_for_optim_step(pp_enabled=True)
     batches = [
         {
@@ -423,10 +424,7 @@ def test_run_train_step_passes_flat_prebatched_datums_to_engine(monkeypatch):
             "input_ids": torch.tensor([[5, 6, 7, 8]]),
         },
     ]
-    finalizer = MagicMock(return_value=2.5)
-    monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.scale_grads_and_clip_grad_norm", finalizer)
-
-    metrics = recipe._run_train_optim_step(batches, max_grad_norm=1.0)
+    metrics = recipe._run_train_optim_step(batches)
 
     datums, loss_fn = recipe.engine.forward_backward.call_args.args
     assert len(datums) == 2
@@ -436,14 +434,18 @@ def test_run_train_step_passes_flat_prebatched_datums_to_engine(monkeypatch):
         [[False, True, False, True]],
     ]
     assert callable(loss_fn)
-    assert finalizer.call_args.kwargs["num_label_tokens"] is None
+    recipe.engine.optim_step.assert_called_once_with(
+        before_optimizer_step=recipe.checkpointer.maybe_wait_for_staging,
+    )
     assert metrics.metrics["loss"] == pytest.approx(0.25)
-    assert recipe.optimizer[0].step_called
-    assert recipe.optimizer[0].zero_grad_called
+    assert metrics.metrics["grad_norm"] == pytest.approx(2.5)
+    assert metrics.metrics["lr"] == pytest.approx(0.01)
+    assert not recipe.optimizer[0].step_called
+    assert not recipe.optimizer[0].zero_grad_called
 
 
 @pytest.mark.cuda(False)
-def test_train_step_logs_joint_drafter_only_on_first_engine_loss_call(monkeypatch):
+def test_train_step_logs_joint_drafter_only_on_first_engine_loss_call():
     recipe = _build_engine_recipe_for_optim_step()
     recipe.step_scheduler.is_remote_logging_step = True
     batches = [
@@ -458,10 +460,6 @@ def test_train_step_logs_joint_drafter_only_on_first_engine_loss_call(monkeypatc
         return torch.tensor(0.25), []
 
     recipe.engine.forward_backward.side_effect = forward_backward
-    monkeypatch.setattr(
-        "nemo_automodel.recipes.vlm.finetune.scale_grads_and_clip_grad_norm",
-        MagicMock(return_value=0.0),
-    )
 
     recipe._run_train_optim_step(batches)
 
@@ -474,19 +472,45 @@ def test_train_step_logs_joint_drafter_only_on_first_engine_loss_call(monkeypatc
 
 
 @pytest.mark.cuda(False)
-def test_run_train_step_uses_engine_for_empty_supervision(monkeypatch):
+def test_run_train_step_uses_engine_for_empty_supervision():
     recipe = _build_engine_recipe_for_optim_step()
     recipe.engine.forward_backward.return_value = (torch.tensor(0.0), [])
-    finalizer = MagicMock(return_value=0.0)
-    monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.scale_grads_and_clip_grad_norm", finalizer)
-
     batch = {"labels": torch.full((1, 4), -100), "input_ids": torch.arange(4).reshape(1, 4)}
     metrics = recipe._run_train_optim_step([batch])
 
     recipe.engine.forward_backward.assert_called_once()
+    recipe.engine.optim_step.assert_called_once()
     assert metrics.metrics["loss"] == 0.0
     assert metrics.metrics["num_label_tokens"] == 0
-    assert recipe.optimizer[0].step_called
+    assert not recipe.optimizer[0].step_called
+
+
+@pytest.mark.cuda(False)
+def test_run_train_step_keeps_fp8_precompute_after_engine_optim_step(monkeypatch):
+    recipe = _build_engine_recipe_for_optim_step()
+    recipe.cfg = _Cfg(
+        fp8={
+            "enabled": True,
+            "precompute_float8_dynamic_scale_for_fsdp": True,
+        }
+    )
+    recipe.device_mesh = {"dp_shard": SimpleNamespace(size=lambda: 2)}
+    events = []
+
+    def optim_step(**kwargs):
+        events.append("optim_step")
+        return SimpleNamespace(grad_norm=2.5, learning_rates=(0.01,))
+
+    recipe.engine.optim_step.side_effect = optim_step
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.vlm.finetune.precompute_float8_dynamic_scale_for_fsdp",
+        lambda model: events.append(("fp8_precompute", model)),
+    )
+
+    batch = {"labels": torch.tensor([[1, 2]]), "input_ids": torch.tensor([[3, 4]])}
+    recipe._run_train_optim_step([batch])
+
+    assert events == ["optim_step", ("fp8_precompute", recipe.model_parts[0])]
 
 
 def test_make_engine_datum_filters_raw_media_off_first_pipeline_stage():
@@ -1935,6 +1959,18 @@ def test_vlm_rope_fusion_disabled_when_cp_gt_1(monkeypatch):
 
     assert cfg.model.backend.rope_fusion is False
     assert trainer.engine is not None
+
+
+def test_vlm_setup_binds_optimizer_state_to_engine(monkeypatch):
+    cfg = _minimal_vlm_cfg(cp_size=1, rope_fusion=False)
+    _patch_vlm_setup_minimals(monkeypatch, cp_size=1)
+
+    trainer = FinetuneRecipeForVLM(cfg)
+    trainer.setup()
+
+    assert trainer.engine.optimizers == tuple(trainer.optimizer)
+    assert trainer.engine.lr_schedulers == tuple(trainer.lr_scheduler or ())
+    assert trainer.engine.max_grad_norm == trainer.max_grad_norm
 
 
 def test_vlm_setup_builds_engine_for_magi(monkeypatch):

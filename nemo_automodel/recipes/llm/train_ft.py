@@ -78,11 +78,7 @@ from nemo_automodel.components.loss.utils import _get_lm_head_weight, calculate_
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
 from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
-from nemo_automodel.components.training.utils import (
-    count_tail_padding,
-    get_expert_tp_replication_factor,
-    scale_grads_and_clip_grad_norm,
-)
+from nemo_automodel.components.training.utils import count_tail_padding
 from nemo_automodel.components.utils.compile_utils import (
     build_compile_config,
 )
@@ -737,21 +733,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         _, self.tokenizer = _build_tokenizer(self.cfg.model, self.cfg.dataset)
         if getattr(self.loss_fn, "reduction", None) != "sum":
             raise ValueError("Engine-backed finetuning requires a loss with reduction='sum'")
-        self.engine = Engine(
-            self.pp if self.pp_enabled else self.model_parts[0],
-            device=self.dist_env.device,
-            mesh_context=self.mesh_context,
-            microbatch_size=1,
-            collate_fn=collate_prebatched,
-            padding_token_id=(self.tokenizer.pad_token_id if self.tokenizer is not None else 0) or 0,
-            mtp_ignore_index=self.cfg.mtp.ignore_index,
-            context_fn=(
-                (lambda _model_inputs: self.te_fp8.maybe_te_autocast())
-                if self.te_fp8 is not None
-                else (lambda _model_inputs: nullcontext())
-            ),
-            defer_fsdp_grad_sync=getattr(self.distributed_config, "defer_fsdp_grad_sync", True),
-        )
         attn_implementation = None
         if (
             self.cfg.get("packed_sequence.packed_sequence_size", 0) > 0
@@ -821,6 +802,25 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self.cfg.lr_scheduler.build(self.optimizer, self.step_scheduler)
             if self.cfg.lr_scheduler is not None
             else None
+        )
+
+        self.engine = Engine(
+            self.pp if self.pp_enabled else self.model_parts[0],
+            device=self.dist_env.device,
+            mesh_context=self.mesh_context,
+            optimizers=self.optimizer,
+            lr_schedulers=self.lr_scheduler,
+            max_grad_norm=self.max_grad_norm,
+            microbatch_size=1,
+            collate_fn=collate_prebatched,
+            padding_token_id=(self.tokenizer.pad_token_id if self.tokenizer is not None else 0) or 0,
+            mtp_ignore_index=self.cfg.mtp.ignore_index,
+            context_fn=(
+                (lambda _model_inputs: self.te_fp8.maybe_te_autocast())
+                if self.te_fp8 is not None
+                else (lambda _model_inputs: nullcontext())
+            ),
+            defer_fsdp_grad_sync=getattr(self.distributed_config, "defer_fsdp_grad_sync", True),
         )
 
         # Log model, parameter counts, norms, optimizer and scheduler
@@ -1016,7 +1016,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 for batches in self.step_scheduler:
                     # If QAT delayed fake-quant is configured, enable after threshold
                     self._enable_qat_if_delayed(self.step_scheduler.step)
-                    train_log_data = self._run_train_optim_step(batches, self.max_grad_norm)
+                    train_log_data = self._run_train_optim_step(batches)
                     # Capture outside the microbatch loop and only after the
                     # eager optimizer step has completed. This leaves no
                     # pending checkpoint recomputation or GA backward work.
@@ -1218,14 +1218,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             is_train=False,
         )
 
-    def _run_train_optim_step(self, batches: list[dict[str, Any]], max_grad_norm: float | None = None) -> MetricsSample:
+    def _run_train_optim_step(self, batches: list[dict[str, Any]]) -> MetricsSample:
         """Execute a single training step.
 
         Args:
             batches: Worker-collated optimizer window. Padded token tensors use
                 shape [batch, sequence]; packed tensors use their THD token layout.
-            max_grad_norm: Gradient clipping norm. Optional, if None will not clip gradients.
-
         Returns:
             Metrics for the completed optimizer step.
         """
@@ -1246,37 +1244,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             [self._make_engine_datum(batch) for batch in batches],
             self._engine_loss_fn,
         )
-
-        grad_norm = scale_grads_and_clip_grad_norm(
-            max_grad_norm,
-            self.model_parts,
-            norm_type=2.0,
-            pp_enabled=self.pp_enabled,
-            device_mesh=self.device_mesh,
-            moe_mesh=self.moe_mesh,
-            ep_axis_name="ep" if self.moe_mesh is not None and "ep" in self.moe_mesh.mesh_dim_names else None,
-            pp_axis_name="pp" if self.pp_enabled else None,
-            foreach=True,
-            num_label_tokens=None,
-            dp_group_size=self._get_dp_group_size(include_cp=True),
-            expert_tp_replication_factor=get_expert_tp_replication_factor(self.model_parts, self.device_mesh),
-        )
-
-        # Note(MegatronFSDP): Need to call these functions for MegatronFSDP if not using latest api
-        # self.model_parts[0].finish_grad_sync()
-
-        self.checkpointer.maybe_wait_for_staging()
-        for opt in self.optimizer:
-            opt.step()
-            opt.zero_grad()
-
-        if hasattr(self.model_parts[0], "update_moe_gate_bias"):
-            for mp in self.model_parts:
-                mp.update_moe_gate_bias()
-
-        if self.lr_scheduler is not None:
-            for scheduler in self.lr_scheduler:
-                scheduler.step(1)
+        step_result = self.engine.optim_step(before_optimizer_step=self.checkpointer.maybe_wait_for_staging)
 
         # Precompute FP8 scales
         fp8_config = self.cfg.get("fp8", None)
@@ -1329,8 +1297,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             epoch=self.step_scheduler.epoch,
             metrics={
                 "loss": reporting_loss,
-                "grad_norm": grad_norm,
-                "lr": self.optimizer[0].param_groups[0]["lr"],
+                "grad_norm": step_result.grad_norm,
+                "lr": step_result.learning_rates[0],
                 "mem": torch.cuda.max_memory_allocated() / 1024**3,
                 "tps": tps,
                 "tps_per_gpu": tps / self._get_cp_group_size() / max(self._get_dp_group_size(), 1),
