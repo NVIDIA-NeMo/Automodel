@@ -19,6 +19,7 @@ from typing import Any, Optional
 import torch
 from torch.distributed.device_mesh import DeviceMesh
 
+from nemo_automodel.components.distributed.init_utils import get_world_size_safe
 from nemo_automodel.components.moe.state_dict_utils import (
     create_dtensor_from_local,
     get_expert_range_for_rank_from_mesh,
@@ -62,7 +63,23 @@ class MoESplitExpertsStateDictMixin:
         This covers only the shared expert conversion. A concrete adapter must also verify that all non-expert
         checkpoint tensors load directly before it enables the full-checkpoint fast path.
         """
-        return self.backend.experts != "te" and self.backend.dispatcher != "mok"
+        return self._grouped_expert_storage_is_model_weight and self.backend.dispatcher != "mok"
+
+    @property
+    def _grouped_expert_storage_is_model_weight(self) -> bool:
+        """Whether the runtime grouped expert tensors use the model's parameter storage.
+
+        TE normally exposes virtual grouped tensors backed by ``torch.stack`` copies. The MoE layer instead constructs
+        ordinary ``GroupedExperts`` when an EP dispatcher runs with world size one, so the same TE configuration uses
+        real model parameters in that runtime. Non-EP dispatchers also construct ordinary grouped experts.
+        """
+        if self.backend.experts != "te":
+            return True
+        if self.backend.dispatcher == "mok":
+            return False
+        if self.backend.dispatcher not in {"deepep", "hybridep", "uccl_ep"}:
+            return True
+        return get_world_size_safe() == 1
 
     @property
     def _is_gated_moe(self) -> bool:
@@ -829,7 +846,6 @@ class MoESplitExpertsStateDictMixin:
         *,
         prefix_override: str | None = None,
         for_checkpoint_load: bool = False,
-        track_inplace_load: bool = True,
         **kwargs,
     ) -> list[tuple[str, torch.Tensor]]:
         """Convert one grouped expert tensor to Hugging Face's per-expert layout.
@@ -846,8 +862,6 @@ class MoESplitExpertsStateDictMixin:
                 outside the main backbone, e.g. ``"mtp."`` for the MTP head.
             for_checkpoint_load: Return views that DCP will completely overwrite. Save/export callers leave this
                 disabled so converted tensors preserve their current values in contiguous storage.
-            track_inplace_load: Record direct-write views for a later ``from_hf`` call. Checkpoint load groups disable
-                this because they write into the model and finish the load without calling ``from_hf``.
             **kwargs: Absorbed for forward-compatibility with base callers
                 that forward arbitrary state-dict kwargs (e.g. ``exclude_key_regex``).
 
@@ -870,7 +884,7 @@ class MoESplitExpertsStateDictMixin:
         # down_projs transpose still uses the model's weight memory. Treat the two native tensors independently so
         # MoK rebuilds gate/up after the read while DCP loads down directly into the model.
         backend = getattr(self, "backend", None)
-        grouped_storage_is_model_weight = getattr(backend, "experts", None) != "te"
+        grouped_storage_is_model_weight = self._grouped_expert_storage_is_model_weight
         gate_up_storage_is_model_weight = (
             grouped_storage_is_model_weight and getattr(backend, "dispatcher", None) != "mok"
         )
@@ -906,7 +920,7 @@ class MoESplitExpertsStateDictMixin:
                 and not quantization
                 and gate_up_storage_is_model_weight
             )
-            if inplace_ok and track_inplace_load:
+            if inplace_ok:
                 self._register_inplace_loaded_key(fqn, prefix_override)
 
             result = []
@@ -959,7 +973,7 @@ class MoESplitExpertsStateDictMixin:
                 and not quantization
                 and down_storage_is_model_weight
             )
-            if inplace_ok and track_inplace_load:
+            if inplace_ok:
                 self._register_inplace_loaded_key(fqn, prefix_override)
 
             result = []

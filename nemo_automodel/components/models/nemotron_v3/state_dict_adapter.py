@@ -114,23 +114,6 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
         }
 
     @property
-    def supports_checkpoint_load_groups(self) -> bool:
-        """Whether the shared direct-view group can load this single-device runtime layout.
-
-        TE/DeepEP is configured for distributed runs, but the MoE layer deliberately falls back to ``GroupedExperts``
-        when world size is one. The adapter configuration still says ``experts="te"``, so the legacy converter assumes
-        the grouped tensors are TE stack copies and rebuilds them. The shared checkpoint-group implementation instead
-        verifies that every converted tensor is a view of the actual runtime model storage. Expert bias and other
-        activations keep the full-checkpoint fallback until their layouts have concrete coverage.
-        """
-        return (
-            self.moe_config is not None
-            and self.backend.experts == "te"
-            and self.moe_config.expert_activation == "relu2"
-            and not self.moe_config.expert_bias
-        )
-
-    @property
     def _hf_prefix(self) -> str:
         """Return the source checkpoint's public Nemotron-H model prefix."""
         return "model." if self._uses_model_prefix else "backbone."
