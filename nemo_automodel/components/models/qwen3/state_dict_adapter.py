@@ -23,7 +23,7 @@ from nemo_automodel.components.checkpoint.state_dict_adapter import PassthroughS
 
 
 class Qwen3StateDictAdapter(PassthroughStateDictAdapter):
-    """Convert dense Qwen3 checkpoints whose HuggingFace and NeMo keys match."""
+    """Pass through dense Qwen3 tensors whose keys and tensor representations already match Hugging Face."""
 
     def __init__(self, config: Qwen3Config) -> None:
         self.config = config
