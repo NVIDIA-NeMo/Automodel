@@ -92,7 +92,7 @@ class _LingExpertGroupBuilder:
 
     Attributes:
         destinations: Checkpoint gate/up views of shape [expert_hidden, hidden] and down views of shape
-            [hidden, expert_hidden]. Every view aliases a final grouped expert parameter.
+            [hidden, expert_hidden]. Every view uses the grouped model weights as its memory.
         native_keys: Names of the final grouped expert parameters completed by ``destinations``.
         projections: Native grouped projection names already added to the builder.
     """
@@ -104,7 +104,7 @@ class _LingExpertGroupBuilder:
 
 @dataclass
 class _LingFusedQKVLoadGroup(CheckpointLoadGroup):
-    """Bounded fused-QKV destination and its final split parameter storage.
+    """One fused QKV checkpoint tensor and the three model weights it fills.
 
     Attributes:
         destinations: One checkpoint tensor of shape [q_heads * head_dim + 2 * kv_heads * head_dim, hidden]. The
@@ -176,7 +176,7 @@ class BailingMoeV2StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapt
 
     @property
     def supports_streaming_checkpoint_load(self) -> bool:
-        """Whether Ling can bound its single-device fused-QKV and expert checkpoint transformations."""
+        """Whether Ling can load single-device QKV and expert transformations one layer at a time."""
         return (
             self.backend.experts in {"torch", "torch_mm"}
             and self.backend.dispatcher == "torch"
@@ -201,7 +201,7 @@ class BailingMoeV2StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapt
             projection: Either ``gate_and_up_projs`` or ``down_projs``.
             grouped_weight: Final gate/up tensor of shape [experts, hidden, 2 * expert_hidden] or final down tensor of
                 shape [experts, expert_hidden, hidden]. The emitted checkpoint destinations are non-contiguous views
-                that alias this storage.
+                that use this model weight memory.
 
         Raises:
             ValueError: If the projection is duplicated or its tensor shape is incompatible with the Ling layout.
@@ -299,7 +299,7 @@ class BailingMoeV2StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapt
         Args:
             expert_root: Checkpoint prefix ending in ``layers.{layer}.mlp.experts``.
             builder: Per-expert gate, up, and down checkpoint views. Gate/up views have shape [expert_hidden, hidden],
-                down views have shape [hidden, expert_hidden], and all views alias final grouped parameters.
+                down views have shape [hidden, expert_hidden], and all views use the grouped model weights as memory.
             n_experts: Number of checkpoint experts required for the layer.
 
         Returns:
@@ -327,7 +327,7 @@ class BailingMoeV2StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapt
         model_part: torch.nn.Module,
         device_mesh: DeviceMesh | None = None,
     ) -> Iterator[CheckpointLoadGroup]:
-        """Yield final-storage expert groups and bounded fused-QKV groups for Ling.
+        """Yield Ling checkpoint tensors in groups that are installed before the next group is read.
 
         Args:
             model_part: Single-device Ling model whose parameters and persistent buffers are final destinations.
@@ -337,8 +337,8 @@ class BailingMoeV2StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapt
             device_mesh: Must be ``None``. Distributed Ling loads continue to use the rank-sharded DCP path.
 
         Returns:
-            Iterator whose ordinary and expert destinations alias final model storage. Each attention group owns one
-            temporary checkpoint tensor of shape [q_hidden + 2 * kv_hidden, hidden] and installs it before advancing.
+            Iterator whose ordinary and expert destinations use model weight memory directly. Each attention group
+            uses one temporary fused-QKV tensor and splits it into Q, K, and V before the iterator advances.
 
         Raises:
             RuntimeError: If the configured expert backend did not opt into streaming.
@@ -403,12 +403,12 @@ class BailingMoeV2StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapt
                     f"Ordinary Ling destination {checkpoint_name} is {type(checkpoint_destination).__name__}, "
                     "expected Tensor"
                 )
-            aliases_parameter = (
+            uses_parameter_memory = (
                 checkpoint_destination.device == destination.device
                 and checkpoint_destination.untyped_storage().data_ptr() == destination.untyped_storage().data_ptr()
             )
-            if not aliases_parameter:
-                raise ValueError(f"Ordinary Ling destination {checkpoint_name} does not alias {native_name}")
+            if not uses_parameter_memory:
+                raise ValueError(f"Ordinary Ling destination {checkpoint_name} does not use {native_name} memory")
             if checkpoint_name in ordinary_destinations:
                 raise ValueError(f"Duplicate ordinary Ling checkpoint destination {checkpoint_name}")
             ordinary_destinations[checkpoint_name] = checkpoint_destination
