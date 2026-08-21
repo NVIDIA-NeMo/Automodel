@@ -16,18 +16,14 @@
 
 from __future__ import annotations
 
-import re
-
 import torch
 from transformers import Qwen3Config
 
-from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
+from nemo_automodel.components.checkpoint.state_dict_adapter import PassthroughStateDictAdapter
 
 
-class Qwen3StateDictAdapter(StateDictAdapter):
+class Qwen3StateDictAdapter(PassthroughStateDictAdapter):
     """Convert dense Qwen3 checkpoints whose HuggingFace and NeMo keys match."""
-
-    _supports_low_memory_dcp_load = True
 
     def __init__(self, config: Qwen3Config) -> None:
         self.config = config
@@ -52,44 +48,3 @@ class Qwen3StateDictAdapter(StateDictAdapter):
         if self.config.tie_word_embeddings and lm_head_key not in state_dict and embed_key in state_dict:
             state_dict[lm_head_key] = state_dict[embed_key]
         return state_dict
-
-    def to_hf(
-        self,
-        state_dict: dict[str, torch.Tensor],
-        exclude_key_regex: str | None = None,
-        **kwargs: object,
-    ) -> dict[str, torch.Tensor]:
-        """Copy a NeMo state dict, optionally excluding matching keys.
-
-        Args:
-            state_dict: Mapping from parameter names to checkpoint tensors with
-                arbitrary parameter shapes; values are returned without mutation.
-            exclude_key_regex: Optional regular expression selecting keys to omit.
-            **kwargs: Compatibility arguments accepted by the checkpoint adapter
-                interface; they do not alter dense Qwen3 tensors.
-
-        Returns:
-            A new HuggingFace-format mapping whose tensor shapes, dtypes,
-            devices, and storage aliases match ``state_dict``.
-        """
-        if exclude_key_regex is None:
-            return dict(state_dict)
-        return {key: value for key, value in state_dict.items() if not re.search(exclude_key_regex, key)}
-
-    def convert_single_tensor_to_hf(
-        self, fqn: str, tensor: torch.Tensor, **kwargs: object
-    ) -> list[tuple[str, torch.Tensor]]:
-        """Return one model tensor under its unchanged Hugging Face key.
-
-        Args:
-            fqn: Fully qualified model tensor name.
-            tensor: Model tensor to expose for checkpoint I/O.
-            **kwargs: Adapter options, including an optional exclusion regex.
-
-        Returns:
-            The unchanged key and tensor, or an empty list when excluded.
-        """
-        exclude_key_regex = kwargs.get("exclude_key_regex")
-        if isinstance(exclude_key_regex, str) and re.search(exclude_key_regex, fqn):
-            return []
-        return [(fqn, tensor)]
