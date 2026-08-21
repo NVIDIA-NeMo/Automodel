@@ -528,7 +528,7 @@ def _compare_logits(
     active_failures = _parity_failures(metrics, active_profile_thresholds)
     threshold_mode = "profile_with_numeric_overrides" if uses_threshold_overrides else "profile"
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "parity_document_sha256": _PARITY_DOCUMENT_SHA256,
         "phase": policy.phase,
         "comparison": policy.comparison,

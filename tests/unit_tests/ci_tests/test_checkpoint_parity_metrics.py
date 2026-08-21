@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -38,6 +40,9 @@ def test_identical_logits_have_zero_divergence_and_unit_cosine():
     assert metrics.mean_kl == pytest.approx(0.0, abs=1e-8)
     assert metrics.p95_kl == pytest.approx(0.0, abs=1e-8)
     assert metrics.max_kl == pytest.approx(0.0, abs=1e-8)
+    assert metrics.mean_jsd == pytest.approx(0.0, abs=5e-8)
+    assert metrics.p95_jsd == pytest.approx(0.0, abs=5e-8)
+    assert metrics.max_jsd == pytest.approx(0.0, abs=5e-8)
     assert metrics.cosine_similarity == pytest.approx(1.0)
     assert metrics.mean_absolute_logit_difference == 0.0
     assert metrics.max_absolute_logit_difference == 0.0
@@ -49,13 +54,22 @@ def test_full_logit_metrics_match_direct_reference_computation():
     reference_flat = reference.reshape(-1, 3).float()
     candidate_flat = candidate.reshape(-1, 3).float()
     reference_log_probs = F.log_softmax(reference_flat, dim=-1)
-    expected_kl = (reference_log_probs.exp() * (reference_log_probs - F.log_softmax(candidate_flat, dim=-1))).sum(-1)
+    candidate_log_probs = F.log_softmax(candidate_flat, dim=-1)
+    expected_kl = (reference_log_probs.exp() * (reference_log_probs - candidate_log_probs)).sum(-1)
+    mixture_log_probs = torch.logaddexp(reference_log_probs, candidate_log_probs) - math.log(2.0)
+    expected_jsd = 0.5 * (
+        (reference_log_probs.exp() * (reference_log_probs - mixture_log_probs)).sum(-1)
+        + (candidate_log_probs.exp() * (candidate_log_probs - mixture_log_probs)).sum(-1)
+    )
 
     metrics = _compute_parity_metrics(reference, candidate, chunk_tokens=1)
 
     assert metrics.mean_kl == pytest.approx(expected_kl.mean().item(), rel=1e-6, abs=1e-8)
     assert metrics.p95_kl == pytest.approx(torch.quantile(expected_kl, 0.95).item(), rel=1e-6, abs=1e-8)
     assert metrics.max_kl == pytest.approx(expected_kl.max().item(), rel=1e-6, abs=1e-8)
+    assert metrics.mean_jsd == pytest.approx(expected_jsd.mean().item(), rel=1e-6, abs=1e-8)
+    assert metrics.p95_jsd == pytest.approx(torch.quantile(expected_jsd, 0.95).item(), rel=1e-6, abs=1e-8)
+    assert metrics.max_jsd == pytest.approx(expected_jsd.max().item(), rel=1e-6, abs=1e-8)
     assert metrics.cosine_similarity == pytest.approx(
         F.cosine_similarity(reference.flatten(), candidate.flatten(), dim=0).item(), rel=1e-6
     )
@@ -74,6 +88,23 @@ def test_p95_is_stable_against_a_single_token_outlier_while_max_remains_diagnost
     assert metrics.mean_kl > 0.0
     assert metrics.p95_kl == pytest.approx(0.0, abs=1e-8)
     assert metrics.max_kl > 1.0
+    assert metrics.mean_jsd > 0.0
+    assert metrics.p95_jsd == pytest.approx(0.0, abs=1e-8)
+    assert metrics.max_jsd > 0.0
+
+
+def test_jsd_is_symmetric_and_bounded_while_kl_remains_directional():
+    reference = torch.tensor([[[math.log(0.9), math.log(0.1)]]])
+    candidate = torch.tensor([[[math.log(0.5), math.log(0.5)]]])
+
+    forward = _compute_parity_metrics(reference, candidate)
+    reverse = _compute_parity_metrics(candidate, reference)
+
+    assert forward.mean_kl != pytest.approx(reverse.mean_kl)
+    assert forward.mean_jsd == pytest.approx(reverse.mean_jsd, rel=1e-6, abs=1e-8)
+    assert forward.p95_jsd == pytest.approx(reverse.p95_jsd, rel=1e-6, abs=1e-8)
+    assert forward.max_jsd == pytest.approx(reverse.max_jsd, rel=1e-6, abs=1e-8)
+    assert 0.0 <= forward.max_jsd <= math.log(2.0)
 
 
 def test_metric_results_do_not_depend_on_chunk_size():
@@ -219,6 +250,7 @@ def test_structured_threshold_overrides_accept_partial_gates_for_every_compariso
     [
         ({"unknown": {"mean_kl": 0.01}}, "Unknown parity_threshold_overrides comparisons"),
         ({"source_load": {"max_kl": 0.01}}, "Unknown parity_threshold_overrides.source_load metrics"),
+        ({"source_load": {"mean_jsd": 0.01}}, "Unknown parity_threshold_overrides.source_load metrics"),
         ({"hf_reload": {"mean_kl": "0.01"}}, "hf_reload.mean_kl must be numeric"),
         ({"cross_tp": {"cosine_similarity": 2.0}}, "cosine_similarity threshold override"),
     ],
