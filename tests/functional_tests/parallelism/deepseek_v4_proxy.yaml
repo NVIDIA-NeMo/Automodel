@@ -31,11 +31,10 @@
 #     `fake_balanced_gate` stays off: it would swap the hash gate these layers
 #     exist to exercise for a fixed balanced one.
 #
-# The real recipe uses `attn: tilelang`, `experts: torch_mm` and
-# `dispatcher: hybridep`. This proxy uses sdpa plus the torch dispatcher, which
-# is what runs on a 2-GPU runner. `dispatcher: torch` still shards the expert
-# weights on the expert axis over the EP mesh (`apply_ep` -> `ExpertParallel`),
-# so the sharding under test is the same.
+# Backends vs the real recipe: `experts` matches it. `attn` uses sdpa rather
+# than tilelang, which JIT-compiles its kernels on every run, and `dispatcher`
+# uses torch rather than hybridep, which is not installed in the CI container.
+# Neither changes what EP shards.
 
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
@@ -93,7 +92,7 @@ model:
     linear: torch
     rms_norm: torch_fp32
     rope_fusion: false
-    experts: torch
+    experts: torch_mm
     dispatcher: torch
     enable_hf_state_dict_adapter: false
     # Recipe value. Gates the MoEFSDPSyncMixin sync deferral that the
