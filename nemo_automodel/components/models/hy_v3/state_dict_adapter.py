@@ -45,7 +45,7 @@ that match the actual on-disk strings.
 
 import logging
 import re
-from typing import Any, Optional
+from typing import Any
 
 import torch
 from torch.distributed.device_mesh import DeviceMesh
@@ -100,7 +100,7 @@ class HYV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
     def to_hf(
         self,
         state_dict: dict[str, Any],
-        exclude_key_regex: Optional[str] = None,
+        exclude_key_regex: str | None = None,
         **kwargs,
     ) -> dict[str, Any]:
         """Convert native state dict back to the on-disk Tencent format.
@@ -133,7 +133,7 @@ class HYV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
     def from_hf(
         self,
         hf_state_dict: dict[str, Any],
-        device_mesh: Optional[DeviceMesh] = None,
+        device_mesh: DeviceMesh | None = None,
         **kwargs,
     ) -> dict[str, Any]:
         """Convert the on-disk Tencent state dict to native format.

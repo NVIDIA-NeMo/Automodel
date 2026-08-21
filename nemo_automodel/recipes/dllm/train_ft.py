@@ -37,7 +37,6 @@ from __future__ import annotations
 import logging
 import time
 from contextlib import nullcontext
-from typing import Optional
 
 import mlflow
 import torch
@@ -458,7 +457,7 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
             num_diffusion_tokens = num_supervised_tokens
         return num_diffusion_tokens, num_supervised_tokens
 
-    def _run_train_optim_step(self, batches, max_grad_norm: Optional[float] = None):
+    def _run_train_optim_step(self, batches, max_grad_norm: float | None = None):
         """Execute a single training step with dLLM loss.
 
         Follows the parent pattern but uses loss_mask from the collate wrapper
