@@ -53,6 +53,8 @@ class LlamaStateDictAdapter(StateDictAdapter):
         hf_state_dict = adapter.to_hf(custom_state_dict)
     """
 
+    _supports_low_memory_dcp_load = True
+
     def __init__(self, config: LlamaConfig):
         """Initialize adapter with Llama config."""
         self.config = config
@@ -81,16 +83,16 @@ class LlamaStateDictAdapter(StateDictAdapter):
             return {k: v for k, v in state_dict.items() if not re.search(exclude_key_regex, k)}
         return dict(state_dict)
 
-    def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs) -> list[tuple[str, Any]]:
-        """Return one Llama tensor under its unchanged HF state-dict key.
+    def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs: Any) -> list[tuple[str, Any]]:
+        """Return one model tensor under its unchanged Hugging Face key.
 
         Args:
-            fqn: Fully-qualified HF state-dict key. The key determines the tensor's rank and axis order.
-            tensor: Tensor/value to export. This passthrough does not copy or transform it.
-            **kwargs: Optional controls, including ``exclude_key_regex`` to skip matching keys.
+            fqn: Fully qualified model tensor name.
+            tensor: Model tensor to expose for checkpoint I/O.
+            **kwargs: Adapter options, including an optional exclusion regex.
 
         Returns:
-            A single ``(fqn, tensor)`` tuple, or an empty list when filtered. The returned tensor aliases the input.
+            The unchanged key and tensor, or an empty list when excluded.
         """
         exclude_key_regex = kwargs.get("exclude_key_regex")
         if exclude_key_regex is not None and re.search(exclude_key_regex, fqn):
