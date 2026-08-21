@@ -33,6 +33,19 @@ VIDEO_OPTIONAL_FIELDS = (
     # in collate_optional_video_fields stays valid.
     "audio_latents",
     "audio_text_embeddings",
+    # Wan-Animate-2 triplet cache keys: the reference-character latent
+    # [1, 16, 1, H, W], the driving-video latents [1, 16, T_drive, H, W], the
+    # all-zero previous-segment conditioning latents [1, 16, T_target, H, W],
+    # CLIP ViT-H features for the reference image and the driving first frame
+    # [1, 257, 1280], and the reference-branch text embedding [1, T_ref, 4096].
+    # Every field is fixed-shape within a bucket, so the torch.cat collation in
+    # collate_optional_video_fields stays valid.
+    "reference_latents",
+    "driving_latents",
+    "cond_zero_latents",
+    "clip_fea",
+    "clip_fea_ref",
+    "prompt_ref_embeddings",
 )
 
 

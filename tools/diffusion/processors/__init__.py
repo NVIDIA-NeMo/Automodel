@@ -30,6 +30,7 @@ from .qwen_image import QwenImageProcessor
 from .qwen_image_edit import QwenImageEditProcessor
 from .registry import ProcessorRegistry
 from .wan import Wan22Processor, WanProcessor
+from .wan_animate2 import WanAnimate2Processor
 
 __all__ = [
     # Base classes
@@ -45,6 +46,7 @@ __all__ = [
     # Video processors
     "WanProcessor",
     "Wan22Processor",
+    "WanAnimate2Processor",
     "HunyuanVideoProcessor",
     "LTX2Processor",
     # Caption loaders

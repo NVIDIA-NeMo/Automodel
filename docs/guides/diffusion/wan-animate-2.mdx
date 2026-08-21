@@ -1,0 +1,125 @@
+---
+title: "Fine-Tune Wan-Animate-2"
+description: ""
+---
+
+## Introduction
+
+Wan-Animate-2 is a character-animation diffusion transformer. Given a reference image of a
+character and a driving video of someone moving, it generates a video of the reference character
+performing the driving motion.
+
+Unlike earlier animation models, Wan-Animate-2 uses no pose extractor. It consumes the driving
+video directly, and motion transfers through frame-aligned attention: generated frame *t* attends to
+driving frame *t*.
+
+This guide covers Supervised Fine-Tuning (SFT) of the Wan-Animate-2 14B model using NeMo
+AutoModel with both full fine-tuning and Low-Rank Adaptation (LoRA).
+
+### Workflow Overview
+
+| Step | What You Do |
+| :--- | :--- |
+| 1. Install | Install NeMo AutoModel using pip or a container |
+| 2. Prepare data | Write a JSONL manifest of reference, driving, and target triplets |
+| 3. Preprocess | Encode the triplets into a cached latent dataset |
+| 4. Train | Launch training with `torchrun` on eight GPUs |
+
+## Model Overview
+
+Wan-Animate-2 is a 40-layer, 16.4B-parameter flow-matching DiT that shares Wan's VAE and UMT5-XXL
+text encoder. It conditions on a reference character image (as a VAE latent plus CLIP features), the
+driving video, and a text caption.
+
+The `WanAnimate2Adapter` handles the following key training mechanics:
+
+- **Two-pass forward**: Each step runs the driving video through the transformer to build a
+  key/value cache, then denoises against it. Both passes carry gradient, so the driving branch is
+  trained rather than frozen.
+- **Reference slot**: The generation stream carries one extra leading latent frame for the reference
+  character. Its prediction is dropped before the loss, as frame 0 is dropped at inference.
+- **LoRA targets**: The three self-attention input projections, named `q`, `k`, and `v` on this
+  architecture, matching the reference training recipe.
+
+The recipe runs with FSDP2 on a single eight-GPU node and mixed precision, with one sample per
+rank. Tensor and context parallelism are not available for this model, and a training run must use a
+single resolution bucket.
+
+Resolution and clip length are set during preprocessing, through `--resolution_preset` and
+`--num_frames`. The two-pass forward attends over both the generated and the driving stream, so it
+uses considerably more memory per frame than a single-pass video model at the same resolution. On
+eight 80 GB GPUs, choose the preset and frame count together rather than assuming a configuration
+that fits another Wan recipe will fit here.
+
+## Prepare Your Data
+
+Training consumes a triplet per sample. Write a JSONL manifest where each row names three media
+files and a caption:
+
+```json
+{"reference_image": "clips/0001_ref.png", "driving_video": "clips/0001_drive.mp4", "target_video": "clips/0001_target.mp4", "caption": "a woman in a red jacket dancing in a park"}
+```
+
+Relative paths resolve against the manifest's parent directory. All reference images in a manifest
+must share an aspect ratio, since the training bucket is derived from them.
+
+<Warning>
+Do not point `driving_video` and `target_video` at the same file. Because the driving video is
+consumed directly with no pose extraction, a model given the target clip as its own driving input
+can reach zero loss by copying it and ignoring the reference image. The loss curve descends
+normally, so this failure is silent. A valid sample needs the driving video to differ from the
+target in appearance while preserving motion.
+</Warning>
+
+Encode the manifest once. Training reads only cached latents:
+
+```bash
+python -m tools.diffusion.preprocessing_multiprocess wan-animate \
+    --manifest /path/to/triplets.jsonl \
+    --output_dir /path/to/wan_animate2_cache \
+    --model_name Wan-AI/Wan2.2-Animate-2-14B-Diffusers \
+    --resolution_preset 256p \
+    --num_frames 17 \
+    --fps 24
+```
+
+`--num_frames` must satisfy `4n + 1`. Both videos are resampled to `--fps`, so training motion speed
+matches inference.
+
+The preset and frame count above are what a single eight-GPU 80 GB node fits. Raising either raises
+memory sharply, because each step attends over the driving stream as well as the generated one.
+The `512p` preset at 33 frames does not fit on that node. Preprocess and train a short run at a new
+setting before committing to it.
+
+<Note>
+Wan-Animate-2 requires `flash-attn`. Unlike the other diffusion models, its transformer calls
+flash attention directly rather than going through the Diffusers attention dispatch, so there is
+no fallback. The NeMo AutoModel container ships it. A bare install needs the `fa` extra.
+</Note>
+
+## Launch Training
+
+Two example configuration files are provided in the `examples/diffusion/finetune/` directory:
+
+| Configuration File | Description |
+| :--- | :--- |
+| [`wan_animate2_flow.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/wan_animate2_flow.yaml) | Full fine-tuning |
+| [`wan_animate2_flow_lora.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/wan_animate2_flow_lora.yaml) | LoRA fine-tuning |
+
+Set `data.dataloader.cache_dir` to the preprocessed cache.
+
+**Full SFT:**
+
+```bash
+torchrun --standalone --nproc-per-node=8 \
+    examples/diffusion/finetune/finetune.py \
+    -c examples/diffusion/finetune/wan_animate2_flow.yaml
+```
+
+**LoRA:**
+
+```bash
+torchrun --standalone --nproc-per-node=8 \
+    examples/diffusion/finetune/finetune.py \
+    -c examples/diffusion/finetune/wan_animate2_flow_lora.yaml
+```

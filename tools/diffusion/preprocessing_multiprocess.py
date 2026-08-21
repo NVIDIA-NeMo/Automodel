@@ -1348,6 +1348,73 @@ Examples:
     image_edit_res_group.add_argument("--max_pixels", type=int, help="Custom maximum pixel budget")
 
     # ===================
+    # Wan-Animate-2 subcommand
+    # ===================
+    wan_animate_parser = subparsers.add_parser(
+        "wan-animate",
+        help="Preprocess Wan-Animate-2 (reference image, driving video, target video) triplets",
+    )
+    wan_animate_parser.add_argument(
+        "--manifest",
+        type=str,
+        required=True,
+        help=(
+            "JSONL manifest. Each row is an object with reference_image, driving_video, target_video, "
+            "and caption. Relative media paths resolve against the manifest's parent directory."
+        ),
+    )
+    wan_animate_parser.add_argument("--output_dir", type=str, required=True, help="Output cache directory")
+    wan_animate_parser.add_argument(
+        "--processor", type=str, default="wan_animate2", help="Processor name (default: wan_animate2)"
+    )
+    wan_animate_parser.add_argument(
+        "--model_name",
+        type=str,
+        required=True,
+        help=(
+            "Diffusers-format Wan-Animate-2 directory or Hub repo id providing vae/, text_encoder/, "
+            "tokenizer/, and image_encoder/ subfolders"
+        ),
+    )
+    wan_animate_parser.add_argument(
+        "--max_sequence_length", type=int, default=512, help="Cached UMT5 token count (default: 512)"
+    )
+    wan_animate_parser.add_argument(
+        "--num_frames",
+        type=int,
+        default=81,
+        help="Pixel-space frames emitted per video after fps resampling. Must satisfy 4n + 1 (default: 81)",
+    )
+    wan_animate_parser.add_argument(
+        "--fps",
+        type=int,
+        default=24,
+        help=(
+            "Target frame rate the cached clips represent. Both the driving and target videos are "
+            "resampled to it, matching the upstream pipeline's inference-time resampling (default: 24)"
+        ),
+    )
+    wan_animate_parser.add_argument(
+        "--torch_dtype",
+        type=str,
+        default="bfloat16",
+        choices=["bfloat16", "float16", "float32"],
+        help="Encoder compute dtype and cached tensor dtype (default: bfloat16)",
+    )
+    wan_animate_parser.add_argument(
+        "--num_gpus", type=int, default=None, help="Number of encoder workers (defaults to all visible GPUs)"
+    )
+    wan_animate_parser.add_argument("--verify", action="store_true", help="Verify cached encodings by decoding")
+    wan_animate_res_group = wan_animate_parser.add_mutually_exclusive_group()
+    wan_animate_res_group.add_argument(
+        "--resolution_preset",
+        type=str,
+        choices=["256p", "512p", "768p", "1024p", "1536p"],
+        help="Resolution preset; the bucket is derived from the reference image within this pixel budget",
+    )
+    wan_animate_res_group.add_argument("--max_pixels", type=int, help="Custom maximum pixel budget")
+
+    # ===================
     # Video subcommand
     # ===================
     video_parser = subparsers.add_parser("video", help="Preprocess videos")
@@ -1507,6 +1574,42 @@ Examples:
             max_items=args.max_items,
             max_pixels=max_pixels,
             resolution_preset=args.resolution_preset,
+            num_gpus=num_gpus,
+            verify=args.verify,
+        )
+
+    elif args.command == "wan-animate":
+        if args.max_sequence_length <= 0:
+            parser.error("--max_sequence_length must be positive")
+        if args.num_frames % 4 != 1:
+            parser.error("--num_frames must satisfy 4n + 1 for the Wan VAE's 4x temporal compression")
+        if args.fps <= 0:
+            parser.error("--fps must be positive")
+
+        num_gpus = args.num_gpus if args.num_gpus is not None else torch.cuda.device_count()
+        if num_gpus <= 0:
+            parser.error("Wan-Animate-2 preprocessing requires at least one GPU")
+
+        if args.resolution_preset:
+            max_pixels = MultiTierBucketCalculator.RESOLUTION_PRESETS[args.resolution_preset]
+        elif args.max_pixels is not None:
+            if args.max_pixels <= 0:
+                parser.error("--max_pixels must be positive")
+            max_pixels = args.max_pixels
+        else:
+            max_pixels = 512 * 512
+
+        encoder = ProcessorRegistry.get_class(args.processor)(
+            model_name=args.model_name,
+            max_sequence_length=args.max_sequence_length,
+            torch_dtype=args.torch_dtype,
+        )
+        encoder.encode_manifest(
+            manifest_path=Path(args.manifest),
+            output_dir=Path(args.output_dir),
+            max_pixels=max_pixels,
+            num_frames=args.num_frames,
+            fps=args.fps,
             num_gpus=num_gpus,
             verify=args.verify,
         )
