@@ -38,7 +38,7 @@ Two training objectives are supported via ``loss_type``:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING, Tuple
 
 import torch
 import torch.nn as nn
@@ -180,7 +180,7 @@ class DFlashTrainerModule(nn.Module):
         block_size: int = 16,
         attention_backend: str = "flex_attention",
         num_anchors: int = 512,
-        loss_decay_gamma: Optional[float] = None,
+        loss_decay_gamma: float | None = None,
         loss_type: str = "dflash",
         prefix_weight_base: float = 0.9,
     ):
@@ -224,7 +224,7 @@ class DFlashTrainerModule(nn.Module):
         seq_len: int,
         loss_mask: torch.Tensor,
         device: torch.device,
-        doc_remaining: Optional[torch.Tensor] = None,
+        doc_remaining: torch.Tensor | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Randomly sample anchor positions per sample; returns ``(anchors, keep_mask)``.
 
@@ -300,7 +300,7 @@ class DFlashTrainerModule(nn.Module):
         return samples.view(bsz, n_blocks) + min_prefix
 
     def _create_position_ids(
-        self, anchor_positions: torch.Tensor, context_position_ids: Optional[torch.Tensor] = None
+        self, anchor_positions: torch.Tensor, context_position_ids: torch.Tensor | None = None
     ) -> torch.Tensor:
         """Position ids for the parallel draft blocks (anchor position + offset).
 
@@ -419,9 +419,7 @@ class DFlashTrainerModule(nn.Module):
         seq_lens: torch.Tensor | None = None,
         doc_remaining: torch.Tensor | None = None,
         causal: bool = False,
-    ) -> Tuple[
-        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, "torch.Tensor | BlockMask", Optional[torch.Tensor]
-    ]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, "torch.Tensor | BlockMask", torch.Tensor | None]:
         """Shared block-drafting prologue: anchors, noise embedding, positions, mask.
 
         Centralises the sequence-packing handling for every block-wise trainer

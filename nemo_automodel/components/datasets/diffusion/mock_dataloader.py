@@ -22,7 +22,7 @@ tests to run without requiring real data.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import Dict, Tuple
 
 import torch
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
@@ -223,7 +223,7 @@ def build_mock_dataloader(
     text_seq_len: int = 77,
     text_embed_dim: int = 4096,
     shuffle: bool = True,
-) -> Tuple[DataLoader, Optional[DistributedSampler]]:
+) -> Tuple[DataLoader, DistributedSampler | None]:
     """Build a mock dataloader for WAN training tests.
 
     This function follows the same interface as build_dataloader but generates

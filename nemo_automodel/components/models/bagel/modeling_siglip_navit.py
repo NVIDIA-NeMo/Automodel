@@ -43,8 +43,6 @@ via the state-dict adapter without key surgery.
 
 from __future__ import annotations
 
-from typing import Optional
-
 import numpy as np
 import torch
 from torch import nn
@@ -308,10 +306,10 @@ class SiglipFlashAttention2(SiglipAttention):
         hidden_states: torch.Tensor,
         cu_seqlens: torch.IntTensor,
         max_seqlen: int,
-        cos_h: Optional[torch.Tensor] = None,
-        sin_h: Optional[torch.Tensor] = None,
-        cos_w: Optional[torch.Tensor] = None,
-        sin_w: Optional[torch.Tensor] = None,
+        cos_h: torch.Tensor | None = None,
+        sin_h: torch.Tensor | None = None,
+        cos_w: torch.Tensor | None = None,
+        sin_w: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
         total_q_len, _ = hidden_states.size()
@@ -383,10 +381,10 @@ class SiglipEncoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         cu_seqlens: torch.IntTensor,
         max_seqlen: int,
-        cos_h: Optional[torch.Tensor] = None,
-        sin_h: Optional[torch.Tensor] = None,
-        cos_w: Optional[torch.Tensor] = None,
-        sin_w: Optional[torch.Tensor] = None,
+        cos_h: torch.Tensor | None = None,
+        sin_h: torch.Tensor | None = None,
+        cos_w: torch.Tensor | None = None,
+        sin_w: torch.Tensor | None = None,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.layer_norm1(hidden_states)
@@ -421,10 +419,10 @@ class SiglipEncoder(nn.Module):
         inputs_embeds: torch.Tensor,
         cu_seqlens: torch.IntTensor,
         max_seqlen: int,
-        cos_h: Optional[torch.Tensor] = None,
-        sin_h: Optional[torch.Tensor] = None,
-        cos_w: Optional[torch.Tensor] = None,
-        sin_w: Optional[torch.Tensor] = None,
+        cos_h: torch.Tensor | None = None,
+        sin_h: torch.Tensor | None = None,
+        cos_w: torch.Tensor | None = None,
+        sin_w: torch.Tensor | None = None,
     ) -> torch.Tensor:
         hidden_states = inputs_embeds
         for encoder_layer in self.layers:
