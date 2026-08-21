@@ -113,6 +113,7 @@ diffusion_kernels = [
 cuda = [
     "causal-conv1d",
     "mamba-ssm",
+    "nvidia-cudnn-frontend[cutedsl]>=1.27.0",
     "nv-grouped-gemm",
     # This is required to prevent ONNX errors arising from TE
     "onnxscript>=0.5.6",
@@ -218,7 +219,7 @@ docs = [
 linting = [
     "bandit~=1.9.0",
     "pre-commit>=4.2.0",
-    "ruff~=0.9.0",
+    "ruff~=0.12.0",
     "import-linter~=2.4",
     "ty>=0.0.20",
 ]
@@ -431,6 +432,7 @@ select = [
     "D103",
     "S301", # no pickle
     "S403", # no pickle
+    "UP045", # Prefer `T | None` over `Optional[T]`
 ]
 
 ignore = [

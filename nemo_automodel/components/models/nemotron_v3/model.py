@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass
-from typing import Any, Optional, Union
+from typing import Any, Union
 
 import torch
 import torch.nn as nn
@@ -61,8 +61,8 @@ class NemotronHCausalLMOutputWithPast(CausalLMOutputWithPast):
     which rebuild ``ModelOutput`` instances from declared fields only.
     """
 
-    mtp_per_depth_h: Optional[list[torch.Tensor]] = None
-    mtp_loss_scaling_factor: Optional[float] = None
+    mtp_per_depth_h: list[torch.Tensor] | None = None
+    mtp_loss_scaling_factor: float | None = None
 
 
 class NemotronV3Model(nn.Module):
@@ -692,22 +692,23 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
 
     def forward(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
+        input_ids: torch.LongTensor | None = None,
         *mtp_embed_inputs: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        causal_mask_mapping: Optional[dict[str, torch.Tensor]] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Any] = None,
-        use_cache: Optional[bool] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
+        attention_mask: torch.Tensor | None = None,
+        causal_mask_mapping: dict[str, torch.Tensor] | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        labels: torch.LongTensor | None = None,
+        past_key_values: Any | None = None,
+        use_cache: bool | None = None,
+        cache_position: torch.LongTensor | None = None,
+        position_ids: torch.LongTensor | None = None,
         mtp_per_depth_input_ids: tuple[torch.LongTensor, ...] | None = None,
         mtp_per_depth_position_ids: tuple[torch.LongTensor, ...] | None = None,
-        padding_mask: Optional[torch.Tensor] = None,
+        padding_mask: torch.Tensor | None = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
+        output_hidden_states: bool | None = None,
+        return_dict: bool | None = None,
+        compute_logits: bool = True,
         **kwargs: Any,
     ) -> CausalLMOutputWithPast:
         """Forward pass with optional loss computation.
@@ -759,6 +760,8 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
             output_hidden_states: Whether to return hidden states.
             return_dict: Accepted for API compatibility (always returns a
                 ``NemotronHCausalLMOutputWithPast`` off-PP).
+            compute_logits: Whether to materialize logits. Fused-linear loss callers
+                may disable this off-PP when they consume final hidden states directly.
             **kwargs: Additional arguments forwarded to the base model
                 (e.g. ``qkv_format``, ``cu_seqlens``, ``cu_seqlens_padded``,
                 ``max_seqlen``, ``seq_idx``, ``cp_rank``, ``cp_size``,
@@ -862,7 +865,12 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
         if past_key_values is not None:
             past_key_values.has_previous_state = True
 
-        logits = compute_lm_head_logits(self.lm_head, hidden_states, logits_to_keep).logits
+        if compute_logits:
+            logits = compute_lm_head_logits(self.lm_head, hidden_states, logits_to_keep).logits
+        else:
+            if labels is not None or is_pp_stage:
+                raise ValueError("compute_logits=False is only supported off-PP without labels.")
+            logits = hidden_states.new_empty((*hidden_states.shape[:-1], 0))
 
         loss = None
         # PP path defers loss to PipelineCausalLMLoss; only compute here off-PP.
@@ -1076,11 +1084,11 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
     def prepare_inputs_for_generation(
         self,
         input_ids: torch.LongTensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        past_key_values: Optional[Any] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = True,
+        attention_mask: torch.Tensor | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        past_key_values: Any | None = None,
+        cache_position: torch.LongTensor | None = None,
+        use_cache: bool | None = True,
         **kwargs,
     ) -> dict:
         """Prepare model inputs for each generation step.
