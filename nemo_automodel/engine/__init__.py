@@ -92,6 +92,54 @@ def _as_tuple(value: _T | Sequence[_T] | None) -> tuple[_T, ...]:
     return (value,)
 
 
+def _resolve_summed_gradient_reduction(model_parts: Sequence[nn.Module]) -> bool:
+    """Resolve whether every local model part uses summed gradient collectives.
+
+    MegatronFSDP exposes ``calculate_per_token_loss`` on its wrapper. Walking
+    each part's module tree also finds it below ordinary wrapper layers such as
+    DDP or compilation wrappers. A part without a declaration uses the normal
+    averaged-gradient contract.
+
+    Args:
+        model_parts: Local eager model or pipeline parts after distributed
+            wrapping.
+
+    Returns:
+        ``True`` when every part declares summed gradients, otherwise ``False``.
+
+    Raises:
+        TypeError: If a declaration is not boolean.
+        ValueError: If modules or model parts disagree on the reduction mode.
+    """
+    part_modes: list[bool] = []
+    sentinel = object()
+    for part_index, part in enumerate(model_parts):
+        declared_modes: set[bool] = set()
+        for module in part.modules():
+            declared_mode = getattr(module, "calculate_per_token_loss", sentinel)
+            if declared_mode is sentinel:
+                continue
+            if not isinstance(declared_mode, bool):
+                raise TypeError(
+                    "model calculate_per_token_loss declarations must be boolean; "
+                    f"part {part_index} has {declared_mode!r}"
+                )
+            declared_modes.add(declared_mode)
+        if len(declared_modes) > 1:
+            raise ValueError(
+                "model part mixes calculate_per_token_loss=True and False; "
+                "Engine requires one gradient-reduction mode per optimizer window"
+            )
+        part_modes.append(next(iter(declared_modes), False))
+
+    if len(set(part_modes)) > 1:
+        raise ValueError(
+            "model parts disagree on calculate_per_token_loss; "
+            "Engine requires one gradient-reduction mode per optimizer window"
+        )
+    return bool(part_modes and part_modes[0])
+
+
 def _tensor_version(tensor: torch.Tensor) -> int:
     """Return the in-place mutation counter when the Tensor exposes one."""
     try:
@@ -372,6 +420,7 @@ class Engine:
         self.pipeline = model if isinstance(model, AutoPipeline) else None
         self.model_parts = model.parts if self.pipeline is not None else [model]
         self.model = self.model_parts[0]
+        self._summed_gradient_reduction = _resolve_summed_gradient_reduction(self.model_parts)
         self._fp8_scale_precompute_parts, self._fp8_scale_precompute_fn = _resolve_fp8_scale_precompute(
             self.model_parts
         )
@@ -835,6 +884,7 @@ class Engine:
         self._validate_parallelism()
         dp_group, dp_size = self._dp_group_and_size()
         grad_group, grad_group_size = self._gradient_group_and_size(dp_group, dp_size)
+        gradient_reduction_multiplier = self._gradient_reduction_multiplier(grad_group_size)
         self._validate_window_size_across_group(len(microbatches), grad_group, grad_group_size)
         denominator = (
             self._global_weight_sum(microbatches, dp_group, dp_size)
@@ -865,7 +915,9 @@ class Engine:
         effective_total_microbatches = (
             len(microbatches) * inner_microbatches if total_microbatches is None else total_microbatches
         )
-        MoEAuxLossAutoScaler.main_loss_backward_scale = torch.tensor(self._cp_size() / effective_total_microbatches)
+        MoEAuxLossAutoScaler.main_loss_backward_scale = torch.tensor(
+            self._cp_size() * gradient_reduction_multiplier / (grad_group_size * effective_total_microbatches)
+        )
 
         local_loss_sum = torch.zeros((), dtype=torch.float64, device=self.device)
         loss_fn_outputs: list[dict[str, Any]] = []
@@ -874,7 +926,7 @@ class Engine:
         backward_scale = (
             safe_gradient_denominator.new_zeros(())
             if zero_denominator or zero_gradient_denominator
-            else safe_gradient_denominator.new_tensor(grad_group_size) / safe_gradient_denominator
+            else safe_gradient_denominator.new_tensor(gradient_reduction_multiplier) / safe_gradient_denominator
         )
 
         for index, datums in enumerate(microbatches):
@@ -2067,17 +2119,24 @@ class Engine:
     def _validate_parallelism(self) -> None:
         """Validate topology plus backward-specific distributed contracts."""
         self._validate_execution_parallelism()
-        if any(
-            bool(getattr(module, "calculate_per_token_loss", False))
-            for part in self.model_parts
-            for module in part.modules()
-        ):
-            raise NotImplementedError(
-                "Engine.forward_backward requires averaged distributed gradients; "
-                "MegatronFSDP calculate_per_token_loss=True uses summed gradients"
-            )
         if self.pipeline is not None and self.pipeline.scale_grads_in_schedule:
             raise ValueError("Engine requires AutoPipeline scale_grads_in_schedule=False")
+
+    def _gradient_reduction_multiplier(self, grad_group_size: int) -> int:
+        """Return the factor that compensates the backend gradient collective.
+
+        Averaging backends divide by the complete DP-CP gradient group, so the
+        local loss numerator is multiplied by that group size before backward.
+        MegatronFSDP ``calculate_per_token_loss=True`` uses SUM collectives and
+        therefore needs no such compensation.
+
+        Args:
+            grad_group_size: Size of the complete DP-CP gradient group.
+
+        Returns:
+            One for summed gradients, otherwise ``grad_group_size``.
+        """
+        return 1 if self._summed_gradient_reduction else grad_group_size
 
     def _validate_execution_parallelism(self) -> None:
         """Validate model-parallel topology shared by forward and backward."""

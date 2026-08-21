@@ -1873,14 +1873,16 @@ def _patch_vlm_distributed_setup(
     )
 
 
-def test_vlm_setup_rejects_calculate_per_token_loss(monkeypatch):
+def test_vlm_setup_allows_calculate_per_token_loss(monkeypatch):
     cfg = _minimal_vlm_cfg(cp_size=1, rope_fusion=False)
     _patch_vlm_setup_minimals(monkeypatch, cp_size=1)
     _patch_vlm_distributed_setup(monkeypatch, pp_enabled=False, calculate_per_token_loss=True)
 
     trainer = FinetuneRecipeForVLM(cfg)
-    with pytest.raises(NotImplementedError, match="calculate_per_token_loss=True"):
-        trainer.setup()
+    trainer.setup()
+
+    assert trainer.distributed_config.calculate_per_token_loss is True
+    assert trainer.engine is not None
 
 
 def test_vlm_setup_rejects_pipeline_schedule_gradient_scaling(monkeypatch):

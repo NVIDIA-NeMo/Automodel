@@ -1290,7 +1290,7 @@ def test_setup_pipeline_engine_matrix(
     assert dataloader_build_kwargs[0]["collate_wrapper"] is (None if dataloader_emits_thd else pp_collate_wrapper)
 
 
-def test_setup_rejects_per_token_megatron_fsdp(monkeypatch):
+def test_setup_allows_per_token_megatron_fsdp(monkeypatch):
     cfg = _minimal_cfg_with_nvtx(nvtx_value=False)
     _patch_setup_minimals(monkeypatch, lambda *args, **kwargs: None)
     monkeypatch.setattr(
@@ -1311,8 +1311,10 @@ def test_setup_rejects_per_token_megatron_fsdp(monkeypatch):
     )
 
     trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
-    with pytest.raises(NotImplementedError, match="calculate_per_token_loss=True"):
-        trainer.setup()
+    trainer.setup()
+
+    assert trainer.distributed_config.calculate_per_token_loss is True
+    assert trainer.engine is not None
 
 
 def test_engine_pipeline_loss_reuses_configured_loss_and_thd_metadata():

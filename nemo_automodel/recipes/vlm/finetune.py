@@ -451,11 +451,6 @@ class FinetuneRecipeForVLM(BaseRecipe):
         if not self._should_setup_training_components():
             return
 
-        if getattr(self.distributed_config, "calculate_per_token_loss", False):
-            raise NotImplementedError(
-                "Engine-backed VLM finetuning does not support "
-                "MegatronFSDP calculate_per_token_loss=True; use averaged gradients instead."
-            )
         if self.pp_enabled and getattr(self.pipeline_config, "scale_grads_in_schedule", False):
             raise ValueError("Engine-backed VLM finetuning requires distributed.pipeline.scale_grads_in_schedule=False")
 

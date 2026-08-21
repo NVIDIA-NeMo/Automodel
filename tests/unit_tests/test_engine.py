@@ -223,6 +223,13 @@ def _identity_loss(output, _loss_inputs):
     return output
 
 
+def _configure_fake_gradient_group(engine: Engine, monkeypatch, *, group_size: int) -> None:
+    """Expose a logical gradient group without running a real collective."""
+    engine._gradient_group_and_size = lambda _group, _size: (None, group_size)
+    engine._validate_window_size_across_group = lambda *_args, **_kwargs: None
+    monkeypatch.setattr(engine_module.dist, "all_reduce", lambda *_args, **_kwargs: None)
+
+
 def test_engine_and_datum_are_lazy_top_level_exports():
     assert PublicEngine is Engine
     assert PublicDatum is Datum
@@ -2757,15 +2764,143 @@ def test_pipeline_parallelism_fails_before_forward():
     assert model.forward_calls == 0
 
 
-def test_megatron_fsdp_per_token_loss_mode_fails_before_forward():
+@pytest.mark.parametrize(
+    ("declared_mode", "expected_multiplier", "expected_pre_collective_grad"),
+    [
+        pytest.param(None, 4, 14.0, id="undeclared-averaged"),
+        pytest.param(False, 4, 14.0, id="explicit-averaged"),
+        pytest.param(True, 1, 3.5, id="summed"),
+    ],
+)
+def test_gradient_reduction_mode_controls_main_loss_scale(
+    monkeypatch,
+    declared_mode,
+    expected_multiplier,
+    expected_pre_collective_grad,
+):
+    model = ScaleModel()
+    if declared_mode is not None:
+        model.calculate_per_token_loss = declared_mode
+    engine = Engine(model, device="cpu")
+    _configure_fake_gradient_group(engine, monkeypatch, group_size=4)
+
+    result = engine.forward_backward([_datum([2, 4], [1.0, 3.0])], _identity_loss)
+
+    assert engine._gradient_reduction_multiplier(4) == expected_multiplier
+    assert result.loss_sum.item() == pytest.approx(14.0)
+    assert result.weight_sum.item() == pytest.approx(4.0)
+    assert result.loss.item() == pytest.approx(3.5)
+    assert model.weight.grad.item() == pytest.approx(expected_pre_collective_grad)
+
+
+def test_gradient_reduction_mode_finds_summed_backend_below_ordinary_wrapper():
+    model = ScaleModel()
+    model.distributed_backend = nn.Identity()
+    model.distributed_backend.calculate_per_token_loss = True
+
+    engine = Engine(model, device="cpu")
+
+    assert engine._gradient_reduction_multiplier(8) == 1
+
+
+def test_summed_gradient_mode_planned_accumulation_matches_one_window(monkeypatch):
+    window_a = [_datum([2, 100], [1.0, 0.0])]
+    window_b = [_datum([4, 8], [0.5, 1.5])]
+
+    reference_model = ScaleModel()
+    reference_model.calculate_per_token_loss = True
+    reference_optimizer = torch.optim.SGD(reference_model.parameters(), lr=0.1)
+    reference_engine = Engine(
+        reference_model,
+        device="cpu",
+        optimizers=reference_optimizer,
+        max_grad_norm=None,
+    )
+    _configure_fake_gradient_group(reference_engine, monkeypatch, group_size=4)
+    reference_result = reference_engine.forward_backward(window_a + window_b, _identity_loss)
+    reference_grad = reference_model.weight.grad.detach().clone()
+    reference_engine.optim_step()
+
+    planned_model = ScaleModel()
+    planned_model.calculate_per_token_loss = True
+    planned_optimizer = torch.optim.SGD(planned_model.parameters(), lr=0.1)
+    planned_engine = Engine(
+        planned_model,
+        device="cpu",
+        optimizers=planned_optimizer,
+        max_grad_norm=None,
+    )
+    _configure_fake_gradient_group(planned_engine, monkeypatch, group_size=4)
+    planned_engine.begin_accumulation([window_a, window_b])
+    result_a = planned_engine.forward_backward(window_a, _identity_loss)
+    result_b = planned_engine.forward_backward(window_b, _identity_loss)
+
+    assert result_a.weight_sum.item() == pytest.approx(1.0)
+    assert result_b.weight_sum.item() == pytest.approx(2.0)
+    assert reference_result.weight_sum.item() == pytest.approx(3.0)
+    assert reference_result.loss.item() == pytest.approx(16.0 / 3.0)
+    torch.testing.assert_close(planned_model.weight.grad, reference_grad)
+    planned_engine.optim_step()
+    torch.testing.assert_close(planned_model.weight, reference_model.weight)
+
+
+def test_summed_gradient_mode_zero_weight_window_keeps_graph_connected_zero(monkeypatch):
     model = ScaleModel()
     model.calculate_per_token_loss = True
+    engine = Engine(model, device="cpu")
+    _configure_fake_gradient_group(engine, monkeypatch, group_size=4)
 
-    with pytest.raises(NotImplementedError, match="calculate_per_token_loss=True"):
-        Engine(model, device="cpu").forward_backward([_datum([1])], _identity_loss)
+    result = engine.forward_backward([_datum([100, 200], [0.0, 0.0])], _identity_loss)
 
-    assert model.forward_calls == 0
-    assert model.weight.grad is None
+    assert result.loss.item() == 0
+    assert result.loss_sum.item() == 0
+    assert result.weight_sum.item() == 0
+    assert model.forward_calls == 1
+    assert model.weight.grad.item() == 0
+
+
+@pytest.mark.parametrize(
+    ("summed_gradients", "expected_scale", "expected_local_aux_grad"),
+    [
+        pytest.param(False, 2.0 / 3.0, 2.0, id="averaged"),
+        pytest.param(True, 1.0 / 12.0, 0.25, id="summed"),
+    ],
+)
+def test_moe_aux_scale_uses_general_gradient_reduction_formula(
+    monkeypatch,
+    summed_gradients,
+    expected_scale,
+    expected_local_aux_grad,
+):
+    monkeypatch.setattr(MoEAuxLossAutoScaler, "main_loss_backward_scale", None)
+    model = _MainAndAuxScaleModel()
+    model.calculate_per_token_loss = summed_gradients
+    engine = Engine(model, device="cpu")
+    engine._cp_size = lambda: 2
+    _configure_fake_gradient_group(engine, monkeypatch, group_size=8)
+
+    engine.forward_backward([_datum([1]), _datum([2]), _datum([3])], _identity_loss)
+
+    assert MoEAuxLossAutoScaler.main_loss_backward_scale.item() == pytest.approx(expected_scale)
+    assert model.aux_weight.grad.item() == pytest.approx(expected_local_aux_grad)
+
+
+@pytest.mark.parametrize(
+    ("root_mode", "nested_mode", "error_type", "match"),
+    [
+        (True, False, ValueError, "mixes calculate_per_token_loss"),
+        ("yes", None, TypeError, "must be boolean"),
+    ],
+)
+def test_gradient_reduction_mode_rejects_ambiguous_declarations(root_mode, nested_mode, error_type, match):
+    model = ScaleModel()
+    model.calculate_per_token_loss = root_mode
+    if nested_mode is not None:
+        model.mode_probe = nn.Identity()
+        model.mode_probe.calculate_per_token_loss = nested_mode
+
+    with pytest.raises(error_type, match=match):
+        Engine(model, device="cpu")
 
 
 def test_loss_shape_must_exactly_match_weights():
@@ -2954,6 +3089,41 @@ def _context_parallel_worker(rank: int, world_size: int, init_file: str, dp_size
 
         planned_engine.optim_step()
         assert planned_model.module.weight.item() == pytest.approx(1.0 - 0.1 * expected_global_mean)
+
+        # Mimic MegatronFSDP calculate_per_token_loss=True with a SUM hook over
+        # the same DP-CP gradient group. Engine must not compensate for an
+        # average a second time, and the DP-only denominator must still produce
+        # the identical normalized update under both CP-only and DP+CP meshes.
+        summed_model = _DistributedCPModel()
+        summed_model.calculate_per_token_loss = True
+        gradient_group = get_flat_mesh(mesh_context.device_mesh, "dp_cp").get_group()
+
+        def sum_gradient(gradient):
+            dist.all_reduce(gradient, op=dist.ReduceOp.SUM, group=gradient_group)
+            return gradient
+
+        summed_model.weight.register_hook(sum_gradient)
+        summed_optimizer = torch.optim.SGD(summed_model.parameters(), lr=0.1)
+        summed_engine = Engine(
+            summed_model,
+            device="cpu",
+            mesh_context=mesh_context,
+            collate_fn=collate_prebatched,
+            optimizers=summed_optimizer,
+            max_grad_norm=None,
+        )
+        summed_engine.begin_accumulation([window_a, window_b])
+        summed_result_a = summed_engine.forward_backward(window_a, _identity_loss)
+        summed_result_b = summed_engine.forward_backward(window_b, _identity_loss)
+
+        torch.testing.assert_close(summed_result_a.loss_sum, result_a.loss_sum)
+        torch.testing.assert_close(summed_result_a.weight_sum, result_a.weight_sum)
+        torch.testing.assert_close(summed_result_b.loss_sum, result_b.loss_sum)
+        torch.testing.assert_close(summed_result_b.weight_sum, result_b.weight_sum)
+        assert summed_model.weight.grad.item() == pytest.approx(expected_global_mean)
+
+        summed_engine.optim_step()
+        torch.testing.assert_close(summed_model.weight, planned_model.module.weight)
     finally:
         dist.destroy_process_group()
 
